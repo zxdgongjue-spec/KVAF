@@ -1,6 +1,12 @@
-# KVAF 初期代码仓
+# KVAF
 
-当前目录只提供 KVAF 初期开发阶段的代码骨架，用于先固定模块边界、公共头文件位置和构建依赖关系。
+当前仓库在原有模块骨架上增加了第一条可执行数据路径：
+**AIV + SIMT + HCOMM/URMA + Host DDR 到 Device HBM（H2D）**。
+
+该路径是完整 KVAF 的最小子集，不包含分布式 Meta、BatchPut、vLLM
+适配或图捕获。设计边界、真实完成状态以及 PC A / 服务器 B / 远端仓 C
+的操作命令见
+[A5 AIV+SIMT+URMA H2D MVP](docs/a5_aiv_simt_urma_h2d_mvp.md)。
 
 ## 模块
 
@@ -28,7 +34,9 @@ kvaf_runtime
 
 Runtime target 依赖另外两个 target，因此后续可以由 Runtime 统一组合调用；Meta Manager 和 KV Access Operator 仍可单独被构建和测试。
 
-当前实现只有头文件占位，不包含业务逻辑，也不会产出有实际执行能力的库。开启 Python binding 时，唯一的 `.cpp` 文件仅用于注册 Python 模块和三个子模块名称，不承载 KVAF 业务实现。
+`kvaf_access_operator` 当前包含固定容量的设备 ABI、CPU 参考规划器和单元测试。
+A5 后端默认关闭；它依赖 Ascend 950、CANN、bisheng、HCOMM 和有效的
+Host/Device EID 对。
 
 ## 构建
 
@@ -39,7 +47,18 @@ cmake -S . -B build
 cmake --build build
 ```
 
-上述默认构建当前可以执行，但只完成 CMake 配置和占位 target 的构建检查。由于三个模块目前均为头文件和 `INTERFACE` target，不会生成具有实际业务能力的 KVAF 库，也不能执行 BatchGet、BatchPut 或 Meta 操作。
+默认构建不依赖 CANN，并会构建 CPU 参考规划器和测试：
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+服务器 B 上构建 A5 数据路径：
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+bash scripts/build_a5_aiv_urma.sh
+```
 
 如需编译 Python 注册模块，需要环境中提供 `pybind11`，并显式开启：
 

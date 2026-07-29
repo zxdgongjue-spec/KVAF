@@ -6,6 +6,7 @@ CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 Makefile
+results/
 
 # Python cache and native build output
 __pycache__/

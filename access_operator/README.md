@@ -21,3 +21,17 @@ Operator 内部按照 Selector、Executor、Template 组织（当前不需要考
 - 采用整批成功或整批失败语义；
 - 仅需要提供上述两个能力，暂不考虑扩展性
 
+## 当前 A5 最小实现
+
+当前代码先实现 BatchGet 的一个受限子集：
+
+- 设备侧固定 ABI：AccessTable、Index、Mask、连续 HBM 输出和 Completion；
+- 32 个 SIMT lane 并行查表并生成 64B 定长 H2D 描述符；
+- 单个 AIV 作为唯一 URMA SQ producer，调用 HCOMM `ReadNbi`；
+- Host DDR 显式执行 `halHostRegister(HOST_MEM_MAP_DEV)`，随后注册、导出并在
+  Device endpoint 导入；
+- CPU/AIV Host-Device channel 建链，以及多描述符、乱序索引和 mask 的
+  H2D 硬件冒烟验证。
+
+限制和运行命令见
+[A5 AIV+SIMT+URMA H2D MVP](../docs/a5_aiv_simt_urma_h2d_mvp.md)。

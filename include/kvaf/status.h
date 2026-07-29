@@ -8,9 +8,13 @@ namespace kvaf {
 enum class StatusCode {
   kOk = 0,
   kInvalidArgument,
+  kOutOfRange,
   kNotInitialized,
   kNotImplemented,
   kOutOfMemory,
+  kUnavailable,
+  kTimeout,
+  kTransportError,
   kInternal,
 };
 
