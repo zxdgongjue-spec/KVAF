@@ -515,26 +515,15 @@ Status HcommUrmaResources::CreateChannel(const EndpointSpec& peer,
 }
 
 Status HcommUrmaResources::WaitChannelReady(std::uint32_t timeout_ms) {
-  if (impl_->channel == 0) {
-    return Status::Error(StatusCode::kNotInitialized,
-                         "HCOMM channel has not been created");
-  }
   std::uint32_t elapsed_ms = 0;
   while (elapsed_ms <= timeout_ms) {
-    std::int32_t channel_status = kChannelConnecting;
-    const auto result =
-        HcommChannelGetStatus(&impl_->channel, 1, &channel_status);
-    if (result != 0) {
-      return HcommFailure("HcommChannelGetStatus", result);
+    bool ready = false;
+    auto status = PollChannelReady(&ready);
+    if (!status.ok()) {
+      return status;
     }
-    if (channel_status == kChannelReady) {
+    if (ready) {
       return Status::OK();
-    }
-    if (channel_status != kChannelConnecting) {
-      return Status::Error(
-          StatusCode::kTransportError,
-          "HCOMM channel entered terminal status " +
-              std::to_string(channel_status));
     }
     std::this_thread::sleep_for(
         std::chrono::milliseconds(kPollIntervalMs));
@@ -542,6 +531,32 @@ Status HcommUrmaResources::WaitChannelReady(std::uint32_t timeout_ms) {
   }
   return Status::Error(StatusCode::kTimeout,
                        "timed out waiting for HCOMM channel readiness");
+}
+
+Status HcommUrmaResources::PollChannelReady(bool* ready) {
+  if (impl_->channel == 0) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "HCOMM channel has not been created");
+  }
+  if (ready == nullptr) {
+    return Status::Error(StatusCode::kInvalidArgument,
+                         "HCOMM channel readiness output is null");
+  }
+  std::int32_t channel_status = kChannelConnecting;
+  const auto result =
+      HcommChannelGetStatus(&impl_->channel, 1, &channel_status);
+  if (result != 0) {
+    return HcommFailure("HcommChannelGetStatus", result);
+  }
+  if (channel_status != kChannelReady &&
+      channel_status != kChannelConnecting) {
+    return Status::Error(
+        StatusCode::kTransportError,
+        "HCOMM channel entered terminal status " +
+            std::to_string(channel_status));
+  }
+  *ready = channel_status == kChannelReady;
+  return Status::OK();
 }
 
 std::uint64_t HcommUrmaResources::channel() const {

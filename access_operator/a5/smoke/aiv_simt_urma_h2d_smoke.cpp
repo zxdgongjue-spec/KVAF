@@ -496,15 +496,24 @@ int RunDevice(const Options& options) {
                      "create Device AIV channel")) {
       return 1;
     }
+    bool server_ready = false;
+    if (!CheckStatus(resources.PollChannelReady(&server_ready),
+                     "arm Device AIV server channel")) {
+      return 1;
+    }
+    const std::string server_state =
+        server_ready ? "READY" : "CONNECTING";
     if (!AtomicWriteText(
             JoinPath(options.exchange_dir, kDeviceChannelCreatedMarker),
             "KVAF_A5_CHANNEL_CREATED role=device engine=AIV "
-            "socket_role=SERVER\n")) {
+            "socket_role=SERVER state=" +
+                server_state + "\n")) {
       std::cerr << "failed to publish Device server channel marker\n";
       return 1;
     }
     std::cout << "KVAF_A5_CHANNEL_CREATED role=device engine=AIV "
-                 "socket_role=SERVER\n";
+                 "socket_role=SERVER state="
+              << server_state << '\n';
     if (!CheckStatus(
             resources.WaitChannelReady(options.timeout_seconds * 1000U),
             "wait Device AIV channel")) {

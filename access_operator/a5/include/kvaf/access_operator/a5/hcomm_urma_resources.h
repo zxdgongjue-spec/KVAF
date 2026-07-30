@@ -91,6 +91,7 @@ class HcommUrmaResources {
                       ImportedMemoryView* view);
   Status CreateChannel(const EndpointSpec& peer, ChannelEngine engine,
                        ChannelRole role);
+  Status PollChannelReady(bool* ready);
   Status WaitChannelReady(std::uint32_t timeout_ms);
 
   std::uint64_t channel() const;

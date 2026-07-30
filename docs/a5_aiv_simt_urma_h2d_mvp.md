@@ -154,12 +154,14 @@ A5 Host DDR 分配/注册、HCOMM endpoint/channel/MR 生命周期和 driver EID
 2. 创建 `ENDPOINT_LOC_TYPE_DEVICE` endpoint；
 3. 以 `COMM_MEM_TYPE_DEVICE` 注册 HBM；
 4. 创建 `COMM_ENGINE_AIV + SERVER` channel；
-5. 原子发布 server channel 已创建标记，允许 Host 再创建 `CLIENT` channel；
-6. Host 和 Device 都使用 `exchangeAllMems=true`，且所有本地 MR 都在建链前
+5. 调用一次 `HcommChannelGetStatus` 启动 SERVER 建链状态机，并确认状态为
+   `CONNECTING` 或 `READY`；
+6. 原子发布 server channel 已启动标记，允许 Host 再创建 `CLIENT` channel；
+7. Host 和 Device 都使用 `exchangeAllMems=true`，且所有本地 MR 都在建链前
    注册；
-7. 轮询 `HcommChannelGetStatus`，只有 READY 才继续；
-8. 导入 Host MR 描述，取得 `HcommMemImport` 返回的 `view.addr`；
-9. 拒绝空地址、错误 memory type 或不足的长度，再启动 kernel。
+8. 轮询 `HcommChannelGetStatus`，只有 READY 才继续；
+9. 导入 Host MR 描述，取得 `HcommMemImport` 返回的 `view.addr`；
+10. 拒绝空地址、错误 memory type 或不足的长度，再启动 kernel。
 
 本冒烟程序显式保证 SERVER 先创建。HCOMM 的 `HcommChannelCreate` 只创建
 通道对象，后续 `HcommChannelGetStatus` 才推进建链状态机；如果 Host
