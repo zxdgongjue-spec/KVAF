@@ -164,7 +164,7 @@ KvafAivSimtUrmaH2DKernel(
   }
 
   asc_vf_call<BuildH2DDescriptorsSimt>(
-      dim3(kAivUrmaSimtLanes), params);
+      cce::dim3(kAivUrmaSimtLanes), params);
   AscendC::PipeBarrier<PIPE_ALL>();
 
   auto* descriptors = reinterpret_cast<__gm__ UrmaH2DDescriptor*>(

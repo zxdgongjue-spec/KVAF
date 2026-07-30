@@ -12,7 +12,13 @@
 #include <dlfcn.h>
 
 #include "hcomm/hcomm_res.h"
+#if __has_include("hcomm/hcomm_res_defs.h")
+#include "hcomm/hcomm_res_defs.h"
+#elif __has_include("hcomm/hcomm_res_entity_defs.h")
 #include "hcomm/hcomm_res_entity_defs.h"
+#else
+#error "KVAF requires hcomm_res_defs.h or hcomm_res_entity_defs.h"
+#endif
 
 namespace kvaf::access::a5 {
 namespace {
