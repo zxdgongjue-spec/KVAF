@@ -14,47 +14,25 @@ namespace kvaf {
 
 namespace {
 
-// slot 元数据，描述一段固定大小的远端可用地址。
-struct SlotMeta {
-  std::size_t slot_id{0};
-  Address uba{0};
-  std::uint64_t capacity{0};
-};
-
-// 地址记录的生命周期:
-// kReserved  : PreparePut 已占位，但尚未提交，对读路径不可见
-// kCommitted : CommitPut 后成为当前可见版本
-// kReclaimed : BatchFree 后已回收，对应 slot 可以重新进入空闲队列
-enum class RecordState {
-  kReserved = 0,
-  kCommitted,
-  kReclaimed,
-};
-
 // 单条 key 当前绑定的地址记录。
-// 当前 POC 只维护每个 key 的一个 active record。
 struct AddressRecord {
   std::uint64_t record_id{0};
   Address uba{0};
   std::uint64_t valid_length{0};
   std::size_t slot_id{0};
   std::uint64_t version{0};
-  RecordState state{RecordState::kReserved};
   std::uint32_t pin_count{0};
 };
 
-// key 到当前可见版本的索引项。
+// key 到当前可见记录的索引项。
 struct KeyEntry {
   AddressRecord active_record;
-  std::uint64_t latest_version{0};
 };
 
-// PreparePut 阶段的临时占位记录。
-// 这些 slot 已从 free queue 弹出，但还没有正式进入 key_index_。
+// PreparePut 阶段的临时预留项。
 struct PendingPutItem {
   KeyId key{0};
   std::size_t slot_id{0};
-  Address uba{0};
   std::uint64_t valid_length{0};
 };
 
@@ -75,7 +53,6 @@ struct ActiveLockContext {
   std::vector<LockedItem> items;
 };
 
-// 统一的错误构造辅助函数，避免重复书写 Status::Error。
 Status InvalidArgument(std::string message) {
   return Status::Error(StatusCode::kInvalidArgument, std::move(message));
 }
@@ -100,7 +77,7 @@ Status InvalidState(std::string message) {
   return Status::Error(StatusCode::kInvalidState, std::move(message));
 }
 
-// 批量接口要求 key 唯一，避免重复申请、重复释放等歧义。
+// 批量接口要求 key 唯一，避免重复申请或重复释放。
 bool HasDistinctKeys(const std::vector<KeyId>& keys) {
   std::unordered_set<KeyId> seen;
   seen.reserve(keys.size());
@@ -114,7 +91,7 @@ bool HasDistinctKeys(const std::vector<KeyId>& keys) {
 
 class InMemoryMetaManager final : public MetaManager {
  public:
-  // 注册远端内存池，并按 slot_size 切分后放入 FIFO 空闲队列。
+  // 注册单个远端 region，并按固定 slot 粒度初始化空闲队列。
   Status RegisterRemoteRegion(const RemoteRegionDesc& region) override {
     if (region.length == 0) {
       return InvalidArgument("remote region length must be greater than zero");
@@ -127,44 +104,23 @@ class InMemoryMetaManager final : public MetaManager {
           "remote region length must be a multiple of slot_size");
     }
 
-    const std::uint64_t slot_count = region.length / region.slot_size;
-    if (slot_count == 0) {
-      return InvalidArgument("slot_count must be greater than zero");
-    }
-
-    std::scoped_lock lock(meta_mutex_, free_queue_mutex_);
+    std::lock_guard<std::mutex> lock(meta_mutex_);
     if (region_registered_) {
       return AlreadyExists("remote region has already been registered");
     }
 
-    // 注册成功后把所有内部状态重置为干净初始态。
     region_ = region;
     region_registered_ = true;
-    slot_table_.clear();
-    while (!free_slots_.empty()) {
-      free_slots_.pop();
-    }
-    key_index_.clear();
-    pending_puts_.clear();
-    pending_keys_.clear();
-    lock_contexts_.clear();
-    next_record_id_ = 1;
-    next_put_context_id_ = 1;
-    next_lock_context_id_ = 1;
 
-    slot_table_.reserve(static_cast<std::size_t>(slot_count));
+    const std::uint64_t slot_count = region.length / region.slot_size;
     for (std::uint64_t i = 0; i < slot_count; ++i) {
-      const auto slot_id = static_cast<std::size_t>(i);
-      slot_table_.push_back(
-          SlotMeta{slot_id, region.base + i * region.slot_size, region.slot_size});
-      free_slots_.push(slot_id);
+      free_slots_.push(static_cast<std::size_t>(i));
     }
 
     return Status::OK();
   }
 
-  // 为一批新 key 预留 slot，并把可写地址返回给调用方。
-  // 该阶段只负责“分配地址”，不会立即暴露给读路径。
+  // 为一批新 key 预留 slot，并返回写路径需要的地址描述。
   Status PreparePut(const std::vector<KeyId>& flat_keys,
                     const std::vector<std::uint64_t>& lengths,
                     PutContext* put_context,
@@ -182,11 +138,10 @@ class InMemoryMetaManager final : public MetaManager {
       return InvalidArgument("PreparePut does not accept duplicate keys");
     }
 
-    std::scoped_lock lock(meta_mutex_, free_queue_mutex_);
+    std::lock_guard<std::mutex> lock(meta_mutex_);
     if (!region_registered_) {
       return NotInitialized("remote region has not been registered");
     }
-
     if (free_slots_.size() < flat_keys.size()) {
       return Status::Error(StatusCode::kOutOfMemory,
                            "not enough free slots for PreparePut");
@@ -216,11 +171,11 @@ class InMemoryMetaManager final : public MetaManager {
       const std::size_t slot_id = free_slots_.front();
       free_slots_.pop();
 
-      const SlotMeta& slot = slot_table_[slot_id];
+      const Address address = SlotAddress(slot_id);
       pending_context.items.push_back(
-          PendingPutItem{flat_keys[i], slot_id, slot.uba, lengths[i]});
+          PendingPutItem{flat_keys[i], slot_id, lengths[i]});
       put_desc->entries.push_back(
-          PutAllocation{flat_keys[i], slot.uba, lengths[i]});
+          PutAllocation{flat_keys[i], address, lengths[i]});
       pending_keys_.insert(flat_keys[i]);
     }
 
@@ -229,7 +184,7 @@ class InMemoryMetaManager final : public MetaManager {
     return Status::OK();
   }
 
-  // 把 PreparePut 产生的临时占位转为正式可见映射。
+  // 将 PreparePut 产生的预留记录提交为正式可见映射。
   Status CommitPut(const PutContext& put_context) override {
     if (put_context.id == 0) {
       return InvalidArgument("PutContext id must be non-zero");
@@ -251,18 +206,17 @@ class InMemoryMetaManager final : public MetaManager {
       }
     }
 
-    // Commit 是写路径与读路径之间的可见性边界。
+    // Commit 是写路径对读路径的可见性边界。
     for (const PendingPutItem& item : pending_it->second.items) {
       AddressRecord record;
       record.record_id = next_record_id_++;
-      record.uba = item.uba;
+      record.uba = SlotAddress(item.slot_id);
       record.valid_length = item.valid_length;
       record.slot_id = item.slot_id;
       record.version = 1;
-      record.state = RecordState::kCommitted;
       record.pin_count = 0;
 
-      key_index_.emplace(item.key, KeyEntry{record, record.version});
+      key_index_.emplace(item.key, KeyEntry{record});
       pending_keys_.erase(item.key);
     }
 
@@ -270,13 +224,13 @@ class InMemoryMetaManager final : public MetaManager {
     return Status::OK();
   }
 
-  // 放弃一次未提交的 put，把预留 slot 退回空闲队列。
+  // 放弃一次未提交的 put，并把预留 slot 归还空闲队列。
   Status AbortPut(const PutContext& put_context) override {
     if (put_context.id == 0) {
       return InvalidArgument("PutContext id must be non-zero");
     }
 
-    std::scoped_lock lock(meta_mutex_, free_queue_mutex_);
+    std::lock_guard<std::mutex> lock(meta_mutex_);
     if (!region_registered_) {
       return NotInitialized("remote region has not been registered");
     }
@@ -323,14 +277,10 @@ class InMemoryMetaManager final : public MetaManager {
       }
 
       const AddressRecord& record = key_it->second.active_record;
-      if (record.state != RecordState::kCommitted) {
-        return InvalidState("LockKeys found a non-committed record");
-      }
-
       items.push_back(LockedItem{key, record.record_id, record.version});
     }
 
-    // 读快照建立后增加 pin，保证读取期间 slot 不会被回收。
+    // 固定快照后增加 pin，保证读期间 slot 不会被回收。
     for (const LockedItem& item : items) {
       auto key_it = key_index_.find(item.key);
       ++key_it->second.active_record.pin_count;
@@ -384,10 +334,9 @@ class InMemoryMetaManager final : public MetaManager {
         return InvalidState("BatchLookup lost a locked key");
       }
 
-      // 如果 record_id / version 不匹配，说明稳定读语义被破坏，直接报错。
+      // 如果 record_id / version 不匹配，说明稳定读语义被破坏。
       const AddressRecord& record = key_it->second.active_record;
-      if (record.state != RecordState::kCommitted ||
-          record.record_id != item.record_id ||
+      if (record.record_id != item.record_id ||
           record.version != item.version) {
         return InvalidState("BatchLookup observed a different record version");
       }
@@ -438,7 +387,7 @@ class InMemoryMetaManager final : public MetaManager {
   }
 
   // 释放一批 key 占用的 slot。
-  // 先整体校验，再统一回收，保证 batch 的 all-or-nothing 语义。
+  // 先整体校验，再统一回收，保持 batch 级 all-or-nothing 语义。
   Status BatchFree(const std::vector<KeyId>& flat_keys) override {
     if (flat_keys.empty()) {
       return InvalidArgument("BatchFree requires at least one key");
@@ -447,7 +396,7 @@ class InMemoryMetaManager final : public MetaManager {
       return InvalidArgument("BatchFree does not accept duplicate keys");
     }
 
-    std::scoped_lock lock(meta_mutex_, free_queue_mutex_);
+    std::lock_guard<std::mutex> lock(meta_mutex_);
     if (!region_registered_) {
       return NotInitialized("remote region has not been registered");
     }
@@ -461,9 +410,6 @@ class InMemoryMetaManager final : public MetaManager {
       }
 
       const AddressRecord& record = key_it->second.active_record;
-      if (record.state != RecordState::kCommitted) {
-        return InvalidState("BatchFree found a non-committed record");
-      }
       if (record.pin_count > 0) {
         return Busy("BatchFree key is still pinned by a LockContext");
       }
@@ -471,11 +417,8 @@ class InMemoryMetaManager final : public MetaManager {
       slots_to_recycle.push_back(record.slot_id);
     }
 
-    // 只有整批校验都通过后，才真正修改 key_index_ 和 free queue。
     for (KeyId key : flat_keys) {
-      auto key_it = key_index_.find(key);
-      key_it->second.active_record.state = RecordState::kReclaimed;
-      key_index_.erase(key_it);
+      key_index_.erase(key);
     }
 
     for (std::size_t slot_id : slots_to_recycle) {
@@ -486,21 +429,19 @@ class InMemoryMetaManager final : public MetaManager {
   }
 
  private:
-  // 元数据受 meta_mutex_ 保护；空闲队列和元数据一起操作时额外持有 free_queue_mutex_。
+  Address SlotAddress(std::size_t slot_id) const {
+    return region_.base + static_cast<Address>(slot_id) * region_.slot_size;
+  }
+
+  // 当前 POC 使用一把总锁保护元数据和空闲 slot 队列。
   std::mutex meta_mutex_;
-  std::mutex free_queue_mutex_;
   bool region_registered_{false};
   RemoteRegionDesc region_;
-  // slot_table_ 记录全部 slot 属性，free_slots_ 维护当前可复用 slot。
-  std::vector<SlotMeta> slot_table_;
   std::queue<std::size_t> free_slots_;
-  // key_index_ 保存已提交映射；pending_puts_ / pending_keys_ 保存未提交事务。
   std::unordered_map<KeyId, KeyEntry> key_index_;
   std::unordered_map<std::uint64_t, PendingPutContext> pending_puts_;
   std::unordered_set<KeyId> pending_keys_;
-  // lock_contexts_ 保存尚未释放的稳定读快照。
   std::unordered_map<std::uint64_t, ActiveLockContext> lock_contexts_;
-  // 进程内自增 id，用于生成 record / put context / lock context 唯一标识。
   std::uint64_t next_record_id_{1};
   std::uint64_t next_put_context_id_{1};
   std::uint64_t next_lock_context_id_{1};

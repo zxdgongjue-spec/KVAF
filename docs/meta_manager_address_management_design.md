@@ -69,25 +69,17 @@
 ## 6. 核心数据结构
 
 ```cpp
-struct SlotMeta {
-  slot_id;
-  uba;
-  capacity;
-};
-
 struct AddressRecord {
   record_id;
   uba;
   valid_length;
   slot_id;
   version;
-  state;
   pin_count;
 };
 
 struct KeyEntry {
   active_record;
-  latest_version;
 };
 
 struct PendingPutContext {
@@ -101,12 +93,12 @@ struct ActiveLockContext {
 
 内部核心容器：
 
-- `slot_table_`：全部 slot 元数据
 - `free_slots_`：空闲 slot 队列
 - `key_index_`：当前 committed key 映射
 - `pending_puts_`：未提交 put
 - `pending_keys_`：pending key 去重
 - `lock_contexts_`：活动读快照
+- `region_`：单 region 配置，slot 地址通过 `base + slot_id * slot_size` 计算
 
 ## 7. 状态机
 

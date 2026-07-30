@@ -83,7 +83,7 @@ sequenceDiagram
 接口定义见 [meta_manager.h](C:/Urma/KVAF/meta_manager/include/kvaf/meta_manager/meta_manager.h:1)。
 
 - `RegisterRemoteRegion`
-  注册 region，初始化 slot 表和空闲队列。
+  注册 region，初始化空闲 slot 队列。
 - `PreparePut`
   为一批 key 预留 slot，返回写路径访问描述。
 - `CommitPut`
@@ -105,14 +105,14 @@ sequenceDiagram
 
 核心数据结构：
 
-- `slot_table_`：slot 元数据表
 - `free_slots_`：FIFO 空闲队列
 - `key_index_`：committed key 索引
 - `pending_puts_`：未提交写事务
 - `pending_keys_`：防止 pending 阶段重复申请
 - `lock_contexts_`：活动读快照
+- `region_`：单 region 配置，slot 地址通过 `base + slot_id * slot_size` 计算
 
-记录状态：
+记录生命周期：
 
 ```mermaid
 stateDiagram-v2
