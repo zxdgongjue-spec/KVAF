@@ -74,7 +74,6 @@ struct AddressRecord {
   uba;
   valid_length;
   slot_id;
-  version;
   pin_count;
 };
 
@@ -199,13 +198,12 @@ sequenceDiagram
 因为两者职责不同：
 
 - `CommitPut` 处理“写何时可见”
-- `LockKeys` 处理“读看哪一版”
+- `LockKeys` 处理“读期间固定哪条记录”
 
 分开后可以：
 
 - 避免每次写完都无意义加锁
 - 让不同读请求拥有独立快照
-- 为后续多版本扩展留接口空间
 
 ### 10.2 为什么 `BatchLookup` 不直接查最新地址
 
@@ -220,14 +218,14 @@ sequenceDiagram
 - 固定 slot
 - 单 key 单 active record
 - 不支持覆盖写
-- 不支持多版本保留
+- 不支持历史记录保留
 
 ## 12. 后续演进
 
 建议下一步按以下顺序推进：
 
 1. 接入 Runtime 主流程
-2. 支持覆盖写和版本切换
+2. 支持覆盖写
 3. 扩展多 region
 4. 评估可变长分配器
 5. 补充更贴近真实场景的并发与恢复测试

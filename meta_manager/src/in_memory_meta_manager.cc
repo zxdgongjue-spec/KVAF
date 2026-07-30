@@ -20,7 +20,6 @@ struct AddressRecord {
   Address uba{0};
   std::uint64_t valid_length{0};
   std::size_t slot_id{0};
-  std::uint64_t version{0};
   std::uint32_t pin_count{0};
 };
 
@@ -45,7 +44,6 @@ struct PendingPutContext {
 struct LockedItem {
   KeyId key{0};
   std::uint64_t record_id{0};
-  std::uint64_t version{0};
 };
 
 // 一次稳定读快照包含的全部 key。
@@ -213,7 +211,6 @@ class InMemoryMetaManager final : public MetaManager {
       record.uba = SlotAddress(item.slot_id);
       record.valid_length = item.valid_length;
       record.slot_id = item.slot_id;
-      record.version = 1;
       record.pin_count = 0;
 
       key_index_.emplace(item.key, KeyEntry{record});
@@ -277,7 +274,7 @@ class InMemoryMetaManager final : public MetaManager {
       }
 
       const AddressRecord& record = key_it->second.active_record;
-      items.push_back(LockedItem{key, record.record_id, record.version});
+      items.push_back(LockedItem{key, record.record_id});
     }
 
     // 固定快照后增加 pin，保证读期间 slot 不会被回收。
@@ -334,11 +331,10 @@ class InMemoryMetaManager final : public MetaManager {
         return InvalidState("BatchLookup lost a locked key");
       }
 
-      // 如果 record_id / version 不匹配，说明稳定读语义被破坏。
+      // 如果 record_id 不匹配，说明稳定读语义被破坏。
       const AddressRecord& record = key_it->second.active_record;
-      if (record.record_id != item.record_id ||
-          record.version != item.version) {
-        return InvalidState("BatchLookup observed a different record version");
+      if (record.record_id != item.record_id) {
+        return InvalidState("BatchLookup observed a different record");
       }
 
       access_desc->addresses.push_back(record.uba);
@@ -372,8 +368,8 @@ class InMemoryMetaManager final : public MetaManager {
       }
 
       AddressRecord& record = key_it->second.active_record;
-      if (record.record_id != item.record_id || record.version != item.version) {
-        return InvalidState("UnlockKeys observed a different record version");
+      if (record.record_id != item.record_id) {
+        return InvalidState("UnlockKeys observed a different record");
       }
       if (record.pin_count == 0) {
         return InvalidState("UnlockKeys found a zero pin_count");

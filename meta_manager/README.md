@@ -27,7 +27,7 @@
 - Payload 数据搬运
 - Prefix Key 转换
 - 多 region 调度
-- 多版本和覆盖写
+- 覆盖写
 
 ## 核心思路
 
@@ -144,6 +144,6 @@ stateDiagram-v2
 ## 后续建议
 
 1. 接入 Runtime 的 `BatchPut / BatchGet / Delete`
-2. 支持覆盖写和版本切换
+2. 支持覆盖写
 3. 从单 region 扩展到多 region
 4. 评估是否需要可变长分配器
