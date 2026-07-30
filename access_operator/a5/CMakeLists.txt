@@ -9,7 +9,7 @@ if(NOT DEFINED ASCEND_HOME_PATH)
 endif()
 
 set(KVAF_ASC_DEVKIT_PATH "" CACHE PATH
-  "Optional asc-devkit checkout that overrides CANN's adv_api/hcomm headers")
+  "Optional asc-devkit checkout that overrides the CANN device header tree")
 set(KVAF_A5_COMPILE_MODE "auto" CACHE STRING
   "Ascend compiler mode: auto, xasc, or xcce")
 set_property(CACHE KVAF_A5_COMPILE_MODE PROPERTY STRINGS auto xasc xcce)
@@ -30,16 +30,45 @@ find_path(KVAF_HCOMM_RESOURCE_INCLUDE_DIR hcomm/hcomm_res.h
   NO_DEFAULT_PATH
   REQUIRED
 )
+set(KVAF_ASC_DEVKIT_INCLUDE_DIRS)
 if(KVAF_ASC_DEVKIT_PATH)
   get_filename_component(KVAF_ASC_DEVKIT_PATH
     "${KVAF_ASC_DEVKIT_PATH}" ABSOLUTE)
   set(_KVAF_HCOMM_ADV_INCLUDE_DIR
     "${KVAF_ASC_DEVKIT_PATH}/include/adv_api")
-  if(NOT EXISTS "${_KVAF_HCOMM_ADV_INCLUDE_DIR}/hcomm/hcomm.h")
-    message(FATAL_ERROR
-      "KVAF_ASC_DEVKIT_PATH does not contain include/adv_api/hcomm/hcomm.h: "
-      "${KVAF_ASC_DEVKIT_PATH}")
-  endif()
+  foreach(_KVAF_ASC_DEVKIT_REQUIRED_FILE IN ITEMS
+      include/kernel_operator.h
+      include/basic_api/kernel_basic_intf.h
+      include/adv_api/kernel_api.h
+      include/adv_api/hcomm/hcomm.h)
+    if(NOT EXISTS
+        "${KVAF_ASC_DEVKIT_PATH}/${_KVAF_ASC_DEVKIT_REQUIRED_FILE}")
+      message(FATAL_ERROR
+        "KVAF_ASC_DEVKIT_PATH is not a complete asc-devkit checkout; missing "
+        "${KVAF_ASC_DEVKIT_PATH}/${_KVAF_ASC_DEVKIT_REQUIRED_FILE}")
+    endif()
+  endforeach()
+  # kernel_operator.h pulls the advanced APIs transitively. Keep the complete
+  # external AscendC tree together so an older CANN kernel_operator.h cannot
+  # claim the shared include guards before the selected HCOMM header is read.
+  list(APPEND KVAF_ASC_DEVKIT_INCLUDE_DIRS
+    "${KVAF_ASC_DEVKIT_PATH}/impl/adv_api"
+    "${KVAF_ASC_DEVKIT_PATH}/impl/basic_api"
+    "${KVAF_ASC_DEVKIT_PATH}/impl/basic_api/reg_compute"
+    "${KVAF_ASC_DEVKIT_PATH}/impl/c_api"
+    "${KVAF_ASC_DEVKIT_PATH}/impl/simt_api"
+    "${KVAF_ASC_DEVKIT_PATH}/impl/utils"
+    "${KVAF_ASC_DEVKIT_PATH}"
+    "${KVAF_ASC_DEVKIT_PATH}/include"
+    "${KVAF_ASC_DEVKIT_PATH}/include/adv_api"
+    "${KVAF_ASC_DEVKIT_PATH}/include/adv_api/matmul"
+    "${KVAF_ASC_DEVKIT_PATH}/include/aicpu_api"
+    "${KVAF_ASC_DEVKIT_PATH}/include/basic_api"
+    "${KVAF_ASC_DEVKIT_PATH}/include/basic_api/reg_compute"
+    "${KVAF_ASC_DEVKIT_PATH}/include/c_api"
+    "${KVAF_ASC_DEVKIT_PATH}/include/simt_api"
+    "${KVAF_ASC_DEVKIT_PATH}/include/utils"
+  )
   # An explicitly supplied asc-devkit is authoritative. FORCE also replaces a
   # stale CMake cache entry left by a previous configure against CANN headers.
   set(KVAF_HCOMM_ADV_INCLUDE_DIR "${_KVAF_HCOMM_ADV_INCLUDE_DIR}"
@@ -90,6 +119,13 @@ foreach(_KVAF_REQUIRED_TOKEN IN ITEMS
 endforeach()
 
 message(STATUS "KVAF HCOMM AIV API: ${_KVAF_HCOMM_HEADER}")
+if(KVAF_ASC_DEVKIT_PATH)
+  message(STATUS
+    "KVAF AscendC device headers: ${KVAF_ASC_DEVKIT_PATH}")
+else()
+  message(STATUS
+    "KVAF AscendC device headers: ${ASCEND_HOME_PATH}")
+endif()
 message(STATUS
   "KVAF HCOMM host resources: "
   "${KVAF_HCOMM_RESOURCE_INCLUDE_DIR}/hcomm/hcomm_res.h")
@@ -166,6 +202,13 @@ add_executable(kvaf_a5_aiv_urma_h2d_smoke
   src/hcomm_urma_resources.cpp
   smoke/aiv_simt_urma_h2d_smoke.cpp
 )
+
+if(KVAF_ASC_DEVKIT_INCLUDE_DIRS)
+  target_include_directories(kvaf_a5_aiv_urma_h2d_smoke
+    BEFORE PRIVATE
+      ${KVAF_ASC_DEVKIT_INCLUDE_DIRS}
+  )
+endif()
 
 target_include_directories(kvaf_a5_aiv_urma_h2d_smoke
   PRIVATE
