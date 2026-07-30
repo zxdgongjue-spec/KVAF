@@ -39,6 +39,8 @@ using kvaf::access::a5::ImportedMemoryView;
 using kvaf::access::a5::MemoryLocation;
 
 constexpr std::uint8_t kCanary = 0xa5;
+constexpr const char* kDeviceChannelCreatedMarker =
+    "device.channel_created";
 
 struct Options {
   std::string role;
@@ -338,7 +340,13 @@ int RunHost(const Options& options) {
                 << " mapped_dva=0x" << device_mapping.device_address()
                 << std::dec
                 << " bytes=" << options.bytes << '\n';
-      if (!CheckStatus(resources.CreateChannel(
+      const std::string device_channel_created =
+          JoinPath(options.exchange_dir, kDeviceChannelCreatedMarker);
+      if (!WaitForFile(device_channel_created, options.timeout_seconds)) {
+        std::cerr
+            << "timed out waiting for Device server channel creation\n";
+      } else if (
+          !CheckStatus(resources.CreateChannel(
                            MakeDeviceEndpoint(options), ChannelEngine::kCpu,
                            ChannelRole::kClient),
                        "create Host CPU channel") ||
@@ -485,8 +493,19 @@ int RunDevice(const Options& options) {
     if (!CheckStatus(resources.CreateChannel(
                          MakeHostEndpoint(options), ChannelEngine::kAiv,
                          ChannelRole::kServer),
-                     "create Device AIV channel") ||
-        !CheckStatus(
+                     "create Device AIV channel")) {
+      return 1;
+    }
+    if (!AtomicWriteText(
+            JoinPath(options.exchange_dir, kDeviceChannelCreatedMarker),
+            "KVAF_A5_CHANNEL_CREATED role=device engine=AIV "
+            "socket_role=SERVER\n")) {
+      std::cerr << "failed to publish Device server channel marker\n";
+      return 1;
+    }
+    std::cout << "KVAF_A5_CHANNEL_CREATED role=device engine=AIV "
+                 "socket_role=SERVER\n";
+    if (!CheckStatus(
             resources.WaitChannelReady(options.timeout_seconds * 1000U),
             "wait Device AIV channel")) {
       return 1;

@@ -137,8 +137,9 @@ A5 Host DDR 分配/注册、HCOMM endpoint/channel/MR 生命周期和 driver EID
 4. 创建 `ENDPOINT_LOC_TYPE_HOST`、`COMM_PROTOCOL_UBC_CTP` endpoint；
 5. 以 `COMM_MEM_TYPE_HOST` 将 HVA 注册到 HCOMM；
 6. `HcommMemExport` 导出不透明 MR 描述；
-7. 创建 `COMM_ENGINE_CPU + CLIENT` channel；
-8. 保持 DDR、DVA mapping、MR、endpoint 和 channel 存活，直到 Device
+7. 等待 Device 完成 `COMM_ENGINE_AIV + SERVER` channel 创建；
+8. 创建 `COMM_ENGINE_CPU + CLIENT` channel，并在两端轮询建链状态；
+9. 保持 DDR、DVA mapping、MR、endpoint 和 channel 存活，直到 Device
    完成。
 
 `mapped_dva` 会写入 Host 日志，作为 DDR 确实映射进 NPU 地址空间的证据。
@@ -153,11 +154,17 @@ A5 Host DDR 分配/注册、HCOMM endpoint/channel/MR 生命周期和 driver EID
 2. 创建 `ENDPOINT_LOC_TYPE_DEVICE` endpoint；
 3. 以 `COMM_MEM_TYPE_DEVICE` 注册 HBM；
 4. 创建 `COMM_ENGINE_AIV + SERVER` channel；
-5. Host 和 Device 都使用 `exchangeAllMems=true`，且所有本地 MR 都在建链前
+5. 原子发布 server channel 已创建标记，允许 Host 再创建 `CLIENT` channel；
+6. Host 和 Device 都使用 `exchangeAllMems=true`，且所有本地 MR 都在建链前
    注册；
-6. 轮询 `HcommChannelGetStatus`，只有 READY 才继续；
-7. 导入 Host MR 描述，取得 `HcommMemImport` 返回的 `view.addr`；
-8. 拒绝空地址、错误 memory type 或不足的长度，再启动 kernel。
+7. 轮询 `HcommChannelGetStatus`，只有 READY 才继续；
+8. 导入 Host MR 描述，取得 `HcommMemImport` 返回的 `view.addr`；
+9. 拒绝空地址、错误 memory type 或不足的长度，再启动 kernel。
+
+本冒烟程序显式保证 SERVER 先创建。HCOMM 的 `HcommChannelCreate` 只创建
+通道对象，后续 `HcommChannelGetStatus` 才推进建链状态机；如果 Host
+CLIENT 在 Device SERVER 尚不存在时先发起，Host 可能直接进入
+`FAILED(2)`，而 Device 只会等待超时。
 
 `view.addr` 才能进入设备 AccessTable。Host HVA、显式映射 DVA、公开逻辑
 地址和 imported view 是不同地址域，不能混用。
