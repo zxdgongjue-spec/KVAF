@@ -1,6 +1,7 @@
 #include "kvaf/access_operator/a5/aiv_simt_urma_h2d_launcher.h"
 
 #include "kernel_operator.h"
+#include "simt_api/asc_simt.h"
 #include "hcomm/hcomm.h"
 
 namespace kvaf::access::a5 {
