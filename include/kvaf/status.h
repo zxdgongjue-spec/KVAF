@@ -10,6 +10,10 @@ enum class StatusCode {
   kInvalidArgument,
   kNotInitialized,
   kNotImplemented,
+  kNotFound,
+  kAlreadyExists,
+  kBusy,
+  kInvalidState,
   kOutOfMemory,
   kInternal,
 };
