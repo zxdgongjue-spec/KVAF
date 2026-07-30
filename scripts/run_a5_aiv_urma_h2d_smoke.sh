@@ -10,6 +10,10 @@ KVAF_A5_BUILD_DIR=${KVAF_A5_BUILD_DIR:-"${ROOT_DIR}/build-a5-aiv-urma"}
 KVAF_A5_BINARY=${KVAF_A5_BINARY:-"${KVAF_A5_BUILD_DIR}/access_operator/a5/kvaf_a5_aiv_urma_h2d_smoke"}
 KVAF_HOST_EID=${KVAF_HOST_EID:-}
 KVAF_DEVICE_EID=${KVAF_DEVICE_EID:-}
+KVAF_PAIR_CHANNEL=${KVAF_PAIR_CHANNEL:-}
+KVAF_EID_PROC_ROOT=${KVAF_EID_PROC_ROOT:-/proc/asdrv_ub}
+KVAF_EID_LOCK_FILE=${KVAF_EID_LOCK_FILE:-/run/lock/kvaf_asdrv_ub_pair.lock}
+KVAF_EID_LOCK_TIMEOUT_SECONDS=${KVAF_EID_LOCK_TIMEOUT_SECONDS:-10}
 KVAF_LOGICAL_DEVICE_ID=${KVAF_LOGICAL_DEVICE_ID:-0}
 KVAF_PHYSICAL_DEVICE_ID=${KVAF_PHYSICAL_DEVICE_ID:-}
 KVAF_SUPER_DEVICE_ID=${KVAF_SUPER_DEVICE_ID:-}
@@ -80,12 +84,84 @@ if (( KVAF_H2D_BYTES > 4294967295 )); then
   echo "ERROR: KVAF_H2D_BYTES must fit the A5 URMA 32-bit SGE length" >&2
   exit 2
 fi
+if [[ -n "${KVAF_PAIR_CHANNEL}" ]]; then
+  require_uint KVAF_PAIR_CHANNEL "${KVAF_PAIR_CHANNEL}"
+fi
+
+if { [[ -n "${KVAF_HOST_EID}" ]] && [[ -z "${KVAF_DEVICE_EID}" ]]; } ||
+   { [[ -z "${KVAF_HOST_EID}" ]] && [[ -n "${KVAF_DEVICE_EID}" ]]; }; then
+  echo "ERROR: set both KVAF_HOST_EID and KVAF_DEVICE_EID, or leave both empty for driver discovery" >&2
+  exit 2
+fi
+
+if [[ -z "${KVAF_HOST_EID}" && -z "${KVAF_DEVICE_EID}" ]]; then
+  resolver_args=(
+    --physical-device-id "${KVAF_PHYSICAL_DEVICE_ID}"
+    --proc-root "${KVAF_EID_PROC_ROOT}"
+    --lock-file "${KVAF_EID_LOCK_FILE}"
+    --lock-timeout-seconds "${KVAF_EID_LOCK_TIMEOUT_SECONDS}"
+    --shell
+  )
+  if [[ -n "${KVAF_PAIR_CHANNEL}" ]]; then
+    resolver_args+=(--pair-channel "${KVAF_PAIR_CHANNEL}")
+  fi
+  if ! eid_output=$(
+    python3 "${SCRIPT_DIR}/resolve_a5_urma_eids.py" "${resolver_args[@]}"
+  ); then
+    echo "ERROR: automatic A5 Host/Device EID discovery failed" >&2
+    exit 2
+  fi
+
+  seen_host_eid=0
+  seen_device_eid=0
+  seen_pair_channel=0
+  while IFS='=' read -r key value; do
+    case "${key}" in
+      KVAF_HOST_EID)
+        if (( seen_host_eid != 0 )); then
+          echo "ERROR: EID resolver returned duplicate KVAF_HOST_EID" >&2
+          exit 2
+        fi
+        KVAF_HOST_EID=${value}
+        seen_host_eid=1
+        ;;
+      KVAF_DEVICE_EID)
+        if (( seen_device_eid != 0 )); then
+          echo "ERROR: EID resolver returned duplicate KVAF_DEVICE_EID" >&2
+          exit 2
+        fi
+        KVAF_DEVICE_EID=${value}
+        seen_device_eid=1
+        ;;
+      KVAF_PAIR_CHANNEL)
+        if (( seen_pair_channel != 0 )); then
+          echo "ERROR: EID resolver returned duplicate KVAF_PAIR_CHANNEL" >&2
+          exit 2
+        fi
+        KVAF_PAIR_CHANNEL=${value}
+        seen_pair_channel=1
+        ;;
+      *)
+        echo "ERROR: EID resolver returned an unknown record: ${key}" >&2
+        exit 2
+        ;;
+    esac
+  done <<<"${eid_output}"
+  if (( seen_host_eid == 0 ||
+        seen_device_eid == 0 ||
+        seen_pair_channel == 0 )); then
+    echo "ERROR: EID resolver output is incomplete" >&2
+    exit 2
+  fi
+  require_uint KVAF_PAIR_CHANNEL "${KVAF_PAIR_CHANNEL}"
+  echo "KVAF_A5_EID_RESOLVED source=driver_pair_info physical_device=${KVAF_PHYSICAL_DEVICE_ID} channel=${KVAF_PAIR_CHANNEL}"
+fi
 
 normalize_eid()
 {
   local value=${1//:/}
   value=${value//-/}
-  value=${value,,}
+  value=$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]')
   if ! [[ "${value}" =~ ^[0-9a-f]{32}$ ]] ||
      [[ "${value}" == "00000000000000000000000000000000" ]]; then
     return 1

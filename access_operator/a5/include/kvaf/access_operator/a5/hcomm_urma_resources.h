@@ -46,8 +46,8 @@ struct ImportedMemoryView {
   MemoryLocation location{MemoryLocation::kHostDdr};
 };
 
-// Pins an existing Host DDR allocation into one NPU address space using the
-// same halHostRegister(..., HOST_MEM_MAP_DEV, ...) lifetime used by MemCache.
+// Pins an existing Host DDR allocation into one NPU address space and owns
+// the matching halHostRegister(..., HOST_MEM_MAP_DEV, ...) lifetime.
 class HostDdrDeviceMapping {
  public:
   HostDdrDeviceMapping();

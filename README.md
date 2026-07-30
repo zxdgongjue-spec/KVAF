@@ -60,6 +60,18 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 bash scripts/build_a5_aiv_urma.sh
 ```
 
+构建成功后，正向硬件冒烟会从驱动自动解析当前物理设备的 Host/Device
+EID pair，不依赖其他代码仓：
+
+```bash
+unset KVAF_HOST_EID KVAF_DEVICE_EID KVAF_PAIR_CHANNEL
+export KVAF_LOGICAL_DEVICE_ID=0
+bash scripts/run_a5_aiv_urma_h2d_smoke.sh
+```
+
+多个 active driver pair 会被拒绝；根据错误中列出的 channel 设置
+`KVAF_PAIR_CHANNEL` 后再运行，不能默认选择 channel 0。
+
 如需编译 Python 注册模块，需要环境中提供 `pybind11`，并显式开启：
 
 ```bash

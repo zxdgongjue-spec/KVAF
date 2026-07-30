@@ -12,6 +12,7 @@ import sys
 INFO_TYPE_SDID = 26
 INFO_TYPE_SERVER_ID = 27
 INFO_TYPE_SUPER_POD_ID = 29
+UNKNOWN_SUPER_POD_ID = 0xFFFFFFFF
 
 
 class TopologyError(RuntimeError):
@@ -144,6 +145,12 @@ def main() -> int:
     except TopologyError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
+    if topology["KVAF_SUPER_POD_INDEX"] == UNKNOWN_SUPER_POD_ID:
+        print(
+            "INFO: runtime reported SuperPod 0xffffffff "
+            "(unknown/unconfigured); preserving the uint32 sentinel",
+            file=sys.stderr,
+        )
     if args.shell:
         for key, value in topology.items():
             print(f"{key}={value}")

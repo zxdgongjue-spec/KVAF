@@ -74,15 +74,14 @@ producer 竞争。
   SIMT；
 - `shmem/CMakeLists.txt`：新旧 bisheng 的 `xasc/xcce`、A5 架构参数与
   fat-object 链接；
-- `memcache/third_party/memcache/3rdparty/memfabric_hybrid/src/hybm/csrc/mm/hybm_conn_based_segment.cpp`：
-  A5 Host DDR 的 `halMemAlloc` 路径；
-- `memcache/third_party/memcache/3rdparty/memfabric_hybrid/src/hybm/csrc/transport/device/urma/device_urma_transport_manager.cpp`：
-  Host/Device endpoint、MR 导入导出与 mixed channel；
 - `asc-devkit/tests/api/adv_api/hcomm/test_hcomm_urma_950.cpp`：HCOMM URMA
   workspace 清零、`ReadNbi/Commit/Drain` 语义；
 - `UB_MicroBenchmark/src/operator/AIV_URMA/new_single_op/aiv_urma.h`：作为
   raw WQE/SIMT 行为的交叉检查。本分支没有复制它的私有 SQ/CQ 写法，而是
   保持在公开 HCOMM API 上。
+
+A5 Host DDR 分配/注册、HCOMM endpoint/channel/MR 生命周期和 driver EID
+发现均在 KVAF 内独立封装；构建和运行不要求下载其他业务代码仓。
 
 ## 3. 固定 ABI 和最小语义
 
@@ -126,9 +125,8 @@ producer 竞争。
 ### 4.1 Host 角色
 
 1. 动态加载 `libascend_hal.so` 并解析分配、注册和释放符号；
-2. 按 MemCache 路径调用
-   `halMemAlloc(MEM_HOST | MEM_TYPE_DDR | MEM_PAGE_NORMAL)` 分配并填充
-   Host DDR；
+2. 调用 `halMemAlloc(MEM_HOST | MEM_TYPE_DDR | MEM_PAGE_NORMAL)` 分配并
+   填充 Host DDR；
 3. 调用：
 
    ```text
@@ -265,33 +263,44 @@ export KVAF_ASC_DEVKIT_PATH=/path/to/asc-devkit
 bash scripts/build_a5_aiv_urma.sh
 ```
 
-推荐使用 memcache 已有的 driver pair resolver 读取
-`/proc/asdrv_ub/{dev_id,pair_info}`，不要手工猜 EID：
+运行脚本会先查询 logical/physical device 映射和 HCOMM endpoint 拓扑。
+如果没有显式设置 EID，它会调用 KVAF 自带的最小 resolver，通过
+`/run/lock/kvaf_asdrv_ub_pair.lock` 协作锁串行化对
+`/proc/asdrv_ub/dev_id` selector 的写入和 `pair_info` 快照读取，再把
+`local_eid` 作为 Host EID、`remote_eid` 作为 Device EID：
 
 ```bash
-python3 /path/to/memcache/scripts/resolve_a5_urma_pair_eids.py \
-  --device-map 0:0 \
-  --pair-channel 0:0 \
-  --eid-file /tmp/kvaf_device_eid.txt \
-  --host-eid-file /tmp/kvaf_host_eid.txt \
-  --manifest /tmp/kvaf_pair_manifest.json
-
-export KVAF_HOST_EID=$(awk '$1 == "0:" {print $2}' /tmp/kvaf_host_eid.txt)
-export KVAF_DEVICE_EID=$(awk '$1 == "0:" {print $2}' /tmp/kvaf_device_eid.txt)
+unset KVAF_HOST_EID KVAF_DEVICE_EID KVAF_PAIR_CHANNEL
 export KVAF_LOGICAL_DEVICE_ID=0
 bash scripts/run_a5_aiv_urma_h2d_smoke.sh
 ```
 
-若 `pair_info` 中选中的 active channel 不是 0，相应修改
-`--pair-channel 0:<channel>`。示例中的 `--device-map 0:0` 只表示
-logical 0 对应 physical 0；服务器映射不同时必须换成真实值。
+若驱动为同一物理设备报告多个 active pair，resolver 会拒绝猜测并列出
+channel。确认实际 channel 后重跑：
 
-运行脚本会调用 `scripts/query_a5_topology.py`，从 ACL/runtime 查询 physical
-device、SDID、server ID 和 super-pod ID。如果要单独检查：
+```bash
+export KVAF_PAIR_CHANNEL=<实际通道号>
+bash scripts/run_a5_aiv_urma_h2d_smoke.sh
+```
+
+resolver 也可以单独检查；参数使用物理设备号：
+
+```bash
+python3 scripts/resolve_a5_urma_eids.py \
+  --physical-device-id 0 \
+  --shell
+```
+
+运行脚本调用 `scripts/query_a5_topology.py`，从 ACL/runtime 查询 physical
+device、SDID、server ID 和 super-pod ID。单独检查：
 
 ```bash
 python3 scripts/query_a5_topology.py --logical-device-id 0 --shell
 ```
+
+`KVAF_SUPER_POD_INDEX=4294967295`（`0xffffffff`）表示 runtime 未配置或
+无法提供 SuperPod，而不是实际索引。本单机 H2D 用例按 HCOMM 的 uint32 ABI
+原样传递该哨兵；跨 Server/SuperPod 的 D2D 路由不能据此判定可达。
 
 只有同时出现以下证据才算正向用例通过：
 
@@ -345,7 +354,7 @@ bash scripts/run_a5_aiv_urma_h2d_smoke.sh
 - 生产级 bootstrap。冒烟程序只用同机文件交换不透明 MR 描述；
 - 性能调优和大 batch 分块。
 
-另外，KVAF、SHMEM 和 memcache 源码中没有可验证的 `SMIT` API 调用。
+另外，KVAF 和 SHMEM 源码中没有可验证的 `SMIT` API 调用。
 当前能证明的是 HCOMM `UBC_CTP` + AIV engine + URMA Read API；底层是否由
 特定版本的 SMIT 驱动，必须由 CANN/HCOMM provider 文档或服务器 B 的驱动
 trace 证明，不能只凭本仓源码断言。

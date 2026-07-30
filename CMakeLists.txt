@@ -12,6 +12,18 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(CTest)
 
+if(BUILD_TESTING)
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    add_test(
+      NAME kvaf_a5_eid_resolver_test
+      COMMAND
+        "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_resolve_a5_urma_eids.py"
+    )
+  endif()
+endif()
+
 add_subdirectory(meta_manager)
 add_subdirectory(access_operator)
 add_subdirectory(runtime)
