@@ -23,6 +23,7 @@
 namespace {
 
 using kvaf::Status;
+using kvaf::access::AivDirectUrmaChannel;
 using kvaf::access::DeviceBatchGetParams;
 using kvaf::access::DeviceBatchState;
 using kvaf::access::DeviceBatchStatus;
@@ -388,6 +389,7 @@ struct DeviceAllocations {
   UrmaH2DDescriptor* descriptors{nullptr};
   DeviceBatchGetParams* params{nullptr};
   DeviceCompletion* completion{nullptr};
+  AivDirectUrmaChannel* direct_channel{nullptr};
 
   ~DeviceAllocations() {
     (void)Close();
@@ -404,6 +406,7 @@ struct DeviceAllocations {
       }
       pointer = nullptr;
     };
+    release(direct_channel);
     release(completion);
     release(params);
     release(descriptors);
@@ -431,7 +434,8 @@ bool AllocateDeviceInputs(std::uint64_t output_bytes,
          AllocateDevice(request_entries, &allocations->output_offsets) &&
          AllocateDevice(request_entries, &allocations->descriptors) &&
          AllocateDevice(1, &allocations->params) &&
-         AllocateDevice(1, &allocations->completion);
+         AllocateDevice(1, &allocations->completion) &&
+         AllocateDevice(1, &allocations->direct_channel);
 }
 
 int RunDevice(const Options& options) {
@@ -478,6 +482,7 @@ int RunDevice(const Options& options) {
   {
     HcommUrmaResources resources;
     ImportedMemoryView imported{};
+    AivDirectUrmaChannel direct_channel{};
     std::uint32_t output_registration = 0;
     if (!CheckStatus(resources.OpenEndpoint(MakeDeviceEndpoint(options)),
                      "open Device endpoint") ||
@@ -520,8 +525,10 @@ int RunDevice(const Options& options) {
       return 1;
     }
     std::cout << "KVAF_A5_CHANNEL_READY role=device engine=AIV\n";
-    if (!CheckStatus(resources.ImportMemory(descriptor, &imported),
-                     "import Host DDR MR")) {
+    if (!CheckStatus(
+            resources.ImportMemory(
+                descriptor, MemoryLocation::kHostDdr, &imported),
+            "import Host DDR MR")) {
       return 1;
     }
     if (imported.location != MemoryLocation::kHostDdr ||
@@ -537,6 +544,21 @@ int RunDevice(const Options& options) {
     std::cout << "KVAF_A5_DDR_IMPORTED"
               << " npu_view=0x" << std::hex << imported.address << std::dec
               << " bytes=" << imported.bytes << " type=HOST\n";
+    if (!CheckStatus(
+            resources.SnapshotDirectChannel(
+                reinterpret_cast<std::uint64_t>(allocations.output),
+                allocation_bytes, imported.address, options.bytes,
+                &direct_channel),
+            "snapshot direct AIV URMA channel")) {
+      return 1;
+    }
+    std::cout << "KVAF_A5_DIRECT_URMA_READY"
+              << " sq_depth=" << direct_channel.sq_depth
+              << " cq_depth=" << direct_channel.cq_depth
+              << " wqe_size=" << direct_channel.wqe_size
+              << " cqe_size=" << direct_channel.cqe_size
+              << " tp_id=" << direct_channel.tp_id
+              << " token_id=" << direct_channel.remote_token_id << '\n';
 
     std::vector<std::uint64_t> remote_addresses(active_descriptor_count);
     std::vector<std::uint64_t> lengths(active_descriptor_count);
@@ -611,7 +633,8 @@ int RunDevice(const Options& options) {
         !CopyHostToDevice(allocations.descriptors,
                           empty_descriptors.data(), request_count) ||
         !CopyHostToDevice(allocations.completion, &empty_completion, 1) ||
-        !CopyHostToDevice(allocations.params, &params, 1)) {
+        !CopyHostToDevice(allocations.params, &params, 1) ||
+        !CopyHostToDevice(allocations.direct_channel, &direct_channel, 1)) {
       return 1;
     }
 
@@ -621,7 +644,7 @@ int RunDevice(const Options& options) {
     }
     kvaf::access::a5::LaunchAivSimtUrmaH2D(
         stream, allocations.params, allocations.completion,
-        resources.channel());
+        allocations.direct_channel);
     const bool synchronized =
         CheckAcl(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream");
     const bool stream_destroyed =
@@ -631,15 +654,27 @@ int RunDevice(const Options& options) {
     }
 
     DeviceCompletion completion{};
+    AivDirectUrmaChannel completed_channel{};
+    AivDirectUrmaChannel hcomm_channel_after{};
     std::vector<UrmaH2DDescriptor> completed_descriptors(request_count);
     std::vector<std::uint8_t> output(allocation_bytes);
     if (!CopyDeviceToHost(&completion, allocations.completion, 1) ||
+        !CopyDeviceToHost(&completed_channel,
+                          allocations.direct_channel, 1) ||
         !CopyDeviceToHost(completed_descriptors.data(),
                           allocations.descriptors, request_count) ||
         !CheckAcl(
             aclrtMemcpy(output.data(), allocation_bytes, allocations.output,
                         allocation_bytes, ACL_MEMCPY_DEVICE_TO_HOST),
             "copy output to Host")) {
+      return 1;
+    }
+    if (!CheckStatus(
+            resources.SnapshotDirectChannel(
+                reinterpret_cast<std::uint64_t>(allocations.output),
+                allocation_bytes, imported.address, options.bytes,
+                &hcomm_channel_after),
+            "resnapshot direct AIV URMA channel after completion")) {
       return 1;
     }
 
@@ -651,7 +686,17 @@ int RunDevice(const Options& options) {
         completion.planned_count == active_descriptor_count &&
         completion.submitted_count == active_descriptor_count &&
         completion.completed_count == active_descriptor_count &&
-        completion.first_failed_index == kvaf::access::kNoFailedIndex;
+        completion.first_failed_index == kvaf::access::kNoFailedIndex &&
+        completed_channel.sq_head - direct_channel.sq_head ==
+            active_descriptor_count &&
+        completed_channel.wqe_count - direct_channel.wqe_count ==
+            active_descriptor_count &&
+        completed_channel.cq_tail - direct_channel.cq_tail ==
+            active_descriptor_count &&
+        completed_channel.wqe_count == completed_channel.cq_tail &&
+        hcomm_channel_after.sq_head == completed_channel.sq_head &&
+        hcomm_channel_after.wqe_count == completed_channel.wqe_count &&
+        hcomm_channel_after.cq_tail == completed_channel.cq_tail;
     for (std::size_t request = 0;
          request < active_descriptor_count && valid_result; ++request) {
       const std::size_t table_index = indices[request];

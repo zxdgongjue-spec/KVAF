@@ -30,9 +30,10 @@ case "${KVAF_A5_COMPILE_MODE}" in
 esac
 
 if [[ -z "${KVAF_ASC_DEVKIT_PATH}" &&
-      ! -r "${ASCEND_HOME_PATH}/include/adv_api/hcomm/hcomm.h" &&
-      ! -r "${ASCEND_HOME_PATH}/$(uname -m)-linux/include/adv_api/hcomm/hcomm.h" &&
-      -r "${ROOT_DIR}/../asc-devkit/include/adv_api/hcomm/hcomm.h" ]]; then
+      ( ! -r "${ASCEND_HOME_PATH}/include/kernel_operator.h" ||
+        ! -r "${ASCEND_HOME_PATH}/include/simt_api/asc_simt.h" ) &&
+      -r "${ROOT_DIR}/../asc-devkit/include/kernel_operator.h" &&
+      -r "${ROOT_DIR}/../asc-devkit/include/simt_api/asc_simt.h" ]]; then
   KVAF_ASC_DEVKIT_PATH="${ROOT_DIR}/../asc-devkit"
 fi
 
@@ -43,10 +44,8 @@ cmake_args=(
   -DCMAKE_CXX_COMPILER="${KVAF_BISHENG}"
   -DKVAF_BUILD_A5_AIV_URMA=ON
   -DKVAF_A5_COMPILE_MODE="${KVAF_A5_COMPILE_MODE}"
+  "-DKVAF_ASC_DEVKIT_PATH=${KVAF_ASC_DEVKIT_PATH}"
 )
-if [[ -n "${KVAF_ASC_DEVKIT_PATH}" ]]; then
-  cmake_args+=("-DKVAF_ASC_DEVKIT_PATH=${KVAF_ASC_DEVKIT_PATH}")
-fi
 
 cmake "${cmake_args[@]}"
 cmake --build "${KVAF_A5_BUILD_DIR}" \

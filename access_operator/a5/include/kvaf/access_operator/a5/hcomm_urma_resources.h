@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "kvaf/access_operator/aiv_simt_urma_h2d.h"
 #include "kvaf/status.h"
 #include "kvaf/types.h"
 
@@ -71,8 +72,10 @@ class HostDdrDeviceMapping {
   std::unique_ptr<Impl> impl_;
 };
 
-// Thin ownership wrapper around the HCOMM resource API. QP/CQ/token details
-// intentionally remain opaque and never enter KVAF's stable Runtime ABI.
+// Ownership wrapper around the HCOMM Host resource API. HCOMM creates and
+// exchanges the Endpoint, MR, EID, TP, Jetty, SQ and CQ resources. Once the
+// AIV channel is READY, SnapshotDirectChannel copies only the versioned queue
+// and token metadata required by KVAF's direct device data plane.
 class HcommUrmaResources {
  public:
   HcommUrmaResources();
@@ -88,11 +91,17 @@ class HcommUrmaResources {
   Status ExportMemory(std::uint32_t registration_id,
                       std::vector<std::uint8_t>* descriptor) const;
   Status ImportMemory(const std::vector<std::uint8_t>& descriptor,
+                      MemoryLocation expected_location,
                       ImportedMemoryView* view);
   Status CreateChannel(const EndpointSpec& peer, ChannelEngine engine,
                        ChannelRole role);
   Status PollChannelReady(bool* ready);
   Status WaitChannelReady(std::uint32_t timeout_ms);
+  Status SnapshotDirectChannel(Address local_address,
+                               std::uint64_t local_bytes,
+                               Address remote_address,
+                               std::uint64_t remote_bytes,
+                               AivDirectUrmaChannel* direct_channel) const;
 
   std::uint64_t channel() const;
   Status Close();

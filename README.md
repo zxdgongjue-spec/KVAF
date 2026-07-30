@@ -1,7 +1,8 @@
 # KVAF
 
 当前仓库在原有模块骨架上增加了第一条可执行数据路径：
-**AIV + SIMT + HCOMM/URMA + Host DDR 到 Device HBM（H2D）**。
+**Host HCOMM 建链 + AIV/SIMT 直写 URMA SQ/CQ + Host DDR 到 Device
+HBM（H2D）**。
 
 该路径是完整 KVAF 的最小子集，不包含分布式 Meta、BatchPut、vLLM
 适配或图捕获。设计边界、真实完成状态以及 PC A / 服务器 B / 远端仓 C

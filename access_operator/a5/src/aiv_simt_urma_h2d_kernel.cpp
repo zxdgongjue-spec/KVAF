@@ -2,17 +2,28 @@
 
 #include "kernel_operator.h"
 #include "simt_api/asc_simt.h"
-#include "hcomm/hcomm.h"
 
 namespace kvaf::access::a5 {
 namespace {
 
+using kvaf::access::AivDirectUrmaChannel;
 using kvaf::access::DeviceBatchGetParams;
 using kvaf::access::DeviceBatchState;
 using kvaf::access::DeviceBatchStatus;
 using kvaf::access::DeviceCompletion;
 using kvaf::access::TransferState;
 using kvaf::access::UrmaH2DDescriptor;
+
+constexpr std::uint32_t kDirectChannelTokenEnabled = 1U;
+constexpr std::uint32_t kUrmaReadOpcode = 6U;
+constexpr std::uint32_t kUrmaDefaultFlags =
+    5U | (1U << 3U) | (1U << 5U);  // strong order, fence, CQE
+constexpr std::uint32_t kUrmaWqeWords = 16U;
+constexpr std::uint32_t kUrmaCqeWords = 16U;
+constexpr std::uint32_t kUrmaQueueEntryBytes = 64U;
+constexpr std::uint32_t kUrmaCqMaxRetries = 1000000U;
+constexpr std::uint32_t kUrmaCqTimeout = 0xffffffffU;
+constexpr std::uint32_t kUrmaScratchBytes = 512U;
 
 __simt_callee__ inline void SetDescriptorFailure(
     __gm__ UrmaH2DDescriptor* descriptor, DeviceBatchStatus status) {
@@ -21,9 +32,11 @@ __simt_callee__ inline void SetDescriptorFailure(
 }
 
 __aicore__ inline void SetDescriptorFailureAiv(
-    __gm__ UrmaH2DDescriptor* descriptor, DeviceBatchStatus status) {
+    __gm__ UrmaH2DDescriptor* descriptor, DeviceBatchStatus status,
+    std::uint32_t detail = 0) {
   descriptor->state = static_cast<std::uint32_t>(TransferState::kFailed);
   descriptor->status = static_cast<std::uint32_t>(status);
+  descriptor->reserved0 = detail;
 }
 
 __simt_vf__ __launch_bounds__(kAivUrmaSimtLanes) inline void
@@ -111,17 +124,194 @@ BuildH2DDescriptorsSimt(__gm__ const DeviceBatchGetParams* params) {
 
 __aicore__ inline void SetCompletionFailure(
     __gm__ DeviceCompletion* completion, DeviceBatchStatus status,
-    std::uint32_t first_failed_index) {
+    std::uint32_t first_failed_index, std::uint32_t detail = 0) {
   completion->state =
       static_cast<std::uint32_t>(DeviceBatchState::kFailed);
   completion->status = static_cast<std::uint32_t>(status);
   completion->first_failed_index = first_failed_index;
+  completion->reserved0 = detail;
+}
+
+__aicore__ inline bool IsPowerOfTwo(std::uint32_t value) {
+  return value != 0 && (value & (value - 1U)) == 0;
+}
+
+__aicore__ inline bool RangeContains(
+    std::uint64_t base, std::uint64_t capacity,
+    std::uint64_t address, std::uint64_t bytes) {
+  return address >= base && bytes <= capacity &&
+         address - base <= capacity - bytes;
+}
+
+__aicore__ inline bool DirectChannelIsValid(
+    __gm__ const AivDirectUrmaChannel* channel) {
+  return channel != nullptr &&
+         channel->abi_version == kAivUrmaAbiVersion &&
+         (channel->flags & kDirectChannelTokenEnabled) != 0 &&
+         channel->sq_base != 0 && channel->sq_doorbell != 0 &&
+         channel->cq_base != 0 && channel->cq_doorbell != 0 &&
+         channel->sq_head_address != 0 &&
+         channel->sq_tail_address != 0 &&
+         channel->cq_tail_address != 0 &&
+         channel->remote_base != 0 && channel->remote_bytes != 0 &&
+         channel->local_base != 0 && channel->local_bytes != 0 &&
+         channel->wqe_size == kUrmaQueueEntryBytes &&
+         channel->cqe_size == kUrmaQueueEntryBytes &&
+         IsPowerOfTwo(channel->sq_depth) &&
+         IsPowerOfTwo(channel->cq_depth) &&
+         channel->tp_id < (1U << 24U) &&
+         channel->remote_token_id < (1U << 20U) &&
+         (channel->remote_eid_low != 0 ||
+          channel->remote_eid_high != 0) &&
+         channel->sq_head == channel->cq_tail &&
+         channel->wqe_count == channel->cq_tail;
+}
+
+__aicore__ inline void FillReadWqe(
+    __ubuf__ std::uint32_t* words,
+    __gm__ const AivDirectUrmaChannel* channel,
+    std::uint32_t sq_head, std::uint64_t remote_address,
+    std::uint64_t local_address, std::uint32_t bytes) {
+  for (std::uint32_t index = 0; index < kUrmaWqeWords; ++index) {
+    words[index] = 0;
+  }
+
+  const std::uint32_t owner =
+      ((sq_head / channel->sq_depth) & 1U) == 0 ? 1U : 0U;
+  words[0] = (kUrmaDefaultFlags << 16U) |
+             (1U << 28U) |  // token enable
+             (1U << 29U) |  // remote object is a Jetty/segment id
+             (owner << 31U);
+  words[1] = kUrmaReadOpcode << 8U;
+  words[2] = channel->tp_id | (1U << 24U);
+  words[3] = channel->remote_token_id;
+  words[4] = static_cast<std::uint32_t>(channel->remote_eid_low);
+  words[5] =
+      static_cast<std::uint32_t>(channel->remote_eid_low >> 32U);
+  words[6] = static_cast<std::uint32_t>(channel->remote_eid_high);
+  words[7] =
+      static_cast<std::uint32_t>(channel->remote_eid_high >> 32U);
+  words[8] = channel->remote_token_value;
+  words[10] = static_cast<std::uint32_t>(remote_address);
+  words[11] = static_cast<std::uint32_t>(remote_address >> 32U);
+  words[12] = bytes;
+  words[13] = 0;  // HCOMM and SHMEM leave the local SGE token disabled.
+  words[14] = static_cast<std::uint32_t>(local_address);
+  words[15] = static_cast<std::uint32_t>(local_address >> 32U);
+}
+
+__aicore__ inline bool PostDirectRead(
+    __gm__ AivDirectUrmaChannel* channel,
+    const AscendC::LocalTensor<std::uint32_t>& wqe_tensor,
+    __ubuf__ std::uint32_t* wqe_words,
+    std::uint64_t remote_address, std::uint64_t local_address,
+    std::uint32_t bytes) {
+  const std::uint32_t sq_head = channel->sq_head;
+  const std::uint32_t wqe_count = channel->wqe_count;
+  const std::uint32_t outstanding = wqe_count - channel->cq_tail;
+  if (outstanding >= channel->sq_depth ||
+      outstanding >= channel->cq_depth) {
+    return false;
+  }
+
+  FillReadWqe(wqe_words, channel, sq_head, remote_address,
+              local_address, bytes);
+  const std::uint64_t sqe_address =
+      channel->sq_base +
+      static_cast<std::uint64_t>(channel->wqe_size) *
+          (sq_head & (channel->sq_depth - 1U));
+  AscendC::GlobalTensor<std::uint32_t> sqe_global;
+  sqe_global.SetGlobalBuffer(
+      reinterpret_cast<__gm__ std::uint32_t*>(sqe_address));
+  AscendC::SyncAction<AscendC::HardEvent::S_MTE3>();
+  AscendC::DataCopy(sqe_global, wqe_tensor, kUrmaWqeWords);
+  AscendC::SyncAction<AscendC::HardEvent::MTE3_S>();
+
+  const std::uint32_t next_head = sq_head + 1U;
+  const std::uint32_t next_wqe_count = wqe_count + 1U;
+  const std::uint64_t packed_head =
+      static_cast<std::uint64_t>(next_head) |
+      (static_cast<std::uint64_t>(next_wqe_count) << 32U);
+  st_dev(packed_head,
+         reinterpret_cast<__gm__ std::uint64_t*>(
+             channel->sq_head_address),
+         0);
+  channel->sq_head = next_head;
+  channel->wqe_count = next_wqe_count;
+  st_dev(next_head,
+         reinterpret_cast<__gm__ std::uint32_t*>(
+             channel->sq_doorbell),
+         0);
+  return true;
+}
+
+__aicore__ inline std::uint32_t PollDirectCq(
+    __gm__ AivDirectUrmaChannel* channel,
+    const AscendC::LocalTensor<std::uint32_t>& cqe_tensor,
+    __ubuf__ std::uint32_t* cqe_words,
+    std::uint32_t expected_tail) {
+  std::uint32_t current_tail = channel->cq_tail;
+  while (current_tail != expected_tail) {
+    const std::uint64_t cqe_address =
+        channel->cq_base +
+        static_cast<std::uint64_t>(channel->cqe_size) *
+            (current_tail & (channel->cq_depth - 1U));
+    AscendC::GlobalTensor<std::uint32_t> cqe_global;
+    cqe_global.SetGlobalBuffer(
+        reinterpret_cast<__gm__ std::uint32_t*>(cqe_address));
+
+    const std::uint32_t expected_phase =
+        (current_tail / channel->cq_depth) & 1U;
+    bool valid = false;
+    for (std::uint32_t retry = 0; retry < kUrmaCqMaxRetries;
+         ++retry) {
+      AscendC::SyncAction<AscendC::HardEvent::S_MTE2>();
+      AscendC::DataCopy(cqe_tensor, cqe_global, kUrmaCqeWords);
+      AscendC::SyncAction<AscendC::HardEvent::MTE2_S>();
+      const std::uint32_t owner = (cqe_words[0] >> 2U) & 1U;
+      if ((expected_phase ^ owner) != 0) {
+        valid = true;
+        break;
+      }
+    }
+    if (!valid) {
+      return kUrmaCqTimeout;
+    }
+
+    const std::uint32_t substatus =
+        (cqe_words[0] >> 16U) & 0xffU;
+    const std::uint32_t status =
+        (cqe_words[0] >> 24U) & 0xffU;
+    if (status != 0 || substatus != 0) {
+      return (status << 8U) | substatus;
+    }
+    ++current_tail;
+  }
+
+  channel->cq_tail = current_tail;
+  st_dev(current_tail,
+         reinterpret_cast<__gm__ std::uint32_t*>(
+             channel->cq_tail_address),
+         0);
+  st_dev(current_tail & 0x00ffffffU,
+         reinterpret_cast<__gm__ std::uint32_t*>(
+             channel->cq_doorbell),
+         0);
+  st_dev(current_tail,
+         reinterpret_cast<__gm__ std::uint32_t*>(
+             channel->sq_tail_address),
+         0);
+  return 0;
 }
 
 extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void
 KvafAivSimtUrmaH2DKernel(
     __gm__ const DeviceBatchGetParams* params,
-    __gm__ DeviceCompletion* completion, std::uint64_t hcomm_channel) {
+    __gm__ DeviceCompletion* completion,
+    __gm__ AivDirectUrmaChannel* direct_channel) {
+  if (completion == nullptr) {
+    return;
+  }
   completion->abi_version = kAivUrmaAbiVersion;
   completion->state =
       static_cast<std::uint32_t>(DeviceBatchState::kPlanning);
@@ -159,7 +349,7 @@ KvafAivSimtUrmaH2DKernel(
       (params->table.remote_addresses == 0 || params->table.lengths == 0 ||
        params->indices == 0 || params->output_offsets == 0 ||
        params->descriptors == 0 || params->output_base == 0 ||
-       hcomm_channel == 0)) {
+       direct_channel == nullptr)) {
     SetCompletionFailure(completion, DeviceBatchStatus::kNullAddress, 0);
     return;
   }
@@ -193,85 +383,92 @@ KvafAivSimtUrmaH2DKernel(
         static_cast<std::uint32_t>(DeviceBatchState::kComplete);
     return;
   }
-
-  AscendC::TPipe pipe;
-  AscendC::TBuf<AscendC::TPosition::VECOUT> hcomm_buffer;
-  pipe.InitBuffer(hcomm_buffer, AscendC::HCOMM_URMA_TMP_BUF_SIZE);
-  auto local_buffer = hcomm_buffer.Get<std::uint8_t>();
-  auto* local_buffer_address = reinterpret_cast<__ubuf__ std::uint8_t*>(
-      local_buffer.GetPhyAddr());
-  for (std::uint32_t offset = 0;
-       offset < AscendC::HCOMM_URMA_TMP_BUF_SIZE; ++offset) {
-    local_buffer_address[offset] = 0;
-  }
-
-  AscendC::Hcomm<AscendC::COMM_PROTOCOL_UBC_CTP> hcomm;
-  if (hcomm.Init(local_buffer_address,
-                 AscendC::HCOMM_URMA_TMP_BUF_SIZE) != 0) {
-    SetCompletionFailure(completion,
-                         DeviceBatchStatus::kHcommInitFailed,
-                         kNoFailedIndex);
+  if (!DirectChannelIsValid(direct_channel)) {
+    SetCompletionFailure(
+        completion, DeviceBatchStatus::kDirectChannelInvalid,
+        kNoFailedIndex);
     return;
   }
 
-  completion->state =
-      static_cast<std::uint32_t>(DeviceBatchState::kSubmitting);
-  std::uint32_t enqueued_count = 0;
-  std::uint32_t failed_request = kNoFailedIndex;
+  // Preflight every descriptor against the exact local and remote MRs before
+  // ringing the first SQ doorbell. This preserves the planner's no-submit-on-
+  // validation-error contract.
   for (std::uint32_t request = 0; request < params->entry_count; ++request) {
     __gm__ UrmaH2DDescriptor* descriptor = &descriptors[request];
     if (descriptor->state !=
         static_cast<std::uint32_t>(TransferState::kReady)) {
       continue;
     }
-    const auto result = hcomm.ReadNbi<false>(
-        static_cast<AscendC::ChannelHandle>(hcomm_channel),
-        reinterpret_cast<GM_ADDR>(descriptor->local_addr),
-        reinterpret_cast<GM_ADDR>(descriptor->remote_addr),
-        descriptor->bytes);
-    if (result != 0) {
-      SetDescriptorFailureAiv(descriptor,
-                              DeviceBatchStatus::kHcommReadFailed);
-      failed_request = request;
-      break;
+    if (!RangeContains(direct_channel->remote_base,
+                       direct_channel->remote_bytes,
+                       descriptor->remote_addr, descriptor->bytes)) {
+      SetDescriptorFailureAiv(
+          descriptor, DeviceBatchStatus::kDirectRemoteRangeInvalid);
+      SetCompletionFailure(
+          completion, DeviceBatchStatus::kDirectRemoteRangeInvalid,
+          request);
+      return;
+    }
+    if (!RangeContains(direct_channel->local_base,
+                       direct_channel->local_bytes,
+                       descriptor->local_addr, descriptor->bytes)) {
+      SetDescriptorFailureAiv(
+          descriptor, DeviceBatchStatus::kDirectLocalRangeInvalid);
+      SetCompletionFailure(
+          completion, DeviceBatchStatus::kDirectLocalRangeInvalid,
+          request);
+      return;
+    }
+  }
+
+  AscendC::TPipe pipe;
+  AscendC::TBuf<AscendC::TPosition::VECOUT> direct_scratch;
+  pipe.InitBuffer(direct_scratch, kUrmaScratchBytes);
+  auto wqe_tensor = direct_scratch.Get<std::uint32_t>();
+  auto cqe_tensor = wqe_tensor[kUrmaWqeWords];
+  auto* wqe_words = reinterpret_cast<__ubuf__ std::uint32_t*>(
+      wqe_tensor.GetPhyAddr());
+  auto* cqe_words = reinterpret_cast<__ubuf__ std::uint32_t*>(
+      cqe_tensor.GetPhyAddr());
+
+  completion->state =
+      static_cast<std::uint32_t>(DeviceBatchState::kSubmitting);
+  for (std::uint32_t request = 0; request < params->entry_count; ++request) {
+    __gm__ UrmaH2DDescriptor* descriptor = &descriptors[request];
+    if (descriptor->state !=
+        static_cast<std::uint32_t>(TransferState::kReady)) {
+      continue;
+    }
+
+    if (!PostDirectRead(
+            direct_channel, wqe_tensor, wqe_words,
+            descriptor->remote_addr, descriptor->local_addr,
+            static_cast<std::uint32_t>(descriptor->bytes))) {
+      SetDescriptorFailureAiv(
+          descriptor, DeviceBatchStatus::kDirectChannelInvalid);
+      SetCompletionFailure(
+          completion, DeviceBatchStatus::kDirectChannelInvalid, request);
+      return;
     }
     descriptor->state =
         static_cast<std::uint32_t>(TransferState::kSubmitted);
-    ++enqueued_count;
     ++completion->submitted_count;
-  }
 
-  if (enqueued_count != 0) {
-    if (hcomm.Commit(
-            static_cast<AscendC::ChannelHandle>(hcomm_channel)) != 0) {
-      SetCompletionFailure(completion,
-                           DeviceBatchStatus::kHcommCommitFailed,
-                           kNoFailedIndex);
+    const std::uint32_t cq_result = PollDirectCq(
+        direct_channel, cqe_tensor, cqe_words,
+        direct_channel->wqe_count);
+    if (cq_result != 0) {
+      const DeviceBatchStatus status =
+          cq_result == kUrmaCqTimeout
+              ? DeviceBatchStatus::kDirectCqTimeout
+              : DeviceBatchStatus::kDirectCqError;
+      SetDescriptorFailureAiv(descriptor, status, cq_result);
+      SetCompletionFailure(completion, status, request, cq_result);
       return;
     }
-    if (hcomm.Drain(
-            static_cast<AscendC::ChannelHandle>(hcomm_channel)) != 0) {
-      SetCompletionFailure(completion,
-                           DeviceBatchStatus::kHcommDrainFailed,
-                           kNoFailedIndex);
-      return;
-    }
-  }
-
-  for (std::uint32_t request = 0; request < params->entry_count; ++request) {
-    if (descriptors[request].state ==
-        static_cast<std::uint32_t>(TransferState::kSubmitted)) {
-      descriptors[request].state =
-          static_cast<std::uint32_t>(TransferState::kComplete);
-      ++completion->completed_count;
-    }
-  }
-
-  if (failed_request != kNoFailedIndex) {
-    SetCompletionFailure(completion,
-                         DeviceBatchStatus::kHcommReadFailed,
-                         failed_request);
-    return;
+    descriptor->state =
+        static_cast<std::uint32_t>(TransferState::kComplete);
+    ++completion->completed_count;
   }
 
   completion->state =
@@ -282,9 +479,10 @@ KvafAivSimtUrmaH2DKernel(
 
 void LaunchAivSimtUrmaH2D(
     void* stream, const DeviceBatchGetParams* device_params,
-    DeviceCompletion* device_completion, std::uint64_t hcomm_channel) {
+    DeviceCompletion* device_completion,
+    AivDirectUrmaChannel* direct_channel) {
   KvafAivSimtUrmaH2DKernel<<<1, nullptr, stream>>>(
-      device_params, device_completion, hcomm_channel);
+      device_params, device_completion, direct_channel);
 }
 
 }  // namespace kvaf::access::a5

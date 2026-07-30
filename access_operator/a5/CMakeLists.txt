@@ -34,13 +34,10 @@ set(KVAF_ASC_DEVKIT_INCLUDE_DIRS)
 if(KVAF_ASC_DEVKIT_PATH)
   get_filename_component(KVAF_ASC_DEVKIT_PATH
     "${KVAF_ASC_DEVKIT_PATH}" ABSOLUTE)
-  set(_KVAF_HCOMM_ADV_INCLUDE_DIR
-    "${KVAF_ASC_DEVKIT_PATH}/include/adv_api")
   foreach(_KVAF_ASC_DEVKIT_REQUIRED_FILE IN ITEMS
       include/kernel_operator.h
       include/basic_api/kernel_basic_intf.h
-      include/adv_api/kernel_api.h
-      include/adv_api/hcomm/hcomm.h)
+      include/simt_api/asc_simt.h)
     if(NOT EXISTS
         "${KVAF_ASC_DEVKIT_PATH}/${_KVAF_ASC_DEVKIT_REQUIRED_FILE}")
       message(FATAL_ERROR
@@ -48,9 +45,9 @@ if(KVAF_ASC_DEVKIT_PATH)
         "${KVAF_ASC_DEVKIT_PATH}/${_KVAF_ASC_DEVKIT_REQUIRED_FILE}")
     endif()
   endforeach()
-  # kernel_operator.h pulls the advanced APIs transitively. Keep the complete
-  # external AscendC tree together so an older CANN kernel_operator.h cannot
-  # claim the shared include guards before the selected HCOMM header is read.
+  # Keep one complete AscendC tree together. The device data plane no longer
+  # includes the version-sensitive hcomm/hcomm.h API; HCOMM remains a Host
+  # resource-creation dependency.
   list(APPEND KVAF_ASC_DEVKIT_INCLUDE_DIRS
     "${KVAF_ASC_DEVKIT_PATH}/impl/adv_api"
     "${KVAF_ASC_DEVKIT_PATH}/impl/basic_api"
@@ -69,56 +66,18 @@ if(KVAF_ASC_DEVKIT_PATH)
     "${KVAF_ASC_DEVKIT_PATH}/include/simt_api"
     "${KVAF_ASC_DEVKIT_PATH}/include/utils"
   )
-  # An explicitly supplied asc-devkit is authoritative. FORCE also replaces a
-  # stale CMake cache entry left by a previous configure against CANN headers.
-  set(KVAF_HCOMM_ADV_INCLUDE_DIR "${_KVAF_HCOMM_ADV_INCLUDE_DIR}"
-    CACHE PATH "HCOMM AIV advanced API include directory" FORCE)
 else()
-  find_path(KVAF_HCOMM_ADV_INCLUDE_DIR hcomm/hcomm.h
-    PATHS
-      "${ASCEND_HOME_PATH}/include/adv_api"
-      "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/adv_api"
-    NO_DEFAULT_PATH
-    REQUIRED
-  )
+  foreach(_KVAF_CANN_REQUIRED_FILE IN ITEMS
+      kernel_operator.h
+      simt_api/asc_simt.h)
+    if(NOT EXISTS "${KVAF_ACL_INCLUDE_DIR}/${_KVAF_CANN_REQUIRED_FILE}")
+      message(FATAL_ERROR
+        "Installed CANN device headers are incomplete; missing "
+        "${KVAF_ACL_INCLUDE_DIR}/${_KVAF_CANN_REQUIRED_FILE}")
+    endif()
+  endforeach()
 endif()
 
-set(_KVAF_HCOMM_HEADER
-  "${KVAF_HCOMM_ADV_INCLUDE_DIR}/hcomm/hcomm.h")
-set(_KVAF_HCOMM_COMMON_HEADER
-  "${KVAF_HCOMM_ADV_INCLUDE_DIR}/hcomm/hcomm_common.h")
-if(NOT EXISTS "${_KVAF_HCOMM_COMMON_HEADER}")
-  message(FATAL_ERROR
-    "Selected HCOMM AIV API is incomplete; missing "
-    "${_KVAF_HCOMM_COMMON_HEADER}")
-endif()
-file(READ "${_KVAF_HCOMM_HEADER}" _KVAF_HCOMM_HEADER_CONTENT)
-file(READ "${_KVAF_HCOMM_COMMON_HEADER}" _KVAF_HCOMM_COMMON_CONTENT)
-foreach(_KVAF_REQUIRED_TOKEN IN ITEMS ReadNbi Drain)
-  string(FIND "${_KVAF_HCOMM_HEADER_CONTENT}"
-    "${_KVAF_REQUIRED_TOKEN}" _KVAF_REQUIRED_TOKEN_OFFSET)
-  if(_KVAF_REQUIRED_TOKEN_OFFSET EQUAL -1)
-    message(FATAL_ERROR
-      "Selected HCOMM AIV API does not provide ${_KVAF_REQUIRED_TOKEN}: "
-      "${_KVAF_HCOMM_HEADER}. KVAF requires the CANN 9.1.0 HCOMM "
-      "Init/ReadNbi/Commit/Drain API; use the asc-devkit revision that "
-      "matches the installed CANN package.")
-  endif()
-endforeach()
-foreach(_KVAF_REQUIRED_TOKEN IN ITEMS
-    ChannelHandle COMM_PROTOCOL_UBC_CTP)
-  string(FIND "${_KVAF_HCOMM_COMMON_CONTENT}"
-    "${_KVAF_REQUIRED_TOKEN}" _KVAF_REQUIRED_TOKEN_OFFSET)
-  if(_KVAF_REQUIRED_TOKEN_OFFSET EQUAL -1)
-    message(FATAL_ERROR
-      "Selected HCOMM AIV API does not provide ${_KVAF_REQUIRED_TOKEN}: "
-      "${_KVAF_HCOMM_COMMON_HEADER}. KVAF requires the CANN 9.1.0 HCOMM "
-      "Init/ReadNbi/Commit/Drain API; use the asc-devkit revision that "
-      "matches the installed CANN package.")
-  endif()
-endforeach()
-
-message(STATUS "KVAF HCOMM AIV API: ${_KVAF_HCOMM_HEADER}")
 if(KVAF_ASC_DEVKIT_PATH)
   message(STATUS
     "KVAF AscendC device headers: ${KVAF_ASC_DEVKIT_PATH}")
@@ -126,6 +85,8 @@ else()
   message(STATUS
     "KVAF AscendC device headers: ${ASCEND_HOME_PATH}")
 endif()
+message(STATUS
+  "KVAF AIV data plane: direct UBC/CTP SQ/CQ (no device HCOMM API)")
 message(STATUS
   "KVAF HCOMM host resources: "
   "${KVAF_HCOMM_RESOURCE_INCLUDE_DIR}/hcomm/hcomm_res.h")
@@ -215,9 +176,6 @@ target_include_directories(kvaf_a5_aiv_urma_h2d_smoke
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    # Keep the AIV API before CANN's general include directory. Some CANN
-    # packages install another hcomm/hcomm.h there with an incompatible API.
-    ${KVAF_HCOMM_ADV_INCLUDE_DIR}
     ${KVAF_ACL_INCLUDE_DIR}
     ${KVAF_HCOMM_RESOURCE_INCLUDE_DIR}
     "${ASCEND_HOME_PATH}/compiler/tikcpp"

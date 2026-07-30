@@ -258,6 +258,7 @@ required_host_markers=(
 required_device_markers=(
   "KVAF_A5_DDR_IMPORTED"
   "KVAF_A5_CHANNEL_READY role=device engine=AIV"
+  "KVAF_A5_DIRECT_URMA_READY"
   "KVAF_A5_H2D_SMOKE_OK"
   "KVAF_A5_TEARDOWN_OK role=device"
 )
@@ -285,6 +286,7 @@ if (( host_rc != 0 || device_rc != 0 || evidence_ok == 0 )); then
   exit 1
 fi
 
-grep -E 'KVAF_A5_(DDR|CHANNEL|H2D|TEARDOWN)' "${host_log}" "${device_log}"
+grep -E 'KVAF_A5_(DDR|CHANNEL|DIRECT|H2D|TEARDOWN)' \
+  "${host_log}" "${device_log}"
 echo "KVAF_A5_AIV_SIMT_URMA_H2D_ACCEPTANCE=PASS"
 echo "RESULT_DIR=${KVAF_A5_RESULT_DIR}"

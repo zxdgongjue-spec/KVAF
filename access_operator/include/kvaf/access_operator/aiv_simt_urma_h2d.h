@@ -46,11 +46,62 @@ enum class DeviceBatchStatus : std::uint32_t {
   kRemoteRangeInvalid,
   kOutputRangeInvalid,
   kDescriptorInvalid,
+  // Retained for ABI v1 compatibility with the earlier device-HCOMM backend.
+  // The direct SQ/CQ backend does not emit these four values.
   kHcommInitFailed,
   kHcommReadFailed,
   kHcommCommitFailed,
   kHcommDrainFailed,
+  kDirectChannelInvalid,
+  kDirectRemoteRangeInvalid,
+  kDirectLocalRangeInvalid,
+  kDirectCqTimeout,
+  kDirectCqError,
 };
+
+// Versioned device-side view of one HCOMM-created UBC/CTP channel. The Host
+// resource layer snapshots the queue and remote-MR metadata after the channel
+// reaches READY; the AIV kernel then owns the producer/consumer counters and
+// writes the SQ/CQ doorbells directly.
+struct alignas(64) AivDirectUrmaChannel {
+  std::uint32_t abi_version{kAivUrmaAbiVersion};
+  std::uint32_t flags{0};
+  std::uint64_t sq_base{0};
+  std::uint64_t sq_doorbell{0};
+  std::uint64_t cq_base{0};
+  std::uint64_t cq_doorbell{0};
+  std::uint64_t remote_base{0};
+  std::uint64_t remote_bytes{0};
+  std::uint64_t local_base{0};
+  std::uint64_t local_bytes{0};
+  std::uint32_t sq_depth{0};
+  std::uint32_t cq_depth{0};
+  std::uint32_t wqe_size{0};
+  std::uint32_t cqe_size{0};
+  std::uint32_t tp_id{0};
+  std::uint32_t remote_token_id{0};
+  std::uint32_t remote_token_value{0};
+  std::uint32_t reserved0{0};
+  std::uint32_t sq_head{0};
+  std::uint32_t cq_tail{0};
+  std::uint64_t remote_eid_low{0};
+  std::uint64_t remote_eid_high{0};
+  // HCOMM keeps software queue indices in the same device slab as the
+  // ChannelEntity.  A direct queue owner must update these locations as well
+  // as the hardware doorbells so that later launches (and HCOMM teardown or
+  // diagnostics) observe one coherent queue state.
+  std::uint64_t sq_head_address{0};
+  std::uint64_t sq_tail_address{0};
+  std::uint64_t cq_tail_address{0};
+  std::uint32_t wqe_count{0};
+  std::uint32_t reserved1{0};
+  std::uint64_t reserved[4]{};
+};
+
+static_assert(sizeof(AivDirectUrmaChannel) == 192,
+              "AIV direct URMA channel ABI must remain 192 bytes");
+static_assert(alignof(AivDirectUrmaChannel) == 64,
+              "AIV direct URMA channel ABI must remain cache-line aligned");
 
 // Stable GM ABI shared by the CPU reference planner, the SIMT descriptor
 // producer, and the scalar AIV URMA queue owner.

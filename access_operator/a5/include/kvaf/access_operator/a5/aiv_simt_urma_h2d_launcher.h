@@ -10,6 +10,7 @@ namespace kvaf::access::a5 {
 // ACL runtime types.
 void LaunchAivSimtUrmaH2D(
     void* stream, const DeviceBatchGetParams* device_params,
-    DeviceCompletion* device_completion, std::uint64_t hcomm_channel);
+    DeviceCompletion* device_completion,
+    AivDirectUrmaChannel* direct_channel);
 
 }  // namespace kvaf::access::a5
