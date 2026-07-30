@@ -47,19 +47,6 @@
 2. `BatchLookup`：读取快照中的地址
 3. `UnlockKeys`：释放快照
 
-## 为什么 `CommitPut` 和 `LockKeys` 分开
-
-两者解决的问题不同：
-
-- `CommitPut` 解决“什么时候可见”
-- `LockKeys` 解决“这次读读哪一版”
-
-分开后有三个好处：
-
-- 写完成后不必立刻为读请求保留快照，减少无意义 `pin_count`
-- 不同读请求可以拥有各自独立的 `LockContext`
-- 后续扩展多版本或覆盖写时，接口边界更清楚
-
 ## 关键时序
 
 ```mermaid
