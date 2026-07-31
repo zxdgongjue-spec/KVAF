@@ -13,6 +13,16 @@ set(KVAF_ASC_DEVKIT_PATH "" CACHE PATH
 set(KVAF_A5_COMPILE_MODE "auto" CACHE STRING
   "Ascend compiler mode: auto, xasc, or xcce")
 set_property(CACHE KVAF_A5_COMPILE_MODE PROPERTY STRINGS auto xasc xcce)
+option(KVAF_A5_BUILD_HCOMM_BACKEND
+  "Build the legacy HCOMM resource-control smoke target" ON)
+option(KVAF_A5_BUILD_DIRECT_URMA_BACKEND
+  "Build the liburma/UDMA resource-control smoke target without HCOMM" OFF)
+
+if(NOT KVAF_A5_BUILD_HCOMM_BACKEND AND
+   NOT KVAF_A5_BUILD_DIRECT_URMA_BACKEND)
+  message(FATAL_ERROR
+    "Enable at least one A5 resource-control backend")
+endif()
 
 find_path(KVAF_ACL_INCLUDE_DIR acl/acl.h
   PATHS
@@ -21,15 +31,17 @@ find_path(KVAF_ACL_INCLUDE_DIR acl/acl.h
   NO_DEFAULT_PATH
   REQUIRED
 )
-find_path(KVAF_HCOMM_RESOURCE_INCLUDE_DIR hcomm/hcomm_res.h
-  PATHS
-    "${ASCEND_HOME_PATH}/include"
-    "${ASCEND_HOME_PATH}/pkg_inc"
-    "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include"
-    "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/pkg_inc"
-  NO_DEFAULT_PATH
-  REQUIRED
-)
+if(KVAF_A5_BUILD_HCOMM_BACKEND)
+  find_path(KVAF_HCOMM_RESOURCE_INCLUDE_DIR hcomm/hcomm_res.h
+    PATHS
+      "${ASCEND_HOME_PATH}/include"
+      "${ASCEND_HOME_PATH}/pkg_inc"
+      "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include"
+      "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/pkg_inc"
+    NO_DEFAULT_PATH
+    REQUIRED
+  )
+endif()
 set(KVAF_ASC_DEVKIT_INCLUDE_DIRS)
 if(KVAF_ASC_DEVKIT_PATH)
   get_filename_component(KVAF_ASC_DEVKIT_PATH
@@ -46,8 +58,8 @@ if(KVAF_ASC_DEVKIT_PATH)
     endif()
   endforeach()
   # Keep one complete AscendC tree together. The device data plane no longer
-  # includes the version-sensitive hcomm/hcomm.h API; HCOMM remains a Host
-  # resource-creation dependency.
+  # includes the version-sensitive hcomm/hcomm.h API. HCOMM remains a
+  # resource-creation dependency only when the legacy backend is enabled.
   list(APPEND KVAF_ASC_DEVKIT_INCLUDE_DIRS
     "${KVAF_ASC_DEVKIT_PATH}/impl/adv_api"
     "${KVAF_ASC_DEVKIT_PATH}/impl/basic_api"
@@ -87,9 +99,16 @@ else()
 endif()
 message(STATUS
   "KVAF AIV data plane: direct UBC/CTP SQ/CQ (no device HCOMM API)")
-message(STATUS
-  "KVAF HCOMM host resources: "
-  "${KVAF_HCOMM_RESOURCE_INCLUDE_DIR}/hcomm/hcomm_res.h")
+if(KVAF_A5_BUILD_HCOMM_BACKEND)
+  message(STATUS
+    "KVAF HCOMM host resources: "
+    "${KVAF_HCOMM_RESOURCE_INCLUDE_DIR}/hcomm/hcomm_res.h")
+endif()
+if(KVAF_A5_BUILD_DIRECT_URMA_BACKEND)
+  message(STATUS
+    "KVAF direct URMA resources: liburma/UDMA provider via Host+AICPU "
+    "(no HCOMM link)")
+endif()
 
 find_library(KVAF_ASCENDCL_LIBRARY ascendcl
   PATHS
@@ -98,13 +117,15 @@ find_library(KVAF_ASCENDCL_LIBRARY ascendcl
   NO_DEFAULT_PATH
   REQUIRED
 )
-find_library(KVAF_HCOMM_LIBRARY hcomm
-  PATHS
-    "${ASCEND_HOME_PATH}/lib64"
-    "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64"
-  NO_DEFAULT_PATH
-  REQUIRED
-)
+if(KVAF_A5_BUILD_HCOMM_BACKEND)
+  find_library(KVAF_HCOMM_LIBRARY hcomm
+    PATHS
+      "${ASCEND_HOME_PATH}/lib64"
+      "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64"
+    NO_DEFAULT_PATH
+    REQUIRED
+  )
+endif()
 
 set(KVAF_A5_EFFECTIVE_COMPILE_MODE "${KVAF_A5_COMPILE_MODE}")
 if(KVAF_A5_EFFECTIVE_COMPILE_MODE STREQUAL "auto")
@@ -158,50 +179,73 @@ endif()
 message(STATUS
   "KVAF A5 AIV+SIMT+URMA compile mode: ${KVAF_A5_EFFECTIVE_COMPILE_MODE}")
 
-add_executable(kvaf_a5_aiv_urma_h2d_smoke
-  src/aiv_simt_urma_h2d_kernel.cpp
-  src/hcomm_urma_resources.cpp
-  smoke/aiv_simt_urma_h2d_smoke.cpp
-)
+function(kvaf_configure_a5_target target)
+  if(KVAF_ASC_DEVKIT_INCLUDE_DIRS)
+    target_include_directories(${target}
+      BEFORE PRIVATE
+        ${KVAF_ASC_DEVKIT_INCLUDE_DIRS}
+    )
+  endif()
 
-if(KVAF_ASC_DEVKIT_INCLUDE_DIRS)
-  target_include_directories(kvaf_a5_aiv_urma_h2d_smoke
-    BEFORE PRIVATE
-      ${KVAF_ASC_DEVKIT_INCLUDE_DIRS}
+  target_include_directories(${target}
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/../include
+      ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+      ${KVAF_ACL_INCLUDE_DIR}
+      "${ASCEND_HOME_PATH}/compiler/tikcpp"
+      "${ASCEND_HOME_PATH}/compiler/tikcpp/tikcfw"
+      "${ASCEND_HOME_PATH}/compiler/tikcpp/tikcfw/interface"
+      "${ASCEND_HOME_PATH}/compiler/tikcpp/tikcfw/impl"
+      "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/tikcpp"
+      "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/tikcpp/tikcfw"
+      "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/tikcpp/tikcfw/interface"
+      "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/tikcpp/tikcfw/impl"
+  )
+
+  target_compile_options(${target}
+    PRIVATE
+      ${KVAF_A5_COMPILE_OPTIONS}
+      -Wno-ignored-attributes
+  )
+  target_link_options(${target}
+    PRIVATE
+      --cce-fatobj-link
+      ${KVAF_A5_ARCH_LINK_OPTIONS}
+  )
+  target_link_libraries(${target}
+    PRIVATE
+      ${KVAF_ASCENDCL_LIBRARY}
+      dl
+      pthread
+  )
+endfunction()
+
+if(KVAF_A5_BUILD_HCOMM_BACKEND)
+  add_executable(kvaf_a5_aiv_urma_h2d_smoke
+    src/aiv_simt_urma_h2d_kernel.cpp
+    src/host_ddr_mapping.cpp
+    src/hcomm_urma_resources.cpp
+    smoke/aiv_simt_urma_h2d_smoke.cpp
+  )
+  kvaf_configure_a5_target(kvaf_a5_aiv_urma_h2d_smoke)
+  target_include_directories(kvaf_a5_aiv_urma_h2d_smoke PRIVATE
+    ${KVAF_HCOMM_RESOURCE_INCLUDE_DIR}
+  )
+  target_link_libraries(kvaf_a5_aiv_urma_h2d_smoke PRIVATE
+    ${KVAF_HCOMM_LIBRARY}
   )
 endif()
 
-target_include_directories(kvaf_a5_aiv_urma_h2d_smoke
-  PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    ${KVAF_ACL_INCLUDE_DIR}
-    ${KVAF_HCOMM_RESOURCE_INCLUDE_DIR}
-    "${ASCEND_HOME_PATH}/compiler/tikcpp"
-    "${ASCEND_HOME_PATH}/compiler/tikcpp/tikcfw"
-    "${ASCEND_HOME_PATH}/compiler/tikcpp/tikcfw/interface"
-    "${ASCEND_HOME_PATH}/compiler/tikcpp/tikcfw/impl"
-    "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/tikcpp"
-    "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/tikcpp/tikcfw"
-    "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/tikcpp/tikcfw/interface"
-    "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/tikcpp/tikcfw/impl"
-)
-
-target_compile_options(kvaf_a5_aiv_urma_h2d_smoke
-  PRIVATE
-    ${KVAF_A5_COMPILE_OPTIONS}
-    -Wno-ignored-attributes
-)
-target_link_options(kvaf_a5_aiv_urma_h2d_smoke
-  PRIVATE
-    --cce-fatobj-link
-    ${KVAF_A5_ARCH_LINK_OPTIONS}
-)
-target_link_libraries(kvaf_a5_aiv_urma_h2d_smoke
-  PRIVATE
-    ${KVAF_ASCENDCL_LIBRARY}
-    ${KVAF_HCOMM_LIBRARY}
-    dl
-    pthread
-)
+if(KVAF_A5_BUILD_DIRECT_URMA_BACKEND)
+  add_executable(kvaf_a5_aiv_direct_urma_h2d_smoke
+    src/aiv_simt_urma_h2d_kernel.cpp
+    src/host_ddr_mapping.cpp
+    src/direct_urma_resources.cpp
+    smoke/aiv_simt_direct_urma_h2d_smoke.cpp
+  )
+  kvaf_configure_a5_target(kvaf_a5_aiv_direct_urma_h2d_smoke)
+  target_include_directories(kvaf_a5_aiv_direct_urma_h2d_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/provider/include
+  )
+endif()

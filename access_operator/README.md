@@ -23,18 +23,23 @@ Operator 内部按照 Selector、Executor、Template 组织（当前不需要考
 
 ## 当前 A5 最小实现
 
-当前代码先实现 BatchGet 的一个受限子集：
+当前代码先实现 BatchGet 的一个受限子集，并保留两个可选资源控制后端：
 
 - 设备侧固定 ABI：AccessTable、Index、Mask、连续 HBM 输出和 Completion；
 - 32 个 SIMT lane 并行查表并生成 64B 定长 H2D 描述符；
-- Host HCOMM 创建并交换 Endpoint/MR/EID/TP/Jetty/SQ/CQ，READY 后快照成
-  版本化设备上下文；
+- legacy HCOMM backend 通过 HCOMM 创建并交换
+  Endpoint/MR/EID/TP/Jetty/SQ/CQ；
+- direct URMA backend 通过 Host+AICPU provider 直接使用
+  `liburma`/UDMA 创建这些资源，不链接 HCOMM，也不依赖 memcache 或
+  memfabric；
 - 单个 AIV 作为唯一 URMA SQ/CQ owner，直接填 READ WQE、敲 doorbell 并
   轮询带 phase/owner 的 CQE；
 - Host DDR 显式执行 `halHostRegister(HOST_MEM_MAP_DEV)`，随后注册、导出并在
   Device endpoint 导入；
-- CPU/AIV Host-Device channel 建链，以及多描述符、乱序索引和 mask 的
-  H2D 硬件冒烟验证。
+- Host/AICPU 完成 direct URMA 建链，AIV 独占数据面 SQ/CQ；并提供
+  多描述符、乱序索引和 mask 的 H2D 硬件冒烟验证。
 
-限制和运行命令见
-[A5 AIV+SIMT+URMA H2D MVP](../docs/a5_aiv_simt_urma_h2d_mvp.md)。
+HCOMM 对照路径见
+[A5 AIV+SIMT+URMA H2D MVP](../docs/a5_aiv_simt_urma_h2d_mvp.md)；
+不链接 HCOMM 的路径和命令见
+[A5 direct URMA H2D](../docs/a5_direct_urma_h2d.md)。

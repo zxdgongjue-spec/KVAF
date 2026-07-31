@@ -14,10 +14,11 @@ using kvaf::access::DeviceCompletion;
 using kvaf::access::TransferState;
 using kvaf::access::UrmaH2DDescriptor;
 
-constexpr std::uint32_t kDirectChannelTokenEnabled = 1U;
 constexpr std::uint32_t kUrmaReadOpcode = 6U;
+constexpr std::uint32_t kUrmaStrongOrder = 2U;
+constexpr std::uint32_t kUrmaComplete = 1U << 5U;
 constexpr std::uint32_t kUrmaDefaultFlags =
-    5U | (1U << 3U) | (1U << 5U);  // strong order, fence, CQE
+    kUrmaStrongOrder | kUrmaComplete;
 constexpr std::uint32_t kUrmaWqeWords = 16U;
 constexpr std::uint32_t kUrmaCqeWords = 16U;
 constexpr std::uint32_t kUrmaQueueEntryBytes = 64U;
@@ -143,11 +144,25 @@ __aicore__ inline bool RangeContains(
          address - base <= capacity - bytes;
 }
 
+__aicore__ inline void InvalidateGlobalCacheLine(
+    std::uint64_t address) {
+  const std::uint64_t aligned =
+      address / AscendC::CACHE_LINE_SIZE *
+      AscendC::CACHE_LINE_SIZE;
+  AscendC::GlobalTensor<std::uint8_t> cache_line;
+  cache_line.SetGlobalBuffer(
+      reinterpret_cast<__gm__ std::uint8_t*>(aligned));
+  __asm__ __volatile__("");
+  AscendC::DataCacheCleanAndInvalid<
+      std::uint8_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+      AscendC::DcciDst::CACHELINE_OUT>(cache_line[0]);
+  __asm__ __volatile__("");
+}
+
 __aicore__ inline bool DirectChannelIsValid(
     __gm__ const AivDirectUrmaChannel* channel) {
   return channel != nullptr &&
          channel->abi_version == kAivUrmaAbiVersion &&
-         (channel->flags & kDirectChannelTokenEnabled) != 0 &&
          channel->sq_base != 0 && channel->sq_doorbell != 0 &&
          channel->cq_base != 0 && channel->cq_doorbell != 0 &&
          channel->sq_head_address != 0 &&
@@ -178,8 +193,10 @@ __aicore__ inline void FillReadWqe(
 
   const std::uint32_t owner =
       ((sq_head / channel->sq_depth) & 1U) == 0 ? 1U : 0U;
+  const std::uint32_t token_enabled =
+      (channel->flags & kAivUrmaChannelTokenEnabled) != 0 ? 1U : 0U;
   words[0] = (kUrmaDefaultFlags << 16U) |
-             (1U << 28U) |  // token enable
+             (token_enabled << 28U) |
              (1U << 29U) |  // remote object is a Jetty/segment id
              (owner << 31U);
   words[1] = kUrmaReadOpcode << 8U;
@@ -191,11 +208,15 @@ __aicore__ inline void FillReadWqe(
   words[6] = static_cast<std::uint32_t>(channel->remote_eid_high);
   words[7] =
       static_cast<std::uint32_t>(channel->remote_eid_high >> 32U);
-  words[8] = channel->remote_token_value;
+  words[8] =
+      token_enabled != 0 ? channel->remote_token_value : 0U;
   words[10] = static_cast<std::uint32_t>(remote_address);
   words[11] = static_cast<std::uint32_t>(remote_address >> 32U);
   words[12] = bytes;
-  words[13] = 0;  // HCOMM and SHMEM leave the local SGE token disabled.
+  // Match udma_fill_read_sqe(), SHMEM and UB_MicroBenchmark_new: the local
+  // SGE token field remains zero and the registered local VA is carried in
+  // words 14-15.
+  words[13] = 0;
   words[14] = static_cast<std::uint32_t>(local_address);
   words[15] = static_cast<std::uint32_t>(local_address >> 32U);
 }
@@ -265,6 +286,10 @@ __aicore__ inline std::uint32_t PollDirectCq(
     bool valid = false;
     for (std::uint32_t retry = 0; retry < kUrmaCqMaxRetries;
          ++retry) {
+      // The UDMA engine updates CQ memory outside the AIV cache. Match the
+      // validated UB_MicroBenchmark path and invalidate the cache line before
+      // each observation of the owner/phase bit.
+      InvalidateGlobalCacheLine(cqe_address);
       AscendC::SyncAction<AscendC::HardEvent::S_MTE2>();
       AscendC::DataCopy(cqe_tensor, cqe_global, kUrmaCqeWords);
       AscendC::SyncAction<AscendC::HardEvent::MTE2_S>();
@@ -293,7 +318,7 @@ __aicore__ inline std::uint32_t PollDirectCq(
          reinterpret_cast<__gm__ std::uint32_t*>(
              channel->cq_tail_address),
          0);
-  st_dev(current_tail & 0x00ffffffU,
+  st_dev(current_tail & 0x003fffffU,
          reinterpret_cast<__gm__ std::uint32_t*>(
              channel->cq_doorbell),
          0);

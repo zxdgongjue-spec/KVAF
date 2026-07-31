@@ -66,7 +66,8 @@ SIMT lane 竞争同一个 SQ head、doorbell 和 CQ tail 会形成多 producer
    MR 边界和 HCOMM 软件队列地址快照成 192B
    `AivDirectUrmaChannel`；
 6. 只有所有 descriptor 同时落在该 local/remote MR 内，AIV 才提交；
-7. AIV 每次填一个带 token、fence 和 CQE 请求的 64B READ WQE，写 SQ 后
+7. AIV 每次填一个带 remote token、strong-order 和 CQE 请求的 64B
+   READ WQE，写 SQ 后
    敲门铃；
 8. AIV 按真实 queue depth 计算 owner/phase，检查 CQE
    `status/substatus`，成功后更新 CQ doorbell。
@@ -248,7 +249,7 @@ super_pod_index` 必须来自当前服务器的真实 ACL/runtime 拓扑。冒�
    remote id    = HCOMM remote MR token id
    token value  = HCOMM remote MR token value
    TP / EID     = HCOMM SQ context
-   flag         = strong-order + fence + CQE
+   flag         = strong-order + CQE
    owner        = absolute_sq_head / actual_sq_depth
    ```
 
