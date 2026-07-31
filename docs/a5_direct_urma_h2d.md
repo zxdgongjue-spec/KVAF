@@ -332,7 +332,7 @@ KVAF_A5_BUILD_DIRECT_URMA_BACKEND=ON
 执行环境：`VLLM_ASCEND_CS_KVAF_DOCKER`
 
 ```bash
-urma_admin show --all --whole | less
+urma_admin show --whole | less
 ```
 
 然后填写实际值，不要照抄示例：
