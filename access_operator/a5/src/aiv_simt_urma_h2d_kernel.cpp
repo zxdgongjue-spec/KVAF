@@ -244,9 +244,11 @@ __aicore__ inline bool PostDirectRead(
   AscendC::GlobalTensor<std::uint32_t> sqe_global;
   sqe_global.SetGlobalBuffer(
       reinterpret_cast<__gm__ std::uint32_t*>(sqe_address));
-  AscendC::SyncAction<AscendC::HardEvent::S_MTE3>();
+  AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+  AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
   AscendC::DataCopy(sqe_global, wqe_tensor, kUrmaWqeWords);
-  AscendC::SyncAction<AscendC::HardEvent::MTE3_S>();
+  AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
+  AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
 
   const std::uint32_t next_head = sq_head + 1U;
   const std::uint32_t next_wqe_count = wqe_count + 1U;
@@ -290,9 +292,11 @@ __aicore__ inline std::uint32_t PollDirectCq(
       // validated UB_MicroBenchmark path and invalidate the cache line before
       // each observation of the owner/phase bit.
       InvalidateGlobalCacheLine(cqe_address);
-      AscendC::SyncAction<AscendC::HardEvent::S_MTE2>();
+      AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID0);
+      AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID0);
       AscendC::DataCopy(cqe_tensor, cqe_global, kUrmaCqeWords);
-      AscendC::SyncAction<AscendC::HardEvent::MTE2_S>();
+      AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+      AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
       const std::uint32_t owner = (cqe_words[0] >> 2U) & 1U;
       if ((expected_phase ^ owner) != 0) {
         valid = true;
