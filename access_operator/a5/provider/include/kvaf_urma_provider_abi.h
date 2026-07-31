@@ -186,6 +186,9 @@ KVAF_URMA_PROVIDER_EXPORT int kvaf_urma_provider_close_v2(
     uint64_t session_id);
 KVAF_URMA_PROVIDER_EXPORT uint32_t
 kvaf_urma_provider_private_abi_v2(void);
+// The AICPU entry points return the KFC task status. Once opaque_args and its
+// result address are valid they return zero even when the provider operation
+// fails; provider status is reported only through the device result block.
 KVAF_URMA_PROVIDER_EXPORT int aicpu_kvaf_urma_open_v2(
     void* opaque_args);
 KVAF_URMA_PROVIDER_EXPORT int aicpu_kvaf_urma_close_v2(

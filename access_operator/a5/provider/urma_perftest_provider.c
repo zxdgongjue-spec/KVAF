@@ -563,7 +563,16 @@ int aicpu_kvaf_urma_open_v2(void *opaque_args)
     }
     result = (struct kvaf_urma_provider_result_v2 *)(uintptr_t)
         args->result_address;
-    return kvaf_urma_provider_open_v2(&args->config, result);
+    (void)kvaf_urma_provider_open_v2(&args->config, result);
+    /*
+     * KFC treats a non-zero AICPU entry-point return as a task exception and
+     * aclrtSynchronizeStream then reports 507018.  Provider failures are
+     * ordinary transport results, not malformed KFC tasks: the stable result
+     * block already carries status, provider_status and cleanup certainty.
+     * Return task success once that block is writable so the Host can inspect
+     * the real provider result and decide whether cleanup is safe.
+     */
+    return 0;
 }
 
 int aicpu_kvaf_urma_close_v2(void *opaque_args)
@@ -579,21 +588,22 @@ int aicpu_kvaf_urma_close_v2(void *opaque_args)
     result = (int32_t *)(uintptr_t)args->result_address;
     *result = -1;
     if (pthread_mutex_lock(&g_kvaf_lock) != 0) {
-        return -1;
+        return 0;
     }
     if (g_kvaf_session_id != 0 &&
         g_kvaf_session_id != args->session_id) {
         (void)pthread_mutex_unlock(&g_kvaf_lock);
-        return -1;
+        return 0;
     }
     if (g_kvaf_context_open &&
         kvaf_quiesce_aiv_queue(
             args->final_sq_head, args->final_cq_tail) != 0) {
         (void)pthread_mutex_unlock(&g_kvaf_lock);
-        return -1;
+        return 0;
     }
     ret = kvaf_close_unlocked(args->session_id);
     (void)pthread_mutex_unlock(&g_kvaf_lock);
     *result = ret;
-    return ret;
+    /* See aicpu_kvaf_urma_open_v2: result reports provider failure. */
+    return 0;
 }

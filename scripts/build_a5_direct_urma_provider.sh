@@ -365,6 +365,16 @@ device_abi_probe_output=$(
     "KVAF_URMA_PROVIDER_PRIVATE_ABI=2" ]] ||
   die "Device provider private-ABI probe returned unexpected output"
 
+aicpu_contract_probe="${staging_dir}/cmake/kvaf_urma_provider_aicpu_contract_probe"
+[[ -x "${aicpu_contract_probe}" ]] ||
+  die "provider build did not produce the AICPU contract probe"
+aicpu_contract_output=$(
+  "${aicpu_contract_probe}" "${device_provider}"
+) || die "Device provider AICPU return-contract probe failed"
+[[ "${aicpu_contract_output}" == \
+    "KVAF_URMA_PROVIDER_AICPU_CONTRACT=PASS" ]] ||
+  die "Device provider AICPU return-contract probe returned unexpected output"
+
 host_provider_sha=$(elf_sha256 "${host_provider}") ||
   die "could not hash the Host provider"
 device_provider_sha=$(elf_sha256 "${device_provider}") ||

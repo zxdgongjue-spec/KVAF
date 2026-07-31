@@ -181,3 +181,18 @@ set_target_properties(kvaf_urma_provider_abi_probe PROPERTIES
   BUILD_WITH_INSTALL_RPATH NO
   INSTALL_RPATH ""
 )
+
+add_executable(kvaf_urma_provider_aicpu_contract_probe
+  provider_aicpu_contract_probe.c)
+target_include_directories(kvaf_urma_provider_aicpu_contract_probe PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+target_link_libraries(kvaf_urma_provider_aicpu_contract_probe PRIVATE dl)
+set_target_properties(kvaf_urma_provider_aicpu_contract_probe PROPERTIES
+  C_STANDARD 11
+  C_STANDARD_REQUIRED YES
+  C_EXTENSIONS YES
+  SKIP_BUILD_RPATH YES
+  BUILD_WITH_INSTALL_RPATH NO
+  INSTALL_RPATH ""
+)
