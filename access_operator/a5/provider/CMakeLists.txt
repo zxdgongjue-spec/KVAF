@@ -138,6 +138,16 @@ set(KVAF_URMA_COMMON_SOURCES
   "${KVAF_URMA_COMMON_SOURCE_DIR}/ub_hmap.c"
   "${KVAF_URMA_COMMON_SOURCE_DIR}/ub_util.c"
 )
+
+# Keep full warnings enabled for KVAF-owned code.  The selected, hash-pinned
+# UMDK snapshot has a small set of known warnings in audited upstream files;
+# attach the narrow suppressions to those source files only instead of
+# weakening an entire KVAF target.
+set_property(SOURCE
+  "${KVAF_URMA_COMMON_SOURCE_DIR}/ub_dstring.c"
+  APPEND PROPERTY COMPILE_OPTIONS
+  "-Wno-sign-compare"
+)
 add_library(kvaf_source_urma_common OBJECT ${KVAF_URMA_COMMON_SOURCES})
 set_target_properties(kvaf_source_urma_common PROPERTIES
   C_STANDARD 11
@@ -170,6 +180,21 @@ foreach(KVAF_URMA_CORE_SOURCE IN LISTS KVAF_URMA_CORE_SOURCES)
       "Missing source-linked UMDK core input ${KVAF_URMA_CORE_SOURCE}")
   endif()
 endforeach()
+
+set_property(SOURCE
+  "${KVAF_URMA_CORE_SOURCE_DIR}/urma_cmd.c"
+  "${KVAF_URMA_CORE_SOURCE_DIR}/urma_log.c"
+  "${KVAF_URMA_CORE_SOURCE_DIR}/urma_perf.c"
+  APPEND PROPERTY COMPILE_OPTIONS
+  "-Wno-sign-compare"
+)
+set_property(SOURCE
+  "${KVAF_URMA_CORE_SOURCE_DIR}/urma_cp_api.c"
+  "${KVAF_URMA_CORE_SOURCE_DIR}/urma_device.c"
+  "${KVAF_URMA_CORE_SOURCE_DIR}/urma_perf.c"
+  APPEND PROPERTY COMPILE_OPTIONS
+  "-Wno-unused-parameter"
+)
 
 add_library(kvaf_source_urma_core OBJECT
   source_linked_urma_main.c

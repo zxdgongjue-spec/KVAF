@@ -84,6 +84,72 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
         self.assertNotIn('"${KVAF_PERFTEST_SOURCE_DIR}/perftest_mgmt.c"', cmake)
         self.assertIn('"-Wl,-z,defs"', cmake)
 
+    def test_upstream_warning_exceptions_are_source_scoped(self):
+        cmake = self.read("access_operator/a5/provider/CMakeLists.txt")
+        resources = self.read(
+            "access_operator/a5/provider/source_matched_perftest.c"
+        )
+
+        self.assertIn(
+            '"${KVAF_URMA_COMMON_SOURCE_DIR}/ub_dstring.c"\n'
+            "  APPEND PROPERTY COMPILE_OPTIONS\n"
+            '  "-Wno-sign-compare"',
+            cmake,
+        )
+        sign_block_start = cmake.index(
+            'set_property(SOURCE\n'
+            '  "${KVAF_URMA_CORE_SOURCE_DIR}/urma_cmd.c"'
+        )
+        sign_block_end = cmake.index("\n)", sign_block_start)
+        sign_block = cmake[sign_block_start:sign_block_end]
+        for source in ("urma_cmd.c", "urma_log.c", "urma_perf.c"):
+            self.assertIn(
+                f'"${{KVAF_URMA_CORE_SOURCE_DIR}}/{source}"', sign_block
+            )
+        self.assertIn('"-Wno-sign-compare"', sign_block)
+
+        unused_block_start = cmake.index(
+            'set_property(SOURCE\n'
+            '  "${KVAF_URMA_CORE_SOURCE_DIR}/urma_cp_api.c"'
+        )
+        unused_block_end = cmake.index("\n)", unused_block_start)
+        unused_block = cmake[unused_block_start:unused_block_end]
+        for source in ("urma_cp_api.c", "urma_device.c", "urma_perf.c"):
+            self.assertIn(
+                f'"${{KVAF_URMA_CORE_SOURCE_DIR}}/{source}"', unused_block
+            )
+        self.assertIn('"-Wno-unused-parameter"', unused_block)
+
+        # Never hide upstream warnings by weakening a complete KVAF target.
+        for target in (
+            "kvaf_source_urma_common",
+            "kvaf_source_urma_core",
+            "kvaf_urma_provider_common",
+        ):
+            compile_options = cmake.index(
+                f"target_compile_options({target} PRIVATE"
+            )
+            compile_options_end = cmake.index(")", compile_options)
+            target_flags = cmake[compile_options:compile_options_end]
+            self.assertIn("-Wall -Wextra", target_flags)
+            self.assertNotIn("-Wno-", target_flags)
+
+        include = resources.index("#include KVAF_PERFTEST_RESOURCES_SOURCE")
+        push = resources.rindex("#pragma GCC diagnostic push", 0, include)
+        sign = resources.rindex(
+            '#pragma GCC diagnostic ignored "-Wsign-compare"', 0, include
+        )
+        unused = resources.rindex(
+            '#pragma GCC diagnostic ignored "-Wunused-parameter"',
+            0,
+            include,
+        )
+        pop = resources.index("#pragma GCC diagnostic pop", include)
+        self.assertLess(push, sign)
+        self.assertLess(sign, unused)
+        self.assertLess(unused, include)
+        self.assertLess(include, pop)
+
     def test_provider_lifecycle_rejects_foreign_global_state(self):
         main = self.read(
             "access_operator/a5/provider/source_matched_udma_main.c"

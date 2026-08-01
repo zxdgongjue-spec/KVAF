@@ -78,7 +78,22 @@ static void kvaf_legacy_close_connection(perftest_config_t *cfg)
 #define urma_uninit kvaf_legacy_urma_uninit_noop
 #define rearm_jfc kvaf_legacy_rearm_jfc_unsupported
 #define close_connection kvaf_legacy_close_connection
+
+/*
+ * perftest_resources.c is an immutable, hash-pinned upstream input.  Limit
+ * its known warning exceptions to the included source body; diagnostics for
+ * the KVAF ownership wrappers above and checked implementation below remain
+ * fully enabled by the target's -Wall -Wextra policy.
+ */
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wsign-compare"
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#endif
 #include KVAF_PERFTEST_RESOURCES_SOURCE
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 #undef close_connection
 #undef rearm_jfc
 #undef urma_uninit
