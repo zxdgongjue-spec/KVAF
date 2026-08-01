@@ -36,12 +36,51 @@ static urma_device_t *kvaf_owned_urma_get_device_by_name(char *name)
         ? device : NULL;
 }
 
+/*
+ * perftest_resources.c also contains legacy benchmark-only recreate/destroy
+ * entry points.  In the official executable their two helpers live in
+ * urma_perftest.c and perftest_mgmt.c, neither of which belongs in the
+ * source-linked direct provider (the former brings main/run loops; the
+ * latter brings the unselected UB management backend).
+ *
+ * The checked direct path rejects use_jfce before creating any resource, so
+ * an accidental legacy JFCE rearm must fail closed rather than silently
+ * widening the supported surface.  Legacy connection close can safely use
+ * the same source-matched TCP owner and then release the three config strings
+ * that official perftest_mgmt.c owns.
+ */
+static int kvaf_legacy_rearm_jfc_unsupported(
+    perftest_context_t *ctx, const perftest_config_t *cfg)
+{
+    (void)ctx;
+    (void)cfg;
+    return -1;
+}
+
+static void kvaf_legacy_close_connection(perftest_config_t *cfg)
+{
+    if (cfg == NULL) {
+        return;
+    }
+    kvaf_perftest_close_connection(cfg);
+    free(cfg->server_ip);
+    cfg->server_ip = NULL;
+    free(cfg->bind_ip);
+    cfg->bind_ip = NULL;
+    free(cfg->mgmt_addr);
+    cfg->mgmt_addr = NULL;
+}
+
 #define create_duplex_ctx kvaf_legacy_create_duplex_ctx
 #define destroy_ctx kvaf_legacy_destroy_ctx
 #define init_device kvaf_legacy_init_device
 #define urma_get_device_by_name kvaf_owned_urma_get_device_by_name
 #define urma_uninit kvaf_legacy_urma_uninit_noop
+#define rearm_jfc kvaf_legacy_rearm_jfc_unsupported
+#define close_connection kvaf_legacy_close_connection
 #include KVAF_PERFTEST_RESOURCES_SOURCE
+#undef close_connection
+#undef rearm_jfc
 #undef urma_uninit
 #undef urma_get_device_by_name
 #undef init_device

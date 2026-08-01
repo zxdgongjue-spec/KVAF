@@ -50,6 +50,40 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
             self.assertNotIn("dev_buf", source)
             self.assertNotIn("comm.sock_fd", source)
 
+    def test_embedded_perftest_legacy_dependencies_are_private_and_closed(self):
+        cmake = self.read("access_operator/a5/provider/CMakeLists.txt")
+        resources = self.read(
+            "access_operator/a5/provider/source_matched_perftest.c"
+        )
+
+        include = resources.index("#include KVAF_PERFTEST_RESOURCES_SOURCE")
+        rearm_define = resources.index(
+            "#define rearm_jfc kvaf_legacy_rearm_jfc_unsupported"
+        )
+        close_define = resources.index(
+            "#define close_connection kvaf_legacy_close_connection"
+        )
+        rearm_undef = resources.index("#undef rearm_jfc", include)
+        close_undef = resources.index("#undef close_connection", include)
+
+        self.assertIn(
+            "static int kvaf_legacy_rearm_jfc_unsupported(", resources
+        )
+        self.assertIn(
+            "static void kvaf_legacy_close_connection(", resources
+        )
+        self.assertIn("kvaf_perftest_close_connection(cfg);", resources)
+        for field in ("server_ip", "bind_ip", "mgmt_addr"):
+            self.assertIn(f"free(cfg->{field});", resources)
+            self.assertIn(f"cfg->{field} = NULL;", resources)
+        self.assertLess(rearm_define, include)
+        self.assertLess(close_define, include)
+        self.assertGreater(rearm_undef, include)
+        self.assertGreater(close_undef, include)
+        self.assertNotIn('"${KVAF_PERFTEST_SOURCE_DIR}/urma_perftest.c"', cmake)
+        self.assertNotIn('"${KVAF_PERFTEST_SOURCE_DIR}/perftest_mgmt.c"', cmake)
+        self.assertIn('"-Wl,-z,defs"', cmake)
+
     def test_provider_lifecycle_rejects_foreign_global_state(self):
         main = self.read(
             "access_operator/a5/provider/source_matched_udma_main.c"
