@@ -3,16 +3,18 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd)
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd -P)
 
 KVAF_A5_BUILD_DIR=${KVAF_A5_BUILD_DIR:-"${ROOT_DIR}/build-a5-aiv-urma"}
 KVAF_A5_BINARY=${KVAF_A5_BINARY:-"${KVAF_A5_BUILD_DIR}/access_operator/a5/kvaf_a5_aiv_urma_h2d_smoke"}
 KVAF_HOST_EID=${KVAF_HOST_EID:-}
 KVAF_DEVICE_EID=${KVAF_DEVICE_EID:-}
 KVAF_PAIR_CHANNEL=${KVAF_PAIR_CHANNEL:-}
+KVAF_GLOBAL_STATE_DIR=${KVAF_GLOBAL_STATE_DIR:-/data/.kvaf-state}
 KVAF_EID_PROC_ROOT=${KVAF_EID_PROC_ROOT:-/proc/asdrv_ub}
-KVAF_EID_LOCK_FILE=${KVAF_EID_LOCK_FILE:-/run/lock/kvaf_asdrv_ub_pair.lock}
+KVAF_EID_LOCK_FILE=${KVAF_EID_LOCK_FILE:-"${KVAF_GLOBAL_STATE_DIR}/asdrv-ub-pair.lock"}
+KVAF_EID_LEGACY_LOCK_FILE=${KVAF_EID_LEGACY_LOCK_FILE:-/run/lock/kvaf_asdrv_ub_pair.lock}
 KVAF_EID_LOCK_TIMEOUT_SECONDS=${KVAF_EID_LOCK_TIMEOUT_SECONDS:-10}
 KVAF_LOGICAL_DEVICE_ID=${KVAF_LOGICAL_DEVICE_ID:-0}
 KVAF_PHYSICAL_DEVICE_ID=${KVAF_PHYSICAL_DEVICE_ID:-}
@@ -23,6 +25,19 @@ KVAF_H2D_BYTES=${KVAF_H2D_BYTES:-4096}
 KVAF_H2D_TIMEOUT_SECONDS=${KVAF_H2D_TIMEOUT_SECONDS:-120}
 KVAF_A5_RUN_TAG=${KVAF_A5_RUN_TAG:-$(date +%Y%m%d_%H%M%S)_$$}
 KVAF_A5_RESULT_DIR=${KVAF_A5_RESULT_DIR:-"${ROOT_DIR}/results/a5_aiv_urma_h2d_${KVAF_A5_RUN_TAG}"}
+
+if [[ "${KVAF_EID_PROC_ROOT}" == /proc/asdrv_ub ]]; then
+  kvaf_expected_global_state=/data/.kvaf-state
+  kvaf_expected_eid_lock="${kvaf_expected_global_state}/asdrv-ub-pair.lock"
+  if [[ "${KVAF_GLOBAL_STATE_DIR}" != "${kvaf_expected_global_state}" ||
+        "${KVAF_EID_LOCK_FILE}" != "${kvaf_expected_eid_lock}" ||
+        "${KVAF_EID_LEGACY_LOCK_FILE}" != \
+          /run/lock/kvaf_asdrv_ub_pair.lock ]]; then
+    echo "ERROR: production EID selector locks must use the fixed shared paths" >&2
+    echo "Unset KVAF_GLOBAL_STATE_DIR/KVAF_EID_*LOCK_FILE and retry." >&2
+    exit 2
+  fi
+fi
 
 require_uint()
 {
@@ -99,6 +114,7 @@ if [[ -z "${KVAF_HOST_EID}" && -z "${KVAF_DEVICE_EID}" ]]; then
     --physical-device-id "${KVAF_PHYSICAL_DEVICE_ID}"
     --proc-root "${KVAF_EID_PROC_ROOT}"
     --lock-file "${KVAF_EID_LOCK_FILE}"
+    --legacy-lock-file "${KVAF_EID_LEGACY_LOCK_FILE}"
     --lock-timeout-seconds "${KVAF_EID_LOCK_TIMEOUT_SECONDS}"
     --shell
   )

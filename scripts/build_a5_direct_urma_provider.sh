@@ -3,14 +3,15 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd)
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd -P)
+source "${SCRIPT_DIR}/a5_direct_urma_legacy_guard.sh"
+kvaf_configure_direct_urma_state_paths "${ROOT_DIR}" || exit 2
 
 KVAF_URMA_PERFTEST_ROOT=${KVAF_URMA_PERFTEST_ROOT:-/data/c00982601/urma_perftest}
 KVAF_DIRECT_PROVIDER_BUILD_DIR=${KVAF_DIRECT_PROVIDER_BUILD_DIR:-"${ROOT_DIR}/build-a5-direct-urma-provider"}
 KVAF_DIRECT_PROVIDER_BUILD_JOBS=${KVAF_DIRECT_PROVIDER_BUILD_JOBS:-8}
 KVAF_DIRECT_PROVIDER_CC=${KVAF_DIRECT_PROVIDER_CC:-$(command -v gcc || true)}
-KVAF_DIRECT_DEPLOY_RUN_LOCK=${KVAF_DIRECT_DEPLOY_RUN_LOCK:-/run/lock/kvaf-a5-direct-urma.lock}
 KVAF_URMA_LIBRARY=${KVAF_URMA_LIBRARY:-}
 KVAF_URMA_COMMON_LIBRARY=${KVAF_URMA_COMMON_LIBRARY:-}
 KVAF_UDMA_PROVIDER_LIBRARY=${KVAF_UDMA_PROVIDER_LIBRARY:-}
@@ -163,11 +164,48 @@ grep -Eq 'Machine:[[:space:]]+AArch64' \
   <<<"${reference_perftest_header}" ||
   die "reference perftest library is not AArch64"
 
-mkdir -p "$(dirname "${KVAF_DIRECT_DEPLOY_RUN_LOCK}")"
+kvaf_check_legacy_direct_urma_state "${ROOT_DIR}" ||
+  die "legacy direct URMA state blocks provider mutation"
+
+if [[ -L "${KVAF_GLOBAL_STATE_DIR}" ||
+      ( -e "${KVAF_GLOBAL_STATE_DIR}" &&
+        ! -d "${KVAF_GLOBAL_STATE_DIR}" ) ]]; then
+  die "global KVAF state path must be a real directory"
+fi
+mkdir -p "${KVAF_GLOBAL_STATE_DIR}"
+chmod 0700 "${KVAF_GLOBAL_STATE_DIR}"
+if [[ -L "${KVAF_DIRECT_STATE_DIR}" ||
+      ( -e "${KVAF_DIRECT_STATE_DIR}" &&
+        ! -d "${KVAF_DIRECT_STATE_DIR}" ) ]]; then
+  die "direct URMA state path must be a real directory"
+fi
+mkdir -p "${KVAF_DIRECT_STATE_DIR}" \
+  "$(dirname "${KVAF_DIRECT_DEPLOY_RUN_LOCK}")" \
+  "$(dirname "${KVAF_DIRECT_ACTIVE_SESSION_LOCK}")"
+chmod 0700 "${KVAF_DIRECT_STATE_DIR}"
+for guarded_path in \
+  "${KVAF_DIRECT_DEPLOY_RUN_LOCK}" \
+  "${KVAF_DIRECT_ACTIVE_SESSION_LOCK}" \
+  "${KVAF_DIRECT_ACTIVE_SESSION_FILE}" \
+  "${KVAF_DIRECT_QUARANTINE_FILE}"
+do
+  [[ ! -L "${guarded_path}" ]] ||
+    die "persistent state path must not be a symlink: ${guarded_path}"
+done
 exec 9>"${KVAF_DIRECT_DEPLOY_RUN_LOCK}"
 if ! flock -w 30 9; then
   die "another direct URMA deploy/run owns ${KVAF_DIRECT_DEPLOY_RUN_LOCK}"
 fi
+if [[ -e "${KVAF_DIRECT_QUARANTINE_FILE}" ||
+      -L "${KVAF_DIRECT_QUARANTINE_FILE}" ||
+      -e "${KVAF_DIRECT_ACTIVE_SESSION_FILE}" ||
+      -L "${KVAF_DIRECT_ACTIVE_SESSION_FILE}" ]]; then
+  die "direct URMA active/quarantine state blocks provider mutation"
+fi
+[[ ! -L "${KVAF_DIRECT_ACTIVE_SESSION_LOCK}" ]] ||
+  die "active-session lock path must not be a symlink"
+exec 8>"${KVAF_DIRECT_ACTIVE_SESSION_LOCK}"
+flock -n 8 || die "a live direct URMA worker blocks provider mutation"
 
 mkdir -p "$(dirname "${KVAF_DIRECT_PROVIDER_BUILD_DIR}")"
 mkdir -p "${KVAF_DIRECT_PROVIDER_BUILD_DIR}"
@@ -446,6 +484,11 @@ urma_common_library_build_id=${urma_common_library_build_id}
 udma_provider_library_path=${KVAF_UDMA_PROVIDER_LIBRARY}
 udma_provider_library_sha256=${udma_provider_library_sha}
 udma_provider_library_build_id=${udma_provider_library_build_id}
+# This build observes the system UDMA provider but does not replace it.  The
+# source-matched implementation currently drops selected ungrant/free errors,
+# so it cannot provide a retryable teardown proof.  The runner fails closed on
+# this value unless an operator explicitly opts into exploratory hardware use.
+udma_teardown_contract=unverified-system-provider
 reference_perftest_abi=perftest-aiv-v1
 reference_perftest_library_path=${KVAF_REFERENCE_PERFTEST_LIBRARY}
 reference_perftest_library_sha256=${reference_perftest_library_sha}

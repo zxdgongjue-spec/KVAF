@@ -77,6 +77,22 @@ int main(int argc, char **argv)
         (void)dlclose(library);
         return 1;
     }
+    close_args.session_id = 1;
+    close_result = 0;
+    if (close_entry(&close_args) != 0 || close_result != -1) {
+        (void)fprintf(stderr,
+            "empty provider instance acknowledged a foreign session\n");
+        (void)dlclose(library);
+        return 1;
+    }
+    close_args.session_id = 2;
+    close_result = 0;
+    if (close_entry(&close_args) != 0 || close_result != -1) {
+        (void)fprintf(stderr,
+            "a second foreign session was acknowledged by an empty provider\n");
+        (void)dlclose(library);
+        return 1;
+    }
     close_args.result_address = 0;
     if (close_entry(&close_args) == 0 || close_entry(NULL) == 0) {
         (void)fprintf(stderr,

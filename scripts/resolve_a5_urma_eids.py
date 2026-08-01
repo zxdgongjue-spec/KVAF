@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import fcntl
 import json
 import math
@@ -39,7 +40,9 @@ REMOTE_EID_PATTERN = re.compile(
 )
 MAX_PAIR_INFO_BYTES = 1024 * 1024
 MAX_UINT32 = (1 << 32) - 1
-DEFAULT_LOCK_FILE = Path("/run/lock/kvaf_asdrv_ub_pair.lock")
+GLOBAL_STATE_ROOT = Path("/data/.kvaf-state")
+DEFAULT_LOCK_FILE = GLOBAL_STATE_ROOT / "asdrv-ub-pair.lock"
+LEGACY_LOCK_FILE = Path("/run/lock/kvaf_asdrv_ub_pair.lock")
 
 
 class EidResolutionError(ValueError):
@@ -176,6 +179,17 @@ def choose_pair(
 
 def acquire_lock(lock_file: Path, timeout_seconds: float):
     lock_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    parent_metadata = lock_file.parent.lstat()
+    if not stat.S_ISDIR(parent_metadata.st_mode):
+        raise EidResolutionError(
+            f"selector lock parent is not a real directory: "
+            f"{lock_file.parent}"
+        )
+    if parent_metadata.st_uid != os.geteuid():
+        raise EidResolutionError(
+            f"selector lock parent is not owned by uid {os.geteuid()}: "
+            f"{lock_file.parent}"
+        )
     flags = os.O_RDWR | os.O_CREAT
     flags |= getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -212,12 +226,41 @@ def acquire_lock(lock_file: Path, timeout_seconds: float):
             time.sleep(0.05)
 
 
+@contextmanager
+def acquire_selector_locks(
+    lock_file: Path,
+    timeout_seconds: float,
+    legacy_lock_file: Path | None = LEGACY_LOCK_FILE,
+):
+    """Serialize the host-global selector across new and legacy callers.
+
+    The persistent lock lives next to the repository so the Server-B host and
+    all containers that mount /data observe the same inode.  While the default
+    is in use, also take the historical /run lock so an older resolver in the
+    same execution environment cannot overlap the selector write/read pair.
+    An explicitly supplied lock remains isolated, which is useful for tests
+    and for callers that deliberately coordinate through another global path.
+    """
+
+    with acquire_lock(lock_file, timeout_seconds):
+        if (
+            legacy_lock_file is not None
+            and os.path.realpath(lock_file)
+            != os.path.realpath(legacy_lock_file)
+        ):
+            with acquire_lock(legacy_lock_file, timeout_seconds):
+                yield
+        else:
+            yield
+
+
 def read_driver_pair(
     proc_root: Path,
     physical_device_id: int,
     requested_channel: int | None,
     lock_file: Path,
     lock_timeout_seconds: float,
+    legacy_lock_file: Path | None = LEGACY_LOCK_FILE,
 ) -> DriverPair:
     selector = proc_root / "dev_id"
     pair_info = proc_root / "pair_info"
@@ -226,7 +269,9 @@ def read_driver_pair(
             f"{proc_root}/{{dev_id,pair_info}} is unavailable"
         )
 
-    with acquire_lock(lock_file, lock_timeout_seconds):
+    with acquire_selector_locks(
+        lock_file, lock_timeout_seconds, legacy_lock_file
+    ):
         last_error = ""
         for attempt in range(3):
             with selector.open("w", encoding="utf-8") as stream:
@@ -276,6 +321,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--lock-timeout-seconds", type=float, default=10.0
     )
     parser.add_argument(
+        "--legacy-lock-file",
+        type=Path,
+        default=LEGACY_LOCK_FILE,
+        help=(
+            "historical same-namespace lock acquired after the persistent "
+            "lock during migration"
+        ),
+    )
+    parser.add_argument(
         "--shell",
         action="store_true",
         help="print only fixed KEY=value records for the KVAF runner",
@@ -313,6 +367,7 @@ def main(argv: list[str] | None = None) -> int:
             args.pair_channel,
             args.lock_file,
             args.lock_timeout_seconds,
+            args.legacy_lock_file,
         )
     except (OSError, EidResolutionError) as error:
         print(f"ERROR: A5 EID resolution failed: {error}", file=sys.stderr)

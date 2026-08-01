@@ -18,6 +18,10 @@ enum kvaf_perftest_checked_status {
   KVAF_PERFTEST_CHECKED_DESTROY_UNSAFE = -3,
 };
 
+// Arms one monotonic deadline for the upstream connect/accept helper. It must
+// be called immediately before establish_connection().
+int kvaf_perftest_set_control_timeout(unsigned int timeout_seconds);
+
 int kvaf_perftest_create_duplex_ctx_checked(
     perftest_context_t *ctx, perftest_config_t *cfg);
 

@@ -1,7 +1,9 @@
 #include "kvaf/access_operator/a5/direct_urma_resources.h"
 
 #include <acl/acl.h>
+#include <runtime/rt_external_kernel.h>
 
+#include <arpa/inet.h>
 #include <dlfcn.h>
 
 #include <algorithm>
@@ -21,28 +23,27 @@
 namespace kvaf::access::a5 {
 namespace {
 
-constexpr std::uint32_t kAicpuKfcKernelType = 5;
+constexpr std::uint32_t kAicpuKfcKernelType =
+    static_cast<std::uint32_t>(KERNEL_TYPE_AICPU_KFC);
 constexpr std::uint32_t kProviderRequiredFlags =
     KVAF_URMA_PROVIDER_CONNECTED |
     KVAF_URMA_PROVIDER_REMOTE_EID_NETWORK_ORDER |
     KVAF_URMA_PROVIDER_QUEUE_IS_AICPU_SHARED_VA;
 
-struct RtAicpuArgsEx {
-  void* args;
-  void* host_input_info;
-  void* kernel_offset_info;
-  std::uint32_t args_size;
-  std::uint16_t host_input_info_count;
-  std::uint16_t kernel_offset_info_count;
-  std::uint32_t so_name_offset;
-  std::uint32_t kernel_name_offset;
-  bool no_h2d_copy;
-  std::uint16_t timeout;
-  std::uint8_t reserved;
-};
-
-static_assert(sizeof(RtAicpuArgsEx) == 48,
+static_assert(sizeof(rtAicpuArgsEx_t) == 48,
               "unexpected CANN rtAicpuArgsEx ABI");
+static_assert(offsetof(rtAicpuArgsEx_t, args) == 0 &&
+                  offsetof(rtAicpuArgsEx_t, hostInputInfoPtr) == 8 &&
+                  offsetof(rtAicpuArgsEx_t, kernelOffsetInfoPtr) == 16 &&
+                  offsetof(rtAicpuArgsEx_t, argsSize) == 24 &&
+                  offsetof(rtAicpuArgsEx_t, hostInputInfoNum) == 28 &&
+                  offsetof(rtAicpuArgsEx_t, kernelOffsetInfoNum) == 30 &&
+                  offsetof(rtAicpuArgsEx_t, soNameAddrOffset) == 32 &&
+                  offsetof(rtAicpuArgsEx_t, kernelNameAddrOffset) == 36 &&
+                  offsetof(rtAicpuArgsEx_t, isNoNeedH2DCopy) == 40 &&
+                  offsetof(rtAicpuArgsEx_t, timeout) == 42 &&
+                  offsetof(rtAicpuArgsEx_t, reserved) == 44,
+              "unexpected CANN rtAicpuArgsEx field layout");
 
 struct alignas(64) DirectQueueState {
   std::uint64_t packed_sq_head{0};
@@ -86,7 +87,8 @@ Status CopyFixedString(const std::string& source, char* destination,
 
 Status ValidateProviderResult(
     const kvaf_urma_provider_result_v2& result,
-    DirectUrmaExecutionDomain domain, std::uint64_t expected_session_id) {
+    DirectUrmaExecutionDomain domain, std::uint64_t expected_session_id,
+    const std::string& expected_peer_eid) {
   if (result.magic != KVAF_URMA_PROVIDER_MAGIC ||
       result.abi_version != KVAF_URMA_PROVIDER_ABI_VERSION ||
       result.struct_size != sizeof(result) ||
@@ -105,6 +107,16 @@ Status ValidateProviderResult(
     return Status::Error(
         StatusCode::kTransportError,
         "direct URMA provider returned an invalid memory view");
+  }
+  std::array<std::uint8_t, 16> expected_peer{};
+  if (inet_pton(AF_INET6, expected_peer_eid.c_str(),
+                expected_peer.data()) != 1 ||
+      !std::equal(expected_peer.begin(), expected_peer.end(),
+                  std::begin(result.remote_eid))) {
+    return Status::Error(
+        StatusCode::kTransportError,
+        "direct URMA provider returned a remote EID different from the "
+        "requested peer");
   }
   const std::uint32_t expected_private_abi =
       domain == DirectUrmaExecutionDomain::kHostProcess
@@ -168,9 +180,7 @@ struct DirectUrmaResources::Impl {
       const kvaf_urma_provider_config_v2*,
       kvaf_urma_provider_result_v2*);
   using ProviderClose = int (*)(std::uint64_t);
-  using AicpuLaunch = int (*)(
-      std::uint32_t, const char*, std::uint32_t,
-      const RtAicpuArgsEx*, void*, void*, std::uint32_t);
+  using AicpuLaunch = decltype(&rtAicpuKernelLaunchExWithArgs);
 
   DirectUrmaOpenSpec spec;
   kvaf_urma_provider_result_v2 result{};
@@ -181,6 +191,8 @@ struct DirectUrmaResources::Impl {
   AicpuLaunch aicpu_launch{nullptr};
   aclrtStream stream{nullptr};
   DirectQueueState* queue_state{nullptr};
+  kvaf_urma_provider_result_v2* device_open_result{nullptr};
+  std::int32_t* device_close_result{nullptr};
   bool queue_state_initialized{false};
   bool last_aicpu_launch_submitted{false};
   bool resource_quiescence_unknown{false};
@@ -189,26 +201,41 @@ struct DirectUrmaResources::Impl {
   bool opened{false};
   bool closed{false};
 
+  bool HasRetainedState() const {
+    return opened || closed || provider_library != nullptr ||
+           provider_open != nullptr || provider_close != nullptr ||
+           runtime_library != nullptr || aicpu_launch != nullptr ||
+           stream != nullptr || queue_state != nullptr ||
+           device_open_result != nullptr || device_close_result != nullptr ||
+           queue_state_initialized || last_aicpu_launch_submitted ||
+           resource_quiescence_unknown || session_id != 0 || provider_active;
+  }
+
   Status LoadRuntime() {
-    static constexpr std::array<const char*, 2> kRuntimeLibraries{
-        "libruntime.so", "libascendcl.so"};
-    for (const auto* library : kRuntimeLibraries) {
-      runtime_library = dlopen(library, RTLD_NOW | RTLD_LOCAL);
-      if (runtime_library == nullptr) {
-        continue;
-      }
+    // The executable is already linked to the build-manifest-pinned
+    // libascendcl. Reopen that loaded object instead of searching an arbitrary
+    // libruntime.so earlier in LD_LIBRARY_PATH (which may be a stub or another
+    // CANN version). dlsym also searches this object's dependency closure.
+    runtime_library = dlopen(
+        "libascendcl.so", RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+    if (runtime_library != nullptr) {
       aicpu_launch = reinterpret_cast<AicpuLaunch>(
           dlsym(runtime_library, "rtAicpuKernelLaunchExWithArgs"));
       if (aicpu_launch != nullptr) {
         return Status::OK();
       }
-      dlclose(runtime_library);
+      if (dlclose(runtime_library) != 0) {
+        return Status::Error(
+            StatusCode::kInternal,
+            "failed to release pinned libascendcl after dlsym failure");
+      }
       runtime_library = nullptr;
     }
     const char* error = dlerror();
     return Status::Error(
         StatusCode::kUnavailable,
-        std::string("rtAicpuKernelLaunchExWithArgs is unavailable: ") +
+        std::string("rtAicpuKernelLaunchExWithArgs is unavailable in the "
+                    "already loaded libascendcl: ") +
             (error == nullptr ? "unknown dlsym error" : error));
   }
 
@@ -217,14 +244,14 @@ struct DirectUrmaResources::Impl {
                      std::uint32_t kernel_name_offset,
                      const char* operation) {
     last_aicpu_launch_submitted = false;
-    RtAicpuArgsEx launch_args{};
+    rtAicpuArgsEx_t launch_args{};
     launch_args.args = args;
-    launch_args.args_size = args_size;
-    launch_args.so_name_offset = so_name_offset;
-    launch_args.kernel_name_offset = kernel_name_offset;
-    const int result_code = aicpu_launch(
+    launch_args.argsSize = args_size;
+    launch_args.soNameAddrOffset = so_name_offset;
+    launch_args.kernelNameAddrOffset = kernel_name_offset;
+    const auto result_code = aicpu_launch(
         kAicpuKfcKernelType, operation, 1, &launch_args, nullptr,
-        stream, 0);
+        reinterpret_cast<rtStream_t>(stream), 0);
     if (result_code != 0) {
       return Status::Error(
           StatusCode::kTransportError,
@@ -232,11 +259,21 @@ struct DirectUrmaResources::Impl {
               std::to_string(result_code));
     }
     last_aicpu_launch_submitted = true;
-    const auto sync_result = aclrtSynchronizeStream(stream);
-    if (sync_result != ACL_SUCCESS) {
+    const auto first_sync_result = aclrtSynchronizeStream(stream);
+    aclError final_sync_result = first_sync_result;
+    if (first_sync_result != ACL_SUCCESS) {
+      // A transient scheduler/runtime wake-up error must not immediately turn
+      // into an unrecoverable ownership state. Retry the same stream once;
+      // no result buffer or provider backing is touched between attempts.
+      final_sync_result = aclrtSynchronizeStream(stream);
+    }
+    if (final_sync_result != ACL_SUCCESS) {
       resource_quiescence_unknown = true;
-      return AclFailure("aclrtSynchronizeStream(AICPU provider)",
-                        sync_result);
+      return Status::Error(
+          StatusCode::kTransportError,
+          "aclrtSynchronizeStream(AICPU provider) failed twice, first=" +
+              std::to_string(first_sync_result) + " second=" +
+              std::to_string(final_sync_result));
     }
     return Status::OK();
   }
@@ -250,15 +287,15 @@ DirectUrmaResources::~DirectUrmaResources() {
 }
 
 Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
-  if (impl_->opened || impl_->closed || spec.local_address == 0 ||
+  if (impl_->HasRetainedState() || spec.local_address == 0 ||
       spec.local_allocation_bytes == 0 ||
       spec.segment_payload_bytes == 0 ||
       spec.control_timeout_seconds == 0 ||
       spec.control_timeout_seconds > 3600U) {
     return Status::Error(
         StatusCode::kInvalidArgument,
-        "direct URMA resources are already used or the memory range is "
-        "invalid");
+        "direct URMA resources are already used, retain cleanup state, or "
+        "the memory range is invalid");
   }
   if (spec.segment_payload_bytes >
           std::numeric_limits<std::uint32_t>::max() ||
@@ -353,7 +390,8 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
         impl_->resource_quiescence_unknown = true;
       }
       status = ValidateProviderResult(
-          impl_->result, spec.execution_domain, impl_->session_id);
+          impl_->result, spec.execution_domain, impl_->session_id,
+          spec.peer_eid);
       (void)Close();
       return status.ok()
                  ? Status::Error(
@@ -403,10 +441,9 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
     }
     impl_->queue_state_initialized = true;
 
-    kvaf_urma_provider_result_v2* device_result = nullptr;
     const auto alloc_result = aclrtMalloc(
-        reinterpret_cast<void**>(&device_result),
-        sizeof(*device_result), ACL_MEM_MALLOC_HUGE_FIRST);
+        reinterpret_cast<void**>(&impl_->device_open_result),
+        sizeof(*impl_->device_open_result), ACL_MEM_MALLOC_HUGE_FIRST);
     if (alloc_result != ACL_SUCCESS) {
       status = AclFailure("aclrtMalloc(AICPU provider result)",
                           alloc_result);
@@ -415,10 +452,9 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
     }
     kvaf_urma_provider_result_v2 empty_result{};
     auto copy_result = aclrtMemcpy(
-        device_result, sizeof(empty_result), &empty_result,
+        impl_->device_open_result, sizeof(empty_result), &empty_result,
         sizeof(empty_result), ACL_MEMCPY_HOST_TO_DEVICE);
     if (copy_result != ACL_SUCCESS) {
-      (void)aclrtFree(device_result);
       status = AclFailure("aclrtMemcpy(AICPU result initialize)",
                           copy_result);
       (void)Close();
@@ -436,7 +472,7 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
     }
     open_args.config = config;
     open_args.result_address =
-        reinterpret_cast<std::uint64_t>(device_result);
+        reinterpret_cast<std::uint64_t>(impl_->device_open_result);
     if (status.ok()) {
       // Close is idempotent even if the Open kernel is rejected before
       // creating a context. Mark the provider first so every launch/sync/copy
@@ -454,10 +490,14 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
     }
     if (status.ok()) {
       copy_result = aclrtMemcpy(
-          &impl_->result, sizeof(impl_->result), device_result,
+          &impl_->result, sizeof(impl_->result),
+          impl_->device_open_result,
           sizeof(impl_->result), ACL_MEMCPY_DEVICE_TO_HOST);
       if (copy_result != ACL_SUCCESS) {
-        impl_->resource_quiescence_unknown = true;
+        // The Open AICPU stream already synchronized, so the task is no
+        // longer in flight. Keep the exact session and result allocation,
+        // then let Close perform checked teardown. Only a Close launch/sync
+        // failure makes provider quiescence unknown.
         status = AclFailure("aclrtMemcpy(AICPU provider result)",
                             copy_result);
       } else if (impl_->result.magic == KVAF_URMA_PROVIDER_MAGIC &&
@@ -477,14 +517,6 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
         }
       }
     }
-    if (!impl_->resource_quiescence_unknown) {
-      const auto free_result = aclrtFree(device_result);
-      if (status.ok() && free_result != ACL_SUCCESS) {
-        impl_->resource_quiescence_unknown = true;
-        status = AclFailure("aclrtFree(AICPU provider result)",
-                            free_result);
-      }
-    }
     if (!status.ok()) {
       (void)Close();
       return status;
@@ -492,23 +524,20 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
   }
 
   status = ValidateProviderResult(
-      impl_->result, spec.execution_domain, impl_->session_id);
+      impl_->result, spec.execution_domain, impl_->session_id,
+      spec.peer_eid);
   if (!status.ok()) {
-    if (impl_->provider_active) {
-      impl_->resource_quiescence_unknown = true;
-    } else {
-      (void)Close();
-    }
+    // The Open task has completed and this object still owns the exact
+    // session.  A malformed/incompatible result is not itself evidence of
+    // in-flight DMA: use the checked Close path and quarantine only if that
+    // close cannot prove teardown.
+    (void)Close();
     return status;
   }
   if (!RangeContains(impl_->result.local_base,
                      impl_->result.local_bytes, spec.local_address,
                      spec.segment_payload_bytes)) {
-    if (impl_->provider_active) {
-      impl_->resource_quiescence_unknown = true;
-    } else {
-      (void)Close();
-    }
+    (void)Close();
     return Status::Error(
         StatusCode::kTransportError,
         "direct URMA provider local MR does not contain the requested "
@@ -618,6 +647,11 @@ Status DirectUrmaResources::SnapshotDirectChannel(
   return Status::OK();
 }
 
+bool DirectUrmaResources::transport_teardown_complete() const {
+  return !impl_->provider_active &&
+         !impl_->resource_quiescence_unknown;
+}
+
 Status DirectUrmaResources::Close() {
   if (impl_->closed) {
     return Status::OK();
@@ -685,11 +719,12 @@ Status DirectUrmaResources::Close() {
             impl_->spec.provider_soname, close_args.so_name,
             sizeof(close_args.so_name), "AICPU provider soname");
       }
-      std::int32_t* device_close_result = nullptr;
-      if (close_status.ok()) {
+      if (close_status.ok() &&
+          impl_->device_close_result == nullptr) {
         const auto alloc_result = aclrtMalloc(
-            reinterpret_cast<void**>(&device_close_result),
-            sizeof(*device_close_result), ACL_MEM_MALLOC_HUGE_FIRST);
+            reinterpret_cast<void**>(&impl_->device_close_result),
+            sizeof(*impl_->device_close_result),
+            ACL_MEM_MALLOC_HUGE_FIRST);
         if (alloc_result != ACL_SUCCESS) {
           close_status = AclFailure(
               "aclrtMalloc(AICPU close result)", alloc_result);
@@ -699,7 +734,8 @@ Status DirectUrmaResources::Close() {
           std::numeric_limits<std::int32_t>::min();
       if (close_status.ok()) {
         const auto copy_result = aclrtMemcpy(
-            device_close_result, sizeof(*device_close_result),
+            impl_->device_close_result,
+            sizeof(*impl_->device_close_result),
             &kCloseNotExecuted, sizeof(kCloseNotExecuted),
             ACL_MEMCPY_HOST_TO_DEVICE);
         if (copy_result != ACL_SUCCESS) {
@@ -708,7 +744,7 @@ Status DirectUrmaResources::Close() {
         }
       }
       close_args.result_address =
-          reinterpret_cast<std::uint64_t>(device_close_result);
+          reinterpret_cast<std::uint64_t>(impl_->device_close_result);
       if (close_status.ok()) {
         close_status = impl_->InvokeAicpu(
             &close_args, sizeof(close_args),
@@ -719,8 +755,10 @@ Status DirectUrmaResources::Close() {
       std::int32_t close_result = kCloseNotExecuted;
       if (close_status.ok()) {
         const auto copy_result = aclrtMemcpy(
-            &close_result, sizeof(close_result), device_close_result,
-            sizeof(*device_close_result), ACL_MEMCPY_DEVICE_TO_HOST);
+            &close_result, sizeof(close_result),
+            impl_->device_close_result,
+            sizeof(*impl_->device_close_result),
+            ACL_MEMCPY_DEVICE_TO_HOST);
         if (copy_result != ACL_SUCCESS) {
           close_status = AclFailure(
               "aclrtMemcpy(AICPU close result)", copy_result);
@@ -733,14 +771,10 @@ Status DirectUrmaResources::Close() {
           provider_was_closed = true;
         }
       }
-      if (device_close_result != nullptr &&
-          !impl_->resource_quiescence_unknown) {
-        const auto free_result = aclrtFree(device_close_result);
-        if (close_status.ok() && free_result != ACL_SUCCESS) {
-          close_status = AclFailure(
-              "aclrtFree(AICPU close result)", free_result);
-        }
-      }
+    } else {
+      close_status = Status::Error(
+          StatusCode::kTransportError,
+          "active AICPU provider lost its launch stream/runtime handle");
     }
     if (provider_was_closed) {
       impl_->provider_active = false;
@@ -750,6 +784,25 @@ Status DirectUrmaResources::Close() {
     }
   }
   impl_->opened = false;
+
+  // These tiny AICPU result buffers remain object-owned until provider
+  // teardown is proven.  Clear a pointer only after aclrtFree succeeds so a
+  // transient local cleanup error can be retried without re-closing the
+  // provider or losing the allocation handle.
+  if (impl_->device_close_result != nullptr) {
+    const auto result = aclrtFree(impl_->device_close_result);
+    if (result != ACL_SUCCESS) {
+      return AclFailure("aclrtFree(AICPU close result)", result);
+    }
+    impl_->device_close_result = nullptr;
+  }
+  if (impl_->device_open_result != nullptr) {
+    const auto result = aclrtFree(impl_->device_open_result);
+    if (result != ACL_SUCCESS) {
+      return AclFailure("aclrtFree(AICPU provider result)", result);
+    }
+    impl_->device_open_result = nullptr;
+  }
 
   if (impl_->queue_state != nullptr) {
     const auto result = aclrtFree(impl_->queue_state);
@@ -767,12 +820,24 @@ Status DirectUrmaResources::Close() {
     impl_->stream = nullptr;
   }
   if (impl_->runtime_library != nullptr) {
-    dlclose(impl_->runtime_library);
+    if (dlclose(impl_->runtime_library) != 0) {
+      const char* error = dlerror();
+      return Status::Error(
+          StatusCode::kInternal,
+          std::string("dlclose(AICPU runtime library) failed: ") +
+              (error == nullptr ? "unknown dlclose error" : error));
+    }
     impl_->runtime_library = nullptr;
     impl_->aicpu_launch = nullptr;
   }
   if (impl_->provider_library != nullptr) {
-    dlclose(impl_->provider_library);
+    if (dlclose(impl_->provider_library) != 0) {
+      const char* error = dlerror();
+      return Status::Error(
+          StatusCode::kInternal,
+          std::string("dlclose(direct URMA provider) failed: ") +
+              (error == nullptr ? "unknown dlclose error" : error));
+    }
     impl_->provider_library = nullptr;
     impl_->provider_open = nullptr;
     impl_->provider_close = nullptr;

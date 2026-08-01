@@ -195,21 +195,108 @@ AIV stream 完成
   -> 删除 Jetty/JFC/context
 ```
 
-runner 只有在两个进程退出码、数据/canary、provider close marker 全部精确
-通过时才打印：
+每次运行生成独立 `run_id`。`device.close_ready`、`device.done` 和两端最终
+marker 都必须携带同一 nonce，旧目录中的 marker 不能触发本次释放。两端
+分别原子写入 `exchange/host.final` 和 `exchange/device.final`；runner 用
+严格解析器拒绝重复字段、软链接、错误角色、错误 nonce 和缺失的安全证明。
+
+端点终态分为三类，runner 另外保留一个“证据暂缺”的可恢复状态：
+
+退出码 2 专用于启动前的 fail-closed 预检失败，例如目标 NPU 忙、`npu-smi`
+不可用/输出无法严格解析、构建来源不一致或端口已占用。此时 Host/Device 尚未
+创建 DDR、HBM、URMA、SQ 或 CQ 资源，不需要 reset，也不会生成 quarantine。
+
+| 终态 | 退出码 | 是否写 quarantine | 含义 |
+|---|---:|---|---|
+| `PASS` | 0 | 否 | 传输、校验和 teardown 全部通过 |
+| `FAIL_SAFE` | 3 | 否 | 功能失败，但 stream/queue/provider 已关闭，Host 映射已注销；普通本地内存或句柄即使清理失败也不再可被 DMA，可直接修复后重试 |
+| `FAIL_UNSAFE` | 4 | 是 | 同步、Close 或 backing 状态无法证明，必须保留进程和内存 |
+| `PENDING_UNPROVEN` | 5 | 否，保留 active | worker 尚未退出、marker 尚未到齐或分类器暂时无法完成；不等同于不安全，不复位、不杀进程，稍后重跑脚本会自动复核 |
+
+分类器内部用退出码 6 表示 `UNPROVEN`（缺失、损坏、错误 nonce 或证明不完整）；
+runner 将它收敛为上表的退出码 5。它不会再把“证据不可解析”冒充成端点已经明确
+发布的 `FAIL_UNSAFE`。反过来，只要任一端存在合法、nonce 一致的
+`FAIL_UNSAFE final`，即使另一端 marker 或短 `fatal.*` 写失败，也会可靠进入
+quarantine。
+
+runner 收到 `Ctrl+C`（`INT`）时，若还没启动资源则安全退出；若 Host 已经
+启动且仍在运行，则先保证 Device 也进入受记录的 pair 状态，再以 130 脱离监督
+并保留 active。这样中断不会再次制造“只知道一个 PID”的半启动会话。
+
+因此，payload/canary 校验失败但双方 provider Close、Host unregister 和 HBM
+释放都成功时，不再误写 quarantine。只有两个进程的最终证明和正向证据都
+精确通过时才打印：
 
 ```text
 KVAF_A5_AIV_SIMT_DIRECT_URMA_H2D_ACCEPTANCE=PASS
 ```
 
-超时、stream 同步失败、provider cleanup 不确定或 marker 缺失会生成：
+Device 在发起 AIV DMA 前失败、或在同步完成后安全回收但无法继续协议时，会先
+原子写入本次 `run_id` 对应的 `device.final=FAIL_SAFE`，再发布
+`device.safe_abort`。Host 以完整 `device.final` 的 stream/queue/provider 安全字段
+为权威证明，短 marker 只用于加速唤醒、写失败也不影响最终恢复。Host 的等待周期
+到期只打印 pending 日志并继续持有资源；晚到的 nonce-bound 证明仍能触发正常
+Close/unregister。Device 写 `close_ready` 失败时同样保留所有权并持续原子重试，
+不会一端进入 Close、另一端永久等待文件而形成 teardown 死锁。
+
+只有端点发布可严格解析的 `FAIL_UNSAFE final`（`fatal.host/fatal.device` 只是
+nonce 校验后的早醒信号），或使用无法验证 teardown 的系统 UDMA 且本次已经
+armed，才会生成：
 
 ```text
-/run/lock/kvaf-a5-direct-urma.quarantine
+/data/.kvaf-state/KVAF/direct-urma.quarantine
 ```
 
-此时先按站点流程 reset/硬件隔离所选 NPU，再终止记录的 PID 和删除
-quarantine。不要在 reset 前 `kill -9`。
+普通超时、marker 暂缺、分类器损坏或 runner 中断只保留
+`PENDING_UNPROVEN` active，不会提前声称必须复位。stream 同步失败、provider
+Close 失败等端点明确的 DMA 安全问题仍由端点写 fatal 并进入 quarantine。
+
+worker 在可能取得 DDR/HBM 前忽略异步 HUP/INT/TERM/QUIT。部署兼容锁与
+active-session 锁由 worker 继承；runner 在启动 Host 前写入
+`/data/.kvaf-state/KVAF/direct-urma.active`，只有严格分类器证明
+清理安全后才删除。active/quarantine 使用
+`fsync(临时文件) -> rename -> fsync(状态目录)`，quarantine 持久化成功后才
+允许删除 active。结果 manifest、固化分类器和构建来源也在第一个 launch intent
+前落盘。
+
+资源持有期的 C++ 异常由组合 owner 统一接管：provider 未证明关闭之前，独立的
+Host mapping/HBM allocation 析构不会先释放 backing。若异常处理本身再次 OOM，
+预装的 terminate handler 只用固定缓冲区写诊断并保持进程存活。AICPU provider
+stream 的同步错误会在不触碰 result/backing 的情况下对同一 stream 重试一次；
+第二次仍失败才进入 unsafe。
+
+状态和结果使用与 checkout 无关、宿主机与 Docker 共享的机器级根
+`/data/.kvaf-state`。因此 runner 被 `SIGKILL`、容器被删除或重建、
+`git clean` 或仓库重拉之后，持久化证据仍会阻止第二个 singleton provider
+会话并支持自动恢复。不要手工删除 `/data/.kvaf-state` 中的锁、active、
+quarantine 或 active 引用的结果目录；`flock` 绑定 inode，删除锁文件会制造第二把
+看似同名但实际不同的锁。
+
+当前 active/quarantine 是整机 KVAF singleton，不按 NPU 分片。一个未解决的
+session 会阻止换另一张卡继续测试，这是有意的 fail-closed 约束；在证明各 NPU
+的 UDMA/driver ownership 完全隔离前，不要通过复制仓库或删除锁绕过它。
+
+active 状态在每次 fork 前先写 `host_launch_intent` 或
+`device_launch_intent`，fork 成功后再补 PID。恢复逻辑按 phase 决定必须检查
+单端还是双端终态，绝不会因为 SIGKILL 恰好发生在 fork 与 PID 落盘之间，就把
+`pid=0` 当成“进程从未启动”。若终态已经证明安全但 worker 尚未退出，状态会
+保留为 `safe_terminal_process_stuck`；worker 继续持有 active-session 锁。下次
+执行会先打印记录的 PID，待 worker 自然退出后再按同一 `run_id` 自动复核并清理
+active 状态，全程不会再次访问 topology、EID selector 或 NPU。
+
+端点在 `aclrtResetDevice`/`aclFinalize` 之前先写一份
+`transport_safe_runtime_cleanup_pending` 的 `FAIL_SAFE` 证明。这里的
+`aclrtResetDevice` 是进程运行时 context 清理，不是 `npu-smi` 的整卡复位。若
+runtime detach 卡住，已证明关闭的 stream/queue/provider/Host 映射不会因此被
+重新判成 DMA 不安全；detach 完成后 PASS 会原子覆盖这份临时证明。
+
+`FAIL_SAFE` 不需要 reset，也不应手工创建或删除 quarantine。`FAIL_UNSAFE`
+仍需先按站点流程 reset/硬件隔离所选 NPU，再终止记录的 PID 和删除
+quarantine；不要在隔离前 `kill -9`。
+
+`PENDING_UNPROVEN` 也不需要 reset。先让 worker 继续完成；active-session 锁释放
+后再次运行同一脚本，它会在访问 topology/EID/NPU 之前用原 `run_id` 和结果目录中
+固化的分类器自动清理安全状态。只有明确的 quarantine 才进入站点隔离流程。
 
 ## 6. 操作命令
 
@@ -346,7 +433,11 @@ export KVAF_DEVICE_EID_INDEX=<Device侧EID序号>
 
 Host/Device peer EID 默认由
 `scripts/resolve_a5_urma_eids.py` 从 `/proc/asdrv_ub/pair_info` 解析，不依赖
-memcache。
+memcache。`dev_id` 是宿主机全局 selector；新代码统一通过宿主机和 Docker 都能
+看到的 `/data/.kvaf-state/asdrv-ub-pair.lock` 串行化完整的
+`write dev_id -> read pair_info -> validate/retry`。迁移期还会取得同一 namespace
+中的旧 `/run/lock/kvaf_asdrv_ub_pair.lock`。不同容器的 `/run` 不能互相保护，
+因此升级期间不要并发运行旧 resolver；所有调用方升级后以 `/data` 锁为准。
 
 ### 6.7 Docker：运行 H2D
 
@@ -354,11 +445,79 @@ memcache。
 
 ```bash
 unset KVAF_HOST_EID KVAF_DEVICE_EID KVAF_PAIR_CHANNEL
+unset KVAF_DIRECT_ALLOW_BUSY_NPU
 export KVAF_LOGICAL_DEVICE_ID=0
+export KVAF_PHYSICAL_DEVICE_ID=0  # 按服务器 B 的实际映射填写
 export KVAF_H2D_BYTES=4096
 export KVAF_DIRECT_CONTROL_PORT=21115
 
 bash scripts/run_a5_direct_urma_h2d_smoke.sh
+```
+
+当前 `vllm-ascend-cs-kvaf` 挂载全部 0–7 号设备，runner 要求逻辑卡号与物理卡号
+相等。二者不同时，无法在“不先创建 ACL device context”的前提下证明映射关系，
+因此会在注册 DDR/HBM/URMA 前退出。
+
+该 smoke 的 payload 上限是 64 MiB，避免错误参数在资源 armed 后触发数 GiB 的
+Host 临时分配。必须显式填写 `KVAF_PHYSICAL_DEVICE_ID`；runner 不再为推导它而
+提前调用会执行 `aclrtSetDevice` 的 ACL topology 查询，因为那会在空闲证明之前
+选择/创建 Device context。可先在服务器 B 宿主机用 `npu-smi info -m` 核对映射，
+再在 Docker 中填写实际值。runner 在启动 Host 之前执行 `npu-smi info`；只有
+inventory 中恰好存在该卡，且进程表中明确出现
+`No running processes found in NPU <physical-id>`、没有目标卡进程记录时才继续；
+缺少进程行本身不算空闲证明。目标卡存在 vLLM、SHMEM 或其他 ACL 进程、命令失败、
+输出截断或格式冲突时均以退出码 2 停止，且尚未 armed 任何传输资源。`npu-smi`
+默认由 `timeout` 限制为 15 秒，只有诊断慢机器时才调整
+`KVAF_NPU_SMI_TIMEOUT_SECONDS`（范围 1～120 秒）。
+
+原始快照、解析结果和解析器会分别固化为结果目录中的 `npu-smi-info.txt`、
+`npu-idle-check.txt`、`check_a5_npu_idle.py`，manifest 记录三者哈希。这个检查是
+启动前的瞬时证明，不能阻止检查之后第三方抢占 NPU，因此硬件 smoke 仍应使用
+调度系统隔离的专用卡。
+
+只有明确接受业务干扰和后续 reset 可能影响同卡业务时，才可在同一 Docker 终端
+显式绕过 busy 或 unproven 状态：
+
+```bash
+export KVAF_DIRECT_ALLOW_BUSY_NPU=1
+```
+
+正常测试必须保持该变量未设置；它与下面的 UDMA teardown experimental override
+是两个独立风险开关。
+
+当前构建仍由系统 `liburma-udma.so` 真正执行注册和释放；它尚未提供可验证、
+可重试的 teardown contract。因此 runner 默认在创建任何 DDR/HBM/URMA 资源前
+退出。只做探索性数据通路测试、并接受底层释放失败仍可能需要硬件隔离时，才在
+同一 Docker 终端显式开启：
+
+```bash
+export KVAF_DIRECT_ALLOW_UNVERIFIED_UDMA_TEARDOWN=1
+bash scripts/run_a5_direct_urma_h2d_smoke.sh
+```
+
+输出 `TEARDOWN_ASSURANCE=experimental-unverified` 不能作为生产释放安全证明。
+只要本次确实 armed 过 URMA 资源，即使数据通路显示 PASS，runner 也会以退出码
+4 保留 quarantine；它只报告 `KVAF_A5_DIRECT_DATA_PATH_RESULT=PASS`，不会伪装成
+“可直接重试”。这是系统 UDMA 吞掉底层 ungrant/free 错误时无法规避的边界。
+后续私有 patched UDMA 通过错误传播、phase retry、ABI/ownership probe 后，
+manifest 才能声明 `udma_teardown_contract=checked-retryable-v1`，届时无需该开关。
+
+运行后的处理只看退出码和最终终态：
+
+```bash
+set +e
+bash scripts/run_a5_direct_urma_h2d_smoke.sh
+kvaf_rc=$?
+set -e
+case "$kvaf_rc" in
+  0) echo "PASS" ;;
+  2) echo "PRECHECK_FAILED：未创建资源，修正参数/构建后重试" ;;
+  3) echo "FAIL_SAFE：无需复位，可直接重试" ;;
+  4) echo "FAIL_UNSAFE：保留进程和 backing，按 quarantine 指引处理" ;;
+  5) echo "PENDING_UNPROVEN：不要复位或杀进程，稍后重跑脚本自动复核" ;;
+  130) echo "RUNNER_DETACHED：pair 已记录，稍后重跑脚本自动复核" ;;
+  *) echo "未分类 runner 错误：rc=$kvaf_rc；保留状态并检查输出" ;;
+esac
 ```
 
 若存在多个 active pair，按错误信息指定：
@@ -370,8 +529,32 @@ bash scripts/run_a5_direct_urma_h2d_smoke.sh
 
 成功必须同时看到 Host DDR 注册、两端 provider ready、direct channel、
 数据/canary、两端 teardown 和最终 acceptance marker。证据保存在
-`results/a5_direct_urma_h2d_<run-tag>/`，其中还包含 provider build/source
-manifest。
+`/data/.kvaf-state/KVAF/results/a5_direct_urma_h2d_<run-tag>/`，
+其中还包含 provider build/source
+manifest，以及 direct smoke 的 build/source manifest。runner 会校验实际
+链接的 `libascendcl.so`、官方 ACL/runtime header、二进制和构建时源码哈希；
+失败的原地重编译会先使旧 manifest 失效，不能误用旧二进制继续上硬件。
+Host DDR 注册固定加载真实 driver 路径
+`/usr/local/Ascend/driver/lib64/driver/libascend_hal.so`，AICPU launch 只从已经由
+build manifest 验证并加载的 `libascendcl.so` 依赖闭包解析，不再搜索任意
+`libruntime.so`；结果 manifest 同时记录 HAL 路径与哈希。
+
+direct build、provider build、AICPU package 和 runner 必须共享一个固定恢复根。
+代码拒绝旧终端残留的 `KVAF_DIRECT_STATE_DIR`、`KVAF_DIRECT_RESULT_ROOT`、
+`KVAF_DIRECT_*LOCK`、`KVAF_DIRECT_*FILE` 或 `KVAF_EID_LOCK_FILE` 分叉覆盖；若
+看到 `cannot override the fixed direct URMA recovery root`，只需在当前 Docker
+终端执行：
+
+```bash
+unset KVAF_GLOBAL_STATE_DIR KVAF_DIRECT_STATE_DIR KVAF_DIRECT_RESULT_ROOT
+unset KVAF_EID_LOCK_FILE KVAF_EID_LEGACY_LOCK_FILE
+unset KVAF_DIRECT_DEPLOY_RUN_LOCK KVAF_DIRECT_ACTIVE_SESSION_LOCK
+unset KVAF_DIRECT_ACTIVE_SESSION_FILE KVAF_DIRECT_QUARANTINE_FILE
+```
+
+首次从旧 `/run`/工作树状态版本升级时要安排一次维护窗口：确认旧 runner/worker
+已经安全退出，或旧 quarantine 已按站点流程处理，再启用新版本。不要先删旧容器、
+旧工作树或执行 `git clean -fdx`，因为旧版状态还没有迁入 `/data` 持久根。
 
 ## 7. 是否必须升级 CANN
 
@@ -399,7 +582,8 @@ manifest。
 - 当前 UDMA 源码中的 `udma_u_unregister_seg`/`udma_u_free_tid` 会吞掉
   `ummu_ungrant`/`ummu_free_tid` 的底层失败并返回成功。要可靠释放
   Host DDR/HBM，必须修改并部署匹配的 `liburma-udma.so`，让错误向上传递
-  且失败句柄保持可重试；KVAF 的 quarantine 只能降低风险，不能修复它；
+  且失败句柄保持可重试；当前 runner 因此默认在资源创建前 fail closed，
+  实验开关和 quarantine 只能降低误操作风险，不能修复该底层缺陷；
 - provider 是进程级 singleton，仅支持一个连接；
 - AICPU Open/Close 必须命中同一进程和 SO 实例；
 - Host DVA 的 `non_pin` 注册和 AIV CQ cache 语义仍需当前 A5 固件实测；

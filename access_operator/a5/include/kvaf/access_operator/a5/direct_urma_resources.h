@@ -61,6 +61,10 @@ class DirectUrmaResources {
       Address local_address, std::uint64_t local_bytes,
       Address remote_address, std::uint64_t remote_bytes,
       AivDirectUrmaChannel* direct_channel) const;
+  // True once no provider/queue can access the caller's backing memory. This
+  // can become true even when Close still reports a local control-buffer,
+  // stream-handle, or dlclose cleanup error.
+  bool transport_teardown_complete() const;
   Status Close();
 
  private:

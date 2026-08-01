@@ -3,8 +3,10 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd)
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd -P)
+source "${SCRIPT_DIR}/a5_direct_urma_legacy_guard.sh"
+kvaf_configure_direct_urma_state_paths "${ROOT_DIR}" || exit 2
 
 : "${ASCEND_HOME_PATH:?source the container CANN set_env.sh first}"
 
@@ -15,8 +17,6 @@ KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST=${KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST:-"${
 KVAF_DIRECT_PROVIDER_BUILD_MANIFEST=${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST:-"${KVAF_DIRECT_PROVIDER_BUILD_DIR}/build.manifest"}
 KVAF_DIRECT_PROVIDER_SUCCESS_STAMP=${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP:-"${KVAF_DIRECT_PROVIDER_BUILD_DIR}/build.success"}
 KVAF_DIRECT_AICPU_ARCHIVE=${KVAF_DIRECT_AICPU_ARCHIVE:-"${ASCEND_HOME_PATH}/compat/liburma_perftest.tar.gz"}
-KVAF_DIRECT_DEPLOY_RUN_LOCK=${KVAF_DIRECT_DEPLOY_RUN_LOCK:-/run/lock/kvaf-a5-direct-urma.lock}
-KVAF_DIRECT_QUARANTINE_FILE=${KVAF_DIRECT_QUARANTINE_FILE:-/run/lock/kvaf-a5-direct-urma.quarantine}
 
 die()
 {
@@ -134,7 +134,34 @@ for command in flock nm readelf sha256sum tar realpath; do
     die "${command} is required"
 done
 
-mkdir -p "$(dirname "${KVAF_DIRECT_DEPLOY_RUN_LOCK}")"
+kvaf_check_legacy_direct_urma_state "${ROOT_DIR}" ||
+  die "legacy direct URMA state blocks AICPU packaging"
+
+if [[ -L "${KVAF_GLOBAL_STATE_DIR}" ||
+      ( -e "${KVAF_GLOBAL_STATE_DIR}" &&
+        ! -d "${KVAF_GLOBAL_STATE_DIR}" ) ]]; then
+  die "global KVAF state path must be a real directory"
+fi
+mkdir -p "${KVAF_GLOBAL_STATE_DIR}"
+chmod 0700 "${KVAF_GLOBAL_STATE_DIR}"
+if [[ -L "${KVAF_DIRECT_STATE_DIR}" ||
+      ( -e "${KVAF_DIRECT_STATE_DIR}" &&
+        ! -d "${KVAF_DIRECT_STATE_DIR}" ) ]]; then
+  die "direct URMA state path must be a real directory"
+fi
+mkdir -p "${KVAF_DIRECT_STATE_DIR}" \
+  "$(dirname "${KVAF_DIRECT_DEPLOY_RUN_LOCK}")" \
+  "$(dirname "${KVAF_DIRECT_ACTIVE_SESSION_LOCK}")"
+chmod 0700 "${KVAF_DIRECT_STATE_DIR}"
+for guarded_path in \
+  "${KVAF_DIRECT_DEPLOY_RUN_LOCK}" \
+  "${KVAF_DIRECT_ACTIVE_SESSION_LOCK}" \
+  "${KVAF_DIRECT_ACTIVE_SESSION_FILE}" \
+  "${KVAF_DIRECT_QUARANTINE_FILE}"
+do
+  [[ ! -L "${guarded_path}" ]] ||
+    die "persistent state path must not be a symlink: ${guarded_path}"
+done
 exec 9>"${KVAF_DIRECT_DEPLOY_RUN_LOCK}"
 if ! flock -w 30 9; then
   die "another direct URMA deploy/run owns ${KVAF_DIRECT_DEPLOY_RUN_LOCK}"
@@ -143,6 +170,14 @@ if [[ -e "${KVAF_DIRECT_QUARANTINE_FILE}" ||
       -L "${KVAF_DIRECT_QUARANTINE_FILE}" ]]; then
   die "an unsafe direct URMA session is quarantined; reset or isolate the NPU before packaging"
 fi
+if [[ -e "${KVAF_DIRECT_ACTIVE_SESSION_FILE}" ||
+      -L "${KVAF_DIRECT_ACTIVE_SESSION_FILE}" ]]; then
+  die "an incomplete direct URMA session blocks AICPU packaging"
+fi
+[[ ! -L "${KVAF_DIRECT_ACTIVE_SESSION_LOCK}" ]] ||
+  die "active-session lock path must not be a symlink"
+exec 8>"${KVAF_DIRECT_ACTIVE_SESSION_LOCK}"
+flock -n 8 || die "a live direct URMA worker blocks AICPU packaging"
 
 for artifact in \
   "${KVAF_DIRECT_HOST_PROVIDER_LIBRARY}" \

@@ -31,6 +31,17 @@ find_path(KVAF_ACL_INCLUDE_DIR acl/acl.h
   NO_DEFAULT_PATH
   REQUIRED
 )
+if(KVAF_A5_BUILD_DIRECT_URMA_BACKEND)
+  find_path(KVAF_RUNTIME_INCLUDE_DIR runtime/rt_external_kernel.h
+    PATHS
+      "${ASCEND_HOME_PATH}/include"
+      "${ASCEND_HOME_PATH}/pkg_inc"
+      "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include"
+      "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/pkg_inc"
+    NO_DEFAULT_PATH
+    REQUIRED
+  )
+endif()
 if(KVAF_A5_BUILD_HCOMM_BACKEND)
   find_path(KVAF_HCOMM_RESOURCE_INCLUDE_DIR hcomm/hcomm_res.h
     PATHS
@@ -247,5 +258,6 @@ if(KVAF_A5_BUILD_DIRECT_URMA_BACKEND)
   kvaf_configure_a5_target(kvaf_a5_aiv_direct_urma_h2d_smoke)
   target_include_directories(kvaf_a5_aiv_direct_urma_h2d_smoke PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/provider/include
+    ${KVAF_RUNTIME_INCLUDE_DIR}
   )
 endif()

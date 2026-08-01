@@ -357,8 +357,8 @@ AscendC 基础/SIMT 头。
 
 运行脚本会先查询 logical/physical device 映射和 HCOMM endpoint 拓扑。
 如果没有显式设置 EID，它会调用 KVAF 自带的最小 resolver，通过
-`/run/lock/kvaf_asdrv_ub_pair.lock` 协作锁串行化对
-`/proc/asdrv_ub/dev_id` selector 的写入和 `pair_info` 快照读取，再把
+`/data/.kvaf-state/asdrv-ub-pair.lock` 跨宿主机/Docker 协作锁，
+串行化 `/proc/asdrv_ub/dev_id` selector 的写入和 `pair_info` 快照读取，再把
 `local_eid` 作为 Host EID、`remote_eid` 作为 Device EID：
 
 ```bash

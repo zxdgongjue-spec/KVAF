@@ -8,9 +8,14 @@
 
 namespace kvaf::access::a5 {
 
-// Pins an existing Host DDR allocation into one NPU address space and owns
-// the matching halHostRegister(..., HOST_MEM_MAP_DEV, ...) lifetime.  This
-// component is deliberately independent of HCOMM and liburma.
+// Allocates or pins Host DDR into one NPU address space and owns the matching
+// halHostRegister(..., HOST_MEM_MAP_DEV, ...) lifetime.  This component is
+// deliberately independent of HCOMM and liburma.
+//
+// Close is retryable: if it returns an error, the object retains every HAL
+// handle and any owned backing that might still be device-visible.  The caller
+// must keep the object alive and retry Close; Register/AllocateAndRegister are
+// rejected until teardown has completed successfully.
 class HostDdrDeviceMapping {
  public:
   HostDdrDeviceMapping();
@@ -26,6 +31,10 @@ class HostDdrDeviceMapping {
   Address host_address() const;
   Address device_address() const;
   std::uint64_t bytes() const;
+  // True once halHostUnregisterEx has proved that the NPU no longer has a
+  // mapping. Close may still fail afterward while freeing local Host memory
+  // or unloading HAL; those failures do not imply live DMA reachability.
+  bool device_mapping_removed() const;
   Status Close();
 
  private:

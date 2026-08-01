@@ -6,12 +6,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cctype>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -20,8 +23,10 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -44,12 +49,36 @@ using kvaf::access::a5::HostDdrDeviceMapping;
 constexpr std::uint8_t kCanary = 0xa5;
 constexpr std::uint64_t kCanaryBytes = 64;
 constexpr std::uint64_t kProviderPageBytes = 4096;
-constexpr int kFatalProviderTeardown = 3;
+constexpr std::uint64_t kSmokeMaxTransferBytes = 64ULL * 1024ULL * 1024ULL;
+constexpr auto kTerminalMarkerRetryInterval =
+    std::chrono::milliseconds(100);
+constexpr auto kTerminalMarkerWarningInterval =
+    std::chrono::seconds(10);
+constexpr const char* kFinalMarkerSchema =
+    "kvaf-a5-direct-final-v1";
 
 enum class DeviceTransferOutcome {
   kPassed,
   kFailedQuiesced,
   kUnsafeUnknown,
+};
+
+enum class EndpointOutcome {
+  kPassed,
+  kFailedSafe,
+  kFailedUnsafe,
+};
+
+struct EndpointResult {
+  EndpointOutcome outcome{EndpointOutcome::kFailedSafe};
+  std::string reason{"unspecified"};
+  bool resource_armed{false};
+  bool stream_quiesced{true};
+  bool queue_drained{true};
+  bool provider_closed{true};
+  bool backing_released{true};
+  bool host_mapping_unregistered{true};
+  bool allocations_released{true};
 };
 
 struct Options {
@@ -61,6 +90,7 @@ struct Options {
   std::string provider_library;
   std::string provider_soname{"libkvaf_urma_provider_device.so"};
   std::string exchange_dir;
+  std::string run_id;
   std::uint32_t host_eid_index{0};
   std::uint32_t device_eid_index{0};
   std::uint32_t logical_device_id{0};
@@ -192,7 +222,8 @@ void PrintUsage(const char* program) {
          " --host-urma-device NAME --device-urma-device NAME"
          " --host-eid-index N --device-eid-index N"
          " --provider-library ABS_PATH --provider-soname NAME"
-         " --exchange-dir PATH [--logical-device-id N]"
+         " --exchange-dir PATH --run-id HEX32_OR_LONGER"
+         " [--logical-device-id N]"
          " [--control-port N] [--bytes N]"
          " [--timeout-seconds N]\n";
 }
@@ -226,6 +257,8 @@ bool ParseOptions(int argc, char** argv, Options* options) {
       options->provider_soname = value;
     } else if (key == "--exchange-dir") {
       options->exchange_dir = value;
+    } else if (key == "--run-id") {
+      options->run_id = value;
     } else if (!ParseUnsigned(value, &parsed)) {
       return false;
     } else if (key == "--host-eid-index" &&
@@ -252,14 +285,19 @@ bool ParseOptions(int argc, char** argv, Options* options) {
       options->timeout_seconds =
           static_cast<std::uint32_t>(parsed);
     } else if (key == "--bytes" && parsed != 0 &&
-               parsed <=
-                   kvaf::access::kAivUrmaMaxTransferBytes -
-                       kCanaryBytes) {
+               parsed <= kSmokeMaxTransferBytes) {
       options->bytes = parsed;
     } else {
       return false;
     }
   }
+  const bool valid_run_id =
+      options->run_id.size() >= 32 &&
+      options->run_id.size() <= 128 &&
+      std::all_of(options->run_id.begin(), options->run_id.end(),
+                  [](unsigned char value) {
+                    return std::isxdigit(value) != 0;
+                  });
   return (options->role == "host" ||
           options->role == "device") &&
          !options->host_urma_device.empty() &&
@@ -269,6 +307,7 @@ bool ParseOptions(int argc, char** argv, Options* options) {
          !options->provider_soname.empty() &&
          options->provider_soname.find('/') == std::string::npos &&
          !options->exchange_dir.empty() &&
+         valid_run_id &&
          ParseEid(host_eid, &options->host_eid) &&
          ParseEid(device_eid, &options->device_eid) &&
          options->host_eid != options->device_eid;
@@ -279,77 +318,222 @@ std::string JoinPath(const std::string& directory,
   return directory + "/" + name;
 }
 
-bool FileExists(const std::string& path) {
-  struct stat info {};
-  return ::stat(path.c_str(), &info) == 0 &&
-         S_ISREG(info.st_mode);
-}
-
-bool WaitForFile(const std::string& path,
-                 std::uint32_t timeout_seconds) {
-  const auto deadline =
-      std::chrono::steady_clock::now() +
-      std::chrono::seconds(timeout_seconds);
-  while (std::chrono::steady_clock::now() < deadline) {
-    if (FileExists(path)) {
-      return true;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  }
-  return FileExists(path);
-}
-
-enum class PeerMarkerWait {
-  kFound,
-  kPeerFatal,
-  kTimedOut,
-};
-
-PeerMarkerWait WaitForFileOrPeerFatal(
-    const std::string& path, const std::string& peer_fatal,
-    std::uint32_t timeout_seconds) {
-  const auto deadline =
-      std::chrono::steady_clock::now() +
-      std::chrono::seconds(timeout_seconds);
-  while (std::chrono::steady_clock::now() < deadline) {
-    if (FileExists(path)) {
-      return PeerMarkerWait::kFound;
-    }
-    if (FileExists(peer_fatal)) {
-      return PeerMarkerWait::kPeerFatal;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  }
-  if (FileExists(path)) {
-    return PeerMarkerWait::kFound;
-  }
-  return FileExists(peer_fatal)
-             ? PeerMarkerWait::kPeerFatal
-             : PeerMarkerWait::kTimedOut;
-}
-
 bool AtomicWriteText(const std::string& path,
                      const std::string& text) {
   const std::string temporary =
       path + ".tmp." +
       std::to_string(static_cast<long long>(::getpid()));
-  {
-    std::ofstream output(
-        temporary, std::ios::binary | std::ios::trunc);
-    if (!output) {
-      return false;
+  const int descriptor = ::open(
+      temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+      S_IRUSR | S_IWUSR);
+  if (descriptor < 0) {
+    return false;
+  }
+  std::size_t written = 0;
+  bool ok = true;
+  while (written < text.size()) {
+    const auto result = ::write(
+        descriptor, text.data() + written, text.size() - written);
+    if (result < 0 && errno == EINTR) {
+      continue;
     }
-    output.write(text.data(),
-                 static_cast<std::streamsize>(text.size()));
-    if (!output) {
-      return false;
+    if (result <= 0) {
+      ok = false;
+      break;
     }
+    written += static_cast<std::size_t>(result);
+  }
+  if (ok && ::fsync(descriptor) != 0) {
+    ok = false;
+  }
+  if (::close(descriptor) != 0) {
+    ok = false;
+  }
+  if (!ok) {
+    (void)::unlink(temporary.c_str());
+    return false;
   }
   if (std::rename(temporary.c_str(), path.c_str()) != 0) {
-    std::remove(temporary.c_str());
+    (void)::unlink(temporary.c_str());
+    return false;
+  }
+
+  const auto separator = path.find_last_of('/');
+  const std::string directory =
+      separator == std::string::npos
+          ? "."
+          : (separator == 0 ? "/" : path.substr(0, separator));
+  const int directory_descriptor =
+      ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (directory_descriptor < 0) {
+    return false;
+  }
+  const bool directory_synced = ::fsync(directory_descriptor) == 0;
+  const bool directory_closed = ::close(directory_descriptor) == 0;
+  if (!directory_synced || !directory_closed) {
     return false;
   }
   return true;
+}
+
+const char* OutcomeName(EndpointOutcome outcome) {
+  switch (outcome) {
+    case EndpointOutcome::kPassed:
+      return "PASS";
+    case EndpointOutcome::kFailedSafe:
+      return "FAIL_SAFE";
+    case EndpointOutcome::kFailedUnsafe:
+      return "FAIL_UNSAFE";
+  }
+  return "FAIL_UNSAFE";
+}
+
+EndpointResult PassedEndpoint() {
+  EndpointResult result;
+  result.outcome = EndpointOutcome::kPassed;
+  result.reason = "ok";
+  result.resource_armed = true;
+  return result;
+}
+
+EndpointResult SafeEndpoint(std::string reason,
+                            bool resource_armed = false,
+                            bool backing_released = true,
+                            bool host_mapping_unregistered = true,
+                            bool allocations_released = true) {
+  EndpointResult result;
+  result.outcome = EndpointOutcome::kFailedSafe;
+  result.reason = std::move(reason);
+  result.resource_armed = resource_armed;
+  result.backing_released = backing_released;
+  result.host_mapping_unregistered = host_mapping_unregistered;
+  result.allocations_released = allocations_released;
+  return result;
+}
+
+EndpointResult UnsafeEndpoint(std::string reason,
+                              bool resource_armed = true,
+                              bool stream_quiesced = false,
+                              bool queue_drained = false,
+                              bool provider_closed = false,
+                              bool backing_released = false) {
+  EndpointResult result;
+  result.outcome = EndpointOutcome::kFailedUnsafe;
+  result.reason = std::move(reason);
+  result.resource_armed = resource_armed;
+  result.stream_quiesced = stream_quiesced;
+  result.queue_drained = queue_drained;
+  result.provider_closed = provider_closed;
+  result.backing_released = backing_released;
+  result.host_mapping_unregistered = backing_released;
+  result.allocations_released = backing_released;
+  return result;
+}
+
+std::string ControlMarker(const Options& options, const char* key,
+                          const char* value) {
+  return "schema=kvaf-a5-direct-control-v1\nrun_id=" +
+         options.run_id + "\n" + key + "=" + value + "\n";
+}
+
+bool WriteTerminalMarker(const Options& options,
+                         const EndpointResult& result) {
+  std::ostringstream marker;
+  marker << "schema=" << kFinalMarkerSchema << '\n'
+         << "run_id=" << options.run_id << '\n'
+         << "role=" << options.role << '\n'
+         << "pid=" << static_cast<long long>(::getpid()) << '\n'
+         << "outcome=" << OutcomeName(result.outcome) << '\n'
+         << "reason=" << result.reason << '\n'
+         << "resource_armed=" << (result.resource_armed ? 1 : 0) << '\n'
+         << "stream_quiesced=" << (result.stream_quiesced ? 1 : 0) << '\n'
+         << "queue_drained=" << (result.queue_drained ? 1 : 0) << '\n'
+         << "provider_closed=" << (result.provider_closed ? 1 : 0) << '\n'
+         << "backing_released=" << (result.backing_released ? 1 : 0) << '\n'
+         << "host_mapping_unregistered="
+         << (options.role != "host" ||
+                     result.host_mapping_unregistered
+                 ? 1
+                 : 0)
+         << '\n'
+         << "allocations_released="
+         << (options.role != "device" || result.allocations_released ? 1 : 0)
+         << '\n';
+  return AtomicWriteText(
+      JoinPath(options.exchange_dir,
+               options.role == "host" ? "host.final" : "device.final"),
+      marker.str());
+}
+
+bool PublishDeviceSafeAbortWakeEdge(const Options& options,
+                                    const EndpointResult& result) {
+  if (options.role != "device" ||
+      result.outcome != EndpointOutcome::kFailedSafe) {
+    return false;
+  }
+  // The caller must persist device.final before publishing this optional
+  // wake-up edge. Host validates the full nonce-bound final marker and never
+  // trusts this short marker as teardown proof.
+  return AtomicWriteText(
+      JoinPath(options.exchange_dir, "device.safe_abort"),
+      ControlMarker(options, "endpoint", "FAIL_SAFE"));
+}
+
+void IgnoreLifecycleSignals() {
+  // Once this process can own registered DDR/HBM, asynchronous termination
+  // must never bypass the checked provider teardown. The runner remains
+  // interruptible and records quarantine; these workers keep ownership until
+  // they reach a terminal marker or explicit unsafe quarantine.
+  (void)std::signal(SIGHUP, SIG_IGN);
+  (void)std::signal(SIGINT, SIG_IGN);
+  (void)std::signal(SIGTERM, SIG_IGN);
+  (void)std::signal(SIGQUIT, SIG_IGN);
+  (void)std::signal(SIGPIPE, SIG_IGN);
+}
+
+void PersistTerminalMarkerUntilDurable(
+    const Options& options, const EndpointResult& result,
+    const char* description) {
+  // Once transport safety is known, a temporary /data failure must not turn
+  // that fact into a permanently UNPROVEN run by letting the worker exit.
+  // Keep the inherited active-session lock and retry at a bounded cadence;
+  // after directory fsync succeeds, the worker may finish and a later runner
+  // invocation can recover the nonce-bound terminal state automatically.
+  IgnoreLifecycleSignals();
+  bool warning_written = false;
+  auto next_warning = std::chrono::steady_clock::now();
+  for (;;) {
+    if (WriteTerminalMarker(options, result)) {
+      if (warning_written) {
+        std::cerr << "durable terminal marker publication recovered"
+                  << " role=" << options.role
+                  << " stage=" << description << '\n';
+      }
+      return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (!warning_written || now >= next_warning) {
+      std::cerr
+          << "failed to durably publish terminal marker"
+          << " role=" << options.role
+          << " stage=" << description
+          << "; transport is safe, worker remains live and will retry\n";
+      warning_written = true;
+      next_warning = now + kTerminalMarkerWarningInterval;
+    }
+    std::this_thread::sleep_for(kTerminalMarkerRetryInterval);
+  }
+}
+
+void PublishDeviceSafeAbortWakeEdgeBestEffort(
+    const Options& options, const EndpointResult& result) {
+  if (options.role == "device" &&
+      result.outcome == EndpointOutcome::kFailedSafe &&
+      !PublishDeviceSafeAbortWakeEdge(options, result)) {
+    std::cerr
+        << "failed to publish optional Device safe-abort wake edge; "
+           "durable device.final remains authoritative\n";
+  }
 }
 
 bool ReadText(const std::string& path, std::string* text) {
@@ -373,12 +557,127 @@ bool ReadExactMarker(const std::string& path,
          text == expected;
 }
 
+bool UniqueMarkerField(const std::string& text, const char* key,
+                       std::string* value) {
+  if (key == nullptr || value == nullptr) {
+    return false;
+  }
+  std::size_t count = 0;
+  std::size_t cursor = 0;
+  const std::string prefix = std::string(key) + "=";
+  while (cursor < text.size()) {
+    const auto end = text.find('\n', cursor);
+    const auto length =
+        (end == std::string::npos ? text.size() : end) - cursor;
+    if (length > prefix.size() &&
+        text.compare(cursor, prefix.size(), prefix) == 0) {
+      *value = text.substr(cursor + prefix.size(),
+                           length - prefix.size());
+      ++count;
+    }
+    if (end == std::string::npos) {
+      break;
+    }
+    cursor = end + 1;
+  }
+  return count == 1 && !value->empty();
+}
+
+bool MarkerFieldEquals(const std::string& text, const char* key,
+                       const char* expected) {
+  std::string value;
+  return expected != nullptr && UniqueMarkerField(text, key, &value) &&
+         value == expected;
+}
+
+bool IsCanonicalPositivePid(const std::string& value) {
+  if (value.empty() || value.front() == '0') {
+    return false;
+  }
+  return std::all_of(value.begin(), value.end(), [](const char character) {
+    return character >= '0' && character <= '9';
+  });
+}
+
+bool ValidPeerFatal(const Options& options, const std::string& path) {
+  std::string marker;
+  std::string pid;
+  std::string reason;
+  return ReadText(path, &marker) &&
+         MarkerFieldEquals(marker, "schema",
+                           "kvaf-a5-direct-fatal-v1") &&
+         MarkerFieldEquals(marker, "run_id", options.run_id.c_str()) &&
+         UniqueMarkerField(marker, "pid", &pid) &&
+         IsCanonicalPositivePid(pid) &&
+         UniqueMarkerField(marker, "reason", &reason);
+}
+
+bool ValidDeviceSafeAbortProof(const Options& options) {
+  std::string marker;
+  std::string resource_armed;
+  std::string backing_released;
+  std::string allocations_released;
+  const auto final_path = JoinPath(options.exchange_dir, "device.final");
+  return ReadText(final_path, &marker) &&
+         MarkerFieldEquals(marker, "schema", kFinalMarkerSchema) &&
+         MarkerFieldEquals(marker, "run_id", options.run_id.c_str()) &&
+         MarkerFieldEquals(marker, "role", "device") &&
+         MarkerFieldEquals(marker, "outcome", "FAIL_SAFE") &&
+         MarkerFieldEquals(marker, "stream_quiesced", "1") &&
+         MarkerFieldEquals(marker, "queue_drained", "1") &&
+         MarkerFieldEquals(marker, "provider_closed", "1") &&
+         MarkerFieldEquals(marker, "host_mapping_unregistered", "1") &&
+         UniqueMarkerField(marker, "resource_armed", &resource_armed) &&
+         (resource_armed == "0" || resource_armed == "1") &&
+         UniqueMarkerField(marker, "backing_released", &backing_released) &&
+         (backing_released == "0" || backing_released == "1") &&
+         UniqueMarkerField(marker, "allocations_released",
+                           &allocations_released) &&
+         (allocations_released == "0" || allocations_released == "1");
+}
+
+enum class PeerMarkerWait {
+  kFound,
+  kPeerFatal,
+  kPeerSafeAbort,
+};
+
+PeerMarkerWait WaitForPeerEvidence(
+    const Options& options, const std::string& path,
+    const char* expected_first, const char* expected_second,
+    const std::string& peer_fatal, const char* description) {
+  auto deadline =
+      std::chrono::steady_clock::now() +
+      std::chrono::seconds(options.timeout_seconds);
+  for (;;) {
+    if (ReadExactMarker(path, expected_first) ||
+        (expected_second != nullptr &&
+         ReadExactMarker(path, expected_second))) {
+      return PeerMarkerWait::kFound;
+    }
+    if (ValidPeerFatal(options, peer_fatal)) {
+      return PeerMarkerWait::kPeerFatal;
+    }
+    // The full nonce-bound final marker is the safety proof.  The short
+    // device.safe_abort file is only a wake-up edge and is deliberately not
+    // trusted on its own (nor required if writing that edge failed).
+    if (ValidDeviceSafeAbortProof(options)) {
+      return PeerMarkerWait::kPeerSafeAbort;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      std::cerr << "still waiting for valid " << description
+                << "; ownership remains live and late evidence will be "
+                   "accepted\n";
+      deadline = std::chrono::steady_clock::now() +
+                 std::chrono::seconds(options.timeout_seconds);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+}
+
 [[noreturn]] void QuarantineUnsafeTeardown(
-    const Options& options) {
-  (void)std::signal(SIGHUP, SIG_IGN);
-  (void)std::signal(SIGINT, SIG_IGN);
-  (void)std::signal(SIGTERM, SIG_IGN);
-  (void)std::signal(SIGQUIT, SIG_IGN);
+    const Options& options, const EndpointResult& result) {
+  IgnoreLifecycleSignals();
 
   const auto pid = static_cast<long long>(::getpid());
   const std::string marker = JoinPath(
@@ -387,13 +686,16 @@ bool ReadExactMarker(const std::string& path,
           ? "fatal.host"
           : "fatal.device");
   const bool marker_written = AtomicWriteText(
-      marker, "pid=" + std::to_string(pid) +
-                  "\nreason=unsafe_provider_teardown\n");
+      marker, "schema=kvaf-a5-direct-fatal-v1\nrun_id=" +
+                  options.run_id + "\npid=" + std::to_string(pid) +
+                  "\nreason=" + result.reason + "\n");
+  const bool final_written = WriteTerminalMarker(options, result);
   std::cerr
       << "KVAF_A5_DIRECT_QUARANTINED"
       << " role=" << options.role
       << " pid=" << pid
       << " marker_written=" << (marker_written ? 1 : 0)
+      << " final_written=" << (final_written ? 1 : 0)
       << "; backing memory remains owned by this live process. "
          "Do not kill it until the selected NPU has been reset or "
          "otherwise hardware-isolated.\n";
@@ -423,15 +725,30 @@ bool CheckStatus(const Status& status, const char* operation) {
 }
 
 bool CloseProviderWithRetry(DirectUrmaResources* resources,
-                            const char* operation) {
+                            const char* operation,
+                            bool* local_cleanup_complete = nullptr) {
+  if (local_cleanup_complete != nullptr) {
+    *local_cleanup_complete = false;
+  }
   auto status = resources->Close();
   if (status.ok()) {
+    if (local_cleanup_complete != nullptr) {
+      *local_cleanup_complete = true;
+    }
     return true;
   }
   std::cerr << operation << " failed: " << status.message()
             << "; retrying once without releasing backing memory\n";
   status = resources->Close();
   if (status.ok()) {
+    if (local_cleanup_complete != nullptr) {
+      *local_cleanup_complete = true;
+    }
+    return true;
+  }
+  if (resources->transport_teardown_complete()) {
+    std::cerr << operation << " transport is closed, but local control "
+              << "cleanup remains incomplete: " << status.message() << '\n';
     return true;
   }
   std::cerr << operation << " retry failed: " << status.message()
@@ -535,6 +852,7 @@ struct DeviceAllocations {
       }
       if (aclrtFree(pointer) != ACL_SUCCESS) {
         ok = false;
+        return;
       }
       pointer = nullptr;
     };
@@ -552,6 +870,149 @@ struct DeviceAllocations {
     return ok;
   }
 };
+
+struct RetainedEndpointState {
+  std::unique_ptr<DirectUrmaResources> resources;
+  std::unique_ptr<HostDdrDeviceMapping> mapping;
+  std::unique_ptr<DeviceAllocations> allocations;
+  aclrtStream transfer_stream{nullptr};
+  bool transfer_stream_quiesced{true};
+};
+
+RetainedEndpointState g_retained_endpoint;
+std::atomic<bool> g_endpoint_may_own_resources{false};
+
+[[noreturn]] void FailClosedTerminate() noexcept {
+  static constexpr char kMessage[] =
+      "KVAF_A5_DIRECT_TERMINATE_WITH_OWNERSHIP; retaining process and "
+      "backing memory\n";
+  if (g_endpoint_may_own_resources.load(std::memory_order_relaxed)) {
+    (void)::write(STDERR_FILENO, kMessage, sizeof(kMessage) - 1);
+    (void)::signal(SIGHUP, SIG_IGN);
+    (void)::signal(SIGINT, SIG_IGN);
+    (void)::signal(SIGTERM, SIG_IGN);
+    (void)::signal(SIGQUIT, SIG_IGN);
+    for (;;) {
+      (void)::pause();
+    }
+  }
+  _exit(134);
+}
+
+template <typename T>
+void RetainUniqueOnFailure(std::unique_ptr<T>* local,
+                           std::unique_ptr<T>* retained) noexcept {
+  if (local == nullptr || retained == nullptr || *local == nullptr) {
+    return;
+  }
+  if (*retained == nullptr) {
+    retained->swap(*local);
+    return;
+  }
+  // This should be unreachable (one endpoint per worker).  Leaking is still
+  // safer than invoking an independent destructor over DMA-reachable state.
+  (void)local->release();
+}
+
+void RetainEndpointOwnership(
+    std::unique_ptr<DirectUrmaResources>* resources,
+    std::unique_ptr<HostDdrDeviceMapping>* mapping,
+    std::unique_ptr<DeviceAllocations>* allocations,
+    aclrtStream* transfer_stream = nullptr,
+    const bool* transfer_stream_quiesced = nullptr) noexcept {
+  RetainUniqueOnFailure(resources, &g_retained_endpoint.resources);
+  RetainUniqueOnFailure(mapping, &g_retained_endpoint.mapping);
+  RetainUniqueOnFailure(allocations, &g_retained_endpoint.allocations);
+  if (transfer_stream != nullptr && *transfer_stream != nullptr) {
+    if (g_retained_endpoint.transfer_stream == nullptr) {
+      g_retained_endpoint.transfer_stream = *transfer_stream;
+      g_retained_endpoint.transfer_stream_quiesced =
+          transfer_stream_quiesced != nullptr &&
+          *transfer_stream_quiesced;
+    } else if (transfer_stream_quiesced != nullptr) {
+      g_retained_endpoint.transfer_stream_quiesced =
+          g_retained_endpoint.transfer_stream_quiesced &&
+          *transfer_stream_quiesced;
+    }
+    *transfer_stream = nullptr;
+  }
+}
+
+class RetainEndpointOnException {
+ public:
+  RetainEndpointOnException(
+      std::unique_ptr<DirectUrmaResources>* resources,
+      std::unique_ptr<HostDdrDeviceMapping>* mapping,
+      std::unique_ptr<DeviceAllocations>* allocations,
+      aclrtStream* transfer_stream = nullptr,
+      const bool* transfer_stream_quiesced = nullptr) noexcept
+      : resources_(resources),
+        mapping_(mapping),
+        allocations_(allocations),
+        transfer_stream_(transfer_stream),
+        transfer_stream_quiesced_(transfer_stream_quiesced),
+        uncaught_exceptions_(std::uncaught_exceptions()) {}
+
+  ~RetainEndpointOnException() noexcept {
+    if (std::uncaught_exceptions() > uncaught_exceptions_) {
+      RetainEndpointOwnership(resources_, mapping_, allocations_,
+                              transfer_stream_,
+                              transfer_stream_quiesced_);
+    }
+  }
+
+ private:
+  std::unique_ptr<DirectUrmaResources>* resources_;
+  std::unique_ptr<HostDdrDeviceMapping>* mapping_;
+  std::unique_ptr<DeviceAllocations>* allocations_;
+  aclrtStream* transfer_stream_;
+  const bool* transfer_stream_quiesced_;
+  int uncaught_exceptions_;
+};
+
+bool CloseMappingWithRetry(HostDdrDeviceMapping* mapping,
+                           const char* operation,
+                           bool* local_cleanup_complete = nullptr) {
+  if (local_cleanup_complete != nullptr) {
+    *local_cleanup_complete = false;
+  }
+  auto status = mapping->Close();
+  if (status.ok()) {
+    if (local_cleanup_complete != nullptr) {
+      *local_cleanup_complete = true;
+    }
+    return true;
+  }
+  std::cerr << operation << " failed: " << status.message()
+            << "; retrying once without releasing ownership\n";
+  status = mapping->Close();
+  if (status.ok()) {
+    if (local_cleanup_complete != nullptr) {
+      *local_cleanup_complete = true;
+    }
+    return true;
+  }
+  if (mapping->device_mapping_removed()) {
+    std::cerr << operation << " removed the NPU mapping, but local cleanup "
+              << "remains incomplete: " << status.message() << '\n';
+    return true;
+  }
+  std::cerr << operation << " retry failed: " << status.message()
+            << "; mapping ownership will be retained\n";
+  return false;
+}
+
+bool CloseAllocationsWithRetry(DeviceAllocations* allocations) {
+  if (allocations->Close()) {
+    return true;
+  }
+  std::cerr << "one or more aclrtFree calls failed; retrying once\n";
+  if (allocations->Close()) {
+    return true;
+  }
+  std::cerr << "aclrtFree retry failed; allocation handles retained\n";
+  return false;
+}
 
 bool AllocateDeviceInputs(
     std::uint64_t registration_bytes, std::size_t table_entries,
@@ -576,7 +1037,14 @@ bool AllocateDeviceInputs(
 DeviceTransferOutcome RunDeviceTransfer(
     const Options& options, std::uint64_t payload_bytes,
     DirectUrmaResources* resources,
-    DeviceAllocations* allocations) {
+    DeviceAllocations* allocations,
+    aclrtStream* retained_stream, bool* stream_quiesced) {
+  if (retained_stream != nullptr) {
+    *retained_stream = nullptr;
+  }
+  if (stream_quiesced != nullptr) {
+    *stream_quiesced = true;
+  }
   const auto local = resources->local_memory();
   const auto remote = resources->remote_memory();
   if (local.address !=
@@ -715,6 +1183,12 @@ DeviceTransferOutcome RunDeviceTransfer(
   if (!CheckAcl(aclrtCreateStream(&stream), "aclrtCreateStream")) {
     return DeviceTransferOutcome::kFailedQuiesced;
   }
+  if (retained_stream != nullptr) {
+    *retained_stream = stream;
+  }
+  if (stream_quiesced != nullptr) {
+    *stream_quiesced = false;
+  }
   kvaf::access::a5::LaunchAivSimtUrmaH2D(
       stream, allocations->params, allocations->completion,
       allocations->direct_channel);
@@ -727,8 +1201,16 @@ DeviceTransferOutcome RunDeviceTransfer(
            "provider, and backing allocations for device reset\n";
     return DeviceTransferOutcome::kUnsafeUnknown;
   }
+  if (stream_quiesced != nullptr) {
+    *stream_quiesced = true;
+  }
   const bool stream_destroyed =
       CheckAcl(aclrtDestroyStream(stream), "aclrtDestroyStream");
+  if (!stream_destroyed && retained_stream != nullptr) {
+    *retained_stream = stream;
+  } else if (stream_destroyed && retained_stream != nullptr) {
+    *retained_stream = nullptr;
+  }
 
   DeviceCompletion completion{};
   AivDirectUrmaChannel completed_channel{};
@@ -838,21 +1320,37 @@ DeviceTransferOutcome RunDeviceTransfer(
              : DeviceTransferOutcome::kFailedQuiesced;
 }
 
-int RunHost(const Options& options) {
+EndpointResult RunHost(const Options& options) {
   std::uint64_t payload_bytes = 0;
   std::uint64_t registration_bytes = 0;
   if (!RegistrationBytes(
           options, &payload_bytes, &registration_bytes)) {
     std::cerr << "invalid direct provider allocation size\n";
-    return 1;
+    return SafeEndpoint("invalid_registration_size");
   }
 
+  g_endpoint_may_own_resources.store(true, std::memory_order_relaxed);
   auto mapping = std::make_unique<HostDdrDeviceMapping>();
-  if (!CheckStatus(
-          mapping->AllocateAndRegister(
-              registration_bytes, options.logical_device_id),
-          "allocate/map direct URMA Host DDR")) {
-    return 1;
+  std::unique_ptr<DirectUrmaResources> resources;
+  RetainEndpointOnException exception_guard(
+      &resources, &mapping, nullptr);
+  const auto mapping_status = mapping->AllocateAndRegister(
+      registration_bytes, options.logical_device_id);
+  if (!CheckStatus(mapping_status,
+                   "allocate/map direct URMA Host DDR")) {
+    bool mapping_cleanup_complete = false;
+    if (CloseMappingWithRetry(
+            mapping.get(), "clean failed Host DDR allocation",
+            &mapping_cleanup_complete)) {
+      return SafeEndpoint(
+          mapping_cleanup_complete
+              ? "host_mapping_open_failed"
+              : "host_mapping_open_local_cleanup_incomplete",
+          false, mapping_cleanup_complete, true, true);
+    }
+    g_retained_endpoint.mapping = std::move(mapping);
+    return UnsafeEndpoint("host_mapping_open_cleanup_failed", true,
+                          true, true, true, false);
   }
   auto* source = reinterpret_cast<std::uint8_t*>(
       mapping->host_address());
@@ -867,20 +1365,33 @@ int RunHost(const Options& options) {
       << " mapped_dva=0x" << mapping->device_address()
       << std::dec << " bytes=" << registration_bytes << '\n';
 
-  auto resources = std::make_unique<DirectUrmaResources>();
+  resources = std::make_unique<DirectUrmaResources>();
   const auto spec = MakeHostOpenSpec(
       options, mapping->device_address(), registration_bytes,
       payload_bytes);
   const auto open_status = resources->Open(spec);
   if (!CheckStatus(open_status, "open Host direct liburma provider")) {
-    if (!CloseProviderWithRetry(
-            resources.get(), "clean failed Host direct provider open")) {
-      (void)resources.release();
-      (void)mapping.release();
-      return kFatalProviderTeardown;
+    bool provider_local_cleanup_complete = false;
+    bool mapping_cleanup_complete = false;
+    const bool provider_closed = CloseProviderWithRetry(
+        resources.get(), "clean failed Host direct provider open",
+        &provider_local_cleanup_complete);
+    const bool mapping_closed =
+        provider_closed &&
+        CloseMappingWithRetry(
+            mapping.get(), "clean Host DDR after provider open failure",
+            &mapping_cleanup_complete);
+    if (provider_closed && mapping_closed) {
+      return SafeEndpoint(
+          provider_local_cleanup_complete && mapping_cleanup_complete
+              ? "host_provider_open_failed"
+              : "host_provider_open_local_cleanup_incomplete",
+          true, mapping_cleanup_complete, true, true);
     }
-    (void)mapping->Close();
-    return 1;
+    g_retained_endpoint.resources = std::move(resources);
+    g_retained_endpoint.mapping = std::move(mapping);
+    return UnsafeEndpoint("host_provider_open_cleanup_failed", true,
+                          true, true, provider_closed, mapping_closed);
   }
   std::cout
       << "KVAF_A5_DIRECT_URMA_READY"
@@ -892,48 +1403,85 @@ int RunHost(const Options& options) {
       JoinPath(options.exchange_dir, "device.close_ready");
   const std::string device_fatal =
       JoinPath(options.exchange_dir, "fatal.device");
-  const auto close_ready_wait = WaitForFileOrPeerFatal(
-      close_ready, device_fatal, options.timeout_seconds);
-  if (close_ready_wait != PeerMarkerWait::kFound) {
-    std::cerr
-        << (close_ready_wait == PeerMarkerWait::kPeerFatal
-                ? "Device reported unsafe transfer quiescence"
-                : "timed out before Device proved transfer quiescence")
-        << "; retaining both provider and Host DDR mapping\n";
-    (void)resources.release();
-    (void)mapping.release();
-    return kFatalProviderTeardown;
+  const auto transfer_pass =
+      ControlMarker(options, "transfer", "PASS");
+  const auto transfer_fail =
+      ControlMarker(options, "transfer", "FAIL");
+  const auto close_ready_wait = WaitForPeerEvidence(
+      options, close_ready, transfer_pass.c_str(), transfer_fail.c_str(),
+      device_fatal, "Device close-ready proof");
+  if (close_ready_wait == PeerMarkerWait::kPeerSafeAbort) {
+    bool provider_local_cleanup_complete = false;
+    bool mapping_cleanup_complete = false;
+    const bool provider_closed = CloseProviderWithRetry(
+        resources.get(),
+        "close Host provider after safe Device abort",
+        &provider_local_cleanup_complete);
+    const bool mapping_closed =
+        provider_closed &&
+        CloseMappingWithRetry(
+            mapping.get(), "unmap Host DDR after safe Device abort",
+            &mapping_cleanup_complete);
+    if (!provider_closed || !mapping_closed) {
+      g_retained_endpoint.resources = std::move(resources);
+      g_retained_endpoint.mapping = std::move(mapping);
+      return UnsafeEndpoint("host_cleanup_after_device_abort_failed", true,
+                            true, true, provider_closed, mapping_closed);
+    }
+    return SafeEndpoint(
+        provider_local_cleanup_complete && mapping_cleanup_complete
+            ? "device_failed_safe"
+            : "device_failed_safe_local_cleanup_incomplete",
+        true, mapping_cleanup_complete, true, true);
+  }
+  if (close_ready_wait == PeerMarkerWait::kPeerFatal) {
+    std::cerr << "Device reported unsafe transfer quiescence; retaining "
+                 "both provider and Host DDR mapping\n";
+    g_retained_endpoint.resources = std::move(resources);
+    g_retained_endpoint.mapping = std::move(mapping);
+    return UnsafeEndpoint("device_reported_unsafe");
   }
   bool transfer_ok = false;
-  if (ReadExactMarker(close_ready, "transfer=PASS\n")) {
+  if (ReadExactMarker(close_ready, transfer_pass.c_str())) {
     transfer_ok = true;
-  } else if (!ReadExactMarker(close_ready, "transfer=FAIL\n")) {
+  } else if (!ReadExactMarker(close_ready, transfer_fail.c_str())) {
     std::cerr
         << "Device close-ready marker has an unknown state; "
            "retaining both provider and Host DDR mapping\n";
-    (void)resources.release();
-    (void)mapping.release();
-    return kFatalProviderTeardown;
+    g_retained_endpoint.resources = std::move(resources);
+    g_retained_endpoint.mapping = std::move(mapping);
+    return UnsafeEndpoint("device_close_ready_invalid");
   }
 
+  bool provider_local_cleanup_complete = false;
   const bool provider_closed = CloseProviderWithRetry(
-      resources.get(), "close Host direct liburma provider");
+      resources.get(), "close Host direct liburma provider",
+      &provider_local_cleanup_complete);
   if (!provider_closed) {
-    (void)resources.release();
-    (void)mapping.release();
-    return kFatalProviderTeardown;
+    g_retained_endpoint.resources = std::move(resources);
+    g_retained_endpoint.mapping = std::move(mapping);
+    return UnsafeEndpoint("host_provider_close_failed", true,
+                          true, true, false, false);
   }
   const std::string device_done =
       JoinPath(options.exchange_dir, "device.done");
+  const auto provider_closed_pass =
+      ControlMarker(options, "provider_closed", "PASS");
+  const auto device_done_wait = WaitForPeerEvidence(
+      options, device_done, provider_closed_pass.c_str(), nullptr,
+      device_fatal, "Device provider-close proof");
   const bool device_teardown_seen =
-      WaitForFile(device_done, options.timeout_seconds);
-  if (!device_teardown_seen) {
-    std::cerr
-        << "timed out waiting for Device provider teardown\n";
-  }
+      device_done_wait == PeerMarkerWait::kFound;
+  const bool device_aborted_safe =
+      device_done_wait == PeerMarkerWait::kPeerSafeAbort;
   const bool device_teardown_safe =
-      device_teardown_seen &&
-      ReadExactMarker(device_done, "provider_closed=PASS\n");
+      (device_teardown_seen &&
+       ReadExactMarker(
+           device_done, provider_closed_pass.c_str())) ||
+      device_aborted_safe;
+  if (device_done_wait == PeerMarkerWait::kPeerFatal) {
+    std::cerr << "Device reported unsafe provider teardown\n";
+  }
   if (device_teardown_seen && !device_teardown_safe) {
     std::cerr
         << "Device teardown marker is not exactly "
@@ -941,30 +1489,47 @@ int RunHost(const Options& options) {
            "retaining Host DDR mapping\n";
   }
   if (!device_teardown_safe) {
-    (void)mapping.release();
-    return kFatalProviderTeardown;
+    g_retained_endpoint.mapping = std::move(mapping);
+    return UnsafeEndpoint("device_provider_close_unproven", true,
+                          false, false, true, false);
   }
+  bool mapping_cleanup_complete = false;
   const bool mapping_closed =
-      CheckStatus(mapping->Close(),
-                  "unmap/free direct URMA Host DDR");
-  if (transfer_ok && provider_closed && device_teardown_safe &&
-      mapping_closed) {
+      CloseMappingWithRetry(
+          mapping.get(), "unmap/free direct URMA Host DDR",
+          &mapping_cleanup_complete);
+  if (!mapping_closed) {
+    g_retained_endpoint.mapping = std::move(mapping);
+    return UnsafeEndpoint("host_mapping_close_failed", true,
+                          true, true, true, false);
+  }
+  if (transfer_ok && !device_aborted_safe &&
+      provider_local_cleanup_complete && mapping_cleanup_complete) {
     std::cout
         << "KVAF_A5_DIRECT_TEARDOWN_OK role=host\n";
-    return 0;
+    return PassedEndpoint();
   }
-  return 1;
+  const char* reason = nullptr;
+  if (!provider_local_cleanup_complete || !mapping_cleanup_complete) {
+    reason = "host_local_cleanup_incomplete";
+  } else if (device_aborted_safe) {
+    reason = "device_failed_safe_after_close_ready";
+  } else {
+    reason = "transfer_validation_failed";
+  }
+  return SafeEndpoint(reason, true, mapping_cleanup_complete, true, true);
 }
 
-int RunDevice(const Options& options) {
+EndpointResult RunDevice(const Options& options) {
   std::uint64_t payload_bytes = 0;
   std::uint64_t registration_bytes = 0;
   if (!RegistrationBytes(
           options, &payload_bytes, &registration_bytes)) {
     std::cerr << "invalid direct provider allocation size\n";
-    return 1;
+    return SafeEndpoint("invalid_registration_size");
   }
 
+  g_endpoint_may_own_resources.store(true, std::memory_order_relaxed);
   constexpr std::size_t kActiveDescriptorTarget = 4;
   const std::size_t active_descriptor_count =
       static_cast<std::size_t>(std::min<std::uint64_t>(
@@ -972,10 +1537,22 @@ int RunDevice(const Options& options) {
   const std::size_t request_count =
       active_descriptor_count + 1;
   auto allocations = std::make_unique<DeviceAllocations>();
+  std::unique_ptr<DirectUrmaResources> resources;
+  aclrtStream retained_stream = nullptr;
+  bool transfer_stream_quiesced = true;
+  RetainEndpointOnException exception_guard(
+      &resources, nullptr, &allocations, &retained_stream,
+      &transfer_stream_quiesced);
   if (!AllocateDeviceInputs(
           registration_bytes, active_descriptor_count,
           request_count, allocations.get())) {
-    return 1;
+    const bool allocations_closed =
+        CloseAllocationsWithRetry(allocations.get());
+    return SafeEndpoint(
+        allocations_closed
+            ? "device_allocation_failed"
+            : "device_allocation_local_cleanup_incomplete",
+        false, allocations_closed, true, allocations_closed);
   }
   std::vector<std::uint8_t> initial_output(
       payload_bytes, kCanary);
@@ -984,10 +1561,16 @@ int RunDevice(const Options& options) {
                       initial_output.data(), payload_bytes,
                       ACL_MEMCPY_HOST_TO_DEVICE),
           "initialize direct output canary")) {
-    return 1;
+    const bool allocations_closed =
+        CloseAllocationsWithRetry(allocations.get());
+    return SafeEndpoint(
+        allocations_closed
+            ? "device_canary_initialize_failed"
+            : "device_canary_local_cleanup_incomplete",
+        false, allocations_closed, true, allocations_closed);
   }
 
-  auto resources = std::make_unique<DirectUrmaResources>();
+  resources = std::make_unique<DirectUrmaResources>();
   const auto spec = MakeDeviceOpenSpec(
       options,
       reinterpret_cast<std::uint64_t>(allocations->output),
@@ -995,13 +1578,24 @@ int RunDevice(const Options& options) {
   const auto open_status = resources->Open(spec);
   if (!CheckStatus(open_status,
                    "open AICPU direct liburma provider")) {
-    if (!CloseProviderWithRetry(
-            resources.get(), "clean failed AICPU direct provider open")) {
-      (void)resources.release();
-      (void)allocations.release();
-      return kFatalProviderTeardown;
+    bool provider_local_cleanup_complete = false;
+    const bool provider_closed = CloseProviderWithRetry(
+        resources.get(), "clean failed AICPU direct provider open",
+        &provider_local_cleanup_complete);
+    const bool allocations_closed =
+        provider_closed && CloseAllocationsWithRetry(allocations.get());
+    if (provider_closed) {
+      return SafeEndpoint(
+          provider_local_cleanup_complete && allocations_closed
+              ? "device_provider_open_failed"
+              : "device_provider_open_local_cleanup_incomplete",
+          true, allocations_closed, true, allocations_closed);
     }
-    return 1;
+    g_retained_endpoint.resources = std::move(resources);
+    g_retained_endpoint.allocations = std::move(allocations);
+    return UnsafeEndpoint("device_provider_open_cleanup_failed", true,
+                          true, true, provider_closed,
+                          allocations_closed);
   }
   std::cout
       << "KVAF_A5_DIRECT_URMA_READY"
@@ -1010,71 +1604,194 @@ int RunDevice(const Options& options) {
       << " eid_index=" << options.device_eid_index << '\n';
 
   const auto transfer_outcome = RunDeviceTransfer(
-      options, payload_bytes, resources.get(), allocations.get());
+      options, payload_bytes, resources.get(), allocations.get(),
+      &retained_stream, &transfer_stream_quiesced);
   if (transfer_outcome == DeviceTransferOutcome::kUnsafeUnknown) {
-    (void)resources.release();
-    (void)allocations.release();
-    return kFatalProviderTeardown;
+    RetainEndpointOwnership(&resources, nullptr, &allocations,
+                            &retained_stream,
+                            &transfer_stream_quiesced);
+    return UnsafeEndpoint("aiv_stream_quiescence_unknown");
+  }
+  bool transfer_stream_local_cleanup_complete = true;
+  if (retained_stream != nullptr) {
+    std::cerr
+        << "quiesced AIV transfer stream destroy failed; retrying once\n";
+    if (aclrtDestroyStream(retained_stream) == ACL_SUCCESS) {
+      retained_stream = nullptr;
+    } else {
+      transfer_stream_local_cleanup_complete = false;
+      // The stream was synchronized successfully, so this is a local handle
+      // leak rather than an in-flight DMA risk. Keep the handle discoverable
+      // until aclrtResetDevice/process exit instead of silently dropping it.
+      RetainEndpointOwnership(nullptr, nullptr, nullptr,
+                              &retained_stream,
+                              &transfer_stream_quiesced);
+    }
   }
   const bool transfer_ok =
       transfer_outcome == DeviceTransferOutcome::kPassed;
   const std::string close_ready =
       JoinPath(options.exchange_dir, "device.close_ready");
-  if (!AtomicWriteText(
-          close_ready,
-          transfer_ok ? "transfer=PASS\n" : "transfer=FAIL\n")) {
-    std::cerr
-        << "failed to publish Device close-ready marker\n";
-    // Enter Close here as well so a concurrently waiting Host can complete
-    // the two-sided destroy_ctx socket handshake. If the marker never becomes
-    // visible, this call may block; the runner records both live processes as
-    // quarantined instead of killing either side.
-    if (!CloseProviderWithRetry(
-            resources.get(), "close AICPU provider after marker failure")) {
-      (void)resources.release();
-      (void)allocations.release();
-      return kFatalProviderTeardown;
+  const auto close_ready_marker =
+      ControlMarker(options, "transfer", transfer_ok ? "PASS" : "FAIL");
+  const auto host_fatal = JoinPath(options.exchange_dir, "fatal.host");
+  bool close_ready_warning_written = false;
+  while (!AtomicWriteText(close_ready, close_ready_marker)) {
+    // rename may have succeeded even when the following directory fsync
+    // failed. If the exact marker is visible, Host can safely participate in
+    // the provider teardown handshake and Device must do so as well.
+    if (ReadExactMarker(close_ready, close_ready_marker.c_str())) {
+      break;
     }
-    (void)allocations->Close();
-    return 1;
+    if (ValidPeerFatal(options, host_fatal)) {
+      RetainEndpointOwnership(&resources, nullptr, &allocations,
+                              &retained_stream,
+                              &transfer_stream_quiesced);
+      return UnsafeEndpoint("host_failed_before_close_ready_publish");
+    }
+    if (!close_ready_warning_written) {
+      std::cerr << "failed to publish Device close-ready marker; retaining "
+                   "ownership and retrying until the evidence path recovers\n";
+      close_ready_warning_written = true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 
+  bool provider_local_cleanup_complete = false;
   const bool provider_closed = CloseProviderWithRetry(
-      resources.get(), "close AICPU direct liburma provider");
+      resources.get(), "close AICPU direct liburma provider",
+      &provider_local_cleanup_complete);
   if (!provider_closed) {
     const std::string device_done =
         JoinPath(options.exchange_dir, "device.done");
     (void)AtomicWriteText(
-        device_done, "provider_closed=FAIL\n");
-    (void)resources.release();
-    (void)allocations.release();
-    return kFatalProviderTeardown;
+        device_done,
+        ControlMarker(options, "provider_closed", "FAIL"));
+    g_retained_endpoint.resources = std::move(resources);
+    g_retained_endpoint.allocations = std::move(allocations);
+    return UnsafeEndpoint("device_provider_close_failed", true,
+                          true, false, false, false);
   }
-  const bool allocations_closed = allocations->Close();
-  if (!allocations_closed) {
-    std::cerr << "one or more aclrtFree calls failed\n";
-  }
-  const bool final_ok =
-      transfer_ok && provider_closed && allocations_closed;
+  const bool allocations_closed =
+      CloseAllocationsWithRetry(allocations.get());
   const std::string device_done =
       JoinPath(options.exchange_dir, "device.done");
   if (!AtomicWriteText(
-          device_done, "provider_closed=PASS\n")) {
+          device_done,
+          ControlMarker(options, "provider_closed", "PASS"))) {
     std::cerr
         << "failed to publish Device done marker\n";
-    return 1;
+    const bool local_cleanup_complete =
+        provider_local_cleanup_complete && allocations_closed &&
+        transfer_stream_local_cleanup_complete;
+    return SafeEndpoint(
+        local_cleanup_complete
+            ? "device_done_publish_failed"
+            : "device_done_publish_local_cleanup_incomplete",
+        true, local_cleanup_complete, true, allocations_closed);
   }
-  if (final_ok) {
+  if (!allocations_closed) {
+    return SafeEndpoint("device_allocations_local_cleanup_incomplete", true,
+                        false, true, false);
+  }
+  if (transfer_ok && provider_local_cleanup_complete &&
+      transfer_stream_local_cleanup_complete) {
     std::cout
         << "KVAF_A5_DIRECT_TEARDOWN_OK role=device\n";
-    return 0;
+    return PassedEndpoint();
   }
-  return 1;
+  const bool local_cleanup_complete =
+      provider_local_cleanup_complete &&
+      transfer_stream_local_cleanup_complete;
+  return SafeEndpoint(
+      !transfer_stream_local_cleanup_complete
+          ? "device_stream_local_cleanup_incomplete"
+          : (provider_local_cleanup_complete
+                 ? "transfer_validation_failed"
+                 : "device_provider_local_cleanup_incomplete"),
+      true, local_cleanup_complete, true, true);
+}
+
+bool TryRecoverRetainedAfterException(
+    EndpointResult* recovered_result) {
+  if (recovered_result == nullptr) {
+    return false;
+  }
+  const bool resource_armed =
+      g_retained_endpoint.resources != nullptr ||
+      g_retained_endpoint.mapping != nullptr;
+  if (g_retained_endpoint.transfer_stream != nullptr &&
+      !g_retained_endpoint.transfer_stream_quiesced) {
+    return false;
+  }
+
+  bool provider_local_cleanup_complete = true;
+  const bool provider_closed =
+      g_retained_endpoint.resources == nullptr ||
+      CloseProviderWithRetry(
+          g_retained_endpoint.resources.get(),
+          "close provider after unexpected C++ exception",
+          &provider_local_cleanup_complete);
+  if (!provider_closed) {
+    return false;
+  }
+
+  bool mapping_local_cleanup_complete = true;
+  const bool mapping_closed =
+      g_retained_endpoint.mapping == nullptr ||
+      CloseMappingWithRetry(
+          g_retained_endpoint.mapping.get(),
+          "unmap Host DDR after unexpected C++ exception",
+          &mapping_local_cleanup_complete);
+  if (!mapping_closed) {
+    return false;
+  }
+  const bool allocations_closed =
+      g_retained_endpoint.allocations == nullptr ||
+      CloseAllocationsWithRetry(g_retained_endpoint.allocations.get());
+
+  bool stream_local_cleanup_complete = true;
+  if (g_retained_endpoint.transfer_stream != nullptr) {
+    if (aclrtDestroyStream(g_retained_endpoint.transfer_stream) ==
+        ACL_SUCCESS) {
+      g_retained_endpoint.transfer_stream = nullptr;
+    } else if (aclrtDestroyStream(
+                   g_retained_endpoint.transfer_stream) == ACL_SUCCESS) {
+      g_retained_endpoint.transfer_stream = nullptr;
+    } else {
+      stream_local_cleanup_complete = false;
+    }
+  }
+
+  recovered_result->outcome = EndpointOutcome::kFailedSafe;
+  recovered_result->resource_armed = resource_armed;
+  recovered_result->stream_quiesced = true;
+  recovered_result->queue_drained = true;
+  recovered_result->provider_closed = true;
+  recovered_result->backing_released =
+      mapping_local_cleanup_complete && allocations_closed;
+  recovered_result->host_mapping_unregistered = true;
+  recovered_result->allocations_released = allocations_closed;
+  if (!provider_local_cleanup_complete) {
+    recovered_result->reason =
+        "unexpected_cpp_exception_provider_local_cleanup_incomplete";
+  } else if (!mapping_local_cleanup_complete) {
+    recovered_result->reason =
+        "unexpected_cpp_exception_mapping_local_cleanup_incomplete";
+  } else if (!allocations_closed) {
+    recovered_result->reason =
+        "unexpected_cpp_exception_allocations_local_cleanup_incomplete";
+  } else if (!stream_local_cleanup_complete) {
+    recovered_result->reason =
+        "unexpected_cpp_exception_stream_local_cleanup_incomplete";
+  }
+  return true;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
+  std::set_terminate(FailClosedTerminate);
   Options options;
   if (!ParseOptions(argc, argv, &options)) {
     PrintUsage(argv[0]);
@@ -1082,25 +1799,99 @@ int main(int argc, char** argv) {
   }
 
   if (!CheckAcl(aclInit(nullptr), "aclInit")) {
+    const auto result = SafeEndpoint("acl_init_failed");
+    PersistTerminalMarkerUntilDurable(
+        options, result, "acl_init_failure");
+    PublishDeviceSafeAbortWakeEdgeBestEffort(options, result);
     return 1;
   }
   if (!CheckAcl(aclrtSetDevice(options.logical_device_id),
                 "aclrtSetDevice")) {
+    const auto result = SafeEndpoint("acl_set_device_failed");
+    PersistTerminalMarkerUntilDurable(
+        options, result, "acl_set_device_failure");
+    PublishDeviceSafeAbortWakeEdgeBestEffort(options, result);
     (void)aclFinalize();
     return 1;
   }
 
-  const int result =
-      options.role == "host"
-          ? RunHost(options)
-          : RunDevice(options);
-  if (result == kFatalProviderTeardown) {
-    QuarantineUnsafeTeardown(options);
+  // Initialization is still pre-resource and remains externally
+  // interruptible. Ignore lifecycle signals only after the runtime context is
+  // ready and immediately before Host DDR/URMA/HBM ownership can begin.
+  IgnoreLifecycleSignals();
+
+  EndpointResult result = UnsafeEndpoint("unexpected_cpp_exception");
+  EndpointResult recovered_exception =
+      SafeEndpoint("unexpected_cpp_exception_cleaned");
+  try {
+    result = options.role == "host"
+                 ? RunHost(options)
+                 : RunDevice(options);
+  } catch (const std::exception& error) {
+    std::cerr << "unexpected C++ exception while endpoint owns resources: "
+              << error.what() << '\n';
+    try {
+      if (TryRecoverRetainedAfterException(&recovered_exception)) {
+        result = std::move(recovered_exception);
+      }
+    } catch (...) {
+      std::cerr << "checked cleanup after exception also threw; retaining "
+                   "all endpoint ownership\n";
+    }
+  } catch (...) {
+    std::cerr << "unknown exception while endpoint owns resources\n";
+    try {
+      if (TryRecoverRetainedAfterException(&recovered_exception)) {
+        result = std::move(recovered_exception);
+      }
+    } catch (...) {
+      std::cerr << "checked cleanup after unknown exception also threw; "
+                   "retaining all endpoint ownership\n";
+    }
   }
+  if (result.outcome == EndpointOutcome::kFailedUnsafe) {
+    QuarantineUnsafeTeardown(options, result);
+  }
+  g_endpoint_may_own_resources.store(false, std::memory_order_relaxed);
+
+  // Persist transport safety before aclrtResetDevice/aclFinalize. Runtime
+  // detach is local cleanup and can itself fail or hang; it must not erase the
+  // already-proven fact that streams/queues/providers/mappings are safe. A
+  // successful PASS atomically replaces this provisional FAIL_SAFE marker
+  // after runtime detach completes.
+  EndpointResult pre_runtime_cleanup = result;
+  if (pre_runtime_cleanup.outcome == EndpointOutcome::kPassed) {
+    pre_runtime_cleanup.outcome = EndpointOutcome::kFailedSafe;
+    pre_runtime_cleanup.reason = "transport_safe_runtime_cleanup_pending";
+  }
+  PersistTerminalMarkerUntilDurable(
+      options, pre_runtime_cleanup, "before_runtime_cleanup");
+  if (result.outcome == EndpointOutcome::kFailedSafe) {
+    PublishDeviceSafeAbortWakeEdgeBestEffort(
+        options, pre_runtime_cleanup);
+  }
+
   const bool reset =
       CheckAcl(aclrtResetDevice(options.logical_device_id),
                "aclrtResetDevice");
+  if (reset) {
+    g_retained_endpoint.transfer_stream = nullptr;
+  }
   const bool finalized =
       CheckAcl(aclFinalize(), "aclFinalize");
-  return result == 0 && reset && finalized ? 0 : 1;
+  if ((!reset || !finalized) &&
+      result.outcome == EndpointOutcome::kPassed) {
+    result.outcome = EndpointOutcome::kFailedSafe;
+    result.reason = !reset ? "acl_reset_failed_after_safe_teardown"
+                           : "acl_finalize_failed_after_safe_teardown";
+  }
+  // Publish the post-runtime result persistently as well. The provisional
+  // proof above already prevents UNPROVEN classification if runtime cleanup
+  // hangs; this durable replacement records PASS or the precise downgrade.
+  PersistTerminalMarkerUntilDurable(
+      options, result, "after_runtime_cleanup");
+  PublishDeviceSafeAbortWakeEdgeBestEffort(options, result);
+  return result.outcome == EndpointOutcome::kPassed && reset && finalized
+             ? 0
+             : 1;
 }

@@ -30,6 +30,7 @@ static bool g_kvaf_connection_open;
 static bool g_kvaf_context_open;
 static bool g_kvaf_cleanup_poisoned;
 static uint64_t g_kvaf_session_id;
+static uint64_t g_kvaf_last_closed_session_id;
 static struct kvaf_udma_direct_queue_info g_kvaf_queue_info;
 static pthread_mutex_t g_kvaf_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -448,7 +449,11 @@ int kvaf_urma_provider_open_v2(
             KVAF_URMA_PROVIDER_LOCAL_CONFIG_FAILED, ret);
         goto fail;
     }
-    ret = establish_connection(&g_kvaf_config);
+    ret = kvaf_perftest_set_control_timeout(
+        config->control_timeout_seconds);
+    if (ret == 0) {
+        ret = establish_connection(&g_kvaf_config);
+    }
     if (ret != 0) {
         kvaf_init_result(result, KVAF_URMA_PROVIDER_CONNECT_FAILED, ret);
         goto fail;
@@ -509,8 +514,27 @@ fail:
 
 static int kvaf_close_unlocked(uint64_t session_id)
 {
-    if (session_id == 0 ||
-        (g_kvaf_session_id != 0 && g_kvaf_session_id != session_id)) {
+    /*
+     * AICPU KFC may dispatch two kernel launches to different workers or SO
+     * instances.  An empty instance must never acknowledge another
+     * instance's Close: doing so would let the caller release DDR/HBM while
+     * the original provider still owns DMA resources.  Close succeeds only
+     * for the exact non-zero session installed by Open in this instance, or
+     * an idempotent retry of the last session closed by this same instance.
+     */
+    if (session_id == 0) {
+        return -1;
+    }
+    /*
+     * A Close result can be lost after this instance has already completed
+     * teardown.  A retry for that exact session is safe and must be
+     * idempotent.  Never generalize this to an arbitrary empty instance: an
+     * AICPU KFC retry may otherwise land on a worker that never owned Open.
+     */
+    if (g_kvaf_session_id == 0) {
+        return g_kvaf_last_closed_session_id == session_id ? 0 : -1;
+    }
+    if (g_kvaf_session_id != session_id) {
         return -1;
     }
     if (g_kvaf_cleanup_poisoned) {
@@ -536,6 +560,7 @@ static int kvaf_close_unlocked(uint64_t session_id)
     (void)memset(&g_kvaf_config, 0, sizeof(g_kvaf_config));
     (void)memset(&g_kvaf_context, 0, sizeof(g_kvaf_context));
     (void)memset(&g_kvaf_queue_info, 0, sizeof(g_kvaf_queue_info));
+    g_kvaf_last_closed_session_id = g_kvaf_session_id;
     g_kvaf_session_id = 0;
     return 0;
 }
@@ -590,8 +615,11 @@ int aicpu_kvaf_urma_close_v2(void *opaque_args)
     if (pthread_mutex_lock(&g_kvaf_lock) != 0) {
         return 0;
     }
-    if (g_kvaf_session_id != 0 &&
-        g_kvaf_session_id != args->session_id) {
+    if (args->session_id == 0 ||
+        (g_kvaf_session_id == 0 &&
+         g_kvaf_last_closed_session_id != args->session_id) ||
+        (g_kvaf_session_id != 0 &&
+         g_kvaf_session_id != args->session_id)) {
         (void)pthread_mutex_unlock(&g_kvaf_lock);
         return 0;
     }

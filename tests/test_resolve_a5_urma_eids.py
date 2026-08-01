@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from unittest import mock
 from pathlib import Path
 
@@ -163,6 +164,7 @@ class ParseTests(unittest.TestCase):
                     None,
                     root / "selector.lock",
                     1.0,
+                    root / "legacy.lock",
                 )
             self.assertEqual(selected.channel, 4)
             self.assertEqual(parser.call_count, 2)
@@ -185,6 +187,8 @@ class CommandLineTests(unittest.TestCase):
                 str(proc_root),
                 "--lock-file",
                 str(lock_file),
+                "--legacy-lock-file",
+                str(lock_file.with_name("legacy-selector.lock")),
                 *extra,
             ],
             check=False,
@@ -326,6 +330,56 @@ class CommandLineTests(unittest.TestCase):
             self.assertIn("exactly one hard link", result.stderr)
 
 
+class LockTopologyTests(unittest.TestCase):
+    def test_default_lock_is_shared_beside_the_physical_repository(self) -> None:
+        self.assertEqual(
+            RESOLVER.DEFAULT_LOCK_FILE,
+            Path("/data/.kvaf-state/asdrv-ub-pair.lock"),
+        )
+
+    def test_persistent_lock_is_held_before_legacy_lock(self) -> None:
+        persistent = Path("/persistent/selector.lock")
+        legacy = Path("/legacy/selector.lock")
+        events: list[str] = []
+
+        @contextmanager
+        def fake_lock(path: Path, _timeout: float):
+            events.append(f"enter:{path}")
+            try:
+                yield object()
+            finally:
+                events.append(f"exit:{path}")
+
+        with mock.patch.object(RESOLVER, "acquire_lock", fake_lock):
+            with RESOLVER.acquire_selector_locks(
+                persistent, 1.0, legacy
+            ):
+                events.append("critical")
+
+        self.assertEqual(
+            events,
+            [
+                f"enter:{persistent}",
+                f"enter:{legacy}",
+                "critical",
+                f"exit:{legacy}",
+                f"exit:{persistent}",
+            ],
+        )
+
+    def test_lock_parent_symlink_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            real_parent = root / "real"
+            real_parent.mkdir()
+            linked_parent = root / "linked"
+            linked_parent.symlink_to(real_parent, target_is_directory=True)
+            with self.assertRaisesRegex(
+                RESOLVER.EidResolutionError, "not a real directory"
+            ):
+                RESOLVER.acquire_lock(linked_parent / "selector.lock", 0.1)
+
+
 class RunnerIntegrationTests(unittest.TestCase):
     def test_runner_auto_resolves_pair_before_binary_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -349,6 +403,9 @@ class RunnerIntegrationTests(unittest.TestCase):
                     "KVAF_SUPER_POD_INDEX": "4294967295",
                     "KVAF_EID_PROC_ROOT": str(proc_root),
                     "KVAF_EID_LOCK_FILE": str(root / "selector.lock"),
+                    "KVAF_EID_LEGACY_LOCK_FILE": str(
+                        root / "legacy-selector.lock"
+                    ),
                     "KVAF_A5_BINARY": str(root / "missing-smoke-binary"),
                 }
             )

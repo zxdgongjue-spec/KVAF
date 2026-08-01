@@ -21,6 +21,24 @@ if(BUILD_TESTING)
         "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_resolve_a5_urma_eids.py"
     )
+    add_test(
+      NAME kvaf_a5_host_ddr_mapping_test
+      COMMAND
+        "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_host_ddr_mapping.py"
+    )
+    add_test(
+      NAME kvaf_a5_direct_urma_outcome_test
+      COMMAND
+        "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_classify_a5_direct_urma_outcome.py"
+    )
+    add_test(
+      NAME kvaf_a5_direct_urma_source_syntax_test
+      COMMAND
+        "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_direct_urma_source_syntax.py"
+    )
   endif()
 endif()
 
