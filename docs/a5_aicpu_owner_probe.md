@@ -174,16 +174,26 @@ if ! bash scripts/build_a5_direct_urma.sh; then
   exit 1
 fi
 
-kvaf_owner_probe_binary="$KVAF_A5_DIRECT_BUILD_DIR/access_operator/a5/kvaf_a5_aicpu_owner_probe"
-if [[ ! -x "$kvaf_owner_probe_binary" ]]; then
-  echo "ERROR: owner probe binary is missing" >&2
-  exit 1
-fi
-
-"$kvaf_owner_probe_binary" \
+bash scripts/run_a5_aicpu_owner_probe.sh \
   --logical-device-id 7 \
   --timeout-seconds 5
 ```
+
+必须通过 `run_a5_aicpu_owner_probe.sh` 启动，而不是直接调用二进制。wrapper 在
+`aclInit` 之前持有 deploy/active 两把锁，并验证 provider v3、direct build manifest、
+owner-probe 哈希、真实 `libascendcl.so`、独立 KVAF AICPU tar，以及
+`ascend_package_load.ini` 中唯一且精确的注册块。成功进入硬件探针前会先输出：
+
+```text
+KVAF_A5_AICPU_OWNER_PROBE_PREFLIGHT_OK
+AICPU_REGISTRATION=verified-exact
+```
+
+打包脚本使用
+`opp/vendors/cust/op_impl/aicpu/kernel/cann-kvaf-direct-urma-compat.tar.gz`，不会覆盖
+UB_MicroBenchmark 的 `compat/liburma_perftest.tar.gz`。仅有 tar 而缺少 CANN 白名单
+注册时，wrapper 会在任何 ACL/NPU 操作前失败；这正是旧版本出现 `507018` 和
+Device 侧 `So does not exist` 的原因。
 
 允许的 timeout 范围是 1–10 秒。probe PASS 后仍不要通过环境变量绕过
 `scripts/run_a5_direct_urma_h2d_smoke.sh` 的 affinity gate；下一步是实现并验证真正的

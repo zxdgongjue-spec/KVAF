@@ -7,6 +7,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd -P)
 source "${SCRIPT_DIR}/a5_direct_urma_legacy_guard.sh"
 source "${SCRIPT_DIR}/a5_direct_urma_manifest_v3.sh"
+source "${SCRIPT_DIR}/a5_aicpu_package_registration.sh"
 kvaf_configure_direct_urma_state_paths "${ROOT_DIR}" || exit 2
 
 : "${ASCEND_HOME_PATH:?source the container CANN set_env.sh first}"
@@ -17,7 +18,10 @@ KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY=${KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY:-"${KV
 KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST=${KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST:-"${KVAF_DIRECT_PROVIDER_BUILD_DIR}/source.sha256"}
 KVAF_DIRECT_PROVIDER_BUILD_MANIFEST=${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST:-"${KVAF_DIRECT_PROVIDER_BUILD_DIR}/build.manifest"}
 KVAF_DIRECT_PROVIDER_SUCCESS_STAMP=${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP:-"${KVAF_DIRECT_PROVIDER_BUILD_DIR}/build.success"}
-KVAF_DIRECT_AICPU_ARCHIVE=${KVAF_DIRECT_AICPU_ARCHIVE:-"${ASCEND_HOME_PATH}/compat/liburma_perftest.tar.gz"}
+KVAF_DIRECT_AICPU_PACKAGE_NAME=cann-kvaf-direct-urma-compat.tar.gz
+KVAF_DIRECT_AICPU_PACKAGE_RELATIVE_DIR=opp/vendors/cust/op_impl/aicpu/kernel
+KVAF_DIRECT_AICPU_ARCHIVE=${KVAF_DIRECT_AICPU_ARCHIVE:-"${ASCEND_HOME_PATH}/${KVAF_DIRECT_AICPU_PACKAGE_RELATIVE_DIR}/${KVAF_DIRECT_AICPU_PACKAGE_NAME}"}
+KVAF_DIRECT_AICPU_REGISTRATION_FILE=${KVAF_DIRECT_AICPU_REGISTRATION_FILE:-"${ASCEND_HOME_PATH}/conf/ascend_package_load.ini"}
 
 die()
 {
@@ -130,7 +134,8 @@ verify_aicpu_archive()
   die "package this AICPU archive inside vllm-ascend-cs-kvaf"
 [[ ${EUID} -eq 0 ]] ||
   die "AICPU compat packaging requires container uid 0"
-for command in flock nm readelf sha256sum tar realpath; do
+for command in awk chmod cp dirname flock grep mkdir mktemp mv nm readelf \
+  realpath rm sha256sum tail tar wc; do
   command -v "${command}" >/dev/null 2>&1 ||
     die "${command} is required"
 done
@@ -216,20 +221,71 @@ if grep -Eq \
   die "provider leaks an internal perftest symbol"
 fi
 
-expected_archive="${ASCEND_HOME_PATH}/compat/liburma_perftest.tar.gz"
+expected_archive="${ASCEND_HOME_PATH}/${KVAF_DIRECT_AICPU_PACKAGE_RELATIVE_DIR}/${KVAF_DIRECT_AICPU_PACKAGE_NAME}"
 if [[ "$(realpath -m "${KVAF_DIRECT_AICPU_ARCHIVE}")" != \
       "$(realpath -m "${expected_archive}")" ]]; then
   die "the AICPU archive must be installed at ${expected_archive}"
 fi
-compat_dir=$(dirname "${KVAF_DIRECT_AICPU_ARCHIVE}")
-mkdir -p "${compat_dir}"
+expected_registration_file="${ASCEND_HOME_PATH}/conf/ascend_package_load.ini"
+if [[ "$(realpath -m "${KVAF_DIRECT_AICPU_REGISTRATION_FILE}")" != \
+      "$(realpath -m "${expected_registration_file}")" ]]; then
+  die "the AICPU package registry must be ${expected_registration_file}"
+fi
+[[ ! -L "${KVAF_DIRECT_AICPU_REGISTRATION_FILE}" &&
+   -f "${KVAF_DIRECT_AICPU_REGISTRATION_FILE}" &&
+   -r "${KVAF_DIRECT_AICPU_REGISTRATION_FILE}" &&
+   -w "${KVAF_DIRECT_AICPU_REGISTRATION_FILE}" ]] ||
+  die "the existing CANN AICPU package registry must be a readable/writable regular file"
+grep -Fxq 'name:Ascend-aicpu_legacy.tar.gz' \
+  "${KVAF_DIRECT_AICPU_REGISTRATION_FILE}" ||
+  die "the CANN AICPU package registry lacks its built-in baseline"
+if kvaf_aicpu_registration_is_exact \
+    "${KVAF_DIRECT_AICPU_REGISTRATION_FILE}" \
+    "${KVAF_DIRECT_AICPU_PACKAGE_NAME}" \
+    "${KVAF_DIRECT_AICPU_PACKAGE_RELATIVE_DIR}"; then
+  registration_state=exact
+elif kvaf_aicpu_registration_is_absent \
+    "${KVAF_DIRECT_AICPU_REGISTRATION_FILE}" \
+    "${KVAF_DIRECT_AICPU_PACKAGE_NAME}" \
+    "${KVAF_DIRECT_AICPU_PACKAGE_RELATIVE_DIR}"; then
+  registration_state=absent
+else
+  die "the KVAF AICPU package registration is duplicated or malformed"
+fi
+package_install_dir=$(dirname "${KVAF_DIRECT_AICPU_ARCHIVE}")
+mkdir -p "${package_install_dir}"
+[[ ! -L "${package_install_dir}" &&
+   -d "${package_install_dir}" &&
+   -w "${package_install_dir}" ]] ||
+  die "the AICPU package directory must be a writable real directory"
+[[ ! -L "${KVAF_DIRECT_AICPU_ARCHIVE}" &&
+   ( ! -e "${KVAF_DIRECT_AICPU_ARCHIVE}" ||
+     -f "${KVAF_DIRECT_AICPU_ARCHIVE}" ) ]] ||
+  die "the AICPU archive target must not be a symlink or non-file"
+if [[ "${registration_state}" == exact ]] &&
+   [[ ! -f "${KVAF_DIRECT_AICPU_ARCHIVE}" ||
+      ! -r "${KVAF_DIRECT_AICPU_ARCHIVE}" ]]; then
+  die "the exact KVAF registration points to a missing/unreadable archive"
+fi
+
+# Older KVAF revisions wrote the same Device provider into the borrowed UB
+# package name.  It is harmless while unregistered, but two registered
+# archives extracting the same SO basename have order-dependent semantics.
+legacy_registration_count=$(grep -Fxc \
+  'name:liburma_perftest.tar.gz' \
+  "${KVAF_DIRECT_AICPU_REGISTRATION_FILE}" || true)
+(( legacy_registration_count == 0 )) ||
+  die "remove the legacy liburma_perftest registration before installing the isolated KVAF package"
 
 shopt -s nullglob
-for archive in "${compat_dir}"/*.tar.gz; do
+for archive in "${package_install_dir}"/*.tar.gz; do
   if [[ "${archive}" == "${KVAF_DIRECT_AICPU_ARCHIVE}" ]]; then
     continue
   fi
-  archive_listing=$(tar -tzf "${archive}" 2>/dev/null || true)
+  [[ ! -L "${archive}" && -f "${archive}" && -r "${archive}" ]] ||
+    die "sibling AICPU package is missing or unsafe: ${archive}"
+  archive_listing=$(tar -tzf "${archive}" 2>/dev/null) ||
+    die "sibling AICPU package is invalid: ${archive}"
   if grep -Eq \
       '(^|/)(libkvaf_urma_provider(_host|_device)?|liburma_perftest)\.so$' \
       <<<"${archive_listing}"; then
@@ -240,12 +296,37 @@ shopt -u nullglob
 
 temporary_dir=$(mktemp -d /tmp/kvaf-direct-aicpu.XXXXXX)
 temporary_install_archive=
+rollback_archive=
+deployment_started=0
+deployment_committed=0
 cleanup()
 {
+  local cleanup_status=$?
+  local restore_candidate
+  trap - EXIT
+  if (( deployment_started != 0 && deployment_committed == 0 )) &&
+     [[ "${registration_state}" == exact &&
+        -n "${rollback_archive}" &&
+        -f "${rollback_archive}" ]]; then
+    restore_candidate=$(mktemp \
+      "${package_install_dir}/.${KVAF_DIRECT_AICPU_PACKAGE_NAME}.rollback.XXXXXX") ||
+      restore_candidate=
+    if [[ -z "${restore_candidate}" ]] ||
+       ! cp -p "${rollback_archive}" "${restore_candidate}" ||
+       ! mv -f "${restore_candidate}" "${KVAF_DIRECT_AICPU_ARCHIVE}"; then
+      [[ -z "${restore_candidate}" ]] ||
+        rm -f "${restore_candidate}" || true
+      echo "ERROR: failed to restore the previously registered KVAF AICPU archive" >&2
+      cleanup_status=3
+    else
+      echo "KVAF_AICPU_ARCHIVE_ROLLBACK_OK" >&2
+    fi
+  fi
   if [[ -n "${temporary_install_archive}" ]]; then
     rm -f "${temporary_install_archive}"
   fi
   rm -rf "${temporary_dir}"
+  exit "${cleanup_status}"
 }
 trap cleanup EXIT
 
@@ -277,7 +358,7 @@ chmod 0755 \
   "${package_dir}/kvaf_udma_private_abi_probe" \
   "${package_dir}/kvaf_ummu_uapi_probe"
 
-temporary_archive="${temporary_dir}/liburma_perftest.tar.gz"
+temporary_archive="${temporary_dir}/${KVAF_DIRECT_AICPU_PACKAGE_NAME}"
 tar -C "${temporary_dir}" -czf "${temporary_archive}" \
   aicpu_kernels_device
 verify_aicpu_archive "${temporary_archive}" candidate
@@ -301,17 +382,43 @@ if [[ -e "${KVAF_DIRECT_AICPU_ARCHIVE}" ]] &&
 fi
 
 temporary_install_archive=$(
-  mktemp "${compat_dir}/.liburma_perftest.tar.gz.XXXXXX"
+  mktemp \
+    "${package_install_dir}/.${KVAF_DIRECT_AICPU_PACKAGE_NAME}.XXXXXX"
 )
 cp "${temporary_archive}" "${temporary_install_archive}"
 chmod 0644 "${temporary_install_archive}"
 verify_aicpu_archive "${temporary_install_archive}" install-candidate
+if [[ "${registration_state}" == exact ]]; then
+  rollback_archive="${temporary_dir}/registered-archive.rollback"
+  cp -p "${KVAF_DIRECT_AICPU_ARCHIVE}" "${rollback_archive}"
+fi
+deployment_started=1
 mv -f "${temporary_install_archive}" "${KVAF_DIRECT_AICPU_ARCHIVE}"
 temporary_install_archive=
 
 verify_aicpu_archive "${KVAF_DIRECT_AICPU_ARCHIVE}" installed
 
+# A tar file is not automatically discovered by CANN.  Register the unique
+# KVAF package only after its verified archive is durably visible.  The helper
+# atomically replaces the registry while preserving every other package
+# stanza; a crash before this point leaves only an inert, unregistered file.
+kvaf_aicpu_install_registration \
+  "${KVAF_DIRECT_AICPU_REGISTRATION_FILE}" \
+  "${KVAF_DIRECT_AICPU_PACKAGE_NAME}" \
+  "${KVAF_DIRECT_AICPU_PACKAGE_RELATIVE_DIR}" ||
+  die "could not atomically register the KVAF AICPU package"
+kvaf_aicpu_registration_is_exact \
+  "${KVAF_DIRECT_AICPU_REGISTRATION_FILE}" \
+  "${KVAF_DIRECT_AICPU_PACKAGE_NAME}" \
+  "${KVAF_DIRECT_AICPU_PACKAGE_RELATIVE_DIR}" ||
+  die "installed KVAF AICPU package registration is not exact"
+deployment_committed=1
+
 echo "KVAF_A5_DIRECT_URMA_AICPU_PACKAGE_OK"
 echo "AICPU_ARCHIVE=${KVAF_DIRECT_AICPU_ARCHIVE}"
+echo "AICPU_PACKAGE_NAME=${KVAF_DIRECT_AICPU_PACKAGE_NAME}"
+echo "AICPU_REGISTRATION_FILE=${KVAF_DIRECT_AICPU_REGISTRATION_FILE}"
+echo "AICPU_REGISTRATION=verified-exact"
+echo "AICPU_REGISTRATION_PREVIOUS_STATE=${registration_state}"
 echo "DEVICE_PROVIDER_SHA256=${device_provider_sha}"
 tar -tzf "${KVAF_DIRECT_AICPU_ARCHIVE}"

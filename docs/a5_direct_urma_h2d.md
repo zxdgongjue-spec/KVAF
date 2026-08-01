@@ -555,11 +555,38 @@ grep -E \
 bash scripts/package_a5_direct_urma_aicpu.sh
 
 tar -tzf \
-  "$ASCEND_HOME_PATH/compat/liburma_perftest.tar.gz"
+  "$ASCEND_HOME_PATH/opp/vendors/cust/op_impl/aicpu/kernel/cann-kvaf-direct-urma-compat.tar.gz"
 ```
 
-archive 名称保留 `liburma_perftest.tar.gz` 只是为了适配当前 CANN compat
-loader；它不是外部 perftest 依赖，内容也不包含旧 `liburma_perftest.so`。
+KVAF 使用独立包名 `cann-kvaf-direct-urma-compat.tar.gz`，不会覆盖
+UB_MicroBenchmark 的 `compat/liburma_perftest.tar.gz`。安装脚本会把归档原子写入
+`opp/vendors/cust/op_impl/aicpu/kernel/`，并在
+`${ASCEND_HOME_PATH}/conf/ascend_package_load.ini` 中保留且仅保留以下注册块：
+
+```text
+name:cann-kvaf-direct-urma-compat.tar.gz
+install_path:2
+optional:true
+package_path:opp/vendors/cust/op_impl/aicpu/kernel
+load_as_per_soc:false
+```
+
+仅复制 tar 不会使 CANN/TDT 下发它；package 成功和 runtime preflight 都会严格
+校验归档路径、内容、哈希及上述注册块。`optional:true` 只避免 KVAF 未使用时影响
+其他 ACL 应用，KVAF 自己缺包或未注册时仍会在任何 URMA/NPU 操作前 fail closed。
+该包不是外部 perftest 依赖，内容也不包含旧 `liburma_perftest.so`。
+
+安装器先确认 registry 中的 KVAF 块“完全不存在或已经精确正确”，再原子发布经过
+校验的 tar，最后原子追加 registration。首次安装若 registration 写入失败，新 tar
+仍未注册、不会被 TDT 下发；重复安装时已有 registration 不改写，tar 始终以完整文件
+原子替换；若替换后的复验或注册步骤失败，安装器会原子恢复旧的已注册 tar。重复或
+畸形 registration 不会被静默修复，而会要求先人工核对。旧
+`liburma_perftest.tar.gz` 文件可以保持未注册状态，但 registry 中不能再有同名旧注册，
+避免两个包向 Device 解压同一个 provider SO。
+
+这些文件位于 `vllm-ascend-cs-kvaf` 的容器 writable layer。停止/启动同一个容器会
+保留它们，但删除并重建容器会丢失；重建后必须重新运行 package 脚本。正式部署应把
+归档与 registration 固化进镜像，或放入受控的容器启动部署步骤。
 精确白名单是：
 
 ```text
@@ -578,9 +605,8 @@ aicpu_kernels_device/kvaf_ummu_uapi_probe
 执行环境：`VLLM_ASCEND_CS_KVAF_DOCKER`
 
 ```bash
-if test -r \
-  /data/c00982601/asc-devkit-9.1.0-20260722/include/simt_api/asc_simt.h
-then
+if [[ -r \
+  /data/c00982601/asc-devkit-9.1.0-20260722/include/simt_api/asc_simt.h ]]; then
   export KVAF_ASC_DEVKIT_PATH=/data/c00982601/asc-devkit-9.1.0-20260722
 else
   export KVAF_ASC_DEVKIT_PATH=/data/c00982601/asc-devkit

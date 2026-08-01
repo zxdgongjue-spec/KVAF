@@ -4,6 +4,12 @@
 # AICPU bundle.  Callers must already hold the deploy lock and must have
 # successfully run kvaf_verify_direct_provider_build_v3.
 
+KVAF_RUNTIME_PREFLIGHT_SCRIPT_DIR=$(
+  cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P
+)
+source "${KVAF_RUNTIME_PREFLIGHT_SCRIPT_DIR}/a5_aicpu_package_registration.sh"
+unset KVAF_RUNTIME_PREFLIGHT_SCRIPT_DIR
+
 kvaf_runtime_preflight_error()
 {
   echo "ERROR: direct URMA runtime-artifact preflight: $*" >&2
@@ -59,6 +65,9 @@ kvaf_verify_direct_runtime_artifacts_v3()
   local direct_acl_header direct_ascendcl direct_source_manifest
   local direct_ldd resolved_direct_ascendcl direct_build_manifest_sha
   local direct_source_manifest_sha expected_archive archive_entries
+  local expected_package_name expected_package_relative_dir
+  local expected_registration_file runtime_registration_file
+  local legacy_registration_count sibling_archive sibling_entries
   local entry entry_count unexpected_entries archive_provider_sha
   local archive_build_manifest_sha archive_source_manifest_sha
   local archive_umdk_source_manifest_sha archive_libummu_source_manifest_sha
@@ -191,13 +200,69 @@ kvaf_verify_direct_runtime_artifacts_v3()
       "AICPU provider archive is missing or unsafe: ${KVAF_DIRECT_AICPU_ARCHIVE}"
     return 1
   }
-  expected_archive="${ASCEND_HOME_PATH}/compat/liburma_perftest.tar.gz"
+  expected_package_name=cann-kvaf-direct-urma-compat.tar.gz
+  expected_package_relative_dir=opp/vendors/cust/op_impl/aicpu/kernel
+  expected_archive="${ASCEND_HOME_PATH}/${expected_package_relative_dir}/${expected_package_name}"
   [[ "$(realpath -m "${KVAF_DIRECT_AICPU_ARCHIVE}")" == \
      "$(realpath -m "${expected_archive}")" ]] || {
     kvaf_runtime_preflight_error \
       "runtime AICPU archive must be installed at ${expected_archive}"
     return 1
   }
+  expected_registration_file="${ASCEND_HOME_PATH}/conf/ascend_package_load.ini"
+  runtime_registration_file=${KVAF_DIRECT_AICPU_REGISTRATION_FILE:-${expected_registration_file}}
+  [[ "$(realpath -m "${runtime_registration_file}")" == \
+     "$(realpath -m "${expected_registration_file}")" ]] || {
+    kvaf_runtime_preflight_error \
+      "runtime AICPU package registry must be ${expected_registration_file}"
+    return 1
+  }
+  kvaf_aicpu_registration_is_exact \
+    "${runtime_registration_file}" \
+    "${expected_package_name}" \
+    "${expected_package_relative_dir}" || {
+    kvaf_runtime_preflight_error \
+      "KVAF AICPU package is not registered exactly once for CANN loading"
+    return 1
+  }
+  grep -Fxq 'name:Ascend-aicpu_legacy.tar.gz' \
+    "${runtime_registration_file}" || {
+    kvaf_runtime_preflight_error \
+      "CANN AICPU package registry lacks its built-in baseline"
+    return 1
+  }
+  legacy_registration_count=$(grep -Fxc \
+    'name:liburma_perftest.tar.gz' \
+    "${runtime_registration_file}" || true)
+  if (( legacy_registration_count != 0 )); then
+    kvaf_runtime_preflight_error \
+      "legacy liburma_perftest registration conflicts with the isolated KVAF package"
+    return 1
+  fi
+  for sibling_archive in "${expected_archive%/*}"/*.tar.gz; do
+    [[ -e "${sibling_archive}" ]] || continue
+    [[ "${sibling_archive}" != "${KVAF_DIRECT_AICPU_ARCHIVE}" ]] ||
+      continue
+    [[ ! -L "${sibling_archive}" &&
+       -f "${sibling_archive}" &&
+       -r "${sibling_archive}" ]] || {
+      kvaf_runtime_preflight_error \
+        "sibling AICPU package is missing or unsafe: ${sibling_archive}"
+      return 1
+    }
+    sibling_entries=$(tar -tzf "${sibling_archive}" 2>/dev/null) || {
+      kvaf_runtime_preflight_error \
+        "sibling AICPU package is invalid: ${sibling_archive}"
+      return 1
+    }
+    if grep -Eq \
+        '(^|/)(libkvaf_urma_provider(_host|_device)?|liburma_perftest)\.so$' \
+        <<<"${sibling_entries}"; then
+      kvaf_runtime_preflight_error \
+        "sibling AICPU package contains a conflicting URMA provider: ${sibling_archive}"
+      return 1
+    fi
+  done
   archive_entries=$(tar -tzf "${KVAF_DIRECT_AICPU_ARCHIVE}") || {
     kvaf_runtime_preflight_error "AICPU archive is not a valid tar.gz"
     return 1

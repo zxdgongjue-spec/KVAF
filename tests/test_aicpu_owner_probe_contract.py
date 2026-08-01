@@ -28,6 +28,7 @@ DIRECT_RUNNER = ROOT / "scripts" / "run_a5_direct_urma_h2d_smoke.sh"
 PROVIDER_BUILD = ROOT / "scripts" / "build_a5_direct_urma_provider.sh"
 AICPU_PACKAGE = ROOT / "scripts" / "package_a5_direct_urma_aicpu.sh"
 RUNTIME_PREFLIGHT = ROOT / "scripts" / "a5_direct_urma_runtime_preflight.sh"
+OWNER_RUNNER = ROOT / "scripts" / "run_a5_aicpu_owner_probe.sh"
 DIRECT_BUILD = ROOT / "scripts" / "build_a5_direct_urma.sh"
 OWNER_DOC = ROOT / "docs" / "a5_aicpu_owner_probe.md"
 
@@ -270,12 +271,46 @@ class AicpuOwnerProbeContractTests(unittest.TestCase):
             "production epoch owner",
             "aicpu_kvaf_urma_owner_probe_v1",
             "kvaf_a5_aicpu_owner_probe",
+            "run_a5_aicpu_owner_probe.sh",
+            "AICPU_REGISTRATION=verified-exact",
             "KVAF_A5_AICPU_OWNER_PROBE_OK",
         ):
             self.assertIn(required, documentation)
         self.assertIn("KVAF_RUNTIME_UDMA_UAPI_HEADER", documentation)
         self.assertIn("KVAF_RUNTIME_UMMU_UAPI_HEADER", documentation)
         self.assertIn("provider build failed; package", documentation)
+
+    def test_owner_probe_runner_verifies_registration_before_acl_exec(self) -> None:
+        runner = OWNER_RUNNER.read_text(encoding="utf-8")
+        documentation = OWNER_DOC.read_text(encoding="utf-8")
+        lock = runner.index('exec 9>"${KVAF_DIRECT_DEPLOY_RUN_LOCK}"')
+        provider = runner.index("kvaf_verify_direct_provider_build_v3")
+        runtime = runner.index("kvaf_verify_direct_runtime_artifacts_v3")
+        owner_hash = runner.index("actual_owner_probe_sha=")
+        launch = runner.index(
+            'exec "${KVAF_A5_OWNER_PROBE_BINARY}" "$@"'
+        )
+        self.assertLess(lock, provider)
+        self.assertLess(provider, runtime)
+        self.assertLess(runtime, owner_hash)
+        self.assertLess(owner_hash, launch)
+        for required in (
+            "cann-kvaf-direct-urma-compat.tar.gz",
+            "ascend_package_load.ini",
+            "KVAF_A5_AICPU_OWNER_PROBE_PREFLIGHT_OK",
+            "AICPU_REGISTRATION=verified-exact",
+            "owner_probe_sha256",
+            "libascendcl.so",
+            "device_provider_sha=${KVAF_VERIFIED_DEVICE_PROVIDER_SHA}",
+            "build_manifest_sha=${KVAF_VERIFIED_BUILD_MANIFEST_SHA}",
+        ):
+            self.assertIn(required, runner)
+        self.assertNotIn("a5_aicpu_affinity_guard.sh", runner)
+
+        self.assertIn(
+            "bash scripts/run_a5_aicpu_owner_probe.sh", documentation
+        )
+        self.assertNotIn('"$kvaf_owner_probe_binary"', documentation)
 
     def test_provider_build_finds_the_shared_running_kernel_uapi(self) -> None:
         build_script = PROVIDER_BUILD.read_text(encoding="utf-8")

@@ -32,8 +32,10 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
             ROOT / "scripts" / "a5_direct_urma_legacy_guard.sh",
             ROOT / "scripts" / "a5_aicpu_affinity_guard.sh",
             MANIFEST_V3,
+            ROOT / "scripts" / "a5_aicpu_package_registration.sh",
             RUNTIME_PREFLIGHT,
             ROOT / "scripts" / "run_a5_aiv_urma_h2d_smoke.sh",
+            ROOT / "scripts" / "run_a5_aicpu_owner_probe.sh",
             ROOT / "scripts" / "build_a5_direct_urma.sh",
             ROOT / "scripts" / "build_a5_direct_urma_provider.sh",
             ROOT / "scripts" / "package_a5_direct_urma_aicpu.sh",
@@ -403,6 +405,71 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
         self.assertEqual(
             package.count("kvaf_verify_direct_provider_build_v3"), 1
         )
+
+    def test_package_registration_is_unique_atomic_and_fail_closed(self) -> None:
+        package = (
+            ROOT / "scripts" / "package_a5_direct_urma_aicpu.sh"
+        ).read_text(encoding="utf-8")
+        registration = (
+            ROOT / "scripts" / "a5_aicpu_package_registration.sh"
+        ).read_text(encoding="utf-8")
+        preflight = RUNTIME_PREFLIGHT.read_text(encoding="utf-8")
+
+        for source in (package, preflight):
+            self.assertIn(
+                "cann-kvaf-direct-urma-compat.tar.gz", source
+            )
+            self.assertIn(
+                "opp/vendors/cust/op_impl/aicpu/kernel", source
+            )
+            self.assertIn("ascend_package_load.ini", source)
+            self.assertIn("kvaf_aicpu_registration_is_exact", source)
+
+        registry_check = package.index(
+            "kvaf_aicpu_registration_is_absent"
+        )
+        archive_publish = package.index(
+            'mv -f "${temporary_install_archive}"'
+        )
+        installed_verify = package.index(
+            'verify_aicpu_archive "${KVAF_DIRECT_AICPU_ARCHIVE}" installed'
+        )
+        registration_publish = package.index(
+            "kvaf_aicpu_install_registration"
+        )
+        self.assertLess(registry_check, archive_publish)
+        self.assertLess(archive_publish, installed_verify)
+        self.assertLess(installed_verify, registration_publish)
+        self.assertIn("name:Ascend-aicpu_legacy.tar.gz", package)
+        self.assertIn("legacy liburma_perftest registration", package)
+        self.assertIn("rollback_archive", package)
+        self.assertIn("deployment_started=1", package)
+        self.assertIn("deployment_committed=1", package)
+        self.assertIn("KVAF_AICPU_ARCHIVE_ROLLBACK_OK", package)
+        rollback = package.index("KVAF_AICPU_ARCHIVE_ROLLBACK_OK")
+        publish_started = package.index("deployment_started=1")
+        publish = package.index(
+            'mv -f "${temporary_install_archive}"'
+        )
+        commit = package.index("deployment_committed=1")
+        self.assertLess(rollback, publish_started)
+        self.assertLess(publish_started, publish)
+        self.assertLess(publish, commit)
+
+        self.assertIn("cp -p --", registration)
+        self.assertIn("mv -f --", registration)
+        self.assertNotIn('mkdir -p -- "${registry_dir}"', registration)
+        self.assertIn('-w "${registry_file}"', registration)
+
+        registration_verify = preflight.index(
+            "kvaf_aicpu_registration_is_exact"
+        )
+        archive_read = preflight.index(
+            'archive_entries=$(tar -tzf "${KVAF_DIRECT_AICPU_ARCHIVE}")'
+        )
+        self.assertLess(registration_verify, archive_read)
+        self.assertIn("sibling AICPU package is invalid", package)
+        self.assertIn("sibling AICPU package is invalid", preflight)
 
     def test_provider_v2_manifest_fails_closed(self) -> None:
         bash = shutil.which("bash")
