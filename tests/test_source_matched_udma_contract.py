@@ -87,6 +87,16 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
         )
         self.assertIn("lib(urma|ummu|urma-udma)\\.so", runner)
 
+    def test_private_core_scan_stub_has_a_real_null_declaration(self):
+        wrapper = self.read(
+            "access_operator/a5/provider/source_linked_urma_main.c"
+        )
+        null_header = wrapper.index("#include <stddef.h>")
+        scan_stub = wrapper.index(
+            "static DIR *kvaf_urma_dynamic_provider_scan_forbidden"
+        )
+        self.assertLess(null_header, scan_stub)
+
     def test_jetty_delete_is_retryable_for_direct_rm_nonshared_path(self):
         source = self.read(
             "access_operator/a5/provider/source_matched_udma_jetty.c"

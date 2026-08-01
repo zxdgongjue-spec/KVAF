@@ -339,6 +339,43 @@ class DirectUrmaTeardownPhaseMachineTests(unittest.TestCase):
             before,
         )
 
+    def test_owned_device_lookup_uses_the_pinned_public_urma_api(self) -> None:
+        api = (
+            ROOT.parent
+            / "urma_perftest"
+            / "urma"
+            / "code"
+            / "include"
+            / "urma_api.h"
+        ).read_text(encoding="utf-8")
+        implementation = (
+            ROOT.parent
+            / "urma_perftest"
+            / "urma"
+            / "code"
+            / "lib"
+            / "urma"
+            / "core"
+            / "urma_main.c"
+        ).read_text(encoding="utf-8")
+        api_include = self.perftest_source.index('#include "urma_api.h"')
+        owned_lookup = self.perftest_source.index(
+            "static urma_device_t *kvaf_owned_urma_get_device_by_name"
+        )
+
+        self.assertLess(api_include, owned_lookup)
+        self.assertIn(
+            "urma_device_t *urma_get_device_by_name(char *dev_name);", api
+        )
+        self.assertIn(
+            "urma_device_t *urma_get_device_by_name(char *dev_name)",
+            implementation,
+        )
+        self.assertNotIn(
+            "extern urma_device_t *urma_get_device_by_name",
+            self.perftest_source,
+        )
+
     def test_synchronized_creation_failure_keeps_handles_for_close(self) -> None:
         create_start = self.perftest_source.index(
             "int kvaf_perftest_create_duplex_ctx_checked("

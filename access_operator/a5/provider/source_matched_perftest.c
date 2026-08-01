@@ -1,5 +1,6 @@
 #include "kvaf_source_matched_perftest.h"
 #include "kvaf_source_matched_udma.h"
+#include "urma_api.h"
 
 #include <errno.h>
 #include <stdbool.h>

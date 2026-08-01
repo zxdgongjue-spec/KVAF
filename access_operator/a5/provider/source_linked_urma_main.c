@@ -24,6 +24,7 @@
  */
 #include <dirent.h>
 #include <errno.h>
+#include <stddef.h>
 
 static DIR *kvaf_urma_dynamic_provider_scan_forbidden(const char *path)
 {
