@@ -99,6 +99,7 @@ HARNESS_SOURCE = r"""
 
 #include <dlfcn.h>
 
+#include <cstring>
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -106,6 +107,22 @@ HARNESS_SOURCE = r"""
 using kvaf::Address;
 using kvaf::StatusCode;
 using kvaf::access::a5::HostDdrDeviceMapping;
+
+#if defined(KVAF_TEST_WRAP_DLOPEN)
+extern "C" void* __real_dlopen(const char* filename, int flags);
+
+extern "C" void* __wrap_dlopen(const char* filename, int flags) {
+  static constexpr char kPinnedHal[] =
+      "/usr/local/Ascend/driver/lib64/driver/libascend_hal.so";
+  if (filename != nullptr && std::strcmp(filename, kPinnedHal) == 0) {
+    // Linux does not apply LD_LIBRARY_PATH to an absolute dlopen path.  Keep
+    // the production path pinned, but redirect that one call inside this
+    // test executable to the fake HAL already selected by LD_LIBRARY_PATH.
+    return __real_dlopen("libascend_hal.so", flags);
+  }
+  return __real_dlopen(filename, flags);
+}
+#endif
 
 namespace {
 
@@ -289,7 +306,7 @@ class HostDdrMappingTests(unittest.TestCase):
                     str(fake_library),
                 ]
                 dynamic_path_variable = "DYLD_LIBRARY_PATH"
-                dl_library: list[str] = []
+                test_link_args: list[str] = []
             else:
                 library_command = [
                     cc,
@@ -300,7 +317,11 @@ class HostDdrMappingTests(unittest.TestCase):
                     str(fake_library),
                 ]
                 dynamic_path_variable = "LD_LIBRARY_PATH"
-                dl_library = ["-ldl"]
+                test_link_args = [
+                    "-DKVAF_TEST_WRAP_DLOPEN=1",
+                    "-Wl,--wrap=dlopen",
+                    "-ldl",
+                ]
 
             subprocess.run(library_command, check=True, capture_output=True)
             subprocess.run(
@@ -313,7 +334,7 @@ class HostDdrMappingTests(unittest.TestCase):
                     str(ROOT / "access_operator" / "a5" / "include"),
                     str(MAPPING_SOURCE),
                     str(harness_source),
-                    *dl_library,
+                    *test_link_args,
                     "-o",
                     str(executable),
                 ],
