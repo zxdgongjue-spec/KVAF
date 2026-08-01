@@ -308,6 +308,28 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
         self.assertIn("ummu_uapi_header_sha256", self.source)
         self.assertIn("lib(urma|ummu|urma-udma)", self.source)
 
+    def test_aicpu_packaging_requires_source_built_provider_manifest(self) -> None:
+        package_source = (
+            ROOT / "scripts" / "package_a5_direct_urma_aicpu.sh"
+        ).read_text(encoding="utf-8")
+        verify_start = package_source.index("verify_runtime_manifest()\n")
+        verify_end = package_source.index("\n}\n", verify_start)
+        runtime_verifier = package_source[verify_start:verify_end]
+
+        self.assertIn(
+            "for prefix in urma_library urma_common_library; do",
+            runtime_verifier,
+        )
+        self.assertNotIn("udma_provider_library", runtime_verifier)
+        for binding in (
+            "urma_core_mode source-linked-no-dynamic-providers",
+            "udma_provider_mode source-built-internal",
+            "ummu_provider_mode source-built-internal",
+        ):
+            self.assertIn(binding, package_source)
+        self.assertIn("'^(udma|ummu)_provider_library_'", package_source)
+        self.assertIn("lib(urma|ummu|urma-udma)\\.so", package_source)
+
     def test_bounded_wait_without_terminal_proof_stays_recoverable(self) -> None:
         start = self.source.index("bounded_wait_expired")
         end = self.source.index("sleep 1 || true", start)

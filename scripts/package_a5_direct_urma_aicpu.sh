@@ -45,7 +45,7 @@ manifest_value()
 verify_runtime_manifest()
 {
   local prefix path expected actual
-  for prefix in urma_library urma_common_library udma_provider_library; do
+  for prefix in urma_library urma_common_library; do
     path=$(manifest_value "${prefix}_path" \
       "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") ||
       die "build manifest lacks ${prefix}_path"
@@ -246,6 +246,15 @@ require_provider_role_manifest device_private_abi 2
 require_provider_role_manifest \
   device_private_abi_name perftest-aiv-v1-device
 require_provider_role_manifest reference_perftest_abi perftest-aiv-v1
+require_provider_role_manifest \
+  urma_core_mode source-linked-no-dynamic-providers
+require_provider_role_manifest udma_provider_mode source-built-internal
+require_provider_role_manifest ummu_provider_mode source-built-internal
+if grep -Eq \
+    '^(udma|ummu)_provider_library_' \
+    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}"; then
+  die "source-built provider manifest contains a forbidden dynamic UDMA/UMMU provider"
+fi
 if ! sha256sum -c "${KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST}" \
     >/dev/null; then
   die "one or more provider source files changed after the atomic build"
@@ -254,6 +263,7 @@ verify_runtime_manifest
 
 provider_dynamic=$(readelf -d "${KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY}")
 if grep -Eq 'lib(hcomm|urma_perftest)' <<<"${provider_dynamic}" ||
+   grep -Eq 'lib(urma|ummu|urma-udma)\.so' <<<"${provider_dynamic}" ||
    grep -Eq '\((RPATH|RUNPATH)\)' <<<"${provider_dynamic}"; then
   die "provider links a forbidden library or contains RPATH/RUNPATH"
 fi
