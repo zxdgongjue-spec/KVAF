@@ -154,6 +154,24 @@ class SourceMatchedUmmuTests(unittest.TestCase):
         self.assertIn("manifest_value ummu_uapi_probe_sha256", runner)
         self.assertIn('probe_output=$("${probe_path}")', runner)
 
+    def test_uapi_compile_entrypoints_define_ioctl_encoding_first(self):
+        entrypoints = (
+            ROOT / "scripts" / "build_a5_direct_urma_provider.sh",
+            PROVIDER / "CMakeLists.txt",
+            PROVIDER / "ummu_uapi_probe.c",
+            RUNTIME,
+        )
+        for entrypoint in entrypoints:
+            with self.subTest(entrypoint=entrypoint.name):
+                source = entrypoint.read_text(encoding="utf-8")
+                ioctl_include = source.index("#include <sys/ioctl.h>")
+                ummu_include = source.index('#include "ummu_api.h"')
+                self.assertLess(
+                    ioctl_include,
+                    ummu_include,
+                    "_IOW/_IOR/_IOWR must be defined before UMMU ioctl macros",
+                )
+
     def test_provider_advertises_checked_capability_only_after_runtime_proof(self):
         provider = (PROVIDER / "urma_perftest_provider.c").read_text(
             encoding="utf-8"

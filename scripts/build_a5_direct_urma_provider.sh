@@ -191,6 +191,7 @@ esac
 if ! printf '%s\n' \
     '#include <stddef.h>' \
     '#include <stdint.h>' \
+    '#include <sys/ioctl.h>' \
     '#include "ummu_api.h"' \
     'int main(void) {' \
     '  struct ummu_tid_info info = {0};' \

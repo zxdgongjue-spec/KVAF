@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/ioctl.h>
 
 #include "ummu_api.h"
 
