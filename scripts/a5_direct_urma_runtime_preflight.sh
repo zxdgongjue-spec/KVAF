@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+
+# File-only validation for the direct smoke executable and the installed
+# AICPU bundle.  Callers must already hold the deploy lock and must have
+# successfully run kvaf_verify_direct_provider_build_v3.
+
+kvaf_runtime_preflight_error()
+{
+  echo "ERROR: direct URMA runtime-artifact preflight: $*" >&2
+  return 1
+}
+
+kvaf_runtime_preflight_manifest_value()
+{
+  local key=$1
+  local file=$2
+  awk -F= -v key="${key}" '
+    $1 == key {
+      value = substr($0, length(key) + 2)
+      count++
+    }
+    END {
+      if (count != 1 || value == "") exit 1
+      print value
+    }
+  ' "${file}"
+}
+
+kvaf_runtime_preflight_sha256()
+{
+  sha256sum -- "$1" | awk '{print $1}'
+}
+
+kvaf_runtime_preflight_ldd_path()
+{
+  local soname=$1
+  awk -v soname="${soname}" '
+    ($1 == soname || index($1, soname ".") == 1) && $2 == "=>" {
+      path = $3
+      count++
+    }
+    END {
+      if (count != 1 || path == "") exit 1
+      print path
+    }
+  '
+}
+
+kvaf_runtime_preflight_archive_sha()
+{
+  local archive=$1
+  local entry=$2
+  tar -xOzf "${archive}" "${entry}" | sha256sum | awk '{print $1}'
+}
+
+kvaf_verify_direct_runtime_artifacts_v3()
+{
+  local command artifact direct_binary_sha direct_runtime_header
+  local direct_acl_header direct_ascendcl direct_source_manifest
+  local direct_ldd resolved_direct_ascendcl direct_build_manifest_sha
+  local direct_source_manifest_sha expected_archive archive_entries
+  local entry entry_count unexpected_entries archive_provider_sha
+  local archive_build_manifest_sha archive_source_manifest_sha
+  local archive_umdk_source_manifest_sha archive_libummu_source_manifest_sha
+  local probe archive_probe_sha local_probe_sha binary_dynamic
+  local provider provider_dynamic provider_symbols symbol
+  local -a required_archive_entries=(
+    aicpu_kernels_device/
+    aicpu_kernels_device/libkvaf_urma_provider_device.so
+    aicpu_kernels_device/kvaf-direct-urma-provider.manifest
+    aicpu_kernels_device/kvaf-direct-urma-source.sha256
+    aicpu_kernels_device/kvaf-direct-urma-umdk-source.sha256
+    aicpu_kernels_device/kvaf-direct-urma-libummu-source.sha256
+    aicpu_kernels_device/kvaf_udma_uapi_probe
+    aicpu_kernels_device/kvaf_udma_private_abi_probe
+    aicpu_kernels_device/kvaf_ummu_uapi_probe
+  )
+
+  for command in awk cp grep ldd nm readelf readlink realpath sha256sum tar timeout; do
+    command -v "${command}" >/dev/null 2>&1 || {
+      kvaf_runtime_preflight_error "${command} is required"
+      return 1
+    }
+  done
+
+  [[ ! -L "${KVAF_ASCEND_HAL_LIBRARY}" &&
+     -f "${KVAF_ASCEND_HAL_LIBRARY}" &&
+     -r "${KVAF_ASCEND_HAL_LIBRARY}" ]] || {
+    kvaf_runtime_preflight_error \
+      "pinned real Ascend HAL library is missing: ${KVAF_ASCEND_HAL_LIBRARY}"
+    return 1
+  }
+  [[ ! -L "${KVAF_A5_DIRECT_BINARY}" &&
+     -f "${KVAF_A5_DIRECT_BINARY}" &&
+     -x "${KVAF_A5_DIRECT_BINARY}" ]] || {
+    kvaf_runtime_preflight_error \
+      "direct smoke binary is missing or unsafe: ${KVAF_A5_DIRECT_BINARY}"
+    return 1
+  }
+  for artifact in \
+    "${KVAF_A5_DIRECT_BUILD_MANIFEST}" \
+    "${KVAF_DIRECT_HOST_PROVIDER_LIBRARY}" \
+    "${KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY}" \
+    "${KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST}" \
+    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}" \
+    "${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP}"
+  do
+    [[ ! -L "${artifact}" && -f "${artifact}" && -r "${artifact}" ]] || {
+      kvaf_runtime_preflight_error \
+        "required build artifact is missing or unsafe: ${artifact}"
+      return 1
+    }
+  done
+
+  direct_binary_sha=$(kvaf_runtime_preflight_sha256 \
+    "${KVAF_A5_DIRECT_BINARY}") || return 1
+  direct_runtime_header=$(kvaf_runtime_preflight_manifest_value \
+    runtime_header_path "${KVAF_A5_DIRECT_BUILD_MANIFEST}") || return 1
+  direct_acl_header=$(kvaf_runtime_preflight_manifest_value \
+    acl_header_path "${KVAF_A5_DIRECT_BUILD_MANIFEST}") || return 1
+  direct_ascendcl=$(kvaf_runtime_preflight_manifest_value \
+    ascendcl_library_path "${KVAF_A5_DIRECT_BUILD_MANIFEST}") || return 1
+  direct_source_manifest=$(kvaf_runtime_preflight_manifest_value \
+    source_manifest_path "${KVAF_A5_DIRECT_BUILD_MANIFEST}") || return 1
+  for artifact in "${direct_runtime_header}" "${direct_acl_header}" \
+    "${direct_ascendcl}" "${direct_source_manifest}"
+  do
+    [[ ! -L "${artifact}" && -f "${artifact}" && -r "${artifact}" ]] || {
+      kvaf_runtime_preflight_error \
+        "direct-smoke dependency is missing or unsafe: ${artifact}"
+      return 1
+    }
+  done
+  [[ "$(kvaf_runtime_preflight_manifest_value schema \
+        "${KVAF_A5_DIRECT_BUILD_MANIFEST}")" == \
+        kvaf-a5-direct-smoke-build-v2 &&
+     "$(kvaf_runtime_preflight_manifest_value binary_sha256 \
+        "${KVAF_A5_DIRECT_BUILD_MANIFEST}")" == "${direct_binary_sha}" &&
+     "$(kvaf_runtime_preflight_sha256 "${direct_runtime_header}")" == \
+        "$(kvaf_runtime_preflight_manifest_value runtime_header_sha256 \
+          "${KVAF_A5_DIRECT_BUILD_MANIFEST}")" &&
+     "$(kvaf_runtime_preflight_sha256 "${direct_acl_header}")" == \
+        "$(kvaf_runtime_preflight_manifest_value acl_header_sha256 \
+          "${KVAF_A5_DIRECT_BUILD_MANIFEST}")" &&
+     "$(kvaf_runtime_preflight_sha256 "${direct_ascendcl}")" == \
+        "$(kvaf_runtime_preflight_manifest_value ascendcl_library_sha256 \
+          "${KVAF_A5_DIRECT_BUILD_MANIFEST}")" &&
+     "$(kvaf_runtime_preflight_sha256 "${direct_source_manifest}")" == \
+        "$(kvaf_runtime_preflight_manifest_value source_manifest_sha256 \
+          "${KVAF_A5_DIRECT_BUILD_MANIFEST}")" ]] || {
+    kvaf_runtime_preflight_error \
+      "direct smoke binary or official CANN runtime ABI changed after build"
+    return 1
+  }
+  sha256sum --check --strict -- "${direct_source_manifest}" >/dev/null || {
+    kvaf_runtime_preflight_error \
+      "direct smoke source changed after the successful build"
+    return 1
+  }
+  direct_ldd=$(ldd -r "${KVAF_A5_DIRECT_BINARY}" 2>&1) || {
+    echo "${direct_ldd}" >&2
+    kvaf_runtime_preflight_error "direct smoke runtime linkage is unresolved"
+    return 1
+  }
+  if grep -Eq 'not found|undefined symbol' <<<"${direct_ldd}"; then
+    echo "${direct_ldd}" >&2
+    kvaf_runtime_preflight_error "direct smoke runtime linkage is unresolved"
+    return 1
+  fi
+  resolved_direct_ascendcl=$(kvaf_runtime_preflight_ldd_path libascendcl.so \
+    <<<"${direct_ldd}") || {
+    kvaf_runtime_preflight_error \
+      "direct smoke did not resolve exactly one libascendcl"
+    return 1
+  }
+  [[ "$(realpath -e "${resolved_direct_ascendcl}")" == \
+     "$(realpath -e "${direct_ascendcl}")" ]] || {
+    kvaf_runtime_preflight_error \
+      "direct smoke resolves a different libascendcl than its build"
+    return 1
+  }
+  direct_build_manifest_sha=$(kvaf_runtime_preflight_sha256 \
+    "${KVAF_A5_DIRECT_BUILD_MANIFEST}") || return 1
+  direct_source_manifest_sha=$(kvaf_runtime_preflight_sha256 \
+    "${direct_source_manifest}") || return 1
+
+  [[ ! -L "${KVAF_DIRECT_AICPU_ARCHIVE}" &&
+     -f "${KVAF_DIRECT_AICPU_ARCHIVE}" &&
+     -r "${KVAF_DIRECT_AICPU_ARCHIVE}" ]] || {
+    kvaf_runtime_preflight_error \
+      "AICPU provider archive is missing or unsafe: ${KVAF_DIRECT_AICPU_ARCHIVE}"
+    return 1
+  }
+  expected_archive="${ASCEND_HOME_PATH}/compat/liburma_perftest.tar.gz"
+  [[ "$(realpath -m "${KVAF_DIRECT_AICPU_ARCHIVE}")" == \
+     "$(realpath -m "${expected_archive}")" ]] || {
+    kvaf_runtime_preflight_error \
+      "runtime AICPU archive must be installed at ${expected_archive}"
+    return 1
+  }
+  archive_entries=$(tar -tzf "${KVAF_DIRECT_AICPU_ARCHIVE}") || {
+    kvaf_runtime_preflight_error "AICPU archive is not a valid tar.gz"
+    return 1
+  }
+  for entry in "${required_archive_entries[@]}"; do
+    entry_count=$(grep -Fxc -- "${entry}" <<<"${archive_entries}" || true)
+    [[ "${entry_count}" == 1 ]] || {
+      kvaf_runtime_preflight_error \
+        "AICPU archive must contain exactly one ${entry}"
+      return 1
+    }
+  done
+  unexpected_entries=$(grep -Ev \
+    '^aicpu_kernels_device/?$|^aicpu_kernels_device/(libkvaf_urma_provider_device\.so|kvaf-direct-urma-provider\.manifest|kvaf-direct-urma-source\.sha256|kvaf-direct-urma-umdk-source\.sha256|kvaf-direct-urma-libummu-source\.sha256|kvaf_udma_uapi_probe|kvaf_udma_private_abi_probe|kvaf_ummu_uapi_probe)$' \
+    <<<"${archive_entries}" || true)
+  [[ -z "${unexpected_entries}" ]] || {
+    kvaf_runtime_preflight_error \
+      "AICPU archive contains a stale or unexpected entry"
+    return 1
+  }
+
+  archive_provider_sha=$(kvaf_runtime_preflight_archive_sha \
+    "${KVAF_DIRECT_AICPU_ARCHIVE}" \
+    aicpu_kernels_device/libkvaf_urma_provider_device.so) || return 1
+  archive_build_manifest_sha=$(kvaf_runtime_preflight_archive_sha \
+    "${KVAF_DIRECT_AICPU_ARCHIVE}" \
+    aicpu_kernels_device/kvaf-direct-urma-provider.manifest) || return 1
+  archive_source_manifest_sha=$(kvaf_runtime_preflight_archive_sha \
+    "${KVAF_DIRECT_AICPU_ARCHIVE}" \
+    aicpu_kernels_device/kvaf-direct-urma-source.sha256) || return 1
+  archive_umdk_source_manifest_sha=$(kvaf_runtime_preflight_archive_sha \
+    "${KVAF_DIRECT_AICPU_ARCHIVE}" \
+    aicpu_kernels_device/kvaf-direct-urma-umdk-source.sha256) || return 1
+  archive_libummu_source_manifest_sha=$(kvaf_runtime_preflight_archive_sha \
+    "${KVAF_DIRECT_AICPU_ARCHIVE}" \
+    aicpu_kernels_device/kvaf-direct-urma-libummu-source.sha256) || return 1
+  [[ "${archive_provider_sha}" == "${device_provider_sha}" &&
+     "${archive_build_manifest_sha}" == "${build_manifest_sha}" &&
+     "${archive_source_manifest_sha}" == "${source_manifest_sha}" &&
+     "${archive_umdk_source_manifest_sha}" == \
+       "${umdk_source_manifest_sha}" &&
+     "${archive_libummu_source_manifest_sha}" == \
+       "${libummu_source_manifest_sha}" ]] || {
+    kvaf_runtime_preflight_error \
+      "AICPU provider or provenance does not match the verified build"
+    return 1
+  }
+  for probe in kvaf_udma_uapi_probe kvaf_udma_private_abi_probe \
+    kvaf_ummu_uapi_probe; do
+    archive_probe_sha=$(kvaf_runtime_preflight_archive_sha \
+      "${KVAF_DIRECT_AICPU_ARCHIVE}" "aicpu_kernels_device/${probe}") ||
+      return 1
+    local_probe_sha=$(kvaf_runtime_preflight_sha256 \
+      "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/${probe}") || return 1
+    [[ "${archive_probe_sha}" == "${local_probe_sha}" ]] || {
+      kvaf_runtime_preflight_error \
+        "archived ${probe} does not match the verified build"
+      return 1
+    }
+  done
+
+  binary_dynamic=$(readelf -d "${KVAF_A5_DIRECT_BINARY}") || return 1
+  grep -Fq libhcomm <<<"${binary_dynamic}" && {
+    kvaf_runtime_preflight_error "direct smoke unexpectedly links HCOMM"
+    return 1
+  }
+  for provider in "${KVAF_DIRECT_HOST_PROVIDER_LIBRARY}" \
+    "${KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY}"
+  do
+    provider_dynamic=$(readelf -d "${provider}") || return 1
+    if grep -Eq \
+        'lib(hcomm|urma_perftest|urma_common|urma|urma-udma|ummu|udma)\.so' \
+        <<<"${provider_dynamic}" ||
+       grep -Eq '\((RPATH|RUNPATH)\)' <<<"${provider_dynamic}"; then
+      kvaf_runtime_preflight_error \
+        "provider links a forbidden external library or contains RPATH"
+      return 1
+    fi
+    provider_symbols=$(nm -D --defined-only "${provider}") || return 1
+    for symbol in kvaf_urma_provider_open_v2 kvaf_urma_provider_close_v2 \
+      kvaf_urma_provider_private_abi_v2 aicpu_kvaf_urma_open_v2 \
+      aicpu_kvaf_urma_close_v2
+    do
+      grep -Eq "[[:space:]]${symbol}(@@KVAF_URMA_PROVIDER_2)?$" \
+        <<<"${provider_symbols}" || {
+        kvaf_runtime_preflight_error \
+          "provider does not export ${symbol}: ${provider}"
+        return 1
+      }
+    done
+  done
+
+  KVAF_VERIFIED_DIRECT_BINARY_SHA=${direct_binary_sha}
+  KVAF_VERIFIED_DIRECT_BUILD_MANIFEST_SHA=${direct_build_manifest_sha}
+  KVAF_VERIFIED_DIRECT_SOURCE_MANIFEST=${direct_source_manifest}
+  KVAF_VERIFIED_DIRECT_SOURCE_MANIFEST_SHA=${direct_source_manifest_sha}
+  KVAF_VERIFIED_DIRECT_RUNTIME_HEADER=${direct_runtime_header}
+}

@@ -157,7 +157,7 @@ class DirectUrmaTeardownPhaseMachineTests(unittest.TestCase):
             )
             self.assertLess(failure_return, clear_offset)
 
-    def test_retryable_close_poisoning_requires_unknown_ummu_state(self) -> None:
+    def test_retryable_close_poisoning_requires_unknown_cleanup_state(self) -> None:
         retryable = self.provider_source.index(
             "KVAF_PERFTEST_CHECKED_DESTROY_RETRYABLE"
         )
@@ -169,8 +169,11 @@ class DirectUrmaTeardownPhaseMachineTests(unittest.TestCase):
             "return KVAF_URMA_PROVIDER_CLOSE_RETRYABLE;",
             retryable_body,
         )
+        self.assertIn(
+            "kvaf_source_ummu_cleanup_is_unknown()", self.provider_source
+        )
         unknown = retryable_body.index(
-            "if (kvaf_source_ummu_state_is_unknown())"
+            "if (kvaf_source_cleanup_state_is_unknown())"
         )
         poison = retryable_body.index(
             "g_kvaf_cleanup_poisoned = true", unknown

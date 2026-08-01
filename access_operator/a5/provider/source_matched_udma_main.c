@@ -12,16 +12,34 @@ static pthread_mutex_t g_kvaf_udma_runtime_lock =
     PTHREAD_MUTEX_INITIALIZER;
 static bool g_kvaf_udma_runtime_owned;
 static bool g_kvaf_udma_runtime_uninit_failed;
+static uint32_t g_kvaf_udma_cleanup_unknown;
+
+void kvaf_udma_source_mark_cleanup_unknown(void)
+{
+    /* A lock-ownership ambiguity cannot be made safe by retrying it. */
+    __atomic_store_n(&g_kvaf_udma_cleanup_unknown, 1U, __ATOMIC_RELEASE);
+}
+
+int kvaf_udma_source_cleanup_is_unknown(void)
+{
+    return __atomic_load_n(
+        &g_kvaf_udma_cleanup_unknown, __ATOMIC_ACQUIRE) != 0U;
+}
 
 int kvaf_udma_register_source_provider(void)
 {
+    urma_provider_ops_t *provider_ops;
     int status;
 
     if (g_kvaf_udma_provider_registered ||
         kvaf_udma_prepare_provider_ops() != 0) {
         return -1;
     }
-    status = urma_register_provider_ops(&g_udma_provider_ops);
+    provider_ops = kvaf_udma_source_provider_ops();
+    if (provider_ops == NULL) {
+        return -1;
+    }
+    status = urma_register_provider_ops(provider_ops);
     if (status != 0) {
         return -1;
     }
@@ -31,13 +49,18 @@ int kvaf_udma_register_source_provider(void)
 
 void kvaf_udma_unregister_source_provider(void)
 {
+    urma_provider_ops_t *provider_ops;
+
     if (!g_kvaf_udma_provider_registered) {
         return;
     }
-    if (kvaf_udma_source_live_context_count() != 0U ||
+    if (kvaf_udma_source_cleanup_is_unknown() != 0 ||
+        kvaf_source_ummu_cleanup_is_unknown() != 0 ||
+        kvaf_udma_source_live_context_count() != 0U ||
         kvaf_udma_source_live_segment_count() != 0U ||
         kvaf_udma_source_live_token_count() != 0U ||
         kvaf_udma_source_live_jetty_count() != 0U ||
+        kvaf_udma_source_live_jfr_count() != 0U ||
         kvaf_udma_source_live_jfc_count() != 0U ||
         kvaf_source_ummu_live_tid_count() != 0U ||
         kvaf_source_ummu_pending_operation_count() != 0U ||
@@ -49,7 +72,9 @@ void kvaf_udma_unregister_source_provider(void)
          */
         return;
     }
-    if (urma_unregister_provider_ops(&g_udma_provider_ops) == 0) {
+    provider_ops = kvaf_udma_source_provider_ops();
+    if (provider_ops != NULL &&
+        urma_unregister_provider_ops(provider_ops) == 0) {
         g_kvaf_udma_provider_registered = false;
     }
 }
@@ -70,6 +95,8 @@ int kvaf_udma_source_runtime_init(void)
     if (!g_kvaf_udma_provider_registered ||
         g_kvaf_udma_runtime_owned ||
         g_kvaf_udma_runtime_uninit_failed ||
+        kvaf_udma_source_cleanup_is_unknown() != 0 ||
+        kvaf_source_ummu_cleanup_is_unknown() != 0 ||
         kvaf_source_ummu_checked_contract_ready() != 1 ||
         kvaf_source_ummu_live_tid_count() != 0U ||
         kvaf_source_ummu_pending_operation_count() != 0U ||
@@ -93,7 +120,9 @@ int kvaf_udma_source_runtime_uninit(void)
 {
     urma_status_t status;
 
-    if (kvaf_udma_source_retry_orphan_contexts() != 0) {
+    if (kvaf_udma_source_cleanup_is_unknown() != 0 ||
+        kvaf_source_ummu_cleanup_is_unknown() != 0 ||
+        kvaf_udma_source_retry_orphan_contexts() != 0) {
         return -1;
     }
     if (pthread_mutex_lock(&g_kvaf_udma_runtime_lock) != 0) {
@@ -101,10 +130,13 @@ int kvaf_udma_source_runtime_uninit(void)
     }
     if (!g_kvaf_udma_runtime_owned ||
         g_kvaf_udma_runtime_uninit_failed ||
+        kvaf_udma_source_cleanup_is_unknown() != 0 ||
+        kvaf_source_ummu_cleanup_is_unknown() != 0 ||
         kvaf_udma_source_live_context_count() != 0U ||
         kvaf_udma_source_live_segment_count() != 0U ||
         kvaf_udma_source_live_token_count() != 0U ||
         kvaf_udma_source_live_jetty_count() != 0U ||
+        kvaf_udma_source_live_jfr_count() != 0U ||
         kvaf_udma_source_live_jfc_count() != 0U ||
         kvaf_source_ummu_checked_contract_ready() != 1 ||
         kvaf_source_ummu_live_tid_count() != 0U ||
@@ -133,16 +165,22 @@ int kvaf_udma_source_runtime_is_owned(void)
         return 0;
     }
     owned = g_kvaf_udma_runtime_owned &&
-        !g_kvaf_udma_runtime_uninit_failed ? 1 : 0;
+        !g_kvaf_udma_runtime_uninit_failed &&
+        kvaf_udma_source_cleanup_is_unknown() == 0 &&
+        kvaf_source_ummu_cleanup_is_unknown() == 0 ? 1 : 0;
     (void)pthread_mutex_unlock(&g_kvaf_udma_runtime_lock);
     return owned;
 }
 
 int kvaf_udma_source_provider_owns_device(const urma_device_t *device)
 {
+    const urma_provider_ops_t *provider_ops =
+        kvaf_udma_source_provider_ops();
+
     return device != NULL &&
+        provider_ops != NULL &&
         kvaf_udma_source_runtime_is_owned() != 0 &&
-        device->ops == &g_udma_provider_ops;
+        device->ops == provider_ops;
 }
 
 uint64_t kvaf_udma_source_public_abi_signature(void)

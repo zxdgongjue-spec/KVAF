@@ -138,40 +138,107 @@ static int kvaf_deadline_accept(
     return accepted;
 }
 
-/*
- * The upstream helper performs one write(2) for an entire protocol frame.
- * Besides permitting a short write, that can terminate the resource-owning
- * process with SIGPIPE after the peer disappears.  Compile the selected
- * communication source through this wrapper so every one of its writes is a
- * complete, no-SIGPIPE socket send.
- */
-static ssize_t kvaf_full_socket_write(
-    int fd, const void *buffer, size_t bytes)
-{
-    const unsigned char *cursor = buffer;
-    size_t written = 0;
+#include "kvaf_source_matched_perftest.h"
+#include "perftest_mgmt_tcp.h"
 
-    while (written < bytes) {
-        ssize_t result = send(
-            fd, cursor + written, bytes - written, MSG_NOSIGNAL);
-        if (result < 0 && errno == EINTR) {
-            continue;
-        }
-        if (result <= 0) {
-            return -1;
-        }
-        written += (size_t)result;
-    }
-    return (ssize_t)written;
-}
-
-#ifndef KVAF_PERFTEST_COMMUNICATION_SOURCE
-#error "KVAF_PERFTEST_COMMUNICATION_SOURCE must name perftest_communication.c"
+#ifndef KVAF_PERFTEST_MGMT_TCP_SOURCE
+#error "KVAF_PERFTEST_MGMT_TCP_SOURCE must name perftest_mgmt_tcp.c"
 #endif
-#define write kvaf_full_socket_write
+/*
+ * UMDK 26.06 already uses a complete MSG_NOSIGNAL send loop.  Only replace
+ * connect/accept so its process-global TCP context observes KVAF's one-shot
+ * monotonic deadline as well.
+ */
 #define connect kvaf_deadline_connect
 #define accept kvaf_deadline_accept
-#include KVAF_PERFTEST_COMMUNICATION_SOURCE
+#include KVAF_PERFTEST_MGMT_TCP_SOURCE
 #undef accept
 #undef connect
-#undef write
+
+int kvaf_perftest_establish_connection(const perftest_config_t *cfg)
+{
+    comm_tcp_cfg_t tcp_cfg;
+
+    if (cfg == NULL || cfg->mgmt_type != PERFTEST_MGMT_TCP) {
+        errno = EINVAL;
+        return -1;
+    }
+    tcp_cfg.server_ip = cfg->server_ip;
+    tcp_cfg.bind_ip = cfg->bind_ip;
+    tcp_cfg.enable_ipv6 = cfg->enable_ipv6;
+    tcp_cfg.port = cfg->port;
+    tcp_cfg.sock_num = cfg->pair_num;
+    return tcp_establish_connection(&tcp_cfg);
+}
+
+void kvaf_perftest_close_connection(perftest_config_t *cfg)
+{
+    (void)cfg;
+    tcp_close_connection();
+}
+
+int kvaf_perftest_sync_data(const perftest_config_t *cfg, uint32_t index,
+    int size, char *local_data, char *remote_data)
+{
+    if (cfg == NULL || cfg->mgmt_type != PERFTEST_MGMT_TCP) {
+        errno = EINVAL;
+        return -1;
+    }
+    return tcp_sync_data(index, size, local_data, remote_data);
+}
+
+/* Used only for SO_RCVTIMEO/SO_SNDTIMEO and emergency shutdown. */
+int kvaf_perftest_control_fd(uint32_t index)
+{
+    if (comm_ctx.sock_fd == NULL || index >= comm_ctx.sock_num) {
+        errno = EINVAL;
+        return -1;
+    }
+    return comm_ctx.sock_fd[index];
+}
+
+/* Official perftest_resources.c consumes the generic management symbols. */
+int sync_data(const perftest_config_t *cfg, uint32_t index, int size,
+    char *local_data, char *remote_data)
+{
+    return kvaf_perftest_sync_data(
+        cfg, index, size, local_data, remote_data);
+}
+
+int sync_time(const perftest_config_t *cfg, uint32_t index, const char *value)
+{
+    if (cfg == NULL || cfg->mgmt_type != PERFTEST_MGMT_TCP) {
+        errno = EINVAL;
+        return -1;
+    }
+    return tcp_sync_time(index, value);
+}
+
+ssize_t comm_send(const perftest_config_t *cfg, uint32_t index,
+    const void *buffer, size_t bytes)
+{
+    if (cfg == NULL || cfg->mgmt_type != PERFTEST_MGMT_TCP) {
+        errno = EINVAL;
+        return -1;
+    }
+    return tcp_comm_send(index, buffer, bytes);
+}
+
+ssize_t comm_recv(const perftest_config_t *cfg, uint32_t index,
+    void *buffer, size_t bytes)
+{
+    if (cfg == NULL || cfg->mgmt_type != PERFTEST_MGMT_TCP) {
+        errno = EINVAL;
+        return -1;
+    }
+    return tcp_comm_recv(index, buffer, bytes);
+}
+
+int comm_poll(const perftest_config_t *cfg, uint32_t index, int timeout_ms)
+{
+    if (cfg == NULL || cfg->mgmt_type != PERFTEST_MGMT_TCP) {
+        errno = EINVAL;
+        return -1;
+    }
+    return tcp_comm_poll(index, timeout_ms);
+}

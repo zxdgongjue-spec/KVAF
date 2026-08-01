@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "kvaf_urma_provider_abi.h"
+#include "urma_provider.h"
 #include "urma_types.h"
 
 /* Runtime evidence written into provider result reserved fields. */
@@ -28,6 +29,13 @@ static inline uint64_t kvaf_urma_public_abi_signature(void)
     offsetof(urma_context_t, ops),
     offsetof(urma_context_t, dev_fd),
     offsetof(urma_context_t, eid),
+    offsetof(urma_context_t, aggr_mode),
+    sizeof(urma_ops_t),
+    offsetof(urma_ops_t, alloc_jfc),
+    offsetof(urma_ops_t, free_jfc),
+    offsetof(urma_ops_t, alloc_jetty),
+    offsetof(urma_ops_t, free_jetty),
+    offsetof(urma_ops_t, get_dmac),
     sizeof(urma_jfc_t),
     offsetof(urma_jfc_t, jfc_cfg),
     offsetof(urma_jfc_t, handle),
@@ -56,12 +64,21 @@ static inline uint64_t kvaf_urma_public_abi_signature(void)
  * this exact provider instance.
  */
 int kvaf_udma_prepare_provider_ops(void);
+urma_provider_ops_t *kvaf_udma_source_provider_ops(void);
 int kvaf_udma_register_source_provider(void);
 void kvaf_udma_unregister_source_provider(void);
 int kvaf_udma_source_provider_is_registered(void);
 int kvaf_udma_source_runtime_init(void);
 int kvaf_udma_source_runtime_uninit(void);
 int kvaf_udma_source_runtime_is_owned(void);
+/*
+ * Process-lifetime fail-closed latch for a userspace UDMA mutation whose
+ * completion/lock ownership can no longer be proved.  Ordinary ioctl and
+ * munmap failures must not set this latch when their exact retry handle is
+ * still retained.
+ */
+void kvaf_udma_source_mark_cleanup_unknown(void);
+int kvaf_udma_source_cleanup_is_unknown(void);
 int kvaf_udma_source_provider_owns_device(const urma_device_t *device);
 int kvaf_udma_source_provider_owns_context(
     const urma_context_t *context);
@@ -73,6 +90,7 @@ uint32_t kvaf_udma_source_live_segment_count(void);
 uint32_t kvaf_udma_source_live_token_count(void);
 uint32_t kvaf_udma_source_live_context_count(void);
 uint32_t kvaf_udma_source_live_jetty_count(void);
+uint32_t kvaf_udma_source_live_jfr_count(void);
 uint32_t kvaf_udma_source_live_jfc_count(void);
 
 /*
@@ -84,10 +102,12 @@ uint32_t kvaf_udma_source_live_jfc_count(void);
 uint32_t kvaf_udma_source_orphan_segment_count(void);
 uint32_t kvaf_udma_source_orphan_token_count(void);
 uint32_t kvaf_udma_source_orphan_jetty_count(void);
+uint32_t kvaf_udma_source_orphan_jfr_count(void);
 uint32_t kvaf_udma_source_orphan_context_count(void);
 int kvaf_udma_source_retry_orphan_segments(urma_context_t *context);
 int kvaf_udma_source_retry_orphan_tokens(urma_context_t *context);
 int kvaf_udma_source_retry_orphan_jetties(urma_context_t *context);
+int kvaf_udma_source_retry_orphan_jfrs(urma_context_t *context);
 int kvaf_udma_source_retry_orphan_jfcs(urma_context_t *context);
 int kvaf_udma_source_retry_orphan_cleanup(urma_context_t *context);
 int kvaf_udma_source_retry_orphan_contexts(void);
@@ -96,6 +116,9 @@ int kvaf_udma_source_retry_orphan_contexts(void);
 urma_jetty_t *kvaf_udma_create_jetty_checked(
     urma_context_t *context, urma_jetty_cfg_t *cfg);
 urma_status_t kvaf_udma_delete_jetty_checked(urma_jetty_t *jetty);
+urma_jfr_t *kvaf_udma_create_jfr_checked(
+    urma_context_t *context, urma_jfr_cfg_t *cfg);
+urma_status_t kvaf_udma_delete_jfr_checked(urma_jfr_t *jfr);
 urma_jfc_t *kvaf_udma_create_jfc_checked(
     urma_context_t *context, urma_jfc_cfg_t *cfg);
 urma_status_t kvaf_udma_delete_jfc_checked(urma_jfc_t *jfc);

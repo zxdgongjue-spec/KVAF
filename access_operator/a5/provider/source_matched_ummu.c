@@ -18,18 +18,6 @@
 #define EUCLEAN 117
 #endif
 
-/* Keep the source-built object portable; this is stronger than the AArch64
- * device barriers used by upstream and avoids a second architecture variant. */
-#define __UMMU_BARRIER__ 1
-static inline void ummu_to_device_wmb(void)
-{
-  __atomic_thread_fence(__ATOMIC_SEQ_CST);
-}
-static inline void ummu_from_device_rmb(void)
-{
-  __atomic_thread_fence(__ATOMIC_SEQ_CST);
-}
-
 #include "ummu_api.h"
 #include "ummu_common.h"
 #include "ummu_log.h"
@@ -39,21 +27,25 @@ static inline void ummu_from_device_rmb(void)
 #include "ummu_resource.h"
 #include "ummu_seg_mng.h"
 
+#include "kvaf_source_matched_ummu_mapping.h"
+
 /*
  * Do not infer this ABI from the older drivers/ubus header.  The selected
  * 2025 MAPT source and the running A5 driver require the complete UAPI with
- * hw_cap, PLBI ioctl commands and the three advertised capability bits.
+ * hw_cap, PLBI ioctl commands and the five MAPT/PLBI capability bits used by
+ * the paired libummu 1.0.5 source.
  */
 #if !defined(KVAF_UMMU_FULL_UAPI_VERIFIED) || \
     KVAF_UMMU_FULL_UAPI_VERIFIED != 1
 #error "KVAF requires the full A5 UMMU UAPI header matching the running driver"
 #endif
 
-static inline uint32_t kvaf_ummu_uapi_hw_cap(
+static inline uint64_t kvaf_ummu_uapi_hw_cap(
     const struct ummu_tid_info *info)
 {
   return info->hw_cap &
-      (HW_CAP_EXPAN | HW_CAP_DOUBLE_PLBI | HW_CAP_KCMD_PLBI);
+      (HW_CAP_EXPAN | HW_CAP_DOUBLE_PLBI | HW_CAP_KCMD_PLBI |
+       HW_CAP_FREE_BIT | HW_CAP_PPLBI);
 }
 
 #define KVAF_UMMU_QUEUE_WAIT_COUNT UINT16_C(300)
@@ -66,12 +58,6 @@ enum kvaf_ummu_cleanup_phase {
   KVAF_UMMU_CLEANUP_PLBI_ALL_DONE,
   KVAF_UMMU_CLEANUP_KERNEL_TID_FREED,
   KVAF_UMMU_CLEANUP_LOCAL_RELEASED
-};
-
-struct kvaf_ummu_retained_mapping {
-  void *address;
-  size_t length;
-  struct kvaf_ummu_retained_mapping *next;
 };
 
 struct kvaf_ummu_tid_state {
@@ -89,7 +75,7 @@ struct kvaf_ummu_tid_state {
   bool pending_state_unknown;
   bool allocation_orphan;
   bool map_inserted;
-  struct kvaf_ummu_retained_mapping *retained;
+  struct kvaf_ummu_mapping_ledger mappings;
   struct kvaf_ummu_tid_state *next;
 };
 
@@ -101,12 +87,19 @@ static pid_t g_kvaf_ummu_owner_pid;
 static uint32_t g_kvaf_ummu_live_tid_count;
 static uint32_t g_kvaf_ummu_pending_count;
 static uint32_t g_kvaf_ummu_retained_count;
+static uint32_t g_kvaf_ummu_cleanup_unknown;
 static struct kvaf_source_ummu_status g_kvaf_ummu_last_status;
 static _Thread_local struct kvaf_ummu_tid_state *g_kvaf_ummu_current_state;
 static _Thread_local enum kvaf_source_ummu_failure_stage g_kvaf_queue_failure_stage;
 static _Thread_local bool g_kvaf_queue_state_unknown;
 
 ummu_vlog_level_t g_loglevel = UMMU_VLOG_LEVEL_WARNING;
+
+int kvaf_source_ummu_cleanup_is_unknown(void)
+{
+  return __atomic_load_n(
+      &g_kvaf_ummu_cleanup_unknown, __ATOMIC_ACQUIRE) != 0U;
+}
 
 struct ummu_ctx_info *get_ummu_ctx(void)
 {
@@ -132,6 +125,15 @@ static void kvaf_record_failure(
     enum kvaf_source_ummu_pending_operation operation,
     uint64_t address, size_t length)
 {
+  if (state_unknown) {
+    /*
+     * This is deliberately process-lifetime state.  The source provider has
+     * no proof that an ambiguous kernel command or lost ownership transition
+     * was rolled back, so a later ordinary failure cannot make it safe.
+     */
+    __atomic_store_n(
+        &g_kvaf_ummu_cleanup_unknown, 1U, __ATOMIC_RELEASE);
+  }
   if (pthread_mutex_lock(&g_kvaf_ummu_status_lock) != 0) {
     return;
   }
@@ -147,7 +149,8 @@ static void kvaf_record_failure(
   g_kvaf_ummu_last_status.last_failure_stage = (uint32_t)stage;
   g_kvaf_ummu_last_status.last_error = kvaf_negative_errno(status);
   g_kvaf_ummu_last_status.last_retryability = (uint32_t)retryability;
-  g_kvaf_ummu_last_status.last_state_unknown = state_unknown ? 1U : 0U;
+  g_kvaf_ummu_last_status.last_state_unknown =
+      kvaf_source_ummu_cleanup_is_unknown() != 0 ? 1U : 0U;
   g_kvaf_ummu_last_status.last_tid = state == NULL ? 0U : state->tid;
   g_kvaf_ummu_last_status.last_pending_operation = (uint32_t)operation;
   g_kvaf_ummu_last_status.last_address = address;
@@ -197,7 +200,6 @@ static void kvaf_add_state_locked(struct kvaf_ummu_tid_state *state)
 {
   state->next = g_kvaf_ummu_states;
   g_kvaf_ummu_states = state;
-  ++g_kvaf_ummu_ctx->tid_cnt;
   __atomic_add_fetch(&g_kvaf_ummu_live_tid_count, 1U, __ATOMIC_RELAXED);
 }
 
@@ -208,7 +210,6 @@ static void kvaf_remove_state_locked(struct kvaf_ummu_tid_state *state)
   while (*cursor != NULL) {
     if (*cursor == state) {
       *cursor = state->next;
-      --g_kvaf_ummu_ctx->tid_cnt;
       __atomic_sub_fetch(
           &g_kvaf_ummu_live_tid_count, 1U, __ATOMIC_RELAXED);
       return;
@@ -275,68 +276,104 @@ error:
   return status;
 }
 
-static int kvaf_retain_mapping(
-    struct kvaf_ummu_tid_state *state, void *address, size_t length)
+static void kvaf_latch_mapping_ownership_unknown(
+    struct kvaf_ummu_tid_state *state, void *address, size_t length,
+    int status)
 {
-  struct kvaf_ummu_retained_mapping *mapping;
+  if (state != NULL) {
+    state->pending_state_unknown = true;
+  }
+  kvaf_record_failure(state, KVAF_SOURCE_UMMU_FAILURE_MUNMAP,
+      status, KVAF_SOURCE_UMMU_RETRY_UNSAFE, true,
+      state == NULL ? KVAF_SOURCE_UMMU_PENDING_NONE : state->pending,
+      (uint64_t)(uintptr_t)address, length);
+}
 
-  if (state == NULL || address == NULL || length == 0) {
-    return -EINVAL;
-  }
-  for (mapping = state->retained; mapping != NULL;
-       mapping = mapping->next) {
-    if (mapping->address == address && mapping->length == length) {
-      return 0;
-    }
-  }
-  mapping = calloc(1, sizeof(*mapping));
+static void kvaf_release_mapping_record(
+    struct kvaf_ummu_owned_mapping *mapping)
+{
+  const bool was_retained = mapping != NULL && mapping->retained;
+
   if (mapping == NULL) {
-    return -ENOMEM;
+    return;
   }
-  mapping->address = address;
-  mapping->length = length;
-  mapping->next = state->retained;
-  state->retained = mapping;
-  __atomic_add_fetch(&g_kvaf_ummu_retained_count, 1U, __ATOMIC_RELAXED);
-  return 0;
+  if (was_retained) {
+    __atomic_sub_fetch(&g_kvaf_ummu_retained_count, 1U, __ATOMIC_RELAXED);
+  }
+  free(mapping);
 }
 
 static int kvaf_checked_munmap(
     struct kvaf_ummu_tid_state *state, void *address, size_t length)
 {
+  struct kvaf_ummu_owned_mapping *mapping;
+  int transition;
   int status;
 
-  if (address == NULL || length == 0) {
-    return -EINVAL;
+  mapping = state == NULL ? NULL :
+      kvaf_ummu_mapping_find(&state->mappings, address, length);
+  if (mapping == NULL) {
+    status = address == NULL || length == 0 ? -EINVAL : -EUCLEAN;
+    kvaf_latch_mapping_ownership_unknown(state, address, length, status);
+    return status;
   }
   if (munmap(address, length) == 0) {
+    mapping = kvaf_ummu_mapping_detach(
+        &state->mappings, address, length);
+    if (mapping == NULL) {
+      kvaf_latch_mapping_ownership_unknown(
+          state, address, length, -EUCLEAN);
+      return -EUCLEAN;
+    }
+    kvaf_release_mapping_record(mapping);
     return 0;
   }
   status = -errno;
-  (void)kvaf_retain_mapping(state, address, length);
+  /* No allocation is permitted after munmap failure.  The ownership record
+   * was reserved before mmap and is now transferred to the retry ledger. */
+  transition = kvaf_ummu_mapping_mark_retained(
+      &state->mappings, address, length);
+  if (transition < 0) {
+    kvaf_latch_mapping_ownership_unknown(
+        state, address, length, -EUCLEAN);
+    return -EUCLEAN;
+  }
+  if (transition > 0) {
+    __atomic_add_fetch(&g_kvaf_ummu_retained_count, 1U, __ATOMIC_RELAXED);
+  }
   kvaf_record_failure(state, KVAF_SOURCE_UMMU_FAILURE_MUNMAP,
       status, KVAF_SOURCE_UMMU_RETRY_SAFE, false,
-      state == NULL ? KVAF_SOURCE_UMMU_PENDING_NONE : state->pending,
+      state->pending,
       (uint64_t)(uintptr_t)address, length);
   return status;
 }
 
 static int kvaf_retry_retained_mappings(struct kvaf_ummu_tid_state *state)
 {
-  struct kvaf_ummu_retained_mapping **cursor = &state->retained;
-  struct kvaf_ummu_retained_mapping *mapping;
+  struct kvaf_ummu_owned_mapping *mapping;
+  struct kvaf_ummu_owned_mapping *next;
+  int status;
 
-  while (*cursor != NULL) {
-    mapping = *cursor;
-    if (munmap(mapping->address, mapping->length) != 0) {
-      kvaf_record_failure(state, KVAF_SOURCE_UMMU_FAILURE_MUNMAP,
-          -errno, KVAF_SOURCE_UMMU_RETRY_SAFE, false, state->pending,
-          (uint64_t)(uintptr_t)mapping->address, mapping->length);
-      return -errno;
+  for (mapping = state->mappings.head; mapping != NULL; mapping = next) {
+    next = mapping->next;
+    if (!mapping->retained) {
+      continue;
     }
-    *cursor = mapping->next;
-    __atomic_sub_fetch(&g_kvaf_ummu_retained_count, 1U, __ATOMIC_RELAXED);
-    free(mapping);
+    if (munmap(mapping->address, mapping->length) != 0) {
+      status = -errno;
+      kvaf_record_failure(state, KVAF_SOURCE_UMMU_FAILURE_MUNMAP,
+          status, KVAF_SOURCE_UMMU_RETRY_SAFE, false, state->pending,
+          (uint64_t)(uintptr_t)mapping->address, mapping->length);
+      return status;
+    }
+    mapping = kvaf_ummu_mapping_detach(
+        &state->mappings, mapping->address, mapping->length);
+    if (mapping == NULL) {
+      kvaf_latch_mapping_ownership_unknown(
+          state, NULL, 0, -EUCLEAN);
+      return -EUCLEAN;
+    }
+    kvaf_release_mapping_record(mapping);
   }
   return 0;
 }
@@ -345,9 +382,12 @@ void *ummu_get_core_buf(
     unsigned int tid, enum ummu_buf_mode mode, size_t size, int fd,
     unsigned long index)
 {
+  struct kvaf_ummu_owned_mapping *mapping;
+  struct kvaf_ummu_tid_state *state = g_kvaf_ummu_current_state;
+  void *address;
   off_t offset;
 
-  if (fd < 0 || size == 0) {
+  if (fd < 0 || size == 0 || state == NULL || state->tid != tid) {
     errno = EINVAL;
     return MAP_FAILED;
   }
@@ -369,7 +409,20 @@ void *ummu_get_core_buf(
       errno = EINVAL;
       return MAP_FAILED;
   }
-  return mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
+  /* Reserve the exact cleanup owner before mmap.  There is deliberately no
+   * fallible operation between a successful mmap and publishing this record. */
+  mapping = calloc(1, sizeof(*mapping));
+  if (mapping == NULL) {
+    errno = ENOMEM;
+    return MAP_FAILED;
+  }
+  address = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
+  if (address == MAP_FAILED) {
+    free(mapping);
+    return MAP_FAILED;
+  }
+  kvaf_ummu_mapping_attach(&state->mappings, mapping, address, size);
+  return address;
 }
 
 void ummu_free_core_buf(enum ummu_buf_mode mode, void *buffer, size_t size)
@@ -727,18 +780,94 @@ static int kvaf_send_plbi_checked(
   return 0;
 }
 
-void ummu_plbi_va_cmd(
-    struct ummu_mapt_info *mapt_info, struct ummu_data_info *data_info)
+static void kvaf_mark_inline_plbi_failed(
+    struct kvaf_ummu_tid_state *state, int status,
+    uint64_t address, size_t length)
 {
-  (void)mapt_info;
-  if (g_kvaf_ummu_current_state == NULL || data_info == NULL) {
-    kvaf_record_failure(NULL, KVAF_SOURCE_UMMU_FAILURE_INTERNAL,
-        -EINVAL, KVAF_SOURCE_UMMU_RETRY_UNSAFE, true,
-        KVAF_SOURCE_UMMU_PENDING_NONE, 0, 0);
+  if (state == NULL || status == 0) {
     return;
   }
-  (void)kvaf_send_plbi_checked(g_kvaf_ummu_current_state,
-      PLBI_VA_OP, data_info->data_base, data_info->data_size);
+  /*
+   * These callbacks are invoked from inside the official MAPT mutation
+   * routines and have a void ABI. Once a command fails the caller cannot
+   * know which table writes and which UMMUs observed it. Never downgrade an
+   * apparently retryable queue/ioctl errno to a retryable public teardown.
+   */
+  state->pending_state_unknown = true;
+  kvaf_record_failure(state,
+      g_kvaf_queue_failure_stage == KVAF_SOURCE_UMMU_FAILURE_NONE
+          ? KVAF_SOURCE_UMMU_FAILURE_PLBI_KERNEL_IOCTL
+          : g_kvaf_queue_failure_stage,
+      status, KVAF_SOURCE_UMMU_RETRY_UNSAFE, true,
+      state->pending, address, length);
+}
+
+void ummu_plbi_va_cmd(
+    struct ummu_mapt_info *mapt_info, uint64_t va, uint64_t size)
+{
+  struct kvaf_ummu_tid_state *state = g_kvaf_ummu_current_state;
+  int status;
+
+  g_kvaf_queue_failure_stage = KVAF_SOURCE_UMMU_FAILURE_NONE;
+  if (state == NULL || mapt_info == NULL || state->mapt != mapt_info ||
+      size > SIZE_MAX) {
+    kvaf_record_failure(state, KVAF_SOURCE_UMMU_FAILURE_INTERNAL,
+        -EINVAL, KVAF_SOURCE_UMMU_RETRY_UNSAFE, true,
+        state == NULL ? KVAF_SOURCE_UMMU_PENDING_NONE : state->pending,
+        va, size > SIZE_MAX ? SIZE_MAX : (size_t)size);
+    if (state != NULL) {
+      state->pending_state_unknown = true;
+    }
+    return;
+  }
+  status = kvaf_send_plbi_checked(
+      state, PLBI_VA_OP, va, (size_t)size);
+  kvaf_mark_inline_plbi_failed(state, status, va, (size_t)size);
+}
+
+void ummu_plbi_f_bit_cmd(
+    struct ummu_mapt_info *mapt_info,
+    uint32_t next_lvl_idx, uint32_t next_lvl_offset)
+{
+  struct kvaf_ummu_tid_state *state = g_kvaf_ummu_current_state;
+  struct ummu_mapt_cmd_free_bit_entry command = {
+      .opcode = PLBI_USR_N,
+      .next_lvl_idx = next_lvl_idx,
+      .next_lvl_offset = next_lvl_offset,
+  };
+  uint32_t index;
+  int status = 0;
+
+  g_kvaf_queue_failure_stage = KVAF_SOURCE_UMMU_FAILURE_NONE;
+  if (state == NULL || mapt_info == NULL || state->mapt != mapt_info ||
+      !mapt_info->free_bit) {
+    status = -EINVAL;
+    goto failed;
+  }
+  /* The public kernel-command ABI has only VA and ALL ioctls. */
+  if (mapt_info->kcmd_plbi) {
+    status = -EOPNOTSUPP;
+    goto failed;
+  }
+  for (index = 0; index < mapt_info->queue_ctx.ummu_cnt; ++index) {
+    status = ummu_send_cmd(
+        (struct ummu_mapt_cmd_entry *)(void *)&command,
+        mapt_info, index);
+    if (status != 0) {
+      goto failed;
+    }
+  }
+  return;
+
+failed:
+  if (state != NULL) {
+    kvaf_mark_inline_plbi_failed(state, status,
+        ((uint64_t)next_lvl_idx << 32U) | next_lvl_offset, 0);
+  } else {
+    kvaf_record_failure(NULL, KVAF_SOURCE_UMMU_FAILURE_INTERNAL,
+        status, KVAF_SOURCE_UMMU_RETRY_UNSAFE, true,
+        KVAF_SOURCE_UMMU_PENDING_NONE, 0, 0);
+  }
 }
 
 void ummu_send_user_all(struct ummu_mapt_info *mapt_info)
@@ -913,6 +1042,7 @@ int ummu_grant(
   data_info.perm = permission;
   data_info.token = segment_attribute->token;
   data_info.e_bit = segment_attribute->e_bit;
+  data_info.lvl = MAX_LEVEL_INDEX;
   if (ummu_check_data(&data_info, state->mapt->mode) != 0 ||
       ummu_perm_data_preproc(&data_info) != 0) {
     status = -EINVAL;
@@ -939,6 +1069,10 @@ int ummu_grant(
   } else {
     status = -EINVAL;
   }
+  if (state->pending_state_unknown) {
+    status = -EUCLEAN;
+    goto clear_token;
+  }
   if (status == 0) {
     status = ummu_update_info(operation, state->mapt, &data_info);
   }
@@ -954,8 +1088,10 @@ int ummu_grant(
   if (state->pending ==
       KVAF_SOURCE_UMMU_PENDING_GRANT_TOKEN_UPDATE) {
     state->pending_local_update_done = true;
-    status = kvaf_send_plbi_checked(state, PLBI_VA_OP,
-        data_info.data_base, data_info.data_size);
+    status = state->mapt->positive_plbi
+        ? 0
+        : kvaf_send_plbi_checked(state, PLBI_VA_OP,
+              data_info.data_base, data_info.data_size);
     if (status == 0) {
       kvaf_clear_pending(state);
     }
@@ -1001,6 +1137,7 @@ static int kvaf_ungrant_data(
   }
   data_info.data = data;
   data_info.data_size = data_size;
+  data_info.lvl = MAX_LEVEL_INDEX;
   data_info.tokenval = token;
   data_info.bytoken = by_token ? 1 : 0;
   data_info.data_base = (uint64_t)(uintptr_t)data;
@@ -1026,6 +1163,10 @@ static int kvaf_ungrant_data(
     status = ummu_entry_op(state->mapt, &data_info);
   } else {
     status = ummu_table_op(state->mapt, &data_info);
+  }
+  if (state->pending_state_unknown) {
+    status = -EUCLEAN;
+    goto done;
   }
   if (status == 0) {
     status = ummu_update_info(operation, state->mapt, &data_info);
@@ -1109,17 +1250,34 @@ static int kvaf_mapt_has_live_mapping(
 static int kvaf_munmap_owned(
     struct kvaf_ummu_tid_state *state, void *address, size_t length)
 {
-  if (address == NULL || length == 0) {
-    return -EINVAL;
+  struct kvaf_ummu_owned_mapping *mapping =
+      kvaf_ummu_mapping_find(&state->mappings, address, length);
+  int status;
+
+  if (mapping == NULL) {
+    status = address == NULL || length == 0 ? -EINVAL : -EUCLEAN;
+    kvaf_latch_mapping_ownership_unknown(state, address, length, status);
+    return status;
   }
   if (munmap(address, length) == 0) {
+    mapping = kvaf_ummu_mapping_detach(
+        &state->mappings, address, length);
+    if (mapping == NULL) {
+      kvaf_latch_mapping_ownership_unknown(
+          state, address, length, -EUCLEAN);
+      return -EUCLEAN;
+    }
+    kvaf_release_mapping_record(mapping);
     return 0;
   }
+  status = -errno;
+  /* The owning MAPT field is cleared only after this function succeeds, so
+   * the active intrusive record and the MAPT object both retain the address. */
   kvaf_record_failure(state, KVAF_SOURCE_UMMU_FAILURE_MUNMAP,
-      -errno, KVAF_SOURCE_UMMU_RETRY_SAFE, false,
+      status, KVAF_SOURCE_UMMU_RETRY_SAFE, false,
       KVAF_SOURCE_UMMU_PENDING_FREE_TID,
       (uint64_t)(uintptr_t)address, length);
-  return -errno;
+  return status;
 }
 
 static int kvaf_release_local_mapt_locked(
@@ -1190,11 +1348,10 @@ static int kvaf_free_tid_state_locked(
   bool mapt_locked = false;
   int status;
 
-  if (state->pending == KVAF_SOURCE_UMMU_PENDING_FREE_TID &&
-      state->pending_state_unknown) {
+  if (state->pending_state_unknown) {
     kvaf_record_failure(state, KVAF_SOURCE_UMMU_FAILURE_INTERNAL,
         -EUCLEAN, KVAF_SOURCE_UMMU_RETRY_UNSAFE, true,
-        KVAF_SOURCE_UMMU_PENDING_FREE_TID, 0, 0);
+        state->pending, state->pending_address, state->pending_length);
     return -EUCLEAN;
   }
 
@@ -1268,6 +1425,14 @@ unlock:
   if (status != 0 ||
       state->cleanup_phase != KVAF_UMMU_CLEANUP_LOCAL_RELEASED) {
     return status == 0 ? -EUCLEAN : status;
+  }
+  if (state->mappings.head != NULL ||
+      state->mappings.retained_count != 0) {
+    state->pending_state_unknown = true;
+    kvaf_record_failure(state, KVAF_SOURCE_UMMU_FAILURE_LIVE_MAPPING,
+        -EUCLEAN, KVAF_SOURCE_UMMU_RETRY_UNSAFE, true,
+        KVAF_SOURCE_UMMU_PENDING_FREE_TID, 0, 0);
+    return -EUCLEAN;
   }
   if (state->mapt != NULL &&
       pthread_mutex_destroy(&state->mapt->mapt_mutex) != 0) {
@@ -1449,6 +1614,9 @@ int kvaf_source_ummu_get_status(struct kvaf_source_ummu_status *status)
       kvaf_source_ummu_pending_operation_count();
   status->retained_mapping_count =
       kvaf_source_ummu_retained_mapping_count();
+  /* Preserve the fail-closed latch even after a later retry-safe failure. */
+  status->last_state_unknown =
+      kvaf_source_ummu_cleanup_is_unknown() != 0 ? 1U : 0U;
   (void)pthread_mutex_unlock(&g_kvaf_ummu_status_lock);
   return 0;
 }

@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).parents[1]
 RUNNER = ROOT / "scripts" / "run_a5_direct_urma_h2d_smoke.sh"
+MANIFEST_V3 = ROOT / "scripts" / "a5_direct_urma_manifest_v3.sh"
+RUNTIME_PREFLIGHT = (
+    ROOT / "scripts" / "a5_direct_urma_runtime_preflight.sh"
+)
 
 
 class DirectUrmaRunnerGuardTests(unittest.TestCase):
@@ -25,6 +30,8 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
             RUNNER,
             ROOT / "scripts" / "a5_direct_urma_legacy_guard.sh",
             ROOT / "scripts" / "a5_aicpu_affinity_guard.sh",
+            MANIFEST_V3,
+            RUNTIME_PREFLIGHT,
             ROOT / "scripts" / "run_a5_aiv_urma_h2d_smoke.sh",
             ROOT / "scripts" / "build_a5_direct_urma.sh",
             ROOT / "scripts" / "build_a5_direct_urma_provider.sh",
@@ -297,38 +304,168 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
             "KVAF_DIRECT_ALLOW_UNVERIFIED_UDMA_TEARDOWN", self.source
         )
         self.assertNotIn("unverified-system-provider)", self.source)
+        verifier = MANIFEST_V3.read_text(encoding="utf-8")
         for binding in (
-            "udma_provider_mode=source-built-internal",
-            "udma_runtime_capability=0x0000000000020001",
-            "ummu_provider_mode=source-built-internal",
-            "ummu_runtime_capability=0x0000000000010001",
+            "kvaf-direct-urma-provider-v3",
+            "official-umdk-source-built-internal",
+            "paired-libummu-source-built-internal",
+            "umdk_libummu_pairing:verified",
             "checked-retryable-v1",
         ):
-            self.assertIn(binding, self.source)
-        self.assertIn("ummu_uapi_header_sha256", self.source)
-        self.assertIn("lib(urma|ummu|urma-udma)", self.source)
+            self.assertIn(binding, verifier)
+        self.assertIn('"${prefix}_header_sha256"', verifier)
+        self.assertIn("lib(urma_common|urma|ummu|udma|urma-udma)", verifier)
+
+    def test_provider_v3_pins_source_pair_kernel_and_runtime_uapi(self) -> None:
+        builder = (
+            ROOT / "scripts" / "build_a5_direct_urma_provider.sh"
+        ).read_text(encoding="utf-8")
+        verifier = MANIFEST_V3.read_text(encoding="utf-8")
+
+        for value in (
+            "12917421beb93c1351eb2f124bb2f34612d8bf2d",
+            "70de020f776d8def0d8a8941cc7cbc5928d66c10",
+            "https://gitcode.com/openeuler/umdk.git",
+            "https://gitcode.com/openeuler/libummu.git",
+            "26.06.0",
+            "1.0.5",
+        ):
+            self.assertIn(value, builder)
+            self.assertIn(value, verifier)
+        self.assertIn("build_kernel_release=${kernel_release}", builder)
+        self.assertIn('"${build_kernel_release}" == "$(uname -r)"', verifier)
+        self.assertIn('"runtime_${prefix}_header_path"', verifier)
+        self.assertIn('"runtime_${prefix}_match" verified-exact', verifier)
+        self.assertIn('"runtime_${prefix}_header_sha256"', verifier)
+
+    def test_recovery_precedes_provider_v3_and_hardware_access(self) -> None:
+        verify = self.source.index("kvaf_verify_direct_provider_build_v3")
+        recovery = self.source.index("acquire_persistent_session_guards\n")
+        eid = self.source.index("resolve_a5_urma_eids.py")
+        endpoint = self.source.index("resolve_a5_urma_endpoints.py")
+        npu = self.source.index('"${kvaf_npu_smi_binary}" info')
+        self.assertLess(recovery, verify)
+        self.assertLess(verify, eid)
+        self.assertLess(verify, endpoint)
+        self.assertLess(verify, npu)
+        verifier = MANIFEST_V3.read_text(encoding="utf-8")
+        for forbidden in ("/proc/", "npu-smi", "aclrt", "resolve_a5_urma"):
+            self.assertNotIn(forbidden, verifier)
+
+    def test_complete_runtime_artifact_preflight_precedes_hardware(self) -> None:
+        provider = self.source.index("kvaf_verify_direct_provider_build_v3")
+        affinity = self.source.index(
+            "kvaf_require_aicpu_affinity_contract || exit $?"
+        )
+        runtime = self.source.index(
+            "kvaf_verify_direct_runtime_artifacts_v3"
+        )
+        eid = self.source.index("resolve_a5_urma_eids.py")
+        endpoint = self.source.index("resolve_a5_urma_endpoints.py")
+        reserved_sq = self.source.index(
+            "/sys/module/udma/parameters/sq_reserved"
+        )
+        npu = self.source.index('"${kvaf_npu_smi_binary}" info')
+        self.assertLess(provider, affinity)
+        self.assertLess(affinity, runtime)
+        self.assertLess(runtime, eid)
+        self.assertLess(runtime, endpoint)
+        self.assertLess(runtime, reserved_sq)
+        self.assertLess(runtime, npu)
+
+        helper = RUNTIME_PREFLIGHT.read_text(encoding="utf-8")
+        for required in (
+            "kvaf-a5-direct-smoke-build-v2",
+            "kvaf-direct-urma-provider.manifest",
+            "kvaf-direct-urma-umdk-source.sha256",
+            "kvaf_udma_private_abi_probe",
+            "libascendcl.so",
+        ):
+            self.assertIn(required, helper)
+        for forbidden in (
+            "/proc/",
+            "hccn_tool",
+            "npu-smi",
+            "aclrt",
+            "/sys/module/",
+        ):
+            self.assertNotIn(forbidden, helper)
+
+    def test_package_verifies_provider_once_under_deploy_lock(self) -> None:
+        package = (
+            ROOT / "scripts" / "package_a5_direct_urma_aicpu.sh"
+        ).read_text(encoding="utf-8")
+        lock = package.index('exec 9>"${KVAF_DIRECT_DEPLOY_RUN_LOCK}"')
+        acquired = package.index("flock -w 30 9", lock)
+        verify = package.index("kvaf_verify_direct_provider_build_v3")
+        self.assertLess(acquired, verify)
+        self.assertEqual(
+            package.count("kvaf_verify_direct_provider_build_v3"), 1
+        )
+
+    def test_provider_v2_manifest_fails_closed(self) -> None:
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("bash is unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary)
+            host = build / "libkvaf_urma_provider_host.so"
+            device = build / "libkvaf_urma_provider_device.so"
+            source_manifest = build / "source.sha256"
+            manifest = build / "build.manifest"
+            success = build / "build.success"
+            host.write_bytes(b"host")
+            device.write_bytes(b"device")
+            source_manifest.write_text("legacy\n", encoding="utf-8")
+            manifest.write_text(
+                "schema=kvaf-direct-urma-provider-v2\n",
+                encoding="utf-8",
+            )
+            success.write_text(
+                "schema=kvaf-direct-urma-provider-success-v2\n",
+                encoding="utf-8",
+            )
+            command = (
+                f'source "{MANIFEST_V3}"; '
+                f'KVAF_DIRECT_PROVIDER_BUILD_DIR="{build}"; '
+                f'KVAF_DIRECT_HOST_PROVIDER_LIBRARY="{host}"; '
+                f'KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY="{device}"; '
+                f'KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST="{source_manifest}"; '
+                f'KVAF_DIRECT_PROVIDER_BUILD_MANIFEST="{manifest}"; '
+                f'KVAF_DIRECT_PROVIDER_SUCCESS_STAMP="{success}"; '
+                "kvaf_verify_direct_provider_build_v3"
+            )
+            result = subprocess.run(
+                [bash, "-c", command],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unexpected schema", result.stderr)
 
     def test_aicpu_packaging_requires_source_built_provider_manifest(self) -> None:
         package_source = (
             ROOT / "scripts" / "package_a5_direct_urma_aicpu.sh"
         ).read_text(encoding="utf-8")
-        verify_start = package_source.index("verify_runtime_manifest()\n")
-        verify_end = package_source.index("\n}\n", verify_start)
-        runtime_verifier = package_source[verify_start:verify_end]
-
-        self.assertIn(
-            "for prefix in urma_library urma_common_library; do",
-            runtime_verifier,
-        )
-        self.assertNotIn("udma_provider_library", runtime_verifier)
+        verifier = MANIFEST_V3.read_text(encoding="utf-8")
+        self.assertIn("kvaf_verify_direct_provider_build_v3", package_source)
+        self.assertNotIn("for prefix in urma_library urma_common_library", verifier)
         for binding in (
-            "urma_core_mode source-linked-no-dynamic-providers",
-            "udma_provider_mode source-built-internal",
-            "ummu_provider_mode source-built-internal",
+            "urma_core_mode:official-umdk-source-linked-no-dynamic-providers",
+            "udma_provider_mode:official-umdk-source-built-internal",
+            "ummu_provider_mode:paired-libummu-source-built-internal",
         ):
-            self.assertIn(binding, package_source)
-        self.assertIn("'^(udma|ummu)_provider_library_'", package_source)
-        self.assertIn("lib(urma|ummu|urma-udma)\\.so", package_source)
+            self.assertIn(binding, verifier)
+        self.assertIn("lib(urma_common|urma|ummu|udma|urma-udma)", verifier)
+        for entry in (
+            "kvaf-direct-urma-umdk-source.sha256",
+            "kvaf-direct-urma-libummu-source.sha256",
+            "kvaf_udma_uapi_probe",
+            "kvaf_udma_private_abi_probe",
+            "kvaf_ummu_uapi_probe",
+        ):
+            self.assertIn(entry, package_source)
 
     def test_bounded_wait_without_terminal_proof_stays_recoverable(self) -> None:
         start = self.source.index("bounded_wait_expired")

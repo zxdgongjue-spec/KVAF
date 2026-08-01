@@ -18,11 +18,14 @@ static inline int kvaf_udma_checked_alloc_hugepage_queue(
     struct udma_u_hugepage_priv *mapping = NULL;
     struct udma_u_hugepage *hugepage;
     uint32_t mapping_length;
+    uint32_t mapping_index;
     off_t offset;
     bool mapping_created = false;
 
     if (queue == NULL || queue->ctx == NULL || queue->qbuf_size == 0U ||
         queue->ctx->page_size < UDMA_HW_PAGE_SIZE ||
+        queue->ctx->page_size > UDMA_HUGEPAGE_SIZE ||
+        UDMA_HUGEPAGE_SIZE % queue->ctx->page_size != 0U ||
         queue->qbuf_size > UINT32_MAX - (UDMA_HUGEPAGE_SIZE - 1U)) {
         return -1;
     }
@@ -44,8 +47,11 @@ static inline int kvaf_udma_checked_alloc_hugepage_queue(
         }
         mapping->va_len = mapping_length;
         mapping->left_va_len = mapping_length;
-        offset = get_mmap_offset(
-            0, queue->ctx->page_size, UDMA_MMAP_HUGEPAGE);
+        mapping_index =
+            (UDMA_HUGEPAGE_SIZE / queue->ctx->page_size) >>
+            MAP_INDEX_SHIFT;
+        offset = get_mmap_offset(mapping_index,
+            queue->ctx->page_size, UDMA_MMAP_HUGEPAGE);
         mapping->va_base = mmap(NULL, mapping->va_len,
             PROT_READ | PROT_WRITE, MAP_SHARED,
             queue->ctx->urma_ctx.dev_fd, offset);
@@ -101,14 +107,15 @@ static inline int kvaf_udma_checked_alloc_queue_buffer(
     uint64_t rounded_bytes = 1U;
     uint64_t aligned_bytes;
 
-    if (queue == NULL || max_entry_count == 0U ||
+    if (queue == NULL || queue->ctx == NULL ||
+        queue->ctx->urma_ctx.dev_fd < 0 || max_entry_count == 0U ||
         base_block_size == 0U || page_size == 0U ||
         (base_block_size & (base_block_size - 1U)) != 0U ||
         (page_size & (page_size - 1U)) != 0U) {
         return -1;
     }
-    if (queue->sq_reserved) {
-        return 0;
+    if (queue->cstm || queue->dtu_en || queue->sq_reserved) {
+        return -1;
     }
     required_bytes = (uint64_t)max_entry_count * base_block_size;
     if (required_bytes == 0U || required_bytes > UINT32_MAX) {
@@ -135,6 +142,7 @@ static inline int kvaf_udma_checked_alloc_queue_buffer(
         return -1;
     }
     queue->baseblk_mask = queue->baseblk_cnt - 1U;
+    queue->aligned_size = page_size;
     if (allocate_wrid) {
         queue->wrid = calloc(queue->baseblk_cnt, sizeof(*queue->wrid));
         if (queue->wrid == NULL) {
@@ -146,9 +154,12 @@ static inline int kvaf_udma_checked_alloc_queue_buffer(
             return -1;
         }
     } else {
+        const off_t offset = get_mmap_offset(0,
+            queue->ctx->page_size, UDMA_MMAP_KERNEL_BUF);
+
         queue->qbuf = mmap(NULL, queue->qbuf_size,
-            PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            PROT_READ | PROT_WRITE, MAP_SHARED,
+            queue->ctx->urma_ctx.dev_fd, offset);
         if (queue->qbuf == MAP_FAILED) {
             queue->qbuf = NULL;
             free(queue->wrid);
@@ -201,9 +212,18 @@ static inline int kvaf_udma_checked_alloc_sw_db(
             free(page);
             goto failure;
         }
-        page->buf.buf = mmap(NULL, page->buf.length,
-            PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (type == UDMA_JFR_PAYLOAD) {
+            page->buf.buf = mmap(NULL, page->buf.length,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        } else {
+            const off_t offset = get_mmap_offset(0,
+                context->page_size, UDMA_MMAP_KERNEL_BUF);
+
+            page->buf.buf = mmap(NULL, page->buf.length,
+                PROT_READ | PROT_WRITE, MAP_SHARED,
+                context->urma_ctx.dev_fd, offset);
+        }
         if (page->buf.buf == MAP_FAILED) {
             udma_bitmap_free(page->bitmap);
             free(page);
@@ -337,7 +357,8 @@ static inline int kvaf_udma_checked_free_queue_buffer(
         free(queue->wrid);
         queue->wrid = NULL;
     }
-    if (!queue->cstm && !queue->sq_reserved && queue->qbuf != NULL) {
+    if (!queue->cstm && !queue->dtu_en && !queue->sq_reserved &&
+        queue->qbuf != NULL) {
         if (queue->hugepage != NULL) {
             if (kvaf_udma_checked_free_hugepage_queue(queue) != 0) {
                 return -1;

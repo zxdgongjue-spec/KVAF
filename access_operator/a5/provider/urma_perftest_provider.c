@@ -10,7 +10,6 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#include "perftest_communication.h"
 #include "perftest_parameters.h"
 #include "perftest_resources.h"
 #include "kvaf_private_udma_accessor.h"
@@ -157,11 +156,8 @@ static int kvaf_set_control_socket_deadlines(
         .tv_usec = 0,
     };
 
-    if (g_kvaf_config.comm.sock_fd == NULL) {
-        return -1;
-    }
     for (i = 0; i < g_kvaf_config.pair_num; ++i) {
-        const int fd = g_kvaf_config.comm.sock_fd[i];
+        const int fd = kvaf_perftest_control_fd(i);
         if (fd < 0 ||
             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
                 &timeout, sizeof(timeout)) != 0 ||
@@ -266,6 +262,8 @@ static bool kvaf_context_is_complete(
             g_kvaf_context.urma_ctx) != 1 ||
         g_kvaf_context.jetty_num != KVAF_PROVIDER_JETTYS ||
         g_kvaf_context.local_buf == NULL ||
+        !g_kvaf_config.enable_va ||
+        g_kvaf_config.v_address != config->local_address ||
         g_kvaf_context.local_buf[0] !=
             (void *)(uintptr_t)config->local_address ||
         g_kvaf_context.local_tseg == NULL ||
@@ -276,6 +274,9 @@ static bool kvaf_context_is_complete(
         g_kvaf_context.import_tseg[0] == NULL ||
         g_kvaf_context.jfc_s == NULL ||
         g_kvaf_context.jfc_s[0] == NULL ||
+        (g_kvaf_config.share_jfr &&
+         (g_kvaf_context.jfr == NULL ||
+          g_kvaf_context.jfr[0] == NULL)) ||
         g_kvaf_context.jetty == NULL ||
         g_kvaf_context.jetty[0] == NULL ||
         g_kvaf_context.buf_len == 0 ||
@@ -349,7 +350,7 @@ static int kvaf_fill_result(
     /*
      * Public liburma query calls do not expose userspace SQ/CQ mappings.
      * Consume only the isolated ABI-pinned accessor output; never use
-     * urma_perftest's copied private ai_jettys layout for device addresses.
+     * any copied perftest private layout for device addresses.
      */
     if (!kvaf_is_power_of_two(raw_sq_depth) ||
         !kvaf_is_power_of_two(
@@ -451,12 +452,13 @@ static int kvaf_close_unlocked(uint64_t session_id);
 
 static bool kvaf_source_ummu_state_is_unknown(void)
 {
-    struct kvaf_source_ummu_status status = {
-        .structure_size = sizeof(status),
-    };
+    return kvaf_source_ummu_cleanup_is_unknown() != 0;
+}
 
-    return kvaf_source_ummu_get_status(&status) != 0 ||
-        status.last_state_unknown != 0U;
+static bool kvaf_source_cleanup_state_is_unknown(void)
+{
+    return kvaf_udma_source_cleanup_is_unknown() != 0 ||
+        kvaf_source_ummu_state_is_unknown();
 }
 
 static bool kvaf_udma_source_has_no_live_resources(void)
@@ -467,15 +469,17 @@ static bool kvaf_udma_source_has_no_live_resources(void)
 
     /* Open can fail before exposing a context handle; drain that sidecar
      * before consulting any ordinary live-resource counter. */
-    return kvaf_udma_source_retry_orphan_contexts() == 0 &&
+    return kvaf_udma_source_cleanup_is_unknown() == 0 &&
+        kvaf_udma_source_retry_orphan_contexts() == 0 &&
         kvaf_udma_source_live_segment_count() == 0U &&
         kvaf_udma_source_live_token_count() == 0U &&
         kvaf_udma_source_live_jetty_count() == 0U &&
+        kvaf_udma_source_live_jfr_count() == 0U &&
         kvaf_udma_source_live_jfc_count() == 0U &&
         kvaf_udma_source_live_context_count() == 0U &&
         kvaf_source_ummu_checked_contract_ready() == 1 &&
         kvaf_source_ummu_get_status(&ummu_status) == 0 &&
-        ummu_status.last_state_unknown == 0U &&
+        kvaf_source_ummu_cleanup_is_unknown() == 0 &&
         kvaf_source_ummu_live_tid_count() == 0U &&
         kvaf_source_ummu_pending_operation_count() == 0U &&
         kvaf_source_ummu_retained_mapping_count() == 0U;
@@ -544,7 +548,7 @@ int kvaf_urma_provider_open_v2(
     ret = kvaf_perftest_set_control_timeout(
         config->control_timeout_seconds);
     if (ret == 0) {
-        ret = establish_connection(&g_kvaf_config);
+        ret = kvaf_perftest_establish_connection(&g_kvaf_config);
     }
     if (ret != 0) {
         kvaf_init_result(result, KVAF_URMA_PROVIDER_CONNECT_FAILED, ret);
@@ -572,7 +576,8 @@ int kvaf_urma_provider_open_v2(
         goto fail;
     }
 
-    g_kvaf_config.dev_buf = (void *)(uintptr_t)config->local_address;
+    g_kvaf_config.v_address = config->local_address;
+    g_kvaf_config.enable_va = true;
     ret = kvaf_perftest_create_duplex_ctx_checked(
         &g_kvaf_context, &g_kvaf_config);
     /*
@@ -671,7 +676,7 @@ static int kvaf_close_unlocked(uint64_t session_id)
                 &g_kvaf_teardown_state);
         if (teardown_status ==
             KVAF_PERFTEST_CHECKED_DESTROY_RETRYABLE) {
-            if (kvaf_source_ummu_state_is_unknown()) {
+            if (kvaf_source_cleanup_state_is_unknown()) {
                 /*
                  * A public destroy API collapses lower UMMU errno values to
                  * URMA_FAIL. Consult the source-owned diagnostic before
@@ -719,7 +724,7 @@ static int kvaf_close_unlocked(uint64_t session_id)
         g_kvaf_runtime_acquired = false;
     }
     if (g_kvaf_connection_open) {
-        close_connection(&g_kvaf_config);
+        kvaf_perftest_close_connection(&g_kvaf_config);
         g_kvaf_connection_open = false;
     }
     if (g_kvaf_config_initialized) {

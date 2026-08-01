@@ -51,7 +51,11 @@ enum kvaf_source_ummu_pending_operation {
 
 /*
  * Stable diagnostic contract for the private source-built UMMU instance.
- * A nonzero live/pending count means the owning provider DSO must not unload.
+ * A nonzero live/pending/retained count means the owning provider DSO must not
+ * unload.  CHECKED_RETRYABLE_V1 guarantees that every successful core-buffer
+ * mmap publishes a preallocated ownership record before it is returned.  A
+ * void rollback therefore retains the exact address after munmap failure
+ * without relying on a post-failure allocation.
  */
 struct kvaf_source_ummu_status {
   uint32_t abi_version;
@@ -76,6 +80,13 @@ int kvaf_source_ummu_get_status(struct kvaf_source_ummu_status *status);
 uint32_t kvaf_source_ummu_live_tid_count(void);
 uint32_t kvaf_source_ummu_pending_operation_count(void);
 uint32_t kvaf_source_ummu_retained_mapping_count(void);
+
+/*
+ * Process-lifetime fail-closed latch.  Once a UMMU command or ownership
+ * transition becomes unknowable, a later retry-safe diagnostic must never
+ * downgrade Close back to RETRYABLE.
+ */
+int kvaf_source_ummu_cleanup_is_unknown(void);
 
 /* Retry only work that is explicitly classified KVAF_SOURCE_UMMU_RETRY_SAFE. */
 int kvaf_source_ummu_retry_pending(uint32_t tid);

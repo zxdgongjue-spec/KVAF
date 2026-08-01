@@ -43,13 +43,15 @@ Runtime target 依赖另外两个 target，因此后续可以由 Runtime 统一�
 `kvaf_access_operator` 当前包含固定容量的设备 ABI、CPU 参考规划器和单元测试。
 A5 后端默认关闭。两个 backend 都依赖 Ascend 950、CANN、bisheng 和有效
 的 Host/Device EID 对；HCOMM backend 额外依赖 HCOMM，direct backend
-从 `urma_perftest` 源码和 UB MicroBenchmark 实测 AIV ABI 构建
-Host/Device provider，
-并依赖内核 UDMA/UMMU、与驱动匹配的 full UMMU UAPI 和 AICPU provider
-部署；private liburma core 与 userspace UDMA/UMMU 均由源码编进 provider，
-并在编译期禁用动态 provider 扫描，不链接或加载系统 `liburma.so`、
-`liburma-udma.so`、`libummu.so` 或预编译
-`liburma_perftest.so`。
+固定使用 openEuler UMDK
+`12917421beb93c1351eb2f124bb2f34612d8bf2d` 及该版本锁定的 libummu
+`70de020f776d8def0d8a8941cc7cbc5928d66c10`。UMDK common、完整 public
+URMA core、UDMA 和官方 perftest TCP 控制面，以及配对的 UMMU 都从这两棵
+源码树编进 Host/Device provider。构建还要求 UDMA、UMMU userspace UAPI 与
+当前运行内核的对应 UAPI 逐字节相同，并在编译期禁用动态 provider 扫描。
+direct backend 不链接或加载系统 `liburma.so`、`liburma_common.so`、
+`liburma-udma.so`、`libummu.so` 或预编译 `liburma_perftest.so`，也不依赖
+memcache、memfabric 或 HCOMM。
 
 ## 构建
 
@@ -73,14 +75,52 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 bash scripts/build_a5_aiv_urma.sh
 ```
 
-构建不链接 HCOMM 的 direct URMA 路径：
+构建不链接 HCOMM 的 direct URMA 路径。先在服务器 B 宿主机准备两棵固定、
+无本地修改的源码树：
 
 ```bash
-export KVAF_UMMU_UAPI_ROOT=/path/to/current-driver-source
+echo "EXECUTION_ENV=SERVER_B_HOST"
+
+test -d /data/c00982601/umdk/.git || \
+  git clone https://gitcode.com/openeuler/umdk.git \
+    /data/c00982601/umdk
+git -C /data/c00982601/umdk fetch origin
+git -C /data/c00982601/umdk switch --detach \
+  12917421beb93c1351eb2f124bb2f34612d8bf2d
+
+test -d /data/c00982601/libummu/.git || \
+  git clone https://gitcode.com/openeuler/libummu.git \
+    /data/c00982601/libummu
+git -C /data/c00982601/libummu fetch origin
+git -C /data/c00982601/libummu switch --detach \
+  70de020f776d8def0d8a8941cc7cbc5928d66c10
+
+test -z "$(git -C /data/c00982601/umdk status --porcelain)"
+test -z "$(git -C /data/c00982601/libummu status --porcelain)"
+```
+
+然后在 `vllm-ascend-cs-kvaf` Docker 中构建。两份 runtime header 必须来自
+`uname -r` 对应的 kernel-devel/kernel source；若不在脚本的标准自动探测路径，
+显式设置为 Docker 内可读的路径：
+
+```bash
+echo "EXECUTION_ENV=VLLM_ASCEND_CS_KVAF_DOCKER"
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+
+export KVAF_UMDK_ROOT=/data/c00982601/umdk
+export KVAF_LIBUMMU_ROOT=/data/c00982601/libummu
+export KVAF_RUNTIME_UDMA_UAPI_HEADER=/data/c00982601/kernel-uapi/$(uname -r)/udma_abi.h
+export KVAF_RUNTIME_UMMU_UAPI_HEADER=/data/c00982601/kernel-uapi/$(uname -r)/ummu_core.h
+
 bash scripts/build_a5_direct_urma_provider.sh
 bash scripts/package_a5_direct_urma_aicpu.sh
 bash scripts/build_a5_direct_urma.sh
 ```
+
+provider 构建产出 `kvaf_udma_uapi_probe`、
+`kvaf_udma_private_abi_probe`、`kvaf_ummu_uapi_probe` 和 v3 build
+manifest/success stamp。任一源码树不干净、commit 配对错误、runtime UAPI
+缺失或不完全匹配，构建都会 fail closed。
 
 构建成功后，正向硬件冒烟会从驱动自动解析当前物理设备的 Host/Device
 EID pair，不依赖其他代码仓；随后按 EID 精确匹配 Host sysfs 与 Device

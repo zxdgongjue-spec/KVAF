@@ -13,10 +13,13 @@ extern "C" {
  * Values extracted from the ABI-pinned UDMA provider object. Public
  * liburma query APIs do not expose userspace SQ/CQ mappings or the JFC
  * software doorbell, so this adapter is intentionally compiled against the
- * top-level urma_types.h layout used by the hardware-tested
- * UB_MicroBenchmark_new liburma_perftest.so. The source-built UDMA objects,
- * accessor and public ABI probe are compiled from one pinned source snapshot.
+ * private UMDK 26.06 UDMA layout.  The source-built UDMA objects, accessor and
+ * public ABI probe are compiled from one pinned source snapshot.  Host and
+ * AICPU keep different execution-domain ABI values, but they no longer select
+ * different C layouts through ST64B/TGID_VA.
  */
+#define KVAF_UDMA_PRIVATE_LAYOUT_UMDK_2606 0x00020600U
+
 struct kvaf_udma_direct_queue_info {
   uint32_t struct_size;
   uint32_t private_abi;
@@ -35,7 +38,7 @@ struct kvaf_udma_direct_queue_info {
   uint32_t cq_producer_index;
   uint32_t cq_consumer_index;
   uint32_t cqe_size;
-  uint32_t reserved0;
+  uint32_t layout_version;
   uint64_t cq_base;
   uint64_t cq_bytes;
   uint64_t cq_doorbell;

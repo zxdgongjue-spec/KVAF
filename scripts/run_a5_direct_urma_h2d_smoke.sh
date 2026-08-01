@@ -7,6 +7,8 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd -P)
 source "${SCRIPT_DIR}/a5_direct_urma_legacy_guard.sh"
 source "${SCRIPT_DIR}/a5_aicpu_affinity_guard.sh"
+source "${SCRIPT_DIR}/a5_direct_urma_manifest_v3.sh"
+source "${SCRIPT_DIR}/a5_direct_urma_runtime_preflight.sh"
 kvaf_configure_direct_urma_state_paths "${ROOT_DIR}" || exit 2
 
 : "${ASCEND_HOME_PATH:?source the container CANN set_env.sh first}"
@@ -133,126 +135,6 @@ durably_publish_state()
 durably_remove_state()
 {
   python3 "${KVAF_DURABLE_STATE_HELPER}" remove "$1"
-}
-
-verify_runtime_manifest()
-{
-  local prefix path expected actual abi abi_sha probe_filename probe_output
-  local probe_path probe_sha
-  for prefix in urma_library urma_common_library; do
-    path=$(manifest_value "${prefix}_path" \
-      "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") ||
-      return 1
-    expected=$(manifest_value "${prefix}_sha256" \
-      "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") ||
-      return 1
-    [[ -r "${path}" ]] || return 1
-    actual=$(sha256sum "${path}" | awk '{print $1}')
-    [[ "${actual}" == "${expected}" ]] || return 1
-  done
-
-  path=$(manifest_value ummu_uapi_header_path \
-    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
-  expected=$(manifest_value ummu_uapi_header_sha256 \
-    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
-  [[ -r "${path}" ]] || return 1
-  actual=$(sha256sum "${path}" | awk '{print $1}')
-  [[ "${actual}" == "${expected}" ]] || return 1
-
-  abi=$(manifest_value ummu_uapi_abi \
-    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
-  abi_sha=$(manifest_value ummu_uapi_abi_sha256 \
-    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
-  [[ "${abi}" =~ ^tid_info_size:[1-9][0-9]*,tid_offset:[0-9]+,hw_cap_offset:[0-9]+,va_offset:[0-9]+,size_offset:[0-9]+,alloc_tid:0x[0-9a-f]{16},free_tid:0x[0-9a-f]{16},plbi_va:0x[0-9a-f]{16},plbi_all:0x[0-9a-f]{16},cap_expan:0x[0-9a-f]{16},cap_double_plbi:0x[0-9a-f]{16},cap_kcmd_plbi:0x[0-9a-f]{16}$ ]] ||
-    return 1
-  actual=$(
-    printf 'KVAF_UMMU_UAPI_ABI=%s\n' "${abi}" | sha256sum | awk '{print $1}'
-  )
-  [[ "${actual}" == "${abi_sha}" ]] || return 1
-
-  probe_filename=$(manifest_value ummu_uapi_probe_filename \
-    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
-  [[ "${probe_filename}" == kvaf_ummu_uapi_probe ]] || return 1
-  probe_path="${KVAF_DIRECT_PROVIDER_BUILD_DIR}/${probe_filename}"
-  [[ ! -L "${probe_path}" && -f "${probe_path}" && -x "${probe_path}" ]] ||
-    return 1
-  probe_sha=$(manifest_value ummu_uapi_probe_sha256 \
-    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
-  actual=$(sha256sum "${probe_path}" | awk '{print $1}')
-  [[ "${actual}" == "${probe_sha}" ]] || return 1
-  probe_output=$("${probe_path}") || return 1
-  [[ "${probe_output}" == "KVAF_UMMU_UAPI_ABI=${abi}" ]]
-}
-
-verify_provider_role_manifest()
-{
-  local key=$1
-  local expected=$2
-  local actual
-
-  actual=$(manifest_value "${key}" \
-    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
-  [[ "${actual}" == "${expected}" ]]
-}
-
-ldd_resolved_path()
-{
-  local soname=$1
-  awk -v soname="${soname}" '
-    ($1 == soname || index($1, soname ".") == 1) && $2 == "=>" {
-      path = $3
-      count++
-    }
-    END {
-      if (count != 1 || path == "") {
-        exit 1
-      }
-      print path
-    }
-  '
-}
-
-verify_provider_runtime_resolution()
-{
-  local label=$1
-  local provider=$2
-  local ldd_output resolved_common
-  local actual_common expected_common
-  local expected_common_sha actual_common_sha
-
-  if ! ldd_output=$(ldd -r "${provider}" 2>&1); then
-    echo "${ldd_output}" >&2
-    echo "ERROR: ldd could not load the ${label} provider" >&2
-    return 1
-  fi
-  if grep -Eq 'not found|undefined symbol' <<<"${ldd_output}"; then
-    echo "${ldd_output}" >&2
-    echo "ERROR: ${label} provider has unresolved runtime dependencies" >&2
-    return 1
-  fi
-  if grep -Eq 'lib(urma|ummu|urma-udma)\.so' <<<"${ldd_output}"; then
-    echo "${ldd_output}" >&2
-    echo "ERROR: ${label} provider resolves external liburma/UDMA/UMMU code" >&2
-    return 1
-  fi
-  resolved_common=$(ldd_resolved_path liburma_common.so \
-    <<<"${ldd_output}") || {
-    echo "ERROR: ldd did not resolve exactly one ${label} liburma_common" >&2
-    return 1
-  }
-  actual_common=$(realpath -e "${resolved_common}") || return 1
-  expected_common=$(manifest_value urma_common_library_path \
-    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
-  expected_common_sha=$(manifest_value urma_common_library_sha256 \
-    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
-  actual_common_sha=$(sha256sum "${actual_common}" | awk '{print $1}') ||
-    return 1
-  if [[ "${actual_common}" != "${expected_common}" ||
-        "${actual_common_sha}" != "${expected_common_sha}" ]]; then
-    echo "ERROR: ${label} provider runtime resolution differs from the build manifest" >&2
-    echo "RESOLVED_LIBURMA_COMMON=${actual_common}" >&2
-    return 1
-  fi
 }
 
 recover_stale_active_session()
@@ -661,12 +543,44 @@ command -v realpath >/dev/null 2>&1 || {
 # host-global /proc/asdrv_ub/dev_id selector again.
 acquire_persistent_session_guards
 
+# Recovery must not depend on the current checkout or provider build: its
+# nonce-bound classifier and final markers were durably copied into the result
+# bundle.  After recovery, however, reject a v2/partial/mismatched provider
+# before EID discovery, endpoint discovery, /proc, npu-smi, ACL, DDR/HBM or
+# URMA.  This also re-runs all three ABI probes and binds the build to the
+# current kernel and its UDMA/UMMU UAPI files.
+if ! kvaf_verify_direct_provider_build_v3; then
+  echo "ERROR: rebuild the paired official UMDK/libummu provider before running hardware" >&2
+  exit 2
+fi
+host_provider_sha=${KVAF_VERIFIED_HOST_PROVIDER_SHA}
+device_provider_sha=${KVAF_VERIFIED_DEVICE_PROVIDER_SHA}
+source_manifest_sha=${KVAF_VERIFIED_SOURCE_MANIFEST_SHA}
+umdk_source_manifest_sha=${KVAF_VERIFIED_UMDK_SOURCE_MANIFEST_SHA}
+libummu_source_manifest_sha=${KVAF_VERIFIED_LIBUMMU_SOURCE_MANIFEST_SHA}
+build_manifest_sha=${KVAF_VERIFIED_BUILD_MANIFEST_SHA}
+kvaf_teardown_assurance=verified
+udma_teardown_contract=checked-retryable-v1
+
 # Recovery above must remain available even while new hardware runs are
 # blocked.  For a new run, however, this ownership proof must precede every
 # EID selector, topology query, npu-smi call, ACL context, AICPU launch and
 # URMA/UMMU allocation.  The public KFC ABI does not currently provide such a
 # proof, so the source-owned guard fails closed without an operator override.
 kvaf_require_aicpu_affinity_contract || exit $?
+
+# The deploy lock acquired during recovery closes the build/package race.
+# Validate the complete direct-smoke and installed AICPU artifact chain before
+# any EID selector, hccn/sysfs query, npu-smi call, ACL context or URMA access.
+if ! kvaf_verify_direct_runtime_artifacts_v3; then
+  echo "ERROR: rebuild and repackage the direct URMA runtime artifacts" >&2
+  exit 2
+fi
+direct_binary_sha=${KVAF_VERIFIED_DIRECT_BINARY_SHA}
+direct_build_manifest_sha=${KVAF_VERIFIED_DIRECT_BUILD_MANIFEST_SHA}
+direct_source_manifest=${KVAF_VERIFIED_DIRECT_SOURCE_MANIFEST}
+direct_source_manifest_sha=${KVAF_VERIFIED_DIRECT_SOURCE_MANIFEST_SHA}
+direct_runtime_header=${KVAF_VERIFIED_DIRECT_RUNTIME_HEADER}
 
 kvaf_result_candidate=$(realpath -m "${KVAF_A5_RESULT_DIR}")
 kvaf_result_parent=${kvaf_result_candidate%/*}
@@ -897,244 +811,6 @@ case "${kvaf_sq_reserved}" in
     ;;
 esac
 
-for command in awk cp ldd nm readelf readlink realpath sha256sum tar timeout; do
-  command -v "${command}" >/dev/null 2>&1 || {
-    echo "ERROR: ${command} is required" >&2
-    exit 2
-  }
-done
-
-if [[ -L "${KVAF_ASCEND_HAL_LIBRARY}" ||
-      ! -f "${KVAF_ASCEND_HAL_LIBRARY}" ||
-      ! -r "${KVAF_ASCEND_HAL_LIBRARY}" ]]; then
-  echo "ERROR: pinned real Ascend HAL library is missing: ${KVAF_ASCEND_HAL_LIBRARY}" >&2
-  exit 2
-fi
-
-if [[ ! -x "${KVAF_A5_DIRECT_BINARY}" ||
-      ! -r "${KVAF_A5_DIRECT_BUILD_MANIFEST}" ||
-      ! -r "${KVAF_DIRECT_HOST_PROVIDER_LIBRARY}" ||
-      ! -r "${KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY}" ||
-      ! -r "${KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST}" ||
-      ! -r "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}" ||
-      ! -r "${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP}" ]]; then
-  echo "ERROR: build the direct smoke and source-compiled provider first" >&2
-  exit 2
-fi
-direct_binary_sha=$(sha256sum "${KVAF_A5_DIRECT_BINARY}" | awk '{print $1}')
-direct_runtime_header=$(manifest_value runtime_header_path \
-  "${KVAF_A5_DIRECT_BUILD_MANIFEST}") || {
-  echo "ERROR: direct smoke build manifest lacks runtime_header_path" >&2
-  exit 2
-}
-direct_acl_header=$(manifest_value acl_header_path \
-  "${KVAF_A5_DIRECT_BUILD_MANIFEST}") || {
-  echo "ERROR: direct smoke build manifest lacks acl_header_path" >&2
-  exit 2
-}
-direct_ascendcl=$(manifest_value ascendcl_library_path \
-  "${KVAF_A5_DIRECT_BUILD_MANIFEST}") || {
-  echo "ERROR: direct smoke build manifest lacks ascendcl_library_path" >&2
-  exit 2
-}
-direct_source_manifest=$(manifest_value source_manifest_path \
-  "${KVAF_A5_DIRECT_BUILD_MANIFEST}") || {
-  echo "ERROR: direct smoke build manifest lacks source_manifest_path" >&2
-  exit 2
-}
-if [[ "$(manifest_value schema "${KVAF_A5_DIRECT_BUILD_MANIFEST}")" != \
-        "kvaf-a5-direct-smoke-build-v2" ||
-      "$(manifest_value binary_sha256 \
-          "${KVAF_A5_DIRECT_BUILD_MANIFEST}")" != "${direct_binary_sha}" ||
-      ! -r "${direct_runtime_header}" ||
-      ! -r "${direct_acl_header}" ||
-      ! -r "${direct_ascendcl}" ||
-      ! -r "${direct_source_manifest}" ||
-      "$(sha256sum "${direct_runtime_header}" | awk '{print $1}')" != \
-        "$(manifest_value runtime_header_sha256 \
-          "${KVAF_A5_DIRECT_BUILD_MANIFEST}")" ||
-      "$(sha256sum "${direct_acl_header}" | awk '{print $1}')" != \
-        "$(manifest_value acl_header_sha256 \
-          "${KVAF_A5_DIRECT_BUILD_MANIFEST}")" ||
-      "$(sha256sum "${direct_ascendcl}" | awk '{print $1}')" != \
-        "$(manifest_value ascendcl_library_sha256 \
-          "${KVAF_A5_DIRECT_BUILD_MANIFEST}")" ||
-      "$(sha256sum "${direct_source_manifest}" | awk '{print $1}')" != \
-        "$(manifest_value source_manifest_sha256 \
-          "${KVAF_A5_DIRECT_BUILD_MANIFEST}")" ]]; then
-  echo "ERROR: direct smoke binary or official CANN runtime ABI changed after build" >&2
-  echo "Re-run scripts/build_a5_direct_urma.sh in this container." >&2
-  exit 2
-fi
-if ! sha256sum -c "${direct_source_manifest}" >/dev/null; then
-  echo "ERROR: direct smoke source changed after the successful build" >&2
-  exit 2
-fi
-if ! direct_ldd=$(ldd -r "${KVAF_A5_DIRECT_BINARY}" 2>&1) ||
-   grep -Eq 'not found|undefined symbol' <<<"${direct_ldd}"; then
-  echo "${direct_ldd}" >&2
-  echo "ERROR: direct smoke runtime linkage is unresolved" >&2
-  exit 2
-fi
-resolved_direct_ascendcl=$(ldd_resolved_path libascendcl.so \
-  <<<"${direct_ldd}") || {
-  echo "ERROR: direct smoke did not resolve exactly one libascendcl" >&2
-  exit 2
-}
-if [[ "$(realpath -e "${resolved_direct_ascendcl}")" != \
-      "$(realpath -e "${direct_ascendcl}")" ]]; then
-  echo "ERROR: direct smoke resolves a different libascendcl than its build" >&2
-  exit 2
-fi
-host_provider_sha=$(
-  sha256sum "${KVAF_DIRECT_HOST_PROVIDER_LIBRARY}" | awk '{print $1}'
-)
-device_provider_sha=$(
-  sha256sum "${KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY}" | awk '{print $1}'
-)
-source_manifest_sha=$(
-  sha256sum "${KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST}" |
-    awk '{print $1}'
-)
-build_manifest_sha=$(
-  sha256sum "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}" |
-    awk '{print $1}'
-)
-direct_build_manifest_sha=$(
-  sha256sum "${KVAF_A5_DIRECT_BUILD_MANIFEST}" |
-    awk '{print $1}'
-)
-direct_source_manifest_sha=$(
-  sha256sum "${direct_source_manifest}" |
-    awk '{print $1}'
-)
-if [[ "$(manifest_value host_provider_sha256 \
-        "${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP}")" != \
-        "${host_provider_sha}" ||
-      "$(manifest_value device_provider_sha256 \
-        "${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP}")" != \
-        "${device_provider_sha}" ||
-      "$(manifest_value build_manifest_sha256 \
-        "${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP}")" != \
-        "${build_manifest_sha}" ||
-      "$(manifest_value host_provider_sha256 \
-        "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}")" != \
-        "${host_provider_sha}" ||
-      "$(manifest_value device_provider_sha256 \
-        "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}")" != \
-      "${device_provider_sha}" ||
-      "${host_provider_sha}" == "${device_provider_sha}" ||
-      "$(manifest_value source_manifest_sha256 \
-        "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}")" != \
-        "${source_manifest_sha}" ]]; then
-  echo "ERROR: provider atomic build provenance is inconsistent" >&2
-  exit 2
-fi
-for role_binding in \
-  'host_provider_filename=libkvaf_urma_provider_host.so' \
-  'host_provider_execution_domain=host-process' \
-  'host_private_abi=1' \
-  'host_private_abi_name=perftest-aiv-v1-host' \
-  'device_provider_filename=libkvaf_urma_provider_device.so' \
-  'device_provider_execution_domain=aicpu' \
-  'device_private_abi=2' \
-  'device_private_abi_name=perftest-aiv-v1-device' \
-  'udma_provider_mode=source-built-internal' \
-  'urma_core_mode=source-linked-no-dynamic-providers' \
-  'urma_library_linkage=abi-reference-only' \
-  'udma_source_capability_magic=0x4b56414655444d41' \
-  'udma_runtime_capability=0x0000000000020001' \
-  'ummu_provider_mode=source-built-internal' \
-  'ummu_source_capability_magic=0x4b564146554d4d55' \
-  'ummu_runtime_capability=0x0000000000010001' \
-  'reference_perftest_abi=perftest-aiv-v1'
-do
-  role_key=${role_binding%%=*}
-  role_value=${role_binding#*=}
-  if ! verify_provider_role_manifest "${role_key}" "${role_value}"; then
-    echo "ERROR: provider role manifest is inconsistent: ${role_binding}" >&2
-    exit 2
-  fi
-done
-udma_teardown_contract=$(manifest_value udma_teardown_contract \
-  "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || {
-  echo "ERROR: provider manifest does not declare its UDMA teardown contract" >&2
-  echo "Rebuild the direct provider before running hardware." >&2
-  exit 2
-}
-case "${udma_teardown_contract}" in
-  checked-retryable-v1)
-    kvaf_teardown_assurance=verified
-    ;;
-  *)
-    echo "ERROR: provider does not prove checked source-owned UDMA/UMMU teardown: ${udma_teardown_contract}" >&2
-    echo "No DDR/HBM/URMA resource has been armed." >&2
-    exit 2
-    ;;
-esac
-if ! sha256sum -c "${KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST}" \
-    >/dev/null; then
-  echo "ERROR: direct provider source changed after its atomic build" >&2
-  exit 2
-fi
-if ! verify_runtime_manifest; then
-  echo "ERROR: pinned liburma/liburma_common/full UMMU UAPI or ABI probe changed" >&2
-  exit 2
-fi
-if [[ ! -r "${KVAF_DIRECT_AICPU_ARCHIVE}" ]]; then
-  echo "ERROR: AICPU provider archive is missing: ${KVAF_DIRECT_AICPU_ARCHIVE}" >&2
-  exit 2
-fi
-expected_archive="${ASCEND_HOME_PATH}/compat/liburma_perftest.tar.gz"
-if [[ "$(realpath -m "${KVAF_DIRECT_AICPU_ARCHIVE}")" != \
-      "$(realpath -m "${expected_archive}")" ]]; then
-  echo "ERROR: the runtime AICPU archive must be ${expected_archive}" >&2
-  echo "CANN does not load an arbitrary same-content archive from another directory." >&2
-  exit 2
-fi
-archive_entries=$(tar -tzf "${KVAF_DIRECT_AICPU_ARCHIVE}")
-for entry in \
-  aicpu_kernels_device/libkvaf_urma_provider_device.so \
-  aicpu_kernels_device/kvaf-direct-urma-provider.manifest \
-  aicpu_kernels_device/kvaf-direct-urma-source.sha256
-do
-  if ! grep -Fxq "${entry}" <<<"${archive_entries}"; then
-    echo "ERROR: AICPU archive does not contain ${entry}" >&2
-    exit 2
-  fi
-done
-if grep -Ev \
-    '^aicpu_kernels_device/?$|^aicpu_kernels_device/(libkvaf_urma_provider_device\.so|kvaf-direct-urma-provider\.manifest|kvaf-direct-urma-source\.sha256)$' \
-    <<<"${archive_entries}" |
-    grep -q .; then
-  echo "ERROR: AICPU archive contains a stale or unexpected entry" >&2
-  exit 2
-fi
-archive_provider_sha=$(
-  tar -xOzf "${KVAF_DIRECT_AICPU_ARCHIVE}" \
-    aicpu_kernels_device/libkvaf_urma_provider_device.so |
-    sha256sum |
-    awk '{print $1}'
-)
-archive_build_manifest_sha=$(
-  tar -xOzf "${KVAF_DIRECT_AICPU_ARCHIVE}" \
-    aicpu_kernels_device/kvaf-direct-urma-provider.manifest |
-    sha256sum |
-    awk '{print $1}'
-)
-archive_source_manifest_sha=$(
-  tar -xOzf "${KVAF_DIRECT_AICPU_ARCHIVE}" \
-    aicpu_kernels_device/kvaf-direct-urma-source.sha256 |
-    sha256sum |
-    awk '{print $1}'
-)
-if [[ "${archive_provider_sha}" != "${device_provider_sha}" ||
-      "${archive_build_manifest_sha}" != "${build_manifest_sha}" ||
-      "${archive_source_manifest_sha}" != "${source_manifest_sha}" ]]; then
-  echo "ERROR: AICPU provider or provenance does not match the build" >&2
-  echo "Re-run build_a5_direct_urma_provider.sh and package_a5_direct_urma_aicpu.sh." >&2
-  exit 2
-fi
 if command -v ss >/dev/null 2>&1; then
   listening_addresses=$(
     ss -H -ltn |
@@ -1145,43 +821,6 @@ if command -v ss >/dev/null 2>&1; then
     echo "ERROR: control port ${KVAF_DIRECT_CONTROL_PORT} is already listening" >&2
     exit 2
   fi
-fi
-
-binary_dynamic=$(readelf -d "${KVAF_A5_DIRECT_BINARY}")
-for provider in \
-  "${KVAF_DIRECT_HOST_PROVIDER_LIBRARY}" \
-  "${KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY}"
-do
-  provider_dynamic=$(readelf -d "${provider}")
-  if grep -Eq 'lib(hcomm|urma_perftest|urma|urma-udma|ummu)\.so' \
-      <<<"${provider_dynamic}" ||
-     grep -Eq '\((RPATH|RUNPATH)\)' <<<"${provider_dynamic}"; then
-    echo "ERROR: provider links HCOMM/prebuilt perftest/external UDMA/UMMU or has RPATH" >&2
-    exit 2
-  fi
-  provider_symbols=$(nm -D --defined-only "${provider}")
-  for symbol in \
-    kvaf_urma_provider_open_v2 \
-    kvaf_urma_provider_close_v2 \
-    kvaf_urma_provider_private_abi_v2 \
-    aicpu_kvaf_urma_open_v2 \
-    aicpu_kvaf_urma_close_v2
-  do
-    grep -Eq \
-      "[[:space:]]${symbol}(@@KVAF_URMA_PROVIDER_2)?$" \
-      <<<"${provider_symbols}" || {
-      echo "ERROR: provider does not export ${symbol}: ${provider}" >&2
-      exit 2
-    }
-  done
-done
-verify_provider_runtime_resolution \
-  host "${KVAF_DIRECT_HOST_PROVIDER_LIBRARY}" || exit 2
-verify_provider_runtime_resolution \
-  device "${KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY}" || exit 2
-if grep -Fq libhcomm <<<"${binary_dynamic}"; then
-  echo "ERROR: direct smoke unexpectedly links HCOMM" >&2
-  exit 2
 fi
 
 # Take the occupancy snapshot as late as possible, after all build/package
@@ -1375,6 +1014,10 @@ archive_sha=$(
     "${build_manifest_sha}"
   printf 'provider_source_manifest_sha256=%s\n' \
     "${source_manifest_sha}"
+  printf 'provider_umdk_source_manifest_sha256=%s\n' \
+    "${umdk_source_manifest_sha}"
+  printf 'provider_libummu_source_manifest_sha256=%s\n' \
+    "${libummu_source_manifest_sha}"
   printf 'aicpu_archive_sha256=%s\n' "${archive_sha}"
   printf 'udma_sq_reserved=%s\n' "${kvaf_sq_reserved}"
   printf 'udma_teardown_contract=%s\n' "${udma_teardown_contract}"
@@ -1386,6 +1029,10 @@ cp "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}" \
   "${KVAF_A5_RESULT_DIR}/provider-build.manifest"
 cp "${KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST}" \
   "${KVAF_A5_RESULT_DIR}/provider-source.sha256"
+cp "${KVAF_VERIFIED_UMDK_SOURCE_MANIFEST}" \
+  "${KVAF_A5_RESULT_DIR}/provider-umdk-source.sha256"
+cp "${KVAF_VERIFIED_LIBUMMU_SOURCE_MANIFEST}" \
+  "${KVAF_A5_RESULT_DIR}/provider-libummu-source.sha256"
 cp "${KVAF_A5_DIRECT_BUILD_MANIFEST}" \
   "${KVAF_A5_RESULT_DIR}/direct-smoke-build.manifest"
 cp "${direct_source_manifest}" \
@@ -1402,6 +1049,8 @@ python3 "${KVAF_DURABLE_STATE_HELPER}" sync \
   "${kvaf_npu_idle_checker_record}" \
   "${KVAF_A5_RESULT_DIR}/provider-build.manifest" \
   "${KVAF_A5_RESULT_DIR}/provider-source.sha256" \
+  "${KVAF_A5_RESULT_DIR}/provider-umdk-source.sha256" \
+  "${KVAF_A5_RESULT_DIR}/provider-libummu-source.sha256" \
   "${KVAF_A5_RESULT_DIR}/direct-smoke-build.manifest" \
   "${KVAF_A5_RESULT_DIR}/direct-smoke-source.sha256" \
   "${exchange_dir}" \

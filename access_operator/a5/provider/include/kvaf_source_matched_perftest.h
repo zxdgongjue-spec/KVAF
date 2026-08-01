@@ -89,8 +89,18 @@ struct kvaf_perftest_teardown_state {
 };
 
 // Arms one monotonic deadline for the upstream connect/accept helper. It must
-// be called immediately before establish_connection().
+// be called immediately before kvaf_perftest_establish_connection().
 int kvaf_perftest_set_control_timeout(unsigned int timeout_seconds);
+
+// The direct provider intentionally supports only the official perftest TCP
+// management backend.  Keep that choice out of perftest_config_t internals:
+// UMDK 26.06 owns its socket array in perftest_mgmt_tcp.c rather than in
+// cfg->comm as the older fork did.
+int kvaf_perftest_establish_connection(const perftest_config_t *cfg);
+void kvaf_perftest_close_connection(perftest_config_t *cfg);
+int kvaf_perftest_sync_data(const perftest_config_t *cfg, uint32_t index,
+    int size, char *local_data, char *remote_data);
+int kvaf_perftest_control_fd(uint32_t index);
 
 int kvaf_perftest_create_duplex_ctx_checked(
     perftest_context_t *ctx, perftest_config_t *cfg);

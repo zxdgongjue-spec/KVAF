@@ -103,6 +103,11 @@ static int kvaf_create_cq_checked(
         return -1;
     }
     state->cq_created = true;
+    cq->cstm = false;
+    cq->sq_reserved = false;
+    cq->dtu_en = false;
+    cq->is_jetty = false;
+    cq->aligned_size = UDMA_HW_PAGE_SIZE;
     return kvaf_udma_checked_alloc_queue_buffer(
         cq, depth, cq->ctx->cqe_size, UDMA_HW_PAGE_SIZE, false);
 }
@@ -175,11 +180,18 @@ urma_jfc_t *kvaf_udma_create_jfc_checked(
     ++g_kvaf_jfc_count;
     ++g_kvaf_jfc_orphan_count;
 
-    if (udma_u_check_jfc_cfg(context, cfg) != 0) {
+    if (udma_u_check_jfc_cfg(context, cfg) != 0 ||
+        cfg->flag.bs.non_blocking) {
         goto fail;
     }
     udma_context = to_udma_u_ctx(context);
+    if (udma_context->dtu_enable || udma_context->sq_reserved) {
+        goto fail;
+    }
     jfc->cq.ctx = udma_context;
+    jfc->cq.dtu_en = false;
+    jfc->db_cstm = false;
+    jfc->ccu_flag = 0U;
     if (kvaf_create_cq_checked(state, cfg) != 0) {
         goto fail;
     }
@@ -224,7 +236,8 @@ urma_status_t kvaf_udma_delete_jfc_checked(urma_jfc_t *public_jfc)
         return URMA_FAIL;
     }
     state = kvaf_find_jfc_locked(to_udma_u_jfc(public_jfc));
-    if (state == NULL) {
+    if (state == NULL ||
+        public_jfc->jfc_cfg.flag.bs.non_blocking) {
         (void)pthread_mutex_unlock(&g_kvaf_jfc_lock);
         return URMA_FAIL;
     }

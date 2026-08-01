@@ -41,6 +41,15 @@ static struct kvaf_udma_segment_state *g_kvaf_segments;
 static uint32_t g_kvaf_segment_count;
 static uint32_t g_kvaf_segment_orphan_count;
 
+static bool kvaf_udma_segment_access_is_supported(uint32_t access)
+{
+    return access == URMA_ACCESS_LOCAL_ONLY ||
+        access == URMA_ACCESS_READ ||
+        access == (URMA_ACCESS_READ | URMA_ACCESS_WRITE) ||
+        access == (URMA_ACCESS_READ | URMA_ACCESS_WRITE |
+            URMA_ACCESS_ATOMIC);
+}
+
 static void kvaf_add_segment_locked(
     struct kvaf_udma_segment_state *state)
 {
@@ -164,7 +173,10 @@ urma_target_seg_t *udma_u_register_seg(
     struct udma_u_segment *segment;
     int status;
 
-    if (udma_u_check_seg_cfg(seg_cfg) != 0) {
+    if (urma_ctx == NULL || seg_cfg == NULL ||
+        !kvaf_udma_segment_access_is_supported(
+            seg_cfg->flag.bs.access) ||
+        udma_u_check_seg_cfg(seg_cfg) != 0) {
         return NULL;
     }
     state = calloc(1, sizeof(*state));
@@ -217,7 +229,9 @@ urma_target_seg_t *udma_u_register_seg(
         (void)pthread_mutex_unlock(&g_kvaf_segment_lock);
         return NULL;
     }
-    state->kernel_registered = !seg_cfg->flag.bs.non_pin;
+    state->kernel_registered =
+        to_udma_u_ctx(urma_ctx)->sva_sep_mode_en ||
+        !seg_cfg->flag.bs.non_pin;
     state->orphan = false;
     --g_kvaf_segment_orphan_count;
     (void)pthread_mutex_unlock(&g_kvaf_segment_lock);

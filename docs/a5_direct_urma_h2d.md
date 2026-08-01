@@ -19,62 +19,77 @@ Host DDR(HVA)
   -> Host DDR 数据进入 Device HBM
 ```
 
-这里复刻的是 `UB_MicroBenchmark_new` 已跑通的资源模型：普通
+资源控制面固定来自 openEuler UMDK 26.06 源码：普通
 `urma_create_jetty` 在 AICPU KFC 进程内执行，AIV 消费同一 unified
-device-VA。代码不会把这个事实误标成 `CREATE_JETTY_EX/TGID-VA`；
+device-VA。代码不会把这个执行模型误标成 `CREATE_JETTY_EX/TGID-VA`；
 最终可达性由真实的一条 SQE、一个 CQE、payload 和 canary 联合验证。
 
 直接依赖中已经移除：
 
 - memcache；
 - memfabric；
-- HCOMM headers、`libhcomm.so` 和 HCOMM resource API。
+- HCOMM headers、`libhcomm.so` 和 HCOMM resource API；
+- 独立的旧 perftest/benchmark 源码树及其预编译参考 SO；
+- 系统 `liburma.so`、`liburma_common.so`、`liburma-udma.so` 和
+  `libummu.so`。
 
 仍然需要：
 
 - CANN/ACL/runtime、bisheng、Ascend HAL 和驱动；
 - AICPU KFC 动态加载；
-- source-linked public `liburma` core、系统 `liburma_common.so` 和内核
-  UDMA/UMMU；
-- 与运行驱动同代的 `urma_perftest/ubengine` 源码快照；
-- 与服务器 B 当前驱动同一构建产物的完整 UMMU UAPI header。
+- clean Git 状态的 openEuler UMDK
+  `12917421beb93c1351eb2f124bb2f34612d8bf2d`；
+- 该 UMDK 在 `src/urma/bazel/urma_deps.bzl` 中锁定的 openEuler libummu
+  `70de020f776d8def0d8a8941cc7cbc5928d66c10`；
+- 当前运行内核对应的完整 UDMA 与 UMMU UAPI header。
 
-KVAF 不再链接系统 `liburma.so`、`liburma-udma.so` 或 `libummu.so`。Host 与
-Device provider 分别把 private liburma core、source-matched UDMA
-（Host=`ST64B`、AICPU=`TGID_VA`）和 checked UMMU 编进自身；private core 在
-编译期禁用动态 provider 目录扫描。构建与运行脚本同时检查 `DT_NEEDED` 和
-`ldd`，发现外部 `liburma`/`liburma-udma`/`libummu` 会直接失败。系统
-`liburma.so` 只作为已验证参考产物参与 public ABI 对比，不进入运行依赖。
+Host 与 Device provider 都把固定版本 UMDK 的 common、完整 public URMA
+core、UDMA 和官方 perftest TCP 管理代码，以及配对 libummu 编进自身；private
+core 在编译期禁用动态 provider 目录扫描。两端 UDMA 源码不再通过 `ST64B` 或
+`TGID_VA` 编译宏伪造不同布局，只在 private accessor 上区分 Host 和 AICPU
+执行域。构建与运行脚本同时检查 `DT_NEEDED` 和 `ldd`，发现外部
+`liburma`、`liburma_common`、`liburma-udma` 或 `libummu` 会直接失败。
 
 这里的“绕过 HCOMM”是指 KVAF 自己完成资源控制。EID、MR、Jetty、TP
 仍必须创建和交换，只是不再由 HCOMM/memfabric/memcache 代办。
 
 ## 2. 代码来源与职责
 
-### 2.1 借鉴 `urma_perftest`
+### 2.1 官方 UMDK 26.06
 
-复用并在 KVAF provider 中源码编译的部分包括：
+provider 固定从 UMDK commit
+`12917421beb93c1351eb2f124bb2f34612d8bf2d` 源码编译：
 
-- `perftest_parse_args` 和配置校验；
-- TCP server/client 与两端配置交换；
-- `urma_create_context`；
-- JFC、Jetty、token、segment 的创建参数和顺序；
-- EID、segment、Jetty、TP 信息交换；
-- remote segment/Jetty import 和 connect；
-- 对称 teardown 的基本顺序。
+- `src/urma/common`；
+- `src/urma/lib/urma/core` 的完整默认 core，包括 `urma_perf.c` 和
+  `ubagg_stats.c`；
+- `src/urma/hw/udma`；
+- `src/urma/tools/urma_perftest` 的资源管理、参数校验、日志和官方
+  `perftest_mgmt_tcp.c` TCP 控制面。
 
-KVAF 不再链接预编译 `liburma_perftest.so`。构建脚本把选中的源码、
-Host/Device provider、系统 URMA 动态库哈希和 build-id 绑定到 manifest，
-避免旧 SO 被误打包。
+构建脚本要求两棵源码树的 `origin` 都是官方 GitCode 地址、工作树无修改，校验
+精确 commit/tree，并在构建前后重新计算
+完整 source manifest。它不链接预编译 perftest SO，也不使用系统 URMA 动态库
+作为“参考 ABI”。UMDK common 和 core 直接编进 provider，动态 provider 扫描在
+编译期关闭。build manifest 还记录构建时 `uname -r`；打包和运行前必须与当前
+内核完全一致，不能把旧内核生成的 provider 搬到新内核继续使用。
 
-上游 fork 的 `fill_ai_jetty()` 会按一份复制的 private struct 读取 queue。
-KVAF 的 checked 路径不调用它，而是仅用 public URMA API 创建资源，完成后
-由一个独立 accessor 按实测 ABI 只读提取 SQ/CQ，避免创建阶段混用两套
-private layout。
+### 2.2 UMDK 锁定的 libummu
 
-### 2.2 借鉴 `UB_MicroBenchmark_new`
+UMDK 的依赖文件锁定 libummu commit
+`70de020f776d8def0d8a8941cc7cbc5928d66c10`、version `1.0.5`、ABI
+version `1`。构建脚本从依赖文件唯一解析这些值，要求 libummu 工作树 clean、
+HEAD 精确匹配，并把其源码和 UAPI 直接编进两个 provider。手工指定另一份
+libummu、只替换头文件或回退系统 `libummu.so` 都会 fail closed。
 
-设备数据面复刻其 AIV 直写 UDMA 的关键规则：
+userspace 源码配对还不等于运行内核配对。构建必须找到当前 `uname -r` 对应的
+UDMA `udma_abi.h` 和 UMMU `ummu_core.h`，并分别与 UMDK/libummu 携带的
+header 执行逐字节比较。任一 header 缺失、不相同或构建期间发生变化，构建立即
+失败。
+
+### 2.3 AIV/SIMT 数据面
+
+设备数据面遵循当前 UMDK/UDMA UAPI 和 A5 硬件格式：
 
 - 64B READ SQE；
 - remote EID 的硬件字节序；
@@ -87,7 +102,7 @@ private layout。
 KVAF 增加了 descriptor 越界检查、单 owner、stream 同步、结果/canary
 验证和失败隔离。
 
-### 2.3 Host DDR
+### 2.4 Host DDR
 
 Host 端严格区分两个地址：
 
@@ -112,6 +127,11 @@ Host 端严格区分两个地址：
 在不能证明 DMA 已停止时，代码不会主动释放 backing memory。明确的
 protocol/ownership ambiguity 才写 quarantine；底层明确返回 RETRYABLE 时，
 原 worker 会保留同一 session、原句柄和 backing，并持续从 teardown 断点重试。
+UMMU 的每个成功 `mmap` 都在返回前挂入预分配 ownership ledger，因而
+`munmap` 失败不需要再分配内存就能保留精确重试地址。JFR/Jetty table unlock、
+UMMU 命令完成状态或 ledger 所有权一旦无法证明，会触发进程生命周期的单向
+`cleanup_unknown` 锁存；后续普通可重试错误不能清除它，Close 必须返回
+`CLOSE_UNSAFE`，避免把真实未知状态误报成可重试。
 
 ## 3. 为什么要分成 Host/Device 两个 provider
 
@@ -120,24 +140,25 @@ doorbell 或 JFC `sw_db`。`urma_user_ctl(CREATE_JETTY_EX)` 只能解决新建
 SQ 的部分信息，也不能查询普通 JFC 的完整 CQ，因此当前 AIV direct
 路径仍需要一个受控的 UDMA 私有访问层。
 
-两端使用同一个经过 `UB_MicroBenchmark_new` 随附 SO 验证的
-`urma/code/include/urma_types.h` AIV private layout，但编译成两个角色
+两端使用固定 UMDK commit 中同一套 public/private UDMA 定义，但生成执行域
 不同的 provider：
 
 | 端 | provider private ABI | KVAF 产物 |
 |---|---|---|
-| Host | `PERFTEST_AIV_V1 / Host` | `libkvaf_urma_provider_host.so` |
-| AICPU/Device | `PERFTEST_AIV_V1 / AICPU shared VA` | `libkvaf_urma_provider_device.so` |
+| Host | `official-umdk-udma-v1-host` | `libkvaf_urma_provider_host.so` |
+| AICPU/Device | `official-umdk-udma-v1-device` | `libkvaf_urma_provider_device.so` |
 
-不能用 `ubengine/ssapi` 里另一代 private header 替代它：两代 public
-JFC/Jetty base 和 queue tail 不同，会让 SQ、CQ、`sw_db` 全部错位。
+不能用其他 UMDK tag、驱动 SDK 内的另一代 private header 或单独复制的 struct
+替代它：public JFC/Jetty base 与 queue tail 发生变化时，会让 SQ、CQ、`sw_db`
+全部错位。
 `CREATE_JETTY_EX(tg_id)` 适用于其他进程代建并把 doorbell 映射到目标
 TGID 的路径；本实现的资源本来就在 AICPU 内创建，强行改用它反而偏离
-已验证基线。
+当前执行模型。
 
 KVAF 把 private header 限制在
 `provider/private_udma_accessor.c` 一个翻译单元中，并为 Host/Device 角色
-分别编译。
+分别编译。角色宏只选择 accessor 的 Host 或 AICPU 执行域；UMDK UDMA 源码本身
+不定义 `ST64B`/`TGID_VA` 角色宏。
 它从真实 queue 对象导出实际 `qbuf_size/baseblk_cnt`，并在返回任何地址前
 校验：
 
@@ -177,8 +198,8 @@ AIV 使用的字段来源如下：
 
 | 字段 | 来源 |
 |---|---|
-| SQ base/depth/doorbell | `PERFTEST_AIV_V1` Device private accessor |
-| CQ base/depth/sw_db | `PERFTEST_AIV_V1` Device private accessor |
+| SQ base/depth/doorbell | 固定 UMDK Device private accessor |
+| CQ base/depth/sw_db | 固定 UMDK Device private accessor |
 | remote MR | `remote_seg[0].ubva/len` |
 | remote TID | remote public segment `token_id >> 8` |
 | local object ID | local public segment `token_id >> 8`，仅用于资源校验，不写入 compact READ WQE |
@@ -313,10 +334,10 @@ quarantine；不要在隔离前 `kill -9`。
 固化的分类器自动清理安全状态。只有明确的 quarantine 才进入站点隔离流程。
 
 需要注意：本版本的 Device provider 仍要求同一 AICPU 进程和 SO instance 执行
-Open/Close。`UB_MicroBenchmark_new` 在同一 stream 上分多次调用，已有日志也曾观察
-到相同 PID/TID；但本地公开 KFC ABI 只提供 associated stream，没有 worker、进程或
-SO instance affinity token。对多次调用采样 PID、进程 cookie、SO base 和 generation
-只能描述过去的调度，不能绑定随后真正持有资源的 Open/Close，因此不能作为安全
+Open/Close。现有观测日志曾在同一 stream 的多次调用中看到相同 PID/TID；但
+公开 KFC ABI 只提供 associated stream，没有 worker、进程或 SO instance
+affinity token。对多次调用采样 PID、进程 cookie、SO base 和 generation 只能
+描述过去的调度，不能绑定随后真正持有资源的 Open/Close，因此不能作为安全
 前置证明。
 
 新硬件运行现在由 `scripts/a5_aicpu_affinity_guard.sh` 默认 fail closed。旧 active
@@ -331,7 +352,7 @@ context 和 URMA/UMMU 资源之前退出，且没有环境变量绕过。只有�
 
 ## 6. 操作命令
 
-### 6.1 服务器 B 宿主机：更新代码
+### 6.1 服务器 B 宿主机：更新代码并准备固定源码
 
 执行环境：`SERVER_B_HOST`
 
@@ -343,15 +364,93 @@ git switch A5_AIV_URMA_cs
 git pull --ff-only origin A5_AIV_URMA_cs
 git log -1 --oneline
 
-test -r \
-  /data/c00982601/urma_perftest/ubengine/ssapi/userspace/udma/udma_u_common.h
+test -d /data/c00982601/umdk/.git || \
+  git clone https://gitcode.com/openeuler/umdk.git \
+    /data/c00982601/umdk
+git -C /data/c00982601/umdk fetch origin
+git -C /data/c00982601/umdk switch --detach \
+  12917421beb93c1351eb2f124bb2f34612d8bf2d
+
+test -d /data/c00982601/libummu/.git || \
+  git clone https://gitcode.com/openeuler/libummu.git \
+    /data/c00982601/libummu
+git -C /data/c00982601/libummu fetch origin
+git -C /data/c00982601/libummu switch --detach \
+  70de020f776d8def0d8a8941cc7cbc5928d66c10
+
+test "$(git -C /data/c00982601/umdk rev-parse HEAD)" = \
+  12917421beb93c1351eb2f124bb2f34612d8bf2d
+test "$(git -C /data/c00982601/libummu rev-parse HEAD)" = \
+  70de020f776d8def0d8a8941cc7cbc5928d66c10
+test -z "$(git -C /data/c00982601/umdk status --porcelain)"
+test -z "$(git -C /data/c00982601/libummu status --porcelain)"
+
+grep -E \
+  'LIBUMMU_(REMOTE|COMMIT|VERSION|ABI_VERSION)' \
+  /data/c00982601/umdk/src/urma/bazel/urma_deps.bzl
+```
+
+两棵上游源码树放在宿主机 `/data`，由已有同路径挂载提供给 Docker。不要把
+它们复制进容器 overlay，也不要修改 root 公共账号的全局 Git 配置。
+
+provider 还要验证运行内核的两份 UAPI。若 Docker 没有挂载宿主机的
+kernel-devel 目录，可在宿主机把精确 header 复制到共享 `/data`：
+
+```bash
+echo "EXECUTION_ENV=SERVER_B_HOST"
+
+(
+  set -Ee
+  kvaf_kernel_release=$(uname -r)
+  kvaf_udma_uapi=
+  kvaf_ummu_uapi=
+
+  for kvaf_candidate in \
+    "/usr/src/kernels/${kvaf_kernel_release}/include/uapi/ub/urma/udma/udma_abi.h" \
+    "/lib/modules/${kvaf_kernel_release}/build/include/uapi/ub/urma/udma/udma_abi.h"
+  do
+    if test -r "$kvaf_candidate"; then
+      kvaf_udma_uapi=$kvaf_candidate
+      break
+    fi
+  done
+
+  for kvaf_candidate in \
+    "/usr/src/kernels/${kvaf_kernel_release}/include/uapi/linux/ummu_core.h" \
+    "/lib/modules/${kvaf_kernel_release}/build/include/uapi/linux/ummu_core.h"
+  do
+    if test -r "$kvaf_candidate"; then
+      kvaf_ummu_uapi=$kvaf_candidate
+      break
+    fi
+  done
+
+  test -n "$kvaf_udma_uapi" || {
+    echo "ERROR: running-kernel UDMA UAPI not found" >&2
+    exit 1
+  }
+  test -n "$kvaf_ummu_uapi" || {
+    echo "ERROR: running-kernel UMMU UAPI not found" >&2
+    exit 1
+  }
+
+  kvaf_shared_uapi=/data/c00982601/kernel-uapi/${kvaf_kernel_release}
+  install -D -m 0444 \
+    "$kvaf_udma_uapi" "$kvaf_shared_uapi/udma_abi.h"
+  install -D -m 0444 \
+    "$kvaf_ummu_uapi" "$kvaf_shared_uapi/ummu_core.h"
+  sha256sum \
+    "$kvaf_shared_uapi/udma_abi.h" \
+    "$kvaf_shared_uapi/ummu_core.h"
+)
 
 docker ps --filter name=vllm-ascend-cs-kvaf
 docker exec -it -u 0 vllm-ascend-cs-kvaf bash
 ```
 
-不需要新建容器。`/data` 已由宿主机挂载到同路径，后续命令都在
-`vllm-ascend-cs-kvaf` 内执行。
+如果任一 kernel UAPI 找不到，先安装与 `uname -r` 完全一致的 kernel-devel
+或提供该运行内核的精确源码；不能从旧驱动、另一台机器或其他 kernel release
+复制。现有 `vllm-ascend-cs-kvaf` 已挂载 `/data` 时不需要新建容器。
 
 ### 6.2 Docker：加载环境
 
@@ -363,44 +462,34 @@ cd /data/c00982601/KVAF
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
 export LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64:/usr/lib64:${LD_LIBRARY_PATH:-}
-export KVAF_URMA_PERFTEST_ROOT=/data/c00982601/urma_perftest
 export KVAF_DIRECT_PROVIDER_BUILD_DIR=/data/c00982601/KVAF/build-a5-direct-urma-provider
-export KVAF_REFERENCE_PERFTEST_LIBRARY=/data/c00982601/UB_MicroBenchmark_new/3rd/urma_perftest/liburma_perftest.so
+export KVAF_UMDK_ROOT=/data/c00982601/umdk
+export KVAF_LIBUMMU_ROOT=/data/c00982601/libummu
+export KVAF_RUNTIME_UDMA_UAPI_HEADER=/data/c00982601/kernel-uapi/$(uname -r)/udma_abi.h
+export KVAF_RUNTIME_UMMU_UAPI_HEADER=/data/c00982601/kernel-uapi/$(uname -r)/ummu_core.h
+
+test "$(git -C "$KVAF_UMDK_ROOT" rev-parse HEAD)" = \
+  12917421beb93c1351eb2f124bb2f34612d8bf2d
+test "$(git -C "$KVAF_LIBUMMU_ROOT" rev-parse HEAD)" = \
+  70de020f776d8def0d8a8941cc7cbc5928d66c10
+test -r "$KVAF_RUNTIME_UDMA_UAPI_HEADER"
+test -r "$KVAF_RUNTIME_UMMU_UAPI_HEADER"
+
+cmp -s \
+  "$KVAF_UMDK_ROOT/src/urma/hw/udma/kernel_headers/udma_abi.h" \
+  "$KVAF_RUNTIME_UDMA_UAPI_HEADER" && \
+  echo "KVAF_RUNTIME_UDMA_UAPI_MATCH=verified-exact"
+cmp -s \
+  "$KVAF_LIBUMMU_ROOT/kernel_headers/ummu_core.h" \
+  "$KVAF_RUNTIME_UMMU_UAPI_HEADER" && \
+  echo "KVAF_RUNTIME_UMMU_UAPI_MATCH=verified-exact"
 ```
 
-先定位与服务器 B 当前驱动同一构建产物的完整 UMMU UAPI。不要使用
-`urma_perftest/drivers/ubus/kernel` 下缺少 `hw_cap` 和 PLBI ioctl 的旧 header：
-
-```bash
-find /usr/src "/lib/modules/$(uname -r)/build" /usr/local/Ascend /data/c00982601 \
-  -type f -path '*/include/uapi/linux/ummu_core.h' -print 2>/dev/null \
-  | sort -u
-
-# 对每个候选执行；六类定义必须全部存在，并确认它来自当前驱动包。
-grep -nE \
-  'hw_cap|HW_CAP_(EXPAN|DOUBLE_PLBI|KCMD_PLBI)|UMMU_IOCPLBI_(VA|ALL)' \
-  /exact/driver-source/include/uapi/linux/ummu_core.h
-
-export KVAF_UMMU_UAPI_ROOT=/exact/driver-source
-test -r "$KVAF_UMMU_UAPI_ROOT/include/uapi/linux/ummu_core.h"
-```
-
-如果找不到该 header，停止在这里并补充当前驱动对应的开发/源码包；不能从旧
-header 猜结构体布局或 ioctl 数值。构建会记录精确路径和 SHA-256，但“与运行
-驱动同源”仍必须由服务器软件包来源保证。
-
-若 `ldconfig` 中同一个 SONAME 有多份候选，显式指定 public ABI 参考库与实际
-`liburma_common` runtime：
-
-```bash
-export KVAF_URMA_LIBRARY=/usr/lib64/liburma.so.0
-export KVAF_URMA_COMMON_LIBRARY=/usr/lib64/liburma_common.so.0
-```
-
-`KVAF_REFERENCE_PERFTEST_LIBRARY` 只用于把
-`UB_MicroBenchmark_new` 已验证过的 AIV private layout 产物记录进
-build manifest，KVAF provider 不链接它。若该路径不存在，构建脚本才回退到
-`urma_perftest/urma/code/output` 中的同名产物。
+若 kernel-devel 目录本来就在 Docker 内，两个 runtime 变量也可直接指向该目录；
+不设置时脚本会检查上述两个标准 kernel-devel 路径。无论路径来自哪里，构建都会
+要求内容与固定 UMDK/libummu header 完全相同。这里不再设置旧的 perftest root、
+外部基准 SO、单独的 UMMU source root、system `liburma` 或 system
+`liburma_common` 变量。
 
 ### 6.3 Docker：构建两端 provider
 
@@ -412,32 +501,45 @@ bash scripts/build_a5_direct_urma_provider.sh
 ls -l \
   "$KVAF_DIRECT_PROVIDER_BUILD_DIR/libkvaf_urma_provider_host.so" \
   "$KVAF_DIRECT_PROVIDER_BUILD_DIR/libkvaf_urma_provider_device.so" \
+  "$KVAF_DIRECT_PROVIDER_BUILD_DIR/kvaf_udma_uapi_probe" \
+  "$KVAF_DIRECT_PROVIDER_BUILD_DIR/kvaf_udma_private_abi_probe" \
   "$KVAF_DIRECT_PROVIDER_BUILD_DIR/kvaf_ummu_uapi_probe" \
+  "$KVAF_DIRECT_PROVIDER_BUILD_DIR/umdk-source.sha256" \
+  "$KVAF_DIRECT_PROVIDER_BUILD_DIR/libummu-source.sha256" \
   "$KVAF_DIRECT_PROVIDER_BUILD_DIR/build.manifest" \
   "$KVAF_DIRECT_PROVIDER_BUILD_DIR/build.success"
 ```
 
 脚本执行 fresh build，校验导出符号、AArch64 ELF、`DT_NEEDED`、RPATH、
-源码前后哈希、Host/Device private-ABI probe、public liburma ABI，以及 pinned
-UMMU UAPI。下面两条都必须无输出：
+两仓 clean commit/tree、源码前后哈希、UMDK→libummu 依赖锁、三个 ABI probe，
+以及两份 runtime kernel UAPI。下面两条都必须无输出：
 
 ```bash
 readelf -d "$KVAF_DIRECT_PROVIDER_BUILD_DIR/libkvaf_urma_provider_host.so" \
-  | grep -E 'NEEDED.*lib(urma|urma-udma|ummu|hcomm)\.so' || true
+  | grep -E 'NEEDED.*lib(urma|urma_common|urma-udma|ummu|hcomm)\.so' || true
 readelf -d "$KVAF_DIRECT_PROVIDER_BUILD_DIR/libkvaf_urma_provider_device.so" \
-  | grep -E 'NEEDED.*lib(urma|urma-udma|ummu|hcomm)\.so' || true
+  | grep -E 'NEEDED.*lib(urma|urma_common|urma-udma|ummu|hcomm)\.so' || true
 
 grep -E \
-  '^(urma_core_mode|urma_library_linkage|udma_provider_mode|ummu_provider_mode|ummu_uapi_header_sha256|ummu_uapi_abi|ummu_uapi_abi_sha256|ummu_uapi_probe_sha256|udma_teardown_contract)=' \
+  '^(schema|source_layout|umdk_git_commit|libummu_git_commit|umdk_libummu_pairing|urma_core_mode|urma_common_mode|urma_common_dt_needed|perftest_source|perftest_management|runtime_udma_uapi_match|runtime_ummu_uapi_match|udma_uapi_probe_filename|udma_private_abi_probe_filename|ummu_uapi_probe_filename|udma_teardown_contract)=' \
   "$KVAF_DIRECT_PROVIDER_BUILD_DIR/build.manifest"
 
+"$KVAF_DIRECT_PROVIDER_BUILD_DIR/kvaf_udma_uapi_probe"
+"$KVAF_DIRECT_PROVIDER_BUILD_DIR/kvaf_udma_private_abi_probe"
 "$KVAF_DIRECT_PROVIDER_BUILD_DIR/kvaf_ummu_uapi_probe"
+
+grep -E \
+  '^(schema|runtime_udma_uapi_header_sha256|runtime_ummu_uapi_header_sha256|udma_uapi_probe_sha256|udma_private_abi_probe_sha256|ummu_uapi_probe_sha256)=' \
+  "$KVAF_DIRECT_PROVIDER_BUILD_DIR/build.success"
 ```
 
-期望 manifest 包含 `urma_core_mode=source-linked-no-dynamic-providers`、
-`source-built-internal`、完整的结构体 offset/ioctl/capability
-指纹和 `udma_teardown_contract=checked-retryable-v1`。runner 在任何硬件资源创建
-前会重新执行并校验这份 probe；header、probe 或 manifest 任一个变化都会退出 2。
+期望 manifest 为 `schema=kvaf-direct-urma-provider-v3`、
+`source_layout=official-umdk-libummu-paired-v1`，两个 commit 与本节固定值一致，
+`umdk_libummu_pairing=verified`，两个 runtime UAPI match 都为
+`verified-exact`，且 `urma_common_dt_needed=absent`。success stamp 必须为
+`schema=kvaf-direct-urma-provider-success-v3`。runner 在任何硬件资源创建前会
+重新执行并校验三个 probe；源码、header、probe、manifest 或 success stamp
+任一个变化都会以退出码 2 fail closed。
 
 ### 6.4 Docker：安装 AICPU provider
 
@@ -451,12 +553,18 @@ tar -tzf \
 ```
 
 archive 名称保留 `liburma_perftest.tar.gz` 只是为了适配当前 CANN compat
-loader；内容不再包含旧 `liburma_perftest.so`，精确白名单是：
+loader；它不是外部 perftest 依赖，内容也不包含旧 `liburma_perftest.so`。
+精确白名单是：
 
 ```text
 aicpu_kernels_device/libkvaf_urma_provider_device.so
 aicpu_kernels_device/kvaf-direct-urma-provider.manifest
 aicpu_kernels_device/kvaf-direct-urma-source.sha256
+aicpu_kernels_device/kvaf-direct-urma-umdk-source.sha256
+aicpu_kernels_device/kvaf-direct-urma-libummu-source.sha256
+aicpu_kernels_device/kvaf_udma_uapi_probe
+aicpu_kernels_device/kvaf_udma_private_abi_probe
+aicpu_kernels_device/kvaf_ummu_uapi_probe
 ```
 
 ### 6.5 Docker：构建 AIV/SIMT smoke
@@ -635,7 +743,7 @@ unset KVAF_DIRECT_ACTIVE_SESSION_FILE KVAF_DIRECT_QUARANTINE_FILE
 1. bisheng 能编译 `dav-3510` AIV + SIMT；
 2. ACL/runtime 能执行 custom AICPU KFC；
 3. compat loader 能加载上面的 Device provider；
-4. public `liburma`、`ubengine` 源码、完整 UMMU UAPI 与运行驱动同代。
+4. 固定 UMDK/libummu 源码与当前运行内核的 UDMA/UMMU UAPI 完全匹配。
 
 四项均通过就不必仅为 direct URMA 升级 CANN；任一项缺失才需要补匹配组件
 或升级完整套件，不能只替换某个 include 目录。
@@ -644,8 +752,8 @@ unset KVAF_DIRECT_ACTIVE_SESSION_FILE KVAF_DIRECT_QUARANTINE_FILE
 
 当前实现用于 A5 正向 MVP 和性能验证，还不能宣称生产安全：
 
-- private accessor 仍依赖 `PERFTEST_AIV_V1` 布局。最终应在实际
-  `liburma-udma` provider 中新增 versioned
+- private accessor 仍依赖固定 UMDK 26.06 的 private UDMA 布局。最终应在
+  UDMA provider 中新增 versioned
   `QUERY_DIRECT_QUEUE_INFO`，由 provider 自己返回 SQ/CQ 地址和 feature，
   彻底删除外部 private cast；
 - source-built UDMA/UMMU 已替换上游会吞掉

@@ -9,8 +9,8 @@
 /*
  * The upstream context delete frees the userspace context even when the
  * kernel delete command fails. Rename that private implementation and install
- * the checked implementation below into g_udma_provider_ops before provider
- * registration.
+ * the checked implementation below into a mutable copy of the UMDK 26.06
+ * provider table before registration.
  */
 #ifndef KVAF_UDMA_OPS_SOURCE
 #error "KVAF_UDMA_OPS_SOURCE must name udma_u_ops.c"
@@ -30,7 +30,9 @@ struct kvaf_udma_context_state {
     bool hugepage_mutex_initialized;
     bool kernel_context_created;
     bool db_allocated;
-    bool node_table_initialized;
+    bool table_layout_initialized;
+    bool jfr_table_lock_initialized;
+    bool jetty_table_lock_initialized;
     struct kvaf_udma_context_state *next;
 };
 
@@ -38,6 +40,76 @@ static pthread_mutex_t g_kvaf_context_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct kvaf_udma_context_state *g_kvaf_contexts;
 static uint32_t g_kvaf_context_count;
 static uint32_t g_kvaf_context_orphan_count;
+static urma_provider_ops_t g_kvaf_udma_provider_ops;
+static bool g_kvaf_udma_provider_ops_prepared;
+
+#define KVAF_UDMA_JETTYS_IN_TABLE_SHIFT 11U
+
+static bool kvaf_context_tables_are_empty(
+    const struct udma_u_context *context)
+{
+    uint32_t index;
+
+    for (index = 0; index < UDMA_JETTY_TABLE_NUM; ++index) {
+        if (context->jetty_table[index].refcnt != 0 ||
+            context->jetty_table[index].jetty_array != NULL ||
+            context->jfr_table[index].refcnt != 0 ||
+            context->jfr_table[index].jfr_array != NULL) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int kvaf_init_context_tables_checked(
+    struct kvaf_udma_context_state *state)
+{
+    struct udma_u_context *context = state->context;
+
+    context->jettys_in_tbl_shift =
+        KVAF_UDMA_JETTYS_IN_TABLE_SHIFT;
+    context->jettys_in_tbl =
+        1U << KVAF_UDMA_JETTYS_IN_TABLE_SHIFT;
+    state->table_layout_initialized = true;
+    if (pthread_rwlock_init(&context->jfr_table_lock, NULL) != 0) {
+        return -1;
+    }
+    state->jfr_table_lock_initialized = true;
+    if (pthread_rwlock_init(&context->jetty_table_lock, NULL) != 0) {
+        return -1;
+    }
+    state->jetty_table_lock_initialized = true;
+    return 0;
+}
+
+static int kvaf_cleanup_context_tables_checked(
+    struct kvaf_udma_context_state *state)
+{
+    struct udma_u_context *context = state->context;
+
+    if (!state->table_layout_initialized) {
+        return 0;
+    }
+    if (!kvaf_context_tables_are_empty(context)) {
+        return -1;
+    }
+    if (state->jetty_table_lock_initialized) {
+        if (pthread_rwlock_destroy(&context->jetty_table_lock) != 0) {
+            return -1;
+        }
+        state->jetty_table_lock_initialized = false;
+    }
+    if (state->jfr_table_lock_initialized) {
+        if (pthread_rwlock_destroy(&context->jfr_table_lock) != 0) {
+            return -1;
+        }
+        state->jfr_table_lock_initialized = false;
+    }
+    context->jettys_in_tbl_shift = 0U;
+    context->jettys_in_tbl = 0U;
+    state->table_layout_initialized = false;
+    return 0;
+}
 
 static void kvaf_add_context_locked(
     struct kvaf_udma_context_state *state)
@@ -125,9 +197,8 @@ static int kvaf_retry_orphan_context_locked(
         }
         state->kernel_context_created = false;
     }
-    if (state->node_table_initialized) {
-        udma_u_uninit_node_tbl(context->src_idx_tbl);
-        state->node_table_initialized = false;
+    if (kvaf_cleanup_context_tables_checked(state) != 0) {
+        return -1;
     }
     if (state->db_allocated) {
         if (kvaf_udma_checked_free_doorbell(
@@ -229,14 +300,20 @@ static urma_context_t *kvaf_udma_create_context_checked(
     state->kernel_context_created = true;
     udma_u_init_context(context, &response);
 
+    /*
+     * The minimal direct path does not own libdtu or the process-global
+     * reserved-SQ mapping.  Refuse those capabilities before either can be
+     * opened, mapped or published to the AIV accessor.
+     */
+    if (context->dtu_enable || context->sq_reserved ||
+        kvaf_init_context_tables_checked(state) != 0) {
+        goto rollback;
+    }
+
     if (udma_u_alloc_db(&context->urma_ctx, &context->db) != 0) {
         goto rollback;
     }
     state->db_allocated = true;
-    if (udma_u_init_node_tbl(context->src_idx_tbl) != 0) {
-        goto rollback;
-    }
-    state->node_table_initialized = true;
     state->orphan = false;
     --g_kvaf_context_orphan_count;
     (void)pthread_mutex_unlock(&g_kvaf_context_lock);
@@ -279,6 +356,7 @@ static urma_status_t kvaf_udma_delete_context_checked(
         kvaf_udma_source_live_segment_count() != 0U ||
         kvaf_udma_source_live_token_count() != 0U ||
         kvaf_udma_source_live_jetty_count() != 0U ||
+        kvaf_udma_source_live_jfr_count() != 0U ||
         kvaf_udma_source_live_jfc_count() != 0U) {
         (void)pthread_mutex_unlock(&g_kvaf_context_lock);
         return URMA_FAIL;
@@ -295,9 +373,9 @@ static urma_status_t kvaf_udma_delete_context_checked(
     }
 
     /* Local mappings are cleared only after their munmap succeeds. */
-    if (state->node_table_initialized) {
-        udma_u_uninit_node_tbl(context->src_idx_tbl);
-        state->node_table_initialized = false;
+    if (kvaf_cleanup_context_tables_checked(state) != 0) {
+        (void)pthread_mutex_unlock(&g_kvaf_context_lock);
+        return URMA_FAIL;
     }
     if (state->db_allocated) {
         if (kvaf_udma_checked_free_doorbell(
@@ -341,6 +419,9 @@ int kvaf_udma_source_retry_orphan_cleanup(urma_context_t *context)
     if (kvaf_udma_source_retry_orphan_jetties(context) != 0) {
         result = -1;
     }
+    if (kvaf_udma_source_retry_orphan_jfrs(context) != 0) {
+        result = -1;
+    }
     if (kvaf_udma_source_retry_orphan_jfcs(context) != 0) {
         result = -1;
     }
@@ -355,19 +436,33 @@ int kvaf_udma_source_retry_orphan_cleanup(urma_context_t *context)
 
 int kvaf_udma_prepare_provider_ops(void)
 {
-    g_udma_ops.create_jetty = kvaf_udma_create_jetty_checked;
-    g_udma_ops.delete_jetty = kvaf_udma_delete_jetty_checked;
-    /* Upstream batch delete mutates every SQ lookup before the ioctl. */
-    g_udma_ops.delete_jetty_batch = NULL;
-    g_udma_ops.create_jfc = kvaf_udma_create_jfc_checked;
-    g_udma_ops.delete_jfc = kvaf_udma_delete_jfc_checked;
-    g_udma_provider_ops.create_context =
-        kvaf_udma_create_context_checked;
-    g_udma_provider_ops.delete_context =
-        kvaf_udma_delete_context_checked;
-    return g_udma_provider_ops.create_context ==
+    if (!g_kvaf_udma_provider_ops_prepared) {
+        g_udma_ops.create_jetty = kvaf_udma_create_jetty_checked;
+        g_udma_ops.delete_jetty = kvaf_udma_delete_jetty_checked;
+        /* Upstream batch delete mutates every SQ lookup before the ioctl. */
+        g_udma_ops.delete_jetty_batch = NULL;
+        g_udma_ops.create_jfc = kvaf_udma_create_jfc_checked;
+        g_udma_ops.delete_jfc = kvaf_udma_delete_jfc_checked;
+        g_udma_ops.create_jfr = kvaf_udma_create_jfr_checked;
+        g_udma_ops.delete_jfr = kvaf_udma_delete_jfr_checked;
+        /* Every direct JFR must carry a checked ownership sidecar. */
+        g_udma_ops.delete_jfr_batch = NULL;
+        g_udma_ops.alloc_jfr = NULL;
+        g_udma_ops.active_jfr = NULL;
+        g_udma_ops.deactive_jfr = NULL;
+        g_udma_ops.free_jfr = NULL;
+
+        /* UMDK 26.06 declares its provider table const.  Patch a copy. */
+        g_kvaf_udma_provider_ops = g_udma_provider_ops;
+        g_kvaf_udma_provider_ops.create_context =
+            kvaf_udma_create_context_checked;
+        g_kvaf_udma_provider_ops.delete_context =
+            kvaf_udma_delete_context_checked;
+        g_kvaf_udma_provider_ops_prepared = true;
+    }
+    return g_kvaf_udma_provider_ops.create_context ==
                 kvaf_udma_create_context_checked &&
-            g_udma_provider_ops.delete_context ==
+            g_kvaf_udma_provider_ops.delete_context ==
                 kvaf_udma_delete_context_checked &&
             g_udma_ops.create_jetty ==
                 kvaf_udma_create_jetty_checked &&
@@ -376,9 +471,24 @@ int kvaf_udma_prepare_provider_ops(void)
             g_udma_ops.create_jfc ==
                 kvaf_udma_create_jfc_checked &&
             g_udma_ops.delete_jfc ==
-                kvaf_udma_delete_jfc_checked
+                kvaf_udma_delete_jfc_checked &&
+            g_udma_ops.create_jfr ==
+                kvaf_udma_create_jfr_checked &&
+            g_udma_ops.delete_jfr ==
+                kvaf_udma_delete_jfr_checked &&
+            g_udma_ops.delete_jfr_batch == NULL &&
+            g_udma_ops.alloc_jfr == NULL &&
+            g_udma_ops.active_jfr == NULL &&
+            g_udma_ops.deactive_jfr == NULL &&
+            g_udma_ops.free_jfr == NULL
         ? 0
         : -1;
+}
+
+urma_provider_ops_t *kvaf_udma_source_provider_ops(void)
+{
+    return g_kvaf_udma_provider_ops_prepared
+        ? &g_kvaf_udma_provider_ops : NULL;
 }
 
 int kvaf_udma_source_provider_owns_context(
@@ -388,5 +498,5 @@ int kvaf_udma_source_provider_owns_context(
         kvaf_udma_source_provider_is_registered() != 0 &&
         kvaf_udma_source_runtime_is_owned() != 0 &&
         public_context->dev != NULL &&
-        public_context->dev->ops == &g_udma_provider_ops;
+        public_context->dev->ops == kvaf_udma_source_provider_ops();
 }

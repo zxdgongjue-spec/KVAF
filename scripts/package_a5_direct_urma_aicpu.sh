@@ -6,6 +6,7 @@ umask 077
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd -P)
 source "${SCRIPT_DIR}/a5_direct_urma_legacy_guard.sh"
+source "${SCRIPT_DIR}/a5_direct_urma_manifest_v3.sh"
 kvaf_configure_direct_urma_state_paths "${ROOT_DIR}" || exit 2
 
 : "${ASCEND_HOME_PATH:?source the container CANN set_env.sh first}"
@@ -42,44 +43,15 @@ manifest_value()
   ' "${file}"
 }
 
-verify_runtime_manifest()
-{
-  local prefix path expected actual
-  for prefix in urma_library urma_common_library; do
-    path=$(manifest_value "${prefix}_path" \
-      "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") ||
-      die "build manifest lacks ${prefix}_path"
-    expected=$(manifest_value "${prefix}_sha256" \
-      "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") ||
-      die "build manifest lacks ${prefix}_sha256"
-    [[ -r "${path}" ]] ||
-      die "pinned runtime library disappeared: ${path}"
-    actual=$(sha256sum "${path}" | awk '{print $1}')
-    [[ "${actual}" == "${expected}" ]] ||
-      die "pinned runtime library changed after provider build: ${path}"
-  done
-}
-
-require_provider_role_manifest()
-{
-  local key=$1
-  local expected=$2
-  local actual
-
-  actual=$(manifest_value "${key}" \
-    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") ||
-    die "build manifest lacks ${key}"
-  [[ "${actual}" == "${expected}" ]] ||
-    die "build manifest has unexpected ${key}: ${actual}"
-}
-
 verify_aicpu_archive()
 {
   local archive=$1
   local label=$2
   local archive_entries unexpected_entries
   local archive_provider_sha archive_manifest_sha
-  local archive_source_manifest_sha entry
+  local archive_source_manifest_sha archive_umdk_manifest_sha
+  local archive_libummu_manifest_sha archive_probe_sha local_probe_sha
+  local entry probe
 
   [[ -r "${archive}" ]] ||
     die "${label} AICPU archive is not readable: ${archive}"
@@ -88,14 +60,19 @@ verify_aicpu_archive()
   for entry in \
     aicpu_kernels_device/libkvaf_urma_provider_device.so \
     aicpu_kernels_device/kvaf-direct-urma-provider.manifest \
-    aicpu_kernels_device/kvaf-direct-urma-source.sha256
+    aicpu_kernels_device/kvaf-direct-urma-source.sha256 \
+    aicpu_kernels_device/kvaf-direct-urma-umdk-source.sha256 \
+    aicpu_kernels_device/kvaf-direct-urma-libummu-source.sha256 \
+    aicpu_kernels_device/kvaf_udma_uapi_probe \
+    aicpu_kernels_device/kvaf_udma_private_abi_probe \
+    aicpu_kernels_device/kvaf_ummu_uapi_probe
   do
     grep -Fxq "${entry}" <<<"${archive_entries}" ||
       die "${label} AICPU archive is missing ${entry}"
   done
   unexpected_entries=$(
     grep -Ev \
-      '^aicpu_kernels_device/?$|^aicpu_kernels_device/(libkvaf_urma_provider_device\.so|kvaf-direct-urma-provider\.manifest|kvaf-direct-urma-source\.sha256)$' \
+      '^aicpu_kernels_device/?$|^aicpu_kernels_device/(libkvaf_urma_provider_device\.so|kvaf-direct-urma-provider\.manifest|kvaf-direct-urma-source\.sha256|kvaf-direct-urma-umdk-source\.sha256|kvaf-direct-urma-libummu-source\.sha256|kvaf_udma_uapi_probe|kvaf_udma_private_abi_probe|kvaf_ummu_uapi_probe)$' \
       <<<"${archive_entries}" || true
   )
   [[ -z "${unexpected_entries}" ]] ||
@@ -119,10 +96,34 @@ verify_aicpu_archive()
       sha256sum |
       awk '{print $1}'
   ) || die "could not hash ${label} archived source manifest"
+  archive_umdk_manifest_sha=$(
+    tar -xOzf "${archive}" \
+      aicpu_kernels_device/kvaf-direct-urma-umdk-source.sha256 |
+      sha256sum | awk '{print $1}'
+  ) || die "could not hash ${label} archived UMDK source manifest"
+  archive_libummu_manifest_sha=$(
+    tar -xOzf "${archive}" \
+      aicpu_kernels_device/kvaf-direct-urma-libummu-source.sha256 |
+      sha256sum | awk '{print $1}'
+  ) || die "could not hash ${label} archived libummu source manifest"
   [[ "${archive_provider_sha}" == "${device_provider_sha}" &&
      "${archive_manifest_sha}" == "${build_manifest_sha}" &&
-     "${archive_source_manifest_sha}" == "${source_manifest_sha}" ]] ||
+     "${archive_source_manifest_sha}" == "${source_manifest_sha}" &&
+     "${archive_umdk_manifest_sha}" == "${umdk_source_manifest_sha}" &&
+     "${archive_libummu_manifest_sha}" == \
+       "${libummu_source_manifest_sha}" ]] ||
     die "${label} AICPU provider/provenance hash mismatch"
+  for probe in kvaf_udma_uapi_probe kvaf_udma_private_abi_probe \
+    kvaf_ummu_uapi_probe; do
+    archive_probe_sha=$(
+      tar -xOzf "${archive}" "aicpu_kernels_device/${probe}" |
+        sha256sum | awk '{print $1}'
+    ) || die "could not hash ${label} archived ${probe}"
+    local_probe_sha=$(sha256sum \
+      "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/${probe}" | awk '{print $1}')
+    [[ "${archive_probe_sha}" == "${local_probe_sha}" ]] ||
+      die "${label} archived ${probe} does not match the verified build"
+  done
 }
 
 [[ -e /.dockerenv ]] ||
@@ -166,6 +167,21 @@ exec 9>"${KVAF_DIRECT_DEPLOY_RUN_LOCK}"
 if ! flock -w 30 9; then
   die "another direct URMA deploy/run owns ${KVAF_DIRECT_DEPLOY_RUN_LOCK}"
 fi
+
+# Validate exactly once while holding the same deploy lock as the builder and
+# runner.  This closes the check/use race with build.success and the atomically
+# published provider artifacts.
+kvaf_verify_direct_provider_build_v3 ||
+  die "rebuild the paired official UMDK/libummu provider before packaging"
+host_provider_sha=${KVAF_VERIFIED_HOST_PROVIDER_SHA}
+device_provider_sha=${KVAF_VERIFIED_DEVICE_PROVIDER_SHA}
+source_manifest_sha=${KVAF_VERIFIED_SOURCE_MANIFEST_SHA}
+umdk_source_manifest_sha=${KVAF_VERIFIED_UMDK_SOURCE_MANIFEST_SHA}
+libummu_source_manifest_sha=${KVAF_VERIFIED_LIBUMMU_SOURCE_MANIFEST_SHA}
+build_manifest_sha=${KVAF_VERIFIED_BUILD_MANIFEST_SHA}
+umdk_source_manifest=${KVAF_VERIFIED_UMDK_SOURCE_MANIFEST}
+libummu_source_manifest=${KVAF_VERIFIED_LIBUMMU_SOURCE_MANIFEST}
+
 if [[ -e "${KVAF_DIRECT_QUARANTINE_FILE}" ||
       -L "${KVAF_DIRECT_QUARANTINE_FILE}" ]]; then
   die "an unsafe direct URMA session is quarantined; reset or isolate the NPU before packaging"
@@ -179,94 +195,6 @@ fi
 exec 8>"${KVAF_DIRECT_ACTIVE_SESSION_LOCK}"
 flock -n 8 || die "a live direct URMA worker blocks AICPU packaging"
 
-for artifact in \
-  "${KVAF_DIRECT_HOST_PROVIDER_LIBRARY}" \
-  "${KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY}" \
-  "${KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST}" \
-  "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}" \
-  "${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP}"
-do
-  [[ -r "${artifact}" ]] ||
-    die "provider atomic build artifact is missing: ${artifact}"
-done
-[[ "$(basename "${KVAF_DIRECT_HOST_PROVIDER_LIBRARY}")" == \
-    "libkvaf_urma_provider_host.so" &&
-    "$(basename "${KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY}")" == \
-    "libkvaf_urma_provider_device.so" ]] ||
-  die "unexpected Host/Device provider library basename"
-
-host_provider_sha=$(
-  sha256sum "${KVAF_DIRECT_HOST_PROVIDER_LIBRARY}" | awk '{print $1}'
-)
-device_provider_sha=$(
-  sha256sum "${KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY}" | awk '{print $1}'
-)
-source_manifest_sha=$(
-  sha256sum "${KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST}" |
-    awk '{print $1}'
-)
-build_manifest_sha=$(
-  sha256sum "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}" |
-    awk '{print $1}'
-)
-[[ "$(manifest_value host_provider_sha256 \
-      "${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP}")" == \
-      "${host_provider_sha}" &&
-    "$(manifest_value device_provider_sha256 \
-      "${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP}")" == \
-      "${device_provider_sha}" ]] ||
-  die "success stamp does not bind both providers"
-[[ "$(manifest_value build_manifest_sha256 \
-      "${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP}")" == \
-      "${build_manifest_sha}" ]] ||
-  die "success stamp does not bind this build manifest"
-[[ "$(manifest_value host_provider_sha256 \
-      "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}")" == \
-      "${host_provider_sha}" &&
-    "$(manifest_value device_provider_sha256 \
-      "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}")" == \
-      "${device_provider_sha}" ]] ||
-  die "build manifest does not bind both providers"
-[[ "$(manifest_value source_manifest_sha256 \
-      "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}")" == \
-      "${source_manifest_sha}" ]] ||
-  die "build manifest does not bind this source manifest"
-[[ "${host_provider_sha}" != "${device_provider_sha}" ]] ||
-  die "Host and Device providers must be distinct binaries"
-require_provider_role_manifest \
-  host_provider_filename libkvaf_urma_provider_host.so
-require_provider_role_manifest host_provider_execution_domain host-process
-require_provider_role_manifest host_private_abi 1
-require_provider_role_manifest \
-  host_private_abi_name perftest-aiv-v1-host
-require_provider_role_manifest \
-  device_provider_filename libkvaf_urma_provider_device.so
-require_provider_role_manifest device_provider_execution_domain aicpu
-require_provider_role_manifest device_private_abi 2
-require_provider_role_manifest \
-  device_private_abi_name perftest-aiv-v1-device
-require_provider_role_manifest reference_perftest_abi perftest-aiv-v1
-require_provider_role_manifest \
-  urma_core_mode source-linked-no-dynamic-providers
-require_provider_role_manifest udma_provider_mode source-built-internal
-require_provider_role_manifest ummu_provider_mode source-built-internal
-if grep -Eq \
-    '^(udma|ummu)_provider_library_' \
-    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}"; then
-  die "source-built provider manifest contains a forbidden dynamic UDMA/UMMU provider"
-fi
-if ! sha256sum -c "${KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST}" \
-    >/dev/null; then
-  die "one or more provider source files changed after the atomic build"
-fi
-verify_runtime_manifest
-
-provider_dynamic=$(readelf -d "${KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY}")
-if grep -Eq 'lib(hcomm|urma_perftest)' <<<"${provider_dynamic}" ||
-   grep -Eq 'lib(urma|ummu|urma-udma)\.so' <<<"${provider_dynamic}" ||
-   grep -Eq '\((RPATH|RUNPATH)\)' <<<"${provider_dynamic}"; then
-  die "provider links a forbidden library or contains RPATH/RUNPATH"
-fi
 provider_dynamic_symbols=$(
   nm -D --defined-only "${KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY}"
 )
@@ -328,7 +256,25 @@ cp "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}" \
   "${package_dir}/kvaf-direct-urma-provider.manifest"
 cp "${KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST}" \
   "${package_dir}/kvaf-direct-urma-source.sha256"
-chmod 0644 "${package_dir}/"*
+cp "${umdk_source_manifest}" \
+  "${package_dir}/kvaf-direct-urma-umdk-source.sha256"
+cp "${libummu_source_manifest}" \
+  "${package_dir}/kvaf-direct-urma-libummu-source.sha256"
+for probe in kvaf_udma_uapi_probe kvaf_udma_private_abi_probe \
+  kvaf_ummu_uapi_probe; do
+  cp "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/${probe}" \
+    "${package_dir}/${probe}"
+done
+chmod 0644 \
+  "${package_dir}/libkvaf_urma_provider_device.so" \
+  "${package_dir}/kvaf-direct-urma-provider.manifest" \
+  "${package_dir}/kvaf-direct-urma-source.sha256" \
+  "${package_dir}/kvaf-direct-urma-umdk-source.sha256" \
+  "${package_dir}/kvaf-direct-urma-libummu-source.sha256"
+chmod 0755 \
+  "${package_dir}/kvaf_udma_uapi_probe" \
+  "${package_dir}/kvaf_udma_private_abi_probe" \
+  "${package_dir}/kvaf_ummu_uapi_probe"
 
 temporary_archive="${temporary_dir}/liburma_perftest.tar.gz"
 tar -C "${temporary_dir}" -czf "${temporary_archive}" \

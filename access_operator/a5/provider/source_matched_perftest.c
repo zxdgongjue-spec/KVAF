@@ -2,7 +2,6 @@
 #include "kvaf_source_matched_udma.h"
 #include "urma_api.h"
 
-#include <errno.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,8 +10,8 @@
 /*
  * Compile the selected perftest resource implementation into the provider
  * instead of linking a separately built liburma_perftest.so. This keeps
- * perftest_context_t, the ai_jettys sidecar and the code that fills them in
- * one compilation unit. The renamed legacy exports remain private to this
+ * perftest_context_t and the resource helpers that fill it in one compilation
+ * unit. The renamed legacy exports remain private to this
  * shared object; KVAF calls only the checked entry points below.
  */
 #ifndef KVAF_PERFTEST_RESOURCES_SOURCE
@@ -62,12 +61,6 @@ static int kvaf_init_device_checked(
     if (urma_query_device(device, &ctx->dev_attr) != URMA_SUCCESS) {
         return -1;
     }
-    if (cfg->enable_user_tp &&
-        (device->type == URMA_TRANSPORT_UB ||
-         (ctx->dev_attr.dev_cap.sub_trans_mode_cap &
-          URMA_RC_USER_TP) == 0)) {
-        return -1;
-    }
     ctx->urma_ctx = urma_create_context(device, cfg->eid_idx);
     if (ctx->urma_ctx == NULL) {
         return -1;
@@ -78,12 +71,10 @@ static int kvaf_init_device_checked(
 }
 
 /*
- * The selected urma_perftest fork carries a copied udma_u_jetty/jfc layout
- * solely to populate its optional urma_ai_jetty_t sidecar.  That copy is not
- * an ABI. KVAF creates the same public URMA resources without calling
- * fill_ai_jetty(); the only private queue access is the isolated accessor
- * compiled with the same source-built UDMA snapshot and checked by the public
- * ABI probe after all public resource creation has completed.
+ * KVAF creates only public URMA resources. The only private queue access is
+ * the isolated accessor compiled with the same source-built UDMA snapshot and
+ * checked by the public ABI probe after all public resource creation has
+ * completed.
  */
 static int kvaf_create_duplex_queues_public(
     perftest_context_t *ctx, perftest_config_t *cfg)
@@ -95,7 +86,6 @@ static int kvaf_create_duplex_queues_public(
     urma_jetty_cfg_t jetty_cfg = {0};
 
     if (ctx == NULL || cfg == NULL || cfg->jettys != 1U ||
-        cfg->share_jfr ||
         cfg->inline_size >
             ctx->dev_attr.dev_cap.max_jfs_inline_len) {
         return -1;
@@ -123,21 +113,38 @@ static int kvaf_create_duplex_queues_public(
 
     fill_jfs_cfg(ctx, cfg, cfg->inline_size, &jfs_cfg);
     fill_jfr_cfg(ctx, cfg, &jfr_cfg);
-    jetty_flag.bs.share_jfr = 0;
+    jetty_flag.bs.share_jfr = cfg->share_jfr ? 1 : 0;
     jetty_cfg.flag = jetty_flag;
     jetty_cfg.jfs_cfg = jfs_cfg;
-    jetty_cfg.jfr_cfg = &jfr_cfg;
+    if (cfg->share_jfr) {
+        ctx->jfr = calloc(1, sizeof(*ctx->jfr));
+        if (ctx->jfr == NULL) {
+            return -1;
+        }
+        jfr_cfg.jfc = ctx->jfc_r[0];
+        ctx->jfr[0] = urma_create_jfr(ctx->urma_ctx, &jfr_cfg);
+        if (ctx->jfr[0] == NULL) {
+            return -1;
+        }
+        jetty_cfg.shared.jfc = ctx->jfc_r[0];
+        jetty_cfg.shared.jfr = ctx->jfr[0];
+    } else {
+        jetty_cfg.jfr_cfg = &jfr_cfg;
+    }
     jetty_cfg.id = cfg->jetty_id;
 
     ctx->jetty = calloc(cfg->jettys, sizeof(*ctx->jetty));
-    ctx->ai_jettys =
-        calloc(cfg->jettys, sizeof(*ctx->ai_jettys));
-    if (ctx->jetty == NULL || ctx->ai_jettys == NULL) {
+    if (ctx->jetty == NULL) {
         return -1;
     }
 
     jetty_cfg.jfs_cfg.jfc = ctx->jfc_s[0];
-    jetty_cfg.jfr_cfg->jfc = ctx->jfc_r[0];
+    if (cfg->share_jfr) {
+        /* jfr_cfg aliases the shared {jfr,jfc} union and is inactive here. */
+        jetty_cfg.shared.jfc = ctx->jfc_r[0];
+    } else {
+        jetty_cfg.jfr_cfg->jfc = ctx->jfc_r[0];
+    }
     ctx->jetty[0] = urma_create_jetty(ctx->urma_ctx, &jetty_cfg);
     if (ctx->jetty[0] == NULL) {
         return -1;
@@ -153,7 +160,7 @@ static int kvaf_register_memory_checked(
     urma_seg_cfg_t seg_cfg = {0};
 
     if (ctx == NULL || cfg == NULL || cfg->jettys != 1U ||
-        cfg->seg_pre_jetty || cfg->dev_buf == NULL ||
+        cfg->seg_pre_jetty || !cfg->enable_va || cfg->v_address == 0 ||
         cfg->cache_line_size == 0) {
         return -1;
     }
@@ -161,7 +168,7 @@ static int kvaf_register_memory_checked(
     if (ctx->local_buf == NULL) {
         return -1;
     }
-    ctx->local_buf[0] = cfg->dev_buf;
+    ctx->local_buf[0] = (void *)(uintptr_t)cfg->v_address;
     ctx->page_size = cfg->page_size;
     maximum_size = cfg->size > ctx->page_size
         ? cfg->size : ctx->page_size;
@@ -181,8 +188,6 @@ static int kvaf_register_memory_checked(
         if (ctx->token_id[0] == NULL) {
             return -1;
         }
-        ctx->ai_jettys[0].sq.token_id =
-            ctx->token_id[0]->token_id;
     }
 
     ctx->local_tseg = calloc(1, sizeof(*ctx->local_tseg));
@@ -388,7 +393,7 @@ static int kvaf_free_tokens_checked(
 static void kvaf_release_local_buffer_vector(perftest_context_t *ctx)
 {
     /*
-     * cfg->dev_buf is owned by KVAF. perftest allocates only this pointer
+     * cfg->v_address is owned by KVAF. perftest allocates only this pointer
      * vector, never the external Host DVA/HBM allocation itself.
      */
     free(ctx->local_buf);
@@ -420,8 +425,6 @@ static int kvaf_delete_jettys_checked(
         free(ctx->jetty);
         ctx->jetty = NULL;
     }
-    free(ctx->ai_jettys);
-    ctx->ai_jettys = NULL;
     return 0;
 }
 
@@ -547,43 +550,6 @@ enum kvaf_phase_sync_result {
     KVAF_PHASE_SYNC_UNCERTAIN = 2,
 };
 
-static int kvaf_write_full(int fd, const void *buffer, size_t bytes)
-{
-    const uint8_t *cursor = (const uint8_t *)buffer;
-    size_t written = 0;
-
-    while (written < bytes) {
-        ssize_t result = send(
-            fd, cursor + written, bytes - written, MSG_NOSIGNAL);
-        if (result < 0 && errno == EINTR) {
-            continue;
-        }
-        if (result <= 0) {
-            return -1;
-        }
-        written += (size_t)result;
-    }
-    return 0;
-}
-
-static int kvaf_read_full(int fd, void *buffer, size_t bytes)
-{
-    uint8_t *cursor = (uint8_t *)buffer;
-    size_t consumed = 0;
-
-    while (consumed < bytes) {
-        ssize_t result = read(fd, cursor + consumed, bytes - consumed);
-        if (result < 0 && errno == EINTR) {
-            continue;
-        }
-        if (result <= 0) {
-            return -1;
-        }
-        consumed += (size_t)result;
-    }
-    return 0;
-}
-
 static enum kvaf_phase_sync_result kvaf_sync_phase_status_detailed(
     const perftest_config_t *cfg, uint32_t phase, int local_status)
 {
@@ -598,10 +564,8 @@ static enum kvaf_phase_sync_result kvaf_sync_phase_status_detailed(
 
     for (i = 0; i < cfg->pair_num; ++i) {
         struct kvaf_checked_phase_status peer = {0};
-        if (kvaf_write_full(
-                cfg->comm.sock_fd[i], &local, sizeof(local)) != 0 ||
-            kvaf_read_full(
-                cfg->comm.sock_fd[i], &peer, sizeof(peer)) != 0 ||
+        if (kvaf_perftest_sync_data(cfg, i, sizeof(local),
+                (char *)&local, (char *)&peer) != 0 ||
             peer.magic != KVAF_CHECKED_PHASE_MAGIC ||
             peer.phase != phase) {
             return KVAF_PHASE_SYNC_UNCERTAIN;
@@ -617,7 +581,7 @@ static void kvaf_abort_control_sockets(const perftest_config_t *cfg)
 {
     uint32_t i;
 
-    if (cfg == NULL || cfg->comm.sock_fd == NULL) {
+    if (cfg == NULL) {
         return;
     }
     /*
@@ -626,8 +590,9 @@ static void kvaf_abort_control_sockets(const perftest_config_t *cfg)
      * processes retain every URMA object and backing allocation for reset.
      */
     for (i = 0; i < cfg->pair_num; ++i) {
-        if (cfg->comm.sock_fd[i] >= 0) {
-            (void)shutdown(cfg->comm.sock_fd[i], SHUT_RDWR);
+        int fd = kvaf_perftest_control_fd(i);
+        if (fd >= 0) {
+            (void)shutdown(fd, SHUT_RDWR);
         }
     }
 }
@@ -774,16 +739,7 @@ static int kvaf_destroy_partial_duplex_ctx_checked(
                 KVAF_PERFTEST_TEARDOWN_CONNECTION_METADATA);
             continue;
         case KVAF_PERFTEST_TEARDOWN_CONNECTION_METADATA:
-            destroy_connection_info(ctx);
-            /*
-             * The selected source's free_remote_tp_info() does not release
-             * remote_tp_info when CTP is used. Keep these explicit, nulling
-             * frees in the same one-shot phase.
-             */
-            free(ctx->remote_tp_info);
-            ctx->remote_tp_info = NULL;
-            free(ctx->local_tp_info);
-            ctx->local_tp_info = NULL;
+            destroy_connection_info(ctx, cfg);
             kvaf_teardown_advance(
                 state, KVAF_PERFTEST_TEARDOWN_ORPHAN_RESOURCES);
             continue;
@@ -891,8 +847,9 @@ int kvaf_perftest_create_duplex_ctx_checked(
     if (ctx == NULL || cfg == NULL ||
         cfg->jetty_mode != PERFTEST_JETTY_DUPLEX ||
         cfg->jettys != 1U || cfg->pair_num != 1U ||
-        cfg->dev_buf == NULL || !cfg->tp_aware || !cfg->use_ctp ||
-        cfg->trans_mode != URMA_TM_RM || cfg->share_jfr ||
+        !cfg->enable_va || cfg->v_address == 0 ||
+        !cfg->tp_aware || !cfg->use_ctp ||
+        cfg->trans_mode != URMA_TM_RM ||
         cfg->seg_pre_jetty ||
         cfg->enable_async_import || cfg->enable_credit ||
         cfg->enable_user_tp || cfg->use_jfce) {
