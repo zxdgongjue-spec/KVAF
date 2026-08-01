@@ -24,24 +24,103 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
         scripts = (
             RUNNER,
             ROOT / "scripts" / "a5_direct_urma_legacy_guard.sh",
+            ROOT / "scripts" / "a5_aicpu_affinity_guard.sh",
             ROOT / "scripts" / "run_a5_aiv_urma_h2d_smoke.sh",
             ROOT / "scripts" / "build_a5_direct_urma.sh",
             ROOT / "scripts" / "build_a5_direct_urma_provider.sh",
             ROOT / "scripts" / "package_a5_direct_urma_aicpu.sh",
         )
-        result = subprocess.run(
-            [bash, "-n", *(str(script) for script in scripts)],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        for script in scripts:
+            with self.subTest(script=script.name):
+                result = subprocess.run(
+                    [bash, "-n", str(script)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_persistent_guard_precedes_eid_access(self) -> None:
         guard = self.source.index("acquire_persistent_session_guards\n")
         eid = self.source.index("resolve_a5_urma_eids.py")
         self.assertLess(guard, eid)
         self.assertNotIn("query_a5_topology.py", self.source)
+
+    def test_unproven_aicpu_affinity_fails_before_hardware_access(self) -> None:
+        guard = self.source.index(
+            "kvaf_require_aicpu_affinity_contract || exit $?"
+        )
+        eid = self.source.index("resolve_a5_urma_eids.py", guard)
+        endpoint = self.source.index("resolve_a5_urma_endpoints.py", guard)
+        npu_smi = self.source.index(
+            '"${kvaf_npu_smi_binary}" info', guard
+        )
+        worker = self.source.index(
+            'nohup "${KVAF_A5_DIRECT_BINARY}" --role host', guard
+        )
+        self.assertLess(guard, eid)
+        self.assertLess(guard, endpoint)
+        self.assertLess(guard, npu_smi)
+        self.assertLess(guard, worker)
+
+        recovery = self.source.index("acquire_persistent_session_guards\n")
+        self.assertLess(recovery, guard)
+
+    def test_aicpu_affinity_gate_has_no_environment_override(self) -> None:
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("bash is unavailable")
+        helper = ROOT / "scripts" / "a5_aicpu_affinity_guard.sh"
+        command = (
+            f"source {helper!s}; "
+            "kvaf_require_aicpu_affinity_contract"
+        )
+        result = subprocess.run(
+            [bash, "-c", command],
+            env={
+                "PATH": str(Path(bash).parent),
+                "KVAF_AICPU_AFFINITY_CONTRACT":
+                    "documented-same-stream-process-affinity-v1",
+            },
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "CONTRACT=unproven-kfc-multilaunch", result.stderr
+        )
+        self.assertIn(
+            "pid/cookie/SO-base/generation sample is diagnostic only",
+            result.stderr,
+        )
+        self.assertIn(
+            "No topology/EID/NPU/URMA operation was attempted.",
+            result.stderr,
+        )
+
+    def test_urma_endpoints_are_exactly_resolved_before_npu_resources(self) -> None:
+        pair = self.source.index("resolve_a5_urma_eids.py")
+        endpoints = self.source.index("endpoint_resolver_args=(", pair)
+        resolver = self.source.index("resolve_a5_urma_endpoints.py", endpoints)
+        reserved_sq = self.source.index(
+            "/sys/module/udma/parameters/sq_reserved", endpoints
+        )
+        idle = self.source.index(
+            "# Take the occupancy snapshot as late as possible", reserved_sq
+        )
+        self.assertLess(pair, endpoints)
+        self.assertLess(endpoints, resolver)
+        self.assertLess(endpoints, reserved_sq)
+        self.assertLess(endpoints, idle)
+        resolution = self.source[endpoints:reserved_sq]
+        self.assertIn("KVAF_UBCORE_SYSFS_ROOT", resolution)
+        self.assertIn("KVAF_HCCN_TIMEOUT_SECONDS", resolution)
+        self.assertIn("disagrees with the exact EID match", resolution)
+        self.assertIn(
+            "No Host/Device DDR, HBM, URMA, SQ, or CQ resource was created.",
+            resolution,
+        )
 
     def test_npu_idle_proof_precedes_result_and_worker_resources(self) -> None:
         preflight = self.source.index(
@@ -207,11 +286,27 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
         self.assertNotIn("clear_active_session", branch)
         self.assertIn("ACTIVE_SESSION=", branch)
 
-    def test_unverified_armed_pass_or_safe_is_quarantined(self) -> None:
+    def test_legacy_unverified_recovery_remains_fail_closed(self) -> None:
         self.assertIn(
             "(( pair_classifier_rc == 0 || pair_classifier_rc == 3 ))",
             self.source,
         )
+
+    def test_new_runs_require_source_owned_checked_udma_and_ummu(self) -> None:
+        self.assertNotIn(
+            "KVAF_DIRECT_ALLOW_UNVERIFIED_UDMA_TEARDOWN", self.source
+        )
+        self.assertNotIn("unverified-system-provider)", self.source)
+        for binding in (
+            "udma_provider_mode=source-built-internal",
+            "udma_runtime_capability=0x0000000000020001",
+            "ummu_provider_mode=source-built-internal",
+            "ummu_runtime_capability=0x0000000000010001",
+            "checked-retryable-v1",
+        ):
+            self.assertIn(binding, self.source)
+        self.assertIn("ummu_uapi_header_sha256", self.source)
+        self.assertIn("lib(urma|ummu|urma-udma)", self.source)
 
     def test_bounded_wait_without_terminal_proof_stays_recoverable(self) -> None:
         start = self.source.index("bounded_wait_expired")

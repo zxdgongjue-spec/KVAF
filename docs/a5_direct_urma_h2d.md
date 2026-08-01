@@ -34,8 +34,17 @@ device-VA。代码不会把这个事实误标成 `CREATE_JETTY_EX/TGID-VA`；
 
 - CANN/ACL/runtime、bisheng、Ascend HAL 和驱动；
 - AICPU KFC 动态加载；
-- 系统 `liburma.so`、`liburma_common.so`、`liburma-udma.so` 和内核 UDMA；
-- 与运行时 UDMA 同代的 `urma_perftest/ubengine` 源码快照。
+- source-linked public `liburma` core、系统 `liburma_common.so` 和内核
+  UDMA/UMMU；
+- 与运行驱动同代的 `urma_perftest/ubengine` 源码快照；
+- 与服务器 B 当前驱动同一构建产物的完整 UMMU UAPI header。
+
+KVAF 不再链接系统 `liburma.so`、`liburma-udma.so` 或 `libummu.so`。Host 与
+Device provider 分别把 private liburma core、source-matched UDMA
+（Host=`ST64B`、AICPU=`TGID_VA`）和 checked UMMU 编进自身；private core 在
+编译期禁用动态 provider 目录扫描。构建与运行脚本同时检查 `DT_NEEDED` 和
+`ldd`，发现外部 `liburma`/`liburma-udma`/`libummu` 会直接失败。系统
+`liburma.so` 只作为已验证参考产物参与 public ABI 对比，不进入运行依赖。
 
 这里的“绕过 HCOMM”是指 KVAF 自己完成资源控制。EID、MR、Jetty、TP
 仍必须创建和交换，只是不再由 HCOMM/memfabric/memcache 代办。
@@ -100,8 +109,9 @@ Host 端严格区分两个地址：
   -> 释放 DDR
 ```
 
-在不能证明 DMA 已停止时，代码不会主动释放 backing memory，而是写入
-quarantine。
+在不能证明 DMA 已停止时，代码不会主动释放 backing memory。明确的
+protocol/ownership ambiguity 才写 quarantine；底层明确返回 RETRYABLE 时，
+原 worker 会保留同一 session、原句柄和 backing，并持续从 teardown 断点重试。
 
 ## 3. 为什么要分成 Host/Device 两个 provider
 
@@ -248,8 +258,12 @@ armed，才会生成：
 ```
 
 普通超时、marker 暂缺、分类器损坏或 runner 中断只保留
-`PENDING_UNPROVEN` active，不会提前声称必须复位。stream 同步失败、provider
-Close 失败等端点明确的 DMA 安全问题仍由端点写 fatal 并进入 quarantine。
+`PENDING_UNPROVEN` active，不会提前声称必须复位。provider 明确返回
+`CLOSE_RETRYABLE` 时也不会因为经过若干秒就升级成 unsafe：worker 先高频、
+随后降频无限重试同一个 provider instance/session，runner 的有界等待到期后只
+返回 5 并保留 live worker 和 active-session 锁。只有 stream 无法证明停止、
+queue 不一致、跨 session/worker ownership 冲突、PLBI/PSYNC 状态未知，或 provider
+明确返回 `CLOSE_UNSAFE` 时，端点才发布 fatal/`FAIL_UNSAFE` 并进入 quarantine。
 
 worker 在可能取得 DDR/HBM 前忽略异步 HUP/INT/TERM/QUIT。部署兼容锁与
 active-session 锁由 worker 继承；runner 在启动 Host 前写入
@@ -298,6 +312,23 @@ quarantine；不要在隔离前 `kill -9`。
 后再次运行同一脚本，它会在访问 topology/EID/NPU 之前用原 `run_id` 和结果目录中
 固化的分类器自动清理安全状态。只有明确的 quarantine 才进入站点隔离流程。
 
+需要注意：本版本的 Device provider 仍要求同一 AICPU 进程和 SO instance 执行
+Open/Close。`UB_MicroBenchmark_new` 在同一 stream 上分多次调用，已有日志也曾观察
+到相同 PID/TID；但本地公开 KFC ABI 只提供 associated stream，没有 worker、进程或
+SO instance affinity token。对多次调用采样 PID、进程 cookie、SO base 和 generation
+只能描述过去的调度，不能绑定随后真正持有资源的 Open/Close，因此不能作为安全
+前置证明。
+
+新硬件运行现在由 `scripts/a5_aicpu_affinity_guard.sh` 默认 fail closed。旧 active
+session/quarantine 仍会先恢复或报告；新运行则会在 EID selector、`npu-smi`、ACL
+context 和 URMA/UMMU 资源之前退出，且没有环境变量绕过。只有以下任一条件经代码和
+目标 CANN 版本验证后，才能修改该源码门并重新开放硬件 runner：
+
+- 厂商提供同一 stream 的 KFC 调用固定在同一进程/SO instance 的正式 runtime
+  契约，KVAF 同时校验该契约适用于当前 CANN/固件；
+- 将 Open、等待 AIV 数据面和 Close 合并到一个 AICPU invocation，或实现一个长驻
+  ownership service，使 liburma/UDMA/UMMU 指针和句柄始终由同一进程持有。
+
 ## 6. 操作命令
 
 ### 6.1 服务器 B 宿主机：更新代码
@@ -337,12 +368,33 @@ export KVAF_DIRECT_PROVIDER_BUILD_DIR=/data/c00982601/KVAF/build-a5-direct-urma-
 export KVAF_REFERENCE_PERFTEST_LIBRARY=/data/c00982601/UB_MicroBenchmark_new/3rd/urma_perftest/liburma_perftest.so
 ```
 
-若 `ldconfig` 中同一个 SONAME 有多份候选，显式指定实际运行库：
+先定位与服务器 B 当前驱动同一构建产物的完整 UMMU UAPI。不要使用
+`urma_perftest/drivers/ubus/kernel` 下缺少 `hw_cap` 和 PLBI ioctl 的旧 header：
+
+```bash
+find /usr/src "/lib/modules/$(uname -r)/build" /usr/local/Ascend /data/c00982601 \
+  -type f -path '*/include/uapi/linux/ummu_core.h' -print 2>/dev/null \
+  | sort -u
+
+# 对每个候选执行；六类定义必须全部存在，并确认它来自当前驱动包。
+grep -nE \
+  'hw_cap|HW_CAP_(EXPAN|DOUBLE_PLBI|KCMD_PLBI)|UMMU_IOCPLBI_(VA|ALL)' \
+  /exact/driver-source/include/uapi/linux/ummu_core.h
+
+export KVAF_UMMU_UAPI_ROOT=/exact/driver-source
+test -r "$KVAF_UMMU_UAPI_ROOT/include/uapi/linux/ummu_core.h"
+```
+
+如果找不到该 header，停止在这里并补充当前驱动对应的开发/源码包；不能从旧
+header 猜结构体布局或 ioctl 数值。构建会记录精确路径和 SHA-256，但“与运行
+驱动同源”仍必须由服务器软件包来源保证。
+
+若 `ldconfig` 中同一个 SONAME 有多份候选，显式指定 public ABI 参考库与实际
+`liburma_common` runtime：
 
 ```bash
 export KVAF_URMA_LIBRARY=/usr/lib64/liburma.so.0
 export KVAF_URMA_COMMON_LIBRARY=/usr/lib64/liburma_common.so.0
-export KVAF_UDMA_PROVIDER_LIBRARY=/usr/lib64/urma/liburma-udma.so
 ```
 
 `KVAF_REFERENCE_PERFTEST_LIBRARY` 只用于把
@@ -360,13 +412,32 @@ bash scripts/build_a5_direct_urma_provider.sh
 ls -l \
   "$KVAF_DIRECT_PROVIDER_BUILD_DIR/libkvaf_urma_provider_host.so" \
   "$KVAF_DIRECT_PROVIDER_BUILD_DIR/libkvaf_urma_provider_device.so" \
+  "$KVAF_DIRECT_PROVIDER_BUILD_DIR/kvaf_ummu_uapi_probe" \
   "$KVAF_DIRECT_PROVIDER_BUILD_DIR/build.manifest" \
   "$KVAF_DIRECT_PROVIDER_BUILD_DIR/build.success"
 ```
 
 脚本执行 fresh build，校验导出符号、AArch64 ELF、`DT_NEEDED`、RPATH、
-源码前后哈希、Host/Device private-ABI probe，以及实际 URMA/UDMA runtime
-哈希。
+源码前后哈希、Host/Device private-ABI probe、public liburma ABI，以及 pinned
+UMMU UAPI。下面两条都必须无输出：
+
+```bash
+readelf -d "$KVAF_DIRECT_PROVIDER_BUILD_DIR/libkvaf_urma_provider_host.so" \
+  | grep -E 'NEEDED.*lib(urma|urma-udma|ummu|hcomm)\.so' || true
+readelf -d "$KVAF_DIRECT_PROVIDER_BUILD_DIR/libkvaf_urma_provider_device.so" \
+  | grep -E 'NEEDED.*lib(urma|urma-udma|ummu|hcomm)\.so' || true
+
+grep -E \
+  '^(urma_core_mode|urma_library_linkage|udma_provider_mode|ummu_provider_mode|ummu_uapi_header_sha256|ummu_uapi_abi|ummu_uapi_abi_sha256|ummu_uapi_probe_sha256|udma_teardown_contract)=' \
+  "$KVAF_DIRECT_PROVIDER_BUILD_DIR/build.manifest"
+
+"$KVAF_DIRECT_PROVIDER_BUILD_DIR/kvaf_ummu_uapi_probe"
+```
+
+期望 manifest 包含 `urma_core_mode=source-linked-no-dynamic-providers`、
+`source-built-internal`、完整的结构体 offset/ioctl/capability
+指纹和 `udma_teardown_contract=checked-retryable-v1`。runner 在任何硬件资源创建
+前会重新执行并校验这份 probe；header、probe 或 manifest 任一个变化都会退出 2。
 
 ### 6.4 Docker：安装 AICPU provider
 
@@ -414,22 +485,23 @@ KVAF_A5_BUILD_DIRECT_URMA_BACKEND=ON
 
 所以 direct binary 和 provider 的 `DT_NEEDED` 都不能含 `libhcomm`。
 
-### 6.6 Docker：确认 UDMA device/EID index
+### 6.6 Docker：精确确认 UDMA device/EID index
 
 执行环境：`VLLM_ASCEND_CS_KVAF_DOCKER`
 
-```bash
-urma_admin show --whole | less
-```
-
-然后填写实际值，不要照抄示例：
+runner 现在以 EID 为 key 分别读取 Host `/sys/class/ubcore` 与 Device
+`hccn_tool -g -dev_info`，不再从 NPU 号猜设备名。NPU7 的已确认映射可独立复核：
 
 ```bash
-export KVAF_HOST_URMA_DEVICE=<Host侧UDMA设备名>
-export KVAF_HOST_EID_INDEX=<Host侧EID序号>
-export KVAF_DEVICE_URMA_DEVICE=<Device侧UDMA设备名>
-export KVAF_DEVICE_EID_INDEX=<Device侧EID序号>
+python3 scripts/resolve_a5_urma_endpoints.py \
+  --physical-device-id 7 \
+  --host-eid 00000000003f050000100000df080b00 \
+  --device-eid 000000000000020000100000df00e100 \
+  --shell
 ```
+
+期望输出为 `udmac0d1e5/eid0` 与 `udmac0d0e2/eid0`。手工设置这些变量时，
+runner 仍会重新做 exact-match；任一不一致都会在创建资源前退出 2。
 
 Host/Device peer EID 默认由
 `scripts/resolve_a5_urma_eids.py` 从 `/proc/asdrv_ub/pair_info` 解析，不依赖
@@ -443,13 +515,26 @@ memcache。`dev_id` 是宿主机全局 selector；新代码统一通过宿主机
 
 执行环境：`VLLM_ASCEND_CS_KVAF_DOCKER`
 
+当前版本执行下面命令时会由 AICPU affinity gate 以退出码 2 停止；这是预期的
+fail-closed 结果，不应通过设置环境变量继续。先完成第 5 节所述正式 runtime 契约
+验证或长驻 owner 改造，再由代码评审修改源码门。保留命令仅用于确认门禁位置和为
+后续实现准备参数。
+
 ```bash
-unset KVAF_HOST_EID KVAF_DEVICE_EID KVAF_PAIR_CHANNEL
+source /tmp/kvaf_npu7_pair.env
+export KVAF_HOST_EID KVAF_DEVICE_EID KVAF_PAIR_CHANNEL
+export KVAF_LOGICAL_DEVICE_ID=7
+export KVAF_PHYSICAL_DEVICE_ID=7
+export KVAF_HOST_URMA_DEVICE=udmac0d1e5
+export KVAF_HOST_EID_INDEX=0
+export KVAF_DEVICE_URMA_DEVICE=udmac0d0e2
+export KVAF_DEVICE_EID_INDEX=0
+export KVAF_PAIR_CHANNEL=0
 unset KVAF_DIRECT_ALLOW_BUSY_NPU
-export KVAF_LOGICAL_DEVICE_ID=0
-export KVAF_PHYSICAL_DEVICE_ID=0  # 按服务器 B 的实际映射填写
 export KVAF_H2D_BYTES=4096
-export KVAF_DIRECT_CONTROL_PORT=21115
+export KVAF_H2D_TIMEOUT_SECONDS=120
+export KVAF_DIRECT_CONTROL_PORT=22117
+export KVAF_A5_RUN_TAG="npu7_checked_$(date +%Y%m%d_%H%M%S)_$$"
 
 bash scripts/run_a5_direct_urma_h2d_smoke.sh
 ```
@@ -482,25 +567,9 @@ inventory 中恰好存在该卡，且进程表中明确出现
 export KVAF_DIRECT_ALLOW_BUSY_NPU=1
 ```
 
-正常测试必须保持该变量未设置；它与下面的 UDMA teardown experimental override
-是两个独立风险开关。
-
-当前构建仍由系统 `liburma-udma.so` 真正执行注册和释放；它尚未提供可验证、
-可重试的 teardown contract。因此 runner 默认在创建任何 DDR/HBM/URMA 资源前
-退出。只做探索性数据通路测试、并接受底层释放失败仍可能需要硬件隔离时，才在
-同一 Docker 终端显式开启：
-
-```bash
-export KVAF_DIRECT_ALLOW_UNVERIFIED_UDMA_TEARDOWN=1
-bash scripts/run_a5_direct_urma_h2d_smoke.sh
-```
-
-输出 `TEARDOWN_ASSURANCE=experimental-unverified` 不能作为生产释放安全证明。
-只要本次确实 armed 过 URMA 资源，即使数据通路显示 PASS，runner 也会以退出码
-4 保留 quarantine；它只报告 `KVAF_A5_DIRECT_DATA_PATH_RESULT=PASS`，不会伪装成
-“可直接重试”。这是系统 UDMA 吞掉底层 ungrant/free 错误时无法规避的边界。
-后续私有 patched UDMA 通过错误传播、phase retry、ABI/ownership probe 后，
-manifest 才能声明 `udma_teardown_contract=checked-retryable-v1`，届时无需该开关。
+正常测试必须保持该变量未设置。旧的
+`KVAF_DIRECT_ALLOW_UNVERIFIED_UDMA_TEARDOWN` 已被删除；新 runner 只接受源码内置
+UDMA+UMMU 和 `checked-retryable-v1`，没有回退到系统 provider 的风险开关。
 
 运行后的处理只看退出码和最终终态：
 
@@ -566,7 +635,7 @@ unset KVAF_DIRECT_ACTIVE_SESSION_FILE KVAF_DIRECT_QUARANTINE_FILE
 1. bisheng 能编译 `dav-3510` AIV + SIMT；
 2. ACL/runtime 能执行 custom AICPU KFC；
 3. compat loader 能加载上面的 Device provider；
-4. 系统 `liburma`/`liburma-udma` 与提供的 `ubengine` 源码同代。
+4. public `liburma`、`ubengine` 源码、完整 UMMU UAPI 与运行驱动同代。
 
 四项均通过就不必仅为 direct URMA 升级 CANN；任一项缺失才需要补匹配组件
 或升级完整套件，不能只替换某个 include 目录。
@@ -579,13 +648,16 @@ unset KVAF_DIRECT_ACTIVE_SESSION_FILE KVAF_DIRECT_QUARANTINE_FILE
   `liburma-udma` provider 中新增 versioned
   `QUERY_DIRECT_QUEUE_INFO`，由 provider 自己返回 SQ/CQ 地址和 feature，
   彻底删除外部 private cast；
-- 当前 UDMA 源码中的 `udma_u_unregister_seg`/`udma_u_free_tid` 会吞掉
-  `ummu_ungrant`/`ummu_free_tid` 的底层失败并返回成功。要可靠释放
-  Host DDR/HBM，必须修改并部署匹配的 `liburma-udma.so`，让错误向上传递
-  且失败句柄保持可重试；当前 runner 因此默认在资源创建前 fail closed，
-  实验开关和 quarantine 只能降低误操作风险，不能修复该底层缺陷；
+- source-built UDMA/UMMU 已替换上游会吞掉
+  `ummu_ungrant`/`ummu_free_tid`、PLBI/PSYNC 与 userspace `munmap` 错误的销毁
+  路径，并按 phase 保留 context/segment/token/Jetty/JFC/TID/queue/doorbell
+  句柄。仍需在服务器 B 用当前驱动匹配的 full UAPI 完成 AArch64 构建和真机
+  fault injection；本机全量单元测试不能替代这一步；
 - provider 是进程级 singleton，仅支持一个连接；
-- AICPU Open/Close 必须命中同一进程和 SO 实例；
+- AICPU Open/Close 必须命中同一 KFC worker 和 SO 实例。当前 runner 在任何新硬件
+  访问前 fail closed；同-stream PID/cookie/SO-base/generation 采样不是正式保证。
+  解除该门需要长驻 AICPU ownership service/单 invocation 生命周期，或当前目标
+  CANN 对同-stream worker affinity 的正式 runtime 契约；
 - Host DVA 的 `non_pin` 注册和 AIV CQ cache 语义仍需当前 A5 固件实测；
 - 当前逐 descriptor `doorbell -> CQ`，还没有批量 WQE/doorbell/CQ。
 

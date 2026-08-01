@@ -20,6 +20,34 @@ enum class DirectUrmaRole : std::uint32_t {
   kClient,
 };
 
+// Monotonic Close cursor. In particular, kAicpuResultPending means the close
+// kernel has already been launched and synchronized: another Close call may
+// only reread the existing device result buffer, never launch that kernel
+// again.
+enum class DirectUrmaClosePhase : std::uint32_t {
+  kNotStarted = 0,
+  kHostProviderCall,
+  kAicpuPreLaunch,
+  kAicpuResultPending,
+  kProviderRetryable,
+  kProviderClosed,
+  kLocalCleanup,
+  kComplete,
+  kUnsafeUnknown,
+};
+
+// Why Close stopped. This separates a provider-authorized retry from a
+// post-launch result reread and from an ownership state that must not be
+// touched again before reset/isolation.
+enum class DirectUrmaCloseDisposition : std::uint32_t {
+  kNotStarted = 0,
+  kPreLaunchRetryable,
+  kAicpuResultReadPending,
+  kProviderRetryable,
+  kTransportComplete,
+  kUnsafeUnknown,
+};
+
 struct DirectUrmaOpenSpec {
   DirectUrmaExecutionDomain execution_domain{
       DirectUrmaExecutionDomain::kAicpu};
@@ -65,6 +93,12 @@ class DirectUrmaResources {
   // can become true even when Close still reports a local control-buffer,
   // stream-handle, or dlclose cleanup error.
   bool transport_teardown_complete() const;
+  // True only while the exact provider session and its checked teardown
+  // cursor are still owned and another Close call is safe. False means either
+  // teardown completed or provider/hardware ownership became ambiguous.
+  bool transport_teardown_retryable() const;
+  DirectUrmaClosePhase close_phase() const;
+  DirectUrmaCloseDisposition close_disposition() const;
   Status Close();
 
  private:

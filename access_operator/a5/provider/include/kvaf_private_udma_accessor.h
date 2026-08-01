@@ -14,8 +14,8 @@ extern "C" {
  * liburma query APIs do not expose userspace SQ/CQ mappings or the JFC
  * software doorbell, so this adapter is intentionally compiled against the
  * top-level urma_types.h layout used by the hardware-tested
- * UB_MicroBenchmark_new liburma_perftest.so.  The target smoke test must
- * still prove that the installed liburma-udma object uses the same layout.
+ * UB_MicroBenchmark_new liburma_perftest.so. The source-built UDMA objects,
+ * accessor and public ABI probe are compiled from one pinned source snapshot.
  */
 struct kvaf_udma_direct_queue_info {
   uint32_t struct_size;

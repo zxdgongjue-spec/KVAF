@@ -189,6 +189,41 @@ class DirectUrmaSourceSyntaxTests(unittest.TestCase):
             self.smoke_source,
         )
 
+    def test_host_exception_never_releases_ddr_without_device_close_proof(
+        self,
+    ) -> None:
+        recovery_start = self.smoke_source.index(
+            "bool TryRecoverRetainedAfterException"
+        )
+        recovery_end = self.smoke_source.index(
+            "}  // namespace", recovery_start
+        )
+        recovery_body = self.smoke_source[recovery_start:recovery_end]
+        proof = recovery_body.index(
+            "ReadExactMarker(device_done, provider_closed_pass.c_str())"
+        )
+        safe_abort = recovery_body.index(
+            "ValidDeviceSafeAbortProof(options)", proof
+        )
+        fail_closed = recovery_body.index(
+            "if (!device_teardown_safe)", safe_abort
+        )
+        mapping_close = recovery_body.index(
+            "CloseMappingWithRetry", fail_closed
+        )
+        self.assertIn(
+            'JoinPath(options.exchange_dir, "device.done")',
+            recovery_body,
+        )
+        self.assertIn(
+            'ControlMarker(options, "provider_closed", "PASS")',
+            recovery_body,
+        )
+        self.assertIn("return false;", recovery_body[fail_closed:mapping_close])
+        self.assertLess(proof, mapping_close)
+        self.assertLess(safe_abort, mapping_close)
+        self.assertLess(fail_closed, mapping_close)
+
     def test_host_wait_accepts_late_nonce_bound_evidence(self) -> None:
         self.assertIn("PeerMarkerWait WaitForPeerEvidence", self.smoke_source)
         wait_start = self.smoke_source.index(
@@ -214,6 +249,21 @@ class DirectUrmaSourceSyntaxTests(unittest.TestCase):
         self.assertIn("ReadExactMarker", retry_body)
         self.assertIn("sleep_for", retry_body)
         self.assertNotIn("CloseProviderWithRetry", retry_body)
+
+    def test_checked_retryable_close_never_ages_into_unsafe(self) -> None:
+        retry_start = self.smoke_source.index(
+            "bool CloseProviderWithRetry"
+        )
+        retry_end = self.smoke_source.index(
+            "DirectUrmaOpenSpec MakeHostOpenSpec", retry_start
+        )
+        retry_body = self.smoke_source[retry_start:retry_end]
+        self.assertIn("for (std::uint64_t attempt = 1;; ++attempt)", retry_body)
+        self.assertIn("transport_teardown_retryable()", retry_body)
+        self.assertIn("kSlowRetryInterval", retry_body)
+        self.assertIn("active-session lock", retry_body)
+        self.assertNotIn("kMaxCheckedCloseAttempts", retry_body)
+        self.assertNotIn("exhausted", retry_body)
 
     def test_aicpu_stream_sync_gets_one_bounded_retry(self) -> None:
         self.assertIn("first_sync_result", self.resources_source)

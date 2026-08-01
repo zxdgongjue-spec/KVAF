@@ -117,8 +117,8 @@ if(KVAF_A5_BUILD_HCOMM_BACKEND)
 endif()
 if(KVAF_A5_BUILD_DIRECT_URMA_BACKEND)
   message(STATUS
-    "KVAF direct URMA resources: liburma/UDMA provider via Host+AICPU "
-    "(no HCOMM link)")
+    "KVAF direct URMA resources: source-linked liburma/UDMA/UMMU via "
+    "Host+AICPU (no HCOMM or dynamic UDMA provider)")
 endif()
 
 find_library(KVAF_ASCENDCL_LIBRARY ascendcl

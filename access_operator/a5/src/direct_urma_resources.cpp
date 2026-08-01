@@ -132,6 +132,15 @@ Status ValidateProviderResult(
         "direct URMA provider private UDMA ABI does not match its "
         "execution domain");
   }
+  if (result.reserved[1] != KVAF_UDMA_SOURCE_CAPABILITY_MAGIC ||
+      result.reserved[2] !=
+          KVAF_UDMA_TEARDOWN_SOURCE_OWNED_CHECKED_RETRYABLE_V1 ||
+      result.reserved[3] == 0) {
+    return Status::Error(
+        StatusCode::kTransportError,
+        "direct URMA provider did not prove the source-owned checked "
+        "teardown/public-ABI runtime contract");
+  }
   if (domain == DirectUrmaExecutionDomain::kHostProcess) {
     return Status::OK();
   }
@@ -203,6 +212,9 @@ struct DirectUrmaResources::Impl {
   bool provider_active{false};
   bool opened{false};
   bool closed{false};
+  DirectUrmaClosePhase close_phase{DirectUrmaClosePhase::kNotStarted};
+  DirectUrmaCloseDisposition close_disposition{
+      DirectUrmaCloseDisposition::kNotStarted};
 
   bool HasRetainedState() const {
     return opened || closed || provider_library != nullptr ||
@@ -211,7 +223,39 @@ struct DirectUrmaResources::Impl {
            stream != nullptr || queue_state != nullptr ||
            device_open_result != nullptr || device_close_result != nullptr ||
            queue_state_initialized || last_aicpu_launch_submitted ||
-           resource_quiescence_unknown || session_id != 0 || provider_active;
+           resource_quiescence_unknown || session_id != 0 || provider_active ||
+           close_phase != DirectUrmaClosePhase::kNotStarted ||
+           close_disposition != DirectUrmaCloseDisposition::kNotStarted;
+  }
+
+  void MarkPreLaunchRetryable() {
+    close_phase = DirectUrmaClosePhase::kAicpuPreLaunch;
+    close_disposition =
+        DirectUrmaCloseDisposition::kPreLaunchRetryable;
+  }
+
+  void MarkResultReadPending() {
+    close_phase = DirectUrmaClosePhase::kAicpuResultPending;
+    close_disposition =
+        DirectUrmaCloseDisposition::kAicpuResultReadPending;
+  }
+
+  void MarkProviderRetryable() {
+    close_phase = DirectUrmaClosePhase::kProviderRetryable;
+    close_disposition = DirectUrmaCloseDisposition::kProviderRetryable;
+  }
+
+  void MarkProviderClosed() {
+    provider_active = false;
+    close_phase = DirectUrmaClosePhase::kProviderClosed;
+    close_disposition =
+        DirectUrmaCloseDisposition::kTransportComplete;
+  }
+
+  void MarkUnsafeUnknown() {
+    resource_quiescence_unknown = true;
+    close_phase = DirectUrmaClosePhase::kUnsafeUnknown;
+    close_disposition = DirectUrmaCloseDisposition::kUnsafeUnknown;
   }
 
   Status LoadRuntime() {
@@ -388,10 +432,38 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
     const int provider_result =
         impl_->provider_open(&config, &impl_->result);
     if (provider_result != 0) {
-      if ((impl_->result.flags &
-           KVAF_URMA_PROVIDER_CLEANUP_UNCERTAIN) != 0) {
+      const bool complete_result =
+          impl_->result.magic == KVAF_URMA_PROVIDER_MAGIC &&
+          impl_->result.abi_version == KVAF_URMA_PROVIDER_ABI_VERSION &&
+          impl_->result.struct_size == sizeof(impl_->result);
+      const bool owns_session =
+          complete_result &&
+          impl_->result.session_id == impl_->session_id;
+      const bool cleanup_retryable =
+          owns_session &&
+          (impl_->result.flags &
+           KVAF_URMA_PROVIDER_CLEANUP_RETRYABLE) != 0;
+      const bool cleanup_uncertain =
+          owns_session &&
+          (impl_->result.flags &
+           KVAF_URMA_PROVIDER_CLEANUP_UNCERTAIN) != 0;
+      if (!complete_result ||
+          ((impl_->result.flags &
+            (KVAF_URMA_PROVIDER_CLEANUP_RETRYABLE |
+             KVAF_URMA_PROVIDER_CLEANUP_UNCERTAIN)) != 0 &&
+           !owns_session) ||
+          cleanup_uncertain) {
         impl_->resource_quiescence_unknown = true;
       }
+      /*
+       * A retryable failed Open still owns this exact provider session.  Keep
+       * Close armed so the same nonce can resume the provider's teardown
+       * cursor.  A contradictory "return failure/result OK" is also treated
+       * as active and closed conservatively.
+       */
+      impl_->provider_active = cleanup_retryable || cleanup_uncertain ||
+          (owns_session &&
+           impl_->result.status == KVAF_URMA_PROVIDER_OK);
       status = ValidateProviderResult(
           impl_->result, spec.execution_domain, impl_->session_id,
           spec.peer_eid);
@@ -486,9 +558,13 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
           offsetof(kvaf_urma_aicpu_open_args_v2, so_name),
           offsetof(kvaf_urma_aicpu_open_args_v2, kernel_name),
           "kvaf_direct_urma_open");
-      if (!status.ok() &&
-          !impl_->last_aicpu_launch_submitted) {
-        impl_->provider_active = false;
+      if (!status.ok()) {
+        /*
+         * The runtime launch ABI does not provide a completion token proving
+         * that a nonzero return happened before AICPU observed the request.
+         * Keep the session/backing exactly as for an ambiguous Close launch.
+         */
+        impl_->MarkUnsafeUnknown();
       }
     }
     if (status.ok()) {
@@ -515,7 +591,8 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
         if ((impl_->result.flags &
              KVAF_URMA_PROVIDER_CLEANUP_UNCERTAIN) != 0) {
           impl_->resource_quiescence_unknown = true;
-        } else {
+        } else if ((impl_->result.flags &
+                    KVAF_URMA_PROVIDER_CLEANUP_RETRYABLE) == 0) {
           impl_->provider_active = false;
         }
       }
@@ -655,11 +732,32 @@ bool DirectUrmaResources::transport_teardown_complete() const {
          !impl_->resource_quiescence_unknown;
 }
 
+bool DirectUrmaResources::transport_teardown_retryable() const {
+  if (!impl_->provider_active || impl_->resource_quiescence_unknown) {
+    return false;
+  }
+  return impl_->close_disposition ==
+             DirectUrmaCloseDisposition::kPreLaunchRetryable ||
+         impl_->close_disposition ==
+             DirectUrmaCloseDisposition::kAicpuResultReadPending ||
+         impl_->close_disposition ==
+             DirectUrmaCloseDisposition::kProviderRetryable;
+}
+
+DirectUrmaClosePhase DirectUrmaResources::close_phase() const {
+  return impl_->close_phase;
+}
+
+DirectUrmaCloseDisposition DirectUrmaResources::close_disposition() const {
+  return impl_->close_disposition;
+}
+
 Status DirectUrmaResources::Close() {
   if (impl_->closed) {
     return Status::OK();
   }
   if (impl_->resource_quiescence_unknown) {
+    impl_->MarkUnsafeUnknown();
     return Status::Error(
         StatusCode::kTransportError,
         "direct provider resource quiescence is unknown; retain all "
@@ -667,126 +765,175 @@ Status DirectUrmaResources::Close() {
   }
 
   if (impl_->provider_active) {
-    Status close_status = Status::OK();
-    bool provider_was_closed = false;
     if (impl_->spec.execution_domain ==
         DirectUrmaExecutionDomain::kHostProcess) {
+      impl_->close_phase = DirectUrmaClosePhase::kHostProviderCall;
       if (impl_->provider_close == nullptr) {
-        close_status = Status::Error(
-            StatusCode::kTransportError,
-            "direct URMA Host provider close symbol is unavailable");
-      } else if (impl_->provider_close(impl_->session_id) != 0) {
-        close_status = Status::Error(
-            StatusCode::kTransportError,
-            "direct URMA Host provider close failed");
-      } else {
-        provider_was_closed = true;
-      }
-    } else if (impl_->aicpu_launch != nullptr &&
-               impl_->stream != nullptr) {
-      kvaf_urma_aicpu_close_args_v2 close_args{};
-      DirectQueueState state{};
-      if (impl_->queue_state != nullptr &&
-          impl_->queue_state_initialized) {
-        const auto copy_result = aclrtMemcpy(
-            &state, sizeof(state), impl_->queue_state, sizeof(state),
-            ACL_MEMCPY_DEVICE_TO_HOST);
-        if (copy_result != ACL_SUCCESS) {
-          return AclFailure(
-              "aclrtMemcpy(direct queue state before close)",
-              copy_result);
-        }
-      } else {
-        state.packed_sq_head =
-            static_cast<std::uint64_t>(impl_->result.sq_head) |
-            (static_cast<std::uint64_t>(impl_->result.wqe_count) << 32U);
-        state.cq_tail = impl_->result.cq_tail;
-      }
-      close_args.final_sq_head =
-          static_cast<std::uint32_t>(state.packed_sq_head);
-      close_args.final_cq_tail = state.cq_tail;
-      close_args.session_id = impl_->session_id;
-      if (close_args.final_sq_head != state.cq_tail ||
-          static_cast<std::uint32_t>(
-              state.packed_sq_head >> 32U) != state.cq_tail) {
+        impl_->MarkUnsafeUnknown();
         return Status::Error(
             StatusCode::kTransportError,
-            "direct URMA queue is not drained before provider close");
+            "direct URMA Host provider close symbol is unavailable");
       }
-      close_status = CopyFixedString(
-          "aicpu_kvaf_urma_close_v2",
-          close_args.kernel_name, sizeof(close_args.kernel_name),
-          "AICPU provider close kernel");
-      if (close_status.ok()) {
-        close_status = CopyFixedString(
-            impl_->spec.provider_soname, close_args.so_name,
-            sizeof(close_args.so_name), "AICPU provider soname");
+      const int provider_close_result =
+          impl_->provider_close(impl_->session_id);
+      if (provider_close_result == KVAF_URMA_PROVIDER_CLOSE_OK) {
+        impl_->MarkProviderClosed();
+      } else if (provider_close_result ==
+                 KVAF_URMA_PROVIDER_CLOSE_RETRYABLE) {
+        impl_->MarkProviderRetryable();
+        return Status::Error(
+            StatusCode::kTransportError,
+            "direct URMA Host provider close is retryable");
+      } else {
+        impl_->MarkUnsafeUnknown();
+        return Status::Error(
+            StatusCode::kTransportError,
+            "direct URMA Host provider close is unsafe or unknown, ret=" +
+                std::to_string(provider_close_result));
       }
-      if (close_status.ok() &&
-          impl_->device_close_result == nullptr) {
-        const auto alloc_result = aclrtMalloc(
-            reinterpret_cast<void**>(&impl_->device_close_result),
-            sizeof(*impl_->device_close_result),
-            ACL_MEM_MALLOC_HUGE_FIRST);
-        if (alloc_result != ACL_SUCCESS) {
-          close_status = AclFailure(
-              "aclrtMalloc(AICPU close result)", alloc_result);
+    } else {
+      const bool result_read_pending =
+          impl_->close_phase ==
+          DirectUrmaClosePhase::kAicpuResultPending;
+      if (!result_read_pending) {
+        if (impl_->aicpu_launch == nullptr || impl_->stream == nullptr) {
+          impl_->MarkUnsafeUnknown();
+          return Status::Error(
+              StatusCode::kTransportError,
+              "active AICPU provider lost its launch stream/runtime handle");
         }
-      }
-      constexpr std::int32_t kCloseNotExecuted =
-          std::numeric_limits<std::int32_t>::min();
-      if (close_status.ok()) {
-        const auto copy_result = aclrtMemcpy(
+
+        impl_->close_phase = DirectUrmaClosePhase::kAicpuPreLaunch;
+        DirectQueueState state{};
+        if (impl_->queue_state != nullptr &&
+            impl_->queue_state_initialized) {
+          const auto copy_result = aclrtMemcpy(
+              &state, sizeof(state), impl_->queue_state, sizeof(state),
+              ACL_MEMCPY_DEVICE_TO_HOST);
+          if (copy_result != ACL_SUCCESS) {
+            impl_->MarkPreLaunchRetryable();
+            return AclFailure(
+                "aclrtMemcpy(direct queue state before close)",
+                copy_result);
+          }
+        } else {
+          state.packed_sq_head =
+              static_cast<std::uint64_t>(impl_->result.sq_head) |
+              (static_cast<std::uint64_t>(impl_->result.wqe_count) << 32U);
+          state.cq_tail = impl_->result.cq_tail;
+        }
+        const auto final_sq_head =
+            static_cast<std::uint32_t>(state.packed_sq_head);
+        const auto final_wqe_count =
+            static_cast<std::uint32_t>(state.packed_sq_head >> 32U);
+        if (final_sq_head != state.cq_tail ||
+            final_wqe_count != state.cq_tail) {
+          impl_->MarkUnsafeUnknown();
+          return Status::Error(
+              StatusCode::kTransportError,
+              "direct URMA queue is not drained before provider close");
+        }
+
+        kvaf_urma_aicpu_close_args_v2 close_args{};
+        close_args.final_sq_head = final_sq_head;
+        close_args.final_cq_tail = state.cq_tail;
+        close_args.session_id = impl_->session_id;
+        auto close_status = CopyFixedString(
+            "aicpu_kvaf_urma_close_v2", close_args.kernel_name,
+            sizeof(close_args.kernel_name),
+            "AICPU provider close kernel");
+        if (close_status.ok()) {
+          close_status = CopyFixedString(
+              impl_->spec.provider_soname, close_args.so_name,
+              sizeof(close_args.so_name), "AICPU provider soname");
+        }
+        if (!close_status.ok()) {
+          impl_->MarkPreLaunchRetryable();
+          return close_status;
+        }
+
+        if (impl_->device_close_result == nullptr) {
+          const auto alloc_result = aclrtMalloc(
+              reinterpret_cast<void**>(&impl_->device_close_result),
+              sizeof(*impl_->device_close_result),
+              ACL_MEM_MALLOC_HUGE_FIRST);
+          if (alloc_result != ACL_SUCCESS) {
+            impl_->MarkPreLaunchRetryable();
+            return AclFailure(
+                "aclrtMalloc(AICPU close result)", alloc_result);
+          }
+        }
+        constexpr std::int32_t kCloseNotExecuted =
+            std::numeric_limits<std::int32_t>::min();
+        const auto initialize_result = aclrtMemcpy(
             impl_->device_close_result,
             sizeof(*impl_->device_close_result),
             &kCloseNotExecuted, sizeof(kCloseNotExecuted),
             ACL_MEMCPY_HOST_TO_DEVICE);
-        if (copy_result != ACL_SUCCESS) {
-          close_status = AclFailure(
-              "aclrtMemcpy(AICPU close result initialize)", copy_result);
+        if (initialize_result != ACL_SUCCESS) {
+          impl_->MarkPreLaunchRetryable();
+          return AclFailure(
+              "aclrtMemcpy(AICPU close result initialize)",
+              initialize_result);
         }
-      }
-      close_args.result_address =
-          reinterpret_cast<std::uint64_t>(impl_->device_close_result);
-      if (close_status.ok()) {
+        close_args.result_address =
+            reinterpret_cast<std::uint64_t>(impl_->device_close_result);
         close_status = impl_->InvokeAicpu(
             &close_args, sizeof(close_args),
             offsetof(kvaf_urma_aicpu_close_args_v2, so_name),
             offsetof(kvaf_urma_aicpu_close_args_v2, kernel_name),
             "kvaf_direct_urma_close");
-      }
-      std::int32_t close_result = kCloseNotExecuted;
-      if (close_status.ok()) {
-        const auto copy_result = aclrtMemcpy(
-            &close_result, sizeof(close_result),
-            impl_->device_close_result,
-            sizeof(*impl_->device_close_result),
-            ACL_MEMCPY_DEVICE_TO_HOST);
-        if (copy_result != ACL_SUCCESS) {
-          close_status = AclFailure(
-              "aclrtMemcpy(AICPU close result)", copy_result);
-        } else if (close_result != 0) {
-          close_status = Status::Error(
-              StatusCode::kTransportError,
-              "AICPU direct URMA provider close failed, provider ret=" +
-                  std::to_string(close_result));
-        } else {
-          provider_was_closed = true;
+        if (!close_status.ok()) {
+          /*
+           * Once the runtime launch entry point was invoked, a nonzero launch
+           * result cannot prove that no task reached AICPU. A sync failure is
+           * equally ambiguous. Neither case is a same-session provider retry.
+           */
+          impl_->MarkUnsafeUnknown();
+          return close_status;
         }
+        impl_->MarkResultReadPending();
       }
-    } else {
-      close_status = Status::Error(
-          StatusCode::kTransportError,
-          "active AICPU provider lost its launch stream/runtime handle");
-    }
-    if (provider_was_closed) {
-      impl_->provider_active = false;
-    }
-    if (!close_status.ok()) {
-      return close_status;
+
+      if (impl_->device_close_result == nullptr) {
+        impl_->MarkUnsafeUnknown();
+        return Status::Error(
+            StatusCode::kTransportError,
+            "AICPU close result handle was lost after kernel launch");
+      }
+      std::int32_t close_result =
+          std::numeric_limits<std::int32_t>::min();
+      const auto copy_result = aclrtMemcpy(
+          &close_result, sizeof(close_result),
+          impl_->device_close_result,
+          sizeof(*impl_->device_close_result),
+          ACL_MEMCPY_DEVICE_TO_HOST);
+      if (copy_result != ACL_SUCCESS) {
+        /* Keep kAicpuResultPending: the next Close only rereads this buffer. */
+        impl_->MarkResultReadPending();
+        return AclFailure("aclrtMemcpy(AICPU close result)", copy_result);
+      }
+      if (close_result == KVAF_URMA_PROVIDER_CLOSE_RETRYABLE) {
+        impl_->MarkProviderRetryable();
+        return Status::Error(
+            StatusCode::kTransportError,
+            "AICPU direct URMA provider close is retryable");
+      }
+      if (close_result == KVAF_URMA_PROVIDER_CLOSE_OK) {
+        impl_->MarkProviderClosed();
+      } else {
+        impl_->MarkUnsafeUnknown();
+        return Status::Error(
+            StatusCode::kTransportError,
+            "AICPU direct URMA provider close is unsafe or unknown, ret=" +
+                std::to_string(close_result));
+      }
     }
   }
   impl_->opened = false;
+  impl_->close_phase = DirectUrmaClosePhase::kLocalCleanup;
+  impl_->close_disposition =
+      DirectUrmaCloseDisposition::kTransportComplete;
 
   // These tiny AICPU result buffers remain object-owned until provider
   // teardown is proven.  Clear a pointer only after aclrtFree succeeds so a
@@ -847,6 +994,9 @@ Status DirectUrmaResources::Close() {
   }
   impl_->closed = true;
   impl_->session_id = 0;
+  impl_->close_phase = DirectUrmaClosePhase::kComplete;
+  impl_->close_disposition =
+      DirectUrmaCloseDisposition::kTransportComplete;
   return Status::OK();
 }
 

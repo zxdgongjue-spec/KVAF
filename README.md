@@ -45,7 +45,10 @@ A5 后端默认关闭。两个 backend 都依赖 Ascend 950、CANN、bisheng 和
 的 Host/Device EID 对；HCOMM backend 额外依赖 HCOMM，direct backend
 从 `urma_perftest` 源码和 UB MicroBenchmark 实测 AIV ABI 构建
 Host/Device provider，
-并依赖系统 liburma/UDMA 和 AICPU provider 部署，不链接预编译
+并依赖内核 UDMA/UMMU、与驱动匹配的 full UMMU UAPI 和 AICPU provider
+部署；private liburma core 与 userspace UDMA/UMMU 均由源码编进 provider，
+并在编译期禁用动态 provider 扫描，不链接或加载系统 `liburma.so`、
+`liburma-udma.so`、`libummu.so` 或预编译
 `liburma_perftest.so`。
 
 ## 构建
@@ -73,22 +76,23 @@ bash scripts/build_a5_aiv_urma.sh
 构建不链接 HCOMM 的 direct URMA 路径：
 
 ```bash
+export KVAF_UMMU_UAPI_ROOT=/path/to/current-driver-source
 bash scripts/build_a5_direct_urma_provider.sh
 bash scripts/package_a5_direct_urma_aicpu.sh
 bash scripts/build_a5_direct_urma.sh
 ```
 
 构建成功后，正向硬件冒烟会从驱动自动解析当前物理设备的 Host/Device
-EID pair，不依赖其他代码仓。direct runner 还要求显式给出两端 UDMA
-device name 和 EID index（不能从 `pair_info` 安全推断）：
+EID pair，不依赖其他代码仓；随后按 EID 精确匹配 Host sysfs 与 Device
+`hccn_tool` inventory。可以显式给出两端 UDMA device name/EID index，但 runner
+仍会校验，不能从 NPU 号或 `pair_info` 猜测。当前 runner 还会在任何硬件访问前
+因 AICPU 多次 KFC 调用缺少正式 worker-affinity 契约而 fail closed；下列命令目前
+用于验证该门禁，不会创建 URMA/UMMU 资源：
 
 ```bash
 unset KVAF_HOST_EID KVAF_DEVICE_EID KVAF_PAIR_CHANNEL
 export KVAF_LOGICAL_DEVICE_ID=0
-export KVAF_HOST_URMA_DEVICE=<host-udma-name>
-export KVAF_HOST_EID_INDEX=<host-eid-index>
-export KVAF_DEVICE_URMA_DEVICE=<device-udma-name>
-export KVAF_DEVICE_EID_INDEX=<device-eid-index>
+export KVAF_PHYSICAL_DEVICE_ID=0
 bash scripts/run_a5_direct_urma_h2d_smoke.sh
 ```
 

@@ -65,6 +65,30 @@ enum kvaf_urma_provider_result_flag {
   // Resource creation or teardown returned without proof that every DMA
   // object was destroyed. The caller must retain backing memory until reset.
   KVAF_URMA_PROVIDER_CLEANUP_UNCERTAIN = 1U << 4,
+  // The provider retained the exact session and failed public handle. Calling
+  // Close again for the same session resumes checked teardown; backing memory
+  // must remain owned between attempts, but hardware reset is not yet implied.
+  KVAF_URMA_PROVIDER_CLEANUP_RETRYABLE = 1U << 5,
+};
+
+/*
+ * Runtime evidence carried in result.reserved[1..3].  A build manifest is
+ * necessary for artifact provenance, but it cannot prove that the loaded
+ * Host/AICPU instance actually selected the source-owned UDMA provider.
+ */
+#define KVAF_UDMA_SOURCE_CAPABILITY_MAGIC \
+  UINT64_C(0x4b56414655444d41) /* "KVAFUDMA" */
+#define KVAF_UDMA_TEARDOWN_SOURCE_OWNED_PARTIAL_RETRY_V1 \
+  UINT64_C(0x0000000000010001)
+#define KVAF_UDMA_TEARDOWN_SOURCE_OWNED_CHECKED_RETRYABLE_V1 \
+  UINT64_C(0x0000000000020001)
+
+enum kvaf_urma_provider_close_status {
+  KVAF_URMA_PROVIDER_CLOSE_OK = 0,
+  // The same provider instance still owns a precise retry cursor and handle.
+  KVAF_URMA_PROVIDER_CLOSE_RETRYABLE = 1,
+  // Ownership/protocol state is ambiguous. Retrying cannot prove quiescence.
+  KVAF_URMA_PROVIDER_CLOSE_UNSAFE = 2,
 };
 
 enum kvaf_urma_provider_status {
@@ -153,6 +177,10 @@ struct kvaf_urma_provider_result_v2 {
   uint32_t private_abi;
   uint64_t session_id;
   // reserved[0] carries the compile-time private-layout signature.
+  // reserved[1] is KVAF_UDMA_SOURCE_CAPABILITY_MAGIC.
+  // reserved[2] is the exact source-owned teardown capability.
+  // reserved[3] is the non-zero source/public URMA layout signature checked
+  // inside the provider before any URMA device is selected.
   uint64_t reserved[11];
 };
 

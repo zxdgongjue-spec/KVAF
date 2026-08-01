@@ -6,14 +6,10 @@ umask 077
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd -P)
 source "${SCRIPT_DIR}/a5_direct_urma_legacy_guard.sh"
+source "${SCRIPT_DIR}/a5_aicpu_affinity_guard.sh"
 kvaf_configure_direct_urma_state_paths "${ROOT_DIR}" || exit 2
 
 : "${ASCEND_HOME_PATH:?source the container CANN set_env.sh first}"
-: "${KVAF_HOST_URMA_DEVICE:?set the Host-side UDMA device name}"
-: "${KVAF_DEVICE_URMA_DEVICE:?set the AICPU-side UDMA device name}"
-: "${KVAF_HOST_EID_INDEX:?set the Host-side UDMA EID index}"
-: "${KVAF_DEVICE_EID_INDEX:?set the AICPU-side UDMA EID index}"
-
 KVAF_A5_DIRECT_BUILD_DIR=${KVAF_A5_DIRECT_BUILD_DIR:-"${ROOT_DIR}/build-a5-direct-urma"}
 KVAF_A5_DIRECT_BINARY=${KVAF_A5_DIRECT_BINARY:-"${KVAF_A5_DIRECT_BUILD_DIR}/access_operator/a5/kvaf_a5_aiv_direct_urma_h2d_smoke"}
 KVAF_A5_DIRECT_BUILD_MANIFEST=${KVAF_A5_DIRECT_BUILD_MANIFEST:-"${KVAF_A5_DIRECT_BUILD_DIR}/direct-smoke.manifest"}
@@ -29,8 +25,15 @@ KVAF_DURABLE_STATE_HELPER="${SCRIPT_DIR}/durable_state_file.py"
 KVAF_HOST_EID=${KVAF_HOST_EID:-}
 KVAF_DEVICE_EID=${KVAF_DEVICE_EID:-}
 KVAF_PAIR_CHANNEL=${KVAF_PAIR_CHANNEL:-}
+KVAF_HOST_URMA_DEVICE=${KVAF_HOST_URMA_DEVICE:-}
+KVAF_DEVICE_URMA_DEVICE=${KVAF_DEVICE_URMA_DEVICE:-}
+KVAF_HOST_EID_INDEX=${KVAF_HOST_EID_INDEX:-}
+KVAF_DEVICE_EID_INDEX=${KVAF_DEVICE_EID_INDEX:-}
 KVAF_EID_PROC_ROOT=${KVAF_EID_PROC_ROOT:-/proc/asdrv_ub}
 KVAF_EID_LOCK_TIMEOUT_SECONDS=${KVAF_EID_LOCK_TIMEOUT_SECONDS:-10}
+KVAF_UBCORE_SYSFS_ROOT=${KVAF_UBCORE_SYSFS_ROOT:-/sys/class/ubcore}
+KVAF_HCCN_TOOL=${KVAF_HCCN_TOOL:-}
+KVAF_HCCN_TIMEOUT_SECONDS=${KVAF_HCCN_TIMEOUT_SECONDS:-30}
 KVAF_LOGICAL_DEVICE_ID=${KVAF_LOGICAL_DEVICE_ID:-0}
 KVAF_PHYSICAL_DEVICE_ID=${KVAF_PHYSICAL_DEVICE_ID:-}
 KVAF_DIRECT_CONTROL_PORT=${KVAF_DIRECT_CONTROL_PORT:-21115}
@@ -39,7 +42,6 @@ KVAF_H2D_TIMEOUT_SECONDS=${KVAF_H2D_TIMEOUT_SECONDS:-120}
 KVAF_DIRECT_SERVER_START_DELAY_SECONDS=${KVAF_DIRECT_SERVER_START_DELAY_SECONDS:-1}
 KVAF_A5_RUN_TAG=${KVAF_A5_RUN_TAG:-$(date +%Y%m%d_%H%M%S)_$$}
 KVAF_A5_RESULT_DIR=${KVAF_A5_RESULT_DIR:-"${KVAF_DIRECT_RESULT_ROOT}/a5_direct_urma_h2d_${KVAF_A5_RUN_TAG}"}
-KVAF_DIRECT_ALLOW_UNVERIFIED_UDMA_TEARDOWN=${KVAF_DIRECT_ALLOW_UNVERIFIED_UDMA_TEARDOWN:-0}
 KVAF_DIRECT_ALLOW_BUSY_NPU=${KVAF_DIRECT_ALLOW_BUSY_NPU:-0}
 KVAF_NPU_SMI_TIMEOUT_SECONDS=${KVAF_NPU_SMI_TIMEOUT_SECONDS:-15}
 KVAF_ASCEND_HAL_LIBRARY=/usr/local/Ascend/driver/lib64/driver/libascend_hal.so
@@ -135,8 +137,9 @@ durably_remove_state()
 
 verify_runtime_manifest()
 {
-  local prefix path expected actual
-  for prefix in urma_library urma_common_library udma_provider_library; do
+  local prefix path expected actual abi abi_sha probe_filename probe_output
+  local probe_path probe_sha
+  for prefix in urma_library urma_common_library; do
     path=$(manifest_value "${prefix}_path" \
       "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") ||
       return 1
@@ -147,6 +150,38 @@ verify_runtime_manifest()
     actual=$(sha256sum "${path}" | awk '{print $1}')
     [[ "${actual}" == "${expected}" ]] || return 1
   done
+
+  path=$(manifest_value ummu_uapi_header_path \
+    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
+  expected=$(manifest_value ummu_uapi_header_sha256 \
+    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
+  [[ -r "${path}" ]] || return 1
+  actual=$(sha256sum "${path}" | awk '{print $1}')
+  [[ "${actual}" == "${expected}" ]] || return 1
+
+  abi=$(manifest_value ummu_uapi_abi \
+    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
+  abi_sha=$(manifest_value ummu_uapi_abi_sha256 \
+    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
+  [[ "${abi}" =~ ^tid_info_size:[1-9][0-9]*,tid_offset:[0-9]+,hw_cap_offset:[0-9]+,va_offset:[0-9]+,size_offset:[0-9]+,alloc_tid:0x[0-9a-f]{16},free_tid:0x[0-9a-f]{16},plbi_va:0x[0-9a-f]{16},plbi_all:0x[0-9a-f]{16},cap_expan:0x[0-9a-f]{16},cap_double_plbi:0x[0-9a-f]{16},cap_kcmd_plbi:0x[0-9a-f]{16}$ ]] ||
+    return 1
+  actual=$(
+    printf 'KVAF_UMMU_UAPI_ABI=%s\n' "${abi}" | sha256sum | awk '{print $1}'
+  )
+  [[ "${actual}" == "${abi_sha}" ]] || return 1
+
+  probe_filename=$(manifest_value ummu_uapi_probe_filename \
+    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
+  [[ "${probe_filename}" == kvaf_ummu_uapi_probe ]] || return 1
+  probe_path="${KVAF_DIRECT_PROVIDER_BUILD_DIR}/${probe_filename}"
+  [[ ! -L "${probe_path}" && -f "${probe_path}" && -x "${probe_path}" ]] ||
+    return 1
+  probe_sha=$(manifest_value ummu_uapi_probe_sha256 \
+    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
+  actual=$(sha256sum "${probe_path}" | awk '{print $1}')
+  [[ "${actual}" == "${probe_sha}" ]] || return 1
+  probe_output=$("${probe_path}") || return 1
+  [[ "${probe_output}" == "KVAF_UMMU_UAPI_ABI=${abi}" ]]
 }
 
 verify_provider_role_manifest()
@@ -181,10 +216,9 @@ verify_provider_runtime_resolution()
 {
   local label=$1
   local provider=$2
-  local ldd_output resolved_urma resolved_common
-  local actual_urma actual_common expected_urma expected_common
-  local expected_urma_sha expected_common_sha
-  local actual_urma_sha actual_common_sha
+  local ldd_output resolved_common
+  local actual_common expected_common
+  local expected_common_sha actual_common_sha
 
   if ! ldd_output=$(ldd -r "${provider}" 2>&1); then
     echo "${ldd_output}" >&2
@@ -196,36 +230,26 @@ verify_provider_runtime_resolution()
     echo "ERROR: ${label} provider has unresolved runtime dependencies" >&2
     return 1
   fi
-  resolved_urma=$(ldd_resolved_path liburma.so \
-    <<<"${ldd_output}") || {
-    echo "ERROR: ldd did not resolve exactly one ${label} liburma" >&2
+  if grep -Eq 'lib(urma|ummu|urma-udma)\.so' <<<"${ldd_output}"; then
+    echo "${ldd_output}" >&2
+    echo "ERROR: ${label} provider resolves external liburma/UDMA/UMMU code" >&2
     return 1
-  }
+  fi
   resolved_common=$(ldd_resolved_path liburma_common.so \
     <<<"${ldd_output}") || {
     echo "ERROR: ldd did not resolve exactly one ${label} liburma_common" >&2
     return 1
   }
-  actual_urma=$(realpath -e "${resolved_urma}") || return 1
   actual_common=$(realpath -e "${resolved_common}") || return 1
-  expected_urma=$(manifest_value urma_library_path \
-    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
   expected_common=$(manifest_value urma_common_library_path \
-    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
-  expected_urma_sha=$(manifest_value urma_library_sha256 \
     "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
   expected_common_sha=$(manifest_value urma_common_library_sha256 \
     "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
-  actual_urma_sha=$(sha256sum "${actual_urma}" | awk '{print $1}') ||
-    return 1
   actual_common_sha=$(sha256sum "${actual_common}" | awk '{print $1}') ||
     return 1
-  if [[ "${actual_urma}" != "${expected_urma}" ||
-        "${actual_common}" != "${expected_common}" ||
-        "${actual_urma_sha}" != "${expected_urma_sha}" ||
+  if [[ "${actual_common}" != "${expected_common}" ||
         "${actual_common_sha}" != "${expected_common_sha}" ]]; then
     echo "ERROR: ${label} provider runtime resolution differs from the build manifest" >&2
-    echo "RESOLVED_LIBURMA=${actual_urma}" >&2
     echo "RESOLVED_LIBURMA_COMMON=${actual_common}" >&2
     return 1
   fi
@@ -563,10 +587,6 @@ acquire_persistent_session_guards()
 
 require_uint_max KVAF_LOGICAL_DEVICE_ID \
   "${KVAF_LOGICAL_DEVICE_ID}" 4294967295
-require_uint_max KVAF_HOST_EID_INDEX \
-  "${KVAF_HOST_EID_INDEX}" 4294967295
-require_uint_max KVAF_DEVICE_EID_INDEX \
-  "${KVAF_DEVICE_EID_INDEX}" 4294967295
 require_uint_max KVAF_DIRECT_CONTROL_PORT \
   "${KVAF_DIRECT_CONTROL_PORT}" 65535
 require_uint_max KVAF_H2D_BYTES "${KVAF_H2D_BYTES}" 67108864
@@ -578,11 +598,8 @@ require_uint KVAF_DIRECT_SERVER_START_DELAY_SECONDS \
   "${KVAF_DIRECT_SERVER_START_DELAY_SECONDS}"
 require_uint_max KVAF_NPU_SMI_TIMEOUT_SECONDS \
   "${KVAF_NPU_SMI_TIMEOUT_SECONDS}" 120
-if [[ "${KVAF_DIRECT_ALLOW_UNVERIFIED_UDMA_TEARDOWN}" != 0 &&
-      "${KVAF_DIRECT_ALLOW_UNVERIFIED_UDMA_TEARDOWN}" != 1 ]]; then
-  echo "ERROR: KVAF_DIRECT_ALLOW_UNVERIFIED_UDMA_TEARDOWN must be 0 or 1" >&2
-  exit 2
-fi
+require_uint_max KVAF_HCCN_TIMEOUT_SECONDS \
+  "${KVAF_HCCN_TIMEOUT_SECONDS}" 120
 if [[ "${KVAF_DIRECT_ALLOW_BUSY_NPU}" != 0 &&
       "${KVAF_DIRECT_ALLOW_BUSY_NPU}" != 1 ]]; then
   echo "ERROR: KVAF_DIRECT_ALLOW_BUSY_NPU must be 0 or 1" >&2
@@ -612,13 +629,8 @@ if (( KVAF_NPU_SMI_TIMEOUT_SECONDS == 0 )); then
   echo "ERROR: KVAF_NPU_SMI_TIMEOUT_SECONDS must be in [1, 120]" >&2
   exit 2
 fi
-if [[ "${KVAF_HOST_URMA_DEVICE}" == */* ||
-      "${KVAF_DEVICE_URMA_DEVICE}" == */* ||
-      ${#KVAF_HOST_URMA_DEVICE} -ge 32 ||
-      ${#KVAF_DEVICE_URMA_DEVICE} -ge 32 ||
-      ! "${KVAF_HOST_URMA_DEVICE}" =~ ^[A-Za-z0-9._:-]+$ ||
-      ! "${KVAF_DEVICE_URMA_DEVICE}" =~ ^[A-Za-z0-9._:-]+$ ]]; then
-  echo "ERROR: UDMA device names must be safe basenames shorter than 32 bytes" >&2
+if (( KVAF_HCCN_TIMEOUT_SECONDS == 0 )); then
+  echo "ERROR: KVAF_HCCN_TIMEOUT_SECONDS must be in [1, 120]" >&2
   exit 2
 fi
 if [[ ! "${KVAF_A5_RUN_TAG}" =~ ^[A-Za-z0-9._-]{1,96}$ ]]; then
@@ -648,6 +660,13 @@ command -v realpath >/dev/null 2>&1 || {
 # unsafe run must be reported without touching ACL, npu-smi, or the
 # host-global /proc/asdrv_ub/dev_id selector again.
 acquire_persistent_session_guards
+
+# Recovery above must remain available even while new hardware runs are
+# blocked.  For a new run, however, this ownership proof must precede every
+# EID selector, topology query, npu-smi call, ACL context, AICPU launch and
+# URMA/UMMU allocation.  The public KFC ABI does not currently provide such a
+# proof, so the source-owned guard fails closed without an operator override.
+kvaf_require_aicpu_affinity_contract || exit $?
 
 kvaf_result_candidate=$(realpath -m "${KVAF_A5_RESULT_DIR}")
 kvaf_result_parent=${kvaf_result_candidate%/*}
@@ -741,6 +760,118 @@ if [[ "${host_eid}" == "${device_eid}" ]]; then
   echo "ERROR: Host and Device EIDs must be different" >&2
   exit 2
 fi
+
+endpoint_resolver_args=(
+  --physical-device-id "${KVAF_PHYSICAL_DEVICE_ID}"
+  --host-eid "${host_eid}"
+  --device-eid "${device_eid}"
+  --ubcore-root "${KVAF_UBCORE_SYSFS_ROOT}"
+  --hccn-timeout-seconds "${KVAF_HCCN_TIMEOUT_SECONDS}"
+  --shell
+)
+if [[ -n "${KVAF_HCCN_TOOL}" ]]; then
+  endpoint_resolver_args+=(--hccn-tool "${KVAF_HCCN_TOOL}")
+fi
+if ! endpoint_output=$(
+  python3 "${SCRIPT_DIR}/resolve_a5_urma_endpoints.py" \
+    "${endpoint_resolver_args[@]}"
+); then
+  echo "ERROR: automatic A5 UDMA endpoint discovery failed" >&2
+  echo "No Host/Device DDR, HBM, URMA, SQ, or CQ resource was created." >&2
+  exit 2
+fi
+
+resolved_host_urma_device=
+resolved_device_urma_device=
+resolved_host_eid_index=
+resolved_device_eid_index=
+seen_host_urma_device=0
+seen_device_urma_device=0
+seen_host_eid_index=0
+seen_device_eid_index=0
+while IFS='=' read -r key value; do
+  case "${key}" in
+    KVAF_HOST_URMA_DEVICE)
+      (( seen_host_urma_device == 0 )) || {
+        echo "ERROR: endpoint resolver returned duplicate KVAF_HOST_URMA_DEVICE" >&2
+        exit 2
+      }
+      resolved_host_urma_device=${value}
+      seen_host_urma_device=1
+      ;;
+    KVAF_DEVICE_URMA_DEVICE)
+      (( seen_device_urma_device == 0 )) || {
+        echo "ERROR: endpoint resolver returned duplicate KVAF_DEVICE_URMA_DEVICE" >&2
+        exit 2
+      }
+      resolved_device_urma_device=${value}
+      seen_device_urma_device=1
+      ;;
+    KVAF_HOST_EID_INDEX)
+      (( seen_host_eid_index == 0 )) || {
+        echo "ERROR: endpoint resolver returned duplicate KVAF_HOST_EID_INDEX" >&2
+        exit 2
+      }
+      resolved_host_eid_index=${value}
+      seen_host_eid_index=1
+      ;;
+    KVAF_DEVICE_EID_INDEX)
+      (( seen_device_eid_index == 0 )) || {
+        echo "ERROR: endpoint resolver returned duplicate KVAF_DEVICE_EID_INDEX" >&2
+        exit 2
+      }
+      resolved_device_eid_index=${value}
+      seen_device_eid_index=1
+      ;;
+    *)
+      echo "ERROR: unknown UDMA endpoint resolver output: ${key}" >&2
+      exit 2
+      ;;
+  esac
+done <<<"${endpoint_output}"
+if (( seen_host_urma_device == 0 ||
+      seen_device_urma_device == 0 ||
+      seen_host_eid_index == 0 ||
+      seen_device_eid_index == 0 )); then
+  echo "ERROR: UDMA endpoint resolver output is incomplete" >&2
+  exit 2
+fi
+
+for endpoint_variable in \
+  KVAF_HOST_URMA_DEVICE \
+  KVAF_DEVICE_URMA_DEVICE \
+  KVAF_HOST_EID_INDEX \
+  KVAF_DEVICE_EID_INDEX
+do
+  case "${endpoint_variable}" in
+    KVAF_HOST_URMA_DEVICE) resolved_value=${resolved_host_urma_device} ;;
+    KVAF_DEVICE_URMA_DEVICE) resolved_value=${resolved_device_urma_device} ;;
+    KVAF_HOST_EID_INDEX) resolved_value=${resolved_host_eid_index} ;;
+    KVAF_DEVICE_EID_INDEX) resolved_value=${resolved_device_eid_index} ;;
+  esac
+  if [[ -n "${!endpoint_variable}" &&
+        "${!endpoint_variable}" != "${resolved_value}" ]]; then
+    echo "ERROR: ${endpoint_variable}=${!endpoint_variable} disagrees with the exact EID match ${resolved_value}" >&2
+    echo "Unset the four KVAF_*URMA_DEVICE/KVAF_*EID_INDEX overrides and retry." >&2
+    exit 2
+  fi
+  printf -v "${endpoint_variable}" '%s' "${resolved_value}"
+done
+
+require_uint_max KVAF_HOST_EID_INDEX \
+  "${KVAF_HOST_EID_INDEX}" 4294967295
+require_uint_max KVAF_DEVICE_EID_INDEX \
+  "${KVAF_DEVICE_EID_INDEX}" 4294967295
+if [[ "${KVAF_HOST_URMA_DEVICE}" == */* ||
+      "${KVAF_DEVICE_URMA_DEVICE}" == */* ||
+      ${#KVAF_HOST_URMA_DEVICE} -ge 32 ||
+      ${#KVAF_DEVICE_URMA_DEVICE} -ge 32 ||
+      ! "${KVAF_HOST_URMA_DEVICE}" =~ ^[A-Za-z0-9._:-]+$ ||
+      ! "${KVAF_DEVICE_URMA_DEVICE}" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+  echo "ERROR: resolved UDMA names must be safe basenames shorter than 32 bytes" >&2
+  exit 2
+fi
+echo "KVAF_A5_URMA_ENDPOINTS_RESOLVED source=host_sysfs+hccn_tool host=${KVAF_HOST_URMA_DEVICE}/eid${KVAF_HOST_EID_INDEX} device=${KVAF_DEVICE_URMA_DEVICE}/eid${KVAF_DEVICE_EID_INDEX}"
 
 # The ABI-pinned accessor exports the normal userspace qbuf geometry and
 # deliberately rejects reserved-SQ contexts.  The device-address and queue
@@ -908,6 +1039,14 @@ for role_binding in \
   'device_provider_execution_domain=aicpu' \
   'device_private_abi=2' \
   'device_private_abi_name=perftest-aiv-v1-device' \
+  'udma_provider_mode=source-built-internal' \
+  'urma_core_mode=source-linked-no-dynamic-providers' \
+  'urma_library_linkage=abi-reference-only' \
+  'udma_source_capability_magic=0x4b56414655444d41' \
+  'udma_runtime_capability=0x0000000000020001' \
+  'ummu_provider_mode=source-built-internal' \
+  'ummu_source_capability_magic=0x4b564146554d4d55' \
+  'ummu_runtime_capability=0x0000000000010001' \
   'reference_perftest_abi=perftest-aiv-v1'
 do
   role_key=${role_binding%%=*}
@@ -927,20 +1066,9 @@ case "${udma_teardown_contract}" in
   checked-retryable-v1)
     kvaf_teardown_assurance=verified
     ;;
-  unverified-system-provider)
-    kvaf_teardown_assurance=experimental-unverified
-    if [[ "${KVAF_DIRECT_ALLOW_UNVERIFIED_UDMA_TEARDOWN}" != 1 ]]; then
-      echo "ERROR: the selected system liburma-udma does not provide checked, retryable teardown" >&2
-      echo "No DDR/HBM/URMA resource has been armed." >&2
-      echo "For exploratory data-path testing only, explicitly set:" >&2
-      echo "  export KVAF_DIRECT_ALLOW_UNVERIFIED_UDMA_TEARDOWN=1" >&2
-      exit 2
-    fi
-    echo "WARNING: exploratory run uses an unverified system UDMA teardown" >&2
-    echo "WARNING: a lower-level ungrant/free failure may still require isolation" >&2
-    ;;
   *)
-    echo "ERROR: unsupported UDMA teardown contract: ${udma_teardown_contract}" >&2
+    echo "ERROR: provider does not prove checked source-owned UDMA/UMMU teardown: ${udma_teardown_contract}" >&2
+    echo "No DDR/HBM/URMA resource has been armed." >&2
     exit 2
     ;;
 esac
@@ -950,7 +1078,7 @@ if ! sha256sum -c "${KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST}" \
   exit 2
 fi
 if ! verify_runtime_manifest; then
-  echo "ERROR: pinned liburma/liburma_common/liburma-udma changed" >&2
+  echo "ERROR: pinned liburma/liburma_common/full UMMU UAPI or ABI probe changed" >&2
   exit 2
 fi
 if [[ ! -r "${KVAF_DIRECT_AICPU_ARCHIVE}" ]]; then
@@ -1025,9 +1153,10 @@ for provider in \
   "${KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY}"
 do
   provider_dynamic=$(readelf -d "${provider}")
-  if grep -Eq 'lib(hcomm|urma_perftest)' <<<"${provider_dynamic}" ||
+  if grep -Eq 'lib(hcomm|urma_perftest|urma|urma-udma|ummu)\.so' \
+      <<<"${provider_dynamic}" ||
      grep -Eq '\((RPATH|RUNPATH)\)' <<<"${provider_dynamic}"; then
-    echo "ERROR: provider links HCOMM/prebuilt perftest or has RPATH" >&2
+    echo "ERROR: provider links HCOMM/prebuilt perftest/external UDMA/UMMU or has RPATH" >&2
     exit 2
   fi
   provider_symbols=$(nm -D --defined-only "${provider}")

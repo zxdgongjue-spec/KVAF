@@ -727,33 +727,62 @@ bool CheckStatus(const Status& status, const char* operation) {
 bool CloseProviderWithRetry(DirectUrmaResources* resources,
                             const char* operation,
                             bool* local_cleanup_complete = nullptr) {
+  constexpr std::uint64_t kFastRetryAttempts = 1000;
+  constexpr std::uint64_t kFastRetryLogInterval = 100;
+  constexpr std::uint64_t kSlowRetryLogInterval = 600;
+  constexpr auto kFastRetryInterval = std::chrono::milliseconds(10);
+  constexpr auto kSlowRetryInterval = std::chrono::milliseconds(100);
   if (local_cleanup_complete != nullptr) {
     *local_cleanup_complete = false;
   }
-  auto status = resources->Close();
-  if (status.ok()) {
-    if (local_cleanup_complete != nullptr) {
-      *local_cleanup_complete = true;
+  Status status = Status::Error(
+      kvaf::StatusCode::kTransportError,
+      "checked provider Close was not attempted");
+  for (std::uint64_t attempt = 1;; ++attempt) {
+    status = resources->Close();
+    if (status.ok()) {
+      if (local_cleanup_complete != nullptr) {
+        *local_cleanup_complete = true;
+      }
+      return true;
     }
-    return true;
-  }
-  std::cerr << operation << " failed: " << status.message()
-            << "; retrying once without releasing backing memory\n";
-  status = resources->Close();
-  if (status.ok()) {
-    if (local_cleanup_complete != nullptr) {
-      *local_cleanup_complete = true;
+    if (resources->transport_teardown_complete()) {
+      std::cerr << operation << " transport is closed, but local control "
+                << "cleanup remains incomplete: " << status.message()
+                << '\n';
+      return true;
     }
-    return true;
+    if (!resources->transport_teardown_retryable()) {
+      std::cerr << operation << " is not safely retryable: "
+                << status.message()
+                << "; retaining all backing memory\n";
+      return false;
+    }
+    const bool fast_retry = attempt <= kFastRetryAttempts;
+    const bool log_retry =
+        attempt == 1 ||
+        (fast_retry && attempt % kFastRetryLogInterval == 0) ||
+        (!fast_retry &&
+         (attempt - kFastRetryAttempts) % kSlowRetryLogInterval == 0);
+    if (log_retry) {
+      std::cerr << operation << " attempt " << attempt
+                << " did not complete: " << status.message()
+                << "; retaining backing memory and resuming the same "
+                   "session";
+      if (!fast_retry) {
+        std::cerr << " at the slow retry cadence";
+      }
+      std::cerr << '\n';
+    }
+    // A checked RETRYABLE result is not made unsafe by elapsed wall time.
+    // Keep this worker, its provider instance, and every exact teardown
+    // handle alive until the same-session cursor converges or reports an
+    // explicit unknown/unsafe state.  The runner has a separate bounded
+    // wait: after that bound it retains the active-session lock and exits 5,
+    // but deliberately does not kill this worker.
+    std::this_thread::sleep_for(
+        fast_retry ? kFastRetryInterval : kSlowRetryInterval);
   }
-  if (resources->transport_teardown_complete()) {
-    std::cerr << operation << " transport is closed, but local control "
-              << "cleanup remains incomplete: " << status.message() << '\n';
-    return true;
-  }
-  std::cerr << operation << " retry failed: " << status.message()
-            << "; backing memory will be retained until process exit\n";
-  return false;
 }
 
 DirectUrmaOpenSpec MakeHostOpenSpec(
@@ -1713,7 +1742,7 @@ EndpointResult RunDevice(const Options& options) {
 }
 
 bool TryRecoverRetainedAfterException(
-    EndpointResult* recovered_result) {
+    const Options& options, EndpointResult* recovered_result) {
   if (recovered_result == nullptr) {
     return false;
   }
@@ -1734,6 +1763,37 @@ bool TryRecoverRetainedAfterException(
           &provider_local_cleanup_complete);
   if (!provider_closed) {
     return false;
+  }
+
+  if (g_retained_endpoint.mapping != nullptr) {
+    /*
+     * Closing the Host provider proves only this process's local transport
+     * teardown.  The Device may still own an imported segment or have DMA in
+     * flight against the registered Host DDR.  The ordinary Host path waits
+     * for the nonce-bound Device close proof before halHostUnregister and
+     * halMemFree; an exception must preserve that same cross-endpoint rule.
+     *
+     * Do not wait or infer safety here: the exception path has already left
+     * the normal handshake.  If exact proof is not durably visible now, keep
+     * the mapping in g_retained_endpoint and let the existing FAIL_UNSAFE
+     * quarantine retain the owning process and backing memory.
+     */
+    if (options.role != "host") {
+      return false;
+    }
+    const auto device_done =
+        JoinPath(options.exchange_dir, "device.done");
+    const auto provider_closed_pass =
+        ControlMarker(options, "provider_closed", "PASS");
+    const bool device_teardown_safe =
+        ReadExactMarker(device_done, provider_closed_pass.c_str()) ||
+        ValidDeviceSafeAbortProof(options);
+    if (!device_teardown_safe) {
+      std::cerr
+          << "Host exception cleanup lacks nonce-bound Device provider-close "
+             "proof; retaining Host DDR mapping\n";
+      return false;
+    }
   }
 
   bool mapping_local_cleanup_complete = true;
@@ -1831,7 +1891,8 @@ int main(int argc, char** argv) {
     std::cerr << "unexpected C++ exception while endpoint owns resources: "
               << error.what() << '\n';
     try {
-      if (TryRecoverRetainedAfterException(&recovered_exception)) {
+      if (TryRecoverRetainedAfterException(
+              options, &recovered_exception)) {
         result = std::move(recovered_exception);
       }
     } catch (...) {
@@ -1841,7 +1902,8 @@ int main(int argc, char** argv) {
   } catch (...) {
     std::cerr << "unknown exception while endpoint owns resources\n";
     try {
-      if (TryRecoverRetainedAfterException(&recovered_exception)) {
+      if (TryRecoverRetainedAfterException(
+              options, &recovered_exception)) {
         result = std::move(recovered_exception);
       }
     } catch (...) {

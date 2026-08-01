@@ -15,6 +15,8 @@
 #include "perftest_resources.h"
 #include "kvaf_private_udma_accessor.h"
 #include "kvaf_source_matched_perftest.h"
+#include "kvaf_source_matched_udma.h"
+#include "kvaf_source_matched_ummu.h"
 
 #define KVAF_PROVIDER_JETTYS 1U
 #define KVAF_PROVIDER_PAGE_SIZE 4096U
@@ -28,10 +30,12 @@ static perftest_context_t g_kvaf_context;
 static bool g_kvaf_config_initialized;
 static bool g_kvaf_connection_open;
 static bool g_kvaf_context_open;
+static bool g_kvaf_runtime_acquired;
 static bool g_kvaf_cleanup_poisoned;
 static uint64_t g_kvaf_session_id;
 static uint64_t g_kvaf_last_closed_session_id;
 static struct kvaf_udma_direct_queue_info g_kvaf_queue_info;
+static struct kvaf_perftest_teardown_state g_kvaf_teardown_state;
 static pthread_mutex_t g_kvaf_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static bool kvaf_is_power_of_two(uint32_t value)
@@ -221,12 +225,45 @@ static int kvaf_parse_config(
     return perftest_parse_args(argc, argv, &g_kvaf_config);
 }
 
+static bool kvaf_ummu_checked_runtime_is_armed(void)
+{
+    struct kvaf_source_ummu_status status = {
+        .structure_size = sizeof(status),
+    };
+    const uint64_t expected_capability =
+        KVAF_SOURCE_UMMU_CHECKED_RETRYABLE_V1 |
+        KVAF_SOURCE_UMMU_PINNED_FULL_UAPI;
+
+    /*
+     * Do not advertise the checked UDMA teardown capability merely because
+     * the provider was compiled with the private UMMU object.  Prove that
+     * the running instance exposes the pinned full-UAPI contract and that
+     * the just-created TID has no deferred or state-unknown cleanup work.
+     */
+    return kvaf_source_ummu_checked_contract_ready() == 1 &&
+        kvaf_source_ummu_get_status(&status) == 0 &&
+        status.abi_version == KVAF_SOURCE_UMMU_STATUS_ABI_VERSION &&
+        status.structure_size == sizeof(status) &&
+        status.capability_magic == KVAF_SOURCE_UMMU_CAPABILITY_MAGIC &&
+        status.capability_bits == expected_capability &&
+        status.live_tid_count != 0U &&
+        status.pending_operation_count == 0U &&
+        status.retained_mapping_count == 0U &&
+        status.last_state_unknown == 0U;
+}
+
 static bool kvaf_context_is_complete(
     const struct kvaf_urma_provider_config_v2 *config)
 {
     uint32_t expected_private_abi;
 
     if (g_kvaf_context.urma_ctx == NULL ||
+        kvaf_udma_source_provider_is_registered() != 1 ||
+        !kvaf_ummu_checked_runtime_is_armed() ||
+        kvaf_udma_source_public_abi_matches(
+            kvaf_urma_public_abi_signature()) != 1 ||
+        kvaf_udma_source_provider_owns_context(
+            g_kvaf_context.urma_ctx) != 1 ||
         g_kvaf_context.jetty_num != KVAF_PROVIDER_JETTYS ||
         g_kvaf_context.local_buf == NULL ||
         g_kvaf_context.local_buf[0] !=
@@ -317,6 +354,7 @@ static int kvaf_fill_result(
     if (!kvaf_is_power_of_two(raw_sq_depth) ||
         !kvaf_is_power_of_two(
             g_kvaf_queue_info.cq_baseblock_count) ||
+        !kvaf_ummu_checked_runtime_is_armed() ||
         !kvaf_remote_eid_is_nonzero(
             g_kvaf_context.import_tjetty[0]->id.eid.raw)) {
         kvaf_init_result(result,
@@ -377,6 +415,17 @@ static int kvaf_fill_result(
     result->private_abi = g_kvaf_queue_info.private_abi;
     result->session_id = g_kvaf_session_id;
     result->reserved[0] = g_kvaf_queue_info.layout_signature;
+    /*
+     * Runtime evidence, not a build-manifest assertion: owns_context() and
+     * the source UMMU status/capability were checked immediately before the
+     * private queue accessor/result were accepted. Consumers must require
+     * both words before assigning any teardown assurance.
+     */
+    result->reserved[1] = KVAF_UDMA_SOURCE_CAPABILITY_MAGIC;
+    result->reserved[2] =
+        KVAF_UDMA_TEARDOWN_RUNTIME_CAPABILITY;
+    result->reserved[3] =
+        kvaf_udma_source_public_abi_signature();
     (void)memcpy(result->remote_eid,
         g_kvaf_context.import_tjetty[0]->id.eid.raw,
         sizeof(result->remote_eid));
@@ -400,11 +449,44 @@ static int kvaf_quiesce_aiv_queue(uint32_t final_sq_head,
 
 static int kvaf_close_unlocked(uint64_t session_id);
 
+static bool kvaf_source_ummu_state_is_unknown(void)
+{
+    struct kvaf_source_ummu_status status = {
+        .structure_size = sizeof(status),
+    };
+
+    return kvaf_source_ummu_get_status(&status) != 0 ||
+        status.last_state_unknown != 0U;
+}
+
+static bool kvaf_udma_source_has_no_live_resources(void)
+{
+    struct kvaf_source_ummu_status ummu_status = {
+        .structure_size = sizeof(ummu_status),
+    };
+
+    /* Open can fail before exposing a context handle; drain that sidecar
+     * before consulting any ordinary live-resource counter. */
+    return kvaf_udma_source_retry_orphan_contexts() == 0 &&
+        kvaf_udma_source_live_segment_count() == 0U &&
+        kvaf_udma_source_live_token_count() == 0U &&
+        kvaf_udma_source_live_jetty_count() == 0U &&
+        kvaf_udma_source_live_jfc_count() == 0U &&
+        kvaf_udma_source_live_context_count() == 0U &&
+        kvaf_source_ummu_checked_contract_ready() == 1 &&
+        kvaf_source_ummu_get_status(&ummu_status) == 0 &&
+        ummu_status.last_state_unknown == 0U &&
+        kvaf_source_ummu_live_tid_count() == 0U &&
+        kvaf_source_ummu_pending_operation_count() == 0U &&
+        kvaf_source_ummu_retained_mapping_count() == 0U;
+}
+
 int kvaf_urma_provider_open_v2(
     const struct kvaf_urma_provider_config_v2 *config,
     struct kvaf_urma_provider_result_v2 *result)
 {
     int ret;
+    int ready_status;
 
     if (result == NULL) {
         return -1;
@@ -418,8 +500,17 @@ int kvaf_urma_provider_open_v2(
         return -1;
     }
     if (g_kvaf_config_initialized || g_kvaf_connection_open ||
-        g_kvaf_context_open || g_kvaf_cleanup_poisoned) {
+        g_kvaf_context_open || g_kvaf_runtime_acquired ||
+        g_kvaf_cleanup_poisoned) {
         kvaf_init_result(result, KVAF_URMA_PROVIDER_ALREADY_OPEN, -1);
+        (void)pthread_mutex_unlock(&g_kvaf_lock);
+        return -1;
+    }
+    /* Validate the public layout before urma_init discovers any device. */
+    if (kvaf_udma_source_public_abi_matches(
+            kvaf_urma_public_abi_signature()) != 1) {
+        kvaf_init_result(result,
+            KVAF_URMA_PROVIDER_RESOURCE_INCOMPATIBLE, -1);
         (void)pthread_mutex_unlock(&g_kvaf_lock);
         return -1;
     }
@@ -428,6 +519,7 @@ int kvaf_urma_provider_open_v2(
     (void)memset(&g_kvaf_config, 0, sizeof(g_kvaf_config));
     (void)memset(&g_kvaf_context, 0, sizeof(g_kvaf_context));
     (void)memset(&g_kvaf_queue_info, 0, sizeof(g_kvaf_queue_info));
+    kvaf_perftest_teardown_state_init(&g_kvaf_teardown_state);
     ret = kvaf_parse_config(config);
     g_kvaf_config_initialized = true;
     if (ret != 0) {
@@ -471,15 +563,31 @@ int kvaf_urma_provider_open_v2(
         goto fail;
     }
 
+    ret = kvaf_udma_source_runtime_init();
+    g_kvaf_runtime_acquired = ret == 0;
+    if (kvaf_perftest_confirm_runtime_ready(
+            &g_kvaf_config, ret) != KVAF_PERFTEST_CHECKED_OK) {
+        kvaf_init_result(result,
+            KVAF_URMA_PROVIDER_RESOURCE_CREATE_FAILED, ret);
+        goto fail;
+    }
+
     g_kvaf_config.dev_buf = (void *)(uintptr_t)config->local_address;
     ret = kvaf_perftest_create_duplex_ctx_checked(
         &g_kvaf_context, &g_kvaf_config);
-    g_kvaf_context_open = ret == KVAF_PERFTEST_CHECKED_OK;
-    if (!g_kvaf_context_open) {
-        g_kvaf_cleanup_poisoned = true;
+    /*
+     * Even a synchronized partial creation may own a context, queue or MR.
+     * Route it through the checked phase machine instead of hiding it behind
+     * a false context_open value.
+     */
+    g_kvaf_context_open = true;
+    if (ret != KVAF_PERFTEST_CHECKED_OK) {
         kvaf_init_result(result,
             KVAF_URMA_PROVIDER_RESOURCE_CREATE_FAILED, ret);
-        result->flags |= KVAF_URMA_PROVIDER_CLEANUP_UNCERTAIN;
+        if (ret != KVAF_PERFTEST_CHECKED_CREATE_CLEANUP_REQUIRED) {
+            g_kvaf_cleanup_poisoned = true;
+            result->flags |= KVAF_URMA_PROVIDER_CLEANUP_UNCERTAIN;
+        }
         goto fail;
     }
     ret = 0;
@@ -490,23 +598,37 @@ int kvaf_urma_provider_open_v2(
     } else if (kvaf_fill_result(result) != 0) {
         ret = -1;
     }
-    if (kvaf_perftest_confirm_provider_ready(
-            &g_kvaf_context, &g_kvaf_config, ret) !=
-        KVAF_PERFTEST_CHECKED_OK) {
-        g_kvaf_cleanup_poisoned = true;
+    ready_status = kvaf_perftest_confirm_provider_ready(
+        &g_kvaf_context, &g_kvaf_config, ret);
+    if (ready_status != KVAF_PERFTEST_CHECKED_OK) {
         if (ret == 0) {
             kvaf_init_result(result,
-                KVAF_URMA_PROVIDER_RESOURCE_CREATE_FAILED, -1);
+                KVAF_URMA_PROVIDER_RESOURCE_CREATE_FAILED,
+                ready_status);
         }
-        result->flags |= KVAF_URMA_PROVIDER_CLEANUP_UNCERTAIN;
+        if (ready_status !=
+            KVAF_PERFTEST_CHECKED_CREATE_CLEANUP_REQUIRED) {
+            g_kvaf_cleanup_poisoned = true;
+            result->flags |= KVAF_URMA_PROVIDER_CLEANUP_UNCERTAIN;
+        }
         goto fail;
     }
     (void)pthread_mutex_unlock(&g_kvaf_lock);
     return 0;
 
 fail:
-    if (kvaf_close_unlocked(config->session_id) != 0) {
+    ret = kvaf_close_unlocked(config->session_id);
+    if (ret == KVAF_URMA_PROVIDER_CLOSE_RETRYABLE) {
+        /*
+         * Preserve the nonce in the error result.  The caller must keep the
+         * provider active and issue Close again for this exact session; this
+         * is not protocol ambiguity and must not be promoted to quarantine.
+         */
+        result->flags |= KVAF_URMA_PROVIDER_CLEANUP_RETRYABLE;
+        result->session_id = config->session_id;
+    } else if (ret != KVAF_URMA_PROVIDER_CLOSE_OK) {
         result->flags |= KVAF_URMA_PROVIDER_CLEANUP_UNCERTAIN;
+        result->session_id = config->session_id;
     }
     (void)pthread_mutex_unlock(&g_kvaf_lock);
     return -1;
@@ -523,7 +645,7 @@ static int kvaf_close_unlocked(uint64_t session_id)
      * an idempotent retry of the last session closed by this same instance.
      */
     if (session_id == 0) {
-        return -1;
+        return KVAF_URMA_PROVIDER_CLOSE_UNSAFE;
     }
     /*
      * A Close result can be lost after this instance has already completed
@@ -532,22 +654,69 @@ static int kvaf_close_unlocked(uint64_t session_id)
      * AICPU KFC retry may otherwise land on a worker that never owned Open.
      */
     if (g_kvaf_session_id == 0) {
-        return g_kvaf_last_closed_session_id == session_id ? 0 : -1;
+        return g_kvaf_last_closed_session_id == session_id
+            ? KVAF_URMA_PROVIDER_CLOSE_OK
+            : KVAF_URMA_PROVIDER_CLOSE_UNSAFE;
     }
     if (g_kvaf_session_id != session_id) {
-        return -1;
+        return KVAF_URMA_PROVIDER_CLOSE_UNSAFE;
     }
     if (g_kvaf_cleanup_poisoned) {
-        return -1;
+        return KVAF_URMA_PROVIDER_CLOSE_UNSAFE;
     }
     if (g_kvaf_context_open) {
-        if (kvaf_perftest_destroy_duplex_ctx_checked(
-                &g_kvaf_context, &g_kvaf_config) !=
-            KVAF_PERFTEST_CHECKED_OK) {
+        const int teardown_status =
+            kvaf_perftest_destroy_duplex_ctx_checked(
+                &g_kvaf_context, &g_kvaf_config,
+                &g_kvaf_teardown_state);
+        if (teardown_status ==
+            KVAF_PERFTEST_CHECKED_DESTROY_RETRYABLE) {
+            if (kvaf_source_ummu_state_is_unknown()) {
+                /*
+                 * A public destroy API collapses lower UMMU errno values to
+                 * URMA_FAIL. Consult the source-owned diagnostic before
+                 * advertising a retry: a command whose completion is
+                 * ambiguous must be quarantined, not retried forever.
+                 */
+                g_kvaf_cleanup_poisoned = true;
+                return KVAF_URMA_PROVIDER_CLOSE_UNSAFE;
+            }
+            /*
+             * The checked source-matched provider retained the exact failed
+             * handle and phase. Keep this session installed so a second
+             * Close for the same nonce resumes rather than re-running
+             * successful teardown actions.
+             */
+            return KVAF_URMA_PROVIDER_CLOSE_RETRYABLE;
+        }
+        if (teardown_status != KVAF_PERFTEST_CHECKED_OK) {
+            /* Only protocol/ownership uncertainty permanently poisons it. */
             g_kvaf_cleanup_poisoned = true;
-            return -1;
+            return KVAF_URMA_PROVIDER_CLOSE_UNSAFE;
+        }
+        if (!kvaf_udma_source_has_no_live_resources()) {
+            /*
+             * The public context is already gone, so a non-zero private
+             * counter contradicts the checked teardown contract. Never
+             * acknowledge Close or release the session in this state.
+             */
+            g_kvaf_cleanup_poisoned = true;
+            return KVAF_URMA_PROVIDER_CLOSE_UNSAFE;
         }
         g_kvaf_context_open = false;
+    }
+    if (g_kvaf_runtime_acquired) {
+        if (!kvaf_udma_source_has_no_live_resources() ||
+            kvaf_udma_source_runtime_uninit() != 0) {
+            /*
+             * urma_uninit mutates process-global state even when it reports
+             * failure. It is not retryable; retain this session and refuse
+             * any future Open in this provider instance.
+             */
+            g_kvaf_cleanup_poisoned = true;
+            return KVAF_URMA_PROVIDER_CLOSE_UNSAFE;
+        }
+        g_kvaf_runtime_acquired = false;
     }
     if (g_kvaf_connection_open) {
         close_connection(&g_kvaf_config);
@@ -560,9 +729,11 @@ static int kvaf_close_unlocked(uint64_t session_id)
     (void)memset(&g_kvaf_config, 0, sizeof(g_kvaf_config));
     (void)memset(&g_kvaf_context, 0, sizeof(g_kvaf_context));
     (void)memset(&g_kvaf_queue_info, 0, sizeof(g_kvaf_queue_info));
+    (void)memset(
+        &g_kvaf_teardown_state, 0, sizeof(g_kvaf_teardown_state));
     g_kvaf_last_closed_session_id = g_kvaf_session_id;
     g_kvaf_session_id = 0;
-    return 0;
+    return KVAF_URMA_PROVIDER_CLOSE_OK;
 }
 
 int kvaf_urma_provider_close_v2(uint64_t session_id)

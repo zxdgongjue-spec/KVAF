@@ -12,12 +12,12 @@
  *   Host endpoint   : urma_perftest AIV private ABI, Host role
  *   AICPU endpoint  : urma_perftest AIV private ABI, Device role
  *
- * UB_MicroBenchmark_new's shipped, hardware-tested liburma_perftest.so was
- * built against this exact top-level urma_types.h layout. In particular, it
- * is not layout-compatible with an older ubengine public Jetty/JFC base.
- * Keep all private reads here and validate the critical AArch64 layout.
+ * The accessor and the source-built UDMA implementation are compiled against
+ * the same udma_u_common.h and the same Host(ST64B)/Device(TGID_VA) role.
+ * This is essential: the older top-level urma_types.h copy omits the queue
+ * hmap_node and sq_reserved fields and is not the complete provider layout.
  */
-#include "urma_types.h"
+#include "udma_u_common.h"
 
 #if !defined(KVAF_UDMA_ACCESSOR_HOST) && \
     !defined(KVAF_UDMA_ACCESSOR_DEVICE)
@@ -32,26 +32,13 @@
 #define KVAF_UDMA_CQE_BYTES 64U
 #define KVAF_UDMA_DOORBELL_OFFSET 0x80U
 
-#if defined(__linux__) && defined(__aarch64__)
-_Static_assert(sizeof(urma_jfc_t) == 0x100U,
-    "unexpected urma_perftest AIV public JFC ABI");
-_Static_assert(sizeof(urma_jetty_t) == 0x160U,
-    "unexpected urma_perftest AIV public Jetty ABI");
-_Static_assert(sizeof(struct udma_u_jetty_queue) == 0x98U,
-    "unexpected urma_perftest AIV queue ABI");
-_Static_assert(sizeof(struct udma_u_context) == 0x1f8U,
-    "unexpected urma_perftest AIV context ABI");
-_Static_assert(offsetof(struct udma_u_context, cqe_size) == 0xc8U,
-    "unexpected urma_perftest AIV context CQE-size offset");
-_Static_assert(offsetof(struct udma_u_context, sq_reserved) == 0x1b8U,
-    "unexpected urma_perftest AIV context SQ-reserved offset");
-_Static_assert(offsetof(struct udma_u_jetty, sq) == 0x160U,
-    "unexpected urma_perftest AIV Jetty SQ offset");
-_Static_assert(offsetof(struct udma_u_jfc, cq) == 0x100U,
-    "unexpected urma_perftest AIV JFC CQ offset");
-_Static_assert(offsetof(struct udma_u_jfc, sw_db) == 0x198U,
-    "unexpected urma_perftest AIV JFC sw_db offset");
-#endif
+_Static_assert(offsetof(struct udma_u_jetty, sq) == sizeof(urma_jetty_t),
+    "source-built UDMA Jetty base layout changed");
+_Static_assert(offsetof(struct udma_u_jfc, cq) == sizeof(urma_jfc_t),
+    "source-built UDMA JFC base layout changed");
+_Static_assert(offsetof(struct udma_u_jfc, sw_db) ==
+        sizeof(urma_jfc_t) + sizeof(struct udma_u_jetty_queue),
+    "source-built UDMA JFC queue layout changed");
 
 static bool kvaf_is_power_of_two(uint32_t value)
 {
@@ -111,7 +98,7 @@ int kvaf_udma_extract_direct_queue_info(
      * fail before the kernel can write an arbitrary location.
      */
     if (sq->ctx == NULL || cq->ctx == NULL || sq->ctx != cq->ctx ||
-        sq->ctx->sq_reserved ||
+        sq->ctx->sq_reserved || sq->sq_reserved ||
         sq->qbuf == NULL || sq->qbuf_curr != sq->qbuf ||
         sq->qbuf_end == NULL ||
         (uintptr_t)sq->qbuf_end <= (uintptr_t)sq->qbuf ||

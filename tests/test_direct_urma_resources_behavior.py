@@ -97,7 +97,7 @@ class DirectUrmaResourcesBehaviorTests(unittest.TestCase):
 
     def run_scenario(self, scenario: str) -> None:
         result = subprocess.run(
-            [str(self.harness), scenario],
+            [str(self.harness), scenario, str(self.library)],
             check=False,
             capture_output=True,
             text=True,
@@ -113,14 +113,47 @@ class DirectUrmaResourcesBehaviorTests(unittest.TestCase):
     def test_double_sync_failure_retains_every_allocation(self) -> None:
         self.run_scenario("sync_twice")
 
+    def test_open_launch_failure_retains_ambiguous_backing(self) -> None:
+        self.run_scenario("open_launch_failure")
+
     def test_foreign_already_open_is_never_closed(self) -> None:
         self.run_scenario("foreign_already_open")
 
     def test_open_result_copy_failure_closes_exact_session(self) -> None:
         self.run_scenario("open_d2h_failure")
 
+    def test_retryable_failed_open_preserves_session_for_close(self) -> None:
+        self.run_scenario("open_cleanup_retryable")
+
+    def test_host_retryable_failed_open_preserves_session_for_close(self) -> None:
+        self.run_scenario("host_open_cleanup_retryable")
+
+    def test_partial_runtime_capability_is_rejected_and_closed(self) -> None:
+        self.run_scenario("runtime_capability_partial")
+
+    def test_missing_runtime_public_abi_evidence_is_rejected(self) -> None:
+        self.run_scenario("runtime_public_abi_missing")
+
     def test_lost_close_result_retries_same_session(self) -> None:
         self.run_scenario("close_d2h_retry")
+
+    def test_provider_retry_relaunches_only_after_result_reread(self) -> None:
+        self.run_scenario("close_d2h_provider_retryable")
+
+    def test_prelaunch_copy_failure_is_safely_retryable(self) -> None:
+        self.run_scenario("close_prelaunch_d2h_retry")
+
+    def test_non_drained_queue_is_unsafe_without_launch(self) -> None:
+        self.run_scenario("close_queue_not_drained")
+
+    def test_close_launch_failure_is_ownership_unknown(self) -> None:
+        self.run_scenario("close_launch_failure")
+
+    def test_explicit_unsafe_close_is_not_retried(self) -> None:
+        self.run_scenario("close_unsafe")
+
+    def test_host_explicit_unsafe_close_is_not_retried(self) -> None:
+        self.run_scenario("host_close_unsafe")
 
     def test_local_free_failure_does_not_repeat_provider_close(self) -> None:
         self.run_scenario("free_retry")

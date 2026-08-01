@@ -9,6 +9,8 @@
 namespace {
 
 using kvaf::access::a5::DirectUrmaExecutionDomain;
+using kvaf::access::a5::DirectUrmaCloseDisposition;
+using kvaf::access::a5::DirectUrmaClosePhase;
 using kvaf::access::a5::DirectUrmaOpenSpec;
 using kvaf::access::a5::DirectUrmaResources;
 using kvaf::access::a5::DirectUrmaRole;
@@ -18,10 +20,16 @@ int Fail(const char* message) {
   return 1;
 }
 
-DirectUrmaOpenSpec MakeSpec(std::vector<std::uint8_t>* backing) {
+DirectUrmaOpenSpec MakeSpec(std::vector<std::uint8_t>* backing,
+                            const std::string& scenario,
+                            const std::string& provider_library) {
   DirectUrmaOpenSpec spec;
-  spec.execution_domain = DirectUrmaExecutionDomain::kAicpu;
+  const bool host = scenario.rfind("host_", 0) == 0;
+  spec.execution_domain = host
+      ? DirectUrmaExecutionDomain::kHostProcess
+      : DirectUrmaExecutionDomain::kAicpu;
   spec.role = DirectUrmaRole::kClient;
+  spec.provider_library_path = provider_library;
   spec.provider_soname = "libkvaf_urma_provider_device.so";
   spec.urma_device = "udmac0d1e4";
   spec.local_eid = "0000:0000:0000:0200:0010:0000:df00:4100";
@@ -37,14 +45,14 @@ DirectUrmaOpenSpec MakeSpec(std::vector<std::uint8_t>* backing) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 2) {
-    return Fail("expected one fault-injection scenario");
+  if (argc != 3) {
+    return Fail("expected a fault-injection scenario and provider library");
   }
   const std::string scenario = argv[1];
   kvaf_fake_acl_set_scenario(scenario.c_str());
   std::vector<std::uint8_t> backing(8192);
   DirectUrmaResources resources;
-  const auto open = resources.Open(MakeSpec(&backing));
+  const auto open = resources.Open(MakeSpec(&backing, scenario, argv[2]));
 
   if (scenario == "sync_twice") {
     if (open.ok() || resources.transport_teardown_complete() ||
@@ -52,6 +60,20 @@ int main(int argc, char** argv) {
         kvaf_fake_acl_free_calls() != 0 ||
         kvaf_fake_acl_destroy_stream_calls() != 0) {
       return Fail("double sync failure released or misclassified ownership");
+    }
+    return 0;
+  }
+  if (scenario == "open_launch_failure") {
+    if (open.ok() || resources.transport_teardown_complete() ||
+        resources.transport_teardown_retryable() ||
+        resources.close_phase() !=
+            DirectUrmaClosePhase::kUnsafeUnknown ||
+        resources.close_disposition() !=
+            DirectUrmaCloseDisposition::kUnsafeUnknown ||
+        kvaf_fake_acl_close_launches() != 0 ||
+        kvaf_fake_acl_free_calls() != 0 ||
+        kvaf_fake_acl_destroy_stream_calls() != 0) {
+      return Fail("ambiguous Open launch released provider backing");
     }
     return 0;
   }
@@ -73,6 +95,54 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+  if (scenario == "open_cleanup_retryable") {
+    if (open.ok() || resources.transport_teardown_complete() ||
+        !resources.transport_teardown_retryable() ||
+        resources.close_phase() !=
+            DirectUrmaClosePhase::kProviderRetryable ||
+        resources.close_disposition() !=
+            DirectUrmaCloseDisposition::kProviderRetryable ||
+        kvaf_fake_acl_close_launches() != 1) {
+      return Fail("retryable failed Open was promoted to unsafe or lost");
+    }
+    if (!resources.Close().ok() ||
+        !resources.transport_teardown_complete() ||
+        resources.transport_teardown_retryable() ||
+        kvaf_fake_acl_close_launches() != 2 ||
+        kvaf_fake_acl_open_session() !=
+            kvaf_fake_acl_last_close_session()) {
+      return Fail("same-session failed Open cleanup retry did not converge");
+    }
+    return 0;
+  }
+  if (scenario == "host_open_cleanup_retryable") {
+    if (open.ok() || resources.transport_teardown_complete() ||
+        !resources.transport_teardown_retryable() ||
+        resources.close_phase() !=
+            DirectUrmaClosePhase::kProviderRetryable ||
+        resources.close_disposition() !=
+            DirectUrmaCloseDisposition::kProviderRetryable ||
+        kvaf_fake_acl_close_launches() != 1) {
+      return Fail("Host retryable failed Open was promoted or lost");
+    }
+    if (!resources.Close().ok() ||
+        !resources.transport_teardown_complete() ||
+        resources.transport_teardown_retryable() ||
+        kvaf_fake_acl_close_launches() != 2 ||
+        kvaf_fake_acl_open_session() !=
+            kvaf_fake_acl_last_close_session()) {
+      return Fail("Host same-session failed Open retry did not converge");
+    }
+    return 0;
+  }
+  if (scenario == "runtime_capability_partial" ||
+      scenario == "runtime_public_abi_missing") {
+    if (open.ok() || !resources.transport_teardown_complete() ||
+        kvaf_fake_acl_close_launches() != 1) {
+      return Fail("unproved runtime contract was accepted or not closed");
+    }
+    return 0;
+  }
   if (!open.ok()) {
     std::cerr << open.message() << '\n';
     return Fail("scenario unexpectedly failed Open");
@@ -89,15 +159,120 @@ int main(int argc, char** argv) {
   }
 
   if (scenario == "close_d2h_retry") {
-    if (resources.Close().ok() || resources.transport_teardown_complete()) {
-      return Fail("lost close result was incorrectly accepted as safe");
+    if (resources.Close().ok() || resources.transport_teardown_complete() ||
+        !resources.transport_teardown_retryable() ||
+        resources.close_phase() !=
+            DirectUrmaClosePhase::kAicpuResultPending ||
+        resources.close_disposition() !=
+            DirectUrmaCloseDisposition::kAicpuResultReadPending ||
+        kvaf_fake_acl_close_launches() != 1) {
+      return Fail("lost close result did not retain its read-only cursor");
     }
     if (!resources.Close().ok() ||
         !resources.transport_teardown_complete() ||
-        kvaf_fake_acl_close_launches() != 2 ||
+        resources.transport_teardown_retryable() ||
+        resources.close_phase() != DirectUrmaClosePhase::kComplete ||
+        resources.close_disposition() !=
+            DirectUrmaCloseDisposition::kTransportComplete ||
+        kvaf_fake_acl_close_launches() != 1 ||
         kvaf_fake_acl_open_session() !=
             kvaf_fake_acl_last_close_session()) {
-      return Fail("same-session close retry did not converge");
+      return Fail("same-buffer close result reread did not converge");
+    }
+    return 0;
+  }
+
+  if (scenario == "close_d2h_provider_retryable") {
+    if (resources.Close().ok() ||
+        resources.close_disposition() !=
+            DirectUrmaCloseDisposition::kAicpuResultReadPending ||
+        kvaf_fake_acl_close_launches() != 1) {
+      return Fail("lost RETRYABLE result did not retain read cursor");
+    }
+    if (resources.Close().ok() ||
+        resources.close_phase() !=
+            DirectUrmaClosePhase::kProviderRetryable ||
+        resources.close_disposition() !=
+            DirectUrmaCloseDisposition::kProviderRetryable ||
+        !resources.transport_teardown_retryable() ||
+        kvaf_fake_acl_close_launches() != 1) {
+      return Fail("result reread did not expose provider RETRYABLE");
+    }
+    if (!resources.Close().ok() ||
+        !resources.transport_teardown_complete() ||
+        kvaf_fake_acl_close_launches() != 2) {
+      return Fail("provider-authorized relaunch did not converge");
+    }
+    return 0;
+  }
+
+  if (scenario == "close_prelaunch_d2h_retry") {
+    if (resources.Close().ok() || resources.transport_teardown_complete() ||
+        !resources.transport_teardown_retryable() ||
+        resources.close_phase() !=
+            DirectUrmaClosePhase::kAicpuPreLaunch ||
+        resources.close_disposition() !=
+            DirectUrmaCloseDisposition::kPreLaunchRetryable ||
+        kvaf_fake_acl_close_launches() != 0) {
+      return Fail("safe pre-launch copy failure was misclassified");
+    }
+    if (!resources.Close().ok() ||
+        !resources.transport_teardown_complete() ||
+        kvaf_fake_acl_close_launches() != 1) {
+      return Fail("safe pre-launch Close retry did not converge");
+    }
+    return 0;
+  }
+
+  if (scenario == "close_queue_not_drained" ||
+      scenario == "close_launch_failure") {
+    if (resources.Close().ok() ||
+        resources.transport_teardown_complete() ||
+        resources.transport_teardown_retryable() ||
+        resources.close_phase() !=
+            DirectUrmaClosePhase::kUnsafeUnknown ||
+        resources.close_disposition() !=
+            DirectUrmaCloseDisposition::kUnsafeUnknown) {
+      return Fail("ambiguous pre-provider Close was not marked unsafe");
+    }
+    const int expected_launches =
+        scenario == "close_launch_failure" ? 1 : 0;
+    if (kvaf_fake_acl_close_launches() != expected_launches ||
+        resources.Close().ok() ||
+        kvaf_fake_acl_close_launches() != expected_launches) {
+      return Fail("unsafe Close was touched again");
+    }
+    return 0;
+  }
+
+  if (scenario == "close_unsafe") {
+    if (resources.Close().ok() ||
+        resources.transport_teardown_complete() ||
+        resources.transport_teardown_retryable() ||
+        kvaf_fake_acl_close_launches() != 1 ||
+        resources.close_disposition() !=
+            DirectUrmaCloseDisposition::kUnsafeUnknown) {
+      return Fail("unsafe provider Close was not retained as unknown");
+    }
+    if (resources.Close().ok() ||
+        kvaf_fake_acl_close_launches() != 1) {
+      return Fail("unsafe provider Close was incorrectly retried");
+    }
+    return 0;
+  }
+
+  if (scenario == "host_close_unsafe") {
+    if (resources.Close().ok() ||
+        resources.transport_teardown_complete() ||
+        resources.transport_teardown_retryable() ||
+        kvaf_fake_acl_close_launches() != 1 ||
+        resources.close_disposition() !=
+            DirectUrmaCloseDisposition::kUnsafeUnknown) {
+      return Fail("unsafe Host provider Close was not retained as unknown");
+    }
+    if (resources.Close().ok() ||
+        kvaf_fake_acl_close_launches() != 1) {
+      return Fail("unsafe Host provider Close was incorrectly retried");
     }
     return 0;
   }

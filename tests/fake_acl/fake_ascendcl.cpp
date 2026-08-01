@@ -56,6 +56,10 @@ void FillSuccessfulOpen(const kvaf_urma_provider_config_v2& config,
   result->private_abi = KVAF_UDMA_PRIVATE_ABI_DEVICE_PERFTEST_AIV_V1;
   result->session_id = config.session_id;
   result->reserved[0] = 1;
+  result->reserved[1] = KVAF_UDMA_SOURCE_CAPABILITY_MAGIC;
+  result->reserved[2] =
+      KVAF_UDMA_TEARDOWN_SOURCE_OWNED_CHECKED_RETRYABLE_V1;
+  result->reserved[3] = 1;
   (void)inet_pton(AF_INET6, config.peer_eid, result->remote_eid);
 }
 
@@ -99,6 +103,38 @@ extern "C" unsigned long long kvaf_fake_acl_last_close_session(void) {
 
 extern "C" uint32_t kvaf_fake_acl_last_kernel_type(void) {
   return g_last_kernel_type;
+}
+
+extern "C" int kvaf_urma_provider_open_v2(
+    const kvaf_urma_provider_config_v2* config,
+    kvaf_urma_provider_result_v2* result) {
+  if (config == nullptr || result == nullptr) {
+    return -1;
+  }
+  g_open_session = config->session_id;
+  FillSuccessfulOpen(*config, result);
+  result->private_abi = KVAF_UDMA_PRIVATE_ABI_HOST_PERFTEST_AIV_V1;
+  result->flags = KVAF_URMA_PROVIDER_CONNECTED |
+                  KVAF_URMA_PROVIDER_REMOTE_EID_NETWORK_ORDER;
+  if (Scenario("host_open_cleanup_retryable")) {
+    result->status = KVAF_URMA_PROVIDER_RESOURCE_CREATE_FAILED;
+    result->provider_status = -3;
+    result->flags = KVAF_URMA_PROVIDER_CLEANUP_RETRYABLE;
+    return -1;
+  }
+  return 0;
+}
+
+extern "C" int kvaf_urma_provider_close_v2(std::uint64_t session_id) {
+  ++g_close_launches;
+  g_last_close_session = session_id;
+  if (Scenario("host_open_cleanup_retryable") && g_close_launches == 1) {
+    return KVAF_URMA_PROVIDER_CLOSE_RETRYABLE;
+  }
+  if (Scenario("host_close_unsafe")) {
+    return KVAF_URMA_PROVIDER_CLOSE_UNSAFE;
+  }
+  return KVAF_URMA_PROVIDER_CLOSE_OK;
 }
 
 extern "C" aclError aclInit(const char*) { return ACL_SUCCESS; }
@@ -155,7 +191,13 @@ extern "C" aclError aclrtMemcpy(void* destination,
     if (Scenario("open_d2h_failure") && g_d2h_copies == 1) {
       return 101;
     }
-    if (Scenario("close_d2h_retry") && g_d2h_copies == 3) {
+    if (Scenario("close_prelaunch_d2h_retry") &&
+        g_d2h_copies == 2) {
+      return 103;
+    }
+    if ((Scenario("close_d2h_retry") ||
+         Scenario("close_d2h_provider_retryable")) &&
+        g_d2h_copies == 3) {
       return 102;
     }
   }
@@ -163,6 +205,11 @@ extern "C" aclError aclrtMemcpy(void* destination,
     return 1;
   }
   std::memcpy(destination, source, source_bytes);
+  if (kind == ACL_MEMCPY_DEVICE_TO_HOST &&
+      Scenario("close_queue_not_drained") && g_d2h_copies == 2 &&
+      source_bytes == 64) {
+    *static_cast<std::uint64_t*>(destination) = 1;
+  }
   return ACL_SUCCESS;
 }
 
@@ -176,11 +223,23 @@ extern "C" rtError_t rtAicpuKernelLaunchExWithArgs(
     auto* result = reinterpret_cast<kvaf_urma_provider_result_v2*>(
         args->result_address);
     g_open_session = args->config.session_id;
+    if (Scenario("open_launch_failure")) {
+      return 130;
+    }
     FillSuccessfulOpen(args->config, result);
     if (Scenario("foreign_already_open")) {
       result->status = KVAF_URMA_PROVIDER_ALREADY_OPEN;
       result->provider_status = -1;
       result->flags = 0;
+    } else if (Scenario("open_cleanup_retryable")) {
+      result->status = KVAF_URMA_PROVIDER_RESOURCE_CREATE_FAILED;
+      result->provider_status = -3;
+      result->flags = KVAF_URMA_PROVIDER_CLEANUP_RETRYABLE;
+    } else if (Scenario("runtime_capability_partial")) {
+      result->reserved[2] =
+          KVAF_UDMA_TEARDOWN_SOURCE_OWNED_PARTIAL_RETRY_V1;
+    } else if (Scenario("runtime_public_abi_missing")) {
+      result->reserved[3] = 0;
     }
     return 0;
   }
@@ -189,7 +248,19 @@ extern "C" rtError_t rtAicpuKernelLaunchExWithArgs(
         args_info->args);
     ++g_close_launches;
     g_last_close_session = args->session_id;
-    *reinterpret_cast<std::int32_t*>(args->result_address) = 0;
+    if (Scenario("close_launch_failure")) {
+      return 131;
+    }
+    std::int32_t close_result = KVAF_URMA_PROVIDER_CLOSE_OK;
+    if (Scenario("open_cleanup_retryable") && g_close_launches == 1) {
+      close_result = KVAF_URMA_PROVIDER_CLOSE_RETRYABLE;
+    } else if (Scenario("close_d2h_provider_retryable") &&
+               g_close_launches == 1) {
+      close_result = KVAF_URMA_PROVIDER_CLOSE_RETRYABLE;
+    } else if (Scenario("close_unsafe")) {
+      close_result = KVAF_URMA_PROVIDER_CLOSE_UNSAFE;
+    }
+    *reinterpret_cast<std::int32_t*>(args->result_address) = close_result;
     return 0;
   }
   return 1;
