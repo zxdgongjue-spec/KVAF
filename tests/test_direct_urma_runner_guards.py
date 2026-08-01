@@ -233,6 +233,10 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
             self.source,
         )
         self.assertIn(
+            "KVAF_HOST_CONTROL_TIMEOUT_SECONDS + 10",
+            self.source,
+        )
+        self.assertIn(
             '--timeout-seconds "${KVAF_H2D_TIMEOUT_SECONDS}"',
             self.source,
         )
@@ -244,6 +248,34 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
         self.assertNotIn("total_timeout_seconds=", self.source)
         self.assertIn("h2d_control_timeout_seconds=%s", self.source)
         self.assertIn("h2d_run_timeout_seconds=%s", self.source)
+
+    def test_device_launch_waits_for_pid_bound_host_listener(self) -> None:
+        for expected in (
+            "KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS",
+            "KVAF_HOST_CONTROL_TIMEOUT_SECONDS",
+            "process_listens_on_control_port",
+            "wait_for_host_control_listener",
+            '"/proc/${pid}/fd/"*',
+            '"/proc/${pid}/net/tcp"',
+            '"/proc/${pid}/net/tcp6"',
+            'current_start_ticks=$(process_start_ticks "${pid}")',
+            'current_executable=$(process_executable "${pid}")',
+            'expected_local="00000000000000000000000000000000:${port_hex}"',
+            'expected_local="00000000:${port_hex}"',
+            "KVAF_A5_HOST_CONTROL_LISTENER_READY",
+            'host_args=(\n  "${common_args[@]}"',
+            'device_args=(\n  "${common_args[@]}"',
+        ):
+            self.assertIn(expected, self.source)
+        self.assertNotIn(
+            'sleep "${KVAF_DIRECT_SERVER_START_DELAY_SECONDS}"',
+            self.source,
+        )
+        listener = self.source.index("wait_for_host_control_listener")
+        device = self.source.index(
+            'nohup "${KVAF_A5_DIRECT_BINARY}" --role device', listener
+        )
+        self.assertLess(listener, device)
 
     def test_tcp_control_addresses_are_explicit_validated_and_audited(self) -> None:
         for expected in (

@@ -89,7 +89,13 @@ else
   kvaf_h2d_workload_mode=explicit-transfer-shape
 fi
 KVAF_H2D_TIMEOUT_SECONDS=${KVAF_H2D_TIMEOUT_SECONDS:-120}
-KVAF_DIRECT_SERVER_START_DELAY_SECONDS=${KVAF_DIRECT_SERVER_START_DELAY_SECONDS:-1}
+if [[ -n "${KVAF_DIRECT_SERVER_START_DELAY_SECONDS+x}" ]]; then
+  echo "ERROR: KVAF_DIRECT_SERVER_START_DELAY_SECONDS was removed; fixed sleeps consume the Host accept deadline" >&2
+  echo "Set KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS instead; Device starts immediately after PID-bound LISTEN proof." >&2
+  exit 2
+fi
+KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS=${KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS:-30}
+KVAF_HOST_CONTROL_TIMEOUT_SECONDS=${KVAF_HOST_CONTROL_TIMEOUT_SECONDS:-}
 KVAF_A5_RUN_TAG=${KVAF_A5_RUN_TAG:-$(date +%Y%m%d_%H%M%S)_$$}
 KVAF_A5_RESULT_DIR=${KVAF_A5_RESULT_DIR:-"${KVAF_DIRECT_RESULT_ROOT}/a5_direct_urma_h2d_${KVAF_A5_RUN_TAG}"}
 KVAF_DIRECT_ALLOW_BUSY_NPU=${KVAF_DIRECT_ALLOW_BUSY_NPU:-0}
@@ -591,10 +597,31 @@ else
     KVAF_H2D_TIMEOUT_SECONDS * 3 + 10
   ))
 fi
+require_uint_max KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS \
+  "${KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS}" 3600
+if [[ -z "${KVAF_HOST_CONTROL_TIMEOUT_SECONDS}" ]]; then
+  KVAF_HOST_CONTROL_TIMEOUT_SECONDS=$((
+    KVAF_H2D_TIMEOUT_SECONDS +
+    KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS + 5
+  ))
+  if (( KVAF_HOST_CONTROL_TIMEOUT_SECONDS > 3600 )); then
+    KVAF_HOST_CONTROL_TIMEOUT_SECONDS=3600
+  fi
+fi
+if (( kvaf_run_timeout_is_set == 0 &&
+      KVAF_H2D_RUN_TIMEOUT_SECONDS <
+        KVAF_HOST_CONTROL_TIMEOUT_SECONDS + 10 )); then
+  # A short Device timeout must not make the historical 3*T+10 default
+  # expire before the independently longer Host accept window.  Explicit
+  # user values still fail closed below when they cannot supervise Host.
+  KVAF_H2D_RUN_TIMEOUT_SECONDS=$((
+    KVAF_HOST_CONTROL_TIMEOUT_SECONDS + 10
+  ))
+fi
 require_uint KVAF_EID_LOCK_TIMEOUT_SECONDS \
   "${KVAF_EID_LOCK_TIMEOUT_SECONDS}"
-require_uint KVAF_DIRECT_SERVER_START_DELAY_SECONDS \
-  "${KVAF_DIRECT_SERVER_START_DELAY_SECONDS}"
+require_uint_max KVAF_HOST_CONTROL_TIMEOUT_SECONDS \
+  "${KVAF_HOST_CONTROL_TIMEOUT_SECONDS}" 3600
 require_uint_max KVAF_NPU_SMI_TIMEOUT_SECONDS \
   "${KVAF_NPU_SMI_TIMEOUT_SECONDS}" 120
 require_uint_max KVAF_HCCN_TIMEOUT_SECONDS \
@@ -615,6 +642,18 @@ fi
 if (( KVAF_DIRECT_CONTROL_PORT < 1024 ||
       KVAF_DIRECT_CONTROL_PORT > 65535 )); then
   echo "ERROR: KVAF_DIRECT_CONTROL_PORT must be in [1024, 65535]" >&2
+  exit 2
+fi
+if (( KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS == 0 ||
+      KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS >
+        KVAF_H2D_RUN_TIMEOUT_SECONDS )); then
+  echo "ERROR: KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS must be in [1, KVAF_H2D_RUN_TIMEOUT_SECONDS]" >&2
+  exit 2
+fi
+if (( KVAF_HOST_CONTROL_TIMEOUT_SECONDS < KVAF_H2D_TIMEOUT_SECONDS ||
+      KVAF_HOST_CONTROL_TIMEOUT_SECONDS >
+        KVAF_H2D_RUN_TIMEOUT_SECONDS )); then
+  echo "ERROR: KVAF_HOST_CONTROL_TIMEOUT_SECONDS must be in [KVAF_H2D_TIMEOUT_SECONDS, KVAF_H2D_RUN_TIMEOUT_SECONDS]" >&2
   exit 2
 fi
 KVAF_DIRECT_CONTROL_SERVER_ADDRESS_SOURCE=explicit
@@ -1052,16 +1091,14 @@ case "${kvaf_sq_reserved}" in
     ;;
 esac
 
-if command -v ss >/dev/null 2>&1; then
-  listening_addresses=$(
-    ss -H -ltn |
-      awk '{print $4}'
-  )
-  if grep -Eq ":${KVAF_DIRECT_CONTROL_PORT}$" \
-      <<<"${listening_addresses}"; then
-    echo "ERROR: control port ${KVAF_DIRECT_CONTROL_PORT} is already listening" >&2
-    exit 2
-  fi
+printf -v kvaf_control_port_hex '%04X' \
+  "${KVAF_DIRECT_CONTROL_PORT}"
+if awk -v expected_port="${kvaf_control_port_hex}" '
+    $4 == "0A" && $2 ~ ":" expected_port "$" { found = 1 }
+    END { exit found ? 0 : 1 }
+  ' /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+  echo "ERROR: control port ${KVAF_DIRECT_CONTROL_PORT} is already listening" >&2
+  exit 2
 fi
 
 # Take the occupancy snapshot as late as possible, after all build/package
@@ -1267,6 +1304,10 @@ archive_sha=$(
   printf 'h2d_total_bytes=%s\n' "${KVAF_H2D_TOTAL_BYTES}"
   printf 'h2d_control_timeout_seconds=%s\n' \
     "${KVAF_H2D_TIMEOUT_SECONDS}"
+  printf 'host_control_timeout_seconds=%s\n' \
+    "${KVAF_HOST_CONTROL_TIMEOUT_SECONDS}"
+  printf 'host_listener_ready_timeout_seconds=%s\n' \
+    "${KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS}"
   printf 'h2d_run_timeout_seconds=%s\n' \
     "${KVAF_H2D_RUN_TIMEOUT_SECONDS}"
   printf 'binary_sha256=%s\n' "${direct_binary_sha}"
@@ -1348,13 +1389,20 @@ common_args=(
   --bytes-per-transfer "${KVAF_H2D_BYTES_PER_TRANSFER}"
   --batch-iterations "${KVAF_H2D_BATCH_ITERATIONS}"
   --descriptor-capacity "${KVAF_H2D_DESCRIPTOR_CAPACITY}"
-  --timeout-seconds "${KVAF_H2D_TIMEOUT_SECONDS}"
 )
 if [[ -n "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}" ]]; then
   common_args+=(
     --control-bind-address "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}"
   )
 fi
+host_args=(
+  "${common_args[@]}"
+  --timeout-seconds "${KVAF_HOST_CONTROL_TIMEOUT_SECONDS}"
+)
+device_args=(
+  "${common_args[@]}"
+  --timeout-seconds "${KVAF_H2D_TIMEOUT_SECONDS}"
+)
 
 host_pid=
 device_pid=
@@ -1395,6 +1443,87 @@ process_executable()
     fi
   fi
   printf 'none\n'
+}
+
+process_listens_on_control_port()
+{
+  local pid=$1
+  local expected_start_ticks=$2
+  local expected_executable=$3
+  local port=$4
+  local server_address=$5
+  local current_start_ticks current_executable descriptor target inode
+  local port_hex expected_local
+  local -A process_socket_inodes=()
+  local -a socket_tables=()
+
+  current_start_ticks=$(process_start_ticks "${pid}")
+  current_executable=$(process_executable "${pid}")
+  [[ "${current_start_ticks}" == "${expected_start_ticks}" ]] || return 2
+  # nohup may still be between fork and exec on the first observation.  The
+  # stable start tick prevents PID reuse; accept readiness only after exec
+  # resolves to the manifest-pinned worker binary.
+  [[ "${current_executable}" == "${expected_executable}" ]] || return 1
+
+  for descriptor in "/proc/${pid}/fd/"*; do
+    target=$(readlink "${descriptor}" 2>/dev/null || true)
+    if [[ "${target}" =~ ^socket:\[([1-9][0-9]*)\]$ ]]; then
+      process_socket_inodes["${BASH_REMATCH[1]}"]=1
+    fi
+  done
+  printf -v port_hex '%04X' "${port}"
+  if [[ "${server_address}" == *:* ]]; then
+    expected_local="00000000000000000000000000000000:${port_hex}"
+    socket_tables=("/proc/${pid}/net/tcp6")
+  else
+    expected_local="00000000:${port_hex}"
+    socket_tables=("/proc/${pid}/net/tcp")
+  fi
+  while read -r inode; do
+    if [[ -n "${process_socket_inodes[${inode}]+x}" ]]; then
+      return 0
+    fi
+  done < <(
+    awk -v expected_local="${expected_local}" '
+      $4 == "0A" && $2 == expected_local { print $10 }
+    ' "${socket_tables[@]}" 2>/dev/null
+  )
+  return 1
+}
+
+wait_for_host_control_listener()
+{
+  local pid=$1
+  local expected_start_ticks=$2
+  local expected_executable=$3
+  local port=$4
+  local server_address=$5
+  local timeout_seconds=$6
+  local deadline=$((SECONDS + timeout_seconds))
+  local listener_status
+
+  while :; do
+    listener_status=0
+    process_listens_on_control_port \
+      "${pid}" "${expected_start_ticks}" \
+      "${expected_executable}" "${port}" \
+      "${server_address}" || listener_status=$?
+    if (( listener_status == 0 )); then
+      return 0
+    fi
+    if (( listener_status == 2 )) ||
+       valid_fatal_marker "${exchange_dir}/fatal.host" ||
+       [[ -f "${host_final}" || -L "${host_final}" ]]; then
+      return 3
+    fi
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      return 1
+    fi
+    if (( SECONDS >= deadline )); then
+      return 2
+    fi
+    sleep 0.05 || true
+  done
 }
 
 write_active_session()
@@ -1680,7 +1809,9 @@ echo "CONTROL_SERVER_ADDRESS=${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}"
 echo "CONTROL_BIND_ADDRESS=${KVAF_DIRECT_CONTROL_BIND_ADDRESS:-none}"
 echo "RUN_ID=${kvaf_run_id}"
 echo "H2D_CONTROL_TIMEOUT_SECONDS=${KVAF_H2D_TIMEOUT_SECONDS}"
+echo "HOST_CONTROL_TIMEOUT_SECONDS=${KVAF_HOST_CONTROL_TIMEOUT_SECONDS}"
 echo "H2D_RUN_TIMEOUT_SECONDS=${KVAF_H2D_RUN_TIMEOUT_SECONDS}"
+echo "HOST_LISTENER_READY_TIMEOUT_SECONDS=${KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS}"
 echo "TEARDOWN_ASSURANCE=${kvaf_teardown_assurance}"
 echo "MANIFEST=${manifest}"
 
@@ -1690,13 +1821,38 @@ fi
 write_active_session
 active_phase=host_launch_intent
 write_active_session
-nohup "${KVAF_A5_DIRECT_BINARY}" --role host "${common_args[@]}" \
+nohup "${KVAF_A5_DIRECT_BINARY}" --role host "${host_args[@]}" \
   9>&- >"${host_log}" 2>&1 &
 host_pid=$!
 active_phase=host_started
 write_active_session
+host_expected_start_ticks=$(process_start_ticks "${host_pid}")
+if [[ "${host_expected_start_ticks}" == 0 ]]; then
+  echo "ERROR: could not pin Host start ticks before listener readiness" >&2
+  exit 5
+fi
 
-sleep "${KVAF_DIRECT_SERVER_START_DELAY_SECONDS}" || true
+host_listener_wait_rc=0
+wait_for_host_control_listener \
+  "${host_pid}" "${host_expected_start_ticks}" \
+  "${worker_expected_exe}" "${KVAF_DIRECT_CONTROL_PORT}" \
+  "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}" \
+  "${KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS}" ||
+  host_listener_wait_rc=$?
+if (( host_listener_wait_rc == 0 )); then
+  echo "KVAF_A5_HOST_CONTROL_LISTENER_READY pid=${host_pid} port=${KVAF_DIRECT_CONTROL_PORT}"
+elif (( host_listener_wait_rc == 2 )); then
+  echo "ERROR: this run's Host PID did not own the control LISTEN socket before the readiness deadline" >&2
+  retain_unproven_active_session \
+    "host_listener_readiness_timeout" \
+    host_terminal_unproven_process_stuck
+  run_completed=1
+  trap - EXIT
+  exit 5
+elif (( host_listener_wait_rc == 3 )); then
+  echo "ERROR: Host identity changed or terminal evidence appeared before listener readiness" >&2
+  exit 5
+fi
 if ! kill -0 "${host_pid}" 2>/dev/null; then
   set +e
   wait "${host_pid}"
@@ -1795,7 +1951,7 @@ fi
 
 active_phase=device_launch_intent
 write_active_session
-nohup "${KVAF_A5_DIRECT_BINARY}" --role device "${common_args[@]}" \
+nohup "${KVAF_A5_DIRECT_BINARY}" --role device "${device_args[@]}" \
   9>&- >"${device_log}" 2>&1 &
 device_pid=$!
 active_phase=device_started

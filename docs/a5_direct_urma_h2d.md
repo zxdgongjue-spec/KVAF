@@ -688,6 +688,10 @@ export KVAF_H2D_DESCRIPTOR_CAPACITY=4096
 export KVAF_H2D_BATCH_ITERATIONS=10
 export KVAF_H2D_TIMEOUT_SECONDS=120
 export KVAF_H2D_RUN_TIMEOUT_SECONDS=600
+unset KVAF_DIRECT_SERVER_START_DELAY_SECONDS
+export KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS=30
+# 默认按 Device timeout + listener-ready timeout + 5 秒计算；通常无需覆盖。
+unset KVAF_HOST_CONTROL_TIMEOUT_SECONDS
 export KVAF_DIRECT_CONTROL_PORT=22117
 # 最小 bring-up 每个 epoch 从 Host EID exact-match 本机 ipourma* global IPv6。
 export KVAF_DIRECT_CONTROL_SERVER_ADDRESS=auto
@@ -699,6 +703,30 @@ export KVAF_A5_RUN_TAG="npu7_checked_$(date +%Y%m%d_%H%M%S)_$$"
 
 bash scripts/run_a5_direct_urma_epoch_owner_validation.sh
 ```
+
+runner 不再用固定 sleep 猜测 Host server 是否启动。它固定本次 Host PID 的
+`start_ticks` 和可执行文件，再将该进程 `/proc/<pid>/fd` 持有的 socket inode 与
+同一 network namespace 的 `/proc/<pid>/net/tcp{,6}` 中 `LISTEN` 项精确求交；只有
+确认该 PID 已监听指定端口，才立即启动 Device。旧
+`KVAF_DIRECT_SERVER_START_DELAY_SECONDS` 会直接报参数错误，避免遗留的 5 秒延迟
+继续消耗 Host `accept()` deadline。
+
+Device provider 的控制超时仍由 `KVAF_H2D_TIMEOUT_SECONDS` 指定。Host 的监听窗口
+独立使用 `KVAF_HOST_CONTROL_TIMEOUT_SECONDS`；默认值是 Device timeout 加 listener
+ready timeout 再加 5 秒，并在 manifest 中分别记录。AIV 对 AICPU owner 的 READY
+观察使用单次一致性快照和 10 ms Host 节拍，不再设置一个会与 provider Open/cleanup
+竞争的第二截止时间。普通 TCP 超时必须等 owner 发布 `OPEN_FAILED_SAFE` 后按退出码
+3 收敛；若 owner 本身长期无终态，runner 以退出码 5 保留 live worker 和 active
+state，而不会仅因观察超时制造 quarantine。
+
+`KVAF_H2D_RUN_TIMEOUT_SECONDS` 从 Device 启动后计时；Host listener-ready 阶段由
+`KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS` 单独计时。因此最坏墙钟监督时长是两者
+之和，不应把 run timeout 理解为从 Host fork 起算的全局 deadline。
+
+不要把 Device URMA EID 直接自动填入 `KVAF_DIRECT_CONTROL_BIND_ADDRESS`。EID 能
+证明 UDMA endpoint，却不能证明同一 128-bit 值可在 AICPU 的 TCP network namespace
+执行 IPv6 `bind()`。当前最小路径先保持 bind 为空，让内核选源；若连接仍安全失败，
+应先用不创建 URMA/MR/Jetty 的 AICPU socket probe 验证显式源地址，再决定是否固定。
 
 当前 `vllm-ascend-cs-kvaf` 挂载全部 0–7 号设备，runner 要求逻辑卡号与物理卡号
 相等。二者不同时，无法在“不先创建 ACL device context”的前提下证明映射关系，

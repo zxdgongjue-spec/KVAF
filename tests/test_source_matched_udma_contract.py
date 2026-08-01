@@ -92,6 +92,26 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
         self.assertIn("saved_errno", communication)
         self.assertIn("kvaf_negative_errno_or(EIO)", provider)
 
+    def test_tcp_connect_retries_share_one_monotonic_deadline(self):
+        communication = self.read(
+            "access_operator/a5/provider/source_matched_communication.c"
+        )
+        connect = communication.index("static int kvaf_deadline_connect(")
+        sleep = communication.index("static int kvaf_deadline_usleep(")
+        include = communication.index(
+            "#include KVAF_PERFTEST_MGMT_TCP_SOURCE"
+        )
+        self.assertLess(connect, sleep)
+        self.assertLess(sleep, include)
+        self.assertIn(
+            "kvaf_deadline_remaining_ms() < 0", communication[connect:sleep]
+        )
+        self.assertIn(
+            "remaining_microseconds", communication[sleep:include]
+        )
+        self.assertIn("#define usleep kvaf_deadline_usleep", communication)
+        self.assertIn("#undef usleep", communication)
+
     def test_provider_config_layout_remains_fixed_and_semantically_pinned(self):
         abi = self.read(
             "access_operator/a5/provider/include/kvaf_urma_provider_abi.h"

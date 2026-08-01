@@ -85,7 +85,10 @@ static int kvaf_deadline_connect(
     int socket_error = 0;
     socklen_t socket_error_bytes = sizeof(socket_error);
 
-    if (original_flags < 0 ||
+    /* Upstream retries ECONNREFUSED on the same socket.  Reject every retry
+     * after the shared monotonic deadline, including failures that do not
+     * enter poll(), so its fixed retry loop cannot extend the contract. */
+    if (kvaf_deadline_remaining_ms() < 0 || original_flags < 0 ||
         fcntl(fd, F_SETFL, original_flags | O_NONBLOCK) != 0) {
         return -1;
     }
@@ -105,6 +108,22 @@ static int kvaf_deadline_connect(
         return -1;
     }
     return result;
+}
+
+static int kvaf_deadline_usleep(useconds_t requested_microseconds)
+{
+    const int remaining_milliseconds = kvaf_deadline_remaining_ms();
+    uint64_t remaining_microseconds;
+    useconds_t bounded_microseconds = requested_microseconds;
+
+    if (remaining_milliseconds < 0) {
+        return -1;
+    }
+    remaining_microseconds = (uint64_t)remaining_milliseconds * 1000U;
+    if ((uint64_t)bounded_microseconds > remaining_microseconds) {
+        bounded_microseconds = (useconds_t)remaining_microseconds;
+    }
+    return usleep(bounded_microseconds);
 }
 
 static int kvaf_deadline_accept(
@@ -151,7 +170,9 @@ static int kvaf_deadline_accept(
  */
 #define connect kvaf_deadline_connect
 #define accept kvaf_deadline_accept
+#define usleep kvaf_deadline_usleep
 #include KVAF_PERFTEST_MGMT_TCP_SOURCE
+#undef usleep
 #undef accept
 #undef connect
 

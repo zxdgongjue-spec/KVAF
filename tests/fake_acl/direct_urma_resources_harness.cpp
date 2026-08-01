@@ -41,6 +41,10 @@ DirectUrmaOpenSpec MakeSpec(std::vector<std::uint8_t>* backing,
   spec.local_allocation_bytes = backing->size();
   spec.segment_payload_bytes = 4096;
   spec.control_timeout_seconds = 10;
+  if (scenario == "ready_after_control_deadline" ||
+      scenario == "opening_then_open_failed_safe") {
+    spec.control_timeout_seconds = 1;
+  }
   if (spec.role == DirectUrmaRole::kServer) {
     spec.control_bind_address.clear();
   }
@@ -105,6 +109,12 @@ int main(int argc, char** argv) {
         resources.transport_teardown_retryable() ||
         resources.close_phase() !=
             DirectUrmaClosePhase::kUnsafeUnknown ||
+        open.message().find("aiv_status=3") == std::string::npos ||
+        open.message().find("owner_state=6") == std::string::npos ||
+        open.message().find("owner_result_code=2") ==
+            std::string::npos ||
+        open.message().find("provider_result_status=0") ==
+            std::string::npos ||
         kvaf_fake_acl_free_calls() != 0 ||
         kvaf_fake_acl_destroy_stream_calls() != 0) {
       return Fail("contradictory OPEN_FAILED_SAFE evidence was trusted");
@@ -121,7 +131,8 @@ int main(int argc, char** argv) {
     return 0;
   }
   if (scenario == "clock_failed_before_open" ||
-      scenario == "lease_expired_after_open") {
+      scenario == "lease_expired_after_open" ||
+      scenario == "opening_then_open_failed_safe") {
     const int expected_close_launches =
         scenario == "lease_expired_after_open" ? 1 : 0;
     if (open.ok() || !resources.transport_teardown_complete() ||
@@ -130,6 +141,13 @@ int main(int argc, char** argv) {
         kvaf_fake_acl_free_calls() != 5 ||
         kvaf_fake_acl_destroy_stream_calls() != 2) {
       return Fail("safe pre-READY terminal proof was not accepted");
+    }
+    if (scenario == "opening_then_open_failed_safe" &&
+        (open.message().find("provider_result_status=5") ==
+             std::string::npos ||
+         open.message().find("owner_result_code=2") ==
+             std::string::npos)) {
+      return Fail("late failed Open lost exact diagnostics");
     }
     return 0;
   }
@@ -201,7 +219,8 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  if (scenario == "ready_timeout_once") {
+  if (scenario == "ready_timeout_once" ||
+      scenario == "ready_after_control_deadline") {
     if (!resources.Close().ok() ||
         !resources.transport_teardown_complete() ||
         kvaf_fake_acl_close_launches() != 1) {

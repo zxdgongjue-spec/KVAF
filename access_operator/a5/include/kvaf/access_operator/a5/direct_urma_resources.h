@@ -100,6 +100,13 @@ struct DirectUrmaMemoryView {
 // this object and all backing memory and retry only when
 // transport_teardown_retryable() is true; object destruction is not an
 // ownership-recovery operation.
+//
+// For kAicpu, Open observes the one live owner until it publishes READY or a
+// proved terminal state.  It deliberately has no competing wrapper timeout:
+// abandoning an EMPTY/OPENING owner could free memory that a delayed KFC
+// launch later acquires.  Direct callers therefore need an external
+// supervisor that retains this process/object on operational timeout; the
+// repository runner provides that active-session contract.
 class DirectUrmaResources {
  public:
   DirectUrmaResources();

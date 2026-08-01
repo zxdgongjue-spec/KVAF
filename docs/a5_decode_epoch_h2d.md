@@ -41,8 +41,17 @@ device ABI 的 `entry_count` 可以在 `0..descriptor_capacity` 内逐批变化�
 允许 candidate 验证，用于测试不发 WQE 的 Open/Close。当前 smoke 的每项长度相同，
 但 device ABI 已经从 AccessTable 读取逐项 length；正式 Runtime 若要混合 KV block
 大小，应直接填逐项 length，而不是为每种大小重建连接。
-`KVAF_H2D_RUN_TIMEOUT_SECONDS` 只控制 Host/Device worker 的整次监督时间，不改变
-provider 控制连接 timeout；长时间 soak 应单独把它调大。
+`KVAF_H2D_RUN_TIMEOUT_SECONDS` 从 Device 启动后控制 Host/Device pair 的监督时间，
+不改变 provider 控制连接 timeout；Host 启动到 Device 启动之前另受 listener-ready
+timeout 约束，因此一次 runner 的最长墙钟时间约为两者之和。长时间 soak 应单独把
+pair 监督时间调大。
+
+控制连接启动也属于 epoch 初始化。runner 必须先确认本次 Host PID 已实际持有目标
+端口的 LISTEN socket，再启动 Device，不能用固定 sleep 猜测。Device provider 使用
+`KVAF_H2D_TIMEOUT_SECONDS`；Host 为覆盖 Device/AICPU 启动使用独立且更长的
+`KVAF_HOST_CONTROL_TIMEOUT_SECONDS`。READY 观察本身不再创建一个同长度截止时间：
+它持续观察同一个 AICPU owner，直到 READY 或带 teardown 证明的明确终态；整次运行
+是否超时由外层 runner 决定，并以 active state 保留尚未证明的所有权。
 
 ## 2. 为什么初始化必须与 BatchGet 分离
 

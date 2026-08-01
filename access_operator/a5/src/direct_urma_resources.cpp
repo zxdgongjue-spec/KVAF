@@ -36,7 +36,9 @@ constexpr std::uint32_t kProviderRequiredFlags =
     KVAF_URMA_PROVIDER_QUEUE_IS_AICPU_SHARED_VA;
 constexpr std::uint32_t kEpochOwnerPollMicroseconds = 1000U;
 constexpr std::uint32_t kEpochOwnerCloseRetryMicroseconds = 1000U;
-constexpr std::uint32_t kEpochOwnerAivPollBudget = 20000000U;
+constexpr std::uint32_t kEpochOwnerReadyAivPollBudget = 1U;
+constexpr std::uint32_t kEpochOwnerReadyRetryMicroseconds = 10000U;
+constexpr std::uint32_t kEpochOwnerShutdownAivPollBudget = 20000000U;
 
 static_assert(sizeof(rtAicpuArgsEx_t) == 48,
               "unexpected CANN rtAicpuArgsEx ABI");
@@ -776,14 +778,17 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
     }
     AicpuEpochOwnerAivResult ready_result{};
     kvaf_urma_epoch_owner_status_v1 ready_status{};
-    const auto ready_deadline = std::chrono::steady_clock::now() +
-        std::chrono::seconds(spec.control_timeout_seconds);
     while (status.ok()) {
+      // READY observation must never introduce a second timeout racing the
+      // provider's own Open cleanup.  Take one coherent AIV snapshot per
+      // launch, then yield on Host before observing the same owner again.
+      // The outer runner owns the operational supervision deadline; if it
+      // expires, the live worker and active-session record are retained.
       LaunchAivEpochOwnerWaitReady(
           impl_->control_stream, impl_->owner_status,
           impl_->device_open_result, impl_->owner_aiv_result,
           impl_->epoch_id, impl_->session_id,
-          kEpochOwnerAivPollBudget);
+          kEpochOwnerReadyAivPollBudget);
       status = impl_->SynchronizeWithRetry(
           impl_->control_stream,
           "aclrtSynchronizeStream(AIV epoch READY)");
@@ -809,15 +814,20 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
                             copy_result);
         break;
       }
-      if (ready_result.status != static_cast<std::uint32_t>(
-              AicpuEpochOwnerAivStatus::kTimedOut) ||
-          std::chrono::steady_clock::now() >= ready_deadline) {
+      const bool ready_still_pending =
+          ready_result.status == static_cast<std::uint32_t>(
+              AicpuEpochOwnerAivStatus::kTimedOut) &&
+          (ready_result.observed_owner_state ==
+               KVAF_URMA_EPOCH_OWNER_STATE_EMPTY ||
+           ready_result.observed_owner_state ==
+               KVAF_URMA_EPOCH_OWNER_STATE_OPENING);
+      if (!ready_still_pending) {
         break;
       }
 
       // One AIV poll task is intentionally finite. A slow TCP/resource Open
-      // gets another task on the same control stream until the Host-side
-      // control deadline; the AICPU owner itself is never relaunched.
+      // gets another task on the same control stream until READY or a proved
+      // terminal owner state; the AICPU owner itself is never relaunched.
       const AicpuEpochOwnerAivResult empty_retry_result{};
       copy_result = aclrtMemcpy(
           impl_->owner_aiv_result, sizeof(empty_retry_result),
@@ -826,6 +836,8 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
       if (copy_result != ACL_SUCCESS) {
         status = AclFailure(
             "aclrtMemcpy(epoch READY retry initialize)", copy_result);
+      } else {
+        (void)::usleep(kEpochOwnerReadyRetryMicroseconds);
       }
     }
     const bool ready_observed =
@@ -915,7 +927,22 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
         impl_->MarkUnsafeUnknown();
         status = Status::Error(
             StatusCode::kTransportError,
-            "AIV did not observe a valid resource-owning epoch READY");
+            "AIV did not observe a valid resource-owning epoch READY: "
+            "aiv_status=" + std::to_string(ready_result.status) +
+            " aiv_observed_owner_state=" +
+                std::to_string(ready_result.observed_owner_state) +
+            " aiv_poll_count=" +
+                std::to_string(ready_result.poll_count) +
+            " owner_state=" + std::to_string(ready_status.state) +
+            " owner_result_code=" +
+                std::to_string(ready_status.result_code) +
+            " owner_provider_status=" +
+                std::to_string(ready_status.provider_status) +
+            " owner_flags=" + std::to_string(ready_status.flags) +
+            " provider_result_status=" +
+                std::to_string(impl_->result.status) +
+            " provider_status=" +
+                std::to_string(impl_->result.provider_status));
       }
       (void)Close();
       return status;
@@ -1247,7 +1274,7 @@ Status DirectUrmaResources::Close() {
             queue_state_base + offsetof(DirectQueueState, sq_tail),
             queue_state_base + offsetof(DirectQueueState, cq_tail),
             impl_->epoch_id, impl_->session_id,
-            kEpochOwnerAivPollBudget);
+            kEpochOwnerShutdownAivPollBudget);
       }
 
       if (!impl_->shutdown_control_quiesced) {

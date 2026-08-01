@@ -4,8 +4,10 @@
 #include <arpa/inet.h>
 
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <string>
+#include <thread>
 
 #include "fake_acl_control.h"
 #include "kvaf/access_operator/a5/aiv_simt_urma_h2d_launcher.h"
@@ -355,6 +357,13 @@ extern "C" rtError_t rtAicpuKernelLaunchExWithArgs(
           KVAF_URMA_EPOCH_OWNER_STATE_OPEN_FAILED_SAFE;
       ++g_close_launches;
       g_last_close_session = args->config.session_id;
+    } else if (Scenario("opening_then_open_failed_safe")) {
+      result->status = KVAF_URMA_PROVIDER_CONNECT_FAILED;
+      result->provider_status = -ETIMEDOUT;
+      result->flags = 0;
+      owner_status->result_code = KVAF_URMA_EPOCH_OWNER_RESULT_OK;
+      owner_status->flags = 0;
+      owner_status->state = KVAF_URMA_EPOCH_OWNER_STATE_OPENING;
     } else if (Scenario("runtime_capability_partial")) {
       result->reserved[2] =
           KVAF_UDMA_TEARDOWN_SOURCE_OWNED_PARTIAL_RETRY_V1;
@@ -389,12 +398,32 @@ void LaunchAivEpochOwnerWaitReady(
   result.session_id = session_id;
   result.observed_owner_state = status->state;
   result.observed_sequence = status->sequence;
-  if (Scenario("ready_timeout_once") && g_ready_wait_launches == 1) {
+  if ((Scenario("ready_timeout_once") ||
+       Scenario("ready_after_control_deadline") ||
+       Scenario("opening_then_open_failed_safe")) &&
+      g_ready_wait_launches == 1) {
+    if (Scenario("ready_after_control_deadline") ||
+        Scenario("opening_then_open_failed_safe")) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    }
     result.status = static_cast<std::uint32_t>(
         AicpuEpochOwnerAivStatus::kTimedOut);
+    result.observed_owner_state = KVAF_URMA_EPOCH_OWNER_STATE_OPENING;
     *aiv_result = result;
     return;
   }
+  if (Scenario("opening_then_open_failed_safe") &&
+      g_ready_wait_launches == 2) {
+    g_owner_status->result_code =
+        KVAF_URMA_EPOCH_OWNER_RESULT_OPEN_FAILED;
+    g_owner_status->flags =
+        KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+        KVAF_URMA_EPOCH_OWNER_TEARDOWN_COMPLETE;
+    g_owner_status->state =
+        KVAF_URMA_EPOCH_OWNER_STATE_OPEN_FAILED_SAFE;
+  }
+  result.observed_owner_state = status->state;
+  result.observed_sequence = status->sequence;
   result.status = static_cast<std::uint32_t>(
       status->state == KVAF_URMA_EPOCH_OWNER_STATE_READY
           ? AicpuEpochOwnerAivStatus::kReadyObserved

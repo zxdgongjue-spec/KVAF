@@ -325,6 +325,33 @@ class DirectUrmaSourceSyntaxTests(unittest.TestCase):
         ):
             self.assertIn(field, self.resources_source)
 
+    def test_ready_observation_cannot_race_provider_open_cleanup(self) -> None:
+        open_start = self.resources_source.index(
+            "Status DirectUrmaResources::Open"
+        )
+        close_start = self.resources_source.index(
+            "Status DirectUrmaResources::Close", open_start
+        )
+        open_body = self.resources_source[open_start:close_start]
+        self.assertIn(
+            "kEpochOwnerReadyAivPollBudget = 1U", self.resources_source
+        )
+        self.assertIn(
+            "kEpochOwnerShutdownAivPollBudget = 20000000U",
+            self.resources_source,
+        )
+        self.assertIn("ready_still_pending", open_body)
+        self.assertIn(
+            "KVAF_URMA_EPOCH_OWNER_STATE_EMPTY", open_body
+        )
+        self.assertIn(
+            "KVAF_URMA_EPOCH_OWNER_STATE_OPENING", open_body
+        )
+        self.assertIn(
+            "::usleep(kEpochOwnerReadyRetryMicroseconds)", open_body
+        )
+        self.assertNotIn("ready_deadline", open_body)
+
     def test_smoke_payload_is_bounded_before_resource_acquisition(self) -> None:
         self.assertIn(
             "kSmokeMaxBatchBytes = 64ULL * 1024ULL * 1024ULL",

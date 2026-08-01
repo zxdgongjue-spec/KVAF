@@ -113,6 +113,12 @@ class DirectUrmaResourcesBehaviorTests(unittest.TestCase):
     def test_slow_open_reuses_owner_with_bounded_ready_tasks(self) -> None:
         self.run_scenario("ready_timeout_once")
 
+    def test_ready_observation_outlives_provider_control_deadline(self) -> None:
+        self.run_scenario("ready_after_control_deadline")
+
+    def test_opening_converges_to_safe_failed_open_after_deadline(self) -> None:
+        self.run_scenario("opening_then_open_failed_safe")
+
     def test_data_and_shutdown_share_one_fifo_stream(self) -> None:
         self.run_scenario("data_stream_fifo")
 
