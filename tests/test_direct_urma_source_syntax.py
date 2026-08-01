@@ -35,6 +35,13 @@ class DirectUrmaSourceSyntaxTests(unittest.TestCase):
             / "src"
             / "host_ddr_mapping.cpp"
         ).read_text(encoding="utf-8")
+        cls.runtime_kernel_header = (
+            ROOT
+            / "tests"
+            / "fake_acl"
+            / "runtime"
+            / "rt_external_kernel.h"
+        ).read_text(encoding="utf-8")
 
     def test_host_control_plane_sources_compile(self) -> None:
         compiler = shutil.which("c++") or shutil.which("g++")
@@ -77,10 +84,14 @@ class DirectUrmaSourceSyntaxTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_aicpu_kernel_type_uses_cann_scoped_enumerator(self) -> None:
+    def test_aicpu_kernel_type_uses_public_cann_abi_value(self) -> None:
         self.assertIn(
-            "rtKernelType_t::KERNEL_TYPE_AICPU_KFC",
+            "constexpr std::uint32_t kAicpuKfcKernelType = 5U;",
             self.resources_source,
+        )
+        self.assertNotIn("rtKernelType_t", self.runtime_kernel_header)
+        self.assertNotIn(
+            "KERNEL_TYPE_AICPU_KFC", self.runtime_kernel_header
         )
 
     def test_transport_safety_marker_precedes_runtime_detach(self) -> None:

@@ -23,9 +23,11 @@
 namespace kvaf::access::a5 {
 namespace {
 
-constexpr std::uint32_t kAicpuKfcKernelType =
-    static_cast<std::uint32_t>(
-        rtKernelType_t::KERNEL_TYPE_AICPU_KFC);
+// CANN's public rt_external_kernel.h accepts the kernel type as uint32_t but
+// does not expose the private rtKernelType_t enum.  The matching runtime ABI
+// assigns AICPU_KFC the stable value 5; keep that ABI value local so this
+// control plane builds against the public SDK rather than a private header.
+constexpr std::uint32_t kAicpuKfcKernelType = 5U;
 constexpr std::uint32_t kProviderRequiredFlags =
     KVAF_URMA_PROVIDER_CONNECTED |
     KVAF_URMA_PROVIDER_REMOTE_EID_NETWORK_ORDER |

@@ -28,10 +28,6 @@ typedef struct tagRtAicpuArgsEx {
   uint8_t reserved;
 } rtAicpuArgsEx_t;
 
-typedef enum rtKernelType {
-  KERNEL_TYPE_AICPU_KFC = 5,
-} rtKernelType_t;
-
 rtError_t rtAicpuKernelLaunchExWithArgs(
     uint32_t kernel_type, const char_t* op_name, uint32_t num_blocks,
     const rtAicpuArgsEx_t* args_info, rtSmDesc_t* sm_desc,
