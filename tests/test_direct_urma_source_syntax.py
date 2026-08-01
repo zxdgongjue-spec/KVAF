@@ -84,11 +84,7 @@ class DirectUrmaSourceSyntaxTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_aicpu_kernel_type_uses_public_cann_abi_value(self) -> None:
-        self.assertIn(
-            "constexpr std::uint32_t kAicpuKfcKernelType = 5U;",
-            self.resources_source,
-        )
+    def test_fake_cann_header_does_not_export_private_kernel_type(self) -> None:
         self.assertNotIn("rtKernelType_t", self.runtime_kernel_header)
         self.assertNotIn(
             "KERNEL_TYPE_AICPU_KFC", self.runtime_kernel_header

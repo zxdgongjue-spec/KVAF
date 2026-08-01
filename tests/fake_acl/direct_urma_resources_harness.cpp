@@ -78,6 +78,16 @@ int main(int argc, char** argv) {
     return Fail("scenario unexpectedly failed Open");
   }
 
+  if (scenario == "kernel_type") {
+    if (kvaf_fake_acl_last_kernel_type() != 5U) {
+      return Fail("AICPU launch did not use the KFC kernel-type ABI value");
+    }
+    if (!resources.Close().ok()) {
+      return Fail("kernel-type scenario failed Close");
+    }
+    return 0;
+  }
+
   if (scenario == "close_d2h_retry") {
     if (resources.Close().ok() || resources.transport_teardown_complete()) {
       return Fail("lost close result was incorrectly accepted as safe");

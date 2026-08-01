@@ -1,6 +1,8 @@
 #ifndef KVAF_TEST_FAKE_ACL_CONTROL_H
 #define KVAF_TEST_FAKE_ACL_CONTROL_H
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -12,6 +14,7 @@ int kvaf_fake_acl_free_calls(void);
 int kvaf_fake_acl_destroy_stream_calls(void);
 unsigned long long kvaf_fake_acl_open_session(void);
 unsigned long long kvaf_fake_acl_last_close_session(void);
+uint32_t kvaf_fake_acl_last_kernel_type(void);
 
 #ifdef __cplusplus
 }

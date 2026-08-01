@@ -18,6 +18,7 @@ int g_close_launches = 0;
 int g_free_calls = 0;
 int g_destroy_stream_calls = 0;
 int g_d2h_copies = 0;
+std::uint32_t g_last_kernel_type = 0;
 std::uint64_t g_open_session = 0;
 std::uint64_t g_last_close_session = 0;
 
@@ -67,6 +68,7 @@ extern "C" void kvaf_fake_acl_set_scenario(const char* scenario) {
   g_free_calls = 0;
   g_destroy_stream_calls = 0;
   g_d2h_copies = 0;
+  g_last_kernel_type = 0;
   g_open_session = 0;
   g_last_close_session = 0;
 }
@@ -93,6 +95,10 @@ extern "C" unsigned long long kvaf_fake_acl_open_session(void) {
 
 extern "C" unsigned long long kvaf_fake_acl_last_close_session(void) {
   return g_last_close_session;
+}
+
+extern "C" uint32_t kvaf_fake_acl_last_kernel_type(void) {
+  return g_last_kernel_type;
 }
 
 extern "C" aclError aclInit(const char*) { return ACL_SUCCESS; }
@@ -161,8 +167,9 @@ extern "C" aclError aclrtMemcpy(void* destination,
 }
 
 extern "C" rtError_t rtAicpuKernelLaunchExWithArgs(
-    uint32_t, const char_t* op_name, uint32_t,
+    uint32_t kernel_type, const char_t* op_name, uint32_t,
     const rtAicpuArgsEx_t* args_info, rtSmDesc_t*, rtStream_t, uint32_t) {
+  g_last_kernel_type = kernel_type;
   if (std::strcmp(op_name, "kvaf_direct_urma_open") == 0) {
     auto* args = static_cast<kvaf_urma_aicpu_open_args_v2*>(
         args_info->args);

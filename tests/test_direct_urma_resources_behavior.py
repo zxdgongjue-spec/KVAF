@@ -107,6 +107,9 @@ class DirectUrmaResourcesBehaviorTests(unittest.TestCase):
     def test_open_sync_transient_is_retried(self) -> None:
         self.run_scenario("sync_retry")
 
+    def test_aicpu_launch_uses_kfc_kernel_type_abi(self) -> None:
+        self.run_scenario("kernel_type")
+
     def test_double_sync_failure_retains_every_allocation(self) -> None:
         self.run_scenario("sync_twice")
 
