@@ -322,7 +322,7 @@ source_roots=(
   "${KVAF_URMA_PERFTEST_ROOT}/ubengine/ssapi/userspace/include/ummu"
   "${KVAF_URMA_PERFTEST_ROOT}/ubengine/ssapi/userspace/udma"
   "${KVAF_URMA_PERFTEST_ROOT}/ubengine/ssapi/userspace/ummu"
-  "${KVAF_UMMU_UAPI_HEADER}"
+  "${KVAF_UMMU_UAPI_ROOT}/include/uapi"
 )
 enumerate_provider_sources()
 {

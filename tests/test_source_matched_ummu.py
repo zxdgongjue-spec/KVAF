@@ -107,6 +107,23 @@ class SourceMatchedUmmuTests(unittest.TestCase):
         self.assertIn("udma_teardown_contract=checked-retryable-v1", script)
         self.assertIn("external liburma/UMMU/UDMA code", script)
 
+    def test_builder_hashes_the_complete_pinned_uapi_header_tree(self):
+        script = (
+            ROOT / "scripts" / "build_a5_direct_urma_provider.sh"
+        ).read_text(encoding="utf-8")
+        roots_start = script.index("source_roots=(\n")
+        roots_end = script.index("\n)\n", roots_start)
+        source_roots = script[roots_start:roots_end]
+
+        self.assertIn(
+            '"${KVAF_UMMU_UAPI_ROOT}/include/uapi"', source_roots
+        )
+        self.assertNotIn('"${KVAF_UMMU_UAPI_HEADER}"', source_roots)
+        self.assertIn("-name '*.h'", script)
+        self.assertIn(
+            '"${legacy_ummu_uapi_root}/"*)', script
+        )
+
     def test_uapi_probe_is_published_and_rechecked_before_hardware(self):
         cmake = (PROVIDER / "CMakeLists.txt").read_text(encoding="utf-8")
         builder = (
