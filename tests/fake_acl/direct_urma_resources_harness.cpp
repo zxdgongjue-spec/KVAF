@@ -34,11 +34,23 @@ DirectUrmaOpenSpec MakeSpec(std::vector<std::uint8_t>* backing,
   spec.urma_device = "udmac0d1e4";
   spec.local_eid = "0000:0000:0000:0200:0010:0000:df00:4100";
   spec.peer_eid = "0000:0000:007f:0400:0010:0000:df0a:0b00";
+  spec.control_server_address = "127.0.0.1";
+  spec.control_bind_address = "127.0.0.1";
   spec.local_address =
       reinterpret_cast<std::uint64_t>(backing->data());
   spec.local_allocation_bytes = backing->size();
   spec.segment_payload_bytes = 4096;
   spec.control_timeout_seconds = 10;
+  if (spec.role == DirectUrmaRole::kServer) {
+    spec.control_bind_address.clear();
+  }
+  if (scenario == "invalid_control_ip") {
+    spec.control_server_address = "not-an-ip";
+  } else if (scenario == "mixed_control_ip_family") {
+    spec.control_bind_address = "::1";
+  } else if (scenario == "server_control_bind") {
+    spec.role = DirectUrmaRole::kServer;
+  }
   return spec;
 }
 
@@ -53,6 +65,17 @@ int main(int argc, char** argv) {
   std::vector<std::uint8_t> backing(8192);
   DirectUrmaResources resources;
   const auto open = resources.Open(MakeSpec(&backing, scenario, argv[2]));
+
+  if (scenario == "invalid_control_ip" ||
+      scenario == "mixed_control_ip_family" ||
+      scenario == "server_control_bind") {
+    if (open.ok() || kvaf_fake_acl_open_session() != 0 ||
+        kvaf_fake_acl_close_launches() != 0 ||
+        kvaf_fake_acl_free_calls() != 0) {
+      return Fail("invalid TCP control address acquired provider resources");
+    }
+    return 0;
+  }
 
   if (scenario == "sync_twice") {
     if (open.ok() || resources.transport_teardown_complete() ||
@@ -124,7 +147,13 @@ int main(int argc, char** argv) {
         resources.transport_teardown_retryable() ||
         kvaf_fake_acl_close_launches() != 1 ||
         kvaf_fake_acl_open_session() !=
-            kvaf_fake_acl_last_close_session()) {
+            kvaf_fake_acl_last_close_session() ||
+        open.message().find("provider_result_status=7") ==
+            std::string::npos ||
+        open.message().find("provider_status=-3") ==
+            std::string::npos ||
+        open.message().find("owner_result_code=2") ==
+            std::string::npos) {
       return Fail("failed Open did not teardown in its owner invocation");
     }
     return 0;

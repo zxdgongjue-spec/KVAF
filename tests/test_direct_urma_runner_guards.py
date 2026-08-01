@@ -195,6 +195,28 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
         self.assertIn("h2d_control_timeout_seconds=%s", self.source)
         self.assertIn("h2d_run_timeout_seconds=%s", self.source)
 
+    def test_tcp_control_addresses_are_explicit_validated_and_audited(self) -> None:
+        for expected in (
+            "KVAF_DIRECT_CONTROL_SERVER_ADDRESS",
+            "KVAF_DIRECT_CONTROL_BIND_ADDRESS",
+            "normalize_numeric_ip",
+            "control_server_address=%s",
+            "control_bind_address=%s",
+            '--control-server-address "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}"',
+            '--control-bind-address "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}"',
+            "URMA EIDs are not TCP management addresses.",
+        ):
+            self.assertIn(expected, self.source)
+        validation = self.source.index(
+            "if ! KVAF_DIRECT_CONTROL_SERVER_ADDRESS=$("
+        )
+        affinity = self.source.index(
+            "kvaf_require_aicpu_affinity_contract", validation
+        )
+        eid = self.source.index("resolve_a5_urma_eids.py", affinity)
+        self.assertLess(validation, affinity)
+        self.assertLess(validation, eid)
+
     def test_urma_endpoints_are_exactly_resolved_before_npu_resources(self) -> None:
         pair = self.source.index("resolve_a5_urma_eids.py")
         endpoints = self.source.index("endpoint_resolver_args=(", pair)

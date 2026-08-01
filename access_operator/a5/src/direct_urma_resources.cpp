@@ -67,6 +67,20 @@ bool IsPowerOfTwo(std::uint32_t value) {
   return value != 0 && (value & (value - 1U)) == 0;
 }
 
+int NumericIpFamily(const std::string& address) {
+  in_addr ipv4{};
+  in6_addr ipv6{};
+  if (!address.empty() &&
+      inet_pton(AF_INET, address.c_str(), &ipv4) == 1) {
+    return AF_INET;
+  }
+  if (!address.empty() &&
+      inet_pton(AF_INET6, address.c_str(), &ipv6) == 1) {
+    return AF_INET6;
+  }
+  return AF_UNSPEC;
+}
+
 bool RangeContains(std::uint64_t base, std::uint64_t capacity,
                    std::uint64_t address, std::uint64_t bytes) {
   return address >= base && bytes <= capacity &&
@@ -428,6 +442,30 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
     return Status::Error(StatusCode::kOutOfRange,
                          "direct URMA segment payload is too large");
   }
+  const int control_family = NumericIpFamily(
+      spec.control_server_address);
+  const int bind_family = spec.control_bind_address.empty()
+                              ? AF_UNSPEC
+                              : NumericIpFamily(spec.control_bind_address);
+  std::array<std::uint8_t, 16> local_eid{};
+  std::array<std::uint8_t, 16> peer_eid{};
+  if (inet_pton(AF_INET6, spec.local_eid.c_str(), local_eid.data()) != 1 ||
+      inet_pton(AF_INET6, spec.peer_eid.c_str(), peer_eid.data()) != 1 ||
+      local_eid == peer_eid) {
+    return Status::Error(
+        StatusCode::kInvalidArgument,
+        "local/peer URMA EIDs must be distinct numeric IPv6 values");
+  }
+  if (control_family == AF_UNSPEC ||
+      (spec.role == DirectUrmaRole::kServer &&
+       !spec.control_bind_address.empty()) ||
+      (!spec.control_bind_address.empty() &&
+       bind_family != control_family)) {
+    return Status::Error(
+        StatusCode::kInvalidArgument,
+        "TCP control server/bind addresses must be numeric, use one IP "
+        "family, and keep the server bind empty for wildcard listen");
+  }
   const std::uint64_t minimum_half =
       std::max<std::uint64_t>(spec.segment_payload_bytes, 4096U);
   if (spec.local_allocation_bytes < minimum_half * 2U) {
@@ -444,6 +482,7 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
                     ? KVAF_URMA_PROVIDER_SERVER
                     : KVAF_URMA_PROVIDER_CLIENT;
   config.flags = KVAF_URMA_PROVIDER_USE_CTP |
+                 KVAF_URMA_PROVIDER_EXPLICIT_TCP_MANAGEMENT |
                  (spec.execution_domain ==
                           DirectUrmaExecutionDomain::kHostProcess
                       ? KVAF_URMA_PROVIDER_EXPECT_HOST_PRIVATE_ABI
@@ -468,15 +507,15 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
   if (!status.ok()) {
     return status;
   }
-  status = CopyFixedString(spec.local_eid, config.local_eid,
-                           sizeof(config.local_eid), "local EID",
-                           spec.role == DirectUrmaRole::kServer);
+  status = CopyFixedString(
+      spec.control_server_address, config.control_server_address,
+      sizeof(config.control_server_address), "TCP control server address");
   if (!status.ok()) {
     return status;
   }
-  status = CopyFixedString(spec.peer_eid, config.peer_eid,
-                           sizeof(config.peer_eid), "peer EID",
-                           spec.role == DirectUrmaRole::kServer);
+  status = CopyFixedString(
+      spec.control_bind_address, config.control_bind_address,
+      sizeof(config.control_bind_address), "TCP control bind address", true);
   if (!status.ok()) {
     return status;
   }
@@ -862,7 +901,13 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
           impl_->MarkProviderClosed();
           status = Status::Error(
               StatusCode::kTransportError,
-              "AICPU epoch owner failed Open and completed safe teardown");
+              "AICPU epoch owner failed Open and completed safe teardown: "
+              "provider_result_status=" +
+                  std::to_string(impl_->result.status) +
+              " provider_status=" +
+                  std::to_string(impl_->result.provider_status) +
+              " owner_result_code=" +
+                  std::to_string(ready_status.result_code));
         } else {
           status = join_status;
         }

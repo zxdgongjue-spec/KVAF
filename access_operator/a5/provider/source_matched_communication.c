@@ -158,6 +158,8 @@ static int kvaf_deadline_accept(
 int kvaf_perftest_establish_connection(const perftest_config_t *cfg)
 {
     comm_tcp_cfg_t tcp_cfg;
+    int result;
+    int saved_errno;
 
     if (cfg == NULL || cfg->mgmt_type != PERFTEST_MGMT_TCP) {
         errno = EINVAL;
@@ -168,7 +170,19 @@ int kvaf_perftest_establish_connection(const perftest_config_t *cfg)
     tcp_cfg.enable_ipv6 = cfg->enable_ipv6;
     tcp_cfg.port = cfg->port;
     tcp_cfg.sock_num = cfg->pair_num;
-    return tcp_establish_connection(&tcp_cfg);
+    errno = 0;
+    result = tcp_establish_connection(&tcp_cfg);
+    if (result == 0) {
+        return 0;
+    }
+    /*
+     * Upstream collapses DNS/bind/connect/accept failures to -1 and its
+     * cleanup can overwrite errno. Preserve the best concrete socket errno;
+     * use EIO only when the upstream path supplied no errno at all.
+     */
+    saved_errno = errno == 0 ? EIO : errno;
+    errno = saved_errno;
+    return -1;
 }
 
 void kvaf_perftest_close_connection(perftest_config_t *cfg)

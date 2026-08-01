@@ -67,8 +67,14 @@ struct DirectUrmaOpenSpec {
   std::string provider_library_path;
   std::string provider_soname{"libkvaf_urma_provider_device.so"};
   std::string urma_device;
+  // URMA EIDs are used only to validate the exchanged transport resource.
   std::string local_eid;
   std::string peer_eid;
+  // TCP management is an ordinary IP channel and is independent of EIDs.
+  // The server listens on the wildcard address of this numeric IP's family;
+  // the client connects to it and may optionally bind control_bind_address.
+  std::string control_server_address;
+  std::string control_bind_address;
   std::uint32_t eid_index{0};
   std::uint32_t control_port{21115};
   std::uint32_t control_timeout_seconds{120};

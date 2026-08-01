@@ -116,6 +116,15 @@ class DirectUrmaResourcesBehaviorTests(unittest.TestCase):
     def test_data_and_shutdown_share_one_fifo_stream(self) -> None:
         self.run_scenario("data_stream_fifo")
 
+    def test_tcp_control_ip_must_be_numeric(self) -> None:
+        self.run_scenario("invalid_control_ip")
+
+    def test_tcp_control_ip_families_must_match(self) -> None:
+        self.run_scenario("mixed_control_ip_family")
+
+    def test_tcp_server_bind_is_always_wildcard(self) -> None:
+        self.run_scenario("server_control_bind")
+
     def test_double_sync_failure_retains_every_allocation(self) -> None:
         self.run_scenario("sync_twice")
 
@@ -137,7 +146,7 @@ class DirectUrmaResourcesBehaviorTests(unittest.TestCase):
     def test_open_result_copy_failure_closes_exact_session(self) -> None:
         self.run_scenario("open_d2h_failure")
 
-    def test_failed_open_is_closed_inside_same_owner_invocation(self) -> None:
+    def test_failed_open_is_closed_and_reports_exact_diagnostics(self) -> None:
         self.run_scenario("open_cleanup_retryable")
 
     def test_host_retryable_failed_open_preserves_session_for_close(self) -> None:

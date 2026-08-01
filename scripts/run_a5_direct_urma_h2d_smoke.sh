@@ -49,6 +49,8 @@ KVAF_HCCN_TIMEOUT_SECONDS=${KVAF_HCCN_TIMEOUT_SECONDS:-30}
 KVAF_LOGICAL_DEVICE_ID=${KVAF_LOGICAL_DEVICE_ID:-0}
 KVAF_PHYSICAL_DEVICE_ID=${KVAF_PHYSICAL_DEVICE_ID:-}
 KVAF_DIRECT_CONTROL_PORT=${KVAF_DIRECT_CONTROL_PORT:-21115}
+KVAF_DIRECT_CONTROL_SERVER_ADDRESS=${KVAF_DIRECT_CONTROL_SERVER_ADDRESS:-}
+KVAF_DIRECT_CONTROL_BIND_ADDRESS=${KVAF_DIRECT_CONTROL_BIND_ADDRESS:-}
 kvaf_legacy_h2d_bytes_is_set=0
 kvaf_transfer_count_is_set=0
 kvaf_bytes_per_transfer_is_set=0
@@ -131,6 +133,18 @@ require_uint_max()
     echo "ERROR: ${name} exceeds ${maximum}, got ${value}" >&2
     exit 2
   }
+}
+
+normalize_numeric_ip()
+{
+  python3 -c '
+import ipaddress
+import sys
+try:
+    print(ipaddress.ip_address(sys.argv[1]).compressed)
+except ValueError:
+    raise SystemExit(1)
+' "$1"
 }
 
 manifest_value()
@@ -562,6 +576,28 @@ if (( KVAF_DIRECT_CONTROL_PORT < 1024 ||
       KVAF_DIRECT_CONTROL_PORT > 65535 )); then
   echo "ERROR: KVAF_DIRECT_CONTROL_PORT must be in [1024, 65535]" >&2
   exit 2
+fi
+if ! KVAF_DIRECT_CONTROL_SERVER_ADDRESS=$(
+  normalize_numeric_ip "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}"
+); then
+  echo "ERROR: KVAF_DIRECT_CONTROL_SERVER_ADDRESS must be a numeric IPv4 or IPv6 address" >&2
+  echo "URMA EIDs are not TCP management addresses." >&2
+  exit 2
+fi
+if [[ -n "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}" ]]; then
+  if ! KVAF_DIRECT_CONTROL_BIND_ADDRESS=$(
+    normalize_numeric_ip "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}"
+  ); then
+    echo "ERROR: KVAF_DIRECT_CONTROL_BIND_ADDRESS must be empty or a numeric IPv4/IPv6 address" >&2
+    exit 2
+  fi
+  if { [[ "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}" == *:* ]] &&
+       [[ "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}" != *:* ]]; } ||
+     { [[ "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}" != *:* ]] &&
+       [[ "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}" == *:* ]]; }; then
+    echo "ERROR: control server and client bind addresses must use the same IP family" >&2
+    exit 2
+  fi
 fi
 if (( KVAF_H2D_BYTES_PER_TRANSFER == 0 ||
       KVAF_H2D_BATCH_ITERATIONS == 0 ||
@@ -1118,6 +1154,10 @@ archive_sha=$(
   printf 'device_urma_device=%s\n' "${KVAF_DEVICE_URMA_DEVICE}"
   printf 'device_eid_index=%s\n' "${KVAF_DEVICE_EID_INDEX}"
   printf 'control_port=%s\n' "${KVAF_DIRECT_CONTROL_PORT}"
+  printf 'control_server_address=%s\n' \
+    "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}"
+  printf 'control_bind_address=%s\n' \
+    "${KVAF_DIRECT_CONTROL_BIND_ADDRESS:-none}"
   printf 'h2d_workload_mode=%s\n' "${kvaf_h2d_workload_mode}"
   printf 'h2d_transfer_count=%s\n' "${KVAF_H2D_TRANSFER_COUNT}"
   printf 'h2d_bytes_per_transfer=%s\n' \
@@ -1214,12 +1254,18 @@ common_args=(
   --run-id "${kvaf_run_id}"
   --logical-device-id "${KVAF_LOGICAL_DEVICE_ID}"
   --control-port "${KVAF_DIRECT_CONTROL_PORT}"
+  --control-server-address "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}"
   --transfer-count "${KVAF_H2D_TRANSFER_COUNT}"
   --bytes-per-transfer "${KVAF_H2D_BYTES_PER_TRANSFER}"
   --batch-iterations "${KVAF_H2D_BATCH_ITERATIONS}"
   --descriptor-capacity "${KVAF_H2D_DESCRIPTOR_CAPACITY}"
   --timeout-seconds "${KVAF_H2D_TIMEOUT_SECONDS}"
 )
+if [[ -n "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}" ]]; then
+  common_args+=(
+    --control-bind-address "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}"
+  )
+fi
 
 host_pid=
 device_pid=
@@ -1539,6 +1585,8 @@ echo "LOGICAL_DEVICE_ID=${KVAF_LOGICAL_DEVICE_ID}"
 echo "HOST_URMA=${KVAF_HOST_URMA_DEVICE}/eid${KVAF_HOST_EID_INDEX}"
 echo "DEVICE_URMA=${KVAF_DEVICE_URMA_DEVICE}/eid${KVAF_DEVICE_EID_INDEX}"
 echo "CONTROL_PORT=${KVAF_DIRECT_CONTROL_PORT}"
+echo "CONTROL_SERVER_ADDRESS=${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}"
+echo "CONTROL_BIND_ADDRESS=${KVAF_DIRECT_CONTROL_BIND_ADDRESS:-none}"
 echo "RUN_ID=${kvaf_run_id}"
 echo "H2D_CONTROL_TIMEOUT_SECONDS=${KVAF_H2D_TIMEOUT_SECONDS}"
 echo "H2D_RUN_TIMEOUT_SECONDS=${KVAF_H2D_RUN_TIMEOUT_SECONDS}"

@@ -51,6 +51,11 @@ Jetty/JFC/SQ/CQ 创建和 Host DDR/NPU HBM 注册。这些操作既慢，又改�
 如果每轮 decode 都重复执行，会把控制面延迟放进 token 热路径，并显著扩大失败和
 teardown 风险。
 
+TCP 控制地址与 URMA EID 是不同地址域：runner 必须用
+`KVAF_DIRECT_CONTROL_SERVER_ADDRESS` 显式提供数值 IPv4/IPv6 地址，client 可用
+`KVAF_DIRECT_CONTROL_BIND_ADDRESS` 选择同族源地址；server 始终 wildcard listen。
+EID 只参与 URMA endpoint 和交换结果校验，绝不能传给 TCP `-S/--bind_ip`。
+
 因此生命周期应拆成三段：
 
 | 阶段 | 执行动作 | 频率 |

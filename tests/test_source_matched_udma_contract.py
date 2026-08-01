@@ -50,6 +50,58 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
             self.assertNotIn("dev_buf", source)
             self.assertNotIn("comm.sock_fd", source)
 
+    def test_tcp_management_addresses_are_never_urma_eids(self):
+        provider = self.read(
+            "access_operator/a5/provider/urma_perftest_provider.c"
+        )
+        abi = self.read(
+            "access_operator/a5/provider/include/kvaf_urma_provider_abi.h"
+        )
+        communication = self.read(
+            "access_operator/a5/provider/source_matched_communication.c"
+        )
+
+        for field in (
+            "control_server_address",
+            "control_bind_address",
+        ):
+            self.assertIn(field, abi)
+            self.assertIn(field, provider)
+        self.assertIn(
+            "KVAF_URMA_PROVIDER_EXPLICIT_TCP_MANAGEMENT", abi
+        )
+        self.assertIn("kvaf_numeric_ip_family", provider)
+        self.assertIn("AF_INET", provider)
+        self.assertIn("AF_INET6", provider)
+        self.assertIn(
+            "KVAF_ADD_ARG(input->control_server_address)", provider
+        )
+        self.assertIn(
+            "KVAF_ADD_ARG(input->control_bind_address)", provider
+        )
+        parse_start = provider.index("static int kvaf_parse_config(")
+        parse_end = provider.index(
+            "static bool kvaf_ummu_checked_runtime_is_armed", parse_start
+        )
+        parse = provider[parse_start:parse_end]
+        self.assertNotIn("local_eid", parse)
+        self.assertNotIn("peer_eid", parse)
+        self.assertIn("input->role == KVAF_URMA_PROVIDER_CLIENT", parse)
+        self.assertIn("control_family == AF_INET6", parse)
+        self.assertIn("errno = 0", communication)
+        self.assertIn("saved_errno", communication)
+        self.assertIn("kvaf_negative_errno_or(EIO)", provider)
+
+    def test_provider_config_layout_remains_fixed_and_semantically_pinned(self):
+        abi = self.read(
+            "access_operator/a5/provider/include/kvaf_urma_provider_abi.h"
+        )
+        self.assertIn(
+            "sizeof(kvaf_urma_provider_config_v2) == 256", abi
+        )
+        self.assertIn("control_server_address) == 104", abi)
+        self.assertIn("control_bind_address) == 168", abi)
+
     def test_embedded_perftest_legacy_dependencies_are_private_and_closed(self):
         cmake = self.read("access_operator/a5/provider/CMakeLists.txt")
         resources = self.read(

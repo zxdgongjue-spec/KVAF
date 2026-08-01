@@ -21,7 +21,7 @@ extern "C" {
 #define KVAF_URMA_PROVIDER_MAGIC 0x4b555250U
 #define KVAF_URMA_PROVIDER_ABI_VERSION 2U
 #define KVAF_URMA_PROVIDER_NAME_BYTES 32U
-#define KVAF_URMA_PROVIDER_EID_TEXT_BYTES 64U
+#define KVAF_URMA_PROVIDER_CONTROL_ADDRESS_BYTES 64U
 
 /*
  * Resource-free AICPU owner probe ABI.  This protocol proves only that one
@@ -203,6 +203,13 @@ enum kvaf_urma_provider_config_flag {
   KVAF_URMA_PROVIDER_USE_CTP = 1U << 0,
   KVAF_URMA_PROVIDER_EXPECT_HOST_PRIVATE_ABI = 1U << 1,
   KVAF_URMA_PROVIDER_EXPECT_DEVICE_PRIVATE_ABI = 1U << 2,
+  /*
+   * The two fixed text slots carry TCP management addresses, never URMA
+   * EIDs. Requiring this bit makes an old binary/new provider (or the
+   * reverse) fail closed even though the fixed 256-byte wire layout is
+   * intentionally preserved.
+   */
+  KVAF_URMA_PROVIDER_EXPLICIT_TCP_MANAGEMENT = 1U << 3,
 };
 
 enum kvaf_urma_provider_address_kind {
@@ -303,8 +310,14 @@ struct kvaf_urma_provider_config_v2 {
   uint64_t local_allocation_bytes;
   uint64_t segment_payload_bytes;
   char device_name[KVAF_URMA_PROVIDER_NAME_BYTES];
-  char local_eid[KVAF_URMA_PROVIDER_EID_TEXT_BYTES];
-  char peer_eid[KVAF_URMA_PROVIDER_EID_TEXT_BYTES];
+  // Numeric IPv4/IPv6 address used by the client as its TCP connect target.
+  // The server uses only its address family and always listens on wildcard.
+  char control_server_address[
+      KVAF_URMA_PROVIDER_CONTROL_ADDRESS_BYTES];
+  // Optional numeric client-side TCP bind address. It must be empty for the
+  // server role and, when present, have the same family as the server address.
+  char control_bind_address[
+      KVAF_URMA_PROVIDER_CONTROL_ADDRESS_BYTES];
   uint64_t reserved[3];
 };
 
@@ -491,6 +504,12 @@ static_assert(offsetof(kvaf_urma_provider_config_v2, session_id) == 40,
               "unexpected direct URMA config session offset");
 static_assert(offsetof(kvaf_urma_provider_config_v2, local_address) == 48,
               "unexpected direct URMA config address offset");
+static_assert(offsetof(kvaf_urma_provider_config_v2,
+                       control_server_address) == 104,
+              "unexpected direct URMA control server address offset");
+static_assert(offsetof(kvaf_urma_provider_config_v2,
+                       control_bind_address) == 168,
+              "unexpected direct URMA control bind address offset");
 static_assert(offsetof(kvaf_urma_provider_result_v2, session_id) == 160,
               "unexpected direct URMA result session offset");
 static_assert(offsetof(kvaf_urma_aicpu_close_args_v2, result_address) == 72,
@@ -563,6 +582,12 @@ _Static_assert(offsetof(struct kvaf_urma_provider_config_v2, session_id) == 40,
                "unexpected direct URMA config session offset");
 _Static_assert(offsetof(struct kvaf_urma_provider_config_v2, local_address) == 48,
                "unexpected direct URMA config address offset");
+_Static_assert(offsetof(struct kvaf_urma_provider_config_v2,
+                        control_server_address) == 104,
+               "unexpected direct URMA control server address offset");
+_Static_assert(offsetof(struct kvaf_urma_provider_config_v2,
+                        control_bind_address) == 168,
+               "unexpected direct URMA control bind address offset");
 _Static_assert(offsetof(struct kvaf_urma_provider_result_v2, session_id) == 160,
                "unexpected direct URMA result session offset");
 _Static_assert(offsetof(struct kvaf_urma_aicpu_close_args_v2,

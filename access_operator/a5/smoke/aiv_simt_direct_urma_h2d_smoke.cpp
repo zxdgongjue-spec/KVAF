@@ -26,6 +26,7 @@
 #include <utility>
 #include <vector>
 
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -93,6 +94,8 @@ struct Options {
   std::string device_urma_device;
   std::string provider_library;
   std::string provider_soname{"libkvaf_urma_provider_device.so"};
+  std::string control_server_address;
+  std::string control_bind_address;
   std::string exchange_dir;
   std::string run_id;
   std::uint32_t host_eid_index{0};
@@ -130,6 +133,20 @@ bool ParseUnsigned(const std::string& text, std::uint64_t* value) {
   }
   *value = static_cast<std::uint64_t>(parsed);
   return true;
+}
+
+int NumericIpFamily(const std::string& address) {
+  in_addr ipv4{};
+  in6_addr ipv6{};
+  if (!address.empty() &&
+      inet_pton(AF_INET, address.c_str(), &ipv4) == 1) {
+    return AF_INET;
+  }
+  if (!address.empty() &&
+      inet_pton(AF_INET6, address.c_str(), &ipv6) == 1) {
+    return AF_INET6;
+  }
+  return AF_UNSPEC;
 }
 
 int HexNibble(char value) {
@@ -237,6 +254,8 @@ void PrintUsage(const char* program) {
          " --host-eid-index N --device-eid-index N"
          " --provider-library ABS_PATH --provider-soname NAME"
          " --exchange-dir PATH --run-id HEX32_OR_LONGER"
+         " --control-server-address NUMERIC_IP"
+         " [--control-bind-address NUMERIC_IP]"
          " [--logical-device-id N]"
          " [--control-port N]"
          " [--transfer-count N] [--descriptor-capacity N]"
@@ -282,6 +301,10 @@ bool ParseOptions(int argc, char** argv, Options* options) {
       options->exchange_dir = value;
     } else if (key == "--run-id") {
       options->run_id = value;
+    } else if (key == "--control-server-address") {
+      options->control_server_address = value;
+    } else if (key == "--control-bind-address") {
+      options->control_bind_address = value;
     } else if (!ParseUnsigned(value, &parsed)) {
       return false;
     } else if (key == "--host-eid-index" &&
@@ -373,6 +396,12 @@ bool ParseOptions(int argc, char** argv, Options* options) {
                   [](unsigned char value) {
                     return std::isxdigit(value) != 0;
                   });
+  const int control_family = NumericIpFamily(
+      options->control_server_address);
+  const int bind_family = options->control_bind_address.empty()
+                              ? AF_UNSPEC
+                              : NumericIpFamily(
+                                    options->control_bind_address);
   return (options->role == "host" ||
           options->role == "device") &&
          !options->host_urma_device.empty() &&
@@ -383,6 +412,9 @@ bool ParseOptions(int argc, char** argv, Options* options) {
          options->provider_soname.find('/') == std::string::npos &&
          !options->exchange_dir.empty() &&
          valid_run_id &&
+         control_family != AF_UNSPEC &&
+         (options->control_bind_address.empty() ||
+          bind_family == control_family) &&
          ParseEid(host_eid, &options->host_eid) &&
          ParseEid(device_eid, &options->device_eid) &&
          options->host_eid != options->device_eid;
@@ -873,6 +905,10 @@ DirectUrmaOpenSpec MakeHostOpenSpec(
   spec.urma_device = options.host_urma_device;
   spec.local_eid = FormatIpv6Eid(options.host_eid);
   spec.peer_eid = FormatIpv6Eid(options.device_eid);
+  spec.control_server_address = options.control_server_address;
+  // The Host endpoint is the TCP server and deliberately listens on the
+  // wildcard address for the selected IPv4/IPv6 family.
+  spec.control_bind_address.clear();
   spec.eid_index = options.host_eid_index;
   spec.control_port = options.control_port;
   spec.control_timeout_seconds = options.timeout_seconds;
@@ -896,6 +932,8 @@ DirectUrmaOpenSpec MakeDeviceOpenSpec(
   spec.urma_device = options.device_urma_device;
   spec.local_eid = FormatIpv6Eid(options.device_eid);
   spec.peer_eid = FormatIpv6Eid(options.host_eid);
+  spec.control_server_address = options.control_server_address;
+  spec.control_bind_address = options.control_bind_address;
   spec.eid_index = options.device_eid_index;
   spec.control_port = options.control_port;
   spec.control_timeout_seconds = options.timeout_seconds;

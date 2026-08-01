@@ -1,5 +1,7 @@
 #include "kvaf_urma_provider_abi.h"
 
+#include <arpa/inet.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -24,6 +26,9 @@
 #define KVAF_PROVIDER_PRIVATE_ABI_MASK \
     (KVAF_URMA_PROVIDER_EXPECT_HOST_PRIVATE_ABI | \
      KVAF_URMA_PROVIDER_EXPECT_DEVICE_PRIVATE_ABI)
+#define KVAF_PROVIDER_REQUIRED_CONFIG_FLAGS \
+    (KVAF_URMA_PROVIDER_USE_CTP | \
+     KVAF_URMA_PROVIDER_EXPLICIT_TCP_MANAGEMENT)
 
 static perftest_config_t g_kvaf_config;
 static perftest_context_t g_kvaf_context;
@@ -80,6 +85,28 @@ static bool kvaf_has_terminator(const char *text, size_t capacity)
     return text != NULL && memchr(text, '\0', capacity) != NULL;
 }
 
+static int kvaf_numeric_ip_family(const char *text)
+{
+    struct in_addr ipv4;
+    struct in6_addr ipv6;
+
+    if (text == NULL || text[0] == '\0') {
+        return AF_UNSPEC;
+    }
+    if (inet_pton(AF_INET, text, &ipv4) == 1) {
+        return AF_INET;
+    }
+    if (inet_pton(AF_INET6, text, &ipv6) == 1) {
+        return AF_INET6;
+    }
+    return AF_UNSPEC;
+}
+
+static int kvaf_negative_errno_or(int fallback)
+{
+    return errno > 0 ? -errno : -fallback;
+}
+
 static bool kvaf_allocation_covers_parsed_config(
     const struct kvaf_urma_provider_config_v2 *input)
 {
@@ -123,18 +150,21 @@ static bool kvaf_config_is_valid(
 {
     uint64_t minimum_bytes;
     uint32_t expected_private_abi;
+    int control_family;
+    int bind_family;
 
     if (config == NULL ||
         config->magic != KVAF_URMA_PROVIDER_MAGIC ||
         config->abi_version != KVAF_URMA_PROVIDER_ABI_VERSION ||
         config->struct_size != sizeof(*config) ||
         config->role > KVAF_URMA_PROVIDER_CLIENT ||
-        (config->flags & KVAF_URMA_PROVIDER_USE_CTP) == 0 ||
+        (config->flags & KVAF_PROVIDER_REQUIRED_CONFIG_FLAGS) !=
+            KVAF_PROVIDER_REQUIRED_CONFIG_FLAGS ||
         (config->flags & KVAF_PROVIDER_PRIVATE_ABI_MASK) == 0 ||
         (config->flags & KVAF_PROVIDER_PRIVATE_ABI_MASK) ==
             KVAF_PROVIDER_PRIVATE_ABI_MASK ||
         (config->flags &
-            ~(KVAF_URMA_PROVIDER_USE_CTP |
+            ~(KVAF_PROVIDER_REQUIRED_CONFIG_FLAGS |
               KVAF_PROVIDER_PRIVATE_ABI_MASK)) != 0 ||
         config->address_kind != KVAF_URMA_PROVIDER_ADDRESS_DEVICE_VA ||
         config->session_id == 0 ||
@@ -149,10 +179,23 @@ static bool kvaf_config_is_valid(
         !kvaf_has_terminator(config->device_name,
             sizeof(config->device_name)) ||
         config->device_name[0] == '\0' ||
-        !kvaf_has_terminator(config->local_eid,
-            sizeof(config->local_eid)) ||
-        !kvaf_has_terminator(config->peer_eid,
-            sizeof(config->peer_eid))) {
+        !kvaf_has_terminator(config->control_server_address,
+            sizeof(config->control_server_address)) ||
+        !kvaf_has_terminator(config->control_bind_address,
+            sizeof(config->control_bind_address))) {
+        return false;
+    }
+
+    control_family = kvaf_numeric_ip_family(
+        config->control_server_address);
+    bind_family = config->control_bind_address[0] == '\0'
+        ? AF_UNSPEC
+        : kvaf_numeric_ip_family(config->control_bind_address);
+    if (control_family == AF_UNSPEC ||
+        (config->role == KVAF_URMA_PROVIDER_SERVER &&
+         config->control_bind_address[0] != '\0') ||
+        (config->control_bind_address[0] != '\0' &&
+         bind_family != control_family)) {
         return false;
     }
 
@@ -174,10 +217,7 @@ static bool kvaf_config_is_valid(
         return false;
     }
     minimum_bytes *= 2U;
-    return config->local_allocation_bytes >= minimum_bytes &&
-        (config->role != KVAF_URMA_PROVIDER_CLIENT ||
-         (config->local_eid[0] != '\0' &&
-          config->peer_eid[0] != '\0'));
+    return config->local_allocation_bytes >= minimum_bytes;
 }
 
 static int kvaf_set_control_socket_deadlines(
@@ -191,12 +231,14 @@ static int kvaf_set_control_socket_deadlines(
 
     for (i = 0; i < g_kvaf_config.pair_num; ++i) {
         const int fd = kvaf_perftest_control_fd(i);
-        if (fd < 0 ||
-            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+        if (fd < 0) {
+            return kvaf_negative_errno_or(EBADF);
+        }
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
                 &timeout, sizeof(timeout)) != 0 ||
             setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
                 &timeout, sizeof(timeout)) != 0) {
-            return -1;
+            return kvaf_negative_errno_or(EIO);
         }
     }
     return 0;
@@ -210,6 +252,8 @@ static int kvaf_parse_config(
     char port_text[16];
     char *argv[24];
     int argc = 0;
+    const int control_family = kvaf_numeric_ip_family(
+        input->control_server_address);
 
     if (snprintf(size_text, sizeof(size_text), "%llu",
         (unsigned long long)input->segment_payload_bytes) < 0 ||
@@ -229,12 +273,16 @@ static int kvaf_parse_config(
     KVAF_ADD_ARG("1");
     KVAF_ADD_ARG("-s");
     KVAF_ADD_ARG(size_text);
-    KVAF_ADD_ARG("--enable_ipv6");
+    if (control_family == AF_INET6) {
+        KVAF_ADD_ARG("--enable_ipv6");
+    }
     if (input->role == KVAF_URMA_PROVIDER_CLIENT) {
         KVAF_ADD_ARG("-S");
-        KVAF_ADD_ARG(input->peer_eid);
-        KVAF_ADD_ARG("--bind_ip");
-        KVAF_ADD_ARG(input->local_eid);
+        KVAF_ADD_ARG(input->control_server_address);
+        if (input->control_bind_address[0] != '\0') {
+            KVAF_ADD_ARG("--bind_ip");
+            KVAF_ADD_ARG(input->control_bind_address);
+        }
     }
     KVAF_ADD_ARG("--tp_aware");
     KVAF_ADD_ARG("--ctp");
@@ -660,13 +708,18 @@ int kvaf_urma_provider_open_v2(
             KVAF_URMA_PROVIDER_LOCAL_CONFIG_FAILED, ret);
         goto fail;
     }
+    errno = 0;
     ret = kvaf_perftest_set_control_timeout(
         config->control_timeout_seconds);
-    if (ret == 0) {
-        ret = kvaf_perftest_establish_connection(&g_kvaf_config);
+    if (ret == 0 &&
+        kvaf_perftest_establish_connection(&g_kvaf_config) != 0) {
+        ret = kvaf_negative_errno_or(EIO);
+    } else if (ret != 0) {
+        ret = kvaf_negative_errno_or(EIO);
     }
     if (ret != 0) {
-        kvaf_init_result(result, KVAF_URMA_PROVIDER_CONNECT_FAILED, ret);
+        kvaf_init_result(result, KVAF_URMA_PROVIDER_CONNECT_FAILED,
+            ret);
         goto fail;
     }
     g_kvaf_connection_open = true;

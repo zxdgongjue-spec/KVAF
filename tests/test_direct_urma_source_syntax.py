@@ -314,6 +314,17 @@ class DirectUrmaSourceSyntaxTests(unittest.TestCase):
         self.assertIn("final_sync_result", self.resources_source)
         self.assertIn("failed twice", self.resources_source)
 
+    def test_safe_open_failure_reports_provider_and_owner_diagnostics(self) -> None:
+        for field in (
+            '"provider_result_status="',
+            '" provider_status="',
+            '" owner_result_code="',
+            "std::to_string(impl_->result.status)",
+            "std::to_string(impl_->result.provider_status)",
+            "std::to_string(ready_status.result_code)",
+        ):
+            self.assertIn(field, self.resources_source)
+
     def test_smoke_payload_is_bounded_before_resource_acquisition(self) -> None:
         self.assertIn(
             "kSmokeMaxBatchBytes = 64ULL * 1024ULL * 1024ULL",
@@ -336,6 +347,27 @@ class DirectUrmaSourceSyntaxTests(unittest.TestCase):
             "cannot be mixed with",
         ):
             self.assertIn(expected, self.smoke_source)
+
+    def test_tcp_control_ip_is_separate_from_urma_eids(self) -> None:
+        for expected in (
+            'key == "--control-server-address"',
+            'key == "--control-bind-address"',
+            "NumericIpFamily(\n      options->control_server_address)",
+            "spec.control_server_address = options.control_server_address",
+            "spec.control_bind_address = options.control_bind_address",
+            "spec.control_bind_address.clear()",
+        ):
+            self.assertIn(expected, self.smoke_source)
+        self.assertIn(
+            "KVAF_URMA_PROVIDER_EXPLICIT_TCP_MANAGEMENT",
+            self.resources_source,
+        )
+        self.assertIn(
+            "config.control_server_address", self.resources_source
+        )
+        self.assertIn("config.control_bind_address", self.resources_source)
+        self.assertNotIn("config.local_eid", self.resources_source)
+        self.assertNotIn("config.peer_eid", self.resources_source)
 
     def test_large_batch_uses_one_simt_plan_and_bounded_queue_waves(self) -> None:
         self.assertIn(

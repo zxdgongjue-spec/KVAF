@@ -194,6 +194,14 @@ parse/check config
   -> provider-ready 双端确认
 ```
 
+这里有两个完全独立的地址域。`local_eid/peer_eid` 是 128-bit URMA 标识，只用于
+选择/校验 UDMA 资源，不能作为 TCP 地址传给 perftest 的 `-S` 或 `--bind_ip`。
+TCP 管理面由 `control_server_address` 指定数值 IPv4/IPv6 地址：client 连接该地址，
+server 只取其地址族并监听 wildcard；`control_bind_address` 仅是可选的 client 本地
+bind 地址，且必须与 server 地址同族。provider config 保持 256-byte 固定布局，并
+要求 `KVAF_URMA_PROVIDER_EXPLICIT_TCP_MANAGEMENT` capability bit；新旧 provider/SO
+若混用会在打开 socket/URMA 资源前 fail closed。
+
 AIV 使用的字段来源如下：
 
 | 字段 | 来源 |
@@ -674,6 +682,11 @@ export KVAF_H2D_BATCH_ITERATIONS=10
 export KVAF_H2D_TIMEOUT_SECONDS=120
 export KVAF_H2D_RUN_TIMEOUT_SECONDS=600
 export KVAF_DIRECT_CONTROL_PORT=22117
+# 必须是 AICPU 网络栈可达的 Host 数值 IP，不是 URMA EID。
+# 若 AICPU 有独立网络命名空间，不能使用 127.0.0.1。
+export KVAF_DIRECT_CONTROL_SERVER_ADDRESS="<HOST_CONTROL_IP>"  # 执行前替换
+# 可选；仅在已证明 AICPU client 源 IP 时设置。
+unset KVAF_DIRECT_CONTROL_BIND_ADDRESS
 export KVAF_A5_RUN_TAG="npu7_checked_$(date +%Y%m%d_%H%M%S)_$$"
 
 bash scripts/run_a5_direct_urma_epoch_owner_validation.sh

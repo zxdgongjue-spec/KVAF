@@ -76,7 +76,9 @@ void FillSuccessfulOpen(const kvaf_urma_provider_config_v2& config,
   result->reserved[2] =
       KVAF_UDMA_TEARDOWN_SOURCE_OWNED_CHECKED_RETRYABLE_V1;
   result->reserved[3] = 1;
-  (void)inet_pton(AF_INET6, config.peer_eid, result->remote_eid);
+  (void)inet_pton(AF_INET6,
+                  "0000:0000:007f:0400:0010:0000:df0a:0b00",
+                  result->remote_eid);
 }
 
 }  // namespace
