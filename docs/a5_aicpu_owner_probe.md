@@ -143,6 +143,16 @@ export KVAF_A5_DIRECT_BUILD_DIR=/data/c00982601/KVAF/build-a5-direct-urma
 export KVAF_DIRECT_PROVIDER_BUILD_DIR=/data/c00982601/KVAF/build-a5-direct-urma-provider
 export KVAF_UMDK_ROOT=/data/c00982601/umdk
 export KVAF_LIBUMMU_ROOT=/data/c00982601/libummu
+kvaf_kernel_uapi_dir=/data/c00982601/kernel-uapi/$(uname -r)
+export KVAF_RUNTIME_UDMA_UAPI_HEADER="$kvaf_kernel_uapi_dir/udma_abi.h"
+export KVAF_RUNTIME_UMMU_UAPI_HEADER="$kvaf_kernel_uapi_dir/ummu_core.h"
+
+if [[ ! -r "$KVAF_RUNTIME_UDMA_UAPI_HEADER" ||
+      ! -r "$KVAF_RUNTIME_UMMU_UAPI_HEADER" ]]; then
+  echo "ERROR: the running-kernel UDMA/UMMU UAPI copy is missing" >&2
+  echo "Copy the exact headers from Server B host as documented in a5_direct_urma_h2d.md." >&2
+  exit 1
+fi
 
 if [[ -r \
   /data/c00982601/asc-devkit-9.1.0-20260722/include/simt_api/asc_simt.h ]]; then
@@ -151,9 +161,18 @@ else
   export KVAF_ASC_DEVKIT_PATH=/data/c00982601/asc-devkit
 fi
 
-bash scripts/build_a5_direct_urma_provider.sh
-bash scripts/package_a5_direct_urma_aicpu.sh
-bash scripts/build_a5_direct_urma.sh
+if ! bash scripts/build_a5_direct_urma_provider.sh; then
+  echo "ERROR: provider build failed; package and probe were not attempted" >&2
+  exit 1
+fi
+if ! bash scripts/package_a5_direct_urma_aicpu.sh; then
+  echo "ERROR: AICPU packaging failed; probe was not attempted" >&2
+  exit 1
+fi
+if ! bash scripts/build_a5_direct_urma.sh; then
+  echo "ERROR: A5 probe build failed" >&2
+  exit 1
+fi
 
 kvaf_owner_probe_binary="$KVAF_A5_DIRECT_BUILD_DIR/access_operator/a5/kvaf_a5_aicpu_owner_probe"
 if [[ ! -x "$kvaf_owner_probe_binary" ]]; then

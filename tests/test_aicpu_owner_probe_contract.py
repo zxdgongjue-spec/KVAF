@@ -273,6 +273,20 @@ class AicpuOwnerProbeContractTests(unittest.TestCase):
             "KVAF_A5_AICPU_OWNER_PROBE_OK",
         ):
             self.assertIn(required, documentation)
+        self.assertIn("KVAF_RUNTIME_UDMA_UAPI_HEADER", documentation)
+        self.assertIn("KVAF_RUNTIME_UMMU_UAPI_HEADER", documentation)
+        self.assertIn("provider build failed; package", documentation)
+
+    def test_provider_build_finds_the_shared_running_kernel_uapi(self) -> None:
+        build_script = PROVIDER_BUILD.read_text(encoding="utf-8")
+        self.assertIn(
+            '"${ROOT_DIR}/../kernel-uapi/${kernel_release}/udma_abi.h"',
+            build_script,
+        )
+        self.assertIn(
+            '"${ROOT_DIR}/../kernel-uapi/${kernel_release}/ummu_core.h"',
+            build_script,
+        )
 
     def test_documented_commands_never_start_with_test(self) -> None:
         command_pattern = re.compile(r"(?m)^[ \t]*test(?:[ \t]|$)")

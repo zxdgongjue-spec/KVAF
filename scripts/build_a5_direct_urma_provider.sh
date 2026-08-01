@@ -220,7 +220,8 @@ if [[ -n "${KVAF_RUNTIME_UDMA_UAPI_HEADER}" ]]; then
 else
   for candidate in \
     "/usr/src/kernels/${kernel_release}/include/uapi/ub/urma/udma/udma_abi.h" \
-    "/lib/modules/${kernel_release}/build/include/uapi/ub/urma/udma/udma_abi.h"
+    "/lib/modules/${kernel_release}/build/include/uapi/ub/urma/udma/udma_abi.h" \
+    "${ROOT_DIR}/../kernel-uapi/${kernel_release}/udma_abi.h"
   do
     [[ -r "${candidate}" ]] && runtime_udma_uapi_candidates+=("${candidate}")
   done
@@ -245,7 +246,8 @@ if [[ -n "${KVAF_RUNTIME_UMMU_UAPI_HEADER}" ]]; then
 else
   for candidate in \
     "/usr/src/kernels/${kernel_release}/include/uapi/linux/ummu_core.h" \
-    "/lib/modules/${kernel_release}/build/include/uapi/linux/ummu_core.h"
+    "/lib/modules/${kernel_release}/build/include/uapi/linux/ummu_core.h" \
+    "${ROOT_DIR}/../kernel-uapi/${kernel_release}/ummu_core.h"
   do
     [[ -r "${candidate}" ]] && runtime_ummu_uapi_candidates+=("${candidate}")
   done
