@@ -77,6 +77,12 @@ class DirectUrmaSourceSyntaxTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_aicpu_kernel_type_uses_cann_scoped_enumerator(self) -> None:
+        self.assertIn(
+            "rtKernelType_t::KERNEL_TYPE_AICPU_KFC",
+            self.resources_source,
+        )
+
     def test_transport_safety_marker_precedes_runtime_detach(self) -> None:
         provisional = self.smoke_source.index(
             'pre_runtime_cleanup.reason = '

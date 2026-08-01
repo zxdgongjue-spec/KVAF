@@ -24,7 +24,8 @@ namespace kvaf::access::a5 {
 namespace {
 
 constexpr std::uint32_t kAicpuKfcKernelType =
-    static_cast<std::uint32_t>(KERNEL_TYPE_AICPU_KFC);
+    static_cast<std::uint32_t>(
+        rtKernelType_t::KERNEL_TYPE_AICPU_KFC);
 constexpr std::uint32_t kProviderRequiredFlags =
     KVAF_URMA_PROVIDER_CONNECTED |
     KVAF_URMA_PROVIDER_REMOTE_EID_NETWORK_ORDER |
