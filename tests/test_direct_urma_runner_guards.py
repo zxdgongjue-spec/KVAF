@@ -23,6 +23,56 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.source = RUNNER.read_text(encoding="utf-8")
 
+    @classmethod
+    def shell_function_source(cls, name: str) -> str:
+        lines = cls.source.splitlines()
+        start = lines.index(f"{name}()")
+        end = lines.index("}", start)
+        return "\n".join(lines[start:end + 1])
+
+    def run_ipourma_resolver(
+        self, address_lines: tuple[str, ...]
+    ) -> subprocess.CompletedProcess[str]:
+        bash = shutil.which("bash")
+        python = shutil.which("python3")
+        if bash is None or python is None:
+            self.skipTest("bash and python3 are required")
+        function = self.shell_function_source(
+            "resolve_ipourma_global_ipv6_for_eid"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            fake_ip = Path(temporary) / "ip"
+            output = "".join(
+                f"printf '%s\\n' '{line}'\n" for line in address_lines
+            )
+            fake_ip.write_text(
+                "#!/bin/sh\n"
+                "test \"$1 $2 $3 $4 $5 $6\" = "
+                "\"-6 -o addr show scope global\" || exit 64\n"
+                f"{output}",
+                encoding="utf-8",
+            )
+            fake_ip.chmod(0o755)
+            path_parts = [
+                temporary,
+                str(Path(bash).parent),
+                str(Path(python).parent),
+            ]
+            path = ":".join(dict.fromkeys(path_parts))
+            return subprocess.run(
+                [
+                    bash,
+                    "-c",
+                    f"{function}\n"
+                    "resolve_ipourma_global_ipv6_for_eid "
+                    "00000000003f050000100000df080b00",
+                ],
+                env={"PATH": path},
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
     def test_mutating_and_run_scripts_are_valid_bash(self) -> None:
         bash = shutil.which("bash")
         if bash is None:
@@ -200,6 +250,12 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
             "KVAF_DIRECT_CONTROL_SERVER_ADDRESS",
             "KVAF_DIRECT_CONTROL_BIND_ADDRESS",
             "normalize_numeric_ip",
+            "resolve_ipourma_global_ipv6_for_eid",
+            "ip -6 -o addr show scope global",
+            "KVAF_DIRECT_CONTROL_SERVER_ADDRESS_SOURCE=auto-ipourma-eid",
+            "control_server_address_source=%s",
+            "CONTROL_SERVER_ADDRESS_SOURCE=",
+            "control_server_interface=%s",
             "control_server_address=%s",
             "control_bind_address=%s",
             '--control-server-address "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}"',
@@ -216,6 +272,83 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
         eid = self.source.index("resolve_a5_urma_eids.py", affinity)
         self.assertLess(validation, affinity)
         self.assertLess(validation, eid)
+
+    def test_auto_control_address_exact_matches_host_eid_before_endpoints(self) -> None:
+        normalize_eid = self.source.index(
+            'if ! host_eid=$(normalize_eid "${KVAF_HOST_EID}")'
+        )
+        resolve = self.source.index(
+            'resolve_ipourma_global_ipv6_for_eid "${host_eid}"',
+            normalize_eid,
+        )
+        validation = self.source.index(
+            'normalize_numeric_ip "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}"',
+            resolve,
+        )
+        endpoints = self.source.index(
+            "endpoint_resolver_args=(", validation
+        )
+        self.assertLess(normalize_eid, resolve)
+        self.assertLess(resolve, validation)
+        self.assertLess(validation, endpoints)
+        self.assertIn(
+            "Host EID has no unique exact global IPv6 assignment on ipourma*",
+            self.source[resolve:endpoints],
+        )
+        self.assertIn(
+            "source=${KVAF_DIRECT_CONTROL_SERVER_ADDRESS_SOURCE}",
+            self.source[resolve:endpoints],
+        )
+        self.assertIn(
+            "No Host/Device DDR, HBM, URMA, SQ, or CQ",
+            self.source[resolve:endpoints],
+        )
+
+    def test_ipourma_resolver_returns_only_exact_host_eid_global_ipv6(self) -> None:
+        result = self.run_ipourma_resolver((
+            "2: eth0 inet6 ::3f:500:10:0:df08:b00/128 scope global",
+            "3: ipourma2 inet6 ::3f:500:10:0:df08:b00/128 scope global",
+            "4: ipourma3 inet6 ::40:500:10:0:df08:b00/128 scope global",
+        ))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "::3f:500:10:0:df08:b00\nipourma2\n")
+
+    def test_ipourma_resolver_fails_closed_without_one_exact_match(self) -> None:
+        cases = {
+            "wrong-interface-only": (
+                "2: eth0 inet6 ::3f:500:10:0:df08:b00/128 scope global",
+            ),
+            "zero-match": (
+                "3: ipourma2 inet6 ::40:500:10:0:df08:b00/128 scope global",
+            ),
+            "duplicate-ipourma-match": (
+                "3: ipourma2 inet6 ::3f:500:10:0:df08:b00/128 scope global",
+                "4: ipourma3 inet6 ::3f:500:10:0:df08:b00/128 scope global",
+            ),
+            "tentative-match": (
+                "3: ipourma2 inet6 ::3f:500:10:0:df08:b00/128 scope global tentative",
+            ),
+            "dadfailed-match": (
+                "3: ipourma2 inet6 ::3f:500:10:0:df08:b00/128 scope global dadfailed",
+            ),
+        }
+        for name, lines in cases.items():
+            with self.subTest(name=name):
+                result = self.run_ipourma_resolver(lines)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+
+    def test_zero_wqe_requires_lifecycle_marker_not_data_channel_marker(self) -> None:
+        markers = self.source.index("required_device_markers=(")
+        evidence = self.source.index("evidence_ok=1", markers)
+        block = self.source[markers:evidence]
+        self.assertIn("KVAF_H2D_TRANSFER_COUNT == 0", block)
+        self.assertIn("KVAF_A5_DIRECT_ZERO_WQE_OK", block)
+        self.assertIn("KVAF_A5_DIRECT_URMA_CHANNEL", block)
+        self.assertLess(
+            block.index("KVAF_A5_DIRECT_ZERO_WQE_OK"),
+            block.index("KVAF_A5_DIRECT_URMA_CHANNEL"),
+        )
 
     def test_urma_endpoints_are_exactly_resolved_before_npu_resources(self) -> None:
         pair = self.source.index("resolve_a5_urma_eids.py")

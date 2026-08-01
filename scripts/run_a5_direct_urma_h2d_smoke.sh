@@ -147,6 +147,46 @@ except ValueError:
 ' "$1"
 }
 
+resolve_ipourma_global_ipv6_for_eid()
+{
+  local eid=$1
+  local address_output
+
+  command -v ip >/dev/null 2>&1 || return 1
+  address_output=$(ip -6 -o addr show scope global 2>/dev/null) || return 1
+  python3 -c '
+import ipaddress
+import sys
+
+try:
+    expected = ipaddress.IPv6Address(int(sys.argv[1], 16))
+except ValueError:
+    raise SystemExit(1)
+
+matches = []
+for line in sys.stdin:
+    fields = line.split()
+    if len(fields) < 4 or fields[2] != "inet6":
+        continue
+    interface = fields[1].split("@", 1)[0]
+    if not interface.startswith("ipourma"):
+        continue
+    if "tentative" in fields or "dadfailed" in fields:
+        continue
+    try:
+        address = ipaddress.ip_interface(fields[3]).ip
+    except ValueError:
+        continue
+    if address == expected:
+        matches.append((address.compressed, interface))
+
+if len(matches) != 1:
+    raise SystemExit(1)
+print(matches[0][0])
+print(matches[0][1])
+' "${eid}" <<<"${address_output}"
+}
+
 manifest_value()
 {
   local key=$1
@@ -577,12 +617,18 @@ if (( KVAF_DIRECT_CONTROL_PORT < 1024 ||
   echo "ERROR: KVAF_DIRECT_CONTROL_PORT must be in [1024, 65535]" >&2
   exit 2
 fi
-if ! KVAF_DIRECT_CONTROL_SERVER_ADDRESS=$(
-  normalize_numeric_ip "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}"
-); then
-  echo "ERROR: KVAF_DIRECT_CONTROL_SERVER_ADDRESS must be a numeric IPv4 or IPv6 address" >&2
-  echo "URMA EIDs are not TCP management addresses." >&2
-  exit 2
+KVAF_DIRECT_CONTROL_SERVER_ADDRESS_SOURCE=explicit
+KVAF_DIRECT_CONTROL_SERVER_INTERFACE=none
+if [[ "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}" == auto ]]; then
+  KVAF_DIRECT_CONTROL_SERVER_ADDRESS_SOURCE=auto-ipourma-eid
+else
+  if ! KVAF_DIRECT_CONTROL_SERVER_ADDRESS=$(
+    normalize_numeric_ip "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}"
+  ); then
+    echo "ERROR: KVAF_DIRECT_CONTROL_SERVER_ADDRESS must be auto or a numeric IPv4/IPv6 address" >&2
+    echo "URMA EIDs are not TCP management addresses." >&2
+    exit 2
+  fi
 fi
 if [[ -n "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}" ]]; then
   if ! KVAF_DIRECT_CONTROL_BIND_ADDRESS=$(
@@ -591,10 +637,11 @@ if [[ -n "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}" ]]; then
     echo "ERROR: KVAF_DIRECT_CONTROL_BIND_ADDRESS must be empty or a numeric IPv4/IPv6 address" >&2
     exit 2
   fi
-  if { [[ "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}" == *:* ]] &&
-       [[ "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}" != *:* ]]; } ||
-     { [[ "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}" != *:* ]] &&
-       [[ "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}" == *:* ]]; }; then
+  if [[ "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS_SOURCE}" == explicit ]] &&
+     { { [[ "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}" == *:* ]] &&
+         [[ "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}" != *:* ]]; } ||
+       { [[ "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}" != *:* ]] &&
+         [[ "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}" == *:* ]]; }; }; then
     echo "ERROR: control server and client bind addresses must use the same IP family" >&2
     exit 2
   fi
@@ -829,6 +876,44 @@ fi
 if [[ "${host_eid}" == "${device_eid}" ]]; then
   echo "ERROR: Host and Device EIDs must be different" >&2
   exit 2
+fi
+
+if [[ "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS_SOURCE}" == \
+      auto-ipourma-eid ]]; then
+  if ! control_address_output=$(
+    resolve_ipourma_global_ipv6_for_eid "${host_eid}"
+  ); then
+    echo "ERROR: Host EID has no unique exact global IPv6 assignment on ipourma*" >&2
+    echo "HOST_EID=${host_eid}" >&2
+    echo "Set KVAF_DIRECT_CONTROL_SERVER_ADDRESS to an explicit proven address if needed." >&2
+    echo "No Host/Device DDR, HBM, URMA, SQ, or CQ resource was created." >&2
+    exit 2
+  fi
+  mapfile -t control_address_fields <<<"${control_address_output}"
+  if (( ${#control_address_fields[@]} != 2 )) ||
+     [[ -z "${control_address_fields[0]}" ||
+        ! "${control_address_fields[1]}" =~ ^ipourma[A-Za-z0-9_.:-]*$ ]]; then
+    echo "ERROR: malformed ipourma control-address resolution" >&2
+    exit 2
+  fi
+  KVAF_DIRECT_CONTROL_SERVER_ADDRESS=${control_address_fields[0]}
+  KVAF_DIRECT_CONTROL_SERVER_INTERFACE=${control_address_fields[1]}
+  if ! KVAF_DIRECT_CONTROL_SERVER_ADDRESS=$(
+    normalize_numeric_ip "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}"
+  ); then
+    echo "ERROR: resolved ipourma control address is not a numeric IP" >&2
+    exit 2
+  fi
+  if [[ "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}" != *:* ]]; then
+    echo "ERROR: auto control address must resolve to Host-EID IPv6" >&2
+    exit 2
+  fi
+  if [[ -n "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}" &&
+        "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}" != *:* ]]; then
+    echo "ERROR: control server and client bind addresses must use the same IP family" >&2
+    exit 2
+  fi
+  echo "KVAF_A5_CONTROL_ADDRESS_RESOLVED source=${KVAF_DIRECT_CONTROL_SERVER_ADDRESS_SOURCE} interface=${KVAF_DIRECT_CONTROL_SERVER_INTERFACE} address=${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}"
 fi
 
 endpoint_resolver_args=(
@@ -1154,6 +1239,10 @@ archive_sha=$(
   printf 'device_urma_device=%s\n' "${KVAF_DEVICE_URMA_DEVICE}"
   printf 'device_eid_index=%s\n' "${KVAF_DEVICE_EID_INDEX}"
   printf 'control_port=%s\n' "${KVAF_DIRECT_CONTROL_PORT}"
+  printf 'control_server_address_source=%s\n' \
+    "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS_SOURCE}"
+  printf 'control_server_interface=%s\n' \
+    "${KVAF_DIRECT_CONTROL_SERVER_INTERFACE}"
   printf 'control_server_address=%s\n' \
     "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}"
   printf 'control_bind_address=%s\n' \
@@ -1585,6 +1674,8 @@ echo "LOGICAL_DEVICE_ID=${KVAF_LOGICAL_DEVICE_ID}"
 echo "HOST_URMA=${KVAF_HOST_URMA_DEVICE}/eid${KVAF_HOST_EID_INDEX}"
 echo "DEVICE_URMA=${KVAF_DEVICE_URMA_DEVICE}/eid${KVAF_DEVICE_EID_INDEX}"
 echo "CONTROL_PORT=${KVAF_DIRECT_CONTROL_PORT}"
+echo "CONTROL_SERVER_ADDRESS_SOURCE=${KVAF_DIRECT_CONTROL_SERVER_ADDRESS_SOURCE}"
+echo "CONTROL_SERVER_INTERFACE=${KVAF_DIRECT_CONTROL_SERVER_INTERFACE}"
 echo "CONTROL_SERVER_ADDRESS=${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}"
 echo "CONTROL_BIND_ADDRESS=${KVAF_DIRECT_CONTROL_BIND_ADDRESS:-none}"
 echo "RUN_ID=${kvaf_run_id}"
@@ -1845,10 +1936,14 @@ required_host_markers=(
 )
 required_device_markers=(
   "KVAF_A5_DIRECT_URMA_READY role=device"
-  "KVAF_A5_DIRECT_URMA_CHANNEL"
   "KVAF_A5_DIRECT_H2D_SMOKE_OK"
   "KVAF_A5_DIRECT_TEARDOWN_OK role=device"
 )
+if (( KVAF_H2D_TRANSFER_COUNT == 0 )); then
+  required_device_markers+=("KVAF_A5_DIRECT_ZERO_WQE_OK")
+else
+  required_device_markers+=("KVAF_A5_DIRECT_URMA_CHANNEL")
+fi
 evidence_ok=1
 for marker in "${required_host_markers[@]}"; do
   if ! grep -Fq "${marker}" "${host_log}"; then

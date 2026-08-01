@@ -201,6 +201,13 @@ server 只取其地址族并监听 wildcard；`control_bind_address` 仅是可�
 bind 地址，且必须与 server 地址同族。provider config 保持 256-byte 固定布局，并
 要求 `KVAF_URMA_PROVIDER_EXPLICIT_TCP_MANAGEMENT` capability bit；新旧 provider/SO
 若混用会在打开 socket/URMA 资源前 fail closed。
+最小 bring-up 可将 `KVAF_DIRECT_CONTROL_SERVER_ADDRESS=auto`；runner 把本 epoch
+已解析的 Host EID 转换为 canonical IPv6，并要求它在本机某个
+`ipourma*` 接口上存在唯一、exact-match 的 global IPv6 assignment，再走
+同一数值 IP 严格校验。不会自动设置 client bind 地址，由 AICPU 路由
+选源。manifest 分别记录
+`control_server_address_source=auto-ipourma-eid|explicit`、
+`control_server_interface` 和解析后的 `control_server_address`。
 
 AIV 使用的字段来源如下：
 
@@ -682,10 +689,11 @@ export KVAF_H2D_BATCH_ITERATIONS=10
 export KVAF_H2D_TIMEOUT_SECONDS=120
 export KVAF_H2D_RUN_TIMEOUT_SECONDS=600
 export KVAF_DIRECT_CONTROL_PORT=22117
-# 必须是 AICPU 网络栈可达的 Host 数值 IP，不是 URMA EID。
-# 若 AICPU 有独立网络命名空间，不能使用 127.0.0.1。
-export KVAF_DIRECT_CONTROL_SERVER_ADDRESS="<HOST_CONTROL_IP>"  # 执行前替换
-# 可选；仅在已证明 AICPU client 源 IP 时设置。
+# 最小 bring-up 每个 epoch 从 Host EID exact-match 本机 ipourma* global IPv6。
+export KVAF_DIRECT_CONTROL_SERVER_ADDRESS=auto
+# 也可显式指定已验证的 Host 数值 IPv4/IPv6：
+# export KVAF_DIRECT_CONTROL_SERVER_ADDRESS="<HOST_CONTROL_IP>"
+# 保持空，由 AICPU 路由自行选择 client 源地址。
 unset KVAF_DIRECT_CONTROL_BIND_ADDRESS
 export KVAF_A5_RUN_TAG="npu7_checked_$(date +%Y%m%d_%H%M%S)_$$"
 

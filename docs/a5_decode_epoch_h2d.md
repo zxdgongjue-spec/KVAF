@@ -51,10 +51,15 @@ Jetty/JFC/SQ/CQ 创建和 Host DDR/NPU HBM 注册。这些操作既慢，又改�
 如果每轮 decode 都重复执行，会把控制面延迟放进 token 热路径，并显著扩大失败和
 teardown 风险。
 
-TCP 控制地址与 URMA EID 是不同地址域：runner 必须用
-`KVAF_DIRECT_CONTROL_SERVER_ADDRESS` 显式提供数值 IPv4/IPv6 地址，client 可用
+TCP 控制地址与 URMA EID 是不同地址域：runner 可用
+`KVAF_DIRECT_CONTROL_SERVER_ADDRESS` 显式提供数值 IPv4/IPv6，或在最小
+bring-up 中设为 `auto`，每个 epoch 把已解析 Host EID 转换为 canonical
+IPv6，并 exact-match 本机 `ipourma*` 接口的唯一 global IPv6 assignment。
+manifest 记录 `control_server_address_source=auto-ipourma-eid|explicit`、
+`control_server_interface` 和解析后的 `control_server_address`。client 可用
 `KVAF_DIRECT_CONTROL_BIND_ADDRESS` 选择同族源地址；server 始终 wildcard listen。
-EID 只参与 URMA endpoint 和交换结果校验，绝不能传给 TCP `-S/--bind_ip`。
+原始 32-hex EID 字符串不能直接传给 TCP；`auto` 只有在系统已将同一数值明确
+配置为 `ipourma*` global IPv6 时，才把它转换为标准 IPv6 文本用于控制连接。
 
 因此生命周期应拆成三段：
 
