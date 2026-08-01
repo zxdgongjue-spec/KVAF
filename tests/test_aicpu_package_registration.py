@@ -247,6 +247,30 @@ class AicpuPackageRegistrationTests(unittest.TestCase):
             self.assertTrue(registry.is_symlink())
             self.assertEqual(target.read_bytes(), target_before)
 
+    def test_install_accepts_canonical_symlinked_parent_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            real_conf = root / "real-conf"
+            real_conf.mkdir()
+            linked_conf = root / "conf"
+            linked_conf.symlink_to(real_conf, target_is_directory=True)
+            registry = linked_conf / "ascend_package_load.ini"
+            registry.write_text(OTHER_STANZAS, encoding="utf-8")
+
+            self.assert_helper_succeeds(
+                "kvaf_aicpu_install_registration", registry
+            )
+
+            self.assert_helper_succeeds(
+                "kvaf_aicpu_registration_is_exact", registry
+            )
+            self.assertEqual(
+                (real_conf / "ascend_package_load.ini").read_text(
+                    encoding="utf-8"
+                ),
+                OTHER_STANZAS + TARGET_BLOCK,
+            )
+
     def test_install_preserves_existing_registry_mode(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             registry = Path(temporary_dir) / "ascend_package_load.ini"

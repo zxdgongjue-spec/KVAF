@@ -17,6 +17,12 @@ kvaf_aicpu_registration_block()
     "load_as_per_soc:false"
 }
 
+kvaf_aicpu_registration_error()
+{
+  echo "ERROR: AICPU package registration: $*" >&2
+  return 1
+}
+
 kvaf_aicpu_registration_arguments_are_valid()
 {
   local package_name=$1
@@ -114,10 +120,13 @@ kvaf_aicpu_install_registration()
   local registry_file=$1
   local package_name=$2
   local package_path=$3
-  local registry_dir temporary_registry
+  local registry_real registry_dir temporary_registry
 
   kvaf_aicpu_registration_arguments_are_valid \
-    "${package_name}" "${package_path}" || return 1
+    "${package_name}" "${package_path}" || {
+    kvaf_aicpu_registration_error "stage=validate-arguments"
+    return 1
+  }
 
   # Never synthesize CANN's base registry.  A missing registry can omit the
   # built-in AICPU packages and is a deployment error, not an empty starting
@@ -126,48 +135,96 @@ kvaf_aicpu_install_registration()
   [[ ! -L "${registry_file}" &&
      -f "${registry_file}" &&
      -r "${registry_file}" &&
-     -w "${registry_file}" ]] || return 1
+     -w "${registry_file}" ]] || {
+    kvaf_aicpu_registration_error \
+      "stage=validate-registry path=${registry_file}"
+    return 1
+  }
   if kvaf_aicpu_registration_is_exact \
       "${registry_file}" "${package_name}" "${package_path}"; then
     return 0
   fi
   kvaf_aicpu_registration_is_absent \
-    "${registry_file}" "${package_name}" "${package_path}" || return 1
+    "${registry_file}" "${package_name}" "${package_path}" || {
+    kvaf_aicpu_registration_error \
+      "stage=validate-existing-registration package=${package_name}"
+    return 1
+  }
 
-  registry_dir=$(dirname -- "${registry_file}") || return 1
-  [[ ! -L "${registry_dir}" &&
-     -d "${registry_dir}" &&
-     -w "${registry_dir}" ]] || return 1
+  # CANN may expose conf through a legitimate directory symlink.  Resolve the
+  # existing regular file once and create/rename the candidate in its real
+  # parent directory.  This keeps the same-filesystem atomic replace while
+  # avoiding both a false rejection and a symlink-parent check/use race.  The
+  # registry file itself remains forbidden from being a symlink.
+  registry_real=$(realpath -- "${registry_file}") || {
+    kvaf_aicpu_registration_error \
+      "stage=resolve-registry path=${registry_file}"
+    return 1
+  }
+  [[ ! -L "${registry_real}" &&
+     -f "${registry_real}" &&
+     -r "${registry_real}" &&
+     -w "${registry_real}" ]] || {
+    kvaf_aicpu_registration_error \
+      "stage=validate-resolved-registry path=${registry_real}"
+    return 1
+  }
+  registry_dir=$(dirname -- "${registry_real}") || {
+    kvaf_aicpu_registration_error "stage=resolve-parent"
+    return 1
+  }
+  [[ -d "${registry_dir}" && -w "${registry_dir}" ]] || {
+    kvaf_aicpu_registration_error \
+      "stage=validate-parent path=${registry_dir}"
+    return 1
+  }
   temporary_registry=$(mktemp \
-    "${registry_dir}/.ascend_package_load.ini.kvaf.XXXXXX") || return 1
+    "${registry_dir}/.ascend_package_load.ini.kvaf.XXXXXX") || {
+    kvaf_aicpu_registration_error \
+      "stage=create-candidate parent=${registry_dir}"
+    return 1
+  }
 
   # cp -p preserves CANN's owner/mode.  Add exactly one terminating newline
   # only when a non-empty foreign registry omitted it; otherwise preserve the
   # existing bytes before appending the KVAF stanza.
-  if ! cp -p -- "${registry_file}" "${temporary_registry}"; then
+  if ! cp -p -- "${registry_real}" "${temporary_registry}"; then
     rm -f -- "${temporary_registry}"
+    kvaf_aicpu_registration_error "stage=copy-registry"
     return 1
   fi
   if [[ -s "${temporary_registry}" ]] &&
      [[ $(tail -c 1 -- "${temporary_registry}" | wc -l) -eq 0 ]] &&
      ! printf '\n' >>"${temporary_registry}"; then
     rm -f -- "${temporary_registry}"
+    kvaf_aicpu_registration_error "stage=terminate-existing-registry"
     return 1
   fi
   if ! kvaf_aicpu_registration_block \
       "${package_name}" "${package_path}" >>"${temporary_registry}"; then
     rm -f -- "${temporary_registry}"
+    kvaf_aicpu_registration_error "stage=append-registration"
     return 1
   fi
   if ! kvaf_aicpu_registration_is_exact \
        "${temporary_registry}" "${package_name}" "${package_path}"; then
     rm -f -- "${temporary_registry}"
+    kvaf_aicpu_registration_error "stage=verify-candidate"
     return 1
   fi
-  if ! mv -f -- "${temporary_registry}" "${registry_file}"; then
+  if ! mv -f -- "${temporary_registry}" "${registry_real}"; then
     rm -f -- "${temporary_registry}"
+    kvaf_aicpu_registration_error \
+      "stage=publish-registration target=${registry_real}"
+    return 1
+  fi
+  if [[ "$(realpath -- "${registry_file}")" != "${registry_real}" ]]; then
+    kvaf_aicpu_registration_error "stage=verify-stable-path"
     return 1
   fi
   kvaf_aicpu_registration_is_exact \
-    "${registry_file}" "${package_name}" "${package_path}"
+    "${registry_file}" "${package_name}" "${package_path}" || {
+    kvaf_aicpu_registration_error "stage=verify-installed-registration"
+    return 1
+  }
 }
