@@ -172,7 +172,7 @@ fi
 # runner.  This closes the check/use race with build.success and the atomically
 # published provider artifacts.
 kvaf_verify_direct_provider_build_v3 ||
-  die "rebuild the paired official UMDK/libummu provider before packaging"
+  die "provider verification failed; inspect the preceding verifier error"
 host_provider_sha=${KVAF_VERIFIED_HOST_PROVIDER_SHA}
 device_provider_sha=${KVAF_VERIFIED_DEVICE_PROVIDER_SHA}
 source_manifest_sha=${KVAF_VERIFIED_SOURCE_MANIFEST_SHA}

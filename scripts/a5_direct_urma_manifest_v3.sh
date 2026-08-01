@@ -72,6 +72,7 @@ kvaf_v3_verify_probe()
   local prefix=$1
   local required_filename=$2
   local output_prefix=$3
+  local abi_key=$4
   local filename path expected_file_sha actual_file_sha
   local expected_abi expected_abi_sha output actual_output_sha
 
@@ -99,12 +100,12 @@ kvaf_v3_verify_probe()
   kvaf_v3_verify_hash_binding "${prefix}_probe_sha256" \
     "${actual_file_sha}" "${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP}" || return 1
 
-  expected_abi=$(kvaf_v3_manifest_value "${prefix}" \
+  expected_abi=$(kvaf_v3_manifest_value "${abi_key}" \
     "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || {
-    kvaf_v3_error "manifest lacks ${prefix}"
+    kvaf_v3_error "manifest lacks ${abi_key}"
     return 1
   }
-  expected_abi_sha=$(kvaf_v3_manifest_value "${prefix}_sha256" \
+  expected_abi_sha=$(kvaf_v3_manifest_value "${abi_key}_sha256" \
     "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
   output=$("${path}") || {
     kvaf_v3_error "${prefix} probe execution failed"
@@ -353,11 +354,11 @@ kvaf_verify_direct_provider_build_v3()
   done
 
   kvaf_v3_verify_probe udma_uapi kvaf_udma_uapi_probe \
-    KVAF_UDMA_UAPI_ABI= || return 1
+    KVAF_UDMA_UAPI_ABI= udma_uapi_abi || return 1
   kvaf_v3_verify_probe udma_private_abi kvaf_udma_private_abi_probe \
-    KVAF_UDMA_PRIVATE_ABI= || return 1
+    KVAF_UDMA_PRIVATE_ABI= udma_private_abi || return 1
   kvaf_v3_verify_probe ummu_uapi kvaf_ummu_uapi_probe \
-    KVAF_UMMU_UAPI_ABI= || return 1
+    KVAF_UMMU_UAPI_ABI= ummu_uapi_abi || return 1
 
   for artifact in \
     "${KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST}" \

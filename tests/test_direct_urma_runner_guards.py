@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import subprocess
 import tempfile
@@ -443,6 +444,93 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
             )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unexpected schema", result.stderr)
+
+    def test_v3_probe_verifier_uses_builder_abi_field_names(self) -> None:
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("bash is unavailable")
+        builder = (
+            ROOT / "scripts" / "build_a5_direct_urma_provider.sh"
+        ).read_text(encoding="utf-8")
+        cases = (
+            (
+                "udma_uapi",
+                "kvaf_udma_uapi_probe",
+                "KVAF_UDMA_UAPI_ABI=",
+                "udma_uapi_abi",
+                "udma-public-layout",
+            ),
+            (
+                "udma_private_abi",
+                "kvaf_udma_private_abi_probe",
+                "KVAF_UDMA_PRIVATE_ABI=",
+                "udma_private_abi",
+                "udma-private-layout",
+            ),
+            (
+                "ummu_uapi",
+                "kvaf_ummu_uapi_probe",
+                "KVAF_UMMU_UAPI_ABI=",
+                "ummu_uapi_abi",
+                "ummu-public-layout",
+            ),
+        )
+        for _, _, _, abi_key, _ in cases:
+            self.assertIn(f"{abi_key}=${{", builder)
+            self.assertIn(f"{abi_key}_sha256=${{", builder)
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary)
+            manifest_lines = []
+            success_lines = []
+            calls = []
+            for prefix, filename, output_prefix, abi_key, abi_value in cases:
+                output = f"{output_prefix}{abi_value}"
+                probe = build / filename
+                probe.write_text(
+                    "#!/bin/sh\n" f"printf '%s\\n' '{output}'\n",
+                    encoding="utf-8",
+                )
+                probe.chmod(0o755)
+                probe_sha = hashlib.sha256(probe.read_bytes()).hexdigest()
+                output_sha = hashlib.sha256(
+                    f"{output}\n".encode("utf-8")
+                ).hexdigest()
+                manifest_lines.extend(
+                    (
+                        f"{prefix}_probe_filename={filename}",
+                        f"{prefix}_probe_sha256={probe_sha}",
+                        f"{abi_key}={abi_value}",
+                        f"{abi_key}_sha256={output_sha}",
+                    )
+                )
+                success_lines.append(f"{prefix}_probe_sha256={probe_sha}")
+                calls.append(
+                    "kvaf_v3_verify_probe "
+                    f"{prefix} {filename} {output_prefix} {abi_key}"
+                )
+
+            manifest = build / "build.manifest"
+            success = build / "build.success"
+            manifest.write_text(
+                "\n".join(manifest_lines) + "\n", encoding="utf-8"
+            )
+            success.write_text(
+                "\n".join(success_lines) + "\n", encoding="utf-8"
+            )
+            command = (
+                f'source "{MANIFEST_V3}"; '
+                f'KVAF_DIRECT_PROVIDER_BUILD_DIR="{build}"; '
+                f'KVAF_DIRECT_PROVIDER_BUILD_MANIFEST="{manifest}"; '
+                f'KVAF_DIRECT_PROVIDER_SUCCESS_STAMP="{success}"; '
+                + " && ".join(calls)
+            )
+            result = subprocess.run(
+                [bash, "-c", command],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_aicpu_packaging_requires_source_built_provider_manifest(self) -> None:
         package_source = (
