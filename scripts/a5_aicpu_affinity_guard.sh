@@ -1,33 +1,42 @@
 #!/usr/bin/env bash
 
-# A KFC launch accepts an associated stream, but the public CANN ABI exposed
-# to this project has no worker/process/SO-instance affinity token.  Sampling
-# getpid(), a process cookie, the SO base and an instance generation over a
-# few completed launches would describe only those past launches; it cannot
-# bind the later Open and Close launches that own process-local UDMA/UMMU
-# handles.  Keep this source-owned value non-configurable: an environment
-# variable is not evidence of a runtime ownership contract.
-readonly KVAF_AICPU_AFFINITY_CONTRACT=unproven-kfc-multilaunch
+# The source now contains a candidate single-invocation epoch owner, but that
+# code has not yet passed the resource-bearing hardware/fault matrix.  Keep
+# the validation state source-owned and non-configurable: an environment
+# variable or a resource-free probe PASS is not evidence that checked Open,
+# AIV transfer and checked Close completed in one live owner invocation.
+readonly KVAF_AICPU_AFFINITY_CONTRACT=candidate-epoch-owner-unvalidated-v1
 
 kvaf_require_aicpu_affinity_contract()
 {
+  local requested_mode=${1:-production}
+
   case "${KVAF_AICPU_AFFINITY_CONTRACT}" in
-    documented-same-stream-process-affinity-v1|single-invocation-owner-v1)
+    documented-same-stream-process-affinity-v1|validated-single-invocation-epoch-owner-v1)
       return 0
       ;;
+    candidate-epoch-owner-unvalidated-v1)
+      if [[ "${requested_mode}" == \
+            candidate-epoch-owner-validation-v1 ]]; then
+        echo "WARNING: running staged resource-bearing epoch-owner validation" >&2
+        echo "CONTRACT=${KVAF_AICPU_AFFINITY_CONTRACT}" >&2
+        return 0
+      fi
+      ;;
+  esac
+
+  case "${KVAF_AICPU_AFFINITY_CONTRACT}" in
     *)
       echo "ERROR: AICPU KFC worker/process affinity is not proven" >&2
       echo "CONTRACT=${KVAF_AICPU_AFFINITY_CONTRACT}" >&2
-      echo "The current Device provider keeps UDMA/UMMU handles in process-local state," >&2
-      echo "but Open and Close are separate KFC launches." >&2
-      echo "A same-stream pid/cookie/SO-base/generation sample is diagnostic only;" >&2
-      echo "the public launch ABI cannot bind either future launch to that worker." >&2
+      echo "The candidate Device path keeps Open, transfer ownership and checked" >&2
+      echo "Close in one epoch-owner invocation, but its resource-bearing hardware" >&2
+      echo "and fault-injection matrix has not been validated yet." >&2
       echo "A bounded, resource-free AICPU owner probe may validate one sampled" >&2
       echo "AICPU/AIV control-buffer handshake, but probe PASS does NOT prove the" >&2
       echo "Open-transfer-Close provider lifetime and does NOT unlock direct URMA." >&2
-      echo "Hardware execution stays disabled until KVAF validates a documented" >&2
-      echo "same-stream same-process/SO runtime contract, or moves the complete" >&2
-      echo "Open-transfer-Close lifetime into one invocation/long-lived owner." >&2
+      echo "Hardware execution stays disabled until KVAF validates the complete" >&2
+      echo "Open-transfer-SHUTDOWN_QUIESCED-Close lifecycle on the pinned stack." >&2
       echo "There is no environment-variable override for this ownership gate." >&2
       echo "No topology/EID/NPU/URMA operation was attempted." >&2
       return 2

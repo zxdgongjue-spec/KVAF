@@ -36,6 +36,42 @@ struct alignas(64) AicpuOwnerProbeAivResult {
 static_assert(sizeof(AicpuOwnerProbeAivResult) == 64,
               "AICPU owner AIV probe result must occupy one cache line");
 
+constexpr std::uint32_t kAicpuEpochOwnerAivResultMagic = 0x4b455641U;
+constexpr std::uint32_t kAicpuEpochOwnerAivResultAbiVersion = 1U;
+
+enum class AicpuEpochOwnerAivStatus : std::uint32_t {
+  kEmpty = 0,
+  kReadyObserved = 1,
+  kShutdownSubmitted = 2,
+  kOwnerTerminal = 3,
+  kQueueNotQuiesced = 4,
+  kTimedOut = 5,
+  kInvalidOwnerStatus = 6,
+};
+
+// One AIV-produced cache line used for both READY and shutdown observations.
+// The four queue counters are zero for the READY phase and carry the exact
+// shutdown proof for the SHUTDOWN_QUIESCED phase.
+struct alignas(64) AicpuEpochOwnerAivResult {
+  std::uint32_t magic{kAicpuEpochOwnerAivResultMagic};
+  std::uint32_t abi_version{kAicpuEpochOwnerAivResultAbiVersion};
+  std::uint32_t struct_size{64U};
+  std::uint32_t status{
+      static_cast<std::uint32_t>(AicpuEpochOwnerAivStatus::kEmpty)};
+  std::uint64_t epoch{0};
+  std::uint64_t session_id{0};
+  std::uint32_t observed_owner_state{0};
+  std::uint32_t poll_count{0};
+  std::uint32_t observed_sq_head{0};
+  std::uint32_t observed_sq_tail{0};
+  std::uint32_t observed_cq_tail{0};
+  std::uint32_t observed_wqe_count{0};
+  std::uint64_t observed_sequence{0};
+};
+
+static_assert(sizeof(AicpuEpochOwnerAivResult) == 64,
+              "AICPU epoch-owner AIV result must occupy one cache line");
+
 // stream is an aclrtStream kept as void* so the stable header does not expose
 // ACL runtime types.
 void LaunchAivSimtUrmaH2D(
@@ -51,5 +87,22 @@ void LaunchAicpuOwnerConcurrencyProbe(
     void* stream, void* command, const void* status,
     AicpuOwnerProbeAivResult* result, std::uint64_t session_id,
     std::uint32_t max_ready_polls);
+
+// Control-plane kernels for the resource-owning AICPU epoch.  These launches
+// are asynchronous; the caller synchronizes the control stream and validates
+// AicpuEpochOwnerAivResult before exposing the data plane or joining owner
+// teardown.
+void LaunchAivEpochOwnerWaitReady(
+    void* stream, const void* owner_status, const void* open_result,
+    AicpuEpochOwnerAivResult* aiv_result, std::uint64_t epoch,
+    std::uint64_t session_id, std::uint32_t max_polls);
+
+void LaunchAivEpochOwnerShutdown(
+    void* stream, void* command, const void* owner_status,
+    AicpuEpochOwnerAivResult* aiv_result,
+    std::uint64_t packed_sq_head_address,
+    std::uint64_t sq_tail_address, std::uint64_t cq_tail_address,
+    std::uint64_t epoch, std::uint64_t session_id,
+    std::uint32_t max_polls);
 
 }  // namespace kvaf::access::a5

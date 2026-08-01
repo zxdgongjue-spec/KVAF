@@ -11,7 +11,11 @@ namespace kvaf::access {
 
 inline constexpr std::uint32_t kAivUrmaAbiVersion = 1;
 inline constexpr std::uint32_t kAivUrmaSimtLanes = 32;
-inline constexpr std::uint32_t kAivUrmaMaxDescriptors = 32;
+// A batch is intentionally larger than one SIMT wave.  The descriptor
+// producer uses a grid-stride loop and the scalar queue owner recycles SQ/CQ
+// entries in bounded waves, so this is a capacity limit rather than a thread
+// count or a hardware queue-depth limit.
+inline constexpr std::uint32_t kAivUrmaMaxDescriptors = 4096;
 inline constexpr std::uint64_t kAivUrmaMaxTransferBytes =
     std::numeric_limits<std::uint32_t>::max();
 inline constexpr std::uint32_t kNoFailedIndex =
@@ -58,6 +62,7 @@ enum class DeviceBatchStatus : std::uint32_t {
   kDirectLocalRangeInvalid,
   kDirectCqTimeout,
   kDirectCqError,
+  kDirectCounterOverflow,
 };
 
 // Versioned device-side view of one UBC/CTP channel. A control-plane backend
@@ -165,6 +170,9 @@ struct alignas(64) DeviceCompletion {
   std::uint32_t first_failed_index{kNoFailedIndex};
   std::uint32_t reserved0{0};
   std::uint64_t generation{0};
+  // reserved[0] is populated by the direct A5 backend with the number of
+  // SQ/CQ waves used by this batch.  It remains reserved in ABI v1 so older
+  // consumers that ignore it stay layout-compatible.
   std::uint64_t reserved[3]{};
 };
 

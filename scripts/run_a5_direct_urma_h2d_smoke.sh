@@ -3,6 +3,15 @@
 set -Eeuo pipefail
 umask 077
 
+kvaf_affinity_run_mode=${1:-production}
+if (( $# > 1 )) ||
+   [[ "${kvaf_affinity_run_mode}" != production &&
+      "${kvaf_affinity_run_mode}" != \
+        candidate-epoch-owner-validation-v1 ]]; then
+  echo "ERROR: invalid direct URMA runner mode" >&2
+  exit 2
+fi
+
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd -P)
 source "${SCRIPT_DIR}/a5_direct_urma_legacy_guard.sh"
@@ -40,7 +49,43 @@ KVAF_HCCN_TIMEOUT_SECONDS=${KVAF_HCCN_TIMEOUT_SECONDS:-30}
 KVAF_LOGICAL_DEVICE_ID=${KVAF_LOGICAL_DEVICE_ID:-0}
 KVAF_PHYSICAL_DEVICE_ID=${KVAF_PHYSICAL_DEVICE_ID:-}
 KVAF_DIRECT_CONTROL_PORT=${KVAF_DIRECT_CONTROL_PORT:-21115}
-KVAF_H2D_BYTES=${KVAF_H2D_BYTES:-4096}
+kvaf_legacy_h2d_bytes_is_set=0
+kvaf_transfer_count_is_set=0
+kvaf_bytes_per_transfer_is_set=0
+kvaf_batch_iterations_is_set=0
+kvaf_descriptor_capacity_is_set=0
+kvaf_run_timeout_is_set=0
+[[ -n "${KVAF_H2D_BYTES+x}" ]] && kvaf_legacy_h2d_bytes_is_set=1
+[[ -n "${KVAF_H2D_TRANSFER_COUNT+x}" ]] && kvaf_transfer_count_is_set=1
+[[ -n "${KVAF_H2D_BYTES_PER_TRANSFER+x}" ]] &&
+  kvaf_bytes_per_transfer_is_set=1
+[[ -n "${KVAF_H2D_BATCH_ITERATIONS+x}" ]] &&
+  kvaf_batch_iterations_is_set=1
+[[ -n "${KVAF_H2D_DESCRIPTOR_CAPACITY+x}" ]] &&
+  kvaf_descriptor_capacity_is_set=1
+[[ -n "${KVAF_H2D_RUN_TIMEOUT_SECONDS+x}" ]] &&
+  kvaf_run_timeout_is_set=1
+if (( kvaf_legacy_h2d_bytes_is_set != 0 &&
+      (kvaf_transfer_count_is_set != 0 ||
+       kvaf_bytes_per_transfer_is_set != 0 ||
+       kvaf_batch_iterations_is_set != 0 ||
+       kvaf_descriptor_capacity_is_set != 0) )); then
+  echo "ERROR: legacy KVAF_H2D_BYTES cannot be combined with the new H2D workload variables" >&2
+  exit 2
+fi
+if (( kvaf_legacy_h2d_bytes_is_set != 0 )); then
+  KVAF_H2D_TRANSFER_COUNT=1
+  KVAF_H2D_BYTES_PER_TRANSFER=${KVAF_H2D_BYTES}
+  KVAF_H2D_BATCH_ITERATIONS=1
+  KVAF_H2D_DESCRIPTOR_CAPACITY=1
+  kvaf_h2d_workload_mode=legacy-total-bytes
+else
+  KVAF_H2D_TRANSFER_COUNT=${KVAF_H2D_TRANSFER_COUNT:-4096}
+  KVAF_H2D_BYTES_PER_TRANSFER=${KVAF_H2D_BYTES_PER_TRANSFER:-1024}
+  KVAF_H2D_BATCH_ITERATIONS=${KVAF_H2D_BATCH_ITERATIONS:-1}
+  KVAF_H2D_DESCRIPTOR_CAPACITY=${KVAF_H2D_DESCRIPTOR_CAPACITY:-4096}
+  kvaf_h2d_workload_mode=explicit-transfer-shape
+fi
 KVAF_H2D_TIMEOUT_SECONDS=${KVAF_H2D_TIMEOUT_SECONDS:-120}
 KVAF_DIRECT_SERVER_START_DELAY_SECONDS=${KVAF_DIRECT_SERVER_START_DELAY_SECONDS:-1}
 KVAF_A5_RUN_TAG=${KVAF_A5_RUN_TAG:-$(date +%Y%m%d_%H%M%S)_$$}
@@ -472,9 +517,26 @@ require_uint_max KVAF_LOGICAL_DEVICE_ID \
   "${KVAF_LOGICAL_DEVICE_ID}" 4294967295
 require_uint_max KVAF_DIRECT_CONTROL_PORT \
   "${KVAF_DIRECT_CONTROL_PORT}" 65535
-require_uint_max KVAF_H2D_BYTES "${KVAF_H2D_BYTES}" 67108864
+require_uint_max KVAF_H2D_TRANSFER_COUNT \
+  "${KVAF_H2D_TRANSFER_COUNT}" 67108864
+require_uint_max KVAF_H2D_BYTES_PER_TRANSFER \
+  "${KVAF_H2D_BYTES_PER_TRANSFER}" 67108864
+require_uint_max KVAF_H2D_BATCH_ITERATIONS \
+  "${KVAF_H2D_BATCH_ITERATIONS}" 67108864
+require_uint_max KVAF_H2D_DESCRIPTOR_CAPACITY \
+  "${KVAF_H2D_DESCRIPTOR_CAPACITY}" 4096
 require_uint_max KVAF_H2D_TIMEOUT_SECONDS \
   "${KVAF_H2D_TIMEOUT_SECONDS}" 3600
+if (( kvaf_run_timeout_is_set != 0 )); then
+  require_uint_max KVAF_H2D_RUN_TIMEOUT_SECONDS \
+    "${KVAF_H2D_RUN_TIMEOUT_SECONDS}" 604800
+else
+  # Preserve the historical worker-supervision deadline. This is separate
+  # from --timeout-seconds below, which remains the provider/control timeout.
+  KVAF_H2D_RUN_TIMEOUT_SECONDS=$((
+    KVAF_H2D_TIMEOUT_SECONDS * 3 + 10
+  ))
+fi
 require_uint KVAF_EID_LOCK_TIMEOUT_SECONDS \
   "${KVAF_EID_LOCK_TIMEOUT_SECONDS}"
 require_uint KVAF_DIRECT_SERVER_START_DELAY_SECONDS \
@@ -501,13 +563,69 @@ if (( KVAF_DIRECT_CONTROL_PORT < 1024 ||
   echo "ERROR: KVAF_DIRECT_CONTROL_PORT must be in [1024, 65535]" >&2
   exit 2
 fi
-if (( KVAF_H2D_BYTES == 0 ||
-      KVAF_H2D_BYTES > 67108864 ||
+if (( KVAF_H2D_BYTES_PER_TRANSFER == 0 ||
+      KVAF_H2D_BATCH_ITERATIONS == 0 ||
+      KVAF_H2D_DESCRIPTOR_CAPACITY == 0 ||
       KVAF_H2D_TIMEOUT_SECONDS == 0 ||
       KVAF_H2D_TIMEOUT_SECONDS > 3600 )); then
-  echo "ERROR: invalid H2D byte count or timeout" >&2
+  echo "ERROR: invalid H2D workload shape or timeout" >&2
   exit 2
 fi
+if (( KVAF_H2D_RUN_TIMEOUT_SECONDS == 0 )); then
+  echo "ERROR: KVAF_H2D_RUN_TIMEOUT_SECONDS must be in [1, 604800]" >&2
+  exit 2
+fi
+if (( KVAF_H2D_TRANSFER_COUNT == 0 )) &&
+   [[ "${kvaf_affinity_run_mode}" != \
+      candidate-epoch-owner-validation-v1 ]]; then
+  echo "ERROR: zero-WQE lifecycle is available only through the staged epoch-owner validation wrapper" >&2
+  exit 2
+fi
+if (( KVAF_H2D_TRANSFER_COUNT > KVAF_H2D_DESCRIPTOR_CAPACITY )); then
+  echo "ERROR: KVAF_H2D_TRANSFER_COUNT exceeds KVAF_H2D_DESCRIPTOR_CAPACITY" >&2
+  exit 2
+fi
+if (( KVAF_H2D_DESCRIPTOR_CAPACITY >
+      67108864 / KVAF_H2D_BYTES_PER_TRANSFER )); then
+  echo "ERROR: the descriptor pool exceeds the 64 MiB registration limit" >&2
+  exit 2
+fi
+KVAF_H2D_PAYLOAD_CAPACITY_BYTES=$((
+  KVAF_H2D_DESCRIPTOR_CAPACITY * KVAF_H2D_BYTES_PER_TRANSFER
+))
+# Mirror smoke RegistrationBytes(): reserve the payload canary, round one
+# half to the provider's 4 KiB page contract, then register two halves.
+KVAF_H2D_PROVIDER_SEGMENT_PAYLOAD_BYTES=$((
+  KVAF_H2D_PAYLOAD_CAPACITY_BYTES + 64
+))
+kvaf_h2d_provider_half_bytes=${KVAF_H2D_PROVIDER_SEGMENT_PAYLOAD_BYTES}
+if (( kvaf_h2d_provider_half_bytes < 4096 )); then
+  kvaf_h2d_provider_half_bytes=4096
+fi
+kvaf_h2d_provider_half_remainder=$((
+  kvaf_h2d_provider_half_bytes % 4096
+))
+if (( kvaf_h2d_provider_half_remainder != 0 )); then
+  kvaf_h2d_provider_half_bytes=$((
+    kvaf_h2d_provider_half_bytes +
+    4096 - kvaf_h2d_provider_half_remainder
+  ))
+fi
+KVAF_H2D_PROVIDER_LOCAL_ALLOCATION_BYTES=$((
+  kvaf_h2d_provider_half_bytes * 2
+))
+KVAF_H2D_BATCH_BYTES=$((
+  KVAF_H2D_TRANSFER_COUNT * KVAF_H2D_BYTES_PER_TRANSFER
+))
+if (( KVAF_H2D_TRANSFER_COUNT != 0 &&
+      KVAF_H2D_BATCH_ITERATIONS >
+        4294967295 / KVAF_H2D_TRANSFER_COUNT )); then
+  echo "ERROR: total transfer count exceeds the 32-bit epoch queue-counter limit" >&2
+  exit 2
+fi
+KVAF_H2D_TOTAL_BYTES=$((
+  KVAF_H2D_BATCH_BYTES * KVAF_H2D_BATCH_ITERATIONS
+))
 if (( KVAF_NPU_SMI_TIMEOUT_SECONDS == 0 )); then
   echo "ERROR: KVAF_NPU_SMI_TIMEOUT_SECONDS must be in [1, 120]" >&2
   exit 2
@@ -568,7 +686,8 @@ udma_teardown_contract=checked-retryable-v1
 # EID selector, topology query, npu-smi call, ACL context, AICPU launch and
 # URMA/UMMU allocation.  The public KFC ABI does not currently provide such a
 # proof, so the source-owned guard fails closed without an operator override.
-kvaf_require_aicpu_affinity_contract || exit $?
+kvaf_require_aicpu_affinity_contract \
+  "${kvaf_affinity_run_mode}" || exit $?
 
 # The deploy lock acquired during recovery closes the build/package race.
 # Validate the complete direct-smoke and installed AICPU artifact chain before
@@ -971,6 +1090,9 @@ archive_sha=$(
 )
 {
   printf 'kvaf_commit=%s\n' "${kvaf_commit}"
+  printf 'aicpu_affinity_contract=%s\n' \
+    "${KVAF_AICPU_AFFINITY_CONTRACT}"
+  printf 'aicpu_affinity_run_mode=%s\n' "${kvaf_affinity_run_mode}"
   printf 'run_id=%s\n' "${kvaf_run_id}"
   printf 'ascend_home_path=%s\n' "${ASCEND_HOME_PATH}"
   printf 'logical_device_id=%s\n' "${KVAF_LOGICAL_DEVICE_ID}"
@@ -996,7 +1118,28 @@ archive_sha=$(
   printf 'device_urma_device=%s\n' "${KVAF_DEVICE_URMA_DEVICE}"
   printf 'device_eid_index=%s\n' "${KVAF_DEVICE_EID_INDEX}"
   printf 'control_port=%s\n' "${KVAF_DIRECT_CONTROL_PORT}"
-  printf 'h2d_bytes=%s\n' "${KVAF_H2D_BYTES}"
+  printf 'h2d_workload_mode=%s\n' "${kvaf_h2d_workload_mode}"
+  printf 'h2d_transfer_count=%s\n' "${KVAF_H2D_TRANSFER_COUNT}"
+  printf 'h2d_bytes_per_transfer=%s\n' \
+    "${KVAF_H2D_BYTES_PER_TRANSFER}"
+  printf 'h2d_batch_iterations=%s\n' \
+    "${KVAF_H2D_BATCH_ITERATIONS}"
+  printf 'h2d_descriptor_capacity=%s\n' \
+    "${KVAF_H2D_DESCRIPTOR_CAPACITY}"
+  printf 'h2d_payload_capacity_bytes=%s\n' \
+    "${KVAF_H2D_PAYLOAD_CAPACITY_BYTES}"
+  printf 'h2d_provider_segment_payload_bytes=%s\n' \
+    "${KVAF_H2D_PROVIDER_SEGMENT_PAYLOAD_BYTES}"
+  # Both endpoints pass this exact local_allocation_bytes value to their
+  # provider. It is not a claim about additional provider-internal memory.
+  printf 'h2d_provider_local_allocation_bytes_per_endpoint=%s\n' \
+    "${KVAF_H2D_PROVIDER_LOCAL_ALLOCATION_BYTES}"
+  printf 'h2d_total_bytes_per_batch=%s\n' "${KVAF_H2D_BATCH_BYTES}"
+  printf 'h2d_total_bytes=%s\n' "${KVAF_H2D_TOTAL_BYTES}"
+  printf 'h2d_control_timeout_seconds=%s\n' \
+    "${KVAF_H2D_TIMEOUT_SECONDS}"
+  printf 'h2d_run_timeout_seconds=%s\n' \
+    "${KVAF_H2D_RUN_TIMEOUT_SECONDS}"
   printf 'binary_sha256=%s\n' "${direct_binary_sha}"
   printf 'direct_build_manifest_sha256=%s\n' \
     "${direct_build_manifest_sha}"
@@ -1071,10 +1214,12 @@ common_args=(
   --run-id "${kvaf_run_id}"
   --logical-device-id "${KVAF_LOGICAL_DEVICE_ID}"
   --control-port "${KVAF_DIRECT_CONTROL_PORT}"
-  --bytes "${KVAF_H2D_BYTES}"
+  --transfer-count "${KVAF_H2D_TRANSFER_COUNT}"
+  --bytes-per-transfer "${KVAF_H2D_BYTES_PER_TRANSFER}"
+  --batch-iterations "${KVAF_H2D_BATCH_ITERATIONS}"
+  --descriptor-capacity "${KVAF_H2D_DESCRIPTOR_CAPACITY}"
   --timeout-seconds "${KVAF_H2D_TIMEOUT_SECONDS}"
 )
-total_timeout_seconds=$((KVAF_H2D_TIMEOUT_SECONDS * 3 + 10))
 
 host_pid=
 device_pid=
@@ -1395,6 +1540,8 @@ echo "HOST_URMA=${KVAF_HOST_URMA_DEVICE}/eid${KVAF_HOST_EID_INDEX}"
 echo "DEVICE_URMA=${KVAF_DEVICE_URMA_DEVICE}/eid${KVAF_DEVICE_EID_INDEX}"
 echo "CONTROL_PORT=${KVAF_DIRECT_CONTROL_PORT}"
 echo "RUN_ID=${kvaf_run_id}"
+echo "H2D_CONTROL_TIMEOUT_SECONDS=${KVAF_H2D_TIMEOUT_SECONDS}"
+echo "H2D_RUN_TIMEOUT_SECONDS=${KVAF_H2D_RUN_TIMEOUT_SECONDS}"
 echo "TEARDOWN_ASSURANCE=${kvaf_teardown_assurance}"
 echo "MANIFEST=${manifest}"
 
@@ -1515,7 +1662,7 @@ device_pid=$!
 active_phase=device_started
 write_active_session
 
-deadline=$(( $(date +%s) + total_timeout_seconds ))
+deadline=$(( $(date +%s) + KVAF_H2D_RUN_TIMEOUT_SECONDS ))
 while kill -0 "${host_pid}" 2>/dev/null ||
       kill -0 "${device_pid}" 2>/dev/null
 do

@@ -14,10 +14,12 @@
 #include <cstring>
 #include <iterator>
 #include <limits>
+#include <mutex>
 #include <string>
 
 #include <unistd.h>
 
+#include "kvaf/access_operator/a5/aiv_simt_urma_h2d_launcher.h"
 #include "kvaf_urma_provider_abi.h"
 
 namespace kvaf::access::a5 {
@@ -32,6 +34,9 @@ constexpr std::uint32_t kProviderRequiredFlags =
     KVAF_URMA_PROVIDER_CONNECTED |
     KVAF_URMA_PROVIDER_REMOTE_EID_NETWORK_ORDER |
     KVAF_URMA_PROVIDER_QUEUE_IS_AICPU_SHARED_VA;
+constexpr std::uint32_t kEpochOwnerPollMicroseconds = 1000U;
+constexpr std::uint32_t kEpochOwnerCloseRetryMicroseconds = 1000U;
+constexpr std::uint32_t kEpochOwnerAivPollBudget = 20000000U;
 
 static_assert(sizeof(rtAicpuArgsEx_t) == 48,
               "unexpected CANN rtAicpuArgsEx ABI");
@@ -171,6 +176,32 @@ Status ValidateProviderResult(
   return Status::OK();
 }
 
+bool EpochOwnerStatusHeaderIsValid(
+    const kvaf_urma_epoch_owner_status_v1& status,
+    std::uint64_t expected_epoch, std::uint64_t expected_session) {
+  return status.magic == KVAF_URMA_EPOCH_OWNER_MAGIC &&
+         status.abi_version == KVAF_URMA_EPOCH_OWNER_ABI_VERSION &&
+         status.struct_size == sizeof(status) &&
+         status.epoch == expected_epoch &&
+         status.session_id == expected_session;
+}
+
+bool EpochOwnerTeardownIsComplete(
+    const kvaf_urma_epoch_owner_status_v1& status) {
+  return status.state == KVAF_URMA_EPOCH_OWNER_STATE_CLOSED &&
+         status.result_code == KVAF_URMA_EPOCH_OWNER_RESULT_OK &&
+         status.provider_status == KVAF_URMA_PROVIDER_CLOSE_OK &&
+         status.sequence == KVAF_URMA_EPOCH_OWNER_SHUTDOWN_SEQUENCE &&
+         status.close_attempts != 0 &&
+         (status.flags &
+          (KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+           KVAF_URMA_EPOCH_OWNER_TEARDOWN_COMPLETE)) ==
+             (KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+              KVAF_URMA_EPOCH_OWNER_TEARDOWN_COMPLETE) &&
+         (status.flags & (KVAF_URMA_EPOCH_OWNER_PROVIDER_ACTIVE |
+                          KVAF_URMA_EPOCH_OWNER_OWNERSHIP_UNSAFE)) == 0;
+}
+
 std::uint64_t NextSessionId() {
   static std::atomic<std::uint64_t> sequence{1};
   const auto ticks = static_cast<std::uint64_t>(
@@ -183,6 +214,18 @@ std::uint64_t NextSessionId() {
     session = ordinal == 0 ? 1 : ordinal;
   }
   return session;
+}
+
+std::uint64_t NextEpochId() {
+  static std::atomic<std::uint64_t> sequence{1};
+  const auto ordinal = sequence.fetch_add(1, std::memory_order_relaxed);
+  std::uint64_t epoch =
+      (static_cast<std::uint64_t>(::getpid()) << 32U) ^
+      (ordinal * 0xd6e8feb86659fd93ULL);
+  if (epoch == 0) {
+    epoch = ordinal == 0 ? 1 : ordinal;
+  }
+  return epoch;
 }
 
 }  // namespace
@@ -201,13 +244,25 @@ struct DirectUrmaResources::Impl {
   ProviderClose provider_close{nullptr};
   void* runtime_library{nullptr};
   AicpuLaunch aicpu_launch{nullptr};
-  aclrtStream stream{nullptr};
+  aclrtStream owner_stream{nullptr};
+  aclrtStream control_stream{nullptr};
   DirectQueueState* queue_state{nullptr};
   kvaf_urma_provider_result_v2* device_open_result{nullptr};
-  std::int32_t* device_close_result{nullptr};
+  kvaf_urma_epoch_owner_command_v1* owner_command{nullptr};
+  kvaf_urma_epoch_owner_status_v1* owner_status{nullptr};
+  AicpuEpochOwnerAivResult* owner_aiv_result{nullptr};
+  mutable std::mutex data_plane_mutex;
   bool queue_state_initialized{false};
-  bool last_aicpu_launch_submitted{false};
+  bool owner_launch_submitted{false};
+  bool owner_joined{false};
+  bool shutdown_control_submitted{false};
+  bool shutdown_control_quiesced{false};
+  bool shutdown_result_validated{false};
+  bool data_plane_frozen{false};
+  bool data_plane_work_enqueued{false};
+  bool data_plane_quiesced{true};
   bool resource_quiescence_unknown{false};
+  std::uint64_t epoch_id{0};
   std::uint64_t session_id{0};
   bool provider_active{false};
   bool opened{false};
@@ -220,10 +275,16 @@ struct DirectUrmaResources::Impl {
     return opened || closed || provider_library != nullptr ||
            provider_open != nullptr || provider_close != nullptr ||
            runtime_library != nullptr || aicpu_launch != nullptr ||
-           stream != nullptr || queue_state != nullptr ||
-           device_open_result != nullptr || device_close_result != nullptr ||
-           queue_state_initialized || last_aicpu_launch_submitted ||
-           resource_quiescence_unknown || session_id != 0 || provider_active ||
+           owner_stream != nullptr || control_stream != nullptr ||
+           queue_state != nullptr || device_open_result != nullptr ||
+           owner_command != nullptr || owner_status != nullptr ||
+           owner_aiv_result != nullptr || queue_state_initialized ||
+           owner_launch_submitted || owner_joined ||
+           shutdown_control_submitted || shutdown_control_quiesced ||
+           shutdown_result_validated || data_plane_frozen ||
+           data_plane_work_enqueued || !data_plane_quiesced ||
+           resource_quiescence_unknown ||
+           epoch_id != 0 || session_id != 0 || provider_active ||
            close_phase != DirectUrmaClosePhase::kNotStarted ||
            close_disposition != DirectUrmaCloseDisposition::kNotStarted;
   }
@@ -286,39 +347,55 @@ struct DirectUrmaResources::Impl {
             (error == nullptr ? "unknown dlsym error" : error));
   }
 
-  Status InvokeAicpu(void* args, std::uint32_t args_size,
-                     std::uint32_t so_name_offset,
-                     std::uint32_t kernel_name_offset,
-                     const char* operation) {
-    last_aicpu_launch_submitted = false;
+  Status LaunchEpochOwner(void* args, std::uint32_t args_size,
+                          std::uint32_t so_name_offset,
+                          std::uint32_t kernel_name_offset,
+                          const char* operation) {
     rtAicpuArgsEx_t launch_args{};
     launch_args.args = args;
     launch_args.argsSize = args_size;
     launch_args.soNameAddrOffset = so_name_offset;
     launch_args.kernelNameAddrOffset = kernel_name_offset;
+    // A runtime watchdog is safe for the resource-free probe but not for an
+    // invocation that owns UDMA/UMMU handles. Zero selects the public
+    // cooperative/no-forced-timeout path; shutdown is driven by the GM
+    // command and the provider's own checked retry loop.
+    launch_args.timeout = 0;
+    // A nonzero launch return cannot prove that KFC never observed the
+    // request. Arm retained ownership before crossing the runtime ABI.
+    owner_launch_submitted = true;
     const auto result_code = aicpu_launch(
         kAicpuKfcKernelType, operation, 1, &launch_args, nullptr,
-        reinterpret_cast<rtStream_t>(stream), 0);
+        reinterpret_cast<rtStream_t>(owner_stream), 0);
     if (result_code != 0) {
       return Status::Error(
           StatusCode::kTransportError,
           std::string(operation) + " launch failed, runtime ret=" +
               std::to_string(result_code));
     }
-    last_aicpu_launch_submitted = true;
-    const auto first_sync_result = aclrtSynchronizeStream(stream);
+    return Status::OK();
+  }
+
+  Status SynchronizeWithRetry(aclrtStream target,
+                              const char* operation) {
+    if (target == nullptr) {
+      return Status::Error(StatusCode::kInternal,
+                           std::string(operation) +
+                               " has no stream");
+    }
+    const auto first_sync_result = aclrtSynchronizeStream(target);
     aclError final_sync_result = first_sync_result;
     if (first_sync_result != ACL_SUCCESS) {
       // A transient scheduler/runtime wake-up error must not immediately turn
       // into an unrecoverable ownership state. Retry the same stream once;
       // no result buffer or provider backing is touched between attempts.
-      final_sync_result = aclrtSynchronizeStream(stream);
+      final_sync_result = aclrtSynchronizeStream(target);
     }
     if (final_sync_result != ACL_SUCCESS) {
       resource_quiescence_unknown = true;
       return Status::Error(
           StatusCode::kTransportError,
-          "aclrtSynchronizeStream(AICPU provider) failed twice, first=" +
+          std::string(operation) + " failed twice, first=" +
               std::to_string(first_sync_result) + " second=" +
               std::to_string(final_sync_result));
     }
@@ -376,6 +453,11 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
   config.address_kind = KVAF_URMA_PROVIDER_ADDRESS_DEVICE_VA;
   config.control_timeout_seconds = spec.control_timeout_seconds;
   impl_->session_id = NextSessionId();
+  // A DirectUrmaResources object owns exactly one transport epoch in both
+  // execution domains.  Host resources are still opened/closed in-process;
+  // Device resources additionally carry this nonce through the long-lived
+  // AICPU owner command/status protocol.
+  impl_->epoch_id = NextEpochId();
   config.session_id = impl_->session_id;
   config.local_address = spec.local_address;
   config.local_allocation_bytes = spec.local_allocation_bytes;
@@ -486,10 +568,26 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
     if (!status.ok()) {
       return status;
     }
-    const auto stream_result = aclrtCreateStream(&impl_->stream);
-    if (stream_result != ACL_SUCCESS) {
-      status = AclFailure("aclrtCreateStream(AICPU provider)",
-                          stream_result);
+    const auto owner_stream_result =
+        aclrtCreateStream(&impl_->owner_stream);
+    if (owner_stream_result != ACL_SUCCESS) {
+      status = AclFailure("aclrtCreateStream(AICPU epoch owner)",
+                          owner_stream_result);
+      (void)Close();
+      return status;
+    }
+    const auto control_stream_result =
+        aclrtCreateStream(&impl_->control_stream);
+    if (control_stream_result != ACL_SUCCESS) {
+      status = AclFailure("aclrtCreateStream(AIV epoch control)",
+                          control_stream_result);
+      (void)Close();
+      return status;
+    }
+    if (impl_->owner_stream == impl_->control_stream) {
+      status = Status::Error(
+          StatusCode::kInternal,
+          "AICPU owner and AIV control streams are not distinct");
       (void)Close();
       return status;
     }
@@ -536,71 +634,248 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
       return status;
     }
 
-    kvaf_urma_aicpu_open_args_v2 open_args{};
+    const auto command_alloc = aclrtMalloc(
+        reinterpret_cast<void**>(&impl_->owner_command),
+        sizeof(*impl_->owner_command), ACL_MEM_MALLOC_HUGE_FIRST);
+    if (command_alloc != ACL_SUCCESS) {
+      status = AclFailure("aclrtMalloc(epoch owner command)",
+                          command_alloc);
+      (void)Close();
+      return status;
+    }
+    const kvaf_urma_epoch_owner_command_v1 empty_command{};
+    copy_result = aclrtMemcpy(
+        impl_->owner_command, sizeof(empty_command), &empty_command,
+        sizeof(empty_command), ACL_MEMCPY_HOST_TO_DEVICE);
+    if (copy_result != ACL_SUCCESS) {
+      status = AclFailure("aclrtMemcpy(epoch owner command initialize)",
+                          copy_result);
+      (void)Close();
+      return status;
+    }
+
+    const auto status_alloc = aclrtMalloc(
+        reinterpret_cast<void**>(&impl_->owner_status),
+        sizeof(*impl_->owner_status), ACL_MEM_MALLOC_HUGE_FIRST);
+    if (status_alloc != ACL_SUCCESS) {
+      status = AclFailure("aclrtMalloc(epoch owner status)", status_alloc);
+      (void)Close();
+      return status;
+    }
+    const kvaf_urma_epoch_owner_status_v1 empty_owner_status{};
+    copy_result = aclrtMemcpy(
+        impl_->owner_status, sizeof(empty_owner_status),
+        &empty_owner_status, sizeof(empty_owner_status),
+        ACL_MEMCPY_HOST_TO_DEVICE);
+    if (copy_result != ACL_SUCCESS) {
+      status = AclFailure("aclrtMemcpy(epoch owner status initialize)",
+                          copy_result);
+      (void)Close();
+      return status;
+    }
+
+    const auto aiv_result_alloc = aclrtMalloc(
+        reinterpret_cast<void**>(&impl_->owner_aiv_result),
+        sizeof(*impl_->owner_aiv_result), ACL_MEM_MALLOC_HUGE_FIRST);
+    if (aiv_result_alloc != ACL_SUCCESS) {
+      status = AclFailure("aclrtMalloc(epoch owner AIV result)",
+                          aiv_result_alloc);
+      (void)Close();
+      return status;
+    }
+    const AicpuEpochOwnerAivResult empty_aiv_result{};
+    copy_result = aclrtMemcpy(
+        impl_->owner_aiv_result, sizeof(empty_aiv_result),
+        &empty_aiv_result, sizeof(empty_aiv_result),
+        ACL_MEMCPY_HOST_TO_DEVICE);
+    if (copy_result != ACL_SUCCESS) {
+      status = AclFailure("aclrtMemcpy(epoch owner AIV result initialize)",
+                          copy_result);
+      (void)Close();
+      return status;
+    }
+
+    kvaf_urma_aicpu_epoch_owner_args_v1 open_args{};
     status = CopyFixedString(
-        "aicpu_kvaf_urma_open_v2", open_args.kernel_name,
-        sizeof(open_args.kernel_name), "AICPU provider kernel name");
+        "aicpu_kvaf_urma_epoch_owner_v1", open_args.kernel_name,
+        sizeof(open_args.kernel_name), "AICPU epoch-owner kernel name");
     if (status.ok()) {
       status = CopyFixedString(
           spec.provider_soname, open_args.so_name,
           sizeof(open_args.so_name), "AICPU provider soname");
     }
     open_args.config = config;
-    open_args.result_address =
+    open_args.epoch = impl_->epoch_id;
+    open_args.command_address =
+        reinterpret_cast<std::uint64_t>(impl_->owner_command);
+    open_args.status_address =
+        reinterpret_cast<std::uint64_t>(impl_->owner_status);
+    open_args.open_result_address =
         reinterpret_cast<std::uint64_t>(impl_->device_open_result);
+    open_args.lease_timeout_milliseconds = 0;
+    open_args.poll_interval_microseconds = kEpochOwnerPollMicroseconds;
+    open_args.close_retry_limit = 0;
+    open_args.close_retry_interval_microseconds =
+        kEpochOwnerCloseRetryMicroseconds;
+    open_args.magic = KVAF_URMA_EPOCH_OWNER_MAGIC;
+    open_args.abi_version = KVAF_URMA_EPOCH_OWNER_ABI_VERSION;
+    open_args.struct_size = sizeof(open_args);
+    open_args.flags = 0;
     if (status.ok()) {
-      // Close is idempotent even if the Open kernel is rejected before
-      // creating a context. Mark the provider first so every launch/sync/copy
-      // failure attempts an AICPU-side cleanup.
+      // Arm retained ownership before the asynchronous launch. The owner
+      // stream must not be synchronized here: READY is observed by an AIV
+      // task on the distinct control stream while this invocation stays live.
       impl_->provider_active = true;
-      status = impl_->InvokeAicpu(
+      status = impl_->LaunchEpochOwner(
           &open_args, sizeof(open_args),
-          offsetof(kvaf_urma_aicpu_open_args_v2, so_name),
-          offsetof(kvaf_urma_aicpu_open_args_v2, kernel_name),
-          "kvaf_direct_urma_open");
+          offsetof(kvaf_urma_aicpu_epoch_owner_args_v1, so_name),
+          offsetof(kvaf_urma_aicpu_epoch_owner_args_v1, kernel_name),
+          "kvaf_direct_urma_epoch_owner");
       if (!status.ok()) {
-        /*
-         * The runtime launch ABI does not provide a completion token proving
-         * that a nonzero return happened before AICPU observed the request.
-         * Keep the session/backing exactly as for an ambiguous Close launch.
-         */
         impl_->MarkUnsafeUnknown();
       }
     }
-    if (status.ok()) {
+    AicpuEpochOwnerAivResult ready_result{};
+    kvaf_urma_epoch_owner_status_v1 ready_status{};
+    const auto ready_deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(spec.control_timeout_seconds);
+    while (status.ok()) {
+      LaunchAivEpochOwnerWaitReady(
+          impl_->control_stream, impl_->owner_status,
+          impl_->device_open_result, impl_->owner_aiv_result,
+          impl_->epoch_id, impl_->session_id,
+          kEpochOwnerAivPollBudget);
+      status = impl_->SynchronizeWithRetry(
+          impl_->control_stream,
+          "aclrtSynchronizeStream(AIV epoch READY)");
+      if (!status.ok()) {
+        break;
+      }
       copy_result = aclrtMemcpy(
-          &impl_->result, sizeof(impl_->result),
-          impl_->device_open_result,
-          sizeof(impl_->result), ACL_MEMCPY_DEVICE_TO_HOST);
+          &ready_result, sizeof(ready_result), impl_->owner_aiv_result,
+          sizeof(ready_result), ACL_MEMCPY_DEVICE_TO_HOST);
+      if (copy_result == ACL_SUCCESS) {
+        copy_result = aclrtMemcpy(
+            &ready_status, sizeof(ready_status), impl_->owner_status,
+            sizeof(ready_status), ACL_MEMCPY_DEVICE_TO_HOST);
+      }
+      if (copy_result == ACL_SUCCESS) {
+        copy_result = aclrtMemcpy(
+            &impl_->result, sizeof(impl_->result),
+            impl_->device_open_result, sizeof(impl_->result),
+            ACL_MEMCPY_DEVICE_TO_HOST);
+      }
       if (copy_result != ACL_SUCCESS) {
-        // The Open AICPU stream already synchronized, so the task is no
-        // longer in flight. Keep the exact session and result allocation,
-        // then let Close perform checked teardown. Only a Close launch/sync
-        // failure makes provider quiescence unknown.
-        status = AclFailure("aclrtMemcpy(AICPU provider result)",
+        status = AclFailure("aclrtMemcpy(epoch owner READY evidence)",
                             copy_result);
-      } else if (impl_->result.magic == KVAF_URMA_PROVIDER_MAGIC &&
-                 impl_->result.abi_version ==
-                     KVAF_URMA_PROVIDER_ABI_VERSION &&
-                 impl_->result.struct_size == sizeof(impl_->result) &&
-                 impl_->result.status != KVAF_URMA_PROVIDER_OK) {
-        // A complete error result proves that the AICPU entry point returned
-        // without transferring ownership of a context to this nonce. In
-        // particular, ALREADY_OPEN belongs to another caller and must never
-        // trigger a close of that caller's singleton provider.
-        if ((impl_->result.flags &
-             KVAF_URMA_PROVIDER_CLEANUP_UNCERTAIN) != 0) {
-          impl_->resource_quiescence_unknown = true;
-        } else if ((impl_->result.flags &
-                    KVAF_URMA_PROVIDER_CLEANUP_RETRYABLE) == 0) {
-          impl_->provider_active = false;
-        }
+        break;
+      }
+      if (ready_result.status != static_cast<std::uint32_t>(
+              AicpuEpochOwnerAivStatus::kTimedOut) ||
+          std::chrono::steady_clock::now() >= ready_deadline) {
+        break;
+      }
+
+      // One AIV poll task is intentionally finite. A slow TCP/resource Open
+      // gets another task on the same control stream until the Host-side
+      // control deadline; the AICPU owner itself is never relaunched.
+      const AicpuEpochOwnerAivResult empty_retry_result{};
+      copy_result = aclrtMemcpy(
+          impl_->owner_aiv_result, sizeof(empty_retry_result),
+          &empty_retry_result, sizeof(empty_retry_result),
+          ACL_MEMCPY_HOST_TO_DEVICE);
+      if (copy_result != ACL_SUCCESS) {
+        status = AclFailure(
+            "aclrtMemcpy(epoch READY retry initialize)", copy_result);
       }
     }
-    if (!status.ok()) {
+    const bool ready_observed =
+        status.ok() &&
+        ready_result.magic == kAicpuEpochOwnerAivResultMagic &&
+        ready_result.abi_version ==
+            kAicpuEpochOwnerAivResultAbiVersion &&
+        ready_result.struct_size == sizeof(ready_result) &&
+        ready_result.status == static_cast<std::uint32_t>(
+            AicpuEpochOwnerAivStatus::kReadyObserved) &&
+        ready_result.epoch == impl_->epoch_id &&
+        ready_result.session_id == impl_->session_id &&
+        ready_result.observed_owner_state ==
+            KVAF_URMA_EPOCH_OWNER_STATE_READY &&
+        EpochOwnerStatusHeaderIsValid(
+            ready_status, impl_->epoch_id, impl_->session_id) &&
+        ready_status.state == KVAF_URMA_EPOCH_OWNER_STATE_READY &&
+        ready_status.result_code == KVAF_URMA_EPOCH_OWNER_RESULT_OK &&
+        (ready_status.flags &
+         (KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+          KVAF_URMA_EPOCH_OWNER_PROVIDER_ACTIVE)) ==
+            (KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+             KVAF_URMA_EPOCH_OWNER_PROVIDER_ACTIVE) &&
+        (ready_status.flags &
+         (KVAF_URMA_EPOCH_OWNER_TEARDOWN_COMPLETE |
+          KVAF_URMA_EPOCH_OWNER_OWNERSHIP_UNSAFE)) == 0;
+    if (!ready_observed) {
+      const bool failed_before_resource_ownership =
+          (ready_status.result_code ==
+               KVAF_URMA_EPOCH_OWNER_RESULT_OPEN_FAILED ||
+           ready_status.result_code ==
+               KVAF_URMA_EPOCH_OWNER_RESULT_CLOCK_FAILED) &&
+          impl_->result.status != KVAF_URMA_PROVIDER_OK;
+      const bool opened_then_closed_before_ready =
+          (ready_status.result_code ==
+               KVAF_URMA_EPOCH_OWNER_RESULT_CLOCK_FAILED ||
+           ready_status.result_code ==
+               KVAF_URMA_EPOCH_OWNER_RESULT_LEASE_EXPIRED) &&
+          impl_->result.status == KVAF_URMA_PROVIDER_OK &&
+          ready_status.close_attempts != 0 &&
+          ready_status.provider_status ==
+              KVAF_URMA_PROVIDER_CLOSE_OK;
+      const bool open_failed_safe =
+          status.ok() &&
+          ready_result.status == static_cast<std::uint32_t>(
+              AicpuEpochOwnerAivStatus::kOwnerTerminal) &&
+          EpochOwnerStatusHeaderIsValid(
+              ready_status, impl_->epoch_id, impl_->session_id) &&
+          ready_status.state ==
+              KVAF_URMA_EPOCH_OWNER_STATE_OPEN_FAILED_SAFE &&
+          (failed_before_resource_ownership ||
+           opened_then_closed_before_ready) &&
+          ready_status.sequence == 0 &&
+          (ready_status.flags &
+           (KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+            KVAF_URMA_EPOCH_OWNER_TEARDOWN_COMPLETE)) ==
+              (KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+               KVAF_URMA_EPOCH_OWNER_TEARDOWN_COMPLETE) &&
+          (ready_status.flags &
+           (KVAF_URMA_EPOCH_OWNER_PROVIDER_ACTIVE |
+            KVAF_URMA_EPOCH_OWNER_OWNERSHIP_UNSAFE)) == 0 &&
+          impl_->result.magic == KVAF_URMA_PROVIDER_MAGIC &&
+          impl_->result.abi_version ==
+              KVAF_URMA_PROVIDER_ABI_VERSION &&
+          impl_->result.struct_size == sizeof(impl_->result) &&
+          impl_->result.session_id == impl_->session_id;
+      if (open_failed_safe) {
+        const auto join_status = impl_->SynchronizeWithRetry(
+            impl_->owner_stream,
+            "aclrtSynchronizeStream(failed epoch owner)");
+        if (join_status.ok()) {
+          impl_->owner_joined = true;
+          impl_->MarkProviderClosed();
+          status = Status::Error(
+              StatusCode::kTransportError,
+              "AICPU epoch owner failed Open and completed safe teardown");
+        } else {
+          status = join_status;
+        }
+      } else if (status.ok()) {
+        impl_->MarkUnsafeUnknown();
+        status = Status::Error(
+            StatusCode::kTransportError,
+            "AIV did not observe a valid resource-owning epoch READY");
+      }
       (void)Close();
       return status;
     }
+    impl_->close_phase = DirectUrmaClosePhase::kAicpuEpochOwnerReady;
   }
 
   status = ValidateProviderResult(
@@ -625,6 +900,9 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
   }
 
   impl_->opened = true;
+  impl_->data_plane_frozen = false;
+  impl_->data_plane_work_enqueued = false;
+  impl_->data_plane_quiesced = true;
   return Status::OK();
 }
 
@@ -638,11 +916,18 @@ DirectUrmaMemoryView DirectUrmaResources::remote_memory() const {
                               impl_->result.remote_bytes};
 }
 
+std::uint64_t DirectUrmaResources::epoch() const {
+  return impl_->epoch_id;
+}
+
 Status DirectUrmaResources::SnapshotDirectChannel(
     Address local_address, std::uint64_t local_bytes,
     Address remote_address, std::uint64_t remote_bytes,
     AivDirectUrmaChannel* direct_channel) const {
+  std::lock_guard<std::mutex> data_plane_lock(
+      impl_->data_plane_mutex);
   if (!impl_->opened || impl_->closed ||
+      impl_->data_plane_frozen || !impl_->data_plane_quiesced ||
       impl_->spec.execution_domain !=
           DirectUrmaExecutionDomain::kAicpu ||
       impl_->queue_state == nullptr || direct_channel == nullptr ||
@@ -727,6 +1012,66 @@ Status DirectUrmaResources::SnapshotDirectChannel(
   return Status::OK();
 }
 
+Status DirectUrmaResources::EnqueueBatch(
+    const DeviceBatchGetParams* device_params,
+    DeviceCompletion* device_completion,
+    AivDirectUrmaChannel* direct_channel) {
+  std::lock_guard<std::mutex> data_plane_lock(
+      impl_->data_plane_mutex);
+  if (!impl_->opened || impl_->closed || impl_->data_plane_frozen ||
+      impl_->resource_quiescence_unknown ||
+      impl_->spec.execution_domain !=
+          DirectUrmaExecutionDomain::kAicpu ||
+      impl_->control_stream == nullptr || device_params == nullptr ||
+      device_completion == nullptr || direct_channel == nullptr) {
+    return Status::Error(
+        StatusCode::kInvalidArgument,
+        "direct URMA batch cannot be submitted outside an active, "
+        "unfrozen Device epoch");
+  }
+
+  // Arm the retained-work cursor before crossing the asynchronous AscendC
+  // launch boundary.  There is no Host-visible return value from the launch;
+  // any later exception or synchronization error must therefore retain this
+  // resources object and all DMA-reachable backing.
+  impl_->data_plane_work_enqueued = true;
+  impl_->data_plane_quiesced = false;
+  LaunchAivSimtUrmaH2D(
+      impl_->control_stream, device_params, device_completion,
+      direct_channel);
+  return Status::OK();
+}
+
+Status DirectUrmaResources::SynchronizeDataPlane() {
+  std::lock_guard<std::mutex> data_plane_lock(
+      impl_->data_plane_mutex);
+  if (impl_->closed) {
+    return Status::OK();
+  }
+  if (!impl_->opened || impl_->resource_quiescence_unknown ||
+      impl_->spec.execution_domain !=
+          DirectUrmaExecutionDomain::kAicpu ||
+      impl_->control_stream == nullptr) {
+    return Status::Error(
+        StatusCode::kInvalidArgument,
+        "direct URMA data plane is not an active Device epoch");
+  }
+  if (impl_->data_plane_quiesced) {
+    return Status::OK();
+  }
+  const auto status = impl_->SynchronizeWithRetry(
+      impl_->control_stream,
+      "aclrtSynchronizeStream(AIV direct URMA batch)");
+  if (!status.ok()) {
+    // SynchronizeWithRetry already marks resource quiescence unknown.  Do not
+    // permit Close to publish a software-only shutdown proof for a stream
+    // whose execution state is indeterminate.
+    return status;
+  }
+  impl_->data_plane_quiesced = true;
+  return Status::OK();
+}
+
 bool DirectUrmaResources::transport_teardown_complete() const {
   return !impl_->provider_active &&
          !impl_->resource_quiescence_unknown;
@@ -741,6 +1086,12 @@ bool DirectUrmaResources::transport_teardown_retryable() const {
          impl_->close_disposition ==
              DirectUrmaCloseDisposition::kAicpuResultReadPending ||
          impl_->close_disposition ==
+             DirectUrmaCloseDisposition::kAivShutdownPreLaunchRetryable ||
+         impl_->close_disposition ==
+             DirectUrmaCloseDisposition::kAivShutdownResultReadPending ||
+         impl_->close_disposition ==
+             DirectUrmaCloseDisposition::kAicpuEpochOwnerStatusReadPending ||
+         impl_->close_disposition ==
              DirectUrmaCloseDisposition::kProviderRetryable;
 }
 
@@ -753,9 +1104,17 @@ DirectUrmaCloseDisposition DirectUrmaResources::close_disposition() const {
 }
 
 Status DirectUrmaResources::Close() {
+  std::lock_guard<std::mutex> data_plane_lock(
+      impl_->data_plane_mutex);
   if (impl_->closed) {
     return Status::OK();
   }
+  // Freeze first, under the same mutex used by EnqueueBatch.  Every accepted
+  // data kernel was placed on control_stream before this point, so the final
+  // shutdown kernel below is FIFO-ordered after all of them.  This stream
+  // ordering, rather than a Host snapshot of equal software counters, is the
+  // proof that Close cannot race a scheduled-but-not-started batch.
+  impl_->data_plane_frozen = true;
   if (impl_->resource_quiescence_unknown) {
     impl_->MarkUnsafeUnknown();
     return Status::Error(
@@ -792,142 +1151,192 @@ Status DirectUrmaResources::Close() {
                 std::to_string(provider_close_result));
       }
     } else {
-      const bool result_read_pending =
-          impl_->close_phase ==
-          DirectUrmaClosePhase::kAicpuResultPending;
-      if (!result_read_pending) {
-        if (impl_->aicpu_launch == nullptr || impl_->stream == nullptr) {
-          impl_->MarkUnsafeUnknown();
-          return Status::Error(
-              StatusCode::kTransportError,
-              "active AICPU provider lost its launch stream/runtime handle");
-        }
+      if (impl_->owner_stream == nullptr ||
+          impl_->control_stream == nullptr ||
+          !impl_->owner_launch_submitted ||
+          impl_->owner_command == nullptr ||
+          impl_->owner_status == nullptr ||
+          impl_->owner_aiv_result == nullptr ||
+          impl_->queue_state == nullptr ||
+          !impl_->queue_state_initialized || impl_->epoch_id == 0 ||
+          impl_->session_id == 0) {
+        impl_->MarkUnsafeUnknown();
+        return Status::Error(
+            StatusCode::kTransportError,
+            "active AICPU epoch owner lost a stream or shared record");
+      }
 
-        impl_->close_phase = DirectUrmaClosePhase::kAicpuPreLaunch;
-        DirectQueueState state{};
-        if (impl_->queue_state != nullptr &&
-            impl_->queue_state_initialized) {
-          const auto copy_result = aclrtMemcpy(
-              &state, sizeof(state), impl_->queue_state, sizeof(state),
-              ACL_MEMCPY_DEVICE_TO_HOST);
-          if (copy_result != ACL_SUCCESS) {
-            impl_->MarkPreLaunchRetryable();
-            return AclFailure(
-                "aclrtMemcpy(direct queue state before close)",
-                copy_result);
-          }
-        } else {
-          state.packed_sq_head =
-              static_cast<std::uint64_t>(impl_->result.sq_head) |
-              (static_cast<std::uint64_t>(impl_->result.wqe_count) << 32U);
-          state.cq_tail = impl_->result.cq_tail;
-        }
-        const auto final_sq_head =
-            static_cast<std::uint32_t>(state.packed_sq_head);
-        const auto final_wqe_count =
-            static_cast<std::uint32_t>(state.packed_sq_head >> 32U);
-        if (final_sq_head != state.cq_tail ||
-            final_wqe_count != state.cq_tail) {
-          impl_->MarkUnsafeUnknown();
-          return Status::Error(
-              StatusCode::kTransportError,
-              "direct URMA queue is not drained before provider close");
-        }
+      if (!impl_->shutdown_control_submitted) {
+        impl_->close_phase = DirectUrmaClosePhase::kAivShutdownPreLaunch;
+        impl_->close_disposition =
+            DirectUrmaCloseDisposition::kAivShutdownPreLaunchRetryable;
 
-        kvaf_urma_aicpu_close_args_v2 close_args{};
-        close_args.final_sq_head = final_sq_head;
-        close_args.final_cq_tail = state.cq_tail;
-        close_args.session_id = impl_->session_id;
-        auto close_status = CopyFixedString(
-            "aicpu_kvaf_urma_close_v2", close_args.kernel_name,
-            sizeof(close_args.kernel_name),
-            "AICPU provider close kernel");
-        if (close_status.ok()) {
-          close_status = CopyFixedString(
-              impl_->spec.provider_soname, close_args.so_name,
-              sizeof(close_args.so_name), "AICPU provider soname");
-        }
-        if (!close_status.ok()) {
-          impl_->MarkPreLaunchRetryable();
-          return close_status;
-        }
-
-        if (impl_->device_close_result == nullptr) {
-          const auto alloc_result = aclrtMalloc(
-              reinterpret_cast<void**>(&impl_->device_close_result),
-              sizeof(*impl_->device_close_result),
-              ACL_MEM_MALLOC_HUGE_FIRST);
-          if (alloc_result != ACL_SUCCESS) {
-            impl_->MarkPreLaunchRetryable();
-            return AclFailure(
-                "aclrtMalloc(AICPU close result)", alloc_result);
-          }
-        }
-        constexpr std::int32_t kCloseNotExecuted =
-            std::numeric_limits<std::int32_t>::min();
+        // A previous READY observation remains in this cache line. Reset it
+        // before launching the final control task so a Host-side reread can
+        // never mistake stale READY evidence for a submitted shutdown.
+        const AicpuEpochOwnerAivResult empty_result{};
         const auto initialize_result = aclrtMemcpy(
-            impl_->device_close_result,
-            sizeof(*impl_->device_close_result),
-            &kCloseNotExecuted, sizeof(kCloseNotExecuted),
-            ACL_MEMCPY_HOST_TO_DEVICE);
+            impl_->owner_aiv_result, sizeof(empty_result), &empty_result,
+            sizeof(empty_result), ACL_MEMCPY_HOST_TO_DEVICE);
         if (initialize_result != ACL_SUCCESS) {
-          impl_->MarkPreLaunchRetryable();
           return AclFailure(
-              "aclrtMemcpy(AICPU close result initialize)",
+              "aclrtMemcpy(epoch owner shutdown result initialize)",
               initialize_result);
         }
-        close_args.result_address =
-            reinterpret_cast<std::uint64_t>(impl_->device_close_result);
-        close_status = impl_->InvokeAicpu(
-            &close_args, sizeof(close_args),
-            offsetof(kvaf_urma_aicpu_close_args_v2, so_name),
-            offsetof(kvaf_urma_aicpu_close_args_v2, kernel_name),
-            "kvaf_direct_urma_close");
-        if (!close_status.ok()) {
-          /*
-           * Once the runtime launch entry point was invoked, a nonzero launch
-           * result cannot prove that no task reached AICPU. A sync failure is
-           * equally ambiguous. Neither case is a same-session provider retry.
-           */
-          impl_->MarkUnsafeUnknown();
-          return close_status;
-        }
-        impl_->MarkResultReadPending();
+
+        const std::uint64_t queue_state_base =
+            reinterpret_cast<std::uint64_t>(impl_->queue_state);
+        // There is no Host-visible return code for an AscendC launch. Arm the
+        // monotonic cursor first: any exception after this boundary must only
+        // synchronize/read this exact launch, never publish a second command.
+        impl_->shutdown_control_submitted = true;
+        impl_->close_phase =
+            DirectUrmaClosePhase::kAivShutdownResultPending;
+        impl_->close_disposition =
+            DirectUrmaCloseDisposition::kAivShutdownResultReadPending;
+        LaunchAivEpochOwnerShutdown(
+            impl_->control_stream, impl_->owner_command,
+            impl_->owner_status, impl_->owner_aiv_result,
+            queue_state_base +
+                offsetof(DirectQueueState, packed_sq_head),
+            queue_state_base + offsetof(DirectQueueState, sq_tail),
+            queue_state_base + offsetof(DirectQueueState, cq_tail),
+            impl_->epoch_id, impl_->session_id,
+            kEpochOwnerAivPollBudget);
       }
 
-      if (impl_->device_close_result == nullptr) {
-        impl_->MarkUnsafeUnknown();
-        return Status::Error(
-            StatusCode::kTransportError,
-            "AICPU close result handle was lost after kernel launch");
+      if (!impl_->shutdown_control_quiesced) {
+        const auto sync_status = impl_->SynchronizeWithRetry(
+            impl_->control_stream,
+            "aclrtSynchronizeStream(AIV epoch shutdown)");
+        if (!sync_status.ok()) {
+          impl_->MarkUnsafeUnknown();
+          return sync_status;
+        }
+        impl_->shutdown_control_quiesced = true;
+        impl_->data_plane_quiesced = true;
       }
-      std::int32_t close_result =
-          std::numeric_limits<std::int32_t>::min();
-      const auto copy_result = aclrtMemcpy(
-          &close_result, sizeof(close_result),
-          impl_->device_close_result,
-          sizeof(*impl_->device_close_result),
+
+      if (!impl_->shutdown_result_validated) {
+        AicpuEpochOwnerAivResult shutdown_result{};
+        kvaf_urma_epoch_owner_command_v1 shutdown_command{};
+        auto copy_result = aclrtMemcpy(
+            &shutdown_result, sizeof(shutdown_result),
+            impl_->owner_aiv_result, sizeof(shutdown_result),
+            ACL_MEMCPY_DEVICE_TO_HOST);
+        if (copy_result == ACL_SUCCESS) {
+          copy_result = aclrtMemcpy(
+              &shutdown_command, sizeof(shutdown_command),
+              impl_->owner_command, sizeof(shutdown_command),
+              ACL_MEMCPY_DEVICE_TO_HOST);
+        }
+        if (copy_result != ACL_SUCCESS) {
+          impl_->close_phase =
+              DirectUrmaClosePhase::kAivShutdownResultPending;
+          impl_->close_disposition =
+              DirectUrmaCloseDisposition::kAivShutdownResultReadPending;
+          return AclFailure(
+              "aclrtMemcpy(epoch owner shutdown evidence)", copy_result);
+        }
+
+        const bool observed_live_owner =
+            shutdown_result.observed_owner_state ==
+                KVAF_URMA_EPOCH_OWNER_STATE_READY ||
+            shutdown_result.observed_owner_state ==
+                KVAF_URMA_EPOCH_OWNER_STATE_UNSAFE_WAITING;
+        const bool counters_quiesced =
+            shutdown_result.observed_sq_head ==
+                shutdown_result.observed_sq_tail &&
+            shutdown_result.observed_sq_tail ==
+                shutdown_result.observed_cq_tail &&
+            shutdown_result.observed_cq_tail ==
+                shutdown_result.observed_wqe_count;
+        const bool result_valid =
+            shutdown_result.magic == kAicpuEpochOwnerAivResultMagic &&
+            shutdown_result.abi_version ==
+                kAicpuEpochOwnerAivResultAbiVersion &&
+            shutdown_result.struct_size == sizeof(shutdown_result) &&
+            shutdown_result.status == static_cast<std::uint32_t>(
+                AicpuEpochOwnerAivStatus::kShutdownSubmitted) &&
+            shutdown_result.epoch == impl_->epoch_id &&
+            shutdown_result.session_id == impl_->session_id &&
+            observed_live_owner && counters_quiesced;
+        const bool command_valid =
+            shutdown_command.magic == KVAF_URMA_EPOCH_OWNER_MAGIC &&
+            shutdown_command.abi_version ==
+                KVAF_URMA_EPOCH_OWNER_ABI_VERSION &&
+            shutdown_command.struct_size == sizeof(shutdown_command) &&
+            shutdown_command.opcode ==
+                KVAF_URMA_EPOCH_OWNER_COMMAND_SHUTDOWN_QUIESCED &&
+            shutdown_command.epoch == impl_->epoch_id &&
+            shutdown_command.session_id == impl_->session_id &&
+            shutdown_command.sequence ==
+                KVAF_URMA_EPOCH_OWNER_SHUTDOWN_SEQUENCE &&
+            shutdown_command.reserved[0] == 0 &&
+            shutdown_command.final_sq_head ==
+                shutdown_result.observed_sq_head &&
+            shutdown_command.final_sq_tail ==
+                shutdown_result.observed_sq_tail &&
+            shutdown_command.final_cq_tail ==
+                shutdown_result.observed_cq_tail &&
+            shutdown_command.final_wqe_count ==
+                shutdown_result.observed_wqe_count;
+        if (!result_valid || !command_valid) {
+          impl_->MarkUnsafeUnknown();
+          const bool queue_not_quiesced =
+              shutdown_result.status == static_cast<std::uint32_t>(
+                  AicpuEpochOwnerAivStatus::kQueueNotQuiesced);
+          return Status::Error(
+              StatusCode::kTransportError,
+              queue_not_quiesced
+                  ? "AIV refused epoch shutdown because the URMA queue is "
+                    "not quiesced"
+                  : "AIV epoch shutdown evidence is invalid or incomplete");
+        }
+        impl_->shutdown_result_validated = true;
+      }
+
+      if (!impl_->owner_joined) {
+        impl_->close_phase =
+            DirectUrmaClosePhase::kAicpuEpochOwnerJoinPending;
+        impl_->close_disposition =
+            DirectUrmaCloseDisposition::kAicpuEpochOwnerJoinPending;
+        const auto join_status = impl_->SynchronizeWithRetry(
+            impl_->owner_stream,
+            "aclrtSynchronizeStream(AICPU epoch owner join)");
+        if (!join_status.ok()) {
+          impl_->MarkUnsafeUnknown();
+          return join_status;
+        }
+        impl_->owner_joined = true;
+      }
+
+      impl_->close_phase =
+          DirectUrmaClosePhase::kAicpuEpochOwnerStatusPending;
+      impl_->close_disposition =
+          DirectUrmaCloseDisposition::kAicpuEpochOwnerStatusReadPending;
+      kvaf_urma_epoch_owner_status_v1 final_owner_status{};
+      const auto status_copy_result = aclrtMemcpy(
+          &final_owner_status, sizeof(final_owner_status),
+          impl_->owner_status, sizeof(final_owner_status),
           ACL_MEMCPY_DEVICE_TO_HOST);
-      if (copy_result != ACL_SUCCESS) {
-        /* Keep kAicpuResultPending: the next Close only rereads this buffer. */
-        impl_->MarkResultReadPending();
-        return AclFailure("aclrtMemcpy(AICPU close result)", copy_result);
+      if (status_copy_result != ACL_SUCCESS) {
+        // The owner stream is already joined. A retry is now a pure read of
+        // the retained terminal cache line; it cannot relaunch or re-close.
+        return AclFailure(
+            "aclrtMemcpy(epoch owner terminal status)",
+            status_copy_result);
       }
-      if (close_result == KVAF_URMA_PROVIDER_CLOSE_RETRYABLE) {
-        impl_->MarkProviderRetryable();
-        return Status::Error(
-            StatusCode::kTransportError,
-            "AICPU direct URMA provider close is retryable");
-      }
-      if (close_result == KVAF_URMA_PROVIDER_CLOSE_OK) {
-        impl_->MarkProviderClosed();
-      } else {
+      if (!EpochOwnerStatusHeaderIsValid(
+              final_owner_status, impl_->epoch_id,
+              impl_->session_id) ||
+          !EpochOwnerTeardownIsComplete(final_owner_status)) {
         impl_->MarkUnsafeUnknown();
         return Status::Error(
             StatusCode::kTransportError,
-            "AICPU direct URMA provider close is unsafe or unknown, ret=" +
-                std::to_string(close_result));
+            "AICPU epoch owner joined without proving checked teardown");
       }
+      impl_->MarkProviderClosed();
     }
   }
   impl_->opened = false;
@@ -935,16 +1344,29 @@ Status DirectUrmaResources::Close() {
   impl_->close_disposition =
       DirectUrmaCloseDisposition::kTransportComplete;
 
-  // These tiny AICPU result buffers remain object-owned until provider
-  // teardown is proven.  Clear a pointer only after aclrtFree succeeds so a
-  // transient local cleanup error can be retried without re-closing the
-  // provider or losing the allocation handle.
-  if (impl_->device_close_result != nullptr) {
-    const auto result = aclrtFree(impl_->device_close_result);
+  // These tiny shared records remain object-owned until provider teardown is
+  // proven. Clear a pointer only after aclrtFree succeeds so a transient
+  // local cleanup error can be retried without losing the allocation handle.
+  if (impl_->owner_aiv_result != nullptr) {
+    const auto result = aclrtFree(impl_->owner_aiv_result);
     if (result != ACL_SUCCESS) {
-      return AclFailure("aclrtFree(AICPU close result)", result);
+      return AclFailure("aclrtFree(epoch owner AIV result)", result);
     }
-    impl_->device_close_result = nullptr;
+    impl_->owner_aiv_result = nullptr;
+  }
+  if (impl_->owner_status != nullptr) {
+    const auto result = aclrtFree(impl_->owner_status);
+    if (result != ACL_SUCCESS) {
+      return AclFailure("aclrtFree(epoch owner status)", result);
+    }
+    impl_->owner_status = nullptr;
+  }
+  if (impl_->owner_command != nullptr) {
+    const auto result = aclrtFree(impl_->owner_command);
+    if (result != ACL_SUCCESS) {
+      return AclFailure("aclrtFree(epoch owner command)", result);
+    }
+    impl_->owner_command = nullptr;
   }
   if (impl_->device_open_result != nullptr) {
     const auto result = aclrtFree(impl_->device_open_result);
@@ -962,12 +1384,28 @@ Status DirectUrmaResources::Close() {
     impl_->queue_state = nullptr;
     impl_->queue_state_initialized = false;
   }
-  if (impl_->stream != nullptr) {
-    const auto result = aclrtDestroyStream(impl_->stream);
+  if (impl_->control_stream != nullptr) {
+    const auto result = aclrtDestroyStream(impl_->control_stream);
     if (result != ACL_SUCCESS) {
-      return AclFailure("aclrtDestroyStream(AICPU provider)", result);
+      return AclFailure("aclrtDestroyStream(AIV epoch control)", result);
     }
-    impl_->stream = nullptr;
+    impl_->control_stream = nullptr;
+  }
+  if (impl_->owner_stream != nullptr) {
+    // A submitted owner stream is destroyable only after its invocation has
+    // joined.  Reaching local cleanup with an unjoined submitted owner would
+    // violate the provider lifetime proof and must retain every handle.
+    if (impl_->owner_launch_submitted && !impl_->owner_joined) {
+      impl_->MarkUnsafeUnknown();
+      return Status::Error(
+          StatusCode::kTransportError,
+          "cannot destroy an unjoined AICPU epoch-owner stream");
+    }
+    const auto result = aclrtDestroyStream(impl_->owner_stream);
+    if (result != ACL_SUCCESS) {
+      return AclFailure("aclrtDestroyStream(AICPU epoch owner)", result);
+    }
+    impl_->owner_stream = nullptr;
   }
   if (impl_->runtime_library != nullptr) {
     if (dlclose(impl_->runtime_library) != 0) {
@@ -993,6 +1431,9 @@ Status DirectUrmaResources::Close() {
     impl_->provider_close = nullptr;
   }
   impl_->closed = true;
+  impl_->data_plane_work_enqueued = false;
+  impl_->data_plane_quiesced = true;
+  impl_->epoch_id = 0;
   impl_->session_id = 0;
   impl_->close_phase = DirectUrmaClosePhase::kComplete;
   impl_->close_disposition =

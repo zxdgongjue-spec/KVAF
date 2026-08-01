@@ -221,7 +221,7 @@ class AicpuOwnerProbeContractTests(unittest.TestCase):
     def test_probe_pass_cannot_override_the_direct_urma_gate(self) -> None:
         self.assertIn(
             "readonly KVAF_AICPU_AFFINITY_CONTRACT="
-            "unproven-kfc-multilaunch",
+            "candidate-epoch-owner-unvalidated-v1",
             self.guard,
         )
         self.assertIn("probe PASS does NOT prove", self.guard)
@@ -248,13 +248,14 @@ class AicpuOwnerProbeContractTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(result.returncode, 2)
-        self.assertIn("CONTRACT=unproven-kfc-multilaunch", result.stderr)
+        self.assertIn(
+            "CONTRACT=candidate-epoch-owner-unvalidated-v1",
+            result.stderr,
+        )
         self.assertIn("does NOT unlock direct URMA", result.stderr)
 
     def test_direct_runner_still_blocks_before_topology_or_workers(self) -> None:
-        guard = self.runner.index(
-            "kvaf_require_aicpu_affinity_contract || exit $?"
-        )
+        guard = self.runner.index("kvaf_require_aicpu_affinity_contract")
         for later_operation in (
             "resolve_a5_urma_eids.py",
             "resolve_a5_urma_endpoints.py",

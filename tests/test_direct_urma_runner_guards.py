@@ -36,6 +36,8 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
             RUNTIME_PREFLIGHT,
             ROOT / "scripts" / "run_a5_aiv_urma_h2d_smoke.sh",
             ROOT / "scripts" / "run_a5_aicpu_owner_probe.sh",
+            ROOT / "scripts" /
+            "run_a5_direct_urma_epoch_owner_validation.sh",
             ROOT / "scripts" / "build_a5_direct_urma.sh",
             ROOT / "scripts" / "build_a5_direct_urma_provider.sh",
             ROOT / "scripts" / "package_a5_direct_urma_aicpu.sh",
@@ -57,9 +59,7 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
         self.assertNotIn("query_a5_topology.py", self.source)
 
     def test_unproven_aicpu_affinity_fails_before_hardware_access(self) -> None:
-        guard = self.source.index(
-            "kvaf_require_aicpu_affinity_contract || exit $?"
-        )
+        guard = self.source.index("kvaf_require_aicpu_affinity_contract")
         eid = self.source.index("resolve_a5_urma_eids.py", guard)
         endpoint = self.source.index("resolve_a5_urma_endpoints.py", guard)
         npu_smi = self.source.index(
@@ -98,16 +98,102 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 2)
         self.assertIn(
-            "CONTRACT=unproven-kfc-multilaunch", result.stderr
+            "CONTRACT=candidate-epoch-owner-unvalidated-v1",
+            result.stderr,
         )
         self.assertIn(
-            "pid/cookie/SO-base/generation sample is diagnostic only",
+            "complete\nOpen-transfer-SHUTDOWN_QUIESCED-Close lifecycle",
             result.stderr,
         )
         self.assertIn(
             "No topology/EID/NPU/URMA operation was attempted.",
             result.stderr,
         )
+
+    def test_candidate_epoch_owner_has_dedicated_staged_entry(self) -> None:
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("bash is unavailable")
+        helper = ROOT / "scripts" / "a5_aicpu_affinity_guard.sh"
+        command = (
+            f"source {helper!s}; "
+            "kvaf_require_aicpu_affinity_contract "
+            "candidate-epoch-owner-validation-v1"
+        )
+        result = subprocess.run(
+            [bash, "-c", command],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("staged resource-bearing", result.stderr)
+        wrapper = (
+            ROOT / "scripts" /
+            "run_a5_direct_urma_epoch_owner_validation.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("run_a5_direct_urma_h2d_smoke.sh", wrapper)
+        self.assertIn("candidate-epoch-owner-validation-v1", wrapper)
+
+    def test_zero_wqe_is_validation_only_and_pool_limit_is_not_cumulative(self) -> None:
+        self.assertIn(
+            '[[ "${kvaf_affinity_run_mode}" != \\\n'
+            '      candidate-epoch-owner-validation-v1 ]]',
+            self.source,
+        )
+        self.assertIn("KVAF_H2D_TRANSFER_COUNT != 0", self.source)
+        self.assertIn("KVAF_H2D_PAYLOAD_CAPACITY_BYTES", self.source)
+        self.assertIn("h2d_payload_capacity_bytes=%s", self.source)
+        self.assertIn("KVAF_H2D_PROVIDER_SEGMENT_PAYLOAD_BYTES", self.source)
+        self.assertIn("KVAF_H2D_PROVIDER_LOCAL_ALLOCATION_BYTES", self.source)
+        self.assertIn(
+            "h2d_provider_local_allocation_bytes_per_endpoint=%s",
+            self.source,
+        )
+        self.assertNotIn("h2d_registered_bytes=%s", self.source)
+        pool_limit = self.source.index(
+            "the descriptor pool exceeds the 64 MiB registration limit"
+        )
+        capacity = self.source.index(
+            "KVAF_H2D_PAYLOAD_CAPACITY_BYTES", pool_limit
+        )
+        total = self.source.index("KVAF_H2D_TOTAL_BYTES", capacity)
+        self.assertLess(pool_limit, capacity)
+        self.assertLess(capacity, total)
+
+    def test_run_timeout_is_independent_from_provider_control_timeout(self) -> None:
+        self.assertIn(
+            "kvaf_run_timeout_is_set=0",
+            self.source,
+        )
+        self.assertIn(
+            "require_uint_max KVAF_H2D_RUN_TIMEOUT_SECONDS",
+            self.source,
+        )
+        self.assertIn(
+            '"${KVAF_H2D_RUN_TIMEOUT_SECONDS}" 604800',
+            self.source,
+        )
+        self.assertIn(
+            "KVAF_H2D_RUN_TIMEOUT_SECONDS == 0",
+            self.source,
+        )
+        self.assertIn(
+            "KVAF_H2D_TIMEOUT_SECONDS * 3 + 10",
+            self.source,
+        )
+        self.assertIn(
+            '--timeout-seconds "${KVAF_H2D_TIMEOUT_SECONDS}"',
+            self.source,
+        )
+        self.assertIn(
+            'deadline=$(( $(date +%s) + '
+            'KVAF_H2D_RUN_TIMEOUT_SECONDS ))',
+            self.source,
+        )
+        self.assertNotIn("total_timeout_seconds=", self.source)
+        self.assertIn("h2d_control_timeout_seconds=%s", self.source)
+        self.assertIn("h2d_run_timeout_seconds=%s", self.source)
 
     def test_urma_endpoints_are_exactly_resolved_before_npu_resources(self) -> None:
         pair = self.source.index("resolve_a5_urma_eids.py")
@@ -358,7 +444,7 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
     def test_complete_runtime_artifact_preflight_precedes_hardware(self) -> None:
         provider = self.source.index("kvaf_verify_direct_provider_build_v3")
         affinity = self.source.index(
-            "kvaf_require_aicpu_affinity_contract || exit $?"
+            "kvaf_require_aicpu_affinity_contract"
         )
         runtime = self.source.index(
             "kvaf_verify_direct_runtime_artifacts_v3"

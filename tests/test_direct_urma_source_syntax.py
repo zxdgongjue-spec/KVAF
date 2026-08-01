@@ -42,6 +42,13 @@ class DirectUrmaSourceSyntaxTests(unittest.TestCase):
             / "runtime"
             / "rt_external_kernel.h"
         ).read_text(encoding="utf-8")
+        cls.aiv_kernel_source = (
+            ROOT
+            / "access_operator"
+            / "a5"
+            / "src"
+            / "aiv_simt_urma_h2d_kernel.cpp"
+        ).read_text(encoding="utf-8")
 
     def test_host_control_plane_sources_compile(self) -> None:
         compiler = shutil.which("c++") or shutil.which("g++")
@@ -167,13 +174,50 @@ class DirectUrmaSourceSyntaxTests(unittest.TestCase):
             self.mapping_source,
         )
 
-    def test_quiesced_stream_destroy_is_retried_and_retained(self) -> None:
+    def test_data_and_shutdown_use_the_resources_owned_fifo_stream(self) -> None:
         self.assertIn(
-            "quiesced AIV transfer stream destroy failed; retrying once",
+            "resources->EnqueueBatch(",
             self.smoke_source,
         )
         self.assertIn(
-            "RetainEndpointOwnership(nullptr, nullptr, nullptr",
+            "resources->SynchronizeDataPlane()",
+            self.smoke_source,
+        )
+        self.assertNotIn(
+            "LaunchAivSimtUrmaH2D(\n        stream", self.smoke_source
+        )
+        enqueue = self.resources_source.index(
+            "Status DirectUrmaResources::EnqueueBatch"
+        )
+        close = self.resources_source.index(
+            "Status DirectUrmaResources::Close", enqueue
+        )
+        enqueue_body = self.resources_source[enqueue:close]
+        self.assertIn("impl_->data_plane_mutex", enqueue_body)
+        self.assertIn("impl_->data_plane_frozen", enqueue_body)
+        self.assertIn("impl_->control_stream", enqueue_body)
+        close_body = self.resources_source[close:]
+        self.assertIn("impl_->data_plane_frozen = true", close_body)
+        self.assertIn(
+            "LaunchAivEpochOwnerShutdown(\n"
+            "            impl_->control_stream",
+            close_body,
+        )
+
+    def test_inactive_descriptor_suffix_is_fully_unchanged(self) -> None:
+        self.assertIn(
+            "completed_descriptors(\n      descriptor_capacity)",
+            self.smoke_source,
+        )
+        self.assertIn(
+            "allocations->descriptors,\n"
+            "                          descriptor_capacity",
+            self.smoke_source,
+        )
+        self.assertIn(
+            "std::memcmp(\n"
+            "          &completed_descriptors[request], "
+            "&empty_descriptors[request],",
             self.smoke_source,
         )
 
@@ -272,8 +316,70 @@ class DirectUrmaSourceSyntaxTests(unittest.TestCase):
 
     def test_smoke_payload_is_bounded_before_resource_acquisition(self) -> None:
         self.assertIn(
-            "kSmokeMaxTransferBytes = 64ULL * 1024ULL * 1024ULL",
+            "kSmokeMaxBatchBytes = 64ULL * 1024ULL * 1024ULL",
             self.smoke_source,
+        )
+
+    def test_batch_defaults_and_legacy_total_bytes_are_unambiguous(self) -> None:
+        for expected in (
+            "kDefaultTransferCount = 4096",
+            "kDefaultDescriptorCapacity = 4096",
+            "kDefaultBytesPerTransfer = 1024",
+            'key == "--transfer-count"',
+            'key == "--descriptor-capacity"',
+            'key == "--bytes-per-transfer"',
+            'key == "--batch-iterations"',
+            'key == "--bytes"',
+            "options->transfer_count = 1;",
+            "options->descriptor_capacity = 1;",
+            "options->bytes_per_transfer = legacy_bytes;",
+            "cannot be mixed with",
+        ):
+            self.assertIn(expected, self.smoke_source)
+
+    def test_large_batch_uses_one_simt_plan_and_bounded_queue_waves(self) -> None:
+        self.assertIn(
+            "request += kAivUrmaSimtLanes", self.aiv_kernel_source
+        )
+        self.assertEqual(
+            self.aiv_kernel_source.count(
+                "asc_vf_call<BuildH2DDescriptorsSimt>"
+            ),
+            1,
+        )
+        for expected in (
+            "wave_capacity",
+            "wave_submitted < wave_capacity",
+            "++completion->reserved[0]",
+            "PollDirectCq(",
+            "kDirectCounterOverflow",
+            "ready_count > kMaxQueueCounter - direct_channel->sq_head",
+        ):
+            self.assertIn(expected, self.aiv_kernel_source)
+
+    def test_batch_iterations_reuse_one_open_and_validate_every_round(self) -> None:
+        transfer_start = self.smoke_source.index(
+            "DeviceTransferOutcome RunDeviceTransfer"
+        )
+        transfer_end = self.smoke_source.index(
+            "EndpointResult RunHost", transfer_start
+        )
+        transfer = self.smoke_source[transfer_start:transfer_end]
+        self.assertIn(
+            "iteration < options.batch_iterations", transfer
+        )
+        self.assertIn("params.generation", transfer)
+        self.assertIn("completion.generation", transfer)
+        self.assertIn("submission_budget", transfer)
+        self.assertNotIn("resources->Open", transfer)
+        self.assertIn("canary_output", transfer)
+
+    def test_zero_wqe_lifecycle_is_explicit(self) -> None:
+        self.assertIn(
+            "if (options.transfer_count == 0)", self.smoke_source
+        )
+        self.assertIn(
+            "KVAF_A5_DIRECT_ZERO_WQE_OK", self.smoke_source
         )
 
 

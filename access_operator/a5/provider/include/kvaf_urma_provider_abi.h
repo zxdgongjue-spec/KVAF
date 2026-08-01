@@ -105,6 +105,95 @@ struct KVAF_URMA_PROVIDER_CACHE_ALIGNED kvaf_urma_aicpu_owner_probe_args_v1 {
   uint64_t reserved[2];
 };
 
+/*
+ * Resource-owning AICPU epoch ABI.  Unlike the resource-free probe above,
+ * one invocation calls provider Open, publishes READY, remains alive while
+ * AIV submits any number of batches to the exported SQ/CQ, and performs the
+ * checked provider Close itself after a cooperative shutdown record proves
+ * that the queue is drained.  Process-local provider pointers therefore
+ * never cross a KFC launch boundary.
+ *
+ * A lease is diagnostic, not permission to destroy live transport state.
+ * Expiry without a valid SHUTDOWN_QUIESCED record leaves the invocation alive
+ * in UNSAFE_WAITING.  A producer may repair and republish the command; only a
+ * command whose epoch, session, sequence and four queue counters match can
+ * start Close.
+ */
+#define KVAF_URMA_EPOCH_OWNER_MAGIC 0x4b45504fU /* "KEPO" */
+#define KVAF_URMA_EPOCH_OWNER_ABI_VERSION 1U
+#define KVAF_URMA_EPOCH_OWNER_CACHE_LINE_BYTES 64U
+#define KVAF_URMA_EPOCH_OWNER_SHUTDOWN_SEQUENCE UINT64_C(1)
+#define KVAF_URMA_EPOCH_OWNER_MAX_LEASE_MILLISECONDS 3600000U
+#define KVAF_URMA_EPOCH_OWNER_MAX_POLL_MICROSECONDS 10000U
+#define KVAF_URMA_EPOCH_OWNER_MAX_CLOSE_RETRY_LIMIT 1024U
+#define KVAF_URMA_EPOCH_OWNER_MAX_CLOSE_RETRY_MICROSECONDS 1000000U
+
+enum kvaf_urma_epoch_owner_command {
+  KVAF_URMA_EPOCH_OWNER_COMMAND_NONE = 0,
+  KVAF_URMA_EPOCH_OWNER_COMMAND_SHUTDOWN_QUIESCED = 1,
+};
+
+enum kvaf_urma_epoch_owner_state {
+  KVAF_URMA_EPOCH_OWNER_STATE_EMPTY = 0,
+  KVAF_URMA_EPOCH_OWNER_STATE_OPENING = 1,
+  KVAF_URMA_EPOCH_OWNER_STATE_READY = 2,
+  KVAF_URMA_EPOCH_OWNER_STATE_CLOSING = 3,
+  KVAF_URMA_EPOCH_OWNER_STATE_CLOSE_RETRYING = 4,
+  KVAF_URMA_EPOCH_OWNER_STATE_CLOSED = 5,
+  KVAF_URMA_EPOCH_OWNER_STATE_OPEN_FAILED_SAFE = 6,
+  KVAF_URMA_EPOCH_OWNER_STATE_UNSAFE_WAITING = 7,
+};
+
+enum kvaf_urma_epoch_owner_result {
+  KVAF_URMA_EPOCH_OWNER_RESULT_OK = 0,
+  KVAF_URMA_EPOCH_OWNER_RESULT_CLOCK_FAILED = 1,
+  KVAF_URMA_EPOCH_OWNER_RESULT_OPEN_FAILED = 2,
+  KVAF_URMA_EPOCH_OWNER_RESULT_INVALID_COMMAND = 3,
+  KVAF_URMA_EPOCH_OWNER_RESULT_QUEUE_NOT_QUIESCED = 4,
+  KVAF_URMA_EPOCH_OWNER_RESULT_LEASE_EXPIRED = 5,
+  KVAF_URMA_EPOCH_OWNER_RESULT_CLOSE_RETRY_LIMIT = 6,
+  KVAF_URMA_EPOCH_OWNER_RESULT_CLOSE_UNSAFE = 7,
+};
+
+enum kvaf_urma_epoch_owner_status_flag {
+  KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID = 1U << 0,
+  KVAF_URMA_EPOCH_OWNER_PROVIDER_ACTIVE = 1U << 1,
+  KVAF_URMA_EPOCH_OWNER_TEARDOWN_COMPLETE = 1U << 2,
+  KVAF_URMA_EPOCH_OWNER_OWNERSHIP_UNSAFE = 1U << 3,
+};
+
+/* AIV/Host producer-owned cache line. Publish opcode last with release. */
+struct KVAF_URMA_PROVIDER_CACHE_ALIGNED kvaf_urma_epoch_owner_command_v1 {
+  uint32_t magic;
+  uint32_t abi_version;
+  uint32_t struct_size;
+  uint32_t opcode;
+  uint64_t epoch;
+  uint64_t session_id;
+  uint64_t sequence;
+  uint32_t final_sq_head;
+  uint32_t final_sq_tail;
+  uint32_t final_cq_tail;
+  uint32_t final_wqe_count;
+  uint64_t reserved[1];
+};
+
+/* AICPU owner-owned cache line. Publish state last with release. */
+struct KVAF_URMA_PROVIDER_CACHE_ALIGNED kvaf_urma_epoch_owner_status_v1 {
+  uint32_t magic;
+  uint32_t abi_version;
+  uint32_t struct_size;
+  uint32_t state;
+  uint64_t epoch;
+  uint64_t session_id;
+  uint64_t sequence;
+  int32_t result_code;
+  int32_t provider_status;
+  uint32_t close_attempts;
+  uint32_t flags;
+  uint64_t elapsed_nanoseconds;
+};
+
 enum kvaf_urma_provider_role {
   KVAF_URMA_PROVIDER_SERVER = 0,
   KVAF_URMA_PROVIDER_CLIENT = 1,
@@ -292,6 +381,31 @@ struct kvaf_urma_aicpu_close_args_v2 {
   uint64_t reserved[5];
 };
 
+/*
+ * KFC locates the two names in the first 64 bytes.  A zero lease selects
+ * cooperative-shutdown-only mode. close_retry_limit is an escalation
+ * threshold, not a permission to return: after that many checked RETRYABLE
+ * results the invocation reports UNSAFE_WAITING but continues retrying the
+ * same process-local teardown cursor.
+ */
+struct KVAF_URMA_PROVIDER_CACHE_ALIGNED kvaf_urma_aicpu_epoch_owner_args_v1 {
+  char kernel_name[KVAF_URMA_PROVIDER_NAME_BYTES];
+  char so_name[KVAF_URMA_PROVIDER_NAME_BYTES];
+  struct kvaf_urma_provider_config_v2 config;
+  uint64_t epoch;
+  uint64_t command_address;
+  uint64_t status_address;
+  uint64_t open_result_address;
+  uint32_t lease_timeout_milliseconds;
+  uint32_t poll_interval_microseconds;
+  uint32_t close_retry_limit;
+  uint32_t close_retry_interval_microseconds;
+  uint32_t magic;
+  uint32_t abi_version;
+  uint32_t struct_size;
+  uint32_t flags;
+};
+
 KVAF_URMA_PROVIDER_EXPORT int kvaf_urma_provider_open_v2(
     const struct kvaf_urma_provider_config_v2* config,
     struct kvaf_urma_provider_result_v2* result);
@@ -307,6 +421,8 @@ KVAF_URMA_PROVIDER_EXPORT int aicpu_kvaf_urma_open_v2(
 KVAF_URMA_PROVIDER_EXPORT int aicpu_kvaf_urma_close_v2(
     void* opaque_args);
 KVAF_URMA_PROVIDER_EXPORT int aicpu_kvaf_urma_owner_probe_v1(
+    void* opaque_args);
+KVAF_URMA_PROVIDER_EXPORT int aicpu_kvaf_urma_epoch_owner_v1(
     void* opaque_args);
 
 #ifdef __cplusplus
@@ -342,6 +458,35 @@ static_assert(offsetof(kvaf_urma_aicpu_owner_probe_args_v1,
 static_assert(offsetof(kvaf_urma_aicpu_owner_probe_args_v1,
                        status_address) == 96,
               "unexpected owner probe status address offset");
+static_assert(sizeof(kvaf_urma_epoch_owner_command_v1) == 64,
+              "epoch owner command ABI must be 64 bytes");
+static_assert(alignof(kvaf_urma_epoch_owner_command_v1) == 64,
+              "epoch owner command must own one cache line");
+static_assert(sizeof(kvaf_urma_epoch_owner_status_v1) == 64,
+              "epoch owner status ABI must be 64 bytes");
+static_assert(alignof(kvaf_urma_epoch_owner_status_v1) == 64,
+              "epoch owner status must own one cache line");
+static_assert(sizeof(kvaf_urma_aicpu_epoch_owner_args_v1) == 384,
+              "epoch owner AICPU args ABI must be 384 bytes");
+static_assert(alignof(kvaf_urma_aicpu_epoch_owner_args_v1) == 64,
+              "epoch owner AICPU args must be cache-line aligned");
+static_assert(offsetof(kvaf_urma_epoch_owner_command_v1, opcode) == 12,
+              "unexpected epoch owner command opcode offset");
+static_assert(offsetof(kvaf_urma_epoch_owner_command_v1,
+                       final_sq_head) == 40,
+              "unexpected epoch owner final SQ head offset");
+static_assert(offsetof(kvaf_urma_epoch_owner_status_v1, state) == 12,
+              "unexpected epoch owner status state offset");
+static_assert(offsetof(kvaf_urma_aicpu_epoch_owner_args_v1, epoch) == 320,
+              "unexpected epoch owner epoch offset");
+static_assert(offsetof(kvaf_urma_aicpu_epoch_owner_args_v1,
+                       command_address) == 328,
+              "unexpected epoch owner command address offset");
+static_assert(offsetof(kvaf_urma_aicpu_epoch_owner_args_v1,
+                       open_result_address) == 344,
+              "unexpected epoch owner open result address offset");
+static_assert(offsetof(kvaf_urma_aicpu_epoch_owner_args_v1, magic) == 368,
+              "unexpected epoch owner args magic offset");
 static_assert(offsetof(kvaf_urma_provider_config_v2, session_id) == 40,
               "unexpected direct URMA config session offset");
 static_assert(offsetof(kvaf_urma_provider_config_v2, local_address) == 48,
@@ -383,6 +528,37 @@ _Static_assert(offsetof(struct kvaf_urma_aicpu_owner_probe_args_v1,
 _Static_assert(offsetof(struct kvaf_urma_aicpu_owner_probe_args_v1,
                         status_address) == 96,
                "unexpected owner probe status address offset");
+_Static_assert(sizeof(struct kvaf_urma_epoch_owner_command_v1) == 64,
+               "epoch owner command ABI must be 64 bytes");
+_Static_assert(_Alignof(struct kvaf_urma_epoch_owner_command_v1) == 64,
+               "epoch owner command must own one cache line");
+_Static_assert(sizeof(struct kvaf_urma_epoch_owner_status_v1) == 64,
+               "epoch owner status ABI must be 64 bytes");
+_Static_assert(_Alignof(struct kvaf_urma_epoch_owner_status_v1) == 64,
+               "epoch owner status must own one cache line");
+_Static_assert(sizeof(struct kvaf_urma_aicpu_epoch_owner_args_v1) == 384,
+               "epoch owner AICPU args ABI must be 384 bytes");
+_Static_assert(_Alignof(struct kvaf_urma_aicpu_epoch_owner_args_v1) == 64,
+               "epoch owner AICPU args must be cache-line aligned");
+_Static_assert(offsetof(struct kvaf_urma_epoch_owner_command_v1, opcode) == 12,
+               "unexpected epoch owner command opcode offset");
+_Static_assert(offsetof(struct kvaf_urma_epoch_owner_command_v1,
+                        final_sq_head) == 40,
+               "unexpected epoch owner final SQ head offset");
+_Static_assert(offsetof(struct kvaf_urma_epoch_owner_status_v1, state) == 12,
+               "unexpected epoch owner status state offset");
+_Static_assert(offsetof(struct kvaf_urma_aicpu_epoch_owner_args_v1,
+                        epoch) == 320,
+               "unexpected epoch owner epoch offset");
+_Static_assert(offsetof(struct kvaf_urma_aicpu_epoch_owner_args_v1,
+                        command_address) == 328,
+               "unexpected epoch owner command address offset");
+_Static_assert(offsetof(struct kvaf_urma_aicpu_epoch_owner_args_v1,
+                        open_result_address) == 344,
+               "unexpected epoch owner open result address offset");
+_Static_assert(offsetof(struct kvaf_urma_aicpu_epoch_owner_args_v1,
+                        magic) == 368,
+               "unexpected epoch owner args magic offset");
 _Static_assert(offsetof(struct kvaf_urma_provider_config_v2, session_id) == 40,
                "unexpected direct URMA config session offset");
 _Static_assert(offsetof(struct kvaf_urma_provider_config_v2, local_address) == 48,

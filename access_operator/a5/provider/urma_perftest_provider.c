@@ -37,6 +37,38 @@ static uint64_t g_kvaf_last_closed_session_id;
 static struct kvaf_udma_direct_queue_info g_kvaf_queue_info;
 static struct kvaf_perftest_teardown_state g_kvaf_teardown_state;
 static pthread_mutex_t g_kvaf_lock = PTHREAD_MUTEX_INITIALIZER;
+/*
+ * The provider state above is process/SO-global.  A resource-owning epoch
+ * invocation must therefore exclude every legacy/public Open and Close for
+ * its complete lifetime, not merely while one provider call holds the mutex.
+ * The global claim is protected by g_kvaf_lock; the thread-local identity is
+ * the capability which permits only that exact invocation to enter the public
+ * provider wrappers while the claim is active.
+ */
+static bool g_kvaf_epoch_claim_active;
+static uint64_t g_kvaf_epoch_claim_epoch;
+static uint64_t g_kvaf_epoch_claim_session_id;
+static _Thread_local bool g_kvaf_epoch_owner_authorized;
+static _Thread_local uint64_t g_kvaf_epoch_owner_epoch;
+static _Thread_local uint64_t g_kvaf_epoch_owner_session_id;
+
+static bool kvaf_epoch_owner_is_authorized_unlocked(uint64_t session_id)
+{
+    return g_kvaf_epoch_claim_active &&
+        g_kvaf_epoch_owner_authorized &&
+        g_kvaf_epoch_claim_epoch != 0 &&
+        g_kvaf_epoch_claim_epoch == g_kvaf_epoch_owner_epoch &&
+        g_kvaf_epoch_claim_session_id != 0 &&
+        g_kvaf_epoch_claim_session_id == session_id &&
+        g_kvaf_epoch_owner_session_id == session_id;
+}
+
+static bool kvaf_provider_has_local_state_unlocked(void)
+{
+    return g_kvaf_config_initialized || g_kvaf_connection_open ||
+        g_kvaf_context_open || g_kvaf_runtime_acquired ||
+        g_kvaf_cleanup_poisoned || g_kvaf_session_id != 0;
+}
 
 static bool kvaf_is_power_of_two(uint32_t value)
 {
@@ -486,6 +518,79 @@ static bool kvaf_udma_source_has_no_live_resources(void)
         kvaf_source_ummu_retained_mapping_count() == 0U;
 }
 
+enum kvaf_epoch_claim_result {
+    KVAF_EPOCH_CLAIM_ACQUIRED = 0,
+    KVAF_EPOCH_CLAIM_CONFLICT = 1,
+    KVAF_EPOCH_CLAIM_LOCK_FAILED = 2,
+};
+
+static enum kvaf_epoch_claim_result kvaf_epoch_owner_acquire_claim(
+    const struct kvaf_urma_aicpu_epoch_owner_args_v1 *args)
+{
+    if (pthread_mutex_lock(&g_kvaf_lock) != 0) {
+        return KVAF_EPOCH_CLAIM_LOCK_FAILED;
+    }
+    if (g_kvaf_epoch_claim_active ||
+        kvaf_provider_has_local_state_unlocked()) {
+        (void)pthread_mutex_unlock(&g_kvaf_lock);
+        return KVAF_EPOCH_CLAIM_CONFLICT;
+    }
+    g_kvaf_epoch_claim_active = true;
+    g_kvaf_epoch_claim_epoch = args->epoch;
+    g_kvaf_epoch_claim_session_id = args->config.session_id;
+    g_kvaf_epoch_owner_authorized = true;
+    g_kvaf_epoch_owner_epoch = args->epoch;
+    g_kvaf_epoch_owner_session_id = args->config.session_id;
+    (void)pthread_mutex_unlock(&g_kvaf_lock);
+    return KVAF_EPOCH_CLAIM_ACQUIRED;
+}
+
+static bool kvaf_epoch_owner_snapshot_local_state(
+    const struct kvaf_urma_aicpu_epoch_owner_args_v1 *args,
+    bool *local_state_present, bool *provider_session_matches)
+{
+    bool authorized;
+
+    if (local_state_present == NULL || provider_session_matches == NULL ||
+        pthread_mutex_lock(&g_kvaf_lock) != 0) {
+        return false;
+    }
+    authorized = kvaf_epoch_owner_is_authorized_unlocked(
+        args->config.session_id) &&
+        g_kvaf_epoch_claim_epoch == args->epoch;
+    if (authorized) {
+        *local_state_present = kvaf_provider_has_local_state_unlocked();
+        *provider_session_matches =
+            g_kvaf_session_id == args->config.session_id;
+    }
+    (void)pthread_mutex_unlock(&g_kvaf_lock);
+    return authorized;
+}
+
+static bool kvaf_epoch_owner_release_claim(
+    const struct kvaf_urma_aicpu_epoch_owner_args_v1 *args)
+{
+    bool released = false;
+
+    if (pthread_mutex_lock(&g_kvaf_lock) != 0) {
+        return false;
+    }
+    if (kvaf_epoch_owner_is_authorized_unlocked(
+            args->config.session_id) &&
+        g_kvaf_epoch_claim_epoch == args->epoch &&
+        !kvaf_provider_has_local_state_unlocked()) {
+        g_kvaf_epoch_claim_active = false;
+        g_kvaf_epoch_claim_epoch = 0;
+        g_kvaf_epoch_claim_session_id = 0;
+        g_kvaf_epoch_owner_authorized = false;
+        g_kvaf_epoch_owner_epoch = 0;
+        g_kvaf_epoch_owner_session_id = 0;
+        released = true;
+    }
+    (void)pthread_mutex_unlock(&g_kvaf_lock);
+    return released;
+}
+
 int kvaf_urma_provider_open_v2(
     const struct kvaf_urma_provider_config_v2 *config,
     struct kvaf_urma_provider_result_v2 *result)
@@ -502,6 +607,15 @@ int kvaf_urma_provider_open_v2(
     }
     if (pthread_mutex_lock(&g_kvaf_lock) != 0) {
         kvaf_init_result(result, KVAF_URMA_PROVIDER_ALREADY_OPEN, -1);
+        return -1;
+    }
+    if (g_kvaf_epoch_claim_active &&
+        !kvaf_epoch_owner_is_authorized_unlocked(config->session_id)) {
+        /* A live epoch owns the complete process-local provider lifetime.
+         * Legacy/public callers must not mutate that instance between READY
+         * and checked teardown, even when they know its session nonce. */
+        kvaf_init_result(result, KVAF_URMA_PROVIDER_ALREADY_OPEN, -1);
+        (void)pthread_mutex_unlock(&g_kvaf_lock);
         return -1;
     }
     if (g_kvaf_config_initialized || g_kvaf_connection_open ||
@@ -749,6 +863,11 @@ int kvaf_urma_provider_close_v2(uint64_t session_id)
     if (pthread_mutex_lock(&g_kvaf_lock) != 0) {
         return -1;
     }
+    if (g_kvaf_epoch_claim_active &&
+        !kvaf_epoch_owner_is_authorized_unlocked(session_id)) {
+        (void)pthread_mutex_unlock(&g_kvaf_lock);
+        return KVAF_URMA_PROVIDER_CLOSE_UNSAFE;
+    }
     ret = kvaf_close_unlocked(session_id);
     (void)pthread_mutex_unlock(&g_kvaf_lock);
     return ret;
@@ -790,6 +909,11 @@ int aicpu_kvaf_urma_close_v2(void *opaque_args)
     result = (int32_t *)(uintptr_t)args->result_address;
     *result = -1;
     if (pthread_mutex_lock(&g_kvaf_lock) != 0) {
+        return 0;
+    }
+    if (g_kvaf_epoch_claim_active &&
+        !kvaf_epoch_owner_is_authorized_unlocked(args->session_id)) {
+        (void)pthread_mutex_unlock(&g_kvaf_lock);
         return 0;
     }
     if (args->session_id == 0 ||
@@ -990,6 +1114,589 @@ int aicpu_kvaf_urma_owner_probe_v1(void *opaque_args)
                 KVAF_URMA_OWNER_PROBE_RESULT_TIMED_OUT, 0,
                 now_nanoseconds - start_nanoseconds);
             return 0;
+        }
+        kvaf_owner_probe_sleep(poll_microseconds);
+    }
+}
+
+static bool kvaf_epoch_owner_range_is_valid(uint64_t address,
+    uint64_t length)
+{
+    return address != 0 && length != 0 &&
+        address <= UINT64_MAX - (length - 1U);
+}
+
+static bool kvaf_epoch_owner_ranges_overlap(uint64_t first_address,
+    uint64_t first_length, uint64_t second_address,
+    uint64_t second_length)
+{
+    return first_address <= second_address
+        ? second_address - first_address < first_length
+        : first_address - second_address < second_length;
+}
+
+static bool kvaf_epoch_owner_args_are_valid(
+    const struct kvaf_urma_aicpu_epoch_owner_args_v1 *args)
+{
+    const uint64_t alignment_mask =
+        KVAF_URMA_EPOCH_OWNER_CACHE_LINE_BYTES - UINT64_C(1);
+
+    if (args == NULL ||
+        args->magic != KVAF_URMA_EPOCH_OWNER_MAGIC ||
+        args->abi_version != KVAF_URMA_EPOCH_OWNER_ABI_VERSION ||
+        args->struct_size != sizeof(*args) ||
+        args->flags != 0 ||
+        args->epoch == 0 ||
+        args->lease_timeout_milliseconds >
+            KVAF_URMA_EPOCH_OWNER_MAX_LEASE_MILLISECONDS ||
+        args->poll_interval_microseconds >
+            KVAF_URMA_EPOCH_OWNER_MAX_POLL_MICROSECONDS ||
+        args->close_retry_limit >
+            KVAF_URMA_EPOCH_OWNER_MAX_CLOSE_RETRY_LIMIT ||
+        args->close_retry_interval_microseconds >
+            KVAF_URMA_EPOCH_OWNER_MAX_CLOSE_RETRY_MICROSECONDS ||
+        !kvaf_config_is_valid(&args->config) ||
+        (args->config.flags &
+            KVAF_URMA_PROVIDER_EXPECT_DEVICE_PRIVATE_ABI) == 0 ||
+        (args->config.flags &
+            KVAF_URMA_PROVIDER_EXPECT_HOST_PRIVATE_ABI) != 0 ||
+        !kvaf_epoch_owner_range_is_valid(args->command_address,
+            sizeof(struct kvaf_urma_epoch_owner_command_v1)) ||
+        !kvaf_epoch_owner_range_is_valid(args->status_address,
+            sizeof(struct kvaf_urma_epoch_owner_status_v1)) ||
+        !kvaf_epoch_owner_range_is_valid(args->open_result_address,
+            sizeof(struct kvaf_urma_provider_result_v2)) ||
+        (args->command_address & alignment_mask) != 0 ||
+        (args->status_address & alignment_mask) != 0 ||
+        (args->open_result_address & alignment_mask) != 0 ||
+        kvaf_epoch_owner_ranges_overlap(args->command_address,
+            sizeof(struct kvaf_urma_epoch_owner_command_v1),
+            args->status_address,
+            sizeof(struct kvaf_urma_epoch_owner_status_v1)) ||
+        kvaf_epoch_owner_ranges_overlap(args->command_address,
+            sizeof(struct kvaf_urma_epoch_owner_command_v1),
+            args->open_result_address,
+            sizeof(struct kvaf_urma_provider_result_v2)) ||
+        kvaf_epoch_owner_ranges_overlap(args->status_address,
+            sizeof(struct kvaf_urma_epoch_owner_status_v1),
+            args->open_result_address,
+            sizeof(struct kvaf_urma_provider_result_v2))) {
+        return false;
+    }
+    return true;
+}
+
+static void kvaf_epoch_owner_initialize_status(
+    struct kvaf_urma_epoch_owner_status_v1 *status,
+    const struct kvaf_urma_aicpu_epoch_owner_args_v1 *args)
+{
+    /* Clear the externally polled state before replacing any payload from a
+     * prior epoch.  This status line has exactly one producer. */
+    __atomic_store_n(&status->state,
+        (uint32_t)KVAF_URMA_EPOCH_OWNER_STATE_EMPTY,
+        __ATOMIC_RELEASE);
+    status->magic = KVAF_URMA_EPOCH_OWNER_MAGIC;
+    status->abi_version = KVAF_URMA_EPOCH_OWNER_ABI_VERSION;
+    status->struct_size = (uint32_t)sizeof(*status);
+    status->epoch = args->epoch;
+    status->session_id = args->config.session_id;
+    status->sequence = 0;
+    status->result_code = KVAF_URMA_EPOCH_OWNER_RESULT_OK;
+    status->provider_status = 0;
+    status->close_attempts = 0;
+    status->flags = 0;
+    status->elapsed_nanoseconds = 0;
+}
+
+static void kvaf_epoch_owner_publish(
+    struct kvaf_urma_epoch_owner_status_v1 *status,
+    enum kvaf_urma_epoch_owner_state state,
+    enum kvaf_urma_epoch_owner_result result,
+    int provider_status, uint64_t sequence,
+    uint32_t close_attempts, uint32_t flags,
+    uint64_t elapsed_nanoseconds)
+{
+    status->sequence = sequence;
+    status->result_code = (int32_t)result;
+    status->provider_status = provider_status;
+    status->close_attempts = close_attempts;
+    status->flags = flags;
+    status->elapsed_nanoseconds = elapsed_nanoseconds;
+    /* Publish the complete payload before AIV/Host observes the state. */
+    __atomic_store_n(&status->state, (uint32_t)state, __ATOMIC_RELEASE);
+}
+
+static uint64_t kvaf_epoch_owner_elapsed(uint64_t start_nanoseconds)
+{
+    uint64_t now_nanoseconds;
+
+    if (start_nanoseconds == 0 ||
+        kvaf_owner_probe_monotonic_nanoseconds(
+            CLOCK_MONOTONIC, &now_nanoseconds) != 0 ||
+        now_nanoseconds < start_nanoseconds) {
+        return 0;
+    }
+    return now_nanoseconds - start_nanoseconds;
+}
+
+static void __attribute__((noreturn)) kvaf_epoch_owner_hold_unsafe(
+    struct kvaf_urma_epoch_owner_status_v1 *status,
+    enum kvaf_urma_epoch_owner_result result,
+    int provider_status, uint64_t sequence,
+    uint32_t close_attempts, uint32_t poll_microseconds,
+    uint64_t start_nanoseconds, bool open_result_valid)
+{
+    const uint32_t open_result_flag = open_result_valid
+        ? KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID
+        : 0U;
+
+    kvaf_epoch_owner_publish(status,
+        KVAF_URMA_EPOCH_OWNER_STATE_UNSAFE_WAITING, result,
+        provider_status, sequence, close_attempts,
+        open_result_flag |
+            KVAF_URMA_EPOCH_OWNER_PROVIDER_ACTIVE |
+            KVAF_URMA_EPOCH_OWNER_OWNERSHIP_UNSAFE,
+        kvaf_epoch_owner_elapsed(start_nanoseconds));
+
+    /* Returning would discard the only process/SO instance that still owns
+     * the provider's pointers and checked teardown cursor.  An UNSAFE owner
+     * therefore remains resident until device reset/process isolation. */
+    for (;;) {
+        kvaf_owner_probe_sleep(poll_microseconds);
+    }
+}
+
+static void __attribute__((noreturn))
+kvaf_epoch_owner_hold_claim_after_teardown(
+    struct kvaf_urma_epoch_owner_status_v1 *status,
+    uint64_t sequence, uint32_t close_attempts,
+    uint32_t poll_microseconds, uint64_t start_nanoseconds)
+{
+    kvaf_epoch_owner_publish(status,
+        KVAF_URMA_EPOCH_OWNER_STATE_UNSAFE_WAITING,
+        KVAF_URMA_EPOCH_OWNER_RESULT_CLOSE_UNSAFE,
+        KVAF_URMA_PROVIDER_CLOSE_OK, sequence, close_attempts,
+        KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+            KVAF_URMA_EPOCH_OWNER_TEARDOWN_COMPLETE |
+            KVAF_URMA_EPOCH_OWNER_OWNERSHIP_UNSAFE,
+        kvaf_epoch_owner_elapsed(start_nanoseconds));
+
+    /* Transport teardown succeeded, but losing the still-installed global
+     * claim would allow a new session to race an indeterminate owner record.
+     * Keep this invocation resident and fail closed instead. */
+    for (;;) {
+        kvaf_owner_probe_sleep(poll_microseconds);
+    }
+}
+
+static int kvaf_epoch_owner_close_until_complete(
+    const struct kvaf_urma_aicpu_epoch_owner_args_v1 *args,
+    struct kvaf_urma_epoch_owner_status_v1 *status,
+    enum kvaf_urma_epoch_owner_state safe_terminal_state,
+    enum kvaf_urma_epoch_owner_result safe_terminal_result,
+    int safe_terminal_provider_status, uint64_t sequence,
+    uint64_t start_nanoseconds)
+{
+    uint32_t close_attempts = 0;
+    uint32_t retry_microseconds =
+        args->close_retry_interval_microseconds;
+
+    if (retry_microseconds == 0) {
+        retry_microseconds = 1000U;
+    }
+    kvaf_epoch_owner_publish(status,
+        KVAF_URMA_EPOCH_OWNER_STATE_CLOSING,
+        KVAF_URMA_EPOCH_OWNER_RESULT_OK, 0, sequence, 0,
+        KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+            KVAF_URMA_EPOCH_OWNER_PROVIDER_ACTIVE,
+        kvaf_epoch_owner_elapsed(start_nanoseconds));
+
+    for (;;) {
+        int close_status;
+
+        if (close_attempts != UINT32_MAX) {
+            close_attempts++;
+        }
+        close_status = kvaf_urma_provider_close_v2(
+            args->config.session_id);
+        if (close_status == KVAF_URMA_PROVIDER_CLOSE_OK) {
+            if (!kvaf_epoch_owner_release_claim(args)) {
+                kvaf_epoch_owner_hold_claim_after_teardown(status,
+                    sequence, close_attempts, retry_microseconds,
+                    start_nanoseconds);
+            }
+            kvaf_epoch_owner_publish(status, safe_terminal_state,
+                safe_terminal_result, safe_terminal_provider_status,
+                sequence, close_attempts,
+                KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+                    KVAF_URMA_EPOCH_OWNER_TEARDOWN_COMPLETE,
+                kvaf_epoch_owner_elapsed(start_nanoseconds));
+            return 0;
+        }
+        if (close_status != KVAF_URMA_PROVIDER_CLOSE_RETRYABLE) {
+            kvaf_epoch_owner_hold_unsafe(status,
+                KVAF_URMA_EPOCH_OWNER_RESULT_CLOSE_UNSAFE,
+                close_status, sequence, close_attempts,
+                retry_microseconds, start_nanoseconds, true);
+        }
+
+        if (args->close_retry_limit != 0 &&
+            close_attempts >= args->close_retry_limit) {
+            /* The threshold escalates observability only.  The provider
+             * explicitly retained a safe retry cursor, so keep retrying it
+             * inside this same invocation instead of returning. */
+            kvaf_epoch_owner_publish(status,
+                KVAF_URMA_EPOCH_OWNER_STATE_UNSAFE_WAITING,
+                KVAF_URMA_EPOCH_OWNER_RESULT_CLOSE_RETRY_LIMIT,
+                close_status, sequence, close_attempts,
+                KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+                    KVAF_URMA_EPOCH_OWNER_PROVIDER_ACTIVE |
+                    KVAF_URMA_EPOCH_OWNER_OWNERSHIP_UNSAFE,
+                kvaf_epoch_owner_elapsed(start_nanoseconds));
+        } else {
+            kvaf_epoch_owner_publish(status,
+                KVAF_URMA_EPOCH_OWNER_STATE_CLOSE_RETRYING,
+                KVAF_URMA_EPOCH_OWNER_RESULT_OK,
+                close_status, sequence, close_attempts,
+                KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+                    KVAF_URMA_EPOCH_OWNER_PROVIDER_ACTIVE,
+                kvaf_epoch_owner_elapsed(start_nanoseconds));
+        }
+        kvaf_owner_probe_sleep(retry_microseconds);
+    }
+}
+
+static bool kvaf_epoch_owner_open_result_is_valid(
+    const struct kvaf_urma_provider_result_v2 *result)
+{
+    return result->magic == KVAF_URMA_PROVIDER_MAGIC &&
+        result->abi_version == KVAF_URMA_PROVIDER_ABI_VERSION &&
+        result->struct_size == sizeof(*result);
+}
+
+static void kvaf_epoch_owner_make_safe_failed_open_result(
+    struct kvaf_urma_provider_result_v2 *result,
+    const struct kvaf_urma_aicpu_epoch_owner_args_v1 *args,
+    enum kvaf_urma_provider_status status, int provider_status)
+{
+    kvaf_init_result(result, status, provider_status);
+    /* OPEN_FAILED_SAFE is useful to Host only when its result is bound to
+     * this launch's nonce.  In particular, a claim conflict must not expose
+     * the active owner's session and an ordinary no-resource failure from
+     * kvaf_urma_provider_open_v2 otherwise leaves session_id as zero. */
+    result->session_id = args->config.session_id;
+}
+
+int aicpu_kvaf_urma_epoch_owner_v1(void *opaque_args)
+{
+    struct kvaf_urma_aicpu_epoch_owner_args_v1 *args =
+        (struct kvaf_urma_aicpu_epoch_owner_args_v1 *)opaque_args;
+    struct kvaf_urma_epoch_owner_command_v1 *command;
+    struct kvaf_urma_epoch_owner_status_v1 *status;
+    struct kvaf_urma_provider_result_v2 *open_result;
+    uint64_t start_nanoseconds = 0;
+    uint64_t lease_nanoseconds = 0;
+    uint32_t poll_microseconds;
+    bool lease_reported = false;
+    bool clock_failure_reported = false;
+    enum kvaf_epoch_claim_result claim_result;
+    int open_status;
+
+    if (!kvaf_epoch_owner_args_are_valid(args)) {
+        return -1;
+    }
+    command = (struct kvaf_urma_epoch_owner_command_v1 *)(uintptr_t)
+        args->command_address;
+    status = (struct kvaf_urma_epoch_owner_status_v1 *)(uintptr_t)
+        args->status_address;
+    open_result = (struct kvaf_urma_provider_result_v2 *)(uintptr_t)
+        args->open_result_address;
+    poll_microseconds = args->poll_interval_microseconds;
+    if (poll_microseconds == 0) {
+        poll_microseconds = 1000U;
+    }
+
+    kvaf_epoch_owner_initialize_status(status, args);
+    if (args->lease_timeout_milliseconds != 0) {
+        if (kvaf_owner_probe_monotonic_nanoseconds(
+                CLOCK_MONOTONIC, &start_nanoseconds) != 0) {
+            kvaf_epoch_owner_make_safe_failed_open_result(open_result, args,
+                KVAF_URMA_PROVIDER_RESOURCE_CREATE_FAILED, -1);
+            kvaf_epoch_owner_publish(status,
+                KVAF_URMA_EPOCH_OWNER_STATE_OPEN_FAILED_SAFE,
+                KVAF_URMA_EPOCH_OWNER_RESULT_CLOCK_FAILED, 0, 0, 0,
+                KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+                    KVAF_URMA_EPOCH_OWNER_TEARDOWN_COMPLETE, 0);
+            return 0;
+        }
+        lease_nanoseconds =
+            (uint64_t)args->lease_timeout_milliseconds *
+            UINT64_C(1000000);
+    }
+
+    claim_result = kvaf_epoch_owner_acquire_claim(args);
+    if (claim_result == KVAF_EPOCH_CLAIM_CONFLICT) {
+        /* This invocation created no resource and owns no provider pointer.
+         * The already-live owner's invocation retains the SO and its claim. */
+        kvaf_epoch_owner_make_safe_failed_open_result(open_result, args,
+            KVAF_URMA_PROVIDER_ALREADY_OPEN, -1);
+        kvaf_epoch_owner_publish(status,
+            KVAF_URMA_EPOCH_OWNER_STATE_OPEN_FAILED_SAFE,
+            KVAF_URMA_EPOCH_OWNER_RESULT_OPEN_FAILED,
+            open_result->provider_status, 0, 0,
+            KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+                KVAF_URMA_EPOCH_OWNER_TEARDOWN_COMPLETE,
+            kvaf_epoch_owner_elapsed(start_nanoseconds));
+        return 0;
+    }
+    if (claim_result != KVAF_EPOCH_CLAIM_ACQUIRED) {
+        kvaf_epoch_owner_publish(status,
+            KVAF_URMA_EPOCH_OWNER_STATE_UNSAFE_WAITING,
+            KVAF_URMA_EPOCH_OWNER_RESULT_OPEN_FAILED, -1, 0, 0,
+            KVAF_URMA_EPOCH_OWNER_OWNERSHIP_UNSAFE,
+            kvaf_epoch_owner_elapsed(start_nanoseconds));
+        /* Without the provider mutex we cannot prove whether another owner is
+         * live. Returning could unload its process-local state. */
+        for (;;) {
+            kvaf_owner_probe_sleep(poll_microseconds);
+        }
+    }
+    kvaf_epoch_owner_publish(status,
+        KVAF_URMA_EPOCH_OWNER_STATE_OPENING,
+        KVAF_URMA_EPOCH_OWNER_RESULT_OK, 0, 0, 0, 0, 0);
+
+    open_status = kvaf_urma_provider_open_v2(
+        &args->config, open_result);
+    if (open_status != 0) {
+        const uint32_t cleanup_mask =
+            KVAF_URMA_PROVIDER_CLEANUP_RETRYABLE |
+            KVAF_URMA_PROVIDER_CLEANUP_UNCERTAIN;
+        const bool result_valid =
+            kvaf_epoch_owner_open_result_is_valid(open_result);
+        const uint32_t cleanup_flags = result_valid
+            ? open_result->flags & cleanup_mask
+            : 0U;
+        const bool result_session_matches = result_valid &&
+            open_result->session_id == args->config.session_id;
+        const bool cleanup_retryable =
+            (cleanup_flags &
+             KVAF_URMA_PROVIDER_CLEANUP_RETRYABLE) != 0;
+        const bool cleanup_uncertain =
+            (cleanup_flags &
+             KVAF_URMA_PROVIDER_CLEANUP_UNCERTAIN) != 0;
+        bool local_state_present = false;
+        bool provider_session_matches = false;
+        const bool snapshot_valid =
+            kvaf_epoch_owner_snapshot_local_state(args,
+                &local_state_present, &provider_session_matches);
+        const bool failure_result_contradicts_ownership =
+            !result_valid ||
+            open_result->status == KVAF_URMA_PROVIDER_OK ||
+            (open_result->flags & ~cleanup_mask) != 0 ||
+            (cleanup_flags != 0 && !result_session_matches);
+
+        /* Only the provider's explicit RETRYABLE result grants this exact
+         * invocation permission to resume checked teardown.  Never infer
+         * ownership from a process-global session alone: it could belong to
+         * an earlier KFC task in the same worker/SO instance. */
+        if (!snapshot_valid) {
+            kvaf_epoch_owner_hold_unsafe(status,
+                KVAF_URMA_EPOCH_OWNER_RESULT_OPEN_FAILED,
+                result_valid ? open_result->provider_status : open_status,
+                0, 0, poll_microseconds, start_nanoseconds,
+                result_valid);
+        }
+        if (cleanup_retryable &&
+            (!local_state_present || !provider_session_matches)) {
+            /* RETRYABLE is meaningful only while this claimed instance still
+             * owns the exact session and teardown cursor. */
+            kvaf_epoch_owner_hold_unsafe(status,
+                KVAF_URMA_EPOCH_OWNER_RESULT_OPEN_FAILED,
+                result_valid ? open_result->provider_status : open_status,
+                0, 0, poll_microseconds, start_nanoseconds,
+                result_valid);
+        }
+        if (!failure_result_contradicts_ownership &&
+            cleanup_retryable && !cleanup_uncertain) {
+            return kvaf_epoch_owner_close_until_complete(args, status,
+                KVAF_URMA_EPOCH_OWNER_STATE_OPEN_FAILED_SAFE,
+                KVAF_URMA_EPOCH_OWNER_RESULT_OPEN_FAILED,
+                open_result->provider_status,
+                0, start_nanoseconds);
+        }
+        if (failure_result_contradicts_ownership || cleanup_uncertain ||
+            cleanup_retryable || local_state_present ||
+            provider_session_matches) {
+            kvaf_epoch_owner_hold_unsafe(status,
+                KVAF_URMA_EPOCH_OWNER_RESULT_OPEN_FAILED,
+                result_valid ? open_result->provider_status : open_status,
+                0, 0, poll_microseconds, start_nanoseconds,
+                result_valid);
+        }
+        if (!kvaf_epoch_owner_release_claim(args)) {
+            kvaf_epoch_owner_hold_claim_after_teardown(status,
+                0, 0, poll_microseconds, start_nanoseconds);
+        }
+        /* The provider's ordinary no-resource failure is structurally valid
+         * but does not carry a session nonce.  Bind it only after the locked
+         * snapshot proved no local state and claim release succeeded. */
+        open_result->session_id = args->config.session_id;
+        kvaf_epoch_owner_publish(status,
+            KVAF_URMA_EPOCH_OWNER_STATE_OPEN_FAILED_SAFE,
+            KVAF_URMA_EPOCH_OWNER_RESULT_OPEN_FAILED,
+            open_result->provider_status, 0, 0,
+            KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+                KVAF_URMA_EPOCH_OWNER_TEARDOWN_COMPLETE,
+            kvaf_epoch_owner_elapsed(start_nanoseconds));
+        return 0;
+    }
+
+    {
+        const bool result_valid =
+            kvaf_epoch_owner_open_result_is_valid(open_result);
+        bool local_state_present = false;
+        bool provider_session_matches = false;
+        const bool snapshot_valid =
+            kvaf_epoch_owner_snapshot_local_state(args,
+                &local_state_present, &provider_session_matches);
+
+        if (!snapshot_valid || !local_state_present ||
+            !result_valid ||
+            open_result->status != KVAF_URMA_PROVIDER_OK ||
+            open_result->provider_status != 0 ||
+            open_result->session_id != args->config.session_id ||
+            !provider_session_matches) {
+            kvaf_epoch_owner_hold_unsafe(status,
+                KVAF_URMA_EPOCH_OWNER_RESULT_OPEN_FAILED,
+                result_valid ? open_result->provider_status : open_status,
+                0, 0, poll_microseconds, start_nanoseconds,
+                result_valid);
+        }
+    }
+
+    if (lease_nanoseconds != 0) {
+        uint64_t now_nanoseconds;
+        enum kvaf_urma_epoch_owner_result pre_ready_result =
+            KVAF_URMA_EPOCH_OWNER_RESULT_OK;
+
+        if (kvaf_owner_probe_monotonic_nanoseconds(
+                CLOCK_MONOTONIC, &now_nanoseconds) != 0 ||
+            now_nanoseconds < start_nanoseconds) {
+            pre_ready_result =
+                KVAF_URMA_EPOCH_OWNER_RESULT_CLOCK_FAILED;
+        } else if (now_nanoseconds - start_nanoseconds >=
+            lease_nanoseconds) {
+            pre_ready_result =
+                KVAF_URMA_EPOCH_OWNER_RESULT_LEASE_EXPIRED;
+        }
+        if (pre_ready_result != KVAF_URMA_EPOCH_OWNER_RESULT_OK) {
+            /* READY has not been published, so AIV cannot have submitted a
+             * WQE. Close is safe here even though no command exists. */
+            return kvaf_epoch_owner_close_until_complete(args, status,
+                KVAF_URMA_EPOCH_OWNER_STATE_OPEN_FAILED_SAFE,
+                pre_ready_result,
+                0, 0, start_nanoseconds);
+        }
+    }
+
+    kvaf_epoch_owner_publish(status,
+        KVAF_URMA_EPOCH_OWNER_STATE_READY,
+        KVAF_URMA_EPOCH_OWNER_RESULT_OK, 0, 0, 0,
+        KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+            KVAF_URMA_EPOCH_OWNER_PROVIDER_ACTIVE,
+        kvaf_epoch_owner_elapsed(start_nanoseconds));
+
+    for (;;) {
+        const uint32_t opcode =
+            __atomic_load_n(&command->opcode, __ATOMIC_ACQUIRE);
+
+        if (opcode ==
+            KVAF_URMA_EPOCH_OWNER_COMMAND_SHUTDOWN_QUIESCED) {
+            const bool identity_valid =
+                command->magic == KVAF_URMA_EPOCH_OWNER_MAGIC &&
+                command->abi_version ==
+                    KVAF_URMA_EPOCH_OWNER_ABI_VERSION &&
+                command->struct_size == sizeof(*command) &&
+                command->epoch == args->epoch &&
+                command->session_id == args->config.session_id &&
+                command->sequence ==
+                    KVAF_URMA_EPOCH_OWNER_SHUTDOWN_SEQUENCE &&
+                command->reserved[0] == 0;
+            const bool queue_quiesced =
+                command->final_sq_head == command->final_sq_tail &&
+                command->final_sq_tail == command->final_cq_tail &&
+                command->final_cq_tail == command->final_wqe_count;
+
+            if (!identity_valid) {
+                kvaf_epoch_owner_publish(status,
+                    KVAF_URMA_EPOCH_OWNER_STATE_UNSAFE_WAITING,
+                    KVAF_URMA_EPOCH_OWNER_RESULT_INVALID_COMMAND,
+                    0, command->sequence, 0,
+                    KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+                        KVAF_URMA_EPOCH_OWNER_PROVIDER_ACTIVE |
+                        KVAF_URMA_EPOCH_OWNER_OWNERSHIP_UNSAFE,
+                    kvaf_epoch_owner_elapsed(start_nanoseconds));
+            } else if (!queue_quiesced ||
+                kvaf_quiesce_aiv_queue(command->final_sq_head,
+                    command->final_cq_tail) != 0) {
+                kvaf_epoch_owner_publish(status,
+                    KVAF_URMA_EPOCH_OWNER_STATE_UNSAFE_WAITING,
+                    KVAF_URMA_EPOCH_OWNER_RESULT_QUEUE_NOT_QUIESCED,
+                    0, command->sequence, 0,
+                    KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+                        KVAF_URMA_EPOCH_OWNER_PROVIDER_ACTIVE |
+                        KVAF_URMA_EPOCH_OWNER_OWNERSHIP_UNSAFE,
+                    kvaf_epoch_owner_elapsed(start_nanoseconds));
+            } else {
+                return kvaf_epoch_owner_close_until_complete(args,
+                    status, KVAF_URMA_EPOCH_OWNER_STATE_CLOSED,
+                    KVAF_URMA_EPOCH_OWNER_RESULT_OK,
+                    KVAF_URMA_PROVIDER_CLOSE_OK, command->sequence,
+                    start_nanoseconds);
+            }
+        } else if (opcode != KVAF_URMA_EPOCH_OWNER_COMMAND_NONE) {
+            kvaf_epoch_owner_publish(status,
+                KVAF_URMA_EPOCH_OWNER_STATE_UNSAFE_WAITING,
+                KVAF_URMA_EPOCH_OWNER_RESULT_INVALID_COMMAND,
+                0, command->sequence, 0,
+                KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+                    KVAF_URMA_EPOCH_OWNER_PROVIDER_ACTIVE |
+                    KVAF_URMA_EPOCH_OWNER_OWNERSHIP_UNSAFE,
+                kvaf_epoch_owner_elapsed(start_nanoseconds));
+        }
+
+        if (lease_nanoseconds != 0 && !lease_reported) {
+            uint64_t now_nanoseconds;
+
+            if (kvaf_owner_probe_monotonic_nanoseconds(
+                    CLOCK_MONOTONIC, &now_nanoseconds) != 0 ||
+                now_nanoseconds < start_nanoseconds) {
+                clock_failure_reported = true;
+                kvaf_epoch_owner_publish(status,
+                    KVAF_URMA_EPOCH_OWNER_STATE_UNSAFE_WAITING,
+                    KVAF_URMA_EPOCH_OWNER_RESULT_CLOCK_FAILED,
+                    0, 0, 0,
+                    KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+                        KVAF_URMA_EPOCH_OWNER_PROVIDER_ACTIVE |
+                        KVAF_URMA_EPOCH_OWNER_OWNERSHIP_UNSAFE,
+                    0);
+            } else if (now_nanoseconds - start_nanoseconds >=
+                lease_nanoseconds) {
+                lease_reported = true;
+                kvaf_epoch_owner_publish(status,
+                    KVAF_URMA_EPOCH_OWNER_STATE_UNSAFE_WAITING,
+                    KVAF_URMA_EPOCH_OWNER_RESULT_LEASE_EXPIRED,
+                    0, 0, 0,
+                    KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+                        KVAF_URMA_EPOCH_OWNER_PROVIDER_ACTIVE |
+                        KVAF_URMA_EPOCH_OWNER_OWNERSHIP_UNSAFE,
+                    now_nanoseconds - start_nanoseconds);
+            }
+            if (clock_failure_reported) {
+                /* Clock failure disables the diagnostic lease.  Continue
+                 * holding the provider for cooperative shutdown. */
+                lease_reported = true;
+            }
         }
         kvaf_owner_probe_sleep(poll_microseconds);
     }

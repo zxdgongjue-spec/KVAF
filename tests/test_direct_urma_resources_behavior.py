@@ -110,19 +110,34 @@ class DirectUrmaResourcesBehaviorTests(unittest.TestCase):
     def test_aicpu_launch_uses_kfc_kernel_type_abi(self) -> None:
         self.run_scenario("kernel_type")
 
+    def test_slow_open_reuses_owner_with_bounded_ready_tasks(self) -> None:
+        self.run_scenario("ready_timeout_once")
+
+    def test_data_and_shutdown_share_one_fifo_stream(self) -> None:
+        self.run_scenario("data_stream_fifo")
+
     def test_double_sync_failure_retains_every_allocation(self) -> None:
         self.run_scenario("sync_twice")
 
     def test_open_launch_failure_retains_ambiguous_backing(self) -> None:
         self.run_scenario("open_launch_failure")
 
+    def test_contradictory_safe_open_terminal_is_not_trusted(self) -> None:
+        self.run_scenario("open_failed_safe_bad_result")
+
     def test_foreign_already_open_is_never_closed(self) -> None:
         self.run_scenario("foreign_already_open")
+
+    def test_clock_failure_before_claim_has_safe_session_proof(self) -> None:
+        self.run_scenario("clock_failed_before_open")
+
+    def test_pre_ready_lease_close_has_safe_terminal_proof(self) -> None:
+        self.run_scenario("lease_expired_after_open")
 
     def test_open_result_copy_failure_closes_exact_session(self) -> None:
         self.run_scenario("open_d2h_failure")
 
-    def test_retryable_failed_open_preserves_session_for_close(self) -> None:
+    def test_failed_open_is_closed_inside_same_owner_invocation(self) -> None:
         self.run_scenario("open_cleanup_retryable")
 
     def test_host_retryable_failed_open_preserves_session_for_close(self) -> None:
@@ -137,20 +152,26 @@ class DirectUrmaResourcesBehaviorTests(unittest.TestCase):
     def test_lost_close_result_retries_same_session(self) -> None:
         self.run_scenario("close_d2h_retry")
 
-    def test_provider_retry_relaunches_only_after_result_reread(self) -> None:
-        self.run_scenario("close_d2h_provider_retryable")
+    def test_terminal_status_reread_never_rejoins_owner(self) -> None:
+        self.run_scenario("close_status_d2h_retry")
 
     def test_prelaunch_copy_failure_is_safely_retryable(self) -> None:
-        self.run_scenario("close_prelaunch_d2h_retry")
+        self.run_scenario("close_prelaunch_h2d_retry")
 
     def test_non_drained_queue_is_unsafe_without_launch(self) -> None:
         self.run_scenario("close_queue_not_drained")
 
-    def test_close_launch_failure_is_ownership_unknown(self) -> None:
-        self.run_scenario("close_launch_failure")
+    def test_owner_join_failure_is_ownership_unknown(self) -> None:
+        self.run_scenario("owner_join_sync_twice")
 
     def test_explicit_unsafe_close_is_not_retried(self) -> None:
         self.run_scenario("close_unsafe")
+
+    def test_terminal_close_requires_full_status_proof(self) -> None:
+        self.run_scenario("close_terminal_incomplete")
+
+    def test_shutdown_command_reserved_bytes_are_zero(self) -> None:
+        self.run_scenario("close_command_reserved_nonzero")
 
     def test_host_explicit_unsafe_close_is_not_retried(self) -> None:
         self.run_scenario("host_close_unsafe")

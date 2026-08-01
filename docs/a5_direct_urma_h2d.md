@@ -333,28 +333,23 @@ quarantine；不要在隔离前 `kill -9`。
 后再次运行同一脚本，它会在访问 topology/EID/NPU 之前用原 `run_id` 和结果目录中
 固化的分类器自动清理安全状态。只有明确的 quarantine 才进入站点隔离流程。
 
-需要注意：本版本的 Device provider 仍要求同一 AICPU 进程和 SO instance 执行
-Open/Close。现有观测日志曾在同一 stream 的多次调用中看到相同 PID/TID；但
-公开 KFC ABI 只提供 associated stream，没有 worker、进程或 SO instance
-affinity token。对多次调用采样 PID、进程 cookie、SO base 和 generation 只能
-描述过去的调度，不能绑定随后真正持有资源的 Open/Close，因此不能作为安全
-前置证明。
+Device provider 的 UMDK/UMMU 句柄必须由创建它们的同一 AICPU 进程和 SO instance
+销毁。公开 KFC ABI 没有跨 invocation 的 worker affinity token，所以对多个短
+invocation 采样到相同 PID/TID 不能作为所有权证明。
 
-新硬件运行现在由 `scripts/a5_aicpu_affinity_guard.sh` 默认 fail closed。旧 active
-session/quarantine 仍会先恢复或报告；新运行则会在 EID selector、`npu-smi`、ACL
-context 和 URMA/UMMU 资源之前退出，且没有环境变量绕过。只有以下任一条件经代码和
-目标 CANN 版本验证后，才能修改该源码门并重新开放硬件 runner：
+候选实现因此把 `Open -> 多轮 AIV BatchGet -> checked Close/retry` 放进同一个
+`aicpu_kvaf_urma_epoch_owner_v1` invocation。provider 内还有进程级 epoch claim；
+owner 存活时，其他 public/legacy Open/Close 都会被拒绝，避免第二个调用破坏它的
+process-local 状态。Host 侧冻结新提交后，关闭命令与此前的 BatchGet kernel 排在
+同一 control/data stream；stream FIFO 与同步结果才是关闭前 drain 的顺序证明。
+GM 中的四个软件计数是额外的一致性证据，不是硬件 PI/CI 的替代品。
 
-- 厂商提供同一 stream 的 KFC 调用固定在同一进程/SO instance 的正式 runtime
-  契约，KVAF 同时校验该契约适用于当前 CANN/固件；
-- 将 Open、等待 AIV 数据面和 Close 合并到一个 AICPU invocation，或实现一个长驻
-  ownership service，使 liburma/UDMA/UMMU 指针和句柄始终由同一进程持有。
-
-仓内的 bounded owner probe 只验证不创建 URMA/UMMU 资源的 AICPU/AIV
-`READY -> RELEASE -> RELEASED` 控制记录握手。即使 probe PASS，也不能推导出
-provider Open-transfer-Close 已具备同一 owner，因而不会改变上述 gate。探针矩阵、
-MVP session owner 与 production epoch owner 的边界见
-[A5 AICPU bounded owner probe](a5_aicpu_owner_probe.md)。
+生产 runner 继续默认 fail closed；只有显式的
+`run_a5_direct_urma_epoch_owner_validation.sh` 才能执行候选真机验证。候选 owner
+解决了 split Open/Close 的所有权缺口，但普通 KFC worker 是否允许跨整个模型
+生命周期驻留，仍需验证当前 CANN 的 worker 配额、watchdog、取消和阻塞契约。
+resource-free bounded probe 也仍只证明 AICPU/AIV 并发控制记录可见性。完整 epoch
+边界和 decode 热路径见 [A5 direct URMA Decode H2D epoch 设计](a5_decode_epoch_h2d.md)。
 
 ## 6. 操作命令
 
@@ -655,11 +650,10 @@ memcache。`dev_id` 是宿主机全局 selector；新代码统一通过宿主机
 
 执行环境：`VLLM_ASCEND_CS_KVAF_DOCKER`
 
-当前版本执行下面命令时会由 AICPU affinity gate 以退出码 2 停止；这是预期的
-fail-closed 结果，不应通过设置环境变量继续。先完成第 5 节所述正式 runtime 契约
-验证或完整的 MVP session owner 改造，再由代码评审修改源码门。Resource-free
-owner probe 的 PASS 不满足这个条件。保留命令仅用于确认门禁位置和为后续实现准备
-参数。
+正式 runner 仍会由 AICPU gate 以退出码 2 停止。真机验证必须使用显式 candidate
+wrapper；它在同一个 AICPU invocation 内持有 Device provider，并在同一个
+control/data stream 上顺序执行全部 BatchGet 与 shutdown。默认负载是 4096 个
+1 KiB 请求（每批 4 MiB），不是旧的“总共 4096 bytes”。
 
 ```bash
 source /tmp/kvaf_npu7_pair.env
@@ -672,12 +666,17 @@ export KVAF_DEVICE_URMA_DEVICE=udmac0d0e2
 export KVAF_DEVICE_EID_INDEX=0
 export KVAF_PAIR_CHANNEL=0
 unset KVAF_DIRECT_ALLOW_BUSY_NPU
-export KVAF_H2D_BYTES=4096
+unset KVAF_H2D_BYTES
+export KVAF_H2D_TRANSFER_COUNT=4096
+export KVAF_H2D_BYTES_PER_TRANSFER=1024
+export KVAF_H2D_DESCRIPTOR_CAPACITY=4096
+export KVAF_H2D_BATCH_ITERATIONS=10
 export KVAF_H2D_TIMEOUT_SECONDS=120
+export KVAF_H2D_RUN_TIMEOUT_SECONDS=600
 export KVAF_DIRECT_CONTROL_PORT=22117
 export KVAF_A5_RUN_TAG="npu7_checked_$(date +%Y%m%d_%H%M%S)_$$"
 
-bash scripts/run_a5_direct_urma_h2d_smoke.sh
+bash scripts/run_a5_direct_urma_epoch_owner_validation.sh
 ```
 
 当前 `vllm-ascend-cs-kvaf` 挂载全部 0–7 号设备，runner 要求逻辑卡号与物理卡号
@@ -794,16 +793,20 @@ unset KVAF_DIRECT_ACTIVE_SESSION_FILE KVAF_DIRECT_QUARANTINE_FILE
   路径，并按 phase 保留 context/segment/token/Jetty/JFC/TID/queue/doorbell
   句柄。仍需在服务器 B 用当前驱动匹配的 full UAPI 完成 AArch64 构建和真机
   fault injection；本机全量单元测试不能替代这一步；
-- provider 是进程级 singleton，仅支持一个连接；
-- AICPU Open/Close 必须命中同一 KFC worker 和 SO 实例。当前 runner 在任何新硬件
-  访问前 fail closed；同-stream PID/cookie/SO-base/generation 采样不是正式保证。
-  解除该门需要长驻 AICPU ownership service/单 invocation 生命周期，或当前目标
-  CANN 对同-stream worker affinity 的正式 runtime 契约。Resource-free bounded
-  owner probe 只验证并发控制记录，不会单独解除该门；
+- provider 是进程级 singleton；当前候选 epoch claim 只支持一个连接/owner，尚未
+  实现多租户 queue pool；
+- 候选 owner 已把 Open/多轮 transfer/Close 合并到同一 AICPU invocation，并阻止
+  外部 Open/Close 并发破坏状态；它仍需在目标 CANN 上验证长驻 KFC worker 的配额、
+  watchdog、合作式取消和 runtime 退出契约，正式 runner 因此继续 fail closed；
 - Host DVA 的 `non_pin` 注册和 AIV CQ cache 语义仍需当前 A5 固件实测；
-- 当前逐 descriptor `doorbell -> CQ`，还没有批量 WQE/doorbell/CQ。
+- AIV 已用 32 个 SIMT lane 规划 descriptor，并按 SQ/CQ 深度分 wave 提交 4096 个
+  WQE；当前仍是单 queue owner，尚未实现多 SQ 分片、图内异步完成和性能调优；
+- CQ poll budget 到期会保留 owner/MR/queue 而不是冒险销毁；要做到无需 reset 的
+  在线恢复，还需实现可续跑的 pending-CQ drain 状态机。
 
-正确性通过后的性能工作依次是：长驻 context、Host DDR pool 一次注册、
-SIMT 批量生成 WQE、一次 doorbell 提交一批、尾部 fence/CQE、多 SQ 分片。
+当前 smoke 已把 Host DDR/HBM pool、MR 和 Jetty/SQ/CQ 维持在整个 epoch 内，能够
+验证多轮 BatchGet 复用；但每轮仍做 Host canary、D2H 校验和 Snapshot，所以不能
+把 smoke 吞吐当作 decode 热路径性能。后续性能工作是图内 AccessTable 生产、异步
+完成通知、doorbell 合并、尾部 fence/CQE、queue pool 与多 SQ 分片。
 绕过 HCOMM 主要减少控制面依赖与建链开销；稳态带宽仍取决于长驻资源和批量
 提交。

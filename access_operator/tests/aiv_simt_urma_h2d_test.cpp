@@ -5,6 +5,7 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -195,6 +196,54 @@ bool TestGenerationMismatch() {
                 "generation mismatch has a precise device status");
 }
 
+bool TestMaximumBatchCapacity() {
+  const std::size_t count = kvaf::access::kAivUrmaMaxDescriptors;
+  std::vector<Address> remote(count);
+  std::vector<std::uint64_t> lengths(count, 64);
+  std::vector<std::uint8_t> valid(count, 1);
+  std::vector<std::uint32_t> indices(count);
+  std::vector<std::uint64_t> offsets(count);
+  std::vector<UrmaH2DDescriptor> descriptors(count);
+  for (std::size_t index = 0; index < count; ++index) {
+    remote[index] = 0x100000ULL + index * 64U;
+    indices[index] = static_cast<std::uint32_t>(index);
+    offsets[index] = index * 64U;
+  }
+
+  DeviceCompletion completion{};
+  H2DPlanView view{};
+  view.remote_addresses = remote.data();
+  view.lengths = lengths.data();
+  view.valid = valid.data();
+  view.table_capacity = static_cast<std::uint32_t>(count);
+  view.table_generation = 11;
+  view.indices = indices.data();
+  view.output_offsets = offsets.data();
+  view.entry_count = static_cast<std::uint32_t>(count);
+  view.output_base = 0x80000000;
+  view.output_bytes = count * 64U;
+  view.generation = 11;
+  view.descriptors = descriptors.data();
+  view.descriptor_capacity = static_cast<std::uint32_t>(count);
+  view.completion = &completion;
+
+  const auto status = BuildH2DTransferPlan(view);
+  bool ok =
+      Expect(status.ok(), "the full 4096-descriptor capacity must plan") &&
+      Expect(completion.planned_count == count,
+             "the full batch must report every planned descriptor");
+
+  view.entry_count =
+      kvaf::access::kAivUrmaMaxDescriptors + 1U;
+  const auto oversized = BuildH2DTransferPlan(view);
+  ok = Expect(!oversized.ok(), "capacity plus one must fail before access") &&
+       Expect(completion.status == static_cast<std::uint32_t>(
+                                       DeviceBatchStatus::kCountOutOfRange),
+              "capacity failure must have the precise device status") &&
+       ok;
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -203,6 +252,7 @@ int main() {
   ok = TestBadIndexFailsWholeBatch() && ok;
   ok = TestInvalidRemoteAndOutputRanges() && ok;
   ok = TestGenerationMismatch() && ok;
+  ok = TestMaximumBatchCapacity() && ok;
   if (!ok) {
     return 1;
   }

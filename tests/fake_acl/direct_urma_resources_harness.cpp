@@ -77,12 +77,36 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+  if (scenario == "open_failed_safe_bad_result") {
+    if (open.ok() || resources.transport_teardown_complete() ||
+        resources.transport_teardown_retryable() ||
+        resources.close_phase() !=
+            DirectUrmaClosePhase::kUnsafeUnknown ||
+        kvaf_fake_acl_free_calls() != 0 ||
+        kvaf_fake_acl_destroy_stream_calls() != 0) {
+      return Fail("contradictory OPEN_FAILED_SAFE evidence was trusted");
+    }
+    return 0;
+  }
   if (scenario == "foreign_already_open") {
     if (open.ok() || !resources.transport_teardown_complete() ||
         kvaf_fake_acl_close_launches() != 0 ||
-        kvaf_fake_acl_free_calls() != 2 ||
-        kvaf_fake_acl_destroy_stream_calls() != 1) {
+        kvaf_fake_acl_free_calls() != 5 ||
+        kvaf_fake_acl_destroy_stream_calls() != 2) {
       return Fail("foreign session was closed or local state was retained");
+    }
+    return 0;
+  }
+  if (scenario == "clock_failed_before_open" ||
+      scenario == "lease_expired_after_open") {
+    const int expected_close_launches =
+        scenario == "lease_expired_after_open" ? 1 : 0;
+    if (open.ok() || !resources.transport_teardown_complete() ||
+        resources.transport_teardown_retryable() ||
+        kvaf_fake_acl_close_launches() != expected_close_launches ||
+        kvaf_fake_acl_free_calls() != 5 ||
+        kvaf_fake_acl_destroy_stream_calls() != 2) {
+      return Fail("safe pre-READY terminal proof was not accepted");
     }
     return 0;
   }
@@ -96,22 +120,12 @@ int main(int argc, char** argv) {
     return 0;
   }
   if (scenario == "open_cleanup_retryable") {
-    if (open.ok() || resources.transport_teardown_complete() ||
-        !resources.transport_teardown_retryable() ||
-        resources.close_phase() !=
-            DirectUrmaClosePhase::kProviderRetryable ||
-        resources.close_disposition() !=
-            DirectUrmaCloseDisposition::kProviderRetryable ||
-        kvaf_fake_acl_close_launches() != 1) {
-      return Fail("retryable failed Open was promoted to unsafe or lost");
-    }
-    if (!resources.Close().ok() ||
-        !resources.transport_teardown_complete() ||
+    if (open.ok() || !resources.transport_teardown_complete() ||
         resources.transport_teardown_retryable() ||
-        kvaf_fake_acl_close_launches() != 2 ||
+        kvaf_fake_acl_close_launches() != 1 ||
         kvaf_fake_acl_open_session() !=
             kvaf_fake_acl_last_close_session()) {
-      return Fail("same-session failed Open cleanup retry did not converge");
+      return Fail("failed Open did not teardown in its owner invocation");
     }
     return 0;
   }
@@ -158,13 +172,50 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  if (scenario == "ready_timeout_once") {
+    if (!resources.Close().ok() ||
+        !resources.transport_teardown_complete() ||
+        kvaf_fake_acl_close_launches() != 1) {
+      return Fail("bounded READY poll retry relaunched or lost the owner");
+    }
+    return 0;
+  }
+
+  if (scenario == "data_stream_fifo") {
+    kvaf::access::AivDirectUrmaChannel channel{};
+    const auto local = resources.local_memory();
+    const auto remote = resources.remote_memory();
+    if (!resources.SnapshotDirectChannel(
+             local.address, 4096, remote.address, 4096,
+             &channel).ok()) {
+      return Fail("could not snapshot candidate data channel");
+    }
+    kvaf::access::DeviceBatchGetParams params{};
+    kvaf::access::DeviceCompletion completion{};
+    if (!resources.EnqueueBatch(&params, &completion, &channel).ok() ||
+        kvaf_fake_acl_data_launches() != 1 ||
+        kvaf_fake_acl_data_stream_matches_control() != 1) {
+      return Fail("batch was not enqueued on the owned control stream");
+    }
+    // Deliberately do not call SynchronizeDataPlane. Close must freeze new
+    // submissions and append shutdown to this same FIFO stream.
+    if (!resources.Close().ok() ||
+        !resources.transport_teardown_complete() ||
+        kvaf_fake_acl_close_launches() != 1 ||
+        kvaf_fake_acl_data_stream_matches_control() != 1 ||
+        resources.EnqueueBatch(&params, &completion, &channel).ok()) {
+      return Fail("Close did not FIFO-order shutdown after accepted data");
+    }
+    return 0;
+  }
+
   if (scenario == "close_d2h_retry") {
     if (resources.Close().ok() || resources.transport_teardown_complete() ||
         !resources.transport_teardown_retryable() ||
         resources.close_phase() !=
-            DirectUrmaClosePhase::kAicpuResultPending ||
+            DirectUrmaClosePhase::kAivShutdownResultPending ||
         resources.close_disposition() !=
-            DirectUrmaCloseDisposition::kAicpuResultReadPending ||
+            DirectUrmaCloseDisposition::kAivShutdownResultReadPending ||
         kvaf_fake_acl_close_launches() != 1) {
       return Fail("lost close result did not retain its read-only cursor");
     }
@@ -182,37 +233,28 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  if (scenario == "close_d2h_provider_retryable") {
+  if (scenario == "close_status_d2h_retry") {
     if (resources.Close().ok() ||
         resources.close_disposition() !=
-            DirectUrmaCloseDisposition::kAicpuResultReadPending ||
+            DirectUrmaCloseDisposition::kAicpuEpochOwnerStatusReadPending ||
         kvaf_fake_acl_close_launches() != 1) {
-      return Fail("lost RETRYABLE result did not retain read cursor");
-    }
-    if (resources.Close().ok() ||
-        resources.close_phase() !=
-            DirectUrmaClosePhase::kProviderRetryable ||
-        resources.close_disposition() !=
-            DirectUrmaCloseDisposition::kProviderRetryable ||
-        !resources.transport_teardown_retryable() ||
-        kvaf_fake_acl_close_launches() != 1) {
-      return Fail("result reread did not expose provider RETRYABLE");
+      return Fail("lost terminal status did not retain read cursor");
     }
     if (!resources.Close().ok() ||
         !resources.transport_teardown_complete() ||
-        kvaf_fake_acl_close_launches() != 2) {
-      return Fail("provider-authorized relaunch did not converge");
+        kvaf_fake_acl_close_launches() != 1) {
+      return Fail("terminal status reread rejoined or relaunched owner");
     }
     return 0;
   }
 
-  if (scenario == "close_prelaunch_d2h_retry") {
+  if (scenario == "close_prelaunch_h2d_retry") {
     if (resources.Close().ok() || resources.transport_teardown_complete() ||
         !resources.transport_teardown_retryable() ||
         resources.close_phase() !=
-            DirectUrmaClosePhase::kAicpuPreLaunch ||
+            DirectUrmaClosePhase::kAivShutdownPreLaunch ||
         resources.close_disposition() !=
-            DirectUrmaCloseDisposition::kPreLaunchRetryable ||
+            DirectUrmaCloseDisposition::kAivShutdownPreLaunchRetryable ||
         kvaf_fake_acl_close_launches() != 0) {
       return Fail("safe pre-launch copy failure was misclassified");
     }
@@ -225,7 +267,7 @@ int main(int argc, char** argv) {
   }
 
   if (scenario == "close_queue_not_drained" ||
-      scenario == "close_launch_failure") {
+      scenario == "owner_join_sync_twice") {
     if (resources.Close().ok() ||
         resources.transport_teardown_complete() ||
         resources.transport_teardown_retryable() ||
@@ -235,8 +277,7 @@ int main(int argc, char** argv) {
             DirectUrmaCloseDisposition::kUnsafeUnknown) {
       return Fail("ambiguous pre-provider Close was not marked unsafe");
     }
-    const int expected_launches =
-        scenario == "close_launch_failure" ? 1 : 0;
+    const int expected_launches = 1;
     if (kvaf_fake_acl_close_launches() != expected_launches ||
         resources.Close().ok() ||
         kvaf_fake_acl_close_launches() != expected_launches) {
@@ -245,14 +286,16 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  if (scenario == "close_unsafe") {
+  if (scenario == "close_unsafe" ||
+      scenario == "close_terminal_incomplete" ||
+      scenario == "close_command_reserved_nonzero") {
     if (resources.Close().ok() ||
         resources.transport_teardown_complete() ||
         resources.transport_teardown_retryable() ||
         kvaf_fake_acl_close_launches() != 1 ||
         resources.close_disposition() !=
             DirectUrmaCloseDisposition::kUnsafeUnknown) {
-      return Fail("unsafe provider Close was not retained as unknown");
+      return Fail("incomplete epoch teardown proof was not retained");
     }
     if (resources.Close().ok() ||
         kvaf_fake_acl_close_launches() != 1) {
@@ -296,14 +339,14 @@ int main(int argc, char** argv) {
     }
     if (!resources.Close().ok() ||
         kvaf_fake_acl_close_launches() != 1 ||
-        kvaf_fake_acl_destroy_stream_calls() != 2) {
+        kvaf_fake_acl_destroy_stream_calls() != 3) {
       return Fail("stream destroy retry repeated provider teardown");
     }
     return 0;
   }
 
   if (scenario == "sync_retry") {
-    if (!resources.Close().ok() || kvaf_fake_acl_sync_calls() != 3 ||
+    if (!resources.Close().ok() || kvaf_fake_acl_sync_calls() != 4 ||
         kvaf_fake_acl_close_launches() != 1) {
       return Fail("bounded stream sync retry did not converge");
     }

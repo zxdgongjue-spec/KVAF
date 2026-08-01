@@ -44,85 +44,88 @@ __aicore__ inline void SetDescriptorFailureAiv(
 
 __simt_vf__ __launch_bounds__(kAivUrmaSimtLanes) inline void
 BuildH2DDescriptorsSimt(__gm__ const DeviceBatchGetParams* params) {
-  const std::uint32_t request = threadIdx.x;
-  if (request >= params->entry_count) {
-    return;
-  }
-
   auto* descriptors = reinterpret_cast<__gm__ UrmaH2DDescriptor*>(
       params->descriptors);
-  __gm__ UrmaH2DDescriptor* descriptor = &descriptors[request];
-  descriptor->abi_version = kAivUrmaAbiVersion;
-  descriptor->state = static_cast<std::uint32_t>(TransferState::kEmpty);
-  descriptor->logical_index = request;
-  descriptor->flags = 0;
-  descriptor->remote_addr = 0;
-  descriptor->local_addr = 0;
-  descriptor->bytes = 0;
-  descriptor->generation = params->generation;
-  descriptor->status =
-      static_cast<std::uint32_t>(DeviceBatchStatus::kOk);
-  descriptor->reserved0 = 0;
-  descriptor->user_tag = request;
+  // entry_count is a runtime workload dimension and may be much larger than
+  // the fixed SIMT lane count.  Each lane therefore owns a strided subset;
+  // one asc_vf_call still plans the complete batch.
+  for (std::uint32_t request = threadIdx.x;
+       request < params->entry_count;
+       request += kAivUrmaSimtLanes) {
+    __gm__ UrmaH2DDescriptor* descriptor = &descriptors[request];
+    descriptor->abi_version = kAivUrmaAbiVersion;
+    descriptor->state = static_cast<std::uint32_t>(TransferState::kEmpty);
+    descriptor->logical_index = request;
+    descriptor->flags = 0;
+    descriptor->remote_addr = 0;
+    descriptor->local_addr = 0;
+    descriptor->bytes = 0;
+    descriptor->generation = params->generation;
+    descriptor->status =
+        static_cast<std::uint32_t>(DeviceBatchStatus::kOk);
+    descriptor->reserved0 = 0;
+    descriptor->user_tag = request;
 
-  if (params->mask != 0) {
-    auto* mask = reinterpret_cast<__gm__ const std::uint8_t*>(params->mask);
-    if (mask[request] == 0) {
-      descriptor->state =
-          static_cast<std::uint32_t>(TransferState::kSkipped);
-      return;
+    if (params->mask != 0) {
+      auto* mask =
+          reinterpret_cast<__gm__ const std::uint8_t*>(params->mask);
+      if (mask[request] == 0) {
+        descriptor->state =
+            static_cast<std::uint32_t>(TransferState::kSkipped);
+        continue;
+      }
     }
-  }
 
-  auto* indices =
-      reinterpret_cast<__gm__ const std::uint32_t*>(params->indices);
-  const std::uint32_t table_index = indices[request];
-  if (table_index >= params->table.capacity) {
-    SetDescriptorFailure(descriptor,
-                         DeviceBatchStatus::kIndexOutOfRange);
-    return;
-  }
-
-  if (params->table.valid != 0) {
-    auto* valid =
-        reinterpret_cast<__gm__ const std::uint8_t*>(params->table.valid);
-    if (valid[table_index] == 0) {
-      SetDescriptorFailure(
-          descriptor, DeviceBatchStatus::kAccessTableEntryInvalid);
-      return;
+    auto* indices =
+        reinterpret_cast<__gm__ const std::uint32_t*>(params->indices);
+    const std::uint32_t table_index = indices[request];
+    if (table_index >= params->table.capacity) {
+      SetDescriptorFailure(descriptor,
+                           DeviceBatchStatus::kIndexOutOfRange);
+      continue;
     }
-  }
 
-  auto* remote_addresses = reinterpret_cast<__gm__ const std::uint64_t*>(
-      params->table.remote_addresses);
-  auto* lengths = reinterpret_cast<__gm__ const std::uint64_t*>(
-      params->table.lengths);
-  auto* output_offsets = reinterpret_cast<__gm__ const std::uint64_t*>(
-      params->output_offsets);
-  const std::uint64_t remote = remote_addresses[table_index];
-  const std::uint64_t bytes = lengths[table_index];
-  const std::uint64_t output_offset = output_offsets[request];
-  const std::uint64_t local_address = params->output_base + output_offset;
+    if (params->table.valid != 0) {
+      auto* valid =
+          reinterpret_cast<__gm__ const std::uint8_t*>(params->table.valid);
+      if (valid[table_index] == 0) {
+        SetDescriptorFailure(
+            descriptor, DeviceBatchStatus::kAccessTableEntryInvalid);
+        continue;
+      }
+    }
 
-  if (remote == 0 || bytes == 0 || bytes > kAivUrmaMaxTransferBytes ||
-      remote + bytes < remote) {
-    SetDescriptorFailure(descriptor,
-                         DeviceBatchStatus::kRemoteRangeInvalid);
-    return;
-  }
-  if (output_offset > params->output_bytes ||
-      bytes > params->output_bytes - output_offset ||
-      local_address < params->output_base ||
-      bytes > ~static_cast<std::uint64_t>(0) - local_address) {
-    SetDescriptorFailure(descriptor,
-                         DeviceBatchStatus::kOutputRangeInvalid);
-    return;
-  }
+    auto* remote_addresses = reinterpret_cast<__gm__ const std::uint64_t*>(
+        params->table.remote_addresses);
+    auto* lengths = reinterpret_cast<__gm__ const std::uint64_t*>(
+        params->table.lengths);
+    auto* output_offsets = reinterpret_cast<__gm__ const std::uint64_t*>(
+        params->output_offsets);
+    const std::uint64_t remote = remote_addresses[table_index];
+    const std::uint64_t bytes = lengths[table_index];
+    const std::uint64_t output_offset = output_offsets[request];
+    const std::uint64_t local_address = params->output_base + output_offset;
 
-  descriptor->remote_addr = remote;
-  descriptor->local_addr = local_address;
-  descriptor->bytes = bytes;
-  descriptor->state = static_cast<std::uint32_t>(TransferState::kReady);
+    if (remote == 0 || bytes == 0 || bytes > kAivUrmaMaxTransferBytes ||
+        remote + bytes < remote) {
+      SetDescriptorFailure(descriptor,
+                           DeviceBatchStatus::kRemoteRangeInvalid);
+      continue;
+    }
+    if (output_offset > params->output_bytes ||
+        bytes > params->output_bytes - output_offset ||
+        local_address < params->output_base ||
+        bytes > ~static_cast<std::uint64_t>(0) - local_address) {
+      SetDescriptorFailure(descriptor,
+                           DeviceBatchStatus::kOutputRangeInvalid);
+      continue;
+    }
+
+    descriptor->remote_addr = remote;
+    descriptor->local_addr = local_address;
+    descriptor->bytes = bytes;
+    descriptor->state = static_cast<std::uint32_t>(TransferState::kReady);
+  }
 }
 
 __aicore__ inline void SetCompletionFailure(
@@ -193,6 +196,260 @@ __aicore__ inline void PublishOwnerProbeAivResult(
   // Status is the commit field for the Host-side result validation.
   result->status = static_cast<std::uint32_t>(status);
   CleanProbeCacheLine(reinterpret_cast<std::uint64_t>(result));
+}
+
+__aicore__ inline void InvalidateGlobalCacheRange(
+    std::uint64_t address, std::uint64_t bytes) {
+  for (std::uint64_t offset = 0; offset < bytes;
+       offset += AscendC::CACHE_LINE_SIZE) {
+    InvalidateGlobalCacheLine(address + offset);
+  }
+}
+
+__aicore__ inline void PublishEpochOwnerAivResult(
+    __gm__ AicpuEpochOwnerAivResult* result,
+    AicpuEpochOwnerAivStatus status, std::uint64_t epoch,
+    std::uint64_t session_id, std::uint32_t owner_state,
+    std::uint32_t poll_count, std::uint64_t sequence,
+    std::uint32_t sq_head = 0, std::uint32_t sq_tail = 0,
+    std::uint32_t cq_tail = 0, std::uint32_t wqe_count = 0) {
+  result->magic = kAicpuEpochOwnerAivResultMagic;
+  result->abi_version = kAicpuEpochOwnerAivResultAbiVersion;
+  result->struct_size = sizeof(AicpuEpochOwnerAivResult);
+  result->epoch = epoch;
+  result->session_id = session_id;
+  result->observed_owner_state = owner_state;
+  result->poll_count = poll_count;
+  result->observed_sq_head = sq_head;
+  result->observed_sq_tail = sq_tail;
+  result->observed_cq_tail = cq_tail;
+  result->observed_wqe_count = wqe_count;
+  result->observed_sequence = sequence;
+  result->status = static_cast<std::uint32_t>(status);
+  CleanProbeCacheLine(reinterpret_cast<std::uint64_t>(result));
+}
+
+__aicore__ inline bool EpochOwnerStatusIdentityIsValid(
+    __gm__ const kvaf_urma_epoch_owner_status_v1* owner_status,
+    std::uint64_t epoch, std::uint64_t session_id) {
+  return owner_status->magic == KVAF_URMA_EPOCH_OWNER_MAGIC &&
+         owner_status->abi_version ==
+             KVAF_URMA_EPOCH_OWNER_ABI_VERSION &&
+         owner_status->struct_size == sizeof(*owner_status) &&
+         owner_status->epoch == epoch &&
+         owner_status->session_id == session_id;
+}
+
+__aicore__ inline bool EpochOwnerStateIsTerminal(std::uint32_t state) {
+  return state == KVAF_URMA_EPOCH_OWNER_STATE_CLOSING ||
+         state == KVAF_URMA_EPOCH_OWNER_STATE_CLOSE_RETRYING ||
+         state == KVAF_URMA_EPOCH_OWNER_STATE_CLOSED ||
+         state == KVAF_URMA_EPOCH_OWNER_STATE_OPEN_FAILED_SAFE;
+}
+
+extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void
+KvafAivEpochOwnerWaitReadyKernel(
+    __gm__ const kvaf_urma_epoch_owner_status_v1* owner_status,
+    __gm__ const kvaf_urma_provider_result_v2* open_result,
+    __gm__ AicpuEpochOwnerAivResult* aiv_result,
+    std::uint64_t epoch, std::uint64_t session_id,
+    std::uint32_t max_polls) {
+  if (owner_status == nullptr || open_result == nullptr ||
+      aiv_result == nullptr || epoch == 0 || session_id == 0 ||
+      max_polls == 0) {
+    if (aiv_result != nullptr) {
+      PublishEpochOwnerAivResult(
+          aiv_result, AicpuEpochOwnerAivStatus::kInvalidOwnerStatus,
+          epoch, session_id, 0, 0, 0);
+    }
+    return;
+  }
+
+  for (std::uint32_t poll = 0; poll < max_polls; ++poll) {
+    const std::uint32_t observed_polls = poll + 1U;
+    InvalidateGlobalCacheLine(
+        reinterpret_cast<std::uint64_t>(owner_status));
+    const std::uint32_t state = owner_status->state;
+    if (state == KVAF_URMA_EPOCH_OWNER_STATE_EMPTY) {
+      continue;
+    }
+    if (!EpochOwnerStatusIdentityIsValid(
+            owner_status, epoch, session_id)) {
+      PublishEpochOwnerAivResult(
+          aiv_result, AicpuEpochOwnerAivStatus::kInvalidOwnerStatus,
+          epoch, session_id, state, observed_polls,
+          owner_status->sequence);
+      return;
+    }
+    if (state == KVAF_URMA_EPOCH_OWNER_STATE_READY) {
+      const std::uint32_t required_flags =
+          KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+          KVAF_URMA_EPOCH_OWNER_PROVIDER_ACTIVE;
+      InvalidateGlobalCacheRange(
+          reinterpret_cast<std::uint64_t>(open_result),
+          sizeof(*open_result));
+      if (owner_status->result_code !=
+              KVAF_URMA_EPOCH_OWNER_RESULT_OK ||
+          (owner_status->flags & required_flags) != required_flags ||
+          open_result->magic != KVAF_URMA_PROVIDER_MAGIC ||
+          open_result->abi_version != KVAF_URMA_PROVIDER_ABI_VERSION ||
+          open_result->struct_size != sizeof(*open_result) ||
+          open_result->status != KVAF_URMA_PROVIDER_OK ||
+          open_result->provider_status != 0 ||
+          open_result->session_id != session_id) {
+        PublishEpochOwnerAivResult(
+            aiv_result, AicpuEpochOwnerAivStatus::kInvalidOwnerStatus,
+            epoch, session_id, state, observed_polls,
+            owner_status->sequence);
+        return;
+      }
+      PublishEpochOwnerAivResult(
+          aiv_result, AicpuEpochOwnerAivStatus::kReadyObserved,
+          epoch, session_id, state, observed_polls,
+          owner_status->sequence);
+      return;
+    }
+    if (EpochOwnerStateIsTerminal(state) ||
+        state == KVAF_URMA_EPOCH_OWNER_STATE_UNSAFE_WAITING) {
+      PublishEpochOwnerAivResult(
+          aiv_result, AicpuEpochOwnerAivStatus::kOwnerTerminal,
+          epoch, session_id, state, observed_polls,
+          owner_status->sequence);
+      return;
+    }
+  }
+
+  InvalidateGlobalCacheLine(
+      reinterpret_cast<std::uint64_t>(owner_status));
+  PublishEpochOwnerAivResult(
+      aiv_result, AicpuEpochOwnerAivStatus::kTimedOut,
+      epoch, session_id, owner_status->state, max_polls,
+      owner_status->sequence);
+}
+
+extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void
+KvafAivEpochOwnerShutdownKernel(
+    __gm__ kvaf_urma_epoch_owner_command_v1* command,
+    __gm__ const kvaf_urma_epoch_owner_status_v1* owner_status,
+    __gm__ AicpuEpochOwnerAivResult* aiv_result,
+    std::uint64_t packed_sq_head_address,
+    std::uint64_t sq_tail_address, std::uint64_t cq_tail_address,
+    std::uint64_t epoch, std::uint64_t session_id,
+    std::uint32_t max_polls) {
+  if (command == nullptr || owner_status == nullptr ||
+      aiv_result == nullptr || packed_sq_head_address == 0 ||
+      sq_tail_address == 0 || cq_tail_address == 0 || epoch == 0 ||
+      session_id == 0 || max_polls == 0 ||
+      packed_sq_head_address % alignof(std::uint64_t) != 0 ||
+      sq_tail_address % alignof(std::uint32_t) != 0 ||
+      cq_tail_address % alignof(std::uint32_t) != 0) {
+    if (aiv_result != nullptr) {
+      PublishEpochOwnerAivResult(
+          aiv_result, AicpuEpochOwnerAivStatus::kInvalidOwnerStatus,
+          epoch, session_id, 0, 0, 0);
+    }
+    return;
+  }
+
+  for (std::uint32_t poll = 0; poll < max_polls; ++poll) {
+    const std::uint32_t observed_polls = poll + 1U;
+    InvalidateGlobalCacheLine(
+        reinterpret_cast<std::uint64_t>(owner_status));
+    const std::uint32_t state = owner_status->state;
+    // The control stream is intentionally independent from the AICPU owner
+    // stream, so it may run before the owner has replaced the Host-initialized
+    // all-zero status line.  EMPTY exposes no resource and is the only state
+    // for which an incomplete identity header is expected.  Once the owner
+    // publishes OPENING (or any later state), the release publication must
+    // make the complete epoch/session header visible and a mismatch is fatal.
+    if (state == KVAF_URMA_EPOCH_OWNER_STATE_EMPTY) {
+      continue;
+    }
+    if (!EpochOwnerStatusIdentityIsValid(
+            owner_status, epoch, session_id)) {
+      PublishEpochOwnerAivResult(
+          aiv_result, AicpuEpochOwnerAivStatus::kInvalidOwnerStatus,
+          epoch, session_id, state, observed_polls,
+          owner_status->sequence);
+      return;
+    }
+    const bool accepts_shutdown =
+        state == KVAF_URMA_EPOCH_OWNER_STATE_READY ||
+        state == KVAF_URMA_EPOCH_OWNER_STATE_UNSAFE_WAITING;
+    if (accepts_shutdown) {
+      const std::uint32_t required_flags =
+          KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+          KVAF_URMA_EPOCH_OWNER_PROVIDER_ACTIVE;
+      if ((owner_status->flags & required_flags) != required_flags) {
+        PublishEpochOwnerAivResult(
+            aiv_result, AicpuEpochOwnerAivStatus::kInvalidOwnerStatus,
+            epoch, session_id, state, observed_polls,
+            owner_status->sequence);
+        return;
+      }
+
+      InvalidateGlobalCacheLine(packed_sq_head_address);
+      InvalidateGlobalCacheLine(sq_tail_address);
+      InvalidateGlobalCacheLine(cq_tail_address);
+      const std::uint64_t packed_sq_head =
+          *reinterpret_cast<__gm__ const std::uint64_t*>(
+              packed_sq_head_address);
+      const std::uint32_t sq_head =
+          static_cast<std::uint32_t>(packed_sq_head);
+      const std::uint32_t wqe_count =
+          static_cast<std::uint32_t>(packed_sq_head >> 32U);
+      const std::uint32_t sq_tail =
+          *reinterpret_cast<__gm__ const std::uint32_t*>(sq_tail_address);
+      const std::uint32_t cq_tail =
+          *reinterpret_cast<__gm__ const std::uint32_t*>(cq_tail_address);
+      if (sq_head != sq_tail || sq_tail != cq_tail ||
+          cq_tail != wqe_count) {
+        PublishEpochOwnerAivResult(
+            aiv_result, AicpuEpochOwnerAivStatus::kQueueNotQuiesced,
+            epoch, session_id, state, observed_polls,
+            owner_status->sequence, sq_head, sq_tail, cq_tail,
+            wqe_count);
+        return;
+      }
+
+      command->magic = KVAF_URMA_EPOCH_OWNER_MAGIC;
+      command->abi_version = KVAF_URMA_EPOCH_OWNER_ABI_VERSION;
+      command->struct_size = sizeof(*command);
+      command->epoch = epoch;
+      command->session_id = session_id;
+      command->sequence = KVAF_URMA_EPOCH_OWNER_SHUTDOWN_SEQUENCE;
+      command->final_sq_head = sq_head;
+      command->final_sq_tail = sq_tail;
+      command->final_cq_tail = cq_tail;
+      command->final_wqe_count = wqe_count;
+      command->reserved[0] = 0;
+      AscendC::PipeBarrier<PIPE_ALL>();
+      command->opcode =
+          KVAF_URMA_EPOCH_OWNER_COMMAND_SHUTDOWN_QUIESCED;
+      CleanProbeCacheLine(reinterpret_cast<std::uint64_t>(command));
+      PublishEpochOwnerAivResult(
+          aiv_result, AicpuEpochOwnerAivStatus::kShutdownSubmitted,
+          epoch, session_id, state, observed_polls,
+          KVAF_URMA_EPOCH_OWNER_SHUTDOWN_SEQUENCE,
+          sq_head, sq_tail, cq_tail,
+          wqe_count);
+      return;
+    }
+    if (EpochOwnerStateIsTerminal(state)) {
+      PublishEpochOwnerAivResult(
+          aiv_result, AicpuEpochOwnerAivStatus::kOwnerTerminal,
+          epoch, session_id, state, observed_polls,
+          owner_status->sequence);
+      return;
+    }
+  }
+
+  InvalidateGlobalCacheLine(
+      reinterpret_cast<std::uint64_t>(owner_status));
+  PublishEpochOwnerAivResult(
+      aiv_result, AicpuEpochOwnerAivStatus::kTimedOut,
+      epoch, session_id, owner_status->state, max_polls,
+      owner_status->sequence);
 }
 
 // This kernel deliberately performs no URMA/EID/topology operation.  Its only
@@ -382,6 +639,7 @@ __aicore__ inline std::uint32_t PollDirectCq(
     __ubuf__ std::uint32_t* cqe_words,
     std::uint32_t expected_tail) {
   std::uint32_t current_tail = channel->cq_tail;
+  std::uint32_t first_error = 0;
   while (current_tail != expected_tail) {
     const std::uint64_t cqe_address =
         channel->cq_base +
@@ -419,8 +677,11 @@ __aicore__ inline std::uint32_t PollDirectCq(
         (cqe_words[0] >> 16U) & 0xffU;
     const std::uint32_t status =
         (cqe_words[0] >> 24U) & 0xffU;
-    if (status != 0 || substatus != 0) {
-      return (status << 8U) | substatus;
+    if ((status != 0 || substatus != 0) && first_error == 0) {
+      // A CQE with an error is still a completed/consumable CQE.  Remember
+      // the first error but continue draining the complete submitted wave so
+      // teardown never inherits avoidable outstanding work.
+      first_error = (status << 8U) | substatus;
     }
     ++current_tail;
   }
@@ -438,7 +699,7 @@ __aicore__ inline std::uint32_t PollDirectCq(
          reinterpret_cast<__gm__ std::uint32_t*>(
              channel->sq_tail_address),
          0);
-  return 0;
+  return first_error;
 }
 
 extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void
@@ -526,6 +787,20 @@ KvafAivSimtUrmaH2DKernel(
         kNoFailedIndex);
     return;
   }
+  // Queue counters are absolute uint32 values.  Never allow one batch to
+  // cross the rollover boundary: all-or-nothing validation must happen before
+  // the first WQE is visible.  A higher layer rebuilds the transport epoch
+  // when this explicit rollover guard trips.
+  constexpr std::uint32_t kMaxQueueCounter =
+      ~static_cast<std::uint32_t>(0);
+  if (ready_count > kMaxQueueCounter - direct_channel->sq_head ||
+      ready_count > kMaxQueueCounter - direct_channel->wqe_count ||
+      ready_count > kMaxQueueCounter - direct_channel->cq_tail) {
+    SetCompletionFailure(
+        completion, DeviceBatchStatus::kDirectCounterOverflow,
+        kNoFailedIndex);
+    return;
+  }
 
   // Preflight every descriptor against the exact local and remote MRs before
   // ringing the first SQ doorbell. This preserves the planner's no-submit-on-
@@ -570,27 +845,63 @@ KvafAivSimtUrmaH2DKernel(
 
   completion->state =
       static_cast<std::uint32_t>(DeviceBatchState::kSubmitting);
-  for (std::uint32_t request = 0; request < params->entry_count; ++request) {
-    __gm__ UrmaH2DDescriptor* descriptor = &descriptors[request];
-    if (descriptor->state !=
-        static_cast<std::uint32_t>(TransferState::kReady)) {
-      continue;
+  const std::uint32_t wave_capacity =
+      direct_channel->sq_depth < direct_channel->cq_depth
+          ? direct_channel->sq_depth
+          : direct_channel->cq_depth;
+  std::uint32_t request_cursor = 0;
+  while (completion->completed_count < ready_count) {
+    const std::uint32_t wave_first = request_cursor;
+    std::uint32_t wave_submitted = 0;
+    std::uint32_t first_submitted = kNoFailedIndex;
+    while (request_cursor < params->entry_count &&
+           wave_submitted < wave_capacity) {
+      __gm__ UrmaH2DDescriptor* descriptor =
+          &descriptors[request_cursor];
+      if (descriptor->state ==
+          static_cast<std::uint32_t>(TransferState::kReady)) {
+        if (!PostDirectRead(
+                direct_channel, wqe_tensor, wqe_words,
+                descriptor->remote_addr, descriptor->local_addr,
+                static_cast<std::uint32_t>(descriptor->bytes))) {
+          // The capacity calculation makes this path unreachable without an
+          // externally corrupted queue state.  If earlier WQEs in this wave
+          // were already posted, drain them before reporting the corruption.
+          const std::uint32_t drain_result =
+              wave_submitted == 0
+                  ? 0
+                  : PollDirectCq(
+                        direct_channel, cqe_tensor, cqe_words,
+                        direct_channel->wqe_count);
+          const DeviceBatchStatus status =
+              drain_result == kUrmaCqTimeout
+                  ? DeviceBatchStatus::kDirectCqTimeout
+                  : (drain_result != 0
+                         ? DeviceBatchStatus::kDirectCqError
+                         : DeviceBatchStatus::kDirectChannelInvalid);
+          SetDescriptorFailureAiv(descriptor, status, drain_result);
+          SetCompletionFailure(
+              completion, status, request_cursor, drain_result);
+          return;
+        }
+        if (first_submitted == kNoFailedIndex) {
+          first_submitted = request_cursor;
+        }
+        descriptor->state =
+            static_cast<std::uint32_t>(TransferState::kSubmitted);
+        ++completion->submitted_count;
+        ++wave_submitted;
+      }
+      ++request_cursor;
     }
 
-    if (!PostDirectRead(
-            direct_channel, wqe_tensor, wqe_words,
-            descriptor->remote_addr, descriptor->local_addr,
-            static_cast<std::uint32_t>(descriptor->bytes))) {
-      SetDescriptorFailureAiv(
-          descriptor, DeviceBatchStatus::kDirectChannelInvalid);
+    if (wave_submitted == 0) {
       SetCompletionFailure(
-          completion, DeviceBatchStatus::kDirectChannelInvalid, request);
+          completion, DeviceBatchStatus::kDirectChannelInvalid,
+          kNoFailedIndex);
       return;
     }
-    descriptor->state =
-        static_cast<std::uint32_t>(TransferState::kSubmitted);
-    ++completion->submitted_count;
-
+    ++completion->reserved[0];
     const std::uint32_t cq_result = PollDirectCq(
         direct_channel, cqe_tensor, cqe_words,
         direct_channel->wqe_count);
@@ -599,13 +910,28 @@ KvafAivSimtUrmaH2DKernel(
           cq_result == kUrmaCqTimeout
               ? DeviceBatchStatus::kDirectCqTimeout
               : DeviceBatchStatus::kDirectCqError;
-      SetDescriptorFailureAiv(descriptor, status, cq_result);
-      SetCompletionFailure(completion, status, request, cq_result);
+      for (std::uint32_t request = wave_first;
+           request < request_cursor; ++request) {
+        __gm__ UrmaH2DDescriptor* descriptor = &descriptors[request];
+        if (descriptor->state ==
+            static_cast<std::uint32_t>(TransferState::kSubmitted)) {
+          SetDescriptorFailureAiv(descriptor, status, cq_result);
+        }
+      }
+      SetCompletionFailure(
+          completion, status, first_submitted, cq_result);
       return;
     }
-    descriptor->state =
-        static_cast<std::uint32_t>(TransferState::kComplete);
-    ++completion->completed_count;
+    for (std::uint32_t request = wave_first;
+         request < request_cursor; ++request) {
+      __gm__ UrmaH2DDescriptor* descriptor = &descriptors[request];
+      if (descriptor->state ==
+          static_cast<std::uint32_t>(TransferState::kSubmitted)) {
+        descriptor->state =
+            static_cast<std::uint32_t>(TransferState::kComplete);
+        ++completion->completed_count;
+      }
+    }
   }
 
   completion->state =
@@ -630,6 +956,30 @@ void LaunchAicpuOwnerConcurrencyProbe(
       static_cast<kvaf_urma_owner_probe_command_v1*>(command),
       static_cast<const kvaf_urma_owner_probe_status_v1*>(status), result,
       session_id, max_ready_polls);
+}
+
+void LaunchAivEpochOwnerWaitReady(
+    void* stream, const void* owner_status, const void* open_result,
+    AicpuEpochOwnerAivResult* aiv_result, std::uint64_t epoch,
+    std::uint64_t session_id, std::uint32_t max_polls) {
+  KvafAivEpochOwnerWaitReadyKernel<<<1, nullptr, stream>>>(
+      static_cast<const kvaf_urma_epoch_owner_status_v1*>(owner_status),
+      static_cast<const kvaf_urma_provider_result_v2*>(open_result),
+      aiv_result, epoch, session_id, max_polls);
+}
+
+void LaunchAivEpochOwnerShutdown(
+    void* stream, void* command, const void* owner_status,
+    AicpuEpochOwnerAivResult* aiv_result,
+    std::uint64_t packed_sq_head_address,
+    std::uint64_t sq_tail_address, std::uint64_t cq_tail_address,
+    std::uint64_t epoch, std::uint64_t session_id,
+    std::uint32_t max_polls) {
+  KvafAivEpochOwnerShutdownKernel<<<1, nullptr, stream>>>(
+      static_cast<kvaf_urma_epoch_owner_command_v1*>(command),
+      static_cast<const kvaf_urma_epoch_owner_status_v1*>(owner_status),
+      aiv_result, packed_sq_head_address, sq_tail_address,
+      cq_tail_address, epoch, session_id, max_polls);
 }
 
 }  // namespace kvaf::access::a5

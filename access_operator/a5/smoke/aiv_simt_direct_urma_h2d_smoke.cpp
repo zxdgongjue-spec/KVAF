@@ -49,7 +49,11 @@ using kvaf::access::a5::HostDdrDeviceMapping;
 constexpr std::uint8_t kCanary = 0xa5;
 constexpr std::uint64_t kCanaryBytes = 64;
 constexpr std::uint64_t kProviderPageBytes = 4096;
-constexpr std::uint64_t kSmokeMaxTransferBytes = 64ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kSmokeMaxBatchBytes = 64ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kSmokeTransferAlignmentBytes = 64;
+constexpr std::uint32_t kDefaultTransferCount = 4096;
+constexpr std::uint32_t kDefaultDescriptorCapacity = 4096;
+constexpr std::uint64_t kDefaultBytesPerTransfer = 1024;
 constexpr auto kTerminalMarkerRetryInterval =
     std::chrono::milliseconds(100);
 constexpr auto kTerminalMarkerWarningInterval =
@@ -96,7 +100,17 @@ struct Options {
   std::uint32_t logical_device_id{0};
   std::uint32_t control_port{21115};
   std::uint32_t timeout_seconds{120};
-  std::uint64_t bytes{4096};
+  std::uint32_t transfer_count{kDefaultTransferCount};
+  std::uint32_t descriptor_capacity{kDefaultDescriptorCapacity};
+  std::uint64_t bytes_per_transfer{kDefaultBytesPerTransfer};
+  std::uint32_t batch_iterations{1};
+  std::uint64_t total_bytes{
+      static_cast<std::uint64_t>(kDefaultTransferCount) *
+      kDefaultBytesPerTransfer};
+  std::uint64_t capacity_bytes{
+      static_cast<std::uint64_t>(kDefaultDescriptorCapacity) *
+      kDefaultBytesPerTransfer};
+  bool legacy_total_bytes{false};
 };
 
 std::uint8_t Pattern(std::uint64_t index) {
@@ -192,11 +206,11 @@ bool RegistrationBytes(const Options& options,
                        std::uint64_t* payload_bytes,
                        std::uint64_t* registration_bytes) {
   if (payload_bytes == nullptr || registration_bytes == nullptr ||
-      options.bytes >
+      options.capacity_bytes >
           std::numeric_limits<std::uint64_t>::max() - kCanaryBytes) {
     return false;
   }
-  *payload_bytes = options.bytes + kCanaryBytes;
+  *payload_bytes = options.capacity_bytes + kCanaryBytes;
   std::uint64_t half =
       std::max(*payload_bytes, kProviderPageBytes);
   const std::uint64_t remainder = half % kProviderPageBytes;
@@ -224,7 +238,10 @@ void PrintUsage(const char* program) {
          " --provider-library ABS_PATH --provider-soname NAME"
          " --exchange-dir PATH --run-id HEX32_OR_LONGER"
          " [--logical-device-id N]"
-         " [--control-port N] [--bytes N]"
+         " [--control-port N]"
+         " [--transfer-count N] [--descriptor-capacity N]"
+         " [--bytes-per-transfer N] [--batch-iterations N]"
+         " [--bytes LEGACY_TOTAL_BYTES]"
          " [--timeout-seconds N]\n";
 }
 
@@ -234,6 +251,12 @@ bool ParseOptions(int argc, char** argv, Options* options) {
   }
   std::string host_eid;
   std::string device_eid;
+  bool transfer_count_seen = false;
+  bool descriptor_capacity_seen = false;
+  bool bytes_per_transfer_seen = false;
+  bool batch_iterations_seen = false;
+  bool legacy_bytes_seen = false;
+  std::uint64_t legacy_bytes = 0;
   for (int index = 1; index < argc; index += 2) {
     if (index + 1 >= argc) {
       return false;
@@ -284,13 +307,65 @@ bool ParseOptions(int argc, char** argv, Options* options) {
                    std::numeric_limits<std::uint32_t>::max() / 1000U) {
       options->timeout_seconds =
           static_cast<std::uint32_t>(parsed);
-    } else if (key == "--bytes" && parsed != 0 &&
-               parsed <= kSmokeMaxTransferBytes) {
-      options->bytes = parsed;
+    } else if (key == "--transfer-count" && !transfer_count_seen &&
+               parsed <= kvaf::access::kAivUrmaMaxDescriptors) {
+      options->transfer_count = static_cast<std::uint32_t>(parsed);
+      transfer_count_seen = true;
+    } else if (key == "--descriptor-capacity" &&
+               !descriptor_capacity_seen && parsed != 0 &&
+               parsed <= kvaf::access::kAivUrmaMaxDescriptors) {
+      options->descriptor_capacity = static_cast<std::uint32_t>(parsed);
+      descriptor_capacity_seen = true;
+    } else if (key == "--bytes-per-transfer" &&
+               !bytes_per_transfer_seen && parsed != 0 &&
+               parsed <= kvaf::access::kAivUrmaMaxTransferBytes) {
+      options->bytes_per_transfer = parsed;
+      bytes_per_transfer_seen = true;
+    } else if (key == "--batch-iterations" && !batch_iterations_seen &&
+               parsed != 0 &&
+               parsed <= std::numeric_limits<std::uint32_t>::max()) {
+      options->batch_iterations = static_cast<std::uint32_t>(parsed);
+      batch_iterations_seen = true;
+    } else if (key == "--bytes" && !legacy_bytes_seen && parsed != 0 &&
+               parsed <= kSmokeMaxBatchBytes) {
+      legacy_bytes = parsed;
+      legacy_bytes_seen = true;
     } else {
       return false;
     }
   }
+  if (legacy_bytes_seen &&
+      (transfer_count_seen || descriptor_capacity_seen ||
+       bytes_per_transfer_seen || batch_iterations_seen)) {
+    std::cerr << "--bytes is legacy total-byte mode and cannot be mixed with "
+                 "the batch workload options\n";
+    return false;
+  }
+  if (legacy_bytes_seen) {
+    options->transfer_count = 1;
+    options->descriptor_capacity = 1;
+    options->bytes_per_transfer = legacy_bytes;
+    options->batch_iterations = 1;
+    options->legacy_total_bytes = true;
+  }
+  if (options->transfer_count > options->descriptor_capacity ||
+      (options->transfer_count != 0 &&
+       options->bytes_per_transfer >
+           kSmokeMaxBatchBytes / options->transfer_count) ||
+      options->bytes_per_transfer >
+          kSmokeMaxBatchBytes / options->descriptor_capacity ||
+      (options->transfer_count != 0 &&
+       options->batch_iterations >
+           std::numeric_limits<std::uint32_t>::max() /
+               options->transfer_count)) {
+    return false;
+  }
+  options->total_bytes =
+      static_cast<std::uint64_t>(options->transfer_count) *
+      options->bytes_per_transfer;
+  options->capacity_bytes =
+      static_cast<std::uint64_t>(options->descriptor_capacity) *
+      options->bytes_per_transfer;
   const bool valid_run_id =
       options->run_id.size() >= 32 &&
       options->run_id.size() <= 128 &&
@@ -832,6 +907,11 @@ DirectUrmaOpenSpec MakeDeviceOpenSpec(
 
 template <typename T>
 bool AllocateDevice(std::size_t count, T** pointer) {
+  if (pointer == nullptr || count == 0 ||
+      count > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+    std::cerr << "invalid or overflowing device allocation count\n";
+    return false;
+  }
   return CheckAcl(
       aclrtMalloc(reinterpret_cast<void**>(pointer),
                   count * sizeof(T), ACL_MEM_MALLOC_HUGE_FIRST),
@@ -841,6 +921,11 @@ bool AllocateDevice(std::size_t count, T** pointer) {
 template <typename T>
 bool CopyHostToDevice(T* destination, const T* source,
                       std::size_t count) {
+  if (destination == nullptr || source == nullptr || count == 0 ||
+      count > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+    std::cerr << "invalid or overflowing Host-to-Device copy count\n";
+    return false;
+  }
   return CheckAcl(
       aclrtMemcpy(destination, count * sizeof(T), source,
                   count * sizeof(T), ACL_MEMCPY_HOST_TO_DEVICE),
@@ -850,6 +935,11 @@ bool CopyHostToDevice(T* destination, const T* source,
 template <typename T>
 bool CopyDeviceToHost(T* destination, const T* source,
                       std::size_t count) {
+  if (destination == nullptr || source == nullptr || count == 0 ||
+      count > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+    std::cerr << "invalid or overflowing Device-to-Host copy count\n";
+    return false;
+  }
   return CheckAcl(
       aclrtMemcpy(destination, count * sizeof(T), source,
                   count * sizeof(T), ACL_MEMCPY_DEVICE_TO_HOST),
@@ -904,8 +994,6 @@ struct RetainedEndpointState {
   std::unique_ptr<DirectUrmaResources> resources;
   std::unique_ptr<HostDdrDeviceMapping> mapping;
   std::unique_ptr<DeviceAllocations> allocations;
-  aclrtStream transfer_stream{nullptr};
-  bool transfer_stream_quiesced{true};
 };
 
 RetainedEndpointState g_retained_endpoint;
@@ -946,25 +1034,10 @@ void RetainUniqueOnFailure(std::unique_ptr<T>* local,
 void RetainEndpointOwnership(
     std::unique_ptr<DirectUrmaResources>* resources,
     std::unique_ptr<HostDdrDeviceMapping>* mapping,
-    std::unique_ptr<DeviceAllocations>* allocations,
-    aclrtStream* transfer_stream = nullptr,
-    const bool* transfer_stream_quiesced = nullptr) noexcept {
+    std::unique_ptr<DeviceAllocations>* allocations) noexcept {
   RetainUniqueOnFailure(resources, &g_retained_endpoint.resources);
   RetainUniqueOnFailure(mapping, &g_retained_endpoint.mapping);
   RetainUniqueOnFailure(allocations, &g_retained_endpoint.allocations);
-  if (transfer_stream != nullptr && *transfer_stream != nullptr) {
-    if (g_retained_endpoint.transfer_stream == nullptr) {
-      g_retained_endpoint.transfer_stream = *transfer_stream;
-      g_retained_endpoint.transfer_stream_quiesced =
-          transfer_stream_quiesced != nullptr &&
-          *transfer_stream_quiesced;
-    } else if (transfer_stream_quiesced != nullptr) {
-      g_retained_endpoint.transfer_stream_quiesced =
-          g_retained_endpoint.transfer_stream_quiesced &&
-          *transfer_stream_quiesced;
-    }
-    *transfer_stream = nullptr;
-  }
 }
 
 class RetainEndpointOnException {
@@ -972,21 +1045,15 @@ class RetainEndpointOnException {
   RetainEndpointOnException(
       std::unique_ptr<DirectUrmaResources>* resources,
       std::unique_ptr<HostDdrDeviceMapping>* mapping,
-      std::unique_ptr<DeviceAllocations>* allocations,
-      aclrtStream* transfer_stream = nullptr,
-      const bool* transfer_stream_quiesced = nullptr) noexcept
+      std::unique_ptr<DeviceAllocations>* allocations) noexcept
       : resources_(resources),
         mapping_(mapping),
         allocations_(allocations),
-        transfer_stream_(transfer_stream),
-        transfer_stream_quiesced_(transfer_stream_quiesced),
         uncaught_exceptions_(std::uncaught_exceptions()) {}
 
   ~RetainEndpointOnException() noexcept {
     if (std::uncaught_exceptions() > uncaught_exceptions_) {
-      RetainEndpointOwnership(resources_, mapping_, allocations_,
-                              transfer_stream_,
-                              transfer_stream_quiesced_);
+      RetainEndpointOwnership(resources_, mapping_, allocations_);
     }
   }
 
@@ -994,8 +1061,6 @@ class RetainEndpointOnException {
   std::unique_ptr<DirectUrmaResources>* resources_;
   std::unique_ptr<HostDdrDeviceMapping>* mapping_;
   std::unique_ptr<DeviceAllocations>* allocations_;
-  aclrtStream* transfer_stream_;
-  const bool* transfer_stream_quiesced_;
   int uncaught_exceptions_;
 };
 
@@ -1047,7 +1112,12 @@ bool AllocateDeviceInputs(
     std::uint64_t registration_bytes, std::size_t table_entries,
     std::size_t request_entries,
     DeviceAllocations* allocations) {
-  return AllocateDevice(registration_bytes, &allocations->output) &&
+  if (allocations == nullptr ||
+      registration_bytes > std::numeric_limits<std::size_t>::max()) {
+    return false;
+  }
+  return AllocateDevice(static_cast<std::size_t>(registration_bytes),
+                        &allocations->output) &&
          AllocateDevice(table_entries,
                         &allocations->remote_addresses) &&
          AllocateDevice(table_entries, &allocations->lengths) &&
@@ -1066,29 +1136,45 @@ bool AllocateDeviceInputs(
 DeviceTransferOutcome RunDeviceTransfer(
     const Options& options, std::uint64_t payload_bytes,
     DirectUrmaResources* resources,
-    DeviceAllocations* allocations,
-    aclrtStream* retained_stream, bool* stream_quiesced) {
-  if (retained_stream != nullptr) {
-    *retained_stream = nullptr;
-  }
-  if (stream_quiesced != nullptr) {
-    *stream_quiesced = true;
-  }
+    DeviceAllocations* allocations) {
   const auto local = resources->local_memory();
   const auto remote = resources->remote_memory();
   if (local.address !=
           reinterpret_cast<std::uint64_t>(allocations->output) ||
       local.bytes < payload_bytes || remote.address == 0 ||
-      remote.bytes < options.bytes) {
+      remote.bytes < options.capacity_bytes ||
+      local.address % kSmokeTransferAlignmentBytes != 0 ||
+      remote.address % kSmokeTransferAlignmentBytes != 0 ||
+      options.capacity_bytes >
+          std::numeric_limits<std::uint64_t>::max() - remote.address ||
+      payload_bytes >
+          std::numeric_limits<std::uint64_t>::max() - local.address) {
     std::cerr << "provider returned an unexpected local/remote MR\n";
     return DeviceTransferOutcome::kFailedQuiesced;
+  }
+  if (options.transfer_count == 0) {
+    // Candidate-hardware lifecycle stage: Open/READY and the checked epoch
+    // shutdown/Close path are exercised, but no data-plane kernel or WQE is
+    // submitted.  The capacity-sized MRs remain registered throughout.
+    std::cout
+        << "KVAF_A5_DIRECT_ZERO_WQE_OK"
+        << " descriptor_capacity=" << options.descriptor_capacity
+        << " bytes_per_transfer=" << options.bytes_per_transfer
+        << " capacity_bytes=" << options.capacity_bytes << '\n'
+        << "KVAF_A5_DIRECT_H2D_SMOKE_OK"
+        << " transfer_count=0"
+        << " descriptor_capacity=" << options.descriptor_capacity
+        << " bytes_per_transfer=" << options.bytes_per_transfer
+        << " total_bytes=0 batch_iterations=0 waves_per_batch=0"
+        << " total_submitted=0 legacy_total_bytes=0 canary=PASS\n";
+    return DeviceTransferOutcome::kPassed;
   }
 
   AivDirectUrmaChannel direct_channel{};
   if (!CheckStatus(
           resources->SnapshotDirectChannel(
               reinterpret_cast<std::uint64_t>(allocations->output),
-              payload_bytes, remote.address, options.bytes,
+              payload_bytes, remote.address, options.capacity_bytes,
               &direct_channel),
           "snapshot direct liburma AIV channel")) {
     return DeviceTransferOutcome::kFailedQuiesced;
@@ -1106,53 +1192,59 @@ DeviceTransferOutcome RunDeviceTransfer(
       << " remote_eid_wqe=" << FormatWqeEid(direct_channel)
       << '\n';
 
-  constexpr std::size_t kActiveDescriptorTarget = 4;
-  const std::size_t active_descriptor_count =
-      static_cast<std::size_t>(std::min<std::uint64_t>(
-          options.bytes, kActiveDescriptorTarget));
-  const std::size_t request_count =
-      active_descriptor_count + 1;
-
-  std::vector<std::uint64_t> remote_addresses(
-      active_descriptor_count);
-  std::vector<std::uint64_t> lengths(
-      active_descriptor_count);
-  std::vector<std::uint64_t> table_output_offsets(
-      active_descriptor_count);
-  std::vector<std::uint8_t> valid(
-      active_descriptor_count, 1);
-  std::uint64_t consumed = 0;
-  for (std::size_t table_index = 0;
-       table_index < active_descriptor_count; ++table_index) {
-    const std::uint64_t entries_left =
-        active_descriptor_count - table_index;
-    const std::uint64_t segment_bytes =
-        (options.bytes - consumed) / entries_left;
-    remote_addresses[table_index] =
-        remote.address + consumed;
-    lengths[table_index] = segment_bytes;
-    table_output_offsets[table_index] = consumed;
-    consumed += segment_bytes;
+  const std::size_t active_descriptor_count = options.transfer_count;
+  const std::size_t descriptor_capacity = options.descriptor_capacity;
+  if (direct_channel.sq_depth == 0 || direct_channel.cq_depth == 0) {
+    std::cerr << "provider returned a zero-depth direct queue\n";
+    return DeviceTransferOutcome::kFailedQuiesced;
+  }
+  const std::uint32_t wave_capacity =
+      std::min(direct_channel.sq_depth, direct_channel.cq_depth);
+  const std::uint64_t expected_waves =
+      (options.transfer_count + wave_capacity - 1U) / wave_capacity;
+  const std::uint64_t submission_budget =
+      static_cast<std::uint64_t>(options.transfer_count) *
+      options.batch_iterations;
+  const std::uint64_t max_counter =
+      std::numeric_limits<std::uint32_t>::max();
+  if (submission_budget > max_counter - direct_channel.sq_head ||
+      submission_budget > max_counter - direct_channel.wqe_count ||
+      submission_budget > max_counter - direct_channel.cq_tail) {
+    std::cerr << "batch iterations would cross the direct queue counter "
+                 "rollover boundary; rebuild the transport epoch\n";
+    return DeviceTransferOutcome::kFailedQuiesced;
   }
 
-  std::vector<std::uint32_t> indices(request_count);
-  std::vector<std::uint8_t> mask(request_count, 1);
-  std::vector<std::uint64_t> output_offsets(request_count);
+  // Allocate and initialize the full graph capacity, while entry_count below
+  // selects the runtime workload.  A later replay may change count/mask up to
+  // this fixed shape without reallocating descriptor metadata or MRs.
+  std::vector<std::uint64_t> remote_addresses(descriptor_capacity);
+  std::vector<std::uint64_t> lengths(
+      descriptor_capacity, options.bytes_per_transfer);
+  std::vector<std::uint8_t> valid(descriptor_capacity, 1);
+  std::vector<std::uint32_t> indices(descriptor_capacity, 0);
+  std::vector<std::uint8_t> mask(descriptor_capacity, 0);
+  std::vector<std::uint64_t> output_offsets(descriptor_capacity, 0);
+  for (std::size_t table_index = 0;
+       table_index < descriptor_capacity; ++table_index) {
+    const std::uint64_t offset =
+        static_cast<std::uint64_t>(table_index) *
+        options.bytes_per_transfer;
+    remote_addresses[table_index] = remote.address + offset;
+  }
   for (std::size_t request = 0;
        request < active_descriptor_count; ++request) {
     const std::size_t table_index =
-        active_descriptor_count - request - 1;
+        active_descriptor_count - request - 1U;
     indices[request] = static_cast<std::uint32_t>(table_index);
+    mask[request] = 1;
     output_offsets[request] =
-        table_output_offsets[table_index];
+        static_cast<std::uint64_t>(table_index) *
+        options.bytes_per_transfer;
   }
-  indices.back() = 0;
-  mask.back() = 0;
-  output_offsets.back() =
-      std::numeric_limits<std::uint64_t>::max();
 
   const std::vector<UrmaH2DDescriptor> empty_descriptors(
-      request_count);
+      descriptor_capacity);
   const DeviceCompletion empty_completion{};
   DeviceBatchGetParams params{};
   params.table.remote_addresses =
@@ -1163,8 +1255,7 @@ DeviceTransferOutcome RunDeviceTransfer(
   params.table.valid =
       reinterpret_cast<std::uint64_t>(allocations->valid);
   params.table.capacity =
-      static_cast<std::uint32_t>(active_descriptor_count);
-  params.table.generation = 1;
+      options.descriptor_capacity;
   params.indices =
       reinterpret_cast<std::uint64_t>(allocations->indices);
   params.mask =
@@ -1177,176 +1268,193 @@ DeviceTransferOutcome RunDeviceTransfer(
           allocations->descriptors);
   params.output_base =
       reinterpret_cast<std::uint64_t>(allocations->output);
-  params.output_bytes = options.bytes;
-  params.entry_count =
-      static_cast<std::uint32_t>(request_count);
-  params.descriptor_capacity =
-      static_cast<std::uint32_t>(request_count);
-  params.generation = 1;
+  params.output_bytes = options.capacity_bytes;
+  params.entry_count = options.transfer_count;
+  params.descriptor_capacity = options.descriptor_capacity;
 
   if (!CopyHostToDevice(allocations->remote_addresses,
                         remote_addresses.data(),
-                        active_descriptor_count) ||
+                        descriptor_capacity) ||
       !CopyHostToDevice(allocations->lengths, lengths.data(),
-                        active_descriptor_count) ||
+                        descriptor_capacity) ||
       !CopyHostToDevice(allocations->valid, valid.data(),
-                        active_descriptor_count) ||
+                        descriptor_capacity) ||
       !CopyHostToDevice(allocations->indices, indices.data(),
-                        request_count) ||
+                        descriptor_capacity) ||
       !CopyHostToDevice(allocations->mask, mask.data(),
-                        request_count) ||
+                        descriptor_capacity) ||
       !CopyHostToDevice(allocations->output_offsets,
-                        output_offsets.data(), request_count) ||
-      !CopyHostToDevice(allocations->descriptors,
-                        empty_descriptors.data(),
-                        request_count) ||
-      !CopyHostToDevice(allocations->completion,
-                        &empty_completion, 1) ||
-      !CopyHostToDevice(allocations->params, &params, 1) ||
+                        output_offsets.data(), descriptor_capacity) ||
       !CopyHostToDevice(allocations->direct_channel,
                         &direct_channel, 1)) {
     return DeviceTransferOutcome::kFailedQuiesced;
   }
 
-  aclrtStream stream = nullptr;
-  if (!CheckAcl(aclrtCreateStream(&stream), "aclrtCreateStream")) {
-    return DeviceTransferOutcome::kFailedQuiesced;
-  }
-  if (retained_stream != nullptr) {
-    *retained_stream = stream;
-  }
-  if (stream_quiesced != nullptr) {
-    *stream_quiesced = false;
-  }
-  kvaf::access::a5::LaunchAivSimtUrmaH2D(
-      stream, allocations->params, allocations->completion,
-      allocations->direct_channel);
-  const bool synchronized =
-      CheckAcl(aclrtSynchronizeStream(stream),
-               "aclrtSynchronizeStream");
-  if (!synchronized) {
-    std::cerr
-        << "AIV stream quiescence is unknown; retaining stream, "
-           "provider, and backing allocations for device reset\n";
-    return DeviceTransferOutcome::kUnsafeUnknown;
-  }
-  if (stream_quiesced != nullptr) {
-    *stream_quiesced = true;
-  }
-  const bool stream_destroyed =
-      CheckAcl(aclrtDestroyStream(stream), "aclrtDestroyStream");
-  if (!stream_destroyed && retained_stream != nullptr) {
-    *retained_stream = stream;
-  } else if (stream_destroyed && retained_stream != nullptr) {
-    *retained_stream = nullptr;
-  }
-
-  DeviceCompletion completion{};
-  AivDirectUrmaChannel completed_channel{};
-  AivDirectUrmaChannel provider_channel_after{};
+  const std::vector<std::uint8_t> canary_output(payload_bytes, kCanary);
   std::vector<UrmaH2DDescriptor> completed_descriptors(
-      request_count);
+      descriptor_capacity);
   std::vector<std::uint8_t> output(payload_bytes);
-  if (!CopyDeviceToHost(&completion, allocations->completion, 1) ||
-      !CopyDeviceToHost(&completed_channel,
-                        allocations->direct_channel, 1) ||
-      !CopyDeviceToHost(completed_descriptors.data(),
-                        allocations->descriptors, request_count) ||
-      !CheckAcl(
-          aclrtMemcpy(output.data(), payload_bytes,
-                      allocations->output, payload_bytes,
-                      ACL_MEMCPY_DEVICE_TO_HOST),
-          "copy direct URMA output to Host") ||
-      !CheckStatus(
-          resources->SnapshotDirectChannel(
-              reinterpret_cast<std::uint64_t>(
-                  allocations->output),
-              payload_bytes, remote.address, options.bytes,
-              &provider_channel_after),
-          "resnapshot direct liburma channel")) {
-    return DeviceTransferOutcome::kFailedQuiesced;
+  AivDirectUrmaChannel previous_channel = direct_channel;
+  DeviceTransferOutcome outcome = DeviceTransferOutcome::kPassed;
+  std::uint64_t completed_iterations = 0;
+  for (std::uint32_t iteration = 0;
+       iteration < options.batch_iterations; ++iteration) {
+    params.table.generation = static_cast<std::uint64_t>(iteration) + 1U;
+    params.generation = params.table.generation;
+    if (!CheckAcl(
+            aclrtMemcpy(allocations->output, payload_bytes,
+                        canary_output.data(), payload_bytes,
+                        ACL_MEMCPY_HOST_TO_DEVICE),
+            "reset direct output canary") ||
+        !CopyHostToDevice(allocations->descriptors,
+                          empty_descriptors.data(), descriptor_capacity) ||
+        !CopyHostToDevice(allocations->completion,
+                          &empty_completion, 1) ||
+        !CopyHostToDevice(allocations->params, &params, 1)) {
+      outcome = DeviceTransferOutcome::kFailedQuiesced;
+      break;
+    }
+
+    if (!CheckStatus(
+            resources->EnqueueBatch(
+                allocations->params, allocations->completion,
+                allocations->direct_channel),
+            "enqueue AIV direct URMA batch")) {
+      outcome = DeviceTransferOutcome::kFailedQuiesced;
+      break;
+    }
+    if (!CheckStatus(resources->SynchronizeDataPlane(),
+                     "synchronize AIV direct URMA batch")) {
+      std::cerr
+          << "AIV data-plane quiescence is unknown; retaining the epoch "
+             "owner and all backing allocations for device reset\n";
+      return DeviceTransferOutcome::kUnsafeUnknown;
+    }
+
+    DeviceCompletion completion{};
+    AivDirectUrmaChannel completed_channel{};
+    if (!CopyDeviceToHost(&completion, allocations->completion, 1) ||
+        !CopyDeviceToHost(&completed_channel,
+                          allocations->direct_channel, 1) ||
+        !CopyDeviceToHost(completed_descriptors.data(),
+                          allocations->descriptors,
+                          descriptor_capacity) ||
+        !CheckAcl(
+            aclrtMemcpy(output.data(), payload_bytes,
+                        allocations->output, payload_bytes,
+                        ACL_MEMCPY_DEVICE_TO_HOST),
+            "copy direct URMA output to Host")) {
+      // The kernel is synchronized, but without its completion/channel record
+      // the Host cannot prove that no DMA remains outstanding.
+      return DeviceTransferOutcome::kUnsafeUnknown;
+    }
+    const bool queue_drained =
+        completed_channel.sq_head == completed_channel.cq_tail &&
+        completed_channel.wqe_count == completed_channel.cq_tail;
+    if (!queue_drained) {
+      std::cerr << "direct queue did not drain after synchronized batch "
+                << iteration << '\n';
+      return DeviceTransferOutcome::kUnsafeUnknown;
+    }
+
+    AivDirectUrmaChannel provider_channel_after{};
+    if (!CheckStatus(
+            resources->SnapshotDirectChannel(
+                reinterpret_cast<std::uint64_t>(allocations->output),
+                payload_bytes, remote.address, options.capacity_bytes,
+                &provider_channel_after),
+            "resnapshot direct liburma channel")) {
+      outcome = DeviceTransferOutcome::kFailedQuiesced;
+      break;
+    }
+
+    bool valid_result =
+        completion.state ==
+            static_cast<std::uint32_t>(DeviceBatchState::kComplete) &&
+        completion.status ==
+            static_cast<std::uint32_t>(DeviceBatchStatus::kOk) &&
+        completion.generation == params.generation &&
+        completion.planned_count == active_descriptor_count &&
+        completion.submitted_count == active_descriptor_count &&
+        completion.completed_count == active_descriptor_count &&
+        completion.first_failed_index == kvaf::access::kNoFailedIndex &&
+        completion.reserved[0] == expected_waves &&
+        completed_channel.sq_head - previous_channel.sq_head ==
+            active_descriptor_count &&
+        completed_channel.wqe_count - previous_channel.wqe_count ==
+            active_descriptor_count &&
+        completed_channel.cq_tail - previous_channel.cq_tail ==
+            active_descriptor_count &&
+        provider_channel_after.sq_head == completed_channel.sq_head &&
+        provider_channel_after.wqe_count == completed_channel.wqe_count &&
+        provider_channel_after.cq_tail == completed_channel.cq_tail;
+    for (std::size_t request = 0;
+         request < active_descriptor_count && valid_result; ++request) {
+      const std::size_t table_index = indices[request];
+      const auto& descriptor = completed_descriptors[request];
+      valid_result =
+          descriptor.state ==
+              static_cast<std::uint32_t>(TransferState::kComplete) &&
+          descriptor.logical_index == request &&
+          descriptor.generation == params.generation &&
+          descriptor.remote_addr == remote_addresses[table_index] &&
+          descriptor.local_addr ==
+              reinterpret_cast<std::uint64_t>(allocations->output) +
+                  output_offsets[request] &&
+          descriptor.bytes == options.bytes_per_transfer;
+    }
+    // Read and validate the full fixed graph capacity.  The active prefix is
+    // selected by entry_count; any write into the inactive suffix indicates
+    // a grid-stride/count bug even when the active completions look correct.
+    for (std::size_t request = active_descriptor_count;
+         request < descriptor_capacity && valid_result; ++request) {
+      valid_result = std::memcmp(
+          &completed_descriptors[request], &empty_descriptors[request],
+          sizeof(UrmaH2DDescriptor)) == 0;
+    }
+    for (std::uint64_t byte = 0;
+         byte < options.total_bytes && valid_result; ++byte) {
+      valid_result = output[byte] == Pattern(byte);
+    }
+    for (std::uint64_t byte = options.total_bytes;
+         byte < payload_bytes && valid_result; ++byte) {
+      valid_result = output[byte] == kCanary;
+    }
+    if (!valid_result) {
+      std::cerr
+          << "direct H2D data/completion/canary validation failed"
+          << " iteration=" << iteration
+          << " state=" << completion.state
+          << " status=" << completion.status
+          << " planned=" << completion.planned_count
+          << " submitted=" << completion.submitted_count
+          << " completed=" << completion.completed_count
+          << " waves=" << completion.reserved[0]
+          << " first_failed=" << completion.first_failed_index
+          << '\n';
+      outcome = DeviceTransferOutcome::kFailedQuiesced;
+      break;
+    }
+    previous_channel = completed_channel;
+    ++completed_iterations;
   }
 
-  bool valid_result =
-      completion.state ==
-          static_cast<std::uint32_t>(
-              DeviceBatchState::kComplete) &&
-      completion.status ==
-          static_cast<std::uint32_t>(
-              DeviceBatchStatus::kOk) &&
-      completion.planned_count == active_descriptor_count &&
-      completion.submitted_count == active_descriptor_count &&
-      completion.completed_count == active_descriptor_count &&
-      completion.first_failed_index ==
-          kvaf::access::kNoFailedIndex &&
-      completed_channel.sq_head - direct_channel.sq_head ==
-          active_descriptor_count &&
-      completed_channel.wqe_count -
-              direct_channel.wqe_count ==
-          active_descriptor_count &&
-      completed_channel.cq_tail - direct_channel.cq_tail ==
-          active_descriptor_count &&
-      completed_channel.wqe_count ==
-          completed_channel.cq_tail &&
-      provider_channel_after.sq_head ==
-          completed_channel.sq_head &&
-      provider_channel_after.wqe_count ==
-          completed_channel.wqe_count &&
-      provider_channel_after.cq_tail ==
-          completed_channel.cq_tail;
-  for (std::size_t request = 0;
-       request < active_descriptor_count && valid_result;
-       ++request) {
-    const std::size_t table_index = indices[request];
-    const auto& descriptor = completed_descriptors[request];
-    valid_result =
-        descriptor.state ==
-            static_cast<std::uint32_t>(
-                TransferState::kComplete) &&
-        descriptor.logical_index == request &&
-        descriptor.remote_addr ==
-            remote_addresses[table_index] &&
-        descriptor.local_addr ==
-            reinterpret_cast<std::uint64_t>(
-                allocations->output) +
-                output_offsets[request] &&
-        descriptor.bytes == lengths[table_index];
-  }
-  valid_result =
-      valid_result &&
-      completed_descriptors.back().state ==
-          static_cast<std::uint32_t>(
-              TransferState::kSkipped);
-  for (std::uint64_t byte = 0;
-       byte < options.bytes && valid_result; ++byte) {
-    valid_result = output[byte] == Pattern(byte);
-  }
-  for (std::uint64_t byte = options.bytes;
-       byte < payload_bytes && valid_result; ++byte) {
-    valid_result = output[byte] == kCanary;
-  }
-  if (!valid_result) {
-    std::cerr
-        << "direct H2D data/completion/canary validation failed"
-        << " state=" << completion.state
-        << " status=" << completion.status
-        << " planned=" << completion.planned_count
-        << " submitted=" << completion.submitted_count
-        << " completed=" << completion.completed_count
-        << " first_failed=" << completion.first_failed_index
-        << '\n';
+  if (outcome != DeviceTransferOutcome::kPassed) {
     return DeviceTransferOutcome::kFailedQuiesced;
   }
   std::cout
       << "KVAF_A5_DIRECT_H2D_SMOKE_OK"
-      << " bytes=" << options.bytes
-      << " planned=" << active_descriptor_count
-      << " submitted=" << active_descriptor_count
-      << " completed=" << active_descriptor_count
-      << " masked=1 canary=PASS\n";
-  return stream_destroyed
-             ? DeviceTransferOutcome::kPassed
-             : DeviceTransferOutcome::kFailedQuiesced;
+      << " transfer_count=" << options.transfer_count
+      << " descriptor_capacity=" << options.descriptor_capacity
+      << " bytes_per_transfer=" << options.bytes_per_transfer
+      << " total_bytes=" << options.total_bytes
+      << " batch_iterations=" << completed_iterations
+      << " waves_per_batch=" << expected_waves
+      << " total_submitted=" << submission_budget
+      << " legacy_total_bytes="
+      << (options.legacy_total_bytes ? 1 : 0)
+      << " canary=PASS\n";
+  return DeviceTransferOutcome::kPassed;
 }
 
 EndpointResult RunHost(const Options& options) {
@@ -1385,7 +1493,7 @@ EndpointResult RunHost(const Options& options) {
       mapping->host_address());
   std::memset(source, kCanary,
               static_cast<std::size_t>(registration_bytes));
-  for (std::uint64_t index = 0; index < options.bytes; ++index) {
+  for (std::uint64_t index = 0; index < options.capacity_bytes; ++index) {
     source[index] = Pattern(index);
   }
   std::cout
@@ -1559,22 +1667,13 @@ EndpointResult RunDevice(const Options& options) {
   }
 
   g_endpoint_may_own_resources.store(true, std::memory_order_relaxed);
-  constexpr std::size_t kActiveDescriptorTarget = 4;
-  const std::size_t active_descriptor_count =
-      static_cast<std::size_t>(std::min<std::uint64_t>(
-          options.bytes, kActiveDescriptorTarget));
-  const std::size_t request_count =
-      active_descriptor_count + 1;
   auto allocations = std::make_unique<DeviceAllocations>();
   std::unique_ptr<DirectUrmaResources> resources;
-  aclrtStream retained_stream = nullptr;
-  bool transfer_stream_quiesced = true;
   RetainEndpointOnException exception_guard(
-      &resources, nullptr, &allocations, &retained_stream,
-      &transfer_stream_quiesced);
+      &resources, nullptr, &allocations);
   if (!AllocateDeviceInputs(
-          registration_bytes, active_descriptor_count,
-          request_count, allocations.get())) {
+          registration_bytes, options.descriptor_capacity,
+          options.descriptor_capacity, allocations.get())) {
     const bool allocations_closed =
         CloseAllocationsWithRetry(allocations.get());
     return SafeEndpoint(
@@ -1633,29 +1732,10 @@ EndpointResult RunDevice(const Options& options) {
       << " eid_index=" << options.device_eid_index << '\n';
 
   const auto transfer_outcome = RunDeviceTransfer(
-      options, payload_bytes, resources.get(), allocations.get(),
-      &retained_stream, &transfer_stream_quiesced);
+      options, payload_bytes, resources.get(), allocations.get());
   if (transfer_outcome == DeviceTransferOutcome::kUnsafeUnknown) {
-    RetainEndpointOwnership(&resources, nullptr, &allocations,
-                            &retained_stream,
-                            &transfer_stream_quiesced);
-    return UnsafeEndpoint("aiv_stream_quiescence_unknown");
-  }
-  bool transfer_stream_local_cleanup_complete = true;
-  if (retained_stream != nullptr) {
-    std::cerr
-        << "quiesced AIV transfer stream destroy failed; retrying once\n";
-    if (aclrtDestroyStream(retained_stream) == ACL_SUCCESS) {
-      retained_stream = nullptr;
-    } else {
-      transfer_stream_local_cleanup_complete = false;
-      // The stream was synchronized successfully, so this is a local handle
-      // leak rather than an in-flight DMA risk. Keep the handle discoverable
-      // until aclrtResetDevice/process exit instead of silently dropping it.
-      RetainEndpointOwnership(nullptr, nullptr, nullptr,
-                              &retained_stream,
-                              &transfer_stream_quiesced);
-    }
+    RetainEndpointOwnership(&resources, nullptr, &allocations);
+    return UnsafeEndpoint("aiv_data_plane_quiescence_unknown");
   }
   const bool transfer_ok =
       transfer_outcome == DeviceTransferOutcome::kPassed;
@@ -1673,9 +1753,7 @@ EndpointResult RunDevice(const Options& options) {
       break;
     }
     if (ValidPeerFatal(options, host_fatal)) {
-      RetainEndpointOwnership(&resources, nullptr, &allocations,
-                              &retained_stream,
-                              &transfer_stream_quiesced);
+      RetainEndpointOwnership(&resources, nullptr, &allocations);
       return UnsafeEndpoint("host_failed_before_close_ready_publish");
     }
     if (!close_ready_warning_written) {
@@ -1711,8 +1789,7 @@ EndpointResult RunDevice(const Options& options) {
     std::cerr
         << "failed to publish Device done marker\n";
     const bool local_cleanup_complete =
-        provider_local_cleanup_complete && allocations_closed &&
-        transfer_stream_local_cleanup_complete;
+        provider_local_cleanup_complete && allocations_closed;
     return SafeEndpoint(
         local_cleanup_complete
             ? "device_done_publish_failed"
@@ -1723,21 +1800,16 @@ EndpointResult RunDevice(const Options& options) {
     return SafeEndpoint("device_allocations_local_cleanup_incomplete", true,
                         false, true, false);
   }
-  if (transfer_ok && provider_local_cleanup_complete &&
-      transfer_stream_local_cleanup_complete) {
+  if (transfer_ok && provider_local_cleanup_complete) {
     std::cout
         << "KVAF_A5_DIRECT_TEARDOWN_OK role=device\n";
     return PassedEndpoint();
   }
-  const bool local_cleanup_complete =
-      provider_local_cleanup_complete &&
-      transfer_stream_local_cleanup_complete;
+  const bool local_cleanup_complete = provider_local_cleanup_complete;
   return SafeEndpoint(
-      !transfer_stream_local_cleanup_complete
-          ? "device_stream_local_cleanup_incomplete"
-          : (provider_local_cleanup_complete
-                 ? "transfer_validation_failed"
-                 : "device_provider_local_cleanup_incomplete"),
+      provider_local_cleanup_complete
+          ? "transfer_validation_failed"
+          : "device_provider_local_cleanup_incomplete",
       true, local_cleanup_complete, true, true);
 }
 
@@ -1749,10 +1821,6 @@ bool TryRecoverRetainedAfterException(
   const bool resource_armed =
       g_retained_endpoint.resources != nullptr ||
       g_retained_endpoint.mapping != nullptr;
-  if (g_retained_endpoint.transfer_stream != nullptr &&
-      !g_retained_endpoint.transfer_stream_quiesced) {
-    return false;
-  }
 
   bool provider_local_cleanup_complete = true;
   const bool provider_closed =
@@ -1810,19 +1878,6 @@ bool TryRecoverRetainedAfterException(
       g_retained_endpoint.allocations == nullptr ||
       CloseAllocationsWithRetry(g_retained_endpoint.allocations.get());
 
-  bool stream_local_cleanup_complete = true;
-  if (g_retained_endpoint.transfer_stream != nullptr) {
-    if (aclrtDestroyStream(g_retained_endpoint.transfer_stream) ==
-        ACL_SUCCESS) {
-      g_retained_endpoint.transfer_stream = nullptr;
-    } else if (aclrtDestroyStream(
-                   g_retained_endpoint.transfer_stream) == ACL_SUCCESS) {
-      g_retained_endpoint.transfer_stream = nullptr;
-    } else {
-      stream_local_cleanup_complete = false;
-    }
-  }
-
   recovered_result->outcome = EndpointOutcome::kFailedSafe;
   recovered_result->resource_armed = resource_armed;
   recovered_result->stream_quiesced = true;
@@ -1841,9 +1896,6 @@ bool TryRecoverRetainedAfterException(
   } else if (!allocations_closed) {
     recovered_result->reason =
         "unexpected_cpp_exception_allocations_local_cleanup_incomplete";
-  } else if (!stream_local_cleanup_complete) {
-    recovered_result->reason =
-        "unexpected_cpp_exception_stream_local_cleanup_incomplete";
   }
   return true;
 }
@@ -1937,7 +1989,6 @@ int main(int argc, char** argv) {
       CheckAcl(aclrtResetDevice(options.logical_device_id),
                "aclrtResetDevice");
   if (reset) {
-    g_retained_endpoint.transfer_stream = nullptr;
   }
   const bool finalized =
       CheckAcl(aclFinalize(), "aclFinalize");

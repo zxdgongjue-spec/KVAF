@@ -9,8 +9,9 @@
 
 **Probe PASS 不会解锁 direct URMA。** 它没有执行 provider Open、AIV 数据传输或
 provider Close，因而不能证明 UDMA/UMMU 句柄在完整生命周期内由同一个 AICPU
-进程和 SO instance 持有。`scripts/a5_aicpu_affinity_guard.sh` 仍固定为
-`unproven-kfc-multilaunch`；环境变量和 probe 输出都不能覆盖这道门。
+进程和 SO instance 持有。`scripts/a5_aicpu_affinity_guard.sh` 当前固定为
+`candidate-epoch-owner-unvalidated-v1`：普通生产入口仍 fail closed，只有专用 staged
+wrapper 能运行资源版 owner 矩阵；环境变量和 probe 输出都不能覆盖这道门。
 
 ## 2. 探针验证的协议
 
@@ -62,27 +63,34 @@ DMA 生命周期。
 
 ### 3.2 MVP session owner
 
-`MVP session owner` 指一次 smoke run 对应一个 session nonce、一个 owner
-invocation 和一个 provider context。这个 invocation 内部完成：
+候选 `MVP session owner` 指一次 smoke run 对应一个 session nonce、一个 owner
+invocation 和一个 provider context。仓内的
+`aicpu_kvaf_urma_epoch_owner_v1` 已按这个结构实现：
 
 ```text
 Open -> publish READY -> wait for quiesced command -> checked Close/retry -> exit
 ```
 
-这样 process-local UDMA/UMMU 指针不会跨 KFC launch。MVP 仍只支持单 session；
-worker 被 `SIGKILL`、ACL context 丢失或控制记录不可读时，不能由新进程接管旧 owner，
-必须继续保留 active/quarantine 语义。只有资源版 owner 的 Open-transfer-Close
-fault matrix 全部通过后，才能评审是否把源码 gate 改为
-`single-invocation-owner-v1`。
+这样 process-local UDMA/UMMU 指针不会跨 KFC launch。provider 的进程级 epoch
+claim 还会拒绝 owner 之外的 Open/Close。Host 关闭时先冻结新提交，再把 shutdown
+和全部 BatchGet 排在同一 control/data stream，以 FIFO 证明没有 data kernel
+落在 Close 后面。MVP 仍只支持单 session；worker 被 `SIGKILL`、ACL context 丢失
+或控制记录不可读时，不能由新进程接管旧 owner，必须继续保留
+active/quarantine 语义。只有资源版 owner 的 Open-transfer-Close fault matrix
+全部通过后，才能评审是否把正式 runner 的源码 gate 改为
+`single-invocation-owner-v1`。目前只能通过显式的 epoch-owner candidate wrapper
+运行真机验证。
 
 ### 3.3 Production epoch owner
 
-`production epoch owner` 是可跨多个 BatchGet 复用、但有明确 idle expiry 和最大
-lease 的事件驱动服务，并不等于永不退出的 KFC task。这里的 epoch 是 owner 每次
+`production epoch owner` 是可跨多个 BatchGet 复用的事件驱动服务，并不等于为
+每次 H2D 创建一个 AICPU task。这里的 epoch 是 owner 每次
 重建、设备 reset 或硬件隔离后递增的代际号。命令必须同时匹配
 `epoch + session + sequence`，因此旧进程遗留的命令不能误关新资源。默认建议每张
-NPU 至多保留一个 owner；如果目标 CANN 没有受支持的 blocking、watchdog、取消和
-worker 配额契约，就不能把这种 owner 作为正式方案。
+NPU 至多保留一个 owner。lease 到期不能在队列未 drain 时强制 Close 或退出；它
+只能触发诊断/拒绝新提交，随后等待合作式 shutdown 或驱动级隔离。如果目标 CANN
+没有受支持的 blocking、watchdog、取消和 worker 配额契约，就不能把普通 KFC
+worker 长驻方案作为正式方案。
 
 生产版本还需要多 session 隔离、租约和 heartbeat、合作式取消、配额、公平调度、
 durable tombstone、进程重启恢复、可审计资源计数以及 epoch rollover 测试。这些能力
@@ -195,9 +203,10 @@ UB_MicroBenchmark 的 `compat/liburma_perftest.tar.gz`。仅有 tar 而缺少 CA
 注册时，wrapper 会在任何 ACL/NPU 操作前失败；这正是旧版本出现 `507018` 和
 Device 侧 `So does not exist` 的原因。
 
-允许的 timeout 范围是 1–10 秒。probe PASS 后仍不要通过环境变量绕过
-`scripts/run_a5_direct_urma_h2d_smoke.sh` 的 affinity gate；下一步是实现并验证真正的
-MVP session owner，而不是直接执行 URMA smoke。
+允许的 timeout 范围是 1–10 秒。probe PASS 后仍不要通过环境变量绕过正式
+`run_a5_direct_urma_h2d_smoke.sh` 的 gate。资源版 session/epoch owner 已进入 candidate
+验证阶段，应只通过 `run_a5_direct_urma_epoch_owner_validation.sh` 分阶段测试；probe
+本身仍不能解除生产门禁。
 
 ## 6. 最小否证标准
 

@@ -344,7 +344,8 @@ kvaf_verify_direct_runtime_artifacts_v3()
     provider_symbols=$(nm -D --defined-only "${provider}") || return 1
     for symbol in kvaf_urma_provider_open_v2 kvaf_urma_provider_close_v2 \
       kvaf_urma_provider_private_abi_v2 aicpu_kvaf_urma_open_v2 \
-      aicpu_kvaf_urma_close_v2 aicpu_kvaf_urma_owner_probe_v1
+      aicpu_kvaf_urma_close_v2 aicpu_kvaf_urma_owner_probe_v1 \
+      aicpu_kvaf_urma_epoch_owner_v1
     do
       grep -Eq "[[:space:]]${symbol}(@@KVAF_URMA_PROVIDER_2)?$" \
         <<<"${provider_symbols}" || {

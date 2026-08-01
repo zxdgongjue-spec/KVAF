@@ -33,6 +33,7 @@ int main(int argc, char **argv)
     aicpu_entry_fn open_entry;
     aicpu_entry_fn close_entry;
     aicpu_entry_fn owner_entry;
+    aicpu_entry_fn epoch_owner_entry;
     void *library;
 
     if (argc != 2) {
@@ -47,7 +48,10 @@ int main(int argc, char **argv)
     open_entry = load_entry(library, "aicpu_kvaf_urma_open_v2");
     close_entry = load_entry(library, "aicpu_kvaf_urma_close_v2");
     owner_entry = load_entry(library, "aicpu_kvaf_urma_owner_probe_v1");
-    if (open_entry == NULL || close_entry == NULL || owner_entry == NULL) {
+    epoch_owner_entry = load_entry(
+        library, "aicpu_kvaf_urma_epoch_owner_v1");
+    if (open_entry == NULL || close_entry == NULL || owner_entry == NULL ||
+        epoch_owner_entry == NULL) {
         (void)fprintf(stderr, "AICPU provider entry is unavailable\n");
         (void)dlclose(library);
         return 1;
@@ -162,6 +166,12 @@ int main(int argc, char **argv)
     if (owner_entry(&owner_args) == 0 || owner_entry(NULL) == 0) {
         (void)fprintf(stderr,
             "invalid AICPU owner probe dispatch unexpectedly succeeded\n");
+        (void)dlclose(library);
+        return 1;
+    }
+    if (epoch_owner_entry(NULL) == 0) {
+        (void)fprintf(stderr,
+            "invalid AICPU epoch owner dispatch unexpectedly succeeded\n");
         (void)dlclose(library);
         return 1;
     }
