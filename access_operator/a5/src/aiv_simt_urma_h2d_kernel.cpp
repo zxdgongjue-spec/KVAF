@@ -3,6 +3,8 @@
 #include "kernel_operator.h"
 #include "simt_api/asc_simt.h"
 
+#include "kvaf_urma_provider_abi.h"
+
 namespace kvaf::access::a5 {
 namespace {
 
@@ -157,6 +159,112 @@ __aicore__ inline void InvalidateGlobalCacheLine(
       std::uint8_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
       AscendC::DcciDst::CACHELINE_OUT>(cache_line[0]);
   __asm__ __volatile__("");
+}
+
+__aicore__ inline void CleanProbeCacheLine(std::uint64_t address) {
+  const std::uint64_t aligned =
+      address / AscendC::CACHE_LINE_SIZE * AscendC::CACHE_LINE_SIZE;
+  AscendC::GlobalTensor<std::uint8_t> cache_line;
+  cache_line.SetGlobalBuffer(
+      reinterpret_cast<__gm__ std::uint8_t*>(aligned));
+  AscendC::PipeBarrier<PIPE_ALL>();
+  __asm__ __volatile__("");
+  AscendC::DataCacheCleanAndInvalid<
+      std::uint8_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+      AscendC::DcciDst::CACHELINE_OUT>(cache_line[0]);
+  __asm__ __volatile__("");
+}
+
+__aicore__ inline void PublishOwnerProbeAivResult(
+    __gm__ AicpuOwnerProbeAivResult* result,
+    AicpuOwnerProbeAivStatus status, std::uint64_t session_id,
+    std::uint64_t observed_sequence, std::uint32_t observed_owner_state,
+    std::uint32_t poll_count) {
+  result->magic = kAicpuOwnerProbeAivResultMagic;
+  result->abi_version = kAicpuOwnerProbeAivResultAbiVersion;
+  result->struct_size = sizeof(AicpuOwnerProbeAivResult);
+  result->session_id = session_id;
+  result->observed_sequence = observed_sequence;
+  result->observed_owner_state = observed_owner_state;
+  result->poll_count = poll_count;
+  result->reserved[0] = 0;
+  result->reserved[1] = 0;
+  result->reserved[2] = 0;
+  // Status is the commit field for the Host-side result validation.
+  result->status = static_cast<std::uint32_t>(status);
+  CleanProbeCacheLine(reinterpret_cast<std::uint64_t>(result));
+}
+
+// This kernel deliberately performs no URMA/EID/topology operation.  Its only
+// purpose is to prove that a bounded AICPU invocation can coexist with an AIV
+// task on another stream and that their two cache-line records are coherent.
+extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void
+KvafAicpuOwnerConcurrencyProbeKernel(
+    __gm__ kvaf_urma_owner_probe_command_v1* command,
+    __gm__ const kvaf_urma_owner_probe_status_v1* owner_status,
+    __gm__ AicpuOwnerProbeAivResult* result, std::uint64_t session_id,
+    std::uint32_t max_ready_polls) {
+  if (command == nullptr || owner_status == nullptr || result == nullptr ||
+      session_id == 0 || max_ready_polls == 0) {
+    if (result != nullptr) {
+      PublishOwnerProbeAivResult(
+          result, AicpuOwnerProbeAivStatus::kInvalidOwnerStatus,
+          session_id, 0, KVAF_URMA_OWNER_PROBE_STATE_EMPTY, 0);
+    }
+    return;
+  }
+
+  for (std::uint32_t poll = 0; poll < max_ready_polls; ++poll) {
+    const std::uint32_t observed_polls = poll + 1U;
+    InvalidateGlobalCacheLine(
+        reinterpret_cast<std::uint64_t>(owner_status));
+    const std::uint32_t state = owner_status->state;
+    if (state == KVAF_URMA_OWNER_PROBE_STATE_READY) {
+      if (owner_status->magic != KVAF_URMA_OWNER_PROBE_MAGIC ||
+          owner_status->abi_version !=
+              KVAF_URMA_OWNER_PROBE_ABI_VERSION ||
+          owner_status->struct_size != sizeof(*owner_status) ||
+          owner_status->session_id != session_id ||
+          owner_status->result_code != KVAF_URMA_OWNER_PROBE_RESULT_OK) {
+        PublishOwnerProbeAivResult(
+            result, AicpuOwnerProbeAivStatus::kInvalidOwnerStatus,
+            session_id, owner_status->sequence, state, observed_polls);
+        return;
+      }
+
+      command->magic = KVAF_URMA_OWNER_PROBE_MAGIC;
+      command->abi_version = KVAF_URMA_OWNER_PROBE_ABI_VERSION;
+      command->struct_size = sizeof(*command);
+      command->session_id = session_id;
+      command->sequence = KVAF_URMA_OWNER_PROBE_RELEASE_SEQUENCE;
+      command->reserved[0] = 0;
+      command->reserved[1] = 0;
+      command->reserved[2] = 0;
+      command->reserved[3] = 0;
+      AscendC::PipeBarrier<PIPE_ALL>();
+      // Publish the opcode last, then clean the complete producer-owned line.
+      command->opcode = KVAF_URMA_OWNER_PROBE_COMMAND_RELEASE;
+      CleanProbeCacheLine(reinterpret_cast<std::uint64_t>(command));
+      PublishOwnerProbeAivResult(
+          result, AicpuOwnerProbeAivStatus::kReleaseSubmitted,
+          session_id, owner_status->sequence, state, observed_polls);
+      return;
+    }
+    if (state == KVAF_URMA_OWNER_PROBE_STATE_RELEASED ||
+        state == KVAF_URMA_OWNER_PROBE_STATE_TIMED_OUT ||
+        state == KVAF_URMA_OWNER_PROBE_STATE_FAILED) {
+      PublishOwnerProbeAivResult(
+          result, AicpuOwnerProbeAivStatus::kOwnerTerminalBeforeReady,
+          session_id, owner_status->sequence, state, observed_polls);
+      return;
+    }
+  }
+
+  InvalidateGlobalCacheLine(
+      reinterpret_cast<std::uint64_t>(owner_status));
+  PublishOwnerProbeAivResult(
+      result, AicpuOwnerProbeAivStatus::kReadyTimedOut, session_id,
+      owner_status->sequence, owner_status->state, max_ready_polls);
 }
 
 __aicore__ inline bool DirectChannelIsValid(
@@ -512,6 +620,16 @@ void LaunchAivSimtUrmaH2D(
     AivDirectUrmaChannel* direct_channel) {
   KvafAivSimtUrmaH2DKernel<<<1, nullptr, stream>>>(
       device_params, device_completion, direct_channel);
+}
+
+void LaunchAicpuOwnerConcurrencyProbe(
+    void* stream, void* command, const void* status,
+    AicpuOwnerProbeAivResult* result, std::uint64_t session_id,
+    std::uint32_t max_ready_polls) {
+  KvafAicpuOwnerConcurrencyProbeKernel<<<1, nullptr, stream>>>(
+      static_cast<kvaf_urma_owner_probe_command_v1*>(command),
+      static_cast<const kvaf_urma_owner_probe_status_v1*>(status), result,
+      session_id, max_ready_polls);
 }
 
 }  // namespace kvaf::access::a5

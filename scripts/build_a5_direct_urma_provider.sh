@@ -543,6 +543,7 @@ public_provider_symbols=(
   kvaf_urma_provider_private_abi_v2
   aicpu_kvaf_urma_open_v2
   aicpu_kvaf_urma_close_v2
+  aicpu_kvaf_urma_owner_probe_v1
 )
 
 validate_provider()

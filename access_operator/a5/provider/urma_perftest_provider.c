@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "perftest_parameters.h"
@@ -810,4 +811,186 @@ int aicpu_kvaf_urma_close_v2(void *opaque_args)
     *result = ret;
     /* See aicpu_kvaf_urma_open_v2: result reports provider failure. */
     return 0;
+}
+
+static bool kvaf_owner_probe_args_are_valid(
+    const struct kvaf_urma_aicpu_owner_probe_args_v1 *args)
+{
+    const uint64_t alignment_mask =
+        KVAF_URMA_OWNER_PROBE_CACHE_LINE_BYTES - UINT64_C(1);
+
+    return args != NULL &&
+        args->magic == KVAF_URMA_OWNER_PROBE_MAGIC &&
+        args->abi_version == KVAF_URMA_OWNER_PROBE_ABI_VERSION &&
+        args->struct_size == sizeof(*args) &&
+        args->session_id != 0 &&
+        args->command_address != 0 &&
+        args->status_address != 0 &&
+        args->command_address != args->status_address &&
+        (args->command_address & alignment_mask) == 0 &&
+        (args->status_address & alignment_mask) == 0 &&
+        args->reserved0 == 0 &&
+        args->reserved[0] == 0 &&
+        args->reserved[1] == 0;
+}
+
+static int kvaf_owner_probe_monotonic_nanoseconds(
+    clockid_t clock_id, uint64_t *nanoseconds)
+{
+    struct timespec now;
+
+    if (nanoseconds == NULL ||
+        clock_gettime(clock_id, &now) != 0 ||
+        now.tv_sec < 0 || now.tv_nsec < 0 ||
+        now.tv_nsec >= 1000000000L ||
+        (uint64_t)now.tv_sec > UINT64_MAX / UINT64_C(1000000000)) {
+        return -1;
+    }
+    *nanoseconds = (uint64_t)now.tv_sec * UINT64_C(1000000000) +
+        (uint64_t)now.tv_nsec;
+    return 0;
+}
+
+static void kvaf_owner_probe_publish(
+    struct kvaf_urma_owner_probe_status_v1 *status,
+    enum kvaf_urma_owner_probe_state state,
+    enum kvaf_urma_owner_probe_result result,
+    uint64_t sequence,
+    uint64_t elapsed_nanoseconds)
+{
+    status->sequence = sequence;
+    status->result_code = (int32_t)result;
+    status->elapsed_nanoseconds = elapsed_nanoseconds;
+    /* Publish every status payload field before the externally polled state. */
+    __atomic_store_n(&status->state, (uint32_t)state, __ATOMIC_RELEASE);
+}
+
+static void kvaf_owner_probe_sleep(uint32_t microseconds)
+{
+    const struct timespec delay = {
+        .tv_sec = (time_t)(microseconds / 1000000U),
+        .tv_nsec = (long)(microseconds % 1000000U) * 1000L,
+    };
+
+    /* A signal merely shortens one poll interval; the monotonic deadline is
+     * checked again before any subsequent sleep. */
+    (void)nanosleep(&delay, NULL);
+}
+
+int aicpu_kvaf_urma_owner_probe_v1(void *opaque_args)
+{
+    struct kvaf_urma_aicpu_owner_probe_args_v1 *args =
+        (struct kvaf_urma_aicpu_owner_probe_args_v1 *)opaque_args;
+    struct kvaf_urma_owner_probe_command_v1 *command;
+    struct kvaf_urma_owner_probe_status_v1 *status;
+    uint64_t start_nanoseconds;
+    uint64_t now_nanoseconds;
+    uint64_t timeout_nanoseconds;
+    uint32_t poll_microseconds;
+
+    if (args == NULL ||
+        args->timeout_milliseconds == 0 ||
+        args->timeout_milliseconds >
+            KVAF_URMA_OWNER_PROBE_MAX_TIMEOUT_MILLISECONDS ||
+        args->poll_interval_microseconds >
+            KVAF_URMA_OWNER_PROBE_MAX_POLL_MICROSECONDS ||
+        !kvaf_owner_probe_args_are_valid(args)) {
+        return -1;
+    }
+    command = (struct kvaf_urma_owner_probe_command_v1 *)(uintptr_t)
+        args->command_address;
+    status = (struct kvaf_urma_owner_probe_status_v1 *)(uintptr_t)
+        args->status_address;
+
+    /* Status has one producer.  Reset state first so a reused block cannot
+     * expose an earlier READY while this invocation initializes its payload. */
+    __atomic_store_n(&status->state,
+        (uint32_t)KVAF_URMA_OWNER_PROBE_STATE_EMPTY, __ATOMIC_RELEASE);
+    status->magic = KVAF_URMA_OWNER_PROBE_MAGIC;
+    status->abi_version = KVAF_URMA_OWNER_PROBE_ABI_VERSION;
+    status->struct_size = (uint32_t)sizeof(*status);
+    status->session_id = args->session_id;
+    status->sequence = 0;
+    status->result_code = KVAF_URMA_OWNER_PROBE_RESULT_OK;
+    status->reserved0 = 0;
+    status->elapsed_nanoseconds = 0;
+    status->reserved[0] = 0;
+    status->reserved[1] = 0;
+
+    if (kvaf_owner_probe_monotonic_nanoseconds(
+            CLOCK_MONOTONIC, &start_nanoseconds) != 0) {
+        kvaf_owner_probe_publish(status,
+            KVAF_URMA_OWNER_PROBE_STATE_FAILED,
+            KVAF_URMA_OWNER_PROBE_RESULT_CLOCK_FAILED, 0, 0);
+        return 0;
+    }
+    timeout_nanoseconds =
+        (uint64_t)args->timeout_milliseconds * UINT64_C(1000000);
+    poll_microseconds = args->poll_interval_microseconds;
+    if (poll_microseconds == 0) {
+        poll_microseconds = 1000U;
+    }
+
+    kvaf_owner_probe_publish(status,
+        KVAF_URMA_OWNER_PROBE_STATE_READY,
+        KVAF_URMA_OWNER_PROBE_RESULT_OK, 0, 0);
+
+    for (;;) {
+        const uint32_t opcode =
+            __atomic_load_n(&command->opcode, __ATOMIC_ACQUIRE);
+
+        if (opcode == KVAF_URMA_OWNER_PROBE_COMMAND_RELEASE) {
+            if (command->magic != KVAF_URMA_OWNER_PROBE_MAGIC ||
+                command->abi_version !=
+                    KVAF_URMA_OWNER_PROBE_ABI_VERSION ||
+                command->struct_size != sizeof(*command) ||
+                command->session_id != args->session_id ||
+                command->sequence !=
+                    KVAF_URMA_OWNER_PROBE_RELEASE_SEQUENCE) {
+                kvaf_owner_probe_publish(status,
+                    KVAF_URMA_OWNER_PROBE_STATE_FAILED,
+                    KVAF_URMA_OWNER_PROBE_RESULT_INVALID_COMMAND,
+                    command->sequence, 0);
+                return 0;
+            }
+            if (kvaf_owner_probe_monotonic_nanoseconds(
+                    CLOCK_MONOTONIC, &now_nanoseconds) != 0 ||
+                now_nanoseconds < start_nanoseconds) {
+                kvaf_owner_probe_publish(status,
+                    KVAF_URMA_OWNER_PROBE_STATE_FAILED,
+                    KVAF_URMA_OWNER_PROBE_RESULT_CLOCK_FAILED,
+                    command->sequence, 0);
+                return 0;
+            }
+            kvaf_owner_probe_publish(status,
+                KVAF_URMA_OWNER_PROBE_STATE_RELEASED,
+                KVAF_URMA_OWNER_PROBE_RESULT_OK,
+                command->sequence,
+                now_nanoseconds - start_nanoseconds);
+            return 0;
+        }
+        if (opcode != KVAF_URMA_OWNER_PROBE_COMMAND_NONE) {
+            kvaf_owner_probe_publish(status,
+                KVAF_URMA_OWNER_PROBE_STATE_FAILED,
+                KVAF_URMA_OWNER_PROBE_RESULT_INVALID_COMMAND, 0, 0);
+            return 0;
+        }
+
+        if (kvaf_owner_probe_monotonic_nanoseconds(
+                CLOCK_MONOTONIC, &now_nanoseconds) != 0 ||
+            now_nanoseconds < start_nanoseconds) {
+            kvaf_owner_probe_publish(status,
+                KVAF_URMA_OWNER_PROBE_STATE_FAILED,
+                KVAF_URMA_OWNER_PROBE_RESULT_CLOCK_FAILED, 0, 0);
+            return 0;
+        }
+        if (now_nanoseconds - start_nanoseconds >= timeout_nanoseconds) {
+            kvaf_owner_probe_publish(status,
+                KVAF_URMA_OWNER_PROBE_STATE_TIMED_OUT,
+                KVAF_URMA_OWNER_PROBE_RESULT_TIMED_OUT, 0,
+                now_nanoseconds - start_nanoseconds);
+            return 0;
+        }
+        kvaf_owner_probe_sleep(poll_microseconds);
+    }
 }

@@ -350,6 +350,12 @@ context 和 URMA/UMMU 资源之前退出，且没有环境变量绕过。只有�
 - 将 Open、等待 AIV 数据面和 Close 合并到一个 AICPU invocation，或实现一个长驻
   ownership service，使 liburma/UDMA/UMMU 指针和句柄始终由同一进程持有。
 
+仓内的 bounded owner probe 只验证不创建 URMA/UMMU 资源的 AICPU/AIV
+`READY -> RELEASE -> RELEASED` 控制记录握手。即使 probe PASS，也不能推导出
+provider Open-transfer-Close 已具备同一 owner，因而不会改变上述 gate。探针矩阵、
+MVP session owner 与 production epoch owner 的边界见
+[A5 AICPU bounded owner probe](a5_aicpu_owner_probe.md)。
+
 ## 6. 操作命令
 
 ### 6.1 服务器 B 宿主机：更新代码并准备固定源码
@@ -625,8 +631,9 @@ memcache。`dev_id` 是宿主机全局 selector；新代码统一通过宿主机
 
 当前版本执行下面命令时会由 AICPU affinity gate 以退出码 2 停止；这是预期的
 fail-closed 结果，不应通过设置环境变量继续。先完成第 5 节所述正式 runtime 契约
-验证或长驻 owner 改造，再由代码评审修改源码门。保留命令仅用于确认门禁位置和为
-后续实现准备参数。
+验证或完整的 MVP session owner 改造，再由代码评审修改源码门。Resource-free
+owner probe 的 PASS 不满足这个条件。保留命令仅用于确认门禁位置和为后续实现准备
+参数。
 
 ```bash
 source /tmp/kvaf_npu7_pair.env
@@ -765,7 +772,8 @@ unset KVAF_DIRECT_ACTIVE_SESSION_FILE KVAF_DIRECT_QUARANTINE_FILE
 - AICPU Open/Close 必须命中同一 KFC worker 和 SO 实例。当前 runner 在任何新硬件
   访问前 fail closed；同-stream PID/cookie/SO-base/generation 采样不是正式保证。
   解除该门需要长驻 AICPU ownership service/单 invocation 生命周期，或当前目标
-  CANN 对同-stream worker affinity 的正式 runtime 契约；
+  CANN 对同-stream worker affinity 的正式 runtime 契约。Resource-free bounded
+  owner probe 只验证并发控制记录，不会单独解除该门；
 - Host DVA 的 `non_pin` 注册和 AIV CQ cache 语义仍需当前 A5 固件实测；
 - 当前逐 descriptor `doorbell -> CQ`，还没有批量 WQE/doorbell/CQ。
 

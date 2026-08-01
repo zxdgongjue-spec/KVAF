@@ -201,6 +201,7 @@ function(kvaf_configure_a5_target target)
   target_include_directories(${target}
     PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/provider/include
       ${CMAKE_CURRENT_SOURCE_DIR}/../include
       ${CMAKE_CURRENT_SOURCE_DIR}/../../include
       ${KVAF_ACL_INCLUDE_DIR}
@@ -257,7 +258,18 @@ if(KVAF_A5_BUILD_DIRECT_URMA_BACKEND)
   )
   kvaf_configure_a5_target(kvaf_a5_aiv_direct_urma_h2d_smoke)
   target_include_directories(kvaf_a5_aiv_direct_urma_h2d_smoke PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/provider/include
+    ${KVAF_RUNTIME_INCLUDE_DIR}
+  )
+
+  # This binary does not open an EID, URMA device, UMMU mapping, SQ or CQ.  It
+  # proves only that one bounded AICPU KFC invocation and an AIV kernel on a
+  # distinct stream can communicate through cache-maintained GM records.
+  add_executable(kvaf_a5_aicpu_owner_probe
+    src/aiv_simt_urma_h2d_kernel.cpp
+    smoke/aicpu_owner_concurrency_probe.cpp
+  )
+  kvaf_configure_a5_target(kvaf_a5_aicpu_owner_probe)
+  target_include_directories(kvaf_a5_aicpu_owner_probe PRIVATE
     ${KVAF_RUNTIME_INCLUDE_DIR}
   )
 endif()

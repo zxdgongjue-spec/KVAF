@@ -6,3 +6,4 @@
 
 - [A5 HCOMM 控制面 + AIV/SIMT direct SQ/CQ H2D MVP](a5_aiv_simt_urma_h2d_mvp.md)
 - [A5 不链接 HCOMM 的 direct URMA H2D](a5_direct_urma_h2d.md)
+- [A5 resource-free AICPU bounded owner probe 与分阶段 owner 设计](a5_aicpu_owner_probe.md)

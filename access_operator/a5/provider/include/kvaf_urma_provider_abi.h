@@ -7,8 +7,11 @@
 #if defined(__GNUC__) || defined(__clang__)
 #define KVAF_URMA_PROVIDER_EXPORT \
   __attribute__((visibility("default")))
+#define KVAF_URMA_PROVIDER_CACHE_ALIGNED \
+  __attribute__((aligned(64)))
 #else
 #define KVAF_URMA_PROVIDER_EXPORT
+#define KVAF_URMA_PROVIDER_CACHE_ALIGNED
 #endif
 
 #ifdef __cplusplus
@@ -19,6 +22,88 @@ extern "C" {
 #define KVAF_URMA_PROVIDER_ABI_VERSION 2U
 #define KVAF_URMA_PROVIDER_NAME_BYTES 32U
 #define KVAF_URMA_PROVIDER_EID_TEXT_BYTES 64U
+
+/*
+ * Resource-free AICPU owner probe ABI.  This protocol proves only that one
+ * bounded AICPU invocation can remain alive while another execution stream
+ * publishes a release command.  It neither creates URMA/UMMU resources nor
+ * establishes a process-affinity contract for separate KFC launches.
+ *
+ * Command and status deliberately occupy different cache lines.  The command
+ * line has one external producer and the status line has one AICPU producer;
+ * consumers synchronize through opcode/state with release/acquire atomics.
+ */
+#define KVAF_URMA_OWNER_PROBE_MAGIC 0x4b4f5052U /* "KOPR" */
+#define KVAF_URMA_OWNER_PROBE_ABI_VERSION 1U
+#define KVAF_URMA_OWNER_PROBE_CACHE_LINE_BYTES 64U
+#define KVAF_URMA_OWNER_PROBE_RELEASE_SEQUENCE UINT64_C(1)
+#define KVAF_URMA_OWNER_PROBE_MAX_TIMEOUT_MILLISECONDS 120000U
+#define KVAF_URMA_OWNER_PROBE_MAX_POLL_MICROSECONDS 10000U
+
+enum kvaf_urma_owner_probe_command {
+  KVAF_URMA_OWNER_PROBE_COMMAND_NONE = 0,
+  KVAF_URMA_OWNER_PROBE_COMMAND_RELEASE = 1,
+};
+
+enum kvaf_urma_owner_probe_state {
+  KVAF_URMA_OWNER_PROBE_STATE_EMPTY = 0,
+  KVAF_URMA_OWNER_PROBE_STATE_READY = 1,
+  KVAF_URMA_OWNER_PROBE_STATE_RELEASED = 2,
+  KVAF_URMA_OWNER_PROBE_STATE_TIMED_OUT = 3,
+  KVAF_URMA_OWNER_PROBE_STATE_FAILED = 4,
+};
+
+enum kvaf_urma_owner_probe_result {
+  KVAF_URMA_OWNER_PROBE_RESULT_OK = 0,
+  KVAF_URMA_OWNER_PROBE_RESULT_TIMED_OUT = 1,
+  KVAF_URMA_OWNER_PROBE_RESULT_CLOCK_FAILED = 2,
+  KVAF_URMA_OWNER_PROBE_RESULT_INVALID_COMMAND = 3,
+};
+
+/* External producer-owned cache line.  Publish opcode last with release. */
+struct KVAF_URMA_PROVIDER_CACHE_ALIGNED kvaf_urma_owner_probe_command_v1 {
+  uint32_t magic;
+  uint32_t abi_version;
+  uint32_t struct_size;
+  uint32_t opcode;
+  uint64_t session_id;
+  uint64_t sequence;
+  uint64_t reserved[4];
+};
+
+/* AICPU owner-owned cache line.  Publish state last with release. */
+struct KVAF_URMA_PROVIDER_CACHE_ALIGNED kvaf_urma_owner_probe_status_v1 {
+  uint32_t magic;
+  uint32_t abi_version;
+  uint32_t struct_size;
+  uint32_t state;
+  uint64_t session_id;
+  uint64_t sequence;
+  int32_t result_code;
+  uint32_t reserved0;
+  uint64_t elapsed_nanoseconds;
+  uint64_t reserved[2];
+};
+
+/*
+ * KFC locates the two names in the first 64 bytes.  timeout_milliseconds is
+ * mandatory and capped above; poll_interval_microseconds may be zero to select
+ * the provider's conservative one-millisecond default.
+ */
+struct KVAF_URMA_PROVIDER_CACHE_ALIGNED kvaf_urma_aicpu_owner_probe_args_v1 {
+  char kernel_name[KVAF_URMA_PROVIDER_NAME_BYTES];
+  char so_name[KVAF_URMA_PROVIDER_NAME_BYTES];
+  uint32_t magic;
+  uint32_t abi_version;
+  uint32_t struct_size;
+  uint32_t timeout_milliseconds;
+  uint64_t session_id;
+  uint64_t command_address;
+  uint64_t status_address;
+  uint32_t poll_interval_microseconds;
+  uint32_t reserved0;
+  uint64_t reserved[2];
+};
 
 enum kvaf_urma_provider_role {
   KVAF_URMA_PROVIDER_SERVER = 0,
@@ -221,6 +306,8 @@ KVAF_URMA_PROVIDER_EXPORT int aicpu_kvaf_urma_open_v2(
     void* opaque_args);
 KVAF_URMA_PROVIDER_EXPORT int aicpu_kvaf_urma_close_v2(
     void* opaque_args);
+KVAF_URMA_PROVIDER_EXPORT int aicpu_kvaf_urma_owner_probe_v1(
+    void* opaque_args);
 
 #ifdef __cplusplus
 }
@@ -233,6 +320,28 @@ static_assert(sizeof(kvaf_urma_aicpu_open_args_v2) == 384,
               "direct URMA AICPU open ABI must be 384 bytes");
 static_assert(sizeof(kvaf_urma_aicpu_close_args_v2) == 128,
               "direct URMA AICPU close ABI must be 128 bytes");
+static_assert(sizeof(kvaf_urma_owner_probe_command_v1) == 64,
+              "owner probe command ABI must be 64 bytes");
+static_assert(alignof(kvaf_urma_owner_probe_command_v1) == 64,
+              "owner probe command must own one cache line");
+static_assert(sizeof(kvaf_urma_owner_probe_status_v1) == 64,
+              "owner probe status ABI must be 64 bytes");
+static_assert(alignof(kvaf_urma_owner_probe_status_v1) == 64,
+              "owner probe status must own one cache line");
+static_assert(sizeof(kvaf_urma_aicpu_owner_probe_args_v1) == 128,
+              "owner probe AICPU args ABI must be 128 bytes");
+static_assert(alignof(kvaf_urma_aicpu_owner_probe_args_v1) == 64,
+              "owner probe AICPU args must be cache-line aligned");
+static_assert(offsetof(kvaf_urma_owner_probe_command_v1, opcode) == 12,
+              "unexpected owner probe command opcode offset");
+static_assert(offsetof(kvaf_urma_owner_probe_status_v1, state) == 12,
+              "unexpected owner probe status state offset");
+static_assert(offsetof(kvaf_urma_aicpu_owner_probe_args_v1,
+                       command_address) == 88,
+              "unexpected owner probe command address offset");
+static_assert(offsetof(kvaf_urma_aicpu_owner_probe_args_v1,
+                       status_address) == 96,
+              "unexpected owner probe status address offset");
 static_assert(offsetof(kvaf_urma_provider_config_v2, session_id) == 40,
               "unexpected direct URMA config session offset");
 static_assert(offsetof(kvaf_urma_provider_config_v2, local_address) == 48,
@@ -252,6 +361,28 @@ _Static_assert(sizeof(struct kvaf_urma_aicpu_open_args_v2) == 384,
                "direct URMA AICPU open ABI must be 384 bytes");
 _Static_assert(sizeof(struct kvaf_urma_aicpu_close_args_v2) == 128,
                "direct URMA AICPU close ABI must be 128 bytes");
+_Static_assert(sizeof(struct kvaf_urma_owner_probe_command_v1) == 64,
+               "owner probe command ABI must be 64 bytes");
+_Static_assert(_Alignof(struct kvaf_urma_owner_probe_command_v1) == 64,
+               "owner probe command must own one cache line");
+_Static_assert(sizeof(struct kvaf_urma_owner_probe_status_v1) == 64,
+               "owner probe status ABI must be 64 bytes");
+_Static_assert(_Alignof(struct kvaf_urma_owner_probe_status_v1) == 64,
+               "owner probe status must own one cache line");
+_Static_assert(sizeof(struct kvaf_urma_aicpu_owner_probe_args_v1) == 128,
+               "owner probe AICPU args ABI must be 128 bytes");
+_Static_assert(_Alignof(struct kvaf_urma_aicpu_owner_probe_args_v1) == 64,
+               "owner probe AICPU args must be cache-line aligned");
+_Static_assert(offsetof(struct kvaf_urma_owner_probe_command_v1, opcode) == 12,
+               "unexpected owner probe command opcode offset");
+_Static_assert(offsetof(struct kvaf_urma_owner_probe_status_v1, state) == 12,
+               "unexpected owner probe status state offset");
+_Static_assert(offsetof(struct kvaf_urma_aicpu_owner_probe_args_v1,
+                        command_address) == 88,
+               "unexpected owner probe command address offset");
+_Static_assert(offsetof(struct kvaf_urma_aicpu_owner_probe_args_v1,
+                        status_address) == 96,
+               "unexpected owner probe status address offset");
 _Static_assert(offsetof(struct kvaf_urma_provider_config_v2, session_id) == 40,
                "unexpected direct URMA config session offset");
 _Static_assert(offsetof(struct kvaf_urma_provider_config_v2, local_address) == 48,

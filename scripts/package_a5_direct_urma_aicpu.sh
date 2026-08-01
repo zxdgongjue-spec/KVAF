@@ -203,7 +203,8 @@ for symbol in \
   kvaf_urma_provider_close_v2 \
   kvaf_urma_provider_private_abi_v2 \
   aicpu_kvaf_urma_open_v2 \
-  aicpu_kvaf_urma_close_v2
+  aicpu_kvaf_urma_close_v2 \
+  aicpu_kvaf_urma_owner_probe_v1
 do
   grep -Eq "[[:space:]]${symbol}(@@KVAF_URMA_PROVIDER_2)?$" \
     <<<"${provider_dynamic_symbols}" ||

@@ -22,6 +22,9 @@ kvaf_require_aicpu_affinity_contract()
       echo "but Open and Close are separate KFC launches." >&2
       echo "A same-stream pid/cookie/SO-base/generation sample is diagnostic only;" >&2
       echo "the public launch ABI cannot bind either future launch to that worker." >&2
+      echo "A bounded, resource-free AICPU owner probe may validate one sampled" >&2
+      echo "AICPU/AIV control-buffer handshake, but probe PASS does NOT prove the" >&2
+      echo "Open-transfer-Close provider lifetime and does NOT unlock direct URMA." >&2
       echo "Hardware execution stays disabled until KVAF validates a documented" >&2
       echo "same-stream same-process/SO runtime contract, or moves the complete" >&2
       echo "Open-transfer-Close lifetime into one invocation/long-lived owner." >&2
