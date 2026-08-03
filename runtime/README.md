@@ -127,33 +127,38 @@ timeout 240s python3 tests/python/test_npu_batch_get.py
 图对象、capture、replay 和销毁都由 Python 测试持有的 `kvaf.AclGraph` 管理；KVAF
 Runtime 与 AccessOperator 不创建或保存图。`AclGraph` 是 pybind 暴露的薄封装，直接
 调用 ACL Runtime Graph 的 `aclmdlRICaptureBegin`、`aclmdlRICaptureEnd`、
-`aclmdlRIExecuteAsync` 和 `aclmdlRIDestroy`。脚本
-先在图外 eager 执行 `output A -> B -> A`，使 A 的 local HBM 注册进入 transport
-cache；再在 raw ACL capture 中只 capture
-`runtime.batch_get(..., stream, synchronize=False)`。图使用一个在 HCCP output
-注册前创建的专用 `graph_stream`。基础图模式用例不在 eager 后创建或修改 NPU tensor：
-它以已验证的固定 `indices` / `mask` / `output_indices` 进行 capture 和 replay，先证明
-KVAF 可以作为外部 ACL 图的节点并测量 replay completion。
+`aclmdlRIExecuteAsync` 和 `aclmdlRIDestroy`。脚本先在图外 eager 执行
+`output A -> B -> A`，使 A 的 local HBM 注册进入 transport cache；再在 raw ACL
+capture 中只 capture `runtime.batch_get(..., stream, synchronize=False)`。
+
+每次 replay 前，Python 在同一 ACL stream 上以
+`AclGraph.copy_host_to_device_async` 更新固定地址的 `address_table`、`indices`、
+`mask`、`output_indices`；capture 中的 BatchGet 参数和所有 NPU tensor 地址不变。正常
+性能口径是 `graph_input_update_to_stream_completion`，包含这四项 H2D 更新与 graph replay。
 
 AIV demo 使用原生
 `aclrtMemcpyAsync(fixed_device_inputs, stream) -> aclmdlRIExecuteAsync(graph, stream)`。
-Python 测试同样使用一个专用 graph stream；KVAF 不拥有这些 input tensor，也不创建、
-保存或 replay 图。图对象会在 Runtime shutdown 前 reset，避免图仍持有调用方 buffer
-时释放 HCCP transport。动态 input content 的图测试与此基础路径分开：AIV C++ demo
-已通过 `aclrtMemcpyAsync` 覆盖；Python ACLGraph 路径须先建立不引入额外 NPU 分配的
-更新方式后再单独启用。
+Python 测试有两种专用 graph stream：`torch.npu.Stream` 用于框架互操作，
+`kvaf.AclStream` 用 `aclrtCreateStream` 创建、用于与 demo 完全同构的 raw ACL 路径。
+`AclGraph.replay(stream)` 显式传入 capture 使用的同一 stream；图对象会在 Runtime
+shutdown 前 reset，避免图仍持有调用方 buffer 时释放 HCCP transport。
 
-图性能指标 `external_graph_replay_to_stream_completion` 包含图 replay 与 graph stream
-同步；不包含 capture、初始化、最终验证和输入更新，因此不能与 eager 指标直接作一一
-对比。
+为缩短远端故障定位，`tests/python/` 提供以下独立 Python 用例，均固定为较小 shape 和
+一次 replay：
 
-`AclGraph.replay(stream)` 显式传入 capture 使用的 `torch.npu.Stream`，并拒绝在另一条
-stream 上 replay；这与 demo 的 `aclmdlRIExecuteAsync(graph, stream)` 同构。上游若
-选择另一条 replay stream，必须自行建立输入依赖、保证其 ACL graph 语义兼容，并等待该
-stream 完成。
+- `test_npu_acl_graph_torch_presync.py`：分离 framework stream 的 H2D 完成与 replay。
+- `test_npu_acl_graph_raw_stream.py`：分离 raw `AclStream` 的 H2D 完成与 replay。
+- `test_npu_acl_graph_raw_stream_replay.py`：raw stream 的正常 H2D + replay。
+- `test_npu_acl_graph_torch_retained_args.py`：framework stream + 稳定 host kernel args。
+- `test_npu_acl_graph_raw_stream_retained_args.py`：raw stream + 稳定 host kernel args。
 
-Python 调用 `batch_get` 必须显式传入 `torch.npu.current_stream()`（或 capture
-stream 对象）。
+`NpuRuntime(..., retain_unsynchronized_launch_args=True)` 仅用于后一类诊断：对
+`synchronize=False` 的请求将 `aclrtLaunchKernelWithHostArgs` 的参数记录保存到 Runtime
+shutdown，以排除 graph replay 访问短生命周期 host args 的可能。
+
+Python 调用 `batch_get` 必须显式传入 `torch.npu.current_stream()`、`torch.npu.Stream`
+或 `kvaf.AclStream`。默认 `synchronize=True` 保持同步接口；只有在外部图 capture
+的调用点传 `synchronize=False`，并由图的调用方在 teardown 前完成 capture stream。
 默认 `synchronize=True` 保持同步接口；只有在外部图 capture 的调用点传
 `synchronize=False`，并由图的调用方在 teardown 前完成 capture stream。
 

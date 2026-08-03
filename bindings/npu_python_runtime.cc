@@ -12,6 +12,7 @@
 
 #include "access_table_python.h"
 #include "acl/acl.h"
+#include "acl_python_utils.h"
 #include "batch_get_abi.h"
 #include "kvaf/access_operator/access_operator.h"
 #include "kvaf/meta_manager/meta_manager.h"
@@ -133,7 +134,8 @@ BatchGetRequest MakeNpuBatchGetRequest(
 class NpuRuntime final {
  public:
   NpuRuntime(std::string kernel_object_path, std::uint32_t device_id,
-             std::uint32_t npu_core_count)
+             std::uint32_t npu_core_count,
+             bool retain_unsynchronized_launch_args)
       : device_id_(device_id), npu_core_count_(npu_core_count),
         meta_manager_(CreateInMemoryMetaManager()) {
     if (kernel_object_path.empty() || npu_core_count == 0 ||
@@ -150,7 +152,8 @@ class NpuRuntime final {
 
     allocator_ = std::make_unique<AclHostDdrAllocator>();
     access_operator_ = std::make_unique<DefaultAccessOperator>(
-        AccessOperatorConfig{std::move(kernel_object_path), npu_core_count_});
+        AccessOperatorConfig{std::move(kernel_object_path), npu_core_count_,
+                             retain_unsynchronized_launch_args});
     runtime_ = std::make_unique<Runtime>(*meta_manager_, *access_operator_,
                                          *allocator_);
   }
@@ -275,14 +278,7 @@ class NpuRuntime final {
                   std::size_t valid_table_bytes,
                   const py::object& stream,
                   bool synchronize) {
-    if (!py::hasattr(stream, "npu_stream")) {
-      throw py::type_error("BatchGet stream must be a torch.npu.Stream");
-    }
-    const std::uint64_t stream_pointer =
-        stream.attr("npu_stream").cast<std::uint64_t>();
-    if (stream_pointer == 0) {
-      throw py::value_error("BatchGet stream must not be null");
-    }
+    const aclrtStream acl_stream = acl_python::StreamFromPython(stream);
     const BatchGetRequest request = MakeNpuBatchGetRequest(
         access_table, indices_pointer, indices_bytes, mask_pointer, mask_bytes,
         output_indices_pointer, output_indices_bytes, output_pointer, output_bytes,
@@ -291,7 +287,7 @@ class NpuRuntime final {
         valid_table_pointer, valid_table_bytes);
     const auto begin = std::chrono::steady_clock::now();
     ThrowIfError(runtime_->BatchGet(
-        request, BatchGetExecutionOptions{PointerFromValue(stream_pointer),
+        request, BatchGetExecutionOptions{acl_stream,
                                            synchronize}));
     const auto end = std::chrono::steady_clock::now();
     return std::chrono::duration<double, std::milli>(end - begin).count();
@@ -325,9 +321,10 @@ class NpuRuntime final {
 
 void BindNpuPythonRuntime(py::module_& module) {
   py::class_<NpuRuntime>(module, "NpuRuntime")
-      .def(py::init<std::string, std::uint32_t, std::uint32_t>(),
+      .def(py::init<std::string, std::uint32_t, std::uint32_t, bool>(),
            py::arg("kernel_object_path"), py::arg("device_id") = 0,
-           py::arg("npu_core_count") = 1)
+           py::arg("npu_core_count") = 1,
+           py::arg("retain_unsynchronized_launch_args") = false)
       .def("initialize", &NpuRuntime::Initialize, py::arg("ddr_bytes"),
            py::arg("slot_size"))
       .def("shutdown", &NpuRuntime::Shutdown)
@@ -354,7 +351,7 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("address_table_pointer"), py::arg("address_table_bytes"),
            py::arg("valid_table_pointer"), py::arg("valid_table_bytes"),
            py::arg("stream"), py::arg("synchronize") = true,
-           "Submit Runtime.BatchGet on caller-owned torch.npu.Stream. The default waits for "
+           "Submit Runtime.BatchGet on a caller-owned ACL stream. The default waits for "
            "completion; external graph capture must pass synchronize=False.");
 }
 

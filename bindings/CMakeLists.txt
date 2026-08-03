@@ -11,7 +11,11 @@ target_include_directories(_kvaf
 )
 
 if(KVAF_ENABLE_AIV_BATCH_GET)
-  target_sources(_kvaf PRIVATE npu_python_runtime.cc acl_graph_python.cc)
+  target_sources(_kvaf PRIVATE
+    acl_python_utils.cc
+    acl_graph_python.cc
+    npu_python_runtime.cc
+  )
   target_link_libraries(_kvaf
     PRIVATE
       kvaf_default_access_operator
