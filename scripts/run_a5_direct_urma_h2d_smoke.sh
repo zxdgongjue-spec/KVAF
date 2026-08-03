@@ -2676,6 +2676,38 @@ deadline=$(( $(date +%s) + KVAF_H2D_RUN_TIMEOUT_SECONDS ))
 while process_is_running "${host_pid}" "${host_expected_start_ticks}" ||
       process_is_running "${device_pid}" "${device_expected_start_ticks}"
 do
+  host_alive=0
+  device_alive=0
+  process_is_running \
+    "${host_pid}" "${host_expected_start_ticks}" && host_alive=1
+  process_is_running \
+    "${device_pid}" "${device_expected_start_ticks}" && device_alive=1
+  # Each worker durably publishes its nonce-bound final marker before exit.
+  # If one identity is already gone without either terminal or fatal
+  # evidence, the peer may wait forever and the pair is UNPROVEN now; waiting
+  # until the global deadline cannot improve that missing process evidence.
+  if (( host_alive == 0 )) &&
+     [[ ! -e "${host_final}" && ! -L "${host_final}" ]] &&
+     ! valid_fatal_marker "${exchange_dir}/fatal.host"; then
+    retain_unproven_active_session \
+      host_exited_without_terminal \
+      pair_terminal_unproven_process_stuck
+    dump_worker_failure_logs
+    run_completed=1
+    trap - EXIT
+    exit 5
+  fi
+  if (( device_alive == 0 )) &&
+     [[ ! -e "${device_final}" && ! -L "${device_final}" ]] &&
+     ! valid_fatal_marker "${exchange_dir}/fatal.device"; then
+    retain_unproven_active_session \
+      device_exited_without_terminal \
+      pair_terminal_unproven_process_stuck
+    dump_worker_failure_logs
+    run_completed=1
+    trap - EXIT
+    exit 5
+  fi
   if any_valid_fatal_marker || terminal_explicit_unsafe_proven; then
     record_quarantine "unsafe_provider_teardown"
     # The first explicit unsafe edge used to exit with only the final reason,
@@ -2713,6 +2745,7 @@ do
     retain_unproven_active_session \
       bounded_wait_expired \
       pair_terminal_unproven_process_stuck
+    dump_worker_failure_logs
     run_completed=1
     trap - EXIT
     exit 5

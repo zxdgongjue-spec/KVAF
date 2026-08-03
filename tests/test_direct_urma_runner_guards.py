@@ -292,6 +292,39 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
         self.assertIn("h2d_control_timeout_seconds=%s", self.source)
         self.assertIn("h2d_run_timeout_seconds=%s", self.source)
 
+    def test_pair_supervisor_reports_missing_terminal_without_waiting_to_deadline(self) -> None:
+        supervisor_start = self.source.index(
+            'deadline=$(( $(date +%s) + KVAF_H2D_RUN_TIMEOUT_SECONDS ))'
+        )
+        supervisor = self.source[
+            supervisor_start : self.source.index(
+                'wait "${host_pid}"', supervisor_start
+            )
+        ]
+        self.assertIn("host_exited_without_terminal", supervisor)
+        self.assertIn("device_exited_without_terminal", supervisor)
+        self.assertGreaterEqual(supervisor.count("dump_worker_failure_logs"), 3)
+        self.assertIn("bounded_wait_expired", supervisor)
+        host_missing = supervisor[
+            supervisor.index("host_exited_without_terminal") :
+            supervisor.index("device_exited_without_terminal")
+        ]
+        device_missing = supervisor[
+            supervisor.index("device_exited_without_terminal") :
+            supervisor.index("if any_valid_fatal_marker")
+        ]
+        timeout_missing = supervisor[
+            supervisor.index("bounded_wait_expired") :
+        ]
+        for branch in (host_missing, device_missing, timeout_missing):
+            self.assertIn("dump_worker_failure_logs", branch)
+            for forbidden in (
+                "kill ",
+                "clear_active_session",
+                "record_quarantine",
+            ):
+                self.assertNotIn(forbidden, branch)
+
     def test_device_launch_waits_for_pid_bound_host_listener(self) -> None:
         for expected in (
             "KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS",

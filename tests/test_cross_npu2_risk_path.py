@@ -186,6 +186,10 @@ class CrossNpu2RiskPathTests(unittest.TestCase):
         )
         self.assertIn("KVAF_DIRECT_ALLOW_BUSY_NPU=0", source)
         self.assertNotIn("KVAF_DIRECT_ALLOW_BUSY_NPU=1", source)
+        self.assertIn(
+            "KVAF_H2D_RUN_TIMEOUT_SECONDS=${KVAF_H2D_RUN_TIMEOUT_SECONDS:-180}",
+            source,
+        )
         self.assertIn("zero-wqe", source)
         self.assertIn("one-kib", source)
         self.assertNotIn("4096", source)

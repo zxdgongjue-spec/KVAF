@@ -396,6 +396,12 @@ result 和锁命名空间，但仍持有跨 NPU 实验互斥锁，避免第二�
 NPU2 成功只说明该次 NPU2 证据闭环，不能清理或降级原 NPU7 quarantine。之后的
 生产 runner 也仍会被全局 quarantine 拒绝。
 
+cross-NPU2 tiny-stage 的默认 worker supervision deadline 为 180 秒。它保持
+Device/provider control deadline 120 秒、Host ready deadline 30 秒以及派生的
+Host control deadline 155 秒，并留出 25 秒终态收敛余量。该 deadline 只让 runner
+更早返回 `PENDING_UNPROVEN`；不会取消 AICPU owner、发送信号或把未证明资源当作
+已经销毁。
+
 这里的剩余风险来自整机共享层：不同 UDMA device/EID/Jetty 并不能证明 UMMU 的
 PASID/TID、驱动内部 ownership 或 AICPU worker/SO 状态按 NPU 完全隔离。因此这个
 模式可能仍让 NPU2 或整机进入需要重启才能恢复的状态。它的价值是用最小增量实验
