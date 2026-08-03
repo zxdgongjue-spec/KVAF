@@ -16,10 +16,9 @@ caller-owned buffer 与远端 DDR 组织为一次数据搬运。它不拥有 Key
 | 接口 | 当前行为 | 目的 |
 | --- | --- | --- |
 | `Initialize(remote_region)` | 已支持 | 加载 BatchGet kernel，并为 Runtime-owned Host DDR 创建可复用 transport。初始化不接收 output HBM。 |
-| `ExecuteBatchGet(request)` | 已支持，同步 | 使用 request 内 caller-owned NPU output/status/queue，Acquire 对应的 local HBM buffer，launch 后同步等待，再 Release。相同 `(output 地址, bytes)` 由底层 transport 缓存复用。 |
+| `ExecuteBatchGet(request)` | 已支持，默认同步 | 使用 request 内 caller-owned NPU output/status/queue 和 stream，Acquire 对应的 local HBM buffer，launch 后按 execution 选项同步等待。相同 `(output 地址, bytes)` 由底层 transport 缓存复用。 |
 | `ExecuteBatchPut(request)` | 已支持，测试 mock | 对 caller-owned NPU input block 执行同步 `aclrtMemcpy(DeviceToHost)` 到 MetaManager 预留的 Host DDR 地址，然后由 Runtime CommitPut。它只用于当前 BatchGet 集成测试，不是最终 BatchPut 数据面。 |
-| `CaptureBatchGetGraph(request)` | 已支持，CANN Adapter 扩展 | 固定 caller-owned tensor / output 地址并 capture 一次 AIV launch；返回的 graph 可在内容更新后 replay。它不是通用 Runtime virtual API。 |
-| `Shutdown()` | 已支持 | 同步 stream 后释放 transport 及其缓存的 local HBM MR。 |
+| `Shutdown()` | 已支持 | 释放 transport 及其缓存的 local HBM MR。调用方必须先完成所有外部 stream/graph 工作。 |
 
 当前 BatchGet 是固定大小 block 的同步 POC：NPU 侧 `indices`、`mask`、
 `output_indices`、device AccessTable、`output`、`status` 和 `queue_state` 都由
@@ -42,11 +41,10 @@ Runtime.BatchGet(request with output B)
   -> launch + stream synchronize
   -> LocalBufferRelease(B)
 
-CaptureBatchGetGraph(request with fixed output A)
-  -> LocalBufferAcquire(A) retained by graph
-  -> ACL capture one AIV launch
-  -> replay: producer update + graph execute + stream synchronize
-  -> graph destruction: LocalBufferRelease(A)
+Python / torch_npu external graph
+  -> warm up Runtime.BatchGet(output A) outside capture
+  -> torch.npu.graph capture(pre-op -> Runtime.BatchGet(stream, synchronize=false) -> post-op)
+  -> torch_npu owns replay / graph destruction / stream completion
 
 Runtime.BatchPut(request with NPU input)
   -> aclrtMemcpy(DeviceToHost) per reserved block  # temporary test mock
@@ -57,9 +55,10 @@ Runtime.Shutdown
 ```
 
 `LocalBufferAcquire/Release` 是 demo host 库的内部协作接口，Operator 上层只调用
-`Runtime.BatchGet`。当前 Runtime 是同步的，因此每次 Release 前已完成 stream
-同步；如果未来加入异步接口，MR 的 Release/Destroy 必须改为等待对应 completion
-event，不能沿用当前同步时序。
+`Runtime.BatchGet`。默认同步调用会在 Release 前完成 stream；外部 graph capture
+只能使用已预热、因而命中 transport cache 的 output，并由 Python/框架保证 graph
+replay 完成后才释放 tensor、AccessTable 和 Runtime。KVAF 不创建、保存或 replay
+任何图对象。
 
 ## 构建范围
 
@@ -68,8 +67,8 @@ event，不能沿用当前同步时序。
 demo；名称中的 AIV 只保留在 demo/kernel 实现目录，非 Runtime 的公开路径选择。
 
 Selector / Executor / Template 分层、通用图调度/与上游框架图的整合、异步执行与真实
-BatchPut 数据面均不属于当前范围。当前仅提供 CANN Adapter 的固定地址 BatchGet
-capture/replay POC。
+BatchPut 数据面均不属于当前范围。CANN Adapter 只提供可被上游固定地址图 capture
+的 BatchGet 提交，不管理图对象。
 
 ## 后续待决事项：BatchGet / BatchPut Transport
 

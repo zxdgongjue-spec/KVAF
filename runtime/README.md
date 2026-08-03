@@ -113,7 +113,8 @@ teardown。它以 `KVAF_NPU_ACTIVE_PERCENT` 构造稀疏 mask（例如 `5` 表�
 有效 address scatter 到可很大的 Device AccessTable。该 mock 验证 Runtime 的
 BatchPut 事务编排，但不代表未来的 BatchPut 数据面实现。
 
-设置 `KVAF_NPU_GRAPH_REPLAYS` 可在同一个 Python 用例中额外运行 ACL 图模式：
+设置 `KVAF_NPU_GRAPH_REPLAYS` 可在同一个 Python 用例中额外运行外部
+`torch.npu.NPUGraph` 图模式：
 
 ```bash
 KVAF_NPU_GRAPH_REPLAYS=2 \
@@ -123,15 +124,19 @@ KVAF_NPU_GRAPH_ITERATIONS=20 \
 timeout 240s python3 tests/python/test_npu_batch_get.py
 ```
 
-图 capture 固定 caller-owned 的 Device tensor 地址、输出地址和对应的 local HBM
-注册；每次 replay 前脚本只更新固定 tensor 的 `indices` 与 `output_indices` 内容。
-`capture_batch_get_graph` 返回 opaque handle，必须在关联 AccessTable 释放前调用
-`release_batch_get_graph`。图性能指标
-`graph_producer_update_to_stream_completion` 包含 Runtime 私有 stream 上一个 1-byte
-producer update、graph replay 与同步；不包含 Python/Torch 对输入 tensor 的写入、
-capture、初始化和最终验证，因此不能与 eager 指标直接作一一对比。这个 1-byte
-更新是当前 demo 已观测到裸 graph replay 可能停滞时的同步 POC；它不代表业务输入
-更新，也不是纯 kernel 性能指标。
+图对象、capture、replay 和销毁都由 `torch_npu` 持有；KVAF 不创建或保存图。脚本
+先在图外 eager 执行 `output A -> B -> A`，使 A 的 local HBM 注册进入 transport
+cache；再在 `torch.npu.graph(...)` 中 capture 固定地址的 `indices.copy_`、
+`output_indices.copy_`、`output.zero_`、`runtime.batch_get(..., stream,
+synchronize=False)` 和一个后续 PyTorch copy。每次 replay 只在图外更新固定 source
+tensor 内容。图性能指标 `external_graph_replay_to_stream_completion` 包含整张外部图
+replay 与 capture stream 同步；不包含图外 source 更新、capture、初始化和最终验证，
+因此不能与 eager 指标直接作一一对比。
+
+Python 调用 `batch_get` 必须显式传入 `torch.npu.current_stream()`（或 capture
+stream 对象）。
+默认 `synchronize=True` 保持同步接口；只有在外部图 capture 的调用点传
+`synchronize=False`，并由图的调用方在 teardown 前完成 capture stream。
 
 正确性验证完成后，脚本会输出
 `PERF_RESULT metric=runtime_batch_get_call_to_stream_completion`。这个计时窗口

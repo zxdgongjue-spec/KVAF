@@ -7,7 +7,6 @@
 #include <utility>
 
 #include "acl/acl.h"
-#include "acl/acl_mdl.h"
 #include "batch_get_abi.h"
 #include "kvaf_aiv_batch_get.h"
 #include "kvaf/meta_manager/meta_manager.h"
@@ -107,55 +106,6 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
 
 }  // namespace
 
-struct CapturedBatchGetGraph::Impl {
-  aclmdlRI graph_model{nullptr};
-  aclrtStream stream{nullptr};
-  KvafBatchGetLocalBuffer* local_buffer{nullptr};
-  void* replay_epoch{nullptr};
-  std::uint8_t next_epoch{0};
-};
-
-CapturedBatchGetGraph::~CapturedBatchGetGraph() {
-  if (impl_ == nullptr) {
-    return;
-  }
-  if (impl_->stream != nullptr) {
-    (void)aclrtSynchronizeStream(impl_->stream);
-  }
-  if (impl_->graph_model != nullptr) {
-    (void)aclmdlRIDestroy(impl_->graph_model);
-  }
-  if (impl_->replay_epoch != nullptr) {
-    (void)aclrtFree(impl_->replay_epoch);
-  }
-  if (impl_->local_buffer != nullptr) {
-    KvafBatchGetLocalBufferRelease(impl_->local_buffer);
-  }
-}
-
-Status CapturedBatchGetGraph::Replay() {
-  if (impl_ == nullptr || impl_->graph_model == nullptr ||
-      impl_->stream == nullptr || impl_->replay_epoch == nullptr) {
-    return Status::InvalidState("BatchGet graph has been released");
-  }
-  ++impl_->next_epoch;
-  // The underlying demo has observed that a completely naked graph replay can
-  // stall. Put a tiny, independent producer operation on the same private
-  // stream before every replay; the caller's fixed tensors are not modified.
-  if (aclrtMemcpyAsync(impl_->replay_epoch, sizeof(impl_->next_epoch),
-                       &impl_->next_epoch, sizeof(impl_->next_epoch),
-                       ACL_MEMCPY_HOST_TO_DEVICE, impl_->stream) != ACL_SUCCESS) {
-    return Internal("failed to enqueue graph replay producer update");
-  }
-  if (aclmdlRIExecuteAsync(impl_->graph_model, impl_->stream) != ACL_SUCCESS) {
-    return Internal("failed to enqueue captured BatchGet graph");
-  }
-  if (aclrtSynchronizeStream(impl_->stream) != ACL_SUCCESS) {
-    return Internal("captured BatchGet graph stream synchronization failed");
-  }
-  return Status::OK();
-}
-
 struct DefaultAccessOperator::Impl {
   explicit Impl(AccessOperatorConfig init_config) : config(std::move(init_config)) {}
 
@@ -175,8 +125,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     return InvalidState("AccessOperator has already been initialized");
   }
   if (remote_region.base == 0 || remote_region.length == 0 ||
-      impl_->config.kernel_object_path.empty() || impl_->config.stream == nullptr ||
-      impl_->config.npu_core_count == 0 ||
+      impl_->config.kernel_object_path.empty() || impl_->config.npu_core_count == 0 ||
       impl_->config.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES) {
     return InvalidArgument("invalid AccessOperator initialization config");
   }
@@ -203,25 +152,25 @@ Status DefaultAccessOperator::Shutdown() {
     return Status::OK();
   }
 
-  Status result = Status::OK();
-  // BatchGet is synchronous. Synchronize once more before destroying cached
-  // local HBM registrations so a caller cannot tear down an in-flight WQE.
-  if (aclrtSynchronizeStream(static_cast<aclrtStream>(impl_->config.stream)) != ACL_SUCCESS) {
-    result = Internal("BatchGet stream synchronization failed during shutdown");
-  }
+  // Every synchronous BatchGet completes before it returns. Callers that
+  // submit with synchronize=false (for an externally captured graph) must
+  // complete their stream before Runtime::Shutdown.
   if (impl_->transport != nullptr) {
     KvafBatchGetTransportDestroy(impl_->transport);
   }
   impl_->transport = nullptr;
   impl_->remote_region = RemoteRegionDesc{};
   impl_->initialized = false;
-  return result;
+  return Status::OK();
 }
 
 Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   if (!impl_->initialized || impl_->transport == nullptr) {
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
+  }
+  if (exec.execution.stream == nullptr) {
+    return InvalidArgument("NPU BatchGet requires a caller-owned ACL stream");
   }
   KvafExecuteBatchGetKernelArgs arguments{};
   Status status = BuildBatchGetKernelArgs(exec, impl_->config.npu_core_count,
@@ -241,79 +190,24 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   }
   arguments.channel_entity = channel_entity;
 
-  const int32_t launch_result = KvafExecuteBatchGetLaunch(
-      &arguments, static_cast<aclrtStream>(impl_->config.stream));
+  const aclrtStream stream = static_cast<aclrtStream>(exec.execution.stream);
+  const int32_t launch_result = KvafExecuteBatchGetLaunch(&arguments, stream);
   if (launch_result != KVAF_BATCH_GET_SUCCESS) {
     KvafBatchGetLocalBufferRelease(local_buffer);
     return Internal("failed to launch BatchGet");
   }
-  const aclError sync_result =
-      aclrtSynchronizeStream(static_cast<aclrtStream>(impl_->config.stream));
-  KvafBatchGetLocalBufferRelease(local_buffer);
-  if (sync_result != ACL_SUCCESS) {
-    return Internal("BatchGet stream synchronization failed");
+  if (exec.execution.synchronize) {
+    const aclError sync_result = aclrtSynchronizeStream(stream);
+    KvafBatchGetLocalBufferRelease(local_buffer);
+    if (sync_result != ACL_SUCCESS) {
+      return Internal("BatchGet stream synchronization failed");
+    }
+  } else {
+    // The demo transport caches zero-reference registrations until shutdown.
+    // Releasing after an externally captured launch keeps KVAF graph-agnostic;
+    // the caller owns stream completion and tensor lifetime.
+    KvafBatchGetLocalBufferRelease(local_buffer);
   }
-  return Status::OK();
-}
-
-Status DefaultAccessOperator::CaptureBatchGetGraph(
-    const BatchGetExecRequest& exec,
-    std::unique_ptr<CapturedBatchGetGraph>* graph) {
-  if (!impl_->initialized || impl_->transport == nullptr) {
-    return Status::NotInitialized("AccessOperator has not been initialized");
-  }
-  if (graph == nullptr) {
-    return InvalidArgument("BatchGet graph result must not be null");
-  }
-  if (*graph != nullptr) {
-    return InvalidState("BatchGet graph result must be empty");
-  }
-
-  KvafExecuteBatchGetKernelArgs arguments{};
-  Status status = BuildBatchGetKernelArgs(exec, impl_->config.npu_core_count,
-                                          &arguments);
-  if (!status.ok()) {
-    return status;
-  }
-
-  KvafBatchGetLocalBuffer* local_buffer = nullptr;
-  std::uint64_t channel_entity = 0;
-  if (KvafBatchGetLocalBufferAcquire(impl_->transport,
-                                     reinterpret_cast<void*>(arguments.output),
-                                     exec.request->output.bytes, &local_buffer,
-                                     &channel_entity) != KVAF_BATCH_GET_SUCCESS ||
-      local_buffer == nullptr || channel_entity == 0) {
-    return Internal("failed to acquire caller output for BatchGet graph");
-  }
-  arguments.channel_entity = channel_entity;
-
-  auto captured = std::unique_ptr<CapturedBatchGetGraph>(
-      new CapturedBatchGetGraph());
-  captured->impl_ = std::make_unique<CapturedBatchGetGraph::Impl>();
-  captured->impl_->stream = static_cast<aclrtStream>(impl_->config.stream);
-  captured->impl_->local_buffer = local_buffer;
-  if (aclrtMalloc(&captured->impl_->replay_epoch, 1U,
-                  ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
-      captured->impl_->replay_epoch == nullptr) {
-    return Internal("failed to allocate graph replay producer buffer");
-  }
-
-  if (aclmdlRICaptureBegin(captured->impl_->stream,
-                           ACL_MODEL_RI_CAPTURE_MODE_RELAXED) != ACL_SUCCESS) {
-    return Internal("failed to begin BatchGet graph capture");
-  }
-  if (KvafExecuteBatchGetLaunch(&arguments, captured->impl_->stream) !=
-      KVAF_BATCH_GET_SUCCESS) {
-    (void)aclmdlRICaptureEnd(captured->impl_->stream,
-                             &captured->impl_->graph_model);
-    return Internal("failed to capture BatchGet launch");
-  }
-  if (aclmdlRICaptureEnd(captured->impl_->stream,
-                          &captured->impl_->graph_model) != ACL_SUCCESS ||
-      captured->impl_->graph_model == nullptr) {
-    return Internal("failed to finish BatchGet graph capture");
-  }
-  *graph = std::move(captured);
   return Status::OK();
 }
 

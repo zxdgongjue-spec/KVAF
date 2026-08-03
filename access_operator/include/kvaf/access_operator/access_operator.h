@@ -17,30 +17,6 @@ struct BatchPutExecRequest {
   const PutAccessDesc* put_desc{nullptr};
 };
 
-// Opaque fixed-shape ACL graph captured from one BatchGet launch. It retains
-// the caller-owned output's local HBM registration until destruction; callers
-// must therefore keep every captured request buffer alive for its lifetime.
-class CapturedBatchGetGraph {
- public:
-  ~CapturedBatchGetGraph();
-
-  CapturedBatchGetGraph(const CapturedBatchGetGraph&) = delete;
-  CapturedBatchGetGraph& operator=(const CapturedBatchGetGraph&) = delete;
-
-  // Enqueues one replay and waits for stream completion. Device tensor
-  // contents may change between replays, but their addresses and shapes are
-  // fixed by capture.
-  Status Replay();
-
- private:
-  friend class DefaultAccessOperator;
-
-  CapturedBatchGetGraph() = default;
-
-  struct Impl;
-  std::unique_ptr<Impl> impl_;
-};
-
 // KV Access Operator 是 Runtime 的数据面依赖。Runtime 管理远端 DDR
 // 生命周期和 Meta 可见性；Operator 只负责初始化链路并执行同步搬运。
 class AccessOperator {
@@ -54,12 +30,10 @@ class AccessOperator {
   virtual Status ExecuteBatchPut(const BatchPutExecRequest& request) = 0;
 };
 
-// Configuration for the current NPU-backed default implementation. The
-// caller owns the ACL stream; AccessOperator owns only the Direct-HCCP
-// transport created on that stream's selected device.
+// Configuration for the current NPU-backed default implementation. Transport
+// 不绑定 ACL stream；每次 BatchGet 都通过 request.execution 接收调用方 stream。
 struct AccessOperatorConfig {
   std::string kernel_object_path;
-  void* stream{nullptr};
   std::uint32_t npu_core_count{0};
 };
 
@@ -84,12 +58,6 @@ class DefaultAccessOperator final : public AccessOperator {
   Status Shutdown() override;
   Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
   Status ExecuteBatchPut(const BatchPutExecRequest& request) override;
-
-  // Captures the fixed-address BatchGet launch. This is a CANN adapter
-  // extension rather than an AccessOperator virtual method: the generic
-  // synchronous Runtime keeps no graph-specific API.
-  Status CaptureBatchGetGraph(const BatchGetExecRequest& request,
-                               std::unique_ptr<CapturedBatchGetGraph>* graph);
 
  private:
   struct Impl;

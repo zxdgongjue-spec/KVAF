@@ -80,10 +80,20 @@ struct BatchFreeRequest {
   std::vector<KeyId> keys;
 };
 
-// Runtime 向 AccessOperator 提交的同步 BatchGet 描述。
+// 一次 BatchGet 提交使用的调用方 stream。Runtime 不解释 stream 的具体
+// 类型；当前 CANN Adapter 将它解释为 aclrtStream。同步调用保持默认行为。
+// 外部框架在 capture 自己的计算图时可设 synchronize=false，由图的 replay
+// 调用方负责完成同步和所有 caller-owned buffer 的生命周期。
+struct BatchGetExecutionOptions {
+  void* stream{nullptr};
+  bool synchronize{true};
+};
+
+// Runtime 向 AccessOperator 提交的 BatchGet 描述。
 struct BatchGetExecRequest {
   AccessTableView host_access_table;
   const BatchGetRequest* request{nullptr};
+  BatchGetExecutionOptions execution;
 };
 
 // Runtime 向 AccessOperator 提交的同步 BatchPut 描述。put_desc 的具体

@@ -13,6 +13,7 @@ from pathlib import Path
 import statistics
 import struct
 import sys
+import time
 from typing import Iterable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -196,13 +197,12 @@ def main() -> int:
     output_indices_values = [output_rows - 1 - request for request in range(requests)]
     ddr_bytes = active_requests * source_stride
 
-    # torch_npu owns ACL process initialization. Select the same device before
-    # creating the private ACL stream in the pybind Runtime.
+    # torch_npu owns ACL process initialization. Select the device before
+    # passing its caller-owned streams through the pybind Runtime.
     torch.npu.set_device(device_id)
     device = f"npu:{device_id}"
     runtime = kvaf.NpuRuntime(str(kernel), device_id, npu_core_count)
     table = None
-    graph = None
     try:
         print(
             "RUNTIME_NPU_SPARSE_LAYOUT "
@@ -270,7 +270,7 @@ def main() -> int:
         torch.npu.synchronize()
         print("RUNTIME_NPU_PHASE_DONE phase=caller_buffer_setup")
 
-        def execute(output: object) -> float:
+        def execute(output: object, stream: object, synchronize: bool = True) -> float:
             return runtime.batch_get(
                 table,
                 int(indices.data_ptr()),
@@ -290,10 +290,13 @@ def main() -> int:
                 tensor_bytes(address_table),
                 int(valid_table.data_ptr()),
                 tensor_bytes(valid_table),
+                stream,
+                synchronize,
             )
 
         print("RUNTIME_NPU_PHASE_BEGIN phase=runtime_batch_get")
-        execute(output_a)
+        caller_stream = torch.npu.current_stream()
+        execute(output_a, caller_stream)
         torch.npu.synchronize()
         validate_output(
             tensor_to_bytes(output_a), mask_values, output_indices_values,
@@ -312,7 +315,7 @@ def main() -> int:
         # Runtime must acquire A and B independently, then reuse A's cached
         # local HBM registration on the third call. The transport is owned by
         # the operator and remains unchanged throughout this sequence.
-        execute(output_b)
+        execute(output_b, caller_stream)
         torch.npu.synchronize()
         validate_output(
             tensor_to_bytes(output_b), mask_values, output_indices_values,
@@ -326,7 +329,7 @@ def main() -> int:
             npu_core_count,
             2,
         )
-        execute(output_a)
+        execute(output_a, caller_stream)
         torch.npu.synchronize()
         validate_output(
             tensor_to_bytes(output_a), mask_values, output_indices_values,
@@ -343,8 +346,8 @@ def main() -> int:
         print("RUNTIME_NPU_DYNAMIC_OUTPUT_VALIDATION_PASS sequence=A_B_A")
 
         for _ in range(warmup):
-            execute(output_a)
-        samples = [execute(output_a) for _ in range(iterations)]
+            execute(output_a, caller_stream)
+        samples = [execute(output_a, caller_stream) for _ in range(iterations)]
         torch.npu.synchronize()
         print("RUNTIME_NPU_PHASE_BEGIN phase=post_perf_validation")
         validate_output(
@@ -377,15 +380,32 @@ def main() -> int:
         )
 
         if graph_replays:
+            if not hasattr(torch.npu, "NPUGraph") or not hasattr(torch.npu, "graph"):
+                print(
+                    "FAIL: external graph test requires torch.npu.NPUGraph and torch.npu.graph",
+                    file=sys.stderr,
+                )
+                return 2
             print(
                 "RUNTIME_NPU_GRAPH_CAPTURE_CONTRACT "
                 "fixed_tensor_addresses=1 "
+                "external_graph_owner=torch_npu "
                 "dynamic_tensor_contents=indices_output_indices "
                 f"functional_replays={graph_replays} "
                 f"perf_warmup={graph_warmup} perf_samples={graph_iterations}"
             )
 
-            def update_graph_inputs(epoch: int) -> list[int | None]:
+            graph_indices_source = torch.empty(
+                requests, dtype=torch.int32, device=device
+            )
+            graph_output_indices_source = torch.empty(
+                requests, dtype=torch.int32, device=device
+            )
+            graph_post_marker = torch.zeros(1, dtype=torch.uint8, device=device)
+
+            def update_graph_sources(
+                epoch: int,
+            ) -> tuple[list[int | None], list[int]]:
                 graph_indices = [table_capacity - 1] * requests
                 graph_payload_slots: list[int | None] = [None] * requests
                 for ordinal, request in enumerate(active_request_positions):
@@ -395,59 +415,50 @@ def main() -> int:
                 graph_output_indices = [
                     (row + epoch) % output_rows for row in output_indices_values
                 ]
-                indices.copy_(
+                graph_indices_source.copy_(
                     torch.tensor(graph_indices, dtype=torch.int32, device=device)
                 )
-                output_indices.copy_(
+                graph_output_indices_source.copy_(
                     torch.tensor(
                         graph_output_indices, dtype=torch.int32, device=device
                     )
                 )
-                output_a.zero_()
-                # Torch writes use its current stream; the captured ACL graph
-                # uses Runtime's private stream. Complete the producer stream
-                # before replaying the fixed-address graph.
+                # The captured graph copies these fixed source tensors on its
+                # own stream before calling KVAF. Complete the producer stream
+                # that updates their contents before each replay.
                 torch.npu.synchronize()
-                return graph_payload_slots
+                return graph_payload_slots, graph_output_indices
 
+            graph_payload_slots, graph_output_indices = update_graph_sources(0)
+            capture_stream = torch.npu.Stream(device=device_id)
+            graph = torch.npu.NPUGraph()
             print("RUNTIME_NPU_PHASE_BEGIN phase=graph_capture")
-            graph = runtime.capture_batch_get_graph(
-                table,
-                int(indices.data_ptr()),
-                tensor_bytes(indices),
-                int(mask.data_ptr()),
-                tensor_bytes(mask),
-                int(output_indices.data_ptr()),
-                tensor_bytes(output_indices),
-                int(output_a.data_ptr()),
-                tensor_bytes(output_a),
-                int(status.data_ptr()),
-                tensor_bytes(status),
-                int(queue.data_ptr()),
-                tensor_bytes(queue),
-                block_bytes,
-                int(address_table.data_ptr()),
-                tensor_bytes(address_table),
-                int(valid_table.data_ptr()),
-                tensor_bytes(valid_table),
-            )
-            print(f"RUNTIME_NPU_PHASE_DONE phase=graph_capture graph={graph}")
+            # output_a was already used by eager A -> B -> A above, so its
+            # Direct-HCCP local HBM registration is cached before capture.
+            # The external torch_npu graph owns capture, replay and lifetime.
+            with torch.npu.graph(graph, stream=capture_stream, capture_error_mode="relaxed"):
+                indices.copy_(graph_indices_source)
+                output_indices.copy_(graph_output_indices_source)
+                output_a.zero_()
+                execute(output_a, capture_stream, synchronize=False)
+                graph_post_marker.copy_(output_a[:1])
+            print("RUNTIME_NPU_PHASE_DONE phase=graph_capture owner=torch_npu")
 
             graph_completed_batches = 3 + warmup + iterations
             for replay in range(graph_replays):
-                graph_payload_slots = update_graph_inputs(replay)
-                runtime.replay_batch_get_graph(graph)
+                graph_payload_slots, graph_output_indices = update_graph_sources(replay)
+                graph.replay()
+                capture_stream.synchronize()
                 graph_completed_batches += 1
                 validate_output(
                     tensor_to_bytes(output_a),
                     mask_values,
-                    [
-                        (row + replay) % output_rows
-                        for row in output_indices_values
-                    ],
+                    graph_output_indices,
                     graph_payload_slots,
                     block_bytes,
                 )
+                if tensor_to_bytes(graph_post_marker) != tensor_to_bytes(output_a[:1]):
+                    raise AssertionError("external graph post-KVAF marker mismatch")
                 validate_completion(
                     tensor_to_bytes(status),
                     tensor_to_bytes(queue),
@@ -460,21 +471,24 @@ def main() -> int:
 
             print("RUNTIME_NPU_GRAPH_PERF_WARMUP_BEGIN")
             for warmup_iteration in range(graph_warmup):
-                update_graph_inputs(graph_replays + warmup_iteration)
-                runtime.replay_batch_get_graph(graph)
+                update_graph_sources(graph_replays + warmup_iteration)
+                graph.replay()
+                capture_stream.synchronize()
                 graph_completed_batches += 1
             print(f"RUNTIME_NPU_GRAPH_PERF_WARMUP_DONE count={graph_warmup}")
 
             graph_samples = []
-            final_graph_payload_slots = None
-            final_graph_output_indices = None
+            final_graph_payload_slots: list[int | None] = []
+            final_graph_output_indices: list[int] = []
             for iteration in range(graph_iterations):
                 epoch = graph_replays + graph_warmup + iteration
-                final_graph_payload_slots = update_graph_inputs(epoch)
-                final_graph_output_indices = [
-                    (row + epoch) % output_rows for row in output_indices_values
-                ]
-                graph_samples.append(runtime.replay_batch_get_graph(graph))
+                final_graph_payload_slots, final_graph_output_indices = (
+                    update_graph_sources(epoch)
+                )
+                begin = time.perf_counter()
+                graph.replay()
+                capture_stream.synchronize()
+                graph_samples.append((time.perf_counter() - begin) * 1000.0)
                 graph_completed_batches += 1
 
             validate_output(
@@ -497,7 +511,7 @@ def main() -> int:
                 active_requests * block_bytes / (1024.0**3) / (graph_mean_ms / 1000.0)
             )
             print(
-                "GRAPH_PERF_RESULT metric=graph_producer_update_to_stream_completion "
+                "GRAPH_PERF_RESULT metric=external_graph_replay_to_stream_completion "
                 f"samples={graph_iterations} warmup_excluded={graph_warmup} "
                 f"active_requests={active_requests} block_bytes={block_bytes} "
                 f"npu_cores={npu_core_count} mean_ms={graph_mean_ms:.3f} "
@@ -506,11 +520,10 @@ def main() -> int:
                 f"p99_ms={percentile(graph_samples, 0.99):.3f} "
                 f"useful_GiBps={graph_useful_gibps:.3f}"
             )
+            graph.reset()
         return 0
     finally:
         print("RUNTIME_NPU_PHASE_BEGIN phase=teardown")
-        if graph is not None:
-            runtime.release_batch_get_graph(graph)
         if table is not None and runtime.initialized:
             runtime.release_access_table(table)
         if runtime.initialized:

@@ -219,7 +219,8 @@ Status Runtime::ReleaseAccessTable(const AccessTableHandle& handle) {
   return Status::OK();
 }
 
-Status Runtime::BatchGet(const BatchGetRequest& request) {
+Status Runtime::BatchGet(const BatchGetRequest& request,
+                         const BatchGetExecutionOptions& execution) {
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
@@ -269,7 +270,8 @@ Status Runtime::BatchGet(const BatchGetRequest& request) {
 
   const AccessTableView view{table->addresses.data(), table->lengths.data(),
                              table->valid.data(), table->addresses.size()};
-  return access_operator_.ExecuteBatchGet(BatchGetExecRequest{view, &request});
+  return access_operator_.ExecuteBatchGet(
+      BatchGetExecRequest{view, &request, execution});
 }
 
 Status Runtime::BatchPut(const BatchPutRequest& request) {

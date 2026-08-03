@@ -53,7 +53,9 @@ class Runtime {
                             AccessTableView* view) const;
   Status ReleaseAccessTable(const AccessTableHandle& handle);
 
-  Status BatchGet(const BatchGetRequest& request);
+  Status BatchGet(
+      const BatchGetRequest& request,
+      const BatchGetExecutionOptions& execution = BatchGetExecutionOptions{});
   Status BatchPut(const BatchPutRequest& request);
   Status BatchFree(const BatchFreeRequest& request);
 
