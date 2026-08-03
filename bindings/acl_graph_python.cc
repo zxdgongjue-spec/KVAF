@@ -1,6 +1,8 @@
 #include "acl_graph_python.h"
 
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -31,6 +33,37 @@ aclrtStream StreamFromPython(const py::object& stream) {
   }
   return reinterpret_cast<aclrtStream>(
       static_cast<std::uintptr_t>(pointer));
+}
+
+std::size_t BufferBytes(const py::buffer_info& info) {
+  if (info.ptr == nullptr || info.size <= 0 || info.itemsize <= 0) {
+    throw py::value_error("ACL async copy source must be a non-empty buffer");
+  }
+  if (static_cast<std::uint64_t>(info.size) >
+      std::numeric_limits<std::size_t>::max() /
+          static_cast<std::size_t>(info.itemsize)) {
+    throw py::value_error("ACL async copy source is too large");
+  }
+  return static_cast<std::size_t>(info.size) *
+         static_cast<std::size_t>(info.itemsize);
+}
+
+bool IsCContiguous(const py::buffer_info& info) {
+  std::size_t expected_stride = static_cast<std::size_t>(info.itemsize);
+  for (py::ssize_t dimension = info.ndim - 1; dimension >= 0; --dimension) {
+    if (info.shape[dimension] > 1 &&
+        info.strides[dimension] !=
+            static_cast<py::ssize_t>(expected_stride)) {
+      return false;
+    }
+    if (info.shape[dimension] > 0 &&
+        expected_stride > std::numeric_limits<std::size_t>::max() /
+                              static_cast<std::size_t>(info.shape[dimension])) {
+      return false;
+    }
+    expected_stride *= static_cast<std::size_t>(info.shape[dimension]);
+  }
+  return true;
 }
 
 class AclGraph final {
@@ -97,6 +130,40 @@ class AclGraph final {
                     "aclrtSynchronizeStream");
   }
 
+  void CopyHostToDeviceAsync(std::uint64_t destination,
+                             std::size_t destination_bytes,
+                             const py::buffer& source,
+                             const py::object& stream) const {
+    if (capturing_ || graph_ == nullptr) {
+      throw py::value_error(
+          "ACLGraph async input copy requires a completed graph capture");
+    }
+    if (destination == 0 || destination_bytes == 0) {
+      throw py::value_error("ACL async copy destination must be non-empty");
+    }
+    const aclrtStream copy_stream = StreamFromPython(stream);
+    if (copy_stream != stream_) {
+      throw py::value_error(
+          "ACLGraph async input copy must use the capture stream");
+    }
+
+    const py::buffer_info source_info = source.request();
+    if (!IsCContiguous(source_info)) {
+      throw py::value_error("ACL async copy source must be C-contiguous");
+    }
+    const std::size_t source_bytes = BufferBytes(source_info);
+    if (source_bytes != destination_bytes) {
+      throw py::value_error(
+          "ACL async copy source and destination byte sizes must match");
+    }
+    ThrowIfAclError(
+        aclrtMemcpyAsync(
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(destination)),
+            destination_bytes, source_info.ptr, source_bytes,
+            ACL_MEMCPY_HOST_TO_DEVICE, copy_stream),
+        "aclrtMemcpyAsync host-to-device");
+  }
+
   void Reset() {
     if (capturing_) {
       throw py::value_error(
@@ -148,6 +215,11 @@ void BindAclGraph(py::module_& module) {
            "Submit the captured ACL graph to its capture stream.")
       .def("synchronize", &AclGraph::Synchronize, py::arg("stream"),
            "Wait for graph work on its capture stream.")
+      .def("copy_host_to_device_async", &AclGraph::CopyHostToDeviceAsync,
+           py::arg("destination"), py::arg("destination_bytes"),
+           py::arg("source"), py::arg("stream"),
+           "Queue a raw ACL H2D copy on the capture stream. The caller owns "
+           "source and must keep it alive until synchronize() returns.")
       .def("reset", &AclGraph::Reset,
            "Destroy the captured graph before releasing caller buffers or Runtime.")
       .def_property_readonly("capturing", &AclGraph::Capturing)

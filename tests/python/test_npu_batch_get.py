@@ -8,6 +8,7 @@ No native runner process is launched.
 
 from __future__ import annotations
 
+from array import array
 import os
 from pathlib import Path
 import statistics
@@ -251,11 +252,16 @@ def main() -> int:
         view = runtime.access_table_view(table)
         if view["size"] != active_requests:
             raise AssertionError("Runtime returned an unexpected Host AccessTable size")
+        # Keep writable host buffers. They both avoid torch.frombuffer's
+        # immutable-buffer warning and become the source for raw ACL graph
+        # input updates later in this test.
+        host_addresses_buffer = bytearray(view["addresses"])
+        host_valid_buffer = bytearray(view["valid"])
         host_addresses = torch.frombuffer(
-            view["addresses"], dtype=torch.int64, count=active_requests
+            host_addresses_buffer, dtype=torch.int64, count=active_requests
         )
         host_valid = torch.frombuffer(
-            view["valid"], dtype=torch.uint8, count=active_requests
+            host_valid_buffer, dtype=torch.uint8, count=active_requests
         )
         address_table = torch.zeros(table_capacity, dtype=torch.int64, device=device)
         valid_table = torch.zeros(table_capacity, dtype=torch.uint8, device=device)
@@ -402,7 +408,7 @@ def main() -> int:
                 "fixed_tensor_addresses=1 "
                 "external_graph_owner=python "
                 "api=aclmdlRI "
-                "input_contents=static "
+                "input_contents=host_to_device_same_stream "
                 "graph_stream=dedicated "
                 "captured_ops=runtime_batch_get "
                 f"functional_replays={graph_replays} "
@@ -415,12 +421,66 @@ def main() -> int:
             print("RUNTIME_NPU_PHASE_BEGIN phase=graph_object")
             graph = kvaf.AclGraph()
             print("RUNTIME_NPU_PHASE_DONE phase=graph_object")
-            # The eager path already validated these fixed caller-owned
-            # tensors. Do not allocate or mutate any NPU input after the
-            # Direct-HCCP transport becomes active in this baseline test.
-            graph_payload_slots = payload_slots
-            graph_output_indices = output_indices_values
-            print("RUNTIME_NPU_GRAPH_STATIC_INPUTS_READY")
+            # The graph captures only BatchGet. Its caller-owned device
+            # tensors keep their addresses, while this host staging storage
+            # updates their contents on the same ACL stream before each
+            # replay. This is the AIV demo's verified graph contract.
+            graph_address_table_host = bytearray(tensor_bytes(address_table))
+            graph_indices_host = array("i", indices_values)
+            graph_mask_host = bytearray(mask_values)
+            graph_output_indices_host = array("i", output_indices_values)
+            if graph_indices_host.itemsize != 4 or graph_output_indices_host.itemsize != 4:
+                raise AssertionError("graph int32 staging requires four-byte Python ints")
+
+            def prepare_graph_inputs(epoch: int) -> list[int | None]:
+                """Update only host staging data; device addresses stay fixed."""
+                expected_payload_slots = list(payload_slots)
+                for payload_slot, table_index in enumerate(sparse_table_indices):
+                    source_slot = (payload_slot + epoch) % active_requests
+                    address = struct.unpack_from(
+                        "<Q", host_addresses_buffer, source_slot * 8
+                    )[0]
+                    struct.pack_into(
+                        "<Q", graph_address_table_host, table_index * 8, address
+                    )
+                for request in active_request_positions:
+                    payload_slot = payload_slots[request]
+                    if payload_slot is None:
+                        raise AssertionError("active request is missing a payload slot")
+                    expected_payload_slots[request] = (
+                        payload_slot + epoch
+                    ) % active_requests
+                return expected_payload_slots
+
+            def enqueue_graph_inputs(trace: str | None = None) -> None:
+                if trace is not None:
+                    print(f"RUNTIME_NPU_GRAPH_INPUT_UPDATE_BEGIN replay={trace}")
+                graph.copy_host_to_device_async(
+                    int(address_table.data_ptr()), tensor_bytes(address_table),
+                    graph_address_table_host, capture_stream
+                )
+                graph.copy_host_to_device_async(
+                    int(indices.data_ptr()), tensor_bytes(indices),
+                    graph_indices_host, capture_stream
+                )
+                graph.copy_host_to_device_async(
+                    int(mask.data_ptr()), tensor_bytes(mask), graph_mask_host,
+                    capture_stream
+                )
+                graph.copy_host_to_device_async(
+                    int(output_indices.data_ptr()), tensor_bytes(output_indices),
+                    graph_output_indices_host, capture_stream
+                )
+                if trace is not None:
+                    print(f"RUNTIME_NPU_GRAPH_INPUT_UPDATE_ENQUEUED replay={trace}")
+
+            print(
+                "RUNTIME_NPU_GRAPH_HOST_INPUTS_READY "
+                f"address_table_bytes={len(graph_address_table_host)} "
+                f"indices_bytes={len(graph_indices_host) * graph_indices_host.itemsize} "
+                f"mask_bytes={len(graph_mask_host)} "
+                f"output_indices_bytes={len(graph_output_indices_host) * graph_output_indices_host.itemsize}"
+            )
             print("RUNTIME_NPU_PHASE_BEGIN phase=graph_capture")
             # output_a was already used by eager A -> B -> A above, so its
             # Direct-HCCP local HBM registration is cached before capture.
@@ -452,7 +512,7 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 raise
-            print("RUNTIME_NPU_PHASE_DONE phase=graph_capture owner=torch_npu")
+            print("RUNTIME_NPU_PHASE_DONE phase=graph_capture owner=python")
 
             def replay_graph_on_capture_stream(trace: str | None = None) -> None:
                 # Raw ACLGraph replay has no PyTorch graph wrapper or current
@@ -466,6 +526,8 @@ def main() -> int:
             graph_completed_batches = 3 + warmup + iterations
             for replay in range(graph_replays):
                 print(f"RUNTIME_NPU_GRAPH_REPLAY_BEGIN replay={replay}")
+                graph_payload_slots = prepare_graph_inputs(replay)
+                enqueue_graph_inputs(str(replay))
                 replay_graph_on_capture_stream(str(replay))
                 graph.synchronize(capture_stream)
                 print(f"RUNTIME_NPU_GRAPH_STREAM_DONE replay={replay}")
@@ -473,7 +535,7 @@ def main() -> int:
                 validate_output(
                     tensor_to_bytes(output_a),
                     mask_values,
-                    graph_output_indices,
+                    output_indices_values,
                     graph_payload_slots,
                     block_bytes,
                 )
@@ -489,6 +551,8 @@ def main() -> int:
 
             print("RUNTIME_NPU_GRAPH_PERF_WARMUP_BEGIN")
             for warmup_iteration in range(graph_warmup):
+                prepare_graph_inputs(graph_replays + warmup_iteration)
+                enqueue_graph_inputs()
                 replay_graph_on_capture_stream()
                 graph.synchronize(capture_stream)
                 graph_completed_batches += 1
@@ -496,16 +560,24 @@ def main() -> int:
 
             graph_samples = []
             for iteration in range(graph_iterations):
+                epoch = graph_replays + graph_warmup + iteration
+                prepare_graph_inputs(epoch)
                 begin = time.perf_counter()
+                # The measured graph step follows the AIV demo: H2D lookup
+                # update, captured BatchGet execution, then stream completion.
+                enqueue_graph_inputs()
                 replay_graph_on_capture_stream()
                 graph.synchronize(capture_stream)
                 graph_samples.append((time.perf_counter() - begin) * 1000.0)
                 graph_completed_batches += 1
 
+            graph_payload_slots = prepare_graph_inputs(
+                graph_replays + graph_warmup + graph_iterations - 1
+            )
             validate_output(
                 tensor_to_bytes(output_a),
                 mask_values,
-                graph_output_indices,
+                output_indices_values,
                 graph_payload_slots,
                 block_bytes,
             )
@@ -522,7 +594,7 @@ def main() -> int:
                 active_requests * block_bytes / (1024.0**3) / (graph_mean_ms / 1000.0)
             )
             print(
-                "GRAPH_PERF_RESULT metric=external_graph_replay_to_stream_completion "
+                "GRAPH_PERF_RESULT metric=graph_input_update_to_stream_completion "
                 f"samples={graph_iterations} warmup_excluded={graph_warmup} "
                 f"active_requests={active_requests} block_bytes={block_bytes} "
                 f"npu_cores={npu_core_count} mean_ms={graph_mean_ms:.3f} "
