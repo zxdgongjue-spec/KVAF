@@ -251,17 +251,17 @@ Status Runtime::BatchGet(const BatchGetRequest& request) {
   }
 
   if (request.indices.device == DeviceKind::kNpu) {
-    const std::size_t address_bytes =
-        table->addresses.size() * sizeof(table->addresses.front());
     if (request.device_access_table.empty() ||
         request.device_access_table.addresses.data == nullptr ||
         request.device_access_table.valid.data == nullptr ||
-        request.device_access_table.addresses.bytes != address_bytes ||
-        request.device_access_table.valid.bytes != table->valid.size() ||
+        request.device_access_table.addresses.bytes == 0 ||
+        request.device_access_table.addresses.bytes % sizeof(Address) != 0 ||
+        request.device_access_table.valid.bytes !=
+            request.device_access_table.addresses.bytes / sizeof(Address) ||
         request.device_access_table.addresses.device != DeviceKind::kNpu ||
         request.device_access_table.valid.device != DeviceKind::kNpu) {
       return Status::InvalidArgument(
-          "NPU BatchGet requires caller-provided matching device AccessTable buffers");
+          "NPU BatchGet requires matching caller-provided device AccessTable buffers");
     }
   } else if (!request.device_access_table.empty()) {
     return Status::InvalidArgument("CPU BatchGet must not provide device AccessTable buffers");

@@ -44,9 +44,10 @@ struct AccessOperatorConfig {
 // Initialize creates one reusable transport for Runtime-owned Host DDR.
 // ExecuteBatchGet obtains a LocalBuffer from the caller-owned output in the
 // request, launches the current BatchGet demo and waits for completion.
-// ExecuteBatchPut is intentionally kNotImplemented until its data-plane
-// implementation is available. This class is built only with
-// KVAF_ENABLE_AIV_BATCH_GET=ON.
+// ExecuteBatchPut currently uses synchronous ACL device-to-host copies as a
+// temporary NPU mock. It preserves the Runtime transaction contract but is
+// not the eventual BatchPut data-plane implementation. This class is built
+// only with KVAF_ENABLE_AIV_BATCH_GET=ON.
 class DefaultAccessOperator final : public AccessOperator {
  public:
   explicit DefaultAccessOperator(AccessOperatorConfig config);

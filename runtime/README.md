@@ -11,7 +11,8 @@ AccessOperator，并把调用方已经准备好的输入/输出 buffer 交给数
 - `Initialize`：经 `DdrMemoryAllocator` 分配内部 DDR，初始化 Operator，
   再向 MetaManager 注册远端 region；任一前置步骤失败会释放已获得资源。
 - `BatchPut`：`PreparePut -> ExecuteBatchPut -> CommitPut`；数据面失败时
-  自动 `AbortPut`，因此 Key 和 slot 可重新使用。
+  自动 `AbortPut`，因此 Key 和 slot 可重新使用。当前 NPU 路径以同步
+  `aclrtMemcpy(DeviceToHost)` 作为测试 mock，真实 BatchPut 数据面尚未合入。
 - `PrepareAccessTable` / `GetAccessTableView` / `ReleaseAccessTable`：持有
   MetaManager 稳定读锁，生成一维 address/length/valid 表，并在 Release 时
   解锁。
@@ -20,7 +21,7 @@ AccessOperator，并把调用方已经准备好的输入/输出 buffer 交给数
 - `BatchFree`：将删除请求交给 MetaManager；仍被 AccessTable 持有的 Key
   会返回 `kBusy`。
 
-异步接口、BatchPut 的 NPU/AICPU 数据面及图捕获管理不在本次 POC 范围。
+异步接口、真实 BatchPut 的 NPU/AICPU 数据面及图捕获管理不在本次 POC 范围。
 
 ## 资源所有权
 
@@ -37,16 +38,21 @@ index/mask/output-index/output buffer，以及 NPU 上的 address/valid 表。Ru
 ## 当前 POC 的 NPU AccessTable 边界
 
 当前 `PrepareAccessTable` 只生成 Runtime-owned 的扁平 Host
-`address/length/valid` 表并持有对应 Key 锁。NPU AccessTable 的 device buffer
-由 CacheOS-vLLM Adapter 创建和维护；本仓的 Python NPU 测试脚本暂时承担该
-Adapter 角色：创建 caller-owned NPU `addresses` 与 `valid` buffer，并通过
-`NpuRuntime.copy_access_table_to_device` 按相同下标顺序上传 Host view，再将
-它们传给 `BatchGet`。该 helper 属于 CANN/Python Adapter，不属于通用 Runtime。
+`address/length/valid` 表并持有对应 Key 锁。C++ `GetAccessTableView` 返回的是
+指向这三段连续 Host 内存的非 owning view，不是 Tensor，也不会复制数据。Python
+绑定将它们导出为只读 `memoryview`，因此 Adapter 可用
+`torch.frombuffer(...).to("npu")` 进行一次必要的 Host-to-NPU 复制，而不会先构造
+数百万 Python 整数。
 
-Adapter 必须保证这些 device buffer 在关联 BatchGet 完成且
-`ReleaseAccessTable` 前持续有效、容量与 Host view 一致；Runtime 不分配、复制、
-释放或注册这两块 device AccessTable buffer。图模式下，Adapter 必须在 capture
-前完成该准备并保持地址稳定。
+NPU AccessTable 的 device tensor 由 CacheOS-vLLM Adapter 创建和维护；本仓的
+Python NPU 测试脚本暂时承担该 Adapter 角色。它只对已锁定的有效 key 读取 Host
+view，并将地址和 valid 值 scatter 到 caller-owned 的稀疏 NPU `addresses` / `valid`
+tensor；未使用的 entry 保持 `valid=0`。因此 Device AccessTable 的容量可以大于
+Host view 的 entry 数，且 Runtime 不拥有这两个 device buffer。
+
+Adapter 必须保证 Host `memoryview` 在完成其 H2D copy 前、device buffer 在关联
+BatchGet 完成且 `ReleaseAccessTable` 前持续有效。Runtime 不分配、复制、释放或
+注册这两块 device AccessTable buffer。
 
 `valid` 是每个 AccessTable entry 的安全位：`1` 表示可访问，`0` 表示 padding
 或无效 entry。AIV kernel 对 `mask=1 && valid=0` 返回设备侧 `kInvalidLookup`，
@@ -95,14 +101,17 @@ KVAF_RUN_NPU_TESTS=1 \
 KVAF_AIV_BATCH_GET_KERNEL="$PWD/build-aiv/bin/kvaf_execute_batch_get_kernels.o" \
 DEVICE_ID=0 \
 PYTHONPATH="$PWD/build-aiv/python" \
+KVAF_NPU_ACTIVE_PERCENT=5 \
 timeout 240s python3 tests/python/test_npu_batch_get.py
 ```
 
 该脚本用小规模 case 验证 Runtime 初始化、调用方 Device buffer、Runtime
 BatchGet、设备完成、输出字节、`output A -> B -> A` 的 local-buffer 缓存复用及
-teardown。当前 demo 尚未实现 `BatchPut`，因此测试的 `seed_fixed_blocks` 只用于
-把固定大小的测试数据写入 Runtime-owned DDR；它不宣称验证 BatchPut。BatchPut
-operator 合入后应改为 `runtime.batch_put`。
+teardown。它以 `KVAF_NPU_ACTIVE_PERCENT` 构造稀疏 mask（例如 `5` 表示 5% 请求
+有效），只为 `mask=1` 的请求写入 KV；随后用 Runtime 的临时 ACL D2H mock
+`batch_put` 将 caller-owned NPU source Tensor 写入 Runtime-owned DDR，再将少量
+有效 address scatter 到可很大的 Device AccessTable。该 mock 验证 Runtime 的
+BatchPut 事务编排，但不代表未来的 BatchPut 数据面实现。
 
 正确性验证完成后，脚本会输出
 `PERF_RESULT metric=runtime_batch_get_call_to_stream_completion`。这个计时窗口

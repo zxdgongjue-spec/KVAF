@@ -9,6 +9,7 @@
 #include "acl/acl.h"
 #include "batch_get_abi.h"
 #include "kvaf_aiv_batch_get.h"
+#include "kvaf/meta_manager/meta_manager.h"
 
 namespace kvaf {
 namespace {
@@ -113,6 +114,10 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
       request.output.device != DeviceKind::kNpu ||
       request.device_access_table.addresses.device != DeviceKind::kNpu ||
       request.device_access_table.valid.device != DeviceKind::kNpu ||
+      request.device_access_table.addresses.bytes == 0 ||
+      request.device_access_table.addresses.bytes % sizeof(Address) != 0 ||
+      request.device_access_table.valid.bytes !=
+          request.device_access_table.addresses.bytes / sizeof(Address) ||
       execution.status.data == nullptr || execution.status.device != DeviceKind::kNpu ||
       execution.queue_state.data == nullptr || execution.queue_state.device != DeviceKind::kNpu ||
       request.output_block_bytes == 0 || exec.host_access_table.size == 0 ||
@@ -128,7 +133,9 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
 
   const std::size_t request_count = request.indices.bytes / sizeof(std::int32_t);
   const std::size_t output_rows = request.output.bytes / request.output_block_bytes;
-  if (!FitsU32(exec.host_access_table.size) || !FitsU32(request_count) ||
+  const std::size_t device_table_entries =
+      request.device_access_table.addresses.bytes / sizeof(Address);
+  if (!FitsU32(device_table_entries) || !FitsU32(request_count) ||
       !FitsU32(output_rows) || !FitsU32(request.output_block_bytes)) {
     return InvalidArgument("BatchGet dimensions exceed the device ABI");
   }
@@ -158,7 +165,7 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   arguments.core_status = PointerValue(execution.status.data);
   arguments.channel_entity = channel_entity;
   arguments.queue_state = PointerValue(execution.queue_state.data);
-  arguments.table_capacity = static_cast<std::uint32_t>(exec.host_access_table.size);
+  arguments.table_capacity = static_cast<std::uint32_t>(device_table_entries);
   arguments.request_capacity = static_cast<std::uint32_t>(request_count);
   arguments.output_rows = static_cast<std::uint32_t>(output_rows);
   arguments.block_bytes = static_cast<std::uint32_t>(request.output_block_bytes);
@@ -179,9 +186,33 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   return Status::OK();
 }
 
-Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest&) {
-  return Status::Error(StatusCode::kNotImplemented,
-                       "BatchPut is not implemented by the current AccessOperator");
+Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
+  if (!impl_->initialized) {
+    return Status::NotInitialized("AccessOperator has not been initialized");
+  }
+  if (exec.request == nullptr || exec.put_desc == nullptr ||
+      exec.request->keys.empty() ||
+      exec.request->keys.size() != exec.request->blocks.size() ||
+      exec.request->keys.size() != exec.put_desc->entries.size()) {
+    return InvalidArgument("BatchPut request does not satisfy the NPU mock contract");
+  }
+
+  for (std::size_t index = 0; index < exec.request->blocks.size(); ++index) {
+    const ConstBufferView& source = exec.request->blocks[index];
+    const PutAllocation& destination = exec.put_desc->entries[index];
+    if (source.data == nullptr || source.bytes == 0 ||
+        source.device != DeviceKind::kNpu || destination.address == 0 ||
+        destination.reserved_length != source.bytes) {
+      return InvalidArgument("BatchPut source and destination blocks do not match");
+    }
+    const aclError result = aclrtMemcpy(
+        reinterpret_cast<void*>(destination.address), destination.reserved_length,
+        source.data, source.bytes, ACL_MEMCPY_DEVICE_TO_HOST);
+    if (result != ACL_SUCCESS) {
+      return Internal("ACL device-to-host mock BatchPut copy failed");
+    }
+  }
+  return Status::OK();
 }
 
 }  // namespace kvaf

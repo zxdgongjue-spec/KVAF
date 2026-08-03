@@ -4,12 +4,13 @@
 
 #include <chrono>
 #include <cstdint>
-#include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "access_table_python.h"
 #include "acl/acl.h"
 #include "batch_get_abi.h"
 #include "kvaf/access_operator/access_operator.h"
@@ -92,26 +93,6 @@ class AclHostDdrAllocator final : public DdrMemoryAllocator {
   void* address_{nullptr};
 };
 
-std::vector<std::vector<std::uint8_t>> CopyPythonBlocks(
-    const py::iterable& blocks) {
-  std::vector<std::vector<std::uint8_t>> result;
-  for (const py::handle& item : blocks) {
-    if (!PyObject_CheckBuffer(item.ptr())) {
-      throw py::type_error(
-          "blocks must be bytes, bytearray, or another Python buffer object");
-    }
-    py::buffer buffer = py::reinterpret_borrow<py::buffer>(item);
-    const py::buffer_info info = buffer.request();
-    if (info.ptr == nullptr || info.size <= 0) {
-      throw py::value_error("blocks must be non-empty");
-    }
-    const auto byte_count = static_cast<std::size_t>(info.size * info.itemsize);
-    const auto* begin = static_cast<const std::uint8_t*>(info.ptr);
-    result.emplace_back(begin, begin + byte_count);
-  }
-  return result;
-}
-
 void* PointerFromValue(std::uint64_t pointer) {
   return reinterpret_cast<void*>(static_cast<std::uintptr_t>(pointer));
 }
@@ -168,84 +149,60 @@ class NpuRuntime final {
     return result;
   }
 
-  // BatchPut is intentionally not exposed here: the current AIV demo has no
-  // ExecuteBatchPut implementation.  This test-only seeding route writes the
-  // Runtime-owned Host DDR after the MetaManager reservation and commit, so
-  // BatchGet can be validated without pretending that BatchPut exists.
-  void SeedFixedBlocks(const std::vector<KeyId>& keys, const py::iterable& blocks) {
+  // Current NPU BatchPut is a synchronous ACL device-to-host copy mock. The
+  // binding keeps Tensor ownership in Python and builds non-owning block views
+  // only for the duration of Runtime::BatchPut.
+  void BatchPut(const std::vector<KeyId>& keys, const py::object& source,
+                std::uint64_t block_bytes) {
     if (!Initialized()) {
       throw std::runtime_error("Runtime has not been initialized");
     }
-    const std::vector<std::vector<std::uint8_t>> payloads =
-        CopyPythonBlocks(blocks);
-    if (keys.empty() || keys.size() != payloads.size()) {
-      throw py::value_error("keys and blocks must be non-empty and equal in size");
+    if (keys.empty() || block_bytes == 0) {
+      throw py::value_error("keys and block_bytes must be non-empty and non-zero");
     }
-
-    std::vector<std::uint64_t> lengths;
-    lengths.reserve(payloads.size());
-    for (const auto& payload : payloads) {
-      lengths.push_back(payload.size());
+    if (!py::hasattr(source, "data_ptr") || !py::hasattr(source, "numel") ||
+        !py::hasattr(source, "element_size") ||
+        !py::hasattr(source, "is_contiguous") ||
+        !py::hasattr(source, "device")) {
+      throw py::type_error("source must be a contiguous NPU Tensor");
     }
-    PutContext context;
-    PutAccessDesc descriptor;
-    ThrowIfError(meta_manager_->PreparePut(keys, lengths, &context, &descriptor));
-    if (descriptor.entries.size() != payloads.size()) {
-      (void)meta_manager_->AbortPut(context);
-      throw std::runtime_error("MetaManager returned an invalid Put descriptor");
+    if (!source.attr("is_contiguous")().cast<bool>()) {
+      throw py::value_error("BatchPut source Tensor must be contiguous");
     }
-    for (std::size_t index = 0; index < payloads.size(); ++index) {
-      std::memcpy(reinterpret_cast<void*>(descriptor.entries[index].address),
-                  payloads[index].data(), payloads[index].size());
+    const std::string device = py::str(source.attr("device")).cast<std::string>();
+    if (device.rfind("npu", 0) != 0) {
+      throw py::value_error("BatchPut source Tensor must reside on an NPU");
     }
-    const Status status = meta_manager_->CommitPut(context);
-    if (!status.ok()) {
-      (void)meta_manager_->AbortPut(context);
-      ThrowIfError(status);
+    const std::uint64_t pointer = source.attr("data_ptr")().cast<std::uint64_t>();
+    const std::uint64_t source_elements = source.attr("numel")().cast<std::uint64_t>();
+    const std::uint64_t source_element_bytes =
+        source.attr("element_size")().cast<std::uint64_t>();
+    if (source_element_bytes == 0 ||
+        source_elements > std::numeric_limits<std::size_t>::max() ||
+        source_element_bytes > std::numeric_limits<std::size_t>::max() ||
+        static_cast<std::size_t>(source_elements) >
+            std::numeric_limits<std::size_t>::max() /
+                static_cast<std::size_t>(source_element_bytes)) {
+      throw py::value_error("BatchPut source Tensor is too large");
     }
-  }
-
-  // Large-scale integration tests need deterministic contents without first
-  // materializing one Python bytes object per block. The pattern intentionally
-  // matches tests/python/test_npu_batch_get.py::pattern(index, block_bytes).
-  void SeedFixedPatternBlocks(const std::vector<KeyId>& keys,
-                              std::uint64_t block_bytes) {
-    if (!Initialized()) {
-      throw std::runtime_error("Runtime has not been initialized");
+    const std::size_t source_bytes =
+        static_cast<std::size_t>(source_elements) *
+        static_cast<std::size_t>(source_element_bytes);
+    if (pointer == 0 || block_bytes > std::numeric_limits<std::size_t>::max() ||
+        keys.size() > std::numeric_limits<std::size_t>::max() /
+                          static_cast<std::size_t>(block_bytes) ||
+        source_bytes != keys.size() * static_cast<std::size_t>(block_bytes)) {
+      throw py::value_error("BatchPut source Tensor byte size does not match keys * block_bytes");
     }
-    if (keys.empty() || block_bytes == 0 ||
-        block_bytes > runtime_->remote_region().slot_size) {
-      throw py::value_error("invalid fixed-pattern seed request");
+    std::vector<ConstBufferView> blocks;
+    blocks.reserve(keys.size());
+    const auto* base = static_cast<const std::uint8_t*>(PointerFromValue(pointer));
+    for (std::size_t index = 0; index < keys.size(); ++index) {
+      blocks.push_back(ConstBufferView{
+          base + index * static_cast<std::size_t>(block_bytes),
+          static_cast<std::size_t>(block_bytes), DeviceKind::kNpu});
     }
-
-    std::vector<std::uint64_t> lengths(keys.size(), block_bytes);
-    PutContext context;
-    PutAccessDesc descriptor;
-    ThrowIfError(meta_manager_->PreparePut(keys, lengths, &context, &descriptor));
-    if (descriptor.entries.size() != keys.size()) {
-      (void)meta_manager_->AbortPut(context);
-      throw std::runtime_error("MetaManager returned an invalid Put descriptor");
-    }
-
-    const std::size_t bytes = static_cast<std::size_t>(block_bytes);
-    std::vector<std::vector<std::uint8_t>> patterns(
-        256U, std::vector<std::uint8_t>(bytes));
-    for (std::size_t slot_modulo = 0; slot_modulo < patterns.size(); ++slot_modulo) {
-      for (std::size_t byte = 0; byte < bytes; ++byte) {
-        patterns[slot_modulo][byte] = static_cast<std::uint8_t>(
-            (slot_modulo * 131U + byte * 17U + (byte >> 3U)) & 0xffU);
-      }
-    }
-    for (std::size_t index = 0; index < descriptor.entries.size(); ++index) {
-      std::memcpy(reinterpret_cast<void*>(descriptor.entries[index].address),
-                  patterns[index & 0xffU].data(), bytes);
-    }
-
-    const Status status = meta_manager_->CommitPut(context);
-    if (!status.ok()) {
-      (void)meta_manager_->AbortPut(context);
-      ThrowIfError(status);
-    }
+    ThrowIfError(runtime_->BatchPut(BatchPutRequest{keys, blocks}));
   }
 
   AccessTableHandle PrepareAccessTable(const std::vector<KeyId>& keys) {
@@ -258,45 +215,7 @@ class NpuRuntime final {
   py::dict AccessTableView(const AccessTableHandle& handle) const {
     kvaf::AccessTableView view;
     ThrowIfError(runtime_->GetAccessTableView(handle, &view));
-    py::list addresses;
-    py::list lengths;
-    py::list valid;
-    for (std::size_t index = 0; index < view.size; ++index) {
-      addresses.append(view.addresses[index]);
-      lengths.append(view.lengths[index]);
-      valid.append(view.valid[index] != 0);
-    }
-    py::dict result;
-    result["addresses"] = std::move(addresses);
-    result["lengths"] = std::move(lengths);
-    result["valid"] = std::move(valid);
-    return result;
-  }
-
-  // This is an adapter-side Host-to-NPU table upload. Generic Runtime still
-  // owns only the Host view and does not depend on ACL or torch_npu.
-  void CopyAccessTableToDevice(const AccessTableHandle& handle,
-                               std::uint64_t address_table_pointer,
-                               std::size_t address_table_bytes,
-                               std::uint64_t valid_table_pointer,
-                               std::size_t valid_table_bytes) const {
-    kvaf::AccessTableView view;
-    ThrowIfError(runtime_->GetAccessTableView(handle, &view));
-    const std::size_t expected_address_bytes =
-        view.size * sizeof(*view.addresses);
-    if (view.size == 0 || address_table_pointer == 0 || valid_table_pointer == 0 ||
-        address_table_bytes != expected_address_bytes ||
-        valid_table_bytes != view.size) {
-      throw py::value_error("device AccessTable buffers do not match the handle");
-    }
-    ThrowIfAclError(aclrtMemcpy(PointerFromValue(address_table_pointer),
-                                address_table_bytes, view.addresses,
-                                expected_address_bytes, ACL_MEMCPY_HOST_TO_DEVICE),
-                    "aclrtMemcpy address AccessTable");
-    ThrowIfAclError(aclrtMemcpy(PointerFromValue(valid_table_pointer),
-                                valid_table_bytes, view.valid, view.size,
-                                ACL_MEMCPY_HOST_TO_DEVICE),
-                    "aclrtMemcpy valid AccessTable");
+    return python_binding::MakeAccessTableView(view);
   }
 
   void ReleaseAccessTable(const AccessTableHandle& handle) {
@@ -396,18 +315,12 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def_property_readonly("device_id", &NpuRuntime::DeviceId)
       .def_property_readonly("npu_core_count", &NpuRuntime::NpuCoreCount)
       .def_property_readonly("remote_region", &NpuRuntime::RemoteRegion)
-      .def("seed_fixed_blocks", &NpuRuntime::SeedFixedBlocks,
-           py::arg("keys"), py::arg("blocks"))
-      .def("seed_fixed_pattern_blocks", &NpuRuntime::SeedFixedPatternBlocks,
-           py::arg("keys"), py::arg("block_bytes"))
+      .def("batch_put", &NpuRuntime::BatchPut, py::arg("keys"),
+           py::arg("source"), py::arg("block_bytes"))
       .def("prepare_access_table", &NpuRuntime::PrepareAccessTable,
            py::arg("keys"))
       .def("access_table_view", &NpuRuntime::AccessTableView,
            py::arg("access_table"))
-      .def("copy_access_table_to_device", &NpuRuntime::CopyAccessTableToDevice,
-           py::arg("access_table"), py::arg("address_table_pointer"),
-           py::arg("address_table_bytes"), py::arg("valid_table_pointer"),
-           py::arg("valid_table_bytes"))
       .def("release_access_table", &NpuRuntime::ReleaseAccessTable,
            py::arg("access_table"))
       .def("batch_get", &NpuRuntime::BatchGet,

@@ -33,6 +33,8 @@ struct AccessTableView {
 
 // NPU BatchGet 使用的、由调用方预先申请且已完成链路注册的表 buffer。
 // Runtime 不拥有这些 buffer，也不在它们上面执行隐式 Host/Device 拷贝。
+// 其 entry 数可以大于 Host AccessTable：Adapter 可以只锁定有效 key，再将
+// 得到的 address/valid scatter 到更大的稀疏 Device 表中。
 struct AccessTableDeviceView {
   ConstBufferView addresses;
   ConstBufferView valid;

@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "access_table_python.h"
 #include "kvaf/access_operator/access_operator.h"
 #include "kvaf/meta_manager/meta_manager.h"
 #include "kvaf/runtime/runtime.h"
@@ -237,20 +238,7 @@ class PythonRuntime final {
   py::dict AccessTableView(const AccessTableHandle& handle) const {
     kvaf::AccessTableView view;
     ThrowIfError(runtime_->GetAccessTableView(handle, &view));
-
-    py::list addresses;
-    py::list lengths;
-    py::list valid;
-    for (std::size_t i = 0; i < view.size; ++i) {
-      addresses.append(view.addresses[i]);
-      lengths.append(view.lengths[i]);
-      valid.append(view.valid[i] != 0);
-    }
-    py::dict result;
-    result["addresses"] = std::move(addresses);
-    result["lengths"] = std::move(lengths);
-    result["valid"] = std::move(valid);
-    return result;
+    return python_binding::MakeAccessTableView(view);
   }
 
   void ReleaseAccessTable(const AccessTableHandle& handle) {

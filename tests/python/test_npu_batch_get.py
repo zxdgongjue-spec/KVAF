@@ -40,17 +40,19 @@ def percentile(values: list[float], fraction: float) -> float:
 
 def validate_output(
     output: bytes,
-    indices: Iterable[int],
     mask: Iterable[int],
     output_indices: Iterable[int],
+    payload_slots: Iterable[int | None],
     block_bytes: int,
 ) -> None:
-    for request, (table_index, enabled, row) in enumerate(
-        zip(indices, mask, output_indices)
+    for request, (enabled, row, payload_slot) in enumerate(
+        zip(mask, output_indices, payload_slots)
     ):
         offset = row * block_bytes
         actual = output[offset : offset + block_bytes]
-        expected = bytes(block_bytes) if not enabled else pattern(table_index, block_bytes)
+        if enabled and payload_slot is None:
+            raise AssertionError(f"missing expected payload for active request={request}")
+        expected = bytes(block_bytes) if not enabled else pattern(payload_slot, block_bytes)
         if actual != expected:
             raise AssertionError(f"output mismatch for request={request}, row={row}")
 
@@ -130,7 +132,7 @@ def main() -> int:
     npu_core_count = int(
         os.environ.get("KVAF_NPU_CORE_COUNT", os.environ.get("KVAF_NPU_AIV_CORES", "1"))
     )
-    mask_every = int(os.environ.get("KVAF_NPU_MASK_EVERY", "0"))
+    active_percent = int(os.environ.get("KVAF_NPU_ACTIVE_PERCENT", "100"))
     warmup = int(os.environ.get("KVAF_NPU_WARMUP", "1"))
     iterations = int(os.environ.get("KVAF_NPU_ITERATIONS", "5"))
     if not (
@@ -142,61 +144,97 @@ def main() -> int:
         and npu_core_count > 0
         and npu_core_count <= requests
         and iterations > 0
+        and 1 <= active_percent <= 100
     ):
         print("FAIL: invalid KVAF_NPU_* shape configuration", file=sys.stderr)
         return 2
 
-    # torch_npu owns ACL process initialization.  Select the same device before
+    # A sparse Device AccessTable can be much larger than the number of valid
+    # remote KV blocks. Only active requests receive a valid table entry; all
+    # masked-out requests are ignored by the kernel.
+    mask_values = [1 if request % 100 < active_percent else 0 for request in range(requests)]
+    active_request_positions = [
+        request for request, enabled in enumerate(mask_values) if enabled
+    ]
+    active_requests = len(active_request_positions)
+    if active_requests > table_capacity:
+        print(
+            "FAIL: KVAF_NPU_TABLE_CAPACITY must be at least the number of active requests",
+            file=sys.stderr,
+        )
+        return 2
+    sparse_table_indices = [
+        (active_ordinal + 1) * table_capacity // (active_requests + 1)
+        for active_ordinal in range(active_requests)
+    ]
+    # In the sparse case this deliberately points masked requests at an invalid
+    # table entry, proving that mask=0 prevents an address lookup.
+    indices_values = [table_capacity - 1] * requests
+    payload_slots: list[int | None] = [None] * requests
+    for payload_slot, request in enumerate(active_request_positions):
+        indices_values[request] = sparse_table_indices[payload_slot]
+        payload_slots[request] = payload_slot
+    output_indices_values = [output_rows - 1 - request for request in range(requests)]
+    ddr_bytes = active_requests * source_stride
+
+    # torch_npu owns ACL process initialization. Select the same device before
     # creating the private ACL stream in the pybind Runtime.
     torch.npu.set_device(device_id)
     device = f"npu:{device_id}"
     runtime = kvaf.NpuRuntime(str(kernel), device_id, npu_core_count)
     table = None
     try:
+        print(
+            "RUNTIME_NPU_SPARSE_LAYOUT "
+            f"table_capacity={table_capacity} requests={requests} "
+            f"active_percent={active_percent} active_requests={active_requests}"
+        )
         print("RUNTIME_NPU_PHASE_BEGIN phase=runtime_initialize")
-        runtime.initialize(table_capacity * source_stride, source_stride)
+        runtime.initialize(ddr_bytes, source_stride)
         print(
             "RUNTIME_NPU_PHASE_DONE phase=runtime_initialize "
-            f"ddr_bytes={table_capacity * source_stride}"
+            f"ddr_bytes={ddr_bytes}"
         )
 
-        print("RUNTIME_NPU_PHASE_BEGIN phase=seed_fixed_blocks")
-        keys = list(range(1, table_capacity + 1))
-        runtime.seed_fixed_pattern_blocks(keys, block_bytes)
+        print("RUNTIME_NPU_PHASE_BEGIN phase=mock_batch_put")
+        active_keys = list(range(1, active_requests + 1))
+        source_rows = torch.arange(active_requests, dtype=torch.int64).unsqueeze(1)
+        source_bytes = torch.arange(block_bytes, dtype=torch.int64).unsqueeze(0)
+        source = (
+            (source_rows * 131 + source_bytes * 17 + (source_bytes >> 3)) & 0xFF
+        ).to(torch.uint8).contiguous().to(device)
+        runtime.batch_put(active_keys, source, block_bytes)
         print(
-            "RUNTIME_NPU_PHASE_DONE phase=seed_fixed_blocks "
-            f"blocks={table_capacity} block_bytes={block_bytes}"
+            "RUNTIME_NPU_PHASE_DONE phase=mock_batch_put "
+            f"blocks={active_requests} block_bytes={block_bytes}"
         )
 
         print("RUNTIME_NPU_PHASE_BEGIN phase=prepare_access_table")
-        table = runtime.prepare_access_table(keys)
-        del keys
+        table = runtime.prepare_access_table(active_keys)
+        del active_keys
         print(
             "RUNTIME_NPU_PHASE_DONE phase=prepare_access_table "
-            f"entries={table_capacity}"
+            f"entries={active_requests}"
         )
-
-        indices_values = [table_capacity - 1 - (request % table_capacity) for request in range(requests)]
-        mask_values = [
-            0 if mask_every and request % mask_every == 0 else 1
-            for request in range(requests)
-        ]
-        output_indices_values = [output_rows - 1 - request for request in range(requests)]
 
         print("RUNTIME_NPU_PHASE_BEGIN phase=caller_buffer_setup")
-        address_table = torch.empty(table_capacity, dtype=torch.int64, device=device)
-        valid_table = torch.empty(table_capacity, dtype=torch.uint8, device=device)
-        print("RUNTIME_NPU_PHASE_BEGIN phase=copy_access_table_to_device")
-        runtime.copy_access_table_to_device(
-            table,
-            int(address_table.data_ptr()),
-            tensor_bytes(address_table),
-            int(valid_table.data_ptr()),
-            tensor_bytes(valid_table),
+        view = runtime.access_table_view(table)
+        if view["size"] != active_requests:
+            raise AssertionError("Runtime returned an unexpected Host AccessTable size")
+        host_addresses = torch.frombuffer(
+            view["addresses"], dtype=torch.int64, count=active_requests
         )
+        host_valid = torch.frombuffer(
+            view["valid"], dtype=torch.uint8, count=active_requests
+        )
+        address_table = torch.zeros(table_capacity, dtype=torch.int64, device=device)
+        valid_table = torch.zeros(table_capacity, dtype=torch.uint8, device=device)
+        scatter_indices = torch.tensor(sparse_table_indices, dtype=torch.int64, device=device)
+        address_table.scatter_(0, scatter_indices, host_addresses.to(device))
+        valid_table.scatter_(0, scatter_indices, host_valid.to(device))
         print(
-            "RUNTIME_NPU_PHASE_DONE phase=copy_access_table_to_device "
-            f"entries={table_capacity}"
+            "RUNTIME_NPU_PHASE_DONE phase=caller_access_table_scatter "
+            f"valid_entries={active_requests} table_capacity={table_capacity}"
         )
         indices = torch.tensor(indices_values, dtype=torch.int32, device=device)
         mask = torch.tensor(mask_values, dtype=torch.uint8, device=device)
@@ -237,7 +275,10 @@ def main() -> int:
         print("RUNTIME_NPU_PHASE_BEGIN phase=runtime_batch_get")
         execute(output_a)
         torch.npu.synchronize()
-        validate_output(bytes(output_a.cpu().tolist()), indices_values, mask_values, output_indices_values, block_bytes)
+        validate_output(
+            bytes(output_a.cpu().tolist()), mask_values, output_indices_values,
+            payload_slots, block_bytes
+        )
         validate_completion(
             bytes(status.cpu().tolist()),
             bytes(queue.cpu().tolist()),
@@ -253,7 +294,10 @@ def main() -> int:
         # the operator and remains unchanged throughout this sequence.
         execute(output_b)
         torch.npu.synchronize()
-        validate_output(bytes(output_b.cpu().tolist()), indices_values, mask_values, output_indices_values, block_bytes)
+        validate_output(
+            bytes(output_b.cpu().tolist()), mask_values, output_indices_values,
+            payload_slots, block_bytes
+        )
         validate_completion(
             bytes(status.cpu().tolist()),
             bytes(queue.cpu().tolist()),
@@ -264,7 +308,10 @@ def main() -> int:
         )
         execute(output_a)
         torch.npu.synchronize()
-        validate_output(bytes(output_a.cpu().tolist()), indices_values, mask_values, output_indices_values, block_bytes)
+        validate_output(
+            bytes(output_a.cpu().tolist()), mask_values, output_indices_values,
+            payload_slots, block_bytes
+        )
         validate_completion(
             bytes(status.cpu().tolist()),
             bytes(queue.cpu().tolist()),
@@ -279,7 +326,10 @@ def main() -> int:
             execute(output_a)
         samples = [execute(output_a) for _ in range(iterations)]
         torch.npu.synchronize()
-        validate_output(bytes(output_a.cpu().tolist()), indices_values, mask_values, output_indices_values, block_bytes)
+        validate_output(
+            bytes(output_a.cpu().tolist()), mask_values, output_indices_values,
+            payload_slots, block_bytes
+        )
         validate_completion(
             bytes(status.cpu().tolist()),
             bytes(queue.cpu().tolist()),
@@ -289,7 +339,6 @@ def main() -> int:
             3 + warmup + iterations,
         )
 
-        active_requests = sum(mask_values)
         mean_ms = statistics.mean(samples)
         useful_gibps = (
             active_requests * block_bytes / (1024.0**3) / (mean_ms / 1000.0)

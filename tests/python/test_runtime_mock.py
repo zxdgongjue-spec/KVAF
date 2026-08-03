@@ -46,8 +46,9 @@ class RuntimeMockTests(unittest.TestCase):
 
         view = self.kvaf.access_table_view(table)
         self.assertEqual(view["addresses"][1] - view["addresses"][0], 64)
-        self.assertEqual(view["lengths"], [3, 4])
-        self.assertEqual(view["valid"], [True, True])
+        self.assertEqual(list(view["lengths"]), [3, 4])
+        self.assertEqual(list(view["valid"]), [1, 1])
+        first_address = view["addresses"][0]
 
         # Requests are scattered to caller-owned output rows in reverse order.
         output = bytearray(16)
@@ -75,7 +76,7 @@ class RuntimeMockTests(unittest.TestCase):
         recycled = self.kvaf.prepare_access_table([105])
         self.assertEqual(
             self.kvaf.access_table_view(recycled)["addresses"][0],
-            view["addresses"][0],
+            first_address,
         )
         self.kvaf.release_access_table(recycled)
 

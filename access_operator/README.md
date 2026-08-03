@@ -17,7 +17,7 @@ caller-owned buffer 与远端 DDR 组织为一次数据搬运。它不拥有 Key
 | --- | --- | --- |
 | `Initialize(remote_region)` | 已支持 | 加载 BatchGet kernel，并为 Runtime-owned Host DDR 创建可复用 transport。初始化不接收 output HBM。 |
 | `ExecuteBatchGet(request)` | 已支持，同步 | 使用 request 内 caller-owned NPU output/status/queue，Acquire 对应的 local HBM buffer，launch 后同步等待，再 Release。相同 `(output 地址, bytes)` 由底层 transport 缓存复用。 |
-| `ExecuteBatchPut(request)` | `kNotImplemented` | 接口已由 Runtime 正常调用；当前没有 BatchPut 数据面，Runtime 会 AbortPut，避免 MetaManager 提交半完成数据。 |
+| `ExecuteBatchPut(request)` | 已支持，测试 mock | 对 caller-owned NPU input block 执行同步 `aclrtMemcpy(DeviceToHost)` 到 MetaManager 预留的 Host DDR 地址，然后由 Runtime CommitPut。它只用于当前 BatchGet 集成测试，不是最终 BatchPut 数据面。 |
 | `Shutdown()` | 已支持 | 同步 stream 后释放 transport 及其缓存的 local HBM MR。 |
 
 当前 BatchGet 是固定大小 block 的同步 POC：NPU 侧 `indices`、`mask`、
@@ -41,6 +41,10 @@ Runtime.BatchGet(request with output B)
   -> launch + stream synchronize
   -> LocalBufferRelease(B)
 
+Runtime.BatchPut(request with NPU input)
+  -> aclrtMemcpy(DeviceToHost) per reserved block  # temporary test mock
+  -> Runtime.CommitPut
+
 Runtime.Shutdown
   -> TransportDestroy                         # 释放缓存的 local HBM MR
 ```
@@ -56,8 +60,8 @@ event，不能沿用当前同步时序。
 `KVAF_ENABLE_AIV_BATCH_GET=ON` 时构建 `DefaultAccessOperator` 和现有的 BatchGet
 demo；名称中的 AIV 只保留在 demo/kernel 实现目录，非 Runtime 的公开路径选择。
 
-Selector / Executor / Template 分层、图捕获管理、异步执行与 BatchPut 数据面均不
-属于当前范围。
+Selector / Executor / Template 分层、图捕获管理、异步执行与真实 BatchPut 数据面
+均不属于当前范围。
 
 ## 后续待决事项：BatchGet / BatchPut Transport
 
