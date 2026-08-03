@@ -53,6 +53,11 @@ constexpr uint32_t kMaxDirectAivWorkers =
     KVAF_AIV_BATCH_GET_MAX_AIV_CORES *
     KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE;
 
+bool LocalBufferVerboseLoggingEnabled() {
+  const char *value = std::getenv("KVAF_AIV_VERBOSE_LOCAL_BUFFER");
+  return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
 struct DeviceIdentity {
   uint32_t logical_device_id = 0;
   uint32_t physical_device_id = 0;
@@ -724,12 +729,15 @@ bool AcquireLocalBuffer(KvafBatchGetTransport *transport, void *output_hbm, uint
       ++existing->reference_count;
       *local_buffer = existing.get();
       *device_channel_entity = existing->device_channel_entity;
-      std::fprintf(stderr,
-                   "[KVAF_AIV] DIRECT_LOCAL_BUFFER_ACQUIRE_CACHE_HIT output_hbm=0x%llx bytes=%llu token_id=0x%x "
-                   "refs=%u entity_table=0x%llx\n",
-                   static_cast<unsigned long long>(output_address), static_cast<unsigned long long>(output_hbm_bytes),
-                   existing->memory.token_id, existing->reference_count,
-                   static_cast<unsigned long long>(existing->device_channel_entity));
+      if (LocalBufferVerboseLoggingEnabled()) {
+        std::fprintf(stderr,
+                     "[KVAF_AIV] DIRECT_LOCAL_BUFFER_ACQUIRE_CACHE_HIT output_hbm=0x%llx bytes=%llu token_id=0x%x "
+                     "refs=%u entity_table=0x%llx\n",
+                     static_cast<unsigned long long>(output_address),
+                     static_cast<unsigned long long>(output_hbm_bytes),
+                     existing->memory.token_id, existing->reference_count,
+                     static_cast<unsigned long long>(existing->device_channel_entity));
+      }
       return true;
     }
   }
@@ -1323,11 +1331,14 @@ extern "C" void KvafBatchGetLocalBufferRelease(KvafBatchGetLocalBuffer *local_bu
     return;
   }
   --local_buffer->reference_count;
-  std::fprintf(stderr,
-               "[KVAF_AIV] DIRECT_LOCAL_BUFFER_RELEASE output_hbm=0x%llx bytes=%llu refs=%u "
-               "cache_retained_until_transport_destroy=1\n",
-               static_cast<unsigned long long>(local_buffer->output_hbm_address),
-               static_cast<unsigned long long>(local_buffer->output_hbm_bytes), local_buffer->reference_count);
+  if (LocalBufferVerboseLoggingEnabled()) {
+    std::fprintf(stderr,
+                 "[KVAF_AIV] DIRECT_LOCAL_BUFFER_RELEASE output_hbm=0x%llx bytes=%llu refs=%u "
+                 "cache_retained_until_transport_destroy=1\n",
+                 static_cast<unsigned long long>(local_buffer->output_hbm_address),
+                 static_cast<unsigned long long>(local_buffer->output_hbm_bytes),
+                 local_buffer->reference_count);
+  }
 }
 
 extern "C" void KvafBatchGetTransportDestroy(KvafBatchGetTransport *transport) {

@@ -119,3 +119,7 @@ BatchPut 事务编排，但不代表未来的 BatchPut 数据面实现。
 DDR 注册、Device buffer 初始化和 Host-to-Device 表更新。输出包括 mean、p50、
 p90、p99 和 useful GiB/s。`ctest` 和上面的命令均设置 240 秒上限；未设置
 `KVAF_RUN_NPU_TESTS=1` 时会明确跳过。
+
+`DIRECT_LOCAL_BUFFER_ACQUIRE_NEW` 会始终记录新的 output HBM 注册；高频的
+cache-hit / release 日志默认关闭，避免压测污染终端。如需排查 LocalBuffer 引用
+计数，可额外设置 `KVAF_AIV_VERBOSE_LOCAL_BUFFER=1`。

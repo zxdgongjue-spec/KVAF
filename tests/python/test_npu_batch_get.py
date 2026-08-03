@@ -30,6 +30,11 @@ def tensor_bytes(tensor: object) -> int:
     return int(tensor.numel() * tensor.element_size())
 
 
+def tensor_to_bytes(tensor: object) -> bytes:
+    """Copy a uint8 Tensor to Host bytes without materializing Python ints."""
+    return tensor.cpu().contiguous().numpy().tobytes()
+
+
 def percentile(values: list[float], fraction: float) -> float:
     ordered = sorted(values)
     position = fraction * (len(ordered) - 1)
@@ -45,6 +50,8 @@ def validate_output(
     payload_slots: Iterable[int | None],
     block_bytes: int,
 ) -> None:
+    zero_block = bytes(block_bytes)
+    payload_cache: dict[int, bytes] = {}
     for request, (enabled, row, payload_slot) in enumerate(
         zip(mask, output_indices, payload_slots)
     ):
@@ -52,7 +59,13 @@ def validate_output(
         actual = output[offset : offset + block_bytes]
         if enabled and payload_slot is None:
             raise AssertionError(f"missing expected payload for active request={request}")
-        expected = bytes(block_bytes) if not enabled else pattern(payload_slot, block_bytes)
+        if not enabled:
+            expected = zero_block
+        else:
+            expected = payload_cache.get(payload_slot)
+            if expected is None:
+                expected = pattern(payload_slot, block_bytes)
+                payload_cache[payload_slot] = expected
         if actual != expected:
             raise AssertionError(f"output mismatch for request={request}, row={row}")
 
@@ -276,12 +289,12 @@ def main() -> int:
         execute(output_a)
         torch.npu.synchronize()
         validate_output(
-            bytes(output_a.cpu().tolist()), mask_values, output_indices_values,
+            tensor_to_bytes(output_a), mask_values, output_indices_values,
             payload_slots, block_bytes
         )
         validate_completion(
-            bytes(status.cpu().tolist()),
-            bytes(queue.cpu().tolist()),
+            tensor_to_bytes(status),
+            tensor_to_bytes(queue),
             requests,
             mask_values,
             npu_core_count,
@@ -295,12 +308,12 @@ def main() -> int:
         execute(output_b)
         torch.npu.synchronize()
         validate_output(
-            bytes(output_b.cpu().tolist()), mask_values, output_indices_values,
+            tensor_to_bytes(output_b), mask_values, output_indices_values,
             payload_slots, block_bytes
         )
         validate_completion(
-            bytes(status.cpu().tolist()),
-            bytes(queue.cpu().tolist()),
+            tensor_to_bytes(status),
+            tensor_to_bytes(queue),
             requests,
             mask_values,
             npu_core_count,
@@ -309,12 +322,12 @@ def main() -> int:
         execute(output_a)
         torch.npu.synchronize()
         validate_output(
-            bytes(output_a.cpu().tolist()), mask_values, output_indices_values,
+            tensor_to_bytes(output_a), mask_values, output_indices_values,
             payload_slots, block_bytes
         )
         validate_completion(
-            bytes(status.cpu().tolist()),
-            bytes(queue.cpu().tolist()),
+            tensor_to_bytes(status),
+            tensor_to_bytes(queue),
             requests,
             mask_values,
             npu_core_count,
@@ -326,18 +339,20 @@ def main() -> int:
             execute(output_a)
         samples = [execute(output_a) for _ in range(iterations)]
         torch.npu.synchronize()
+        print("RUNTIME_NPU_PHASE_BEGIN phase=post_perf_validation")
         validate_output(
-            bytes(output_a.cpu().tolist()), mask_values, output_indices_values,
+            tensor_to_bytes(output_a), mask_values, output_indices_values,
             payload_slots, block_bytes
         )
         validate_completion(
-            bytes(status.cpu().tolist()),
-            bytes(queue.cpu().tolist()),
+            tensor_to_bytes(status),
+            tensor_to_bytes(queue),
             requests,
             mask_values,
             npu_core_count,
             3 + warmup + iterations,
         )
+        print("RUNTIME_NPU_PHASE_DONE phase=post_perf_validation")
 
         mean_ms = statistics.mean(samples)
         useful_gibps = (
