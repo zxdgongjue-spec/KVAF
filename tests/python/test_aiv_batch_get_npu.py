@@ -60,12 +60,11 @@ def main() -> int:
         os.environ.get("KVAF_NPU_SOURCE_STRIDE", "4096"),
         "--aiv-cores",
         os.environ.get("KVAF_NPU_AIV_CORES", "1"),
-        "--warmup",
-        os.environ.get("KVAF_NPU_WARMUP", "1"),
-        "--iterations",
-        os.environ.get("KVAF_NPU_ITERATIONS", "1"),
+        "--mask-every",
+        os.environ.get("KVAF_NPU_MASK_EVERY", "0"),
     ]
     timeout_seconds = int(os.environ.get("KVAF_NPU_TIMEOUT_SECONDS", "240"))
+    print("RUNTIME_AIV_PYTHON_COMMAND", " ".join(command))
     try:
         result = subprocess.run(
             command,
