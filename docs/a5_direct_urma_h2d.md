@@ -537,6 +537,31 @@ TABLE 存储与 queue mapping 分别记录释放 phase；因此 table 已释放�
 resource-free bounded probe 也仍只证明 AICPU/AIV 并发控制记录可见性。完整 epoch
 边界和 decode 热路径见 [A5 direct URMA Decode H2D epoch 设计](a5_decode_epoch_h2d.md)。
 
+### 5.2 干净整机状态下的固定 NPU2 验证
+
+`run_a5_direct_urma_npu2_clean_validation.sh` 是普通全局 singleton 的便捷入口，
+不是 5.1 的 cross-NPU bypass。它固定 logical/physical NPU2、两条精确 EID、UB
+management 和 Jetty 502，并清除调用者提供的 UDMA device/index 猜测，由现场
+exact-EID resolver 重新解析。它强制 `KVAF_DIRECT_ALLOW_BUSY_NPU=0`，拒绝所有
+cross-NPU 风险接受变量，继续使用生产 active/quarantine 和全部历史 legacy lock。
+
+因此，只要旧 NPU7 owner 仍持有 `/run/lock/kvaf-a5-direct-urma.lock`，或机器级
+active/quarantine 尚未闭环，该入口会在 topology、ACL、DDR/HBM、URMA 之前失败；
+它不会删除状态、发送信号或在线覆盖 AICPU package。完成复位/操作系统重启，并用
+当前 checkout 重新构建 provider、安装 AICPU package 和 direct binary 后才能运行。
+
+一次调用严格按以下顺序建立三个独立验证 epoch，前一阶段非 PASS 就停止：
+
+1. zero-WQE：只验证建链、注册和完整销毁；
+2. one-kib：提交一条 1024-byte H2D READ；
+3. batch：默认在一次 Open/register/connect 生命周期内提交 `4096 x 1024 B`，不会
+   重复注册或建链 4096 次。
+
+最终 batch 可通过 `KVAF_NPU2_TRANSFER_COUNT`、
+`KVAF_NPU2_BYTES_PER_TRANSFER` 和 `KVAF_NPU2_BATCH_ITERATIONS` 修改；默认分别为
+4096、1024、1。控制 timeout 默认 60 秒，单阶段 runner supervision deadline 默认
+180 秒，失败后保留全部证据且不会自动进入下一阶段。
+
 ## 6. 操作命令
 
 ### 6.1 服务器 B 宿主机：更新代码并准备固定源码
