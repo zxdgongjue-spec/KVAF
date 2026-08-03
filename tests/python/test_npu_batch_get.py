@@ -260,6 +260,12 @@ def main() -> int:
         indices = torch.tensor(indices_values, dtype=torch.int32, device=device)
         mask = torch.tensor(mask_values, dtype=torch.uint8, device=device)
         output_indices = torch.tensor(output_indices_values, dtype=torch.int32, device=device)
+        # torch_npu graph input producers are NPU tensors too. Allocate them
+        # with the caller buffers, before the Runtime owns any Direct-HCCP
+        # local-buffer registrations; they remain caller-owned throughout.
+        if graph_replays:
+            graph_indices_staging = torch.empty_like(indices)
+            graph_output_indices_staging = torch.empty_like(output_indices)
         output_a = torch.zeros(output_rows * block_bytes, dtype=torch.uint8, device=device)
         output_b = torch.zeros_like(output_a)
         status = torch.zeros(
@@ -392,18 +398,16 @@ def main() -> int:
                 "fixed_tensor_addresses=1 "
                 "external_graph_owner=torch_npu "
                 "dynamic_tensor_contents=indices_output_indices "
-                "input_update=host_to_device_same_stream "
-                "captured_ops=runtime_batch_get "
+                "input_producer=caller_stream "
+                "captured_ops=input_copy_runtime_batch_get "
                 f"functional_replays={graph_replays} "
                 f"perf_warmup={graph_warmup} perf_samples={graph_iterations}"
             )
 
-            # Match the proven C++ demo graph boundary: inputs are written to
-            # the fixed caller-owned device tensors before replay; capture
-            # contains only the BatchGet launch.  Do not introduce separate
-            # NPU source/staging tensors or cross-stream dependencies here.
-            graph_indices_host = torch.empty(requests, dtype=torch.int32)
-            graph_output_indices_host = torch.empty(requests, dtype=torch.int32)
+            # A direct CPU -> NPU copy on the post-capture stream is a known
+            # torch_npu blocking boundary on this environment. Model inputs
+            # are normally produced on NPU, so use fixed caller-owned NPU
+            # staging tensors and make the captured graph consume them.
 
             def prepare_graph_inputs(
                 epoch: int, trace: str | None = None
@@ -419,16 +423,19 @@ def main() -> int:
                 graph_output_indices = [
                     (row + epoch) % output_rows for row in output_indices_values
                 ]
-                # Keep the Host source buffers alive until the associated
-                # capture stream completes its H2D updates.
-                graph_indices_host.copy_(
-                    torch.tensor(graph_indices, dtype=torch.int32)
-                )
-                if trace is not None:
-                    print(f"RUNTIME_NPU_GRAPH_STAGE_INDICES_DONE replay={trace}")
-                graph_output_indices_host.copy_(
-                    torch.tensor(graph_output_indices, dtype=torch.int32)
-                )
+                # This is the upstream NPU producer. It stays outside graph
+                # capture, and capture_stream waits for it before replay.
+                with torch.npu.stream(caller_stream):
+                    graph_indices_staging.copy_(
+                        torch.tensor(graph_indices, dtype=torch.int32, device=device)
+                    )
+                    if trace is not None:
+                        print(f"RUNTIME_NPU_GRAPH_STAGE_INDICES_DONE replay={trace}")
+                    graph_output_indices_staging.copy_(
+                        torch.tensor(
+                            graph_output_indices, dtype=torch.int32, device=device
+                        )
+                    )
                 if trace is not None:
                     print(f"RUNTIME_NPU_GRAPH_STAGE_OUTPUT_INDICES_DONE replay={trace}")
                 return graph_payload_slots, graph_output_indices
@@ -436,19 +443,13 @@ def main() -> int:
             def enqueue_graph_input_update(
                 stream: object, trace: str | None = None
             ) -> None:
-                # Equivalent to the demo's aclrtMemcpyAsync calls: update
-                # fixed caller tensors then replay on this exact same stream.
+                # Establish the framework-level producer -> graph dependency.
+                # The captured D2D input copies run after this wait.
                 if trace is not None:
                     print(f"RUNTIME_NPU_GRAPH_INPUT_STREAM_ENTER replay={trace}")
-                with torch.npu.stream(stream):
-                    if trace is not None:
-                        print(f"RUNTIME_NPU_GRAPH_INPUT_COPY_BEGIN replay={trace}")
-                    indices.copy_(graph_indices_host)
-                    if trace is not None:
-                        print(f"RUNTIME_NPU_GRAPH_INPUT_INDICES_DONE replay={trace}")
-                    output_indices.copy_(graph_output_indices_host)
-                    if trace is not None:
-                        print(f"RUNTIME_NPU_GRAPH_INPUT_OUTPUT_INDICES_DONE replay={trace}")
+                stream.wait_stream(caller_stream)
+                if trace is not None:
+                    print(f"RUNTIME_NPU_GRAPH_INPUT_WAIT_ENQUEUED replay={trace}")
 
             capture_stream = torch.npu.Stream(device=device_id)
             graph = torch.npu.NPUGraph()
@@ -460,6 +461,8 @@ def main() -> int:
             # Direct-HCCP local HBM registration is cached before capture.
             # The external torch_npu graph owns capture, replay and lifetime.
             with torch.npu.graph(graph, stream=capture_stream, capture_error_mode="relaxed"):
+                indices.copy_(graph_indices_staging)
+                output_indices.copy_(graph_output_indices_staging)
                 execute(output_a, capture_stream, synchronize=False)
             print("RUNTIME_NPU_PHASE_DONE phase=graph_capture owner=torch_npu")
 
