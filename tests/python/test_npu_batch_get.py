@@ -148,6 +148,9 @@ def main() -> int:
     active_percent = int(os.environ.get("KVAF_NPU_ACTIVE_PERCENT", "100"))
     warmup = int(os.environ.get("KVAF_NPU_WARMUP", "1"))
     iterations = int(os.environ.get("KVAF_NPU_ITERATIONS", "5"))
+    graph_replays = int(os.environ.get("KVAF_NPU_GRAPH_REPLAYS", "0"))
+    graph_warmup = int(os.environ.get("KVAF_NPU_GRAPH_WARMUP", "5"))
+    graph_iterations = int(os.environ.get("KVAF_NPU_GRAPH_ITERATIONS", "20"))
     if not (
         table_capacity > 0
         and requests > 0
@@ -158,6 +161,9 @@ def main() -> int:
         and npu_core_count <= requests
         and iterations > 0
         and 1 <= active_percent <= 100
+        and graph_replays >= 0
+        and graph_warmup >= 0
+        and graph_iterations > 0
     ):
         print("FAIL: invalid KVAF_NPU_* shape configuration", file=sys.stderr)
         return 2
@@ -196,6 +202,7 @@ def main() -> int:
     device = f"npu:{device_id}"
     runtime = kvaf.NpuRuntime(str(kernel), device_id, npu_core_count)
     table = None
+    graph = None
     try:
         print(
             "RUNTIME_NPU_SPARSE_LAYOUT "
@@ -368,9 +375,142 @@ def main() -> int:
             f"p99_ms={percentile(samples, 0.99):.3f} "
             f"useful_GiBps={useful_gibps:.3f}"
         )
+
+        if graph_replays:
+            print(
+                "RUNTIME_NPU_GRAPH_CAPTURE_CONTRACT "
+                "fixed_tensor_addresses=1 "
+                "dynamic_tensor_contents=indices_output_indices "
+                f"functional_replays={graph_replays} "
+                f"perf_warmup={graph_warmup} perf_samples={graph_iterations}"
+            )
+
+            def update_graph_inputs(epoch: int) -> list[int | None]:
+                graph_indices = [table_capacity - 1] * requests
+                graph_payload_slots: list[int | None] = [None] * requests
+                for ordinal, request in enumerate(active_request_positions):
+                    payload_slot = (ordinal + epoch) % active_requests
+                    graph_indices[request] = sparse_table_indices[payload_slot]
+                    graph_payload_slots[request] = payload_slot
+                graph_output_indices = [
+                    (row + epoch) % output_rows for row in output_indices_values
+                ]
+                indices.copy_(
+                    torch.tensor(graph_indices, dtype=torch.int32, device=device)
+                )
+                output_indices.copy_(
+                    torch.tensor(
+                        graph_output_indices, dtype=torch.int32, device=device
+                    )
+                )
+                output_a.zero_()
+                # Torch writes use its current stream; the captured ACL graph
+                # uses Runtime's private stream. Complete the producer stream
+                # before replaying the fixed-address graph.
+                torch.npu.synchronize()
+                return graph_payload_slots
+
+            print("RUNTIME_NPU_PHASE_BEGIN phase=graph_capture")
+            graph = runtime.capture_batch_get_graph(
+                table,
+                int(indices.data_ptr()),
+                tensor_bytes(indices),
+                int(mask.data_ptr()),
+                tensor_bytes(mask),
+                int(output_indices.data_ptr()),
+                tensor_bytes(output_indices),
+                int(output_a.data_ptr()),
+                tensor_bytes(output_a),
+                int(status.data_ptr()),
+                tensor_bytes(status),
+                int(queue.data_ptr()),
+                tensor_bytes(queue),
+                block_bytes,
+                int(address_table.data_ptr()),
+                tensor_bytes(address_table),
+                int(valid_table.data_ptr()),
+                tensor_bytes(valid_table),
+            )
+            print(f"RUNTIME_NPU_PHASE_DONE phase=graph_capture graph={graph}")
+
+            graph_completed_batches = 3 + warmup + iterations
+            for replay in range(graph_replays):
+                graph_payload_slots = update_graph_inputs(replay)
+                runtime.replay_batch_get_graph(graph)
+                graph_completed_batches += 1
+                validate_output(
+                    tensor_to_bytes(output_a),
+                    mask_values,
+                    [
+                        (row + replay) % output_rows
+                        for row in output_indices_values
+                    ],
+                    graph_payload_slots,
+                    block_bytes,
+                )
+                validate_completion(
+                    tensor_to_bytes(status),
+                    tensor_to_bytes(queue),
+                    requests,
+                    mask_values,
+                    npu_core_count,
+                    graph_completed_batches,
+                )
+                print(f"RUNTIME_NPU_GRAPH_REPLAY_VALIDATION_PASS replay={replay}")
+
+            print("RUNTIME_NPU_GRAPH_PERF_WARMUP_BEGIN")
+            for warmup_iteration in range(graph_warmup):
+                update_graph_inputs(graph_replays + warmup_iteration)
+                runtime.replay_batch_get_graph(graph)
+                graph_completed_batches += 1
+            print(f"RUNTIME_NPU_GRAPH_PERF_WARMUP_DONE count={graph_warmup}")
+
+            graph_samples = []
+            final_graph_payload_slots = None
+            final_graph_output_indices = None
+            for iteration in range(graph_iterations):
+                epoch = graph_replays + graph_warmup + iteration
+                final_graph_payload_slots = update_graph_inputs(epoch)
+                final_graph_output_indices = [
+                    (row + epoch) % output_rows for row in output_indices_values
+                ]
+                graph_samples.append(runtime.replay_batch_get_graph(graph))
+                graph_completed_batches += 1
+
+            validate_output(
+                tensor_to_bytes(output_a),
+                mask_values,
+                final_graph_output_indices,
+                final_graph_payload_slots,
+                block_bytes,
+            )
+            validate_completion(
+                tensor_to_bytes(status),
+                tensor_to_bytes(queue),
+                requests,
+                mask_values,
+                npu_core_count,
+                graph_completed_batches,
+            )
+            graph_mean_ms = statistics.mean(graph_samples)
+            graph_useful_gibps = (
+                active_requests * block_bytes / (1024.0**3) / (graph_mean_ms / 1000.0)
+            )
+            print(
+                "GRAPH_PERF_RESULT metric=graph_producer_update_to_stream_completion "
+                f"samples={graph_iterations} warmup_excluded={graph_warmup} "
+                f"active_requests={active_requests} block_bytes={block_bytes} "
+                f"npu_cores={npu_core_count} mean_ms={graph_mean_ms:.3f} "
+                f"p50_ms={percentile(graph_samples, 0.50):.3f} "
+                f"p90_ms={percentile(graph_samples, 0.90):.3f} "
+                f"p99_ms={percentile(graph_samples, 0.99):.3f} "
+                f"useful_GiBps={graph_useful_gibps:.3f}"
+            )
         return 0
     finally:
         print("RUNTIME_NPU_PHASE_BEGIN phase=teardown")
+        if graph is not None:
+            runtime.release_batch_get_graph(graph)
         if table is not None and runtime.initialized:
             runtime.release_access_table(table)
         if runtime.initialized:

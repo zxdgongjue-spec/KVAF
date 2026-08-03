@@ -113,6 +113,26 @@ teardown。它以 `KVAF_NPU_ACTIVE_PERCENT` 构造稀疏 mask（例如 `5` 表�
 有效 address scatter 到可很大的 Device AccessTable。该 mock 验证 Runtime 的
 BatchPut 事务编排，但不代表未来的 BatchPut 数据面实现。
 
+设置 `KVAF_NPU_GRAPH_REPLAYS` 可在同一个 Python 用例中额外运行 ACL 图模式：
+
+```bash
+KVAF_NPU_GRAPH_REPLAYS=2 \
+KVAF_NPU_GRAPH_WARMUP=5 \
+KVAF_NPU_GRAPH_ITERATIONS=20 \
+# 其余 KVAF_RUN_NPU_TESTS / kernel / shape 环境变量与上例相同
+timeout 240s python3 tests/python/test_npu_batch_get.py
+```
+
+图 capture 固定 caller-owned 的 Device tensor 地址、输出地址和对应的 local HBM
+注册；每次 replay 前脚本只更新固定 tensor 的 `indices` 与 `output_indices` 内容。
+`capture_batch_get_graph` 返回 opaque handle，必须在关联 AccessTable 释放前调用
+`release_batch_get_graph`。图性能指标
+`graph_producer_update_to_stream_completion` 包含 Runtime 私有 stream 上一个 1-byte
+producer update、graph replay 与同步；不包含 Python/Torch 对输入 tensor 的写入、
+capture、初始化和最终验证，因此不能与 eager 指标直接作一一对比。这个 1-byte
+更新是当前 demo 已观测到裸 graph replay 可能停滞时的同步 POC；它不代表业务输入
+更新，也不是纯 kernel 性能指标。
+
 正确性验证完成后，脚本会输出
 `PERF_RESULT metric=runtime_batch_get_call_to_stream_completion`。这个计时窗口
 从 `Runtime.BatchGet` 调用开始，到 AIV adapter 中的 stream 同步完成结束，排除

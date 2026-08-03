@@ -7,6 +7,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -96,6 +97,44 @@ class AclHostDdrAllocator final : public DdrMemoryAllocator {
 void* PointerFromValue(std::uint64_t pointer) {
   return reinterpret_cast<void*>(static_cast<std::uintptr_t>(pointer));
 }
+
+BatchGetRequest MakeNpuBatchGetRequest(
+    const AccessTableHandle& access_table, std::uint64_t indices_pointer,
+    std::size_t indices_bytes, std::uint64_t mask_pointer,
+    std::size_t mask_bytes, std::uint64_t output_indices_pointer,
+    std::size_t output_indices_bytes, std::uint64_t output_pointer,
+    std::size_t output_bytes, std::uint64_t status_pointer,
+    std::size_t status_bytes, std::uint64_t queue_state_pointer,
+    std::size_t queue_state_bytes, std::uint64_t output_block_bytes,
+    std::uint64_t address_table_pointer, std::size_t address_table_bytes,
+    std::uint64_t valid_table_pointer, std::size_t valid_table_bytes) {
+  return BatchGetRequest{
+      access_table,
+      ConstBufferView{PointerFromValue(indices_pointer), indices_bytes,
+                      DeviceKind::kNpu},
+      ConstBufferView{PointerFromValue(mask_pointer), mask_bytes,
+                      DeviceKind::kNpu},
+      ConstBufferView{PointerFromValue(output_indices_pointer),
+                      output_indices_bytes, DeviceKind::kNpu},
+      MutableBufferView{PointerFromValue(output_pointer), output_bytes,
+                        DeviceKind::kNpu},
+      output_block_bytes,
+      AccessTableDeviceView{
+          ConstBufferView{PointerFromValue(address_table_pointer),
+                          address_table_bytes, DeviceKind::kNpu},
+          ConstBufferView{PointerFromValue(valid_table_pointer),
+                          valid_table_bytes, DeviceKind::kNpu}},
+      BatchGetExecutionBuffers{
+          MutableBufferView{PointerFromValue(status_pointer), status_bytes,
+                            DeviceKind::kNpu},
+          MutableBufferView{PointerFromValue(queue_state_pointer),
+                            queue_state_bytes, DeviceKind::kNpu}}};
+}
+
+struct CapturedGraphState {
+  AccessTableHandle access_table;
+  std::unique_ptr<CapturedBatchGetGraph> graph;
+};
 
 class NpuRuntime final {
  public:
@@ -219,6 +258,12 @@ class NpuRuntime final {
   }
 
   void ReleaseAccessTable(const AccessTableHandle& handle) {
+    for (const auto& [_, graph] : captured_graphs_) {
+      if (graph.access_table.opaque == handle.opaque) {
+        throw py::value_error(
+            "Release captured BatchGet graphs before releasing their AccessTable");
+      }
+    }
     ThrowIfError(runtime_->ReleaseAccessTable(handle));
   }
 
@@ -240,34 +285,73 @@ class NpuRuntime final {
                   std::size_t address_table_bytes,
                   std::uint64_t valid_table_pointer,
                   std::size_t valid_table_bytes) {
-    const BatchGetRequest request{
-        access_table,
-        ConstBufferView{PointerFromValue(indices_pointer), indices_bytes,
-                        DeviceKind::kNpu},
-        ConstBufferView{PointerFromValue(mask_pointer), mask_bytes,
-                        DeviceKind::kNpu},
-        ConstBufferView{PointerFromValue(output_indices_pointer),
-                        output_indices_bytes, DeviceKind::kNpu},
-        MutableBufferView{PointerFromValue(output_pointer), output_bytes,
-                          DeviceKind::kNpu},
-        output_block_bytes,
-        AccessTableDeviceView{
-            ConstBufferView{PointerFromValue(address_table_pointer),
-                            address_table_bytes, DeviceKind::kNpu},
-            ConstBufferView{PointerFromValue(valid_table_pointer),
-                            valid_table_bytes, DeviceKind::kNpu}},
-        BatchGetExecutionBuffers{
-            MutableBufferView{PointerFromValue(status_pointer), status_bytes,
-                              DeviceKind::kNpu},
-            MutableBufferView{PointerFromValue(queue_state_pointer), queue_state_bytes,
-                              DeviceKind::kNpu}}};
+    const BatchGetRequest request = MakeNpuBatchGetRequest(
+        access_table, indices_pointer, indices_bytes, mask_pointer, mask_bytes,
+        output_indices_pointer, output_indices_bytes, output_pointer, output_bytes,
+        status_pointer, status_bytes, queue_state_pointer, queue_state_bytes,
+        output_block_bytes, address_table_pointer, address_table_bytes,
+        valid_table_pointer, valid_table_bytes);
     const auto begin = std::chrono::steady_clock::now();
     ThrowIfError(runtime_->BatchGet(request));
     const auto end = std::chrono::steady_clock::now();
     return std::chrono::duration<double, std::milli>(end - begin).count();
   }
 
+  std::uint64_t CaptureBatchGetGraph(
+      const AccessTableHandle& access_table, std::uint64_t indices_pointer,
+      std::size_t indices_bytes, std::uint64_t mask_pointer,
+      std::size_t mask_bytes, std::uint64_t output_indices_pointer,
+      std::size_t output_indices_bytes, std::uint64_t output_pointer,
+      std::size_t output_bytes, std::uint64_t status_pointer,
+      std::size_t status_bytes, std::uint64_t queue_state_pointer,
+      std::size_t queue_state_bytes, std::uint64_t output_block_bytes,
+      std::uint64_t address_table_pointer, std::size_t address_table_bytes,
+      std::uint64_t valid_table_pointer, std::size_t valid_table_bytes) {
+    if (!Initialized()) {
+      throw std::runtime_error("Runtime has not been initialized");
+    }
+    const BatchGetRequest request = MakeNpuBatchGetRequest(
+        access_table, indices_pointer, indices_bytes, mask_pointer, mask_bytes,
+        output_indices_pointer, output_indices_bytes, output_pointer, output_bytes,
+        status_pointer, status_bytes, queue_state_pointer, queue_state_bytes,
+        output_block_bytes, address_table_pointer, address_table_bytes,
+        valid_table_pointer, valid_table_bytes);
+    AccessTableView host_view;
+    ThrowIfError(runtime_->GetAccessTableView(access_table, &host_view));
+
+    std::unique_ptr<CapturedBatchGetGraph> graph;
+    ThrowIfError(access_operator_->CaptureBatchGetGraph(
+        BatchGetExecRequest{host_view, &request}, &graph));
+    const std::uint64_t graph_id = next_graph_id_++;
+    if (graph_id == 0) {
+      throw py::value_error("BatchGet graph handle space is exhausted");
+    }
+    captured_graphs_.emplace(
+        graph_id, CapturedGraphState{access_table, std::move(graph)});
+    return graph_id;
+  }
+
+  double ReplayBatchGetGraph(std::uint64_t graph_id) {
+    const auto graph = captured_graphs_.find(graph_id);
+    if (graph == captured_graphs_.end()) {
+      throw py::key_error("BatchGet graph handle was not found");
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    ThrowIfError(graph->second.graph->Replay());
+    const auto end = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(end - begin).count();
+  }
+
+  void ReleaseBatchGetGraph(std::uint64_t graph_id) {
+    const auto graph = captured_graphs_.find(graph_id);
+    if (graph == captured_graphs_.end()) {
+      throw py::key_error("BatchGet graph handle was not found");
+    }
+    captured_graphs_.erase(graph);
+  }
+
   void Shutdown() {
+    captured_graphs_.clear();
     if (runtime_ != nullptr && runtime_->initialized()) {
       ThrowIfError(runtime_->Shutdown());
     }
@@ -283,6 +367,7 @@ class NpuRuntime final {
   }
 
   void CloseNoThrow() {
+    captured_graphs_.clear();
     if (runtime_ != nullptr && runtime_->initialized()) {
       (void)runtime_->Shutdown();
     }
@@ -299,6 +384,8 @@ class NpuRuntime final {
   std::unique_ptr<AclHostDdrAllocator> allocator_;
   std::unique_ptr<DefaultAccessOperator> access_operator_;
   std::unique_ptr<Runtime> runtime_;
+  std::uint64_t next_graph_id_{1};
+  std::unordered_map<std::uint64_t, CapturedGraphState> captured_graphs_;
 };
 
 }  // namespace
@@ -333,7 +420,23 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("queue_state_bytes"), py::arg("output_block_bytes"),
            py::arg("address_table_pointer"), py::arg("address_table_bytes"),
            py::arg("valid_table_pointer"), py::arg("valid_table_bytes"),
-           "Run synchronous Runtime.BatchGet and return call-to-stream-completion milliseconds.");
+           "Run synchronous Runtime.BatchGet and return call-to-stream-completion milliseconds.")
+      .def("capture_batch_get_graph", &NpuRuntime::CaptureBatchGetGraph,
+           py::arg("access_table"), py::arg("indices_pointer"),
+           py::arg("indices_bytes"), py::arg("mask_pointer"),
+           py::arg("mask_bytes"), py::arg("output_indices_pointer"),
+           py::arg("output_indices_bytes"), py::arg("output_pointer"),
+           py::arg("output_bytes"), py::arg("status_pointer"),
+           py::arg("status_bytes"), py::arg("queue_state_pointer"),
+           py::arg("queue_state_bytes"), py::arg("output_block_bytes"),
+           py::arg("address_table_pointer"), py::arg("address_table_bytes"),
+           py::arg("valid_table_pointer"), py::arg("valid_table_bytes"),
+           "Capture a fixed-shape BatchGet graph and return its opaque handle.")
+      .def("replay_batch_get_graph", &NpuRuntime::ReplayBatchGetGraph,
+           py::arg("graph"),
+           "Replay a captured BatchGet graph and return producer-update-to-stream-completion milliseconds.")
+      .def("release_batch_get_graph", &NpuRuntime::ReleaseBatchGetGraph,
+           py::arg("graph"));
 }
 
 }  // namespace kvaf
