@@ -31,6 +31,11 @@ class RebootStateReconcileTests(unittest.TestCase):
         self.assertIn("flock -n 5", self.source)
         self.assertIn("mktemp", self.source)
         self.assertIn("kvaf_git_head=%s", self.source)
+        self.assertIn("status --porcelain", self.source)
+        self.assertIn(
+            "KVAF checkout must be clean for reboot reconciliation",
+            self.source,
+        )
         self.assertIn("reconcile_script_sha256=%s", self.source)
         self.assertIn("durable_helper_sha256=%s", self.source)
         self.assertIn(

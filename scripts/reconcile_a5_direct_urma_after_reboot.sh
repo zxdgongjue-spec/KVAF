@@ -202,6 +202,12 @@ kvaf_git_head=$(git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null) ||
   die "could not identify the KVAF checkout"
 [[ "${kvaf_git_head}" =~ ^[0-9a-f]{40}$ ]] ||
   die "KVAF checkout HEAD is malformed"
+kvaf_git_status=$(git -C "${ROOT_DIR}" status --porcelain 2>/dev/null) ||
+  die "could not inspect the KVAF checkout"
+if [[ -n "${kvaf_git_status}" ]]; then
+  echo "${kvaf_git_status}" >&2
+  die "KVAF checkout must be clean for reboot reconciliation"
+fi
 
 if [[ "${action}" == prepare ]]; then
   if [[ -e "${pending_file}" || -L "${pending_file}" ]]; then
