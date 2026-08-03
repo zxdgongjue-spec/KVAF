@@ -113,8 +113,8 @@ teardown。它以 `KVAF_NPU_ACTIVE_PERCENT` 构造稀疏 mask（例如 `5` 表�
 有效 address scatter 到可很大的 Device AccessTable。该 mock 验证 Runtime 的
 BatchPut 事务编排，但不代表未来的 BatchPut 数据面实现。
 
-设置 `KVAF_NPU_GRAPH_REPLAYS` 可在同一个 Python 用例中额外运行外部
-`torch.npu.NPUGraph` 图模式：
+设置 `KVAF_NPU_GRAPH_REPLAYS` 可在同一个 Python 用例中额外运行 Python-owned 的
+raw `kvaf.AclGraph` 图模式：
 
 ```bash
 KVAF_NPU_GRAPH_REPLAYS=2 \
@@ -124,30 +124,33 @@ KVAF_NPU_GRAPH_ITERATIONS=20 \
 timeout 240s python3 tests/python/test_npu_batch_get.py
 ```
 
-图对象、capture、replay 和销毁都由 `torch_npu` 持有；KVAF 不创建或保存图。脚本
+图对象、capture、replay 和销毁都由 Python 测试持有的 `kvaf.AclGraph` 管理；KVAF
+Runtime 与 AccessOperator 不创建或保存图。`AclGraph` 是 pybind 暴露的薄封装，直接
+调用 ACL Runtime Graph 的 `aclmdlRICaptureBegin`、`aclmdlRICaptureEnd`、
+`aclmdlRIExecuteAsync` 和 `aclmdlRIDestroy`。脚本
 先在图外 eager 执行 `output A -> B -> A`，使 A 的 local HBM 注册进入 transport
-cache；再在 `torch.npu.graph(...)` 中只 capture
+cache；再在 raw ACL capture 中只 capture
 `runtime.batch_get(..., stream, synchronize=False)`。图使用一个在 HCCP output
 注册前创建的专用 `graph_stream`。基础图模式用例不在 eager 后创建或修改 NPU tensor：
 它以已验证的固定 `indices` / `mask` / `output_indices` 进行 capture 和 replay，先证明
-KVAF 可以作为外部 `torch_npu` 图的节点并测量 replay completion。
+KVAF 可以作为外部 ACL 图的节点并测量 replay completion。
 
 AIV demo 使用原生
 `aclrtMemcpyAsync(fixed_device_inputs, stream) -> aclmdlRIExecuteAsync(graph, stream)`。
 Python 测试同样使用一个专用 graph stream；KVAF 不拥有这些 input tensor，也不创建、
 保存或 replay 图。图对象会在 Runtime shutdown 前 reset，避免图仍持有调用方 buffer
 时释放 HCCP transport。动态 input content 的图测试与此基础路径分开：AIV C++ demo
-已通过 `aclrtMemcpyAsync` 覆盖；Python/torch_npu 路径须先建立不引入额外 NPU 分配的
+已通过 `aclrtMemcpyAsync` 覆盖；Python ACLGraph 路径须先建立不引入额外 NPU 分配的
 更新方式后再单独启用。
 
 图性能指标 `external_graph_replay_to_stream_completion` 包含图 replay 与 graph stream
 同步；不包含 capture、初始化、最终验证和输入更新，因此不能与 eager 指标直接作一一
 对比。
 
-`torch_npu.NPUGraph.replay()` 会在调用时的 **current stream** 上提交 replay，
-不会自动切回 capture 时传入的 stream。因此测试会显式进入 `capture_stream` 后再调用
-replay：输入更新、图执行和 completion wait 必须属于同一条 stream 顺序链。上游若选择
-另一条 replay stream，必须自行在该 stream 上建立输入依赖并等待该 stream 完成。
+`AclGraph.replay(stream)` 显式传入 capture 使用的 `torch.npu.Stream`，并拒绝在另一条
+stream 上 replay；这与 demo 的 `aclmdlRIExecuteAsync(graph, stream)` 同构。上游若
+选择另一条 replay stream，必须自行建立输入依赖、保证其 ACL graph 语义兼容，并等待该
+stream 完成。
 
 Python 调用 `batch_get` 必须显式传入 `torch.npu.current_stream()`（或 capture
 stream 对象）。

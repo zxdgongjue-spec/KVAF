@@ -390,16 +390,18 @@ def main() -> int:
         )
 
         if graph_replays:
-            if not hasattr(torch.npu, "NPUGraph") or not hasattr(torch.npu, "graph"):
+            if not hasattr(kvaf, "AclGraph"):
                 print(
-                    "FAIL: external graph test requires torch.npu.NPUGraph and torch.npu.graph",
+                    "FAIL: raw ACL graph test requires kvaf.AclGraph; rebuild with "
+                    "-DKVAF_ENABLE_AIV_BATCH_GET=ON -DKVAF_BUILD_PYTHON=ON",
                     file=sys.stderr,
                 )
                 return 2
             print(
                 "RUNTIME_NPU_GRAPH_CAPTURE_CONTRACT "
                 "fixed_tensor_addresses=1 "
-                "external_graph_owner=torch_npu "
+                "external_graph_owner=python "
+                "api=aclmdlRI "
                 "input_contents=static "
                 "graph_stream=dedicated "
                 "captured_ops=runtime_batch_get "
@@ -411,7 +413,7 @@ def main() -> int:
                 raise AssertionError("graph stream was not created")
             capture_stream = graph_stream
             print("RUNTIME_NPU_PHASE_BEGIN phase=graph_object")
-            graph = torch.npu.NPUGraph()
+            graph = kvaf.AclGraph()
             print("RUNTIME_NPU_PHASE_DONE phase=graph_object")
             # The eager path already validated these fixed caller-owned
             # tensors. Do not allocate or mutate any NPU input after the
@@ -422,16 +424,28 @@ def main() -> int:
             print("RUNTIME_NPU_PHASE_BEGIN phase=graph_capture")
             # output_a was already used by eager A -> B -> A above, so its
             # Direct-HCCP local HBM registration is cached before capture.
-            # The external torch_npu graph owns capture, replay and lifetime.
+            # Python owns this raw ACL graph; KVAF only submits BatchGet to
+            # the caller-provided stream while capture is active.
+            capture_started = False
             try:
-                with torch.npu.graph(
-                    graph, stream=capture_stream, capture_error_mode="relaxed"
-                ):
-                    print("RUNTIME_NPU_GRAPH_CAPTURE_ENTERED")
-                    print("RUNTIME_NPU_GRAPH_CAPTURE_BATCH_GET_BEGIN")
-                    execute(output_a, capture_stream, synchronize=False)
-                    print("RUNTIME_NPU_GRAPH_CAPTURE_BATCH_GET_ENQUEUED")
+                graph.capture_begin(capture_stream)
+                capture_started = True
+                print("RUNTIME_NPU_GRAPH_CAPTURE_ENTERED")
+                print("RUNTIME_NPU_GRAPH_CAPTURE_BATCH_GET_BEGIN")
+                execute(output_a, capture_stream, synchronize=False)
+                print("RUNTIME_NPU_GRAPH_CAPTURE_BATCH_GET_ENQUEUED")
+                graph.capture_end()
+                capture_started = False
             except Exception as error:
+                if capture_started:
+                    try:
+                        graph.capture_end()
+                    except Exception as end_error:
+                        print(
+                            "RUNTIME_NPU_GRAPH_CAPTURE_END_ERROR "
+                            f"type={type(end_error).__name__} message={end_error}",
+                            file=sys.stderr,
+                        )
                 print(
                     "RUNTIME_NPU_GRAPH_CAPTURE_ERROR "
                     f"type={type(error).__name__} message={error}",
@@ -441,14 +455,11 @@ def main() -> int:
             print("RUNTIME_NPU_PHASE_DONE phase=graph_capture owner=torch_npu")
 
             def replay_graph_on_capture_stream(trace: str | None = None) -> None:
-                # torch_npu.NPUGraph.replay() submits work on the current NPU
-                # stream, rather than implicitly selecting the capture stream.
-                # Keep the input producer, graph execution, and completion
-                # wait as one ordered chain on capture_stream.
+                # Raw ACLGraph replay has no PyTorch graph wrapper or current
+                # stream selection: the captured ACL stream is explicit.
                 if trace is not None:
                     print(f"RUNTIME_NPU_GRAPH_REPLAY_STREAM_ENTER replay={trace}")
-                with torch.npu.stream(capture_stream):
-                    graph.replay()
+                graph.replay(capture_stream)
                 if trace is not None:
                     print(f"RUNTIME_NPU_GRAPH_REPLAY_ENQUEUED replay={trace}")
 
@@ -456,7 +467,7 @@ def main() -> int:
             for replay in range(graph_replays):
                 print(f"RUNTIME_NPU_GRAPH_REPLAY_BEGIN replay={replay}")
                 replay_graph_on_capture_stream(str(replay))
-                capture_stream.synchronize()
+                graph.synchronize(capture_stream)
                 print(f"RUNTIME_NPU_GRAPH_STREAM_DONE replay={replay}")
                 graph_completed_batches += 1
                 validate_output(
@@ -479,7 +490,7 @@ def main() -> int:
             print("RUNTIME_NPU_GRAPH_PERF_WARMUP_BEGIN")
             for warmup_iteration in range(graph_warmup):
                 replay_graph_on_capture_stream()
-                capture_stream.synchronize()
+                graph.synchronize(capture_stream)
                 graph_completed_batches += 1
             print(f"RUNTIME_NPU_GRAPH_PERF_WARMUP_DONE count={graph_warmup}")
 
@@ -487,7 +498,7 @@ def main() -> int:
             for iteration in range(graph_iterations):
                 begin = time.perf_counter()
                 replay_graph_on_capture_stream()
-                capture_stream.synchronize()
+                graph.synchronize(capture_stream)
                 graph_samples.append((time.perf_counter() - begin) * 1000.0)
                 graph_completed_batches += 1
 

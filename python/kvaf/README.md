@@ -34,3 +34,7 @@ Python buffer 对象；`batch_get` 目前要求可写 `bytearray` 作为 CPU Moc
 CPU Mock 仅用于本地功能验证；它不等同于 A5/CANN 的设备内存和 Direct-HCCP
 传输。AIV operator 的直接 Python binding 会作为独立后端提供，不能用 MPS
 代替 NPU 集成验证。vLLM 的 CacheOS-vLLM Adaptor 不在此处实现。
+
+启用 AIV CANN 构建时，额外导出 `kvaf.AclGraph`。它由 Python 调用方持有，直接封装
+ACL Runtime Graph 的 capture / replay / synchronize / reset；图内可以调用
+`NpuRuntime.batch_get(..., synchronize=False)`，但图对象不属于 Runtime 或 Operator。

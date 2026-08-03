@@ -15,6 +15,7 @@
 #include "kvaf/runtime/runtime.h"
 
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
+#include "acl_graph_python.h"
 #include "npu_python_runtime.h"
 #endif
 
@@ -361,5 +362,6 @@ PYBIND11_MODULE(_kvaf, m) {
 
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
   kvaf::BindNpuPythonRuntime(m);
+  kvaf::BindAclGraph(m);
 #endif
 }
