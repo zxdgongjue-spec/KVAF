@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <iterator>
 #include <limits>
@@ -433,9 +434,10 @@ struct DirectUrmaResources::Impl {
     launch_args.soNameAddrOffset = so_name_offset;
     launch_args.kernelNameAddrOffset = kernel_name_offset;
     // A runtime watchdog is safe for the resource-free probe but not for an
-    // invocation that owns UDMA/UMMU handles. Zero selects the public
-    // cooperative/no-forced-timeout path; shutdown is driven by the GM
-    // command and the provider's own checked retry loop.
+    // invocation that owns UDMA/UMMU handles. Zero does not establish an
+    // infinite execution contract: the target CANN/driver combination still
+    // enforced an effective AICPU watchdog. The owner must therefore reach
+    // cooperative shutdown and checked Close well before the observed bound.
     launch_args.timeout = 0;
     // A nonzero launch return cannot prove that KFC never observed the
     // request. Arm retained ownership before crossing the runtime ABI.
@@ -877,6 +879,14 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
     }
     AicpuEpochOwnerAivResult ready_result{};
     kvaf_urma_epoch_owner_status_v1 ready_status{};
+    std::uint64_t ready_poll_count = 0;
+    std::uint32_t last_progress_aiv_status =
+        std::numeric_limits<std::uint32_t>::max();
+    std::uint32_t last_progress_owner_state =
+        std::numeric_limits<std::uint32_t>::max();
+    const auto ready_observation_started =
+        std::chrono::steady_clock::now();
+    auto next_progress_log = ready_observation_started;
     while (status.ok()) {
       // READY observation must never introduce a second timeout racing the
       // provider's own Open cleanup.  Take one coherent AIV snapshot per
@@ -912,6 +922,62 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
         status = AclFailure("aclrtMemcpy(epoch owner READY evidence)",
                             copy_result);
         break;
+      }
+      ++ready_poll_count;
+      const auto progress_now = std::chrono::steady_clock::now();
+      const bool progress_state_changed =
+          ready_result.status != last_progress_aiv_status ||
+          ready_result.observed_owner_state !=
+              last_progress_owner_state;
+      if (progress_state_changed || progress_now >= next_progress_log) {
+        const auto observer_elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                progress_now - ready_observation_started).count();
+        const bool progress_aiv_identity_valid =
+            ready_result.magic == kAicpuEpochOwnerAivResultMagic &&
+            ready_result.abi_version ==
+                kAicpuEpochOwnerAivResultAbiVersion &&
+            ready_result.struct_size == sizeof(ready_result) &&
+            ready_result.epoch == impl_->epoch_id &&
+            ready_result.session_id == impl_->session_id;
+        const bool progress_owner_identity_valid =
+            ready_result.observed_owner_state ==
+                KVAF_URMA_EPOCH_OWNER_STATE_EMPTY ||
+            EpochOwnerStatusHeaderIsValid(
+                ready_status, impl_->epoch_id, impl_->session_id);
+        const bool progress_open_result_valid =
+            impl_->result.magic == KVAF_URMA_PROVIDER_MAGIC &&
+            impl_->result.abi_version ==
+                KVAF_URMA_PROVIDER_ABI_VERSION &&
+            impl_->result.struct_size == sizeof(impl_->result) &&
+            impl_->result.session_id == impl_->session_id;
+        (void)std::fprintf(stderr,
+            "KVAF_A5_AICPU_OWNER_PROGRESS phase=open polls=%llu "
+            "observer_elapsed_ms=%lld aiv_identity_valid=%u "
+            "owner_identity_valid=%u open_result_valid=%u "
+            "aiv_status=%u aiv_observed_state=%u owner_state=%u "
+            "owner_result=%d owner_provider_status=%d owner_flags=%u "
+            "owner_close_attempts=%u owner_elapsed_ns=%llu "
+            "open_status=%u open_provider_status=%d "
+            "open_session=%llu\n",
+            (unsigned long long)ready_poll_count,
+            (long long)observer_elapsed_ms,
+            progress_aiv_identity_valid ? 1U : 0U,
+            progress_owner_identity_valid ? 1U : 0U,
+            progress_open_result_valid ? 1U : 0U,
+            ready_result.status, ready_result.observed_owner_state,
+            ready_status.state, ready_status.result_code,
+            ready_status.provider_status, ready_status.flags,
+            ready_status.close_attempts,
+            (unsigned long long)ready_status.elapsed_nanoseconds,
+            (unsigned int)impl_->result.status,
+            impl_->result.provider_status,
+            (unsigned long long)impl_->result.session_id);
+        (void)std::fflush(stderr);
+        last_progress_aiv_status = ready_result.status;
+        last_progress_owner_state =
+            ready_result.observed_owner_state;
+        next_progress_log = progress_now + std::chrono::seconds(1);
       }
       const bool ready_result_identity_valid =
           ready_result.magic == kAicpuEpochOwnerAivResultMagic &&

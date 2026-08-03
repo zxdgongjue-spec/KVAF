@@ -75,11 +75,18 @@ class SourceMatchedUmmuTests(unittest.TestCase):
         runtime = RUNTIME.read_text(encoding="utf-8")
 
         self.assertIn("kvaf_source_ummu_get_thread_status", header)
+        self.assertIn("kvaf_source_ummu_reset_thread_status", header)
         self.assertIn(
             "static _Thread_local struct kvaf_source_ummu_status",
             runtime,
         )
         self.assertIn("kvaf_clear_thread_failure", runtime)
+        reset_start = runtime.index(
+            "void kvaf_source_ummu_reset_thread_status(void)"
+        )
+        reset_body = runtime[reset_start:reset_start + 180]
+        self.assertIn("kvaf_clear_thread_failure();", reset_body)
+        self.assertNotIn("g_kvaf_ummu_cleanup_unknown", reset_body)
         for operation in (
             "int ummu_grant(",
             "int ummu_ungrant(",
@@ -110,10 +117,78 @@ class SourceMatchedUmmuTests(unittest.TestCase):
         self.assertIn("KVAF_UMMU_CLEANUP_PLBI_ALL_DONE", runtime)
         self.assertIn("KVAF_UMMU_CLEANUP_KERNEL_TID_FREED", runtime)
         self.assertIn("KVAF_UMMU_CLEANUP_LOCAL_RELEASED", runtime)
+        self.assertIn("kvaf_local_cleanup_unsafe", runtime)
         self.assertLess(
             runtime.index("kvaf_send_plbi_checked(state, PLBI_ALL_OP"),
             runtime.index("kvaf_issue_free_tid_ioctl(state)"),
         )
+
+    def test_free_tid_replay_requires_explicit_kernel_backpressure(self):
+        runtime = RUNTIME.read_text(encoding="utf-8")
+
+        checked_start = runtime.index("static int kvaf_issue_free_tid_ioctl(")
+        checked_end = runtime.index(
+            "static int kvaf_mapt_has_live_mapping(", checked_start
+        )
+        checked = runtime[checked_start:checked_end]
+        self.assertIn("errno == EAGAIN || errno == EBUSY", checked)
+        self.assertNotIn("errno == EINTR", checked)
+        self.assertNotIn("errno == ENOSPC", checked)
+
+        legacy_start = runtime.index("void ummu_put_tid(")
+        legacy_end = runtime.index("void ummu_kcmd_plbi(", legacy_start)
+        legacy = runtime[legacy_start:legacy_end]
+        self.assertIn(
+            "error_code == EAGAIN || error_code == EBUSY", legacy
+        )
+        self.assertNotIn("error_code == EINTR", legacy)
+        self.assertNotIn("error_code == ENOSPC", legacy)
+
+        free_start = runtime.index("int ummu_free_tid(uint32_t tid)")
+        free_end = runtime.index(
+            "uint64_t kvaf_source_ummu_capability(void)", free_start
+        )
+        free_tid = runtime[free_start:free_end]
+        self.assertIn("lock_status = pthread_mutex_lock", free_tid)
+        self.assertIn(
+            "unlock_status = pthread_mutex_unlock", free_tid
+        )
+        self.assertGreaterEqual(
+            free_tid.count("KVAF_SOURCE_UMMU_RETRY_UNSAFE"), 3
+        )
+
+    def test_table_release_resumes_after_queue_munmap_failure(self):
+        runtime = RUNTIME.read_text(encoding="utf-8")
+
+        self.assertIn("bool table_storage_released;", runtime)
+        release_start = runtime.index(
+            "static int kvaf_release_local_mapt_locked("
+        )
+        release_end = runtime.index(
+            "static int kvaf_free_tid_state_locked(", release_start
+        )
+        release = runtime[release_start:release_end]
+        table_guard = release.index("if (!state->table_storage_released)")
+        table_commit = release.index(
+            "state->table_storage_released = true;", table_guard
+        )
+        queue_unmap = release.index(
+            "queues[0].cmd_entry", table_commit
+        )
+        self.assertLess(table_guard, table_commit)
+        self.assertLess(table_commit, queue_unmap)
+        self.assertIn("kvaf_local_cleanup_unsafe", release)
+        invalid_mode = release[release.rindex("} else {") :]
+        self.assertIn("kvaf_local_cleanup_unsafe", invalid_mode)
+
+        helper_start = runtime.index(
+            "static int kvaf_local_cleanup_unsafe("
+        )
+        helper_end = runtime.index(
+            "static int kvaf_release_local_mapt_locked(", helper_start
+        )
+        helper = runtime[helper_start:helper_end]
+        self.assertIn("KVAF_SOURCE_UMMU_RETRY_UNSAFE", helper)
 
     def test_mmap_ownership_is_reserved_before_mapping_and_never_allocated_on_failure(self):
         runtime = RUNTIME.read_text(encoding="utf-8")

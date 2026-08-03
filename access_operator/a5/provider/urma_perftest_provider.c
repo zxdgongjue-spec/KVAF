@@ -985,7 +985,9 @@ static int kvaf_close_unlocked(uint64_t session_id)
             kvaf_perftest_close_connection(&g_kvaf_config);
         if (management_status !=
             KVAF_PERFTEST_MANAGEMENT_CLOSE_OK) {
-            if (kvaf_source_cleanup_state_is_unknown()) {
+            if (management_status ==
+                    KVAF_PERFTEST_MANAGEMENT_CLOSE_UNSAFE ||
+                kvaf_source_cleanup_state_is_unknown()) {
                 g_kvaf_cleanup_poisoned = true;
                 return KVAF_URMA_PROVIDER_CLOSE_UNSAFE;
             }

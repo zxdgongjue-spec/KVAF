@@ -25,11 +25,16 @@
 #undef udma_u_create_jetty
 
 #include "kvaf_source_matched_udma_cleanup.h"
+#include "urma_cmd_tlv.h"
 
 struct kvaf_udma_jetty_state {
     struct udma_u_jetty *jetty;
     urma_context_t *owner_context;
     bool kernel_created;
+    bool kernel_delete_pending;
+    uint32_t delete_async_events_reported;
+    bool event_condition_initialized;
+    bool event_mutex_initialized;
     bool sq_created;
     bool doorbell_allocated;
     bool queue_inserted;
@@ -43,6 +48,20 @@ static pthread_mutex_t g_kvaf_jetty_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct kvaf_udma_jetty_state *g_kvaf_jetties;
 static uint32_t g_kvaf_jetty_count;
 static uint32_t g_kvaf_jetty_orphan_count;
+
+static int kvaf_lock_jetty_registry_checked(void)
+{
+    const int status = pthread_mutex_lock(&g_kvaf_jetty_lock);
+
+    return status == 0 ? 0 : kvaf_udma_pthread_cleanup_failed(status);
+}
+
+static int kvaf_unlock_jetty_registry_checked(void)
+{
+    const int status = pthread_mutex_unlock(&g_kvaf_jetty_lock);
+
+    return status == 0 ? 0 : kvaf_udma_pthread_cleanup_failed(status);
+}
 
 static int kvaf_unlock_jetty_table_checked(
     struct kvaf_udma_jetty_state *state,
@@ -130,37 +149,104 @@ uint32_t kvaf_udma_source_orphan_jetty_count(void)
     return count;
 }
 
-static int kvaf_delete_kernel_jetty_preserve_cfg(
-    urma_jetty_t *public_jetty)
+static int kvaf_delete_kernel_jetty_nonblocking(
+    struct kvaf_udma_jetty_state *state)
 {
-    urma_jfr_cfg_t *original_jfr_cfg;
-    urma_jfr_cfg_t *command_jfr_cfg;
-    int status;
+    urma_jetty_t *jetty;
+    uint32_t events_acked;
+    enum kvaf_udma_destroy_decision decision;
 
-    if (public_jetty->jetty_cfg.flag.bs.share_jfr ==
-            URMA_SHARE_JFR) {
-        /* urma_uninit_jetty_cfg is a no-op for the shared union member. */
-        return urma_cmd_delete_jetty(public_jetty);
+    if (state == NULL || state->jetty == NULL ||
+        state->owner_context == NULL) {
+        return kvaf_udma_cleanup_invariant_failed();
     }
-    original_jfr_cfg = public_jetty->jetty_cfg.jfr_cfg;
-    if (original_jfr_cfg == NULL) {
+    jetty = &state->jetty->base;
+    decision = kvaf_udma_destroy_decide(
+        state->kernel_created, state->kernel_delete_pending,
+        0U, state->delete_async_events_reported, 0U, 0U, false);
+    if (decision == KVAF_UDMA_DESTROY_FAIL_UNSAFE) {
+        errno = EUCLEAN;
+        kvaf_udma_source_mark_cleanup_unknown();
         return -1;
     }
-    command_jfr_cfg = malloc(sizeof(*command_jfr_cfg));
-    if (command_jfr_cfg == NULL) {
+    if (decision == KVAF_UDMA_DESTROY_RELEASE_LOCAL) {
+        state->kernel_delete_pending = false;
+        return 0;
+    }
+    if (decision == KVAF_UDMA_DESTROY_ISSUE_IOCTL) {
+        urma_cmd_delete_jetty_t command = {0};
+        int status;
+
+        if (jetty->urma_ctx == NULL ||
+            jetty->urma_ctx != state->owner_context ||
+            jetty->urma_ctx->dev_fd < 0) {
+            return kvaf_udma_cleanup_invariant_failed();
+        }
+        command.in.handle = jetty->handle;
+        errno = 0;
+        status = urma_ioctl_delete_jetty(
+            jetty->urma_ctx->dev_fd, &command);
+        if (status != 0) {
+            if (!kvaf_udma_destroy_ioctl_retry_is_proven(
+                    status, errno)) {
+                kvaf_udma_source_mark_cleanup_unknown();
+            }
+            return status;
+        }
+        /* Keep the original cfg and every local queue mapping alive while
+         * the same sidecar drains the events reported by this one ioctl. */
+        state->kernel_created = false;
+        state->kernel_delete_pending = true;
+        state->delete_async_events_reported =
+            command.out.async_events_reported;
+    }
+
+    if (kvaf_udma_snapshot_event_counters_checked(
+            &jetty->event_mutex, NULL, &jetty->async_events_acked,
+            NULL, &events_acked) != 0) {
         return -1;
     }
-    (void)memcpy(command_jfr_cfg, original_jfr_cfg,
-        sizeof(*command_jfr_cfg));
-    public_jetty->jetty_cfg.jfr_cfg = command_jfr_cfg;
-    status = urma_cmd_delete_jetty(public_jetty);
-    public_jetty->jetty_cfg.jfr_cfg = original_jfr_cfg;
-    if (status != 0) {
-        /* Direct-mode Jettys reject non-blocking delete, so this is an
-         * ioctl failure and UMDK has not consumed the temporary cfg. */
-        free(command_jfr_cfg);
+    decision = kvaf_udma_destroy_decide(
+        state->kernel_created, state->kernel_delete_pending,
+        0U, state->delete_async_events_reported, 0U, events_acked,
+        false);
+    if (decision == KVAF_UDMA_DESTROY_FAIL_UNSAFE) {
+        errno = EUCLEAN;
+        kvaf_udma_source_mark_cleanup_unknown();
+        return -1;
     }
-    return status;
+    if (decision == KVAF_UDMA_DESTROY_DRAIN_ASYNC) {
+        if (kvaf_udma_drain_async_events_bounded(
+                jetty->urma_ctx) != 0) {
+            return -1;
+        }
+        if (kvaf_udma_snapshot_event_counters_checked(
+                &jetty->event_mutex, NULL,
+                &jetty->async_events_acked, NULL,
+                &events_acked) != 0) {
+            return -1;
+        }
+        decision = kvaf_udma_destroy_decide(
+            state->kernel_created, state->kernel_delete_pending,
+            0U, state->delete_async_events_reported, 0U,
+            events_acked, true);
+        if (decision == KVAF_UDMA_DESTROY_FAIL_UNSAFE) {
+            errno = EUCLEAN;
+            kvaf_udma_source_mark_cleanup_unknown();
+            return -1;
+        }
+        if (decision == KVAF_UDMA_DESTROY_RETRY_LATER) {
+            errno = EAGAIN;
+            return URMA_EAGAIN;
+        }
+    }
+    if (decision != KVAF_UDMA_DESTROY_RELEASE_LOCAL) {
+        errno = EUCLEAN;
+        kvaf_udma_source_mark_cleanup_unknown();
+        return -1;
+    }
+    state->kernel_delete_pending = false;
+    return 0;
 }
 
 static int kvaf_create_direct_jetty_command(
@@ -336,7 +422,26 @@ static int kvaf_remove_jetty_table_checked(
 static int kvaf_cleanup_local_jetty_checked(
     struct kvaf_udma_jetty_state *state)
 {
-    struct udma_u_jetty *jetty = state->jetty;
+    struct udma_u_jetty *jetty;
+
+    if (state == NULL || state->jetty == NULL ||
+        state->owner_context == NULL) {
+        return kvaf_udma_cleanup_invariant_failed();
+    }
+    jetty = state->jetty;
+    if ((state->sq_created || state->doorbell_allocated ||
+         state->queue_inserted) &&
+        (jetty->sq.ctx == NULL ||
+         jetty->sq.ctx != to_udma_u_ctx(state->owner_context))) {
+        return kvaf_udma_cleanup_invariant_failed();
+    }
+    if ((state->kernel_created || state->kernel_delete_pending ||
+         state->doorbell_allocated ||
+         state->event_condition_initialized ||
+         state->event_mutex_initialized) &&
+        jetty->base.urma_ctx != state->owner_context) {
+        return kvaf_udma_cleanup_invariant_failed();
+    }
 
     if (!state->orphan && !state->jfc_flushed) {
         struct udma_u_context *context = jetty->sq.ctx;
@@ -382,11 +487,21 @@ static int kvaf_cleanup_local_jetty_checked(
         if (kvaf_udma_checked_free_queue_buffer(&jetty->sq) != 0) {
             return -1;
         }
-        if (!jetty->sq.lock_free &&
-            pthread_spin_destroy(&jetty->sq.lock) != 0) {
-            return -1;
+        if (!jetty->sq.lock_free) {
+            const int spin_status =
+                pthread_spin_destroy(&jetty->sq.lock);
+
+            if (spin_status != 0) {
+                return kvaf_udma_pthread_cleanup_failed(spin_status);
+            }
         }
         state->sq_created = false;
+    }
+    if (kvaf_udma_destroy_event_sync_checked(
+            &jetty->base.event_mutex, &jetty->base.event_cond,
+            &state->event_condition_initialized,
+            &state->event_mutex_initialized) != 0) {
+        return -1;
     }
     remove_jetty_from_grp(jetty);
     return 0;
@@ -411,8 +526,12 @@ int kvaf_udma_source_retry_orphan_jetties(urma_context_t *context)
     struct kvaf_udma_jetty_state *state;
     struct kvaf_udma_jetty_state *next;
     int result = 0;
+    int saved_errno = 0;
 
-    if (context == NULL || pthread_mutex_lock(&g_kvaf_jetty_lock) != 0) {
+    if (context == NULL) {
+        return kvaf_udma_cleanup_invariant_failed();
+    }
+    if (kvaf_lock_jetty_registry_checked() != 0) {
         return -1;
     }
     for (state = g_kvaf_jetties; state != NULL; state = next) {
@@ -420,22 +539,29 @@ int kvaf_udma_source_retry_orphan_jetties(urma_context_t *context)
         if (!state->orphan || state->owner_context != context) {
             continue;
         }
-        if (state->kernel_created &&
-            kvaf_delete_kernel_jetty_preserve_cfg(
-                &state->jetty->base) != 0) {
+        if ((state->kernel_created || state->kernel_delete_pending) &&
+            kvaf_delete_kernel_jetty_nonblocking(state) != 0) {
             result = -1;
+            kvaf_udma_preserve_cleanup_errno(&saved_errno);
             continue;
         }
-        state->kernel_created = false;
+        errno = 0;
         if (kvaf_cleanup_local_jetty_checked(state) != 0) {
+            (void)kvaf_udma_classify_cleanup_failure();
             result = -1;
+            kvaf_udma_preserve_cleanup_errno(&saved_errno);
             continue;
         }
         kvaf_remove_jetty_locked(state);
         kvaf_free_local_jetty(state);
         free(state);
     }
-    (void)pthread_mutex_unlock(&g_kvaf_jetty_lock);
+    if (kvaf_unlock_jetty_registry_checked() != 0) {
+        return -1;
+    }
+    if (result != 0) {
+        errno = saved_errno == 0 ? EIO : saved_errno;
+    }
     return result;
 }
 
@@ -451,8 +577,12 @@ urma_jetty_t *kvaf_udma_create_jetty_checked(
 
     state = calloc(1, sizeof(*state));
     jetty = calloc(1, sizeof(*jetty));
-    if (state == NULL || jetty == NULL || context == NULL || cfg == NULL ||
-        pthread_mutex_lock(&g_kvaf_jetty_lock) != 0) {
+    if (state == NULL || jetty == NULL || context == NULL || cfg == NULL) {
+        free(state);
+        free(jetty);
+        return NULL;
+    }
+    if (kvaf_lock_jetty_registry_checked() != 0) {
         free(state);
         free(jetty);
         return NULL;
@@ -514,6 +644,14 @@ urma_jetty_t *kvaf_udma_create_jetty_checked(
     jetty->jetty_type = UDMA_URMA_NORMAL_JETTY_TYPE;
     status = kvaf_create_direct_jetty_command(
         context, jetty, cfg, &state->kernel_created);
+    if (state->kernel_created) {
+        /* urma_cmd_create_jetty initializes both event primitives before
+         * returning the kernel handle.  A later userspace SQ setup failure
+         * still has to destroy those primitives after the kernel object is
+         * deleted; recording them only on complete success leaked them. */
+        state->event_condition_initialized = true;
+        state->event_mutex_initialized = true;
+    }
     if (status != 0) {
         goto fail_after_command;
     }
@@ -528,26 +666,33 @@ urma_jetty_t *kvaf_udma_create_jetty_checked(
     }
     state->orphan = false;
     --g_kvaf_jetty_orphan_count;
-    (void)pthread_mutex_unlock(&g_kvaf_jetty_lock);
+    if (kvaf_unlock_jetty_registry_checked() != 0) {
+        /* Keep the non-published handle under the orphan sidecar; exposing it
+         * after a registry unlock ambiguity would permit unsafe reuse. */
+        state->orphan = true;
+        ++g_kvaf_jetty_orphan_count;
+        return NULL;
+    }
     return &jetty->base;
 
 fail_after_command:
-    if (state->kernel_created &&
-        kvaf_delete_kernel_jetty_preserve_cfg(&jetty->base) != 0) {
+    if ((state->kernel_created || state->kernel_delete_pending) &&
+        kvaf_delete_kernel_jetty_nonblocking(state) != 0) {
         /* No public handle escapes; the live count forces quarantine. */
-        (void)pthread_mutex_unlock(&g_kvaf_jetty_lock);
+        (void)kvaf_unlock_jetty_registry_checked();
         return NULL;
     }
-    state->kernel_created = false;
 fail_local:
+    errno = 0;
     if (kvaf_cleanup_local_jetty_checked(state) != 0) {
+        (void)kvaf_udma_classify_cleanup_failure();
         /* Retain every address and phase for the context-owned retry pass. */
-        (void)pthread_mutex_unlock(&g_kvaf_jetty_lock);
+        (void)kvaf_unlock_jetty_registry_checked();
         return NULL;
     }
     kvaf_remove_jetty_locked(state);
     kvaf_free_local_jetty(state);
-    (void)pthread_mutex_unlock(&g_kvaf_jetty_lock);
+    (void)kvaf_unlock_jetty_registry_checked();
     free(state);
     return NULL;
 }
@@ -559,14 +704,20 @@ urma_status_t kvaf_udma_delete_jetty_checked(urma_jetty_t *public_jetty)
     struct udma_u_jetty_queue *sq;
     int status;
 
-    if (public_jetty == NULL ||
-        pthread_mutex_lock(&g_kvaf_jetty_lock) != 0) {
+    if (public_jetty == NULL) {
+        (void)kvaf_udma_cleanup_invariant_failed();
+        return URMA_FAIL;
+    }
+    if (kvaf_lock_jetty_registry_checked() != 0) {
         return URMA_FAIL;
     }
     jetty = to_udma_u_jetty(public_jetty);
     state = kvaf_find_jetty_locked(jetty);
-    if (state == NULL) {
-        (void)pthread_mutex_unlock(&g_kvaf_jetty_lock);
+    if (state == NULL || state->owner_context == NULL ||
+        public_jetty->urma_ctx != state->owner_context ||
+        jetty->sq.ctx != to_udma_u_ctx(state->owner_context)) {
+        (void)kvaf_udma_cleanup_invariant_failed();
+        (void)kvaf_unlock_jetty_registry_checked();
         return URMA_FAIL;
     }
 
@@ -574,7 +725,8 @@ urma_status_t kvaf_udma_delete_jetty_checked(urma_jetty_t *public_jetty)
     if (public_jetty->jetty_cfg.flag.bs.non_blocking ||
         (sq->trans_mode == URMA_TM_RC && sq->tjetty != NULL)) {
         /* The current direct path is blocking RM. */
-        (void)pthread_mutex_unlock(&g_kvaf_jetty_lock);
+        (void)kvaf_udma_cleanup_invariant_failed();
+        (void)kvaf_unlock_jetty_registry_checked();
         return URMA_FAIL;
     }
     if ((public_jetty->jetty_cfg.flag.bs.share_jfr ==
@@ -585,7 +737,8 @@ urma_status_t kvaf_udma_delete_jetty_checked(urma_jetty_t *public_jetty)
         (public_jetty->jetty_cfg.flag.bs.share_jfr ==
             URMA_NO_SHARE_JFR &&
          public_jetty->jetty_cfg.jfr_cfg == NULL)) {
-        (void)pthread_mutex_unlock(&g_kvaf_jetty_lock);
+        (void)kvaf_udma_cleanup_invariant_failed();
+        (void)kvaf_unlock_jetty_registry_checked();
         return URMA_FAIL;
     }
     /*
@@ -593,22 +746,25 @@ urma_status_t kvaf_udma_delete_jetty_checked(urma_jetty_t *public_jetty)
      * receives a disposable deep-copy. The shared-JFR union member is never
      * freed or rewritten by urma_uninit_jetty_cfg.
      */
-    if (state->kernel_created) {
-        status = kvaf_delete_kernel_jetty_preserve_cfg(public_jetty);
+    if (state->kernel_created || state->kernel_delete_pending) {
+        status = kvaf_delete_kernel_jetty_nonblocking(state);
         if (status != 0) {
-            (void)pthread_mutex_unlock(&g_kvaf_jetty_lock);
+            (void)kvaf_unlock_jetty_registry_checked();
             return URMA_FAIL;
         }
-        state->kernel_created = false;
     }
 
+    errno = 0;
     if (kvaf_cleanup_local_jetty_checked(state) != 0) {
+        (void)kvaf_udma_classify_cleanup_failure();
         /* Transport is gone; retry resumes only local queue/mapping phases. */
-        (void)pthread_mutex_unlock(&g_kvaf_jetty_lock);
+        (void)kvaf_unlock_jetty_registry_checked();
         return URMA_FAIL;
     }
     kvaf_remove_jetty_locked(state);
-    (void)pthread_mutex_unlock(&g_kvaf_jetty_lock);
+    if (kvaf_unlock_jetty_registry_checked() != 0) {
+        return URMA_FAIL;
+    }
 
     kvaf_free_local_jetty(state);
     free(state);

@@ -16,6 +16,7 @@
 #include "urma_api.h"
 #include "kvaf_source_matched_udma.h"
 #include "kvaf_source_matched_ummu.h"
+#include "kvaf_ub_close_policy.h"
 
 static struct timespec g_kvaf_control_deadline;
 static int g_kvaf_control_deadline_valid;
@@ -214,6 +215,39 @@ static bool g_kvaf_ub_server_arming;
 static uint32_t g_kvaf_ub_server_recv_posts;
 static uint32_t g_kvaf_ub_server_jetty_id;
 static char g_kvaf_ub_server_local_eid[64];
+/* Every management SEND requests a CQE.  Exact accounting lets failed-Open
+ * teardown distinguish the server's recv-only handshake timeout from a
+ * client whose SQ still owns the registered send buffer.  A failed post with
+ * no usable bad-WR boundary is deliberately treated as ambiguous until a
+ * hardware flush completion proves that the whole SQ is quiescent. */
+static struct kvaf_ub_send_tracker g_kvaf_ub_send_tracker;
+#define KVAF_UB_MANAGEMENT_SEND_WR_SCAN_LIMIT 1024U
+
+enum kvaf_ub_management_close_phase {
+    KVAF_UB_CLOSE_RETRY_ORPHANS = 0,
+    KVAF_UB_CLOSE_QUIESCE_JETTY,
+    KVAF_UB_CLOSE_QUIESCE_JFR,
+    KVAF_UB_CLOSE_DRAIN_JFC,
+    KVAF_UB_CLOSE_UNIMPORT_TJETTY,
+    KVAF_UB_CLOSE_DELETE_JETTY,
+    KVAF_UB_CLOSE_DELETE_JFR,
+    KVAF_UB_CLOSE_UNREGISTER_HANDSHAKE,
+    KVAF_UB_CLOSE_FREE_HANDSHAKE_TOKEN,
+    KVAF_UB_CLOSE_UNREGISTER_RECEIVE,
+    KVAF_UB_CLOSE_FREE_RECEIVE_TOKEN,
+    KVAF_UB_CLOSE_UNREGISTER_SEND,
+    KVAF_UB_CLOSE_FREE_SEND_TOKEN,
+    KVAF_UB_CLOSE_DELETE_JFC,
+    KVAF_UB_CLOSE_DELETE_CONTEXT,
+    KVAF_UB_CLOSE_RELEASE_LOCAL,
+};
+
+/* One provider instance owns at most one UMDK management context.  Keep the
+ * teardown cursor beside that context so a same-process Close retry never
+ * repeats an already successful state transition or destroy operation. */
+static enum kvaf_ub_management_close_phase g_kvaf_ub_close_phase =
+    KVAF_UB_CLOSE_RETRY_ORPHANS;
+static uint64_t g_kvaf_ub_close_attempt;
 
 static urma_status_t kvaf_ub_reuse_runtime_init(
     urma_init_attr_t *attribute)
@@ -222,16 +256,89 @@ static urma_status_t kvaf_ub_reuse_runtime_init(
     return URMA_EEXIST;
 }
 
+static void kvaf_ub_account_management_completions(
+    int count, const urma_cr_t *completions)
+{
+    int index;
+
+    if (count <= 0 || completions == NULL) {
+        return;
+    }
+    for (index = 0; index < count; ++index) {
+        const urma_cr_t *completion = &completions[index];
+
+        if (completion->flag.bs.s_r != 0U) {
+            continue;
+        }
+        /* The pinned UDMA provider does not initialize every CR flag bit.
+         * Match official perftest and use the status value as the only
+         * full-SQ flush proof. */
+        if (completion->status == URMA_CR_WR_FLUSH_ERR_DONE) {
+            kvaf_ub_send_tracker_record_completion(
+                &g_kvaf_ub_send_tracker, true);
+            continue;
+        }
+        kvaf_ub_send_tracker_record_completion(
+            &g_kvaf_ub_send_tracker, false);
+    }
+}
+
 /* All handshake and metadata CQ polling consumes the single monotonic Open
  * deadline.  The upstream loops remain source-identical, but can no longer
  * spin forever if a peer disappears. */
 static int kvaf_deadline_urma_poll_jfc(
     urma_jfc_t *jfc, int cr_cnt, urma_cr_t *cr)
 {
+    int count;
+
     if (kvaf_deadline_remaining_ms() < 0) {
         return -1;
     }
-    return urma_poll_jfc(jfc, cr_cnt, cr);
+    count = urma_poll_jfc(jfc, cr_cnt, cr);
+    kvaf_ub_account_management_completions(count, cr);
+    return count;
+}
+
+static urma_status_t kvaf_tracking_urma_post_jetty_send_wr(
+    urma_jetty_t *jetty, urma_jfs_wr_t *wr, urma_jfs_wr_t **bad_wr)
+{
+    urma_status_t status = urma_post_jetty_send_wr(jetty, wr, bad_wr);
+    urma_jfs_wr_t *stop = NULL;
+    urma_jfs_wr_t *current;
+    uint32_t submitted_count = 0;
+    uint32_t index;
+
+    if (status != URMA_SUCCESS) {
+        if (bad_wr == NULL || *bad_wr == NULL) {
+            kvaf_ub_send_tracker_mark_post_unknown(
+                &g_kvaf_ub_send_tracker);
+            return status;
+        }
+        /* URMA reports the first WR that was not posted.  Earlier list nodes
+         * remain real in-flight submissions and must be counted. */
+        stop = *bad_wr;
+    }
+    for (current = wr;
+         current != NULL && current != stop &&
+             submitted_count < KVAF_UB_MANAGEMENT_SEND_WR_SCAN_LIMIT;
+         current = current->next) {
+        ++submitted_count;
+    }
+    if (current != stop) {
+        /* A provider-owned pointer outside the submitted chain, a cycle or
+         * an unexpectedly large list cannot define a trustworthy partial
+         * post boundary.  A later flush barrier is the only safe proof. */
+        kvaf_ub_send_tracker_mark_post_unknown(
+            &g_kvaf_ub_send_tracker);
+        return status;
+    }
+    current = wr;
+    for (index = 0; index < submitted_count; ++index) {
+        kvaf_ub_send_tracker_record_post(&g_kvaf_ub_send_tracker,
+            current->flag.bs.complete_enable != 0U);
+        current = current->next;
+    }
+    return status;
 }
 
 /* The server is connectable only after both FIFO receive WQEs (handshake and
@@ -258,6 +365,7 @@ static urma_status_t kvaf_ready_urma_post_jetty_recv_wr(
 #define g_exit_flag g_kvaf_ub_exit_flag
 #define urma_init kvaf_ub_reuse_runtime_init
 #define urma_poll_jfc kvaf_deadline_urma_poll_jfc
+#define urma_post_jetty_send_wr kvaf_tracking_urma_post_jetty_send_wr
 #define urma_post_jetty_recv_wr kvaf_ready_urma_post_jetty_recv_wr
 #define ub_establish_connection kvaf_upstream_ub_establish_connection
 #define ub_close_connection kvaf_upstream_ub_close_connection
@@ -275,6 +383,7 @@ static urma_status_t kvaf_ready_urma_post_jetty_recv_wr(
 #undef ub_close_connection
 #undef ub_establish_connection
 #undef urma_post_jetty_recv_wr
+#undef urma_post_jetty_send_wr
 #undef urma_poll_jfc
 #undef urma_init
 #undef g_exit_flag
@@ -304,6 +413,289 @@ static int kvaf_ub_management_error(
     errno = concrete_errno;
     return -1;
 }
+
+#define KVAF_UB_CLOSE_DRAIN_BATCH 1
+#define KVAF_UB_CLOSE_DRAIN_PASSES 8
+
+static const char *kvaf_ub_close_phase_name(
+    enum kvaf_ub_management_close_phase phase)
+{
+    switch (phase) {
+        case KVAF_UB_CLOSE_RETRY_ORPHANS:
+            return "retry_orphan_cleanup";
+        case KVAF_UB_CLOSE_QUIESCE_JETTY:
+            return "quiesce_jetty";
+        case KVAF_UB_CLOSE_QUIESCE_JFR:
+            return "quiesce_jfr";
+        case KVAF_UB_CLOSE_DRAIN_JFC:
+            return "drain_jfc";
+        case KVAF_UB_CLOSE_UNIMPORT_TJETTY:
+            return "unimport_tjetty";
+        case KVAF_UB_CLOSE_DELETE_JETTY:
+            return "delete_jetty";
+        case KVAF_UB_CLOSE_DELETE_JFR:
+            return "delete_jfr";
+        case KVAF_UB_CLOSE_UNREGISTER_HANDSHAKE:
+            return "unregister_handshake_segment";
+        case KVAF_UB_CLOSE_FREE_HANDSHAKE_TOKEN:
+            return "free_handshake_token";
+        case KVAF_UB_CLOSE_UNREGISTER_RECEIVE:
+            return "unregister_receive_segment";
+        case KVAF_UB_CLOSE_FREE_RECEIVE_TOKEN:
+            return "free_receive_token";
+        case KVAF_UB_CLOSE_UNREGISTER_SEND:
+            return "unregister_send_segment";
+        case KVAF_UB_CLOSE_FREE_SEND_TOKEN:
+            return "free_send_token";
+        case KVAF_UB_CLOSE_DELETE_JFC:
+            return "delete_jfc";
+        case KVAF_UB_CLOSE_DELETE_CONTEXT:
+            return "delete_context";
+        case KVAF_UB_CLOSE_RELEASE_LOCAL:
+            return "release_local";
+        default:
+            return "unknown";
+    }
+}
+
+static void kvaf_ub_reset_close_cursor(void)
+{
+    g_kvaf_ub_close_phase = KVAF_UB_CLOSE_RETRY_ORPHANS;
+    g_kvaf_ub_close_attempt = 0;
+}
+
+static bool kvaf_ub_should_log_close_attempt(uint64_t attempt)
+{
+    return attempt <= 3U || (attempt & (attempt - 1U)) == 0U ||
+        attempt % UINT64_C(256) == 0U;
+}
+
+static int kvaf_ub_close_operation_failed(
+    enum kvaf_ub_management_close_phase phase,
+    int operation_status, int operation_errno,
+    int query_status, int query_errno, bool state_ambiguous,
+    enum kvaf_ub_close_retry_class retry_class,
+    bool explicit_retry_proven)
+{
+    const bool timed_out = operation_status == URMA_ETIMEOUT ||
+        operation_errno == ETIMEDOUT || query_status == URMA_ETIMEOUT ||
+        query_errno == ETIMEDOUT;
+    const bool retryable = kvaf_ub_close_retry_is_proven(
+        operation_status, operation_errno, retry_class,
+        explicit_retry_proven, state_ambiguous, timed_out);
+
+    if (kvaf_ub_should_log_close_attempt(g_kvaf_ub_close_attempt) ||
+        !retryable) {
+        (void)fprintf(stderr,
+            "KVAF_URMA_MGMT_CLOSE_ERROR stage=%s status=%d errno=%d "
+            "query_status=%d query_errno=%d attempt=%llu retryable=%u "
+            "state_ambiguous=%u send_inflight=%u "
+            "send_accounting_unknown=%u flush_barrier_required=%u "
+            "flush_barrier_seen=%u\n",
+            kvaf_ub_close_phase_name(phase), operation_status,
+            operation_errno, query_status, query_errno,
+            (unsigned long long)g_kvaf_ub_close_attempt,
+            retryable ? 1U : 0U, state_ambiguous ? 1U : 0U,
+            g_kvaf_ub_send_tracker.inflight,
+            g_kvaf_ub_send_tracker.accounting_unknown ? 1U : 0U,
+            g_kvaf_ub_send_tracker.flush_barrier_required ? 1U : 0U,
+            g_kvaf_ub_send_tracker.flush_barrier_seen ? 1U : 0U);
+        (void)fflush(stderr);
+    }
+    if (state_ambiguous || operation_status == URMA_ETIMEOUT ||
+        operation_errno == ETIMEDOUT || query_status == URMA_ETIMEOUT ||
+        query_errno == ETIMEDOUT) {
+        kvaf_udma_source_mark_cleanup_unknown();
+    }
+    errno = operation_errno == 0 ? EIO : operation_errno;
+    return retryable
+        ? KVAF_PERFTEST_MANAGEMENT_CLOSE_RETRYABLE
+        : KVAF_PERFTEST_MANAGEMENT_CLOSE_UNSAFE;
+}
+
+static bool kvaf_ub_close_phase_uses_ummu(
+    enum kvaf_ub_management_close_phase phase)
+{
+    return phase == KVAF_UB_CLOSE_UNREGISTER_HANDSHAKE ||
+        phase == KVAF_UB_CLOSE_FREE_HANDSHAKE_TOKEN ||
+        phase == KVAF_UB_CLOSE_UNREGISTER_RECEIVE ||
+        phase == KVAF_UB_CLOSE_FREE_RECEIVE_TOKEN ||
+        phase == KVAF_UB_CLOSE_UNREGISTER_SEND ||
+        phase == KVAF_UB_CLOSE_FREE_SEND_TOKEN;
+}
+
+static int kvaf_ub_destroy_operation_failed(
+    enum kvaf_ub_management_close_phase phase,
+    int operation_status, int operation_errno)
+{
+    struct kvaf_source_ummu_status ummu = {
+        .structure_size = sizeof(ummu),
+    };
+    int diagnostic_status = URMA_SUCCESS;
+    int diagnostic_errno = 0;
+    bool state_ambiguous = false;
+    bool retry_proven = false;
+
+    if (kvaf_ub_close_phase_uses_ummu(phase)) {
+        diagnostic_status = kvaf_source_ummu_get_thread_status(&ummu);
+        diagnostic_errno = ummu.last_error == INT32_MIN ? EIO :
+            (ummu.last_error < 0
+                ? -ummu.last_error : ummu.last_error);
+        if (diagnostic_status != 0 || ummu.last_state_unknown != 0U ||
+            ummu.last_retryability == KVAF_SOURCE_UMMU_RETRY_UNSAFE) {
+            state_ambiguous = true;
+        } else if (ummu.last_retryability ==
+                   KVAF_SOURCE_UMMU_RETRY_SAFE) {
+            /* The source-matched UMMU layer retained the exact TID/token
+             * operation and explicitly classified replay as safe. */
+            retry_proven = true;
+        }
+    }
+    return kvaf_ub_close_operation_failed(
+        phase, operation_status, operation_errno,
+        diagnostic_status, diagnostic_errno, state_ambiguous,
+        KVAF_UB_CLOSE_RETRY_CHECKED_DESTROY, retry_proven);
+}
+
+static void kvaf_ub_close_phase_completed(
+    enum kvaf_ub_management_close_phase completed,
+    enum kvaf_ub_management_close_phase next)
+{
+    (void)fprintf(stderr,
+        "KVAF_URMA_MGMT_CLOSE_PROGRESS stage=%s attempt=%llu\n",
+        kvaf_ub_close_phase_name(completed),
+        (unsigned long long)g_kvaf_ub_close_attempt);
+    (void)fflush(stderr);
+    g_kvaf_ub_close_phase = next;
+}
+
+static int kvaf_ub_quiesce_management_jetty(ub_mgmt_ctx_t *ctx)
+{
+    urma_jetty_attr_t requested = {
+        .mask = JETTY_STATE,
+        .state = URMA_JETTY_STATE_ERROR,
+    };
+    urma_jetty_cfg_t observed_cfg = {0};
+    urma_jetty_attr_t observed_attr = {
+        .mask = JETTY_STATE,
+    };
+    int operation_errno;
+    int query_errno;
+    urma_status_t status;
+    urma_status_t query_status;
+
+    if (ctx->pair.jetty == NULL) {
+        return KVAF_PERFTEST_MANAGEMENT_CLOSE_OK;
+    }
+    errno = 0;
+    status = urma_modify_jetty(ctx->pair.jetty, &requested);
+    operation_errno = errno;
+    if (status == URMA_SUCCESS) {
+        return KVAF_PERFTEST_MANAGEMENT_CLOSE_OK;
+    }
+
+    /* A modify completion can be lost after hardware already entered ERROR.
+     * Query before deciding whether the transition is retryable. */
+    errno = 0;
+    query_status = urma_query_jetty(
+        ctx->pair.jetty, &observed_cfg, &observed_attr);
+    query_errno = errno;
+    if (query_status == URMA_SUCCESS &&
+        observed_attr.state == URMA_JETTY_STATE_ERROR) {
+        return KVAF_PERFTEST_MANAGEMENT_CLOSE_OK;
+    }
+    return kvaf_ub_close_operation_failed(
+        KVAF_UB_CLOSE_QUIESCE_JETTY, status, operation_errno,
+        query_status, query_errno, query_status != URMA_SUCCESS,
+        KVAF_UB_CLOSE_RETRY_CONTROL, false);
+}
+
+static int kvaf_ub_quiesce_management_jfr(ub_mgmt_ctx_t *ctx)
+{
+    urma_jfr_attr_t requested = {
+        .mask = JFR_STATE,
+        .state = URMA_JFR_STATE_ERROR,
+    };
+    urma_jfr_cfg_t observed_cfg = {0};
+    urma_jfr_attr_t observed_attr = {
+        .mask = JFR_STATE,
+    };
+    int operation_errno;
+    int query_errno;
+    urma_status_t status;
+    urma_status_t query_status;
+
+    if (ctx->jfr == NULL) {
+        return KVAF_PERFTEST_MANAGEMENT_CLOSE_OK;
+    }
+    errno = 0;
+    status = urma_modify_jfr(ctx->jfr, &requested);
+    operation_errno = errno;
+    if (status == URMA_SUCCESS) {
+        return KVAF_PERFTEST_MANAGEMENT_CLOSE_OK;
+    }
+
+    errno = 0;
+    query_status = urma_query_jfr(
+        ctx->jfr, &observed_cfg, &observed_attr);
+    query_errno = errno;
+    if (query_status == URMA_SUCCESS &&
+        observed_attr.state == URMA_JFR_STATE_ERROR) {
+        return KVAF_PERFTEST_MANAGEMENT_CLOSE_OK;
+    }
+    return kvaf_ub_close_operation_failed(
+        KVAF_UB_CLOSE_QUIESCE_JFR, status, operation_errno,
+        query_status, query_errno, query_status != URMA_SUCCESS,
+        KVAF_UB_CLOSE_RETRY_CONTROL, false);
+}
+
+static int kvaf_ub_drain_management_jfc(ub_mgmt_ctx_t *ctx)
+{
+    urma_cr_t completions[KVAF_UB_CLOSE_DRAIN_BATCH] = {{0}};
+    int pass;
+
+    if (ctx->jfc == NULL) {
+        return KVAF_PERFTEST_MANAGEMENT_CLOSE_OK;
+    }
+    for (pass = 0; pass < KVAF_UB_CLOSE_DRAIN_PASSES; ++pass) {
+        int count;
+        int operation_errno;
+
+        errno = 0;
+        /* Pinned UDMA may consume an earlier CQE and still return a negative
+         * batch result when a later CQE is malformed.  Poll one CR at a time
+         * so a SEND completion or WR_FLUSH_ERR_DONE barrier can never be
+         * consumed without reaching the ownership tracker. */
+        count = urma_poll_jfc(ctx->jfc,
+            KVAF_UB_CLOSE_DRAIN_BATCH, completions);
+        operation_errno = errno;
+        if (count == 0) {
+            if (kvaf_ub_send_tracker_close_is_quiesced(
+                    &g_kvaf_ub_send_tracker)) {
+                return KVAF_PERFTEST_MANAGEMENT_CLOSE_OK;
+            }
+            return kvaf_ub_close_operation_failed(
+                KVAF_UB_CLOSE_DRAIN_JFC, URMA_EAGAIN, EAGAIN,
+                URMA_SUCCESS, 0, false,
+                KVAF_UB_CLOSE_RETRY_CONTROL, false);
+        }
+        if (count < 0) {
+            return kvaf_ub_close_operation_failed(
+                KVAF_UB_CLOSE_DRAIN_JFC, count, operation_errno,
+                URMA_SUCCESS, 0, false,
+                KVAF_UB_CLOSE_RETRY_CONTROL, false);
+        }
+        kvaf_ub_account_management_completions(count, completions);
+    }
+    errno = EAGAIN;
+    return kvaf_ub_close_operation_failed(
+        KVAF_UB_CLOSE_DRAIN_JFC, URMA_EAGAIN, EAGAIN,
+        URMA_SUCCESS, 0, false,
+        KVAF_UB_CLOSE_RETRY_CONTROL, false);
+}
+
+#undef KVAF_UB_CLOSE_DRAIN_PASSES
+#undef KVAF_UB_CLOSE_DRAIN_BATCH
 
 static const char *kvaf_segment_failure_stage_name(uint32_t stage)
 {
@@ -584,6 +976,8 @@ static int kvaf_ub_create_local_resources_checked(
         return kvaf_ub_management_error(
             "create_jetty", errno, EIO);
     }
+    kvaf_ub_send_tracker_require_flush_barrier(
+        &g_kvaf_ub_send_tracker);
     return 0;
 }
 
@@ -617,6 +1011,8 @@ static int kvaf_ub_establish_connection(
         return kvaf_ub_management_error(
             "validate_establish_arguments", EINVAL, EINVAL);
     }
+    kvaf_ub_reset_close_cursor();
+    kvaf_ub_send_tracker_reset(&g_kvaf_ub_send_tracker);
     if (kvaf_ub_create_local_resources_checked(
             &ub_cfg, cfg->dev_name, cfg->eid_idx, &ctx) != 0) {
         /* A partial owner is deliberately published for checked rollback. */
@@ -671,51 +1067,147 @@ static int kvaf_ub_establish_connection(
 static int kvaf_ub_close_connection_checked(void)
 {
     ub_mgmt_ctx_t *ctx = g_ub_ctx;
+    int status;
 
     if (ctx == NULL) {
         return KVAF_PERFTEST_MANAGEMENT_CLOSE_OK;
     }
+    if (g_kvaf_ub_close_attempt != UINT64_MAX) {
+        ++g_kvaf_ub_close_attempt;
+    }
+
     /* A create API can fail after the source-linked provider acquired a
      * lower kernel object. Drain those context-owned orphan sidecars before
-     * deleting the successfully returned parent handles below. */
-    if (ctx->urma_ctx != NULL &&
-        kvaf_udma_source_retry_orphan_cleanup(ctx->urma_ctx) != 0) {
-        errno = EAGAIN;
-        return KVAF_PERFTEST_MANAGEMENT_CLOSE_RETRYABLE;
+     * changing the state of successfully returned parent handles. */
+    if (g_kvaf_ub_close_phase == KVAF_UB_CLOSE_RETRY_ORPHANS) {
+        int orphan_status = 0;
+        int orphan_errno = 0;
+
+        if (ctx->urma_ctx != NULL) {
+            errno = 0;
+            orphan_status =
+                kvaf_udma_source_retry_orphan_cleanup(ctx->urma_ctx);
+            orphan_errno = errno;
+        }
+        if (orphan_status != 0) {
+            if (kvaf_udma_source_cleanup_is_unknown() != 0 ||
+                kvaf_source_ummu_cleanup_is_unknown() != 0) {
+                return kvaf_ub_close_operation_failed(
+                    KVAF_UB_CLOSE_RETRY_ORPHANS, orphan_status,
+                    orphan_errno == 0 ? EIO : orphan_errno,
+                    URMA_FAIL, EIO, true,
+                    KVAF_UB_CLOSE_RETRY_NONE, false);
+            }
+            return kvaf_ub_close_operation_failed(
+                KVAF_UB_CLOSE_RETRY_ORPHANS, orphan_status,
+                orphan_errno == 0 ? EIO : orphan_errno,
+                URMA_SUCCESS, 0, false,
+                KVAF_UB_CLOSE_RETRY_CHECKED_DESTROY, false);
+        }
+        kvaf_ub_close_phase_completed(KVAF_UB_CLOSE_RETRY_ORPHANS,
+            KVAF_UB_CLOSE_QUIESCE_JETTY);
     }
-#define KVAF_UB_DESTROY(handle, operation) do { \
-    if ((handle) != NULL) { \
-        if ((operation)(handle) != URMA_SUCCESS) { \
-            errno = EAGAIN; \
-            return KVAF_PERFTEST_MANAGEMENT_CLOSE_RETRYABLE; \
+
+    /* UMDK's data teardown first transitions Jetty/JFR to ERROR and drains
+     * their shared JFC.  The management server also needs that precondition:
+     * it publishes READY only after two receive WQEs are resident, and a
+     * missing client otherwise leaves those buffers referenced by the RQ. */
+    if (g_kvaf_ub_close_phase == KVAF_UB_CLOSE_QUIESCE_JETTY) {
+        status = kvaf_ub_quiesce_management_jetty(ctx);
+        if (status != KVAF_PERFTEST_MANAGEMENT_CLOSE_OK) {
+            return status;
+        }
+        kvaf_ub_close_phase_completed(KVAF_UB_CLOSE_QUIESCE_JETTY,
+            KVAF_UB_CLOSE_QUIESCE_JFR);
+    }
+    if (g_kvaf_ub_close_phase == KVAF_UB_CLOSE_QUIESCE_JFR) {
+        status = kvaf_ub_quiesce_management_jfr(ctx);
+        if (status != KVAF_PERFTEST_MANAGEMENT_CLOSE_OK) {
+            return status;
+        }
+        kvaf_ub_close_phase_completed(KVAF_UB_CLOSE_QUIESCE_JFR,
+            KVAF_UB_CLOSE_DRAIN_JFC);
+    }
+    if (g_kvaf_ub_close_phase == KVAF_UB_CLOSE_DRAIN_JFC) {
+        status = kvaf_ub_drain_management_jfc(ctx);
+        if (status != KVAF_PERFTEST_MANAGEMENT_CLOSE_OK) {
+            return status;
+        }
+        kvaf_ub_close_phase_completed(KVAF_UB_CLOSE_DRAIN_JFC,
+            KVAF_UB_CLOSE_UNIMPORT_TJETTY);
+    }
+
+#define KVAF_UB_DESTROY_STEP(phase, next_phase, handle, operation) do { \
+    if (g_kvaf_ub_close_phase == (phase)) { \
+        if ((handle) != NULL) { \
+            int kvaf_saved_errno; \
+            urma_status_t kvaf_destroy_status; \
+            if (kvaf_ub_close_phase_uses_ummu((phase))) { \
+                kvaf_source_ummu_reset_thread_status(); \
+            } \
+            errno = 0; \
+            kvaf_destroy_status = (operation)(handle); \
+            kvaf_saved_errno = errno; \
+            if (kvaf_destroy_status != URMA_SUCCESS) { \
+                return kvaf_ub_destroy_operation_failed((phase), \
+                    kvaf_destroy_status, kvaf_saved_errno); \
+            } \
+            (handle) = NULL; \
         } \
-        (handle) = NULL; \
+        kvaf_ub_close_phase_completed((phase), (next_phase)); \
     } \
 } while (0)
-    KVAF_UB_DESTROY(ctx->pair.tjetty, urma_unimport_jetty);
-    KVAF_UB_DESTROY(ctx->pair.jetty, urma_delete_jetty);
-    KVAF_UB_DESTROY(ctx->jfr, urma_delete_jfr);
-    KVAF_UB_DESTROY(ctx->tseg_recv_hs, urma_unregister_seg);
-    KVAF_UB_DESTROY(
+
+    KVAF_UB_DESTROY_STEP(KVAF_UB_CLOSE_UNIMPORT_TJETTY,
+        KVAF_UB_CLOSE_DELETE_JETTY,
+        ctx->pair.tjetty, urma_unimport_jetty);
+    KVAF_UB_DESTROY_STEP(KVAF_UB_CLOSE_DELETE_JETTY,
+        KVAF_UB_CLOSE_DELETE_JFR,
+        ctx->pair.jetty, urma_delete_jetty);
+    KVAF_UB_DESTROY_STEP(KVAF_UB_CLOSE_DELETE_JFR,
+        KVAF_UB_CLOSE_UNREGISTER_HANDSHAKE,
+        ctx->jfr, urma_delete_jfr);
+    KVAF_UB_DESTROY_STEP(KVAF_UB_CLOSE_UNREGISTER_HANDSHAKE,
+        KVAF_UB_CLOSE_FREE_HANDSHAKE_TOKEN,
+        ctx->tseg_recv_hs, urma_unregister_seg);
+    KVAF_UB_DESTROY_STEP(KVAF_UB_CLOSE_FREE_HANDSHAKE_TOKEN,
+        KVAF_UB_CLOSE_UNREGISTER_RECEIVE,
         g_kvaf_ub_management_tokens[KVAF_UB_MANAGEMENT_HANDSHAKE],
         urma_free_token_id);
-    KVAF_UB_DESTROY(ctx->tseg_recv, urma_unregister_seg);
-    KVAF_UB_DESTROY(
+    KVAF_UB_DESTROY_STEP(KVAF_UB_CLOSE_UNREGISTER_RECEIVE,
+        KVAF_UB_CLOSE_FREE_RECEIVE_TOKEN,
+        ctx->tseg_recv, urma_unregister_seg);
+    KVAF_UB_DESTROY_STEP(KVAF_UB_CLOSE_FREE_RECEIVE_TOKEN,
+        KVAF_UB_CLOSE_UNREGISTER_SEND,
         g_kvaf_ub_management_tokens[KVAF_UB_MANAGEMENT_RECEIVE],
         urma_free_token_id);
-    KVAF_UB_DESTROY(ctx->tseg_send, urma_unregister_seg);
-    KVAF_UB_DESTROY(
+    KVAF_UB_DESTROY_STEP(KVAF_UB_CLOSE_UNREGISTER_SEND,
+        KVAF_UB_CLOSE_FREE_SEND_TOKEN,
+        ctx->tseg_send, urma_unregister_seg);
+    KVAF_UB_DESTROY_STEP(KVAF_UB_CLOSE_FREE_SEND_TOKEN,
+        KVAF_UB_CLOSE_DELETE_JFC,
         g_kvaf_ub_management_tokens[KVAF_UB_MANAGEMENT_SEND],
         urma_free_token_id);
-    KVAF_UB_DESTROY(ctx->jfc, urma_delete_jfc);
-    KVAF_UB_DESTROY(ctx->urma_ctx, urma_delete_context);
-#undef KVAF_UB_DESTROY
+    KVAF_UB_DESTROY_STEP(KVAF_UB_CLOSE_DELETE_JFC,
+        KVAF_UB_CLOSE_DELETE_CONTEXT,
+        ctx->jfc, urma_delete_jfc);
+    KVAF_UB_DESTROY_STEP(KVAF_UB_CLOSE_DELETE_CONTEXT,
+        KVAF_UB_CLOSE_RELEASE_LOCAL,
+        ctx->urma_ctx, urma_delete_context);
+#undef KVAF_UB_DESTROY_STEP
 
+    if (g_kvaf_ub_close_phase != KVAF_UB_CLOSE_RELEASE_LOCAL) {
+        kvaf_udma_source_mark_cleanup_unknown();
+        errno = EIO;
+        return KVAF_PERFTEST_MANAGEMENT_CLOSE_UNSAFE;
+    }
     free(ctx->send_buf);
     free(ctx->recv_buf);
     free(ctx->recv_buf_hs);
     free(ctx);
     g_ub_ctx = NULL;
+    kvaf_ub_send_tracker_reset(&g_kvaf_ub_send_tracker);
+    kvaf_ub_reset_close_cursor();
     return KVAF_PERFTEST_MANAGEMENT_CLOSE_OK;
 }
 
@@ -768,7 +1260,7 @@ int kvaf_perftest_close_connection(perftest_config_t *cfg)
 {
     if (cfg == NULL) {
         errno = EINVAL;
-        return KVAF_PERFTEST_MANAGEMENT_CLOSE_RETRYABLE;
+        return KVAF_PERFTEST_MANAGEMENT_CLOSE_UNSAFE;
     }
     if (cfg->mgmt_type == PERFTEST_MGMT_UB) {
         return kvaf_ub_close_connection_checked();
@@ -778,7 +1270,7 @@ int kvaf_perftest_close_connection(perftest_config_t *cfg)
         return KVAF_PERFTEST_MANAGEMENT_CLOSE_OK;
     }
     errno = EINVAL;
-    return KVAF_PERFTEST_MANAGEMENT_CLOSE_RETRYABLE;
+    return KVAF_PERFTEST_MANAGEMENT_CLOSE_UNSAFE;
 }
 
 int kvaf_perftest_sync_data(const perftest_config_t *cfg, uint32_t index,

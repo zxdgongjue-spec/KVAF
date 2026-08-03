@@ -603,6 +603,7 @@ validate_provider()
     kvaf_source_ummu_capability \
     kvaf_source_ummu_get_status \
     kvaf_source_ummu_get_thread_status \
+    kvaf_source_ummu_reset_thread_status \
     kvaf_source_ummu_live_tid_count \
     kvaf_source_ummu_pending_operation_count \
     kvaf_source_ummu_retained_mapping_count \

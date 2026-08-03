@@ -16,11 +16,17 @@
 #undef udma_u_create_jfc
 
 #include "kvaf_source_matched_udma_cleanup.h"
+#include "urma_cmd_tlv.h"
 
 struct kvaf_udma_jfc_state {
     struct udma_u_jfc *jfc;
     urma_context_t *owner_context;
     bool kernel_created;
+    bool kernel_delete_pending;
+    uint32_t delete_comp_events_reported;
+    uint32_t delete_async_events_reported;
+    bool event_condition_initialized;
+    bool event_mutex_initialized;
     bool sw_db_allocated;
     bool cq_created;
     bool orphan;
@@ -31,6 +37,129 @@ static pthread_mutex_t g_kvaf_jfc_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct kvaf_udma_jfc_state *g_kvaf_jfcs;
 static uint32_t g_kvaf_jfc_count;
 static uint32_t g_kvaf_jfc_orphan_count;
+
+static int kvaf_lock_jfc_registry_checked(void)
+{
+    const int status = pthread_mutex_lock(&g_kvaf_jfc_lock);
+
+    return status == 0 ? 0 : kvaf_udma_pthread_cleanup_failed(status);
+}
+
+static int kvaf_unlock_jfc_registry_checked(void)
+{
+    const int status = pthread_mutex_unlock(&g_kvaf_jfc_lock);
+
+    return status == 0 ? 0 : kvaf_udma_pthread_cleanup_failed(status);
+}
+
+static int kvaf_delete_kernel_jfc_nonblocking(
+    struct kvaf_udma_jfc_state *state)
+{
+    urma_jfc_t *jfc;
+    uint32_t comp_events_acked;
+    uint32_t async_events_acked;
+    enum kvaf_udma_destroy_decision decision;
+
+    if (state == NULL || state->jfc == NULL ||
+        state->owner_context == NULL) {
+        return kvaf_udma_cleanup_invariant_failed();
+    }
+    jfc = &state->jfc->base;
+    decision = kvaf_udma_destroy_decide(
+        state->kernel_created, state->kernel_delete_pending,
+        state->delete_comp_events_reported,
+        state->delete_async_events_reported, 0U, 0U, false);
+    if (decision == KVAF_UDMA_DESTROY_FAIL_UNSAFE &&
+        state->kernel_created && state->kernel_delete_pending) {
+        errno = EUCLEAN;
+        kvaf_udma_source_mark_cleanup_unknown();
+        return -1;
+    }
+    if (decision == KVAF_UDMA_DESTROY_RELEASE_LOCAL) {
+        state->kernel_delete_pending = false;
+        return 0;
+    }
+    if (decision == KVAF_UDMA_DESTROY_ISSUE_IOCTL) {
+        urma_cmd_delete_jfc_t command = {0};
+        int status;
+
+        if (jfc->urma_ctx == NULL ||
+            jfc->urma_ctx != state->owner_context ||
+            jfc->urma_ctx->dev_fd < 0) {
+            return kvaf_udma_cleanup_invariant_failed();
+        }
+        command.in.handle = jfc->handle;
+        errno = 0;
+        status = urma_ioctl_delete_jfc(
+            jfc->urma_ctx->dev_fd, &command);
+        /* Preserve the exact pinned UMDK destroy convention. */
+        if (status == EIO) {
+            status = 0;
+        }
+        if (status != 0) {
+            if (!kvaf_udma_destroy_ioctl_retry_is_proven(
+                    status, errno)) {
+                kvaf_udma_source_mark_cleanup_unknown();
+            }
+            return status;
+        }
+        state->kernel_created = false;
+        state->kernel_delete_pending = true;
+        state->delete_comp_events_reported =
+            command.out.comp_events_reported;
+        state->delete_async_events_reported =
+            command.out.async_events_reported;
+    }
+
+    if (kvaf_udma_snapshot_event_counters_checked(
+            &jfc->event_mutex, &jfc->comp_events_acked,
+            &jfc->async_events_acked, &comp_events_acked,
+            &async_events_acked) != 0) {
+        return -1;
+    }
+    decision = kvaf_udma_destroy_decide(
+        state->kernel_created, state->kernel_delete_pending,
+        state->delete_comp_events_reported,
+        state->delete_async_events_reported,
+        comp_events_acked, async_events_acked, false);
+    if (decision == KVAF_UDMA_DESTROY_FAIL_UNSAFE) {
+        errno = EUCLEAN;
+        kvaf_udma_source_mark_cleanup_unknown();
+        return -1;
+    }
+    if (decision == KVAF_UDMA_DESTROY_DRAIN_ASYNC) {
+        if (kvaf_udma_drain_async_events_bounded(jfc->urma_ctx) != 0) {
+            return -1;
+        }
+        if (kvaf_udma_snapshot_event_counters_checked(
+                &jfc->event_mutex, &jfc->comp_events_acked,
+                &jfc->async_events_acked, &comp_events_acked,
+                &async_events_acked) != 0) {
+            return -1;
+        }
+        decision = kvaf_udma_destroy_decide(
+            state->kernel_created, state->kernel_delete_pending,
+            state->delete_comp_events_reported,
+            state->delete_async_events_reported,
+            comp_events_acked, async_events_acked, true);
+        if (decision == KVAF_UDMA_DESTROY_FAIL_UNSAFE) {
+            errno = EUCLEAN;
+            kvaf_udma_source_mark_cleanup_unknown();
+            return -1;
+        }
+        if (decision == KVAF_UDMA_DESTROY_RETRY_LATER) {
+            errno = EAGAIN;
+            return URMA_EAGAIN;
+        }
+    }
+    if (decision != KVAF_UDMA_DESTROY_RELEASE_LOCAL) {
+        errno = EUCLEAN;
+        kvaf_udma_source_mark_cleanup_unknown();
+        return -1;
+    }
+    state->kernel_delete_pending = false;
+    return 0;
+}
 
 static struct kvaf_udma_jfc_state *kvaf_find_jfc_locked(
     struct udma_u_jfc *jfc)
@@ -65,9 +194,25 @@ static void kvaf_remove_jfc_locked(struct kvaf_udma_jfc_state *state)
 static int kvaf_cleanup_local_jfc_checked(
     struct kvaf_udma_jfc_state *state)
 {
-    struct udma_u_jfc *jfc = state->jfc;
-    struct udma_u_context *context =
-        to_udma_u_ctx(state->owner_context);
+    struct udma_u_jfc *jfc;
+    struct udma_u_context *context;
+
+    if (state == NULL || state->jfc == NULL ||
+        state->owner_context == NULL) {
+        return kvaf_udma_cleanup_invariant_failed();
+    }
+    jfc = state->jfc;
+    context = to_udma_u_ctx(state->owner_context);
+    if ((state->sw_db_allocated || state->cq_created) &&
+        jfc->cq.ctx != context) {
+        return kvaf_udma_cleanup_invariant_failed();
+    }
+    if ((state->kernel_created || state->kernel_delete_pending ||
+         state->event_condition_initialized ||
+         state->event_mutex_initialized) &&
+        jfc->base.urma_ctx != state->owner_context) {
+        return kvaf_udma_cleanup_invariant_failed();
+    }
 
     if (state->sw_db_allocated) {
         if (kvaf_udma_checked_free_sw_db(
@@ -81,11 +226,21 @@ static int kvaf_cleanup_local_jfc_checked(
         if (kvaf_udma_checked_free_queue_buffer(&jfc->cq) != 0) {
             return -1;
         }
-        if (!jfc->cq.lock_free &&
-            pthread_spin_destroy(&jfc->cq.lock) != 0) {
-            return -1;
+        if (!jfc->cq.lock_free) {
+            const int spin_status =
+                pthread_spin_destroy(&jfc->cq.lock);
+
+            if (spin_status != 0) {
+                return kvaf_udma_pthread_cleanup_failed(spin_status);
+            }
         }
         state->cq_created = false;
+    }
+    if (kvaf_udma_destroy_event_sync_checked(
+            &jfc->base.event_mutex, &jfc->base.event_cond,
+            &state->event_condition_initialized,
+            &state->event_mutex_initialized) != 0) {
+        return -1;
     }
     return 0;
 }
@@ -117,8 +272,12 @@ int kvaf_udma_source_retry_orphan_jfcs(urma_context_t *context)
     struct kvaf_udma_jfc_state *state;
     struct kvaf_udma_jfc_state *next;
     int result = 0;
+    int saved_errno = 0;
 
-    if (context == NULL || pthread_mutex_lock(&g_kvaf_jfc_lock) != 0) {
+    if (context == NULL) {
+        return kvaf_udma_cleanup_invariant_failed();
+    }
+    if (kvaf_lock_jfc_registry_checked() != 0) {
         return -1;
     }
     for (state = g_kvaf_jfcs; state != NULL; state = next) {
@@ -126,21 +285,29 @@ int kvaf_udma_source_retry_orphan_jfcs(urma_context_t *context)
         if (!state->orphan || state->owner_context != context) {
             continue;
         }
-        if (state->kernel_created &&
-            urma_cmd_delete_jfc(&state->jfc->base) != 0) {
+        if ((state->kernel_created || state->kernel_delete_pending) &&
+            kvaf_delete_kernel_jfc_nonblocking(state) != 0) {
             result = -1;
+            kvaf_udma_preserve_cleanup_errno(&saved_errno);
             continue;
         }
-        state->kernel_created = false;
+        errno = 0;
         if (kvaf_cleanup_local_jfc_checked(state) != 0) {
+            (void)kvaf_udma_classify_cleanup_failure();
             result = -1;
+            kvaf_udma_preserve_cleanup_errno(&saved_errno);
             continue;
         }
         kvaf_remove_jfc_locked(state);
         free(state->jfc);
         free(state);
     }
-    (void)pthread_mutex_unlock(&g_kvaf_jfc_lock);
+    if (kvaf_unlock_jfc_registry_checked() != 0) {
+        return -1;
+    }
+    if (result != 0) {
+        errno = saved_errno == 0 ? EIO : saved_errno;
+    }
     return result;
 }
 
@@ -184,8 +351,12 @@ urma_jfc_t *kvaf_udma_create_jfc_checked(
 
     state = calloc(1, sizeof(*state));
     jfc = calloc(1, sizeof(*jfc));
-    if (state == NULL || jfc == NULL || context == NULL || cfg == NULL ||
-        pthread_mutex_lock(&g_kvaf_jfc_lock) != 0) {
+    if (state == NULL || jfc == NULL || context == NULL || cfg == NULL) {
+        free(state);
+        free(jfc);
+        return NULL;
+    }
+    if (kvaf_lock_jfc_registry_checked() != 0) {
         free(state);
         free(jfc);
         return NULL;
@@ -199,7 +370,7 @@ urma_jfc_t *kvaf_udma_create_jfc_checked(
     ++g_kvaf_jfc_orphan_count;
 
     if (udma_u_check_jfc_cfg(context, cfg) != 0 ||
-        cfg->flag.bs.non_blocking) {
+        cfg->flag.bs.non_blocking || cfg->jfce != NULL) {
         goto fail;
     }
     udma_context = to_udma_u_ctx(context);
@@ -226,21 +397,32 @@ urma_jfc_t *kvaf_udma_create_jfc_checked(
         goto fail;
     }
     state->kernel_created = true;
+    state->event_condition_initialized = true;
+    state->event_mutex_initialized = true;
     jfc->cq_shift = align_power2(jfc->cq.baseblk_cnt);
     jfc->cq.idx = jfc->base.jfc_id.id;
     jfc->arm_sn = 1;
     state->orphan = false;
     --g_kvaf_jfc_orphan_count;
-    (void)pthread_mutex_unlock(&g_kvaf_jfc_lock);
+    if (kvaf_unlock_jfc_registry_checked() != 0) {
+        /* No public handle escaped. Keep the fully created object owned by the
+         * orphan sidecar while the process-lifetime unsafe latch blocks reuse. */
+        state->orphan = true;
+        ++g_kvaf_jfc_orphan_count;
+        return NULL;
+    }
     return &jfc->base;
 
 fail:
+    errno = 0;
     if (kvaf_cleanup_local_jfc_checked(state) == 0) {
         kvaf_remove_jfc_locked(state);
         free(jfc);
         free(state);
+    } else {
+        (void)kvaf_udma_classify_cleanup_failure();
     }
-    (void)pthread_mutex_unlock(&g_kvaf_jfc_lock);
+    (void)kvaf_unlock_jfc_registry_checked();
     return NULL;
 }
 
@@ -249,31 +431,40 @@ urma_status_t kvaf_udma_delete_jfc_checked(urma_jfc_t *public_jfc)
     struct kvaf_udma_jfc_state *state;
     int status;
 
-    if (public_jfc == NULL ||
-        pthread_mutex_lock(&g_kvaf_jfc_lock) != 0) {
+    if (public_jfc == NULL) {
+        (void)kvaf_udma_cleanup_invariant_failed();
+        return URMA_FAIL;
+    }
+    if (kvaf_lock_jfc_registry_checked() != 0) {
         return URMA_FAIL;
     }
     state = kvaf_find_jfc_locked(to_udma_u_jfc(public_jfc));
     if (state == NULL ||
+        state->owner_context == NULL ||
+        public_jfc->urma_ctx != state->owner_context ||
         public_jfc->jfc_cfg.flag.bs.non_blocking) {
-        (void)pthread_mutex_unlock(&g_kvaf_jfc_lock);
+        (void)kvaf_udma_cleanup_invariant_failed();
+        (void)kvaf_unlock_jfc_registry_checked();
         return URMA_FAIL;
     }
-    if (state->kernel_created) {
-        status = urma_cmd_delete_jfc(public_jfc);
+    if (state->kernel_created || state->kernel_delete_pending) {
+        status = kvaf_delete_kernel_jfc_nonblocking(state);
         if (status != 0) {
-            (void)pthread_mutex_unlock(&g_kvaf_jfc_lock);
+            (void)kvaf_unlock_jfc_registry_checked();
             return URMA_FAIL;
         }
-        state->kernel_created = false;
     }
+    errno = 0;
     if (kvaf_cleanup_local_jfc_checked(state) != 0) {
+        (void)kvaf_udma_classify_cleanup_failure();
         /* Kernel CQ is gone; retain local mapping handles for exact retry. */
-        (void)pthread_mutex_unlock(&g_kvaf_jfc_lock);
+        (void)kvaf_unlock_jfc_registry_checked();
         return URMA_FAIL;
     }
     kvaf_remove_jfc_locked(state);
-    (void)pthread_mutex_unlock(&g_kvaf_jfc_lock);
+    if (kvaf_unlock_jfc_registry_checked() != 0) {
+        return URMA_FAIL;
+    }
     free(state->jfc);
     free(state);
     return URMA_SUCCESS;

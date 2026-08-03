@@ -77,6 +77,7 @@ struct kvaf_ummu_tid_state {
   bool pending_state_unknown;
   bool allocation_orphan;
   bool map_inserted;
+  bool table_storage_released;
   struct kvaf_ummu_mapping_ledger mappings;
   struct kvaf_ummu_tid_state *next;
 };
@@ -131,6 +132,11 @@ static void kvaf_clear_thread_failure(void)
     .capability_bits = KVAF_SOURCE_UMMU_CHECKED_RETRYABLE_V1 |
         KVAF_SOURCE_UMMU_PINNED_FULL_UAPI,
   };
+}
+
+void kvaf_source_ummu_reset_thread_status(void)
+{
+  kvaf_clear_thread_failure();
 }
 
 static void kvaf_record_failure(
@@ -505,11 +511,29 @@ int ummu_get_tid(int fd, struct ummu_tid_info *info)
 void ummu_put_tid(int fd, unsigned int tid)
 {
   struct ummu_tid_info info = {.tid = tid};
+  int error_code;
+  bool retry_safe;
 
-  if (fd < 0 || ioctl(fd, UMMU_IOCFREE_TID, &info) != 0) {
+  errno = 0;
+  if (fd >= 0 && ioctl(fd, UMMU_IOCFREE_TID, &info) == 0) {
+    return;
+  }
+  error_code = fd < 0 ? EINVAL : (errno == 0 ? EIO : errno);
+  /* FREE_TID may already have consumed the TID when an interrupted or
+   * otherwise ambiguous ioctl returns.  Only explicit kernel back-pressure
+   * proves that replay is safe. */
+  retry_safe = fd >= 0 &&
+      (error_code == EAGAIN || error_code == EBUSY);
+  if (g_kvaf_ummu_current_state != NULL) {
+    g_kvaf_ummu_current_state->pending_state_unknown = !retry_safe;
+  }
+  {
     kvaf_record_failure(g_kvaf_ummu_current_state,
         KVAF_SOURCE_UMMU_FAILURE_FREE_TID_IOCTL,
-        fd < 0 ? -EINVAL : -errno, KVAF_SOURCE_UMMU_RETRY_SAFE, false,
+        -error_code,
+        retry_safe ? KVAF_SOURCE_UMMU_RETRY_SAFE
+                   : KVAF_SOURCE_UMMU_RETRY_UNSAFE,
+        !retry_safe,
         KVAF_SOURCE_UMMU_PENDING_FREE_TID, 0, 0);
   }
 }
@@ -1297,8 +1321,10 @@ static int kvaf_issue_free_tid_ioctl(
   }
   if (ioctl(g_kvaf_ummu_ctx->shared_fd, UMMU_IOCFREE_TID, &info) != 0) {
     const int status = -errno;
-    const bool retry_safe = errno == EINTR || errno == EAGAIN ||
-        errno == EBUSY || errno == ENOSPC;
+    /* FREE_TID is destructive and has no query contract.  EINTR does not
+     * prove whether the kernel consumed the handle, so replaying it is not
+     * safe.  Only explicit "not performed yet" back-pressure is retryable. */
+    const bool retry_safe = errno == EAGAIN || errno == EBUSY;
     state->pending_state_unknown = !retry_safe;
     kvaf_record_failure(state,
         KVAF_SOURCE_UMMU_FAILURE_FREE_TID_IOCTL, status,
@@ -1362,6 +1388,20 @@ static int kvaf_munmap_owned(
   return status;
 }
 
+static int kvaf_local_cleanup_unsafe(
+    struct kvaf_ummu_tid_state *state,
+    enum kvaf_source_ummu_failure_stage stage, int status)
+{
+  if (status >= 0) {
+    status = -EUCLEAN;
+  }
+  state->pending_state_unknown = true;
+  kvaf_record_failure(state, stage, status,
+      KVAF_SOURCE_UMMU_RETRY_UNSAFE, true,
+      KVAF_SOURCE_UMMU_PENDING_FREE_TID, 0, 0);
+  return status;
+}
+
 static int kvaf_release_local_mapt_locked(
     struct kvaf_ummu_tid_state *state)
 {
@@ -1385,29 +1425,37 @@ static int kvaf_release_local_mapt_locked(
       state->mapt->block_base.entry_block = NULL;
     }
   } else if (state->mapt->mode == MAPT_MODE_TABLE) {
-    table = state->mapt->block_base.table_ctx;
-    if (table == NULL ||
-        !kvaf_source_ummu_seg_tree_is_empty(table->granted_addr_mng)) {
-      return -EBUSY;
-    }
-    for (index = 0; index < INDEX_MAX_SIZE; ++index) {
-      block = table->mapt_block_array[index];
-      if (block == NULL) {
-        continue;
+    if (!state->table_storage_released) {
+      table = state->mapt->block_base.table_ctx;
+      if (table == NULL ||
+          !kvaf_source_ummu_seg_tree_is_empty(table->granted_addr_mng)) {
+        return kvaf_local_cleanup_unsafe(state,
+            KVAF_SOURCE_UMMU_FAILURE_LIVE_MAPPING, -EUCLEAN);
       }
-      status = kvaf_munmap_owned(
-          state, block->block_addr, table->blk_exp_size);
-      if (status != 0) {
-        return status;
+      for (index = 0; index < INDEX_MAX_SIZE; ++index) {
+        block = table->mapt_block_array[index];
+        if (block == NULL) {
+          continue;
+        }
+        status = kvaf_munmap_owned(
+            state, block->block_addr, table->blk_exp_size);
+        if (status != 0) {
+          return status;
+        }
+        table->mapt_block_array[index] = NULL;
+        free(block);
       }
-      table->mapt_block_array[index] = NULL;
-      free(block);
+      ummu_destroy_seg_mng(&table->granted_addr_mng);
+      free(table);
+      state->mapt->block_base.table_ctx = NULL;
+      /* Queue unmap below is a separate fallible local phase.  Persist this
+       * transition so a retry cannot mistake the deliberately NULL table for
+       * corruption and can resume at the exact queue mapping. */
+      state->table_storage_released = true;
     }
-    ummu_destroy_seg_mng(&table->granted_addr_mng);
-    free(table);
-    state->mapt->block_base.table_ctx = NULL;
   } else {
-    return -EINVAL;
+    return kvaf_local_cleanup_unsafe(state,
+        KVAF_SOURCE_UMMU_FAILURE_INTERNAL, -EUCLEAN);
   }
 
   if (!state->mapt->kcmd_plbi &&
@@ -1439,27 +1487,35 @@ static int kvaf_free_tid_state_locked(
 
   if (state->pending != KVAF_SOURCE_UMMU_PENDING_NONE &&
       state->pending != KVAF_SOURCE_UMMU_PENDING_FREE_TID) {
-    if (state->mapt == NULL ||
-        pthread_mutex_lock(&state->mapt->mapt_mutex) != 0) {
-      return -EDEADLK;
+    int lock_status;
+
+    if (state->mapt == NULL) {
+      return kvaf_local_cleanup_unsafe(state,
+          KVAF_SOURCE_UMMU_FAILURE_INTERNAL, -EUCLEAN);
+    }
+    lock_status = pthread_mutex_lock(&state->mapt->mapt_mutex);
+    if (lock_status != 0) {
+      return kvaf_local_cleanup_unsafe(state,
+          KVAF_SOURCE_UMMU_FAILURE_INTERNAL, -lock_status);
     }
     mapt_locked = true;
     g_kvaf_ummu_current_state = state;
     status = kvaf_retry_data_operation_locked(state);
     g_kvaf_ummu_current_state = NULL;
-    (void)pthread_mutex_unlock(&state->mapt->mapt_mutex);
+    lock_status = pthread_mutex_unlock(&state->mapt->mapt_mutex);
     mapt_locked = false;
+    if (lock_status != 0) {
+      return kvaf_local_cleanup_unsafe(state,
+          KVAF_SOURCE_UMMU_FAILURE_INTERNAL, -lock_status);
+    }
     if (status != 0) {
       return status;
     }
   }
   if (state->pending == KVAF_SOURCE_UMMU_PENDING_NONE) {
     if (kvaf_mapt_has_live_mapping(state)) {
-      kvaf_record_failure(state,
-          KVAF_SOURCE_UMMU_FAILURE_LIVE_MAPPING, -EBUSY,
-          KVAF_SOURCE_UMMU_RETRY_SAFE, false,
-          KVAF_SOURCE_UMMU_PENDING_FREE_TID, 0, 0);
-      return -EBUSY;
+      return kvaf_local_cleanup_unsafe(state,
+          KVAF_SOURCE_UMMU_FAILURE_LIVE_MAPPING, -EUCLEAN);
     }
     kvaf_set_pending(state, KVAF_SOURCE_UMMU_PENDING_FREE_TID);
     state->cleanup_phase = state->allocation_orphan
@@ -1468,8 +1524,12 @@ static int kvaf_free_tid_state_locked(
   }
 
   if (state->mapt != NULL) {
-    if (pthread_mutex_lock(&state->mapt->mapt_mutex) != 0) {
-      return -EDEADLK;
+    const int lock_status =
+        pthread_mutex_lock(&state->mapt->mapt_mutex);
+
+    if (lock_status != 0) {
+      return kvaf_local_cleanup_unsafe(state,
+          KVAF_SOURCE_UMMU_FAILURE_INTERNAL, -lock_status);
     }
     mapt_locked = true;
     g_kvaf_ummu_current_state = state;
@@ -1502,7 +1562,13 @@ static int kvaf_free_tid_state_locked(
 unlock:
   g_kvaf_ummu_current_state = NULL;
   if (mapt_locked) {
-    (void)pthread_mutex_unlock(&state->mapt->mapt_mutex);
+    const int unlock_status =
+        pthread_mutex_unlock(&state->mapt->mapt_mutex);
+
+    if (unlock_status != 0) {
+      return kvaf_local_cleanup_unsafe(state,
+          KVAF_SOURCE_UMMU_FAILURE_INTERNAL, -unlock_status);
+    }
   }
   if (status != 0 ||
       state->cleanup_phase != KVAF_UMMU_CLEANUP_LOCAL_RELEASED) {
@@ -1642,19 +1708,38 @@ int ummu_allocate_tid(struct ummu_tid_attr *attribute, uint32_t *tid_out)
 int ummu_free_tid(uint32_t tid)
 {
   struct kvaf_ummu_tid_state *state;
+  int lock_status;
   int status;
+  int unlock_status;
 
   kvaf_clear_thread_failure();
   status = kvaf_ensure_context();
   if (status != 0) {
     return status;
   }
-  if (pthread_mutex_lock(&g_kvaf_ummu_ctx->ctx_mutex) != 0) {
-    return -EDEADLK;
+  lock_status = pthread_mutex_lock(&g_kvaf_ummu_ctx->ctx_mutex);
+  if (lock_status != 0) {
+    kvaf_record_failure(NULL, KVAF_SOURCE_UMMU_FAILURE_INTERNAL,
+        -lock_status, KVAF_SOURCE_UMMU_RETRY_UNSAFE, true,
+        KVAF_SOURCE_UMMU_PENDING_FREE_TID, 0, 0);
+    return -lock_status;
   }
   state = kvaf_find_state_locked(tid);
-  status = state == NULL ? -ENOENT : kvaf_free_tid_state_locked(state);
-  (void)pthread_mutex_unlock(&g_kvaf_ummu_ctx->ctx_mutex);
+  if (state == NULL) {
+    status = -ENOENT;
+    kvaf_record_failure(NULL, KVAF_SOURCE_UMMU_FAILURE_INTERNAL,
+        status, KVAF_SOURCE_UMMU_RETRY_UNSAFE, true,
+        KVAF_SOURCE_UMMU_PENDING_FREE_TID, 0, 0);
+  } else {
+    status = kvaf_free_tid_state_locked(state);
+  }
+  unlock_status = pthread_mutex_unlock(&g_kvaf_ummu_ctx->ctx_mutex);
+  if (unlock_status != 0) {
+    kvaf_record_failure(NULL, KVAF_SOURCE_UMMU_FAILURE_INTERNAL,
+        -unlock_status, KVAF_SOURCE_UMMU_RETRY_UNSAFE, true,
+        KVAF_SOURCE_UMMU_PENDING_FREE_TID, 0, 0);
+    return -unlock_status;
+  }
   return status;
 }
 

@@ -1,5 +1,6 @@
 #include "kvaf_source_matched_udma.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -86,22 +87,25 @@ static int kvaf_cleanup_context_tables_checked(
     struct kvaf_udma_context_state *state)
 {
     struct udma_u_context *context = state->context;
+    int status;
 
     if (!state->table_layout_initialized) {
         return 0;
     }
     if (!kvaf_context_tables_are_empty(context)) {
-        return -1;
+        return kvaf_udma_cleanup_invariant_failed();
     }
     if (state->jetty_table_lock_initialized) {
-        if (pthread_rwlock_destroy(&context->jetty_table_lock) != 0) {
-            return -1;
+        status = pthread_rwlock_destroy(&context->jetty_table_lock);
+        if (status != 0) {
+            return kvaf_udma_pthread_cleanup_failed(status);
         }
         state->jetty_table_lock_initialized = false;
     }
     if (state->jfr_table_lock_initialized) {
-        if (pthread_rwlock_destroy(&context->jfr_table_lock) != 0) {
-            return -1;
+        status = pthread_rwlock_destroy(&context->jfr_table_lock);
+        if (status != 0) {
+            return kvaf_udma_pthread_cleanup_failed(status);
         }
         state->jfr_table_lock_initialized = false;
     }
@@ -209,16 +213,26 @@ static int kvaf_retry_orphan_context_locked(
     }
     /* No queue was returned, so a create orphan cannot own hugepage data. */
     if (state->hugepage_mutex_initialized) {
-        if (context->hugepage_list != NULL ||
-            pthread_mutex_destroy(&context->hugepage_lock) != 0) {
-            return -1;
+        int status;
+
+        if (context->hugepage_list != NULL) {
+            return kvaf_udma_cleanup_invariant_failed();
+        }
+        status = pthread_mutex_destroy(&context->hugepage_lock);
+        if (status != 0) {
+            return kvaf_udma_pthread_cleanup_failed(status);
         }
         state->hugepage_mutex_initialized = false;
     }
     if (state->db_list_mutex_initialized) {
-        if (kvaf_udma_context_has_db_pages(context) ||
-            pthread_mutex_destroy(&context->db_list_mutex) != 0) {
-            return -1;
+        int status;
+
+        if (kvaf_udma_context_has_db_pages(context)) {
+            return kvaf_udma_cleanup_invariant_failed();
+        }
+        status = pthread_mutex_destroy(&context->db_list_mutex);
+        if (status != 0) {
+            return kvaf_udma_pthread_cleanup_failed(status);
         }
         state->db_list_mutex_initialized = false;
     }
@@ -239,7 +253,9 @@ int kvaf_udma_source_retry_orphan_contexts(void)
         if (!state->orphan) {
             continue;
         }
+        errno = 0;
         if (kvaf_retry_orphan_context_locked(state) != 0) {
+            (void)kvaf_udma_classify_cleanup_failure();
             result = -1;
             continue;
         }
@@ -320,10 +336,13 @@ static urma_context_t *kvaf_udma_create_context_checked(
     return &context->urma_ctx;
 
 rollback:
+    errno = 0;
     if (kvaf_retry_orphan_context_locked(state) == 0) {
         kvaf_remove_context_locked(state);
         free(context);
         free(state);
+    } else {
+        (void)kvaf_udma_classify_cleanup_failure();
     }
     (void)pthread_mutex_unlock(&g_kvaf_context_lock);
     return NULL;
@@ -352,8 +371,12 @@ static urma_status_t kvaf_udma_delete_context_checked(
      * the normal live-object gate.  Each kind only visits orphan sidecars
      * owned by this exact public context.
      */
-    if (kvaf_udma_source_retry_orphan_cleanup(public_context) != 0 ||
-        kvaf_udma_source_context_has_live_resources(public_context) != 0) {
+    if (kvaf_udma_source_retry_orphan_cleanup(public_context) != 0) {
+        (void)pthread_mutex_unlock(&g_kvaf_context_lock);
+        return URMA_FAIL;
+    }
+    if (kvaf_udma_source_context_has_live_resources(public_context) != 0) {
+        (void)kvaf_udma_cleanup_invariant_failed();
         (void)pthread_mutex_unlock(&g_kvaf_context_lock);
         return URMA_FAIL;
     }
@@ -370,20 +393,30 @@ static urma_status_t kvaf_udma_delete_context_checked(
 
     /* Local mappings are cleared only after their munmap succeeds. */
     if (kvaf_cleanup_context_tables_checked(state) != 0) {
+        (void)kvaf_udma_classify_cleanup_failure();
         (void)pthread_mutex_unlock(&g_kvaf_context_lock);
         return URMA_FAIL;
     }
     if (state->db_allocated) {
         if (kvaf_udma_checked_free_doorbell(
                 public_context, &context->db) != 0) {
+            (void)kvaf_udma_classify_cleanup_failure();
             (void)pthread_mutex_unlock(&g_kvaf_context_lock);
             return URMA_FAIL;
         }
         state->db_allocated = false;
     }
     if (state->hugepage_mutex_initialized) {
-        if (context->hugepage_list != NULL ||
-            pthread_mutex_destroy(&context->hugepage_lock) != 0) {
+        int status;
+
+        if (context->hugepage_list != NULL) {
+            (void)kvaf_udma_cleanup_invariant_failed();
+            (void)pthread_mutex_unlock(&g_kvaf_context_lock);
+            return URMA_FAIL;
+        }
+        status = pthread_mutex_destroy(&context->hugepage_lock);
+        if (status != 0) {
+            (void)kvaf_udma_pthread_cleanup_failed(status);
             (void)pthread_mutex_unlock(&g_kvaf_context_lock);
             return URMA_FAIL;
         }
@@ -391,8 +424,16 @@ static urma_status_t kvaf_udma_delete_context_checked(
     }
 
     if (state->db_list_mutex_initialized) {
-        if (kvaf_udma_context_has_db_pages(context) ||
-            pthread_mutex_destroy(&context->db_list_mutex) != 0) {
+        int status;
+
+        if (kvaf_udma_context_has_db_pages(context)) {
+            (void)kvaf_udma_cleanup_invariant_failed();
+            (void)pthread_mutex_unlock(&g_kvaf_context_lock);
+            return URMA_FAIL;
+        }
+        status = pthread_mutex_destroy(&context->db_list_mutex);
+        if (status != 0) {
+            (void)kvaf_udma_pthread_cleanup_failed(status);
             (void)pthread_mutex_unlock(&g_kvaf_context_lock);
             return URMA_FAIL;
         }
@@ -425,24 +466,38 @@ int kvaf_udma_source_context_has_live_resources(
 int kvaf_udma_source_retry_orphan_cleanup(urma_context_t *context)
 {
     int result = 0;
+    int saved_errno = 0;
 
     if (context == NULL) {
         return -1;
     }
+    errno = 0;
     if (kvaf_udma_source_retry_orphan_jetties(context) != 0) {
         result = -1;
+        kvaf_udma_preserve_cleanup_errno(&saved_errno);
     }
+    errno = 0;
     if (kvaf_udma_source_retry_orphan_jfrs(context) != 0) {
         result = -1;
+        kvaf_udma_preserve_cleanup_errno(&saved_errno);
     }
+    errno = 0;
     if (kvaf_udma_source_retry_orphan_jfcs(context) != 0) {
         result = -1;
+        kvaf_udma_preserve_cleanup_errno(&saved_errno);
     }
+    errno = 0;
     if (kvaf_udma_source_retry_orphan_segments(context) != 0) {
         result = -1;
+        kvaf_udma_preserve_cleanup_errno(&saved_errno);
     }
+    errno = 0;
     if (kvaf_udma_source_retry_orphan_tokens(context) != 0) {
         result = -1;
+        kvaf_udma_preserve_cleanup_errno(&saved_errno);
+    }
+    if (result != 0) {
+        errno = saved_errno == 0 ? EIO : saved_errno;
     }
     return result;
 }

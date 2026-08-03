@@ -364,6 +364,23 @@ class DirectUrmaSourceSyntaxTests(unittest.TestCase):
         )
         self.assertNotIn("ready_deadline", open_body)
 
+    def test_ready_observation_reports_rate_limited_host_progress(self) -> None:
+        open_start = self.resources_source.index(
+            "Status DirectUrmaResources::Open"
+        )
+        close_start = self.resources_source.index(
+            "Status DirectUrmaResources::Close", open_start
+        )
+        open_body = self.resources_source[open_start:close_start]
+        for expected in (
+            '"KVAF_A5_AICPU_OWNER_PROGRESS phase=open polls=%llu "',
+            '"observer_elapsed_ms=%lld aiv_identity_valid=%u "',
+            '"owner_identity_valid=%u open_result_valid=%u "',
+            "progress_now >= next_progress_log",
+            "progress_now + std::chrono::seconds(1)",
+        ):
+            self.assertIn(expected, open_body)
+
     def test_aiv_ready_wait_does_not_make_cleanup_progress_terminal(
         self,
     ) -> None:

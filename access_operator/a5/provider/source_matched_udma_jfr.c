@@ -25,11 +25,16 @@
 #undef udma_u_create_jfr
 
 #include "kvaf_source_matched_udma_cleanup.h"
+#include "urma_cmd_tlv.h"
 
 struct kvaf_udma_jfr_state {
     struct udma_u_jfr *jfr;
     urma_context_t *owner_context;
     bool kernel_created;
+    bool kernel_delete_pending;
+    uint32_t delete_async_events_reported;
+    bool event_condition_initialized;
+    bool event_mutex_initialized;
     bool spin_initialized;
     bool index_bitmap_allocated;
     bool index_buffer_mapped;
@@ -47,6 +52,123 @@ static pthread_mutex_t g_kvaf_jfr_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct kvaf_udma_jfr_state *g_kvaf_jfrs;
 static uint32_t g_kvaf_jfr_count;
 static uint32_t g_kvaf_jfr_orphan_count;
+
+static int kvaf_lock_jfr_registry_checked(void)
+{
+    const int status = pthread_mutex_lock(&g_kvaf_jfr_lock);
+
+    return status == 0 ? 0 : kvaf_udma_pthread_cleanup_failed(status);
+}
+
+static int kvaf_unlock_jfr_registry_checked(void)
+{
+    const int status = pthread_mutex_unlock(&g_kvaf_jfr_lock);
+
+    return status == 0 ? 0 : kvaf_udma_pthread_cleanup_failed(status);
+}
+
+static int kvaf_delete_kernel_jfr_nonblocking(
+    struct kvaf_udma_jfr_state *state)
+{
+    urma_jfr_t *jfr;
+    uint32_t events_acked;
+    enum kvaf_udma_destroy_decision decision;
+
+    if (state == NULL || state->jfr == NULL ||
+        state->owner_context == NULL) {
+        return kvaf_udma_cleanup_invariant_failed();
+    }
+    jfr = &state->jfr->base;
+    decision = kvaf_udma_destroy_decide(
+        state->kernel_created, state->kernel_delete_pending,
+        0U, state->delete_async_events_reported, 0U, 0U, false);
+    if (decision == KVAF_UDMA_DESTROY_FAIL_UNSAFE) {
+        errno = EUCLEAN;
+        kvaf_udma_source_mark_cleanup_unknown();
+        return -1;
+    }
+    if (decision == KVAF_UDMA_DESTROY_RELEASE_LOCAL) {
+        state->kernel_delete_pending = false;
+        return 0;
+    }
+    if (decision == KVAF_UDMA_DESTROY_ISSUE_IOCTL) {
+        urma_cmd_delete_jfr_t command = {0};
+        int status;
+
+        if (jfr->urma_ctx == NULL ||
+            jfr->urma_ctx != state->owner_context ||
+            jfr->urma_ctx->dev_fd < 0) {
+            return kvaf_udma_cleanup_invariant_failed();
+        }
+        command.in.handle = jfr->handle;
+        errno = 0;
+        status = urma_ioctl_delete_jfr(
+            jfr->urma_ctx->dev_fd, &command);
+        /* Preserve the exact pinned UMDK destroy convention. */
+        if (status == EIO) {
+            status = 0;
+        }
+        if (status != 0) {
+            if (!kvaf_udma_destroy_ioctl_retry_is_proven(
+                    status, errno)) {
+                kvaf_udma_source_mark_cleanup_unknown();
+            }
+            return status;
+        }
+        /* The destructive ioctl is issued exactly once.  From here on the
+         * sidecar owns only event acknowledgement and local release. */
+        state->kernel_created = false;
+        state->kernel_delete_pending = true;
+        state->delete_async_events_reported =
+            command.out.async_events_reported;
+    }
+
+    if (kvaf_udma_snapshot_event_counters_checked(
+            &jfr->event_mutex, NULL, &jfr->async_events_acked,
+            NULL, &events_acked) != 0) {
+        return -1;
+    }
+    decision = kvaf_udma_destroy_decide(
+        state->kernel_created, state->kernel_delete_pending,
+        0U, state->delete_async_events_reported, 0U, events_acked,
+        false);
+    if (decision == KVAF_UDMA_DESTROY_FAIL_UNSAFE) {
+        errno = EUCLEAN;
+        kvaf_udma_source_mark_cleanup_unknown();
+        return -1;
+    }
+    if (decision == KVAF_UDMA_DESTROY_DRAIN_ASYNC) {
+        if (kvaf_udma_drain_async_events_bounded(jfr->urma_ctx) != 0) {
+            return -1;
+        }
+        if (kvaf_udma_snapshot_event_counters_checked(
+                &jfr->event_mutex, NULL,
+                &jfr->async_events_acked, NULL,
+                &events_acked) != 0) {
+            return -1;
+        }
+        decision = kvaf_udma_destroy_decide(
+            state->kernel_created, state->kernel_delete_pending,
+            0U, state->delete_async_events_reported, 0U,
+            events_acked, true);
+        if (decision == KVAF_UDMA_DESTROY_FAIL_UNSAFE) {
+            errno = EUCLEAN;
+            kvaf_udma_source_mark_cleanup_unknown();
+            return -1;
+        }
+        if (decision == KVAF_UDMA_DESTROY_RETRY_LATER) {
+            errno = EAGAIN;
+            return URMA_EAGAIN;
+        }
+    }
+    if (decision != KVAF_UDMA_DESTROY_RELEASE_LOCAL) {
+        errno = EUCLEAN;
+        kvaf_udma_source_mark_cleanup_unknown();
+        return -1;
+    }
+    state->kernel_delete_pending = false;
+    return 0;
+}
 
 static int kvaf_unlock_jfr_table_checked(
     struct kvaf_udma_jfr_state *state,
@@ -353,8 +475,29 @@ static int kvaf_create_direct_jfr_command(
 static int kvaf_cleanup_local_jfr_checked(
     struct kvaf_udma_jfr_state *state)
 {
-    struct udma_u_jfr *jfr = state->jfr;
-    struct udma_u_context *context = jfr->rq.ctx;
+    struct udma_u_jfr *jfr;
+    struct udma_u_context *context;
+
+    if (state == NULL || state->jfr == NULL ||
+        state->owner_context == NULL) {
+        return kvaf_udma_cleanup_invariant_failed();
+    }
+    jfr = state->jfr;
+    context = jfr->rq.ctx;
+    if ((state->spin_initialized || state->index_bitmap_allocated ||
+         state->index_buffer_mapped || state->rq_created ||
+         state->sw_db_allocated || state->sleep_db_allocated ||
+         state->table_inserted) &&
+        (context == NULL ||
+         context != to_udma_u_ctx(state->owner_context))) {
+        return kvaf_udma_cleanup_invariant_failed();
+    }
+    if ((state->kernel_created || state->kernel_delete_pending ||
+         state->event_condition_initialized ||
+         state->event_mutex_initialized) &&
+        jfr->base.urma_ctx != state->owner_context) {
+        return kvaf_udma_cleanup_invariant_failed();
+    }
 
     if (!state->orphan && !state->jfc_flushed) {
         if (jfr->base.jfr_cfg.jfc != NULL) {
@@ -393,10 +536,18 @@ static int kvaf_cleanup_local_jfr_checked(
         return -1;
     }
     if (state->spin_initialized) {
-        if (pthread_spin_destroy(&jfr->lock) != 0) {
-            return -1;
+        const int spin_status = pthread_spin_destroy(&jfr->lock);
+
+        if (spin_status != 0) {
+            return kvaf_udma_pthread_cleanup_failed(spin_status);
         }
         state->spin_initialized = false;
+    }
+    if (kvaf_udma_destroy_event_sync_checked(
+            &jfr->base.event_mutex, &jfr->base.event_cond,
+            &state->event_condition_initialized,
+            &state->event_mutex_initialized) != 0) {
+        return -1;
     }
     return 0;
 }
@@ -406,8 +557,12 @@ int kvaf_udma_source_retry_orphan_jfrs(urma_context_t *context)
     struct kvaf_udma_jfr_state *state;
     struct kvaf_udma_jfr_state *next;
     int result = 0;
+    int saved_errno = 0;
 
-    if (context == NULL || pthread_mutex_lock(&g_kvaf_jfr_lock) != 0) {
+    if (context == NULL) {
+        return kvaf_udma_cleanup_invariant_failed();
+    }
+    if (kvaf_lock_jfr_registry_checked() != 0) {
         return -1;
     }
     for (state = g_kvaf_jfrs; state != NULL; state = next) {
@@ -415,21 +570,29 @@ int kvaf_udma_source_retry_orphan_jfrs(urma_context_t *context)
         if (!state->orphan || state->owner_context != context) {
             continue;
         }
-        if (state->kernel_created &&
-            urma_cmd_delete_jfr(&state->jfr->base) != 0) {
+        if ((state->kernel_created || state->kernel_delete_pending) &&
+            kvaf_delete_kernel_jfr_nonblocking(state) != 0) {
             result = -1;
+            kvaf_udma_preserve_cleanup_errno(&saved_errno);
             continue;
         }
-        state->kernel_created = false;
+        errno = 0;
         if (kvaf_cleanup_local_jfr_checked(state) != 0) {
+            (void)kvaf_udma_classify_cleanup_failure();
             result = -1;
+            kvaf_udma_preserve_cleanup_errno(&saved_errno);
             continue;
         }
         kvaf_remove_jfr_locked(state);
         free(state->jfr);
         free(state);
     }
-    (void)pthread_mutex_unlock(&g_kvaf_jfr_lock);
+    if (kvaf_unlock_jfr_registry_checked() != 0) {
+        return -1;
+    }
+    if (result != 0) {
+        errno = saved_errno == 0 ? EIO : saved_errno;
+    }
     return result;
 }
 
@@ -446,8 +609,12 @@ urma_jfr_t *kvaf_udma_create_jfr_checked(
 
     state = calloc(1, sizeof(*state));
     jfr = calloc(1, sizeof(*jfr));
-    if (state == NULL || jfr == NULL || context == NULL || config == NULL ||
-        pthread_mutex_lock(&g_kvaf_jfr_lock) != 0) {
+    if (state == NULL || jfr == NULL || context == NULL || config == NULL) {
+        free(state);
+        free(jfr);
+        return NULL;
+    }
+    if (kvaf_lock_jfr_registry_checked() != 0) {
         free(state);
         free(jfr);
         return NULL;
@@ -529,27 +696,37 @@ urma_jfr_t *kvaf_udma_create_jfr_checked(
     if (status != 0) {
         goto fail;
     }
+    state->event_condition_initialized = true;
+    state->event_mutex_initialized = true;
     if (kvaf_insert_jfr_table_checked(state) != 0) {
         goto fail;
     }
     state->orphan = false;
     --g_kvaf_jfr_orphan_count;
-    (void)pthread_mutex_unlock(&g_kvaf_jfr_lock);
+    if (kvaf_unlock_jfr_registry_checked() != 0) {
+        /* The caller never received this handle; retain it as an orphan and
+         * let the unsafe latch prevent any new provider session. */
+        state->orphan = true;
+        ++g_kvaf_jfr_orphan_count;
+        return NULL;
+    }
     return &jfr->base;
 
 fail:
-    if (state->kernel_created &&
-        urma_cmd_delete_jfr(&jfr->base) != 0) {
-        (void)pthread_mutex_unlock(&g_kvaf_jfr_lock);
+    if ((state->kernel_created || state->kernel_delete_pending) &&
+        kvaf_delete_kernel_jfr_nonblocking(state) != 0) {
+        (void)kvaf_unlock_jfr_registry_checked();
         return NULL;
     }
-    state->kernel_created = false;
+    errno = 0;
     if (kvaf_cleanup_local_jfr_checked(state) == 0) {
         kvaf_remove_jfr_locked(state);
         free(jfr);
         free(state);
+    } else {
+        (void)kvaf_udma_classify_cleanup_failure();
     }
-    (void)pthread_mutex_unlock(&g_kvaf_jfr_lock);
+    (void)kvaf_unlock_jfr_registry_checked();
     return NULL;
 }
 
@@ -558,32 +735,41 @@ urma_status_t kvaf_udma_delete_jfr_checked(urma_jfr_t *public_jfr)
     struct kvaf_udma_jfr_state *state;
     struct udma_u_jfr *jfr;
 
-    if (public_jfr == NULL ||
-        pthread_mutex_lock(&g_kvaf_jfr_lock) != 0) {
+    if (public_jfr == NULL) {
+        (void)kvaf_udma_cleanup_invariant_failed();
+        return URMA_FAIL;
+    }
+    if (kvaf_lock_jfr_registry_checked() != 0) {
         return URMA_FAIL;
     }
     jfr = to_udma_u_jfr(public_jfr);
     state = kvaf_find_jfr_locked(jfr);
-    if (state == NULL || public_jfr->jfr_cfg.flag.bs.non_blocking ||
+    if (state == NULL || state->owner_context == NULL ||
+        public_jfr->urma_ctx != state->owner_context ||
+        public_jfr->jfr_cfg.flag.bs.non_blocking ||
         jfr->rq.cstm || jfr->idx_que.cstm || jfr->swdb_cstm ||
         jfr->rq.dtu_en || jfr->rq.sq_reserved) {
-        (void)pthread_mutex_unlock(&g_kvaf_jfr_lock);
+        (void)kvaf_udma_cleanup_invariant_failed();
+        (void)kvaf_unlock_jfr_registry_checked();
         return URMA_FAIL;
     }
-    if (state->kernel_created) {
-        if (urma_cmd_delete_jfr(public_jfr) != 0) {
-            (void)pthread_mutex_unlock(&g_kvaf_jfr_lock);
+    if (state->kernel_created || state->kernel_delete_pending) {
+        if (kvaf_delete_kernel_jfr_nonblocking(state) != 0) {
+            (void)kvaf_unlock_jfr_registry_checked();
             return URMA_FAIL;
         }
-        state->kernel_created = false;
     }
+    errno = 0;
     if (kvaf_cleanup_local_jfr_checked(state) != 0) {
+        (void)kvaf_udma_classify_cleanup_failure();
         /* Kernel JFR is gone; retain all remaining local retry handles. */
-        (void)pthread_mutex_unlock(&g_kvaf_jfr_lock);
+        (void)kvaf_unlock_jfr_registry_checked();
         return URMA_FAIL;
     }
     kvaf_remove_jfr_locked(state);
-    (void)pthread_mutex_unlock(&g_kvaf_jfr_lock);
+    if (kvaf_unlock_jfr_registry_checked() != 0) {
+        return URMA_FAIL;
+    }
     free(jfr);
     free(state);
     return URMA_SUCCESS;

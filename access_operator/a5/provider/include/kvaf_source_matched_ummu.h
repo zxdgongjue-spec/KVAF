@@ -83,6 +83,11 @@ int kvaf_source_ummu_get_status(struct kvaf_source_ummu_status *status);
 /* Same-thread causal snapshot for the most recent top-level UMMU operation. */
 int kvaf_source_ummu_get_thread_status(
     struct kvaf_source_ummu_status *status);
+/* Clear only this thread's last-operation diagnostic.  The process-lifetime
+ * cleanup-unknown latch is deliberately untouched.  Source-linked callers
+ * use this immediately before a wrapper that may fail before entering UMMU,
+ * so a stale earlier UMMU result can never authorize a destructive retry. */
+void kvaf_source_ummu_reset_thread_status(void);
 uint32_t kvaf_source_ummu_live_tid_count(void);
 uint32_t kvaf_source_ummu_pending_operation_count(void);
 uint32_t kvaf_source_ummu_retained_mapping_count(void);

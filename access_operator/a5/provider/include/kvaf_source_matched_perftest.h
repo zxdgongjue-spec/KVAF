@@ -109,6 +109,11 @@ enum kvaf_perftest_management_close_status {
   // Every failed public destroy retains the exact handle in the process-local
   // UB context. Calling Close again resumes at that handle.
   KVAF_PERFTEST_MANAGEMENT_CLOSE_RETRYABLE = -1,
+  // The provider still owns at least one management resource, but the last
+  // operation was either non-retryable or could not be disambiguated.  The
+  // caller must retain the owner and quarantine the session; treating this
+  // as EAGAIN would turn a permanent driver/API error into an infinite loop.
+  KVAF_PERFTEST_MANAGEMENT_CLOSE_UNSAFE = -2,
 };
 
 int kvaf_perftest_close_connection(perftest_config_t *cfg);

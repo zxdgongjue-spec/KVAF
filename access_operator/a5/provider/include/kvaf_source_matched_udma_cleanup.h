@@ -1,6 +1,8 @@
 #ifndef KVAF_SOURCE_MATCHED_UDMA_CLEANUP_H
 #define KVAF_SOURCE_MATCHED_UDMA_CLEANUP_H
 
+#include <errno.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -11,6 +13,188 @@
 
 #include "udma_u_buf.h"
 #include "udma_u_db.h"
+#include "urma_api.h"
+#include "kvaf_udma_destroy_policy.h"
+
+/*
+ * Destroy ioctls report how many asynchronous events must be acknowledged
+ * before their userspace objects can be released.  The upstream blocking
+ * helpers wait on a condition variable forever, but the direct AICPU owner
+ * has no background event thread.  Drain a bounded number on the owner
+ * thread instead; a remaining backlog is resumed by the next Close call.
+ *
+ * The caller must keep every referenced object alive until its captured
+ * reported counters equal the corresponding acked counters.
+ */
+#define KVAF_UDMA_ASYNC_DRAIN_BUDGET 32U
+
+static inline bool kvaf_udma_destroy_ioctl_retry_is_proven(
+    int operation_status, int operation_errno)
+{
+    return operation_status == EAGAIN || operation_status == EBUSY ||
+        operation_errno == EAGAIN || operation_errno == EBUSY;
+}
+
+static inline bool kvaf_udma_cleanup_errno_is_retryable(int error_code)
+{
+    return error_code == EAGAIN || error_code == EBUSY;
+}
+
+static inline void kvaf_udma_preserve_cleanup_errno(int *saved_errno)
+{
+    const int error_code = errno == 0 ? EIO : errno;
+
+    if (saved_errno == NULL) {
+        return;
+    }
+    if (*saved_errno == 0 ||
+        (kvaf_udma_cleanup_errno_is_retryable(*saved_errno) &&
+         !kvaf_udma_cleanup_errno_is_retryable(error_code))) {
+        *saved_errno = error_code;
+    }
+}
+
+static inline int kvaf_udma_cleanup_invariant_failed(void)
+{
+    errno = EUCLEAN;
+    kvaf_udma_source_mark_cleanup_unknown();
+    return -1;
+}
+
+static inline int kvaf_udma_pthread_cleanup_failed(int status)
+{
+    if (status == 0) {
+        return 0;
+    }
+    errno = status;
+    /* A local mutex/condition/lock destroy has no device-side event source
+     * that can make EBUSY progress.  Retrying it forever would only consume
+     * the AICPU watchdog budget. */
+    kvaf_udma_source_mark_cleanup_unknown();
+    return -1;
+}
+
+static inline int kvaf_udma_classify_cleanup_failure(void)
+{
+    const int error_code = errno == 0 ? EIO : errno;
+
+    errno = error_code;
+    /* This helper is used only after local mapping/bookkeeping cleanup.  No
+     * asynchronous producer owns those phases, so even EAGAIN/EBUSY is an
+     * invariant failure rather than a resumable device operation. */
+    kvaf_udma_source_mark_cleanup_unknown();
+    return -1;
+}
+
+static inline int kvaf_udma_snapshot_event_counters_checked(
+    pthread_mutex_t *mutex,
+    const uint32_t *comp_events_acked,
+    const uint32_t *async_events_acked,
+    uint32_t *comp_events_out,
+    uint32_t *async_events_out)
+{
+    int status;
+
+    if (mutex == NULL || async_events_acked == NULL ||
+        async_events_out == NULL ||
+        ((comp_events_acked == NULL) != (comp_events_out == NULL))) {
+        return kvaf_udma_cleanup_invariant_failed();
+    }
+    status = pthread_mutex_lock(mutex);
+    if (status != 0) {
+        return kvaf_udma_pthread_cleanup_failed(status);
+    }
+    if (comp_events_out != NULL) {
+        *comp_events_out = *comp_events_acked;
+    }
+    *async_events_out = *async_events_acked;
+    status = pthread_mutex_unlock(mutex);
+    if (status != 0) {
+        return kvaf_udma_pthread_cleanup_failed(status);
+    }
+    return 0;
+}
+
+static inline int kvaf_udma_destroy_event_sync_checked(
+    pthread_mutex_t *mutex, pthread_cond_t *condition,
+    bool *condition_initialized, bool *mutex_initialized)
+{
+    int status;
+
+    if (mutex == NULL || condition == NULL ||
+        condition_initialized == NULL || mutex_initialized == NULL) {
+        return kvaf_udma_cleanup_invariant_failed();
+    }
+    if (*condition_initialized) {
+        status = pthread_cond_destroy(condition);
+        if (status != 0) {
+            return kvaf_udma_pthread_cleanup_failed(status);
+        }
+        *condition_initialized = false;
+    }
+    if (*mutex_initialized) {
+        status = pthread_mutex_destroy(mutex);
+        if (status != 0) {
+            return kvaf_udma_pthread_cleanup_failed(status);
+        }
+        *mutex_initialized = false;
+    }
+    return 0;
+}
+
+static inline int kvaf_udma_drain_async_events_bounded(
+    urma_context_t *context)
+{
+    uint32_t drained;
+
+    if (context == NULL || context->async_fd < 0) {
+        errno = EINVAL;
+        kvaf_udma_source_mark_cleanup_unknown();
+        return -1;
+    }
+    for (drained = 0; drained < KVAF_UDMA_ASYNC_DRAIN_BUDGET;
+         ++drained) {
+        struct pollfd descriptor = {
+            .fd = context->async_fd,
+            .events = POLLIN,
+        };
+        urma_async_event_t event = {0};
+        int poll_status;
+        int poll_errno;
+        enum kvaf_udma_async_poll_decision decision;
+
+        errno = 0;
+        poll_status = poll(&descriptor, 1, 0);
+        poll_errno = errno;
+        decision = kvaf_udma_async_poll_decide(
+            poll_status, descriptor.revents, poll_errno);
+        if (decision == KVAF_UDMA_ASYNC_POLL_IDLE) {
+            return 0;
+        }
+        if (decision == KVAF_UDMA_ASYNC_POLL_RETRY_LATER) {
+            errno = EAGAIN;
+            return 0;
+        }
+        if (decision != KVAF_UDMA_ASYNC_POLL_READ_ONE) {
+            errno = poll_errno == 0 ? EIO : poll_errno;
+            kvaf_udma_source_mark_cleanup_unknown();
+            return -1;
+        }
+        errno = 0;
+        if (urma_get_async_event(context, &event) != URMA_SUCCESS) {
+            if (errno == EAGAIN) {
+                return 0;
+            }
+            if (errno == 0) {
+                errno = EIO;
+            }
+            kvaf_udma_source_mark_cleanup_unknown();
+            return -1;
+        }
+        urma_ack_async_event(&event);
+    }
+    return 0;
+}
 
 static inline int kvaf_udma_checked_alloc_hugepage_queue(
     struct udma_u_jetty_queue *queue)

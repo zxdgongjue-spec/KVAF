@@ -132,11 +132,53 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
             "eid_idx != expected_eid_index",
             "kvaf_deadline_urma_poll_jfc",
             "kvaf_udma_source_retry_orphan_cleanup(ctx->urma_ctx)",
-            "KVAF_UB_DESTROY(ctx->pair.tjetty, urma_unimport_jetty)",
-            "KVAF_UB_DESTROY(ctx->urma_ctx, urma_delete_context)",
+            "kvaf_ub_quiesce_management_jetty(ctx)",
+            "kvaf_ub_quiesce_management_jfr(ctx)",
+            "kvaf_ub_drain_management_jfc(ctx)",
+            "kvaf_tracking_urma_post_jetty_send_wr",
+            "kvaf_ub_account_management_completions",
+            "kvaf_ub_send_tracker_close_is_quiesced(",
+            "kvaf_ub_send_tracker_require_flush_barrier(",
+            "#define KVAF_UB_CLOSE_DRAIN_BATCH 1",
+            "URMA_CR_WR_FLUSH_ERR_DONE",
+            "kvaf_udma_source_cleanup_is_unknown() != 0",
+            "kvaf_source_ummu_cleanup_is_unknown() != 0",
+            "kvaf_source_ummu_reset_thread_status()",
+            "KVAF_UB_DESTROY_STEP(KVAF_UB_CLOSE_UNIMPORT_TJETTY,",
+            "KVAF_UB_DESTROY_STEP(KVAF_UB_CLOSE_DELETE_CONTEXT,",
             "KVAF_PERFTEST_MANAGEMENT_CLOSE_RETRYABLE",
+            "KVAF_PERFTEST_MANAGEMENT_CLOSE_UNSAFE",
+            '"KVAF_URMA_MGMT_CLOSE_ERROR stage=%s status=%d errno=%d "',
         ):
             self.assertIn(expected, communication)
+        self.assertNotIn(
+            "kvaf_source_cleanup_state_is_unknown()", communication
+        )
+        self.assertNotIn(
+            "operation_status == EINTR || operation_errno == EINTR",
+            communication,
+        )
+        self.assertNotIn("completion->flag.bs.flush_err_done", communication)
+        self.assertIn("current != NULL && current != stop", communication)
+        self.assertIn("if (current != stop)", communication)
+        self.assertIn(
+            "KVAF_UB_MANAGEMENT_SEND_WR_SCAN_LIMIT", communication
+        )
+        self.assertIn(
+            "kvaf_ub_send_tracker_mark_post_unknown(", communication
+        )
+        jetty_create = communication.index(
+            "ctx->pair.jetty = urma_create_jetty("
+        )
+        jetty_null_check = communication.index(
+            "if (ctx->pair.jetty == NULL)", jetty_create
+        )
+        barrier_required = communication.index(
+            "kvaf_ub_send_tracker_require_flush_barrier(",
+            jetty_null_check,
+        )
+        self.assertLess(jetty_create, jetty_null_check)
+        self.assertLess(jetty_null_check, barrier_required)
         self.assertLess(
             communication.index("g_kvaf_ub_server_recv_posts == 2U"),
             communication.index(
@@ -302,26 +344,29 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
             "KVAF_URMA_TOKEN_ERROR management_stage=%s",
             communication,
         )
-        handshake_segment = communication.index(
-            "KVAF_UB_DESTROY(ctx->tseg_recv_hs, urma_unregister_seg)"
+        close = communication[communication.index(
+            "static int kvaf_ub_close_connection_checked(void)"
+        ):]
+        handshake_segment = close.index(
+            "ctx->tseg_recv_hs, urma_unregister_seg"
         )
-        handshake_token = communication.index(
+        handshake_token = close.index(
             "g_kvaf_ub_management_tokens[KVAF_UB_MANAGEMENT_HANDSHAKE]",
             handshake_segment,
         )
-        receive_segment = communication.index(
-            "KVAF_UB_DESTROY(ctx->tseg_recv, urma_unregister_seg)",
+        receive_segment = close.index(
+            "ctx->tseg_recv, urma_unregister_seg",
             handshake_token,
         )
-        receive_token = communication.index(
+        receive_token = close.index(
             "g_kvaf_ub_management_tokens[KVAF_UB_MANAGEMENT_RECEIVE]",
             receive_segment,
         )
-        send_segment = communication.index(
-            "KVAF_UB_DESTROY(ctx->tseg_send, urma_unregister_seg)",
+        send_segment = close.index(
+            "ctx->tseg_send, urma_unregister_seg",
             receive_token,
         )
-        send_token = communication.index(
+        send_token = close.index(
             "g_kvaf_ub_management_tokens[KVAF_UB_MANAGEMENT_SEND]",
             send_segment,
         )
@@ -539,29 +584,40 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
         )
         self.assertLess(null_header, scan_stub)
 
-    def test_jetty_delete_is_retryable_for_direct_rm_nonshared_path(self):
+    def test_jetty_delete_is_single_shot_and_event_ack_resumable(self):
         source = self.read(
             "access_operator/a5/provider/source_matched_udma_jetty.c"
         )
-        command = source.index("status = urma_cmd_delete_jetty(public_jetty);")
-        restore = source.index(
-            "public_jetty->jetty_cfg.jfr_cfg = original_jfr_cfg;",
-            command,
+        command = source.index("status = urma_ioctl_delete_jetty(")
+        issued = source.index(
+            "state->kernel_delete_pending = true;", command
+        )
+        wait = source.index(
+            "kvaf_udma_drain_async_events_bounded(", issued
         )
         local_cleanup = source.index(
-            "kvaf_cleanup_local_jetty_checked(state)", restore
+            "kvaf_cleanup_local_jetty_checked(state)", wait
         )
         free_local = source.index("kvaf_free_local_jetty(state)", local_cleanup)
-        self.assertLess(command, restore)
-        self.assertLess(restore, local_cleanup)
+        self.assertLess(command, issued)
+        self.assertLess(issued, wait)
         self.assertLess(local_cleanup, free_local)
-        self.assertIn("command_jfr_cfg", source)
+        self.assertIn("bool kernel_delete_pending;", source)
+        self.assertIn("delete_async_events_reported", source)
+        self.assertIn("kvaf_udma_destroy_decide(", source)
+        self.assertIn(
+            "decision == KVAF_UDMA_DESTROY_ISSUE_IOCTL", source
+        )
+        self.assertNotIn("urma_cmd_delete_jetty(", source)
         self.assertIn("URMA_NO_SHARE_JFR", source)
         self.assertIn("sq->trans_mode == URMA_TM_RC", source)
         delete = source[source.index(
             "urma_status_t kvaf_udma_delete_jetty_checked("
         ):]
-        self.assertIn("if (state->kernel_created)", delete)
+        self.assertIn(
+            "state->kernel_created || state->kernel_delete_pending",
+            delete,
+        )
         self.assertNotIn("udma_u_free_jetty(public_jetty)", delete)
 
     def test_direct_jetty_creation_does_not_use_broken_legacy_union_path(self):
@@ -580,7 +636,7 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
         self.assertIn("jetty->jfr = shared_jfr", create)
         self.assertIn("cfg->shared.jfr", create)
         self.assertIn("kvaf_create_direct_jetty_command", create)
-        self.assertIn("kvaf_delete_kernel_jetty_preserve_cfg", create)
+        self.assertIn("kvaf_delete_kernel_jetty_nonblocking", create)
 
     def test_segment_and_token_retain_state_on_ummu_failure(self):
         segment = self.read(
@@ -742,6 +798,124 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
         self.assertIn("state->kernel_context_created = false;", retry)
         self.assertNotIn("free(state)", retry)
 
+    def test_local_cleanup_ebusy_is_unsafe_not_watchdog_retry(self):
+        cleanup = self.read(
+            "access_operator/a5/provider/include/"
+            "kvaf_source_matched_udma_cleanup.h"
+        )
+        ops = self.read(
+            "access_operator/a5/provider/source_matched_udma_ops.c"
+        )
+
+        pthread_start = cleanup.index(
+            "static inline int kvaf_udma_pthread_cleanup_failed("
+        )
+        pthread_end = cleanup.index(
+            "static inline int kvaf_udma_classify_cleanup_failure(",
+            pthread_start,
+        )
+        pthread_body = cleanup[pthread_start:pthread_end]
+        self.assertIn("kvaf_udma_source_mark_cleanup_unknown();", pthread_body)
+        self.assertNotIn(
+            "!kvaf_udma_cleanup_errno_is_retryable", pthread_body
+        )
+
+        classify_start = pthread_end
+        classify_end = cleanup.index(
+            "static inline int kvaf_udma_snapshot_event_counters_checked(",
+            classify_start,
+        )
+        classify_body = cleanup[classify_start:classify_end]
+        self.assertIn(
+            "kvaf_udma_source_mark_cleanup_unknown();", classify_body
+        )
+        self.assertIn("kvaf_udma_cleanup_invariant_failed()", ops)
+
+    def test_direct_destroy_local_invariants_fail_closed(self):
+        for kind, public_type, orphan_name in (
+            ("jetty", "urma_jetty_t", "jetties"),
+            ("jfr", "urma_jfr_t", "jfrs"),
+            ("jfc", "urma_jfc_t", "jfcs"),
+        ):
+            source = self.read(
+                f"access_operator/a5/provider/source_matched_udma_{kind}.c"
+            )
+            lock_name = f"kvaf_lock_{kind}_registry_checked"
+            unlock_name = f"kvaf_unlock_{kind}_registry_checked"
+
+            lock_start = source.index(f"static int {lock_name}(void)")
+            unlock_start = source.index(
+                f"static int {unlock_name}(void)", lock_start
+            )
+            kernel_start = source.index(
+                f"static int kvaf_delete_kernel_{kind}_nonblocking("
+            )
+            kernel_end = source.index("\n}\n", kernel_start) + 3
+            kernel = source[kernel_start:kernel_end]
+            delete_start = source.index(
+                f"urma_status_t kvaf_udma_delete_{kind}_checked("
+                f"{public_type} *public_{kind})"
+            )
+            delete_end = source.index("\n}\n", delete_start) + 3
+            delete = source[delete_start:delete_end]
+            create_start = source.index(
+                f"kvaf_udma_create_{kind}_checked("
+            )
+            create = source[create_start:delete_start]
+            orphan_start = source.index(
+                f"int kvaf_udma_source_retry_orphan_{orphan_name}("
+            )
+            orphan_end = source.index("\n}\n", orphan_start) + 3
+            orphan = source[orphan_start:orphan_end]
+
+            self.assertIn(
+                "kvaf_udma_pthread_cleanup_failed(status)",
+                source[lock_start:kernel_start],
+            )
+            self.assertIn("state->owner_context == NULL", kernel)
+            self.assertIn(
+                f"{kind}->urma_ctx != state->owner_context", kernel
+            )
+            self.assertIn(f"{kind}->urma_ctx->dev_fd < 0", kernel)
+            self.assertIn(
+                "return kvaf_udma_cleanup_invariant_failed();", kernel
+            )
+            self.assertIn(
+                "if (!kvaf_udma_destroy_ioctl_retry_is_proven(", kernel
+            )
+
+            for cleanup_path in (delete, orphan):
+                self.assertIn(f"{lock_name}()", cleanup_path)
+                self.assertIn(f"{unlock_name}()", cleanup_path)
+                self.assertIn(
+                    "kvaf_udma_cleanup_invariant_failed()", cleanup_path
+                )
+                self.assertNotIn(
+                    f"pthread_mutex_lock(&g_kvaf_{kind}_lock)",
+                    cleanup_path,
+                )
+                self.assertNotIn(
+                    f"pthread_mutex_unlock(&g_kvaf_{kind}_lock)",
+                    cleanup_path,
+                )
+
+            create_unlock = create.index(
+                f"if ({unlock_name}() != 0)"
+            )
+            create_unlock_failure = create[create_unlock:]
+            self.assertIn(f"{lock_name}()", create)
+            self.assertIn("state->orphan = true;", create_unlock_failure)
+            self.assertIn(
+                f"++g_kvaf_{kind}_orphan_count;", create_unlock_failure
+            )
+            self.assertIn("return NULL;", create_unlock_failure)
+            self.assertNotIn(
+                f"pthread_mutex_lock(&g_kvaf_{kind}_lock)", create
+            )
+            self.assertNotIn(
+                f"pthread_mutex_unlock(&g_kvaf_{kind}_lock)", create
+            )
+
     def test_userspace_mappings_have_checked_retry_phases(self):
         cleanup = self.read(
             "access_operator/a5/provider/include/"
@@ -877,9 +1051,6 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
             self.assertIn(
                 "kvaf_udma_source_mark_cleanup_unknown();", helper_body
             )
-            self.assertEqual(
-                source.count("kvaf_udma_source_mark_cleanup_unknown();"), 1
-            )
 
         no_live = provider[provider.index(
             "static bool kvaf_udma_source_has_no_live_resources(void)"
@@ -893,6 +1064,52 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
         self.assertIn("kvaf_source_cleanup_state_is_unknown()", close_retry)
         self.assertIn("KVAF_URMA_PROVIDER_CLOSE_UNSAFE", close_retry)
         self.assertIn("KVAF_URMA_PROVIDER_CLOSE_RETRYABLE", close_retry)
+
+    def test_kernel_destroy_event_waits_never_use_blocking_umdk_helpers(self):
+        cleanup = self.read(
+            "access_operator/a5/provider/include/"
+            "kvaf_source_matched_udma_cleanup.h"
+        )
+        self.assertIn("poll(&descriptor, 1, 0)", cleanup)
+        self.assertIn("KVAF_UDMA_ASYNC_DRAIN_BUDGET", cleanup)
+        self.assertIn("urma_get_async_event(context, &event)", cleanup)
+        self.assertIn("urma_ack_async_event(&event)", cleanup)
+
+        for kind in ("jetty", "jfr", "jfc"):
+            source = self.read(
+                f"access_operator/a5/provider/source_matched_udma_{kind}.c"
+            )
+            self.assertIn("bool kernel_delete_pending;", source)
+            self.assertIn(f"urma_ioctl_delete_{kind}(", source)
+            self.assertNotIn(f"urma_cmd_delete_{kind}(", source)
+            self.assertIn("kvaf_udma_destroy_decide(", source)
+            self.assertIn(
+                "decision == KVAF_UDMA_DESTROY_ISSUE_IOCTL", source
+            )
+            self.assertIn(
+                "kvaf_udma_destroy_ioctl_retry_is_proven(", source
+            )
+            self.assertIn(
+                "kvaf_udma_drain_async_events_bounded(", source
+            )
+            self.assertIn("bool event_condition_initialized;", source)
+            self.assertIn("bool event_mutex_initialized;", source)
+            self.assertIn("kvaf_udma_destroy_event_sync_checked(", source)
+            self.assertIn(
+                "kvaf_udma_snapshot_event_counters_checked(", source
+            )
+
+        jetty = self.read(
+            "access_operator/a5/provider/source_matched_udma_jetty.c"
+        )
+        command = jetty.index("status = kvaf_create_direct_jetty_command(")
+        created_guard = jetty.index("if (state->kernel_created)", command)
+        failure_guard = jetty.index("if (status != 0)", command)
+        self.assertLess(created_guard, failure_guard)
+        self.assertIn(
+            "state->event_condition_initialized = true;",
+            jetty[created_guard:failure_guard],
+        )
 
     def test_checked_jfr_and_shared_jetty_are_the_only_direct_paths(self):
         cmake = self.read("access_operator/a5/provider/CMakeLists.txt")

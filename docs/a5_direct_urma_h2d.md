@@ -491,6 +491,45 @@ process-local 状态。Host 侧冻结新提交后，关闭命令与此前的 Bat
 同一 control/data stream；stream FIFO 与同步结果才是关闭前 drain 的顺序证明。
 GM 中的四个软件计数是额外的一致性证据，不是硬件 PI/CI 的替代品。
 
+目标 CANN 9.1/driver 现场已经证明 `rtAicpuArgsEx_t.timeout=0` **没有建立无限
+执行契约**：一次停留在 `OPENING` 的 owner 在约 1091 秒后仍被 runtime 以
+`KERNEL_AICPU task timeout` 终止。1091 秒只是一次观测，不是稳定 SLA，也不应推断
+该字段与平台 watchdog 的确切关系。Device Open 等待现在每秒输出
+`KVAF_A5_AICPU_OWNER_PROGRESS`，记录 Host observer elapsed、AIV snapshot、owner
+state/result、provider status/flags、身份有效位和 open result，便于区分未进入、
+停在 `OPENING`、清理中和安全终态；这个可观测性修复本身不授予强杀或重新接管权限。
+
+UB 管理连接失败的 Close 使用持久 phase cursor：先将管理 Jetty 与 shared JFR
+切换到 `ERROR`，排空 JFC，然后才 unimport/delete Jetty、delete JFR、注销三个
+Segment/Token、删除 JFC/context。管理 SEND 逐条计数；已知未完成 SEND 必须收到其
+终态 CQE，提交结果不明时必须收到 `WR_FLUSH_ERR_DONE` barrier，不能把一次空 poll
+误当成 SQ 已静默。每个失败都记录
+`KVAF_URMA_MGMT_CLOSE_ERROR stage/status/errno/query_status/query_errno`。控制状态转换和
+poll 只重试明确的 `EAGAIN/EBUSY/EINTR`；破坏性调用不因 `EINTR` 重放，Segment/Token
+只有本次 UMMU 诊断明确给出 `RETRY_SAFE` 才额外允许重试。其他错误进入 UNSAFE，
+不再被统一改写为 EAGAIN 无限循环。
+
+接收侧也不能因一次空 CQ poll 就释放：即使 Server 尚未发送任何管理 SEND，两个
+已投递 RECV 仍可能由硬件持有。Close 必须先观察到 Jetty/JFR 进入 ERROR 后产生的
+`WR_FLUSH_ERR_DONE`，再观察一次空 CQ，才允许注销接收 Segment/Token。这个 flush
+barrier 同时覆盖 recv-only 握手超时和正常收发后的关闭路径。只有成功返回了管理
+Jetty 才启用这个要求；若 Open 在创建 Jetty 前失败，尚无任何管理 WQE 能被提交，
+也不可能产生 send-side barrier，此时空 CQ 可以推进 partial-create 回滚。
+
+Jetty/JFR/JFC 的内核 delete ioctl 每个对象只发一次；返回的 async/comp event
+计数保存在 sidecar 中，随后以非阻塞 poll/ack 逐次收敛。只有 reported 与 acked
+完全一致后才销毁 event condition/mutex 和队列映射。这样 Close 重入只继续清理事件
+债务，不会再次发出已经可能生效的破坏性 ioctl。NPU2 风险验证的默认控制/总监督
+超时分别收紧为 60/120 秒；总监督超时只控制 runner 何时返回诊断，不能撤销已经
+提交的 AICPU owner。
+
+只有具有明确内核/事件进度源的 `EAGAIN/EBUSY` 才能留待下一轮 Close。pthread
+同步原语销毁失败、本地对象表仍有 live entry、链表或映射不变量破坏都没有后台进度
+来源，必须锁存为 `cleanup_unknown/UNSAFE`，不能靠无限重试拖到 watchdog。UMMU 的
+TABLE 存储与 queue mapping 分别记录释放 phase；因此 table 已释放而后续 queue
+`munmap` 暂时失败时，重入只继续 queue 阶段，不会重放 `FREE_TID` 或把已完成的 table
+释放误判成永久 `EBUSY`。
+
 生产 runner 继续默认 fail closed；只有显式的
 `run_a5_direct_urma_epoch_owner_validation.sh` 才能执行候选真机验证。候选 owner
 解决了 split Open/Close 的所有权缺口，但普通 KFC worker 是否允许跨整个模型

@@ -141,6 +141,13 @@ AIV 直接操作 SQ/CQ。POC 中保持一个 owner 是绕开 HCOMM 后保住 pro
 AICPU service/daemon；如果没有这种能力，需要评估基于目标 TGID 建队列的 Host
 控制面或回到受支持的资源服务，而不是无限占用通用 worker。
 
+当前 CANN 9.1/driver 组合已给出反例：资源 owner 即使以
+`rtAicpuArgsEx_t.timeout=0` 启动，仍在一次运行约 1091 秒后收到
+`KERNEL_AICPU task timeout`。该观测不是稳定 SLA，但足以证明 0 没有建立无限执行
+契约。所以普通 KFC invocation 只能承载远短于有效 watchdog、能够合作式
+drain/Close 的验证 epoch；它不能覆盖长期 decode 服务。缩短 runner 的 supervision
+timeout 只会更早返回诊断结果，不会取消 owner，也不构成恢复机制。
+
 资源 owner 的 lease 也不能粗暴超时退出。若没有收到带 queue-drain 证明的
 `SHUTDOWN_QUIESCED`，超时强杀会再次丢失 UDMA/UMMU 所有权。候选 owner 将 lease
 到期视为诊断/故障状态，并继续保留资源；只有合作式 shutdown 或硬件 reset/隔离
