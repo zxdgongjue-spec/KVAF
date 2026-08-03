@@ -254,6 +254,36 @@ kvaf_try_function_graph()
 kvaf_try_function_filter()
 {
   local filter_file=${kvaf_trace_instance_dir}/set_ftrace_filter
+  local -a filter_candidate_roots=(
+    uburma_cmd_create_jfr
+    uburma_tlv_parse
+    uobj_alloc_begin
+    uobj_lookup_get
+    ubcore_create_jfr
+    ubcore_eid_valid
+    ubcore_check_jfr_cfg
+    udma_create_jfr
+    udma_verify_jfr_param
+    udma_alloc_jfr_id
+    udma_get_jfr_buf
+    udma_get_u_jfr_buf
+    pin_queue_addr
+    unpin_queue_addr
+    udma_umem_get
+    udma_verify_input
+    udma_get_target_umem
+    udma_pin_all_pages
+    udma_pin_pages
+    pin_user_pages_fast
+    internal_get_user_pages_fast
+    gup_fast_fallback
+    udma_pin_sw_db
+    udma_hw_init_jfrc
+    udma_alloc_cmd_mailbox
+    udma_post_mbox
+    ubase_hw_upgrade_ctx_ex
+  )
+  local filter_output=
   local -a filter_symbols=()
 
   if [[ ! -r "${kvaf_available_tracers}" ]] ||
@@ -269,37 +299,18 @@ kvaf_try_function_filter()
   # read-only in non-top-level trace arrays.  Select a fixed CREATE_JFR branch
   # rather than every UB/UDMA function.  The old per-symbol family loop could
   # rebuild ftrace's dynamic table thousands of times before printing output.
-  # One awk pass resolves available compiler-suffixed symbols, and one tee
-  # transaction installs at most 32 exact functions.
-  mapfile -t filter_symbols < <(
-    awk '
-      BEGIN {
-        split("uburma_cmd_create_jfr uburma_tlv_parse uobj_alloc "
-              "uobj_get_read ubcore_create_jfr ubcore_eid_valid "
-              "ubcore_check_jfr_cfg udma_create_jfr "
-              "udma_verify_jfr_param udma_alloc_jfr_id "
-              "udma_get_jfr_buf udma_get_u_jfr_buf pin_queue_addr "
-              "unpin_queue_addr udma_umem_get udma_verify_input "
-              "udma_get_target_umem udma_pin_all_pages "
-              "udma_pin_pages pin_user_pages_fast "
-              "internal_get_user_pages_fast gup_fast_fallback "
-              "udma_pin_sw_db udma_hw_init_jfrc "
-              "udma_alloc_cmd_mailbox udma_post_mbox "
-              "ubase_hw_upgrade_ctx_ex", wanted, " ")
-        for (index in wanted) {
-          selected[wanted[index]] = 1
-        }
-      }
-      {
-        symbol = $1
-        base = symbol
-        sub(/\..*$/, "", base)
-        if (selected[base] && !seen[symbol]++) {
-          print symbol
-        }
-      }
-    ' "${kvaf_tracefs}/available_filter_functions"
-  )
+  # One POSIX-awk pass resolves available compiler-suffixed symbols, and one
+  # tee transaction installs at most 32 exact functions.  Keep the candidate
+  # list in Bash: unlike C and Bash, awk does not concatenate adjacent string
+  # literals split across source lines.
+  if ! filter_output=$(awk -v candidates="${filter_candidate_roots[*]}" \
+       -f "${SCRIPT_DIR}/a5_create_jfr_trace_filter.awk" \
+       "${kvaf_tracefs}/available_filter_functions"); then
+    echo "ERROR: CREATE_JFR trace symbol selection failed" >&2
+    return 1
+  fi
+  [[ -n "${filter_output}" ]] || return 1
+  mapfile -t filter_symbols <<<"${filter_output}"
   if (( ${#filter_symbols[@]} == 0 || ${#filter_symbols[@]} > 32 )); then
     return 1
   fi

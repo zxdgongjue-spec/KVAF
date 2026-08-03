@@ -1080,7 +1080,8 @@ UDMA 校验、RQ/index/DB pin 到 mailbox 的固定分支，最多 32 个实际�
 时才降级为普通 `function` tracer。脚本从入口、
 tracer 选择到 fallback 安装都会输出 `KVAF_JFR_TRACE_PREFLIGHT stage=...`，因此 tracefs
 配置不会再表现为无输出的硬件卡死。fallback 仍保留有序调用路径和直接 caller，但不
-声称具有完整嵌套/返回值。两种模式都不修改
+声称具有完整嵌套/返回值。候选表由 Bash 数组传给独立 POSIX `awk` 过滤程序；测试会
+实际调用系统 `awk` 解析该程序，避免只做源码文本断言而漏掉运行时方言错误。两种模式都不修改
 top-level/global tracer；仅当两种 instance-local 过滤方式均不可用时才在硬件前退出。
 脚本同时用
 `journalctl` cursor（不可用时退化为只读 `dmesg`）保存同时间段内核日志。若 tracefs

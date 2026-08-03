@@ -15,6 +15,7 @@ COORDINATOR = (
     ROOT / "scripts" / "prepare_and_run_a5_direct_urma_npu2_clean.sh"
 )
 TRACE = ROOT / "scripts" / "trace_a5_direct_urma_npu2_jfr_failure.sh"
+TRACE_FILTER = ROOT / "scripts" / "a5_create_jfr_trace_filter.awk"
 
 
 class Npu2CleanValidationTests(unittest.TestCase):
@@ -118,8 +119,14 @@ class Npu2CleanValidationTests(unittest.TestCase):
             "KVAF_JFR_TRACE_PREFLIGHT stage=entry",
             "KVAF_JFR_TRACE_PREFLIGHT stage=select-tracer",
             "KVAF_JFR_TRACE_PREFLIGHT stage=function-filter-install",
-            "uburma_cmd_create_jfr uburma_tlv_parse uobj_alloc",
-            "internal_get_user_pages_fast gup_fast_fallback",
+            "filter_candidate_roots=(",
+            "uburma_cmd_create_jfr",
+            "uburma_tlv_parse",
+            "uobj_alloc_begin",
+            "uobj_lookup_get",
+            "internal_get_user_pages_fast",
+            "gup_fast_fallback",
+            "a5_create_jfr_trace_filter.awk",
             "${#filter_symbols[@]} > 32",
             "function-graph-filter",
             "kvaf_trace_mode=function-filter",
@@ -139,6 +146,45 @@ class Npu2CleanValidationTests(unittest.TestCase):
         )
         self.assertNotIn("while read -r filter_symbol", trace)
         self.assertNotIn("available_filter_functions\"; do", trace)
+
+    def test_trace_filter_program_runs_with_system_awk(self) -> None:
+        awk = shutil.which("awk")
+        if awk is None:
+            self.skipTest("awk is unavailable")
+
+        result = subprocess.run(
+            [
+                awk,
+                "-v",
+                (
+                    "candidates=uburma_cmd_create_jfr uobj_alloc_begin "
+                    "uobj_lookup_get udma_create_jfr"
+                ),
+                "-f",
+                str(TRACE_FILTER),
+            ],
+            input=(
+                "unrelated_symbol\n"
+                "uburma_cmd_create_jfr\n"
+                "uobj_alloc_begin\n"
+                "uobj_lookup_get.constprop.0 [uburma]\n"
+                "udma_create_jfr.isra.7 [udma]\n"
+                "udma_create_jfr.constprop.9 [udma]\n"
+            ),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [
+                "uburma_cmd_create_jfr",
+                "uobj_alloc_begin",
+                "uobj_lookup_get.constprop.0",
+                "udma_create_jfr.isra.7",
+            ],
+        )
 
     def run_preflight(self, **updates: str) -> subprocess.CompletedProcess[str]:
         bash = shutil.which("bash")
