@@ -126,16 +126,16 @@ timeout 240s python3 tests/python/test_npu_batch_get.py
 
 图对象、capture、replay 和销毁都由 `torch_npu` 持有；KVAF 不创建或保存图。脚本
 先在图外 eager 执行 `output A -> B -> A`，使 A 的 local HBM 注册进入 transport
-cache；再在 `torch.npu.graph(...)` 中 capture 固定地址的 `indices.copy_`、
-`output_indices.copy_`、`output.zero_`、`runtime.batch_get(..., stream,
-synchronize=False)` 和一个后续 PyTorch copy。每次 replay 前，脚本先在同一个
-capture stream 上把已经准备好的固定 NPU staging tensor 拷贝到固定 source tensor，
-再调用 `graph.replay()`；这是 demo 已验证的 producer -> replay 顺序，不能改成裸
-replay。图性能指标 `external_graph_input_copy_to_stream_completion` 包含这两次输入
-NPU-to-NPU copy、整张外部图 replay 与 capture stream 同步；不包含 Python 构造 Host 输入、
-capture、初始化和最终验证，因此不能与 eager 指标直接作一一对比。
-staging 准备与 capture stream 之间使用 `wait_stream` 建立事件依赖，不在 capture
-结束后做全设备 `torch.npu.synchronize()`。
+cache；再在 `torch.npu.graph(...)` 中只 capture
+`runtime.batch_get(..., stream, synchronize=False)`。每次 replay 前，脚本在同一条
+capture stream 上将 Host staging 数据拷贝到既有的 caller-owned `indices` 和
+`output_indices` tensor，再调用 `graph.replay()`。这与 AIV demo 的
+`aclrtMemcpyAsync(fixed_device_inputs, stream) -> aclmdlRIExecuteAsync(graph, stream)`
+完全同构：不创建额外 NPU staging/source tensor，也不引入跨 stream 依赖。
+
+图性能指标 `external_graph_input_copy_to_stream_completion` 包含两次 H2D 输入更新、
+整张外部图 replay 与 capture stream 同步；不包含 Python 构造 Host 输入、capture、
+初始化和最终验证，因此不能与 eager 指标直接作一一对比。
 
 `torch_npu.NPUGraph.replay()` 会在调用时的 **current stream** 上提交 replay，
 不会自动切回 capture 时传入的 stream。因此测试会显式进入 `capture_stream` 后再调用

@@ -392,49 +392,18 @@ def main() -> int:
                 "fixed_tensor_addresses=1 "
                 "external_graph_owner=torch_npu "
                 "dynamic_tensor_contents=indices_output_indices "
-                "producer_stream=capture_stream "
+                "input_update=host_to_device_same_stream "
+                "captured_ops=runtime_batch_get "
                 f"functional_replays={graph_replays} "
                 f"perf_warmup={graph_warmup} perf_samples={graph_iterations}"
             )
 
-            graph_input_bytes = requests * torch.tensor(
-                [], dtype=torch.int32
-            ).element_size()
-            print(
-                "RUNTIME_NPU_GRAPH_ALLOCATION_BEGIN "
-                f"item=indices_source bytes={graph_input_bytes}"
-            )
-            graph_indices_source = torch.empty(
-                requests, dtype=torch.int32, device=device
-            )
-            print("RUNTIME_NPU_GRAPH_ALLOCATION_DONE item=indices_source")
-            print(
-                "RUNTIME_NPU_GRAPH_ALLOCATION_BEGIN "
-                f"item=output_indices_source bytes={graph_input_bytes}"
-            )
-            graph_output_indices_source = torch.empty(
-                requests, dtype=torch.int32, device=device
-            )
-            print("RUNTIME_NPU_GRAPH_ALLOCATION_DONE item=output_indices_source")
-            print(
-                "RUNTIME_NPU_GRAPH_ALLOCATION_BEGIN "
-                f"item=indices_staging bytes={graph_input_bytes}"
-            )
-            graph_indices_staging = torch.empty(
-                requests, dtype=torch.int32, device=device
-            )
-            print("RUNTIME_NPU_GRAPH_ALLOCATION_DONE item=indices_staging")
-            print(
-                "RUNTIME_NPU_GRAPH_ALLOCATION_BEGIN "
-                f"item=output_indices_staging bytes={graph_input_bytes}"
-            )
-            graph_output_indices_staging = torch.empty(
-                requests, dtype=torch.int32, device=device
-            )
-            print("RUNTIME_NPU_GRAPH_ALLOCATION_DONE item=output_indices_staging")
-            print("RUNTIME_NPU_GRAPH_ALLOCATION_BEGIN item=post_marker bytes=1")
-            graph_post_marker = torch.zeros(1, dtype=torch.uint8, device=device)
-            print("RUNTIME_NPU_GRAPH_ALLOCATION_DONE item=post_marker")
+            # Match the proven C++ demo graph boundary: inputs are written to
+            # the fixed caller-owned device tensors before replay; capture
+            # contains only the BatchGet launch.  Do not introduce separate
+            # NPU source/staging tensors or cross-stream dependencies here.
+            graph_indices_host = torch.empty(requests, dtype=torch.int32)
+            graph_output_indices_host = torch.empty(requests, dtype=torch.int32)
 
             def prepare_graph_inputs(
                 epoch: int, trace: str | None = None
@@ -450,21 +419,16 @@ def main() -> int:
                 graph_output_indices = [
                     (row + epoch) % output_rows for row in output_indices_values
                 ]
-                # The normal caller stream prepares a fixed NPU staging
-                # buffer. This work is intentionally outside graph timing.
-                with torch.npu.stream(caller_stream):
-                    graph_indices_staging.copy_(
-                        torch.tensor(
-                            graph_indices, dtype=torch.int32, device=device
-                        )
-                    )
-                    if trace is not None:
-                        print(f"RUNTIME_NPU_GRAPH_STAGE_INDICES_DONE replay={trace}")
-                    graph_output_indices_staging.copy_(
-                        torch.tensor(
-                            graph_output_indices, dtype=torch.int32, device=device
-                        )
-                    )
+                # Keep the Host source buffers alive until the associated
+                # capture stream completes its H2D updates.
+                graph_indices_host.copy_(
+                    torch.tensor(graph_indices, dtype=torch.int32)
+                )
+                if trace is not None:
+                    print(f"RUNTIME_NPU_GRAPH_STAGE_INDICES_DONE replay={trace}")
+                graph_output_indices_host.copy_(
+                    torch.tensor(graph_output_indices, dtype=torch.int32)
+                )
                 if trace is not None:
                     print(f"RUNTIME_NPU_GRAPH_STAGE_OUTPUT_INDICES_DONE replay={trace}")
                 return graph_payload_slots, graph_output_indices
@@ -472,40 +436,31 @@ def main() -> int:
             def enqueue_graph_input_update(
                 stream: object, trace: str | None = None
             ) -> None:
-                # This is deliberately outside the captured graph and uses
-                # the graph's stream. The demo has verified this producer ->
-                # replay ordering; a naked aclmdlRI graph replay can stall.
+                # Equivalent to the demo's aclrtMemcpyAsync calls: update
+                # fixed caller tensors then replay on this exact same stream.
                 if trace is not None:
                     print(f"RUNTIME_NPU_GRAPH_INPUT_STREAM_ENTER replay={trace}")
-                if stream != caller_stream:
-                    stream.wait_stream(caller_stream)
-                if trace is not None:
-                    print(f"RUNTIME_NPU_GRAPH_INPUT_WAIT_ENQUEUED replay={trace}")
                 with torch.npu.stream(stream):
                     if trace is not None:
                         print(f"RUNTIME_NPU_GRAPH_INPUT_COPY_BEGIN replay={trace}")
-                    graph_indices_source.copy_(graph_indices_staging)
+                    indices.copy_(graph_indices_host)
                     if trace is not None:
                         print(f"RUNTIME_NPU_GRAPH_INPUT_INDICES_DONE replay={trace}")
-                    graph_output_indices_source.copy_(graph_output_indices_staging)
+                    output_indices.copy_(graph_output_indices_host)
                     if trace is not None:
                         print(f"RUNTIME_NPU_GRAPH_INPUT_OUTPUT_INDICES_DONE replay={trace}")
 
-            graph_payload_slots, graph_output_indices = prepare_graph_inputs(0)
-            enqueue_graph_input_update(caller_stream)
-            caller_stream.synchronize()
             capture_stream = torch.npu.Stream(device=device_id)
             graph = torch.npu.NPUGraph()
+            graph_payload_slots, graph_output_indices = prepare_graph_inputs(0)
+            enqueue_graph_input_update(capture_stream)
+            capture_stream.synchronize()
             print("RUNTIME_NPU_PHASE_BEGIN phase=graph_capture")
             # output_a was already used by eager A -> B -> A above, so its
             # Direct-HCCP local HBM registration is cached before capture.
             # The external torch_npu graph owns capture, replay and lifetime.
             with torch.npu.graph(graph, stream=capture_stream, capture_error_mode="relaxed"):
-                indices.copy_(graph_indices_source)
-                output_indices.copy_(graph_output_indices_source)
-                output_a.zero_()
                 execute(output_a, capture_stream, synchronize=False)
-                graph_post_marker.copy_(output_a[:1])
             print("RUNTIME_NPU_PHASE_DONE phase=graph_capture owner=torch_npu")
 
             def replay_graph_on_capture_stream(trace: str | None = None) -> None:
@@ -539,8 +494,6 @@ def main() -> int:
                     graph_payload_slots,
                     block_bytes,
                 )
-                if tensor_to_bytes(graph_post_marker) != tensor_to_bytes(output_a[:1]):
-                    raise AssertionError("external graph post-KVAF marker mismatch")
                 validate_completion(
                     tensor_to_bytes(status),
                     tensor_to_bytes(queue),
