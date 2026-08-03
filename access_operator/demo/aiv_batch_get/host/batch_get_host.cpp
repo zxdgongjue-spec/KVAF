@@ -48,6 +48,9 @@ constexpr uint32_t kCtpQueryTimeoutMs = 10000U;
 // asynchronous request-result API (HCCP_EAGAIN vs OTHERS_EAGAIN).
 constexpr int kHccpInitAgain = 128001;
 constexpr int kHccpAsyncAgain = 128301;
+constexpr uint32_t kMaxDirectAivWorkers =
+    KVAF_AIV_BATCH_GET_MAX_AIV_CORES *
+    KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE;
 
 struct DeviceIdentity {
   uint32_t logical_device_id = 0;
@@ -148,7 +151,13 @@ struct KvafBatchGetDdrRegistration {
   DirectMemory host_memory{};
   DirectMemory output_memory{};
   void *device_host_memory_import = nullptr;
-  std::vector<DirectAivWorker> workers{};
+  // Direct-HCCP writes private ABI outputs directly into the worker records.
+  // Keep the bounded records inline with the registration, rather than in a
+  // separately allocated std::vector buffer.  The old vector's allocator
+  // metadata was the first heap object destroyed after the HCCP release path
+  // and was where glibc reported "invalid size" on A5 teardown.
+  std::array<DirectAivWorker, kMaxDirectAivWorkers> workers{};
+  uint32_t worker_count{0};
   void *device_entities = nullptr;
   uint64_t channel_entity = 0;
   bool host_ra_initialized = false;
@@ -912,7 +921,9 @@ void ReleaseRegistration(KvafBatchGetDdrRegistration *registration) {
   }
   if (registration->api.qp_unimport != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=unimport_jettys\n");
-    for (auto &worker : registration->workers) {
+    for (uint32_t worker_index = 0U;
+         worker_index < registration->worker_count; ++worker_index) {
+      DirectAivWorker &worker = registration->workers[worker_index];
       if (registration->host_context != nullptr && worker.host_device_target_jetty != nullptr) {
         (void)registration->api.qp_unimport(registration->host_context, worker.host_device_target_jetty);
       }
@@ -923,7 +934,9 @@ void ReleaseRegistration(KvafBatchGetDdrRegistration *registration) {
   }
   if (registration->api.qp_destroy != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=destroy_jettys\n");
-    for (auto &worker : registration->workers) {
+    for (uint32_t worker_index = 0U;
+         worker_index < registration->worker_count; ++worker_index) {
+      DirectAivWorker &worker = registration->workers[worker_index];
       if (worker.device_user_ctl_jetty.handle != nullptr) {
         (void)registration->api.qp_destroy(worker.device_user_ctl_jetty.handle);
       }
@@ -934,7 +947,9 @@ void ReleaseRegistration(KvafBatchGetDdrRegistration *registration) {
   }
   if (registration->api.cq_destroy != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=destroy_completion_queues\n");
-    for (auto &worker : registration->workers) {
+    for (uint32_t worker_index = 0U;
+         worker_index < registration->worker_count; ++worker_index) {
+      DirectAivWorker &worker = registration->workers[worker_index];
       if (registration->device_context != nullptr && worker.device_user_ctl_cq != nullptr) {
         (void)registration->api.cq_destroy(registration->device_context, worker.device_user_ctl_cq);
       }
@@ -985,7 +1000,10 @@ void ReleaseRegistration(KvafBatchGetDdrRegistration *registration) {
   }
   std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=close_dynamic_libraries\n");
   CloseDirectHccp(&registration->api);
-  std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=delete_registration\n");
+  std::fprintf(stderr,
+               "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=delete_registration "
+               "worker_storage=inline workers=%u\n",
+               registration->worker_count);
   delete registration;
 }
 
@@ -1052,7 +1070,7 @@ extern "C" int32_t KvafBatchGetRegisterLocalDdr(void *host_ddr, uint64_t host_dd
       goto failed;
     }
   }
-  state->workers.resize(entity_count);
+  state->worker_count = entity_count;
   for (uint32_t entity_index = 0U; entity_index < entity_count; ++entity_index) {
     const uint32_t core = entity_index / jettys_per_core;
     const uint32_t jetty_slot = entity_index % jettys_per_core;
