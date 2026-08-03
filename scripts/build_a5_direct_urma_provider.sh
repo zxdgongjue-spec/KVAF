@@ -287,7 +287,12 @@ required_source_paths=(
   "${KVAF_PERFTEST_ROOT}/perftest_log.c"
   "${KVAF_PERFTEST_ROOT}/perftest_parameters.c"
   "${KVAF_PERFTEST_ROOT}/perftest_resources.c"
+  "${KVAF_PERFTEST_ROOT}/perftest_mgmt.c"
+  "${KVAF_PERFTEST_ROOT}/perftest_mgmt.h"
   "${KVAF_PERFTEST_ROOT}/perftest_mgmt_tcp.c"
+  "${KVAF_PERFTEST_ROOT}/perftest_mgmt_tcp.h"
+  "${KVAF_PERFTEST_ROOT}/perftest_mgmt_ub.c"
+  "${KVAF_PERFTEST_ROOT}/perftest_mgmt_ub.h"
   "${KVAF_UDMA_UAPI_HEADER}"
   "${KVAF_UDMA_ROOT}/udma_u_common.h"
   "${KVAF_UDMA_ROOT}/udma_u_ops.c"
@@ -815,7 +820,7 @@ urma_core_mode=official-umdk-source-linked-no-dynamic-providers
 urma_common_mode=official-umdk-source-built-internal
 urma_common_dt_needed=absent
 perftest_source=official-umdk
-perftest_management=official-umdk-tcp
+perftest_management=official-umdk-ub-default-tcp-fallback-v1
 udma_provider_mode=official-umdk-source-built-internal
 udma_source_capability_magic=0x4b56414655444d41
 udma_runtime_capability=0x0000000000020001
@@ -948,4 +953,5 @@ echo "UDMA_UAPI_ABI_SHA256=${udma_uapi_abi_sha}"
 echo "UDMA_PRIVATE_ABI_SHA256=${udma_private_abi_sha}"
 echo "UMMU_UAPI_ABI_SHA256=${ummu_uapi_abi_sha}"
 echo "URMA_COMMON_DT_NEEDED=absent"
+echo "PERFTEST_MANAGEMENT=official-umdk-ub-default-tcp-fallback-v1"
 echo "UDMA_TEARDOWN_CONTRACT=checked-retryable-v1"

@@ -94,6 +94,26 @@ uint32_t kvaf_udma_source_live_jfr_count(void);
 uint32_t kvaf_udma_source_live_jfc_count(void);
 
 /*
+ * Count sidecars owned by one exact public context.  Context deletion must
+ * use these predicates rather than process-global counts: the direct data
+ * context and the long-lived UB-management context intentionally coexist.
+ * UINT32_MAX is returned for a NULL context or a lock failure so every
+ * caller fails closed.
+ */
+uint32_t kvaf_udma_source_live_segment_count_for_context(
+    const urma_context_t *context);
+uint32_t kvaf_udma_source_live_token_count_for_context(
+    const urma_context_t *context);
+uint32_t kvaf_udma_source_live_jetty_count_for_context(
+    const urma_context_t *context);
+uint32_t kvaf_udma_source_live_jfr_count_for_context(
+    const urma_context_t *context);
+uint32_t kvaf_udma_source_live_jfc_count_for_context(
+    const urma_context_t *context);
+int kvaf_udma_source_context_has_live_resources(
+    const urma_context_t *context);
+
+/*
  * A create operation can return NULL after the kernel or UMMU has already
  * acquired a resource.  Such an object is not visible to the caller and must
  * therefore be retried by its owning context before context destruction.

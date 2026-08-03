@@ -375,20 +375,37 @@ class DirectUrmaSourceSyntaxTests(unittest.TestCase):
         ):
             self.assertIn(expected, self.smoke_source)
 
-    def test_tcp_control_ip_is_separate_from_urma_eids(self) -> None:
+    def test_urma_management_is_default_and_tcp_is_explicit_fallback(self) -> None:
         for expected in (
+            "DirectUrmaManagementMode::kUrma",
+            'key == "--management-mode"',
+            'value == "ub"',
+            'value == "tcp"',
+            'key == "--management-jetty-id"',
             'key == "--control-server-address"',
             'key == "--control-bind-address"',
-            "NumericIpFamily(\n      options->control_server_address)",
+            "options->management_mode == DirectUrmaManagementMode::kTcp",
+            "NumericIpFamily(\n        options->control_server_address)",
+            "FormatUrmaEid(options.host_eid)",
+            "FormatUrmaEid(options.device_eid)",
             "spec.control_server_address = options.control_server_address",
             "spec.control_bind_address = options.control_bind_address",
             "spec.control_bind_address.clear()",
+            "spec.management_jetty_id = options.management_jetty_id",
         ):
             self.assertIn(expected, self.smoke_source)
-        self.assertIn(
+        for expected in (
+            "KVAF_URMA_PROVIDER_URMA_MANAGEMENT",
             "KVAF_URMA_PROVIDER_EXPLICIT_TCP_MANAGEMENT",
-            self.resources_source,
-        )
+            "config.management_peer_address",
+            "config.management_local_address",
+            "config.management_jetty_id",
+            "ParseUrmaEid(spec.local_eid",
+            "ParseUrmaEid(spec.peer_eid",
+            "FormatUrmaEid(local_eid)",
+            "FormatUrmaEid(peer_eid)",
+        ):
+            self.assertIn(expected, self.resources_source)
         self.assertIn(
             "config.control_server_address", self.resources_source
         )

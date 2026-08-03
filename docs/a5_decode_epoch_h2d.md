@@ -42,12 +42,13 @@ device ABI 的 `entry_count` 可以在 `0..descriptor_capacity` 内逐批变化�
 但 device ABI 已经从 AccessTable 读取逐项 length；正式 Runtime 若要混合 KV block
 大小，应直接填逐项 length，而不是为每种大小重建连接。
 `KVAF_H2D_RUN_TIMEOUT_SECONDS` 从 Device 启动后控制 Host/Device pair 的监督时间，
-不改变 provider 控制连接 timeout；Host 启动到 Device 启动之前另受 listener-ready
+不改变 provider 管理连接 timeout；Host 启动到 Device 启动之前另受 management-ready
 timeout 约束，因此一次 runner 的最长墙钟时间约为两者之和。长时间 soak 应单独把
 pair 监督时间调大。
 
-控制连接启动也属于 epoch 初始化。runner 必须先确认本次 Host PID 已实际持有目标
-端口的 LISTEN socket，再启动 Device，不能用固定 sleep 猜测。Device provider 使用
+管理连接启动也属于 epoch 初始化。默认 UB 模式下，runner 必须先确认本次 Host PID
+已发布精确的 management Jetty READY 行，再启动 Device，不能用固定 sleep 猜测。
+Device provider 使用
 `KVAF_H2D_TIMEOUT_SECONDS`；Host 为覆盖 Device/AICPU 启动使用独立且更长的
 `KVAF_HOST_CONTROL_TIMEOUT_SECONDS`。READY 观察本身不再创建一个同长度截止时间：
 它持续观察同一个 AICPU owner，直到 READY 或带 teardown 证明的明确终态；整次运行
@@ -55,20 +56,21 @@ pair 监督时间调大。
 
 ## 2. 为什么初始化必须与 BatchGet 分离
 
-一次 direct URMA 初始化包含 TCP 控制连接、EID/MR/Jetty/TP 交换、UMMU 映射、
+一次 direct URMA 初始化包含 URMA 管理 Jetty、EID/MR/Jetty/TP 交换、UMMU 映射、
 Jetty/JFC/SQ/CQ 创建和 Host DDR/NPU HBM 注册。这些操作既慢，又改变资源所有权；
 如果每轮 decode 都重复执行，会把控制面延迟放进 token 热路径，并显著扩大失败和
 teardown 风险。
 
-TCP 控制地址与 URMA EID 是不同地址域：runner 可用
-`KVAF_DIRECT_CONTROL_SERVER_ADDRESS` 显式提供数值 IPv4/IPv6，或在最小
-bring-up 中设为 `auto`，每个 epoch 把已解析 Host EID 转换为 canonical
-IPv6，并 exact-match 本机 `ipourma*` 接口的唯一 global IPv6 assignment。
-manifest 记录 `control_server_address_source=auto-ipourma-eid|explicit`、
-`control_server_interface` 和解析后的 `control_server_address`。client 可用
-`KVAF_DIRECT_CONTROL_BIND_ADDRESS` 选择同族源地址；server 始终 wildcard listen。
-原始 32-hex EID 字符串不能直接传给 TCP；`auto` 只有在系统已将同一数值明确
-配置为 `ipourma*` global IPv6 时，才把它转换为标准 IPv6 文本用于控制连接。
+默认 `KVAF_DIRECT_MANAGEMENT_MODE=ub`。Host 用自身 EID 和 well-known management
+Jetty ID 创建 RM+CTP Jetty 并预投 RECV；Device 使用 Host EID/Jetty ID 导入后发送
+握手。Host 从 CQE 获得 Device 的 remote ID，随后双方通过 URMA SEND/RECV 交换
+正式 MR、Jetty 和 TP 元数据。整个 bootstrap 不创建 TCP socket，也不依赖 Linux
+IPv4/IPv6、路由或 `ipourma*` 地址。runner 默认将 NPU0..7 映射到保留 Jetty ID
+500..507，并在 Host 精确发布 `KVAF_URMA_MGMT_READY` 后才启动 Device。
+
+`KVAF_DIRECT_MANAGEMENT_MODE=tcp` 仅用于显式回归旧控制面。只有该模式才读取
+`KVAF_DIRECT_CONTROL_*`、做数值 IP 校验和 PID-bound LISTEN 证明；decode 默认设计
+不依赖这些配置。
 
 因此生命周期应拆成三段：
 

@@ -156,6 +156,24 @@ uint32_t kvaf_udma_source_live_jfc_count(void)
     return count;
 }
 
+uint32_t kvaf_udma_source_live_jfc_count_for_context(
+    const urma_context_t *context)
+{
+    const struct kvaf_udma_jfc_state *state;
+    uint32_t count = 0;
+
+    if (context == NULL || pthread_mutex_lock(&g_kvaf_jfc_lock) != 0) {
+        return UINT32_MAX;
+    }
+    for (state = g_kvaf_jfcs; state != NULL; state = state->next) {
+        if (state->owner_context == context) {
+            ++count;
+        }
+    }
+    (void)pthread_mutex_unlock(&g_kvaf_jfc_lock);
+    return count;
+}
+
 urma_jfc_t *kvaf_udma_create_jfc_checked(
     urma_context_t *context, urma_jfc_cfg_t *cfg)
 {

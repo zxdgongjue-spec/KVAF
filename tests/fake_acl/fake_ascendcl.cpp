@@ -39,6 +39,10 @@ bool g_terminal_status_read_failed = false;
 int g_aiv_result_h2d_copies = 0;
 int g_ready_wait_launches = 0;
 int g_data_launches = 0;
+std::uint32_t g_last_config_flags = 0;
+std::uint32_t g_last_management_jetty_id = 0;
+std::string g_last_management_local_address;
+std::string g_last_management_peer_address;
 
 bool Scenario(const char* name) {
   return g_scenario == name;
@@ -83,6 +87,13 @@ void FillSuccessfulOpen(const kvaf_urma_provider_config_v2& config,
                   result->remote_eid);
 }
 
+void RecordOpenConfig(const kvaf_urma_provider_config_v2& config) {
+  g_last_config_flags = config.flags;
+  g_last_management_jetty_id = config.management_jetty_id;
+  g_last_management_local_address = config.management_local_address;
+  g_last_management_peer_address = config.management_peer_address;
+}
+
 }  // namespace
 
 extern "C" void kvaf_fake_acl_set_scenario(const char* scenario) {
@@ -110,6 +121,10 @@ extern "C" void kvaf_fake_acl_set_scenario(const char* scenario) {
   g_aiv_result_h2d_copies = 0;
   g_ready_wait_launches = 0;
   g_data_launches = 0;
+  g_last_config_flags = 0;
+  g_last_management_jetty_id = 0;
+  g_last_management_local_address.clear();
+  g_last_management_peer_address.clear();
 }
 
 extern "C" int kvaf_fake_acl_sync_calls(void) {
@@ -140,6 +155,22 @@ extern "C" uint32_t kvaf_fake_acl_last_kernel_type(void) {
   return g_last_kernel_type;
 }
 
+extern "C" uint32_t kvaf_fake_acl_last_config_flags(void) {
+  return g_last_config_flags;
+}
+
+extern "C" uint32_t kvaf_fake_acl_last_management_jetty_id(void) {
+  return g_last_management_jetty_id;
+}
+
+extern "C" const char* kvaf_fake_acl_last_management_local_address(void) {
+  return g_last_management_local_address.c_str();
+}
+
+extern "C" const char* kvaf_fake_acl_last_management_peer_address(void) {
+  return g_last_management_peer_address.c_str();
+}
+
 extern "C" int kvaf_fake_acl_data_launches(void) {
   return g_data_launches;
 }
@@ -155,6 +186,7 @@ extern "C" int kvaf_urma_provider_open_v2(
     return -1;
   }
   g_open_session = config->session_id;
+  RecordOpenConfig(*config);
   FillSuccessfulOpen(*config, result);
   result->private_abi = KVAF_UDMA_PRIVATE_ABI_HOST_PERFTEST_AIV_V1;
   result->flags = KVAF_URMA_PROVIDER_CONNECTED |
@@ -287,6 +319,7 @@ extern "C" rtError_t rtAicpuKernelLaunchExWithArgs(
     g_owner_status = owner_status;
     g_device_open_result = result;
     g_open_session = args->config.session_id;
+    RecordOpenConfig(args->config);
     g_epoch = args->epoch;
     if (Scenario("open_launch_failure")) {
       return 130;

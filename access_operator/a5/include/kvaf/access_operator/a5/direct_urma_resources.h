@@ -20,6 +20,11 @@ enum class DirectUrmaRole : std::uint32_t {
   kClient,
 };
 
+enum class DirectUrmaManagementMode : std::uint32_t {
+  kTcp = 0,
+  kUrma,
+};
+
 // Monotonic Close cursor. In particular, kAicpuResultPending means the close
 // kernel has already been launched and synchronized: another Close call may
 // only reread the existing device result buffer, never launch that kernel
@@ -64,19 +69,29 @@ struct DirectUrmaOpenSpec {
   DirectUrmaExecutionDomain execution_domain{
       DirectUrmaExecutionDomain::kAicpu};
   DirectUrmaRole role{DirectUrmaRole::kClient};
+  // The direct path defaults to an in-band URMA RM+CTP management Jetty.
+  // TCP remains available only as an explicit compatibility mode.
+  DirectUrmaManagementMode management_mode{
+      DirectUrmaManagementMode::kUrma};
   std::string provider_library_path;
   std::string provider_soname{"libkvaf_urma_provider_device.so"};
   std::string urma_device;
-  // URMA EIDs are used only to validate the exchanged transport resource.
+  // In URMA management mode these EIDs also identify the local management
+  // endpoint and the peer/server management endpoint. They are 128-bit URMA
+  // identifiers; their colon-separated text form does not imply an IP socket.
   std::string local_eid;
   std::string peer_eid;
-  // TCP management is an ordinary IP channel and is independent of EIDs.
+  // TCP compatibility mode uses an ordinary IP channel independent of EIDs.
   // The server listens on the wildcard address of this numeric IP's family;
   // the client connects to it and may optionally bind control_bind_address.
+  // Both strings are ignored in URMA management mode.
   std::string control_server_address;
   std::string control_bind_address;
   std::uint32_t eid_index{0};
   std::uint32_t control_port{21115};
+  // Fixed server RM management Jetty ID, shared out of band. UMDK's UB
+  // management implementation reserves zero and accepts IDs below 1024.
+  std::uint32_t management_jetty_id{511};
   std::uint32_t control_timeout_seconds{120};
   Address local_address{0};
   std::uint64_t local_allocation_bytes{0};

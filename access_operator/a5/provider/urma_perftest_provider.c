@@ -26,9 +26,13 @@
 #define KVAF_PROVIDER_PRIVATE_ABI_MASK \
     (KVAF_URMA_PROVIDER_EXPECT_HOST_PRIVATE_ABI | \
      KVAF_URMA_PROVIDER_EXPECT_DEVICE_PRIVATE_ABI)
-#define KVAF_PROVIDER_REQUIRED_CONFIG_FLAGS \
+#define KVAF_PROVIDER_MANAGEMENT_MASK \
+    (KVAF_URMA_PROVIDER_EXPLICIT_TCP_MANAGEMENT | \
+     KVAF_URMA_PROVIDER_URMA_MANAGEMENT)
+#define KVAF_PROVIDER_ALLOWED_CONFIG_FLAGS \
     (KVAF_URMA_PROVIDER_USE_CTP | \
-     KVAF_URMA_PROVIDER_EXPLICIT_TCP_MANAGEMENT)
+     KVAF_PROVIDER_PRIVATE_ABI_MASK | \
+     KVAF_PROVIDER_MANAGEMENT_MASK)
 
 static perftest_config_t g_kvaf_config;
 static perftest_context_t g_kvaf_context;
@@ -102,6 +106,33 @@ static int kvaf_numeric_ip_family(const char *text)
     return AF_UNSPEC;
 }
 
+static bool kvaf_valid_nonzero_urma_eid(const char *text)
+{
+    urma_eid_t eid = {0};
+    uint8_t combined = 0;
+    uint32_t i;
+
+    if (text == NULL || text[0] == '\0' ||
+        urma_str_to_eid(text, &eid) != 0) {
+        return false;
+    }
+    for (i = 0; i < sizeof(eid.raw); ++i) {
+        combined |= eid.raw[i];
+    }
+    return combined != 0;
+}
+
+static bool kvaf_same_urma_eid(const char *left, const char *right)
+{
+    urma_eid_t left_eid = {0};
+    urma_eid_t right_eid = {0};
+
+    return left != NULL && right != NULL &&
+        urma_str_to_eid(left, &left_eid) == 0 &&
+        urma_str_to_eid(right, &right_eid) == 0 &&
+        memcmp(&left_eid, &right_eid, sizeof(left_eid)) == 0;
+}
+
 static int kvaf_negative_errno_or(int fallback)
 {
     return errno > 0 ? -errno : -fallback;
@@ -150,29 +181,28 @@ static bool kvaf_config_is_valid(
 {
     uint64_t minimum_bytes;
     uint32_t expected_private_abi;
+    uint32_t management_flags;
     int control_family;
     int bind_family;
+    bool use_urma_management;
 
     if (config == NULL ||
         config->magic != KVAF_URMA_PROVIDER_MAGIC ||
         config->abi_version != KVAF_URMA_PROVIDER_ABI_VERSION ||
         config->struct_size != sizeof(*config) ||
         config->role > KVAF_URMA_PROVIDER_CLIENT ||
-        (config->flags & KVAF_PROVIDER_REQUIRED_CONFIG_FLAGS) !=
-            KVAF_PROVIDER_REQUIRED_CONFIG_FLAGS ||
+        (config->flags & KVAF_URMA_PROVIDER_USE_CTP) == 0 ||
         (config->flags & KVAF_PROVIDER_PRIVATE_ABI_MASK) == 0 ||
         (config->flags & KVAF_PROVIDER_PRIVATE_ABI_MASK) ==
             KVAF_PROVIDER_PRIVATE_ABI_MASK ||
-        (config->flags &
-            ~(KVAF_PROVIDER_REQUIRED_CONFIG_FLAGS |
-              KVAF_PROVIDER_PRIVATE_ABI_MASK)) != 0 ||
+        (config->flags & ~KVAF_PROVIDER_ALLOWED_CONFIG_FLAGS) != 0 ||
         config->address_kind != KVAF_URMA_PROVIDER_ADDRESS_DEVICE_VA ||
         config->session_id == 0 ||
         config->jetty_index != 0 ||
-        config->control_port < 1024U ||
-        config->control_port > 65535U ||
         config->control_timeout_seconds == 0 ||
         config->control_timeout_seconds > 3600U ||
+        config->reserved0 != 0U || config->reserved[0] != 0U ||
+        config->reserved[1] != 0U ||
         config->local_address == 0 ||
         config->segment_payload_bytes == 0 ||
         config->segment_payload_bytes > UINT32_MAX ||
@@ -186,17 +216,43 @@ static bool kvaf_config_is_valid(
         return false;
     }
 
-    control_family = kvaf_numeric_ip_family(
-        config->control_server_address);
-    bind_family = config->control_bind_address[0] == '\0'
-        ? AF_UNSPEC
-        : kvaf_numeric_ip_family(config->control_bind_address);
-    if (control_family == AF_UNSPEC ||
-        (config->role == KVAF_URMA_PROVIDER_SERVER &&
-         config->control_bind_address[0] != '\0') ||
-        (config->control_bind_address[0] != '\0' &&
-         bind_family != control_family)) {
+    management_flags = config->flags & KVAF_PROVIDER_MANAGEMENT_MASK;
+    if (management_flags == 0 ||
+        management_flags == KVAF_PROVIDER_MANAGEMENT_MASK) {
         return false;
+    }
+    use_urma_management =
+        management_flags == KVAF_URMA_PROVIDER_URMA_MANAGEMENT;
+    if (use_urma_management) {
+        /* 1..1023 is the agreed well-known management-Jetty range.  It is
+         * intentionally disjoint from ordinary TCP listener ports. */
+        if (config->management_jetty_id == 0 ||
+            config->management_jetty_id > 1023U ||
+            !kvaf_valid_nonzero_urma_eid(
+                config->management_local_address) ||
+            !kvaf_valid_nonzero_urma_eid(
+                config->management_peer_address) ||
+            kvaf_same_urma_eid(config->management_local_address,
+                config->management_peer_address)) {
+            return false;
+        }
+    } else {
+        if (config->control_port < 1024U ||
+            config->control_port > 65535U) {
+            return false;
+        }
+        control_family = kvaf_numeric_ip_family(
+            config->control_server_address);
+        bind_family = config->control_bind_address[0] == '\0'
+            ? AF_UNSPEC
+            : kvaf_numeric_ip_family(config->control_bind_address);
+        if (control_family == AF_UNSPEC ||
+            (config->role == KVAF_URMA_PROVIDER_SERVER &&
+             config->control_bind_address[0] != '\0') ||
+            (config->control_bind_address[0] != '\0' &&
+             bind_family != control_family)) {
+            return false;
+        }
     }
 
     expected_private_abi =
@@ -250,17 +306,23 @@ static int kvaf_parse_config(
     char size_text[32];
     char eid_index_text[32];
     char port_text[16];
-    char *argv[24];
+    char *argv[32];
     int argc = 0;
-    const int control_family = kvaf_numeric_ip_family(
-        input->control_server_address);
+    const bool use_urma_management =
+        (input->flags & KVAF_URMA_PROVIDER_URMA_MANAGEMENT) != 0;
+    const int control_family = use_urma_management
+        ? AF_UNSPEC
+        : kvaf_numeric_ip_family(input->control_server_address);
+    const uint32_t endpoint = use_urma_management
+        ? input->management_jetty_id
+        : input->control_port;
 
     if (snprintf(size_text, sizeof(size_text), "%llu",
         (unsigned long long)input->segment_payload_bytes) < 0 ||
         snprintf(eid_index_text, sizeof(eid_index_text), "%u",
         input->eid_index) < 0 ||
         snprintf(port_text, sizeof(port_text), "%u",
-        input->control_port) < 0) {
+        endpoint) < 0) {
         return -1;
     }
 
@@ -273,15 +335,26 @@ static int kvaf_parse_config(
     KVAF_ADD_ARG("1");
     KVAF_ADD_ARG("-s");
     KVAF_ADD_ARG(size_text);
-    if (control_family == AF_INET6) {
-        KVAF_ADD_ARG("--enable_ipv6");
-    }
-    if (input->role == KVAF_URMA_PROVIDER_CLIENT) {
-        KVAF_ADD_ARG("-S");
-        KVAF_ADD_ARG(input->control_server_address);
-        if (input->control_bind_address[0] != '\0') {
-            KVAF_ADD_ARG("--bind_ip");
-            KVAF_ADD_ARG(input->control_bind_address);
+    if (use_urma_management) {
+        KVAF_ADD_ARG("--mgmt_proto");
+        KVAF_ADD_ARG("ub");
+        KVAF_ADD_ARG("--mgmt_addr");
+        KVAF_ADD_ARG(input->management_local_address);
+        if (input->role == KVAF_URMA_PROVIDER_CLIENT) {
+            KVAF_ADD_ARG("-S");
+            KVAF_ADD_ARG(input->management_peer_address);
+        }
+    } else {
+        if (control_family == AF_INET6) {
+            KVAF_ADD_ARG("--enable_ipv6");
+        }
+        if (input->role == KVAF_URMA_PROVIDER_CLIENT) {
+            KVAF_ADD_ARG("-S");
+            KVAF_ADD_ARG(input->control_server_address);
+            if (input->control_bind_address[0] != '\0') {
+                KVAF_ADD_ARG("--bind_ip");
+                KVAF_ADD_ARG(input->control_bind_address);
+            }
         }
     }
     KVAF_ADD_ARG("--tp_aware");
@@ -645,6 +718,8 @@ int kvaf_urma_provider_open_v2(
 {
     int ret;
     int ready_status;
+    const bool use_urma_management = config != NULL &&
+        (config->flags & KVAF_URMA_PROVIDER_URMA_MANAGEMENT) != 0;
 
     if (result == NULL) {
         return -1;
@@ -708,11 +783,31 @@ int kvaf_urma_provider_open_v2(
             KVAF_URMA_PROVIDER_LOCAL_CONFIG_FAILED, ret);
         goto fail;
     }
+
+    /* UB management creates a context, queues and registered segments of its
+     * own, so the source-linked runtime must already be alive.  The inlined
+     * UMDK helper is compiled with its duplicate urma_init suppressed. */
+    if (use_urma_management) {
+        ret = kvaf_udma_source_runtime_init();
+        g_kvaf_runtime_acquired = ret == 0;
+        if (ret != 0) {
+            kvaf_init_result(result,
+                KVAF_URMA_PROVIDER_RESOURCE_CREATE_FAILED, ret);
+            goto fail;
+        }
+    }
+
     errno = 0;
     ret = kvaf_perftest_set_control_timeout(
         config->control_timeout_seconds);
-    if (ret == 0 &&
-        kvaf_perftest_establish_connection(&g_kvaf_config) != 0) {
+    /* Mark ownership before establish: UB publishes a partially-created
+     * context on failure so fail/Close can retry exact public handles. TCP's
+     * close helper is likewise idempotent after partial connect cleanup. */
+    g_kvaf_connection_open = ret == 0;
+    if (ret == 0 && kvaf_perftest_establish_connection(
+            &g_kvaf_config,
+            use_urma_management
+                ? config->management_peer_address : NULL) != 0) {
         ret = kvaf_negative_errno_or(EIO);
     } else if (ret != 0) {
         ret = kvaf_negative_errno_or(EIO);
@@ -722,11 +817,13 @@ int kvaf_urma_provider_open_v2(
             ret);
         goto fail;
     }
-    g_kvaf_connection_open = true;
-    ret = kvaf_set_control_socket_deadlines(config);
-    if (ret != 0) {
-        kvaf_init_result(result, KVAF_URMA_PROVIDER_CONNECT_FAILED, ret);
-        goto fail;
+    if (!use_urma_management) {
+        ret = kvaf_set_control_socket_deadlines(config);
+        if (ret != 0) {
+            kvaf_init_result(result,
+                KVAF_URMA_PROVIDER_CONNECT_FAILED, ret);
+            goto fail;
+        }
     }
     ret = check_remote_cfg(&g_kvaf_config);
     if (ret != 0) {
@@ -735,8 +832,12 @@ int kvaf_urma_provider_open_v2(
         goto fail;
     }
 
-    ret = kvaf_udma_source_runtime_init();
-    g_kvaf_runtime_acquired = ret == 0;
+    if (!use_urma_management) {
+        ret = kvaf_udma_source_runtime_init();
+        g_kvaf_runtime_acquired = ret == 0;
+    } else {
+        ret = 0;
+    }
     if (kvaf_perftest_confirm_runtime_ready(
             &g_kvaf_config, ret) != KVAF_PERFTEST_CHECKED_OK) {
         kvaf_init_result(result,
@@ -837,6 +938,12 @@ static int kvaf_close_unlocked(uint64_t session_id)
     if (g_kvaf_cleanup_poisoned) {
         return KVAF_URMA_PROVIDER_CLOSE_UNSAFE;
     }
+    if (g_kvaf_connection_open &&
+        kvaf_perftest_rearm_control_timeout() != 0) {
+        /* No resource was touched. Retrying Close can safely acquire a fresh
+         * deadline and resume the same session. */
+        return KVAF_URMA_PROVIDER_CLOSE_RETRYABLE;
+    }
     if (g_kvaf_context_open) {
         const int teardown_status =
             kvaf_perftest_destroy_duplex_ctx_checked(
@@ -867,16 +974,24 @@ static int kvaf_close_unlocked(uint64_t session_id)
             g_kvaf_cleanup_poisoned = true;
             return KVAF_URMA_PROVIDER_CLOSE_UNSAFE;
         }
-        if (!kvaf_udma_source_has_no_live_resources()) {
-            /*
-             * The public context is already gone, so a non-zero private
-             * counter contradicts the checked teardown contract. Never
-             * acknowledge Close or release the session in this state.
-             */
-            g_kvaf_cleanup_poisoned = true;
-            return KVAF_URMA_PROVIDER_CLOSE_UNSAFE;
-        }
         g_kvaf_context_open = false;
+    }
+    /* The UB management context is a real URMA resource owner.  Destroy it
+     * after the data teardown protocol has used it, but before runtime uninit
+     * can invalidate its provider ops. A failed public destroy keeps its
+     * pointer in g_ub_ctx and is resumed by the next Close. */
+    if (g_kvaf_connection_open) {
+        const int management_status =
+            kvaf_perftest_close_connection(&g_kvaf_config);
+        if (management_status !=
+            KVAF_PERFTEST_MANAGEMENT_CLOSE_OK) {
+            if (kvaf_source_cleanup_state_is_unknown()) {
+                g_kvaf_cleanup_poisoned = true;
+                return KVAF_URMA_PROVIDER_CLOSE_UNSAFE;
+            }
+            return KVAF_URMA_PROVIDER_CLOSE_RETRYABLE;
+        }
+        g_kvaf_connection_open = false;
     }
     if (g_kvaf_runtime_acquired) {
         if (!kvaf_udma_source_has_no_live_resources() ||
@@ -890,10 +1005,6 @@ static int kvaf_close_unlocked(uint64_t session_id)
             return KVAF_URMA_PROVIDER_CLOSE_UNSAFE;
         }
         g_kvaf_runtime_acquired = false;
-    }
-    if (g_kvaf_connection_open) {
-        kvaf_perftest_close_connection(&g_kvaf_config);
-        g_kvaf_connection_open = false;
     }
     if (g_kvaf_config_initialized) {
         destroy_cfg(&g_kvaf_config);

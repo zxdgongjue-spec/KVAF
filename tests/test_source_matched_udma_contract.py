@@ -24,7 +24,7 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
         self.assertIn("kvaf_udma_uapi_probe", cmake)
         self.assertIn("kvaf_udma_private_abi_probe", cmake)
 
-    def test_official_perftest_uses_tcp_management_and_external_va(self):
+    def test_official_perftest_uses_ub_default_tcp_fallback_and_external_va(self):
         cmake = self.read("access_operator/a5/provider/CMakeLists.txt")
         communication = self.read(
             "access_operator/a5/provider/source_matched_communication.c"
@@ -38,8 +38,17 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
 
         self.assertIn("perftest_mgmt_tcp.c", cmake)
         self.assertIn("KVAF_PERFTEST_MGMT_TCP_SOURCE", cmake)
+        self.assertIn("perftest_mgmt_ub.c", cmake)
+        self.assertIn("perftest_mgmt_ub.h", cmake)
+        self.assertIn("KVAF_PERFTEST_MGMT_UB_SOURCE", cmake)
         self.assertNotIn("KVAF_PERFTEST_COMMUNICATION_SOURCE", cmake)
         self.assertIn('#include "perftest_mgmt_tcp.h"', communication)
+        self.assertIn('#include "perftest_mgmt_ub.h"', communication)
+        self.assertIn(
+            "#include KVAF_PERFTEST_MGMT_UB_SOURCE", communication
+        )
+        self.assertIn("kvaf_ub_establish_connection", communication)
+        self.assertIn("kvaf_ub_close_connection_checked", communication)
         self.assertIn("kvaf_perftest_control_fd", communication)
         self.assertIn("cfg->v_address", resources)
         self.assertIn("cfg->enable_va", resources)
@@ -50,7 +59,7 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
             self.assertNotIn("dev_buf", source)
             self.assertNotIn("comm.sock_fd", source)
 
-    def test_tcp_management_addresses_are_never_urma_eids(self):
+    def test_tcp_and_urma_management_addresses_are_disjoint(self):
         provider = self.read(
             "access_operator/a5/provider/urma_perftest_provider.c"
         )
@@ -64,12 +73,19 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
         for field in (
             "control_server_address",
             "control_bind_address",
+            "management_peer_address",
+            "management_local_address",
+            "management_jetty_id",
         ):
             self.assertIn(field, abi)
             self.assertIn(field, provider)
         self.assertIn(
             "KVAF_URMA_PROVIDER_EXPLICIT_TCP_MANAGEMENT", abi
         )
+        self.assertIn("KVAF_URMA_PROVIDER_URMA_MANAGEMENT", abi)
+        self.assertIn("config->reserved0 != 0U", provider)
+        self.assertIn("config->reserved[0] != 0U", provider)
+        self.assertIn("config->reserved[1] != 0U", provider)
         self.assertIn("kvaf_numeric_ip_family", provider)
         self.assertIn("AF_INET", provider)
         self.assertIn("AF_INET6", provider)
@@ -79,18 +95,69 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
         self.assertIn(
             "KVAF_ADD_ARG(input->control_bind_address)", provider
         )
+        self.assertIn('KVAF_ADD_ARG("--mgmt_proto")', provider)
+        self.assertNotIn('KVAF_ADD_ARG("--mgmt")', provider)
+        self.assertIn('KVAF_ADD_ARG("ub")', provider)
+        self.assertIn(
+            "KVAF_ADD_ARG(input->management_local_address)", provider
+        )
+        self.assertIn(
+            "KVAF_ADD_ARG(input->management_peer_address)", provider
+        )
         parse_start = provider.index("static int kvaf_parse_config(")
         parse_end = provider.index(
             "static bool kvaf_ummu_checked_runtime_is_armed", parse_start
         )
         parse = provider[parse_start:parse_end]
-        self.assertNotIn("local_eid", parse)
-        self.assertNotIn("peer_eid", parse)
+        self.assertIn("use_urma_management", parse)
         self.assertIn("input->role == KVAF_URMA_PROVIDER_CLIENT", parse)
         self.assertIn("control_family == AF_INET6", parse)
         self.assertIn("errno = 0", communication)
         self.assertIn("saved_errno", communication)
         self.assertIn("kvaf_negative_errno_or(EIO)", provider)
+
+    def test_ub_management_bootstrap_and_teardown_are_checked(self):
+        provider = self.read(
+            "access_operator/a5/provider/urma_perftest_provider.c"
+        )
+        communication = self.read(
+            "access_operator/a5/provider/source_matched_communication.c"
+        )
+
+        for expected in (
+            "g_kvaf_ub_server_recv_posts == 2U",
+            '"KVAF_URMA_MGMT_READY role=server jetty_id=%u "',
+            "kvaf_ub_peer_matches(expected_peer_eid)",
+            "strcmp(ctx->dev->name, expected_device_name) != 0",
+            "eid_idx != expected_eid_index",
+            "kvaf_deadline_urma_poll_jfc",
+            "kvaf_udma_source_retry_orphan_cleanup(ctx->urma_ctx)",
+            "KVAF_UB_DESTROY(ctx->pair.tjetty, urma_unimport_jetty)",
+            "KVAF_UB_DESTROY(ctx->urma_ctx, urma_delete_context)",
+            "KVAF_PERFTEST_MANAGEMENT_CLOSE_RETRYABLE",
+        ):
+            self.assertIn(expected, communication)
+        self.assertLess(
+            communication.index("g_kvaf_ub_server_recv_posts == 2U"),
+            communication.index(
+                '"KVAF_URMA_MGMT_READY role=server jetty_id=%u "'
+            ),
+        )
+
+        open_start = provider.index("int kvaf_urma_provider_open_v2(")
+        close_start = provider.index(
+            "static int kvaf_close_unlocked(", open_start
+        )
+        open_body = provider[open_start:close_start]
+        self.assertLess(
+            open_body.index("kvaf_udma_source_runtime_init()"),
+            open_body.index("kvaf_perftest_establish_connection("),
+        )
+        close_body = provider[close_start:]
+        self.assertLess(
+            close_body.index("kvaf_perftest_close_connection("),
+            close_body.index("kvaf_udma_source_runtime_uninit()"),
+        )
 
     def test_tcp_connect_retries_share_one_monotonic_deadline(self):
         communication = self.read(
@@ -121,6 +188,9 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
         )
         self.assertIn("control_server_address) == 104", abi)
         self.assertIn("control_bind_address) == 168", abi)
+        self.assertIn("management_peer_address) == 104", abi)
+        self.assertIn("management_local_address) == 168", abi)
+        self.assertIn("management_jetty_id) == 232", abi)
 
     def test_embedded_perftest_legacy_dependencies_are_private_and_closed(self):
         cmake = self.read("access_operator/a5/provider/CMakeLists.txt")
@@ -391,9 +461,62 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
         self.assertIn("kvaf_udma_source_retry_orphan_cleanup", ops)
         drain = ops.index("kvaf_udma_source_retry_orphan_cleanup(")
         live_gate = ops.index(
-            "kvaf_udma_source_live_segment_count()", drain
+            "kvaf_udma_source_context_has_live_resources(", drain
         )
         self.assertLess(drain, live_gate)
+
+    def test_context_delete_gates_only_exact_context_sidecars(self):
+        header = self.read(
+            "access_operator/a5/provider/include/kvaf_source_matched_udma.h"
+        )
+        ops = self.read(
+            "access_operator/a5/provider/source_matched_udma_ops.c"
+        )
+        delete_start = ops.index(
+            "static urma_status_t kvaf_udma_delete_context_checked("
+        )
+        delete_end = ops.index(
+            "int kvaf_udma_source_context_has_live_resources(",
+            delete_start,
+        )
+        delete_context = ops[delete_start:delete_end]
+
+        self.assertIn(
+            "kvaf_udma_source_context_has_live_resources(public_context)",
+            delete_context,
+        )
+        for kind, relative in (
+            ("segment", "source_matched_udma_segment.c"),
+            ("token", "source_matched_udma_tid.c"),
+            ("jetty", "source_matched_udma_jetty.c"),
+            ("jfr", "source_matched_udma_jfr.c"),
+            ("jfc", "source_matched_udma_jfc.c"),
+        ):
+            symbol = f"kvaf_udma_source_live_{kind}_count_for_context"
+            source = self.read(f"access_operator/a5/provider/{relative}")
+            self.assertIn(symbol, header)
+            self.assertIn(symbol, source)
+            helper_start = source.index(symbol)
+            helper = source[helper_start:helper_start + 900]
+            self.assertIn("state->owner_context == context", helper)
+            self.assertIn("pthread_mutex_lock(", helper)
+            self.assertIn("pthread_mutex_unlock(", helper)
+
+        aggregate_start = ops.index(
+            "int kvaf_udma_source_context_has_live_resources("
+        )
+        aggregate_end = ops.index(
+            "int kvaf_udma_source_retry_orphan_cleanup(", aggregate_start
+        )
+        aggregate = ops[aggregate_start:aggregate_end]
+        for kind in ("segment", "token", "jetty", "jfr", "jfc"):
+            self.assertIn(
+                f"kvaf_udma_source_live_{kind}_count_for_context(context)",
+                aggregate,
+            )
+            self.assertNotIn(
+                f"kvaf_udma_source_live_{kind}_count()", delete_context
+            )
 
     def test_context_create_is_failure_atomic_without_legacy_wrapper(self):
         ops = self.read(
@@ -639,8 +762,11 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
         ):
             self.assertIn(f"g_udma_ops.{unsafe_op} = NULL;", ops)
         self.assertIn("kvaf_udma_source_retry_orphan_jfrs", ops)
-        for lifecycle in (ops, main, provider):
+        for lifecycle in (main, provider):
             self.assertIn("kvaf_udma_source_live_jfr_count()", lifecycle)
+        self.assertIn(
+            "kvaf_udma_source_live_jfr_count_for_context(context)", ops
+        )
         for symbol in (
             "kvaf_udma_source_live_jfr_count",
             "kvaf_udma_source_orphan_jfr_count",

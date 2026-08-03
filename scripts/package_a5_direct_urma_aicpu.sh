@@ -186,6 +186,20 @@ libummu_source_manifest_sha=${KVAF_VERIFIED_LIBUMMU_SOURCE_MANIFEST_SHA}
 build_manifest_sha=${KVAF_VERIFIED_BUILD_MANIFEST_SHA}
 umdk_source_manifest=${KVAF_VERIFIED_UMDK_SOURCE_MANIFEST}
 libummu_source_manifest=${KVAF_VERIFIED_LIBUMMU_SOURCE_MANIFEST}
+umdk_root=$(manifest_value umdk_root \
+  "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") ||
+  die "provider build manifest lacks umdk_root"
+for management_source in \
+  perftest_mgmt.c perftest_mgmt.h \
+  perftest_mgmt_tcp.c perftest_mgmt_tcp.h \
+  perftest_mgmt_ub.c perftest_mgmt_ub.h
+do
+  management_path="${umdk_root}/src/urma/tools/urma_perftest/${management_source}"
+  awk -v expected="${management_path}" \
+      '$2 == expected { found = 1 } END { exit found ? 0 : 1 }' \
+      "${umdk_source_manifest}" ||
+    die "UMDK source manifest omits ${management_source}"
+done
 
 if [[ -e "${KVAF_DIRECT_QUARANTINE_FILE}" ||
       -L "${KVAF_DIRECT_QUARANTINE_FILE}" ]]; then
@@ -422,4 +436,5 @@ echo "AICPU_REGISTRATION_FILE=${KVAF_DIRECT_AICPU_REGISTRATION_FILE}"
 echo "AICPU_REGISTRATION=verified-exact"
 echo "AICPU_REGISTRATION_PREVIOUS_STATE=${registration_state}"
 echo "DEVICE_PROVIDER_SHA256=${device_provider_sha}"
+echo "PERFTEST_MANAGEMENT=official-umdk-ub-default-tcp-fallback-v1"
 tar -tzf "${KVAF_DIRECT_AICPU_ARCHIVE}"

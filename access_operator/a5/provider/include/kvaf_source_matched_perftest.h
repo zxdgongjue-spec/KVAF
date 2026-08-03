@@ -92,12 +92,26 @@ struct kvaf_perftest_teardown_state {
 // be called immediately before kvaf_perftest_establish_connection().
 int kvaf_perftest_set_control_timeout(unsigned int timeout_seconds);
 
-// The direct provider intentionally supports only the official perftest TCP
-// management backend.  Keep that choice out of perftest_config_t internals:
-// UMDK 26.06 owns its socket array in perftest_mgmt_tcp.c rather than in
-// cfg->comm as the older fork did.
-int kvaf_perftest_establish_connection(const perftest_config_t *cfg);
-void kvaf_perftest_close_connection(perftest_config_t *cfg);
+// Re-arm the same bounded interval for the coordinated teardown exchange.
+// A decode epoch may outlive the bootstrap deadline, so Close must not reuse
+// the already-expired Open deadline.
+int kvaf_perftest_rearm_control_timeout(void);
+
+// Both backends are source-matched to the pinned UMDK snapshot.  In UB mode
+// expected_peer_eid is mandatory on both roles: the server compares it with
+// the remote identity learned from the receive CQE, while the client compares
+// it with the imported management target before any metadata is exchanged.
+int kvaf_perftest_establish_connection(const perftest_config_t *cfg,
+    const char *expected_peer_eid);
+
+enum kvaf_perftest_management_close_status {
+  KVAF_PERFTEST_MANAGEMENT_CLOSE_OK = 0,
+  // Every failed public destroy retains the exact handle in the process-local
+  // UB context. Calling Close again resumes at that handle.
+  KVAF_PERFTEST_MANAGEMENT_CLOSE_RETRYABLE = -1,
+};
+
+int kvaf_perftest_close_connection(perftest_config_t *cfg);
 int kvaf_perftest_sync_data(const perftest_config_t *cfg, uint32_t index,
     int size, char *local_data, char *remote_data);
 int kvaf_perftest_control_fd(uint32_t index);

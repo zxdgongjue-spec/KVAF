@@ -100,6 +100,24 @@ uint32_t kvaf_udma_source_live_jetty_count(void)
     return count;
 }
 
+uint32_t kvaf_udma_source_live_jetty_count_for_context(
+    const urma_context_t *context)
+{
+    const struct kvaf_udma_jetty_state *state;
+    uint32_t count = 0;
+
+    if (context == NULL || pthread_mutex_lock(&g_kvaf_jetty_lock) != 0) {
+        return UINT32_MAX;
+    }
+    for (state = g_kvaf_jetties; state != NULL; state = state->next) {
+        if (state->owner_context == context) {
+            ++count;
+        }
+    }
+    (void)pthread_mutex_unlock(&g_kvaf_jetty_lock);
+    return count;
+}
+
 uint32_t kvaf_udma_source_orphan_jetty_count(void)
 {
     uint32_t count;

@@ -42,6 +42,7 @@ using kvaf::access::DeviceCompletion;
 using kvaf::access::TransferState;
 using kvaf::access::UrmaH2DDescriptor;
 using kvaf::access::a5::DirectUrmaExecutionDomain;
+using kvaf::access::a5::DirectUrmaManagementMode;
 using kvaf::access::a5::DirectUrmaOpenSpec;
 using kvaf::access::a5::DirectUrmaResources;
 using kvaf::access::a5::DirectUrmaRole;
@@ -88,6 +89,8 @@ struct EndpointResult {
 
 struct Options {
   std::string role;
+  DirectUrmaManagementMode management_mode{
+      DirectUrmaManagementMode::kUrma};
   std::array<std::uint8_t, 16> host_eid{};
   std::array<std::uint8_t, 16> device_eid{};
   std::string host_urma_device;
@@ -102,6 +105,7 @@ struct Options {
   std::uint32_t device_eid_index{0};
   std::uint32_t logical_device_id{0};
   std::uint32_t control_port{21115};
+  std::uint32_t management_jetty_id{511};
   std::uint32_t timeout_seconds{120};
   std::uint32_t transfer_count{kDefaultTransferCount};
   std::uint32_t descriptor_capacity{kDefaultDescriptorCapacity};
@@ -188,7 +192,7 @@ bool ParseEid(const std::string& text,
   return any_nonzero;
 }
 
-std::string FormatIpv6Eid(
+std::string FormatUrmaEid(
     const std::array<std::uint8_t, 16>& eid) {
   std::ostringstream output;
   output << std::hex << std::setfill('0');
@@ -254,7 +258,9 @@ void PrintUsage(const char* program) {
          " --host-eid-index N --device-eid-index N"
          " --provider-library ABS_PATH --provider-soname NAME"
          " --exchange-dir PATH --run-id HEX32_OR_LONGER"
-         " --control-server-address NUMERIC_IP"
+         " [--management-mode ub|tcp]"
+         " [--management-jetty-id N]"
+         " [--control-server-address NUMERIC_IP]"
          " [--control-bind-address NUMERIC_IP]"
          " [--logical-device-id N]"
          " [--control-port N]"
@@ -285,6 +291,14 @@ bool ParseOptions(int argc, char** argv, Options* options) {
     std::uint64_t parsed = 0;
     if (key == "--role") {
       options->role = value;
+    } else if (key == "--management-mode") {
+      if (value == "ub") {
+        options->management_mode = DirectUrmaManagementMode::kUrma;
+      } else if (value == "tcp") {
+        options->management_mode = DirectUrmaManagementMode::kTcp;
+      } else {
+        return false;
+      }
     } else if (key == "--host-eid") {
       host_eid = value;
     } else if (key == "--device-eid") {
@@ -325,6 +339,10 @@ bool ParseOptions(int argc, char** argv, Options* options) {
     } else if (key == "--control-port" && parsed >= 1024 &&
                parsed <= 65535) {
       options->control_port = static_cast<std::uint32_t>(parsed);
+    } else if (key == "--management-jetty-id" && parsed != 0 &&
+               parsed < 1024) {
+      options->management_jetty_id =
+          static_cast<std::uint32_t>(parsed);
     } else if (key == "--timeout-seconds" && parsed != 0 &&
                parsed <=
                    std::numeric_limits<std::uint32_t>::max() / 1000U) {
@@ -396,12 +414,21 @@ bool ParseOptions(int argc, char** argv, Options* options) {
                   [](unsigned char value) {
                     return std::isxdigit(value) != 0;
                   });
-  const int control_family = NumericIpFamily(
-      options->control_server_address);
-  const int bind_family = options->control_bind_address.empty()
-                              ? AF_UNSPEC
-                              : NumericIpFamily(
-                                    options->control_bind_address);
+  bool management_configuration_valid =
+      options->management_jetty_id != 0 &&
+      options->management_jetty_id < 1024U;
+  if (options->management_mode == DirectUrmaManagementMode::kTcp) {
+    const int control_family = NumericIpFamily(
+        options->control_server_address);
+    const int bind_family = options->control_bind_address.empty()
+                                ? AF_UNSPEC
+                                : NumericIpFamily(
+                                      options->control_bind_address);
+    management_configuration_valid =
+        control_family != AF_UNSPEC &&
+        (options->control_bind_address.empty() ||
+         bind_family == control_family);
+  }
   return (options->role == "host" ||
           options->role == "device") &&
          !options->host_urma_device.empty() &&
@@ -412,9 +439,7 @@ bool ParseOptions(int argc, char** argv, Options* options) {
          options->provider_soname.find('/') == std::string::npos &&
          !options->exchange_dir.empty() &&
          valid_run_id &&
-         control_family != AF_UNSPEC &&
-         (options->control_bind_address.empty() ||
-          bind_family == control_family) &&
+         management_configuration_valid &&
          ParseEid(host_eid, &options->host_eid) &&
          ParseEid(device_eid, &options->device_eid) &&
          options->host_eid != options->device_eid;
@@ -903,14 +928,16 @@ DirectUrmaOpenSpec MakeHostOpenSpec(
   spec.provider_library_path = options.provider_library;
   spec.provider_soname = options.provider_soname;
   spec.urma_device = options.host_urma_device;
-  spec.local_eid = FormatIpv6Eid(options.host_eid);
-  spec.peer_eid = FormatIpv6Eid(options.device_eid);
+  spec.management_mode = options.management_mode;
+  spec.local_eid = FormatUrmaEid(options.host_eid);
+  spec.peer_eid = FormatUrmaEid(options.device_eid);
   spec.control_server_address = options.control_server_address;
-  // The Host endpoint is the TCP server and deliberately listens on the
-  // wildcard address for the selected IPv4/IPv6 family.
+  // In TCP compatibility mode the Host deliberately listens on the wildcard
+  // address for the selected IPv4/IPv6 family. UB mode ignores both fields.
   spec.control_bind_address.clear();
   spec.eid_index = options.host_eid_index;
   spec.control_port = options.control_port;
+  spec.management_jetty_id = options.management_jetty_id;
   spec.control_timeout_seconds = options.timeout_seconds;
   // URMA must register the NPU-visible DVA. The Host fills the same pages
   // through the HVA retained by HostDdrDeviceMapping.
@@ -930,12 +957,14 @@ DirectUrmaOpenSpec MakeDeviceOpenSpec(
   spec.provider_library_path = options.provider_library;
   spec.provider_soname = options.provider_soname;
   spec.urma_device = options.device_urma_device;
-  spec.local_eid = FormatIpv6Eid(options.device_eid);
-  spec.peer_eid = FormatIpv6Eid(options.host_eid);
+  spec.management_mode = options.management_mode;
+  spec.local_eid = FormatUrmaEid(options.device_eid);
+  spec.peer_eid = FormatUrmaEid(options.host_eid);
   spec.control_server_address = options.control_server_address;
   spec.control_bind_address = options.control_bind_address;
   spec.eid_index = options.device_eid_index;
   spec.control_port = options.control_port;
+  spec.management_jetty_id = options.management_jetty_id;
   spec.control_timeout_seconds = options.timeout_seconds;
   spec.local_address = output_address;
   spec.local_allocation_bytes = registration_bytes;

@@ -9,7 +9,7 @@ Host DDR(HVA)
   -> halHostRegister(HOST_MEM_MAP_DEV)
   -> Host DVA
   -> Host liburma 注册 MR、创建 Jetty/TP
-  -> TCP 交换 EID、MR、Jetty、TP
+  -> URMA RM 管理 Jetty 交换 EID、MR、Jetty、TP
   -> AICPU liburma 注册 HBM MR、创建 Jetty/SQ/CQ
   -> 返回 AICPU shared device-VA 的 SQ/CQ/doorbell/TP/MR
   -> 32-lane SIMT 规划 descriptor
@@ -44,7 +44,7 @@ device-VA。代码不会把这个执行模型误标成 `CREATE_JETTY_EX/TGID-VA`
 - 当前运行内核对应的完整 UDMA 与 UMMU UAPI header。
 
 Host 与 Device provider 都把固定版本 UMDK 的 common、完整 public URMA
-core、UDMA 和官方 perftest TCP 管理代码，以及配对 libummu 编进自身；private
+core、UDMA 和官方 perftest UB/TCP 管理代码，以及配对 libummu 编进自身；private
 core 在编译期禁用动态 provider 目录扫描。两端 UDMA 源码不再通过 `ST64B` 或
 `TGID_VA` 编译宏伪造不同布局，只在 private accessor 上区分 Host 和 AICPU
 执行域。构建与运行脚本同时检查 `DT_NEEDED` 和 `ldd`，发现外部
@@ -64,8 +64,10 @@ provider 固定从 UMDK commit
 - `src/urma/lib/urma/core` 的完整默认 core，包括 `urma_perf.c` 和
   `ubagg_stats.c`；
 - `src/urma/hw/udma`；
-- `src/urma/tools/urma_perftest` 的资源管理、参数校验、日志和官方
-  `perftest_mgmt_tcp.c` TCP 控制面。
+- `src/urma/tools/urma_perftest` 的资源管理、参数校验、日志，以及官方
+  `perftest_mgmt_ub.c` 和 `perftest_mgmt_tcp.c` 后端；构建清单同时固定
+  `perftest_mgmt.c/.h` 调度器来源，但 direct provider 不编入其 executable-level
+  dispatcher。默认使用 URMA/UB 管理通道；TCP 仅保留为显式回退。
 
 构建脚本要求两棵源码树的 `origin` 都是官方 GitCode 地址、工作树无修改，校验
 精确 commit/tree，并在构建前后重新计算
@@ -183,7 +185,8 @@ KVAF 把 private header 限制在
 
 ```text
 parse/check config
-  -> establish TCP connection
+  -> establish URMA RM management Jetty
+  -> 1-byte client handshake（server 从 CQE 学到 client EID/Jetty ID）
   -> create context
   -> create JFC/Jetty
   -> register local segment
@@ -194,20 +197,23 @@ parse/check config
   -> provider-ready 双端确认
 ```
 
-这里有两个完全独立的地址域。`local_eid/peer_eid` 是 128-bit URMA 标识，只用于
-选择/校验 UDMA 资源，不能作为 TCP 地址传给 perftest 的 `-S` 或 `--bind_ip`。
-TCP 管理面由 `control_server_address` 指定数值 IPv4/IPv6 地址：client 连接该地址，
-server 只取其地址族并监听 wildcard；`control_bind_address` 仅是可选的 client 本地
-bind 地址，且必须与 server 地址同族。provider config 保持 256-byte 固定布局，并
-要求 `KVAF_URMA_PROVIDER_EXPLICIT_TCP_MANAGEMENT` capability bit；新旧 provider/SO
-若混用会在打开 socket/URMA 资源前 fail closed。
-最小 bring-up 可将 `KVAF_DIRECT_CONTROL_SERVER_ADDRESS=auto`；runner 把本 epoch
-已解析的 Host EID 转换为 canonical IPv6，并要求它在本机某个
-`ipourma*` 接口上存在唯一、exact-match 的 global IPv6 assignment，再走
-同一数值 IP 严格校验。不会自动设置 client bind 地址，由 AICPU 路由
-选源。manifest 分别记录
-`control_server_address_source=auto-ipourma-eid|explicit`、
-`control_server_interface` 和解析后的 `control_server_address`。
+默认 `KVAF_DIRECT_MANAGEMENT_MODE=ub`。Host 用自身 EID 创建固定的 RM+CTP 管理
+Jetty 并预投 RECV；Device/AICPU 只需要 Host EID 和约定的 management Jetty ID
+即可 `urma_import_jetty()` 并发送握手。Host 从接收 CQE 的 `remote_id` 得到 Device
+EID/Jetty ID，随后双方用 URMA SEND/RECV 交换正式 data MR、Jetty 和 TP 元数据。
+该路径不创建 IP socket，不读取 `/proc/net/tcp{,6}`，也不依赖 Linux IPv4、IPv6、
+路由或 `ipourma*` 地址配置。EID 即使显示成 IPv6 风格，也只是 128-bit URMA 标识。
+
+`KVAF_DIRECT_MANAGEMENT_JETTY_ID` 必须是双方一致的 well-known ID。runner 默认按
+`500 + physical_device_id` 推导，因此 NPU0..7 分别使用 500..507，并限制在保留范围
+1..1023；0、历史 TCP 端口 21115 和范围外值会在创建资源前被拒绝。runner 启动 Host
+后等待日志中的精确证明
+`KVAF_URMA_MGMT_READY role=server jetty_id=... local_eid=...`，再启动 Device，不能用
+固定 sleep 猜测。
+
+调试旧环境时可显式设置 `KVAF_DIRECT_MANAGEMENT_MODE=tcp`。只有该模式才解析
+`KVAF_DIRECT_CONTROL_SERVER_ADDRESS`、检查 TCP LISTEN socket，并向 worker 传入
+`--control-*` 参数；它不是默认路径，也不是 UB 模式的隐式依赖。
 
 AIV 使用的字段来源如下：
 
@@ -227,8 +233,8 @@ AIV 使用的字段来源如下：
 
 ## 5. 失败与 teardown
 
-创建过程按阶段互相确认。一端失败会 shutdown TCP 控制连接，另一端不会
-无限阻塞。正常关闭顺序是：
+创建过程按阶段互相确认。管理握手和 CQ polling 都受同一个有界 provider deadline
+约束，一端失败会唤醒另一端并进入 checked cleanup。正常关闭顺序是：
 
 ```text
 AIV stream 完成
@@ -238,8 +244,16 @@ AIV stream 完成
   -> 两端 unimport peer segment
   -> barrier
   -> unregister local segment/token
-  -> 删除 Jetty/JFC/context
+  -> 删除 data Jetty/JFC/context（按 owner context 校验，管理 context 仍存活）
+  -> 删除 management target Jetty/local Jetty/JFR/segment/JFC/context
+  -> 确认全局 live-resource 计数为 0
+  -> urma_uninit
 ```
+
+管理 context 必须留到 data context 完成双端 teardown 协议之后；否则 barrier 本身
+会被提前拆掉。反过来，删除 data context 时也不能要求进程内所有 URMA 资源都为零，
+因为此时管理 context 合法存活。因此 provider 的 context gate 只检查“该 context
+拥有的资源”，最后关闭管理 context 后才执行全局零资源检查与 runtime uninit。
 
 每次运行生成独立 `run_id`。`device.close_ready`、`device.done` 和两端最终
 marker 都必须携带同一 nonce，旧目录中的 marker 不能触发本次释放。两端
@@ -690,14 +704,14 @@ export KVAF_H2D_TIMEOUT_SECONDS=120
 export KVAF_H2D_RUN_TIMEOUT_SECONDS=600
 unset KVAF_DIRECT_SERVER_START_DELAY_SECONDS
 export KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS=30
-# 默认按 Device timeout + listener-ready timeout + 5 秒计算；通常无需覆盖。
+# 默认按 Device timeout + management-ready timeout + 5 秒计算；通常无需覆盖。
 unset KVAF_HOST_CONTROL_TIMEOUT_SECONDS
-export KVAF_DIRECT_CONTROL_PORT=22117
-# 最小 bring-up 每个 epoch 从 Host EID exact-match 本机 ipourma* global IPv6。
-export KVAF_DIRECT_CONTROL_SERVER_ADDRESS=auto
-# 也可显式指定已验证的 Host 数值 IPv4/IPv6：
-# export KVAF_DIRECT_CONTROL_SERVER_ADDRESS="<HOST_CONTROL_IP>"
-# 保持空，由 AICPU 路由自行选择 client 源地址。
+export KVAF_DIRECT_MANAGEMENT_MODE=ub
+# 可省略；NPU7 默认推导为 507。显式设置时必须位于 1..1023。
+export KVAF_DIRECT_MANAGEMENT_JETTY_ID=507
+# UB 模式不读取或传递任何 TCP/IP 控制参数。
+unset KVAF_DIRECT_CONTROL_PORT
+unset KVAF_DIRECT_CONTROL_SERVER_ADDRESS
 unset KVAF_DIRECT_CONTROL_BIND_ADDRESS
 export KVAF_A5_RUN_TAG="npu7_checked_$(date +%Y%m%d_%H%M%S)_$$"
 
@@ -705,28 +719,28 @@ bash scripts/run_a5_direct_urma_epoch_owner_validation.sh
 ```
 
 runner 不再用固定 sleep 猜测 Host server 是否启动。它固定本次 Host PID 的
-`start_ticks` 和可执行文件，再将该进程 `/proc/<pid>/fd` 持有的 socket inode 与
-同一 network namespace 的 `/proc/<pid>/net/tcp{,6}` 中 `LISTEN` 项精确求交；只有
-确认该 PID 已监听指定端口，才立即启动 Device。旧
+`start_ticks` 和可执行文件，并只接受本次 Host provider 写入日志的完整
+`KVAF_URMA_MGMT_READY role=server jetty_id=<id> local_eid=<eid>` 行；只有确认该 PID
+已创建管理 Jetty 并预投 RECV，才立即启动 Device。旧
 `KVAF_DIRECT_SERVER_START_DELAY_SECONDS` 会直接报参数错误，避免遗留的 5 秒延迟
-继续消耗 Host `accept()` deadline。
+继续消耗 Host 管理握手 deadline。
 
-Device provider 的控制超时仍由 `KVAF_H2D_TIMEOUT_SECONDS` 指定。Host 的监听窗口
-独立使用 `KVAF_HOST_CONTROL_TIMEOUT_SECONDS`；默认值是 Device timeout 加 listener
+Device provider 的控制超时仍由 `KVAF_H2D_TIMEOUT_SECONDS` 指定。Host 的管理窗口
+独立使用 `KVAF_HOST_CONTROL_TIMEOUT_SECONDS`；默认值是 Device timeout 加 management
 ready timeout 再加 5 秒，并在 manifest 中分别记录。AIV 对 AICPU owner 的 READY
 观察使用单次一致性快照和 10 ms Host 节拍，不再设置一个会与 provider Open/cleanup
-竞争的第二截止时间。普通 TCP 超时必须等 owner 发布 `OPEN_FAILED_SAFE` 后按退出码
+竞争的第二截止时间。普通管理握手超时必须等 owner 发布 `OPEN_FAILED_SAFE` 后按退出码
 3 收敛；若 owner 本身长期无终态，runner 以退出码 5 保留 live worker 和 active
 state，而不会仅因观察超时制造 quarantine。
 
-`KVAF_H2D_RUN_TIMEOUT_SECONDS` 从 Device 启动后计时；Host listener-ready 阶段由
+`KVAF_H2D_RUN_TIMEOUT_SECONDS` 从 Device 启动后计时；Host management-ready 阶段由
 `KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS` 单独计时。因此最坏墙钟监督时长是两者
 之和，不应把 run timeout 理解为从 Host fork 起算的全局 deadline。
 
-不要把 Device URMA EID 直接自动填入 `KVAF_DIRECT_CONTROL_BIND_ADDRESS`。EID 能
-证明 UDMA endpoint，却不能证明同一 128-bit 值可在 AICPU 的 TCP network namespace
-执行 IPv6 `bind()`。当前最小路径先保持 bind 为空，让内核选源；若连接仍安全失败，
-应先用不创建 URMA/MR/Jetty 的 AICPU socket probe 验证显式源地址，再决定是否固定。
+需要回归旧 TCP 管理面时，显式设置
+`KVAF_DIRECT_MANAGEMENT_MODE=tcp`、`KVAF_DIRECT_CONTROL_PORT` 和
+`KVAF_DIRECT_CONTROL_SERVER_ADDRESS`。此时 runner 才恢复 PID-bound LISTEN 证明和
+IPv4/IPv6 地址校验；不要把它误当成 UB 默认路径的前置条件。
 
 当前 `vllm-ascend-cs-kvaf` 挂载全部 0–7 号设备，runner 要求逻辑卡号与物理卡号
 相等。二者不同时，无法在“不先创建 ACL device context”的前提下证明映射关系，

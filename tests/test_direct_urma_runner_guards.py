@@ -277,6 +277,33 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
         )
         self.assertLess(listener, device)
 
+    def test_ub_management_is_default_and_needs_no_ip_listener(self) -> None:
+        for expected in (
+            "KVAF_DIRECT_MANAGEMENT_MODE=${KVAF_DIRECT_MANAGEMENT_MODE:-ub}",
+            "KVAF_DIRECT_MANAGEMENT_JETTY_ID",
+            "KVAF_DIRECT_MANAGEMENT_JETTY_ID=$((500 + KVAF_PHYSICAL_DEVICE_ID))",
+            "wait_for_host_urma_management_ready",
+            "format_urma_eid_canonical",
+            "KVAF_URMA_MGMT_READY role=server",
+            '--management-mode "${KVAF_DIRECT_MANAGEMENT_MODE}"',
+            '--management-jetty-id "${KVAF_DIRECT_MANAGEMENT_JETTY_ID}"',
+            "KVAF_A5_HOST_URMA_MANAGEMENT_READY",
+            "management_host_eid_canonical=%s",
+        ):
+            self.assertIn(expected, self.source)
+        tcp_branch = self.source.index(
+            'if [[ "${KVAF_DIRECT_MANAGEMENT_MODE}" == tcp ]]; then'
+        )
+        ip_validation = self.source.index(
+            "if ! KVAF_DIRECT_CONTROL_SERVER_ADDRESS=", tcp_branch
+        )
+        self.assertLess(tcp_branch, ip_validation)
+        ub_wait = self.source.index("wait_for_host_urma_management_ready")
+        device = self.source.index(
+            'nohup "${KVAF_A5_DIRECT_BINARY}" --role device', ub_wait
+        )
+        self.assertLess(ub_wait, device)
+
     def test_tcp_control_addresses_are_explicit_validated_and_audited(self) -> None:
         for expected in (
             "KVAF_DIRECT_CONTROL_SERVER_ADDRESS",

@@ -153,6 +153,7 @@ kvaf_verify_direct_provider_build_v3()
   local runtime_header_path runtime_header_sha expected_runtime_header_sha
   local build_kernel_release
   local umdk_commit libummu_commit expected_libummu_commit
+  local umdk_root management_source management_path
   local binding command key prefix
 
   # Parse the schema before requiring platform-specific ELF tools so legacy
@@ -264,7 +265,7 @@ kvaf_verify_direct_provider_build_v3()
     'urma_common_mode:official-umdk-source-built-internal' \
     'urma_common_dt_needed:absent' \
     'perftest_source:official-umdk' \
-    'perftest_management:official-umdk-tcp' \
+    'perftest_management:official-umdk-ub-default-tcp-fallback-v1' \
     'udma_provider_mode:official-umdk-source-built-internal' \
     'udma_source_capability_magic:0x4b56414655444d41' \
     'udma_runtime_capability:0x0000000000020001' \
@@ -359,6 +360,22 @@ kvaf_verify_direct_provider_build_v3()
     KVAF_UDMA_PRIVATE_ABI= udma_private_abi || return 1
   kvaf_v3_verify_probe ummu_uapi kvaf_ummu_uapi_probe \
     KVAF_UMMU_UAPI_ABI= ummu_uapi_abi || return 1
+
+  umdk_root=$(kvaf_v3_manifest_value umdk_root \
+    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
+  for management_source in \
+    perftest_mgmt.c perftest_mgmt.h \
+    perftest_mgmt_tcp.c perftest_mgmt_tcp.h \
+    perftest_mgmt_ub.c perftest_mgmt_ub.h
+  do
+    management_path="${umdk_root}/src/urma/tools/urma_perftest/${management_source}"
+    awk -v expected="${management_path}" \
+        '$2 == expected { found = 1 } END { exit found ? 0 : 1 }' \
+        "${umdk_manifest}" || {
+      kvaf_v3_error "UMDK source manifest omits ${management_source}"
+      return 1
+    }
+  done
 
   for artifact in \
     "${KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST}" \

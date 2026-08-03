@@ -83,6 +83,67 @@ int NumericIpFamily(const std::string& address) {
   return AF_UNSPEC;
 }
 
+int HexNibble(char value) {
+  if (value >= '0' && value <= '9') {
+    return value - '0';
+  }
+  if (value >= 'a' && value <= 'f') {
+    return 10 + value - 'a';
+  }
+  if (value >= 'A' && value <= 'F') {
+    return 10 + value - 'A';
+  }
+  return -1;
+}
+
+// URMA EIDs are 128-bit transport identifiers.  Their conventional text
+// form resembles an IPv6 address, but validating one must not imply that a
+// Linux IP socket, interface, route, or IPv6 stack participates in the path.
+bool ParseUrmaEid(const std::string& text,
+                  std::array<std::uint8_t, 16>* eid) {
+  if (eid == nullptr) {
+    return false;
+  }
+  std::array<char, 32> compact{};
+  std::size_t length = 0;
+  for (const char value : text) {
+    if (value == ':' || value == '-') {
+      continue;
+    }
+    if (length == compact.size() || HexNibble(value) < 0) {
+      return false;
+    }
+    compact[length++] = value;
+  }
+  if (length != compact.size()) {
+    return false;
+  }
+  bool any_nonzero = false;
+  for (std::size_t index = 0; index < eid->size(); ++index) {
+    const int high = HexNibble(compact[index * 2U]);
+    const int low = HexNibble(compact[index * 2U + 1U]);
+    (*eid)[index] =
+        static_cast<std::uint8_t>((high << 4) | low);
+    any_nonzero = any_nonzero || (*eid)[index] != 0;
+  }
+  return any_nonzero;
+}
+
+std::string FormatUrmaEid(
+    const std::array<std::uint8_t, 16>& eid) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string canonical;
+  canonical.reserve(39);
+  for (std::size_t index = 0; index < eid.size(); ++index) {
+    if (index != 0 && index % 2U == 0) {
+      canonical.push_back(':');
+    }
+    canonical.push_back(kHex[eid[index] >> 4U]);
+    canonical.push_back(kHex[eid[index] & 0x0fU]);
+  }
+  return canonical;
+}
+
 bool RangeContains(std::uint64_t base, std::uint64_t capacity,
                    std::uint64_t address, std::uint64_t bytes) {
   return address >= base && bytes <= capacity &&
@@ -133,8 +194,7 @@ Status ValidateProviderResult(
         "direct URMA provider returned an invalid memory view");
   }
   std::array<std::uint8_t, 16> expected_peer{};
-  if (inet_pton(AF_INET6, expected_peer_eid.c_str(),
-                expected_peer.data()) != 1 ||
+  if (!ParseUrmaEid(expected_peer_eid, &expected_peer) ||
       !std::equal(expected_peer.begin(), expected_peer.end(),
                   std::begin(result.remote_eid))) {
     return Status::Error(
@@ -444,29 +504,42 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
     return Status::Error(StatusCode::kOutOfRange,
                          "direct URMA segment payload is too large");
   }
-  const int control_family = NumericIpFamily(
-      spec.control_server_address);
-  const int bind_family = spec.control_bind_address.empty()
-                              ? AF_UNSPEC
-                              : NumericIpFamily(spec.control_bind_address);
   std::array<std::uint8_t, 16> local_eid{};
   std::array<std::uint8_t, 16> peer_eid{};
-  if (inet_pton(AF_INET6, spec.local_eid.c_str(), local_eid.data()) != 1 ||
-      inet_pton(AF_INET6, spec.peer_eid.c_str(), peer_eid.data()) != 1 ||
+  if (!ParseUrmaEid(spec.local_eid, &local_eid) ||
+      !ParseUrmaEid(spec.peer_eid, &peer_eid) ||
       local_eid == peer_eid) {
     return Status::Error(
         StatusCode::kInvalidArgument,
-        "local/peer URMA EIDs must be distinct numeric IPv6 values");
+        "local/peer URMA EIDs must be distinct non-zero 128-bit values");
   }
-  if (control_family == AF_UNSPEC ||
-      (spec.role == DirectUrmaRole::kServer &&
-       !spec.control_bind_address.empty()) ||
-      (!spec.control_bind_address.empty() &&
-       bind_family != control_family)) {
-    return Status::Error(
-        StatusCode::kInvalidArgument,
-        "TCP control server/bind addresses must be numeric, use one IP "
-        "family, and keep the server bind empty for wildcard listen");
+  if (spec.management_mode == DirectUrmaManagementMode::kTcp) {
+    const int control_family = NumericIpFamily(
+        spec.control_server_address);
+    const int bind_family = spec.control_bind_address.empty()
+                                ? AF_UNSPEC
+                                : NumericIpFamily(
+                                      spec.control_bind_address);
+    if (control_family == AF_UNSPEC ||
+        (spec.role == DirectUrmaRole::kServer &&
+         !spec.control_bind_address.empty()) ||
+        (!spec.control_bind_address.empty() &&
+         bind_family != control_family)) {
+      return Status::Error(
+          StatusCode::kInvalidArgument,
+          "TCP control server/bind addresses must be numeric, use one IP "
+          "family, and keep the server bind empty for wildcard listen");
+    }
+  } else if (spec.management_mode == DirectUrmaManagementMode::kUrma) {
+    if (spec.management_jetty_id == 0 ||
+        spec.management_jetty_id >= 1024U) {
+      return Status::Error(
+          StatusCode::kInvalidArgument,
+          "URMA management Jetty ID must be in the range 1..1023");
+    }
+  } else {
+    return Status::Error(StatusCode::kInvalidArgument,
+                         "unknown direct URMA management mode");
   }
   const std::uint64_t minimum_half =
       std::max<std::uint64_t>(spec.segment_payload_bytes, 4096U);
@@ -483,14 +556,24 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
   config.role = spec.role == DirectUrmaRole::kServer
                     ? KVAF_URMA_PROVIDER_SERVER
                     : KVAF_URMA_PROVIDER_CLIENT;
-  config.flags = KVAF_URMA_PROVIDER_USE_CTP |
-                 KVAF_URMA_PROVIDER_EXPLICIT_TCP_MANAGEMENT |
+  const std::uint32_t management_flag =
+      spec.management_mode == DirectUrmaManagementMode::kUrma
+          ? KVAF_URMA_PROVIDER_URMA_MANAGEMENT
+          : KVAF_URMA_PROVIDER_EXPLICIT_TCP_MANAGEMENT;
+  config.flags = KVAF_URMA_PROVIDER_USE_CTP | management_flag |
                  (spec.execution_domain ==
                           DirectUrmaExecutionDomain::kHostProcess
                       ? KVAF_URMA_PROVIDER_EXPECT_HOST_PRIVATE_ABI
                       : KVAF_URMA_PROVIDER_EXPECT_DEVICE_PRIVATE_ABI);
   config.eid_index = spec.eid_index;
-  config.control_port = spec.control_port;
+  config.control_port =
+      spec.management_mode == DirectUrmaManagementMode::kTcp
+          ? spec.control_port
+          : 0U;
+  config.management_jetty_id =
+      spec.management_mode == DirectUrmaManagementMode::kUrma
+          ? spec.management_jetty_id
+          : 0U;
   config.address_kind = KVAF_URMA_PROVIDER_ADDRESS_DEVICE_VA;
   config.control_timeout_seconds = spec.control_timeout_seconds;
   impl_->session_id = NextSessionId();
@@ -509,15 +592,31 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
   if (!status.ok()) {
     return status;
   }
-  status = CopyFixedString(
-      spec.control_server_address, config.control_server_address,
-      sizeof(config.control_server_address), "TCP control server address");
-  if (!status.ok()) {
-    return status;
+  if (spec.management_mode == DirectUrmaManagementMode::kTcp) {
+    status = CopyFixedString(
+        spec.control_server_address, config.control_server_address,
+        sizeof(config.control_server_address),
+        "TCP control server address");
+    if (status.ok()) {
+      status = CopyFixedString(
+          spec.control_bind_address, config.control_bind_address,
+          sizeof(config.control_bind_address), "TCP control bind address",
+          true);
+    }
+  } else {
+    const std::string canonical_peer_eid = FormatUrmaEid(peer_eid);
+    const std::string canonical_local_eid = FormatUrmaEid(local_eid);
+    status = CopyFixedString(
+        canonical_peer_eid, config.management_peer_address,
+        sizeof(config.management_peer_address),
+        "URMA management peer EID");
+    if (status.ok()) {
+      status = CopyFixedString(
+          canonical_local_eid, config.management_local_address,
+          sizeof(config.management_local_address),
+          "URMA management local EID");
+    }
   }
-  status = CopyFixedString(
-      spec.control_bind_address, config.control_bind_address,
-      sizeof(config.control_bind_address), "TCP control bind address", true);
   if (!status.ok()) {
     return status;
   }

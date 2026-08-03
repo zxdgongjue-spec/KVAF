@@ -41,13 +41,14 @@ static urma_device_t *kvaf_owned_urma_get_device_by_name(char *name)
  * entry points.  In the official executable their two helpers live in
  * urma_perftest.c and perftest_mgmt.c, neither of which belongs in the
  * source-linked direct provider (the former brings main/run loops; the
- * latter brings the unselected UB management backend).
+ * latter owns the executable-level management dispatcher).
  *
  * The checked direct path rejects use_jfce before creating any resource, so
  * an accidental legacy JFCE rearm must fail closed rather than silently
- * widening the supported surface.  Legacy connection close can safely use
- * the same source-matched TCP owner and then release the three config strings
- * that official perftest_mgmt.c owns.
+ * widening the supported surface. Legacy connection close delegates to the
+ * selected source-matched TCP or UB owner and then releases the three config
+ * strings that official perftest_mgmt.c owns. The checked direct path never
+ * enters this void-returning legacy wrapper.
  */
 static int kvaf_legacy_rearm_jfc_unsupported(
     perftest_context_t *ctx, const perftest_config_t *cfg)
@@ -62,7 +63,7 @@ static void kvaf_legacy_close_connection(perftest_config_t *cfg)
     if (cfg == NULL) {
         return;
     }
-    kvaf_perftest_close_connection(cfg);
+    (void)kvaf_perftest_close_connection(cfg);
     free(cfg->server_ip);
     cfg->server_ip = NULL;
     free(cfg->bind_ip);

@@ -210,6 +210,14 @@ enum kvaf_urma_provider_config_flag {
    * intentionally preserved.
    */
   KVAF_URMA_PROVIDER_EXPLICIT_TCP_MANAGEMENT = 1U << 3,
+  /*
+   * Bootstrap and all perftest metadata exchange use a dedicated URMA
+   * RM+CTP management Jetty.  The 128-bit EID strings in the two fixed text
+   * slots are URMA identifiers; they are never passed to an IPv4/IPv6 socket.
+   * Exactly one management flag must be set, which makes a new caller paired
+   * with an old provider (or the reverse) fail closed.
+   */
+  KVAF_URMA_PROVIDER_URMA_MANAGEMENT = 1U << 4,
 };
 
 enum kvaf_urma_provider_address_kind {
@@ -299,9 +307,10 @@ struct kvaf_urma_provider_config_v2 {
   uint32_t flags;
   uint32_t eid_index;
   uint32_t jetty_index;
+  // TCP listener port. Ignored by the URMA management backend.
   uint32_t control_port;
   uint32_t address_kind;
-  // Deadline applied to every control-socket send/receive after connect.
+  // Shared monotonic deadline for management bootstrap and every exchange.
   uint32_t control_timeout_seconds;
   // Non-zero caller nonce. A close operation may destroy only the provider
   // context created by the same nonce.
@@ -310,15 +319,29 @@ struct kvaf_urma_provider_config_v2 {
   uint64_t local_allocation_bytes;
   uint64_t segment_payload_bytes;
   char device_name[KVAF_URMA_PROVIDER_NAME_BYTES];
-  // Numeric IPv4/IPv6 address used by the client as its TCP connect target.
-  // The server uses only its address family and always listens on wildcard.
-  char control_server_address[
-      KVAF_URMA_PROVIDER_CONTROL_ADDRESS_BYTES];
-  // Optional numeric client-side TCP bind address. It must be empty for the
-  // server role and, when present, have the same family as the server address.
-  char control_bind_address[
-      KVAF_URMA_PROVIDER_CONTROL_ADDRESS_BYTES];
-  uint64_t reserved[3];
+  union {
+    // Numeric IPv4/IPv6 client connect target in TCP management mode.
+    char control_server_address[
+        KVAF_URMA_PROVIDER_CONTROL_ADDRESS_BYTES];
+    // Peer/server URMA EID in UB management mode. The server carries its
+    // expected peer EID for validation even though bootstrap learns the
+    // client's Jetty ID from the receive CQE.
+    char management_peer_address[
+        KVAF_URMA_PROVIDER_CONTROL_ADDRESS_BYTES];
+  };
+  union {
+    // Optional numeric client bind address in TCP management mode.
+    char control_bind_address[
+        KVAF_URMA_PROVIDER_CONTROL_ADDRESS_BYTES];
+    // Local URMA EID in UB management mode.
+    char management_local_address[
+        KVAF_URMA_PROVIDER_CONTROL_ADDRESS_BYTES];
+  };
+  // Fixed, non-zero server management Jetty ID. It is deliberately separate
+  // from the TCP port and from the data Jetty created by perftest.
+  uint32_t management_jetty_id;
+  uint32_t reserved0;
+  uint64_t reserved[2];
 };
 
 // Provider-private pointers never cross this ABI. Only device-visible queue,
@@ -510,6 +533,15 @@ static_assert(offsetof(kvaf_urma_provider_config_v2,
 static_assert(offsetof(kvaf_urma_provider_config_v2,
                        control_bind_address) == 168,
               "unexpected direct URMA control bind address offset");
+static_assert(offsetof(kvaf_urma_provider_config_v2,
+                       management_peer_address) == 104,
+              "unexpected direct URMA management peer EID offset");
+static_assert(offsetof(kvaf_urma_provider_config_v2,
+                       management_local_address) == 168,
+              "unexpected direct URMA management local EID offset");
+static_assert(offsetof(kvaf_urma_provider_config_v2,
+                       management_jetty_id) == 232,
+              "unexpected direct URMA management Jetty offset");
 static_assert(offsetof(kvaf_urma_provider_result_v2, session_id) == 160,
               "unexpected direct URMA result session offset");
 static_assert(offsetof(kvaf_urma_aicpu_close_args_v2, result_address) == 72,
@@ -588,6 +620,15 @@ _Static_assert(offsetof(struct kvaf_urma_provider_config_v2,
 _Static_assert(offsetof(struct kvaf_urma_provider_config_v2,
                         control_bind_address) == 168,
                "unexpected direct URMA control bind address offset");
+_Static_assert(offsetof(struct kvaf_urma_provider_config_v2,
+                        management_peer_address) == 104,
+               "unexpected direct URMA management peer EID offset");
+_Static_assert(offsetof(struct kvaf_urma_provider_config_v2,
+                        management_local_address) == 168,
+               "unexpected direct URMA management local EID offset");
+_Static_assert(offsetof(struct kvaf_urma_provider_config_v2,
+                        management_jetty_id) == 232,
+               "unexpected direct URMA management Jetty offset");
 _Static_assert(offsetof(struct kvaf_urma_provider_result_v2, session_id) == 160,
                "unexpected direct URMA result session offset");
 _Static_assert(offsetof(struct kvaf_urma_aicpu_close_args_v2,

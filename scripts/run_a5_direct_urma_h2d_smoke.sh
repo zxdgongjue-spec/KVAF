@@ -48,6 +48,8 @@ KVAF_HCCN_TOOL=${KVAF_HCCN_TOOL:-}
 KVAF_HCCN_TIMEOUT_SECONDS=${KVAF_HCCN_TIMEOUT_SECONDS:-30}
 KVAF_LOGICAL_DEVICE_ID=${KVAF_LOGICAL_DEVICE_ID:-0}
 KVAF_PHYSICAL_DEVICE_ID=${KVAF_PHYSICAL_DEVICE_ID:-}
+KVAF_DIRECT_MANAGEMENT_MODE=${KVAF_DIRECT_MANAGEMENT_MODE:-ub}
+KVAF_DIRECT_MANAGEMENT_JETTY_ID=${KVAF_DIRECT_MANAGEMENT_JETTY_ID:-}
 KVAF_DIRECT_CONTROL_PORT=${KVAF_DIRECT_CONTROL_PORT:-21115}
 KVAF_DIRECT_CONTROL_SERVER_ADDRESS=${KVAF_DIRECT_CONTROL_SERVER_ADDRESS:-}
 KVAF_DIRECT_CONTROL_BIND_ADDRESS=${KVAF_DIRECT_CONTROL_BIND_ADDRESS:-}
@@ -90,8 +92,8 @@ else
 fi
 KVAF_H2D_TIMEOUT_SECONDS=${KVAF_H2D_TIMEOUT_SECONDS:-120}
 if [[ -n "${KVAF_DIRECT_SERVER_START_DELAY_SECONDS+x}" ]]; then
-  echo "ERROR: KVAF_DIRECT_SERVER_START_DELAY_SECONDS was removed; fixed sleeps consume the Host accept deadline" >&2
-  echo "Set KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS instead; Device starts immediately after PID-bound LISTEN proof." >&2
+  echo "ERROR: KVAF_DIRECT_SERVER_START_DELAY_SECONDS was removed; fixed sleeps consume the Host management deadline" >&2
+  echo "Set KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS instead; Device starts after PID-bound management readiness proof." >&2
   exit 2
 fi
 KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS=${KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS:-30}
@@ -575,8 +577,18 @@ acquire_persistent_session_guards()
 
 require_uint_max KVAF_LOGICAL_DEVICE_ID \
   "${KVAF_LOGICAL_DEVICE_ID}" 4294967295
-require_uint_max KVAF_DIRECT_CONTROL_PORT \
-  "${KVAF_DIRECT_CONTROL_PORT}" 65535
+case "${KVAF_DIRECT_MANAGEMENT_MODE}" in
+  ub|tcp)
+    ;;
+  *)
+    echo "ERROR: KVAF_DIRECT_MANAGEMENT_MODE must be ub or tcp" >&2
+    exit 2
+    ;;
+esac
+if [[ "${KVAF_DIRECT_MANAGEMENT_MODE}" == tcp ]]; then
+  require_uint_max KVAF_DIRECT_CONTROL_PORT \
+    "${KVAF_DIRECT_CONTROL_PORT}" 65535
+fi
 require_uint_max KVAF_H2D_TRANSFER_COUNT \
   "${KVAF_H2D_TRANSFER_COUNT}" 67108864
 require_uint_max KVAF_H2D_BYTES_PER_TRANSFER \
@@ -639,10 +651,12 @@ if [[ -n "${KVAF_PAIR_CHANNEL}" ]]; then
   require_uint_max KVAF_PAIR_CHANNEL \
     "${KVAF_PAIR_CHANNEL}" 4294967295
 fi
-if (( KVAF_DIRECT_CONTROL_PORT < 1024 ||
-      KVAF_DIRECT_CONTROL_PORT > 65535 )); then
-  echo "ERROR: KVAF_DIRECT_CONTROL_PORT must be in [1024, 65535]" >&2
-  exit 2
+if [[ "${KVAF_DIRECT_MANAGEMENT_MODE}" == tcp ]]; then
+  if (( KVAF_DIRECT_CONTROL_PORT < 1024 ||
+        KVAF_DIRECT_CONTROL_PORT > 65535 )); then
+    echo "ERROR: KVAF_DIRECT_CONTROL_PORT must be in [1024, 65535]" >&2
+    exit 2
+  fi
 fi
 if (( KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS == 0 ||
       KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS >
@@ -656,33 +670,36 @@ if (( KVAF_HOST_CONTROL_TIMEOUT_SECONDS < KVAF_H2D_TIMEOUT_SECONDS ||
   echo "ERROR: KVAF_HOST_CONTROL_TIMEOUT_SECONDS must be in [KVAF_H2D_TIMEOUT_SECONDS, KVAF_H2D_RUN_TIMEOUT_SECONDS]" >&2
   exit 2
 fi
-KVAF_DIRECT_CONTROL_SERVER_ADDRESS_SOURCE=explicit
+KVAF_DIRECT_CONTROL_SERVER_ADDRESS_SOURCE=unused
 KVAF_DIRECT_CONTROL_SERVER_INTERFACE=none
-if [[ "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}" == auto ]]; then
-  KVAF_DIRECT_CONTROL_SERVER_ADDRESS_SOURCE=auto-ipourma-eid
-else
-  if ! KVAF_DIRECT_CONTROL_SERVER_ADDRESS=$(
-    normalize_numeric_ip "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}"
-  ); then
-    echo "ERROR: KVAF_DIRECT_CONTROL_SERVER_ADDRESS must be auto or a numeric IPv4/IPv6 address" >&2
-    echo "URMA EIDs are not TCP management addresses." >&2
-    exit 2
+if [[ "${KVAF_DIRECT_MANAGEMENT_MODE}" == tcp ]]; then
+  KVAF_DIRECT_CONTROL_SERVER_ADDRESS_SOURCE=explicit
+  if [[ "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}" == auto ]]; then
+    KVAF_DIRECT_CONTROL_SERVER_ADDRESS_SOURCE=auto-ipourma-eid
+  else
+    if ! KVAF_DIRECT_CONTROL_SERVER_ADDRESS=$(
+      normalize_numeric_ip "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}"
+    ); then
+      echo "ERROR: TCP management requires KVAF_DIRECT_CONTROL_SERVER_ADDRESS=auto or a numeric IPv4/IPv6 address" >&2
+      echo "URMA EIDs are not TCP management addresses." >&2
+      exit 2
+    fi
   fi
-fi
-if [[ -n "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}" ]]; then
-  if ! KVAF_DIRECT_CONTROL_BIND_ADDRESS=$(
-    normalize_numeric_ip "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}"
-  ); then
-    echo "ERROR: KVAF_DIRECT_CONTROL_BIND_ADDRESS must be empty or a numeric IPv4/IPv6 address" >&2
-    exit 2
-  fi
-  if [[ "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS_SOURCE}" == explicit ]] &&
-     { { [[ "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}" == *:* ]] &&
-         [[ "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}" != *:* ]]; } ||
-       { [[ "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}" != *:* ]] &&
-         [[ "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}" == *:* ]]; }; }; then
-    echo "ERROR: control server and client bind addresses must use the same IP family" >&2
-    exit 2
+  if [[ -n "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}" ]]; then
+    if ! KVAF_DIRECT_CONTROL_BIND_ADDRESS=$(
+      normalize_numeric_ip "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}"
+    ); then
+      echo "ERROR: KVAF_DIRECT_CONTROL_BIND_ADDRESS must be empty or a numeric IPv4/IPv6 address" >&2
+      exit 2
+    fi
+    if [[ "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS_SOURCE}" == explicit ]] &&
+       { { [[ "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}" == *:* ]] &&
+           [[ "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}" != *:* ]]; } ||
+         { [[ "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}" != *:* ]] &&
+           [[ "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}" == *:* ]]; }; }; then
+      echo "ERROR: control server and client bind addresses must use the same IP family" >&2
+      exit 2
+    fi
   fi
 fi
 if (( KVAF_H2D_BYTES_PER_TRANSFER == 0 ||
@@ -858,6 +875,26 @@ if [[ "${KVAF_LOGICAL_DEVICE_ID}" != \
   exit 2
 fi
 
+# UMDK's URMA-management bootstrap uses a well-known server Jetty ID. Keep
+# it in the kernel-reserved range so it cannot collide with dynamically
+# allocated application Jetty IDs. A5 physical IDs 0..7 map to 500..507.
+if [[ -z "${KVAF_DIRECT_MANAGEMENT_JETTY_ID}" ]]; then
+  if (( KVAF_PHYSICAL_DEVICE_ID > 523 )); then
+    echo "ERROR: cannot derive a reserved management Jetty ID for physical NPU ${KVAF_PHYSICAL_DEVICE_ID}" >&2
+    echo "Set KVAF_DIRECT_MANAGEMENT_JETTY_ID explicitly in [1, 1023]." >&2
+    exit 2
+  fi
+  KVAF_DIRECT_MANAGEMENT_JETTY_ID=$((500 + KVAF_PHYSICAL_DEVICE_ID))
+fi
+require_uint_max KVAF_DIRECT_MANAGEMENT_JETTY_ID \
+  "${KVAF_DIRECT_MANAGEMENT_JETTY_ID}" 65535
+if (( KVAF_DIRECT_MANAGEMENT_JETTY_ID == 0 ||
+      KVAF_DIRECT_MANAGEMENT_JETTY_ID == 21115 ||
+      KVAF_DIRECT_MANAGEMENT_JETTY_ID > 1023 )); then
+  echo "ERROR: KVAF_DIRECT_MANAGEMENT_JETTY_ID must be in the reserved range [1, 1023] and must not be 21115" >&2
+  exit 2
+fi
+
 if [[ -z "${KVAF_HOST_EID}" ]]; then
   resolver_args=(
     --physical-device-id "${KVAF_PHYSICAL_DEVICE_ID}"
@@ -904,6 +941,19 @@ normalize_eid()
   printf '%s\n' "${value}"
 }
 
+format_urma_eid_canonical()
+{
+  local value=$1
+  if ! [[ "${value}" =~ ^[0-9a-f]{32}$ ]]; then
+    return 1
+  fi
+  printf '%s:%s:%s:%s:%s:%s:%s:%s\n' \
+    "${value:0:4}" "${value:4:4}" \
+    "${value:8:4}" "${value:12:4}" \
+    "${value:16:4}" "${value:20:4}" \
+    "${value:24:4}" "${value:28:4}"
+}
+
 if ! host_eid=$(normalize_eid "${KVAF_HOST_EID}"); then
   echo "ERROR: KVAF_HOST_EID is not a non-zero 16-byte EID" >&2
   exit 2
@@ -916,6 +966,12 @@ if [[ "${host_eid}" == "${device_eid}" ]]; then
   echo "ERROR: Host and Device EIDs must be different" >&2
   exit 2
 fi
+host_management_eid=$(
+  format_urma_eid_canonical "${host_eid}"
+) || {
+  echo "ERROR: could not format the canonical Host management EID" >&2
+  exit 2
+}
 
 if [[ "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS_SOURCE}" == \
       auto-ipourma-eid ]]; then
@@ -1091,14 +1147,16 @@ case "${kvaf_sq_reserved}" in
     ;;
 esac
 
-printf -v kvaf_control_port_hex '%04X' \
-  "${KVAF_DIRECT_CONTROL_PORT}"
-if awk -v expected_port="${kvaf_control_port_hex}" '
-    $4 == "0A" && $2 ~ ":" expected_port "$" { found = 1 }
-    END { exit found ? 0 : 1 }
-  ' /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
-  echo "ERROR: control port ${KVAF_DIRECT_CONTROL_PORT} is already listening" >&2
-  exit 2
+if [[ "${KVAF_DIRECT_MANAGEMENT_MODE}" == tcp ]]; then
+  printf -v kvaf_control_port_hex '%04X' \
+    "${KVAF_DIRECT_CONTROL_PORT}"
+  if awk -v expected_port="${kvaf_control_port_hex}" '
+      $4 == "0A" && $2 ~ ":" expected_port "$" { found = 1 }
+      END { exit found ? 0 : 1 }
+    ' /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+    echo "ERROR: control port ${KVAF_DIRECT_CONTROL_PORT} is already listening" >&2
+    exit 2
+  fi
 fi
 
 # Take the occupancy snapshot as late as possible, after all build/package
@@ -1275,15 +1333,22 @@ archive_sha=$(
   printf 'host_eid_index=%s\n' "${KVAF_HOST_EID_INDEX}"
   printf 'device_urma_device=%s\n' "${KVAF_DEVICE_URMA_DEVICE}"
   printf 'device_eid_index=%s\n' "${KVAF_DEVICE_EID_INDEX}"
-  printf 'control_port=%s\n' "${KVAF_DIRECT_CONTROL_PORT}"
-  printf 'control_server_address_source=%s\n' \
-    "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS_SOURCE}"
-  printf 'control_server_interface=%s\n' \
-    "${KVAF_DIRECT_CONTROL_SERVER_INTERFACE}"
-  printf 'control_server_address=%s\n' \
-    "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}"
-  printf 'control_bind_address=%s\n' \
-    "${KVAF_DIRECT_CONTROL_BIND_ADDRESS:-none}"
+  printf 'management_mode=%s\n' "${KVAF_DIRECT_MANAGEMENT_MODE}"
+  printf 'management_jetty_id=%s\n' \
+    "${KVAF_DIRECT_MANAGEMENT_JETTY_ID}"
+  printf 'management_host_eid_canonical=%s\n' \
+    "${host_management_eid}"
+  if [[ "${KVAF_DIRECT_MANAGEMENT_MODE}" == tcp ]]; then
+    printf 'control_port=%s\n' "${KVAF_DIRECT_CONTROL_PORT}"
+    printf 'control_server_address_source=%s\n' \
+      "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS_SOURCE}"
+    printf 'control_server_interface=%s\n' \
+      "${KVAF_DIRECT_CONTROL_SERVER_INTERFACE}"
+    printf 'control_server_address=%s\n' \
+      "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}"
+    printf 'control_bind_address=%s\n' \
+      "${KVAF_DIRECT_CONTROL_BIND_ADDRESS:-none}"
+  fi
   printf 'h2d_workload_mode=%s\n' "${kvaf_h2d_workload_mode}"
   printf 'h2d_transfer_count=%s\n' "${KVAF_H2D_TRANSFER_COUNT}"
   printf 'h2d_bytes_per_transfer=%s\n' \
@@ -1306,7 +1371,7 @@ archive_sha=$(
     "${KVAF_H2D_TIMEOUT_SECONDS}"
   printf 'host_control_timeout_seconds=%s\n' \
     "${KVAF_HOST_CONTROL_TIMEOUT_SECONDS}"
-  printf 'host_listener_ready_timeout_seconds=%s\n' \
+  printf 'host_management_ready_timeout_seconds=%s\n' \
     "${KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS}"
   printf 'h2d_run_timeout_seconds=%s\n' \
     "${KVAF_H2D_RUN_TIMEOUT_SECONDS}"
@@ -1383,14 +1448,21 @@ common_args=(
   --exchange-dir "${exchange_dir}"
   --run-id "${kvaf_run_id}"
   --logical-device-id "${KVAF_LOGICAL_DEVICE_ID}"
-  --control-port "${KVAF_DIRECT_CONTROL_PORT}"
-  --control-server-address "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}"
+  --management-mode "${KVAF_DIRECT_MANAGEMENT_MODE}"
+  --management-jetty-id "${KVAF_DIRECT_MANAGEMENT_JETTY_ID}"
   --transfer-count "${KVAF_H2D_TRANSFER_COUNT}"
   --bytes-per-transfer "${KVAF_H2D_BYTES_PER_TRANSFER}"
   --batch-iterations "${KVAF_H2D_BATCH_ITERATIONS}"
   --descriptor-capacity "${KVAF_H2D_DESCRIPTOR_CAPACITY}"
 )
-if [[ -n "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}" ]]; then
+if [[ "${KVAF_DIRECT_MANAGEMENT_MODE}" == tcp ]]; then
+  common_args+=(
+    --control-port "${KVAF_DIRECT_CONTROL_PORT}"
+    --control-server-address "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}"
+  )
+fi
+if [[ "${KVAF_DIRECT_MANAGEMENT_MODE}" == tcp &&
+      -n "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}" ]]; then
   common_args+=(
     --control-bind-address "${KVAF_DIRECT_CONTROL_BIND_ADDRESS}"
   )
@@ -1513,6 +1585,43 @@ wait_for_host_control_listener()
     fi
     if (( listener_status == 2 )) ||
        valid_fatal_marker "${exchange_dir}/fatal.host" ||
+       [[ -f "${host_final}" || -L "${host_final}" ]]; then
+      return 3
+    fi
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      return 1
+    fi
+    if (( SECONDS >= deadline )); then
+      return 2
+    fi
+    sleep 0.05 || true
+  done
+}
+
+wait_for_host_urma_management_ready()
+{
+  local pid=$1
+  local expected_start_ticks=$2
+  local expected_executable=$3
+  local jetty_id=$4
+  local local_eid=$5
+  local timeout_seconds=$6
+  local deadline=$((SECONDS + timeout_seconds))
+  local current_start_ticks current_executable
+  local expected_marker
+
+  expected_marker="KVAF_URMA_MGMT_READY role=server jetty_id=${jetty_id} local_eid=${local_eid}"
+  while :; do
+    current_start_ticks=$(process_start_ticks "${pid}")
+    current_executable=$(process_executable "${pid}")
+    if [[ "${current_start_ticks}" != "${expected_start_ticks}" ]]; then
+      return 3
+    fi
+    if [[ "${current_executable}" == "${expected_executable}" ]] &&
+       grep -Fxq -- "${expected_marker}" "${host_log}"; then
+      return 0
+    fi
+    if valid_fatal_marker "${exchange_dir}/fatal.host" ||
        [[ -f "${host_final}" || -L "${host_final}" ]]; then
       return 3
     fi
@@ -1802,16 +1911,20 @@ echo "RESULT_DIR=${KVAF_A5_RESULT_DIR}"
 echo "LOGICAL_DEVICE_ID=${KVAF_LOGICAL_DEVICE_ID}"
 echo "HOST_URMA=${KVAF_HOST_URMA_DEVICE}/eid${KVAF_HOST_EID_INDEX}"
 echo "DEVICE_URMA=${KVAF_DEVICE_URMA_DEVICE}/eid${KVAF_DEVICE_EID_INDEX}"
-echo "CONTROL_PORT=${KVAF_DIRECT_CONTROL_PORT}"
-echo "CONTROL_SERVER_ADDRESS_SOURCE=${KVAF_DIRECT_CONTROL_SERVER_ADDRESS_SOURCE}"
-echo "CONTROL_SERVER_INTERFACE=${KVAF_DIRECT_CONTROL_SERVER_INTERFACE}"
-echo "CONTROL_SERVER_ADDRESS=${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}"
-echo "CONTROL_BIND_ADDRESS=${KVAF_DIRECT_CONTROL_BIND_ADDRESS:-none}"
+echo "MANAGEMENT_MODE=${KVAF_DIRECT_MANAGEMENT_MODE}"
+echo "MANAGEMENT_JETTY_ID=${KVAF_DIRECT_MANAGEMENT_JETTY_ID}"
+if [[ "${KVAF_DIRECT_MANAGEMENT_MODE}" == tcp ]]; then
+  echo "CONTROL_PORT=${KVAF_DIRECT_CONTROL_PORT}"
+  echo "CONTROL_SERVER_ADDRESS_SOURCE=${KVAF_DIRECT_CONTROL_SERVER_ADDRESS_SOURCE}"
+  echo "CONTROL_SERVER_INTERFACE=${KVAF_DIRECT_CONTROL_SERVER_INTERFACE}"
+  echo "CONTROL_SERVER_ADDRESS=${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}"
+  echo "CONTROL_BIND_ADDRESS=${KVAF_DIRECT_CONTROL_BIND_ADDRESS:-none}"
+fi
 echo "RUN_ID=${kvaf_run_id}"
 echo "H2D_CONTROL_TIMEOUT_SECONDS=${KVAF_H2D_TIMEOUT_SECONDS}"
 echo "HOST_CONTROL_TIMEOUT_SECONDS=${KVAF_HOST_CONTROL_TIMEOUT_SECONDS}"
 echo "H2D_RUN_TIMEOUT_SECONDS=${KVAF_H2D_RUN_TIMEOUT_SECONDS}"
-echo "HOST_LISTENER_READY_TIMEOUT_SECONDS=${KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS}"
+echo "HOST_MANAGEMENT_READY_TIMEOUT_SECONDS=${KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS}"
 echo "TEARDOWN_ASSURANCE=${kvaf_teardown_assurance}"
 echo "MANIFEST=${manifest}"
 
@@ -1832,25 +1945,39 @@ if [[ "${host_expected_start_ticks}" == 0 ]]; then
   exit 5
 fi
 
-host_listener_wait_rc=0
-wait_for_host_control_listener \
-  "${host_pid}" "${host_expected_start_ticks}" \
-  "${worker_expected_exe}" "${KVAF_DIRECT_CONTROL_PORT}" \
-  "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}" \
-  "${KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS}" ||
-  host_listener_wait_rc=$?
-if (( host_listener_wait_rc == 0 )); then
-  echo "KVAF_A5_HOST_CONTROL_LISTENER_READY pid=${host_pid} port=${KVAF_DIRECT_CONTROL_PORT}"
-elif (( host_listener_wait_rc == 2 )); then
-  echo "ERROR: this run's Host PID did not own the control LISTEN socket before the readiness deadline" >&2
+host_management_wait_rc=0
+if [[ "${KVAF_DIRECT_MANAGEMENT_MODE}" == ub ]]; then
+  wait_for_host_urma_management_ready \
+    "${host_pid}" "${host_expected_start_ticks}" \
+    "${worker_expected_exe}" \
+    "${KVAF_DIRECT_MANAGEMENT_JETTY_ID}" \
+    "${host_management_eid}" \
+    "${KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS}" ||
+    host_management_wait_rc=$?
+else
+  wait_for_host_control_listener \
+    "${host_pid}" "${host_expected_start_ticks}" \
+    "${worker_expected_exe}" "${KVAF_DIRECT_CONTROL_PORT}" \
+    "${KVAF_DIRECT_CONTROL_SERVER_ADDRESS}" \
+    "${KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS}" ||
+    host_management_wait_rc=$?
+fi
+if (( host_management_wait_rc == 0 )); then
+  if [[ "${KVAF_DIRECT_MANAGEMENT_MODE}" == ub ]]; then
+    echo "KVAF_A5_HOST_URMA_MANAGEMENT_READY pid=${host_pid} jetty_id=${KVAF_DIRECT_MANAGEMENT_JETTY_ID} local_eid=${host_management_eid}"
+  else
+    echo "KVAF_A5_HOST_CONTROL_LISTENER_READY pid=${host_pid} port=${KVAF_DIRECT_CONTROL_PORT}"
+  fi
+elif (( host_management_wait_rc == 2 )); then
+  echo "ERROR: this run's Host PID did not publish management readiness before the deadline" >&2
   retain_unproven_active_session \
-    "host_listener_readiness_timeout" \
+    "host_management_readiness_timeout_${KVAF_DIRECT_MANAGEMENT_MODE}" \
     host_terminal_unproven_process_stuck
   run_completed=1
   trap - EXIT
   exit 5
-elif (( host_listener_wait_rc == 3 )); then
-  echo "ERROR: Host identity changed or terminal evidence appeared before listener readiness" >&2
+elif (( host_management_wait_rc == 3 )); then
+  echo "ERROR: Host identity changed or terminal evidence appeared before management readiness" >&2
   exit 5
 fi
 if ! kill -0 "${host_pid}" 2>/dev/null; then
@@ -2090,6 +2217,11 @@ required_host_markers=(
   "KVAF_A5_DIRECT_URMA_READY role=host"
   "KVAF_A5_DIRECT_TEARDOWN_OK role=host"
 )
+if [[ "${KVAF_DIRECT_MANAGEMENT_MODE}" == ub ]]; then
+  required_host_markers+=(
+    "KVAF_URMA_MGMT_READY role=server jetty_id=${KVAF_DIRECT_MANAGEMENT_JETTY_ID} local_eid=${host_management_eid}"
+  )
+fi
 required_device_markers=(
   "KVAF_A5_DIRECT_URMA_READY role=device"
   "KVAF_A5_DIRECT_H2D_SMOKE_OK"
@@ -2137,6 +2269,7 @@ host_pid=
 device_pid=
 run_completed=1
 trap - EXIT
-grep -E 'KVAF_A5_(DIRECT|EID)' "${host_log}" "${device_log}"
+grep -E 'KVAF_(A5_(DIRECT|EID)|URMA_MGMT_READY)' \
+  "${host_log}" "${device_log}"
 echo "KVAF_A5_AIV_SIMT_DIRECT_URMA_H2D_ACCEPTANCE=PASS"
 echo "RESULT_DIR=${KVAF_A5_RESULT_DIR}"

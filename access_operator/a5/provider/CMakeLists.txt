@@ -57,6 +57,8 @@ set(KVAF_REQUIRED_OFFICIAL_SOURCE_PATHS
   "${KVAF_PERFTEST_SOURCE_DIR}/perftest_resources.c"
   "${KVAF_PERFTEST_SOURCE_DIR}/perftest_parameters.c"
   "${KVAF_PERFTEST_SOURCE_DIR}/perftest_mgmt_tcp.c"
+  "${KVAF_PERFTEST_SOURCE_DIR}/perftest_mgmt_ub.c"
+  "${KVAF_PERFTEST_SOURCE_DIR}/perftest_mgmt_ub.h"
   "${KVAF_UDMA_ABI_HEADER}"
   "${KVAF_UDMA_PRIVATE_HEADER}"
   "${KVAF_UDMA_JFR_SOURCE}"
@@ -120,7 +122,9 @@ foreach(KVAF_REQUIRED_PERFTEST_SOURCE
     perftest_log.c
     perftest_parameters.c
     perftest_resources.c
-    perftest_mgmt_tcp.c)
+    perftest_mgmt_tcp.c
+    perftest_mgmt_ub.c
+    perftest_mgmt_ub.h)
   if(NOT EXISTS
       "${KVAF_PERFTEST_SOURCE_DIR}/${KVAF_REQUIRED_PERFTEST_SOURCE}")
     message(FATAL_ERROR
@@ -244,6 +248,7 @@ target_include_directories(kvaf_urma_provider_common PRIVATE
 target_compile_definitions(kvaf_urma_provider_common PRIVATE
   "KVAF_PERFTEST_RESOURCES_SOURCE=\"${KVAF_PERFTEST_SOURCE_DIR}/perftest_resources.c\""
   "KVAF_PERFTEST_MGMT_TCP_SOURCE=\"${KVAF_PERFTEST_SOURCE_DIR}/perftest_mgmt_tcp.c\""
+  "KVAF_PERFTEST_MGMT_UB_SOURCE=\"${KVAF_PERFTEST_SOURCE_DIR}/perftest_mgmt_ub.c\""
 )
 
 set(KVAF_UDMA_PRIVATE_INCLUDE_DIRS

@@ -353,11 +353,7 @@ static urma_status_t kvaf_udma_delete_context_checked(
      * owned by this exact public context.
      */
     if (kvaf_udma_source_retry_orphan_cleanup(public_context) != 0 ||
-        kvaf_udma_source_live_segment_count() != 0U ||
-        kvaf_udma_source_live_token_count() != 0U ||
-        kvaf_udma_source_live_jetty_count() != 0U ||
-        kvaf_udma_source_live_jfr_count() != 0U ||
-        kvaf_udma_source_live_jfc_count() != 0U) {
+        kvaf_udma_source_context_has_live_resources(public_context) != 0) {
         (void)pthread_mutex_unlock(&g_kvaf_context_lock);
         return URMA_FAIL;
     }
@@ -407,6 +403,23 @@ static urma_status_t kvaf_udma_delete_context_checked(
     free(context);
     free(state);
     return URMA_SUCCESS;
+}
+
+int kvaf_udma_source_context_has_live_resources(
+    const urma_context_t *context)
+{
+    /*
+     * Each count helper acquires and releases exactly one sidecar lock.
+     * Never hold two resource locks at once: delete_context already owns the
+     * context lock, so the one-way context -> sidecar ordering cannot form a
+     * resource-lock cycle.
+     */
+    return context == NULL ||
+        kvaf_udma_source_live_segment_count_for_context(context) != 0U ||
+        kvaf_udma_source_live_token_count_for_context(context) != 0U ||
+        kvaf_udma_source_live_jetty_count_for_context(context) != 0U ||
+        kvaf_udma_source_live_jfr_count_for_context(context) != 0U ||
+        kvaf_udma_source_live_jfc_count_for_context(context) != 0U;
 }
 
 int kvaf_udma_source_retry_orphan_cleanup(urma_context_t *context)

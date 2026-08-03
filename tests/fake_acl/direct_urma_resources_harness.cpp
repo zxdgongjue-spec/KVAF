@@ -5,12 +5,14 @@
 
 #include "fake_acl_control.h"
 #include "kvaf/access_operator/a5/direct_urma_resources.h"
+#include "kvaf_urma_provider_abi.h"
 
 namespace {
 
 using kvaf::access::a5::DirectUrmaExecutionDomain;
 using kvaf::access::a5::DirectUrmaCloseDisposition;
 using kvaf::access::a5::DirectUrmaClosePhase;
+using kvaf::access::a5::DirectUrmaManagementMode;
 using kvaf::access::a5::DirectUrmaOpenSpec;
 using kvaf::access::a5::DirectUrmaResources;
 using kvaf::access::a5::DirectUrmaRole;
@@ -34,6 +36,9 @@ DirectUrmaOpenSpec MakeSpec(std::vector<std::uint8_t>* backing,
   spec.urma_device = "udmac0d1e4";
   spec.local_eid = "0000:0000:0000:0200:0010:0000:df00:4100";
   spec.peer_eid = "0000:0000:007f:0400:0010:0000:df0a:0b00";
+  // Most fault-injection scenarios predate the UB management backend and
+  // intentionally continue to exercise the explicit TCP compatibility path.
+  spec.management_mode = DirectUrmaManagementMode::kTcp;
   spec.control_server_address = "127.0.0.1";
   spec.control_bind_address = "127.0.0.1";
   spec.local_address =
@@ -54,6 +59,15 @@ DirectUrmaOpenSpec MakeSpec(std::vector<std::uint8_t>* backing,
     spec.control_bind_address = "::1";
   } else if (scenario == "server_control_bind") {
     spec.role = DirectUrmaRole::kServer;
+  } else if (scenario == "ub_management_config") {
+    spec.management_mode = DirectUrmaManagementMode::kUrma;
+    spec.control_server_address.clear();
+    spec.control_bind_address.clear();
+    spec.management_jetty_id = 507;
+    // The public C++ API accepts compact EIDs, but the provider ABI always
+    // receives one canonical 8x4 representation understood by UMDK.
+    spec.local_eid = "000000000000020000100000df004100";
+    spec.peer_eid = "00000000007f040000100000df0a0b00";
   }
   return spec;
 }
@@ -207,6 +221,21 @@ int main(int argc, char** argv) {
   if (!open.ok()) {
     std::cerr << open.message() << '\n';
     return Fail("scenario unexpectedly failed Open");
+  }
+
+  if (scenario == "ub_management_config") {
+    const auto flags = kvaf_fake_acl_last_config_flags();
+    if ((flags & KVAF_URMA_PROVIDER_URMA_MANAGEMENT) == 0 ||
+        (flags & KVAF_URMA_PROVIDER_EXPLICIT_TCP_MANAGEMENT) != 0 ||
+        kvaf_fake_acl_last_management_jetty_id() != 507 ||
+        std::string(kvaf_fake_acl_last_management_local_address()) !=
+            "0000:0000:0000:0200:0010:0000:df00:4100" ||
+        std::string(kvaf_fake_acl_last_management_peer_address()) !=
+            "0000:0000:007f:0400:0010:0000:df0a:0b00" ||
+        !resources.Close().ok()) {
+      return Fail("URMA management configuration crossed the ABI incorrectly");
+    }
+    return 0;
   }
 
   if (scenario == "kernel_type") {

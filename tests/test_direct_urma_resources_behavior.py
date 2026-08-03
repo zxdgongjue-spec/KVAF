@@ -131,6 +131,9 @@ class DirectUrmaResourcesBehaviorTests(unittest.TestCase):
     def test_tcp_server_bind_is_always_wildcard(self) -> None:
         self.run_scenario("server_control_bind")
 
+    def test_ub_management_uses_eids_and_well_known_jetty(self) -> None:
+        self.run_scenario("ub_management_config")
+
     def test_double_sync_failure_retains_every_allocation(self) -> None:
         self.run_scenario("sync_twice")
 
