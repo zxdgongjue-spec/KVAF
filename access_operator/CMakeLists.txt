@@ -36,6 +36,7 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
     PUBLIC
       kvaf_access_operator
     PRIVATE
+      kvaf_meta_manager
       kvaf_execute_batch_get_host
       ascendcl
   )
