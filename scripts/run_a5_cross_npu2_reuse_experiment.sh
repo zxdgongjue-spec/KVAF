@@ -40,6 +40,12 @@ for kvaf_command in awk cat chmod git grep ln mkdir mktemp npu-smi python3 \
   }
 done
 
+kvaf_expected_source_commit=${KVAF_CROSS_NPU2_REUSE_EXPECTED_SOURCE_COMMIT:-}
+if [[ ! "${kvaf_expected_source_commit}" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "ERROR: KVAF_CROSS_NPU2_REUSE_EXPECTED_SOURCE_COMMIT must be an exact 40-hex commit" >&2
+  exit 2
+fi
+
 kvaf_token=${KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN:-}
 if [[ -z "${kvaf_token}" ]]; then
   if [[ ! -r /proc/sys/kernel/random/uuid ]]; then
@@ -64,6 +70,12 @@ kvaf_configure_cross_npu2_reuse_state_paths \
 kvaf_source_commit=$(git -C "${ROOT_DIR}" rev-parse HEAD) || exit 2
 if [[ ! "${kvaf_source_commit}" =~ ^[0-9a-f]{40}$ ]]; then
   echo "ERROR: current KVAF commit is not canonical" >&2
+  exit 2
+fi
+if [[ "${kvaf_source_commit}" != "${kvaf_expected_source_commit}" ]]; then
+  echo "ERROR: current KVAF commit does not match the externally authorized experiment commit" >&2
+  echo "EXPECTED_SOURCE_COMMIT=${kvaf_expected_source_commit}" >&2
+  echo "ACTUAL_SOURCE_COMMIT=${kvaf_source_commit}" >&2
   exit 2
 fi
 

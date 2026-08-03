@@ -54,6 +54,24 @@ class CrossNpu2ReuseCoordinatorTests(unittest.TestCase):
         self.assertIn("^[0-9a-f]{16}$", self.source)
         self.assertIn("/proc/sys/kernel/random/uuid", self.source)
 
+    def test_external_full_source_commit_is_required_before_any_build(self) -> None:
+        required = "KVAF_CROSS_NPU2_REUSE_EXPECTED_SOURCE_COMMIT"
+        self.assertIn(required, self.source)
+        self.assertIn("^[0-9a-f]{40}$", self.source)
+        expected = self.source.index("kvaf_expected_source_commit=")
+        actual = self.source.index(
+            'kvaf_source_commit=$(git -C "${ROOT_DIR}" rev-parse HEAD)'
+        )
+        compare = self.source.index(
+            '[[ "${kvaf_source_commit}" != "${kvaf_expected_source_commit}" ]]'
+        )
+        provider = self.source.index(
+            '"${SCRIPT_DIR}/build_a5_direct_urma_provider.sh"'
+        )
+        self.assertLess(expected, actual)
+        self.assertLess(actual, compare)
+        self.assertLess(compare, provider)
+
     def test_evidence_precedes_every_mutating_or_hardware_stage(self) -> None:
         initial = self.source.index("kvaf_validate_reuse_evidence initial")
         provider = self.source.index(
