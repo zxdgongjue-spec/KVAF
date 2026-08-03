@@ -8,6 +8,7 @@ demo_dir=$(cd "${script_dir}/.." && pwd)
 build_dir=${BUILD_DIR:-"${demo_dir}/build"}
 result_dir=${RESULT_DIR:-"${demo_dir}/results/execute_batch_get_$(date +%Y%m%d_%H%M%S)"}
 timeout_seconds=${TIMEOUT_SECONDS:-180}
+toolkit=${ASCEND_CANN_PACKAGE_PATH:-${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}}
 
 : "${DEVICE_ID:=0}"
 : "${TABLE_CAPACITY:=4096}"
@@ -42,8 +43,25 @@ if [[ ! -x "${test_binary}" || ! -f "${kernel}" ]]; then
 fi
 
 driver_lib=${ASCEND_DRIVER_LIB_PATH:-/usr/local/Ascend/driver/lib64}
-export LD_LIBRARY_PATH="${build_dir}/bin:${driver_lib}:${LD_LIBRARY_PATH:-}"
-echo "[EXECUTE_BATCH_GET] contract=npu_execute_address_table_to_udma_read device=${DEVICE_ID} table=${TABLE_CAPACITY} requests=${REQUESTS} output_rows=${OUTPUT_ROWS} block_bytes=${BLOCK_BYTES} stride=${SOURCE_STRIDE} aiv_cores=${AIV_CORES} mask_every=${MASK_EVERY} graph_replays=${GRAPH_REPLAYS} graph_warmup=${GRAPH_WARMUP} graph_iterations=${GRAPH_ITERATIONS}" | tee "${log_file}"
+cann_lib="${toolkit}/lib64"
+if [[ ! -r "${cann_lib}/libunified_dlog.so" ]]; then
+  echo "RUNTIME_LIB_PRECHECK_FAIL missing=${cann_lib}/libunified_dlog.so" | tee -a "${log_file}" >&2
+  exit 2
+fi
+export ASCEND_CANN_PACKAGE_PATH="${toolkit}"
+export ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-${toolkit}}"
+export LD_LIBRARY_PATH="${build_dir}/bin:${cann_lib}:${driver_lib}:${LD_LIBRARY_PATH:-}"
+if ldd "${test_binary}" 2>/dev/null | grep -q 'not found'; then
+  echo "RUNTIME_LIB_PRECHECK_FAIL executable_dependency_missing" | tee -a "${log_file}" >&2
+  ldd "${test_binary}" 2>&1 | tee -a "${log_file}" >&2 || true
+  exit 2
+fi
+if dumper=$(command -v asc_dumper 2>/dev/null) && ldd "${dumper}" 2>/dev/null | grep -q 'not found'; then
+  echo "RUNTIME_LIB_PRECHECK_FAIL asc_dumper_dependency_missing binary=${dumper}" | tee -a "${log_file}" >&2
+  ldd "${dumper}" 2>&1 | tee -a "${log_file}" >&2 || true
+  exit 2
+fi
+echo "[EXECUTE_BATCH_GET] contract=npu_execute_address_table_to_udma_read device=${DEVICE_ID} table=${TABLE_CAPACITY} requests=${REQUESTS} output_rows=${OUTPUT_ROWS} block_bytes=${BLOCK_BYTES} stride=${SOURCE_STRIDE} aiv_cores=${AIV_CORES} mask_every=${MASK_EVERY} graph_replays=${GRAPH_REPLAYS} graph_warmup=${GRAPH_WARMUP} graph_iterations=${GRAPH_ITERATIONS} timeout=${timeout_seconds} toolkit_lib=${cann_lib}" | tee "${log_file}"
 
 set +e
 timeout "${timeout_seconds}" "${test_binary}" --kernel "${kernel}" \
