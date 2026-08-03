@@ -58,3 +58,16 @@ demo；名称中的 AIV 只保留在 demo/kernel 实现目录，非 Runtime 的�
 
 Selector / Executor / Template 分层、图捕获管理、异步执行与 BatchPut 数据面均不
 属于当前范围。
+
+## 后续待决事项：BatchGet / BatchPut Transport
+
+当前 `DefaultAccessOperator` 只接入 BatchGet demo 的 transport。BatchPut 数据面
+合入时，必须由两个 demo 的接口与 ABI 共同确认 EID、CTP、Jetty、SQ/CQ 是否能
+安全共享；不能仅因两者都使用 Direct-HCCP 就假设可复用。
+
+- 若控制面资源、token 语义和队列并发模型兼容，则提取共享 transport，并在一次
+  `Initialize` 中创建。
+- 若任一项不兼容，则 BatchGet 与 BatchPut 分别持有各自 transport，并在
+  `Initialize` 中各自初始化、在 `Shutdown` 中按各自完成状态释放。
+
+在 BatchPut 接口和硬件实测就绪前，保持当前 BatchGet-only transport，不提前抽象。
