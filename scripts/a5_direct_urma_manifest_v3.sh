@@ -146,6 +146,7 @@ kvaf_v3_verify_provider_dynamic()
 
 kvaf_verify_direct_provider_build_v3()
 {
+  local expected_device_basename=${1:-libkvaf_urma_provider_device.so}
   local artifact source_filename umdk_filename libummu_filename
   local umdk_manifest libummu_manifest
   local host_sha device_sha source_sha umdk_sha libummu_sha build_sha
@@ -155,6 +156,15 @@ kvaf_verify_direct_provider_build_v3()
   local umdk_commit libummu_commit expected_libummu_commit
   local umdk_root management_source management_path
   local binding command key prefix
+
+  if (( $# > 1 )) ||
+     [[ -z "${expected_device_basename}" ||
+        "${expected_device_basename}" == */* ||
+        "${expected_device_basename}" == *\\* ||
+        ${#expected_device_basename} -ge 32 ]]; then
+    kvaf_v3_error "expected Device provider basename is invalid"
+    return 1
+  fi
 
   # Parse the schema before requiring platform-specific ELF tools so legacy
   # v2 artifacts are rejected for the right reason on every control host.
@@ -179,7 +189,7 @@ kvaf_verify_direct_provider_build_v3()
   [[ "$(basename "${KVAF_DIRECT_HOST_PROVIDER_LIBRARY}")" == \
       libkvaf_urma_provider_host.so &&
      "$(basename "${KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY}")" == \
-      libkvaf_urma_provider_device.so ]] || {
+      "${expected_device_basename}" ]] || {
     kvaf_v3_error "unexpected Host/Device provider basename"
     return 1
   }
@@ -257,7 +267,7 @@ kvaf_verify_direct_provider_build_v3()
     'host_provider_execution_domain:host-process' \
     'host_private_abi:1' \
     'host_private_abi_name:official-umdk-udma-v1-host' \
-    'device_provider_filename:libkvaf_urma_provider_device.so' \
+    "device_provider_filename:${expected_device_basename}" \
     'device_provider_execution_domain:aicpu' \
     'device_private_abi:2' \
     'device_private_abi_name:official-umdk-udma-v1-device' \

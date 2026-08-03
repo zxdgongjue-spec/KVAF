@@ -6,7 +6,9 @@ kvaf_direct_build_mode=${1:-production}
 if (( $# > 1 )) ||
    [[ "${kvaf_direct_build_mode}" != production &&
       "${kvaf_direct_build_mode}" != \
-        cross-npu2-risk-offline-v1 ]]; then
+        cross-npu2-risk-offline-v1 &&
+      "${kvaf_direct_build_mode}" != \
+        cross-npu2-reuse-versioned-offline-v1 ]]; then
   echo "ERROR: invalid direct URMA build mode" >&2
   exit 2
 fi
@@ -14,8 +16,10 @@ fi
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd -P)
 source "${SCRIPT_DIR}/a5_direct_urma_legacy_guard.sh"
+source "${SCRIPT_DIR}/a5_cross_npu2_reuse_state.sh"
 
 kvaf_cross_npu_offline_build=0
+kvaf_cross_npu_reuse_offline_build=0
 if [[ "${kvaf_direct_build_mode}" == cross-npu2-risk-offline-v1 ]]; then
   kvaf_cross_npu_offline_build=1
   : "${KVAF_CROSS_NPU_SOURCE_RUN_ID:?set the pinned NPU7 run ID}"
@@ -27,6 +31,26 @@ if [[ "${kvaf_direct_build_mode}" == cross-npu2-risk-offline-v1 ]]; then
   fi
   kvaf_configure_cross_npu2_risk_state_paths \
     "${ROOT_DIR}" "${KVAF_CROSS_NPU_SOURCE_RUN_ID}" || exit 2
+elif [[ "${kvaf_direct_build_mode}" == \
+        cross-npu2-reuse-versioned-offline-v1 ]]; then
+  kvaf_cross_npu_reuse_offline_build=1
+  if [[ "${KVAF_CROSS_NPU2_REUSE_RISK_ACCEPTANCE:-}" != \
+        I_ACCEPT_UNKNOWN_NPU2_REUSE_AND_SHARED_UMMU_RISK ]]; then
+    echo "ERROR: the versioned NPU2 reuse build requires the exact second-order risk acceptance phrase" >&2
+    exit 2
+  fi
+  KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN=${KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN:-}
+  if [[ ! "${KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN}" =~ \
+        ^[0-9a-f]{16}$ ]]; then
+    echo "ERROR: KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN must be 16 lowercase hexadecimal digits" >&2
+    exit 2
+  fi
+  readonly kvaf_reuse_source_run_id=530f5998a0b646d48db858170a9996ff
+  readonly kvaf_reuse_prior_run_id=30ef7336d212459a9317fd6647f6fa15
+  kvaf_configure_cross_npu2_reuse_state_paths \
+    "${ROOT_DIR}" "${kvaf_reuse_source_run_id}" \
+    "${kvaf_reuse_prior_run_id}" \
+    "${KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN}" || exit 2
 else
   kvaf_configure_direct_urma_state_paths "${ROOT_DIR}" || exit 2
 fi
@@ -49,6 +73,23 @@ if (( kvaf_cross_npu_offline_build != 0 )); then
         "${KVAF_A5_DIRECT_BUILD_DIR}" != \
           "${kvaf_expected_build_dir}" ]]; then
     echo "ERROR: the risk build directory is source-owned" >&2
+    echo "EXPECTED=${kvaf_expected_build_dir}" >&2
+    echo "ACTUAL=${KVAF_A5_DIRECT_BUILD_DIR}" >&2
+    exit 2
+  fi
+  KVAF_A5_DIRECT_BUILD_DIR=${kvaf_expected_build_dir}
+elif (( kvaf_cross_npu_reuse_offline_build != 0 )); then
+  kvaf_source_commit=$(git -C "${ROOT_DIR}" rev-parse HEAD) || exit 2
+  if [[ ! "${kvaf_source_commit}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "ERROR: could not pin the KVAF source commit" >&2
+    exit 2
+  fi
+  kvaf_reuse_artifact_root="${KVAF_GLOBAL_STATE_DIR}/KVAF/experimental/reuse-artifacts/${kvaf_source_commit}/${KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN}"
+  kvaf_expected_build_dir="${kvaf_reuse_artifact_root}/direct"
+  if [[ -n "${KVAF_A5_DIRECT_BUILD_DIR+x}" &&
+        "${KVAF_A5_DIRECT_BUILD_DIR}" != \
+          "${kvaf_expected_build_dir}" ]]; then
+    echo "ERROR: the versioned NPU2 reuse direct-build directory is source-owned" >&2
     echo "EXPECTED=${kvaf_expected_build_dir}" >&2
     echo "ACTUAL=${KVAF_A5_DIRECT_BUILD_DIR}" >&2
     exit 2
@@ -81,7 +122,8 @@ if ! command -v flock >/dev/null 2>&1; then
   echo "ERROR: flock is required to serialize direct URMA deploy/run" >&2
   exit 2
 fi
-if (( kvaf_cross_npu_offline_build == 0 )); then
+if (( kvaf_cross_npu_offline_build == 0 &&
+      kvaf_cross_npu_reuse_offline_build == 0 )); then
   if ! kvaf_check_legacy_direct_urma_state "${ROOT_DIR}"; then
     exit 4
   fi
@@ -97,20 +139,33 @@ else
     echo "ERROR: the cross-NPU risk build requires a clean tracked checkout" >&2
     exit 2
   fi
-  kvaf_cross_npu_validator="${SCRIPT_DIR}/validate_a5_cross_npu_risk_acceptance.py"
-  if [[ -L "${kvaf_cross_npu_validator}" ||
-        ! -f "${kvaf_cross_npu_validator}" ||
-        ! -r "${kvaf_cross_npu_validator}" ]]; then
-    echo "ERROR: cross-NPU acceptance validator is missing or unsafe" >&2
-    exit 2
+  if (( kvaf_cross_npu_offline_build != 0 )); then
+    kvaf_cross_npu_validator="${SCRIPT_DIR}/validate_a5_cross_npu_risk_acceptance.py"
+    if [[ -L "${kvaf_cross_npu_validator}" ||
+          ! -f "${kvaf_cross_npu_validator}" ||
+          ! -r "${kvaf_cross_npu_validator}" ]]; then
+      echo "ERROR: cross-NPU acceptance validator is missing or unsafe" >&2
+      exit 2
+    fi
+    python3 "${kvaf_cross_npu_validator}" \
+      --quarantine /data/.kvaf-state/KVAF/direct-urma.quarantine \
+      --quarantine-sha256 \
+        "${KVAF_CROSS_NPU_SOURCE_QUARANTINE_SHA256}" \
+      --run-id "${KVAF_CROSS_NPU_SOURCE_RUN_ID}" \
+      --source-logical-device-id 7 \
+      --result-root /data/.kvaf-state/KVAF/results
+  else
+    kvaf_cross_npu_validator="${SCRIPT_DIR}/validate_a5_cross_npu2_reuse_risk.py"
+    if [[ -L "${kvaf_cross_npu_validator}" ||
+          ! -f "${kvaf_cross_npu_validator}" ||
+          ! -r "${kvaf_cross_npu_validator}" ]]; then
+      echo "ERROR: NPU2 reuse acceptance validator is missing or unsafe" >&2
+      exit 2
+    fi
+    python3 "${kvaf_cross_npu_validator}" \
+      --new-artifact-token \
+        "${KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN}"
   fi
-  python3 "${kvaf_cross_npu_validator}" \
-    --quarantine /data/.kvaf-state/KVAF/direct-urma.quarantine \
-    --quarantine-sha256 \
-      "${KVAF_CROSS_NPU_SOURCE_QUARANTINE_SHA256}" \
-    --run-id "${KVAF_CROSS_NPU_SOURCE_RUN_ID}" \
-    --source-logical-device-id 7 \
-    --result-root /data/.kvaf-state/KVAF/results
 
   kvaf_cross_npu_experiment_root="${KVAF_GLOBAL_STATE_DIR}/KVAF/experimental"
   if [[ -L "${kvaf_cross_npu_experiment_root}" ||
@@ -121,7 +176,12 @@ else
   fi
   mkdir -p "${kvaf_cross_npu_experiment_root}"
   chmod 0700 "${kvaf_cross_npu_experiment_root}"
-  exec 10>"${kvaf_cross_npu_experiment_root}/cross-npu-risk.lock"
+  if (( kvaf_cross_npu_reuse_offline_build != 0 )); then
+    kvaf_build_experiment_lock="${kvaf_cross_npu_experiment_root}/cross-npu2-reuse-build.lock"
+  else
+    kvaf_build_experiment_lock="${kvaf_cross_npu_experiment_root}/cross-npu-risk.lock"
+  fi
+  exec 10>"${kvaf_build_experiment_lock}"
   if ! flock -n 10; then
     echo "ERROR: a cross-NPU experiment is already active" >&2
     exit 5
@@ -136,14 +196,23 @@ else
   mkdir -p "${kvaf_artifact_parent}"
   chmod 0700 "${kvaf_artifact_parent}"
   kvaf_artifact_parent=$(realpath -e "${kvaf_artifact_parent}") || exit 2
+  if (( kvaf_cross_npu_reuse_offline_build != 0 )); then
+    kvaf_expected_artifact_parent="${kvaf_reuse_artifact_root}"
+  else
+    kvaf_expected_artifact_parent="${KVAF_GLOBAL_STATE_DIR}/KVAF/experimental/artifacts/${kvaf_source_commit}"
+  fi
   if [[ "${kvaf_artifact_parent}" != \
-        "${KVAF_GLOBAL_STATE_DIR}/KVAF/experimental/artifacts/${kvaf_source_commit}" ]]; then
+        "${kvaf_expected_artifact_parent}" ]]; then
     echo "ERROR: experimental artifact directory escaped its fixed root" >&2
     exit 2
   fi
   if [[ -e "${KVAF_A5_DIRECT_BUILD_DIR}" ||
         -L "${KVAF_A5_DIRECT_BUILD_DIR}" ]]; then
-    echo "ERROR: risk build requires a fresh artifact ID" >&2
+    if (( kvaf_cross_npu_reuse_offline_build != 0 )); then
+      echo "ERROR: risk build requires a fresh direct artifact directory" >&2
+    else
+      echo "ERROR: risk build requires a fresh artifact ID" >&2
+    fi
     echo "PATH=${KVAF_A5_DIRECT_BUILD_DIR}" >&2
     exit 2
   fi
@@ -420,6 +489,48 @@ if (( kvaf_cross_npu_offline_build != 0 )); then
     >"${KVAF_A5_DIRECT_BUILD_DIR}/cross-npu2-artifact.manifest"
   chmod 0400 "${KVAF_A5_DIRECT_BUILD_DIR}/cross-npu2-artifact.manifest"
   echo "KVAF_CROSS_NPU2_OFFLINE_ARTIFACT=${KVAF_A5_DIRECT_BUILD_DIR}"
+elif (( kvaf_cross_npu_reuse_offline_build != 0 )); then
+  kvaf_reuse_evidence=$(
+    python3 "${kvaf_cross_npu_validator}" \
+      --new-artifact-token \
+        "${KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN}"
+  ) || {
+    echo "ERROR: NPU2 reuse evidence changed during the direct build" >&2
+    exit 2
+  }
+  kvaf_reuse_evidence_sha=$(
+    printf '%s\n' "${kvaf_reuse_evidence}" | sha256sum | awk '{print $1}'
+  )
+  kvaf_direct_profile="${kvaf_reuse_artifact_root}/experiment-direct.profile"
+  if [[ -e "${kvaf_direct_profile}" || -L "${kvaf_direct_profile}" ]]; then
+    echo "ERROR: versioned direct profile appeared concurrently" >&2
+    exit 2
+  fi
+  kvaf_direct_profile_temporary="${kvaf_direct_profile}.tmp.$$"
+  printf '%s\n' \
+    'schema=kvaf-a5-cross-npu2-versioned-direct-v1' \
+    "artifact_token=${KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN}" \
+    "source_commit=${kvaf_source_commit}" \
+    "direct_build_dir=${KVAF_A5_DIRECT_BUILD_DIR}" \
+    "direct_binary=${binary}" \
+    "direct_binary_sha256=${binary_sha}" \
+    "owner_probe=${owner_probe}" \
+    "owner_probe_sha256=${owner_probe_sha}" \
+    "direct_build_manifest=${build_manifest}" \
+    "direct_build_manifest_sha256=$(sha256sum "${build_manifest}" | awk '{print $1}')" \
+    "direct_source_manifest=${source_manifest}" \
+    "direct_source_manifest_sha256=${source_manifest_sha}" \
+    "reuse_evidence_sha256=${kvaf_reuse_evidence_sha}" \
+    'artifact_mutation_policy=forbidden-during-hardware-run' \
+    >"${kvaf_direct_profile_temporary}"
+  chmod 0400 "${kvaf_direct_profile_temporary}"
+  if ! ln "${kvaf_direct_profile_temporary}" "${kvaf_direct_profile}"; then
+    echo "ERROR: could not publish the immutable versioned direct profile" >&2
+    exit 2
+  fi
+  rm -f "${kvaf_direct_profile_temporary}"
+  echo "KVAF_CROSS_NPU2_REUSE_DIRECT_ARTIFACT=${KVAF_A5_DIRECT_BUILD_DIR}"
+  echo "KVAF_CROSS_NPU2_REUSE_DIRECT_PROFILE=${kvaf_direct_profile}"
 fi
 
 echo "KVAF_A5_DIRECT_URMA_BUILD_OK"

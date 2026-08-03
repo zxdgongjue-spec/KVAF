@@ -10,6 +10,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <string>
 #include <string_view>
 
 #include <unistd.h>
@@ -30,7 +31,8 @@ constexpr std::uint32_t kOwnerPollIntervalMicroseconds = 1000U;
 // READY is published before the AICPU owner starts its bounded wait.  This
 // generous finite budget avoids depending on an AIV clock-frequency contract.
 constexpr std::uint32_t kAivReadyPollBudget = 20000000U;
-constexpr char kProviderSoname[] = "libkvaf_urma_provider_device.so";
+constexpr char kDefaultProviderSoname[] =
+    "libkvaf_urma_provider_device.so";
 constexpr char kOwnerEntry[] = "aicpu_kvaf_urma_owner_probe_v1";
 
 static_assert(kMaximumTimeoutSeconds + kRuntimeTimeoutGraceSeconds <=
@@ -48,7 +50,15 @@ static_assert(offsetof(rtAicpuArgsEx_t, args) == 0 &&
 struct Options {
   std::int32_t logical_device_id{-1};
   std::uint32_t timeout_seconds{kDefaultTimeoutSeconds};
+  std::string provider_soname{kDefaultProviderSoname};
 };
+
+bool IsProviderBasename(std::string_view name) {
+  return !name.empty() && name.size() < 32U &&
+         name.find('/') == std::string_view::npos &&
+         name.find('\\') == std::string_view::npos &&
+         name != "." && name != "..";
+}
 
 bool ParseUnsigned(std::string_view text, std::uint32_t* value) {
   if (text.empty() || value == nullptr) {
@@ -83,18 +93,25 @@ bool ParseOptions(int argc, char** argv, Options* options) {
       if (!ParseUnsigned(argv[++index], &options->timeout_seconds)) {
         return false;
       }
+    } else if (argument == "--provider-soname" && index + 1 < argc) {
+      options->provider_soname = argv[++index];
+      if (!IsProviderBasename(options->provider_soname)) {
+        return false;
+      }
     } else {
       return false;
     }
   }
   return options->logical_device_id >= 0 &&
          options->timeout_seconds >= 1U &&
-         options->timeout_seconds <= kMaximumTimeoutSeconds;
+         options->timeout_seconds <= kMaximumTimeoutSeconds &&
+         IsProviderBasename(options->provider_soname);
 }
 
 void PrintUsage(const char* program) {
   std::cerr << "usage: " << program
-            << " --logical-device-id N [--timeout-seconds 1..10]\n";
+            << " --logical-device-id N [--timeout-seconds 1..10]"
+               " [--provider-soname BASENAME]\n";
 }
 
 std::uint64_t NewSessionId() {
@@ -296,7 +313,7 @@ int RunProbe(const Options& options) {
   kvaf_urma_aicpu_owner_probe_args_v1 owner_args{};
   if (!CopyFixed(kOwnerEntry, owner_args.kernel_name,
                  sizeof(owner_args.kernel_name)) ||
-      !CopyFixed(kProviderSoname, owner_args.so_name,
+      !CopyFixed(options.provider_soname.c_str(), owner_args.so_name,
                  sizeof(owner_args.so_name))) {
     std::cerr << "KVAF_A5_AICPU_OWNER_PROBE_FAILED phase=build_args\n";
     return 1;

@@ -443,6 +443,34 @@ backing 和结果证据，按现场隔离或整机重启流程恢复。即使两
 “跨 NPU 共享状态是否隔离”保留为未证明项；只有驱动/UMMU/AICPU 契约或额外故障
 注入证据补齐后，才可以讨论将状态从整机 singleton 改成正式的 per-NPU 分片。
 
+#### 5.1.1 第一次 NPU2 也未闭环时的单次 reuse 实验
+
+第一次 `risk-accepted-cross-npu2-v1` 已经在 NPU2 留下
+`PENDING_UNPROVEN`，不能把它当作成功经验直接重跑。现场不能重启时，仅保留一个
+更窄的第二代诊断入口：
+`run_a5_cross_npu2_reuse_experiment.sh zero-wqe`。它要求显式接受
+`I_ACCEPT_UNKNOWN_NPU2_REUSE_AND_SHARED_UMMU_RISK`，同时逐字节固定原 NPU7
+quarantine 和第一次 NPU2 active/result/PID-start-ticks 证据；任何一项变化都会在
+新资源创建前停止。
+
+该入口只允许 NPU2 zero-WQE，不允许 `one-kib` 或 batch。每次使用一个 16 位小写
+十六进制 token，构建独立 provider、短于 AICPU ABI 上限的唯一 Device SO/SONAME、
+增量 AICPU 包和 direct binary；不会覆盖 canonical provider/package。资源创建前还会
+在 NPU2 严格 idle 的条件下，用唯一 SO 运行一次 bounded、resource-free owner
+probe。probe 只验证该包可被 AICPU loader 加载以及 AIV/AICPU mailbox 可见性，不会
+创建 URMA/UMMU context、MR、Jetty、SQ 或 CQ。
+
+为防止失败后不断换 token 重试，首次通过证据验证后会原子发布只读 one-shot claim：
+`/data/.kvaf-state/KVAF/experimental/npu-2-reuse/530f5998a0b646d48db858170a9996ff/30ef7336d212459a9317fd6647f6fa15/attempt.selected`。
+claim 精确绑定 token 和 KVAF commit；一旦存在，新 token 与相同 token 都会被拒绝，
+不能删除 claim 来制造第二次机会。新的运行使用 Jetty 602 和独立 state/result/lock
+目录，但这仍不是 UMMU、AICPU 或驱动跨 NPU 隔离证明。
+
+owner probe 或 zero-WQE 任一步失败，都只打印 hard-stop 证据并返回：入口不会自动
+重试、给既有 worker 发信号、删除 active/quarantine、降级到 canonical SO，或继续
+提交数据 WQE。即使 zero-WQE PASS，也只说明这一次资源创建和销毁闭环；在整机恢复
+并补足隔离契约前，不能继续真实 H2D。
+
 active 状态在每次 fork 前先写 `host_launch_intent` 或
 `device_launch_intent`，fork 成功后再补 PID。恢复逻辑按 phase 决定必须检查
 单端还是双端终态，绝不会因为 SIGKILL 恰好发生在 fork 与 PID 落盘之间，就把

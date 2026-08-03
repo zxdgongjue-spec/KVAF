@@ -3,10 +3,70 @@
 set -Eeuo pipefail
 umask 077
 
+kvaf_provider_build_mode=${1:-production}
+if (( $# > 1 )) ||
+   [[ "${kvaf_provider_build_mode}" != production &&
+      "${kvaf_provider_build_mode}" != \
+        cross-npu2-reuse-versioned-offline-v1 ]]; then
+  echo "ERROR: invalid direct URMA provider build mode" >&2
+  exit 2
+fi
+
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd -P)
 source "${SCRIPT_DIR}/a5_direct_urma_legacy_guard.sh"
-kvaf_configure_direct_urma_state_paths "${ROOT_DIR}" || exit 2
+
+kvaf_versioned_experiment_build=0
+kvaf_device_provider_output_name=kvaf_urma_provider_device
+kvaf_device_provider_filename=libkvaf_urma_provider_device.so
+kvaf_experiment_schema=
+kvaf_experiment_profile=
+kvaf_experiment_artifact_token=
+kvaf_experiment_source_commit=
+kvaf_experiment_artifact_dir=
+if [[ "${kvaf_provider_build_mode}" == \
+      cross-npu2-reuse-versioned-offline-v1 ]]; then
+  kvaf_versioned_experiment_build=1
+  kvaf_experiment_schema=kvaf-a5-cross-npu2-versioned-provider-v1
+  kvaf_experiment_profile=cross-npu2-reuse-versioned-offline-v1
+  if [[ "${KVAF_CROSS_NPU2_REUSE_RISK_ACCEPTANCE:-}" != \
+        I_ACCEPT_UNKNOWN_NPU2_REUSE_AND_SHARED_UMMU_RISK ]]; then
+    echo "ERROR: the versioned provider build requires the exact second-order risk acceptance phrase" >&2
+    exit 2
+  fi
+  kvaf_experiment_artifact_token=${KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN:-}
+  if [[ ! "${kvaf_experiment_artifact_token}" =~ ^[0-9a-f]{16}$ ]]; then
+    echo "ERROR: KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN must be 16 lowercase hexadecimal digits" >&2
+    exit 2
+  fi
+  kvaf_experiment_source_commit=$(git -C "${ROOT_DIR}" rev-parse HEAD) || {
+    echo "ERROR: could not pin the KVAF source commit" >&2
+    exit 2
+  }
+  if [[ ! "${kvaf_experiment_source_commit}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "ERROR: the KVAF source commit is malformed" >&2
+    exit 2
+  fi
+  kvaf_experiment_artifact_dir="/data/.kvaf-state/KVAF/experimental/reuse-artifacts/${kvaf_experiment_source_commit}/${kvaf_experiment_artifact_token}"
+  kvaf_expected_provider_dir="${kvaf_experiment_artifact_dir}/provider"
+  if [[ -n "${KVAF_DIRECT_PROVIDER_BUILD_DIR+x}" &&
+        "${KVAF_DIRECT_PROVIDER_BUILD_DIR}" != \
+          "${kvaf_expected_provider_dir}" ]]; then
+    echo "ERROR: the versioned provider output directory is source-owned" >&2
+    echo "EXPECTED=${kvaf_expected_provider_dir}" >&2
+    echo "ACTUAL=${KVAF_DIRECT_PROVIDER_BUILD_DIR}" >&2
+    exit 2
+  fi
+  KVAF_DIRECT_PROVIDER_BUILD_DIR=${kvaf_expected_provider_dir}
+  kvaf_device_provider_output_name="kvaf_ud_${kvaf_experiment_artifact_token}"
+  kvaf_device_provider_filename="lib${kvaf_device_provider_output_name}.so"
+  (( ${#kvaf_device_provider_filename} < 32 )) || {
+    echo "ERROR: the versioned Device provider filename must be shorter than 32 bytes" >&2
+    exit 2
+  }
+else
+  kvaf_configure_direct_urma_state_paths "${ROOT_DIR}" || exit 2
+fi
 
 KVAF_UMDK_ROOT=${KVAF_UMDK_ROOT:-/data/c00982601/umdk}
 KVAF_LIBUMMU_ROOT=${KVAF_LIBUMMU_ROOT:-/data/c00982601/libummu}
@@ -54,6 +114,23 @@ manifest_value()
       print value
     }
   ' "${file}"
+}
+
+elf_soname()
+{
+  local file=$1
+  readelf -d "${file}" | awk '
+    /\(SONAME\)/ {
+      value = $0
+      sub(/^.*\[/, "", value)
+      sub(/\].*$/, "", value)
+      count++
+    }
+    END {
+      if (count != 1 || value == "") exit 1
+      print value
+    }
+  '
 }
 
 starlark_string_value()
@@ -354,48 +431,97 @@ if ! printf '%s\n' \
   die "paired libummu failed the full A5 UMMU ABI syntax probe"
 fi
 
-kvaf_check_legacy_direct_urma_state "${ROOT_DIR}" ||
-  die "legacy direct URMA state blocks provider mutation"
+if (( kvaf_versioned_experiment_build != 0 )); then
+  require_clean_git_source "${ROOT_DIR}" KVAF
+  [[ "$(git -C "${ROOT_DIR}" rev-parse HEAD)" == \
+        "${kvaf_experiment_source_commit}" ]] ||
+    die "the KVAF source commit changed during provider preflight"
 
-if [[ -L "${KVAF_GLOBAL_STATE_DIR}" ||
-      ( -e "${KVAF_GLOBAL_STATE_DIR}" &&
-        ! -d "${KVAF_GLOBAL_STATE_DIR}" ) ]]; then
-  die "global KVAF state path must be a real directory"
+  kvaf_experiment_root=/data/.kvaf-state/KVAF/experimental/reuse-artifacts
+  for guarded_dir in \
+    /data/.kvaf-state \
+    /data/.kvaf-state/KVAF \
+    /data/.kvaf-state/KVAF/experimental \
+    "${kvaf_experiment_root}" \
+    "${kvaf_experiment_root}/${kvaf_experiment_source_commit}" \
+    "${kvaf_experiment_artifact_dir}"
+  do
+    if [[ -L "${guarded_dir}" ||
+          ( -e "${guarded_dir}" && ! -d "${guarded_dir}" ) ]]; then
+      die "experimental provider ancestor must be a real directory: ${guarded_dir}"
+    fi
+  done
+  mkdir -p \
+    "${kvaf_experiment_root}/${kvaf_experiment_source_commit}" \
+    "${kvaf_experiment_artifact_dir}"
+  chmod 0700 \
+    /data/.kvaf-state/KVAF/experimental \
+    "${kvaf_experiment_root}" \
+    "${kvaf_experiment_root}/${kvaf_experiment_source_commit}" \
+    "${kvaf_experiment_artifact_dir}"
+  kvaf_resolved_artifact_dir=$(realpath -e \
+    "${kvaf_experiment_artifact_dir}") ||
+    die "could not canonicalize the experimental provider artifact directory"
+  [[ "${kvaf_resolved_artifact_dir}" == \
+        "${kvaf_experiment_artifact_dir}" ]] ||
+    die "experimental provider artifact directory escaped its fixed root"
+  if [[ -e "${KVAF_DIRECT_PROVIDER_BUILD_DIR}" ||
+        -L "${KVAF_DIRECT_PROVIDER_BUILD_DIR}" ]]; then
+    die "the versioned provider build requires a fresh artifact token"
+  fi
+  kvaf_experiment_build_lock="${kvaf_experiment_artifact_dir}/provider-build.lock"
+  [[ ! -L "${kvaf_experiment_build_lock}" &&
+     ( ! -e "${kvaf_experiment_build_lock}" ||
+       -f "${kvaf_experiment_build_lock}" ) ]] ||
+    die "experimental provider build lock must be a regular non-symlink file"
+  exec 9>"${kvaf_experiment_build_lock}"
+  flock -n 9 ||
+    die "another process owns this versioned provider artifact token"
+  chmod 0600 "${kvaf_experiment_build_lock}"
+else
+  kvaf_check_legacy_direct_urma_state "${ROOT_DIR}" ||
+    die "legacy direct URMA state blocks provider mutation"
+
+  if [[ -L "${KVAF_GLOBAL_STATE_DIR}" ||
+        ( -e "${KVAF_GLOBAL_STATE_DIR}" &&
+          ! -d "${KVAF_GLOBAL_STATE_DIR}" ) ]]; then
+    die "global KVAF state path must be a real directory"
+  fi
+  mkdir -p "${KVAF_GLOBAL_STATE_DIR}"
+  chmod 0700 "${KVAF_GLOBAL_STATE_DIR}"
+  if [[ -L "${KVAF_DIRECT_STATE_DIR}" ||
+        ( -e "${KVAF_DIRECT_STATE_DIR}" &&
+          ! -d "${KVAF_DIRECT_STATE_DIR}" ) ]]; then
+    die "direct URMA state path must be a real directory"
+  fi
+  mkdir -p "${KVAF_DIRECT_STATE_DIR}" \
+    "$(dirname "${KVAF_DIRECT_DEPLOY_RUN_LOCK}")" \
+    "$(dirname "${KVAF_DIRECT_ACTIVE_SESSION_LOCK}")"
+  chmod 0700 "${KVAF_DIRECT_STATE_DIR}"
+  for guarded_path in \
+    "${KVAF_DIRECT_DEPLOY_RUN_LOCK}" \
+    "${KVAF_DIRECT_ACTIVE_SESSION_LOCK}" \
+    "${KVAF_DIRECT_ACTIVE_SESSION_FILE}" \
+    "${KVAF_DIRECT_QUARANTINE_FILE}"
+  do
+    [[ ! -L "${guarded_path}" ]] ||
+      die "persistent state path must not be a symlink: ${guarded_path}"
+  done
+  exec 9>"${KVAF_DIRECT_DEPLOY_RUN_LOCK}"
+  if ! flock -w 30 9; then
+    die "another direct URMA deploy/run owns ${KVAF_DIRECT_DEPLOY_RUN_LOCK}"
+  fi
+  if [[ -e "${KVAF_DIRECT_QUARANTINE_FILE}" ||
+        -L "${KVAF_DIRECT_QUARANTINE_FILE}" ||
+        -e "${KVAF_DIRECT_ACTIVE_SESSION_FILE}" ||
+        -L "${KVAF_DIRECT_ACTIVE_SESSION_FILE}" ]]; then
+    die "direct URMA active/quarantine state blocks provider mutation"
+  fi
+  [[ ! -L "${KVAF_DIRECT_ACTIVE_SESSION_LOCK}" ]] ||
+    die "active-session lock path must not be a symlink"
+  exec 8>"${KVAF_DIRECT_ACTIVE_SESSION_LOCK}"
+  flock -n 8 || die "a live direct URMA worker blocks provider mutation"
 fi
-mkdir -p "${KVAF_GLOBAL_STATE_DIR}"
-chmod 0700 "${KVAF_GLOBAL_STATE_DIR}"
-if [[ -L "${KVAF_DIRECT_STATE_DIR}" ||
-      ( -e "${KVAF_DIRECT_STATE_DIR}" &&
-        ! -d "${KVAF_DIRECT_STATE_DIR}" ) ]]; then
-  die "direct URMA state path must be a real directory"
-fi
-mkdir -p "${KVAF_DIRECT_STATE_DIR}" \
-  "$(dirname "${KVAF_DIRECT_DEPLOY_RUN_LOCK}")" \
-  "$(dirname "${KVAF_DIRECT_ACTIVE_SESSION_LOCK}")"
-chmod 0700 "${KVAF_DIRECT_STATE_DIR}"
-for guarded_path in \
-  "${KVAF_DIRECT_DEPLOY_RUN_LOCK}" \
-  "${KVAF_DIRECT_ACTIVE_SESSION_LOCK}" \
-  "${KVAF_DIRECT_ACTIVE_SESSION_FILE}" \
-  "${KVAF_DIRECT_QUARANTINE_FILE}"
-do
-  [[ ! -L "${guarded_path}" ]] ||
-    die "persistent state path must not be a symlink: ${guarded_path}"
-done
-exec 9>"${KVAF_DIRECT_DEPLOY_RUN_LOCK}"
-if ! flock -w 30 9; then
-  die "another direct URMA deploy/run owns ${KVAF_DIRECT_DEPLOY_RUN_LOCK}"
-fi
-if [[ -e "${KVAF_DIRECT_QUARANTINE_FILE}" ||
-      -L "${KVAF_DIRECT_QUARANTINE_FILE}" ||
-      -e "${KVAF_DIRECT_ACTIVE_SESSION_FILE}" ||
-      -L "${KVAF_DIRECT_ACTIVE_SESSION_FILE}" ]]; then
-  die "direct URMA active/quarantine state blocks provider mutation"
-fi
-[[ ! -L "${KVAF_DIRECT_ACTIVE_SESSION_LOCK}" ]] ||
-  die "active-session lock path must not be a symlink"
-exec 8>"${KVAF_DIRECT_ACTIVE_SESSION_LOCK}"
-flock -n 8 || die "a live direct URMA worker blocks provider mutation"
 
 mkdir -p "$(dirname "${KVAF_DIRECT_PROVIDER_BUILD_DIR}")"
 mkdir -p "${KVAF_DIRECT_PROVIDER_BUILD_DIR}"
@@ -498,13 +624,14 @@ cmake \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_C_COMPILER="${KVAF_DIRECT_PROVIDER_CC}" \
   -DKVAF_UMDK_ROOT="${KVAF_UMDK_ROOT}" \
-  -DKVAF_LIBUMMU_ROOT="${KVAF_LIBUMMU_ROOT}"
+  -DKVAF_LIBUMMU_ROOT="${KVAF_LIBUMMU_ROOT}" \
+  -DKVAF_DEVICE_PROVIDER_OUTPUT_NAME="${kvaf_device_provider_output_name}"
 cmake --build "${staging_dir}/cmake" \
   --clean-first \
   --parallel "${KVAF_DIRECT_PROVIDER_BUILD_JOBS}"
 
 host_provider="${staging_dir}/cmake/libkvaf_urma_provider_host.so"
-device_provider="${staging_dir}/cmake/libkvaf_urma_provider_device.so"
+device_provider="${staging_dir}/cmake/${kvaf_device_provider_filename}"
 for provider in "${host_provider}" "${device_provider}"; do
   [[ -r "${provider}" ]] ||
     die "provider build did not produce ${provider}"
@@ -522,6 +649,12 @@ for group in source umdk-source libummu-source; do
 done
 require_clean_git_source "${KVAF_UMDK_ROOT}" UMDK
 require_clean_git_source "${KVAF_LIBUMMU_ROOT}" libummu
+if (( kvaf_versioned_experiment_build != 0 )); then
+  require_clean_git_source "${ROOT_DIR}" KVAF
+  [[ "$(git -C "${ROOT_DIR}" rev-parse HEAD)" == \
+        "${kvaf_experiment_source_commit}" ]] ||
+    die "the KVAF source commit changed during the versioned provider build"
+fi
 [[ "$(git -C "${KVAF_UMDK_ROOT}" rev-parse HEAD)" == \
       "${umdk_git_commit}" &&
     "$(git -C "${KVAF_UMDK_ROOT}" rev-parse 'HEAD^{tree}')" == \
@@ -662,6 +795,12 @@ validate_provider()
 
 validate_provider "${host_provider}" host-provider
 validate_provider "${device_provider}" device-provider
+[[ "$(elf_soname "${host_provider}")" == \
+      libkvaf_urma_provider_host.so ]] ||
+  die "Host provider SONAME does not match its canonical filename"
+[[ "$(elf_soname "${device_provider}")" == \
+      "${kvaf_device_provider_filename}" ]] ||
+  die "Device provider SONAME does not match its versioned filename"
 
 public_abi_probe="${staging_dir}/cmake/kvaf_urma_public_abi_probe"
 [[ -x "${public_abi_probe}" ]] ||
@@ -813,7 +952,7 @@ host_provider_execution_domain=host-process
 host_provider_sha256=${host_provider_sha}
 host_private_abi=1
 host_private_abi_name=official-umdk-udma-v1-host
-device_provider_filename=libkvaf_urma_provider_device.so
+device_provider_filename=${kvaf_device_provider_filename}
 device_provider_execution_domain=aicpu
 device_provider_sha256=${device_provider_sha}
 device_private_abi=2
@@ -856,6 +995,18 @@ ummu_uapi_probe_sha256=${ummu_uapi_probe_binary_sha}
 udma_teardown_contract=checked-retryable-v1
 EOF
 
+if (( kvaf_versioned_experiment_build != 0 )); then
+  cat >>"${staging_dir}/build.manifest" <<EOF
+experiment_schema=${kvaf_experiment_schema}
+experiment_profile=${kvaf_experiment_profile}
+mode=${kvaf_experiment_profile}
+experiment_profile_filename=experiment-provider.profile
+artifact_token=${kvaf_experiment_artifact_token}
+source_commit=${kvaf_experiment_source_commit}
+provider_dir=${KVAF_DIRECT_PROVIDER_BUILD_DIR}
+EOF
+fi
+
 build_manifest_sha=$(sha256_file "${staging_dir}/build.manifest") ||
   die "could not hash the provider build manifest"
 [[ "${build_manifest_sha}" =~ ^[0-9a-f]{64}$ ]] ||
@@ -875,6 +1026,23 @@ udma_private_abi_probe_sha256=${udma_private_abi_probe_binary_sha}
 ummu_uapi_probe_sha256=${ummu_uapi_probe_binary_sha}
 EOF
 
+
+if (( kvaf_versioned_experiment_build != 0 )); then
+  cat >>"${staging_dir}/build.success" <<EOF
+experiment_schema=${kvaf_experiment_schema}
+experiment_profile=${kvaf_experiment_profile}
+mode=${kvaf_experiment_profile}
+experiment_profile_filename=experiment-provider.profile
+artifact_token=${kvaf_experiment_artifact_token}
+source_commit=${kvaf_experiment_source_commit}
+provider_dir=${KVAF_DIRECT_PROVIDER_BUILD_DIR}
+host_provider_filename=libkvaf_urma_provider_host.so
+device_provider_filename=${kvaf_device_provider_filename}
+source_manifest_filename=source.sha256
+build_manifest_filename=build.manifest
+EOF
+fi
+
 [[ "$(manifest_value schema "${staging_dir}/build.success")" == \
       "kvaf-direct-urma-provider-success-v3" &&
     "$(manifest_value host_provider_sha256 \
@@ -891,13 +1059,89 @@ EOF
       "${runtime_ummu_uapi_header_sha}" ]] ||
   die "internal v3 success-stamp validation failed"
 
-publish_dir=$(
-  mktemp -d "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/.publish.XXXXXX"
-)
+if (( kvaf_versioned_experiment_build != 0 )); then
+  success_stamp_sha=$(sha256_file "${staging_dir}/build.success") ||
+    die "could not hash the versioned provider success stamp"
+  [[ "${success_stamp_sha}" =~ ^[0-9a-f]{64}$ ]] ||
+    die "versioned provider success-stamp SHA-256 output is malformed"
+  cat >"${staging_dir}/experiment-provider.profile" <<EOF
+schema=${kvaf_experiment_schema}
+experiment_profile=${kvaf_experiment_profile}
+mode=${kvaf_experiment_profile}
+artifact_token=${kvaf_experiment_artifact_token}
+source_commit=${kvaf_experiment_source_commit}
+provider_dir=${KVAF_DIRECT_PROVIDER_BUILD_DIR}
+host_provider_filename=libkvaf_urma_provider_host.so
+host_provider_sha256=${host_provider_sha}
+device_provider_filename=${kvaf_device_provider_filename}
+device_provider_sha256=${device_provider_sha}
+source_manifest_filename=source.sha256
+source_manifest_sha256=${source_manifest_sha}
+build_manifest_filename=build.manifest
+build_manifest_sha256=${build_manifest_sha}
+success_stamp_filename=build.success
+success_stamp_sha256=${success_stamp_sha}
+EOF
+  [[ "$(manifest_value schema \
+        "${staging_dir}/experiment-provider.profile")" == \
+        "${kvaf_experiment_schema}" &&
+      "$(manifest_value mode \
+        "${staging_dir}/experiment-provider.profile")" == \
+        "${kvaf_experiment_profile}" &&
+      "$(manifest_value artifact_token \
+        "${staging_dir}/experiment-provider.profile")" == \
+        "${kvaf_experiment_artifact_token}" &&
+      "$(manifest_value source_commit \
+        "${staging_dir}/experiment-provider.profile")" == \
+        "${kvaf_experiment_source_commit}" &&
+      "$(manifest_value provider_dir \
+        "${staging_dir}/experiment-provider.profile")" == \
+        "${KVAF_DIRECT_PROVIDER_BUILD_DIR}" &&
+      "$(manifest_value host_provider_filename \
+        "${staging_dir}/experiment-provider.profile")" == \
+        libkvaf_urma_provider_host.so &&
+      "$(manifest_value host_provider_sha256 \
+        "${staging_dir}/experiment-provider.profile")" == \
+        "${host_provider_sha}" &&
+      "$(manifest_value device_provider_filename \
+        "${staging_dir}/experiment-provider.profile")" == \
+        "${kvaf_device_provider_filename}" &&
+      "$(manifest_value device_provider_sha256 \
+        "${staging_dir}/experiment-provider.profile")" == \
+        "${device_provider_sha}" &&
+      "$(manifest_value source_manifest_filename \
+        "${staging_dir}/experiment-provider.profile")" == \
+        source.sha256 &&
+      "$(manifest_value source_manifest_sha256 \
+        "${staging_dir}/experiment-provider.profile")" == \
+        "${source_manifest_sha}" &&
+      "$(manifest_value build_manifest_filename \
+        "${staging_dir}/experiment-provider.profile")" == \
+        build.manifest &&
+      "$(manifest_value build_manifest_sha256 \
+        "${staging_dir}/experiment-provider.profile")" == \
+        "${build_manifest_sha}" &&
+      "$(manifest_value success_stamp_filename \
+        "${staging_dir}/experiment-provider.profile")" == \
+        build.success &&
+      "$(manifest_value success_stamp_sha256 \
+        "${staging_dir}/experiment-provider.profile")" == \
+        "${success_stamp_sha}" ]] ||
+    die "internal versioned provider profile validation failed"
+fi
+
+if (( kvaf_versioned_experiment_build != 0 )); then
+  publish_dir=$(mktemp -d \
+    "${kvaf_experiment_artifact_dir}/.provider.publish.XXXXXX")
+else
+  publish_dir=$(
+    mktemp -d "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/.publish.XXXXXX"
+  )
+fi
 cp "${host_provider}" \
   "${publish_dir}/libkvaf_urma_provider_host.so"
 cp "${device_provider}" \
-  "${publish_dir}/libkvaf_urma_provider_device.so"
+  "${publish_dir}/${kvaf_device_provider_filename}"
 for artifact in \
   source.sha256 umdk-source.sha256 libummu-source.sha256 \
   build.manifest build.success \
@@ -906,6 +1150,10 @@ for artifact in \
 do
   cp "${staging_dir}/${artifact}" "${publish_dir}/${artifact}"
 done
+if (( kvaf_versioned_experiment_build != 0 )); then
+  cp "${staging_dir}/experiment-provider.profile" \
+    "${publish_dir}/experiment-provider.profile"
+fi
 cp "${udma_uapi_probe}" "${publish_dir}/kvaf_udma_uapi_probe"
 cp "${udma_private_abi_probe}" \
   "${publish_dir}/kvaf_udma_private_abi_probe"
@@ -916,20 +1164,25 @@ chmod 0755 \
   "${publish_dir}/kvaf_udma_private_abi_probe" \
   "${publish_dir}/kvaf_ummu_uapi_probe"
 
-for artifact in \
-  libkvaf_urma_provider_host.so \
-  libkvaf_urma_provider_device.so \
-  source.sha256 \
-  umdk-source.sha256 \
-  libummu-source.sha256 \
-  build.manifest \
-  host-provider.dynamic.txt \
-  host-provider.ldd.txt \
-  device-provider.dynamic.txt \
-  device-provider.ldd.txt \
-  kvaf_udma_uapi_probe \
-  kvaf_udma_private_abi_probe \
+publish_artifacts=(
+  libkvaf_urma_provider_host.so
+  "${kvaf_device_provider_filename}"
+  source.sha256
+  umdk-source.sha256
+  libummu-source.sha256
+  build.manifest
+  host-provider.dynamic.txt
+  host-provider.ldd.txt
+  device-provider.dynamic.txt
+  device-provider.ldd.txt
+  kvaf_udma_uapi_probe
+  kvaf_udma_private_abi_probe
   kvaf_ummu_uapi_probe
+)
+if (( kvaf_versioned_experiment_build != 0 )); then
+  publish_artifacts+=(experiment-provider.profile)
+fi
+for artifact in "${publish_artifacts[@]}"
 do
   mv -f "${publish_dir}/${artifact}" \
     "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/${artifact}"
@@ -937,11 +1190,39 @@ done
 mv -f "${publish_dir}/build.success" "${success_stamp}"
 rmdir "${publish_dir}"
 
+if (( kvaf_versioned_experiment_build != 0 )); then
+  chmod 0500 \
+    "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/libkvaf_urma_provider_host.so" \
+    "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/${kvaf_device_provider_filename}" \
+    "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/kvaf_udma_uapi_probe" \
+    "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/kvaf_udma_private_abi_probe" \
+    "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/kvaf_ummu_uapi_probe"
+  chmod 0400 \
+    "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/source.sha256" \
+    "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/umdk-source.sha256" \
+    "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/libummu-source.sha256" \
+    "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/build.manifest" \
+    "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/build.success" \
+    "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/host-provider.dynamic.txt" \
+    "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/host-provider.ldd.txt" \
+    "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/device-provider.dynamic.txt" \
+    "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/device-provider.ldd.txt" \
+    "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/experiment-provider.profile"
+  chmod 0500 "${KVAF_DIRECT_PROVIDER_BUILD_DIR}"
+fi
+
 echo "KVAF_A5_DIRECT_URMA_PROVIDER_BUILD_OK"
 echo "HOST_PROVIDER=${KVAF_DIRECT_PROVIDER_BUILD_DIR}/libkvaf_urma_provider_host.so"
-echo "DEVICE_PROVIDER=${KVAF_DIRECT_PROVIDER_BUILD_DIR}/libkvaf_urma_provider_device.so"
+echo "DEVICE_PROVIDER=${KVAF_DIRECT_PROVIDER_BUILD_DIR}/${kvaf_device_provider_filename}"
 echo "SOURCE_MANIFEST=${KVAF_DIRECT_PROVIDER_BUILD_DIR}/source.sha256"
 echo "BUILD_MANIFEST=${KVAF_DIRECT_PROVIDER_BUILD_DIR}/build.manifest"
+if (( kvaf_versioned_experiment_build != 0 )); then
+  echo "EXPERIMENT_PROVIDER_PROFILE=${KVAF_DIRECT_PROVIDER_BUILD_DIR}/experiment-provider.profile"
+  echo "EXPERIMENT_SCHEMA=${kvaf_experiment_schema}"
+  echo "EXPERIMENT_PROFILE=${kvaf_experiment_profile}"
+  echo "EXPERIMENT_ARTIFACT_TOKEN=${kvaf_experiment_artifact_token}"
+  echo "EXPERIMENT_SOURCE_COMMIT=${kvaf_experiment_source_commit}"
+fi
 echo "HOST_PROVIDER_SHA256=${host_provider_sha}"
 echo "DEVICE_PROVIDER_SHA256=${device_provider_sha}"
 echo "UMDK_ROOT=${KVAF_UMDK_ROOT}"

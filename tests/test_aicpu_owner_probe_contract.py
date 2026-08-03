@@ -196,10 +196,17 @@ class AicpuOwnerProbeContractTests(unittest.TestCase):
             "KVAF_A5_AICPU_OWNER_PROBE_FAILED",
             "--logical-device-id",
             "--timeout-seconds",
+            "--provider-soname",
+            "IsProviderBasename",
+            "options.provider_soname.c_str()",
             "launch_args.timeout",
             "kRuntimeTimeoutGraceSeconds",
         ):
             self.assertIn(required, self.probe)
+
+        self.assertIn("name.size() < 32U", self.probe)
+        self.assertIn("name.find('/')", self.probe)
+        self.assertIn("name.find('\\\\')", self.probe)
 
         aiv_sync = self.probe.index(
             "aclrtSynchronizeStream(resources.aiv_stream)"

@@ -28,6 +28,13 @@ kvaf_require_aicpu_affinity_contract()
         echo "PRODUCTION_SAFETY_CLAIM=none" >&2
         return 0
       fi
+      if [[ "${requested_mode}" == \
+            risk-accepted-cross-npu2-reuse-v2 ]]; then
+        echo "WARNING: running explicitly risk-accepted second-order NPU2 reuse validation" >&2
+        echo "CONTRACT=${KVAF_AICPU_AFFINITY_CONTRACT}" >&2
+        echo "PRODUCTION_SAFETY_CLAIM=none" >&2
+        return 0
+      fi
       ;;
   esac
 

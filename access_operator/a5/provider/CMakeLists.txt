@@ -6,12 +6,24 @@ set(KVAF_UMDK_ROOT "" CACHE PATH
   "Path to the paired openEuler UMDK source repository")
 set(KVAF_LIBUMMU_ROOT "" CACHE PATH
   "Path to the libummu source repository pinned by UMDK")
+set(KVAF_DEVICE_PROVIDER_OUTPUT_NAME "kvaf_urma_provider_device" CACHE STRING
+  "Device provider output basename (without lib prefix or .so suffix)")
 
 if(NOT KVAF_UMDK_ROOT)
   message(FATAL_ERROR "KVAF_UMDK_ROOT is required")
 endif()
 if(NOT KVAF_LIBUMMU_ROOT)
   message(FATAL_ERROR "KVAF_LIBUMMU_ROOT is required")
+endif()
+string(LENGTH "${KVAF_DEVICE_PROVIDER_OUTPUT_NAME}"
+  KVAF_DEVICE_PROVIDER_OUTPUT_NAME_LENGTH)
+if(NOT KVAF_DEVICE_PROVIDER_OUTPUT_NAME STREQUAL
+      "kvaf_urma_provider_device" AND
+   (NOT KVAF_DEVICE_PROVIDER_OUTPUT_NAME MATCHES "^kvaf_ud_[0-9a-f]+$" OR
+    NOT KVAF_DEVICE_PROVIDER_OUTPUT_NAME_LENGTH EQUAL 24))
+  message(FATAL_ERROR
+    "KVAF_DEVICE_PROVIDER_OUTPUT_NAME must be the canonical basename or "
+    "kvaf_ud_<16 lowercase hexadecimal digits>")
 endif()
 get_filename_component(KVAF_UMDK_ROOT "${KVAF_UMDK_ROOT}" REALPATH)
 get_filename_component(KVAF_LIBUMMU_ROOT "${KVAF_LIBUMMU_ROOT}" REALPATH)
@@ -409,6 +421,14 @@ function(kvaf_add_urma_provider
     "-Wl,-Bsymbolic-functions"
     "-Wl,-z,defs"
   )
+  if(NOT OUTPUT_BASENAME STREQUAL "kvaf_urma_provider_device")
+    # The experimental AICPU loader key must be unique even if another worker
+    # has cached the canonical Device DSO.  CMake also derives its normal
+    # SHARED-library SONAME from OUTPUT_NAME; keep the explicit link option so
+    # the versioned identity is visible and independently verifiable.
+    target_link_options(${TARGET_NAME} PRIVATE
+      "-Wl,-soname,lib${OUTPUT_BASENAME}.so")
+  endif()
   set_target_properties(${TARGET_NAME} PROPERTIES
     OUTPUT_NAME "${OUTPUT_BASENAME}"
     C_VISIBILITY_PRESET hidden
@@ -429,7 +449,7 @@ kvaf_add_urma_provider(
   kvaf_udma_accessor_device
   kvaf_source_udma_device
   kvaf_source_ummu_device
-  kvaf_urma_provider_device)
+  "${KVAF_DEVICE_PROVIDER_OUTPUT_NAME}")
 
 add_library(kvaf_public_abi_consumer_probe OBJECT
   public_abi_probe_consumer.c)

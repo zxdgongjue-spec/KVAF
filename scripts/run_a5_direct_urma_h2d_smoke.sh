@@ -10,7 +10,9 @@ if (( $# > 1 )) ||
         candidate-epoch-owner-validation-v1 &&
       "${kvaf_affinity_run_mode}" != recovery-only-v1 &&
       "${kvaf_affinity_run_mode}" != \
-        risk-accepted-cross-npu2-v1 ]]; then
+        risk-accepted-cross-npu2-v1 &&
+      "${kvaf_affinity_run_mode}" != \
+        risk-accepted-cross-npu2-reuse-v2 ]]; then
   echo "ERROR: invalid direct URMA runner mode" >&2
   exit 2
 fi
@@ -21,7 +23,10 @@ source "${SCRIPT_DIR}/a5_direct_urma_legacy_guard.sh"
 source "${SCRIPT_DIR}/a5_aicpu_affinity_guard.sh"
 source "${SCRIPT_DIR}/a5_direct_urma_manifest_v3.sh"
 source "${SCRIPT_DIR}/a5_direct_urma_runtime_preflight.sh"
+source "${SCRIPT_DIR}/a5_cross_npu2_reuse_state.sh"
+source "${SCRIPT_DIR}/a5_cross_npu2_versioned_runtime_preflight.sh"
 kvaf_cross_npu_risk_mode=0
+kvaf_cross_npu_reuse_mode=0
 if [[ "${kvaf_affinity_run_mode}" == \
       risk-accepted-cross-npu2-v1 ]]; then
   kvaf_cross_npu_risk_mode=1
@@ -41,22 +46,85 @@ if [[ "${kvaf_affinity_run_mode}" == \
   fi
   kvaf_configure_cross_npu2_risk_state_paths \
     "${ROOT_DIR}" "${KVAF_CROSS_NPU_SOURCE_RUN_ID}" || exit 2
+elif [[ "${kvaf_affinity_run_mode}" == \
+        risk-accepted-cross-npu2-reuse-v2 ]]; then
+  kvaf_cross_npu_risk_mode=1
+  kvaf_cross_npu_reuse_mode=1
+  if [[ "${KVAF_CROSS_NPU2_REUSE_RISK_ACCEPTANCE:-}" != \
+        I_ACCEPT_UNKNOWN_NPU2_REUSE_AND_SHARED_UMMU_RISK ]]; then
+    echo "ERROR: NPU2 reuse mode requires the exact second-order risk phrase" >&2
+    exit 2
+  fi
+  if [[ ! "${KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN:-}" =~ \
+        ^[0-9a-f]{16}$ ]]; then
+    echo "ERROR: NPU2 reuse mode requires a fresh 16-lowercase-hex artifact token" >&2
+    exit 2
+  fi
+  readonly KVAF_CROSS_NPU2_REUSE_SOURCE_RUN_ID=530f5998a0b646d48db858170a9996ff
+  readonly KVAF_CROSS_NPU2_REUSE_PRIOR_RUN_ID=30ef7336d212459a9317fd6647f6fa15
+  kvaf_configure_cross_npu2_reuse_state_paths \
+    "${ROOT_DIR}" \
+    "${KVAF_CROSS_NPU2_REUSE_SOURCE_RUN_ID}" \
+    "${KVAF_CROSS_NPU2_REUSE_PRIOR_RUN_ID}" \
+    "${KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN}" || exit 2
 else
   kvaf_configure_direct_urma_state_paths "${ROOT_DIR}" || exit 2
 fi
 
-KVAF_A5_DIRECT_BUILD_DIR=${KVAF_A5_DIRECT_BUILD_DIR:-"${ROOT_DIR}/build-a5-direct-urma"}
+kvaf_reuse_source_commit=not-applicable
+kvaf_reuse_artifact_root=not-applicable
+if (( kvaf_cross_npu_reuse_mode != 0 )); then
+  kvaf_reuse_source_commit=$(git -C "${ROOT_DIR}" rev-parse HEAD) || {
+    echo "ERROR: could not pin the NPU2 reuse source commit" >&2
+    exit 2
+  }
+  [[ "${kvaf_reuse_source_commit}" =~ ^[0-9a-f]{40}$ ]] || exit 2
+  kvaf_reuse_artifact_root="${KVAF_GLOBAL_STATE_DIR}/KVAF/experimental/reuse-artifacts/${kvaf_reuse_source_commit}/${KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN}"
+  kvaf_default_direct_build_dir="${kvaf_reuse_artifact_root}/direct"
+  kvaf_default_provider_build_dir="${kvaf_reuse_artifact_root}/provider"
+  kvaf_default_device_provider="${kvaf_default_provider_build_dir}/libkvaf_ud_${KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN}.so"
+  kvaf_default_provider_soname="libkvaf_ud_${KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN}.so"
+else
+  kvaf_default_direct_build_dir="${ROOT_DIR}/build-a5-direct-urma"
+  kvaf_default_provider_build_dir="${ROOT_DIR}/build-a5-direct-urma-provider"
+  kvaf_default_device_provider="${kvaf_default_provider_build_dir}/libkvaf_urma_provider_device.so"
+  kvaf_default_provider_soname=libkvaf_urma_provider_device.so
+fi
+KVAF_A5_DIRECT_BUILD_DIR=${KVAF_A5_DIRECT_BUILD_DIR:-"${kvaf_default_direct_build_dir}"}
 KVAF_A5_DIRECT_BINARY=${KVAF_A5_DIRECT_BINARY:-"${KVAF_A5_DIRECT_BUILD_DIR}/access_operator/a5/kvaf_a5_aiv_direct_urma_h2d_smoke"}
 KVAF_A5_DIRECT_BUILD_MANIFEST=${KVAF_A5_DIRECT_BUILD_MANIFEST:-"${KVAF_A5_DIRECT_BUILD_DIR}/direct-smoke.manifest"}
-KVAF_DIRECT_PROVIDER_BUILD_DIR=${KVAF_DIRECT_PROVIDER_BUILD_DIR:-"${ROOT_DIR}/build-a5-direct-urma-provider"}
+KVAF_DIRECT_PROVIDER_BUILD_DIR=${KVAF_DIRECT_PROVIDER_BUILD_DIR:-"${kvaf_default_provider_build_dir}"}
 KVAF_DIRECT_HOST_PROVIDER_LIBRARY=${KVAF_DIRECT_HOST_PROVIDER_LIBRARY:-"${KVAF_DIRECT_PROVIDER_BUILD_DIR}/libkvaf_urma_provider_host.so"}
-KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY=${KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY:-"${KVAF_DIRECT_PROVIDER_BUILD_DIR}/libkvaf_urma_provider_device.so"}
+KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY=${KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY:-"${kvaf_default_device_provider}"}
 KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST=${KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST:-"${KVAF_DIRECT_PROVIDER_BUILD_DIR}/source.sha256"}
 KVAF_DIRECT_PROVIDER_BUILD_MANIFEST=${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST:-"${KVAF_DIRECT_PROVIDER_BUILD_DIR}/build.manifest"}
 KVAF_DIRECT_PROVIDER_SUCCESS_STAMP=${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP:-"${KVAF_DIRECT_PROVIDER_BUILD_DIR}/build.success"}
-KVAF_DIRECT_PROVIDER_SONAME=${KVAF_DIRECT_PROVIDER_SONAME:-libkvaf_urma_provider_device.so}
+KVAF_DIRECT_PROVIDER_SONAME=${KVAF_DIRECT_PROVIDER_SONAME:-"${kvaf_default_provider_soname}"}
 KVAF_CROSS_NPU_ARTIFACT_MANIFEST_SHA256=not-applicable
-if (( kvaf_cross_npu_risk_mode != 0 )); then
+if (( kvaf_cross_npu_reuse_mode != 0 )); then
+  if [[ "${KVAF_A5_DIRECT_BUILD_DIR}" != "${kvaf_default_direct_build_dir}" ||
+        "${KVAF_A5_DIRECT_BINARY}" != \
+          "${kvaf_default_direct_build_dir}/access_operator/a5/kvaf_a5_aiv_direct_urma_h2d_smoke" ||
+        "${KVAF_A5_DIRECT_BUILD_MANIFEST}" != \
+          "${kvaf_default_direct_build_dir}/direct-smoke.manifest" ||
+        "${KVAF_DIRECT_PROVIDER_BUILD_DIR}" != \
+          "${kvaf_default_provider_build_dir}" ||
+        "${KVAF_DIRECT_HOST_PROVIDER_LIBRARY}" != \
+          "${kvaf_default_provider_build_dir}/libkvaf_urma_provider_host.so" ||
+        "${KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY}" != \
+          "${kvaf_default_device_provider}" ||
+        "${KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST}" != \
+          "${kvaf_default_provider_build_dir}/source.sha256" ||
+        "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}" != \
+          "${kvaf_default_provider_build_dir}/build.manifest" ||
+        "${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP}" != \
+          "${kvaf_default_provider_build_dir}/build.success" ||
+        "${KVAF_DIRECT_PROVIDER_SONAME}" != \
+          "${kvaf_default_provider_soname}" ]]; then
+    echo "ERROR: NPU2 reuse mode artifacts must remain inside the token-owned immutable root" >&2
+    exit 2
+  fi
+elif (( kvaf_cross_npu_risk_mode != 0 )); then
   kvaf_cross_npu_source_commit=$(
     git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null
   ) || {
@@ -670,7 +738,7 @@ cross_npu_validation_value()
   ' <<<"${text}"
 }
 
-validate_cross_npu_risk_acceptance()
+validate_cross_npu_v1_risk_acceptance()
 {
   local validator output source_identity source_links
   local accepted_contract accepted_source_id accepted_run_id
@@ -773,6 +841,248 @@ validate_cross_npu_risk_acceptance()
   KVAF_CROSS_NPU_ACCEPTED_HOST_START_TICKS=${accepted_host_start_ticks}
   KVAF_CROSS_NPU_ACCEPTED_DEVICE_PID=${accepted_device_pid}
   KVAF_CROSS_NPU_ACCEPTED_DEVICE_START_TICKS=${accepted_device_start_ticks}
+}
+
+verify_cross_npu2_reuse_attempt_claim()
+{
+  local expected_path expected_content actual_content identity resolved
+
+  (( kvaf_cross_npu_reuse_mode != 0 )) || return 0
+  expected_path="${KVAF_CROSS_NPU2_REUSE_ROOT}/${KVAF_CROSS_NPU2_REUSE_SOURCE_RUN_ID}/${KVAF_CROSS_NPU2_REUSE_PRIOR_RUN_ID}/attempt.selected"
+  if [[ "${KVAF_CROSS_NPU2_REUSE_ATTEMPT_CLAIM_FILE:-}" != \
+        "${expected_path}" ||
+        -L "${expected_path}" ||
+        ! -f "${expected_path}" ||
+        ! -r "${expected_path}" ]]; then
+    echo "ERROR: sealed one-shot NPU2 reuse claim is missing or has the wrong path" >&2
+    return 2
+  fi
+  resolved=$(realpath -e "${expected_path}") || return 2
+  [[ "${resolved}" == "${expected_path}" ]] || return 2
+  identity=$(stat -c '%h:%a' "${expected_path}") || return 2
+  [[ "${identity}" == 1:400 ]] || {
+    echo "ERROR: one-shot NPU2 reuse claim must have nlink=1 and mode=0400" >&2
+    return 2
+  }
+  expected_content=$(printf '%s\n' \
+    'schema=kvaf-a5-cross-npu2-reuse-attempt-v1' \
+    "source_run_id=${KVAF_CROSS_NPU2_REUSE_SOURCE_RUN_ID}" \
+    "prior_target_run_id=${KVAF_CROSS_NPU2_REUSE_PRIOR_RUN_ID}" \
+    "artifact_token=${KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN}" \
+    "source_commit=${kvaf_reuse_source_commit}" \
+    'execution_contract=risk-accepted-cross-npu2-reuse-v2')
+  actual_content=$(cat "${expected_path}") || return 2
+  if [[ "${actual_content}" != "${expected_content}" ]]; then
+    echo "ERROR: one-shot NPU2 reuse claim content is inconsistent" >&2
+    return 2
+  fi
+}
+
+validate_cross_npu2_reuse_acceptance()
+{
+  local validator output accepted_contract accepted_token
+  local accepted_source_run accepted_prior_run accepted_state accepted_results
+  local accepted_prior_active_sha accepted_prior_manifest_sha
+  local accepted_prior_host_log_sha accepted_output_sha
+
+  (( kvaf_cross_npu_reuse_mode != 0 )) || return 0
+  verify_cross_npu2_reuse_attempt_claim || return $?
+  validator="${SCRIPT_DIR}/validate_a5_cross_npu2_reuse_risk.py"
+  if [[ -L "${validator}" || ! -f "${validator}" ||
+        ! -r "${validator}" ]]; then
+    echo "ERROR: second-order NPU2 risk validator is missing or unsafe" >&2
+    return 2
+  fi
+  if ! output=$(python3 "${validator}" \
+      --new-artifact-token \
+        "${KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN}"); then
+    echo "ERROR: the pinned NPU7 + first-NPU2 evidence no longer satisfies the reuse contract" >&2
+    return 2
+  fi
+
+  accepted_contract=$(cross_npu_validation_value \
+    KVAF_REUSE_CONTRACT "${output}") || return 2
+  accepted_token=$(cross_npu_validation_value \
+    KVAF_REUSE_ARTIFACT_TOKEN "${output}") || return 2
+  accepted_source_run=$(cross_npu_validation_value \
+    KVAF_REUSE_SOURCE_RUN_ID "${output}") || return 2
+  accepted_prior_run=$(cross_npu_validation_value \
+    KVAF_REUSE_PRIOR_TARGET_RUN_ID "${output}") || return 2
+  accepted_state=$(cross_npu_validation_value \
+    KVAF_REUSE_STATE_DIR "${output}") || return 2
+  accepted_results=$(cross_npu_validation_value \
+    KVAF_REUSE_RESULT_ROOT "${output}") || return 2
+  accepted_prior_active_sha=$(cross_npu_validation_value \
+    KVAF_REUSE_PRIOR_ACTIVE_SHA256 "${output}") || return 2
+  accepted_prior_manifest_sha=$(cross_npu_validation_value \
+    KVAF_REUSE_PRIOR_MANIFEST_SHA256 "${output}") || return 2
+  accepted_prior_host_log_sha=$(cross_npu_validation_value \
+    KVAF_REUSE_PRIOR_HOST_LOG_SHA256 "${output}") || return 2
+
+  if [[ "${accepted_contract}" != risk-accepted-cross-npu2-reuse-v1 ||
+        "${accepted_token}" != \
+          "${KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN}" ||
+        "${accepted_source_run}" != \
+          "${KVAF_CROSS_NPU2_REUSE_SOURCE_RUN_ID}" ||
+        "${accepted_prior_run}" != \
+          "${KVAF_CROSS_NPU2_REUSE_PRIOR_RUN_ID}" ||
+        "${accepted_state}" != "${KVAF_DIRECT_STATE_DIR}" ||
+        "${accepted_results}" != "${KVAF_DIRECT_RESULT_ROOT}" ]]; then
+    echo "ERROR: second-order NPU2 validator returned an inconsistent identity" >&2
+    return 2
+  fi
+  for accepted_output_sha in \
+    "${accepted_prior_active_sha}" \
+    "${accepted_prior_manifest_sha}" \
+    "${accepted_prior_host_log_sha}"; do
+    [[ "${accepted_output_sha}" =~ ^[0-9a-f]{64}$ ]] || return 2
+  done
+  accepted_output_sha=$(printf '%s\n' "${output}" | sha256sum | awk '{print $1}')
+
+  if [[ -n "${KVAF_CROSS_NPU2_REUSE_VALIDATION_OUTPUT:-}" ]]; then
+    if [[ "${output}" != \
+          "${KVAF_CROSS_NPU2_REUSE_VALIDATION_OUTPUT}" ||
+          "${accepted_output_sha}" != \
+          "${KVAF_CROSS_NPU2_REUSE_VALIDATION_SHA256}" ]]; then
+      echo "ERROR: pinned NPU7 or first-NPU2 evidence changed during the reuse run" >&2
+      return 2
+    fi
+    return 0
+  fi
+
+  KVAF_CROSS_NPU2_REUSE_VALIDATION_OUTPUT=${output}
+  KVAF_CROSS_NPU2_REUSE_VALIDATION_SHA256=${accepted_output_sha}
+  KVAF_CROSS_NPU2_REUSE_PRIOR_ACTIVE_SHA256=${accepted_prior_active_sha}
+  KVAF_CROSS_NPU2_REUSE_PRIOR_MANIFEST_SHA256=${accepted_prior_manifest_sha}
+  KVAF_CROSS_NPU2_REUSE_PRIOR_HOST_LOG_SHA256=${accepted_prior_host_log_sha}
+}
+
+validate_cross_npu_risk_acceptance()
+{
+  if (( kvaf_cross_npu_reuse_mode != 0 )); then
+    validate_cross_npu2_reuse_acceptance
+  else
+    validate_cross_npu_v1_risk_acceptance
+  fi
+}
+
+acquire_cross_npu2_reuse_session_guards()
+{
+  local path resolved_expected resolved_actual recovery_rc
+  local -a state_directories=(
+    "${KVAF_GLOBAL_STATE_DIR}"
+    "${KVAF_GLOBAL_STATE_DIR}/KVAF"
+    "${KVAF_GLOBAL_STATE_DIR}/KVAF/experimental"
+    "${KVAF_CROSS_NPU2_REUSE_ROOT}"
+    "${KVAF_CROSS_NPU2_REUSE_ROOT}/${KVAF_CROSS_NPU2_REUSE_SOURCE_RUN_ID}"
+    "${KVAF_CROSS_NPU2_REUSE_ROOT}/${KVAF_CROSS_NPU2_REUSE_SOURCE_RUN_ID}/${KVAF_CROSS_NPU2_REUSE_PRIOR_RUN_ID}"
+    "${KVAF_DIRECT_STATE_DIR}"
+    "${KVAF_DIRECT_RESULT_ROOT}"
+  )
+
+  for command in awk flock python3 realpath sha256sum stat; do
+    command -v "${command}" >/dev/null 2>&1 || {
+      echo "ERROR: ${command} is required for NPU2 reuse guards" >&2
+      exit 2
+    }
+  done
+  if [[ -L "${KVAF_DURABLE_STATE_HELPER}" ||
+        ! -f "${KVAF_DURABLE_STATE_HELPER}" ||
+        ! -r "${KVAF_DURABLE_STATE_HELPER}" ]]; then
+    echo "ERROR: durable state helper is missing or unsafe" >&2
+    exit 2
+  fi
+
+  # This validator is read-only for both the pinned NPU7 evidence and the
+  # complete first NPU2 transaction.  Validate before creating this token's
+  # state, and again after taking the reuse serialization lock.
+  validate_cross_npu2_reuse_acceptance || exit $?
+  for path in "${state_directories[@]}"; do
+    if [[ -L "${path}" || ( -e "${path}" && ! -d "${path}" ) ]]; then
+      echo "ERROR: NPU2 reuse state component is not a real directory" >&2
+      echo "PATH=${path}" >&2
+      exit 2
+    fi
+    mkdir -p "${path}"
+  done
+  chmod 0700 \
+    "${KVAF_CROSS_NPU2_REUSE_ROOT}" \
+    "${KVAF_CROSS_NPU2_REUSE_ROOT}/${KVAF_CROSS_NPU2_REUSE_SOURCE_RUN_ID}" \
+    "${KVAF_CROSS_NPU2_REUSE_ROOT}/${KVAF_CROSS_NPU2_REUSE_SOURCE_RUN_ID}/${KVAF_CROSS_NPU2_REUSE_PRIOR_RUN_ID}" \
+    "${KVAF_DIRECT_STATE_DIR}" \
+    "${KVAF_DIRECT_RESULT_ROOT}"
+
+  resolved_expected="${KVAF_CROSS_NPU2_REUSE_ROOT}/${KVAF_CROSS_NPU2_REUSE_SOURCE_RUN_ID}/${KVAF_CROSS_NPU2_REUSE_PRIOR_RUN_ID}/${KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN}"
+  resolved_actual=$(realpath -e "${KVAF_DIRECT_STATE_DIR}") || exit 2
+  if [[ "${resolved_actual}" != "${resolved_expected}" ]]; then
+    echo "ERROR: NPU2 reuse state directory escaped its fixed generation" >&2
+    exit 2
+  fi
+  kvaf_global_state_root=$(realpath -e "${KVAF_GLOBAL_STATE_DIR}") || exit 2
+  kvaf_state_root=${resolved_actual}
+  kvaf_results_root=$(realpath -e "${KVAF_DIRECT_RESULT_ROOT}") || exit 2
+  if [[ "${kvaf_results_root}" != "${kvaf_state_root}/results" ]]; then
+    echo "ERROR: NPU2 reuse result root escaped its fixed generation" >&2
+    exit 2
+  fi
+  KVAF_DIRECT_RESULT_ROOT=${kvaf_results_root}
+
+  for path in \
+    "${KVAF_CROSS_NPU2_REUSE_LOCK_FILE}" \
+    "${KVAF_DIRECT_DEPLOY_RUN_LOCK}" \
+    "${KVAF_DIRECT_ACTIVE_SESSION_LOCK}" \
+    "${KVAF_DIRECT_ACTIVE_SESSION_FILE}" \
+    "${KVAF_DIRECT_QUARANTINE_FILE}" \
+    "${KVAF_EID_LOCK_FILE}"; do
+    if [[ -L "${path}" ]]; then
+      echo "ERROR: NPU2 reuse state path must not be a symlink: ${path}" >&2
+      exit 2
+    fi
+  done
+
+  exec 10>"${KVAF_CROSS_NPU2_REUSE_LOCK_FILE}"
+  chmod 0600 "${KVAF_CROSS_NPU2_REUSE_LOCK_FILE}"
+  if ! flock -n 10; then
+    echo "ERROR: another second-order NPU2 experiment owns FD10" >&2
+    exit 5
+  fi
+  validate_cross_npu2_reuse_acceptance || exit $?
+
+  exec 9>"${KVAF_DIRECT_DEPLOY_RUN_LOCK}"
+  chmod 0600 "${KVAF_DIRECT_DEPLOY_RUN_LOCK}"
+  if ! flock -w "${KVAF_EID_LOCK_TIMEOUT_SECONDS}" 9; then
+    echo "ERROR: another run owns this NPU2 reuse generation" >&2
+    exit 5
+  fi
+  if [[ -e "${KVAF_DIRECT_QUARANTINE_FILE}" ||
+        -L "${KVAF_DIRECT_QUARANTINE_FILE}" ]]; then
+    echo "ERROR: this NPU2 reuse generation is quarantined" >&2
+    [[ -f "${KVAF_DIRECT_QUARANTINE_FILE}" &&
+       ! -L "${KVAF_DIRECT_QUARANTINE_FILE}" ]] &&
+      cat "${KVAF_DIRECT_QUARANTINE_FILE}" >&2
+    exit 4
+  fi
+
+  exec 8>"${KVAF_DIRECT_ACTIVE_SESSION_LOCK}"
+  chmod 0600 "${KVAF_DIRECT_ACTIVE_SESSION_LOCK}"
+  if ! flock -n 8; then
+    echo "ERROR: this NPU2 reuse generation retains an active worker" >&2
+    exit 5
+  fi
+  if [[ -e "${KVAF_DIRECT_ACTIVE_SESSION_FILE}" ||
+        -L "${KVAF_DIRECT_ACTIVE_SESSION_FILE}" ]]; then
+    if recover_stale_active_session; then
+      :
+    else
+      recovery_rc=$?
+      if (( recovery_rc == 4 )); then
+        echo "ERROR: stale NPU2 reuse state was quarantined" >&2
+        exit 4
+      fi
+      echo "ERROR: stale NPU2 reuse state is not safely recoverable" >&2
+      exit 5
+    fi
+  fi
 }
 
 acquire_cross_npu2_risk_session_guards()
@@ -961,6 +1271,11 @@ if [[ "${KVAF_DIRECT_ALLOW_BUSY_NPU}" != 0 &&
   echo "ERROR: KVAF_DIRECT_ALLOW_BUSY_NPU must be 0 or 1" >&2
   exit 2
 fi
+if (( kvaf_cross_npu_reuse_mode != 0 )) &&
+   [[ "${KVAF_DIRECT_ALLOW_BUSY_NPU}" != 0 ]]; then
+  echo "ERROR: NPU2 reuse mode requires a proven-idle NPU2; busy override is forbidden" >&2
+  exit 2
+fi
 if [[ -n "${KVAF_PHYSICAL_DEVICE_ID}" ]]; then
   require_uint_max KVAF_PHYSICAL_DEVICE_ID \
     "${KVAF_PHYSICAL_DEVICE_ID}" 4294967295
@@ -1036,10 +1351,20 @@ if (( KVAF_H2D_TRANSFER_COUNT == 0 )) &&
    [[ "${kvaf_affinity_run_mode}" != \
       candidate-epoch-owner-validation-v1 ]]; then
   if [[ "${kvaf_affinity_run_mode}" != \
-        risk-accepted-cross-npu2-v1 ]]; then
+        risk-accepted-cross-npu2-v1 &&
+        "${kvaf_affinity_run_mode}" != \
+        risk-accepted-cross-npu2-reuse-v2 ]]; then
     echo "ERROR: zero-WQE lifecycle is available only through a staged validation entry" >&2
     exit 2
   fi
+fi
+if (( kvaf_cross_npu_reuse_mode != 0 )) &&
+   (( KVAF_H2D_TRANSFER_COUNT != 0 ||
+      KVAF_H2D_BYTES_PER_TRANSFER != 1024 ||
+      KVAF_H2D_BATCH_ITERATIONS != 1 ||
+      KVAF_H2D_DESCRIPTOR_CAPACITY != 1 )); then
+  echo "ERROR: NPU2 reuse mode is limited to zero-WQE shape 0x1024, batch=1, capacity=1" >&2
+  exit 2
 fi
 if (( KVAF_H2D_TRANSFER_COUNT > KVAF_H2D_DESCRIPTOR_CAPACITY )); then
   echo "ERROR: KVAF_H2D_TRANSFER_COUNT exceeds KVAF_H2D_DESCRIPTOR_CAPACITY" >&2
@@ -1103,8 +1428,14 @@ if [[ "${KVAF_DIRECT_PROVIDER_SONAME}" == */* ||
   echo "ERROR: provider soname must be a basename shorter than 32 bytes" >&2
   exit 2
 fi
-if [[ "${KVAF_DIRECT_PROVIDER_SONAME}" != \
-      "libkvaf_urma_provider_device.so" ]]; then
+if (( kvaf_cross_npu_reuse_mode != 0 )); then
+  if [[ "${KVAF_DIRECT_PROVIDER_SONAME}" != \
+        "libkvaf_ud_${KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN}.so" ]]; then
+    echo "ERROR: NPU2 reuse provider SONAME must match its token-owned AICPU entry" >&2
+    exit 2
+  fi
+elif [[ "${KVAF_DIRECT_PROVIDER_SONAME}" != \
+        libkvaf_urma_provider_device.so ]]; then
   echo "ERROR: provider soname must match the AICPU package entry" >&2
   exit 2
 fi
@@ -1121,7 +1452,9 @@ command -v realpath >/dev/null 2>&1 || {
 # continues to reject every global quarantine.  The exact risk mode uses an
 # isolated target transaction and a read-only validator for one pinned NPU7
 # quarantine; it never calls or weakens the production legacy guard.
-if (( kvaf_cross_npu_risk_mode != 0 )); then
+if (( kvaf_cross_npu_reuse_mode != 0 )); then
+  acquire_cross_npu2_reuse_session_guards
+elif (( kvaf_cross_npu_risk_mode != 0 )); then
   acquire_cross_npu2_risk_session_guards
 else
   acquire_persistent_session_guards
@@ -1139,7 +1472,18 @@ if [[ "${kvaf_affinity_run_mode}" == recovery-only-v1 ]]; then
 fi
 
 : "${ASCEND_HOME_PATH:?source the container CANN set_env.sh first}"
-KVAF_DIRECT_AICPU_ARCHIVE=${KVAF_DIRECT_AICPU_ARCHIVE:-"${ASCEND_HOME_PATH}/opp/vendors/cust/op_impl/aicpu/kernel/cann-kvaf-direct-urma-compat.tar.gz"}
+if (( kvaf_cross_npu_reuse_mode != 0 )); then
+  kvaf_reuse_ascend_home=$(realpath -e "${ASCEND_HOME_PATH}") || exit 2
+  kvaf_expected_reuse_archive="${kvaf_reuse_ascend_home}/opp/vendors/cust/op_impl/aicpu/kernel/cann-kvaf-du-${KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN}.tar.gz"
+  KVAF_DIRECT_AICPU_ARCHIVE=${KVAF_DIRECT_AICPU_ARCHIVE:-"${kvaf_expected_reuse_archive}"}
+  if [[ "${KVAF_DIRECT_AICPU_ARCHIVE}" != \
+        "${kvaf_expected_reuse_archive}" ]]; then
+    echo "ERROR: NPU2 reuse archive must use the token-owned package name" >&2
+    exit 2
+  fi
+else
+  KVAF_DIRECT_AICPU_ARCHIVE=${KVAF_DIRECT_AICPU_ARCHIVE:-"${ASCEND_HOME_PATH}/opp/vendors/cust/op_impl/aicpu/kernel/cann-kvaf-direct-urma-compat.tar.gz"}
+fi
 KVAF_DIRECT_AICPU_REGISTRATION_FILE=${KVAF_DIRECT_AICPU_REGISTRATION_FILE:-"${ASCEND_HOME_PATH}/conf/ascend_package_load.ini"}
 
 # Recovery must not depend on the current checkout or provider build: its
@@ -1148,9 +1492,16 @@ KVAF_DIRECT_AICPU_REGISTRATION_FILE=${KVAF_DIRECT_AICPU_REGISTRATION_FILE:-"${AS
 # before EID discovery, endpoint discovery, /proc, npu-smi, ACL, DDR/HBM or
 # URMA.  This also re-runs all three ABI probes and binds the build to the
 # current kernel and its UDMA/UMMU UAPI files.
-if ! kvaf_verify_direct_provider_build_v3; then
-  echo "ERROR: rebuild the paired official UMDK/libummu provider before running hardware" >&2
-  exit 2
+if (( kvaf_cross_npu_reuse_mode != 0 )); then
+  if ! kvaf_verify_cross_npu2_versioned_runtime_artifacts; then
+    echo "ERROR: rebuild the complete token-owned NPU2 reuse artifact chain" >&2
+    exit 2
+  fi
+else
+  if ! kvaf_verify_direct_provider_build_v3; then
+    echo "ERROR: rebuild the paired official UMDK/libummu provider before running hardware" >&2
+    exit 2
+  fi
 fi
 host_provider_sha=${KVAF_VERIFIED_HOST_PROVIDER_SHA}
 device_provider_sha=${KVAF_VERIFIED_DEVICE_PROVIDER_SHA}
@@ -1172,15 +1523,27 @@ kvaf_require_aicpu_affinity_contract \
 # The deploy lock acquired during recovery closes the build/package race.
 # Validate the complete direct-smoke and installed AICPU artifact chain before
 # any EID selector, hccn/sysfs query, npu-smi call, ACL context or URMA access.
-if ! kvaf_verify_direct_runtime_artifacts_v3; then
-  echo "ERROR: rebuild and repackage the direct URMA runtime artifacts" >&2
-  exit 2
+if (( kvaf_cross_npu_reuse_mode != 0 )); then
+  # The versioned preflight above validates provider, direct executable,
+  # unique AICPU archive/registration and their sealed profiles as one chain.
+  direct_binary_sha=${KVAF_VERIFIED_DIRECT_BINARY_SHA}
+  direct_build_manifest_sha=${KVAF_VERIFIED_DIRECT_BUILD_MANIFEST_SHA}
+  direct_source_manifest="${KVAF_A5_DIRECT_BUILD_DIR}/direct-smoke-source.sha256"
+  direct_source_manifest_sha=$(sha256sum "${direct_source_manifest}" |
+    awk '{print $1}')
+  direct_runtime_header=$(kvaf_runtime_preflight_manifest_value \
+    runtime_header_path "${KVAF_A5_DIRECT_BUILD_MANIFEST}") || exit 2
+else
+  if ! kvaf_verify_direct_runtime_artifacts_v3; then
+    echo "ERROR: rebuild and repackage the direct URMA runtime artifacts" >&2
+    exit 2
+  fi
+  direct_binary_sha=${KVAF_VERIFIED_DIRECT_BINARY_SHA}
+  direct_build_manifest_sha=${KVAF_VERIFIED_DIRECT_BUILD_MANIFEST_SHA}
+  direct_source_manifest=${KVAF_VERIFIED_DIRECT_SOURCE_MANIFEST}
+  direct_source_manifest_sha=${KVAF_VERIFIED_DIRECT_SOURCE_MANIFEST_SHA}
+  direct_runtime_header=${KVAF_VERIFIED_DIRECT_RUNTIME_HEADER}
 fi
-direct_binary_sha=${KVAF_VERIFIED_DIRECT_BINARY_SHA}
-direct_build_manifest_sha=${KVAF_VERIFIED_DIRECT_BUILD_MANIFEST_SHA}
-direct_source_manifest=${KVAF_VERIFIED_DIRECT_SOURCE_MANIFEST}
-direct_source_manifest_sha=${KVAF_VERIFIED_DIRECT_SOURCE_MANIFEST_SHA}
-direct_runtime_header=${KVAF_VERIFIED_DIRECT_RUNTIME_HEADER}
 
 # Host Segment registration allocates UMMU Token/TID state before it can
 # create any URMA MR.  HAL Host DDR mapping does not provide or replace this
@@ -1259,12 +1622,15 @@ fi
 # it in the kernel-reserved range so it cannot collide with dynamically
 # allocated application Jetty IDs. A5 physical IDs 0..7 map to 500..507.
 if [[ -z "${KVAF_DIRECT_MANAGEMENT_JETTY_ID}" ]]; then
-  if (( KVAF_PHYSICAL_DEVICE_ID > 523 )); then
+  if (( kvaf_cross_npu_reuse_mode != 0 )); then
+    KVAF_DIRECT_MANAGEMENT_JETTY_ID=602
+  elif (( KVAF_PHYSICAL_DEVICE_ID > 523 )); then
     echo "ERROR: cannot derive a reserved management Jetty ID for physical NPU ${KVAF_PHYSICAL_DEVICE_ID}" >&2
     echo "Set KVAF_DIRECT_MANAGEMENT_JETTY_ID explicitly in [1, 1023]." >&2
     exit 2
+  else
+    KVAF_DIRECT_MANAGEMENT_JETTY_ID=$((500 + KVAF_PHYSICAL_DEVICE_ID))
   fi
-  KVAF_DIRECT_MANAGEMENT_JETTY_ID=$((500 + KVAF_PHYSICAL_DEVICE_ID))
 fi
 require_uint_max KVAF_DIRECT_MANAGEMENT_JETTY_ID \
   "${KVAF_DIRECT_MANAGEMENT_JETTY_ID}" 65535
@@ -1274,8 +1640,13 @@ if (( KVAF_DIRECT_MANAGEMENT_JETTY_ID == 0 ||
   echo "ERROR: KVAF_DIRECT_MANAGEMENT_JETTY_ID must be in the reserved range [1, 1023] and must not be 21115" >&2
   exit 2
 fi
-if (( kvaf_cross_npu_risk_mode != 0 )) &&
-   [[ "${KVAF_DIRECT_MANAGEMENT_JETTY_ID}" != 502 ]]; then
+if (( kvaf_cross_npu_reuse_mode != 0 )); then
+  if [[ "${KVAF_DIRECT_MANAGEMENT_JETTY_ID}" != 602 ]]; then
+    echo "ERROR: NPU2 reuse mode is pinned to fresh management Jetty 602" >&2
+    exit 2
+  fi
+elif (( kvaf_cross_npu_risk_mode != 0 )) &&
+     [[ "${KVAF_DIRECT_MANAGEMENT_JETTY_ID}" != 502 ]]; then
   echo "ERROR: cross-NPU risk mode is pinned to management Jetty 502" >&2
   exit 2
 fi
@@ -1700,7 +2071,12 @@ archive_sha=$(
     awk '{print $1}'
 )
 risk_validator_sha=not-applicable
-if (( kvaf_cross_npu_risk_mode != 0 )); then
+if (( kvaf_cross_npu_reuse_mode != 0 )); then
+  risk_validator_sha=$(
+    sha256sum "${SCRIPT_DIR}/validate_a5_cross_npu2_reuse_risk.py" |
+      awk '{print $1}'
+  )
+elif (( kvaf_cross_npu_risk_mode != 0 )); then
   risk_validator_sha=$(
     sha256sum "${SCRIPT_DIR}/validate_a5_cross_npu_risk_acceptance.py" |
       awk '{print $1}'
@@ -1711,7 +2087,57 @@ fi
   printf 'aicpu_affinity_contract=%s\n' \
     "${KVAF_AICPU_AFFINITY_CONTRACT}"
   printf 'aicpu_affinity_run_mode=%s\n' "${kvaf_affinity_run_mode}"
-  if (( kvaf_cross_npu_risk_mode != 0 )); then
+  if (( kvaf_cross_npu_reuse_mode != 0 )); then
+    printf 'execution_safety_contract=experimental-risk-accepted-cross-npu2-reuse-v2\n'
+    printf 'production_safety_claim=none\n'
+    printf 'artifact_mutation_policy=forbidden-during-run\n'
+    printf 'source_process_policy=retain-no-signal\n'
+    printf 'cross_npu_reuse_artifact_token=%s\n' \
+      "${KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN}"
+    printf 'cross_npu_reuse_artifact_root=%s\n' \
+      "${kvaf_reuse_artifact_root}"
+    printf 'cross_npu_reuse_source_commit=%s\n' \
+      "${kvaf_reuse_source_commit}"
+    printf 'cross_npu_reuse_lock_fd=10\n'
+    printf 'cross_npu_reuse_lock_file=%s\n' \
+      "${KVAF_CROSS_NPU2_REUSE_LOCK_FILE}"
+    printf 'cross_npu_reuse_target_state_dir=%s\n' \
+      "${KVAF_DIRECT_STATE_DIR}"
+    printf 'cross_npu_reuse_source_run_id=%s\n' \
+      "${KVAF_CROSS_NPU2_REUSE_SOURCE_RUN_ID}"
+    printf 'cross_npu_reuse_prior_target_run_id=%s\n' \
+      "${KVAF_CROSS_NPU2_REUSE_PRIOR_RUN_ID}"
+    printf 'cross_npu_reuse_prior_active_file=%s\n' \
+      "${KVAF_CROSS_NPU2_REUSE_PRIOR_ACTIVE_FILE}"
+    printf 'cross_npu_reuse_prior_active_sha256=%s\n' \
+      "${KVAF_CROSS_NPU2_REUSE_PRIOR_ACTIVE_SHA256}"
+    printf 'cross_npu_reuse_prior_manifest_sha256=%s\n' \
+      "${KVAF_CROSS_NPU2_REUSE_PRIOR_MANIFEST_SHA256}"
+    printf 'cross_npu_reuse_prior_host_log_sha256=%s\n' \
+      "${KVAF_CROSS_NPU2_REUSE_PRIOR_HOST_LOG_SHA256}"
+    printf 'cross_npu_reuse_validation_sha256=%s\n' \
+      "${KVAF_CROSS_NPU2_REUSE_VALIDATION_SHA256}"
+    printf 'cross_npu_reuse_risk_validator_sha256=%s\n' \
+      "${risk_validator_sha}"
+    printf 'cross_npu_reuse_provider_profile=%s\n' \
+      "${KVAF_CROSS_NPU2_PROVIDER_PROFILE}"
+    printf 'cross_npu_reuse_provider_profile_sha256=%s\n' "$(
+      sha256sum "${KVAF_CROSS_NPU2_PROVIDER_PROFILE}" | awk '{print $1}'
+    )"
+    printf 'cross_npu_reuse_package_profile=%s\n' \
+      "${KVAF_CROSS_NPU2_PACKAGE_PROFILE}"
+    printf 'cross_npu_reuse_package_profile_sha256=%s\n' "$(
+      sha256sum "${KVAF_CROSS_NPU2_PACKAGE_PROFILE}" | awk '{print $1}'
+    )"
+    printf 'cross_npu_reuse_direct_profile=%s\n' \
+      "${KVAF_CROSS_NPU2_DIRECT_PROFILE}"
+    printf 'cross_npu_reuse_direct_profile_sha256=%s\n' "$(
+      sha256sum "${KVAF_CROSS_NPU2_DIRECT_PROFILE}" | awk '{print $1}'
+    )"
+    printf 'cross_npu_target_logical_device_id=2\n'
+    printf 'cross_npu_target_management_jetty_id=602\n'
+    printf 'unverified_risk_mask=UMMU_GLOBAL|PRIOR_NPU2_STATE|AICPU_PROCESS_REUSE|INFLIGHT_DMA_SCOPE|PLBI_PSYNC_SCOPE|DRIVER_GLOBAL_STATE\n'
+  elif (( kvaf_cross_npu_risk_mode != 0 )); then
     printf 'execution_safety_contract=experimental-risk-accepted-cross-npu2-v1\n'
     printf 'production_safety_claim=none\n'
     printf 'artifact_mutation_policy=forbidden\n'
