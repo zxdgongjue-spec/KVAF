@@ -352,6 +352,9 @@ active 状态，全程不会再次访问 topology、EID selector 或 NPU。
 单独用它判定 worker 仍能执行：`Z/X/x` 状态会被视为已经退出并由父 runner 执行
 `wait` 回收；只有终态已严格证明 `PASS/FAIL_SAFE` 时才随即删除 active。若 proc
 状态不可读或无法解析，则仍按“可能存活”保留 active，避免观测故障放宽安全门。
+`FAIL_SAFE` 刚发布时，runner 还会固定等待最多 2 秒，让正在执行
+`aclrtResetDevice`/`aclFinalize` 的安全 worker 自然退出；不发送信号，超时后仍按
+`safe_terminal_process_stuck` 保留状态。
 
 端点在 `aclrtResetDevice`/`aclFinalize` 之前先写一份
 `transport_safe_runtime_cleanup_pending` 的 `FAIL_SAFE` 证明。这里的

@@ -1588,6 +1588,29 @@ reap_zombie_child()
   esac
 }
 
+safe_workers_exited_after_grace()
+{
+  local attempt
+
+  # A FAIL_SAFE marker can precede aclrtResetDevice/aclFinalize and process
+  # exit by a few scheduler quanta. Give already-safe children two seconds to
+  # become waitable before persisting a process-stuck state. This never sends
+  # a signal and never changes an unknown/mismatched identity into "exited".
+  for (( attempt = 0; attempt < 40; ++attempt )); do
+    if ! process_is_running \
+           "${host_pid:-0}" "${host_expected_start_ticks:-0}" &&
+       ! process_is_running \
+           "${device_pid:-0}" "${device_expected_start_ticks:-0}"; then
+      return 0
+    fi
+    sleep 0.05 || true
+  done
+  ! process_is_running \
+      "${host_pid:-0}" "${host_expected_start_ticks:-0}" &&
+    ! process_is_running \
+      "${device_pid:-0}" "${device_expected_start_ticks:-0}"
+}
+
 process_executable()
 {
   local pid=${1:-0}
@@ -1936,14 +1959,7 @@ cleanup_on_exit()
        [[ -n "${host_pid}" || -n "${device_pid}" ]]; then
       set +e
       if terminal_cleanup_proven; then
-        if [[ -n "${host_pid}" ]] &&
-           process_is_running \
-             "${host_pid}" "${host_expected_start_ticks}"; then
-          worker_live=1
-        fi
-        if [[ -n "${device_pid}" ]] &&
-           process_is_running \
-             "${device_pid}" "${device_expected_start_ticks}"; then
+        if ! safe_workers_exited_after_grace; then
           worker_live=1
         fi
         if (( worker_live != 0 )); then
@@ -2151,7 +2167,7 @@ if (( pre_device_host_classifier_rc == 3 )) &&
         "$(manifest_value resource_armed "${host_final}")" == 1 ]]; then
     record_quarantine "unverified_udma_armed_host_terminal_before_device"
     pre_device_safe_exit_rc=4
-  elif process_is_running "${host_pid}" "${host_expected_start_ticks}"; then
+  elif ! safe_workers_exited_after_grace; then
     active_phase=host_safe_terminal_process_stuck
     write_active_session
     pre_device_safe_exit_rc=3

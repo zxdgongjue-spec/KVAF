@@ -295,14 +295,15 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
         self.assertIn("Z|X|x)", state_block)
         self.assertIn("observational uncertainty", state_block)
         self.assertIn("reap_zombie_child()", state_block)
+        self.assertIn("safe_workers_exited_after_grace()", state_block)
+        self.assertIn("attempt < 40", state_block)
+        self.assertIn("sleep 0.05", state_block)
+        self.assertIn("never sends", state_block)
 
         cleanup_start = self.source.index("cleanup_on_exit()")
         cleanup_end = self.source.index("trap cleanup_on_exit EXIT")
         cleanup = self.source[cleanup_start:cleanup_end]
-        self.assertIn('"${host_pid}" "${host_expected_start_ticks}"', cleanup)
-        self.assertIn(
-            '"${device_pid}" "${device_expected_start_ticks}"', cleanup
-        )
+        self.assertIn("safe_workers_exited_after_grace", cleanup)
         self.assertIn('"${host_pid:-0}" "${host_expected_start_ticks:-0}"', cleanup)
 
         wait_start = self.source.index(
