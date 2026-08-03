@@ -11,6 +11,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 WRAPPER = ROOT / "scripts" / "run_a5_direct_urma_npu2_clean_validation.sh"
+COORDINATOR = (
+    ROOT / "scripts" / "prepare_and_run_a5_direct_urma_npu2_clean.sh"
+)
 
 
 class Npu2CleanValidationTests(unittest.TestCase):
@@ -18,13 +21,14 @@ class Npu2CleanValidationTests(unittest.TestCase):
         bash = shutil.which("bash")
         if bash is None:
             self.skipTest("bash is unavailable")
-        result = subprocess.run(
-            [bash, "-n", str(WRAPPER)],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        for script in (WRAPPER, COORDINATOR):
+            result = subprocess.run(
+                [bash, "-n", str(script)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
 
         source = WRAPPER.read_text(encoding="utf-8")
         for required in (
@@ -48,6 +52,20 @@ class Npu2CleanValidationTests(unittest.TestCase):
         self.assertNotIn("KVAF_DIRECT_ALLOW_BUSY_NPU=1", source)
         self.assertNotIn("rm -f /data/.kvaf-state", source)
         self.assertNotIn("kill ", source)
+
+        coordinator = COORDINATOR.read_text(encoding="utf-8")
+        provider = coordinator.index("build_a5_direct_urma_provider.sh")
+        package = coordinator.index("package_a5_direct_urma_aicpu.sh")
+        direct = coordinator.index('build_a5_direct_urma.sh"')
+        validation = coordinator.index(
+            "run_a5_direct_urma_npu2_clean_validation.sh"
+        )
+        self.assertLess(provider, package)
+        self.assertLess(package, direct)
+        self.assertLess(direct, validation)
+        self.assertNotIn("risk-accepted-cross-npu2-v1", coordinator)
+        self.assertNotIn("rm -f /data/.kvaf-state", coordinator)
+        self.assertNotIn("kill ", coordinator)
 
     def run_preflight(self, **updates: str) -> subprocess.CompletedProcess[str]:
         bash = shutil.which("bash")

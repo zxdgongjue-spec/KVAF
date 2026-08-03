@@ -560,7 +560,10 @@ active/quarantine 尚未闭环，该入口会在 topology、ACL、DDR/HBM、URMA
 最终 batch 可通过 `KVAF_NPU2_TRANSFER_COUNT`、
 `KVAF_NPU2_BYTES_PER_TRANSFER` 和 `KVAF_NPU2_BATCH_ITERATIONS` 修改；默认分别为
 4096、1024、1。控制 timeout 默认 60 秒，单阶段 runner supervision deadline 默认
-180 秒，失败后保留全部证据且不会自动进入下一阶段。
+180 秒，失败后保留全部证据且不会自动进入下一阶段。干净重启后可从 Docker 内调用
+`prepare_and_run_a5_direct_urma_npu2_clean.sh`，由它依次完成 provider 构建、AICPU
+打包、direct binary 构建和上述三阶段验证，避免在终端逐段粘贴命令；每个子步骤
+仍使用原有 machine-wide guard。
 
 ## 6. 操作命令
 
