@@ -128,10 +128,12 @@ timeout 240s python3 tests/python/test_npu_batch_get.py
 先在图外 eager 执行 `output A -> B -> A`，使 A 的 local HBM 注册进入 transport
 cache；再在 `torch.npu.graph(...)` 中 capture 固定地址的 `indices.copy_`、
 `output_indices.copy_`、`output.zero_`、`runtime.batch_get(..., stream,
-synchronize=False)` 和一个后续 PyTorch copy。每次 replay 只在图外更新固定 source
-tensor 内容。图性能指标 `external_graph_replay_to_stream_completion` 包含整张外部图
-replay 与 capture stream 同步；不包含图外 source 更新、capture、初始化和最终验证，
-因此不能与 eager 指标直接作一一对比。
+synchronize=False)` 和一个后续 PyTorch copy。每次 replay 前，脚本先在同一个
+capture stream 上把新的 Host lookup 输入拷贝到固定 source tensor，再调用
+`graph.replay()`；这是 demo 已验证的 producer -> replay 顺序，不能改成裸 replay。
+图性能指标 `external_graph_input_update_to_stream_completion` 包含这两次输入 H2D
+更新、整张外部图 replay 与 capture stream 同步；不包含 Python 构造 Host 输入、
+capture、初始化和最终验证，因此不能与 eager 指标直接作一一对比。
 
 Python 调用 `batch_get` 必须显式传入 `torch.npu.current_stream()`（或 capture
 stream 对象）。
