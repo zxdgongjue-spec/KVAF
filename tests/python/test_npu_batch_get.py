@@ -397,19 +397,44 @@ def main() -> int:
                 f"perf_warmup={graph_warmup} perf_samples={graph_iterations}"
             )
 
+            graph_input_bytes = requests * torch.tensor(
+                [], dtype=torch.int32
+            ).element_size()
+            print(
+                "RUNTIME_NPU_GRAPH_ALLOCATION_BEGIN "
+                f"item=indices_source bytes={graph_input_bytes}"
+            )
             graph_indices_source = torch.empty(
                 requests, dtype=torch.int32, device=device
+            )
+            print("RUNTIME_NPU_GRAPH_ALLOCATION_DONE item=indices_source")
+            print(
+                "RUNTIME_NPU_GRAPH_ALLOCATION_BEGIN "
+                f"item=output_indices_source bytes={graph_input_bytes}"
             )
             graph_output_indices_source = torch.empty(
                 requests, dtype=torch.int32, device=device
             )
+            print("RUNTIME_NPU_GRAPH_ALLOCATION_DONE item=output_indices_source")
+            print(
+                "RUNTIME_NPU_GRAPH_ALLOCATION_BEGIN "
+                f"item=indices_staging bytes={graph_input_bytes}"
+            )
             graph_indices_staging = torch.empty(
                 requests, dtype=torch.int32, device=device
+            )
+            print("RUNTIME_NPU_GRAPH_ALLOCATION_DONE item=indices_staging")
+            print(
+                "RUNTIME_NPU_GRAPH_ALLOCATION_BEGIN "
+                f"item=output_indices_staging bytes={graph_input_bytes}"
             )
             graph_output_indices_staging = torch.empty(
                 requests, dtype=torch.int32, device=device
             )
+            print("RUNTIME_NPU_GRAPH_ALLOCATION_DONE item=output_indices_staging")
+            print("RUNTIME_NPU_GRAPH_ALLOCATION_BEGIN item=post_marker bytes=1")
             graph_post_marker = torch.zeros(1, dtype=torch.uint8, device=device)
+            print("RUNTIME_NPU_GRAPH_ALLOCATION_DONE item=post_marker")
 
             def prepare_graph_inputs(
                 epoch: int, trace: str | None = None
