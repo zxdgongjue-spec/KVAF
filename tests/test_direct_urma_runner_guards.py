@@ -88,6 +88,7 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
             ROOT / "scripts" / "run_a5_aicpu_owner_probe.sh",
             ROOT / "scripts" /
             "run_a5_direct_urma_epoch_owner_validation.sh",
+            ROOT / "scripts" / "recover_a5_direct_urma_state.sh",
             ROOT / "scripts" / "build_a5_direct_urma.sh",
             ROOT / "scripts" / "build_a5_direct_urma_provider.sh",
             ROOT / "scripts" / "package_a5_direct_urma_aicpu.sh",
@@ -184,6 +185,48 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("run_a5_direct_urma_h2d_smoke.sh", wrapper)
         self.assertIn("candidate-epoch-owner-validation-v1", wrapper)
+
+    def test_recovery_only_entry_exits_before_artifact_or_hardware_access(self) -> None:
+        wrapper = (
+            ROOT / "scripts" / "recover_a5_direct_urma_state.sh"
+        ).read_text(encoding="utf-8")
+        guard = self.source.index("acquire_persistent_session_guards\n")
+        recovery_exit = self.source.index(
+            'if [[ "${kvaf_affinity_run_mode}" == recovery-only-v1 ]]'
+        )
+        provider = self.source.index(
+            "if ! kvaf_verify_direct_provider_build_v3; then"
+        )
+        endpoint = self.source.index("resolve_a5_urma_eids.py")
+
+        self.assertIn("recovery-only-v1", self.source[:500])
+        self.assertLess(guard, recovery_exit)
+        self.assertLess(recovery_exit, provider)
+        self.assertLess(recovery_exit, endpoint)
+        recovery_block = self.source[recovery_exit:provider]
+        self.assertIn("KVAF_A5_DIRECT_RECOVERY_ONLY_OK", recovery_block)
+        self.assertIn(
+            "No provider/EID/NPU/ACL/DDR/HBM/URMA operation was attempted.",
+            recovery_block,
+        )
+        self.assertIn("exit 0", recovery_block)
+        self.assertIn("run_a5_direct_urma_h2d_smoke.sh", wrapper)
+        self.assertIn("recovery-only-v1", wrapper)
+        self.assertIn("KVAF_H2D_TRANSFER_COUNT=1", wrapper)
+        self.assertIn("KVAF_DIRECT_ALLOW_BUSY_NPU=0", wrapper)
+        self.assertIn("KVAF_EID_LOCK_TIMEOUT_SECONDS=10", wrapper)
+        self.assertIn("KVAF_NPU_SMI_TIMEOUT_SECONDS=1", wrapper)
+        self.assertIn("KVAF_HCCN_TIMEOUT_SECONDS=1", wrapper)
+        self.assertIn(
+            "KVAF_DIRECT_PROVIDER_SONAME=libkvaf_urma_provider_device.so",
+            wrapper,
+        )
+        self.assertIn("unset KVAF_PHYSICAL_DEVICE_ID", wrapper)
+        self.assertIn("unset KVAF_PAIR_CHANNEL", wrapper)
+        ascend_requirement = self.source.index(
+            ': "${ASCEND_HOME_PATH:?source the container CANN set_env.sh first}"'
+        )
+        self.assertLess(recovery_exit, ascend_requirement)
 
     def test_zero_wqe_is_validation_only_and_pool_limit_is_not_cumulative(self) -> None:
         self.assertIn(

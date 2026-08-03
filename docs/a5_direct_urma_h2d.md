@@ -377,6 +377,13 @@ quarantine；不要在隔离前 `kill -9`。
 后再次运行同一脚本，它会在访问 topology/EID/NPU 之前用原 `run_id` 和结果目录中
 固化的分类器自动清理安全状态。只有明确的 quarantine 才进入站点隔离流程。
 
+如果 stale active 恰好阻止 provider 重新编译，先执行
+`bash scripts/recover_a5_direct_urma_state.sh`。该入口只获取持久锁并运行上述固化证据
+分类：只清理 `PASS/FAIL_SAFE`，对 `FAIL_UNSAFE` 生成/保留 quarantine，对证据不完整
+继续保留 active；成功后在 provider 校验、EID、NPU、ACL、DDR/HBM 和 URMA 之前退出。
+该入口不要求加载 CANN 环境，也不读取或修改 provider 构建产物。因此无需手工删除状态
+文件，也无需通过“故意使用失配 provider”来触发恢复。
+
 Device provider 的 UMDK/UMMU 句柄必须由创建它们的同一 AICPU 进程和 SO instance
 销毁。公开 KFC ABI 没有跨 invocation 的 worker affinity token，所以对多个短
 invocation 采样到相同 PID/TID 不能作为所有权证明。

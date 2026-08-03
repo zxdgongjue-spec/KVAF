@@ -7,7 +7,8 @@ kvaf_affinity_run_mode=${1:-production}
 if (( $# > 1 )) ||
    [[ "${kvaf_affinity_run_mode}" != production &&
       "${kvaf_affinity_run_mode}" != \
-        candidate-epoch-owner-validation-v1 ]]; then
+        candidate-epoch-owner-validation-v1 &&
+      "${kvaf_affinity_run_mode}" != recovery-only-v1 ]]; then
   echo "ERROR: invalid direct URMA runner mode" >&2
   exit 2
 fi
@@ -20,7 +21,6 @@ source "${SCRIPT_DIR}/a5_direct_urma_manifest_v3.sh"
 source "${SCRIPT_DIR}/a5_direct_urma_runtime_preflight.sh"
 kvaf_configure_direct_urma_state_paths "${ROOT_DIR}" || exit 2
 
-: "${ASCEND_HOME_PATH:?source the container CANN set_env.sh first}"
 KVAF_A5_DIRECT_BUILD_DIR=${KVAF_A5_DIRECT_BUILD_DIR:-"${ROOT_DIR}/build-a5-direct-urma"}
 KVAF_A5_DIRECT_BINARY=${KVAF_A5_DIRECT_BINARY:-"${KVAF_A5_DIRECT_BUILD_DIR}/access_operator/a5/kvaf_a5_aiv_direct_urma_h2d_smoke"}
 KVAF_A5_DIRECT_BUILD_MANIFEST=${KVAF_A5_DIRECT_BUILD_MANIFEST:-"${KVAF_A5_DIRECT_BUILD_DIR}/direct-smoke.manifest"}
@@ -31,8 +31,6 @@ KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST=${KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST:-"${
 KVAF_DIRECT_PROVIDER_BUILD_MANIFEST=${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST:-"${KVAF_DIRECT_PROVIDER_BUILD_DIR}/build.manifest"}
 KVAF_DIRECT_PROVIDER_SUCCESS_STAMP=${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP:-"${KVAF_DIRECT_PROVIDER_BUILD_DIR}/build.success"}
 KVAF_DIRECT_PROVIDER_SONAME=${KVAF_DIRECT_PROVIDER_SONAME:-libkvaf_urma_provider_device.so}
-KVAF_DIRECT_AICPU_ARCHIVE=${KVAF_DIRECT_AICPU_ARCHIVE:-"${ASCEND_HOME_PATH}/opp/vendors/cust/op_impl/aicpu/kernel/cann-kvaf-direct-urma-compat.tar.gz"}
-KVAF_DIRECT_AICPU_REGISTRATION_FILE=${KVAF_DIRECT_AICPU_REGISTRATION_FILE:-"${ASCEND_HOME_PATH}/conf/ascend_package_load.ini"}
 KVAF_DURABLE_STATE_HELPER="${SCRIPT_DIR}/durable_state_file.py"
 KVAF_HOST_EID=${KVAF_HOST_EID:-}
 KVAF_DEVICE_EID=${KVAF_DEVICE_EID:-}
@@ -800,6 +798,21 @@ command -v realpath >/dev/null 2>&1 || {
 # unsafe run must be reported without touching ACL, npu-smi, or the
 # host-global /proc/asdrv_ub/dev_id selector again.
 acquire_persistent_session_guards
+
+# Artifact mutation deliberately refuses any active/quarantine marker, while
+# stale-session recovery must remain independent of the current provider
+# build.  Expose that recovery transaction as a first-class, hardware-free
+# command instead of forcing operators to run until an intentional artifact
+# verification failure.  The persistent locks close automatically on exit.
+if [[ "${kvaf_affinity_run_mode}" == recovery-only-v1 ]]; then
+  echo "KVAF_A5_DIRECT_RECOVERY_ONLY_OK"
+  echo "No provider/EID/NPU/ACL/DDR/HBM/URMA operation was attempted."
+  exit 0
+fi
+
+: "${ASCEND_HOME_PATH:?source the container CANN set_env.sh first}"
+KVAF_DIRECT_AICPU_ARCHIVE=${KVAF_DIRECT_AICPU_ARCHIVE:-"${ASCEND_HOME_PATH}/opp/vendors/cust/op_impl/aicpu/kernel/cann-kvaf-direct-urma-compat.tar.gz"}
+KVAF_DIRECT_AICPU_REGISTRATION_FILE=${KVAF_DIRECT_AICPU_REGISTRATION_FILE:-"${ASCEND_HOME_PATH}/conf/ascend_package_load.ini"}
 
 # Recovery must not depend on the current checkout or provider build: its
 # nonce-bound classifier and final markers were durably copied into the result
