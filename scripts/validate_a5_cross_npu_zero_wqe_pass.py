@@ -149,7 +149,7 @@ def validate_zero_wqe_pass(
             "device_eid": "000000000000020000100000df004100",
             "host_urma_device": "udmac1d1e4",
             "host_eid_index": "0",
-            "device_urma_device": "udmac0d1e4",
+            "device_urma_device": "udmac0d0e2",
             "device_eid_index": "0",
             "management_mode": "ub",
             "management_jetty_id": "502",

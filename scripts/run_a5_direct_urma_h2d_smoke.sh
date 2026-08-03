@@ -1509,11 +1509,11 @@ fi
 if (( kvaf_cross_npu_risk_mode != 0 )) &&
    [[ "${KVAF_HOST_URMA_DEVICE}" != udmac1d1e4 ||
       "${KVAF_HOST_EID_INDEX}" != 0 ||
-      "${KVAF_DEVICE_URMA_DEVICE}" != udmac0d1e4 ||
+      "${KVAF_DEVICE_URMA_DEVICE}" != udmac0d0e2 ||
       "${KVAF_DEVICE_EID_INDEX}" != 0 ]]; then
   echo "ERROR: discovered endpoints do not match the pinned NPU2 risk contract" >&2
   echo "EXPECTED_HOST=udmac1d1e4/eid0" >&2
-  echo "EXPECTED_DEVICE=udmac0d1e4/eid0" >&2
+  echo "EXPECTED_DEVICE=udmac0d0e2/eid0" >&2
   exit 2
 fi
 echo "KVAF_A5_URMA_ENDPOINTS_RESOLVED source=host_sysfs+hccn_tool host=${KVAF_HOST_URMA_DEVICE}/eid${KVAF_HOST_EID_INDEX} device=${KVAF_DEVICE_URMA_DEVICE}/eid${KVAF_DEVICE_EID_INDEX}"

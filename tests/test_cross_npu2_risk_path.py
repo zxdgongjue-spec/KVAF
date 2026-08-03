@@ -90,7 +90,7 @@ class CrossNpu2RiskPathTests(unittest.TestCase):
             "device_eid": "000000000000020000100000df004100",
             "host_urma_device": "udmac1d1e4",
             "host_eid_index": "0",
-            "device_urma_device": "udmac0d1e4",
+            "device_urma_device": "udmac0d0e2",
             "device_eid_index": "0",
             "management_mode": "ub",
             "management_jetty_id": "502",
@@ -175,6 +175,15 @@ class CrossNpu2RiskPathTests(unittest.TestCase):
         self.assertIn("KVAF_LOGICAL_DEVICE_ID=2", source)
         self.assertIn("KVAF_PHYSICAL_DEVICE_ID=2", source)
         self.assertIn("KVAF_DIRECT_MANAGEMENT_JETTY_ID=502", source)
+        self.assertIn("unset KVAF_HOST_URMA_DEVICE", source)
+        self.assertIn("unset KVAF_HOST_EID_INDEX", source)
+        self.assertIn("unset KVAF_DEVICE_URMA_DEVICE", source)
+        self.assertIn("unset KVAF_DEVICE_EID_INDEX", source)
+        self.assertNotIn("export KVAF_DEVICE_URMA_DEVICE=", source)
+        self.assertIn(
+            "export KVAF_HCCN_TOOL=/usr/local/Ascend/driver/tools/hccn_tool",
+            source,
+        )
         self.assertIn("KVAF_DIRECT_ALLOW_BUSY_NPU=0", source)
         self.assertNotIn("KVAF_DIRECT_ALLOW_BUSY_NPU=1", source)
         self.assertIn("zero-wqe", source)

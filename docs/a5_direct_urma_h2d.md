@@ -373,10 +373,22 @@ Device final 为 `FAIL_UNSAFE/device_provider_open_cleanup_failed` 的那一次�
 |---|---|---|
 | NPU | logical/physical NPU7 | logical/physical NPU2 |
 | Host URMA | `udmac0d1e5/eid0` | `udmac1d1e4/eid0` |
-| Device URMA | `udmac0d0e2/eid0` | `udmac0d1e4/eid0` |
+| Device URMA | `udmac0d0e2/eid0` | `udmac0d0e2/eid0` |
 | Host EID | `00000000003f050000100000df080b00` | `00000000007f040000100000df0a0b00` |
 | Device EID | `000000000000020000100000df00e100` | `000000000000020000100000df004100` |
 | management Jetty | 507 | 502 |
+
+两侧 Device inventory 都可能显示 `udmac0d0e2`；该字符串来自各自所选 NPU 的
+`hccn_tool -i <physical-device-id>`/AICPU URMA 可见域，不是宿主机范围内唯一的
+物理卡编号。绑定身份必须同时包含 logical/physical device、精确 EID 和 EID index。
+因此 NPU2 不能沿用先前按 `/dev/uburma` 名字猜出的 `udmac0d1e4`，runner 会以
+NPU2 的现场 EID 表复核 `udmac0d0e2/eid0` 后才允许创建 context。这仍不构成 UMMU
+跨 NPU 隔离证明。
+
+风险入口不会向 runner 预填四个 URMA name/index selector；它固定 NPU2 和两条
+EID 后清除调用者的 selector override，由 exact-EID resolver 现场选出端点。上表的
+`udmac0d0e2/eid0` 是本次现场结果以及风险契约的 fail-closed 复核值，不是从 Host
+`/dev/uburma` 推导出的默认值。
 
 NPU7 的全局 quarantine、结果目录、Host/Device 进程和 backing 必须原样保留；实验
 不能删除、移动、覆盖或向它们发送信号。NPU2 使用独立的实验 active、quarantine、

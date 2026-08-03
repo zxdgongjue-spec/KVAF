@@ -111,10 +111,14 @@ export KVAF_PHYSICAL_DEVICE_ID=2
 export KVAF_HOST_EID=00000000007f040000100000df0a0b00
 export KVAF_DEVICE_EID=000000000000020000100000df004100
 export KVAF_PAIR_CHANNEL=0
-export KVAF_HOST_URMA_DEVICE=udmac1d1e4
-export KVAF_HOST_EID_INDEX=0
-export KVAF_DEVICE_URMA_DEVICE=udmac0d1e4
-export KVAF_DEVICE_EID_INDEX=0
+# Device names are scoped to the selected Host/AICPU inventory.  Do not
+# infer them from the Host /dev/uburma namespace or preserve caller
+# overrides: the main runner resolves both fixed EIDs live and then applies
+# the pinned NPU2 risk contract before creating any resource.
+unset KVAF_HOST_URMA_DEVICE
+unset KVAF_HOST_EID_INDEX
+unset KVAF_DEVICE_URMA_DEVICE
+unset KVAF_DEVICE_EID_INDEX
 export KVAF_DIRECT_MANAGEMENT_MODE=ub
 export KVAF_DIRECT_MANAGEMENT_JETTY_ID=502
 export KVAF_DIRECT_ALLOW_BUSY_NPU=0
@@ -134,7 +138,7 @@ unset KVAF_DIRECT_CONTROL_BIND_ADDRESS
 unset KVAF_DIRECT_SERVER_START_DELAY_SECONDS
 export KVAF_EID_PROC_ROOT=/proc/asdrv_ub
 export KVAF_UBCORE_SYSFS_ROOT=/sys/class/ubcore
-unset KVAF_HCCN_TOOL
+export KVAF_HCCN_TOOL=/usr/local/Ascend/driver/tools/hccn_tool
 unset ASCEND_RT_VISIBLE_DEVICES
 
 if [[ "${kvaf_stage}" == zero-wqe ]]; then

@@ -34,7 +34,7 @@ DirectUrmaOpenSpec MakeSpec(std::vector<std::uint8_t>* backing,
   spec.role = DirectUrmaRole::kClient;
   spec.provider_library_path = provider_library;
   spec.provider_soname = "libkvaf_urma_provider_device.so";
-  spec.urma_device = "udmac0d1e4";
+  spec.urma_device = "udmac0d0e2";
   spec.local_eid = "0000:0000:0000:0200:0010:0000:df00:4100";
   spec.peer_eid = "0000:0000:007f:0400:0010:0000:df0a:0b00";
   // Most fault-injection scenarios predate the UB management backend and
