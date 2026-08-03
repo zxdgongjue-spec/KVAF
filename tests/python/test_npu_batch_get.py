@@ -483,6 +483,18 @@ def main() -> int:
                 graph_post_marker.copy_(output_a[:1])
             print("RUNTIME_NPU_PHASE_DONE phase=graph_capture owner=torch_npu")
 
+            def replay_graph_on_capture_stream(trace: str | None = None) -> None:
+                # torch_npu.NPUGraph.replay() submits work on the current NPU
+                # stream, rather than implicitly selecting the capture stream.
+                # Keep the input producer, graph execution, and completion
+                # wait as one ordered chain on capture_stream.
+                if trace is not None:
+                    print(f"RUNTIME_NPU_GRAPH_REPLAY_STREAM_ENTER replay={trace}")
+                with torch.npu.stream(capture_stream):
+                    graph.replay()
+                if trace is not None:
+                    print(f"RUNTIME_NPU_GRAPH_REPLAY_ENQUEUED replay={trace}")
+
             graph_completed_batches = 3 + warmup + iterations
             for replay in range(graph_replays):
                 graph_payload_slots, graph_output_indices = prepare_graph_inputs(
@@ -491,8 +503,7 @@ def main() -> int:
                 print(f"RUNTIME_NPU_GRAPH_REPLAY_BEGIN replay={replay}")
                 enqueue_graph_input_update(capture_stream, str(replay))
                 print(f"RUNTIME_NPU_GRAPH_INPUT_ENQUEUED replay={replay}")
-                graph.replay()
-                print(f"RUNTIME_NPU_GRAPH_REPLAY_ENQUEUED replay={replay}")
+                replay_graph_on_capture_stream(str(replay))
                 capture_stream.synchronize()
                 print(f"RUNTIME_NPU_GRAPH_STREAM_DONE replay={replay}")
                 graph_completed_batches += 1
@@ -519,7 +530,7 @@ def main() -> int:
             for warmup_iteration in range(graph_warmup):
                 prepare_graph_inputs(graph_replays + warmup_iteration)
                 enqueue_graph_input_update(capture_stream)
-                graph.replay()
+                replay_graph_on_capture_stream()
                 capture_stream.synchronize()
                 graph_completed_batches += 1
             print(f"RUNTIME_NPU_GRAPH_PERF_WARMUP_DONE count={graph_warmup}")
@@ -535,7 +546,7 @@ def main() -> int:
                 ) = prepare_graph_inputs(epoch)
                 begin = time.perf_counter()
                 enqueue_graph_input_update(capture_stream)
-                graph.replay()
+                replay_graph_on_capture_stream()
                 capture_stream.synchronize()
                 graph_samples.append((time.perf_counter() - begin) * 1000.0)
                 graph_completed_batches += 1

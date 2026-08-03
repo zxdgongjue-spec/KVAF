@@ -137,6 +137,11 @@ capture、初始化和最终验证，因此不能与 eager 指标直接作一一
 staging 准备与 capture stream 之间使用 `wait_stream` 建立事件依赖，不在 capture
 结束后做全设备 `torch.npu.synchronize()`。
 
+`torch_npu.NPUGraph.replay()` 会在调用时的 **current stream** 上提交 replay，
+不会自动切回 capture 时传入的 stream。因此测试会显式进入 `capture_stream` 后再调用
+replay：输入更新、图执行和 completion wait 必须属于同一条 stream 顺序链。上游若选择
+另一条 replay stream，必须自行在该 stream 上建立输入依赖并等待该 stream 完成。
+
 Python 调用 `batch_get` 必须显式传入 `torch.npu.current_stream()`（或 capture
 stream 对象）。
 默认 `synchronize=True` 保持同步接口；只有在外部图 capture 的调用点传
