@@ -128,20 +128,21 @@ timeout 240s python3 tests/python/test_npu_batch_get.py
 先在图外 eager 执行 `output A -> B -> A`，使 A 的 local HBM 注册进入 transport
 cache；再在 `torch.npu.graph(...)` 中只 capture
 `runtime.batch_get(..., stream, synchronize=False)`。图使用一个在 HCCP output
-注册前创建的专用 `graph_stream`；每次 replay 前，调用方在普通 caller stream 上
-更新固定地址的 `indices` 与 `output_indices` tensor，`graph_stream.wait_stream`
-建立依赖后再调用 `graph.replay()`。因此固定调用方 input tensor 的地址始终不变，
-而内容可改变。
+注册前创建的专用 `graph_stream`。基础图模式用例不在 eager 后创建或修改 NPU tensor：
+它以已验证的固定 `indices` / `mask` / `output_indices` 进行 capture 和 replay，先证明
+KVAF 可以作为外部 `torch_npu` 图的节点并测量 replay completion。
 
 AIV demo 使用原生
 `aclrtMemcpyAsync(fixed_device_inputs, stream) -> aclmdlRIExecuteAsync(graph, stream)`。
-Python 测试同样使用一个专用 graph stream，但以 NPU tensor 的内容更新代替裸 ACL
-copy；KVAF 不拥有这些 input tensor，也不创建、保存或 replay 图。图对象会在
-Runtime shutdown 前 reset，避免图仍持有调用方 buffer 时释放 HCCP transport。
+Python 测试同样使用一个专用 graph stream；KVAF 不拥有这些 input tensor，也不创建、
+保存或 replay 图。图对象会在 Runtime shutdown 前 reset，避免图仍持有调用方 buffer
+时释放 HCCP transport。动态 input content 的图测试与此基础路径分开：AIV C++ demo
+已通过 `aclrtMemcpyAsync` 覆盖；Python/torch_npu 路径须先建立不引入额外 NPU 分配的
+更新方式后再单独启用。
 
-图性能指标 `external_graph_input_copy_to_stream_completion` 包含输入更新、整张外部图
-replay 与 stream 同步；不包含 Python 构造 Host 输入、capture、初始化和最终验证，
-因此不能与 eager 指标直接作一一对比。
+图性能指标 `external_graph_replay_to_stream_completion` 包含图 replay 与 graph stream
+同步；不包含 capture、初始化、最终验证和输入更新，因此不能与 eager 指标直接作一一
+对比。
 
 `torch_npu.NPUGraph.replay()` 会在调用时的 **current stream** 上提交 replay，
 不会自动切回 capture 时传入的 stream。因此测试会显式进入 `capture_stream` 后再调用

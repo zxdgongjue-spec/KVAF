@@ -400,46 +400,12 @@ def main() -> int:
                 "RUNTIME_NPU_GRAPH_CAPTURE_CONTRACT "
                 "fixed_tensor_addresses=1 "
                 "external_graph_owner=torch_npu "
-                "dynamic_tensor_contents=indices_output_indices "
-                "single_stream=caller_stream "
+                "input_contents=static "
+                "graph_stream=dedicated "
                 "captured_ops=runtime_batch_get "
                 f"functional_replays={graph_replays} "
                 f"perf_warmup={graph_warmup} perf_samples={graph_iterations}"
             )
-
-            # Match the demo's single-stream contract. The caller updates the
-            # fixed input tensors before replay; capture contains BatchGet.
-
-            def prepare_graph_inputs(
-                epoch: int, trace: str | None = None
-            ) -> tuple[list[int | None], list[int]]:
-                if trace is not None:
-                    print(f"RUNTIME_NPU_GRAPH_STAGE_BEGIN replay={trace}")
-                graph_indices = [table_capacity - 1] * requests
-                graph_payload_slots: list[int | None] = [None] * requests
-                for ordinal, request in enumerate(active_request_positions):
-                    payload_slot = (ordinal + epoch) % active_requests
-                    graph_indices[request] = sparse_table_indices[payload_slot]
-                    graph_payload_slots[request] = payload_slot
-                graph_output_indices = [
-                    (row + epoch) % output_rows for row in output_indices_values
-                ]
-                # The caller writes fixed-address NPU inputs on the same
-                # stream that owns capture and replay.
-                with torch.npu.stream(caller_stream):
-                    indices.copy_(
-                        torch.tensor(graph_indices, dtype=torch.int32, device=device)
-                    )
-                    if trace is not None:
-                        print(f"RUNTIME_NPU_GRAPH_STAGE_INDICES_DONE replay={trace}")
-                    output_indices.copy_(
-                        torch.tensor(
-                            graph_output_indices, dtype=torch.int32, device=device
-                        )
-                    )
-                if trace is not None:
-                    print(f"RUNTIME_NPU_GRAPH_STAGE_OUTPUT_INDICES_DONE replay={trace}")
-                return graph_payload_slots, graph_output_indices
 
             if graph_stream is None:
                 raise AssertionError("graph stream was not created")
@@ -447,9 +413,12 @@ def main() -> int:
             print("RUNTIME_NPU_PHASE_BEGIN phase=graph_object")
             graph = torch.npu.NPUGraph()
             print("RUNTIME_NPU_PHASE_DONE phase=graph_object")
-            graph_payload_slots, graph_output_indices = prepare_graph_inputs(0)
-            capture_stream.wait_stream(caller_stream)
-            capture_stream.synchronize()
+            # The eager path already validated these fixed caller-owned
+            # tensors. Do not allocate or mutate any NPU input after the
+            # Direct-HCCP transport becomes active in this baseline test.
+            graph_payload_slots = payload_slots
+            graph_output_indices = output_indices_values
+            print("RUNTIME_NPU_GRAPH_STATIC_INPUTS_READY")
             print("RUNTIME_NPU_PHASE_BEGIN phase=graph_capture")
             # output_a was already used by eager A -> B -> A above, so its
             # Direct-HCCP local HBM registration is cached before capture.
@@ -485,12 +454,7 @@ def main() -> int:
 
             graph_completed_batches = 3 + warmup + iterations
             for replay in range(graph_replays):
-                graph_payload_slots, graph_output_indices = prepare_graph_inputs(
-                    replay, str(replay)
-                )
                 print(f"RUNTIME_NPU_GRAPH_REPLAY_BEGIN replay={replay}")
-                capture_stream.wait_stream(caller_stream)
-                print(f"RUNTIME_NPU_GRAPH_INPUT_WAIT_ENQUEUED replay={replay}")
                 replay_graph_on_capture_stream(str(replay))
                 capture_stream.synchronize()
                 print(f"RUNTIME_NPU_GRAPH_STREAM_DONE replay={replay}")
@@ -514,24 +478,14 @@ def main() -> int:
 
             print("RUNTIME_NPU_GRAPH_PERF_WARMUP_BEGIN")
             for warmup_iteration in range(graph_warmup):
-                prepare_graph_inputs(graph_replays + warmup_iteration)
-                capture_stream.wait_stream(caller_stream)
                 replay_graph_on_capture_stream()
                 capture_stream.synchronize()
                 graph_completed_batches += 1
             print(f"RUNTIME_NPU_GRAPH_PERF_WARMUP_DONE count={graph_warmup}")
 
             graph_samples = []
-            final_graph_payload_slots: list[int | None] = []
-            final_graph_output_indices: list[int] = []
             for iteration in range(graph_iterations):
-                epoch = graph_replays + graph_warmup + iteration
-                (
-                    final_graph_payload_slots,
-                    final_graph_output_indices,
-                ) = prepare_graph_inputs(epoch)
                 begin = time.perf_counter()
-                capture_stream.wait_stream(caller_stream)
                 replay_graph_on_capture_stream()
                 capture_stream.synchronize()
                 graph_samples.append((time.perf_counter() - begin) * 1000.0)
@@ -540,8 +494,8 @@ def main() -> int:
             validate_output(
                 tensor_to_bytes(output_a),
                 mask_values,
-                final_graph_output_indices,
-                final_graph_payload_slots,
+                graph_output_indices,
+                graph_payload_slots,
                 block_bytes,
             )
             validate_completion(
@@ -557,7 +511,7 @@ def main() -> int:
                 active_requests * block_bytes / (1024.0**3) / (graph_mean_ms / 1000.0)
             )
             print(
-                "GRAPH_PERF_RESULT metric=external_graph_input_copy_to_stream_completion "
+                "GRAPH_PERF_RESULT metric=external_graph_replay_to_stream_completion "
                 f"samples={graph_iterations} warmup_excluded={graph_warmup} "
                 f"active_requests={active_requests} block_bytes={block_bytes} "
                 f"npu_cores={npu_core_count} mean_ms={graph_mean_ms:.3f} "
