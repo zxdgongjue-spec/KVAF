@@ -1,6 +1,7 @@
 # KVAF 初期代码仓
 
-当前目录只提供 KVAF 初期开发阶段的代码骨架，用于先固定模块边界、公共头文件位置和构建依赖关系。
+当前目录包含 KVAF 同步 Runtime POC、MetaManager 地址管理实现，以及可选的
+A5 AIV BatchGet demo/adapter。
 
 ## 模块
 
@@ -28,7 +29,9 @@ kvaf_runtime
 
 Runtime target 依赖另外两个 target，因此后续可以由 Runtime 统一组合调用；Meta Manager 和 KV Access Operator 仍可单独被构建和测试。
 
-当前实现只有头文件占位，不包含业务逻辑，也不会产出有实际执行能力的库。开启 Python binding 时，唯一的 `.cpp` 文件仅用于注册 Python 模块和三个子模块名称，不承载 KVAF 业务实现。
+默认构建会生成 `kvaf_meta_manager` 和 `kvaf_runtime` 静态库。Runtime 支持
+内部 DDR 初始化、同步 BatchPut、Prepare/Release AccessTable、同步 BatchGet
+和 BatchFree；真实数据搬运由注入的 `AccessOperator` 实现提供。
 
 ## 构建
 
@@ -39,7 +42,16 @@ cmake -S . -B build
 cmake --build build
 ```
 
-上述默认构建当前可以执行，但只完成 CMake 配置和占位 target 的构建检查。由于三个模块目前均为头文件和 `INTERFACE` target，不会生成具有实际业务能力的 KVAF 库，也不能执行 BatchGet、BatchPut 或 Meta 操作。
+Python 定义的功能测试可用以下命令运行：
+
+```bash
+cmake -S . -B build -DBUILD_TESTING=ON
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+```
+
+详细 Runtime 生命周期、测试边界和 A5/CANN 集成命令见
+[`runtime/README.md`](runtime/README.md)。
 
 如需编译 Python 注册模块，需要环境中提供 `pybind11`，并显式开启：
 
@@ -48,7 +60,8 @@ cmake -S . -B build -DKVAF_BUILD_PYTHON=ON
 cmake --build build
 ```
 
-当前 Python 注册模块可以编译，但 Python 运行时暂不作为当前环境下的可用能力保证。编译时使用的 Python 解释器、Python 版本、CPU 架构必须和运行时保持一致；当前仓库尚未提供统一的 Python 环境配置，也尚未完成这部分适配。
+当前 Python 注册模块仍只提供命名空间；Python 测试通过独立的测试 driver
+执行 C++ Runtime，因此不要求 pybind11。
 
 因此，下面的命令当前仅作为目标使用方式示例，不保证在当前环境直接成功：
 
@@ -67,6 +80,5 @@ kvaf.meta_manager
 kvaf.access_operator
 ```
 
-即使 Python 扩展成功加载，目前也只有 `build_stage()` 和三个空的命名空间可用，尚不能调用 KVAF 的实际接口。
-
-具体可调用接口和实现内容后续分别在三个模块内补充。
+即使 Python 扩展成功加载，目前也只有 `build_stage()` 和三个空的命名空间；
+正式产品 Python binding 留待接口进一步稳定后补充。

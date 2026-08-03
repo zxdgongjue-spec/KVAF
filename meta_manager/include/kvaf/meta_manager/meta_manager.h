@@ -14,15 +14,6 @@ enum class MetaManagerLockMode {
   kStableReadAllowAppend = 0,
 };
 
-// 远端可分配内存区域描述。
-// 当前实现只支持注册一块固定大小、按 slot 切分的 region。
-struct RemoteRegionDesc {
-  Address base{0};
-  std::uint64_t length{0};
-  std::uint64_t slot_size{0};
-  DeviceKind device{DeviceKind::kCpu};
-};
-
 // put 上下文，表示一次“已预留地址但尚未对读路径可见”的写事务。
 struct PutContext {
   std::uint64_t id{0};

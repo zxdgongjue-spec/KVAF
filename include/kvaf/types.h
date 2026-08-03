@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace kvaf {
@@ -16,11 +17,36 @@ enum class DeviceKind {
   kNpu,
 };
 
-// 当前只保留句柄形态；内部字段和生命周期语义后续确定。
+// 远端 DDR 区域。base 是可供 AccessOperator 使用的绝对地址（UBA）。
+// Runtime 通过 DdrMemoryAllocator 创建并持有该区域的生命周期。
+struct RemoteRegionDesc {
+  Address base{0};
+  std::uint64_t length{0};
+  std::uint64_t slot_size{0};
+  DeviceKind device{DeviceKind::kCpu};
+};
+
+// 调用方拥有的只读/可写 buffer 描述。Runtime 不申请、释放或注册这些
+// BatchGet 输入输出 buffer；它们必须在调用返回前保持有效。
+struct ConstBufferView {
+  const void* data{nullptr};
+  std::size_t bytes{0};
+  DeviceKind device{DeviceKind::kCpu};
+};
+
+struct MutableBufferView {
+  void* data{nullptr};
+  std::size_t bytes{0};
+  DeviceKind device{DeviceKind::kCpu};
+};
+
+// 当前同步 Runtime 不暴露 Event；保留类型以免破坏已有占位调用方。
 struct Event {
   std::uint64_t opaque{0};
 };
 
+// AccessTable 的所有权与 Key 稳定性锁由 Runtime 保存。opaque 为 0 的
+// Handle 无效；ReleaseAccessTable 后不得再次使用。
 struct AccessTableHandle {
   std::uint64_t opaque{0};
 };

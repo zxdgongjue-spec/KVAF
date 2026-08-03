@@ -14,6 +14,10 @@ add_subdirectory(meta_manager)
 add_subdirectory(access_operator)
 add_subdirectory(runtime)
 
+if(BUILD_TESTING)
+  add_subdirectory(tests)
+endif()
+
 if(KVAF_BUILD_PYTHON)
   find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 
