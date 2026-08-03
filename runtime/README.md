@@ -134,6 +134,8 @@ capture stream 上把已经准备好的固定 NPU staging tensor 拷贝到固定
 replay。图性能指标 `external_graph_input_copy_to_stream_completion` 包含这两次输入
 NPU-to-NPU copy、整张外部图 replay 与 capture stream 同步；不包含 Python 构造 Host 输入、
 capture、初始化和最终验证，因此不能与 eager 指标直接作一一对比。
+staging 准备与 capture stream 之间使用 `wait_stream` 建立事件依赖，不在 capture
+结束后做全设备 `torch.npu.synchronize()`。
 
 Python 调用 `batch_get` 必须显式传入 `torch.npu.current_stream()`（或 capture
 stream 对象）。

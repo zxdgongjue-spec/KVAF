@@ -412,8 +412,10 @@ def main() -> int:
             graph_post_marker = torch.zeros(1, dtype=torch.uint8, device=device)
 
             def prepare_graph_inputs(
-                epoch: int,
+                epoch: int, trace: str | None = None
             ) -> tuple[list[int | None], list[int]]:
+                if trace is not None:
+                    print(f"RUNTIME_NPU_GRAPH_STAGE_BEGIN replay={trace}")
                 graph_indices = [table_capacity - 1] * requests
                 graph_payload_slots: list[int | None] = [None] * requests
                 for ordinal, request in enumerate(active_request_positions):
@@ -425,15 +427,21 @@ def main() -> int:
                 ]
                 # The normal caller stream prepares a fixed NPU staging
                 # buffer. This work is intentionally outside graph timing.
-                graph_indices_staging.copy_(
-                    torch.tensor(graph_indices, dtype=torch.int32, device=device)
-                )
-                graph_output_indices_staging.copy_(
-                    torch.tensor(
-                        graph_output_indices, dtype=torch.int32, device=device
+                with torch.npu.stream(caller_stream):
+                    graph_indices_staging.copy_(
+                        torch.tensor(
+                            graph_indices, dtype=torch.int32, device=device
+                        )
                     )
-                )
-                torch.npu.synchronize()
+                    if trace is not None:
+                        print(f"RUNTIME_NPU_GRAPH_STAGE_INDICES_DONE replay={trace}")
+                    graph_output_indices_staging.copy_(
+                        torch.tensor(
+                            graph_output_indices, dtype=torch.int32, device=device
+                        )
+                    )
+                if trace is not None:
+                    print(f"RUNTIME_NPU_GRAPH_STAGE_OUTPUT_INDICES_DONE replay={trace}")
                 return graph_payload_slots, graph_output_indices
 
             def enqueue_graph_input_update(
@@ -444,6 +452,10 @@ def main() -> int:
                 # replay ordering; a naked aclmdlRI graph replay can stall.
                 if trace is not None:
                     print(f"RUNTIME_NPU_GRAPH_INPUT_STREAM_ENTER replay={trace}")
+                if stream != caller_stream:
+                    stream.wait_stream(caller_stream)
+                if trace is not None:
+                    print(f"RUNTIME_NPU_GRAPH_INPUT_WAIT_ENQUEUED replay={trace}")
                 with torch.npu.stream(stream):
                     if trace is not None:
                         print(f"RUNTIME_NPU_GRAPH_INPUT_COPY_BEGIN replay={trace}")
@@ -473,7 +485,9 @@ def main() -> int:
 
             graph_completed_batches = 3 + warmup + iterations
             for replay in range(graph_replays):
-                graph_payload_slots, graph_output_indices = prepare_graph_inputs(replay)
+                graph_payload_slots, graph_output_indices = prepare_graph_inputs(
+                    replay, str(replay)
+                )
                 print(f"RUNTIME_NPU_GRAPH_REPLAY_BEGIN replay={replay}")
                 enqueue_graph_input_update(capture_stream, str(replay))
                 print(f"RUNTIME_NPU_GRAPH_INPUT_ENQUEUED replay={replay}")
