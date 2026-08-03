@@ -472,6 +472,20 @@ owner probe 或 zero-WQE 任一步失败，都只打印 hard-stop 证据并返�
 提交数据 WQE。即使 zero-WQE PASS，也只说明这一次资源创建和销毁闭环；在整机恢复
 并补足隔离契约前，不能继续真实 H2D。
 
+当 SSH/Xshell 不能可靠粘贴多行命令时，服务器 B 宿主机可使用受测的短命令入口
+`bash scripts/launch_a5_cross_npu2_reuse_detached.sh start --accept-npu2-reuse-risk`。
+launcher 自身可以来自后续提交，但实验代码固定在已经审阅和预检过的完整提交
+`cc3cc0e8e08bf4882c290dc3ed0a5b40a45312ce`：该提交在 coordinator 内新增外部
+expected-commit 强校验。入口先创建或复核该提交的 detached
+worktree，再重新执行只读事故证据与 NPU2 idle 预检。预检通过后，它原子固定全局
+launch reservation、token、完整 commit、日志和返回码身份，再通过 `docker exec -d`
+启动该固定 worktree 内的 container-only coordinator；它不改变硬件安全门。运行状态分别通过
+`bash scripts/launch_a5_cross_npu2_reuse_detached.sh status` 和 `watch` 只读查看，
+两者从全局只读 reservation 找到原运行，不依赖当前 checkout HEAD，也不会向 worker
+发送信号。reservation、日志、dispatch-unproven 或返回码一旦存在，`start` 会拒绝
+覆盖和重跑；Docker dispatch 失败只记录为“是否已启动未知”，不能伪装成 coordinator
+已经返回。
+
 active 状态在每次 fork 前先写 `host_launch_intent` 或
 `device_launch_intent`，fork 成功后再补 PID。恢复逻辑按 phase 决定必须检查
 单端还是双端终态，绝不会因为 SIGKILL 恰好发生在 fork 与 PID 落盘之间，就把
