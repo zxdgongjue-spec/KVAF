@@ -1054,6 +1054,21 @@ Token/TID 分配失败还会先输出 `KVAF_URMA_TOKEN_ERROR`；Segment 注册�
 retryability、pending/retained 计数和 kernel-register rollback 结果。每个顶层 UMMU
 操作都会清空线程快照，避免把前一次失败或另一线程的失败误配到本次注册。
 
+JFR 创建失败会先输出 `KVAF_URMA_JFR_ERROR`。它保留 public
+`urma_create_jfr()` 指针接口原本会丢失的首个 checked-UDMA 叶子，区分参数/context
+校验、index/RQ 分配、record/sleep doorbell、内核 `CREATE_JFR` 命令和 table 插入，
+并分别记录创建错误和 rollback 错误。顶层 management diagnostic 的
+`operation_status` 是底层返回值，`completion_status` 是 `provider_stage_id`；即使
+AICPU stderr 未被完整转发，也能从 Device owner progress 恢复失败阶段。该诊断不会
+切换到 non-shared/embedded JFR，也不会设置 `non_pin`：A5 UB 要求 shared JFR，后两种
+绕行均缺少当前 checked teardown 所需的公开所有权证明。若阶段是
+`create_command`，应再结合同时段 UDMA driver 日志判断 RQ/index/DB pin 或 mailbox
+失败；不得仅凭原来的通用 `EIO` 修改地址或销毁策略。
+
+数据面参数显式传入 `--share_jfr true`，不再依赖固定 perftest 在 capability check
+中把默认 `false` 隐式改写为 `true`。这保证后续 data Jetty 与 management Jetty
+使用一致的 A5 UB receive-queue 契约，但它不是 management `create_jfr` 失败的修复。
+
 Host binary 会先初始化 ACL/CANN，再加载 direct provider。CANN 依赖中的官方
 `libummu` 构造函数可能已经打开 `/dev/ummu/tid`；A5 UMMU driver 又按
 `tgid + task start_time` 为一个 owner 只建立一个 `proc_manager`，因此 provider

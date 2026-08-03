@@ -398,6 +398,11 @@ static int kvaf_parse_config(
     }
     KVAF_ADD_ARG("--tp_aware");
     KVAF_ADD_ARG("--ctp");
+    /* UB accepts only a shared receive queue.  Make the data-plane contract
+     * explicit instead of relying on check_dev_cap() to mutate the parsed
+     * perftest default after the management channel has been established. */
+    KVAF_ADD_ARG("--share_jfr");
+    KVAF_ADD_ARG("true");
     KVAF_ADD_ARG("--page_size");
     KVAF_ADD_ARG("4096");
     KVAF_ADD_ARG("--eid_idx");

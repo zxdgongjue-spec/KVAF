@@ -1,7 +1,9 @@
 #include "kvaf_source_matched_perftest.h"
 #include "kvaf_source_matched_udma.h"
+#include "kvaf_source_matched_ummu.h"
 #include "urma_api.h"
 
+#include <errno.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -184,6 +186,7 @@ static int kvaf_create_duplex_queues_public(
             return -1;
         }
         jfr_cfg.jfc = ctx->jfc_r[0];
+        kvaf_udma_source_reset_jfr_failure();
         ctx->jfr[0] = urma_create_jfr(ctx->urma_ctx, &jfr_cfg);
         if (ctx->jfr[0] == NULL) {
             return -1;
@@ -872,6 +875,11 @@ static int kvaf_destroy_partial_duplex_ctx_checked(
                 state, KVAF_PERFTEST_TEARDOWN_ORPHAN_RESOURCES);
             continue;
         case KVAF_PERFTEST_TEARDOWN_ORPHAN_RESOURCES:
+            if (kvaf_udma_source_cleanup_is_unknown() != 0 ||
+                kvaf_source_ummu_cleanup_is_unknown() != 0) {
+                errno = EUCLEAN;
+                return kvaf_teardown_mark_unsafe(state, URMA_FAIL);
+            }
             if (ctx->urma_ctx != NULL) {
                 kvaf_teardown_set_cursor(state,
                     KVAF_PERFTEST_TEARDOWN_OBJECT_ORPHAN_RESOURCE, 0,

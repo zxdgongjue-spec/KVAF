@@ -990,6 +990,95 @@ static const char *kvaf_segment_failure_stage_name(uint32_t stage)
     }
 }
 
+static const char *kvaf_jfr_failure_stage_name(uint32_t stage)
+{
+    switch (stage) {
+        case KVAF_UDMA_JFR_FAILURE_NONE:
+            return "none";
+        case KVAF_UDMA_JFR_FAILURE_VALIDATE_ARGUMENTS:
+            return "validate_arguments";
+        case KVAF_UDMA_JFR_FAILURE_ALLOCATE_OWNER:
+            return "allocate_owner";
+        case KVAF_UDMA_JFR_FAILURE_LOCK_REGISTRY:
+            return "lock_registry";
+        case KVAF_UDMA_JFR_FAILURE_VALIDATE_CONFIG:
+            return "validate_config";
+        case KVAF_UDMA_JFR_FAILURE_VALIDATE_CONTEXT:
+            return "validate_context";
+        case KVAF_UDMA_JFR_FAILURE_INIT_SPIN:
+            return "init_spin";
+        case KVAF_UDMA_JFR_FAILURE_ALLOCATE_INDEX:
+            return "allocate_index";
+        case KVAF_UDMA_JFR_FAILURE_COMPUTE_RQ:
+            return "compute_rq";
+        case KVAF_UDMA_JFR_FAILURE_ALLOCATE_RQ:
+            return "allocate_rq";
+        case KVAF_UDMA_JFR_FAILURE_ALLOCATE_RECORD_DB:
+            return "allocate_record_db";
+        case KVAF_UDMA_JFR_FAILURE_ALLOCATE_SLEEP_DB:
+            return "allocate_sleep_db";
+        case KVAF_UDMA_JFR_FAILURE_CREATE_COMMAND:
+            return "create_command";
+        case KVAF_UDMA_JFR_FAILURE_INSERT_TABLE:
+            return "insert_table";
+        case KVAF_UDMA_JFR_FAILURE_UNLOCK_REGISTRY:
+            return "unlock_registry";
+        case KVAF_UDMA_JFR_FAILURE_ROLLBACK_KERNEL:
+            return "rollback_kernel";
+        case KVAF_UDMA_JFR_FAILURE_ROLLBACK_LOCAL:
+            return "rollback_local";
+        default:
+            return "unknown";
+    }
+}
+
+static int kvaf_ub_jfr_creation_error(
+    const char *stage, int wrapper_errno, int fallback_errno)
+{
+    struct kvaf_udma_jfr_failure failure = {
+        .structure_size = sizeof(failure),
+    };
+    const int query_status =
+        kvaf_udma_source_get_jfr_failure(&failure);
+    const bool failure_valid = query_status == 0 &&
+        failure.abi_version == KVAF_UDMA_JFR_FAILURE_ABI_VERSION &&
+        failure.structure_size == sizeof(failure) &&
+        failure.stage != KVAF_UDMA_JFR_FAILURE_NONE;
+    int effective_errno = wrapper_errno;
+
+    if (failure_valid && failure.operation_errno != 0) {
+        effective_errno = failure.operation_errno;
+    }
+    if (effective_errno == 0) {
+        effective_errno = fallback_errno;
+    }
+    (void)fprintf(stderr,
+        "KVAF_URMA_JFR_ERROR management_stage=%s "
+        "provider_stage=%s provider_stage_id=%u query_status=%d "
+        "operation_status=%d operation_errno=%d "
+        "rollback_status=%d rollback_errno=%d "
+        "requested_depth=%u requested_max_sge=%u "
+        "device_max_depth=%u device_max_sge=%u "
+        "context_jfr_sge=%u context_dtu_enable=%u "
+        "context_sq_reserved=%u context_table_shift=%u "
+        "context_table_entries=%u\n",
+        stage, kvaf_jfr_failure_stage_name(failure.stage),
+        failure.stage, query_status, failure.operation_status,
+        failure.operation_errno, failure.rollback_status,
+        failure.rollback_errno, failure.requested_depth,
+        failure.requested_max_sge, failure.device_max_depth,
+        failure.device_max_sge, failure.context_jfr_sge,
+        failure.context_dtu_enable, failure.context_sq_reserved,
+        failure.context_table_shift, failure.context_table_entries);
+    (void)fflush(stderr);
+    kvaf_ub_record_management_diagnostic(
+        stage, wrapper_errno, effective_errno,
+        failure.operation_status, failure_valid,
+        (int)failure.stage, failure_valid);
+    return kvaf_ub_management_error(
+        stage, effective_errno, fallback_errno);
+}
+
 static int kvaf_ub_segment_registration_error(
     const char *stage, int wrapper_errno, int fallback_errno)
 {
@@ -1248,10 +1337,14 @@ static int kvaf_ub_create_local_resources_checked(
     jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
     jfr_cfg.jfc = ctx->jfc;
     jfr_cfg.token_value = g_ub_mgmt_token;
+    /* The public URMA wrapper can reject a request before dispatching into
+     * the checked UDMA provider.  Reset first so that such a failure cannot
+     * be paired with a previous create attempt's thread-local leaf. */
+    kvaf_udma_source_reset_jfr_failure();
     errno = 0;
     ctx->jfr = urma_create_jfr(ctx->urma_ctx, &jfr_cfg);
     if (ctx->jfr == NULL) {
-        return kvaf_ub_management_error(
+        return kvaf_ub_jfr_creation_error(
             "create_jfr", errno, EIO);
     }
 
@@ -1454,6 +1547,13 @@ static int kvaf_ub_close_connection_checked(void)
         int orphan_status = 0;
         int orphan_errno = 0;
 
+        if (kvaf_udma_source_cleanup_is_unknown() != 0 ||
+            kvaf_source_ummu_cleanup_is_unknown() != 0) {
+            return kvaf_ub_close_operation_failed(
+                KVAF_UB_CLOSE_RETRY_ORPHANS, URMA_FAIL, EUCLEAN,
+                URMA_FAIL, EUCLEAN, true,
+                KVAF_UB_CLOSE_RETRY_NONE, false);
+        }
         if (ctx->urma_ctx != NULL) {
             errno = 0;
             orphan_status =

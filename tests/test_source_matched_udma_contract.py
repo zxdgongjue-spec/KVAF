@@ -1063,9 +1063,8 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
                     cleanup_path,
                 )
 
-            create_unlock = create.index(
-                f"if ({unlock_name}() != 0)"
-            )
+            published = create.index("state->orphan = false;")
+            create_unlock = create.index(f"{unlock_name}()", published)
             create_unlock_failure = create[create_unlock:]
             self.assertIn(f"{lock_name}()", create)
             self.assertIn("state->orphan = true;", create_unlock_failure)

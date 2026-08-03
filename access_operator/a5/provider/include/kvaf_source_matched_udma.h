@@ -150,6 +150,58 @@ int kvaf_udma_source_get_segment_failure(
     struct kvaf_udma_segment_failure *failure);
 
 /*
+ * The public urma_create_jfr() API returns only a pointer.  The pinned UDMA
+ * provider has several userspace allocation and kernel-command stages behind
+ * that pointer, and its rollback path can overwrite errno.  Preserve the
+ * first per-thread leaf so management Open can report the real failing stage
+ * without exposing private UDMA layouts through the provider ABI.
+ */
+#define KVAF_UDMA_JFR_FAILURE_ABI_VERSION UINT32_C(1)
+
+enum kvaf_udma_jfr_failure_stage {
+    KVAF_UDMA_JFR_FAILURE_NONE = 0,
+    KVAF_UDMA_JFR_FAILURE_VALIDATE_ARGUMENTS,
+    KVAF_UDMA_JFR_FAILURE_ALLOCATE_OWNER,
+    KVAF_UDMA_JFR_FAILURE_LOCK_REGISTRY,
+    KVAF_UDMA_JFR_FAILURE_VALIDATE_CONFIG,
+    KVAF_UDMA_JFR_FAILURE_VALIDATE_CONTEXT,
+    KVAF_UDMA_JFR_FAILURE_INIT_SPIN,
+    KVAF_UDMA_JFR_FAILURE_ALLOCATE_INDEX,
+    KVAF_UDMA_JFR_FAILURE_COMPUTE_RQ,
+    KVAF_UDMA_JFR_FAILURE_ALLOCATE_RQ,
+    KVAF_UDMA_JFR_FAILURE_ALLOCATE_RECORD_DB,
+    KVAF_UDMA_JFR_FAILURE_ALLOCATE_SLEEP_DB,
+    KVAF_UDMA_JFR_FAILURE_CREATE_COMMAND,
+    KVAF_UDMA_JFR_FAILURE_INSERT_TABLE,
+    KVAF_UDMA_JFR_FAILURE_UNLOCK_REGISTRY,
+    KVAF_UDMA_JFR_FAILURE_ROLLBACK_KERNEL,
+    KVAF_UDMA_JFR_FAILURE_ROLLBACK_LOCAL,
+};
+
+struct kvaf_udma_jfr_failure {
+    uint32_t abi_version;
+    uint32_t structure_size;
+    uint32_t stage;
+    int32_t operation_status;
+    int32_t operation_errno;
+    int32_t rollback_status;
+    int32_t rollback_errno;
+    uint32_t requested_depth;
+    uint32_t requested_max_sge;
+    uint32_t device_max_depth;
+    uint32_t device_max_sge;
+    uint32_t context_jfr_sge;
+    uint32_t context_dtu_enable;
+    uint32_t context_sq_reserved;
+    uint32_t context_table_shift;
+    uint32_t context_table_entries;
+};
+
+int kvaf_udma_source_get_jfr_failure(
+    struct kvaf_udma_jfr_failure *failure);
+void kvaf_udma_source_reset_jfr_failure(void);
+
+/*
  * A create operation can return NULL after the kernel or UMMU has already
  * acquired a resource.  Such an object is not visible to the caller and must
  * therefore be retried by its owning context before context destruction.

@@ -1,5 +1,6 @@
 #include "kvaf_source_matched_udma.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -52,6 +53,95 @@ static pthread_mutex_t g_kvaf_jfr_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct kvaf_udma_jfr_state *g_kvaf_jfrs;
 static uint32_t g_kvaf_jfr_count;
 static uint32_t g_kvaf_jfr_orphan_count;
+static _Thread_local struct kvaf_udma_jfr_failure g_kvaf_jfr_failure;
+
+static int kvaf_jfr_effective_errno(int status, int operation_errno)
+{
+    if (status < 0 && status != -1) {
+        return -status;
+    }
+    if (status > 0) {
+        return status;
+    }
+    if (operation_errno != 0) {
+        return operation_errno;
+    }
+    return EIO;
+}
+
+static void kvaf_clear_jfr_failure(void)
+{
+    g_kvaf_jfr_failure = (struct kvaf_udma_jfr_failure) {
+        .abi_version = KVAF_UDMA_JFR_FAILURE_ABI_VERSION,
+        .structure_size = sizeof(g_kvaf_jfr_failure),
+    };
+}
+
+void kvaf_udma_source_reset_jfr_failure(void)
+{
+    kvaf_clear_jfr_failure();
+}
+
+static void kvaf_record_jfr_failure(
+    enum kvaf_udma_jfr_failure_stage stage, int operation_status,
+    int operation_errno, const urma_context_t *context,
+    const urma_jfr_cfg_t *config)
+{
+    const urma_device_cap_t *cap = context == NULL ||
+        context->dev == NULL || context->dev->sysfs_dev == NULL
+        ? NULL : &context->dev->sysfs_dev->dev_attr.dev_cap;
+    const struct udma_u_context *udma_context = context == NULL
+        ? NULL : to_udma_u_ctx((urma_context_t *)context);
+
+    if (g_kvaf_jfr_failure.stage != KVAF_UDMA_JFR_FAILURE_NONE) {
+        return;
+    }
+    g_kvaf_jfr_failure.stage = (uint32_t)stage;
+    g_kvaf_jfr_failure.operation_status = operation_status;
+    g_kvaf_jfr_failure.operation_errno = kvaf_jfr_effective_errno(
+        operation_status, operation_errno);
+    g_kvaf_jfr_failure.requested_depth =
+        config == NULL ? 0U : config->depth;
+    g_kvaf_jfr_failure.requested_max_sge =
+        config == NULL ? 0U : config->max_sge;
+    g_kvaf_jfr_failure.device_max_depth =
+        cap == NULL ? 0U : cap->max_jfr_depth;
+    g_kvaf_jfr_failure.device_max_sge =
+        cap == NULL ? 0U : cap->max_jfr_sge;
+    g_kvaf_jfr_failure.context_jfr_sge =
+        udma_context == NULL ? 0U : udma_context->jfr_sge;
+    g_kvaf_jfr_failure.context_dtu_enable =
+        udma_context == NULL ? 0U : (uint32_t)udma_context->dtu_enable;
+    g_kvaf_jfr_failure.context_sq_reserved =
+        udma_context == NULL ? 0U : (uint32_t)udma_context->sq_reserved;
+    g_kvaf_jfr_failure.context_table_shift = udma_context == NULL
+        ? 0U : udma_context->jettys_in_tbl_shift;
+    g_kvaf_jfr_failure.context_table_entries = udma_context == NULL
+        ? 0U : udma_context->jettys_in_tbl;
+}
+
+static void kvaf_record_jfr_rollback(int status, int operation_errno)
+{
+    if (status == 0 || g_kvaf_jfr_failure.rollback_status != 0) {
+        return;
+    }
+    g_kvaf_jfr_failure.rollback_status = status;
+    g_kvaf_jfr_failure.rollback_errno = kvaf_jfr_effective_errno(
+        status, operation_errno);
+}
+
+int kvaf_udma_source_get_jfr_failure(
+    struct kvaf_udma_jfr_failure *failure)
+{
+    if (failure == NULL ||
+        failure->structure_size < sizeof(*failure)) {
+        return -EINVAL;
+    }
+    *failure = g_kvaf_jfr_failure;
+    failure->abi_version = KVAF_UDMA_JFR_FAILURE_ABI_VERSION;
+    failure->structure_size = sizeof(*failure);
+    return 0;
+}
 
 static int kvaf_lock_jfr_registry_checked(void)
 {
@@ -606,17 +696,37 @@ urma_jfr_t *kvaf_udma_create_jfr_checked(
     uint32_t sge_per_wqe;
     uint32_t wqebb_count;
     int status;
+    int operation_errno;
+    int root_errno;
 
-    state = calloc(1, sizeof(*state));
-    jfr = calloc(1, sizeof(*jfr));
-    if (state == NULL || jfr == NULL || context == NULL || config == NULL) {
-        free(state);
-        free(jfr);
+    kvaf_udma_source_reset_jfr_failure();
+    if (context == NULL || config == NULL) {
+        kvaf_record_jfr_failure(
+            KVAF_UDMA_JFR_FAILURE_VALIDATE_ARGUMENTS,
+            -1, EINVAL, context, config);
+        errno = EINVAL;
         return NULL;
     }
-    if (kvaf_lock_jfr_registry_checked() != 0) {
+    state = calloc(1, sizeof(*state));
+    jfr = calloc(1, sizeof(*jfr));
+    if (state == NULL || jfr == NULL) {
+        kvaf_record_jfr_failure(
+            KVAF_UDMA_JFR_FAILURE_ALLOCATE_OWNER,
+            -1, ENOMEM, context, config);
         free(state);
         free(jfr);
+        errno = ENOMEM;
+        return NULL;
+    }
+    errno = 0;
+    if (kvaf_lock_jfr_registry_checked() != 0) {
+        operation_errno = errno;
+        kvaf_record_jfr_failure(
+            KVAF_UDMA_JFR_FAILURE_LOCK_REGISTRY,
+            -1, operation_errno, context, config);
+        free(state);
+        free(jfr);
+        errno = g_kvaf_jfr_failure.operation_errno;
         return NULL;
     }
     state->jfr = jfr;
@@ -627,17 +737,26 @@ urma_jfr_t *kvaf_udma_create_jfr_checked(
     ++g_kvaf_jfr_count;
     ++g_kvaf_jfr_orphan_count;
 
+    errno = 0;
+    status = udma_u_verify_jfr_param(context, config);
     if (config->jfc == NULL || config->jfc->urma_ctx != context ||
         config->flag.bs.non_blocking ||
         config->flag.bs.tag_matching != URMA_NO_TAG_MATCHING ||
         config->trans_mode != URMA_TM_RM ||
-        udma_u_verify_jfr_param(context, config) != 0) {
+        status != 0) {
+        kvaf_record_jfr_failure(
+            KVAF_UDMA_JFR_FAILURE_VALIDATE_CONFIG,
+            status == 0 ? -1 : status,
+            errno == 0 ? EINVAL : errno, context, config);
         goto fail;
     }
     udma_context = to_udma_u_ctx(context);
     if (udma_context->dtu_enable || udma_context->sq_reserved ||
         udma_context->jettys_in_tbl_shift == 0U ||
         udma_context->jettys_in_tbl == 0U) {
+        kvaf_record_jfr_failure(
+            KVAF_UDMA_JFR_FAILURE_VALIDATE_CONTEXT,
+            -1, EOPNOTSUPP, context, config);
         goto fail;
     }
     jfr->rq.ctx = udma_context;
@@ -651,82 +770,145 @@ urma_jfr_t *kvaf_udma_create_jfr_checked(
     udma_u_init_jfr_param(jfr, config);
 
     if (!jfr->lock_free) {
-        if (pthread_spin_init(&jfr->lock,
-                PTHREAD_PROCESS_PRIVATE) != 0) {
+        status = pthread_spin_init(
+            &jfr->lock, PTHREAD_PROCESS_PRIVATE);
+        if (status != 0) {
+            kvaf_record_jfr_failure(
+                KVAF_UDMA_JFR_FAILURE_INIT_SPIN,
+                status, status, context, config);
             goto fail;
         }
         state->spin_initialized = true;
     }
-    if (kvaf_alloc_jfr_index_checked(state) != 0) {
+    errno = 0;
+    status = kvaf_alloc_jfr_index_checked(state);
+    if (status != 0) {
+        operation_errno = errno;
+        kvaf_record_jfr_failure(
+            KVAF_UDMA_JFR_FAILURE_ALLOCATE_INDEX,
+            status, operation_errno, context, config);
         goto fail;
     }
     sge_per_wqe = UDMA_MIN(jfr->max_sge, udma_context->jfr_sge);
     if (sge_per_wqe == 0U ||
         jfr->wqe_cnt > UINT32_MAX / sge_per_wqe) {
+        kvaf_record_jfr_failure(
+            KVAF_UDMA_JFR_FAILURE_COMPUTE_RQ,
+            -1, sge_per_wqe == 0U ? EOPNOTSUPP : EOVERFLOW,
+            context, config);
         goto fail;
     }
     wqebb_count = sge_per_wqe * jfr->wqe_cnt;
     state->rq_created = true;
-    if (kvaf_udma_checked_alloc_queue_buffer(&jfr->rq,
-            wqebb_count, UDMA_JFR_WQEBB,
-            UDMA_HW_PAGE_SIZE, true) != 0) {
+    errno = 0;
+    status = kvaf_udma_checked_alloc_queue_buffer(
+        &jfr->rq, wqebb_count, UDMA_JFR_WQEBB,
+        UDMA_HW_PAGE_SIZE, true);
+    if (status != 0) {
+        operation_errno = errno;
+        kvaf_record_jfr_failure(
+            KVAF_UDMA_JFR_FAILURE_ALLOCATE_RQ,
+            status, operation_errno, context, config);
         goto fail;
     }
+    errno = 0;
     status = kvaf_udma_checked_alloc_sw_db(
         udma_context, UDMA_JFR_TYPE_DB, &jfr->sw_db);
+    operation_errno = errno;
     if (jfr->sw_db != NULL) {
         state->sw_db_allocated = true;
     }
     if (status != 0) {
+        kvaf_record_jfr_failure(
+            KVAF_UDMA_JFR_FAILURE_ALLOCATE_RECORD_DB,
+            status, operation_errno, context, config);
         goto fail;
     }
+    errno = 0;
     status = kvaf_udma_checked_alloc_sw_db(
         udma_context, UDMA_JFR_PAYLOAD, &sleep_db);
+    operation_errno = errno;
     jfr->long_sleeptime = (bool *)sleep_db;
     if (sleep_db != NULL) {
         state->sleep_db_allocated = true;
     }
     if (status != 0) {
+        kvaf_record_jfr_failure(
+            KVAF_UDMA_JFR_FAILURE_ALLOCATE_SLEEP_DB,
+            status, operation_errno, context, config);
         goto fail;
     }
     *jfr->long_sleeptime = false;
 
+    errno = 0;
     status = kvaf_create_direct_jfr_command(
         context, jfr, config, &state->kernel_created);
     if (status != 0) {
+        operation_errno = errno;
+        kvaf_record_jfr_failure(
+            KVAF_UDMA_JFR_FAILURE_CREATE_COMMAND,
+            status, operation_errno, context, config);
         goto fail;
     }
     state->event_condition_initialized = true;
     state->event_mutex_initialized = true;
-    if (kvaf_insert_jfr_table_checked(state) != 0) {
+    errno = 0;
+    status = kvaf_insert_jfr_table_checked(state);
+    if (status != 0) {
+        operation_errno = errno;
+        kvaf_record_jfr_failure(
+            KVAF_UDMA_JFR_FAILURE_INSERT_TABLE,
+            status, operation_errno, context, config);
         goto fail;
     }
     state->orphan = false;
     --g_kvaf_jfr_orphan_count;
-    if (kvaf_unlock_jfr_registry_checked() != 0) {
+    errno = 0;
+    status = kvaf_unlock_jfr_registry_checked();
+    if (status != 0) {
         /* The caller never received this handle; retain it as an orphan and
          * let the unsafe latch prevent any new provider session. */
         state->orphan = true;
         ++g_kvaf_jfr_orphan_count;
+        kvaf_record_jfr_failure(
+            KVAF_UDMA_JFR_FAILURE_UNLOCK_REGISTRY,
+            status, errno, context, config);
+        errno = g_kvaf_jfr_failure.operation_errno;
         return NULL;
     }
     return &jfr->base;
 
 fail:
+    if (g_kvaf_jfr_failure.stage == KVAF_UDMA_JFR_FAILURE_NONE) {
+        kvaf_record_jfr_failure(
+            KVAF_UDMA_JFR_FAILURE_ROLLBACK_LOCAL,
+            -1, EIO, context, config);
+    }
+    root_errno = g_kvaf_jfr_failure.operation_errno;
+    errno = 0;
     if ((state->kernel_created || state->kernel_delete_pending) &&
-        kvaf_delete_kernel_jfr_nonblocking(state) != 0) {
+        (status = kvaf_delete_kernel_jfr_nonblocking(state)) != 0) {
+        kvaf_record_jfr_rollback(status, errno);
         (void)kvaf_unlock_jfr_registry_checked();
+        errno = root_errno;
         return NULL;
     }
     errno = 0;
-    if (kvaf_cleanup_local_jfr_checked(state) == 0) {
+    status = kvaf_cleanup_local_jfr_checked(state);
+    if (status == 0) {
         kvaf_remove_jfr_locked(state);
         free(jfr);
         free(state);
     } else {
+        kvaf_record_jfr_rollback(status, errno);
         (void)kvaf_udma_classify_cleanup_failure();
     }
-    (void)kvaf_unlock_jfr_registry_checked();
+    errno = 0;
+    status = kvaf_unlock_jfr_registry_checked();
+    if (status != 0) {
+        kvaf_record_jfr_rollback(status, errno);
+    }
+    errno = root_errno;
     return NULL;
 }
 

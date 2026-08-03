@@ -1,4 +1,5 @@
 #include "kvaf_source_matched_udma.h"
+#include "kvaf_source_matched_ummu.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -469,6 +470,12 @@ int kvaf_udma_source_retry_orphan_cleanup(urma_context_t *context)
     int saved_errno = 0;
 
     if (context == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (kvaf_udma_source_cleanup_is_unknown() != 0 ||
+        kvaf_source_ummu_cleanup_is_unknown() != 0) {
+        errno = EUCLEAN;
         return -1;
     }
     errno = 0;
@@ -476,25 +483,50 @@ int kvaf_udma_source_retry_orphan_cleanup(urma_context_t *context)
         result = -1;
         kvaf_udma_preserve_cleanup_errno(&saved_errno);
     }
+    if (kvaf_udma_source_cleanup_is_unknown() != 0 ||
+        kvaf_source_ummu_cleanup_is_unknown() != 0) {
+        errno = EUCLEAN;
+        return -1;
+    }
     errno = 0;
     if (kvaf_udma_source_retry_orphan_jfrs(context) != 0) {
         result = -1;
         kvaf_udma_preserve_cleanup_errno(&saved_errno);
+    }
+    if (kvaf_udma_source_cleanup_is_unknown() != 0 ||
+        kvaf_source_ummu_cleanup_is_unknown() != 0) {
+        errno = EUCLEAN;
+        return -1;
     }
     errno = 0;
     if (kvaf_udma_source_retry_orphan_jfcs(context) != 0) {
         result = -1;
         kvaf_udma_preserve_cleanup_errno(&saved_errno);
     }
+    if (kvaf_udma_source_cleanup_is_unknown() != 0 ||
+        kvaf_source_ummu_cleanup_is_unknown() != 0) {
+        errno = EUCLEAN;
+        return -1;
+    }
     errno = 0;
     if (kvaf_udma_source_retry_orphan_segments(context) != 0) {
         result = -1;
         kvaf_udma_preserve_cleanup_errno(&saved_errno);
     }
+    if (kvaf_udma_source_cleanup_is_unknown() != 0 ||
+        kvaf_source_ummu_cleanup_is_unknown() != 0) {
+        errno = EUCLEAN;
+        return -1;
+    }
     errno = 0;
     if (kvaf_udma_source_retry_orphan_tokens(context) != 0) {
         result = -1;
         kvaf_udma_preserve_cleanup_errno(&saved_errno);
+    }
+    if (kvaf_udma_source_cleanup_is_unknown() != 0 ||
+        kvaf_source_ummu_cleanup_is_unknown() != 0) {
+        errno = EUCLEAN;
+        return -1;
     }
     if (result != 0) {
         errno = saved_errno == 0 ? EIO : saved_errno;
