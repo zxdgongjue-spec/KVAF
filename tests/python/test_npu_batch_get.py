@@ -260,12 +260,6 @@ def main() -> int:
         indices = torch.tensor(indices_values, dtype=torch.int32, device=device)
         mask = torch.tensor(mask_values, dtype=torch.uint8, device=device)
         output_indices = torch.tensor(output_indices_values, dtype=torch.int32, device=device)
-        # torch_npu graph input producers are NPU tensors too. Allocate them
-        # with the caller buffers, before the Runtime owns any Direct-HCCP
-        # local-buffer registrations; they remain caller-owned throughout.
-        if graph_replays:
-            graph_indices_staging = torch.empty_like(indices)
-            graph_output_indices_staging = torch.empty_like(output_indices)
         output_a = torch.zeros(output_rows * block_bytes, dtype=torch.uint8, device=device)
         output_b = torch.zeros_like(output_a)
         status = torch.zeros(
@@ -398,16 +392,14 @@ def main() -> int:
                 "fixed_tensor_addresses=1 "
                 "external_graph_owner=torch_npu "
                 "dynamic_tensor_contents=indices_output_indices "
-                "input_producer=caller_stream "
-                "captured_ops=input_copy_runtime_batch_get "
+                "single_stream=caller_stream "
+                "captured_ops=runtime_batch_get "
                 f"functional_replays={graph_replays} "
                 f"perf_warmup={graph_warmup} perf_samples={graph_iterations}"
             )
 
-            # A direct CPU -> NPU copy on the post-capture stream is a known
-            # torch_npu blocking boundary on this environment. Model inputs
-            # are normally produced on NPU, so use fixed caller-owned NPU
-            # staging tensors and make the captured graph consume them.
+            # Match the demo's single-stream contract. The caller updates the
+            # fixed input tensors before replay; capture contains BatchGet.
 
             def prepare_graph_inputs(
                 epoch: int, trace: str | None = None
@@ -423,15 +415,15 @@ def main() -> int:
                 graph_output_indices = [
                     (row + epoch) % output_rows for row in output_indices_values
                 ]
-                # This is the upstream NPU producer. It stays outside graph
-                # capture, and capture_stream waits for it before replay.
+                # The caller writes fixed-address NPU inputs on the same
+                # stream that owns capture and replay.
                 with torch.npu.stream(caller_stream):
-                    graph_indices_staging.copy_(
+                    indices.copy_(
                         torch.tensor(graph_indices, dtype=torch.int32, device=device)
                     )
                     if trace is not None:
                         print(f"RUNTIME_NPU_GRAPH_STAGE_INDICES_DONE replay={trace}")
-                    graph_output_indices_staging.copy_(
+                    output_indices.copy_(
                         torch.tensor(
                             graph_output_indices, dtype=torch.int32, device=device
                         )
@@ -440,29 +432,17 @@ def main() -> int:
                     print(f"RUNTIME_NPU_GRAPH_STAGE_OUTPUT_INDICES_DONE replay={trace}")
                 return graph_payload_slots, graph_output_indices
 
-            def enqueue_graph_input_update(
-                stream: object, trace: str | None = None
-            ) -> None:
-                # Establish the framework-level producer -> graph dependency.
-                # The captured D2D input copies run after this wait.
-                if trace is not None:
-                    print(f"RUNTIME_NPU_GRAPH_INPUT_STREAM_ENTER replay={trace}")
-                stream.wait_stream(caller_stream)
-                if trace is not None:
-                    print(f"RUNTIME_NPU_GRAPH_INPUT_WAIT_ENQUEUED replay={trace}")
-
-            capture_stream = torch.npu.Stream(device=device_id)
+            capture_stream = caller_stream
+            print("RUNTIME_NPU_PHASE_BEGIN phase=graph_object")
             graph = torch.npu.NPUGraph()
+            print("RUNTIME_NPU_PHASE_DONE phase=graph_object")
             graph_payload_slots, graph_output_indices = prepare_graph_inputs(0)
-            enqueue_graph_input_update(capture_stream)
             capture_stream.synchronize()
             print("RUNTIME_NPU_PHASE_BEGIN phase=graph_capture")
             # output_a was already used by eager A -> B -> A above, so its
             # Direct-HCCP local HBM registration is cached before capture.
             # The external torch_npu graph owns capture, replay and lifetime.
             with torch.npu.graph(graph, stream=capture_stream, capture_error_mode="relaxed"):
-                indices.copy_(graph_indices_staging)
-                output_indices.copy_(graph_output_indices_staging)
                 execute(output_a, capture_stream, synchronize=False)
             print("RUNTIME_NPU_PHASE_DONE phase=graph_capture owner=torch_npu")
 
@@ -484,8 +464,6 @@ def main() -> int:
                     replay, str(replay)
                 )
                 print(f"RUNTIME_NPU_GRAPH_REPLAY_BEGIN replay={replay}")
-                enqueue_graph_input_update(capture_stream, str(replay))
-                print(f"RUNTIME_NPU_GRAPH_INPUT_ENQUEUED replay={replay}")
                 replay_graph_on_capture_stream(str(replay))
                 capture_stream.synchronize()
                 print(f"RUNTIME_NPU_GRAPH_STREAM_DONE replay={replay}")
@@ -510,7 +488,6 @@ def main() -> int:
             print("RUNTIME_NPU_GRAPH_PERF_WARMUP_BEGIN")
             for warmup_iteration in range(graph_warmup):
                 prepare_graph_inputs(graph_replays + warmup_iteration)
-                enqueue_graph_input_update(capture_stream)
                 replay_graph_on_capture_stream()
                 capture_stream.synchronize()
                 graph_completed_batches += 1
@@ -526,7 +503,6 @@ def main() -> int:
                     final_graph_output_indices,
                 ) = prepare_graph_inputs(epoch)
                 begin = time.perf_counter()
-                enqueue_graph_input_update(capture_stream)
                 replay_graph_on_capture_stream()
                 capture_stream.synchronize()
                 graph_samples.append((time.perf_counter() - begin) * 1000.0)
