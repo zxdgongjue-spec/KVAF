@@ -42,6 +42,8 @@ device-VA。代码不会把这个执行模型误标成 `CREATE_JETTY_EX/TGID-VA`
 - 该 UMDK 在 `src/urma/bazel/urma_deps.bzl` 中锁定的 openEuler libummu
   `70de020f776d8def0d8a8941cc7cbc5928d66c10`；
 - 当前运行内核对应的完整 UDMA 与 UMMU UAPI header。
+- Host 与 `vllm-ascend-cs-kvaf` 内同路径可读写的 UMMU TID 字符设备
+  `/dev/ummu/tid`；Host DDR 的 HAL 注册不能替代它。
 
 Host 与 Device provider 都把固定版本 UMDK 的 common、完整 public URMA
 core、UDMA 和官方 perftest UB/TCP 管理代码，以及配对 libummu 编进自身；private
@@ -134,6 +136,11 @@ UMMU 的每个成功 `mmap` 都在返回前挂入预分配 ownership ledger，�
 UMMU 命令完成状态或 ledger 所有权一旦无法证明，会触发进程生命周期的单向
 `cleanup_unknown` 锁存；后续普通可重试错误不能清除它，Close 必须返回
 `CLOSE_UNSAFE`，避免把真实未知状态误报成可重试。
+
+UB 管理通道的三个 4 KiB Segment 分别显式持有 Token/TID。Close 严格按
+`unregister Segment -> free Token` 的配对顺序逆序释放；若 Segment 注销失败，
+Token handle 保留给同一 owner 重试，不使用 public `urma_register_seg()` 会在
+失败清理中提前释放隐式 Token 的便利路径。
 
 ## 3. 为什么要分成 Host/Device 两个 provider
 
@@ -494,6 +501,13 @@ docker exec -it -u 0 vllm-ascend-cs-kvaf bash
 
 执行环境：`VLLM_ASCEND_CS_KVAF_DOCKER`
 
+运行前 `/dev/ummu/tid` 必须是可读写字符设备。若宿主机存在而 Docker 不存在，
+需要重建同名容器并增加 `--device /dev/ummu/tid:/dev/ummu/tid:rwm`；
+`--privileged` 只放开权限，不能保证容器创建后出现的嵌套设备节点自动可见。
+runner 会在 EID、`npu-smi`、ACL、DDR/HBM 和 URMA 操作之前 fail closed。
+除字符设备类型和权限位外，runner 还会执行一次不发 ioctl 的 `O_RDWR`
+打开/关闭探测，以提前识别 device-cgroup 或 LSM 拒绝。
+
 ```bash
 echo "EXECUTION_ENV=VLLM_ASCEND_CS_KVAF_DOCKER"
 cd /data/c00982601/KVAF
@@ -741,6 +755,11 @@ runner 不再用固定 sleep 猜测 Host server 是否启动。它固定本次 H
 该扫描可能产生 `ENOENT`，因此不能再只凭最终 `provider_status=-2` 推断设备节点或
 EID 缺失，必须以 `stage` 和该阶段的底层 UMDK 日志为准。该诊断不改变 provider
 ABI、资源所有权或 checked teardown 行为。
+
+Token/TID 分配失败还会先输出 `KVAF_URMA_TOKEN_ERROR`；Segment 注册失败会先输出
+`KVAF_URMA_SEGMENT_ERROR`，其中包含同线程、同次 UMMU 操作的 failure stage、
+retryability、pending/retained 计数和 kernel-register rollback 结果。每个顶层 UMMU
+操作都会清空线程快照，避免把前一次失败或另一线程的失败误配到本次注册。
 
 Device provider 的控制超时仍由 `KVAF_H2D_TIMEOUT_SECONDS` 指定。Host 的管理窗口
 独立使用 `KVAF_HOST_CONTROL_TIMEOUT_SECONDS`；默认值是 Device timeout 加 management

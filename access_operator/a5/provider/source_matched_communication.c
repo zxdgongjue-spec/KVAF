@@ -15,6 +15,7 @@
 
 #include "urma_api.h"
 #include "kvaf_source_matched_udma.h"
+#include "kvaf_source_matched_ummu.h"
 
 static struct timespec g_kvaf_control_deadline;
 static int g_kvaf_control_deadline_valid;
@@ -304,6 +305,113 @@ static int kvaf_ub_management_error(
     return -1;
 }
 
+static const char *kvaf_segment_failure_stage_name(uint32_t stage)
+{
+    switch (stage) {
+        case KVAF_UDMA_SEGMENT_FAILURE_NONE:
+            return "none";
+        case KVAF_UDMA_SEGMENT_FAILURE_VALIDATE:
+            return "validate";
+        case KVAF_UDMA_SEGMENT_FAILURE_ALLOCATE_OWNER:
+            return "allocate_owner";
+        case KVAF_UDMA_SEGMENT_FAILURE_LOCK_OWNER:
+            return "lock_owner";
+        case KVAF_UDMA_SEGMENT_FAILURE_UMMU_GRANT:
+            return "ummu_grant";
+        case KVAF_UDMA_SEGMENT_FAILURE_KERNEL_REGISTER:
+            return "kernel_register";
+        default:
+            return "unknown";
+    }
+}
+
+static int kvaf_ub_segment_registration_error(
+    const char *stage, int wrapper_errno, int fallback_errno)
+{
+    struct kvaf_udma_segment_failure segment = {
+        .structure_size = sizeof(segment),
+    };
+    struct kvaf_source_ummu_status ummu = {
+        .structure_size = sizeof(ummu),
+    };
+    const int segment_status =
+        kvaf_udma_source_get_segment_failure(&segment);
+    const int ummu_status =
+        kvaf_source_ummu_get_thread_status(&ummu);
+    int effective_errno = wrapper_errno;
+
+    if (segment_status == 0 && segment.stage !=
+        KVAF_UDMA_SEGMENT_FAILURE_NONE) {
+        effective_errno = segment.operation_errno;
+    }
+    (void)fprintf(stderr,
+        "KVAF_URMA_SEGMENT_ERROR management_stage=%s "
+        "provider_stage=%s operation_status=%d operation_errno=%d "
+        "rollback_status=%d rollback_errno=%d ummu_tid=%u "
+        "token_id=%u token_handle=%llu address=0x%llx length=%llu "
+        "ummu_query_status=%d ummu_failure_stage=%u "
+        "ummu_error=%d ummu_retryability=%u ummu_state_unknown=%u "
+        "ummu_live_tids=%u ummu_pending=%u ummu_retained=%u\n",
+        stage, kvaf_segment_failure_stage_name(segment.stage),
+        segment.operation_status, segment.operation_errno,
+        segment.rollback_status, segment.rollback_errno,
+        segment.ummu_tid, segment.token_id,
+        (unsigned long long)segment.token_handle,
+        (unsigned long long)segment.address,
+        (unsigned long long)segment.length,
+        ummu_status, ummu.last_failure_stage, ummu.last_error,
+        ummu.last_retryability, ummu.last_state_unknown,
+        ummu.live_tid_count, ummu.pending_operation_count,
+        ummu.retained_mapping_count);
+    (void)fflush(stderr);
+    return kvaf_ub_management_error(
+        stage, effective_errno, fallback_errno);
+}
+
+enum kvaf_ub_management_segment_index {
+    KVAF_UB_MANAGEMENT_SEND = 0,
+    KVAF_UB_MANAGEMENT_RECEIVE,
+    KVAF_UB_MANAGEMENT_HANDSHAKE,
+    KVAF_UB_MANAGEMENT_SEGMENT_COUNT,
+};
+
+/*
+ * Do not use the public Segment-registration implicit-token convenience path.
+ * The public unregister wrapper frees an implicit token even when the
+ * provider's checked segment teardown returns failure.  Explicit ownership
+ * lets Close retry the Segment first and free its Token/TID only afterwards.
+ */
+static urma_token_id_t *g_kvaf_ub_management_tokens[
+    KVAF_UB_MANAGEMENT_SEGMENT_COUNT];
+
+static int kvaf_ub_token_allocation_error(
+    const char *stage, int wrapper_errno, int fallback_errno)
+{
+    struct kvaf_source_ummu_status ummu = {
+        .structure_size = sizeof(ummu),
+    };
+    const int ummu_status =
+        kvaf_source_ummu_get_thread_status(&ummu);
+    int effective_errno = wrapper_errno;
+
+    if (effective_errno == 0 && ummu_status == 0 &&
+        ummu.last_error < 0) {
+        effective_errno = -ummu.last_error;
+    }
+    (void)fprintf(stderr,
+        "KVAF_URMA_TOKEN_ERROR management_stage=%s wrapper_errno=%d "
+        "ummu_query_status=%d ummu_failure_stage=%u ummu_error=%d "
+        "ummu_retryability=%u ummu_state_unknown=%u ummu_live_tids=%u "
+        "ummu_pending=%u ummu_retained=%u\n",
+        stage, wrapper_errno, ummu_status, ummu.last_failure_stage,
+        ummu.last_error, ummu.last_retryability,
+        ummu.last_state_unknown, ummu.live_tid_count,
+        ummu.pending_operation_count, ummu.retained_mapping_count);
+    (void)fflush(stderr);
+    return kvaf_ub_management_error(
+        stage, effective_errno, fallback_errno);
+}
+
 static int kvaf_ub_create_local_resources_checked(
     const comm_ub_cfg_t *cfg, const char *expected_device_name,
     uint32_t expected_eid_index, ub_mgmt_ctx_t **ctx_out)
@@ -389,28 +497,57 @@ static int kvaf_ub_create_local_resources_checked(
     seg_cfg.token_value = g_ub_mgmt_token;
     seg_cfg.flag.value = 0;
     seg_cfg.flag.bs.access = URMA_ACCESS_LOCAL_ONLY;
+    seg_cfg.flag.bs.token_id_valid = URMA_TOKEN_ID_VALID;
     seg_cfg.user_ctx = (uint64_t)NULL;
     seg_cfg.iova = 0;
 
+    errno = 0;
+    g_kvaf_ub_management_tokens[KVAF_UB_MANAGEMENT_SEND] =
+        urma_alloc_token_id(ctx->urma_ctx);
+    if (g_kvaf_ub_management_tokens[KVAF_UB_MANAGEMENT_SEND] == NULL) {
+        return kvaf_ub_token_allocation_error(
+            "allocate_send_token", errno, EIO);
+    }
+    seg_cfg.token_id =
+        g_kvaf_ub_management_tokens[KVAF_UB_MANAGEMENT_SEND];
     seg_cfg.va = (uint64_t)ctx->send_buf;
     errno = 0;
     ctx->tseg_send = urma_register_seg(ctx->urma_ctx, &seg_cfg);
     if (ctx->tseg_send == NULL) {
-        return kvaf_ub_management_error(
+        return kvaf_ub_segment_registration_error(
             "register_send_segment", errno, EIO);
     }
+    errno = 0;
+    g_kvaf_ub_management_tokens[KVAF_UB_MANAGEMENT_RECEIVE] =
+        urma_alloc_token_id(ctx->urma_ctx);
+    if (g_kvaf_ub_management_tokens[KVAF_UB_MANAGEMENT_RECEIVE] == NULL) {
+        return kvaf_ub_token_allocation_error(
+            "allocate_receive_token", errno, EIO);
+    }
+    seg_cfg.token_id =
+        g_kvaf_ub_management_tokens[KVAF_UB_MANAGEMENT_RECEIVE];
     seg_cfg.va = (uint64_t)ctx->recv_buf;
     errno = 0;
     ctx->tseg_recv = urma_register_seg(ctx->urma_ctx, &seg_cfg);
     if (ctx->tseg_recv == NULL) {
-        return kvaf_ub_management_error(
+        return kvaf_ub_segment_registration_error(
             "register_receive_segment", errno, EIO);
     }
+    errno = 0;
+    g_kvaf_ub_management_tokens[KVAF_UB_MANAGEMENT_HANDSHAKE] =
+        urma_alloc_token_id(ctx->urma_ctx);
+    if (g_kvaf_ub_management_tokens[
+            KVAF_UB_MANAGEMENT_HANDSHAKE] == NULL) {
+        return kvaf_ub_token_allocation_error(
+            "allocate_handshake_token", errno, EIO);
+    }
+    seg_cfg.token_id =
+        g_kvaf_ub_management_tokens[KVAF_UB_MANAGEMENT_HANDSHAKE];
     seg_cfg.va = (uint64_t)ctx->recv_buf_hs;
     errno = 0;
     ctx->tseg_recv_hs = urma_register_seg(ctx->urma_ctx, &seg_cfg);
     if (ctx->tseg_recv_hs == NULL) {
-        return kvaf_ub_management_error(
+        return kvaf_ub_segment_registration_error(
             "register_handshake_segment", errno, EIO);
     }
 
@@ -471,7 +608,11 @@ static int kvaf_ub_establish_connection(
     };
     ub_mgmt_ctx_t *ctx = NULL;
 
-    if (g_ub_ctx != NULL || cfg->pair_num != 1U ||
+    if (g_ub_ctx != NULL ||
+        g_kvaf_ub_management_tokens[KVAF_UB_MANAGEMENT_SEND] != NULL ||
+        g_kvaf_ub_management_tokens[KVAF_UB_MANAGEMENT_RECEIVE] != NULL ||
+        g_kvaf_ub_management_tokens[KVAF_UB_MANAGEMENT_HANDSHAKE] != NULL ||
+        cfg->pair_num != 1U ||
         expected_peer_eid == NULL || expected_peer_eid[0] == '\0') {
         return kvaf_ub_management_error(
             "validate_establish_arguments", EINVAL, EINVAL);
@@ -554,9 +695,18 @@ static int kvaf_ub_close_connection_checked(void)
     KVAF_UB_DESTROY(ctx->pair.tjetty, urma_unimport_jetty);
     KVAF_UB_DESTROY(ctx->pair.jetty, urma_delete_jetty);
     KVAF_UB_DESTROY(ctx->jfr, urma_delete_jfr);
-    KVAF_UB_DESTROY(ctx->tseg_recv, urma_unregister_seg);
     KVAF_UB_DESTROY(ctx->tseg_recv_hs, urma_unregister_seg);
+    KVAF_UB_DESTROY(
+        g_kvaf_ub_management_tokens[KVAF_UB_MANAGEMENT_HANDSHAKE],
+        urma_free_token_id);
+    KVAF_UB_DESTROY(ctx->tseg_recv, urma_unregister_seg);
+    KVAF_UB_DESTROY(
+        g_kvaf_ub_management_tokens[KVAF_UB_MANAGEMENT_RECEIVE],
+        urma_free_token_id);
     KVAF_UB_DESTROY(ctx->tseg_send, urma_unregister_seg);
+    KVAF_UB_DESTROY(
+        g_kvaf_ub_management_tokens[KVAF_UB_MANAGEMENT_SEND],
+        urma_free_token_id);
     KVAF_UB_DESTROY(ctx->jfc, urma_delete_jfc);
     KVAF_UB_DESTROY(ctx->urma_ctx, urma_delete_context);
 #undef KVAF_UB_DESTROY

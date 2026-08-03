@@ -89,6 +89,8 @@ static uint32_t g_kvaf_ummu_pending_count;
 static uint32_t g_kvaf_ummu_retained_count;
 static uint32_t g_kvaf_ummu_cleanup_unknown;
 static struct kvaf_source_ummu_status g_kvaf_ummu_last_status;
+static _Thread_local struct kvaf_source_ummu_status
+    g_kvaf_ummu_thread_status;
 static _Thread_local struct kvaf_ummu_tid_state *g_kvaf_ummu_current_state;
 static _Thread_local enum kvaf_source_ummu_failure_stage g_kvaf_queue_failure_stage;
 static _Thread_local bool g_kvaf_queue_state_unknown;
@@ -117,6 +119,17 @@ static int kvaf_negative_errno(int status)
   return errno == 0 ? -EIO : -errno;
 }
 
+static void kvaf_clear_thread_failure(void)
+{
+  g_kvaf_ummu_thread_status = (struct kvaf_source_ummu_status) {
+    .abi_version = KVAF_SOURCE_UMMU_STATUS_ABI_VERSION,
+    .structure_size = sizeof(g_kvaf_ummu_thread_status),
+    .capability_magic = KVAF_SOURCE_UMMU_CAPABILITY_MAGIC,
+    .capability_bits = KVAF_SOURCE_UMMU_CHECKED_RETRYABLE_V1 |
+        KVAF_SOURCE_UMMU_PINNED_FULL_UAPI,
+  };
+}
+
 static void kvaf_record_failure(
     const struct kvaf_ummu_tid_state *state,
     enum kvaf_source_ummu_failure_stage stage, int status,
@@ -125,6 +138,21 @@ static void kvaf_record_failure(
     enum kvaf_source_ummu_pending_operation operation,
     uint64_t address, size_t length)
 {
+  struct kvaf_source_ummu_status snapshot = {
+    .abi_version = KVAF_SOURCE_UMMU_STATUS_ABI_VERSION,
+    .structure_size = sizeof(snapshot),
+    .capability_magic = KVAF_SOURCE_UMMU_CAPABILITY_MAGIC,
+    .capability_bits = KVAF_SOURCE_UMMU_CHECKED_RETRYABLE_V1 |
+        KVAF_SOURCE_UMMU_PINNED_FULL_UAPI,
+    .last_failure_stage = (uint32_t)stage,
+    .last_error = kvaf_negative_errno(status),
+    .last_retryability = (uint32_t)retryability,
+    .last_tid = state == NULL ? 0U : state->tid,
+    .last_pending_operation = (uint32_t)operation,
+    .last_address = address,
+    .last_length = length,
+  };
+
   if (state_unknown) {
     /*
      * This is deliberately process-lifetime state.  The source provider has
@@ -134,27 +162,14 @@ static void kvaf_record_failure(
     __atomic_store_n(
         &g_kvaf_ummu_cleanup_unknown, 1U, __ATOMIC_RELEASE);
   }
+  snapshot.last_state_unknown =
+      kvaf_source_ummu_cleanup_is_unknown() != 0 ? 1U : 0U;
+  /* Preserve causality even if another thread updates the process snapshot. */
+  g_kvaf_ummu_thread_status = snapshot;
   if (pthread_mutex_lock(&g_kvaf_ummu_status_lock) != 0) {
     return;
   }
-  g_kvaf_ummu_last_status.abi_version =
-      KVAF_SOURCE_UMMU_STATUS_ABI_VERSION;
-  g_kvaf_ummu_last_status.structure_size =
-      sizeof(g_kvaf_ummu_last_status);
-  g_kvaf_ummu_last_status.capability_magic =
-      KVAF_SOURCE_UMMU_CAPABILITY_MAGIC;
-  g_kvaf_ummu_last_status.capability_bits =
-      KVAF_SOURCE_UMMU_CHECKED_RETRYABLE_V1 |
-      KVAF_SOURCE_UMMU_PINNED_FULL_UAPI;
-  g_kvaf_ummu_last_status.last_failure_stage = (uint32_t)stage;
-  g_kvaf_ummu_last_status.last_error = kvaf_negative_errno(status);
-  g_kvaf_ummu_last_status.last_retryability = (uint32_t)retryability;
-  g_kvaf_ummu_last_status.last_state_unknown =
-      kvaf_source_ummu_cleanup_is_unknown() != 0 ? 1U : 0U;
-  g_kvaf_ummu_last_status.last_tid = state == NULL ? 0U : state->tid;
-  g_kvaf_ummu_last_status.last_pending_operation = (uint32_t)operation;
-  g_kvaf_ummu_last_status.last_address = address;
-  g_kvaf_ummu_last_status.last_length = length;
+  g_kvaf_ummu_last_status = snapshot;
   (void)pthread_mutex_unlock(&g_kvaf_ummu_status_lock);
 }
 
@@ -1013,11 +1028,22 @@ int ummu_grant(
   enum ummu_grant_op_type operation;
   int status;
 
+  kvaf_clear_thread_failure();
   if (segment_attribute == NULL) {
+    kvaf_record_failure(NULL,
+        KVAF_SOURCE_UMMU_FAILURE_GRANT_VALIDATE, -EINVAL,
+        KVAF_SOURCE_UMMU_RETRY_NOT_APPLICABLE, false,
+        KVAF_SOURCE_UMMU_PENDING_NONE,
+        (uint64_t)(uintptr_t)data, data_size);
     return -EINVAL;
   }
   status = kvaf_context_and_state_lock(tid, &context, &state);
   if (status != 0) {
+    kvaf_record_failure(NULL,
+        KVAF_SOURCE_UMMU_FAILURE_GRANT_STATE_LOOKUP, status,
+        KVAF_SOURCE_UMMU_RETRY_SAFE, false,
+        KVAF_SOURCE_UMMU_PENDING_NONE,
+        (uint64_t)(uintptr_t)data, data_size);
     return status;
   }
   if (state->pending != KVAF_SOURCE_UMMU_PENDING_NONE) {
@@ -1032,6 +1058,10 @@ int ummu_grant(
       status = kvaf_retry_data_operation_locked(state);
     } else {
       status = -EBUSY;
+      kvaf_record_failure(state,
+          KVAF_SOURCE_UMMU_FAILURE_GRANT_BUSY, status,
+          KVAF_SOURCE_UMMU_RETRY_SAFE, false, state->pending,
+          (uint64_t)(uintptr_t)data, data_size);
     }
     kvaf_context_and_state_unlock(context, state);
     return status;
@@ -1046,11 +1076,21 @@ int ummu_grant(
   if (ummu_check_data(&data_info, state->mapt->mode) != 0 ||
       ummu_perm_data_preproc(&data_info) != 0) {
     status = -EINVAL;
+    kvaf_record_failure(state,
+        KVAF_SOURCE_UMMU_FAILURE_GRANT_VALIDATE, status,
+        KVAF_SOURCE_UMMU_RETRY_NOT_APPLICABLE, false,
+        KVAF_SOURCE_UMMU_PENDING_NONE,
+        (uint64_t)(uintptr_t)data, data_size);
     goto done;
   }
   operation = ummu_grant_check(state->mapt, &data_info);
   if (operation == UMMU_OP_END) {
     status = -EINVAL;
+    kvaf_record_failure(state,
+        KVAF_SOURCE_UMMU_FAILURE_GRANT_VALIDATE, status,
+        KVAF_SOURCE_UMMU_RETRY_NOT_APPLICABLE, false,
+        KVAF_SOURCE_UMMU_PENDING_NONE,
+        data_info.data_base, data_info.data_size);
     goto clear_token;
   }
   data_info.op = operation;
@@ -1196,12 +1236,14 @@ done:
 
 int ummu_ungrant(uint32_t tid, void *data, size_t data_size)
 {
+  kvaf_clear_thread_failure();
   return kvaf_ungrant_data(tid, data, data_size, 0, false);
 }
 
 int ummu_ungrant_by_token(
     uint32_t tid, void *data, size_t data_size, uint32_t token)
 {
+  kvaf_clear_thread_failure();
   return kvaf_ungrant_data(tid, data, data_size, token, true);
 }
 
@@ -1466,6 +1508,7 @@ int ummu_allocate_tid(struct ummu_tid_attr *attribute, uint32_t *tid_out)
   int cleanup_status;
   int status;
 
+  kvaf_clear_thread_failure();
   if (attribute == NULL || tid_out == NULL ||
       attribute->mode < MAPT_MODE_TABLE ||
       attribute->mode >= MAPT_MODE_END) {
@@ -1561,6 +1604,7 @@ int ummu_free_tid(uint32_t tid)
   struct kvaf_ummu_tid_state *state;
   int status;
 
+  kvaf_clear_thread_failure();
   status = kvaf_ensure_context();
   if (status != 0) {
     return status;
@@ -1621,11 +1665,34 @@ int kvaf_source_ummu_get_status(struct kvaf_source_ummu_status *status)
   return 0;
 }
 
+int kvaf_source_ummu_get_thread_status(
+    struct kvaf_source_ummu_status *status)
+{
+  if (status == NULL ||
+      status->structure_size < sizeof(struct kvaf_source_ummu_status)) {
+    return -EINVAL;
+  }
+  *status = g_kvaf_ummu_thread_status;
+  status->abi_version = KVAF_SOURCE_UMMU_STATUS_ABI_VERSION;
+  status->structure_size = sizeof(*status);
+  status->capability_magic = KVAF_SOURCE_UMMU_CAPABILITY_MAGIC;
+  status->capability_bits = kvaf_source_ummu_capability();
+  status->live_tid_count = kvaf_source_ummu_live_tid_count();
+  status->pending_operation_count =
+      kvaf_source_ummu_pending_operation_count();
+  status->retained_mapping_count =
+      kvaf_source_ummu_retained_mapping_count();
+  status->last_state_unknown =
+      kvaf_source_ummu_cleanup_is_unknown() != 0 ? 1U : 0U;
+  return 0;
+}
+
 int kvaf_source_ummu_retry_pending(uint32_t tid)
 {
   struct kvaf_ummu_tid_state *state;
   int status;
 
+  kvaf_clear_thread_failure();
   status = kvaf_ensure_context();
   if (status != 0) {
     return status;

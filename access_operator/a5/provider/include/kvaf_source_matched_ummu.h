@@ -32,7 +32,10 @@ enum kvaf_source_ummu_failure_stage {
   KVAF_SOURCE_UMMU_FAILURE_MUNMAP,
   KVAF_SOURCE_UMMU_FAILURE_LIVE_MAPPING,
   KVAF_SOURCE_UMMU_FAILURE_FORKED_PROCESS,
-  KVAF_SOURCE_UMMU_FAILURE_INTERNAL
+  KVAF_SOURCE_UMMU_FAILURE_INTERNAL,
+  KVAF_SOURCE_UMMU_FAILURE_GRANT_STATE_LOOKUP,
+  KVAF_SOURCE_UMMU_FAILURE_GRANT_VALIDATE,
+  KVAF_SOURCE_UMMU_FAILURE_GRANT_BUSY
 };
 
 enum kvaf_source_ummu_retryability {
@@ -77,6 +80,9 @@ struct kvaf_source_ummu_status {
 
 uint64_t kvaf_source_ummu_capability(void);
 int kvaf_source_ummu_get_status(struct kvaf_source_ummu_status *status);
+/* Same-thread causal snapshot for the most recent top-level UMMU operation. */
+int kvaf_source_ummu_get_thread_status(
+    struct kvaf_source_ummu_status *status);
 uint32_t kvaf_source_ummu_live_tid_count(void);
 uint32_t kvaf_source_ummu_pending_operation_count(void);
 uint32_t kvaf_source_ummu_retained_mapping_count(void);

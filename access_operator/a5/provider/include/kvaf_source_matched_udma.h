@@ -114,6 +114,42 @@ int kvaf_udma_source_context_has_live_resources(
     const urma_context_t *context);
 
 /*
+ * The public urma_register_seg() wrapper may allocate/free an implicit token
+ * around the provider call.  Those cleanup calls are allowed to overwrite
+ * errno, so errno observed by the management layer cannot identify whether
+ * validation, UMMU grant, or the kernel register command failed.  Keep the
+ * provider's exact per-thread result out of the public provider ABI.
+ */
+#define KVAF_UDMA_SEGMENT_FAILURE_ABI_VERSION UINT32_C(1)
+
+enum kvaf_udma_segment_failure_stage {
+    KVAF_UDMA_SEGMENT_FAILURE_NONE = 0,
+    KVAF_UDMA_SEGMENT_FAILURE_VALIDATE,
+    KVAF_UDMA_SEGMENT_FAILURE_ALLOCATE_OWNER,
+    KVAF_UDMA_SEGMENT_FAILURE_LOCK_OWNER,
+    KVAF_UDMA_SEGMENT_FAILURE_UMMU_GRANT,
+    KVAF_UDMA_SEGMENT_FAILURE_KERNEL_REGISTER,
+};
+
+struct kvaf_udma_segment_failure {
+    uint32_t abi_version;
+    uint32_t structure_size;
+    uint32_t stage;
+    int32_t operation_status;
+    int32_t operation_errno;
+    int32_t rollback_status;
+    int32_t rollback_errno;
+    uint32_t ummu_tid;
+    uint32_t token_id;
+    uint64_t token_handle;
+    uint64_t address;
+    uint64_t length;
+};
+
+int kvaf_udma_source_get_segment_failure(
+    struct kvaf_udma_segment_failure *failure);
+
+/*
  * A create operation can return NULL after the kernel or UMMU has already
  * acquired a resource.  Such an object is not visible to the caller and must
  * therefore be retried by its owning context before context destruction.

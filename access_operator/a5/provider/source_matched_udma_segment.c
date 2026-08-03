@@ -1,10 +1,12 @@
 #include "kvaf_source_matched_udma.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 
+#include "kvaf_source_matched_ummu.h"
 #include "ummu_api.h"
 
 /*
@@ -32,6 +34,8 @@ struct kvaf_udma_segment_state {
     uint32_t ummu_tid;
     bool kernel_registered;
     bool ummu_granted;
+    bool grant_retry_needed;
+    bool grant_state_unknown;
     bool orphan;
     struct kvaf_udma_segment_state *next;
 };
@@ -40,6 +44,71 @@ static pthread_mutex_t g_kvaf_segment_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct kvaf_udma_segment_state *g_kvaf_segments;
 static uint32_t g_kvaf_segment_count;
 static uint32_t g_kvaf_segment_orphan_count;
+static _Thread_local struct kvaf_udma_segment_failure
+    g_kvaf_segment_failure;
+
+static void kvaf_clear_segment_failure(void)
+{
+    g_kvaf_segment_failure = (struct kvaf_udma_segment_failure) {
+        .abi_version = KVAF_UDMA_SEGMENT_FAILURE_ABI_VERSION,
+        .structure_size = sizeof(g_kvaf_segment_failure),
+    };
+}
+
+static int kvaf_effective_errno(int status, int operation_errno)
+{
+    if (status < 0 && status != -1) {
+        return -status;
+    }
+    if (status > 0) {
+        return status;
+    }
+    if (operation_errno != 0) {
+        return operation_errno;
+    }
+    return EIO;
+}
+
+static void kvaf_record_segment_failure(
+    enum kvaf_udma_segment_failure_stage stage, int operation_status,
+    int operation_errno, int rollback_status, int rollback_errno,
+    const struct udma_u_segment *segment)
+{
+    const struct udma_u_tid *token = segment == NULL ||
+        segment->urma_tseg.token_id == NULL ? NULL :
+        to_udma_u_tid(segment->urma_tseg.token_id);
+
+    g_kvaf_segment_failure = (struct kvaf_udma_segment_failure) {
+        .abi_version = KVAF_UDMA_SEGMENT_FAILURE_ABI_VERSION,
+        .structure_size = sizeof(g_kvaf_segment_failure),
+        .stage = (uint32_t)stage,
+        .operation_status = operation_status,
+        .operation_errno = kvaf_effective_errno(
+            operation_status, operation_errno),
+        .rollback_status = rollback_status,
+        .rollback_errno = rollback_status == 0 ? 0 :
+            kvaf_effective_errno(rollback_status, rollback_errno),
+        .ummu_tid = token == NULL ? UINT32_MAX : token->tid,
+        .token_id = token == NULL ? UINT32_MAX : token->base.token_id,
+        .token_handle = token == NULL ? 0 : token->base.handle,
+        .address = segment == NULL ? 0 :
+            segment->urma_tseg.seg.ubva.va,
+        .length = segment == NULL ? 0 : segment->urma_tseg.seg.len,
+    };
+}
+
+int kvaf_udma_source_get_segment_failure(
+    struct kvaf_udma_segment_failure *failure)
+{
+    if (failure == NULL ||
+        failure->structure_size < sizeof(*failure)) {
+        return -EINVAL;
+    }
+    *failure = g_kvaf_segment_failure;
+    failure->abi_version = KVAF_UDMA_SEGMENT_FAILURE_ABI_VERSION;
+    failure->structure_size = sizeof(*failure);
+    return 0;
+}
 
 static bool kvaf_udma_segment_access_is_supported(uint32_t access)
 {
@@ -138,8 +207,38 @@ uint32_t kvaf_udma_source_orphan_segment_count(void)
 static int kvaf_retry_orphan_segment_locked(
     struct kvaf_udma_segment_state *state)
 {
+    int status;
+
     if (!state->orphan) {
         return 0;
+    }
+    if (state->grant_retry_needed) {
+        struct kvaf_source_ummu_status ummu = {
+            .structure_size = sizeof(ummu),
+        };
+
+        if (state->grant_state_unknown ||
+            kvaf_source_ummu_cleanup_is_unknown() != 0) {
+            return -1;
+        }
+        errno = 0;
+        status = udma_u_grant_segment(state->segment);
+        if (status != 0) {
+            if (kvaf_source_ummu_get_thread_status(&ummu) != 0 ||
+                ummu.last_failure_stage ==
+                    KVAF_SOURCE_UMMU_FAILURE_NONE ||
+                ummu.last_state_unknown != 0U ||
+                ummu.last_retryability ==
+                    KVAF_SOURCE_UMMU_RETRY_UNSAFE) {
+                state->grant_state_unknown = true;
+                kvaf_udma_source_mark_cleanup_unknown();
+            }
+            return -1;
+        }
+        state->ummu_tid = to_udma_u_tid(
+            state->segment->urma_tseg.token_id)->tid;
+        state->ummu_granted = true;
+        state->grant_retry_needed = false;
     }
     if (state->kernel_registered) {
         if (urma_cmd_unregister_seg(&state->segment->urma_tseg) != 0) {
@@ -192,60 +291,129 @@ urma_target_seg_t *udma_u_register_seg(
     struct udma_u_segment *segment;
     int status;
 
+    kvaf_clear_segment_failure();
     if (urma_ctx == NULL || seg_cfg == NULL ||
         !kvaf_udma_segment_access_is_supported(
             seg_cfg->flag.bs.access) ||
         udma_u_check_seg_cfg(seg_cfg) != 0) {
+        kvaf_record_segment_failure(
+            KVAF_UDMA_SEGMENT_FAILURE_VALIDATE, -EINVAL, EINVAL,
+            0, 0, NULL);
+        errno = EINVAL;
         return NULL;
     }
     state = calloc(1, sizeof(*state));
     segment = calloc(1, sizeof(*segment));
     if (state == NULL || segment == NULL) {
+        kvaf_record_segment_failure(
+            KVAF_UDMA_SEGMENT_FAILURE_ALLOCATE_OWNER, -ENOMEM, ENOMEM,
+            0, 0, NULL);
         free(state);
         free(segment);
+        errno = ENOMEM;
         return NULL;
     }
     state->segment = segment;
     state->owner_context = urma_ctx;
     state->orphan = true;
     if (pthread_mutex_lock(&g_kvaf_segment_lock) != 0) {
+        kvaf_record_segment_failure(
+            KVAF_UDMA_SEGMENT_FAILURE_LOCK_OWNER, -EDEADLK, EDEADLK,
+            0, 0, segment);
         free(segment);
         free(state);
+        errno = EDEADLK;
         return NULL;
     }
     /* Own the object before the first lower-level resource is acquired. */
     kvaf_add_segment_locked(state);
     udma_u_init_seg_cfg(urma_ctx, seg_cfg, segment);
 
+    errno = 0;
     status = udma_u_grant_segment(segment);
     if (status != 0) {
-        kvaf_remove_segment_locked(state);
+        const int operation_errno = errno;
+        struct kvaf_source_ummu_status ummu = {
+            .structure_size = sizeof(ummu),
+        };
+        const int ummu_status =
+            kvaf_source_ummu_get_thread_status(&ummu);
+        const bool no_grant_resource_acquired =
+            ummu_status == 0 &&
+            ummu.last_pending_operation ==
+                KVAF_SOURCE_UMMU_PENDING_NONE &&
+            ummu.last_state_unknown == 0U &&
+            (ummu.last_failure_stage ==
+                 KVAF_SOURCE_UMMU_FAILURE_GRANT_VALIDATE ||
+             ummu.last_failure_stage ==
+                 KVAF_SOURCE_UMMU_FAILURE_GRANT_STATE_LOOKUP);
+
+        kvaf_record_segment_failure(
+            KVAF_UDMA_SEGMENT_FAILURE_UMMU_GRANT, status,
+            operation_errno, 0, 0, segment);
+        if (no_grant_resource_acquired) {
+            kvaf_remove_segment_locked(state);
+        } else {
+            /*
+             * A retryable PLBI failure can leave a completed local MAPT
+             * mutation plus PENDING_GRANT_TOKEN_UPDATE.  The Segment address
+             * is the only exact owner which can finish that grant and then
+             * ungrant it.  Keep the orphan sidecar until Close retries both.
+             */
+            state->grant_retry_needed = true;
+            state->grant_state_unknown = ummu_status != 0 ||
+                ummu.last_failure_stage ==
+                    KVAF_SOURCE_UMMU_FAILURE_NONE ||
+                ummu.last_state_unknown != 0U ||
+                ummu.last_retryability ==
+                    KVAF_SOURCE_UMMU_RETRY_UNSAFE;
+            if (state->grant_state_unknown) {
+                kvaf_udma_source_mark_cleanup_unknown();
+            }
+        }
         (void)pthread_mutex_unlock(&g_kvaf_segment_lock);
-        free(segment);
-        free(state);
+        if (no_grant_resource_acquired) {
+            free(segment);
+            free(state);
+        }
+        errno = g_kvaf_segment_failure.operation_errno;
         return NULL;
     }
     state->ummu_granted = true;
     state->ummu_tid =
         to_udma_u_tid(segment->urma_tseg.token_id)->tid;
 
+    errno = 0;
     status = udma_exec_register_seg_cmd(
         urma_ctx, seg_cfg, &segment->urma_tseg);
     if (status != 0) {
-        status = ummu_ungrant(
+        const int operation_status = status;
+        const int operation_errno = errno;
+        int rollback_status;
+        int rollback_errno;
+
+        errno = 0;
+        rollback_status = ummu_ungrant(
             state->ummu_tid,
             (void *)segment->urma_tseg.seg.ubva.va,
             segment->urma_tseg.seg.len);
-        if (status == 0) {
+        rollback_errno = errno;
+        kvaf_record_segment_failure(
+            KVAF_UDMA_SEGMENT_FAILURE_KERNEL_REGISTER,
+            operation_status, operation_errno,
+            rollback_status, rollback_errno, segment);
+        if (rollback_status == 0) {
             state->ummu_granted = false;
             kvaf_remove_segment_locked(state);
             (void)pthread_mutex_unlock(&g_kvaf_segment_lock);
             free(segment);
             free(state);
+            errno = g_kvaf_segment_failure.operation_errno;
             return NULL;
         }
         /* Preserve an ungrantable mapping instead of losing its owner. */
         (void)pthread_mutex_unlock(&g_kvaf_segment_lock);
+        errno = g_kvaf_segment_failure.operation_errno;
         return NULL;
     }
     state->kernel_registered =

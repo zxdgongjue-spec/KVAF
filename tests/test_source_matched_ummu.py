@@ -70,6 +70,38 @@ class SourceMatchedUmmuTests(unittest.TestCase):
             "kvaf_source_ummu_cleanup_is_unknown()", get_status
         )
 
+    def test_causal_failure_snapshot_is_thread_local_and_generation_clean(self):
+        header = HEADER.read_text(encoding="utf-8")
+        runtime = RUNTIME.read_text(encoding="utf-8")
+
+        self.assertIn("kvaf_source_ummu_get_thread_status", header)
+        self.assertIn(
+            "static _Thread_local struct kvaf_source_ummu_status",
+            runtime,
+        )
+        self.assertIn("kvaf_clear_thread_failure", runtime)
+        for operation in (
+            "int ummu_grant(",
+            "int ummu_ungrant(",
+            "int ummu_ungrant_by_token(",
+            "int ummu_allocate_tid(",
+            "int ummu_free_tid(",
+            "int kvaf_source_ummu_retry_pending(",
+        ):
+            start = runtime.index(operation)
+            body = runtime[start:start + 900]
+            self.assertIn("kvaf_clear_thread_failure();", body)
+
+        record_start = runtime.index("static void kvaf_record_failure(")
+        record_end = runtime.index(
+            "\nstatic void kvaf_set_pending(", record_start
+        )
+        record = runtime[record_start:record_end]
+        self.assertLess(
+            record.index("g_kvaf_ummu_thread_status = snapshot"),
+            record.index("pthread_mutex_lock(&g_kvaf_ummu_status_lock)"),
+        )
+
     def test_ungrant_and_free_tid_retain_retry_state(self):
         runtime = RUNTIME.read_text(encoding="utf-8")
 

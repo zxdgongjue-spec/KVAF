@@ -178,6 +178,9 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
             "validate_device_eid",
             "create_context",
             "create_jfc",
+            "allocate_send_token",
+            "allocate_receive_token",
+            "allocate_handshake_token",
             "register_send_segment",
             "register_receive_segment",
             "register_handshake_segment",
@@ -221,6 +224,112 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
         self.assertLess(helper.index("(void)fflush(stderr);"), helper.index(
             "errno = concrete_errno;"
         ))
+
+    def test_segment_failure_survives_public_wrapper_cleanup(self):
+        header = self.read(
+            "access_operator/a5/provider/include/kvaf_source_matched_udma.h"
+        )
+        segment = self.read(
+            "access_operator/a5/provider/source_matched_udma_segment.c"
+        )
+        communication = self.read(
+            "access_operator/a5/provider/source_matched_communication.c"
+        )
+
+        self.assertIn("struct kvaf_udma_segment_failure", header)
+        self.assertIn("KVAF_UDMA_SEGMENT_FAILURE_UMMU_GRANT", header)
+        self.assertIn("KVAF_UDMA_SEGMENT_FAILURE_KERNEL_REGISTER", header)
+        self.assertIn("static _Thread_local struct kvaf_udma_segment_failure", segment)
+        self.assertIn("kvaf_udma_source_get_segment_failure", segment)
+        self.assertIn("rollback_status = ummu_ungrant(", segment)
+        self.assertIn("KVAF_URMA_SEGMENT_ERROR management_stage=%s", communication)
+        self.assertIn("provider_stage=%s operation_status=%d", communication)
+        self.assertIn("ummu_failure_stage=%u", communication)
+        self.assertIn("ummu_state_unknown=%u", communication)
+        for stage in (
+            "register_send_segment",
+            "register_receive_segment",
+            "register_handshake_segment",
+        ):
+            call = communication.index(f'"{stage}", errno, EIO')
+            self.assertIn(
+                "kvaf_ub_segment_registration_error(",
+                communication[max(0, call - 120):call],
+            )
+
+    def test_retryable_grant_failure_retains_exact_segment_owner(self):
+        segment = self.read(
+            "access_operator/a5/provider/source_matched_udma_segment.c"
+        )
+
+        retry_start = segment.index(
+            "static int kvaf_retry_orphan_segment_locked("
+        )
+        retry_end = segment.index(
+            "\nint kvaf_udma_source_retry_orphan_segments(", retry_start
+        )
+        retry = segment[retry_start:retry_end]
+        register_start = segment.index("urma_target_seg_t *udma_u_register_seg(")
+        register_end = segment.index(
+            "\n urma_status_t udma_u_unregister_seg(".lstrip(),
+            register_start,
+        )
+        register = segment[register_start:register_end]
+
+        self.assertIn("grant_retry_needed", segment)
+        self.assertIn("grant_state_unknown", segment)
+        self.assertIn("kvaf_source_ummu_get_thread_status", register)
+        self.assertIn("no_grant_resource_acquired", register)
+        self.assertIn("state->grant_retry_needed = true", register)
+        self.assertIn("udma_u_grant_segment(state->segment)", retry)
+        self.assertLess(
+            retry.index("udma_u_grant_segment(state->segment)"),
+            retry.index("ummu_ungrant("),
+        )
+        self.assertIn("kvaf_udma_source_mark_cleanup_unknown", segment)
+
+    def test_ub_management_explicitly_owns_segment_tokens(self):
+        communication = self.read(
+            "access_operator/a5/provider/source_matched_communication.c"
+        )
+
+        self.assertIn("g_kvaf_ub_management_tokens", communication)
+        self.assertIn(
+            "seg_cfg.flag.bs.token_id_valid = URMA_TOKEN_ID_VALID",
+            communication,
+        )
+        self.assertIn(
+            "KVAF_URMA_TOKEN_ERROR management_stage=%s",
+            communication,
+        )
+        handshake_segment = communication.index(
+            "KVAF_UB_DESTROY(ctx->tseg_recv_hs, urma_unregister_seg)"
+        )
+        handshake_token = communication.index(
+            "g_kvaf_ub_management_tokens[KVAF_UB_MANAGEMENT_HANDSHAKE]",
+            handshake_segment,
+        )
+        receive_segment = communication.index(
+            "KVAF_UB_DESTROY(ctx->tseg_recv, urma_unregister_seg)",
+            handshake_token,
+        )
+        receive_token = communication.index(
+            "g_kvaf_ub_management_tokens[KVAF_UB_MANAGEMENT_RECEIVE]",
+            receive_segment,
+        )
+        send_segment = communication.index(
+            "KVAF_UB_DESTROY(ctx->tseg_send, urma_unregister_seg)",
+            receive_token,
+        )
+        send_token = communication.index(
+            "g_kvaf_ub_management_tokens[KVAF_UB_MANAGEMENT_SEND]",
+            send_segment,
+        )
+        self.assertLess(handshake_segment, handshake_token)
+        self.assertLess(handshake_token, receive_segment)
+        self.assertLess(receive_segment, receive_token)
+        self.assertLess(receive_token, send_segment)
+        self.assertLess(send_segment, send_token)
 
     def test_tcp_connect_retries_share_one_monotonic_deadline(self):
         communication = self.read(

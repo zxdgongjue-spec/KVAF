@@ -841,6 +841,30 @@ direct_source_manifest=${KVAF_VERIFIED_DIRECT_SOURCE_MANIFEST}
 direct_source_manifest_sha=${KVAF_VERIFIED_DIRECT_SOURCE_MANIFEST_SHA}
 direct_runtime_header=${KVAF_VERIFIED_DIRECT_RUNTIME_HEADER}
 
+# Host Segment registration allocates UMMU Token/TID state before it can
+# create any URMA MR.  HAL Host DDR mapping does not provide or replace this
+# character device.  Reject a missing container mount before EID selection,
+# npu-smi, ACL, Host DDR/HBM allocation, or any URMA/UMMU mutation.
+kvaf_ummu_tid_device=/dev/ummu/tid
+if [[ -L "${kvaf_ummu_tid_device}" ||
+      ! -c "${kvaf_ummu_tid_device}" ||
+      ! -r "${kvaf_ummu_tid_device}" ||
+      ! -w "${kvaf_ummu_tid_device}" ]]; then
+  echo "ERROR: required UMMU TID character device is unavailable: ${kvaf_ummu_tid_device}" >&2
+  echo "Mount the Host device into vllm-ascend-cs-kvaf at the identical path." >&2
+  echo "UMMU_TID_DEVICE_MISSING=${kvaf_ummu_tid_device}" >&2
+  echo "No topology/EID/NPU/ACL/DDR/HBM/URMA operation was attempted." >&2
+  exit 2
+fi
+if ! exec {kvaf_ummu_tid_fd}<>"${kvaf_ummu_tid_device}"; then
+  echo "ERROR: cannot open the UMMU TID device read/write: ${kvaf_ummu_tid_device}" >&2
+  echo "Check the Docker device mount, device cgroup and LSM policy." >&2
+  echo "UMMU_TID_DEVICE_OPEN_FAILED=${kvaf_ummu_tid_device}" >&2
+  echo "No topology/EID/NPU/ACL/DDR/HBM/URMA operation was attempted." >&2
+  exit 2
+fi
+exec {kvaf_ummu_tid_fd}>&-
+
 kvaf_result_candidate=$(realpath -m "${KVAF_A5_RESULT_DIR}")
 kvaf_result_parent=${kvaf_result_candidate%/*}
 kvaf_result_name=${kvaf_result_candidate##*/}

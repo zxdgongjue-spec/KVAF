@@ -586,6 +586,7 @@ validate_provider()
     kvaf_udma_source_runtime_is_owned \
     kvaf_udma_source_public_abi_signature \
     kvaf_udma_source_public_abi_matches \
+    kvaf_udma_source_get_segment_failure \
     kvaf_urma_core_has_dynamic_provider_scan_disabled \
     kvaf_udma_source_live_context_count \
     kvaf_udma_source_live_segment_count \
@@ -601,6 +602,7 @@ validate_provider()
     kvaf_udma_source_retry_orphan_cleanup \
     kvaf_source_ummu_capability \
     kvaf_source_ummu_get_status \
+    kvaf_source_ummu_get_thread_status \
     kvaf_source_ummu_live_tid_count \
     kvaf_source_ummu_pending_operation_count \
     kvaf_source_ummu_retained_mapping_count \

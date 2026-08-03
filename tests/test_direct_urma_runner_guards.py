@@ -599,6 +599,42 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
         ):
             self.assertIn(name, self.source)
 
+    def test_ummu_tid_device_is_proven_before_hardware_discovery(self) -> None:
+        runtime = self.source.index(
+            "if ! kvaf_verify_direct_runtime_artifacts_v3; then"
+        )
+        tid_guard = self.source.index(
+            "kvaf_ummu_tid_device=/dev/ummu/tid", runtime
+        )
+        result = self.source.index(
+            'kvaf_result_candidate=$(realpath -m "${KVAF_A5_RESULT_DIR}")',
+            tid_guard,
+        )
+        endpoint = self.source.index(
+            "resolve_a5_urma_endpoints.py", result
+        )
+        idle = self.source.index(
+            "# Take the occupancy snapshot as late as possible", endpoint
+        )
+        block = self.source[tid_guard:result]
+        self.assertIn("! -c", block)
+        self.assertIn("! -r", block)
+        self.assertIn("! -w", block)
+        self.assertIn("UMMU_TID_DEVICE_MISSING", block)
+        self.assertIn(
+            'exec {kvaf_ummu_tid_fd}<>"${kvaf_ummu_tid_device}"',
+            block,
+        )
+        self.assertIn("UMMU_TID_DEVICE_OPEN_FAILED", block)
+        self.assertIn("exec {kvaf_ummu_tid_fd}>&-", block)
+        self.assertIn(
+            "No topology/EID/NPU/ACL/DDR/HBM/URMA operation was attempted.",
+            block,
+        )
+        self.assertLess(tid_guard, result)
+        self.assertLess(tid_guard, endpoint)
+        self.assertLess(tid_guard, idle)
+
     def test_physical_id_is_required_without_acl_topology_side_effects(self) -> None:
         physical_guard = self.source.index(
             'if [[ -z "${KVAF_PHYSICAL_DEVICE_ID}" ]]; then'
