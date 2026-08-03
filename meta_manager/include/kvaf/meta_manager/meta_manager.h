@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -7,7 +8,6 @@
 #include <mutex>
 #include <queue>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "kvaf/status.h"
@@ -15,14 +15,15 @@
 
 namespace kvaf {
 
-// 当前 POC 只支持一种稳定读语义：锁定后允许其它新 key 继续追加，
-// 但不允许把本次锁定的 key 回收掉。
+// 当前 POC 只支持一种稳定读语义：
+// 锁住一批 key 后，允许其他新 key 继续写入，
+// 但不允许这批 key 在解锁前被回收。
 enum class MetaManagerLockMode {
   kStableReadAllowAppend = 0,
 };
 
-// 单个远端 region 的配置。
-// 当前实现把 region 拆成两段：前半段放短 slot，后半段放长 slot。
+// 远端内存区域描述。
+// 当前实现把 region 划分成两段：前半段是 short slot，后半段是 long slot。
 struct RemoteRegionDesc {
   Address base{0};
   std::uint64_t length{0};
@@ -32,140 +33,185 @@ struct RemoteRegionDesc {
   DeviceKind device{DeviceKind::kCpu};
 };
 
-// PreparePut 返回的事务句柄。调用方写完数据后需要带着它继续 Commit/Abort。
+// PreparePut 返回的上下文，后续需要用它继续 Commit 或 Abort。
 struct PutContext {
   std::uint64_t id{0};
 };
 
-// LockKeys 返回的快照句柄。调用方用它把 lock / get / unlock 串起来。
+// LockKeys 返回的上下文，后续需要用它继续 BatchLookup 或 Unlock。
 struct LockContext {
   std::uint64_t id{0};
 };
 
-// 单个 key 本次被分配到的写入地址。
-struct PutAllocation {
-  KeyId key{};
+// 一条对外返回的访问结果。
+// key 是指向内部稳定存储字符串的指针，避免热路径重复复制字符串。
+struct AccessEntry {
+  const KeyId* key{nullptr};
   Address address{0};
-  std::uint64_t reserved_length{0};
+  std::uint64_t length{0};
+  std::uint8_t valid{0};
 };
 
-// PreparePut 返回的一批写入地址描述。
-struct PutAccessDesc {
-  std::vector<PutAllocation> entries;
+// PreparePut / BatchLookup 统一使用这类批量返回结构。
+struct AccessDesc {
+  std::vector<AccessEntry> entries;
 };
 
-// BatchLookup 返回的一批读地址描述，三个数组按相同下标一一对应。
-struct FlatAccessDesc {
-  std::vector<Address> addresses;
-  std::vector<std::uint64_t> lengths;
-  std::vector<std::uint8_t> valid;
-};
+using PutAccessDesc = AccessDesc;
+using FlatAccessDesc = AccessDesc;
 
-// MetaManager 直接持有 POC 所需的全部状态：
-// 1. slot 分配/回收
-// 2. key 到地址记录的映射
-// 3. pending put 和活动 lock 的上下文
 class MetaManager {
  public:
   MetaManager() = default;
 
-  // 注册唯一的远端 region，并初始化短/长 slot 的空闲队列。
   Status RegisterRemoteRegion(const RemoteRegionDesc& region);
-  // 为一批 key 预留地址；真正可见前还需要 CommitPut。
   Status PreparePut(const std::vector<KeyId>& flat_keys,
                     const std::vector<std::uint64_t>& lengths,
                     PutContext* put_context,
                     PutAccessDesc* put_desc);
-  // 把 PreparePut 产生的预留结果提交为正式映射。
   Status CommitPut(const PutContext& put_context);
-  // 放弃一次未提交的 put，并把预留 slot 归还。
   Status AbortPut(const PutContext& put_context);
-  // 固定一批 key，阻止它们在读期间被回收。
   Status LockKeys(const std::vector<KeyId>& flat_keys,
                   MetaManagerLockMode lock_mode,
                   LockContext* lock_context);
-  // 读取 LockKeys 固定下来的地址与长度信息。
   Status BatchLookup(const std::vector<KeyId>& flat_keys,
                      const LockContext& lock_context,
                      FlatAccessDesc* access_desc);
-  // 释放一次稳定读快照。
   Status UnlockKeys(const LockContext& lock_context);
-  // 回收一批 key 当前占用的 slot。
   Status BatchFree(const std::vector<KeyId>& flat_keys);
-  // 控制是否输出每个接口的耗时日志；默认关闭。
   void SetTimingLogEnabled(bool enabled);
+  void SetPerformanceModeEnabled(bool enabled);
 
  private:
-  // slot 按长度分为两类；PreparePut 会根据 payload 长度选择其一。
+  static constexpr std::size_t kKeyShardCount = 64;
+
+  enum class RegionState {
+    kUninitialized = 0,
+    kInitializing,
+    kReady,
+  };
+
+  // slot 根据长度分成两类。
   enum class SlotClass {
     kShort = 0,
     kLong,
   };
 
-  // 内部只保存 slot 类型和 slot 下标，需要对外返回地址时再做换算。
+  // 内部只保存 slot 类型和槽位下标，需要返回真实地址时再换算。
   struct SlotRef {
     SlotClass slot_class{SlotClass::kShort};
     std::size_t slot_index{0};
   };
 
-  // 一条已提交的地址记录。
+  // 一条已提交地址记录。
   struct AddressRecord {
     SlotRef slot;
     std::uint64_t valid_length{0};
-    std::uint32_t pin_count{0};
+    std::atomic<std::uint32_t> pin_count{0};
+
+    AddressRecord() = default;
+
+    AddressRecord(SlotRef slot_value,
+                  std::uint64_t valid_length_value,
+                  std::uint32_t pin_count_value)
+        : slot(slot_value),
+          valid_length(valid_length_value),
+          pin_count(pin_count_value) {}
+
+    AddressRecord(const AddressRecord& other)
+        : slot(other.slot),
+          valid_length(other.valid_length),
+          pin_count(other.pin_count.load(std::memory_order_relaxed)) {}
+
+    AddressRecord& operator=(const AddressRecord& other) {
+      if (this == &other) {
+        return *this;
+      }
+      slot = other.slot;
+      valid_length = other.valid_length;
+      pin_count.store(other.pin_count.load(std::memory_order_relaxed),
+                      std::memory_order_relaxed);
+      return *this;
+    }
   };
 
-  // 当前 POC 中，一个 key 只保留一条 active_record。
+  // 一个 key 的完整生命周期状态。
+  // 这样热路径只需要在所属 shard 内查一次表，
+  // 不必再拆成 active/pending 多张表反复查找。
   struct KeyEntry {
     AddressRecord active_record;
+    bool has_active_record{false};
+    bool is_pending{false};
   };
 
-  // PreparePut 期间暂存的预留项；Commit 前不可见。
+  // 一个 key shard：自己的锁 + 自己那部分 key 元数据。
+  struct KeyShard {
+    std::mutex mutex;
+    std::unordered_map<KeyId, KeyEntry> entries;
+  };
+
+  // PreparePut 暂存但尚未 Commit 的预留项。
   struct PendingPutItem {
-    KeyId key{};
+    std::size_t shard_id{0};
+    KeyEntry* key_entry{nullptr};
+    const KeyId* key{nullptr};
     SlotRef slot;
     std::uint64_t valid_length{0};
   };
 
-  // 一次 PreparePut 对应的上下文。
   struct PendingPutContext {
     std::vector<PendingPutItem> items;
   };
 
-  // 一次 LockKeys 固定下来的 key 列表。
-  struct ActiveLockContext {
-    std::vector<KeyId> keys;
+  // LockKeys 固定下来的记录指针，后续 lookup/unlock 不再重复查表。
+  struct LockedRecordRef {
+    const KeyId* key{nullptr};
+    AddressRecord* record{nullptr};
   };
 
-  // 按 slot 类型和下标换算出真实远端地址。
-  Address SlotAddress(const SlotRef& slot) const;
-  // 根据 payload 长度判断应该落到短 slot 还是长 slot。
-  bool TryResolveSlotClass(std::uint64_t length, SlotClass* slot_class) const;
-  // 从对应空闲队列取出一个 slot。
-  SlotRef AcquireSlot(SlotClass slot_class);
-  // 把 slot 归还到对应空闲队列。
-  void ReleaseSlot(const SlotRef& slot);
+  struct ActiveLockContext {
+    std::vector<LockedRecordRef> items;
+  };
 
-  // 当前实现用一把总锁保护全部元数据状态。
-  std::mutex meta_mutex_;
-  bool region_registered_{false};
+  Address SlotAddress(const SlotRef& slot) const;
+  bool TryResolveSlotClass(std::uint64_t length, SlotClass* slot_class) const;
+  void FillAccessEntry(const KeyId* key,
+                       Address address,
+                       std::uint64_t length,
+                       AccessEntry* entry) const;
+  std::uint32_t LoadPinCount(const AddressRecord& record) const;
+  void IncrementPinCount(AddressRecord* record);
+  void DecrementPinCount(AddressRecord* record);
+  SlotRef AcquireSlot(SlotClass slot_class);
+  void ReleaseSlot(const SlotRef& slot);
+  std::size_t ShardIndexForKey(const KeyId& key) const;
+  void CollectShardPlan(const std::vector<KeyId>& flat_keys,
+                        std::vector<std::size_t>* key_shard_ids,
+                        std::vector<std::size_t>* shard_order) const;
+
+  // region 只允许注册一次；注册后 region_ 只读，因此只需要注册锁。
+  std::atomic<RegionState> region_state_{RegionState::kUninitialized};
   RemoteRegionDesc region_;
-  // 两类 slot 各自维护独立的 FIFO 空闲队列。
+
+  // 两类空闲队列各自独立加锁，不再被全局锁串行化。
+  std::mutex free_queue_mutex_;
   std::queue<std::size_t> short_free_slots_;
   std::queue<std::size_t> long_free_slots_;
-  // 已提交 key、pending put、pending key 和活动读快照。
-  std::unordered_map<KeyId, KeyEntry> key_index_;
+
+  // key 按 shard 切分；不同 shard 之间可以并行操作。
+  std::array<KeyShard, kKeyShardCount> key_shards_;
+
+  // put / lock 上下文统一由 context 锁保护。
+  std::mutex context_mutex_;
   std::unordered_map<std::uint64_t, PendingPutContext> pending_puts_;
-  std::unordered_set<KeyId> pending_keys_;
   std::unordered_map<std::uint64_t, ActiveLockContext> lock_contexts_;
-  // 递增上下文 id，用于标识一次 put 或一次 lock。
   std::uint64_t next_put_context_id_{1};
   std::uint64_t next_lock_context_id_{1};
-  // 计时日志默认关闭，避免影响正常路径。
+
   std::atomic<bool> timing_log_enabled_{false};
+  bool performance_mode_enabled_{false};
 };
 
-// 创建一个基于内存数据结构的 MetaManager POC。
 std::unique_ptr<MetaManager> CreateInMemoryMetaManager();
 
 }  // namespace kvaf

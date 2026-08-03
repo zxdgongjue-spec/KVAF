@@ -2,13 +2,17 @@
 
 #include <chrono>
 #include <iostream>
+#include <string_view>
+#include <unordered_set>
 #include <utility>
 
 namespace kvaf {
 
 namespace {
 
-// 统一内部错误标签，避免每个分支都拼接一套长字符串。
+// 统一的短错误标签，避免不同分支拼接不同格式的字符串。
+constexpr std::size_t kLockKeysGroupedThreshold = 256;
+
 enum class ErrorTag {
   kInvalidRequest,
   kInvalidRegion,
@@ -24,7 +28,6 @@ enum class ErrorTag {
   kUnsupportedMode,
 };
 
-// 把内部错误标签转换成稳定的外部错误消息。
 Status Error(StatusCode code, ErrorTag tag) {
   switch (tag) {
     case ErrorTag::kInvalidRequest:
@@ -56,19 +59,7 @@ Status Error(StatusCode code, ErrorTag tag) {
   return Status::Error(StatusCode::kInternal, "internal_error");
 }
 
-// 批量接口要求 key 唯一，避免重复申请、重复锁定或重复回收。
-bool HasDistinctKeys(const std::vector<KeyId>& keys) {
-  std::unordered_set<KeyId> seen;
-  seen.reserve(keys.size());
-  for (const KeyId& key : keys) {
-    if (!seen.insert(key).second) {
-      return false;
-    }
-  }
-  return true;
-}
-
-// 作用域计时器：函数退出时按需打印耗时，避免每个 return 分支都手动写日志。
+// 作用域计时器：函数退出时按需打印耗时。
 class ScopedMethodTimer {
  public:
   ScopedMethodTimer(const std::atomic<bool>* enabled, const char* method_name)
@@ -81,9 +72,9 @@ class ScopedMethodTimer {
       return;
     }
 
-    const auto end = std::chrono::steady_clock::now();
     const auto elapsed_ns =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(end - start_)
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start_)
             .count();
     std::cout << "[MetaManagerTiming] method=" << method_name_
               << " elapsed_ns=" << elapsed_ns << '\n';
@@ -99,36 +90,57 @@ class ScopedMethodTimer {
 
 Status MetaManager::RegisterRemoteRegion(const RemoteRegionDesc& region) {
   ScopedMethodTimer timer(&timing_log_enabled_, "RegisterRemoteRegion");
-  std::lock_guard<std::mutex> lock(meta_mutex_);
-  if (region_registered_) {
+  if (region_state_.load(std::memory_order_acquire) !=
+      RegionState::kUninitialized) {
     return Error(StatusCode::kAlreadyExists, ErrorTag::kRegionExists);
   }
 
-  // 当前 POC 约束：
-  // 1. 必须同时提供短/长两类 slot
-  // 2. 长 slot 必须严格大于短 slot
-  // 3. 两类 slot 的数量必须相同
+  // 当前 POC 要求：
+  // 1. short / long 两类 slot 都必须存在
+  // 2. long slot 必须严格大于 short slot
+  // 3. 两类 slot 数量相同
   if (region.short_slot_size == 0 || region.long_slot_size == 0 ||
       region.slot_count_per_class == 0 ||
       region.short_slot_size >= region.long_slot_size) {
     return Error(StatusCode::kInvalidArgument, ErrorTag::kInvalidRegion);
   }
 
-  // region 的总长度必须正好等于“短区 + 长区”的总和。
   const std::uint64_t total_slot_size =
       region.short_slot_size + region.long_slot_size;
   if (region.length != region.slot_count_per_class * total_slot_size) {
     return Error(StatusCode::kInvalidArgument, ErrorTag::kInvalidRegion);
   }
 
+  RegionState expected = RegionState::kUninitialized;
+  if (!region_state_.compare_exchange_strong(
+          expected, RegionState::kInitializing, std::memory_order_acq_rel,
+          std::memory_order_acquire)) {
+    return Error(StatusCode::kAlreadyExists, ErrorTag::kRegionExists);
+  }
+
   region_ = region;
-  region_registered_ = true;
-  // 初始化两类空闲队列；下标相同不代表同一地址，只是各自队列里的第几个 slot。
+
   for (std::uint64_t i = 0; i < region.slot_count_per_class; ++i) {
     short_free_slots_.push(static_cast<std::size_t>(i));
     long_free_slots_.push(static_cast<std::size_t>(i));
   }
 
+  const std::size_t max_active_keys =
+      static_cast<std::size_t>(region.slot_count_per_class) * 2u;
+  const std::size_t reserve_per_shard =
+      (max_active_keys + kKeyShardCount - 1u) / kKeyShardCount;
+  for (KeyShard& shard : key_shards_) {
+    shard.entries.max_load_factor(0.5f);
+    shard.entries.reserve(reserve_per_shard);
+  }
+
+  {
+    std::lock_guard<std::mutex> context_lock(context_mutex_);
+    pending_puts_.reserve(1024);
+    lock_contexts_.reserve(1024);
+  }
+
+  region_state_.store(RegionState::kReady, std::memory_order_release);
   return Status::OK();
 }
 
@@ -138,109 +150,207 @@ Status MetaManager::PreparePut(const std::vector<KeyId>& flat_keys,
                                PutAccessDesc* put_desc) {
   ScopedMethodTimer timer(&timing_log_enabled_, "PreparePut");
   if (put_context == nullptr || put_desc == nullptr || flat_keys.empty() ||
-      flat_keys.size() != lengths.size() || !HasDistinctKeys(flat_keys)) {
+      flat_keys.size() != lengths.size()) {
     return Error(StatusCode::kInvalidArgument, ErrorTag::kInvalidRequest);
   }
-
-  std::lock_guard<std::mutex> lock(meta_mutex_);
-  if (!region_registered_) {
+  if (region_state_.load(std::memory_order_acquire) != RegionState::kReady) {
     return Error(StatusCode::kNotInitialized, ErrorTag::kRegionMissing);
   }
 
-  // 先统计本次需要多少短 slot、多少长 slot，避免取了一半才发现队列不够。
-  std::vector<SlotClass> slot_classes;
-  slot_classes.reserve(flat_keys.size());
-
+  // 这一步完全是线程私有工作：先做长度判断。
+  // 默认模式下仍保留批次内重复 key 校验；性能模式可跳过这段预检查。
+  std::vector<SlotClass> slot_classes(flat_keys.size());
+  std::unordered_set<std::string_view> batch_seen;
+  if (!performance_mode_enabled_) {
+    batch_seen.reserve(flat_keys.size());
+  }
   std::size_t short_needed = 0;
   std::size_t long_needed = 0;
   for (std::size_t i = 0; i < flat_keys.size(); ++i) {
-    SlotClass slot_class;
-    if (!TryResolveSlotClass(lengths[i], &slot_class)) {
+    if (!performance_mode_enabled_ && !batch_seen.emplace(flat_keys[i]).second) {
       return Error(StatusCode::kInvalidArgument, ErrorTag::kInvalidRequest);
     }
-    if (key_index_.find(flat_keys[i]) != key_index_.end() ||
-        pending_keys_.find(flat_keys[i]) != pending_keys_.end()) {
-      return Error(StatusCode::kAlreadyExists, ErrorTag::kKeyExists);
+
+    if (!TryResolveSlotClass(lengths[i], &slot_classes[i])) {
+      return Error(StatusCode::kInvalidArgument, ErrorTag::kInvalidRequest);
     }
 
-    slot_classes.push_back(slot_class);
-    if (slot_class == SlotClass::kShort) {
+    if (slot_classes[i] == SlotClass::kShort) {
       ++short_needed;
     } else {
       ++long_needed;
     }
   }
 
+  std::vector<std::size_t> key_shard_ids;
+  std::vector<std::size_t> shard_order;
+  CollectShardPlan(flat_keys, &key_shard_ids, &shard_order);
+
+  // 按 shard id 升序加锁，避免多个线程交叉锁 shard 时死锁。
+  std::vector<std::unique_lock<std::mutex>> shard_locks;
+  shard_locks.reserve(shard_order.size());
+  for (std::size_t shard_id : shard_order) {
+    shard_locks.emplace_back(key_shards_[shard_id].mutex);
+  }
+
+  PendingPutContext pending_context;
+  pending_context.items.reserve(flat_keys.size());
+  std::vector<std::pair<std::size_t, const KeyId*>> new_keys;
+  new_keys.reserve(flat_keys.size());
+
+  auto rollback_new_keys = [&]() {
+    for (auto it = new_keys.rbegin(); it != new_keys.rend(); ++it) {
+      key_shards_[it->first].entries.erase(*it->second);
+    }
+  };
+
+  for (std::size_t i = 0; i < flat_keys.size(); ++i) {
+    KeyShard& shard = key_shards_[key_shard_ids[i]];
+    auto key_it = shard.entries.find(flat_keys[i]);
+    if (key_it == shard.entries.end()) {
+      key_it = shard.entries.emplace(flat_keys[i], KeyEntry{}).first;
+      new_keys.push_back({key_shard_ids[i], &key_it->first});
+    }
+
+    KeyEntry& key_entry = key_it->second;
+    if (key_entry.has_active_record || key_entry.is_pending) {
+      rollback_new_keys();
+      return Error(StatusCode::kAlreadyExists, ErrorTag::kKeyExists);
+    }
+
+    pending_context.items.push_back(PendingPutItem{
+        key_shard_ids[i], &key_entry, &key_it->first,
+        SlotRef{slot_classes[i], 0}, lengths[i]});
+  }
+
+  std::unique_lock<std::mutex> free_queue_lock;
+  if (short_needed > 0 || long_needed > 0) {
+    free_queue_lock = std::unique_lock<std::mutex>(free_queue_mutex_);
+  }
+
   if (short_free_slots_.size() < short_needed ||
       long_free_slots_.size() < long_needed) {
+    rollback_new_keys();
     return Error(StatusCode::kOutOfMemory, ErrorTag::kOutOfSlots);
   }
 
-  const std::uint64_t ctx_id = next_put_context_id_++;
-  PendingPutContext pending_context;
-  pending_context.items.reserve(flat_keys.size());
-
-  // put_desc 是“本次调用的输出缓冲区”，进入前先清空旧结果。
-  put_desc->entries.clear();
-  put_desc->entries.reserve(flat_keys.size());
-
-  for (std::size_t i = 0; i < flat_keys.size(); ++i) {
-    // 这里 slot 已经离开空闲队列，但在 CommitPut 之前仍然对读路径不可见。
-    const SlotRef slot = AcquireSlot(slot_classes[i]);
-    pending_context.items.push_back(
-        PendingPutItem{flat_keys[i], slot, lengths[i]});
-    put_desc->entries.push_back(
-        PutAllocation{flat_keys[i], SlotAddress(slot), lengths[i]});
-    pending_keys_.insert(flat_keys[i]);
+  put_desc->entries.resize(flat_keys.size());
+  for (std::size_t i = 0; i < pending_context.items.size(); ++i) {
+    PendingPutItem& item = pending_context.items[i];
+    item.slot = AcquireSlot(item.slot.slot_class);
+    item.key_entry->is_pending = true;
+    FillAccessEntry(item.key, SlotAddress(item.slot), item.valid_length,
+                    &put_desc->entries[i]);
   }
 
-  pending_puts_.emplace(ctx_id, std::move(pending_context));
-  put_context->id = ctx_id;
+  {
+    std::lock_guard<std::mutex> context_lock(context_mutex_);
+    const std::uint64_t ctx_id = next_put_context_id_++;
+    pending_puts_.emplace(ctx_id, std::move(pending_context));
+    put_context->id = ctx_id;
+  }
+
   return Status::OK();
 }
 
 Status MetaManager::CommitPut(const PutContext& put_context) {
   ScopedMethodTimer timer(&timing_log_enabled_, "CommitPut");
-  std::lock_guard<std::mutex> lock(meta_mutex_);
-  if (!region_registered_) {
+  if (region_state_.load(std::memory_order_acquire) != RegionState::kReady) {
     return Error(StatusCode::kNotInitialized, ErrorTag::kRegionMissing);
   }
 
-  auto pending_it = pending_puts_.find(put_context.id);
-  if (pending_it == pending_puts_.end()) {
-    return Error(StatusCode::kNotFound, ErrorTag::kPutContextMissing);
+  PendingPutContext pending_context;
+  {
+    std::lock_guard<std::mutex> context_lock(context_mutex_);
+    auto pending_it = pending_puts_.find(put_context.id);
+    if (pending_it == pending_puts_.end()) {
+      return Error(StatusCode::kNotFound, ErrorTag::kPutContextMissing);
+    }
+    pending_context = std::move(pending_it->second);
+    pending_puts_.erase(pending_it);
   }
 
-  // CommitPut 是写路径的可见性边界：提交后 key 才进入 key_index_。
-  for (const PendingPutItem& item : pending_it->second.items) {
-    key_index_.emplace(
-        item.key, KeyEntry{AddressRecord{item.slot, item.valid_length, 0}});
-    pending_keys_.erase(item.key);
+  std::array<bool, kKeyShardCount> shard_used{};
+  std::vector<std::size_t> shard_order;
+  for (const PendingPutItem& item : pending_context.items) {
+    if (!shard_used[item.shard_id]) {
+      shard_used[item.shard_id] = true;
+      shard_order.push_back(item.shard_id);
+    }
   }
 
-  pending_puts_.erase(pending_it);
+  std::vector<std::unique_lock<std::mutex>> shard_locks;
+  shard_locks.reserve(shard_order.size());
+  for (std::size_t shard_id : shard_order) {
+    shard_locks.emplace_back(key_shards_[shard_id].mutex);
+  }
+
+  // Commit 是写路径的可见性边界；提交后才变成 active record。
+  for (const PendingPutItem& item : pending_context.items) {
+    if (item.key_entry == nullptr || !item.key_entry->is_pending ||
+        item.key_entry->has_active_record) {
+      return Error(StatusCode::kInvalidState, ErrorTag::kStateConflict);
+    }
+    item.key_entry->is_pending = false;
+    item.key_entry->has_active_record = true;
+    item.key_entry->active_record = {item.slot, item.valid_length, 0};
+  }
+
   return Status::OK();
 }
 
 Status MetaManager::AbortPut(const PutContext& put_context) {
   ScopedMethodTimer timer(&timing_log_enabled_, "AbortPut");
-  std::lock_guard<std::mutex> lock(meta_mutex_);
-  if (!region_registered_) {
+  if (region_state_.load(std::memory_order_acquire) != RegionState::kReady) {
     return Error(StatusCode::kNotInitialized, ErrorTag::kRegionMissing);
   }
 
-  auto pending_it = pending_puts_.find(put_context.id);
-  if (pending_it == pending_puts_.end()) {
-    return Error(StatusCode::kNotFound, ErrorTag::kPutContextMissing);
+  PendingPutContext pending_context;
+  {
+    std::lock_guard<std::mutex> context_lock(context_mutex_);
+    auto pending_it = pending_puts_.find(put_context.id);
+    if (pending_it == pending_puts_.end()) {
+      return Error(StatusCode::kNotFound, ErrorTag::kPutContextMissing);
+    }
+    pending_context = std::move(pending_it->second);
+    pending_puts_.erase(pending_it);
   }
 
-  // AbortPut 回滚一次未提交的 put，把已预留的 slot 重新放回空闲队列。
-  for (const PendingPutItem& item : pending_it->second.items) {
+  std::array<bool, kKeyShardCount> shard_used{};
+  std::vector<std::size_t> shard_order;
+  std::size_t short_count = 0;
+  std::size_t long_count = 0;
+  for (const PendingPutItem& item : pending_context.items) {
+    if (!shard_used[item.shard_id]) {
+      shard_used[item.shard_id] = true;
+      shard_order.push_back(item.shard_id);
+    }
+    if (item.slot.slot_class == SlotClass::kShort) {
+      ++short_count;
+    } else {
+      ++long_count;
+    }
+  }
+
+  std::vector<std::unique_lock<std::mutex>> shard_locks;
+  shard_locks.reserve(shard_order.size());
+  for (std::size_t shard_id : shard_order) {
+    shard_locks.emplace_back(key_shards_[shard_id].mutex);
+  }
+
+  std::unique_lock<std::mutex> free_queue_lock;
+  if (short_count > 0 || long_count > 0) {
+    free_queue_lock = std::unique_lock<std::mutex>(free_queue_mutex_);
+  }
+
+  for (const PendingPutItem& item : pending_context.items) {
+    if (item.key_entry == nullptr || !item.key_entry->is_pending) {
+      return Error(StatusCode::kInvalidState, ErrorTag::kStateConflict);
+    }
+    item.key_entry->is_pending = false;
     ReleaseSlot(item.slot);
-    pending_keys_.erase(item.key);
   }
 
-  pending_puts_.erase(pending_it);
   return Status::OK();
 }
 
@@ -248,33 +358,91 @@ Status MetaManager::LockKeys(const std::vector<KeyId>& flat_keys,
                              MetaManagerLockMode lock_mode,
                              LockContext* lock_context) {
   ScopedMethodTimer timer(&timing_log_enabled_, "LockKeys");
-  if (lock_context == nullptr || flat_keys.empty() ||
-      !HasDistinctKeys(flat_keys)) {
+  if (lock_context == nullptr || flat_keys.empty()) {
     return Error(StatusCode::kInvalidArgument, ErrorTag::kInvalidRequest);
   }
   if (lock_mode != MetaManagerLockMode::kStableReadAllowAppend) {
     return Error(StatusCode::kInvalidArgument, ErrorTag::kUnsupportedMode);
   }
-
-  std::lock_guard<std::mutex> lock(meta_mutex_);
-  if (!region_registered_) {
+  if (region_state_.load(std::memory_order_acquire) != RegionState::kReady) {
     return Error(StatusCode::kNotInitialized, ErrorTag::kRegionMissing);
   }
 
+  ActiveLockContext active_context;
+  std::vector<AddressRecord*> pinned_records;
+  pinned_records.reserve(flat_keys.size());
+
+  auto rollback_pins = [&]() {
+    for (AddressRecord* record : pinned_records) {
+      DecrementPinCount(record);
+    }
+  };
+
+  if (flat_keys.size() < kLockKeysGroupedThreshold) {
+    active_context.items.reserve(flat_keys.size());
+
+  // 逐 key 加 shard 锁，避免先整批做一次 shard 规划、再整批做一次查表。
+  // 在当前 benchmark 的单线程场景里，这条路径比“多锁统一规划”更轻。
   for (const KeyId& key : flat_keys) {
-    if (key_index_.find(key) == key_index_.end()) {
+    KeyShard& shard = key_shards_[ShardIndexForKey(key)];
+    std::lock_guard<std::mutex> shard_lock(shard.mutex);
+    auto key_it = shard.entries.find(key);
+    if (key_it == shard.entries.end() || !key_it->second.has_active_record) {
+      rollback_pins();
       return Error(StatusCode::kNotFound, ErrorTag::kKeyMissing);
+    }
+
+    AddressRecord* record = &key_it->second.active_record;
+    IncrementPinCount(record);
+    pinned_records.push_back(record);
+      active_context.items.push_back(LockedRecordRef{&key_it->first, record});
+    }
+  } else {
+    std::vector<std::size_t> key_shard_ids;
+    std::vector<std::size_t> shard_order;
+    CollectShardPlan(flat_keys, &key_shard_ids, &shard_order);
+
+    std::array<std::size_t, kKeyShardCount> shard_counts{};
+    for (std::size_t shard_id : key_shard_ids) {
+      ++shard_counts[shard_id];
+    }
+
+    std::array<std::vector<std::size_t>, kKeyShardCount> shard_key_indices;
+    for (std::size_t shard_id : shard_order) {
+      shard_key_indices[shard_id].reserve(shard_counts[shard_id]);
+    }
+    for (std::size_t i = 0; i < key_shard_ids.size(); ++i) {
+      shard_key_indices[key_shard_ids[i]].push_back(i);
+    }
+
+    active_context.items.resize(flat_keys.size());
+    for (std::size_t shard_id : shard_order) {
+      KeyShard& shard = key_shards_[shard_id];
+      std::lock_guard<std::mutex> shard_lock(shard.mutex);
+      for (std::size_t key_index : shard_key_indices[shard_id]) {
+        auto key_it = shard.entries.find(flat_keys[key_index]);
+        if (key_it == shard.entries.end() ||
+            !key_it->second.has_active_record) {
+          rollback_pins();
+          return Error(StatusCode::kNotFound, ErrorTag::kKeyMissing);
+        }
+
+        AddressRecord* record = &key_it->second.active_record;
+        IncrementPinCount(record);
+        pinned_records.push_back(record);
+        active_context.items[key_index] =
+            LockedRecordRef{&key_it->first, record};
+      }
     }
   }
 
-  // pin_count 用来阻止并发 BatchFree；只要还有活跃 lock，就不允许回收。
-  for (const KeyId& key : flat_keys) {
-    ++key_index_.find(key)->second.active_record.pin_count;
+  {
+    std::lock_guard<std::mutex> context_lock(context_mutex_);
+    const std::uint64_t ctx_id = next_lock_context_id_++;
+    lock_contexts_.emplace(ctx_id, std::move(active_context));
+    lock_context->id = ctx_id;
   }
 
-  const std::uint64_t ctx_id = next_lock_context_id_++;
-  lock_contexts_.emplace(ctx_id, ActiveLockContext{flat_keys});
-  lock_context->id = ctx_id;
   return Status::OK();
 }
 
@@ -285,99 +453,143 @@ Status MetaManager::BatchLookup(const std::vector<KeyId>& flat_keys,
   if (access_desc == nullptr) {
     return Error(StatusCode::kInvalidArgument, ErrorTag::kInvalidRequest);
   }
-
-  std::lock_guard<std::mutex> lock(meta_mutex_);
-  if (!region_registered_) {
+  if (region_state_.load(std::memory_order_acquire) != RegionState::kReady) {
     return Error(StatusCode::kNotInitialized, ErrorTag::kRegionMissing);
   }
 
-  auto lock_it = lock_contexts_.find(lock_context.id);
-  if (lock_it == lock_contexts_.end()) {
-    return Error(StatusCode::kNotFound, ErrorTag::kLockContextMissing);
-  }
-  // BatchLookup 必须和 LockKeys 使用同一批 key，确保返回结果按同一顺序一一对应。
-  if (lock_it->second.keys != flat_keys) {
-    return Error(StatusCode::kInvalidArgument, ErrorTag::kInvalidRequest);
-  }
-
-  access_desc->addresses.clear();
-  access_desc->lengths.clear();
-  access_desc->valid.clear();
-  access_desc->addresses.reserve(flat_keys.size());
-  access_desc->lengths.reserve(flat_keys.size());
-  access_desc->valid.reserve(flat_keys.size());
-
-  for (const KeyId& key : flat_keys) {
-    auto key_it = key_index_.find(key);
-    if (key_it == key_index_.end()) {
-      return Error(StatusCode::kInvalidState, ErrorTag::kStateConflict);
+  // BatchLookup 只读 lock 上下文；这里持有 context 锁即可保证：
+  // 1. 同一个 lock context 不会在 lookup 途中被 Unlock 删除
+  // 2. 对应 pin_count 在 lookup 期间不会被减到 0
+  std::vector<AccessEntry> snapshot_entries(flat_keys.size());
+  {
+    std::lock_guard<std::mutex> context_lock(context_mutex_);
+    auto lock_it = lock_contexts_.find(lock_context.id);
+    if (lock_it == lock_contexts_.end()) {
+      return Error(StatusCode::kNotFound, ErrorTag::kLockContextMissing);
+    }
+    if (lock_it->second.items.size() != flat_keys.size()) {
+      return Error(StatusCode::kInvalidArgument, ErrorTag::kInvalidRequest);
     }
 
-    // 内部记录只保存 slot 引用；对外返回时再换算成真实地址。
-    const AddressRecord& record = key_it->second.active_record;
-    access_desc->addresses.push_back(SlotAddress(record.slot));
-    access_desc->lengths.push_back(record.valid_length);
-    access_desc->valid.push_back(1);
+    for (std::size_t i = 0; i < lock_it->second.items.size(); ++i) {
+      const LockedRecordRef& item = lock_it->second.items[i];
+      if (item.key == nullptr || item.record == nullptr) {
+        return Error(StatusCode::kInvalidState, ErrorTag::kStateConflict);
+      }
+      if (!performance_mode_enabled_ && *item.key != flat_keys[i]) {
+        return Error(StatusCode::kInvalidArgument, ErrorTag::kInvalidRequest);
+      }
+      FillAccessEntry(item.key, SlotAddress(item.record->slot),
+                      item.record->valid_length, &snapshot_entries[i]);
+    }
   }
 
+  access_desc->entries = std::move(snapshot_entries);
   return Status::OK();
 }
 
 Status MetaManager::UnlockKeys(const LockContext& lock_context) {
   ScopedMethodTimer timer(&timing_log_enabled_, "UnlockKeys");
-  std::lock_guard<std::mutex> lock(meta_mutex_);
-  if (!region_registered_) {
+  if (region_state_.load(std::memory_order_acquire) != RegionState::kReady) {
     return Error(StatusCode::kNotInitialized, ErrorTag::kRegionMissing);
   }
 
-  auto lock_it = lock_contexts_.find(lock_context.id);
-  if (lock_it == lock_contexts_.end()) {
-    return Error(StatusCode::kNotFound, ErrorTag::kLockContextMissing);
+  ActiveLockContext active_context;
+  {
+    std::lock_guard<std::mutex> context_lock(context_mutex_);
+    auto lock_it = lock_contexts_.find(lock_context.id);
+    if (lock_it == lock_contexts_.end()) {
+      return Error(StatusCode::kNotFound, ErrorTag::kLockContextMissing);
+    }
+    active_context = std::move(lock_it->second);
+    lock_contexts_.erase(lock_it);
   }
 
-  // 先整体检查，再统一减 pin_count，避免中途失败留下部分解锁的状态。
-  for (const KeyId& key : lock_it->second.keys) {
-    auto key_it = key_index_.find(key);
-    if (key_it == key_index_.end() || key_it->second.active_record.pin_count == 0) {
+  // Unlock 不再回头做“key 去重 + shard 规划 + 二次加锁”。
+  // lock context 已经缓存了稳定 record 指针，这里直接原子减 pin 即可。
+  for (const LockedRecordRef& item : active_context.items) {
+    if (item.record == nullptr || LoadPinCount(*item.record) == 0) {
       return Error(StatusCode::kInvalidState, ErrorTag::kStateConflict);
     }
   }
 
-  for (const KeyId& key : lock_it->second.keys) {
-    --key_index_.find(key)->second.active_record.pin_count;
+  for (const LockedRecordRef& item : active_context.items) {
+    DecrementPinCount(item.record);
   }
 
-  lock_contexts_.erase(lock_it);
   return Status::OK();
 }
 
 Status MetaManager::BatchFree(const std::vector<KeyId>& flat_keys) {
   ScopedMethodTimer timer(&timing_log_enabled_, "BatchFree");
-  if (flat_keys.empty() || !HasDistinctKeys(flat_keys)) {
+  if (flat_keys.empty()) {
     return Error(StatusCode::kInvalidArgument, ErrorTag::kInvalidRequest);
   }
-
-  std::lock_guard<std::mutex> lock(meta_mutex_);
-  if (!region_registered_) {
+  if (region_state_.load(std::memory_order_acquire) != RegionState::kReady) {
     return Error(StatusCode::kNotInitialized, ErrorTag::kRegionMissing);
   }
 
-  // BatchFree 保持 all-or-nothing：先整批校验，再统一删除和回收。
-  std::vector<SlotRef> slots_to_recycle;
-  slots_to_recycle.reserve(flat_keys.size());
-  for (const KeyId& key : flat_keys) {
-    auto key_it = key_index_.find(key);
-    if (key_it == key_index_.end()) {
-      return Error(StatusCode::kNotFound, ErrorTag::kKeyMissing);
+  // BatchFree 默认保留重复 key 的静默去重；性能模式可跳过，
+  // 由上层保证输入不重复。
+  std::unordered_set<std::string_view> batch_seen;
+  std::vector<KeyId> unique_keys;
+  unique_keys.reserve(flat_keys.size());
+  if (performance_mode_enabled_) {
+    unique_keys = flat_keys;
+  } else {
+    batch_seen.reserve(flat_keys.size());
+    for (const KeyId& key : flat_keys) {
+      if (batch_seen.emplace(key).second) {
+        unique_keys.push_back(key);
+      }
     }
-    if (key_it->second.active_record.pin_count > 0) {
-      return Error(StatusCode::kBusy, ErrorTag::kKeyBusy);
-    }
-    slots_to_recycle.push_back(key_it->second.active_record.slot);
   }
 
-  for (const KeyId& key : flat_keys) {
-    key_index_.erase(key);
+  std::vector<std::size_t> key_shard_ids;
+  std::vector<std::size_t> shard_order;
+  CollectShardPlan(unique_keys, &key_shard_ids, &shard_order);
+
+  std::vector<std::unique_lock<std::mutex>> shard_locks;
+  shard_locks.reserve(shard_order.size());
+  for (std::size_t shard_id : shard_order) {
+    shard_locks.emplace_back(key_shards_[shard_id].mutex);
+  }
+
+  std::vector<SlotRef> slots_to_recycle;
+  slots_to_recycle.reserve(unique_keys.size());
+  std::vector<KeyEntry*> entries_to_clear;
+  entries_to_clear.reserve(unique_keys.size());
+  std::size_t short_count = 0;
+  std::size_t long_count = 0;
+
+  for (std::size_t i = 0; i < unique_keys.size(); ++i) {
+    KeyShard& shard = key_shards_[key_shard_ids[i]];
+    auto key_it = shard.entries.find(unique_keys[i]);
+    if (key_it == shard.entries.end() || !key_it->second.has_active_record) {
+      return Error(StatusCode::kNotFound, ErrorTag::kKeyMissing);
+    }
+    if (LoadPinCount(key_it->second.active_record) > 0) {
+      return Error(StatusCode::kBusy, ErrorTag::kKeyBusy);
+    }
+
+    const SlotRef slot = key_it->second.active_record.slot;
+    if (slot.slot_class == SlotClass::kShort) {
+      ++short_count;
+    } else {
+      ++long_count;
+    }
+    slots_to_recycle.push_back(slot);
+    entries_to_clear.push_back(&key_it->second);
+  }
+
+  std::unique_lock<std::mutex> free_queue_lock;
+  if (short_count > 0 || long_count > 0) {
+    free_queue_lock = std::unique_lock<std::mutex>(free_queue_mutex_);
+  }
+
+  for (KeyEntry* entry : entries_to_clear) {
+    entry->has_active_record = false;
+    entry->active_record = {};
   }
   for (const SlotRef& slot : slots_to_recycle) {
     ReleaseSlot(slot);
@@ -387,7 +599,7 @@ Status MetaManager::BatchFree(const std::vector<KeyId>& flat_keys) {
 }
 
 Address MetaManager::SlotAddress(const SlotRef& slot) const {
-  // region 前半段是短 slot 区，后半段是长 slot 区。
+  // region 前半段是 short slot 区，后半段是 long slot 区。
   if (slot.slot_class == SlotClass::kShort) {
     return region_.base +
            static_cast<Address>(slot.slot_index) * region_.short_slot_size;
@@ -401,7 +613,7 @@ Address MetaManager::SlotAddress(const SlotRef& slot) const {
 
 bool MetaManager::TryResolveSlotClass(std::uint64_t length,
                                       SlotClass* slot_class) const {
-  // 长度为 0 无效；否则优先使用更省空间的短 slot。
+  // 长度为 0 非法；否则优先走更省空间的 short slot。
   if (length == 0 || slot_class == nullptr) {
     return false;
   }
@@ -416,8 +628,39 @@ bool MetaManager::TryResolveSlotClass(std::uint64_t length,
   return false;
 }
 
+void MetaManager::FillAccessEntry(const KeyId* key,
+                                  Address address,
+                                  std::uint64_t length,
+                                  AccessEntry* entry) const {
+  if (entry == nullptr) {
+    return;
+  }
+
+  entry->key = key;
+  entry->address = address;
+  entry->length = length;
+  entry->valid = 1;
+}
+
+std::uint32_t MetaManager::LoadPinCount(const AddressRecord& record) const {
+  return record.pin_count.load(std::memory_order_relaxed);
+}
+
+void MetaManager::IncrementPinCount(AddressRecord* record) {
+  if (record == nullptr) {
+    return;
+  }
+  record->pin_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void MetaManager::DecrementPinCount(AddressRecord* record) {
+  if (record == nullptr) {
+    return;
+  }
+  record->pin_count.fetch_sub(1, std::memory_order_relaxed);
+}
+
 MetaManager::SlotRef MetaManager::AcquireSlot(SlotClass slot_class) {
-  // 两类 slot 各自独立排队，避免不同长度的空间互相挤占。
   std::queue<std::size_t>& free_slots =
       slot_class == SlotClass::kShort ? short_free_slots_ : long_free_slots_;
   const std::size_t slot_index = free_slots.front();
@@ -426,18 +669,45 @@ MetaManager::SlotRef MetaManager::AcquireSlot(SlotClass slot_class) {
 }
 
 void MetaManager::ReleaseSlot(const SlotRef& slot) {
-  // 回收时按 slot 类型放回原来的队列，保持地址空间分层不变。
   std::queue<std::size_t>& free_slots =
       slot.slot_class == SlotClass::kShort ? short_free_slots_ : long_free_slots_;
   free_slots.push(slot.slot_index);
+}
+
+std::size_t MetaManager::ShardIndexForKey(const KeyId& key) const {
+  return std::hash<KeyId>{}(key) % kKeyShardCount;
+}
+
+void MetaManager::CollectShardPlan(const std::vector<KeyId>& flat_keys,
+                                   std::vector<std::size_t>* key_shard_ids,
+                                   std::vector<std::size_t>* shard_order) const {
+  key_shard_ids->resize(flat_keys.size());
+  shard_order->clear();
+
+  std::array<bool, kKeyShardCount> shard_used{};
+  for (std::size_t i = 0; i < flat_keys.size(); ++i) {
+    const std::size_t shard_id = ShardIndexForKey(flat_keys[i]);
+    (*key_shard_ids)[i] = shard_id;
+    shard_used[shard_id] = true;
+  }
+
+  shard_order->reserve(kKeyShardCount);
+  for (std::size_t shard_id = 0; shard_id < kKeyShardCount; ++shard_id) {
+    if (shard_used[shard_id]) {
+      shard_order->push_back(shard_id);
+    }
+  }
 }
 
 void MetaManager::SetTimingLogEnabled(bool enabled) {
   timing_log_enabled_.store(enabled, std::memory_order_relaxed);
 }
 
+void MetaManager::SetPerformanceModeEnabled(bool enabled) {
+  performance_mode_enabled_ = enabled;
+}
+
 std::unique_ptr<MetaManager> CreateInMemoryMetaManager() {
-  // 当前 POC 直接返回一个带完整状态的 MetaManager 实例。
   return std::make_unique<MetaManager>();
 }
 

@@ -216,6 +216,13 @@ sequenceDiagram
 - `BatchFree`
   删除映射并回收 slot。
 
+返回结构说明：
+
+- `PutAccessDesc` 和 `FlatAccessDesc` 统一复用 `AccessDesc`
+- 两者仍保留原有名字，目的是让调用点一眼看出当前处于 put 结果还是 lookup 结果
+- `AccessDesc` 内部只维护一份 `entries`
+- 每个 `AccessEntry` 包含 `key / address / length / valid`
+
 ## 11. 当前实现特点
 
 当前代码中：

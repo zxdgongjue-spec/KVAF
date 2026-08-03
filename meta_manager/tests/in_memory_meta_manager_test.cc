@@ -161,18 +161,31 @@ bool TestPutCommitLookupUnlockFreeRoundTrip() {
                 "BatchLookup should succeed")) {
     return false;
   }
-  if (!Expect(access_desc.addresses ==
-                  std::vector<Address>{kBaseAddress,
-                                       kBaseAddress + kShortSlotSize},
+  if (!Expect(access_desc.entries.size() == 2,
+              "BatchLookup should return one result entry per key")) {
+    return false;
+  }
+  if (!Expect(access_desc.entries[0].address == kBaseAddress &&
+                  access_desc.entries[1].address ==
+                      kBaseAddress + kShortSlotSize,
               "BatchLookup should return committed short addresses")) {
     return false;
   }
-  if (!Expect(access_desc.lengths == lengths,
+  if (!Expect(access_desc.entries[0].length == lengths[0] &&
+                  access_desc.entries[1].length == lengths[1],
               "BatchLookup should return committed lengths")) {
     return false;
   }
-  if (!Expect(access_desc.valid == std::vector<std::uint8_t>{1, 1},
+  if (!Expect(access_desc.entries[0].valid == 1 &&
+                  access_desc.entries[1].valid == 1,
               "BatchLookup should mark committed records valid")) {
+    return false;
+  }
+  if (!Expect(access_desc.entries[0].key != nullptr &&
+                  access_desc.entries[1].key != nullptr &&
+                  *access_desc.entries[0].key == keys[0] &&
+                  *access_desc.entries[1].key == keys[1],
+              "BatchLookup should preserve key order in the returned entries")) {
     return false;
   }
 
@@ -235,8 +248,12 @@ bool TestLongSlotAllocation() {
                 "BatchLookup should succeed for mixed slot classes")) {
     return false;
   }
-  if (!Expect(access_desc.addresses ==
-                  std::vector<Address>{kBaseAddress, LongSlotBase(2)},
+  if (!Expect(access_desc.entries.size() == 2,
+              "BatchLookup should return one result entry per key")) {
+    return false;
+  }
+  if (!Expect(access_desc.entries[0].address == kBaseAddress &&
+                  access_desc.entries[1].address == LongSlotBase(2),
               "BatchLookup should preserve short and long addresses")) {
     return false;
   }
