@@ -239,8 +239,6 @@ echo "WARNING: starting one second-order cross-NPU2 zero-WQE experiment" >&2
 echo "CONTRACT=risk-accepted-cross-npu2-reuse-v2" >&2
 echo "ARTIFACT_TOKEN=${kvaf_token}"
 kvaf_validate_reuse_evidence initial
-kvaf_publish_one_shot_claim
-kvaf_validate_reuse_evidence after-attempt-selection
 
 echo "STAGE=build-versioned-provider"
 bash "${SCRIPT_DIR}/build_a5_direct_urma_provider.sh" \
@@ -280,6 +278,8 @@ export KVAF_CROSS_NPU2_PACKAGE_PROFILE
 export KVAF_CROSS_NPU2_DIRECT_PROFILE
 kvaf_validate_reuse_evidence before-owner-probe
 kvaf_prove_npu2_idle before-owner-probe
+kvaf_publish_one_shot_claim
+kvaf_validate_reuse_evidence after-attempt-selection
 
 echo "STAGE=resource-free-versioned-aicpu-owner-probe"
 set +e

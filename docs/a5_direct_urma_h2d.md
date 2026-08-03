@@ -460,7 +460,8 @@ quarantine 和第一次 NPU2 active/result/PID-start-ticks 证据；任何一项
 probe。probe 只验证该包可被 AICPU loader 加载以及 AIV/AICPU mailbox 可见性，不会
 创建 URMA/UMMU context、MR、Jetty、SQ 或 CQ。
 
-为防止失败后不断换 token 重试，首次通过证据验证后会原子发布只读 one-shot claim：
+为防止硬件探针失败后不断换 token 重试，离线构建、文件校验和 NPU2 idle 校验通过后，
+在第一个 AICPU 硬件探针前会原子发布只读 one-shot claim：
 `/data/.kvaf-state/KVAF/experimental/npu-2-reuse/530f5998a0b646d48db858170a9996ff/30ef7336d212459a9317fd6647f6fa15/attempt.selected`。
 claim 精确绑定 token 和 KVAF commit；一旦存在，新 token 与相同 token 都会被拒绝，
 不能删除 claim 来制造第二次机会。新的运行使用 Jetty 602 和独立 state/result/lock

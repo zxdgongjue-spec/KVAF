@@ -84,15 +84,15 @@ class CrossNpu2ReuseCoordinatorTests(unittest.TestCase):
             "kvaf_validate_reuse_evidence before-zero-wqe-run"
         )
         runner = self.source.index('"${SCRIPT_DIR}/run_a5_direct_urma_h2d_smoke.sh"')
-        self.assertLess(initial, claim)
-        self.assertLess(claim, provider)
+        self.assertLess(initial, provider)
         self.assertLess(provider, provider_recheck)
         self.assertLess(provider_recheck, package)
         self.assertLess(package, package_recheck)
         self.assertLess(package_recheck, direct)
         self.assertLess(direct, direct_recheck)
         self.assertLess(direct_recheck, probe_precheck)
-        self.assertLess(probe_precheck, probe)
+        self.assertLess(probe_precheck, claim)
+        self.assertLess(claim, probe)
         self.assertLess(probe, probe_recheck)
         self.assertLess(probe_recheck, run_precheck)
         self.assertLess(run_precheck, runner)
@@ -118,7 +118,7 @@ class CrossNpu2ReuseCoordinatorTests(unittest.TestCase):
             3,
         )
 
-    def test_attempt_is_atomically_claimed_once_before_any_build(self) -> None:
+    def test_attempt_is_atomically_claimed_once_before_hardware_probe(self) -> None:
         for required in (
             "attempt.selected",
             "schema=kvaf-a5-cross-npu2-reuse-attempt-v1",
@@ -131,10 +131,11 @@ class CrossNpu2ReuseCoordinatorTests(unittest.TestCase):
             "A new token and a same-token retry are both forbidden.",
         ):
             self.assertIn(required, self.source)
-        self.assertLess(
-            self.source.index("kvaf_publish_one_shot_claim\n"),
-            self.source.index('"${SCRIPT_DIR}/build_a5_direct_urma_provider.sh"'),
-        )
+        claim = self.source.index("kvaf_publish_one_shot_claim\n")
+        direct = self.source.index('"${SCRIPT_DIR}/build_a5_direct_urma.sh"')
+        probe = self.source.index('"${KVAF_A5_OWNER_PROBE_BINARY}"')
+        self.assertLess(direct, claim)
+        self.assertLess(claim, probe)
 
     def test_npu2_probe_and_zero_wqe_are_strictly_bounded(self) -> None:
         for required in (
