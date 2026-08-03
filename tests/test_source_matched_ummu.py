@@ -115,13 +115,42 @@ class SourceMatchedUmmuTests(unittest.TestCase):
         self.assertIn("kvaf_retry_data_operation_locked", runtime)
         self.assertIn("kvaf_retry_retained_mappings", runtime)
         self.assertIn("KVAF_UMMU_CLEANUP_PLBI_ALL_DONE", runtime)
-        self.assertIn("KVAF_UMMU_CLEANUP_KERNEL_TID_FREED", runtime)
-        self.assertIn("KVAF_UMMU_CLEANUP_LOCAL_RELEASED", runtime)
-        self.assertIn("kvaf_local_cleanup_unsafe", runtime)
-        self.assertLess(
-            runtime.index("kvaf_send_plbi_checked(state, PLBI_ALL_OP"),
-            runtime.index("kvaf_issue_free_tid_ioctl(state)"),
+        self.assertIn(
+            "KVAF_UMMU_CLEANUP_LOCAL_MAPPINGS_RELEASED", runtime
         )
+        self.assertIn("KVAF_UMMU_CLEANUP_KERNEL_TID_FREED", runtime)
+        self.assertIn("kvaf_local_cleanup_unsafe", runtime)
+        free_start = runtime.index("static int kvaf_free_tid_state_locked(")
+        free_end = runtime.index("\nint ummu_allocate_tid(", free_start)
+        free_tid_state = runtime[free_start:free_end]
+        plbi = free_tid_state.index(
+            "kvaf_send_plbi_checked(state, PLBI_ALL_OP"
+        )
+        local_release = free_tid_state.index(
+            "kvaf_release_local_mapt_locked(state)"
+        )
+        kernel_free = free_tid_state.index(
+            "kvaf_issue_free_tid_ioctl(state)"
+        )
+        self.assertLess(plbi, local_release)
+        self.assertLess(local_release, kernel_free)
+        self.assertIn(
+            "state->cleanup_phase = "
+            "KVAF_UMMU_CLEANUP_LOCAL_MAPPINGS_RELEASED",
+            free_tid_state,
+        )
+
+    def test_udma_token_free_propagates_causal_ummu_errno(self):
+        token = (PROVIDER / "source_matched_udma_tid.c").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertGreaterEqual(token.count("status = ummu_free_tid("), 2)
+        self.assertGreaterEqual(
+            token.count("errno = kvaf_errno_from_ummu_status(status);"), 2
+        )
+        self.assertIn("status >= -4095", token)
+        self.assertIn("return EIO;", token)
 
     def test_free_tid_replay_requires_explicit_kernel_backpressure(self):
         runtime = RUNTIME.read_text(encoding="utf-8")

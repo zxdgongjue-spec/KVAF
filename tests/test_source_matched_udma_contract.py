@@ -144,6 +144,7 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
             "kvaf_udma_source_cleanup_is_unknown() != 0",
             "kvaf_source_ummu_cleanup_is_unknown() != 0",
             "kvaf_source_ummu_reset_thread_status()",
+            '"KVAF_URMA_MGMT_CLOSE_UMMU stage=%s failure_stage=%u "',
             "KVAF_UB_DESTROY_STEP(KVAF_UB_CLOSE_UNIMPORT_TJETTY,",
             "KVAF_UB_DESTROY_STEP(KVAF_UB_CLOSE_DELETE_CONTEXT,",
             "KVAF_PERFTEST_MANAGEMENT_CLOSE_RETRYABLE",
@@ -179,6 +180,17 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
         )
         self.assertLess(jetty_create, jetty_null_check)
         self.assertLess(jetty_null_check, barrier_required)
+        actual_id_check = communication.index(
+            "ctx->pair.jetty->jetty_id.id != cfg->dst_jetty_id",
+            jetty_null_check,
+        )
+        self.assertLess(jetty_null_check, actual_id_check)
+        self.assertLess(actual_id_check, barrier_required)
+        self.assertIn(
+            "g_kvaf_ub_server_jetty_id = "
+            "ctx->pair.jetty->jetty_id.id",
+            communication,
+        )
         self.assertLess(
             communication.index("g_kvaf_ub_server_recv_posts == 2U"),
             communication.index(
@@ -228,8 +240,12 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
             "register_handshake_segment",
             "create_jfr",
             "create_jetty",
+            "validate_server_jetty_id",
             "server_handshake",
-            "client_handshake",
+            "client_parse_peer_eid",
+            "client_import_peer_jetty",
+            "client_post_handshake_send",
+            "client_poll_handshake_cqe",
             "validate_peer_eid",
             "post_client_receive",
         ):
@@ -247,7 +263,7 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
             "urma_create_jfr(",
             "urma_create_jetty(",
             "ub_server_handshake(",
-            "ub_client_handshake(",
+            "if (kvaf_ub_client_handshake_checked(",
             "ub_post_one_recv(",
         ):
             operation_index = communication.index(operation)
@@ -656,7 +672,9 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
         )
         self.assertIn("bool kernel_allocated;", token)
         self.assertIn("bool ummu_allocated;", token)
-        self.assertIn("if (ummu_free_tid(token->tid) != 0)", token)
+        self.assertIn("status = ummu_free_tid(token->tid);", token)
+        self.assertIn("if (status != 0)", token)
+        self.assertIn("errno = kvaf_errno_from_ummu_status(status);", token)
 
     def test_failed_create_orphans_are_context_owned_and_retryable(self):
         segment = self.read(

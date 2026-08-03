@@ -369,12 +369,14 @@ static urma_status_t kvaf_ready_urma_post_jetty_recv_wr(
 #define urma_post_jetty_recv_wr kvaf_ready_urma_post_jetty_recv_wr
 #define ub_establish_connection kvaf_upstream_ub_establish_connection
 #define ub_close_connection kvaf_upstream_ub_close_connection
+#define ub_client_handshake kvaf_upstream_ub_client_handshake
 #define ub_sync_data kvaf_upstream_ub_sync_data
 #define ub_sync_time kvaf_upstream_ub_sync_time
 #define ub_comm_send kvaf_upstream_ub_comm_send
 #define ub_comm_recv kvaf_upstream_ub_comm_recv
 #define ub_comm_poll kvaf_upstream_ub_comm_poll
 #include KVAF_PERFTEST_MGMT_UB_SOURCE
+#undef ub_client_handshake
 #undef ub_comm_poll
 #undef ub_comm_recv
 #undef ub_comm_send
@@ -549,6 +551,20 @@ static int kvaf_ub_destroy_operation_failed(
             /* The source-matched UMMU layer retained the exact TID/token
              * operation and explicitly classified replay as safe. */
             retry_proven = true;
+        }
+        if (kvaf_ub_should_log_close_attempt(g_kvaf_ub_close_attempt) ||
+            state_ambiguous) {
+            (void)fprintf(stderr,
+                "KVAF_URMA_MGMT_CLOSE_UMMU stage=%s failure_stage=%u "
+                "tid=%u pending_operation=%u live_tids=%u pending=%u "
+                "retained=%u address=0x%llx length=%llu\n",
+                kvaf_ub_close_phase_name(phase),
+                ummu.last_failure_stage, ummu.last_tid,
+                ummu.last_pending_operation, ummu.live_tid_count,
+                ummu.pending_operation_count, ummu.retained_mapping_count,
+                (unsigned long long)ummu.last_address,
+                (unsigned long long)ummu.last_length);
+            (void)fflush(stderr);
         }
     }
     return kvaf_ub_close_operation_failed(
@@ -976,6 +992,16 @@ static int kvaf_ub_create_local_resources_checked(
         return kvaf_ub_management_error(
             "create_jetty", errno, EIO);
     }
+    if (ctx->is_server &&
+        ctx->pair.jetty->jetty_id.id != cfg->dst_jetty_id) {
+        (void)fprintf(stderr,
+            "KVAF_URMA_MGMT_JETTY_ID_MISMATCH "
+            "requested=%u actual=%u\n",
+            cfg->dst_jetty_id, ctx->pair.jetty->jetty_id.id);
+        (void)fflush(stderr);
+        return kvaf_ub_management_error(
+            "validate_server_jetty_id", EPROTO, EPROTO);
+    }
     kvaf_ub_send_tracker_require_flush_barrier(
         &g_kvaf_ub_send_tracker);
     return 0;
@@ -990,6 +1016,65 @@ static bool kvaf_ub_peer_matches(const char *expected_peer_eid)
         g_ub_ctx != NULL && g_ub_ctx->pair.tjetty != NULL &&
         memcmp(&expected, &g_ub_ctx->pair.tjetty->id.eid,
             sizeof(expected)) == 0;
+}
+
+/* The upstream UB helper collapses every client-handshake failure to -1 and
+ * commonly leaves errno unset.  Keep its wire protocol source-identical while
+ * naming the exact failing operation so AICPU Open evidence can distinguish a
+ * route/import failure from a SEND or CQ failure. */
+static int kvaf_ub_client_handshake_checked(
+    ub_mgmt_ctx_t *ctx, const char *peer_eid_str, uint32_t peer_jetty_id)
+{
+    urma_eid_t peer_eid = {0};
+    urma_rjetty_t rjetty = {0};
+    urma_sge_t sge = {0};
+    urma_jfs_wr_t wr = {0};
+    urma_jfs_wr_t *bad = NULL;
+    urma_cr_t cr = {0};
+    urma_status_t post_status;
+    int operation_errno;
+
+    errno = 0;
+    if (urma_str_to_eid(peer_eid_str, &peer_eid) != 0) {
+        return kvaf_ub_management_error(
+            "client_parse_peer_eid", errno, EINVAL);
+    }
+    fill_rjetty(peer_eid, peer_jetty_id, &rjetty);
+    errno = 0;
+    ctx->pair.tjetty =
+        urma_import_jetty(ctx->urma_ctx, &rjetty, &g_ub_mgmt_token);
+    if (ctx->pair.tjetty == NULL) {
+        return kvaf_ub_management_error(
+            "client_import_peer_jetty", errno, EIO);
+    }
+
+    ctx->send_buf[0] = 'H';
+    sge.addr = (uint64_t)ctx->send_buf;
+    sge.len = UB_MGMT_HANDSHAKE_SIZE;
+    sge.tseg = ctx->tseg_send;
+    wr.opcode = URMA_OPC_SEND;
+    wr.flag.value = 0;
+    wr.flag.bs.complete_enable = 1;
+    wr.tjetty = ctx->pair.tjetty;
+    wr.user_ctx = 0;
+    wr.send.src.sge = &sge;
+    wr.send.src.num_sge = 1;
+    wr.send.imm_data = 0;
+    wr.next = NULL;
+    errno = 0;
+    post_status = kvaf_tracking_urma_post_jetty_send_wr(
+        ctx->pair.jetty, &wr, &bad);
+    operation_errno = errno;
+    if (post_status != URMA_SUCCESS) {
+        return kvaf_ub_management_error(
+            "client_post_handshake_send", operation_errno, EIO);
+    }
+    errno = 0;
+    if (poll_one_cqe(ctx->jfc, &cr, true) != 0) {
+        return kvaf_ub_management_error(
+            "client_poll_handshake_cqe", errno, EIO);
+    }
+    return 0;
 }
 
 static int kvaf_ub_establish_connection(
@@ -1024,7 +1109,7 @@ static int kvaf_ub_establish_connection(
     if (ctx->is_server) {
         g_kvaf_ub_server_arming = true;
         g_kvaf_ub_server_recv_posts = 0;
-        g_kvaf_ub_server_jetty_id = ub_cfg.dst_jetty_id;
+        g_kvaf_ub_server_jetty_id = ctx->pair.jetty->jetty_id.id;
         (void)snprintf(g_kvaf_ub_server_local_eid,
             sizeof(g_kvaf_ub_server_local_eid), "%s", ub_cfg.src_eid);
         errno = 0;
@@ -1038,7 +1123,7 @@ static int kvaf_ub_establish_connection(
         g_kvaf_ub_server_arming = false;
     } else {
         errno = 0;
-        if (ub_client_handshake(
+        if (kvaf_ub_client_handshake_checked(
                 ctx, ub_cfg.dst_eid, ub_cfg.dst_jetty_id) != 0) {
             return kvaf_ub_management_error(
                 "client_handshake", errno, EIO);

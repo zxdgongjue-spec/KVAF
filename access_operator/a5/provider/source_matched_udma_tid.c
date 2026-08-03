@@ -33,6 +33,19 @@ static struct kvaf_udma_token_state *g_kvaf_tokens;
 static uint32_t g_kvaf_token_count;
 static uint32_t g_kvaf_token_orphan_count;
 
+static int kvaf_errno_from_ummu_status(int status)
+{
+    /* Linux errno values occupy [1, 4095].  Avoid negating INT_MIN or
+     * exporting an arbitrary positive library status as errno. */
+    if (status > 0 && status <= 4095) {
+        return status;
+    }
+    if (status < 0 && status >= -4095) {
+        return -status;
+    }
+    return EIO;
+}
+
 static void kvaf_add_token_locked(struct kvaf_udma_token_state *state)
 {
     state->next = g_kvaf_tokens;
@@ -118,6 +131,8 @@ uint32_t kvaf_udma_source_orphan_token_count(void)
 static int kvaf_retry_orphan_token_locked(
     struct kvaf_udma_token_state *state)
 {
+    int status;
+
     if (!state->orphan) {
         return 0;
     }
@@ -128,7 +143,9 @@ static int kvaf_retry_orphan_token_locked(
         state->kernel_allocated = false;
     }
     if (state->ummu_allocated) {
-        if (ummu_free_tid(state->token->tid) != 0) {
+        status = ummu_free_tid(state->token->tid);
+        if (status != 0) {
+            errno = kvaf_errno_from_ummu_status(status);
             return -1;
         }
         state->ummu_allocated = false;
@@ -254,6 +271,7 @@ urma_status_t udma_u_free_tid(urma_token_id_t *token_id)
 {
     struct udma_u_tid *token;
     struct kvaf_udma_token_state *state;
+    int status;
 
     if (token_id == NULL ||
         pthread_mutex_lock(&g_kvaf_token_lock) != 0) {
@@ -274,8 +292,10 @@ urma_status_t udma_u_free_tid(urma_token_id_t *token_id)
         state->kernel_allocated = false;
     }
     if (state->ummu_allocated) {
-        if (ummu_free_tid(token->tid) != 0) {
+        status = ummu_free_tid(token->tid);
+        if (status != 0) {
             /* A retry skips the completed kernel free. */
+            errno = kvaf_errno_from_ummu_status(status);
             (void)pthread_mutex_unlock(&g_kvaf_token_lock);
             return URMA_FAIL;
         }

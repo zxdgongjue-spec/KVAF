@@ -58,8 +58,8 @@ static inline uint64_t kvaf_ummu_uapi_hw_cap(
 enum kvaf_ummu_cleanup_phase {
   KVAF_UMMU_CLEANUP_ACTIVE = 0,
   KVAF_UMMU_CLEANUP_PLBI_ALL_DONE,
-  KVAF_UMMU_CLEANUP_KERNEL_TID_FREED,
-  KVAF_UMMU_CLEANUP_LOCAL_RELEASED
+  KVAF_UMMU_CLEANUP_LOCAL_MAPPINGS_RELEASED,
+  KVAF_UMMU_CLEANUP_KERNEL_TID_FREED
 };
 
 struct kvaf_ummu_tid_state {
@@ -1542,20 +1542,27 @@ static int kvaf_free_tid_state_locked(
     state->cleanup_phase = KVAF_UMMU_CLEANUP_PLBI_ALL_DONE;
   }
   if (state->cleanup_phase == KVAF_UMMU_CLEANUP_PLBI_ALL_DONE) {
-    status = kvaf_issue_free_tid_ioctl(state);
-    if (status != 0) {
-      goto unlock;
-    }
-    state->cleanup_phase = KVAF_UMMU_CLEANUP_KERNEL_TID_FREED;
-  }
-  if (state->cleanup_phase == KVAF_UMMU_CLEANUP_KERNEL_TID_FREED) {
+    /* Match the paired official libummu lifetime: its ummu_free_tid() first
+     * destroys MAPT/core/queue mappings and only then submits FREE_TID.  The
+     * running A5 driver can reject FREE_TID with EBUSY while those mappings
+     * are still owned by this process.  Reversing that order creates a
+     * permanent dependency cycle because the old cursor released mappings
+     * only after FREE_TID succeeded. */
     status = state->mapt == NULL
         ? kvaf_retry_retained_mappings(state)
         : kvaf_release_local_mapt_locked(state);
     if (status != 0) {
       goto unlock;
     }
-    state->cleanup_phase = KVAF_UMMU_CLEANUP_LOCAL_RELEASED;
+    state->cleanup_phase = KVAF_UMMU_CLEANUP_LOCAL_MAPPINGS_RELEASED;
+  }
+  if (state->cleanup_phase ==
+      KVAF_UMMU_CLEANUP_LOCAL_MAPPINGS_RELEASED) {
+    status = kvaf_issue_free_tid_ioctl(state);
+    if (status != 0) {
+      goto unlock;
+    }
+    state->cleanup_phase = KVAF_UMMU_CLEANUP_KERNEL_TID_FREED;
   }
   status = 0;
 
@@ -1571,7 +1578,7 @@ unlock:
     }
   }
   if (status != 0 ||
-      state->cleanup_phase != KVAF_UMMU_CLEANUP_LOCAL_RELEASED) {
+      state->cleanup_phase != KVAF_UMMU_CLEANUP_KERNEL_TID_FREED) {
     return status == 0 ? -EUCLEAN : status;
   }
   if (state->mappings.head != NULL ||

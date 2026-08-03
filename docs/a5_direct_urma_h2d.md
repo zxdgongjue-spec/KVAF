@@ -607,6 +607,17 @@ TABLE 存储与 queue mapping 分别记录释放 phase；因此 table 已释放�
 `munmap` 暂时失败时，重入只继续 queue 阶段，不会重放 `FREE_TID` 或把已完成的 table
 释放误判成永久 `EBUSY`。
 
+TID 的最终销毁顺序与配套官方 `libummu` 保持一致：`PLBI_ALL` 后先释放
+MAPT/core/queue userspace mapping，再提交内核 `FREE_TID`。如果先发 `FREE_TID`，
+当前驱动会在本进程仍持有 mapping 时持续返回 `EBUSY`；而旧实现又只在
+`FREE_TID` 成功后释放 mapping，形成没有外部进度源的永久循环。每次失败同时输出
+UMMU failure stage、pending operation、TID、live/pending/retained 数量和地址范围，
+UDMA Token 层保留并向上传递该次 UMMU 的真实 errno。
+
+UB server 只有在内核返回的实际 management Jetty ID 与请求值完全一致时才发布
+READY。client 将 EID 解析、peer Jetty import、握手 SEND 和 CQE poll 分别记录为
+独立失败阶段，避免再次把毫秒级本地 import/post 错误折叠成笼统的握手超时。
+
 生产 runner 继续默认 fail closed；只有显式的
 `run_a5_direct_urma_epoch_owner_validation.sh` 才能执行候选真机验证。候选 owner
 解决了 split Open/Close 的所有权缺口，但普通 KFC worker 是否允许跨整个模型
@@ -626,6 +637,16 @@ cross-NPU 风险接受变量，继续使用生产 active/quarantine 和全部历
 active/quarantine 尚未闭环，该入口会在 topology、ACL、DDR/HBM、URMA 之前失败；
 它不会删除状态、发送信号或在线覆盖 AICPU package。完成复位/操作系统重启，并用
 当前 checkout 重新构建 provider、安装 AICPU package 和 direct binary 后才能运行。
+
+OS reboot 会清除旧进程和设备状态，但不会清除 `/data` 中的恢复 barrier。在服务器 B
+宿主机先更新到目标提交，再运行
+`scripts/reconcile_a5_direct_urma_after_reboot.sh prepare` 固化一次性 boot proof，并立即
+重启；重连后不要先启动 Docker 或任何 KVAF/cross-NPU 入口，应在同一 checkout HEAD
+首先运行同一脚本的 `retire`。后者校验 boot ID、脚本/helper/HEAD 和原 marker 的
+identity/SHA-256，持有 canonical、legacy、cross/reuse 全部协调锁，并确认没有 KVAF
+direct-URMA 进程后，才把旧 marker 连同旧/新 boot ID 归档到
+`retired-after-reboot/`，然后移除 canonical barrier。结果、lock 文件和所有 cross-NPU
+实验证据不会被移动或删除；proof 被消费后不能用于跳过另一次真实重启。
 
 一次调用严格按以下顺序建立三个独立验证 epoch，前一阶段非 PASS 就停止：
 
