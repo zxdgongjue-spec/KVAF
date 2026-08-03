@@ -322,6 +322,12 @@ class DirectUrmaSourceSyntaxTests(unittest.TestCase):
             "std::to_string(impl_->result.status)",
             "std::to_string(impl_->result.provider_status)",
             "std::to_string(ready_status.result_code)",
+            '" management_stage="',
+            '" management_raw_errno="',
+            '" management_effective_errno="',
+            '" management_operation_status="',
+            '" management_completion_status="',
+            "FormatManagementDiagnostic(impl_->result)",
         ):
             self.assertIn(field, self.resources_source)
 

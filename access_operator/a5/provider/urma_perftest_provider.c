@@ -176,6 +176,45 @@ static void kvaf_init_result(struct kvaf_urma_provider_result_v2 *result,
     result->provider_status = provider_status;
 }
 
+static uint64_t kvaf_pack_signed_pair(int32_t low, int32_t high)
+{
+    return (uint64_t)(uint32_t)low |
+        ((uint64_t)(uint32_t)high << 32U);
+}
+
+static void kvaf_attach_management_diagnostic(
+    struct kvaf_urma_provider_result_v2 *result)
+{
+    struct kvaf_perftest_management_diagnostic_v1 diagnostic = {
+        .structure_size = sizeof(diagnostic),
+        .abi_version = KVAF_URMA_MANAGEMENT_DIAGNOSTIC_VERSION,
+    };
+
+    if (kvaf_perftest_management_diagnostic_get(&diagnostic) != 0 ||
+        diagnostic.structure_size != sizeof(diagnostic) ||
+        diagnostic.abi_version !=
+            KVAF_URMA_MANAGEMENT_DIAGNOSTIC_VERSION ||
+        diagnostic.stage == KVAF_URMA_MANAGEMENT_STAGE_NONE) {
+        return;
+    }
+    result->reserved[KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_STAGE] =
+        (uint64_t)diagnostic.stage |
+        ((uint64_t)diagnostic.abi_version << 32U);
+    result->reserved[KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_ERRNO] =
+        kvaf_pack_signed_pair(
+            diagnostic.raw_errno, diagnostic.effective_errno);
+    result->reserved[KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_STATUS] =
+        kvaf_pack_signed_pair(
+            diagnostic.operation_status,
+            diagnostic.completion_status);
+    result->reserved[KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_FLAGS] =
+        diagnostic.flags;
+    /* Publish the validity marker last so a progress reader cannot accept a
+     * partially populated diagnostic payload. */
+    result->reserved[KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_MAGIC] =
+        KVAF_URMA_MANAGEMENT_DIAGNOSTIC_MAGIC;
+}
+
 static bool kvaf_config_is_valid(
     const struct kvaf_urma_provider_config_v2 *config)
 {
@@ -725,6 +764,10 @@ int kvaf_urma_provider_open_v2(
         return -1;
     }
     kvaf_init_result(result, KVAF_URMA_PROVIDER_INVALID_ARGUMENT, -1);
+    /* A provider instance can serve multiple sequential sessions. Clear the
+     * thread-local diagnostic before any early-return/fail path so one Open
+     * can never report a leaf failure from an older session. */
+    kvaf_perftest_management_diagnostic_reset();
     if (!kvaf_config_is_valid(config)) {
         return -1;
     }
@@ -891,6 +934,10 @@ int kvaf_urma_provider_open_v2(
     return 0;
 
 fail:
+    /* Snapshot the first management leaf failure before checked teardown can
+     * execute secondary management operations on the same thread. This also
+     * covers failures discovered after the initial connection handshake. */
+    kvaf_attach_management_diagnostic(result);
     ret = kvaf_close_unlocked(config->session_id);
     if (ret == KVAF_URMA_PROVIDER_CLOSE_RETRYABLE) {
         /*

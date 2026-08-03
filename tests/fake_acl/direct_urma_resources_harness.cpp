@@ -178,6 +178,17 @@ int main(int argc, char** argv) {
         (open.message().find("provider_result_status=5") ==
              std::string::npos ||
          open.message().find("owner_result_code=2") ==
+             std::string::npos ||
+         open.message().find(
+             "management_stage=client_get_tp_list") ==
+             std::string::npos ||
+         open.message().find("management_raw_errno=0") ==
+             std::string::npos ||
+         open.message().find("management_effective_errno=5") ==
+             std::string::npos ||
+         open.message().find("management_operation_status=-5") ==
+             std::string::npos ||
+         open.message().find("management_diagnostic_flags=7") ==
              std::string::npos)) {
       return Fail("late failed Open lost exact diagnostics");
     }

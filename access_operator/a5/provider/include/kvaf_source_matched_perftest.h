@@ -31,6 +31,27 @@ enum kvaf_perftest_checked_status {
   KVAF_PERFTEST_CHECKED_CREATE_CLEANUP_REQUIRED = -5,
 };
 
+/*
+ * Thread-local leaf failure captured by the source-matched UB management
+ * backend.  Outer wrappers such as client_handshake must not replace an
+ * already-recorded leaf stage.  Open snapshots the record before checked
+ * Close can execute another management operation on the same thread.
+ */
+struct kvaf_perftest_management_diagnostic_v1 {
+  uint32_t structure_size;
+  uint32_t abi_version;
+  uint32_t stage;
+  uint32_t flags;
+  int32_t raw_errno;
+  int32_t effective_errno;
+  int32_t operation_status;
+  int32_t completion_status;
+};
+
+void kvaf_perftest_management_diagnostic_reset(void);
+int kvaf_perftest_management_diagnostic_get(
+    struct kvaf_perftest_management_diagnostic_v1 *diagnostic);
+
 enum kvaf_perftest_teardown_phase {
   KVAF_PERFTEST_TEARDOWN_NOT_STARTED = 0,
   KVAF_PERFTEST_TEARDOWN_RUN_CONTEXT = 1,

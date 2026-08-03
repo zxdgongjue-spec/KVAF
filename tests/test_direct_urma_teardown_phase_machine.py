@@ -409,6 +409,73 @@ class DirectUrmaTeardownPhaseMachineTests(unittest.TestCase):
             self.provider_source,
         )
 
+    def test_tp_metadata_is_ready_before_data_jetty_import(self) -> None:
+        create_start = self.perftest_source.index(
+            "int kvaf_perftest_create_duplex_ctx_checked("
+        )
+        create_end = self.perftest_source.index(
+            "int kvaf_perftest_confirm_provider_ready(", create_start
+        )
+        create = self.perftest_source[create_start:create_end]
+        segment_exchange = create.index("exchange_seg_info(ctx, cfg)")
+        jetty_exchange = create.index("exchange_jetty_id(ctx, cfg)")
+        tp_create = create.index(
+            "kvaf_create_fixed_ctp_info_checked(ctx, cfg)"
+        )
+        import_segment = create.index("import_seg_for_duplex(ctx, cfg)")
+        connect = create.index(
+            "kvaf_connect_fixed_ctp_jetty_checked(ctx, cfg)"
+        )
+        self.assertLess(segment_exchange, jetty_exchange)
+        self.assertLess(jetty_exchange, tp_create)
+        self.assertLess(tp_create, import_segment)
+        self.assertLess(import_segment, connect)
+        self.assertNotIn("exchange_connection_info(ctx, cfg)", create)
+        self.assertNotIn("if (connect_jetty(ctx, cfg)", create)
+
+        helper_start = self.perftest_source.index(
+            "static int kvaf_create_fixed_ctp_info_checked("
+        )
+        helper_end = self.perftest_source.index(
+            "static int kvaf_connect_fixed_ctp_jetty_checked(",
+            helper_start,
+        )
+        helper = self.perftest_source[helper_start:helper_end]
+        self.assertIn("ctx->tp_info != NULL", helper)
+        self.assertIn("create_tp_info(ctx, cfg)", helper)
+
+    def test_checked_ctp_connect_retains_import_for_retryable_teardown(
+        self,
+    ) -> None:
+        helper_start = self.perftest_source.index(
+            "static int kvaf_connect_fixed_ctp_jetty_checked("
+        )
+        helper_end = self.perftest_source.index(
+            "static void kvaf_teardown_set_cursor(", helper_start
+        )
+        helper = self.perftest_source[helper_start:helper_end]
+        self.assertIn("urma_import_jetty_ex(", helper)
+        self.assertIn("remote_jetty.tp_type = URMA_CTP", helper)
+        self.assertNotIn("urma_unimport_jetty", helper)
+        self.assertNotIn("free(ctx->import_tjetty)", helper)
+
+        create_start = self.perftest_source.index(
+            "int kvaf_perftest_create_duplex_ctx_checked("
+        )
+        create_end = self.perftest_source.index(
+            "int kvaf_perftest_confirm_provider_ready(", create_start
+        )
+        create = self.perftest_source[create_start:create_end]
+        connect = create.index(
+            "status = kvaf_connect_fixed_ctp_jetty_checked(ctx, cfg);"
+        )
+        barrier = create.index(
+            "cfg, KVAF_CHECKED_PHASE_CONNECT_DONE, status", connect
+        )
+        cleanup_return = create.index("return phase_status;", barrier)
+        self.assertLess(connect, barrier)
+        self.assertLess(barrier, cleanup_return)
+
     def test_close_requires_all_private_live_counts_to_reach_zero(
         self,
     ) -> None:

@@ -167,6 +167,13 @@ static int kvaf_create_duplex_queues_public(
     }
 
     fill_jfs_cfg(ctx, cfg, cfg->inline_size, &jfs_cfg);
+    /*
+     * A direct AIV queue must stop after the first transport or memory
+     * error.  Continuing to consume raw SQ entries after such an error can
+     * make the software CQ cursor diverge from the device and turns a
+     * recoverable request failure into a queue that requires an NPU reset.
+     */
+    jfs_cfg.flag.bs.error_suspend = 1;
     fill_jfr_cfg(ctx, cfg, &jfr_cfg);
     jetty_flag.bs.share_jfr = cfg->share_jfr ? 1 : 0;
     jetty_cfg.flag = jetty_flag;
@@ -264,6 +271,72 @@ static int kvaf_register_memory_checked(
     }
     ctx->local_tseg[0] = urma_register_seg(ctx->urma_ctx, &seg_cfg);
     return ctx->local_tseg[0] == NULL ? -1 : 0;
+}
+
+static int kvaf_create_fixed_ctp_info_checked(
+    perftest_context_t *ctx, perftest_config_t *cfg)
+{
+    if (ctx == NULL || cfg == NULL || ctx->urma_ctx == NULL ||
+        ctx->remote_jetty_id == NULL || ctx->jetty_num != 1U ||
+        !cfg->tp_aware || !cfg->use_ctp ||
+        cfg->trans_mode != URMA_TM_RM || cfg->uboe ||
+        ctx->tp_info != NULL) {
+        return -1;
+    }
+
+    /*
+     * Do this local operation only after both fixed wire exchanges complete.
+     * Unlike upstream exchange_connection_info(), the caller can then report
+     * a get_tp_list failure in a matching phase frame, so both endpoints can
+     * enter the checked teardown state machine instead of poisoning the
+     * session merely because one local TP lookup failed.
+     */
+    return create_tp_info(ctx, cfg);
+}
+
+static int kvaf_connect_fixed_ctp_jetty_checked(
+    perftest_context_t *ctx, perftest_config_t *cfg)
+{
+    urma_import_jetty_ex_cfg_t active_cfg = {0};
+    urma_rjetty_t remote_jetty = {0};
+
+    /*
+     * This direct path intentionally supports only one RM/CTP Jetty on a UB
+     * device.  Keep the successful Target Jetty handle in ctx immediately.
+     * No failure path here unimports or frees it: a matching CONNECT_DONE
+     * frame hands every acquired handle to the retryable checked teardown.
+     */
+    if (ctx == NULL || cfg == NULL || ctx->urma_ctx == NULL ||
+        ctx->urma_ctx->dev == NULL ||
+        ctx->urma_ctx->dev->type != URMA_TRANSPORT_UB ||
+        ctx->jetty_num != 1U || ctx->remote_jetty_id == NULL ||
+        ctx->tp_info == NULL || !cfg->tp_aware || !cfg->use_ctp ||
+        cfg->trans_mode != URMA_TM_RM || cfg->enable_async_import ||
+        cfg->uboe) {
+        return -1;
+    }
+
+    if (ctx->import_tjetty == NULL) {
+        ctx->import_tjetty =
+            calloc(ctx->jetty_num, sizeof(*ctx->import_tjetty));
+        if (ctx->import_tjetty == NULL) {
+            return -1;
+        }
+    } else if (ctx->import_tjetty[0] != NULL) {
+        return -1;
+    }
+
+    active_cfg.tp_handle = ctx->tp_info[0].tp_handle;
+    active_cfg.tp_attr.tx_psn = (uint32_t)random();
+    remote_jetty.jetty_id = ctx->remote_jetty_id[0];
+    remote_jetty.trans_mode = cfg->trans_mode;
+    remote_jetty.type = URMA_JETTY;
+    remote_jetty.flag.bs.order_type = cfg->order_type;
+    remote_jetty.tp_type = URMA_CTP;
+
+    ctx->import_tjetty[0] = urma_import_jetty_ex(
+        ctx->urma_ctx, &remote_jetty, &g_perftest_token, &active_cfg);
+    return ctx->import_tjetty[0] == NULL ? -1 : 0;
 }
 
 static void kvaf_teardown_set_cursor(
@@ -905,14 +978,20 @@ int kvaf_perftest_create_duplex_ctx_checked(
         !cfg->enable_va || cfg->v_address == 0 ||
         !cfg->tp_aware || !cfg->use_ctp ||
         cfg->trans_mode != URMA_TM_RM ||
-        cfg->seg_pre_jetty ||
+        cfg->seg_pre_jetty || cfg->pair_flag || cfg->uboe ||
         cfg->enable_async_import || cfg->enable_credit ||
-        cfg->enable_user_tp || cfg->use_jfce) {
+        cfg->enable_notify || cfg->enable_user_tp || cfg->use_jfce) {
         return KVAF_PERFTEST_CHECKED_CREATE_UNSAFE;
     }
 
     (void)memset(ctx, 0, sizeof(*ctx));
     status = kvaf_init_device_checked(ctx, cfg);
+    if (status == 0 &&
+        (ctx->urma_ctx == NULL || ctx->urma_ctx->dev == NULL ||
+         ctx->urma_ctx->dev->type != URMA_TRANSPORT_UB ||
+         perftest_is_bonding_dev(ctx->urma_ctx->dev->name))) {
+        status = -1;
+    }
     phase_status = kvaf_sync_local_create_phase(
         cfg, KVAF_CHECKED_PHASE_INIT_DEVICE, status);
     if (phase_status != KVAF_PERFTEST_CHECKED_OK) {
@@ -932,17 +1011,19 @@ int kvaf_perftest_create_duplex_ctx_checked(
     }
 
     /*
-     * The next two upstream helpers contain their own peer exchanges. If one
-     * side fails locally before completing such an exchange, sending a new
-     * phase frame would be interpreted as old-protocol payload. Shut down the
-     * control socket immediately instead; that makes the peer's full read
-     * fail and drives both providers into the poisoned state.
+     * The fixed direct MVP has no credit/notify/bonding payload. Exchange
+     * only the remote Segment and Jetty ID here. If either wire exchange is
+     * incomplete, framing is ambiguous and the session remains unsafe. Once
+     * both complete, local CTP lookup is phase-coordinated and may use the
+     * normal checked cleanup path.
      */
-    if (exchange_connection_info(ctx, cfg) != 0) {
+    if (exchange_seg_info(ctx, cfg) != 0 ||
+        exchange_jetty_id(ctx, cfg) != 0) {
         goto unsafe;
     }
+    status = kvaf_create_fixed_ctp_info_checked(ctx, cfg);
     phase_status = kvaf_sync_local_create_phase(
-        cfg, KVAF_CHECKED_PHASE_EXCHANGE_DONE, 0);
+        cfg, KVAF_CHECKED_PHASE_EXCHANGE_DONE, status);
     if (phase_status != KVAF_PERFTEST_CHECKED_OK) {
         if (phase_status ==
             KVAF_PERFTEST_CHECKED_CREATE_CLEANUP_REQUIRED) {
@@ -957,13 +1038,11 @@ int kvaf_perftest_create_duplex_ctx_checked(
     if (phase_status != KVAF_PERFTEST_CHECKED_OK) {
         return phase_status;
     }
-    if (connect_jetty(ctx, cfg) != 0) {
-        goto unsafe;
-    }
-    if (kvaf_sync_local_create_phase(
-            cfg, KVAF_CHECKED_PHASE_CONNECT_DONE, 0) !=
-        KVAF_PERFTEST_CHECKED_OK) {
-        goto unsafe;
+    status = kvaf_connect_fixed_ctp_jetty_checked(ctx, cfg);
+    phase_status = kvaf_sync_local_create_phase(
+        cfg, KVAF_CHECKED_PHASE_CONNECT_DONE, status);
+    if (phase_status != KVAF_PERFTEST_CHECKED_OK) {
+        return phase_status;
     }
     status = create_run_ctx(ctx, cfg);
     phase_status = kvaf_sync_local_create_phase(

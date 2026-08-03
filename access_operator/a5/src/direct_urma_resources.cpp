@@ -145,6 +145,155 @@ std::string FormatUrmaEid(
   return canonical;
 }
 
+struct ManagementDiagnosticView {
+  bool valid{false};
+  std::uint32_t stage{KVAF_URMA_MANAGEMENT_STAGE_NONE};
+  std::uint32_t flags{0};
+  std::int32_t raw_errno{0};
+  std::int32_t effective_errno{0};
+  std::int32_t operation_status{0};
+  std::int32_t completion_status{0};
+};
+
+std::int32_t SignedWord(std::uint64_t packed, unsigned int shift) {
+  const std::uint32_t bits =
+      static_cast<std::uint32_t>(packed >> shift);
+  std::int32_t value = 0;
+  static_assert(sizeof(value) == sizeof(bits));
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+ManagementDiagnosticView DecodeManagementDiagnostic(
+    const kvaf_urma_provider_result_v2& result) {
+  ManagementDiagnosticView diagnostic;
+  if (result.reserved[
+          KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_MAGIC] !=
+      KVAF_URMA_MANAGEMENT_DIAGNOSTIC_MAGIC) {
+    return diagnostic;
+  }
+  const std::uint64_t stage_word = result.reserved[
+      KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_STAGE];
+  const std::uint32_t version =
+      static_cast<std::uint32_t>(stage_word >> 32U);
+  if (version != KVAF_URMA_MANAGEMENT_DIAGNOSTIC_VERSION) {
+    return diagnostic;
+  }
+  diagnostic.stage = static_cast<std::uint32_t>(stage_word);
+  if (diagnostic.stage == KVAF_URMA_MANAGEMENT_STAGE_NONE) {
+    return diagnostic;
+  }
+  const std::uint64_t errno_word = result.reserved[
+      KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_ERRNO];
+  const std::uint64_t status_word = result.reserved[
+      KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_STATUS];
+  diagnostic.flags = static_cast<std::uint32_t>(result.reserved[
+      KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_FLAGS]);
+  diagnostic.raw_errno = SignedWord(errno_word, 0);
+  diagnostic.effective_errno = SignedWord(errno_word, 32);
+  diagnostic.operation_status = SignedWord(status_word, 0);
+  diagnostic.completion_status = SignedWord(status_word, 32);
+  diagnostic.valid = true;
+  return diagnostic;
+}
+
+const char* ManagementStageName(std::uint32_t stage) {
+  switch (stage) {
+    case KVAF_URMA_MANAGEMENT_STAGE_VALIDATE_ESTABLISH_ARGUMENTS:
+      return "validate_establish_arguments";
+    case KVAF_URMA_MANAGEMENT_STAGE_VALIDATE_ARGUMENTS:
+      return "validate_arguments";
+    case KVAF_URMA_MANAGEMENT_STAGE_ALLOCATE_OWNER:
+      return "allocate_owner";
+    case KVAF_URMA_MANAGEMENT_STAGE_RESOLVE_DEVICE_EID:
+      return "resolve_device_eid";
+    case KVAF_URMA_MANAGEMENT_STAGE_VALIDATE_DEVICE_EID:
+      return "validate_device_eid";
+    case KVAF_URMA_MANAGEMENT_STAGE_CREATE_CONTEXT:
+      return "create_context";
+    case KVAF_URMA_MANAGEMENT_STAGE_CREATE_JFC:
+      return "create_jfc";
+    case KVAF_URMA_MANAGEMENT_STAGE_ALLOCATE_SEND_BUFFER:
+      return "allocate_send_buffer";
+    case KVAF_URMA_MANAGEMENT_STAGE_ALLOCATE_RECEIVE_BUFFER:
+      return "allocate_receive_buffer";
+    case KVAF_URMA_MANAGEMENT_STAGE_ALLOCATE_HANDSHAKE_BUFFER:
+      return "allocate_handshake_buffer";
+    case KVAF_URMA_MANAGEMENT_STAGE_ALLOCATE_SEND_TOKEN:
+      return "allocate_send_token";
+    case KVAF_URMA_MANAGEMENT_STAGE_REGISTER_SEND_SEGMENT:
+      return "register_send_segment";
+    case KVAF_URMA_MANAGEMENT_STAGE_ALLOCATE_RECEIVE_TOKEN:
+      return "allocate_receive_token";
+    case KVAF_URMA_MANAGEMENT_STAGE_REGISTER_RECEIVE_SEGMENT:
+      return "register_receive_segment";
+    case KVAF_URMA_MANAGEMENT_STAGE_ALLOCATE_HANDSHAKE_TOKEN:
+      return "allocate_handshake_token";
+    case KVAF_URMA_MANAGEMENT_STAGE_REGISTER_HANDSHAKE_SEGMENT:
+      return "register_handshake_segment";
+    case KVAF_URMA_MANAGEMENT_STAGE_CREATE_JFR:
+      return "create_jfr";
+    case KVAF_URMA_MANAGEMENT_STAGE_CREATE_JETTY:
+      return "create_jetty";
+    case KVAF_URMA_MANAGEMENT_STAGE_VALIDATE_SERVER_JETTY_ID:
+      return "validate_server_jetty_id";
+    case KVAF_URMA_MANAGEMENT_STAGE_SERVER_HANDSHAKE:
+      return "server_handshake";
+    case KVAF_URMA_MANAGEMENT_STAGE_CLIENT_PARSE_PEER_EID:
+      return "client_parse_peer_eid";
+    case KVAF_URMA_MANAGEMENT_STAGE_CLIENT_GET_TP_LIST:
+      return "client_get_tp_list";
+    case KVAF_URMA_MANAGEMENT_STAGE_CLIENT_VALIDATE_TP_LIST:
+      return "client_validate_tp_list";
+    case KVAF_URMA_MANAGEMENT_STAGE_CLIENT_IMPORT_PEER_JETTY_EX:
+      return "client_import_peer_jetty_ex";
+    case KVAF_URMA_MANAGEMENT_STAGE_CLIENT_POST_HANDSHAKE_SEND:
+      return "client_post_handshake_send";
+    case KVAF_URMA_MANAGEMENT_STAGE_CLIENT_POLL_HANDSHAKE_CQE:
+      return "client_poll_handshake_cqe";
+    case KVAF_URMA_MANAGEMENT_STAGE_CLIENT_HANDSHAKE:
+      return "client_handshake";
+    case KVAF_URMA_MANAGEMENT_STAGE_VALIDATE_PEER_EID:
+      return "validate_peer_eid";
+    case KVAF_URMA_MANAGEMENT_STAGE_POST_CLIENT_RECEIVE:
+      return "post_client_receive";
+    case KVAF_URMA_MANAGEMENT_STAGE_SERVER_VALIDATE_PEER_CTP:
+      return "server_validate_peer_ctp";
+    case KVAF_URMA_MANAGEMENT_STAGE_SERVER_GET_TP_LIST:
+      return "server_get_tp_list";
+    case KVAF_URMA_MANAGEMENT_STAGE_SERVER_VALIDATE_TP_LIST:
+      return "server_validate_tp_list";
+    case KVAF_URMA_MANAGEMENT_STAGE_SERVER_IMPORT_PEER_JETTY_EX:
+      return "server_import_peer_jetty_ex";
+    case KVAF_URMA_MANAGEMENT_STAGE_CLIENT_VALIDATE_PEER_CTP:
+      return "client_validate_peer_ctp";
+    default:
+      return "unknown";
+  }
+}
+
+std::string FormatManagementDiagnostic(
+    const kvaf_urma_provider_result_v2& result) {
+  const ManagementDiagnosticView diagnostic =
+      DecodeManagementDiagnostic(result);
+  if (!diagnostic.valid) {
+    return " management_diagnostic=unavailable";
+  }
+  return " management_stage=" +
+      std::string(ManagementStageName(diagnostic.stage)) +
+      " management_stage_id=" + std::to_string(diagnostic.stage) +
+      " management_raw_errno=" +
+      std::to_string(diagnostic.raw_errno) +
+      " management_effective_errno=" +
+      std::to_string(diagnostic.effective_errno) +
+      " management_operation_status=" +
+      std::to_string(diagnostic.operation_status) +
+      " management_completion_status=" +
+      std::to_string(diagnostic.completion_status) +
+      " management_diagnostic_flags=" +
+      std::to_string(diagnostic.flags);
+}
+
 bool RangeContains(std::uint64_t base, std::uint64_t capacity,
                    std::uint64_t address, std::uint64_t bytes) {
   return address >= base && bytes <= capacity &&
@@ -186,7 +335,8 @@ Status ValidateProviderResult(
         "direct URMA provider returned an ABI or resource error: status=" +
             std::to_string(result.status) +
             " provider_status=" +
-            std::to_string(result.provider_status));
+            std::to_string(result.provider_status) +
+            FormatManagementDiagnostic(result));
   }
   if (result.local_base == 0 || result.local_bytes == 0 ||
       result.remote_base == 0 || result.remote_bytes == 0) {
@@ -951,6 +1101,8 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
                 KVAF_URMA_PROVIDER_ABI_VERSION &&
             impl_->result.struct_size == sizeof(impl_->result) &&
             impl_->result.session_id == impl_->session_id;
+        const ManagementDiagnosticView progress_management =
+            DecodeManagementDiagnostic(impl_->result);
         (void)std::fprintf(stderr,
             "KVAF_A5_AICPU_OWNER_PROGRESS phase=open polls=%llu "
             "observer_elapsed_ms=%lld aiv_identity_valid=%u "
@@ -959,7 +1111,12 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
             "owner_result=%d owner_provider_status=%d owner_flags=%u "
             "owner_close_attempts=%u owner_elapsed_ns=%llu "
             "open_status=%u open_provider_status=%d "
-            "open_session=%llu\n",
+            "open_session=%llu management_diagnostic_valid=%u "
+            "management_stage=%s management_stage_id=%u "
+            "management_raw_errno=%d management_effective_errno=%d "
+            "management_operation_status=%d "
+            "management_completion_status=%d "
+            "management_diagnostic_flags=%u\n",
             (unsigned long long)ready_poll_count,
             (long long)observer_elapsed_ms,
             progress_aiv_identity_valid ? 1U : 0U,
@@ -972,7 +1129,15 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
             (unsigned long long)ready_status.elapsed_nanoseconds,
             (unsigned int)impl_->result.status,
             impl_->result.provider_status,
-            (unsigned long long)impl_->result.session_id);
+            (unsigned long long)impl_->result.session_id,
+            progress_management.valid ? 1U : 0U,
+            ManagementStageName(progress_management.stage),
+            progress_management.stage,
+            progress_management.raw_errno,
+            progress_management.effective_errno,
+            progress_management.operation_status,
+            progress_management.completion_status,
+            progress_management.flags);
         (void)std::fflush(stderr);
         last_progress_aiv_status = ready_result.status;
         last_progress_owner_state =
@@ -1159,7 +1324,8 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
               " provider_status=" +
                   std::to_string(impl_->result.provider_status) +
               " owner_result_code=" +
-                  std::to_string(ready_status.result_code));
+                  std::to_string(ready_status.result_code) +
+              FormatManagementDiagnostic(impl_->result));
         } else {
           status = join_status;
         }
@@ -1182,7 +1348,8 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
             " provider_result_status=" +
                 std::to_string(impl_->result.status) +
             " provider_status=" +
-                std::to_string(impl_->result.provider_status));
+                std::to_string(impl_->result.provider_status) +
+            FormatManagementDiagnostic(impl_->result));
       }
       (void)Close();
       return status;

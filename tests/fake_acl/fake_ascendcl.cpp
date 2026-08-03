@@ -394,6 +394,31 @@ extern "C" rtError_t rtAicpuKernelLaunchExWithArgs(
       result->status = KVAF_URMA_PROVIDER_CONNECT_FAILED;
       result->provider_status = -ETIMEDOUT;
       result->flags = 0;
+      result->reserved[
+          KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_MAGIC] =
+          KVAF_URMA_MANAGEMENT_DIAGNOSTIC_MAGIC;
+      result->reserved[
+          KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_STAGE] =
+          static_cast<std::uint64_t>(
+              KVAF_URMA_MANAGEMENT_STAGE_CLIENT_GET_TP_LIST) |
+          (static_cast<std::uint64_t>(
+               KVAF_URMA_MANAGEMENT_DIAGNOSTIC_VERSION)
+           << 32U);
+      result->reserved[
+          KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_ERRNO] =
+          static_cast<std::uint64_t>(static_cast<std::uint32_t>(0)) |
+          (static_cast<std::uint64_t>(
+               static_cast<std::uint32_t>(EIO))
+           << 32U);
+      result->reserved[
+          KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_STATUS] =
+          static_cast<std::uint64_t>(
+              static_cast<std::uint32_t>(-5));
+      result->reserved[
+          KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_FLAGS] =
+          KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RAW_ERRNO_VALID |
+          KVAF_URMA_MANAGEMENT_DIAGNOSTIC_EFFECTIVE_ERRNO_VALID |
+          KVAF_URMA_MANAGEMENT_DIAGNOSTIC_OPERATION_STATUS_VALID;
       owner_status->result_code = KVAF_URMA_EPOCH_OWNER_RESULT_OK;
       owner_status->flags = 0;
       owner_status->state = KVAF_URMA_EPOCH_OWNER_STATE_OPENING;

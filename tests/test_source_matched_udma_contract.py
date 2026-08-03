@@ -283,6 +283,152 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
             "errno = concrete_errno;"
         ))
 
+    def test_ub_management_import_resolves_ctp_before_extended_import(self):
+        communication = self.read(
+            "access_operator/a5/provider/source_matched_communication.c"
+        )
+
+        helper_start = communication.index(
+            "static urma_target_jetty_t "
+            "*kvaf_ub_import_peer_jetty_tp_aware("
+        )
+        helper_end = communication.index(
+            "#define KVAF_UB_CLOSE_DRAIN_BATCH", helper_start
+        )
+        helper = communication[helper_start:helper_end]
+
+        # The inlined official server and client helpers must not fall back
+        # to liburma's all-zero active-TP compatibility import.
+        include = communication.index(
+            "#include KVAF_PERFTEST_MGMT_UB_SOURCE"
+        )
+        import_override = communication.index(
+            "#define urma_import_jetty "
+            "kvaf_ub_import_peer_jetty_tp_aware"
+        )
+        import_restore = communication.index(
+            "#undef urma_import_jetty", include
+        )
+        self.assertLess(import_override, include)
+        self.assertLess(include, import_restore)
+
+        for marker in (
+            "get_tp_cfg.flag.bs.ctp = 1",
+            "get_tp_cfg.trans_mode = URMA_TM_RM",
+            "get_tp_cfg.local_eid = ctx->eid",
+            "get_tp_cfg.peer_eid = rjetty->jetty_id.eid",
+            "status = urma_get_tp_list(",
+            "status != URMA_SUCCESS || tp_count != 1U",
+            "active_tp_cfg.tp_handle = tp_info.tp_handle",
+            "active_tp_cfg.tp_attr.tx_psn = (uint32_t)rand()",
+            "tjetty = urma_import_jetty_ex(",
+            '"server_get_tp_list"',
+            '"client_get_tp_list"',
+            '"server_import_peer_jetty_ex"',
+            '"client_import_peer_jetty_ex"',
+        ):
+            self.assertIn(marker, helper)
+        self.assertLess(
+            helper.index("status = urma_get_tp_list("),
+            helper.index("tjetty = urma_import_jetty_ex("),
+        )
+        self.assertNotIn("= urma_import_jetty(", communication)
+
+    def test_direct_queues_suspend_after_first_transport_error(self):
+        communication = self.read(
+            "access_operator/a5/provider/source_matched_communication.c"
+        )
+        resources = self.read(
+            "access_operator/a5/provider/source_matched_perftest.c"
+        )
+
+        management_flag = communication.index(
+            "jfs_cfg.flag.bs.error_suspend = 1"
+        )
+        management_create = communication.index(
+            "ctx->pair.jetty = urma_create_jetty(", management_flag
+        )
+        data_flag = resources.index(
+            "jfs_cfg.flag.bs.error_suspend = 1"
+        )
+        data_create = resources.index(
+            "ctx->jetty[0] = urma_create_jetty(", data_flag
+        )
+        self.assertLess(management_flag, management_create)
+        self.assertLess(data_flag, data_create)
+
+    def test_management_failure_diagnostic_survives_checked_teardown(self):
+        abi = self.read(
+            "access_operator/a5/provider/include/kvaf_urma_provider_abi.h"
+        )
+        header = self.read(
+            "access_operator/a5/provider/include/"
+            "kvaf_source_matched_perftest.h"
+        )
+        communication = self.read(
+            "access_operator/a5/provider/source_matched_communication.c"
+        )
+        provider = self.read(
+            "access_operator/a5/provider/urma_perftest_provider.c"
+        )
+
+        for marker in (
+            "KVAF_URMA_MANAGEMENT_DIAGNOSTIC_MAGIC",
+            "KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_MAGIC 4U",
+            "KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_FLAGS 8U",
+            "KVAF_URMA_MANAGEMENT_STAGE_CLIENT_GET_TP_LIST",
+            "KVAF_URMA_MANAGEMENT_STAGE_SERVER_GET_TP_LIST",
+            "KVAF_URMA_MANAGEMENT_STAGE_CLIENT_IMPORT_PEER_JETTY_EX",
+            "KVAF_URMA_MANAGEMENT_STAGE_SERVER_IMPORT_PEER_JETTY_EX",
+        ):
+            self.assertIn(marker, abi)
+        self.assertIn(
+            "struct kvaf_perftest_management_diagnostic_v1", header
+        )
+        self.assertIn(
+            "static _Thread_local struct "
+            "kvaf_perftest_management_diagnostic_v1",
+            communication,
+        )
+        self.assertIn(
+            "if (g_kvaf_management_diagnostic.stage !=",
+            communication,
+        )
+
+        reset = provider.index(
+            "kvaf_perftest_management_diagnostic_reset();"
+        )
+        establish = provider.index(
+            "kvaf_perftest_establish_connection(", reset
+        )
+        open_start = provider.index("int kvaf_urma_provider_open_v2(")
+        fail = provider.index("\nfail:", open_start)
+        attach = provider.index(
+            "kvaf_attach_management_diagnostic(result);", fail
+        )
+        close = provider.index(
+            "ret = kvaf_close_unlocked(config->session_id);", attach
+        )
+        self.assertLess(reset, establish)
+        self.assertLess(establish, fail)
+        self.assertLess(fail, attach)
+        self.assertLess(attach, close)
+
+        attach_start = provider.index(
+            "static void kvaf_attach_management_diagnostic("
+        )
+        attach_end = provider.index(
+            "static bool kvaf_config_is_valid(", attach_start
+        )
+        attach_body = provider[attach_start:attach_end]
+        flags = attach_body.index(
+            "KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_FLAGS"
+        )
+        magic = attach_body.index(
+            "KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_MAGIC"
+        )
+        self.assertLess(flags, magic)
+
     def test_segment_failure_survives_public_wrapper_cleanup(self):
         header = self.read(
             "access_operator/a5/provider/include/kvaf_source_matched_udma.h"

@@ -14,13 +14,168 @@
 #include <unistd.h>
 
 #include "urma_api.h"
+#include "kvaf_source_matched_perftest.h"
 #include "kvaf_source_matched_udma.h"
 #include "kvaf_source_matched_ummu.h"
+#include "kvaf_urma_provider_abi.h"
 #include "kvaf_ub_close_policy.h"
 
 static struct timespec g_kvaf_control_deadline;
 static int g_kvaf_control_deadline_valid;
 static unsigned int g_kvaf_control_timeout_seconds;
+
+static _Thread_local struct kvaf_perftest_management_diagnostic_v1
+    g_kvaf_management_diagnostic = {
+        .structure_size = sizeof(g_kvaf_management_diagnostic),
+        .abi_version = KVAF_URMA_MANAGEMENT_DIAGNOSTIC_VERSION,
+    };
+
+struct kvaf_ub_management_stage_entry {
+    const char *name;
+    uint32_t stage;
+};
+
+static uint32_t kvaf_ub_management_stage_from_name(const char *name)
+{
+    static const struct kvaf_ub_management_stage_entry stages[] = {
+        {"validate_establish_arguments",
+            KVAF_URMA_MANAGEMENT_STAGE_VALIDATE_ESTABLISH_ARGUMENTS},
+        {"validate_arguments",
+            KVAF_URMA_MANAGEMENT_STAGE_VALIDATE_ARGUMENTS},
+        {"allocate_owner", KVAF_URMA_MANAGEMENT_STAGE_ALLOCATE_OWNER},
+        {"resolve_device_eid",
+            KVAF_URMA_MANAGEMENT_STAGE_RESOLVE_DEVICE_EID},
+        {"validate_device_eid",
+            KVAF_URMA_MANAGEMENT_STAGE_VALIDATE_DEVICE_EID},
+        {"create_context", KVAF_URMA_MANAGEMENT_STAGE_CREATE_CONTEXT},
+        {"create_jfc", KVAF_URMA_MANAGEMENT_STAGE_CREATE_JFC},
+        {"allocate_send_buffer",
+            KVAF_URMA_MANAGEMENT_STAGE_ALLOCATE_SEND_BUFFER},
+        {"allocate_receive_buffer",
+            KVAF_URMA_MANAGEMENT_STAGE_ALLOCATE_RECEIVE_BUFFER},
+        {"allocate_handshake_buffer",
+            KVAF_URMA_MANAGEMENT_STAGE_ALLOCATE_HANDSHAKE_BUFFER},
+        {"allocate_send_token",
+            KVAF_URMA_MANAGEMENT_STAGE_ALLOCATE_SEND_TOKEN},
+        {"register_send_segment",
+            KVAF_URMA_MANAGEMENT_STAGE_REGISTER_SEND_SEGMENT},
+        {"allocate_receive_token",
+            KVAF_URMA_MANAGEMENT_STAGE_ALLOCATE_RECEIVE_TOKEN},
+        {"register_receive_segment",
+            KVAF_URMA_MANAGEMENT_STAGE_REGISTER_RECEIVE_SEGMENT},
+        {"allocate_handshake_token",
+            KVAF_URMA_MANAGEMENT_STAGE_ALLOCATE_HANDSHAKE_TOKEN},
+        {"register_handshake_segment",
+            KVAF_URMA_MANAGEMENT_STAGE_REGISTER_HANDSHAKE_SEGMENT},
+        {"create_jfr", KVAF_URMA_MANAGEMENT_STAGE_CREATE_JFR},
+        {"create_jetty", KVAF_URMA_MANAGEMENT_STAGE_CREATE_JETTY},
+        {"validate_server_jetty_id",
+            KVAF_URMA_MANAGEMENT_STAGE_VALIDATE_SERVER_JETTY_ID},
+        {"server_handshake",
+            KVAF_URMA_MANAGEMENT_STAGE_SERVER_HANDSHAKE},
+        {"client_parse_peer_eid",
+            KVAF_URMA_MANAGEMENT_STAGE_CLIENT_PARSE_PEER_EID},
+        {"client_get_tp_list",
+            KVAF_URMA_MANAGEMENT_STAGE_CLIENT_GET_TP_LIST},
+        {"client_validate_tp_list",
+            KVAF_URMA_MANAGEMENT_STAGE_CLIENT_VALIDATE_TP_LIST},
+        {"client_import_peer_jetty",
+            KVAF_URMA_MANAGEMENT_STAGE_CLIENT_IMPORT_PEER_JETTY_EX},
+        {"client_import_peer_jetty_ex",
+            KVAF_URMA_MANAGEMENT_STAGE_CLIENT_IMPORT_PEER_JETTY_EX},
+        {"client_post_handshake_send",
+            KVAF_URMA_MANAGEMENT_STAGE_CLIENT_POST_HANDSHAKE_SEND},
+        {"client_poll_handshake_cqe",
+            KVAF_URMA_MANAGEMENT_STAGE_CLIENT_POLL_HANDSHAKE_CQE},
+        {"client_handshake",
+            KVAF_URMA_MANAGEMENT_STAGE_CLIENT_HANDSHAKE},
+        {"validate_peer_eid",
+            KVAF_URMA_MANAGEMENT_STAGE_VALIDATE_PEER_EID},
+        {"post_client_receive",
+            KVAF_URMA_MANAGEMENT_STAGE_POST_CLIENT_RECEIVE},
+        {"server_validate_peer_ctp",
+            KVAF_URMA_MANAGEMENT_STAGE_SERVER_VALIDATE_PEER_CTP},
+        {"server_get_tp_list",
+            KVAF_URMA_MANAGEMENT_STAGE_SERVER_GET_TP_LIST},
+        {"server_validate_tp_list",
+            KVAF_URMA_MANAGEMENT_STAGE_SERVER_VALIDATE_TP_LIST},
+        {"server_import_peer_jetty_ex",
+            KVAF_URMA_MANAGEMENT_STAGE_SERVER_IMPORT_PEER_JETTY_EX},
+        {"client_validate_peer_ctp",
+            KVAF_URMA_MANAGEMENT_STAGE_CLIENT_VALIDATE_PEER_CTP},
+    };
+    size_t index;
+
+    if (name == NULL) {
+        return KVAF_URMA_MANAGEMENT_STAGE_NONE;
+    }
+    for (index = 0; index < sizeof(stages) / sizeof(stages[0]); ++index) {
+        if (strcmp(name, stages[index].name) == 0) {
+            return stages[index].stage;
+        }
+    }
+    return KVAF_URMA_MANAGEMENT_STAGE_NONE;
+}
+
+static void kvaf_ub_record_management_diagnostic(
+    const char *stage, int raw_errno, int effective_errno,
+    int operation_status, bool operation_status_valid,
+    int completion_status, bool completion_status_valid)
+{
+    uint32_t stage_id;
+
+    /* Keep the first concrete leaf.  Outer handshake wrappers and checked
+     * teardown run later on the same thread and must not hide the cause. */
+    if (g_kvaf_management_diagnostic.stage !=
+        KVAF_URMA_MANAGEMENT_STAGE_NONE) {
+        return;
+    }
+    stage_id = kvaf_ub_management_stage_from_name(stage);
+    if (stage_id == KVAF_URMA_MANAGEMENT_STAGE_NONE) {
+        return;
+    }
+    g_kvaf_management_diagnostic.stage = stage_id;
+    g_kvaf_management_diagnostic.raw_errno = raw_errno;
+    g_kvaf_management_diagnostic.effective_errno = effective_errno;
+    g_kvaf_management_diagnostic.operation_status = operation_status;
+    g_kvaf_management_diagnostic.completion_status = completion_status;
+    g_kvaf_management_diagnostic.flags =
+        KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RAW_ERRNO_VALID |
+        KVAF_URMA_MANAGEMENT_DIAGNOSTIC_EFFECTIVE_ERRNO_VALID;
+    if (operation_status_valid) {
+        g_kvaf_management_diagnostic.flags |=
+            KVAF_URMA_MANAGEMENT_DIAGNOSTIC_OPERATION_STATUS_VALID;
+    }
+    if (completion_status_valid) {
+        g_kvaf_management_diagnostic.flags |=
+            KVAF_URMA_MANAGEMENT_DIAGNOSTIC_COMPLETION_STATUS_VALID;
+    }
+}
+
+void kvaf_perftest_management_diagnostic_reset(void)
+{
+    (void)memset(&g_kvaf_management_diagnostic, 0,
+        sizeof(g_kvaf_management_diagnostic));
+    g_kvaf_management_diagnostic.structure_size =
+        sizeof(g_kvaf_management_diagnostic);
+    g_kvaf_management_diagnostic.abi_version =
+        KVAF_URMA_MANAGEMENT_DIAGNOSTIC_VERSION;
+}
+
+int kvaf_perftest_management_diagnostic_get(
+    struct kvaf_perftest_management_diagnostic_v1 *diagnostic)
+{
+    if (diagnostic == NULL ||
+        diagnostic->structure_size != sizeof(*diagnostic) ||
+        diagnostic->abi_version !=
+            KVAF_URMA_MANAGEMENT_DIAGNOSTIC_VERSION ||
+        g_kvaf_management_diagnostic.stage ==
+            KVAF_URMA_MANAGEMENT_STAGE_NONE) {
+        return -1;
+    }
+    *diagnostic = g_kvaf_management_diagnostic;
+    return 0;
+}
 
 int kvaf_perftest_set_control_timeout(unsigned int timeout_seconds)
 {
@@ -180,7 +335,6 @@ static int kvaf_deadline_accept(
     return accepted;
 }
 
-#include "kvaf_source_matched_perftest.h"
 #include "perftest_mgmt_tcp.h"
 #include "perftest_mgmt_ub.h"
 
@@ -362,11 +516,27 @@ static urma_status_t kvaf_ready_urma_post_jetty_recv_wr(
     return status;
 }
 
+static int kvaf_ub_management_error(
+    const char *stage, int operation_errno, int fallback_errno);
+
+/*
+ * The pinned UDMA provider exposes import_jetty_ex rather than the legacy
+ * import_jetty operation.  The generic liburma compatibility path supplies
+ * an all-zero active-TP configuration, which is not sufficient for UDMA
+ * CTP.  Keep the upstream management wire protocol, but replace every peer
+ * Jetty import in it (server and client) with the checked public-API path
+ * implemented below.
+ */
+static urma_target_jetty_t *kvaf_ub_import_peer_jetty_tp_aware(
+    urma_context_t *ctx, urma_rjetty_t *rjetty,
+    urma_token_t *token_value);
+
 #define g_exit_flag g_kvaf_ub_exit_flag
 #define urma_init kvaf_ub_reuse_runtime_init
 #define urma_poll_jfc kvaf_deadline_urma_poll_jfc
 #define urma_post_jetty_send_wr kvaf_tracking_urma_post_jetty_send_wr
 #define urma_post_jetty_recv_wr kvaf_ready_urma_post_jetty_recv_wr
+#define urma_import_jetty kvaf_ub_import_peer_jetty_tp_aware
 #define ub_establish_connection kvaf_upstream_ub_establish_connection
 #define ub_close_connection kvaf_upstream_ub_close_connection
 #define ub_client_handshake kvaf_upstream_ub_client_handshake
@@ -384,6 +554,7 @@ static urma_status_t kvaf_ready_urma_post_jetty_recv_wr(
 #undef ub_sync_data
 #undef ub_close_connection
 #undef ub_establish_connection
+#undef urma_import_jetty
 #undef urma_post_jetty_recv_wr
 #undef urma_post_jetty_send_wr
 #undef urma_poll_jfc
@@ -403,6 +574,9 @@ static int kvaf_ub_management_error(
     const int concrete_errno =
         operation_errno == 0 ? fallback_errno : operation_errno;
 
+    kvaf_ub_record_management_diagnostic(
+        stage, operation_errno, concrete_errno, 0, false, 0, false);
+
     /* source_linked_urma_main deliberately reports ENOENT while suppressing
      * dynamic provider scans. Reset errno before every checked operation and
      * name the exact failing stage so that such an internal errno can never
@@ -414,6 +588,89 @@ static int kvaf_ub_management_error(
     (void)fflush(stderr);
     errno = concrete_errno;
     return -1;
+}
+
+static urma_target_jetty_t *kvaf_ub_import_peer_jetty_tp_aware(
+    urma_context_t *ctx, urma_rjetty_t *rjetty,
+    urma_token_t *token_value)
+{
+    urma_get_tp_cfg_t get_tp_cfg = {0};
+    urma_tp_info_t tp_info = {0};
+    urma_import_jetty_ex_cfg_t active_tp_cfg = {0};
+    urma_target_jetty_t *tjetty;
+    urma_status_t status;
+    uint32_t tp_count = 1;
+    int operation_errno;
+    const bool server = g_kvaf_ub_server_arming;
+    const char *get_stage = server ?
+        "server_get_tp_list" : "client_get_tp_list";
+    const char *validate_stage = server ?
+        "server_validate_tp_list" : "client_validate_tp_list";
+    const char *import_stage = server ?
+        "server_import_peer_jetty_ex" :
+        "client_import_peer_jetty_ex";
+
+    if (ctx == NULL || rjetty == NULL || token_value == NULL ||
+        rjetty->trans_mode != URMA_TM_RM ||
+        rjetty->tp_type != URMA_CTP) {
+        (void)kvaf_ub_management_error(
+            server ? "server_validate_peer_ctp" :
+                     "client_validate_peer_ctp",
+            EINVAL, EINVAL);
+        return NULL;
+    }
+
+    /* Match the known-working public perftest compatibility sequence:
+     * resolve exactly one RM+CTP transport path for local/peer EIDs, carry
+     * its handle and a local initial PSN into import_jetty_ex.  CTP does not
+     * use the RTP peer-handle/PSN exchange step. */
+    get_tp_cfg.flag.bs.ctp = 1;
+    get_tp_cfg.trans_mode = URMA_TM_RM;
+    get_tp_cfg.local_eid = ctx->eid;
+    get_tp_cfg.peer_eid = rjetty->jetty_id.eid;
+    errno = 0;
+    status = urma_get_tp_list(
+        ctx, &get_tp_cfg, &tp_count, &tp_info);
+    operation_errno = errno;
+    if (status != URMA_SUCCESS || tp_count != 1U) {
+        const char *failure_stage = status == URMA_SUCCESS ?
+            validate_stage : get_stage;
+        const int effective_errno = operation_errno == 0 ?
+            (status == URMA_SUCCESS ? EPROTO : EIO) : operation_errno;
+
+        (void)fprintf(stderr,
+            "KVAF_URMA_MGMT_TP_ERROR stage=%s urma_status=%d "
+            "tp_count=%u raw_errno=%d\n",
+            failure_stage, (int)status, tp_count, operation_errno);
+        (void)fflush(stderr);
+        kvaf_ub_record_management_diagnostic(
+            failure_stage, operation_errno, effective_errno,
+            (int)status, true, (int)tp_count, true);
+        (void)kvaf_ub_management_error(
+            failure_stage, operation_errno,
+            status == URMA_SUCCESS ? EPROTO : EIO);
+        return NULL;
+    }
+
+    active_tp_cfg.tp_handle = tp_info.tp_handle;
+    active_tp_cfg.tp_attr.tx_psn = (uint32_t)rand();
+    errno = 0;
+    tjetty = urma_import_jetty_ex(
+        ctx, rjetty, token_value, &active_tp_cfg);
+    operation_errno = errno;
+    if (tjetty == NULL) {
+        (void)fprintf(stderr,
+            "KVAF_URMA_MGMT_TP_ERROR stage=%s tp_handle=%llu "
+            "tx_psn=%u raw_errno=%d\n",
+            import_stage,
+            (unsigned long long)active_tp_cfg.tp_handle,
+            active_tp_cfg.tp_attr.tx_psn, operation_errno);
+        (void)fflush(stderr);
+        (void)kvaf_ub_management_error(
+            import_stage, operation_errno, EIO);
+        return NULL;
+    }
+    return tjetty;
 }
 
 #define KVAF_UB_CLOSE_DRAIN_BATCH 1
@@ -772,6 +1029,14 @@ static int kvaf_ub_segment_registration_error(
         ummu.live_tid_count, ummu.pending_operation_count,
         ummu.retained_mapping_count);
     (void)fflush(stderr);
+    kvaf_ub_record_management_diagnostic(
+        stage, wrapper_errno,
+        effective_errno == 0 ? fallback_errno : effective_errno,
+        segment.operation_status,
+        segment_status == 0 &&
+            segment.stage != KVAF_UDMA_SEGMENT_FAILURE_NONE,
+        segment.rollback_status,
+        segment_status == 0 && segment.rollback_status != 0);
     return kvaf_ub_management_error(
         stage, effective_errno, fallback_errno);
 }
@@ -816,6 +1081,11 @@ static int kvaf_ub_token_allocation_error(
         ummu.last_state_unknown, ummu.live_tid_count,
         ummu.pending_operation_count, ummu.retained_mapping_count);
     (void)fflush(stderr);
+    kvaf_ub_record_management_diagnostic(
+        stage, wrapper_errno,
+        effective_errno == 0 ? fallback_errno : effective_errno,
+        ummu_status, ummu_status != 0, ummu.last_error,
+        ummu_status == 0 && ummu.last_error != 0);
     return kvaf_ub_management_error(
         stage, effective_errno, fallback_errno);
 }
@@ -960,6 +1230,11 @@ static int kvaf_ub_create_local_resources_checked(
     }
 
     jfs_cfg.depth = UB_MGMT_JFS_DEPTH;
+    /* A management SEND or route error must suspend this SQ.  Continuing
+     * after a failed WQE can advance queue ownership beyond the checked
+     * teardown cursor and turn a recoverable Open failure into reset-only
+     * hardware state. */
+    jfs_cfg.flag.bs.error_suspend = 1;
     jfs_cfg.trans_mode = URMA_TM_RM;
     jfs_cfg.max_sge = 1;
     jfs_cfg.max_rsge = 1;
@@ -1032,6 +1307,7 @@ static int kvaf_ub_client_handshake_checked(
     urma_jfs_wr_t *bad = NULL;
     urma_cr_t cr = {0};
     urma_status_t post_status;
+    int poll_status;
     int operation_errno;
 
     errno = 0;
@@ -1040,9 +1316,8 @@ static int kvaf_ub_client_handshake_checked(
             "client_parse_peer_eid", errno, EINVAL);
     }
     fill_rjetty(peer_eid, peer_jetty_id, &rjetty);
-    errno = 0;
-    ctx->pair.tjetty =
-        urma_import_jetty(ctx->urma_ctx, &rjetty, &g_ub_mgmt_token);
+    ctx->pair.tjetty = kvaf_ub_import_peer_jetty_tp_aware(
+        ctx->urma_ctx, &rjetty, &g_ub_mgmt_token);
     if (ctx->pair.tjetty == NULL) {
         return kvaf_ub_management_error(
             "client_import_peer_jetty", errno, EIO);
@@ -1066,13 +1341,24 @@ static int kvaf_ub_client_handshake_checked(
         ctx->pair.jetty, &wr, &bad);
     operation_errno = errno;
     if (post_status != URMA_SUCCESS) {
+        kvaf_ub_record_management_diagnostic(
+            "client_post_handshake_send", operation_errno,
+            operation_errno == 0 ? EIO : operation_errno,
+            (int)post_status, true, 0, false);
         return kvaf_ub_management_error(
             "client_post_handshake_send", operation_errno, EIO);
     }
     errno = 0;
-    if (poll_one_cqe(ctx->jfc, &cr, true) != 0) {
+    poll_status = poll_one_cqe(ctx->jfc, &cr, true);
+    if (poll_status != 0) {
+        operation_errno = errno;
+        kvaf_ub_record_management_diagnostic(
+            "client_poll_handshake_cqe", operation_errno,
+            operation_errno == 0 ? EIO : operation_errno,
+            poll_status, true, (int)cr.status,
+            cr.status != URMA_CR_SUCCESS);
         return kvaf_ub_management_error(
-            "client_poll_handshake_cqe", errno, EIO);
+            "client_poll_handshake_cqe", operation_errno, EIO);
     }
     return 0;
 }

@@ -206,8 +206,24 @@ parse/check config
 
 默认 `KVAF_DIRECT_MANAGEMENT_MODE=ub`。Host 用自身 EID 创建固定的 RM+CTP 管理
 Jetty 并预投 RECV；Device/AICPU 只需要 Host EID 和约定的 management Jetty ID
-即可 `urma_import_jetty()` 并发送握手。Host 从接收 CQE 的 `remote_id` 得到 Device
-EID/Jetty ID，随后双方用 URMA SEND/RECV 交换正式 data MR、Jetty 和 TP 元数据。
+即可建链并发送握手。固定 UMDK 的旧 `urma_import_jetty()` 兼容路径会向 UDMA
+传入全零 active-TP 配置，因此 Direct provider 不再调用它：Client 先以
+`local EID + peer EID + RM + CTP` 调用 `urma_get_tp_list()`，严格取得一个
+`tp_handle` 后再调用 `urma_import_jetty_ex()`；Server 收到握手 CQE、从硬件填充的
+`remote_id` 得到 Client EID/Jetty ID 后执行相同流程。CTP 不需要交换 RTP 的
+peer TP handle/PSN。随后双方才用 URMA SEND/RECV 交换正式 data MR、Jetty 和 TP
+元数据。
+
+这里借用了 HCCP 已验证的“先解析 TP、再扩展导入”生命周期，但没有引入 HCCP、
+HCOMM、`libra.so` 或额外 socket。管理与 data JFS 都设置
+`error_suspend=1`：第一个传输/内存错误会停止继续取 SQE，避免软件队列游标在错误
+后继续前进并把可回收失败扩大成 reset-only 状态。
+
+data Jetty 同样不再调用固定 UMDK 中的通用 `connect_jetty()`：Direct MVP 在 Segment
+和 Jetty ID 两次固定交换完成后单独执行 `urma_get_tp_list()`，用 phase frame 同步其
+结果，再以 `urma_import_jetty_ex()` 导入。成功返回的 Target Jetty 立即保存在 checked
+context 中；后续任何一端 import/phase 失败都不在 create 路径做 best-effort unimport，
+而是交给可重试 teardown。这样即使 unimport 暂时失败，也不会丢失句柄或只能复位。
 该路径不创建 IP socket，不读取 `/proc/net/tcp{,6}`，也不依赖 Linux IPv4、IPv6、
 路由或 `ipourma*` 地址配置。EID 即使显示成 IPv6 风格，也只是 128-bit URMA 标识。
 
@@ -256,6 +272,12 @@ AIV stream 完成
   -> 确认全局 live-resource 计数为 0
   -> urma_uninit
 ```
+
+管理 Open 失败时，AICPU 还会在固定 256-byte result ABI 的保留字中返回首个叶子
+错误，包括 get-TP、extended import、SEND 或 CQ 阶段、raw/effective errno 以及
+URMA/CQE 状态。该记录在 checked Close 之前快照，后续外层 handshake 错误和 teardown
+不会覆盖它；因此 Zero-WQE 再失败时可以直接区分路由/TP、Jetty import 和队列完成
+问题，而不再只有通用的 `provider_status=-5`。
 
 管理 context 必须留到 data context 完成双端 teardown 协议之后；否则 barrier 本身
 会被提前拆掉。反过来，删除 data context 时也不能要求进程内所有 URMA 资源都为零，
