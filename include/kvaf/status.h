@@ -28,6 +28,42 @@ class Status {
     return Status(code, std::move(message));
   }
 
+  static Status InvalidArgument(std::string message) {
+    return Error(StatusCode::kInvalidArgument, std::move(message));
+  }
+
+  static Status NotInitialized(std::string message) {
+    return Error(StatusCode::kNotInitialized, std::move(message));
+  }
+
+  static Status NotImplemented(std::string message) {
+    return Error(StatusCode::kNotImplemented, std::move(message));
+  }
+
+  static Status NotFound(std::string message) {
+    return Error(StatusCode::kNotFound, std::move(message));
+  }
+
+  static Status AlreadyExists(std::string message) {
+    return Error(StatusCode::kAlreadyExists, std::move(message));
+  }
+
+  static Status Busy(std::string message) {
+    return Error(StatusCode::kBusy, std::move(message));
+  }
+
+  static Status InvalidState(std::string message) {
+    return Error(StatusCode::kInvalidState, std::move(message));
+  }
+
+  static Status OutOfMemory(std::string message) {
+    return Error(StatusCode::kOutOfMemory, std::move(message));
+  }
+
+  static Status Internal(std::string message) {
+    return Error(StatusCode::kInternal, std::move(message));
+  }
+
   bool ok() const { return code_ == StatusCode::kOk; }
   StatusCode code() const { return code_; }
   const std::string& message() const { return message_; }

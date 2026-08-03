@@ -23,11 +23,11 @@ namespace kvaf {
 namespace {
 
 Status InvalidArgument(std::string message) {
-  return Status::Error(StatusCode::kInvalidArgument, std::move(message));
+  return Status::InvalidArgument(std::move(message));
 }
 
 Status Internal(std::string message) {
-  return Status::Error(StatusCode::kInternal, std::move(message));
+  return Status::Internal(std::move(message));
 }
 
 void ThrowIfError(const Status& status) {

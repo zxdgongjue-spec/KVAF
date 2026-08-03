@@ -12,44 +12,27 @@ namespace kvaf {
 
 namespace {
 
-Status InvalidArgument(std::string message) {
-  return Status::Error(StatusCode::kInvalidArgument, std::move(message));
-}
-
-Status InvalidState(std::string message) {
-  return Status::Error(StatusCode::kInvalidState, std::move(message));
-}
-
-Status NotInitialized(std::string message) {
-  return Status::Error(StatusCode::kNotInitialized, std::move(message));
-}
-
-Status NotFound(std::string message) {
-  return Status::Error(StatusCode::kNotFound, std::move(message));
-}
-
 class HostDdrMemoryAllocator final : public DdrMemoryAllocator {
  public:
   Status Allocate(const RuntimeInitRequest& request,
                   RemoteRegionDesc* remote_region) override {
     if (remote_region == nullptr) {
-      return InvalidArgument("remote_region must not be null");
+      return Status::InvalidArgument("remote_region must not be null");
     }
     if (request.ddr_device != DeviceKind::kCpu) {
-      return InvalidArgument(
+      return Status::InvalidArgument(
           "HostDdrMemoryAllocator supports only CPU host DDR");
     }
     if (request.ddr_bytes == 0 || request.slot_size == 0 ||
         request.ddr_bytes % request.slot_size != 0) {
-      return InvalidArgument(
+      return Status::InvalidArgument(
           "ddr_bytes must be a non-zero multiple of slot_size");
     }
 
     auto bytes = std::unique_ptr<std::uint8_t[]>(
         new (std::nothrow) std::uint8_t[request.ddr_bytes]());
     if (!bytes) {
-      return Status::Error(StatusCode::kOutOfMemory,
-                           "failed to allocate host DDR");
+      return Status::OutOfMemory("failed to allocate host DDR");
     }
 
     const Address base = reinterpret_cast<Address>(bytes.get());
@@ -62,7 +45,7 @@ class HostDdrMemoryAllocator final : public DdrMemoryAllocator {
   Status Release(const RemoteRegionDesc& remote_region) override {
     const auto it = allocations_.find(remote_region.base);
     if (it == allocations_.end()) {
-      return NotFound("host DDR allocation was not found");
+      return Status::NotFound("host DDR allocation was not found");
     }
     allocations_.erase(it);
     return Status::OK();
@@ -72,23 +55,7 @@ class HostDdrMemoryAllocator final : public DdrMemoryAllocator {
   std::unordered_map<Address, std::unique_ptr<std::uint8_t[]>> allocations_;
 };
 
-bool HasBuffer(const ConstBufferView& view) {
-  return view.data != nullptr || view.bytes != 0;
-}
-
-bool IsInt32Buffer(const ConstBufferView& view) {
-  return view.data != nullptr && view.bytes != 0 &&
-         view.bytes % sizeof(std::int32_t) == 0;
-}
-
 }  // namespace
-
-struct Runtime::AccessTableState {
-  LockContext lock_context;
-  std::vector<Address> addresses;
-  std::vector<std::uint64_t> lengths;
-  std::vector<std::uint8_t> valid;
-};
 
 std::unique_ptr<DdrMemoryAllocator> CreateHostDdrMemoryAllocator() {
   return std::make_unique<HostDdrMemoryAllocator>();
@@ -108,10 +75,10 @@ Runtime::~Runtime() {
 
 Status Runtime::Initialize(const RuntimeInitRequest& request) {
   if (initialized_) {
-    return InvalidState("Runtime has already been initialized");
+    return Status::InvalidState("Runtime has already been initialized");
   }
   if (!access_tables_.empty()) {
-    return InvalidState("Runtime has unreleased AccessTables");
+    return Status::InvalidState("Runtime has unreleased AccessTables");
   }
 
   RemoteRegionDesc remote_region;
@@ -122,7 +89,7 @@ Status Runtime::Initialize(const RuntimeInitRequest& request) {
   if (remote_region.length == 0 || remote_region.slot_size == 0 ||
       remote_region.length % remote_region.slot_size != 0) {
     (void)ddr_allocator_.Release(remote_region);
-    return InvalidArgument("DDR allocator returned an invalid remote region");
+    return Status::InvalidArgument("DDR allocator returned an invalid remote region");
   }
 
   status = access_operator_.Initialize(remote_region);
@@ -145,7 +112,7 @@ Status Runtime::Initialize(const RuntimeInitRequest& request) {
 
 Status Runtime::Shutdown() {
   if (!initialized_) {
-    return NotInitialized("Runtime has not been initialized");
+    return Status::NotInitialized("Runtime has not been initialized");
   }
 
   Status first_error = Status::OK();
@@ -174,13 +141,13 @@ Status Runtime::Shutdown() {
 Status Runtime::PrepareAccessTable(const AccessTablePrepareRequest& request,
                                    AccessTableHandle* handle) {
   if (!initialized_) {
-    return NotInitialized("Runtime has not been initialized");
+    return Status::NotInitialized("Runtime has not been initialized");
   }
   if (handle == nullptr) {
-    return InvalidArgument("handle must not be null");
+    return Status::InvalidArgument("handle must not be null");
   }
   if (request.flat_keys.empty()) {
-    return InvalidArgument("PrepareAccessTable requires at least one key");
+    return Status::InvalidArgument("PrepareAccessTable requires at least one key");
   }
 
   LockContext lock_context;
@@ -201,13 +168,13 @@ Status Runtime::PrepareAccessTable(const AccessTablePrepareRequest& request,
       lookup.lengths.size() != request.flat_keys.size() ||
       lookup.valid.size() != request.flat_keys.size()) {
     (void)meta_manager_.UnlockKeys(lock_context);
-    return InvalidState("MetaManager returned an invalid AccessTable lookup");
+    return Status::InvalidState("MetaManager returned an invalid AccessTable lookup");
   }
 
   const std::uint64_t id = next_access_table_id_++;
   if (id == 0) {
     (void)meta_manager_.UnlockKeys(lock_context);
-    return InvalidState("AccessTable handle space is exhausted");
+    return Status::InvalidState("AccessTable handle space is exhausted");
   }
   auto table = std::make_unique<AccessTableState>();
   table->lock_context = lock_context;
@@ -222,14 +189,14 @@ Status Runtime::PrepareAccessTable(const AccessTablePrepareRequest& request,
 Status Runtime::GetAccessTableView(const AccessTableHandle& handle,
                                    AccessTableView* view) const {
   if (!initialized_) {
-    return NotInitialized("Runtime has not been initialized");
+    return Status::NotInitialized("Runtime has not been initialized");
   }
   if (view == nullptr) {
-    return InvalidArgument("view must not be null");
+    return Status::InvalidArgument("view must not be null");
   }
   const AccessTableState* table = FindAccessTable(handle);
   if (table == nullptr) {
-    return NotFound("AccessTable handle was not found");
+    return Status::NotFound("AccessTable handle was not found");
   }
   *view = AccessTableView{table->addresses.data(), table->lengths.data(),
                           table->valid.data(), table->addresses.size()};
@@ -238,11 +205,11 @@ Status Runtime::GetAccessTableView(const AccessTableHandle& handle,
 
 Status Runtime::ReleaseAccessTable(const AccessTableHandle& handle) {
   if (!initialized_) {
-    return NotInitialized("Runtime has not been initialized");
+    return Status::NotInitialized("Runtime has not been initialized");
   }
   AccessTableState* table = FindAccessTable(handle);
   if (table == nullptr) {
-    return NotFound("AccessTable handle was not found");
+    return Status::NotFound("AccessTable handle was not found");
   }
   const Status status = meta_manager_.UnlockKeys(table->lock_context);
   if (!status.ok()) {
@@ -254,33 +221,33 @@ Status Runtime::ReleaseAccessTable(const AccessTableHandle& handle) {
 
 Status Runtime::BatchGet(const BatchGetRequest& request) {
   if (!initialized_) {
-    return NotInitialized("Runtime has not been initialized");
+    return Status::NotInitialized("Runtime has not been initialized");
   }
   const AccessTableState* table = FindAccessTable(request.access_table);
   if (table == nullptr) {
-    return NotFound("AccessTable handle was not found");
+    return Status::NotFound("AccessTable handle was not found");
   }
-  if (!IsInt32Buffer(request.indices) ||
-      !IsInt32Buffer(request.output_indices) ||
+  if (!request.indices.has_elements<std::int32_t>() ||
+      !request.output_indices.has_elements<std::int32_t>() ||
       request.indices.bytes != request.output_indices.bytes) {
-    return InvalidArgument(
+    return Status::InvalidArgument(
         "indices and output_indices must be equally sized int32 buffers");
   }
   const std::size_t request_count =
       request.indices.bytes / sizeof(std::int32_t);
-  if (HasBuffer(request.mask) &&
-      (request.mask.data == nullptr || request.mask.bytes != request_count ||
+  if (!request.mask.empty() &&
+      (!request.mask.valid() || request.mask.bytes != request_count ||
        request.mask.device != request.indices.device)) {
-    return InvalidArgument("mask must match indices when provided");
+    return Status::InvalidArgument("mask must match indices when provided");
   }
-  if (request.output.data == nullptr || request.output.bytes == 0 ||
+  if (!request.output.valid() ||
       request.output_block_bytes == 0 ||
       request.output.bytes % request.output_block_bytes != 0) {
-    return InvalidArgument("output must contain whole non-empty output blocks");
+    return Status::InvalidArgument("output must contain whole non-empty output blocks");
   }
   if (request.indices.device != request.output_indices.device ||
       request.indices.device != request.output.device) {
-    return InvalidArgument("BatchGet input and output buffers must share a device");
+    return Status::InvalidArgument("BatchGet input and output buffers must share a device");
   }
 
   if (request.indices.device == DeviceKind::kNpu) {
@@ -293,11 +260,11 @@ Status Runtime::BatchGet(const BatchGetRequest& request) {
         request.device_access_table.valid.bytes != table->valid.size() ||
         request.device_access_table.addresses.device != DeviceKind::kNpu ||
         request.device_access_table.valid.device != DeviceKind::kNpu) {
-      return InvalidArgument(
+      return Status::InvalidArgument(
           "NPU BatchGet requires caller-provided matching device AccessTable buffers");
     }
   } else if (!request.device_access_table.empty()) {
-    return InvalidArgument("CPU BatchGet must not provide device AccessTable buffers");
+    return Status::InvalidArgument("CPU BatchGet must not provide device AccessTable buffers");
   }
 
   const AccessTableView view{table->addresses.data(), table->lengths.data(),
@@ -307,10 +274,10 @@ Status Runtime::BatchGet(const BatchGetRequest& request) {
 
 Status Runtime::BatchPut(const BatchPutRequest& request) {
   if (!initialized_) {
-    return NotInitialized("Runtime has not been initialized");
+    return Status::NotInitialized("Runtime has not been initialized");
   }
   if (request.keys.empty() || request.keys.size() != request.blocks.size()) {
-    return InvalidArgument("BatchPut keys and blocks must be non-empty and equal in size");
+    return Status::InvalidArgument("BatchPut keys and blocks must be non-empty and equal in size");
   }
 
   const DeviceKind device = request.blocks.front().device;
@@ -318,10 +285,10 @@ Status Runtime::BatchPut(const BatchPutRequest& request) {
   lengths.reserve(request.blocks.size());
   for (const ConstBufferView& block : request.blocks) {
     if (block.data == nullptr || block.bytes == 0) {
-      return InvalidArgument("BatchPut blocks must be non-empty");
+      return Status::InvalidArgument("BatchPut blocks must be non-empty");
     }
     if (block.device != device) {
-      return InvalidArgument("BatchPut blocks must share a device");
+      return Status::InvalidArgument("BatchPut blocks must share a device");
     }
     lengths.push_back(block.bytes);
   }
@@ -346,10 +313,10 @@ Status Runtime::BatchPut(const BatchPutRequest& request) {
 
 Status Runtime::BatchFree(const BatchFreeRequest& request) {
   if (!initialized_) {
-    return NotInitialized("Runtime has not been initialized");
+    return Status::NotInitialized("Runtime has not been initialized");
   }
   if (request.keys.empty()) {
-    return InvalidArgument("BatchFree requires at least one key");
+    return Status::InvalidArgument("BatchFree requires at least one key");
   }
   return meta_manager_.BatchFree(request.keys);
 }

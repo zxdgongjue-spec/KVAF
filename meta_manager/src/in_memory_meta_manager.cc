@@ -52,15 +52,15 @@ struct ActiveLockContext {
 };
 
 Status InvalidArgument(std::string message) {
-  return Status::Error(StatusCode::kInvalidArgument, std::move(message));
+  return Status::InvalidArgument(std::move(message));
 }
 
 Status NotInitialized(std::string message) {
-  return Status::Error(StatusCode::kNotInitialized, std::move(message));
+  return Status::NotInitialized(std::move(message));
 }
 
 Status NotFound(std::string message) {
-  return Status::Error(StatusCode::kNotFound, std::move(message));
+  return Status::NotFound(std::move(message));
 }
 
 Status AlreadyExists(std::string message) {
@@ -72,7 +72,7 @@ Status Busy(std::string message) {
 }
 
 Status InvalidState(std::string message) {
-  return Status::Error(StatusCode::kInvalidState, std::move(message));
+  return Status::InvalidState(std::move(message));
 }
 
 // 批量接口要求 key 唯一，避免重复申请或重复释放。

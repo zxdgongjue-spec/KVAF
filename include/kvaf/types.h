@@ -32,12 +32,28 @@ struct ConstBufferView {
   const void* data{nullptr};
   std::size_t bytes{0};
   DeviceKind device{DeviceKind::kCpu};
+
+  bool empty() const { return data == nullptr && bytes == 0; }
+  bool valid() const { return data != nullptr && bytes != 0; }
+
+  template <typename Element>
+  bool has_elements() const {
+    return valid() && bytes % sizeof(Element) == 0;
+  }
 };
 
 struct MutableBufferView {
   void* data{nullptr};
   std::size_t bytes{0};
   DeviceKind device{DeviceKind::kCpu};
+
+  bool empty() const { return data == nullptr && bytes == 0; }
+  bool valid() const { return data != nullptr && bytes != 0; }
+
+  template <typename Element>
+  bool has_elements() const {
+    return valid() && bytes % sizeof(Element) == 0;
+  }
 };
 
 // 当前同步 Runtime 不暴露 Event；保留类型以免破坏已有占位调用方。

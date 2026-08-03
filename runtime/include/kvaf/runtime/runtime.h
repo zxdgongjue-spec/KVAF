@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 #include "kvaf/access_operator/access_operator.h"
 #include "kvaf/meta_manager/meta_manager.h"
@@ -62,7 +63,13 @@ class Runtime {
   DdrMemoryAllocator& ddr_allocator_;
 
  private:
-  struct AccessTableState;
+  struct AccessTableState {
+    LockContext lock_context;
+    std::vector<Address> addresses;
+    std::vector<std::uint64_t> lengths;
+    std::vector<std::uint8_t> valid;
+  };
+
   AccessTableState* FindAccessTable(const AccessTableHandle& handle);
   const AccessTableState* FindAccessTable(
       const AccessTableHandle& handle) const;

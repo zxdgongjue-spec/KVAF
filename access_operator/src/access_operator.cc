@@ -14,15 +14,15 @@ namespace kvaf {
 namespace {
 
 Status InvalidArgument(std::string message) {
-  return Status::Error(StatusCode::kInvalidArgument, std::move(message));
+  return Status::InvalidArgument(std::move(message));
 }
 
 Status InvalidState(std::string message) {
-  return Status::Error(StatusCode::kInvalidState, std::move(message));
+  return Status::InvalidState(std::move(message));
 }
 
 Status Internal(std::string message) {
-  return Status::Error(StatusCode::kInternal, std::move(message));
+  return Status::Internal(std::move(message));
 }
 
 std::uint64_t PointerValue(const void* pointer) {
