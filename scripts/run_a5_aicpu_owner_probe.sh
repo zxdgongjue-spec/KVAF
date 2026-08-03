@@ -6,9 +6,17 @@
 
 set -Eeuo pipefail
 umask 077
+unset BASH_ENV ENV
+unset -f exit builtin 2>/dev/null || true
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd -P)
+
+echo "KVAF_A5_AICPU_OWNER_DYNAMIC_PROBE_DISABLED" >&2
+echo "CAPABILITY_OBSERVATION_LEDGER=not-implemented" >&2
+echo "No CANN/package/ACL/AICPU/NPU operation was attempted." >&2
+builtin exit 2
+if [[ 0 == 1 ]]; then
 source "${SCRIPT_DIR}/a5_direct_urma_legacy_guard.sh"
 source "${SCRIPT_DIR}/a5_direct_urma_manifest_v3.sh"
 source "${SCRIPT_DIR}/a5_direct_urma_runtime_preflight.sh"
@@ -146,3 +154,5 @@ echo "KVAF_A5_AICPU_OWNER_PROBE_PREFLIGHT_OK"
 echo "AICPU_ARCHIVE=${KVAF_DIRECT_AICPU_ARCHIVE}"
 echo "AICPU_REGISTRATION=verified-exact"
 exec "${KVAF_A5_OWNER_PROBE_BINARY}" "$@"
+fi
+/bin/sh -c 'exit 2'

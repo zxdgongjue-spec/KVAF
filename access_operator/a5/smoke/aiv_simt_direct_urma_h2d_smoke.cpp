@@ -1970,6 +1970,16 @@ bool TryRecoverRetainedAfterException(
 }  // namespace
 
 int main(int argc, char** argv) {
+  // Defense in depth: the shell runner is not a security boundary because an
+  // operator can invoke this build artifact directly.  Keep the resource-
+  // bearing binary itself inert until a reviewed capability ledger proves the
+  // caller domain, lifecycle, Host-to-NPU mapping and private queue ABI.  This
+  // gate is unconditional and has no environment-variable override.
+  std::cerr << "KVAF_A5_DIRECT_BINARY_HARDWARE_EXECUTION_DISABLED\n"
+            << "CAPABILITY_LEDGER=not-implemented\n"
+            << "No ACL/NPU/DDR/HBM/URMA operation was attempted.\n";
+  return 2;
+
   std::set_terminate(FailClosedTerminate);
   Options options;
   if (!ParseOptions(argc, argv, &options)) {

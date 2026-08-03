@@ -1,5 +1,11 @@
 # A5 AICPU bounded owner probe 与分阶段 owner 设计
 
+> **HISTORICAL / `HARDWARE_EXECUTION_DISABLED`**
+>
+> 本文保留 AICPU/AIV 控制记录协议和 owner 生命周期分析，但不再提供动态
+> probe 或资源版 owner 的真机操作。即使 resource-free probe 不创建 URMA/UMMU
+> 资源，它仍会进入 ACL、AICPU 和 AIV，因此不属于当前允许的静态检查。
+
 ## 1. 结论
 
 `kvaf_a5_aicpu_owner_probe` 是一个不创建 URMA/UMMU 资源的并发可见性探针。
@@ -9,9 +15,10 @@
 
 **Probe PASS 不会解锁 direct URMA。** 它没有执行 provider Open、AIV 数据传输或
 provider Close，因而不能证明 UDMA/UMMU 句柄在完整生命周期内由同一个 AICPU
-进程和 SO instance 持有。`scripts/a5_aicpu_affinity_guard.sh` 当前固定为
-`candidate-epoch-owner-unvalidated-v1`：普通生产入口仍 fail closed，只有专用 staged
-wrapper 能运行资源版 owner 矩阵；环境变量和 probe 输出都不能覆盖这道门。
+进程和 SO instance 持有。历史实现曾使用
+`candidate-epoch-owner-unvalidated-v1` staged wrapper；当前全局
+`HARDWARE_EXECUTION_DISABLED` 门禁同时禁止动态 owner probe 和资源版矩阵，
+不存在环境变量、probe 输出或专用 wrapper 绕过。
 
 ## 2. 探针验证的协议
 
@@ -78,8 +85,8 @@ claim 还会拒绝 owner 之外的 Open/Close。Host 关闭时先冻结新提交
 或控制记录不可读时，不能由新进程接管旧 owner，必须继续保留
 active/quarantine 语义。只有资源版 owner 的 Open-transfer-Close fault matrix
 全部通过后，才能评审是否把正式 runner 的源码 gate 改为
-`single-invocation-owner-v1`。目前只能通过显式的 epoch-owner candidate wrapper
-运行真机验证。
+`single-invocation-owner-v1`。历史 epoch-owner candidate wrapper 只保留作代码
+审计，当前不能运行真机验证。
 
 ### 3.3 Production epoch owner
 
@@ -121,76 +128,26 @@ soak、调度压力和异常退出仍是后续工作。
 PID、TID、SO base 和 generation 可以随结果记录，但它们只是诊断。即使 10,000 次
 都相同，也不能推出下一次独立 KFC Open/Close 一定命中同一 worker。
 
-## 5. 操作命令
+## 5. 历史操作记录（不可执行）
 
-探针会使用 AICPU 和 AIV，必须在服务器 B 上选择调度系统已隔离且空闲的 NPU。
-它不应与线上 vLLM 请求并发执行。
+旧验证流程会构建 provider、部署 AICPU package、构建 probe，然后在隔离 NPU 上
+启动动态 owner runner。这条流程已撤下：package 部署会改变 CANN
+注册状态，probe 随后会调用 `aclInit` 并进入 AICPU/AIV；两者都不属于当前静态审计
+范围。保留的历史关系如下，故意使用非 shell 记录格式：
 
-### 5.1 服务器 B 宿主机
-
-执行环境：`SERVER_B_HOST`
-
-```bash
-echo "EXECUTION_ENV=SERVER_B_HOST"
-cd /data/c00982601/KVAF
-git switch A5_AIV_URMA_cs
-git pull --ff-only origin A5_AIV_URMA_cs
-docker exec -it -u 0 vllm-ascend-cs-kvaf bash --noprofile --norc
+```text
+HISTORICAL_OWNER_PROBE_RECORD (NOT SHELL)
+  build provider: scripts/build_a5_direct_urma_provider.sh
+  deploy AICPU package: scripts/package_a5_direct_urma_aicpu.sh
+  build probe: scripts/build_a5_direct_urma.sh
+  dynamic runner: scripts/run_a5_aicpu_owner_probe.sh
+  former parameters: logical_device_id=7, timeout_seconds=5
+  execution: HARDWARE_EXECUTION_DISABLED
 ```
 
-### 5.2 `vllm-ascend-cs-kvaf` Docker
-
-执行环境：`VLLM_ASCEND_CS_KVAF_DOCKER`
-
-```bash
-echo "EXECUTION_ENV=VLLM_ASCEND_CS_KVAF_DOCKER"
-cd /data/c00982601/KVAF
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-
-export KVAF_A5_DIRECT_BUILD_DIR=/data/c00982601/KVAF/build-a5-direct-urma
-export KVAF_DIRECT_PROVIDER_BUILD_DIR=/data/c00982601/KVAF/build-a5-direct-urma-provider
-export KVAF_UMDK_ROOT=/data/c00982601/umdk
-export KVAF_LIBUMMU_ROOT=/data/c00982601/libummu
-kvaf_kernel_uapi_dir=/data/c00982601/kernel-uapi/$(uname -r)
-export KVAF_RUNTIME_UDMA_UAPI_HEADER="$kvaf_kernel_uapi_dir/udma_abi.h"
-export KVAF_RUNTIME_UMMU_UAPI_HEADER="$kvaf_kernel_uapi_dir/ummu_core.h"
-
-if [[ ! -r "$KVAF_RUNTIME_UDMA_UAPI_HEADER" ||
-      ! -r "$KVAF_RUNTIME_UMMU_UAPI_HEADER" ]]; then
-  echo "ERROR: the running-kernel UDMA/UMMU UAPI copy is missing" >&2
-  echo "Copy the exact headers from Server B host as documented in a5_direct_urma_h2d.md." >&2
-  exit 1
-fi
-
-if [[ -r \
-  /data/c00982601/asc-devkit-9.1.0-20260722/include/simt_api/asc_simt.h ]]; then
-  export KVAF_ASC_DEVKIT_PATH=/data/c00982601/asc-devkit-9.1.0-20260722
-else
-  export KVAF_ASC_DEVKIT_PATH=/data/c00982601/asc-devkit
-fi
-
-if ! bash scripts/build_a5_direct_urma_provider.sh; then
-  echo "ERROR: provider build failed; package and probe were not attempted" >&2
-  exit 1
-fi
-if ! bash scripts/package_a5_direct_urma_aicpu.sh; then
-  echo "ERROR: AICPU packaging failed; probe was not attempted" >&2
-  exit 1
-fi
-if ! bash scripts/build_a5_direct_urma.sh; then
-  echo "ERROR: A5 probe build failed" >&2
-  exit 1
-fi
-
-bash scripts/run_a5_aicpu_owner_probe.sh \
-  --logical-device-id 7 \
-  --timeout-seconds 5
-```
-
-必须通过 `run_a5_aicpu_owner_probe.sh` 启动，而不是直接调用二进制。wrapper 在
-`aclInit` 之前持有 deploy/active 两把锁，并验证 provider v3、direct build manifest、
-owner-probe 哈希、真实 `libascendcl.so`、独立 KVAF AICPU tar，以及
-`ascend_package_load.ini` 中唯一且精确的注册块。成功进入硬件探针前会先输出：
+历史 wrapper 会在 `aclInit` 之前持有 deploy/active 两把锁，并验证 provider v3、
+direct build manifest、owner-probe 哈希、真实 `libascendcl.so`、独立 KVAF AICPU tar，
+以及 `ascend_package_load.ini` 中唯一且精确的注册块。旧成功前置标记为：
 
 ```text
 KVAF_A5_AICPU_OWNER_PROBE_PREFLIGHT_OK
@@ -203,10 +160,8 @@ UB_MicroBenchmark 的 `compat/liburma_perftest.tar.gz`。仅有 tar 而缺少 CA
 注册时，wrapper 会在任何 ACL/NPU 操作前失败；这正是旧版本出现 `507018` 和
 Device 侧 `So does not exist` 的原因。
 
-允许的 timeout 范围是 1–10 秒。probe PASS 后仍不要通过环境变量绕过正式
-`run_a5_direct_urma_h2d_smoke.sh` 的 gate。资源版 session/epoch owner 已进入 candidate
-验证阶段，应只通过 `run_a5_direct_urma_epoch_owner_validation.sh` 分阶段测试；probe
-本身仍不能解除生产门禁。
+旧 timeout 范围是 1–10 秒。即使已有历史 PASS，也不能据此运行 direct smoke 或
+epoch-owner candidate；当前没有环境变量、旧 marker 或风险接受短语可以解除门禁。
 
 ## 6. 最小否证标准
 

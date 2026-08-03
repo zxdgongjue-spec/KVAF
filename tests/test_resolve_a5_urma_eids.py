@@ -381,7 +381,7 @@ class LockTopologyTests(unittest.TestCase):
 
 
 class RunnerIntegrationTests(unittest.TestCase):
-    def test_runner_auto_resolves_pair_before_binary_preflight(self) -> None:
+    def test_legacy_hcomm_runner_gate_precedes_pair_resolution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             proc_root = root / "proc"
@@ -417,12 +417,20 @@ class RunnerIntegrationTests(unittest.TestCase):
                 env=environment,
             )
             self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
             self.assertIn(
-                "KVAF_A5_EID_RESOLVED "
-                "source=driver_pair_info physical_device=0 channel=3",
-                result.stdout,
+                "KVAF_A5_HCOMM_HARDWARE_EXECUTION_DISABLED",
+                result.stderr,
             )
-            self.assertIn("smoke binary is missing", result.stderr)
+            self.assertIn(
+                "No topology/EID/ACL/NPU/HCOMM/URMA operation was attempted.",
+                result.stderr,
+            )
+            self.assertNotIn("KVAF_A5_EID_RESOLVED", result.stdout)
+            self.assertNotIn("smoke binary is missing", result.stderr)
+            self.assertEqual(
+                (proc_root / "dev_id").read_text(encoding="utf-8"), ""
+            )
 
 
 if __name__ == "__main__":

@@ -2,9 +2,17 @@
 
 set -Eeuo pipefail
 umask 077
+unset BASH_ENV ENV
+unset -f exit builtin 2>/dev/null || true
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd -P)
+
+echo "KVAF_A5_HCOMM_HARDWARE_EXECUTION_DISABLED" >&2
+echo "CAPABILITY_LEDGER=not-implemented" >&2
+echo "No topology/EID/ACL/NPU/HCOMM/URMA operation was attempted." >&2
+builtin exit 2
+if [[ 0 == 1 ]]; then
 
 KVAF_A5_BUILD_DIR=${KVAF_A5_BUILD_DIR:-"${ROOT_DIR}/build-a5-aiv-urma"}
 KVAF_A5_BINARY=${KVAF_A5_BINARY:-"${KVAF_A5_BUILD_DIR}/access_operator/a5/kvaf_a5_aiv_urma_h2d_smoke"}
@@ -306,3 +314,5 @@ grep -E 'KVAF_A5_(DDR|CHANNEL|DIRECT|H2D|TEARDOWN)' \
   "${host_log}" "${device_log}"
 echo "KVAF_A5_AIV_SIMT_URMA_H2D_ACCEPTANCE=PASS"
 echo "RESULT_DIR=${KVAF_A5_RESULT_DIR}"
+fi
+/bin/sh -c 'exit 2'

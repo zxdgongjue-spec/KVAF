@@ -45,7 +45,13 @@ struct kvaf_perftest_management_diagnostic_v1 {
   int32_t raw_errno;
   int32_t effective_errno;
   int32_t operation_status;
-  int32_t completion_status;
+  /*
+   * The upper status word is provider-specific auxiliary evidence.  It is
+   * not a hardware completion code unless the matching semantic flag says
+   * so.  In particular CREATE_JFR stores the local provider failure-stage
+   * id here.
+   */
+  int32_t auxiliary_status;
 };
 
 void kvaf_perftest_management_diagnostic_reset(void);

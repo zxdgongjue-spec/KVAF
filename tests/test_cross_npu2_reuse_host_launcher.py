@@ -25,7 +25,7 @@ class CrossNpu2ReuseHostLauncherTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
-    def test_invalid_invocation_stops_before_host_or_docker_checks(self) -> None:
+    def test_retired_launcher_stops_before_argument_or_docker_checks(self) -> None:
         completed = subprocess.run(
             ["bash", str(LAUNCHER)],
             cwd=ROOT,
@@ -34,7 +34,11 @@ class CrossNpu2ReuseHostLauncherTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(completed.returncode, 2)
-        self.assertIn("Usage:", completed.stderr)
+        self.assertIn(
+            "KVAF_A5_CROSS_NPU2_REUSE_DETACHED_COORDINATOR_DISABLED",
+            completed.stderr,
+        )
+        self.assertNotIn("Usage:", completed.stderr)
 
     def test_start_requires_an_explicit_short_risk_flag(self) -> None:
         self.assertIn(

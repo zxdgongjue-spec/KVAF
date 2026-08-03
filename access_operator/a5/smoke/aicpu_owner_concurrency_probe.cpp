@@ -450,6 +450,11 @@ int RunProbe(const Options& options) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  std::cerr << "KVAF_A5_AICPU_OWNER_BINARY_DYNAMIC_PROBE_DISABLED\n"
+            << "CAPABILITY_OBSERVATION_LEDGER=not-implemented\n"
+            << "No ACL/AICPU/NPU operation was attempted.\n";
+  return 2;
+
   Options options;
   if (!ParseOptions(argc, argv, &options)) {
     PrintUsage(argv[0]);

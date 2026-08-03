@@ -205,9 +205,11 @@ int main(int argc, char** argv) {
               std::string::npos ||
           open.message().find("management_raw_errno=22") ==
               std::string::npos ||
-          open.message().find("management_completion_status=12") ==
+          open.message().find("management_auxiliary_status=12") ==
               std::string::npos ||
-          open.message().find("management_diagnostic_flags=47") ==
+          open.message().find("management_diagnostic_flags=111") ==
+              std::string::npos ||
+          open.message().find("management_auxiliary_kind=64") ==
               std::string::npos ||
           open.message().find("jfr_context_sva_separate=0") ==
               std::string::npos ||

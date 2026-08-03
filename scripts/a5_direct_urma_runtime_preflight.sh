@@ -8,7 +8,6 @@ KVAF_RUNTIME_PREFLIGHT_SCRIPT_DIR=$(
   cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P
 )
 source "${KVAF_RUNTIME_PREFLIGHT_SCRIPT_DIR}/a5_aicpu_package_registration.sh"
-unset KVAF_RUNTIME_PREFLIGHT_SCRIPT_DIR
 
 kvaf_runtime_preflight_error()
 {
@@ -69,6 +68,11 @@ kvaf_verify_direct_runtime_artifacts_v3()
   local expected_registration_file runtime_registration_file
   local legacy_registration_count sibling_archive sibling_entries
   local entry entry_count unexpected_entries archive_provider_sha
+  local runtime_probe_provider_filename runtime_probe_provider_sha
+  local device_provider_soname registered_package_audit
+  local registered_package_audit_b64 registered_package_audit_sha
+  local registered_package_audit_rc
+  local archive_runtime_probe_provider_sha
   local archive_build_manifest_sha archive_source_manifest_sha
   local archive_umdk_source_manifest_sha archive_libummu_source_manifest_sha
   local probe archive_probe_sha local_probe_sha binary_dynamic
@@ -84,8 +88,18 @@ kvaf_verify_direct_runtime_artifacts_v3()
     aicpu_kernels_device/kvaf_udma_private_abi_probe
     aicpu_kernels_device/kvaf_ummu_uapi_probe
   )
+  runtime_probe_provider_filename=${KVAF_VERIFIED_RUNTIME_PROBE_PROVIDER_FILENAME:-}
+  runtime_probe_provider_sha=${KVAF_VERIFIED_RUNTIME_PROBE_PROVIDER_SHA:-}
+  [[ ${runtime_probe_provider_filename} =~ ^libkvaf_rt_[0-9a-f]{16}\.so$ &&
+     ${runtime_probe_provider_sha} =~ ^[0-9a-f]{64}$ ]] || {
+    kvaf_runtime_preflight_error \
+      "verified runtime probe provider identity is unavailable"
+    return 1
+  }
+  required_archive_entries+=(
+    "aicpu_kernels_device/${runtime_probe_provider_filename}")
 
-  for command in awk cp grep ldd nm readelf readlink realpath sha256sum tar timeout; do
+  for command in awk base64 bash cp grep ldd nm python3 readelf readlink realpath sha256sum tar timeout; do
     command -v "${command}" >/dev/null 2>&1 || {
       kvaf_runtime_preflight_error "${command} is required"
       return 1
@@ -217,6 +231,11 @@ kvaf_verify_direct_runtime_artifacts_v3()
       "runtime AICPU package registry must be ${expected_registration_file}"
     return 1
   }
+  kvaf_aicpu_acquire_registry_lock "${runtime_registration_file}" || {
+    kvaf_runtime_preflight_error \
+      "could not acquire the shared CANN AICPU registry lock"
+    return 1
+  }
   kvaf_aicpu_registration_is_exact \
     "${runtime_registration_file}" \
     "${expected_package_name}" \
@@ -239,6 +258,103 @@ kvaf_verify_direct_runtime_artifacts_v3()
       "legacy liburma_perftest registration conflicts with the isolated KVAF package"
     return 1
   fi
+  registered_package_audit="${KVAF_RUNTIME_PREFLIGHT_SCRIPT_DIR}/audit_a5_registered_aicpu_packages.sh"
+  [[ -f ${registered_package_audit} &&
+     ! -L ${registered_package_audit} &&
+     -x ${registered_package_audit} ]] || {
+    kvaf_runtime_preflight_error \
+      "registered AICPU package audit is missing or unsafe"
+    return 1
+  }
+  device_provider_soname=$(readelf -d \
+    "${KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY}" | awk '
+      /\(SONAME\)/ {
+        value = $0
+        sub(/^.*\[/, "", value)
+        sub(/\].*$/, "", value)
+        count++
+      }
+      END { if (count != 1 || value == "") exit 1; print value }
+    ') || {
+    kvaf_runtime_preflight_error "Device provider has no unique SONAME"
+    return 1
+  }
+  # Securely snapshot the checked script with O_NOFOLLOW and pre/post fstat.
+  # Base64 preserves every byte (including NUL) in a shell variable.  The
+  # digest must match the provider build manifest, so a pre-open replacement
+  # cannot silently weaken this gate.
+  registered_package_audit_b64=$(python3 -c '
+import base64, os, stat, sys
+path = sys.argv[1]
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+fd = os.open(path, flags)
+try:
+    before = os.fstat(fd)
+    if (not stat.S_ISREG(before.st_mode) or
+            before.st_size <= 0 or before.st_size > 1024 * 1024 or
+            before.st_mode & 0o111 == 0):
+        raise RuntimeError("unsafe audit source")
+    chunks = []
+    remaining = before.st_size
+    while remaining:
+        chunk = os.read(fd, min(remaining, 65536))
+        if not chunk:
+            raise RuntimeError("short audit read")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if os.read(fd, 1):
+        raise RuntimeError("audit grew during read")
+    after = os.fstat(fd)
+    identity = lambda value: (value.st_dev, value.st_ino, value.st_size,
+        value.st_mtime_ns, value.st_ctime_ns)
+    if identity(before) != identity(after):
+        raise RuntimeError("audit changed during read")
+    sys.stdout.write(base64.b64encode(b"".join(chunks)).decode("ascii"))
+finally:
+    os.close(fd)
+' "${registered_package_audit}") || {
+    kvaf_runtime_preflight_error \
+      "could not pin the registered AICPU package audit bytes"
+    return 1
+  }
+  [[ -n ${registered_package_audit_b64} ]] || {
+    kvaf_runtime_preflight_error \
+      "registered AICPU package audit is empty"
+    return 1
+  }
+  registered_package_audit_sha=$(printf '%s' \
+    "${registered_package_audit_b64}" | base64 -d | \
+    sha256sum | awk '{print $1}') || {
+    kvaf_runtime_preflight_error \
+      "could not hash the pinned registered AICPU package audit"
+    return 1
+  }
+  [[ ${registered_package_audit_sha} == \
+     "${KVAF_VERIFIED_REGISTERED_PACKAGE_AUDIT_SHA:-}" ]] || {
+    kvaf_runtime_preflight_error \
+      "registered AICPU package audit differs from the verified provider build"
+    return 1
+  }
+  if printf '%s' "${registered_package_audit_b64}" | base64 -d | \
+    bash --noprofile --norc -s -- \
+      --ascend-home "${ASCEND_HOME_PATH}" \
+      --registry "${runtime_registration_file}" \
+      --replace-archive "${expected_archive}" \
+      --candidate-soname \
+        "${device_provider_soname}=${KVAF_VERIFIED_DEVICE_PROVIDER_SHA}" \
+      --candidate-soname \
+        "${runtime_probe_provider_filename}=${runtime_probe_provider_sha}"; then
+    registered_package_audit_rc=0
+  else
+    registered_package_audit_rc=$?
+  fi
+  unset registered_package_audit_b64
+  if (( registered_package_audit_rc != 0 )); then
+    kvaf_runtime_preflight_error \
+      "registered AICPU package/SONAME audit failed"
+    return 1
+  fi
+  echo "REGISTERED_AICPU_PACKAGE_AUDIT_SHA256=${registered_package_audit_sha}"
   for sibling_archive in "${expected_archive%/*}"/*.tar.gz; do
     [[ -e "${sibling_archive}" ]] || continue
     [[ "${sibling_archive}" != "${KVAF_DIRECT_AICPU_ARCHIVE}" ]] ||
@@ -256,7 +372,7 @@ kvaf_verify_direct_runtime_artifacts_v3()
       return 1
     }
     if grep -Eq \
-        '(^|/)(libkvaf_urma_provider(_host|_device)?|liburma_perftest)\.so$' \
+        '(^|/)(libkvaf_urma_provider(_host|_device)?|libkvaf_rt_[0-9a-f]{16}|liburma_perftest)\.so$' \
         <<<"${sibling_entries}"; then
       kvaf_runtime_preflight_error \
         "sibling AICPU package contains a conflicting URMA provider: ${sibling_archive}"
@@ -276,7 +392,7 @@ kvaf_verify_direct_runtime_artifacts_v3()
     }
   done
   unexpected_entries=$(grep -Ev \
-    '^aicpu_kernels_device/?$|^aicpu_kernels_device/(libkvaf_urma_provider_device\.so|kvaf-direct-urma-provider\.manifest|kvaf-direct-urma-source\.sha256|kvaf-direct-urma-umdk-source\.sha256|kvaf-direct-urma-libummu-source\.sha256|kvaf_udma_uapi_probe|kvaf_udma_private_abi_probe|kvaf_ummu_uapi_probe)$' \
+    "^aicpu_kernels_device/?$|^aicpu_kernels_device/(libkvaf_urma_provider_device\\.so|${runtime_probe_provider_filename//./\\.}|kvaf-direct-urma-provider\\.manifest|kvaf-direct-urma-source\\.sha256|kvaf-direct-urma-umdk-source\\.sha256|kvaf-direct-urma-libummu-source\\.sha256|kvaf_udma_uapi_probe|kvaf_udma_private_abi_probe|kvaf_ummu_uapi_probe)$" \
     <<<"${archive_entries}" || true)
   [[ -z "${unexpected_entries}" ]] || {
     kvaf_runtime_preflight_error \
@@ -290,6 +406,9 @@ kvaf_verify_direct_runtime_artifacts_v3()
   archive_build_manifest_sha=$(kvaf_runtime_preflight_archive_sha \
     "${KVAF_DIRECT_AICPU_ARCHIVE}" \
     aicpu_kernels_device/kvaf-direct-urma-provider.manifest) || return 1
+  archive_runtime_probe_provider_sha=$(kvaf_runtime_preflight_archive_sha \
+    "${KVAF_DIRECT_AICPU_ARCHIVE}" \
+    "aicpu_kernels_device/${runtime_probe_provider_filename}") || return 1
   archive_source_manifest_sha=$(kvaf_runtime_preflight_archive_sha \
     "${KVAF_DIRECT_AICPU_ARCHIVE}" \
     aicpu_kernels_device/kvaf-direct-urma-source.sha256) || return 1
@@ -300,6 +419,8 @@ kvaf_verify_direct_runtime_artifacts_v3()
     "${KVAF_DIRECT_AICPU_ARCHIVE}" \
     aicpu_kernels_device/kvaf-direct-urma-libummu-source.sha256) || return 1
   [[ "${archive_provider_sha}" == "${device_provider_sha}" &&
+     "${archive_runtime_probe_provider_sha}" == \
+       "${runtime_probe_provider_sha}" &&
      "${archive_build_manifest_sha}" == "${build_manifest_sha}" &&
      "${archive_source_manifest_sha}" == "${source_manifest_sha}" &&
      "${archive_umdk_source_manifest_sha}" == \
@@ -354,6 +475,46 @@ kvaf_verify_direct_runtime_artifacts_v3()
         return 1
       }
     done
+    if grep -Eq \
+        '[[:space:]]aicpu_kvaf_urma_rt_probe_v2(@@[^[:space:]]+)?$' \
+        <<<"${provider_symbols}"; then
+      kvaf_runtime_preflight_error \
+        "canonical provider exports the isolated runtime probe: ${provider}"
+      return 1
+    fi
+  done
+
+  provider="${KVAF_DIRECT_PROVIDER_BUILD_DIR}/${runtime_probe_provider_filename}"
+  [[ ! -L ${provider} && -f ${provider} && -r ${provider} ]] || {
+    kvaf_runtime_preflight_error \
+      "isolated runtime probe provider is missing or unsafe"
+    return 1
+  }
+  provider_dynamic=$(readelf -d "${provider}") || return 1
+  if grep -Eq \
+      'lib(hcomm|urma_perftest|urma_common|urma|urma-udma|ummu|udma)\.so|\((RPATH|RUNPATH)\)' \
+      <<<"${provider_dynamic}"; then
+    kvaf_runtime_preflight_error \
+      "isolated runtime probe provider contains stateful linkage or RPATH"
+    return 1
+  fi
+  provider_symbols=$(nm -D --defined-only "${provider}") || return 1
+  grep -Eq \
+    '[[:space:]]aicpu_kvaf_urma_rt_probe_v2(@@KVAF_URMA_RUNTIME_PROBE_2)?$' \
+    <<<"${provider_symbols}" || {
+    kvaf_runtime_preflight_error \
+      "isolated runtime probe provider lacks its sole AICPU entry"
+    return 1
+  }
+  for symbol in aicpu_kvaf_urma_open_v2 aicpu_kvaf_urma_close_v2 \
+    aicpu_kvaf_urma_owner_probe_v1 aicpu_kvaf_urma_epoch_owner_v1
+  do
+    if grep -Eq "[[:space:]]${symbol}(@@[^[:space:]]+)?$" \
+        <<<"${provider_symbols}"; then
+      kvaf_runtime_preflight_error \
+        "isolated runtime probe provider leaks canonical entry ${symbol}"
+      return 1
+    fi
   done
 
   KVAF_VERIFIED_DIRECT_BINARY_SHA=${direct_binary_sha}

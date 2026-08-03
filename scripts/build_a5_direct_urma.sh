@@ -330,6 +330,7 @@ cmake --build "${KVAF_A5_DIRECT_BUILD_DIR}" \
   --target \
     kvaf_a5_aiv_direct_urma_h2d_smoke \
     kvaf_a5_aicpu_owner_probe \
+    kvaf_a5_aicpu_runtime_urma_probe \
   --parallel "${KVAF_A5_BUILD_JOBS}"
 
 write_direct_source_manifest \
@@ -346,12 +347,17 @@ rm -f "${KVAF_A5_DIRECT_BUILD_DIR}/direct-smoke-source.before.sha256"
 
 binary="${KVAF_A5_DIRECT_BUILD_DIR}/access_operator/a5/kvaf_a5_aiv_direct_urma_h2d_smoke"
 owner_probe="${KVAF_A5_DIRECT_BUILD_DIR}/access_operator/a5/kvaf_a5_aicpu_owner_probe"
+runtime_urma_probe="${KVAF_A5_DIRECT_BUILD_DIR}/access_operator/a5/kvaf_a5_aicpu_runtime_urma_probe"
 if [[ ! -x "${binary}" ]]; then
   echo "ERROR: expected direct smoke binary is missing: ${binary}" >&2
   exit 3
 fi
 if [[ ! -x "${owner_probe}" ]]; then
   echo "ERROR: expected AICPU owner probe is missing: ${owner_probe}" >&2
+  exit 3
+fi
+if [[ ! -x "${runtime_urma_probe}" ]]; then
+  echo "ERROR: expected AICPU runtime URMA probe is missing: ${runtime_urma_probe}" >&2
   exit 3
 fi
 
@@ -385,11 +391,32 @@ readelf -d "${binary}" \
   >"${KVAF_A5_DIRECT_BUILD_DIR}/direct-smoke.dynamic.txt"
 readelf -d "${owner_probe}" \
   >"${KVAF_A5_DIRECT_BUILD_DIR}/aicpu-owner-probe.dynamic.txt"
+readelf -d "${runtime_urma_probe}" \
+  >"${KVAF_A5_DIRECT_BUILD_DIR}/aicpu-runtime-urma-probe.dynamic.txt"
 if grep -Fq 'libhcomm' \
     "${KVAF_A5_DIRECT_BUILD_DIR}/direct-smoke.dynamic.txt" ||
    grep -Fq 'libhcomm' \
-    "${KVAF_A5_DIRECT_BUILD_DIR}/aicpu-owner-probe.dynamic.txt"; then
+    "${KVAF_A5_DIRECT_BUILD_DIR}/aicpu-owner-probe.dynamic.txt" ||
+   grep -Fq 'libhcomm' \
+    "${KVAF_A5_DIRECT_BUILD_DIR}/aicpu-runtime-urma-probe.dynamic.txt"; then
   echo "ERROR: direct A5 artifact unexpectedly has a DT_NEEDED on HCOMM" >&2
+  exit 3
+fi
+if grep -Eq '\(NEEDED\).*(liburma|liburma-udma|libummu)' \
+    "${KVAF_A5_DIRECT_BUILD_DIR}/aicpu-runtime-urma-probe.dynamic.txt"; then
+  echo "ERROR: Host runtime probe must not link URMA/UDMA/UMMU; the Device AICPU DSO dlopens its runtime by handle" >&2
+  exit 3
+fi
+if ! ldd -r "${runtime_urma_probe}" \
+    >"${KVAF_A5_DIRECT_BUILD_DIR}/aicpu-runtime-urma-probe.ldd.txt" 2>&1; then
+  cat "${KVAF_A5_DIRECT_BUILD_DIR}/aicpu-runtime-urma-probe.ldd.txt" >&2
+  echo "ERROR: ldd could not load the AICPU runtime URMA probe" >&2
+  exit 3
+fi
+if grep -Eq 'not found|undefined symbol' \
+    "${KVAF_A5_DIRECT_BUILD_DIR}/aicpu-runtime-urma-probe.ldd.txt"; then
+  cat "${KVAF_A5_DIRECT_BUILD_DIR}/aicpu-runtime-urma-probe.ldd.txt" >&2
+  echo "ERROR: AICPU runtime URMA probe has unresolved dependencies" >&2
   exit 3
 fi
 
@@ -431,6 +458,13 @@ resolved_probe_ascendcl=$(awk '
   echo "ERROR: ldd did not resolve exactly one owner-probe libascendcl" >&2
   exit 3
 }
+resolved_runtime_probe_ascendcl=$(awk '
+  $1 ~ /^libascendcl\.so/ && $2 == "=>" { path=$3; count++ }
+  END { if (count != 1 || path == "") exit 1; print path }
+' "${KVAF_A5_DIRECT_BUILD_DIR}/aicpu-runtime-urma-probe.ldd.txt") || {
+  echo "ERROR: ldd did not resolve exactly one runtime-probe libascendcl" >&2
+  exit 3
+}
 if [[ "$(realpath -e "${resolved_ascendcl}")" != \
       "${ascendcl_library}" ]]; then
   echo "ERROR: CMake link-time and runtime libascendcl differ" >&2
@@ -441,9 +475,15 @@ if [[ "$(realpath -e "${resolved_probe_ascendcl}")" != \
   echo "ERROR: owner-probe link-time and runtime libascendcl differ" >&2
   exit 3
 fi
+if [[ "$(realpath -e "${resolved_runtime_probe_ascendcl}")" != \
+      "${ascendcl_library}" ]]; then
+  echo "ERROR: runtime-probe link-time and runtime libascendcl differ" >&2
+  exit 3
+fi
 
 binary_sha=$(sha256sum "${binary}" | awk '{print $1}')
 owner_probe_sha=$(sha256sum "${owner_probe}" | awk '{print $1}')
+runtime_urma_probe_sha=$(sha256sum "${runtime_urma_probe}" | awk '{print $1}')
 runtime_header_sha=$(sha256sum "${runtime_header}" | awk '{print $1}')
 acl_header_sha=$(sha256sum "${acl_header}" | awk '{print $1}')
 ascendcl_library_sha=$(sha256sum "${ascendcl_library}" | awk '{print $1}')
@@ -455,6 +495,8 @@ binary_path=${binary}
 binary_sha256=${binary_sha}
 owner_probe_path=${owner_probe}
 owner_probe_sha256=${owner_probe_sha}
+runtime_urma_probe_path=${runtime_urma_probe}
+runtime_urma_probe_sha256=${runtime_urma_probe_sha}
 runtime_header_path=${runtime_header}
 runtime_header_sha256=${runtime_header_sha}
 acl_header_path=${acl_header}
@@ -516,6 +558,8 @@ elif (( kvaf_cross_npu_reuse_offline_build != 0 )); then
     "direct_binary_sha256=${binary_sha}" \
     "owner_probe=${owner_probe}" \
     "owner_probe_sha256=${owner_probe_sha}" \
+    "runtime_urma_probe=${runtime_urma_probe}" \
+    "runtime_urma_probe_sha256=${runtime_urma_probe_sha}" \
     "direct_build_manifest=${build_manifest}" \
     "direct_build_manifest_sha256=$(sha256sum "${build_manifest}" | awk '{print $1}')" \
     "direct_source_manifest=${source_manifest}" \
@@ -536,5 +580,6 @@ fi
 echo "KVAF_A5_DIRECT_URMA_BUILD_OK"
 echo "BINARY=${binary}"
 echo "OWNER_PROBE=${owner_probe}"
+echo "RUNTIME_URMA_PROBE=${runtime_urma_probe}"
 echo "BUILD_MANIFEST=${build_manifest}"
 echo "HCOMM_DT_NEEDED=absent"

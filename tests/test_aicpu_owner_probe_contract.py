@@ -89,6 +89,9 @@ class AicpuOwnerProbeContractTests(unittest.TestCase):
             static_assert(KVAF_URMA_OWNER_PROBE_RESULT_TIMED_OUT == 1);
             static_assert(KVAF_URMA_OWNER_PROBE_RESULT_CLOCK_FAILED == 2);
             static_assert(KVAF_URMA_OWNER_PROBE_RESULT_INVALID_COMMAND == 3);
+            static_assert(
+                KVAF_URMA_OWNER_PROBE_RESULT_CAPABILITY_LEDGER_UNAVAILABLE
+                == 4);
             static_assert(sizeof(kvaf_urma_owner_probe_command_v1) == 64);
             static_assert(alignof(kvaf_urma_owner_probe_command_v1) == 64);
             static_assert(sizeof(kvaf_urma_owner_probe_status_v1) == 64);
@@ -274,6 +277,7 @@ class AicpuOwnerProbeContractTests(unittest.TestCase):
     def test_owner_probe_documentation_is_explicitly_non_unlocking(self) -> None:
         documentation = OWNER_DOC.read_text(encoding="utf-8")
         for required in (
+            "HISTORICAL / `HARDWARE_EXECUTION_DISABLED`",
             "Probe PASS 不会解锁 direct URMA",
             "MVP session owner",
             "production epoch owner",
@@ -282,11 +286,14 @@ class AicpuOwnerProbeContractTests(unittest.TestCase):
             "run_a5_aicpu_owner_probe.sh",
             "AICPU_REGISTRATION=verified-exact",
             "KVAF_A5_AICPU_OWNER_PROBE_OK",
+            "HISTORICAL_OWNER_PROBE_RECORD (NOT SHELL)",
+            "execution: HARDWARE_EXECUTION_DISABLED",
         ):
             self.assertIn(required, documentation)
-        self.assertIn("KVAF_RUNTIME_UDMA_UAPI_HEADER", documentation)
-        self.assertIn("KVAF_RUNTIME_UMMU_UAPI_HEADER", documentation)
-        self.assertIn("provider build failed; package", documentation)
+        self.assertNotIn("```bash", documentation)
+        self.assertNotIn(
+            "bash scripts/run_a5_aicpu_owner_probe.sh", documentation
+        )
 
     def test_owner_probe_runner_verifies_registration_before_acl_exec(self) -> None:
         runner = OWNER_RUNNER.read_text(encoding="utf-8")
@@ -316,6 +323,10 @@ class AicpuOwnerProbeContractTests(unittest.TestCase):
         self.assertNotIn("a5_aicpu_affinity_guard.sh", runner)
 
         self.assertIn(
+            "dynamic runner: scripts/run_a5_aicpu_owner_probe.sh",
+            documentation,
+        )
+        self.assertNotIn(
             "bash scripts/run_a5_aicpu_owner_probe.sh", documentation
         )
         self.assertNotIn('"$kvaf_owner_probe_binary"', documentation)

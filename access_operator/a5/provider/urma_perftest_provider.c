@@ -298,7 +298,7 @@ static void kvaf_attach_management_diagnostic(
     result->reserved[KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_STATUS] =
         kvaf_pack_signed_pair(
             diagnostic.operation_status,
-            diagnostic.completion_status);
+            diagnostic.auxiliary_status);
     result->reserved[KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_FLAGS] =
         diagnostic.flags;
     kvaf_attach_jfr_command_diagnostic(result, diagnostic.stage);
@@ -855,12 +855,28 @@ int kvaf_urma_provider_open_v2(
 {
     int ret;
     int ready_status;
-    const bool use_urma_management = config != NULL &&
-        (config->flags & KVAF_URMA_PROVIDER_URMA_MANAGEMENT) != 0;
+    bool use_urma_management;
 
     if (result == NULL) {
         return -1;
     }
+    /*
+     * This is the lowest exported resource-creation boundary shared by the
+     * Host DSO, the legacy AICPU Open entry and the epoch-owner entry.  The
+     * sealed capability ledger has not been implemented, so no argument,
+     * environment variable or alternate Host caller may authorize Open.
+     * Keep the complete implementation below for compilation and review, but
+     * make it unreachable before config parsing, locks, urma_init, UMMU, TP,
+     * Segment, Jetty, JFR or JFC creation.
+     */
+    kvaf_init_result(result,
+        KVAF_URMA_PROVIDER_CAPABILITY_LEDGER_UNAVAILABLE, -ENOTSUP);
+    /* Do not dereference caller configuration while the gate is closed. */
+    result->session_id = 0;
+    return -1;
+
+    use_urma_management = config != NULL &&
+        (config->flags & KVAF_URMA_PROVIDER_URMA_MANAGEMENT) != 0;
     kvaf_init_result(result, KVAF_URMA_PROVIDER_INVALID_ARGUMENT, -1);
     /* A provider instance can serve multiple sequential sessions. Clear the
      * thread-local diagnostic before any early-return/fail path so one Open
@@ -1332,8 +1348,6 @@ int aicpu_kvaf_urma_owner_probe_v1(void *opaque_args)
         !kvaf_owner_probe_args_are_valid(args)) {
         return -1;
     }
-    command = (struct kvaf_urma_owner_probe_command_v1 *)(uintptr_t)
-        args->command_address;
     status = (struct kvaf_urma_owner_probe_status_v1 *)(uintptr_t)
         args->status_address;
 
@@ -1346,11 +1360,28 @@ int aicpu_kvaf_urma_owner_probe_v1(void *opaque_args)
     status->struct_size = (uint32_t)sizeof(*status);
     status->session_id = args->session_id;
     status->sequence = 0;
-    status->result_code = KVAF_URMA_OWNER_PROBE_RESULT_OK;
+    status->result_code =
+        KVAF_URMA_OWNER_PROBE_RESULT_CAPABILITY_LEDGER_UNAVAILABLE;
     status->reserved0 = 0;
     status->elapsed_nanoseconds = 0;
     status->reserved[0] = 0;
     status->reserved[1] = 0;
+
+    /*
+     * This resource-free probe still enters AICPU and can occupy a worker.
+     * The observation ledger needed to authorize that execution has not been
+     * implemented.  Publish a complete nonce-bound terminal for a valid
+     * caller, but stop before reading command memory, consulting the clock or
+     * sleeping.  No Host wrapper or alternate KFC caller can bypass this
+     * entry-level gate.
+     */
+    kvaf_owner_probe_publish(status,
+        KVAF_URMA_OWNER_PROBE_STATE_FAILED,
+        KVAF_URMA_OWNER_PROBE_RESULT_CAPABILITY_LEDGER_UNAVAILABLE, 0, 0);
+    return 0;
+
+    command = (struct kvaf_urma_owner_probe_command_v1 *)(uintptr_t)
+        args->command_address;
 
     if (kvaf_owner_probe_monotonic_nanoseconds(
             CLOCK_MONOTONIC, &start_nanoseconds) != 0) {
@@ -1728,6 +1759,24 @@ int aicpu_kvaf_urma_epoch_owner_v1(void *opaque_args)
     }
 
     kvaf_epoch_owner_initialize_status(status, args);
+    /*
+     * Fail in the resource-owning entry itself as well as in public Open.
+     * This publishes a complete nonce-bound, teardown-complete terminal to a
+     * valid KFC caller without taking the epoch claim or entering any resource
+     * API.  A custom rtAicpuKernelLaunchExWithArgs caller therefore cannot
+     * bypass the shell runner's hardware gate.
+     */
+    kvaf_epoch_owner_make_safe_failed_open_result(open_result, args,
+        KVAF_URMA_PROVIDER_CAPABILITY_LEDGER_UNAVAILABLE, -ENOTSUP);
+    kvaf_epoch_owner_publish(status,
+        KVAF_URMA_EPOCH_OWNER_STATE_OPEN_FAILED_SAFE,
+        KVAF_URMA_EPOCH_OWNER_RESULT_CAPABILITY_LEDGER_UNAVAILABLE,
+        -ENOTSUP, 0, 0,
+        KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+            KVAF_URMA_EPOCH_OWNER_TEARDOWN_COMPLETE,
+        0);
+    return 0;
+
     if (args->lease_timeout_milliseconds != 0) {
         if (kvaf_owner_probe_monotonic_nanoseconds(
                 CLOCK_MONOTONIC, &start_nanoseconds) != 0) {

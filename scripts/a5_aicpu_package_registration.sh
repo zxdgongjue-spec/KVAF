@@ -4,6 +4,92 @@
 # sourced by the installer and runtime preflight; it deliberately does not
 # change the caller's shell options.
 
+KVAF_AICPU_REGISTRY_LOCK_HELD=0
+KVAF_AICPU_REGISTRY_LOCK_PATH=
+
+kvaf_aicpu_acquire_registry_lock()
+{
+  local registry_file=$1
+  local registry_real registry_lock
+
+  [[ ! -L "${registry_file}" && -f "${registry_file}" &&
+     -r "${registry_file}" && -w "${registry_file}" ]] || {
+    kvaf_aicpu_registration_error \
+      "stage=validate-registry-for-lock path=${registry_file}"
+    return 1
+  }
+  registry_real=$(realpath -- "${registry_file}") || {
+    kvaf_aicpu_registration_error \
+      "stage=resolve-registry-for-lock path=${registry_file}"
+    return 1
+  }
+  registry_lock="${registry_real}.kvaf.lock"
+  [[ ! -L "${registry_lock}" &&
+     ( ! -e "${registry_lock}" || -f "${registry_lock}" ) ]] || {
+    kvaf_aicpu_registration_error \
+      "stage=validate-registry-lock path=${registry_lock}"
+    return 1
+  }
+  if (( KVAF_AICPU_REGISTRY_LOCK_HELD != 0 )); then
+    [[ ${KVAF_AICPU_REGISTRY_LOCK_PATH} == "${registry_lock}" ]] || {
+      kvaf_aicpu_registration_error \
+        "stage=registry-lock-split-brain expected=${KVAF_AICPU_REGISTRY_LOCK_PATH} actual=${registry_lock}"
+      return 1
+    }
+    return 0
+  fi
+  # FD 11 is reserved for the CANN registry transaction.  Direct runners use
+  # 5..10 for their long-lived compatibility/session locks.
+  # Read/write open creates the lock without truncating an existing path.  A
+  # symlink or hardlink is opened without modifying its target, then rejected
+  # from the descriptor metadata before fchmod/flock.  Revalidate the pathname
+  # after locking so all cooperating KVAF processes converge on one inode.
+  exec 11<>"${registry_lock}" || {
+    kvaf_aicpu_registration_error \
+      "stage=open-registry-lock path=${registry_lock}"
+    return 1
+  }
+  if ! python3 -c '
+import os, stat, sys
+path = sys.argv[1]
+opened = os.fstat(11)
+named = os.lstat(path)
+if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or
+        opened.st_uid != os.geteuid() or stat.S_ISLNK(named.st_mode) or
+        opened.st_dev != named.st_dev or opened.st_ino != named.st_ino):
+    raise SystemExit(1)
+os.fchmod(11, 0o600)
+' "${registry_lock}"; then
+    exec 11>&-
+    kvaf_aicpu_registration_error \
+      "stage=revalidate-registry-lock path=${registry_lock}"
+    return 1
+  fi
+  flock -w 30 11 || {
+    exec 11>&-
+    kvaf_aicpu_registration_error \
+      "stage=acquire-registry-lock path=${registry_lock}"
+    return 1
+  }
+  if ! python3 -c '
+import os, stat, sys
+path = sys.argv[1]
+opened = os.fstat(11)
+named = os.lstat(path)
+if (not stat.S_ISREG(named.st_mode) or named.st_nlink != 1 or
+        named.st_uid != os.geteuid() or opened.st_dev != named.st_dev or
+        opened.st_ino != named.st_ino):
+    raise SystemExit(1)
+' "${registry_lock}"; then
+    exec 11>&-
+    kvaf_aicpu_registration_error \
+      "stage=post-lock-identity path=${registry_lock}"
+    return 1
+  fi
+  KVAF_AICPU_REGISTRY_LOCK_HELD=1
+  KVAF_AICPU_REGISTRY_LOCK_PATH=${registry_lock}
+}
+
 kvaf_aicpu_registration_block()
 {
   local package_name=$1
@@ -120,7 +206,11 @@ kvaf_aicpu_install_registration()
   local registry_file=$1
   local package_name=$2
   local package_path=$3
+  local expected_old_sha=${4:-}
   local registry_real registry_dir temporary_registry
+  local current_registry_sha candidate_registry_sha
+
+  KVAF_AICPU_REGISTRATION_PUBLISHED_SHA256=
 
   kvaf_aicpu_registration_arguments_are_valid \
     "${package_name}" "${package_path}" || {
@@ -140,8 +230,22 @@ kvaf_aicpu_install_registration()
       "stage=validate-registry path=${registry_file}"
     return 1
   }
+  kvaf_aicpu_acquire_registry_lock "${registry_file}" || return 1
+  current_registry_sha=$(sha256sum -- "${registry_file}" | awk '{print $1}') || {
+    kvaf_aicpu_registration_error "stage=hash-registry-before-update"
+    return 1
+  }
+  if [[ -n ${expected_old_sha} ]]; then
+    [[ ${expected_old_sha} =~ ^[0-9a-f]{64}$ &&
+       ${current_registry_sha} == "${expected_old_sha}" ]] || {
+      kvaf_aicpu_registration_error \
+        "stage=compare-registry-before-update expected=${expected_old_sha} actual=${current_registry_sha}"
+      return 1
+    }
+  fi
   if kvaf_aicpu_registration_is_exact \
       "${registry_file}" "${package_name}" "${package_path}"; then
+    KVAF_AICPU_REGISTRATION_PUBLISHED_SHA256=${current_registry_sha}
     return 0
   fi
   kvaf_aicpu_registration_is_absent \
@@ -212,10 +316,43 @@ kvaf_aicpu_install_registration()
     kvaf_aicpu_registration_error "stage=verify-candidate"
     return 1
   fi
+  candidate_registry_sha=$(sha256sum -- "${temporary_registry}" |
+    awk '{print $1}') || {
+    rm -f -- "${temporary_registry}"
+    kvaf_aicpu_registration_error "stage=hash-candidate"
+    return 1
+  }
+  # Recheck the exact old bytes immediately before publish.  The shared lock
+  # serializes every cooperating KVAF packager.  The SHA comparison detects a
+  # foreign write that completed before this check, but it is not an atomic CAS
+  # against a non-cooperating root writer in the final check/rename window.
+  # Callers must therefore install packages in an exclusive CANN maintenance
+  # window; the code deliberately does not claim a stronger global guarantee.
+  current_registry_sha=$(sha256sum -- "${registry_real}" |
+    awk '{print $1}') || {
+    rm -f -- "${temporary_registry}"
+    kvaf_aicpu_registration_error "stage=rehash-registry-before-publish"
+    return 1
+  }
+  if [[ -n ${expected_old_sha} &&
+        ${current_registry_sha} != "${expected_old_sha}" ]]; then
+    rm -f -- "${temporary_registry}"
+    kvaf_aicpu_registration_error \
+      "stage=compare-registry-before-publish expected=${expected_old_sha} actual=${current_registry_sha}"
+    return 1
+  fi
+  KVAF_AICPU_REGISTRATION_PUBLISHED_SHA256=${candidate_registry_sha}
   if ! mv -f -- "${temporary_registry}" "${registry_real}"; then
     rm -f -- "${temporary_registry}"
     kvaf_aicpu_registration_error \
       "stage=publish-registration target=${registry_real}"
+    return 1
+  fi
+  if [[ -n ${KVAF_AICPU_DURABLE_STATE_HELPER:-} ]] &&
+     ! python3 "${KVAF_AICPU_DURABLE_STATE_HELPER}" sync \
+       "${registry_real}" "${registry_dir}"; then
+    kvaf_aicpu_registration_error \
+      "stage=sync-published-registration target=${registry_real}"
     return 1
   fi
   if [[ "$(realpath -- "${registry_file}")" != "${registry_real}" ]]; then

@@ -4,6 +4,15 @@
 # experiment.  It preserves both earlier incidents byte-for-byte and creates
 # a source/token-owned provider, AICPU package, direct binary and state lane.
 
+unset BASH_ENV ENV
+unset -f exit builtin 2>/dev/null || true
+
+echo "KVAF_A5_CROSS_NPU2_REUSE_EXPERIMENT_COORDINATOR_DISABLED" >&2
+echo "CAPABILITY_LEDGER=not-implemented" >&2
+echo "No argument/environment/source/state/CANN/docker/NPU operation was attempted." >&2
+builtin exit 2
+if [[ 0 == 1 ]]; then
+
 set -Eeuo pipefail
 umask 077
 
@@ -351,3 +360,5 @@ if (( kvaf_run_rc != 0 )); then
   exit "${kvaf_run_rc}"
 fi
 echo "KVAF_NPU2_REUSE_ZERO_WQE_ACCEPTANCE=PASS"
+fi
+/bin/sh -c 'exit 2'

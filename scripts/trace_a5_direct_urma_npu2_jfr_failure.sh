@@ -8,6 +8,8 @@
 
 set -Eeuo pipefail
 umask 077
+unset BASH_ENV ENV
+unset -f exit builtin 2>/dev/null || true
 
 if (( $# != 0 )); then
   echo "Usage: $0" >&2
@@ -20,6 +22,11 @@ fi
 
 echo "EXECUTION_ENV=SERVER_B_HOST"
 echo "KVAF_JFR_TRACE_PREFLIGHT stage=entry"
+echo "KVAF_JFR_TRACE_RETIRED=host-trace-cannot-observe-kvaf-aicpu-device-os"
+echo "ERROR: this historical Host trace captured hccn_tool/HCCP, not the KVAF AICPU CREATE_JFR path" >&2
+echo "No hardware operation was attempted. Use the static registered-package and HCCP/HAL audits instead." >&2
+builtin exit 2
+if [[ 0 == 1 ]]; then
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd -P)
@@ -557,3 +564,5 @@ echo "KVAF_JFR_KERNEL_TAIL_BEGIN"
 tail -n 160 "${kvaf_kernel_filtered}" || true
 echo "KVAF_JFR_KERNEL_TAIL_END"
 exit "${kvaf_evidence_rc}"
+fi
+/bin/sh -c 'exit 2'

@@ -2,6 +2,8 @@
 
 set -Eeuo pipefail
 umask 077
+unset BASH_ENV ENV
+unset -f exit builtin 2>/dev/null || true
 
 kvaf_affinity_run_mode=${1:-production}
 if (( $# > 1 )) ||
@@ -1470,6 +1472,27 @@ if [[ "${kvaf_affinity_run_mode}" == recovery-only-v1 ]]; then
   echo "No provider/EID/NPU/ACL/DDR/HBM/URMA operation was attempted."
   exit 0
 fi
+
+# No current artifact proves the complete control/data-plane contract needed
+# by this runner.  In particular, public URMA symbols and SUCCESS returns do
+# not prove the AICPU caller domain, Segment/Jetty/TP semantics, AIV-visible
+# queue addresses, private WQE/CQE/doorbell/cache ordering, or retryable
+# teardown.  Keep recovery available above, but make every new resource-
+# bearing run fail closed until a sealed, reboot-consumable capability ledger
+# is implemented and verified here.  There is deliberately no environment
+# variable or risk phrase that bypasses this gate.
+echo "KVAF_A5_DIRECT_HARDWARE_EXECUTION_DISABLED" >&2
+echo "CAPABILITY_LEDGER=not-implemented" >&2
+echo "ZERO_WQE_STATUS=not-proven" >&2
+echo "UNPROVEN=official-runtime-source,official-aicpu-caller-domain,segment-jetty-tp-semantics,aiv-address-domain,wqe-cqe-doorbell-cache-ordering,teardown" >&2
+echo "Run only the registered-package static audit and HCCP/HAL declaration preflight." >&2
+echo "No provider/EID/NPU/ACL/DDR/HBM/URMA operation was attempted." >&2
+builtin exit 2
+
+# If an inherited shell hook ever shadows `exit`, the complete legacy body is
+# still syntactically enclosed by a constant-false branch.  The worker binary
+# has an independent gate as a second boundary.
+if [[ 0 == 1 ]]; then
 
 : "${ASCEND_HOME_PATH:?source the container CANN set_env.sh first}"
 if (( kvaf_cross_npu_reuse_mode != 0 )); then
@@ -3325,3 +3348,5 @@ grep -E 'KVAF_(A5_(DIRECT|EID)|URMA_MGMT_READY)' \
   "${host_log}" "${device_log}"
 echo "KVAF_A5_AIV_SIMT_DIRECT_URMA_H2D_ACCEPTANCE=PASS"
 echo "RESULT_DIR=${KVAF_A5_RESULT_DIR}"
+fi
+/bin/sh -c 'exit 2'

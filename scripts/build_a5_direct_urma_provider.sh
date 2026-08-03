@@ -198,7 +198,7 @@ if ! [[ "${KVAF_DIRECT_PROVIDER_BUILD_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
   die "KVAF_DIRECT_PROVIDER_BUILD_JOBS must be positive"
 fi
 for command in \
-  awk cmake cmp find flock git ldd nm readelf realpath sha256sum sort uname
+  awk cmake cmp dd find flock git ldd nm readelf realpath sha256sum sort uname
 do
   command -v "${command}" >/dev/null 2>&1 ||
     die "${command} is required"
@@ -618,6 +618,68 @@ enumerate_all_sources()
 
 enumerate_all_sources before
 
+# This identity is computed before compilation from every selected source plus
+# selected source/compiler/UAPI/build-script configuration.  It is embedded in
+# the provider and also used as a versioned AICPU loader key.  It is
+# intentionally distinct
+# from the final ELF SHA-256: embedding an ELF's own digest is circular.
+kvaf_provider_compiler=$(realpath -e "${KVAF_DIRECT_PROVIDER_CC}") ||
+  die "could not canonicalize the provider compiler"
+kvaf_provider_compiler_sha=$(sha256_file "${kvaf_provider_compiler}") ||
+  die "could not hash the provider compiler"
+kvaf_provider_compiler_version_sha=$(
+  "${kvaf_provider_compiler}" --version | sha256sum | awk '{print $1}'
+) || die "could not hash the provider compiler version"
+kvaf_provider_builder=$(realpath -e "${BASH_SOURCE[0]}") ||
+  die "could not canonicalize the provider build script"
+kvaf_provider_builder_sha=$(sha256_file "${kvaf_provider_builder}") ||
+  die "could not hash the provider build script"
+kvaf_registered_package_audit_script="${ROOT_DIR}/scripts/audit_a5_registered_aicpu_packages.sh"
+[[ -f "${kvaf_registered_package_audit_script}" &&
+   ! -L "${kvaf_registered_package_audit_script}" &&
+   -x "${kvaf_registered_package_audit_script}" ]] ||
+  die "registered AICPU package audit script is missing or unsafe"
+kvaf_registered_package_audit_sha=$(sha256_file \
+  "${kvaf_registered_package_audit_script}") ||
+  die "could not hash the registered AICPU package audit script"
+kvaf_provider_source_input_sha=$(sha256_file \
+  "${staging_dir}/source.before.sha256") ||
+  die "could not hash the provider source input manifest"
+kvaf_runtime_probe_provider_source_config_sha=$(
+  printf '%s\n' \
+    'schema=kvaf-runtime-probe-provider-source-config-v1' \
+    "source_input_sha256=${kvaf_provider_source_input_sha}" \
+    "compiler_sha256=${kvaf_provider_compiler_sha}" \
+    "compiler_version_sha256=${kvaf_provider_compiler_version_sha}" \
+    "builder_script_sha256=${kvaf_provider_builder_sha}" \
+    "registered_package_audit_script_sha256=${kvaf_registered_package_audit_sha}" \
+    "kernel_release=${kernel_release}" \
+    "runtime_udma_uapi_sha256=${runtime_udma_uapi_header_sha}" \
+    "runtime_ummu_uapi_sha256=${runtime_ummu_uapi_header_sha}" \
+    "umdk_commit=${umdk_git_commit}" \
+    "libummu_commit=${libummu_git_commit}" \
+    "build_mode=${kvaf_provider_build_mode}" \
+    "device_output_name=${kvaf_device_provider_output_name}" |
+    sha256sum | awk '{print $1}'
+) || die "could not derive the runtime probe provider source/config identity"
+[[ ${kvaf_runtime_probe_provider_source_config_sha} =~ ^[0-9a-f]{64}$ ]] ||
+  die "runtime probe provider source/config identity is malformed"
+# A source/config digest is not a loader identity: inherited flags, linker
+# version and staging paths can still change the ELF.  Give every successful
+# build a fresh 256-bit instance identity and make that identity the SONAME.
+# This prevents an AICPU process from reusing a previous mapping after an
+# archive update with the same audited source inputs.  The final ELF hash is
+# recorded separately and remains the packaged-artifact identity.
+kvaf_runtime_probe_provider_build_id=$(
+  dd if=/dev/urandom bs=32 count=1 status=none | sha256sum | awk '{print $1}'
+) || die "could not generate the runtime probe provider build-instance identity"
+[[ ${kvaf_runtime_probe_provider_build_id} =~ ^[0-9a-f]{64}$ ]] ||
+  die "runtime probe provider build-instance identity is malformed"
+kvaf_runtime_probe_provider_filename="libkvaf_rt_${kvaf_runtime_probe_provider_build_id:0:16}.so"
+kvaf_runtime_probe_provider_output_name="kvaf_rt_${kvaf_runtime_probe_provider_build_id:0:16}"
+[[ ${#kvaf_runtime_probe_provider_filename} -lt 32 ]] ||
+  die "versioned runtime probe provider filename is too long"
+
 cmake \
   -S "${ROOT_DIR}/access_operator/a5/provider" \
   -B "${staging_dir}/cmake" \
@@ -625,14 +687,18 @@ cmake \
   -DCMAKE_C_COMPILER="${KVAF_DIRECT_PROVIDER_CC}" \
   -DKVAF_UMDK_ROOT="${KVAF_UMDK_ROOT}" \
   -DKVAF_LIBUMMU_ROOT="${KVAF_LIBUMMU_ROOT}" \
-  -DKVAF_DEVICE_PROVIDER_OUTPUT_NAME="${kvaf_device_provider_output_name}"
+  -DKVAF_DEVICE_PROVIDER_OUTPUT_NAME="${kvaf_device_provider_output_name}" \
+  -DKVAF_RUNTIME_PROBE_PROVIDER_OUTPUT_NAME="${kvaf_runtime_probe_provider_output_name}" \
+  -DKVAF_RUNTIME_PROBE_PROVIDER_BUILD_ID_HEX="${kvaf_runtime_probe_provider_build_id}"
 cmake --build "${staging_dir}/cmake" \
   --clean-first \
   --parallel "${KVAF_DIRECT_PROVIDER_BUILD_JOBS}"
 
 host_provider="${staging_dir}/cmake/libkvaf_urma_provider_host.so"
 device_provider="${staging_dir}/cmake/${kvaf_device_provider_filename}"
-for provider in "${host_provider}" "${device_provider}"; do
+runtime_probe_provider="${staging_dir}/cmake/${kvaf_runtime_probe_provider_filename}"
+for provider in "${host_provider}" "${device_provider}" \
+  "${runtime_probe_provider}"; do
   [[ -r "${provider}" ]] ||
     die "provider build did not produce ${provider}"
 done
@@ -702,6 +768,9 @@ validate_provider()
       <<<"${provider_dynamic_symbols}" ||
       die "${label} provider does not export ${symbol}"
   done
+  grep -Eq '[[:space:]]aicpu_kvaf_urma_rt_probe_v2(@@[^[:space:]]+)?$' \
+      <<<"${provider_dynamic_symbols}" &&
+    die "${label} canonical provider exports the isolated runtime probe"
   if grep -Eq \
       '[[:space:]](perftest_|kvaf_perftest_|kvaf_udma_|kvaf_source_ummu_|create_duplex_ctx|destroy_ctx)' \
       <<<"${provider_dynamic_symbols}"; then
@@ -793,14 +862,67 @@ validate_provider()
   fi
 }
 
+validate_runtime_probe_provider()
+{
+  local provider=$1
+  local dynamic_file="${staging_dir}/runtime-probe-provider.dynamic.txt"
+  local ldd_file="${staging_dir}/runtime-probe-provider.ldd.txt"
+  local dynamic_symbols all_symbols elf_header symbol
+
+  dynamic_symbols=$(nm -D --defined-only "${provider}") ||
+    die "could not inspect runtime probe provider exports"
+  grep -Eq \
+    '[[:space:]]aicpu_kvaf_urma_rt_probe_v2(@@KVAF_URMA_RUNTIME_PROBE_2)?$' \
+    <<<"${dynamic_symbols}" ||
+    die "runtime probe provider does not export its sole AICPU entry"
+  for symbol in "${public_provider_symbols[@]}"; do
+    grep -Eq "[[:space:]]${symbol}(@@[^[:space:]]+)?$" \
+        <<<"${dynamic_symbols}" &&
+      die "runtime probe provider leaks canonical entry ${symbol}"
+  done
+
+  all_symbols=$(nm --defined-only "${provider}") ||
+    die "could not inspect runtime probe provider symbols"
+  if grep -Eq \
+      '[[:space:]](kvaf_udma_|kvaf_source_ummu_|kvaf_perftest_|perftest_|urma_init|urma_uninit|liburma_init|kvaf_udma_provider_init)' \
+      <<<"${all_symbols}"; then
+    die "runtime probe provider contains source-linked URMA/UDMA/UMMU/perftest code"
+  fi
+
+  readelf -d "${provider}" >"${dynamic_file}" ||
+    die "could not inspect runtime probe provider dynamic section"
+  elf_header=$(readelf -h "${provider}") ||
+    die "could not inspect runtime probe provider ELF header"
+  grep -Eq 'Machine:[[:space:]]+AArch64' <<<"${elf_header}" &&
+    grep -Eq 'Type:[[:space:]]+DYN' <<<"${elf_header}" ||
+    die "runtime probe provider must be AArch64 ET_DYN"
+  if grep -Eq \
+      'lib(hcomm|urma_perftest|urma_common|urma|urma-udma|ummu|udma)\.so|\((RPATH|RUNPATH)\)' \
+      "${dynamic_file}"; then
+    die "runtime probe provider links forbidden stateful code or contains RPATH"
+  fi
+  if ! ldd -r "${provider}" >"${ldd_file}" 2>&1; then
+    cat "${ldd_file}" >&2
+    die "ldd could not load the runtime probe provider"
+  fi
+  if grep -Eq 'not found|undefined symbol' "${ldd_file}"; then
+    cat "${ldd_file}" >&2
+    die "runtime probe provider has unresolved runtime dependencies"
+  fi
+}
+
 validate_provider "${host_provider}" host-provider
 validate_provider "${device_provider}" device-provider
+validate_runtime_probe_provider "${runtime_probe_provider}"
 [[ "$(elf_soname "${host_provider}")" == \
       libkvaf_urma_provider_host.so ]] ||
   die "Host provider SONAME does not match its canonical filename"
 [[ "$(elf_soname "${device_provider}")" == \
       "${kvaf_device_provider_filename}" ]] ||
   die "Device provider SONAME does not match its versioned filename"
+[[ "$(elf_soname "${runtime_probe_provider}")" == \
+      "${kvaf_runtime_probe_provider_filename}" ]] ||
+  die "runtime probe provider SONAME does not match its versioned build identity"
 
 public_abi_probe="${staging_dir}/cmake/kvaf_urma_public_abi_probe"
 [[ -x "${public_abi_probe}" ]] ||
@@ -833,11 +955,20 @@ aicpu_contract_probe="${staging_dir}/cmake/kvaf_urma_provider_aicpu_contract_pro
 [[ -x "${aicpu_contract_probe}" ]] ||
   die "provider build did not produce the AICPU contract probe"
 aicpu_contract_output=$(
-  "${aicpu_contract_probe}" "${device_provider}"
+  "${aicpu_contract_probe}" "${device_provider}" \
+    "${runtime_probe_provider}"
 ) || die "Device provider AICPU return-contract probe failed"
 [[ "${aicpu_contract_output}" == \
     "KVAF_URMA_PROVIDER_AICPU_CONTRACT=PASS" ]] ||
   die "Device provider AICPU return-contract probe returned unexpected output"
+aicpu_contract_probe_sha=$(sha256_file "${aicpu_contract_probe}") ||
+  die "could not hash the AICPU resource-gate contract probe"
+aicpu_contract_output_sha=$(
+  printf '%s\n' "${aicpu_contract_output}" | sha256sum | awk '{print $1}'
+) || die "could not hash the AICPU resource-gate contract result"
+[[ ${aicpu_contract_probe_sha} =~ ^[0-9a-f]{64}$ &&
+   ${aicpu_contract_output_sha} =~ ^[0-9a-f]{64}$ ]] ||
+  die "AICPU resource-gate contract hashes are malformed"
 
 udma_uapi_probe="${staging_dir}/cmake/kvaf_udma_uapi_probe"
 udma_private_abi_probe="${staging_dir}/cmake/kvaf_udma_private_abi_probe"
@@ -894,8 +1025,11 @@ host_provider_sha=$(sha256_file "${host_provider}") ||
   die "could not hash the Host provider"
 device_provider_sha=$(sha256_file "${device_provider}") ||
   die "could not hash the Device provider"
+runtime_probe_provider_sha=$(sha256_file "${runtime_probe_provider}") ||
+  die "could not hash the source/config-versioned runtime probe provider"
 [[ "${host_provider_sha}" =~ ^[0-9a-f]{64}$ &&
-   "${device_provider_sha}" =~ ^[0-9a-f]{64}$ ]] ||
+   "${device_provider_sha}" =~ ^[0-9a-f]{64}$ &&
+   "${runtime_probe_provider_sha}" =~ ^[0-9a-f]{64}$ ]] ||
   die "provider SHA-256 output is malformed"
 [[ "${host_provider_sha}" != "${device_provider_sha}" ]] ||
   die "Host and Device providers must be distinct binaries"
@@ -955,6 +1089,24 @@ host_private_abi_name=official-umdk-udma-v1-host
 device_provider_filename=${kvaf_device_provider_filename}
 device_provider_execution_domain=aicpu
 device_provider_sha256=${device_provider_sha}
+runtime_probe_provider_filename=${kvaf_runtime_probe_provider_filename}
+runtime_probe_provider_build_id_schema=random-build-instance-sha256-v1
+runtime_probe_provider_build_id_sha256=${kvaf_runtime_probe_provider_build_id}
+runtime_probe_provider_source_config_schema=audited-inputs-sha256-v1
+runtime_probe_provider_source_config_sha256=${kvaf_runtime_probe_provider_source_config_sha}
+runtime_probe_provider_artifact_sha256=${runtime_probe_provider_sha}
+runtime_probe_provider_builder_script_sha256=${kvaf_provider_builder_sha}
+registered_package_audit_script_sha256=${kvaf_registered_package_audit_sha}
+resource_entry_gate_schema=capability-ledger-fail-closed-v1
+capability_ledger_state=not-implemented
+provider_open_gate=disabled-before-config-validation-v1
+owner_probe_gate=disabled-before-command-clock-sleep-v1
+epoch_owner_gate=disabled-before-claim-v1
+runtime_probe_gate=disabled-before-dlopen-v1
+resource_gate_contract=verified-valid-request-v1
+resource_gate_contract_probe_filename=kvaf_urma_provider_aicpu_contract_probe
+resource_gate_contract_probe_sha256=${aicpu_contract_probe_sha}
+resource_gate_contract_output_sha256=${aicpu_contract_output_sha}
 device_private_abi=2
 device_private_abi_name=official-umdk-udma-v1-device
 urma_public_abi_signature=${urma_public_abi_signature}
@@ -1016,6 +1168,19 @@ cat >"${staging_dir}/build.success" <<EOF
 schema=kvaf-direct-urma-provider-success-v3
 host_provider_sha256=${host_provider_sha}
 device_provider_sha256=${device_provider_sha}
+runtime_probe_provider_build_id_sha256=${kvaf_runtime_probe_provider_build_id}
+runtime_probe_provider_source_config_sha256=${kvaf_runtime_probe_provider_source_config_sha}
+runtime_probe_provider_artifact_sha256=${runtime_probe_provider_sha}
+registered_package_audit_script_sha256=${kvaf_registered_package_audit_sha}
+resource_entry_gate_schema=capability-ledger-fail-closed-v1
+capability_ledger_state=not-implemented
+provider_open_gate=disabled-before-config-validation-v1
+owner_probe_gate=disabled-before-command-clock-sleep-v1
+epoch_owner_gate=disabled-before-claim-v1
+runtime_probe_gate=disabled-before-dlopen-v1
+resource_gate_contract=verified-valid-request-v1
+resource_gate_contract_probe_sha256=${aicpu_contract_probe_sha}
+resource_gate_contract_output_sha256=${aicpu_contract_output_sha}
 build_manifest_sha256=${build_manifest_sha}
 source_manifest_sha256=${source_manifest_sha}
 umdk_source_manifest_sha256=${umdk_source_manifest_sha}
@@ -1050,6 +1215,26 @@ fi
       "${staging_dir}/build.success")" == "${host_provider_sha}" &&
     "$(manifest_value device_provider_sha256 \
       "${staging_dir}/build.success")" == "${device_provider_sha}" &&
+    "$(manifest_value runtime_probe_provider_build_id_sha256 \
+      "${staging_dir}/build.success")" == \
+      "${kvaf_runtime_probe_provider_build_id}" &&
+    "$(manifest_value runtime_probe_provider_source_config_sha256 \
+      "${staging_dir}/build.success")" == \
+      "${kvaf_runtime_probe_provider_source_config_sha}" &&
+    "$(manifest_value runtime_probe_provider_artifact_sha256 \
+      "${staging_dir}/build.success")" == "${runtime_probe_provider_sha}" &&
+    "$(manifest_value resource_gate_contract_probe_sha256 \
+      "${staging_dir}/build.success")" == "${aicpu_contract_probe_sha}" &&
+    "$(manifest_value resource_gate_contract_output_sha256 \
+      "${staging_dir}/build.success")" == "${aicpu_contract_output_sha}" &&
+    "$(manifest_value resource_entry_gate_schema \
+      "${staging_dir}/build.success")" == \
+      capability-ledger-fail-closed-v1 &&
+    "$(manifest_value capability_ledger_state \
+      "${staging_dir}/build.success")" == not-implemented &&
+    "$(manifest_value owner_probe_gate \
+      "${staging_dir}/build.success")" == \
+      disabled-before-command-clock-sleep-v1 &&
     "$(manifest_value build_manifest_sha256 \
       "${staging_dir}/build.success")" == "${build_manifest_sha}" &&
     "$(manifest_value runtime_udma_uapi_header_sha256 \
@@ -1143,6 +1328,8 @@ cp "${host_provider}" \
   "${publish_dir}/libkvaf_urma_provider_host.so"
 cp "${device_provider}" \
   "${publish_dir}/${kvaf_device_provider_filename}"
+cp "${runtime_probe_provider}" \
+  "${publish_dir}/${kvaf_runtime_probe_provider_filename}"
 for artifact in \
   source.sha256 umdk-source.sha256 libummu-source.sha256 \
   build.manifest build.success \
@@ -1159,15 +1346,19 @@ cp "${udma_uapi_probe}" "${publish_dir}/kvaf_udma_uapi_probe"
 cp "${udma_private_abi_probe}" \
   "${publish_dir}/kvaf_udma_private_abi_probe"
 cp "${ummu_uapi_probe}" "${publish_dir}/kvaf_ummu_uapi_probe"
+cp "${aicpu_contract_probe}" \
+  "${publish_dir}/kvaf_urma_provider_aicpu_contract_probe"
 chmod 0644 "${publish_dir}/"*
 chmod 0755 \
   "${publish_dir}/kvaf_udma_uapi_probe" \
   "${publish_dir}/kvaf_udma_private_abi_probe" \
-  "${publish_dir}/kvaf_ummu_uapi_probe"
+  "${publish_dir}/kvaf_ummu_uapi_probe" \
+  "${publish_dir}/kvaf_urma_provider_aicpu_contract_probe"
 
 publish_artifacts=(
   libkvaf_urma_provider_host.so
   "${kvaf_device_provider_filename}"
+  "${kvaf_runtime_probe_provider_filename}"
   source.sha256
   umdk-source.sha256
   libummu-source.sha256
@@ -1179,6 +1370,7 @@ publish_artifacts=(
   kvaf_udma_uapi_probe
   kvaf_udma_private_abi_probe
   kvaf_ummu_uapi_probe
+  kvaf_urma_provider_aicpu_contract_probe
 )
 if (( kvaf_versioned_experiment_build != 0 )); then
   publish_artifacts+=(experiment-provider.profile)
@@ -1197,7 +1389,8 @@ if (( kvaf_versioned_experiment_build != 0 )); then
     "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/${kvaf_device_provider_filename}" \
     "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/kvaf_udma_uapi_probe" \
     "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/kvaf_udma_private_abi_probe" \
-    "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/kvaf_ummu_uapi_probe"
+    "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/kvaf_ummu_uapi_probe" \
+    "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/kvaf_urma_provider_aicpu_contract_probe"
   chmod 0400 \
     "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/source.sha256" \
     "${KVAF_DIRECT_PROVIDER_BUILD_DIR}/umdk-source.sha256" \
@@ -1215,6 +1408,7 @@ fi
 echo "KVAF_A5_DIRECT_URMA_PROVIDER_BUILD_OK"
 echo "HOST_PROVIDER=${KVAF_DIRECT_PROVIDER_BUILD_DIR}/libkvaf_urma_provider_host.so"
 echo "DEVICE_PROVIDER=${KVAF_DIRECT_PROVIDER_BUILD_DIR}/${kvaf_device_provider_filename}"
+echo "RUNTIME_PROBE_PROVIDER=${KVAF_DIRECT_PROVIDER_BUILD_DIR}/${kvaf_runtime_probe_provider_filename}"
 echo "SOURCE_MANIFEST=${KVAF_DIRECT_PROVIDER_BUILD_DIR}/source.sha256"
 echo "BUILD_MANIFEST=${KVAF_DIRECT_PROVIDER_BUILD_DIR}/build.manifest"
 if (( kvaf_versioned_experiment_build != 0 )); then
@@ -1226,6 +1420,8 @@ if (( kvaf_versioned_experiment_build != 0 )); then
 fi
 echo "HOST_PROVIDER_SHA256=${host_provider_sha}"
 echo "DEVICE_PROVIDER_SHA256=${device_provider_sha}"
+echo "RUNTIME_PROBE_PROVIDER_BUILD_ID_SHA256=${kvaf_runtime_probe_provider_build_id}"
+echo "RUNTIME_PROBE_PROVIDER_SOURCE_CONFIG_SHA256=${kvaf_runtime_probe_provider_source_config_sha}"
 echo "UMDK_ROOT=${KVAF_UMDK_ROOT}"
 echo "UMDK_GIT_COMMIT=${umdk_git_commit}"
 echo "LIBUMMU_ROOT=${KVAF_LIBUMMU_ROOT}"

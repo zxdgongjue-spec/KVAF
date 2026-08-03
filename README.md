@@ -1,5 +1,10 @@
 # KVAF
 
+> **当前执行状态：`HARDWARE_EXECUTION_DISABLED`。** 仓库中的 A5 H2D、
+> zero-WQE、AICPU owner 和动态 URMA probe 都只是历史实现或架构候选，不能作为
+> 当前真机操作指南。现阶段只允许 CPU/编译测试、已注册 AICPU package 的静态冲突
+> 审计，以及 HCCP/HAL 声明面预检；静态结果也不会解锁硬件路径。
+
 当前仓库在原有模块骨架上增加了 AIV/SIMT 直写 URMA SQ/CQ、Host DDR
 到 Device HBM（H2D）的数据路径，并提供两个可选控制面：
 
@@ -8,10 +13,9 @@
   MR/EID/Jetty/TP/SQ/CQ，不链接 HCOMM，也不依赖 memcache/memfabric。
 
 该路径是完整 KVAF 的最小子集，不包含分布式 Meta、BatchPut、vLLM
-适配或图捕获。设计边界、真实完成状态以及 PC A / 服务器 B / 远端仓 C
-的操作命令见
-[A5 AIV+SIMT+URMA H2D MVP](docs/a5_aiv_simt_urma_h2d_mvp.md)。
-不链接 HCOMM 的实现、依赖边界和服务器操作见
+适配或图捕获。旧 HCOMM MVP 只作为设计和失败经验记录保留，见
+[A5 AIV+SIMT+URMA H2D 历史 MVP](docs/a5_aiv_simt_urma_h2d_mvp.md)。
+不链接 HCOMM 的候选实现、能力缺口和当前允许的静态检查见
 [A5 direct URMA H2D](docs/a5_direct_urma_h2d.md)。
 
 ## 模块
@@ -68,76 +72,15 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-服务器 B 上构建 A5 数据路径：
+服务器 B 上的旧 A5 源码准备、provider 构建、AICPU package 部署和真机 smoke
+流程已从本首页撤下。原因不只是早期的 worker-affinity 缺口：官方 URMA 的 AICPU
+调用域、资源语义、AIV 可见地址域、私有队列 ABI 和可重试销毁仍缺少完整证据链。
+direct runner 与 legacy HCOMM runner 现在都固定命中
+`HARDWARE_EXECUTION_DISABLED`，不能把旧 HCOMM 路径作为替代入口。
 
-```bash
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-bash scripts/build_a5_aiv_urma.sh
-```
-
-构建不链接 HCOMM 的 direct URMA 路径。先在服务器 B 宿主机准备两棵固定、
-无本地修改的源码树：
-
-```bash
-echo "EXECUTION_ENV=SERVER_B_HOST"
-
-test -d /data/c00982601/umdk/.git || \
-  git clone https://gitcode.com/openeuler/umdk.git \
-    /data/c00982601/umdk
-git -C /data/c00982601/umdk fetch origin
-git -C /data/c00982601/umdk switch --detach \
-  12917421beb93c1351eb2f124bb2f34612d8bf2d
-
-test -d /data/c00982601/libummu/.git || \
-  git clone https://gitcode.com/openeuler/libummu.git \
-    /data/c00982601/libummu
-git -C /data/c00982601/libummu fetch origin
-git -C /data/c00982601/libummu switch --detach \
-  70de020f776d8def0d8a8941cc7cbc5928d66c10
-
-test -z "$(git -C /data/c00982601/umdk status --porcelain)"
-test -z "$(git -C /data/c00982601/libummu status --porcelain)"
-```
-
-然后在 `vllm-ascend-cs-kvaf` Docker 中构建。两份 runtime header 必须来自
-`uname -r` 对应的 kernel-devel/kernel source；若不在脚本的标准自动探测路径，
-显式设置为 Docker 内可读的路径：
-
-```bash
-echo "EXECUTION_ENV=VLLM_ASCEND_CS_KVAF_DOCKER"
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-
-export KVAF_UMDK_ROOT=/data/c00982601/umdk
-export KVAF_LIBUMMU_ROOT=/data/c00982601/libummu
-export KVAF_RUNTIME_UDMA_UAPI_HEADER=/data/c00982601/kernel-uapi/$(uname -r)/udma_abi.h
-export KVAF_RUNTIME_UMMU_UAPI_HEADER=/data/c00982601/kernel-uapi/$(uname -r)/ummu_core.h
-
-bash scripts/build_a5_direct_urma_provider.sh
-bash scripts/package_a5_direct_urma_aicpu.sh
-bash scripts/build_a5_direct_urma.sh
-```
-
-provider 构建产出 `kvaf_udma_uapi_probe`、
-`kvaf_udma_private_abi_probe`、`kvaf_ummu_uapi_probe` 和 v3 build
-manifest/success stamp。任一源码树不干净、commit 配对错误、runtime UAPI
-缺失或不完全匹配，构建都会 fail closed。
-
-构建成功后，正向硬件冒烟会从驱动自动解析当前物理设备的 Host/Device
-EID pair，不依赖其他代码仓；随后按 EID 精确匹配 Host sysfs 与 Device
-`hccn_tool` inventory。可以显式给出两端 UDMA device name/EID index，但 runner
-仍会校验，不能从 NPU 号或 `pair_info` 猜测。当前 runner 还会在任何硬件访问前
-因 AICPU 多次 KFC 调用缺少正式 worker-affinity 契约而 fail closed；下列命令目前
-用于验证该门禁，不会创建 URMA/UMMU 资源：
-
-```bash
-unset KVAF_HOST_EID KVAF_DEVICE_EID KVAF_PAIR_CHANNEL
-export KVAF_LOGICAL_DEVICE_ID=0
-export KVAF_PHYSICAL_DEVICE_ID=0
-bash scripts/run_a5_direct_urma_h2d_smoke.sh
-```
-
-多个 active driver pair 会被拒绝；根据错误中列出的 channel 设置
-`KVAF_PAIR_CHANNEL` 后再运行，不能默认选择 channel 0。
+当前服务器 B 只执行 [direct URMA 文档 6.7 节](docs/a5_direct_urma_h2d.md#67-docker当前唯一允许的下一步静态检查)
+中的两项静态检查。固定 UMDK/libummu commit、runtime UAPI 配对和历史构建流程仍在
+该文档中保留，供源码审计和未来恢复构建时参考；它们不是当前运行步骤。
 
 如需编译 Python 注册模块，需要环境中提供 `pybind11`，并显式开启：
 

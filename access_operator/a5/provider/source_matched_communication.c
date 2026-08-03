@@ -121,7 +121,8 @@ static uint32_t kvaf_ub_management_stage_from_name(const char *name)
 static void kvaf_ub_record_management_diagnostic(
     const char *stage, int raw_errno, int effective_errno,
     int operation_status, bool operation_status_valid,
-    int completion_status, bool completion_status_valid)
+    int auxiliary_status, bool auxiliary_status_valid,
+    uint32_t auxiliary_kind_flag)
 {
     uint32_t stage_id;
 
@@ -139,7 +140,7 @@ static void kvaf_ub_record_management_diagnostic(
     g_kvaf_management_diagnostic.raw_errno = raw_errno;
     g_kvaf_management_diagnostic.effective_errno = effective_errno;
     g_kvaf_management_diagnostic.operation_status = operation_status;
-    g_kvaf_management_diagnostic.completion_status = completion_status;
+    g_kvaf_management_diagnostic.auxiliary_status = auxiliary_status;
     g_kvaf_management_diagnostic.flags =
         KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RAW_ERRNO_VALID |
         KVAF_URMA_MANAGEMENT_DIAGNOSTIC_EFFECTIVE_ERRNO_VALID;
@@ -147,9 +148,10 @@ static void kvaf_ub_record_management_diagnostic(
         g_kvaf_management_diagnostic.flags |=
             KVAF_URMA_MANAGEMENT_DIAGNOSTIC_OPERATION_STATUS_VALID;
     }
-    if (completion_status_valid) {
+    if (auxiliary_status_valid) {
         g_kvaf_management_diagnostic.flags |=
-            KVAF_URMA_MANAGEMENT_DIAGNOSTIC_COMPLETION_STATUS_VALID;
+            KVAF_URMA_MANAGEMENT_DIAGNOSTIC_AUXILIARY_STATUS_VALID |
+            auxiliary_kind_flag;
     }
 }
 
@@ -576,7 +578,7 @@ static int kvaf_ub_management_error(
         operation_errno == 0 ? fallback_errno : operation_errno;
 
     kvaf_ub_record_management_diagnostic(
-        stage, operation_errno, concrete_errno, 0, false, 0, false);
+        stage, operation_errno, concrete_errno, 0, false, 0, false, 0U);
 
     /* source_linked_urma_main deliberately reports ENOENT while suppressing
      * dynamic provider scans. Reset errno before every checked operation and
@@ -646,7 +648,8 @@ static urma_target_jetty_t *kvaf_ub_import_peer_jetty_tp_aware(
         (void)fflush(stderr);
         kvaf_ub_record_management_diagnostic(
             failure_stage, operation_errno, effective_errno,
-            (int)status, true, (int)tp_count, true);
+            (int)status, true, (int)tp_count, true,
+            KVAF_URMA_MANAGEMENT_DIAGNOSTIC_AUX_TP_COUNT);
         (void)kvaf_ub_management_error(
             failure_stage, operation_errno,
             status == URMA_SUCCESS ? EPROTO : EIO);
@@ -1108,7 +1111,8 @@ static int kvaf_ub_jfr_creation_error(
     kvaf_ub_record_management_diagnostic(
         stage, wrapper_errno, effective_errno,
         failure.operation_status, failure_valid,
-        (int)failure.stage, failure_valid);
+        (int)failure.stage, failure_valid,
+        KVAF_URMA_MANAGEMENT_DIAGNOSTIC_AUX_PROVIDER_STAGE_ID);
     if (g_kvaf_management_diagnostic.stage ==
         KVAF_URMA_MANAGEMENT_STAGE_CREATE_JFR) {
         const char *memory_marker =
@@ -1175,7 +1179,8 @@ static int kvaf_ub_segment_registration_error(
         segment_status == 0 &&
             segment.stage != KVAF_UDMA_SEGMENT_FAILURE_NONE,
         segment.rollback_status,
-        segment_status == 0 && segment.rollback_status != 0);
+        segment_status == 0 && segment.rollback_status != 0,
+        KVAF_URMA_MANAGEMENT_DIAGNOSTIC_AUX_ROLLBACK_STATUS);
     return kvaf_ub_management_error(
         stage, effective_errno, fallback_errno);
 }
@@ -1224,7 +1229,8 @@ static int kvaf_ub_token_allocation_error(
         stage, wrapper_errno,
         effective_errno == 0 ? fallback_errno : effective_errno,
         ummu_status, ummu_status != 0, ummu.last_error,
-        ummu_status == 0 && ummu.last_error != 0);
+        ummu_status == 0 && ummu.last_error != 0,
+        KVAF_URMA_MANAGEMENT_DIAGNOSTIC_AUX_UMMU_LAST_ERROR);
     return kvaf_ub_management_error(
         stage, effective_errno, fallback_errno);
 }
@@ -1501,7 +1507,7 @@ static int kvaf_ub_client_handshake_checked(
         kvaf_ub_record_management_diagnostic(
             "client_post_handshake_send", operation_errno,
             operation_errno == 0 ? EIO : operation_errno,
-            (int)post_status, true, 0, false);
+            (int)post_status, true, 0, false, 0U);
         return kvaf_ub_management_error(
             "client_post_handshake_send", operation_errno, EIO);
     }
@@ -1513,7 +1519,8 @@ static int kvaf_ub_client_handshake_checked(
             "client_poll_handshake_cqe", operation_errno,
             operation_errno == 0 ? EIO : operation_errno,
             poll_status, true, (int)cr.status,
-            cr.status != URMA_CR_SUCCESS);
+            cr.status != URMA_CR_SUCCESS,
+            KVAF_URMA_MANAGEMENT_DIAGNOSTIC_AUX_COMPLETION_STATUS);
         return kvaf_ub_management_error(
             "client_poll_handshake_cqe", operation_errno, EIO);
     }

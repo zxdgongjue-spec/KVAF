@@ -8,12 +8,34 @@ set(KVAF_LIBUMMU_ROOT "" CACHE PATH
   "Path to the libummu source repository pinned by UMDK")
 set(KVAF_DEVICE_PROVIDER_OUTPUT_NAME "kvaf_urma_provider_device" CACHE STRING
   "Device provider output basename (without lib prefix or .so suffix)")
+set(KVAF_RUNTIME_PROBE_PROVIDER_BUILD_ID_HEX "" CACHE STRING
+  "SHA-256 source/config build identity embedded in the runtime probe")
+set(KVAF_RUNTIME_PROBE_PROVIDER_OUTPUT_NAME "" CACHE STRING
+  "Source/config-versioned runtime-probe Device provider output basename")
 
 if(NOT KVAF_UMDK_ROOT)
   message(FATAL_ERROR "KVAF_UMDK_ROOT is required")
 endif()
 if(NOT KVAF_LIBUMMU_ROOT)
   message(FATAL_ERROR "KVAF_LIBUMMU_ROOT is required")
+endif()
+string(LENGTH "${KVAF_RUNTIME_PROBE_PROVIDER_BUILD_ID_HEX}"
+  KVAF_RUNTIME_PROBE_PROVIDER_BUILD_ID_LENGTH)
+if(NOT KVAF_RUNTIME_PROBE_PROVIDER_BUILD_ID_LENGTH EQUAL 64 OR
+   NOT KVAF_RUNTIME_PROBE_PROVIDER_BUILD_ID_HEX MATCHES "^[0-9a-f]+$")
+  message(FATAL_ERROR
+    "KVAF_RUNTIME_PROBE_PROVIDER_BUILD_ID_HEX must be 64 lowercase hex digits")
+endif()
+if(NOT KVAF_RUNTIME_PROBE_PROVIDER_OUTPUT_NAME MATCHES
+       "^kvaf_rt_[0-9a-f]+$")
+  message(FATAL_ERROR
+    "KVAF_RUNTIME_PROBE_PROVIDER_OUTPUT_NAME must be kvaf_rt_<16 hex>")
+endif()
+string(LENGTH "${KVAF_RUNTIME_PROBE_PROVIDER_OUTPUT_NAME}"
+  KVAF_RUNTIME_PROBE_PROVIDER_OUTPUT_NAME_LENGTH)
+if(NOT KVAF_RUNTIME_PROBE_PROVIDER_OUTPUT_NAME_LENGTH EQUAL 24)
+  message(FATAL_ERROR
+    "KVAF_RUNTIME_PROBE_PROVIDER_OUTPUT_NAME must contain 16 hex digits")
 endif()
 string(LENGTH "${KVAF_DEVICE_PROVIDER_OUTPUT_NAME}"
   KVAF_DEVICE_PROVIDER_OUTPUT_NAME_LENGTH)
@@ -452,6 +474,38 @@ kvaf_add_urma_provider(
   kvaf_source_udma_device
   kvaf_source_ummu_device
   "${KVAF_DEVICE_PROVIDER_OUTPUT_NAME}")
+
+# This DSO is intentionally isolated from the source-linked provider above.
+# Its only job is to inspect the Device OS runtime selected by dlopen().  If it
+# linked kvaf_source_urma_core/UDMA/UMMU/perftest, those constructors and
+# process-global objects would contaminate the caller domain before the probe
+# reached the official liburma.so.0 and make every observation ambiguous.
+add_library(kvaf_urma_runtime_probe_provider_device SHARED
+  runtime_matched_urma_probe.c)
+set_target_properties(kvaf_urma_runtime_probe_provider_device PROPERTIES
+  C_STANDARD 11
+  C_STANDARD_REQUIRED YES
+  C_EXTENSIONS YES
+  C_VISIBILITY_PRESET hidden
+  OUTPUT_NAME "${KVAF_RUNTIME_PROBE_PROVIDER_OUTPUT_NAME}"
+  SKIP_BUILD_RPATH YES
+  BUILD_WITH_INSTALL_RPATH NO
+  INSTALL_RPATH ""
+)
+target_compile_options(kvaf_urma_runtime_probe_provider_device PRIVATE
+  -Wall -Wextra -Werror)
+target_compile_definitions(kvaf_urma_runtime_probe_provider_device PRIVATE
+  "KVAF_RUNTIME_PROBE_PROVIDER_BUILD_ID_HEX=\"${KVAF_RUNTIME_PROBE_PROVIDER_BUILD_ID_HEX}\"")
+target_include_directories(kvaf_urma_runtime_probe_provider_device PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${KVAF_URMA_PUBLIC_INCLUDE_DIR}")
+target_link_libraries(kvaf_urma_runtime_probe_provider_device PRIVATE
+  pthread dl)
+target_link_options(kvaf_urma_runtime_probe_provider_device PRIVATE
+  "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/runtime_probe_exports.map"
+  "-Wl,-Bsymbolic-functions"
+  "-Wl,-z,defs"
+  "-Wl,-soname,lib${KVAF_RUNTIME_PROBE_PROVIDER_OUTPUT_NAME}.so")
 
 add_library(kvaf_public_abi_consumer_probe OBJECT
   public_abi_probe_consumer.c)

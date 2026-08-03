@@ -8,6 +8,15 @@
 # fresh epochs in order: resource-only, one 1-KiB WQE, then the requested
 # decode-style batch (4096 x 1 KiB by default).
 
+unset BASH_ENV ENV
+unset -f exit builtin 2>/dev/null || true
+
+echo "KVAF_A5_NPU2_CLEAN_VALIDATION_COORDINATOR_DISABLED" >&2
+echo "CAPABILITY_LEDGER=not-implemented" >&2
+echo "No argument/environment/source/state/CANN/docker/NPU operation was attempted." >&2
+builtin exit 2
+if [[ 0 == 1 ]]; then
+
 set -Eeuo pipefail
 umask 077
 
@@ -234,3 +243,5 @@ kvaf_run_stage batch \
 
 echo "KVAF_NPU2_CLEAN_VALIDATION=PASS"
 echo "KVAF_NPU2_FINAL_SHAPE=${KVAF_NPU2_TRANSFER_COUNT}x${KVAF_NPU2_BYTES_PER_TRANSFER}x${KVAF_NPU2_BATCH_ITERATIONS}"
+fi
+/bin/sh -c 'exit 2'

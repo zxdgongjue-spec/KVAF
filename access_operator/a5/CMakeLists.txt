@@ -233,6 +233,28 @@ function(kvaf_configure_a5_target target)
   )
 endfunction()
 
+# Plain Host control binaries must not inherit AscendC device compilation or
+# fat-object link options.  They launch already-packaged AICPU kernels through
+# ACL/runtime only and contain no AIV/AIC translation unit.
+function(kvaf_configure_a5_host_target target)
+  target_include_directories(${target}
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/provider/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/../include
+      ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+      ${KVAF_ACL_INCLUDE_DIR}
+      ${KVAF_RUNTIME_INCLUDE_DIR}
+  )
+  target_compile_options(${target} PRIVATE -Wall -Wextra -Werror)
+  target_link_libraries(${target}
+    PRIVATE
+      ${KVAF_ASCENDCL_LIBRARY}
+      dl
+      pthread
+  )
+endfunction()
+
 if(KVAF_A5_BUILD_HCOMM_BACKEND)
   add_executable(kvaf_a5_aiv_urma_h2d_smoke
     src/aiv_simt_urma_h2d_kernel.cpp
@@ -272,4 +294,12 @@ if(KVAF_A5_BUILD_DIRECT_URMA_BACKEND)
   target_include_directories(kvaf_a5_aicpu_owner_probe PRIVATE
     ${KVAF_RUNTIME_INCLUDE_DIR}
   )
+
+  # Staged AICPU Device-runtime compatibility probe.  Discover performs no
+  # URMA init/resource calls, but its dlopen may run official constructors;
+  # every mode is therefore owned by the guarded external supervisor.
+  add_executable(kvaf_a5_aicpu_runtime_urma_probe
+    smoke/aicpu_runtime_urma_probe.cpp
+  )
+  kvaf_configure_a5_host_target(kvaf_a5_aicpu_runtime_urma_probe)
 endif()

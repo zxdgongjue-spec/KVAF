@@ -4,6 +4,15 @@
 # Every delegated build/run command retains its normal machine-wide guards;
 # this coordinator never removes locks or recovery evidence.
 
+unset BASH_ENV ENV
+unset -f exit builtin 2>/dev/null || true
+
+echo "KVAF_A5_NPU2_CLEAN_PREPARE_COORDINATOR_DISABLED" >&2
+echo "CAPABILITY_LEDGER=not-implemented" >&2
+echo "No argument/environment/source/state/CANN/docker/NPU operation was attempted." >&2
+builtin exit 2
+if [[ 0 == 1 ]]; then
+
 set -Ee
 set -o pipefail
 umask 077
@@ -155,3 +164,5 @@ unset KVAF_DIRECT_MANAGEMENT_MODE
 unset KVAF_DIRECT_MANAGEMENT_JETTY_ID
 unset KVAF_DIRECT_ALLOW_BUSY_NPU
 exec bash "${SCRIPT_DIR}/run_a5_direct_urma_npu2_clean_validation.sh"
+fi
+/bin/sh -c 'exit 2'

@@ -5,6 +5,15 @@
 # an external expected-commit guard; this newer wrapper only makes launching
 # and observing it reliable when an SSH client cannot paste multiline commands.
 
+unset BASH_ENV ENV
+unset -f exit builtin 2>/dev/null || true
+
+echo "KVAF_A5_CROSS_NPU2_REUSE_DETACHED_COORDINATOR_DISABLED" >&2
+echo "CAPABILITY_LEDGER=not-implemented" >&2
+echo "No argument/environment/source/state/CANN/docker/NPU operation was attempted." >&2
+builtin exit 2
+if [[ 0 == 1 ]]; then
+
 set -Ee
 set -o pipefail
 umask 077
@@ -1778,3 +1787,5 @@ case "${kvaf_mode}" in
   recovery-watch) watch_recovery_status "$@" ;;
   *) usage ;;
 esac
+fi
+/bin/sh -c 'exit 2'

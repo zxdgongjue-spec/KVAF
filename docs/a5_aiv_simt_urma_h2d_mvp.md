@@ -1,8 +1,17 @@
 # A5 AIV + SIMT + URMA + H2D 最小集合
 
+> **HISTORICAL / `HARDWARE_EXECUTION_DISABLED`**
+>
+> 本文记录早期 HCOMM 对照路径的结构、ABI 和实验判据，不再提供真机操作
+> 指导。legacy HCOMM runner 和对应 binary 现在也有固定硬门禁，不能把它们
+> 当成绕过 direct gate 的替代入口。本文中的硬件流程、
+> marker 和参数只用于代码审计；当前只允许执行
+> [direct URMA 文档 6.7 节](a5_direct_urma_h2d.md#67-docker当前唯一允许的下一步静态检查)
+> 的静态检查。
+
 ## 1. 结论和状态
 
-本分支实现的是完整 KVAF 的第一条数据面最小闭环：
+本分支保留了完整 KVAF 第一条数据面最小闭环的候选代码结构：
 
 ```text
 预先准备的 Device AccessTable
@@ -32,17 +41,18 @@
 | 层次 | 状态 | 证据 |
 |---|---|---|
 | 固定设备 ABI 与 CPU 参考规划器 | 已实现 | 默认库和单元测试 |
-| SIMT 查表与 64B 描述符生成 | 已实现代码 | 服务器 B 需用 bisheng 编译 |
+| SIMT 查表与 64B 描述符生成 | 已实现代码 | 未来解锁后需用 bisheng 复核 |
 | Host DDR HVA→DVA 显式映射 | 已实现代码 | `halHostRegister(HOST_MEM_MAP_DEV)` |
 | Host MR 导出、Device endpoint 导入 | 已实现代码 | `HcommMemExport/Import` |
-| CPU/AIV UBC_CTP channel | 已实现代码 | 服务器 B 需验证 channel READY |
-| SQ/CQ/EID/TP/token 快照与校验 | 已实现代码 | 服务器 B 需验证 `DIRECT_URMA_READY` |
-| AIV 直写 SQ/CQ 的 URMA READ | 已实现代码 | 服务器 B 需验证数据与 Completion |
+| CPU/AIV UBC_CTP channel | 已实现代码 | 当前未授权真机验证 |
+| SQ/CQ/EID/TP/token 快照与校验 | 已实现代码 | 当前未授权真机验证 |
+| AIV 直写 SQ/CQ 的 URMA READ | 已实现代码 | 当前未授权真机验证 |
 | PC A 本地验证 | 已通过 | Apple clang CPU 单测和脚本语法检查 |
-| A5 硬件端到端验证 | 尚未执行 | PC A 没有 CANN、bisheng 和 A5 |
+| A5 硬件端到端验证 | 未证明且已禁用 | `HARDWARE_EXECUTION_DISABLED` |
 
-因此，合入前的准确说法是“**代码闭环已实现，本地可验证部分已通过，A5
-硬件验收待服务器 B 执行**”，不能把它描述成已经在 A5 上跑通。
+因此，当前准确说法是“**候选代码结构和本地 CPU 逻辑存在，但 A5 端到端能力
+尚未证明且当前不允许执行**”，不能把它描述成已经在 A5 上跑通，也不能把
+“待验证”理解为要求操作员立即上机。
 
 本最小集采用设计文档 §3.4 的具体图边界：Replay 从 capture 前已稳定放在
 NPU 上的 AccessTable 开始，`PrepareAccessTable`、Key 展开和 Meta 查询在
@@ -277,7 +287,7 @@ super_pod_index` 必须来自当前服务器的真实 ACL/runtime 拓扑。冒�
 吞吐最优实现。批量 post、SIMT 并行填 WQE、多 Jetty 和多 QP 需要在硬件
 验收后单独增加。
 
-## 6. PC A、服务器 B、远端仓 C 操作
+## 6. 历史开发流程（真机步骤已撤下）
 
 ### 6.1 PC A：开发和非硬件测试
 
@@ -310,7 +320,7 @@ clang++ -std=c++17 -Wall -Wextra -Werror \
 KVAF_AIV_SIMT_URMA_H2D_UNIT_OK
 ```
 
-### 6.2 服务器 B：拉取、构建和 A5 验收
+### 6.2 服务器 B：历史构建与 A5 验收记录（不可执行）
 
 在服务器 B 宿主机更新共享代码；不要再建临时容器：
 
@@ -322,73 +332,78 @@ git pull --ff-only
 git log -1 --oneline
 ```
 
-构建和硬件运行都在现有 `vllm-ascend-cs-kvaf` 容器内执行。容器和宿主机
-均挂载 `/data/c00982601/KVAF`，因此不需要在容器内再次 clone：
+历史实验曾在 `vllm-ascend-cs-kvaf` 容器内构建。下面只保留产物关系，
+不再给出可直接粘贴的 Docker、CANN 环境或构建/运行组合命令：
 
-```bash
-docker exec -it -u 0 vllm-ascend-cs-kvaf bash
-
-cd /data/c00982601/KVAF
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-export LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64:${LD_LIBRARY_PATH:-}
-unset ASCEND_RT_VISIBLE_DEVICES
-
-export KVAF_A5_BUILD_DIR=/data/c00982601/KVAF/build-a5-direct-urma
-export KVAF_ASC_DEVKIT_PATH=/data/c00982601/asc-devkit-9.1.0-20260722
-bash scripts/build_a5_aiv_urma.sh
+```text
+HISTORICAL_BUILD_RECORD (NOT SHELL)
+  container: vllm-ascend-cs-kvaf
+  build entry: scripts/build_a5_aiv_urma.sh
+  build output: build-a5-direct-urma
+  compile headers: asc-devkit-9.1.0-20260722
 ```
 
 本实现不再包含设备侧 `hcomm/hcomm.h`，所以**不要求仅为
 `COMM_PROTOCOL_UBC_CTP/ChannelHandle` 升级 CANN**。第一轮应优先使用容器
 内的 CANN runtime/`libhcomm.so`/`libascendcl.so`，并沿用此前已证明能与
 bisheng 完成 xasc 编译的 `asc-devkit-9.1.0-20260722` 基础/SIMT 头。若该
-目录不存在，再检查原路径：
+目录不存在时，旧流程曾回退到 `asc-devkit`。该回退现在仅作为版本配对
+风险记录，不应在服务器上复现：
 
-```bash
-test -r /data/c00982601/asc-devkit/include/simt_api/asc_simt.h
-export KVAF_ASC_DEVKIT_PATH=/data/c00982601/asc-devkit
-export KVAF_A5_BUILD_DIR=/data/c00982601/KVAF/build-a5-direct-urma-fallback
-bash scripts/build_a5_aiv_urma.sh
+```text
+HISTORICAL_FALLBACK_RECORD (NOT SHELL)
+  compile headers: asc-devkit
+  build output: build-a5-direct-urma-fallback
 ```
 
 不能混装另一套完整 CANN 到容器目录。Host `libhcomm.so`、ACL runtime、
 driver 和 AICPU 包仍必须彼此兼容；`asc-devkit` 在这里最多只覆盖编译期
 AscendC 基础/SIMT 头。
 
-运行脚本会先查询 logical/physical device 映射和 HCOMM endpoint 拓扑。
+旧运行脚本会先查询 logical/physical device 映射和 HCOMM endpoint 拓扑。
 如果没有显式设置 EID，它会调用 KVAF 自带的最小 resolver，通过
 `/data/.kvaf-state/asdrv-ub-pair.lock` 跨宿主机/Docker 协作锁，
 串行化 `/proc/asdrv_ub/dev_id` selector 的写入和 `pair_info` 快照读取，再把
-`local_eid` 作为 Host EID、`remote_eid` 作为 Device EID：
+`local_eid` 作为 Host EID、`remote_eid` 作为 Device EID。原实验参数只保留为
+不可执行记录：
 
-```bash
-unset KVAF_HOST_EID KVAF_DEVICE_EID KVAF_PAIR_CHANNEL
-export KVAF_LOGICAL_DEVICE_ID=0
-export KVAF_H2D_BYTES=4096
-bash scripts/run_a5_aiv_urma_h2d_smoke.sh
+```text
+HISTORICAL_HARDWARE_RECORD (NOT SHELL)
+  runner: scripts/run_a5_aiv_urma_h2d_smoke.sh
+  logical_device_id: 0
+  payload_bytes: 4096
+  endpoint_source: driver pair resolver
+  execution: DISABLED
 ```
 
 若驱动为同一物理设备报告多个 active pair，resolver 会拒绝猜测并列出
-channel。确认实际 channel 后重跑：
+channel。旧流程要求人工确认 channel；当前不得据此重跑硬件：
 
-```bash
-export KVAF_PAIR_CHANNEL=<实际通道号>
-bash scripts/run_a5_aiv_urma_h2d_smoke.sh
+```text
+HISTORICAL_CHANNEL_RECORD (NOT SHELL)
+  pair_channel: operator-selected
+  runner: disabled
 ```
 
-resolver 也可以单独检查；参数使用物理设备号：
+resolver 会写全局 selector，不能再作为“单独只读检查”运行。历史调用关系为：
 
-```bash
-python3 scripts/resolve_a5_urma_eids.py \
-  --physical-device-id 0 \
-  --shell
+```text
+HISTORICAL_RESOLVER_RECORD (NOT SHELL)
+  component: scripts/resolve_a5_urma_eids.py
+  input: physical device ID
+  side effect: writes /proc/asdrv_ub/dev_id selector
+  execution: DISABLED
 ```
 
-运行脚本调用 `scripts/query_a5_topology.py`，从 ACL/runtime 查询 physical
-device、SDID、server ID 和 super-pod ID。单独检查：
+旧运行脚本调用 `scripts/query_a5_topology.py`，从 ACL/runtime 查询 physical
+device、SDID、server ID 和 super-pod ID。该 helper 会进入 ACL/runtime，
+不再给出可执行的单独检查命令：
 
-```bash
-python3 scripts/query_a5_topology.py --logical-device-id 0 --shell
+```text
+HISTORICAL_TOPOLOGY_RECORD (NOT SHELL)
+  component: scripts/query_a5_topology.py
+  input: logical device ID
+  execution: DISABLED
 ```
 
 `KVAF_SUPER_POD_INDEX=4294967295`（`0xffffffff`）表示 runtime 未配置或
@@ -418,7 +433,7 @@ git ls-remote --heads https://gitcode.com/CacheOS/KVAF.git \
   A5_AIV_URMA_cs
 ```
 
-服务器 B 验收后如需修复，仍按 A→C→B 循环：
+代码同步仍可按 A→C→B 循环，但真机构建/运行步骤已经撤下：
 
 ```bash
 # PC A
@@ -432,11 +447,8 @@ git fetch origin
 git switch A5_AIV_URMA_cs
 git pull --ff-only
 
-# Docker vllm-ascend-cs-kvaf
-cd /data/c00982601/KVAF
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-bash scripts/build_a5_aiv_urma.sh
-bash scripts/run_a5_aiv_urma_h2d_smoke.sh
+# Docker hardware validation: HISTORICAL / DISABLED
+# Do not invoke build+run as an acceptance workflow.
 ```
 
 ## 7. 当前没有包含的完整 KVAF 能力
@@ -458,9 +470,11 @@ bash scripts/run_a5_aiv_urma_h2d_smoke.sh
 特定版本的 SMIT 驱动，必须由 CANN/HCOMM provider 文档或服务器 B 的驱动
 trace 证明，不能只凭本仓源码断言。
 
-## 8. 进入下一阶段前的硬门槛
+## 8. 未来重新启用前必须满足的门槛
 
-1. 服务器 B 正向 H2D smoke 全部 marker 通过；
+以下条目是未来解除源码硬门禁前的验收标准，不是要求当前操作员执行的测试：
+
+1. 经评审批准的新 runner 在服务器 B 正向 H2D smoke 全部 marker 通过；
 2. wrong/expired MR token 或越界地址负向用例能失败且不污染 canary；
 3. 重复至少 1000 次建链、传输、销毁，无超时和资源泄漏；
 4. 将正向 smoke 的多条 descriptor（含 mask）扩大到完整 32-lane 边界；

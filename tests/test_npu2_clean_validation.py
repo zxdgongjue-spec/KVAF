@@ -91,6 +91,12 @@ class Npu2CleanValidationTests(unittest.TestCase):
         self.assertNotIn("kill ", coordinator)
 
         trace = TRACE.read_text(encoding="utf-8")
+        retired = trace.index("KVAF_JFR_TRACE_RETIRED=")
+        retired_exit = trace.index("exit 2", retired)
+        first_docker_access = trace.index("command -v docker")
+        self.assertLess(retired, retired_exit)
+        self.assertLess(retired_exit, first_docker_access)
+        self.assertIn("hccn_tool/HCCP, not the KVAF AICPU", trace)
         for required in (
             "EXECUTION_ENV=SERVER_B_HOST",
             "/proc/sys/kernel/random/boot_id",
@@ -217,10 +223,11 @@ class Npu2CleanValidationTests(unittest.TestCase):
             env=env,
         )
 
-    def test_rejects_target_and_risk_overrides_before_hardware(self) -> None:
+    def test_retired_entry_precedes_target_and_risk_validation(self) -> None:
+        marker = "KVAF_A5_NPU2_CLEAN_VALIDATION_COORDINATOR_DISABLED"
         result = self.run_preflight(KVAF_LOGICAL_DEVICE_ID="7")
         self.assertEqual(result.returncode, 2)
-        self.assertIn("KVAF_LOGICAL_DEVICE_ID is source-owned", result.stderr)
+        self.assertIn(marker, result.stderr)
         self.assertNotIn("RESULT_DIR=", result.stdout)
 
         result = self.run_preflight(
@@ -229,41 +236,39 @@ class Npu2CleanValidationTests(unittest.TestCase):
             )
         )
         self.assertEqual(result.returncode, 2)
-        self.assertIn("is forbidden", result.stderr)
+        self.assertIn(marker, result.stderr)
         self.assertNotIn("RESULT_DIR=", result.stdout)
 
         result = self.run_preflight(
             KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN="0000000000000002"
         )
         self.assertEqual(result.returncode, 2)
-        self.assertIn(
-            "KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN is forbidden",
-            result.stderr,
-        )
+        self.assertIn(marker, result.stderr)
         self.assertNotIn("RESULT_DIR=", result.stdout)
 
-    def test_rejects_invalid_batch_shape_before_hardware(self) -> None:
+    def test_retired_entry_precedes_batch_shape_validation(self) -> None:
+        marker = "KVAF_A5_NPU2_CLEAN_VALIDATION_COORDINATOR_DISABLED"
         result = self.run_preflight(KVAF_NPU2_TRANSFER_COUNT="0")
         self.assertEqual(result.returncode, 2)
-        self.assertIn("KVAF_NPU2_TRANSFER_COUNT", result.stderr)
+        self.assertIn(marker, result.stderr)
         self.assertNotIn("RESULT_DIR=", result.stdout)
 
         result = self.run_preflight(
             KVAF_NPU2_TRANSFER_COUNT="999999999999999999999999999999"
         )
         self.assertEqual(result.returncode, 2)
-        self.assertIn("KVAF_NPU2_TRANSFER_COUNT", result.stderr)
+        self.assertIn(marker, result.stderr)
 
         result = self.run_preflight(
             KVAF_NPU2_TRANSFER_COUNT="4096",
             KVAF_NPU2_BYTES_PER_TRANSFER="65536",
         )
         self.assertEqual(result.returncode, 2)
-        self.assertIn("64 MiB registration limit", result.stderr)
+        self.assertIn(marker, result.stderr)
 
         result = self.run_preflight(KVAF_NPU2_VALIDATION_LIMIT="one-kib")
         self.assertEqual(result.returncode, 2)
-        self.assertIn("must be full or zero-wqe", result.stderr)
+        self.assertIn(marker, result.stderr)
         self.assertNotIn("RESULT_DIR=", result.stdout)
 
 

@@ -233,7 +233,8 @@ class JfrFailureDiagnosticsTests(unittest.TestCase):
             helper,
             r"kvaf_ub_record_management_diagnostic\s*\("
             r"[\s\S]*?failure\.operation_status\s*,\s*failure_valid\s*,"
-            r"[\s\S]*?\(int\)failure\.stage\s*,\s*failure_valid\s*\)",
+            r"[\s\S]*?\(int\)failure\.stage\s*,\s*failure_valid\s*,"
+            r"[\s\S]*?AUX_PROVIDER_STAGE_ID\s*\)",
         )
         self.assertRegex(
             helper,

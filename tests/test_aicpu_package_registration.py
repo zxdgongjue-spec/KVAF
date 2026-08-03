@@ -1,3 +1,4 @@
+import hashlib
 import os
 from pathlib import Path
 import stat
@@ -40,6 +41,7 @@ class AicpuPackageRegistrationTests(unittest.TestCase):
         self,
         function: str,
         registry: Path,
+        expected_old_sha: str = "",
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
@@ -47,13 +49,16 @@ class AicpuPackageRegistrationTests(unittest.TestCase):
                 "--noprofile",
                 "--norc",
                 "-c",
-                'set -Eeuo pipefail\nsource "$1"\n"$2" "$3" "$4" "$5"',
+                'set -Eeuo pipefail\n'
+                'command -v flock >/dev/null 2>&1 || flock() { return 0; }\n'
+                'source "$1"\n"$2" "$3" "$4" "$5" "$6"',
                 "kvaf-aicpu-registration-test",
                 str(REGISTRATION_HELPER),
                 function,
                 str(registry),
                 PACKAGE_NAME,
                 PACKAGE_PATH,
+                expected_old_sha,
             ],
             check=False,
             capture_output=True,
@@ -283,6 +288,86 @@ class AicpuPackageRegistrationTests(unittest.TestCase):
 
             self.assertEqual(
                 stat.S_IMODE(registry.stat().st_mode), 0o640
+            )
+
+    def test_install_rejects_mismatched_expected_old_sha_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            registry = Path(temporary_dir) / "ascend_package_load.ini"
+            registry.write_text(OTHER_STANZAS, encoding="utf-8")
+            initial_bytes = registry.read_bytes()
+            wrong_sha = "0" * 64
+            self.assertNotEqual(
+                hashlib.sha256(initial_bytes).hexdigest(), wrong_sha
+            )
+
+            result = self.run_helper(
+                "kvaf_aicpu_install_registration",
+                registry,
+                wrong_sha,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "stage=compare-registry-before-update", result.stderr
+            )
+            self.assertEqual(registry.read_bytes(), initial_bytes)
+
+    def test_sync_failure_keeps_published_registration_sha_observable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            registry = root / "ascend_package_load.ini"
+            registry.write_text(OTHER_STANZAS, encoding="utf-8")
+            expected_old_sha = hashlib.sha256(registry.read_bytes()).hexdigest()
+            failing_sync = root / "fail_sync.py"
+            failing_sync.write_text(
+                "import sys\n"
+                "raise SystemExit(71)\n",
+                encoding="utf-8",
+            )
+
+            command = (
+                'set -uo pipefail\n'
+                'command -v flock >/dev/null 2>&1 || flock() { return 0; }\n'
+                'source "$1"\n'
+                'KVAF_AICPU_DURABLE_STATE_HELPER=$7\n'
+                'kvaf_aicpu_install_registration "$2" "$3" "$4" "$5"\n'
+                'helper_rc=$?\n'
+                'printf "helper_rc=%s\\n" "$helper_rc"\n'
+                'printf "published_sha=%s\\n" '
+                '"${KVAF_AICPU_REGISTRATION_PUBLISHED_SHA256:-}"\n'
+                'exit 0\n'
+            )
+            result = subprocess.run(
+                [
+                    "bash",
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    command,
+                    "kvaf-aicpu-registration-sync-failure-test",
+                    str(REGISTRATION_HELPER),
+                    str(registry),
+                    PACKAGE_NAME,
+                    PACKAGE_PATH,
+                    expected_old_sha,
+                    "unused",
+                    str(failing_sync),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("helper_rc=1", result.stdout)
+            self.assertIn(
+                "stage=sync-published-registration", result.stderr
+            )
+            published_sha = hashlib.sha256(registry.read_bytes()).hexdigest()
+            self.assertIn(f"published_sha={published_sha}", result.stdout)
+            self.assertEqual(
+                registry.read_text(encoding="utf-8"),
+                OTHER_STANZAS + TARGET_BLOCK,
             )
 
 

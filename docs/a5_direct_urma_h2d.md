@@ -2,7 +2,23 @@
 
 ## 1. 结论
 
-KVAF 现在有一条不调用、不链接 HCOMM 的实验性 H2D 路径：
+当前代码中保留了一条不调用、不链接 HCOMM 的候选 H2D
+路径，但它只是“已编译的架构候选”，不是“已验证的可执行数据面”。
+当前门禁状态为：
+
+```text
+HARDWARE_EXECUTION_DISABLED
+ZERO_WQE_NOT_PROVEN
+DYNAMIC_RUNTIME_PROBE_DISABLED
+```
+
+这三项状态的直接含义是：不再执行 zero-WQE、不再执行真实 H2D，
+也不再启动会进入 AICPU 官方 `liburma.so.0` 的动态 runtime probe。
+direct H2D runner 及其 candidate wrapper 会在拓扑、
+EID、ACL、DDR/HBM 注册和 URMA 资源创建之前固定退出 2；
+runtime probe 的三个动态模式同样固定退出 2。不提供环境变量绕过。
+
+候选流程仅用于说明代码意图：
 
 ```text
 Host DDR(HVA)
@@ -18,6 +34,22 @@ Host DDR(HVA)
   -> DCCI 后轮询 CQE，并更新 CQ doorbell
   -> Host DDR 数据进入 Device HBM
 ```
+
+官方 URMA 能力必须分层判定，不能由一个符号或一次 SUCCESS 返回推导
+整条链路成立：
+
+1. **符号层**：目标函数能否从实际 DSO 解析；
+2. **返回码层**：入口是否接受当前 mode、token 和 endpoint；
+3. **语义层**：SUCCESS 是否真正完成创建、advise、notify 或销毁，而不是
+   no-op 或只记录内部错误；
+4. **调用域层**：Host Linux userspace 入口是否有明文支持 AICPU/Device OS；
+5. **生命周期层**：部分创建、并发 init、逆序 cleanup 和错误传播是否完整；
+6. **AIV 私有队列 ABI 层**：SQ/CQ/doorbell 地址域、WQE/CQE 格式、owner bit、
+   barrier 和 cache 语义是否与 A5 一致。
+
+当前六层尚未形成可机器复核的完整证据链，因此 zero-WQE 也不能当作
+“无数据的安全预检”。更完整的缺口和判定标准见
+[A5 官方 URMA 接口能力边界与 KVAF 门禁](a5_official_urma_capability_audit.md)。
 
 资源控制面固定来自 openEuler UMDK 26.06 源码：普通
 `urma_create_jetty` 在 AICPU KFC 进程内执行，AIV 消费同一 unified
@@ -371,11 +403,16 @@ quarantine 或 active 引用的结果目录；`flock` 绑定 inode，删除锁�
 session 会阻止换另一张卡继续测试，这是有意的 fail-closed 约束；生产路径不提供
 quarantine bypass，也不接受通过复制仓库、删除锁或改状态目录绕过它。
 
-### 5.1 受限的 NPU7 -> NPU2 风险接受实验
+### 5.1 历史方案：受限的 NPU7 -> NPU2 风险接受实验（当前禁用）
 
-当前有一个范围刻意收窄的真机诊断模式
+> 本节只保留事故处置设计和旧证据的可审计性。下文出现的
+> `zero-wqe`、`one-kib`、cross-NPU 和 detached launcher 命令名都不是当前
+> 操作指南。全局 `HARDWARE_EXECUTION_DISABLED` 门禁不允许它们创建
+> URMA/UMMU 资源，也没有风险接受开关可以解锁。
+
+历史版本曾有一个范围刻意收窄的真机诊断模式
 `risk-accepted-cross-npu2-v1`。它不是生产恢复机制，也不是对“不同 NPU 一定彼此
-隔离”的声明。它只用于以下具体情况：NPU7 已因一次旧版 zero-WQE 测试进入
+隔离”的声明。它曾用于以下具体情况：NPU7 已因一次旧版 zero-WQE 测试进入
 quarantine，现场暂时不能重启，但需要验证修复后的代码能否在 NPU2 完成最小资源
 生命周期和一条真实 H2D。
 
@@ -386,7 +423,7 @@ zero-WQE 工作负载、最终失败原因、Host/Device PID、进程起始时�
 进程身份发生变化。任何字段缺失、重复、变更或无法读取都会在目标资源创建前
 fail closed。
 
-当前唯一接受的源事件是 commit
+历史实现唯一接受的源事件是 commit
 `ed13d76f4a5a9c89b91c0524b2a4f53da2e3a874`、`h2d_transfer_count=0`，且
 Device final 为 `FAIL_UNSAFE/device_provider_open_cleanup_failed` 的那一次运行。
 模式不会接受“看起来相似”的另一份 quarantine，也不会把后续新故障加入白名单。
@@ -438,14 +475,13 @@ PASID/TID、驱动内部 ownership 或 AICPU worker/SO 状态按 NPU 完全隔�
 2. `one-kib`：只提交 1 条 1024-byte H2D READ，并校验 payload、canary、CQ 和完整
    teardown。该受限入口不允许直接运行 4096 x 1 KiB 或自定义更大负载。
 
-实验必须先用 `build_a5_direct_urma.sh cross-npu2-risk-offline-v1` 在
+历史实验会先以 `cross-npu2-risk-offline-v1` 模式构建一次性 direct binary，并放在
 `/data/.kvaf-state/KVAF/experimental/artifacts/` 下生成一次性的离线 direct binary；
-它不会重建 provider，也不会改写 CANN/AICPU package。两个硬件阶段统一从
-`run_a5_direct_urma_cross_npu2_risk_accepted.sh` 进入，不能直接调用内部 mode。
+它不会重建 provider，也不会改写 CANN/AICPU package。两个硬件阶段曾由
+cross-NPU2 risk wrapper 统一进入；当前不再给出 wrapper 的调用语法。
 `one-kib` 还必须提供前一轮 zero-WQE 的结果目录，入口会复核双端 final、清理位、
 日志 marker、源 quarantine 摘要以及 artifact/commit 绑定后才提交一条 WQE。
-操作员通常只需要调用更上层的
-`run_a5_cross_npu2_recovery_experiment.sh {zero-wqe|one-kib}`；它从固定全局
+更上层的 recovery coordinator 曾从固定全局
 quarantine 派生精确摘要，生成一次性 artifact ID，并在 zero-WQE PASS 后写入只读
 handoff，避免人工复制 EID、路径或结果目录。
 
@@ -471,9 +507,8 @@ backing 和结果证据，按现场隔离或整机重启流程恢复。即使两
 
 第一次 `risk-accepted-cross-npu2-v1` 已经在 NPU2 留下
 `PENDING_UNPROVEN`，不能把它当作成功经验直接重跑。现场不能重启时，仅保留一个
-更窄的第二代诊断入口：
-`run_a5_cross_npu2_reuse_experiment.sh zero-wqe`。它要求显式接受
-`I_ACCEPT_UNKNOWN_NPU2_REUSE_AND_SHARED_UMMU_RISK`，同时逐字节固定原 NPU7
+更窄的第二代诊断入口。它只允许 zero-WQE，并曾要求一个现已撤销、本文不再列出的
+风险接受短语，同时逐字节固定原 NPU7
 quarantine 和第一次 NPU2 active/result/PID-start-ticks 证据；任何一项变化都会在
 新资源创建前停止。
 
@@ -496,16 +531,16 @@ owner probe 或 zero-WQE 任一步失败，都只打印 hard-stop 证据并返�
 提交数据 WQE。即使 zero-WQE PASS，也只说明这一次资源创建和销毁闭环；在整机恢复
 并补足隔离契约前，不能继续真实 H2D。
 
-当 SSH/Xshell 不能可靠粘贴多行命令时，服务器 B 宿主机可使用受测的短命令入口
-`bash scripts/launch_a5_cross_npu2_reuse_detached.sh start --accept-npu2-reuse-risk`。
-launcher 自身可以来自后续提交，但实验代码固定在已经审阅和预检过的完整提交
+历史实验曾为 SSH/Xshell 粘贴问题提供 detached launcher。该入口能够固定并执行旧
+提交，因此不能依赖“当前 checkout 已有硬门禁”来保证安全；启动、status、watch 和
+recovery 子命令已全部从操作指南撤下。launcher 自身曾来自后续提交，但实验代码固定在
+已经审阅和预检过的完整提交
 `cc3cc0e8e08bf4882c290dc3ed0a5b40a45312ce`：该提交在 coordinator 内新增外部
 expected-commit 强校验。入口先创建或复核该提交的 detached
 worktree，再重新执行只读事故证据与 NPU2 idle 预检。预检通过后，它原子固定全局
 launch reservation、token、完整 commit、日志和返回码身份，再通过 `docker exec -d`
-启动该固定 worktree 内的 container-only coordinator；它不改变硬件安全门。运行状态分别通过
-`bash scripts/launch_a5_cross_npu2_reuse_detached.sh status` 和 `watch` 只读查看，
-两者从全局只读 reservation 找到原运行，不依赖当前 checkout HEAD，也不会向 worker
+启动该固定 worktree 内的 container-only coordinator。历史 status/watch 从全局只读
+reservation 找到原运行，不依赖当前 checkout HEAD，也不会向 worker
 发送信号。reservation、日志、dispatch-unproven 或返回码一旦存在，`start` 会拒绝
 覆盖和重跑；Docker dispatch 失败只记录为“是否已启动未知”，不能伪装成 coordinator
 已经返回。
@@ -518,14 +553,9 @@ bootstrap 失败：它执行过只读的 `npu-smi` idle 查询，但没有进入
 没有构建 token provider、安装 AICPU 包、发布 attempt claim、创建 URMA/UMMU 资源或
 执行 zero-WQE。
 
-不要删除或覆盖这次失败的 reservation、日志、worker selection 和 rc。修复后的入口
-提供一次独立恢复：
-
-```bash
-bash scripts/launch_a5_cross_npu2_reuse_detached.sh \
-  recover-cann-bootstrap --accept-npu2-reuse-risk
-bash scripts/launch_a5_cross_npu2_reuse_detached.sh recovery-status
-```
+不要删除或覆盖这次失败的 reservation、日志、worker selection 和 rc。旧版本曾提供
+`recover-cann-bootstrap` 和 `recovery-status` 子命令；它们可能重新 dispatch 固定旧提交，
+所以这里只记录名称，不给出可执行语法，当前也不得调用。
 
 恢复入口只接受上面这个固定 launcher commit 的精确四行失败正文。它把旧四个文件的
 SHA-256、device/inode/size/mode/link-count/owner 固定到新的只读 recovery
@@ -574,8 +604,7 @@ quarantine；不要在隔离前 `kill -9`。
 后再次运行同一脚本，它会在访问 topology/EID/NPU 之前用原 `run_id` 和结果目录中
 固化的分类器自动清理安全状态。只有明确的 quarantine 才进入站点隔离流程。
 
-如果 stale active 恰好阻止 provider 重新编译，先执行
-`bash scripts/recover_a5_direct_urma_state.sh`。该入口只获取持久锁并运行上述固化证据
+历史 recovery-only 入口只获取持久锁并运行上述固化证据
 分类：只清理 `PASS/FAIL_SAFE`，对 `FAIL_UNSAFE` 生成/保留 quarantine，对证据不完整
 继续保留 active；成功后在 provider 校验、EID、NPU、ACL、DDR/HBM 和 URMA 之前退出。
 该入口不要求加载 CANN 环境，也不读取或修改 provider 构建产物。因此无需手工删除状态
@@ -642,31 +671,34 @@ UB server 只有在内核返回的实际 management Jetty ID 与请求值完全�
 READY。client 将 EID 解析、peer Jetty import、握手 SEND 和 CQE poll 分别记录为
 独立失败阶段，避免再次把毫秒级本地 import/post 错误折叠成笼统的握手超时。
 
-生产 runner 继续默认 fail closed；只有显式的
-`run_a5_direct_urma_epoch_owner_validation.sh` 才能执行候选真机验证。候选 owner
+历史 candidate wrapper 曾能执行候选真机验证；当前它也受
+`HARDWARE_EXECUTION_DISABLED` 约束。候选 owner
 解决了 split Open/Close 的所有权缺口，但普通 KFC worker 是否允许跨整个模型
 生命周期驻留，仍需验证当前 CANN 的 worker 配额、watchdog、取消和阻塞契约。
 resource-free bounded probe 也仍只证明 AICPU/AIV 并发控制记录可见性。完整 epoch
 边界和 decode 热路径见 [A5 direct URMA Decode H2D epoch 设计](a5_decode_epoch_h2d.md)。
 
-### 5.2 干净整机状态下的固定 NPU2 验证
+### 5.2 历史方案：干净整机状态下的固定 NPU2 验证（当前禁用）
 
-`run_a5_direct_urma_npu2_clean_validation.sh` 是普通全局 singleton 的便捷入口，
-不是 5.1 的 cross-NPU bypass。它固定 logical/physical NPU2、两条精确 EID、UB
+> 本节记录原三阶段方案，不表示重启后可以重新执行。OS reboot 能清除
+> 旧设备状态，但不能补齐官方 caller-domain、cleanup 和 AIV 队列 ABI
+> 契约。因此 `ZERO_WQE_NOT_PROVEN` 在重启后仍然成立。
+
+历史 clean-NPU2 validator 是普通全局 singleton 的便捷入口，不是 5.1 的
+cross-NPU bypass。它固定 logical/physical NPU2、两条精确 EID、UB
 management 和 Jetty 502，并清除调用者提供的 UDMA device/index 猜测，由现场
 exact-EID resolver 重新解析。它强制 `KVAF_DIRECT_ALLOW_BUSY_NPU=0`，拒绝所有
 cross-NPU 风险接受变量，继续使用生产 active/quarantine 和全部历史 legacy lock。
 
 因此，只要旧 NPU7 owner 仍持有 `/run/lock/kvaf-a5-direct-urma.lock`，或机器级
 active/quarantine 尚未闭环，该入口会在 topology、ACL、DDR/HBM、URMA 之前失败；
-它不会删除状态、发送信号或在线覆盖 AICPU package。完成复位/操作系统重启，并用
-当前 checkout 重新构建 provider、安装 AICPU package 和 direct binary 后才能运行。
+它不会删除状态、发送信号或在线覆盖 AICPU package。旧方案要求复位/操作系统重启
+后重新构建；当前即使完成重启也不能运行，因为能力证据缺口仍然存在。
 
-OS reboot 会清除旧进程和设备状态，但不会清除 `/data` 中的恢复 barrier。在服务器 B
-宿主机先更新到目标提交，再运行
-`scripts/reconcile_a5_direct_urma_after_reboot.sh prepare` 固化一次性 boot proof，并立即
-重启；重连后不要先启动 Docker 或任何 KVAF/cross-NPU 入口，应在同一 checkout HEAD
-首先运行同一脚本的 `retire`。后者校验 boot ID、脚本/helper/HEAD 和原 marker 的
+OS reboot 会清除旧进程和设备状态，但不会清除 `/data` 中的恢复 barrier。历史流程
+曾通过 reboot reconcile helper 的 `prepare`/`retire` 两阶段固化 boot proof。这里不再
+提供调用顺序，因为 reboot proof 只能用于恢复旧状态，不能解锁新硬件实验。该 helper
+会校验 boot ID、脚本/helper/HEAD 和原 marker 的
 identity/SHA-256，持有 canonical、legacy、cross/reuse 全部协调锁，并确认没有 KVAF
 direct-URMA 进程后，才把旧 marker 连同旧/新 boot ID 归档到
 `retired-after-reboot/`，然后移除 canonical barrier。结果、lock 文件和所有 cross-NPU
@@ -682,8 +714,8 @@ direct-URMA 进程后，才把旧 marker 连同旧/新 boot ID 归档到
 最终 batch 可通过 `KVAF_NPU2_TRANSFER_COUNT`、
 `KVAF_NPU2_BYTES_PER_TRANSFER` 和 `KVAF_NPU2_BATCH_ITERATIONS` 修改；默认分别为
 4096、1024、1。控制 timeout 默认 60 秒，单阶段 runner supervision deadline 默认
-180 秒，失败后保留全部证据且不会自动进入下一阶段。干净重启后可从 Docker 内调用
-`prepare_and_run_a5_direct_urma_npu2_clean.sh`，由它依次完成 provider 构建、AICPU
+180 秒，失败后保留全部证据且不会自动进入下一阶段。历史 one-paste coordinator 会依次
+完成 provider 构建、AICPU
 打包、direct binary 构建、无 URMA 资源的 AICPU owner probe 和上述三阶段验证，避免
 在终端逐段粘贴命令；每个子步骤仍使用原有 machine-wide guard。入口接受安装器生成
 的 `ascend-toolkit/set_env.sh` 版本软链接，但要求它解析到固定 CANN 9.1.0；同时拒绝
@@ -691,6 +723,11 @@ direct-URMA 进程后，才把旧 marker 连同旧/新 boot ID 归档到
 诊断 shell 继承版本化实验产物。
 
 ## 6. 操作命令
+
+**当前仅允许 6.7 的两项静态检查。** 6.1～6.6 保留的源码准备、构建和
+打包命令用于复现产物与审计 manifest，不会解锁硬件，也不是当前
+要求操作员立即执行的下一步。在静态 package audit 和 HCCP/HAL 声明
+preflight 完成前，不要重新打包、部署或进入任何 AICPU/URMA 动态路径。
 
 ### 6.1 服务器 B 宿主机：更新代码并准备固定源码
 
@@ -888,21 +925,17 @@ grep -E \
 重新执行并校验三个 probe；源码、header、probe、manifest 或 success stamp
 任一个变化都会以退出码 2 fail closed。
 
-### 6.4 Docker：安装 AICPU provider
+### 6.4 历史 Docker 步骤：安装 AICPU provider（当前禁用）
 
-执行环境：`VLLM_ASCEND_CS_KVAF_DOCKER`
+历史实现使用独立包名
+`cann-kvaf-direct-urma-compat.tar.gz`，不覆盖 UB_MicroBenchmark 的
+`compat/liburma_perftest.tar.gz`。当前
+`scripts/package_a5_direct_urma_aicpu.sh` 在读取 CANN、状态目录、归档或
+registry 前无条件返回 2，没有环境变量或风险接受开关可以解锁。
+不要把该脚本当作当前部署命令，也不要手工复制 tar 或改写
+`ascend_package_load.ini`。
 
-```bash
-bash scripts/package_a5_direct_urma_aicpu.sh
-
-tar -tzf \
-  "$ASCEND_HOME_PATH/opp/vendors/cust/op_impl/aicpu/kernel/cann-kvaf-direct-urma-compat.tar.gz"
-```
-
-KVAF 使用独立包名 `cann-kvaf-direct-urma-compat.tar.gz`，不会覆盖
-UB_MicroBenchmark 的 `compat/liburma_perftest.tar.gz`。安装脚本会把归档原子写入
-`opp/vendors/cust/op_impl/aicpu/kernel/`，并在
-`${ASCEND_HOME_PATH}/conf/ascend_package_load.ini` 中保留且仅保留以下注册块：
+历史注册块仅保留为已部署包静态审计时的识别记录：
 
 ```text
 name:cann-kvaf-direct-urma-compat.tar.gz
@@ -912,22 +945,8 @@ package_path:opp/vendors/cust/op_impl/aicpu/kernel
 load_as_per_soc:false
 ```
 
-仅复制 tar 不会使 CANN/TDT 下发它；package 成功和 runtime preflight 都会严格
-校验归档路径、内容、哈希及上述注册块。`optional:true` 只避免 KVAF 未使用时影响
-其他 ACL 应用，KVAF 自己缺包或未注册时仍会在任何 URMA/NPU 操作前 fail closed。
-该包不是外部 perftest 依赖，内容也不包含旧 `liburma_perftest.so`。
-
-安装器先确认 registry 中的 KVAF 块“完全不存在或已经精确正确”，再原子发布经过
-校验的 tar，最后原子追加 registration。首次安装若 registration 写入失败，新 tar
-仍未注册、不会被 TDT 下发；重复安装时已有 registration 不改写，tar 始终以完整文件
-原子替换；若替换后的复验或注册步骤失败，安装器会原子恢复旧的已注册 tar。重复或
-畸形 registration 不会被静默修复，而会要求先人工核对。旧
-`liburma_perftest.tar.gz` 文件可以保持未注册状态，但 registry 中不能再有同名旧注册，
-避免两个包向 Device 解压同一个 provider SO。
-
-这些文件位于 `vllm-ascend-cs-kvaf` 的容器 writable layer。停止/启动同一个容器会
-保留它们，但删除并重建容器会丢失；重建后必须重新运行 package 脚本。正式部署应把
-归档与 registration 固化进镜像，或放入受控的容器启动部署步骤。
+只读脚本 `audit_a5_registered_aicpu_packages.sh` 会用上述记录检查当前
+registry 已引用的归档，但不会添加、替换或修复任何包。历史归档的
 精确白名单是：
 
 ```text
@@ -966,23 +985,24 @@ KVAF_A5_BUILD_DIRECT_URMA_BACKEND=ON
 
 所以 direct binary 和 provider 的 `DT_NEEDED` 都不能含 `libhcomm`。
 
-### 6.6 Docker：精确确认 UDMA device/EID index
+### 6.6 历史 Docker 步骤：精确确认 UDMA device/EID index（当前禁用）
 
 执行环境：`VLLM_ASCEND_CS_KVAF_DOCKER`
 
-runner 现在以 EID 为 key 分别读取 Host `/sys/class/ubcore` 与 Device
-`hccn_tool -g -dev_info`，不再从 NPU 号猜设备名。NPU7 的已确认映射可独立复核：
+历史 runner 以 EID 为 key 分别读取 Host `/sys/class/ubcore` 与 Device
+`hccn_tool -g -dev_info`，不再从 NPU 号猜设备名。该 resolver 会访问实时设备
+inventory，不属于当前静态检查。NPU7 的旧映射只保留为记录：
 
-```bash
-python3 scripts/resolve_a5_urma_endpoints.py \
-  --physical-device-id 7 \
-  --host-eid 00000000003f050000100000df080b00 \
-  --device-eid 000000000000020000100000df00e100 \
-  --shell
+```text
+HISTORICAL_ENDPOINT_RECORD (NOT SHELL)
+  resolver: scripts/resolve_a5_urma_endpoints.py
+  physical_device_id: 7
+  host: 00000000003f050000100000df080b00 -> udmac0d1e5/eid0
+  device: 000000000000020000100000df00e100 -> udmac0d0e2/eid0
+  execution: HARDWARE_EXECUTION_DISABLED
 ```
 
-期望输出为 `udmac0d1e5/eid0` 与 `udmac0d0e2/eid0`。手工设置这些变量时，
-runner 仍会重新做 exact-match；任一不一致都会在创建资源前退出 2。
+未来恢复 runner 时仍必须重新做 exact-match；旧映射不能当作当前设备证据。
 
 Host/Device peer EID 默认由
 `scripts/resolve_a5_urma_eids.py` 从 `/proc/asdrv_ub/pair_info` 解析，不依赖
@@ -992,47 +1012,72 @@ memcache。`dev_id` 是宿主机全局 selector；新代码统一通过宿主机
 中的旧 `/run/lock/kvaf_asdrv_ub_pair.lock`。不同容器的 `/run` 不能互相保护，
 因此升级期间不要并发运行旧 resolver；所有调用方升级后以 `/data` 锁为准。
 
-### 6.7 Docker：运行 H2D
+### 6.7 Docker：当前唯一允许的下一步（静态检查）
 
 执行环境：`VLLM_ASCEND_CS_KVAF_DOCKER`
+
+这一步不加载官方 `liburma.so.0`，不打开 NPU/URMA/UMMU 设备，不创建
+context、JFC、JFR、Jetty、TP 或 MR，也不写 SQ/CQ。第一个脚本只把 CANN
+registry 中已注册的 AICPU archive 复制到私有临时目录后做 ELF/符号
+冲突审计；第二个脚本只对安装 HAL header 做编译期声明检查，并对
+`libascend_hal.so` 做动态符号表检查。
+
+```bash
+(
+  set -Ee
+  set -o pipefail
+
+  echo "EXECUTION_ENV=VLLM_ASCEND_CS_KVAF_DOCKER"
+  cd /data/c00982601/KVAF
+  source /usr/local/Ascend/ascend-toolkit/set_env.sh
+
+  bash scripts/audit_a5_registered_aicpu_packages.sh \
+    --ascend-home "$ASCEND_HOME_PATH" \
+    2>&1 | tee /tmp/kvaf_registered_aicpu_static_audit.log
+  kvaf_audit_rc=${PIPESTATUS[0]}
+  test "$kvaf_audit_rc" -eq 0
+
+  bash scripts/preflight_a5_hccp_hal_capabilities.sh \
+    2>&1 | tee /tmp/kvaf_hccp_hal_declaration_preflight.log
+  kvaf_hal_rc=${PIPESTATUS[0]}
+  test "$kvaf_hal_rc" -eq 0
+
+  echo "KVAF_STATIC_CAPABILITY_COLLECTION_OK"
+)
+```
+
+package audit 的可接受结果必须为 `conflicts=0`、`candidate_conflicts=0`、
+`errors=0`。HAL 检查成功时会输出
+`KVAF_A5_HCCP_HAL_DECLARATION_PREFLIGHT_OK`，但同时仍应输出
+`KVAF_HCCP_BACKEND_READY=no`：前者只表示 header/符号声明面完整，后者提醒
+runtime 版本配对、resource ID/UASID 语义和生命周期还没有被调用验证。
+两个命令都通过也不能执行 zero-WQE 或 H2D；它们只是为下一轮设计
+选择 Host HCCP/HAL 控制面还是补齐官方 runtime 契约提供证据。
+
+### 6.8 历史运行方案（当前硬禁用，不要执行）
+
+> 从本节开始到第 7 节之前的命令、环境变量和判定矩阵只是历史设计
+> 记录，不是当前运行指南。包括 epoch-owner、direct H2D 和动态 runtime probe
+> 在内的
+> resource-bearing/dynamic 入口均已被无条件门禁。下文中的“当前”均应读作
+> “原设计曾计划”。
 
 正式 runner 仍会由 AICPU gate 以退出码 2 停止。真机验证必须使用显式 candidate
 wrapper；它在同一个 AICPU invocation 内持有 Device provider，并在同一个
 control/data stream 上顺序执行全部 BatchGet 与 shutdown。默认负载是 4096 个
 1 KiB 请求（每批 4 MiB），不是旧的“总共 4096 bytes”。
 
-```bash
-source /tmp/kvaf_npu7_pair.env
-export KVAF_HOST_EID KVAF_DEVICE_EID KVAF_PAIR_CHANNEL
-export KVAF_LOGICAL_DEVICE_ID=7
-export KVAF_PHYSICAL_DEVICE_ID=7
-export KVAF_HOST_URMA_DEVICE=udmac0d1e5
-export KVAF_HOST_EID_INDEX=0
-export KVAF_DEVICE_URMA_DEVICE=udmac0d0e2
-export KVAF_DEVICE_EID_INDEX=0
-export KVAF_PAIR_CHANNEL=0
-unset KVAF_DIRECT_ALLOW_BUSY_NPU
-unset KVAF_H2D_BYTES
-export KVAF_H2D_TRANSFER_COUNT=4096
-export KVAF_H2D_BYTES_PER_TRANSFER=1024
-export KVAF_H2D_DESCRIPTOR_CAPACITY=4096
-export KVAF_H2D_BATCH_ITERATIONS=10
-export KVAF_H2D_TIMEOUT_SECONDS=120
-export KVAF_H2D_RUN_TIMEOUT_SECONDS=600
-unset KVAF_DIRECT_SERVER_START_DELAY_SECONDS
-export KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS=30
-# 默认按 Device timeout + management-ready timeout + 5 秒计算；通常无需覆盖。
-unset KVAF_HOST_CONTROL_TIMEOUT_SECONDS
-export KVAF_DIRECT_MANAGEMENT_MODE=ub
-# 可省略；NPU7 默认推导为 507。显式设置时必须位于 1..1023。
-export KVAF_DIRECT_MANAGEMENT_JETTY_ID=507
-# UB 模式不读取或传递任何 TCP/IP 控制参数。
-unset KVAF_DIRECT_CONTROL_PORT
-unset KVAF_DIRECT_CONTROL_SERVER_ADDRESS
-unset KVAF_DIRECT_CONTROL_BIND_ADDRESS
-export KVAF_A5_RUN_TAG="npu7_checked_$(date +%Y%m%d_%H%M%S)_$$"
-
-bash scripts/run_a5_direct_urma_epoch_owner_validation.sh
+```text
+HISTORICAL_EPOCH_OWNER_RECORD (NOT SHELL)
+  logical_device_id: 7
+  physical_device_id: 7
+  host endpoint: udmac0d1e5/eid0
+  device endpoint: udmac0d0e2/eid0
+  management: UB, jetty_id=507
+  former workload: 4096 descriptors x 1024 bytes x 10 batches
+  former timeouts: provider=120s, run=600s, management-ready=30s
+  former runner: scripts/run_a5_direct_urma_epoch_owner_validation.sh
+  execution: HARDWARE_EXECUTION_DISABLED
 ```
 
 runner 不再用固定 sleep 猜测 Host server 是否启动。它固定本次 Host PID 的
@@ -1060,34 +1105,157 @@ JFR 创建失败会先输出 `KVAF_URMA_JFR_ERROR`。它保留 public
 `urma_create_jfr()` 指针接口原本会丢失的首个 checked-UDMA 叶子，区分参数/context
 校验、index/RQ 分配、record/sleep doorbell、内核 `CREATE_JFR` 命令和 table 插入，
 并分别记录创建错误和 rollback 错误。顶层 management diagnostic 的
-`operation_status` 是底层返回值，`completion_status` 是 `provider_stage_id`；即使
+`operation_status` 是底层返回值。旧日志里的 `completion_status` 并不是统一的
+硬件完成码；它是 provider-specific 辅助槽。当前日志改名为
+`management_auxiliary_status`，并用 `management_auxiliary_kind` 明确其语义；
+CREATE_JFR 失败时该值是本地 `provider_stage_id`。即使
 AICPU stderr 未被完整转发，也能从 Device owner progress 恢复失败阶段。该诊断不会
 切换到 non-shared/embedded JFR，也不会设置 `non_pin`：A5 UB 要求 shared JFR，后两种
 绕行均缺少当前 checked teardown 所需的公开所有权证明。若阶段是
 `create_command`，应再结合同时段 UDMA driver 日志判断 RQ/index/DB pin 或 mailbox
 失败；不得仅凭原来的通用 `EIO` 修改地址或销毁策略。
 
-若 clean NPU2 的 Device 仍在 `create_jfr/create_command` 返回 `EINVAL`，不要切换
-`non_pin`、custom queue 或 DTU。先在服务器 B 宿主机执行一次
-`scripts/trace_a5_direct_urma_npu2_jfr_failure.sh`。脚本在消耗
-`boot-id + KVAF commit` 一次性身份前，要求 tracefs 独立 instance 和至少一个已加载的
-`uburma_cmd_create_jfr`、`ubcore_create_jfr`、`udma_create_jfr` 根符号。随后仅执行一轮
-zero-WQE。脚本优先用 `function_graph + set_graph_function` 保存原始 CREATE_JFR 的
-内核调用树/返回值；若厂商内核不允许在私有 instance 写 `set_graph_function`，则回退到
-同一私有 instance 的 `set_ftrace_filter`，只选择 CREATE_JFR 从 TLV/uobject、ubcore、
-UDMA 校验、RQ/index/DB pin 到 mailbox 的固定分支，最多 32 个实际存在的精确符号，
-一次写入过滤表，不再逐个写入数千个函数。过滤后优先继续使用 `function_graph`，不支持
-时才降级为普通 `function` tracer。脚本从入口、
-tracer 选择到 fallback 安装都会输出 `KVAF_JFR_TRACE_PREFLIGHT stage=...`，因此 tracefs
-配置不会再表现为无输出的硬件卡死。fallback 仍保留有序调用路径和直接 caller，但不
-声称具有完整嵌套/返回值。候选表由 Bash 数组传给独立 POSIX `awk` 过滤程序；测试会
-实际调用系统 `awk` 解析该程序，避免只做源码文本断言而漏掉运行时方言错误。两种模式都不修改
-top-level/global tracer；仅当两种 instance-local 过滤方式均不可用时才在硬件前退出。
-脚本同时用
-`journalctl` cursor（不可用时退化为只读 `dmesg`）保存同时间段内核日志。若 tracefs
-能力不足，脚本在任何硬件操作和一次性目录创建前退出，不会浪费该 commit 的实验。
-它拒绝已有 active/quarantine，不向 KVAF worker 发信号、不复位 NPU、不删除已有状态，
-且退出 trap 只关闭和移除自己的 tracefs instance。
+此前的 Host tracefs 结论已撤销。fallback trace 中执行 `CREATE_JFR` 的 comm 是
+`hccn_tool-*`，而不是 KVAF AICPU worker；Host tracefs 也不能证明 Device OS/AICPU 的
+ioctl 路径。因此不得再把那棵成功调用树解释成“KVAF Device 已进入 mailbox”，也不要
+继续通过修改 ftrace 过滤器重复 zero-WQE。`trace_a5_direct_urma_npu2_jfr_failure.sh`
+已在任何 Docker、tracefs 或硬件访问之前 fail-closed；它只保留历史实现供审计，不能再
+启动一次硬件实验。
+
+历史设计曾计划执行三阶段 Device-runtime A/B，逐级扩大资源面。
+这三种模式现在全部由 `DYNAMIC_RUNTIME_PROBE_DISABLED` 门禁拒绝：
+
+1. 历史动态 runtime probe 的 `discover` mode 在 AICPU 中按 handle
+   `dlopen/dlsym/dladdr` 系统 `liburma.so.0`，不显式调用 `urma_init/create_*`。但
+   `dlopen` 会执行官方 DSO constructor，constructor 是否初始化全局状态、打开设备或
+   启动后台对象没有公开的 AICPU 契约，因此该阶段不再称为 resource-free，也不能用
+   shell `timeout`/信号强杀。该阶段只把
+   `init/uninit/get_device` 作为必需基础符号，仍会探测 context/JFC/JFR 可选符号，并以
+   `required_symbol_mask/resolved_symbol_mask` 报告差集。v2 wire ABI 使用 Host 随机
+   nonce、mode/EID/logical-device/queue-depth 回显、provider ABI token、固定 offset 与
+   严格 enum/flag/cleanup/string/reserved 校验；旧 DSO、旧 ABI 或畸形结果不会被当作成功。
+   结果行中的 symbol-surface 字段只表示对应入口可解析；官方 Device runtime 若裁剪了
+   队列生命周期 API，会被单独归类，而不会伪装成 JFR 参数错误。由于单独的 `dlclose`
+   不能证明 constructor 副作用已撤销，discover 即使解析成功也固定输出
+   `cleanup_proven=0` 并保留 owner/quarantine 到 OS 重启或等价厂商恢复；它不会发布
+   safe-terminal 成功标记；
+2. symbol surface 明确成功后，先执行 `--mode init-device`，在同一 KFC 调用中只做
+   `init -> get_device_by_name -> uninit`，用于把 provider/device discovery 与队列资源
+   创建分开；
+3. init-device 明确成功后，才选择 `--mode create-delete`，并在同一个 KFC 调用中完成
+   `init -> context -> JFC -> JFR -> reverse delete -> uninit`。三种模式都先严格证明
+   logical/physical NPU 和 NPU idle，并要求同一 caller-domain 风险确认；只有
+   init-device/create-delete 额外要求 Device EID/UDMA endpoint 亲和性，discover 不要求
+   EID 或 UDMA device。runner 不再用外层 `timeout` 强杀任何一种 probe，而是统一以独立
+   session 启动长驻 supervisor。supervisor
+   首先核对继承的 active/deploy lock FD 8/9 确实指向固定锁文件，然后按
+   `quarantine -> active -> ready -> worker` 顺序进行 durable publish；父进程必须收到并
+   核对 ready 中的 mode/run/boot、PID/start_ticks、worker path/SHA 和结果路径，才承认
+   worker 已启动。Ctrl-C、SSH 断开或观察超时只结束观察者，不杀资源 owner。KFC、provider
+   或 Host ACL teardown 任一环节不确定时，owner 留存且 active/quarantine 保留；只有
+   provider 逆序清理、stream/GM、device context 与 ACL finalize 全部检查成功，日志已
+   `fsync`，且 terminal 绑定日志 SHA256 后才移除。若观察 shell/SSH 在 owner 已安全完成
+   之后中断，下一次 runner 会在验证当前二进制、CANN 或 provider 之前，仅依据旧会话
+   自身封存的 dedicated schema、mode/boot/run ID、worker 路径与 SHA、PID/start_ticks、
+   log SHA 和安全终态恢复 stale active/quarantine；这保证重编译或删除旧 worker 不会让
+   安全终态永久不可恢复。borrowed-runtime 使用独立 blocked schema，在同一 boot 内
+   永不自动恢复；只有严格校验旧 terminal/log/hash 后又证明 kernel boot ID 已变化，
+   才允许执行一次“仅清理 barrier、不启动 probe”的 reboot recovery transaction。
+   `HoldUnsafeOwner` 没有 terminal 时，recovery 只验证旧 boot 的
+   quarantine/active/ready 全量身份后清障，并丢弃其 capability 结论；不会伪造安全终态。
+   其他缺字段、摘要不符、owner 仍存活或终态不明确的情况一律保留。
+
+该探针也不把官方 public API 视为天然完备：Device OS 没有公开的 UAPI/provider ABI
+协商；`urma_init()` 成功不等价于目标 provider/device 可用；`create_*()` 返回 `NULL`
+后只给 `errno`，没有半创建对象句柄或 cleanup certainty。新版 Host UMDK 已声明并实现
+`alloc/set/get/active/deactive/free` 队列接口，其中 `get_opt` 可返回 SQ/RQ/CQ、DB、
+PI/CI 地址；但同为 `URMA_API_VERSION=0.9` 的旧快照没有这些 callable API，相关结构字段
+顺序也不同。因此 runtime discover 会分别报告“候选 modern wrapper”和从当前 checked
+Direct-UB 路径审计出的 34 个公开符号精确并集
+`current_direct_ub_symbol_surface`；后者即使为 `complete-semantics-unproven` 也不能
+用来推断官方函数实现完整。即使符号存在，地址是否属于
+AIV 可访问的 GM 域，以及 WQEBB/CQE layout、owner bit、doorbell、barrier/cache 语义
+仍是未公开/未协商的私有契约。故 `create_* == NULL` 一律设置
+`KVAF_URMA_RUNTIME_PROBE_CREATE_FAILURE_CLEANUP_UNPROVEN` 并保留 quarantine，不能
+宣称安全清理。`operation_errno_valid=0` 时也不会用 `ENOENT/ENODEV/EIO` 猜错误码；
+loader 失败只保留净化后的 `dlerror`。即使 create-delete 的公开 API 都返回成功，输出
+仍会同时记录 `official_public_cleanup=returned-complete` 与
+`official_side_effects_cleanup=unproven`：前者只证明安装 runtime 接受最小配置并完成
+公开逆序调用，后者明确说明 constructor、线程和内核内部副作用没有公开的 AICPU
+cleanup 契约。因此当前不会发出 accepted safe-terminal，也不自动解锁完整 H2D；
+owner/quarantine 保留到重启或厂商等价恢复。
+
+每条结果显式输出两个独立维度：`capability_class` 描述符号表面、runtime init、
+endpoint/provider discovery、public create 或 cleanup contract 所处阶段；
+`cleanup_proven` 只描述本次所有权是否安全结束。固定字段
+`official_abi_handshake=unavailable`、
+`documented_official_aicpu_call_contract=not-found-in-audited-sources`、
+`local_runtime_compatibility=unproven`、
+`aiv_address_visibility=unproven` 与 `private_queue_abi=unproven` 防止把一次最小成功
+误当成官方 ABI 完备。KVAF probe 每次构建生成新的 build-instance ID 并用作独立
+SONAME，另存 source/config 摘要；Host 验证期望 package 内 ELF SHA256，Device 仅回显
+内嵌 build-instance ID，因此不声称已证明实际加载 ELF 的逐字节身份。新 SONAME 防止
+同一 AICPU 进程把前一次构建的 loader mapping 当成当前包。探针同时要求每个计入 mask
+的官方符号都由 `dladdr` 证明
+来自与解析到的 `urma_init` 相同的 DSO，且 v2 nonce/token 回显吻合。但随后加载的官方
+`liburma.so.0` 尚无内容哈希/源码版本握手，其 dlopen 依赖闭包和实际服务目标 device 的
+底层 provider 身份仍固定为 `unproven`。
+
+这里的 caller-domain 限制尤其重要。当前 UMDK 文档与实现把 public `urma_*` 定位为
+Linux Host userspace API：实现会扫描 provider/sysfs、打开 `/dev/uburma`、执行 ioctl，
+并依赖 pthread/dlopen。仓内没有 AICPU/Device OS 可调用契约。Ascend910D 特性表中的
+“支持”只能证明硬件/provider 能力，不能证明同一 `liburma.so` ABI 可在 AICPU 中直接
+调用。当前 public 实现本身也有待完善项，例如部分 `alloc_jfs/alloc_jfr` 路径在 provider
+失败后缺少 NULL 检查，provider 实现与能力表对 RC/token policy 也存在不一致。因此
+包括 discover 在内的 runtime probe 都不能把官方实现当作无 bug oracle。
+旧实现曾记录一个 caller-domain 风险接受字段。该变量和完整接受短语已从操作文档
+移除；它们**不能解锁任何模式，也不应在 shell 中设置**：
+
+```text
+HISTORICAL_RISK_FIELD (NOT SHELL)
+  name: KVAF_ACCEPT_UNDOCUMENTED_AICPU_URMA
+  value: retired; intentionally omitted
+  execution effect: none
+```
+
+该决定会被写入 quarantine、active、ready、terminal 四份证据。discover 虽然不要求
+EID/device endpoint，仍要求该变量并走相同的 durable quarantine，因为 DSO constructor
+已经越过纯符号文件检查的边界。这个确认只授权一次受保护的能力实验，不把 public URMA 解释成
+官方支持的 AICPU ABI，也不证明官方接口完整：缺少 caller-domain 契约、provider ABI
+handshake、半创建对象的 cleanup handle、AIV 队列布局与 cache/doorbell 语义仍分别属于
+待官方补齐或必须由匹配版本实测证明的缺口。
+
+仓内参考的官方 `urma_npu` 接口同样不能被当作现成替代：其公开类型当前只有
+`URMA_NPU_SDMA`，并明确标注 `URMA_NPU_ROCE // not support now`；实现依赖 Host/Device
+HDC daemon、`halQueryDevpid` 和预留 SDMA channel。它可作为官方 H2D 生命周期参考，
+但不是本目标的 AIV+SIMT 直写 UBC/CTP SQ/CQ 数据面。
+
+判定矩阵是：
+
+- symbol surface 成功而 init-device 失败：问题已收敛到 runtime 初始化、provider
+  discovery 或 Device endpoint，不应再修改 JFR/Jetty/SQ/CQ；
+- init-device 成功而 create-delete 失败：runtime/provider/device 基础面存在，问题才进入
+  public context/JFC/JFR create 或 cleanup contract；
+- Device runtime 最小 create-delete 的公开返回路径与 source-linked 路径结果不同：只能
+  证明两条路径在 public JFR 生命周期前后发生分歧。根因仍包含头/库 ABI、provider、
+  UAPI、AICPU caller domain、配置与内存 backing；停止盲改 JFR flag，但不能直接归因为
+  某一版本错配；
+- 两条 public JFR 路径均返回真实且有效的 `EINVAL`：只能证明当前两套 public 路径
+  共同拒绝当前最小配置，仍不能区分 ABI/UAPI 错配、provider/KVAF/driver bug、权限或
+  内存模型限制以及目标操作确实不支持；据此停止继续排列 JFR 参数并转查 Host
+  HCCP-style owner，但不能宣布硬件故障或官方明确不支持；
+- runtime library/provider 不存在：AICPU 镜像未提供完整官方 runtime，必须精确打包
+  匹配版本或转 Host bootstrap。
+
+Host HCCP-style 分支也必须先运行 `preflight_a5_hccp_hal_capabilities.sh`。该只读门禁
+不仅检查五个 HAL symbol，还以安装头编译精确函数签名、CP1 常量、结构成员和 HCCP
+URMA 资源枚举。HCCP 使用的 `UdmaVaInfo` 并不属于安装版公开 HAL：它位于固定 HCOMM
+源码的内部 `rs_ctx_inner.h`。KVAF 的候选兼容头记录 HCOMM commit 与源文件哈希，并以
+静态断言固定 24 字节布局和 0/4/8/16 字段偏移；它不复制 enum 数值，也不把私有结构
+冒充公开接口。若 V2 map 公共类型/enum 缺失，门禁失败；私有布局编译通过也只算
+`source-audited-...-runtime-unproven`。脚本固定输出 `KVAF_HCCP_BACKEND_READY=no`，因为
+resource-ID/UASID 语义、安装 HAL 与 HCOMM 快照配套及运行时生命周期仍未证明。未来
+backend 仍必须绝对路径加载已检查的 `libascend_hal.so` 并通过单独运行时语义验证。
 
 Device Open 结果的 `reserved[9..10]` 同时带回只读 JFR 命令摘要：完整 64 位 JFC
 handle、JFC ID、context page shift、`F_GETFD` errno，以及 UDATA 地址/大小、RQ/index
@@ -1205,41 +1373,33 @@ inventory 中恰好存在该卡，且进程表中明确出现
 启动前的瞬时证明，不能阻止检查之后第三方抢占 NPU，因此硬件 smoke 仍应使用
 调度系统隔离的专用卡。
 
-只有明确接受业务干扰和后续 reset 可能影响同卡业务时，才可在同一 Docker 终端
-显式绕过 busy 或 unproven 状态：
+旧设计包含过 busy-NPU 风险开关。该开关不能绕过当前 capability ledger 门禁，
+也不再作为可复制的 shell 设置公开：
 
-```bash
-export KVAF_DIRECT_ALLOW_BUSY_NPU=1
+```text
+HISTORICAL_BUSY_OVERRIDE (NOT SHELL)
+  field: KVAF_DIRECT_ALLOW_BUSY_NPU
+  former value: enabled
+  current effect: none; hardware execution remains disabled
 ```
 
-正常测试必须保持该变量未设置。旧的
+未来恢复测试时也必须默认保持该变量未设置。旧的
 `KVAF_DIRECT_ALLOW_UNVERIFIED_UDMA_TEARDOWN` 已被删除；新 runner 只接受源码内置
 UDMA+UMMU 和 `checked-retryable-v1`，没有回退到系统 provider 的风险开关。
 
-运行后的处理只看退出码和最终终态：
+历史 runner 的终态分类仍有事故分析价值，但不再附带执行命令：
 
-```bash
-set +e
-bash scripts/run_a5_direct_urma_h2d_smoke.sh
-kvaf_rc=$?
-set -e
-case "$kvaf_rc" in
-  0) echo "PASS" ;;
-  2) echo "PRECHECK_FAILED：未创建资源，修正参数/构建后重试" ;;
-  3) echo "FAIL_SAFE：无需复位，可直接重试" ;;
-  4) echo "FAIL_UNSAFE：保留进程和 backing，按 quarantine 指引处理" ;;
-  5) echo "PENDING_UNPROVEN：不要复位或杀进程，稍后重跑脚本自动复核" ;;
-  130) echo "RUNNER_DETACHED：pair 已记录，稍后重跑脚本自动复核" ;;
-  *) echo "未分类 runner 错误：rc=$kvaf_rc；保留状态并检查输出" ;;
-esac
-```
+| 历史退出码 | 历史含义 | 当前操作 |
+|---|---|---|
+| 0 | PASS | 仅作为旧证据，不解锁硬件 |
+| 2 | PRECHECK_FAILED | 当前硬门禁的预期返回 |
+| 3 | FAIL_SAFE | 保留日志；不得自动重跑硬件 |
+| 4 | FAIL_UNSAFE | 保留 owner、backing 和 quarantine |
+| 5 | PENDING_UNPROVEN | 不杀进程，不启动另一轮 |
+| 130 | RUNNER_DETACHED | 仅按持久状态做恢复审计 |
 
-若存在多个 active pair，按错误信息指定：
-
-```bash
-export KVAF_PAIR_CHANNEL=<实际channel>
-bash scripts/run_a5_direct_urma_h2d_smoke.sh
-```
+多个 active pair 的 channel 选择同样属于历史运行参数；当前不得通过设置
+`KVAF_PAIR_CHANNEL` 后重跑 direct smoke。
 
 成功必须同时看到 Host DDR 注册、两端 provider ready、direct channel、
 数据/canary、两端 teardown 和最终 acceptance marker。证据保存在
@@ -1256,15 +1416,10 @@ build manifest 验证并加载的 `libascendcl.so` 依赖闭包解析，不再�
 direct build、provider build、AICPU package 和 runner 必须共享一个固定恢复根。
 代码拒绝旧终端残留的 `KVAF_DIRECT_STATE_DIR`、`KVAF_DIRECT_RESULT_ROOT`、
 `KVAF_DIRECT_*LOCK`、`KVAF_DIRECT_*FILE` 或 `KVAF_EID_LOCK_FILE` 分叉覆盖；若
-看到 `cannot override the fixed direct URMA recovery root`，只需在当前 Docker
-终端执行：
-
-```bash
-unset KVAF_GLOBAL_STATE_DIR KVAF_DIRECT_STATE_DIR KVAF_DIRECT_RESULT_ROOT
-unset KVAF_EID_LOCK_FILE KVAF_EID_LEGACY_LOCK_FILE
-unset KVAF_DIRECT_DEPLOY_RUN_LOCK KVAF_DIRECT_ACTIVE_SESSION_LOCK
-unset KVAF_DIRECT_ACTIVE_SESSION_FILE KVAF_DIRECT_QUARANTINE_FILE
-```
+看到 `cannot override the fixed direct URMA recovery root` 时，不要为了重跑硬件而
+清空环境或状态。历史流程曾要求移除 `KVAF_GLOBAL_STATE_DIR`、
+`KVAF_DIRECT_STATE_DIR`、结果根、EID lock 和 active/quarantine 路径覆盖；当前应停止，
+保留现场并只运行静态审计或专用 recovery-only 入口。
 
 首次从旧 `/run`/工作树状态版本升级时要安排一次维护窗口：确认旧 runner/worker
 已经安全退出，或旧 quarantine 已按站点流程处理，再启用新版本。不要先删旧容器、
@@ -1287,7 +1442,9 @@ unset KVAF_DIRECT_ACTIVE_SESSION_FILE KVAF_DIRECT_QUARANTINE_FILE
 
 ## 8. 仍未完成的生产化工作
 
-当前实现用于 A5 正向 MVP 和性能验证，还不能宣称生产安全：
+当前实现只是 A5 架构候选与静态能力审计对象，尚未达到可执行 MVP，
+更不能宣称生产安全。在本节缺口和官方能力分层证据补齐前，
+`HARDWARE_EXECUTION_DISABLED` 和 `ZERO_WQE_NOT_PROVEN` 必须保持：
 
 - private accessor 仍依赖固定 UMDK 26.06 的 private UDMA 布局。最终应在
   UDMA provider 中新增 versioned

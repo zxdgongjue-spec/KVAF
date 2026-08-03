@@ -7,6 +7,15 @@
 # and targets only the disjoint NPU2 UDMA endpoints.  UMMU/AICPU isolation
 # across NPUs is still unproven, so this is not a production bypass.
 
+unset BASH_ENV ENV
+unset -f exit builtin 2>/dev/null || true
+
+echo "KVAF_A5_CROSS_NPU2_RISK_ACCEPTED_COORDINATOR_DISABLED" >&2
+echo "CAPABILITY_LEDGER=not-implemented" >&2
+echo "No argument/environment/source/state/CANN/docker/NPU operation was attempted." >&2
+builtin exit 2
+if [[ 0 == 1 ]]; then
+
 set -Eeuo pipefail
 umask 077
 
@@ -161,3 +170,5 @@ echo "The NPU7 quarantine and workers will not be modified or signalled." >&2
 
 exec bash "${SCRIPT_DIR}/run_a5_direct_urma_h2d_smoke.sh" \
   risk-accepted-cross-npu2-v1
+fi
+/bin/sh -c 'exit 2'

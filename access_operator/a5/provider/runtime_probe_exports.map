@@ -1,0 +1,6 @@
+KVAF_URMA_RUNTIME_PROBE_2 {
+  global:
+    aicpu_kvaf_urma_rt_probe_v2;
+  local:
+    *;
+};

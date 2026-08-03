@@ -152,7 +152,7 @@ struct ManagementDiagnosticView {
   std::int32_t raw_errno{0};
   std::int32_t effective_errno{0};
   std::int32_t operation_status{0};
-  std::int32_t completion_status{0};
+  std::int32_t auxiliary_status{0};
 };
 
 struct JfrCommandDiagnosticView {
@@ -202,7 +202,7 @@ ManagementDiagnosticView DecodeManagementDiagnostic(
   diagnostic.raw_errno = SignedWord(errno_word, 0);
   diagnostic.effective_errno = SignedWord(errno_word, 32);
   diagnostic.operation_status = SignedWord(status_word, 0);
-  diagnostic.completion_status = SignedWord(status_word, 32);
+  diagnostic.auxiliary_status = SignedWord(status_word, 32);
   diagnostic.valid = true;
   return diagnostic;
 }
@@ -335,8 +335,15 @@ std::string FormatManagementDiagnostic(
       std::to_string(diagnostic.effective_errno) +
       " management_operation_status=" +
       std::to_string(diagnostic.operation_status) +
-      " management_completion_status=" +
-      std::to_string(diagnostic.completion_status) +
+      " management_auxiliary_status=" +
+      std::to_string(diagnostic.auxiliary_status) +
+      " management_auxiliary_kind=" +
+      std::to_string(diagnostic.flags &
+          (KVAF_URMA_MANAGEMENT_DIAGNOSTIC_AUX_PROVIDER_STAGE_ID |
+           KVAF_URMA_MANAGEMENT_DIAGNOSTIC_AUX_ROLLBACK_STATUS |
+           KVAF_URMA_MANAGEMENT_DIAGNOSTIC_AUX_TP_COUNT |
+           KVAF_URMA_MANAGEMENT_DIAGNOSTIC_AUX_UMMU_LAST_ERROR |
+           KVAF_URMA_MANAGEMENT_DIAGNOSTIC_AUX_COMPLETION_STATUS)) +
       " management_diagnostic_flags=" +
       std::to_string(diagnostic.flags);
   if (diagnostic.stage == KVAF_URMA_MANAGEMENT_STAGE_CREATE_JFR) {
@@ -1224,7 +1231,7 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
             "management_stage=%s management_stage_id=%u "
             "management_raw_errno=%d management_effective_errno=%d "
             "management_operation_status=%d "
-            "management_completion_status=%d "
+            "management_auxiliary_status=%d "
             "management_diagnostic_flags=%u\n",
             (unsigned long long)ready_poll_count,
             (long long)observer_elapsed_ms,
@@ -1245,7 +1252,7 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
             progress_management.raw_errno,
             progress_management.effective_errno,
             progress_management.operation_status,
-            progress_management.completion_status,
+            progress_management.auxiliary_status,
             progress_management.flags);
         (void)std::fflush(stderr);
         last_progress_aiv_status = ready_result.status;

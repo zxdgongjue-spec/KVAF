@@ -7,6 +7,21 @@
 
 set -Eeuo pipefail
 umask 077
+unset BASH_ENV ENV
+unset -f exit builtin 2>/dev/null || true
+
+# The cross-NPU reuse experiment is retired.  Its packager publishes a live
+# CANN archive and registry stanza before invoking any canonical workflow, so
+# it must be independently unreachable while the same capability ledger is
+# absent.  No risk-acceptance environment variable can bypass this gate.
+echo "KVAF_A5_CROSS_NPU2_AICPU_PACKAGE_MUTATION_DISABLED" >&2
+echo "CAPABILITY_LEDGER=not-implemented" >&2
+echo "CROSS_NPU2_EXPERIMENT=retired" >&2
+echo "No CANN/state/helper/lock/archive/registry operation was attempted." >&2
+builtin exit 2
+
+# Preserve the retired implementation only as unreachable reference code.
+if [[ 0 == 1 ]]; then
 
 if (( $# != 0 )); then
   echo "ERROR: this packager takes no positional arguments" >&2
@@ -384,15 +399,8 @@ grep -Fxq 'name:Ascend-aicpu_legacy.tar.gz' \
   "${kvaf_registration_file}" ||
   die "the CANN AICPU registry lacks its built-in baseline"
 
-kvaf_registry_lock="${kvaf_experiment_root}/versioned-aicpu-registry.lock"
-[[ ! -L "${kvaf_registry_lock}" &&
-   ( ! -e "${kvaf_registry_lock}" || -f "${kvaf_registry_lock}" ) ]] ||
-  die "the independent versioned AICPU registry lock must be a regular non-symlink"
-exec 9>"${kvaf_registry_lock}"
-[[ -f "${kvaf_registry_lock}" && ! -L "${kvaf_registry_lock}" ]] ||
-  die "the independent versioned AICPU registry lock changed identity"
-flock -w 30 9 ||
-  die "another versioned AICPU registry transaction is running"
+kvaf_aicpu_acquire_registry_lock "${kvaf_registration_file}" ||
+  die "another CANN AICPU registry transaction is running"
 
 if [[ -e "${kvaf_canonical_archive}" ||
       -L "${kvaf_canonical_archive}" ]]; then
@@ -503,6 +511,8 @@ fi
 kvaf_registry_before="${kvaf_stage_dir}/registry.before"
 kvaf_registry_expected="${kvaf_stage_dir}/registry.expected"
 cp -p -- "${kvaf_registration_file}" "${kvaf_registry_before}"
+kvaf_registry_before_sha=$(sha256_file "${kvaf_registry_before}") ||
+  die "could not hash the versioned registry snapshot"
 if kvaf_aicpu_registration_is_exact \
     "${kvaf_registration_file}" "${kvaf_package_name}" \
     "${kvaf_package_relative_dir}"; then
@@ -524,7 +534,8 @@ else
 fi
 
 kvaf_aicpu_install_registration "${kvaf_registration_file}" \
-  "${kvaf_package_name}" "${kvaf_package_relative_dir}" ||
+  "${kvaf_package_name}" "${kvaf_package_relative_dir}" \
+  "${kvaf_registry_before_sha}" ||
   die "could not atomically append the versioned AICPU registration"
 cmp -s -- "${kvaf_registry_expected}" "${kvaf_registration_file}" ||
   die "the AICPU registry changed by more than the one versioned stanza"
@@ -546,3 +557,5 @@ echo "AICPU_REGISTRATION_FILE=${kvaf_registration_file}"
 echo "AICPU_REGISTRATION_PREVIOUS_STATE=${kvaf_registration_previous_state}"
 echo "DEVICE_PROVIDER_FILENAME=${kvaf_device_provider_filename}"
 echo "DEVICE_PROVIDER_SHA256=${kvaf_device_provider_sha}"
+fi
+/bin/sh -c 'exit 2'

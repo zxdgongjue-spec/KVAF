@@ -26,7 +26,7 @@ class CrossNpu2ReuseCoordinatorTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
-    def test_only_zero_wqe_is_accepted(self) -> None:
+    def test_retired_entry_exits_before_stage_validation(self) -> None:
         environment = os.environ.copy()
         environment.pop("KVAF_CROSS_NPU2_REUSE_RISK_ACCEPTANCE", None)
         for arguments in ([], ["one-kib"], ["zero-wqe", "again"]):
@@ -39,7 +39,11 @@ class CrossNpu2ReuseCoordinatorTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(completed.returncode, 2)
-            self.assertIn("Usage:", completed.stderr)
+            self.assertIn(
+                "KVAF_A5_CROSS_NPU2_REUSE_EXPERIMENT_COORDINATOR_DISABLED",
+                completed.stderr,
+            )
+            self.assertNotIn("Usage:", completed.stderr)
 
     def test_exact_second_order_risk_phrase_and_token_are_required(self) -> None:
         self.assertIn(

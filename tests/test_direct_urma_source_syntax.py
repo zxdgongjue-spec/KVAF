@@ -326,7 +326,7 @@ class DirectUrmaSourceSyntaxTests(unittest.TestCase):
             '" management_raw_errno="',
             '" management_effective_errno="',
             '" management_operation_status="',
-            '" management_completion_status="',
+            '" management_auxiliary_status="',
             "FormatManagementDiagnostic(impl_->result)",
         ):
             self.assertIn(field, self.resources_source)

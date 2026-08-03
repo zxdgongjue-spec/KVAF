@@ -228,6 +228,51 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
         )
         self.assertLess(recovery_exit, ascend_requirement)
 
+    def test_hardware_execution_is_unconditionally_disabled_after_recovery(self) -> None:
+        recovery = self.source.index(
+            'if [[ "${kvaf_affinity_run_mode}" == recovery-only-v1 ]]'
+        )
+        recovery_success = self.source.index(
+            "KVAF_A5_DIRECT_RECOVERY_ONLY_OK", recovery
+        )
+        recovery_exit = self.source.index("exit 0", recovery_success)
+        gate = self.source.index(
+            'echo "KVAF_A5_DIRECT_HARDWARE_EXECUTION_DISABLED"'
+        )
+        gate_exit = self.source.index("builtin exit 2", gate)
+        false_branch = self.source.index(
+            "if [[ 0 == 1 ]]; then", gate_exit
+        )
+        ascend = self.source.index(
+            ': "${ASCEND_HOME_PATH:?source the container CANN set_env.sh first}"',
+            gate,
+        )
+        provider = self.source.index(
+            "if ! kvaf_verify_direct_provider_build_v3; then", gate
+        )
+        eid = self.source.index("resolve_a5_urma_eids.py", gate)
+        endpoint = self.source.index("resolve_a5_urma_endpoints.py", gate)
+        npu = self.source.index('"${kvaf_npu_smi_binary}" info', gate)
+
+        self.assertEqual(
+            [recovery, recovery_success, recovery_exit, gate, gate_exit],
+            sorted([recovery, recovery_success, recovery_exit, gate, gate_exit]),
+        )
+        for operation in (ascend, provider, eid, endpoint, npu):
+            self.assertLess(gate_exit, operation)
+
+        gate_block = self.source[gate:ascend]
+        self.assertIn("CAPABILITY_LEDGER=not-implemented", gate_block)
+        self.assertIn("ZERO_WQE_STATUS=not-proven", gate_block)
+        self.assertIn(
+            "No provider/EID/NPU/ACL/DDR/HBM/URMA operation was attempted.",
+            gate_block,
+        )
+        self.assertNotIn("${KVAF_", gate_block)
+        self.assertNotIn("getenv", gate_block)
+        self.assertEqual(gate_block.count("if [[ 0 == 1 ]]; then"), 1)
+        self.assertLess(gate_exit, false_branch)
+
     def test_zero_wqe_is_validation_only_and_pool_limit_is_not_cumulative(self) -> None:
         self.assertIn(
             '[[ "${kvaf_affinity_run_mode}" != \\\n'
@@ -970,7 +1015,7 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
             "kvaf_aicpu_registration_is_absent"
         )
         archive_publish = package.index(
-            'mv -f "${temporary_install_archive}"'
+            '"${temporary_install_archive}" "${KVAF_DIRECT_AICPU_ARCHIVE}"'
         )
         installed_verify = package.index(
             'verify_aicpu_archive "${KVAF_DIRECT_AICPU_ARCHIVE}" installed'
@@ -984,13 +1029,26 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
         self.assertIn("name:Ascend-aicpu_legacy.tar.gz", package)
         self.assertIn("legacy liburma_perftest registration", package)
         self.assertIn("rollback_archive", package)
+        self.assertIn("archive_preexisting=0", package)
+        self.assertIn("archive_preexisting=1", package)
+        self.assertIn("archive_preexisting != 0", package)
+        self.assertIn("archive_preexisting == 0", package)
+        self.assertIn("transaction_archive_sha", package)
+        self.assertIn("transaction_registration_sha", package)
+        self.assertIn("refusing to overwrite it during rollback", package)
+        self.assertIn('"${KVAF_DURABLE_STATE_HELPER}" publish', package)
+        self.assertIn('"${KVAF_DURABLE_STATE_HELPER}" remove', package)
         self.assertIn("deployment_started=1", package)
         self.assertIn("deployment_committed=1", package)
         self.assertIn("KVAF_AICPU_ARCHIVE_ROLLBACK_OK", package)
+        self.assertIn("KVAF_AICPU_REGISTRATION_ROLLBACK_OK", package)
+        self.assertIn("registration_update_started=1", package)
+        self.assertIn("audit_a5_registered_aicpu_packages.sh", package)
+        self.assertIn("audit_a5_registered_aicpu_packages.sh", preflight)
         rollback = package.index("KVAF_AICPU_ARCHIVE_ROLLBACK_OK")
         publish_started = package.index("deployment_started=1")
         publish = package.index(
-            'mv -f "${temporary_install_archive}"'
+            '"${temporary_install_archive}" "${KVAF_DIRECT_AICPU_ARCHIVE}"'
         )
         commit = package.index("deployment_committed=1")
         self.assertLess(rollback, publish_started)
@@ -1005,12 +1063,139 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
         registration_verify = preflight.index(
             "kvaf_aicpu_registration_is_exact"
         )
+        registered_audit = preflight.index(
+            "registered_package_audit_b64=$(python3 -c"
+        )
         archive_read = preflight.index(
             'archive_entries=$(tar -tzf "${KVAF_DIRECT_AICPU_ARCHIVE}")'
         )
         self.assertLess(registration_verify, archive_read)
+        self.assertLess(registered_audit, archive_read)
+        self.assertIn(
+            "registered_package_audit_b64", preflight
+        )
+        self.assertIn("bash --noprofile --norc -s --", preflight)
+        self.assertIn("O_NOFOLLOW", preflight)
+        self.assertIn("O_NOFOLLOW", package)
+        self.assertIn(
+            "KVAF_VERIFIED_REGISTERED_PACKAGE_AUDIT_SHA", package
+        )
+        self.assertIn(
+            "REGISTERED_AICPU_PACKAGE_AUDIT_SHA256=", preflight
+        )
         self.assertIn("sibling AICPU package is invalid", package)
         self.assertIn("sibling AICPU package is invalid", preflight)
+
+    def test_package_failure_preserves_unproven_rollback_evidence(self) -> None:
+        package = (
+            ROOT / "scripts" / "package_a5_direct_urma_aicpu.sh"
+        ).read_text(encoding="utf-8")
+        cleanup_start = package.index("cleanup()\n{")
+        cleanup_end = package.index("trap cleanup EXIT", cleanup_start)
+        cleanup = package[cleanup_start:cleanup_end]
+
+        safe_backup_guard = cleanup.index(
+            "if (( operator_backup_created != 0 && deployment_committed == 0 &&\n"
+            "        archive_rollback_safe != 0 )); then"
+        )
+        backup_remove = cleanup.index(
+            '"${KVAF_DURABLE_STATE_HELPER}" remove \\\n'
+            '         "${operator_backup}"',
+            safe_backup_guard,
+        )
+        unsafe_backup_branch = cleanup.index(
+            "elif (( operator_backup_created != 0 && "
+            "deployment_committed == 0 )); then",
+            backup_remove,
+        )
+        backup_end = cleanup.index("\n  fi", unsafe_backup_branch)
+        self.assertLess(safe_backup_guard, backup_remove)
+        self.assertLess(backup_remove, unsafe_backup_branch)
+        self.assertIn(
+            "KVAF_AICPU_OPERATOR_BACKUP_PRESERVED=", cleanup[
+                unsafe_backup_branch:backup_end
+            ]
+        )
+        self.assertNotIn(
+            '"${KVAF_DURABLE_STATE_HELPER}" remove',
+            cleanup[unsafe_backup_branch:backup_end],
+        )
+
+        preserve_start = cleanup.index("preserve_recovery_copy()")
+        preserve_end = cleanup.index("\n  }", preserve_start)
+        preserve = cleanup[preserve_start:preserve_end]
+        for operation in (
+            'recovery_file=$(mktemp "${recovery_template}")',
+            'cp -p -- "${source_file}" "${recovery_file}"',
+            'sha256sum -- "${recovery_file}"',
+            '"${KVAF_DURABLE_STATE_HELPER}" sync',
+            "_RECOVERY_COPY=%s",
+        ):
+            self.assertIn(operation, preserve)
+
+        registry_preserve = cleanup.index(
+            "if (( registration_rollback_safe == 0 ))"
+        )
+        archive_preserve = cleanup.index(
+            "if (( archive_rollback_safe == 0 && "
+            "archive_preexisting != 0 ))"
+        )
+        self.assertIn(
+            ".ascend_package_load.ini.kvaf-recovery.XXXXXX",
+            cleanup[registry_preserve:archive_preserve],
+        )
+        archive_preserve_end = cleanup.index(
+            "if (( operator_backup_created", archive_preserve
+        )
+        archive_recovery = cleanup[archive_preserve:archive_preserve_end]
+        self.assertIn(
+            ".${KVAF_DIRECT_AICPU_PACKAGE_NAME}.kvaf-recovery.XXXXXX",
+            archive_recovery,
+        )
+        self.assertNotIn("XXXXXX.tar.gz", archive_recovery)
+
+    def test_package_rechecks_archive_preimage_without_claiming_atomic_cas(self) -> None:
+        package = (
+            ROOT / "scripts" / "package_a5_direct_urma_aicpu.sh"
+        ).read_text(encoding="utf-8")
+        snapshot = package.index(
+            'rollback_archive_sha=$(sha256sum "${rollback_archive}"'
+        )
+        prepublish = package.index(
+            "if (( archive_preexisting != 0 )); then", snapshot
+        )
+        deployment_started = package.index("deployment_started=1", prepublish)
+        publish = package.index(
+            '"${temporary_install_archive}" "${KVAF_DIRECT_AICPU_ARCHIVE}"',
+            deployment_started,
+        )
+        check = package[prepublish:deployment_started]
+
+        self.assertIn(
+            'sha256sum -- "${KVAF_DIRECT_AICPU_ARCHIVE}"', check
+        )
+        self.assertIn('"${rollback_archive_sha}"', check)
+        self.assertIn(
+            "AICPU archive changed before transaction publish", check
+        )
+        self.assertIn(
+            "AICPU archive appeared before transaction publish", check
+        )
+        self.assertLess(snapshot, prepublish)
+        self.assertLess(prepublish, deployment_started)
+        self.assertLess(deployment_started, publish)
+
+        comment_start = package.index(
+            "# The common registry lock", snapshot, prepublish
+        )
+        prepublish_comment = package[comment_start:prepublish]
+        self.assertIn(
+            "A non-cooperating root writer can still", prepublish_comment
+        )
+        self.assertIn("race the final check/rename window", prepublish_comment)
+        self.assertIn("exclusive CANN maintenance window", prepublish_comment)
+        self.assertNotIn("atomic CAS", package)
+        self.assertNotIn("compare-and-swap", package)
 
     def test_provider_v2_manifest_fails_closed(self) -> None:
         bash = shutil.which("bash")

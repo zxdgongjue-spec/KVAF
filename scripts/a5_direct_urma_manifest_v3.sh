@@ -155,6 +155,15 @@ kvaf_verify_direct_provider_build_v3()
   local build_kernel_release
   local umdk_commit libummu_commit expected_libummu_commit
   local umdk_root management_source management_path
+  local runtime_probe_provider_filename runtime_probe_provider_path
+  local runtime_probe_provider_build_id runtime_probe_provider_sha
+  local runtime_probe_provider_source_config_sha
+  local runtime_probe_provider_builder_sha current_provider_builder_sha
+  local registered_package_audit_sha current_registered_package_audit_sha
+  local resource_gate_probe_filename resource_gate_probe_path
+  local resource_gate_probe_sha resource_gate_probe_actual_sha
+  local resource_gate_output_sha resource_gate_output_actual_sha
+  local resource_gate_output
   local binding command key prefix
 
   if (( $# > 1 )) ||
@@ -260,6 +269,141 @@ kvaf_verify_direct_provider_build_v3()
       "${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP}" || return 1
   done
   kvaf_v3_verify_hash_binding build_manifest_sha256 "${build_sha}" \
+    "${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP}" || return 1
+
+  runtime_probe_provider_filename=$(kvaf_v3_manifest_value \
+    runtime_probe_provider_filename \
+    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
+  runtime_probe_provider_build_id=$(kvaf_v3_manifest_value \
+    runtime_probe_provider_build_id_sha256 \
+    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
+  runtime_probe_provider_source_config_sha=$(kvaf_v3_manifest_value \
+    runtime_probe_provider_source_config_sha256 \
+    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
+  runtime_probe_provider_builder_sha=$(kvaf_v3_manifest_value \
+    runtime_probe_provider_builder_script_sha256 \
+    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
+  [[ -n ${ROOT_DIR:-} &&
+     -f ${ROOT_DIR}/scripts/build_a5_direct_urma_provider.sh &&
+     ! -L ${ROOT_DIR}/scripts/build_a5_direct_urma_provider.sh ]] || {
+    kvaf_v3_error "current provider build script is missing or unsafe"
+    return 1
+  }
+  current_provider_builder_sha=$(kvaf_v3_sha256 \
+    "${ROOT_DIR}/scripts/build_a5_direct_urma_provider.sh") || return 1
+  [[ ${runtime_probe_provider_builder_sha} =~ ^[0-9a-f]{64}$ &&
+     ${runtime_probe_provider_builder_sha} == \
+       "${current_provider_builder_sha}" ]] || {
+    kvaf_v3_error \
+      "provider build script changed after the verified provider build"
+    return 1
+  }
+  registered_package_audit_sha=$(kvaf_v3_manifest_value \
+    registered_package_audit_script_sha256 \
+    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
+  [[ -f ${ROOT_DIR}/scripts/audit_a5_registered_aicpu_packages.sh &&
+     ! -L ${ROOT_DIR}/scripts/audit_a5_registered_aicpu_packages.sh &&
+     -x ${ROOT_DIR}/scripts/audit_a5_registered_aicpu_packages.sh ]] || {
+    kvaf_v3_error "registered AICPU package audit is missing or unsafe"
+    return 1
+  }
+  current_registered_package_audit_sha=$(kvaf_v3_sha256 \
+    "${ROOT_DIR}/scripts/audit_a5_registered_aicpu_packages.sh") || return 1
+  [[ ${registered_package_audit_sha} =~ ^[0-9a-f]{64}$ &&
+     ${registered_package_audit_sha} == \
+       "${current_registered_package_audit_sha}" ]] || {
+    kvaf_v3_error \
+      "registered AICPU package audit changed after the verified provider build"
+    return 1
+  }
+  kvaf_v3_verify_hash_binding registered_package_audit_script_sha256 \
+    "${registered_package_audit_sha}" \
+    "${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP}" || return 1
+  [[ ${runtime_probe_provider_build_id} =~ ^[0-9a-f]{64}$ &&
+     ${runtime_probe_provider_filename} == \
+       "libkvaf_rt_${runtime_probe_provider_build_id:0:16}.so" &&
+     ${#runtime_probe_provider_filename} -lt 32 ]] || {
+    kvaf_v3_error "runtime probe provider build-instance identity is malformed"
+    return 1
+  }
+  runtime_probe_provider_path="${KVAF_DIRECT_PROVIDER_BUILD_DIR}/${runtime_probe_provider_filename}"
+  [[ ! -L ${runtime_probe_provider_path} &&
+     -f ${runtime_probe_provider_path} &&
+     -r ${runtime_probe_provider_path} ]] || {
+    kvaf_v3_error "runtime probe provider alias is missing or unsafe"
+    return 1
+  }
+  runtime_probe_provider_sha=$(kvaf_v3_sha256 \
+    "${runtime_probe_provider_path}") || return 1
+  kvaf_v3_require_value runtime_probe_provider_build_id_schema \
+    random-build-instance-sha256-v1 \
+    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}" || return 1
+  kvaf_v3_require_value runtime_probe_provider_source_config_schema \
+    audited-inputs-sha256-v1 \
+    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}" || return 1
+  [[ ${runtime_probe_provider_source_config_sha} =~ ^[0-9a-f]{64}$ ]] || {
+    kvaf_v3_error "runtime probe provider source/config identity is malformed"
+    return 1
+  }
+  for binding in \
+    "runtime_probe_provider_build_id_sha256:${runtime_probe_provider_build_id}" \
+    "runtime_probe_provider_source_config_sha256:${runtime_probe_provider_source_config_sha}" \
+    "runtime_probe_provider_artifact_sha256:${runtime_probe_provider_sha}"
+  do
+    kvaf_v3_verify_hash_binding "${binding%%:*}" "${binding#*:}" \
+      "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}" || return 1
+    kvaf_v3_verify_hash_binding "${binding%%:*}" "${binding#*:}" \
+      "${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP}" || return 1
+  done
+
+  for binding in \
+    'resource_entry_gate_schema:capability-ledger-fail-closed-v1' \
+    'capability_ledger_state:not-implemented' \
+    'provider_open_gate:disabled-before-config-validation-v1' \
+    'owner_probe_gate:disabled-before-command-clock-sleep-v1' \
+    'epoch_owner_gate:disabled-before-claim-v1' \
+    'runtime_probe_gate:disabled-before-dlopen-v1' \
+    'resource_gate_contract:verified-valid-request-v1'
+  do
+    kvaf_v3_require_value "${binding%%:*}" "${binding#*:}" \
+      "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}" || return 1
+    kvaf_v3_require_value "${binding%%:*}" "${binding#*:}" \
+      "${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP}" || return 1
+  done
+  resource_gate_probe_filename=$(kvaf_v3_manifest_value \
+    resource_gate_contract_probe_filename \
+    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
+  [[ ${resource_gate_probe_filename} == \
+       kvaf_urma_provider_aicpu_contract_probe ]] || {
+    kvaf_v3_error "unexpected resource-gate contract probe filename"
+    return 1
+  }
+  resource_gate_probe_path="${KVAF_DIRECT_PROVIDER_BUILD_DIR}/${resource_gate_probe_filename}"
+  [[ ! -L ${resource_gate_probe_path} &&
+     -f ${resource_gate_probe_path} &&
+     -x ${resource_gate_probe_path} ]] || {
+    kvaf_v3_error "resource-gate contract probe is missing or unsafe"
+    return 1
+  }
+  resource_gate_probe_actual_sha=$(kvaf_v3_sha256 \
+    "${resource_gate_probe_path}") || return 1
+  resource_gate_probe_sha=$(kvaf_v3_manifest_value \
+    resource_gate_contract_probe_sha256 \
+    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
+  resource_gate_output_sha=$(kvaf_v3_manifest_value \
+    resource_gate_contract_output_sha256 \
+    "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}") || return 1
+  [[ ${resource_gate_probe_sha} =~ ^[0-9a-f]{64}$ &&
+     ${resource_gate_output_sha} =~ ^[0-9a-f]{64}$ &&
+     ${resource_gate_probe_actual_sha} == "${resource_gate_probe_sha}" ]] || {
+    kvaf_v3_error "resource-gate contract proof changed after build"
+    return 1
+  }
+  kvaf_v3_verify_hash_binding resource_gate_contract_probe_sha256 \
+    "${resource_gate_probe_sha}" \
+    "${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP}" || return 1
+  kvaf_v3_verify_hash_binding resource_gate_contract_output_sha256 \
+    "${resource_gate_output_sha}" \
     "${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP}" || return 1
 
   for binding in \
@@ -403,6 +547,33 @@ kvaf_verify_direct_provider_build_v3()
     "${KVAF_DIRECT_HOST_PROVIDER_LIBRARY}" || return 1
   kvaf_v3_verify_provider_dynamic Device \
     "${KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY}" || return 1
+  kvaf_v3_verify_provider_dynamic Runtime-probe \
+    "${runtime_probe_provider_path}" || return 1
+
+  # The probe sends valid, identity-bound requests through each exported
+  # resource-bearing entry.  A PASS proves that the exact Device and runtime
+  # probe DSOs in this build return the fixed ledger-unavailable result and
+  # leave no provider session, before any URMA/UMMU resource or dlopen path.
+  resource_gate_output=$(
+    "${resource_gate_probe_path}" \
+      "${KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY}" \
+      "${runtime_probe_provider_path}"
+  ) || {
+    kvaf_v3_error "resource-gate contract probe execution failed"
+    return 1
+  }
+  [[ ${resource_gate_output} == \
+       KVAF_URMA_PROVIDER_AICPU_CONTRACT=PASS ]] || {
+    kvaf_v3_error "resource-gate contract probe returned an unexpected result"
+    return 1
+  }
+  resource_gate_output_actual_sha=$(
+    printf '%s\n' "${resource_gate_output}" | sha256sum | awk '{print $1}'
+  ) || return 1
+  [[ ${resource_gate_output_actual_sha} == "${resource_gate_output_sha}" ]] || {
+    kvaf_v3_error "resource-gate contract result changed after build"
+    return 1
+  }
 
   KVAF_VERIFIED_HOST_PROVIDER_SHA=${host_sha}
   KVAF_VERIFIED_DEVICE_PROVIDER_SHA=${device_sha}
@@ -410,6 +581,10 @@ kvaf_verify_direct_provider_build_v3()
   KVAF_VERIFIED_UMDK_SOURCE_MANIFEST_SHA=${umdk_sha}
   KVAF_VERIFIED_LIBUMMU_SOURCE_MANIFEST_SHA=${libummu_sha}
   KVAF_VERIFIED_BUILD_MANIFEST_SHA=${build_sha}
+  KVAF_VERIFIED_RUNTIME_PROBE_PROVIDER_FILENAME=${runtime_probe_provider_filename}
+  KVAF_VERIFIED_RUNTIME_PROBE_PROVIDER_BUILD_ID=${runtime_probe_provider_build_id}
+  KVAF_VERIFIED_RUNTIME_PROBE_PROVIDER_SHA=${runtime_probe_provider_sha}
+  KVAF_VERIFIED_REGISTERED_PACKAGE_AUDIT_SHA=${registered_package_audit_sha}
   KVAF_VERIFIED_UMDK_SOURCE_MANIFEST=${umdk_manifest}
   KVAF_VERIFIED_LIBUMMU_SOURCE_MANIFEST=${libummu_manifest}
 }

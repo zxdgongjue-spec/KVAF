@@ -764,6 +764,11 @@ int RunDevice(const Options& options) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  std::cerr << "KVAF_A5_HCOMM_BINARY_HARDWARE_EXECUTION_DISABLED\n"
+            << "CAPABILITY_LEDGER=not-implemented\n"
+            << "No ACL/NPU/HCOMM/URMA operation was attempted.\n";
+  return 2;
+
   Options options;
   if (!ParseOptions(argc, argv, &options)) {
     PrintUsage(argv[0]);

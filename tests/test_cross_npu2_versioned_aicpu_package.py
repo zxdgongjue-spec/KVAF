@@ -58,7 +58,7 @@ class CrossNpu2VersionedAicpuPackageTests(unittest.TestCase):
         self.assertLess(token_gate, archive_publish)
         self.assertLess(archive_publish, registration_publish)
 
-    def test_bad_acceptance_and_token_fail_before_environment_access(self) -> None:
+    def test_retired_packager_fails_before_risk_or_environment_access(self) -> None:
         bash = shutil.which("bash")
         if bash is None:
             self.skipTest("bash is unavailable")
@@ -73,7 +73,11 @@ class CrossNpu2VersionedAicpuPackageTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(result.returncode, 2)
-        self.assertIn("exact NPU2 reuse/shared UMMU risk phrase", result.stderr)
+        self.assertIn(
+            "KVAF_A5_CROSS_NPU2_AICPU_PACKAGE_MUTATION_DISABLED",
+            result.stderr,
+        )
+        self.assertIn("CAPABILITY_LEDGER=not-implemented", result.stderr)
 
         base_env["KVAF_CROSS_NPU2_REUSE_RISK_ACCEPTANCE"] = RISK_PHRASE
         base_env["KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN"] = "NOT-HEX"
@@ -85,7 +89,11 @@ class CrossNpu2VersionedAicpuPackageTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(result.returncode, 2)
-        self.assertIn("16 lowercase hexadecimal digits", result.stderr)
+        self.assertIn(
+            "KVAF_A5_CROSS_NPU2_AICPU_PACKAGE_MUTATION_DISABLED",
+            result.stderr,
+        )
+        self.assertNotIn("16 lowercase hexadecimal digits", result.stderr)
 
     def test_provider_and_package_profiles_are_source_owned_and_sealed(self) -> None:
         for required in (
@@ -166,10 +174,10 @@ class CrossNpu2VersionedAicpuPackageTests(unittest.TestCase):
         for text in forbidden:
             self.assertNotIn(text, self.source)
 
-    def test_registry_uses_independent_lock_and_exact_append_proof(self) -> None:
-        self.assertIn("versioned-aicpu-registry.lock", self.source)
-        self.assertIn('exec 9>"${kvaf_registry_lock}"', self.source)
-        self.assertIn("flock -w 30 9", self.source)
+    def test_registry_uses_shared_lock_and_exact_append_proof(self) -> None:
+        self.assertIn("a5_aicpu_package_registration.sh", self.source)
+        self.assertIn("kvaf_aicpu_acquire_registry_lock", self.source)
+        self.assertNotIn("versioned-aicpu-registry.lock", self.source)
         self.assertNotIn("KVAF_DIRECT_DEPLOY_RUN_LOCK", self.source)
         self.assertNotIn("KVAF_DIRECT_ACTIVE_SESSION_LOCK", self.source)
         self.assertNotIn("kvaf_check_legacy_direct_urma_state", self.source)
@@ -183,6 +191,10 @@ class CrossNpu2VersionedAicpuPackageTests(unittest.TestCase):
         ):
             self.assertIn(required, self.source)
         helper = REGISTRATION.read_text(encoding="utf-8")
+        self.assertIn('registry_lock="${registry_real}.kvaf.lock"', helper)
+        self.assertIn('exec 11<>"${registry_lock}"', helper)
+        self.assertIn("flock -w 30 11", helper)
+        self.assertIn("os.fstat(11)", helper)
         self.assertIn("cp -p --", helper)
         self.assertIn("mv -f --", helper)
 
