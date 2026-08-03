@@ -34,6 +34,31 @@ index/mask/output-index/output buffer，以及 NPU 上的 address/valid 表。Ru
 `output` 一样在每次 `BatchGetRequest` 中传给 Runtime，再由 Operator 在本次
 执行中 Acquire 对应的 local HBM MR；没有固定的 output 绑定 API。
 
+## 当前 POC 的 NPU AccessTable 边界
+
+当前 `PrepareAccessTable` 只生成 Runtime-owned 的扁平 Host
+`address/length/valid` 表并持有对应 Key 锁。NPU AccessTable 的 device buffer
+由 CacheOS-vLLM Adapter 创建和维护；本仓的 Python NPU 测试脚本暂时承担该
+Adapter 角色：读取 Host view，按相同下标顺序写入 caller-owned NPU
+`addresses` 与 `valid` buffer，再将它们传给 `BatchGet`。
+
+Adapter 必须保证这些 device buffer 在关联 BatchGet 完成且
+`ReleaseAccessTable` 前持续有效、容量与 Host view 一致；Runtime 不分配、复制、
+释放或注册这两块 device AccessTable buffer。图模式下，Adapter 必须在 capture
+前完成该准备并保持地址稳定。
+
+`valid` 是每个 AccessTable entry 的安全位：`1` 表示可访问，`0` 表示 padding
+或无效 entry。AIV kernel 对 `mask=1 && valid=0` 返回设备侧 `kInvalidLookup`，
+且不会对该地址发起 UDMA 读；padding 应由 Adapter 同时以 `mask=0` 跳过。
+当前 InMemory MetaManager 对不存在的 Key 在 `PrepareAccessTable` 的
+`LockKeys` 阶段直接返回 `kNotFound`，因此不会产生一张含该 Key 的
+`valid=0` 表。
+
+当前同步 Operator 尚未把 kernel 写入的 `core_status.result`（例如
+`kInvalidLookup`）转换为 `Runtime.BatchGet` 的错误 Status；NPU 集成测试会
+显式检查该状态。将设备 completion status 纳入 Runtime 返回语义，是后续把
+Adapter 输入扩展为通用 AccessTableOutputSpec 时必须完成的工作。
+
 ## 测试
 
 默认测试均由 Python 脚本定义场景和断言，并直接调用 pybind 的
