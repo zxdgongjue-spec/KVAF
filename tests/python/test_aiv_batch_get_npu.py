@@ -62,6 +62,10 @@ def main() -> int:
         os.environ.get("KVAF_NPU_AIV_CORES", "1"),
         "--mask-every",
         os.environ.get("KVAF_NPU_MASK_EVERY", "0"),
+        "--warmup",
+        os.environ.get("KVAF_NPU_WARMUP", "1"),
+        "--iterations",
+        os.environ.get("KVAF_NPU_ITERATIONS", "5"),
     ]
     timeout_seconds = int(os.environ.get("KVAF_NPU_TIMEOUT_SECONDS", "240"))
     print("RUNTIME_AIV_PYTHON_COMMAND", " ".join(command))
@@ -69,26 +73,26 @@ def main() -> int:
         result = subprocess.run(
             command,
             text=True,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             check=False,
             timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired as error:
         sys.stdout.write(error.stdout or "")
-        sys.stderr.write(error.stderr or "")
         print(
             f"FAIL: Runtime AIV smoke test timed out after {timeout_seconds}s",
             file=sys.stderr,
         )
         return 124
     sys.stdout.write(result.stdout)
-    sys.stderr.write(result.stderr)
     if result.returncode != 0:
         return result.returncode
     for marker in (
         "RUNTIME_AIV_PHASE_DONE phase=runtime_initialize",
         "RUNTIME_AIV_PHASE_DONE phase=caller_buffer_setup",
         "RUNTIME_AIV_BATCH_GET_VALIDATION_PASS",
+        "PERF_RESULT metric=runtime_batch_get_call_to_stream_completion",
         "RUNTIME_AIV_PHASE_DONE phase=teardown status=0",
     ):
         if marker not in result.stdout:

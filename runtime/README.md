@@ -68,5 +68,9 @@ python3 tests/python/test_aiv_batch_get_npu.py
 ```
 
 该脚本用小规模 eager case 验证 Runtime 初始化、调用方 Device buffer/链路
-注册、Runtime BatchGet、设备完成、输出字节和 teardown。它有 240 秒超时并
-输出分阶段标记，未设置 `KVAF_RUN_NPU_TESTS=1` 时会明确跳过。
+注册、Runtime BatchGet、设备完成、输出字节和 teardown。正确性验证完成后，
+它会输出 `PERF_RESULT metric=runtime_batch_get_call_to_stream_completion`；这个
+计时窗口从 `Runtime.BatchGet` 调用开始，到 AIV adapter 中的 stream 同步完成
+结束，排除 DDR 注册、Device buffer 初始化和 Host-to-Device 表更新。输出包括
+mean、p50、p90、p99 和 useful GiB/s。它有 240 秒超时并输出分阶段标记，未设置
+`KVAF_RUN_NPU_TESTS=1` 时会明确跳过。

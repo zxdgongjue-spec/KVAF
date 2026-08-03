@@ -1,10 +1,13 @@
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <string>
 #include <utility>
 #include <vector>
@@ -27,6 +30,8 @@ struct Options {
   std::uint32_t source_stride{4096};
   std::uint32_t aiv_cores{1};
   std::uint32_t mask_every{0};
+  std::uint32_t warmup{1};
+  std::uint32_t iterations{5};
 };
 
 std::uint8_t PatternByte(std::uint32_t slot, std::uint32_t byte) {
@@ -68,6 +73,10 @@ bool ParseOptions(int argc, char** argv, Options* options) {
       if (!ParseU32(argv[++index], &options->aiv_cores)) return false;
     } else if (argument == "--mask-every" && index + 1 < argc) {
       if (!ParseU32(argv[++index], &options->mask_every)) return false;
+    } else if (argument == "--warmup" && index + 1 < argc) {
+      if (!ParseU32(argv[++index], &options->warmup)) return false;
+    } else if (argument == "--iterations" && index + 1 < argc) {
+      if (!ParseU32(argv[++index], &options->iterations)) return false;
     } else {
       return false;
     }
@@ -78,7 +87,7 @@ bool ParseOptions(int argc, char** argv, Options* options) {
          options->source_stride >= options->block_bytes &&
          options->aiv_cores != 0 &&
          options->aiv_cores <= KVAF_AIV_BATCH_GET_MAX_AIV_CORES &&
-         options->aiv_cores <= options->requests;
+         options->aiv_cores <= options->requests && options->iterations != 0;
 }
 
 bool CheckAcl(aclError error, const char* step) {
@@ -139,7 +148,8 @@ bool ValidateOutput(const std::vector<std::uint8_t>& output,
                     const std::vector<std::int32_t>& output_indices,
                     const Options& options,
                     const std::vector<KvafBatchGetCoreStatus>& statuses,
-                    const std::vector<KvafBatchGetQueueState>& queues) {
+                    const std::vector<KvafBatchGetQueueState>& queues,
+                    std::uint64_t expected_batches) {
   for (std::uint32_t request = 0; request < options.requests; ++request) {
     const std::size_t output_offset =
         static_cast<std::size_t>(output_indices[request]) * options.block_bytes;
@@ -174,10 +184,12 @@ bool ValidateOutput(const std::vector<std::uint8_t>& output,
     if (statuses[core].magic != KVAF_AIV_BATCH_GET_STATUS_MAGIC ||
         statuses[core].result != 0 ||
         statuses[core].processed_request_count != active ||
-        statuses[core].completed_batch_count != (active == 0 ? 0 : 1) ||
+        statuses[core].completed_batch_count !=
+            (active == 0 ? 0 : expected_batches) ||
         queues[core].magic != 0x4b564151U || queues[core].initialized != 1U ||
         queues[core].last_error != 0 ||
-        queues[core].completed_batch_count != (active == 0 ? 0 : 1)) {
+        queues[core].completed_batch_count !=
+            (active == 0 ? 0 : expected_batches)) {
       std::cerr << "[KVAF_RUNTIME_AIV] completion state mismatch core=" << core
                 << " result=" << statuses[core].result
                 << " queue_error=" << queues[core].last_error << '\n';
@@ -185,6 +197,15 @@ bool ValidateOutput(const std::vector<std::uint8_t>& output,
     }
   }
   return true;
+}
+
+double Percentile(std::vector<double> samples, double fraction) {
+  std::sort(samples.begin(), samples.end());
+  const double position = fraction * static_cast<double>(samples.size() - 1U);
+  const std::size_t lower = static_cast<std::size_t>(position);
+  const std::size_t upper = std::min(lower + 1U, samples.size() - 1U);
+  return samples[lower] + (samples[upper] - samples[lower]) *
+                              (position - lower);
 }
 
 }  // namespace
@@ -195,7 +216,8 @@ int main(int argc, char** argv) {
   if (!ParseOptions(argc, argv, &options)) {
     std::cerr << "usage: kvaf_runtime_aiv_batch_get_runner --kernel PATH "
                  "[--device N --table-capacity N --requests N --output-rows N "
-                 "--block-bytes N --source-stride N --aiv-cores N --mask-every N]\n";
+                 "--block-bytes N --source-stride N --aiv-cores N --mask-every N "
+                 "--warmup N --iterations N]\n";
     return 2;
   }
 
@@ -236,6 +258,7 @@ int main(int argc, char** argv) {
   std::vector<KvafBatchGetCoreStatus> statuses(options.aiv_cores);
   std::vector<KvafBatchGetQueueState> queues(options.aiv_cores);
   std::vector<std::uint8_t> output(output_bytes);
+  std::vector<double> elapsed_ms;
 
   std::cout << "RUNTIME_AIV_PHASE_BEGIN phase=acl_init\n";
   do {
@@ -392,11 +415,75 @@ int main(int argc, char** argv) {
         !CheckAcl(aclrtMemcpy(queues.data(), queues.size() * sizeof(queues[0]),
                                device_queue, queues.size() * sizeof(queues[0]),
                                ACL_MEMCPY_DEVICE_TO_HOST), "copy queue") ||
-        !ValidateOutput(output, indices, mask, output_indices, options, statuses, queues)) {
+        !ValidateOutput(output, indices, mask, output_indices, options, statuses,
+                        queues, 1U)) {
       break;
     }
     std::cout << "RUNTIME_AIV_BATCH_GET_VALIDATION_PASS requests="
               << options.requests << '\n';
+
+    bool warmup_ok = true;
+    for (std::uint32_t iteration = 0; iteration < options.warmup; ++iteration) {
+      if (!CheckStatus(runtime->BatchGet(request), "Runtime.BatchGet warmup")) {
+        warmup_ok = false;
+        break;
+      }
+    }
+    if (!warmup_ok) {
+      break;
+    }
+    const std::uint64_t completed_before_measurement =
+        1U + options.warmup;
+    elapsed_ms.reserve(options.iterations);
+    bool measurement_ok = true;
+    for (std::uint32_t iteration = 0; iteration < options.iterations; ++iteration) {
+      const auto begin = std::chrono::steady_clock::now();
+      const kvaf::Status status = runtime->BatchGet(request);
+      const auto end = std::chrono::steady_clock::now();
+      if (!CheckStatus(status, "Runtime.BatchGet measured")) {
+        measurement_ok = false;
+        break;
+      }
+      elapsed_ms.push_back(
+          std::chrono::duration<double, std::milli>(end - begin).count());
+    }
+    if (!measurement_ok) {
+      break;
+    }
+    if (!CheckAcl(aclrtMemcpy(output.data(), output.size(), output_device, output.size(),
+                               ACL_MEMCPY_DEVICE_TO_HOST), "copy measured output") ||
+        !CheckAcl(aclrtMemcpy(statuses.data(), statuses.size() * sizeof(statuses[0]),
+                               device_status, statuses.size() * sizeof(statuses[0]),
+                               ACL_MEMCPY_DEVICE_TO_HOST), "copy measured status") ||
+        !CheckAcl(aclrtMemcpy(queues.data(), queues.size() * sizeof(queues[0]),
+                               device_queue, queues.size() * sizeof(queues[0]),
+                               ACL_MEMCPY_DEVICE_TO_HOST), "copy measured queue") ||
+        !ValidateOutput(output, indices, mask, output_indices, options, statuses,
+                        queues, completed_before_measurement + options.iterations)) {
+      break;
+    }
+    const std::uint64_t active_requests =
+        static_cast<std::uint64_t>(std::count_if(
+            mask.begin(), mask.end(),
+            [](std::uint8_t value) { return value != 0; }));
+    const double mean_ms = std::accumulate(elapsed_ms.begin(), elapsed_ms.end(), 0.0) /
+                           static_cast<double>(elapsed_ms.size());
+    const double useful_gibps =
+        (static_cast<double>(active_requests) * options.block_bytes /
+         (1024.0 * 1024.0 * 1024.0)) /
+        (mean_ms / 1000.0);
+    std::cout << std::fixed << std::setprecision(3)
+              << "PERF_RESULT metric=runtime_batch_get_call_to_stream_completion"
+              << " samples=" << options.iterations
+              << " warmup_excluded=" << options.warmup
+              << " active_requests=" << active_requests
+              << " block_bytes=" << options.block_bytes
+              << " aiv_cores=" << options.aiv_cores
+              << " mean_ms=" << mean_ms
+              << " p50_ms=" << Percentile(elapsed_ms, 0.50)
+              << " p90_ms=" << Percentile(elapsed_ms, 0.90)
+              << " p99_ms=" << Percentile(elapsed_ms, 0.99)
+              << " useful_GiBps=" << useful_gibps << '\n';
     exit_code = 0;
   } while (false);
 

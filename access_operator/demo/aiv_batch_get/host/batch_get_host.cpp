@@ -904,11 +904,14 @@ void ReleaseRegistration(KvafBatchGetDdrRegistration *registration) {
   if (registration == nullptr) {
     return;
   }
+  std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=begin\n");
   if (registration->device_entities != nullptr) {
+    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=free_device_entities\n");
     (void)aclrtFree(registration->device_entities);
     registration->device_entities = nullptr;
   }
   if (registration->api.qp_unimport != nullptr) {
+    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=unimport_jettys\n");
     for (auto &worker : registration->workers) {
       if (registration->host_context != nullptr && worker.host_device_target_jetty != nullptr) {
         (void)registration->api.qp_unimport(registration->host_context, worker.host_device_target_jetty);
@@ -919,6 +922,7 @@ void ReleaseRegistration(KvafBatchGetDdrRegistration *registration) {
     }
   }
   if (registration->api.qp_destroy != nullptr) {
+    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=destroy_jettys\n");
     for (auto &worker : registration->workers) {
       if (worker.device_user_ctl_jetty.handle != nullptr) {
         (void)registration->api.qp_destroy(worker.device_user_ctl_jetty.handle);
@@ -929,6 +933,7 @@ void ReleaseRegistration(KvafBatchGetDdrRegistration *registration) {
     }
   }
   if (registration->api.cq_destroy != nullptr) {
+    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=destroy_completion_queues\n");
     for (auto &worker : registration->workers) {
       if (registration->device_context != nullptr && worker.device_user_ctl_cq != nullptr) {
         (void)registration->api.cq_destroy(registration->device_context, worker.device_user_ctl_cq);
@@ -940,9 +945,11 @@ void ReleaseRegistration(KvafBatchGetDdrRegistration *registration) {
   }
   if (registration->api.rmem_unimport != nullptr && registration->device_context != nullptr &&
       registration->device_host_memory_import != nullptr) {
+    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=unimport_host_memory\n");
     (void)registration->api.rmem_unimport(registration->device_context, registration->device_host_memory_import);
   }
   if (registration->api.lmem_unregister != nullptr) {
+    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=unregister_memory\n");
     if (registration->device_context != nullptr && registration->output_memory.handle != nullptr) {
       (void)registration->api.lmem_unregister(registration->device_context, registration->output_memory.handle);
     }
@@ -951,6 +958,7 @@ void ReleaseRegistration(KvafBatchGetDdrRegistration *registration) {
     }
   }
   if (registration->api.token_free != nullptr) {
+    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=free_tokens\n");
     if (registration->device_context != nullptr && registration->device_token_handle != nullptr) {
       (void)registration->api.token_free(registration->device_context, registration->device_token_handle);
     }
@@ -959,6 +967,7 @@ void ReleaseRegistration(KvafBatchGetDdrRegistration *registration) {
     }
   }
   if (registration->api.ctx_deinit != nullptr) {
+    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=deinit_contexts\n");
     if (registration->device_context != nullptr) {
       (void)registration->api.ctx_deinit(registration->device_context);
     }
@@ -967,12 +976,16 @@ void ReleaseRegistration(KvafBatchGetDdrRegistration *registration) {
     }
   }
   if (registration->device_ra_initialized) {
+    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=deinit_device_ra\n");
     DeinitRaBestEffort(registration->api, registration->physical_device_id, hccp::kOfflineHdc, "device_aiv");
   }
   if (registration->host_ra_initialized) {
+    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=deinit_host_ra\n");
     DeinitRaBestEffort(registration->api, registration->physical_device_id, hccp::kPeerOnline, "host_cpu");
   }
+  std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=close_dynamic_libraries\n");
   CloseDirectHccp(&registration->api);
+  std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=delete_registration\n");
   delete registration;
 }
 
