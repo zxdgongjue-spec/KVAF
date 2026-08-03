@@ -192,6 +192,158 @@ class CrossNpu2ReuseHostLauncherTests(unittest.TestCase):
         self.assertIn("read_reservation", observation)
         self.assertNotIn("rev-parse HEAD", observation)
 
+    def test_cann_alias_is_bound_to_the_pinned_91_installation(self) -> None:
+        start = self.source.index("inspect_pinned_cann_installation()")
+        end = self.source.index("require_clean_git_tree()")
+        resolver = self.source[start:end]
+        for required in (
+            "/usr/local/Ascend/ascend-toolkit/set_env.sh",
+            "/usr/local/Ascend/cann-9.1.0/set_env.sh",
+            "/usr/local/Ascend/cann-9.1.0",
+            "realpath -e --",
+            "kvaf_alias_real",
+            "kvaf_entry_real",
+            "KVAF_PINNED_CANN_SET_ENV_SEAL",
+            "ASCEND_HOME_PATH",
+            "KVAF_PINNED_CANN_BISHENG_SEAL",
+            "group/world writable",
+            "multiple hard links",
+        ):
+            self.assertIn(required, resolver)
+        self.assertNotIn(
+            '! -L "${KVAF_ASCEND_SET_ENV}"', self.source
+        )
+
+    def test_normal_launch_checks_cann_before_reserving(self) -> None:
+        start = self.source.index("start_experiment()")
+        worker_result = self.source.index("publish_worker_rc()")
+        body = self.source[start:worker_result]
+        self.assertLess(
+            body.index("run_pinned_cann_read_only_preflight"),
+            body.index("reserve_launch_generation"),
+        )
+        worker = self.source.index("run_worker()")
+        parser = self.source.index("read_canonical_worker_rc()")
+        self.assertIn(
+            "source_pinned_cann_environment",
+            self.source[worker:parser],
+        )
+
+    def test_recovery_accepts_only_the_exact_pre_coordinator_failure(self) -> None:
+        verifier = self.source.index(
+            "verify_original_cann_symlink_failure()"
+        )
+        preflight = self.source.index("run_read_only_preflight()")
+        body = self.source[verifier:preflight]
+        for required in (
+            "KVAF_KNOWN_CANN_SYMLINK_FAILURE_COMMIT",
+            "original dispatch or worker bootstrap is ambiguous",
+            "cmp -s <(printf '2\\n')",
+            "${#kvaf_failed_log_lines[@]} == 12",
+            "stage=container-worker-started",
+            "ERROR: CANN set_env.sh is missing",
+            "KVAF_CLAIM",
+            "KVAF_ARTIFACT_ROOT",
+            "KVAF_REUSE_STATE_DIR",
+            "sealed_root_file_identity",
+        ):
+            self.assertIn(required, body)
+
+    def test_recovery_proves_no_process_or_preclaim_output_remains(self) -> None:
+        gates = self.source.index("run_container_recovery_gates()")
+        host_preflight = self.source.index(
+            "run_recovery_container_preflight()"
+        )
+        body = self.source[gates:host_preflight]
+        for required in (
+            "/proc/[0-9]*",
+            "a persistent process is unreadable during recovery proof",
+            "KVAF_DETACHED_LAUNCH_NONCE=${KVAF_FAILED_LAUNCH_NONCE}",
+            "run_a5_cross_npu2_reuse_experiment.sh",
+            "package_a5_cross_npu2_reuse_aicpu.sh",
+            ".attempt.selected.*",
+            "cann-kvaf-du-${KVAF_ARTIFACT_TOKEN}.tar.gz",
+            "name:Ascend-aicpu_legacy.tar.gz",
+            "validate_a5_cross_npu2_reuse_risk.py",
+            "KVAF_NPU_IDLE_STATUS=idle",
+        ):
+            self.assertIn(required, body)
+        for forbidden in (r"\bkill\b", r"\bpkill\b", r"\brm\b"):
+            self.assertIsNone(re.search(forbidden, body), forbidden)
+        self.assertNotIn("kvaf_a5_aiv_direct_urma_h2d_smoke", body)
+
+    def test_recovery_checks_cann_seal_before_sourcing(self) -> None:
+        gates = self.source.index("run_container_recovery_gates()")
+        host_preflight = self.source.index(
+            "run_recovery_container_preflight()"
+        )
+        body = self.source[gates:host_preflight]
+        inspect = body.index("inspect_pinned_cann_installation")
+        changed_before = body.index(
+            "pinned CANN set_env.sh changed before source"
+        )
+        source = body.index("source_pinned_cann_environment")
+        self.assertLess(inspect, changed_before)
+        self.assertLess(changed_before, source)
+        self.assertIn("kvaf_expected_cann_seal", body)
+        self.assertIn("kvaf_expected_bisheng_seal", body)
+
+    def test_recovery_uses_a_distinct_single_use_generation(self) -> None:
+        for required in (
+            "KVAF_RECOVERY_RESERVATION",
+            "KVAF_RECOVERY_LOG",
+            "KVAF_RECOVERY_WORKER_RC",
+            "KVAF_RECOVERY_WORKER_SELECTED",
+            "single-pre-coordinator-cann-bootstrap-recovery-v1",
+            "failed_reservation_seal=",
+            "failed_log_seal=",
+            "cann_set_env_seal=",
+            "recovery_nonce=",
+            "the single CANN bootstrap recovery generation was already used",
+        ):
+            self.assertIn(required, self.source)
+
+    def test_recovery_worker_rechecks_every_gate_before_coordinator(self) -> None:
+        worker = self.source.index("run_recovery_worker()")
+        parser = self.source.index("read_canonical_worker_rc()")
+        body = self.source[worker:parser]
+        selection = body.index(
+            'publish_file_once "${KVAF_RECOVERY_WORKER_SELECTED}"'
+        )
+        gates = body.index("run_container_recovery_gates")
+        coordinator = body.index(
+            "run_a5_cross_npu2_reuse_experiment.sh zero-wqe"
+        )
+        self.assertLess(selection, gates)
+        self.assertLess(gates, coordinator)
+        self.assertIn("verify_recovery_bound_original_evidence", body)
+        self.assertIn("stage=coordinator-starting", body)
+        self.assertIn("KVAF_RECOVERY_WORKER_OWNS_GENERATION=1", body)
+
+    def test_recovery_status_requires_pass_markers_and_exact_claim(self) -> None:
+        status = self.source.index("show_recovery_status()")
+        watch = self.source.index("watch_recovery_status()")
+        body = self.source[status:watch]
+        for required in (
+            "KVAF_ORIGINAL_COORDINATOR_STARTED=no",
+            "KVAF_RECOVERY_COORDINATOR_STARTED=yes",
+            "KVAF_NPU2_REUSE_ZERO_WQE_RC=0",
+            "KVAF_NPU2_REUSE_ZERO_WQE_ACCEPTANCE=PASS",
+            "require_exact_recovery_attempt_claim",
+            "KVAF_CANN_RECOVERY_ACCEPTANCE=PASS",
+        ):
+            self.assertIn(required, body)
+
+    def test_recovery_operator_commands_are_short_and_explicit(self) -> None:
+        for required in (
+            "recover-cann-bootstrap --accept-npu2-reuse-risk",
+            "recovery-status",
+            "recovery-watch",
+            "recovery-worker",
+            "recovery-preflight",
+        ):
+            self.assertIn(required, self.source)
+
 
 if __name__ == "__main__":
     unittest.main()

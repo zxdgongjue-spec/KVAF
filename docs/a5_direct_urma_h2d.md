@@ -486,6 +486,40 @@ launch reservation、token、完整 commit、日志和返回码身份，再通�
 覆盖和重跑；Docker dispatch 失败只记录为“是否已启动未知”，不能伪装成 coordinator
 已经返回。
 
+早期 launcher `5615967b639f49e787221c317a95a0a1b4739015` 把
+`/usr/local/Ascend/ascend-toolkit/set_env.sh` 本身是符号链接误判成 CANN 缺失。
+若旧日志逐行精确停在 `stage=container-worker-started`、worker PID、UTC 时间和
+`ERROR: CANN set_env.sh is missing`，且 worker rc 是 2，那么这只是 launcher
+bootstrap 失败：它执行过只读的 `npu-smi` idle 查询，但没有进入 coordinator，因而
+没有构建 token provider、安装 AICPU 包、发布 attempt claim、创建 URMA/UMMU 资源或
+执行 zero-WQE。
+
+不要删除或覆盖这次失败的 reservation、日志、worker selection 和 rc。修复后的入口
+提供一次独立恢复：
+
+```bash
+bash scripts/launch_a5_cross_npu2_reuse_detached.sh \
+  recover-cann-bootstrap --accept-npu2-reuse-risk
+bash scripts/launch_a5_cross_npu2_reuse_detached.sh recovery-status
+```
+
+恢复入口只接受上面这个固定 launcher commit 的精确四行失败正文。它把旧四个文件的
+SHA-256、device/inode/size/mode/link-count/owner 固定到新的只读 recovery
+reservation，并要求原 dispatch/bootstrap 均无歧义、旧 nonce 不在任何 live
+process 中、claim 与临时 claim 均不存在、token artifact/state/AICPU archive/注册项
+均未产生。随后它重新验证两个历史事故、固定 worktree 和 NPU2 idle，再原子选择唯一
+recovery worker。旧文件始终保持逐字节不变；recovery 路径一旦出现，不允许第三次
+dispatch。
+
+CANN 检查不再粗暴拒绝符号链接。入口只接受固定别名
+`/usr/local/Ascend/ascend-toolkit/set_env.sh`，并要求它与
+`/usr/local/Ascend/cann-9.1.0/set_env.sh` 解析到同一个、位于固定 CANN 9.1.0 根下的
+root-owned 非可写文件。source 前后还会复核路径、元数据、哈希、
+`ASCEND_HOME_PATH` 和 `bisheng`。这样既兼容安装器的正常版本链接，又不会静默切换到
+另一套 CANN。`recovery-status` 会把旧返回明确标成 `KVAF_ORIGINAL_BOOTSTRAP_RC=2`
+和 `KVAF_ORIGINAL_COORDINATOR_STARTED=no`；只有新日志同时包含 zero-WQE rc 0、PASS
+以及精确 attempt claim 时才返回恢复成功。
+
 active 状态在每次 fork 前先写 `host_launch_intent` 或
 `device_launch_intent`，fork 成功后再补 PID。恢复逻辑按 phase 决定必须检查
 单端还是双端终态，绝不会因为 SIGKILL 恰好发生在 fork 与 PID 落盘之间，就把
