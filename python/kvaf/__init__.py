@@ -2,8 +2,8 @@
 
 The default in-tree binding is an in-process CPU MockRuntime.  It exercises
 the real Runtime and MetaManager lifecycle without a subprocess or a concrete
-hardware AccessOperator.  Hardware-specific Python bindings are opt-in and
-will be added alongside their operator implementation.
+hardware AccessOperator. The optional CANN build additionally exposes
+``NpuRuntime`` for the current synchronous BatchGet implementation.
 """
 
 try:
@@ -23,14 +23,14 @@ runtime = _native.runtime
 meta_manager = _native.meta_manager
 access_operator = _native.access_operator
 
-if hasattr(_native, "AivBatchGetRuntime"):
-    AivBatchGetRuntime = _native.AivBatchGetRuntime
-    # These are fixed host/AIV ABI values from batch_get_abi.h. Keep them in
+if hasattr(_native, "NpuRuntime"):
+    NpuRuntime = _native.NpuRuntime
+    # These are fixed host/kernel ABI values from batch_get_abi.h. Keep them in
     # Python instead of module-level C++ attribute assignment so the binding
     # also loads with the target's pybind11 2.10.x / Python 3.13 combination.
-    AIV_BATCH_GET_STATUS_BYTES = 384
-    AIV_BATCH_GET_QUEUE_STATE_BYTES = 64
-    AIV_BATCH_GET_STATUS_MAGIC = 0x4B5641464247444F
+    NPU_BATCH_GET_STATUS_BYTES = 384
+    NPU_BATCH_GET_QUEUE_STATE_BYTES = 64
+    NPU_BATCH_GET_STATUS_MAGIC = 0x4B5641464247444F
 
 __all__ = [
     "AccessTable",
@@ -42,10 +42,10 @@ __all__ = [
     "access_operator",
 ]
 
-if hasattr(_native, "AivBatchGetRuntime"):
+if hasattr(_native, "NpuRuntime"):
     __all__ += [
-        "AivBatchGetRuntime",
-        "AIV_BATCH_GET_STATUS_BYTES",
-        "AIV_BATCH_GET_QUEUE_STATE_BYTES",
-        "AIV_BATCH_GET_STATUS_MAGIC",
+        "NpuRuntime",
+        "NPU_BATCH_GET_STATUS_BYTES",
+        "NPU_BATCH_GET_QUEUE_STATE_BYTES",
+        "NPU_BATCH_GET_STATUS_MAGIC",
     ]

@@ -14,7 +14,7 @@
 #include "kvaf/runtime/runtime.h"
 
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
-#include "aiv_python_runtime.h"
+#include "npu_python_runtime.h"
 #endif
 
 namespace py = pybind11;
@@ -372,6 +372,6 @@ PYBIND11_MODULE(_kvaf, m) {
   m.def_submodule("access_operator");
 
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
-  kvaf::BindAivBatchGetPythonRuntime(m);
+  kvaf::BindNpuPythonRuntime(m);
 #endif
 }

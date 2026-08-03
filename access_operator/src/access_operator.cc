@@ -1,0 +1,187 @@
+#include "kvaf/access_operator/access_operator.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <utility>
+
+#include "acl/acl.h"
+#include "batch_get_abi.h"
+#include "kvaf_aiv_batch_get.h"
+
+namespace kvaf {
+namespace {
+
+Status InvalidArgument(std::string message) {
+  return Status::Error(StatusCode::kInvalidArgument, std::move(message));
+}
+
+Status InvalidState(std::string message) {
+  return Status::Error(StatusCode::kInvalidState, std::move(message));
+}
+
+Status Internal(std::string message) {
+  return Status::Error(StatusCode::kInternal, std::move(message));
+}
+
+std::uint64_t PointerValue(const void* pointer) {
+  return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(pointer));
+}
+
+bool FitsU32(std::uint64_t value) {
+  return value <= std::numeric_limits<std::uint32_t>::max();
+}
+
+}  // namespace
+
+struct DefaultAccessOperator::Impl {
+  explicit Impl(AccessOperatorConfig init_config) : config(std::move(init_config)) {}
+
+  AccessOperatorConfig config;
+  RemoteRegionDesc remote_region;
+  KvafBatchGetTransport* transport{nullptr};
+  bool initialized{false};
+};
+
+DefaultAccessOperator::DefaultAccessOperator(AccessOperatorConfig config)
+    : impl_(std::make_unique<Impl>(std::move(config))) {}
+
+DefaultAccessOperator::~DefaultAccessOperator() { (void)Shutdown(); }
+
+Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) {
+  if (impl_->initialized) {
+    return InvalidState("AccessOperator has already been initialized");
+  }
+  if (remote_region.base == 0 || remote_region.length == 0 ||
+      impl_->config.kernel_object_path.empty() || impl_->config.stream == nullptr ||
+      impl_->config.npu_core_count == 0 ||
+      impl_->config.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES) {
+    return InvalidArgument("invalid AccessOperator initialization config");
+  }
+  if (KvafExecuteBatchGetLoadKernel(impl_->config.kernel_object_path.c_str()) !=
+      KVAF_BATCH_GET_SUCCESS) {
+    return Internal("failed to load BatchGet kernel");
+  }
+
+  KvafBatchGetTransport* transport = nullptr;
+  const int32_t result = KvafBatchGetTransportCreate(
+      reinterpret_cast<void*>(remote_region.base), remote_region.length,
+      impl_->config.npu_core_count, 1U, &transport);
+  if (result != KVAF_BATCH_GET_SUCCESS || transport == nullptr) {
+    return Internal("failed to create reusable BatchGet transport");
+  }
+  impl_->remote_region = remote_region;
+  impl_->transport = transport;
+  impl_->initialized = true;
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::Shutdown() {
+  if (!impl_->initialized) {
+    return Status::OK();
+  }
+
+  Status result = Status::OK();
+  // BatchGet is synchronous. Synchronize once more before destroying cached
+  // local HBM registrations so a caller cannot tear down an in-flight WQE.
+  if (aclrtSynchronizeStream(static_cast<aclrtStream>(impl_->config.stream)) != ACL_SUCCESS) {
+    result = Internal("BatchGet stream synchronization failed during shutdown");
+  }
+  if (impl_->transport != nullptr) {
+    KvafBatchGetTransportDestroy(impl_->transport);
+  }
+  impl_->transport = nullptr;
+  impl_->remote_region = RemoteRegionDesc{};
+  impl_->initialized = false;
+  return result;
+}
+
+Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
+  if (!impl_->initialized || impl_->transport == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  if (exec.request == nullptr) {
+    return InvalidArgument("BatchGet request must not be null");
+  }
+  const BatchGetRequest& request = *exec.request;
+  const BatchGetExecutionBuffers& execution = request.execution_buffers;
+  if (request.indices.device != DeviceKind::kNpu ||
+      request.output_indices.device != DeviceKind::kNpu ||
+      request.mask.data == nullptr || request.mask.device != DeviceKind::kNpu ||
+      request.output.device != DeviceKind::kNpu ||
+      request.device_access_table.addresses.device != DeviceKind::kNpu ||
+      request.device_access_table.valid.device != DeviceKind::kNpu ||
+      execution.status.data == nullptr || execution.status.device != DeviceKind::kNpu ||
+      execution.queue_state.data == nullptr || execution.queue_state.device != DeviceKind::kNpu ||
+      request.output_block_bytes == 0 || exec.host_access_table.size == 0 ||
+      request.indices.bytes % sizeof(std::int32_t) != 0 ||
+      request.output_indices.bytes != request.indices.bytes ||
+      request.mask.bytes != request.indices.bytes / sizeof(std::int32_t) ||
+      execution.status.bytes < static_cast<std::size_t>(impl_->config.npu_core_count) *
+                                   sizeof(KvafBatchGetCoreStatus) ||
+      execution.queue_state.bytes < static_cast<std::size_t>(impl_->config.npu_core_count) *
+                                        sizeof(KvafBatchGetQueueState)) {
+    return InvalidArgument("BatchGet request does not satisfy the NPU buffer contract");
+  }
+
+  const std::size_t request_count = request.indices.bytes / sizeof(std::int32_t);
+  const std::size_t output_rows = request.output.bytes / request.output_block_bytes;
+  if (!FitsU32(exec.host_access_table.size) || !FitsU32(request_count) ||
+      !FitsU32(output_rows) || !FitsU32(request.output_block_bytes)) {
+    return InvalidArgument("BatchGet dimensions exceed the device ABI");
+  }
+  for (std::size_t index = 0; index < exec.host_access_table.size; ++index) {
+    if (exec.host_access_table.valid[index] != 0 &&
+        exec.host_access_table.lengths[index] != request.output_block_bytes) {
+      return InvalidArgument("NPU BatchGet supports fixed-size valid blocks only");
+    }
+  }
+
+  KvafBatchGetLocalBuffer* local_buffer = nullptr;
+  std::uint64_t channel_entity = 0;
+  if (KvafBatchGetLocalBufferAcquire(impl_->transport, request.output.data,
+                                     request.output.bytes, &local_buffer,
+                                     &channel_entity) != KVAF_BATCH_GET_SUCCESS ||
+      local_buffer == nullptr || channel_entity == 0) {
+    return Internal("failed to acquire caller output for BatchGet");
+  }
+
+  KvafExecuteBatchGetKernelArgs arguments{};
+  arguments.address_table = PointerValue(request.device_access_table.addresses.data);
+  arguments.valid_table = PointerValue(request.device_access_table.valid.data);
+  arguments.indices = PointerValue(request.indices.data);
+  arguments.mask = PointerValue(request.mask.data);
+  arguments.output_indices = PointerValue(request.output_indices.data);
+  arguments.output = PointerValue(request.output.data);
+  arguments.core_status = PointerValue(execution.status.data);
+  arguments.channel_entity = channel_entity;
+  arguments.queue_state = PointerValue(execution.queue_state.data);
+  arguments.table_capacity = static_cast<std::uint32_t>(exec.host_access_table.size);
+  arguments.request_capacity = static_cast<std::uint32_t>(request_count);
+  arguments.output_rows = static_cast<std::uint32_t>(output_rows);
+  arguments.block_bytes = static_cast<std::uint32_t>(request.output_block_bytes);
+  arguments.block_count = impl_->config.npu_core_count;
+
+  const int32_t launch_result = KvafExecuteBatchGetLaunch(
+      &arguments, static_cast<aclrtStream>(impl_->config.stream));
+  if (launch_result != KVAF_BATCH_GET_SUCCESS) {
+    KvafBatchGetLocalBufferRelease(local_buffer);
+    return Internal("failed to launch BatchGet");
+  }
+  const aclError sync_result =
+      aclrtSynchronizeStream(static_cast<aclrtStream>(impl_->config.stream));
+  KvafBatchGetLocalBufferRelease(local_buffer);
+  if (sync_result != ACL_SUCCESS) {
+    return Internal("BatchGet stream synchronization failed");
+  }
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest&) {
+  return Status::Error(StatusCode::kNotImplemented,
+                       "BatchPut is not implemented by the current AccessOperator");
+}
+
+}  // namespace kvaf

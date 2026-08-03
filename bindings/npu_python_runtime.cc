@@ -1,4 +1,4 @@
-#include "aiv_python_runtime.h"
+#include "npu_python_runtime.h"
 
 #include <pybind11/stl.h>
 
@@ -12,7 +12,7 @@
 
 #include "acl/acl.h"
 #include "batch_get_abi.h"
-#include "kvaf/access_operator/aiv_batch_get_access_operator.h"
+#include "kvaf/access_operator/access_operator.h"
 #include "kvaf/meta_manager/meta_manager.h"
 #include "kvaf/runtime/runtime.h"
 
@@ -116,15 +116,15 @@ void* PointerFromValue(std::uint64_t pointer) {
   return reinterpret_cast<void*>(static_cast<std::uintptr_t>(pointer));
 }
 
-class AivPythonRuntime final {
+class NpuRuntime final {
  public:
-  AivPythonRuntime(std::string kernel_object_path, std::uint32_t device_id,
-                   std::uint32_t aiv_core_count)
-      : device_id_(device_id), aiv_core_count_(aiv_core_count),
+  NpuRuntime(std::string kernel_object_path, std::uint32_t device_id,
+             std::uint32_t npu_core_count)
+      : device_id_(device_id), npu_core_count_(npu_core_count),
         meta_manager_(CreateInMemoryMetaManager()) {
-    if (kernel_object_path.empty() || aiv_core_count == 0 ||
-        aiv_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES) {
-      throw py::value_error("invalid AIV BatchGet Runtime configuration");
+    if (kernel_object_path.empty() || npu_core_count == 0 ||
+        npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES) {
+      throw py::value_error("invalid NPU Runtime configuration");
     }
 
     // torch_npu owns process-wide ACL initialisation/finalisation.  The
@@ -134,17 +134,17 @@ class AivPythonRuntime final {
     ThrowIfAclError(aclrtCreateStream(&stream_), "aclrtCreateStream");
 
     allocator_ = std::make_unique<AclHostDdrAllocator>();
-    access_operator_ = std::make_unique<AivBatchGetAccessOperator>(
-        AivBatchGetOperatorConfig{std::move(kernel_object_path), stream_,
-                                  aiv_core_count_});
+    access_operator_ = std::make_unique<DefaultAccessOperator>(
+        AccessOperatorConfig{std::move(kernel_object_path), stream_,
+                             npu_core_count_});
     runtime_ = std::make_unique<Runtime>(*meta_manager_, *access_operator_,
                                          *allocator_);
   }
 
-  ~AivPythonRuntime() { CloseNoThrow(); }
+  ~NpuRuntime() { CloseNoThrow(); }
 
-  AivPythonRuntime(const AivPythonRuntime&) = delete;
-  AivPythonRuntime& operator=(const AivPythonRuntime&) = delete;
+  NpuRuntime(const NpuRuntime&) = delete;
+  NpuRuntime& operator=(const NpuRuntime&) = delete;
 
   void Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
     ThrowIfError(runtime_->Initialize(
@@ -156,7 +156,7 @@ class AivPythonRuntime final {
   }
 
   std::uint32_t DeviceId() const { return device_id_; }
-  std::uint32_t AivCoreCount() const { return aiv_core_count_; }
+  std::uint32_t NpuCoreCount() const { return npu_core_count_; }
 
   py::dict RemoteRegion() const {
     const RemoteRegionDesc& region = runtime_->remote_region();
@@ -234,33 +234,19 @@ class AivPythonRuntime final {
     ThrowIfError(runtime_->ReleaseAccessTable(handle));
   }
 
-  void BindBatchGetOutput(std::uint64_t output_pointer,
-                          std::size_t output_bytes,
-                          std::uint64_t core_status_pointer,
-                          std::size_t core_status_bytes,
-                          std::uint64_t queue_state_pointer,
-                          std::size_t queue_state_bytes) {
-    ThrowIfError(access_operator_->BindBatchGetOutput(AivBatchGetOutputBinding{
-        MutableBufferView{PointerFromValue(output_pointer), output_bytes,
-                          DeviceKind::kNpu},
-        MutableBufferView{PointerFromValue(core_status_pointer), core_status_bytes,
-                          DeviceKind::kNpu},
-        MutableBufferView{PointerFromValue(queue_state_pointer), queue_state_bytes,
-                          DeviceKind::kNpu}}));
-  }
-
-  void UnbindBatchGetOutput() { ThrowIfError(access_operator_->UnbindBatchGetOutput()); }
-
   // All pointers here are supplied by the Python caller, normally as
-  // ``int(tensor.data_ptr())`` from torch_npu tensors.  No tensor ownership is
+  // ``int(tensor.data_ptr())`` from torch_npu tensors. No tensor ownership is
   // transferred; the caller must keep every tensor alive until this method
-  // returns and must keep output/status/queue alive until unbind/shutdown.
+  // returns. Output/status/queue are execution buffers, so a later BatchGet
+  // may use another caller-owned output pointer.
   double BatchGet(const AccessTableHandle& access_table,
                   std::uint64_t indices_pointer, std::size_t indices_bytes,
                   std::uint64_t mask_pointer, std::size_t mask_bytes,
                   std::uint64_t output_indices_pointer,
                   std::size_t output_indices_bytes,
                   std::uint64_t output_pointer, std::size_t output_bytes,
+                  std::uint64_t status_pointer, std::size_t status_bytes,
+                  std::uint64_t queue_state_pointer, std::size_t queue_state_bytes,
                   std::uint64_t output_block_bytes,
                   std::uint64_t address_table_pointer,
                   std::size_t address_table_bytes,
@@ -281,7 +267,12 @@ class AivPythonRuntime final {
             ConstBufferView{PointerFromValue(address_table_pointer),
                             address_table_bytes, DeviceKind::kNpu},
             ConstBufferView{PointerFromValue(valid_table_pointer),
-                            valid_table_bytes, DeviceKind::kNpu}}};
+                            valid_table_bytes, DeviceKind::kNpu}},
+        BatchGetExecutionBuffers{
+            MutableBufferView{PointerFromValue(status_pointer), status_bytes,
+                              DeviceKind::kNpu},
+            MutableBufferView{PointerFromValue(queue_state_pointer), queue_state_bytes,
+                              DeviceKind::kNpu}}};
     const auto begin = std::chrono::steady_clock::now();
     ThrowIfError(runtime_->BatchGet(request));
     const auto end = std::chrono::steady_clock::now();
@@ -314,47 +305,44 @@ class AivPythonRuntime final {
   }
 
   std::uint32_t device_id_{0};
-  std::uint32_t aiv_core_count_{0};
+  std::uint32_t npu_core_count_{0};
   aclrtStream stream_{nullptr};
   std::unique_ptr<MetaManager> meta_manager_;
   std::unique_ptr<AclHostDdrAllocator> allocator_;
-  std::unique_ptr<AivBatchGetAccessOperator> access_operator_;
+  std::unique_ptr<DefaultAccessOperator> access_operator_;
   std::unique_ptr<Runtime> runtime_;
 };
 
 }  // namespace
 
-void BindAivBatchGetPythonRuntime(py::module_& module) {
-  py::class_<AivPythonRuntime>(module, "AivBatchGetRuntime")
+void BindNpuPythonRuntime(py::module_& module) {
+  py::class_<NpuRuntime>(module, "NpuRuntime")
       .def(py::init<std::string, std::uint32_t, std::uint32_t>(),
            py::arg("kernel_object_path"), py::arg("device_id") = 0,
-           py::arg("aiv_core_count") = 1)
-      .def("initialize", &AivPythonRuntime::Initialize, py::arg("ddr_bytes"),
+           py::arg("npu_core_count") = 1)
+      .def("initialize", &NpuRuntime::Initialize, py::arg("ddr_bytes"),
            py::arg("slot_size"))
-      .def("shutdown", &AivPythonRuntime::Shutdown)
-      .def_property_readonly("initialized", &AivPythonRuntime::Initialized)
-      .def_property_readonly("device_id", &AivPythonRuntime::DeviceId)
-      .def_property_readonly("aiv_core_count", &AivPythonRuntime::AivCoreCount)
-      .def_property_readonly("remote_region", &AivPythonRuntime::RemoteRegion)
-      .def("seed_fixed_blocks", &AivPythonRuntime::SeedFixedBlocks,
+      .def("shutdown", &NpuRuntime::Shutdown)
+      .def_property_readonly("initialized", &NpuRuntime::Initialized)
+      .def_property_readonly("device_id", &NpuRuntime::DeviceId)
+      .def_property_readonly("npu_core_count", &NpuRuntime::NpuCoreCount)
+      .def_property_readonly("remote_region", &NpuRuntime::RemoteRegion)
+      .def("seed_fixed_blocks", &NpuRuntime::SeedFixedBlocks,
            py::arg("keys"), py::arg("blocks"))
-      .def("prepare_access_table", &AivPythonRuntime::PrepareAccessTable,
+      .def("prepare_access_table", &NpuRuntime::PrepareAccessTable,
            py::arg("keys"))
-      .def("access_table_view", &AivPythonRuntime::AccessTableView,
+      .def("access_table_view", &NpuRuntime::AccessTableView,
            py::arg("access_table"))
-      .def("release_access_table", &AivPythonRuntime::ReleaseAccessTable,
+      .def("release_access_table", &NpuRuntime::ReleaseAccessTable,
            py::arg("access_table"))
-      .def("bind_batch_get_output", &AivPythonRuntime::BindBatchGetOutput,
-           py::arg("output_pointer"), py::arg("output_bytes"),
-           py::arg("core_status_pointer"), py::arg("core_status_bytes"),
-           py::arg("queue_state_pointer"), py::arg("queue_state_bytes"))
-      .def("unbind_batch_get_output", &AivPythonRuntime::UnbindBatchGetOutput)
-      .def("batch_get", &AivPythonRuntime::BatchGet,
+      .def("batch_get", &NpuRuntime::BatchGet,
            py::arg("access_table"), py::arg("indices_pointer"),
            py::arg("indices_bytes"), py::arg("mask_pointer"),
            py::arg("mask_bytes"), py::arg("output_indices_pointer"),
            py::arg("output_indices_bytes"), py::arg("output_pointer"),
-           py::arg("output_bytes"), py::arg("output_block_bytes"),
+           py::arg("output_bytes"), py::arg("status_pointer"),
+           py::arg("status_bytes"), py::arg("queue_state_pointer"),
+           py::arg("queue_state_bytes"), py::arg("output_block_bytes"),
            py::arg("address_table_pointer"), py::arg("address_table_bytes"),
            py::arg("valid_table_pointer"), py::arg("valid_table_bytes"),
            "Run synchronous Runtime.BatchGet and return call-to-stream-completion milliseconds.");

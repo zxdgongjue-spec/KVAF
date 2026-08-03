@@ -30,8 +30,9 @@ Runtime 持有且负责释放：内部 DDR、AccessTable 状态和 Key 稳定性
 index/mask/output-index/output buffer，以及 NPU 上的 address/valid 表。Runtime
 不会为这些调用方 buffer 分配、释放、隐式复制或注册链路。
 
-NPU `AivBatchGetAccessOperator::BindBatchGetOutput` 必须由调用方或测试在
-Graph Capture 前完成；它接收 caller-owned output/status/queue buffer。
+调用方也持有 NPU BatchGet 的 `status` 和 `queue_state` buffer。它们与
+`output` 一样在每次 `BatchGetRequest` 中传给 Runtime，再由 Operator 在本次
+执行中 Acquire 对应的 local HBM MR；没有固定的 output 绑定 API。
 
 ## 测试
 
@@ -53,9 +54,9 @@ AIV 或 Direct-HCCP 的替身，因此不能作为 NPU 数据面验证结论。
 ## A5 / CANN BatchGet 集成
 
 `KVAF_ENABLE_AIV_BATCH_GET=ON` 配合 `KVAF_BUILD_PYTHON=ON` 会构建 merged
-demo 的 kernel/host 库、`AivBatchGetAccessOperator` 和
-`kvaf.AivBatchGetRuntime`。Python 脚本创建 NPU Tensor、显式注册
-output/status/queue 链路，再直接调用同步 `batch_get`：
+demo 的 kernel/host 库、`DefaultAccessOperator` 和 `kvaf.NpuRuntime`。
+Python 脚本创建 NPU Tensor，并在每次同步 `batch_get` 中直接传入
+output/status/queue：
 
 ```bash
 cmake -S . -B build-aiv -DBUILD_TESTING=ON \
@@ -68,14 +69,14 @@ KVAF_RUN_NPU_TESTS=1 \
 KVAF_AIV_BATCH_GET_KERNEL="$PWD/build-aiv/bin/kvaf_execute_batch_get_kernels.o" \
 DEVICE_ID=0 \
 PYTHONPATH="$PWD/build-aiv/python" \
-timeout 240s python3 tests/python/test_aiv_batch_get_npu.py
+timeout 240s python3 tests/python/test_npu_batch_get.py
 ```
 
-该脚本用小规模 eager case 验证 Runtime 初始化、调用方 Device buffer/链路
-注册、Runtime BatchGet、设备完成、输出字节和 teardown。AIV demo 尚未实现
-`BatchPut`，因此测试的 `seed_fixed_blocks` 只用于把固定大小的测试数据写入
-Runtime-owned DDR；它不宣称验证 BatchPut。BatchPut operator 合入后应改为
-`runtime.batch_put`。
+该脚本用小规模 case 验证 Runtime 初始化、调用方 Device buffer、Runtime
+BatchGet、设备完成、输出字节、`output A -> B -> A` 的 local-buffer 缓存复用及
+teardown。当前 demo 尚未实现 `BatchPut`，因此测试的 `seed_fixed_blocks` 只用于
+把固定大小的测试数据写入 Runtime-owned DDR；它不宣称验证 BatchPut。BatchPut
+operator 合入后应改为 `runtime.batch_put`。
 
 正确性验证完成后，脚本会输出
 `PERF_RESULT metric=runtime_batch_get_call_to_stream_completion`。这个计时窗口

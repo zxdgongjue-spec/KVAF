@@ -43,6 +43,14 @@ struct AccessTableDeviceView {
   }
 };
 
+// Caller-owned NPU buffers used by the current synchronous BatchGet kernel
+// for per-core completion state and queue state. They are execution inputs,
+// not operator-initialization state, so each BatchGet call supplies them.
+struct BatchGetExecutionBuffers {
+  MutableBufferView status;
+  MutableBufferView queue_state;
+};
+
 struct BatchGetRequest {
   AccessTableHandle access_table;
 
@@ -55,6 +63,10 @@ struct BatchGetRequest {
 
   // CPU path 留空。NPU path 必须由调用方提供与 handle 对应的稳定 Device 表。
   AccessTableDeviceView device_access_table;
+
+  // CPU Mock path ignores these. The current NPU BatchGet path requires both
+  // buffers and keeps their ownership with the caller.
+  BatchGetExecutionBuffers execution_buffers;
 };
 
 struct BatchPutRequest {

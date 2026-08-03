@@ -11,10 +11,10 @@ target_include_directories(_kvaf
 )
 
 if(KVAF_ENABLE_AIV_BATCH_GET)
-  target_sources(_kvaf PRIVATE aiv_python_runtime.cc)
+  target_sources(_kvaf PRIVATE npu_python_runtime.cc)
   target_link_libraries(_kvaf
     PRIVATE
-      kvaf_aiv_batch_get_operator
+      kvaf_default_access_operator
       kvaf_execute_batch_get_host
       ascendcl
   )

@@ -78,7 +78,7 @@ runtime.shutdown()
 ```
 
 Mock API 走 Runtime/MetaManager 的实际代码路径，适合本地功能测试。它不把
-MPS 当作 NPU；A5/CANN 集成需要 AIV AccessOperator 的专用 Python backend。
-启用该 backend 后，Python 以 NPU Tensor 的 `data_ptr()` 直接注册调用方的
-output/status/queue buffer 并调用 `kvaf.AivBatchGetRuntime.batch_get`；完整
+MPS 当作 NPU；A5/CANN 集成需要 NPU Python backend。启用该 backend 后，Python
+以 NPU Tensor 的 `data_ptr()` 在每次调用中传入 caller-owned
+output/status/queue buffer 并调用 `kvaf.NpuRuntime.batch_get`；完整
 构建和测试命令见 [`runtime/README.md`](runtime/README.md)。
