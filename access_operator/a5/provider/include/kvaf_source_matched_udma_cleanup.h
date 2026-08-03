@@ -286,6 +286,7 @@ failure:
 enum kvaf_udma_queue_memory_policy {
     KVAF_UDMA_QUEUE_MEMORY_AUTO = 0,
     KVAF_UDMA_QUEUE_MEMORY_KERNEL_BUFFER,
+    KVAF_UDMA_QUEUE_MEMORY_USER_ANONYMOUS,
 };
 
 static inline int kvaf_udma_checked_alloc_queue_buffer_policy(
@@ -303,7 +304,8 @@ static inline int kvaf_udma_checked_alloc_queue_buffer_policy(
         (base_block_size & (base_block_size - 1U)) != 0U ||
         (page_size & (page_size - 1U)) != 0U ||
         (memory_policy != KVAF_UDMA_QUEUE_MEMORY_AUTO &&
-         memory_policy != KVAF_UDMA_QUEUE_MEMORY_KERNEL_BUFFER)) {
+         memory_policy != KVAF_UDMA_QUEUE_MEMORY_KERNEL_BUFFER &&
+         memory_policy != KVAF_UDMA_QUEUE_MEMORY_USER_ANONYMOUS)) {
         return -1;
     }
     if (queue->cstm || queue->dtu_en || queue->sq_reserved) {
@@ -347,12 +349,17 @@ static inline int kvaf_udma_checked_alloc_queue_buffer_policy(
             return -1;
         }
     } else {
-        const off_t offset = get_mmap_offset(0,
+        const bool user_anonymous =
+            memory_policy == KVAF_UDMA_QUEUE_MEMORY_USER_ANONYMOUS;
+        const off_t offset = user_anonymous ? 0 : get_mmap_offset(0,
             queue->ctx->page_size, UDMA_MMAP_KERNEL_BUF);
+        const int flags = user_anonymous ?
+            (MAP_PRIVATE | MAP_ANONYMOUS) : MAP_SHARED;
+        const int fd = user_anonymous ? -1 :
+            queue->ctx->urma_ctx.dev_fd;
 
         queue->qbuf = mmap(NULL, queue->qbuf_size,
-            PROT_READ | PROT_WRITE, MAP_SHARED,
-            queue->ctx->urma_ctx.dev_fd, offset);
+            PROT_READ | PROT_WRITE, flags, fd, offset);
         if (queue->qbuf == MAP_FAILED) {
             queue->qbuf = NULL;
             free(queue->wrid);
@@ -378,9 +385,10 @@ static inline int kvaf_udma_checked_alloc_queue_buffer(
         allocate_wrid, KVAF_UDMA_QUEUE_MEMORY_AUTO);
 }
 
-static inline int kvaf_udma_checked_alloc_sw_db(
+static inline int kvaf_udma_checked_alloc_sw_db_policy(
     struct udma_u_context *context, enum udma_db_type type,
-    uint32_t **doorbell_out)
+    uint32_t **doorbell_out,
+    enum kvaf_udma_queue_memory_policy memory_policy)
 {
     struct udma_u_db_page *page;
     uint32_t position;
@@ -389,11 +397,27 @@ static inline int kvaf_udma_checked_alloc_sw_db(
     if (context == NULL || doorbell_out == NULL ||
         (uint32_t)type >= UDMA_DB_TYPE_NUM ||
         context->page_size < UDMA_DB_SIZE ||
-        (context->page_size & (context->page_size - 1U)) != 0U) {
+        (context->page_size & (context->page_size - 1U)) != 0U ||
+        (memory_policy != KVAF_UDMA_QUEUE_MEMORY_AUTO &&
+         memory_policy != KVAF_UDMA_QUEUE_MEMORY_KERNEL_BUFFER &&
+         memory_policy != KVAF_UDMA_QUEUE_MEMORY_USER_ANONYMOUS) ||
+        (memory_policy == KVAF_UDMA_QUEUE_MEMORY_USER_ANONYMOUS &&
+         type != UDMA_JFR_TYPE_DB)) {
         return -1;
     }
     *doorbell_out = NULL;
     if (pthread_mutex_lock(&context->db_list_mutex) != 0) {
+        return -1;
+    }
+    /*
+     * An anonymous management record DB must never silently reuse a page
+     * created under another backing policy.  Conversely, its one-slot page
+     * is marked full below so later AUTO data JFRs cannot reuse it.
+     */
+    if (memory_policy == KVAF_UDMA_QUEUE_MEMORY_USER_ANONYMOUS &&
+        context->db_list[type] != NULL) {
+        errno = EBUSY;
+        (void)pthread_mutex_unlock(&context->db_list_mutex);
         return -1;
     }
     for (page = context->db_list[type]; page != NULL; page = page->next) {
@@ -414,7 +438,8 @@ static inline int kvaf_udma_checked_alloc_sw_db(
             free(page);
             goto failure;
         }
-        if (type == UDMA_JFR_PAYLOAD) {
+        if (memory_policy == KVAF_UDMA_QUEUE_MEMORY_USER_ANONYMOUS ||
+            type == UDMA_JFR_PAYLOAD) {
             page->buf.buf = mmap(NULL, page->buf.length,
                 PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -453,6 +478,9 @@ static inline int kvaf_udma_checked_alloc_sw_db(
         position * UDMA_DB_SIZE);
     **doorbell_out = 0U;
     ++page->use_cnt;
+    if (memory_policy == KVAF_UDMA_QUEUE_MEMORY_USER_ANONYMOUS) {
+        page->num_db = page->use_cnt;
+    }
     if (new_page &&
         madvise(page->buf.buf, page->buf.length, MADV_DONTFORK) != 0) {
         /* Page remains linked and the returned slot is the cleanup handle. */
@@ -466,6 +494,14 @@ static inline int kvaf_udma_checked_alloc_sw_db(
 failure:
     (void)pthread_mutex_unlock(&context->db_list_mutex);
     return -1;
+}
+
+static inline int kvaf_udma_checked_alloc_sw_db(
+    struct udma_u_context *context, enum udma_db_type type,
+    uint32_t **doorbell_out)
+{
+    return kvaf_udma_checked_alloc_sw_db_policy(
+        context, type, doorbell_out, KVAF_UDMA_QUEUE_MEMORY_AUTO);
 }
 
 /*

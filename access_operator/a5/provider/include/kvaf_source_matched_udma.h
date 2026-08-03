@@ -291,15 +291,17 @@ void kvaf_udma_source_reset_jfr_failure(void);
 
 /*
  * Management JFRs retain the public URMA validation/refcount path.  The
- * Device provider supplies a one-call RQ allocation policy so its small
- * control-plane receive queue uses the pinned UDMA_MMAP_KERNEL_BUF path;
- * Host management and every ordinary/data JFR keep the provider's default
- * capability-driven hugepage policy.
+ * Device provider supplies a one-call mapping policy for the management
+ * JFR's RQ, index queue, and record DB.  Non-separated SVA uses the
+ * known-working user-anonymous pinned family; separated SVA keeps the
+ * official kernel-buffer family.  The sleep DB stays anonymous through the
+ * normal payload path.  Host management and every ordinary/data JFR keep
+ * AUTO.
  */
 urma_jfr_t *kvaf_udma_source_create_management_jfr(
     urma_context_t *context, urma_jfr_cfg_t *config);
 
-const char *kvaf_udma_source_management_jfr_rq_memory(void);
+const char *kvaf_udma_source_management_jfr_memory_policy(void);
 
 /*
  * A create operation can return NULL after the kernel or UMMU has already

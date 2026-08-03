@@ -106,6 +106,17 @@ class Npu2CleanValidationTests(unittest.TestCase):
             "kvaf_tee_rc=${kvaf_pipeline_status[1]}",
             "console evidence write failed",
             "KVAF_JFR_KERNEL_TAIL_BEGIN",
+            "/sys/kernel/tracing",
+            "/sys/kernel/debug/tracing",
+            "available_filter_functions",
+            "uburma_cmd_create_jfr",
+            "ubcore_create_jfr",
+            "udma_create_jfr",
+            "function_graph",
+            "set_graph_function",
+            "KVAF_JFR_FUNCTION_GRAPH_ROOT=",
+            "KVAF_JFR_FUNCTION_GRAPH_TAIL_BEGIN",
+            "No hardware operation was attempted and no one-shot trace directory was consumed.",
         ):
             self.assertIn(required, trace)
         for forbidden in ("npu-smi set", "docker rm", "rm -f", "kill "):

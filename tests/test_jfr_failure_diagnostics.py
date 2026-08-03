@@ -449,7 +449,7 @@ class JfrFailureDiagnosticsTests(unittest.TestCase):
         share_call = parser.index('KVAF_ADD_ARG("--share_jfr")')
         self.assertLess(share_call, parse_call)
 
-    def test_device_management_jfr_uses_one_call_kernel_buffer_policy(
+    def test_device_management_jfr_uses_one_call_user_anonymous_policy(
         self,
     ) -> None:
         policy = braced_body(
@@ -457,6 +457,7 @@ class JfrFailureDiagnosticsTests(unittest.TestCase):
         )
         self.assertIn("KVAF_UDMA_QUEUE_MEMORY_AUTO", policy)
         self.assertIn("KVAF_UDMA_QUEUE_MEMORY_KERNEL_BUFFER", policy)
+        self.assertIn("KVAF_UDMA_QUEUE_MEMORY_USER_ANONYMOUS", policy)
 
         allocator = braced_body(
             self.cleanup,
@@ -468,6 +469,9 @@ class JfrFailureDiagnosticsTests(unittest.TestCase):
             r"[\s\S]*?queue->ctx->hugepage_enable",
         )
         self.assertIn("UDMA_MMAP_KERNEL_BUF", allocator)
+        self.assertIn("KVAF_UDMA_QUEUE_MEMORY_USER_ANONYMOUS", allocator)
+        self.assertIn("MAP_PRIVATE | MAP_ANONYMOUS", allocator)
+        self.assertRegex(allocator, r"user_anonymous\s*\?\s*-1")
         self.assertNotIn("queue->ctx->hugepage_enable =", allocator)
 
         default_allocator = braced_body(
@@ -478,21 +482,101 @@ class JfrFailureDiagnosticsTests(unittest.TestCase):
             "KVAF_UDMA_QUEUE_MEMORY_AUTO", default_allocator
         )
 
+        index_allocator = braced_body(
+            self.jfr, "static int kvaf_alloc_jfr_index_checked("
+        )
+        self.assertIn(
+            "KVAF_UDMA_QUEUE_MEMORY_USER_ANONYMOUS", index_allocator
+        )
+        self.assertIn("MAP_PRIVATE | MAP_ANONYMOUS", index_allocator)
+        self.assertIn("UDMA_MMAP_KERNEL_BUF", index_allocator)
+
+        db_allocator = braced_body(
+            self.cleanup,
+            "static inline int kvaf_udma_checked_alloc_sw_db_policy(",
+        )
+        self.assertIn(
+            "KVAF_UDMA_QUEUE_MEMORY_USER_ANONYMOUS", db_allocator
+        )
+        self.assertIn("MAP_PRIVATE | MAP_ANONYMOUS", db_allocator)
+        self.assertRegex(
+            db_allocator,
+            r"memory_policy\s*==\s*"
+            r"KVAF_UDMA_QUEUE_MEMORY_USER_ANONYMOUS[\s\S]*?"
+            r"context->db_list\[type\]\s*!=\s*NULL[\s\S]*?"
+            r"errno\s*=\s*EBUSY[\s\S]*?return\s+-1",
+        )
+        self.assertIn("page->num_db = page->use_cnt", db_allocator)
+        self.assertIn("type == UDMA_JFR_PAYLOAD", db_allocator)
+
+        default_db_allocator = braced_body(
+            self.cleanup,
+            "static inline int kvaf_udma_checked_alloc_sw_db(",
+        )
+        self.assertIn(
+            "KVAF_UDMA_QUEUE_MEMORY_AUTO", default_db_allocator
+        )
+
         checked_create = braced_body(
             self.jfr, "urma_jfr_t *kvaf_udma_create_jfr_checked("
         )
         self.assertIn(
-            "rq_memory_policy = g_kvaf_next_jfr_rq_memory",
+            "jfr_memory_policy = g_kvaf_next_jfr_memory_policy",
             checked_create,
         )
         self.assertIn(
-            "g_kvaf_next_jfr_rq_memory = KVAF_UDMA_QUEUE_MEMORY_AUTO",
+            "g_kvaf_next_jfr_memory_policy = "
+            "KVAF_UDMA_QUEUE_MEMORY_AUTO",
             checked_create,
+        )
+        consume = checked_create.index(
+            "jfr_memory_policy = g_kvaf_next_jfr_memory_policy"
+        )
+        reset = checked_create.index(
+            "g_kvaf_next_jfr_memory_policy = "
+            "KVAF_UDMA_QUEUE_MEMORY_AUTO"
+        )
+        first_failure = checked_create.index("if (context == NULL")
+        self.assertLess(consume, reset)
+        self.assertLess(reset, first_failure)
+        validate_context = checked_create.index(
+            "KVAF_UDMA_JFR_FAILURE_VALIDATE_CONTEXT"
+        )
+        allocate_index = checked_create.index(
+            "kvaf_alloc_jfr_index_checked("
+        )
+        create_command = checked_create.index(
+            "kvaf_create_direct_jfr_command("
+        )
+        self.assertLess(validate_context, allocate_index)
+        self.assertLess(validate_context, create_command)
+        self.assertRegex(
+            checked_create,
+            r"jfr_memory_policy\s*==\s*"
+            r"KVAF_UDMA_QUEUE_MEMORY_AUTO[\s\S]*?"
+            r"g_kvaf_last_management_jfr_memory_policy\s*=\s*"
+            r"KVAF_UDMA_QUEUE_MEMORY_AUTO",
+        )
+        self.assertRegex(
+            checked_create,
+            r"kvaf_alloc_jfr_index_checked\s*\("
+            r"state,\s*jfr_memory_policy\s*\)",
         )
         self.assertRegex(
             checked_create,
             r"kvaf_udma_checked_alloc_queue_buffer_policy\s*\("
-            r"[\s\S]*?&jfr->rq[\s\S]*?rq_memory_policy\s*\)",
+            r"[\s\S]*?&jfr->rq[\s\S]*?jfr_memory_policy\s*\)",
+        )
+        self.assertRegex(
+            checked_create,
+            r"kvaf_udma_checked_alloc_sw_db_policy\s*\("
+            r"[\s\S]*?UDMA_JFR_TYPE_DB[\s\S]*?"
+            r"jfr_memory_policy\s*\)",
+        )
+        self.assertRegex(
+            checked_create,
+            r"kvaf_udma_checked_alloc_sw_db\s*\("
+            r"[\s\S]*?UDMA_JFR_PAYLOAD[\s\S]*?&sleep_db\s*\)",
         )
 
         management_wrapper = braced_body(
@@ -501,17 +585,30 @@ class JfrFailureDiagnosticsTests(unittest.TestCase):
         )
         self.assertIn("KVAF_UDMA_PROVIDER_ROLE_DEVICE", management_wrapper)
         self.assertIn(
+            "KVAF_UDMA_QUEUE_MEMORY_USER_ANONYMOUS", management_wrapper
+        )
+        self.assertIn(
             "KVAF_UDMA_QUEUE_MEMORY_KERNEL_BUFFER", management_wrapper
         )
+        self.assertIn("sva_sep_mode_en", management_wrapper)
         self.assertEqual(management_wrapper.count("urma_create_jfr("), 2)
         self.assertGreaterEqual(
             management_wrapper.count(
-                "g_kvaf_next_jfr_rq_memory = "
+                "g_kvaf_next_jfr_memory_policy = "
                 "KVAF_UDMA_QUEUE_MEMORY_AUTO"
             ),
             1,
         )
         self.assertNotIn("hugepage_enable =", management_wrapper)
+        memory_marker = braced_body(
+            self.jfr,
+            "const char *kvaf_udma_source_management_jfr_memory_policy(",
+        )
+        self.assertIn(
+            "anonymous-pinned-known-working-v1", memory_marker
+        )
+        self.assertIn("kernel-buffer-pinned-v1", memory_marker)
+        self.assertIn("capability-default-v1", memory_marker)
 
         management_create = braced_body(
             self.communication,
@@ -522,7 +619,7 @@ class JfrFailureDiagnosticsTests(unittest.TestCase):
             management_create,
         )
         self.assertIn(
-            "KVAF_URMA_MGMT_JFR_RQ_MEMORY", management_create
+            "KVAF_URMA_MGMT_JFR_MEMORY_POLICY", management_create
         )
 
         data_create = braced_body(
@@ -539,6 +636,15 @@ class JfrFailureDiagnosticsTests(unittest.TestCase):
                 "kvaf_udma_checked_alloc_queue_buffer_policy(", source
             )
 
+        cleanup = braced_body(
+            self.jfr, "static int kvaf_cleanup_local_jfr_checked("
+        )
+        self.assertEqual(
+            cleanup.count("kvaf_udma_checked_free_sw_db("), 2
+        )
+        self.assertIn("kvaf_udma_checked_free_queue_buffer(", cleanup)
+        self.assertIn("kvaf_free_jfr_index_checked(", cleanup)
+
         cmake = read_source("access_operator/a5/provider/CMakeLists.txt")
         self.assertIn("KVAF_UDMA_PROVIDER_ROLE_HOST=1", cmake)
         self.assertIn("KVAF_UDMA_PROVIDER_ROLE_DEVICE=1", cmake)
@@ -547,18 +653,18 @@ class JfrFailureDiagnosticsTests(unittest.TestCase):
         builder = read_source("scripts/build_a5_direct_urma_provider.sh")
         package = read_source("scripts/package_a5_direct_urma_aicpu.sh")
         contract = (
-            "management_device_jfr_rq_memory:"
-            "kernel-buffer-pinned-v1"
+            "management_device_jfr_memory_policy:"
+            "sva-aware-anonymous-or-kernel-v1"
         )
         self.assertIn(contract, manifest)
         self.assertIn(
-            "management_device_jfr_rq_memory="
-            "kernel-buffer-pinned-v1",
+            "management_device_jfr_memory_policy="
+            "sva-aware-anonymous-or-kernel-v1",
             builder,
         )
         self.assertIn(
-            "MANAGEMENT_DEVICE_JFR_RQ_MEMORY="
-            "kernel-buffer-pinned-v1",
+            "MANAGEMENT_DEVICE_JFR_MEMORY_POLICY="
+            "sva-aware-anonymous-or-kernel-v1",
             package,
         )
 

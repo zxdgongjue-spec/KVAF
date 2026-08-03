@@ -276,7 +276,7 @@ kvaf_verify_direct_provider_build_v3()
     'urma_common_dt_needed:absent' \
     'perftest_source:official-umdk' \
     'perftest_management:official-umdk-ub-default-tcp-fallback-v1' \
-    'management_device_jfr_rq_memory:kernel-buffer-pinned-v1' \
+    'management_device_jfr_memory_policy:sva-aware-anonymous-or-kernel-v1' \
     'udma_provider_mode:official-umdk-source-built-internal' \
     'udma_source_capability_magic:0x4b56414655444d41' \
     'udma_runtime_capability:0x0000000000020001' \

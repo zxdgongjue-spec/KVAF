@@ -1109,6 +1109,22 @@ static int kvaf_ub_jfr_creation_error(
         stage, wrapper_errno, effective_errno,
         failure.operation_status, failure_valid,
         (int)failure.stage, failure_valid);
+    if (g_kvaf_management_diagnostic.stage ==
+        KVAF_URMA_MANAGEMENT_STAGE_CREATE_JFR) {
+        const char *memory_marker =
+            kvaf_udma_source_management_jfr_memory_policy();
+
+        if (failure_valid && failure.context_sva_sep_mode != 0U) {
+            g_kvaf_management_diagnostic.flags |=
+                KVAF_URMA_MANAGEMENT_DIAGNOSTIC_JFR_CONTEXT_SVA_SEPARATE;
+        }
+        if (memory_marker != NULL &&
+            strcmp(memory_marker,
+                "anonymous-pinned-known-working-v1") == 0) {
+            g_kvaf_management_diagnostic.flags |=
+                KVAF_URMA_MANAGEMENT_DIAGNOSTIC_JFR_USER_ANONYMOUS_MEMORY;
+        }
+    }
     return kvaf_ub_management_error(
         stage, effective_errno, fallback_errno);
 }
@@ -1383,9 +1399,9 @@ static int kvaf_ub_create_local_resources_checked(
             "create_jfr", errno, EIO);
     }
     (void)fprintf(stderr,
-        "KVAF_URMA_MGMT_JFR_RQ_MEMORY role=%s backing=%s\n",
+        "KVAF_URMA_MGMT_JFR_MEMORY_POLICY role=%s policy=%s\n",
         cfg->dst_eid == NULL ? "server" : "client",
-        kvaf_udma_source_management_jfr_rq_memory());
+        kvaf_udma_source_management_jfr_memory_policy());
     (void)fflush(stderr);
 
     ctx->is_server = cfg->dst_eid == NULL;

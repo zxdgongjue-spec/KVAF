@@ -1068,14 +1068,15 @@ AICPU stderr 未被完整转发，也能从 Device owner progress 恢复失败�
 失败；不得仅凭原来的通用 `EIO` 修改地址或销毁策略。
 
 若 clean NPU2 的 Device 仍在 `create_jfr/create_command` 返回 `EINVAL`，不要切换
-`non_pin`、custom queue、DTU 或匿名 RQ/index。先在服务器 B 宿主机执行一次
-`scripts/trace_a5_direct_urma_npu2_jfr_failure.sh`。脚本以
-`boot-id + KVAF commit` 创建不可覆盖的一次性证据目录，执行一轮 zero-WQE，并用
-`journalctl` cursor（不可用时退化为只读 `dmesg`）保存同时段 `UDMA/uburma/ubcore/
-JFR/JFC` 内核日志。它拒绝已有 active/quarantine，不会向 KVAF worker 发信号、复位
-NPU 或删除已有状态；下层构建/打包会原子更新生成物，runner 只会清理本次且已证明
-安全终止的 active 状态。若只能使用无时间范围的 dmesg，metadata 会明确标记
-`dmesg-ring-unscoped-fallback`，不能把旧错误当成本轮证据。
+`non_pin`、custom queue 或 DTU。先在服务器 B 宿主机执行一次
+`scripts/trace_a5_direct_urma_npu2_jfr_failure.sh`。脚本在消耗
+`boot-id + KVAF commit` 一次性身份前，要求 tracefs 独立 instance 和至少一个已加载的
+`uburma_cmd_create_jfr`、`ubcore_create_jfr`、`udma_create_jfr` 根符号。随后仅执行一轮
+zero-WQE，用 `function_graph` 保存原始 CREATE_JFR 的内核调用树/返回值，同时用
+`journalctl` cursor（不可用时退化为只读 `dmesg`）保存同时间段内核日志。若 tracefs
+能力不足，脚本在任何硬件操作和一次性目录创建前退出，不会浪费该 commit 的实验。
+它拒绝已有 active/quarantine，不向 KVAF worker 发信号、不复位 NPU、不删除已有状态，
+且退出 trap 只关闭和移除自己的 tracefs instance。
 
 Device Open 结果的 `reserved[9..10]` 同时带回只读 JFR 命令摘要：完整 64 位 JFC
 handle、JFC ID、context page shift、`F_GETFD` errno，以及 UDATA 地址/大小、RQ/index
@@ -1088,19 +1089,24 @@ identity 修 JFC 所有权；若是 `in_len/in_addr`，修加载模块与固定 
 失败，再评估 Host-owned resource owner。该证据出现前不引入 HCCP，因为当前失败仍
 早于 Jetty/TP/import 阶段。
 
-`aff4de9` 的一次性证据给出 `jfr_command_flags=0x9ffff`：RQ/index/UDATA、
-context fd 和 JFC 创建时 sidecar identity 的 bits 0..16 全部成立，
-`non_pin=0`、`dtu=0`，唯一额外分支是 `is_hugepage=1`。参考 UDMA 驱动会在
-JFR RQ 的 `udma_occupy_u_hugepage()` 找不到该 AICPU VA 时把错误折成
-`EINVAL`。因此 Device 管理 JFR 只把这个小 RQ 改为固定 UMDK 的
-`UDMA_MMAP_KERNEL_BUF` 路径；命令仍携带原 UDATA、`non_pin=0`、`dtu=0`，
-并且仍只发送一次 CREATE_JFR。Host 管理 JFR、JFC、Jetty 和 decode 数据面
-JFR/SQ/CQ 继续使用 capability 驱动的原分配策略。
+`aff4de9` 的证据只证明 hugepage 失败；`f465ef1` 把 Device 管理 RQ 改成
+`UDMA_MMAP_KERNEL_BUF` 后仍失败，证明不能把 index、record DB 或更上层
+TLV/uobject/EID 检查排除。所提供的两个旧工作 UDMA userspace 实现都让 RQ、index、
+record DB 使用 `MAP_PRIVATE|MAP_ANONYMOUS`，sleep DB 也使用匿名页；而 26.06 UMDK
+在引入 separate-page-table 支持时，把前三者改成 kernel buffer、只保留 sleep DB 匿名。
 
-普通 RQ 仍由 driver pin，并在删除 kernel JFR 后由 checked `munmap` 释放；
-该兼容策略不改变现有销毁状态机。若仍在 CREATE_JFR 失败，命令快照应从
-`0x9ffff` 变为 `0x1ffff`、`jfr_hugepage=0`，然后按新的 errno/内核日志继续
-定位；不得在同一 session 原地回退 hugepage 或尝试 `non_pin`。
+因此 Device 管理 JFR 使用一次性、SVA-aware 的完整内存策略：若 context 的
+`sva_sep_mode_en=0`，RQ、index、record DB 采用旧工作实现已验证的 anonymous pinned
+family；若为 1，则保持官方 kernel-buffer family。sleep DB 继续走原 payload 匿名路径。
+Host 管理和所有普通/decode 数据面 JFR/JFC/Jetty 均保持 AUTO，不受该策略影响。错误串
+显式输出 `jfr_context_sva_separate` 和 `jfr_user_anonymous_memory`，避免再次因 compact
+flags 没有携带 bit 20 而误判。两种分支都保留当前 UAPI、64 位 JFC handle、
+`non_pin=0`、`dtu=0`，且仍只发送一次 CREATE_JFR。
+
+三类映射仍在 kernel JFR 删除后由原 checked `munmap` 状态机释放；anonymous record
+DB 使用独占页并拒绝复用已有不同 backing 的同类型页，防止管理策略污染随后数据面。
+若 CREATE_JFR 仍失败，应直接按同轮 function graph 判定失败位于 uburma TLV/JFC uobject、
+ubcore EID/trans-mode、RQ/index/DB pin 或 driver mailbox；在得到该证据前不引入 HCCP。
 
 数据面参数显式传入 `--share_jfr true`，不再依赖固定 perftest 在 capability check
 中把默认 `false` 隐式改写为 `true`。这保证后续 data Jetty 与 management Jetty

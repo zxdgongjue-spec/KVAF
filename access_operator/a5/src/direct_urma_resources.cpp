@@ -340,6 +340,17 @@ std::string FormatManagementDiagnostic(
       " management_diagnostic_flags=" +
       std::to_string(diagnostic.flags);
   if (diagnostic.stage == KVAF_URMA_MANAGEMENT_STAGE_CREATE_JFR) {
+    formatted +=
+        " jfr_context_sva_separate=" +
+        std::to_string(
+            (diagnostic.flags &
+             KVAF_URMA_MANAGEMENT_DIAGNOSTIC_JFR_CONTEXT_SVA_SEPARATE) !=
+            0U) +
+        " jfr_user_anonymous_memory=" +
+        std::to_string(
+            (diagnostic.flags &
+             KVAF_URMA_MANAGEMENT_DIAGNOSTIC_JFR_USER_ANONYMOUS_MEMORY) !=
+            0U);
     const JfrCommandDiagnosticView jfr =
         DecodeJfrCommandDiagnostic(result);
     if (!jfr.valid) {
