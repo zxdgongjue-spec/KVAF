@@ -1074,8 +1074,13 @@ AICPU stderr 未被完整转发，也能从 Device owner progress 恢复失败�
 `uburma_cmd_create_jfr`、`ubcore_create_jfr`、`udma_create_jfr` 根符号。随后仅执行一轮
 zero-WQE。脚本优先用 `function_graph + set_graph_function` 保存原始 CREATE_JFR 的
 内核调用树/返回值；若厂商内核不允许在私有 instance 写 `set_graph_function`，则回退到
-同一私有 instance 的 `function + set_ftrace_filter`，只跟踪 UB/UDMA 与 page-pin 函数，
-仍保留有序调用路径和直接 caller，但不声称具有完整嵌套/返回值。两种模式都不修改
+同一私有 instance 的 `set_ftrace_filter`，只选择 CREATE_JFR 从 TLV/uobject、ubcore、
+UDMA 校验、RQ/index/DB pin 到 mailbox 的固定分支，最多 32 个实际存在的精确符号，
+一次写入过滤表，不再逐个写入数千个函数。过滤后优先继续使用 `function_graph`，不支持
+时才降级为普通 `function` tracer。脚本从入口、
+tracer 选择到 fallback 安装都会输出 `KVAF_JFR_TRACE_PREFLIGHT stage=...`，因此 tracefs
+配置不会再表现为无输出的硬件卡死。fallback 仍保留有序调用路径和直接 caller，但不
+声称具有完整嵌套/返回值。两种模式都不修改
 top-level/global tracer；仅当两种 instance-local 过滤方式均不可用时才在硬件前退出。
 脚本同时用
 `journalctl` cursor（不可用时退化为只读 `dmesg`）保存同时间段内核日志。若 tracefs

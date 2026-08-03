@@ -18,6 +18,9 @@ if (( EUID != 0 )); then
   exit 2
 fi
 
+echo "EXECUTION_ENV=SERVER_B_HOST"
+echo "KVAF_JFR_TRACE_PREFLIGHT stage=entry"
+
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd -P)
 kvaf_container=vllm-ascend-cs-kvaf
@@ -57,7 +60,7 @@ kvaf_finalize_tracefs_instance()
         cleanup_status=1
       fi
       ;;
-    function-filter)
+    function-graph-filter|function-filter)
       if ! { : >"${kvaf_trace_instance_dir}/set_ftrace_filter"; } \
           2>/dev/null; then
         echo "ERROR: could not clear the KVAF function filter" >&2
@@ -251,7 +254,7 @@ kvaf_try_function_graph()
 kvaf_try_function_filter()
 {
   local filter_file=${kvaf_trace_instance_dir}/set_ftrace_filter
-  local filter_symbol=
+  local -a filter_symbols=()
 
   if [[ ! -r "${kvaf_available_tracers}" ]] ||
      ! grep -qw function "${kvaf_available_tracers}"; then
@@ -263,29 +266,49 @@ kvaf_try_function_filter()
   fi
 
   # A vendor kernel may expose function_graph but make set_graph_function
-  # read-only in non-top-level trace arrays.  The ordinary function tracer
-  # still accepts an independent per-instance filter.  Select the complete
-  # UB/UDMA family plus page-pinning leaves so the ordered call path and each
-  # function's direct caller remain visible without tracing the whole kernel.
-  # Install one exact symbol per write: vendor tracefs parsers commonly cap a
-  # control write at PAGE_SIZE, while the complete module list may exceed it.
-  if ! printf '%s\n' "${kvaf_trace_root_symbol}" \
-      >"${filter_file}" 2>/dev/null; then
+  # read-only in non-top-level trace arrays.  Select a fixed CREATE_JFR branch
+  # rather than every UB/UDMA function.  The old per-symbol family loop could
+  # rebuild ftrace's dynamic table thousands of times before printing output.
+  # One awk pass resolves available compiler-suffixed symbols, and one tee
+  # transaction installs at most 32 exact functions.
+  mapfile -t filter_symbols < <(
+    awk '
+      BEGIN {
+        split("uburma_cmd_create_jfr uburma_tlv_parse uobj_alloc "
+              "uobj_get_read ubcore_create_jfr ubcore_eid_valid "
+              "ubcore_check_jfr_cfg udma_create_jfr "
+              "udma_verify_jfr_param udma_alloc_jfr_id "
+              "udma_get_jfr_buf udma_get_u_jfr_buf pin_queue_addr "
+              "unpin_queue_addr udma_umem_get udma_verify_input "
+              "udma_get_target_umem udma_pin_all_pages "
+              "udma_pin_pages pin_user_pages_fast "
+              "internal_get_user_pages_fast gup_fast_fallback "
+              "udma_pin_sw_db udma_hw_init_jfrc "
+              "udma_alloc_cmd_mailbox udma_post_mbox "
+              "ubase_hw_upgrade_ctx_ex", wanted, " ")
+        for (index in wanted) {
+          selected[wanted[index]] = 1
+        }
+      }
+      {
+        symbol = $1
+        base = symbol
+        sub(/\..*$/, "", base)
+        if (selected[base] && !seen[symbol]++) {
+          print symbol
+        }
+      }
+    ' "${kvaf_tracefs}/available_filter_functions"
+  )
+  if (( ${#filter_symbols[@]} == 0 || ${#filter_symbols[@]} > 32 )); then
     return 1
   fi
-  kvaf_trace_filter_count=1
-  while read -r filter_symbol _; do
-    [[ -n "${filter_symbol}" ]] || continue
-    [[ "${filter_symbol}" != "${kvaf_trace_root_symbol}" ]] || continue
-    if [[ "${filter_symbol}" =~ ^(uburma|ubcore|udma|hns3_udma|ummu)_ ]] ||
-       [[ "${filter_symbol}" =~ ^(pin_user_pages|unpin_user_pages?|get_user_pages|internal_get_user_pages_fast|gup_fast_fallback)(_|\.|$) ]]; then
-      if ! printf '%s\n' "${filter_symbol}" \
-          >>"${filter_file}" 2>/dev/null; then
-        return 1
-      fi
-      ((kvaf_trace_filter_count += 1))
-    fi
-  done <"${kvaf_tracefs}/available_filter_functions"
+  if ! printf '%s\n' "${filter_symbols[@]}" | \
+      tee "${filter_file}" >/dev/null; then
+    return 1
+  fi
+  kvaf_trace_filter_count=$(awk 'NF { count += 1 } END { print count + 0 }' \
+    "${filter_file}")
   if ! awk -v wanted="${kvaf_trace_root_symbol}" \
       '$1 == wanted { found = 1 } END { exit !found }' \
       "${filter_file}"; then
@@ -294,21 +317,31 @@ kvaf_try_function_filter()
   if (( kvaf_trace_filter_count < 1 )); then
     return 1
   fi
-  if ! printf 'function\n' \
-      >"${kvaf_trace_instance_dir}/current_tracer" 2>/dev/null; then
-    return 1
-  fi
-  if [[ "$(tr -d '[:space:]' \
-          <"${kvaf_trace_instance_dir}/current_tracer")" != function ]]; then
+  echo "KVAF_JFR_TRACE_PREFLIGHT stage=function-filter-install symbol_count=${kvaf_trace_filter_count}"
+  if printf 'function_graph\n' \
+       >"${kvaf_trace_instance_dir}/current_tracer" 2>/dev/null &&
+     [[ "$(tr -d '[:space:]' \
+          <"${kvaf_trace_instance_dir}/current_tracer")" == function_graph ]]; then
+    kvaf_trace_mode=function-graph-filter
+  else
     printf 'nop\n' >"${kvaf_trace_instance_dir}/current_tracer" || true
-    return 1
+    if ! printf 'function\n' \
+        >"${kvaf_trace_instance_dir}/current_tracer" 2>/dev/null; then
+      return 1
+    fi
+    if [[ "$(tr -d '[:space:]' \
+            <"${kvaf_trace_instance_dir}/current_tracer")" != function ]]; then
+      printf 'nop\n' >"${kvaf_trace_instance_dir}/current_tracer" || true
+      return 1
+    fi
+    kvaf_trace_mode=function-filter
   fi
-  kvaf_trace_mode=function-filter
   return 0
 }
 
 printf '0\n' >"${kvaf_trace_instance_dir}/tracing_on"
 printf 'nop\n' >"${kvaf_trace_instance_dir}/current_tracer"
+echo "KVAF_JFR_TRACE_PREFLIGHT stage=select-tracer"
 if ! kvaf_try_function_graph; then
   printf 'nop\n' >"${kvaf_trace_instance_dir}/current_tracer" || true
   if [[ -e "${kvaf_trace_instance_dir}/set_graph_function" ]]; then
@@ -321,13 +354,14 @@ if ! kvaf_try_function_graph; then
     echo "No hardware operation was attempted and no one-shot trace directory was consumed." >&2
     exit 2
   fi
-  echo "WARNING: filtered function_graph unavailable; using the instance-local function tracer" >&2
+  echo "WARNING: graph-root filter unavailable; using a bounded instance-local CREATE_JFR filter" >&2
   echo "FUNCTION_GRAPH_REJECTION=${kvaf_graph_rejection_reason}" >&2
 fi
 
 if [[ -r "${kvaf_trace_instance_dir}/trace_options" ]]; then
   kvaf_trace_options=(context-info record-cmd print-parent sym-offset)
-  if [[ "${kvaf_trace_mode}" == function-graph ]]; then
+  if [[ "${kvaf_trace_mode}" == function-graph ||
+        "${kvaf_trace_mode}" == function-graph-filter ]]; then
     kvaf_trace_options+=(
       funcgraph-proc
       funcgraph-duration
@@ -403,7 +437,6 @@ fi
   echo "function_graph_instance=${kvaf_trace_instance_name}"
 } >"${kvaf_metadata}"
 
-echo "EXECUTION_ENV=SERVER_B_HOST"
 echo "KVAF_JFR_TRACE_DIR=${kvaf_trace_dir}"
 echo "KVAF_JFR_TRACE_STAGE=single-zero-wqe"
 echo "KVAF_JFR_TRACE_MODE=${kvaf_trace_mode}"

@@ -115,6 +115,13 @@ class Npu2CleanValidationTests(unittest.TestCase):
             "function_graph",
             "set_graph_function",
             "set_ftrace_filter",
+            "KVAF_JFR_TRACE_PREFLIGHT stage=entry",
+            "KVAF_JFR_TRACE_PREFLIGHT stage=select-tracer",
+            "KVAF_JFR_TRACE_PREFLIGHT stage=function-filter-install",
+            "uburma_cmd_create_jfr uburma_tlv_parse uobj_alloc",
+            "internal_get_user_pages_fast gup_fast_fallback",
+            "${#filter_symbols[@]} > 32",
+            "function-graph-filter",
             "kvaf_trace_mode=function-filter",
             "KVAF_JFR_TRACE_MODE=",
             "FUNCTION_GRAPH_REJECTION=",
@@ -130,6 +137,8 @@ class Npu2CleanValidationTests(unittest.TestCase):
             "tracefs instance control is not readable/writable",
             trace,
         )
+        self.assertNotIn("while read -r filter_symbol", trace)
+        self.assertNotIn("available_filter_functions\"; do", trace)
 
     def run_preflight(self, **updates: str) -> subprocess.CompletedProcess[str]:
         bash = shutil.which("bash")
