@@ -436,29 +436,33 @@ int main(int argc, char **argv) {
     std::cout << "GRAPH_PERF_WARMUP_BEGIN\n";
     for (uint32_t warmup = 0U; warmup < options.graph_warmup; ++warmup) {
       const uint32_t epoch = options.graph_replays + warmup;
+      std::cout << "GRAPH_PERF_WARMUP_STEP_BEGIN iteration=" << warmup << " epoch=" << epoch << '\n';
       PrepareGraphReplayInputs(epoch, source, options, &address_table, &indices, &mask, &output_indices);
       if (!CopyGraphReplayInputs(stream, device_address_table, device_indices, device_mask, device_output_indices,
-                                 address_table, indices, mask, output_indices) ||
-          !CheckAcl(aclmdlRIExecuteAsync(graph_model, stream), "graph performance warmup replay") ||
-          !CheckAcl(aclrtSynchronizeStream(stream), "graph performance warmup completion")) {
-        goto cleanup;
-      }
+                                 address_table, indices, mask, output_indices)) goto cleanup;
+      std::cout << "GRAPH_PERF_WARMUP_INPUT_ENQUEUED iteration=" << warmup << '\n';
+      if (!CheckAcl(aclmdlRIExecuteAsync(graph_model, stream), "graph performance warmup replay")) goto cleanup;
+      std::cout << "GRAPH_PERF_WARMUP_EXECUTE_ENQUEUED iteration=" << warmup << '\n';
+      if (!CheckAcl(aclrtSynchronizeStream(stream), "graph performance warmup completion")) goto cleanup;
+      std::cout << "GRAPH_PERF_WARMUP_STEP_DONE iteration=" << warmup << '\n';
     }
     std::cout << "GRAPH_PERF_WARMUP_DONE count=" << options.graph_warmup << '\n';
     std::cout << "GRAPH_PERF_MEASURED_BEGIN\n";
     elapsed_ms.reserve(options.graph_iterations);
     for (uint32_t iteration = 0U; iteration < options.graph_iterations; ++iteration) {
       const uint32_t epoch = options.graph_replays + options.graph_warmup + iteration;
+      std::cout << "GRAPH_PERF_MEASURED_STEP_BEGIN iteration=" << iteration << " epoch=" << epoch << '\n';
       PrepareGraphReplayInputs(epoch, source, options, &address_table, &indices, &mask, &output_indices);
       const auto begin = std::chrono::steady_clock::now();
       if (!CopyGraphReplayInputs(stream, device_address_table, device_indices, device_mask, device_output_indices,
-                                 address_table, indices, mask, output_indices) ||
-          !CheckAcl(aclmdlRIExecuteAsync(graph_model, stream), "measured graph replay") ||
-          !CheckAcl(aclrtSynchronizeStream(stream), "measured graph replay completion")) {
-        goto cleanup;
-      }
+                                 address_table, indices, mask, output_indices)) goto cleanup;
+      std::cout << "GRAPH_PERF_MEASURED_INPUT_ENQUEUED iteration=" << iteration << '\n';
+      if (!CheckAcl(aclmdlRIExecuteAsync(graph_model, stream), "measured graph replay")) goto cleanup;
+      std::cout << "GRAPH_PERF_MEASURED_EXECUTE_ENQUEUED iteration=" << iteration << '\n';
+      if (!CheckAcl(aclrtSynchronizeStream(stream), "measured graph replay completion")) goto cleanup;
       const auto end = std::chrono::steady_clock::now();
       elapsed_ms.push_back(std::chrono::duration<double, std::milli>(end - begin).count());
+      std::cout << "GRAPH_PERF_MEASURED_STEP_DONE iteration=" << iteration << '\n';
     }
     if (!CheckAcl(aclrtMemcpy(statuses.data(), statuses.size() * sizeof(statuses[0]), device_status,
                                statuses.size() * sizeof(statuses[0]), ACL_MEMCPY_DEVICE_TO_HOST),

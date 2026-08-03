@@ -33,8 +33,10 @@ kernel="${build_dir}/bin/kvaf_execute_batch_get_kernels.o"
 test_binary="${build_dir}/bin/kvaf_execute_batch_get_test"
 touch "${run_started}"
 
-if [[ ! -x "${test_binary}" || ! -f "${kernel}" ]]; then
-  echo "[EXECUTE_BATCH_GET] build artifact missing; running scripts/build.sh" | tee "${log_file}"
+if [[ ! -x "${test_binary}" || ! -f "${kernel}" ||
+      -n "$(find "${demo_dir}" \( -path "${demo_dir}/build*" -o -path "${demo_dir}/results" \) -prune -o \
+            -type f -newer "${test_binary}" -print -quit)" ]]; then
+  echo "[EXECUTE_BATCH_GET] build artifact missing_or_stale; running scripts/build.sh" | tee "${log_file}"
   BUILD_DIR="${build_dir}" bash "${script_dir}/build.sh" 2>&1 | tee -a "${log_file}"
 fi
 if [[ ! -x "${test_binary}" || ! -f "${kernel}" ]]; then
