@@ -270,6 +270,7 @@ kvaf_verify_direct_provider_build_v3()
     'udma_source_capability_magic:0x4b56414655444d41' \
     'udma_runtime_capability:0x0000000000020001' \
     'ummu_provider_mode:paired-libummu-source-built-internal' \
+    'ummu_context_fd_contract:private-open-or-unique-process-dup-v1' \
     'ummu_source_capability_magic:0x4b564146554d4d55' \
     'ummu_runtime_capability:0x0000000000010001' \
     'umdk_git_tree_state:clean' \

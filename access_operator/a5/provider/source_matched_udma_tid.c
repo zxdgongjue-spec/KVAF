@@ -1,5 +1,6 @@
 #include "kvaf_source_matched_udma.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -189,6 +190,9 @@ static urma_token_id_t *kvaf_udma_alloc_tid_checked(
 
     status = ummu_allocate_tid(&tid_attr, &tid);
     if (status != 0 || tid > UDMA_MAX_TID) {
+        const int operation_errno = status < 0 ? -status :
+            (status > 0 ? status : EOVERFLOW);
+
         if (tid != UINT32_MAX) {
             state->ummu_allocated = true;
             token->tid = tid;
@@ -205,6 +209,7 @@ static urma_token_id_t *kvaf_udma_alloc_tid_checked(
             /* Retain an orphan whose UMMU TID could not be released. */
             (void)pthread_mutex_unlock(&g_kvaf_token_lock);
         }
+        errno = operation_errno;
         return NULL;
     }
     token->tid = tid;

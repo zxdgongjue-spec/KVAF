@@ -336,6 +336,7 @@ endforeach()
 function(kvaf_add_source_ummu_object TARGET_NAME)
   add_library(${TARGET_NAME} OBJECT
     source_matched_ummu.c
+    source_matched_ummu_fd.c
     source_matched_ummu_collections.c
   )
   set_target_properties(${TARGET_NAME} PROPERTIES

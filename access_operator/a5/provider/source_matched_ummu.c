@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -28,6 +29,7 @@
 #include "ummu_seg_mng.h"
 
 #include "kvaf_source_matched_ummu_mapping.h"
+#include "kvaf_source_matched_ummu_fd.h"
 
 /*
  * Do not infer this ABI from the older drivers/ubus header.  The selected
@@ -88,6 +90,7 @@ static uint32_t g_kvaf_ummu_live_tid_count;
 static uint32_t g_kvaf_ummu_pending_count;
 static uint32_t g_kvaf_ummu_retained_count;
 static uint32_t g_kvaf_ummu_cleanup_unknown;
+static uint32_t g_kvaf_ummu_fd_mode;
 static struct kvaf_source_ummu_status g_kvaf_ummu_last_status;
 static _Thread_local struct kvaf_source_ummu_status
     g_kvaf_ummu_thread_status;
@@ -236,6 +239,7 @@ static void kvaf_remove_state_locked(struct kvaf_ummu_tid_state *state)
 static int kvaf_ensure_context(void)
 {
   struct ummu_ctx_info *context;
+  int open_error;
   int status = 0;
 
   if (pthread_mutex_lock(&g_kvaf_ummu_init_lock) != 0) {
@@ -249,6 +253,9 @@ static int kvaf_ensure_context(void)
           KVAF_SOURCE_UMMU_PENDING_NONE, 0, 0);
     }
     (void)pthread_mutex_unlock(&g_kvaf_ummu_init_lock);
+    if (status == 0) {
+      errno = 0;
+    }
     return status;
   }
 
@@ -269,12 +276,45 @@ static int kvaf_ensure_context(void)
   }
   context->shared_fd = open(TID_DEVICE_NAME, O_RDWR | O_CLOEXEC);
   if (context->shared_fd < 0) {
-    status = -errno;
-    goto clear_map;
+    open_error = errno;
+    if (open_error == EEXIST) {
+      /*
+       * The A5 UMMU driver indexes one proc_manager by tgid/task start time
+       * and stores that key in struct file::private_data.  CANN may have
+       * loaded the official libummu constructor before this source-owned
+       * provider, so a second open in the same worker correctly returns
+       * EEXIST.  Duplicate the unique matching process descriptor: dup keeps
+       * the same private_data and gives KVAF an independently closeable
+       * reference.  The helper rejects read-only, foreign and ambiguous fds.
+       */
+      context->shared_fd =
+          kvaf_source_ummu_duplicate_unique_process_fd(
+              TID_DEVICE_NAME, "/proc/self/fd");
+      if (context->shared_fd >= 0) {
+        g_kvaf_ummu_fd_mode = KVAF_SOURCE_UMMU_FD_PROCESS_DUP;
+      } else {
+        status = context->shared_fd == -ENOENT ?
+            -open_error : context->shared_fd;
+        context->shared_fd = -1;
+        goto clear_map;
+      }
+    } else {
+      status = -open_error;
+      goto clear_map;
+    }
+  } else {
+    g_kvaf_ummu_fd_mode = KVAF_SOURCE_UMMU_FD_PRIVATE_OPEN;
   }
   g_kvaf_ummu_ctx = context;
   g_kvaf_ummu_owner_pid = getpid();
   (void)pthread_mutex_unlock(&g_kvaf_ummu_init_lock);
+  (void)fprintf(stderr,
+      "KVAF_UMMU_CONTEXT_READY fd_mode=%s owner_pid=%ld\n",
+      g_kvaf_ummu_fd_mode == KVAF_SOURCE_UMMU_FD_PROCESS_DUP ?
+          "process_fd_dup" : "private_open",
+      (long)g_kvaf_ummu_owner_pid);
+  (void)fflush(stderr);
+  errno = 0;
   return 0;
 
 clear_map:
@@ -1749,6 +1789,7 @@ static __attribute__((destructor)) void kvaf_source_ummu_uninit(void)
     return;
   }
   g_kvaf_ummu_ctx = NULL;
+  g_kvaf_ummu_fd_mode = KVAF_SOURCE_UMMU_FD_NONE;
   if (context->shared_fd >= 0) {
     (void)close(context->shared_fd);
   }

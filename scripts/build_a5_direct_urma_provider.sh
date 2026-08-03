@@ -840,6 +840,7 @@ udma_private_abi_sha256=${udma_private_abi_sha}
 udma_private_abi_probe_filename=kvaf_udma_private_abi_probe
 udma_private_abi_probe_sha256=${udma_private_abi_probe_binary_sha}
 ummu_provider_mode=paired-libummu-source-built-internal
+ummu_context_fd_contract=private-open-or-unique-process-dup-v1
 ummu_source_capability_magic=0x4b564146554d4d55
 ummu_runtime_capability=0x0000000000010001
 ummu_uapi_header_path=${KVAF_UMMU_UAPI_HEADER}

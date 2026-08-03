@@ -768,6 +768,24 @@ Token/TID 分配失败还会先输出 `KVAF_URMA_TOKEN_ERROR`；Segment 注册�
 retryability、pending/retained 计数和 kernel-register rollback 结果。每个顶层 UMMU
 操作都会清空线程快照，避免把前一次失败或另一线程的失败误配到本次注册。
 
+Host binary 会先初始化 ACL/CANN，再加载 direct provider。CANN 依赖中的官方
+`libummu` 构造函数可能已经打开 `/dev/ummu/tid`；A5 UMMU driver 又按
+`tgid + task start_time` 为一个 owner 只建立一个 `proc_manager`，因此 provider
+再次打开会返回 `EEXIST`。这不是设备被其他业务占用，也不是需要复位 NPU。
+source-built UMMU 只在 fresh open 精确返回 `EEXIST` 时扫描当前进程 fd，并且先
+`F_DUPFD_CLOEXEC`、后验证 duplicate。只有唯一匹配、`O_RDWR`、同一字符设备的
+process descriptor 才会被采用；日志会输出
+`KVAF_UMMU_CONTEXT_READY fd_mode=process_fd_dup`。KVAF 只关闭自己的 duplicate，
+不会关闭 CANN 的原 fd；duplicate 共享 driver `private_data`，最后一个引用关闭前
+`proc_manager` 不会释放。无候选、只读候选或多个候选均 fail closed，不会尝试用
+`ALLOC_TID` 做有副作用的探测。
+
+这个兼容路径要求一个 worker 在 provider 资源生命周期内不 fork，也不通过
+`SCM_RIGHTS` 接收外部 UMMU fd。当前 runner 是 `fork + exec` 后才在独立 worker 中
+加载 provider，所有相关 fd 都是 `CLOEXEC`，并满足该约束；未来集成到常驻 decode
+进程时，应把 UMMU owner 收敛成进程内唯一 broker，通过显式 acquire/release 返回
+duplicate，而不是让多个组件分别初始化 context。
+
 Device provider 的控制超时仍由 `KVAF_H2D_TIMEOUT_SECONDS` 指定。Host 的管理窗口
 独立使用 `KVAF_HOST_CONTROL_TIMEOUT_SECONDS`；默认值是 Device timeout 加 management
 ready timeout 再加 5 秒，并在 manifest 中分别记录。AIV 对 AICPU owner 的 READY
