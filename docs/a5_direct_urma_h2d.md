@@ -343,9 +343,83 @@ stream 的同步错误会在不触碰 result/backing 的情况下对同一 strea
 quarantine 或 active 引用的结果目录；`flock` 绑定 inode，删除锁文件会制造第二把
 看似同名但实际不同的锁。
 
-当前 active/quarantine 是整机 KVAF singleton，不按 NPU 分片。一个未解决的
-session 会阻止换另一张卡继续测试，这是有意的 fail-closed 约束；在证明各 NPU
-的 UDMA/driver ownership 完全隔离前，不要通过复制仓库或删除锁绕过它。
+生产 runner 的 active/quarantine 是整机 KVAF singleton，不按 NPU 分片。一个未解决的
+session 会阻止换另一张卡继续测试，这是有意的 fail-closed 约束；生产路径不提供
+quarantine bypass，也不接受通过复制仓库、删除锁或改状态目录绕过它。
+
+### 5.1 受限的 NPU7 -> NPU2 风险接受实验
+
+当前有一个范围刻意收窄的真机诊断模式
+`risk-accepted-cross-npu2-v1`。它不是生产恢复机制，也不是对“不同 NPU 一定彼此
+隔离”的声明。它只用于以下具体情况：NPU7 已因一次旧版 zero-WQE 测试进入
+quarantine，现场暂时不能重启，但需要验证修复后的代码能否在 NPU2 完成最小资源
+生命周期和一条真实 H2D。
+
+这个模式不会把 NPU7 判定为安全。启动前，read-only 验证器必须把操作员提供的
+quarantine SHA-256 和 `run_id` 精确绑定到已知的 NPU7 事件，并复核源 commit、
+zero-WQE 工作负载、最终失败原因、Host/Device PID、进程起始时刻、可执行文件和
+命令行。相同验证会在 Host fork 前和 Device fork 前再次执行，防止验证后源状态或
+进程身份发生变化。任何字段缺失、重复、变更或无法读取都会在目标资源创建前
+fail closed。
+
+当前唯一接受的源事件是 commit
+`ed13d76f4a5a9c89b91c0524b2a4f53da2e3a874`、`h2d_transfer_count=0`，且
+Device final 为 `FAIL_UNSAFE/device_provider_open_cleanup_failed` 的那一次运行。
+模式不会接受“看起来相似”的另一份 quarantine，也不会把后续新故障加入白名单。
+
+源与目标范围固定如下，不能通过环境变量扩展：
+
+| 项目 | 源事件（只读保留） | 本次实验目标 |
+|---|---|---|
+| NPU | logical/physical NPU7 | logical/physical NPU2 |
+| Host URMA | `udmac0d1e5/eid0` | `udmac1d1e4/eid0` |
+| Device URMA | `udmac0d0e2/eid0` | `udmac0d1e4/eid0` |
+| Host EID | `00000000003f050000100000df080b00` | `00000000007f040000100000df0a0b00` |
+| Device EID | `000000000000020000100000df00e100` | `000000000000020000100000df004100` |
+| management Jetty | 507 | 502 |
+
+NPU7 的全局 quarantine、结果目录、Host/Device 进程和 backing 必须原样保留；实验
+不能删除、移动、覆盖或向它们发送信号。NPU2 使用独立的实验 active、quarantine、
+result 和锁命名空间，但仍持有跨 NPU 实验互斥锁，避免第二个风险接受会话并发启动。
+NPU2 成功只说明该次 NPU2 证据闭环，不能清理或降级原 NPU7 quarantine。之后的
+生产 runner 也仍会被全局 quarantine 拒绝。
+
+这里的剩余风险来自整机共享层：不同 UDMA device/EID/Jetty 并不能证明 UMMU 的
+PASID/TID、驱动内部 ownership 或 AICPU worker/SO 状态按 NPU 完全隔离。因此这个
+模式可能仍让 NPU2 或整机进入需要重启才能恢复的状态。它的价值是用最小增量实验
+验证隔离假设，不是把这个假设当成既有保证。
+
+实验只允许按以下两阶段推进：
+
+1. `zero-WQE`：创建并交换资源，但提交 0 条数据 WQE；只有双端精确 `PASS`、全部
+   teardown 字段为 1、进程退出且实验 active 已清理后，才能进入下一阶段。
+2. `one-kib`：只提交 1 条 1024-byte H2D READ，并校验 payload、canary、CQ 和完整
+   teardown。该受限入口不允许直接运行 4096 x 1 KiB 或自定义更大负载。
+
+实验必须先用 `build_a5_direct_urma.sh cross-npu2-risk-offline-v1` 在
+`/data/.kvaf-state/KVAF/experimental/artifacts/` 下生成一次性的离线 direct binary；
+它不会重建 provider，也不会改写 CANN/AICPU package。两个硬件阶段统一从
+`run_a5_direct_urma_cross_npu2_risk_accepted.sh` 进入，不能直接调用内部 mode。
+`one-kib` 还必须提供前一轮 zero-WQE 的结果目录，入口会复核双端 final、清理位、
+日志 marker、源 quarantine 摘要以及 artifact/commit 绑定后才提交一条 WQE。
+
+出现以下任一情况必须立即停止，不得进入下一阶段：
+
+- 源 quarantine 缺失、SHA-256 改变、`run_id` 不一致，或 NPU7 任一固定进程身份
+  不再与验证证据一致；
+- NPU2 忙、固定 EID/URMA device/management Jetty 不匹配，或预检不能证明目标
+  端点可用；
+- ACL/AICPU 返回 `507018`，出现 PLBI/PSYNC 超时，或 UMMU/PASID/TID ownership
+  进入 unknown；
+- 任一 final 缺失、损坏或 nonce 不匹配，worker 卡住，或
+  `stream_quiesced`、`queue_drained`、`provider_closed`、`backing_released`、
+  `allocations_released` 中任一项不是 1；Host 端还必须证明
+  `host_mapping_unregistered=1`。
+
+硬停止后不要 `kill -9` worker，也不要删除源或实验 quarantine/active。保留进程、
+backing 和结果证据，按现场隔离或整机重启流程恢复。即使两个阶段都成功，仍应把
+“跨 NPU 共享状态是否隔离”保留为未证明项；只有驱动/UMMU/AICPU 契约或额外故障
+注入证据补齐后，才可以讨论将状态从整机 singleton 改成正式的 per-NPU 分片。
 
 active 状态在每次 fork 前先写 `host_launch_intent` 或
 `device_launch_intent`，fork 成功后再补 PID。恢复逻辑按 phase 决定必须检查

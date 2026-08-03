@@ -8,7 +8,9 @@ if (( $# > 1 )) ||
    [[ "${kvaf_affinity_run_mode}" != production &&
       "${kvaf_affinity_run_mode}" != \
         candidate-epoch-owner-validation-v1 &&
-      "${kvaf_affinity_run_mode}" != recovery-only-v1 ]]; then
+      "${kvaf_affinity_run_mode}" != recovery-only-v1 &&
+      "${kvaf_affinity_run_mode}" != \
+        risk-accepted-cross-npu2-v1 ]]; then
   echo "ERROR: invalid direct URMA runner mode" >&2
   exit 2
 fi
@@ -19,7 +21,29 @@ source "${SCRIPT_DIR}/a5_direct_urma_legacy_guard.sh"
 source "${SCRIPT_DIR}/a5_aicpu_affinity_guard.sh"
 source "${SCRIPT_DIR}/a5_direct_urma_manifest_v3.sh"
 source "${SCRIPT_DIR}/a5_direct_urma_runtime_preflight.sh"
-kvaf_configure_direct_urma_state_paths "${ROOT_DIR}" || exit 2
+kvaf_cross_npu_risk_mode=0
+if [[ "${kvaf_affinity_run_mode}" == \
+      risk-accepted-cross-npu2-v1 ]]; then
+  kvaf_cross_npu_risk_mode=1
+  if [[ "${KVAF_CROSS_NPU_RISK_ACCEPTANCE:-}" != \
+        I_ACCEPT_UNKNOWN_CROSS_NPU_DMA_RISK ]]; then
+    echo "ERROR: risk mode requires the exact cross-NPU DMA acceptance phrase" >&2
+    exit 2
+  fi
+  KVAF_CROSS_NPU_SOURCE_RUN_ID=${KVAF_CROSS_NPU_SOURCE_RUN_ID:-}
+  KVAF_CROSS_NPU_SOURCE_QUARANTINE_SHA256=${KVAF_CROSS_NPU_SOURCE_QUARANTINE_SHA256:-}
+  KVAF_CROSS_NPU_ARTIFACT_ID=${KVAF_CROSS_NPU_ARTIFACT_ID:-}
+  if [[ -z "${KVAF_CROSS_NPU_SOURCE_RUN_ID}" ||
+        -z "${KVAF_CROSS_NPU_SOURCE_QUARANTINE_SHA256}" ||
+        ! "${KVAF_CROSS_NPU_ARTIFACT_ID}" =~ ^[0-9a-f]{32}$ ]]; then
+    echo "ERROR: risk mode requires the pinned source run, quarantine SHA256, and 32-hex artifact ID" >&2
+    exit 2
+  fi
+  kvaf_configure_cross_npu2_risk_state_paths \
+    "${ROOT_DIR}" "${KVAF_CROSS_NPU_SOURCE_RUN_ID}" || exit 2
+else
+  kvaf_configure_direct_urma_state_paths "${ROOT_DIR}" || exit 2
+fi
 
 KVAF_A5_DIRECT_BUILD_DIR=${KVAF_A5_DIRECT_BUILD_DIR:-"${ROOT_DIR}/build-a5-direct-urma"}
 KVAF_A5_DIRECT_BINARY=${KVAF_A5_DIRECT_BINARY:-"${KVAF_A5_DIRECT_BUILD_DIR}/access_operator/a5/kvaf_a5_aiv_direct_urma_h2d_smoke"}
@@ -31,6 +55,61 @@ KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST=${KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST:-"${
 KVAF_DIRECT_PROVIDER_BUILD_MANIFEST=${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST:-"${KVAF_DIRECT_PROVIDER_BUILD_DIR}/build.manifest"}
 KVAF_DIRECT_PROVIDER_SUCCESS_STAMP=${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP:-"${KVAF_DIRECT_PROVIDER_BUILD_DIR}/build.success"}
 KVAF_DIRECT_PROVIDER_SONAME=${KVAF_DIRECT_PROVIDER_SONAME:-libkvaf_urma_provider_device.so}
+KVAF_CROSS_NPU_ARTIFACT_MANIFEST_SHA256=not-applicable
+if (( kvaf_cross_npu_risk_mode != 0 )); then
+  kvaf_cross_npu_source_commit=$(
+    git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null
+  ) || {
+    echo "ERROR: could not pin the risk-mode source commit" >&2
+    exit 2
+  }
+  kvaf_cross_npu_expected_build_dir="${KVAF_GLOBAL_STATE_DIR}/KVAF/experimental/artifacts/${kvaf_cross_npu_source_commit}/${KVAF_CROSS_NPU_ARTIFACT_ID}"
+  kvaf_cross_npu_expected_binary="${kvaf_cross_npu_expected_build_dir}/access_operator/a5/kvaf_a5_aiv_direct_urma_h2d_smoke"
+  kvaf_cross_npu_expected_build_manifest="${kvaf_cross_npu_expected_build_dir}/direct-smoke.manifest"
+  kvaf_cross_npu_expected_provider_dir="${ROOT_DIR}/build-a5-direct-urma-provider"
+  if [[ "${KVAF_A5_DIRECT_BUILD_DIR}" != \
+          "${kvaf_cross_npu_expected_build_dir}" ||
+        "${KVAF_A5_DIRECT_BINARY}" != \
+          "${kvaf_cross_npu_expected_binary}" ||
+        "${KVAF_A5_DIRECT_BUILD_MANIFEST}" != \
+          "${kvaf_cross_npu_expected_build_manifest}" ||
+        "${KVAF_DIRECT_PROVIDER_BUILD_DIR}" != \
+          "${kvaf_cross_npu_expected_provider_dir}" ||
+        "${KVAF_DIRECT_HOST_PROVIDER_LIBRARY}" != \
+          "${kvaf_cross_npu_expected_provider_dir}/libkvaf_urma_provider_host.so" ||
+        "${KVAF_DIRECT_DEVICE_PROVIDER_LIBRARY}" != \
+          "${kvaf_cross_npu_expected_provider_dir}/libkvaf_urma_provider_device.so" ||
+        "${KVAF_DIRECT_PROVIDER_SOURCE_MANIFEST}" != \
+          "${kvaf_cross_npu_expected_provider_dir}/source.sha256" ||
+        "${KVAF_DIRECT_PROVIDER_BUILD_MANIFEST}" != \
+          "${kvaf_cross_npu_expected_provider_dir}/build.manifest" ||
+        "${KVAF_DIRECT_PROVIDER_SUCCESS_STAMP}" != \
+          "${kvaf_cross_npu_expected_provider_dir}/build.success" ]]; then
+    echo "ERROR: risk mode artifacts must use the pinned offline binary and default verified provider" >&2
+    exit 2
+  fi
+  kvaf_cross_npu_artifact_manifest="${kvaf_cross_npu_expected_build_dir}/cross-npu2-artifact.manifest"
+  if [[ -L "${kvaf_cross_npu_artifact_manifest}" ||
+        ! -f "${kvaf_cross_npu_artifact_manifest}" ||
+        ! -r "${kvaf_cross_npu_artifact_manifest}" ]] ||
+     ! grep -Fxq 'schema=kvaf-a5-cross-npu2-offline-artifact-v1' \
+       "${kvaf_cross_npu_artifact_manifest}" ||
+     ! grep -Fxq "source_commit=${kvaf_cross_npu_source_commit}" \
+       "${kvaf_cross_npu_artifact_manifest}" ||
+     ! grep -Fxq "artifact_id=${KVAF_CROSS_NPU_ARTIFACT_ID}" \
+       "${kvaf_cross_npu_artifact_manifest}" ||
+     ! grep -Fxq "source_run_id=${KVAF_CROSS_NPU_SOURCE_RUN_ID}" \
+       "${kvaf_cross_npu_artifact_manifest}" ||
+     ! grep -Fxq \
+       "source_quarantine_sha256=${KVAF_CROSS_NPU_SOURCE_QUARANTINE_SHA256}" \
+       "${kvaf_cross_npu_artifact_manifest}"; then
+    echo "ERROR: risk mode offline artifact manifest is missing or inconsistent" >&2
+    exit 2
+  fi
+  KVAF_CROSS_NPU_ARTIFACT_MANIFEST_SHA256=$(
+    sha256sum "${kvaf_cross_npu_artifact_manifest}" | awk '{print $1}'
+  )
+fi
 KVAF_DURABLE_STATE_HELPER="${SCRIPT_DIR}/durable_state_file.py"
 KVAF_HOST_EID=${KVAF_HOST_EID:-}
 KVAF_DEVICE_EID=${KVAF_DEVICE_EID:-}
@@ -573,6 +652,247 @@ acquire_persistent_session_guards()
   fi
 }
 
+cross_npu_validation_value()
+{
+  local key=$1
+  local text=$2
+  awk -F= -v key="${key}" '
+    $1 == key {
+      value = substr($0, length(key) + 2)
+      count++
+    }
+    END {
+      if (count != 1 || value == "") {
+        exit 1
+      }
+      print value
+    }
+  ' <<<"${text}"
+}
+
+validate_cross_npu_risk_acceptance()
+{
+  local validator output source_identity source_links
+  local accepted_contract accepted_source_id accepted_run_id
+  local accepted_quarantine_sha accepted_manifest_sha
+  local accepted_device_final_sha accepted_result_dir
+  local accepted_host_pid accepted_host_start_ticks
+  local accepted_device_pid accepted_device_start_ticks
+  local accepted_digest accepted_number
+
+  (( kvaf_cross_npu_risk_mode != 0 )) || return 0
+  validator="${SCRIPT_DIR}/validate_a5_cross_npu_risk_acceptance.py"
+  if [[ -L "${validator}" || ! -f "${validator}" ||
+        ! -r "${validator}" ]]; then
+    echo "ERROR: cross-NPU risk validator is missing or unsafe" >&2
+    return 2
+  fi
+  if [[ ! "${KVAF_CROSS_NPU_SOURCE_QUARANTINE_SHA256}" =~ \
+        ^[0-9a-f]{64}$ ]]; then
+    echo "ERROR: source quarantine SHA256 must be 64 lowercase hex digits" >&2
+    return 2
+  fi
+
+  if ! output=$(python3 "${validator}" \
+      --quarantine "${KVAF_CROSS_NPU_SOURCE_QUARANTINE_FILE}" \
+      --quarantine-sha256 \
+        "${KVAF_CROSS_NPU_SOURCE_QUARANTINE_SHA256}" \
+      --run-id "${KVAF_CROSS_NPU_SOURCE_RUN_ID}" \
+      --source-logical-device-id 7 \
+      --result-root "${KVAF_CROSS_NPU_SOURCE_RESULT_ROOT}"); then
+    echo "ERROR: the pinned NPU7 quarantine no longer satisfies the risk contract" >&2
+    return 2
+  fi
+
+  accepted_contract=$(cross_npu_validation_value \
+    KVAF_CROSS_NPU_RISK_ACCEPTANCE "${output}") || return 2
+  accepted_quarantine_sha=$(cross_npu_validation_value \
+    KVAF_ACCEPTED_QUARANTINE_SHA256 "${output}") || return 2
+  accepted_manifest_sha=$(cross_npu_validation_value \
+    KVAF_ACCEPTED_MANIFEST_SHA256 "${output}") || return 2
+  accepted_device_final_sha=$(cross_npu_validation_value \
+    KVAF_ACCEPTED_DEVICE_FINAL_SHA256 "${output}") || return 2
+  accepted_run_id=$(cross_npu_validation_value \
+    KVAF_ACCEPTED_RUN_ID "${output}") || return 2
+  accepted_source_id=$(cross_npu_validation_value \
+    KVAF_ACCEPTED_SOURCE_LOGICAL_DEVICE_ID "${output}") || return 2
+  accepted_result_dir=$(cross_npu_validation_value \
+    KVAF_ACCEPTED_RESULT_DIR "${output}") || return 2
+  accepted_host_pid=$(cross_npu_validation_value \
+    KVAF_ACCEPTED_HOST_PID "${output}") || return 2
+  accepted_host_start_ticks=$(cross_npu_validation_value \
+    KVAF_ACCEPTED_HOST_START_TICKS "${output}") || return 2
+  accepted_device_pid=$(cross_npu_validation_value \
+    KVAF_ACCEPTED_DEVICE_PID "${output}") || return 2
+  accepted_device_start_ticks=$(cross_npu_validation_value \
+    KVAF_ACCEPTED_DEVICE_START_TICKS "${output}") || return 2
+
+  if [[ "${accepted_contract}" != verified ||
+        "${accepted_source_id}" != 7 ||
+        "${accepted_run_id}" != "${KVAF_CROSS_NPU_SOURCE_RUN_ID}" ||
+        "${accepted_quarantine_sha}" != \
+          "${KVAF_CROSS_NPU_SOURCE_QUARANTINE_SHA256}" ]]; then
+    echo "ERROR: cross-NPU risk validator returned an inconsistent contract" >&2
+    return 2
+  fi
+  for accepted_digest in \
+    "${accepted_manifest_sha}" "${accepted_device_final_sha}"; do
+    [[ "${accepted_digest}" =~ ^[0-9a-f]{64}$ ]] || return 2
+  done
+  for accepted_number in \
+    "${accepted_host_pid}" "${accepted_host_start_ticks}" \
+    "${accepted_device_pid}" "${accepted_device_start_ticks}"; do
+    [[ "${accepted_number}" =~ ^[1-9][0-9]*$ ]] || return 2
+  done
+
+  source_identity=$(stat -Lc '%d:%i:%h:%s' \
+    "${KVAF_CROSS_NPU_SOURCE_QUARANTINE_FILE}") || return 2
+  source_links=${source_identity#*:*:}
+  source_links=${source_links%%:*}
+  if [[ "${source_links}" != 1 ]]; then
+    echo "ERROR: source quarantine must have exactly one hard link" >&2
+    return 2
+  fi
+
+  if [[ -n "${KVAF_CROSS_NPU_RISK_VALIDATION_OUTPUT:-}" ]]; then
+    if [[ "${output}" != "${KVAF_CROSS_NPU_RISK_VALIDATION_OUTPUT}" ||
+          "${source_identity}" != \
+            "${KVAF_CROSS_NPU_SOURCE_QUARANTINE_IDENTITY}" ]]; then
+      echo "ERROR: accepted NPU7 evidence changed during the NPU2 run" >&2
+      return 2
+    fi
+    return 0
+  fi
+
+  KVAF_CROSS_NPU_RISK_VALIDATION_OUTPUT=${output}
+  KVAF_CROSS_NPU_SOURCE_QUARANTINE_IDENTITY=${source_identity}
+  KVAF_CROSS_NPU_ACCEPTED_MANIFEST_SHA256=${accepted_manifest_sha}
+  KVAF_CROSS_NPU_ACCEPTED_DEVICE_FINAL_SHA256=${accepted_device_final_sha}
+  KVAF_CROSS_NPU_ACCEPTED_RESULT_DIR=${accepted_result_dir}
+  KVAF_CROSS_NPU_ACCEPTED_HOST_PID=${accepted_host_pid}
+  KVAF_CROSS_NPU_ACCEPTED_HOST_START_TICKS=${accepted_host_start_ticks}
+  KVAF_CROSS_NPU_ACCEPTED_DEVICE_PID=${accepted_device_pid}
+  KVAF_CROSS_NPU_ACCEPTED_DEVICE_START_TICKS=${accepted_device_start_ticks}
+}
+
+acquire_cross_npu2_risk_session_guards()
+{
+  local path resolved_expected resolved_actual recovery_rc
+  local -a state_directories=(
+    "${KVAF_GLOBAL_STATE_DIR}"
+    "${KVAF_GLOBAL_STATE_DIR}/KVAF"
+    "${KVAF_CROSS_NPU_EXPERIMENT_ROOT}"
+    "${KVAF_CROSS_NPU_EXPERIMENT_ROOT}/npu-2"
+    "${KVAF_DIRECT_STATE_DIR}"
+    "${KVAF_DIRECT_RESULT_ROOT}"
+  )
+
+  for command in awk flock python3 realpath sha256sum stat; do
+    command -v "${command}" >/dev/null 2>&1 || {
+      echo "ERROR: ${command} is required for cross-NPU risk guards" >&2
+      exit 2
+    }
+  done
+  if [[ -L "${KVAF_DURABLE_STATE_HELPER}" ||
+        ! -f "${KVAF_DURABLE_STATE_HELPER}" ||
+        ! -r "${KVAF_DURABLE_STATE_HELPER}" ]]; then
+    echo "ERROR: durable state helper is missing or unsafe" >&2
+    exit 2
+  fi
+
+  # Establish that the one accepted global quarantine is still exact before
+  # creating any target state.  This function is read-only with respect to
+  # the source quarantine and its result bundle.
+  validate_cross_npu_risk_acceptance || exit $?
+
+  for path in "${state_directories[@]}"; do
+    if [[ -L "${path}" || ( -e "${path}" && ! -d "${path}" ) ]]; then
+      echo "ERROR: cross-NPU risk state component is not a real directory" >&2
+      echo "PATH=${path}" >&2
+      exit 2
+    fi
+    mkdir -p "${path}"
+  done
+  chmod 0700 \
+    "${KVAF_CROSS_NPU_EXPERIMENT_ROOT}" \
+    "${KVAF_CROSS_NPU_EXPERIMENT_ROOT}/npu-2" \
+    "${KVAF_DIRECT_STATE_DIR}" \
+    "${KVAF_DIRECT_RESULT_ROOT}"
+
+  resolved_expected="${KVAF_CROSS_NPU_EXPERIMENT_ROOT}/npu-2/${KVAF_CROSS_NPU_SOURCE_RUN_ID}"
+  resolved_actual=$(realpath -e "${KVAF_DIRECT_STATE_DIR}") || exit 2
+  if [[ "${resolved_actual}" != "${resolved_expected}" ]]; then
+    echo "ERROR: cross-NPU2 state directory escaped its fixed root" >&2
+    exit 2
+  fi
+  kvaf_global_state_root=$(realpath -e "${KVAF_GLOBAL_STATE_DIR}") || exit 2
+  kvaf_state_root=${resolved_actual}
+  kvaf_results_root=$(realpath -e "${KVAF_DIRECT_RESULT_ROOT}") || exit 2
+  if [[ "${kvaf_results_root}" != "${kvaf_state_root}/results" ]]; then
+    echo "ERROR: cross-NPU2 result root escaped its fixed state directory" >&2
+    exit 2
+  fi
+  KVAF_DIRECT_RESULT_ROOT=${kvaf_results_root}
+
+  for path in \
+    "${KVAF_CROSS_NPU_LOCK_FILE}" \
+    "${KVAF_DIRECT_DEPLOY_RUN_LOCK}" \
+    "${KVAF_DIRECT_ACTIVE_SESSION_LOCK}" \
+    "${KVAF_DIRECT_ACTIVE_SESSION_FILE}" \
+    "${KVAF_DIRECT_QUARANTINE_FILE}" \
+    "${KVAF_EID_LOCK_FILE}"; do
+    if [[ -L "${path}" ]]; then
+      echo "ERROR: cross-NPU risk state path must not be a symlink: ${path}" >&2
+      exit 2
+    fi
+  done
+
+  exec 10>"${KVAF_CROSS_NPU_LOCK_FILE}"
+  chmod 0600 "${KVAF_CROSS_NPU_LOCK_FILE}"
+  if ! flock -n 10; then
+    echo "ERROR: another cross-NPU risk experiment owns FD10" >&2
+    exit 5
+  fi
+  # Close the validation/serialization race before taking target locks.
+  validate_cross_npu_risk_acceptance || exit $?
+
+  exec 9>"${KVAF_DIRECT_DEPLOY_RUN_LOCK}"
+  chmod 0600 "${KVAF_DIRECT_DEPLOY_RUN_LOCK}"
+  if ! flock -w "${KVAF_EID_LOCK_TIMEOUT_SECONDS}" 9; then
+    echo "ERROR: another NPU2 risk run owns ${KVAF_DIRECT_DEPLOY_RUN_LOCK}" >&2
+    exit 5
+  fi
+  if [[ -e "${KVAF_DIRECT_QUARANTINE_FILE}" ||
+        -L "${KVAF_DIRECT_QUARANTINE_FILE}" ]]; then
+    echo "ERROR: the isolated NPU2 risk transaction is quarantined" >&2
+    [[ -f "${KVAF_DIRECT_QUARANTINE_FILE}" &&
+       ! -L "${KVAF_DIRECT_QUARANTINE_FILE}" ]] &&
+      cat "${KVAF_DIRECT_QUARANTINE_FILE}" >&2
+    exit 4
+  fi
+
+  exec 8>"${KVAF_DIRECT_ACTIVE_SESSION_LOCK}"
+  chmod 0600 "${KVAF_DIRECT_ACTIVE_SESSION_LOCK}"
+  if ! flock -n 8; then
+    echo "ERROR: a prior isolated NPU2 worker retains its active lock" >&2
+    exit 5
+  fi
+  if [[ -e "${KVAF_DIRECT_ACTIVE_SESSION_FILE}" ||
+        -L "${KVAF_DIRECT_ACTIVE_SESSION_FILE}" ]]; then
+    if recover_stale_active_session; then
+      :
+    else
+      recovery_rc=$?
+      if (( recovery_rc == 4 )); then
+        echo "ERROR: stale isolated NPU2 state was quarantined" >&2
+        exit 4
+      fi
+      echo "ERROR: stale isolated NPU2 state is not safely recoverable" >&2
+      exit 5
+    fi
+  fi
+}
+
 require_uint_max KVAF_LOGICAL_DEVICE_ID \
   "${KVAF_LOGICAL_DEVICE_ID}" 4294967295
 case "${KVAF_DIRECT_MANAGEMENT_MODE}" in
@@ -715,8 +1035,11 @@ fi
 if (( KVAF_H2D_TRANSFER_COUNT == 0 )) &&
    [[ "${kvaf_affinity_run_mode}" != \
       candidate-epoch-owner-validation-v1 ]]; then
-  echo "ERROR: zero-WQE lifecycle is available only through the staged epoch-owner validation wrapper" >&2
-  exit 2
+  if [[ "${kvaf_affinity_run_mode}" != \
+        risk-accepted-cross-npu2-v1 ]]; then
+    echo "ERROR: zero-WQE lifecycle is available only through a staged validation entry" >&2
+    exit 2
+  fi
 fi
 if (( KVAF_H2D_TRANSFER_COUNT > KVAF_H2D_DESCRIPTOR_CAPACITY )); then
   echo "ERROR: KVAF_H2D_TRANSFER_COUNT exceeds KVAF_H2D_DESCRIPTOR_CAPACITY" >&2
@@ -794,10 +1117,15 @@ command -v realpath >/dev/null 2>&1 || {
   exit 2
 }
 
-# This guard intentionally precedes EID selector and NPU access. A prior
-# unsafe run must be reported without touching ACL, npu-smi, or the
-# host-global /proc/asdrv_ub/dev_id selector again.
-acquire_persistent_session_guards
+# This guard intentionally precedes EID selector and NPU access. Production
+# continues to reject every global quarantine.  The exact risk mode uses an
+# isolated target transaction and a read-only validator for one pinned NPU7
+# quarantine; it never calls or weakens the production legacy guard.
+if (( kvaf_cross_npu_risk_mode != 0 )); then
+  acquire_cross_npu2_risk_session_guards
+else
+  acquire_persistent_session_guards
+fi
 
 # Artifact mutation deliberately refuses any active/quarantine marker, while
 # stale-session recovery must remain independent of the current provider
@@ -911,6 +1239,21 @@ if [[ "${KVAF_LOGICAL_DEVICE_ID}" != \
   echo "No Host/Device DDR, HBM, URMA, SQ, or CQ resource was created." >&2
   exit 2
 fi
+if (( kvaf_cross_npu_risk_mode != 0 )); then
+  if [[ "${KVAF_LOGICAL_DEVICE_ID}" != 2 ||
+        "${KVAF_PHYSICAL_DEVICE_ID}" != 2 ||
+        "${KVAF_DIRECT_MANAGEMENT_MODE}" != ub ||
+        "${KVAF_PAIR_CHANNEL}" != 0 ||
+        "${KVAF_HOST_EID}" != \
+          00000000007f040000100000df0a0b00 ||
+        "${KVAF_DEVICE_EID}" != \
+          000000000000020000100000df004100 ]]; then
+    echo "ERROR: cross-NPU risk mode is pinned to the known NPU2 UB endpoint pair" >&2
+    echo "TARGET=NPU2 host=00000000007f040000100000df0a0b00 device=000000000000020000100000df004100 channel=0" >&2
+    echo "No topology/EID/NPU operation was attempted." >&2
+    exit 2
+  fi
+fi
 
 # UMDK's URMA-management bootstrap uses a well-known server Jetty ID. Keep
 # it in the kernel-reserved range so it cannot collide with dynamically
@@ -929,6 +1272,11 @@ if (( KVAF_DIRECT_MANAGEMENT_JETTY_ID == 0 ||
       KVAF_DIRECT_MANAGEMENT_JETTY_ID == 21115 ||
       KVAF_DIRECT_MANAGEMENT_JETTY_ID > 1023 )); then
   echo "ERROR: KVAF_DIRECT_MANAGEMENT_JETTY_ID must be in the reserved range [1, 1023] and must not be 21115" >&2
+  exit 2
+fi
+if (( kvaf_cross_npu_risk_mode != 0 )) &&
+   [[ "${KVAF_DIRECT_MANAGEMENT_JETTY_ID}" != 502 ]]; then
+  echo "ERROR: cross-NPU risk mode is pinned to management Jetty 502" >&2
   exit 2
 fi
 
@@ -1158,6 +1506,16 @@ if [[ "${KVAF_HOST_URMA_DEVICE}" == */* ||
   echo "ERROR: resolved UDMA names must be safe basenames shorter than 32 bytes" >&2
   exit 2
 fi
+if (( kvaf_cross_npu_risk_mode != 0 )) &&
+   [[ "${KVAF_HOST_URMA_DEVICE}" != udmac1d1e4 ||
+      "${KVAF_HOST_EID_INDEX}" != 0 ||
+      "${KVAF_DEVICE_URMA_DEVICE}" != udmac0d1e4 ||
+      "${KVAF_DEVICE_EID_INDEX}" != 0 ]]; then
+  echo "ERROR: discovered endpoints do not match the pinned NPU2 risk contract" >&2
+  echo "EXPECTED_HOST=udmac1d1e4/eid0" >&2
+  echo "EXPECTED_DEVICE=udmac0d1e4/eid0" >&2
+  exit 2
+fi
 echo "KVAF_A5_URMA_ENDPOINTS_RESOLVED source=host_sysfs+hccn_tool host=${KVAF_HOST_URMA_DEVICE}/eid${KVAF_HOST_EID_INDEX} device=${KVAF_DEVICE_URMA_DEVICE}/eid${KVAF_DEVICE_EID_INDEX}"
 
 # The ABI-pinned accessor exports the normal userspace qbuf geometry and
@@ -1341,11 +1699,69 @@ archive_sha=$(
   sha256sum "${KVAF_DIRECT_AICPU_ARCHIVE}" |
     awk '{print $1}'
 )
+risk_validator_sha=not-applicable
+if (( kvaf_cross_npu_risk_mode != 0 )); then
+  risk_validator_sha=$(
+    sha256sum "${SCRIPT_DIR}/validate_a5_cross_npu_risk_acceptance.py" |
+      awk '{print $1}'
+  )
+fi
 {
   printf 'kvaf_commit=%s\n' "${kvaf_commit}"
   printf 'aicpu_affinity_contract=%s\n' \
     "${KVAF_AICPU_AFFINITY_CONTRACT}"
   printf 'aicpu_affinity_run_mode=%s\n' "${kvaf_affinity_run_mode}"
+  if (( kvaf_cross_npu_risk_mode != 0 )); then
+    printf 'execution_safety_contract=experimental-risk-accepted-cross-npu2-v1\n'
+    printf 'production_safety_claim=none\n'
+    printf 'artifact_mutation_policy=forbidden\n'
+    printf 'cross_npu_artifact_id=%s\n' \
+      "${KVAF_CROSS_NPU_ARTIFACT_ID}"
+    printf 'cross_npu_artifact_manifest=%s\n' \
+      "${kvaf_cross_npu_artifact_manifest}"
+    printf 'cross_npu_artifact_manifest_sha256=%s\n' \
+      "${KVAF_CROSS_NPU_ARTIFACT_MANIFEST_SHA256}"
+    printf 'source_process_policy=retain-no-signal\n'
+    printf 'cross_npu_lock_fd=10\n'
+    printf 'cross_npu_lock_file=%s\n' "${KVAF_CROSS_NPU_LOCK_FILE}"
+    printf 'cross_npu_target_state_dir=%s\n' "${KVAF_DIRECT_STATE_DIR}"
+    printf 'cross_npu_source_quarantine_file=%s\n' \
+      "${KVAF_CROSS_NPU_SOURCE_QUARANTINE_FILE}"
+    printf 'cross_npu_source_quarantine_sha256=%s\n' \
+      "${KVAF_CROSS_NPU_SOURCE_QUARANTINE_SHA256}"
+    printf 'cross_npu_source_quarantine_identity=%s\n' \
+      "${KVAF_CROSS_NPU_SOURCE_QUARANTINE_IDENTITY}"
+    printf 'cross_npu_source_run_id=%s\n' \
+      "${KVAF_CROSS_NPU_SOURCE_RUN_ID}"
+    printf 'cross_npu_source_kvaf_commit=ed13d76f4a5a9c89b91c0524b2a4f53da2e3a874\n'
+    printf 'cross_npu_source_logical_device_id=7\n'
+    printf 'cross_npu_source_physical_device_id=7\n'
+    printf 'cross_npu_source_host_eid=00000000003f050000100000df080b00\n'
+    printf 'cross_npu_source_device_eid=000000000000020000100000df00e100\n'
+    printf 'cross_npu_source_host_urma_device=udmac0d1e5\n'
+    printf 'cross_npu_source_host_eid_index=0\n'
+    printf 'cross_npu_source_device_urma_device=udmac0d0e2\n'
+    printf 'cross_npu_source_device_eid_index=0\n'
+    printf 'cross_npu_source_management_jetty_id=507\n'
+    printf 'cross_npu_target_logical_device_id=2\n'
+    printf 'cross_npu_source_result_dir=%s\n' \
+      "${KVAF_CROSS_NPU_ACCEPTED_RESULT_DIR}"
+    printf 'cross_npu_source_manifest_sha256=%s\n' \
+      "${KVAF_CROSS_NPU_ACCEPTED_MANIFEST_SHA256}"
+    printf 'cross_npu_source_device_final_sha256=%s\n' \
+      "${KVAF_CROSS_NPU_ACCEPTED_DEVICE_FINAL_SHA256}"
+    printf 'cross_npu_source_host_pid=%s\n' \
+      "${KVAF_CROSS_NPU_ACCEPTED_HOST_PID}"
+    printf 'cross_npu_source_host_start_ticks=%s\n' \
+      "${KVAF_CROSS_NPU_ACCEPTED_HOST_START_TICKS}"
+    printf 'cross_npu_source_device_pid=%s\n' \
+      "${KVAF_CROSS_NPU_ACCEPTED_DEVICE_PID}"
+    printf 'cross_npu_source_device_start_ticks=%s\n' \
+      "${KVAF_CROSS_NPU_ACCEPTED_DEVICE_START_TICKS}"
+    printf 'cross_npu_risk_validator_sha256=%s\n' \
+      "${risk_validator_sha}"
+    printf 'unverified_risk_mask=UMMU_GLOBAL|AICPU_PROCESS_REUSE|INFLIGHT_DMA_SCOPE|PLBI_PSYNC_SCOPE|DRIVER_GLOBAL_STATE\n'
+  fi
   printf 'run_id=%s\n' "${kvaf_run_id}"
   printf 'ascend_home_path=%s\n' "${ASCEND_HOME_PATH}"
   printf 'logical_device_id=%s\n' "${KVAF_LOGICAL_DEVICE_ID}"
@@ -2087,6 +2503,9 @@ echo "MANIFEST=${manifest}"
 if (( runner_signal_requested != 0 )); then
   exit 130
 fi
+if (( kvaf_cross_npu_risk_mode != 0 )); then
+  validate_cross_npu_risk_acceptance || exit 5
+fi
 write_active_session
 active_phase=host_launch_intent
 write_active_session
@@ -2237,6 +2656,9 @@ if [[ -e "${host_final}" || -L "${host_final}" ]]; then
   exit 5
 fi
 
+if (( kvaf_cross_npu_risk_mode != 0 )); then
+  validate_cross_npu_risk_acceptance || exit 5
+fi
 active_phase=device_launch_intent
 write_active_session
 nohup "${KVAF_A5_DIRECT_BINARY}" --role device "${device_args[@]}" \

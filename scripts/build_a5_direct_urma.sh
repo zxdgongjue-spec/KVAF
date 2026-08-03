@@ -2,14 +2,61 @@
 
 set -Eeuo pipefail
 
+kvaf_direct_build_mode=${1:-production}
+if (( $# > 1 )) ||
+   [[ "${kvaf_direct_build_mode}" != production &&
+      "${kvaf_direct_build_mode}" != \
+        cross-npu2-risk-offline-v1 ]]; then
+  echo "ERROR: invalid direct URMA build mode" >&2
+  exit 2
+fi
+
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd -P)
 source "${SCRIPT_DIR}/a5_direct_urma_legacy_guard.sh"
-kvaf_configure_direct_urma_state_paths "${ROOT_DIR}" || exit 2
+
+kvaf_cross_npu_offline_build=0
+if [[ "${kvaf_direct_build_mode}" == cross-npu2-risk-offline-v1 ]]; then
+  kvaf_cross_npu_offline_build=1
+  : "${KVAF_CROSS_NPU_SOURCE_RUN_ID:?set the pinned NPU7 run ID}"
+  : "${KVAF_CROSS_NPU_SOURCE_QUARANTINE_SHA256:?set the pinned NPU7 quarantine SHA256}"
+  if [[ "${KVAF_CROSS_NPU_RISK_ACCEPTANCE:-}" != \
+        I_ACCEPT_UNKNOWN_CROSS_NPU_DMA_RISK ]]; then
+    echo "ERROR: the offline risk build requires the exact acceptance phrase" >&2
+    exit 2
+  fi
+  kvaf_configure_cross_npu2_risk_state_paths \
+    "${ROOT_DIR}" "${KVAF_CROSS_NPU_SOURCE_RUN_ID}" || exit 2
+else
+  kvaf_configure_direct_urma_state_paths "${ROOT_DIR}" || exit 2
+fi
 
 : "${ASCEND_HOME_PATH:?source the CANN set_env.sh before building}"
 
-KVAF_A5_DIRECT_BUILD_DIR=${KVAF_A5_DIRECT_BUILD_DIR:-"${ROOT_DIR}/build-a5-direct-urma"}
+if (( kvaf_cross_npu_offline_build != 0 )); then
+  : "${KVAF_CROSS_NPU_ARTIFACT_ID:?set a fresh 32-hex artifact ID}"
+  if [[ ! "${KVAF_CROSS_NPU_ARTIFACT_ID}" =~ ^[0-9a-f]{32}$ ]]; then
+    echo "ERROR: KVAF_CROSS_NPU_ARTIFACT_ID must be 32 lowercase hexadecimal digits" >&2
+    exit 2
+  fi
+  kvaf_source_commit=$(git -C "${ROOT_DIR}" rev-parse HEAD) || exit 2
+  if [[ ! "${kvaf_source_commit}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "ERROR: could not pin the KVAF source commit" >&2
+    exit 2
+  fi
+  kvaf_expected_build_dir="${KVAF_GLOBAL_STATE_DIR}/KVAF/experimental/artifacts/${kvaf_source_commit}/${KVAF_CROSS_NPU_ARTIFACT_ID}"
+  if [[ -n "${KVAF_A5_DIRECT_BUILD_DIR+x}" &&
+        "${KVAF_A5_DIRECT_BUILD_DIR}" != \
+          "${kvaf_expected_build_dir}" ]]; then
+    echo "ERROR: the risk build directory is source-owned" >&2
+    echo "EXPECTED=${kvaf_expected_build_dir}" >&2
+    echo "ACTUAL=${KVAF_A5_DIRECT_BUILD_DIR}" >&2
+    exit 2
+  fi
+  KVAF_A5_DIRECT_BUILD_DIR=${kvaf_expected_build_dir}
+else
+  KVAF_A5_DIRECT_BUILD_DIR=${KVAF_A5_DIRECT_BUILD_DIR:-"${ROOT_DIR}/build-a5-direct-urma"}
+fi
 KVAF_A5_BUILD_JOBS=${KVAF_A5_BUILD_JOBS:-8}
 KVAF_A5_COMPILE_MODE=${KVAF_A5_COMPILE_MODE:-auto}
 KVAF_BISHENG=${KVAF_BISHENG:-$(command -v bisheng || true)}
@@ -34,8 +81,77 @@ if ! command -v flock >/dev/null 2>&1; then
   echo "ERROR: flock is required to serialize direct URMA deploy/run" >&2
   exit 2
 fi
-if ! kvaf_check_legacy_direct_urma_state "${ROOT_DIR}"; then
-  exit 4
+if (( kvaf_cross_npu_offline_build == 0 )); then
+  if ! kvaf_check_legacy_direct_urma_state "${ROOT_DIR}"; then
+    exit 4
+  fi
+else
+  for kvaf_required_command in git python3 realpath sha256sum; do
+    command -v "${kvaf_required_command}" >/dev/null 2>&1 || {
+      echo "ERROR: ${kvaf_required_command} is required for the risk build" >&2
+      exit 2
+    }
+  done
+  if ! git -C "${ROOT_DIR}" diff --quiet --ignore-submodules -- ||
+     ! git -C "${ROOT_DIR}" diff --cached --quiet --ignore-submodules --; then
+    echo "ERROR: the cross-NPU risk build requires a clean tracked checkout" >&2
+    exit 2
+  fi
+  kvaf_cross_npu_validator="${SCRIPT_DIR}/validate_a5_cross_npu_risk_acceptance.py"
+  if [[ -L "${kvaf_cross_npu_validator}" ||
+        ! -f "${kvaf_cross_npu_validator}" ||
+        ! -r "${kvaf_cross_npu_validator}" ]]; then
+    echo "ERROR: cross-NPU acceptance validator is missing or unsafe" >&2
+    exit 2
+  fi
+  python3 "${kvaf_cross_npu_validator}" \
+    --quarantine /data/.kvaf-state/KVAF/direct-urma.quarantine \
+    --quarantine-sha256 \
+      "${KVAF_CROSS_NPU_SOURCE_QUARANTINE_SHA256}" \
+    --run-id "${KVAF_CROSS_NPU_SOURCE_RUN_ID}" \
+    --source-logical-device-id 7 \
+    --result-root /data/.kvaf-state/KVAF/results
+
+  kvaf_cross_npu_experiment_root="${KVAF_GLOBAL_STATE_DIR}/KVAF/experimental"
+  if [[ -L "${kvaf_cross_npu_experiment_root}" ||
+        ( -e "${kvaf_cross_npu_experiment_root}" &&
+          ! -d "${kvaf_cross_npu_experiment_root}" ) ]]; then
+    echo "ERROR: cross-NPU experiment root must be a real directory" >&2
+    exit 2
+  fi
+  mkdir -p "${kvaf_cross_npu_experiment_root}"
+  chmod 0700 "${kvaf_cross_npu_experiment_root}"
+  exec 10>"${kvaf_cross_npu_experiment_root}/cross-npu-risk.lock"
+  if ! flock -n 10; then
+    echo "ERROR: a cross-NPU experiment is already active" >&2
+    exit 5
+  fi
+  kvaf_artifact_parent=$(dirname "${KVAF_A5_DIRECT_BUILD_DIR}")
+  if [[ -L "${kvaf_artifact_parent}" ||
+        ( -e "${kvaf_artifact_parent}" &&
+          ! -d "${kvaf_artifact_parent}" ) ]]; then
+    echo "ERROR: experimental artifact parent must be a real directory" >&2
+    exit 2
+  fi
+  mkdir -p "${kvaf_artifact_parent}"
+  chmod 0700 "${kvaf_artifact_parent}"
+  kvaf_artifact_parent=$(realpath -e "${kvaf_artifact_parent}") || exit 2
+  if [[ "${kvaf_artifact_parent}" != \
+        "${KVAF_GLOBAL_STATE_DIR}/KVAF/experimental/artifacts/${kvaf_source_commit}" ]]; then
+    echo "ERROR: experimental artifact directory escaped its fixed root" >&2
+    exit 2
+  fi
+  if [[ -e "${KVAF_A5_DIRECT_BUILD_DIR}" ||
+        -L "${KVAF_A5_DIRECT_BUILD_DIR}" ]]; then
+    echo "ERROR: risk build requires a fresh artifact ID" >&2
+    echo "PATH=${KVAF_A5_DIRECT_BUILD_DIR}" >&2
+    exit 2
+  fi
+  exec 11>"${KVAF_A5_DIRECT_BUILD_DIR}.lock"
+  if ! flock -n 11; then
+    echo "ERROR: another process owns this experimental artifact ID" >&2
+    exit 5
+  fi
 fi
 if [[ -L "${KVAF_GLOBAL_STATE_DIR}" ||
       ( -e "${KVAF_GLOBAL_STATE_DIR}" &&
@@ -282,6 +398,29 @@ compiler_path=${KVAF_BISHENG}
 compiler_sha256=${compiler_sha}
 ascend_home_path=${ASCEND_HOME_PATH}
 EOF
+
+if (( kvaf_cross_npu_offline_build != 0 )); then
+  # Recheck the accepted source incident after the potentially long compile.
+  # The build is CPU-only; a changed source worker/quarantine invalidates the
+  # artifact before it can be selected by the hardware runner.
+  python3 "${kvaf_cross_npu_validator}" \
+    --quarantine /data/.kvaf-state/KVAF/direct-urma.quarantine \
+    --quarantine-sha256 \
+      "${KVAF_CROSS_NPU_SOURCE_QUARANTINE_SHA256}" \
+    --run-id "${KVAF_CROSS_NPU_SOURCE_RUN_ID}" \
+    --source-logical-device-id 7 \
+    --result-root /data/.kvaf-state/KVAF/results
+  printf '%s\n' \
+    'schema=kvaf-a5-cross-npu2-offline-artifact-v1' \
+    "source_commit=${kvaf_source_commit}" \
+    "artifact_id=${KVAF_CROSS_NPU_ARTIFACT_ID}" \
+    "source_run_id=${KVAF_CROSS_NPU_SOURCE_RUN_ID}" \
+    "source_quarantine_sha256=${KVAF_CROSS_NPU_SOURCE_QUARANTINE_SHA256}" \
+    'artifact_mutation_policy=forbidden-during-hardware-run' \
+    >"${KVAF_A5_DIRECT_BUILD_DIR}/cross-npu2-artifact.manifest"
+  chmod 0400 "${KVAF_A5_DIRECT_BUILD_DIR}/cross-npu2-artifact.manifest"
+  echo "KVAF_CROSS_NPU2_OFFLINE_ARTIFACT=${KVAF_A5_DIRECT_BUILD_DIR}"
+fi
 
 echo "KVAF_A5_DIRECT_URMA_BUILD_OK"
 echo "BINARY=${binary}"

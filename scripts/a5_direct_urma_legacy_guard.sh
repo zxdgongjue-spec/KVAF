@@ -47,6 +47,62 @@ kvaf_configure_direct_urma_state_paths()
   done
 }
 
+# Configure the deliberately isolated state transaction used by the one
+# explicit NPU7-quarantine -> NPU2 experiment.  This is not a configurable
+# alternative production root: both the target NPU and the accepted source
+# run are part of the directory identity, and every per-file override is
+# rejected just as it is for the production transaction above.
+kvaf_configure_cross_npu2_risk_state_paths()
+{
+  local root_dir=$1
+  local source_run_id=$2
+  local expected_global_state expected_experiment_root
+  local expected_direct_state variable expected current
+  local -a fixed_paths
+
+  if [[ ! "${source_run_id}" =~ ^[0-9a-f]{32,128}$ ]]; then
+    echo "ERROR: cross-NPU source run ID must be 32-128 lowercase hex digits" >&2
+    return 1
+  fi
+
+  # Keep ROOT_DIR in the interface so callers cannot accidentally substitute
+  # this function for a general state-root setter in another checkout.
+  [[ -n "${root_dir}" ]] || return 1
+  expected_global_state=/data/.kvaf-state
+  expected_experiment_root="${expected_global_state}/KVAF/experimental"
+  expected_direct_state="${expected_experiment_root}/npu-2/${source_run_id}"
+  fixed_paths=(
+    "KVAF_GLOBAL_STATE_DIR=${expected_global_state}"
+    "KVAF_CROSS_NPU_EXPERIMENT_ROOT=${expected_experiment_root}"
+    "KVAF_DIRECT_STATE_DIR=${expected_direct_state}"
+    "KVAF_DIRECT_RESULT_ROOT=${expected_direct_state}/results"
+    "KVAF_EID_LOCK_FILE=${expected_global_state}/asdrv-ub-pair.lock"
+    "KVAF_EID_LEGACY_LOCK_FILE=/run/lock/kvaf_asdrv_ub_pair.lock"
+    "KVAF_DIRECT_DEPLOY_RUN_LOCK=${expected_direct_state}/direct-urma.lock"
+    "KVAF_DIRECT_ACTIVE_SESSION_LOCK=${expected_direct_state}/direct-urma.active.lock"
+    "KVAF_DIRECT_ACTIVE_SESSION_FILE=${expected_direct_state}/direct-urma.active"
+    "KVAF_DIRECT_QUARANTINE_FILE=${expected_direct_state}/direct-urma.quarantine"
+    "KVAF_CROSS_NPU_LOCK_FILE=${expected_experiment_root}/cross-npu-risk.lock"
+    "KVAF_CROSS_NPU_SOURCE_QUARANTINE_FILE=${expected_global_state}/KVAF/direct-urma.quarantine"
+    "KVAF_CROSS_NPU_SOURCE_RESULT_ROOT=${expected_global_state}/KVAF/results"
+  )
+
+  for variable in "${fixed_paths[@]}"; do
+    expected=${variable#*=}
+    variable=${variable%%=*}
+    if declare -p "${variable}" >/dev/null 2>&1; then
+      current=${!variable}
+      if [[ "${current}" != "${expected}" ]]; then
+        echo "ERROR: ${variable} cannot override the fixed cross-NPU2 risk root" >&2
+        echo "EXPECTED=${expected}" >&2
+        echo "ACTUAL=${current}" >&2
+        return 1
+      fi
+    fi
+    printf -v "${variable}" '%s' "${expected}"
+  done
+}
+
 kvaf_check_legacy_direct_urma_state()
 {
   local root_dir=$1
