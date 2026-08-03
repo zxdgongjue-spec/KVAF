@@ -639,8 +639,11 @@ active/quarantine 尚未闭环，该入口会在 topology、ACL、DDR/HBM、URMA
 4096、1024、1。控制 timeout 默认 60 秒，单阶段 runner supervision deadline 默认
 180 秒，失败后保留全部证据且不会自动进入下一阶段。干净重启后可从 Docker 内调用
 `prepare_and_run_a5_direct_urma_npu2_clean.sh`，由它依次完成 provider 构建、AICPU
-打包、direct binary 构建和上述三阶段验证，避免在终端逐段粘贴命令；每个子步骤
-仍使用原有 machine-wide guard。
+打包、direct binary 构建、无 URMA 资源的 AICPU owner probe 和上述三阶段验证，避免
+在终端逐段粘贴命令；每个子步骤仍使用原有 machine-wide guard。入口接受安装器生成
+的 `ascend-toolkit/set_env.sh` 版本软链接，但要求它解析到固定 CANN 9.1.0；同时拒绝
+全部 cross-NPU/reuse 环境变量并固定普通 provider、AICPU 包和构建目录，避免从事故
+诊断 shell 继承版本化实验产物。
 
 ## 6. 操作命令
 

@@ -17,6 +17,7 @@ if (( $# != 0 )); then
 fi
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd -P)
 : "${ASCEND_HOME_PATH:?source the container CANN set_env.sh first}"
 
 kvaf_reject_risk_variable()
@@ -38,6 +39,17 @@ for kvaf_variable in \
 do
   kvaf_reject_risk_variable "${kvaf_variable}"
 done
+
+# Reject every current or future cross-NPU experiment variable.  The explicit
+# list above documents the first-generation contract; the prefix scan closes
+# the same boundary for the versioned/reuse experiment family.
+kvaf_cross_npu_variables=$(
+  env | sed -n 's/^\(KVAF_CROSS_NPU[A-Za-z0-9_]*\)=.*/\1/p'
+)
+while IFS= read -r kvaf_variable; do
+  [[ -n "${kvaf_variable}" ]] || continue
+  kvaf_reject_risk_variable "${kvaf_variable}"
+done <<<"${kvaf_cross_npu_variables}"
 
 kvaf_pin_value()
 {
@@ -63,6 +75,16 @@ kvaf_pin_value KVAF_PAIR_CHANNEL 0
 kvaf_pin_value KVAF_DIRECT_MANAGEMENT_MODE ub
 kvaf_pin_value KVAF_DIRECT_MANAGEMENT_JETTY_ID 502
 kvaf_pin_value KVAF_DIRECT_ALLOW_BUSY_NPU 0
+kvaf_pin_value KVAF_DIRECT_PROVIDER_BUILD_DIR \
+  "${ROOT_DIR}/build-a5-direct-urma-provider"
+kvaf_pin_value KVAF_A5_DIRECT_BUILD_DIR \
+  "${ROOT_DIR}/build-a5-direct-urma"
+kvaf_pin_value KVAF_DIRECT_PROVIDER_SONAME \
+  libkvaf_urma_provider_device.so
+kvaf_pin_value KVAF_DIRECT_AICPU_ARCHIVE \
+  "${ASCEND_HOME_PATH}/opp/vendors/cust/op_impl/aicpu/kernel/cann-kvaf-direct-urma-compat.tar.gz"
+kvaf_pin_value KVAF_DIRECT_AICPU_REGISTRATION_FILE \
+  "${ASCEND_HOME_PATH}/conf/ascend_package_load.ini"
 
 # Resolve the fixed EIDs against the live Host/AICPU inventory.  Stale caller
 # guesses such as udmac0d1e4 must not select an endpoint by name.

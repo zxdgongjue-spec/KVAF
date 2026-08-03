@@ -39,6 +39,11 @@ class Npu2CleanValidationTests(unittest.TestCase):
             "kvaf_pin_value KVAF_DIRECT_MANAGEMENT_MODE ub",
             "kvaf_pin_value KVAF_DIRECT_MANAGEMENT_JETTY_ID 502",
             "kvaf_pin_value KVAF_DIRECT_ALLOW_BUSY_NPU 0",
+            "KVAF_CROSS_NPU[A-Za-z0-9_]*",
+            "kvaf_pin_value KVAF_DIRECT_PROVIDER_BUILD_DIR",
+            "kvaf_pin_value KVAF_A5_DIRECT_BUILD_DIR",
+            "kvaf_pin_value KVAF_DIRECT_PROVIDER_SONAME",
+            "kvaf_pin_value KVAF_DIRECT_AICPU_ARCHIVE",
             "unset KVAF_HOST_URMA_DEVICE",
             "unset KVAF_DEVICE_URMA_DEVICE",
             "KVAF_NPU2_TRANSFER_COUNT:-4096",
@@ -57,12 +62,26 @@ class Npu2CleanValidationTests(unittest.TestCase):
         provider = coordinator.index("build_a5_direct_urma_provider.sh")
         package = coordinator.index("package_a5_direct_urma_aicpu.sh")
         direct = coordinator.index('build_a5_direct_urma.sh"')
+        owner_probe = coordinator.index("run_a5_aicpu_owner_probe.sh")
         validation = coordinator.index(
             "run_a5_direct_urma_npu2_clean_validation.sh"
         )
         self.assertLess(provider, package)
         self.assertLess(package, direct)
-        self.assertLess(direct, validation)
+        self.assertLess(direct, owner_probe)
+        self.assertLess(owner_probe, validation)
+        for required in (
+            "/usr/local/Ascend/cann-9.1.0",
+            "kvaf_cann_alias_real",
+            "kvaf_cann_entry_real",
+            'source "${kvaf_cann_entry_real}"',
+            "ASCEND_HOME_PATH",
+            "kvaf_bisheng_real",
+        ):
+            self.assertIn(required, coordinator)
+        self.assertNotIn(
+            '[[ -L "${KVAF_ASCEND_SET_ENV}"', coordinator
+        )
         self.assertNotIn("risk-accepted-cross-npu2-v1", coordinator)
         self.assertNotIn("rm -f /data/.kvaf-state", coordinator)
         self.assertNotIn("kill ", coordinator)
@@ -110,6 +129,16 @@ class Npu2CleanValidationTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 2)
         self.assertIn("is forbidden", result.stderr)
+        self.assertNotIn("RESULT_DIR=", result.stdout)
+
+        result = self.run_preflight(
+            KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN="0000000000000002"
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "KVAF_CROSS_NPU2_REUSE_ARTIFACT_TOKEN is forbidden",
+            result.stderr,
+        )
         self.assertNotIn("RESULT_DIR=", result.stdout)
 
     def test_rejects_invalid_batch_shape_before_hardware(self) -> None:
