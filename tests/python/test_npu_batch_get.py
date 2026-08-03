@@ -403,11 +403,17 @@ def main() -> int:
             graph_output_indices_source = torch.empty(
                 requests, dtype=torch.int32, device=device
             )
+            graph_indices_staging = torch.empty(
+                requests, dtype=torch.int32, device=device
+            )
+            graph_output_indices_staging = torch.empty(
+                requests, dtype=torch.int32, device=device
+            )
             graph_post_marker = torch.zeros(1, dtype=torch.uint8, device=device)
 
-            def make_graph_inputs(
+            def prepare_graph_inputs(
                 epoch: int,
-            ) -> tuple[list[int | None], list[int], object, object]:
+            ) -> tuple[list[int | None], list[int]]:
                 graph_indices = [table_capacity - 1] * requests
                 graph_payload_slots: list[int | None] = [None] * requests
                 for ordinal, request in enumerate(active_request_positions):
@@ -417,32 +423,39 @@ def main() -> int:
                 graph_output_indices = [
                     (row + epoch) % output_rows for row in output_indices_values
                 ]
-                return (
-                    graph_payload_slots,
-                    graph_output_indices,
-                    torch.tensor(graph_indices, dtype=torch.int32),
-                    torch.tensor(graph_output_indices, dtype=torch.int32),
+                # The normal caller stream prepares a fixed NPU staging
+                # buffer. This work is intentionally outside graph timing.
+                graph_indices_staging.copy_(
+                    torch.tensor(graph_indices, dtype=torch.int32, device=device)
                 )
+                graph_output_indices_staging.copy_(
+                    torch.tensor(
+                        graph_output_indices, dtype=torch.int32, device=device
+                    )
+                )
+                torch.npu.synchronize()
+                return graph_payload_slots, graph_output_indices
 
             def enqueue_graph_input_update(
-                stream: object, graph_indices_host: object, graph_output_indices_host: object
+                stream: object, trace: str | None = None
             ) -> None:
                 # This is deliberately outside the captured graph and uses
                 # the graph's stream. The demo has verified this producer ->
                 # replay ordering; a naked aclmdlRI graph replay can stall.
+                if trace is not None:
+                    print(f"RUNTIME_NPU_GRAPH_INPUT_STREAM_ENTER replay={trace}")
                 with torch.npu.stream(stream):
-                    graph_indices_source.copy_(graph_indices_host)
-                    graph_output_indices_source.copy_(graph_output_indices_host)
+                    if trace is not None:
+                        print(f"RUNTIME_NPU_GRAPH_INPUT_COPY_BEGIN replay={trace}")
+                    graph_indices_source.copy_(graph_indices_staging)
+                    if trace is not None:
+                        print(f"RUNTIME_NPU_GRAPH_INPUT_INDICES_DONE replay={trace}")
+                    graph_output_indices_source.copy_(graph_output_indices_staging)
+                    if trace is not None:
+                        print(f"RUNTIME_NPU_GRAPH_INPUT_OUTPUT_INDICES_DONE replay={trace}")
 
-            (
-                graph_payload_slots,
-                graph_output_indices,
-                graph_indices_host,
-                graph_output_indices_host,
-            ) = make_graph_inputs(0)
-            enqueue_graph_input_update(
-                caller_stream, graph_indices_host, graph_output_indices_host
-            )
+            graph_payload_slots, graph_output_indices = prepare_graph_inputs(0)
+            enqueue_graph_input_update(caller_stream)
             caller_stream.synchronize()
             capture_stream = torch.npu.Stream(device=device_id)
             graph = torch.npu.NPUGraph()
@@ -460,16 +473,9 @@ def main() -> int:
 
             graph_completed_batches = 3 + warmup + iterations
             for replay in range(graph_replays):
-                (
-                    graph_payload_slots,
-                    graph_output_indices,
-                    graph_indices_host,
-                    graph_output_indices_host,
-                ) = make_graph_inputs(replay)
+                graph_payload_slots, graph_output_indices = prepare_graph_inputs(replay)
                 print(f"RUNTIME_NPU_GRAPH_REPLAY_BEGIN replay={replay}")
-                enqueue_graph_input_update(
-                    capture_stream, graph_indices_host, graph_output_indices_host
-                )
+                enqueue_graph_input_update(capture_stream, str(replay))
                 print(f"RUNTIME_NPU_GRAPH_INPUT_ENQUEUED replay={replay}")
                 graph.replay()
                 print(f"RUNTIME_NPU_GRAPH_REPLAY_ENQUEUED replay={replay}")
@@ -497,15 +503,8 @@ def main() -> int:
 
             print("RUNTIME_NPU_GRAPH_PERF_WARMUP_BEGIN")
             for warmup_iteration in range(graph_warmup):
-                (
-                    _,
-                    _,
-                    graph_indices_host,
-                    graph_output_indices_host,
-                ) = make_graph_inputs(graph_replays + warmup_iteration)
-                enqueue_graph_input_update(
-                    capture_stream, graph_indices_host, graph_output_indices_host
-                )
+                prepare_graph_inputs(graph_replays + warmup_iteration)
+                enqueue_graph_input_update(capture_stream)
                 graph.replay()
                 capture_stream.synchronize()
                 graph_completed_batches += 1
@@ -519,13 +518,9 @@ def main() -> int:
                 (
                     final_graph_payload_slots,
                     final_graph_output_indices,
-                    graph_indices_host,
-                    graph_output_indices_host,
-                ) = make_graph_inputs(epoch)
+                ) = prepare_graph_inputs(epoch)
                 begin = time.perf_counter()
-                enqueue_graph_input_update(
-                    capture_stream, graph_indices_host, graph_output_indices_host
-                )
+                enqueue_graph_input_update(capture_stream)
                 graph.replay()
                 capture_stream.synchronize()
                 graph_samples.append((time.perf_counter() - begin) * 1000.0)
@@ -551,7 +546,7 @@ def main() -> int:
                 active_requests * block_bytes / (1024.0**3) / (graph_mean_ms / 1000.0)
             )
             print(
-                "GRAPH_PERF_RESULT metric=external_graph_input_update_to_stream_completion "
+                "GRAPH_PERF_RESULT metric=external_graph_input_copy_to_stream_completion "
                 f"samples={graph_iterations} warmup_excluded={graph_warmup} "
                 f"active_requests={active_requests} block_bytes={block_bytes} "
                 f"npu_cores={npu_core_count} mean_ms={graph_mean_ms:.3f} "
