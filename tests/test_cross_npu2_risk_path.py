@@ -16,6 +16,9 @@ ROOT = Path(__file__).parents[1]
 WRAPPER = (
     ROOT / "scripts" / "run_a5_direct_urma_cross_npu2_risk_accepted.sh"
 )
+COORDINATOR = (
+    ROOT / "scripts" / "run_a5_cross_npu2_recovery_experiment.sh"
+)
 BUILD = ROOT / "scripts" / "build_a5_direct_urma.sh"
 RUNNER = ROOT / "scripts" / "run_a5_direct_urma_h2d_smoke.sh"
 GATE_SCRIPT = ROOT / "scripts" / "validate_a5_cross_npu_zero_wqe_pass.py"
@@ -159,7 +162,7 @@ class CrossNpu2RiskPathTests(unittest.TestCase):
         bash = shutil.which("bash")
         if bash is None:
             self.skipTest("bash is unavailable")
-        for script in (WRAPPER, BUILD):
+        for script in (WRAPPER, COORDINATOR, BUILD):
             result = subprocess.run(
                 [bash, "-n", str(script)],
                 check=False,
@@ -177,6 +180,11 @@ class CrossNpu2RiskPathTests(unittest.TestCase):
         self.assertIn("zero-wqe", source)
         self.assertIn("one-kib", source)
         self.assertNotIn("4096", source)
+        coordinator = COORDINATOR.read_text(encoding="utf-8")
+        self.assertIn("build_a5_direct_urma.sh", coordinator)
+        self.assertIn("cross-npu2-risk-offline-v1", coordinator)
+        self.assertIn("zero-wqe-pass.handoff", coordinator)
+        self.assertIn("KVAF_NPU2_ONE_KIB_H2D_ACCEPTANCE=PASS", coordinator)
 
     def test_offline_build_is_fresh_and_does_not_package_aicpu(self) -> None:
         source = BUILD.read_text(encoding="utf-8")

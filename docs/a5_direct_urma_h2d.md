@@ -402,6 +402,10 @@ PASID/TID、驱动内部 ownership 或 AICPU worker/SO 状态按 NPU 完全隔�
 `run_a5_direct_urma_cross_npu2_risk_accepted.sh` 进入，不能直接调用内部 mode。
 `one-kib` 还必须提供前一轮 zero-WQE 的结果目录，入口会复核双端 final、清理位、
 日志 marker、源 quarantine 摘要以及 artifact/commit 绑定后才提交一条 WQE。
+操作员通常只需要调用更上层的
+`run_a5_cross_npu2_recovery_experiment.sh {zero-wqe|one-kib}`；它从固定全局
+quarantine 派生精确摘要，生成一次性 artifact ID，并在 zero-WQE PASS 后写入只读
+handoff，避免人工复制 EID、路径或结果目录。
 
 出现以下任一情况必须立即停止，不得进入下一阶段：
 
