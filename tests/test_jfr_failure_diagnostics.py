@@ -45,6 +45,12 @@ class JfrFailureDiagnosticsTests(unittest.TestCase):
         cls.jfc = read_source(
             "access_operator/a5/provider/source_matched_udma_jfc.c"
         )
+        cls.jetty = read_source(
+            "access_operator/a5/provider/source_matched_udma_jetty.c"
+        )
+        cls.cleanup = read_source(
+            "access_operator/a5/provider/include/kvaf_source_matched_udma_cleanup.h"
+        )
         cls.communication = read_source(
             "access_operator/a5/provider/source_matched_communication.c"
         )
@@ -239,7 +245,9 @@ class JfrFailureDiagnosticsTests(unittest.TestCase):
             self.communication,
             "static int kvaf_ub_create_local_resources_checked(",
         )
-        create_call = create_resources.index("urma_create_jfr(")
+        create_call = create_resources.index(
+            "kvaf_udma_source_create_management_jfr("
+        )
         failure_call = create_resources.index(
             "kvaf_ub_jfr_creation_error(", create_call
         )
@@ -440,6 +448,119 @@ class JfrFailureDiagnosticsTests(unittest.TestCase):
         parse_call = parser.index("perftest_parse_args(")
         share_call = parser.index('KVAF_ADD_ARG("--share_jfr")')
         self.assertLess(share_call, parse_call)
+
+    def test_device_management_jfr_uses_one_call_kernel_buffer_policy(
+        self,
+    ) -> None:
+        policy = braced_body(
+            self.cleanup, "enum kvaf_udma_queue_memory_policy"
+        )
+        self.assertIn("KVAF_UDMA_QUEUE_MEMORY_AUTO", policy)
+        self.assertIn("KVAF_UDMA_QUEUE_MEMORY_KERNEL_BUFFER", policy)
+
+        allocator = braced_body(
+            self.cleanup,
+            "static inline int kvaf_udma_checked_alloc_queue_buffer_policy(",
+        )
+        self.assertRegex(
+            allocator,
+            r"memory_policy\s*==\s*KVAF_UDMA_QUEUE_MEMORY_AUTO"
+            r"[\s\S]*?queue->ctx->hugepage_enable",
+        )
+        self.assertIn("UDMA_MMAP_KERNEL_BUF", allocator)
+        self.assertNotIn("queue->ctx->hugepage_enable =", allocator)
+
+        default_allocator = braced_body(
+            self.cleanup,
+            "static inline int kvaf_udma_checked_alloc_queue_buffer(",
+        )
+        self.assertIn(
+            "KVAF_UDMA_QUEUE_MEMORY_AUTO", default_allocator
+        )
+
+        checked_create = braced_body(
+            self.jfr, "urma_jfr_t *kvaf_udma_create_jfr_checked("
+        )
+        self.assertIn(
+            "rq_memory_policy = g_kvaf_next_jfr_rq_memory",
+            checked_create,
+        )
+        self.assertIn(
+            "g_kvaf_next_jfr_rq_memory = KVAF_UDMA_QUEUE_MEMORY_AUTO",
+            checked_create,
+        )
+        self.assertRegex(
+            checked_create,
+            r"kvaf_udma_checked_alloc_queue_buffer_policy\s*\("
+            r"[\s\S]*?&jfr->rq[\s\S]*?rq_memory_policy\s*\)",
+        )
+
+        management_wrapper = braced_body(
+            self.jfr,
+            "urma_jfr_t *kvaf_udma_source_create_management_jfr(",
+        )
+        self.assertIn("KVAF_UDMA_PROVIDER_ROLE_DEVICE", management_wrapper)
+        self.assertIn(
+            "KVAF_UDMA_QUEUE_MEMORY_KERNEL_BUFFER", management_wrapper
+        )
+        self.assertEqual(management_wrapper.count("urma_create_jfr("), 2)
+        self.assertGreaterEqual(
+            management_wrapper.count(
+                "g_kvaf_next_jfr_rq_memory = "
+                "KVAF_UDMA_QUEUE_MEMORY_AUTO"
+            ),
+            1,
+        )
+        self.assertNotIn("hugepage_enable =", management_wrapper)
+
+        management_create = braced_body(
+            self.communication,
+            "static int kvaf_ub_create_local_resources_checked(",
+        )
+        self.assertIn(
+            "kvaf_udma_source_create_management_jfr(",
+            management_create,
+        )
+        self.assertIn(
+            "KVAF_URMA_MGMT_JFR_RQ_MEMORY", management_create
+        )
+
+        data_create = braced_body(
+            self.perftest, "static int kvaf_create_duplex_queues_public("
+        )
+        self.assertIn("urma_create_jfr(", data_create)
+        self.assertNotIn(
+            "kvaf_udma_source_create_management_jfr(", data_create
+        )
+
+        for source in (self.jfc, self.jetty):
+            self.assertIn("kvaf_udma_checked_alloc_queue_buffer(", source)
+            self.assertNotIn(
+                "kvaf_udma_checked_alloc_queue_buffer_policy(", source
+            )
+
+        cmake = read_source("access_operator/a5/provider/CMakeLists.txt")
+        self.assertIn("KVAF_UDMA_PROVIDER_ROLE_HOST=1", cmake)
+        self.assertIn("KVAF_UDMA_PROVIDER_ROLE_DEVICE=1", cmake)
+
+        manifest = read_source("scripts/a5_direct_urma_manifest_v3.sh")
+        builder = read_source("scripts/build_a5_direct_urma_provider.sh")
+        package = read_source("scripts/package_a5_direct_urma_aicpu.sh")
+        contract = (
+            "management_device_jfr_rq_memory:"
+            "kernel-buffer-pinned-v1"
+        )
+        self.assertIn(contract, manifest)
+        self.assertIn(
+            "management_device_jfr_rq_memory="
+            "kernel-buffer-pinned-v1",
+            builder,
+        )
+        self.assertIn(
+            "MANAGEMENT_DEVICE_JFR_RQ_MEMORY="
+            "kernel-buffer-pinned-v1",
+            package,
+        )
 
 
 if __name__ == "__main__":

@@ -290,6 +290,18 @@ int kvaf_udma_source_get_jfr_failure(
 void kvaf_udma_source_reset_jfr_failure(void);
 
 /*
+ * Management JFRs retain the public URMA validation/refcount path.  The
+ * Device provider supplies a one-call RQ allocation policy so its small
+ * control-plane receive queue uses the pinned UDMA_MMAP_KERNEL_BUF path;
+ * Host management and every ordinary/data JFR keep the provider's default
+ * capability-driven hugepage policy.
+ */
+urma_jfr_t *kvaf_udma_source_create_management_jfr(
+    urma_context_t *context, urma_jfr_cfg_t *config);
+
+const char *kvaf_udma_source_management_jfr_rq_memory(void);
+
+/*
  * A create operation can return NULL after the kernel or UMMU has already
  * acquired a resource.  Such an object is not visible to the caller and must
  * therefore be retried by its owning context before context destruction.

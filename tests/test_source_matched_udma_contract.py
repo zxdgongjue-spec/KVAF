@@ -260,7 +260,7 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
             "urma_create_context(",
             "urma_create_jfc(",
             "urma_register_seg(",
-            "urma_create_jfr(",
+            "kvaf_udma_source_create_management_jfr(",
             "urma_create_jetty(",
             "ub_server_handshake(",
             "if (kvaf_ub_client_handshake_checked(",

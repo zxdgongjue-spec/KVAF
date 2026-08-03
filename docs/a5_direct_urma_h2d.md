@@ -48,8 +48,10 @@ device-VA。代码不会把这个执行模型误标成 `CREATE_JETTY_EX/TGID-VA`
 Host 与 Device provider 都把固定版本 UMDK 的 common、完整 public URMA
 core、UDMA 和官方 perftest UB/TCP 管理代码，以及配对 libummu 编进自身；private
 core 在编译期禁用动态 provider 目录扫描。两端 UDMA 源码不再通过 `ST64B` 或
-`TGID_VA` 编译宏伪造不同布局，只在 private accessor 上区分 Host 和 AICPU
-执行域。构建与运行脚本同时检查 `DT_NEEDED` 和 `ldd`，发现外部
+`TGID_VA` 编译宏伪造不同布局。private accessor 区分 Host 和 AICPU 执行域；
+此外，Device 角色只为管理面 JFR 的小 RQ 选择固定 UMDK 已支持的
+`UDMA_MMAP_KERNEL_BUF`，不改变任何 private struct 布局。构建与运行脚本同时
+检查 `DT_NEEDED` 和 `ldd`，发现外部
 `liburma`、`liburma_common`、`liburma-udma` 或 `libummu` 会直接失败。
 
 这里的“绕过 HCOMM”是指 KVAF 自己完成资源控制。EID、MR、Jetty、TP
@@ -164,10 +166,10 @@ SQ 的部分信息，也不能查询普通 JFC 的完整 CQ，因此当前 AIV d
 TGID 的路径；本实现的资源本来就在 AICPU 内创建，强行改用它反而偏离
 当前执行模型。
 
-KVAF 把 private header 限制在
-`provider/private_udma_accessor.c` 一个翻译单元中，并为 Host/Device 角色
-分别编译。角色宏只选择 accessor 的 Host 或 AICPU 执行域；UMDK UDMA 源码本身
-不定义 `ST64B`/`TGID_VA` 角色宏。
+KVAF 把 private header 限制在 private accessor 和 source-matched UDMA
+适配层，并为 Host/Device 角色分别编译。角色宏选择 accessor 执行域，并只在
+Device 管理 JFR 的一次 RQ 分配中选择普通 kernel-buffer；它不定义
+`ST64B`/`TGID_VA`，也不修改共享 context 的 `hugepage_enable`。
 它从真实 queue 对象导出实际 `qbuf_size/baseblk_cnt`，并在返回任何地址前
 校验：
 
@@ -1085,6 +1087,20 @@ AICPU leaf 日志，不声称它们全部被压缩到 `reserved[9..10]`。该诊
 identity 修 JFC 所有权；若是 `in_len/in_addr`，修加载模块与固定 UAPI 配对；若是 pin
 失败，再评估 Host-owned resource owner。该证据出现前不引入 HCCP，因为当前失败仍
 早于 Jetty/TP/import 阶段。
+
+`aff4de9` 的一次性证据给出 `jfr_command_flags=0x9ffff`：RQ/index/UDATA、
+context fd 和 JFC 创建时 sidecar identity 的 bits 0..16 全部成立，
+`non_pin=0`、`dtu=0`，唯一额外分支是 `is_hugepage=1`。参考 UDMA 驱动会在
+JFR RQ 的 `udma_occupy_u_hugepage()` 找不到该 AICPU VA 时把错误折成
+`EINVAL`。因此 Device 管理 JFR 只把这个小 RQ 改为固定 UMDK 的
+`UDMA_MMAP_KERNEL_BUF` 路径；命令仍携带原 UDATA、`non_pin=0`、`dtu=0`，
+并且仍只发送一次 CREATE_JFR。Host 管理 JFR、JFC、Jetty 和 decode 数据面
+JFR/SQ/CQ 继续使用 capability 驱动的原分配策略。
+
+普通 RQ 仍由 driver pin，并在删除 kernel JFR 后由 checked `munmap` 释放；
+该兼容策略不改变现有销毁状态机。若仍在 CREATE_JFR 失败，命令快照应从
+`0x9ffff` 变为 `0x1ffff`、`jfr_hugepage=0`，然后按新的 errno/内核日志继续
+定位；不得在同一 session 原地回退 hugepage 或尝试 `non_pin`。
 
 数据面参数显式传入 `--share_jfr true`，不再依赖固定 perftest 在 capability check
 中把默认 `false` 隐式改写为 `true`。这保证后续 data Jetty 与 management Jetty

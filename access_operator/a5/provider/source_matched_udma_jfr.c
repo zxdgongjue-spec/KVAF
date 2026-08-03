@@ -55,6 +55,13 @@ static struct kvaf_udma_jfr_state *g_kvaf_jfrs;
 static uint32_t g_kvaf_jfr_count;
 static uint32_t g_kvaf_jfr_orphan_count;
 static _Thread_local struct kvaf_udma_jfr_failure g_kvaf_jfr_failure;
+static _Thread_local enum kvaf_udma_queue_memory_policy
+    g_kvaf_next_jfr_rq_memory = KVAF_UDMA_QUEUE_MEMORY_AUTO;
+
+#if defined(KVAF_UDMA_PROVIDER_ROLE_HOST) == \
+    defined(KVAF_UDMA_PROVIDER_ROLE_DEVICE)
+#error "exactly one KVAF UDMA provider role must be selected"
+#endif
 
 static int kvaf_jfr_effective_errno(int status, int operation_errno)
 {
@@ -865,11 +872,17 @@ urma_jfr_t *kvaf_udma_create_jfr_checked(
     uint32_t *sleep_db = NULL;
     uint32_t sge_per_wqe;
     uint32_t wqebb_count;
+    enum kvaf_udma_queue_memory_policy rq_memory_policy;
     int status;
     int operation_errno;
     int root_errno;
 
     kvaf_udma_source_reset_jfr_failure();
+    /* Consume the per-thread one-call policy before validation or any
+     * allocation.  A failed public wrapper or a failed CREATE_JFR can never
+     * leak the management policy into a later data-plane JFR. */
+    rq_memory_policy = g_kvaf_next_jfr_rq_memory;
+    g_kvaf_next_jfr_rq_memory = KVAF_UDMA_QUEUE_MEMORY_AUTO;
     if (context == NULL || config == NULL) {
         kvaf_record_jfr_failure(
             KVAF_UDMA_JFR_FAILURE_VALIDATE_ARGUMENTS,
@@ -971,9 +984,9 @@ urma_jfr_t *kvaf_udma_create_jfr_checked(
     wqebb_count = sge_per_wqe * jfr->wqe_cnt;
     state->rq_created = true;
     errno = 0;
-    status = kvaf_udma_checked_alloc_queue_buffer(
+    status = kvaf_udma_checked_alloc_queue_buffer_policy(
         &jfr->rq, wqebb_count, UDMA_JFR_WQEBB,
-        UDMA_HW_PAGE_SIZE, true);
+        UDMA_HW_PAGE_SIZE, true, rq_memory_policy);
     if (status != 0) {
         operation_errno = errno;
         kvaf_record_jfr_failure(
@@ -1080,6 +1093,37 @@ fail:
     }
     errno = root_errno;
     return NULL;
+}
+
+urma_jfr_t *kvaf_udma_source_create_management_jfr(
+    urma_context_t *context, urma_jfr_cfg_t *config)
+{
+#if defined(KVAF_UDMA_PROVIDER_ROLE_DEVICE)
+    urma_jfr_t *jfr;
+
+    if (g_kvaf_next_jfr_rq_memory !=
+        KVAF_UDMA_QUEUE_MEMORY_AUTO) {
+        errno = EBUSY;
+        return NULL;
+    }
+    g_kvaf_next_jfr_rq_memory =
+        KVAF_UDMA_QUEUE_MEMORY_KERNEL_BUFFER;
+    jfr = urma_create_jfr(context, config);
+    /* Public validation may reject the request before provider dispatch. */
+    g_kvaf_next_jfr_rq_memory = KVAF_UDMA_QUEUE_MEMORY_AUTO;
+    return jfr;
+#else
+    return urma_create_jfr(context, config);
+#endif
+}
+
+const char *kvaf_udma_source_management_jfr_rq_memory(void)
+{
+#if defined(KVAF_UDMA_PROVIDER_ROLE_DEVICE)
+    return "kernel-buffer-pinned-v1";
+#else
+    return "capability-default-v1";
+#endif
 }
 
 urma_status_t kvaf_udma_delete_jfr_checked(urma_jfr_t *public_jfr)

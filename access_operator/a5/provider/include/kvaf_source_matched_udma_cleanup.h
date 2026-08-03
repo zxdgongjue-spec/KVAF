@@ -283,9 +283,15 @@ failure:
     return -1;
 }
 
-static inline int kvaf_udma_checked_alloc_queue_buffer(
+enum kvaf_udma_queue_memory_policy {
+    KVAF_UDMA_QUEUE_MEMORY_AUTO = 0,
+    KVAF_UDMA_QUEUE_MEMORY_KERNEL_BUFFER,
+};
+
+static inline int kvaf_udma_checked_alloc_queue_buffer_policy(
     struct udma_u_jetty_queue *queue, uint32_t max_entry_count,
-    uint32_t base_block_size, uint32_t page_size, bool allocate_wrid)
+    uint32_t base_block_size, uint32_t page_size, bool allocate_wrid,
+    enum kvaf_udma_queue_memory_policy memory_policy)
 {
     uint64_t required_bytes;
     uint64_t rounded_bytes = 1U;
@@ -295,7 +301,9 @@ static inline int kvaf_udma_checked_alloc_queue_buffer(
         queue->ctx->urma_ctx.dev_fd < 0 || max_entry_count == 0U ||
         base_block_size == 0U || page_size == 0U ||
         (base_block_size & (base_block_size - 1U)) != 0U ||
-        (page_size & (page_size - 1U)) != 0U) {
+        (page_size & (page_size - 1U)) != 0U ||
+        (memory_policy != KVAF_UDMA_QUEUE_MEMORY_AUTO &&
+         memory_policy != KVAF_UDMA_QUEUE_MEMORY_KERNEL_BUFFER)) {
         return -1;
     }
     if (queue->cstm || queue->dtu_en || queue->sq_reserved) {
@@ -333,7 +341,8 @@ static inline int kvaf_udma_checked_alloc_queue_buffer(
             return -1;
         }
     }
-    if (queue->ctx != NULL && queue->ctx->hugepage_enable) {
+    if (memory_policy == KVAF_UDMA_QUEUE_MEMORY_AUTO &&
+        queue->ctx->hugepage_enable) {
         if (kvaf_udma_checked_alloc_hugepage_queue(queue) != 0) {
             return -1;
         }
@@ -358,6 +367,15 @@ static inline int kvaf_udma_checked_alloc_queue_buffer(
         }
     }
     return 0;
+}
+
+static inline int kvaf_udma_checked_alloc_queue_buffer(
+    struct udma_u_jetty_queue *queue, uint32_t max_entry_count,
+    uint32_t base_block_size, uint32_t page_size, bool allocate_wrid)
+{
+    return kvaf_udma_checked_alloc_queue_buffer_policy(
+        queue, max_entry_count, base_block_size, page_size,
+        allocate_wrid, KVAF_UDMA_QUEUE_MEMORY_AUTO);
 }
 
 static inline int kvaf_udma_checked_alloc_sw_db(

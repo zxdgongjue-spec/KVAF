@@ -1376,11 +1376,17 @@ static int kvaf_ub_create_local_resources_checked(
      * be paired with a previous create attempt's thread-local leaf. */
     kvaf_udma_source_reset_jfr_failure();
     errno = 0;
-    ctx->jfr = urma_create_jfr(ctx->urma_ctx, &jfr_cfg);
+    ctx->jfr = kvaf_udma_source_create_management_jfr(
+        ctx->urma_ctx, &jfr_cfg);
     if (ctx->jfr == NULL) {
         return kvaf_ub_jfr_creation_error(
             "create_jfr", errno, EIO);
     }
+    (void)fprintf(stderr,
+        "KVAF_URMA_MGMT_JFR_RQ_MEMORY role=%s backing=%s\n",
+        cfg->dst_eid == NULL ? "server" : "client",
+        kvaf_udma_source_management_jfr_rq_memory());
+    (void)fflush(stderr);
 
     ctx->is_server = cfg->dst_eid == NULL;
     jetty_cfg.id = ctx->is_server ? cfg->dst_jetty_id : 0;

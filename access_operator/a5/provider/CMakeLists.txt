@@ -325,8 +325,10 @@ function(kvaf_add_source_udma_object TARGET_NAME ROLE_DEFINITION)
     ${KVAF_UDMA_PRIVATE_INCLUDE_DIRS})
 endfunction()
 
-kvaf_add_source_udma_object(kvaf_source_udma_host "")
-kvaf_add_source_udma_object(kvaf_source_udma_device "")
+kvaf_add_source_udma_object(
+  kvaf_source_udma_host KVAF_UDMA_PROVIDER_ROLE_HOST=1)
+kvaf_add_source_udma_object(
+  kvaf_source_udma_device KVAF_UDMA_PROVIDER_ROLE_DEVICE=1)
 
 set(KVAF_UMMU_COMMON_SOURCE "${KVAF_UMMU_SOURCE_DIR}/ummu_common.c")
 set(KVAF_UMMU_LEVEL_BLOCK_SOURCE
