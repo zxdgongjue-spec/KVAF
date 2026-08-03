@@ -8,8 +8,8 @@ or the optional Python/Torch adapter.
 
 ## Operator contract
 
-All lookup tensors are device-resident and retain their shapes and addresses
-through graph capture:
+All lookup tensors are device-resident.  The transport owns the Host-DDR
+registration; each HBM output is registered separately as a local UDMA range.
 
 | Tensor | Type / shape | Meaning |
 | --- | --- | --- |
@@ -30,8 +30,9 @@ rejected and have last-completion-wins semantics.
 
 - `kernel/execute_batch_get_aiv.asc`: AIV UDMA READ WQE producer and CQ owner
   polling. It never uses MTE to dereference Host DDR.
-- `host/batch_get_host.cpp`: CPU/device EID discovery, Direct-HCCP context,
-  Host DDR/HBM registrations, and one private USER_CTL SQ/CQ/Jetty per AIV.
+- `host/batch_get_host.cpp`: CPU/device EID discovery, Direct-HCCP transport,
+  Host-DDR registration, per-output HBM-MR cache, and one private USER_CTL
+  SQ/CQ/Jetty per AIV.
 - `host/execute_batch_get_loader.cpp`: ACL binary load and AIV launch.
 - `test/execute_batch_get_main.cpp`: eager correctness/performance test and
   ACL graph capture/replay test. Every graph functional replay changes fixed
@@ -62,6 +63,11 @@ DEVICE_ID=0 TABLE_CAPACITY=256 REQUESTS=10 OUTPUT_ROWS=200 \
 BLOCK_BYTES=1024 SOURCE_STRIDE=4096 AIV_CORES=1 MASK_EVERY=3 \
 WARMUP=1 ITERATIONS=1 bash scripts/run_execute_batch_get.sh
 
+# Proves that one initialized transport can use two independently registered
+# output tensors without rebuilding EID/CTP/Jetty resources.
+DEVICE_ID=0 DYNAMIC_OUTPUT_SMOKE=1 WARMUP=1 ITERATIONS=1 \
+bash scripts/run_execute_batch_get.sh
+
 DEVICE_ID=0 GRAPH_REPLAYS=4 GRAPH_WARMUP=1 GRAPH_ITERATIONS=5 \
 bash scripts/run_execute_batch_get_graph.sh
 ```
@@ -74,11 +80,13 @@ is `host_submit_to_stream_completion` and excludes warmup.
 
 ## Graph boundary
 
-Resource creation and Host DDR registration occur before capture. Capture
-contains only the fixed-address AIV kernel launch. Therefore one graph
-session serves replay-time changes to addresses, validity, request indices,
-mask and output rows, but a change to any capacity, block size, output shape,
-or AIV count requires a new session/captured graph.
+Resource creation, Host DDR registration and one `PrepareLocalHbm(output)`
+call occur before capture. Capture contains only the AIV kernel launch. One
+graph therefore serves replay-time changes to addresses, validity, request
+indices, mask and output rows. A different output allocation needs its own
+prepared binding and graph instance; eager launches may select any cached
+binding at runtime. A capacity, block-size or AIV-count change also needs a
+new session/captured graph.
 
 ## Status
 

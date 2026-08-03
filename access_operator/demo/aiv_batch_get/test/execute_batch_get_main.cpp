@@ -35,6 +35,9 @@ struct Options {
   uint32_t graph_replays = 0U;
   uint32_t graph_warmup = 5U;
   uint32_t graph_iterations = 20U;
+  // Optional functional preflight: use a second runtime output allocation on
+  // the same transport, then return to the primary benchmark output.
+  uint32_t dynamic_output_smoke = 0U;
   std::string kernel;
 };
 
@@ -88,6 +91,8 @@ bool ParseOptions(int argc, char **argv, Options *options) {
       if (!ParseU32(argv[++index], &options->graph_warmup)) return false;
     } else if (arg == "--graph-iterations" && index + 1 < argc) {
       if (!ParseU32(argv[++index], &options->graph_iterations)) return false;
+    } else if (arg == "--dynamic-output-smoke" && index + 1 < argc) {
+      if (!ParseU32(argv[++index], &options->dynamic_output_smoke)) return false;
     } else {
       return false;
     }
@@ -97,12 +102,13 @@ bool ParseOptions(int argc, char **argv, Options *options) {
          ReadEnvU32("OUTPUT_ROWS", &options->output_rows) && ReadEnvU32("BLOCK_BYTES", &options->block_bytes) &&
          ReadEnvU32("SOURCE_STRIDE", &options->source_stride) && ReadEnvU32("AIV_CORES", &options->aiv_cores) &&
          ReadEnvU32("WARMUP", &options->warmup) && ReadEnvU32("ITERATIONS", &options->iterations) &&
-         ReadEnvU32("MASK_EVERY", &options->mask_every) && options->table_capacity != 0U &&
+         ReadEnvU32("MASK_EVERY", &options->mask_every) &&
+         ReadEnvU32("DYNAMIC_OUTPUT_SMOKE", &options->dynamic_output_smoke) && options->table_capacity != 0U &&
          options->requests != 0U && options->requests <= options->output_rows && options->output_rows != 0U &&
          options->block_bytes != 0U && options->source_stride >= options->block_bytes &&
          options->aiv_cores != 0U && options->aiv_cores <= KVAF_AIV_BATCH_GET_MAX_AIV_CORES &&
          options->aiv_cores <= options->requests && options->iterations != 0U &&
-         options->graph_iterations != 0U;
+         options->graph_iterations != 0U && options->dynamic_output_smoke <= 1U;
 }
 
 bool CheckAcl(aclError error, const char *step) {
@@ -237,7 +243,7 @@ int main(int argc, char **argv) {
     std::cerr << "usage: kvaf_execute_batch_get_test --kernel <kvaf_execute_batch_get_kernels.o> "
                  "[--device N --table-capacity N --requests N --output-rows N --block-bytes N "
                  "--source-stride N --aiv-cores N --warmup N --iterations N --mask-every N "
-                 "--graph-replays N --graph-warmup N --graph-iterations N]\n";
+                 "--graph-replays N --graph-warmup N --graph-iterations N --dynamic-output-smoke 0|1]\n";
     return 2;
   }
   const uint64_t source_bytes = static_cast<uint64_t>(options.table_capacity) * options.source_stride;
@@ -250,6 +256,7 @@ int main(int argc, char **argv) {
   aclrtStream stream = nullptr;
   void *source_ddr = nullptr;
   void *output_hbm = nullptr;
+  void *alternate_output_hbm = nullptr;
   void *device_address_table = nullptr;
   void *device_valid_table = nullptr;
   void *device_indices = nullptr;
@@ -260,6 +267,9 @@ int main(int argc, char **argv) {
   KvafBatchGetDdrRegistration *registration = nullptr;
   aclmdlRI graph_model = nullptr;
   uint64_t entity_table = 0U;
+  uint64_t local_hbm_binding = 0U;
+  uint64_t alternate_local_hbm_binding = 0U;
+  uint64_t completed_batch_base = 0U;
   uint8_t *source = nullptr;
   KvafExecuteBatchGetKernelArgs args{};
   std::vector<uint64_t> address_table(options.table_capacity);
@@ -340,12 +350,23 @@ int main(int argc, char **argv) {
       !CheckAcl(aclrtMemcpy(device_queue, queues.size() * sizeof(queues[0]), queues.data(),
                              queues.size() * sizeof(queues[0]), ACL_MEMCPY_HOST_TO_DEVICE), "initialize queue")) goto cleanup;
 
-  if (!CheckKvaf(KvafBatchGetRegisterLocalDdr(source_ddr, source_bytes, output_hbm, output_bytes,
-                                               options.aiv_cores, 1U, &registration, &entity_table),
-                 "register Host DDR and create AIV UDMA entities")) goto cleanup;
+  if (options.dynamic_output_smoke != 0U &&
+      (!CheckAcl(aclrtMalloc(&alternate_output_hbm, output_bytes, ACL_MEM_MALLOC_HUGE_FIRST),
+                 "allocate alternate output HBM") ||
+       !CheckAcl(aclrtMemset(alternate_output_hbm, output_bytes, 0, output_bytes), "clear alternate output"))) {
+    goto cleanup;
+  }
+
+  if (!CheckKvaf(KvafBatchGetInitializeTransport(source_ddr, source_bytes, options.aiv_cores, 1U,
+                                                  &registration, &entity_table),
+                 "initialize Direct-HCCP transport and register Host DDR")) goto cleanup;
+  if (!CheckKvaf(KvafBatchGetPrepareLocalHbm(registration, output_hbm, output_bytes, &local_hbm_binding),
+                 "prepare runtime output HBM for UDMA")) goto cleanup;
   std::cout << "PHASE_EID_ENDPOINT_READY entity_table=0x" << std::hex << entity_table << std::dec
             << " table_capacity=" << options.table_capacity << " output_rows=" << options.output_rows
-            << " source_bytes=" << source_bytes << " output_bytes=" << output_bytes << '\n';
+            << " source_bytes=" << source_bytes << " output_bytes=" << output_bytes
+            << " local_hbm_binding=0x" << std::hex << local_hbm_binding << std::dec
+            << " output_lifetime=runtime_prepared\n";
   if (!CheckKvaf(KvafExecuteBatchGetLoadKernel(options.kernel.c_str()), "load ExecuteBatchGet kernel")) goto cleanup;
   std::cout << "PHASE_KERNEL_REGISTERED cores=" << options.aiv_cores
             << " contract=address_table_absolute_uba_plus_mask_plus_output_scatter\n";
@@ -355,7 +376,7 @@ int main(int argc, char **argv) {
   args.indices = reinterpret_cast<uint64_t>(device_indices);
   args.mask = reinterpret_cast<uint64_t>(device_mask);
   args.output_indices = reinterpret_cast<uint64_t>(device_output_indices);
-  args.output = reinterpret_cast<uint64_t>(output_hbm);
+  args.local_hbm_binding = local_hbm_binding;
   args.core_status = reinterpret_cast<uint64_t>(device_status);
   args.channel_entity = entity_table;
   args.queue_state = reinterpret_cast<uint64_t>(device_queue);
@@ -364,6 +385,37 @@ int main(int argc, char **argv) {
   args.output_rows = options.output_rows;
   args.block_bytes = options.block_bytes;
   args.block_count = options.aiv_cores;
+
+  if (options.dynamic_output_smoke != 0U) {
+    if (!CheckKvaf(KvafBatchGetPrepareLocalHbm(registration, alternate_output_hbm, output_bytes,
+                                                &alternate_local_hbm_binding),
+                   "prepare alternate runtime output HBM") ||
+        alternate_local_hbm_binding == local_hbm_binding) {
+      std::cerr << "[KVAF_EXECUTE] dynamic output registration did not produce an independent binding\n";
+      goto cleanup;
+    }
+    args.local_hbm_binding = alternate_local_hbm_binding;
+    if (!CheckKvaf(KvafExecuteBatchGetLaunch(&args, stream), "dynamic output smoke launch") ||
+        !CheckAcl(aclrtSynchronizeStream(stream), "dynamic output smoke completion") ||
+        !CheckAcl(aclrtMemcpy(statuses.data(), statuses.size() * sizeof(statuses[0]), device_status,
+                               statuses.size() * sizeof(statuses[0]), ACL_MEMCPY_DEVICE_TO_HOST),
+                  "copy dynamic output status") ||
+        !CheckAcl(aclrtMemcpy(queues.data(), queues.size() * sizeof(queues[0]), device_queue,
+                               queues.size() * sizeof(queues[0]), ACL_MEMCPY_DEVICE_TO_HOST),
+                  "copy dynamic output queue") ||
+        !CheckAcl(aclrtMemcpy(output.data(), output.size(), alternate_output_hbm, output.size(),
+                               ACL_MEMCPY_DEVICE_TO_HOST),
+                  "copy dynamic output") ||
+        !Validate(output, address_table, indices, mask, output_indices, options, source, statuses, queues, 1U,
+                  "dynamic_output")) {
+      goto cleanup;
+    }
+    completed_batch_base = 1U;
+    args.local_hbm_binding = local_hbm_binding;
+    std::cout << "PHASE_DYNAMIC_OUTPUT_VALIDATION_PASS primary_binding=0x" << std::hex << local_hbm_binding
+              << " alternate_binding=0x" << alternate_local_hbm_binding << std::dec
+              << " transport_reused=1\n";
+  }
 
   if (options.graph_replays != 0U) {
     // Resources, tensor allocations, fixed kernel arguments and the direct
@@ -414,7 +466,7 @@ int main(int argc, char **argv) {
           !CheckAcl(aclrtMemcpy(output.data(), output.size(), output_hbm, output.size(), ACL_MEMCPY_DEVICE_TO_HOST),
                     "copy graph output") ||
           !Validate(output, address_table, indices, mask, output_indices, options, source, statuses, queues,
-                    static_cast<uint64_t>(replay) + 1U, "graph_replay")) {
+                    completed_batch_base + static_cast<uint64_t>(replay) + 1U, "graph_replay")) {
         goto cleanup;
       }
       std::cout << "GRAPH_REPLAY_VALIDATION_PASS replay=" << replay
@@ -473,7 +525,8 @@ int main(int argc, char **argv) {
         !CheckAcl(aclrtMemcpy(output.data(), output.size(), output_hbm, output.size(), ACL_MEMCPY_DEVICE_TO_HOST),
                   "copy graph performance output") ||
         !Validate(output, address_table, indices, mask, output_indices, options, source, statuses, queues,
-                  static_cast<uint64_t>(options.graph_replays) + options.graph_warmup + options.graph_iterations,
+                  completed_batch_base + static_cast<uint64_t>(options.graph_replays) + options.graph_warmup +
+                      options.graph_iterations,
                   "graph_performance")) {
       goto cleanup;
     }
@@ -508,7 +561,7 @@ int main(int argc, char **argv) {
       !CheckAcl(aclrtMemcpy(output.data(), output.size(), output_hbm, output.size(), ACL_MEMCPY_DEVICE_TO_HOST),
                 "copy warmup output") ||
       !Validate(output, address_table, indices, mask, output_indices, options, source, statuses, queues,
-                options.warmup, "warmup")) goto cleanup;
+                completed_batch_base + options.warmup, "warmup")) goto cleanup;
   std::cout << "PHASE_VALIDATION_PASS stage=warmup\n";
 
   elapsed_ms.reserve(options.iterations);
@@ -526,7 +579,8 @@ int main(int argc, char **argv) {
       !CheckAcl(aclrtMemcpy(output.data(), output.size(), output_hbm, output.size(), ACL_MEMCPY_DEVICE_TO_HOST),
                 "copy measured output") ||
       !Validate(output, address_table, indices, mask, output_indices, options, source, statuses, queues,
-                static_cast<uint64_t>(options.warmup) + options.iterations, "measured")) goto cleanup;
+                completed_batch_base + static_cast<uint64_t>(options.warmup) + options.iterations,
+                "measured")) goto cleanup;
   std::cout << "PHASE_MEASURED_VALIDATION_PASS\n";
   {
     const double mean_ms = std::accumulate(elapsed_ms.begin(), elapsed_ms.end(), 0.0) / elapsed_ms.size();
@@ -547,7 +601,7 @@ int main(int argc, char **argv) {
 cleanup:
   std::cout << "PHASE_TEARDOWN_BEGIN status=" << exit_code << '\n';
   if (graph_model != nullptr) (void)aclmdlRIDestroy(graph_model);
-  if (registration != nullptr) KvafBatchGetUnregisterLocalDdr(registration);
+  if (registration != nullptr) KvafBatchGetDestroyTransport(registration);
   if (device_queue != nullptr) (void)aclrtFree(device_queue);
   if (device_status != nullptr) (void)aclrtFree(device_status);
   if (device_output_indices != nullptr) (void)aclrtFree(device_output_indices);
@@ -555,6 +609,7 @@ cleanup:
   if (device_indices != nullptr) (void)aclrtFree(device_indices);
   if (device_valid_table != nullptr) (void)aclrtFree(device_valid_table);
   if (device_address_table != nullptr) (void)aclrtFree(device_address_table);
+  if (alternate_output_hbm != nullptr) (void)aclrtFree(alternate_output_hbm);
   if (output_hbm != nullptr) (void)aclrtFree(output_hbm);
   if (source_ddr != nullptr) (void)aclrtFreeHost(source_ddr);
   if (stream != nullptr) {
