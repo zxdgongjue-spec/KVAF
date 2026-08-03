@@ -1,60 +1,24 @@
 #!/usr/bin/env python3
-"""Python-owned functional tests for the synchronous KVAF Runtime.
+"""Direct Python API tests for the synchronous KVAF Runtime.
 
-Each test describes its own Runtime lifecycle using the driver protocol, so
-new scenarios can be added by changing only Python commands and assertions.
+No C++ driver process is involved.  Each test creates ``kvaf.Runtime`` and
+uses the same lifecycle that a Python caller will use in its own scenarios.
 """
 
-import argparse
+from __future__ import annotations
+
 import pathlib
-import subprocess
 import sys
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
+import kvaf
+
 from backend import TorchBackend, detect_torch_backend, test_payload
 
 
-class RuntimeDriver:
-    def __init__(self, executable: str):
-        self.process = subprocess.Popen(
-            [executable],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-
-    def command(self, text: str) -> str:
-        assert self.process.stdin is not None
-        assert self.process.stdout is not None
-        self.process.stdin.write(text + "\n")
-        self.process.stdin.flush()
-        result = self.process.stdout.readline().strip()
-        if not result:
-            stderr = self.process.stderr.read() if self.process.stderr else ""
-            raise AssertionError(f"driver produced no result for {text!r}: {stderr}")
-        return result
-
-    def close(self) -> None:
-        if self.process.poll() is None:
-            self.command("QUIT")
-            self.process.wait(timeout=5)
-        if self.process.returncode:
-            stderr = self.process.stderr.read() if self.process.stderr else ""
-            raise AssertionError(f"driver exited with {self.process.returncode}: {stderr}")
-        if self.process.stdin:
-            self.process.stdin.close()
-        if self.process.stdout:
-            self.process.stdout.close()
-        if self.process.stderr:
-            self.process.stderr.close()
-
-
 class RuntimeMockTests(unittest.TestCase):
-    driver_path = ""
     backend = TorchBackend("python", None, "not detected")
 
     @classmethod
@@ -63,101 +27,97 @@ class RuntimeMockTests(unittest.TestCase):
         print(f"Mock input backend={cls.backend.name}: {cls.backend.reason}")
 
     def setUp(self) -> None:
-        self.driver = RuntimeDriver(self.driver_path)
+        self.kvaf = kvaf.Runtime()
 
     def tearDown(self) -> None:
-        self.driver.close()
+        if self.kvaf.initialized:
+            self.kvaf.shutdown()
 
-    def assert_ok(self, command: str, suffix: str | None = None) -> str:
-        result = self.driver.command(command)
-        self.assertTrue(result.startswith("OK"), f"{command}: {result}")
-        if suffix is not None:
-            self.assertTrue(result.endswith(suffix), f"{command}: {result}")
-        return result
-
-    def assert_error(self, command: str, code: int) -> None:
-        self.assertEqual(self.driver.command(command), f"ERR code={code}")
-
-    def payload_hex(self, values: list[int]) -> str:
-        return test_payload(values, self.backend).hex()
+    def payload(self, values: list[int]) -> bytes:
+        return test_payload(values, self.backend)
 
     def test_put_prepare_get_release_and_slot_reuse(self) -> None:
-        self.assert_ok("INIT 256 64")
-        first = self.payload_hex([1, 2, 3])
-        second = self.payload_hex([160, 161, 162, 163])
-        self.assert_ok(f"PUT 101 {first} 102 {second}")
-        self.assert_ok("PREPARE decode 101 102")
+        self.kvaf.initialize(ddr_bytes=256, slot_size=64)
+        self.kvaf.batch_put(
+            keys=[101, 102],
+            blocks=[self.payload([1, 2, 3]), self.payload([160, 161, 162, 163])],
+        )
+        table = self.kvaf.prepare_access_table([101, 102])
 
-        view = self.assert_ok("VIEW decode")
-        entries = view.removeprefix("OK VIEW ").split(",")
-        self.assertEqual(len(entries), 2)
-        first_address, first_length, first_valid = entries[0].split(":")
-        second_address, second_length, second_valid = entries[1].split(":")
-        self.assertEqual(int(second_address) - int(first_address), 64)
-        self.assertEqual((first_length, first_valid), ("3", "1"))
-        self.assertEqual((second_length, second_valid), ("4", "1"))
+        view = self.kvaf.access_table_view(table)
+        self.assertEqual(view["addresses"][1] - view["addresses"][0], 64)
+        self.assertEqual(view["lengths"], [3, 4])
+        self.assertEqual(view["valid"], [True, True])
 
         # Requests are scattered to caller-owned output rows in reverse order.
-        result = self.assert_ok("GET decode 8 1:0:1 0:1:1")
-        self.assertEqual(
-            result,
-            "OK GET a0a1a2a3000000000102030000000000",
+        output = bytearray(16)
+        self.kvaf.batch_get(
+            table,
+            indices=[1, 0],
+            output_indices=[0, 1],
+            output=output,
+            output_block_bytes=8,
         )
+        self.assertEqual(output, bytes.fromhex("a0a1a2a3000000000102030000000000"))
+
         # The handle pins its keys until the caller releases it.
-        self.assert_error("FREE 101", 6)  # kBusy
-        self.assert_ok("RELEASE decode")
-        self.assert_ok("FREE 101 102")
+        with self.assertRaises(ValueError):
+            self.kvaf.batch_free([101])
+        self.kvaf.release_access_table(table)
+        self.kvaf.batch_free([101, 102])
 
         # The MetaManager free queue is FIFO. Consume the two never-used slots
         # first, then verify that a freed address becomes available again.
-        self.assert_ok(
-            "PUT 103 "
-            f"{self.payload_hex([255])} 104 {self.payload_hex([238])} "
-            f"105 {self.payload_hex([221])}"
+        self.kvaf.batch_put(
+            keys=[103, 104, 105],
+            blocks=[self.payload([255]), self.payload([238]), self.payload([221])],
         )
-        self.assert_ok("PREPARE recycled 105")
-        reused_view = self.assert_ok("VIEW recycled")
-        self.assertEqual(int(reused_view.removeprefix("OK VIEW ").split(":")[0]), int(first_address))
-        self.assert_ok("RELEASE recycled")
+        recycled = self.kvaf.prepare_access_table([105])
+        self.assertEqual(
+            self.kvaf.access_table_view(recycled)["addresses"][0],
+            view["addresses"][0],
+        )
+        self.kvaf.release_access_table(recycled)
 
     def test_failed_put_is_aborted_and_key_is_reusable(self) -> None:
-        self.assert_ok("INIT 128 64")
-        self.assert_ok("FAIL_NEXT_PUT")
-        self.assert_error(f"PUT 7 {self.payload_hex([170])}", 9)  # kInternal from the mock data plane
-        # Runtime must invoke AbortPut, otherwise this second PUT would be kAlreadyExists.
-        self.assert_ok(f"PUT 7 {self.payload_hex([187])}")
-        self.assert_ok("PREPARE key7 7")
-        self.assertEqual(self.assert_ok("GET key7 4 0:0:1"), "OK GET bb000000")
-        self.assert_ok("RELEASE key7")
+        self.kvaf.initialize(ddr_bytes=128, slot_size=64)
+        self.kvaf._fail_next_put()
+        with self.assertRaises(RuntimeError):
+            self.kvaf.batch_put(keys=[7], blocks=[self.payload([170])])
+
+        # Runtime must invoke AbortPut, otherwise this would be kAlreadyExists.
+        self.kvaf.batch_put(keys=[7], blocks=[self.payload([187])])
+        table = self.kvaf.prepare_access_table([7])
+        output = bytearray(4)
+        self.kvaf.batch_get(table, [0], [0], output, output_block_bytes=4)
+        self.assertEqual(output, bytes.fromhex("bb000000"))
+        self.kvaf.release_access_table(table)
 
     def test_get_failure_preserves_lifecycle_and_invalid_index_is_rejected(self) -> None:
-        self.assert_ok("INIT 128 64")
-        self.assert_ok(f"PUT 9 {self.payload_hex([10, 11])}")
-        self.assert_ok("PREPARE key9 9")
-        self.assert_ok("FAIL_NEXT_GET")
-        self.assert_error("GET key9 4 0:0:1", 9)
-        self.assert_error("GET key9 4 1:0:1", 1)
+        self.kvaf.initialize(ddr_bytes=128, slot_size=64)
+        self.kvaf.batch_put(keys=[9], blocks=[self.payload([10, 11])])
+        table = self.kvaf.prepare_access_table([9])
+        self.kvaf._fail_next_get()
+        with self.assertRaises(RuntimeError):
+            self.kvaf.batch_get(table, [0], [0], bytearray(4), output_block_bytes=4)
+        with self.assertRaises(ValueError):
+            self.kvaf.batch_get(table, [1], [0], bytearray(4), output_block_bytes=4)
         # A data-plane failure does not leak the stable-read lock.
-        self.assert_ok("RELEASE key9")
-        self.assert_ok("FREE 9")
+        self.kvaf.release_access_table(table)
+        self.kvaf.batch_free([9])
 
     def test_validation_and_shutdown(self) -> None:
-        self.assert_error("INIT 10 4", 1)
-        self.assert_ok("INIT 64 32")
-        self.assert_error("PREPARE absent 999", 4)
-        self.assert_ok(f"PUT 1 {self.payload_hex([1])}")
-        self.assert_ok("PREPARE one 1")
-        self.assert_ok("SHUTDOWN")
-        self.assert_error("GET one 4 0:0:1", 2)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--driver", required=True)
-    args = parser.parse_args()
-    RuntimeMockTests.driver_path = args.driver
-    unittest.main(argv=["test_runtime_mock.py"])
+        with self.assertRaises(ValueError):
+            self.kvaf.initialize(ddr_bytes=10, slot_size=4)
+        self.kvaf.initialize(ddr_bytes=64, slot_size=32)
+        with self.assertRaises(KeyError):
+            self.kvaf.prepare_access_table([999])
+        self.kvaf.batch_put(keys=[1], blocks=[self.payload([1])])
+        table = self.kvaf.prepare_access_table([1])
+        self.kvaf.shutdown()
+        with self.assertRaises(RuntimeError):
+            self.kvaf.batch_get(table, [0], [0], bytearray(4), output_block_bytes=4)
 
 
 if __name__ == "__main__":
-    main()
+    unittest.main()

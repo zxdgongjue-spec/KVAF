@@ -10,6 +10,27 @@ target_include_directories(_kvaf
     ${CMAKE_CURRENT_SOURCE_DIR}/../access_operator/include
 )
 
+if(KVAF_ENABLE_AIV_BATCH_GET)
+  target_sources(_kvaf PRIVATE aiv_python_runtime.cc)
+  target_link_libraries(_kvaf
+    PRIVATE
+      kvaf_aiv_batch_get_operator
+      kvaf_execute_batch_get_host
+      ascendcl
+  )
+  target_include_directories(_kvaf
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/../access_operator/demo/aiv_batch_get/include
+      ${ASCEND_CANN_PACKAGE_PATH}/include
+  )
+  target_link_directories(_kvaf PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/lib64)
+  target_compile_definitions(_kvaf
+    PRIVATE
+      KVAF_ENABLE_AIV_BATCH_GET=1
+      _GLIBCXX_USE_CXX11_ABI=0
+  )
+endif()
+
 set_target_properties(_kvaf PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/python/kvaf"
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/python/kvaf"

@@ -35,10 +35,11 @@ Graph Capture 前完成；它接收 caller-owned output/status/queue buffer。
 
 ## 测试
 
-默认测试均由 Python 脚本定义场景和断言，C++ 只提供无场景的 Mock driver：
+默认测试均由 Python 脚本定义场景和断言，并直接调用 pybind 的
+`kvaf.Runtime`；没有 C++ Mock driver 或子进程协议：
 
 ```bash
-cmake -S . -B build -DBUILD_TESTING=ON
+cmake -S . -B build -DBUILD_TESTING=ON -DKVAF_BUILD_PYTHON=ON
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
@@ -46,31 +47,39 @@ ctest --test-dir build --output-on-failure
 `tests/python/test_runtime_mock.py` 可以直接编辑；其中覆盖 Runtime 初始化、
 Put/Get 生命周期、AccessTable 锁定、slot 回收、参数校验和 Operator 失败回滚。
 脚本会以 `try/except` 探测 `torch_npu`、MPS、CPU 和无 PyTorch 环境：MPS 可用时
-用于在本机生成 caller-side 测试数据，随后序列化给 CPU Mock。MPS 不是 CANN AIV
-或 Direct-HCCP 的替身，因此不能作为 NPU 数据面验证结论。
+用于在本机生成 caller-side 测试数据，然后直接传给 CPU Mock。MPS 不是 CANN
+AIV 或 Direct-HCCP 的替身，因此不能作为 NPU 数据面验证结论。
 
 ## A5 / CANN BatchGet 集成
 
-`KVAF_ENABLE_AIV_BATCH_GET=ON` 会构建 merged demo 的 kernel/host 库、
-`AivBatchGetAccessOperator`，以及 Runtime→MetaManager→AIV 的 smoke runner：
+`KVAF_ENABLE_AIV_BATCH_GET=ON` 配合 `KVAF_BUILD_PYTHON=ON` 会构建 merged
+demo 的 kernel/host 库、`AivBatchGetAccessOperator` 和
+`kvaf.AivBatchGetRuntime`。Python 脚本创建 NPU Tensor、显式注册
+output/status/queue 链路，再直接调用同步 `batch_get`：
 
 ```bash
 cmake -S . -B build-aiv -DBUILD_TESTING=ON \
+  -DKVAF_BUILD_PYTHON=ON \
   -DKVAF_ENABLE_AIV_BATCH_GET=ON \
   -DASCEND_CANN_PACKAGE_PATH="$ASCEND_CANN_PACKAGE_PATH"
 cmake --build build-aiv -j
 
 KVAF_RUN_NPU_TESTS=1 \
-KVAF_AIV_RUNTIME_BATCH_GET_RUNNER="$PWD/build-aiv/bin/kvaf_runtime_aiv_batch_get_runner" \
 KVAF_AIV_BATCH_GET_KERNEL="$PWD/build-aiv/bin/kvaf_execute_batch_get_kernels.o" \
 DEVICE_ID=0 \
-python3 tests/python/test_aiv_batch_get_npu.py
+PYTHONPATH="$PWD/build-aiv/python" \
+timeout 240s python3 tests/python/test_aiv_batch_get_npu.py
 ```
 
 该脚本用小规模 eager case 验证 Runtime 初始化、调用方 Device buffer/链路
-注册、Runtime BatchGet、设备完成、输出字节和 teardown。正确性验证完成后，
-它会输出 `PERF_RESULT metric=runtime_batch_get_call_to_stream_completion`；这个
-计时窗口从 `Runtime.BatchGet` 调用开始，到 AIV adapter 中的 stream 同步完成
-结束，排除 DDR 注册、Device buffer 初始化和 Host-to-Device 表更新。输出包括
-mean、p50、p90、p99 和 useful GiB/s。它有 240 秒超时并输出分阶段标记，未设置
+注册、Runtime BatchGet、设备完成、输出字节和 teardown。AIV demo 尚未实现
+`BatchPut`，因此测试的 `seed_fixed_blocks` 只用于把固定大小的测试数据写入
+Runtime-owned DDR；它不宣称验证 BatchPut。BatchPut operator 合入后应改为
+`runtime.batch_put`。
+
+正确性验证完成后，脚本会输出
+`PERF_RESULT metric=runtime_batch_get_call_to_stream_completion`。这个计时窗口
+从 `Runtime.BatchGet` 调用开始，到 AIV adapter 中的 stream 同步完成结束，排除
+DDR 注册、Device buffer 初始化和 Host-to-Device 表更新。输出包括 mean、p50、
+p90、p99 和 useful GiB/s。`ctest` 和上面的命令均设置 240 秒上限；未设置
 `KVAF_RUN_NPU_TESTS=1` 时会明确跳过。

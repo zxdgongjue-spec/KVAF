@@ -45,7 +45,7 @@ cmake --build build
 Python 定义的功能测试可用以下命令运行：
 
 ```bash
-cmake -S . -B build -DBUILD_TESTING=ON
+cmake -S . -B build -DBUILD_TESTING=ON -DKVAF_BUILD_PYTHON=ON
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
@@ -60,25 +60,25 @@ cmake -S . -B build -DKVAF_BUILD_PYTHON=ON
 cmake --build build
 ```
 
-当前 Python 注册模块仍只提供命名空间；Python 测试通过独立的测试 driver
-执行 C++ Runtime，因此不要求 pybind11。
-
-因此，下面的命令当前仅作为目标使用方式示例，不保证在当前环境直接成功：
-
-```bash
-PYTHONPATH=build/python python3 -c 'import kvaf; print(kvaf.build_stage())'
-```
-
-Python 侧的目标形态为：
+构建后，Python 直接创建并调用 Runtime；没有 stdin/stdout driver 或
+`subprocess.run`：
 
 ```python
 import kvaf
 
-kvaf.build_stage()
-kvaf.runtime
-kvaf.meta_manager
-kvaf.access_operator
+runtime = kvaf.Runtime()  # 当前注入进程内 CPU Mock AccessOperator
+runtime.initialize(ddr_bytes=256, slot_size=64)
+runtime.batch_put(keys=[1], blocks=[b"value"])
+table = runtime.prepare_access_table([1])
+output = bytearray(64)
+runtime.batch_get(table, indices=[0], output_indices=[0], output=output,
+                  output_block_bytes=64)
+runtime.release_access_table(table)
+runtime.shutdown()
 ```
 
-即使 Python 扩展成功加载，目前也只有 `build_stage()` 和三个空的命名空间；
-正式产品 Python binding 留待接口进一步稳定后补充。
+Mock API 走 Runtime/MetaManager 的实际代码路径，适合本地功能测试。它不把
+MPS 当作 NPU；A5/CANN 集成需要 AIV AccessOperator 的专用 Python backend。
+启用该 backend 后，Python 以 NPU Tensor 的 `data_ptr()` 直接注册调用方的
+output/status/queue buffer 并调用 `kvaf.AivBatchGetRuntime.batch_get`；完整
+构建和测试命令见 [`runtime/README.md`](runtime/README.md)。
