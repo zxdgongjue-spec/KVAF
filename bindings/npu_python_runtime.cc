@@ -205,6 +205,49 @@ class NpuRuntime final {
     }
   }
 
+  // Large-scale integration tests need deterministic contents without first
+  // materializing one Python bytes object per block. The pattern intentionally
+  // matches tests/python/test_npu_batch_get.py::pattern(index, block_bytes).
+  void SeedFixedPatternBlocks(const std::vector<KeyId>& keys,
+                              std::uint64_t block_bytes) {
+    if (!Initialized()) {
+      throw std::runtime_error("Runtime has not been initialized");
+    }
+    if (keys.empty() || block_bytes == 0 ||
+        block_bytes > runtime_->remote_region().slot_size) {
+      throw py::value_error("invalid fixed-pattern seed request");
+    }
+
+    std::vector<std::uint64_t> lengths(keys.size(), block_bytes);
+    PutContext context;
+    PutAccessDesc descriptor;
+    ThrowIfError(meta_manager_->PreparePut(keys, lengths, &context, &descriptor));
+    if (descriptor.entries.size() != keys.size()) {
+      (void)meta_manager_->AbortPut(context);
+      throw std::runtime_error("MetaManager returned an invalid Put descriptor");
+    }
+
+    const std::size_t bytes = static_cast<std::size_t>(block_bytes);
+    std::vector<std::vector<std::uint8_t>> patterns(
+        256U, std::vector<std::uint8_t>(bytes));
+    for (std::size_t slot_modulo = 0; slot_modulo < patterns.size(); ++slot_modulo) {
+      for (std::size_t byte = 0; byte < bytes; ++byte) {
+        patterns[slot_modulo][byte] = static_cast<std::uint8_t>(
+            (slot_modulo * 131U + byte * 17U + (byte >> 3U)) & 0xffU);
+      }
+    }
+    for (std::size_t index = 0; index < descriptor.entries.size(); ++index) {
+      std::memcpy(reinterpret_cast<void*>(descriptor.entries[index].address),
+                  patterns[index & 0xffU].data(), bytes);
+    }
+
+    const Status status = meta_manager_->CommitPut(context);
+    if (!status.ok()) {
+      (void)meta_manager_->AbortPut(context);
+      ThrowIfError(status);
+    }
+  }
+
   AccessTableHandle PrepareAccessTable(const std::vector<KeyId>& keys) {
     AccessTableHandle handle;
     ThrowIfError(runtime_->PrepareAccessTable(AccessTablePrepareRequest{keys},
@@ -228,6 +271,32 @@ class NpuRuntime final {
     result["lengths"] = std::move(lengths);
     result["valid"] = std::move(valid);
     return result;
+  }
+
+  // This is an adapter-side Host-to-NPU table upload. Generic Runtime still
+  // owns only the Host view and does not depend on ACL or torch_npu.
+  void CopyAccessTableToDevice(const AccessTableHandle& handle,
+                               std::uint64_t address_table_pointer,
+                               std::size_t address_table_bytes,
+                               std::uint64_t valid_table_pointer,
+                               std::size_t valid_table_bytes) const {
+    kvaf::AccessTableView view;
+    ThrowIfError(runtime_->GetAccessTableView(handle, &view));
+    const std::size_t expected_address_bytes =
+        view.size * sizeof(*view.addresses);
+    if (view.size == 0 || address_table_pointer == 0 || valid_table_pointer == 0 ||
+        address_table_bytes != expected_address_bytes ||
+        valid_table_bytes != view.size) {
+      throw py::value_error("device AccessTable buffers do not match the handle");
+    }
+    ThrowIfAclError(aclrtMemcpy(PointerFromValue(address_table_pointer),
+                                address_table_bytes, view.addresses,
+                                expected_address_bytes, ACL_MEMCPY_HOST_TO_DEVICE),
+                    "aclrtMemcpy address AccessTable");
+    ThrowIfAclError(aclrtMemcpy(PointerFromValue(valid_table_pointer),
+                                valid_table_bytes, view.valid, view.size,
+                                ACL_MEMCPY_HOST_TO_DEVICE),
+                    "aclrtMemcpy valid AccessTable");
   }
 
   void ReleaseAccessTable(const AccessTableHandle& handle) {
@@ -329,10 +398,16 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def_property_readonly("remote_region", &NpuRuntime::RemoteRegion)
       .def("seed_fixed_blocks", &NpuRuntime::SeedFixedBlocks,
            py::arg("keys"), py::arg("blocks"))
+      .def("seed_fixed_pattern_blocks", &NpuRuntime::SeedFixedPatternBlocks,
+           py::arg("keys"), py::arg("block_bytes"))
       .def("prepare_access_table", &NpuRuntime::PrepareAccessTable,
            py::arg("keys"))
       .def("access_table_view", &NpuRuntime::AccessTableView,
            py::arg("access_table"))
+      .def("copy_access_table_to_device", &NpuRuntime::CopyAccessTableToDevice,
+           py::arg("access_table"), py::arg("address_table_pointer"),
+           py::arg("address_table_bytes"), py::arg("valid_table_pointer"),
+           py::arg("valid_table_bytes"))
       .def("release_access_table", &NpuRuntime::ReleaseAccessTable,
            py::arg("access_table"))
       .def("batch_get", &NpuRuntime::BatchGet,

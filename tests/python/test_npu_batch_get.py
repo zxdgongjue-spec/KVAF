@@ -160,10 +160,21 @@ def main() -> int:
             f"ddr_bytes={table_capacity * source_stride}"
         )
 
+        print("RUNTIME_NPU_PHASE_BEGIN phase=seed_fixed_blocks")
         keys = list(range(1, table_capacity + 1))
-        runtime.seed_fixed_blocks(keys, [pattern(slot, block_bytes) for slot in range(table_capacity)])
+        runtime.seed_fixed_pattern_blocks(keys, block_bytes)
+        print(
+            "RUNTIME_NPU_PHASE_DONE phase=seed_fixed_blocks "
+            f"blocks={table_capacity} block_bytes={block_bytes}"
+        )
+
+        print("RUNTIME_NPU_PHASE_BEGIN phase=prepare_access_table")
         table = runtime.prepare_access_table(keys)
-        view = runtime.access_table_view(table)
+        del keys
+        print(
+            "RUNTIME_NPU_PHASE_DONE phase=prepare_access_table "
+            f"entries={table_capacity}"
+        )
 
         indices_values = [table_capacity - 1 - (request % table_capacity) for request in range(requests)]
         mask_values = [
@@ -173,8 +184,20 @@ def main() -> int:
         output_indices_values = [output_rows - 1 - request for request in range(requests)]
 
         print("RUNTIME_NPU_PHASE_BEGIN phase=caller_buffer_setup")
-        address_table = torch.tensor(view["addresses"], dtype=torch.int64, device=device)
-        valid_table = torch.tensor(view["valid"], dtype=torch.uint8, device=device)
+        address_table = torch.empty(table_capacity, dtype=torch.int64, device=device)
+        valid_table = torch.empty(table_capacity, dtype=torch.uint8, device=device)
+        print("RUNTIME_NPU_PHASE_BEGIN phase=copy_access_table_to_device")
+        runtime.copy_access_table_to_device(
+            table,
+            int(address_table.data_ptr()),
+            tensor_bytes(address_table),
+            int(valid_table.data_ptr()),
+            tensor_bytes(valid_table),
+        )
+        print(
+            "RUNTIME_NPU_PHASE_DONE phase=copy_access_table_to_device "
+            f"entries={table_capacity}"
+        )
         indices = torch.tensor(indices_values, dtype=torch.int32, device=device)
         mask = torch.tensor(mask_values, dtype=torch.uint8, device=device)
         output_indices = torch.tensor(output_indices_values, dtype=torch.int32, device=device)

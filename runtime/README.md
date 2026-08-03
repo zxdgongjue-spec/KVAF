@@ -39,8 +39,9 @@ index/mask/output-index/output buffer，以及 NPU 上的 address/valid 表。Ru
 当前 `PrepareAccessTable` 只生成 Runtime-owned 的扁平 Host
 `address/length/valid` 表并持有对应 Key 锁。NPU AccessTable 的 device buffer
 由 CacheOS-vLLM Adapter 创建和维护；本仓的 Python NPU 测试脚本暂时承担该
-Adapter 角色：读取 Host view，按相同下标顺序写入 caller-owned NPU
-`addresses` 与 `valid` buffer，再将它们传给 `BatchGet`。
+Adapter 角色：创建 caller-owned NPU `addresses` 与 `valid` buffer，并通过
+`NpuRuntime.copy_access_table_to_device` 按相同下标顺序上传 Host view，再将
+它们传给 `BatchGet`。该 helper 属于 CANN/Python Adapter，不属于通用 Runtime。
 
 Adapter 必须保证这些 device buffer 在关联 BatchGet 完成且
 `ReleaseAccessTable` 前持续有效、容量与 Host view 一致；Runtime 不分配、复制、
