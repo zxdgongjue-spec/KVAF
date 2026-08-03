@@ -29,6 +29,12 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
       KVAF_ENABLE_AIV_BATCH_GET=1
       _GLIBCXX_USE_CXX11_ABI=0
   )
+  # _kvaf directly links the AIV host shared object. Keep its build-tree
+  # location in the extension RPATH so PYTHONPATH=build/python is sufficient
+  # for the direct Python integration test.
+  set_property(TARGET _kvaf APPEND PROPERTY BUILD_RPATH
+    "$<TARGET_FILE_DIR:kvaf_execute_batch_get_host>"
+  )
 endif()
 
 set_target_properties(_kvaf PROPERTIES
@@ -40,4 +46,10 @@ add_custom_command(TARGET _kvaf POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory
     ${CMAKE_CURRENT_SOURCE_DIR}/../python/kvaf
     ${CMAKE_BINARY_DIR}/python/kvaf
+  # Fail the build at the Python dynamic-loader boundary, rather than later
+  # obscuring a missing shared library as a test-script import error.
+  COMMAND ${CMAKE_COMMAND} -E env
+    "PYTHONPATH=${CMAKE_BINARY_DIR}/python"
+    "${Python_EXECUTABLE}" -c
+    "import kvaf"
 )

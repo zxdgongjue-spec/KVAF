@@ -8,14 +8,12 @@ will be added alongside their operator implementation.
 
 try:
     from . import _kvaf as _native
-except ImportError:
-    _native = None
-
-if _native is None:
+except ImportError as error:
     raise ImportError(
-        "KVAF native bindings are not available. Configure with "
-        "-DKVAF_BUILD_PYTHON=ON and add build/python to PYTHONPATH."
-    )
+        "KVAF native bindings could not be loaded. Configure with "
+        "-DKVAF_BUILD_PYTHON=ON, add build/python to PYTHONPATH, and inspect "
+        f"this dynamic-loader error: {error}"
+    ) from error
 
 AccessTable = _native.AccessTable
 Runtime = _native.Runtime
