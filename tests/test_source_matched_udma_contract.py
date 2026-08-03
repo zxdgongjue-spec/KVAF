@@ -159,6 +159,69 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
             close_body.index("kvaf_udma_source_runtime_uninit()"),
         )
 
+    def test_ub_management_reports_the_exact_failed_stage(self):
+        communication = self.read(
+            "access_operator/a5/provider/source_matched_communication.c"
+        )
+
+        self.assertIn(
+            '"KVAF_URMA_MGMT_ERROR stage=%s raw_errno=%d "',
+            communication,
+        )
+        self.assertIn(
+            '"fallback_errno=%d effective_errno=%d\\n"',
+            communication,
+        )
+        for stage in (
+            "validate_establish_arguments",
+            "resolve_device_eid",
+            "validate_device_eid",
+            "create_context",
+            "create_jfc",
+            "register_send_segment",
+            "register_receive_segment",
+            "register_handshake_segment",
+            "create_jfr",
+            "create_jetty",
+            "server_handshake",
+            "client_handshake",
+            "validate_peer_eid",
+            "post_client_receive",
+        ):
+            self.assertIn(f'"{stage}"', communication)
+
+        # The source-linked URMA core intentionally leaves ENOENT while it
+        # suppresses dynamic-provider scans. Every independently checked UB
+        # operation must start with a clean errno, while the error reporter
+        # retains a deterministic fallback for APIs that do not set errno.
+        for operation in (
+            "ub_resolve_dev_and_eid_idx(",
+            "urma_create_context(",
+            "urma_create_jfc(",
+            "urma_register_seg(",
+            "urma_create_jfr(",
+            "urma_create_jetty(",
+            "ub_server_handshake(",
+            "ub_client_handshake(",
+            "ub_post_one_recv(",
+        ):
+            operation_index = communication.index(operation)
+            self.assertIn(
+                "errno = 0;",
+                communication[max(0, operation_index - 120):operation_index],
+            )
+        helper_start = communication.index(
+            "static int kvaf_ub_management_error("
+        )
+        helper_end = communication.index(
+            "static int kvaf_ub_create_local_resources_checked(",
+            helper_start,
+        )
+        helper = communication[helper_start:helper_end]
+        self.assertLess(helper.index("(void)fflush(stderr);"), helper.index(
+            "errno = concrete_errno;"
+        ))
+
     def test_tcp_connect_retries_share_one_monotonic_deadline(self):
         communication = self.read(
             "access_operator/a5/provider/source_matched_communication.c"

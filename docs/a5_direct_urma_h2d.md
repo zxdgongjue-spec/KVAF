@@ -725,6 +725,15 @@ runner 不再用固定 sleep 猜测 Host server 是否启动。它固定本次 H
 `KVAF_DIRECT_SERVER_START_DELAY_SECONDS` 会直接报参数错误，避免遗留的 5 秒延迟
 继续消耗 Host 管理握手 deadline。
 
+若 Host 在 READY 前退出，先查看同一 `host.log` 中的
+`KVAF_URMA_MGMT_ERROR stage=<stage> raw_errno=<raw>`，以及同一行的
+`fallback_errno=<fallback> effective_errno=<effective>`。`stage`
+精确区分 EID 解析、context/JFC/segment/JFR/Jetty 创建以及 server/client handshake；
+每个独立 URMA 操作前都会清空 `errno`。固定源码会主动屏蔽动态 provider 目录扫描，
+该扫描可能产生 `ENOENT`，因此不能再只凭最终 `provider_status=-2` 推断设备节点或
+EID 缺失，必须以 `stage` 和该阶段的底层 UMDK 日志为准。该诊断不改变 provider
+ABI、资源所有权或 checked teardown 行为。
+
 Device provider 的控制超时仍由 `KVAF_H2D_TIMEOUT_SECONDS` 指定。Host 的管理窗口
 独立使用 `KVAF_HOST_CONTROL_TIMEOUT_SECONDS`；默认值是 Device timeout 加 management
 ready timeout 再加 5 秒，并在 manifest 中分别记录。AIV 对 AICPU owner 的 READY

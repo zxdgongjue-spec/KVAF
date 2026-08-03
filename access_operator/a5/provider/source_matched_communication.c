@@ -285,6 +285,25 @@ static urma_status_t kvaf_ready_urma_post_jetty_recv_wr(
  * that context is installed in g_ub_ctx and the ordinary checked Close path
  * retains/retries every successfully returned public handle.
  */
+static int kvaf_ub_management_error(
+    const char *stage, int operation_errno, int fallback_errno)
+{
+    const int concrete_errno =
+        operation_errno == 0 ? fallback_errno : operation_errno;
+
+    /* source_linked_urma_main deliberately reports ENOENT while suppressing
+     * dynamic provider scans. Reset errno before every checked operation and
+     * name the exact failing stage so that such an internal errno can never
+     * be mistaken for a missing endpoint, context, queue or Jetty. */
+    (void)fprintf(stderr,
+        "KVAF_URMA_MGMT_ERROR stage=%s raw_errno=%d "
+        "fallback_errno=%d effective_errno=%d\n",
+        stage, operation_errno, fallback_errno, concrete_errno);
+    (void)fflush(stderr);
+    errno = concrete_errno;
+    return -1;
+}
+
 static int kvaf_ub_create_local_resources_checked(
     const comm_ub_cfg_t *cfg, const char *expected_device_name,
     uint32_t expected_eid_index, ub_mgmt_ctx_t **ctx_out)
@@ -299,50 +318,67 @@ static int kvaf_ub_create_local_resources_checked(
 
     if (cfg == NULL || expected_device_name == NULL ||
         expected_device_name[0] == '\0' || ctx_out == NULL) {
-        errno = EINVAL;
-        return -1;
+        return kvaf_ub_management_error(
+            "validate_arguments", EINVAL, EINVAL);
     }
     *ctx_out = NULL;
+    errno = 0;
     ctx = (ub_mgmt_ctx_t *)calloc(1, sizeof(*ctx));
     if (ctx == NULL) {
-        errno = ENOMEM;
-        return -1;
+        return kvaf_ub_management_error(
+            "allocate_owner", errno, ENOMEM);
     }
     *ctx_out = ctx;
 
+    errno = 0;
     if (ub_resolve_dev_and_eid_idx(
             cfg->src_eid, &ctx->dev, &eid_idx) != 0) {
-        return -1;
+        return kvaf_ub_management_error(
+            "resolve_device_eid", errno, ENODEV);
     }
     /* Management and data resources are one endpoint lifetime. Silently
      * resolving the management EID onto a different UDMA device/index would
      * create a second, unproven ownership domain and break teardown proofs. */
     if (strcmp(ctx->dev->name, expected_device_name) != 0 ||
         eid_idx != expected_eid_index) {
-        errno = EACCES;
-        return -1;
+        return kvaf_ub_management_error(
+            "validate_device_eid", EACCES, EACCES);
     }
+    errno = 0;
     ctx->urma_ctx = urma_create_context(ctx->dev, eid_idx);
     if (ctx->urma_ctx == NULL) {
-        return -1;
+        return kvaf_ub_management_error(
+            "create_context", errno, EIO);
     }
 
     jfc_cfg.depth = UB_MGMT_JFC_DEPTH;
+    errno = 0;
     ctx->jfc = urma_create_jfc(ctx->urma_ctx, &jfc_cfg);
     if (ctx->jfc == NULL) {
-        return -1;
+        return kvaf_ub_management_error(
+            "create_jfc", errno, EIO);
     }
 
+    errno = 0;
     ctx->send_buf = (char *)memalign(
         UB_MGMT_SEG_ALIGN, UB_MGMT_MSG_MAX_SIZE);
+    if (ctx->send_buf == NULL) {
+        return kvaf_ub_management_error(
+            "allocate_send_buffer", errno, ENOMEM);
+    }
+    errno = 0;
     ctx->recv_buf = (char *)memalign(
         UB_MGMT_SEG_ALIGN, UB_MGMT_MSG_MAX_SIZE);
+    if (ctx->recv_buf == NULL) {
+        return kvaf_ub_management_error(
+            "allocate_receive_buffer", errno, ENOMEM);
+    }
+    errno = 0;
     ctx->recv_buf_hs = (char *)memalign(
         UB_MGMT_SEG_ALIGN, UB_MGMT_MSG_MAX_SIZE);
-    if (ctx->send_buf == NULL || ctx->recv_buf == NULL ||
-        ctx->recv_buf_hs == NULL) {
-        errno = ENOMEM;
-        return -1;
+    if (ctx->recv_buf_hs == NULL) {
+        return kvaf_ub_management_error(
+            "allocate_handshake_buffer", errno, ENOMEM);
     }
     (void)memset(ctx->send_buf, 0, UB_MGMT_MSG_MAX_SIZE);
     (void)memset(ctx->recv_buf, 0, UB_MGMT_MSG_MAX_SIZE);
@@ -357,19 +393,25 @@ static int kvaf_ub_create_local_resources_checked(
     seg_cfg.iova = 0;
 
     seg_cfg.va = (uint64_t)ctx->send_buf;
+    errno = 0;
     ctx->tseg_send = urma_register_seg(ctx->urma_ctx, &seg_cfg);
     if (ctx->tseg_send == NULL) {
-        return -1;
+        return kvaf_ub_management_error(
+            "register_send_segment", errno, EIO);
     }
     seg_cfg.va = (uint64_t)ctx->recv_buf;
+    errno = 0;
     ctx->tseg_recv = urma_register_seg(ctx->urma_ctx, &seg_cfg);
     if (ctx->tseg_recv == NULL) {
-        return -1;
+        return kvaf_ub_management_error(
+            "register_receive_segment", errno, EIO);
     }
     seg_cfg.va = (uint64_t)ctx->recv_buf_hs;
+    errno = 0;
     ctx->tseg_recv_hs = urma_register_seg(ctx->urma_ctx, &seg_cfg);
     if (ctx->tseg_recv_hs == NULL) {
-        return -1;
+        return kvaf_ub_management_error(
+            "register_handshake_segment", errno, EIO);
     }
 
     jfs_cfg.depth = UB_MGMT_JFS_DEPTH;
@@ -386,9 +428,11 @@ static int kvaf_ub_create_local_resources_checked(
     jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
     jfr_cfg.jfc = ctx->jfc;
     jfr_cfg.token_value = g_ub_mgmt_token;
+    errno = 0;
     ctx->jfr = urma_create_jfr(ctx->urma_ctx, &jfr_cfg);
     if (ctx->jfr == NULL) {
-        return -1;
+        return kvaf_ub_management_error(
+            "create_jfr", errno, EIO);
     }
 
     ctx->is_server = cfg->dst_eid == NULL;
@@ -397,9 +441,11 @@ static int kvaf_ub_create_local_resources_checked(
     jetty_cfg.jfs_cfg = jfs_cfg;
     jetty_cfg.shared.jfr = ctx->jfr;
     jetty_cfg.shared.jfc = ctx->jfc;
+    errno = 0;
     ctx->pair.jetty = urma_create_jetty(ctx->urma_ctx, &jetty_cfg);
     if (ctx->pair.jetty == NULL) {
-        return -1;
+        return kvaf_ub_management_error(
+            "create_jetty", errno, EIO);
     }
     return 0;
 }
@@ -427,8 +473,8 @@ static int kvaf_ub_establish_connection(
 
     if (g_ub_ctx != NULL || cfg->pair_num != 1U ||
         expected_peer_eid == NULL || expected_peer_eid[0] == '\0') {
-        errno = EINVAL;
-        return -1;
+        return kvaf_ub_management_error(
+            "validate_establish_arguments", EINVAL, EINVAL);
     }
     if (kvaf_ub_create_local_resources_checked(
             &ub_cfg, cfg->dev_name, cfg->eid_idx, &ctx) != 0) {
@@ -444,26 +490,38 @@ static int kvaf_ub_establish_connection(
         g_kvaf_ub_server_jetty_id = ub_cfg.dst_jetty_id;
         (void)snprintf(g_kvaf_ub_server_local_eid,
             sizeof(g_kvaf_ub_server_local_eid), "%s", ub_cfg.src_eid);
+        errno = 0;
         if (ub_server_handshake(ctx) != 0) {
+            const int handshake_errno = errno;
+
             g_kvaf_ub_server_arming = false;
-            return -1;
+            return kvaf_ub_management_error(
+                "server_handshake", handshake_errno, EIO);
         }
         g_kvaf_ub_server_arming = false;
-    } else if (ub_client_handshake(
-            ctx, ub_cfg.dst_eid, ub_cfg.dst_jetty_id) != 0) {
-        return -1;
+    } else {
+        errno = 0;
+        if (ub_client_handshake(
+                ctx, ub_cfg.dst_eid, ub_cfg.dst_jetty_id) != 0) {
+            return kvaf_ub_management_error(
+                "client_handshake", errno, EIO);
+        }
     }
 
     /* Never exchange an MR, token or data-Jetty descriptor with an endpoint
      * other than the EID selected by the caller.  On the server this checks
      * the hardware-filled receive CQE identity, not client-supplied bytes. */
     if (!kvaf_ub_peer_matches(expected_peer_eid)) {
-        errno = EACCES;
-        return -1;
+        return kvaf_ub_management_error(
+            "validate_peer_eid", EACCES, EACCES);
     }
 
-    if (!ctx->is_server && ub_post_one_recv(ctx) != 0) {
-        return -1;
+    if (!ctx->is_server) {
+        errno = 0;
+        if (ub_post_one_recv(ctx) != 0) {
+            return kvaf_ub_management_error(
+                "post_client_receive", errno, EIO);
+        }
     }
     ctx->pair.have_pending_recv = !ctx->is_server;
     return 0;
