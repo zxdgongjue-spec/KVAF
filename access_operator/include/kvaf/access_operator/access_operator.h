@@ -1,11 +1,12 @@
 #pragma once
 
-#include "kvaf/meta_manager/meta_manager.h"
 #include "kvaf/requests.h"
 #include "kvaf/status.h"
 #include "kvaf/types.h"
 
 namespace kvaf {
+
+struct PutAccessDesc;
 
 struct BatchPutExecRequest {
   const BatchPutRequest* request{nullptr};
