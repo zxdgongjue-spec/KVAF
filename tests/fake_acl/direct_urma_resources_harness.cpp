@@ -1,3 +1,4 @@
+#include <cerrno>
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -135,6 +136,20 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+  if (scenario == "cleanup_state_regression" ||
+      scenario == "cleanup_foreign_session") {
+    if (open.ok() || resources.transport_teardown_complete() ||
+        resources.transport_teardown_retryable() ||
+        resources.close_phase() !=
+            DirectUrmaClosePhase::kUnsafeUnknown ||
+        resources.close_disposition() !=
+            DirectUrmaCloseDisposition::kUnsafeUnknown ||
+        kvaf_fake_acl_free_calls() != 0 ||
+        kvaf_fake_acl_destroy_stream_calls() != 0) {
+      return Fail("invalid cleanup progress released shared backing");
+    }
+    return 0;
+  }
   if (scenario == "foreign_already_open") {
     if (open.ok() || !resources.transport_teardown_complete() ||
         kvaf_fake_acl_close_launches() != 0 ||
@@ -146,9 +161,12 @@ int main(int argc, char** argv) {
   }
   if (scenario == "clock_failed_before_open" ||
       scenario == "lease_expired_after_open" ||
-      scenario == "opening_then_open_failed_safe") {
+      scenario == "opening_then_open_failed_safe" ||
+      scenario == "closing_retry_then_open_failed_safe") {
     const int expected_close_launches =
-        scenario == "lease_expired_after_open" ? 1 : 0;
+        scenario == "lease_expired_after_open"
+            ? 1
+            : (scenario == "closing_retry_then_open_failed_safe" ? 2 : 0);
     if (open.ok() || !resources.transport_teardown_complete() ||
         resources.transport_teardown_retryable() ||
         kvaf_fake_acl_close_launches() != expected_close_launches ||
@@ -162,6 +180,16 @@ int main(int argc, char** argv) {
          open.message().find("owner_result_code=2") ==
              std::string::npos)) {
       return Fail("late failed Open lost exact diagnostics");
+    }
+    if (scenario == "closing_retry_then_open_failed_safe" &&
+        (open.message().find("provider_result_status=7") ==
+             std::string::npos ||
+         open.message().find(
+             "provider_status=" + std::to_string(-EAGAIN)) ==
+             std::string::npos ||
+         open.message().find("owner_result_code=2") ==
+             std::string::npos)) {
+      return Fail("retrying failed Open lost exact terminal diagnostics");
     }
     return 0;
   }

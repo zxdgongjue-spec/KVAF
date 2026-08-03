@@ -794,6 +794,15 @@ ready timeout 再加 5 秒，并在 manifest 中分别记录。AIV 对 AICPU own
 3 收敛；若 owner 本身长期无终态，runner 以退出码 5 保留 live worker 和 active
 state，而不会仅因观察超时制造 quarantine。
 
+failed-Open 的 checked teardown 会先经过 `CLOSING`、`CLOSE_RETRYING`，最后才发布
+`OPEN_FAILED_SAFE`。前两者仍持有 provider 和同一 session 的重试 cursor，不是终态；
+AIV 与 Host wrapper 都必须继续观察，且不得再次提交 Close。AIV 只有在验证 owner
+identity、provider result session 和 active/teardown flags 后才允许等待这两个过渡态。
+`CLOSED`、`OPEN_FAILED_SAFE` 才是已停止修改传输资源的完成态；明确的
+`UNSAFE_WAITING` 仍按 ownership failure 处理。runner 在首次真正的 unsafe 证据后会
+持久化 quarantine，并自动打印最多 320 行 Host/Device 日志，保留
+`aiv_status/owner_state/provider_status` 供定位。
+
 `KVAF_H2D_RUN_TIMEOUT_SECONDS` 从 Device 启动后计时；Host management-ready 阶段由
 `KVAF_DIRECT_SERVER_READY_TIMEOUT_SECONDS` 单独计时。因此最坏墙钟监督时长是两者
 之和，不应把 run timeout 理解为从 Host fork 起算的全局 deadline。

@@ -119,6 +119,15 @@ class DirectUrmaResourcesBehaviorTests(unittest.TestCase):
     def test_opening_converges_to_safe_failed_open_after_deadline(self) -> None:
         self.run_scenario("opening_then_open_failed_safe")
 
+    def test_failed_open_cleanup_progress_is_not_terminal(self) -> None:
+        self.run_scenario("closing_retry_then_open_failed_safe")
+
+    def test_failed_open_cleanup_state_cannot_move_backwards(self) -> None:
+        self.run_scenario("cleanup_state_regression")
+
+    def test_failed_open_cleanup_rejects_foreign_session(self) -> None:
+        self.run_scenario("cleanup_foreign_session")
+
     def test_data_and_shutdown_share_one_fifo_stream(self) -> None:
         self.run_scenario("data_stream_fifo")
 

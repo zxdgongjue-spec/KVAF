@@ -241,9 +241,12 @@ __aicore__ inline bool EpochOwnerStatusIdentityIsValid(
 }
 
 __aicore__ inline bool EpochOwnerStateIsTerminal(std::uint32_t state) {
-  return state == KVAF_URMA_EPOCH_OWNER_STATE_CLOSING ||
-         state == KVAF_URMA_EPOCH_OWNER_STATE_CLOSE_RETRYING ||
-         state == KVAF_URMA_EPOCH_OWNER_STATE_CLOSED ||
+  // CLOSING and CLOSE_RETRYING still own the provider and its exact
+  // same-session teardown cursor.  Treating either as terminal lets a
+  // one-poll READY observer race checked cleanup and falsely promote a
+  // retryable failed Open to ownership-unknown.  Only states in which the
+  // owner has stopped mutating transport resources are terminal here.
+  return state == KVAF_URMA_EPOCH_OWNER_STATE_CLOSED ||
          state == KVAF_URMA_EPOCH_OWNER_STATE_OPEN_FAILED_SAFE;
 }
 
@@ -265,11 +268,16 @@ KvafAivEpochOwnerWaitReadyKernel(
     return;
   }
 
+  std::uint32_t last_observed_state =
+      KVAF_URMA_EPOCH_OWNER_STATE_EMPTY;
+  std::uint64_t last_observed_sequence = 0;
   for (std::uint32_t poll = 0; poll < max_polls; ++poll) {
     const std::uint32_t observed_polls = poll + 1U;
     InvalidateGlobalCacheLine(
         reinterpret_cast<std::uint64_t>(owner_status));
     const std::uint32_t state = owner_status->state;
+    last_observed_state = state;
+    last_observed_sequence = owner_status->sequence;
     if (state == KVAF_URMA_EPOCH_OWNER_STATE_EMPTY) {
       continue;
     }
@@ -309,6 +317,36 @@ KvafAivEpochOwnerWaitReadyKernel(
           owner_status->sequence);
       return;
     }
+    if (state == KVAF_URMA_EPOCH_OWNER_STATE_CLOSING ||
+        state == KVAF_URMA_EPOCH_OWNER_STATE_CLOSE_RETRYING) {
+      const std::uint32_t required_flags =
+          KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+          KVAF_URMA_EPOCH_OWNER_PROVIDER_ACTIVE;
+      InvalidateGlobalCacheRange(
+          reinterpret_cast<std::uint64_t>(open_result),
+          sizeof(*open_result));
+      if (owner_status->result_code !=
+              KVAF_URMA_EPOCH_OWNER_RESULT_OK ||
+          owner_status->sequence != 0 ||
+          (owner_status->flags & required_flags) != required_flags ||
+          (owner_status->flags &
+           (KVAF_URMA_EPOCH_OWNER_TEARDOWN_COMPLETE |
+            KVAF_URMA_EPOCH_OWNER_OWNERSHIP_UNSAFE)) != 0 ||
+          open_result->magic != KVAF_URMA_PROVIDER_MAGIC ||
+          open_result->abi_version != KVAF_URMA_PROVIDER_ABI_VERSION ||
+          open_result->struct_size != sizeof(*open_result) ||
+          open_result->session_id != session_id) {
+        PublishEpochOwnerAivResult(
+            aiv_result, AicpuEpochOwnerAivStatus::kInvalidOwnerStatus,
+            epoch, session_id, state, observed_polls,
+            owner_status->sequence);
+        return;
+      }
+      // The resource-owning invocation is converging inside its checked
+      // Close loop.  Keep observing this same owner; do not submit another
+      // Close and do not report a terminal state yet.
+      continue;
+    }
     if (EpochOwnerStateIsTerminal(state) ||
         state == KVAF_URMA_EPOCH_OWNER_STATE_UNSAFE_WAITING) {
       PublishEpochOwnerAivResult(
@@ -319,12 +357,14 @@ KvafAivEpochOwnerWaitReadyKernel(
     }
   }
 
-  InvalidateGlobalCacheLine(
-      reinterpret_cast<std::uint64_t>(owner_status));
+  // Report the exact state whose identity/flags were checked in the loop.
+  // Re-reading state here could observe a later terminal publication without
+  // classifying its evidence, which would recreate the same false-unsafe
+  // race in the Host wrapper.
   PublishEpochOwnerAivResult(
       aiv_result, AicpuEpochOwnerAivStatus::kTimedOut,
-      epoch, session_id, owner_status->state, max_polls,
-      owner_status->sequence);
+      epoch, session_id, last_observed_state, max_polls,
+      last_observed_sequence);
 }
 
 extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void

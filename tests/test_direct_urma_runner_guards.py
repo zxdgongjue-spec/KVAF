@@ -1155,6 +1155,23 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
         self.assertIn("record_quarantine", final_branch)
         self.assertNotIn("fatal.host", final_branch)
 
+    def test_first_unsafe_edge_prints_bounded_worker_diagnostics(self) -> None:
+        helper = self.shell_function_source("dump_worker_failure_logs")
+        self.assertIn('echo "HOST_LOG=${host_log}"', helper)
+        self.assertIn('echo "DEVICE_LOG=${device_log}"', helper)
+        self.assertEqual(helper.count("tail -n 320"), 2)
+
+        wait_start = self.source.index(
+            'while process_is_running "${host_pid}"'
+        )
+        unsafe = self.source.index(
+            'record_quarantine "unsafe_provider_teardown"', wait_start
+        )
+        exit_unsafe = self.source.index("exit 4", unsafe)
+        self.assertIn(
+            "dump_worker_failure_logs", self.source[unsafe:exit_unsafe]
+        )
+
     def test_fatal_wakeup_is_nonce_validated(self) -> None:
         self.assertIn("valid_fatal_marker()", self.source)
         self.assertIn(

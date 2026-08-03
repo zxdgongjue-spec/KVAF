@@ -397,6 +397,21 @@ extern "C" rtError_t rtAicpuKernelLaunchExWithArgs(
       owner_status->result_code = KVAF_URMA_EPOCH_OWNER_RESULT_OK;
       owner_status->flags = 0;
       owner_status->state = KVAF_URMA_EPOCH_OWNER_STATE_OPENING;
+    } else if (Scenario("closing_retry_then_open_failed_safe") ||
+               Scenario("cleanup_state_regression") ||
+               Scenario("cleanup_foreign_session")) {
+      result->status = KVAF_URMA_PROVIDER_RESOURCE_CREATE_FAILED;
+      result->provider_status = -EAGAIN;
+      result->flags = KVAF_URMA_PROVIDER_CLEANUP_RETRYABLE;
+      result->session_id = args->config.session_id;
+      owner_status->result_code = KVAF_URMA_EPOCH_OWNER_RESULT_OK;
+      owner_status->provider_status = 0;
+      owner_status->flags =
+          KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+          KVAF_URMA_EPOCH_OWNER_PROVIDER_ACTIVE;
+      owner_status->state = Scenario("cleanup_state_regression")
+          ? KVAF_URMA_EPOCH_OWNER_STATE_CLOSE_RETRYING
+          : KVAF_URMA_EPOCH_OWNER_STATE_CLOSING;
     } else if (Scenario("runtime_capability_partial")) {
       result->reserved[2] =
           KVAF_UDMA_TEARDOWN_SOURCE_OWNED_PARTIAL_RETRY_V1;
@@ -429,6 +444,7 @@ void LaunchAivEpochOwnerWaitReady(
   AicpuEpochOwnerAivResult result{};
   result.epoch = epoch;
   result.session_id = session_id;
+  result.poll_count = 1;
   result.observed_owner_state = status->state;
   result.observed_sequence = status->sequence;
   if ((Scenario("ready_timeout_once") ||
@@ -454,6 +470,58 @@ void LaunchAivEpochOwnerWaitReady(
         KVAF_URMA_EPOCH_OWNER_TEARDOWN_COMPLETE;
     g_owner_status->state =
         KVAF_URMA_EPOCH_OWNER_STATE_OPEN_FAILED_SAFE;
+  }
+  if (Scenario("closing_retry_then_open_failed_safe")) {
+    if (g_ready_wait_launches == 1) {
+      result.status = static_cast<std::uint32_t>(
+          AicpuEpochOwnerAivStatus::kOwnerTerminal);
+      result.observed_owner_state =
+          KVAF_URMA_EPOCH_OWNER_STATE_CLOSING;
+      *aiv_result = result;
+      g_owner_status->state =
+          KVAF_URMA_EPOCH_OWNER_STATE_CLOSE_RETRYING;
+      return;
+    }
+    if (g_ready_wait_launches == 2) {
+      result.status = static_cast<std::uint32_t>(
+          AicpuEpochOwnerAivStatus::kTimedOut);
+      result.observed_owner_state =
+          KVAF_URMA_EPOCH_OWNER_STATE_CLOSE_RETRYING;
+      *aiv_result = result;
+      g_owner_status->result_code =
+          KVAF_URMA_EPOCH_OWNER_RESULT_OPEN_FAILED;
+      g_owner_status->provider_status = -EAGAIN;
+      g_owner_status->close_attempts = 2;
+      g_owner_status->flags =
+          KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+          KVAF_URMA_EPOCH_OWNER_TEARDOWN_COMPLETE;
+      g_owner_status->state =
+          KVAF_URMA_EPOCH_OWNER_STATE_OPEN_FAILED_SAFE;
+      g_close_launches = 2;
+      g_last_close_session = session_id;
+      return;
+    }
+  }
+  if (Scenario("cleanup_state_regression") &&
+      g_ready_wait_launches == 1) {
+    result.status = static_cast<std::uint32_t>(
+        AicpuEpochOwnerAivStatus::kTimedOut);
+    result.observed_owner_state =
+        KVAF_URMA_EPOCH_OWNER_STATE_CLOSE_RETRYING;
+    *aiv_result = result;
+    // A copied status that moves backwards cannot describe the same checked
+    // Close cursor.  The Host wrapper must retain every shared allocation.
+    g_owner_status->state = KVAF_URMA_EPOCH_OWNER_STATE_CLOSING;
+    return;
+  }
+  if (Scenario("cleanup_foreign_session") &&
+      g_ready_wait_launches == 1) {
+    result.status = static_cast<std::uint32_t>(
+        AicpuEpochOwnerAivStatus::kTimedOut);
+    result.observed_owner_state = KVAF_URMA_EPOCH_OWNER_STATE_CLOSING;
+    *aiv_result = result;
+    ++g_owner_status->session_id;
+    return;
   }
   result.observed_owner_state = status->state;
   result.observed_sequence = status->sequence;

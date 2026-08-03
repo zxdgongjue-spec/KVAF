@@ -913,20 +913,95 @@ Status DirectUrmaResources::Open(const DirectUrmaOpenSpec& spec) {
                             copy_result);
         break;
       }
-      const bool ready_still_pending =
-          ready_result.status == static_cast<std::uint32_t>(
-              AicpuEpochOwnerAivStatus::kTimedOut) &&
+      const bool ready_result_identity_valid =
+          ready_result.magic == kAicpuEpochOwnerAivResultMagic &&
+          ready_result.abi_version ==
+              kAicpuEpochOwnerAivResultAbiVersion &&
+          ready_result.struct_size == sizeof(ready_result) &&
+          ready_result.epoch == impl_->epoch_id &&
+          ready_result.session_id == impl_->session_id;
+      const bool ready_owner_is_progressing =
+          ready_result.observed_owner_state ==
+              KVAF_URMA_EPOCH_OWNER_STATE_EMPTY ||
+          ready_result.observed_owner_state ==
+              KVAF_URMA_EPOCH_OWNER_STATE_OPENING ||
+          ready_result.observed_owner_state ==
+              KVAF_URMA_EPOCH_OWNER_STATE_CLOSING ||
+          ready_result.observed_owner_state ==
+              KVAF_URMA_EPOCH_OWNER_STATE_CLOSE_RETRYING;
+      const bool ready_observed_cleanup_progress =
+          ready_result.observed_owner_state ==
+              KVAF_URMA_EPOCH_OWNER_STATE_CLOSING ||
+          ready_result.observed_owner_state ==
+              KVAF_URMA_EPOCH_OWNER_STATE_CLOSE_RETRYING;
+      const bool ready_owner_identity_valid =
+          ready_result.observed_owner_state ==
+              KVAF_URMA_EPOCH_OWNER_STATE_EMPTY ||
+          EpochOwnerStatusHeaderIsValid(
+              ready_status, impl_->epoch_id, impl_->session_id);
+      const bool ready_cleanup_result_valid =
+          !ready_observed_cleanup_progress ||
+          (impl_->result.magic == KVAF_URMA_PROVIDER_MAGIC &&
+           impl_->result.abi_version ==
+               KVAF_URMA_PROVIDER_ABI_VERSION &&
+           impl_->result.struct_size == sizeof(impl_->result) &&
+           impl_->result.session_id == impl_->session_id);
+      const bool ready_status_is_cleanup_progress =
+          ready_status.state == KVAF_URMA_EPOCH_OWNER_STATE_CLOSING ||
+          ready_status.state ==
+              KVAF_URMA_EPOCH_OWNER_STATE_CLOSE_RETRYING;
+      const std::uint32_t cleanup_required_flags =
+          KVAF_URMA_EPOCH_OWNER_OPEN_RESULT_VALID |
+          KVAF_URMA_EPOCH_OWNER_PROVIDER_ACTIVE;
+      const bool ready_cleanup_status_fields_valid =
+          !ready_status_is_cleanup_progress ||
+          (ready_status.result_code ==
+               KVAF_URMA_EPOCH_OWNER_RESULT_OK &&
+           ready_status.sequence == 0 &&
+           (ready_status.flags & cleanup_required_flags) ==
+               cleanup_required_flags &&
+           (ready_status.flags &
+            (KVAF_URMA_EPOCH_OWNER_TEARDOWN_COMPLETE |
+             KVAF_URMA_EPOCH_OWNER_OWNERSHIP_UNSAFE)) == 0);
+      const bool ready_cleanup_state_is_monotonic =
+          !ready_observed_cleanup_progress ||
           (ready_result.observed_owner_state ==
-               KVAF_URMA_EPOCH_OWNER_STATE_EMPTY ||
-           ready_result.observed_owner_state ==
-               KVAF_URMA_EPOCH_OWNER_STATE_OPENING);
+                   KVAF_URMA_EPOCH_OWNER_STATE_CLOSING
+               ? (ready_status.state ==
+                      KVAF_URMA_EPOCH_OWNER_STATE_CLOSING ||
+                  ready_status.state ==
+                      KVAF_URMA_EPOCH_OWNER_STATE_CLOSE_RETRYING ||
+                  ready_status.state ==
+                      KVAF_URMA_EPOCH_OWNER_STATE_OPEN_FAILED_SAFE)
+               : (ready_status.state ==
+                      KVAF_URMA_EPOCH_OWNER_STATE_CLOSE_RETRYING ||
+                  ready_status.state ==
+                      KVAF_URMA_EPOCH_OWNER_STATE_OPEN_FAILED_SAFE));
+      // Accept kOwnerTerminal for states 3/4 as a compatibility defense for
+      // an older co-built AIV observer.  The current kernel reports kTimedOut,
+      // but neither status may turn a resource-owning Close cursor into an
+      // ownership-unknown terminal.  Identity and provider-result evidence
+      // remain mandatory before another bounded observation is launched.
+      const bool ready_observation_can_progress =
+          ready_result.status == static_cast<std::uint32_t>(
+              AicpuEpochOwnerAivStatus::kTimedOut) ||
+          (ready_observed_cleanup_progress &&
+           ready_result.status == static_cast<std::uint32_t>(
+               AicpuEpochOwnerAivStatus::kOwnerTerminal));
+      const bool ready_still_pending =
+          ready_result_identity_valid &&
+          ready_observation_can_progress && ready_owner_is_progressing &&
+          ready_owner_identity_valid && ready_cleanup_result_valid &&
+          ready_cleanup_status_fields_valid &&
+          ready_cleanup_state_is_monotonic;
       if (!ready_still_pending) {
         break;
       }
 
-      // One AIV poll task is intentionally finite. A slow TCP/resource Open
-      // gets another task on the same control stream until READY or a proved
-      // terminal owner state; the AICPU owner itself is never relaunched.
+      // One AIV poll task is intentionally finite. A slow resource Open or
+      // its checked same-session cleanup gets another task on the same
+      // control stream until READY or a proved terminal owner state; the
+      // AICPU owner itself is never relaunched.
       const AicpuEpochOwnerAivResult empty_retry_result{};
       copy_result = aclrtMemcpy(
           impl_->owner_aiv_result, sizeof(empty_retry_result),

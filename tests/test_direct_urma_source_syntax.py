@@ -348,9 +348,61 @@ class DirectUrmaSourceSyntaxTests(unittest.TestCase):
             "KVAF_URMA_EPOCH_OWNER_STATE_OPENING", open_body
         )
         self.assertIn(
+            "KVAF_URMA_EPOCH_OWNER_STATE_CLOSING", open_body
+        )
+        self.assertIn(
+            "KVAF_URMA_EPOCH_OWNER_STATE_CLOSE_RETRYING", open_body
+        )
+        self.assertIn("ready_result_identity_valid", open_body)
+        self.assertIn("ready_owner_identity_valid", open_body)
+        self.assertIn("ready_cleanup_result_valid", open_body)
+        self.assertIn("ready_cleanup_status_fields_valid", open_body)
+        self.assertIn("ready_cleanup_state_is_monotonic", open_body)
+        self.assertIn("ready_observation_can_progress", open_body)
+        self.assertIn(
             "::usleep(kEpochOwnerReadyRetryMicroseconds)", open_body
         )
         self.assertNotIn("ready_deadline", open_body)
+
+    def test_aiv_ready_wait_does_not_make_cleanup_progress_terminal(
+        self,
+    ) -> None:
+        terminal_start = self.aiv_kernel_source.index(
+            "__aicore__ inline bool EpochOwnerStateIsTerminal"
+        )
+        terminal_end = self.aiv_kernel_source.index(
+            "KvafAivEpochOwnerWaitReadyKernel", terminal_start
+        )
+        terminal_body = self.aiv_kernel_source[terminal_start:terminal_end]
+        self.assertIn("KVAF_URMA_EPOCH_OWNER_STATE_CLOSED", terminal_body)
+        self.assertIn(
+            "KVAF_URMA_EPOCH_OWNER_STATE_OPEN_FAILED_SAFE", terminal_body
+        )
+        return_expression = terminal_body.split("return", 1)[1]
+        self.assertNotIn(
+            "KVAF_URMA_EPOCH_OWNER_STATE_CLOSING", return_expression
+        )
+        self.assertNotIn(
+            "KVAF_URMA_EPOCH_OWNER_STATE_CLOSE_RETRYING",
+            return_expression,
+        )
+
+        wait_start = self.aiv_kernel_source.index(
+            "KvafAivEpochOwnerWaitReadyKernel"
+        )
+        wait_end = self.aiv_kernel_source.index(
+            "KvafAivEpochOwnerShutdownKernel", wait_start
+        )
+        wait_body = self.aiv_kernel_source[wait_start:wait_end]
+        self.assertIn("last_observed_state", wait_body)
+        self.assertIn("last_observed_sequence", wait_body)
+        self.assertIn(
+            "state == KVAF_URMA_EPOCH_OWNER_STATE_CLOSING", wait_body
+        )
+        self.assertIn(
+            "state == KVAF_URMA_EPOCH_OWNER_STATE_CLOSE_RETRYING",
+            wait_body,
+        )
 
     def test_smoke_payload_is_bounded_before_resource_acquisition(self) -> None:
         self.assertIn(

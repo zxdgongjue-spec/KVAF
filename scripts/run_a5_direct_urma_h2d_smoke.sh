@@ -1840,6 +1840,14 @@ clear_active_session()
   active_session_written=0
 }
 
+dump_worker_failure_logs()
+{
+  echo "HOST_LOG=${host_log}" >&2
+  tail -n 320 "${host_log}" >&2 || true
+  echo "DEVICE_LOG=${device_log}" >&2
+  tail -n 320 "${device_log}" >&2 || true
+}
+
 record_quarantine()
 {
   local reason=$1
@@ -2248,6 +2256,11 @@ while process_is_running "${host_pid}" "${host_expected_start_ticks}" ||
 do
   if any_valid_fatal_marker || terminal_explicit_unsafe_proven; then
     record_quarantine "unsafe_provider_teardown"
+    # The first explicit unsafe edge used to exit with only the final reason,
+    # hiding the AIV/owner/provider fields that distinguish a real ownership
+    # failure from a state-observation bug.  Dump bounded immutable logs after
+    # quarantine is durable; this never signals a worker or touches hardware.
+    dump_worker_failure_logs
     run_completed=1
     trap - EXIT
     exit 4
