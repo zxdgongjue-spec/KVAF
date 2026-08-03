@@ -48,7 +48,8 @@ DirectUrmaOpenSpec MakeSpec(std::vector<std::uint8_t>* backing,
   spec.segment_payload_bytes = 4096;
   spec.control_timeout_seconds = 10;
   if (scenario == "ready_after_control_deadline" ||
-      scenario == "opening_then_open_failed_safe") {
+      scenario == "opening_then_open_failed_safe" ||
+      scenario == "opening_jfr_failed_safe") {
     spec.control_timeout_seconds = 1;
   }
   if (spec.role == DirectUrmaRole::kServer) {
@@ -162,6 +163,7 @@ int main(int argc, char** argv) {
   if (scenario == "clock_failed_before_open" ||
       scenario == "lease_expired_after_open" ||
       scenario == "opening_then_open_failed_safe" ||
+      scenario == "opening_jfr_failed_safe" ||
       scenario == "closing_retry_then_open_failed_safe") {
     const int expected_close_launches =
         scenario == "lease_expired_after_open"
@@ -191,6 +193,44 @@ int main(int argc, char** argv) {
          open.message().find("management_diagnostic_flags=7") ==
              std::string::npos)) {
       return Fail("late failed Open lost exact diagnostics");
+    }
+    if (scenario == "opening_jfr_failed_safe") {
+      constexpr std::uint64_t kJfcHandle = 0x12345678abcdef01ULL;
+      constexpr std::uint32_t kJfcId = 0x89abcdefU;
+      constexpr std::uint32_t kFlags =
+          KVAF_URMA_JFR_DIAGNOSTIC_RQ_ADDRESS_VALID |
+          KVAF_URMA_JFR_DIAGNOSTIC_JFC_REGISTRY_IDENTITY_MATCH |
+          KVAF_URMA_JFR_DIAGNOSTIC_HUGEPAGE;
+      if (open.message().find("management_stage=create_jfr") ==
+              std::string::npos ||
+          open.message().find("management_raw_errno=22") ==
+              std::string::npos ||
+          open.message().find("management_completion_status=12") ==
+              std::string::npos ||
+          open.message().find("jfr_command_diagnostic=valid") ==
+              std::string::npos ||
+          open.message().find("jfr_command_version=1") ==
+              std::string::npos ||
+          open.message().find("jfr_context_page_shift=12") ==
+              std::string::npos ||
+          open.message().find(
+              "jfr_command_flags=" + std::to_string(kFlags)) ==
+              std::string::npos ||
+          open.message().find("jfr_context_fd_errno=9") ==
+              std::string::npos ||
+          open.message().find(
+              "jfr_jfc_id=" + std::to_string(kJfcId)) ==
+              std::string::npos ||
+          open.message().find(
+              "jfr_jfc_handle=" + std::to_string(kJfcHandle)) ==
+              std::string::npos ||
+          open.message().find("jfr_jfc_registry_identity_match=1") ==
+              std::string::npos ||
+          open.message().find("jfr_non_pin=0") == std::string::npos ||
+          open.message().find("jfr_dtu=0") == std::string::npos ||
+          open.message().find("jfr_hugepage=1") == std::string::npos) {
+        return Fail("CREATE_JFR compact diagnostic did not round-trip");
+      }
     }
     if (scenario == "closing_retry_then_open_failed_safe" &&
         (open.message().find("provider_result_status=7") ==

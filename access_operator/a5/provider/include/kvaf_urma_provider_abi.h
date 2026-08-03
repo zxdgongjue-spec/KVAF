@@ -309,6 +309,48 @@ enum kvaf_urma_provider_status {
 #define KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_STATUS 7U
 #define KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_FLAGS 8U
 
+/*
+ * CREATE_JFR-only command snapshot. reserved[9] preserves the complete opaque
+ * 64-bit JFC handle. reserved[10] packs jfc_id plus version, context page
+ * shift, validation flags and the bounded F_GETFD errno. The outer management
+ * diagnostic magic/stage is the publication marker. This snapshot is
+ * observation-only: no allocator, pinning, queue or command bit is changed.
+ */
+#define KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_VERSION 1U
+#define KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_RESERVED_HANDLE 9U
+#define KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_RESERVED_LAYOUT 10U
+#define KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_VERSION_SHIFT 0U
+#define KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_VERSION_MASK 0x3U
+#define KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_PAGE_SHIFT_SHIFT 2U
+#define KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_PAGE_SHIFT_MASK 0x1fU
+#define KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_FLAGS_SHIFT 7U
+#define KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_FLAGS_MASK 0xfffffU
+#define KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_FD_ERRNO_SHIFT 27U
+#define KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_FD_ERRNO_MASK 0x1fU
+
+enum kvaf_urma_jfr_command_diagnostic_flag {
+  KVAF_URMA_JFR_DIAGNOSTIC_RQ_ADDRESS_VALID = 1U << 0,
+  KVAF_URMA_JFR_DIAGNOSTIC_RQ_HW_PAGE_ALIGNED = 1U << 1,
+  KVAF_URMA_JFR_DIAGNOSTIC_RQ_RANGE_VALID = 1U << 2,
+  KVAF_URMA_JFR_DIAGNOSTIC_INDEX_ADDRESS_VALID = 1U << 3,
+  KVAF_URMA_JFR_DIAGNOSTIC_INDEX_HW_PAGE_ALIGNED = 1U << 4,
+  KVAF_URMA_JFR_DIAGNOSTIC_INDEX_RANGE_VALID = 1U << 5,
+  KVAF_URMA_JFR_DIAGNOSTIC_RECORD_DB_VALID = 1U << 6,
+  KVAF_URMA_JFR_DIAGNOSTIC_SLEEP_DB_VALID = 1U << 7,
+  KVAF_URMA_JFR_DIAGNOSTIC_JFC_HANDLE_VALID = 1U << 8,
+  KVAF_URMA_JFR_DIAGNOSTIC_INPUT_SIZE_MATCH = 1U << 9,
+  KVAF_URMA_JFR_DIAGNOSTIC_OUTPUT_SIZE_MATCH = 1U << 10,
+  KVAF_URMA_JFR_DIAGNOSTIC_INPUT_ADDRESS_MATCH = 1U << 11,
+  KVAF_URMA_JFR_DIAGNOSTIC_OUTPUT_ADDRESS_MATCH = 1U << 12,
+  KVAF_URMA_JFR_DIAGNOSTIC_CONTEXT_FD_VALID = 1U << 13,
+  KVAF_URMA_JFR_DIAGNOSTIC_JFC_CONTEXT_MATCH = 1U << 14,
+  KVAF_URMA_JFR_DIAGNOSTIC_JFC_FD_MATCH = 1U << 15,
+  KVAF_URMA_JFR_DIAGNOSTIC_JFC_REGISTRY_IDENTITY_MATCH = 1U << 16,
+  KVAF_URMA_JFR_DIAGNOSTIC_NON_PIN = 1U << 17,
+  KVAF_URMA_JFR_DIAGNOSTIC_DTU = 1U << 18,
+  KVAF_URMA_JFR_DIAGNOSTIC_HUGEPAGE = 1U << 19,
+};
+
 enum kvaf_urma_management_diagnostic_flag {
   KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RAW_ERRNO_VALID = 1U << 0,
   KVAF_URMA_MANAGEMENT_DIAGNOSTIC_EFFECTIVE_ERRNO_VALID = 1U << 1,
@@ -457,7 +499,8 @@ struct kvaf_urma_provider_result_v2 {
   // reserved[4] equals KVAF_URMA_MANAGEMENT_DIAGNOSTIC_MAGIC. reserved[5]
   // packs version:stage, reserved[6] packs effective_errno:raw_errno,
   // reserved[7] packs completion_status:operation_status, and reserved[8]
-  // carries enum kvaf_urma_management_diagnostic_flag.
+  // carries enum kvaf_urma_management_diagnostic_flag. reserved[9..10]
+  // carry the failure-only CREATE_JFR command snapshot described above.
   uint64_t reserved[11];
 };
 

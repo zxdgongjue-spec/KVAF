@@ -42,6 +42,9 @@ class JfrFailureDiagnosticsTests(unittest.TestCase):
         cls.jfr = read_source(
             "access_operator/a5/provider/source_matched_udma_jfr.c"
         )
+        cls.jfc = read_source(
+            "access_operator/a5/provider/source_matched_udma_jfc.c"
+        )
         cls.communication = read_source(
             "access_operator/a5/provider/source_matched_communication.c"
         )
@@ -58,7 +61,7 @@ class JfrFailureDiagnosticsTests(unittest.TestCase):
     def test_failure_abi_is_versioned_sized_and_queryable(self) -> None:
         self.assertRegex(
             self.header,
-            r"#define\s+KVAF_UDMA_JFR_FAILURE_ABI_VERSION\s+UINT32_C\(1\)",
+            r"#define\s+KVAF_UDMA_JFR_FAILURE_ABI_VERSION\s+UINT32_C\(2\)",
         )
 
         structure = braced_body(
@@ -84,6 +87,26 @@ class JfrFailureDiagnosticsTests(unittest.TestCase):
                 "device_max_depth",
                 "device_max_sge",
                 "context_jfr_sge",
+                "context_page_size",
+                "context_sva_sep_mode",
+                "command_size",
+                "response_size",
+                "udata_in_len",
+                "udata_out_len",
+                "udata_in_address",
+                "udata_out_address",
+                "command_flags",
+                "jfc_id",
+                "jfc_handle",
+                "rq_address",
+                "rq_length",
+                "index_address",
+                "index_length",
+                "record_db_address",
+                "sleep_db_address",
+                "context_fd_errno",
+                "jfc_registry_flags",
+                "jfc_created_handle",
             }.issubset(fields)
         )
 
@@ -241,6 +264,110 @@ class JfrFailureDiagnosticsTests(unittest.TestCase):
             "kvaf_udma_source_reset_jfr_failure()", 0, data_create_call
         )
         self.assertLess(data_reset_call, data_create_call)
+
+    def test_create_command_snapshot_is_observation_only(self) -> None:
+        command = braced_body(
+            self.jfr, "static int kvaf_create_direct_jfr_command("
+        )
+        snapshot = command.index("kvaf_snapshot_jfr_command(")
+        ioctl = command.index("urma_cmd_create_jfr(", snapshot)
+        self.assertLess(snapshot, ioctl)
+        between = command[snapshot:ioctl]
+        self.assertNotIn("return", between)
+        self.assertNotIn("EINVAL", between)
+        self.assertEqual(command.count("urma_cmd_create_jfr("), 1)
+        self.assertNotIn("kvaf_jfr_command_snapshot_is_valid", self.jfr)
+
+        create = braced_body(
+            self.jfr, "urma_jfr_t *kvaf_udma_create_jfr_checked("
+        )
+        self.assertIn("KVAF_UDMA_JFR_FAILURE_CREATE_COMMAND", create)
+        self.assertNotIn("KVAF_UDMA_JFR_FAILURE_VALIDATE_COMMAND", self.header)
+
+        snapshot_body = braced_body(
+            self.jfr, "static void kvaf_snapshot_jfr_command("
+        )
+        for diagnostic in (
+            "KVAF_UDMA_JFR_COMMAND_RQ_RANGE_VALID",
+            "KVAF_UDMA_JFR_COMMAND_INDEX_RANGE_VALID",
+            "KVAF_UDMA_JFR_COMMAND_INPUT_ADDRESS_MATCH",
+            "KVAF_UDMA_JFR_COMMAND_OUTPUT_ADDRESS_MATCH",
+            "KVAF_UDMA_JFR_COMMAND_JFC_REGISTRY_IDENTITY_MATCH",
+            "context_fd_errno",
+        ):
+            self.assertIn(diagnostic, snapshot_body)
+        self.assertIn("UDMA_HW_PAGE_SIZE", snapshot_body)
+        self.assertNotRegex(snapshot_body, r"buf_addr\s*%\s*page_size")
+
+    def test_jfc_registry_preserves_creation_time_identity(self) -> None:
+        state = braced_body(self.jfc, "struct kvaf_udma_jfc_state")
+        for field in (
+            "created_owner_context",
+            "created_handle",
+            "created_id",
+            "created_dev_fd",
+        ):
+            self.assertIn(field, state)
+        create = braced_body(
+            self.jfc, "urma_jfc_t *kvaf_udma_create_jfc_checked("
+        )
+        command = create.index("udma_u_jfc_cmd(")
+        for assignment in (
+            "state->created_owner_context = context",
+            "state->created_handle = jfc->base.handle",
+            "state->created_id = jfc->base.jfc_id.id",
+            "state->created_dev_fd = context->dev_fd",
+        ):
+            self.assertGreater(create.index(assignment), command)
+        snapshot = braced_body(
+            self.jfc, "int kvaf_udma_source_snapshot_jfc_identity("
+        )
+        for required in (
+            "KVAF_UDMA_JFC_IDENTITY_REGISTRY_FOUND",
+            "KVAF_UDMA_JFC_IDENTITY_KERNEL_CREATED",
+            "KVAF_UDMA_JFC_IDENTITY_NOT_ORPHAN",
+            "KVAF_UDMA_JFC_IDENTITY_HANDLE_MATCH",
+            "KVAF_UDMA_JFC_IDENTITY_ID_MATCH",
+            "KVAF_UDMA_JFC_IDENTITY_DEV_FD_MATCH",
+        ):
+            self.assertIn(required, snapshot)
+
+    def test_device_result_carries_compact_jfr_snapshot(self) -> None:
+        abi = read_source(
+            "access_operator/a5/provider/include/kvaf_urma_provider_abi.h"
+        )
+        direct = read_source(
+            "access_operator/a5/src/direct_urma_resources.cpp"
+        )
+        attach = braced_body(
+            self.provider,
+            "static void kvaf_attach_jfr_command_diagnostic(",
+        )
+        for required in (
+            "KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_RESERVED_HANDLE",
+            "KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_RESERVED_LAYOUT",
+        ):
+            self.assertIn(required, abi)
+            self.assertIn(required, attach)
+            self.assertIn(required, direct)
+        self.assertIn(
+            "kvaf_attach_jfr_command_diagnostic(result, diagnostic.stage)",
+            braced_body(
+                self.provider,
+                "static void kvaf_attach_management_diagnostic(",
+            ),
+        )
+        self.assertIn("jfr_command_diagnostic=valid", direct)
+        self.assertIn("std::uint64_t jfc_handle", direct)
+        self.assertNotIn("failure.jfc_handle == 0U", attach)
+        self.assertNotIn("diagnostic.jfc_handle == 0U", direct)
+        fake = read_source("tests/fake_acl/fake_ascendcl.cpp")
+        harness = read_source(
+            "tests/fake_acl/direct_urma_resources_harness.cpp"
+        )
+        self.assertIn("0x12345678abcdef01ULL", fake)
+        self.assertIn("opening_jfr_failed_safe", harness)
+        self.assertIn("CREATE_JFR compact diagnostic did not round-trip", harness)
 
     def test_unknown_cleanup_never_reenters_orphan_registries(self) -> None:
         aggregate = braced_body(

@@ -1,5 +1,6 @@
 #include "kvaf_source_matched_udma.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -21,6 +22,10 @@
 struct kvaf_udma_jfc_state {
     struct udma_u_jfc *jfc;
     urma_context_t *owner_context;
+    urma_context_t *created_owner_context;
+    uint64_t created_handle;
+    uint32_t created_id;
+    int created_dev_fd;
     bool kernel_created;
     bool kernel_delete_pending;
     uint32_t delete_comp_events_reported;
@@ -172,6 +177,84 @@ static struct kvaf_udma_jfc_state *kvaf_find_jfc_locked(
         }
     }
     return NULL;
+}
+
+int kvaf_udma_source_snapshot_jfc_identity(
+    const urma_context_t *expected_context, const urma_jfc_t *public_jfc,
+    struct kvaf_udma_jfc_identity *identity)
+{
+    struct kvaf_udma_jfc_state *state;
+    int lock_status;
+    struct kvaf_udma_jfc_identity snapshot = {
+        .abi_version = KVAF_UDMA_JFC_IDENTITY_ABI_VERSION,
+        .structure_size = sizeof(snapshot),
+        .created_dev_fd = -1,
+        .current_dev_fd = -1,
+    };
+
+    if (expected_context == NULL || public_jfc == NULL || identity == NULL ||
+        identity->structure_size < sizeof(*identity)) {
+        errno = EINVAL;
+        return -1;
+    }
+    lock_status = pthread_mutex_trylock(&g_kvaf_jfc_lock);
+    if (lock_status != 0) {
+        errno = lock_status;
+        return -1;
+    }
+    state = kvaf_find_jfc_locked(
+        to_udma_u_jfc((urma_jfc_t *)public_jfc));
+    if (state != NULL) {
+        snapshot.flags |= KVAF_UDMA_JFC_IDENTITY_REGISTRY_FOUND;
+        snapshot.current_handle = public_jfc->handle;
+        snapshot.current_id = public_jfc->jfc_id.id;
+        if (public_jfc->urma_ctx != NULL) {
+            snapshot.current_dev_fd = public_jfc->urma_ctx->dev_fd;
+        }
+        snapshot.created_handle = state->created_handle;
+        snapshot.created_id = state->created_id;
+        snapshot.created_dev_fd = state->created_dev_fd;
+        if (state->kernel_created) {
+            snapshot.flags |= KVAF_UDMA_JFC_IDENTITY_KERNEL_CREATED;
+        }
+        if (!state->kernel_delete_pending) {
+            snapshot.flags |= KVAF_UDMA_JFC_IDENTITY_DELETE_IDLE;
+        }
+        if (!state->orphan) {
+            snapshot.flags |= KVAF_UDMA_JFC_IDENTITY_NOT_ORPHAN;
+        }
+        if (state->owner_context == expected_context) {
+            snapshot.flags |=
+                KVAF_UDMA_JFC_IDENTITY_OWNER_CONTEXT_MATCH;
+        }
+        if (public_jfc->urma_ctx == expected_context) {
+            snapshot.flags |=
+                KVAF_UDMA_JFC_IDENTITY_PUBLIC_CONTEXT_MATCH;
+        }
+        if (state->created_owner_context == expected_context) {
+            snapshot.flags |=
+                KVAF_UDMA_JFC_IDENTITY_CREATED_CONTEXT_MATCH;
+        }
+        if (state->created_handle != 0U &&
+            state->created_handle == public_jfc->handle) {
+            snapshot.flags |= KVAF_UDMA_JFC_IDENTITY_HANDLE_MATCH;
+        }
+        if (state->created_id == public_jfc->jfc_id.id) {
+            snapshot.flags |= KVAF_UDMA_JFC_IDENTITY_ID_MATCH;
+        }
+        if (state->created_dev_fd >= 0 &&
+            state->created_dev_fd == expected_context->dev_fd &&
+            state->created_dev_fd == snapshot.current_dev_fd) {
+            snapshot.flags |= KVAF_UDMA_JFC_IDENTITY_DEV_FD_MATCH;
+        }
+    }
+    lock_status = pthread_mutex_unlock(&g_kvaf_jfc_lock);
+    if (lock_status != 0) {
+        errno = lock_status;
+        return -1;
+    }
+    *identity = snapshot;
+    return 0;
 }
 
 static void kvaf_remove_jfc_locked(struct kvaf_udma_jfc_state *state)
@@ -396,6 +479,10 @@ urma_jfc_t *kvaf_udma_create_jfc_checked(
     if (status != 0) {
         goto fail;
     }
+    state->created_owner_context = context;
+    state->created_handle = jfc->base.handle;
+    state->created_id = jfc->base.jfc_id.id;
+    state->created_dev_fd = context->dev_fd;
     state->kernel_created = true;
     state->event_condition_initialized = true;
     state->event_mutex_initialized = true;

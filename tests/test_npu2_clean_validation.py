@@ -14,6 +14,7 @@ WRAPPER = ROOT / "scripts" / "run_a5_direct_urma_npu2_clean_validation.sh"
 COORDINATOR = (
     ROOT / "scripts" / "prepare_and_run_a5_direct_urma_npu2_clean.sh"
 )
+TRACE = ROOT / "scripts" / "trace_a5_direct_urma_npu2_jfr_failure.sh"
 
 
 class Npu2CleanValidationTests(unittest.TestCase):
@@ -21,7 +22,7 @@ class Npu2CleanValidationTests(unittest.TestCase):
         bash = shutil.which("bash")
         if bash is None:
             self.skipTest("bash is unavailable")
-        for script in (WRAPPER, COORDINATOR):
+        for script in (WRAPPER, COORDINATOR, TRACE):
             result = subprocess.run(
                 [bash, "-n", str(script)],
                 check=False,
@@ -48,6 +49,8 @@ class Npu2CleanValidationTests(unittest.TestCase):
             "unset KVAF_DEVICE_URMA_DEVICE",
             "KVAF_NPU2_TRANSFER_COUNT:-4096",
             "KVAF_NPU2_BYTES_PER_TRANSFER:-1024",
+            "KVAF_NPU2_VALIDATION_LIMIT:-full",
+            "PASS_LIMITED_ZERO_WQE",
             "kvaf_run_stage zero-wqe 0 1024 1 1",
             "kvaf_run_stage one-kib 1 1024 1 1",
             "run_a5_direct_urma_epoch_owner_validation.sh",
@@ -86,6 +89,28 @@ class Npu2CleanValidationTests(unittest.TestCase):
         self.assertNotIn("rm -f /data/.kvaf-state", coordinator)
         self.assertNotIn("kill ", coordinator)
 
+        trace = TRACE.read_text(encoding="utf-8")
+        for required in (
+            "EXECUTION_ENV=SERVER_B_HOST",
+            "/proc/sys/kernel/random/boot_id",
+            "trace identity would be ambiguous",
+            "journalctl -k -n 0 --show-cursor",
+            'journalctl -k --after-cursor "${kvaf_journal_cursor}"',
+            "dmesg --time-format=iso",
+            "dmesg-ring-unscoped-fallback",
+            "KVAF_NPU2_H2D_TIMEOUT_SECONDS=20",
+            "KVAF_NPU2_RUN_TIMEOUT_SECONDS=90",
+            "KVAF_NPU2_VALIDATION_LIMIT=zero-wqe",
+            "prepare_and_run_a5_direct_urma_npu2_clean.sh",
+            "this boot-id/commit trace was already selected",
+            "kvaf_tee_rc=${kvaf_pipeline_status[1]}",
+            "console evidence write failed",
+            "KVAF_JFR_KERNEL_TAIL_BEGIN",
+        ):
+            self.assertIn(required, trace)
+        for forbidden in ("npu-smi set", "docker rm", "rm -f", "kill "):
+            self.assertNotIn(forbidden, trace)
+
     def run_preflight(self, **updates: str) -> subprocess.CompletedProcess[str]:
         bash = shutil.which("bash")
         if bash is None:
@@ -99,6 +124,7 @@ class Npu2CleanValidationTests(unittest.TestCase):
             "KVAF_CROSS_NPU_ZERO_WQE_RESULT_DIR",
             "KVAF_LOGICAL_DEVICE_ID",
             "KVAF_PHYSICAL_DEVICE_ID",
+            "KVAF_NPU2_VALIDATION_LIMIT",
         ):
             env.pop(variable, None)
         env.update(
@@ -159,6 +185,11 @@ class Npu2CleanValidationTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 2)
         self.assertIn("64 MiB registration limit", result.stderr)
+
+        result = self.run_preflight(KVAF_NPU2_VALIDATION_LIMIT="one-kib")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("must be full or zero-wqe", result.stderr)
+        self.assertNotIn("RESULT_DIR=", result.stdout)
 
 
 if __name__ == "__main__":

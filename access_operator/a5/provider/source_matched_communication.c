@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <malloc.h>
 #include <poll.h>
@@ -1061,7 +1062,23 @@ static int kvaf_ub_jfr_creation_error(
         "device_max_depth=%u device_max_sge=%u "
         "context_jfr_sge=%u context_dtu_enable=%u "
         "context_sq_reserved=%u context_table_shift=%u "
-        "context_table_entries=%u\n",
+        "context_table_entries=%u context_page_size=%u "
+        "context_sva_sep_mode=%u command_size=%u response_size=%u "
+        "udata_in_len=%u udata_out_len=%u "
+        "udata_in_address=0x%" PRIx64 " "
+        "udata_out_address=0x%" PRIx64 " command_flags=0x%x "
+        "jfc_id=%u jfc_handle=%" PRIu64 " context_dev_fd=%d "
+        "context_fd_flags=%d context_fd_errno=%d "
+        "jfc_context_dev_fd=%d jfc_registry_query_status=%d "
+        "jfc_registry_query_errno=%d jfc_registry_flags=0x%x "
+        "jfc_created_id=%u jfc_created_dev_fd=%d "
+        "jfc_created_handle=%" PRIu64 " "
+        "requested_trans_mode=%u requested_flags=0x%x "
+        "requested_min_rnr_timer=%u requested_token=%u requested_id=%u "
+        "rq_address=0x%" PRIx64 " rq_length=%" PRIu64 " "
+        "index_address=0x%" PRIx64 " index_length=%" PRIu64 " "
+        "record_db_address=0x%" PRIx64 " "
+        "sleep_db_address=0x%" PRIx64 "\n",
         stage, kvaf_jfr_failure_stage_name(failure.stage),
         failure.stage, query_status, failure.operation_status,
         failure.operation_errno, failure.rollback_status,
@@ -1069,7 +1086,24 @@ static int kvaf_ub_jfr_creation_error(
         failure.requested_max_sge, failure.device_max_depth,
         failure.device_max_sge, failure.context_jfr_sge,
         failure.context_dtu_enable, failure.context_sq_reserved,
-        failure.context_table_shift, failure.context_table_entries);
+        failure.context_table_shift, failure.context_table_entries,
+        failure.context_page_size, failure.context_sva_sep_mode,
+        failure.command_size, failure.response_size,
+        failure.udata_in_len, failure.udata_out_len,
+        failure.udata_in_address, failure.udata_out_address,
+        failure.command_flags, failure.jfc_id, failure.jfc_handle,
+        failure.context_dev_fd, failure.context_fd_flags,
+        failure.context_fd_errno, failure.jfc_context_dev_fd,
+        failure.jfc_registry_query_status,
+        failure.jfc_registry_query_errno,
+        failure.jfc_registry_flags, failure.jfc_created_id,
+        failure.jfc_created_dev_fd, failure.jfc_created_handle,
+        failure.requested_trans_mode,
+        failure.requested_flags, failure.requested_min_rnr_timer,
+        failure.requested_token, failure.requested_id,
+        failure.rq_address, failure.rq_length,
+        failure.index_address, failure.index_length,
+        failure.record_db_address, failure.sleep_db_address);
     (void)fflush(stderr);
     kvaf_ub_record_management_diagnostic(
         stage, wrapper_errno, effective_errno,

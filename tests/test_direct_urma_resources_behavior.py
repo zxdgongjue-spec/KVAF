@@ -119,6 +119,9 @@ class DirectUrmaResourcesBehaviorTests(unittest.TestCase):
     def test_opening_converges_to_safe_failed_open_after_deadline(self) -> None:
         self.run_scenario("opening_then_open_failed_safe")
 
+    def test_create_jfr_compact_diagnostic_round_trips(self) -> None:
+        self.run_scenario("opening_jfr_failed_safe")
+
     def test_failed_open_cleanup_progress_is_not_terminal(self) -> None:
         self.run_scenario("closing_retry_then_open_failed_safe")
 

@@ -182,6 +182,98 @@ static uint64_t kvaf_pack_signed_pair(int32_t low, int32_t high)
         ((uint64_t)(uint32_t)high << 32U);
 }
 
+static bool kvaf_power_of_two_shift(uint32_t value, uint32_t *shift_out)
+{
+    uint32_t shift = 0U;
+
+    if (shift_out == NULL || value == 0U ||
+        (value & (value - 1U)) != 0U) {
+        return false;
+    }
+    while (value > 1U) {
+        value >>= 1U;
+        ++shift;
+    }
+    *shift_out = shift;
+    return true;
+}
+
+static void kvaf_attach_jfr_command_diagnostic(
+    struct kvaf_urma_provider_result_v2 *result,
+    uint32_t management_stage)
+{
+    struct kvaf_udma_jfr_failure failure = {
+        .structure_size = sizeof(failure),
+    };
+    uint64_t layout;
+    uint32_t page_shift;
+    uint32_t fd_errno;
+
+#define KVAF_ASSERT_JFR_DIAGNOSTIC_FLAG(name) \
+    _Static_assert( \
+        (unsigned int)KVAF_UDMA_JFR_COMMAND_##name == \
+            (unsigned int)KVAF_URMA_JFR_DIAGNOSTIC_##name, \
+        "JFR command diagnostic flag ABI mismatch: " #name)
+    KVAF_ASSERT_JFR_DIAGNOSTIC_FLAG(RQ_ADDRESS_VALID);
+    KVAF_ASSERT_JFR_DIAGNOSTIC_FLAG(RQ_HW_PAGE_ALIGNED);
+    KVAF_ASSERT_JFR_DIAGNOSTIC_FLAG(RQ_RANGE_VALID);
+    KVAF_ASSERT_JFR_DIAGNOSTIC_FLAG(INDEX_ADDRESS_VALID);
+    KVAF_ASSERT_JFR_DIAGNOSTIC_FLAG(INDEX_HW_PAGE_ALIGNED);
+    KVAF_ASSERT_JFR_DIAGNOSTIC_FLAG(INDEX_RANGE_VALID);
+    KVAF_ASSERT_JFR_DIAGNOSTIC_FLAG(RECORD_DB_VALID);
+    KVAF_ASSERT_JFR_DIAGNOSTIC_FLAG(SLEEP_DB_VALID);
+    KVAF_ASSERT_JFR_DIAGNOSTIC_FLAG(JFC_HANDLE_VALID);
+    KVAF_ASSERT_JFR_DIAGNOSTIC_FLAG(INPUT_SIZE_MATCH);
+    KVAF_ASSERT_JFR_DIAGNOSTIC_FLAG(OUTPUT_SIZE_MATCH);
+    KVAF_ASSERT_JFR_DIAGNOSTIC_FLAG(INPUT_ADDRESS_MATCH);
+    KVAF_ASSERT_JFR_DIAGNOSTIC_FLAG(OUTPUT_ADDRESS_MATCH);
+    KVAF_ASSERT_JFR_DIAGNOSTIC_FLAG(CONTEXT_FD_VALID);
+    KVAF_ASSERT_JFR_DIAGNOSTIC_FLAG(JFC_CONTEXT_MATCH);
+    KVAF_ASSERT_JFR_DIAGNOSTIC_FLAG(JFC_FD_MATCH);
+    KVAF_ASSERT_JFR_DIAGNOSTIC_FLAG(JFC_REGISTRY_IDENTITY_MATCH);
+    KVAF_ASSERT_JFR_DIAGNOSTIC_FLAG(NON_PIN);
+    KVAF_ASSERT_JFR_DIAGNOSTIC_FLAG(DTU);
+    KVAF_ASSERT_JFR_DIAGNOSTIC_FLAG(HUGEPAGE);
+#undef KVAF_ASSERT_JFR_DIAGNOSTIC_FLAG
+    _Static_assert(
+        KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_VERSION <=
+            KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_VERSION_MASK,
+        "JFR command diagnostic version exceeds packed field");
+    if (management_stage != KVAF_URMA_MANAGEMENT_STAGE_CREATE_JFR ||
+        kvaf_udma_source_get_jfr_failure(&failure) != 0 ||
+        failure.abi_version != KVAF_UDMA_JFR_FAILURE_ABI_VERSION ||
+        failure.structure_size != sizeof(failure) ||
+        failure.stage != KVAF_UDMA_JFR_FAILURE_CREATE_COMMAND ||
+        failure.command_size == 0U) {
+        return;
+    }
+    if (!kvaf_power_of_two_shift(
+            failure.context_page_size, &page_shift) ||
+        page_shift > KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_PAGE_SHIFT_MASK) {
+        return;
+    }
+    fd_errno = failure.context_fd_errno < 0
+        ? KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_FD_ERRNO_MASK
+        : (uint32_t)failure.context_fd_errno;
+    if (fd_errno > KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_FD_ERRNO_MASK) {
+        fd_errno = KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_FD_ERRNO_MASK;
+    }
+    layout = ((uint64_t)failure.jfc_id << 32U) |
+        ((uint64_t)KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_VERSION <<
+            KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_VERSION_SHIFT) |
+        ((uint64_t)page_shift <<
+            KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_PAGE_SHIFT_SHIFT) |
+        ((uint64_t)(failure.command_flags &
+            KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_FLAGS_MASK) <<
+            KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_FLAGS_SHIFT) |
+        ((uint64_t)fd_errno <<
+            KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_FD_ERRNO_SHIFT);
+    result->reserved[KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_RESERVED_LAYOUT] =
+        layout;
+    result->reserved[KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_RESERVED_HANDLE] =
+        failure.jfc_handle;
+}
+
 static void kvaf_attach_management_diagnostic(
     struct kvaf_urma_provider_result_v2 *result)
 {
@@ -209,6 +301,7 @@ static void kvaf_attach_management_diagnostic(
             diagnostic.completion_status);
     result->reserved[KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_FLAGS] =
         diagnostic.flags;
+    kvaf_attach_jfr_command_diagnostic(result, diagnostic.stage);
     /* Publish the validity marker last so a progress reader cannot accept a
      * partially populated diagnostic payload. */
     result->reserved[KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_MAGIC] =

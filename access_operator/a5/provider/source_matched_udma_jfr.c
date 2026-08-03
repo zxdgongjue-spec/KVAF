@@ -1,6 +1,7 @@
 #include "kvaf_source_matched_udma.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -74,6 +75,10 @@ static void kvaf_clear_jfr_failure(void)
     g_kvaf_jfr_failure = (struct kvaf_udma_jfr_failure) {
         .abi_version = KVAF_UDMA_JFR_FAILURE_ABI_VERSION,
         .structure_size = sizeof(g_kvaf_jfr_failure),
+        .context_dev_fd = -1,
+        .context_fd_flags = -1,
+        .jfc_context_dev_fd = -1,
+        .jfc_created_dev_fd = -1,
     };
 }
 
@@ -118,6 +123,166 @@ static void kvaf_record_jfr_failure(
         ? 0U : udma_context->jettys_in_tbl_shift;
     g_kvaf_jfr_failure.context_table_entries = udma_context == NULL
         ? 0U : udma_context->jettys_in_tbl;
+    g_kvaf_jfr_failure.context_page_size = udma_context == NULL
+        ? 0U : udma_context->page_size;
+    g_kvaf_jfr_failure.context_sva_sep_mode = udma_context == NULL
+        ? 0U : (uint32_t)udma_context->sva_sep_mode_en;
+}
+
+static void kvaf_snapshot_jfr_command(
+    urma_context_t *context, const struct udma_u_jfr *jfr,
+    const urma_jfr_cfg_t *config,
+    const struct udma_create_jetty_ucmd *command,
+    const struct udma_create_jfr_resp *response,
+    const urma_cmd_udrv_priv_t *udata)
+{
+    const struct udma_u_context *udma_context = context == NULL
+        ? NULL : to_udma_u_ctx(context);
+    struct kvaf_udma_jfc_identity jfc_identity = {
+        .structure_size = sizeof(jfc_identity),
+    };
+    const uint32_t required_identity_flags =
+        KVAF_UDMA_JFC_IDENTITY_REGISTRY_FOUND |
+        KVAF_UDMA_JFC_IDENTITY_KERNEL_CREATED |
+        KVAF_UDMA_JFC_IDENTITY_DELETE_IDLE |
+        KVAF_UDMA_JFC_IDENTITY_NOT_ORPHAN |
+        KVAF_UDMA_JFC_IDENTITY_OWNER_CONTEXT_MATCH |
+        KVAF_UDMA_JFC_IDENTITY_PUBLIC_CONTEXT_MATCH |
+        KVAF_UDMA_JFC_IDENTITY_CREATED_CONTEXT_MATCH |
+        KVAF_UDMA_JFC_IDENTITY_HANDLE_MATCH |
+        KVAF_UDMA_JFC_IDENTITY_ID_MATCH |
+        KVAF_UDMA_JFC_IDENTITY_DEV_FD_MATCH;
+    uint32_t flags = 0U;
+    uint32_t page_size;
+    int query_status;
+    int query_errno;
+    int fd_errno;
+
+    if (udma_context == NULL || jfr == NULL || config == NULL ||
+        config->jfc == NULL || command == NULL || response == NULL ||
+        udata == NULL) {
+        return;
+    }
+    page_size = udma_context->page_size;
+    if (command->buf_addr != 0U && command->buf_len != 0U) {
+        flags |= KVAF_UDMA_JFR_COMMAND_RQ_ADDRESS_VALID;
+        if (command->buf_addr % UDMA_HW_PAGE_SIZE == 0U) {
+            flags |= KVAF_UDMA_JFR_COMMAND_RQ_HW_PAGE_ALIGNED;
+        }
+        if (command->buf_addr <= UINT64_MAX - command->buf_len) {
+            flags |= KVAF_UDMA_JFR_COMMAND_RQ_RANGE_VALID;
+        }
+    }
+    if (command->idx_addr != 0U && command->idx_len != 0U) {
+        flags |= KVAF_UDMA_JFR_COMMAND_INDEX_ADDRESS_VALID;
+        if (command->idx_addr % UDMA_HW_PAGE_SIZE == 0U) {
+            flags |= KVAF_UDMA_JFR_COMMAND_INDEX_HW_PAGE_ALIGNED;
+        }
+        if (command->idx_addr <= UINT64_MAX - command->idx_len) {
+            flags |= KVAF_UDMA_JFR_COMMAND_INDEX_RANGE_VALID;
+        }
+    }
+    if (command->db_addr != 0U) {
+        flags |= KVAF_UDMA_JFR_COMMAND_RECORD_DB_VALID;
+    }
+    if (command->jfr_sleep_buf != 0U) {
+        flags |= KVAF_UDMA_JFR_COMMAND_SLEEP_DB_VALID;
+    }
+    if (config->jfc->handle != 0U) {
+        flags |= KVAF_UDMA_JFR_COMMAND_JFC_HANDLE_VALID;
+    }
+    if (udata->in_len == sizeof(*command)) {
+        flags |= KVAF_UDMA_JFR_COMMAND_INPUT_SIZE_MATCH;
+    }
+    if (udata->out_len == sizeof(*response)) {
+        flags |= KVAF_UDMA_JFR_COMMAND_OUTPUT_SIZE_MATCH;
+    }
+    if (udata->in_addr != 0U &&
+        udata->in_addr == (uint64_t)(uintptr_t)command) {
+        flags |= KVAF_UDMA_JFR_COMMAND_INPUT_ADDRESS_MATCH;
+    }
+    if (udata->out_addr != 0U &&
+        udata->out_addr == (uint64_t)(uintptr_t)response) {
+        flags |= KVAF_UDMA_JFR_COMMAND_OUTPUT_ADDRESS_MATCH;
+    }
+    if (udma_context->sva_sep_mode_en) {
+        flags |= KVAF_UDMA_JFR_COMMAND_CONTEXT_SVA_SEPARATE;
+    }
+    if (command->non_pin) {
+        flags |= KVAF_UDMA_JFR_COMMAND_NON_PIN;
+    }
+    if (command->dtu_en) {
+        flags |= KVAF_UDMA_JFR_COMMAND_DTU;
+    }
+    if (command->is_hugepage) {
+        flags |= KVAF_UDMA_JFR_COMMAND_HUGEPAGE;
+    }
+    g_kvaf_jfr_failure.context_dev_fd = context->dev_fd;
+    errno = 0;
+    g_kvaf_jfr_failure.context_fd_flags =
+        fcntl(context->dev_fd, F_GETFD);
+    fd_errno = errno;
+    if (g_kvaf_jfr_failure.context_fd_flags >= 0) {
+        flags |= KVAF_UDMA_JFR_COMMAND_CONTEXT_FD_VALID;
+        fd_errno = 0;
+    }
+    g_kvaf_jfr_failure.context_fd_errno = fd_errno;
+    g_kvaf_jfr_failure.jfc_context_dev_fd =
+        config->jfc->urma_ctx == NULL
+            ? -1 : config->jfc->urma_ctx->dev_fd;
+    if (config->jfc->urma_ctx == context) {
+        flags |= KVAF_UDMA_JFR_COMMAND_JFC_CONTEXT_MATCH;
+    }
+    if (config->jfc->urma_ctx != NULL &&
+        config->jfc->urma_ctx->dev_fd == context->dev_fd) {
+        flags |= KVAF_UDMA_JFR_COMMAND_JFC_FD_MATCH;
+    }
+    errno = 0;
+    query_status = kvaf_udma_source_snapshot_jfc_identity(
+        context, config->jfc, &jfc_identity);
+    query_errno = errno;
+    g_kvaf_jfr_failure.jfc_registry_query_status = query_status;
+    g_kvaf_jfr_failure.jfc_registry_query_errno =
+        query_status == 0 ? 0 : query_errno;
+    if (query_status == 0) {
+        g_kvaf_jfr_failure.jfc_registry_flags = jfc_identity.flags;
+        g_kvaf_jfr_failure.jfc_created_id = jfc_identity.created_id;
+        g_kvaf_jfr_failure.jfc_created_dev_fd =
+            jfc_identity.created_dev_fd;
+        g_kvaf_jfr_failure.jfc_created_handle =
+            jfc_identity.created_handle;
+        if ((jfc_identity.flags & required_identity_flags) ==
+            required_identity_flags) {
+            flags |=
+                KVAF_UDMA_JFR_COMMAND_JFC_REGISTRY_IDENTITY_MATCH;
+        }
+    }
+
+    g_kvaf_jfr_failure.context_page_size = page_size;
+    g_kvaf_jfr_failure.context_sva_sep_mode =
+        (uint32_t)udma_context->sva_sep_mode_en;
+    g_kvaf_jfr_failure.command_size = sizeof(*command);
+    g_kvaf_jfr_failure.response_size = sizeof(*response);
+    g_kvaf_jfr_failure.udata_in_len = udata->in_len;
+    g_kvaf_jfr_failure.udata_out_len = udata->out_len;
+    g_kvaf_jfr_failure.udata_in_address = udata->in_addr;
+    g_kvaf_jfr_failure.udata_out_address = udata->out_addr;
+    g_kvaf_jfr_failure.command_flags = flags;
+    g_kvaf_jfr_failure.jfc_id = config->jfc->jfc_id.id;
+    g_kvaf_jfr_failure.requested_trans_mode =
+        (uint32_t)config->trans_mode;
+    g_kvaf_jfr_failure.requested_flags = config->flag.value;
+    g_kvaf_jfr_failure.requested_min_rnr_timer =
+        config->min_rnr_timer;
+    g_kvaf_jfr_failure.requested_token = config->token_value.token;
+    g_kvaf_jfr_failure.requested_id = config->id;
+    g_kvaf_jfr_failure.jfc_handle = config->jfc->handle;
+    g_kvaf_jfr_failure.rq_address = command->buf_addr;
+    g_kvaf_jfr_failure.rq_length = command->buf_len;
+    g_kvaf_jfr_failure.index_address = command->idx_addr;
+    g_kvaf_jfr_failure.index_length = command->idx_len;
+    g_kvaf_jfr_failure.record_db_address = command->db_addr;
+    g_kvaf_jfr_failure.sleep_db_address = command->jfr_sleep_buf;
 }
 
 static void kvaf_record_jfr_rollback(int status, int operation_errno)
@@ -551,6 +716,11 @@ static int kvaf_create_direct_jfr_command(
     command.is_hugepage = jfr->rq.hugepage != NULL;
     udma_u_set_udata(&udata, &command, (uint32_t)sizeof(command),
         &response, (uint32_t)sizeof(response));
+    kvaf_snapshot_jfr_command(
+        context, jfr, config, &command, &response, &udata);
+    /* The snapshot is observation-only.  Do not let fcntl/registry
+     * diagnostics alter the one official CREATE_JFR command. */
+    errno = 0;
     status = urma_cmd_create_jfr(
         context, &jfr->base, config, &udata);
     if (status != 0) {

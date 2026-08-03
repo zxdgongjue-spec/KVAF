@@ -130,6 +130,13 @@ KVAF_NPU2_BATCH_ITERATIONS=${KVAF_NPU2_BATCH_ITERATIONS:-1}
 KVAF_NPU2_H2D_TIMEOUT_SECONDS=${KVAF_NPU2_H2D_TIMEOUT_SECONDS:-60}
 KVAF_NPU2_RUN_TIMEOUT_SECONDS=${KVAF_NPU2_RUN_TIMEOUT_SECONDS:-180}
 KVAF_NPU2_SERVER_READY_TIMEOUT_SECONDS=${KVAF_NPU2_SERVER_READY_TIMEOUT_SECONDS:-30}
+KVAF_NPU2_VALIDATION_LIMIT=${KVAF_NPU2_VALIDATION_LIMIT:-full}
+
+if [[ "${KVAF_NPU2_VALIDATION_LIMIT}" != full &&
+      "${KVAF_NPU2_VALIDATION_LIMIT}" != zero-wqe ]]; then
+  echo "ERROR: KVAF_NPU2_VALIDATION_LIMIT must be full or zero-wqe" >&2
+  exit 2
+fi
 
 kvaf_require_positive_uint KVAF_NPU2_TRANSFER_COUNT \
   "${KVAF_NPU2_TRANSFER_COUNT}" 4096
@@ -214,6 +221,10 @@ kvaf_run_stage()
 # A successful final stage performs one Open/register/connect lifecycle for
 # the entire descriptor batch; it does not register/connect 4096 times.
 kvaf_run_stage zero-wqe 0 1024 1 1
+if [[ "${KVAF_NPU2_VALIDATION_LIMIT}" == zero-wqe ]]; then
+  echo "KVAF_NPU2_CLEAN_VALIDATION=PASS_LIMITED_ZERO_WQE"
+  exit 0
+fi
 kvaf_run_stage one-kib 1 1024 1 1
 kvaf_run_stage batch \
   "${KVAF_NPU2_TRANSFER_COUNT}" \

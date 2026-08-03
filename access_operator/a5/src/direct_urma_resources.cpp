@@ -155,6 +155,16 @@ struct ManagementDiagnosticView {
   std::int32_t completion_status{0};
 };
 
+struct JfrCommandDiagnosticView {
+  bool valid{false};
+  std::uint32_t jfc_id{0};
+  std::uint64_t jfc_handle{0};
+  std::uint32_t version{0};
+  std::uint32_t context_page_shift{0};
+  std::uint32_t flags{0};
+  std::uint32_t context_fd_errno{0};
+};
+
 std::int32_t SignedWord(std::uint64_t packed, unsigned int shift) {
   const std::uint32_t bits =
       static_cast<std::uint32_t>(packed >> shift);
@@ -195,6 +205,43 @@ ManagementDiagnosticView DecodeManagementDiagnostic(
   diagnostic.completion_status = SignedWord(status_word, 32);
   diagnostic.valid = true;
   return diagnostic;
+}
+
+JfrCommandDiagnosticView DecodeJfrCommandDiagnostic(
+    const kvaf_urma_provider_result_v2& result) {
+  JfrCommandDiagnosticView diagnostic;
+  const std::uint64_t layout = result.reserved[
+      KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_RESERVED_LAYOUT];
+  diagnostic.version = static_cast<std::uint32_t>(
+      (layout >> KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_VERSION_SHIFT) &
+      KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_VERSION_MASK);
+  if (diagnostic.version !=
+      KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_VERSION) {
+    return diagnostic;
+  }
+  diagnostic.jfc_handle = result.reserved[
+      KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_RESERVED_HANDLE];
+  diagnostic.jfc_id = static_cast<std::uint32_t>(layout >> 32U);
+  diagnostic.context_page_shift =
+      static_cast<std::uint32_t>(
+          (layout >>
+              KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_PAGE_SHIFT_SHIFT) &
+          KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_PAGE_SHIFT_MASK);
+  diagnostic.flags =
+      static_cast<std::uint32_t>(
+          (layout >> KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_FLAGS_SHIFT) &
+          KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_FLAGS_MASK);
+  diagnostic.context_fd_errno =
+      static_cast<std::uint32_t>(
+          (layout >> KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_FD_ERRNO_SHIFT) &
+          KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_FD_ERRNO_MASK);
+  diagnostic.valid = true;
+  return diagnostic;
+}
+
+bool JfrDiagnosticFlagsContain(std::uint32_t flags,
+                               std::uint32_t required) {
+  return (flags & required) == required;
 }
 
 const char* ManagementStageName(std::uint32_t stage) {
@@ -279,7 +326,7 @@ std::string FormatManagementDiagnostic(
   if (!diagnostic.valid) {
     return " management_diagnostic=unavailable";
   }
-  return " management_stage=" +
+  std::string formatted = " management_stage=" +
       std::string(ManagementStageName(diagnostic.stage)) +
       " management_stage_id=" + std::to_string(diagnostic.stage) +
       " management_raw_errno=" +
@@ -292,6 +339,57 @@ std::string FormatManagementDiagnostic(
       std::to_string(diagnostic.completion_status) +
       " management_diagnostic_flags=" +
       std::to_string(diagnostic.flags);
+  if (diagnostic.stage == KVAF_URMA_MANAGEMENT_STAGE_CREATE_JFR) {
+    const JfrCommandDiagnosticView jfr =
+        DecodeJfrCommandDiagnostic(result);
+    if (!jfr.valid) {
+      formatted += " jfr_command_diagnostic=unavailable";
+    } else {
+      formatted +=
+          " jfr_command_diagnostic=valid jfr_command_version=" +
+          std::to_string(jfr.version) +
+          " jfr_context_page_shift=" +
+          std::to_string(jfr.context_page_shift) +
+          " jfr_command_flags=" + std::to_string(jfr.flags) +
+          " jfr_context_fd_errno=" +
+          std::to_string(jfr.context_fd_errno) +
+          " jfr_jfc_id=" + std::to_string(jfr.jfc_id) +
+          " jfr_jfc_handle=" + std::to_string(jfr.jfc_handle) +
+          " jfr_rq_valid=" +
+          std::to_string(JfrDiagnosticFlagsContain(
+              jfr.flags,
+              KVAF_URMA_JFR_DIAGNOSTIC_RQ_ADDRESS_VALID |
+                  KVAF_URMA_JFR_DIAGNOSTIC_RQ_HW_PAGE_ALIGNED |
+                  KVAF_URMA_JFR_DIAGNOSTIC_RQ_RANGE_VALID)) +
+          " jfr_index_valid=" +
+          std::to_string(JfrDiagnosticFlagsContain(
+              jfr.flags,
+              KVAF_URMA_JFR_DIAGNOSTIC_INDEX_ADDRESS_VALID |
+                  KVAF_URMA_JFR_DIAGNOSTIC_INDEX_HW_PAGE_ALIGNED |
+                  KVAF_URMA_JFR_DIAGNOSTIC_INDEX_RANGE_VALID)) +
+          " jfr_udata_valid=" +
+          std::to_string(JfrDiagnosticFlagsContain(
+              jfr.flags,
+              KVAF_URMA_JFR_DIAGNOSTIC_INPUT_SIZE_MATCH |
+                  KVAF_URMA_JFR_DIAGNOSTIC_OUTPUT_SIZE_MATCH |
+                  KVAF_URMA_JFR_DIAGNOSTIC_INPUT_ADDRESS_MATCH |
+                  KVAF_URMA_JFR_DIAGNOSTIC_OUTPUT_ADDRESS_MATCH)) +
+          " jfr_jfc_registry_identity_match=" +
+          std::to_string(JfrDiagnosticFlagsContain(
+              jfr.flags,
+              KVAF_URMA_JFR_DIAGNOSTIC_JFC_REGISTRY_IDENTITY_MATCH)) +
+          " jfr_non_pin=" +
+          std::to_string(JfrDiagnosticFlagsContain(
+              jfr.flags, KVAF_URMA_JFR_DIAGNOSTIC_NON_PIN)) +
+          " jfr_dtu=" +
+          std::to_string(JfrDiagnosticFlagsContain(
+              jfr.flags, KVAF_URMA_JFR_DIAGNOSTIC_DTU)) +
+          " jfr_hugepage=" +
+          std::to_string(JfrDiagnosticFlagsContain(
+              jfr.flags, KVAF_URMA_JFR_DIAGNOSTIC_HUGEPAGE));
+    }
+  }
+  return formatted;
 }
 
 bool RangeContains(std::uint64_t base, std::uint64_t capacity,

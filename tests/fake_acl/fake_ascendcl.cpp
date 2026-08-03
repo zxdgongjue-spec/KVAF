@@ -390,9 +390,11 @@ extern "C" rtError_t rtAicpuKernelLaunchExWithArgs(
           KVAF_URMA_EPOCH_OWNER_STATE_OPEN_FAILED_SAFE;
       ++g_close_launches;
       g_last_close_session = args->config.session_id;
-    } else if (Scenario("opening_then_open_failed_safe")) {
+    } else if (Scenario("opening_then_open_failed_safe") ||
+               Scenario("opening_jfr_failed_safe")) {
       result->status = KVAF_URMA_PROVIDER_CONNECT_FAILED;
-      result->provider_status = -ETIMEDOUT;
+      const bool jfr_failure = Scenario("opening_jfr_failed_safe");
+      result->provider_status = jfr_failure ? -EINVAL : -ETIMEDOUT;
       result->flags = 0;
       result->reserved[
           KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_MAGIC] =
@@ -400,25 +402,59 @@ extern "C" rtError_t rtAicpuKernelLaunchExWithArgs(
       result->reserved[
           KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_STAGE] =
           static_cast<std::uint64_t>(
-              KVAF_URMA_MANAGEMENT_STAGE_CLIENT_GET_TP_LIST) |
+              jfr_failure
+                  ? KVAF_URMA_MANAGEMENT_STAGE_CREATE_JFR
+                  : KVAF_URMA_MANAGEMENT_STAGE_CLIENT_GET_TP_LIST) |
           (static_cast<std::uint64_t>(
                KVAF_URMA_MANAGEMENT_DIAGNOSTIC_VERSION)
            << 32U);
       result->reserved[
           KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_ERRNO] =
-          static_cast<std::uint64_t>(static_cast<std::uint32_t>(0)) |
+          static_cast<std::uint64_t>(static_cast<std::uint32_t>(
+              jfr_failure ? EINVAL : 0)) |
           (static_cast<std::uint64_t>(
-               static_cast<std::uint32_t>(EIO))
+               static_cast<std::uint32_t>(
+                   jfr_failure ? EINVAL : EIO))
            << 32U);
       result->reserved[
           KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_STATUS] =
           static_cast<std::uint64_t>(
-              static_cast<std::uint32_t>(-5));
+              static_cast<std::uint32_t>(jfr_failure ? -1 : -5)) |
+          (static_cast<std::uint64_t>(static_cast<std::uint32_t>(
+               jfr_failure ? 12 : 0)) << 32U);
       result->reserved[
           KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RESERVED_FLAGS] =
           KVAF_URMA_MANAGEMENT_DIAGNOSTIC_RAW_ERRNO_VALID |
           KVAF_URMA_MANAGEMENT_DIAGNOSTIC_EFFECTIVE_ERRNO_VALID |
-          KVAF_URMA_MANAGEMENT_DIAGNOSTIC_OPERATION_STATUS_VALID;
+          KVAF_URMA_MANAGEMENT_DIAGNOSTIC_OPERATION_STATUS_VALID |
+          (jfr_failure
+              ? KVAF_URMA_MANAGEMENT_DIAGNOSTIC_COMPLETION_STATUS_VALID
+              : 0U);
+      if (jfr_failure) {
+        constexpr std::uint64_t kJfcHandle = 0x12345678abcdef01ULL;
+        constexpr std::uint32_t kJfcId = 0x89abcdefU;
+        constexpr std::uint32_t kPageShift = 12U;
+        constexpr std::uint32_t kFdErrno = EBADF;
+        constexpr std::uint32_t kFlags =
+            KVAF_URMA_JFR_DIAGNOSTIC_RQ_ADDRESS_VALID |
+            KVAF_URMA_JFR_DIAGNOSTIC_JFC_REGISTRY_IDENTITY_MATCH |
+            KVAF_URMA_JFR_DIAGNOSTIC_HUGEPAGE;
+        result->reserved[
+            KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_RESERVED_HANDLE] =
+            kJfcHandle;
+        result->reserved[
+            KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_RESERVED_LAYOUT] =
+            (static_cast<std::uint64_t>(kJfcId) << 32U) |
+            (static_cast<std::uint64_t>(
+                 KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_VERSION)
+             << KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_VERSION_SHIFT) |
+            (static_cast<std::uint64_t>(kPageShift)
+             << KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_PAGE_SHIFT_SHIFT) |
+            (static_cast<std::uint64_t>(kFlags)
+             << KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_FLAGS_SHIFT) |
+            (static_cast<std::uint64_t>(kFdErrno)
+             << KVAF_URMA_JFR_COMMAND_DIAGNOSTIC_FD_ERRNO_SHIFT);
+      }
       owner_status->result_code = KVAF_URMA_EPOCH_OWNER_RESULT_OK;
       owner_status->flags = 0;
       owner_status->state = KVAF_URMA_EPOCH_OWNER_STATE_OPENING;
@@ -474,10 +510,12 @@ void LaunchAivEpochOwnerWaitReady(
   result.observed_sequence = status->sequence;
   if ((Scenario("ready_timeout_once") ||
        Scenario("ready_after_control_deadline") ||
-       Scenario("opening_then_open_failed_safe")) &&
+       Scenario("opening_then_open_failed_safe") ||
+       Scenario("opening_jfr_failed_safe")) &&
       g_ready_wait_launches == 1) {
     if (Scenario("ready_after_control_deadline") ||
-        Scenario("opening_then_open_failed_safe")) {
+        Scenario("opening_then_open_failed_safe") ||
+        Scenario("opening_jfr_failed_safe")) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1100));
     }
     result.status = static_cast<std::uint32_t>(
@@ -486,7 +524,8 @@ void LaunchAivEpochOwnerWaitReady(
     *aiv_result = result;
     return;
   }
-  if (Scenario("opening_then_open_failed_safe") &&
+  if ((Scenario("opening_then_open_failed_safe") ||
+       Scenario("opening_jfr_failed_safe")) &&
       g_ready_wait_launches == 2) {
     g_owner_status->result_code =
         KVAF_URMA_EPOCH_OWNER_RESULT_OPEN_FAILED;

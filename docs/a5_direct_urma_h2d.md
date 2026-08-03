@@ -1065,6 +1065,27 @@ AICPU stderr 未被完整转发，也能从 Device owner progress 恢复失败�
 `create_command`，应再结合同时段 UDMA driver 日志判断 RQ/index/DB pin 或 mailbox
 失败；不得仅凭原来的通用 `EIO` 修改地址或销毁策略。
 
+若 clean NPU2 的 Device 仍在 `create_jfr/create_command` 返回 `EINVAL`，不要切换
+`non_pin`、custom queue、DTU 或匿名 RQ/index。先在服务器 B 宿主机执行一次
+`scripts/trace_a5_direct_urma_npu2_jfr_failure.sh`。脚本以
+`boot-id + KVAF commit` 创建不可覆盖的一次性证据目录，执行一轮 zero-WQE，并用
+`journalctl` cursor（不可用时退化为只读 `dmesg`）保存同时段 `UDMA/uburma/ubcore/
+JFR/JFC` 内核日志。它拒绝已有 active/quarantine，不会向 KVAF worker 发信号、复位
+NPU 或删除已有状态；下层构建/打包会原子更新生成物，runner 只会清理本次且已证明
+安全终止的 active 状态。若只能使用无时间范围的 dmesg，metadata 会明确标记
+`dmesg-ring-unscoped-fallback`，不能把旧错误当成本轮证据。
+
+Device Open 结果的 `reserved[9..10]` 同时带回只读 JFR 命令摘要：完整 64 位 JFC
+handle、JFC ID、context page shift、`F_GETFD` errno，以及 UDATA 地址/大小、RQ/index
+范围、4 KiB UDMA queue 对齐、JFC 创建时 sidecar 身份和
+`non_pin/DTU/hugepage` 的检查位。完整地址、长度和创建时身份字段仅写入
+AICPU leaf 日志，不声称它们全部被压缩到 `reserved[9..10]`。该诊断不会阻止、
+增加或重试 ioctl；原始路径仍只发送一次 `CREATE_JFR`，避免诊断改变硬件语义。
+若内核日志是 `failed to find jfc`，结合 creation-time handle/id/fd
+identity 修 JFC 所有权；若是 `in_len/in_addr`，修加载模块与固定 UAPI 配对；若是 pin
+失败，再评估 Host-owned resource owner。该证据出现前不引入 HCCP，因为当前失败仍
+早于 Jetty/TP/import 阶段。
+
 数据面参数显式传入 `--share_jfr true`，不再依赖固定 perftest 在 capability check
 中把默认 `false` 隐式改写为 `true`。这保证后续 data Jetty 与 management Jetty
 使用一致的 A5 UB receive-queue 契约，但它不是 management `create_jfr` 失败的修复。
