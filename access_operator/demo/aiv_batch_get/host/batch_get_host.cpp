@@ -106,11 +106,19 @@ struct DirectJetty {
   hccp::QpCreateInfo info{};
 };
 
-struct LocalHbmRegistration {
+struct KvafBatchGetTransport;
+
+// A local buffer has stable heap storage because it is an opaque handle held
+// by the caller. Zero-reference entries stay cached until transport teardown.
+struct KvafBatchGetLocalBuffer {
+  KvafBatchGetTransport *transport = nullptr;
   void *token_handle = nullptr;
   DirectMemory memory{};
-  KvafBatchGetLocalHbmBinding host_binding{};
-  void *device_binding = nullptr;
+  uint64_t output_hbm_address = 0U;
+  uint64_t output_hbm_bytes = 0U;
+  uint32_t reference_count = 0U;
+  void *device_entities = nullptr;
+  uint64_t device_channel_entity = 0U;
 };
 
 // A USER_CTL SQ/CQ is strictly single-producer/single-consumer from the AIV
@@ -149,7 +157,7 @@ const char *JettyProfileName(DirectJettyProfile profile) {
   return "invalid";
 }
 
-struct KvafBatchGetDdrRegistration {
+struct KvafBatchGetTransport {
   DirectHccpApi api{};
   uint32_t physical_device_id = 0;
   void *host_context = nullptr;
@@ -161,18 +169,19 @@ struct KvafBatchGetDdrRegistration {
   uint32_t device_transport_token_value = 0U;
   DirectMemory host_memory{};
   void *device_host_memory_import = nullptr;
-  // Local HBM registrations are keyed by their original user-visible range.
-  // Heap ownership is stable while Direct-HCCP holds the returned handles.
-  std::vector<std::unique_ptr<LocalHbmRegistration>> local_hbm_registrations{};
+  // Local HBM registrations are keyed by the exact caller-visible (addr,
+  // bytes) pair. Heap ownership keeps opaque LocalBuffer handles stable.
+  std::vector<std::unique_ptr<KvafBatchGetLocalBuffer>> local_buffers{};
   // Direct-HCCP writes private ABI outputs directly into the worker records.
   // Keep the bounded records inline with the registration, rather than in a
   // separately allocated std::vector buffer.  The old vector's allocator
   // metadata was the first heap object destroyed after the HCCP release path
   // and was where glibc reported "invalid size" on A5 teardown.
   std::array<DirectAivWorker, kMaxDirectAivWorkers> workers{};
+  // Template entity records contain only transport fields. Acquire copies and
+  // completes them with the selected caller-owned HBM buffer fields.
+  std::array<KvafBatchGetDirectUrmaEntity, kMaxDirectAivWorkers> entity_templates{};
   uint32_t worker_count{0};
-  void *device_entities = nullptr;
-  uint64_t channel_entity = 0;
   bool host_ra_initialized = false;
   bool device_ra_initialized = false;
 };
@@ -538,7 +547,7 @@ void DeinitRaBestEffort(const DirectHccpApi &api, uint32_t physical_device_id, u
                physical_device_id, mode, ret);
 }
 
-bool BootstrapDirectHccp(KvafBatchGetDdrRegistration *state, uint32_t physical_device_id) {
+bool BootstrapDirectHccp(KvafBatchGetTransport *state, uint32_t physical_device_id) {
   if (state == nullptr) {
     return false;
   }
@@ -683,68 +692,92 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
   return true;
 }
 
-bool PrepareLocalHbmRegistration(KvafBatchGetDdrRegistration *state, void *output_device,
-                                 uint64_t output_device_bytes, uint64_t *device_binding) {
-  if (state == nullptr || output_device == nullptr || output_device_bytes == 0U || device_binding == nullptr ||
-      state->device_context == nullptr || state->device_transport_token_value == 0U) {
+void ReleaseLocalBufferResources(KvafBatchGetTransport *transport, KvafBatchGetLocalBuffer *local) {
+  if (transport == nullptr || local == nullptr) return;
+  if (local->device_entities != nullptr) {
+    (void)aclrtFree(local->device_entities);
+    local->device_entities = nullptr;
+    local->device_channel_entity = 0U;
+  }
+  if (local->memory.handle != nullptr && transport->api.lmem_unregister != nullptr &&
+      transport->device_context != nullptr) {
+    (void)transport->api.lmem_unregister(transport->device_context, local->memory.handle);
+    local->memory.handle = nullptr;
+  }
+  if (local->token_handle != nullptr && transport->api.token_free != nullptr && transport->device_context != nullptr) {
+    (void)transport->api.token_free(transport->device_context, local->token_handle);
+    local->token_handle = nullptr;
+  }
+}
+
+bool AcquireLocalBuffer(KvafBatchGetTransport *transport, void *output_hbm, uint64_t output_hbm_bytes,
+                        KvafBatchGetLocalBuffer **local_buffer, uint64_t *device_channel_entity) {
+  if (transport == nullptr || output_hbm == nullptr || output_hbm_bytes == 0U || local_buffer == nullptr ||
+      device_channel_entity == nullptr || transport->device_context == nullptr || transport->worker_count == 0U ||
+      transport->device_transport_token_value == 0U) {
     return false;
   }
-  for (const auto &existing : state->local_hbm_registrations) {
-    if (existing != nullptr && existing->host_binding.hbm_address == reinterpret_cast<uint64_t>(output_device) &&
-        existing->host_binding.hbm_size >= output_device_bytes) {
-      *device_binding = reinterpret_cast<uint64_t>(existing->device_binding);
+  const uint64_t output_address = reinterpret_cast<uint64_t>(output_hbm);
+  for (const auto &existing : transport->local_buffers) {
+    if (existing != nullptr && existing->output_hbm_address == output_address &&
+        existing->output_hbm_bytes == output_hbm_bytes) {
+      ++existing->reference_count;
+      *local_buffer = existing.get();
+      *device_channel_entity = existing->device_channel_entity;
       std::fprintf(stderr,
-                   "[KVAF_AIV] DIRECT_LOCAL_HBM_CACHE_HIT output_hbm=0x%llx bytes=%llu token_id=0x%x binding=0x%llx\n",
-                   static_cast<unsigned long long>(existing->host_binding.hbm_address),
-                   static_cast<unsigned long long>(output_device_bytes), existing->host_binding.local_token_id,
-                   static_cast<unsigned long long>(*device_binding));
+                   "[KVAF_AIV] DIRECT_LOCAL_BUFFER_ACQUIRE_CACHE_HIT output_hbm=0x%llx bytes=%llu token_id=0x%x "
+                   "refs=%u entity_table=0x%llx\n",
+                   static_cast<unsigned long long>(output_address), static_cast<unsigned long long>(output_hbm_bytes),
+                   existing->memory.token_id, existing->reference_count,
+                   static_cast<unsigned long long>(existing->device_channel_entity));
       return true;
     }
   }
 
-  auto candidate = std::make_unique<LocalHbmRegistration>();
+  auto candidate = std::make_unique<KvafBatchGetLocalBuffer>();
+  candidate->transport = transport;
+  candidate->output_hbm_address = output_address;
+  candidate->output_hbm_bytes = output_hbm_bytes;
   uint32_t token_id = 0U;
-  if (!AllocateToken(state->api, state->device_context, "device_local_hbm", &candidate->token_handle, &token_id) ||
-      !RegisterMemory(state->api, state->device_context, candidate->token_handle, token_id,
-                      state->device_transport_token_value, output_device, output_device_bytes, "device_hbm",
+  if (!AllocateToken(transport->api, transport->device_context, "device_local_hbm", &candidate->token_handle,
+                     &token_id) ||
+      !RegisterMemory(transport->api, transport->device_context, candidate->token_handle, token_id,
+                      transport->device_transport_token_value, output_hbm, output_hbm_bytes, "device_hbm",
                       &candidate->memory)) {
-    if (candidate->memory.handle != nullptr && state->api.lmem_unregister != nullptr) {
-      (void)state->api.lmem_unregister(state->device_context, candidate->memory.handle);
-    }
-    if (candidate->token_handle != nullptr && state->api.token_free != nullptr) {
-      (void)state->api.token_free(state->device_context, candidate->token_handle);
-    }
+    ReleaseLocalBufferResources(transport, candidate.get());
     return false;
   }
-  candidate->host_binding.hbm_address = reinterpret_cast<uint64_t>(output_device);
-  candidate->host_binding.hbm_size = output_device_bytes;
-  candidate->host_binding.local_token_id = candidate->memory.token_id;
-  candidate->host_binding.local_token_value = candidate->memory.token_value;
-  if (aclrtMalloc(&candidate->device_binding, sizeof(candidate->host_binding), ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
-      candidate->device_binding == nullptr ||
-      aclrtMemcpy(candidate->device_binding, sizeof(candidate->host_binding), &candidate->host_binding,
-                  sizeof(candidate->host_binding), ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
+
+  std::array<KvafBatchGetDirectUrmaEntity, kMaxDirectAivWorkers> entities = transport->entity_templates;
+  for (uint32_t index = 0U; index < transport->worker_count; ++index) {
+    entities[index].local_hbm_address = output_address;
+    entities[index].local_hbm_size = output_hbm_bytes;
+    entities[index].local_token_id = candidate->memory.token_id;
+    entities[index].local_token_value = candidate->memory.token_value;
+  }
+  const uint64_t entity_bytes = static_cast<uint64_t>(transport->worker_count) * sizeof(entities.front());
+  if (entity_bytes > UINT32_MAX ||
+      aclrtMalloc(&candidate->device_entities, entity_bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
+      candidate->device_entities == nullptr ||
+      aclrtMemcpy(candidate->device_entities, entity_bytes, entities.data(), entity_bytes,
+                  ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
     std::fprintf(stderr,
-                 "[KVAF_AIV] DIRECT_LOCAL_HBM_BINDING_COPY_FAILED output_hbm=0x%llx bytes=%llu binding=%p\n",
-                 static_cast<unsigned long long>(candidate->host_binding.hbm_address),
-                 static_cast<unsigned long long>(output_device_bytes), candidate->device_binding);
-    if (candidate->device_binding != nullptr) (void)aclrtFree(candidate->device_binding);
-    if (candidate->memory.handle != nullptr && state->api.lmem_unregister != nullptr) {
-      (void)state->api.lmem_unregister(state->device_context, candidate->memory.handle);
-    }
-    if (candidate->token_handle != nullptr && state->api.token_free != nullptr) {
-      (void)state->api.token_free(state->device_context, candidate->token_handle);
-    }
+                 "[KVAF_AIV] DIRECT_LOCAL_BUFFER_ENTITY_COPY_FAILED output_hbm=0x%llx bytes=%llu workers=%u\n",
+                 static_cast<unsigned long long>(output_address), static_cast<unsigned long long>(output_hbm_bytes),
+                 transport->worker_count);
+    ReleaseLocalBufferResources(transport, candidate.get());
     return false;
   }
-  *device_binding = reinterpret_cast<uint64_t>(candidate->device_binding);
+  candidate->device_channel_entity = reinterpret_cast<uint64_t>(candidate->device_entities);
+  candidate->reference_count = 1U;
+  *local_buffer = candidate.get();
+  *device_channel_entity = candidate->device_channel_entity;
   std::fprintf(stderr,
-               "[KVAF_AIV] DIRECT_LOCAL_HBM_READY output_hbm=0x%llx bytes=%llu token_id=0x%x binding=0x%llx "
-               "registration=dynamic_cached\n",
-               static_cast<unsigned long long>(candidate->host_binding.hbm_address),
-               static_cast<unsigned long long>(candidate->host_binding.hbm_size), candidate->host_binding.local_token_id,
-               static_cast<unsigned long long>(*device_binding));
-  state->local_hbm_registrations.push_back(std::move(candidate));
+               "[KVAF_AIV] DIRECT_LOCAL_BUFFER_ACQUIRE_NEW output_hbm=0x%llx bytes=%llu token_id=0x%x refs=1 "
+               "entity_table=0x%llx transport_reused=1\n",
+               static_cast<unsigned long long>(output_address), static_cast<unsigned long long>(output_hbm_bytes),
+               candidate->memory.token_id, static_cast<unsigned long long>(candidate->device_channel_entity));
+  transport->local_buffers.push_back(std::move(candidate));
   return true;
 }
 
@@ -987,141 +1020,119 @@ bool ImportJetty(const DirectHccpApi &api, void *context, const DirectJetty &rem
   return true;
 }
 
-void ReleaseRegistration(KvafBatchGetDdrRegistration *registration) {
-  if (registration == nullptr) {
+void ReleaseTransport(KvafBatchGetTransport *transport) {
+  if (transport == nullptr) {
     return;
   }
   std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=begin\n");
-  if (registration->device_entities != nullptr) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=free_device_entities\n");
-    (void)aclrtFree(registration->device_entities);
-    registration->device_entities = nullptr;
-  }
-  if (!registration->local_hbm_registrations.empty()) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=free_local_hbm_bindings count=%zu\n",
-                 registration->local_hbm_registrations.size());
-    for (const auto &local : registration->local_hbm_registrations) {
-      if (local != nullptr && local->device_binding != nullptr) {
-        (void)aclrtFree(local->device_binding);
-      }
+  if (!transport->local_buffers.empty()) {
+    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=release_local_buffers count=%zu\n",
+                 transport->local_buffers.size());
+    for (const auto &local : transport->local_buffers) {
+      if (local != nullptr) ReleaseLocalBufferResources(transport, local.get());
     }
   }
-  if (registration->api.qp_unimport != nullptr) {
+  if (transport->api.qp_unimport != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=unimport_jettys\n");
     for (uint32_t worker_index = 0U;
-         worker_index < registration->worker_count; ++worker_index) {
-      DirectAivWorker &worker = registration->workers[worker_index];
-      if (registration->host_context != nullptr && worker.host_device_target_jetty != nullptr) {
-        (void)registration->api.qp_unimport(registration->host_context, worker.host_device_target_jetty);
+         worker_index < transport->worker_count; ++worker_index) {
+      DirectAivWorker &worker = transport->workers[worker_index];
+      if (transport->host_context != nullptr && worker.host_device_target_jetty != nullptr) {
+        (void)transport->api.qp_unimport(transport->host_context, worker.host_device_target_jetty);
       }
-      if (registration->device_context != nullptr && worker.device_host_target_jetty != nullptr) {
-        (void)registration->api.qp_unimport(registration->device_context, worker.device_host_target_jetty);
+      if (transport->device_context != nullptr && worker.device_host_target_jetty != nullptr) {
+        (void)transport->api.qp_unimport(transport->device_context, worker.device_host_target_jetty);
       }
     }
   }
-  if (registration->api.qp_destroy != nullptr) {
+  if (transport->api.qp_destroy != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=destroy_jettys\n");
     for (uint32_t worker_index = 0U;
-         worker_index < registration->worker_count; ++worker_index) {
-      DirectAivWorker &worker = registration->workers[worker_index];
+         worker_index < transport->worker_count; ++worker_index) {
+      DirectAivWorker &worker = transport->workers[worker_index];
       if (worker.device_user_ctl_jetty.handle != nullptr) {
-        (void)registration->api.qp_destroy(worker.device_user_ctl_jetty.handle);
+        (void)transport->api.qp_destroy(worker.device_user_ctl_jetty.handle);
       }
       if (worker.host_standard_jetty.handle != nullptr) {
-        (void)registration->api.qp_destroy(worker.host_standard_jetty.handle);
+        (void)transport->api.qp_destroy(worker.host_standard_jetty.handle);
       }
     }
   }
-  if (registration->api.cq_destroy != nullptr) {
+  if (transport->api.cq_destroy != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=destroy_completion_queues\n");
     for (uint32_t worker_index = 0U;
-         worker_index < registration->worker_count; ++worker_index) {
-      DirectAivWorker &worker = registration->workers[worker_index];
-      if (registration->device_context != nullptr && worker.device_user_ctl_cq != nullptr) {
-        (void)registration->api.cq_destroy(registration->device_context, worker.device_user_ctl_cq);
+         worker_index < transport->worker_count; ++worker_index) {
+      DirectAivWorker &worker = transport->workers[worker_index];
+      if (transport->device_context != nullptr && worker.device_user_ctl_cq != nullptr) {
+        (void)transport->api.cq_destroy(transport->device_context, worker.device_user_ctl_cq);
       }
-      if (registration->host_context != nullptr && worker.host_normal_cq != nullptr) {
-        (void)registration->api.cq_destroy(registration->host_context, worker.host_normal_cq);
+      if (transport->host_context != nullptr && worker.host_normal_cq != nullptr) {
+        (void)transport->api.cq_destroy(transport->host_context, worker.host_normal_cq);
       }
     }
   }
-  if (registration->api.rmem_unimport != nullptr && registration->device_context != nullptr &&
-      registration->device_host_memory_import != nullptr) {
+  if (transport->api.rmem_unimport != nullptr && transport->device_context != nullptr &&
+      transport->device_host_memory_import != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=unimport_host_memory\n");
-    (void)registration->api.rmem_unimport(registration->device_context, registration->device_host_memory_import);
+    (void)transport->api.rmem_unimport(transport->device_context, transport->device_host_memory_import);
   }
-  if (registration->api.lmem_unregister != nullptr) {
+  if (transport->api.lmem_unregister != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=unregister_memory\n");
-    if (registration->device_context != nullptr) {
-      for (const auto &local : registration->local_hbm_registrations) {
-        if (local != nullptr && local->memory.handle != nullptr) {
-          (void)registration->api.lmem_unregister(registration->device_context, local->memory.handle);
-        }
-      }
-    }
-    if (registration->host_context != nullptr && registration->host_memory.handle != nullptr) {
-      (void)registration->api.lmem_unregister(registration->host_context, registration->host_memory.handle);
+    if (transport->host_context != nullptr && transport->host_memory.handle != nullptr) {
+      (void)transport->api.lmem_unregister(transport->host_context, transport->host_memory.handle);
     }
   }
-  if (registration->api.token_free != nullptr) {
+  if (transport->api.token_free != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=free_tokens\n");
-    if (registration->device_context != nullptr) {
-      for (const auto &local : registration->local_hbm_registrations) {
-        if (local != nullptr && local->token_handle != nullptr) {
-          (void)registration->api.token_free(registration->device_context, local->token_handle);
-        }
-      }
-      if (registration->device_transport_token_handle != nullptr) {
-        (void)registration->api.token_free(registration->device_context, registration->device_transport_token_handle);
+    if (transport->device_context != nullptr) {
+      if (transport->device_transport_token_handle != nullptr) {
+        (void)transport->api.token_free(transport->device_context, transport->device_transport_token_handle);
       }
     }
-    if (registration->host_context != nullptr && registration->host_token_handle != nullptr) {
-      (void)registration->api.token_free(registration->host_context, registration->host_token_handle);
+    if (transport->host_context != nullptr && transport->host_token_handle != nullptr) {
+      (void)transport->api.token_free(transport->host_context, transport->host_token_handle);
     }
   }
-  if (registration->api.ctx_deinit != nullptr) {
+  if (transport->api.ctx_deinit != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=deinit_contexts\n");
-    if (registration->device_context != nullptr) {
-      (void)registration->api.ctx_deinit(registration->device_context);
+    if (transport->device_context != nullptr) {
+      (void)transport->api.ctx_deinit(transport->device_context);
     }
-    if (registration->host_context != nullptr) {
-      (void)registration->api.ctx_deinit(registration->host_context);
+    if (transport->host_context != nullptr) {
+      (void)transport->api.ctx_deinit(transport->host_context);
     }
   }
-  if (registration->device_ra_initialized) {
+  if (transport->device_ra_initialized) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=deinit_device_ra\n");
-    DeinitRaBestEffort(registration->api, registration->physical_device_id, hccp::kOfflineHdc, "device_aiv");
+    DeinitRaBestEffort(transport->api, transport->physical_device_id, hccp::kOfflineHdc, "device_aiv");
   }
-  if (registration->host_ra_initialized) {
+  if (transport->host_ra_initialized) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=deinit_host_ra\n");
-    DeinitRaBestEffort(registration->api, registration->physical_device_id, hccp::kPeerOnline, "host_cpu");
+    DeinitRaBestEffort(transport->api, transport->physical_device_id, hccp::kPeerOnline, "host_cpu");
   }
   std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=close_dynamic_libraries\n");
-  CloseDirectHccp(&registration->api);
+  CloseDirectHccp(&transport->api);
   std::fprintf(stderr,
-               "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=delete_registration "
+               "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=delete_transport "
                "worker_storage=inline workers=%u\n",
-               registration->worker_count);
-  delete registration;
+               transport->worker_count);
+  delete transport;
 }
 
-extern "C" int32_t KvafBatchGetInitializeTransport(void *host_ddr, uint64_t host_ddr_bytes,
-                                                       uint32_t aiv_core_count, uint32_t jettys_per_core,
-                                                       KvafBatchGetDdrRegistration **registration,
-                                                       uint64_t *channel_entity) {
+extern "C" int32_t KvafBatchGetTransportCreate(void *host_ddr, uint64_t host_ddr_bytes,
+                                                 uint32_t aiv_core_count, uint32_t jettys_per_core,
+                                                 KvafBatchGetTransport **transport) {
   if (host_ddr == nullptr || host_ddr_bytes == 0U ||
       aiv_core_count == 0U || aiv_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES || jettys_per_core == 0U ||
       jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
       static_cast<uint64_t>(aiv_core_count) * jettys_per_core >
           static_cast<uint64_t>(KVAF_AIV_BATCH_GET_MAX_AIV_CORES) * KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
-      registration == nullptr ||
-      channel_entity == nullptr) {
+      transport == nullptr) {
     return KVAF_BATCH_GET_INVALID_ARGUMENT;
   }
-  *registration = nullptr;
-  *channel_entity = 0U;
+  *transport = nullptr;
 
-  auto *state = new (std::nothrow) KvafBatchGetDdrRegistration();
+  auto *state = new (std::nothrow) KvafBatchGetTransport();
   if (state == nullptr) {
     return KVAF_BATCH_GET_RUNTIME_ERROR;
   }
@@ -1218,7 +1229,7 @@ extern "C" int32_t KvafBatchGetInitializeTransport(void *host_ddr, uint64_t host
   }
 
   {
-    std::vector<KvafBatchGetDirectUrmaEntity> entities(entity_count);
+    auto &entities = state->entity_templates;
     for (uint32_t entity_index = 0U; entity_index < entity_count; ++entity_index) {
       const uint32_t core = entity_index / jettys_per_core;
       const uint32_t jetty_slot = entity_index % jettys_per_core;
@@ -1272,50 +1283,53 @@ extern "C" int32_t KvafBatchGetInitializeTransport(void *host_ddr, uint64_t host
         }
       }
     }
-    const uint64_t entity_bytes = static_cast<uint64_t>(entities.size()) * sizeof(entities.front());
-    if (entity_bytes > UINT32_MAX ||
-        aclrtMalloc(&state->device_entities, entity_bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
-        state->device_entities == nullptr ||
-        aclrtMemcpy(state->device_entities, entity_bytes, entities.data(), entity_bytes, ACL_MEMCPY_HOST_TO_DEVICE) !=
-            ACL_SUCCESS) {
-      std::fprintf(stderr, "[KVAF_AIV] DIRECT_AIV_ENTITY_TABLE_BUILD_FAILED cores=%u bytes=%llu\n", aiv_core_count,
-                   static_cast<unsigned long long>(entity_bytes));
-      goto failed;
-    }
-    state->channel_entity = reinterpret_cast<uint64_t>(state->device_entities);
     for (uint32_t entity_index = 0U; entity_index < entity_count; ++entity_index) {
       const uint32_t core = entity_index / jettys_per_core;
       const uint32_t jetty_slot = entity_index % jettys_per_core;
       const KvafBatchGetDirectUrmaEntity &entity = entities[entity_index];
       std::fprintf(stderr,
-                   "[KVAF_AIV] DIRECT_AIV_ENTITY_READY core=%u jetty_slot=%u entity_index=%u entity_table=0x%llx sq_depth_wqebbs=%u cq_depth=%u "
+                   "[KVAF_AIV] DIRECT_AIV_ENTITY_TEMPLATE_READY core=%u jetty_slot=%u entity_index=%u sq_depth_wqebbs=%u cq_depth=%u "
                    "architecture=cpu_normal_jetty_to_device_aiv_dev_used_user_ctl_symmetric_ctp\n",
-                   core, jetty_slot, entity_index, static_cast<unsigned long long>(state->channel_entity),
-                   entity.sq_depth, entity.cq_depth);
+                   core, jetty_slot, entity_index, entity.sq_depth, entity.cq_depth);
     }
   }
 
   std::fprintf(stderr,
-               "[KVAF_AIV] DIRECT_TRANSPORT_READY host_ddr_bytes=%llu workers=%u local_hbm=deferred_runtime_prepare\n",
+               "[KVAF_AIV] DIRECT_TRANSPORT_READY host_ddr_bytes=%llu workers=%u local_hbm=deferred_acquire\n",
                static_cast<unsigned long long>(host_ddr_bytes), entity_count);
-  *registration = state;
-  *channel_entity = state->channel_entity;
+  *transport = state;
   return KVAF_BATCH_GET_SUCCESS;
 
 failed:
-  ReleaseRegistration(state);
+  ReleaseTransport(state);
   return result;
 }
 
-extern "C" int32_t KvafBatchGetPrepareLocalHbm(KvafBatchGetDdrRegistration *registration,
-                                                  void *output_device, uint64_t output_device_bytes,
-                                                  uint64_t *local_hbm_binding) {
-  if (!PrepareLocalHbmRegistration(registration, output_device, output_device_bytes, local_hbm_binding)) {
+extern "C" int32_t KvafBatchGetLocalBufferAcquire(KvafBatchGetTransport *transport, void *output_hbm,
+                                                    uint64_t output_hbm_bytes,
+                                                    KvafBatchGetLocalBuffer **local_buffer,
+                                                    uint64_t *device_channel_entity) {
+  if (!AcquireLocalBuffer(transport, output_hbm, output_hbm_bytes, local_buffer, device_channel_entity)) {
     return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
   }
   return KVAF_BATCH_GET_SUCCESS;
 }
 
-extern "C" void KvafBatchGetDestroyTransport(KvafBatchGetDdrRegistration *registration) {
-  ReleaseRegistration(registration);
+extern "C" void KvafBatchGetLocalBufferRelease(KvafBatchGetLocalBuffer *local_buffer) {
+  if (local_buffer == nullptr || local_buffer->transport == nullptr) return;
+  if (local_buffer->reference_count == 0U) {
+    std::fprintf(stderr, "[KVAF_AIV] DIRECT_LOCAL_BUFFER_RELEASE_WARNING reason=reference_underflow output_hbm=0x%llx\n",
+                 static_cast<unsigned long long>(local_buffer->output_hbm_address));
+    return;
+  }
+  --local_buffer->reference_count;
+  std::fprintf(stderr,
+               "[KVAF_AIV] DIRECT_LOCAL_BUFFER_RELEASE output_hbm=0x%llx bytes=%llu refs=%u "
+               "cache_retained_until_transport_destroy=1\n",
+               static_cast<unsigned long long>(local_buffer->output_hbm_address),
+               static_cast<unsigned long long>(local_buffer->output_hbm_bytes), local_buffer->reference_count);
+}
+
+extern "C" void KvafBatchGetTransportDestroy(KvafBatchGetTransport *transport) {
+  ReleaseTransport(transport);
 }

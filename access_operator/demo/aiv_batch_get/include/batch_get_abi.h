@@ -40,9 +40,10 @@ typedef struct KvafBatchGetQueueState {
   uint64_t reserved[3];
 } KvafBatchGetQueueState;
 
-// Device view of the fixed Direct-HCCP transport resources.  It intentionally
-// contains no per-call HBM address or local-memory token: those belong to a
-// LocalHbmBinding and may change for every ExecuteBatchGet invocation.
+// Device view of one Direct-HCCP transport plus one acquired local HBM
+// buffer.  The Host-DDR/Jetty fields are transport-scoped; each successful
+// LocalBufferAcquire creates its own device-resident entity table with the
+// local HBM address/token fields below filled for that caller-owned buffer.
 typedef struct KvafBatchGetDirectUrmaEntity {
   uint32_t magic;
   uint32_t version;
@@ -50,6 +51,10 @@ typedef struct KvafBatchGetDirectUrmaEntity {
   uint64_t remote_host_ddr_size;
   uint32_t remote_token_id;
   uint32_t remote_token_value;
+  uint64_t local_hbm_address;
+  uint64_t local_hbm_size;
+  uint32_t local_token_id;
+  uint32_t local_token_value;
   uint64_t sq_va;
   uint64_t sq_db_va;
   uint32_t jetty_id;
@@ -63,32 +68,19 @@ typedef struct KvafBatchGetDirectUrmaEntity {
   uint32_t cq_depth;
   uint32_t cqe_size;
   uint32_t reserved0;
-  uint64_t reserved[10];
+  uint64_t reserved[7];
 } KvafBatchGetDirectUrmaEntity;
 
-// One registered, local HBM allocation.  The binding is copied to HBM by the
-// host transport layer and passed to the AIV kernel for an individual launch.
-// `hbm_address` may therefore differ between ExecuteBatchGet calls, while the
-// HCCP transport and Host-DDR registration remain unchanged.
-typedef struct KvafBatchGetLocalHbmBinding {
-  uint64_t hbm_address;
-  uint64_t hbm_size;
-  uint32_t local_token_id;
-  uint32_t local_token_value;
-  uint64_t reserved0;
-} KvafBatchGetLocalHbmBinding;
-
-// Fixed-shape graph ABI.  Shapes and the binding-descriptor pointer stay
-// constant during capture/replay; address/valid/index/mask/output-index
-// contents may change between replays.  An inactive/invalid request is
-// skipped without changing shape, preserving graph safety.
+// Fixed-shape graph ABI. `output` and `channel_entity` must identify the same
+// LocalBufferAcquire result. During capture/replay both addresses stay fixed;
+// address/valid/index/mask/output-index contents may change between replays.
 typedef struct KvafExecuteBatchGetKernelArgs {
   uint64_t address_table;       // uint64[table_capacity], absolute Host DDR UBA
   uint64_t valid_table;         // uint8[table_capacity]
   uint64_t indices;             // int32[request_capacity]
   uint64_t mask;                // uint8[request_capacity]
   uint64_t output_indices;      // int32[request_capacity]
-  uint64_t local_hbm_binding;   // KvafBatchGetLocalHbmBinding on Device HBM
+  uint64_t output;              // caller-owned HBM output; must match entity
   uint64_t core_status;         // KvafBatchGetCoreStatus[block_count]
   uint64_t channel_entity;      // KvafBatchGetDirectUrmaEntity[block_count]
   uint64_t queue_state;         // KvafBatchGetQueueState[block_count]
@@ -107,8 +99,6 @@ static_assert(sizeof(KvafBatchGetQueueState) == KVAF_AIV_BATCH_GET_QUEUE_STATE_B
               "KvafBatchGetQueueState ABI changed");
 static_assert(sizeof(KvafBatchGetDirectUrmaEntity) == 192,
               "KvafBatchGetDirectUrmaEntity ABI changed");
-static_assert(sizeof(KvafBatchGetLocalHbmBinding) == 32,
-              "KvafBatchGetLocalHbmBinding ABI changed");
 static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 96,
               "KvafExecuteBatchGetKernelArgs ABI changed");
 #endif

@@ -18,24 +18,29 @@ enum {
   KVAF_BATCH_GET_DIRECT_HCCP_ERROR = -4,
 };
 
-typedef struct KvafBatchGetDdrRegistration KvafBatchGetDdrRegistration;
+typedef struct KvafBatchGetTransport KvafBatchGetTransport;
+typedef struct KvafBatchGetLocalBuffer KvafBatchGetLocalBuffer;
 
-// Creates the CPU-EID <-> device-EID Direct-HCCP transport, registers and
-// imports Host DDR, and returns device-visible USER_CTL queue entities.  It
-// does not take an HBM input/output buffer.
-int32_t KvafBatchGetInitializeTransport(void *host_ddr, uint64_t host_ddr_bytes,
-                                        uint32_t aiv_core_count, uint32_t jettys_per_core,
-                                        KvafBatchGetDdrRegistration **registration,
-                                        uint64_t *channel_entity);
+// Transport owns only the reusable CPU-EID <-> device-EID path and Host DDR.
+// It deliberately accepts no caller-owned HBM buffer.
+int32_t KvafBatchGetTransportCreate(void *host_ddr, uint64_t host_ddr_bytes,
+                                    uint32_t aiv_core_count, uint32_t jettys_per_core,
+                                    KvafBatchGetTransport **transport);
+void KvafBatchGetTransportDestroy(KvafBatchGetTransport *transport);
 
-// Ensures that one local HBM range is registered for UDMA and returns a
-// device-resident KvafBatchGetLocalHbmBinding.  Registrations are cached for
-// the transport lifetime.  The returned binding is passed in kernel args and
-// may be different for every eager ExecuteBatchGet call.
-int32_t KvafBatchGetPrepareLocalHbm(KvafBatchGetDdrRegistration *registration,
-                                    void *output_device, uint64_t output_device_bytes,
-                                    uint64_t *local_hbm_binding);
-void KvafBatchGetDestroyTransport(KvafBatchGetDdrRegistration *registration);
+// Acquire registers/caches one caller-owned HBM output range. Re-acquiring
+// the exact (address, bytes) pair returns the same local-buffer handle and
+// entity table while adding one reference. The returned entity is passed in
+// every kernel launch that uses this output.
+int32_t KvafBatchGetLocalBufferAcquire(KvafBatchGetTransport *transport,
+                                       void *output_hbm, uint64_t output_hbm_bytes,
+                                       KvafBatchGetLocalBuffer **local_buffer,
+                                       uint64_t *device_channel_entity);
+
+// The demo retains zero-reference registrations until TransportDestroy, so a
+// later acquire can reuse them without re-registering HBM. Call only after
+// all launches using this local buffer have completed.
+void KvafBatchGetLocalBufferRelease(KvafBatchGetLocalBuffer *local_buffer);
 
 int32_t KvafExecuteBatchGetLoadKernel(const char *kernel_object_path);
 int32_t KvafExecuteBatchGetLaunch(const KvafExecuteBatchGetKernelArgs *arguments,

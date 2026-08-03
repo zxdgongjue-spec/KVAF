@@ -95,7 +95,7 @@ done
   printf 'kernel=%s\n' "${kernel}"
   printf 'plog_directory=%s\n' "${plog_dir}"
   printf '\n[markers]\n'
-  grep -a -E 'PHASE_|DIRECT_(TRANSPORT|LOCAL_HBM)|EXECUTE_BATCH_GET_VALIDATION|GRAPH_(CAPTURE|REPLAY|PERF)|PERF_RESULT|KVAF_EXECUTE' "${log_file}" | tail -n 120 || true
+  grep -a -E 'PHASE_|DIRECT_(TRANSPORT|LOCAL_BUFFER|AIV_ENTITY_TEMPLATE)|EXECUTE_BATCH_GET_VALIDATION|GRAPH_(CAPTURE|REPLAY|PERF)|PERF_RESULT|KVAF_EXECUTE' "${log_file}" | tail -n 120 || true
   printf '\n[plog]\n'
   find "${plog_dir}" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort || true
 } > "${feedback_file}"

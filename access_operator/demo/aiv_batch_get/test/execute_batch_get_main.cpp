@@ -264,11 +264,14 @@ int main(int argc, char **argv) {
   void *device_output_indices = nullptr;
   void *device_status = nullptr;
   void *device_queue = nullptr;
-  KvafBatchGetDdrRegistration *registration = nullptr;
+  KvafBatchGetTransport *transport = nullptr;
+  KvafBatchGetLocalBuffer *primary_local_buffer = nullptr;
+  KvafBatchGetLocalBuffer *alternate_local_buffer = nullptr;
+  KvafBatchGetLocalBuffer *primary_reacquired_buffer = nullptr;
   aclmdlRI graph_model = nullptr;
-  uint64_t entity_table = 0U;
-  uint64_t local_hbm_binding = 0U;
-  uint64_t alternate_local_hbm_binding = 0U;
+  uint64_t primary_entity_table = 0U;
+  uint64_t alternate_entity_table = 0U;
+  uint64_t primary_reacquired_entity_table = 0U;
   uint64_t completed_batch_base = 0U;
   uint8_t *source = nullptr;
   KvafExecuteBatchGetKernelArgs args{};
@@ -357,16 +360,15 @@ int main(int argc, char **argv) {
     goto cleanup;
   }
 
-  if (!CheckKvaf(KvafBatchGetInitializeTransport(source_ddr, source_bytes, options.aiv_cores, 1U,
-                                                  &registration, &entity_table),
-                 "initialize Direct-HCCP transport and register Host DDR")) goto cleanup;
-  if (!CheckKvaf(KvafBatchGetPrepareLocalHbm(registration, output_hbm, output_bytes, &local_hbm_binding),
-                 "prepare runtime output HBM for UDMA")) goto cleanup;
-  std::cout << "PHASE_EID_ENDPOINT_READY entity_table=0x" << std::hex << entity_table << std::dec
+  if (!CheckKvaf(KvafBatchGetTransportCreate(source_ddr, source_bytes, options.aiv_cores, 1U, &transport),
+                 "create reusable Direct-HCCP transport and register Host DDR")) goto cleanup;
+  if (!CheckKvaf(KvafBatchGetLocalBufferAcquire(transport, output_hbm, output_bytes, &primary_local_buffer,
+                                                 &primary_entity_table),
+                 "acquire primary caller-owned output HBM for UDMA")) goto cleanup;
+  std::cout << "PHASE_EID_ENDPOINT_READY primary_entity_table=0x" << std::hex << primary_entity_table << std::dec
             << " table_capacity=" << options.table_capacity << " output_rows=" << options.output_rows
             << " source_bytes=" << source_bytes << " output_bytes=" << output_bytes
-            << " local_hbm_binding=0x" << std::hex << local_hbm_binding << std::dec
-            << " output_lifetime=runtime_prepared\n";
+            << " output_lifetime=local_buffer_acquired\n";
   if (!CheckKvaf(KvafExecuteBatchGetLoadKernel(options.kernel.c_str()), "load ExecuteBatchGet kernel")) goto cleanup;
   std::cout << "PHASE_KERNEL_REGISTERED cores=" << options.aiv_cores
             << " contract=address_table_absolute_uba_plus_mask_plus_output_scatter\n";
@@ -376,9 +378,9 @@ int main(int argc, char **argv) {
   args.indices = reinterpret_cast<uint64_t>(device_indices);
   args.mask = reinterpret_cast<uint64_t>(device_mask);
   args.output_indices = reinterpret_cast<uint64_t>(device_output_indices);
-  args.local_hbm_binding = local_hbm_binding;
+  args.output = reinterpret_cast<uint64_t>(output_hbm);
   args.core_status = reinterpret_cast<uint64_t>(device_status);
-  args.channel_entity = entity_table;
+  args.channel_entity = primary_entity_table;
   args.queue_state = reinterpret_cast<uint64_t>(device_queue);
   args.table_capacity = options.table_capacity;
   args.request_capacity = options.requests;
@@ -387,15 +389,33 @@ int main(int argc, char **argv) {
   args.block_count = options.aiv_cores;
 
   if (options.dynamic_output_smoke != 0U) {
-    if (!CheckKvaf(KvafBatchGetPrepareLocalHbm(registration, alternate_output_hbm, output_bytes,
-                                                &alternate_local_hbm_binding),
-                   "prepare alternate runtime output HBM") ||
-        alternate_local_hbm_binding == local_hbm_binding) {
-      std::cerr << "[KVAF_EXECUTE] dynamic output registration did not produce an independent binding\n";
+    // A -> B -> A proves the API contract rather than merely proving that two
+    // MRs can coexist: the second A acquire must return the cached entity.
+    if (!CheckKvaf(KvafExecuteBatchGetLaunch(&args, stream), "primary local-buffer smoke launch") ||
+        !CheckAcl(aclrtSynchronizeStream(stream), "primary local-buffer smoke completion") ||
+        !CheckAcl(aclrtMemcpy(statuses.data(), statuses.size() * sizeof(statuses[0]), device_status,
+                               statuses.size() * sizeof(statuses[0]), ACL_MEMCPY_DEVICE_TO_HOST),
+                  "copy primary local-buffer status") ||
+        !CheckAcl(aclrtMemcpy(queues.data(), queues.size() * sizeof(queues[0]), device_queue,
+                               queues.size() * sizeof(queues[0]), ACL_MEMCPY_DEVICE_TO_HOST),
+                  "copy primary local-buffer queue") ||
+        !CheckAcl(aclrtMemcpy(output.data(), output.size(), output_hbm, output.size(), ACL_MEMCPY_DEVICE_TO_HOST),
+                  "copy primary local-buffer output") ||
+        !Validate(output, address_table, indices, mask, output_indices, options, source, statuses, queues, 1U,
+                  "primary_output")) {
       goto cleanup;
     }
-    args.local_hbm_binding = alternate_local_hbm_binding;
-    if (!CheckKvaf(KvafExecuteBatchGetLaunch(&args, stream), "dynamic output smoke launch") ||
+
+    if (!CheckKvaf(KvafBatchGetLocalBufferAcquire(transport, alternate_output_hbm, output_bytes,
+                                                   &alternate_local_buffer, &alternate_entity_table),
+                   "acquire alternate caller-owned output HBM") ||
+        alternate_local_buffer == primary_local_buffer || alternate_entity_table == primary_entity_table) {
+      std::cerr << "[KVAF_EXECUTE] alternate output did not receive an independent local-buffer entity\n";
+      goto cleanup;
+    }
+    args.output = reinterpret_cast<uint64_t>(alternate_output_hbm);
+    args.channel_entity = alternate_entity_table;
+    if (!CheckKvaf(KvafExecuteBatchGetLaunch(&args, stream), "alternate local-buffer smoke launch") ||
         !CheckAcl(aclrtSynchronizeStream(stream), "dynamic output smoke completion") ||
         !CheckAcl(aclrtMemcpy(statuses.data(), statuses.size() * sizeof(statuses[0]), device_status,
                                statuses.size() * sizeof(statuses[0]), ACL_MEMCPY_DEVICE_TO_HOST),
@@ -406,15 +426,41 @@ int main(int argc, char **argv) {
         !CheckAcl(aclrtMemcpy(output.data(), output.size(), alternate_output_hbm, output.size(),
                                ACL_MEMCPY_DEVICE_TO_HOST),
                   "copy dynamic output") ||
-        !Validate(output, address_table, indices, mask, output_indices, options, source, statuses, queues, 1U,
-                  "dynamic_output")) {
+        !Validate(output, address_table, indices, mask, output_indices, options, source, statuses, queues, 2U,
+                  "alternate_output")) {
       goto cleanup;
     }
-    completed_batch_base = 1U;
-    args.local_hbm_binding = local_hbm_binding;
-    std::cout << "PHASE_DYNAMIC_OUTPUT_VALIDATION_PASS primary_binding=0x" << std::hex << local_hbm_binding
-              << " alternate_binding=0x" << alternate_local_hbm_binding << std::dec
-              << " transport_reused=1\n";
+    if (!CheckKvaf(KvafBatchGetLocalBufferAcquire(transport, output_hbm, output_bytes, &primary_reacquired_buffer,
+                                                   &primary_reacquired_entity_table),
+                   "re-acquire primary caller-owned output HBM") ||
+        primary_reacquired_buffer != primary_local_buffer || primary_reacquired_entity_table != primary_entity_table) {
+      std::cerr << "[KVAF_EXECUTE] primary local-buffer cache contract failed\n";
+      goto cleanup;
+    }
+    args.output = reinterpret_cast<uint64_t>(output_hbm);
+    args.channel_entity = primary_reacquired_entity_table;
+    if (!CheckKvaf(KvafExecuteBatchGetLaunch(&args, stream), "re-acquired primary local-buffer smoke launch") ||
+        !CheckAcl(aclrtSynchronizeStream(stream), "re-acquired primary local-buffer smoke completion") ||
+        !CheckAcl(aclrtMemcpy(statuses.data(), statuses.size() * sizeof(statuses[0]), device_status,
+                               statuses.size() * sizeof(statuses[0]), ACL_MEMCPY_DEVICE_TO_HOST),
+                  "copy re-acquired primary status") ||
+        !CheckAcl(aclrtMemcpy(queues.data(), queues.size() * sizeof(queues[0]), device_queue,
+                               queues.size() * sizeof(queues[0]), ACL_MEMCPY_DEVICE_TO_HOST),
+                  "copy re-acquired primary queue") ||
+        !CheckAcl(aclrtMemcpy(output.data(), output.size(), output_hbm, output.size(), ACL_MEMCPY_DEVICE_TO_HOST),
+                  "copy re-acquired primary output") ||
+        !Validate(output, address_table, indices, mask, output_indices, options, source, statuses, queues, 3U,
+                  "reacquired_primary_output")) {
+      goto cleanup;
+    }
+    KvafBatchGetLocalBufferRelease(primary_reacquired_buffer);
+    primary_reacquired_buffer = nullptr;
+    completed_batch_base = 3U;
+    args.output = reinterpret_cast<uint64_t>(output_hbm);
+    args.channel_entity = primary_entity_table;
+    std::cout << "PHASE_DYNAMIC_OUTPUT_VALIDATION_PASS primary_entity=0x" << std::hex << primary_entity_table
+              << " alternate_entity=0x" << alternate_entity_table << std::dec
+              << " primary_reacquire_cache_hit=1 transport_reused=1\n";
   }
 
   if (options.graph_replays != 0U) {
@@ -601,7 +647,13 @@ int main(int argc, char **argv) {
 cleanup:
   std::cout << "PHASE_TEARDOWN_BEGIN status=" << exit_code << '\n';
   if (graph_model != nullptr) (void)aclmdlRIDestroy(graph_model);
-  if (registration != nullptr) KvafBatchGetDestroyTransport(registration);
+  // Every normal launch above synchronizes before this point. Keep the
+  // LocalBuffer release-before-transport-destroy order explicit so callers
+  // can follow the same safe lifetime contract.
+  if (primary_reacquired_buffer != nullptr) KvafBatchGetLocalBufferRelease(primary_reacquired_buffer);
+  if (alternate_local_buffer != nullptr) KvafBatchGetLocalBufferRelease(alternate_local_buffer);
+  if (primary_local_buffer != nullptr) KvafBatchGetLocalBufferRelease(primary_local_buffer);
+  if (transport != nullptr) KvafBatchGetTransportDestroy(transport);
   if (device_queue != nullptr) (void)aclrtFree(device_queue);
   if (device_status != nullptr) (void)aclrtFree(device_status);
   if (device_output_indices != nullptr) (void)aclrtFree(device_output_indices);

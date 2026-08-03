@@ -26,6 +26,27 @@ For an active request `i`, the kernel reads `block_bytes` from
 fixed-block, single-output-scatter scope; duplicate output rows are not
 rejected and have last-completion-wins semantics.
 
+The local-memory lifetime is intentionally separate from the shared
+transport:
+
+```cpp
+KvafBatchGetTransport *transport = nullptr;
+KvafBatchGetLocalBuffer *output_binding = nullptr;
+uint64_t entity = 0;
+KvafBatchGetTransportCreate(host_ddr, host_ddr_bytes, aiv_cores, 1, &transport);
+KvafBatchGetLocalBufferAcquire(transport, output_hbm, output_bytes,
+                               &output_binding, &entity);
+args.output = reinterpret_cast<uint64_t>(output_hbm);
+args.channel_entity = entity;
+// launch and synchronize the stream
+KvafBatchGetLocalBufferRelease(output_binding);
+KvafBatchGetTransportDestroy(transport);
+```
+
+An exact repeat of `Acquire(transport, output_hbm, output_bytes, ...)`
+returns the cached binding/entity and increments its use reference. New HBM
+addresses receive a new local MR and entity table but reuse the transport.
+
 ## What is included
 
 - `kernel/execute_batch_get_aiv.asc`: AIV UDMA READ WQE producer and CQ owner
@@ -63,8 +84,8 @@ DEVICE_ID=0 TABLE_CAPACITY=256 REQUESTS=10 OUTPUT_ROWS=200 \
 BLOCK_BYTES=1024 SOURCE_STRIDE=4096 AIV_CORES=1 MASK_EVERY=3 \
 WARMUP=1 ITERATIONS=1 bash scripts/run_execute_batch_get.sh
 
-# Proves that one initialized transport can use two independently registered
-# output tensors without rebuilding EID/CTP/Jetty resources.
+# Proves TransportCreate -> Acquire(A) -> Acquire(B) -> re-Acquire(A), then
+# releases both local-buffer references without rebuilding EID/CTP/Jettys.
 DEVICE_ID=0 DYNAMIC_OUTPUT_SMOKE=1 WARMUP=1 ITERATIONS=1 \
 bash scripts/run_execute_batch_get.sh
 
@@ -80,13 +101,17 @@ is `host_submit_to_stream_completion` and excludes warmup.
 
 ## Graph boundary
 
-Resource creation, Host DDR registration and one `PrepareLocalHbm(output)`
-call occur before capture. Capture contains only the AIV kernel launch. One
-graph therefore serves replay-time changes to addresses, validity, request
-indices, mask and output rows. A different output allocation needs its own
-prepared binding and graph instance; eager launches may select any cached
-binding at runtime. A capacity, block-size or AIV-count change also needs a
-new session/captured graph.
+`KvafBatchGetTransportCreate(host_ddr, ...)` creates only the reusable EID,
+Host-DDR and queue resources. Before capture, the caller acquires the fixed
+graph output through `KvafBatchGetLocalBufferAcquire(transport, output, ...)`.
+That call returns an opaque local-buffer handle and a device entity table whose
+local HBM address/token match `args.output`; capture contains only the AIV
+kernel launch. One graph therefore serves replay-time changes to addresses,
+validity, request indices, mask and output rows. A different output allocation
+uses its own acquire result and graph instance; eager launches may select any
+cached acquire result at runtime. A capacity, block-size or AIV-count change
+also needs a new session/captured graph. After all stream work completes,
+release local buffers before destroying the transport.
 
 ## Status
 
