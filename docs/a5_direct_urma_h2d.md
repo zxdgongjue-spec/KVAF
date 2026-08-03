@@ -348,6 +348,11 @@ active 状态在每次 fork 前先写 `host_launch_intent` 或
 执行会先打印记录的 PID，待 worker 自然退出后再按同一 `run_id` 自动复核并清理
 active 状态，全程不会再次访问 topology、EID selector 或 NPU。
 
+进程存活判断同时读取 `/proc/<pid>/stat`。`kill -0` 对僵尸进程仍会成功，因此不能
+单独用它判定 worker 仍能执行：`Z/X/x` 状态会被视为已经退出并由父 runner 执行
+`wait` 回收；只有终态已严格证明 `PASS/FAIL_SAFE` 时才随即删除 active。若 proc
+状态不可读或无法解析，则仍按“可能存活”保留 active，避免观测故障放宽安全门。
+
 端点在 `aclrtResetDevice`/`aclFinalize` 之前先写一份
 `transport_safe_runtime_cleanup_pending` 的 `FAIL_SAFE` 证明。这里的
 `aclrtResetDevice` 是进程运行时 context 清理，不是 `npu-smi` 的整卡复位。若

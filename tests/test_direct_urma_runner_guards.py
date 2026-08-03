@@ -277,6 +277,134 @@ class DirectUrmaRunnerGuardTests(unittest.TestCase):
         )
         self.assertLess(listener, device)
 
+    def test_worker_liveness_excludes_zombies_but_unknown_is_live(self) -> None:
+        state_start = self.source.index("process_snapshot_from_stat_file()")
+        state_end = self.source.index("process_executable()", state_start)
+        state_block = self.source[state_start:state_end]
+
+        self.assertIn('stat_tail=${stat_line##*) }', state_block)
+        self.assertIn('state=${stat_fields[0]:-}', state_block)
+        self.assertIn('ticks=${stat_fields[19]:-}', state_block)
+        self.assertIn("process_is_running_at_root()", state_block)
+        self.assertIn("process_is_running()", state_block)
+        self.assertIn('[[ ! -d "${process_dir}" ]]', state_block)
+        self.assertIn(
+            '"${current_start_ticks}" != "${expected_start_ticks}"',
+            state_block,
+        )
+        self.assertIn("Z|X|x)", state_block)
+        self.assertIn("observational uncertainty", state_block)
+        self.assertIn("reap_zombie_child()", state_block)
+
+        cleanup_start = self.source.index("cleanup_on_exit()")
+        cleanup_end = self.source.index("trap cleanup_on_exit EXIT")
+        cleanup = self.source[cleanup_start:cleanup_end]
+        self.assertIn('"${host_pid}" "${host_expected_start_ticks}"', cleanup)
+        self.assertIn(
+            '"${device_pid}" "${device_expected_start_ticks}"', cleanup
+        )
+        self.assertIn('"${host_pid:-0}" "${host_expected_start_ticks:-0}"', cleanup)
+
+        wait_start = self.source.index(
+            'while process_is_running "${host_pid}"'
+        )
+        wait_end = self.source.index('set +e\nwait "${host_pid}"', wait_start)
+        self.assertIn(
+            'process_is_running "${device_pid}"',
+            self.source[wait_start:wait_end],
+        )
+        self.assertNotIn("kill -0", self.source)
+
+        host_launch = self.source.index(
+            'nohup "${KVAF_A5_DIRECT_BINARY}" --role host'
+        )
+        host_pin = self.source.index(
+            'host_expected_start_ticks=$(process_start_ticks "${host_pid}")',
+            host_launch,
+        )
+        host_state = self.source.index(
+            "active_phase=host_started", host_launch
+        )
+        device_launch = self.source.index(
+            'nohup "${KVAF_A5_DIRECT_BINARY}" --role device'
+        )
+        device_pin = self.source.index(
+            'device_expected_start_ticks=$(process_start_ticks "${device_pid}")',
+            device_launch,
+        )
+        device_state = self.source.index(
+            "active_phase=device_started", device_launch
+        )
+        self.assertLess(host_pin, host_state)
+        self.assertLess(device_pin, device_state)
+        self.assertGreaterEqual(
+            self.source.count('"${host_expected_start_ticks:-0}"'), 3
+        )
+        self.assertGreaterEqual(
+            self.source.count('"${device_expected_start_ticks:-0}"'), 3
+        )
+
+    def test_worker_liveness_behavior_is_identity_bound_and_fail_closed(
+        self,
+    ) -> None:
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("bash is required")
+        functions = "\n".join(
+            (
+                self.shell_function_source(
+                    "process_snapshot_from_stat_file"
+                ),
+                self.shell_function_source("process_is_running_at_root"),
+            )
+        )
+        command = (
+            functions
+            + '\nprocess_is_running_at_root "$1" "$2" "$3"\n'
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            proc_root = Path(temporary) / "proc"
+            process_dir = proc_root / "123"
+            process_dir.mkdir(parents=True)
+            stat_file = process_dir / "stat"
+
+            def write_stat(state: str, ticks: int) -> None:
+                fields = [state] + ["0"] * 18 + [str(ticks)]
+                stat_file.write_text(
+                    "123 (worker ) name) " + " ".join(fields) + "\n",
+                    encoding="utf-8",
+                )
+
+            def running(expected_ticks: int, pid: int = 123) -> bool:
+                completed = subprocess.run(
+                    [
+                        bash,
+                        "-c",
+                        command,
+                        "kvaf-process-test",
+                        str(pid),
+                        str(expected_ticks),
+                        str(proc_root),
+                    ],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                self.assertIn(completed.returncode, (0, 1))
+                return completed.returncode == 0
+
+            write_stat("R", 777)
+            self.assertTrue(running(777))
+            write_stat("Z", 777)
+            self.assertFalse(running(777))
+            self.assertTrue(running(778))
+            self.assertTrue(running(0))
+            stat_file.write_text("malformed\n", encoding="utf-8")
+            self.assertTrue(running(777))
+            self.assertFalse(running(777, pid=456))
+
     def test_ub_management_is_default_and_needs_no_ip_listener(self) -> None:
         for expected in (
             "KVAF_DIRECT_MANAGEMENT_MODE=${KVAF_DIRECT_MANAGEMENT_MODE:-ub}",

@@ -1478,29 +1478,114 @@ device_args=(
 
 host_pid=
 device_pid=
+host_expected_start_ticks=0
+device_expected_start_ticks=0
 run_completed=0
 active_session_written=0
 active_phase=before_host_launch
 worker_expected_exe=$(realpath -e "${KVAF_A5_DIRECT_BINARY}")
 
-process_start_ticks()
+process_snapshot_from_stat_file()
 {
-  local pid=${1:-0}
-  local stat_line stat_tail ticks
+  local stat_file=$1
+  local stat_line stat_tail state ticks
   local -a stat_fields
-  if [[ "${pid}" =~ ^[1-9][0-9]*$ && -r "/proc/${pid}/stat" ]]; then
-    stat_line=$(<"/proc/${pid}/stat")
+
+  if [[ -r "${stat_file}" ]]; then
+    stat_line=$(<"${stat_file}")
     # comm is parenthesized and may itself contain spaces. Strip through the
-    # final ") " before indexing field 22 (field 20 in the remaining tail).
+    # final ") ". State is tail field 1 and starttime is tail field 20.
     stat_tail=${stat_line##*) }
     read -r -a stat_fields <<<"${stat_tail}"
+    state=${stat_fields[0]:-}
     ticks=${stat_fields[19]:-}
-    if [[ "${ticks}" =~ ^[1-9][0-9]*$ ]]; then
-      printf '%s\n' "${ticks}"
+    if [[ "${state}" =~ ^[A-Za-z]$ &&
+          "${ticks}" =~ ^[1-9][0-9]*$ ]]; then
+      printf '%s %s\n' "${state}" "${ticks}"
       return 0
     fi
   fi
+  return 1
+}
+
+process_snapshot()
+{
+  local pid=${1:-0}
+
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  process_snapshot_from_stat_file "/proc/${pid}/stat"
+}
+
+process_start_ticks()
+{
+  local pid=${1:-0}
+  local snapshot state ticks
+
+  if snapshot=$(process_snapshot "${pid}"); then
+    read -r state ticks <<<"${snapshot}"
+    printf '%s\n' "${ticks}"
+    return 0
+  fi
   printf '0\n'
+}
+
+process_is_running_at_root()
+{
+  local pid=${1:-0}
+  local expected_start_ticks=${2:-0}
+  local proc_root=$3
+  local process_dir snapshot state current_start_ticks
+
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  process_dir="${proc_root}/${pid}"
+  if [[ ! -d "${process_dir}" ]]; then
+    return 1
+  fi
+  # A missing/zero pin or a transiently unreadable/malformed stat record is
+  # observational uncertainty, not proof that the launched worker exited.
+  if ! [[ "${expected_start_ticks}" =~ ^[1-9][0-9]*$ ]] ||
+     ! snapshot=$(process_snapshot_from_stat_file \
+         "${process_dir}/stat"); then
+    return 0
+  fi
+  read -r state current_start_ticks <<<"${snapshot}"
+  if [[ "${current_start_ticks}" != "${expected_start_ticks}" ]]; then
+    # The PID now names another task. The original identity cannot be
+    # observed here, so retain the durable barrier and let its inherited lock
+    # plus nonce-bound recovery decide safety.
+    return 0
+  fi
+  case "${state}" in
+    Z|X|x)
+      # A zombie/dead task cannot execute provider code and has already
+      # released every fd, including the inherited active-session lock.
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+process_is_running()
+{
+  process_is_running_at_root "${1:-0}" "${2:-0}" /proc
+}
+
+reap_zombie_child()
+{
+  local pid=${1:-0}
+  local expected_start_ticks=${2:-0}
+  local snapshot state current_start_ticks
+
+  snapshot=$(process_snapshot "${pid}") || return 0
+  read -r state current_start_ticks <<<"${snapshot}"
+  [[ "${current_start_ticks}" == "${expected_start_ticks}" ]] || return 0
+  case "${state}" in
+    Z|X|x)
+      wait "${pid}" >/dev/null 2>&1 || true
+      ;;
+  esac
 }
 
 process_executable()
@@ -1588,7 +1673,7 @@ wait_for_host_control_listener()
        [[ -f "${host_final}" || -L "${host_final}" ]]; then
       return 3
     fi
-    if ! kill -0 "${pid}" 2>/dev/null; then
+    if ! process_is_running "${pid}" "${expected_start_ticks}"; then
       return 1
     fi
     if (( SECONDS >= deadline )); then
@@ -1625,7 +1710,7 @@ wait_for_host_urma_management_ready()
        [[ -f "${host_final}" || -L "${host_final}" ]]; then
       return 3
     fi
-    if ! kill -0 "${pid}" 2>/dev/null; then
+    if ! process_is_running "${pid}" "${expected_start_ticks}"; then
       return 1
     fi
     if (( SECONDS >= deadline )); then
@@ -1646,9 +1731,9 @@ write_active_session()
     printf 'host_pid=%s\n' "${host_pid:-0}"
     printf 'device_pid=%s\n' "${device_pid:-0}"
     printf 'host_start_ticks=%s\n' \
-      "$(process_start_ticks "${host_pid:-0}")"
+      "${host_expected_start_ticks:-0}"
     printf 'device_start_ticks=%s\n' \
-      "$(process_start_ticks "${device_pid:-0}")"
+      "${device_expected_start_ticks:-0}"
     printf 'host_observed_exe=%s\n' \
       "$(process_executable "${host_pid:-0}")"
     printf 'device_observed_exe=%s\n' \
@@ -1707,9 +1792,9 @@ record_quarantine()
     printf 'host_pid=%s\n' "${host_pid:-0}"
     printf 'device_pid=%s\n' "${device_pid:-0}"
     printf 'host_start_ticks=%s\n' \
-      "$(process_start_ticks "${host_pid:-0}")"
+      "${host_expected_start_ticks:-0}"
     printf 'device_start_ticks=%s\n' \
-      "$(process_start_ticks "${device_pid:-0}")"
+      "${device_expected_start_ticks:-0}"
     printf 'host_observed_exe=%s\n' \
       "$(process_executable "${host_pid:-0}")"
     printf 'device_observed_exe=%s\n' \
@@ -1851,10 +1936,14 @@ cleanup_on_exit()
        [[ -n "${host_pid}" || -n "${device_pid}" ]]; then
       set +e
       if terminal_cleanup_proven; then
-        if [[ -n "${host_pid}" ]] && kill -0 "${host_pid}" 2>/dev/null; then
+        if [[ -n "${host_pid}" ]] &&
+           process_is_running \
+             "${host_pid}" "${host_expected_start_ticks}"; then
           worker_live=1
         fi
-        if [[ -n "${device_pid}" ]] && kill -0 "${device_pid}" 2>/dev/null; then
+        if [[ -n "${device_pid}" ]] &&
+           process_is_running \
+             "${device_pid}" "${device_expected_start_ticks}"; then
           worker_live=1
         fi
         if (( worker_live != 0 )); then
@@ -1873,9 +1962,15 @@ cleanup_on_exit()
             echo "KVAF_A5_DIRECT_SAFE_STATE_MAINTENANCE_FAILED action=write rc=${rc}" >&2
             echo "Transport teardown is already proven safe; do not reset the NPU." >&2
           fi
-        elif clear_active_session; then
-          echo "KVAF_A5_DIRECT_RUNNER_EXIT_AFTER_SAFE_TERMINAL_PROOF rc=${rc}" >&2
         else
+          reap_zombie_child \
+            "${host_pid:-0}" "${host_expected_start_ticks:-0}"
+          reap_zombie_child \
+            "${device_pid:-0}" "${device_expected_start_ticks:-0}"
+        fi
+        if (( worker_live == 0 )) && clear_active_session; then
+          echo "KVAF_A5_DIRECT_RUNNER_EXIT_AFTER_SAFE_TERMINAL_PROOF rc=${rc}" >&2
+        elif (( worker_live == 0 )); then
           echo "KVAF_A5_DIRECT_SAFE_STATE_MAINTENANCE_FAILED action=clear rc=${rc}" >&2
           echo "Transport teardown is already proven safe; retry stale-state recovery." >&2
         fi
@@ -1937,9 +2032,9 @@ write_active_session
 nohup "${KVAF_A5_DIRECT_BINARY}" --role host "${host_args[@]}" \
   9>&- >"${host_log}" 2>&1 &
 host_pid=$!
+host_expected_start_ticks=$(process_start_ticks "${host_pid}")
 active_phase=host_started
 write_active_session
-host_expected_start_ticks=$(process_start_ticks "${host_pid}")
 if [[ "${host_expected_start_ticks}" == 0 ]]; then
   echo "ERROR: could not pin Host start ticks before listener readiness" >&2
   exit 5
@@ -1980,7 +2075,7 @@ elif (( host_management_wait_rc == 3 )); then
   echo "ERROR: Host identity changed or terminal evidence appeared before management readiness" >&2
   exit 5
 fi
-if ! kill -0 "${host_pid}" 2>/dev/null; then
+if ! process_is_running "${host_pid}" "${host_expected_start_ticks}"; then
   set +e
   wait "${host_pid}"
   host_rc=$?
@@ -2031,8 +2126,8 @@ if ! kill -0 "${host_pid}" 2>/dev/null; then
 fi
 
 # A quarantined Host intentionally remains alive to retain DDR ownership.
-# Therefore kill -0 alone is not proof that it is waiting for a client. Check
-# its nonce-bound terminal evidence before exposing the Device/AICPU side.
+# Therefore PID existence alone is not proof that it is waiting for a client.
+# Check its nonce-bound terminal evidence before exposing the Device/AICPU side.
 set +e
 pre_device_host_outcome=$(
   python3 "${outcome_classifier}" \
@@ -2056,9 +2151,14 @@ if (( pre_device_host_classifier_rc == 3 )) &&
         "$(manifest_value resource_armed "${host_final}")" == 1 ]]; then
     record_quarantine "unverified_udma_armed_host_terminal_before_device"
     pre_device_safe_exit_rc=4
-  else
+  elif process_is_running "${host_pid}" "${host_expected_start_ticks}"; then
     active_phase=host_safe_terminal_process_stuck
     write_active_session
+    pre_device_safe_exit_rc=3
+  else
+    reap_zombie_child "${host_pid}" "${host_expected_start_ticks}"
+    clear_active_session
+    host_pid=
     pre_device_safe_exit_rc=3
   fi
   run_completed=1
@@ -2081,12 +2181,17 @@ write_active_session
 nohup "${KVAF_A5_DIRECT_BINARY}" --role device "${device_args[@]}" \
   9>&- >"${device_log}" 2>&1 &
 device_pid=$!
+device_expected_start_ticks=$(process_start_ticks "${device_pid}")
 active_phase=device_started
 write_active_session
+if [[ "${device_expected_start_ticks}" == 0 ]]; then
+  echo "ERROR: could not pin Device start ticks after launch" >&2
+  exit 5
+fi
 
 deadline=$(( $(date +%s) + KVAF_H2D_RUN_TIMEOUT_SECONDS ))
-while kill -0 "${host_pid}" 2>/dev/null ||
-      kill -0 "${device_pid}" 2>/dev/null
+while process_is_running "${host_pid}" "${host_expected_start_ticks}" ||
+      process_is_running "${device_pid}" "${device_expected_start_ticks}"
 do
   if any_valid_fatal_marker || terminal_explicit_unsafe_proven; then
     record_quarantine "unsafe_provider_teardown"
