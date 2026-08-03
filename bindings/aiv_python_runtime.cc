@@ -325,11 +325,6 @@ class AivPythonRuntime final {
 }  // namespace
 
 void BindAivBatchGetPythonRuntime(py::module_& module) {
-  module.attr("AIV_BATCH_GET_STATUS_BYTES") = KVAF_AIV_BATCH_GET_STATUS_BYTES;
-  module.attr("AIV_BATCH_GET_QUEUE_STATE_BYTES") =
-      KVAF_AIV_BATCH_GET_QUEUE_STATE_BYTES;
-  module.attr("AIV_BATCH_GET_STATUS_MAGIC") = KVAF_AIV_BATCH_GET_STATUS_MAGIC;
-
   py::class_<AivPythonRuntime>(module, "AivBatchGetRuntime")
       .def(py::init<std::string, std::uint32_t, std::uint32_t>(),
            py::arg("kernel_object_path"), py::arg("device_id") = 0,

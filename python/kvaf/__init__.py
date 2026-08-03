@@ -25,9 +25,12 @@ access_operator = _native.access_operator
 
 if hasattr(_native, "AivBatchGetRuntime"):
     AivBatchGetRuntime = _native.AivBatchGetRuntime
-    AIV_BATCH_GET_STATUS_BYTES = _native.AIV_BATCH_GET_STATUS_BYTES
-    AIV_BATCH_GET_QUEUE_STATE_BYTES = _native.AIV_BATCH_GET_QUEUE_STATE_BYTES
-    AIV_BATCH_GET_STATUS_MAGIC = _native.AIV_BATCH_GET_STATUS_MAGIC
+    # These are fixed host/AIV ABI values from batch_get_abi.h. Keep them in
+    # Python instead of module-level C++ attribute assignment so the binding
+    # also loads with the target's pybind11 2.10.x / Python 3.13 combination.
+    AIV_BATCH_GET_STATUS_BYTES = 384
+    AIV_BATCH_GET_QUEUE_STATE_BYTES = 64
+    AIV_BATCH_GET_STATUS_MAGIC = 0x4B5641464247444F
 
 __all__ = [
     "AccessTable",
