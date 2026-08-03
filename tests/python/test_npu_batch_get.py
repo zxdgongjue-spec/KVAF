@@ -203,6 +203,8 @@ def main() -> int:
     device = f"npu:{device_id}"
     runtime = kvaf.NpuRuntime(str(kernel), device_id, npu_core_count)
     table = None
+    graph = None
+    graph_stream = None
     try:
         print(
             "RUNTIME_NPU_SPARSE_LAYOUT "
@@ -210,6 +212,13 @@ def main() -> int:
             f"active_percent={active_percent} active_requests={active_requests} "
             f"block_bytes={block_bytes} source_stride={source_stride}"
         )
+        if graph_replays:
+            # The demo uses one explicitly-created ACL stream for graph
+            # capture and replay. Create torch_npu's equivalent before
+            # Direct-HCCP output registration occurs.
+            print("RUNTIME_NPU_PHASE_BEGIN phase=graph_stream_create")
+            graph_stream = torch.npu.Stream(device=device_id)
+            print("RUNTIME_NPU_PHASE_DONE phase=graph_stream_create")
         print("RUNTIME_NPU_PHASE_BEGIN phase=runtime_initialize")
         runtime.initialize(ddr_bytes, source_stride)
         print(
@@ -432,18 +441,34 @@ def main() -> int:
                     print(f"RUNTIME_NPU_GRAPH_STAGE_OUTPUT_INDICES_DONE replay={trace}")
                 return graph_payload_slots, graph_output_indices
 
-            capture_stream = caller_stream
+            if graph_stream is None:
+                raise AssertionError("graph stream was not created")
+            capture_stream = graph_stream
             print("RUNTIME_NPU_PHASE_BEGIN phase=graph_object")
             graph = torch.npu.NPUGraph()
             print("RUNTIME_NPU_PHASE_DONE phase=graph_object")
             graph_payload_slots, graph_output_indices = prepare_graph_inputs(0)
+            capture_stream.wait_stream(caller_stream)
             capture_stream.synchronize()
             print("RUNTIME_NPU_PHASE_BEGIN phase=graph_capture")
             # output_a was already used by eager A -> B -> A above, so its
             # Direct-HCCP local HBM registration is cached before capture.
             # The external torch_npu graph owns capture, replay and lifetime.
-            with torch.npu.graph(graph, stream=capture_stream, capture_error_mode="relaxed"):
-                execute(output_a, capture_stream, synchronize=False)
+            try:
+                with torch.npu.graph(
+                    graph, stream=capture_stream, capture_error_mode="relaxed"
+                ):
+                    print("RUNTIME_NPU_GRAPH_CAPTURE_ENTERED")
+                    print("RUNTIME_NPU_GRAPH_CAPTURE_BATCH_GET_BEGIN")
+                    execute(output_a, capture_stream, synchronize=False)
+                    print("RUNTIME_NPU_GRAPH_CAPTURE_BATCH_GET_ENQUEUED")
+            except Exception as error:
+                print(
+                    "RUNTIME_NPU_GRAPH_CAPTURE_ERROR "
+                    f"type={type(error).__name__} message={error}",
+                    file=sys.stderr,
+                )
+                raise
             print("RUNTIME_NPU_PHASE_DONE phase=graph_capture owner=torch_npu")
 
             def replay_graph_on_capture_stream(trace: str | None = None) -> None:
@@ -464,6 +489,8 @@ def main() -> int:
                     replay, str(replay)
                 )
                 print(f"RUNTIME_NPU_GRAPH_REPLAY_BEGIN replay={replay}")
+                capture_stream.wait_stream(caller_stream)
+                print(f"RUNTIME_NPU_GRAPH_INPUT_WAIT_ENQUEUED replay={replay}")
                 replay_graph_on_capture_stream(str(replay))
                 capture_stream.synchronize()
                 print(f"RUNTIME_NPU_GRAPH_STREAM_DONE replay={replay}")
@@ -488,6 +515,7 @@ def main() -> int:
             print("RUNTIME_NPU_GRAPH_PERF_WARMUP_BEGIN")
             for warmup_iteration in range(graph_warmup):
                 prepare_graph_inputs(graph_replays + warmup_iteration)
+                capture_stream.wait_stream(caller_stream)
                 replay_graph_on_capture_stream()
                 capture_stream.synchronize()
                 graph_completed_batches += 1
@@ -503,6 +531,7 @@ def main() -> int:
                     final_graph_output_indices,
                 ) = prepare_graph_inputs(epoch)
                 begin = time.perf_counter()
+                capture_stream.wait_stream(caller_stream)
                 replay_graph_on_capture_stream()
                 capture_stream.synchronize()
                 graph_samples.append((time.perf_counter() - begin) * 1000.0)
@@ -538,9 +567,19 @@ def main() -> int:
                 f"useful_GiBps={graph_useful_gibps:.3f}"
             )
             graph.reset()
+            graph = None
         return 0
     finally:
         print("RUNTIME_NPU_PHASE_BEGIN phase=teardown")
+        if graph is not None:
+            try:
+                graph.reset()
+            except Exception as error:
+                print(
+                    "RUNTIME_NPU_GRAPH_RESET_ERROR "
+                    f"type={type(error).__name__} message={error}",
+                    file=sys.stderr,
+                )
         if table is not None and runtime.initialized:
             runtime.release_access_table(table)
         if runtime.initialized:
