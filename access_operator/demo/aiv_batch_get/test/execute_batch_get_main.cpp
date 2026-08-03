@@ -246,6 +246,7 @@ int main(int argc, char **argv) {
       output_bytes > std::numeric_limits<size_t>::max()) return 2;
 
   int exit_code = 1;
+  uint32_t device_count = 0U;
   aclrtStream stream = nullptr;
   void *source_ddr = nullptr;
   void *output_hbm = nullptr;
@@ -271,8 +272,24 @@ int main(int argc, char **argv) {
   std::vector<uint8_t> output(output_bytes);
   std::vector<double> elapsed_ms;
 
-  if (!CheckAcl(aclInit(nullptr), "aclInit") || !CheckAcl(aclrtSetDevice(options.device), "aclrtSetDevice") ||
-      !CheckAcl(aclrtCreateStream(&stream), "aclrtCreateStream")) goto cleanup;
+  std::cout << "PHASE_PROCESS_READY\n";
+  std::cout << "PHASE_RUNTIME_STEP_BEGIN step=aclInit\n";
+  if (!CheckAcl(aclInit(nullptr), "aclInit")) goto cleanup;
+  std::cout << "PHASE_RUNTIME_STEP_DONE step=aclInit\n";
+  std::cout << "PHASE_RUNTIME_STEP_BEGIN step=aclrtGetDeviceCount\n";
+  if (!CheckAcl(aclrtGetDeviceCount(&device_count), "aclrtGetDeviceCount") || device_count == 0U ||
+      options.device >= device_count) {
+    std::cerr << "[KVAF_EXECUTE] requested device=" << options.device
+              << " available_devices=" << device_count << '\n';
+    goto cleanup;
+  }
+  std::cout << "PHASE_RUNTIME_STEP_DONE step=aclrtGetDeviceCount count=" << device_count << '\n';
+  std::cout << "PHASE_RUNTIME_STEP_BEGIN step=aclrtSetDevice\n";
+  if (!CheckAcl(aclrtSetDevice(options.device), "aclrtSetDevice")) goto cleanup;
+  std::cout << "PHASE_RUNTIME_STEP_DONE step=aclrtSetDevice\n";
+  std::cout << "PHASE_RUNTIME_STEP_BEGIN step=aclrtCreateStream\n";
+  if (!CheckAcl(aclrtCreateStream(&stream), "aclrtCreateStream")) goto cleanup;
+  std::cout << "PHASE_RUNTIME_STEP_DONE step=aclrtCreateStream\n";
   std::cout << "PHASE_RUNTIME_READY device=" << options.device << '\n';
   if (!CheckAcl(aclrtMallocHost(&source_ddr, source_bytes), "aclrtMallocHost(source DDR)")) goto cleanup;
   source = static_cast<uint8_t *>(source_ddr);
@@ -524,6 +541,7 @@ int main(int argc, char **argv) {
   exit_code = 0;
 
 cleanup:
+  std::cout << "PHASE_TEARDOWN_BEGIN status=" << exit_code << '\n';
   if (graph_model != nullptr) (void)aclmdlRIDestroy(graph_model);
   if (registration != nullptr) KvafBatchGetUnregisterLocalDdr(registration);
   if (device_queue != nullptr) (void)aclrtFree(device_queue);
@@ -535,9 +553,17 @@ cleanup:
   if (device_address_table != nullptr) (void)aclrtFree(device_address_table);
   if (output_hbm != nullptr) (void)aclrtFree(output_hbm);
   if (source_ddr != nullptr) (void)aclrtFreeHost(source_ddr);
-  if (stream != nullptr) (void)aclrtDestroyStream(stream);
+  if (stream != nullptr) {
+    std::cout << "PHASE_RUNTIME_STEP_BEGIN step=aclrtDestroyStream\n";
+    (void)aclrtDestroyStream(stream);
+    std::cout << "PHASE_RUNTIME_STEP_DONE step=aclrtDestroyStream\n";
+  }
+  std::cout << "PHASE_RUNTIME_STEP_BEGIN step=aclrtResetDevice\n";
   (void)aclrtResetDevice(options.device);
+  std::cout << "PHASE_RUNTIME_STEP_DONE step=aclrtResetDevice\n";
+  std::cout << "PHASE_RUNTIME_STEP_BEGIN step=aclFinalize\n";
   (void)aclFinalize();
-  if (exit_code == 0) std::cout << "PHASE_TEARDOWN_DONE\n";
+  std::cout << "PHASE_RUNTIME_STEP_DONE step=aclFinalize\n";
+  std::cout << "PHASE_TEARDOWN_DONE status=" << exit_code << '\n';
   return exit_code;
 }
