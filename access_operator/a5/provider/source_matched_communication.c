@@ -1284,6 +1284,37 @@ static int kvaf_ub_create_local_resources_checked(
             "create_jfc", errno, EIO);
     }
 
+    /* Match the HCCP resource model at the public-URMA boundary: the receive
+     * resource belongs to the context, is created before any registered
+     * management Segment, and is subsequently shared by every Jetty in this
+     * context.  HCCP uses the same minimum depth as its shared JFC (64).
+     * Keeping this creation early also makes a CREATE_JFR failure independent
+     * of UMMU Segment-registration side effects and leaves fewer resources to
+     * unwind. */
+    jfr_cfg.depth = UB_MGMT_JFC_DEPTH;
+    jfr_cfg.trans_mode = URMA_TM_RM;
+    jfr_cfg.max_sge = 1;
+    jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
+    jfr_cfg.jfc = ctx->jfc;
+    jfr_cfg.token_value = g_ub_mgmt_token;
+    /* The public URMA wrapper can reject a request before dispatching into
+     * the checked UDMA provider.  Reset first so that such a failure cannot
+     * be paired with a previous create attempt's thread-local leaf. */
+    kvaf_udma_source_reset_jfr_failure();
+    errno = 0;
+    ctx->jfr = kvaf_udma_source_create_management_jfr(
+        ctx->urma_ctx, &jfr_cfg);
+    if (ctx->jfr == NULL) {
+        return kvaf_ub_jfr_creation_error(
+            "create_jfr", errno, EIO);
+    }
+    (void)fprintf(stderr,
+        "KVAF_URMA_MGMT_SHARED_JFR lifecycle=context-early "
+        "depth=%u role=%s policy=%s\n",
+        jfr_cfg.depth, cfg->dst_eid == NULL ? "server" : "client",
+        kvaf_udma_source_management_jfr_memory_policy());
+    (void)fflush(stderr);
+
     errno = 0;
     ctx->send_buf = (char *)memalign(
         UB_MGMT_SEG_ALIGN, UB_MGMT_MSG_MAX_SIZE);
@@ -1380,29 +1411,6 @@ static int kvaf_ub_create_local_resources_checked(
     jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
     jfs_cfg.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
     jfs_cfg.jfc = ctx->jfc;
-
-    jfr_cfg.depth = UB_MGMT_JFR_DEPTH;
-    jfr_cfg.trans_mode = URMA_TM_RM;
-    jfr_cfg.max_sge = 1;
-    jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
-    jfr_cfg.jfc = ctx->jfc;
-    jfr_cfg.token_value = g_ub_mgmt_token;
-    /* The public URMA wrapper can reject a request before dispatching into
-     * the checked UDMA provider.  Reset first so that such a failure cannot
-     * be paired with a previous create attempt's thread-local leaf. */
-    kvaf_udma_source_reset_jfr_failure();
-    errno = 0;
-    ctx->jfr = kvaf_udma_source_create_management_jfr(
-        ctx->urma_ctx, &jfr_cfg);
-    if (ctx->jfr == NULL) {
-        return kvaf_ub_jfr_creation_error(
-            "create_jfr", errno, EIO);
-    }
-    (void)fprintf(stderr,
-        "KVAF_URMA_MGMT_JFR_MEMORY_POLICY role=%s policy=%s\n",
-        cfg->dst_eid == NULL ? "server" : "client",
-        kvaf_udma_source_management_jfr_memory_policy());
-    (void)fflush(stderr);
 
     ctx->is_server = cfg->dst_eid == NULL;
     jetty_cfg.id = ctx->is_server ? cfg->dst_jetty_id : 0;

@@ -318,9 +318,10 @@ static int kvaf_create_direct_sq_checked(
     sq->sqe_bb_cnt = sqe_base_block_count;
     sq->max_sge_num = config->max_sge;
     sq->aligned_size = UDMA_HW_PAGE_SIZE;
-    return kvaf_udma_checked_alloc_queue_buffer(
+    return kvaf_udma_checked_alloc_queue_buffer_policy(
         sq, sqe_base_block_count * config->depth,
-        UDMA_JFS_WQEBB, UDMA_HW_PAGE_SIZE, true);
+        UDMA_JFS_WQEBB, UDMA_HW_PAGE_SIZE, true,
+        kvaf_udma_queue_memory_policy_for_context(sq->ctx));
 }
 
 static int kvaf_insert_jetty_table_checked(

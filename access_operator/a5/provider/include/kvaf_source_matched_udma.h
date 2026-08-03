@@ -291,12 +291,11 @@ void kvaf_udma_source_reset_jfr_failure(void);
 
 /*
  * Management JFRs retain the public URMA validation/refcount path.  The
- * Device provider supplies a one-call mapping policy for the management
- * JFR's RQ, index queue, and record DB.  Non-separated SVA uses the
- * known-working user-anonymous pinned family; separated SVA keeps the
- * official kernel-buffer family.  The sleep DB stays anonymous through the
- * normal payload path.  Host management and every ordinary/data JFR keep
- * AUTO.
+ * Device provider records the one-call management marker while the common
+ * context policy selects backing for every Device JFR and Jetty SQ.
+ * Non-separated SVA uses the known-working user-anonymous pinned family;
+ * separated SVA keeps the official kernel-buffer family.  The sleep DB stays
+ * anonymous through the normal payload path.  Host queues keep AUTO.
  */
 urma_jfr_t *kvaf_udma_source_create_management_jfr(
     urma_context_t *context, urma_jfr_cfg_t *config);

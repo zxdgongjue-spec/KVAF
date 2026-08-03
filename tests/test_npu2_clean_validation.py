@@ -114,6 +114,11 @@ class Npu2CleanValidationTests(unittest.TestCase):
             "udma_create_jfr",
             "function_graph",
             "set_graph_function",
+            "set_ftrace_filter",
+            "kvaf_trace_mode=function-filter",
+            "KVAF_JFR_TRACE_MODE=",
+            "FUNCTION_GRAPH_REJECTION=",
+            "neither a filtered function graph nor an instance-local function filter is usable",
             "KVAF_JFR_FUNCTION_GRAPH_ROOT=",
             "KVAF_JFR_FUNCTION_GRAPH_TAIL_BEGIN",
             "No hardware operation was attempted and no one-shot trace directory was consumed.",
@@ -121,6 +126,10 @@ class Npu2CleanValidationTests(unittest.TestCase):
             self.assertIn(required, trace)
         for forbidden in ("npu-smi set", "docker rm", "rm -f", "kill "):
             self.assertNotIn(forbidden, trace)
+        self.assertNotIn(
+            "tracefs instance control is not readable/writable",
+            trace,
+        )
 
     def run_preflight(self, **updates: str) -> subprocess.CompletedProcess[str]:
         bash = shutil.which("bash")

@@ -289,6 +289,28 @@ enum kvaf_udma_queue_memory_policy {
     KVAF_UDMA_QUEUE_MEMORY_USER_ANONYMOUS,
 };
 
+/* A5 Device/AICPU contexts without a separate SVA page table require the
+ * historical anonymous-and-pin queue family.  Once separate SVA is enabled,
+ * use the current UMDK kernel-buffer family.  Host queues retain the pinned
+ * UMDK AUTO behavior.  Resolve this in one place so management JFRs, data
+ * JFRs, and Jetty SQs cannot silently select different address domains. */
+static inline enum kvaf_udma_queue_memory_policy
+kvaf_udma_queue_memory_policy_for_context(
+    const struct udma_u_context *context)
+{
+#if defined(KVAF_UDMA_PROVIDER_ROLE_DEVICE)
+    if (context == NULL) {
+        return KVAF_UDMA_QUEUE_MEMORY_AUTO;
+    }
+    return context->sva_sep_mode_en ?
+        KVAF_UDMA_QUEUE_MEMORY_KERNEL_BUFFER :
+        KVAF_UDMA_QUEUE_MEMORY_USER_ANONYMOUS;
+#else
+    (void)context;
+    return KVAF_UDMA_QUEUE_MEMORY_AUTO;
+#endif
+}
+
 static inline int kvaf_udma_checked_alloc_queue_buffer_policy(
     struct udma_u_jetty_queue *queue, uint32_t max_entry_count,
     uint32_t base_block_size, uint32_t page_size, bool allocate_wrid,

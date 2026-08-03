@@ -459,6 +459,16 @@ class JfrFailureDiagnosticsTests(unittest.TestCase):
         self.assertIn("KVAF_UDMA_QUEUE_MEMORY_KERNEL_BUFFER", policy)
         self.assertIn("KVAF_UDMA_QUEUE_MEMORY_USER_ANONYMOUS", policy)
 
+        resolver = braced_body(
+            self.cleanup,
+            "kvaf_udma_queue_memory_policy_for_context(",
+        )
+        self.assertIn("KVAF_UDMA_PROVIDER_ROLE_DEVICE", resolver)
+        self.assertIn("context->sva_sep_mode_en", resolver)
+        self.assertIn("KVAF_UDMA_QUEUE_MEMORY_KERNEL_BUFFER", resolver)
+        self.assertIn("KVAF_UDMA_QUEUE_MEMORY_USER_ANONYMOUS", resolver)
+        self.assertIn("KVAF_UDMA_QUEUE_MEMORY_AUTO", resolver)
+
         allocator = braced_body(
             self.cleanup,
             "static inline int kvaf_udma_checked_alloc_queue_buffer_policy(",
@@ -550,6 +560,10 @@ class JfrFailureDiagnosticsTests(unittest.TestCase):
         )
         self.assertLess(validate_context, allocate_index)
         self.assertLess(validate_context, create_command)
+        self.assertIn(
+            "kvaf_udma_queue_memory_policy_for_context(udma_context)",
+            checked_create,
+        )
         self.assertRegex(
             checked_create,
             r"jfr_memory_policy\s*==\s*"
@@ -585,12 +599,9 @@ class JfrFailureDiagnosticsTests(unittest.TestCase):
         )
         self.assertIn("KVAF_UDMA_PROVIDER_ROLE_DEVICE", management_wrapper)
         self.assertIn(
-            "KVAF_UDMA_QUEUE_MEMORY_USER_ANONYMOUS", management_wrapper
+            "kvaf_udma_queue_memory_policy_for_context(",
+            management_wrapper,
         )
-        self.assertIn(
-            "KVAF_UDMA_QUEUE_MEMORY_KERNEL_BUFFER", management_wrapper
-        )
-        self.assertIn("sva_sep_mode_en", management_wrapper)
         self.assertEqual(management_wrapper.count("urma_create_jfr("), 2)
         self.assertGreaterEqual(
             management_wrapper.count(
@@ -619,7 +630,8 @@ class JfrFailureDiagnosticsTests(unittest.TestCase):
             management_create,
         )
         self.assertIn(
-            "KVAF_URMA_MGMT_JFR_MEMORY_POLICY", management_create
+            "KVAF_URMA_MGMT_SHARED_JFR lifecycle=context-early",
+            management_create,
         )
 
         data_create = braced_body(
@@ -630,11 +642,20 @@ class JfrFailureDiagnosticsTests(unittest.TestCase):
             "kvaf_udma_source_create_management_jfr(", data_create
         )
 
-        for source in (self.jfc, self.jetty):
-            self.assertIn("kvaf_udma_checked_alloc_queue_buffer(", source)
-            self.assertNotIn(
-                "kvaf_udma_checked_alloc_queue_buffer_policy(", source
-            )
+        self.assertIn("kvaf_udma_checked_alloc_queue_buffer(", self.jfc)
+        self.assertNotIn(
+            "kvaf_udma_checked_alloc_queue_buffer_policy(", self.jfc
+        )
+        direct_sq = braced_body(
+            self.jetty, "static int kvaf_create_direct_sq_checked("
+        )
+        self.assertIn(
+            "kvaf_udma_checked_alloc_queue_buffer_policy(", direct_sq
+        )
+        self.assertIn(
+            "kvaf_udma_queue_memory_policy_for_context(sq->ctx)",
+            direct_sq,
+        )
 
         cleanup = braced_body(
             self.jfr, "static int kvaf_cleanup_local_jfr_checked("
@@ -653,17 +674,17 @@ class JfrFailureDiagnosticsTests(unittest.TestCase):
         builder = read_source("scripts/build_a5_direct_urma_provider.sh")
         package = read_source("scripts/package_a5_direct_urma_aicpu.sh")
         contract = (
-            "management_device_jfr_memory_policy:"
+            "device_queue_memory_policy:"
             "sva-aware-anonymous-or-kernel-v1"
         )
         self.assertIn(contract, manifest)
         self.assertIn(
-            "management_device_jfr_memory_policy="
+            "device_queue_memory_policy="
             "sva-aware-anonymous-or-kernel-v1",
             builder,
         )
         self.assertIn(
-            "MANAGEMENT_DEVICE_JFR_MEMORY_POLICY="
+            "DEVICE_QUEUE_MEMORY_POLICY="
             "sva-aware-anonymous-or-kernel-v1",
             package,
         )

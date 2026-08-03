@@ -956,6 +956,10 @@ urma_jfr_t *kvaf_udma_create_jfr_checked(
             -1, EOPNOTSUPP, context, config);
         goto fail;
     }
+    if (jfr_memory_policy == KVAF_UDMA_QUEUE_MEMORY_AUTO) {
+        jfr_memory_policy =
+            kvaf_udma_queue_memory_policy_for_context(udma_context);
+    }
     jfr->rq.ctx = udma_context;
     jfr->rq.cstm = false;
     jfr->rq.sq_reserved = false;
@@ -1122,10 +1126,8 @@ urma_jfr_t *kvaf_udma_source_create_management_jfr(
         errno = EBUSY;
         return NULL;
     }
-    memory_policy = context != NULL &&
-        !to_udma_u_ctx(context)->sva_sep_mode_en ?
-        KVAF_UDMA_QUEUE_MEMORY_USER_ANONYMOUS :
-        KVAF_UDMA_QUEUE_MEMORY_KERNEL_BUFFER;
+    memory_policy = kvaf_udma_queue_memory_policy_for_context(
+        context == NULL ? NULL : to_udma_u_ctx(context));
     g_kvaf_next_jfr_memory_policy = memory_policy;
     jfr = urma_create_jfr(context, config);
     /* Public validation may reject the request before provider dispatch. */

@@ -1072,7 +1072,12 @@ AICPU stderr 未被完整转发，也能从 Device owner progress 恢复失败�
 `scripts/trace_a5_direct_urma_npu2_jfr_failure.sh`。脚本在消耗
 `boot-id + KVAF commit` 一次性身份前，要求 tracefs 独立 instance 和至少一个已加载的
 `uburma_cmd_create_jfr`、`ubcore_create_jfr`、`udma_create_jfr` 根符号。随后仅执行一轮
-zero-WQE，用 `function_graph` 保存原始 CREATE_JFR 的内核调用树/返回值，同时用
+zero-WQE。脚本优先用 `function_graph + set_graph_function` 保存原始 CREATE_JFR 的
+内核调用树/返回值；若厂商内核不允许在私有 instance 写 `set_graph_function`，则回退到
+同一私有 instance 的 `function + set_ftrace_filter`，只跟踪 UB/UDMA 与 page-pin 函数，
+仍保留有序调用路径和直接 caller，但不声称具有完整嵌套/返回值。两种模式都不修改
+top-level/global tracer；仅当两种 instance-local 过滤方式均不可用时才在硬件前退出。
+脚本同时用
 `journalctl` cursor（不可用时退化为只读 `dmesg`）保存同时间段内核日志。若 tracefs
 能力不足，脚本在任何硬件操作和一次性目录创建前退出，不会浪费该 commit 的实验。
 它拒绝已有 active/quarantine，不向 KVAF worker 发信号、不复位 NPU、不删除已有状态，
@@ -1086,8 +1091,8 @@ AICPU leaf 日志，不声称它们全部被压缩到 `reserved[9..10]`。该诊
 增加或重试 ioctl；原始路径仍只发送一次 `CREATE_JFR`，避免诊断改变硬件语义。
 若内核日志是 `failed to find jfc`，结合 creation-time handle/id/fd
 identity 修 JFC 所有权；若是 `in_len/in_addr`，修加载模块与固定 UAPI 配对；若是 pin
-失败，再评估 Host-owned resource owner。该证据出现前不引入 HCCP，因为当前失败仍
-早于 Jetty/TP/import 阶段。
+失败，再评估 Host-owned resource owner。当前失败仍早于 Jetty/TP/import 阶段，因此
+不能把 HCCP 的 Jetty/TP flag 当作此 `CREATE_JFR` 的直接修复。
 
 `aff4de9` 的证据只证明 hugepage 失败；`f465ef1` 把 Device 管理 RQ 改成
 `UDMA_MMAP_KERNEL_BUF` 后仍失败，证明不能把 index、record DB 或更上层
@@ -1095,18 +1100,35 @@ TLV/uobject/EID 检查排除。所提供的两个旧工作 UDMA userspace 实现
 record DB 使用 `MAP_PRIVATE|MAP_ANONYMOUS`，sleep DB 也使用匿名页；而 26.06 UMDK
 在引入 separate-page-table 支持时，把前三者改成 kernel buffer、只保留 sleep DB 匿名。
 
-因此 Device 管理 JFR 使用一次性、SVA-aware 的完整内存策略：若 context 的
-`sva_sep_mode_en=0`，RQ、index、record DB 采用旧工作实现已验证的 anonymous pinned
-family；若为 1，则保持官方 kernel-buffer family。sleep DB 继续走原 payload 匿名路径。
-Host 管理和所有普通/decode 数据面 JFR/JFC/Jetty 均保持 AUTO，不受该策略影响。错误串
-显式输出 `jfr_context_sva_separate` 和 `jfr_user_anonymous_memory`，避免再次因 compact
-flags 没有携带 bit 20 而误判。两种分支都保留当前 UAPI、64 位 JFC handle、
-`non_pin=0`、`dtu=0`，且仍只发送一次 CREATE_JFR。
+因此 Device 使用统一的 context/SVA-aware queue 策略：若 context 的
+`sva_sep_mode_en=0`，管理 JFR、decode 数据 JFR 的 RQ/index/record DB，以及管理/数据
+Jetty SQ 都采用旧工作实现已验证的 anonymous pinned family；若为 1，则全部保持官方
+kernel-buffer family。sleep DB 继续走原 payload 匿名路径，Host 保持 AUTO。策略只在
+`kvaf_udma_queue_memory_policy_for_context()` 解析，避免 zero-WQE 通过后数据面又悄悄
+切回另一地址域。错误串显式输出 `jfr_context_sva_separate` 和
+`jfr_user_anonymous_memory`，避免再次因 compact flags 没有携带 bit 20 而误判。两种
+分支都保留当前 UAPI、64 位 JFC handle、`non_pin=0`、`dtu=0`，且仍只发送一次
+CREATE_JFR。
 
 三类映射仍在 kernel JFR 删除后由原 checked `munmap` 状态机释放；anonymous record
 DB 使用独占页并拒绝复用已有不同 backing 的同类型页，防止管理策略污染随后数据面。
-若 CREATE_JFR 仍失败，应直接按同轮 function graph 判定失败位于 uburma TLV/JFC uobject、
-ubcore EID/trans-mode、RQ/index/DB pin 或 driver mailbox；在得到该证据前不引入 HCCP。
+管理 shared JFR 也按 HCCP 的 context 初始化顺序提前到 JFC 之后、任何 management
+Segment 注册之前创建，depth 与 shared JFC 一致为 64。Jetty 继续复用这个 JFR；销毁
+顺序仍是 Jetty -> shared JFR -> shared JFC -> context。该修改既减少失败时的回滚面，
+也排除同 context 中先注册 UMMU Segment 对 JFR pin 域的干扰。
+
+HCCP 能成功而 direct-UMDK 失败并不矛盾。HCCP 的 rdma_service 是长驻 owner：它用平台
+安装且与驱动配套的 `liburma.so.0` 在 context 初始化时创建普通 shared JFC/JFR；AIV 的
+DEV_USED Jetty 则另外走 `JETTY_MODE_USER_CTL_NORMAL`，由 HCCP/HAL 把 SQ/CQ/DB/UASID
+映射到 CP1。KVAF 当前失败的是短驻 AICPU 中 public `/dev/uburma` standalone
+`CREATE_JFR + pin` 路径，尚未到 Jetty。故 HCCP 成功证明硬件/EID 基础链路可用，但不
+证明这条 AICPU public-create 路径可用。
+
+若本轮统一内存策略、context-early shared JFR 后仍在同一个 `CREATE_JFR` 返回
+`EINVAL`，停止继续排列 depth/handle/hugepage/Jetty flag。下一实现应转为 checked
+user-control backend（custom RQ/index/SWDB、`CREATE_JFR_EX/CREATE_JETTY_EX`、完整 owner
+sidecar），或让 HCCP-style 长驻 bootstrap owner 只创建和映射控制面资源。两者都只把
+SQ/CQ/DB/UASID 描述符交给 AIV；decode 的 AIV+SIMT 直写数据面不经过 HCOMM/HCCP。
 
 数据面参数显式传入 `--share_jfr true`，不再依赖固定 perftest 在 capability check
 中把默认 `false` 隐式改写为 `true`。这保证后续 data Jetty 与 management Jetty

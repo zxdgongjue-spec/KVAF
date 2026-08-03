@@ -24,6 +24,9 @@ kvaf_container=vllm-ascend-cs-kvaf
 kvaf_state_root=/data/.kvaf-state/KVAF
 kvaf_trace_instance_dir=
 kvaf_function_graph=
+kvaf_trace_mode=
+kvaf_trace_filter_count=0
+kvaf_graph_rejection_reason=not-attempted
 
 kvaf_finalize_tracefs_instance()
 {
@@ -46,11 +49,22 @@ kvaf_finalize_tracefs_instance()
     echo "ERROR: could not restore the KVAF instance tracer to nop" >&2
     cleanup_status=1
   fi
-  if [[ -w "${kvaf_trace_instance_dir}/set_graph_function" ]] &&
-     ! : >"${kvaf_trace_instance_dir}/set_graph_function"; then
-    echo "ERROR: could not clear the KVAF graph-function filter" >&2
-    cleanup_status=1
-  fi
+  case "${kvaf_trace_mode}" in
+    function-graph)
+      if ! { : >"${kvaf_trace_instance_dir}/set_graph_function"; } \
+          2>/dev/null; then
+        echo "ERROR: could not clear the KVAF graph-function filter" >&2
+        cleanup_status=1
+      fi
+      ;;
+    function-filter)
+      if ! { : >"${kvaf_trace_instance_dir}/set_ftrace_filter"; } \
+          2>/dev/null; then
+        echo "ERROR: could not clear the KVAF function filter" >&2
+        cleanup_status=1
+      fi
+      ;;
+  esac
   if rmdir -- "${kvaf_trace_instance_dir}"; then
     kvaf_trace_instance_dir=
   else
@@ -173,55 +187,175 @@ kvaf_trace_instance_dir=${kvaf_trace_instance_candidate}
 for kvaf_trace_control in \
   tracing_on \
   current_tracer \
-  set_graph_function \
-  max_graph_depth \
   trace
 do
-  if [[ ! -r "${kvaf_trace_instance_dir}/${kvaf_trace_control}" ||
-        ! -w "${kvaf_trace_instance_dir}/${kvaf_trace_control}" ]]; then
-    echo "ERROR: tracefs instance control is not readable/writable: ${kvaf_trace_control}" >&2
+  if [[ ! -r "${kvaf_trace_instance_dir}/${kvaf_trace_control}" ]]; then
+    echo "ERROR: tracefs instance control is not readable: ${kvaf_trace_control}" >&2
     echo "No hardware operation was attempted and no one-shot trace directory was consumed." >&2
     exit 2
   fi
 done
+
+kvaf_available_tracers=${kvaf_trace_instance_dir}/available_tracers
+if [[ ! -r "${kvaf_available_tracers}" ]]; then
+  kvaf_available_tracers=${kvaf_tracefs}/available_tracers
+fi
+
+kvaf_try_function_graph()
+{
+  if [[ ! -r "${kvaf_available_tracers}" ]] ||
+     ! grep -qw function_graph "${kvaf_available_tracers}"; then
+    kvaf_graph_rejection_reason=function-graph-tracer-unavailable
+    return 1
+  fi
+  if [[ ! -e "${kvaf_trace_instance_dir}/set_graph_function" ]]; then
+    kvaf_graph_rejection_reason=set-graph-function-absent
+    return 1
+  fi
+  if ! { : >"${kvaf_trace_instance_dir}/set_graph_function"; } \
+      2>/dev/null; then
+    kvaf_graph_rejection_reason=set-graph-function-not-writable
+    return 1
+  fi
+  if ! printf 'function_graph\n' \
+      >"${kvaf_trace_instance_dir}/current_tracer" 2>/dev/null; then
+    kvaf_graph_rejection_reason=function-graph-activation-failed
+    return 1
+  fi
+  if ! printf '%s\n' "${kvaf_trace_root_symbol}" \
+      >"${kvaf_trace_instance_dir}/set_graph_function" 2>/dev/null; then
+    kvaf_graph_rejection_reason=set-graph-function-write-failed
+    printf 'nop\n' >"${kvaf_trace_instance_dir}/current_tracer" || true
+    return 1
+  fi
+  if [[ -e "${kvaf_trace_instance_dir}/max_graph_depth" ]] &&
+     ! printf '16\n' \
+       >"${kvaf_trace_instance_dir}/max_graph_depth" 2>/dev/null; then
+    echo "WARNING: optional max_graph_depth control is unavailable" >&2
+  fi
+  if [[ "$(tr -d '[:space:]' \
+          <"${kvaf_trace_instance_dir}/current_tracer")" != function_graph ]] ||
+     ! awk -v wanted="${kvaf_trace_root_symbol}" \
+         '$1 == wanted { found = 1 } END { exit !found }' \
+         "${kvaf_trace_instance_dir}/set_graph_function"; then
+    kvaf_graph_rejection_reason=function-graph-verification-failed
+    printf 'nop\n' >"${kvaf_trace_instance_dir}/current_tracer" || true
+    return 1
+  fi
+  kvaf_trace_mode=function-graph
+  kvaf_trace_filter_count=1
+  kvaf_graph_rejection_reason=none
+  return 0
+}
+
+kvaf_try_function_filter()
+{
+  local filter_file=${kvaf_trace_instance_dir}/set_ftrace_filter
+  local filter_symbol=
+
+  if [[ ! -r "${kvaf_available_tracers}" ]] ||
+     ! grep -qw function "${kvaf_available_tracers}"; then
+    return 1
+  fi
+  [[ -e "${filter_file}" ]] || return 1
+  if ! { : >"${filter_file}"; } 2>/dev/null; then
+    return 1
+  fi
+
+  # A vendor kernel may expose function_graph but make set_graph_function
+  # read-only in non-top-level trace arrays.  The ordinary function tracer
+  # still accepts an independent per-instance filter.  Select the complete
+  # UB/UDMA family plus page-pinning leaves so the ordered call path and each
+  # function's direct caller remain visible without tracing the whole kernel.
+  # Install one exact symbol per write: vendor tracefs parsers commonly cap a
+  # control write at PAGE_SIZE, while the complete module list may exceed it.
+  if ! printf '%s\n' "${kvaf_trace_root_symbol}" \
+      >"${filter_file}" 2>/dev/null; then
+    return 1
+  fi
+  kvaf_trace_filter_count=1
+  while read -r filter_symbol _; do
+    [[ -n "${filter_symbol}" ]] || continue
+    [[ "${filter_symbol}" != "${kvaf_trace_root_symbol}" ]] || continue
+    if [[ "${filter_symbol}" =~ ^(uburma|ubcore|udma|hns3_udma|ummu)_ ]] ||
+       [[ "${filter_symbol}" =~ ^(pin_user_pages|unpin_user_pages?|get_user_pages|internal_get_user_pages_fast|gup_fast_fallback)(_|\.|$) ]]; then
+      if ! printf '%s\n' "${filter_symbol}" \
+          >>"${filter_file}" 2>/dev/null; then
+        return 1
+      fi
+      ((kvaf_trace_filter_count += 1))
+    fi
+  done <"${kvaf_tracefs}/available_filter_functions"
+  if ! awk -v wanted="${kvaf_trace_root_symbol}" \
+      '$1 == wanted { found = 1 } END { exit !found }' \
+      "${filter_file}"; then
+    return 1
+  fi
+  if (( kvaf_trace_filter_count < 1 )); then
+    return 1
+  fi
+  if ! printf 'function\n' \
+      >"${kvaf_trace_instance_dir}/current_tracer" 2>/dev/null; then
+    return 1
+  fi
+  if [[ "$(tr -d '[:space:]' \
+          <"${kvaf_trace_instance_dir}/current_tracer")" != function ]]; then
+    printf 'nop\n' >"${kvaf_trace_instance_dir}/current_tracer" || true
+    return 1
+  fi
+  kvaf_trace_mode=function-filter
+  return 0
+}
+
 printf '0\n' >"${kvaf_trace_instance_dir}/tracing_on"
-printf 'function_graph\n' >"${kvaf_trace_instance_dir}/current_tracer"
-printf '%s\n' "${kvaf_trace_root_symbol}" \
-  >"${kvaf_trace_instance_dir}/set_graph_function"
-printf '16\n' >"${kvaf_trace_instance_dir}/max_graph_depth"
-if [[ -r "${kvaf_trace_instance_dir}/trace_options" &&
-      -w "${kvaf_trace_instance_dir}/trace_options" ]]; then
-  for kvaf_graph_option in \
-    funcgraph-proc \
-    funcgraph-duration \
-    funcgraph-abstime \
-    funcgraph-retval
-  do
-    if grep -qw -- "${kvaf_graph_option}" \
+printf 'nop\n' >"${kvaf_trace_instance_dir}/current_tracer"
+if ! kvaf_try_function_graph; then
+  printf 'nop\n' >"${kvaf_trace_instance_dir}/current_tracer" || true
+  if [[ -e "${kvaf_trace_instance_dir}/set_graph_function" ]]; then
+    { : >"${kvaf_trace_instance_dir}/set_graph_function"; } \
+      2>/dev/null || true
+  fi
+  if ! kvaf_try_function_filter; then
+    echo "ERROR: neither a filtered function graph nor an instance-local function filter is usable" >&2
+    echo "FUNCTION_GRAPH_REJECTION=${kvaf_graph_rejection_reason}" >&2
+    echo "No hardware operation was attempted and no one-shot trace directory was consumed." >&2
+    exit 2
+  fi
+  echo "WARNING: filtered function_graph unavailable; using the instance-local function tracer" >&2
+  echo "FUNCTION_GRAPH_REJECTION=${kvaf_graph_rejection_reason}" >&2
+fi
+
+if [[ -r "${kvaf_trace_instance_dir}/trace_options" ]]; then
+  kvaf_trace_options=(context-info record-cmd print-parent sym-offset)
+  if [[ "${kvaf_trace_mode}" == function-graph ]]; then
+    kvaf_trace_options+=(
+      funcgraph-proc
+      funcgraph-duration
+      funcgraph-abstime
+      funcgraph-retval
+    )
+  fi
+  for kvaf_trace_option in "${kvaf_trace_options[@]}"; do
+    if grep -qw -- "${kvaf_trace_option}" \
          "${kvaf_trace_instance_dir}/trace_options" ||
-       grep -qw -- "no${kvaf_graph_option}" \
+       grep -qw -- "no${kvaf_trace_option}" \
          "${kvaf_trace_instance_dir}/trace_options"; then
-      if ! printf '%s\n' "${kvaf_graph_option}" \
-          >"${kvaf_trace_instance_dir}/trace_options"; then
-        echo "WARNING: optional trace option unavailable: ${kvaf_graph_option}" >&2
+      if ! printf '%s\n' "${kvaf_trace_option}" \
+          >"${kvaf_trace_instance_dir}/trace_options" 2>/dev/null; then
+        echo "WARNING: optional trace option unavailable: ${kvaf_trace_option}" >&2
       fi
     fi
   done
-fi
-if [[ "$(tr -d '[:space:]' \
-        <"${kvaf_trace_instance_dir}/current_tracer")" != function_graph ]] ||
-   ! awk -v wanted="${kvaf_trace_root_symbol}" \
-       '$1 == wanted { found = 1 } END { exit !found }' \
-       "${kvaf_trace_instance_dir}/set_graph_function"; then
-  echo "ERROR: function_graph root installation was not verified" >&2
-  echo "No hardware operation was attempted and no one-shot trace directory was consumed." >&2
-  exit 2
 fi
 # Prove that this private instance can toggle before the one-shot identity is
 # consumed.  Its tracer is filtered and no KVAF hardware process is running.
 printf '1\n' >"${kvaf_trace_instance_dir}/tracing_on"
 printf '0\n' >"${kvaf_trace_instance_dir}/tracing_on"
-: >"${kvaf_trace_instance_dir}/trace"
+if ! : >"${kvaf_trace_instance_dir}/trace"; then
+  echo "ERROR: the private trace buffer cannot be cleared" >&2
+  echo "No hardware operation was attempted and no one-shot trace directory was consumed." >&2
+  exit 2
+fi
 
 kvaf_trace_root=${kvaf_state_root}/diagnostics/jfr-create
 kvaf_trace_dir=${kvaf_trace_root}/${kvaf_boot_id}/${kvaf_commit}
@@ -253,7 +387,7 @@ if command -v journalctl >/dev/null 2>&1; then
 fi
 
 {
-  echo "schema=kvaf-a5-jfr-kernel-trace-v1"
+  echo "schema=kvaf-a5-jfr-kernel-trace-v2"
   echo "boot_id=${kvaf_boot_id}"
   echo "kvaf_commit=${kvaf_commit}"
   echo "started_at=${kvaf_start_wall}"
@@ -262,6 +396,9 @@ fi
   echo "physical_device_id=2"
   echo "journal_cursor=${kvaf_journal_cursor}"
   echo "tracefs=${kvaf_tracefs}"
+  echo "trace_mode=${kvaf_trace_mode}"
+  echo "trace_filter_count=${kvaf_trace_filter_count}"
+  echo "function_graph_rejection=${kvaf_graph_rejection_reason}"
   echo "function_graph_root=${kvaf_trace_root_symbol}"
   echo "function_graph_instance=${kvaf_trace_instance_name}"
 } >"${kvaf_metadata}"
@@ -269,6 +406,8 @@ fi
 echo "EXECUTION_ENV=SERVER_B_HOST"
 echo "KVAF_JFR_TRACE_DIR=${kvaf_trace_dir}"
 echo "KVAF_JFR_TRACE_STAGE=single-zero-wqe"
+echo "KVAF_JFR_TRACE_MODE=${kvaf_trace_mode}"
+echo "KVAF_JFR_TRACE_FILTER_COUNT=${kvaf_trace_filter_count}"
 echo "KVAF_JFR_FUNCTION_GRAPH_ROOT=${kvaf_trace_root_symbol}"
 printf '1\n' >"${kvaf_trace_instance_dir}/tracing_on"
 set +e

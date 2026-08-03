@@ -271,6 +271,21 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
                 "errno = 0;",
                 communication[max(0, operation_index - 120):operation_index],
             )
+        context_create = communication.index("urma_create_context(")
+        shared_jfr_create = communication.index(
+            "kvaf_udma_source_create_management_jfr("
+        )
+        first_segment_registration = communication.index("urma_register_seg(")
+        self.assertLess(context_create, shared_jfr_create)
+        self.assertLess(shared_jfr_create, first_segment_registration)
+        self.assertIn(
+            "jfr_cfg.depth = UB_MGMT_JFC_DEPTH;",
+            communication[context_create:first_segment_registration],
+        )
+        self.assertIn(
+            "KVAF_URMA_MGMT_SHARED_JFR lifecycle=context-early",
+            communication[context_create:first_segment_registration],
+        )
         helper_start = communication.index(
             "static int kvaf_ub_management_error("
         )
@@ -1135,7 +1150,14 @@ class SourceMatchedUdmaContractTests(unittest.TestCase):
         direct_create = jetty[jetty.index(
             "static int kvaf_create_direct_sq_checked("
         ):jetty.index("static int kvaf_cleanup_local_jetty_checked(")]
-        self.assertIn("kvaf_udma_checked_alloc_queue_buffer(", direct_create)
+        self.assertIn(
+            "kvaf_udma_checked_alloc_queue_buffer_policy(",
+            direct_create,
+        )
+        self.assertIn(
+            "kvaf_udma_queue_memory_policy_for_context(sq->ctx)",
+            direct_create,
+        )
         self.assertNotIn("udma_u_create_sq(", direct_create)
         self.assertIn("UINT32_MAX / config->depth", direct_create)
 
