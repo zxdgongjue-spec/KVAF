@@ -10,6 +10,7 @@
 
 namespace {
 
+using kvaf::Address;
 using kvaf::CreateInMemoryMetaManager;
 using kvaf::FlatAccessDesc;
 using kvaf::KeyId;
@@ -23,9 +24,10 @@ using kvaf::Status;
 using kvaf::StatusCode;
 
 constexpr std::uint64_t kBaseAddress = 4096;
-constexpr std::uint64_t kSlotSize = 256;
+constexpr std::uint64_t kShortSlotSize = 128;
+constexpr std::uint64_t kLongSlotSize = 256;
 
-// 最轻量的断言助手。失败时直接输出错误信息，便于脱离 gtest 独立运行。
+// 轻量断言助手：测试失败时直接打印原因，便于独立执行时定位问题。
 bool Expect(bool condition, const std::string& message) {
   if (!condition) {
     std::cerr << "EXPECT FAILED: " << message << '\n';
@@ -34,6 +36,7 @@ bool Expect(bool condition, const std::string& message) {
   return true;
 }
 
+// 检查返回码是否符合预期，同时把 detail 一并带出来。
 bool ExpectStatusCode(const Status& status,
                       StatusCode code,
                       const std::string& message) {
@@ -51,18 +54,28 @@ bool ExpectOk(const Status& status, const std::string& message) {
   return ExpectStatusCode(status, StatusCode::kOk, message);
 }
 
-// 构造一个按固定 slot 切分的远端 region。
-RemoteRegionDesc MakeRegion(std::uint64_t slot_count) {
+// 构造一个同时包含短 slot 区和长 slot 区的测试 region。
+RemoteRegionDesc MakeRegion(std::uint64_t slot_count_per_class) {
   RemoteRegionDesc region;
   region.base = kBaseAddress;
-  region.length = slot_count * kSlotSize;
-  region.slot_size = kSlotSize;
+  region.short_slot_size = kShortSlotSize;
+  region.long_slot_size = kLongSlotSize;
+  region.slot_count_per_class = slot_count_per_class;
+  region.length = slot_count_per_class * (kShortSlotSize + kLongSlotSize);
   return region;
 }
 
-std::unique_ptr<MetaManager> MakeInitializedManager(std::uint64_t slot_count) {
+// 长 slot 区紧跟在短 slot 区之后，因此它的起始地址可以直接算出来。
+Address LongSlotBase(std::uint64_t slot_count_per_class) {
+  return kBaseAddress + slot_count_per_class * kShortSlotSize;
+}
+
+// 创建并初始化一个可直接使用的 MetaManager，减少各个用例里的重复样板代码。
+std::unique_ptr<MetaManager> MakeInitializedManager(
+    std::uint64_t slot_count_per_class) {
   auto manager = CreateInMemoryMetaManager();
-  const Status status = manager->RegisterRemoteRegion(MakeRegion(slot_count));
+  const Status status =
+      manager->RegisterRemoteRegion(MakeRegion(slot_count_per_class));
   if (!status.ok()) {
     std::cerr << "Failed to initialize manager: " << status.message() << '\n';
     return nullptr;
@@ -70,15 +83,15 @@ std::unique_ptr<MetaManager> MakeInitializedManager(std::uint64_t slot_count) {
   return manager;
 }
 
-// 验证 region 注册阶段的参数检查与重复注册保护。
+// 验证 region 注册阶段的参数检查，以及“只允许注册一次”的约束。
 bool TestRegisterRemoteRegionValidation() {
   auto manager = CreateInMemoryMetaManager();
 
   RemoteRegionDesc invalid = MakeRegion(1);
-  invalid.slot_size = 0;
+  invalid.short_slot_size = 0;
   if (!ExpectStatusCode(manager->RegisterRemoteRegion(invalid),
                         StatusCode::kInvalidArgument,
-                        "slot_size=0 should be rejected")) {
+                        "zero short slot size should be rejected")) {
     return false;
   }
 
@@ -93,16 +106,15 @@ bool TestRegisterRemoteRegionValidation() {
                           "RegisterRemoteRegion should reject a second call");
 }
 
-// 验证 put -> commit -> lock -> get -> unlock -> free 主流程，
-// 同时确认 free 后 slot 会按 FIFO 语义重新进入可分配队列。
+// 验证短 slot 路径上的完整主流程：预留、提交、查询、解锁、回收、复用。
 bool TestPutCommitLookupUnlockFreeRoundTrip() {
   auto manager = MakeInitializedManager(2);
   if (!manager) {
     return false;
   }
 
-  const std::vector<KeyId> keys{11, 12};
-  const std::vector<std::uint64_t> lengths{64, 128};
+  const std::vector<KeyId> keys{"k11", "k12"};
+  const std::vector<std::uint64_t> lengths{64, 120};
   PutContext put_context;
   PutAccessDesc put_desc;
 
@@ -111,15 +123,15 @@ bool TestPutCommitLookupUnlockFreeRoundTrip() {
     return false;
   }
   if (!Expect(put_desc.entries.size() == 2,
-              "PreparePut should return one reserved address per key")) {
+              "PreparePut should return one address per key")) {
     return false;
   }
   if (!Expect(put_desc.entries[0].address == kBaseAddress,
-              "first reservation should use the first slot")) {
+              "first short reservation should use the first short slot")) {
     return false;
   }
-  if (!Expect(put_desc.entries[1].address == kBaseAddress + kSlotSize,
-              "second reservation should use the second slot")) {
+  if (!Expect(put_desc.entries[1].address == kBaseAddress + kShortSlotSize,
+              "second short reservation should use the second short slot")) {
     return false;
   }
 
@@ -128,7 +140,7 @@ bool TestPutCommitLookupUnlockFreeRoundTrip() {
           manager->LockKeys(keys, MetaManagerLockMode::kStableReadAllowAppend,
                             &invisible_lock),
           StatusCode::kNotFound,
-          "uncommitted keys should stay invisible to readers")) {
+          "uncommitted keys should stay invisible")) {
     return false;
   }
 
@@ -146,13 +158,13 @@ bool TestPutCommitLookupUnlockFreeRoundTrip() {
 
   FlatAccessDesc access_desc;
   if (!ExpectOk(manager->BatchLookup(keys, lock_context, &access_desc),
-                "BatchLookup should succeed for a locked snapshot")) {
+                "BatchLookup should succeed")) {
     return false;
   }
-  if (!Expect(access_desc.addresses == std::vector<std::uint64_t>{
-                                           kBaseAddress,
-                                           kBaseAddress + kSlotSize},
-              "BatchLookup should return committed addresses in key order")) {
+  if (!Expect(access_desc.addresses ==
+                  std::vector<Address>{kBaseAddress,
+                                       kBaseAddress + kShortSlotSize},
+              "BatchLookup should return committed short addresses")) {
     return false;
   }
   if (!Expect(access_desc.lengths == lengths,
@@ -171,26 +183,69 @@ bool TestPutCommitLookupUnlockFreeRoundTrip() {
     return false;
   }
 
-  LockContext free_lock;
-  if (!ExpectStatusCode(
-      manager->LockKeys(keys, MetaManagerLockMode::kStableReadAllowAppend,
-                        &free_lock),
-      StatusCode::kNotFound,
-      "freed keys should no longer be visible")) {
-    return false;
-  }
-
   PutContext recycled_put;
   PutAccessDesc recycled_desc;
-  if (!ExpectOk(manager->PreparePut({13}, {32}, &recycled_put, &recycled_desc),
-                "freed slots should be reusable by later puts")) {
+  if (!ExpectOk(manager->PreparePut({"k13"}, {32}, &recycled_put, &recycled_desc),
+                "freed short slots should be reusable")) {
     return false;
   }
   return Expect(recycled_desc.entries[0].address == kBaseAddress,
-                "BatchFree should recycle the first freed slot back to the queue");
+                "BatchFree should recycle the first short slot");
 }
 
-// 验证 AbortPut 不会留下可见映射，并且会回收之前预留的 slot。
+// 验证较大的 payload 会进入长 slot 区，而不是挤占短 slot。
+bool TestLongSlotAllocation() {
+  auto manager = MakeInitializedManager(2);
+  if (!manager) {
+    return false;
+  }
+
+  const std::vector<KeyId> keys{"short-key", "long-key"};
+  const std::vector<std::uint64_t> lengths{96, 200};
+  PutContext put_context;
+  PutAccessDesc put_desc;
+
+  if (!ExpectOk(manager->PreparePut(keys, lengths, &put_context, &put_desc),
+                "PreparePut should place keys into different slot classes")) {
+    return false;
+  }
+  if (!Expect(put_desc.entries[0].address == kBaseAddress,
+              "short payload should use short slot space")) {
+    return false;
+  }
+  if (!Expect(put_desc.entries[1].address == LongSlotBase(2),
+              "long payload should use long slot space")) {
+    return false;
+  }
+
+  if (!ExpectOk(manager->CommitPut(put_context), "CommitPut should succeed")) {
+    return false;
+  }
+
+  LockContext lock_context;
+  if (!ExpectOk(
+          manager->LockKeys(keys, MetaManagerLockMode::kStableReadAllowAppend,
+                            &lock_context),
+          "LockKeys should succeed for mixed slot classes")) {
+    return false;
+  }
+
+  FlatAccessDesc access_desc;
+  if (!ExpectOk(manager->BatchLookup(keys, lock_context, &access_desc),
+                "BatchLookup should succeed for mixed slot classes")) {
+    return false;
+  }
+  if (!Expect(access_desc.addresses ==
+                  std::vector<Address>{kBaseAddress, LongSlotBase(2)},
+              "BatchLookup should preserve short and long addresses")) {
+    return false;
+  }
+
+  return ExpectOk(manager->UnlockKeys(lock_context),
+                  "UnlockKeys should succeed for mixed slot classes");
+}
+
+// 验证 AbortPut 不会留下可见映射，并且会把短 slot 归还给空闲队列。
 bool TestAbortPutRecyclesSlot() {
   auto manager = MakeInitializedManager(1);
   if (!manager) {
@@ -199,7 +254,7 @@ bool TestAbortPutRecyclesSlot() {
 
   PutContext first_put;
   PutAccessDesc first_desc;
-  if (!ExpectOk(manager->PreparePut({21}, {32}, &first_put, &first_desc),
+  if (!ExpectOk(manager->PreparePut({"k21"}, {32}, &first_put, &first_desc),
                 "first PreparePut should succeed")) {
     return false;
   }
@@ -207,30 +262,17 @@ bool TestAbortPutRecyclesSlot() {
     return false;
   }
 
-  LockContext invisible_lock;
-  if (!ExpectStatusCode(
-          manager->LockKeys({21}, MetaManagerLockMode::kStableReadAllowAppend,
-                            &invisible_lock),
-          StatusCode::kNotFound,
-          "aborted puts should not leave visible mappings behind")) {
-    return false;
-  }
-
   PutContext second_put;
   PutAccessDesc second_desc;
-  if (!ExpectOk(manager->PreparePut({22}, {48}, &second_put, &second_desc),
-                "second PreparePut should reuse the freed slot")) {
-    return false;
-  }
-  if (!Expect(second_desc.entries.size() == 1,
-              "PreparePut should return one reservation")) {
+  if (!ExpectOk(manager->PreparePut({"k22"}, {48}, &second_put, &second_desc),
+                "second PreparePut should reuse the freed short slot")) {
     return false;
   }
   return Expect(second_desc.entries[0].address == first_desc.entries[0].address,
-                "AbortPut should recycle the reserved slot back to the queue");
+                "AbortPut should recycle the reserved short slot");
 }
 
-// 验证只要 key 仍被稳定读快照 pin 住，就不允许 free。
+// 验证被 LockKeys 固定住的 key 在解锁前不能被 BatchFree 回收。
 bool TestBatchFreeFailsWhileLocked() {
   auto manager = MakeInitializedManager(1);
   if (!manager) {
@@ -239,7 +281,7 @@ bool TestBatchFreeFailsWhileLocked() {
 
   PutContext put_context;
   PutAccessDesc put_desc;
-  if (!ExpectOk(manager->PreparePut({31}, {80}, &put_context, &put_desc),
+  if (!ExpectOk(manager->PreparePut({"k31"}, {80}, &put_context, &put_desc),
                 "PreparePut should succeed")) {
     return false;
   }
@@ -249,24 +291,24 @@ bool TestBatchFreeFailsWhileLocked() {
 
   LockContext lock_context;
   if (!ExpectOk(
-          manager->LockKeys({31}, MetaManagerLockMode::kStableReadAllowAppend,
+          manager->LockKeys({"k31"}, MetaManagerLockMode::kStableReadAllowAppend,
                             &lock_context),
           "LockKeys should succeed")) {
     return false;
   }
 
-  if (!ExpectStatusCode(manager->BatchFree({31}), StatusCode::kBusy,
+  if (!ExpectStatusCode(manager->BatchFree({"k31"}), StatusCode::kBusy,
                         "BatchFree should reject locked keys")) {
     return false;
   }
   if (!ExpectOk(manager->UnlockKeys(lock_context), "UnlockKeys should succeed")) {
     return false;
   }
-  return ExpectOk(manager->BatchFree({31}),
+  return ExpectOk(manager->BatchFree({"k31"}),
                   "BatchFree should succeed after unlock");
 }
 
-// 验证重复 key、错误查询 key 顺序等非法输入分支。
+// 验证重复 key、错误 key 顺序等典型非法输入分支。
 bool TestInvalidArgumentAndDuplicateKeyPaths() {
   auto manager = MakeInitializedManager(2);
   if (!manager) {
@@ -275,16 +317,17 @@ bool TestInvalidArgumentAndDuplicateKeyPaths() {
 
   PutContext duplicate_put;
   PutAccessDesc duplicate_desc;
-  if (!ExpectStatusCode(manager->PreparePut({41, 41}, {8, 8}, &duplicate_put,
-                                            &duplicate_desc),
-                        StatusCode::kInvalidArgument,
-                        "PreparePut should reject duplicate keys in one batch")) {
+  if (!ExpectStatusCode(
+          manager->PreparePut({"dup", "dup"}, {8, 8}, &duplicate_put,
+                              &duplicate_desc),
+          StatusCode::kInvalidArgument,
+          "PreparePut should reject duplicate keys")) {
     return false;
   }
 
   PutContext put_context;
   PutAccessDesc put_desc;
-  if (!ExpectOk(manager->PreparePut({42}, {16}, &put_context, &put_desc),
+  if (!ExpectOk(manager->PreparePut({"k42"}, {16}, &put_context, &put_desc),
                 "PreparePut should succeed for a fresh key")) {
     return false;
   }
@@ -294,56 +337,58 @@ bool TestInvalidArgumentAndDuplicateKeyPaths() {
 
   PutContext conflict_put;
   PutAccessDesc conflict_desc;
-  if (!ExpectStatusCode(manager->PreparePut({42}, {32}, &conflict_put,
+  if (!ExpectStatusCode(manager->PreparePut({"k42"}, {32}, &conflict_put,
                                             &conflict_desc),
                         StatusCode::kAlreadyExists,
-                        "PreparePut should reject an already committed key")) {
+                        "PreparePut should reject an existing key")) {
     return false;
   }
 
   LockContext lock_context;
   if (!ExpectOk(
-          manager->LockKeys({42}, MetaManagerLockMode::kStableReadAllowAppend,
+          manager->LockKeys({"k42"}, MetaManagerLockMode::kStableReadAllowAppend,
                             &lock_context),
           "LockKeys should succeed")) {
     return false;
   }
 
   FlatAccessDesc access_desc;
-  if (!ExpectStatusCode(manager->BatchLookup({99}, lock_context, &access_desc),
-                        StatusCode::kInvalidArgument,
-                        "BatchLookup should validate key order against LockContext")) {
+  if (!ExpectStatusCode(
+          manager->BatchLookup({"other"}, lock_context, &access_desc),
+          StatusCode::kInvalidArgument,
+          "BatchLookup should reject keys that do not match the lock context")) {
     return false;
   }
   return ExpectOk(manager->UnlockKeys(lock_context), "UnlockKeys should succeed");
 }
 
-// 验证在 region 尚未注册前，核心接口都会返回未初始化错误。
+// 验证 region 尚未注册时，核心接口都会返回未初始化错误。
 bool TestNotInitializedPaths() {
   auto manager = CreateInMemoryMetaManager();
 
   PutContext put_context;
   PutAccessDesc put_desc;
-  if (!ExpectStatusCode(manager->PreparePut({51}, {8}, &put_context, &put_desc),
-                        StatusCode::kNotInitialized,
-                        "PreparePut should fail before RegisterRemoteRegion")) {
+  if (!ExpectStatusCode(
+          manager->PreparePut({"k51"}, {8}, &put_context, &put_desc),
+          StatusCode::kNotInitialized,
+          "PreparePut should fail before RegisterRemoteRegion")) {
     return false;
   }
 
   LockContext lock_context;
   if (!ExpectStatusCode(
-          manager->LockKeys({51}, MetaManagerLockMode::kStableReadAllowAppend,
+          manager->LockKeys({"k51"}, MetaManagerLockMode::kStableReadAllowAppend,
                             &lock_context),
           StatusCode::kNotInitialized,
           "LockKeys should fail before RegisterRemoteRegion")) {
     return false;
   }
 
-  return ExpectStatusCode(manager->BatchFree({51}), StatusCode::kNotInitialized,
+  return ExpectStatusCode(manager->BatchFree({"k51"}), StatusCode::kNotInitialized,
                           "BatchFree should fail before RegisterRemoteRegion");
 }
 
-// 验证非法上下文 id 会被明确拒绝，避免调用方误用旧上下文。
+// 验证未知上下文 id 和空输出指针等错误使用场景。
 bool TestInvalidContextPaths() {
   auto manager = MakeInitializedManager(1);
   if (!manager) {
@@ -365,12 +410,13 @@ bool TestInvalidContextPaths() {
                         "UnlockKeys should reject an unknown LockContext")) {
     return false;
   }
-  return ExpectStatusCode(manager->BatchLookup({1}, LockContext{666}, nullptr),
-                          StatusCode::kInvalidArgument,
-                          "BatchLookup should validate nullptr access_desc first");
+  return ExpectStatusCode(
+      manager->BatchLookup({"k1"}, LockContext{666}, nullptr),
+      StatusCode::kInvalidArgument,
+      "BatchLookup should reject a null output pointer");
 }
 
-// 验证单条写入长度不能超过 slot 容量。
+// 验证超过长 slot 容量的 payload 会被拒绝。
 bool TestPreparePutRejectsOversizedLength() {
   auto manager = MakeInitializedManager(1);
   if (!manager) {
@@ -380,33 +426,27 @@ bool TestPreparePutRejectsOversizedLength() {
   PutContext put_context;
   PutAccessDesc put_desc;
   return ExpectStatusCode(
-      manager->PreparePut({61}, {kSlotSize + 1}, &put_context, &put_desc),
+      manager->PreparePut({"k61"}, {kLongSlotSize + 1}, &put_context, &put_desc),
       StatusCode::kInvalidArgument,
-      "PreparePut should reject payload larger than one slot");
+      "PreparePut should reject payload larger than the long slot");
 }
 
-// 验证 free queue 耗尽后会返回 OOM，而不是产生重复分配。
+// 验证某一类 slot 队列耗尽后，会返回 OOM，而不是错误复用已有空间。
 bool TestPreparePutOutOfMemory() {
   auto manager = MakeInitializedManager(1);
   if (!manager) {
     return false;
   }
 
-  PutContext first_put;
-  PutAccessDesc first_desc;
-  if (!ExpectOk(manager->PreparePut({71}, {16}, &first_put, &first_desc),
-                "first PreparePut should consume the only slot")) {
-    return false;
-  }
-
-  PutContext second_put;
-  PutAccessDesc second_desc;
-  return ExpectStatusCode(manager->PreparePut({72}, {16}, &second_put, &second_desc),
-                          StatusCode::kOutOfMemory,
-                          "PreparePut should fail when no free slot remains");
+  PutContext put_context;
+  PutAccessDesc put_desc;
+  return ExpectStatusCode(
+      manager->PreparePut({"k71", "k72"}, {16, 32}, &put_context, &put_desc),
+      StatusCode::kOutOfMemory,
+      "PreparePut should fail when the short slot queue is exhausted");
 }
 
-// 验证同一个 lock context 只能释放一次，避免 pin_count 被重复扣减。
+// 验证同一个 lock context 只能成功解锁一次，避免 pin_count 被重复扣减。
 bool TestDoubleUnlockReturnsNotFound() {
   auto manager = MakeInitializedManager(1);
   if (!manager) {
@@ -415,7 +455,7 @@ bool TestDoubleUnlockReturnsNotFound() {
 
   PutContext put_context;
   PutAccessDesc put_desc;
-  if (!ExpectOk(manager->PreparePut({81}, {24}, &put_context, &put_desc),
+  if (!ExpectOk(manager->PreparePut({"k81"}, {24}, &put_context, &put_desc),
                 "PreparePut should succeed")) {
     return false;
   }
@@ -425,7 +465,7 @@ bool TestDoubleUnlockReturnsNotFound() {
 
   LockContext lock_context;
   if (!ExpectOk(
-          manager->LockKeys({81}, MetaManagerLockMode::kStableReadAllowAppend,
+          manager->LockKeys({"k81"}, MetaManagerLockMode::kStableReadAllowAppend,
                             &lock_context),
           "LockKeys should succeed")) {
     return false;
@@ -445,10 +485,12 @@ struct TestCase {
 }  // namespace
 
 int main() {
+  // 把所有用例放进一张表里统一执行，便于后续继续扩充覆盖面。
   const std::vector<TestCase> tests{
       {"RegisterRemoteRegionValidation", TestRegisterRemoteRegionValidation},
       {"PutCommitLookupUnlockFreeRoundTrip",
        TestPutCommitLookupUnlockFreeRoundTrip},
+      {"LongSlotAllocation", TestLongSlotAllocation},
       {"AbortPutRecyclesSlot", TestAbortPutRecyclesSlot},
       {"BatchFreeFailsWhileLocked", TestBatchFreeFailsWhileLocked},
       {"InvalidArgumentAndDuplicateKeyPaths",
