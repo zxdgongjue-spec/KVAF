@@ -118,8 +118,8 @@ raw `kvaf.AclGraph` 图模式：
 
 ```bash
 KVAF_NPU_GRAPH_REPLAYS=2 \
-KVAF_NPU_GRAPH_WARMUP=5 \
-KVAF_NPU_GRAPH_ITERATIONS=20 \
+KVAF_NPU_WARMUP=10 \
+KVAF_NPU_ITERATIONS=100 \
 # 其余 KVAF_RUN_NPU_TESTS / kernel / shape 环境变量与上例相同
 timeout 240s python3 tests/python/test_npu_batch_get.py
 ```
@@ -134,7 +134,11 @@ capture 中只 capture `runtime.batch_get(..., stream, synchronize=False)`。
 每次 replay 前，Python 在同一 ACL stream 上以
 `AclGraph.copy_host_to_device_async` 更新固定地址的 `address_table`、`indices`、
 `mask`、`output_indices`；capture 中的 BatchGet 参数和所有 NPU tensor 地址不变。正常
-性能口径是 `graph_input_update_to_stream_completion`，包含这四项 H2D 更新与 graph replay。
+性能口径是 `graph_replay_to_stream_completion`：四项 H2D 更新会在 replay 前完成并同步，
+不进入计时窗口；计时仅包含 graph replay 到同一 stream 完成，与 eager 的
+`runtime_batch_get_call_to_stream_completion` 口径对齐。默认 graph 的 warmup/iterations
+继承 `KVAF_NPU_WARMUP` / `KVAF_NPU_ITERATIONS`；仅在有意使用不同采样计划时设置
+`KVAF_NPU_GRAPH_WARMUP` / `KVAF_NPU_GRAPH_ITERATIONS` 覆盖。
 
 AIV demo 使用原生
 `aclrtMemcpyAsync(fixed_device_inputs, stream) -> aclmdlRIExecuteAsync(graph, stream)`。

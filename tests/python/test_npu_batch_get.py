@@ -151,8 +151,13 @@ def main() -> int:
     warmup = int(os.environ.get("KVAF_NPU_WARMUP", "1"))
     iterations = int(os.environ.get("KVAF_NPU_ITERATIONS", "5"))
     graph_replays = int(os.environ.get("KVAF_NPU_GRAPH_REPLAYS", "0"))
-    graph_warmup = int(os.environ.get("KVAF_NPU_GRAPH_WARMUP", "5"))
-    graph_iterations = int(os.environ.get("KVAF_NPU_GRAPH_ITERATIONS", "20"))
+    # Use the eager benchmark's sample plan by default.  This keeps the two
+    # result lines directly comparable; graph-specific values are only needed
+    # when a caller deliberately wants a different diagnostic sample plan.
+    graph_warmup = int(os.environ.get("KVAF_NPU_GRAPH_WARMUP", str(warmup)))
+    graph_iterations = int(
+        os.environ.get("KVAF_NPU_GRAPH_ITERATIONS", str(iterations))
+    )
     graph_stream_kind = os.environ.get("KVAF_NPU_GRAPH_STREAM_KIND", "torch").lower()
     graph_input_preflight_sync = (
         os.environ.get("KVAF_NPU_GRAPH_INPUT_PREFLIGHT_SYNC", "0") == "1"
@@ -588,10 +593,22 @@ def main() -> int:
             if graph_input_preflight_sync:
                 print("GRAPH_PERF_SKIPPED reason=input_preflight_sync_diagnostic")
             else:
+                print(
+                    "GRAPH_PERF_CONTRACT "
+                    "metric=graph_replay_to_stream_completion "
+                    "capture_excluded=1 input_updates_excluded=1 "
+                    "validation_excluded=1 "
+                    f"warmup={graph_warmup} samples={graph_iterations}"
+                )
                 print("RUNTIME_NPU_GRAPH_PERF_WARMUP_BEGIN")
                 for warmup_iteration in range(graph_warmup):
                     prepare_graph_inputs(graph_replays + warmup_iteration)
+                    # Input tensors are mutable graph inputs, not part of the
+                    # BatchGet measurement.  Complete their H2D update before
+                    # replaying the fixed graph so no copy time leaks into the
+                    # replay-to-completion interval below.
                     enqueue_graph_inputs()
+                    graph.synchronize(capture_stream)
                     replay_graph_on_capture_stream()
                     graph.synchronize(capture_stream)
                     graph_completed_batches += 1
@@ -601,10 +618,12 @@ def main() -> int:
                 for iteration in range(graph_iterations):
                     epoch = graph_replays + graph_warmup + iteration
                     prepare_graph_inputs(epoch)
-                    begin = time.perf_counter()
-                    # The measured graph step follows the AIV demo: H2D lookup
-                    # update, captured BatchGet execution, then stream completion.
                     enqueue_graph_inputs()
+                    graph.synchronize(capture_stream)
+                    # Match the eager metric: start after caller-side input
+                    # preparation is complete and measure only graph submission
+                    # through completion of the stream that executes BatchGet.
+                    begin = time.perf_counter()
                     replay_graph_on_capture_stream()
                     graph.synchronize(capture_stream)
                     graph_samples.append((time.perf_counter() - begin) * 1000.0)
@@ -633,7 +652,7 @@ def main() -> int:
                     active_requests * block_bytes / (1024.0**3) / (graph_mean_ms / 1000.0)
                 )
                 print(
-                    "GRAPH_PERF_RESULT metric=graph_input_update_to_stream_completion "
+                    "GRAPH_PERF_RESULT metric=graph_replay_to_stream_completion "
                     f"samples={graph_iterations} warmup_excluded={graph_warmup} "
                     f"active_requests={active_requests} block_bytes={block_bytes} "
                     f"npu_cores={npu_core_count} mean_ms={graph_mean_ms:.3f} "
