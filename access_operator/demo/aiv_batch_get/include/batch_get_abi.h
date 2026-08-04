@@ -22,6 +22,7 @@ typedef struct KvafBatchGetCoreStatus {
   uint64_t processed_request_count;
   uint64_t result;
   uint64_t completed_batch_count;
+  // With multiple Jettys these two diagnostic indices report Jetty 0.
   uint64_t sq_producer_index;
   uint64_t cq_consumer_index;
   uint64_t failed_request_index;
@@ -29,7 +30,8 @@ typedef struct KvafBatchGetCoreStatus {
   uint64_t reserved[40];
 } KvafBatchGetCoreStatus;
 
-// Persistent, AIV-owned software indices for one USER_CTL SQ/CQ pair.
+// Persistent, AIV-owned software indices for one USER_CTL SQ/CQ pair. Queue
+// arrays are core-major: [block_count][jettys_per_core].
 typedef struct KvafBatchGetQueueState {
   uint32_t magic;
   uint32_t initialized;
@@ -82,14 +84,15 @@ typedef struct KvafExecuteBatchGetKernelArgs {
   uint64_t output_indices;      // int32[request_capacity]
   uint64_t output;              // caller-owned HBM output; must match entity
   uint64_t core_status;         // KvafBatchGetCoreStatus[block_count]
-  uint64_t channel_entity;      // KvafBatchGetDirectUrmaEntity[block_count]
-  uint64_t queue_state;         // KvafBatchGetQueueState[block_count]
+  uint64_t channel_entity;      // Entity[block_count * jettys_per_core]
+  uint64_t queue_state;         // QueueState[block_count * jettys_per_core]
   uint32_t table_capacity;
   uint32_t request_capacity;
   uint32_t output_rows;
   uint32_t block_bytes;
   uint32_t block_count;
-  uint32_t reserved0;
+  // Zero preserves the phase-one ABI and selects one Jetty per AIV core.
+  uint32_t jettys_per_core;
 } KvafExecuteBatchGetKernelArgs;
 
 #if defined(__cplusplus)

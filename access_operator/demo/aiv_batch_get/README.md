@@ -33,11 +33,16 @@ transport:
 KvafBatchGetTransport *transport = nullptr;
 KvafBatchGetLocalBuffer *output_binding = nullptr;
 uint64_t entity = 0;
-KvafBatchGetTransportCreate(host_ddr, host_ddr_bytes, aiv_cores, 1, &transport);
+uint32_t jettys_per_core = 2;
+KvafBatchGetTransportCreate(host_ddr, host_ddr_bytes, aiv_cores,
+                            jettys_per_core, &transport);
 KvafBatchGetLocalBufferAcquire(transport, output_hbm, output_bytes,
                                &output_binding, &entity);
 args.output = reinterpret_cast<uint64_t>(output_hbm);
 args.channel_entity = entity;
+args.jettys_per_core = jettys_per_core;
+// args.queue_state points to a zero-initialized
+// KvafBatchGetQueueState[aiv_cores * jettys_per_core] array.
 // launch and synchronize the stream
 KvafBatchGetLocalBufferRelease(output_binding);
 KvafBatchGetTransportDestroy(transport);
@@ -54,8 +59,8 @@ addresses receive a new local MR and entity table but reuse the transport.
   UB-to-SQ copies, and scalar doorbells with two UB banks. It never uses MTE to
   dereference Host DDR.
 - `host/batch_get_host.cpp`: CPU/device EID discovery, Direct-HCCP transport,
-  Host-DDR registration, per-output HBM-MR cache, and one private USER_CTL
-  SQ/CQ/Jetty per AIV.
+  Host-DDR registration, per-output HBM-MR cache, and up to two private
+  USER_CTL SQ/CQ/Jettys per AIV.
 - `host/execute_batch_get_loader.cpp`: ACL binary load and AIV launch.
 - `test/execute_batch_get_main.cpp`: eager correctness/performance test and
   ACL graph capture/replay test. Every graph functional replay changes fixed
@@ -77,9 +82,13 @@ preserving the all-or-nothing safety rule for invalid table/output addresses.
 It then compacts the complete partition once into a 4096-entry UB active-ID
 array. The caller must guarantee that each AIV owns at most 4096 mask entries
 whose value is nonzero; the kernel verifies that bound before touching the SQ.
-Each 32-WQE post advances the persistent producer index and rings the doorbell;
-only the final READ requests a CQE. Persistent caller-owned SQ/CQ indices remain
-valid across eager calls and graph replays.
+The phase-two scheduler assigns complete 32-WQE posts to the core's Jettys in
+round-robin order. Each Jetty has an independent persistent SQ producer and CQ
+consumer index. Only the last READ assigned to each used Jetty requests a CQE;
+the kernel drains one CQE from every used Jetty before reporting the batch
+complete. This is required because a CQE on one Jetty does not fence READs
+submitted through another Jetty. A core with one post uses only Jetty 0, while
+the one-Jetty phase-one path remains selectable with `JETTYS_PER_CORE=1`.
 
 The ACL launcher explicitly reserves 128 KiB of AIV local memory for the two
 WQE banks and SIMT validation/compaction scratch.
@@ -106,15 +115,16 @@ If that header is absent from both the CANN toolkit and asc-devkit, install the
 asc-devkit package matching the target CANN version before building; mixing
 headers from a different CANN release is not supported.
 
-The eager default is 4096 requests of 1024 bytes, 4 KiB source stride, and
-four AIVs. Results are written beneath `results/`; `feedback.txt` contains
+The eager default is 4096 requests of 1024 bytes, 4 KiB source stride, four
+AIVs, and two Jettys per AIV. Results are written beneath `results/`;
+`feedback.txt` contains
 the outcome, key phase markers, run log, and any locally copied PLOG files.
 
 Useful overrides:
 
 ```bash
 DEVICE_ID=0 TABLE_CAPACITY=256 REQUESTS=10 OUTPUT_ROWS=200 \
-BLOCK_BYTES=1024 SOURCE_STRIDE=4096 AIV_CORES=1 MASK_EVERY=3 \
+BLOCK_BYTES=1024 SOURCE_STRIDE=4096 AIV_CORES=1 JETTYS_PER_CORE=2 MASK_EVERY=3 \
 WARMUP=1 ITERATIONS=1 bash scripts/run_execute_batch_get.sh
 
 # Proves TransportCreate -> Acquire(A) -> Acquire(B) -> re-Acquire(A), then
@@ -152,8 +162,9 @@ local HBM address/token match `args.output`; capture contains only the AIV
 kernel launch. One graph therefore serves replay-time changes to addresses,
 validity, request indices, mask and output rows. A different output allocation
 uses its own acquire result and graph instance; eager launches may select any
-cached acquire result at runtime. A capacity, block-size or AIV-count change
-also needs a new session/captured graph. After all stream work completes,
+cached acquire result at runtime. A capacity, block-size, AIV-count or
+Jetty-count change also needs a new session/captured graph. After all stream
+work completes,
 release local buffers before destroying the transport.
 
 ## Status
