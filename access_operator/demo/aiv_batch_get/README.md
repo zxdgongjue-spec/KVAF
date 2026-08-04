@@ -93,6 +93,19 @@ DEVICE_ID=0 bash scripts/run_execute_batch_get.sh
 DEVICE_ID=0 bash scripts/run_execute_batch_get_graph.sh
 ```
 
+The kernel uses the Ascend C SIMT API. The build automatically checks the
+toolkit's top-level `include/simt_api` directory and the older tikcpp layouts.
+If asc-devkit is installed separately, point the build at the directory that
+contains `simt_api/device_atomic_functions.h`:
+
+```bash
+ASCEND_SIMT_API_DIR=/path/to/asc-devkit/include bash scripts/build.sh
+```
+
+If that header is absent from both the CANN toolkit and asc-devkit, install the
+asc-devkit package matching the target CANN version before building; mixing
+headers from a different CANN release is not supported.
+
 The eager default is 4096 requests of 1024 bytes, 4 KiB source stride, and
 four AIVs. Results are written beneath `results/`; `feedback.txt` contains
 the outcome, key phase markers, run log, and any locally copied PLOG files.

@@ -21,6 +21,13 @@ if(NOT KVAF_KERNEL_OPERATOR_DIR)
 endif()
 
 find_path(KVAF_SIMT_API_DIR NAMES simt_api/device_atomic_functions.h HINTS
+  "$ENV{ASCEND_SIMT_API_DIR}"
+  "${ASCEND_CANN_PACKAGE_PATH}/include"
+  "${ASCEND_CANN_PACKAGE_PATH}/include/ascendc"
+  "${ASCEND_CANN_PACKAGE_PATH}/compiler/include"
+  "${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/include"
+  "${ASCEND_CANN_PACKAGE_PATH}/x86_64-linux/include"
+  "${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw/include"
   "${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw/lib"
   "${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw"
   "${ASCEND_CANN_PACKAGE_PATH}/tikcpp/tikcfw/lib"
@@ -28,8 +35,13 @@ find_path(KVAF_SIMT_API_DIR NAMES simt_api/device_atomic_functions.h HINTS
   "${ASCEND_CANN_PACKAGE_PATH}/include/tikcpp/tikcfw/lib"
   "${ASCEND_CANN_PACKAGE_PATH}/include/tikcpp/tikcfw")
 if(NOT KVAF_SIMT_API_DIR)
-  message(FATAL_ERROR "simt_api/device_atomic_functions.h not found under ${ASCEND_CANN_PACKAGE_PATH}")
+  message(FATAL_ERROR
+    "simt_api/device_atomic_functions.h was not found. Install the matching "
+    "CANN asc-devkit package, or set ASCEND_SIMT_API_DIR to the directory "
+    "that contains simt_api/device_atomic_functions.h. "
+    "ASCEND_CANN_PACKAGE_PATH=${ASCEND_CANN_PACKAGE_PATH}")
 endif()
+message(STATUS "BatchGet SIMT API root: ${KVAF_SIMT_API_DIR}")
 
 set(KVAF_KERNEL_INCLUDES
   "-I${KVAF_KERNEL_OPERATOR_DIR}"
