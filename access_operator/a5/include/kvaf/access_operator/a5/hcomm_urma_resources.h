@@ -69,6 +69,12 @@ class HcommUrmaResources {
   Status ImportMemory(const std::vector<std::uint8_t>& descriptor,
                       MemoryLocation expected_location,
                       ImportedMemoryView* view);
+
+  // Pure descriptor construction/ABI validation. This does not initialize
+  // ACL or call HCOMM, so callers can reject incompatible installed headers
+  // before allocating or registering resource-owning memory.
+  static Status ValidateChannelDescriptor(const EndpointSpec& peer,
+                                          ChannelRole role);
   Status CreateChannel(const EndpointSpec& peer, ChannelEngine engine,
                        ChannelRole role,
                        const std::string& channel_name = {});

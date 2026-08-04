@@ -127,6 +127,9 @@ class HccpAivChannelProbeContractTests(unittest.TestCase):
 
     def test_legacy_hcomm_qos_does_not_alias_ubc_queue_depth(self) -> None:
         hcomm = HCOMM_SOURCE.read_text(encoding="utf-8")
+        header = HCOMM_HEADER.read_text(encoding="utf-8")
+        source = SOURCE.read_text(encoding="utf-8")
+        main = source[source.index("int main(") :]
 
         self.assertIn("void SetDefaultQos(T* desc)", hcomm)
         self.assertIn(
@@ -134,13 +137,15 @@ class HccpAivChannelProbeContractTests(unittest.TestCase):
         )
         self.assertIn("desc->hccsAttr.qos = kDefaultQos;", hcomm)
         self.assertIn("Status ValidateLegacyUbcQueueDefaults", hcomm)
+        self.assertIn("Status PrepareChannelDescriptor", hcomm)
+        self.assertIn("ValidateChannelDescriptor", header)
         self.assertIn("COMM_PROTOCOL_UBC_CTP", hcomm)
         self.assertIn("COMM_PROTOCOL_UBC_TP", hcomm)
         self.assertIn(
             "first_union_word != std::numeric_limits<std::uint32_t>::max()",
             hcomm,
         )
-        self.assertIn("ValidateLegacyUbcQueueDefaults(desc)", hcomm)
+        self.assertIn("return ValidateLegacyUbcQueueDefaults(*desc);", hcomm)
         self.assertIn("refusing HcommChannelCreate before an HCOMM", hcomm)
         self.assertIn('"resource operation"', hcomm)
         self.assertNotIn(
@@ -148,6 +153,10 @@ class HccpAivChannelProbeContractTests(unittest.TestCase):
             "    desc->hccsAttr.qos = kDefaultQos;\n"
             "  }",
             hcomm,
+        )
+        self.assertIn("channel-descriptor-preflight-failed", main)
+        self.assertLess(
+            main.index("ValidateChannelDescriptor"), main.index("aclInit")
         )
 
     def test_runner_has_strict_safety_gates_but_no_worker_kill_path(self) -> None:

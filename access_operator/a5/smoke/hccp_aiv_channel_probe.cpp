@@ -1017,6 +1017,21 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  // Validate the exact HCOMM descriptor used below before either worker owns
+  // ACL, Host DDR, HBM, an endpoint, or an MR. In particular, old HCOMM
+  // headers share HCCS QoS and UBC queue fields in a union; a compatibility
+  // bug must be a preflight FAIL_SAFE result, never a retained-resource run.
+  const Status descriptor_status = options.role == "host"
+      ? HcommUrmaResources::ValidateChannelDescriptor(
+            MakeDeviceEndpoint(options), ChannelRole::kClient)
+      : HcommUrmaResources::ValidateChannelDescriptor(
+            MakeHostEndpoint(options), ChannelRole::kServer);
+  if (!CheckStatus(descriptor_status,
+                   "validate HCOMM UBC channel descriptor")) {
+    WriteEarlySafeFailure(options, "channel-descriptor-preflight-failed");
+    return 1;
+  }
+
   if (!CheckAcl(aclInit(nullptr), "aclInit")) {
     WriteEarlySafeFailure(options, "acl-init-failed");
     return 1;

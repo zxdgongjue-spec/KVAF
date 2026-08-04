@@ -301,6 +301,31 @@ Status BuildEndpointDesc(const EndpointSpec& spec, EndpointDesc* desc) {
   return Status::OK();
 }
 
+Status PrepareChannelDescriptor(const EndpointSpec& peer, ChannelRole role,
+                                HcommChannelDesc* desc) {
+  if (desc == nullptr) {
+    return Status::Error(StatusCode::kInvalidArgument,
+                         "HCOMM channel descriptor output is null");
+  }
+  const auto init_result = HcommChannelDescInit(desc, 1);
+  if (init_result != 0) {
+    return HcommFailure("HcommChannelDescInit", init_result);
+  }
+  auto status = BuildEndpointDesc(peer, &desc->remoteEndpoint);
+  if (!status.ok()) {
+    return status;
+  }
+  desc->notifyNum = 0;
+  desc->exchangeAllMems = true;
+  desc->memHandles = nullptr;
+  desc->memHandleNum = 0;
+  desc->role = role == ChannelRole::kClient ? HCOMM_SOCKET_ROLE_CLIENT
+                                            : HCOMM_SOCKET_ROLE_SERVER;
+  desc->port = 0;
+  SetDefaultQos(desc);
+  return ValidateLegacyUbcQueueDefaults(*desc);
+}
+
 }  // namespace
 
 struct HcommUrmaResources::Impl {
@@ -496,6 +521,12 @@ Status HcommUrmaResources::ImportMemory(
   return Status::OK();
 }
 
+Status HcommUrmaResources::ValidateChannelDescriptor(
+    const EndpointSpec& peer, ChannelRole role) {
+  HcommChannelDesc desc{};
+  return PrepareChannelDescriptor(peer, role, &desc);
+}
+
 Status HcommUrmaResources::CreateChannel(const EndpointSpec& peer,
                                          ChannelEngine engine,
                                          ChannelRole role,
@@ -506,23 +537,7 @@ Status HcommUrmaResources::CreateChannel(const EndpointSpec& peer,
   }
 
   HcommChannelDesc desc{};
-  const auto init_result = HcommChannelDescInit(&desc, 1);
-  if (init_result != 0) {
-    return HcommFailure("HcommChannelDescInit", init_result);
-  }
-  auto status = BuildEndpointDesc(peer, &desc.remoteEndpoint);
-  if (!status.ok()) {
-    return status;
-  }
-  desc.notifyNum = 0;
-  desc.exchangeAllMems = true;
-  desc.memHandles = nullptr;
-  desc.memHandleNum = 0;
-  desc.role = role == ChannelRole::kClient ? HCOMM_SOCKET_ROLE_CLIENT
-                                           : HCOMM_SOCKET_ROLE_SERVER;
-  desc.port = 0;
-  SetDefaultQos(&desc);
-  status = ValidateLegacyUbcQueueDefaults(desc);
+  auto status = PrepareChannelDescriptor(peer, role, &desc);
   if (!status.ok()) {
     return status;
   }
