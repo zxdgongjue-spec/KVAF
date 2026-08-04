@@ -80,6 +80,9 @@ class HcommUrmaResources {
                                AivDirectUrmaChannel* direct_channel) const;
 
   std::uint64_t channel() const;
+  // Retryable reverse teardown.  Channel destruction must succeed before any
+  // lower resource is touched; after that, independent imports/registrations
+  // are drained best-effort and failed handles remain owned for a later retry.
   Status Close();
 
  private:

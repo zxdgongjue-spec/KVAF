@@ -269,6 +269,23 @@ if(KVAF_A5_BUILD_HCOMM_BACKEND)
   target_link_libraries(kvaf_a5_aiv_urma_h2d_smoke PRIVATE
     ${KVAF_HCOMM_LIBRARY}
   )
+
+  # This deliberately contains no AIV kernel launch and creates no channel,
+  # Jetty, SQ, CQ or WQE.  It is the first hardware-bearing stage for the
+  # HCCP-backed resource lifecycle: Host DDR/HBM MR registration, descriptor
+  # export where applicable, and strict resource-before-memory teardown.
+  add_executable(kvaf_a5_hccp_resource_lifecycle_probe
+    src/host_ddr_mapping.cpp
+    src/hcomm_urma_resources.cpp
+    smoke/hccp_resource_lifecycle_probe.cpp
+  )
+  kvaf_configure_a5_host_target(kvaf_a5_hccp_resource_lifecycle_probe)
+  target_include_directories(kvaf_a5_hccp_resource_lifecycle_probe PRIVATE
+    ${KVAF_HCOMM_RESOURCE_INCLUDE_DIR}
+  )
+  target_link_libraries(kvaf_a5_hccp_resource_lifecycle_probe PRIVATE
+    ${KVAF_HCOMM_LIBRARY}
+  )
 endif()
 
 if(KVAF_A5_BUILD_DIRECT_URMA_BACKEND)

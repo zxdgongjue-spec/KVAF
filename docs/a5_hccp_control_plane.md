@@ -94,6 +94,45 @@ SDK 的 `ascend_hal.h`，会将 raw-HAL 声明面记为 `unavailable`，但仍�
 4. Host owner 的逐阶段 rollback 测试；
 5. 返回队列地址的只读验证方案。
 
+### 当前执行的第一阶段：公开 HCOMM resource ABI → HCCP
+
+当前服务器的 `libra.so` 已被发现，且 `RaCtx*` 符号完整；但 CANN 安装包没有提供
+`CtxInitCfg`、`CtxInitAttr`、`QpCreateInfo` 等 `RaCtx*` 参数/返回结构的公开头文件。
+这些定义只存在于 HCCP 源码树的内部 include 路径。符号存在不能证明结构体 layout、枚举值、
+padding 和 Device service package 与源码一致，因此 KVAF **不会**把源码私有头文件直接编进
+一个调用已安装 `libra.so` 的真机程序。
+
+第一条可执行阶段改为
+`scripts/run_a5_hccp_resource_lifecycle_probe.sh`。它使用当前安装 CANN 已提供、可用
+`hcomm_res.h` 编译校验的 resource C API 作为 HCCP bootstrap，按下面的有界流程执行：
+
+```text
+静态 library/header/symbol 审计
+  -> npu-smi 明确证明选定 NPU idle
+  -> 串行解析一个 Host/Device EID pair
+  -> host-ddr: HAL 分配+映射 DDR -> Endpoint -> MR register -> MR export
+  -> HCOMM/HCCP 资源 Close（重试） -> HAL unregister -> 释放 DDR
+```
+
+`device-hbm` 是第二个、独立的资源阶段：分配 Device HBM、Endpoint、MR register、
+resource Close、释放 HBM。两阶段都不会创建 channel/Jetty/SQ/CQ，不会提交 WQE，也不会运行
+AIV kernel。每个阶段必须输出 `KVAF_A5_HCCP_RESOURCE_LIFECYCLE_OK` 才允许进入下一个阶段。
+
+清理顺序是资源先于内存。若 `HcommMemUnreg` / endpoint destroy 无法在有限重试内证明成功，
+程序刻意保留可能仍被 DMA 引用的 mapping/backing，并输出
+`KVAF_A5_HCCP_RESOURCE_TEARDOWN_UNPROVEN`；它不会把 Host DDR/HBM 提前释放后继续测试。
+这不是 normal retry，后续 channel/WQE 阶段必须停止并保留结果目录用于诊断。
+
+只有资源和 backing 均已确认回收后，probe 才调用 `aclrtResetDevice` 释放**本进程**的
+ACL logical-device context，再调用 `aclFinalize`。这不是 `npu-smi set -t reset` 的物理卡
+复位；若 cleanup 未证明，二者均不会调用，避免 runtime teardown 抢先释放仍可能被 DMA
+引用的内存。
+
+因此当前 “使用 HCOMM” 的边界非常严格：它只替代没有公开 ABI 的 `RaCtx*` 调用，实际
+调用的仍是安装 CANN 配套 HCCP service；它绝不进入 AIV/SIMT 每次 decode H2D 的热路径。
+资源阶段通过后，下一步会增加两方 AIV channel 的无 WQE create/ready/snapshot/close，最后
+才打开可配置 descriptor batch 的 AIV+SIMT READ 数据面。
+
 ## 安装布局与控制面选择
 
 HCCP 源码中的 Host client 目标名为 `ra`，但其安装位置不在

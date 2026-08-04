@@ -49,14 +49,20 @@ cmake_args=(
 
 cmake "${cmake_args[@]}"
 cmake --build "${KVAF_A5_BUILD_DIR}" \
-  --target kvaf_a5_aiv_urma_h2d_smoke \
+  --target kvaf_a5_aiv_urma_h2d_smoke kvaf_a5_hccp_resource_lifecycle_probe \
   --parallel "${KVAF_A5_BUILD_JOBS}"
 
 binary="${KVAF_A5_BUILD_DIR}/access_operator/a5/kvaf_a5_aiv_urma_h2d_smoke"
+resource_probe="${KVAF_A5_BUILD_DIR}/access_operator/a5/kvaf_a5_hccp_resource_lifecycle_probe"
 if [[ ! -x "${binary}" ]]; then
   echo "ERROR: expected smoke binary is missing: ${binary}" >&2
+  exit 3
+fi
+if [[ ! -x "${resource_probe}" ]]; then
+  echo "ERROR: expected HCCP resource probe is missing: ${resource_probe}" >&2
   exit 3
 fi
 
 echo "KVAF_A5_AIV_URMA_BUILD_OK"
 echo "BINARY=${binary}"
+echo "HCCP_RESOURCE_PROBE=${resource_probe}"

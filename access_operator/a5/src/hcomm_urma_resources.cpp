@@ -707,41 +707,78 @@ Status HcommUrmaResources::Close() {
     return Status::OK();
   }
 
+  // Teardown is intentionally stateful and retryable.  A channel may still
+  // refer to every imported/local MR, so a failed channel destroy is the one
+  // dependency failure for which it is unsafe to attempt lower layers.  Once
+  // the channel is gone, independent imports and registrations are drained
+  // best-effort in reverse order; successful entries are forgotten while a
+  // failed entry stays owned by this object for a future Close retry.
   if (impl_->channel != 0) {
-    const auto result = HcommChannelDestroy(&impl_->channel, 1);
+    ChannelHandle destroying_channel = impl_->channel;
+    const auto result = HcommChannelDestroy(&destroying_channel, 1);
     if (result != 0) {
       return HcommFailure("HcommChannelDestroy", result);
     }
     impl_->channel = 0;
     impl_->channel_abi_header = {};
   }
+
+  Status first_failure = Status::OK();
+  auto remember_failure = [&first_failure](const char* operation,
+                                           std::int32_t result) {
+    if (first_failure.ok()) {
+      first_failure = HcommFailure(operation, result);
+    }
+  };
   if (impl_->endpoint != nullptr) {
-    while (!impl_->imported_descriptors.empty()) {
-      const auto& descriptor = impl_->imported_descriptors.back();
+    for (std::size_t index = impl_->imported_descriptors.size(); index != 0;) {
+      --index;
+      const auto& descriptor = impl_->imported_descriptors[index];
       const auto result =
           HcommMemUnimport(impl_->endpoint, descriptor.data(),
                            static_cast<std::uint32_t>(descriptor.size()));
       if (result != 0) {
-        return HcommFailure("HcommMemUnimport", result);
+        remember_failure("HcommMemUnimport", result);
+        continue;
       }
-      impl_->imported_descriptors.pop_back();
+      impl_->imported_descriptors.erase(
+          impl_->imported_descriptors.begin() + index);
     }
 
-    while (!impl_->registrations.empty()) {
+    // Do not unregister local memory until every remote import is gone.  The
+    // HCOMM API does not document whether a retained import can still use a
+    // local MR owned by the same endpoint.
+    if (!impl_->imported_descriptors.empty()) {
+      return first_failure;
+    }
+
+    for (std::size_t index = impl_->registrations.size(); index != 0;) {
+      --index;
       const auto result =
-          HcommMemUnreg(impl_->endpoint,
-                        impl_->registrations.back().handle);
+          HcommMemUnreg(impl_->endpoint, impl_->registrations[index].handle);
       if (result != 0) {
-        return HcommFailure("HcommMemUnreg", result);
+        remember_failure("HcommMemUnreg", result);
+        continue;
       }
-      impl_->registrations.pop_back();
+      impl_->registrations.erase(impl_->registrations.begin() + index);
+    }
+
+    // Endpoint destruction is last.  Retain it while any local registration
+    // has an unproven unregister result, rather than handing the caller a
+    // dangling HCOMM memory handle.
+    if (!impl_->registrations.empty()) {
+      return first_failure;
     }
 
     const auto result = HcommEndpointDestroy(impl_->endpoint);
     if (result != 0) {
-      return HcommFailure("HcommEndpointDestroy", result);
+      remember_failure("HcommEndpointDestroy", result);
+      return first_failure;
     }
     impl_->endpoint = nullptr;
+  }
+  if (!first_failure.ok()) {
+    return first_failure;
   }
   impl_->closed = true;
   return Status::OK();
