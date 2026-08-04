@@ -56,6 +56,35 @@ ALL_SYMBOLS = (
     "halMemBindSibling",
     "halResAddrMapV2",
     "halResAddrUnmapV2",
+    "RaCtxInit",
+    "RaCtxDeinit",
+    "RaCtxLmemRegister",
+    "RaCtxLmemUnregister",
+    "RaCtxRmemImport",
+    "RaCtxRmemUnimport",
+    "RaCtxChanCreate",
+    "RaCtxChanDestroy",
+    "RaCtxCqCreate",
+    "RaCtxCqDestroy",
+    "RaCtxQpCreate",
+    "RaCtxQpDestroy",
+    "RaCtxQpImport",
+    "RaCtxQpUnimport",
+    "RaCtxQpBind",
+    "RaCtxQpUnbind",
+    "RaCtxGetTpInfoList",
+    "RaCtxGetTpAttr",
+    "RaCtxSetTpAttr",
+    "RaInit",
+    "RaRdevGetHandle",
+    "RaRdevInitV2",
+    "RaAiQpCreate",
+    "RaQpDestroy",
+    "RaRegisterMr",
+    "RaDeregisterMr",
+    "RaMrReg",
+    "RaQpConnectAsync",
+    "RaGetQpStatus",
 )
 
 
@@ -65,12 +94,15 @@ class HccpHalCapabilityPreflightTests(unittest.TestCase):
         self.root = Path(self.tempdir.name) / "driver"
         self.header = self.root / "include" / "driver" / "ascend_hal.h"
         self.library = self.root / "lib64" / "driver" / "libascend_hal.so"
+        self.ra_library = self.root / "lib64" / "common" / "libra.so"
         self.bin_dir = Path(self.tempdir.name) / "bin"
         self.header.parent.mkdir(parents=True)
         self.library.parent.mkdir(parents=True)
+        self.ra_library.parent.mkdir(parents=True)
         self.bin_dir.mkdir()
         self.header.write_text(COMPLETE_HEADER, encoding="utf-8")
         self.library.write_bytes(b"not loaded by the preflight\n")
+        self.ra_library.write_bytes(b"not loaded by the preflight\n")
         self.nm = self.bin_dir / "kvaf-nm"
         self.write_nm(ALL_SYMBOLS)
 
@@ -132,6 +164,9 @@ class HccpHalCapabilityPreflightTests(unittest.TestCase):
         self.assertIn("-fsyntax-only", source)
         self.assertIn("--defined-only", source)
         self.assertIn("unproven-not-called", source)
+        self.assertIn("RaCtxQpCreate", source)
+        self.assertIn("RaAiQpCreate", source)
+        self.assertIn("host-owned-libra-init-aiv-direct-data-plane", source)
         self.assertIn("KVAF_HAL_PROBE_BASELINE", source)
         self.assertIn("UdmaVaInfo_private_payload", source)
         self.assertIn("hccp_hal_private_abi.h", probe)
@@ -168,18 +203,34 @@ class HccpHalCapabilityPreflightTests(unittest.TestCase):
             result.stdout,
         )
         self.assertIn("KVAF_HCCP_PRIVATE_PAYLOAD_PUBLIC_API=no", result.stdout)
+        self.assertIn(
+            "KVAF_HCCP_CONTROL_PLANE_CANDIDATE=libra-ra-ctx",
+            result.stdout,
+        )
+        self.assertIn(
+            "KVAF_A5_HCCP_CONTROL_PLANE_STATIC_AUDIT_OK", result.stdout
+        )
+        self.assertIn(
+            "KVAF_HCCP_RA_PRODUCT_MODE_SUPPORT="
+            "unproven-user-ctl-and-custom-sq-must-be-probed",
+            result.stdout,
+        )
 
-    def test_missing_library_symbol_fails_closed(self) -> None:
+    def test_missing_private_hal_symbol_is_reported_but_ra_audit_completes(self) -> None:
         self.write_nm(tuple(s for s in ALL_SYMBOLS if s != "halResAddrMapV2"))
         result = self.run_preflight()
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(
             "KVAF_HCCP_HAL_LIBRARY_SYMBOL_halResAddrMapV2=missing",
             result.stdout,
         )
         self.assertIn("KVAF_HCCP_HAL_SURFACE=incomplete", result.stdout)
-        self.assertNotIn("DECLARATION_PREFLIGHT_OK", result.stdout)
+        self.assertNotIn("HAL_DECLARATION_PREFLIGHT_OK", result.stdout)
         self.assertIn("KVAF_HCCP_BACKEND_READY=no", result.stdout)
+        self.assertIn(
+            "KVAF_HCCP_CONTROL_PLANE_CANDIDATE=libra-ra-ctx",
+            result.stdout,
+        )
 
     def test_missing_official_definition_fails_without_fallback_value(self) -> None:
         self.header.write_text(
@@ -189,7 +240,7 @@ class HccpHalCapabilityPreflightTests(unittest.TestCase):
             encoding="utf-8",
         )
         result = self.run_preflight()
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(
             "KVAF_HCCP_HAL_HEADER_CAPABILITY_"
             "RES_ADDR_TYPE_HCCP_URMA_JETTY=missing",
@@ -208,7 +259,7 @@ class HccpHalCapabilityPreflightTests(unittest.TestCase):
             encoding="utf-8",
         )
         result = self.run_preflight()
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(
             "KVAF_HCCP_HAL_HEADER_CAPABILITY_res_map_info_in=missing",
             result.stdout,
@@ -231,7 +282,7 @@ class HccpHalCapabilityPreflightTests(unittest.TestCase):
             encoding="utf-8",
         )
         result = self.run_preflight()
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(
             "KVAF_HCCP_HAL_HEADER_CAPABILITY_"
             "UdmaVaInfo_private_payload=missing",
@@ -239,9 +290,36 @@ class HccpHalCapabilityPreflightTests(unittest.TestCase):
         )
         self.assertIn(
             "KVAF_HCCP_PRIVATE_PAYLOAD_ABI="
-            "source-audited-layout-incompatible-with-selected-public-header",
+            "not-selected-for-primary-backend",
             result.stdout,
         )
+
+    def test_runtime_image_without_hal_header_still_audits_libra(self) -> None:
+        self.header.unlink()
+        result = self.run_preflight()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("KVAF_HCCP_HAL_HEADER=not-found", result.stdout)
+        self.assertIn(
+            "KVAF_HCCP_HAL_HEADER_SURFACE="
+            "unavailable-runtime-image-has-no-sdk-header",
+            result.stdout,
+        )
+        self.assertIn(
+            "KVAF_HCCP_CONTROL_PLANE_CANDIDATE=libra-ra-ctx",
+            result.stdout,
+        )
+        self.assertIn("KVAF_HCCP_BACKEND_READY=no", result.stdout)
+
+    def test_incomplete_ra_surface_is_inventory_not_hardware_authorization(self) -> None:
+        self.write_nm(tuple(s for s in ALL_SYMBOLS if not s.startswith("RaCtx")))
+        result = self.run_preflight()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("KVAF_HCCP_RA_CTX_SURFACE=incomplete", result.stdout)
+        self.assertIn(
+            "KVAF_HCCP_CONTROL_PLANE_CANDIDATE=libra-legacy-ai-qp",
+            result.stdout,
+        )
+        self.assertIn("KVAF_HCCP_BACKEND_READY=no", result.stdout)
 
     def test_unusable_header_is_reported_as_baseline_failure(self) -> None:
         self.header.write_text("#error broken installed header\n", encoding="utf-8")

@@ -25,8 +25,12 @@ Options:
   -h, --help         Show this help
 
 The audit is read-only apart from private temporary files.  It reports every
-matching archive member and exits nonzero for malformed inputs, inspection
-failures, or one runtime SONAME backed by more than one SHA256.
+matching archive member and exits nonzero for malformed inputs, strict KVAF
+target inspection failures, or one runtime SONAME backed by more than one
+SHA256.  A missing registry stanza marked optional is reported but is not an
+error.  A present CANN package that uses a vendor-private/unsupported container
+is reported as unaudited rather than guessed to be a conflict.  Candidate
+checks remain fail-closed when such an opaque registered package exists.
 EOF
 }
 
@@ -195,8 +199,10 @@ registry_sha256=$(audit_snapshot_regular \
 registered_packages_file="${audit_tmp_dir}/registered-packages.tsv"
 runtime_sonames_file="${audit_tmp_dir}/runtime-sonames.tsv"
 candidate_sonames_file="${audit_tmp_dir}/candidate-sonames.tsv"
+optional_missing_paths_file="${audit_tmp_dir}/optional-missing-paths"
 : >"${runtime_sonames_file}"
 : >"${candidate_sonames_file}"
+: >"${optional_missing_paths_file}"
 
 for candidate_binding in \
   ${candidate_soname_bindings[@]+"${candidate_soname_bindings[@]}"}; do
@@ -251,13 +257,21 @@ if ! awk '
                    /^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/ ||
                  index(package_path, "..") != 0) {
         report("unsafe package_path for " name ": " package_path)
+      } else if (optional_count > 1) {
+        report("tar.gz stanza contains duplicate optional values")
+      } else if (optional != "" && optional != "true" &&
+                 optional != "false") {
+        report("invalid optional value for " name ": " optional)
       } else {
-        print name "\t" package_path
+        if (optional == "") optional = "false"
+        print name "\t" package_path "\t" optional
       }
     }
     name = ""
     package_path = ""
     package_path_count = 0
+    optional = ""
+    optional_count = 0
     name_line = 0
   }
   {
@@ -276,6 +290,9 @@ if ! awk '
     } else if (key == "package_path" && name != "") {
       package_path = value
       package_path_count++
+    } else if (key == "optional" && name != "") {
+      optional = tolower(value)
+      optional_count++
     }
   }
   END {
@@ -321,14 +338,54 @@ join_values()
   ' "$1"
 }
 
+archive_container_hint()
+{
+  python3 -c '
+import sys
+
+path = sys.argv[1]
+with open(path, "rb") as stream:
+    prefix = stream.read(512)
+
+if prefix.startswith(b"\x1f\x8b"):
+    kind = "gzip"
+elif prefix.startswith(b"\xfd7zXZ\x00"):
+    kind = "xz"
+elif prefix.startswith(b"BZh"):
+    kind = "bzip2"
+elif prefix.startswith(b"\x28\xb5\x2f\xfd"):
+    kind = "zstd"
+elif prefix.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
+    kind = "zip"
+elif len(prefix) >= 262 and prefix[257:262] == b"ustar":
+    kind = "tar"
+else:
+    kind = "opaque"
+print(kind)
+' "$1"
+}
+
+is_strict_kvaf_archive()
+{
+  local package_name=$1
+  local archive_path=$2
+
+  [[ ${package_name} == *kvaf* ||
+     ( -n ${replace_archive} && ${archive_path} == "${replace_archive}" ) ]]
+}
+
 printf 'STATIC_AUDIT\tregistry=%s\tascend_home=%s\n' \
   "${registry_file}" "${ascend_home}"
 
 audit_errors=0
 registered_packages=0
 library_count=0
+optional_missing_count=0
+opaque_package_count=0
+unaudited_package_count=0
+candidate_unknown_count=0
 
-while IFS=$'\t' read -r package_name package_path; do
+while IFS=$'\t' read -r package_name package_path package_optional; do
   [[ -n ${package_name} && -n ${package_path} ]] || continue
   registered_packages=$((registered_packages + 1))
   normalized_package_path=${package_path}
@@ -344,6 +401,11 @@ while IFS=$'\t' read -r package_name package_path; do
   else
     archive_path="${ascend_home}/${package_name}"
   fi
+  strict_kvaf_archive=0
+  if is_strict_kvaf_archive "${package_name}" "${archive_path}"; then
+    strict_kvaf_archive=1
+  fi
+  package_library_count_before=${library_count}
   listing_file="${audit_tmp_dir}/archive-${registered_packages}.listing"
   candidates_file="${audit_tmp_dir}/archive-${registered_packages}.candidates"
   unique_candidates_file="${audit_tmp_dir}/archive-${registered_packages}.unique"
@@ -353,7 +415,20 @@ while IFS=$'\t' read -r package_name package_path; do
   : >"${aliases_file}"
   : >"${regular_identities_file}"
 
-  if [[ -L ${archive_path} || ! -f ${archive_path} || ! -r ${archive_path} ]]; then
+  if [[ -L ${archive_path} ]]; then
+    audit_error "registered archive path is a symlink: ${archive_path}"
+    audit_errors=$((audit_errors + 1))
+    continue
+  fi
+  if [[ ! -e ${archive_path} && ${package_optional} == true &&
+        ${strict_kvaf_archive} -eq 0 ]]; then
+    printf 'PACKAGE_UNAVAILABLE\tarchive_path=%s\tpackage_path=%s\tname=%s\toptional=true\treason=optional-missing\n' \
+      "${archive_path}" "${package_path}" "${package_name}"
+    printf '%s\n' "${archive_path}" >>"${optional_missing_paths_file}"
+    optional_missing_count=$((optional_missing_count + 1))
+    continue
+  fi
+  if [[ ! -f ${archive_path} || ! -r ${archive_path} ]]; then
     audit_error "registered archive is missing or unreadable: ${archive_path}"
     audit_errors=$((audit_errors + 1))
     continue
@@ -386,11 +461,42 @@ while IFS=$'\t' read -r package_name package_path; do
   printf 'PACKAGE\tarchive_path=%s\tarchive_sha256=%s\tpackage_path=%s\tname=%s\n' \
     "${archive_path}" "${archive_sha256}" "${package_path}" "${package_name}"
 
-  if ! tar -tzf "${archive_snapshot}" >"${listing_file}"; then
-    audit_error "registered archive is not a readable tar.gz: ${archive_path}"
+  container_hint=$(archive_container_hint "${archive_snapshot}") || {
+    audit_error "could not classify registered archive: ${archive_path}"
     audit_errors=$((audit_errors + 1))
     continue
+  }
+  listing_error_file="${listing_file}.stderr"
+  if ! tar -tf "${archive_snapshot}" >"${listing_file}" \
+       2>"${listing_error_file}"; then
+    if (( strict_kvaf_archive != 0 )); then
+      audit_error "strict KVAF archive is not a readable tar container: ${archive_path} container_hint=${container_hint}"
+      audit_errors=$((audit_errors + 1))
+      continue
+    fi
+    printf 'PACKAGE_UNAUDITED\tarchive_path=%s\tarchive_sha256=%s\tname=%s\tcontainer_hint=%s\treason=vendor-private-or-unsupported-container\n' \
+      "${archive_path}" "${archive_sha256}" "${package_name}" \
+      "${container_hint}"
+    unaudited_package_count=$((unaudited_package_count + 1))
+    if [[ ${container_hint} == opaque ]]; then
+      opaque_package_count=$((opaque_package_count + 1))
+    fi
+    if [[ -s ${candidate_sonames_file} ]]; then
+      printf 'CANDIDATE_UNAUDITED_SCOPE\tarchive_path=%s\tarchive_sha256=%s\tname=%s\tcontainer_hint=%s\n' \
+        "${archive_path}" "${archive_sha256}" "${package_name}" \
+        "${container_hint}" >&2
+      candidate_unknown_count=$((candidate_unknown_count + 1))
+    fi
+    if [[ -L ${archive_path} || ! -f ${archive_path} ]] ||
+       [[ $(sha256sum -- "${archive_path}" | awk '{print $1}') != \
+          "${archive_sha256}" ]]; then
+      audit_error "registered archive changed during audit: ${archive_path}"
+      audit_errors=$((audit_errors + 1))
+    fi
+    continue
   fi
+  printf 'PACKAGE_CONTAINER\tarchive_path=%s\tcontainer_hint=%s\taudit_format=tar-auto\n' \
+    "${archive_path}" "${container_hint}"
   awk '
     {
       member = $0
@@ -451,7 +557,7 @@ while IFS=$'\t' read -r package_name package_path; do
     # not misclassify that valid packaging pattern as an empty/corrupt ELF.
     # The target must remain a safe in-archive path whose basename is also in
     # the audited library families, so the regular target is inspected below.
-    if ! member_metadata=$(LC_ALL=C tar -tvzf "${archive_snapshot}" -- "${member}"); then
+    if ! member_metadata=$(LC_ALL=C tar -tvf "${archive_snapshot}" -- "${member}"); then
       audit_error "could not inspect matching member type: archive=${archive_path} member=${member}"
       audit_errors=$((audit_errors + 1))
       continue
@@ -513,7 +619,7 @@ while IFS=$'\t' read -r package_name package_path; do
     build_ids_file="${member_file}.build-ids"
     exports_file="${member_file}.exports"
 
-    if ! tar -xOzf "${archive_snapshot}" -- "${member}" >"${member_file}"; then
+    if ! tar -xOf "${archive_snapshot}" -- "${member}" >"${member_file}"; then
       audit_error "could not stream matching member: archive=${archive_path} member=${member}"
       audit_errors=$((audit_errors + 1))
       continue
@@ -686,6 +792,13 @@ while IFS=$'\t' read -r package_name package_path; do
     fi
   done <"${aliases_file}"
 
+  if (( strict_kvaf_archive != 0 &&
+        library_count == package_library_count_before )); then
+    audit_error \
+      "strict KVAF archive contains no inspectable runtime library: ${archive_path}"
+    audit_errors=$((audit_errors + 1))
+  fi
+
   if [[ -L ${archive_path} || ! -f ${archive_path} ]] ||
      [[ $(sha256sum -- "${archive_path}" | awk '{print $1}') != \
         "${archive_sha256}" ]]; then
@@ -694,6 +807,16 @@ while IFS=$'\t' read -r package_name package_path; do
     audit_errors=$((audit_errors + 1))
   fi
 done <"${registered_packages_file}"
+
+while IFS= read -r optional_missing_path ||
+      [[ -n ${optional_missing_path} ]]; do
+  [[ -n ${optional_missing_path} ]] || continue
+  if [[ -e ${optional_missing_path} || -L ${optional_missing_path} ]]; then
+    audit_error \
+      "optional registered archive appeared during audit: ${optional_missing_path}"
+    audit_errors=$((audit_errors + 1))
+  fi
+done <"${optional_missing_paths_file}"
 
 if [[ -L ${registry_file} || ! -f ${registry_file} ]] ||
    [[ $(sha256sum -- "${registry_file}" | awk '{print $1}') != \
@@ -771,10 +894,19 @@ if ! conflict_count=$(
   conflict_count=0
 fi
 
-printf 'SUMMARY\tregistered_packages=%d\tlibraries=%d\tconflicts=%d\tcandidate_conflicts=%d\terrors=%d\n' \
-  "${registered_packages}" "${library_count}" "${conflict_count}" \
-  "${candidate_conflict_count}" "${audit_errors}"
+audit_coverage=complete
+if (( unaudited_package_count > 0 || optional_missing_count > 0 )); then
+  audit_coverage=partial
+fi
 
-if (( audit_errors > 0 || conflict_count > 0 || candidate_conflict_count > 0 )); then
+printf 'SUMMARY\tregistered_packages=%d\tlibraries=%d\tconflicts=%d\tcandidate_conflicts=%d\terrors=%d\toptional_missing=%d\topaque_packages=%d\tunaudited_packages=%d\tcandidate_unknowns=%d\tcoverage=%s\n' \
+  "${registered_packages}" "${library_count}" "${conflict_count}" \
+  "${candidate_conflict_count}" "${audit_errors}" \
+  "${optional_missing_count}" "${opaque_package_count}" \
+  "${unaudited_package_count}" "${candidate_unknown_count}" \
+  "${audit_coverage}"
+
+if (( audit_errors > 0 || conflict_count > 0 ||
+      candidate_conflict_count > 0 || candidate_unknown_count > 0 )); then
   exit 1
 fi

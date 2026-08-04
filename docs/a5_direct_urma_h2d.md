@@ -960,6 +960,22 @@ aicpu_kernels_device/kvaf_udma_private_abi_probe
 aicpu_kernels_device/kvaf_ummu_uapi_probe
 ```
 
+registry 的文件名后缀不能当作压缩格式契约。部分 CANN 内置条目虽然以
+`.tar.gz` 结尾，实际可能是普通 tar、当前 `tar` 支持的其他压缩格式，或者
+厂商私有容器；部分 `optional:true` 的跨产品 legacy 条目在当前安装中也可能
+没有实体文件。因此审计器按内容使用 tar 自动检测，并采用以下分级：
+
+- 可读 tar：逐个检查目标 ELF、成员名、SONAME、hash 和 alias；
+- 缺失的非 KVAF `optional:true` 条目：输出 `PACKAGE_UNAVAILABLE`，不把一个
+  实际不存在的包误判为冲突；
+- 存在但不可用标准 tar 读取的非 KVAF 官方包：输出
+  `PACKAGE_UNAUDITED`，将整体 `coverage` 标为 `partial`，既不猜测其内容，也
+  不伪造冲突；
+- 名称包含 `kvaf` 的目标包、`--replace-archive` 指定的目标，以及所有
+  `--candidate-soname` 发布判定继续 fail closed。目标包不可读或缺失是错误；
+  candidate 检查遇到 opaque 注册包会输出 `CANDIDATE_UNAUDITED_SCOPE` 并
+  非零退出，因为“没有发现冲突”不等于“已经证明没有冲突”。
+
 ### 6.5 Docker：构建 AIV/SIMT smoke
 
 执行环境：`VLLM_ASCEND_CS_KVAF_DOCKER`
@@ -1019,8 +1035,10 @@ memcache。`dev_id` 是宿主机全局 selector；新代码统一通过宿主机
 这一步不加载官方 `liburma.so.0`，不打开 NPU/URMA/UMMU 设备，不创建
 context、JFC、JFR、Jetty、TP 或 MR，也不写 SQ/CQ。第一个脚本只把 CANN
 registry 中已注册的 AICPU archive 复制到私有临时目录后做 ELF/符号
-冲突审计；第二个脚本只对安装 HAL header 做编译期声明检查，并对
-`libascend_hal.so` 做动态符号表检查。
+冲突审计；第二个脚本读取 `libra.so` 与 `libascend_hal.so` 动态符号表。
+安装镜像如果不含 SDK 的 HAL header，会把 raw-HAL 声明面标记为 unavailable，
+但仍继续识别 modern `RaCtx*` 与 SHMEM 使用的 legacy `RaAiQpCreate` 两套 HCCP
+控制面。它不会加载任何库。
 
 ```bash
 (
@@ -1046,11 +1064,17 @@ registry 中已注册的 AICPU archive 复制到私有临时目录后做 ELF/符
 )
 ```
 
-package audit 的可接受结果必须为 `conflicts=0`、`candidate_conflicts=0`、
-`errors=0`。HAL 检查成功时会输出
-`KVAF_A5_HCCP_HAL_DECLARATION_PREFLIGHT_OK`，但同时仍应输出
-`KVAF_HCCP_BACKEND_READY=no`：前者只表示 header/符号声明面完整，后者提醒
-runtime 版本配对、resource ID/UASID 语义和生命周期还没有被调用验证。
+只做现状盘点时，package audit 的可接受结果必须为 `conflicts=0`、
+`candidate_conflicts=0`、`candidate_unknowns=0`、`errors=0`。如果同时出现
+`coverage=partial`，必须查看每一条 `PACKAGE_UNAVAILABLE` 和
+`PACKAGE_UNAUDITED`；它表示官方内置包存在明确的未审计范围，不能写成
+“全部注册包无冲突”。带 `--candidate-soname` 的发布判定还要求
+`candidate_unknowns=0`；仅由实际缺失的 optional 包造成的 partial coverage
+不会伪造冲突，但 opaque 范围会严格阻止发布。HCCP 检查完成时会输出
+`KVAF_A5_HCCP_CONTROL_PLANE_STATIC_AUDIT_OK` 和实际候选
+`libra-ra-ctx`、`libra-legacy-ai-qp` 或 `none-*`；同时始终输出
+`KVAF_HCCP_BACKEND_READY=no`。符号完整只用于选择适配器，不能证明结构 ABI、
+`USER_CTL_NORMAL`、地址可见性或生命周期语义。
 两个命令都通过也不能执行 zero-WQE 或 H2D；它们只是为下一轮设计
 选择 Host HCCP/HAL 控制面还是补齐官方 runtime 契约提供证据。
 
@@ -1247,15 +1271,18 @@ HDC daemon、`halQueryDevpid` 和预留 SDMA channel。它可作为官方 H2D �
 - runtime library/provider 不存在：AICPU 镜像未提供完整官方 runtime，必须精确打包
   匹配版本或转 Host bootstrap。
 
-Host HCCP-style 分支也必须先运行 `preflight_a5_hccp_hal_capabilities.sh`。该只读门禁
-不仅检查五个 HAL symbol，还以安装头编译精确函数签名、CP1 常量、结构成员和 HCCP
-URMA 资源枚举。HCCP 使用的 `UdmaVaInfo` 并不属于安装版公开 HAL：它位于固定 HCOMM
+Host HCCP-style 分支也必须先运行 `preflight_a5_hccp_hal_capabilities.sh`。主路径
+优先检查驱动 `libra.so` 的 `RaCtx*`；若安装版只导出 SHMEM 已使用的 legacy
+`RaAiQpCreate`/MR/QP 接口，则单独报告该候选。raw-HAL 只保留为回退研究：脚本检查
+五个 HAL symbol，并在安装 SDK header 存在时编译精确函数签名、CP1 常量、结构成员和
+HCCP URMA 资源枚举。HCCP 使用的 `UdmaVaInfo` 并不属于安装版公开 HAL：它位于固定 HCOMM
 源码的内部 `rs_ctx_inner.h`。KVAF 的候选兼容头记录 HCOMM commit 与源文件哈希，并以
 静态断言固定 24 字节布局和 0/4/8/16 字段偏移；它不复制 enum 数值，也不把私有结构
 冒充公开接口。若 V2 map 公共类型/enum 缺失，门禁失败；私有布局编译通过也只算
 `source-audited-...-runtime-unproven`。脚本固定输出 `KVAF_HCCP_BACKEND_READY=no`，因为
-resource-ID/UASID 语义、安装 HAL 与 HCOMM 快照配套及运行时生命周期仍未证明。未来
-backend 仍必须绝对路径加载已检查的 `libascend_hal.so` 并通过单独运行时语义验证。
+resource-ID/UASID 语义、安装 HCCP/HAL 与 HCOMM 快照配套及运行时生命周期仍未证明。
+未来 backend 应优先绝对路径加载已检查的 `libra.so`，由 HCCP 完成产品相关 HAL
+映射；只有 `libra.so` 功能面明确不足时才评估私有 HAL adapter。
 
 Device Open 结果的 `reserved[9..10]` 同时带回只读 JFR 命令摘要：完整 64 位 JFC
 handle、JFC ID、context page shift、`F_GETFD` errno，以及 UDATA 地址/大小、RQ/index

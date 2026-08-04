@@ -13,5 +13,6 @@
 - [A5 不链接 HCOMM 的 direct URMA H2D：当前门禁与静态检查](a5_direct_urma_h2d.md)
 - [HISTORICAL：A5 resource-free AICPU bounded owner probe 与分阶段 owner 设计](a5_aicpu_owner_probe.md)
 - [DESIGN ONLY：A5 direct URMA Decode H2D epoch 设计](a5_decode_epoch_h2d.md)
-- [A5 HCCP 私有 HAL 声明表面只读预检（不代表 backend ready）](../scripts/preflight_a5_hccp_hal_capabilities.sh)
+- [A5 HCCP 控制面 + AIV/SIMT 直写数据面候选架构](a5_hccp_control_plane.md)
+- [A5 HCCP/libra + 私有 HAL 只读能力审计（不代表 backend ready）](../scripts/preflight_a5_hccp_hal_capabilities.sh)
 - [A5 官方 URMA 接口能力边界与分层门禁](a5_official_urma_capability_audit.md)

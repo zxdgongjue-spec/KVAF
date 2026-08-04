@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import pathlib
+import signal
 import subprocess
 import tempfile
 import textwrap
@@ -382,7 +383,7 @@ class RuntimeProbeStateTests(unittest.TestCase):
                     ])
                     if (len(sys.argv) == 4 and sys.argv[1] == "publish" and
                             pathlib.Path(sys.argv[3]) == pathlib.Path({str(ready)!r})):
-                        pathlib.Path({str(published)!r}).write_text("ready\n")
+                        pathlib.Path({str(published)!r}).write_text("ready\\n")
                         while not pathlib.Path({str(release)!r}).exists():
                             time.sleep(0.01)
                     """
@@ -441,17 +442,56 @@ class RuntimeProbeStateTests(unittest.TestCase):
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                start_new_session=True,
             )
-            deadline = time.monotonic() + 10
-            while not published.exists() and time.monotonic() < deadline:
-                time.sleep(0.01)
-            self.assertTrue(published.exists(), "supervisor did not reach ready")
-            os.replace(replacement, worker)
-            release.write_text("continue\n", encoding="utf-8")
-            stdout, stderr = process.communicate(timeout=15)
-            self.assertEqual(process.returncode, 0, stdout + stderr)
-            self.assertIn("WORKER_ID=verified", log.read_text(encoding="utf-8"))
-            self.assertNotIn("WORKER_ID=replaced", log.read_text(encoding="utf-8"))
+            stdout = ""
+            stderr = ""
+            communicated = False
+            try:
+                deadline = time.monotonic() + 10
+                while not published.exists() and time.monotonic() < deadline:
+                    if process.poll() is not None:
+                        break
+                    time.sleep(0.01)
+                if not published.exists():
+                    stdout, stderr = process.communicate(timeout=2)
+                    communicated = True
+                    self.fail(
+                        "supervisor did not reach ready\n"
+                        f"returncode={process.returncode}\n"
+                        f"stdout:\n{stdout}\n"
+                        f"stderr:\n{stderr}"
+                    )
+                os.replace(replacement, worker)
+                release.write_text("continue\n", encoding="utf-8")
+                stdout, stderr = process.communicate(timeout=15)
+                communicated = True
+                self.assertEqual(process.returncode, 0, stdout + stderr)
+                self.assertIn(
+                    "WORKER_ID=verified", log.read_text(encoding="utf-8")
+                )
+                self.assertNotIn(
+                    "WORKER_ID=replaced", log.read_text(encoding="utf-8")
+                )
+            finally:
+                # A failed assertion must not leave the supervisor or its
+                # blocking durable-helper child alive, and communicate() must
+                # always close both captured pipes.
+                release.touch(exist_ok=True)
+                if not communicated:
+                    if process.poll() is None:
+                        try:
+                            os.killpg(process.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                    try:
+                        process.communicate(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        process.communicate(timeout=2)
 
 
 if __name__ == "__main__":

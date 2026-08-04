@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pathlib
-import platform
+import shlex
 import subprocess
 import tempfile
 import textwrap
@@ -10,6 +10,39 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PROVIDER = ROOT / "access_operator/a5/provider"
+
+
+FAKE_DLFCN = r"""
+#ifndef KVAF_TEST_DLFCN_H
+#define KVAF_TEST_DLFCN_H
+#include <stddef.h>
+typedef struct {
+    const char *dli_fname;
+    void *dli_fbase;
+    const char *dli_sname;
+    void *dli_saddr;
+} Dl_info;
+#define RTLD_NOW 2
+#define RTLD_LOCAL 0
+void *dlopen(const char *, int);
+void *dlsym(void *, const char *);
+char *dlerror(void);
+int dlclose(void *);
+int dladdr(const void *, Dl_info *);
+#endif
+"""
+
+
+def run_compiler(command: list[str]) -> None:
+    result = subprocess.run(command, check=False, text=True, capture_output=True)
+    if result.returncode != 0:
+        raise AssertionError(
+            "compiler command failed\n"
+            f"command: {shlex.join(command)}\n"
+            f"returncode: {result.returncode}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
 
 
 FAKE_URMA_API = r"""
@@ -451,32 +484,13 @@ int main(int argc, char **argv)
 
 class RuntimeMatchedUrmaProbeCompileTests(unittest.TestCase):
     def test_provider_source_compiles_with_strict_warnings(self) -> None:
-        fake_dlfcn = r"""
-#ifndef KVAF_TEST_DLFCN_H
-#define KVAF_TEST_DLFCN_H
-#include <stddef.h>
-typedef struct {
-    const char *dli_fname;
-    void *dli_fbase;
-    const char *dli_sname;
-    void *dli_saddr;
-} Dl_info;
-#define RTLD_NOW 2
-#define RTLD_LOCAL 0
-void *dlopen(const char *, int);
-void *dlsym(void *, const char *);
-char *dlerror(void);
-int dlclose(void *);
-int dladdr(const void *, Dl_info *);
-#endif
-"""
         with tempfile.TemporaryDirectory() as temporary:
             temporary_path = pathlib.Path(temporary)
             (temporary_path / "urma_api.h").write_text(
                 textwrap.dedent(FAKE_URMA_API), encoding="utf-8"
             )
             (temporary_path / "dlfcn.h").write_text(
-                textwrap.dedent(fake_dlfcn), encoding="utf-8"
+                textwrap.dedent(FAKE_DLFCN), encoding="utf-8"
             )
             command = [
                 "cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
@@ -490,10 +504,9 @@ int dladdr(const void *, Dl_info *);
                 "-I", str(PROVIDER / "include"),
                 str(PROVIDER / "runtime_matched_urma_probe.c"),
             ]
-            subprocess.run(command, check=True, text=True, capture_output=True)
+            run_compiler(command)
 
 
-@unittest.skipUnless(platform.system() == "Linux", "uses glibc loader ABI")
 class RuntimeMatchedUrmaProbeBehaviorTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -501,8 +514,14 @@ class RuntimeMatchedUrmaProbeBehaviorTests(unittest.TestCase):
         cls.binary = pathlib.Path(cls.temporary.name) / "runtime-probe-harness"
         harness = pathlib.Path(cls.temporary.name) / "harness.c"
         fake_header = pathlib.Path(cls.temporary.name) / "urma_api.h"
+        fake_dlfcn = pathlib.Path(cls.temporary.name) / "dlfcn.h"
         harness.write_text(textwrap.dedent(HARNESS), encoding="utf-8")
         fake_header.write_text(textwrap.dedent(FAKE_URMA_API), encoding="utf-8")
+        # The harness renames the loader API before including the provider.
+        # Using glibc's declarations would transfer implementation-specific
+        # attributes to those local fake definitions, which GCC diagnoses
+        # under -Werror.  Use one controlled ABI stub for both compile tests.
+        fake_dlfcn.write_text(textwrap.dedent(FAKE_DLFCN), encoding="utf-8")
         command = [
             "cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
             (
@@ -515,7 +534,7 @@ class RuntimeMatchedUrmaProbeBehaviorTests(unittest.TestCase):
             "-I", str(PROVIDER / "include"),
             str(harness), "-pthread", "-o", str(cls.binary),
         ]
-        subprocess.run(command, check=True, text=True, capture_output=True)
+        run_compiler(command)
 
     @classmethod
     def tearDownClass(cls) -> None:

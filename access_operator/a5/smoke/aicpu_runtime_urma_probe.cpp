@@ -347,10 +347,12 @@ bool ValidateResultAgainstRequest(
   if (result.outcome == KVAF_URMA_RUNTIME_PROBE_OUTCOME_OK) {
     const std::uint32_t expected_cleanup =
         options.mode == KVAF_URMA_RUNTIME_PROBE_MODE_DISCOVER
-            ? KVAF_URMA_RUNTIME_PROBE_CLEANUP_LIBRARY
+            ? static_cast<std::uint32_t>(
+                  KVAF_URMA_RUNTIME_PROBE_CLEANUP_LIBRARY)
             : (options.mode == KVAF_URMA_RUNTIME_PROBE_MODE_INIT_DEVICE
-                   ? KVAF_URMA_RUNTIME_PROBE_CLEANUP_RUNTIME |
-                         KVAF_URMA_RUNTIME_PROBE_CLEANUP_LIBRARY
+                   ? static_cast<std::uint32_t>(
+                         KVAF_URMA_RUNTIME_PROBE_CLEANUP_RUNTIME |
+                         KVAF_URMA_RUNTIME_PROBE_CLEANUP_LIBRARY)
                    : KVAF_URMA_RUNTIME_PROBE_ALL_CLEANUP_BITS);
     const bool resource_attempted =
         (result.flags &

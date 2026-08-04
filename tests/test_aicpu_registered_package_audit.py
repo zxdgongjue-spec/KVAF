@@ -99,6 +99,22 @@ class RegisteredAicpuPackageAuditTests(unittest.TestCase):
                 archive.addfile(info, io.BytesIO(content))
         return archive_path
 
+    def write_plain_tar_with_gzip_suffix(
+        self,
+        package_path: str,
+        package_name: str,
+        members: dict[str, bytes],
+    ) -> Path:
+        archive_path = self.root / package_path / package_name
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(archive_path, "w") as archive:
+            for member, content in members.items():
+                info = tarfile.TarInfo(member)
+                info.mode = 0o644
+                info.size = len(content)
+                archive.addfile(info, io.BytesIO(content))
+        return archive_path
+
     def write_archive_with_symlink(
         self,
         package_path: str,
@@ -519,6 +535,161 @@ class RegisteredAicpuPackageAuditTests(unittest.TestCase):
             result.stdout,
         )
 
+    def test_missing_optional_official_archive_is_reported_not_failed(
+        self,
+    ) -> None:
+        missing = self.root / "opp" / "Ascend-aicpu_legacy.tar.gz"
+        self.registry.write_text(
+            "name:Ascend-aicpu_legacy.tar.gz\n"
+            "package_path:opp\n"
+            "optional:true\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_audit()
+
+        self.assert_success(result)
+        self.assertIn(
+            f"PACKAGE_UNAVAILABLE\tarchive_path={missing}\t"
+            "package_path=opp\tname=Ascend-aicpu_legacy.tar.gz\t"
+            "optional=true\treason=optional-missing",
+            result.stdout,
+        )
+        self.assertIn(
+            "\terrors=0\toptional_missing=1\topaque_packages=0\t"
+            "unaudited_packages=0\tcandidate_unknowns=0\tcoverage=partial",
+            result.stdout,
+        )
+        self.assertEqual(result.stderr, "")
+
+    def test_missing_optional_kvaf_target_still_fails_closed(self) -> None:
+        self.registry.write_text(
+            "name:cann-kvaf-direct-urma-compat.tar.gz\n"
+            "package_path:packages\n"
+            "optional:true\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_audit()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("registered archive is missing or unreadable", result.stderr)
+        self.assertNotIn("PACKAGE_UNAVAILABLE", result.stdout)
+
+    def test_plain_tar_with_gzip_suffix_is_inspected_by_content(self) -> None:
+        archive = self.write_plain_tar_with_gzip_suffix(
+            "built-in",
+            "official.tar.gz",
+            {"runtime/liburma.so.0": b"C-plain-tar"},
+        )
+        self.registry.write_text(
+            "name:official.tar.gz\npackage_path:built-in\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_audit()
+
+        self.assert_success(result)
+        self.assertIn(
+            f"PACKAGE_CONTAINER\tarchive_path={archive}\t"
+            "container_hint=tar\taudit_format=tar-auto",
+            result.stdout,
+        )
+        self.assertIn("\tmember=runtime/liburma.so.0\t", result.stdout)
+        self.assertIn("\tcoverage=complete", result.stdout)
+
+    def test_opaque_official_package_is_explicit_partial_coverage(
+        self,
+    ) -> None:
+        archive = self.root / "built-in" / "aicpu_hcomm.tar.gz"
+        archive.parent.mkdir(parents=True)
+        archive.write_bytes(b"CANN-private-container\x00payload")
+        self.registry.write_text(
+            "name:aicpu_hcomm.tar.gz\npackage_path:built-in\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_audit()
+
+        self.assert_success(result)
+        self.assertIn(
+            f"PACKAGE_UNAUDITED\tarchive_path={archive}\t",
+            result.stdout,
+        )
+        self.assertIn(
+            "\tname=aicpu_hcomm.tar.gz\tcontainer_hint=opaque\t"
+            "reason=vendor-private-or-unsupported-container",
+            result.stdout,
+        )
+        self.assertIn(
+            "\terrors=0\toptional_missing=0\topaque_packages=1\t"
+            "unaudited_packages=1\tcandidate_unknowns=0\tcoverage=partial",
+            result.stdout,
+        )
+        self.assertNotIn("CONFLICT", result.stderr)
+
+    def test_candidate_check_fails_on_opaque_scope_without_false_conflict(
+        self,
+    ) -> None:
+        archive = self.root / "built-in" / "aicpu_hcomm.tar.gz"
+        archive.parent.mkdir(parents=True)
+        archive.write_bytes(b"CANN-private-container\x00payload")
+        self.registry.write_text(
+            "name:aicpu_hcomm.tar.gz\npackage_path:built-in\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_audit(
+            "--candidate-soname",
+            "libkvaf_candidate.so=" + hashlib.sha256(b"candidate").hexdigest(),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            f"CANDIDATE_UNAUDITED_SCOPE\tarchive_path={archive}\t",
+            result.stderr,
+        )
+        self.assertNotIn("CANDIDATE_CONFLICT\t", result.stderr)
+        self.assertIn("\tcandidate_unknowns=1\tcoverage=partial", result.stdout)
+
+    def test_opaque_kvaf_target_is_a_strict_error(self) -> None:
+        archive = self.root / "cust" / "cann-kvaf-test.tar.gz"
+        archive.parent.mkdir(parents=True)
+        archive.write_bytes(b"opaque-kvaf-container")
+        self.registry.write_text(
+            "name:cann-kvaf-test.tar.gz\npackage_path:cust\noptional:true\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_audit()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "strict KVAF archive is not a readable tar container", result.stderr
+        )
+        self.assertNotIn("PACKAGE_UNAUDITED", result.stdout)
+
+    def test_readable_kvaf_target_without_runtime_library_is_an_error(
+        self,
+    ) -> None:
+        self.write_archive(
+            "cust",
+            "cann-kvaf-empty.tar.gz",
+            {"aicpu_kernels_device/manifest.txt": b"metadata-only"},
+        )
+        self.registry.write_text(
+            "name:cann-kvaf-empty.tar.gz\npackage_path:cust\noptional:true\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_audit()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "strict KVAF archive contains no inspectable runtime library",
+            result.stderr,
+        )
+
     def test_dot_package_path_is_canonically_audited(self) -> None:
         archive = self.write_archive(
             ".", "root-package.tar.gz", {"lib/liburma.so.0": b"C-root"}
@@ -548,7 +719,7 @@ class RegisteredAicpuPackageAuditTests(unittest.TestCase):
         result = self.run_audit()
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("registered archive is missing or unreadable", result.stderr)
+        self.assertIn("registered archive path is a symlink", result.stderr)
 
     def test_candidate_rejects_any_foreign_registration_and_ignores_replaced_archive(
         self,

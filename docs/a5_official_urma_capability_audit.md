@@ -177,12 +177,18 @@ provider 和路径身份，同时明确不把未封存日志当作 capability �
 当前的最小证伪是纯静态的：
 
 1. `audit_a5_registered_aicpu_packages.sh` 检查 CANN registry 已注册 archive 中的
-   SONAME、成员名和 ELF hash 是否冲突。冲突非零时，当前 package/runtime
-   身份基线被证伪，应先修复部署，不进入硬件；
-2. `preflight_a5_hccp_hal_capabilities.sh` 只编译安装 HAL header 并读取
-   `libascend_hal.so` 动态符号表。声明面缺失时，Host HCCP/HAL 候选控制面
-   在该安装上被证伪；声明面完整时，也只能记为
-   `declarations-complete/runtime-unproven`，不能记为 backend ready。
+   SONAME、成员名和 ELF hash 是否冲突。它按内容读取标准 tar，而不是根据
+   `.tar.gz` 后缀强制 gzip；缺失的非 KVAF `optional:true` 条目会明确记录为
+   unavailable，厂商私有/当前工具不支持的容器会记录为 unaudited，并将
+   coverage 标为 partial，而不会被臆测成冲突。KVAF 目标包仍严格审计；带
+   candidate 的发布判定遇到 opaque 范围也会 fail closed。真实冲突、目标包
+   错误或 candidate 未审计范围非零时，当前 package/runtime 身份基线没有被
+   证明，应先修复部署，不进入硬件；
+2. `preflight_a5_hccp_hal_capabilities.sh` 读取 `libra.so` 和
+   `libascend_hal.so` 动态符号表，并在 SDK HAL header 存在时做编译期声明检查。
+   runtime 镜像没有 header 不再阻断 `libra.so` 审计；脚本会分别报告 modern
+   `RaCtx*` 与 SHMEM legacy `RaAiQpCreate` 功能面。任一符号面完整都只能选择候选
+   adapter，不能证明结构 ABI、runtime 语义或 backend ready。
 
 两项静态证据收集后，再决定是否转向 HCCP/HAL Host 长驻控制面，或向厂商
 索要官方 AICPU caller-domain、生命周期和 AIV 队列 ABI 契约。在任一选项形成
