@@ -86,6 +86,9 @@ class HccpAivChannelProbeContractTests(unittest.TestCase):
         main = source[source.index("int main(") :]
 
         self.assertIn("--print-capabilities", source)
+        self.assertIn(
+            '<< "usage: " << program << " --print-capabilities\\n"', source
+        )
         self.assertIn("KVAF_HCCP_CHANNEL_NAME_SUPPORT=", source)
         self.assertIn("channel-name-unsupported", main)
         self.assertIn("legacy-anonymous-guard-fd-absent", main)

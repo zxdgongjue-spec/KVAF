@@ -193,8 +193,8 @@ bool ValidRunId(const std::string& run_id) {
 
 void PrintUsage(const char* program) {
   std::cerr
-      << "usage: " << program
-         " --print-capabilities\n       " << program
+      << "usage: " << program << " --print-capabilities\n"
+      << "       " << program
       << " --role host|device --run-id TOKEN --exchange-dir PATH"
          " --host-eid HEX32 --device-eid HEX32"
          " --logical-device-id N --physical-device-id N"
