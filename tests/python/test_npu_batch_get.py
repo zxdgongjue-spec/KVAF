@@ -151,20 +151,9 @@ def main() -> int:
     warmup = int(os.environ.get("KVAF_NPU_WARMUP", "1"))
     iterations = int(os.environ.get("KVAF_NPU_ITERATIONS", "5"))
     graph_replays = int(os.environ.get("KVAF_NPU_GRAPH_REPLAYS", "0"))
-    # Use the eager benchmark's sample plan by default.  This keeps the two
-    # result lines directly comparable; graph-specific values are only needed
-    # when a caller deliberately wants a different diagnostic sample plan.
-    graph_warmup = int(os.environ.get("KVAF_NPU_GRAPH_WARMUP", str(warmup)))
-    graph_iterations = int(
-        os.environ.get("KVAF_NPU_GRAPH_ITERATIONS", str(iterations))
-    )
-    graph_stream_kind = os.environ.get("KVAF_NPU_GRAPH_STREAM_KIND", "torch").lower()
-    graph_input_preflight_sync = (
-        os.environ.get("KVAF_NPU_GRAPH_INPUT_PREFLIGHT_SYNC", "0") == "1"
-    )
-    retain_unsynchronized_launch_args = (
-        os.environ.get("KVAF_NPU_GRAPH_RETAIN_HOST_ARGS", "0") == "1"
-    )
+    # Graph and eager measurements always use the same sample plan.
+    graph_warmup = warmup
+    graph_iterations = iterations
     if not (
         table_capacity > 0
         and requests > 0
@@ -178,7 +167,6 @@ def main() -> int:
         and graph_replays >= 0
         and graph_warmup >= 0
         and graph_iterations > 0
-        and graph_stream_kind in {"torch", "acl"}
     ):
         print("FAIL: invalid KVAF_NPU_* shape configuration", file=sys.stderr)
         return 2
@@ -215,21 +203,7 @@ def main() -> int:
     # passing its caller-owned streams through the pybind Runtime.
     torch.npu.set_device(device_id)
     device = f"npu:{device_id}"
-    native_constructor_doc = getattr(kvaf.NpuRuntime.__init__, "__doc__", "")
-    if "retain_unsynchronized_launch_args" not in native_constructor_doc:
-        print(
-            "FAIL: stale KVAF native binding: NpuRuntime lacks "
-            "retain_unsynchronized_launch_args. Rebuild _kvaf from the current "
-            "source and use PYTHONPATH=build-aiv/python.",
-            file=sys.stderr,
-        )
-        return 2
-    runtime = kvaf.NpuRuntime(
-        str(kernel),
-        device_id,
-        npu_core_count,
-        retain_unsynchronized_launch_args,
-    )
+    runtime = kvaf.NpuRuntime(str(kernel), device_id, npu_core_count)
     table = None
     graph = None
     graph_stream = None
@@ -241,19 +215,13 @@ def main() -> int:
             f"block_bytes={block_bytes} source_stride={source_stride}"
         )
         if graph_replays:
-            # Both variants are created before Direct-HCCP output registration.
-            # "torch" exercises framework-owned stream interop. "acl"
-            # mirrors the demo's aclrtCreateStream path exactly.
+            # Create the caller-owned framework stream before Direct-HCCP
+            # output registration; capture, input updates and replay use it.
             print("RUNTIME_NPU_PHASE_BEGIN phase=graph_stream_create")
-            if graph_stream_kind == "acl":
-                if not hasattr(kvaf, "AclStream"):
-                    raise AssertionError("raw ACL graph stream binding is unavailable")
-                graph_stream = kvaf.AclStream()
-            else:
-                graph_stream = torch.npu.Stream(device=device_id)
+            graph_stream = torch.npu.Stream(device=device_id)
             print(
                 "RUNTIME_NPU_PHASE_DONE phase=graph_stream_create "
-                f"kind={graph_stream_kind}"
+                "kind=torch"
             )
         print("RUNTIME_NPU_PHASE_BEGIN phase=runtime_initialize")
         runtime.initialize(ddr_bytes, source_stride)
@@ -288,7 +256,7 @@ def main() -> int:
         if view["size"] != active_requests:
             raise AssertionError("Runtime returned an unexpected Host AccessTable size")
         # Keep writable host buffers. They both avoid torch.frombuffer's
-        # immutable-buffer warning and become the source for raw ACL graph
+        # immutable-buffer warning and become the source for ACL graph
         # input updates later in this test.
         host_addresses_buffer = bytearray(view["addresses"])
         host_valid_buffer = bytearray(view["valid"])
@@ -433,7 +401,7 @@ def main() -> int:
         if graph_replays:
             if not hasattr(kvaf, "AclGraph"):
                 print(
-                    "FAIL: raw ACL graph test requires kvaf.AclGraph; rebuild with "
+                    "FAIL: ACL graph test requires kvaf.AclGraph; rebuild with "
                     "-DKVAF_ENABLE_AIV_BATCH_GET=ON -DKVAF_BUILD_PYTHON=ON",
                     file=sys.stderr,
                 )
@@ -444,9 +412,7 @@ def main() -> int:
                 "external_graph_owner=python "
                 "api=aclmdlRI "
                 "input_contents=host_to_device_same_stream "
-                f"graph_stream={graph_stream_kind} "
-                f"input_preflight_sync={int(graph_input_preflight_sync)} "
-                f"retain_host_args={int(retain_unsynchronized_launch_args)} "
+                "graph_stream=torch "
                 "captured_ops=runtime_batch_get "
                 f"functional_replays={graph_replays} "
                 f"perf_warmup={graph_warmup} perf_samples={graph_iterations}"
@@ -521,7 +487,7 @@ def main() -> int:
             print("RUNTIME_NPU_PHASE_BEGIN phase=graph_capture")
             # output_a was already used by eager A -> B -> A above, so its
             # Direct-HCCP local HBM registration is cached before capture.
-            # Python owns this raw ACL graph; KVAF only submits BatchGet to
+            # Python owns this ACL graph; KVAF only submits BatchGet to
             # the caller-provided stream while capture is active.
             capture_started = False
             try:
@@ -565,10 +531,6 @@ def main() -> int:
                 print(f"RUNTIME_NPU_GRAPH_REPLAY_BEGIN replay={replay}")
                 graph_payload_slots = prepare_graph_inputs(replay)
                 enqueue_graph_inputs(str(replay))
-                if graph_input_preflight_sync:
-                    print(f"RUNTIME_NPU_GRAPH_INPUT_STREAM_SYNC_BEGIN replay={replay}")
-                    graph.synchronize(capture_stream)
-                    print(f"RUNTIME_NPU_GRAPH_INPUT_STREAM_DONE replay={replay}")
                 replay_graph_on_capture_stream(str(replay))
                 graph.synchronize(capture_stream)
                 print(f"RUNTIME_NPU_GRAPH_STREAM_DONE replay={replay}")
@@ -590,77 +552,74 @@ def main() -> int:
                 )
                 print(f"RUNTIME_NPU_GRAPH_REPLAY_VALIDATION_PASS replay={replay}")
 
-            if graph_input_preflight_sync:
-                print("GRAPH_PERF_SKIPPED reason=input_preflight_sync_diagnostic")
-            else:
-                print(
-                    "GRAPH_PERF_CONTRACT "
-                    "metric=graph_replay_to_stream_completion "
-                    "capture_excluded=1 input_updates_excluded=1 "
-                    "validation_excluded=1 "
-                    f"warmup={graph_warmup} samples={graph_iterations}"
-                )
-                print("RUNTIME_NPU_GRAPH_PERF_WARMUP_BEGIN")
-                for warmup_iteration in range(graph_warmup):
-                    prepare_graph_inputs(graph_replays + warmup_iteration)
-                    # Input tensors are mutable graph inputs, not part of the
-                    # BatchGet measurement.  Complete their H2D update before
-                    # replaying the fixed graph so no copy time leaks into the
-                    # replay-to-completion interval below.
-                    enqueue_graph_inputs()
-                    graph.synchronize(capture_stream)
-                    replay_graph_on_capture_stream()
-                    graph.synchronize(capture_stream)
-                    graph_completed_batches += 1
-                print(f"RUNTIME_NPU_GRAPH_PERF_WARMUP_DONE count={graph_warmup}")
+            print(
+                "GRAPH_PERF_CONTRACT "
+                "metric=graph_replay_to_stream_completion "
+                "capture_excluded=1 input_updates_excluded=1 "
+                "validation_excluded=1 "
+                f"warmup={graph_warmup} samples={graph_iterations}"
+            )
+            print("RUNTIME_NPU_GRAPH_PERF_WARMUP_BEGIN")
+            for warmup_iteration in range(graph_warmup):
+                prepare_graph_inputs(graph_replays + warmup_iteration)
+                # Input tensors are mutable graph inputs, not part of the
+                # BatchGet measurement. Complete their H2D update before
+                # replaying the fixed graph so no copy time leaks into the
+                # replay-to-completion interval below.
+                enqueue_graph_inputs()
+                graph.synchronize(capture_stream)
+                replay_graph_on_capture_stream()
+                graph.synchronize(capture_stream)
+                graph_completed_batches += 1
+            print(f"RUNTIME_NPU_GRAPH_PERF_WARMUP_DONE count={graph_warmup}")
 
-                graph_samples = []
-                for iteration in range(graph_iterations):
-                    epoch = graph_replays + graph_warmup + iteration
-                    prepare_graph_inputs(epoch)
-                    enqueue_graph_inputs()
-                    graph.synchronize(capture_stream)
-                    # Match the eager metric: start after caller-side input
-                    # preparation is complete and measure only graph submission
-                    # through completion of the stream that executes BatchGet.
-                    begin = time.perf_counter()
-                    replay_graph_on_capture_stream()
-                    graph.synchronize(capture_stream)
-                    graph_samples.append((time.perf_counter() - begin) * 1000.0)
-                    graph_completed_batches += 1
+            graph_samples = []
+            for iteration in range(graph_iterations):
+                epoch = graph_replays + graph_warmup + iteration
+                prepare_graph_inputs(epoch)
+                enqueue_graph_inputs()
+                graph.synchronize(capture_stream)
+                # Match the eager metric: start after caller-side input
+                # preparation is complete and measure only graph submission
+                # through completion of the stream that executes BatchGet.
+                begin = time.perf_counter()
+                replay_graph_on_capture_stream()
+                graph.synchronize(capture_stream)
+                graph_samples.append((time.perf_counter() - begin) * 1000.0)
+                graph_completed_batches += 1
 
-                graph_payload_slots = prepare_graph_inputs(
-                    graph_replays + graph_warmup + graph_iterations - 1
-                )
-                validate_output(
-                    tensor_to_bytes(output_a),
-                    mask_values,
-                    output_indices_values,
-                    graph_payload_slots,
-                    block_bytes,
-                )
-                validate_completion(
-                    tensor_to_bytes(status),
-                    tensor_to_bytes(queue),
-                    requests,
-                    mask_values,
-                    npu_core_count,
-                    graph_completed_batches,
-                )
-                graph_mean_ms = statistics.mean(graph_samples)
-                graph_useful_gibps = (
-                    active_requests * block_bytes / (1024.0**3) / (graph_mean_ms / 1000.0)
-                )
-                print(
-                    "GRAPH_PERF_RESULT metric=graph_replay_to_stream_completion "
-                    f"samples={graph_iterations} warmup_excluded={graph_warmup} "
-                    f"active_requests={active_requests} block_bytes={block_bytes} "
-                    f"npu_cores={npu_core_count} mean_ms={graph_mean_ms:.3f} "
-                    f"p50_ms={percentile(graph_samples, 0.50):.3f} "
-                    f"p90_ms={percentile(graph_samples, 0.90):.3f} "
-                    f"p99_ms={percentile(graph_samples, 0.99):.3f} "
-                    f"useful_GiBps={graph_useful_gibps:.3f}"
-                )
+            graph_payload_slots = prepare_graph_inputs(
+                graph_replays + graph_warmup + graph_iterations - 1
+            )
+            validate_output(
+                tensor_to_bytes(output_a),
+                mask_values,
+                output_indices_values,
+                graph_payload_slots,
+                block_bytes,
+            )
+            validate_completion(
+                tensor_to_bytes(status),
+                tensor_to_bytes(queue),
+                requests,
+                mask_values,
+                npu_core_count,
+                graph_completed_batches,
+            )
+            graph_mean_ms = statistics.mean(graph_samples)
+            graph_useful_gibps = (
+                active_requests * block_bytes / (1024.0**3) / (graph_mean_ms / 1000.0)
+            )
+            print(
+                "GRAPH_PERF_RESULT metric=graph_replay_to_stream_completion "
+                f"samples={graph_iterations} warmup_excluded={graph_warmup} "
+                f"active_requests={active_requests} block_bytes={block_bytes} "
+                f"npu_cores={npu_core_count} mean_ms={graph_mean_ms:.3f} "
+                f"p50_ms={percentile(graph_samples, 0.50):.3f} "
+                f"p90_ms={percentile(graph_samples, 0.90):.3f} "
+                f"p99_ms={percentile(graph_samples, 0.99):.3f} "
+                f"useful_GiBps={graph_useful_gibps:.3f}"
+            )
             graph.reset()
             graph = None
         return 0
@@ -679,8 +638,6 @@ def main() -> int:
             runtime.release_access_table(table)
         if runtime.initialized:
             runtime.shutdown()
-        if graph_stream is not None and hasattr(graph_stream, "close"):
-            graph_stream.close()
         print("RUNTIME_NPU_PHASE_DONE phase=teardown status=0")
 
 

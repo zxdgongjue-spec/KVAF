@@ -35,10 +35,6 @@ class AccessOperator {
 struct AccessOperatorConfig {
   std::string kernel_object_path;
   std::uint32_t npu_core_count{0};
-  // A captured aclrtLaunchKernelWithHostArgs task can outlive the C++ call
-  // that submitted it. Enable this for caller-managed asynchronous execution
-  // when the host argument record must remain valid until shutdown.
-  bool retain_unsynchronized_launch_args{false};
 };
 
 // Default synchronous NPU data-plane implementation.

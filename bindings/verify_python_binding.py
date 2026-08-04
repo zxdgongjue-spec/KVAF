@@ -14,13 +14,8 @@ def main() -> int:
     import kvaf
 
     if options.require_aiv:
-        if not hasattr(kvaf, "AclStream"):
-            raise RuntimeError("KVAF AIV binding does not export AclStream")
-        constructor_doc = getattr(kvaf.NpuRuntime.__init__, "__doc__", "")
-        if "retain_unsynchronized_launch_args" not in constructor_doc:
-            raise RuntimeError(
-                "KVAF AIV binding has a stale NpuRuntime constructor ABI"
-            )
+        if not hasattr(kvaf, "NpuRuntime") or not hasattr(kvaf, "AclGraph"):
+            raise RuntimeError("KVAF AIV binding does not export NpuRuntime and AclGraph")
     return 0
 
 

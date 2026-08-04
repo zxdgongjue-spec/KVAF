@@ -5,7 +5,6 @@
 #include <limits>
 #include <string>
 #include <utility>
-#include <vector>
 
 #include "acl/acl.h"
 #include "batch_get_abi.h"
@@ -113,8 +112,6 @@ struct DefaultAccessOperator::Impl {
   AccessOperatorConfig config;
   RemoteRegionDesc remote_region;
   KvafBatchGetTransport* transport{nullptr};
-  std::vector<std::unique_ptr<KvafExecuteBatchGetKernelArgs>>
-      retained_unsynchronized_launch_args;
   bool initialized{false};
 };
 
@@ -161,7 +158,6 @@ Status DefaultAccessOperator::Shutdown() {
   if (impl_->transport != nullptr) {
     KvafBatchGetTransportDestroy(impl_->transport);
   }
-  impl_->retained_unsynchronized_launch_args.clear();
   impl_->transport = nullptr;
   impl_->remote_region = RemoteRegionDesc{};
   impl_->initialized = false;
@@ -195,15 +191,7 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   arguments.channel_entity = channel_entity;
 
   const aclrtStream stream = static_cast<aclrtStream>(exec.execution.stream);
-  const KvafExecuteBatchGetKernelArgs* launch_arguments = &arguments;
-  std::unique_ptr<KvafExecuteBatchGetKernelArgs> retained_arguments;
-  if (!exec.execution.synchronize &&
-      impl_->config.retain_unsynchronized_launch_args) {
-    retained_arguments = std::make_unique<KvafExecuteBatchGetKernelArgs>(arguments);
-    launch_arguments = retained_arguments.get();
-  }
-  const int32_t launch_result =
-      KvafExecuteBatchGetLaunch(launch_arguments, stream);
+  const int32_t launch_result = KvafExecuteBatchGetLaunch(&arguments, stream);
   if (launch_result != KVAF_BATCH_GET_SUCCESS) {
     KvafBatchGetLocalBufferRelease(local_buffer);
     return Internal("failed to launch BatchGet");
@@ -215,10 +203,6 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
       return Internal("BatchGet stream synchronization failed");
     }
   } else {
-    if (retained_arguments != nullptr) {
-      impl_->retained_unsynchronized_launch_args.push_back(
-          std::move(retained_arguments));
-    }
     // The demo transport caches zero-reference registrations until shutdown.
     // Releasing after an externally captured launch keeps KVAF graph-agnostic;
     // the caller owns stream completion and tensor lifetime.

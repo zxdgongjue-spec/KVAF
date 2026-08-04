@@ -137,34 +137,17 @@ capture 中只 capture `runtime.batch_get(..., stream, synchronize=False)`。
 性能口径是 `graph_replay_to_stream_completion`：四项 H2D 更新会在 replay 前完成并同步，
 不进入计时窗口；计时仅包含 graph replay 到同一 stream 完成，与 eager 的
 `runtime_batch_get_call_to_stream_completion` 口径对齐。默认 graph 的 warmup/iterations
-继承 `KVAF_NPU_WARMUP` / `KVAF_NPU_ITERATIONS`；仅在有意使用不同采样计划时设置
-`KVAF_NPU_GRAPH_WARMUP` / `KVAF_NPU_GRAPH_ITERATIONS` 覆盖。
+与 eager 一律使用相同的 `KVAF_NPU_WARMUP` / `KVAF_NPU_ITERATIONS` 采样计划。
 
 AIV demo 使用原生
 `aclrtMemcpyAsync(fixed_device_inputs, stream) -> aclmdlRIExecuteAsync(graph, stream)`。
-Python 测试有两种专用 graph stream：`torch.npu.Stream` 用于框架互操作，
-`kvaf.AclStream` 用 `aclrtCreateStream` 创建、用于与 demo 完全同构的 raw ACL 路径。
-`AclGraph.replay(stream)` 显式传入 capture 使用的同一 stream；图对象会在 Runtime
-shutdown 前 reset，避免图仍持有调用方 buffer 时释放 HCCP transport。
+Python 测试使用调用方持有的 `torch.npu.Stream`；`AclGraph.replay(stream)` 显式传入
+capture 使用的同一 stream。图对象会在 Runtime shutdown 前 reset，避免图仍持有调用方
+buffer 时释放 HCCP transport。
 
-为缩短远端故障定位，`tests/python/` 提供以下独立 Python 用例，均固定为较小 shape 和
-一次 replay：
-
-- `test_npu_acl_graph_torch_presync.py`：分离 framework stream 的 H2D 完成与 replay。
-- `test_npu_acl_graph_raw_stream.py`：分离 raw `AclStream` 的 H2D 完成与 replay。
-- `test_npu_acl_graph_raw_stream_replay.py`：raw stream 的正常 H2D + replay。
-- `test_npu_acl_graph_torch_retained_args.py`：framework stream + 稳定 host kernel args。
-- `test_npu_acl_graph_raw_stream_retained_args.py`：raw stream + 稳定 host kernel args。
-
-`NpuRuntime(..., retain_unsynchronized_launch_args=True)` 仅用于后一类诊断：对
-`synchronize=False` 的请求将 `aclrtLaunchKernelWithHostArgs` 的参数记录保存到 Runtime
-shutdown，以排除 graph replay 访问短生命周期 host args 的可能。
-
-Python 调用 `batch_get` 必须显式传入 `torch.npu.current_stream()`、`torch.npu.Stream`
-或 `kvaf.AclStream`。默认 `synchronize=True` 保持同步接口；只有在外部图 capture
-的调用点传 `synchronize=False`，并由图的调用方在 teardown 前完成 capture stream。
-默认 `synchronize=True` 保持同步接口；只有在外部图 capture 的调用点传
-`synchronize=False`，并由图的调用方在 teardown 前完成 capture stream。
+Python 调用 `batch_get` 必须显式传入 `torch.npu.current_stream()` 或
+`torch.npu.Stream`。默认 `synchronize=True` 保持同步接口；只有在外部图 capture 的
+调用点传 `synchronize=False`，并由图的调用方在 teardown 前完成 capture stream。
 
 正确性验证完成后，脚本会输出
 `PERF_RESULT metric=runtime_batch_get_call_to_stream_completion`。这个计时窗口

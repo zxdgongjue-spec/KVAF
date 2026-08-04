@@ -190,65 +190,9 @@ class AclGraph final {
   bool capturing_{false};
 };
 
-class AclStream final {
- public:
-  AclStream() {
-    ThrowIfAclError(aclrtCreateStream(&stream_), "aclrtCreateStream");
-  }
-  ~AclStream() { CloseNoThrow(); }
-
-  AclStream(const AclStream&) = delete;
-  AclStream& operator=(const AclStream&) = delete;
-
-  std::uint64_t Handle() const {
-    if (stream_ == nullptr) {
-      throw py::value_error("ACL stream is closed");
-    }
-    return static_cast<std::uint64_t>(
-        reinterpret_cast<std::uintptr_t>(stream_));
-  }
-
-  void Synchronize() const {
-    if (stream_ == nullptr) {
-      throw py::value_error("ACL stream is closed");
-    }
-    ThrowIfAclError(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
-  }
-
-  void Close() {
-    if (stream_ == nullptr) {
-      return;
-    }
-    const aclError error = aclrtDestroyStream(stream_);
-    stream_ = nullptr;
-    ThrowIfAclError(error, "aclrtDestroyStream");
-  }
-
-  bool Closed() const { return stream_ == nullptr; }
-
- private:
-  void CloseNoThrow() {
-    if (stream_ != nullptr) {
-      (void)aclrtDestroyStream(stream_);
-      stream_ = nullptr;
-    }
-  }
-
-  aclrtStream stream_{nullptr};
-};
-
 }  // namespace
 
 void BindAclGraph(py::module_& module) {
-  py::class_<AclStream>(module, "AclStream")
-      .def(py::init<>(),
-           "Create a Python-owned raw ACL stream on the current NPU device.")
-      .def_property_readonly("acl_stream", &AclStream::Handle)
-      .def("synchronize", &AclStream::Synchronize)
-      .def("close", &AclStream::Close,
-           "Destroy the raw stream after graphs and Runtime have been released.")
-      .def_property_readonly("closed", &AclStream::Closed);
-
   py::class_<AclGraph>(module, "AclGraph")
       .def(py::init<>())
       .def("capture_begin", &AclGraph::CaptureBegin, py::arg("stream"),

@@ -134,8 +134,7 @@ BatchGetRequest MakeNpuBatchGetRequest(
 class NpuRuntime final {
  public:
   NpuRuntime(std::string kernel_object_path, std::uint32_t device_id,
-             std::uint32_t npu_core_count,
-             bool retain_unsynchronized_launch_args)
+             std::uint32_t npu_core_count)
       : device_id_(device_id), npu_core_count_(npu_core_count),
         meta_manager_(CreateInMemoryMetaManager()) {
     if (kernel_object_path.empty() || npu_core_count == 0 ||
@@ -152,8 +151,7 @@ class NpuRuntime final {
 
     allocator_ = std::make_unique<AclHostDdrAllocator>();
     access_operator_ = std::make_unique<DefaultAccessOperator>(
-        AccessOperatorConfig{std::move(kernel_object_path), npu_core_count_,
-                             retain_unsynchronized_launch_args});
+        AccessOperatorConfig{std::move(kernel_object_path), npu_core_count_});
     runtime_ = std::make_unique<Runtime>(*meta_manager_, *access_operator_,
                                          *allocator_);
   }
@@ -321,10 +319,9 @@ class NpuRuntime final {
 
 void BindNpuPythonRuntime(py::module_& module) {
   py::class_<NpuRuntime>(module, "NpuRuntime")
-      .def(py::init<std::string, std::uint32_t, std::uint32_t, bool>(),
+      .def(py::init<std::string, std::uint32_t, std::uint32_t>(),
            py::arg("kernel_object_path"), py::arg("device_id") = 0,
-           py::arg("npu_core_count") = 1,
-           py::arg("retain_unsynchronized_launch_args") = false)
+           py::arg("npu_core_count") = 1)
       .def("initialize", &NpuRuntime::Initialize, py::arg("ddr_bytes"),
            py::arg("slot_size"))
       .def("shutdown", &NpuRuntime::Shutdown)
