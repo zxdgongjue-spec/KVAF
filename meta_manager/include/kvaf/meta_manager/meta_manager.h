@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -84,6 +85,7 @@ class MetaManager {
 
  private:
   static constexpr std::size_t kKeyShardCount = 64;
+  static constexpr std::size_t kLockContextShardCount = 64;
 
   enum class RegionState {
     kUninitialized = 0,
@@ -146,7 +148,7 @@ class MetaManager {
 
   // 一个 key shard：自己的锁 + 自己那部分 key 元数据。
   struct KeyShard {
-    std::mutex mutex;
+    mutable std::shared_mutex mutex;
     std::unordered_map<KeyId, KeyEntry> entries;
   };
 
@@ -170,7 +172,13 @@ class MetaManager {
   };
 
   struct ActiveLockContext {
+    mutable std::shared_mutex lifecycle_mutex;
     std::vector<LockedRecordRef> items;
+  };
+
+  struct LockContextShard {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, ActiveLockContext> items;
   };
 
   Address SlotAddress(const SlotRef& slot) const;
@@ -185,6 +193,7 @@ class MetaManager {
   SlotRef AcquireSlot(SlotClass slot_class);
   void ReleaseSlot(const SlotRef& slot);
   std::size_t ShardIndexForKey(const KeyId& key) const;
+  std::size_t LockContextShardIndex(std::uint64_t context_id) const;
   void CollectShardPlan(const std::vector<KeyId>& flat_keys,
                         std::vector<std::size_t>* key_shard_ids,
                         std::vector<std::size_t>* shard_order) const;
@@ -204,12 +213,12 @@ class MetaManager {
   // put / lock 上下文统一由 context 锁保护。
   std::mutex context_mutex_;
   std::unordered_map<std::uint64_t, PendingPutContext> pending_puts_;
-  std::unordered_map<std::uint64_t, ActiveLockContext> lock_contexts_;
   std::uint64_t next_put_context_id_{1};
-  std::uint64_t next_lock_context_id_{1};
+  std::array<LockContextShard, kLockContextShardCount> lock_context_shards_;
+  std::atomic<std::uint64_t> next_lock_context_id_{1};
 
   std::atomic<bool> timing_log_enabled_{false};
-  bool performance_mode_enabled_{false};
+  std::atomic<bool> performance_mode_enabled_{false};
 };
 
 std::unique_ptr<MetaManager> CreateInMemoryMetaManager();
