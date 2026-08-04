@@ -28,6 +28,7 @@ struct Options {
   uint32_t warmup = 10U;
   uint32_t iterations = 50U;
   uint32_t mask_every = 0U;
+  uint32_t active_every = 0U;
   // Zero selects the normal launch/synchronize test.  A nonzero value
   // captures the ExecuteBatchGet launch once, then replays the captured model
   // this many times after changing the contents (not addresses) of the fixed
@@ -43,6 +44,13 @@ struct Options {
 
 uint8_t PatternByte(uint32_t slot, uint32_t byte) {
   return static_cast<uint8_t>((slot * 131U + byte * 17U + (byte >> 3U)) & 0xffU);
+}
+
+bool RequestIsActive(uint32_t request, const Options &options) {
+  if (options.active_every != 0U) {
+    return request % options.active_every == 0U;
+  }
+  return options.mask_every == 0U || request % options.mask_every != 0U;
 }
 
 bool ParseU32(const char *text, uint32_t *value) {
@@ -85,6 +93,8 @@ bool ParseOptions(int argc, char **argv, Options *options) {
       if (!ParseU32(argv[++index], &options->iterations)) return false;
     } else if (arg == "--mask-every" && index + 1 < argc) {
       if (!ParseU32(argv[++index], &options->mask_every)) return false;
+    } else if (arg == "--active-every" && index + 1 < argc) {
+      if (!ParseU32(argv[++index], &options->active_every)) return false;
     } else if (arg == "--graph-replays" && index + 1 < argc) {
       if (!ParseU32(argv[++index], &options->graph_replays)) return false;
     } else if (arg == "--graph-warmup" && index + 1 < argc) {
@@ -103,12 +113,14 @@ bool ParseOptions(int argc, char **argv, Options *options) {
          ReadEnvU32("SOURCE_STRIDE", &options->source_stride) && ReadEnvU32("AIV_CORES", &options->aiv_cores) &&
          ReadEnvU32("WARMUP", &options->warmup) && ReadEnvU32("ITERATIONS", &options->iterations) &&
          ReadEnvU32("MASK_EVERY", &options->mask_every) &&
+         ReadEnvU32("ACTIVE_EVERY", &options->active_every) &&
          ReadEnvU32("DYNAMIC_OUTPUT_SMOKE", &options->dynamic_output_smoke) && options->table_capacity != 0U &&
          options->requests != 0U && options->requests <= options->output_rows && options->output_rows != 0U &&
          options->block_bytes != 0U && options->source_stride >= options->block_bytes &&
          options->aiv_cores != 0U && options->aiv_cores <= KVAF_AIV_BATCH_GET_MAX_AIV_CORES &&
          options->aiv_cores <= options->requests && options->iterations != 0U &&
-         options->graph_iterations != 0U && options->dynamic_output_smoke <= 1U;
+         options->graph_iterations != 0U && options->dynamic_output_smoke <= 1U &&
+         (options->mask_every == 0U || options->active_every == 0U);
 }
 
 bool CheckAcl(aclError error, const char *step) {
@@ -137,36 +149,8 @@ bool Validate(const std::vector<uint8_t> &output, const std::vector<uint64_t> &a
               const uint8_t *source, const std::vector<KvafBatchGetCoreStatus> &statuses,
               const std::vector<KvafBatchGetQueueState> &queues, uint64_t expected_batches,
               const char *stage) {
-  uint64_t active_total = 0U;
-  for (uint32_t request = 0U; request < options.requests; ++request) {
-    if (mask[request] == 0U) {
-      for (uint32_t byte = 0U; byte < options.block_bytes; ++byte) {
-        const uint8_t actual = output[static_cast<uint64_t>(output_indices[request]) * options.block_bytes + byte];
-        if (actual != 0U) {
-          std::cerr << "[KVAF_EXECUTE] masked row modified stage=" << stage << " request=" << request
-                    << " output_row=" << output_indices[request] << " byte=" << byte << " actual="
-                    << static_cast<uint32_t>(actual) << '\n';
-          return false;
-        }
-      }
-      continue;
-    }
-    ++active_total;
-    const uint64_t source_offset = address_table[static_cast<uint32_t>(indices[request])] -
-                                   reinterpret_cast<uint64_t>(source);
-    for (uint32_t byte = 0U; byte < options.block_bytes; ++byte) {
-      const uint8_t actual = output[static_cast<uint64_t>(output_indices[request]) * options.block_bytes + byte];
-      const uint8_t expected = source[source_offset + byte];
-      if (actual != expected) {
-        std::cerr << "[KVAF_EXECUTE] validation mismatch stage=" << stage << " request=" << request
-                  << " source_uba=0x" << std::hex << address_table[static_cast<uint32_t>(indices[request])]
-                  << std::dec << " output_row=" << output_indices[request] << " byte=" << byte
-                  << " expected=" << static_cast<uint32_t>(expected) << " actual="
-                  << static_cast<uint32_t>(actual) << '\n';
-        return false;
-      }
-    }
-  }
+  const uint64_t active_total =
+      static_cast<uint64_t>(std::count_if(mask.begin(), mask.end(), [](uint8_t entry) { return entry != 0U; }));
   for (uint32_t core = 0U; core < options.aiv_cores; ++core) {
     const uint32_t begin = static_cast<uint32_t>((static_cast<uint64_t>(options.requests) * core) / options.aiv_cores);
     const uint32_t end = static_cast<uint32_t>((static_cast<uint64_t>(options.requests) * (core + 1U)) /
@@ -188,6 +172,34 @@ bool Validate(const std::vector<uint8_t> &output, const std::vector<uint64_t> &a
       return false;
     }
   }
+  for (uint32_t request = 0U; request < options.requests; ++request) {
+    if (mask[request] == 0U) {
+      for (uint32_t byte = 0U; byte < options.block_bytes; ++byte) {
+        const uint8_t actual = output[static_cast<uint64_t>(output_indices[request]) * options.block_bytes + byte];
+        if (actual != 0U) {
+          std::cerr << "[KVAF_EXECUTE] masked row modified stage=" << stage << " request=" << request
+                    << " output_row=" << output_indices[request] << " byte=" << byte << " actual="
+                    << static_cast<uint32_t>(actual) << '\n';
+          return false;
+        }
+      }
+      continue;
+    }
+    const uint64_t source_offset = address_table[static_cast<uint32_t>(indices[request])] -
+                                   reinterpret_cast<uint64_t>(source);
+    for (uint32_t byte = 0U; byte < options.block_bytes; ++byte) {
+      const uint8_t actual = output[static_cast<uint64_t>(output_indices[request]) * options.block_bytes + byte];
+      const uint8_t expected = source[source_offset + byte];
+      if (actual != expected) {
+        std::cerr << "[KVAF_EXECUTE] validation mismatch stage=" << stage << " request=" << request
+                  << " source_uba=0x" << std::hex << address_table[static_cast<uint32_t>(indices[request])]
+                  << std::dec << " output_row=" << output_indices[request] << " byte=" << byte
+                  << " expected=" << static_cast<uint32_t>(expected) << " actual="
+                  << static_cast<uint32_t>(actual) << '\n';
+        return false;
+      }
+    }
+  }
   std::cout << "EXECUTE_BATCH_GET_VALIDATION stage=" << stage << " active_requests=" << active_total
             << " masked_requests=" << (options.requests - active_total) << " table_mode=absolute_host_uba"
             << " output_layout=scatter_rows\n";
@@ -202,6 +214,7 @@ void PrepareGraphReplayInputs(uint32_t replay, const uint8_t *source, const Opti
                               std::vector<uint64_t> *address_table, std::vector<int32_t> *indices,
                               std::vector<uint8_t> *mask, std::vector<int32_t> *output_indices) {
   const uint32_t address_shift = replay % options.table_capacity;
+  const bool sparse_mask = options.mask_every != 0U || options.active_every != 0U;
   for (uint32_t entry = 0U; entry < options.table_capacity; ++entry) {
     const uint32_t source_slot = (entry + address_shift) % options.table_capacity;
     (*address_table)[entry] = reinterpret_cast<uint64_t>(source) +
@@ -209,8 +222,11 @@ void PrepareGraphReplayInputs(uint32_t replay, const uint8_t *source, const Opti
   }
   for (uint32_t request = 0U; request < options.requests; ++request) {
     (*indices)[request] = static_cast<int32_t>(request % options.table_capacity);
-    (*mask)[request] = 1U;
-    (*output_indices)[request] = static_cast<int32_t>((request + replay) % options.output_rows);
+    (*mask)[request] = RequestIsActive(request, options) ? 1U : 0U;
+    // Keep sparse output rows stable so a row written by an earlier replay is
+    // never reinterpreted as a masked row during byte-for-byte validation.
+    const uint32_t output_row = sparse_mask ? request : request + replay;
+    (*output_indices)[request] = static_cast<int32_t>(output_row % options.output_rows);
   }
 }
 
@@ -243,6 +259,7 @@ int main(int argc, char **argv) {
     std::cerr << "usage: kvaf_execute_batch_get_test --kernel <kvaf_execute_batch_get_kernels.o> "
                  "[--device N --table-capacity N --requests N --output-rows N --block-bytes N "
                  "--source-stride N --aiv-cores N --warmup N --iterations N --mask-every N "
+                 "--active-every N "
                  "--graph-replays N --graph-warmup N --graph-iterations N --dynamic-output-smoke 0|1]\n";
     return 2;
   }
@@ -314,7 +331,7 @@ int main(int argc, char **argv) {
   for (uint32_t request = 0U; request < options.requests; ++request) {
     indices[request] = static_cast<int32_t>(options.table_capacity - 1U - (request % options.table_capacity));
     output_indices[request] = static_cast<int32_t>(options.output_rows - 1U - request);
-    if (options.mask_every != 0U && request % options.mask_every == 0U) mask[request] = 0U;
+    mask[request] = RequestIsActive(request, options) ? 1U : 0U;
   }
   // Match the architecture note's concrete [200,1024] scatter example when
   // that shape is requested; the normal default remains a larger reverse

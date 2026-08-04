@@ -74,12 +74,12 @@ control-region writes, fixed 64K request shape, or per-launch CQ reset.
 
 Each AIV first validates its complete request partition before touching the SQ,
 preserving the all-or-nothing safety rule for invalid table/output addresses.
-It then compacts mask entries in windows of 4096 request slots. The UB active-ID
-array is reused between windows, so 4096 is a scratch-window size rather than an
-active-request limit. The complete active count must still be smaller than the
-private SQ depth. Each 32-WQE post advances the persistent producer index and
-rings the doorbell; only the final READ requests a CQE. Persistent caller-owned
-SQ/CQ indices remain valid across eager calls and graph replays.
+It then compacts the complete partition once into a 4096-entry UB active-ID
+array. The caller must guarantee that each AIV owns at most 4096 mask entries
+whose value is nonzero; the kernel verifies that bound before touching the SQ.
+Each 32-WQE post advances the persistent producer index and rings the doorbell;
+only the final READ requests a CQE. Persistent caller-owned SQ/CQ indices remain
+valid across eager calls and graph replays.
 
 The ACL launcher explicitly reserves 128 KiB of AIV local memory for the two
 WQE banks and SIMT validation/compaction scratch.
@@ -122,15 +122,19 @@ WARMUP=1 ITERATIONS=1 bash scripts/run_execute_batch_get.sh
 DEVICE_ID=0 DYNAMIC_OUTPUT_SMOKE=1 WARMUP=1 ITERATIONS=1 \
 bash scripts/run_execute_batch_get.sh
 
-# Exercises multiple 4096-request compaction windows per AIV while keeping
-# each core below its private SQ depth.
-DEVICE_ID=0 TABLE_CAPACITY=4096 REQUESTS=65536 OUTPUT_ROWS=65536 \
-AIV_CORES=4 MASK_EVERY=5 WARMUP=1 ITERATIONS=1 \
+# Compacts a 65536-request partition once with exactly 4096 active entries.
+DEVICE_ID=0 TABLE_CAPACITY=65536 REQUESTS=65536 OUTPUT_ROWS=65536 \
+AIV_CORES=1 ACTIVE_EVERY=16 WARMUP=1 ITERATIONS=1 \
 bash scripts/run_execute_batch_get.sh
 
 DEVICE_ID=0 GRAPH_REPLAYS=4 GRAPH_WARMUP=1 GRAPH_ITERATIONS=5 \
 bash scripts/run_execute_batch_get_graph.sh
 ```
+
+`MASK_EVERY=N` starts with every request active and masks request IDs divisible
+by `N`. `ACTIVE_EVERY=N` starts with every request masked and activates request
+IDs divisible by `N`; the two options are mutually exclusive. The same mask
+policy is retained during graph replay.
 
 The graph performance metric is
 `graph_input_update_to_stream_completion`: updates into the fixed lookup
