@@ -11,8 +11,11 @@ KVAF 不再把“在 AICPU 内自行拼装 UMDK 私有资源”作为主路径�
 - AIV+SIMT 在 decode 热路径直接生成 WQE、更新 PI/doorbell、轮询 CQ；
 - HCCP 不参与每个 1 KiB 请求，也不参与每个 batch 的控制交互。
 
-这仍然是“不链接 HCOMM”的方案。这里复用的是 HCCP 的资源所有权、内核/驱动适配和
-HAL 地址映射，不是 HCOMM 的 collective 或传输调度层。
+直接 `libra.so` 仍是最终“不链接 HCOMM”的控制面。为尽快打通首个端到端 H2D，KVAF
+同时允许一个降级候选：若安装环境没有完整 `libra.so`，但有版本匹配且资源 API 完整的
+`libhcomm.so`，可以只在 epoch 初始化/销毁阶段复用 HCOMM 的 Endpoint/MR/Channel
+资源管理。建链完成后仍由 AIV+SIMT 直写 SQ/CQ，HCOMM 不进入每次传输热路径。这个
+降级候选不是 collective 路径，也不能仅凭符号齐全就授权真机运行。
 
 ## 为什么比 Direct-UMDK 更合适
 
@@ -74,7 +77,12 @@ wrapper 不能照搬这种“best effort”语义：它必须逐对象记录 own
 
 `scripts/preflight_a5_hccp_hal_capabilities.sh` 只读取 ELF 动态符号表；如果运行容器没有
 SDK 的 `ascend_hal.h`，会将 raw-HAL 声明面记为 `unavailable`，但仍继续审计
-`libra.so` 的两代接口。它不会 `dlopen`、不会调用 HCCP/HAL，也不会操作 NPU。
+`libra.so` 的两代接口，并审计现有 `HcommUrmaResources` 实际调用的
+`libhcomm.so` Endpoint/MR/Channel 符号。库发现按显式路径、绝对且非空的
+`LD_LIBRARY_PATH`、与 Host 架构相符的动态链接器缓存、CANN/Driver 固定布局依次进行，
+并报告全部候选。这是针对 name-only `dlopen` 的保守发现顺序，不等价于某个未来可执行
+文件的完整 ELF 解析顺序：`DT_RPATH/DT_RUNPATH` 尚未纳入；空/相对 loader path 因会
+引入当前目录而被故意忽略。它不会 `dlopen`、不会调用 HCCP/HCOMM/HAL，也不会操作 NPU。
 
 静态审计结果只能选择下一步适配器，不能授权真机执行。只有以下证据齐全后才会增加
 一个资源级、无 WQE 的 HCCP backend probe：
@@ -84,3 +92,65 @@ SDK 的 `ascend_hal.h`，会将 raw-HAL 声明面记为 `unavailable`，但仍�
 3. 与该二进制版本配套的结构体 ABI；
 4. Host owner 的逐阶段 rollback 测试；
 5. 返回队列地址的只读验证方案。
+
+## 安装布局与控制面选择
+
+HCCP 源码中的 Host client 目标名为 `ra`，但其安装位置不在
+Driver 固定目录，而是 CANN 的 `${arch}-linux/lib64/libra.so`。因此，
+仅检查 `/usr/local/Ascend/driver/lib64*` 会把已安装的 Host client
+误报为缺失。静态预检现在按确定性的发现顺序审计显式路径、
+安全的 `LD_LIBRARY_PATH` 项、同架构 `ldconfig` cache、CANN 布局和
+Driver 布局，并报告所有额外同名库。该步骤仍只读 ELF，不会 `dlopen`，
+也不会把该顺序宣称为已证明的运行时解析结果。
+
+控制面候选顺序是：
+
+1. 与当前 CANN/Driver/Device package 严格配套的 `libra.so` `RaCtx*`；
+2. 同一 `libra.so` 的完整 legacy AI-QP 接口；
+3. 已安装 `libhcomm.so` 的 resource C API，仅作 Endpoint/MR/Channel
+   初始化 bootstrap，建链后仍由 AIV+SIMT 直写 SQ/CQ；
+4. 前三者均不完整时停止，不再回退到猜测私有 HAL/UMDK
+   参数。
+
+第 3 项不是把 HCOMM 放回 decode 热路径。它只在 session/epoch
+初始化和销毁阶段执行；重复的 4096×1 KiB 或其他可配置 batch
+不调用 HCOMM/HCCP。这是当前最快打通端到端 H2D、同时保留
+后续替换为直接 HCCP client 的分层方案。
+
+## `halMemBindSibling` 的适用边界
+
+`halMemBindSibling` 不是 Host `libra.so` client 或 Host raw-map 的通用
+前置条件。它只在 HCCP Device/offline `CUSTOM_INTERFACE` 共享池
+分支中用于 Host PID 和 AICPU PID 的 sibling bind。Host 侧将
+JFC/Jetty/SQ/CQ/doorbell 映射到 `PROCESS_CP1` 主要依赖
+`halResAddrMapV2/halResAddrUnmapV2`。
+
+HCOMM 9.1 对 `halMemBindSibling` 只做精确名称的 `dlsym`，没有
+alias 或版本回退。如果 Device/offline 分支进入后仍无法解析/调用，
+源码会每 10 ms 重试，最多 12000 次，即约 120 s。预检必须
+将这项标记为 Device/offline capability 和长时延风险，不能再用它
+否定 Host client 候选；但对实际进入 UDMA Device service share-pool
+初始化的 backend，它仍是阻断性依赖。Host `libascend_hal.so` 本体未导出
+该符号也不能证明 Device service 环境必然缺失它，因为依赖 DSO 的解析闭包
+和设备侧运行环境仍需单独核对。
+
+## 为什么不单独自行编译 `libra.so`
+
+HCCP 的 A5 直写队列路径是 `NETWORK_OFFLINE/HDC`：Host RA 通过
+HDC 请求 Device `hccp_service.bin`，由设备侧与 Driver 配套的
+UMDK/HAL 创建并映射 JFC/Jetty，再返回 Device-visible 队列地址。
+HCOMM 9.1 的 `ra` target 还依赖 `ra_hdc`、`ra_peer`、`librs`、
+TSD/network service 以及设备侧 compat package，不是可独立部署的最小
+client SO。
+
+所以，不应在共享服务器上用当前源码单独编译一个
+`libra.so` 去搭配不透明的现有 Device package。首选是发现并审计
+已安装的同版本 Host 库；若确实缺失，要么使用已安装
+`libhcomm.so` 的资源 C API，要么取得官方同源 Host package。只有
+能同时替换 Host 和 Device HCCP package 时，才考虑 exact-commit 的完整
+HCOMM build。
+
+若 direct `libra.so` 不完整而静态审计把 `libhcomm-resource-api` 列为静态符号候选，
+仍需额外核对
+HCOMM header/runtime 版本、AIV ChannelEntity ABI 和可重试逆序销毁；
+`KVAF_HCCP_BACKEND_READY` 在这些验证完成前保持 `no`。

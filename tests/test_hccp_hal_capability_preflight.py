@@ -50,12 +50,15 @@ drvError_t halResAddrUnmapV2(unsigned int, struct res_map_info_in *);
 """
 
 
-ALL_SYMBOLS = (
+HAL_SYMBOLS = (
     "drvDeviceGetIndexByPhyId",
     "halQueryDevpid",
     "halMemBindSibling",
     "halResAddrMapV2",
     "halResAddrUnmapV2",
+)
+
+RA_SYMBOLS = (
     "RaCtxInit",
     "RaCtxDeinit",
     "RaCtxLmemRegister",
@@ -87,6 +90,21 @@ ALL_SYMBOLS = (
     "RaGetQpStatus",
 )
 
+HCOMM_SYMBOLS = (
+    "HcommEndpointCreate",
+    "HcommEndpointDestroy",
+    "HcommMemReg",
+    "HcommMemUnreg",
+    "HcommMemExport",
+    "HcommMemImport",
+    "HcommMemUnimport",
+    "HcommChannelCreate",
+    "HcommChannelGetStatus",
+    "HcommChannelDestroy",
+)
+
+ALL_SYMBOLS = HAL_SYMBOLS + RA_SYMBOLS + HCOMM_SYMBOLS
+
 
 class HccpHalCapabilityPreflightTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -104,29 +122,77 @@ class HccpHalCapabilityPreflightTests(unittest.TestCase):
         self.library.write_bytes(b"not loaded by the preflight\n")
         self.ra_library.write_bytes(b"not loaded by the preflight\n")
         self.nm = self.bin_dir / "kvaf-nm"
+        self.ldconfig = self.bin_dir / "kvaf-ldconfig"
         self.write_nm(ALL_SYMBOLS)
+        self.write_ldconfig(())
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
 
     def write_nm(self, symbols: tuple[str, ...]) -> None:
-        body = "\n".join(f"0000000000001000 T {name}" for name in symbols)
+        def body_for(domain: tuple[str, ...]) -> str:
+            return "\n".join(
+                f"0000000000001000 T {name}"
+                for name in symbols
+                if name in domain
+            )
+
         self.nm.write_text(
-            "#!/bin/sh\ncat <<'KVAF_NM'\n" + body + "\nKVAF_NM\n",
+            "#!/bin/sh\n"
+            "for kvaf_arg do kvaf_library=$kvaf_arg; done\n"
+            "case ${kvaf_library##*/} in\n"
+            "  libascend_hal.so) cat <<'KVAF_HAL_NM'\n"
+            + body_for(HAL_SYMBOLS)
+            + "\nKVAF_HAL_NM\n"
+            "    ;;\n"
+            "  libra.so) cat <<'KVAF_RA_NM'\n"
+            + body_for(RA_SYMBOLS)
+            + "\nKVAF_RA_NM\n"
+            "    ;;\n"
+            "  libhcomm.so) cat <<'KVAF_HCOMM_NM'\n"
+            + body_for(HCOMM_SYMBOLS)
+            + "\nKVAF_HCOMM_NM\n"
+            "    ;;\n"
+            "  *) exit 2 ;;\n"
+            "esac\n",
             encoding="utf-8",
         )
         self.nm.chmod(self.nm.stat().st_mode | stat.S_IXUSR)
+
+    def write_ldconfig(self, libraries: tuple[Path, ...]) -> None:
+        entries = "\n".join(
+            f"\t{library.name} (libc6,AArch64) => {library}"
+            for library in libraries
+        )
+        self.ldconfig.write_text(
+            "#!/bin/sh\n"
+            "test \"${1:-}\" = -p || exit 2\n"
+            "cat <<'KVAF_LDCONFIG'\n"
+            + entries
+            + "\nKVAF_LDCONFIG\n",
+            encoding="utf-8",
+        )
+        self.ldconfig.chmod(self.ldconfig.stat().st_mode | stat.S_IXUSR)
 
     def run_preflight(self) -> subprocess.CompletedProcess[str]:
         cc = shutil.which("cc")
         if cc is None:
             self.skipTest("C compiler is unavailable")
         env = os.environ.copy()
+        for name in (
+            "ASCEND_HOME_PATH",
+            "LD_LIBRARY_PATH",
+            "KVAF_HCCP_RA_LIBRARY",
+            "KVAF_HCCP_HCOMM_LIBRARY",
+        ):
+            env.pop(name, None)
         env.update(
             {
                 "KVAF_ASCEND_DRIVER_ROOT": str(self.root),
                 "KVAF_HCCP_HAL_CC": cc,
                 "KVAF_HCCP_HAL_NM": str(self.nm),
+                "KVAF_HCCP_LDCONFIG": str(self.ldconfig),
+                "KVAF_HCCP_HOST_MACHINE": "aarch64",
             }
         )
         return subprocess.run(
@@ -167,6 +233,12 @@ class HccpHalCapabilityPreflightTests(unittest.TestCase):
         self.assertIn("RaCtxQpCreate", source)
         self.assertIn("RaAiQpCreate", source)
         self.assertIn("host-owned-libra-init-aiv-direct-data-plane", source)
+        self.assertIn("ASCEND_HOME_PATH", source)
+        self.assertIn("LD_LIBRARY_PATH", source)
+        self.assertIn("KVAF_HCCP_LDCONFIG", source)
+        self.assertIn("HcommEndpointCreate", source)
+        self.assertIn("HcommChannelGetStatus", source)
+        self.assertIn("initialization-bootstrap-only-not-aiv-hot-path", source)
         self.assertIn("KVAF_HAL_PROBE_BASELINE", source)
         self.assertIn("UdmaVaInfo_private_payload", source)
         self.assertIn("hccp_hal_private_abi.h", probe)
@@ -208,11 +280,54 @@ class HccpHalCapabilityPreflightTests(unittest.TestCase):
             result.stdout,
         )
         self.assertIn(
+            "KVAF_HCCP_RA_DISCOVERY_SOURCE=driver-layout", result.stdout
+        )
+        self.assertIn(
+            "KVAF_HCCP_RA_DISCOVERY_CANDIDATE_COUNT=1", result.stdout
+        )
+        self.assertIn(
             "KVAF_A5_HCCP_CONTROL_PLANE_STATIC_AUDIT_OK", result.stdout
         )
         self.assertIn(
             "KVAF_HCCP_RA_PRODUCT_MODE_SUPPORT="
             "unproven-user-ctl-and-custom-sq-must-be-probed",
+            result.stdout,
+        )
+        self.assertIn(
+            "KVAF_HCCP_DEVICE_OFFLINE_SHAREPOOL_SURFACE="
+            "complete-selected-dso-symbol-only",
+            result.stdout,
+        )
+
+    def test_missing_bind_sibling_does_not_reject_host_map_surface(self) -> None:
+        self.write_nm(tuple(s for s in ALL_SYMBOLS if s != "halMemBindSibling"))
+        result = self.run_preflight()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "KVAF_HCCP_HAL_LIBRARY_SYMBOL_halMemBindSibling=missing",
+            result.stdout,
+        )
+        self.assertIn(
+            "KVAF_HCCP_HOST_MAP_REQUIRED_SYMBOL_MISSING_COUNT=0",
+            result.stdout,
+        )
+        self.assertIn(
+            "KVAF_HCCP_DEVICE_OFFLINE_SHAREPOOL_SURFACE="
+            "incomplete-selected-dso-symbol-only",
+            result.stdout,
+        )
+        self.assertIn(
+            "KVAF_HCCP_DEVICE_OFFLINE_MISSING_BIND_BEHAVIOR="
+            "hcomm-9.1-retries-up-to-120s-if-entered",
+            result.stdout,
+        )
+        self.assertIn(
+            "KVAF_HCCP_HAL_SURFACE=declarations-complete",
+            result.stdout,
+        )
+        self.assertIn(
+            "KVAF_HCCP_CONTROL_PLANE_CANDIDATE=libra-ra-ctx",
             result.stdout,
         )
 
@@ -310,6 +425,223 @@ class HccpHalCapabilityPreflightTests(unittest.TestCase):
         )
         self.assertIn("KVAF_HCCP_BACKEND_READY=no", result.stdout)
 
+    def test_discovers_cann_arch_library_outside_driver_tree(self) -> None:
+        self.ra_library.unlink()
+        cann_root = Path(self.tempdir.name) / "cann-9.1.0"
+        cann_library = cann_root / "aarch64-linux" / "lib64" / "libra.so"
+        cann_library.parent.mkdir(parents=True)
+        cann_library.write_bytes(b"CANN libra is inspected but not loaded\n")
+
+        cc = shutil.which("cc")
+        if cc is None:
+            self.skipTest("C compiler is unavailable")
+        env = os.environ.copy()
+        env.pop("LD_LIBRARY_PATH", None)
+        env.update(
+            {
+                "ASCEND_HOME_PATH": str(cann_root),
+                "KVAF_ASCEND_DRIVER_ROOT": str(self.root),
+                "KVAF_HCCP_HAL_CC": cc,
+                "KVAF_HCCP_HAL_NM": str(self.nm),
+                "KVAF_HCCP_LDCONFIG": str(self.ldconfig),
+            }
+        )
+        result = subprocess.run(
+            ["bash", str(PREFLIGHT)], cwd=ROOT, env=env, text=True,
+            capture_output=True, check=False
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            f"KVAF_HCCP_RA_LIBRARY={cann_library.resolve()}", result.stdout
+        )
+        self.assertIn(
+            "KVAF_HCCP_RA_DISCOVERY_SOURCE=ascend-home-layout",
+            result.stdout,
+        )
+        self.assertIn(
+            "KVAF_HCCP_CONTROL_PLANE_CANDIDATE=libra-ra-ctx",
+            result.stdout,
+        )
+
+    def test_ld_library_path_has_loader_precedence_and_deduplicates(self) -> None:
+        runtime_dir = Path(self.tempdir.name) / "runtime-lib"
+        runtime_dir.mkdir()
+        runtime_library = runtime_dir / "libra.so"
+        runtime_library.write_bytes(b"runtime-selected libra\n")
+        self.ra_library.unlink()
+        self.ra_library.symlink_to(runtime_library)
+
+        cc = shutil.which("cc")
+        if cc is None:
+            self.skipTest("C compiler is unavailable")
+        env = os.environ.copy()
+        env.pop("ASCEND_HOME_PATH", None)
+        env.update(
+            {
+                "LD_LIBRARY_PATH": f"relative:{runtime_dir}::{runtime_dir}",
+                "KVAF_ASCEND_DRIVER_ROOT": str(self.root),
+                "KVAF_HCCP_HAL_CC": cc,
+                "KVAF_HCCP_HAL_NM": str(self.nm),
+                "KVAF_HCCP_LDCONFIG": str(self.ldconfig),
+            }
+        )
+        result = subprocess.run(
+            ["bash", str(PREFLIGHT)], cwd=ROOT, env=env, text=True,
+            capture_output=True, check=False
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            f"KVAF_HCCP_RA_LIBRARY={runtime_library.resolve()}", result.stdout
+        )
+        self.assertIn(
+            "KVAF_HCCP_RA_DISCOVERY_SOURCE=ld-library-path", result.stdout
+        )
+        self.assertIn(
+            "KVAF_HCCP_RA_DISCOVERY_CANDIDATE_COUNT=1", result.stdout
+        )
+        self.assertIn(
+            "KVAF_HCCP_RA_DISCOVERY_LD_LIBRARY_PATH_IGNORED_COUNT=2",
+            result.stdout,
+        )
+
+    def test_ldconfig_cache_is_used_when_loader_path_has_no_library(self) -> None:
+        self.ra_library.unlink()
+        cache_dir = Path(self.tempdir.name) / "cache-lib"
+        cache_dir.mkdir()
+        cache_library = cache_dir / "libra.so"
+        cache_library.write_bytes(b"cached libra\n")
+        self.write_ldconfig((cache_library,))
+
+        result = self.run_preflight()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            f"KVAF_HCCP_RA_LIBRARY={cache_library.resolve()}", result.stdout
+        )
+        self.assertIn(
+            "KVAF_HCCP_RA_DISCOVERY_SOURCE=ldconfig-cache", result.stdout
+        )
+        self.assertIn(
+            "KVAF_HCCP_RA_DISCOVERY_LDCONFIG=readable", result.stdout
+        )
+
+    def test_ldconfig_cache_rejects_wrong_machine_entry(self) -> None:
+        self.ra_library.unlink()
+        wrong_dir = Path(self.tempdir.name) / "x86-cache-lib"
+        right_dir = Path(self.tempdir.name) / "arm-cache-lib"
+        wrong_dir.mkdir()
+        right_dir.mkdir()
+        wrong_library = wrong_dir / "libra.so"
+        right_library = right_dir / "libra.so"
+        wrong_library.write_bytes(b"wrong-machine libra\n")
+        right_library.write_bytes(b"matching-machine libra\n")
+        self.ldconfig.write_text(
+            "#!/bin/sh\n"
+            "test \"${1:-}\" = -p || exit 2\n"
+            "cat <<'KVAF_LDCONFIG'\n"
+            f"\tlibra.so (libc6,x86-64) => {wrong_library}\n"
+            f"\tlibra.so (libc6,AArch64) => {right_library}\n"
+            "KVAF_LDCONFIG\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_preflight()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            f"KVAF_HCCP_RA_LIBRARY={right_library.resolve()}", result.stdout
+        )
+        self.assertNotIn(str(wrong_library.resolve()), result.stdout)
+
+    def test_ldconfig_failure_is_reported_without_aborting_layout_audit(
+        self,
+    ) -> None:
+        self.ldconfig.write_text("#!/bin/sh\nexit 9\n", encoding="utf-8")
+
+        result = self.run_preflight()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "KVAF_HCCP_RA_DISCOVERY_LDCONFIG=failed", result.stdout
+        )
+        self.assertIn(
+            "KVAF_HCCP_RA_DISCOVERY_SOURCE=driver-layout", result.stdout
+        )
+
+    def test_distinct_loader_candidates_are_reported_not_silently_merged(self) -> None:
+        first_dir = Path(self.tempdir.name) / "first-runtime-lib"
+        second_dir = Path(self.tempdir.name) / "second-runtime-lib"
+        first_dir.mkdir()
+        second_dir.mkdir()
+        first_library = first_dir / "libra.so"
+        second_library = second_dir / "libra.so"
+        first_library.write_bytes(b"first runtime libra\n")
+        second_library.write_bytes(b"second runtime libra\n")
+
+        cc = shutil.which("cc")
+        if cc is None:
+            self.skipTest("C compiler is unavailable")
+        env = os.environ.copy()
+        env.pop("ASCEND_HOME_PATH", None)
+        env.update(
+            {
+                "LD_LIBRARY_PATH": f"{first_dir}:{second_dir}",
+                "KVAF_ASCEND_DRIVER_ROOT": str(self.root),
+                "KVAF_HCCP_HAL_CC": cc,
+                "KVAF_HCCP_HAL_NM": str(self.nm),
+                "KVAF_HCCP_LDCONFIG": str(self.ldconfig),
+            }
+        )
+        result = subprocess.run(
+            ["bash", str(PREFLIGHT)], cwd=ROOT, env=env, text=True,
+            capture_output=True, check=False
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            f"KVAF_HCCP_RA_LIBRARY={first_library.resolve()}", result.stdout
+        )
+        self.assertIn(
+            "KVAF_HCCP_RA_DISCOVERY_CANDIDATE_COUNT=3", result.stdout
+        )
+        self.assertIn(
+            "KVAF_HCCP_RA_DISCOVERY_ADDITIONAL_COUNT=2", result.stdout
+        )
+        self.assertIn(
+            f"KVAF_HCCP_RA_DISCOVERY_CANDIDATE_1={second_library.resolve()}",
+            result.stdout,
+        )
+
+    def test_explicit_ra_library_may_be_in_versioned_cann_tree(self) -> None:
+        external = Path(self.tempdir.name) / "versioned-cann" / "libra.so"
+        external.parent.mkdir()
+        external.write_bytes(b"explicit CANN libra\n")
+        cc = shutil.which("cc")
+        if cc is None:
+            self.skipTest("C compiler is unavailable")
+        env = os.environ.copy()
+        env.update(
+            {
+                "KVAF_ASCEND_DRIVER_ROOT": str(self.root),
+                "KVAF_HCCP_RA_LIBRARY": str(external),
+                "KVAF_HCCP_HAL_CC": cc,
+                "KVAF_HCCP_HAL_NM": str(self.nm),
+                "KVAF_HCCP_LDCONFIG": str(self.ldconfig),
+            }
+        )
+        result = subprocess.run(
+            ["bash", str(PREFLIGHT)], cwd=ROOT, env=env, text=True,
+            capture_output=True, check=False
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            f"KVAF_HCCP_RA_LIBRARY={external.resolve()}", result.stdout
+        )
+        self.assertIn("KVAF_HCCP_RA_DISCOVERY_SOURCE=explicit", result.stdout)
+
     def test_incomplete_ra_surface_is_inventory_not_hardware_authorization(self) -> None:
         self.write_nm(tuple(s for s in ALL_SYMBOLS if not s.startswith("RaCtx")))
         result = self.run_preflight()
@@ -320,6 +652,110 @@ class HccpHalCapabilityPreflightTests(unittest.TestCase):
             result.stdout,
         )
         self.assertIn("KVAF_HCCP_BACKEND_READY=no", result.stdout)
+
+    def test_complete_hcomm_resource_api_is_fallback_when_libra_is_absent(
+        self,
+    ) -> None:
+        self.ra_library.unlink()
+        cann_root = Path(self.tempdir.name) / "cann-9.1.0"
+        hcomm_library = cann_root / "aarch64-linux" / "lib64" / "libhcomm.so"
+        hcomm_library.parent.mkdir(parents=True)
+        hcomm_library.write_bytes(b"HCOMM inspected but not loaded\n")
+
+        cc = shutil.which("cc")
+        if cc is None:
+            self.skipTest("C compiler is unavailable")
+        env = os.environ.copy()
+        env.pop("LD_LIBRARY_PATH", None)
+        env.pop("KVAF_HCCP_RA_LIBRARY", None)
+        env.pop("KVAF_HCCP_HCOMM_LIBRARY", None)
+        env.update(
+            {
+                "ASCEND_HOME_PATH": str(cann_root),
+                "KVAF_ASCEND_DRIVER_ROOT": str(self.root),
+                "KVAF_HCCP_HAL_CC": cc,
+                "KVAF_HCCP_HAL_NM": str(self.nm),
+                "KVAF_HCCP_LDCONFIG": str(self.ldconfig),
+            }
+        )
+        result = subprocess.run(
+            ["bash", str(PREFLIGHT)], cwd=ROOT, env=env, text=True,
+            capture_output=True, check=False
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("KVAF_HCCP_CONTROL_PLANE_CANDIDATE=none-libra-not-found", result.stdout)
+        self.assertIn(
+            f"KVAF_HCCP_HCOMM_LIBRARY={hcomm_library.resolve()}",
+            result.stdout,
+        )
+        self.assertIn(
+            "KVAF_HCCP_HCOMM_DISCOVERY_SOURCE=ascend-home-layout",
+            result.stdout,
+        )
+        self.assertIn(
+            "KVAF_HCCP_HCOMM_RESOURCE_SURFACE=complete-symbols-only",
+            result.stdout,
+        )
+        self.assertIn(
+            "KVAF_HCCP_CONTROL_PLANE_FALLBACK_STATIC_SYMBOL_CANDIDATE="
+            "libhcomm-resource-api",
+            result.stdout,
+        )
+        self.assertIn(
+            "KVAF_HCCP_SELECTED_STATIC_SYMBOL_CANDIDATE="
+            "libhcomm-resource-api",
+            result.stdout,
+        )
+        self.assertIn("KVAF_HCCP_BACKEND_READY=no", result.stdout)
+
+    def test_incomplete_hcomm_resource_api_is_not_selected(self) -> None:
+        self.ra_library.unlink()
+        self.write_nm(
+            tuple(s for s in ALL_SYMBOLS if s != "HcommChannelDestroy")
+        )
+        hcomm_library = self.root / "lib64" / "common" / "libhcomm.so"
+        hcomm_library.write_bytes(b"incomplete HCOMM inspected only\n")
+
+        result = self.run_preflight()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "KVAF_HCCP_HCOMM_RESOURCE_SYMBOL_HcommChannelDestroy=missing",
+            result.stdout,
+        )
+        self.assertIn(
+            "KVAF_HCCP_HCOMM_RESOURCE_SURFACE=incomplete", result.stdout
+        )
+        self.assertIn(
+            "KVAF_HCCP_SELECTED_STATIC_SYMBOL_CANDIDATE="
+            "none-usable-static-symbol-surface",
+            result.stdout,
+        )
+
+    def test_relative_explicit_hcomm_library_is_rejected(self) -> None:
+        cc = shutil.which("cc")
+        if cc is None:
+            self.skipTest("C compiler is unavailable")
+        env = os.environ.copy()
+        env.update(
+            {
+                "KVAF_ASCEND_DRIVER_ROOT": str(self.root),
+                "KVAF_HCCP_HCOMM_LIBRARY": "relative/libhcomm.so",
+                "KVAF_HCCP_HAL_CC": cc,
+                "KVAF_HCCP_HAL_NM": str(self.nm),
+                "KVAF_HCCP_LDCONFIG": str(self.ldconfig),
+                "KVAF_HCCP_HOST_MACHINE": "aarch64",
+            }
+        )
+
+        result = subprocess.run(
+            ["bash", str(PREFLIGHT)], cwd=ROOT, env=env, text=True,
+            capture_output=True, check=False
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("libhcomm.so path must be absolute", result.stderr)
 
     def test_unusable_header_is_reported_as_baseline_failure(self) -> None:
         self.header.write_text("#error broken installed header\n", encoding="utf-8")
