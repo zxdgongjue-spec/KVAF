@@ -274,12 +274,18 @@ if(KVAF_A5_BUILD_HCOMM_BACKEND)
   # Jetty, SQ, CQ or WQE.  It is the first hardware-bearing stage for the
   # HCCP-backed resource lifecycle: Host DDR/HBM MR registration, descriptor
   # export where applicable, and strict resource-before-memory teardown.
+  #
+  # `hcomm_res.h` pulls in CANN's secure-C helpers.  On CANN 9.1 bisheng's
+  # ordinary Host link path omits their runtime and the C++ standard runtime;
+  # reuse the proven AscendC fat-object link path used by the HCOMM smoke
+  # target.  This is a link/runtime choice only: this target has no device
+  # kernel translation unit and never launches an AIV kernel.
   add_executable(kvaf_a5_hccp_resource_lifecycle_probe
     src/host_ddr_mapping.cpp
     src/hcomm_urma_resources.cpp
     smoke/hccp_resource_lifecycle_probe.cpp
   )
-  kvaf_configure_a5_host_target(kvaf_a5_hccp_resource_lifecycle_probe)
+  kvaf_configure_a5_target(kvaf_a5_hccp_resource_lifecycle_probe)
   target_include_directories(kvaf_a5_hccp_resource_lifecycle_probe PRIVATE
     ${KVAF_HCOMM_RESOURCE_INCLUDE_DIR}
   )

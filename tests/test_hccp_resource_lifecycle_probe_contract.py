@@ -74,6 +74,10 @@ class HccpResourceLifecycleProbeContractTests(unittest.TestCase):
         self.assertIn("kvaf_a5_hccp_resource_lifecycle_probe", cmake)
         self.assertIn("smoke/hccp_resource_lifecycle_probe.cpp", cmake)
         self.assertIn("${KVAF_HCOMM_LIBRARY}", cmake)
+        self.assertIn(
+            "kvaf_configure_a5_target(kvaf_a5_hccp_resource_lifecycle_probe)",
+            cmake,
+        )
         self.assertIn("kvaf_a5_hccp_resource_lifecycle_probe", build)
 
     def test_hcomm_close_retains_dependency_state_but_drains_safe_siblings(self) -> None:
