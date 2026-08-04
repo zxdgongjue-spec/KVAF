@@ -210,6 +210,15 @@ def main() -> int:
     # passing its caller-owned streams through the pybind Runtime.
     torch.npu.set_device(device_id)
     device = f"npu:{device_id}"
+    native_constructor_doc = getattr(kvaf.NpuRuntime.__init__, "__doc__", "")
+    if "retain_unsynchronized_launch_args" not in native_constructor_doc:
+        print(
+            "FAIL: stale KVAF native binding: NpuRuntime lacks "
+            "retain_unsynchronized_launch_args. Rebuild _kvaf from the current "
+            "source and use PYTHONPATH=build-aiv/python.",
+            file=sys.stderr,
+        )
+        return 2
     runtime = kvaf.NpuRuntime(
         str(kernel),
         device_id,

@@ -10,6 +10,8 @@ target_include_directories(_kvaf
     ${CMAKE_CURRENT_SOURCE_DIR}/../access_operator/include
 )
 
+set(KVAF_PYTHON_BINDING_PREFLIGHT "import kvaf")
+
 if(KVAF_ENABLE_AIV_BATCH_GET)
   target_sources(_kvaf PRIVATE
     acl_python_utils.cc
@@ -39,6 +41,9 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
   set_property(TARGET _kvaf APPEND PROPERTY BUILD_RPATH
     "$<TARGET_FILE_DIR:kvaf_execute_batch_get_host>"
   )
+  set(KVAF_PYTHON_BINDING_PREFLIGHT
+    "import kvaf; assert hasattr(kvaf, 'AclStream'); assert 'retain_unsynchronized_launch_args' in kvaf.NpuRuntime.__init__.__doc__"
+  )
 endif()
 
 set_target_properties(_kvaf PROPERTIES
@@ -55,5 +60,5 @@ add_custom_command(TARGET _kvaf POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E env
     "PYTHONPATH=${CMAKE_BINARY_DIR}/python"
     "${Python_EXECUTABLE}" -c
-    "import kvaf"
+    "${KVAF_PYTHON_BINDING_PREFLIGHT}"
 )

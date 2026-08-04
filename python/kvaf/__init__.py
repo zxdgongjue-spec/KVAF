@@ -26,6 +26,7 @@ access_operator = _native.access_operator
 if hasattr(_native, "NpuRuntime"):
     NpuRuntime = _native.NpuRuntime
     AclGraph = _native.AclGraph
+    AclStream = _native.AclStream
     # These are fixed host/kernel ABI values from batch_get_abi.h. Keep them in
     # Python instead of module-level C++ attribute assignment so the binding
     # also loads with the target's pybind11 2.10.x / Python 3.13 combination.
@@ -47,6 +48,7 @@ if hasattr(_native, "NpuRuntime"):
     __all__ += [
         "NpuRuntime",
         "AclGraph",
+        "AclStream",
         "NPU_BATCH_GET_STATUS_BYTES",
         "NPU_BATCH_GET_QUEUE_STATE_BYTES",
         "NPU_BATCH_GET_STATUS_MAGIC",
