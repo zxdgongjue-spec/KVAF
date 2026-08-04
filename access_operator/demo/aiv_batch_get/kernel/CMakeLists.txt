@@ -26,6 +26,7 @@ find_path(KVAF_SIMT_API_DIR NAMES simt_api/device_atomic_functions.h HINTS
   "${ASCEND_CANN_PACKAGE_PATH}/include/ascendc"
   "${ASCEND_CANN_PACKAGE_PATH}/compiler/include"
   "${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/include"
+  "${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include"
   "${ASCEND_CANN_PACKAGE_PATH}/x86_64-linux/include"
   "${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw/include"
   "${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw/lib"
