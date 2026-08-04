@@ -49,8 +49,10 @@ addresses receive a new local MR and entity table but reuse the transport.
 
 ## What is included
 
-- `kernel/execute_batch_get_aiv.asc`: AIV UDMA READ WQE producer and CQ owner
-  polling. It never uses MTE to dereference Host DDR.
+- `kernel/execute_batch_get_aiv.asc`: SIMT-validates and compacts requests,
+  generates 32 UDMA READ WQEs in parallel, and overlaps vector fill, MTE3
+  UB-to-SQ copies, and scalar doorbells with two UB banks. It never uses MTE to
+  dereference Host DDR.
 - `host/batch_get_host.cpp`: CPU/device EID discovery, Direct-HCCP transport,
   Host-DDR registration, per-output HBM-MR cache, and one private USER_CTL
   SQ/CQ/Jetty per AIV.
@@ -63,6 +65,24 @@ addresses receive a new local MR and entity table but reuse the transport.
 The checked Direct-HCCP declarations in `include/direct_hccp_abi.h` are the
 minimum private driver ABI needed to create the queue resources. They must be
 rebuilt against the target CANN/driver combination.
+
+## Pipelined kernel boundary
+
+The data path keeps the public KVAF ABI and the verified Direct-HCCP WQE token
+fields. It does not copy the AIV_URMA benchmark's server/client handshake,
+control-region writes, fixed 64K request shape, or per-launch CQ reset.
+
+Each AIV first validates its complete request partition before touching the SQ,
+preserving the all-or-nothing safety rule for invalid table/output addresses.
+It then compacts mask entries in windows of 4096 request slots. The UB active-ID
+array is reused between windows, so 4096 is a scratch-window size rather than an
+active-request limit. The complete active count must still be smaller than the
+private SQ depth. Each 32-WQE post advances the persistent producer index and
+rings the doorbell; only the final READ requests a CQE. Persistent caller-owned
+SQ/CQ indices remain valid across eager calls and graph replays.
+
+The ACL launcher explicitly reserves 128 KiB of AIV local memory for the two
+WQE banks and SIMT validation/compaction scratch.
 
 ## Build and run on A5
 
@@ -87,6 +107,12 @@ WARMUP=1 ITERATIONS=1 bash scripts/run_execute_batch_get.sh
 # Proves TransportCreate -> Acquire(A) -> Acquire(B) -> re-Acquire(A), then
 # releases both local-buffer references without rebuilding EID/CTP/Jettys.
 DEVICE_ID=0 DYNAMIC_OUTPUT_SMOKE=1 WARMUP=1 ITERATIONS=1 \
+bash scripts/run_execute_batch_get.sh
+
+# Exercises multiple 4096-request compaction windows per AIV while keeping
+# each core below its private SQ depth.
+DEVICE_ID=0 TABLE_CAPACITY=4096 REQUESTS=65536 OUTPUT_ROWS=65536 \
+AIV_CORES=4 MASK_EVERY=5 WARMUP=1 ITERATIONS=1 \
 bash scripts/run_execute_batch_get.sh
 
 DEVICE_ID=0 GRAPH_REPLAYS=4 GRAPH_WARMUP=1 GRAPH_ITERATIONS=5 \
