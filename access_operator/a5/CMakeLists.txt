@@ -292,6 +292,23 @@ if(KVAF_A5_BUILD_HCOMM_BACKEND)
   target_link_libraries(kvaf_a5_hccp_resource_lifecycle_probe PRIVATE
     ${KVAF_HCOMM_LIBRARY}
   )
+
+  # The next HCCP stage is still strictly zero-WQE.  It creates the exact
+  # asymmetric Host-CPU / Device-AIV channel that production will later hand
+  # to AIV, then snapshots its queue metadata and tears it down.  It contains
+  # no device kernel translation unit and never launches an AIV kernel.
+  add_executable(kvaf_a5_hccp_aiv_channel_probe
+    src/host_ddr_mapping.cpp
+    src/hcomm_urma_resources.cpp
+    smoke/hccp_aiv_channel_probe.cpp
+  )
+  kvaf_configure_a5_target(kvaf_a5_hccp_aiv_channel_probe)
+  target_include_directories(kvaf_a5_hccp_aiv_channel_probe PRIVATE
+    ${KVAF_HCOMM_RESOURCE_INCLUDE_DIR}
+  )
+  target_link_libraries(kvaf_a5_hccp_aiv_channel_probe PRIVATE
+    ${KVAF_HCOMM_LIBRARY}
+  )
 endif()
 
 if(KVAF_A5_BUILD_DIRECT_URMA_BACKEND)

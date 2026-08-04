@@ -70,7 +70,8 @@ class HcommUrmaResources {
                       MemoryLocation expected_location,
                       ImportedMemoryView* view);
   Status CreateChannel(const EndpointSpec& peer, ChannelEngine engine,
-                       ChannelRole role);
+                       ChannelRole role,
+                       const std::string& channel_name = {});
   Status PollChannelReady(bool* ready);
   Status WaitChannelReady(std::uint32_t timeout_ms);
   Status SnapshotDirectChannel(Address local_address,

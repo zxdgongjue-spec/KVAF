@@ -133,6 +133,54 @@ ACL logical-device context，再调用 `aclFinalize`。这不是 `npu-smi set -t
 资源阶段通过后，下一步会增加两方 AIV channel 的无 WQE create/ready/snapshot/close，最后
 才打开可配置 descriptor batch 的 AIV+SIMT READ 数据面。
 
+### 第二阶段：双端 AIV Channel 快照（严格零 WQE）
+
+当 `host-ddr` 与 `device-hbm` 都已通过后，使用
+`scripts/run_a5_hccp_aiv_channel_probe.sh` 验证**同一条** Host DDR →
+Device AIV 通道能否安全建立和销毁。该 probe 不是一次 H2D，也不会创建 ACL
+stream、启动 AIV/SIMT kernel、写 SQ、写 CQ 或 ring doorbell。它只读取 HCOMM
+已经创建的 metadata，因此 `WQE_SUBMISSIONS=0`。
+
+```text
+Host:   map Host DDR -> Endpoint -> Host MR/export
+Device: alloc HBM -> Endpoint -> Device MR
+        -> CreateChannel(AIV, SERVER) -> Poll once (arm)
+Host:   CreateChannel(CPU, CLIENT) -> both wait READY
+Device: import Host MR -> SnapshotDirectChannel (SQ/CQ/TP/token, zero counters)
+Host:   request Device detach
+Device: destroy channel -> unimport -> unregister Device MR -> free HBM
+Host:   destroy channel -> unregister Host MR -> unregister/free Host DDR
+```
+
+这里 Host 使用 CPU engine、Device 使用 AIV engine 是 HCOMM UBC/CTP 的既定
+配对，不应为了“对称”而改成两边 AIV。两端还使用同一随机 `run-id` 作为
+`HcommChannelDesc.channelName`；旧的匿名 channel 会允许共享 EID 上的旧进程或
+其他测试误匹配。HCOMM 可异步保留该 `char *`，所以 KVAF 将字符串保存在
+`HcommUrmaResources` 内部，直到 `HcommChannelDestroy` 已成功。
+
+销毁顺序比创建顺序更重要：Device 已导入 Host DDR 后，Host 绝不能抢先
+`HcommMemUnreg` 或撤销 HAL mapping。Device 必须先发布 nonce 绑定的
+`device.teardown_ok`，Host 才允许 Close 自己的 HCOMM resource 与 Host DDR。
+每个 marker 都是临时文件 `fsync` 后原子 rename 的结果，含 schema/run-id/stage，
+不是“只要文件存在即成功”。
+
+若任一 `Close` 在有限重试后仍不能证明成功，worker 会写 `unsafe.<role>` 并保持
+进程/背后内存存活；supervisor 只报告，不会 TERM/KILL 它，也不会偷偷释放可能仍被
+DMA 引用的内存。正常成功时两端才各自 `aclrtResetDevice`/`aclFinalize`，这仍是
+本进程 context 释放而非物理卡复位。
+
+同样地，当前公开 HCOMM 文档仅定义“返回 0 成功、非 0 失败”，没有承诺失败时所有
+输出句柄必为空、也没有承诺内部对象必不存在。KVAF 对“失败且无可销毁句柄”的 create/
+register/import 结果采用 fail-closed：不注销 Host DDR/HBM，而是保留 owner 进程并标为
+`unsafe`。这是故意避免把未证实为空的 DMA 引用变成卡复位问题；等产品 API 补充该失败
+契约后，才可以安全放宽为普通回收。
+
+通过此阶段只证明 HCCP 可交付给 AIV 的空闲 SQ/CQ/token 快照，并不证明 AIV/SIMT
+已经执行。下一阶段会单独启动一个不写 WQE 的 AIV/SIMT channel-validity kernel；只有它
+和本阶段都通过，才允许启用可配置的 decode epoch batch（transfer count、每项字节数、
+batch iterations、descriptor capacity）。这些资源会在 epoch 初始化一次，重复 H2D
+不会重新注册 MR 或重建 Channel。
+
 ## 安装布局与控制面选择
 
 HCCP 源码中的 Host client 目标名为 `ra`，但其安装位置不在

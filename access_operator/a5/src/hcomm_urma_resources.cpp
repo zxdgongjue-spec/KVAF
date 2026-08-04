@@ -28,6 +28,11 @@ constexpr std::int32_t kChannelConnecting = 1;
 constexpr std::uint32_t kPollIntervalMs = 10;
 constexpr std::uint32_t kDefaultQos = 4;
 constexpr std::uint32_t kMaximumChannelResources = 1024U;
+// HCOMM v3 documents HCOMM_CHANNEL_NAME_MAX_LEN as 191.  Keep the numeric
+// bound local because older public headers did not expose that macro, while a
+// named channel is essential to prevent two concurrent probes on the same EID
+// pair from anonymously pairing with each other.
+constexpr std::size_t kMaximumChannelNameBytes = 191U;
 constexpr std::int32_t kDirectRegedBufferRma = 1;
 constexpr std::int32_t kDirectProtectionUb = 1;
 constexpr std::int32_t kDirectSqUbJfs = 0;
@@ -193,6 +198,31 @@ void SetDefaultQos(T* desc) {
   }
 }
 
+template <typename T, typename = void>
+struct HasChannelName : std::false_type {};
+
+template <typename T>
+struct HasChannelName<
+    T, std::void_t<decltype(std::declval<T&>().channelName)>>
+    : std::true_type {};
+
+template <typename T>
+Status SetChannelName(T* desc, const std::string& name) {
+  if constexpr (HasChannelName<T>::value) {
+    // HCOMM keeps this pointer while its asynchronous channel construction is
+    // active.  The caller owns the backing string in HcommUrmaResources::Impl
+    // until HcommChannelDestroy has succeeded.
+    desc->channelName = name.empty() ? nullptr : name.c_str();
+    return Status::OK();
+  }
+  if (!name.empty()) {
+    return Status::Error(
+        StatusCode::kNotImplemented,
+        "installed public HCOMM headers do not expose ChannelDesc.channelName");
+  }
+  return Status::OK();
+}
+
 Status HcommFailure(const char* operation, std::int32_t result) {
   return Status::Error(StatusCode::kTransportError,
                        std::string(operation) + " failed, HCOMM ret=" +
@@ -249,8 +279,16 @@ struct HcommUrmaResources::Impl {
   EndpointHandle endpoint{nullptr};
   ChannelHandle channel{0};
   CommAbiHeader channel_abi_header{};
+  std::string channel_name;
   std::vector<Registration> registrations;
   std::vector<std::vector<std::uint8_t>> imported_descriptors;
+  // The public HCOMM reference specifies only that a nonzero return is a
+  // failure; it does not state that every out-parameter is guaranteed empty
+  // or that no internal object exists.  A null/zero output on a failed (or
+  // malformed successful) create operation is therefore not proof that the
+  // backing memory may be released.  Keep the owning process alive rather
+  // than guessing until the product contract explicitly supplies that proof.
+  const char* unproven_resource_operation{nullptr};
   bool closed{false};
 };
 
@@ -273,12 +311,18 @@ Status HcommUrmaResources::OpenEndpoint(const EndpointSpec& local) {
   EndpointHandle endpoint = nullptr;
   const auto result = HcommEndpointCreate(&desc, &endpoint);
   if (result != 0) {
+    // HCOMM may return a partially created endpoint together with an error.
+    // Keep it owned so Close can retry destruction; dropping it would make a
+    // subsequent MR/Host-DDR cleanup race an unknown endpoint lifetime.
     if (endpoint != nullptr) {
-      (void)HcommEndpointDestroy(endpoint);
+      impl_->endpoint = endpoint;
+    } else {
+      impl_->unproven_resource_operation = "HcommEndpointCreate";
     }
     return HcommFailure("HcommEndpointCreate", result);
   }
   if (endpoint == nullptr) {
+    impl_->unproven_resource_operation = "HcommEndpointCreate";
     return HcommInvalidOutput("HcommEndpointCreate");
   }
   impl_->endpoint = endpoint;
@@ -301,24 +345,32 @@ Status HcommUrmaResources::RegisterMemory(
   memory.addr = reinterpret_cast<void*>(address);
   memory.size = bytes;
 
+  // Reserve before HCOMM can hand back a live handle.  No allocation may be
+  // needed after the call while recording a partial/successful registration.
+  try {
+    impl_->registrations.reserve(impl_->registrations.size() + 1U);
+  } catch (const std::bad_alloc&) {
+    return Status::Error(StatusCode::kOutOfMemory,
+                         "reserving HCOMM registration tracking failed");
+  }
   HcommMemHandle handle = nullptr;
   const auto result =
       HcommMemReg(impl_->endpoint, tag.c_str(), &memory, &handle);
+  if (handle != nullptr) {
+    impl_->registrations.push_back({handle});
+  }
   if (result != 0) {
-    if (handle != nullptr) {
-      (void)HcommMemUnreg(impl_->endpoint, handle);
+    // A non-null handle is retained above even on an error return.  The
+    // retryable Close path, rather than a best-effort rollback, decides when
+    // it is safe for the caller to release the registered backing memory.
+    if (handle == nullptr) {
+      impl_->unproven_resource_operation = "HcommMemReg";
     }
     return HcommFailure("HcommMemReg", result);
   }
   if (handle == nullptr) {
+    impl_->unproven_resource_operation = "HcommMemReg";
     return HcommInvalidOutput("HcommMemReg");
-  }
-  try {
-    impl_->registrations.push_back({handle});
-  } catch (const std::bad_alloc&) {
-    (void)HcommMemUnreg(impl_->endpoint, handle);
-    return Status::Error(StatusCode::kOutOfMemory,
-                         "tracking the HCOMM registration failed");
   }
   *registration_id =
       static_cast<std::uint32_t>(impl_->registrations.size() - 1);
@@ -366,28 +418,37 @@ Status HcommUrmaResources::ImportMemory(
                          "invalid endpoint, descriptor, or imported view");
   }
   CommMem memory{};
+  // Copy and reserve before the API call.  If HCOMM reports a partial or
+  // successful import, moving this preallocated descriptor into ownership
+  // cannot fail and makes HcommMemUnimport retryable through Close.
+  std::vector<std::uint8_t> retained_descriptor;
+  try {
+    retained_descriptor = descriptor;
+    impl_->imported_descriptors.reserve(
+        impl_->imported_descriptors.size() + 1U);
+  } catch (const std::bad_alloc&) {
+    return Status::Error(StatusCode::kOutOfMemory,
+                         "reserving HCOMM import tracking failed");
+  }
   const auto result =
       HcommMemImport(impl_->endpoint, descriptor.data(),
                      static_cast<std::uint32_t>(descriptor.size()), &memory);
   if (result != 0) {
     if (memory.addr != nullptr || memory.size != 0) {
-      (void)HcommMemUnimport(
-          impl_->endpoint, descriptor.data(),
-          static_cast<std::uint32_t>(descriptor.size()));
+      impl_->imported_descriptors.push_back(std::move(retained_descriptor));
+    } else {
+      impl_->unproven_resource_operation = "HcommMemImport";
     }
     return HcommFailure("HcommMemImport", result);
   }
+  impl_->imported_descriptors.push_back(std::move(retained_descriptor));
   if (memory.addr == nullptr || memory.size == 0) {
-    const auto rollback_result =
-        HcommMemUnimport(impl_->endpoint, descriptor.data(),
-                         static_cast<std::uint32_t>(descriptor.size()));
-    std::string message =
-        "HcommMemImport returned a null or empty memory view";
-    if (rollback_result != 0) {
-      message += "; HcommMemUnimport rollback failed, ret=" +
-                 std::to_string(rollback_result);
-    }
-    return Status::Error(StatusCode::kTransportError, message);
+    impl_->unproven_resource_operation = "HcommMemImport";
+    return Status::Error(
+        StatusCode::kTransportError,
+        "HcommMemImport returned a null or empty memory view; the worker "
+        "must retain process-owned backing until HCOMM documents the "
+        "failure contract");
   }
 
   ImportedMemoryView imported_view{};
@@ -399,25 +460,14 @@ Status HcommUrmaResources::ImportMemory(
   // DDR region as COMM_MEM_TYPE_DEVICE.  The descriptor producer is known by
   // this two-party exchange; preserve that explicit contract here.
   imported_view.location = expected_location;
-  try {
-    impl_->imported_descriptors.push_back(descriptor);
-  } catch (const std::bad_alloc&) {
-    const auto rollback_result =
-        HcommMemUnimport(impl_->endpoint, descriptor.data(),
-                         static_cast<std::uint32_t>(descriptor.size()));
-    if (rollback_result != 0) {
-      return HcommFailure("HcommMemUnimport rollback", rollback_result);
-    }
-    return Status::Error(StatusCode::kOutOfMemory,
-                         "tracking the HCOMM import descriptor failed");
-  }
   *view = imported_view;
   return Status::OK();
 }
 
 Status HcommUrmaResources::CreateChannel(const EndpointSpec& peer,
                                          ChannelEngine engine,
-                                         ChannelRole role) {
+                                         ChannelRole role,
+                                         const std::string& channel_name) {
   if (impl_->endpoint == nullptr || impl_->channel != 0) {
     return Status::Error(StatusCode::kInvalidArgument,
                          "endpoint is absent or channel already exists");
@@ -441,6 +491,22 @@ Status HcommUrmaResources::CreateChannel(const EndpointSpec& peer,
   desc.port = 0;
   SetDefaultQos(&desc);
 
+  if (channel_name.size() > kMaximumChannelNameBytes) {
+    return Status::Error(StatusCode::kInvalidArgument,
+                         "HCOMM channel name exceeds the documented limit");
+  }
+  try {
+    impl_->channel_name = channel_name;
+  } catch (const std::bad_alloc&) {
+    return Status::Error(StatusCode::kOutOfMemory,
+                         "tracking the HCOMM channel name failed");
+  }
+  const auto channel_name_status = SetChannelName(&desc, impl_->channel_name);
+  if (!channel_name_status.ok()) {
+    impl_->channel_name.clear();
+    return channel_name_status;
+  }
+
   const auto hcomm_engine =
       engine == ChannelEngine::kAiv ? COMM_ENGINE_AIV : COMM_ENGINE_CPU;
   ChannelHandle channel = 0;
@@ -448,12 +514,20 @@ Status HcommUrmaResources::CreateChannel(const EndpointSpec& peer,
       HcommChannelCreate(impl_->endpoint, hcomm_engine, &desc, 1,
                          &channel);
   if (result != 0) {
+    // A failed create can still hand back a partially initialized channel.
+    // Retain both its handle and the owned channelName backing; silently
+    // clearing either would make a later asynchronous destroy use a dangling
+    // pointer.  The caller's normal retryable Close path owns the cleanup.
     if (channel != 0) {
-      (void)HcommChannelDestroy(&channel, 1);
+      impl_->channel = channel;
+      impl_->channel_abi_header = desc.header;
+      return HcommFailure("HcommChannelCreate", result);
     }
+    impl_->unproven_resource_operation = "HcommChannelCreate";
     return HcommFailure("HcommChannelCreate", result);
   }
   if (channel == 0) {
+    impl_->unproven_resource_operation = "HcommChannelCreate";
     return HcommInvalidOutput("HcommChannelCreate");
   }
   impl_->channel = channel;
@@ -707,6 +781,14 @@ Status HcommUrmaResources::Close() {
     return Status::OK();
   }
 
+  if (impl_->unproven_resource_operation != nullptr) {
+    return Status::Error(
+        StatusCode::kTransportError,
+        std::string("HCOMM did not prove that a failed create/import left no ") +
+            "resource: " + impl_->unproven_resource_operation +
+            "; retaining the process-owned backing is required");
+  }
+
   // Teardown is intentionally stateful and retryable.  A channel may still
   // refer to every imported/local MR, so a failed channel destroy is the one
   // dependency failure for which it is unsafe to attempt lower layers.  Once
@@ -721,6 +803,7 @@ Status HcommUrmaResources::Close() {
     }
     impl_->channel = 0;
     impl_->channel_abi_header = {};
+    impl_->channel_name.clear();
   }
 
   Status first_failure = Status::OK();
