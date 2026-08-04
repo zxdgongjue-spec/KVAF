@@ -194,8 +194,40 @@ void SetDefaultQos(T* desc) {
   if constexpr (HasQos<T>::value) {
     desc->qos = kDefaultQos;
   } else if constexpr (HasHccsQos<T>::value) {
-    desc->hccsAttr.qos = kDefaultQos;
+    // HCOMM channel descriptor v1 has no independent QoS field.  Its
+    // hccsAttr and the UBC attributes used by newer runtimes share the same
+    // union.  HcommChannelDescInit deliberately leaves that union as all
+    // ones, which means "use the UBC defaults".  Writing HCCS QoS=4 for a
+    // UBC-CTP descriptor aliases the first UBC word to sqDepth=4; the
+    // runtime rejects that before it creates a channel because the legal
+    // range starts at 16.  Only HCCS may use the v1 union member.
+    if (desc->remoteEndpoint.protocol == COMM_PROTOCOL_HCCS) {
+      desc->hccsAttr.qos = kDefaultQos;
+    }
   }
+}
+
+template <typename T>
+Status ValidateLegacyUbcQueueDefaults(const T& desc) {
+  // This is intentionally limited to the v1 layout.  Newer headers expose a
+  // separate top-level QoS field, so their UB attribute union must remain
+  // entirely owned by the installed HCOMM ABI.
+  if constexpr (!HasQos<T>::value && HasHccsQos<T>::value) {
+    if (desc.remoteEndpoint.protocol == COMM_PROTOCOL_UBC_CTP ||
+        desc.remoteEndpoint.protocol == COMM_PROTOCOL_UBC_TP) {
+      std::uint32_t first_union_word = 0;
+      std::memcpy(&first_union_word, &desc.hccsAttr.qos,
+                  sizeof(first_union_word));
+      if (first_union_word != std::numeric_limits<std::uint32_t>::max()) {
+        return Status::Error(
+            StatusCode::kInvalidArgument,
+            "legacy HCOMM UBC descriptor has a non-default shared queue "
+            "attribute; refusing HcommChannelCreate before an HCOMM "
+            "resource operation");
+      }
+    }
+  }
+  return Status::OK();
 }
 
 template <typename T, typename = void>
@@ -490,6 +522,10 @@ Status HcommUrmaResources::CreateChannel(const EndpointSpec& peer,
                                            : HCOMM_SOCKET_ROLE_SERVER;
   desc.port = 0;
   SetDefaultQos(&desc);
+  status = ValidateLegacyUbcQueueDefaults(desc);
+  if (!status.ok()) {
+    return status;
+  }
 
   if (channel_name.size() > kMaximumChannelNameBytes) {
     return Status::Error(StatusCode::kInvalidArgument,
