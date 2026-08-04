@@ -11,6 +11,7 @@
 namespace {
 constexpr char kKernelName[] = "KvafExecuteBatchGetAivKernel";
 constexpr uint32_t kKernelTimeoutSeconds = 180U;
+constexpr uint32_t kKernelLocalMemoryBytes = 128U * 1024U;
 std::mutex g_mutex;
 bool g_loaded = false;
 aclrtBinHandle g_binary = nullptr;
@@ -48,19 +49,22 @@ extern "C" int32_t KvafExecuteBatchGetLaunch(const KvafExecuteBatchGetKernelArgs
                                                 aclrtStream stream) {
   if (!g_loaded || g_function == nullptr || arguments == nullptr || stream == nullptr ||
       arguments->block_count == 0U || arguments->block_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
-      arguments->request_capacity == 0U || arguments->block_bytes == 0U) {
+      arguments->request_capacity == 0U || arguments->block_bytes == 0U ||
+      arguments->jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE) {
     return KVAF_BATCH_GET_INVALID_ARGUMENT;
   }
-  aclrtLaunchKernelAttr attrs[3]{};
+  aclrtLaunchKernelAttr attrs[4]{};
   attrs[0].id = ACL_RT_LAUNCH_KERNEL_ATTR_SCHEM_MODE;
   attrs[0].value.schemMode = 1;
-  attrs[1].id = ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT_US;
-  attrs[1].value.timeoutUs.timeoutLow = kKernelTimeoutSeconds * 1000000U;
-  attrs[1].value.timeoutUs.timeoutHigh = 0U;
-  attrs[2].id = ACL_RT_LAUNCH_KERNEL_ATTR_ENGINE_TYPE;
-  attrs[2].value.engineType = ACL_RT_ENGINE_TYPE_AIV;
+  attrs[1].id = ACL_RT_LAUNCH_KERNEL_ATTR_LOCAL_MEMORY_SIZE;
+  attrs[1].value.localMemorySize = kKernelLocalMemoryBytes;
+  attrs[2].id = ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT_US;
+  attrs[2].value.timeoutUs.timeoutLow = kKernelTimeoutSeconds * 1000000U;
+  attrs[2].value.timeoutUs.timeoutHigh = 0U;
+  attrs[3].id = ACL_RT_LAUNCH_KERNEL_ATTR_ENGINE_TYPE;
+  attrs[3].value.engineType = ACL_RT_ENGINE_TYPE_AIV;
   aclrtLaunchKernelCfg config{};
-  config.numAttrs = 3U;
+  config.numAttrs = 4U;
   config.attrs = attrs;
   const aclError ret = aclrtLaunchKernelWithHostArgs(g_function, arguments->block_count, stream, &config,
                                                      const_cast<KvafExecuteBatchGetKernelArgs *>(arguments),

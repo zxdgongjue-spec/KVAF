@@ -25,9 +25,11 @@ struct Options {
   uint32_t block_bytes = 1024U;
   uint32_t source_stride = 4096U;
   uint32_t aiv_cores = 4U;
+  uint32_t jettys_per_core = 2U;
   uint32_t warmup = 10U;
   uint32_t iterations = 50U;
   uint32_t mask_every = 0U;
+  uint32_t active_every = 0U;
   // Zero selects the normal launch/synchronize test.  A nonzero value
   // captures the ExecuteBatchGet launch once, then replays the captured model
   // this many times after changing the contents (not addresses) of the fixed
@@ -43,6 +45,13 @@ struct Options {
 
 uint8_t PatternByte(uint32_t slot, uint32_t byte) {
   return static_cast<uint8_t>((slot * 131U + byte * 17U + (byte >> 3U)) & 0xffU);
+}
+
+bool RequestIsActive(uint32_t request, const Options &options) {
+  if (options.active_every != 0U) {
+    return request % options.active_every == 0U;
+  }
+  return options.mask_every == 0U || request % options.mask_every != 0U;
 }
 
 bool ParseU32(const char *text, uint32_t *value) {
@@ -79,12 +88,16 @@ bool ParseOptions(int argc, char **argv, Options *options) {
       if (!ParseU32(argv[++index], &options->source_stride)) return false;
     } else if (arg == "--aiv-cores" && index + 1 < argc) {
       if (!ParseU32(argv[++index], &options->aiv_cores)) return false;
+    } else if (arg == "--jettys-per-core" && index + 1 < argc) {
+      if (!ParseU32(argv[++index], &options->jettys_per_core)) return false;
     } else if (arg == "--warmup" && index + 1 < argc) {
       if (!ParseU32(argv[++index], &options->warmup)) return false;
     } else if (arg == "--iterations" && index + 1 < argc) {
       if (!ParseU32(argv[++index], &options->iterations)) return false;
     } else if (arg == "--mask-every" && index + 1 < argc) {
       if (!ParseU32(argv[++index], &options->mask_every)) return false;
+    } else if (arg == "--active-every" && index + 1 < argc) {
+      if (!ParseU32(argv[++index], &options->active_every)) return false;
     } else if (arg == "--graph-replays" && index + 1 < argc) {
       if (!ParseU32(argv[++index], &options->graph_replays)) return false;
     } else if (arg == "--graph-warmup" && index + 1 < argc) {
@@ -101,14 +114,19 @@ bool ParseOptions(int argc, char **argv, Options *options) {
          ReadEnvU32("TABLE_CAPACITY", &options->table_capacity) && ReadEnvU32("REQUESTS", &options->requests) &&
          ReadEnvU32("OUTPUT_ROWS", &options->output_rows) && ReadEnvU32("BLOCK_BYTES", &options->block_bytes) &&
          ReadEnvU32("SOURCE_STRIDE", &options->source_stride) && ReadEnvU32("AIV_CORES", &options->aiv_cores) &&
+         ReadEnvU32("JETTYS_PER_CORE", &options->jettys_per_core) &&
          ReadEnvU32("WARMUP", &options->warmup) && ReadEnvU32("ITERATIONS", &options->iterations) &&
          ReadEnvU32("MASK_EVERY", &options->mask_every) &&
+         ReadEnvU32("ACTIVE_EVERY", &options->active_every) &&
          ReadEnvU32("DYNAMIC_OUTPUT_SMOKE", &options->dynamic_output_smoke) && options->table_capacity != 0U &&
          options->requests != 0U && options->requests <= options->output_rows && options->output_rows != 0U &&
          options->block_bytes != 0U && options->source_stride >= options->block_bytes &&
          options->aiv_cores != 0U && options->aiv_cores <= KVAF_AIV_BATCH_GET_MAX_AIV_CORES &&
+         options->jettys_per_core != 0U &&
+         options->jettys_per_core <= KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE &&
          options->aiv_cores <= options->requests && options->iterations != 0U &&
-         options->graph_iterations != 0U && options->dynamic_output_smoke <= 1U;
+         options->graph_iterations != 0U && options->dynamic_output_smoke <= 1U &&
+         (options->mask_every == 0U || options->active_every == 0U);
 }
 
 bool CheckAcl(aclError error, const char *step) {
@@ -137,7 +155,60 @@ bool Validate(const std::vector<uint8_t> &output, const std::vector<uint64_t> &a
               const uint8_t *source, const std::vector<KvafBatchGetCoreStatus> &statuses,
               const std::vector<KvafBatchGetQueueState> &queues, uint64_t expected_batches,
               const char *stage) {
-  uint64_t active_total = 0U;
+  const uint64_t active_total =
+      static_cast<uint64_t>(std::count_if(mask.begin(), mask.end(), [](uint8_t entry) { return entry != 0U; }));
+  for (uint32_t core = 0U; core < options.aiv_cores; ++core) {
+    const uint32_t begin = static_cast<uint32_t>((static_cast<uint64_t>(options.requests) * core) / options.aiv_cores);
+    const uint32_t end = static_cast<uint32_t>((static_cast<uint64_t>(options.requests) * (core + 1U)) /
+                                               options.aiv_cores);
+    uint64_t active = 0U;
+    for (uint32_t request = begin; request < end; ++request) active += mask[request] != 0U;
+    const auto &status = statuses[core];
+    const uint64_t expected_core_batches = active == 0U ? 0U : expected_batches;
+    if (status.magic != KVAF_AIV_BATCH_GET_STATUS_MAGIC || status.result != 0U ||
+        status.processed_request_count != active || status.completed_batch_count != expected_core_batches) {
+      std::cerr << "[KVAF_EXECUTE] kernel state mismatch stage=" << stage << " core=" << core
+                << " result=" << status.result << " processed=" << status.processed_request_count
+                << " active=" << active << " completed=" << status.completed_batch_count
+                << " expected_batches=" << expected_core_batches
+                << " failed_request=" << status.failed_request_index << '\n';
+      return false;
+    }
+    const uint64_t total_posts = (active + 31U) / 32U;
+    const uint32_t used_jettys = static_cast<uint32_t>(
+        std::min<uint64_t>(total_posts, options.jettys_per_core));
+    for (uint32_t jetty = 0U; jetty < options.jettys_per_core; ++jetty) {
+      const auto &queue =
+          queues[static_cast<uint64_t>(core) * options.jettys_per_core + jetty];
+      const uint64_t expected_jetty_batches =
+          jetty < used_jettys ? expected_batches : 0U;
+      uint64_t assigned_requests = 0U;
+      for (uint64_t post = jetty; post < total_posts;
+           post += options.jettys_per_core) {
+        assigned_requests +=
+            std::min<uint64_t>(32U, active - post * 32U);
+      }
+      const uint64_t expected_sq_pi = assigned_requests * expected_batches;
+      if (queue.magic != 0x4b564151U || queue.initialized != 1U ||
+          queue.last_error != 0U ||
+          queue.completed_batch_count != expected_jetty_batches ||
+          queue.sq_producer_index != expected_sq_pi ||
+          queue.cq_consumer_index != expected_jetty_batches ||
+          (jetty == 0U &&
+           (status.sq_producer_index != queue.sq_producer_index ||
+            status.cq_consumer_index != queue.cq_consumer_index))) {
+        std::cerr << "[KVAF_EXECUTE] queue state mismatch stage=" << stage
+                  << " core=" << core << " jetty=" << jetty
+                  << " completed=" << queue.completed_batch_count
+                  << " expected_batches=" << expected_jetty_batches
+                  << " queue_error=" << queue.last_error
+                  << " sq_pi=" << queue.sq_producer_index
+                  << " expected_sq_pi=" << expected_sq_pi
+                  << " cq_ci=" << queue.cq_consumer_index << '\n';
+        return false;
+      }
+    }
+  }
   for (uint32_t request = 0U; request < options.requests; ++request) {
     if (mask[request] == 0U) {
       for (uint32_t byte = 0U; byte < options.block_bytes; ++byte) {
@@ -151,7 +222,6 @@ bool Validate(const std::vector<uint8_t> &output, const std::vector<uint64_t> &a
       }
       continue;
     }
-    ++active_total;
     const uint64_t source_offset = address_table[static_cast<uint32_t>(indices[request])] -
                                    reinterpret_cast<uint64_t>(source);
     for (uint32_t byte = 0U; byte < options.block_bytes; ++byte) {
@@ -167,30 +237,10 @@ bool Validate(const std::vector<uint8_t> &output, const std::vector<uint64_t> &a
       }
     }
   }
-  for (uint32_t core = 0U; core < options.aiv_cores; ++core) {
-    const uint32_t begin = static_cast<uint32_t>((static_cast<uint64_t>(options.requests) * core) / options.aiv_cores);
-    const uint32_t end = static_cast<uint32_t>((static_cast<uint64_t>(options.requests) * (core + 1U)) /
-                                               options.aiv_cores);
-    uint64_t active = 0U;
-    for (uint32_t request = begin; request < end; ++request) active += mask[request] != 0U;
-    const auto &status = statuses[core];
-    const auto &queue = queues[core];
-    const uint64_t expected_core_batches = active == 0U ? 0U : expected_batches;
-    if (status.magic != KVAF_AIV_BATCH_GET_STATUS_MAGIC || status.result != 0U ||
-        status.processed_request_count != active || status.completed_batch_count != expected_core_batches ||
-        queue.magic != 0x4b564151U || queue.initialized != 1U || queue.last_error != 0U ||
-        queue.completed_batch_count != expected_core_batches) {
-      std::cerr << "[KVAF_EXECUTE] kernel state mismatch stage=" << stage << " core=" << core
-                << " result=" << status.result << " processed=" << status.processed_request_count
-                << " active=" << active << " completed=" << status.completed_batch_count
-                << " expected_batches=" << expected_core_batches << " queue_error=" << queue.last_error
-                << " failed_request=" << status.failed_request_index << '\n';
-      return false;
-    }
-  }
   std::cout << "EXECUTE_BATCH_GET_VALIDATION stage=" << stage << " active_requests=" << active_total
             << " masked_requests=" << (options.requests - active_total) << " table_mode=absolute_host_uba"
-            << " output_layout=scatter_rows\n";
+            << " output_layout=scatter_rows jettys_per_core="
+            << options.jettys_per_core << "\n";
   return true;
 }
 
@@ -202,6 +252,7 @@ void PrepareGraphReplayInputs(uint32_t replay, const uint8_t *source, const Opti
                               std::vector<uint64_t> *address_table, std::vector<int32_t> *indices,
                               std::vector<uint8_t> *mask, std::vector<int32_t> *output_indices) {
   const uint32_t address_shift = replay % options.table_capacity;
+  const bool sparse_mask = options.mask_every != 0U || options.active_every != 0U;
   for (uint32_t entry = 0U; entry < options.table_capacity; ++entry) {
     const uint32_t source_slot = (entry + address_shift) % options.table_capacity;
     (*address_table)[entry] = reinterpret_cast<uint64_t>(source) +
@@ -209,8 +260,11 @@ void PrepareGraphReplayInputs(uint32_t replay, const uint8_t *source, const Opti
   }
   for (uint32_t request = 0U; request < options.requests; ++request) {
     (*indices)[request] = static_cast<int32_t>(request % options.table_capacity);
-    (*mask)[request] = 1U;
-    (*output_indices)[request] = static_cast<int32_t>((request + replay) % options.output_rows);
+    (*mask)[request] = RequestIsActive(request, options) ? 1U : 0U;
+    // Keep sparse output rows stable so a row written by an earlier replay is
+    // never reinterpreted as a masked row during byte-for-byte validation.
+    const uint32_t output_row = sparse_mask ? request : request + replay;
+    (*output_indices)[request] = static_cast<int32_t>(output_row % options.output_rows);
   }
 }
 
@@ -242,7 +296,8 @@ int main(int argc, char **argv) {
   if (!ParseOptions(argc, argv, &options)) {
     std::cerr << "usage: kvaf_execute_batch_get_test --kernel <kvaf_execute_batch_get_kernels.o> "
                  "[--device N --table-capacity N --requests N --output-rows N --block-bytes N "
-                 "--source-stride N --aiv-cores N --warmup N --iterations N --mask-every N "
+                 "--source-stride N --aiv-cores N --jettys-per-core N --warmup N --iterations N --mask-every N "
+                 "--active-every N "
                  "--graph-replays N --graph-warmup N --graph-iterations N --dynamic-output-smoke 0|1]\n";
     return 2;
   }
@@ -281,7 +336,8 @@ int main(int argc, char **argv) {
   std::vector<uint8_t> mask(options.requests, 1U);
   std::vector<int32_t> output_indices(options.requests);
   std::vector<KvafBatchGetCoreStatus> statuses(options.aiv_cores);
-  std::vector<KvafBatchGetQueueState> queues(options.aiv_cores);
+  std::vector<KvafBatchGetQueueState> queues(
+      static_cast<uint64_t>(options.aiv_cores) * options.jettys_per_core);
   std::vector<uint8_t> output(output_bytes);
   std::vector<double> elapsed_ms;
 
@@ -314,7 +370,7 @@ int main(int argc, char **argv) {
   for (uint32_t request = 0U; request < options.requests; ++request) {
     indices[request] = static_cast<int32_t>(options.table_capacity - 1U - (request % options.table_capacity));
     output_indices[request] = static_cast<int32_t>(options.output_rows - 1U - request);
-    if (options.mask_every != 0U && request % options.mask_every == 0U) mask[request] = 0U;
+    mask[request] = RequestIsActive(request, options) ? 1U : 0U;
   }
   // Match the architecture note's concrete [200,1024] scatter example when
   // that shape is requested; the normal default remains a larger reverse
@@ -360,7 +416,8 @@ int main(int argc, char **argv) {
     goto cleanup;
   }
 
-  if (!CheckKvaf(KvafBatchGetTransportCreate(source_ddr, source_bytes, options.aiv_cores, 1U, &transport),
+  if (!CheckKvaf(KvafBatchGetTransportCreate(source_ddr, source_bytes, options.aiv_cores,
+                                               options.jettys_per_core, &transport),
                  "create reusable Direct-HCCP transport and register Host DDR")) goto cleanup;
   if (!CheckKvaf(KvafBatchGetLocalBufferAcquire(transport, output_hbm, output_bytes, &primary_local_buffer,
                                                  &primary_entity_table),
@@ -371,6 +428,7 @@ int main(int argc, char **argv) {
             << " output_lifetime=local_buffer_acquired\n";
   if (!CheckKvaf(KvafExecuteBatchGetLoadKernel(options.kernel.c_str()), "load ExecuteBatchGet kernel")) goto cleanup;
   std::cout << "PHASE_KERNEL_REGISTERED cores=" << options.aiv_cores
+            << " jettys_per_core=" << options.jettys_per_core
             << " contract=address_table_absolute_uba_plus_mask_plus_output_scatter\n";
 
   args.address_table = reinterpret_cast<uint64_t>(device_address_table);
@@ -387,6 +445,7 @@ int main(int argc, char **argv) {
   args.output_rows = options.output_rows;
   args.block_bytes = options.block_bytes;
   args.block_count = options.aiv_cores;
+  args.jettys_per_core = options.jettys_per_core;
 
   if (options.dynamic_output_smoke != 0U) {
     // A -> B -> A proves the API contract rather than merely proving that two
@@ -472,6 +531,7 @@ int main(int argc, char **argv) {
                  "dynamic_device_contents=address_table_indices_mask_output_indices "
                  "replays="
               << options.graph_replays << " aiv_cores=" << options.aiv_cores
+              << " jettys_per_core=" << options.jettys_per_core
               << " perf_warmup=" << options.graph_warmup
               << " perf_samples=" << options.graph_iterations << '\n';
     if (!CheckAcl(aclmdlRICaptureBegin(stream, ACL_MODEL_RI_CAPTURE_MODE_RELAXED),
@@ -588,7 +648,9 @@ int main(int argc, char **argv) {
               << "GRAPH_PERF_RESULT metric=graph_input_update_to_stream_completion samples="
               << options.graph_iterations << " warmup_excluded=" << options.graph_warmup
               << " active_requests=" << active << " block_bytes=" << options.block_bytes
-              << " aiv_cores=" << options.aiv_cores << " mean_ms=" << mean_ms
+              << " aiv_cores=" << options.aiv_cores
+              << " jettys_per_core=" << options.jettys_per_core
+              << " mean_ms=" << mean_ms
               << " p50_ms=" << Percentile(elapsed_ms, 0.50) << " p90_ms=" << Percentile(elapsed_ms, 0.90)
               << " p99_ms=" << Percentile(elapsed_ms, 0.99) << " useful_GiBps=" << gibps << '\n';
     exit_code = 0;
@@ -638,6 +700,7 @@ int main(int argc, char **argv) {
               << "PERF_RESULT metric=host_submit_to_stream_completion samples=" << options.iterations
               << " warmup_excluded=" << options.warmup << " active_requests=" << active
               << " block_bytes=" << options.block_bytes << " aiv_cores=" << options.aiv_cores
+              << " jettys_per_core=" << options.jettys_per_core
               << " mean_ms=" << mean_ms << " p50_ms=" << Percentile(elapsed_ms, 0.50)
               << " p90_ms=" << Percentile(elapsed_ms, 0.90) << " p99_ms=" << Percentile(elapsed_ms, 0.99)
               << " useful_GiBps=" << gibps << '\n';
