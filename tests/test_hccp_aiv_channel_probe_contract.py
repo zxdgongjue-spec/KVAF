@@ -179,6 +179,32 @@ class HccpAivChannelProbeContractTests(unittest.TestCase):
         self.assertNotIn("aclrt", runner)
         self.assertNotIn("npu-smi set", runner)
 
+    def test_legacy_anonymous_guard_is_scoped_to_npu_and_eid_pair(self) -> None:
+        runner = RUNNER.read_text(encoding="utf-8")
+
+        self.assertIn("legacy_workers_for_current_npu", runner)
+        self.assertIn(
+            "hccp-aiv-channel.npu${physical_device_id}.lock", runner
+        )
+        self.assertIn('lock_dir="${legacy_state_dir}"', runner)
+        self.assertIn(
+            "KVAF_GLOBAL_STATE_DIR to select this lock would let another container evade",
+            runner,
+        )
+        self.assertIn(
+            "hccp-aiv-anonymous-channel.${legacy_scope}.lock", runner
+        )
+        self.assertIn(
+            "hccp-aiv-legacy-anonymous.${legacy_scope}.active", runner
+        )
+        self.assertIn("--physical-device-id ${physical_device_id}", runner)
+        self.assertIn("KVAF_A5_HCCP_LEGACY_ANONYMOUS_OTHER_NPU_RETAINED", runner)
+        self.assertIn("Never remove the old file during this migration", runner)
+        self.assertLess(
+            runner.rindex("legacy_workers_for_current_npu"),
+            runner.index("legacy_boot_id=$(cat /proc/sys/kernel/random/boot_id)"),
+        )
+
     def test_runner_is_shell_syntax_valid(self) -> None:
         bash = shutil.which("bash")
         if bash is None:

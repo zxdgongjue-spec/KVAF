@@ -64,6 +64,36 @@ process_start_ticks()
   awk '{ print $22 }' "/proc/${pid}/stat" 2>/dev/null || true
 }
 
+legacy_active_field()
+{
+  local path=$1
+  local key=$2
+  awk -F= -v key="${key}" '$1 == key { print $2; exit }' \
+    "${path}" 2>/dev/null || true
+}
+
+# Old HCOMM headers cannot carry a run-id channel name. Never let an unsafe
+# owner on NPU2 block an independent NPU7 pair, but never allow a second
+# legacy channel-probe worker on the selected physical NPU either.
+legacy_workers_for_current_npu()
+{
+  local -a candidate_pids=()
+  local candidate_pid
+  local cmdline
+
+  mapfile -t candidate_pids < <(
+    pgrep -f '[k]vaf_a5_hccp_aiv_channel_probe' 2>/dev/null || true
+  )
+  for candidate_pid in "${candidate_pids[@]}"; do
+    [[ "${candidate_pid}" =~ ^[0-9]+$ &&
+       -r "/proc/${candidate_pid}/cmdline" ]] || continue
+    cmdline=$(tr '\0' ' ' < "/proc/${candidate_pid}/cmdline" 2>/dev/null || true)
+    [[ " ${cmdline} " == *" --physical-device-id ${physical_device_id} "* ]] ||
+      continue
+    printf '%s %s\n' "${candidate_pid}" "${cmdline}"
+  done
+}
+
 : "${ASCEND_HOME_PATH:?source the container CANN set_env.sh first}"
 
 if [[ "${KVAF_HCCP_AIV_CHANNEL_PROBE_ACK:-}" != \
@@ -141,38 +171,20 @@ fi
 
 mkdir -p "${global_state_dir}/KVAF" "${result_root}"
 chmod 0700 "${global_state_dir}/KVAF" "${result_root}"
-lock_file="${global_state_dir}/KVAF/hccp-aiv-channel.lock"
-exec 9>"${lock_file}"
-if ! flock -n 9; then
-  die "another HCCP AIV channel probe is active: ${lock_file}"
-fi
+lock_file=
 
-# The legacy ABI has no run-id namespace.  This fixed, host-shared lock is
-# intentionally independent from KVAF_GLOBAL_STATE_DIR and is inherited by
-# both workers (then checked in their process before ACL initialization).
-# It only serializes KVAF probes; it cannot prove that a non-KVAF HCOMM/HCCP
-# process will not use the same endpoints, hence the explicit risk ACK above.
+# The legacy ABI has no run-id namespace.  Its lock and persistent owner
+# state are selected only after topology and the exact EID pair are resolved.
+# They intentionally remain independent from KVAF_GLOBAL_STATE_DIR so two
+# containers cannot evade a retained-owner guard by choosing different result
+# roots.
 resource_guard_fd=9
 legacy_state_dir=/data/.kvaf-state/KVAF
-legacy_active_file=${legacy_state_dir}/hccp-aiv-legacy-anonymous.active
+legacy_unscoped_active_file=${legacy_state_dir}/hccp-aiv-legacy-anonymous.active
+legacy_active_file=
 legacy_active_owned=0
 legacy_boot_id=
-if [[ "${channel_name_mode}" == legacy-anonymous-risk-ack ]]; then
-  command -v pgrep >/dev/null 2>&1 ||
-    die "legacy anonymous compatibility probe requires pgrep"
-  if legacy_workers=$(pgrep -af '[k]vaf_a5_hccp_aiv_channel_probe' || true);
-     [[ -n "${legacy_workers}" ]]; then
-    die "legacy anonymous mode refused: existing channel-probe worker(s): ${legacy_workers}"
-  fi
-  mkdir -p "${legacy_state_dir}"
-  chmod 0700 "${legacy_state_dir}"
-  legacy_lock_file=${legacy_state_dir}/hccp-aiv-anonymous-channel.lock
-  exec 10>"${legacy_lock_file}"
-  if ! flock -n 10; then
-    die "legacy anonymous mode refused: lock is held: ${legacy_lock_file}"
-  fi
-  resource_guard_fd=10
-fi
+legacy_scope=
 
 # The topology helper selects then releases its own short-lived ACL context.
 # Parse only its known KEY=UINT32 output rather than sourcing arbitrary text.
@@ -193,6 +205,24 @@ physical_device_id=$(topology_value KVAF_PHYSICAL_DEVICE_ID)
 super_device_id=$(topology_value KVAF_SUPER_DEVICE_ID)
 server_index=$(topology_value KVAF_SERVER_INDEX)
 super_pod_index=$(topology_value KVAF_SUPER_POD_INDEX)
+
+# A worker retains inherited lock descriptors after an unsafe owner exits its
+# supervisor.  Scope the supervisor lock to the physical NPU, so an NPU2
+# retained worker cannot falsely block an independently selected NPU7.  The
+# old-header fallback must use the fixed host-shared state root: permitting
+# KVAF_GLOBAL_STATE_DIR to select this lock would let another container evade
+# the same-NPU exclusion simply by choosing a different result directory.
+lock_dir="${global_state_dir}/KVAF"
+if [[ "${channel_name_mode}" == legacy-anonymous-risk-ack ]]; then
+  mkdir -p "${legacy_state_dir}"
+  chmod 0700 "${legacy_state_dir}"
+  lock_dir="${legacy_state_dir}"
+fi
+lock_file="${lock_dir}/hccp-aiv-channel.npu${physical_device_id}.lock"
+exec 9>"${lock_file}"
+if ! flock -n 9; then
+  die "another HCCP AIV channel probe is active on this NPU: ${lock_file}"
+fi
 
 run_id=${KVAF_HCCP_AIV_CHANNEL_RUN_ID:-"aivch_${physical_device_id}_$(date +%Y%m%d_%H%M%S)_$$"}
 [[ "${run_id}" =~ ^[A-Za-z0-9_-]{1,128}$ ]] ||
@@ -259,12 +289,65 @@ device_eid=$(awk -F= '$1 == "KVAF_DEVICE_EID" { print $2 }' "${result_dir}/eid-r
   die "EID resolver returned an invalid or identical endpoint pair"
 echo "KVAF_A5_HCCP_CHANNEL_EIDS_RESOLVED source=driver-pair-info"
 
+# Scope the old-header fallback by the hardware identity HCOMM uses for
+# matching.  The same-EID scope remains fail-closed; a retained owner on a
+# different physical NPU is reported and left intact, not deleted or reused.
+if [[ "${channel_name_mode}" == legacy-anonymous-risk-ack ]]; then
+  command -v pgrep >/dev/null 2>&1 ||
+    die "legacy anonymous compatibility probe requires pgrep"
+  mkdir -p "${legacy_state_dir}"
+  chmod 0700 "${legacy_state_dir}"
+  legacy_scope="npu${physical_device_id}_${host_eid}_${device_eid}"
+  [[ "${legacy_scope}" =~ ^npu[0-9]+_[0-9A-Fa-f]{32}_[0-9A-Fa-f]{32}$ ]] ||
+    die "invalid legacy anonymous scope"
+  legacy_active_file=${legacy_state_dir}/hccp-aiv-legacy-anonymous.${legacy_scope}.active
+  legacy_lock_file=${legacy_state_dir}/hccp-aiv-anonymous-channel.${legacy_scope}.lock
+  exec 10>"${legacy_lock_file}"
+  if ! flock -n 10; then
+    die "legacy anonymous mode refused: same NPU/EID-pair lock is held: ${legacy_lock_file}"
+  fi
+  resource_guard_fd=10
+
+  if legacy_workers=$(legacy_workers_for_current_npu); [[ -n "${legacy_workers}" ]]; then
+    die "legacy anonymous mode refused: channel-probe worker(s) remain on this NPU: ${legacy_workers}"
+  fi
+
+  # Releases before this change used one unscoped active file.  Preserve it
+  # as an owner guard for its recorded NPU while allowing a different NPU/EID
+  # pair to proceed.  Never remove the old file during this migration.
+  if [[ -e "${legacy_unscoped_active_file}" ||
+        -L "${legacy_unscoped_active_file}" ]]; then
+    legacy_unscoped_device=$(legacy_active_field "${legacy_unscoped_active_file}" \
+      physical_device_id)
+    legacy_unscoped_boot_id=$(legacy_active_field "${legacy_unscoped_active_file}" \
+      boot_id)
+    [[ "${legacy_unscoped_device}" =~ ^[0-9]+$ &&
+       "${legacy_unscoped_boot_id}" =~ ^[0-9a-f-]{36}$ ]] ||
+      die "legacy anonymous active state is malformed: ${legacy_unscoped_active_file}"
+    if [[ "${legacy_unscoped_device}" == "${physical_device_id}" ]]; then
+      legacy_boot_id=$(cat /proc/sys/kernel/random/boot_id)
+      [[ "${legacy_boot_id}" =~ ^[0-9a-f-]{36}$ ]] ||
+        die "could not read a valid current boot ID"
+      if [[ "${legacy_unscoped_boot_id}" == "${legacy_boot_id}" ]]; then
+        die "legacy anonymous active state remains on this NPU: ${legacy_unscoped_active_file}; do not retry until its owner is proven safe or the host reboots"
+      fi
+      legacy_reboot_archive=${legacy_unscoped_active_file}.previous-boot.$(date +%Y%m%d_%H%M%S).$$
+      mv -- "${legacy_unscoped_active_file}" "${legacy_reboot_archive}"
+      echo "KVAF_A5_HCCP_LEGACY_ANONYMOUS_PREVIOUS_BOOT_STATE_ARCHIVED=${legacy_reboot_archive}"
+    else
+      echo "KVAF_A5_HCCP_LEGACY_ANONYMOUS_OTHER_NPU_RETAINED physical_device_id=${legacy_unscoped_device}"
+    fi
+  fi
+fi
+
 # A stale legacy owner is never silently cleared on the same boot.  A normal
 # PASS or FAIL_SAFE run archives this file only after both exact teardown
 # markers exist; timeout, interrupt, or unsafe retention leaves it in place
 # and blocks the next old-header attempt until reboot/operator isolation.
 if [[ "${channel_name_mode}" == legacy-anonymous-risk-ack ]]; then
-  legacy_boot_id=$(cat /proc/sys/kernel/random/boot_id)
+  if [[ -z "${legacy_boot_id}" ]]; then
+    legacy_boot_id=$(cat /proc/sys/kernel/random/boot_id)
+  fi
   [[ "${legacy_boot_id}" =~ ^[0-9a-f-]{36}$ ]] ||
     die "could not read a valid current boot ID"
   if [[ -e "${legacy_active_file}" || -L "${legacy_active_file}" ]]; then
