@@ -80,6 +80,10 @@ class HcommUrmaResources {
                                std::uint64_t remote_bytes,
                                AivDirectUrmaChannel* direct_channel) const;
 
+  // CANN HCOMM v3 adds HcommChannelDesc.channelName. Older installed public
+  // headers support only anonymous pairing; callers must make that downgrade
+  // explicit and provide their own endpoint-exclusivity proof.
+  bool SupportsChannelName() const;
   std::uint64_t channel() const;
   // Retryable reverse teardown.  Channel destruction must succeed before any
   // lower resource is touched; after that, independent imports/registrations

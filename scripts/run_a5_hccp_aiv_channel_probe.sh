@@ -50,6 +50,20 @@ worker_running()
   [[ -n "${state}" && "${state}" != Z* ]]
 }
 
+marker_has_safe_terminal()
+{
+  local path=$1
+  local run_id=$2
+  marker_has_stage "${path}" "${run_id}" PASS ||
+    marker_has_stage "${path}" "${run_id}" FAIL_SAFE
+}
+
+process_start_ticks()
+{
+  local pid=$1
+  awk '{ print $22 }' "/proc/${pid}/stat" 2>/dev/null || true
+}
+
 : "${ASCEND_HOME_PATH:?source the container CANN set_env.sh first}"
 
 if [[ "${KVAF_HCCP_AIV_CHANNEL_PROBE_ACK:-}" != \
@@ -67,6 +81,8 @@ global_state_dir=${KVAF_GLOBAL_STATE_DIR:-/data/.kvaf-state}
 result_root=${KVAF_HCCP_AIV_CHANNEL_RESULT_ROOT:-"${global_state_dir}/KVAF/results"}
 binary=${KVAF_HCCP_AIV_CHANNEL_PROBE_BINARY:-"${KVAF_A5_BUILD_DIR:-${ROOT_DIR}/build-a5-aiv-urma}/access_operator/a5/kvaf_a5_hccp_aiv_channel_probe"}
 idle_checker=${KVAF_NPU_IDLE_CHECKER:-"${SCRIPT_DIR}/check_a5_npu_idle.py"}
+legacy_anonymous_requested=${KVAF_HCCP_AIV_CHANNEL_LEGACY_ANONYMOUS:-0}
+legacy_anonymous_ack=${KVAF_HCCP_AIV_CHANNEL_LEGACY_ANONYMOUS_ACK:-}
 
 [[ -n "${logical_device_id}" ]] || die "set KVAF_LOGICAL_DEVICE_ID explicitly"
 require_uint KVAF_LOGICAL_DEVICE_ID "${logical_device_id}"
@@ -86,6 +102,42 @@ require_uint KVAF_HCCP_AIV_CHANNEL_TEARDOWN_RETRIES "${teardown_retries}"
 [[ -x "${binary}" ]] || die "missing channel probe ${binary}; run scripts/build_a5_aiv_urma.sh first"
 [[ -f "${idle_checker}" && ! -L "${idle_checker}" ]] ||
   die "missing regular NPU idle checker ${idle_checker}"
+[[ "${legacy_anonymous_requested}" == 0 ||
+   "${legacy_anonymous_requested}" == 1 ]] ||
+  die "KVAF_HCCP_AIV_CHANNEL_LEGACY_ANONYMOUS must be 0 or 1"
+
+# This is a compile/header capability query only.  It does not initialize ACL
+# or create an HCOMM resource.  Keep the normal path fail-closed: decode and
+# production use require v3's run-id-bound channelName.
+if ! channel_capability_output=$("${binary}" --print-capabilities 2>&1); then
+  die "could not query HCOMM channel-name capability: ${channel_capability_output}"
+fi
+case "${channel_capability_output}" in
+  KVAF_HCCP_CHANNEL_NAME_SUPPORT=1)
+    channel_name_support=1
+    ;;
+  KVAF_HCCP_CHANNEL_NAME_SUPPORT=0)
+    channel_name_support=0
+    ;;
+  *)
+    die "invalid HCOMM channel-name capability output: ${channel_capability_output}"
+    ;;
+esac
+
+channel_name_mode=named-required
+channel_identity=named-run-id
+if [[ "${channel_name_support}" -eq 0 ]]; then
+  if [[ "${legacy_anonymous_requested}" != 1 ]]; then
+    die "installed HCOMM header has no ChannelDesc.channelName; default named-required mode performed no hardware operation. Upgrade the paired CANN/HCOMM stack, or explicitly opt into the zero-WQE legacy compatibility probe."
+  fi
+  [[ "${legacy_anonymous_ack}" == \
+     "I_ACCEPT_LEGACY_ANONYMOUS_CHANNEL_CROSS_PROCESS_PAIRING_RISK" ]] ||
+    die "set KVAF_HCCP_AIV_CHANNEL_LEGACY_ANONYMOUS_ACK=I_ACCEPT_LEGACY_ANONYMOUS_CHANNEL_CROSS_PROCESS_PAIRING_RISK for the old-header zero-WQE compatibility probe"
+  channel_name_mode=legacy-anonymous-risk-ack
+  channel_identity=anonymous-old-header-exclusive
+elif [[ "${legacy_anonymous_requested}" == 1 ]]; then
+  die "legacy anonymous mode is only valid when the installed public HCOMM header lacks ChannelDesc.channelName"
+fi
 
 mkdir -p "${global_state_dir}/KVAF" "${result_root}"
 chmod 0700 "${global_state_dir}/KVAF" "${result_root}"
@@ -93,6 +145,33 @@ lock_file="${global_state_dir}/KVAF/hccp-aiv-channel.lock"
 exec 9>"${lock_file}"
 if ! flock -n 9; then
   die "another HCCP AIV channel probe is active: ${lock_file}"
+fi
+
+# The legacy ABI has no run-id namespace.  This fixed, host-shared lock is
+# intentionally independent from KVAF_GLOBAL_STATE_DIR and is inherited by
+# both workers (then checked in their process before ACL initialization).
+# It only serializes KVAF probes; it cannot prove that a non-KVAF HCOMM/HCCP
+# process will not use the same endpoints, hence the explicit risk ACK above.
+resource_guard_fd=9
+legacy_state_dir=/data/.kvaf-state/KVAF
+legacy_active_file=${legacy_state_dir}/hccp-aiv-legacy-anonymous.active
+legacy_active_owned=0
+legacy_boot_id=
+if [[ "${channel_name_mode}" == legacy-anonymous-risk-ack ]]; then
+  command -v pgrep >/dev/null 2>&1 ||
+    die "legacy anonymous compatibility probe requires pgrep"
+  if legacy_workers=$(pgrep -af '[k]vaf_a5_hccp_aiv_channel_probe' || true);
+     [[ -n "${legacy_workers}" ]]; then
+    die "legacy anonymous mode refused: existing channel-probe worker(s): ${legacy_workers}"
+  fi
+  mkdir -p "${legacy_state_dir}"
+  chmod 0700 "${legacy_state_dir}"
+  legacy_lock_file=${legacy_state_dir}/hccp-aiv-anonymous-channel.lock
+  exec 10>"${legacy_lock_file}"
+  if ! flock -n 10; then
+    die "legacy anonymous mode refused: lock is held: ${legacy_lock_file}"
+  fi
+  resource_guard_fd=10
 fi
 
 # The topology helper selects then releases its own short-lived ACL context.
@@ -134,6 +213,12 @@ echo "PHYSICAL_DEVICE_ID=${physical_device_id}"
 echo "HCCP_CONTROL_PLANE=installed-libhcomm-resource-api"
 echo "HOT_PATH=none-this-is-channel-snapshot-only"
 echo "WQE_SUBMISSIONS=0"
+echo "CHANNEL_NAME_SUPPORT=${channel_name_support}"
+echo "CHANNEL_NAME_MODE=${channel_name_mode}"
+echo "CHANNEL_IDENTITY=${channel_identity}"
+if [[ "${channel_name_mode}" == legacy-anonymous-risk-ack ]]; then
+  echo "CONTRACT=best-effort-exclusive-legacy-anonymous-v1"
+fi
 
 if ! preflight_output=$(bash "${SCRIPT_DIR}/preflight_a5_hccp_hal_capabilities.sh" 2>&1); then
   printf '%s\n' "${preflight_output}" > "${result_dir}/static-preflight.log"
@@ -174,6 +259,38 @@ device_eid=$(awk -F= '$1 == "KVAF_DEVICE_EID" { print $2 }' "${result_dir}/eid-r
   die "EID resolver returned an invalid or identical endpoint pair"
 echo "KVAF_A5_HCCP_CHANNEL_EIDS_RESOLVED source=driver-pair-info"
 
+# A stale legacy owner is never silently cleared on the same boot.  A normal
+# PASS or FAIL_SAFE run archives this file only after both exact teardown
+# markers exist; timeout, interrupt, or unsafe retention leaves it in place
+# and blocks the next old-header attempt until reboot/operator isolation.
+if [[ "${channel_name_mode}" == legacy-anonymous-risk-ack ]]; then
+  legacy_boot_id=$(cat /proc/sys/kernel/random/boot_id)
+  [[ "${legacy_boot_id}" =~ ^[0-9a-f-]{36}$ ]] ||
+    die "could not read a valid current boot ID"
+  if [[ -e "${legacy_active_file}" || -L "${legacy_active_file}" ]]; then
+    legacy_previous_boot_id=$(awk -F= '$1 == "boot_id" { print $2 }' \
+      "${legacy_active_file}" 2>/dev/null || true)
+    [[ "${legacy_previous_boot_id}" =~ ^[0-9a-f-]{36}$ ]] ||
+      die "legacy anonymous active state is malformed: ${legacy_active_file}"
+    [[ "${legacy_previous_boot_id}" != "${legacy_boot_id}" ]] ||
+      die "legacy anonymous active state remains from this boot: ${legacy_active_file}; do not retry until its owner is proven safe or the host reboots"
+    legacy_reboot_archive="${legacy_active_file}.previous-boot.$(date +%Y%m%d_%H%M%S).$$"
+    mv -- "${legacy_active_file}" "${legacy_reboot_archive}"
+    echo "KVAF_A5_HCCP_LEGACY_ANONYMOUS_PREVIOUS_BOOT_STATE_ARCHIVED=${legacy_reboot_archive}"
+  fi
+  if ! (set -o noclobber; printf '%s\n' \
+      'schema=kvaf-hccp-aiv-legacy-anonymous-active-v1' \
+      "boot_id=${legacy_boot_id}" \
+      "run_id=${run_id}" \
+      "physical_device_id=${physical_device_id}" \
+      "host_eid=${host_eid}" \
+      "device_eid=${device_eid}" \
+      'state=launching' > "${legacy_active_file}"); then
+    die "could not claim legacy anonymous active state: ${legacy_active_file}"
+  fi
+  legacy_active_owned=1
+fi
+
 common_args=(
   --run-id "${run_id}"
   --exchange-dir "${exchange_dir}"
@@ -187,6 +304,8 @@ common_args=(
   --bytes "${bytes}"
   --timeout-seconds "${worker_timeout_seconds}"
   --teardown-retries "${teardown_retries}"
+  --channel-name-mode "${channel_name_mode}"
+  --resource-guard-fd "${resource_guard_fd}"
 )
 
 "${binary}" --role host "${common_args[@]}" >"${result_dir}/host.log" 2>&1 &
@@ -195,6 +314,12 @@ host_pid=$!
 device_pid=$!
 printf 'run_id=%s\nhost_pid=%s\ndevice_pid=%s\n' \
   "${run_id}" "${host_pid}" "${device_pid}" > "${result_dir}/workers.env"
+if [[ "${legacy_active_owned}" -eq 1 ]]; then
+  printf 'host_pid=%s\nhost_start_ticks=%s\ndevice_pid=%s\ndevice_start_ticks=%s\nstate=workers-launched\n' \
+    "${host_pid}" "$(process_start_ticks "${host_pid}")" \
+    "${device_pid}" "$(process_start_ticks "${device_pid}")" \
+    >> "${legacy_active_file}"
+fi
 
 interrupted=0
 on_interrupt()
@@ -244,6 +369,24 @@ host_rc=$?
 wait "${device_pid}"
 device_rc=$?
 set -e
+
+archive_legacy_active_if_terminal_safe()
+{
+  [[ "${legacy_active_owned}" -eq 1 ]] || return 0
+  [[ ! -e "${exchange_dir}/unsafe.host" &&
+     ! -e "${exchange_dir}/unsafe.device" ]] || return 0
+  marker_has_safe_terminal "${exchange_dir}/host.final" "${run_id}" &&
+    marker_has_safe_terminal "${exchange_dir}/device.final" "${run_id}" &&
+    marker_has_stage "${exchange_dir}/host.teardown_ok" "${run_id}" teardown-ok &&
+    marker_has_stage "${exchange_dir}/device.teardown_ok" "${run_id}" teardown-ok ||
+    return 0
+  legacy_complete_file="${legacy_active_file}.completed.${run_id}"
+  mv -- "${legacy_active_file}" "${legacy_complete_file}"
+  legacy_active_owned=0
+  echo "KVAF_A5_HCCP_LEGACY_ANONYMOUS_TERMINAL_SAFE=${legacy_complete_file}"
+}
+
+archive_legacy_active_if_terminal_safe
 
 if [[ "${host_rc}" -eq 0 && "${device_rc}" -eq 0 ]] &&
    marker_has_stage "${exchange_dir}/host.final" "${run_id}" PASS &&

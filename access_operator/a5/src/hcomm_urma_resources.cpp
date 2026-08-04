@@ -772,6 +772,10 @@ Status HcommUrmaResources::SnapshotDirectChannel(
   return Status::OK();
 }
 
+bool HcommUrmaResources::SupportsChannelName() const {
+  return HasChannelName<HcommChannelDesc>::value;
+}
+
 std::uint64_t HcommUrmaResources::channel() const {
   return impl_->channel;
 }

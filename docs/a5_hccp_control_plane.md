@@ -153,10 +153,18 @@ Host:   destroy channel -> unregister Host MR -> unregister/free Host DDR
 ```
 
 这里 Host 使用 CPU engine、Device 使用 AIV engine 是 HCOMM UBC/CTP 的既定
-配对，不应为了“对称”而改成两边 AIV。两端还使用同一随机 `run-id` 作为
-`HcommChannelDesc.channelName`；旧的匿名 channel 会允许共享 EID 上的旧进程或
-其他测试误匹配。HCOMM 可异步保留该 `char *`，所以 KVAF 将字符串保存在
-`HcommUrmaResources` 内部，直到 `HcommChannelDestroy` 已成功。
+配对，不应为了“对称”而改成两边 AIV。正式路径要求两端使用同一随机 `run-id`
+作为 `HcommChannelDesc.channelName`；HCOMM 可异步保留该 `char *`，所以 KVAF 将
+字符串保存在 `HcommUrmaResources` 内部，直到 `HcommChannelDestroy` 已成功。
+
+安装的旧 CANN 公共头可能没有 `channelName` 字段。KVAF 默认在任何 ACL、HCOMM、
+内存或设备操作前停止，并输出 `KVAF_HCCP_CHANNEL_NAME_SUPPORT=0`；这不是资源
+创建失败。仅为定位旧 ABI 兼容性，可以在**独占 NPU、唯一 Host/Device EID 对、零 WQE**
+的单次 probe 中显式设置 `KVAF_HCCP_AIV_CHANNEL_LEGACY_ANONYMOUS=1` 和独立风险
+确认值。该模式传递空名称（HCOMM 定义的匿名 pairing），使用固定宿主机锁、worker
+继承并验证的 guard FD、同 boot active-state 保护。它只能称为
+`best-effort-exclusive-legacy-anonymous-v1`：KVAF 无法排除外部 HCOMM/HCCP 进程，
+因此绝不能用于 decode H2D 正式链路、多通道、重启重连，亦不会自动从命名模式降级。
 
 销毁顺序比创建顺序更重要：Device 已导入 Host DDR 后，Host 绝不能抢先
 `HcommMemUnreg` 或撤销 HAL mapping。Device 必须先发布 nonce 绑定的

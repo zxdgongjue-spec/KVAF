@@ -72,6 +72,8 @@ struct Options {
   std::uint32_t timeout_seconds{30};
   std::uint32_t teardown_retries{kDefaultTeardownRetries};
   std::uint64_t bytes{4096};
+  bool allow_anonymous_channel_fallback{false};
+  int resource_guard_fd{-1};
 };
 
 struct RunResult {
@@ -192,11 +194,14 @@ bool ValidRunId(const std::string& run_id) {
 void PrintUsage(const char* program) {
   std::cerr
       << "usage: " << program
+         " --print-capabilities\n       " << program
       << " --role host|device --run-id TOKEN --exchange-dir PATH"
          " --host-eid HEX32 --device-eid HEX32"
          " --logical-device-id N --physical-device-id N"
          " --super-device-id N --server-index N --super-pod-index N"
-         " [--bytes N] [--timeout-seconds N] [--teardown-retries N]\n";
+         " [--bytes N] [--timeout-seconds N] [--teardown-retries N]"
+         " [--channel-name-mode named-required|legacy-anonymous-risk-ack]"
+         " [--resource-guard-fd N]\n";
 }
 
 bool ParseOptions(int argc, char** argv, Options* options) {
@@ -227,6 +232,14 @@ bool ParseOptions(int argc, char** argv, Options* options) {
       host_eid = value;
     } else if (key == "--device-eid") {
       device_eid = value;
+    } else if (key == "--channel-name-mode") {
+      if (value == "named-required") {
+        options->allow_anonymous_channel_fallback = false;
+      } else if (value == "legacy-anonymous-risk-ack") {
+        options->allow_anonymous_channel_fallback = true;
+      } else {
+        return false;
+      }
     } else if (!ParseUnsigned(value, &parsed)) {
       return false;
     } else if (key == "--logical-device-id" &&
@@ -256,6 +269,10 @@ bool ParseOptions(int argc, char** argv, Options* options) {
     } else if (key == "--bytes" && parsed != 0 &&
                parsed <= (1ULL << 30U)) {
       options->bytes = parsed;
+    } else if (key == "--resource-guard-fd" &&
+               parsed <= static_cast<std::uint64_t>(
+                             std::numeric_limits<int>::max())) {
+      options->resource_guard_fd = static_cast<int>(parsed);
     } else {
       return false;
     }
@@ -267,6 +284,11 @@ bool ParseOptions(int argc, char** argv, Options* options) {
          ParseEid(host_eid, &options->host_eid) &&
          ParseEid(device_eid, &options->device_eid) &&
          options->host_eid != options->device_eid;
+}
+
+bool HasOpenResourceGuardFd(const Options& options) {
+  return options.resource_guard_fd >= 0 &&
+         ::fcntl(options.resource_guard_fd, F_GETFD) != -1;
 }
 
 bool CheckAcl(aclError result, const char* operation) {
@@ -671,6 +693,22 @@ RunResult RunHost(const Options& options) {
 
   try {
 
+  const bool supports_channel_name = resources->SupportsChannelName();
+  if (!supports_channel_name && !options.allow_anonymous_channel_fallback) {
+    return FailHost(options, &resources, &mapping, false,
+                    "channel-name-unsupported");
+  }
+  if (!supports_channel_name && !HasOpenResourceGuardFd(options)) {
+    return FailHost(options, &resources, &mapping, false,
+                    "legacy-anonymous-guard-fd-absent");
+  }
+  const std::string channel_name = supports_channel_name ? options.run_id : "";
+  std::cout << "KVAF_A5_HCCP_CHANNEL_MATCHING mode="
+            << (supports_channel_name ? "named-run-id"
+                                      : "legacy-anonymous-risk-ack")
+            << " resource_guard_fd=" << options.resource_guard_fd
+            << '\n';
+
   if (!CheckStatus(mapping->AllocateAndRegister(options.bytes,
                                                  options.logical_device_id),
                    "allocate and map A5 Host DDR")) {
@@ -711,7 +749,7 @@ RunResult RunHost(const Options& options) {
 
   if (!CheckStatus(resources->CreateChannel(
                        MakeDeviceEndpoint(options), ChannelEngine::kCpu,
-                       ChannelRole::kClient, options.run_id),
+                       ChannelRole::kClient, channel_name),
                    "create Host CPU channel")) {
     return FailHost(options, &resources, &mapping, host_ddr_exported,
                     "host-channel-create-failed");
@@ -777,6 +815,22 @@ RunResult RunDevice(const Options& options) {
 
   try {
 
+  const bool supports_channel_name = resources->SupportsChannelName();
+  if (!supports_channel_name && !options.allow_anonymous_channel_fallback) {
+    return FailDevice(options, &resources, &hbm,
+                      "channel-name-unsupported");
+  }
+  if (!supports_channel_name && !HasOpenResourceGuardFd(options)) {
+    return FailDevice(options, &resources, &hbm,
+                      "legacy-anonymous-guard-fd-absent");
+  }
+  const std::string channel_name = supports_channel_name ? options.run_id : "";
+  std::cout << "KVAF_A5_HCCP_CHANNEL_MATCHING mode="
+            << (supports_channel_name ? "named-run-id"
+                                      : "legacy-anonymous-risk-ack")
+            << " resource_guard_fd=" << options.resource_guard_fd
+            << '\n';
+
   const WaitResult exported =
       WaitForMarker(options, "host.ddr_exported", "ddr-exported", "host");
   if (exported != WaitResult::kReady) {
@@ -807,7 +861,7 @@ RunResult RunDevice(const Options& options) {
   }
   if (!CheckStatus(resources->CreateChannel(
                        MakeHostEndpoint(options), ChannelEngine::kAiv,
-                       ChannelRole::kServer, options.run_id),
+                       ChannelRole::kServer, channel_name),
                    "create Device AIV server channel")) {
     return FailDevice(options, &resources, &hbm, "device-channel-create-failed");
   }
@@ -930,11 +984,39 @@ void WriteEarlySafeFailure(const Options& options, const std::string& stage) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // This query deliberately constructs no endpoint, memory, channel, ACL
+  // context, or device allocation.  The runner uses it to reject an old
+  // public header before it starts either resource-owning worker.
+  if (argc == 2 && std::string(argv[1]) == "--print-capabilities") {
+    HcommUrmaResources capability_probe;
+    std::cout << "KVAF_HCCP_CHANNEL_NAME_SUPPORT="
+              << (capability_probe.SupportsChannelName() ? 1 : 0) << '\n';
+    return 0;
+  }
+
   Options options;
   if (!ParseOptions(argc, argv, &options)) {
     PrintUsage(argv[0]);
     return 2;
   }
+
+  // HCOMM v3's run-id channelName is the production matching mechanism.  An
+  // old public header can only request HCOMM's documented anonymous mode.
+  // Reject that downgrade before ACL initialization unless the supervisor has
+  // explicitly selected the compatibility probe and passed an inherited
+  // resource-guard descriptor.  This check intentionally precedes every ACL,
+  // HCOMM, memory, and device operation.
+  HcommUrmaResources capability_probe;
+  const bool supports_channel_name = capability_probe.SupportsChannelName();
+  if (!supports_channel_name && !options.allow_anonymous_channel_fallback) {
+    WriteEarlySafeFailure(options, "channel-name-unsupported");
+    return 1;
+  }
+  if (!supports_channel_name && !HasOpenResourceGuardFd(options)) {
+    WriteEarlySafeFailure(options, "legacy-anonymous-guard-fd-absent");
+    return 1;
+  }
+
   if (!CheckAcl(aclInit(nullptr), "aclInit")) {
     WriteEarlySafeFailure(options, "acl-init-failed");
     return 1;

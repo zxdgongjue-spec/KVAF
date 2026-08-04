@@ -80,6 +80,48 @@ class HccpAivChannelProbeContractTests(unittest.TestCase):
         self.assertIn("did not prove that a failed create/import", hcomm)
         self.assertNotIn("SetChannelName(&desc, channel_name.c_str())", hcomm)
 
+    def test_old_header_anonymous_mode_is_explicit_and_hardware_gated(self) -> None:
+        source = SOURCE.read_text(encoding="utf-8")
+        runner = RUNNER.read_text(encoding="utf-8")
+        main = source[source.index("int main(") :]
+
+        self.assertIn("--print-capabilities", source)
+        self.assertIn("KVAF_HCCP_CHANNEL_NAME_SUPPORT=", source)
+        self.assertIn("channel-name-unsupported", main)
+        self.assertIn("legacy-anonymous-guard-fd-absent", main)
+        self.assertIn("HasOpenResourceGuardFd", source)
+        self.assertIn("legacy-anonymous-risk-ack", source)
+        self.assertIn(
+            "const std::string channel_name = supports_channel_name ? options.run_id : \"\";",
+            source,
+        )
+        self.assertLess(
+            main.index("if (!supports_channel_name && !options.allow_anonymous_channel_fallback)"),
+            main.index("aclInit"),
+        )
+
+        self.assertIn("KVAF_HCCP_AIV_CHANNEL_LEGACY_ANONYMOUS", runner)
+        self.assertIn(
+            "I_ACCEPT_LEGACY_ANONYMOUS_CHANNEL_CROSS_PROCESS_PAIRING_RISK",
+            runner,
+        )
+        self.assertIn("KVAF_HCCP_CHANNEL_NAME_SUPPORT=0", runner)
+        self.assertIn("--print-capabilities", runner)
+        self.assertLess(
+            runner.index("channel_capability_output"),
+            runner.index("query_a5_topology.py"),
+        )
+        self.assertIn("CONTRACT=best-effort-exclusive-legacy-anonymous-v1", runner)
+        self.assertIn("exec 10>", runner)
+        self.assertIn("flock -n 10", runner)
+        self.assertIn("[k]vaf_a5_hccp_aiv_channel_probe", runner)
+        self.assertIn("/data/.kvaf-state/KVAF", runner)
+        self.assertIn("hccp-aiv-legacy-anonymous.active", runner)
+        self.assertIn("marker_has_safe_terminal", runner)
+        self.assertIn('--channel-name-mode "${channel_name_mode}"', runner)
+        self.assertIn('--resource-guard-fd "${resource_guard_fd}"', runner)
+        self.assertNotIn("legacy-anonymous-risk-ack)\n    channel_name_support=1", runner)
+
     def test_runner_has_strict_safety_gates_but_no_worker_kill_path(self) -> None:
         runner = RUNNER.read_text(encoding="utf-8")
         self.assertIn(
