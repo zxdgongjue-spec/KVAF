@@ -10,7 +10,7 @@ target_include_directories(_kvaf
     ${CMAKE_CURRENT_SOURCE_DIR}/../access_operator/include
 )
 
-set(KVAF_PYTHON_BINDING_PREFLIGHT "import kvaf")
+set(KVAF_PYTHON_BINDING_PREFLIGHT_ARGS)
 
 if(KVAF_ENABLE_AIV_BATCH_GET)
   target_sources(_kvaf PRIVATE
@@ -41,9 +41,7 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
   set_property(TARGET _kvaf APPEND PROPERTY BUILD_RPATH
     "$<TARGET_FILE_DIR:kvaf_execute_batch_get_host>"
   )
-  set(KVAF_PYTHON_BINDING_PREFLIGHT
-    "import kvaf; assert hasattr(kvaf, 'AclStream'); assert 'retain_unsynchronized_launch_args' in kvaf.NpuRuntime.__init__.__doc__"
-  )
+  list(APPEND KVAF_PYTHON_BINDING_PREFLIGHT_ARGS --require-aiv)
 endif()
 
 set_target_properties(_kvaf PROPERTIES
@@ -59,6 +57,7 @@ add_custom_command(TARGET _kvaf POST_BUILD
   # obscuring a missing shared library as a test-script import error.
   COMMAND ${CMAKE_COMMAND} -E env
     "PYTHONPATH=${CMAKE_BINARY_DIR}/python"
-    "${Python_EXECUTABLE}" -c
-    "${KVAF_PYTHON_BINDING_PREFLIGHT}"
+    "${Python_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/verify_python_binding.py"
+    ${KVAF_PYTHON_BINDING_PREFLIGHT_ARGS}
 )
