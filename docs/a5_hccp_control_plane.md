@@ -82,7 +82,8 @@ SDK 的 `ascend_hal.h`，会将 raw-HAL 声明面记为 `unavailable`，但仍�
 `LD_LIBRARY_PATH`、与 Host 架构相符的动态链接器缓存、CANN/Driver 固定布局依次进行，
 并报告全部候选。这是针对 name-only `dlopen` 的保守发现顺序，不等价于某个未来可执行
 文件的完整 ELF 解析顺序：`DT_RPATH/DT_RUNPATH` 尚未纳入；空/相对 loader path 因会
-引入当前目录而被故意忽略。它不会 `dlopen`、不会调用 HCCP/HCOMM/HAL，也不会操作 NPU。
+引入当前目录而被故意忽略。`ldconfig` 项会按 Host 架构过滤，其他显式/固定路径的 ELF
+架构仍只标记为未证明。它不会 `dlopen`、不会调用 HCCP/HCOMM/HAL，也不会操作 NPU。
 
 静态审计结果只能选择下一步适配器，不能授权真机执行。只有以下证据齐全后才会增加
 一个资源级、无 WQE 的 HCCP backend probe：
