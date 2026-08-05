@@ -77,11 +77,11 @@ The data path keeps the public KVAF ABI and the verified Direct-HCCP WQE token
 fields. It does not copy the AIV_URMA benchmark's server/client handshake,
 control-region writes, fixed 64K request shape, or per-launch CQ reset.
 
-Each AIV first validates its complete request partition before touching the SQ,
-preserving the all-or-nothing safety rule for invalid table/output addresses.
-It then compacts the complete partition once into a 4096-entry UB active-ID
-array. The caller must guarantee that each AIV owns at most 4096 mask entries
-whose value is nonzero; the kernel verifies that bound before touching the SQ.
+Each AIV compacts its complete request partition once into a 16384-entry UB
+active-ID array. The caller must guarantee that each AIV owns at most 16384
+mask entries whose value is nonzero. Before touching the SQ, the kernel rejects
+an active count beyond that capacity or a per-Jetty assignment that fills the
+entire SQ.
 The phase-two scheduler assigns complete 32-WQE posts to the core's Jettys in
 round-robin order. Each Jetty has an independent persistent SQ producer and CQ
 consumer index. Only the last READ assigned to each used Jetty requests a CQE;
@@ -132,9 +132,9 @@ WARMUP=1 ITERATIONS=1 bash scripts/run_execute_batch_get.sh
 DEVICE_ID=0 DYNAMIC_OUTPUT_SMOKE=1 WARMUP=1 ITERATIONS=1 \
 bash scripts/run_execute_batch_get.sh
 
-# Compacts a 65536-request partition once with exactly 4096 active entries.
+# Compacts a 65536-request partition once with exactly 16384 active entries.
 DEVICE_ID=0 TABLE_CAPACITY=65536 REQUESTS=65536 OUTPUT_ROWS=65536 \
-AIV_CORES=1 ACTIVE_EVERY=16 WARMUP=1 ITERATIONS=1 \
+AIV_CORES=1 ACTIVE_EVERY=4 WARMUP=1 ITERATIONS=1 \
 bash scripts/run_execute_batch_get.sh
 
 DEVICE_ID=0 GRAPH_REPLAYS=4 GRAPH_WARMUP=1 GRAPH_ITERATIONS=5 \
