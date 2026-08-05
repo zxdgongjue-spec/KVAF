@@ -64,7 +64,7 @@ if dumper=$(command -v asc_dumper 2>/dev/null) && ldd "${dumper}" 2>/dev/null | 
   ldd "${dumper}" 2>&1 | tee -a "${log_file}" >&2 || true
   exit 2
 fi
-echo "[EXECUTE_BATCH_GET] contract=npu_execute_address_table_to_udma_read device=${DEVICE_ID} table=${TABLE_CAPACITY} requests=${REQUESTS} output_rows=${OUTPUT_ROWS} block_bytes=${BLOCK_BYTES} stride=${SOURCE_STRIDE} aiv_cores=${AIV_CORES} mask_every=${MASK_EVERY} dynamic_output_smoke=${DYNAMIC_OUTPUT_SMOKE} graph_replays=${GRAPH_REPLAYS} graph_warmup=${GRAPH_WARMUP} graph_iterations=${GRAPH_ITERATIONS} timeout=${timeout_seconds} toolkit_lib=${cann_lib}" | tee "${log_file}"
+echo "[EXECUTE_BATCH_GET] contract=npu_execute_address_table_to_udma_read schedule=serial_simt jettys_per_core=1 device=${DEVICE_ID} table=${TABLE_CAPACITY} requests=${REQUESTS} output_rows=${OUTPUT_ROWS} block_bytes=${BLOCK_BYTES} stride=${SOURCE_STRIDE} aiv_cores=${AIV_CORES} mask_every=${MASK_EVERY} dynamic_output_smoke=${DYNAMIC_OUTPUT_SMOKE} graph_replays=${GRAPH_REPLAYS} graph_warmup=${GRAPH_WARMUP} graph_iterations=${GRAPH_ITERATIONS} timeout=${timeout_seconds} toolkit_lib=${cann_lib}" | tee "${log_file}"
 
 set +e
 timeout "${timeout_seconds}" "${test_binary}" --kernel "${kernel}" \

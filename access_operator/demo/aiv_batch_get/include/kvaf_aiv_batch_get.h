@@ -22,7 +22,8 @@ typedef struct KvafBatchGetTransport KvafBatchGetTransport;
 typedef struct KvafBatchGetLocalBuffer KvafBatchGetLocalBuffer;
 
 // Transport owns only the reusable CPU-EID <-> device-EID path and Host DDR.
-// It deliberately accepts no caller-owned HBM buffer.
+// It deliberately accepts no caller-owned HBM buffer. The serial baseline
+// requires jettys_per_core == 1.
 int32_t KvafBatchGetTransportCreate(void *host_ddr, uint64_t host_ddr_bytes,
                                     uint32_t aiv_core_count, uint32_t jettys_per_core,
                                     KvafBatchGetTransport **transport);

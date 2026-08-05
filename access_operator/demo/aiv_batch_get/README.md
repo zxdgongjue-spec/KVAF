@@ -1,4 +1,4 @@
-# A5 AIV ExecuteBatchGet (minimal)
+# A5 AIV ExecuteBatchGet (serial SIMT baseline)
 
 This directory is the smallest standalone implementation of the NPU-side
 `ExecuteBatchGet` path: an AIV kernel looks up fixed-shape device tensors and
@@ -14,7 +14,7 @@ registration; each HBM output is registered separately as a local UDMA range.
 | Tensor | Type / shape | Meaning |
 | --- | --- | --- |
 | `address_table` | `uint64[table_capacity]` | Absolute Host DDR UBAs, produced by the meta layer. |
-| `valid_table` | `uint8[table_capacity]` | A zero entry makes its lookup invalid. |
+| `valid_table` | `uint8[table_capacity]` | Fixed ABI validity tensor; active entries must be prevalidated in this baseline. |
 | `indices` | `int32[request_capacity]` | Logical entries requested by this batch. |
 | `mask` | `uint8[request_capacity]` | Zero skips that request without changing the graph shape. |
 | `output_indices` | `int32[request_capacity]` | Destination row in `output`. |
@@ -49,8 +49,9 @@ addresses receive a new local MR and entity table but reuse the transport.
 
 ## What is included
 
-- `kernel/execute_batch_get_aiv.asc`: AIV UDMA READ WQE producer and CQ owner
-  polling. It never uses MTE to dereference Host DDR.
+- `kernel/execute_batch_get_aiv.asc`: SIMT mask compaction and 32-lane UDMA
+  READ WQE generation, followed by CQ owner polling. It never uses MTE to
+  dereference Host DDR.
 - `host/batch_get_host.cpp`: CPU/device EID discovery, Direct-HCCP transport,
   Host-DDR registration, per-output HBM-MR cache, and one private USER_CTL
   SQ/CQ/Jetty per AIV.
@@ -64,6 +65,24 @@ The checked Direct-HCCP declarations in `include/direct_hccp_abi.h` are the
 minimum private driver ABI needed to create the queue resources. They must be
 rebuilt against the target CANN/driver combination.
 
+## Baseline boundary
+
+This version keeps the same SIMT WQE format, 32-WQE post size, active-request
+capacity, low-level UB-to-SQ copy, and 128 KiB local-memory configuration as
+`simt-batch-get`. It deliberately removes both optimized scheduling axes:
+
+- Every AIV owns exactly one Jetty and one persistent SQ/CQ state.
+- One UB WQE bank is used. For every post, Vector WQE generation completes,
+  then MTE3 copies that post to SQ, then Scalar updates the producer index and
+  rings the doorbell. Only after all three stages finish does the next post
+  start.
+
+Each AIV compacts its full request partition once into a 16384-entry active-ID
+array. A batch is rejected before SQ submission if that capacity is exceeded
+or if the active request count would fill the single Jetty's SQ. As in the
+referenced performance path, active table indices, addresses, and output rows
+must already be valid; `valid_table` remains in the fixed public ABI.
+
 ## Build and run on A5
 
 ```bash
@@ -72,6 +91,17 @@ bash scripts/build.sh
 DEVICE_ID=0 bash scripts/run_execute_batch_get.sh
 DEVICE_ID=0 bash scripts/run_execute_batch_get_graph.sh
 ```
+
+The kernel uses the Ascend C SIMT API. The build automatically checks the
+toolkit's top-level `include/simt_api` directory and older tikcpp layouts. If
+asc-devkit is installed separately, point the build at the directory that
+contains `simt_api/device_atomic_functions.h`:
+
+```bash
+ASCEND_SIMT_API_DIR=/path/to/asc-devkit/include bash scripts/build.sh
+```
+
+Use the asc-devkit package matching the target CANN version.
 
 The eager default is 4096 requests of 1024 bytes, 4 KiB source stride, and
 four AIVs. Results are written beneath `results/`; `feedback.txt` contains
@@ -115,8 +145,7 @@ release local buffers before destroying the transport.
 
 ## Status
 
-The Direct-HCCP A5 data path and the fixed-shape eager/ACL graph tests were
-validated on the target environment before this minimal extraction. This
-branch is intentionally a source reduction of that known route; it still
-needs one remote build and smoke run after extraction before it can be called
-independently revalidated.
+The baseline is implemented against the established Direct-HCCP A5 data path
+and fixed-shape eager/ACL graph harness. It still needs a build and smoke run
+on an A5 environment with the matching CANN asc-devkit before it can be called
+hardware-validated.

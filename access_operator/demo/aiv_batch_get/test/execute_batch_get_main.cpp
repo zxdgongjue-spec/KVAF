@@ -371,6 +371,7 @@ int main(int argc, char **argv) {
             << " output_lifetime=local_buffer_acquired\n";
   if (!CheckKvaf(KvafExecuteBatchGetLoadKernel(options.kernel.c_str()), "load ExecuteBatchGet kernel")) goto cleanup;
   std::cout << "PHASE_KERNEL_REGISTERED cores=" << options.aiv_cores
+            << " schedule=serial_simt jettys_per_core=1"
             << " contract=address_table_absolute_uba_plus_mask_plus_output_scatter\n";
 
   args.address_table = reinterpret_cast<uint64_t>(device_address_table);
@@ -588,7 +589,8 @@ int main(int argc, char **argv) {
               << "GRAPH_PERF_RESULT metric=graph_input_update_to_stream_completion samples="
               << options.graph_iterations << " warmup_excluded=" << options.graph_warmup
               << " active_requests=" << active << " block_bytes=" << options.block_bytes
-              << " aiv_cores=" << options.aiv_cores << " mean_ms=" << mean_ms
+              << " aiv_cores=" << options.aiv_cores
+              << " schedule=serial_simt jettys_per_core=1 mean_ms=" << mean_ms
               << " p50_ms=" << Percentile(elapsed_ms, 0.50) << " p90_ms=" << Percentile(elapsed_ms, 0.90)
               << " p99_ms=" << Percentile(elapsed_ms, 0.99) << " useful_GiBps=" << gibps << '\n';
     exit_code = 0;
@@ -638,7 +640,8 @@ int main(int argc, char **argv) {
               << "PERF_RESULT metric=host_submit_to_stream_completion samples=" << options.iterations
               << " warmup_excluded=" << options.warmup << " active_requests=" << active
               << " block_bytes=" << options.block_bytes << " aiv_cores=" << options.aiv_cores
-              << " mean_ms=" << mean_ms << " p50_ms=" << Percentile(elapsed_ms, 0.50)
+              << " schedule=serial_simt jettys_per_core=1 mean_ms=" << mean_ms
+              << " p50_ms=" << Percentile(elapsed_ms, 0.50)
               << " p90_ms=" << Percentile(elapsed_ms, 0.90) << " p99_ms=" << Percentile(elapsed_ms, 0.99)
               << " useful_GiBps=" << gibps << '\n';
   }
