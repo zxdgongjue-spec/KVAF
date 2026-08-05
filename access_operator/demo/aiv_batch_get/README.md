@@ -55,10 +55,10 @@ addresses receive a new local MR and entity table but reuse the transport.
 ## What is included
 
 - `kernel/execute_batch_get_aiv.asc`: SIMT-compacts requests,
-  caches each active request's table index and request ID in UB, generates 32
-  UDMA READ WQEs in parallel, and overlaps vector fill, MTE3 UB-to-SQ copies,
-  and scalar doorbells with two UB banks. It never uses MTE to dereference Host
-  DDR.
+  caches each active request's resolved remote address and output row in UB,
+  generates 32 UDMA READ WQEs in parallel, and overlaps vector fill, MTE3
+  UB-to-SQ copies, and scalar doorbells with two UB banks. It never uses MTE to
+  dereference Host DDR.
 - `host/batch_get_host.cpp`: CPU/device EID discovery, Direct-HCCP transport,
   Host-DDR registration, per-output HBM-MR cache, and up to two private
   USER_CTL SQ/CQ/Jettys per AIV.
@@ -79,10 +79,10 @@ fields. It does not copy the AIV_URMA benchmark's server/client handshake,
 control-region writes, fixed 64K request shape, or per-launch CQ reset.
 
 Each AIV compacts its complete request partition once into parallel 16384-entry
-UB arrays containing the active table indices and original request IDs. The
-caller must guarantee that each AIV owns at most 16384 mask entries whose value
-is nonzero. Before touching the SQ, the kernel rejects an active count beyond
-that capacity or a per-Jetty assignment that fills the entire SQ.
+UB arrays containing the resolved remote addresses and output rows. The caller
+must guarantee that each AIV owns at most 16384 mask entries whose value is
+nonzero. Before touching the SQ, the kernel rejects an active count beyond that
+capacity or a per-Jetty assignment that fills the entire SQ.
 The phase-two scheduler assigns complete 32-WQE posts to the core's Jettys in
 round-robin order. Each Jetty has an independent persistent SQ producer and CQ
 consumer index. Only the last READ assigned to each used Jetty requests a CQE;
@@ -91,8 +91,9 @@ complete. This is required because a CQE on one Jetty does not fence READs
 submitted through another Jetty. A core with one post uses only Jetty 0, while
 the one-Jetty phase-one path remains selectable with `JETTYS_PER_CORE=1`.
 
-The ACL launcher explicitly reserves 160 KiB of AIV local memory for the two
-WQE banks, compacted table-index/request-ID arrays and SIMT validation scratch.
+The ACL launcher explicitly reserves 224 KiB of AIV local memory for the two
+WQE banks, compacted remote-address/output-row arrays and SIMT validation
+scratch.
 
 ## Build and run on A5
 
