@@ -116,7 +116,10 @@ asc-devkit package matching the target CANN version before building; mixing
 headers from a different CANN release is not supported.
 
 The eager default is 4096 requests of 1024 bytes, 4 KiB source stride, four
-AIVs, and two Jettys per AIV. Results are written beneath `results/`;
+AIVs, two Jettys per AIV, and a 5% active probability. As in
+`tests/python/test_npu_runtime_perf.py`, every warmup and measured sample uses
+its own random indices/mask pair. All pairs are generated and copied to the
+device before the benchmark starts. Results are written beneath `results/`;
 `feedback.txt` contains
 the outcome, key phase markers, run log, and any locally copied PLOG files.
 
@@ -124,7 +127,7 @@ Useful overrides:
 
 ```bash
 DEVICE_ID=0 TABLE_CAPACITY=256 REQUESTS=10 OUTPUT_ROWS=200 \
-BLOCK_BYTES=1024 SOURCE_STRIDE=4096 AIV_CORES=1 JETTYS_PER_CORE=2 MASK_EVERY=3 \
+BLOCK_BYTES=1024 SOURCE_STRIDE=4096 AIV_CORES=1 JETTYS_PER_CORE=2 ACTIVE_PERCENT=20 \
 WARMUP=1 ITERATIONS=1 bash scripts/run_execute_batch_get.sh
 
 # Proves TransportCreate -> Acquire(A) -> Acquire(B) -> re-Acquire(A), then
@@ -132,25 +135,24 @@ WARMUP=1 ITERATIONS=1 bash scripts/run_execute_batch_get.sh
 DEVICE_ID=0 DYNAMIC_OUTPUT_SMOKE=1 WARMUP=1 ITERATIONS=1 \
 bash scripts/run_execute_batch_get.sh
 
-# Compacts a 65536-request partition once with exactly 16384 active entries.
-DEVICE_ID=0 TABLE_CAPACITY=65536 REQUESTS=65536 OUTPUT_ROWS=65536 \
-AIV_CORES=1 ACTIVE_EVERY=4 WARMUP=1 ITERATIONS=1 \
-bash scripts/run_execute_batch_get.sh
-
 DEVICE_ID=0 GRAPH_REPLAYS=4 GRAPH_WARMUP=1 GRAPH_ITERATIONS=5 \
 bash scripts/run_execute_batch_get_graph.sh
 ```
 
-`MASK_EVERY=N` starts with every request active and masks request IDs divisible
-by `N`. `ACTIVE_EVERY=N` starts with every request masked and activates request
-IDs divisible by `N`; the two options are mutually exclusive. The same mask
-policy is retained during graph replay.
+For the eager benchmark, `ACTIVE_PERCENT=N` controls the independent Bernoulli
+mask probability for every sample; random generation and the one-time H2D
+upload are excluded from timing. `MASK_EVERY=N` and `ACTIVE_EVERY=N` remain
+deterministic functional controls for the dynamic-output smoke test and graph
+replay: the former masks request IDs divisible by `N`, while the latter
+activates only request IDs divisible by `N`; the two options are mutually
+exclusive.
 
 The graph performance metric is
 `graph_input_update_to_stream_completion`: updates into the fixed lookup
 tensors, captured graph execution, and stream completion are included;
 capture, HCCP setup and final D2H validation are excluded. The normal metric
-is `host_submit_to_stream_completion` and excludes warmup.
+is `host_submit_to_stream_completion`; it includes only launch through stream
+completion and excludes input generation, H2D upload, warmup and validation.
 
 ## Graph boundary
 
