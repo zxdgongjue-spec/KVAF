@@ -10,11 +10,11 @@
 
 namespace kvaf {
 
-struct PutAccessDesc;
+struct AccessDesc;
 
 struct BatchPutExecRequest {
   const BatchPutRequest* request{nullptr};
-  const PutAccessDesc* put_desc{nullptr};
+  const AccessDesc* put_desc{nullptr};
   BatchPutExecutionOptions execution;
 };
 

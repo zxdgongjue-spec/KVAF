@@ -207,5 +207,5 @@ timeout 1800s python3 tests/python/test_npu_runtime_perf.py
 逻辑 KV block；脚本显式配置 AIV Direct-HCCP BatchPut kernel，BatchPut 性能样本
 测量 Runtime metadata upload、AIV WRITE 及其 caller-stream 完成，不包含全量数据
 填充。
-脚本以 CPU `torch.int64` Tensor 传入全量 Prepare key，避免 Python `list[int]` 转换污染
-这项控制面性能数据。
+脚本以字符串 key 列表传入全量 Prepare key；`KeyId` 在 Runtime 控制面统一为
+`std::string`。性能数据中的 `torch.int64` 仅用于地址、索引或 payload 生成。

@@ -182,8 +182,11 @@ def main() -> int:
         variable_offsets.append(len(variable_input_host))
         variable_lengths.append(len(payload))
         variable_input_host.extend(payload)
-    variable_keys = list(range(1_000_001, 1_000_001 + len(variable_payloads)))
-    ddr_bytes = (active_requests + len(variable_keys)) * source_stride
+    variable_keys = [
+        f"variable_{index}" for index in range(len(variable_payloads))
+    ]
+    slot_count_per_class = active_requests + len(variable_keys)
+    ddr_bytes = slot_count_per_class * (source_stride + 2 * source_stride)
 
     # torch_npu owns ACL process initialization. Select the device before
     # passing its caller-owned streams through the pybind Runtime.
@@ -214,7 +217,12 @@ def main() -> int:
                 "kind=torch"
             )
         print("RUNTIME_NPU_PHASE_BEGIN phase=runtime_initialize")
-        runtime.initialize(ddr_bytes, source_stride)
+        runtime.initialize(
+            ddr_bytes,
+            source_stride,
+            2 * source_stride,
+            slot_count_per_class,
+        )
         print(
             "RUNTIME_NPU_PHASE_DONE phase=runtime_initialize "
             f"ddr_bytes={ddr_bytes}"
@@ -257,7 +265,7 @@ def main() -> int:
         )
 
         print("RUNTIME_NPU_PHASE_BEGIN phase=batch_put")
-        active_keys = list(range(1, active_requests + 1))
+        active_keys = [f"active_{index}" for index in range(active_requests)]
         source_rows = torch.arange(active_requests, dtype=torch.int64).unsqueeze(1)
         source_bytes = torch.arange(block_bytes, dtype=torch.int64).unsqueeze(0)
         source = (

@@ -60,8 +60,19 @@ class AclHostDdrAllocator final : public DdrMemoryAllocator {
   Status Allocate(const RuntimeInitRequest& request,
                   RemoteRegionDesc* region) override {
     if (region == nullptr || request.ddr_device != DeviceKind::kCpu ||
-        request.ddr_bytes == 0 || request.slot_size == 0 ||
-        request.ddr_bytes % request.slot_size != 0) {
+        request.ddr_bytes == 0 || request.short_slot_size == 0 ||
+        request.long_slot_size == 0 ||
+        request.slot_count_per_class == 0 ||
+        request.short_slot_size >= request.long_slot_size ||
+        request.short_slot_size >
+            std::numeric_limits<std::uint64_t>::max() -
+                request.long_slot_size ||
+        request.slot_count_per_class >
+            std::numeric_limits<std::uint64_t>::max() /
+                (request.short_slot_size + request.long_slot_size) ||
+        request.slot_count_per_class *
+                (request.short_slot_size + request.long_slot_size) !=
+            request.ddr_bytes) {
       return InvalidArgument("invalid ACL Host DDR allocation request");
     }
     if (address_ != nullptr) {
@@ -73,7 +84,9 @@ class AclHostDdrAllocator final : public DdrMemoryAllocator {
                            "aclrtMallocHost failed for Runtime DDR");
     }
     *region = RemoteRegionDesc{reinterpret_cast<Address>(address_),
-                               request.ddr_bytes, request.slot_size,
+                               request.ddr_bytes, request.short_slot_size,
+                               request.long_slot_size,
+                               request.slot_count_per_class,
                                DeviceKind::kCpu};
     return Status::OK();
   }
@@ -139,36 +152,16 @@ NpuTensorView GetNpuTensorView(const py::object& tensor, const char* name) {
 }
 
 std::vector<KeyId> CopyPrepareKeys(const py::object& keys) {
-  // A full AccessTable can contain millions of keys. Accepting a CPU int64
-  // Tensor avoids Pybind iterating millions of Python int objects before the
-  // Runtime control plane even starts. Runtime's C++ API still owns a vector
-  // snapshot, so this performs one contiguous 8-byte copy per key.
-  if (!py::hasattr(keys, "data_ptr")) {
-    return keys.cast<std::vector<KeyId>>();
+  py::sequence sequence = keys.cast<py::sequence>();
+  std::vector<KeyId> result;
+  result.reserve(sequence.size());
+  for (const py::handle item : sequence) {
+    if (!py::isinstance<py::str>(item)) {
+      throw py::type_error("keys must be a sequence of strings");
+    }
+    result.push_back(py::cast<std::string>(item));
   }
-  if (!py::hasattr(keys, "numel") || !py::hasattr(keys, "element_size") ||
-      !py::hasattr(keys, "is_contiguous") || !py::hasattr(keys, "device") ||
-      !py::hasattr(keys, "dim") || !py::hasattr(keys, "dtype")) {
-    throw py::type_error("PrepareAccessTable keys must be a sequence or CPU int64 Tensor");
-  }
-  if (!keys.attr("is_contiguous")().cast<bool>() ||
-      keys.attr("dim")().cast<int>() != 1 ||
-      py::str(keys.attr("device")).cast<std::string>() != "cpu" ||
-      py::str(keys.attr("dtype")).cast<std::string>() != "torch.int64" ||
-      keys.attr("element_size")().cast<std::size_t>() != sizeof(KeyId)) {
-    throw py::value_error(
-        "PrepareAccessTable Tensor keys must be contiguous CPU torch.int64 with one dimension");
-  }
-  const std::uint64_t count = keys.attr("numel")().cast<std::uint64_t>();
-  if (count == 0 || count > std::numeric_limits<std::size_t>::max()) {
-    throw py::value_error("PrepareAccessTable Tensor keys must be non-empty");
-  }
-  const auto* data = static_cast<const KeyId*>(
-      PointerFromValue(keys.attr("data_ptr")().cast<std::uint64_t>()));
-  if (data == nullptr) {
-    throw py::value_error("PrepareAccessTable Tensor keys must have storage");
-  }
-  return std::vector<KeyId>{data, data + static_cast<std::size_t>(count)};
+  return result;
 }
 
 class DeviceAccessTable final {
@@ -230,9 +223,16 @@ class NpuRuntime final {
   NpuRuntime(const NpuRuntime&) = delete;
   NpuRuntime& operator=(const NpuRuntime&) = delete;
 
-  void Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
+  void Initialize(std::uint64_t ddr_bytes,
+                  std::uint64_t short_slot_size,
+                  std::uint64_t long_slot_size,
+                  std::uint64_t slot_count_per_class) {
     ThrowIfError(runtime_->Initialize(
-        RuntimeInitRequest{ddr_bytes, slot_size, DeviceKind::kCpu}));
+        RuntimeInitRequest{ddr_bytes,
+                           short_slot_size,
+                           long_slot_size,
+                           slot_count_per_class,
+                           DeviceKind::kCpu}));
   }
 
   bool Initialized() const {
@@ -247,7 +247,9 @@ class NpuRuntime final {
     py::dict result;
     result["base"] = region.base;
     result["length"] = region.length;
-    result["slot_size"] = region.slot_size;
+    result["short_slot_size"] = region.short_slot_size;
+    result["long_slot_size"] = region.long_slot_size;
+    result["slot_count_per_class"] = region.slot_count_per_class;
     result["device"] = "cpu";
     return result;
   }
@@ -256,10 +258,11 @@ class NpuRuntime final {
   // metadata describes its variable-size blocks for the duration of
   // Runtime::BatchPut. When batch_put_kernel_object_path was configured,
   // the Direct-HCCP implementation synchronously completes this stream.
-  void BatchPut(const std::vector<KeyId>& keys, const py::object& source,
+  void BatchPut(const py::object& key_object, const py::object& source,
                 const std::vector<std::uint64_t>& input_offsets,
                 const std::vector<std::uint64_t>& lengths,
                 const py::object& stream) {
+    const std::vector<KeyId> keys = CopyPrepareKeys(key_object);
     if (!Initialized()) {
       throw std::runtime_error("Runtime has not been initialized");
     }
@@ -351,10 +354,8 @@ class NpuRuntime final {
     ThrowIfError(runtime_->ReleaseAccessTable(handle));
   }
 
-  // BatchFree is a control-plane operation.  It deliberately takes the same
-  // Python key forms as PrepareAccessTable (a Python key sequence or a
-  // contiguous one-dimensional CPU torch.int64 Tensor), rather than imposing
-  // a second representation solely for the NPU Runtime binding.
+  // BatchFree is a control-plane operation and uses the same string-key
+  // sequence representation as PrepareAccessTable.
   void BatchFree(const py::object& keys) {
     std::vector<KeyId> copied_keys = CopyPrepareKeys(keys);
     ThrowIfError(runtime_->BatchFree(BatchFreeRequest{std::move(copied_keys)}));
@@ -454,8 +455,9 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("batch_get_kernel_object_path"), py::arg("device_id") = 0,
            py::arg("npu_core_count") = 1,
            py::arg("batch_put_kernel_object_path") = "")
-      .def("initialize", &NpuRuntime::Initialize, py::arg("ddr_bytes"),
-           py::arg("slot_size"))
+       .def("initialize", &NpuRuntime::Initialize, py::arg("ddr_bytes"),
+            py::arg("short_slot_size"), py::arg("long_slot_size"),
+            py::arg("slot_count_per_class"))
       .def("shutdown", &NpuRuntime::Shutdown)
       .def_property_readonly("initialized", &NpuRuntime::Initialized)
       .def_property_readonly("device_id", &NpuRuntime::DeviceId)
@@ -476,8 +478,7 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("access_table"))
       .def("batch_free", &NpuRuntime::BatchFree, py::arg("keys"),
            "Release the supplied keys from the Runtime metadata store. keys "
-           "accepts a Python key sequence or a contiguous one-dimensional "
-           "CPU torch.int64 Tensor.")
+           "must be a sequence of strings.")
       .def("batch_get", &NpuRuntime::BatchGet,
            py::arg("device_access_table"), py::arg("indices"), py::arg("mask"),
            py::arg("output_indices"), py::arg("output"),

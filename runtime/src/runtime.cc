@@ -1,6 +1,7 @@
 #include "kvaf/runtime/runtime.h"
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <new>
 #include <string>
@@ -23,10 +24,24 @@ class HostDdrMemoryAllocator final : public DdrMemoryAllocator {
       return Status::InvalidArgument(
           "HostDdrMemoryAllocator supports only CPU host DDR");
     }
-    if (request.ddr_bytes == 0 || request.slot_size == 0 ||
-        request.ddr_bytes % request.slot_size != 0) {
+    if (request.ddr_bytes == 0 || request.short_slot_size == 0 ||
+        request.long_slot_size == 0 ||
+        request.slot_count_per_class == 0 ||
+        request.short_slot_size >= request.long_slot_size) {
       return Status::InvalidArgument(
-          "ddr_bytes must be a non-zero multiple of slot_size");
+          "invalid dual-slot DDR layout");
+    }
+    if (request.short_slot_size >
+            std::numeric_limits<std::uint64_t>::max() -
+                request.long_slot_size ||
+        request.slot_count_per_class >
+            std::numeric_limits<std::uint64_t>::max() /
+                (request.short_slot_size + request.long_slot_size) ||
+        request.slot_count_per_class *
+                (request.short_slot_size + request.long_slot_size) !=
+            request.ddr_bytes) {
+      return Status::InvalidArgument(
+          "ddr_bytes does not match the dual-slot layout");
     }
 
     auto bytes = std::unique_ptr<std::uint8_t[]>(
@@ -37,8 +52,13 @@ class HostDdrMemoryAllocator final : public DdrMemoryAllocator {
 
     const Address base = reinterpret_cast<Address>(bytes.get());
     allocations_.emplace(base, std::move(bytes));
-    *remote_region = RemoteRegionDesc{base, request.ddr_bytes,
-                                      request.slot_size, request.ddr_device};
+    *remote_region = RemoteRegionDesc{
+        base,
+        request.ddr_bytes,
+        request.short_slot_size,
+        request.long_slot_size,
+        request.slot_count_per_class,
+        request.ddr_device};
     return Status::OK();
   }
 
@@ -86,10 +106,22 @@ Status Runtime::Initialize(const RuntimeInitRequest& request) {
   if (!status.ok()) {
     return status;
   }
-  if (remote_region.length == 0 || remote_region.slot_size == 0 ||
-      remote_region.length % remote_region.slot_size != 0) {
+  if (remote_region.length == 0 || remote_region.short_slot_size == 0 ||
+      remote_region.long_slot_size == 0 ||
+      remote_region.slot_count_per_class == 0 ||
+      remote_region.short_slot_size >= remote_region.long_slot_size ||
+      remote_region.short_slot_size >
+          std::numeric_limits<std::uint64_t>::max() -
+              remote_region.long_slot_size ||
+      remote_region.slot_count_per_class >
+          std::numeric_limits<std::uint64_t>::max() /
+              (remote_region.short_slot_size + remote_region.long_slot_size) ||
+      remote_region.slot_count_per_class *
+              (remote_region.short_slot_size + remote_region.long_slot_size) !=
+          remote_region.length) {
     (void)ddr_allocator_.Release(remote_region);
-    return Status::InvalidArgument("DDR allocator returned an invalid remote region");
+    return Status::InvalidArgument(
+        "DDR allocator returned an invalid dual-slot region");
   }
 
   status = access_operator_.Initialize(remote_region);
@@ -164,9 +196,7 @@ Status Runtime::PrepareAccessTable(const AccessTablePrepareRequest& request,
     (void)meta_manager_.UnlockKeys(lock_context);
     return status;
   }
-  if (lookup.addresses.size() != request.flat_keys.size() ||
-      lookup.lengths.size() != request.flat_keys.size() ||
-      lookup.valid.size() != request.flat_keys.size()) {
+  if (lookup.entries.size() != request.flat_keys.size()) {
     (void)meta_manager_.UnlockKeys(lock_context);
     return Status::InvalidState("MetaManager returned an invalid AccessTable lookup");
   }
@@ -174,14 +204,15 @@ Status Runtime::PrepareAccessTable(const AccessTablePrepareRequest& request,
   bool has_valid_entries = false;
   bool has_uniform_valid_length = true;
   std::uint64_t uniform_valid_length = 0;
-  for (std::size_t index = 0; index < lookup.valid.size(); ++index) {
-    if (lookup.valid[index] == 0) {
+  for (std::size_t index = 0; index < lookup.entries.size(); ++index) {
+    const AccessEntry& entry = lookup.entries[index];
+    if (entry.valid == 0) {
       continue;
     }
     if (!has_valid_entries) {
       has_valid_entries = true;
-      uniform_valid_length = lookup.lengths[index];
-    } else if (lookup.lengths[index] != uniform_valid_length) {
+      uniform_valid_length = entry.length;
+    } else if (entry.length != uniform_valid_length) {
       has_uniform_valid_length = false;
       break;
     }
@@ -194,9 +225,15 @@ Status Runtime::PrepareAccessTable(const AccessTablePrepareRequest& request,
   }
   auto table = std::make_unique<AccessTableState>();
   table->lock_context = lock_context;
-  table->addresses = std::move(lookup.addresses);
-  table->lengths = std::move(lookup.lengths);
-  table->valid = std::move(lookup.valid);
+  table->addresses.resize(lookup.entries.size());
+  table->lengths.resize(lookup.entries.size());
+  table->valid.resize(lookup.entries.size());
+  for (std::size_t index = 0; index < lookup.entries.size(); ++index) {
+    const AccessEntry& entry = lookup.entries[index];
+    table->addresses[index] = entry.address;
+    table->lengths[index] = entry.length;
+    table->valid[index] = entry.valid;
+  }
   table->has_valid_entries = has_valid_entries;
   table->has_uniform_valid_length = has_uniform_valid_length;
   table->uniform_valid_length = uniform_valid_length;

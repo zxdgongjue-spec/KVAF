@@ -23,17 +23,6 @@ enum class MetaManagerLockMode {
   kStableReadAllowAppend = 0,
 };
 
-// 远端内存区域描述。
-// 当前实现把 region 划分成两段：前半段是 short slot，后半段是 long slot。
-struct RemoteRegionDesc {
-  Address base{0};
-  std::uint64_t length{0};
-  std::uint64_t short_slot_size{0};
-  std::uint64_t long_slot_size{0};
-  std::uint64_t slot_count_per_class{0};
-  DeviceKind device{DeviceKind::kCpu};
-};
-
 // PreparePut 返回的上下文，后续需要用它继续 Commit 或 Abort。
 struct PutContext {
   std::uint64_t id{0};

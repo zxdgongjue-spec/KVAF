@@ -39,7 +39,7 @@ constexpr std::uint64_t kShortLength = 64;
 constexpr std::uint64_t kLongLength = 200;
 // One independent round is used to warm up concurrent benchmark paths. It is
 // deliberately excluded from call_count and all reported latency statistics.
-constexpr std::size_t kConcurrentWarmupRounds = 10;
+constexpr std::size_t kConcurrentWarmupRounds = 1;
 
 // resident_keys 表示测试开始前，已经在 key_index_ 中常驻的已提交 key 数量。
 // batch_size 表示单次接口调用处理多少个 key。

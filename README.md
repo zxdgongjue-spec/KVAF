@@ -67,12 +67,17 @@ cmake --build build
 import kvaf
 
 runtime = kvaf.Runtime()  # 当前注入进程内 CPU Mock AccessOperator
-runtime.initialize(ddr_bytes=256, slot_size=64)
+runtime.initialize(
+    ddr_bytes=384,
+    short_slot_size=64,
+    long_slot_size=128,
+    slot_count_per_class=2,
+)
 payload = b"value"
 runtime.batch_put(
-    keys=[1], input=payload, input_offsets=[0], lengths=[len(payload)]
+    keys=["key-1"], input=payload, input_offsets=[0], lengths=[len(payload)]
 )
-table = runtime.prepare_access_table([1])
+table = runtime.prepare_access_table(["key-1"])
 output = bytearray(64)
 runtime.batch_get(table, indices=[0], output_indices=[0], output=output,
                   output_block_bytes=64)

@@ -18,12 +18,14 @@ enum class DeviceKind {
   kNpu,
 };
 
-// 远端 DDR 区域。base 是可供 AccessOperator 使用的绝对地址（UBA）。
-// Runtime 通过 DdrMemoryAllocator 创建并持有该区域的生命周期。
+// Remote DDR region owned by Runtime. The region contains two contiguous
+// slot classes: short slots first, followed by long slots.
 struct RemoteRegionDesc {
   Address base{0};
   std::uint64_t length{0};
-  std::uint64_t slot_size{0};
+  std::uint64_t short_slot_size{0};
+  std::uint64_t long_slot_size{0};
+  std::uint64_t slot_count_per_class{0};
   DeviceKind device{DeviceKind::kCpu};
 };
 

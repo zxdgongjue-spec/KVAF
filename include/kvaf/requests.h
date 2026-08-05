@@ -11,8 +11,12 @@ namespace kvaf {
 // Runtime 初始化时由 Runtime 自己申请并注册的远端 DDR 资源规格。
 // BatchGet 的调用方 buffer 不属于这里：它们由上层在每次调用前准备。
 struct RuntimeInitRequest {
+  // ddr_bytes must equal slot_count_per_class *
+  // (short_slot_size + long_slot_size).
   std::uint64_t ddr_bytes{0};
-  std::uint64_t slot_size{0};
+  std::uint64_t short_slot_size{0};
+  std::uint64_t long_slot_size{0};
+  std::uint64_t slot_count_per_class{0};
   DeviceKind ddr_device{DeviceKind::kCpu};
 };
 

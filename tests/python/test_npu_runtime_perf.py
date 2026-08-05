@@ -112,8 +112,8 @@ def main(batch: int = 16) -> int:
 
     # All BatchPut and BatchFree inputs are created before their measured loops.
     # Key batches are distinct, so Runtime never sees a duplicate Put or Free.
-    all_keys = list(range(1, table_capacity + 1))
-    prepare_keys = torch.arange(1, table_capacity + 1, dtype=torch.int64)
+    all_keys = [f"resident_{index}" for index in range(table_capacity)]
+    prepare_keys = all_keys
     key_batches = [
         all_keys[batch_index * PUT_BATCH_SIZE : (batch_index + 1) * PUT_BATCH_SIZE]
         for batch_index in range(total_put_batches)
@@ -143,7 +143,13 @@ def main(batch: int = 16) -> int:
         # Initialize and Shutdown run once: they are lifecycle operations, not
         # a steady-state dataplane metric.
         print("RUNTIME_PERF_PHASE_BEGIN phase=initialize")
-        runtime.initialize(table_capacity * block_bytes, source_stride)
+        slot_count_per_class = table_capacity
+        runtime.initialize(
+            slot_count_per_class * (source_stride + 2 * source_stride),
+            source_stride,
+            2 * source_stride,
+            slot_count_per_class,
+        )
         print("RUNTIME_PERF_PHASE_DONE phase=initialize")
 
         print("RUNTIME_PERF_PHASE_BEGIN phase=batch_put")

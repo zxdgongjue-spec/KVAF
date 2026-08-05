@@ -33,6 +33,19 @@ Status Internal(std::string message) {
   return Status::Internal(std::move(message));
 }
 
+std::vector<KeyId> CopyKeys(const py::object& keys) {
+  py::sequence sequence = keys.cast<py::sequence>();
+  std::vector<KeyId> result;
+  result.reserve(sequence.size());
+  for (const py::handle item : sequence) {
+    if (!py::isinstance<py::str>(item)) {
+      throw py::type_error("keys must be a sequence of strings");
+    }
+    result.push_back(py::cast<std::string>(item));
+  }
+  return result;
+}
+
 bool IsCContiguous(const py::buffer_info& info) {
   std::size_t expected_stride = static_cast<std::size_t>(info.itemsize);
   for (py::ssize_t dimension = info.ndim - 1; dimension >= 0; --dimension) {
@@ -170,12 +183,11 @@ class MockAccessOperator final : public AccessOperator {
     for (std::size_t i = 0; i < exec.request->keys.size(); ++i) {
       const std::uint64_t offset = exec.request->input_offsets[i];
       const std::uint64_t length = exec.request->lengths[i];
-      const PutAllocation& target = exec.put_desc->entries[i];
+      const AccessEntry& target = exec.put_desc->entries[i];
       if (exec.request->input.device != DeviceKind::kCpu || length == 0 ||
           offset > exec.request->input.bytes ||
           length > exec.request->input.bytes - offset ||
-          length != target.reserved_length ||
-          target.key != exec.request->keys[i]) {
+          length != target.length) {
         return InvalidArgument("invalid mock BatchPut block");
       }
       std::memcpy(reinterpret_cast<void*>(target.address),
@@ -203,9 +215,16 @@ class PythonRuntime final {
         runtime_(std::make_unique<Runtime>(*meta_manager_, *access_operator_,
                                            *allocator_)) {}
 
-  void Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
+  void Initialize(std::uint64_t ddr_bytes,
+                  std::uint64_t short_slot_size,
+                  std::uint64_t long_slot_size,
+                  std::uint64_t slot_count_per_class) {
     ThrowIfError(runtime_->Initialize(
-        RuntimeInitRequest{ddr_bytes, slot_size, DeviceKind::kCpu}));
+        RuntimeInitRequest{ddr_bytes,
+                           short_slot_size,
+                           long_slot_size,
+                           slot_count_per_class,
+                           DeviceKind::kCpu}));
   }
 
   void Shutdown() { ThrowIfError(runtime_->Shutdown()); }
@@ -217,7 +236,9 @@ class PythonRuntime final {
     py::dict result;
     result["base"] = region.base;
     result["length"] = region.length;
-    result["slot_size"] = region.slot_size;
+    result["short_slot_size"] = region.short_slot_size;
+    result["long_slot_size"] = region.long_slot_size;
+    result["slot_count_per_class"] = region.slot_count_per_class;
     result["device"] = "cpu";
     return result;
   }
@@ -225,9 +246,10 @@ class PythonRuntime final {
   // input_offsets and lengths are host metadata for the caller-owned packed
   // input buffer. Runtime uses lengths for PreparePut; hardware operators can
   // upload the same arrays as their per-request execution descriptors.
-  void BatchPut(const std::vector<KeyId>& keys, const py::buffer& input,
+  void BatchPut(const py::object& key_object, const py::buffer& input,
                 const std::vector<std::uint64_t>& input_offsets,
                 const std::vector<std::uint64_t>& lengths) {
+    const std::vector<KeyId> keys = CopyKeys(key_object);
     const py::buffer_info info = input.request();
     if (info.ptr == nullptr || info.size <= 0 || info.itemsize <= 0 ||
         !IsCContiguous(info) ||
@@ -246,10 +268,12 @@ class PythonRuntime final {
         lengths}));
   }
 
-  AccessTableHandle PrepareAccessTable(const std::vector<KeyId>& keys) {
+  AccessTableHandle PrepareAccessTable(const py::object& key_object) {
+    std::vector<KeyId> keys = CopyKeys(key_object);
     AccessTableHandle handle;
-    ThrowIfError(runtime_->PrepareAccessTable(AccessTablePrepareRequest{keys},
-                                              &handle));
+    ThrowIfError(runtime_->PrepareAccessTable(
+        AccessTablePrepareRequest{std::move(keys)},
+        &handle));
     return handle;
   }
 
@@ -310,8 +334,9 @@ class PythonRuntime final {
     ThrowIfError(runtime_->BatchGet(request));
   }
 
-  void BatchFree(const std::vector<KeyId>& keys) {
-    ThrowIfError(runtime_->BatchFree(BatchFreeRequest{keys}));
+  void BatchFree(const py::object& key_object) {
+    ThrowIfError(runtime_->BatchFree(
+        BatchFreeRequest{CopyKeys(key_object)}));
   }
 
   void FailNextPut() { access_operator_->FailNextPut(); }
@@ -343,7 +368,8 @@ PYBIND11_MODULE(_kvaf, m) {
   py::class_<kvaf::PythonRuntime>(m, "Runtime")
       .def(py::init<>())
       .def("initialize", &kvaf::PythonRuntime::Initialize, py::arg("ddr_bytes"),
-           py::arg("slot_size"),
+           py::arg("short_slot_size"), py::arg("long_slot_size"),
+           py::arg("slot_count_per_class"),
            "Allocate Runtime-owned host DDR and initialize the mock operator.")
       .def("shutdown", &kvaf::PythonRuntime::Shutdown)
       .def_property_readonly("initialized", &kvaf::PythonRuntime::Initialized)

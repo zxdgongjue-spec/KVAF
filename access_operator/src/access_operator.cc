@@ -446,11 +446,11 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
   for (std::size_t index = 0; index < exec.request->keys.size(); ++index) {
     const std::uint64_t offset = exec.request->input_offsets[index];
     const std::uint64_t length = exec.request->lengths[index];
-    const PutAllocation& destination = exec.put_desc->entries[index];
+    const AccessEntry& destination = exec.put_desc->entries[index];
     if (length == 0 || offset > exec.request->input.bytes ||
         length > exec.request->input.bytes - offset ||
         exec.request->input.device != DeviceKind::kNpu ||
-        destination.address == 0 || destination.reserved_length != length) {
+        destination.address == 0 || destination.length != length) {
       return InvalidArgument("BatchPut source and destination blocks do not match");
     }
   }
@@ -532,14 +532,15 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
   // destination ranges; non-contiguous ranges remain separate copies.
   std::size_t first = 0;
   while (first < exec.request->keys.size()) {
-    const PutAllocation& first_destination = exec.put_desc->entries[first];
+    const AccessEntry& first_destination = exec.put_desc->entries[first];
     const std::size_t first_offset =
         static_cast<std::size_t>(exec.request->input_offsets[first]);
     std::size_t bytes = static_cast<std::size_t>(exec.request->lengths[first]);
     std::size_t next = first + 1;
     while (next < exec.request->keys.size()) {
-      const PutAllocation& previous_destination = exec.put_desc->entries[next - 1];
-      const PutAllocation& next_destination = exec.put_desc->entries[next];
+      const AccessEntry& previous_destination =
+          exec.put_desc->entries[next - 1];
+      const AccessEntry& next_destination = exec.put_desc->entries[next];
       const std::size_t next_offset =
           static_cast<std::size_t>(exec.request->input_offsets[next]);
       const std::size_t next_bytes =
@@ -548,7 +549,7 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
       const bool contiguous_destination =
           next_destination.address >= previous_destination.address &&
           next_destination.address - previous_destination.address ==
-              previous_destination.reserved_length;
+              previous_destination.length;
       if (!contiguous_input || !contiguous_destination) {
         break;
       }
