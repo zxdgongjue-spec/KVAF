@@ -57,8 +57,8 @@ extern "C" int32_t KvafExecuteBatchGetLaunch(const KvafExecuteBatchGetKernelArgs
   aclrtLaunchKernelAttr attrs[4]{};
   attrs[0].id = ACL_RT_LAUNCH_KERNEL_ATTR_SCHEM_MODE;
   attrs[0].value.schemMode = 1;
-  attrs[1].id = ACL_RT_LAUNCH_KERNEL_ATTR_LOCAL_MEMORY_SIZE;
-  attrs[1].value.localMemorySize = kKernelLocalMemoryBytes;
+  attrs[1].id = ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE;
+  attrs[1].value.dynUBufSize = kKernelLocalMemoryBytes;
   attrs[2].id = ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT_US;
   attrs[2].value.timeoutUs.timeoutLow = kKernelTimeoutSeconds * 1000000U;
   attrs[2].value.timeoutUs.timeoutHigh = 0U;

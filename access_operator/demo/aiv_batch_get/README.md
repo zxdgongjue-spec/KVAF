@@ -78,9 +78,9 @@ The data path keeps the public KVAF ABI and the verified Direct-HCCP WQE token
 fields. It does not copy the AIV_URMA benchmark's server/client handshake,
 control-region writes, fixed 64K request shape, or per-launch CQ reset.
 
-Each AIV compacts its complete request partition once into parallel 16384-entry
+Each AIV compacts its complete request partition once into parallel 8192-entry
 UB arrays containing the resolved remote addresses and output rows. The caller
-must guarantee that each AIV owns at most 16384 mask entries whose value is
+must guarantee that each AIV owns at most 8192 mask entries whose value is
 nonzero. Before touching the SQ, the kernel rejects an active count beyond that
 capacity or a per-Jetty assignment that fills the entire SQ.
 The phase-two scheduler assigns complete 32-WQE posts to the core's Jettys in
