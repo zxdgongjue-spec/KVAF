@@ -11,7 +11,8 @@
 namespace {
 constexpr char kKernelName[] = "KvafExecuteBatchGetAivKernel";
 constexpr uint32_t kKernelTimeoutSeconds = 180U;
-constexpr uint32_t kKernelLocalMemoryBytes = 128U * 1024U;
+constexpr uint32_t kKernelLocalMemoryBytes =
+    KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES;
 std::mutex g_mutex;
 bool g_loaded = false;
 aclrtBinHandle g_binary = nullptr;
