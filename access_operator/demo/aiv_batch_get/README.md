@@ -103,15 +103,17 @@ ASCEND_SIMT_API_DIR=/path/to/asc-devkit/include bash scripts/build.sh
 
 Use the asc-devkit package matching the target CANN version.
 
-The eager default is 4096 requests of 1024 bytes, 4 KiB source stride, and
-four AIVs. Results are written beneath `results/`; `feedback.txt` contains
+The eager default is 4096 requests of 1024 bytes, 4 KiB source stride, four
+AIVs, and a 5% active probability. Every warmup and measured sample uses its
+own random indices/mask pair. All pairs are generated and copied to the device
+before timing. Results are written beneath `results/`; `feedback.txt` contains
 the outcome, key phase markers, run log, and any locally copied PLOG files.
 
 Useful overrides:
 
 ```bash
 DEVICE_ID=0 TABLE_CAPACITY=256 REQUESTS=10 OUTPUT_ROWS=200 \
-BLOCK_BYTES=1024 SOURCE_STRIDE=4096 AIV_CORES=1 MASK_EVERY=3 \
+BLOCK_BYTES=1024 SOURCE_STRIDE=4096 AIV_CORES=1 ACTIVE_PERCENT=20 \
 WARMUP=1 ITERATIONS=1 bash scripts/run_execute_batch_get.sh
 
 # Proves TransportCreate -> Acquire(A) -> Acquire(B) -> re-Acquire(A), then
@@ -122,6 +124,14 @@ bash scripts/run_execute_batch_get.sh
 DEVICE_ID=0 GRAPH_REPLAYS=4 GRAPH_WARMUP=1 GRAPH_ITERATIONS=5 \
 bash scripts/run_execute_batch_get_graph.sh
 ```
+
+For eager runs, `ACTIVE_PERCENT=N` controls the independent Bernoulli
+probability that each request's mask is 1; it defaults to 5. Random generation
+and the one-time H2D upload are excluded from the performance interval.
+`MASK_EVERY=N` and `ACTIVE_EVERY=N` remain deterministic controls for the
+dynamic-output and graph paths: the former clears request IDs divisible by
+`N`, while the latter sets only request IDs divisible by `N`. They are mutually
+exclusive.
 
 The graph performance metric is
 `graph_input_update_to_stream_completion`: updates into the fixed lookup
