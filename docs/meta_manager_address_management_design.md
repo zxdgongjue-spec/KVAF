@@ -61,6 +61,33 @@
 - `LockKeys` 固定一批 key，并增加 `pin_count`
 - `BatchFree` 只回收未被锁定的记录
 
+### 4.3 并发粒度
+
+当前实现不是单个全局元数据锁，而是按访问对象拆分锁：
+
+- `key_shards_[0..63]`：每个 shard 保存一部分 `KeyId -> KeyEntry`，使用
+  `std::shared_mutex`。读路径获取共享锁，写路径获取独占锁。
+- `lock_context_shards_[0..63]`：按 `LockContext.id` 分片保存活动锁上下文，
+  每个 context shard 使用一个 `std::mutex`。
+- `free_queue_mutex_`：保护 short/long 两个空闲 slot 队列。
+- `ActiveLockContext::lifecycle_mutex`：保护单个锁上下文的生命周期，
+  允许 `BatchLookup` 与 `UnlockKeys` 安全并发。
+
+接口与锁的关系如下：
+
+| 接口 | 主要锁 | 作用 |
+| --- | --- | --- |
+| `PreparePut` | 相关 key shard 独占锁、空闲队列锁、`context_mutex_` | 创建 pending 记录并预留 slot |
+| `CommitPut` | `context_mutex_`、相关 key shard 独占锁 | 发布 active record |
+| `AbortPut` | `context_mutex_`、相关 key shard 独占锁、空闲队列锁 | 回滚 pending 记录并归还 slot |
+| `LockKeys` | 相关 key shard 共享锁、目标 context shard 锁 | 查找记录、增加 pin、保存锁上下文 |
+| `BatchLookup` | 目标 context shard 锁、context 生命周期共享锁 | 根据锁上下文填充访问结果 |
+| `UnlockKeys` | 目标 context shard 锁、context 生命周期独占锁 | 减少 pin 并销毁锁上下文 |
+| `BatchFree` | 相关 key shard 独占锁、空闲队列锁 | 清理 active record 并归还 slot |
+
+因此，不同 key shard 之间可以并行执行；真正需要串行化的范围只限于同一
+shard、同一个 context shard 或空闲队列。
+
 ## 5. 为什么是 `hashtable + queue`
 
 这个组合分别解决两类问题：
@@ -100,10 +127,9 @@ struct ActiveLockContext {
 
 - `short_free_slots_`：短 slot 空闲队列
 - `long_free_slots_`：长 slot 空闲队列
-- `key_index_`：当前已提交的 key 映射
-- `pending_puts_`：未提交 put
-- `pending_keys_`：pending key 去重
-- `lock_contexts_`：活动读快照
+- `key_shards_`：分片保存当前 key 映射
+- `pending_puts_`：未提交 put 上下文
+- `lock_context_shards_`：分片保存活动读快照
 - `region_`：当前 region 配置
 
 ## 7. 地址计算
@@ -192,7 +218,7 @@ sequenceDiagram
 
 1. 检查 key 是否存在
 2. 检查记录是否仍被锁定
-3. 删除 `key_index_` 映射
+3. 清理 `KeyEntry` 中的 active record
 4. 将 slot 归还到对应的短/长空闲队列
 
 若记录仍被使用，则返回 `kBusy`。

@@ -37,6 +37,9 @@ constexpr std::uint64_t kShortSlotSize = 128;
 constexpr std::uint64_t kLongSlotSize = 256;
 constexpr std::uint64_t kShortLength = 64;
 constexpr std::uint64_t kLongLength = 200;
+// One independent round is used to warm up concurrent benchmark paths. It is
+// deliberately excluded from call_count and all reported latency statistics.
+constexpr std::size_t kConcurrentWarmupRounds = 10;
 
 // resident_keys 表示测试开始前，已经在 key_index_ 中常驻的已提交 key 数量。
 // batch_size 表示单次接口调用处理多少个 key。
@@ -349,6 +352,210 @@ double RunConcurrentRound(std::size_t thread_count,
           .count());
 }
 
+void WarmupConcurrentPreparePut(
+    MetaManager* manager,
+    const BenchmarkScenario& scenario,
+    const std::vector<std::uint64_t>& lengths,
+    const std::string& key_prefix,
+    const char* benchmark_name) {
+  if (manager == nullptr) {
+    FailBenchmark(benchmark_name, "warm-up manager is null");
+  }
+
+  for (std::size_t warmup_round = 0;
+       warmup_round < kConcurrentWarmupRounds; ++warmup_round) {
+    ProgressLog(std::string(benchmark_name) + " warm-up round=" +
+                std::to_string(warmup_round + 1) + "/" +
+                std::to_string(kConcurrentWarmupRounds));
+
+    const auto key_batches =
+        BuildRoundKeyBatches(key_prefix, scenario, warmup_round);
+    std::vector<PutContext> put_contexts(scenario.thread_count);
+    std::vector<PutAccessDesc> put_descs(scenario.thread_count);
+    std::string first_error;
+
+    RunConcurrentRound(
+        scenario.thread_count,
+        [&](std::size_t t) -> std::string {
+          const Status status = manager->PreparePut(
+              key_batches[t], lengths, &put_contexts[t], &put_descs[t]);
+          if (!status.ok()) {
+            return std::string(benchmark_name) +
+                   ".warm-up PreparePut status=" + status.message();
+          }
+          return "";
+        },
+        &first_error);
+
+    if (!first_error.empty()) {
+      FailBenchmark(benchmark_name, first_error);
+    }
+
+    for (std::size_t t = 0; t < scenario.thread_count; ++t) {
+      CheckAccessDesc(put_descs[t], key_batches[t], lengths.front(),
+                      benchmark_name);
+      CheckOk(manager->AbortPut(put_contexts[t]),
+              "AbortPut(after concurrent warm-up)");
+    }
+  }
+}
+
+void WarmupConcurrentLockKeys(MetaManager* manager,
+                              const BenchmarkScenario& scenario,
+                              const std::string& key_prefix,
+                              const char* benchmark_name) {
+  if (manager == nullptr) {
+    FailBenchmark(benchmark_name, "warm-up manager is null");
+  }
+
+  for (std::size_t warmup_round = 0;
+       warmup_round < kConcurrentWarmupRounds; ++warmup_round) {
+    ProgressLog(std::string(benchmark_name) + " warm-up round=" +
+                std::to_string(warmup_round + 1) + "/" +
+                std::to_string(kConcurrentWarmupRounds));
+
+    const auto key_batches =
+        BuildRoundKeyBatches(key_prefix, scenario, warmup_round);
+    std::vector<LockContext> lock_contexts(scenario.thread_count);
+    std::string first_error;
+
+    RunConcurrentRound(
+        scenario.thread_count,
+        [&](std::size_t t) -> std::string {
+          const Status status = manager->LockKeys(
+              key_batches[t], MetaManagerLockMode::kStableReadAllowAppend,
+              &lock_contexts[t]);
+          if (!status.ok()) {
+            return std::string(benchmark_name) +
+                   ".warm-up LockKeys status=" + status.message();
+          }
+          return "";
+        },
+        &first_error);
+
+    if (!first_error.empty()) {
+      FailBenchmark(benchmark_name, first_error);
+    }
+
+    for (const LockContext& lock_context : lock_contexts) {
+      CheckOk(manager->UnlockKeys(lock_context),
+              "UnlockKeys(after concurrent warm-up)");
+    }
+  }
+}
+
+void WarmupConcurrentBatchLookup(MetaManager* manager,
+                                 const BenchmarkScenario& scenario,
+                                 const std::string& key_prefix,
+                                 const char* benchmark_name) {
+  if (manager == nullptr) {
+    FailBenchmark(benchmark_name, "warm-up manager is null");
+  }
+
+  for (std::size_t warmup_round = 0;
+       warmup_round < kConcurrentWarmupRounds; ++warmup_round) {
+    ProgressLog(std::string(benchmark_name) + " warm-up round=" +
+                std::to_string(warmup_round + 1) + "/" +
+                std::to_string(kConcurrentWarmupRounds));
+
+    const auto key_batches =
+        BuildRoundKeyBatches(key_prefix, scenario, warmup_round);
+    std::vector<LockContext> lock_contexts(scenario.thread_count);
+    std::vector<FlatAccessDesc> access_descs(scenario.thread_count);
+    for (std::size_t t = 0; t < scenario.thread_count; ++t) {
+      CheckOk(manager->LockKeys(
+                  key_batches[t], MetaManagerLockMode::kStableReadAllowAppend,
+                  &lock_contexts[t]),
+              "LockKeys(before concurrent warm-up BatchLookup)");
+    }
+
+    std::string first_error;
+    RunConcurrentRound(
+        scenario.thread_count,
+        [&](std::size_t t) -> std::string {
+          const Status status = manager->BatchLookup(
+              key_batches[t], lock_contexts[t], &access_descs[t]);
+          if (!status.ok()) {
+            return std::string(benchmark_name) +
+                   ".warm-up BatchLookup status=" + status.message();
+          }
+          return "";
+        },
+        &first_error);
+
+    if (!first_error.empty()) {
+      FailBenchmark(benchmark_name, first_error);
+    }
+
+    for (std::size_t t = 0; t < scenario.thread_count; ++t) {
+      std::string validation_error;
+      if (!ValidateAccessDesc(access_descs[t], key_batches[t], kShortLength,
+                              &validation_error)) {
+        FailBenchmark(benchmark_name, validation_error);
+      }
+      CheckOk(manager->UnlockKeys(lock_contexts[t]),
+              "UnlockKeys(after concurrent warm-up)");
+    }
+  }
+}
+
+void WarmupConcurrentLockLookup(MetaManager* manager,
+                                const BenchmarkScenario& scenario,
+                                const std::string& key_prefix,
+                                const char* benchmark_name) {
+  if (manager == nullptr) {
+    FailBenchmark(benchmark_name, "warm-up manager is null");
+  }
+
+  for (std::size_t warmup_round = 0;
+       warmup_round < kConcurrentWarmupRounds; ++warmup_round) {
+    ProgressLog(std::string(benchmark_name) + " warm-up round=" +
+                std::to_string(warmup_round + 1) + "/" +
+                std::to_string(kConcurrentWarmupRounds));
+
+    const auto key_batches =
+        BuildRoundKeyBatches(key_prefix, scenario, warmup_round);
+    std::vector<LockContext> lock_contexts(scenario.thread_count);
+    std::vector<FlatAccessDesc> access_descs(scenario.thread_count);
+    std::string first_error;
+
+    RunConcurrentRound(
+        scenario.thread_count,
+        [&](std::size_t t) -> std::string {
+          const Status lock_status = manager->LockKeys(
+              key_batches[t], MetaManagerLockMode::kStableReadAllowAppend,
+              &lock_contexts[t]);
+          if (!lock_status.ok()) {
+            return std::string(benchmark_name) +
+                   ".warm-up LockKeys status=" + lock_status.message();
+          }
+
+          const Status lookup_status = manager->BatchLookup(
+              key_batches[t], lock_contexts[t], &access_descs[t]);
+          if (!lookup_status.ok()) {
+            return std::string(benchmark_name) +
+                   ".warm-up BatchLookup status=" + lookup_status.message();
+          }
+          return "";
+        },
+        &first_error);
+
+    if (!first_error.empty()) {
+      FailBenchmark(benchmark_name, first_error);
+    }
+
+    for (std::size_t t = 0; t < scenario.thread_count; ++t) {
+      std::string validation_error;
+      if (!ValidateAccessDesc(access_descs[t], key_batches[t], kShortLength,
+                              &validation_error)) {
+        FailBenchmark(benchmark_name, validation_error);
+      }
+      CheckOk(manager->UnlockKeys(lock_contexts[t]),
+              "UnlockKeys(after concurrent warm-up)");
+    }
+  }
+}
+
 Stats BenchmarkRegisterRemoteRegion(bool enable_timing_log) {
   std::vector<double> call_latencies_ns;
   call_latencies_ns.reserve(1);
@@ -609,6 +816,10 @@ Stats BenchmarkConcurrentPreparePutShort(const BenchmarkScenario& scenario,
                         scenario.resident_keys, scenario.batch_size,
                         resident_lengths,
                         "ConcurrentPreparePutShort.populate");
+  WarmupConcurrentPreparePut(
+      manager.get(), scenario, work_lengths,
+      "concurrent_prepare_short_warmup",
+      "ConcurrentPreparePut(short)");
 
   std::vector<double> call_latencies_ns;
   call_latencies_ns.reserve(round_count);
@@ -675,6 +886,10 @@ Stats BenchmarkConcurrentPreparePutLong(const BenchmarkScenario& scenario,
                         scenario.resident_keys, scenario.batch_size,
                         resident_lengths,
                         "ConcurrentPreparePutLong.populate");
+  WarmupConcurrentPreparePut(
+      manager.get(), scenario, work_lengths,
+      "concurrent_prepare_long_warmup",
+      "ConcurrentPreparePut(long)");
 
   std::vector<double> call_latencies_ns;
   call_latencies_ns.reserve(round_count);
@@ -737,6 +952,8 @@ Stats BenchmarkConcurrentLockKeys(const BenchmarkScenario& scenario,
   PopulateCommittedKeys(manager.get(), "concurrent_lock_resident",
                         scenario.resident_keys, scenario.batch_size, lengths,
                         "ConcurrentLockKeys.populate");
+  WarmupConcurrentLockKeys(manager.get(), scenario, "concurrent_lock_resident",
+                           "ConcurrentLockKeys");
 
   std::vector<double> call_latencies_ns;
   call_latencies_ns.reserve(round_count);
@@ -796,6 +1013,9 @@ Stats BenchmarkConcurrentBatchLookup(const BenchmarkScenario& scenario,
   PopulateCommittedKeys(manager.get(), "concurrent_lookup_resident",
                         scenario.resident_keys, scenario.batch_size, lengths,
                         "ConcurrentBatchLookup.populate");
+  WarmupConcurrentBatchLookup(manager.get(), scenario,
+                              "concurrent_lookup_resident",
+                              "ConcurrentBatchLookup");
 
   std::vector<double> call_latencies_ns;
   call_latencies_ns.reserve(round_count);
@@ -866,6 +1086,9 @@ Stats BenchmarkConcurrentLockLookup(const BenchmarkScenario& scenario,
   PopulateCommittedKeys(manager.get(), "concurrent_lookup_resident",
                         scenario.resident_keys, scenario.batch_size, lengths,
                         "ConcurrentLockLookup.populate");
+  WarmupConcurrentLockLookup(manager.get(), scenario,
+                             "concurrent_lookup_resident",
+                             "ConcurrentLockLookup");
 
   std::vector<double> call_latencies_ns;
   call_latencies_ns.reserve(round_count);
@@ -1094,6 +1317,7 @@ void PrintStatsTable(const std::vector<Stats>& stats_list) {
   std::cout << "- avg_per_batch_ns: avg_ns amortized to one batch; in concurrent methods one batch is handled by one thread\n";
   std::cout << "- avg_per_key_ns: avg_ns amortized to one key; concurrent methods amortize over all keys of one round\n";
   std::cout << "- total_ms: total measured time of this method/scenario across all measured calls\n";
+  std::cout << "- concurrent warm-up: one independent round runs before measurement and is excluded from call_count and statistics\n";
   std::cout << "- concurrent methods are only emitted when explicitly enabled\n";
   std::cout << "method,resident_keys,batch_size,thread_count,call_count,total_ms,avg_ns,avg_per_batch_ns,avg_per_key_ns,min_ns,p50_ns,p95_ns,max_ns\n";
   for (const Stats& stats : stats_list) {
