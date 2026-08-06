@@ -438,7 +438,8 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
       exec.request->input.bytes == 0 ||
       exec.request->keys.size() != exec.request->input_offsets.size() ||
       exec.request->keys.size() != exec.request->lengths.size() ||
-      exec.request->keys.size() != exec.put_desc->entries.size()) {
+      exec.request->keys.size() != exec.put_desc->addresses.size() ||
+      exec.request->keys.size() != exec.put_desc->lengths.size()) {
     return InvalidArgument("BatchPut request does not satisfy the NPU mock contract");
   }
 
@@ -446,11 +447,11 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
   for (std::size_t index = 0; index < exec.request->keys.size(); ++index) {
     const std::uint64_t offset = exec.request->input_offsets[index];
     const std::uint64_t length = exec.request->lengths[index];
-    const AccessEntry& destination = exec.put_desc->entries[index];
     if (length == 0 || offset > exec.request->input.bytes ||
         length > exec.request->input.bytes - offset ||
         exec.request->input.device != DeviceKind::kNpu ||
-        destination.address == 0 || destination.length != length) {
+        exec.put_desc->addresses[index] == 0 ||
+        exec.put_desc->lengths[index] != length) {
       return InvalidArgument("BatchPut source and destination blocks do not match");
     }
   }
@@ -477,7 +478,7 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
     std::copy(exec.request->lengths.begin(), exec.request->lengths.end(),
               host_lengths);
     for (std::size_t index = 0; index < rows; ++index) {
-      host_destinations[index] = exec.put_desc->entries[index].address;
+      host_destinations[index] = exec.put_desc->addresses[index];
     }
 
     const std::size_t metadata_bytes = rows * 3U * sizeof(std::uint64_t);
@@ -532,24 +533,20 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
   // destination ranges; non-contiguous ranges remain separate copies.
   std::size_t first = 0;
   while (first < exec.request->keys.size()) {
-    const AccessEntry& first_destination = exec.put_desc->entries[first];
     const std::size_t first_offset =
         static_cast<std::size_t>(exec.request->input_offsets[first]);
     std::size_t bytes = static_cast<std::size_t>(exec.request->lengths[first]);
     std::size_t next = first + 1;
     while (next < exec.request->keys.size()) {
-      const AccessEntry& previous_destination =
-          exec.put_desc->entries[next - 1];
-      const AccessEntry& next_destination = exec.put_desc->entries[next];
       const std::size_t next_offset =
           static_cast<std::size_t>(exec.request->input_offsets[next]);
       const std::size_t next_bytes =
           static_cast<std::size_t>(exec.request->lengths[next]);
       const bool contiguous_input = next_offset == first_offset + bytes;
       const bool contiguous_destination =
-          next_destination.address >= previous_destination.address &&
-          next_destination.address - previous_destination.address ==
-              previous_destination.length;
+          exec.put_desc->addresses[next] >= exec.put_desc->addresses[next - 1] &&
+          exec.put_desc->addresses[next] - exec.put_desc->addresses[next - 1] ==
+              exec.put_desc->lengths[next - 1];
       if (!contiguous_input || !contiguous_destination) {
         break;
       }
@@ -558,7 +555,7 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
     }
 
     const aclError result = aclrtMemcpy(
-        reinterpret_cast<void*>(first_destination.address), bytes,
+        reinterpret_cast<void*>(exec.put_desc->addresses[first]), bytes,
         input + first_offset, bytes, ACL_MEMCPY_DEVICE_TO_HOST);
     if (result != ACL_SUCCESS) {
       return Internal("ACL device-to-host mock BatchPut copy failed");

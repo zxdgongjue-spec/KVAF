@@ -246,8 +246,9 @@ sequenceDiagram
 
 - `PutAccessDesc` 和 `FlatAccessDesc` 统一复用 `AccessDesc`
 - 两者仍保留原有名字，目的是让调用点一眼看出当前处于 put 结果还是 lookup 结果
-- `AccessDesc` 内部只维护一份 `entries`
-- 每个 `AccessEntry` 包含 `key / address / length / valid`
+- `AccessDesc` 内部使用 `keys / addresses / lengths / valid` 四个并行数组
+- 四个数组使用相同下标描述同一条记录，即 `keys[i] / addresses[i] / lengths[i] / valid[i]`
+- `keys[i]` 是指向 MetaManager 内部稳定字符串的指针，避免热路径复制 `KeyId`
 
 ## 11. 当前实现特点
 

@@ -45,24 +45,21 @@ LockKeys -> BatchLookup -> UnlockKeys
 接口定义见 [meta_manager.h](include/kvaf/meta_manager/meta_manager.h)。
 
 ```cpp
-struct AccessEntry {
-  const KeyId* key;
-  Address address;
-  std::uint64_t length;
-  std::uint8_t valid;
-};
-
 struct AccessDesc {
-  std::vector<AccessEntry> entries;
+  std::vector<const KeyId*> keys;
+  std::vector<Address> addresses;
+  std::vector<std::uint64_t> lengths;
+  std::vector<std::uint8_t> valid;
 };
 
 using PutAccessDesc = AccessDesc;
 using FlatAccessDesc = AccessDesc;
 ```
 
-`PutAccessDesc` 和 `FlatAccessDesc` 保留语义名称，但统一通过
-`entries[i]` 访问，避免多组并行数组错位。`entry.key` 指向 MetaManager
-内部稳定存储的字符串，不在热路径复制 `std::string`。
+`PutAccessDesc` 和 `FlatAccessDesc` 保留语义名称，但底层直接使用并行数组。
+同一个下标 `i` 的 `keys[i]`、`addresses[i]`、`lengths[i]` 和 `valid[i]`
+描述同一条记录。`keys[i]` 指向 MetaManager 内部稳定存储的字符串，避免在
+热路径复制 `std::string`；下游可以直接访问 `addresses[i]` 和 `lengths[i]`。
 
 ## 构建与测试
 

@@ -175,7 +175,8 @@ class MockAccessOperator final : public AccessOperator {
         exec.request->input.data == nullptr || exec.request->input.bytes == 0 ||
         exec.request->keys.size() != exec.request->input_offsets.size() ||
         exec.request->keys.size() != exec.request->lengths.size() ||
-        exec.request->keys.size() != exec.put_desc->entries.size()) {
+        exec.request->keys.size() != exec.put_desc->addresses.size() ||
+        exec.request->keys.size() != exec.put_desc->lengths.size()) {
       return InvalidArgument("invalid mock BatchPut request");
     }
 
@@ -183,14 +184,13 @@ class MockAccessOperator final : public AccessOperator {
     for (std::size_t i = 0; i < exec.request->keys.size(); ++i) {
       const std::uint64_t offset = exec.request->input_offsets[i];
       const std::uint64_t length = exec.request->lengths[i];
-      const AccessEntry& target = exec.put_desc->entries[i];
       if (exec.request->input.device != DeviceKind::kCpu || length == 0 ||
           offset > exec.request->input.bytes ||
           length > exec.request->input.bytes - offset ||
-          length != target.length) {
+          length != exec.put_desc->lengths[i]) {
         return InvalidArgument("invalid mock BatchPut block");
       }
-      std::memcpy(reinterpret_cast<void*>(target.address),
+      std::memcpy(reinterpret_cast<void*>(exec.put_desc->addresses[i]),
                   input + static_cast<std::size_t>(offset),
                   static_cast<std::size_t>(length));
     }

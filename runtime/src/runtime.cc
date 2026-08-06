@@ -196,7 +196,10 @@ Status Runtime::PrepareAccessTable(const AccessTablePrepareRequest& request,
     (void)meta_manager_.UnlockKeys(lock_context);
     return status;
   }
-  if (lookup.entries.size() != request.flat_keys.size()) {
+  if (lookup.addresses.size() != request.flat_keys.size() ||
+      lookup.keys.size() != request.flat_keys.size() ||
+      lookup.lengths.size() != request.flat_keys.size() ||
+      lookup.valid.size() != request.flat_keys.size()) {
     (void)meta_manager_.UnlockKeys(lock_context);
     return Status::InvalidState("MetaManager returned an invalid AccessTable lookup");
   }
@@ -204,15 +207,14 @@ Status Runtime::PrepareAccessTable(const AccessTablePrepareRequest& request,
   bool has_valid_entries = false;
   bool has_uniform_valid_length = true;
   std::uint64_t uniform_valid_length = 0;
-  for (std::size_t index = 0; index < lookup.entries.size(); ++index) {
-    const AccessEntry& entry = lookup.entries[index];
-    if (entry.valid == 0) {
+  for (std::size_t index = 0; index < lookup.addresses.size(); ++index) {
+    if (lookup.valid[index] == 0) {
       continue;
     }
     if (!has_valid_entries) {
       has_valid_entries = true;
-      uniform_valid_length = entry.length;
-    } else if (entry.length != uniform_valid_length) {
+      uniform_valid_length = lookup.lengths[index];
+    } else if (lookup.lengths[index] != uniform_valid_length) {
       has_uniform_valid_length = false;
       break;
     }
@@ -225,15 +227,9 @@ Status Runtime::PrepareAccessTable(const AccessTablePrepareRequest& request,
   }
   auto table = std::make_unique<AccessTableState>();
   table->lock_context = lock_context;
-  table->addresses.resize(lookup.entries.size());
-  table->lengths.resize(lookup.entries.size());
-  table->valid.resize(lookup.entries.size());
-  for (std::size_t index = 0; index < lookup.entries.size(); ++index) {
-    const AccessEntry& entry = lookup.entries[index];
-    table->addresses[index] = entry.address;
-    table->lengths[index] = entry.length;
-    table->valid[index] = entry.valid;
-  }
+  table->addresses = std::move(lookup.addresses);
+  table->lengths = std::move(lookup.lengths);
+  table->valid = std::move(lookup.valid);
   table->has_valid_entries = has_valid_entries;
   table->has_uniform_valid_length = has_uniform_valid_length;
   table->uniform_valid_length = uniform_valid_length;

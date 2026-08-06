@@ -221,16 +221,18 @@ void CheckAccessDesc(const AccessDesc& access_desc,
                      const std::vector<KeyId>& keys,
                      std::uint64_t expected_length,
                      const char* step) {
-  if (access_desc.entries.size() != keys.size()) {
+  if (access_desc.keys.size() != keys.size() ||
+      access_desc.addresses.size() != keys.size() ||
+      access_desc.lengths.size() != keys.size() ||
+      access_desc.valid.size() != keys.size()) {
     FailBenchmark(step, "returned entry count does not match batch size");
   }
 
   for (std::size_t i = 0; i < keys.size(); ++i) {
-    const auto& entry = access_desc.entries[i];
-    if (entry.length != expected_length) {
+    if (access_desc.lengths[i] != expected_length) {
       FailBenchmark(step, "returned length does not match the requested length");
     }
-    if (entry.valid != 1) {
+    if (access_desc.valid[i] != 1) {
       FailBenchmark(step, "returned valid flag is not set");
     }
   }
@@ -240,18 +242,20 @@ bool ValidateAccessDesc(const AccessDesc& access_desc,
                         const std::vector<KeyId>& keys,
                         std::uint64_t expected_length,
                         std::string* error_message) {
-  if (access_desc.entries.size() != keys.size()) {
+  if (access_desc.keys.size() != keys.size() ||
+      access_desc.addresses.size() != keys.size() ||
+      access_desc.lengths.size() != keys.size() ||
+      access_desc.valid.size() != keys.size()) {
     *error_message = "returned entry count does not match batch size";
     return false;
   }
 
   for (std::size_t i = 0; i < keys.size(); ++i) {
-    const auto& entry = access_desc.entries[i];
-    if (entry.length != expected_length) {
+    if (access_desc.lengths[i] != expected_length) {
       *error_message = "returned length does not match the requested length";
       return false;
     }
-    if (entry.valid != 1) {
+    if (access_desc.valid[i] != 1) {
       *error_message = "returned valid flag is not set";
       return false;
     }
@@ -757,7 +761,7 @@ Stats BenchmarkLockKeys(const BenchmarkScenario& scenario,
   return BuildStats("LockKeys", scenario, std::move(call_latencies_ns));
 }
 
-// BatchLookup: 对一批已经 lock 的 key 做查询；输出同时校验 entries[i] 语义是否正确。
+// BatchLookup: 对一批已经 lock 的 key 做查询；输出同时校验并行数组语义是否正确。
 Stats BenchmarkBatchLookup(const BenchmarkScenario& scenario,
                            bool enable_timing_log) {
   const auto lengths = BuildLengthBatch(scenario.batch_size, kShortLength);

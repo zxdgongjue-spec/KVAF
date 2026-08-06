@@ -244,7 +244,7 @@ Status MetaManager::PreparePut(const std::vector<KeyId>& flat_keys,
   }
 
   try {
-    put_desc->entries.resize(flat_keys.size());
+    ResizeAccessDesc(flat_keys.size(), put_desc);
   } catch (const std::bad_alloc&) {
     rollback_new_keys();
     return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
@@ -254,8 +254,8 @@ Status MetaManager::PreparePut(const std::vector<KeyId>& flat_keys,
     PendingPutItem& item = pending_context.items[i];
     item.slot = AcquireSlot(item.slot.slot_class);
     item.key_entry->is_pending = true;
-    FillAccessEntry(item.key, SlotAddress(item.slot), item.valid_length,
-                    &put_desc->entries[i]);
+    FillAccessDescAt(item.key, SlotAddress(item.slot), item.valid_length, i,
+                     put_desc);
   }
 
   try {
@@ -489,7 +489,7 @@ Status MetaManager::BatchLookup(const std::vector<KeyId>& flat_keys,
   const bool performance_mode =
       performance_mode_enabled_.load(std::memory_order_relaxed);
   try {
-    access_desc->entries.resize(active_context->items.size());
+    ResizeAccessDesc(active_context->items.size(), access_desc);
   } catch (const std::bad_alloc&) {
     return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
   }
@@ -503,8 +503,8 @@ Status MetaManager::BatchLookup(const std::vector<KeyId>& flat_keys,
       return Error(StatusCode::kInvalidArgument, ErrorTag::kInvalidRequest);
     }
 
-    FillAccessEntry(item.key, SlotAddress(item.record->slot),
-                    item.record->valid_length, &access_desc->entries[i]);
+    FillAccessDescAt(item.key, SlotAddress(item.record->slot),
+                     item.record->valid_length, i, access_desc);
   }
 
   return Status::OK();
@@ -668,18 +668,31 @@ bool MetaManager::TryResolveSlotClass(std::uint64_t length,
   return false;
 }
 
-void MetaManager::FillAccessEntry(const KeyId* key,
-                                  Address address,
-                                  std::uint64_t length,
-                                  AccessEntry* entry) const {
-  if (entry == nullptr) {
+void MetaManager::ResizeAccessDesc(std::size_t count,
+                                   AccessDesc* access_desc) const {
+  if (access_desc == nullptr) {
     return;
   }
 
-  entry->key = key;
-  entry->address = address;
-  entry->length = length;
-  entry->valid = 1;
+  access_desc->keys.resize(count);
+  access_desc->addresses.resize(count);
+  access_desc->lengths.resize(count);
+  access_desc->valid.resize(count);
+}
+
+void MetaManager::FillAccessDescAt(const KeyId* key,
+                                   Address address,
+                                   std::uint64_t length,
+                                   std::size_t index,
+                                   AccessDesc* access_desc) const {
+  if (access_desc == nullptr) {
+    return;
+  }
+
+  access_desc->keys[index] = key;
+  access_desc->addresses[index] = address;
+  access_desc->lengths[index] = length;
+  access_desc->valid[index] = 1;
 }
 
 std::uint32_t MetaManager::LoadPinCount(const AddressRecord& record) const {

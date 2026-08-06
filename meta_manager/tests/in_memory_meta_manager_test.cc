@@ -11,6 +11,7 @@
 namespace {
 
 using kvaf::Address;
+using kvaf::AccessDesc;
 using kvaf::CreateInMemoryMetaManager;
 using kvaf::FlatAccessDesc;
 using kvaf::KeyId;
@@ -52,6 +53,16 @@ bool ExpectStatusCode(const Status& status,
 
 bool ExpectOk(const Status& status, const std::string& message) {
   return ExpectStatusCode(status, StatusCode::kOk, message);
+}
+
+bool ExpectAccessDescSize(const AccessDesc& access_desc,
+                          std::size_t expected_size,
+                          const std::string& message) {
+  return Expect(access_desc.keys.size() == expected_size &&
+                    access_desc.addresses.size() == expected_size &&
+                    access_desc.lengths.size() == expected_size &&
+                    access_desc.valid.size() == expected_size,
+                message);
 }
 
 // 构造一个同时包含短 slot 区和长 slot 区的测试 region。
@@ -122,15 +133,15 @@ bool TestPutCommitLookupUnlockFreeRoundTrip() {
                 "PreparePut should succeed")) {
     return false;
   }
-  if (!Expect(put_desc.entries.size() == 2,
+  if (!ExpectAccessDescSize(put_desc, 2,
               "PreparePut should return one address per key")) {
     return false;
   }
-  if (!Expect(put_desc.entries[0].address == kBaseAddress,
+  if (!Expect(put_desc.addresses[0] == kBaseAddress,
               "first short reservation should use the first short slot")) {
     return false;
   }
-  if (!Expect(put_desc.entries[1].address == kBaseAddress + kShortSlotSize,
+  if (!Expect(put_desc.addresses[1] == kBaseAddress + kShortSlotSize,
               "second short reservation should use the second short slot")) {
     return false;
   }
@@ -161,31 +172,31 @@ bool TestPutCommitLookupUnlockFreeRoundTrip() {
                 "BatchLookup should succeed")) {
     return false;
   }
-  if (!Expect(access_desc.entries.size() == 2,
+  if (!ExpectAccessDescSize(access_desc, 2,
               "BatchLookup should return one result entry per key")) {
     return false;
   }
-  if (!Expect(access_desc.entries[0].address == kBaseAddress &&
-                  access_desc.entries[1].address ==
+  if (!Expect(access_desc.addresses[0] == kBaseAddress &&
+                  access_desc.addresses[1] ==
                       kBaseAddress + kShortSlotSize,
               "BatchLookup should return committed short addresses")) {
     return false;
   }
-  if (!Expect(access_desc.entries[0].length == lengths[0] &&
-                  access_desc.entries[1].length == lengths[1],
+  if (!Expect(access_desc.lengths[0] == lengths[0] &&
+                  access_desc.lengths[1] == lengths[1],
               "BatchLookup should return committed lengths")) {
     return false;
   }
-  if (!Expect(access_desc.entries[0].valid == 1 &&
-                  access_desc.entries[1].valid == 1,
+  if (!Expect(access_desc.valid[0] == 1 &&
+                  access_desc.valid[1] == 1,
               "BatchLookup should mark committed records valid")) {
     return false;
   }
-  if (!Expect(access_desc.entries[0].key != nullptr &&
-                  access_desc.entries[1].key != nullptr &&
-                  *access_desc.entries[0].key == keys[0] &&
-                  *access_desc.entries[1].key == keys[1],
-              "BatchLookup should preserve key order in the returned entries")) {
+  if (!Expect(access_desc.keys[0] != nullptr &&
+                  access_desc.keys[1] != nullptr &&
+                  *access_desc.keys[0] == keys[0] &&
+                  *access_desc.keys[1] == keys[1],
+              "BatchLookup should preserve key order in the returned vectors")) {
     return false;
   }
 
@@ -202,7 +213,7 @@ bool TestPutCommitLookupUnlockFreeRoundTrip() {
                 "freed short slots should be reusable")) {
     return false;
   }
-  return Expect(recycled_desc.entries[0].address == kBaseAddress,
+  return Expect(recycled_desc.addresses[0] == kBaseAddress,
                 "BatchFree should recycle the first short slot");
 }
 
@@ -222,11 +233,11 @@ bool TestLongSlotAllocation() {
                 "PreparePut should place keys into different slot classes")) {
     return false;
   }
-  if (!Expect(put_desc.entries[0].address == kBaseAddress,
+  if (!Expect(put_desc.addresses[0] == kBaseAddress,
               "short payload should use short slot space")) {
     return false;
   }
-  if (!Expect(put_desc.entries[1].address == LongSlotBase(2),
+  if (!Expect(put_desc.addresses[1] == LongSlotBase(2),
               "long payload should use long slot space")) {
     return false;
   }
@@ -248,12 +259,12 @@ bool TestLongSlotAllocation() {
                 "BatchLookup should succeed for mixed slot classes")) {
     return false;
   }
-  if (!Expect(access_desc.entries.size() == 2,
+  if (!ExpectAccessDescSize(access_desc, 2,
               "BatchLookup should return one result entry per key")) {
     return false;
   }
-  if (!Expect(access_desc.entries[0].address == kBaseAddress &&
-                  access_desc.entries[1].address == LongSlotBase(2),
+  if (!Expect(access_desc.addresses[0] == kBaseAddress &&
+                  access_desc.addresses[1] == LongSlotBase(2),
               "BatchLookup should preserve short and long addresses")) {
     return false;
   }
@@ -285,7 +296,7 @@ bool TestAbortPutRecyclesSlot() {
                 "second PreparePut should reuse the freed short slot")) {
     return false;
   }
-  return Expect(second_desc.entries[0].address == first_desc.entries[0].address,
+  return Expect(second_desc.addresses[0] == first_desc.addresses[0],
                 "AbortPut should recycle the reserved short slot");
 }
 

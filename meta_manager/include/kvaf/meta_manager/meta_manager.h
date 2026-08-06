@@ -16,35 +16,31 @@
 
 namespace kvaf {
 
-// 当前 POC 只支持一种稳定读语义：
-// 锁住一批 key 后，允许其他新 key 继续写入，
-// 但不允许这批 key 在解锁前被回收。
+// The current POC supports one stable-read mode: readers can pin a batch of
+// committed keys while independent new keys continue to be inserted.
 enum class MetaManagerLockMode {
   kStableReadAllowAppend = 0,
 };
 
-// PreparePut 返回的上下文，后续需要用它继续 Commit 或 Abort。
+// PreparePut returns a write transaction handle that must later be committed
+// or aborted.
 struct PutContext {
   std::uint64_t id{0};
 };
 
-// LockKeys 返回的上下文，后续需要用它继续 BatchLookup 或 Unlock。
+// LockKeys returns a read-snapshot handle that must later be used for lookup
+// and unlock.
 struct LockContext {
   std::uint64_t id{0};
 };
 
-// 一条对外返回的访问结果。
-// key 是指向内部稳定存储字符串的指针，避免热路径重复复制字符串。
-struct AccessEntry {
-  const KeyId* key{nullptr};
-  Address address{0};
-  std::uint64_t length{0};
-  std::uint8_t valid{0};
-};
-
-// PreparePut / BatchLookup 统一使用这类批量返回结构。
+// PreparePut / BatchLookup share one batched return layout. All vectors use
+// the same index to describe the same key record.
 struct AccessDesc {
-  std::vector<AccessEntry> entries;
+  std::vector<const KeyId*> keys;
+  std::vector<Address> addresses;
+  std::vector<std::uint64_t> lengths;
+  std::vector<std::uint8_t> valid;
 };
 
 using PutAccessDesc = AccessDesc;
@@ -82,19 +78,18 @@ class MetaManager {
     kReady,
   };
 
-  // slot 根据长度分成两类。
   enum class SlotClass {
     kShort = 0,
     kLong,
   };
 
-  // 内部只保存 slot 类型和槽位下标，需要返回真实地址时再换算。
+  // Internally a slot is tracked by class and index. The UBA is derived only
+  // when an external address must be returned.
   struct SlotRef {
     SlotClass slot_class{SlotClass::kShort};
     std::size_t slot_index{0};
   };
 
-  // 一条已提交地址记录。
   struct AddressRecord {
     SlotRef slot;
     std::uint64_t valid_length{0};
@@ -126,22 +121,17 @@ class MetaManager {
     }
   };
 
-  // 一个 key 的完整生命周期状态。
-  // 这样热路径只需要在所属 shard 内查一次表，
-  // 不必再拆成 active/pending 多张表反复查找。
   struct KeyEntry {
     AddressRecord active_record;
     bool has_active_record{false};
     bool is_pending{false};
   };
 
-  // 一个 key shard：自己的锁 + 自己那部分 key 元数据。
   struct KeyShard {
     mutable std::shared_mutex mutex;
     std::unordered_map<KeyId, KeyEntry> entries;
   };
 
-  // PreparePut 暂存但尚未 Commit 的预留项。
   struct PendingPutItem {
     std::size_t shard_id{0};
     KeyEntry* key_entry{nullptr};
@@ -154,7 +144,6 @@ class MetaManager {
     std::vector<PendingPutItem> items;
   };
 
-  // LockKeys 固定下来的记录指针，后续 lookup/unlock 不再重复查表。
   struct LockedRecordRef {
     const KeyId* key{nullptr};
     AddressRecord* record{nullptr};
@@ -172,10 +161,12 @@ class MetaManager {
 
   Address SlotAddress(const SlotRef& slot) const;
   bool TryResolveSlotClass(std::uint64_t length, SlotClass* slot_class) const;
-  void FillAccessEntry(const KeyId* key,
-                       Address address,
-                       std::uint64_t length,
-                       AccessEntry* entry) const;
+  void ResizeAccessDesc(std::size_t count, AccessDesc* access_desc) const;
+  void FillAccessDescAt(const KeyId* key,
+                        Address address,
+                        std::uint64_t length,
+                        std::size_t index,
+                        AccessDesc* access_desc) const;
   std::uint32_t LoadPinCount(const AddressRecord& record) const;
   void IncrementPinCount(AddressRecord* record);
   void DecrementPinCount(AddressRecord* record);
@@ -187,19 +178,15 @@ class MetaManager {
                         std::vector<std::size_t>* key_shard_ids,
                         std::vector<std::size_t>* shard_order) const;
 
-  // region 只允许注册一次；注册后 region_ 只读，因此只需要注册锁。
   std::atomic<RegionState> region_state_{RegionState::kUninitialized};
   RemoteRegionDesc region_;
 
-  // 两类空闲队列各自独立加锁，不再被全局锁串行化。
   std::mutex free_queue_mutex_;
   std::queue<std::size_t> short_free_slots_;
   std::queue<std::size_t> long_free_slots_;
 
-  // key 按 shard 切分；不同 shard 之间可以并行操作。
   std::array<KeyShard, kKeyShardCount> key_shards_;
 
-  // put / lock 上下文统一由 context 锁保护。
   std::mutex context_mutex_;
   std::unordered_map<std::uint64_t, PendingPutContext> pending_puts_;
   std::uint64_t next_put_context_id_{1};
