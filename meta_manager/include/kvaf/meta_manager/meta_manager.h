@@ -47,7 +47,8 @@ using FlatAccessDesc = AccessDesc;
 
 class MetaManager {
  public:
-  MetaManager() = default;
+  MetaManager();
+  ~MetaManager();
 
   Status RegisterRemoteRegion(const RemoteRegionDesc& region);
   Status PreparePut(const std::vector<KeyId>& flat_keys,
@@ -165,7 +166,11 @@ class MetaManager {
   std::mutex write_mutex_;
   std::queue<std::size_t> short_free_slots_;
   std::queue<std::size_t> long_free_slots_;
-  std::unordered_map<KeyId, KeyEntry> entries_;
+
+  // The bucket index is flat/open-addressed; EntryIndex keeps nodes stable so
+  // PendingPutItem and LockedRecordRef can safely retain pointers.
+  struct EntryIndex;
+  std::unique_ptr<EntryIndex> entries_;
 
   std::unordered_map<std::uint64_t, PendingPutContext> pending_puts_;
   std::uint64_t next_put_context_id_{1};
