@@ -120,6 +120,7 @@ def main() -> int:
     npu_core_count = int(
         os.environ.get("KVAF_NPU_CORE_COUNT", os.environ.get("KVAF_NPU_AIV_CORES", "1"))
     )
+    jettys_per_core = int(os.environ.get("KVAF_NPU_JETTYS_PER_CORE", "2"))
     active_percent = int(os.environ.get("KVAF_NPU_ACTIVE_PERCENT", "100"))
     warmup = int(os.environ.get("KVAF_NPU_WARMUP", "1"))
     iterations = int(os.environ.get("KVAF_NPU_ITERATIONS", "5"))
@@ -135,6 +136,7 @@ def main() -> int:
         and source_stride >= block_bytes
         and npu_core_count > 0
         and npu_core_count <= requests
+        and 1 <= jettys_per_core <= 2
         and iterations > 0
         and 1 <= active_percent <= 100
         and graph_replays >= 0
@@ -192,6 +194,7 @@ def main() -> int:
     runtime = kvaf.NpuRuntime(
         str(kernel), device_id, npu_core_count,
         "" if batch_put_kernel is None else str(batch_put_kernel),
+        jettys_per_core,
     )
     table = None
     graph = None
@@ -202,6 +205,7 @@ def main() -> int:
             f"table_capacity={table_capacity} requests={requests} "
             f"active_percent={active_percent} active_requests={active_requests} "
             f"block_bytes={block_bytes} source_stride={source_stride} "
+            f"npu_cores={npu_core_count} jettys_per_core={jettys_per_core} "
             f"batch_put_backend={'aiv_direct_hccp' if batch_put_kernel else 'acl_d2h_mock'}"
         )
         if graph_replays:

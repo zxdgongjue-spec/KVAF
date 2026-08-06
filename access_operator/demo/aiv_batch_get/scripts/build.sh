@@ -10,7 +10,21 @@ toolkit=${ASCEND_CANN_PACKAGE_PATH:-${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend
 test -x "${toolkit}/tools/ccec_compiler/bin/ccec"
 test -x "${toolkit}/tools/ccec_compiler/bin/ld.lld"
 echo "[PREFLIGHT] toolkit=${toolkit} build=${build_dir}"
-cmake -S "${demo_dir}" -B "${build_dir}" -DASCEND_CANN_PACKAGE_PATH="${toolkit}" -DCMAKE_BUILD_TYPE=Release
+cmake_args=(
+  -S "${demo_dir}"
+  -B "${build_dir}"
+  -DASCEND_CANN_PACKAGE_PATH="${toolkit}"
+  -DCMAKE_BUILD_TYPE=Release
+)
+if [[ -n "${ASCEND_SIMT_API_DIR:-}" ]]; then
+  if [[ ! -f "${ASCEND_SIMT_API_DIR}/simt_api/device_atomic_functions.h" ]]; then
+    echo "[PREFLIGHT] missing ${ASCEND_SIMT_API_DIR}/simt_api/device_atomic_functions.h" >&2
+    exit 1
+  fi
+  echo "[PREFLIGHT] simt_api=${ASCEND_SIMT_API_DIR}"
+  cmake_args+=(-DKVAF_SIMT_API_DIR="${ASCEND_SIMT_API_DIR}")
+fi
+cmake "${cmake_args[@]}"
 cmake --build "${build_dir}" --parallel "${JOBS}"
 
 kernel="${build_dir}/bin/kvaf_execute_batch_get_kernels.o"

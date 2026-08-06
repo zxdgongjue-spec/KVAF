@@ -1065,7 +1065,7 @@ extern "C" int32_t KvafBatchGetTransportCreate(void *host_ddr, uint64_t host_ddr
     const uint32_t device_psn = MakeCtpPsn(state->api, identity.physical_device_id, device_ctp_role.c_str());
     const std::string host_import_role = "host_import_device_" + suffix;
     const std::string device_import_role = "device_import_host_" + suffix;
-    // Each core owns a matched reciprocal Jetty pair.  This deliberately
+    // Each core/Jetty slot owns a matched reciprocal Jetty pair. This deliberately
     // spends more control-plane resources than sharing one Host Jetty, so a
     // successful two-core run proves isolation rather than an unverified
     // multi-producer convention on a single connection.
