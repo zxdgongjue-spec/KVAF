@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -16,8 +15,8 @@
 
 namespace kvaf {
 
-// The current POC supports one stable-read mode: readers can pin a batch of
-// committed keys while independent new keys continue to be inserted.
+// Writes and reads are executed in separate phases. Multiple read requests
+// may run concurrently, but writes must not overlap with Lock/Lookup/Unlock.
 enum class MetaManagerLockMode {
   kStableReadAllowAppend = 0,
 };
@@ -69,9 +68,6 @@ class MetaManager {
   void SetPerformanceModeEnabled(bool enabled);
 
  private:
-  static constexpr std::size_t kKeyShardCount = 64;
-  static constexpr std::size_t kLockContextShardCount = 64;
-
   enum class RegionState {
     kUninitialized = 0,
     kInitializing,
@@ -127,13 +123,7 @@ class MetaManager {
     bool is_pending{false};
   };
 
-  struct KeyShard {
-    mutable std::shared_mutex mutex;
-    std::unordered_map<KeyId, KeyEntry> entries;
-  };
-
   struct PendingPutItem {
-    std::size_t shard_id{0};
     KeyEntry* key_entry{nullptr};
     const KeyId* key{nullptr};
     SlotRef slot;
@@ -150,13 +140,7 @@ class MetaManager {
   };
 
   struct ActiveLockContext {
-    mutable std::shared_mutex lifecycle_mutex;
     std::vector<LockedRecordRef> items;
-  };
-
-  struct LockContextShard {
-    std::mutex mutex;
-    std::unordered_map<std::uint64_t, ActiveLockContext> items;
   };
 
   Address SlotAddress(const SlotRef& slot) const;
@@ -172,25 +156,22 @@ class MetaManager {
   void DecrementPinCount(AddressRecord* record);
   SlotRef AcquireSlot(SlotClass slot_class);
   void ReleaseSlot(const SlotRef& slot);
-  std::size_t ShardIndexForKey(const KeyId& key) const;
-  std::size_t LockContextShardIndex(std::uint64_t context_id) const;
-  void CollectShardPlan(const std::vector<KeyId>& flat_keys,
-                        std::vector<std::size_t>* key_shard_ids,
-                        std::vector<std::size_t>* shard_order) const;
 
   std::atomic<RegionState> region_state_{RegionState::kUninitialized};
   RemoteRegionDesc region_;
 
-  std::mutex free_queue_mutex_;
+  // Write operations are serialized here. The caller must also keep this
+  // phase separate from the read phase, so read methods do not lock entries_.
+  std::mutex write_mutex_;
   std::queue<std::size_t> short_free_slots_;
   std::queue<std::size_t> long_free_slots_;
+  std::unordered_map<KeyId, KeyEntry> entries_;
 
-  std::array<KeyShard, kKeyShardCount> key_shards_;
-
-  std::mutex context_mutex_;
   std::unordered_map<std::uint64_t, PendingPutContext> pending_puts_;
   std::uint64_t next_put_context_id_{1};
-  std::array<LockContextShard, kLockContextShardCount> lock_context_shards_;
+
+  mutable std::shared_mutex lock_context_mutex_;
+  std::unordered_map<std::uint64_t, ActiveLockContext> lock_contexts_;
   std::atomic<std::uint64_t> next_lock_context_id_{1};
 
   std::atomic<bool> timing_log_enabled_{false};

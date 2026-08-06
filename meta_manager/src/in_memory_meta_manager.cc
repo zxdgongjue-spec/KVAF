@@ -1,6 +1,5 @@
 #include "kvaf/meta_manager/meta_manager.h"
 
-#include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <new>
@@ -120,20 +119,10 @@ Status MetaManager::RegisterRemoteRegion(const RemoteRegionDesc& region) {
 
     const std::size_t max_active_keys =
         static_cast<std::size_t>(region.slot_count_per_class) * 2u;
-    const std::size_t reserve_per_shard =
-        (max_active_keys + kKeyShardCount - 1u) / kKeyShardCount;
-    for (KeyShard& shard : key_shards_) {
-      shard.entries.max_load_factor(0.5f);
-      shard.entries.reserve(reserve_per_shard);
-    }
-
-    {
-      std::lock_guard<std::mutex> context_lock(context_mutex_);
-      pending_puts_.reserve(1024);
-    }
-    for (LockContextShard& context_shard : lock_context_shards_) {
-      context_shard.items.reserve(128);
-    }
+    entries_.max_load_factor(0.5f);
+    entries_.reserve(max_active_keys);
+    pending_puts_.reserve(1024);
+    lock_contexts_.reserve(128);
 
     region_ = region;
     short_free_slots_ = std::move(short_free_slots);
@@ -160,6 +149,8 @@ Status MetaManager::PreparePut(const std::vector<KeyId>& flat_keys,
     return Error(StatusCode::kNotInitialized, ErrorTag::kRegionMissing);
   }
 
+  std::lock_guard<std::mutex> write_lock(write_mutex_);
+
   std::vector<SlotClass> slot_classes(flat_keys.size());
   std::unordered_set<std::string_view> batch_seen;
   const bool performance_mode =
@@ -184,22 +175,8 @@ Status MetaManager::PreparePut(const std::vector<KeyId>& flat_keys,
     }
   }
 
-  std::vector<std::size_t> key_shard_ids;
-  std::vector<std::size_t> shard_order;
-  try {
-    CollectShardPlan(flat_keys, &key_shard_ids, &shard_order);
-  } catch (const std::bad_alloc&) {
-    return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
-  }
-
-  std::vector<std::unique_lock<std::shared_mutex>> shard_locks;
-  shard_locks.reserve(shard_order.size());
-  for (std::size_t shard_id : shard_order) {
-    shard_locks.emplace_back(key_shards_[shard_id].mutex);
-  }
-
   PendingPutContext pending_context;
-  std::vector<std::pair<std::size_t, const KeyId*>> new_keys;
+  std::vector<const KeyId*> new_keys;
   try {
     pending_context.items.reserve(flat_keys.size());
     new_keys.reserve(flat_keys.size());
@@ -209,16 +186,15 @@ Status MetaManager::PreparePut(const std::vector<KeyId>& flat_keys,
 
   auto rollback_new_keys = [&]() {
     for (auto it = new_keys.rbegin(); it != new_keys.rend(); ++it) {
-      key_shards_[it->first].entries.erase(*it->second);
+      entries_.erase(**it);
     }
   };
 
   for (std::size_t i = 0; i < flat_keys.size(); ++i) {
-    KeyShard& shard = key_shards_[key_shard_ids[i]];
-    auto key_it = shard.entries.find(flat_keys[i]);
-    if (key_it == shard.entries.end()) {
-      key_it = shard.entries.emplace(flat_keys[i], KeyEntry{}).first;
-      new_keys.push_back({key_shard_ids[i], &key_it->first});
+    auto key_it = entries_.find(flat_keys[i]);
+    if (key_it == entries_.end()) {
+      key_it = entries_.emplace(flat_keys[i], KeyEntry{}).first;
+      new_keys.push_back(&key_it->first);
     }
 
     KeyEntry& key_entry = key_it->second;
@@ -228,13 +204,7 @@ Status MetaManager::PreparePut(const std::vector<KeyId>& flat_keys,
     }
 
     pending_context.items.push_back(PendingPutItem{
-        key_shard_ids[i], &key_entry, &key_it->first,
-        SlotRef{slot_classes[i], 0}, lengths[i]});
-  }
-
-  std::unique_lock<std::mutex> free_queue_lock;
-  if (short_needed > 0 || long_needed > 0) {
-    free_queue_lock = std::unique_lock<std::mutex>(free_queue_mutex_);
+        &key_entry, &key_it->first, SlotRef{slot_classes[i], 0}, lengths[i]});
   }
 
   if (short_free_slots_.size() < short_needed ||
@@ -259,7 +229,6 @@ Status MetaManager::PreparePut(const std::vector<KeyId>& flat_keys,
   }
 
   try {
-    std::lock_guard<std::mutex> context_lock(context_mutex_);
     const std::uint64_t ctx_id = next_put_context_id_++;
     pending_puts_.emplace(ctx_id, std::move(pending_context));
     put_context->id = ctx_id;
@@ -281,33 +250,15 @@ Status MetaManager::CommitPut(const PutContext& put_context) {
     return Error(StatusCode::kNotInitialized, ErrorTag::kRegionMissing);
   }
 
+  std::lock_guard<std::mutex> write_lock(write_mutex_);
+
   PendingPutContext pending_context;
-  {
-    std::lock_guard<std::mutex> context_lock(context_mutex_);
-    auto pending_it = pending_puts_.find(put_context.id);
-    if (pending_it == pending_puts_.end()) {
-      return Error(StatusCode::kNotFound, ErrorTag::kPutContextMissing);
-    }
-    pending_context = std::move(pending_it->second);
-    pending_puts_.erase(pending_it);
+  auto pending_it = pending_puts_.find(put_context.id);
+  if (pending_it == pending_puts_.end()) {
+    return Error(StatusCode::kNotFound, ErrorTag::kPutContextMissing);
   }
-
-  std::vector<std::size_t> shard_order;
-  shard_order.reserve(kKeyShardCount);
-  std::array<bool, kKeyShardCount> shard_used{};
-  for (const PendingPutItem& item : pending_context.items) {
-    if (!shard_used[item.shard_id]) {
-      shard_used[item.shard_id] = true;
-      shard_order.push_back(item.shard_id);
-    }
-  }
-  std::sort(shard_order.begin(), shard_order.end());
-
-  std::vector<std::unique_lock<std::shared_mutex>> shard_locks;
-  shard_locks.reserve(shard_order.size());
-  for (std::size_t shard_id : shard_order) {
-    shard_locks.emplace_back(key_shards_[shard_id].mutex);
-  }
+  pending_context = std::move(pending_it->second);
+  pending_puts_.erase(pending_it);
 
   for (const PendingPutItem& item : pending_context.items) {
     if (item.key_entry == nullptr || !item.key_entry->is_pending ||
@@ -330,45 +281,15 @@ Status MetaManager::AbortPut(const PutContext& put_context) {
     return Error(StatusCode::kNotInitialized, ErrorTag::kRegionMissing);
   }
 
+  std::lock_guard<std::mutex> write_lock(write_mutex_);
+
   PendingPutContext pending_context;
-  {
-    std::lock_guard<std::mutex> context_lock(context_mutex_);
-    auto pending_it = pending_puts_.find(put_context.id);
-    if (pending_it == pending_puts_.end()) {
-      return Error(StatusCode::kNotFound, ErrorTag::kPutContextMissing);
-    }
-    pending_context = std::move(pending_it->second);
-    pending_puts_.erase(pending_it);
+  auto pending_it = pending_puts_.find(put_context.id);
+  if (pending_it == pending_puts_.end()) {
+    return Error(StatusCode::kNotFound, ErrorTag::kPutContextMissing);
   }
-
-  std::vector<std::size_t> shard_order;
-  shard_order.reserve(kKeyShardCount);
-  std::array<bool, kKeyShardCount> shard_used{};
-  std::size_t short_count = 0;
-  std::size_t long_count = 0;
-  for (const PendingPutItem& item : pending_context.items) {
-    if (!shard_used[item.shard_id]) {
-      shard_used[item.shard_id] = true;
-      shard_order.push_back(item.shard_id);
-    }
-    if (item.slot.slot_class == SlotClass::kShort) {
-      ++short_count;
-    } else {
-      ++long_count;
-    }
-  }
-  std::sort(shard_order.begin(), shard_order.end());
-
-  std::vector<std::unique_lock<std::shared_mutex>> shard_locks;
-  shard_locks.reserve(shard_order.size());
-  for (std::size_t shard_id : shard_order) {
-    shard_locks.emplace_back(key_shards_[shard_id].mutex);
-  }
-
-  std::unique_lock<std::mutex> free_queue_lock;
-  if (short_count > 0 || long_count > 0) {
-    free_queue_lock = std::unique_lock<std::mutex>(free_queue_mutex_);
-  }
+  pending_context = std::move(pending_it->second);
+  pending_puts_.erase(pending_it);
 
   for (const PendingPutItem& item : pending_context.items) {
     if (item.key_entry == nullptr || !item.key_entry->is_pending) {
@@ -395,12 +316,9 @@ Status MetaManager::LockKeys(const std::vector<KeyId>& flat_keys,
     return Error(StatusCode::kNotInitialized, ErrorTag::kRegionMissing);
   }
 
-  std::vector<std::size_t> key_shard_ids;
-  std::vector<std::size_t> shard_order;
   ActiveLockContext active_context;
   std::vector<AddressRecord*> pinned_records;
   try {
-    CollectShardPlan(flat_keys, &key_shard_ids, &shard_order);
     active_context.items.reserve(flat_keys.size());
     pinned_records.reserve(flat_keys.size());
   } catch (const std::bad_alloc&) {
@@ -413,35 +331,24 @@ Status MetaManager::LockKeys(const std::vector<KeyId>& flat_keys,
     }
   };
 
-  {
-    std::vector<std::shared_lock<std::shared_mutex>> shard_locks;
-    shard_locks.reserve(shard_order.size());
-    for (std::size_t shard_id : shard_order) {
-      shard_locks.emplace_back(key_shards_[shard_id].mutex);
+  for (const KeyId& key : flat_keys) {
+    auto key_it = entries_.find(key);
+    if (key_it == entries_.end() || !key_it->second.has_active_record) {
+      rollback_pins();
+      return Error(StatusCode::kNotFound, ErrorTag::kKeyMissing);
     }
 
-    for (std::size_t i = 0; i < flat_keys.size(); ++i) {
-      KeyShard& shard = key_shards_[key_shard_ids[i]];
-      auto key_it = shard.entries.find(flat_keys[i]);
-      if (key_it == shard.entries.end() || !key_it->second.has_active_record) {
-        rollback_pins();
-        return Error(StatusCode::kNotFound, ErrorTag::kKeyMissing);
-      }
-
-      AddressRecord* record = &key_it->second.active_record;
-      IncrementPinCount(record);
-      pinned_records.push_back(record);
-      active_context.items.push_back(LockedRecordRef{&key_it->first, record});
-    }
+    AddressRecord* record = &key_it->second.active_record;
+    IncrementPinCount(record);
+    pinned_records.push_back(record);
+    active_context.items.push_back(LockedRecordRef{&key_it->first, record});
   }
 
   const std::uint64_t ctx_id =
       next_lock_context_id_.fetch_add(1, std::memory_order_relaxed);
-  LockContextShard& context_shard =
-      lock_context_shards_[LockContextShardIndex(ctx_id)];
   try {
-    std::lock_guard<std::mutex> context_lock(context_shard.mutex);
-    auto inserted = context_shard.items.try_emplace(ctx_id);
+    std::unique_lock<std::shared_mutex> context_lock(lock_context_mutex_);
+    auto inserted = lock_contexts_.try_emplace(ctx_id);
     if (!inserted.second) {
       rollback_pins();
       return Error(StatusCode::kInvalidState, ErrorTag::kStateConflict);
@@ -467,35 +374,27 @@ Status MetaManager::BatchLookup(const std::vector<KeyId>& flat_keys,
     return Error(StatusCode::kNotInitialized, ErrorTag::kRegionMissing);
   }
 
-  LockContextShard& context_shard =
-      lock_context_shards_[LockContextShardIndex(lock_context.id)];
-  ActiveLockContext* active_context = nullptr;
-  std::shared_lock<std::shared_mutex> lifecycle_lock;
-  {
-    std::lock_guard<std::mutex> context_lock(context_shard.mutex);
-    auto context_it = context_shard.items.find(lock_context.id);
-    if (context_it == context_shard.items.end()) {
-      return Error(StatusCode::kNotFound, ErrorTag::kLockContextMissing);
-    }
-    active_context = &context_it->second;
-    lifecycle_lock =
-        std::shared_lock<std::shared_mutex>(active_context->lifecycle_mutex);
+  std::shared_lock<std::shared_mutex> context_lock(lock_context_mutex_);
+  auto context_it = lock_contexts_.find(lock_context.id);
+  if (context_it == lock_contexts_.end()) {
+    return Error(StatusCode::kNotFound, ErrorTag::kLockContextMissing);
   }
+  const ActiveLockContext& active_context = context_it->second;
 
-  if (active_context->items.size() != flat_keys.size()) {
+  if (active_context.items.size() != flat_keys.size()) {
     return Error(StatusCode::kInvalidArgument, ErrorTag::kInvalidRequest);
   }
 
   const bool performance_mode =
       performance_mode_enabled_.load(std::memory_order_relaxed);
   try {
-    ResizeAccessDesc(active_context->items.size(), access_desc);
+    ResizeAccessDesc(active_context.items.size(), access_desc);
   } catch (const std::bad_alloc&) {
     return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
   }
 
-  for (std::size_t i = 0; i < active_context->items.size(); ++i) {
-    const LockedRecordRef& item = active_context->items[i];
+  for (std::size_t i = 0; i < active_context.items.size(); ++i) {
+    const LockedRecordRef& item = active_context.items[i];
     if (item.key == nullptr || item.record == nullptr) {
       return Error(StatusCode::kInvalidState, ErrorTag::kStateConflict);
     }
@@ -516,17 +415,13 @@ Status MetaManager::UnlockKeys(const LockContext& lock_context) {
     return Error(StatusCode::kNotInitialized, ErrorTag::kRegionMissing);
   }
 
-  LockContextShard& context_shard =
-      lock_context_shards_[LockContextShardIndex(lock_context.id)];
-  std::lock_guard<std::mutex> context_lock(context_shard.mutex);
-  auto context_it = context_shard.items.find(lock_context.id);
-  if (context_it == context_shard.items.end()) {
+  std::unique_lock<std::shared_mutex> context_lock(lock_context_mutex_);
+  auto context_it = lock_contexts_.find(lock_context.id);
+  if (context_it == lock_contexts_.end()) {
     return Error(StatusCode::kNotFound, ErrorTag::kLockContextMissing);
   }
 
   ActiveLockContext& active_context = context_it->second;
-  std::unique_lock<std::shared_mutex> lifecycle_lock(
-      active_context.lifecycle_mutex);
   for (const LockedRecordRef& item : active_context.items) {
     if (item.record == nullptr || LoadPinCount(*item.record) == 0) {
       return Error(StatusCode::kInvalidState, ErrorTag::kStateConflict);
@@ -537,8 +432,7 @@ Status MetaManager::UnlockKeys(const LockContext& lock_context) {
     DecrementPinCount(item.record);
   }
 
-  lifecycle_lock.unlock();
-  context_shard.items.erase(context_it);
+  lock_contexts_.erase(context_it);
   return Status::OK();
 }
 
@@ -550,6 +444,8 @@ Status MetaManager::BatchFree(const std::vector<KeyId>& flat_keys) {
   if (region_state_.load(std::memory_order_acquire) != RegionState::kReady) {
     return Error(StatusCode::kNotInitialized, ErrorTag::kRegionMissing);
   }
+
+  std::lock_guard<std::mutex> write_lock(write_mutex_);
 
   std::vector<KeyId> unique_keys;
   const bool performance_mode =
@@ -576,30 +472,18 @@ Status MetaManager::BatchFree(const std::vector<KeyId>& flat_keys) {
     }
   }
 
-  std::vector<std::size_t> key_shard_ids;
-  std::vector<std::size_t> shard_order;
   std::vector<SlotRef> slots_to_recycle;
   std::vector<KeyEntry*> entries_to_clear;
   try {
-    CollectShardPlan(unique_keys, &key_shard_ids, &shard_order);
     slots_to_recycle.reserve(unique_keys.size());
     entries_to_clear.reserve(unique_keys.size());
   } catch (const std::bad_alloc&) {
     return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
   }
 
-  std::vector<std::unique_lock<std::shared_mutex>> shard_locks;
-  shard_locks.reserve(shard_order.size());
-  for (std::size_t shard_id : shard_order) {
-    shard_locks.emplace_back(key_shards_[shard_id].mutex);
-  }
-
-  std::size_t short_count = 0;
-  std::size_t long_count = 0;
-  for (std::size_t i = 0; i < unique_keys.size(); ++i) {
-    KeyShard& shard = key_shards_[key_shard_ids[i]];
-    auto key_it = shard.entries.find(unique_keys[i]);
-    if (key_it == shard.entries.end() || !key_it->second.has_active_record) {
+  for (const KeyId& key : unique_keys) {
+    auto key_it = entries_.find(key);
+    if (key_it == entries_.end() || !key_it->second.has_active_record) {
       return Error(StatusCode::kNotFound, ErrorTag::kKeyMissing);
     }
     if (LoadPinCount(key_it->second.active_record) > 0) {
@@ -607,18 +491,8 @@ Status MetaManager::BatchFree(const std::vector<KeyId>& flat_keys) {
     }
 
     const SlotRef slot = key_it->second.active_record.slot;
-    if (slot.slot_class == SlotClass::kShort) {
-      ++short_count;
-    } else {
-      ++long_count;
-    }
     slots_to_recycle.push_back(slot);
     entries_to_clear.push_back(&key_it->second);
-  }
-
-  std::unique_lock<std::mutex> free_queue_lock;
-  if (short_count > 0 || long_count > 0) {
-    free_queue_lock = std::unique_lock<std::mutex>(free_queue_mutex_);
   }
 
   for (KeyEntry* entry : entries_to_clear) {
@@ -731,39 +605,6 @@ void MetaManager::ReleaseSlot(const SlotRef& slot) {
   } else {
     long_free_slots_.push(slot.slot_index);
   }
-}
-
-std::size_t MetaManager::ShardIndexForKey(const KeyId& key) const {
-  return std::hash<KeyId>{}(key) % kKeyShardCount;
-}
-
-std::size_t MetaManager::LockContextShardIndex(std::uint64_t context_id) const {
-  return static_cast<std::size_t>(context_id % kLockContextShardCount);
-}
-
-void MetaManager::CollectShardPlan(
-    const std::vector<KeyId>& flat_keys,
-    std::vector<std::size_t>* key_shard_ids,
-    std::vector<std::size_t>* shard_order) const {
-  if (key_shard_ids == nullptr || shard_order == nullptr) {
-    return;
-  }
-
-  key_shard_ids->clear();
-  shard_order->clear();
-  key_shard_ids->reserve(flat_keys.size());
-
-  std::array<bool, kKeyShardCount> shard_used{};
-  for (const KeyId& key : flat_keys) {
-    const std::size_t shard_id = ShardIndexForKey(key);
-    key_shard_ids->push_back(shard_id);
-    if (!shard_used[shard_id]) {
-      shard_used[shard_id] = true;
-      shard_order->push_back(shard_id);
-    }
-  }
-
-  std::sort(shard_order->begin(), shard_order->end());
 }
 
 std::unique_ptr<MetaManager> CreateInMemoryMetaManager() {
