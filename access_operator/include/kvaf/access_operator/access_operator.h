@@ -40,6 +40,8 @@ struct AccessOperatorConfig {
   std::string batch_get_kernel_object_path;
   std::string batch_put_kernel_object_path;
   std::uint32_t npu_core_count{0};
+  // BatchGet Direct-HCCP Jettys assigned to each AIV core.
+  std::uint32_t jettys_per_core{2};
 };
 
 // Default synchronous NPU data-plane implementation.

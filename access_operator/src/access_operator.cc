@@ -143,6 +143,7 @@ bool FitsU32(std::uint64_t value) {
 
 Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
                                std::uint32_t npu_core_count,
+                               std::uint32_t jettys_per_core,
                                const BatchGetExecutionState& execution,
                                KvafExecuteBatchGetKernelArgs* arguments) {
   if (exec.request == nullptr || arguments == nullptr) {
@@ -173,8 +174,9 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
       execution.status_bytes < static_cast<std::size_t>(npu_core_count) *
                                    sizeof(KvafBatchGetCoreStatus) ||
       execution.queue_state == nullptr ||
-      execution.queue_state_bytes < static_cast<std::size_t>(npu_core_count) *
-                                        sizeof(KvafBatchGetQueueState)) {
+      execution.queue_state_bytes <
+          static_cast<std::size_t>(npu_core_count) * jettys_per_core *
+              sizeof(KvafBatchGetQueueState)) {
     return InvalidArgument("BatchGet request does not satisfy the NPU buffer contract");
   }
 
@@ -200,6 +202,7 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
   arguments->output_rows = static_cast<std::uint32_t>(output_rows);
   arguments->block_bytes = static_cast<std::uint32_t>(request.output_block_bytes);
   arguments->block_count = npu_core_count;
+  arguments->jettys_per_core = jettys_per_core;
   return Status::OK();
 }
 
@@ -260,7 +263,10 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
   if (remote_region.base == 0 || remote_region.length == 0 ||
       impl_->config.batch_get_kernel_object_path.empty() ||
       impl_->config.npu_core_count == 0 ||
-      impl_->config.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES) {
+      impl_->config.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
+      impl_->config.jettys_per_core == 0 ||
+      impl_->config.jettys_per_core >
+          KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE) {
     return InvalidArgument("invalid AccessOperator initialization config");
   }
   if (KvafExecuteBatchGetLoadKernel(
@@ -272,7 +278,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
   KvafBatchGetTransport* transport = nullptr;
   const int32_t result = KvafBatchGetTransportCreate(
       reinterpret_cast<void*>(remote_region.base), remote_region.length,
-      impl_->config.npu_core_count, 1U, &transport);
+      impl_->config.npu_core_count, impl_->config.jettys_per_core, &transport);
   if (result != KVAF_BATCH_GET_SUCCESS || transport == nullptr) {
     return Internal("failed to create reusable BatchGet transport");
   }
@@ -282,6 +288,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
                            sizeof(KvafBatchGetCoreStatus);
   execution.queue_state_bytes =
       static_cast<std::size_t>(impl_->config.npu_core_count) *
+      impl_->config.jettys_per_core *
       sizeof(KvafBatchGetQueueState);
   if (aclrtMalloc(&execution.status, execution.status_bytes,
                   ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
@@ -389,9 +396,9 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
     return InvalidArgument("NPU BatchGet requires a caller-owned ACL stream");
   }
   KvafExecuteBatchGetKernelArgs arguments{};
-  Status status = BuildBatchGetKernelArgs(exec, impl_->config.npu_core_count,
-                                          impl_->execution,
-                                          &arguments);
+  Status status = BuildBatchGetKernelArgs(
+      exec, impl_->config.npu_core_count, impl_->config.jettys_per_core,
+      impl_->execution, &arguments);
   if (!status.ok()) {
     return status;
   }
