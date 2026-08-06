@@ -548,8 +548,8 @@ Status MetaManager::CommitPut(const PutContext& put_context) {
 
     item.key_entry->is_pending = false;
     item.key_entry->has_active_record = true;
-    item.key_entry->active_record = AddressRecord{
-        item.slot, item.valid_length, 0};
+    item.key_entry->active_record =
+        AddressRecord{item.slot, item.valid_length};
   }
 
   return Status::OK();
@@ -597,36 +597,31 @@ Status MetaManager::LockKeys(const std::vector<KeyId>& flat_keys,
   }
 
   ActiveLockContext active_context;
-  std::vector<AddressRecord*> pinned_records;
+  {
+    ScopedMethodTimer phase_timer(&timing_log_enabled_, "LockKeys",
+                                  "read_phase");
+    active_context.read_phase_lock =
+        std::shared_lock<std::shared_mutex>(read_phase_mutex_);
+  }
+
   {
     ScopedMethodTimer phase_timer(&timing_log_enabled_, "LockKeys", "reserve");
     try {
       active_context.items.reserve(flat_keys.size());
-      pinned_records.reserve(flat_keys.size());
     } catch (const std::bad_alloc&) {
       return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
     }
   }
 
-  auto rollback_pins = [&]() {
-    for (AddressRecord* record : pinned_records) {
-      DecrementPinCount(record);
-    }
-  };
-
   {
-    ScopedMethodTimer phase_timer(&timing_log_enabled_, "LockKeys",
-                                  "find_and_pin");
+    ScopedMethodTimer phase_timer(&timing_log_enabled_, "LockKeys", "find");
     for (const KeyId& key : flat_keys) {
       EntryIndex::Node* key_node = entries_->Find(key);
       if (key_node == nullptr || !key_node->value.has_active_record) {
-        rollback_pins();
         return Error(StatusCode::kNotFound, ErrorTag::kKeyMissing);
       }
 
       AddressRecord* record = &key_node->value.active_record;
-      IncrementPinCount(record);
-      pinned_records.push_back(record);
       active_context.items.push_back(LockedRecordRef{&key_node->key, record});
     }
   }
@@ -640,12 +635,12 @@ Status MetaManager::LockKeys(const std::vector<KeyId>& flat_keys,
       std::unique_lock<std::shared_mutex> context_lock(lock_context_mutex_);
       auto inserted = lock_contexts_.try_emplace(ctx_id);
       if (!inserted.second) {
-        rollback_pins();
         return Error(StatusCode::kInvalidState, ErrorTag::kStateConflict);
       }
       inserted.first->second.items.swap(active_context.items);
+      inserted.first->second.read_phase_lock =
+          std::move(active_context.read_phase_lock);
     } catch (const std::bad_alloc&) {
-      rollback_pins();
       return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
     }
 
@@ -714,16 +709,12 @@ Status MetaManager::UnlockKeys(const LockContext& lock_context) {
   }
 
   ActiveLockContext& active_context = context_it->second;
-  for (const LockedRecordRef& item : active_context.items) {
-    if (item.record == nullptr || LoadPinCount(*item.record) == 0) {
-      return Error(StatusCode::kInvalidState, ErrorTag::kStateConflict);
-    }
+  if (!active_context.read_phase_lock.owns_lock()) {
+    return Error(StatusCode::kInvalidState, ErrorTag::kStateConflict);
   }
 
-  for (const LockedRecordRef& item : active_context.items) {
-    DecrementPinCount(item.record);
-  }
-
+  // Erasing the context releases its read lease after the context is removed
+  // from the lookup table, so BatchLookup cannot observe a reclaimed context.
   lock_contexts_.erase(context_it);
   return Status::OK();
 }
@@ -735,6 +726,16 @@ Status MetaManager::BatchFree(const std::vector<KeyId>& flat_keys) {
   }
   if (region_state_.load(std::memory_order_acquire) != RegionState::kReady) {
     return Error(StatusCode::kNotInitialized, ErrorTag::kRegionMissing);
+  }
+
+  std::unique_lock<std::shared_mutex> read_phase_lock(read_phase_mutex_,
+                                                       std::defer_lock);
+  {
+    ScopedMethodTimer phase_timer(&timing_log_enabled_, "BatchFree",
+                                  "write_phase");
+    if (!read_phase_lock.try_lock()) {
+      return Error(StatusCode::kBusy, ErrorTag::kKeyBusy);
+    }
   }
 
   std::unique_lock<std::mutex> write_lock(write_mutex_, std::defer_lock);
@@ -791,9 +792,6 @@ Status MetaManager::BatchFree(const std::vector<KeyId>& flat_keys) {
       EntryIndex::Node* key_node = entries_->Find(key);
       if (key_node == nullptr || !key_node->value.has_active_record) {
         return Error(StatusCode::kNotFound, ErrorTag::kKeyMissing);
-      }
-      if (LoadPinCount(key_node->value.active_record) > 0) {
-        return Error(StatusCode::kBusy, ErrorTag::kKeyBusy);
       }
 
       const SlotRef slot = key_node->value.active_record.slot;
@@ -882,24 +880,6 @@ void MetaManager::FillAccessDescAt(const KeyId* key,
   access_desc->addresses[index] = address;
   access_desc->lengths[index] = length;
   access_desc->valid[index] = 1;
-}
-
-std::uint32_t MetaManager::LoadPinCount(const AddressRecord& record) const {
-  return record.pin_count.load(std::memory_order_relaxed);
-}
-
-void MetaManager::IncrementPinCount(AddressRecord* record) {
-  if (record == nullptr) {
-    return;
-  }
-  record->pin_count.fetch_add(1, std::memory_order_relaxed);
-}
-
-void MetaManager::DecrementPinCount(AddressRecord* record) {
-  if (record == nullptr) {
-    return;
-  }
-  record->pin_count.fetch_sub(1, std::memory_order_relaxed);
 }
 
 MetaManager::SlotRef MetaManager::AcquireSlot(SlotClass slot_class) {

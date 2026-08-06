@@ -476,7 +476,7 @@ bool TestPreparePutOutOfMemory() {
       "PreparePut should fail when the short slot queue is exhausted");
 }
 
-// 验证同一个 lock context 只能成功解锁一次，避免 pin_count 被重复扣减。
+// 验证同一个 lock context 只能成功解锁一次，避免读阶段 lease 被重复释放。
 bool TestDoubleUnlockReturnsNotFound() {
   auto manager = MakeInitializedManager(1);
   if (!manager) {
@@ -550,8 +550,10 @@ bool TestTimingLogPhases() {
          expect_phase("PreparePut", "classify") &&
          expect_phase("PreparePut", "allocate_slots") &&
          expect_phase("PreparePut", "publish_context") &&
-         expect_phase("LockKeys", "find_and_pin") &&
+         expect_phase("LockKeys", "read_phase") &&
+         expect_phase("LockKeys", "find") &&
          expect_phase("LockKeys", "register_context") &&
+         expect_phase("BatchFree", "write_phase") &&
          expect_phase("BatchFree", "deduplicate") &&
          expect_phase("BatchFree", "validate_keys") &&
          expect_phase("BatchFree", "clear_entries") &&

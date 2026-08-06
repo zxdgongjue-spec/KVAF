@@ -90,32 +90,13 @@ class MetaManager {
   struct AddressRecord {
     SlotRef slot;
     std::uint64_t valid_length{0};
-    std::atomic<std::uint32_t> pin_count{0};
 
     AddressRecord() = default;
 
     AddressRecord(SlotRef slot_value,
-                  std::uint64_t valid_length_value,
-                  std::uint32_t pin_count_value)
+                  std::uint64_t valid_length_value)
         : slot(slot_value),
-          valid_length(valid_length_value),
-          pin_count(pin_count_value) {}
-
-    AddressRecord(const AddressRecord& other)
-        : slot(other.slot),
-          valid_length(other.valid_length),
-          pin_count(other.pin_count.load(std::memory_order_relaxed)) {}
-
-    AddressRecord& operator=(const AddressRecord& other) {
-      if (this == &other) {
-        return *this;
-      }
-      slot = other.slot;
-      valid_length = other.valid_length;
-      pin_count.store(other.pin_count.load(std::memory_order_relaxed),
-                      std::memory_order_relaxed);
-      return *this;
-    }
+          valid_length(valid_length_value) {}
   };
 
   struct KeyEntry {
@@ -142,6 +123,8 @@ class MetaManager {
 
   struct ActiveLockContext {
     std::vector<LockedRecordRef> items;
+    // Keeps active records and their slots alive until UnlockKeys.
+    std::shared_lock<std::shared_mutex> read_phase_lock;
   };
 
   Address SlotAddress(const SlotRef& slot) const;
@@ -152,17 +135,14 @@ class MetaManager {
                         std::uint64_t length,
                         std::size_t index,
                         AccessDesc* access_desc) const;
-  std::uint32_t LoadPinCount(const AddressRecord& record) const;
-  void IncrementPinCount(AddressRecord* record);
-  void DecrementPinCount(AddressRecord* record);
   SlotRef AcquireSlot(SlotClass slot_class);
   void ReleaseSlot(const SlotRef& slot);
 
   std::atomic<RegionState> region_state_{RegionState::kUninitialized};
   RemoteRegionDesc region_;
 
-  // Write operations are serialized here. The caller must also keep this
-  // phase separate from the read phase, so read methods do not lock entries_.
+  // Write operations are serialized here. The caller must keep put operations
+  // separate from the read phase, so read methods do not lock entries_.
   std::mutex write_mutex_;
   std::queue<std::size_t> short_free_slots_;
   std::queue<std::size_t> long_free_slots_;
@@ -175,6 +155,10 @@ class MetaManager {
   std::unordered_map<std::uint64_t, PendingPutContext> pending_puts_;
   std::uint64_t next_put_context_id_{1};
 
+  // LockKeys holds a shared lease for the lifetime of each read snapshot.
+  // BatchFree takes the exclusive side before clearing records and recycling
+  // slots.
+  mutable std::shared_mutex read_phase_mutex_;
   mutable std::shared_mutex lock_context_mutex_;
   std::unordered_map<std::uint64_t, ActiveLockContext> lock_contexts_;
   std::atomic<std::uint64_t> next_lock_context_id_{1};

@@ -24,7 +24,7 @@
 
 - `key_shards_`：分片维护 `key -> record`
 - `short_free_slots_ / long_free_slots_`：维护两类空闲 slot
-- `LockKeys`：固定 key 并增加 `pin_count`
+- `LockKeys`：建立读阶段 lease，固定 key 直到 `UnlockKeys`
 - `BatchLookup`：返回已固定 key 的地址信息
 - `BatchFree`：回收未被锁定的记录
 
