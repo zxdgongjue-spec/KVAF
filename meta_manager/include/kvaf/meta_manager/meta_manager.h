@@ -180,4 +180,8 @@ class MetaManager {
 
 std::unique_ptr<MetaManager> CreateInMemoryMetaManager();
 
+// Flushes aggregated method/phase timing collected while timing logging is
+// enabled. Output is written to stderr and the collected samples are cleared.
+void FlushMetaManagerTimingSummary();
+
 }  // namespace kvaf

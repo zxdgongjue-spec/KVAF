@@ -4,6 +4,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -14,6 +15,7 @@ using kvaf::Address;
 using kvaf::AccessDesc;
 using kvaf::CreateInMemoryMetaManager;
 using kvaf::FlatAccessDesc;
+using kvaf::FlushMetaManagerTimingSummary;
 using kvaf::KeyId;
 using kvaf::LockContext;
 using kvaf::MetaManager;
@@ -505,6 +507,57 @@ bool TestDoubleUnlockReturnsNotFound() {
                           "second UnlockKeys should fail because context is gone");
 }
 
+bool TestTimingLogPhases() {
+  auto manager = MakeInitializedManager(2);
+  manager->SetTimingLogEnabled(true);
+
+  const std::vector<KeyId> keys{"timing_key"};
+  const std::vector<std::uint64_t> lengths{64};
+  PutContext put_context;
+  PutAccessDesc put_desc;
+  LockContext lock_context;
+
+  std::ostringstream timing_output;
+  std::streambuf* original_buffer = std::cerr.rdbuf(timing_output.rdbuf());
+  const Status prepare_status =
+      manager->PreparePut(keys, lengths, &put_context, &put_desc);
+  const Status commit_status = manager->CommitPut(put_context);
+  const Status lock_status = manager->LockKeys(
+      keys, MetaManagerLockMode::kStableReadAllowAppend, &lock_context);
+  const Status unlock_status = manager->UnlockKeys(lock_context);
+  const Status free_status = manager->BatchFree(keys);
+  FlushMetaManagerTimingSummary();
+  std::cerr.rdbuf(original_buffer);
+
+  if (!ExpectOk(prepare_status, "PreparePut should succeed with timing log") ||
+      !ExpectOk(commit_status, "CommitPut should succeed with timing log") ||
+      !ExpectOk(lock_status, "LockKeys should succeed with timing log") ||
+      !ExpectOk(unlock_status, "UnlockKeys should succeed with timing log") ||
+      !ExpectOk(free_status, "BatchFree should succeed with timing log")) {
+    return false;
+  }
+
+  const std::string output = timing_output.str();
+  const auto expect_phase = [&output](const char* method,
+                                      const char* phase) {
+    return Expect(output.find(std::string("method=") + method + " phase=" +
+                              phase + " count=") != std::string::npos,
+                  std::string("timing log should contain ") + method + "." +
+                      phase);
+  };
+
+  return expect_phase("PreparePut", "lock") &&
+         expect_phase("PreparePut", "classify") &&
+         expect_phase("PreparePut", "allocate_slots") &&
+         expect_phase("PreparePut", "publish_context") &&
+         expect_phase("LockKeys", "find_and_pin") &&
+         expect_phase("LockKeys", "register_context") &&
+         expect_phase("BatchFree", "deduplicate") &&
+         expect_phase("BatchFree", "validate_keys") &&
+         expect_phase("BatchFree", "clear_entries") &&
+         expect_phase("BatchFree", "release_slots");
+}
+
 struct TestCase {
   const char* name;
   std::function<bool()> run;
@@ -528,6 +581,7 @@ int main() {
       {"PreparePutRejectsOversizedLength", TestPreparePutRejectsOversizedLength},
       {"PreparePutOutOfMemory", TestPreparePutOutOfMemory},
       {"DoubleUnlockReturnsNotFound", TestDoubleUnlockReturnsNotFound},
+      {"TimingLogPhases", TestTimingLogPhases},
   };
 
   bool all_passed = true;

@@ -1,7 +1,10 @@
 #include "kvaf/meta_manager/meta_manager.h"
 
+#include <algorithm>
 #include <chrono>
 #include <iostream>
+#include <map>
+#include <mutex>
 #include <new>
 #include <string_view>
 #include <unordered_set>
@@ -60,33 +63,103 @@ Status Error(StatusCode code, ErrorTag tag) {
   return Status::Error(StatusCode::kInternal, "internal_error");
 }
 
+class TimingAggregator {
+ public:
+  void Add(const char* method_name,
+           const char* phase_name,
+           std::uint64_t elapsed_ns) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    samples_[{method_name, phase_name == nullptr ? "" : phase_name}]
+        .push_back(elapsed_ns);
+  }
+
+  void Flush() {
+    std::map<std::pair<std::string, std::string>,
+             std::vector<std::uint64_t>>
+        samples;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      samples.swap(samples_);
+    }
+
+    for (auto& entry : samples) {
+      std::vector<std::uint64_t>& values = entry.second;
+      if (values.empty()) {
+        continue;
+      }
+
+      std::sort(values.begin(), values.end());
+      std::uint64_t total_ns = 0;
+      for (const std::uint64_t value : values) {
+        total_ns += value;
+      }
+
+      const auto& key = entry.first;
+      std::cerr << "[MetaManagerTimingSummary] method=" << key.first;
+      if (!key.second.empty()) {
+        std::cerr << " phase=" << key.second;
+      }
+      std::cerr << " count=" << values.size()
+                << " total_ns=" << total_ns
+                << " avg_ns="
+                << static_cast<double>(total_ns) / values.size()
+                << " min_ns=" << values.front()
+                << " p50_ns=" << values[values.size() / 2]
+                << " p95_ns=" << values[(values.size() * 95) / 100]
+                << " max_ns=" << values.back() << '\n';
+    }
+  }
+
+ private:
+  std::mutex mutex_;
+  std::map<std::pair<std::string, std::string>,
+           std::vector<std::uint64_t>>
+      samples_;
+};
+
+TimingAggregator& GetTimingAggregator() {
+  static TimingAggregator aggregator;
+  return aggregator;
+}
+
 class ScopedMethodTimer {
  public:
-  ScopedMethodTimer(const std::atomic<bool>* enabled, const char* method_name)
-      : enabled_(enabled),
-        method_name_(method_name),
-        start_(std::chrono::steady_clock::now()) {}
+  ScopedMethodTimer(const std::atomic<bool>* enabled,
+                   const char* method_name,
+                   const char* phase_name = nullptr)
+      : method_name_(method_name),
+        phase_name_(phase_name),
+        active_(enabled->load(std::memory_order_relaxed)) {
+    if (active_) {
+      start_ = std::chrono::steady_clock::now();
+    }
+  }
 
   ~ScopedMethodTimer() {
-    if (!enabled_->load(std::memory_order_relaxed)) {
+    if (!active_) {
       return;
     }
 
     const auto elapsed_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - start_)
+          std::chrono::steady_clock::now() - start_)
             .count();
-    std::cout << "[MetaManagerTiming] method=" << method_name_
-              << " elapsed_ns=" << elapsed_ns << '\n';
+    GetTimingAggregator().Add(method_name_, phase_name_,
+                               static_cast<std::uint64_t>(elapsed_ns));
   }
 
  private:
-  const std::atomic<bool>* enabled_;
   const char* method_name_;
+  const char* phase_name_;
+  bool active_{false};
   std::chrono::steady_clock::time_point start_;
 };
 
 }  // namespace
+
+void FlushMetaManagerTimingSummary() {
+  GetTimingAggregator().Flush();
+}
 
 Status MetaManager::RegisterRemoteRegion(const RemoteRegionDesc& region) {
   ScopedMethodTimer timer(&timing_log_enabled_, "RegisterRemoteRegion");
@@ -149,39 +222,53 @@ Status MetaManager::PreparePut(const std::vector<KeyId>& flat_keys,
     return Error(StatusCode::kNotInitialized, ErrorTag::kRegionMissing);
   }
 
-  std::lock_guard<std::mutex> write_lock(write_mutex_);
+  std::unique_lock<std::mutex> write_lock(write_mutex_, std::defer_lock);
+  {
+    ScopedMethodTimer phase_timer(&timing_log_enabled_, "PreparePut", "lock");
+    write_lock.lock();
+  }
 
-  std::vector<SlotClass> slot_classes(flat_keys.size());
+  std::vector<SlotClass> slot_classes;
   std::unordered_set<std::string_view> batch_seen;
   const bool performance_mode =
       performance_mode_enabled_.load(std::memory_order_relaxed);
-  if (!performance_mode) {
-    batch_seen.reserve(flat_keys.size());
-  }
 
   std::size_t short_needed = 0;
   std::size_t long_needed = 0;
-  for (std::size_t i = 0; i < flat_keys.size(); ++i) {
-    if (!performance_mode && !batch_seen.emplace(flat_keys[i]).second) {
-      return Error(StatusCode::kInvalidArgument, ErrorTag::kInvalidRequest);
+  {
+    ScopedMethodTimer phase_timer(&timing_log_enabled_, "PreparePut",
+                                  "classify");
+    slot_classes.resize(flat_keys.size());
+    if (!performance_mode) {
+      batch_seen.reserve(flat_keys.size());
     }
-    if (!TryResolveSlotClass(lengths[i], &slot_classes[i])) {
-      return Error(StatusCode::kInvalidArgument, ErrorTag::kInvalidRequest);
-    }
-    if (slot_classes[i] == SlotClass::kShort) {
-      ++short_needed;
-    } else {
-      ++long_needed;
+
+    for (std::size_t i = 0; i < flat_keys.size(); ++i) {
+      if (!performance_mode && !batch_seen.emplace(flat_keys[i]).second) {
+        return Error(StatusCode::kInvalidArgument, ErrorTag::kInvalidRequest);
+      }
+      if (!TryResolveSlotClass(lengths[i], &slot_classes[i])) {
+        return Error(StatusCode::kInvalidArgument, ErrorTag::kInvalidRequest);
+      }
+      if (slot_classes[i] == SlotClass::kShort) {
+        ++short_needed;
+      } else {
+        ++long_needed;
+      }
     }
   }
 
   PendingPutContext pending_context;
   std::vector<const KeyId*> new_keys;
-  try {
-    pending_context.items.reserve(flat_keys.size());
-    new_keys.reserve(flat_keys.size());
-  } catch (const std::bad_alloc&) {
-    return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
+  {
+    ScopedMethodTimer phase_timer(&timing_log_enabled_, "PreparePut",
+                                  "reserve");
+    try {
+      pending_context.items.reserve(flat_keys.size());
+      new_keys.reserve(flat_keys.size());
+    } catch (const std::bad_alloc&) {
+      return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
+    }
   }
 
   auto rollback_new_keys = [&]() {
@@ -190,55 +277,75 @@ Status MetaManager::PreparePut(const std::vector<KeyId>& flat_keys,
     }
   };
 
-  for (std::size_t i = 0; i < flat_keys.size(); ++i) {
-    auto key_it = entries_.find(flat_keys[i]);
-    if (key_it == entries_.end()) {
-      key_it = entries_.emplace(flat_keys[i], KeyEntry{}).first;
-      new_keys.push_back(&key_it->first);
-    }
+  {
+    ScopedMethodTimer phase_timer(&timing_log_enabled_, "PreparePut",
+                                  "index_keys");
+    for (std::size_t i = 0; i < flat_keys.size(); ++i) {
+      auto key_it = entries_.find(flat_keys[i]);
+      if (key_it == entries_.end()) {
+        key_it = entries_.emplace(flat_keys[i], KeyEntry{}).first;
+        new_keys.push_back(&key_it->first);
+      }
 
-    KeyEntry& key_entry = key_it->second;
-    if (key_entry.has_active_record || key_entry.is_pending) {
+      KeyEntry& key_entry = key_it->second;
+      if (key_entry.has_active_record || key_entry.is_pending) {
+        rollback_new_keys();
+        return Error(StatusCode::kAlreadyExists, ErrorTag::kKeyExists);
+      }
+
+      pending_context.items.push_back(PendingPutItem{
+          &key_entry, &key_it->first, SlotRef{slot_classes[i], 0}, lengths[i]});
+    }
+  }
+
+  {
+    ScopedMethodTimer phase_timer(&timing_log_enabled_, "PreparePut",
+                                  "check_capacity");
+    if (short_free_slots_.size() < short_needed ||
+        long_free_slots_.size() < long_needed) {
       rollback_new_keys();
-      return Error(StatusCode::kAlreadyExists, ErrorTag::kKeyExists);
+      return Error(StatusCode::kOutOfMemory, ErrorTag::kOutOfSlots);
     }
-
-    pending_context.items.push_back(PendingPutItem{
-        &key_entry, &key_it->first, SlotRef{slot_classes[i], 0}, lengths[i]});
   }
 
-  if (short_free_slots_.size() < short_needed ||
-      long_free_slots_.size() < long_needed) {
-    rollback_new_keys();
-    return Error(StatusCode::kOutOfMemory, ErrorTag::kOutOfSlots);
-  }
-
-  try {
-    ResizeAccessDesc(flat_keys.size(), put_desc);
-  } catch (const std::bad_alloc&) {
-    rollback_new_keys();
-    return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
-  }
-
-  for (std::size_t i = 0; i < pending_context.items.size(); ++i) {
-    PendingPutItem& item = pending_context.items[i];
-    item.slot = AcquireSlot(item.slot.slot_class);
-    item.key_entry->is_pending = true;
-    FillAccessDescAt(item.key, SlotAddress(item.slot), item.valid_length, i,
-                     put_desc);
-  }
-
-  try {
-    const std::uint64_t ctx_id = next_put_context_id_++;
-    pending_puts_.emplace(ctx_id, std::move(pending_context));
-    put_context->id = ctx_id;
-  } catch (const std::bad_alloc&) {
-    for (const PendingPutItem& item : pending_context.items) {
-      item.key_entry->is_pending = false;
-      ReleaseSlot(item.slot);
+  {
+    ScopedMethodTimer phase_timer(&timing_log_enabled_, "PreparePut",
+                                  "resize_desc");
+    try {
+      ResizeAccessDesc(flat_keys.size(), put_desc);
+    } catch (const std::bad_alloc&) {
+      rollback_new_keys();
+      return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
     }
-    rollback_new_keys();
-    return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
+  }
+
+  {
+    ScopedMethodTimer phase_timer(&timing_log_enabled_, "PreparePut",
+                                  "allocate_slots");
+    for (std::size_t i = 0; i < pending_context.items.size(); ++i) {
+      PendingPutItem& item = pending_context.items[i];
+      item.slot = AcquireSlot(item.slot.slot_class);
+      item.key_entry->is_pending = true;
+      FillAccessDescAt(item.key, SlotAddress(item.slot), item.valid_length, i,
+                       put_desc);
+    }
+  }
+
+  {
+    ScopedMethodTimer phase_timer(&timing_log_enabled_, "PreparePut",
+                                  "publish_context");
+    try {
+      const std::uint64_t ctx_id = next_put_context_id_++;
+      pending_puts_.emplace(ctx_id, std::move(pending_context));
+      put_context->id = ctx_id;
+    } catch (const std::bad_alloc&) {
+      for (const PendingPutItem& item : pending_context.items) {
+        item.key_entry->is_pending = false;
+        ReleaseSlot(item.slot);
+      }
+      rollback_new_keys();
+      return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
+    }
   }
 
   return Status::OK();
@@ -318,11 +425,14 @@ Status MetaManager::LockKeys(const std::vector<KeyId>& flat_keys,
 
   ActiveLockContext active_context;
   std::vector<AddressRecord*> pinned_records;
-  try {
-    active_context.items.reserve(flat_keys.size());
-    pinned_records.reserve(flat_keys.size());
-  } catch (const std::bad_alloc&) {
-    return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
+  {
+    ScopedMethodTimer phase_timer(&timing_log_enabled_, "LockKeys", "reserve");
+    try {
+      active_context.items.reserve(flat_keys.size());
+      pinned_records.reserve(flat_keys.size());
+    } catch (const std::bad_alloc&) {
+      return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
+    }
   }
 
   auto rollback_pins = [&]() {
@@ -331,35 +441,44 @@ Status MetaManager::LockKeys(const std::vector<KeyId>& flat_keys,
     }
   };
 
-  for (const KeyId& key : flat_keys) {
-    auto key_it = entries_.find(key);
-    if (key_it == entries_.end() || !key_it->second.has_active_record) {
-      rollback_pins();
-      return Error(StatusCode::kNotFound, ErrorTag::kKeyMissing);
-    }
+  {
+    ScopedMethodTimer phase_timer(&timing_log_enabled_, "LockKeys",
+                                  "find_and_pin");
+    for (const KeyId& key : flat_keys) {
+      auto key_it = entries_.find(key);
+      if (key_it == entries_.end() || !key_it->second.has_active_record) {
+        rollback_pins();
+        return Error(StatusCode::kNotFound, ErrorTag::kKeyMissing);
+      }
 
-    AddressRecord* record = &key_it->second.active_record;
-    IncrementPinCount(record);
-    pinned_records.push_back(record);
-    active_context.items.push_back(LockedRecordRef{&key_it->first, record});
+      AddressRecord* record = &key_it->second.active_record;
+      IncrementPinCount(record);
+      pinned_records.push_back(record);
+      active_context.items.push_back(LockedRecordRef{&key_it->first, record});
+    }
   }
 
-  const std::uint64_t ctx_id =
-      next_lock_context_id_.fetch_add(1, std::memory_order_relaxed);
-  try {
-    std::unique_lock<std::shared_mutex> context_lock(lock_context_mutex_);
-    auto inserted = lock_contexts_.try_emplace(ctx_id);
-    if (!inserted.second) {
+  {
+    ScopedMethodTimer phase_timer(&timing_log_enabled_, "LockKeys",
+                                  "register_context");
+    const std::uint64_t ctx_id =
+        next_lock_context_id_.fetch_add(1, std::memory_order_relaxed);
+    try {
+      std::unique_lock<std::shared_mutex> context_lock(lock_context_mutex_);
+      auto inserted = lock_contexts_.try_emplace(ctx_id);
+      if (!inserted.second) {
+        rollback_pins();
+        return Error(StatusCode::kInvalidState, ErrorTag::kStateConflict);
+      }
+      inserted.first->second.items.swap(active_context.items);
+    } catch (const std::bad_alloc&) {
       rollback_pins();
-      return Error(StatusCode::kInvalidState, ErrorTag::kStateConflict);
+      return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
     }
-    inserted.first->second.items.swap(active_context.items);
-  } catch (const std::bad_alloc&) {
-    rollback_pins();
-    return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
+
+    lock_context->id = ctx_id;
   }
 
-  lock_context->id = ctx_id;
   return Status::OK();
 }
 
@@ -445,62 +564,86 @@ Status MetaManager::BatchFree(const std::vector<KeyId>& flat_keys) {
     return Error(StatusCode::kNotInitialized, ErrorTag::kRegionMissing);
   }
 
-  std::lock_guard<std::mutex> write_lock(write_mutex_);
+  std::unique_lock<std::mutex> write_lock(write_mutex_, std::defer_lock);
+  {
+    ScopedMethodTimer phase_timer(&timing_log_enabled_, "BatchFree", "lock");
+    write_lock.lock();
+  }
 
   std::vector<KeyId> unique_keys;
   const bool performance_mode =
       performance_mode_enabled_.load(std::memory_order_relaxed);
-  if (performance_mode) {
-    try {
-      unique_keys = flat_keys;
-    } catch (const std::bad_alloc&) {
-      return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
-    }
-  } else {
-    std::unordered_set<std::string_view> batch_seen;
-    try {
-      batch_seen.reserve(flat_keys.size());
-      unique_keys.reserve(flat_keys.size());
-    } catch (const std::bad_alloc&) {
-      return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
-    }
+  {
+    ScopedMethodTimer phase_timer(&timing_log_enabled_, "BatchFree",
+                                  "deduplicate");
+    if (performance_mode) {
+      try {
+        unique_keys = flat_keys;
+      } catch (const std::bad_alloc&) {
+        return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
+      }
+    } else {
+      std::unordered_set<std::string_view> batch_seen;
+      try {
+        batch_seen.reserve(flat_keys.size());
+        unique_keys.reserve(flat_keys.size());
+      } catch (const std::bad_alloc&) {
+        return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
+      }
 
-    for (const KeyId& key : flat_keys) {
-      if (batch_seen.emplace(key).second) {
-        unique_keys.push_back(key);
+      for (const KeyId& key : flat_keys) {
+        if (batch_seen.emplace(key).second) {
+          unique_keys.push_back(key);
+        }
       }
     }
   }
 
   std::vector<SlotRef> slots_to_recycle;
   std::vector<KeyEntry*> entries_to_clear;
-  try {
-    slots_to_recycle.reserve(unique_keys.size());
-    entries_to_clear.reserve(unique_keys.size());
-  } catch (const std::bad_alloc&) {
-    return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
-  }
-
-  for (const KeyId& key : unique_keys) {
-    auto key_it = entries_.find(key);
-    if (key_it == entries_.end() || !key_it->second.has_active_record) {
-      return Error(StatusCode::kNotFound, ErrorTag::kKeyMissing);
+  {
+    ScopedMethodTimer phase_timer(&timing_log_enabled_, "BatchFree",
+                                  "reserve");
+    try {
+      slots_to_recycle.reserve(unique_keys.size());
+      entries_to_clear.reserve(unique_keys.size());
+    } catch (const std::bad_alloc&) {
+      return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
     }
-    if (LoadPinCount(key_it->second.active_record) > 0) {
-      return Error(StatusCode::kBusy, ErrorTag::kKeyBusy);
+  }
+
+  {
+    ScopedMethodTimer phase_timer(&timing_log_enabled_, "BatchFree",
+                                  "validate_keys");
+    for (const KeyId& key : unique_keys) {
+      auto key_it = entries_.find(key);
+      if (key_it == entries_.end() || !key_it->second.has_active_record) {
+        return Error(StatusCode::kNotFound, ErrorTag::kKeyMissing);
+      }
+      if (LoadPinCount(key_it->second.active_record) > 0) {
+        return Error(StatusCode::kBusy, ErrorTag::kKeyBusy);
+      }
+
+      const SlotRef slot = key_it->second.active_record.slot;
+      slots_to_recycle.push_back(slot);
+      entries_to_clear.push_back(&key_it->second);
     }
-
-    const SlotRef slot = key_it->second.active_record.slot;
-    slots_to_recycle.push_back(slot);
-    entries_to_clear.push_back(&key_it->second);
   }
 
-  for (KeyEntry* entry : entries_to_clear) {
-    entry->has_active_record = false;
-    entry->active_record = {};
+  {
+    ScopedMethodTimer phase_timer(&timing_log_enabled_, "BatchFree",
+                                  "clear_entries");
+    for (KeyEntry* entry : entries_to_clear) {
+      entry->has_active_record = false;
+      entry->active_record = {};
+    }
   }
-  for (const SlotRef& slot : slots_to_recycle) {
-    ReleaseSlot(slot);
+  {
+    ScopedMethodTimer phase_timer(&timing_log_enabled_, "BatchFree",
+                                  "release_slots");
+    for (const SlotRef& slot : slots_to_recycle) {
+      ReleaseSlot(slot);
+    }
   }
 
   return Status::OK();
