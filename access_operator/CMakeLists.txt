@@ -8,19 +8,6 @@ target_include_directories(kvaf_access_operator
 
 target_compile_features(kvaf_access_operator INTERFACE cxx_std_17)
 
-option(KVAF_ENABLE_AIV_BATCH_GET
-       "Build the CANN-backed default BatchGet AccessOperator" OFF)
-
-option(KVAF_ENABLE_AIV_BATCH_PUT
-       "Build the CANN-backed Direct-HCCP BatchPut data plane"
-       ${KVAF_ENABLE_AIV_BATCH_GET})
-
-if(KVAF_ENABLE_AIV_BATCH_PUT AND NOT KVAF_ENABLE_AIV_BATCH_GET)
-  message(FATAL_ERROR
-    "KVAF_ENABLE_AIV_BATCH_PUT requires KVAF_ENABLE_AIV_BATCH_GET because "
-    "DefaultAccessOperator is built by the CANN BatchGet integration")
-endif()
-
 if(KVAF_ENABLE_AIV_BATCH_GET)
   add_subdirectory(demo/direct_hccp_session)
   add_subdirectory(demo/aiv_batch_get)
