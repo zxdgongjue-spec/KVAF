@@ -39,6 +39,13 @@ stream 时使用 `torch.npu.current_stream()`。KVAF 不创建、不保存或销
 图 capture、replay 和生命周期仍由上层框架负责。同一 stream 上的后续 Torch/ACL 操作
 自然按序；跨 stream 依赖由调用方建立。
 
+`start_batch_get_profile()` / `stop_batch_get_profile()` 提供可选的稳态 Host 分段
+计时。开启后累计 Tensor view 解析、binding 校验与 request 构造、stream 解析、
+Runtime 校验、Operator 构参、local-buffer acquire/release 和 kernel launch 的
+`steady_clock` 纳秒数；仅在 `stop_batch_get_profile()` 时一次性返回统计，不在热路径
+打印。该功能默认关闭，且不包含 Python 调用前的 pybind 参数派发和调用后的
+`torch.npu.synchronize()`。
+
 Binding 不负责 vLLM 适配。后续只在 Runtime、Meta Manager 和 KV Access Operator 的 C++ 接口稳定后，将需要暴露的类和方法注册到 Python。
 
 CacheOS-vLLM Adaptor 属于 vLLM 侧实现，不放在本目录。

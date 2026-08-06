@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kvaf
 
 from backend import detect_torch_backend
+from batch_get_profile import print_batch_get_profile
 
 
 def pattern(slot: int, block_bytes: int) -> bytes:
@@ -125,6 +126,7 @@ def main() -> int:
     warmup = int(os.environ.get("KVAF_NPU_WARMUP", "1"))
     iterations = int(os.environ.get("KVAF_NPU_ITERATIONS", "5"))
     graph_replays = int(os.environ.get("KVAF_NPU_GRAPH_REPLAYS", "0"))
+    profile_batch_get = os.environ.get("KVAF_PROFILE_BATCH_GET") == "1"
     # Graph and eager measurements always use the same sample plan.
     graph_warmup = warmup
     graph_iterations = iterations
@@ -206,6 +208,7 @@ def main() -> int:
             f"active_percent={active_percent} active_requests={active_requests} "
             f"block_bytes={block_bytes} source_stride={source_stride} "
             f"npu_cores={npu_core_count} jettys_per_core={jettys_per_core} "
+            f"profile_batch_get={int(profile_batch_get)} "
             f"batch_put_backend={'aiv_direct_hccp' if batch_put_kernel else 'acl_d2h_mock'}"
         )
         if graph_replays:
@@ -345,12 +348,27 @@ def main() -> int:
         for _ in range(warmup):
             execute(output_a)
         torch.npu.synchronize()
+        if profile_batch_get:
+            runtime.start_batch_get_profile()
         samples = []
-        for _ in range(iterations):
-            begin = time.perf_counter()
-            execute(output_a)
-            torch.npu.synchronize()
-            samples.append((time.perf_counter() - begin) * 1000.0)
+        submit_samples = []
+        synchronize_samples = []
+        if profile_batch_get:
+            for _ in range(iterations):
+                begin = time.perf_counter()
+                execute(output_a)
+                submitted = time.perf_counter()
+                torch.npu.synchronize()
+                completed = time.perf_counter()
+                samples.append((completed - begin) * 1000.0)
+                submit_samples.append((submitted - begin) * 1000.0)
+                synchronize_samples.append((completed - submitted) * 1000.0)
+        else:
+            for _ in range(iterations):
+                begin = time.perf_counter()
+                execute(output_a)
+                torch.npu.synchronize()
+                samples.append((time.perf_counter() - begin) * 1000.0)
         print("RUNTIME_NPU_PHASE_BEGIN phase=post_perf_validation")
         validate_output(
             tensor_to_bytes(output_a), mask_values, output_indices_values,
@@ -372,6 +390,13 @@ def main() -> int:
             f"p99_ms={percentile(samples, 0.99):.3f} "
             f"useful_GiBps={useful_gibps:.3f}"
         )
+        if profile_batch_get:
+            print_batch_get_profile(
+                runtime.stop_batch_get_profile(),
+                samples,
+                submit_samples,
+                synchronize_samples,
+            )
 
         if graph_replays:
             if not hasattr(kvaf, "AclGraph"):

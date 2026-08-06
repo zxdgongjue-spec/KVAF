@@ -1,5 +1,6 @@
 #include "kvaf/runtime/runtime.h"
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <new>
@@ -240,6 +241,9 @@ Status Runtime::ReleaseAccessTable(const AccessTableHandle& handle) {
 
 Status Runtime::BatchGet(const BatchGetRequest& request,
                          const BatchGetExecutionOptions& execution) {
+  const auto profile_begin = execution.profile == nullptr
+                                 ? std::chrono::steady_clock::time_point{}
+                                 : std::chrono::steady_clock::now();
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
@@ -295,8 +299,27 @@ Status Runtime::BatchGet(const BatchGetRequest& request,
 
   const AccessTableView view{table->addresses.data(), table->lengths.data(),
                              table->valid.data(), table->addresses.size()};
-  return access_operator_.ExecuteBatchGet(
+  const auto operator_begin = execution.profile == nullptr
+                                  ? std::chrono::steady_clock::time_point{}
+                                  : std::chrono::steady_clock::now();
+  Status status = access_operator_.ExecuteBatchGet(
       BatchGetExecRequest{view, &request, execution});
+  if (execution.profile != nullptr) {
+    const auto profile_end = std::chrono::steady_clock::now();
+    execution.profile->runtime_validation_ns +=
+        std::chrono::duration_cast<std::chrono::nanoseconds>(operator_begin -
+                                                             profile_begin)
+            .count();
+    execution.profile->operator_total_ns +=
+        std::chrono::duration_cast<std::chrono::nanoseconds>(profile_end -
+                                                             operator_begin)
+            .count();
+    execution.profile->runtime_total_ns +=
+        std::chrono::duration_cast<std::chrono::nanoseconds>(profile_end -
+                                                             profile_begin)
+            .count();
+  }
+  return status;
 }
 
 Status Runtime::BatchPut(const BatchPutRequest& request,

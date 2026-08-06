@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kvaf
 
 from backend import detect_torch_backend
+from batch_get_profile import print_batch_get_profile
 
 
 AIV_CORES = 32
@@ -79,6 +80,7 @@ def main(batch: int = 16) -> int:
         os.environ.get("KVAF_RUNTIME_PERF_ACTIVE_PERCENT", str(ACTIVE_PERCENT))
     )
     block_bytes = int(os.environ.get("KVAF_RUNTIME_PERF_BLOCK_BYTES", str(BLOCK_BYTES)))
+    profile_batch_get = os.environ.get("KVAF_PROFILE_BATCH_GET") == "1"
     table_capacity = batch * PUT_BATCH_SIZE * 1024
     requests = batch * 2048
     source_stride = block_bytes
@@ -147,6 +149,7 @@ def main(batch: int = 16) -> int:
             f"requests={requests} block_bytes={block_bytes} aiv_cores={npu_core_count} "
             f"jettys_per_core={jettys_per_core} "
             f"active_percent={active_percent} warmup={warmup} iterations={iterations} "
+            f"profile_batch_get={int(profile_batch_get)} "
             "batch_put_backend=aiv_direct_hccp"
         )
 
@@ -226,18 +229,47 @@ def main(batch: int = 16) -> int:
         for index, mask in zip(indices_batches[:warmup], mask_batches[:warmup]):
             runtime.batch_get(device_table, index, mask, output_indices, output)
         torch.npu.synchronize()
+        if profile_batch_get:
+            runtime.start_batch_get_profile()
         batch_get_samples: list[float] = []
-        for index, mask in zip(
-            indices_batches[warmup:], mask_batches[warmup:]
-        ):
-            begin = time.perf_counter()
-            runtime.batch_get(device_table, index, mask, output_indices, output)
-            torch.npu.synchronize()
-            batch_get_samples.append((time.perf_counter() - begin) * 1000.0)
+        batch_get_submit_samples: list[float] = []
+        batch_get_synchronize_samples: list[float] = []
+        measured_inputs = zip(indices_batches[warmup:], mask_batches[warmup:])
+        if profile_batch_get:
+            for index, mask in measured_inputs:
+                begin = time.perf_counter()
+                runtime.batch_get(
+                    device_table, index, mask, output_indices, output
+                )
+                submitted = time.perf_counter()
+                torch.npu.synchronize()
+                completed = time.perf_counter()
+                batch_get_samples.append((completed - begin) * 1000.0)
+                batch_get_submit_samples.append((submitted - begin) * 1000.0)
+                batch_get_synchronize_samples.append(
+                    (completed - submitted) * 1000.0
+                )
+        else:
+            for index, mask in measured_inputs:
+                begin = time.perf_counter()
+                runtime.batch_get(
+                    device_table, index, mask, output_indices, output
+                )
+                torch.npu.synchronize()
+                batch_get_samples.append(
+                    (time.perf_counter() - begin) * 1000.0
+                )
         print_samples(
             "batch_get", batch_get_samples, warmup,
             f"{requests}_requests_per_call"
         )
+        if profile_batch_get:
+            print_batch_get_profile(
+                runtime.stop_batch_get_profile(),
+                batch_get_samples,
+                batch_get_submit_samples,
+                batch_get_synchronize_samples,
+            )
         print("RUNTIME_PERF_PHASE_DONE phase=batch_get")
 
         # The full-table lock must be released before BatchFree can reclaim its

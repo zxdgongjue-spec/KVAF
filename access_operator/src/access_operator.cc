@@ -1,6 +1,7 @@
 #include "kvaf/access_operator/access_operator.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -396,42 +397,105 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
     return InvalidArgument("NPU BatchGet requires a caller-owned ACL stream");
   }
   KvafExecuteBatchGetKernelArgs arguments{};
+  const auto build_begin = exec.execution.profile == nullptr
+                               ? std::chrono::steady_clock::time_point{}
+                               : std::chrono::steady_clock::now();
   Status status = BuildBatchGetKernelArgs(
       exec, impl_->config.npu_core_count, impl_->config.jettys_per_core,
       impl_->execution, &arguments);
+  if (exec.execution.profile != nullptr) {
+    exec.execution.profile->operator_build_args_ns +=
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - build_begin)
+            .count();
+  }
   if (!status.ok()) {
     return status;
   }
 
   KvafBatchGetLocalBuffer* local_buffer = nullptr;
   std::uint64_t channel_entity = 0;
-  if (KvafBatchGetLocalBufferAcquire(impl_->transport,
-                                     reinterpret_cast<void*>(arguments.output),
-                                     exec.request->output.bytes, &local_buffer,
-                                     &channel_entity) != KVAF_BATCH_GET_SUCCESS ||
+  const auto acquire_begin = exec.execution.profile == nullptr
+                                 ? std::chrono::steady_clock::time_point{}
+                                 : std::chrono::steady_clock::now();
+  const int32_t acquire_result = KvafBatchGetLocalBufferAcquire(
+      impl_->transport, reinterpret_cast<void*>(arguments.output),
+      exec.request->output.bytes, &local_buffer, &channel_entity);
+  if (exec.execution.profile != nullptr) {
+    exec.execution.profile->operator_local_buffer_acquire_ns +=
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - acquire_begin)
+            .count();
+  }
+  if (acquire_result != KVAF_BATCH_GET_SUCCESS ||
       local_buffer == nullptr || channel_entity == 0) {
     return Internal("failed to acquire caller output for BatchGet");
   }
   arguments.channel_entity = channel_entity;
 
   const aclrtStream stream = static_cast<aclrtStream>(exec.execution.stream);
+  const auto launch_begin = exec.execution.profile == nullptr
+                                ? std::chrono::steady_clock::time_point{}
+                                : std::chrono::steady_clock::now();
   const int32_t launch_result = KvafExecuteBatchGetLaunch(&arguments, stream);
+  if (exec.execution.profile != nullptr) {
+    exec.execution.profile->operator_kernel_launch_ns +=
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - launch_begin)
+            .count();
+  }
   if (launch_result != KVAF_BATCH_GET_SUCCESS) {
     KvafBatchGetLocalBufferRelease(local_buffer);
     return Internal("failed to launch BatchGet");
   }
   if (exec.execution.synchronize) {
+    const auto synchronize_begin = exec.execution.profile == nullptr
+                                       ? std::chrono::steady_clock::time_point{}
+                                       : std::chrono::steady_clock::now();
     const aclError sync_result = aclrtSynchronizeStream(stream);
+    if (exec.execution.profile != nullptr) {
+      exec.execution.profile->operator_stream_synchronize_ns +=
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - synchronize_begin)
+              .count();
+    }
+    const auto release_begin = exec.execution.profile == nullptr
+                                   ? std::chrono::steady_clock::time_point{}
+                                   : std::chrono::steady_clock::now();
     KvafBatchGetLocalBufferRelease(local_buffer);
+    if (exec.execution.profile != nullptr) {
+      exec.execution.profile->operator_local_buffer_release_ns +=
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - release_begin)
+              .count();
+    }
     if (sync_result != ACL_SUCCESS) {
       return Internal("BatchGet stream synchronization failed");
     }
+    const auto status_begin = exec.execution.profile == nullptr
+                                  ? std::chrono::steady_clock::time_point{}
+                                  : std::chrono::steady_clock::now();
     LogBatchGetDeviceStatus(impl_->execution, impl_->config.npu_core_count);
+    if (exec.execution.profile != nullptr) {
+      exec.execution.profile->operator_status_copy_ns +=
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - status_begin)
+              .count();
+    }
   } else {
     // The demo transport caches zero-reference registrations until shutdown.
     // Releasing after an externally captured launch keeps KVAF graph-agnostic;
     // the caller owns stream completion and tensor lifetime.
+    const auto release_begin = exec.execution.profile == nullptr
+                                   ? std::chrono::steady_clock::time_point{}
+                                   : std::chrono::steady_clock::now();
     KvafBatchGetLocalBufferRelease(local_buffer);
+    if (exec.execution.profile != nullptr) {
+      exec.execution.profile->operator_local_buffer_release_ns +=
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - release_begin)
+              .count();
+    }
   }
   return Status::OK();
 }

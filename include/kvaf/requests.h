@@ -83,6 +83,23 @@ struct BatchFreeRequest {
   std::vector<KeyId> keys;
 };
 
+// Optional cumulative timings for one or more successful NPU BatchGet calls.
+// All fields use host steady-clock nanoseconds. Callers own and zero this
+// storage; Runtime and AccessOperator only add measurements when profile is
+// non-null. Keeping the hook in execution options makes profiling opt-in and
+// avoids logging or clock reads on the normal dataplane path.
+struct BatchGetExecutionProfile {
+  std::uint64_t runtime_total_ns{0};
+  std::uint64_t runtime_validation_ns{0};
+  std::uint64_t operator_total_ns{0};
+  std::uint64_t operator_build_args_ns{0};
+  std::uint64_t operator_local_buffer_acquire_ns{0};
+  std::uint64_t operator_kernel_launch_ns{0};
+  std::uint64_t operator_stream_synchronize_ns{0};
+  std::uint64_t operator_status_copy_ns{0};
+  std::uint64_t operator_local_buffer_release_ns{0};
+};
+
 // 一次 BatchGet 提交使用的调用方 stream。Runtime 不解释 stream 的具体
 // 类型；当前 CANN Adapter 将它解释为 aclrtStream。默认只向 stream enqueue，
 // 不替调用方同步；同一 stream 上的后续 Torch/ACL 操作天然按序执行。跨 stream
@@ -90,6 +107,7 @@ struct BatchFreeRequest {
 struct BatchGetExecutionOptions {
   void* stream{nullptr};
   bool synchronize{false};
+  BatchGetExecutionProfile* profile{nullptr};
 };
 
 // Runtime 向 AccessOperator 提交的 BatchGet 描述。

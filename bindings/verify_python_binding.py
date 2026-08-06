@@ -19,10 +19,12 @@ def main() -> int:
             or not hasattr(kvaf, "DeviceAccessTable")
             or not hasattr(kvaf, "AclGraph")
             or not hasattr(kvaf.NpuRuntime, "batch_free")
+            or not hasattr(kvaf.NpuRuntime, "start_batch_get_profile")
+            or not hasattr(kvaf.NpuRuntime, "stop_batch_get_profile")
         ):
             raise RuntimeError(
                 "KVAF AIV binding does not export NpuRuntime, DeviceAccessTable, "
-                "AclGraph, and NpuRuntime.batch_free"
+                "AclGraph, BatchFree, and BatchGet profiling"
             )
     return 0
 

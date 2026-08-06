@@ -2,6 +2,7 @@
 
 #include <pybind11/stl.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -103,6 +104,151 @@ struct NpuTensorView {
   std::size_t bytes{0};
   std::size_t element_bytes{0};
   std::vector<py::ssize_t> shape;
+};
+
+using ProfileClock = std::chrono::steady_clock;
+
+std::uint64_t ElapsedNs(ProfileClock::time_point begin,
+                        ProfileClock::time_point end) {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin)
+          .count());
+}
+
+std::uint64_t SaturatingSubtract(std::uint64_t total,
+                                 std::uint64_t accounted) {
+  return total > accounted ? total - accounted : 0;
+}
+
+struct BatchGetBindingCallProfile {
+  std::uint64_t binding_total_ns{0};
+  std::uint64_t indices_tensor_ns{0};
+  std::uint64_t mask_tensor_ns{0};
+  std::uint64_t output_indices_tensor_ns{0};
+  std::uint64_t output_tensor_ns{0};
+  std::uint64_t table_addresses_tensor_ns{0};
+  std::uint64_t table_valid_tensor_ns{0};
+  std::uint64_t validate_and_build_request_ns{0};
+  std::uint64_t resolve_stream_ns{0};
+  std::uint64_t runtime_call_ns{0};
+  BatchGetExecutionProfile execution;
+};
+
+struct BatchGetBindingProfile {
+  bool enabled{false};
+  std::uint64_t samples{0};
+  BatchGetBindingCallProfile totals;
+
+  void Start() {
+    *this = BatchGetBindingProfile{};
+    enabled = true;
+  }
+
+  void Add(const BatchGetBindingCallProfile& sample) {
+    ++samples;
+    totals.binding_total_ns += sample.binding_total_ns;
+    totals.indices_tensor_ns += sample.indices_tensor_ns;
+    totals.mask_tensor_ns += sample.mask_tensor_ns;
+    totals.output_indices_tensor_ns += sample.output_indices_tensor_ns;
+    totals.output_tensor_ns += sample.output_tensor_ns;
+    totals.table_addresses_tensor_ns += sample.table_addresses_tensor_ns;
+    totals.table_valid_tensor_ns += sample.table_valid_tensor_ns;
+    totals.validate_and_build_request_ns +=
+        sample.validate_and_build_request_ns;
+    totals.resolve_stream_ns += sample.resolve_stream_ns;
+    totals.runtime_call_ns += sample.runtime_call_ns;
+    totals.execution.runtime_total_ns += sample.execution.runtime_total_ns;
+    totals.execution.runtime_validation_ns +=
+        sample.execution.runtime_validation_ns;
+    totals.execution.operator_total_ns += sample.execution.operator_total_ns;
+    totals.execution.operator_build_args_ns +=
+        sample.execution.operator_build_args_ns;
+    totals.execution.operator_local_buffer_acquire_ns +=
+        sample.execution.operator_local_buffer_acquire_ns;
+    totals.execution.operator_kernel_launch_ns +=
+        sample.execution.operator_kernel_launch_ns;
+    totals.execution.operator_stream_synchronize_ns +=
+        sample.execution.operator_stream_synchronize_ns;
+    totals.execution.operator_status_copy_ns +=
+        sample.execution.operator_status_copy_ns;
+    totals.execution.operator_local_buffer_release_ns +=
+        sample.execution.operator_local_buffer_release_ns;
+  }
+
+  py::dict ToPython() const {
+    py::dict total_ns;
+    py::dict mean_us;
+    const auto add = [&](const char* name, std::uint64_t value) {
+      total_ns[name] = value;
+      mean_us[name] = samples == 0
+                          ? 0.0
+                          : static_cast<double>(value) /
+                                static_cast<double>(samples) / 1000.0;
+    };
+
+    const std::uint64_t tensor_views_ns =
+        totals.indices_tensor_ns + totals.mask_tensor_ns +
+        totals.output_indices_tensor_ns + totals.output_tensor_ns +
+        totals.table_addresses_tensor_ns + totals.table_valid_tensor_ns;
+    const std::uint64_t binding_accounted_ns =
+        tensor_views_ns + totals.validate_and_build_request_ns +
+        totals.resolve_stream_ns + totals.runtime_call_ns;
+    const std::uint64_t runtime_accounted_ns =
+        totals.execution.runtime_validation_ns +
+        totals.execution.operator_total_ns;
+    const std::uint64_t operator_accounted_ns =
+        totals.execution.operator_build_args_ns +
+        totals.execution.operator_local_buffer_acquire_ns +
+        totals.execution.operator_kernel_launch_ns +
+        totals.execution.operator_stream_synchronize_ns +
+        totals.execution.operator_status_copy_ns +
+        totals.execution.operator_local_buffer_release_ns;
+
+    add("binding_total", totals.binding_total_ns);
+    add("binding_tensor_views", tensor_views_ns);
+    add("binding_indices_tensor", totals.indices_tensor_ns);
+    add("binding_mask_tensor", totals.mask_tensor_ns);
+    add("binding_output_indices_tensor", totals.output_indices_tensor_ns);
+    add("binding_output_tensor", totals.output_tensor_ns);
+    add("binding_table_addresses_tensor",
+        totals.table_addresses_tensor_ns);
+    add("binding_table_valid_tensor", totals.table_valid_tensor_ns);
+    add("binding_validate_and_build_request",
+        totals.validate_and_build_request_ns);
+    add("binding_resolve_stream", totals.resolve_stream_ns);
+    add("binding_runtime_call", totals.runtime_call_ns);
+    add("binding_unaccounted",
+        SaturatingSubtract(totals.binding_total_ns, binding_accounted_ns));
+
+    add("runtime_total", totals.execution.runtime_total_ns);
+    add("runtime_validation", totals.execution.runtime_validation_ns);
+    add("runtime_operator", totals.execution.operator_total_ns);
+    add("runtime_unaccounted",
+        SaturatingSubtract(totals.execution.runtime_total_ns,
+                           runtime_accounted_ns));
+
+    add("operator_total", totals.execution.operator_total_ns);
+    add("operator_build_args", totals.execution.operator_build_args_ns);
+    add("operator_local_buffer_acquire",
+        totals.execution.operator_local_buffer_acquire_ns);
+    add("operator_kernel_launch",
+        totals.execution.operator_kernel_launch_ns);
+    add("operator_stream_synchronize",
+        totals.execution.operator_stream_synchronize_ns);
+    add("operator_status_copy", totals.execution.operator_status_copy_ns);
+    add("operator_local_buffer_release",
+        totals.execution.operator_local_buffer_release_ns);
+    add("operator_unaccounted",
+        SaturatingSubtract(totals.execution.operator_total_ns,
+                           operator_accounted_ns));
+
+    py::dict result;
+    result["enabled"] = enabled;
+    result["samples"] = samples;
+    result["total_ns"] = std::move(total_ns);
+    result["mean_us"] = std::move(mean_us);
+    return result;
+  }
 };
 
 NpuTensorView GetNpuTensorView(const py::object& tensor, const char* name) {
@@ -365,6 +511,15 @@ class NpuRuntime final {
     ThrowIfError(runtime_->BatchFree(BatchFreeRequest{std::move(copied_keys)}));
   }
 
+  void StartBatchGetProfile() { batch_get_profile_.Start(); }
+
+  py::dict BatchGetProfile() const { return batch_get_profile_.ToPython(); }
+
+  py::dict StopBatchGetProfile() {
+    batch_get_profile_.enabled = false;
+    return batch_get_profile_.ToPython();
+  }
+
   // Tensor ownership remains with Python. KVAF creates no output Tensor and
   // only retains its internal Direct-HCCP execution state; callers must keep
   // input/output Tensors and the DeviceAccessTable alive until their stream
@@ -373,15 +528,52 @@ class NpuRuntime final {
                 const py::object& indices, const py::object& mask,
                 const py::object& output_indices, const py::object& output,
                 const py::object& stream, bool synchronize) {
+    const bool profiling = batch_get_profile_.enabled;
+    BatchGetBindingCallProfile call_profile;
+    const auto binding_begin = profiling ? ProfileClock::now()
+                                         : ProfileClock::time_point{};
+
+    auto stage_begin = profiling ? ProfileClock::now()
+                                 : ProfileClock::time_point{};
     const NpuTensorView index_view = GetNpuTensorView(indices, "indices");
+    if (profiling) {
+      call_profile.indices_tensor_ns =
+          ElapsedNs(stage_begin, ProfileClock::now());
+      stage_begin = ProfileClock::now();
+    }
     const NpuTensorView mask_view = GetNpuTensorView(mask, "mask");
+    if (profiling) {
+      call_profile.mask_tensor_ns =
+          ElapsedNs(stage_begin, ProfileClock::now());
+      stage_begin = ProfileClock::now();
+    }
     const NpuTensorView output_index_view =
         GetNpuTensorView(output_indices, "output_indices");
+    if (profiling) {
+      call_profile.output_indices_tensor_ns =
+          ElapsedNs(stage_begin, ProfileClock::now());
+      stage_begin = ProfileClock::now();
+    }
     const NpuTensorView output_view = GetNpuTensorView(output, "output");
+    if (profiling) {
+      call_profile.output_tensor_ns =
+          ElapsedNs(stage_begin, ProfileClock::now());
+      stage_begin = ProfileClock::now();
+    }
     const NpuTensorView address_view =
         GetNpuTensorView(access_table.addresses(), "device_access_table.addresses");
+    if (profiling) {
+      call_profile.table_addresses_tensor_ns =
+          ElapsedNs(stage_begin, ProfileClock::now());
+      stage_begin = ProfileClock::now();
+    }
     const NpuTensorView valid_view =
         GetNpuTensorView(access_table.valid(), "device_access_table.valid");
+    if (profiling) {
+      call_profile.table_valid_tensor_ns =
+          ElapsedNs(stage_begin, ProfileClock::now());
+      stage_begin = ProfileClock::now();
+    }
     if (index_view.shape.size() != 1 || mask_view.shape.size() != 1 ||
         output_index_view.shape.size() != 1 || output_view.shape.size() < 2 ||
         index_view.element_bytes != sizeof(std::int32_t) ||
@@ -414,10 +606,29 @@ class NpuRuntime final {
         AccessTableDeviceView{
             ConstBufferView{address_view.data, address_view.bytes, DeviceKind::kNpu},
             ConstBufferView{valid_view.data, valid_view.bytes, DeviceKind::kNpu}}};
+    if (profiling) {
+      call_profile.validate_and_build_request_ns =
+          ElapsedNs(stage_begin, ProfileClock::now());
+      stage_begin = ProfileClock::now();
+    }
     const aclrtStream acl_stream = ResolveStream(stream);
+    if (profiling) {
+      call_profile.resolve_stream_ns =
+          ElapsedNs(stage_begin, ProfileClock::now());
+      stage_begin = ProfileClock::now();
+    }
     ThrowIfError(runtime_->BatchGet(
         request, BatchGetExecutionOptions{acl_stream,
-                                           synchronize}));
+                                           synchronize,
+                                           profiling ? &call_profile.execution
+                                                     : nullptr}));
+    if (profiling) {
+      const auto binding_end = ProfileClock::now();
+      call_profile.runtime_call_ns = ElapsedNs(stage_begin, binding_end);
+      call_profile.binding_total_ns =
+          ElapsedNs(binding_begin, binding_end);
+      batch_get_profile_.Add(call_profile);
+    }
   }
 
   void Shutdown() {
@@ -443,6 +654,7 @@ class NpuRuntime final {
   std::unique_ptr<AclHostDdrAllocator> allocator_;
   std::unique_ptr<DefaultAccessOperator> access_operator_;
   std::unique_ptr<Runtime> runtime_;
+  BatchGetBindingProfile batch_get_profile_;
 };
 
 }  // namespace
@@ -487,6 +699,12 @@ void BindNpuPythonRuntime(py::module_& module) {
            "Release the supplied keys from the Runtime metadata store. keys "
            "accepts a Python key sequence or a contiguous one-dimensional "
            "CPU torch.int64 Tensor.")
+      .def("start_batch_get_profile", &NpuRuntime::StartBatchGetProfile,
+           "Reset and enable cumulative BatchGet host timing.")
+      .def("batch_get_profile", &NpuRuntime::BatchGetProfile,
+           "Return the current cumulative BatchGet host timing snapshot.")
+      .def("stop_batch_get_profile", &NpuRuntime::StopBatchGetProfile,
+           "Disable and return cumulative BatchGet host timing.")
       .def("batch_get", &NpuRuntime::BatchGet,
            py::arg("device_access_table"), py::arg("indices"), py::arg("mask"),
            py::arg("output_indices"), py::arg("output"),

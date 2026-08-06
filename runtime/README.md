@@ -202,6 +202,25 @@ PYTHONPATH="$PWD/build-aiv/python" \
 timeout 1800s python3 tests/python/test_npu_runtime_perf.py
 ```
 
+需要拆解 Python/pybind/Runtime/Operator 的 BatchGet Host 开销时，增加：
+
+```bash
+KVAF_PROFILE_BATCH_GET=1 \
+KVAF_RUN_NPU_TESTS=1 \
+KVAF_AIV_BATCH_GET_KERNEL="$PWD/build-aiv/bin/kvaf_execute_batch_get_kernels.o" \
+KVAF_BATCH_PUT_KERNEL="$PWD/build-aiv/bin/kvaf_execute_batch_put_kernels.o" \
+DEVICE_ID=0 \
+PYTHONPATH="$PWD/build-aiv/python" \
+timeout 1800s python3 tests/python/test_npu_runtime_perf.py
+```
+
+输出的 `BATCH_GET_PROFILE` 按 `python`、`binding`、`tensor_views`、`runtime`
+和 `operator` 分层报告每次调用的平均微秒数。`python.submit_us` 覆盖 Python
+调用到 pybind 返回，`python.synchronize_us` 是外部 `torch.npu.synchronize()`；
+`pybind_boundary_us` 是 submit 时间减去 C++ binding 函数内部计时后的边界残差。
+分段计时会额外读取 host `steady_clock`，因此与未开启 profile 的基准结果
+并排使用：前者用于定位，后者作为最终性能数据。
+
 默认 `batch=16`，即全表 2,097,152 key、每次 BatchGet 32,768 requests、`block_bytes=576`、
 32 个 AIV core、每 core 2 个 Jetty、3 次 warmup 与 1000 个样本。可用
 `KVAF_RUNTIME_PERF_BATCH`、
