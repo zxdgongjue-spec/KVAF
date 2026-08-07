@@ -15,27 +15,25 @@
 
 namespace kvaf {
 
-// Writes and reads are executed in separate phases. Multiple read requests
-// may run concurrently, but writes must not overlap with Lock/Lookup/Unlock.
+// 写入和读取处于不同阶段。多个读请求可以并发执行，但写入不能与
+// Lock/Lookup/Unlock 阶段重叠。
 enum class MetaManagerLockMode {
   kStableReadAllowAppend = 0,
 };
 
-// PreparePut returns a write transaction handle that must later be committed
-// or aborted.
+// PreparePut 返回一个写事务句柄，后续必须提交或中止该事务。
 struct PutContext {
   std::uint64_t id{0};
 };
 
-// LockKeys returns a global read-snapshot handle. It does not scan or pin
-// individual keys; the handle must later be used for lookup and unlock.
+// LockKeys 返回全局读快照句柄。它不会扫描或固定单个 key，后续需要使用该句柄
+// 执行查询和解锁。
 struct LockContext {
   std::uint64_t id{0};
 };
 
-// PreparePut / BatchLookup share one batched return layout. All vectors use
-// the same index to describe the same key record. keys are borrowed pointers
-// into the corresponding input batch.
+// PreparePut / BatchLookup 共用批量返回布局。所有 vector 使用相同下标描述同一条
+// key 记录，keys 中的指针借用对应输入批次中的字符串。
 struct AccessDesc {
   std::vector<const KeyId*> keys;
   std::vector<Address> addresses;
@@ -61,8 +59,7 @@ class MetaManager {
   Status LockKeys(const std::vector<KeyId>& flat_keys,
                   MetaManagerLockMode lock_mode,
                   LockContext* lock_context);
-  // BatchLookup performs the actual KeyId -> address lookups while the global
-  // read snapshot remains held by lock_context.
+  // BatchLookup 在 lock_context 持有全局读快照期间，执行 KeyId 到地址的实际查询。
   Status BatchLookup(const std::vector<KeyId>& flat_keys,
                      const LockContext& lock_context,
                      FlatAccessDesc* access_desc);
@@ -83,8 +80,7 @@ class MetaManager {
     kLong,
   };
 
-  // Internally a slot is tracked by class and index. The UBA is derived only
-  // when an external address must be returned.
+  // 内部只记录 slot 类别和索引，只有需要返回外部地址时才计算 UBA。
   struct SlotRef {
     SlotClass slot_class{SlotClass::kShort};
     std::size_t slot_index{0};
@@ -109,7 +105,7 @@ class MetaManager {
   };
 
   struct ActiveLockContext {
-    // Keeps the whole key-to-address table stable until UnlockKeys.
+    // 在 UnlockKeys 前保持完整的 key 到地址表稳定。
     std::shared_lock<std::shared_mutex> read_phase_lock;
   };
 
@@ -127,29 +123,26 @@ class MetaManager {
   std::atomic<RegionState> region_state_{RegionState::kUninitialized};
   RemoteRegionDesc region_;
 
-  // Write operations are serialized here. The caller must keep put operations
-  // separate from the read phase, so read methods do not lock entries_.
+  // 写操作在这里串行化。调用方必须将 put 操作与读阶段分离，因此读方法不锁定
+  // entries_。
   std::mutex write_mutex_;
   std::queue<std::size_t> short_free_slots_;
   std::queue<std::size_t> long_free_slots_;
 
-  // EntryIndex stores the address metadata directly in the open-addressed
-  // bucket. KeyId storage is append-only and separate only because strings
-  // need stable addresses while buckets are rehashed.
+  // EntryIndex 将地址元数据直接存储在开放寻址桶中。KeyId 单独追加保存，是因为
+  // 桶重哈希时仍需要保持字符串地址稳定。
   struct EntryIndex;
   std::unique_ptr<EntryIndex> entries_;
 
-  // Large BatchLookup calls reuse a small worker group instead of creating
-  // and joining threads for every request.
+  // 大批量 BatchLookup 复用少量 worker，避免每次请求都创建和回收线程。
   class LookupWorkerPool;
   std::unique_ptr<LookupWorkerPool> lookup_workers_;
 
   std::unordered_map<std::uint64_t, PendingPutContext> pending_puts_;
   std::uint64_t next_put_context_id_{1};
 
-  // LockKeys holds a shared lease for the lifetime of each read snapshot.
-  // BatchFree takes the exclusive side before clearing records and recycling
-  // slots.
+  // LockKeys 在读快照整个生命周期内持有共享租约。BatchFree 清理记录和回收 slot
+  // 前需要获取排他侧。
   mutable std::shared_mutex read_phase_mutex_;
   mutable std::shared_mutex lock_context_mutex_;
   std::unordered_map<std::uint64_t, ActiveLockContext> lock_contexts_;
@@ -161,8 +154,7 @@ class MetaManager {
 
 std::unique_ptr<MetaManager> CreateInMemoryMetaManager();
 
-// Flushes aggregated method/phase timing collected while timing logging is
-// enabled. Output is written to stderr and the collected samples are cleared.
+// 输出计时日志开启期间收集的方法/阶段汇总，并清空已收集的样本。
 void FlushMetaManagerTimingSummary();
 
 }  // namespace kvaf

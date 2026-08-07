@@ -162,9 +162,11 @@ class ScopedMethodTimer {
   std::chrono::steady_clock::time_point start_;
 };
 
-}  // namespace
+}  // 匿名命名空间
 
 struct MetaManager::EntryIndex {
+  // control_ 保存已占用桶的指纹。已释放记录仍保持占用状态，保证探测链
+  // 不会被截断，同时也禁止同一个 KeyId 被复用。
   struct Bucket {
     std::size_t hash{0};
     const KeyId* key{nullptr};
@@ -202,32 +204,19 @@ struct MetaManager::EntryIndex {
   }
 
   Bucket* Find(const KeyId& key) {
-    const std::size_t hash = std::hash<KeyId>{}(key);
-    return FindWithHash(key, hash);
+    return FindByHash(std::hash<KeyId>{}(key),
+                      [&key](const Bucket& candidate) {
+                        return *candidate.key == key;
+                      });
   }
 
   Bucket* FindStored(const KeyId* key, std::size_t hash) {
-    if (key == nullptr || buckets_.empty()) {
+    if (key == nullptr) {
       return nullptr;
     }
-
-    const std::uint8_t fingerprint = Fingerprint(hash);
-    const std::size_t mask = buckets_.size() - 1;
-    std::size_t bucket = hash & mask;
-    for (std::size_t probes = 0; probes < buckets_.size(); ++probes) {
-      const std::uint8_t control = control_[bucket];
-      if (control == kEmptyControl) {
-        return nullptr;
-      }
-      if (control == fingerprint) {
-        Bucket& candidate = buckets_[bucket];
-        if (candidate.hash == hash && candidate.key == key) {
-          return &candidate;
-        }
-      }
-      bucket = (bucket + 1) & mask;
-    }
-    return nullptr;
+    return FindByHash(hash, [key](const Bucket& candidate) {
+      return candidate.key == key;
+    });
   }
 
   template <typename Consumer>
@@ -245,13 +234,13 @@ struct MetaManager::EntryIndex {
       return false;
     }
 
+    // 交错探测四个 key，隐藏部分哈希表加载延迟，同时保持输入输出顺序不变。
     struct Lane {
       std::size_t hash{0};
       std::size_t bucket{0};
       std::size_t probes{0};
       std::uint8_t fingerprint{0};
       Bucket* result{nullptr};
-      bool done{false};
     };
 
     constexpr std::size_t kLaneCount = 4;
@@ -272,7 +261,7 @@ struct MetaManager::EntryIndex {
       while (remaining != 0) {
         for (std::size_t lane = 0; lane < lane_count; ++lane) {
           Lane& current = lanes[lane];
-          if (current.done) {
+          if (current.result != nullptr) {
             continue;
           }
 
@@ -285,7 +274,6 @@ struct MetaManager::EntryIndex {
             if (candidate.hash == current.hash &&
                 *candidate.key == keys[base + lane]) {
               current.result = &candidate;
-              current.done = true;
               --remaining;
               continue;
             }
@@ -306,13 +294,8 @@ struct MetaManager::EntryIndex {
     return true;
   }
 
-  template <typename Consumer>
-  bool FindBatch(const std::vector<KeyId>& keys, Consumer&& consumer) {
-    return FindBatchRange(keys, 0, keys.size(),
-                          std::forward<Consumer>(consumer));
-  }
-
   InsertResult TryEmplace(const KeyId& key) {
+    // 已释放记录不会被删除，哈希表只增长和重哈希，查询仍可在第一个空桶处结束。
     if (buckets_.empty()) {
       Reserve(8);
     }
@@ -346,7 +329,10 @@ struct MetaManager::EntryIndex {
   }
 
  private:
-  Bucket* FindWithHash(const KeyId& key, std::size_t hash) {
+  // 开放寻址让桶连续存储。调用方传入最终的 key 比较方式：
+  // 回滚路径已经持有稳定指针，普通查询则需要比较字符串内容。
+  template <typename Match>
+  Bucket* FindByHash(std::size_t hash, Match&& match) {
     if (buckets_.empty()) {
       return nullptr;
     }
@@ -361,7 +347,7 @@ struct MetaManager::EntryIndex {
       }
       if (control == fingerprint) {
         Bucket& candidate = buckets_[bucket];
-        if (candidate.hash == hash && *candidate.key == key) {
+        if (candidate.hash == hash && match(candidate)) {
           return &candidate;
         }
       }
@@ -378,6 +364,7 @@ struct MetaManager::EntryIndex {
   }
 
   void Rehash(std::size_t capacity) {
+    // 只重建探测表。keys_ 使用 deque，重排桶位置不会改变已保存 key 的地址。
     std::vector<Bucket> new_buckets(capacity);
     std::vector<std::uint8_t> new_control(capacity, kEmptyControl);
     const std::size_t mask = capacity - 1;
@@ -406,26 +393,21 @@ struct MetaManager::EntryIndex {
   std::size_t size_{0};
 };
 
+// 大批量查询复用少量 worker。每次 Run 调用在栈上创建一个 Job，排队任务只
+// 借用该 Job，直到 Run 等待所有任务完成后才返回。
 class MetaManager::LookupWorkerPool {
  public:
   using RangeFunction =
       std::function<bool(std::size_t begin, std::size_t end)>;
 
   enum class RunResult {
-    kSuccess = 0,
+    kRunning = 0,
+    kSuccess,
     kLookupFailed,
     kResourceFailure,
   };
 
-  LookupWorkerPool()
-      : worker_limit_([]() {
-          constexpr std::size_t kMaxWorkers = 4;
-          const std::size_t hardware_threads =
-              std::thread::hardware_concurrency();
-          return hardware_threads == 0
-                     ? kMaxWorkers
-                     : std::min(kMaxWorkers, hardware_threads);
-        }()) {}
+  LookupWorkerPool() : worker_limit_(DetectWorkerLimit()) {}
 
   ~LookupWorkerPool() {
     {
@@ -443,150 +425,151 @@ class MetaManager::LookupWorkerPool {
   RunResult Run(std::size_t key_count,
                 std::size_t keys_per_worker,
                 const RangeFunction& range_function) {
-    if (key_count == 0) {
-      return RunResult::kSuccess;
-    }
-    if (keys_per_worker == 0 || worker_limit_ <= 1) {
-      return range_function(0, key_count) ? RunResult::kSuccess
-                                          : RunResult::kLookupFailed;
-    }
-
+    // 这里只处理 BatchLookup 已筛选出的超大批次，调用方保证
+    // key_count > keys_per_worker > 0。
     const std::size_t task_count =
         (key_count + keys_per_worker - 1) / keys_per_worker;
-    if (task_count <= 1) {
-      return range_function(0, key_count) ? RunResult::kSuccess
-                                          : RunResult::kLookupFailed;
-    }
 
-    const std::size_t requested_workers =
-        std::min(worker_limit_, task_count);
-    const std::size_t requested_background_workers =
-        requested_workers > 1 ? requested_workers - 1 : 0;
+    const std::size_t worker_count = std::min(worker_limit_, task_count);
     const std::size_t background_workers =
-        EnsureWorkers(requested_background_workers);
+        EnsureWorkers(worker_count - 1);
     if (background_workers == 0) {
       return range_function(0, key_count) ? RunResult::kSuccess
                                           : RunResult::kLookupFailed;
     }
 
-    std::shared_ptr<Completion> completion;
-    try {
-      completion = std::make_shared<Completion>(task_count);
-    } catch (const std::bad_alloc&) {
-      return RunResult::kResourceFailure;
-    }
-    std::size_t queued_tasks = 0;
-    bool resource_failure = false;
+    // 调用线程直接处理最后一个分片，既减少一个后台线程，也避免调用线程空等。
+    Job job{&range_function, task_count};
+    std::size_t queued_count = 0;
+    bool enqueue_failed = false;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (stopping_) {
-        resource_failure = true;
+        enqueue_failed = true;
       } else {
         try {
           for (std::size_t task = 0; task + 1 < task_count; ++task) {
             const std::size_t begin = task * keys_per_worker;
             const std::size_t end =
                 std::min(key_count, begin + keys_per_worker);
-            tasks_.push_back(
-                Task{begin, end, &range_function, completion});
-            ++queued_tasks;
+            tasks_.push_back(Task{begin, end, &job});
+            ++queued_count;
           }
-        } catch (const std::bad_alloc&) {
-          resource_failure = true;
-        } catch (const std::system_error&) {
-          resource_failure = true;
+        } catch (...) {
+          enqueue_failed = true;
         }
       }
 
-      if (resource_failure) {
-        completion->resource_failure.store(true, std::memory_order_relaxed);
-        completion->Skip((task_count - 1) - queued_tasks);
+      if (enqueue_failed) {
+        job.FailResource();
+        job.Skip((task_count - 1) - queued_count);
       }
     }
     for (std::size_t i = 0;
-         i < std::min(queued_tasks, background_workers); ++i) {
+         i < std::min(queued_count, background_workers); ++i) {
       condition_.notify_one();
     }
 
     const std::size_t caller_begin = (task_count - 1) * keys_per_worker;
-    const std::size_t caller_end = key_count;
-    try {
-      if (!completion->resource_failure.load(std::memory_order_relaxed) &&
-          !completion->lookup_failed.load(std::memory_order_relaxed) &&
-          !range_function(caller_begin, caller_end)) {
-        completion->lookup_failed.store(true, std::memory_order_relaxed);
-      }
-    } catch (const std::bad_alloc&) {
-      completion->resource_failure.store(true, std::memory_order_relaxed);
-    } catch (const std::system_error&) {
-      completion->resource_failure.store(true, std::memory_order_relaxed);
-    } catch (...) {
-      completion->resource_failure.store(true, std::memory_order_relaxed);
-    }
-    completion->Complete();
+    Execute(Task{caller_begin, key_count, &job});
+    job.Wait();
 
-    std::unique_lock<std::mutex> completion_lock(completion->mutex);
-    completion->condition.wait(completion_lock, [&completion]() {
-      return completion->remaining.load(std::memory_order_acquire) == 0;
-    });
-
-    if (completion->resource_failure.load(std::memory_order_relaxed)) {
-      return RunResult::kResourceFailure;
-    }
-    if (completion->lookup_failed.load(std::memory_order_relaxed)) {
-      return RunResult::kLookupFailed;
-    }
-    return RunResult::kSuccess;
+    const RunResult result = job.status.load(std::memory_order_relaxed);
+    return result == RunResult::kRunning ? RunResult::kSuccess : result;
   }
 
  private:
-  struct Completion {
-    explicit Completion(std::size_t task_count)
-        : remaining(task_count) {}
+  static constexpr std::size_t kMaxWorkers = 4;
 
-    void Complete() {
+  // Job 位于 Run 调用方的栈上。只有确认所有排队分片完成后，Run 才会返回。
+  struct Job {
+    Job(const RangeFunction* function, std::size_t task_count)
+        : function(function), remaining(task_count) {}
+
+    void CompleteOne() {
       if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        condition.notify_one();
+        done.notify_one();
       }
+    }
+
+    void FailLookup() {
+      RunResult expected = RunResult::kRunning;
+      status.compare_exchange_strong(expected, RunResult::kLookupFailed,
+                                     std::memory_order_relaxed);
+    }
+
+    void FailResource() {
+      // 资源失败优先级高于普通的 key 缺失，避免错误被覆盖。
+      status.store(RunResult::kResourceFailure, std::memory_order_relaxed);
     }
 
     void Skip(std::size_t task_count) {
       if (task_count != 0 &&
           remaining.fetch_sub(task_count, std::memory_order_acq_rel) ==
               task_count) {
-        condition.notify_one();
+        done.notify_one();
       }
     }
 
+    void Wait() {
+      std::unique_lock<std::mutex> lock(mutex);
+      done.wait(lock, [this]() {
+        return remaining.load(std::memory_order_acquire) == 0;
+      });
+    }
+
+    const RangeFunction* function;
     std::atomic<std::size_t> remaining{0};
-    std::atomic<bool> lookup_failed{false};
-    std::atomic<bool> resource_failure{false};
+    std::atomic<RunResult> status{RunResult::kRunning};
     std::mutex mutex;
-    std::condition_variable condition;
+    std::condition_variable done;
   };
 
   struct Task {
     std::size_t begin{0};
     std::size_t end{0};
-    const RangeFunction* range_function{nullptr};
-    std::shared_ptr<Completion> completion;
+    Job* job{nullptr};
   };
+
+  static std::size_t DetectWorkerLimit() {
+    const std::size_t hardware_threads =
+        std::thread::hardware_concurrency();
+    return hardware_threads == 0
+               ? kMaxWorkers
+               : std::min(kMaxWorkers, hardware_threads);
+  }
 
   std::size_t EnsureWorkers(std::size_t requested_workers) {
     std::lock_guard<std::mutex> lock(mutex_);
     while (!stopping_ && workers_.size() < requested_workers) {
       try {
         workers_.emplace_back([this]() { WorkerLoop(); });
-      } catch (const std::bad_alloc&) {
-        break;
-      } catch (const std::system_error&) {
+      } catch (...) {
+        // worker 创建失败时仍可由调用线程串行完成查询。
         break;
       }
     }
     return workers_.size();
   }
 
+  static void Execute(const Task& task) {
+    Job& job = *task.job;
+    try {
+      if (job.status.load(std::memory_order_relaxed) ==
+              RunResult::kRunning &&
+          !(*job.function)(task.begin, task.end)) {
+        job.FailLookup();
+      }
+    } catch (...) {
+      // FindBatchRange 正常不会分配内存。异常时标记资源失败，但必须完成
+      // 计数，避免调用线程永久等待。
+      job.FailResource();
+    }
+    job.CompleteOne();
+  }
+
   void WorkerLoop() {
+    // worker 只在取任务时持有队列锁，哈希探测和结果写入都在锁外执行。
     for (;;) {
       Task task;
       {
@@ -600,30 +583,11 @@ class MetaManager::LookupWorkerPool {
         task = std::move(tasks_.front());
         tasks_.pop_front();
       }
-
-      try {
-        if (!task.completion->resource_failure.load(
-                std::memory_order_relaxed) &&
-            !task.completion->lookup_failed.load(std::memory_order_relaxed) &&
-            !(*task.range_function)(task.begin, task.end)) {
-          task.completion->lookup_failed.store(true,
-                                               std::memory_order_relaxed);
-        }
-      } catch (const std::bad_alloc&) {
-        task.completion->resource_failure.store(true,
-                                                 std::memory_order_relaxed);
-      } catch (const std::system_error&) {
-        task.completion->resource_failure.store(true,
-                                                 std::memory_order_relaxed);
-      } catch (...) {
-        task.completion->resource_failure.store(true,
-                                                 std::memory_order_relaxed);
-      }
-      task.completion->Complete();
+      Execute(task);
     }
   }
 
-  const std::size_t worker_limit_{1};
+  const std::size_t worker_limit_;
   std::mutex mutex_;
   std::condition_variable condition_;
   std::deque<Task> tasks_;
@@ -970,8 +934,8 @@ Status MetaManager::LockKeys(const std::vector<KeyId>& flat_keys,
 Status MetaManager::BatchLookup(const std::vector<KeyId>& flat_keys,
                                 const LockContext&,
                                 FlatAccessDesc* access_desc) {
-  // The phase contract keeps the LockContext alive and prevents UnlockKeys
-  // from running concurrently, so the hot path does not revalidate it.
+  // 阶段协议保证 LockContext 在查询期间有效，并阻止 UnlockKeys 并发执行，
+  // 因此热路径不再重复校验上下文。
   ScopedMethodTimer timer(&timing_log_enabled_, "BatchLookup");
   if (access_desc == nullptr) {
     return Error(StatusCode::kInvalidArgument, ErrorTag::kInvalidRequest);
@@ -1055,8 +1019,7 @@ Status MetaManager::UnlockKeys(const LockContext& lock_context) {
     return Error(StatusCode::kInvalidState, ErrorTag::kStateConflict);
   }
 
-  // Erasing the context releases its read lease after the context is removed
-  // from the lookup table, so BatchLookup cannot observe a reclaimed context.
+  // 先从上下文表移除记录，再释放读租约，保证 BatchLookup 不会观察到已回收的上下文。
   lock_contexts_.erase(context_it);
   return Status::OK();
 }
@@ -1094,8 +1057,7 @@ Status MetaManager::BatchFree(const std::vector<KeyId>& flat_keys) {
     ScopedMethodTimer phase_timer(&timing_log_enabled_, "BatchFree",
                                   "deduplicate");
     if (performance_mode) {
-      // Performance mode already skips duplicate-key validation, so avoid
-      // copying the input strings before the lookup pass.
+      // 性能模式已经跳过批内重复 key 校验，因此不需要在查询前复制输入字符串。
     } else {
       std::unordered_set<std::string_view> batch_seen;
       try {
