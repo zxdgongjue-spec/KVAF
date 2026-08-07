@@ -122,6 +122,7 @@ KVAF_AIV_BATCH_GET_KERNEL="$PWD/build-aiv/bin/kvaf_execute_batch_get_kernels.o" 
 DEVICE_ID=0 \
 PYTHONPATH="$PWD/build-aiv/python" \
 KVAF_NPU_ACTIVE_PERCENT=5 \
+KVAF_NPU_JETTYS_PER_CORE=2 \
 timeout 240s python3 tests/python/test_npu_batch_get.py
 ```
 
@@ -131,6 +132,8 @@ teardown。它以 `KVAF_NPU_ACTIVE_PERCENT` 构造稀疏 mask（例如 `5` 表�
 有效），只为 `mask=1` 的请求写入 KV；随后可用 Runtime 的 ACL D2H mock
 `batch_put` 将 caller-owned NPU source Tensor 写入 Runtime-owned DDR。该小型
 BatchGet 用例不传 BatchPut kernel，因而不启动 Direct-HCCP BatchPut transport。
+每个 AIV core 默认使用 2 个 Jetty；可通过 `KVAF_NPU_JETTYS_PER_CORE=1` 切换为
+单 Jetty 验证。
 
 设置 `KVAF_NPU_GRAPH_REPLAYS` 可在同一个 Python 用例中额外运行 Python-owned 的
 raw `kvaf.AclGraph` 图模式：
@@ -200,10 +203,12 @@ timeout 1800s python3 tests/python/test_npu_runtime_perf.py
 ```
 
 默认 `batch=16`，即全表 2,097,152 key、每次 BatchGet 32,768 requests、`block_bytes=576`、
-32 个 AIV core、3 次 warmup 与 1000 个样本。可用 `KVAF_RUNTIME_PERF_BATCH`、
+32 个 AIV core、每 core 2 个 Jetty、3 次 warmup 与 1000 个样本。可用
+`KVAF_RUNTIME_PERF_BATCH`、
 `KVAF_RUNTIME_PERF_AIV_CORES`、`KVAF_RUNTIME_PERF_WARMUP`、
 `KVAF_RUNTIME_PERF_ITERATIONS`、`KVAF_RUNTIME_PERF_ACTIVE_PERCENT` 和
-`KVAF_RUNTIME_PERF_BLOCK_BYTES` 覆盖。全量 data population 会写入 2,097,152 个
+`KVAF_RUNTIME_PERF_BLOCK_BYTES` 覆盖；Jetty 数量可通过
+`KVAF_RUNTIME_PERF_JETTYS_PER_CORE` 覆盖。全量 data population 会写入 2,097,152 个
 逻辑 KV block；脚本显式配置 AIV Direct-HCCP BatchPut kernel，BatchPut 性能样本
 测量 Runtime metadata upload、AIV WRITE 及其 caller-stream 完成，不包含全量数据
 填充。

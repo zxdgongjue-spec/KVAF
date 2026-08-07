@@ -195,11 +195,15 @@ class NpuRuntime final {
  public:
   NpuRuntime(std::string batch_get_kernel_object_path, std::uint32_t device_id,
              std::uint32_t npu_core_count,
-             std::string batch_put_kernel_object_path)
+             std::string batch_put_kernel_object_path,
+             std::uint32_t jettys_per_core)
       : device_id_(device_id), npu_core_count_(npu_core_count),
+        jettys_per_core_(jettys_per_core),
         meta_manager_(CreateInMemoryMetaManager()) {
     if (batch_get_kernel_object_path.empty() || npu_core_count == 0 ||
-        npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES) {
+        npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
+        jettys_per_core == 0 ||
+        jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE) {
       throw py::value_error("invalid NPU Runtime configuration");
     }
 
@@ -213,7 +217,7 @@ class NpuRuntime final {
     access_operator_ = std::make_unique<DefaultAccessOperator>(
         AccessOperatorConfig{std::move(batch_get_kernel_object_path),
                              std::move(batch_put_kernel_object_path),
-                             npu_core_count_});
+                             npu_core_count_, jettys_per_core_});
     runtime_ = std::make_unique<Runtime>(*meta_manager_, *access_operator_,
                                          *allocator_);
   }
@@ -241,6 +245,7 @@ class NpuRuntime final {
 
   std::uint32_t DeviceId() const { return device_id_; }
   std::uint32_t NpuCoreCount() const { return npu_core_count_; }
+  std::uint32_t JettysPerCore() const { return jettys_per_core_; }
 
   py::dict RemoteRegion() const {
     const RemoteRegionDesc& region = runtime_->remote_region();
@@ -434,6 +439,7 @@ class NpuRuntime final {
 
   std::uint32_t device_id_{0};
   std::uint32_t npu_core_count_{0};
+  std::uint32_t jettys_per_core_{2};
   std::unique_ptr<MetaManager> meta_manager_;
   std::unique_ptr<AclHostDdrAllocator> allocator_;
   std::unique_ptr<DefaultAccessOperator> access_operator_;
@@ -451,7 +457,8 @@ void BindNpuPythonRuntime(py::module_& module) {
       });
 
   py::class_<NpuRuntime>(module, "NpuRuntime")
-      .def(py::init<std::string, std::uint32_t, std::uint32_t, std::string>(),
+      .def(py::init<std::string, std::uint32_t, std::uint32_t, std::string,
+                    std::uint32_t>(),
            py::arg("batch_get_kernel_object_path"), py::arg("device_id") = 0,
            py::arg("npu_core_count") = 1,
            py::arg("batch_put_kernel_object_path") = "")
@@ -462,6 +469,7 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def_property_readonly("initialized", &NpuRuntime::Initialized)
       .def_property_readonly("device_id", &NpuRuntime::DeviceId)
       .def_property_readonly("npu_core_count", &NpuRuntime::NpuCoreCount)
+      .def_property_readonly("jettys_per_core", &NpuRuntime::JettysPerCore)
       .def_property_readonly("remote_region", &NpuRuntime::RemoteRegion)
       .def("batch_put", &NpuRuntime::BatchPut, py::arg("keys"),
            py::arg("source"), py::arg("input_offsets"), py::arg("lengths"),
