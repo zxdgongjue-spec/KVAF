@@ -139,6 +139,11 @@ class MetaManager {
   struct EntryIndex;
   std::unique_ptr<EntryIndex> entries_;
 
+  // Large BatchLookup calls reuse a small worker group instead of creating
+  // and joining threads for every request.
+  class LookupWorkerPool;
+  std::unique_ptr<LookupWorkerPool> lookup_workers_;
+
   std::unordered_map<std::uint64_t, PendingPutContext> pending_puts_;
   std::uint64_t next_put_context_id_{1};
 

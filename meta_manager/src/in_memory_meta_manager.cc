@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <functional>
 #include <iostream>
@@ -405,8 +406,234 @@ struct MetaManager::EntryIndex {
   std::size_t size_{0};
 };
 
+class MetaManager::LookupWorkerPool {
+ public:
+  using RangeFunction =
+      std::function<bool(std::size_t begin, std::size_t end)>;
+
+  enum class RunResult {
+    kSuccess = 0,
+    kLookupFailed,
+    kResourceFailure,
+  };
+
+  LookupWorkerPool()
+      : worker_limit_([]() {
+          constexpr std::size_t kMaxWorkers = 4;
+          const std::size_t hardware_threads =
+              std::thread::hardware_concurrency();
+          return hardware_threads == 0
+                     ? kMaxWorkers
+                     : std::min(kMaxWorkers, hardware_threads);
+        }()) {}
+
+  ~LookupWorkerPool() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+    }
+    condition_.notify_all();
+    for (std::thread& worker : workers_) {
+      if (worker.joinable()) {
+        worker.join();
+      }
+    }
+  }
+
+  RunResult Run(std::size_t key_count,
+                std::size_t keys_per_worker,
+                const RangeFunction& range_function) {
+    if (key_count == 0) {
+      return RunResult::kSuccess;
+    }
+    if (keys_per_worker == 0 || worker_limit_ <= 1) {
+      return range_function(0, key_count) ? RunResult::kSuccess
+                                          : RunResult::kLookupFailed;
+    }
+
+    const std::size_t task_count =
+        (key_count + keys_per_worker - 1) / keys_per_worker;
+    if (task_count <= 1) {
+      return range_function(0, key_count) ? RunResult::kSuccess
+                                          : RunResult::kLookupFailed;
+    }
+
+    const std::size_t requested_workers =
+        std::min(worker_limit_, task_count);
+    const std::size_t requested_background_workers =
+        requested_workers > 1 ? requested_workers - 1 : 0;
+    const std::size_t background_workers =
+        EnsureWorkers(requested_background_workers);
+    if (background_workers == 0) {
+      return range_function(0, key_count) ? RunResult::kSuccess
+                                          : RunResult::kLookupFailed;
+    }
+
+    std::shared_ptr<Completion> completion;
+    try {
+      completion = std::make_shared<Completion>(task_count);
+    } catch (const std::bad_alloc&) {
+      return RunResult::kResourceFailure;
+    }
+    std::size_t queued_tasks = 0;
+    bool resource_failure = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (stopping_) {
+        resource_failure = true;
+      } else {
+        try {
+          for (std::size_t task = 0; task + 1 < task_count; ++task) {
+            const std::size_t begin = task * keys_per_worker;
+            const std::size_t end =
+                std::min(key_count, begin + keys_per_worker);
+            tasks_.push_back(
+                Task{begin, end, &range_function, completion});
+            ++queued_tasks;
+          }
+        } catch (const std::bad_alloc&) {
+          resource_failure = true;
+        } catch (const std::system_error&) {
+          resource_failure = true;
+        }
+      }
+
+      if (resource_failure) {
+        completion->resource_failure.store(true, std::memory_order_relaxed);
+        completion->Skip((task_count - 1) - queued_tasks);
+      }
+    }
+    for (std::size_t i = 0;
+         i < std::min(queued_tasks, background_workers); ++i) {
+      condition_.notify_one();
+    }
+
+    const std::size_t caller_begin = (task_count - 1) * keys_per_worker;
+    const std::size_t caller_end = key_count;
+    try {
+      if (!completion->resource_failure.load(std::memory_order_relaxed) &&
+          !completion->lookup_failed.load(std::memory_order_relaxed) &&
+          !range_function(caller_begin, caller_end)) {
+        completion->lookup_failed.store(true, std::memory_order_relaxed);
+      }
+    } catch (const std::bad_alloc&) {
+      completion->resource_failure.store(true, std::memory_order_relaxed);
+    } catch (const std::system_error&) {
+      completion->resource_failure.store(true, std::memory_order_relaxed);
+    } catch (...) {
+      completion->resource_failure.store(true, std::memory_order_relaxed);
+    }
+    completion->Complete();
+
+    std::unique_lock<std::mutex> completion_lock(completion->mutex);
+    completion->condition.wait(completion_lock, [&completion]() {
+      return completion->remaining.load(std::memory_order_acquire) == 0;
+    });
+
+    if (completion->resource_failure.load(std::memory_order_relaxed)) {
+      return RunResult::kResourceFailure;
+    }
+    if (completion->lookup_failed.load(std::memory_order_relaxed)) {
+      return RunResult::kLookupFailed;
+    }
+    return RunResult::kSuccess;
+  }
+
+ private:
+  struct Completion {
+    explicit Completion(std::size_t task_count)
+        : remaining(task_count) {}
+
+    void Complete() {
+      if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        condition.notify_one();
+      }
+    }
+
+    void Skip(std::size_t task_count) {
+      if (task_count != 0 &&
+          remaining.fetch_sub(task_count, std::memory_order_acq_rel) ==
+              task_count) {
+        condition.notify_one();
+      }
+    }
+
+    std::atomic<std::size_t> remaining{0};
+    std::atomic<bool> lookup_failed{false};
+    std::atomic<bool> resource_failure{false};
+    std::mutex mutex;
+    std::condition_variable condition;
+  };
+
+  struct Task {
+    std::size_t begin{0};
+    std::size_t end{0};
+    const RangeFunction* range_function{nullptr};
+    std::shared_ptr<Completion> completion;
+  };
+
+  std::size_t EnsureWorkers(std::size_t requested_workers) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    while (!stopping_ && workers_.size() < requested_workers) {
+      try {
+        workers_.emplace_back([this]() { WorkerLoop(); });
+      } catch (const std::bad_alloc&) {
+        break;
+      } catch (const std::system_error&) {
+        break;
+      }
+    }
+    return workers_.size();
+  }
+
+  void WorkerLoop() {
+    for (;;) {
+      Task task;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        condition_.wait(lock, [this]() {
+          return stopping_ || !tasks_.empty();
+        });
+        if (stopping_ && tasks_.empty()) {
+          return;
+        }
+        task = std::move(tasks_.front());
+        tasks_.pop_front();
+      }
+
+      try {
+        if (!task.completion->resource_failure.load(
+                std::memory_order_relaxed) &&
+            !task.completion->lookup_failed.load(std::memory_order_relaxed) &&
+            !(*task.range_function)(task.begin, task.end)) {
+          task.completion->lookup_failed.store(true,
+                                               std::memory_order_relaxed);
+        }
+      } catch (const std::bad_alloc&) {
+        task.completion->resource_failure.store(true,
+                                                 std::memory_order_relaxed);
+      } catch (const std::system_error&) {
+        task.completion->resource_failure.store(true,
+                                                 std::memory_order_relaxed);
+      } catch (...) {
+        task.completion->resource_failure.store(true,
+                                                 std::memory_order_relaxed);
+      }
+      task.completion->Complete();
+    }
+  }
+
+  const std::size_t worker_limit_{1};
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  std::deque<Task> tasks_;
+  std::vector<std::thread> workers_;
+  bool stopping_{false};
+};
+
 MetaManager::MetaManager()
-    : entries_(std::make_unique<EntryIndex>()) {}
+    : entries_(std::make_unique<EntryIndex>()),
+      lookup_workers_(std::make_unique<LookupWorkerPool>()) {}
 
 MetaManager::~MetaManager() = default;
 
@@ -777,65 +1004,33 @@ Status MetaManager::BatchLookup(const std::vector<KeyId>& flat_keys,
           return true;
         };
 
-    constexpr std::size_t kParallelThreshold = 8192;
-    constexpr std::size_t kKeysPerWorker = 4096;
-    constexpr std::size_t kMaxWorkers = 4;
-
-    std::size_t worker_count = 1;
-    if (flat_keys.size() >= kParallelThreshold) {
-      const std::size_t hardware_threads =
-          std::thread::hardware_concurrency();
-      const std::size_t available_threads =
-          hardware_threads == 0 ? kMaxWorkers : hardware_threads;
-      const std::size_t required_workers =
-          (flat_keys.size() + kKeysPerWorker - 1) / kKeysPerWorker;
-      worker_count =
-          std::min({kMaxWorkers, available_threads, required_workers});
+    constexpr std::size_t kKeysPerWorker = 8 * 1024;
+    if (flat_keys.size() <= kKeysPerWorker) {
+      if (!entries_->FindBatchRange(flat_keys, 0, flat_keys.size(),
+                                    consumer)) {
+        return Error(StatusCode::kNotFound, ErrorTag::kKeyMissing);
+      }
+      return Status::OK();
     }
 
-    const std::size_t chunk_size =
-        (flat_keys.size() + worker_count - 1) / worker_count;
-    std::atomic<bool> lookup_failed{false};
-    bool thread_creation_failed = false;
-    std::vector<std::thread> workers;
-
+    LookupWorkerPool::RunResult result =
+        LookupWorkerPool::RunResult::kResourceFailure;
     try {
-      workers.reserve(worker_count > 1 ? worker_count - 1 : 0);
-      for (std::size_t worker = 0; worker + 1 < worker_count; ++worker) {
-        const std::size_t begin = worker * chunk_size;
-        const std::size_t end =
-            std::min(flat_keys.size(), begin + chunk_size);
-        workers.emplace_back([&, begin, end]() {
-          if (!lookup_failed.load(std::memory_order_relaxed) &&
-              !entries_->FindBatchRange(flat_keys, begin, end, consumer)) {
-            lookup_failed.store(true, std::memory_order_relaxed);
-          }
-        });
-      }
-
-      if (!lookup_failed.load(std::memory_order_relaxed)) {
-        const std::size_t begin = (worker_count - 1) * chunk_size;
-        if (!entries_->FindBatchRange(flat_keys, begin, flat_keys.size(),
-                                       consumer)) {
-          lookup_failed.store(true, std::memory_order_relaxed);
-        }
-      }
+      const LookupWorkerPool::RangeFunction range_function =
+          [&](std::size_t begin, std::size_t end) {
+            return entries_->FindBatchRange(flat_keys, begin, end, consumer);
+          };
+      result = lookup_workers_->Run(flat_keys.size(), kKeysPerWorker,
+                                    range_function);
     } catch (const std::bad_alloc&) {
-      thread_creation_failed = true;
+      result = LookupWorkerPool::RunResult::kResourceFailure;
     } catch (const std::system_error&) {
-      thread_creation_failed = true;
+      result = LookupWorkerPool::RunResult::kResourceFailure;
     }
-
-    for (std::thread& worker : workers) {
-      if (worker.joinable()) {
-        worker.join();
-      }
-    }
-
-    if (thread_creation_failed) {
+    if (result == LookupWorkerPool::RunResult::kResourceFailure) {
       return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
     }
-    if (lookup_failed.load(std::memory_order_relaxed)) {
+    if (result == LookupWorkerPool::RunResult::kLookupFailed) {
       return Error(StatusCode::kNotFound, ErrorTag::kKeyMissing);
     }
   }
