@@ -131,6 +131,13 @@ DEVICE_ID=0 TABLE_CAPACITY=256 REQUESTS=10 OUTPUT_ROWS=200 \
 BLOCK_BYTES=1024 SOURCE_STRIDE=4096 AIV_CORES=1 JETTYS_PER_CORE=2 ACTIVE_PERCENT=20 \
 WARMUP=1 ITERATIONS=1 bash scripts/run_execute_batch_get.sh
 
+# Keep the full AddressTable and Host-DDR allocation, but constrain generated
+# lookup indices to [0, INDEX_RANGE) to isolate the active lookup working set.
+DEVICE_ID=0 TABLE_CAPACITY=134217728 INDEX_RANGE=2097152 \
+REQUESTS=65536 OUTPUT_ROWS=65536 BLOCK_BYTES=576 SOURCE_STRIDE=576 \
+AIV_CORES=1 JETTYS_PER_CORE=2 WARMUP=3 ITERATIONS=1000 \
+bash scripts/run_execute_batch_get.sh
+
 # Proves TransportCreate -> Acquire(A) -> Acquire(B) -> re-Acquire(A), then
 # releases both local-buffer references without rebuilding EID/CTP/Jettys.
 DEVICE_ID=0 DYNAMIC_OUTPUT_SMOKE=1 WARMUP=1 ITERATIONS=1 \
@@ -145,7 +152,11 @@ DEVICE_ID=0 GRAPH_REPLAYS=4 GRAPH_WARMUP=1 GRAPH_ITERATIONS=5 \
 bash scripts/run_execute_batch_get_graph.sh
 ```
 
-For the eager benchmark, `ACTIVE_PERCENT=N` controls the independent Bernoulli
+For the eager benchmark, `INDEX_RANGE=N` constrains every generated lookup
+index to `[0, N)` while `TABLE_CAPACITY` continues to control the allocated
+AddressTable, valid table and Host-DDR region; it defaults to `TABLE_CAPACITY`.
+This makes it possible to vary the active lookup working set independently of
+the allocation size. `ACTIVE_PERCENT=N` controls the independent Bernoulli
 mask probability for every sample; random generation and the one-time H2D
 upload are excluded from timing. `MASK_EVERY=N` and `ACTIVE_EVERY=N` remain
 deterministic functional controls for the dynamic-output smoke test and graph

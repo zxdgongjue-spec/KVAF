@@ -23,6 +23,9 @@ constexpr uint32_t kEagerRandomSeed = 0x4b564146U;
 struct Options {
   uint32_t device = 0U;
   uint32_t table_capacity = 4096U;
+  // Limit generated lookup indices without changing the allocated AddressTable
+  // or Host-DDR region. Zero follows table_capacity for direct binary users.
+  uint32_t index_range = 0U;
   uint32_t requests = 4096U;
   uint32_t output_rows = 4096U;
   uint32_t block_bytes = 1024U;
@@ -88,6 +91,8 @@ bool ParseOptions(int argc, char **argv, Options *options) {
       if (!ParseU32(argv[++index], &options->device)) return false;
     } else if (arg == "--table-capacity" && index + 1 < argc) {
       if (!ParseU32(argv[++index], &options->table_capacity)) return false;
+    } else if (arg == "--index-range" && index + 1 < argc) {
+      if (!ParseU32(argv[++index], &options->index_range)) return false;
     } else if (arg == "--requests" && index + 1 < argc) {
       if (!ParseU32(argv[++index], &options->requests)) return false;
     } else if (arg == "--output-rows" && index + 1 < argc) {
@@ -126,19 +131,27 @@ bool ParseOptions(int argc, char **argv, Options *options) {
       return false;
     }
   }
-  return !options->kernel.empty() && ReadEnvU32("DEVICE_ID", &options->device) &&
-         ReadEnvU32("TABLE_CAPACITY", &options->table_capacity) && ReadEnvU32("REQUESTS", &options->requests) &&
-         ReadEnvU32("OUTPUT_ROWS", &options->output_rows) && ReadEnvU32("BLOCK_BYTES", &options->block_bytes) &&
-         ReadEnvU32("SOURCE_STRIDE", &options->source_stride) && ReadEnvU32("AIV_CORES", &options->aiv_cores) &&
-         ReadEnvU32("JETTYS_PER_CORE", &options->jettys_per_core) &&
-         ReadEnvU32("WARMUP", &options->warmup) && ReadEnvU32("ITERATIONS", &options->iterations) &&
-         ReadEnvU32("MASK_EVERY", &options->mask_every) &&
-         ReadEnvU32("ACTIVE_EVERY", &options->active_every) &&
-         ReadEnvU32("ACTIVE_PERCENT", &options->active_percent) &&
-         ReadEnvU32("DYNAMIC_OUTPUT_SMOKE", &options->dynamic_output_smoke) &&
-         ReadEnvU32("KERNEL_PROFILE", &options->kernel_profile) &&
-         ReadEnvU32("KERNEL_PROFILE_CLOCK_MHZ", &options->kernel_profile_clock_mhz) &&
-         options->table_capacity != 0U &&
+  const bool environment_valid =
+      !options->kernel.empty() && ReadEnvU32("DEVICE_ID", &options->device) &&
+      ReadEnvU32("TABLE_CAPACITY", &options->table_capacity) &&
+      ReadEnvU32("INDEX_RANGE", &options->index_range) &&
+      ReadEnvU32("REQUESTS", &options->requests) &&
+      ReadEnvU32("OUTPUT_ROWS", &options->output_rows) && ReadEnvU32("BLOCK_BYTES", &options->block_bytes) &&
+      ReadEnvU32("SOURCE_STRIDE", &options->source_stride) && ReadEnvU32("AIV_CORES", &options->aiv_cores) &&
+      ReadEnvU32("JETTYS_PER_CORE", &options->jettys_per_core) &&
+      ReadEnvU32("WARMUP", &options->warmup) && ReadEnvU32("ITERATIONS", &options->iterations) &&
+      ReadEnvU32("MASK_EVERY", &options->mask_every) &&
+      ReadEnvU32("ACTIVE_EVERY", &options->active_every) &&
+      ReadEnvU32("ACTIVE_PERCENT", &options->active_percent) &&
+      ReadEnvU32("DYNAMIC_OUTPUT_SMOKE", &options->dynamic_output_smoke) &&
+      ReadEnvU32("KERNEL_PROFILE", &options->kernel_profile) &&
+      ReadEnvU32("KERNEL_PROFILE_CLOCK_MHZ", &options->kernel_profile_clock_mhz);
+  if (!environment_valid) return false;
+  if (options->index_range == 0U) options->index_range = options->table_capacity;
+  return options->table_capacity != 0U &&
+         options->index_range != 0U && options->index_range <= options->table_capacity &&
+         static_cast<uint64_t>(options->index_range) <=
+             static_cast<uint64_t>(INT32_MAX) + 1U &&
          options->requests != 0U && options->requests <= options->output_rows && options->output_rows != 0U &&
          options->block_bytes != 0U && options->source_stride >= options->block_bytes &&
          options->aiv_cores != 0U && options->aiv_cores <= KVAF_AIV_BATCH_GET_MAX_AIV_CORES &&
@@ -536,7 +549,7 @@ void PrepareGraphReplayInputs(uint32_t replay, const uint8_t *source, const Opti
                               static_cast<uint64_t>(source_slot) * options.source_stride;
   }
   for (uint32_t request = 0U; request < options.requests; ++request) {
-    (*indices)[request] = static_cast<int32_t>(request % options.table_capacity);
+    (*indices)[request] = static_cast<int32_t>(request % options.index_range);
     (*mask)[request] = RequestIsActive(request, options) ? 1U : 0U;
     // Keep sparse output rows stable so a row written by an earlier replay is
     // never reinterpreted as a masked row during byte-for-byte validation.
@@ -572,7 +585,7 @@ int main(int argc, char **argv) {
   Options options;
   if (!ParseOptions(argc, argv, &options)) {
     std::cerr << "usage: kvaf_execute_batch_get_test --kernel <kvaf_execute_batch_get_kernels.o> "
-                 "[--device N --table-capacity N --requests N --output-rows N --block-bytes N "
+                 "[--device N --table-capacity N --index-range N --requests N --output-rows N --block-bytes N "
                  "--source-stride N --aiv-cores N --jettys-per-core N --warmup N --iterations N --mask-every N "
                  "--active-every N --active-percent N "
                  "--graph-replays N --graph-warmup N --graph-iterations N --dynamic-output-smoke 0|1 "
@@ -666,14 +679,15 @@ int main(int argc, char **argv) {
     address_table[slot] = reinterpret_cast<uint64_t>(block);
   }
   for (uint32_t request = 0U; request < options.requests; ++request) {
-    indices[request] = static_cast<int32_t>(options.table_capacity - 1U - (request % options.table_capacity));
+    indices[request] = static_cast<int32_t>(options.index_range - 1U -
+                                            (request % options.index_range));
     output_indices[request] = static_cast<int32_t>(options.output_rows - 1U - request);
     mask[request] = RequestIsActive(request, options) ? 1U : 0U;
   }
   // Match the architecture note's concrete [200,1024] scatter example when
   // that shape is requested; the normal default remains a larger reverse
   // permutation for the 4096-block throughput run.
-  if (options.requests == 10U && options.table_capacity > 10U && options.output_rows >= 200U) {
+  if (options.requests == 10U && options.index_range > 10U && options.output_rows >= 200U) {
     constexpr int32_t kExampleRows[10] = {1, 10, 15, 11, 199, 150, 70, 88, 65, 120};
     for (uint32_t request = 0U; request < 10U; ++request) {
       indices[request] = static_cast<int32_t>(request + 1U);
@@ -723,6 +737,7 @@ int main(int argc, char **argv) {
                  "acquire primary caller-owned output HBM for UDMA")) goto cleanup;
   std::cout << "PHASE_EID_ENDPOINT_READY primary_entity_table=0x" << std::hex << primary_entity_table << std::dec
             << " table_capacity=" << options.table_capacity << " output_rows=" << options.output_rows
+            << " index_range=" << options.index_range
             << " source_bytes=" << source_bytes << " output_bytes=" << output_bytes
             << " output_lifetime=local_buffer_acquired\n";
   if (!CheckKvaf(KvafExecuteBatchGetLoadKernel(options.kernel.c_str()), "load ExecuteBatchGet kernel")) goto cleanup;
@@ -836,6 +851,7 @@ int main(int argc, char **argv) {
                  "replays="
               << options.graph_replays << " aiv_cores=" << options.aiv_cores
               << " jettys_per_core=" << options.jettys_per_core
+              << " index_range=" << options.index_range
               << " perf_warmup=" << options.graph_warmup
               << " perf_samples=" << options.graph_iterations << '\n';
     if (!CheckAcl(aclmdlRICaptureBegin(stream, ACL_MODEL_RI_CAPTURE_MODE_RELAXED),
@@ -965,6 +981,7 @@ int main(int argc, char **argv) {
               << "GRAPH_PERF_RESULT metric=graph_input_update_to_stream_completion samples="
               << options.graph_iterations << " warmup_excluded=" << options.graph_warmup
               << " active_requests=" << active << " block_bytes=" << options.block_bytes
+              << " index_range=" << options.index_range
               << " aiv_cores=" << options.aiv_cores
               << " jettys_per_core=" << options.jettys_per_core
               << " mean_ms=" << mean_ms
@@ -989,7 +1006,7 @@ int main(int argc, char **argv) {
   {
     std::mt19937 random(kEagerRandomSeed);
     std::uniform_int_distribution<uint32_t> index_distribution(
-        0U, options.table_capacity - 1U);
+        0U, options.index_range - 1U);
     std::bernoulli_distribution mask_distribution(
         static_cast<double>(options.active_percent) / 100.0);
     for (uint64_t sample = 0U; sample < eager_sample_count; ++sample) {
@@ -1027,6 +1044,7 @@ int main(int argc, char **argv) {
   }
   std::cout << "EAGER_RANDOM_INPUTS_READY samples=" << eager_sample_count
             << " requests_per_sample=" << options.requests
+            << " index_range=" << options.index_range
             << " active_percent=" << options.active_percent
             << " seed=" << kEagerRandomSeed
             << " generation_excluded=1 h2d_excluded=1\n";
@@ -1113,7 +1131,9 @@ int main(int argc, char **argv) {
               << "PERF_RESULT metric=host_submit_to_stream_completion samples=" << options.iterations
               << " warmup_excluded=" << options.warmup
               << " mean_active_requests=" << mean_active
-              << " block_bytes=" << options.block_bytes << " aiv_cores=" << options.aiv_cores
+              << " block_bytes=" << options.block_bytes
+              << " index_range=" << options.index_range
+              << " aiv_cores=" << options.aiv_cores
               << " jettys_per_core=" << options.jettys_per_core
               << " mean_ms=" << mean_ms << " p50_ms=" << Percentile(elapsed_ms, 0.50)
               << " p90_ms=" << Percentile(elapsed_ms, 0.90) << " p99_ms=" << Percentile(elapsed_ms, 0.99)
