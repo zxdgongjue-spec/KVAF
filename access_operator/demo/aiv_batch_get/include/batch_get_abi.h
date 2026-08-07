@@ -21,8 +21,9 @@ static const uint64_t KVAF_AIV_BATCH_GET_PROFILE_MAGIC =
 // Optional, per-core kernel timeline. The host enables collection by placing
 // KVAF_AIV_BATCH_GET_PROFILE_MAGIC in `magic` before launch. The kernel keeps
 // the magic in its output so profiling remains enabled across warmup and
-// measured launches that reuse the same status buffer. GetSystemCycle uses a
-// 50 MHz clock, so elapsed_us = elapsed_cycles / 50.
+// measured launches that reuse the same status buffer. GetSystemCycle's
+// counter frequency is product-specific; the runner converts these raw cycles
+// with KERNEL_PROFILE_CLOCK_MHZ (1000 by default for A5).
 typedef struct KvafBatchGetCoreProfile {
   uint64_t magic;
   uint64_t kernel_start_cycle;

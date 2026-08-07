@@ -47,6 +47,9 @@ struct Options {
   // Opt-in AIV-internal cycle timeline. Disabled measurements retain the
   // original hot path without GetSystemCycle calls or per-iteration D2H.
   uint32_t kernel_profile = 0U;
+  // GetSystemCycle counter frequency in cycles per microsecond. The A5 target
+  // used by this demo runs it at 1 GHz; A2/A3 users can override this to 50.
+  uint32_t kernel_profile_clock_mhz = 1000U;
   std::string kernel;
 };
 
@@ -117,6 +120,8 @@ bool ParseOptions(int argc, char **argv, Options *options) {
       if (!ParseU32(argv[++index], &options->dynamic_output_smoke)) return false;
     } else if (arg == "--kernel-profile" && index + 1 < argc) {
       if (!ParseU32(argv[++index], &options->kernel_profile)) return false;
+    } else if (arg == "--kernel-profile-clock-mhz" && index + 1 < argc) {
+      if (!ParseU32(argv[++index], &options->kernel_profile_clock_mhz)) return false;
     } else {
       return false;
     }
@@ -131,7 +136,9 @@ bool ParseOptions(int argc, char **argv, Options *options) {
          ReadEnvU32("ACTIVE_EVERY", &options->active_every) &&
          ReadEnvU32("ACTIVE_PERCENT", &options->active_percent) &&
          ReadEnvU32("DYNAMIC_OUTPUT_SMOKE", &options->dynamic_output_smoke) &&
-         ReadEnvU32("KERNEL_PROFILE", &options->kernel_profile) && options->table_capacity != 0U &&
+         ReadEnvU32("KERNEL_PROFILE", &options->kernel_profile) &&
+         ReadEnvU32("KERNEL_PROFILE_CLOCK_MHZ", &options->kernel_profile_clock_mhz) &&
+         options->table_capacity != 0U &&
          options->requests != 0U && options->requests <= options->output_rows && options->output_rows != 0U &&
          options->block_bytes != 0U && options->source_stride >= options->block_bytes &&
          options->aiv_cores != 0U && options->aiv_cores <= KVAF_AIV_BATCH_GET_MAX_AIV_CORES &&
@@ -141,6 +148,7 @@ bool ParseOptions(int argc, char **argv, Options *options) {
          options->active_percent >= 1U && options->active_percent <= 100U &&
          options->graph_iterations != 0U && options->dynamic_output_smoke <= 1U &&
          options->kernel_profile <= 1U &&
+         options->kernel_profile_clock_mhz != 0U &&
          (options->mask_every == 0U || options->active_every == 0U);
 }
 
@@ -164,10 +172,9 @@ double Percentile(std::vector<double> samples, double fraction) {
   return samples[lower] + (samples[upper] - samples[lower]) * (position - lower);
 }
 
-constexpr double kProfileCyclesPerMicrosecond = 50.0;
-
-double ProfileCyclesToUs(uint64_t begin, uint64_t end) {
-  return static_cast<double>(end - begin) / kProfileCyclesPerMicrosecond;
+double ProfileCyclesToUs(uint64_t begin, uint64_t end,
+                         double cycles_per_microsecond) {
+  return static_cast<double>(end - begin) / cycles_per_microsecond;
 }
 
 bool CollectKernelProfiles(
@@ -235,6 +242,8 @@ void PrintKernelProfileSummary(
   }
 
   std::vector<KernelProfileAccumulator> per_core(options.aiv_cores);
+  const double cycles_per_microsecond =
+      static_cast<double>(options.kernel_profile_clock_mhz);
   std::vector<double> kernel_wall_us;
   std::vector<double> critical_total_us;
   std::vector<double> max_setup_us;
@@ -264,22 +273,29 @@ void PrintKernelProfileSummary(
           profiles[static_cast<uint64_t>(sample) * options.aiv_cores + core];
       KernelProfileAccumulator &accumulator = per_core[core];
       const double total = ProfileCyclesToUs(
-          profile.kernel_start_cycle, profile.kernel_finish_cycle);
+          profile.kernel_start_cycle, profile.kernel_finish_cycle,
+          cycles_per_microsecond);
       const double setup = ProfileCyclesToUs(
-          profile.kernel_start_cycle, profile.setup_done_cycle);
+          profile.kernel_start_cycle, profile.setup_done_cycle,
+          cycles_per_microsecond);
       const double compact = ProfileCyclesToUs(
-          profile.setup_done_cycle, profile.compact_done_cycle);
+          profile.setup_done_cycle, profile.compact_done_cycle,
+          cycles_per_microsecond);
       const double post = ProfileCyclesToUs(
-          profile.compact_done_cycle, profile.post_done_cycle);
+          profile.compact_done_cycle, profile.post_done_cycle,
+          cycles_per_microsecond);
       const double completion = ProfileCyclesToUs(
-          profile.post_done_cycle, profile.completion_done_cycle);
+          profile.post_done_cycle, profile.completion_done_cycle,
+          cycles_per_microsecond);
       const double transfer = profile.first_doorbell_cycle == 0U
                                   ? 0.0
                                   : ProfileCyclesToUs(
                                         profile.first_doorbell_cycle,
-                                        profile.completion_done_cycle);
+                                        profile.completion_done_cycle,
+                                        cycles_per_microsecond);
       const double finalize = ProfileCyclesToUs(
-          profile.completion_done_cycle, profile.kernel_finish_cycle);
+          profile.completion_done_cycle, profile.kernel_finish_cycle,
+          cycles_per_microsecond);
       accumulator.total_us += total;
       accumulator.setup_us += setup;
       accumulator.compact_us += compact;
@@ -294,7 +310,7 @@ void PrintKernelProfileSummary(
            jetty < KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE; ++jetty) {
         accumulator.jetty_wait_us[jetty] +=
             static_cast<double>(profile.jetty_completion_wait_cycles[jetty]) /
-            kProfileCyclesPerMicrosecond;
+            cycles_per_microsecond;
         accumulator.jetty_polls[jetty] += static_cast<double>(
             profile.jetty_completion_polls[jetty]);
       }
@@ -310,7 +326,8 @@ void PrintKernelProfileSummary(
           std::max(latest_finish, profile.kernel_finish_cycle);
     }
     kernel_wall_us.push_back(
-        ProfileCyclesToUs(earliest_start, latest_finish));
+        ProfileCyclesToUs(earliest_start, latest_finish,
+                          cycles_per_microsecond));
     critical_total_us.push_back(sample_total);
     max_setup_us.push_back(sample_setup);
     max_compact_us.push_back(sample_compact);
@@ -324,7 +341,8 @@ void PrintKernelProfileSummary(
            samples.size();
   };
   const double divisor = static_cast<double>(sample_count);
-  std::cout << "KERNEL_PROFILE_CONTRACT clock_mhz=50 unit=us "
+  std::cout << "KERNEL_PROFILE_CONTRACT clock_mhz="
+            << options.kernel_profile_clock_mhz << " unit=us "
                "setup=entity_and_queue compact=mask_and_index_compaction "
                "post=wqe_fill_sq_copy_and_doorbell "
                "transfer_window=first_doorbell_to_all_cq_complete "
@@ -558,7 +576,7 @@ int main(int argc, char **argv) {
                  "--source-stride N --aiv-cores N --jettys-per-core N --warmup N --iterations N --mask-every N "
                  "--active-every N --active-percent N "
                  "--graph-replays N --graph-warmup N --graph-iterations N --dynamic-output-smoke 0|1 "
-                 "--kernel-profile 0|1]\n";
+                 "--kernel-profile 0|1 --kernel-profile-clock-mhz N]\n";
     return 2;
   }
   const uint64_t source_bytes = static_cast<uint64_t>(options.table_capacity) * options.source_stride;

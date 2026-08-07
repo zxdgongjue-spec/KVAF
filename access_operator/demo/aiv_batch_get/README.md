@@ -160,8 +160,10 @@ capture, HCCP setup and final D2H validation are excluded. The normal metric
 is `host_submit_to_stream_completion`; it includes only launch through stream
 completion and excludes input generation, H2D upload, warmup and validation.
 
-With `KERNEL_PROFILE=1`, every AIV writes a 50 MHz `GetSystemCycle` timeline
-into the existing reserved status area. The runner reports `setup`, `compact`,
+With `KERNEL_PROFILE=1`, every AIV writes a raw `GetSystemCycle` timeline into
+the existing reserved status area. The A5 runner default converts it with
+`KERNEL_PROFILE_CLOCK_MHZ=1000`; use `50` on A2/A3 products whose documented
+system counter runs at 50 MHz. The runner reports `setup`, `compact`,
 `post`, `transfer_window`, `completion_wait`, and `finalize` durations, plus
 the number of 32-WQE posts and CQ polls for each Jetty. `post` covers
 queue-capacity checks, WQE materialization, SQ writes, and doorbells;
