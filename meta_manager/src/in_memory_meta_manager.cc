@@ -165,8 +165,8 @@ class ScopedMethodTimer {
 }  // 匿名命名空间
 
 struct MetaManager::EntryIndex {
-  // control_ 保存已占用桶的指纹。已释放记录仍保持占用状态，保证探测链
-  // 不会被截断，同时也禁止同一个 KeyId 被复用。
+  // control_ 保存已占用桶的指纹。已释放记录仍保持占用状态，既不会截断
+  // 探测链，也允许 AbortPut 后复用同一个 KeyId 的桶。
   struct Bucket {
     std::size_t hash{0};
     const KeyId* key{nullptr};
@@ -295,7 +295,7 @@ struct MetaManager::EntryIndex {
   }
 
   InsertResult TryEmplace(const KeyId& key) {
-    // 已释放记录不会被删除，哈希表只增长和重哈希，查询仍可在第一个空桶处结束。
+    // 已释放桶保留在探测表中，命中相同 key 时直接复用该桶，避免破坏探测链。
     if (buckets_.empty()) {
       Reserve(8);
     }
@@ -321,6 +321,9 @@ struct MetaManager::EntryIndex {
       if (control == fingerprint) {
         Bucket& candidate = buckets_[bucket];
         if (candidate.hash == hash && *candidate.key == key) {
+          if (candidate.state == RecordState::kFreed) {
+            return InsertResult{&candidate, candidate.key, hash, true};
+          }
           return InsertResult{&candidate, candidate.key, hash, false};
         }
       }
@@ -702,20 +705,20 @@ Status MetaManager::PreparePut(const std::vector<KeyId>& flat_keys,
   }
 
   PendingPutContext pending_context;
-  std::vector<const KeyId*> new_keys;
+  std::vector<const KeyId*> keys_to_rollback;
   {
     ScopedMethodTimer phase_timer(&timing_log_enabled_, "PreparePut",
                                   "reserve");
     try {
       pending_context.items.reserve(flat_keys.size());
-      new_keys.reserve(flat_keys.size());
+      keys_to_rollback.reserve(flat_keys.size());
     } catch (const std::bad_alloc&) {
       return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
     }
   }
 
-  auto rollback_new_keys = [&]() {
-    for (const KeyId* key : new_keys) {
+  auto rollback_keys = [&]() {
+    for (const KeyId* key : keys_to_rollback) {
       EntryIndex::Bucket* bucket =
           entries_->FindStored(key, std::hash<KeyId>{}(*key));
       if (bucket != nullptr) {
@@ -732,12 +735,15 @@ Status MetaManager::PreparePut(const std::vector<KeyId>& flat_keys,
         const EntryIndex::InsertResult result =
             entries_->TryEmplace(flat_keys[i]);
         if (result.inserted) {
-          new_keys.push_back(result.key);
+          keys_to_rollback.push_back(result.key);
         }
 
         EntryIndex::Bucket& bucket = *result.bucket;
-        if (!result.inserted || bucket.state != RecordState::kUnused) {
-          rollback_new_keys();
+        const bool reusable =
+            bucket.state == RecordState::kUnused ||
+            bucket.state == RecordState::kFreed;
+        if (!result.inserted || !reusable) {
+          rollback_keys();
           return Error(StatusCode::kAlreadyExists, ErrorTag::kKeyExists);
         }
 
@@ -746,7 +752,7 @@ Status MetaManager::PreparePut(const std::vector<KeyId>& flat_keys,
             result.key, result.hash, SlotRef{slot_classes[i], 0}, lengths[i]});
       }
     } catch (const std::bad_alloc&) {
-      rollback_new_keys();
+      rollback_keys();
       return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
     }
   }
@@ -756,7 +762,7 @@ Status MetaManager::PreparePut(const std::vector<KeyId>& flat_keys,
                                   "check_capacity");
     if (short_free_slots_.size() < short_needed ||
         long_free_slots_.size() < long_needed) {
-      rollback_new_keys();
+      rollback_keys();
       return Error(StatusCode::kOutOfMemory, ErrorTag::kOutOfSlots);
     }
   }
@@ -767,7 +773,7 @@ Status MetaManager::PreparePut(const std::vector<KeyId>& flat_keys,
     try {
       ResizeAccessDesc(flat_keys.size(), put_desc);
     } catch (const std::bad_alloc&) {
-      rollback_new_keys();
+      rollback_keys();
       return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
     }
   }
@@ -798,7 +804,7 @@ Status MetaManager::PreparePut(const std::vector<KeyId>& flat_keys,
           }
           ReleaseSlot(item.slot);
         }
-        rollback_new_keys();
+        rollback_keys();
         return Error(StatusCode::kInvalidState, ErrorTag::kStateConflict);
       }
       inserted.first->second.items.swap(pending_context.items);
@@ -812,7 +818,7 @@ Status MetaManager::PreparePut(const std::vector<KeyId>& flat_keys,
         }
         ReleaseSlot(item.slot);
       }
-      rollback_new_keys();
+      rollback_keys();
       return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
     }
   }
