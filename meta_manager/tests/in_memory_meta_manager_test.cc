@@ -149,11 +149,22 @@ bool TestPutCommitLookupUnlockFreeRoundTrip() {
   }
 
   LockContext invisible_lock;
-  if (!ExpectStatusCode(
+  if (!ExpectOk(
           manager->LockKeys(keys, MetaManagerLockMode::kStableReadAllowAppend,
                             &invisible_lock),
+          "LockKeys should only establish a read lease")) {
+    return false;
+  }
+  FlatAccessDesc invisible_access_desc;
+  if (!ExpectStatusCode(
+          manager->BatchLookup(keys, invisible_lock, &invisible_access_desc),
           StatusCode::kNotFound,
-          "uncommitted keys should stay invisible")) {
+          "uncommitted keys should stay invisible during lookup")) {
+    (void)manager->UnlockKeys(invisible_lock);
+    return false;
+  }
+  if (!ExpectOk(manager->UnlockKeys(invisible_lock),
+                "UnlockKeys should release the invisible read lease")) {
     return false;
   }
 
@@ -385,8 +396,8 @@ bool TestInvalidArgumentAndDuplicateKeyPaths() {
   FlatAccessDesc access_desc;
   if (!ExpectStatusCode(
           manager->BatchLookup({"other"}, lock_context, &access_desc),
-          StatusCode::kInvalidArgument,
-          "BatchLookup should reject keys that do not match the lock context")) {
+          StatusCode::kNotFound,
+          "BatchLookup should report an unknown key")) {
     return false;
   }
   return ExpectOk(manager->UnlockKeys(lock_context), "UnlockKeys should succeed");
@@ -524,6 +535,9 @@ bool TestTimingLogPhases() {
   const Status commit_status = manager->CommitPut(put_context);
   const Status lock_status = manager->LockKeys(
       keys, MetaManagerLockMode::kStableReadAllowAppend, &lock_context);
+  FlatAccessDesc lookup_desc;
+  const Status lookup_status =
+      manager->BatchLookup(keys, lock_context, &lookup_desc);
   const Status unlock_status = manager->UnlockKeys(lock_context);
   const Status free_status = manager->BatchFree(keys);
   FlushMetaManagerTimingSummary();
@@ -532,6 +546,7 @@ bool TestTimingLogPhases() {
   if (!ExpectOk(prepare_status, "PreparePut should succeed with timing log") ||
       !ExpectOk(commit_status, "CommitPut should succeed with timing log") ||
       !ExpectOk(lock_status, "LockKeys should succeed with timing log") ||
+      !ExpectOk(lookup_status, "BatchLookup should succeed with timing log") ||
       !ExpectOk(unlock_status, "UnlockKeys should succeed with timing log") ||
       !ExpectOk(free_status, "BatchFree should succeed with timing log")) {
     return false;
@@ -551,8 +566,8 @@ bool TestTimingLogPhases() {
          expect_phase("PreparePut", "allocate_slots") &&
          expect_phase("PreparePut", "publish_context") &&
          expect_phase("LockKeys", "read_phase") &&
-         expect_phase("LockKeys", "find") &&
          expect_phase("LockKeys", "register_context") &&
+         expect_phase("BatchLookup", "find") &&
          expect_phase("BatchFree", "write_phase") &&
          expect_phase("BatchFree", "deduplicate") &&
          expect_phase("BatchFree", "validate_keys") &&

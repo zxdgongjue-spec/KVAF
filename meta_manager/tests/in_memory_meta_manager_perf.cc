@@ -865,7 +865,7 @@ void PrintStatsTable(const std::vector<Stats>& stats_list) {
   std::cout << "- avg_per_key_ns: avg_ns amortized to one key\n";
   std::cout << "- EndToEnd rows include per-stage PreparePut/LockKeys/BatchFree timing\n";
   std::cout << "- --enable-timing-log emits internal phase timing for "
-               "PreparePut/LockKeys/BatchFree\n";
+               "PreparePut/LockKeys/BatchLookup/BatchFree\n";
   std::cout << "method,resident_keys,batch_size,call_count,total_ms,avg_ns,"
                "avg_per_key_ns,min_ns,p50_ns,p95_ns,max_ns\n";
   for (const Stats& stats : stats_list) {

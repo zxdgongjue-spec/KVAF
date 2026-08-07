@@ -27,14 +27,15 @@ struct PutContext {
   std::uint64_t id{0};
 };
 
-// LockKeys returns a read-snapshot handle that must later be used for lookup
-// and unlock.
+// LockKeys returns a global read-snapshot handle. It does not scan or pin
+// individual keys; the handle must later be used for lookup and unlock.
 struct LockContext {
   std::uint64_t id{0};
 };
 
 // PreparePut / BatchLookup share one batched return layout. All vectors use
-// the same index to describe the same key record.
+// the same index to describe the same key record. keys are borrowed pointers
+// into the corresponding input batch.
 struct AccessDesc {
   std::vector<const KeyId*> keys;
   std::vector<Address> addresses;
@@ -60,6 +61,8 @@ class MetaManager {
   Status LockKeys(const std::vector<KeyId>& flat_keys,
                   MetaManagerLockMode lock_mode,
                   LockContext* lock_context);
+  // BatchLookup performs the actual KeyId -> address lookups while the global
+  // read snapshot remains held by lock_context.
   Status BatchLookup(const std::vector<KeyId>& flat_keys,
                      const LockContext& lock_context,
                      FlatAccessDesc* access_desc);
@@ -87,27 +90,15 @@ class MetaManager {
     std::size_t slot_index{0};
   };
 
-  struct AddressRecord {
-    SlotRef slot;
-    std::uint64_t valid_length{0};
-
-    AddressRecord() = default;
-
-    AddressRecord(SlotRef slot_value,
-                  std::uint64_t valid_length_value)
-        : slot(slot_value),
-          valid_length(valid_length_value) {}
-  };
-
-  struct KeyEntry {
-    AddressRecord active_record;
-    bool has_active_record{false};
-    bool is_pending{false};
+  enum class RecordState : std::uint8_t {
+    kUnused = 0,
+    kPending,
+    kActive,
+    kFreed,
   };
 
   struct PendingPutItem {
-    KeyEntry* key_entry{nullptr};
-    const KeyId* key{nullptr};
+    std::size_t entry_id{0};
     SlotRef slot;
     std::uint64_t valid_length{0};
   };
@@ -116,14 +107,8 @@ class MetaManager {
     std::vector<PendingPutItem> items;
   };
 
-  struct LockedRecordRef {
-    const KeyId* key{nullptr};
-    AddressRecord* record{nullptr};
-  };
-
   struct ActiveLockContext {
-    std::vector<LockedRecordRef> items;
-    // Keeps active records and their slots alive until UnlockKeys.
+    // Keeps the whole key-to-address table stable until UnlockKeys.
     std::shared_lock<std::shared_mutex> read_phase_lock;
   };
 
@@ -147,8 +132,10 @@ class MetaManager {
   std::queue<std::size_t> short_free_slots_;
   std::queue<std::size_t> long_free_slots_;
 
-  // The bucket index is flat/open-addressed; EntryIndex keeps nodes stable so
-  // PendingPutItem and LockedRecordRef can safely retain pointers.
+  // EntryIndex stores one compact entry per unique KeyId and uses an
+  // open-addressed bucket array containing only EntryIds. KeyIds are
+  // append-only, so freeing a key only changes its state and never removes
+  // the hash slot.
   struct EntryIndex;
   std::unique_ptr<EntryIndex> entries_;
 
