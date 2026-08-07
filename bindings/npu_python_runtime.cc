@@ -461,7 +461,8 @@ void BindNpuPythonRuntime(py::module_& module) {
                     std::uint32_t>(),
            py::arg("batch_get_kernel_object_path"), py::arg("device_id") = 0,
            py::arg("npu_core_count") = 1,
-           py::arg("batch_put_kernel_object_path") = "")
+           py::arg("batch_put_kernel_object_path") = "",
+           py::arg("jettys_per_core") = 2)
        .def("initialize", &NpuRuntime::Initialize, py::arg("ddr_bytes"),
             py::arg("short_slot_size"), py::arg("long_slot_size"),
             py::arg("slot_count_per_class"))
