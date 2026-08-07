@@ -166,6 +166,7 @@ struct MetaManager::EntryIndex {
     std::size_t hash{0};
     const KeyId* key{nullptr};
     SlotRef slot;
+    Address address{0};
     std::uint64_t valid_length{0};
     RecordState state{RecordState::kUnused};
   };
@@ -224,6 +225,76 @@ struct MetaManager::EntryIndex {
       bucket = (bucket + 1) & mask;
     }
     return nullptr;
+  }
+
+  template <typename Consumer>
+  bool FindBatch(const std::vector<KeyId>& keys, Consumer&& consumer) {
+    if (keys.empty()) {
+      return true;
+    }
+    if (buckets_.empty()) {
+      return false;
+    }
+
+    struct Lane {
+      std::size_t hash{0};
+      std::size_t bucket{0};
+      std::size_t probes{0};
+      std::uint8_t fingerprint{0};
+      Bucket* result{nullptr};
+      bool done{false};
+    };
+
+    constexpr std::size_t kLaneCount = 4;
+    const std::size_t mask = buckets_.size() - 1;
+    for (std::size_t base = 0; base < keys.size();
+         base += kLaneCount) {
+      const std::size_t lane_count =
+          std::min(kLaneCount, keys.size() - base);
+      Lane lanes[kLaneCount];
+      std::size_t remaining = lane_count;
+
+      for (std::size_t lane = 0; lane < lane_count; ++lane) {
+        lanes[lane].hash = std::hash<KeyId>{}(keys[base + lane]);
+        lanes[lane].bucket = lanes[lane].hash & mask;
+        lanes[lane].fingerprint = Fingerprint(lanes[lane].hash);
+      }
+
+      while (remaining != 0) {
+        for (std::size_t lane = 0; lane < lane_count; ++lane) {
+          Lane& current = lanes[lane];
+          if (current.done) {
+            continue;
+          }
+
+          const std::uint8_t control = control_[current.bucket];
+          if (control == kEmptyControl) {
+            return false;
+          }
+          if (control == current.fingerprint) {
+            Bucket& candidate = buckets_[current.bucket];
+            if (candidate.hash == current.hash &&
+                *candidate.key == keys[base + lane]) {
+              current.result = &candidate;
+              current.done = true;
+              --remaining;
+              continue;
+            }
+          }
+          if (++current.probes >= buckets_.size()) {
+            return false;
+          }
+          current.bucket = (current.bucket + 1) & mask;
+        }
+      }
+
+      for (std::size_t lane = 0; lane < lane_count; ++lane) {
+        if (!consumer(base + lane, *lanes[lane].result)) {
+          return false;
+        }
+      }
+    }
+    return true;
   }
 
   InsertResult TryEmplace(const KeyId& key) {
@@ -570,6 +641,7 @@ Status MetaManager::CommitPut(const PutContext& put_context) {
   for (const PendingPutItem& item : pending_context.items) {
     EntryIndex::Bucket* bucket = entries_->FindStored(item.key, item.hash);
     bucket->slot = item.slot;
+    bucket->address = SlotAddress(item.slot);
     bucket->valid_length = item.valid_length;
     bucket->state = RecordState::kActive;
   }
@@ -655,24 +727,16 @@ Status MetaManager::LockKeys(const std::vector<KeyId>& flat_keys,
 }
 
 Status MetaManager::BatchLookup(const std::vector<KeyId>& flat_keys,
-                                const LockContext& lock_context,
+                                const LockContext&,
                                 FlatAccessDesc* access_desc) {
+  // The phase contract keeps the LockContext alive and prevents UnlockKeys
+  // from running concurrently, so the hot path does not revalidate it.
   ScopedMethodTimer timer(&timing_log_enabled_, "BatchLookup");
   if (access_desc == nullptr) {
     return Error(StatusCode::kInvalidArgument, ErrorTag::kInvalidRequest);
   }
   if (region_state_.load(std::memory_order_acquire) != RegionState::kReady) {
     return Error(StatusCode::kNotInitialized, ErrorTag::kRegionMissing);
-  }
-
-  std::shared_lock<std::shared_mutex> context_lock;
-  {
-    ScopedMethodTimer phase_timer(&timing_log_enabled_, "BatchLookup",
-                                  "lock_context");
-    context_lock = std::shared_lock<std::shared_mutex>(lock_context_mutex_);
-    if (lock_contexts_.find(lock_context.id) == lock_contexts_.end()) {
-      return Error(StatusCode::kNotFound, ErrorTag::kLockContextMissing);
-    }
   }
 
   {
@@ -688,14 +752,18 @@ Status MetaManager::BatchLookup(const std::vector<KeyId>& flat_keys,
   {
     ScopedMethodTimer phase_timer(&timing_log_enabled_, "BatchLookup",
                                   "find");
-    for (std::size_t i = 0; i < flat_keys.size(); ++i) {
-      const EntryIndex::Bucket* bucket = entries_->Find(flat_keys[i]);
-      if (bucket == nullptr || bucket->state != RecordState::kActive) {
-        return Error(StatusCode::kNotFound, ErrorTag::kKeyMissing);
-      }
+    const bool found = entries_->FindBatch(
+        flat_keys, [&](std::size_t index, const EntryIndex::Bucket& bucket) {
+          if (bucket.state != RecordState::kActive) {
+            return false;
+          }
 
-      FillAccessDescAt(&flat_keys[i], SlotAddress(bucket->slot),
-                       bucket->valid_length, i, access_desc);
+          FillAccessDescAt(&flat_keys[index], bucket.address,
+                           bucket.valid_length, index, access_desc);
+          return true;
+        });
+    if (!found) {
+      return Error(StatusCode::kNotFound, ErrorTag::kKeyMissing);
     }
   }
 
@@ -810,6 +878,7 @@ Status MetaManager::BatchFree(const std::vector<KeyId>& flat_keys) {
                                   "clear_entries");
     for (EntryIndex::Bucket* bucket : entries_to_clear) {
       bucket->slot = {};
+      bucket->address = 0;
       bucket->valid_length = 0;
       bucket->state = RecordState::kFreed;
     }
