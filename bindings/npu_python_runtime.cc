@@ -2,8 +2,11 @@
 
 #include <pybind11/stl.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <string>
@@ -30,6 +33,39 @@ Status InvalidArgument(std::string message) {
 Status Internal(std::string message) {
   return Status::Internal(std::move(message));
 }
+
+bool RuntimeTimingEnabled() {
+  const char* value = std::getenv("KVAF_RUNTIME_TIMING_LOG");
+  return value != nullptr && value[0] == '1';
+}
+
+class ScopedPrepareAccessTimer {
+ public:
+  explicit ScopedPrepareAccessTimer(const char* phase)
+      : phase_(phase), active_(RuntimeTimingEnabled()) {
+    if (active_) {
+      start_ = std::chrono::steady_clock::now();
+    }
+  }
+
+  ~ScopedPrepareAccessTimer() {
+    if (!active_) {
+      return;
+    }
+
+    const auto elapsed_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start_)
+            .count();
+    std::cerr << "RUNTIME_PERF_DETAIL operation=prepare_access_table"
+              << " phase=" << phase_ << " elapsed_ns=" << elapsed_ns << '\n';
+  }
+
+ private:
+  const char* phase_;
+  bool active_{false};
+  std::chrono::steady_clock::time_point start_;
+};
 
 void ThrowIfError(const Status& status) {
   if (status.ok()) return;
@@ -295,10 +331,18 @@ class NpuRuntime final {
   }
 
   AccessTableHandle PrepareAccessTable(const py::object& keys) {
-    std::vector<KeyId> copied_keys = CopyPrepareKeys(keys);
+    ScopedPrepareAccessTimer total_timer("binding_total");
+    std::vector<KeyId> copied_keys;
+    {
+      ScopedPrepareAccessTimer phase_timer("copy_prepare_keys");
+      copied_keys = CopyPrepareKeys(keys);
+    }
     AccessTableHandle handle;
-    ThrowIfError(runtime_->PrepareAccessTable(
-        AccessTablePrepareRequest{std::move(copied_keys)}, &handle));
+    {
+      ScopedPrepareAccessTimer phase_timer("runtime_prepare_access_table");
+      ThrowIfError(runtime_->PrepareAccessTable(
+          AccessTablePrepareRequest{std::move(copied_keys)}, &handle));
+    }
     return handle;
   }
 

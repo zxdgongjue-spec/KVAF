@@ -1,6 +1,9 @@
 #include "kvaf/runtime/runtime.h"
 
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <new>
@@ -12,6 +15,76 @@
 namespace kvaf {
 
 namespace {
+
+bool RuntimeTimingEnabled() {
+  const char* value = std::getenv("KVAF_RUNTIME_TIMING_LOG");
+  return value != nullptr && value[0] == '1';
+}
+
+// Runtime 外层计时与 MetaManager 内部计时分开，避免普通分析扰动哈希查询热路径。
+bool MetaManagerTimingEnabled() {
+  const char* value = std::getenv("KVAF_META_MANAGER_TIMING_LOG");
+  return value != nullptr && value[0] == '1';
+}
+
+class ScopedRuntimeTimer {
+ public:
+  ScopedRuntimeTimer(const char* operation,
+                     const char* phase,
+                     std::size_t key_count)
+      : operation_(operation),
+        phase_(phase),
+        key_count_(key_count),
+        active_(RuntimeTimingEnabled()) {
+    if (active_) {
+      start_ = std::chrono::steady_clock::now();
+    }
+  }
+
+  ~ScopedRuntimeTimer() {
+    if (!active_) {
+      return;
+    }
+
+    const auto elapsed_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start_)
+            .count();
+    std::cerr << "RUNTIME_PERF_DETAIL operation=" << operation_
+              << " phase=" << phase_ << " keys=" << key_count_
+              << " elapsed_ns=" << elapsed_ns << '\n';
+  }
+
+ private:
+  const char* operation_;
+  const char* phase_;
+  std::size_t key_count_;
+  bool active_{false};
+  std::chrono::steady_clock::time_point start_;
+};
+
+class ScopedMetaManagerTiming {
+ public:
+  explicit ScopedMetaManagerTiming(MetaManager& meta_manager)
+      : meta_manager_(meta_manager), active_(MetaManagerTimingEnabled()) {
+    if (active_) {
+      meta_manager_.SetTimingLogEnabled(true);
+    }
+  }
+
+  ~ScopedMetaManagerTiming() {
+    if (!active_) {
+      return;
+    }
+
+    meta_manager_.SetTimingLogEnabled(false);
+    FlushMetaManagerTimingSummary();
+  }
+
+ private:
+  MetaManager& meta_manager_;
+  bool active_{false};
+};
 
 class HostDdrMemoryAllocator final : public DdrMemoryAllocator {
  public:
@@ -172,6 +245,8 @@ Status Runtime::Shutdown() {
 
 Status Runtime::PrepareAccessTable(const AccessTablePrepareRequest& request,
                                    AccessTableHandle* handle) {
+  ScopedRuntimeTimer total_timer("prepare_access_table", "total",
+                                 request.flat_keys.size());
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
@@ -182,59 +257,83 @@ Status Runtime::PrepareAccessTable(const AccessTablePrepareRequest& request,
     return Status::InvalidArgument("PrepareAccessTable requires at least one key");
   }
 
+  ScopedMetaManagerTiming meta_manager_timing(meta_manager_);
+
   LockContext lock_context;
-  Status status = meta_manager_.LockKeys(
-      request.flat_keys, MetaManagerLockMode::kStableReadAllowAppend,
-      &lock_context);
+  Status status;
+  {
+    ScopedRuntimeTimer phase_timer("prepare_access_table", "lock_keys",
+                                   request.flat_keys.size());
+    status = meta_manager_.LockKeys(
+        request.flat_keys, MetaManagerLockMode::kStableReadAllowAppend,
+        &lock_context);
+  }
   if (!status.ok()) {
     return status;
   }
 
   FlatAccessDesc lookup;
-  status = meta_manager_.BatchLookup(request.flat_keys, lock_context, &lookup);
+  {
+    ScopedRuntimeTimer phase_timer("prepare_access_table", "batch_lookup",
+                                   request.flat_keys.size());
+    status = meta_manager_.BatchLookup(request.flat_keys, lock_context, &lookup);
+  }
   if (!status.ok()) {
     (void)meta_manager_.UnlockKeys(lock_context);
     return status;
   }
-  if (lookup.addresses.size() != request.flat_keys.size() ||
-      lookup.keys.size() != request.flat_keys.size() ||
-      lookup.lengths.size() != request.flat_keys.size() ||
-      lookup.valid.size() != request.flat_keys.size()) {
-    (void)meta_manager_.UnlockKeys(lock_context);
-    return Status::InvalidState("MetaManager returned an invalid AccessTable lookup");
+  {
+    ScopedRuntimeTimer phase_timer("prepare_access_table", "validate_layout",
+                                   request.flat_keys.size());
+    if (lookup.addresses.size() != request.flat_keys.size() ||
+        lookup.keys.size() != request.flat_keys.size() ||
+        lookup.lengths.size() != request.flat_keys.size() ||
+        lookup.valid.size() != request.flat_keys.size()) {
+      (void)meta_manager_.UnlockKeys(lock_context);
+      return Status::InvalidState(
+          "MetaManager returned an invalid AccessTable lookup");
+    }
   }
 
   bool has_valid_entries = false;
   bool has_uniform_valid_length = true;
   std::uint64_t uniform_valid_length = 0;
-  for (std::size_t index = 0; index < lookup.addresses.size(); ++index) {
-    if (lookup.valid[index] == 0) {
-      continue;
-    }
-    if (!has_valid_entries) {
-      has_valid_entries = true;
-      uniform_valid_length = lookup.lengths[index];
-    } else if (lookup.lengths[index] != uniform_valid_length) {
-      has_uniform_valid_length = false;
-      break;
+  {
+    ScopedRuntimeTimer phase_timer("prepare_access_table", "scan_lengths",
+                                   request.flat_keys.size());
+    for (std::size_t index = 0; index < lookup.addresses.size(); ++index) {
+      if (lookup.valid[index] == 0) {
+        continue;
+      }
+      if (!has_valid_entries) {
+        has_valid_entries = true;
+        uniform_valid_length = lookup.lengths[index];
+      } else if (lookup.lengths[index] != uniform_valid_length) {
+        has_uniform_valid_length = false;
+        break;
+      }
     }
   }
 
-  const std::uint64_t id = next_access_table_id_++;
-  if (id == 0) {
-    (void)meta_manager_.UnlockKeys(lock_context);
-    return Status::InvalidState("AccessTable handle space is exhausted");
+  {
+    ScopedRuntimeTimer phase_timer("prepare_access_table", "publish_table",
+                                   request.flat_keys.size());
+    const std::uint64_t id = next_access_table_id_++;
+    if (id == 0) {
+      (void)meta_manager_.UnlockKeys(lock_context);
+      return Status::InvalidState("AccessTable handle space is exhausted");
+    }
+    auto table = std::make_unique<AccessTableState>();
+    table->lock_context = lock_context;
+    table->addresses = std::move(lookup.addresses);
+    table->lengths = std::move(lookup.lengths);
+    table->valid = std::move(lookup.valid);
+    table->has_valid_entries = has_valid_entries;
+    table->has_uniform_valid_length = has_uniform_valid_length;
+    table->uniform_valid_length = uniform_valid_length;
+    access_tables_.emplace(id, std::move(table));
+    *handle = AccessTableHandle{id};
   }
-  auto table = std::make_unique<AccessTableState>();
-  table->lock_context = lock_context;
-  table->addresses = std::move(lookup.addresses);
-  table->lengths = std::move(lookup.lengths);
-  table->valid = std::move(lookup.valid);
-  table->has_valid_entries = has_valid_entries;
-  table->has_uniform_valid_length = has_uniform_valid_length;
-  table->uniform_valid_length = uniform_valid_length;
-  access_tables_.emplace(id, std::move(table));
-  *handle = AccessTableHandle{id};
   return Status::OK();
 }
 
