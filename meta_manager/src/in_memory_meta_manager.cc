@@ -11,6 +11,8 @@
 #include <new>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 
@@ -228,8 +230,14 @@ struct MetaManager::EntryIndex {
   }
 
   template <typename Consumer>
-  bool FindBatch(const std::vector<KeyId>& keys, Consumer&& consumer) {
-    if (keys.empty()) {
+  bool FindBatchRange(const std::vector<KeyId>& keys,
+                      std::size_t begin,
+                      std::size_t end,
+                      Consumer&& consumer) {
+    if (begin > end || end > keys.size()) {
+      return false;
+    }
+    if (begin == end) {
       return true;
     }
     if (buckets_.empty()) {
@@ -247,10 +255,10 @@ struct MetaManager::EntryIndex {
 
     constexpr std::size_t kLaneCount = 4;
     const std::size_t mask = buckets_.size() - 1;
-    for (std::size_t base = 0; base < keys.size();
+    for (std::size_t base = begin; base < end;
          base += kLaneCount) {
       const std::size_t lane_count =
-          std::min(kLaneCount, keys.size() - base);
+          std::min(kLaneCount, end - base);
       Lane lanes[kLaneCount];
       std::size_t remaining = lane_count;
 
@@ -295,6 +303,12 @@ struct MetaManager::EntryIndex {
       }
     }
     return true;
+  }
+
+  template <typename Consumer>
+  bool FindBatch(const std::vector<KeyId>& keys, Consumer&& consumer) {
+    return FindBatchRange(keys, 0, keys.size(),
+                          std::forward<Consumer>(consumer));
   }
 
   InsertResult TryEmplace(const KeyId& key) {
@@ -752,8 +766,8 @@ Status MetaManager::BatchLookup(const std::vector<KeyId>& flat_keys,
   {
     ScopedMethodTimer phase_timer(&timing_log_enabled_, "BatchLookup",
                                   "find");
-    const bool found = entries_->FindBatch(
-        flat_keys, [&](std::size_t index, const EntryIndex::Bucket& bucket) {
+    const auto consumer =
+        [&](std::size_t index, const EntryIndex::Bucket& bucket) {
           if (bucket.state != RecordState::kActive) {
             return false;
           }
@@ -761,8 +775,67 @@ Status MetaManager::BatchLookup(const std::vector<KeyId>& flat_keys,
           FillAccessDescAt(&flat_keys[index], bucket.address,
                            bucket.valid_length, index, access_desc);
           return true;
+        };
+
+    constexpr std::size_t kParallelThreshold = 8192;
+    constexpr std::size_t kKeysPerWorker = 4096;
+    constexpr std::size_t kMaxWorkers = 4;
+
+    std::size_t worker_count = 1;
+    if (flat_keys.size() >= kParallelThreshold) {
+      const std::size_t hardware_threads =
+          std::thread::hardware_concurrency();
+      const std::size_t available_threads =
+          hardware_threads == 0 ? kMaxWorkers : hardware_threads;
+      const std::size_t required_workers =
+          (flat_keys.size() + kKeysPerWorker - 1) / kKeysPerWorker;
+      worker_count =
+          std::min({kMaxWorkers, available_threads, required_workers});
+    }
+
+    const std::size_t chunk_size =
+        (flat_keys.size() + worker_count - 1) / worker_count;
+    std::atomic<bool> lookup_failed{false};
+    bool thread_creation_failed = false;
+    std::vector<std::thread> workers;
+
+    try {
+      workers.reserve(worker_count > 1 ? worker_count - 1 : 0);
+      for (std::size_t worker = 0; worker + 1 < worker_count; ++worker) {
+        const std::size_t begin = worker * chunk_size;
+        const std::size_t end =
+            std::min(flat_keys.size(), begin + chunk_size);
+        workers.emplace_back([&, begin, end]() {
+          if (!lookup_failed.load(std::memory_order_relaxed) &&
+              !entries_->FindBatchRange(flat_keys, begin, end, consumer)) {
+            lookup_failed.store(true, std::memory_order_relaxed);
+          }
         });
-    if (!found) {
+      }
+
+      if (!lookup_failed.load(std::memory_order_relaxed)) {
+        const std::size_t begin = (worker_count - 1) * chunk_size;
+        if (!entries_->FindBatchRange(flat_keys, begin, flat_keys.size(),
+                                       consumer)) {
+          lookup_failed.store(true, std::memory_order_relaxed);
+        }
+      }
+    } catch (const std::bad_alloc&) {
+      thread_creation_failed = true;
+    } catch (const std::system_error&) {
+      thread_creation_failed = true;
+    }
+
+    for (std::thread& worker : workers) {
+      if (worker.joinable()) {
+        worker.join();
+      }
+    }
+
+    if (thread_creation_failed) {
+      return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
+    }
+    if (lookup_failed.load(std::memory_order_relaxed)) {
       return Error(StatusCode::kNotFound, ErrorTag::kKeyMissing);
     }
   }
