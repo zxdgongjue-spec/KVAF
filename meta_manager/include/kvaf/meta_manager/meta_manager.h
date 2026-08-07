@@ -98,7 +98,8 @@ class MetaManager {
   };
 
   struct PendingPutItem {
-    std::size_t entry_id{0};
+    const KeyId* key{nullptr};
+    std::size_t hash{0};
     SlotRef slot;
     std::uint64_t valid_length{0};
   };
@@ -132,10 +133,9 @@ class MetaManager {
   std::queue<std::size_t> short_free_slots_;
   std::queue<std::size_t> long_free_slots_;
 
-  // EntryIndex stores one compact entry per unique KeyId and uses an
-  // open-addressed bucket array containing only EntryIds. KeyIds are
-  // append-only, so freeing a key only changes its state and never removes
-  // the hash slot.
+  // EntryIndex stores the address metadata directly in the open-addressed
+  // bucket. KeyId storage is append-only and separate only because strings
+  // need stable addresses while buckets are rehashed.
   struct EntryIndex;
   std::unique_ptr<EntryIndex> entries_;
 

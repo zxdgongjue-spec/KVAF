@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <deque>
 #include <functional>
 #include <iostream>
 #include <limits>
@@ -161,71 +162,75 @@ class ScopedMethodTimer {
 }  // namespace
 
 struct MetaManager::EntryIndex {
-  using EntryId = std::uint32_t;
-  static constexpr EntryId kInvalidEntry =
-      std::numeric_limits<EntryId>::max();
-
-  struct Entry {
+  struct Bucket {
     std::size_t hash{0};
-    KeyId key;
+    const KeyId* key{nullptr};
     SlotRef slot;
     std::uint64_t valid_length{0};
     RecordState state{RecordState::kUnused};
   };
 
   struct InsertResult {
-    EntryId id{kInvalidEntry};
+    Bucket* bucket{nullptr};
+    const KeyId* key{nullptr};
+    std::size_t hash{0};
     bool inserted{false};
   };
 
   static constexpr std::uint8_t kEmptyControl = 0;
 
   void Reserve(std::size_t max_entries) {
+    const std::size_t max_size = std::numeric_limits<std::size_t>::max();
     const std::size_t required_capacity =
-        std::max<std::size_t>(8, max_entries * 2);
+        max_entries > max_size / 2
+            ? max_size
+            : std::max<std::size_t>(8, max_entries * 2);
     std::size_t capacity = 1;
-    while (capacity < required_capacity) {
+    while (capacity < required_capacity && capacity <= max_size / 2) {
       capacity <<= 1;
+    }
+    if (capacity < required_capacity) {
+      capacity = required_capacity;
     }
     if (capacity > buckets_.size()) {
       Rehash(capacity);
     }
-    if (max_entries > entries_.capacity()) {
-      entries_.reserve(max_entries);
-    }
   }
 
-  EntryId Find(const KeyId& key) const {
+  Bucket* Find(const KeyId& key) {
     const std::size_t hash = std::hash<KeyId>{}(key);
-    const std::uint8_t fingerprint = Fingerprint(hash);
-    if (buckets_.empty()) {
-      return kInvalidEntry;
+    return FindWithHash(key, hash);
+  }
+
+  Bucket* FindStored(const KeyId* key, std::size_t hash) {
+    if (key == nullptr || buckets_.empty()) {
+      return nullptr;
     }
 
+    const std::uint8_t fingerprint = Fingerprint(hash);
     const std::size_t mask = buckets_.size() - 1;
     std::size_t bucket = hash & mask;
     for (std::size_t probes = 0; probes < buckets_.size(); ++probes) {
       const std::uint8_t control = control_[bucket];
       if (control == kEmptyControl) {
-        return kInvalidEntry;
+        return nullptr;
       }
       if (control == fingerprint) {
-        const EntryId entry_id = buckets_[bucket];
-        const Entry& candidate = entries_[entry_id];
+        Bucket& candidate = buckets_[bucket];
         if (candidate.hash == hash && candidate.key == key) {
-          return entry_id;
+          return &candidate;
         }
       }
       bucket = (bucket + 1) & mask;
     }
-    return kInvalidEntry;
+    return nullptr;
   }
 
   InsertResult TryEmplace(const KeyId& key) {
     if (buckets_.empty()) {
       Reserve(8);
     }
-    if ((entries_.size() + 1) * 2 >= buckets_.size()) {
+    if ((size_ + 1) * 2 >= buckets_.size()) {
       Rehash(buckets_.size() * 2);
     }
 
@@ -236,36 +241,49 @@ struct MetaManager::EntryIndex {
     for (;;) {
       const std::uint8_t control = control_[bucket];
       if (control == kEmptyControl) {
-        if (entries_.size() >= kInvalidEntry) {
-          throw std::bad_alloc();
-        }
-        entries_.push_back(Entry{hash, key});
-        const EntryId entry_id =
-            static_cast<EntryId>(entries_.size() - 1);
-        buckets_[bucket] = entry_id;
+        keys_.emplace_back(key);
+        const KeyId* stored_key = &keys_.back();
+        Bucket& new_bucket = buckets_[bucket];
+        new_bucket = Bucket{hash, stored_key};
         control_[bucket] = fingerprint;
-        return InsertResult{entry_id, true};
+        ++size_;
+        return InsertResult{&new_bucket, stored_key, hash, true};
       }
       if (control == fingerprint) {
-        const EntryId entry_id = buckets_[bucket];
-        const Entry& candidate = entries_[entry_id];
-        if (candidate.hash == hash && candidate.key == key) {
-          return InsertResult{entry_id, false};
+        Bucket& candidate = buckets_[bucket];
+        if (candidate.hash == hash && *candidate.key == key) {
+          return InsertResult{&candidate, candidate.key, hash, false};
         }
       }
       bucket = (bucket + 1) & mask;
     }
   }
 
-  Entry& Get(EntryId entry_id) {
-    return entries_[entry_id];
-  }
-
-  const Entry& Get(EntryId entry_id) const {
-    return entries_[entry_id];
-  }
-
  private:
+  Bucket* FindWithHash(const KeyId& key, std::size_t hash) {
+    if (buckets_.empty()) {
+      return nullptr;
+    }
+
+    const std::uint8_t fingerprint = Fingerprint(hash);
+    const std::size_t mask = buckets_.size() - 1;
+    std::size_t bucket = hash & mask;
+    for (std::size_t probes = 0; probes < buckets_.size(); ++probes) {
+      const std::uint8_t control = control_[bucket];
+      if (control == kEmptyControl) {
+        return nullptr;
+      }
+      if (control == fingerprint) {
+        Bucket& candidate = buckets_[bucket];
+        if (candidate.hash == hash && *candidate.key == key) {
+          return &candidate;
+        }
+      }
+      bucket = (bucket + 1) & mask;
+    }
+    return nullptr;
+  }
+
   static std::uint8_t Fingerprint(std::size_t hash) {
     const std::uint64_t mixed_hash = static_cast<std::uint64_t>(hash);
     const std::uint8_t low_byte = static_cast<std::uint8_t>(
@@ -274,17 +292,21 @@ struct MetaManager::EntryIndex {
   }
 
   void Rehash(std::size_t capacity) {
-    std::vector<EntryId> new_buckets(capacity, kInvalidEntry);
+    std::vector<Bucket> new_buckets(capacity);
     std::vector<std::uint8_t> new_control(capacity, kEmptyControl);
     const std::size_t mask = capacity - 1;
-    for (EntryId entry_id = 0;
-         entry_id < static_cast<EntryId>(entries_.size()); ++entry_id) {
-      const Entry& entry = entries_[entry_id];
+    for (std::size_t old_bucket = 0; old_bucket < buckets_.size();
+         ++old_bucket) {
+      if (control_[old_bucket] == kEmptyControl) {
+        continue;
+      }
+
+      const Bucket& entry = buckets_[old_bucket];
       std::size_t bucket = entry.hash & mask;
       while (new_control[bucket] != kEmptyControl) {
         bucket = (bucket + 1) & mask;
       }
-      new_buckets[bucket] = entry_id;
+      new_buckets[bucket] = entry;
       new_control[bucket] = Fingerprint(entry.hash);
     }
 
@@ -292,9 +314,10 @@ struct MetaManager::EntryIndex {
     control_.swap(new_control);
   }
 
-  std::vector<Entry> entries_;
-  std::vector<EntryId> buckets_;
+  std::deque<KeyId> keys_;
+  std::vector<Bucket> buckets_;
   std::vector<std::uint8_t> control_;
+  std::size_t size_{0};
 };
 
 MetaManager::MetaManager()
@@ -403,21 +426,25 @@ Status MetaManager::PreparePut(const std::vector<KeyId>& flat_keys,
   }
 
   PendingPutContext pending_context;
-  std::vector<EntryIndex::EntryId> new_entries;
+  std::vector<const KeyId*> new_keys;
   {
     ScopedMethodTimer phase_timer(&timing_log_enabled_, "PreparePut",
                                   "reserve");
     try {
       pending_context.items.reserve(flat_keys.size());
-      new_entries.reserve(flat_keys.size());
+      new_keys.reserve(flat_keys.size());
     } catch (const std::bad_alloc&) {
       return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
     }
   }
 
-  auto rollback_new_entries = [&]() {
-    for (const EntryIndex::EntryId entry_id : new_entries) {
-      entries_->Get(entry_id).state = RecordState::kFreed;
+  auto rollback_new_keys = [&]() {
+    for (const KeyId* key : new_keys) {
+      EntryIndex::Bucket* bucket =
+          entries_->FindStored(key, std::hash<KeyId>{}(*key));
+      if (bucket != nullptr) {
+        bucket->state = RecordState::kFreed;
+      }
     }
   };
 
@@ -429,21 +456,21 @@ Status MetaManager::PreparePut(const std::vector<KeyId>& flat_keys,
         const EntryIndex::InsertResult result =
             entries_->TryEmplace(flat_keys[i]);
         if (result.inserted) {
-          new_entries.push_back(result.id);
+          new_keys.push_back(result.key);
         }
 
-        EntryIndex::Entry& entry = entries_->Get(result.id);
-        if (!result.inserted || entry.state != RecordState::kUnused) {
-          rollback_new_entries();
+        EntryIndex::Bucket& bucket = *result.bucket;
+        if (!result.inserted || bucket.state != RecordState::kUnused) {
+          rollback_new_keys();
           return Error(StatusCode::kAlreadyExists, ErrorTag::kKeyExists);
         }
 
-        entry.state = RecordState::kPending;
+        bucket.state = RecordState::kPending;
         pending_context.items.push_back(PendingPutItem{
-            result.id, SlotRef{slot_classes[i], 0}, lengths[i]});
+            result.key, result.hash, SlotRef{slot_classes[i], 0}, lengths[i]});
       }
     } catch (const std::bad_alloc&) {
-      rollback_new_entries();
+      rollback_new_keys();
       return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
     }
   }
@@ -453,7 +480,7 @@ Status MetaManager::PreparePut(const std::vector<KeyId>& flat_keys,
                                   "check_capacity");
     if (short_free_slots_.size() < short_needed ||
         long_free_slots_.size() < long_needed) {
-      rollback_new_entries();
+      rollback_new_keys();
       return Error(StatusCode::kOutOfMemory, ErrorTag::kOutOfSlots);
     }
   }
@@ -464,7 +491,7 @@ Status MetaManager::PreparePut(const std::vector<KeyId>& flat_keys,
     try {
       ResizeAccessDesc(flat_keys.size(), put_desc);
     } catch (const std::bad_alloc&) {
-      rollback_new_entries();
+      rollback_new_keys();
       return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
     }
   }
@@ -488,20 +515,28 @@ Status MetaManager::PreparePut(const std::vector<KeyId>& flat_keys,
       auto inserted = pending_puts_.try_emplace(ctx_id);
       if (!inserted.second) {
         for (const PendingPutItem& item : pending_context.items) {
-          entries_->Get(item.entry_id).state = RecordState::kFreed;
+          EntryIndex::Bucket* bucket =
+              entries_->FindStored(item.key, item.hash);
+          if (bucket != nullptr) {
+            bucket->state = RecordState::kFreed;
+          }
           ReleaseSlot(item.slot);
         }
-        rollback_new_entries();
+        rollback_new_keys();
         return Error(StatusCode::kInvalidState, ErrorTag::kStateConflict);
       }
       inserted.first->second.items.swap(pending_context.items);
       put_context->id = ctx_id;
     } catch (const std::bad_alloc&) {
       for (const PendingPutItem& item : pending_context.items) {
-        entries_->Get(item.entry_id).state = RecordState::kFreed;
+        EntryIndex::Bucket* bucket =
+            entries_->FindStored(item.key, item.hash);
+        if (bucket != nullptr) {
+          bucket->state = RecordState::kFreed;
+        }
         ReleaseSlot(item.slot);
       }
-      rollback_new_entries();
+      rollback_new_keys();
       return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
     }
   }
@@ -526,17 +561,17 @@ Status MetaManager::CommitPut(const PutContext& put_context) {
   pending_puts_.erase(pending_it);
 
   for (const PendingPutItem& item : pending_context.items) {
-    EntryIndex::Entry& entry = entries_->Get(item.entry_id);
-    if (entry.state != RecordState::kPending) {
+    EntryIndex::Bucket* bucket = entries_->FindStored(item.key, item.hash);
+    if (bucket == nullptr || bucket->state != RecordState::kPending) {
       return Error(StatusCode::kInvalidState, ErrorTag::kStateConflict);
     }
   }
 
   for (const PendingPutItem& item : pending_context.items) {
-    EntryIndex::Entry& entry = entries_->Get(item.entry_id);
-    entry.slot = item.slot;
-    entry.valid_length = item.valid_length;
-    entry.state = RecordState::kActive;
+    EntryIndex::Bucket* bucket = entries_->FindStored(item.key, item.hash);
+    bucket->slot = item.slot;
+    bucket->valid_length = item.valid_length;
+    bucket->state = RecordState::kActive;
   }
 
   return Status::OK();
@@ -559,15 +594,15 @@ Status MetaManager::AbortPut(const PutContext& put_context) {
   pending_puts_.erase(pending_it);
 
   for (const PendingPutItem& item : pending_context.items) {
-    EntryIndex::Entry& entry = entries_->Get(item.entry_id);
-    if (entry.state != RecordState::kPending) {
+    EntryIndex::Bucket* bucket = entries_->FindStored(item.key, item.hash);
+    if (bucket == nullptr || bucket->state != RecordState::kPending) {
       return Error(StatusCode::kInvalidState, ErrorTag::kStateConflict);
     }
   }
 
   for (const PendingPutItem& item : pending_context.items) {
-    EntryIndex::Entry& entry = entries_->Get(item.entry_id);
-    entry.state = RecordState::kFreed;
+    EntryIndex::Bucket* bucket = entries_->FindStored(item.key, item.hash);
+    bucket->state = RecordState::kFreed;
     ReleaseSlot(item.slot);
   }
 
@@ -630,31 +665,37 @@ Status MetaManager::BatchLookup(const std::vector<KeyId>& flat_keys,
     return Error(StatusCode::kNotInitialized, ErrorTag::kRegionMissing);
   }
 
-  std::shared_lock<std::shared_mutex> context_lock(lock_context_mutex_);
-  auto context_it = lock_contexts_.find(lock_context.id);
-  if (context_it == lock_contexts_.end()) {
-    return Error(StatusCode::kNotFound, ErrorTag::kLockContextMissing);
+  std::shared_lock<std::shared_mutex> context_lock;
+  {
+    ScopedMethodTimer phase_timer(&timing_log_enabled_, "BatchLookup",
+                                  "lock_context");
+    context_lock = std::shared_lock<std::shared_mutex>(lock_context_mutex_);
+    if (lock_contexts_.find(lock_context.id) == lock_contexts_.end()) {
+      return Error(StatusCode::kNotFound, ErrorTag::kLockContextMissing);
+    }
   }
 
-  try {
-    ResizeAccessDesc(flat_keys.size(), access_desc);
-  } catch (const std::bad_alloc&) {
-    return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
+  {
+    ScopedMethodTimer phase_timer(&timing_log_enabled_, "BatchLookup",
+                                  "resize_desc");
+    try {
+      ResizeAccessDesc(flat_keys.size(), access_desc);
+    } catch (const std::bad_alloc&) {
+      return Error(StatusCode::kOutOfMemory, ErrorTag::kHostOutOfMemory);
+    }
   }
 
   {
     ScopedMethodTimer phase_timer(&timing_log_enabled_, "BatchLookup",
                                   "find");
     for (std::size_t i = 0; i < flat_keys.size(); ++i) {
-      const EntryIndex::EntryId entry_id = entries_->Find(flat_keys[i]);
-      if (entry_id == EntryIndex::kInvalidEntry ||
-          entries_->Get(entry_id).state != RecordState::kActive) {
+      const EntryIndex::Bucket* bucket = entries_->Find(flat_keys[i]);
+      if (bucket == nullptr || bucket->state != RecordState::kActive) {
         return Error(StatusCode::kNotFound, ErrorTag::kKeyMissing);
       }
 
-      const EntryIndex::Entry& entry = entries_->Get(entry_id);
-      FillAccessDescAt(&flat_keys[i], SlotAddress(entry.slot),
-                       entry.valid_length, i, access_desc);
+      FillAccessDescAt(&flat_keys[i], SlotAddress(bucket->slot),
+                       bucket->valid_length, i, access_desc);
     }
   }
 
@@ -738,7 +779,7 @@ Status MetaManager::BatchFree(const std::vector<KeyId>& flat_keys) {
   }
 
   std::vector<SlotRef> slots_to_recycle;
-  std::vector<EntryIndex::EntryId> entries_to_clear;
+  std::vector<EntryIndex::Bucket*> entries_to_clear;
   {
     ScopedMethodTimer phase_timer(&timing_log_enabled_, "BatchFree",
                                   "reserve");
@@ -754,27 +795,23 @@ Status MetaManager::BatchFree(const std::vector<KeyId>& flat_keys) {
     ScopedMethodTimer phase_timer(&timing_log_enabled_, "BatchFree",
                                   "validate_keys");
     for (const KeyId& key : *keys_to_free) {
-      const EntryIndex::EntryId entry_id = entries_->Find(key);
-      if (entry_id == EntryIndex::kInvalidEntry ||
-          entries_->Get(entry_id).state != RecordState::kActive) {
+      EntryIndex::Bucket* bucket = entries_->Find(key);
+      if (bucket == nullptr || bucket->state != RecordState::kActive) {
         return Error(StatusCode::kNotFound, ErrorTag::kKeyMissing);
       }
 
-      const EntryIndex::Entry& entry = entries_->Get(entry_id);
-      const SlotRef slot = entry.slot;
-      slots_to_recycle.push_back(slot);
-      entries_to_clear.push_back(entry_id);
+      slots_to_recycle.push_back(bucket->slot);
+      entries_to_clear.push_back(bucket);
     }
   }
 
   {
     ScopedMethodTimer phase_timer(&timing_log_enabled_, "BatchFree",
                                   "clear_entries");
-    for (const EntryIndex::EntryId entry_id : entries_to_clear) {
-      EntryIndex::Entry& entry = entries_->Get(entry_id);
-      entry.slot = {};
-      entry.valid_length = 0;
-      entry.state = RecordState::kFreed;
+    for (EntryIndex::Bucket* bucket : entries_to_clear) {
+      bucket->slot = {};
+      bucket->valid_length = 0;
+      bucket->state = RecordState::kFreed;
     }
   }
   {

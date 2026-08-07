@@ -567,6 +567,8 @@ bool TestTimingLogPhases() {
          expect_phase("PreparePut", "publish_context") &&
          expect_phase("LockKeys", "read_phase") &&
          expect_phase("LockKeys", "register_context") &&
+         expect_phase("BatchLookup", "lock_context") &&
+         expect_phase("BatchLookup", "resize_desc") &&
          expect_phase("BatchLookup", "find") &&
          expect_phase("BatchFree", "write_phase") &&
          expect_phase("BatchFree", "deduplicate") &&
