@@ -44,6 +44,9 @@ struct Options {
   // Optional functional preflight: use a second runtime output allocation on
   // the same transport, then return to the primary benchmark output.
   uint32_t dynamic_output_smoke = 0U;
+  // Opt-in AIV-internal cycle timeline. Disabled measurements retain the
+  // original hot path without GetSystemCycle calls or per-iteration D2H.
+  uint32_t kernel_profile = 0U;
   std::string kernel;
 };
 
@@ -112,6 +115,8 @@ bool ParseOptions(int argc, char **argv, Options *options) {
       if (!ParseU32(argv[++index], &options->graph_iterations)) return false;
     } else if (arg == "--dynamic-output-smoke" && index + 1 < argc) {
       if (!ParseU32(argv[++index], &options->dynamic_output_smoke)) return false;
+    } else if (arg == "--kernel-profile" && index + 1 < argc) {
+      if (!ParseU32(argv[++index], &options->kernel_profile)) return false;
     } else {
       return false;
     }
@@ -125,7 +130,8 @@ bool ParseOptions(int argc, char **argv, Options *options) {
          ReadEnvU32("MASK_EVERY", &options->mask_every) &&
          ReadEnvU32("ACTIVE_EVERY", &options->active_every) &&
          ReadEnvU32("ACTIVE_PERCENT", &options->active_percent) &&
-         ReadEnvU32("DYNAMIC_OUTPUT_SMOKE", &options->dynamic_output_smoke) && options->table_capacity != 0U &&
+         ReadEnvU32("DYNAMIC_OUTPUT_SMOKE", &options->dynamic_output_smoke) &&
+         ReadEnvU32("KERNEL_PROFILE", &options->kernel_profile) && options->table_capacity != 0U &&
          options->requests != 0U && options->requests <= options->output_rows && options->output_rows != 0U &&
          options->block_bytes != 0U && options->source_stride >= options->block_bytes &&
          options->aiv_cores != 0U && options->aiv_cores <= KVAF_AIV_BATCH_GET_MAX_AIV_CORES &&
@@ -134,6 +140,7 @@ bool ParseOptions(int argc, char **argv, Options *options) {
          options->aiv_cores <= options->requests && options->iterations != 0U &&
          options->active_percent >= 1U && options->active_percent <= 100U &&
          options->graph_iterations != 0U && options->dynamic_output_smoke <= 1U &&
+         options->kernel_profile <= 1U &&
          (options->mask_every == 0U || options->active_every == 0U);
 }
 
@@ -155,6 +162,219 @@ double Percentile(std::vector<double> samples, double fraction) {
   const size_t lower = static_cast<size_t>(position);
   const size_t upper = std::min(lower + 1U, samples.size() - 1U);
   return samples[lower] + (samples[upper] - samples[lower]) * (position - lower);
+}
+
+constexpr double kProfileCyclesPerMicrosecond = 50.0;
+
+double ProfileCyclesToUs(uint64_t begin, uint64_t end) {
+  return static_cast<double>(end - begin) / kProfileCyclesPerMicrosecond;
+}
+
+bool CollectKernelProfiles(
+    const std::vector<KvafBatchGetCoreStatus> &statuses,
+    std::vector<KvafBatchGetCoreProfile> *profiles) {
+  if (profiles == nullptr) return false;
+  for (size_t core = 0U; core < statuses.size(); ++core) {
+    const KvafBatchGetCoreStatus &status = statuses[core];
+    const KvafBatchGetCoreProfile &profile = status.profile;
+    const bool invalid_doorbell =
+        (profile.first_doorbell_cycle != 0U &&
+         (profile.first_doorbell_cycle < profile.compact_done_cycle ||
+          profile.first_doorbell_cycle > profile.post_done_cycle)) ||
+        (status.result == 0U && profile.active_requests != 0U &&
+         profile.first_doorbell_cycle == 0U) ||
+        (profile.active_requests == 0U &&
+         profile.first_doorbell_cycle != 0U);
+    if (profile.magic != KVAF_AIV_BATCH_GET_PROFILE_MAGIC ||
+        profile.kernel_start_cycle > profile.setup_done_cycle ||
+        profile.setup_done_cycle > profile.compact_done_cycle ||
+        profile.compact_done_cycle > profile.post_done_cycle ||
+        profile.post_done_cycle > profile.completion_done_cycle ||
+        profile.completion_done_cycle > profile.kernel_finish_cycle ||
+        invalid_doorbell) {
+      std::cerr << "[KVAF_EXECUTE] invalid kernel profile core=" << core
+                << " magic=0x" << std::hex << profile.magic << std::dec
+                << " start=" << profile.kernel_start_cycle
+                << " setup=" << profile.setup_done_cycle
+                << " compact=" << profile.compact_done_cycle
+                << " first_doorbell=" << profile.first_doorbell_cycle
+                << " post=" << profile.post_done_cycle
+                << " completion=" << profile.completion_done_cycle
+                << " finish=" << profile.kernel_finish_cycle << '\n';
+      return false;
+    }
+    profiles->push_back(profile);
+  }
+  return true;
+}
+
+struct KernelProfileAccumulator {
+  double total_us = 0.0;
+  double setup_us = 0.0;
+  double compact_us = 0.0;
+  double post_us = 0.0;
+  double transfer_window_us = 0.0;
+  double completion_wait_us = 0.0;
+  double finalize_us = 0.0;
+  double posts = 0.0;
+  double active_requests = 0.0;
+  double jetty_wait_us[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE] = {0.0, 0.0};
+  double jetty_polls[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE] = {0.0,
+                                                                 0.0};
+};
+
+void PrintKernelProfileSummary(
+    const std::vector<KvafBatchGetCoreProfile> &profiles,
+    uint32_t sample_count, const Options &options) {
+  const uint64_t expected =
+      static_cast<uint64_t>(sample_count) * options.aiv_cores;
+  if (sample_count == 0U || profiles.size() != expected) {
+    std::cerr << "[KVAF_EXECUTE] kernel profile sample mismatch expected="
+              << expected << " actual=" << profiles.size() << '\n';
+    return;
+  }
+
+  std::vector<KernelProfileAccumulator> per_core(options.aiv_cores);
+  std::vector<double> kernel_wall_us;
+  std::vector<double> critical_total_us;
+  std::vector<double> max_setup_us;
+  std::vector<double> max_compact_us;
+  std::vector<double> max_post_us;
+  std::vector<double> max_transfer_window_us;
+  std::vector<double> max_completion_wait_us;
+  kernel_wall_us.reserve(sample_count);
+  critical_total_us.reserve(sample_count);
+  max_setup_us.reserve(sample_count);
+  max_compact_us.reserve(sample_count);
+  max_post_us.reserve(sample_count);
+  max_transfer_window_us.reserve(sample_count);
+  max_completion_wait_us.reserve(sample_count);
+
+  for (uint32_t sample = 0U; sample < sample_count; ++sample) {
+    double sample_total = 0.0;
+    double sample_setup = 0.0;
+    double sample_compact = 0.0;
+    double sample_post = 0.0;
+    double sample_transfer = 0.0;
+    double sample_completion = 0.0;
+    uint64_t earliest_start = UINT64_MAX;
+    uint64_t latest_finish = 0U;
+    for (uint32_t core = 0U; core < options.aiv_cores; ++core) {
+      const KvafBatchGetCoreProfile &profile =
+          profiles[static_cast<uint64_t>(sample) * options.aiv_cores + core];
+      KernelProfileAccumulator &accumulator = per_core[core];
+      const double total = ProfileCyclesToUs(
+          profile.kernel_start_cycle, profile.kernel_finish_cycle);
+      const double setup = ProfileCyclesToUs(
+          profile.kernel_start_cycle, profile.setup_done_cycle);
+      const double compact = ProfileCyclesToUs(
+          profile.setup_done_cycle, profile.compact_done_cycle);
+      const double post = ProfileCyclesToUs(
+          profile.compact_done_cycle, profile.post_done_cycle);
+      const double completion = ProfileCyclesToUs(
+          profile.post_done_cycle, profile.completion_done_cycle);
+      const double transfer = profile.first_doorbell_cycle == 0U
+                                  ? 0.0
+                                  : ProfileCyclesToUs(
+                                        profile.first_doorbell_cycle,
+                                        profile.completion_done_cycle);
+      const double finalize = ProfileCyclesToUs(
+          profile.completion_done_cycle, profile.kernel_finish_cycle);
+      accumulator.total_us += total;
+      accumulator.setup_us += setup;
+      accumulator.compact_us += compact;
+      accumulator.post_us += post;
+      accumulator.transfer_window_us += transfer;
+      accumulator.completion_wait_us += completion;
+      accumulator.finalize_us += finalize;
+      accumulator.posts += static_cast<double>(profile.total_posts);
+      accumulator.active_requests +=
+          static_cast<double>(profile.active_requests);
+      for (uint32_t jetty = 0U;
+           jetty < KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE; ++jetty) {
+        accumulator.jetty_wait_us[jetty] +=
+            static_cast<double>(profile.jetty_completion_wait_cycles[jetty]) /
+            kProfileCyclesPerMicrosecond;
+        accumulator.jetty_polls[jetty] += static_cast<double>(
+            profile.jetty_completion_polls[jetty]);
+      }
+      sample_total = std::max(sample_total, total);
+      sample_setup = std::max(sample_setup, setup);
+      sample_compact = std::max(sample_compact, compact);
+      sample_post = std::max(sample_post, post);
+      sample_transfer = std::max(sample_transfer, transfer);
+      sample_completion = std::max(sample_completion, completion);
+      earliest_start =
+          std::min(earliest_start, profile.kernel_start_cycle);
+      latest_finish =
+          std::max(latest_finish, profile.kernel_finish_cycle);
+    }
+    kernel_wall_us.push_back(
+        ProfileCyclesToUs(earliest_start, latest_finish));
+    critical_total_us.push_back(sample_total);
+    max_setup_us.push_back(sample_setup);
+    max_compact_us.push_back(sample_compact);
+    max_post_us.push_back(sample_post);
+    max_transfer_window_us.push_back(sample_transfer);
+    max_completion_wait_us.push_back(sample_completion);
+  }
+
+  const auto mean = [](const std::vector<double> &samples) {
+    return std::accumulate(samples.begin(), samples.end(), 0.0) /
+           samples.size();
+  };
+  const double divisor = static_cast<double>(sample_count);
+  std::cout << "KERNEL_PROFILE_CONTRACT clock_mhz=50 unit=us "
+               "setup=entity_and_queue compact=mask_and_index_compaction "
+               "post=wqe_fill_sq_copy_and_doorbell "
+               "transfer_window=first_doorbell_to_all_cq_complete "
+               "completion_wait=cq_poll_until_udma_complete "
+               "profile_overhead_included=1 d2h_outside_host_metric=1\n";
+  for (uint32_t core = 0U; core < options.aiv_cores; ++core) {
+    const KernelProfileAccumulator &accumulator = per_core[core];
+    std::cout << std::fixed << std::setprecision(3)
+              << "KERNEL_PROFILE_CORE core=" << core
+              << " samples=" << sample_count
+              << " total_us_mean=" << accumulator.total_us / divisor
+              << " setup_us_mean=" << accumulator.setup_us / divisor
+              << " compact_us_mean=" << accumulator.compact_us / divisor
+              << " post_us_mean=" << accumulator.post_us / divisor
+              << " transfer_window_us_mean="
+              << accumulator.transfer_window_us / divisor
+              << " completion_wait_us_mean="
+              << accumulator.completion_wait_us / divisor
+              << " finalize_us_mean=" << accumulator.finalize_us / divisor
+              << " posts_mean=" << accumulator.posts / divisor
+              << " active_requests_mean="
+              << accumulator.active_requests / divisor
+              << " jetty0_wait_us_mean="
+              << accumulator.jetty_wait_us[0] / divisor
+              << " jetty0_polls_mean="
+              << accumulator.jetty_polls[0] / divisor
+              << " jetty1_wait_us_mean="
+              << accumulator.jetty_wait_us[1] / divisor
+              << " jetty1_polls_mean="
+              << accumulator.jetty_polls[1] / divisor << '\n';
+  }
+  std::cout << std::fixed << std::setprecision(3)
+            << "KERNEL_PROFILE_RESULT samples=" << sample_count
+            << " aiv_cores=" << options.aiv_cores
+            << " jettys_per_core=" << options.jettys_per_core
+            << " kernel_wall_us_mean=" << mean(kernel_wall_us)
+            << " kernel_wall_us_p50=" << Percentile(kernel_wall_us, 0.50)
+            << " kernel_wall_us_p90=" << Percentile(kernel_wall_us, 0.90)
+            << " critical_total_us_mean=" << mean(critical_total_us)
+            << " critical_total_us_p50="
+            << Percentile(critical_total_us, 0.50)
+            << " critical_total_us_p90="
+            << Percentile(critical_total_us, 0.90)
+            << " max_setup_us_mean=" << mean(max_setup_us)
+            << " max_compact_us_mean=" << mean(max_compact_us)
+            << " max_post_us_mean=" << mean(max_post_us)
+            << " max_transfer_window_us_mean="
+            << mean(max_transfer_window_us)
+            << " max_completion_wait_us_mean="
+            << mean(max_completion_wait_us) << '\n';
 }
 
 struct QueueExpectation {
@@ -337,7 +557,8 @@ int main(int argc, char **argv) {
                  "[--device N --table-capacity N --requests N --output-rows N --block-bytes N "
                  "--source-stride N --aiv-cores N --jettys-per-core N --warmup N --iterations N --mask-every N "
                  "--active-every N --active-percent N "
-                 "--graph-replays N --graph-warmup N --graph-iterations N --dynamic-output-smoke 0|1]\n";
+                 "--graph-replays N --graph-warmup N --graph-iterations N --dynamic-output-smoke 0|1 "
+                 "--kernel-profile 0|1]\n";
     return 2;
   }
   const uint64_t source_bytes = static_cast<uint64_t>(options.table_capacity) * options.source_stride;
@@ -391,7 +612,14 @@ int main(int argc, char **argv) {
   std::vector<uint64_t> eager_active_counts;
   std::vector<uint8_t> output(output_bytes);
   std::vector<double> elapsed_ms;
+  std::vector<KvafBatchGetCoreProfile> kernel_profiles;
   uint64_t measured_active_total = 0U;
+
+  if (options.kernel_profile != 0U) {
+    for (KvafBatchGetCoreStatus &status : statuses) {
+      status.profile.magic = KVAF_AIV_BATCH_GET_PROFILE_MAGIC;
+    }
+  }
 
   std::cout << "PHASE_PROCESS_READY\n";
   std::cout << "PHASE_RUNTIME_STEP_BEGIN step=aclInit\n";
@@ -456,8 +684,9 @@ int main(int argc, char **argv) {
       !CheckAcl(aclrtMemcpy(device_output_indices, output_indices.size() * sizeof(int32_t), output_indices.data(),
                              output_indices.size() * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE), "copy output_indices") ||
       !CheckAcl(aclrtMemset(output_hbm, output_bytes, 0, output_bytes), "clear output") ||
-      !CheckAcl(aclrtMemset(device_status, statuses.size() * sizeof(statuses[0]), 0, statuses.size() * sizeof(statuses[0])),
-                "clear status") ||
+      !CheckAcl(aclrtMemcpy(device_status, statuses.size() * sizeof(statuses[0]), statuses.data(),
+                             statuses.size() * sizeof(statuses[0]), ACL_MEMCPY_HOST_TO_DEVICE),
+                "initialize status and profile control") ||
       !CheckAcl(aclrtMemcpy(device_queue, queues.size() * sizeof(queues[0]), queues.data(),
                              queues.size() * sizeof(queues[0]), ACL_MEMCPY_HOST_TO_DEVICE), "initialize queue")) goto cleanup;
 
@@ -681,6 +910,16 @@ int main(int argc, char **argv) {
       if (!CheckAcl(aclrtSynchronizeStream(stream), "measured graph replay completion")) goto cleanup;
       const auto end = std::chrono::steady_clock::now();
       elapsed_ms.push_back(std::chrono::duration<double, std::milli>(end - begin).count());
+      if (options.kernel_profile != 0U &&
+          (!CheckAcl(aclrtMemcpy(statuses.data(),
+                                 statuses.size() * sizeof(statuses[0]),
+                                 device_status,
+                                 statuses.size() * sizeof(statuses[0]),
+                                 ACL_MEMCPY_DEVICE_TO_HOST),
+                     "copy measured graph kernel profile") ||
+           !CollectKernelProfiles(statuses, &kernel_profiles))) {
+        goto cleanup;
+      }
       std::cout << "GRAPH_PERF_MEASURED_STEP_DONE iteration=" << iteration << '\n';
     }
     if (!CheckAcl(aclrtMemcpy(statuses.data(), statuses.size() * sizeof(statuses[0]), device_status,
@@ -713,6 +952,10 @@ int main(int argc, char **argv) {
               << " mean_ms=" << mean_ms
               << " p50_ms=" << Percentile(elapsed_ms, 0.50) << " p90_ms=" << Percentile(elapsed_ms, 0.90)
               << " p99_ms=" << Percentile(elapsed_ms, 0.99) << " useful_GiBps=" << gibps << '\n';
+    if (options.kernel_profile != 0U) {
+      PrintKernelProfileSummary(kernel_profiles, options.graph_iterations,
+                                options);
+    }
     exit_code = 0;
     goto cleanup;
   }
@@ -821,6 +1064,16 @@ int main(int argc, char **argv) {
         !CheckAcl(aclrtSynchronizeStream(stream), "measured completion")) goto cleanup;
     const auto end = std::chrono::steady_clock::now();
     elapsed_ms.push_back(std::chrono::duration<double, std::milli>(end - begin).count());
+    if (options.kernel_profile != 0U &&
+        (!CheckAcl(aclrtMemcpy(statuses.data(),
+                               statuses.size() * sizeof(statuses[0]),
+                               device_status,
+                               statuses.size() * sizeof(statuses[0]),
+                               ACL_MEMCPY_DEVICE_TO_HOST),
+                   "copy measured eager kernel profile") ||
+         !CollectKernelProfiles(statuses, &kernel_profiles))) {
+      goto cleanup;
+    }
   }
   if (!CheckAcl(aclrtMemcpy(statuses.data(), statuses.size() * sizeof(statuses[0]), device_status,
                              statuses.size() * sizeof(statuses[0]), ACL_MEMCPY_DEVICE_TO_HOST), "copy measured status") ||
@@ -847,6 +1100,9 @@ int main(int argc, char **argv) {
               << " mean_ms=" << mean_ms << " p50_ms=" << Percentile(elapsed_ms, 0.50)
               << " p90_ms=" << Percentile(elapsed_ms, 0.90) << " p99_ms=" << Percentile(elapsed_ms, 0.99)
               << " useful_GiBps=" << gibps << '\n';
+  }
+  if (options.kernel_profile != 0U) {
+    PrintKernelProfileSummary(kernel_profiles, options.iterations, options);
   }
   exit_code = 0;
 

@@ -136,6 +136,11 @@ WARMUP=1 ITERATIONS=1 bash scripts/run_execute_batch_get.sh
 DEVICE_ID=0 DYNAMIC_OUTPUT_SMOKE=1 WARMUP=1 ITERATIONS=1 \
 bash scripts/run_execute_batch_get.sh
 
+# Opt-in per-AIV kernel timeline. D2H profile collection happens after each
+# timed launch and is excluded from host_submit_to_stream_completion.
+DEVICE_ID=0 KERNEL_PROFILE=1 WARMUP=5 ITERATIONS=20 \
+bash scripts/run_execute_batch_get.sh
+
 DEVICE_ID=0 GRAPH_REPLAYS=4 GRAPH_WARMUP=1 GRAPH_ITERATIONS=5 \
 bash scripts/run_execute_batch_get_graph.sh
 ```
@@ -154,6 +159,18 @@ tensors, captured graph execution, and stream completion are included;
 capture, HCCP setup and final D2H validation are excluded. The normal metric
 is `host_submit_to_stream_completion`; it includes only launch through stream
 completion and excludes input generation, H2D upload, warmup and validation.
+
+With `KERNEL_PROFILE=1`, every AIV writes a 50 MHz `GetSystemCycle` timeline
+into the existing reserved status area. The runner reports `setup`, `compact`,
+`post`, `transfer_window`, `completion_wait`, and `finalize` durations, plus
+the number of 32-WQE posts and CQ polls for each Jetty. `post` covers
+queue-capacity checks, WQE materialization, SQ writes, and doorbells;
+`transfer_window` spans the first
+doorbell through the last CQE and therefore includes WQE/UDMA overlap;
+`completion_wait` begins after the last doorbell and ends after every used
+Jetty returns its completion CQE.
+Profiling adds timestamp and status-write overhead, so use the default
+`KERNEL_PROFILE=0` result for final performance numbers.
 
 ## Graph boundary
 

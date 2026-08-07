@@ -15,10 +15,34 @@ enum {
 };
 
 static const uint64_t KVAF_AIV_BATCH_GET_STATUS_MAGIC = 0x4b5641464247444fULL;
+static const uint64_t KVAF_AIV_BATCH_GET_PROFILE_MAGIC =
+    0x4b56414650524f46ULL;  // "KVAFPROF"
+
+// Optional, per-core kernel timeline. The host enables collection by placing
+// KVAF_AIV_BATCH_GET_PROFILE_MAGIC in `magic` before launch. The kernel keeps
+// the magic in its output so profiling remains enabled across warmup and
+// measured launches that reuse the same status buffer. GetSystemCycle uses a
+// 50 MHz clock, so elapsed_us = elapsed_cycles / 50.
+typedef struct KvafBatchGetCoreProfile {
+  uint64_t magic;
+  uint64_t kernel_start_cycle;
+  uint64_t setup_done_cycle;
+  uint64_t compact_done_cycle;
+  uint64_t first_doorbell_cycle;
+  uint64_t post_done_cycle;
+  uint64_t completion_done_cycle;
+  uint64_t kernel_finish_cycle;
+  uint64_t active_requests;
+  uint64_t total_posts;
+  uint64_t jetty_completion_wait_cycles[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE];
+  uint64_t jetty_completion_polls[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE];
+  uint64_t reserved[26];
+} KvafBatchGetCoreProfile;
 
 // Keep the historical 384-byte stride even though ExecuteBatchGet uses only
-// the first cache line.  This keeps the verified host/device allocation ABI
-// stable while reserving space for future non-hot diagnostics.
+// the first cache line on the normal path. This keeps the verified host/device
+// allocation ABI stable while using the reserved non-hot diagnostics area for
+// opt-in profiling.
 typedef struct KvafBatchGetCoreStatus {
   uint64_t magic;
   uint64_t processed_request_count;
@@ -29,7 +53,7 @@ typedef struct KvafBatchGetCoreStatus {
   uint64_t cq_consumer_index;
   uint64_t failed_request_index;
   uint64_t last_wqe_protocol;
-  uint64_t reserved[40];
+  KvafBatchGetCoreProfile profile;
 } KvafBatchGetCoreStatus;
 
 // Persistent, AIV-owned software indices for one USER_CTL SQ/CQ pair. Queue
@@ -100,6 +124,8 @@ typedef struct KvafExecuteBatchGetKernelArgs {
 #if defined(__cplusplus)
 static_assert(sizeof(KvafBatchGetCoreStatus) == KVAF_AIV_BATCH_GET_STATUS_BYTES,
               "KvafBatchGetCoreStatus ABI changed");
+static_assert(sizeof(KvafBatchGetCoreProfile) == 320,
+              "KvafBatchGetCoreProfile ABI changed");
 static_assert(sizeof(KvafBatchGetQueueState) == KVAF_AIV_BATCH_GET_QUEUE_STATE_BYTES,
               "KvafBatchGetQueueState ABI changed");
 static_assert(sizeof(KvafBatchGetDirectUrmaEntity) == 192,
