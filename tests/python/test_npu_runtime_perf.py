@@ -22,6 +22,7 @@ from backend import detect_torch_backend
 
 
 AIV_CORES = 32
+JETTYS_PER_CORE = 2
 PUT_BATCH_SIZE = 128
 WARMUP = 3
 ITERATIONS = 1000
@@ -66,6 +67,12 @@ def main(batch: int = 16) -> int:
     device_id = int(os.environ.get("DEVICE_ID", "0"))
     batch = int(os.environ.get("KVAF_RUNTIME_PERF_BATCH", str(batch)))
     npu_core_count = int(os.environ.get("KVAF_RUNTIME_PERF_AIV_CORES", str(AIV_CORES)))
+    jettys_per_core = int(
+        os.environ.get(
+            "KVAF_RUNTIME_PERF_JETTYS_PER_CORE",
+            os.environ.get("KVAF_NPU_JETTYS_PER_CORE", str(JETTYS_PER_CORE)),
+        )
+    )
     warmup = int(os.environ.get("KVAF_RUNTIME_PERF_WARMUP", str(WARMUP)))
     iterations = int(os.environ.get("KVAF_RUNTIME_PERF_ITERATIONS", str(ITERATIONS)))
     active_percent = int(
@@ -79,6 +86,7 @@ def main(batch: int = 16) -> int:
     if not (
         batch > 0
         and npu_core_count > 0
+        and 1 <= jettys_per_core <= 2
         and warmup >= 0
         and iterations > 0
         and 1 <= active_percent <= 100
@@ -127,7 +135,8 @@ def main(batch: int = 16) -> int:
     output_indices = torch.arange(requests, dtype=torch.int32, device=device)
     output = torch.empty((requests, block_bytes), dtype=torch.uint8, device=device)
     runtime = kvaf.NpuRuntime(
-        str(kernel), device_id, npu_core_count, str(batch_put_kernel)
+        str(kernel), device_id, npu_core_count, str(batch_put_kernel),
+        jettys_per_core,
     )
     table = None
     device_table = None
@@ -136,6 +145,7 @@ def main(batch: int = 16) -> int:
             "RUNTIME_PERF_CONFIG "
             f"table_capacity={table_capacity} put_batch_size={PUT_BATCH_SIZE} "
             f"requests={requests} block_bytes={block_bytes} aiv_cores={npu_core_count} "
+            f"jettys_per_core={jettys_per_core} "
             f"active_percent={active_percent} warmup={warmup} iterations={iterations} "
             "batch_put_backend=aiv_direct_hccp"
         )
