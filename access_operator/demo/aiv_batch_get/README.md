@@ -152,17 +152,32 @@ DEVICE_ID=0 GRAPH_REPLAYS=4 GRAPH_WARMUP=1 GRAPH_ITERATIONS=5 \
 bash scripts/run_execute_batch_get_graph.sh
 ```
 
-For the eager benchmark, `INDEX_RANGE=N` constrains every generated lookup
-index to `[0, N)` while `TABLE_CAPACITY` continues to control the allocated
-AddressTable, valid table and Host-DDR region; it defaults to `TABLE_CAPACITY`.
-This makes it possible to vary the active lookup working set independently of
-the allocation size. `ACTIVE_PERCENT=N` controls the independent Bernoulli
-mask probability for every sample; random generation and the one-time H2D
-upload are excluded from timing. `MASK_EVERY=N` and `ACTIVE_EVERY=N` remain
-deterministic functional controls for the dynamic-output smoke test and graph
-replay: the former masks request IDs divisible by `N`, while the latter
-activates only request IDs divisible by `N`; the two options are mutually
-exclusive.
+For the eager benchmark, `INDEX_RANGE=N` controls the total number of table
+entries reachable by generated lookup indices while `TABLE_CAPACITY` continues
+to control the allocated AddressTable, valid table and Host-DDR region; it
+defaults to `TABLE_CAPACITY`. `INDEX_BLOCKS=B` (default `1`) splits every eager
+request vector and the total index range into `B` equal parts. Part `b` uses a
+local random range of `INDEX_RANGE / B` entries and is offset into table block
+`b`, whose start is `b * TABLE_CAPACITY / B`. This preserves the total reachable
+entry count while distributing those entries across the full table. The table
+capacity, index range and request count must all be divisible by `INDEX_BLOCKS`.
+For example:
+
+```bash
+TABLE_CAPACITY=134217728 INDEX_RANGE=2097152 INDEX_BLOCKS=64 \
+REQUESTS=65536 OUTPUT_ROWS=65536 BLOCK_BYTES=576 SOURCE_STRIDE=576 \
+AIV_CORES=1 JETTYS_PER_CORE=2 WARMUP=3 ITERATIONS=1000 \
+bash scripts/run_execute_batch_get.sh
+```
+
+This makes it possible to vary both the active lookup working-set size and its
+dispersion independently of the allocation size. `ACTIVE_PERCENT=N` controls
+the independent Bernoulli mask probability for every sample; random generation
+and the one-time H2D upload are excluded from timing. `MASK_EVERY=N` and
+`ACTIVE_EVERY=N` remain deterministic functional controls for the
+dynamic-output smoke test and graph replay: the former masks request IDs
+divisible by `N`, while the latter activates only request IDs divisible by `N`;
+the two options are mutually exclusive.
 
 The graph performance metric is
 `graph_input_update_to_stream_completion`: updates into the fixed lookup

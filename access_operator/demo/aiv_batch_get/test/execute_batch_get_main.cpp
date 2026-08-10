@@ -26,6 +26,9 @@ struct Options {
   // Limit generated lookup indices without changing the allocated AddressTable
   // or Host-DDR region. Zero follows table_capacity for direct binary users.
   uint32_t index_range = 0U;
+  // Split each eager request vector and its total index_range into this many
+  // hot ranges, then place one hot range in each equal-sized table block.
+  uint32_t index_blocks = 1U;
   uint32_t requests = 4096U;
   uint32_t output_rows = 4096U;
   uint32_t block_bytes = 1024U;
@@ -93,6 +96,8 @@ bool ParseOptions(int argc, char **argv, Options *options) {
       if (!ParseU32(argv[++index], &options->table_capacity)) return false;
     } else if (arg == "--index-range" && index + 1 < argc) {
       if (!ParseU32(argv[++index], &options->index_range)) return false;
+    } else if (arg == "--index-blocks" && index + 1 < argc) {
+      if (!ParseU32(argv[++index], &options->index_blocks)) return false;
     } else if (arg == "--requests" && index + 1 < argc) {
       if (!ParseU32(argv[++index], &options->requests)) return false;
     } else if (arg == "--output-rows" && index + 1 < argc) {
@@ -135,6 +140,7 @@ bool ParseOptions(int argc, char **argv, Options *options) {
       !options->kernel.empty() && ReadEnvU32("DEVICE_ID", &options->device) &&
       ReadEnvU32("TABLE_CAPACITY", &options->table_capacity) &&
       ReadEnvU32("INDEX_RANGE", &options->index_range) &&
+      ReadEnvU32("INDEX_BLOCKS", &options->index_blocks) &&
       ReadEnvU32("REQUESTS", &options->requests) &&
       ReadEnvU32("OUTPUT_ROWS", &options->output_rows) && ReadEnvU32("BLOCK_BYTES", &options->block_bytes) &&
       ReadEnvU32("SOURCE_STRIDE", &options->source_stride) && ReadEnvU32("AIV_CORES", &options->aiv_cores) &&
@@ -150,9 +156,17 @@ bool ParseOptions(int argc, char **argv, Options *options) {
   if (options->index_range == 0U) options->index_range = options->table_capacity;
   return options->table_capacity != 0U &&
          options->index_range != 0U && options->index_range <= options->table_capacity &&
-         static_cast<uint64_t>(options->index_range) <=
-             static_cast<uint64_t>(INT32_MAX) + 1U &&
+         options->index_blocks != 0U && options->index_blocks <= options->index_range &&
+         options->index_blocks <= options->table_capacity &&
+         options->table_capacity % options->index_blocks == 0U &&
+         options->index_range % options->index_blocks == 0U &&
          options->requests != 0U && options->requests <= options->output_rows && options->output_rows != 0U &&
+         options->index_blocks <= options->requests &&
+         options->requests % options->index_blocks == 0U &&
+         (static_cast<uint64_t>(options->index_blocks - 1U) *
+                  (options->table_capacity / options->index_blocks) +
+              options->index_range / options->index_blocks - 1U <=
+          static_cast<uint64_t>(INT32_MAX)) &&
          options->block_bytes != 0U && options->source_stride >= options->block_bytes &&
          options->aiv_cores != 0U && options->aiv_cores <= KVAF_AIV_BATCH_GET_MAX_AIV_CORES &&
          options->jettys_per_core != 0U &&
@@ -585,7 +599,8 @@ int main(int argc, char **argv) {
   Options options;
   if (!ParseOptions(argc, argv, &options)) {
     std::cerr << "usage: kvaf_execute_batch_get_test --kernel <kvaf_execute_batch_get_kernels.o> "
-                 "[--device N --table-capacity N --index-range N --requests N --output-rows N --block-bytes N "
+                 "[--device N --table-capacity N --index-range N --index-blocks N --requests N "
+                 "--output-rows N --block-bytes N "
                  "--source-stride N --aiv-cores N --jettys-per-core N --warmup N --iterations N --mask-every N "
                  "--active-every N --active-percent N "
                  "--graph-replays N --graph-warmup N --graph-iterations N --dynamic-output-smoke 0|1 "
@@ -738,6 +753,7 @@ int main(int argc, char **argv) {
   std::cout << "PHASE_EID_ENDPOINT_READY primary_entity_table=0x" << std::hex << primary_entity_table << std::dec
             << " table_capacity=" << options.table_capacity << " output_rows=" << options.output_rows
             << " index_range=" << options.index_range
+            << " index_blocks=" << options.index_blocks
             << " source_bytes=" << source_bytes << " output_bytes=" << output_bytes
             << " output_lifetime=local_buffer_acquired\n";
   if (!CheckKvaf(KvafExecuteBatchGetLoadKernel(options.kernel.c_str()), "load ExecuteBatchGet kernel")) goto cleanup;
@@ -1004,9 +1020,15 @@ int main(int argc, char **argv) {
   eager_masks.resize(static_cast<size_t>(eager_request_entries));
   eager_active_counts.resize(static_cast<size_t>(eager_sample_count));
   {
+    const uint32_t local_index_range =
+        options.index_range / options.index_blocks;
+    const uint32_t table_entries_per_block =
+        options.table_capacity / options.index_blocks;
+    const uint32_t requests_per_block =
+        options.requests / options.index_blocks;
     std::mt19937 random(kEagerRandomSeed);
     std::uniform_int_distribution<uint32_t> index_distribution(
-        0U, options.index_range - 1U);
+        0U, local_index_range - 1U);
     std::bernoulli_distribution mask_distribution(
         static_cast<double>(options.active_percent) / 100.0);
     for (uint64_t sample = 0U; sample < eager_sample_count; ++sample) {
@@ -1021,6 +1043,24 @@ int main(int argc, char **argv) {
         active += is_active;
       }
       eager_active_counts[static_cast<size_t>(sample)] = active;
+    }
+    if (options.index_blocks > 1U) {
+      // Keep the random values local while constructing all samples, then move
+      // each contiguous request block into its corresponding table block.
+      for (uint64_t sample = 0U; sample < eager_sample_count; ++sample) {
+        const size_t sample_offset =
+            static_cast<size_t>(sample * options.requests);
+        for (uint32_t block = 0U; block < options.index_blocks; ++block) {
+          const uint32_t table_offset = block * table_entries_per_block;
+          const uint32_t request_begin = block * requests_per_block;
+          const uint32_t request_end = request_begin + requests_per_block;
+          for (uint32_t request = request_begin; request < request_end;
+               ++request) {
+            eager_indices[sample_offset + request] +=
+                static_cast<int32_t>(table_offset);
+          }
+        }
+      }
     }
   }
   if (!CheckAcl(aclrtMalloc(&device_eager_indices,
@@ -1045,6 +1085,13 @@ int main(int argc, char **argv) {
   std::cout << "EAGER_RANDOM_INPUTS_READY samples=" << eager_sample_count
             << " requests_per_sample=" << options.requests
             << " index_range=" << options.index_range
+            << " index_blocks=" << options.index_blocks
+            << " local_index_range="
+            << options.index_range / options.index_blocks
+            << " table_entries_per_block="
+            << options.table_capacity / options.index_blocks
+            << " requests_per_block="
+            << options.requests / options.index_blocks
             << " active_percent=" << options.active_percent
             << " seed=" << kEagerRandomSeed
             << " generation_excluded=1 h2d_excluded=1\n";
@@ -1133,6 +1180,7 @@ int main(int argc, char **argv) {
               << " mean_active_requests=" << mean_active
               << " block_bytes=" << options.block_bytes
               << " index_range=" << options.index_range
+              << " index_blocks=" << options.index_blocks
               << " aiv_cores=" << options.aiv_cores
               << " jettys_per_core=" << options.jettys_per_core
               << " mean_ms=" << mean_ms << " p50_ms=" << Percentile(elapsed_ms, 0.50)
