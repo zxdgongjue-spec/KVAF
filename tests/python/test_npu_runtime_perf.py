@@ -24,6 +24,7 @@ from backend import detect_torch_backend
 AIV_CORES = 32
 JETTYS_PER_CORE = 2
 PUT_BATCH_SIZE = 128
+PREPARE_BATCH_SIZE = 32 * 1024
 WARMUP = 3
 ITERATIONS = 1000
 ACTIVE_PERCENT = 5
@@ -83,6 +84,7 @@ def main(batch: int = 16) -> int:
     requests = batch * 2048
     source_stride = block_bytes
     total_put_batches = table_capacity // PUT_BATCH_SIZE
+    prepare_batch_count = table_capacity // PREPARE_BATCH_SIZE
     if not (
         batch > 0
         and npu_core_count > 0
@@ -92,6 +94,8 @@ def main(batch: int = 16) -> int:
         and 1 <= active_percent <= 100
         and block_bytes > 0
         and total_put_batches >= warmup + iterations
+        and table_capacity % PREPARE_BATCH_SIZE == 0
+        and prepare_batch_count > warmup
     ):
         print("FAIL: invalid KVAF_RUNTIME_PERF_* configuration", file=sys.stderr)
         return 2
@@ -185,17 +189,46 @@ def main(batch: int = 16) -> int:
         torch.npu.synchronize()
         print("RUNTIME_PERF_PHASE_DONE phase=batch_put")
 
-        # PrepareAccessTable is CPU-only. Measure the requested full table once.
+        # Match the MetaManager benchmark's 32K control-plane batch size.
         print("RUNTIME_PERF_PHASE_BEGIN phase=prepare_access_table")
-        begin = time.perf_counter()
-        table = runtime.prepare_access_table(prepare_keys)
-        prepare_ms = (time.perf_counter() - begin) * 1000.0
+        prepare_samples: list[float] = []
+        for batch_index in range(prepare_batch_count):
+            key_batch = all_keys[
+                batch_index * PREPARE_BATCH_SIZE :
+                (batch_index + 1) * PREPARE_BATCH_SIZE
+            ]
+            measured = batch_index >= warmup
+            if measured:
+                begin = time.perf_counter()
+            batch_table = runtime.prepare_access_table(key_batch)
+            if measured:
+                prepare_samples.append((time.perf_counter() - begin) * 1000.0)
+            runtime.release_access_table(batch_table)
+        print_samples(
+            "prepare_access_table",
+            prepare_samples,
+            warmup,
+            f"{PREPARE_BATCH_SIZE}_keys_per_call",
+        )
         print(
             "PERF_RESULT "
-            "operation=prepare_access_table samples=1 "
-            f"keys={table_capacity} elapsed_ms={prepare_ms:.3f}"
+            "operation=prepare_access_table_config "
+            f"total_keys={table_capacity} keys_per_call={PREPARE_BATCH_SIZE} "
+            f"call_count={prepare_batch_count}"
         )
         print("RUNTIME_PERF_PHASE_DONE phase=prepare_access_table")
+
+        # Keep the original full-table setup for the NPU BatchGet benchmark.
+        print("RUNTIME_PERF_PHASE_BEGIN phase=prepare_access_table_full_setup")
+        begin = time.perf_counter()
+        table = runtime.prepare_access_table(prepare_keys)
+        full_prepare_ms = (time.perf_counter() - begin) * 1000.0
+        print(
+            "PERF_RESULT "
+            "operation=prepare_access_table_full_setup samples=1 "
+            f"keys={table_capacity} elapsed_ms={full_prepare_ms:.3f}"
+        )
+        print("RUNTIME_PERF_PHASE_DONE phase=prepare_access_table_full_setup")
 
         # Materialize the full device table once. This is the caller-visible
         # Runtime H2D path; it is intentionally separate from BatchGet timing.
