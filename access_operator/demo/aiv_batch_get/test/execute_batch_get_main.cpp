@@ -29,6 +29,9 @@ struct Options {
   // Split each eager request vector and its total index_range into this many
   // hot ranges, then place one hot range in each equal-sized table block.
   uint32_t index_blocks = 1U;
+  // Sort each complete eager sample after block offsets are applied. Sorting
+  // is caller-side input preparation and remains outside timed measurements.
+  uint32_t sort_eager_indices = 0U;
   uint32_t requests = 4096U;
   uint32_t output_rows = 4096U;
   uint32_t block_bytes = 1024U;
@@ -98,6 +101,8 @@ bool ParseOptions(int argc, char **argv, Options *options) {
       if (!ParseU32(argv[++index], &options->index_range)) return false;
     } else if (arg == "--index-blocks" && index + 1 < argc) {
       if (!ParseU32(argv[++index], &options->index_blocks)) return false;
+    } else if (arg == "--sort-eager-indices" && index + 1 < argc) {
+      if (!ParseU32(argv[++index], &options->sort_eager_indices)) return false;
     } else if (arg == "--requests" && index + 1 < argc) {
       if (!ParseU32(argv[++index], &options->requests)) return false;
     } else if (arg == "--output-rows" && index + 1 < argc) {
@@ -141,6 +146,7 @@ bool ParseOptions(int argc, char **argv, Options *options) {
       ReadEnvU32("TABLE_CAPACITY", &options->table_capacity) &&
       ReadEnvU32("INDEX_RANGE", &options->index_range) &&
       ReadEnvU32("INDEX_BLOCKS", &options->index_blocks) &&
+      ReadEnvU32("SORT_EAGER_INDICES", &options->sort_eager_indices) &&
       ReadEnvU32("REQUESTS", &options->requests) &&
       ReadEnvU32("OUTPUT_ROWS", &options->output_rows) && ReadEnvU32("BLOCK_BYTES", &options->block_bytes) &&
       ReadEnvU32("SOURCE_STRIDE", &options->source_stride) && ReadEnvU32("AIV_CORES", &options->aiv_cores) &&
@@ -174,6 +180,7 @@ bool ParseOptions(int argc, char **argv, Options *options) {
          options->aiv_cores <= options->requests && options->iterations != 0U &&
          options->active_percent >= 1U && options->active_percent <= 100U &&
          options->graph_iterations != 0U && options->dynamic_output_smoke <= 1U &&
+         options->sort_eager_indices <= 1U &&
          options->kernel_profile <= 1U &&
          options->kernel_profile_clock_mhz != 0U &&
          (options->mask_every == 0U || options->active_every == 0U);
@@ -599,8 +606,8 @@ int main(int argc, char **argv) {
   Options options;
   if (!ParseOptions(argc, argv, &options)) {
     std::cerr << "usage: kvaf_execute_batch_get_test --kernel <kvaf_execute_batch_get_kernels.o> "
-                 "[--device N --table-capacity N --index-range N --index-blocks N --requests N "
-                 "--output-rows N --block-bytes N "
+                 "[--device N --table-capacity N --index-range N --index-blocks N "
+                 "--sort-eager-indices 0|1 --requests N --output-rows N --block-bytes N "
                  "--source-stride N --aiv-cores N --jettys-per-core N --warmup N --iterations N --mask-every N "
                  "--active-every N --active-percent N "
                  "--graph-replays N --graph-warmup N --graph-iterations N --dynamic-output-smoke 0|1 "
@@ -754,6 +761,7 @@ int main(int argc, char **argv) {
             << " table_capacity=" << options.table_capacity << " output_rows=" << options.output_rows
             << " index_range=" << options.index_range
             << " index_blocks=" << options.index_blocks
+            << " sort_eager_indices=" << options.sort_eager_indices
             << " source_bytes=" << source_bytes << " output_bytes=" << output_bytes
             << " output_lifetime=local_buffer_acquired\n";
   if (!CheckKvaf(KvafExecuteBatchGetLoadKernel(options.kernel.c_str()), "load ExecuteBatchGet kernel")) goto cleanup;
@@ -1062,6 +1070,15 @@ int main(int argc, char **argv) {
         }
       }
     }
+    if (options.sort_eager_indices != 0U) {
+      for (uint64_t sample = 0U; sample < eager_sample_count; ++sample) {
+        const size_t sample_offset =
+            static_cast<size_t>(sample * options.requests);
+        int32_t *const sample_indices =
+            eager_indices.data() + sample_offset;
+        std::sort(sample_indices, sample_indices + options.requests);
+      }
+    }
   }
   if (!CheckAcl(aclrtMalloc(&device_eager_indices,
                              eager_indices.size() * sizeof(eager_indices[0]),
@@ -1086,6 +1103,7 @@ int main(int argc, char **argv) {
             << " requests_per_sample=" << options.requests
             << " index_range=" << options.index_range
             << " index_blocks=" << options.index_blocks
+            << " sort_eager_indices=" << options.sort_eager_indices
             << " local_index_range="
             << options.index_range / options.index_blocks
             << " table_entries_per_block="
@@ -1094,7 +1112,7 @@ int main(int argc, char **argv) {
             << options.requests / options.index_blocks
             << " active_percent=" << options.active_percent
             << " seed=" << kEagerRandomSeed
-            << " generation_excluded=1 h2d_excluded=1\n";
+            << " generation_excluded=1 sort_excluded=1 h2d_excluded=1\n";
 
   for (uint32_t warmup = 0U; warmup < options.warmup; ++warmup) {
     const size_t sample_offset =
@@ -1181,6 +1199,7 @@ int main(int argc, char **argv) {
               << " block_bytes=" << options.block_bytes
               << " index_range=" << options.index_range
               << " index_blocks=" << options.index_blocks
+              << " sort_eager_indices=" << options.sort_eager_indices
               << " aiv_cores=" << options.aiv_cores
               << " jettys_per_core=" << options.jettys_per_core
               << " mean_ms=" << mean_ms << " p50_ms=" << Percentile(elapsed_ms, 0.50)

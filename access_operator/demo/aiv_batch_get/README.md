@@ -170,6 +170,19 @@ AIV_CORES=1 JETTYS_PER_CORE=2 WARMUP=3 ITERATIONS=1000 \
 bash scripts/run_execute_batch_get.sh
 ```
 
+`SORT_EAGER_INDICES=1` sorts each complete eager sample in ascending table-index
+order after all `INDEX_BLOCKS` offsets have been applied. Sorting is performed
+independently for each sample; samples are never mixed, and mask/output tensors
+are not reordered. Random generation, optional sorting and the one-time H2D
+upload all remain outside `host_submit_to_stream_completion`. For example:
+
+```bash
+TABLE_CAPACITY=134217728 INDEX_RANGE=2097152 INDEX_BLOCKS=2048 \
+SORT_EAGER_INDICES=1 REQUESTS=65536 OUTPUT_ROWS=65536 BLOCK_BYTES=576 \
+SOURCE_STRIDE=576 AIV_CORES=1 JETTYS_PER_CORE=2 WARMUP=3 ITERATIONS=1000 \
+bash scripts/run_execute_batch_get.sh
+```
+
 This makes it possible to vary both the active lookup working-set size and its
 dispersion independently of the allocation size. `ACTIVE_PERCENT=N` controls
 the independent Bernoulli mask probability for every sample; random generation
