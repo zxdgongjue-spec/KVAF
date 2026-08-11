@@ -20,12 +20,37 @@ if(NOT KVAF_KERNEL_OPERATOR_DIR)
   message(FATAL_ERROR "kernel_operator.h not found under ${ASCEND_CANN_PACKAGE_PATH}")
 endif()
 
+find_path(KVAF_SIMT_API_DIR NAMES simt_api/device_atomic_functions.h HINTS
+  "$ENV{ASCEND_SIMT_API_DIR}"
+  "${ASCEND_CANN_PACKAGE_PATH}/include"
+  "${ASCEND_CANN_PACKAGE_PATH}/include/ascendc"
+  "${ASCEND_CANN_PACKAGE_PATH}/compiler/include"
+  "${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/include"
+  "${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include"
+  "${ASCEND_CANN_PACKAGE_PATH}/x86_64-linux/include"
+  "${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw/include"
+  "${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw/lib"
+  "${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw"
+  "${ASCEND_CANN_PACKAGE_PATH}/tikcpp/tikcfw/lib"
+  "${ASCEND_CANN_PACKAGE_PATH}/tikcpp/tikcfw"
+  "${ASCEND_CANN_PACKAGE_PATH}/include/tikcpp/tikcfw/lib"
+  "${ASCEND_CANN_PACKAGE_PATH}/include/tikcpp/tikcfw")
+if(NOT KVAF_SIMT_API_DIR)
+  message(FATAL_ERROR
+    "simt_api/device_atomic_functions.h was not found. Install the matching "
+    "CANN asc-devkit package, or set ASCEND_SIMT_API_DIR to the directory "
+    "that contains simt_api/device_atomic_functions.h. "
+    "ASCEND_CANN_PACKAGE_PATH=${ASCEND_CANN_PACKAGE_PATH}")
+endif()
+message(STATUS "BatchPut SIMT API root: ${KVAF_SIMT_API_DIR}")
+
 set(KVAF_KERNEL_INCLUDES
   "-I${KVAF_KERNEL_OPERATOR_DIR}"
   "-I${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw/lib"
   "-I${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw"
   "-I${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw/interface"
   "-I${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw/impl"
+  "-I${KVAF_SIMT_API_DIR}"
   "-I${ASCEND_CANN_PACKAGE_PATH}/tikcpp/tikcfw"
   "-I${ASCEND_CANN_PACKAGE_PATH}/tikcpp/tikcfw/interface"
   "-I${ASCEND_CANN_PACKAGE_PATH}/tikcpp/tikcfw/impl"
@@ -43,8 +68,10 @@ add_custom_command(
   DEPENDS "${KVAF_EXECUTE_KERNEL_SOURCE}"
           "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_put_abi.h"
           "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_put_internal.h"
-  VERBATIM)
-add_custom_target(kvaf_execute_batch_put_kernel ALL DEPENDS "${KVAF_EXECUTE_KERNEL_OBJECT}")
+          "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"
+          VERBATIM)
+add_custom_target(kvaf_execute_batch_put_kernel ALL
+  DEPENDS "${KVAF_EXECUTE_KERNEL_OBJECT}")
 add_custom_command(TARGET kvaf_execute_batch_put_kernel POST_BUILD
   COMMAND "${CMAKE_COMMAND}" -E make_directory "${KVAF_AIV_DEMO_BIN_DIR}"
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${KVAF_EXECUTE_KERNEL_OBJECT}"

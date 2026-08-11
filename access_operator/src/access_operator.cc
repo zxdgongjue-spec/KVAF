@@ -265,10 +265,17 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
       impl_->config.npu_core_count == 0 ||
       impl_->config.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->config.jettys_per_core == 0 ||
-      impl_->config.jettys_per_core >
-          KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE) {
+      impl_->config.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE) {
     return InvalidArgument("invalid AccessOperator initialization config");
   }
+#if defined(KVAF_ENABLE_AIV_BATCH_PUT)
+  if (!impl_->config.batch_put_kernel_object_path.empty() &&
+      (impl_->config.npu_core_count > KVAF_AIV_BATCH_PUT_MAX_AIV_CORES ||
+       impl_->config.jettys_per_core >
+           KVAF_AIV_BATCH_PUT_MAX_JETTYS_PER_CORE)) {
+    return InvalidArgument("invalid BatchPut transport configuration");
+  }
+#endif
   if (KvafExecuteBatchGetLoadKernel(
           impl_->config.batch_get_kernel_object_path.c_str()) !=
       KVAF_BATCH_GET_SUCCESS) {
@@ -323,7 +330,8 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     KvafBatchPutTransport* batch_put_transport = nullptr;
     const int32_t batch_put_result = KvafBatchPutTransportCreate(
         reinterpret_cast<void*>(remote_region.base), remote_region.length,
-        impl_->config.npu_core_count, &batch_put_transport);
+        impl_->config.npu_core_count,
+        impl_->config.jettys_per_core, &batch_put_transport);
     if (batch_put_result != KVAF_BATCH_PUT_SUCCESS ||
         batch_put_transport == nullptr) {
       (void)aclrtFree(impl_->execution.queue_state);
@@ -349,8 +357,10 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     impl_->batch_put_execution = std::move(batch_put_execution);
     std::fprintf(stderr,
                  "[KVAF_AIV] RUNTIME_BATCH_PUT_TRANSPORT_READY cores=%u "
+                 "jettys_per_core=%u "
                  "metadata_staging=reusable\n",
-                 impl_->config.npu_core_count);
+                 impl_->config.npu_core_count,
+                 impl_->config.jettys_per_core);
   }
 #endif
   impl_->initialized = true;

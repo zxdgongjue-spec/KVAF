@@ -184,6 +184,47 @@ p90、p99 和 useful GiB/s。`ctest` 和上面的命令均设置 240 秒上限�
 cache-hit / release 日志默认关闭，避免压测污染终端。如需排查 LocalBuffer 引用
 计数，可额外设置 `KVAF_AIV_VERBOSE_LOCAL_BUFFER=1`。
 
+## A5 / CANN BatchPut 集成
+
+`tests/python/test_npu_batch_put.py` 通过 `kvaf.NpuRuntime` 验证真实的 AIV
+Direct-HCCP BatchPut 路径，不使用 demo test binary 或 ACL D2H mock。默认每轮写入
+4096 个 1 KiB block。写入完成后通过 Runtime 的 Host AccessTable 检查 Meta 已提交
+的长度、有效位和远端 DDR payload。测试流程与 BatchGet 一致：先进行一次正确性
+验证，再执行 warmup 和正式采样，最后重新校验采样结果。测试会输出 `PERF_RESULT`，统计
+`runtime.batch_put()` 到 stream 完成的 mean、p50、p90、p99 和有效 GB/s。
+
+BatchPut 的 Runtime binding 依赖 BatchGet 的公共 NPU Runtime 构建，因此需要同时
+打开两个 AIV 选项。首次运行或源码更新后，先构建：
+
+```bash
+export ASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/cann-9.1.0
+cmake -S . -B build-aiv \
+  -DBUILD_TESTING=ON \
+  -DKVAF_BUILD_PYTHON=ON \
+  -DKVAF_ENABLE_AIV_BATCH_GET=ON \
+  -DKVAF_ENABLE_AIV_BATCH_PUT=ON \
+  -DASCEND_CANN_PACKAGE_PATH="$ASCEND_CANN_PACKAGE_PATH"
+cmake --build build-aiv -j
+```
+
+构建成功后，确认两个 kernel object 和 Python binding 都存在，再运行端到端测试：
+
+```bash
+KVAF_RUN_NPU_TESTS=1 \
+KVAF_BATCH_GET_KERNEL="$PWD/build-aiv/bin/kvaf_execute_batch_get_kernels.o" \
+KVAF_BATCH_PUT_KERNEL="$PWD/build-aiv/bin/kvaf_execute_batch_put_kernels.o" \
+DEVICE_ID=0 \
+PYTHONPATH="$PWD/build-aiv/python" \
+KVAF_NPU_WARMUP=1 \
+KVAF_NPU_ITERATIONS=5 \
+timeout 240s python3 tests/python/test_npu_batch_put.py
+```
+
+测试规模复用 BatchGet 的 `KVAF_NPU_REQUESTS`、`KVAF_NPU_BLOCK_BYTES`、
+`KVAF_NPU_CORE_COUNT`、`KVAF_NPU_JETTYS_PER_CORE`、`KVAF_NPU_WARMUP` 和
+`KVAF_NPU_ITERATIONS`。启用 `BUILD_TESTING` 后，该脚本也会注册为
+`kvaf_npu_batch_put_python`；没有设置 `KVAF_RUN_NPU_TESTS=1` 时会明确跳过。
+
 ## NPU Runtime 性能脚本
 
 `tests/python/test_npu_runtime_perf.py` 是独立的 steady-state 性能脚本，不纳入

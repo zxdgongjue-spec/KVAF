@@ -29,7 +29,8 @@ output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数�
 第 0 维之后的连续元素推导，也不返回伪装成完成时间的数值。
 
 `NpuRuntime(batch_get_kernel_object_path, device_id=0, npu_core_count=1,
-batch_put_kernel_object_path="")` 的最后一个参数启用 AIV Direct-HCCP BatchPut。
+batch_put_kernel_object_path="", jettys_per_core=2)` 的 `jettys_per_core` 参数同时
+配置 BatchGet 和 BatchPut 每个 AIV core 使用的 Jetty 数量，可选 1 或 2 个独立 Jetty。
 `batch_put(keys, packed_input, input_offsets, lengths, stream=None)` 接收 caller-owned
 NPU packed input 和每条 block 的 CPU 整数 metadata；同步写入完成后才返回。未传
 BatchPut kernel 时，该方法保留 ACL D2H mock，便于只验证 BatchGet 的构建。

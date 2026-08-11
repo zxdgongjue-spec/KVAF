@@ -51,7 +51,8 @@ constexpr uint32_t kCtpQueryTimeoutMs = 10000U;
 // A5 HCCP converts EAGAIN differently for initialization and for the
 // asynchronous request-result API (HCCP_EAGAIN vs OTHERS_EAGAIN).
 constexpr int kHccpAsyncAgain = 128301;
-constexpr uint32_t kMaxDirectAivWorkers = KVAF_AIV_BATCH_PUT_MAX_AIV_CORES;
+constexpr uint32_t kMaxDirectAivWorkers =
+    KVAF_AIV_BATCH_PUT_MAX_AIV_CORES * KVAF_AIV_BATCH_PUT_MAX_JETTYS_PER_CORE;
 
 struct DeviceIdentity {
   uint32_t logical_device_id = 0;
@@ -102,9 +103,8 @@ struct DirectJetty {
 };
 
 // A USER_CTL SQ/CQ is strictly single-producer/single-consumer from the AIV
-// kernel's point of view.  A multi-AIV launch therefore owns one complete
-// Host/Device Jetty pair per core rather than sharing producer/consumer
-// indices or relying on unverified atomics around a single queue.
+// kernel's point of view. Each core/Jetty slot therefore owns one complete
+// Host/Device Jetty pair rather than sharing producer/consumer indices.
 struct DirectAivWorker {
   void *host_normal_cq = nullptr;
   hccp::CqInfo host_cq_info{};
@@ -155,6 +155,8 @@ struct KvafBatchPutTransport {
   hccp::DirectHccpSession *session = nullptr;
   uint32_t physical_device_id = 0;
   uint32_t aiv_core_count = 0U;
+  uint32_t jettys_per_core = 0U;
+  uint32_t worker_count = 0U;
   void *host_context = nullptr;
   void *device_context = nullptr;
   void *host_token_handle = nullptr;
@@ -805,7 +807,8 @@ void ReleaseTransport(KvafBatchPutTransport *transport) {
     transport->device_queue_state = nullptr;
   }
   if (transport->api.qp_unimport != nullptr) {
-    for (auto &worker : transport->workers) {
+    for (uint32_t worker_index = 0U; worker_index < transport->worker_count; ++worker_index) {
+      DirectAivWorker &worker = transport->workers[worker_index];
       if (transport->host_context != nullptr && worker.host_device_target_jetty != nullptr) {
         (void)transport->api.qp_unimport(transport->host_context, worker.host_device_target_jetty);
       }
@@ -815,7 +818,8 @@ void ReleaseTransport(KvafBatchPutTransport *transport) {
     }
   }
   if (transport->api.qp_destroy != nullptr) {
-    for (auto &worker : transport->workers) {
+    for (uint32_t worker_index = 0U; worker_index < transport->worker_count; ++worker_index) {
+      DirectAivWorker &worker = transport->workers[worker_index];
       if (worker.device_user_ctl_jetty.handle != nullptr) {
         (void)transport->api.qp_destroy(worker.device_user_ctl_jetty.handle);
       }
@@ -825,7 +829,8 @@ void ReleaseTransport(KvafBatchPutTransport *transport) {
     }
   }
   if (transport->api.cq_destroy != nullptr) {
-    for (auto &worker : transport->workers) {
+    for (uint32_t worker_index = 0U; worker_index < transport->worker_count; ++worker_index) {
+      DirectAivWorker &worker = transport->workers[worker_index];
       if (transport->device_context != nullptr && worker.device_user_ctl_cq != nullptr) {
         (void)transport->api.cq_destroy(transport->device_context, worker.device_user_ctl_cq);
       }
@@ -869,10 +874,11 @@ void ReleaseTransport(KvafBatchPutTransport *transport) {
 }
 
 extern "C" int32_t KvafBatchPutTransportCreate(void *host_ddr, uint64_t host_ddr_bytes,
-                                                uint32_t aiv_core_count,
+                                                uint32_t aiv_core_count, uint32_t jettys_per_core,
                                                 KvafBatchPutTransport **transport) {
   if (host_ddr == nullptr || host_ddr_bytes == 0U || aiv_core_count == 0U ||
-      aiv_core_count > KVAF_AIV_BATCH_PUT_MAX_AIV_CORES || transport == nullptr) {
+      aiv_core_count > KVAF_AIV_BATCH_PUT_MAX_AIV_CORES || jettys_per_core == 0U ||
+      jettys_per_core > KVAF_AIV_BATCH_PUT_MAX_JETTYS_PER_CORE || transport == nullptr) {
     return KVAF_BATCH_PUT_INVALID_ARGUMENT;
   }
   *transport = nullptr;
@@ -882,13 +888,16 @@ extern "C" int32_t KvafBatchPutTransportCreate(void *host_ddr, uint64_t host_ddr
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
   state->aiv_core_count = aiv_core_count;
+  state->jettys_per_core = jettys_per_core;
+  state->worker_count = aiv_core_count * jettys_per_core;
   state->host_ddr_address = reinterpret_cast<uint64_t>(host_ddr);
   state->host_ddr_bytes = host_ddr_bytes;
   DeviceIdentity identity{};
   EidPair pair{};
   int32_t result = KVAF_BATCH_PUT_DIRECT_HCCP_ERROR;
   uint32_t device_transport_token_id = 0U;
-  const uint64_t queue_bytes = static_cast<uint64_t>(aiv_core_count) * sizeof(KvafBatchPutQueueState);
+  const uint64_t queue_bytes =
+      static_cast<uint64_t>(state->worker_count) * sizeof(KvafBatchPutQueueState);
 
   if (!GetDeviceIdentity(&identity)) {
     std::fprintf(stderr, "[KVAF_AIV] unable to resolve physical device id from selected ACL device\n");
@@ -920,9 +929,12 @@ extern "C" int32_t KvafBatchPutTransportCreate(void *host_ddr, uint64_t host_ddr
                           &state->device_host_memory_import)) {
     goto failed;
   }
-  for (uint32_t core = 0U; core < aiv_core_count; ++core) {
-    DirectAivWorker &worker = state->workers[core];
-    const std::string suffix = "core=" + std::to_string(core);
+  for (uint32_t entity_index = 0U; entity_index < state->worker_count; ++entity_index) {
+    const uint32_t core = entity_index / jettys_per_core;
+    const uint32_t jetty_slot = entity_index % jettys_per_core;
+    DirectAivWorker &worker = state->workers[entity_index];
+    const std::string suffix =
+        "core=" + std::to_string(core) + "_jetty=" + std::to_string(jetty_slot);
     const std::string host_cq_role = "host_normal_" + suffix;
     const std::string host_jetty_role = "host_standard_" + suffix;
     const std::string device_cq_role = "device_user_ctl_" + suffix;
@@ -955,10 +967,7 @@ extern "C" int32_t KvafBatchPutTransportCreate(void *host_ddr, uint64_t host_ddr
     const uint32_t device_psn = MakeCtpPsn(state->api, identity.physical_device_id, device_ctp_role.c_str());
     const std::string host_import_role = "host_import_device_" + suffix;
     const std::string device_import_role = "device_import_host_" + suffix;
-    // Each core owns a matched reciprocal Jetty pair.  This deliberately
-    // spends more control-plane resources than sharing one Host Jetty, so a
-    // successful two-core run proves isolation rather than an unverified
-    // multi-producer convention on a single connection.
+    // Each core/Jetty slot owns a matched reciprocal Jetty pair.
     if (!ImportJetty(state->api, state->host_context, worker.device_user_ctl_jetty,
                      state->device_transport_token_value, host_tp, device_tp, host_psn, device_psn,
                      host_import_role.c_str(), &worker.host_device_import_info, &worker.host_device_target_jetty) ||
@@ -968,9 +977,9 @@ extern "C" int32_t KvafBatchPutTransportCreate(void *host_ddr, uint64_t host_ddr
       goto failed;
     }
   }
-  for (uint32_t core = 0U; core < aiv_core_count; ++core) {
-    const DirectAivWorker &worker = state->workers[core];
-    KvafBatchPutDirectUrmaEntity &entity = state->entity_templates[core];
+  for (uint32_t entity_index = 0U; entity_index < state->worker_count; ++entity_index) {
+    const DirectAivWorker &worker = state->workers[entity_index];
+    KvafBatchPutDirectUrmaEntity &entity = state->entity_templates[entity_index];
     entity.magic = kDirectEntityMagic;
     entity.version = kDirectEntityVersion;
     entity.remote_host_ddr_address = state->host_ddr_address;
@@ -993,7 +1002,7 @@ extern "C" int32_t KvafBatchPutTransportCreate(void *host_ddr, uint64_t host_ddr
         entity.cq_db_va == 0U || entity.cqe_size < 32U || entity.tp_id == 0U) {
       goto failed;
     }
-    for (uint32_t previous = 0U; previous < core; ++previous) {
+    for (uint32_t previous = 0U; previous < entity_index; ++previous) {
       const KvafBatchPutDirectUrmaEntity &other = state->entity_templates[previous];
       if (entity.sq_va == other.sq_va || entity.sq_db_va == other.sq_db_va ||
           entity.cq_va == other.cq_va || entity.cq_db_va == other.cq_db_va ||
@@ -1005,7 +1014,9 @@ extern "C" int32_t KvafBatchPutTransportCreate(void *host_ddr, uint64_t host_ddr
   if (aclrtMalloc(&state->device_queue_state, queue_bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
       state->device_queue_state == nullptr ||
       aclrtMemset(state->device_queue_state, queue_bytes, 0, queue_bytes) != ACL_SUCCESS) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_QUEUE_STATE_ALLOC_FAILED cores=%u\n", aiv_core_count);
+    std::fprintf(stderr,
+                 "[KVAF_AIV] DIRECT_QUEUE_STATE_ALLOC_FAILED cores=%u jettys_per_core=%u\n",
+                 aiv_core_count, jettys_per_core);
     goto failed;
   }
 
@@ -1063,13 +1074,14 @@ extern "C" int32_t KvafBatchPutLocalBufferAcquire(KvafBatchPutTransport *transpo
   }
 
   auto entities = transport->entity_templates;
-  for (uint32_t core = 0U; core < transport->aiv_core_count; ++core) {
-    entities[core].local_hbm_address = input_address;
-    entities[core].local_hbm_size = input_device_bytes;
-    entities[core].local_token_id = candidate->memory.token_id;
-    entities[core].local_token_value = candidate->memory.token_value;
+  for (uint32_t entity_index = 0U; entity_index < transport->worker_count; ++entity_index) {
+    entities[entity_index].local_hbm_address = input_address;
+    entities[entity_index].local_hbm_size = input_device_bytes;
+    entities[entity_index].local_token_id = candidate->memory.token_id;
+    entities[entity_index].local_token_value = candidate->memory.token_value;
   }
-  const uint64_t entity_bytes = static_cast<uint64_t>(transport->aiv_core_count) * sizeof(entities.front());
+  const uint64_t entity_bytes =
+      static_cast<uint64_t>(transport->worker_count) * sizeof(entities.front());
   if (aclrtMalloc(&candidate->device_entities, entity_bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
       candidate->device_entities == nullptr ||
       aclrtMemcpy(candidate->device_entities, entity_bytes, entities.data(), entity_bytes,
@@ -1139,6 +1151,7 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
   launch_args.request = *arguments;
   launch_args.channel_entity = local_buffer->device_channel_entity;
   launch_args.queue_state = reinterpret_cast<uint64_t>(transport->device_queue_state);
+  launch_args.jettys_per_core = transport->jettys_per_core;
   int32_t result = KvafExecuteBatchPutLaunchInternal(&launch_args, stream);
   if (result != KVAF_BATCH_PUT_SUCCESS) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=launch result=%d\n", result);
