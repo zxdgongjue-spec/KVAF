@@ -139,36 +139,16 @@ NpuTensorView GetNpuTensorView(const py::object& tensor, const char* name) {
 }
 
 std::vector<KeyId> CopyPrepareKeys(const py::object& keys) {
-  // A full AccessTable can contain millions of keys. Accepting a CPU int64
-  // Tensor avoids Pybind iterating millions of Python int objects before the
-  // Runtime control plane even starts. Runtime's C++ API still owns a vector
-  // snapshot, so this performs one contiguous 8-byte copy per key.
-  if (!py::hasattr(keys, "data_ptr")) {
-    return keys.cast<std::vector<KeyId>>();
+  py::sequence sequence = keys.cast<py::sequence>();
+  std::vector<KeyId> result;
+  result.reserve(sequence.size());
+  for (const py::handle item : sequence) {
+    if (!py::isinstance<py::str>(item)) {
+      throw py::type_error("keys must be a sequence of strings");
+    }
+    result.push_back(py::cast<std::string>(item));
   }
-  if (!py::hasattr(keys, "numel") || !py::hasattr(keys, "element_size") ||
-      !py::hasattr(keys, "is_contiguous") || !py::hasattr(keys, "device") ||
-      !py::hasattr(keys, "dim") || !py::hasattr(keys, "dtype")) {
-    throw py::type_error("PrepareAccessTable keys must be a sequence or CPU int64 Tensor");
-  }
-  if (!keys.attr("is_contiguous")().cast<bool>() ||
-      keys.attr("dim")().cast<int>() != 1 ||
-      py::str(keys.attr("device")).cast<std::string>() != "cpu" ||
-      py::str(keys.attr("dtype")).cast<std::string>() != "torch.int64" ||
-      keys.attr("element_size")().cast<std::size_t>() != sizeof(KeyId)) {
-    throw py::value_error(
-        "PrepareAccessTable Tensor keys must be contiguous CPU torch.int64 with one dimension");
-  }
-  const std::uint64_t count = keys.attr("numel")().cast<std::uint64_t>();
-  if (count == 0 || count > std::numeric_limits<std::size_t>::max()) {
-    throw py::value_error("PrepareAccessTable Tensor keys must be non-empty");
-  }
-  const auto* data = static_cast<const KeyId*>(
-      PointerFromValue(keys.attr("data_ptr")().cast<std::uint64_t>()));
-  if (data == nullptr) {
-    throw py::value_error("PrepareAccessTable Tensor keys must have storage");
-  }
-  return std::vector<KeyId>{data, data + static_cast<std::size_t>(count)};
+  return result;
 }
 
 class DeviceAccessTable final {
@@ -357,9 +337,7 @@ class NpuRuntime final {
   }
 
   // BatchFree is a control-plane operation.  It deliberately takes the same
-  // Python key forms as PrepareAccessTable (a Python key sequence or a
-  // contiguous one-dimensional CPU torch.int64 Tensor), rather than imposing
-  // a second representation solely for the NPU Runtime binding.
+  // BatchFree 使用与 PrepareAccessTable 相同的字符串 key 序列。
   void BatchFree(const py::object& keys) {
     std::vector<KeyId> copied_keys = CopyPrepareKeys(keys);
     ThrowIfError(runtime_->BatchFree(BatchFreeRequest{std::move(copied_keys)}));
@@ -485,8 +463,7 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("access_table"))
       .def("batch_free", &NpuRuntime::BatchFree, py::arg("keys"),
            "Release the supplied keys from the Runtime metadata store. keys "
-           "accepts a Python key sequence or a contiguous one-dimensional "
-           "CPU torch.int64 Tensor.")
+           "must be a sequence of strings.")
       .def("batch_get", &NpuRuntime::BatchGet,
            py::arg("device_access_table"), py::arg("indices"), py::arg("mask"),
            py::arg("output_indices"), py::arg("output"),

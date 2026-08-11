@@ -30,7 +30,7 @@ struct KeyEntry {
 
 // PreparePut 阶段的临时预留项。
 struct PendingPutItem {
-  KeyId key{0};
+  KeyId key{};
   std::size_t slot_id{0};
   std::uint64_t valid_length{0};
 };
@@ -42,7 +42,7 @@ struct PendingPutContext {
 
 // LockKeys 固定下来的一条快照项。
 struct LockedItem {
-  KeyId key{0};
+  KeyId key{};
   AddressRecord* record{nullptr};
 };
 
@@ -79,7 +79,7 @@ Status InvalidState(std::string message) {
 bool HasDistinctKeys(const std::vector<KeyId>& keys) {
   std::unordered_set<KeyId> seen;
   seen.reserve(keys.size());
-  for (KeyId key : keys) {
+  for (const KeyId& key : keys) {
     if (!seen.insert(key).second) {
       return false;
     }
@@ -267,7 +267,7 @@ class InMemoryMetaManager final : public MetaManager {
 
     std::vector<LockedItem> items;
     items.reserve(flat_keys.size());
-    for (KeyId key : flat_keys) {
+    for (const KeyId& key : flat_keys) {
       auto key_it = key_index_.find(key);
       if (key_it == key_index_.end()) {
         // Pins are taken while building the snapshot so this path needs to
@@ -387,7 +387,7 @@ class InMemoryMetaManager final : public MetaManager {
 
     std::vector<std::size_t> slots_to_recycle;
     slots_to_recycle.reserve(flat_keys.size());
-    for (KeyId key : flat_keys) {
+    for (const KeyId& key : flat_keys) {
       auto key_it = key_index_.find(key);
       if (key_it == key_index_.end()) {
         return NotFound("BatchFree key was not found");
@@ -401,7 +401,7 @@ class InMemoryMetaManager final : public MetaManager {
       slots_to_recycle.push_back(record.slot_id);
     }
 
-    for (KeyId key : flat_keys) {
+    for (const KeyId& key : flat_keys) {
       key_index_.erase(key);
     }
 

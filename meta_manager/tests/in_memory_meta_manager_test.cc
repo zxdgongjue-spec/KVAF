@@ -25,6 +25,10 @@ using kvaf::StatusCode;
 constexpr std::uint64_t kBaseAddress = 4096;
 constexpr std::uint64_t kSlotSize = 256;
 
+KeyId MakeKey(std::uint64_t id) {
+  return "key-" + std::to_string(id);
+}
+
 // 最轻量的断言助手。失败时直接输出错误信息，便于脱离 gtest 独立运行。
 bool Expect(bool condition, const std::string& message) {
   if (!condition) {
@@ -101,7 +105,7 @@ bool TestPutCommitLookupUnlockFreeRoundTrip() {
     return false;
   }
 
-  const std::vector<KeyId> keys{11, 12};
+  const std::vector<KeyId> keys{MakeKey(11), MakeKey(12)};
   const std::vector<std::uint64_t> lengths{64, 128};
   PutContext put_context;
   PutAccessDesc put_desc;
@@ -182,7 +186,8 @@ bool TestPutCommitLookupUnlockFreeRoundTrip() {
 
   PutContext recycled_put;
   PutAccessDesc recycled_desc;
-  if (!ExpectOk(manager->PreparePut({13}, {32}, &recycled_put, &recycled_desc),
+  if (!ExpectOk(
+          manager->PreparePut({MakeKey(13)}, {32}, &recycled_put, &recycled_desc),
                 "freed slots should be reusable by later puts")) {
     return false;
   }
@@ -199,7 +204,8 @@ bool TestAbortPutRecyclesSlot() {
 
   PutContext first_put;
   PutAccessDesc first_desc;
-  if (!ExpectOk(manager->PreparePut({21}, {32}, &first_put, &first_desc),
+  if (!ExpectOk(
+          manager->PreparePut({MakeKey(21)}, {32}, &first_put, &first_desc),
                 "first PreparePut should succeed")) {
     return false;
   }
@@ -209,7 +215,8 @@ bool TestAbortPutRecyclesSlot() {
 
   LockContext invisible_lock;
   if (!ExpectStatusCode(
-          manager->LockKeys({21}, MetaManagerLockMode::kStableReadAllowAppend,
+          manager->LockKeys({MakeKey(21)},
+                            MetaManagerLockMode::kStableReadAllowAppend,
                             &invisible_lock),
           StatusCode::kNotFound,
           "aborted puts should not leave visible mappings behind")) {
@@ -218,7 +225,8 @@ bool TestAbortPutRecyclesSlot() {
 
   PutContext second_put;
   PutAccessDesc second_desc;
-  if (!ExpectOk(manager->PreparePut({22}, {48}, &second_put, &second_desc),
+  if (!ExpectOk(
+          manager->PreparePut({MakeKey(22)}, {48}, &second_put, &second_desc),
                 "second PreparePut should reuse the freed slot")) {
     return false;
   }
@@ -239,7 +247,8 @@ bool TestBatchFreeFailsWhileLocked() {
 
   PutContext put_context;
   PutAccessDesc put_desc;
-  if (!ExpectOk(manager->PreparePut({31}, {80}, &put_context, &put_desc),
+  if (!ExpectOk(
+          manager->PreparePut({MakeKey(31)}, {80}, &put_context, &put_desc),
                 "PreparePut should succeed")) {
     return false;
   }
@@ -249,20 +258,21 @@ bool TestBatchFreeFailsWhileLocked() {
 
   LockContext lock_context;
   if (!ExpectOk(
-          manager->LockKeys({31}, MetaManagerLockMode::kStableReadAllowAppend,
+          manager->LockKeys({MakeKey(31)},
+                            MetaManagerLockMode::kStableReadAllowAppend,
                             &lock_context),
           "LockKeys should succeed")) {
     return false;
   }
 
-  if (!ExpectStatusCode(manager->BatchFree({31}), StatusCode::kBusy,
+  if (!ExpectStatusCode(manager->BatchFree({MakeKey(31)}), StatusCode::kBusy,
                         "BatchFree should reject locked keys")) {
     return false;
   }
   if (!ExpectOk(manager->UnlockKeys(lock_context), "UnlockKeys should succeed")) {
     return false;
   }
-  return ExpectOk(manager->BatchFree({31}),
+  return ExpectOk(manager->BatchFree({MakeKey(31)}),
                   "BatchFree should succeed after unlock");
 }
 
@@ -275,7 +285,8 @@ bool TestInvalidArgumentAndDuplicateKeyPaths() {
 
   PutContext duplicate_put;
   PutAccessDesc duplicate_desc;
-  if (!ExpectStatusCode(manager->PreparePut({41, 41}, {8, 8}, &duplicate_put,
+  if (!ExpectStatusCode(
+          manager->PreparePut({MakeKey(41), MakeKey(41)}, {8, 8}, &duplicate_put,
                                             &duplicate_desc),
                         StatusCode::kInvalidArgument,
                         "PreparePut should reject duplicate keys in one batch")) {
@@ -284,7 +295,8 @@ bool TestInvalidArgumentAndDuplicateKeyPaths() {
 
   PutContext put_context;
   PutAccessDesc put_desc;
-  if (!ExpectOk(manager->PreparePut({42}, {16}, &put_context, &put_desc),
+  if (!ExpectOk(
+          manager->PreparePut({MakeKey(42)}, {16}, &put_context, &put_desc),
                 "PreparePut should succeed for a fresh key")) {
     return false;
   }
@@ -294,7 +306,7 @@ bool TestInvalidArgumentAndDuplicateKeyPaths() {
 
   PutContext conflict_put;
   PutAccessDesc conflict_desc;
-  if (!ExpectStatusCode(manager->PreparePut({42}, {32}, &conflict_put,
+  if (!ExpectStatusCode(manager->PreparePut({MakeKey(42)}, {32}, &conflict_put,
                                             &conflict_desc),
                         StatusCode::kAlreadyExists,
                         "PreparePut should reject an already committed key")) {
@@ -303,14 +315,16 @@ bool TestInvalidArgumentAndDuplicateKeyPaths() {
 
   LockContext lock_context;
   if (!ExpectOk(
-          manager->LockKeys({42}, MetaManagerLockMode::kStableReadAllowAppend,
+          manager->LockKeys({MakeKey(42)},
+                            MetaManagerLockMode::kStableReadAllowAppend,
                             &lock_context),
           "LockKeys should succeed")) {
     return false;
   }
 
   FlatAccessDesc access_desc;
-  if (!ExpectStatusCode(manager->BatchLookup({99}, lock_context, &access_desc),
+  if (!ExpectStatusCode(
+          manager->BatchLookup({MakeKey(99)}, lock_context, &access_desc),
                         StatusCode::kInvalidArgument,
                         "BatchLookup should validate key order against LockContext")) {
     return false;
@@ -324,7 +338,8 @@ bool TestNotInitializedPaths() {
 
   PutContext put_context;
   PutAccessDesc put_desc;
-  if (!ExpectStatusCode(manager->PreparePut({51}, {8}, &put_context, &put_desc),
+  if (!ExpectStatusCode(
+          manager->PreparePut({MakeKey(51)}, {8}, &put_context, &put_desc),
                         StatusCode::kNotInitialized,
                         "PreparePut should fail before RegisterRemoteRegion")) {
     return false;
@@ -332,14 +347,16 @@ bool TestNotInitializedPaths() {
 
   LockContext lock_context;
   if (!ExpectStatusCode(
-          manager->LockKeys({51}, MetaManagerLockMode::kStableReadAllowAppend,
+          manager->LockKeys({MakeKey(51)},
+                            MetaManagerLockMode::kStableReadAllowAppend,
                             &lock_context),
           StatusCode::kNotInitialized,
           "LockKeys should fail before RegisterRemoteRegion")) {
     return false;
   }
 
-  return ExpectStatusCode(manager->BatchFree({51}), StatusCode::kNotInitialized,
+  return ExpectStatusCode(manager->BatchFree({MakeKey(51)}),
+                          StatusCode::kNotInitialized,
                           "BatchFree should fail before RegisterRemoteRegion");
 }
 
@@ -365,7 +382,8 @@ bool TestInvalidContextPaths() {
                         "UnlockKeys should reject an unknown LockContext")) {
     return false;
   }
-  return ExpectStatusCode(manager->BatchLookup({1}, LockContext{666}, nullptr),
+  return ExpectStatusCode(
+      manager->BatchLookup({MakeKey(1)}, LockContext{666}, nullptr),
                           StatusCode::kInvalidArgument,
                           "BatchLookup should validate nullptr access_desc first");
 }
@@ -380,7 +398,8 @@ bool TestPreparePutRejectsOversizedLength() {
   PutContext put_context;
   PutAccessDesc put_desc;
   return ExpectStatusCode(
-      manager->PreparePut({61}, {kSlotSize + 1}, &put_context, &put_desc),
+      manager->PreparePut({MakeKey(61)}, {kSlotSize + 1}, &put_context,
+                          &put_desc),
       StatusCode::kInvalidArgument,
       "PreparePut should reject payload larger than one slot");
 }
@@ -394,14 +413,16 @@ bool TestPreparePutOutOfMemory() {
 
   PutContext first_put;
   PutAccessDesc first_desc;
-  if (!ExpectOk(manager->PreparePut({71}, {16}, &first_put, &first_desc),
+  if (!ExpectOk(
+          manager->PreparePut({MakeKey(71)}, {16}, &first_put, &first_desc),
                 "first PreparePut should consume the only slot")) {
     return false;
   }
 
   PutContext second_put;
   PutAccessDesc second_desc;
-  return ExpectStatusCode(manager->PreparePut({72}, {16}, &second_put, &second_desc),
+  return ExpectStatusCode(
+      manager->PreparePut({MakeKey(72)}, {16}, &second_put, &second_desc),
                           StatusCode::kOutOfMemory,
                           "PreparePut should fail when no free slot remains");
 }
@@ -415,7 +436,8 @@ bool TestDoubleUnlockReturnsNotFound() {
 
   PutContext put_context;
   PutAccessDesc put_desc;
-  if (!ExpectOk(manager->PreparePut({81}, {24}, &put_context, &put_desc),
+  if (!ExpectOk(
+          manager->PreparePut({MakeKey(81)}, {24}, &put_context, &put_desc),
                 "PreparePut should succeed")) {
     return false;
   }
@@ -425,7 +447,8 @@ bool TestDoubleUnlockReturnsNotFound() {
 
   LockContext lock_context;
   if (!ExpectOk(
-          manager->LockKeys({81}, MetaManagerLockMode::kStableReadAllowAppend,
+          manager->LockKeys({MakeKey(81)},
+                            MetaManagerLockMode::kStableReadAllowAppend,
                             &lock_context),
           "LockKeys should succeed")) {
     return false;

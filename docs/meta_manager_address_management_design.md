@@ -34,6 +34,7 @@
 4. `valid_length <= slot_size`。
 5. 一个 key 当前只保留一个 `active_record`。
 6. 被锁定记录不允许 `free`，直接返回 `kBusy`。
+7. `KeyId` 使用字符串表示。
 
 ## 4. 总体方案
 

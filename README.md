@@ -70,15 +70,17 @@ runtime = kvaf.Runtime()  # 当前注入进程内 CPU Mock AccessOperator
 runtime.initialize(ddr_bytes=256, slot_size=64)
 payload = b"value"
 runtime.batch_put(
-    keys=[1], input=payload, input_offsets=[0], lengths=[len(payload)]
+    keys=["key-1"], input=payload, input_offsets=[0], lengths=[len(payload)]
 )
-table = runtime.prepare_access_table([1])
+table = runtime.prepare_access_table(["key-1"])
 output = bytearray(64)
 runtime.batch_get(table, indices=[0], output_indices=[0], output=output,
                   output_block_bytes=64)
 runtime.release_access_table(table)
 runtime.shutdown()
 ```
+
+`KeyId` in the C++ and Python control-plane APIs is represented as a string.
 
 Mock API 走 Runtime/MetaManager 的实际代码路径，适合本地功能测试。它不把
 MPS 当作 NPU；A5/CANN 集成需要 NPU Python backend。启用该 backend 后，Python

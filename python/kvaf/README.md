@@ -11,10 +11,10 @@ runtime = kvaf.Runtime()  # 当前是确定性的进程内 CPU Mock operator
 runtime.initialize(ddr_bytes=256, slot_size=64)
 payload = b"payload"
 runtime.batch_put(
-    keys=[101], input=payload, input_offsets=[0], lengths=[len(payload)]
+    keys=["key-101"], input=payload, input_offsets=[0], lengths=[len(payload)]
 )
 
-table = runtime.prepare_access_table([101])
+table = runtime.prepare_access_table(["key-101"])
 output = bytearray(64)  # 调用方拥有 BatchGet 的输出 buffer
 runtime.batch_get(
     table,
@@ -24,7 +24,7 @@ runtime.batch_get(
     output_block_bytes=64,
 )
 runtime.release_access_table(table)
-runtime.batch_free([101])
+runtime.batch_free(["key-101"])
 runtime.shutdown()
 ```
 

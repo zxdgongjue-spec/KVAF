@@ -28,7 +28,7 @@ struct LockContext {
 // 单个 key 对应的一段预留写入地址。
 // AccessOperator 在拿到该结构后，把 payload 写到 address 指向的远端地址。
 struct PutAllocation {
-  KeyId key{0};
+  KeyId key{};
   Address address{0};
   std::uint64_t reserved_length{0};
 };

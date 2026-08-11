@@ -2,11 +2,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace kvaf {
 
 // TODO: 与最终 Key 编码和上层 tensor/host 表示统一。
-using KeyId = std::uint64_t;
+using KeyId = std::string;
 
 // TODO: 与远端 DDR 地址表示和 UBA 定义统一。
 using Address = std::uint64_t;
