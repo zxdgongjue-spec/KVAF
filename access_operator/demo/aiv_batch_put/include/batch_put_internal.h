@@ -50,8 +50,10 @@ typedef struct KvafBatchPutDirectUrmaEntity {
 // transport fields; KvafExecuteBatchPutSync injects them from the transport.
 typedef struct KvafExecuteBatchPutLaunchArgs {
   KvafExecuteBatchPutKernelArgs request;
-  uint64_t channel_entity;
-  uint64_t queue_state;
+  uint64_t channel_entity;  // Entity[aiv_core_count * jettys_per_core]
+  uint64_t queue_state;     // QueueState[aiv_core_count * jettys_per_core]
+  uint32_t jettys_per_core;
+  uint32_t reserved0;
 } KvafExecuteBatchPutLaunchArgs;
 
 #if defined(__cplusplus)
@@ -59,7 +61,7 @@ static_assert(sizeof(KvafBatchPutQueueState) == KVAF_AIV_BATCH_PUT_QUEUE_STATE_B
               "KvafBatchPutQueueState ABI changed");
 static_assert(sizeof(KvafBatchPutDirectUrmaEntity) == 192,
               "KvafBatchPutDirectUrmaEntity ABI changed");
-static_assert(sizeof(KvafExecuteBatchPutLaunchArgs) == 72,
+static_assert(sizeof(KvafExecuteBatchPutLaunchArgs) == 80,
               "KvafExecuteBatchPutLaunchArgs ABI changed");
 #endif
 

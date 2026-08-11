@@ -9,7 +9,9 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -22,6 +24,7 @@ struct Options {
   uint32_t max_bytes = 4096U;
   uint32_t destination_stride = 4096U;
   uint32_t aiv_cores = 1U;
+  uint32_t jettys_per_core = 2U;
   uint32_t iterations = 1U;
 };
 
@@ -51,6 +54,8 @@ bool ParseOptions(int argc, char **argv, Options *options) {
       if (!ParseU32(argv[++index], &options->destination_stride)) return false;
     } else if (argument == "--aiv-cores" && index + 1 < argc) {
       if (!ParseU32(argv[++index], &options->aiv_cores)) return false;
+    } else if (argument == "--jettys-per-core" && index + 1 < argc) {
+      if (!ParseU32(argv[++index], &options->jettys_per_core)) return false;
     } else if (argument == "--iterations" && index + 1 < argc) {
       if (!ParseU32(argv[++index], &options->iterations)) return false;
     } else {
@@ -60,7 +65,10 @@ bool ParseOptions(int argc, char **argv, Options *options) {
   return !options->kernel.empty() && options->rows != 0U && options->min_bytes != 0U &&
          options->max_bytes >= options->min_bytes && options->destination_stride >= options->max_bytes &&
          options->aiv_cores != 0U && options->aiv_cores <= options->rows &&
-         options->aiv_cores <= KVAF_AIV_BATCH_PUT_MAX_AIV_CORES && options->iterations != 0U;
+         options->aiv_cores <= KVAF_AIV_BATCH_PUT_MAX_AIV_CORES &&
+         options->jettys_per_core != 0U &&
+         options->jettys_per_core <= KVAF_AIV_BATCH_PUT_MAX_JETTYS_PER_CORE &&
+         options->iterations != 0U;
 }
 
 bool CheckAcl(aclError error, const char *step) {
@@ -79,12 +87,31 @@ uint8_t PatternByte(uint32_t row, uint64_t byte, uint32_t epoch) {
   return static_cast<uint8_t>((row * 37U + byte * 13U + epoch * 17U + 1U) & 0xffU);
 }
 
-bool Validate(const uint8_t *host_ddr, const std::vector<uint8_t> &input,
-              const std::vector<uint64_t> &offsets, const std::vector<uint64_t> &lengths,
-              uint32_t destination_stride, const std::vector<KvafBatchPutCoreStatus> &statuses,
+void RandomizeDestinations(uint64_t host_ddr_address, uint32_t rows,
+                           uint32_t destination_stride, uint32_t iteration,
+                           std::vector<uint32_t> *previous_slots,
+                           std::vector<uint64_t> *destinations) {
+  std::vector<uint32_t> slots(rows);
+  std::iota(slots.begin(), slots.end(), 0U);
+  std::mt19937_64 generator(0x4b5641465f425054ULL + iteration);
+  std::shuffle(slots.begin(), slots.end(), generator);
+  if (!previous_slots->empty() && slots == *previous_slots) {
+    std::rotate(slots.begin(), slots.begin() + 1, slots.end());
+  }
+  for (uint32_t row = 0U; row < rows; ++row) {
+    (*destinations)[row] = host_ddr_address +
+                           static_cast<uint64_t>(slots[row]) * destination_stride;
+  }
+  *previous_slots = std::move(slots);
+}
+
+bool Validate(const std::vector<uint8_t> &input, const std::vector<uint64_t> &offsets,
+              const std::vector<uint64_t> &lengths,
+              const std::vector<uint64_t> &destinations, uint32_t destination_stride,
+              const std::vector<KvafBatchPutCoreStatus> &statuses,
               uint32_t aiv_cores, uint32_t rows, uint64_t expected_batches) {
   for (uint32_t row = 0U; row < rows; ++row) {
-    const uint8_t *actual = host_ddr + static_cast<uint64_t>(row) * destination_stride;
+    const uint8_t *actual = reinterpret_cast<const uint8_t *>(destinations[row]);
     const uint8_t *expected = input.data() + offsets[row];
     if (!std::equal(expected, expected + lengths[row], actual)) {
       std::cerr << "DATA_MISMATCH row=" << row << " bytes=" << lengths[row] << '\n';
@@ -123,7 +150,8 @@ int main(int argc, char **argv) {
   if (!ParseOptions(argc, argv, &options)) {
     std::cerr << "usage: kvaf_execute_batch_put_test --kernel <kernels.o> "
                  "[--device N --rows N --min-bytes N --max-bytes N "
-                 "--destination-stride N --aiv-cores N --iterations N]\n";
+                 "--destination-stride N --aiv-cores N --jettys-per-core N "
+                 "--iterations N]\n";
     return 2;
   }
 
@@ -156,6 +184,7 @@ int main(int argc, char **argv) {
   KvafExecuteBatchPutKernelArgs arguments{};
   std::vector<uint8_t> input(input_bytes);
   std::vector<uint64_t> destinations(options.rows);
+  std::vector<uint32_t> previous_destination_slots;
   std::vector<KvafBatchPutCoreStatus> statuses(options.aiv_cores);
   std::vector<double> elapsed_ms;
 
@@ -178,11 +207,13 @@ int main(int argc, char **argv) {
     goto cleanup;
   }
   std::memset(host_ddr, 0, destination_bytes);
-  for (uint32_t row = 0U; row < options.rows; ++row) {
-    destinations[row] = reinterpret_cast<uint64_t>(host_ddr) +
-                        static_cast<uint64_t>(row) * options.destination_stride;
-  }
-  if (!CheckKvaf(KvafBatchPutTransportCreate(host_ddr, destination_bytes, options.aiv_cores, &transport),
+  RandomizeDestinations(reinterpret_cast<uint64_t>(host_ddr), options.rows,
+                        options.destination_stride, 0U, &previous_destination_slots,
+                        &destinations);
+  if (!CheckKvaf(KvafBatchPutTransportCreate(host_ddr, destination_bytes,
+                                              options.aiv_cores,
+                                              options.jettys_per_core,
+                                              &transport),
                  "create transport") ||
       !CheckKvaf(KvafBatchPutLocalBufferAcquire(transport, input_hbm, input_bytes, &local_buffer),
                  "acquire local buffer") ||
@@ -202,6 +233,7 @@ int main(int argc, char **argv) {
   KvafBatchPutLocalBufferRelease(reacquired_local_buffer);
   reacquired_local_buffer = nullptr;
   std::cout << "PHASE_TRANSPORT_READY cores=" << options.aiv_cores
+            << " jettys_per_core=" << options.jettys_per_core
             << " dynamic_input=A_to_B_to_A local_buffer_cache_verified=1\n";
 
   if (!CheckAcl(aclrtMemcpy(device_offsets, offsets.size() * sizeof(offsets[0]), offsets.data(),
@@ -236,8 +268,8 @@ int main(int argc, char **argv) {
   if (!CheckKvaf(KvafExecuteBatchPutSync(alternate_local_buffer, &arguments, stream, statuses.data(),
                                          static_cast<uint32_t>(statuses.size())),
                  "alternate input synchronous BatchPut") ||
-      !Validate(static_cast<const uint8_t *>(host_ddr), input, offsets, lengths,
-                options.destination_stride, statuses, options.aiv_cores, options.rows, 1U)) {
+      !Validate(input, offsets, lengths, destinations, options.destination_stride,
+                statuses, options.aiv_cores, options.rows, 1U)) {
     goto cleanup;
   }
   std::cout << "PHASE_ALTERNATE_INPUT_VALIDATION_PASS transport_reused=1\n";
@@ -246,13 +278,23 @@ int main(int argc, char **argv) {
   elapsed_ms.reserve(options.iterations);
   for (uint32_t iteration = 0U; iteration < options.iterations; ++iteration) {
     std::memset(host_ddr, 0, destination_bytes);
+    RandomizeDestinations(reinterpret_cast<uint64_t>(host_ddr), options.rows,
+                          options.destination_stride, iteration + 1U,
+                          &previous_destination_slots, &destinations);
     for (uint32_t row = 0U; row < options.rows; ++row) {
       for (uint64_t byte = 0U; byte < lengths[row]; ++byte) {
         input[offsets[row] + byte] = PatternByte(row, byte, iteration);
       }
     }
-    if (!CheckAcl(aclrtMemcpy(input_hbm, input_bytes, input.data(), input_bytes, ACL_MEMCPY_HOST_TO_DEVICE),
-                  "copy packed input")) goto cleanup;
+    if (!CheckAcl(aclrtMemcpy(device_destinations,
+                              destinations.size() * sizeof(destinations[0]),
+                              destinations.data(),
+                              destinations.size() * sizeof(destinations[0]),
+                              ACL_MEMCPY_HOST_TO_DEVICE), "copy random destinations") ||
+        !CheckAcl(aclrtMemcpy(input_hbm, input_bytes, input.data(), input_bytes,
+                              ACL_MEMCPY_HOST_TO_DEVICE), "copy packed input")) {
+      goto cleanup;
+    }
     const auto begin = std::chrono::steady_clock::now();
     if (!CheckKvaf(KvafExecuteBatchPutSync(local_buffer, &arguments, stream, statuses.data(),
                                            static_cast<uint32_t>(statuses.size())),
@@ -267,8 +309,8 @@ int main(int argc, char **argv) {
     }
     const auto end = std::chrono::steady_clock::now();
     elapsed_ms.push_back(std::chrono::duration<double, std::milli>(end - begin).count());
-    if (!Validate(static_cast<const uint8_t *>(host_ddr), input, offsets, lengths,
-                  options.destination_stride, statuses, options.aiv_cores, options.rows, iteration + 2U)) {
+    if (!Validate(input, offsets, lengths, destinations, options.destination_stride,
+                  statuses, options.aiv_cores, options.rows, iteration + 2U)) {
       goto cleanup;
     }
     std::cout << "EAGER_ITERATION_PASS iteration=" << iteration << " rows=" << options.rows << '\n';
@@ -280,6 +322,7 @@ int main(int argc, char **argv) {
     std::cout << std::fixed << std::setprecision(3)
               << "EXECUTE_BATCH_PUT_VALIDATION result=pass variable_lengths=1 rows=" << options.rows
               << " useful_bytes=" << useful_bytes << " mean_sync_ms=" << mean_ms
+              << " random_destinations_per_iteration=1 jettys_per_core=" << options.jettys_per_core
               << " all_core_status=success\n";
   }
   exit_code = 0;

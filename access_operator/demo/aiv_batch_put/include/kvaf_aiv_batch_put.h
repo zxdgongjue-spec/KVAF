@@ -23,7 +23,7 @@ typedef struct KvafBatchPutTransport KvafBatchPutTransport;
 typedef struct KvafBatchPutLocalBuffer KvafBatchPutLocalBuffer;
 
 int32_t KvafBatchPutTransportCreate(void *host_ddr, uint64_t host_ddr_bytes,
-                                    uint32_t aiv_core_count,
+                                    uint32_t aiv_core_count, uint32_t jettys_per_core,
                                     KvafBatchPutTransport **transport);
 void KvafBatchPutTransportDestroy(KvafBatchPutTransport *transport);
 
@@ -35,7 +35,7 @@ void KvafBatchPutLocalBufferRelease(KvafBatchPutLocalBuffer *local_buffer);
 int32_t KvafExecuteBatchPutLoadKernel(const char *kernel_object_path);
 
 // Synchronous eager execution: launch, stream synchronization, status copy
-// and validation all finish before this function returns.
+// and core-status checking all finish before this function returns.
 int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer,
                                const KvafExecuteBatchPutKernelArgs *arguments,
                                aclrtStream stream,

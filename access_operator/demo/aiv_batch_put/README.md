@@ -35,18 +35,26 @@ bytes = lengths[i];
 UDMA_WRITE(source, target, bytes);
 ```
 
+The source payload must already be visible in Global Memory before launch.
+Inputs produced by DMA or `DataCopy` satisfy this requirement. A Scalar
+producer must clean its Data Cache before handing the buffer to BatchPut; the
+BatchPut kernel does not perform source-payload cache maintenance.
+
 There are no indices, masks, validity tables, table capacities or graph
 capture/replay semantics in V1.
 
-Before publishing any WQE in its shard, each AIV core validates that the
-length is nonzero and fits the 32-bit WQE byte-count field, the source range is
-inside `input_bytes`, and the destination range is inside the exact Host DDR
-range passed to `KvafBatchPutTransportCreate`.
+The kernel trusts per-request metadata and does not validate it before
+publishing WQEs. The caller must ensure that every length is nonzero and fits
+the 32-bit WQE byte-count field, every source range is inside `input_bytes`,
+and every destination range is inside the Host DDR region passed to
+`KvafBatchPutTransportCreate`. Invalid metadata is unsupported and may result
+in a transport or completion error.
 
 ## Resource lifecycle
 
 ```cpp
-KvafBatchPutTransportCreate(host_ddr, host_ddr_bytes, aiv_core_count, &transport);
+KvafBatchPutTransportCreate(host_ddr, host_ddr_bytes, aiv_core_count,
+                            jettys_per_core, &transport);
 KvafBatchPutLocalBufferAcquire(transport, input_hbm, input_bytes, &local_buffer);
 
 KvafExecuteBatchPutSync(local_buffer, &args, stream, statuses, aiv_core_count);
@@ -56,7 +64,9 @@ KvafBatchPutTransportDestroy(transport);
 ```
 
 `TransportCreate` owns EIDs, contexts, CTPs, Jettys, SQ/CQ, Host DDR
-registration/import and persistent queue state. It never registers input HBM.
+registration/import and persistent queue state. Each AIV core owns one or two
+independent Jetty slots, each with its own SQ, CQ, doorbells and persistent
+producer/consumer indices. It never registers input HBM.
 
 `LocalBufferAcquire` registers only input HBM. Repeated Acquire with the same
 `(address, bytes)` returns the same opaque handle and reuses its MR/entity.
@@ -65,10 +75,15 @@ MRs are unregistered by `TransportDestroy`. Inputs using the same transport
 must not execute concurrently because each AIV queue is single-producer; the
 synchronous API serializes launches on that transport.
 
+Each post contains at most 32 WQEs. A core assigns complete posts to its Jettys
+in round-robin order. Only the last WQE assigned to each used Jetty requests a
+CQE, and the kernel waits for one CQE from every used Jetty before reporting
+success. A core with at most one post uses only Jetty 0.
+
 ## Completion and errors
 
 `KvafExecuteBatchPutSync` performs kernel launch, stream synchronization,
-device-to-host status copy, and validation of every core status. It returns
+device-to-host status copy, and checking of every core status. It returns
 success only when all cores report success.
 
 Host return codes:
@@ -90,17 +105,20 @@ Core `result` values:
 | `1` | Invalid kernel arguments. |
 | `2` | Invalid local/remote entity, token, SQ or CQ metadata. |
 | `3` | Corrupt persistent queue state. |
-| `4` | `input_offsets[i] + lengths[i]` exceeds `input_bytes`. |
-| `5` | Destination range is outside registered Host DDR. |
+| `4` | Reserved compatibility value; this kernel does not validate source ranges. |
+| `5` | Reserved compatibility value; this kernel does not validate destination ranges. |
 | `6` | Core shard cannot fit the SQ. |
 | `7` | CQ completion timeout. |
 | `8` | CQ status or sub-status reports an error. |
-| `9` | Zero length or length larger than the WQE byte-count field. |
+| `9` | Reserved compatibility value; this kernel does not validate request lengths. |
 
-`failed_request_index` identifies the invalid row for per-request validation
-errors. `sq_producer_index`, `cq_consumer_index`, `cq_status`,
-`cq_sub_status`, `last_wqe_protocol` and `completed_batch_count` preserve queue
-diagnostics.
+The kernel does not produce a request-level error index; for a normally written
+status, `failed_request_index` is `UINT64_MAX`. `sq_producer_index`,
+`cq_consumer_index`,
+`cq_status`, `cq_sub_status`, `last_wqe_protocol` and `completed_batch_count`
+preserve queue diagnostics. The per-core status reports Jetty 0
+producer/consumer indices; each Jetty still maintains its own persistent queue
+state internally.
 
 ## Logging
 
@@ -119,7 +137,7 @@ KVAF_AIV_VERBOSE_DIRECT_HCCP=1
 This restores the complete successful resource-lifecycle diagnostics. Failures
 are always printed, regardless of this setting.
 
-## A5 eager validation
+## A5 eager test
 
 ```bash
 cd access_operator/demo/aiv_batch_put
@@ -132,6 +150,13 @@ Small variable-length run:
 ```bash
 ROWS=10 MIN_BYTES=128 MAX_BYTES=1024 DESTINATION_STRIDE=1024 \
 AIV_CORES=1 ITERATIONS=1 bash scripts/run_execute_batch_put.sh
+```
+
+Select one or two Jettys per AIV core with `JETTYS_PER_CORE`. The default is 2;
+use 1 for the single-Jetty comparison path:
+
+```bash
+JETTYS_PER_CORE=1 AIV_CORES=1 ITERATIONS=1 bash scripts/run_execute_batch_put.sh
 ```
 
 A passing run proves packed input HBM, Direct-HCCP setup, variable-length

@@ -20,6 +20,18 @@ if(KVAF_BUILD_PYTHON)
       ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}/python"
       TIMEOUT 240
     )
+
+    if(KVAF_ENABLE_AIV_BATCH_PUT)
+      add_test(
+        NAME kvaf_npu_batch_put_python
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/python/test_npu_batch_put.py"
+      )
+      set_tests_properties(kvaf_npu_batch_put_python PROPERTIES
+        ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}/python"
+        TIMEOUT 240
+      )
+    endif()
   endif()
 else()
   message(STATUS
