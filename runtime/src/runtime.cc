@@ -115,6 +115,13 @@ Status Runtime::Shutdown() {
     return Status::NotInitialized("Runtime has not been initialized");
   }
 
+  if (dsa_row_state_ != nullptr) {
+    const Status dsa_status = CheckDsaRowShutdown();
+    if (!dsa_status.ok()) {
+      return dsa_status;
+    }
+  }
+
   Status first_error = Status::OK();
   for (const auto& entry : access_tables_) {
     const Status status = meta_manager_.UnlockKeys(entry.second->lock_context);
@@ -135,6 +142,8 @@ Status Runtime::Shutdown() {
 
   initialized_ = false;
   remote_region_ = RemoteRegionDesc{};
+  dsa_row_state_.reset();
+  legacy_data_plane_used_ = false;
   return first_error;
 }
 
@@ -145,6 +154,10 @@ Status Runtime::PrepareAccessTable(const AccessTablePrepareRequest& request,
   }
   if (handle == nullptr) {
     return Status::InvalidArgument("handle must not be null");
+  }
+  if (dsa_row_state_ != nullptr) {
+    return Status::InvalidState(
+        "legacy AccessTable is unavailable while DSA_ROW owns the DDR arena");
   }
   if (request.flat_keys.empty()) {
     return Status::InvalidArgument("PrepareAccessTable requires at least one key");
@@ -243,6 +256,10 @@ Status Runtime::BatchGet(const BatchGetRequest& request,
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
+  if (dsa_row_state_ != nullptr) {
+    return Status::InvalidState(
+        "legacy BatchGet is unavailable while DSA_ROW owns the DDR arena");
+  }
   const AccessTableState* table = FindAccessTable(request.access_table);
   if (table == nullptr) {
     return Status::NotFound("AccessTable handle was not found");
@@ -304,6 +321,10 @@ Status Runtime::BatchPut(const BatchPutRequest& request,
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
+  if (dsa_row_state_ != nullptr) {
+    return Status::InvalidState(
+        "legacy BatchPut is unavailable while DSA_ROW owns the DDR arena");
+  }
   if (request.keys.empty() || request.input.data == nullptr ||
       request.input.bytes == 0 ||
       request.keys.size() != request.input_offsets.size() ||
@@ -337,17 +358,29 @@ Status Runtime::BatchPut(const BatchPutRequest& request,
     return status;
   }
 
-  return meta_manager_.CommitPut(put_context);
+  status = meta_manager_.CommitPut(put_context);
+  if (status.ok()) {
+    legacy_data_plane_used_ = true;
+  }
+  return status;
 }
 
 Status Runtime::BatchFree(const BatchFreeRequest& request) {
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
+  if (dsa_row_state_ != nullptr) {
+    return Status::InvalidState(
+        "legacy BatchFree is unavailable while DSA_ROW owns the DDR arena");
+  }
   if (request.keys.empty()) {
     return Status::InvalidArgument("BatchFree requires at least one key");
   }
-  return meta_manager_.BatchFree(request.keys);
+  const Status status = meta_manager_.BatchFree(request.keys);
+  if (status.ok()) {
+    legacy_data_plane_used_ = true;
+  }
+  return status;
 }
 
 Runtime::AccessTableState* Runtime::FindAccessTable(

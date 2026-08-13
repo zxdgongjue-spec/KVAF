@@ -13,6 +13,12 @@ def main() -> int:
 
     import kvaf
 
+    if not hasattr(kvaf, "DsaRowMockRuntime"):
+        raise RuntimeError(
+            "KVAF binding does not export the required DsaRowMockRuntime "
+            "CPU reference storage API"
+        )
+
     if options.require_aiv:
         if (
             not hasattr(kvaf, "NpuRuntime")

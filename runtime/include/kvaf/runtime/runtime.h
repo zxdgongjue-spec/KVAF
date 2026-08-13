@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "kvaf/access_operator/access_operator.h"
+#include "kvaf/dsa_row/requests.h"
 #include "kvaf/meta_manager/meta_manager.h"
 #include "kvaf/requests.h"
 #include "kvaf/status.h"
@@ -60,6 +61,49 @@ class Runtime {
                   BatchPutExecutionOptions execution = {});
   Status BatchFree(const BatchFreeRequest& request);
 
+  // DSA_ROW M0 -------------------------------------------------------------
+  // These APIs are intentionally independent from the legacy KeyId based
+  // MetaManager path above.  They implement the fixed row-major directory
+  // contract used by DSA cache offload and are synchronous on the CPU
+  // reference backend.
+  Status InitializeDsaRowIndex(const DsaRowInitRequest& request);
+  Status GetDsaRowDirectoryView(DsaRowDirectoryView* view) const;
+  Status GetDsaRowCommittedBlockCount(std::uint32_t pool_row,
+                                      std::uint32_t* count) const;
+  Status BindResidentPoolRow(const RowBindRequest& request);
+  Status AbortBindResidentPoolRow(std::uint32_t pool_row);
+
+  Status PrepareFullBlockGroupPut(
+      const std::vector<KvafPutBlockTarget>& targets,
+      const std::vector<RowCountCommitSpec>& row_commits,
+      DsaPutPlanHandle* plan);
+  Status WriteFullBlockGroupLayer(
+      const DsaPutPlanHandle& plan,
+      const std::vector<KvafPutBlockItem>& layer_blocks,
+      const BoundLayerCacheView& layer_cache, void* stream = nullptr);
+  Status SealFullBlockGroupPut(const DsaPutPlanHandle& plan,
+                               DsaSealResult* result);
+  Status CommitFullBlockGroupPut(DsaPutPlanHandle* plan,
+                                 PutLocalResult* result);
+  Status AbortFullBlockGroupPut(DsaPutPlanHandle* plan,
+                                PutLocalResult* result);
+
+  Status PrepareUnifiedAccess(const PrepareUnifiedAccessRequest& request,
+                              PrepareUnifiedAccessResult* result);
+  Status PrepareDirectBatchGet(const DsaRowAccessHandle& access,
+                               const DirectGetRequest& request,
+                               DsaDirectGetPlanHandle* plan);
+  Status ExecutePreparedDirectBatchGet(const DsaDirectGetPlanHandle& plan,
+                                       DirectGetCompletion* completion);
+  Status SettleDirectBatchGet(DsaDirectGetPlanHandle* plan,
+                              const DirectGetCompletion& completion,
+                              GetLocalResult* result);
+  Status AbortPreparedDirectBatchGet(DsaDirectGetPlanHandle* plan,
+                                     GetLocalResult* result);
+  Status ReleaseUnifiedAccess(DsaRowAccessHandle* access);
+  Status CloseResidentPoolRow(std::uint32_t pool_row,
+                              CloseLocalResult* result);
+
  protected:
   MetaManager& meta_manager_;
   AccessOperator& access_operator_;
@@ -80,15 +124,25 @@ class Runtime {
     std::uint64_t uniform_valid_length{0};
   };
 
+  class DsaRowState;
+  struct DsaRowStateDeleter {
+    void operator()(DsaRowState* state) const;
+  };
+
   AccessTableState* FindAccessTable(const AccessTableHandle& handle);
   const AccessTableState* FindAccessTable(
       const AccessTableHandle& handle) const;
+  Status CheckDsaRowShutdown() const;
 
   bool initialized_{false};
   RemoteRegionDesc remote_region_;
   std::uint64_t next_access_table_id_{1};
   std::unordered_map<std::uint64_t, std::unique_ptr<AccessTableState>>
       access_tables_;
+  std::unique_ptr<DsaRowState, DsaRowStateDeleter> dsa_row_state_;
+  // The M0 DSA directory owns the complete region slot map.  Keep legacy
+  // writes and DSA_ROW mutually exclusive until the allocator is unified.
+  bool legacy_data_plane_used_{false};
 };
 
 }  // namespace kvaf

@@ -1,5 +1,6 @@
 add_library(kvaf_runtime
   src/runtime.cc
+  src/dsa_row.cc
 )
 
 target_include_directories(kvaf_runtime

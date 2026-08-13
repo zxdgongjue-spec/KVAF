@@ -1,5 +1,10 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+add_executable(kvaf_dsa_row_runtime_test dsa_row_runtime_test.cc)
+target_link_libraries(kvaf_dsa_row_runtime_test PRIVATE kvaf_runtime)
+target_compile_features(kvaf_dsa_row_runtime_test PRIVATE cxx_std_17)
+add_test(NAME kvaf_dsa_row_runtime COMMAND kvaf_dsa_row_runtime_test)
+
 if(KVAF_BUILD_PYTHON)
   add_test(
     NAME kvaf_runtime_mock_python
@@ -7,6 +12,15 @@ if(KVAF_BUILD_PYTHON)
             "${CMAKE_CURRENT_SOURCE_DIR}/python/test_runtime_mock.py"
   )
   set_tests_properties(kvaf_runtime_mock_python PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}/python"
+  )
+
+  add_test(
+    NAME kvaf_dsa_row_mock_python
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/python/test_dsa_row_runtime.py"
+  )
+  set_tests_properties(kvaf_dsa_row_mock_python PROPERTIES
     ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}/python"
   )
 

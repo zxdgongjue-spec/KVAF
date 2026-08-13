@@ -23,6 +23,13 @@ runtime = _native.runtime
 meta_manager = _native.meta_manager
 access_operator = _native.access_operator
 
+# DSA_ROW is a separate, row-major storage ABI. The in-tree CPU reference is
+# intentionally named *Mock* so production probing cannot mistake it for the
+# future NPU packed-cache runtime.
+if hasattr(_native, "DsaRowMockRuntime"):
+    DsaRowMockRuntime = _native.DsaRowMockRuntime
+    create_dsa_row_mock_runtime = _native.create_dsa_row_mock_runtime
+
 if hasattr(_native, "NpuRuntime"):
     NpuRuntime = _native.NpuRuntime
     AclGraph = _native.AclGraph
@@ -37,6 +44,12 @@ __all__ = [
     "meta_manager",
     "access_operator",
 ]
+
+if hasattr(_native, "DsaRowMockRuntime"):
+    __all__ += [
+        "DsaRowMockRuntime",
+        "create_dsa_row_mock_runtime",
+    ]
 
 if hasattr(_native, "NpuRuntime"):
     __all__ += [
