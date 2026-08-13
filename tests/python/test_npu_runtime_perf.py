@@ -2,8 +2,9 @@
 """NPU Runtime steady-state performance benchmark.
 
 This is intentionally a direct Python/pybind benchmark, not a CTest case.
-It measures Runtime calls only: caller inputs are created before the timed
-loops, and NPU calls end each sample with an external stream synchronize.
+It measures Runtime calls only: source request plans are created before the
+timed loops, BatchGet tensors are derived immediately before each call, and
+NPU calls end each sample with an external stream synchronize.
 """
 
 from __future__ import annotations
@@ -213,52 +214,62 @@ def main(batch: int = 16) -> int:
         )
         print("RUNTIME_PERF_PHASE_DONE phase=access_table_view_npu")
 
-        # Pre-create one token-level request plan per warmup/measured sample.
-        # source_token_ids select one of table_capacity * 128 remote tokens;
-        # integer division/modulo derive the AccessTable index and byte offset.
-        # destination_slots are random output rows. Each batch item contributes
-        # a random miss_count < 2048 and therefore a prefix-one/suffix-zero mask
-        # for its contiguous 2048-request segment. The expected sum of the
-        # miss counts is requests * active_percent / 100.
-        #
-        # All generation and derivation stay outside BatchGet timing.
+        # Pre-create only the source data for one token-level request plan per
+        # warmup/measured sample. source_token_ids select one of
+        # table_capacity * 128 remote tokens, destination_slots select random
+        # output rows, and each batch item contributes a random miss_count <
+        # 2048. BatchGet tensors are derived from these immediately before the
+        # corresponding sample call.
         probability = active_percent / 100.0
         sample_count = warmup + iterations
-        request_positions = torch.arange(
-            REQUESTS_PER_BATCH, dtype=torch.int32, device=device
-        ).unsqueeze(0)
         source_token_id_batches = []
         destination_slot_batches = []
         miss_count_batches = []
-        indices_batches = []
-        offset_batches = []
-        mask_batches = []
-        for _ in range(sample_count):
+        source_profile_samples: dict[str, list[float]] = {
+            "source_token_ids": [],
+            "destination_slots": [],
+            "miss_count": [],
+            "source_plan": [],
+        }
+        for sample_index in range(sample_count):
+            sample_begin = time.perf_counter()
             source_token_ids = torch.randint(
                 0, total_tokens, (requests,), dtype=torch.int32, device=device
             )
+            torch.npu.synchronize()
+            source_token_ids_ready = time.perf_counter()
+
             destination_slots = torch.randperm(requests, device=device).to(
                 torch.int32
             )
+            torch.npu.synchronize()
+            destination_slots_ready = time.perf_counter()
+
             miss_count = (
                 torch.rand(
                     (batch, REQUESTS_PER_BATCH - 1), device=device
                 )
                 < probability
             ).sum(dim=1).to(torch.int32)
-            mask = (
-                request_positions < miss_count.unsqueeze(1)
-            ).reshape(requests).to(torch.uint8)
+            torch.npu.synchronize()
+            source_plan_ready = time.perf_counter()
 
             source_token_id_batches.append(source_token_ids)
             destination_slot_batches.append(destination_slots)
             miss_count_batches.append(miss_count)
-            indices_batches.append(source_token_ids // ROWS_PER_ENTRY)
-            offset_batches.append(
-                (source_token_ids % ROWS_PER_ENTRY) * WQE_BYTES
-            )
-            mask_batches.append(mask)
-        torch.npu.synchronize()
+            if sample_index >= warmup:
+                source_profile_samples["source_token_ids"].append(
+                    (source_token_ids_ready - sample_begin) * 1000.0
+                )
+                source_profile_samples["destination_slots"].append(
+                    (destination_slots_ready - source_token_ids_ready) * 1000.0
+                )
+                source_profile_samples["miss_count"].append(
+                    (source_plan_ready - destination_slots_ready) * 1000.0
+                )
+                source_profile_samples["source_plan"].append(
+                    (source_plan_ready - sample_begin) * 1000.0
+                )
 
         miss_count_host = torch.stack(miss_count_batches).cpu()
         if bool((miss_count_host >= REQUESTS_PER_BATCH).any().item()):
@@ -274,34 +285,136 @@ def main(batch: int = 16) -> int:
             "source_token_ids=random destination_slots=random_permutation "
             "mask_layout=miss_count_prefix"
         )
+        for stage in (
+            "source_token_ids",
+            "destination_slots",
+            "miss_count",
+            "source_plan",
+        ):
+            print_samples(
+                f"batch_get_{stage}", source_profile_samples[stage], warmup,
+                f"{requests}_requests_per_call"
+            )
 
         print("RUNTIME_PERF_PHASE_BEGIN phase=batch_get")
-        for index, offset, mask, destination_slots in zip(
-            indices_batches[:warmup],
-            offset_batches[:warmup],
-            mask_batches[:warmup],
+        warmup_inputs = []
+        for source_token_ids, destination_slots, miss_count in zip(
+            source_token_id_batches[:warmup],
             destination_slot_batches[:warmup],
+            miss_count_batches[:warmup],
         ):
+            indices = source_token_ids // ROWS_PER_ENTRY
+            torch.npu.synchronize()
+            offsets = (source_token_ids % ROWS_PER_ENTRY) * WQE_BYTES
+            torch.npu.synchronize()
+            output_indices = destination_slots.clone()
+            torch.npu.synchronize()
+            mask = (
+                torch.arange(
+                    REQUESTS_PER_BATCH, dtype=torch.int32, device=device
+                ).unsqueeze(0)
+                < miss_count.unsqueeze(1)
+            ).reshape(requests).to(torch.uint8)
+            torch.npu.synchronize()
+            warmup_inputs.append((indices, offsets, output_indices, mask))
             runtime.batch_get(
-                device_table, index, offset, mask, destination_slots, output
+                device_table, indices, offsets, mask, output_indices, output
             )
         torch.npu.synchronize()
+        warmup_inputs.clear()
         batch_get_samples: list[float] = []
-        for index, offset, mask, destination_slots in zip(
-            indices_batches[warmup:],
-            offset_batches[warmup:],
-            mask_batches[warmup:],
+        input_profile_samples: dict[str, list[float]] = {
+            "indices": [],
+            "offsets": [],
+            "output_indices": [],
+            "mask": [],
+            "prepare_inputs": [],
+            "submit": [],
+            "synchronize": [],
+            "sample_total": [],
+        }
+        for source_token_ids, destination_slots, miss_count in zip(
+            source_token_id_batches[warmup:],
             destination_slot_batches[warmup:],
+            miss_count_batches[warmup:],
         ):
-            begin = time.perf_counter()
-            runtime.batch_get(
-                device_table, index, offset, mask, destination_slots, output
-            )
+            sample_begin = time.perf_counter()
+            begin = sample_begin
+            indices = source_token_ids // ROWS_PER_ENTRY
             torch.npu.synchronize()
-            batch_get_samples.append((time.perf_counter() - begin) * 1000.0)
+            input_profile_samples["indices"].append(
+                (time.perf_counter() - begin) * 1000.0
+            )
+
+            begin = time.perf_counter()
+            offsets = (source_token_ids % ROWS_PER_ENTRY) * WQE_BYTES
+            torch.npu.synchronize()
+            input_profile_samples["offsets"].append(
+                (time.perf_counter() - begin) * 1000.0
+            )
+
+            begin = time.perf_counter()
+            output_indices = destination_slots.clone()
+            torch.npu.synchronize()
+            input_profile_samples["output_indices"].append(
+                (time.perf_counter() - begin) * 1000.0
+            )
+
+            begin = time.perf_counter()
+            mask = (
+                torch.arange(
+                    REQUESTS_PER_BATCH, dtype=torch.int32, device=device
+                ).unsqueeze(0)
+                < miss_count.unsqueeze(1)
+            ).reshape(requests).to(torch.uint8)
+            torch.npu.synchronize()
+            inputs_ready = time.perf_counter()
+            input_profile_samples["mask"].append(
+                (inputs_ready - begin) * 1000.0
+            )
+            input_profile_samples["prepare_inputs"].append(
+                (inputs_ready - sample_begin) * 1000.0
+            )
+
+            begin = inputs_ready
+            runtime.batch_get(
+                device_table, indices, offsets, mask, output_indices, output
+            )
+            submitted = time.perf_counter()
+            torch.npu.synchronize()
+            completed = time.perf_counter()
+            input_profile_samples["submit"].append(
+                (submitted - begin) * 1000.0
+            )
+            input_profile_samples["synchronize"].append(
+                (completed - submitted) * 1000.0
+            )
+            batch_get_samples.append((completed - begin) * 1000.0)
+            input_profile_samples["sample_total"].append(
+                (completed - sample_begin) * 1000.0
+            )
+        for stage in (
+            "indices",
+            "offsets",
+            "output_indices",
+            "mask",
+            "prepare_inputs",
+            "submit",
+            "synchronize",
+        ):
+            print_samples(
+                f"batch_get_{stage}", input_profile_samples[stage], warmup,
+                f"{requests}_requests_per_call"
+            )
         print_samples(
             "batch_get", batch_get_samples, warmup,
             f"{requests}_requests_per_call"
+        )
+        print_samples(
+            "batch_get_sample_total",
+            input_profile_samples["sample_total"],
+            warmup,
+            f"{requests}_requests_per_call",
         )
         print("RUNTIME_PERF_PHASE_DONE phase=batch_get")
 

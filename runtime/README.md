@@ -234,15 +234,24 @@ timeout 240s python3 tests/python/test_npu_batch_put.py
 `PrepareAccessTable`、一次全量 `access_table_view(device="npu")`、token 级随机请求
 的 `BatchGet`、全量 `ReleaseAccessTable`，以及 128-key batch 的 `BatchFree`。
 BatchGet/Put 的每个样本均在 Runtime 调用后由调用方 `torch.npu.synchronize()`
-结束；随机输入与数据填充不进入样本计时。
+结束；随机源数据与数据填充不进入样本计时。
 
 每个 BatchGet 样本在 `[0, table_capacity * 128)` 中生成
-`source_token_ids[batch * 2048]`，并派生
-`indices = source_token_ids // 128`、
-`offsets = (source_token_ids % 128) * 656`。`destination_slots` 是输出行的随机
-排列。每个 batch item 单独生成小于 2048 的 `miss_count`，对应 2048-request
-分段的前 `miss_count[i]` 个 mask 为 1、其余为 0；所有 miss_count 的期望总数
-约为 `batch * 2048 * active_percent`。
+`source_token_ids[batch * 2048]`，`destination_slots` 是输出行的随机排列。每个
+batch item 单独生成小于 2048 的 `miss_count`；所有 miss_count 的期望总数约为
+`batch * 2048 * active_percent`。数据构造阶段只保存这三项；每个 sample 调用
+BatchGet 前再生成 `indices = source_token_ids // 128`、
+`offsets = (source_token_ids % 128) * 656`、由 `destination_slots` 物化的
+`output_indices`，以及每个 2048-request 分段前 `miss_count[i]` 个为 1、其余为 0
+的 `mask`。正式 sample 会分别输出 `batch_get_indices`、`batch_get_offsets`、
+`batch_get_output_indices`、`batch_get_mask`、`batch_get_prepare_inputs`、
+`batch_get_submit`、`batch_get_synchronize`、`batch_get` 和
+`batch_get_sample_total` 的 `PERF_RESULT`。原始数据构造还会输出
+`batch_get_source_token_ids`、`batch_get_destination_slots`、
+`batch_get_miss_count` 和合计 `batch_get_source_plan`。各阶段均在 NPU 同步后记录
+墙钟耗时；`batch_get_prepare_inputs` 覆盖全部输入派生，
+`batch_get_sample_total` 覆盖输入派生开始至 BatchGet stream 完成。warmup 执行
+同样的阶段同步但不进入统计。
 
 ```bash
 KVAF_RUN_NPU_TESTS=1 \
