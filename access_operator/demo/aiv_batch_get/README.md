@@ -157,6 +157,14 @@ capture, HCCP setup and final D2H validation are excluded. The normal metric
 is `host_submit_to_stream_completion`; it includes only launch through stream
 completion and excludes input generation, H2D upload, warmup and validation.
 
+The Python Runtime benchmark can opt into the same per-core AIV timeline with
+`KVAF_RUNTIME_PERF_KERNEL_PROFILE=1`. It reports setup, mask/index compact,
+WQE/SQ post, first-doorbell-to-CQ transfer window, CQ completion wait and
+finalization. `KVAF_RUNTIME_PERF_KERNEL_PROFILE_CLOCK_MHZ` controls raw
+`GetSystemCycle` conversion (1000 by default for A5). Profiling reuses the
+reserved `KvafBatchGetCoreStatus` bytes; when disabled, the kernel executes no
+cycle reads and the normal ABI stride remains 384 bytes.
+
 ## Graph boundary
 
 `KvafBatchGetTransportCreate(host_ddr, ...)` creates only the reusable EID,

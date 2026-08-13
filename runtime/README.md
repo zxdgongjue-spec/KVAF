@@ -253,6 +253,16 @@ BatchGet 前再生成 `indices = source_token_ids // 128`、
 `batch_get_sample_total` 覆盖输入派生开始至 BatchGet stream 完成。warmup 执行
 同样的阶段同步但不进入统计。
 
+设置 `KVAF_RUNTIME_PERF_KERNEL_PROFILE=1` 可启用 BatchGet AIV 核函数的
+逐核 cycle timeline，并在每个正式 sample stream 完成后读取状态。输出覆盖
+`kernel_setup`、`kernel_compact`、`kernel_post`、`kernel_transfer_window`、
+`kernel_completion_wait`、`kernel_finalize`、`kernel_total` 和跨核
+`kernel_wall`，同时打印每核 active request、32-WQE post、各 Jetty CQ wait 与
+poll 均值。A5 默认按 1000 MHz 换算；其他平台可通过
+`KVAF_RUNTIME_PERF_KERNEL_PROFILE_CLOCK_MHZ` 指定 `GetSystemCycle` 时钟频率。
+profile 的 cycle read 开销包含在 kernel 指标中，每次 D2H profile 读取发生在 host
+BatchGet 计时结束后。
+
 ```bash
 KVAF_RUN_NPU_TESTS=1 \
 KVAF_AIV_BATCH_GET_KERNEL="$PWD/build-aiv/bin/kvaf_execute_batch_get_kernels.o" \

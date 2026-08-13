@@ -451,6 +451,88 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   return Status::OK();
 }
 
+Status DefaultAccessOperator::SetBatchGetKernelProfiling(bool enabled) {
+  if (!impl_->initialized || impl_->execution.status == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  std::vector<KvafBatchGetCoreStatus> statuses(
+      impl_->config.npu_core_count);
+  if (enabled) {
+    for (KvafBatchGetCoreStatus& status : statuses) {
+      status.profile.magic = KVAF_AIV_BATCH_GET_PROFILE_MAGIC;
+    }
+  }
+  if (aclrtMemcpy(impl_->execution.status, impl_->execution.status_bytes,
+                  statuses.data(), statuses.size() * sizeof(statuses.front()),
+                  ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
+    return Internal("failed to configure BatchGet kernel profiling");
+  }
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
+    std::vector<BatchGetKernelProfile>* profiles) const {
+  if (profiles == nullptr) {
+    return InvalidArgument("BatchGet kernel profile output must not be null");
+  }
+  if (!impl_->initialized || impl_->execution.status == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  std::vector<KvafBatchGetCoreStatus> statuses(
+      impl_->config.npu_core_count);
+  if (aclrtMemcpy(statuses.data(), statuses.size() * sizeof(statuses.front()),
+                  impl_->execution.status, impl_->execution.status_bytes,
+                  ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
+    return Internal("failed to copy BatchGet kernel profiles");
+  }
+  profiles->clear();
+  profiles->reserve(statuses.size());
+  for (const KvafBatchGetCoreStatus& status : statuses) {
+    const KvafBatchGetCoreProfile& source = status.profile;
+    const bool invalid_doorbell =
+        (source.first_doorbell_cycle != 0U &&
+         (source.first_doorbell_cycle < source.compact_done_cycle ||
+          source.first_doorbell_cycle > source.post_done_cycle)) ||
+        (status.result == 0U && source.active_requests != 0U &&
+         source.first_doorbell_cycle == 0U) ||
+        (source.active_requests == 0U &&
+         source.first_doorbell_cycle != 0U);
+    if (status.magic != KVAF_AIV_BATCH_GET_STATUS_MAGIC ||
+        status.result != 0U ||
+        source.magic != KVAF_AIV_BATCH_GET_PROFILE_MAGIC ||
+        source.kernel_start_cycle > source.setup_done_cycle ||
+        source.setup_done_cycle > source.compact_done_cycle ||
+        source.compact_done_cycle > source.post_done_cycle ||
+        source.post_done_cycle > source.completion_done_cycle ||
+        source.completion_done_cycle > source.kernel_finish_cycle ||
+        invalid_doorbell) {
+      profiles->clear();
+      return Internal("BatchGet kernel returned an invalid profile timeline");
+    }
+    BatchGetKernelProfile destination;
+    destination.kernel_start_cycle = source.kernel_start_cycle;
+    destination.setup_done_cycle = source.setup_done_cycle;
+    destination.compact_done_cycle = source.compact_done_cycle;
+    destination.first_doorbell_cycle = source.first_doorbell_cycle;
+    destination.post_done_cycle = source.post_done_cycle;
+    destination.completion_done_cycle = source.completion_done_cycle;
+    destination.kernel_finish_cycle = source.kernel_finish_cycle;
+    destination.active_requests = source.active_requests;
+    destination.total_posts = source.total_posts;
+    for (std::size_t jetty = 0;
+         jetty < destination.jetty_completion_wait_cycles.size(); ++jetty) {
+      destination.jetty_completion_wait_cycles[jetty] =
+          source.jetty_completion_wait_cycles[jetty];
+      destination.jetty_completion_polls[jetty] =
+          source.jetty_completion_polls[jetty];
+    }
+    profiles->push_back(destination);
+  }
+  return Status::OK();
+}
+
 Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
   if (!impl_->initialized) {
     return Status::NotInitialized("AccessOperator has not been initialized");
