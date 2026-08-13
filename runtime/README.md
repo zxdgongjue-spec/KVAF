@@ -231,10 +231,18 @@ timeout 240s python3 tests/python/test_npu_batch_put.py
 
 `tests/python/test_npu_runtime_perf.py` 是独立的 steady-state 性能脚本，不纳入
 `ctest`。它分别测量：固定 128-key batch 的 `BatchPut`、一次全量
-`PrepareAccessTable`、一次全量 `access_table_view(device="npu")`、随机 index/mask
+`PrepareAccessTable`、一次全量 `access_table_view(device="npu")`、token 级随机请求
 的 `BatchGet`、全量 `ReleaseAccessTable`，以及 128-key batch 的 `BatchFree`。
 BatchGet/Put 的每个样本均在 Runtime 调用后由调用方 `torch.npu.synchronize()`
 结束；随机输入与数据填充不进入样本计时。
+
+每个 BatchGet 样本在 `[0, table_capacity * 128)` 中生成
+`source_token_ids[batch * 2048]`，并派生
+`indices = source_token_ids // 128`、
+`offsets = (source_token_ids % 128) * 656`。`destination_slots` 是输出行的随机
+排列。每个 batch item 单独生成小于 2048 的 `miss_count`，对应 2048-request
+分段的前 `miss_count[i]` 个 mask 为 1、其余为 0；所有 miss_count 的期望总数
+约为 `batch * 2048 * active_percent`。
 
 ```bash
 KVAF_RUN_NPU_TESTS=1 \

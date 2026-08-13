@@ -31,6 +31,7 @@ BLOCK_BYTES = 656
 WQE_BYTES = 656
 ROWS_PER_ENTRY = 128
 ENTRY_BYTES = ROWS_PER_ENTRY * WQE_BYTES
+REQUESTS_PER_BATCH = 2048
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -83,7 +84,8 @@ def main(batch: int = 16) -> int:
     )
     block_bytes = int(os.environ.get("KVAF_RUNTIME_PERF_BLOCK_BYTES", str(BLOCK_BYTES)))
     table_capacity = batch * PUT_BATCH_SIZE * 8
-    requests = batch * 2048
+    requests = batch * REQUESTS_PER_BATCH
+    total_tokens = table_capacity * ROWS_PER_ENTRY
     source_stride = ENTRY_BYTES
     total_put_batches = table_capacity // PUT_BATCH_SIZE
     if not (
@@ -135,10 +137,6 @@ def main(batch: int = 16) -> int:
     torch.npu.set_device(device_id)
     device = f"npu:{device_id}"
     kv_data = torch.empty((PUT_BATCH_SIZE, ENTRY_BYTES), dtype=torch.uint8, device=device)
-    offsets = torch.randint(
-        0, ROWS_PER_ENTRY, (requests,), dtype=torch.int32, device=device
-    ) * WQE_BYTES
-    output_indices = torch.arange(requests, dtype=torch.int32, device=device)
     output = torch.empty((requests, block_bytes), dtype=torch.uint8, device=device)
     runtime = kvaf.NpuRuntime(
         str(kernel), device_id, npu_core_count, str(batch_put_kernel),
@@ -150,7 +148,8 @@ def main(batch: int = 16) -> int:
         print(
             "RUNTIME_PERF_CONFIG "
             f"table_capacity={table_capacity} put_batch_size={PUT_BATCH_SIZE} "
-            f"requests={requests} block_bytes={block_bytes} aiv_cores={npu_core_count} "
+            f"total_tokens={total_tokens} requests={requests} "
+            f"block_bytes={block_bytes} aiv_cores={npu_core_count} "
             f"jettys_per_core={jettys_per_core} "
             f"active_percent={active_percent} warmup={warmup} iterations={iterations} "
             "batch_put_backend=aiv_direct_hccp"
@@ -214,30 +213,90 @@ def main(batch: int = 16) -> int:
         )
         print("RUNTIME_PERF_PHASE_DONE phase=access_table_view_npu")
 
-        # Pre-create different random request tensors. This setup is excluded
-        # from BatchGet samples; each sample measures Runtime enqueue through
-        # completion of its caller-owned current stream.
+        # Pre-create one token-level request plan per warmup/measured sample.
+        # source_token_ids select one of table_capacity * 128 remote tokens;
+        # integer division/modulo derive the AccessTable index and byte offset.
+        # destination_slots are random output rows. Each batch item contributes
+        # a random miss_count < 2048 and therefore a prefix-one/suffix-zero mask
+        # for its contiguous 2048-request segment. The expected sum of the
+        # miss counts is requests * active_percent / 100.
+        #
+        # All generation and derivation stay outside BatchGet timing.
         probability = active_percent / 100.0
-        indices_batches = [
-            torch.randint(0, table_capacity, (requests,), dtype=torch.int32, device=device)
-            for _ in range(warmup + iterations)
-        ]
-        mask_batches = [
-            (torch.rand(requests, device=device) < probability).to(torch.uint8)
-            for _ in range(warmup + iterations)
-        ]
+        sample_count = warmup + iterations
+        request_positions = torch.arange(
+            REQUESTS_PER_BATCH, dtype=torch.int32, device=device
+        ).unsqueeze(0)
+        source_token_id_batches = []
+        destination_slot_batches = []
+        miss_count_batches = []
+        indices_batches = []
+        offset_batches = []
+        mask_batches = []
+        for _ in range(sample_count):
+            source_token_ids = torch.randint(
+                0, total_tokens, (requests,), dtype=torch.int32, device=device
+            )
+            destination_slots = torch.randperm(requests, device=device).to(
+                torch.int32
+            )
+            miss_count = (
+                torch.rand(
+                    (batch, REQUESTS_PER_BATCH - 1), device=device
+                )
+                < probability
+            ).sum(dim=1).to(torch.int32)
+            mask = (
+                request_positions < miss_count.unsqueeze(1)
+            ).reshape(requests).to(torch.uint8)
+
+            source_token_id_batches.append(source_token_ids)
+            destination_slot_batches.append(destination_slots)
+            miss_count_batches.append(miss_count)
+            indices_batches.append(source_token_ids // ROWS_PER_ENTRY)
+            offset_batches.append(
+                (source_token_ids % ROWS_PER_ENTRY) * WQE_BYTES
+            )
+            mask_batches.append(mask)
         torch.npu.synchronize()
 
+        miss_count_host = torch.stack(miss_count_batches).cpu()
+        if bool((miss_count_host >= REQUESTS_PER_BATCH).any().item()):
+            raise AssertionError("miss_count must be smaller than 2048")
+        mean_active_requests = float(miss_count_host.sum().item()) / sample_count
+        target_active_requests = requests * probability
+        print(
+            "RUNTIME_PERF_BATCH_GET_INPUTS_READY "
+            f"samples={sample_count} total_tokens={total_tokens} "
+            f"requests_per_sample={requests} requests_per_batch=2048 "
+            f"mean_active_requests={mean_active_requests:.3f} "
+            f"target_active_requests={target_active_requests:.3f} "
+            "source_token_ids=random destination_slots=random_permutation "
+            "mask_layout=miss_count_prefix"
+        )
+
         print("RUNTIME_PERF_PHASE_BEGIN phase=batch_get")
-        for index, mask in zip(indices_batches[:warmup], mask_batches[:warmup]):
-            runtime.batch_get(device_table, index, offsets, mask, output_indices, output)
+        for index, offset, mask, destination_slots in zip(
+            indices_batches[:warmup],
+            offset_batches[:warmup],
+            mask_batches[:warmup],
+            destination_slot_batches[:warmup],
+        ):
+            runtime.batch_get(
+                device_table, index, offset, mask, destination_slots, output
+            )
         torch.npu.synchronize()
         batch_get_samples: list[float] = []
-        for index, mask in zip(
-            indices_batches[warmup:], mask_batches[warmup:]
+        for index, offset, mask, destination_slots in zip(
+            indices_batches[warmup:],
+            offset_batches[warmup:],
+            mask_batches[warmup:],
+            destination_slot_batches[warmup:],
         ):
             begin = time.perf_counter()
-            runtime.batch_get(device_table, index, offsets, mask, output_indices, output)
+            runtime.batch_get(
+                device_table, index, offset, mask, destination_slots, output
+            )
             torch.npu.synchronize()
             batch_get_samples.append((time.perf_counter() - begin) * 1000.0)
         print_samples(
