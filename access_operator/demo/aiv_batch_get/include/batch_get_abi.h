@@ -10,6 +10,11 @@ enum {
   KVAF_AIV_BATCH_GET_QUEUE_STATE_BYTES = 64,
   KVAF_AIV_BATCH_GET_MAX_AIV_CORES = 48,
   KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE = 2,
+  KVAF_AIV_BATCH_GET_WQE_DATA_BYTES = 656,
+  KVAF_AIV_BATCH_GET_ADDRESS_TABLE_ENTRY_COUNT = 128,
+  KVAF_AIV_BATCH_GET_ADDRESS_TABLE_ENTRY_BYTES =
+      KVAF_AIV_BATCH_GET_ADDRESS_TABLE_ENTRY_COUNT *
+      KVAF_AIV_BATCH_GET_WQE_DATA_BYTES,
   // Shared local-memory contract used by the AIV kernel and launcher.
   KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES = 160 * 1024,
 };
@@ -77,11 +82,13 @@ typedef struct KvafBatchGetDirectUrmaEntity {
 
 // Fixed-shape graph ABI. `output` and `channel_entity` must identify the same
 // LocalBufferAcquire result. During capture/replay both addresses stay fixed;
-// address/valid/index/mask/output-index contents may change between replays.
+// address/valid/index/offset/mask/output-index contents may change between
+// replays.
 typedef struct KvafExecuteBatchGetKernelArgs {
   uint64_t address_table;       // uint64[table_capacity], absolute Host DDR UBA
   uint64_t valid_table;         // uint8[table_capacity]
   uint64_t indices;             // int32[request_capacity]
+  uint64_t offsets;             // int32[request_capacity], byte offset in entry
   uint64_t mask;                // uint8[request_capacity]
   uint64_t output_indices;      // int32[request_capacity]
   uint64_t output;              // caller-owned HBM output; must match entity
@@ -104,7 +111,7 @@ static_assert(sizeof(KvafBatchGetQueueState) == KVAF_AIV_BATCH_GET_QUEUE_STATE_B
               "KvafBatchGetQueueState ABI changed");
 static_assert(sizeof(KvafBatchGetDirectUrmaEntity) == 192,
               "KvafBatchGetDirectUrmaEntity ABI changed");
-static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 96,
+static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 104,
               "KvafExecuteBatchGetKernelArgs ABI changed");
 #endif
 

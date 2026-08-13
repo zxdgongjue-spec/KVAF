@@ -16,13 +16,15 @@ registration; each HBM output is registered separately as a local UDMA range.
 | `address_table` | `uint64[table_capacity]` | Absolute Host DDR UBAs, produced by the meta layer. |
 | `valid_table` | `uint8[table_capacity]` | A zero entry makes its lookup invalid. |
 | `indices` | `int32[request_capacity]` | Logical entries requested by this batch. |
+| `offsets` | `int32[request_capacity]` | Byte offset inside the selected 128 * 656B entry. |
 | `mask` | `uint8[request_capacity]` | Zero skips that request without changing the graph shape. |
 | `output_indices` | `int32[request_capacity]` | Destination row in `output`. |
-| `output` | `uint8[output_rows * block_bytes]` | Contiguous Device HBM output. |
+| `output` | `uint8[output_rows * 656]` | Contiguous Device HBM output. |
 
-For an active request `i`, the kernel reads `block_bytes` from
-`address_table[indices[i]]` and stores it at
-`output + output_indices[i] * block_bytes`. This is exactly the initial
+For an active request `i`, the kernel reads exactly 656 bytes from
+`address_table[indices[i]] + offsets[i]` and stores it at
+`output + output_indices[i] * 656`. Each address-table entry spans
+`128 * 656` bytes, so `offsets[i] + 656` must stay within that entry. This is the
 fixed-block, single-output-scatter scope; duplicate output rows are not
 rejected and have last-completion-wins semantics.
 
@@ -128,7 +130,7 @@ Useful overrides:
 
 ```bash
 DEVICE_ID=0 TABLE_CAPACITY=256 REQUESTS=10 OUTPUT_ROWS=200 \
-BLOCK_BYTES=1024 SOURCE_STRIDE=4096 AIV_CORES=1 JETTYS_PER_CORE=2 ACTIVE_PERCENT=20 \
+BLOCK_BYTES=656 SOURCE_STRIDE=83968 AIV_CORES=1 JETTYS_PER_CORE=2 ACTIVE_PERCENT=20 \
 WARMUP=1 ITERATIONS=1 bash scripts/run_execute_batch_get.sh
 
 # Proves TransportCreate -> Acquire(A) -> Acquire(B) -> re-Acquire(A), then

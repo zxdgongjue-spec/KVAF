@@ -370,10 +370,12 @@ class NpuRuntime final {
   // input/output Tensors and the DeviceAccessTable alive until their stream
   // completes the BatchGet operation.
   void BatchGet(const DeviceAccessTable& access_table,
-                const py::object& indices, const py::object& mask,
+                const py::object& indices, const py::object& offsets,
+                const py::object& mask,
                 const py::object& output_indices, const py::object& output,
                 const py::object& stream, bool synchronize) {
     const NpuTensorView index_view = GetNpuTensorView(indices, "indices");
+    const NpuTensorView offset_view = GetNpuTensorView(offsets, "offsets");
     const NpuTensorView mask_view = GetNpuTensorView(mask, "mask");
     const NpuTensorView output_index_view =
         GetNpuTensorView(output_indices, "output_indices");
@@ -382,11 +384,14 @@ class NpuRuntime final {
         GetNpuTensorView(access_table.addresses(), "device_access_table.addresses");
     const NpuTensorView valid_view =
         GetNpuTensorView(access_table.valid(), "device_access_table.valid");
-    if (index_view.shape.size() != 1 || mask_view.shape.size() != 1 ||
+    if (index_view.shape.size() != 1 || offset_view.shape.size() != 1 ||
+        mask_view.shape.size() != 1 ||
         output_index_view.shape.size() != 1 || output_view.shape.size() < 2 ||
         index_view.element_bytes != sizeof(std::int32_t) ||
+        offset_view.element_bytes != sizeof(std::int32_t) ||
         output_index_view.element_bytes != sizeof(std::int32_t) ||
         mask_view.element_bytes != sizeof(std::uint8_t) ||
+        index_view.bytes != offset_view.bytes ||
         index_view.bytes != output_index_view.bytes ||
         mask_view.bytes != index_view.bytes / sizeof(std::int32_t) ||
         address_view.element_bytes != sizeof(Address) ||
@@ -399,13 +404,13 @@ class NpuRuntime final {
     const std::uint64_t output_rows =
         static_cast<std::uint64_t>(output_view.shape.front());
     const std::uint64_t output_block_bytes = output_view.bytes / output_rows;
-    if (output_block_bytes == 0 ||
-        output_block_bytes > std::numeric_limits<std::uint32_t>::max()) {
-      throw py::value_error("BatchGet output Tensor has an invalid row size");
+    if (output_block_bytes != kBatchGetTransferBytes) {
+      throw py::value_error("BatchGet output Tensor rows must each be 656 bytes");
     }
     const BatchGetRequest request{
         access_table.source(),
         ConstBufferView{index_view.data, index_view.bytes, DeviceKind::kNpu},
+        ConstBufferView{offset_view.data, offset_view.bytes, DeviceKind::kNpu},
         ConstBufferView{mask_view.data, mask_view.bytes, DeviceKind::kNpu},
         ConstBufferView{output_index_view.data, output_index_view.bytes,
                         DeviceKind::kNpu},
@@ -488,7 +493,8 @@ void BindNpuPythonRuntime(py::module_& module) {
            "accepts a Python key sequence or a contiguous one-dimensional "
            "CPU torch.int64 Tensor.")
       .def("batch_get", &NpuRuntime::BatchGet,
-           py::arg("device_access_table"), py::arg("indices"), py::arg("mask"),
+           py::arg("device_access_table"), py::arg("indices"), py::arg("offsets"),
+           py::arg("mask"),
            py::arg("output_indices"), py::arg("output"),
            py::arg("stream") = py::none(), py::arg("synchronize") = false,
            "Submit BatchGet from NPU Tensors. stream=None uses torch.npu.current_stream(); "

@@ -19,14 +19,19 @@
 namespace {
 
 constexpr uint32_t kEagerRandomSeed = 0x4b564146U;
+constexpr uint32_t kTransferBytes = KVAF_AIV_BATCH_GET_WQE_DATA_BYTES;
+constexpr uint32_t kRowsPerEntry =
+    KVAF_AIV_BATCH_GET_ADDRESS_TABLE_ENTRY_COUNT;
+constexpr uint32_t kEntryBytes =
+    KVAF_AIV_BATCH_GET_ADDRESS_TABLE_ENTRY_BYTES;
 
 struct Options {
   uint32_t device = 0U;
   uint32_t table_capacity = 4096U;
   uint32_t requests = 4096U;
   uint32_t output_rows = 4096U;
-  uint32_t block_bytes = 1024U;
-  uint32_t source_stride = 4096U;
+  uint32_t block_bytes = kTransferBytes;
+  uint32_t source_stride = kEntryBytes;
   uint32_t aiv_cores = 4U;
   uint32_t jettys_per_core = 2U;
   uint32_t warmup = 10U;
@@ -127,7 +132,8 @@ bool ParseOptions(int argc, char **argv, Options *options) {
          ReadEnvU32("ACTIVE_PERCENT", &options->active_percent) &&
          ReadEnvU32("DYNAMIC_OUTPUT_SMOKE", &options->dynamic_output_smoke) && options->table_capacity != 0U &&
          options->requests != 0U && options->requests <= options->output_rows && options->output_rows != 0U &&
-         options->block_bytes != 0U && options->source_stride >= options->block_bytes &&
+         options->block_bytes == kTransferBytes &&
+         options->source_stride == kEntryBytes &&
          options->aiv_cores != 0U && options->aiv_cores <= KVAF_AIV_BATCH_GET_MAX_AIV_CORES &&
          options->jettys_per_core != 0U &&
          options->jettys_per_core <= KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE &&
@@ -194,7 +200,8 @@ void AccumulateQueueExpectations(const std::vector<uint8_t> &mask, const Options
 }
 
 bool Validate(const std::vector<uint8_t> &output, const std::vector<uint64_t> &address_table,
-              const std::vector<int32_t> &indices, const std::vector<uint8_t> &mask,
+              const std::vector<int32_t> &indices, const std::vector<int32_t> &offsets,
+              const std::vector<uint8_t> &mask,
               const std::vector<int32_t> &output_indices, const Options &options,
               const uint8_t *source, const std::vector<KvafBatchGetCoreStatus> &statuses,
               const std::vector<KvafBatchGetQueueState> &queues,
@@ -262,13 +269,16 @@ bool Validate(const std::vector<uint8_t> &output, const std::vector<uint64_t> &a
       continue;
     }
     const uint64_t source_offset = address_table[static_cast<uint32_t>(indices[request])] -
-                                   reinterpret_cast<uint64_t>(source);
+                                   reinterpret_cast<uint64_t>(source) +
+                                   static_cast<uint32_t>(offsets[request]);
     for (uint32_t byte = 0U; byte < options.block_bytes; ++byte) {
       const uint8_t actual = output[static_cast<uint64_t>(output_indices[request]) * options.block_bytes + byte];
       const uint8_t expected = source[source_offset + byte];
       if (actual != expected) {
         std::cerr << "[KVAF_EXECUTE] validation mismatch stage=" << stage << " request=" << request
-                  << " source_uba=0x" << std::hex << address_table[static_cast<uint32_t>(indices[request])]
+                  << " source_uba=0x" << std::hex
+                  << address_table[static_cast<uint32_t>(indices[request])] +
+                         static_cast<uint32_t>(offsets[request])
                   << std::dec << " output_row=" << output_indices[request] << " byte=" << byte
                   << " expected=" << static_cast<uint32_t>(expected) << " actual="
                   << static_cast<uint32_t>(actual) << '\n';
@@ -289,6 +299,7 @@ bool Validate(const std::vector<uint8_t> &output, const std::vector<uint64_t> &a
 // different registered Host-DDR blocks.
 void PrepareGraphReplayInputs(uint32_t replay, const uint8_t *source, const Options &options,
                               std::vector<uint64_t> *address_table, std::vector<int32_t> *indices,
+                              std::vector<int32_t> *offsets,
                               std::vector<uint8_t> *mask, std::vector<int32_t> *output_indices) {
   const uint32_t address_shift = replay % options.table_capacity;
   const bool sparse_mask = options.mask_every != 0U || options.active_every != 0U;
@@ -299,6 +310,9 @@ void PrepareGraphReplayInputs(uint32_t replay, const uint8_t *source, const Opti
   }
   for (uint32_t request = 0U; request < options.requests; ++request) {
     (*indices)[request] = static_cast<int32_t>(request % options.table_capacity);
+    (*offsets)[request] =
+        static_cast<int32_t>(((request + replay) % kRowsPerEntry) *
+                             kTransferBytes);
     (*mask)[request] = RequestIsActive(request, options) ? 1U : 0U;
     // Keep sparse output rows stable so a row written by an earlier replay is
     // never reinterpreted as a masked row during byte-for-byte validation.
@@ -308,8 +322,11 @@ void PrepareGraphReplayInputs(uint32_t replay, const uint8_t *source, const Opti
 }
 
 bool CopyGraphReplayInputs(aclrtStream stream, void *device_address_table, void *device_indices, void *device_mask,
-                           void *device_output_indices, const std::vector<uint64_t> &address_table,
-                           const std::vector<int32_t> &indices, const std::vector<uint8_t> &mask,
+                           void *device_offsets, void *device_output_indices,
+                           const std::vector<uint64_t> &address_table,
+                           const std::vector<int32_t> &indices,
+                           const std::vector<int32_t> &offsets,
+                           const std::vector<uint8_t> &mask,
                            const std::vector<int32_t> &output_indices) {
   return CheckAcl(aclrtMemcpyAsync(device_address_table, address_table.size() * sizeof(uint64_t),
                                    address_table.data(), address_table.size() * sizeof(uint64_t),
@@ -318,6 +335,9 @@ bool CopyGraphReplayInputs(aclrtStream stream, void *device_address_table, void 
          CheckAcl(aclrtMemcpyAsync(device_indices, indices.size() * sizeof(int32_t), indices.data(),
                                    indices.size() * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE, stream),
                   "graph copy indices") &&
+         CheckAcl(aclrtMemcpyAsync(device_offsets, offsets.size() * sizeof(int32_t), offsets.data(),
+                                   offsets.size() * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE, stream),
+                  "graph copy offsets") &&
          CheckAcl(aclrtMemcpyAsync(device_mask, mask.size(), mask.data(), mask.size(), ACL_MEMCPY_HOST_TO_DEVICE,
                                    stream),
                   "graph copy mask") &&
@@ -361,6 +381,7 @@ int main(int argc, char **argv) {
   void *device_address_table = nullptr;
   void *device_valid_table = nullptr;
   void *device_indices = nullptr;
+  void *device_offsets = nullptr;
   void *device_mask = nullptr;
   void *device_eager_indices = nullptr;
   void *device_eager_mask = nullptr;
@@ -380,6 +401,7 @@ int main(int argc, char **argv) {
   std::vector<uint64_t> address_table(options.table_capacity);
   std::vector<uint8_t> valid_table(options.table_capacity, 1U);
   std::vector<int32_t> indices(options.requests);
+  std::vector<int32_t> offsets(options.requests);
   std::vector<uint8_t> mask(options.requests, 1U);
   std::vector<int32_t> output_indices(options.requests);
   std::vector<KvafBatchGetCoreStatus> statuses(options.aiv_cores);
@@ -416,11 +438,18 @@ int main(int argc, char **argv) {
   source = static_cast<uint8_t *>(source_ddr);
   for (uint32_t slot = 0U; slot < options.table_capacity; ++slot) {
     uint8_t *block = source + static_cast<uint64_t>(slot) * options.source_stride;
-    for (uint32_t byte = 0U; byte < options.block_bytes; ++byte) block[byte] = PatternByte(slot, byte);
+    for (uint32_t row = 0U; row < kRowsPerEntry; ++row) {
+      for (uint32_t byte = 0U; byte < options.block_bytes; ++byte) {
+        block[static_cast<uint64_t>(row) * options.block_bytes + byte] =
+            PatternByte(slot * kRowsPerEntry + row, byte);
+      }
+    }
     address_table[slot] = reinterpret_cast<uint64_t>(block);
   }
   for (uint32_t request = 0U; request < options.requests; ++request) {
     indices[request] = static_cast<int32_t>(options.table_capacity - 1U - (request % options.table_capacity));
+    offsets[request] =
+        static_cast<int32_t>((request % kRowsPerEntry) * kTransferBytes);
     output_indices[request] = static_cast<int32_t>(options.output_rows - 1U - request);
     mask[request] = RequestIsActive(request, options) ? 1U : 0U;
   }
@@ -439,6 +468,7 @@ int main(int argc, char **argv) {
                 "allocate address_table") ||
       !CheckAcl(aclrtMalloc(&device_valid_table, valid_table.size(), ACL_MEM_MALLOC_HUGE_FIRST), "allocate valid_table") ||
       !CheckAcl(aclrtMalloc(&device_indices, indices.size() * sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST), "allocate indices") ||
+      !CheckAcl(aclrtMalloc(&device_offsets, offsets.size() * sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST), "allocate offsets") ||
       !CheckAcl(aclrtMalloc(&device_mask, mask.size(), ACL_MEM_MALLOC_HUGE_FIRST), "allocate mask") ||
       !CheckAcl(aclrtMalloc(&device_output_indices, output_indices.size() * sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST),
                 "allocate output_indices") ||
@@ -452,6 +482,8 @@ int main(int argc, char **argv) {
                              ACL_MEMCPY_HOST_TO_DEVICE), "copy valid_table") ||
       !CheckAcl(aclrtMemcpy(device_indices, indices.size() * sizeof(int32_t), indices.data(),
                              indices.size() * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE), "copy indices") ||
+      !CheckAcl(aclrtMemcpy(device_offsets, offsets.size() * sizeof(int32_t), offsets.data(),
+                             offsets.size() * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE), "copy offsets") ||
       !CheckAcl(aclrtMemcpy(device_mask, mask.size(), mask.data(), mask.size(), ACL_MEMCPY_HOST_TO_DEVICE), "copy mask") ||
       !CheckAcl(aclrtMemcpy(device_output_indices, output_indices.size() * sizeof(int32_t), output_indices.data(),
                              output_indices.size() * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE), "copy output_indices") ||
@@ -486,6 +518,7 @@ int main(int argc, char **argv) {
   args.address_table = reinterpret_cast<uint64_t>(device_address_table);
   args.valid_table = reinterpret_cast<uint64_t>(device_valid_table);
   args.indices = reinterpret_cast<uint64_t>(device_indices);
+  args.offsets = reinterpret_cast<uint64_t>(device_offsets);
   args.mask = reinterpret_cast<uint64_t>(device_mask);
   args.output_indices = reinterpret_cast<uint64_t>(device_output_indices);
   args.output = reinterpret_cast<uint64_t>(output_hbm);
@@ -513,7 +546,7 @@ int main(int argc, char **argv) {
                   "copy primary local-buffer queue") ||
         !CheckAcl(aclrtMemcpy(output.data(), output.size(), output_hbm, output.size(), ACL_MEMCPY_DEVICE_TO_HOST),
                   "copy primary local-buffer output") ||
-        !Validate(output, address_table, indices, mask, output_indices, options,
+        !Validate(output, address_table, indices, offsets, mask, output_indices, options,
                   source, statuses, queues, queue_expectations, true,
                   "primary_output")) {
       goto cleanup;
@@ -540,7 +573,7 @@ int main(int argc, char **argv) {
         !CheckAcl(aclrtMemcpy(output.data(), output.size(), alternate_output_hbm, output.size(),
                                ACL_MEMCPY_DEVICE_TO_HOST),
                   "copy dynamic output") ||
-        !Validate(output, address_table, indices, mask, output_indices, options,
+        !Validate(output, address_table, indices, offsets, mask, output_indices, options,
                   source, statuses, queues, queue_expectations, true,
                   "alternate_output")) {
       goto cleanup;
@@ -565,7 +598,7 @@ int main(int argc, char **argv) {
                   "copy re-acquired primary queue") ||
         !CheckAcl(aclrtMemcpy(output.data(), output.size(), output_hbm, output.size(), ACL_MEMCPY_DEVICE_TO_HOST),
                   "copy re-acquired primary output") ||
-        !Validate(output, address_table, indices, mask, output_indices, options,
+        !Validate(output, address_table, indices, offsets, mask, output_indices, options,
                   source, statuses, queues, queue_expectations, true,
                   "reacquired_primary_output")) {
       goto cleanup;
@@ -611,9 +644,9 @@ int main(int argc, char **argv) {
     std::cout << "GRAPH_CAPTURE_DONE model_ready=1\n";
 
     for (uint32_t replay = 0U; replay < options.graph_replays; ++replay) {
-      PrepareGraphReplayInputs(replay, source, options, &address_table, &indices, &mask, &output_indices);
-      if (!CopyGraphReplayInputs(stream, device_address_table, device_indices, device_mask, device_output_indices,
-                                 address_table, indices, mask, output_indices)) {
+      PrepareGraphReplayInputs(replay, source, options, &address_table, &indices, &offsets, &mask, &output_indices);
+      if (!CopyGraphReplayInputs(stream, device_address_table, device_indices, device_mask, device_offsets,
+                                 device_output_indices, address_table, indices, offsets, mask, output_indices)) {
         goto cleanup;
       }
       std::cout << "GRAPH_REPLAY_INPUT_UPDATED replay=" << replay
@@ -629,7 +662,7 @@ int main(int argc, char **argv) {
                     "copy graph queue") ||
           !CheckAcl(aclrtMemcpy(output.data(), output.size(), output_hbm, output.size(), ACL_MEMCPY_DEVICE_TO_HOST),
                     "copy graph output") ||
-          !Validate(output, address_table, indices, mask, output_indices, options,
+          !Validate(output, address_table, indices, offsets, mask, output_indices, options,
                     source, statuses, queues, queue_expectations, true,
                     "graph_replay")) {
         goto cleanup;
@@ -654,9 +687,9 @@ int main(int argc, char **argv) {
     for (uint32_t warmup = 0U; warmup < options.graph_warmup; ++warmup) {
       const uint32_t epoch = options.graph_replays + warmup;
       std::cout << "GRAPH_PERF_WARMUP_STEP_BEGIN iteration=" << warmup << " epoch=" << epoch << '\n';
-      PrepareGraphReplayInputs(epoch, source, options, &address_table, &indices, &mask, &output_indices);
-      if (!CopyGraphReplayInputs(stream, device_address_table, device_indices, device_mask, device_output_indices,
-                                 address_table, indices, mask, output_indices)) goto cleanup;
+      PrepareGraphReplayInputs(epoch, source, options, &address_table, &indices, &offsets, &mask, &output_indices);
+      if (!CopyGraphReplayInputs(stream, device_address_table, device_indices, device_mask, device_offsets,
+                                 device_output_indices, address_table, indices, offsets, mask, output_indices)) goto cleanup;
       std::cout << "GRAPH_PERF_WARMUP_INPUT_ENQUEUED iteration=" << warmup << '\n';
       AccumulateQueueExpectations(mask, options, &queue_expectations);
       if (!CheckAcl(aclmdlRIExecuteAsync(graph_model, stream), "graph performance warmup replay")) goto cleanup;
@@ -670,10 +703,10 @@ int main(int argc, char **argv) {
     for (uint32_t iteration = 0U; iteration < options.graph_iterations; ++iteration) {
       const uint32_t epoch = options.graph_replays + options.graph_warmup + iteration;
       std::cout << "GRAPH_PERF_MEASURED_STEP_BEGIN iteration=" << iteration << " epoch=" << epoch << '\n';
-      PrepareGraphReplayInputs(epoch, source, options, &address_table, &indices, &mask, &output_indices);
+      PrepareGraphReplayInputs(epoch, source, options, &address_table, &indices, &offsets, &mask, &output_indices);
       const auto begin = std::chrono::steady_clock::now();
-      if (!CopyGraphReplayInputs(stream, device_address_table, device_indices, device_mask, device_output_indices,
-                                 address_table, indices, mask, output_indices)) goto cleanup;
+      if (!CopyGraphReplayInputs(stream, device_address_table, device_indices, device_mask, device_offsets,
+                                 device_output_indices, address_table, indices, offsets, mask, output_indices)) goto cleanup;
       std::cout << "GRAPH_PERF_MEASURED_INPUT_ENQUEUED iteration=" << iteration << '\n';
       AccumulateQueueExpectations(mask, options, &queue_expectations);
       if (!CheckAcl(aclmdlRIExecuteAsync(graph_model, stream), "measured graph replay")) goto cleanup;
@@ -691,7 +724,7 @@ int main(int argc, char **argv) {
                   "copy graph performance queue") ||
         !CheckAcl(aclrtMemcpy(output.data(), output.size(), output_hbm, output.size(), ACL_MEMCPY_DEVICE_TO_HOST),
                   "copy graph performance output") ||
-        !Validate(output, address_table, indices, mask, output_indices, options,
+        !Validate(output, address_table, indices, offsets, mask, output_indices, options,
                   source, statuses, queues, queue_expectations, true,
                   "graph_performance")) {
       goto cleanup;
@@ -794,7 +827,7 @@ int main(int argc, char **argv) {
                   "copy warmup queue") ||
         !CheckAcl(aclrtMemcpy(output.data(), output.size(), output_hbm, output.size(), ACL_MEMCPY_DEVICE_TO_HOST),
                   "copy warmup output") ||
-        !Validate(output, address_table, indices, mask, output_indices, options,
+        !Validate(output, address_table, indices, offsets, mask, output_indices, options,
                   source, statuses, queues, queue_expectations, false,
                   "warmup")) {
       goto cleanup;
@@ -828,7 +861,7 @@ int main(int argc, char **argv) {
                              queues.size() * sizeof(queues[0]), ACL_MEMCPY_DEVICE_TO_HOST), "copy measured queue") ||
       !CheckAcl(aclrtMemcpy(output.data(), output.size(), output_hbm, output.size(), ACL_MEMCPY_DEVICE_TO_HOST),
                 "copy measured output") ||
-      !Validate(output, address_table, indices, mask, output_indices, options,
+      !Validate(output, address_table, indices, offsets, mask, output_indices, options,
                 source, statuses, queues, queue_expectations, false,
                 "measured")) goto cleanup;
   std::cout << "PHASE_MEASURED_VALIDATION_PASS\n";
@@ -867,6 +900,7 @@ cleanup:
   if (device_eager_indices != nullptr) (void)aclrtFree(device_eager_indices);
   if (device_mask != nullptr) (void)aclrtFree(device_mask);
   if (device_indices != nullptr) (void)aclrtFree(device_indices);
+  if (device_offsets != nullptr) (void)aclrtFree(device_offsets);
   if (device_valid_table != nullptr) (void)aclrtFree(device_valid_table);
   if (device_address_table != nullptr) (void)aclrtFree(device_address_table);
   if (alternate_output_hbm != nullptr) (void)aclrtFree(alternate_output_hbm);

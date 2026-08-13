@@ -75,8 +75,10 @@ address/valid Tensor。
 `LockKeys` 阶段直接返回 `kNotFound`，因此不会产生一张含该 Key 的
 `valid=0` 表。
 
-当前 AIV BatchGet ABI 每次 launch 只有一个 `block_bytes`，所以 NPU AccessTable
-的所有 valid entry 必须具有相同长度。Runtime 在 `PrepareAccessTable` 时一次性
+当前 AIV BatchGet ABI 固定每个 WQE 读取 656B，且每个 NPU AccessTable valid
+entry 必须是 `128 * 656B`。`indices[i]` 选择 entry，`offsets[i]` 提供 entry 内
+字节偏移，最终远端地址为 `address_table[indices[i]] + offsets[i]`。Runtime 在
+`PrepareAccessTable` 时一次性
 计算这一不变量，之后每次 BatchGet 只做 O(1) 比较；不会在数据面热路径重新扫描
 整张表。
 
@@ -243,14 +245,15 @@ PYTHONPATH="$PWD/build-aiv/python" \
 timeout 1800s python3 tests/python/test_npu_runtime_perf.py
 ```
 
-默认 `batch=16`，即全表 2,097,152 key、每次 BatchGet 32,768 requests、`block_bytes=576`、
-32 个 AIV core、每 core 2 个 Jetty、3 次 warmup 与 1000 个样本。可用
+默认 `batch=16`，即全表 16,384 个 `128 * 656B` entry、每次 BatchGet 32,768
+requests、每个 WQE 656B、32 个 AIV core、每 core 2 个 Jetty、3 次 warmup 与
+100 个样本。可用
 `KVAF_RUNTIME_PERF_BATCH`、
 `KVAF_RUNTIME_PERF_AIV_CORES`、`KVAF_RUNTIME_PERF_WARMUP`、
 `KVAF_RUNTIME_PERF_ITERATIONS`、`KVAF_RUNTIME_PERF_ACTIVE_PERCENT` 和
 `KVAF_RUNTIME_PERF_BLOCK_BYTES` 覆盖；Jetty 数量可通过
-`KVAF_RUNTIME_PERF_JETTYS_PER_CORE` 覆盖。全量 data population 会写入 2,097,152 个
-逻辑 KV block；脚本显式配置 AIV Direct-HCCP BatchPut kernel，BatchPut 性能样本
+`KVAF_RUNTIME_PERF_JETTYS_PER_CORE` 覆盖。全量 data population 会写入 16,384 个
+逻辑 KV entry；脚本显式配置 AIV Direct-HCCP BatchPut kernel，BatchPut 性能样本
 测量 Runtime metadata upload、AIV WRITE 及其 caller-stream 完成，不包含全量数据
 填充。
 脚本以 CPU `torch.int64` Tensor 传入全量 Prepare key，避免 Python `list[int]` 转换污染

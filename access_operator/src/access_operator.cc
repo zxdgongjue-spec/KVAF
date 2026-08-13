@@ -151,9 +151,12 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
   }
   const BatchGetRequest& request = *exec.request;
   if (!request.indices.has_elements<std::int32_t>() ||
+      !request.offsets.has_elements<std::int32_t>() ||
       !request.output_indices.has_elements<std::int32_t>() ||
-      !request.output.valid() || request.output_block_bytes == 0 ||
+      !request.output.valid() ||
+      request.output_block_bytes != kBatchGetTransferBytes ||
       request.output.bytes % request.output_block_bytes != 0 ||
+      request.indices.device != request.offsets.device ||
       request.indices.device != request.output_indices.device ||
       request.indices.device != request.output.device ||
       request.indices.device != DeviceKind::kNpu ||
@@ -168,6 +171,7 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
           request.device_access_table.addresses.bytes / sizeof(Address) ||
       request.output_block_bytes == 0 || exec.host_access_table.size == 0 ||
       request.indices.bytes % sizeof(std::int32_t) != 0 ||
+      request.offsets.bytes != request.indices.bytes ||
       request.output_indices.bytes != request.indices.bytes ||
       request.mask.bytes != request.indices.bytes / sizeof(std::int32_t) ||
       execution.status == nullptr ||
@@ -192,6 +196,7 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
   arguments->address_table = PointerValue(request.device_access_table.addresses.data);
   arguments->valid_table = PointerValue(request.device_access_table.valid.data);
   arguments->indices = PointerValue(request.indices.data);
+  arguments->offsets = PointerValue(request.offsets.data);
   arguments->mask = PointerValue(request.mask.data);
   arguments->output_indices = PointerValue(request.output_indices.data);
   arguments->output = PointerValue(request.output.data);
@@ -200,7 +205,7 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
   arguments->table_capacity = static_cast<std::uint32_t>(device_table_entries);
   arguments->request_capacity = static_cast<std::uint32_t>(request_count);
   arguments->output_rows = static_cast<std::uint32_t>(output_rows);
-  arguments->block_bytes = static_cast<std::uint32_t>(request.output_block_bytes);
+  arguments->block_bytes = KVAF_AIV_BATCH_GET_WQE_DATA_BYTES;
   arguments->block_count = npu_core_count;
   arguments->jettys_per_core = jettys_per_core;
   return Status::OK();

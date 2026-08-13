@@ -25,9 +25,12 @@ AIV_CORES = 32
 JETTYS_PER_CORE = 2
 PUT_BATCH_SIZE = 128
 WARMUP = 3
-ITERATIONS = 1000
+ITERATIONS = 100
 ACTIVE_PERCENT = 5
-BLOCK_BYTES = 512 + 64
+BLOCK_BYTES = 656
+WQE_BYTES = 656
+ROWS_PER_ENTRY = 128
+ENTRY_BYTES = ROWS_PER_ENTRY * WQE_BYTES
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -79,9 +82,9 @@ def main(batch: int = 16) -> int:
         os.environ.get("KVAF_RUNTIME_PERF_ACTIVE_PERCENT", str(ACTIVE_PERCENT))
     )
     block_bytes = int(os.environ.get("KVAF_RUNTIME_PERF_BLOCK_BYTES", str(BLOCK_BYTES)))
-    table_capacity = batch * PUT_BATCH_SIZE * 1024
+    table_capacity = batch * PUT_BATCH_SIZE * 8
     requests = batch * 2048
-    source_stride = block_bytes
+    source_stride = ENTRY_BYTES
     total_put_batches = table_capacity // PUT_BATCH_SIZE
     if not (
         batch > 0
@@ -90,7 +93,7 @@ def main(batch: int = 16) -> int:
         and warmup >= 0
         and iterations > 0
         and 1 <= active_percent <= 100
-        and block_bytes > 0
+        and block_bytes == WQE_BYTES
         and total_put_batches >= warmup + iterations
     ):
         print("FAIL: invalid KVAF_RUNTIME_PERF_* configuration", file=sys.stderr)
@@ -126,12 +129,15 @@ def main(batch: int = 16) -> int:
         all_keys[batch_index * PUT_BATCH_SIZE : (batch_index + 1) * PUT_BATCH_SIZE]
         for batch_index in range(total_put_batches)
     ]
-    offsets = [row * block_bytes for row in range(PUT_BATCH_SIZE)]
-    lengths = [block_bytes] * PUT_BATCH_SIZE
+    put_offsets = [row * ENTRY_BYTES for row in range(PUT_BATCH_SIZE)]
+    lengths = [ENTRY_BYTES] * PUT_BATCH_SIZE
 
     torch.npu.set_device(device_id)
     device = f"npu:{device_id}"
-    kv_data = torch.empty((PUT_BATCH_SIZE, block_bytes), dtype=torch.uint8, device=device)
+    kv_data = torch.empty((PUT_BATCH_SIZE, ENTRY_BYTES), dtype=torch.uint8, device=device)
+    offsets = torch.randint(
+        0, ROWS_PER_ENTRY, (requests,), dtype=torch.int32, device=device
+    ) * WQE_BYTES
     output_indices = torch.arange(requests, dtype=torch.int32, device=device)
     output = torch.empty((requests, block_bytes), dtype=torch.uint8, device=device)
     runtime = kvaf.NpuRuntime(
@@ -153,17 +159,17 @@ def main(batch: int = 16) -> int:
         # Initialize and Shutdown run once: they are lifecycle operations, not
         # a steady-state dataplane metric.
         print("RUNTIME_PERF_PHASE_BEGIN phase=initialize")
-        runtime.initialize(table_capacity * block_bytes, source_stride)
+        runtime.initialize(table_capacity * ENTRY_BYTES, source_stride)
         print("RUNTIME_PERF_PHASE_DONE phase=initialize")
 
         print("RUNTIME_PERF_PHASE_BEGIN phase=batch_put")
         for key_batch in key_batches[:warmup]:
-            runtime.batch_put(key_batch, kv_data, offsets, lengths)
+            runtime.batch_put(key_batch, kv_data, put_offsets, lengths)
         torch.npu.synchronize()
         batch_put_samples: list[float] = []
         for key_batch in key_batches[warmup : warmup + iterations]:
             begin = time.perf_counter()
-            runtime.batch_put(key_batch, kv_data, offsets, lengths)
+            runtime.batch_put(key_batch, kv_data, put_offsets, lengths)
             torch.npu.synchronize()
             batch_put_samples.append((time.perf_counter() - begin) * 1000.0)
         print_samples(
@@ -175,7 +181,7 @@ def main(batch: int = 16) -> int:
         # from BatchPut samples, but is necessary for a full AccessTable and
         # valid random BatchGet indices.
         for key_batch in key_batches[warmup + iterations :]:
-            runtime.batch_put(key_batch, kv_data, offsets, lengths)
+            runtime.batch_put(key_batch, kv_data, put_offsets, lengths)
         torch.npu.synchronize()
         print("RUNTIME_PERF_PHASE_DONE phase=batch_put")
 
@@ -224,14 +230,14 @@ def main(batch: int = 16) -> int:
 
         print("RUNTIME_PERF_PHASE_BEGIN phase=batch_get")
         for index, mask in zip(indices_batches[:warmup], mask_batches[:warmup]):
-            runtime.batch_get(device_table, index, mask, output_indices, output)
+            runtime.batch_get(device_table, index, offsets, mask, output_indices, output)
         torch.npu.synchronize()
         batch_get_samples: list[float] = []
         for index, mask in zip(
             indices_batches[warmup:], mask_batches[warmup:]
         ):
             begin = time.perf_counter()
-            runtime.batch_get(device_table, index, mask, output_indices, output)
+            runtime.batch_get(device_table, index, offsets, mask, output_indices, output)
             torch.npu.synchronize()
             batch_get_samples.append((time.perf_counter() - begin) * 1000.0)
         print_samples(
