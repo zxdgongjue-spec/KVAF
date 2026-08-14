@@ -49,13 +49,11 @@ struct DirectHccpSession {
   RtOpenNetServiceFn rt_open_net_service = nullptr;
   uint32_t reference_count = 0U;
   bool host_ra_initialized = false;
-  bool device_ra_initialized = false;
 };
 
 namespace {
 
 constexpr uint32_t kPeerOnline = 0U;
-constexpr uint32_t kOfflineHdc = 1U;
 constexpr int kInitAgain = 128001;
 constexpr uint32_t kRetryMs = 10U;
 constexpr uint32_t kTimeoutMs = 10000U;
@@ -215,21 +213,19 @@ bool Bootstrap(DirectHccpSession *session) {
   VerboseLog("[KVAF_AIV] DIRECT_HCCP_SESSION_SERVICE_READY physical=%u hdc_type=%u\n",
              session->key.physical_device_id, session->key.hdc_type);
 
-  if (!CallRaInit(session, kOfflineHdc, "device_aiv")) {
-    CallRaDeinitBestEffort(session, kPeerOnline, "host_cpu");
-    session->host_ra_initialized = false;
-    return false;
-  }
-  session->device_ra_initialized = true;
+  // RaInit is a process-level RA bootstrap, not a per-RaCtx operation.
+  // Calling it a second time with the offline/device role returns HCCP 328002
+  // on A5 (also when the host role has just succeeded).  The individual
+  // BatchGet/BatchPut transports create their AIV-facing offline-HDC contexts
+  // through RaCtxInit, which is the correct per-transport device setup.
+  // Do not claim ownership of a device-side RA instance here: it may belong
+  // to CANN/HCCL and must never be released by KVAF.
   return true;
 }
 
 void DestroySession(DirectHccpSession *session) {
   if (session == nullptr) {
     return;
-  }
-  if (session->device_ra_initialized) {
-    CallRaDeinitBestEffort(session, kOfflineHdc, "device_aiv");
   }
   if (session->host_ra_initialized) {
     CallRaDeinitBestEffort(session, kPeerOnline, "host_cpu");

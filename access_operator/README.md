@@ -30,7 +30,7 @@ caller-owned buffer 与远端 DDR 组织为一次数据搬运。它不拥有 Key
 ```text
 Runtime.Initialize
   -> DefaultAccessOperator.Initialize(remote DDR)
-  -> DirectHccpSessionAcquire(physical NPU)  # RaInit / HDC service，仅首次
+  -> DirectHccpSessionAcquire(physical NPU)  # host RaInit / HDC service，仅首次
   -> BatchGetTransportCreate(remote DDR)     # Get 的 RaCtx / CTP / Jetty / SQ / CQ
   -> BatchPutTransportCreate(remote DDR)     # Put 的 RaCtx / CTP / Jetty / SQ / CQ
 
@@ -80,8 +80,9 @@ Selector / Executor / Template 分层、通用图调度/与上游框架图的整
 ## Direct-HCCP session 与 Transport 边界
 
 BatchGet / BatchPut 的 demo 现在共享按 `{physical device, hdc type}` 索引的进程级
-RA/HDC session。它只拥有 `RaInit`、`rtOpenNetService`、`RaDeinit` 与引用计数，避免
-第二个 demo 重复 `RaInit`（HCCP `328002`）或在失败路径错误释放第一个 demo 的 RA。
+RA/HDC session。它只拥有 host 侧 `RaInit`、`rtOpenNetService`、`RaDeinit` 与引用计数。
+每个 transport 用 `RaCtxInit(kOfflineHdc)` 创建自己的 AIV context；不得再调用第二次
+device-mode `RaInit`，否则 A5 会返回 HCCP `328002`。
 
 两个数据面 transport 仍然独立：各自创建 `RaCtx`、token、MR、CQ、Jetty、TP 与
 kernel entity。不能仅因两者共用 session 就假设 EID、CTP、Jetty、SQ/CQ 可共享。
