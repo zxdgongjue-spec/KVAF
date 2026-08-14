@@ -13,3 +13,7 @@ target_compile_definitions(kvaf_direct_hccp_session PRIVATE _GLIBCXX_USE_CXX11_A
 target_compile_options(kvaf_direct_hccp_session PRIVATE -O2 -fno-common -fno-strict-aliasing)
 target_link_libraries(kvaf_direct_hccp_session PRIVATE dl pthread)
 target_compile_features(kvaf_direct_hccp_session PUBLIC cxx_std_17)
+
+if(BUILD_TESTING)
+  add_subdirectory(tests)
+endif()
