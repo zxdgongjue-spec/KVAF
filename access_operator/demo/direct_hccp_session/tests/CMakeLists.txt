@@ -11,6 +11,9 @@ target_include_directories(kvaf_direct_hccp_fake_runtime PRIVATE
 target_compile_features(kvaf_direct_hccp_fake_runtime PRIVATE cxx_std_17)
 
 add_executable(kvaf_direct_hccp_session_test direct_hccp_session_test.cc)
+add_dependencies(kvaf_direct_hccp_session_test
+  kvaf_direct_hccp_fake_ra
+  kvaf_direct_hccp_fake_runtime)
 target_include_directories(kvaf_direct_hccp_session_test PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/../include")
 target_link_libraries(kvaf_direct_hccp_session_test PRIVATE
