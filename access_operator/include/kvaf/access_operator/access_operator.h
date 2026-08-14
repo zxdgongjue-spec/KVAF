@@ -52,6 +52,16 @@ struct DsaDirectBatchGetRequest {
   bool synchronize{true};
 };
 
+// A graph binding owns the Direct-HCCP registration for one fixed caller
+// output buffer and one fixed set of device descriptor tensors.  It is made
+// outside ACL graph capture, captured once through
+// CaptureDsaDirectBatchGetGraph(), and released only after the graph and its
+// output buffers are no longer usable.  The opaque value deliberately keeps
+// the transport lifetime out of the Python/vLLM graph code.
+struct DsaDirectBatchGetGraphBinding {
+  std::uint64_t opaque{0};
+};
+
 // KV Access Operator 是 Runtime 的数据面依赖。Runtime 管理远端 DDR
 // 生命周期和 Meta 可见性；Operator 只负责初始化链路并执行同步搬运。
 class AccessOperator {
@@ -109,6 +119,21 @@ class DefaultAccessOperator final : public AccessOperator {
   // host-side payload path into the production DSA/KVAF route.
   Status ExecuteDsaFullBlockPut(const DsaFullBlockPutRequest& request);
   Status ExecuteDsaDirectBatchGet(const DsaDirectBatchGetRequest& request);
+
+  // Graph-safe DSA DirectGet lifecycle. Bind validates the fixed tensor ABI
+  // and acquires the Direct-HCCP local HBM registration exactly once, before
+  // graph capture. Capture only submits the prebuilt AIV launch on the
+  // caller's capture stream: it performs no tensor inspection, transport
+  // acquire/release, stream synchronization, or status D2H copy. Replays are
+  // therefore fully owned by the enclosing ACL graph. Release must happen
+  // after every graph replay using this binding has completed.
+  Status BindDsaDirectBatchGetGraph(
+      const DsaDirectBatchGetRequest& request,
+      DsaDirectBatchGetGraphBinding* binding);
+  Status CaptureDsaDirectBatchGetGraph(
+      const DsaDirectBatchGetGraphBinding& binding, void* stream);
+  Status ReleaseDsaDirectBatchGetGraph(
+      DsaDirectBatchGetGraphBinding* binding);
 
  private:
   struct Impl;

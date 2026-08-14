@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <limits>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -317,6 +318,15 @@ Status CheckBatchGetDeviceStatus(const BatchGetExecutionState& execution,
 struct DefaultAccessOperator::Impl {
   explicit Impl(AccessOperatorConfig init_config) : config(std::move(init_config)) {}
 
+  // This state is deliberately independent of an individual DirectGet
+  // request.  Its argument record contains only fixed NPU addresses and the
+  // caller-output-specific Direct-HCCP entity table; after it has been
+  // captured, ACL graph replay never calls back into this map.
+  struct DsaGraphDirectGetState {
+    KvafExecuteBatchGetKernelArgs arguments{};
+    KvafBatchGetLocalBuffer* local_buffer{nullptr};
+  };
+
   AccessOperatorConfig config;
   RemoteRegionDesc remote_region;
   KvafBatchGetTransport* transport{nullptr};
@@ -325,6 +335,9 @@ struct DefaultAccessOperator::Impl {
   KvafBatchPutTransport* batch_put_transport{nullptr};
   BatchPutExecutionState batch_put_execution;
 #endif
+  std::uint64_t next_dsa_graph_direct_get_id{1};
+  std::unordered_map<std::uint64_t, DsaGraphDirectGetState>
+      dsa_graph_direct_gets;
   bool initialized{false};
 };
 
@@ -438,6 +451,16 @@ Status DefaultAccessOperator::Shutdown() {
   if (!impl_->initialized) {
     return Status::OK();
   }
+
+  // Callers must complete all submitted streams before Runtime::Shutdown,
+  // including graph replays.  Release graph-owned output registrations before
+  // destroying the transport that owns them.
+  for (auto& entry : impl_->dsa_graph_direct_gets) {
+    if (entry.second.local_buffer != nullptr) {
+      KvafBatchGetLocalBufferRelease(entry.second.local_buffer);
+    }
+  }
+  impl_->dsa_graph_direct_gets.clear();
 
   // Callers must complete all submitted streams before Runtime::Shutdown,
   // including the default enqueue-only Python BatchGet path.
@@ -569,6 +592,108 @@ Status DefaultAccessOperator::ExecuteDsaDirectBatchGet(
   } else {
     KvafBatchGetLocalBufferRelease(local_buffer);
   }
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::BindDsaDirectBatchGetGraph(
+    const DsaDirectBatchGetRequest& request,
+    DsaDirectBatchGetGraphBinding* binding) {
+  if (binding == nullptr) {
+    return InvalidArgument("DSA_ROW graph DirectGet binding must not be null");
+  }
+  if (!impl_->initialized || impl_->transport == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  if (binding->opaque != 0) {
+    return InvalidArgument("DSA_ROW graph DirectGet binding is already active");
+  }
+
+  // All fixed-address tensor validation occurs before graph capture.  In
+  // particular no stream is supplied here: a capture stream is intentionally
+  // bound only by CaptureDsaDirectBatchGetGraph().
+  Impl::DsaGraphDirectGetState state;
+  Status status = BuildDsaDirectBatchGetKernelArgs(
+      request, impl_->config.npu_core_count, impl_->config.jettys_per_core,
+      impl_->execution, &state.arguments);
+  if (!status.ok()) {
+    return status;
+  }
+
+  std::uint64_t channel_entity = 0;
+  if (KvafBatchGetLocalBufferAcquire(
+          impl_->transport,
+          reinterpret_cast<void*>(state.arguments.output), request.output.bytes,
+          &state.local_buffer, &channel_entity) != KVAF_BATCH_GET_SUCCESS ||
+      state.local_buffer == nullptr || channel_entity == 0) {
+    return Internal(
+        "failed to prewarm caller output for DSA_ROW graph DirectGet");
+  }
+  state.arguments.channel_entity = channel_entity;
+
+  const std::uint64_t handle = impl_->next_dsa_graph_direct_get_id++;
+  if (handle == 0) {
+    KvafBatchGetLocalBufferRelease(state.local_buffer);
+    return InvalidState("DSA_ROW graph DirectGet handle space is exhausted");
+  }
+  try {
+    impl_->dsa_graph_direct_gets.emplace(handle, std::move(state));
+  } catch (...) {
+    KvafBatchGetLocalBufferRelease(state.local_buffer);
+    return Internal("failed to retain DSA_ROW graph DirectGet binding");
+  }
+  binding->opaque = handle;
+  std::fprintf(stderr,
+               "[KVAF_AIV] DSA_GRAPH_DIRECT_GET_PREWARMED binding=%llu "
+               "output=0x%llx request_capacity=%u output_rows=%u\n",
+               static_cast<unsigned long long>(handle),
+               static_cast<unsigned long long>(
+                   impl_->dsa_graph_direct_gets.at(handle).arguments.output),
+               impl_->dsa_graph_direct_gets.at(handle).arguments.request_capacity,
+               impl_->dsa_graph_direct_gets.at(handle).arguments.output_rows);
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::CaptureDsaDirectBatchGetGraph(
+    const DsaDirectBatchGetGraphBinding& binding, void* stream) {
+  if (!impl_->initialized || impl_->transport == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  if (binding.opaque == 0 || stream == nullptr) {
+    return InvalidArgument(
+        "DSA_ROW graph DirectGet requires an active binding and capture stream");
+  }
+  const auto it = impl_->dsa_graph_direct_gets.find(binding.opaque);
+  if (it == impl_->dsa_graph_direct_gets.end()) {
+    return Status::NotFound("DSA_ROW graph DirectGet binding was not found");
+  }
+
+  // This is the capture-only hot path. Do not add descriptor checks,
+  // Direct-HCCP acquire/release, stream synchronization, or status D2H here:
+  // each of those would either invalidate the fixed-address ACL graph contract
+  // or reintroduce an eager per-decode host bubble.
+  const int32_t launch_result = KvafExecuteBatchGetLaunch(
+      &it->second.arguments, static_cast<aclrtStream>(stream));
+  return launch_result == KVAF_BATCH_GET_SUCCESS
+             ? Status::OK()
+             : Internal("failed to capture DSA_ROW graph DirectGet");
+}
+
+Status DefaultAccessOperator::ReleaseDsaDirectBatchGetGraph(
+    DsaDirectBatchGetGraphBinding* binding) {
+  if (binding == nullptr || binding->opaque == 0) {
+    return InvalidArgument("DSA_ROW graph DirectGet binding is invalid");
+  }
+  const auto it = impl_->dsa_graph_direct_gets.find(binding->opaque);
+  if (it == impl_->dsa_graph_direct_gets.end()) {
+    return Status::NotFound("DSA_ROW graph DirectGet binding was not found");
+  }
+  if (it->second.local_buffer != nullptr) {
+    KvafBatchGetLocalBufferRelease(it->second.local_buffer);
+  }
+  impl_->dsa_graph_direct_gets.erase(it);
+  *binding = DsaDirectBatchGetGraphBinding{};
   return Status::OK();
 }
 

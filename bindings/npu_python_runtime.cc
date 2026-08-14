@@ -543,6 +543,9 @@ class NpuRuntime final {
 // address is `flat_index -> directory UBA`, and DirectGet additionally carries
 // a packed-token offset to the AIV kernel.
 class DsaRowRuntime final {
+ private:
+  struct GraphGetPlan;
+
  public:
   DsaRowRuntime() = default;
   ~DsaRowRuntime() { CloseNoThrow(); }
@@ -552,6 +555,13 @@ class DsaRowRuntime final {
 
   static const char* ProbeDsaRowPayloadAbi() {
     return "torch_npu_packed_v1";
+  }
+
+  // Kept separate from the payload ABI so vLLM can fail closed when an older
+  // KVAF build would silently take the eager DirectGet path during graph
+  // capture.
+  static const char* ProbeDsaRowGraphDirectGetAbi() {
+    return "graph_direct_get_v1";
   }
 
   void InitializeDsaRowIndex(const py::dict& layout, const py::dict& geometry,
@@ -1129,6 +1139,136 @@ class DsaRowRuntime final {
     return py::int_(get_handle);
   }
 
+  // Prewarm one fixed-address DirectGet launch for ACL graph capture.  This
+  // method is intentionally independent of UnifiedAccess: graph capture uses
+  // PAD descriptors, while vLLM pins the real per-request access separately
+  // until the corresponding graph replay has completed.  The caller must keep
+  // these tensors at the same addresses for the lifetime of the graph binding;
+  // their contents may be updated between graph replays.
+  py::int_ PrewarmGraphDirectBatchGetDevice(
+      const py::object& flat_indices, const py::object& token_offsets,
+      const py::object& mask, const py::object& destination_indices,
+      const py::dict& output_cache) {
+    RequireInitialized();
+    const std::uint32_t output_layer = static_cast<std::uint32_t>(
+        DictU64(output_cache, "local_layer_ordinal"));
+    const std::uint64_t byte_capacity =
+        DictU64(output_cache, "byte_capacity");
+    const std::uint64_t row_capacity =
+        DictU64(output_cache, "row_capacity");
+    const py::str cache_name("cache");
+    if (output_layer >= geometry_.n_layers || !output_cache.contains(cache_name)) {
+      throw py::value_error(
+          "invalid DSA_ROW graph DirectGet output cache");
+    }
+    const py::object output = output_cache[cache_name];
+    const NpuTensorView output_view =
+        GetNpuTensorView(output, "DSA_ROW graph DirectGet output cache");
+    const NpuTensorView index_view = GetNpuTensorView(
+        flat_indices, "DSA_ROW graph DirectGet flat_indices");
+    const NpuTensorView offset_view = GetNpuTensorView(
+        token_offsets, "DSA_ROW graph DirectGet token_offsets");
+    const NpuTensorView mask_view =
+        GetNpuTensorView(mask, "DSA_ROW graph DirectGet mask");
+    const NpuTensorView destination_view = GetNpuTensorView(
+        destination_indices, "DSA_ROW graph DirectGet destination_indices");
+    const auto binding = bound_layers_.find(output_layer);
+    if (binding == bound_layers_.end() ||
+        binding->second.byte_capacity != byte_capacity ||
+        binding->second.row_capacity != row_capacity ||
+        GetNpuTensorView(binding->second.cache,
+                         "DSA_ROW bound graph output cache").data !=
+            output_view.data ||
+        byte_capacity == 0 || row_capacity == 0 ||
+        output_view.bytes < byte_capacity ||
+        byte_capacity % layout_.packed_token_bytes != 0 ||
+        row_capacity > byte_capacity / layout_.packed_token_bytes ||
+        index_view.shape.size() != 1 || offset_view.shape.size() != 1 ||
+        mask_view.shape.size() != 1 || destination_view.shape.size() != 1 ||
+        index_view.element_bytes != sizeof(std::int32_t) ||
+        offset_view.element_bytes != sizeof(std::int32_t) ||
+        destination_view.element_bytes != sizeof(std::int32_t) ||
+        mask_view.element_bytes != sizeof(std::uint8_t) ||
+        index_view.bytes == 0 || offset_view.bytes != index_view.bytes ||
+        destination_view.bytes != index_view.bytes ||
+        mask_view.bytes != index_view.bytes / sizeof(std::int32_t)) {
+      throw py::value_error(
+          "DSA_ROW graph DirectGet tensors do not satisfy the fixed NPU ABI");
+    }
+    const std::size_t item_count = index_view.bytes / sizeof(std::int32_t);
+    if (item_count > std::numeric_limits<std::uint32_t>::max()) {
+      throw py::value_error(
+          "DSA_ROW graph DirectGet request count exceeds uint32");
+    }
+
+    const NpuTensorView directory =
+        GetNpuTensorView(device_directory_, "DSA_ROW device directory");
+    const NpuTensorView valid =
+        GetNpuTensorView(device_valid_, "DSA_ROW device valid directory");
+    const std::uint64_t graph_handle = NextHandle();
+    DsaDirectBatchGetGraphBinding native_binding;
+    ThrowIfError(access_operator_->BindDsaDirectBatchGetGraph(
+        DsaDirectBatchGetRequest{
+            ConstBufferView{directory.data, directory.bytes, DeviceKind::kNpu},
+            ConstBufferView{valid.data, valid.bytes, DeviceKind::kNpu},
+            ConstBufferView{index_view.data, index_view.bytes, DeviceKind::kNpu},
+            ConstBufferView{offset_view.data, offset_view.bytes, DeviceKind::kNpu},
+            ConstBufferView{mask_view.data, mask_view.bytes, DeviceKind::kNpu},
+            ConstBufferView{destination_view.data, destination_view.bytes,
+                            DeviceKind::kNpu},
+            MutableBufferView{output_view.data, output_view.bytes,
+                              DeviceKind::kNpu},
+            layout_.packed_token_bytes, layout_.tokens_per_logical_block,
+            nullptr, false},
+        &native_binding));
+
+    GraphGetPlan graph_plan;
+    graph_plan.native_binding = native_binding;
+    graph_plan.flat_indices = flat_indices;
+    graph_plan.token_offsets = token_offsets;
+    graph_plan.mask = mask;
+    graph_plan.destinations = destination_indices;
+    graph_plan.output = output;
+    try {
+      graph_get_plans_.emplace(graph_handle, std::move(graph_plan));
+    } catch (...) {
+      (void)access_operator_->ReleaseDsaDirectBatchGetGraph(&native_binding);
+      throw;
+    }
+    return py::int_(graph_handle);
+  }
+
+  // Invoke only while the caller's ACL graph is being captured.  Replaying the
+  // graph does not execute this Python method.  Keep this method deliberately
+  // lean: all tensor/layout validation and Direct-HCCP registration happened
+  // in PrewarmGraphDirectBatchGetDevice().
+  py::none CaptureGraphDirectBatchGet(const py::object& binding,
+                                      const py::object& stream) {
+    RequireInitialized();
+    GraphGetPlan& graph =
+        FindGraphGetPlan(ParseHandle(binding, "graph DirectGet binding"));
+    const aclrtStream acl_stream = ResolveStream(stream);
+    ThrowIfError(access_operator_->CaptureDsaDirectBatchGetGraph(
+        graph.native_binding, acl_stream));
+    return py::none();
+  }
+
+  // Destroy only after the owning ACL graph has been reset/destroyed and all
+  // of its replays have completed.  This is intentionally outside capture.
+  py::none ReleaseGraphDirectBatchGet(const py::object& binding) {
+    RequireInitialized();
+    const std::uint64_t handle =
+        ParseHandle(binding, "graph DirectGet binding");
+    const auto it = graph_get_plans_.find(handle);
+    if (it == graph_get_plans_.end()) {
+      throw py::value_error("DSA_ROW graph DirectGet binding was not found");
+    }
+    ThrowIfError(
+        access_operator_->ReleaseDsaDirectBatchGetGraph(&it->second.native_binding));
+    graph_get_plans_.erase(it);
+    return py::none();
+  }
+
   py::int_ ExecutePreparedDirectBatchGet(const py::object& plan) {
     RequireInitialized();
     const std::uint64_t handle = ParseHandle(plan, "DirectGet plan");
@@ -1271,6 +1411,10 @@ class DsaRowRuntime final {
             "DSA_ROW close requires all rows/accesses to be released first");
       }
     }
+    if (!graph_get_plans_.empty()) {
+      throw py::value_error(
+          "DSA_ROW close requires graph DirectGet bindings to be released first");
+    }
     CloseNoThrow();
   }
 
@@ -1369,6 +1513,18 @@ class DsaRowRuntime final {
     py::object output;
     aclrtStream stream{nullptr};
     bool executed{false};
+  };
+
+  // Keep all Python tensors alive for the entire captured graph lifetime. The
+  // native binding contains their fixed device addresses, whereas these
+  // references guarantee the allocator cannot recycle those addresses early.
+  struct GraphGetPlan {
+    DsaDirectBatchGetGraphBinding native_binding;
+    py::object flat_indices;
+    py::object token_offsets;
+    py::object mask;
+    py::object destinations;
+    py::object output;
   };
 
   void RequireInitialized() const {
@@ -1641,6 +1797,14 @@ class DsaRowRuntime final {
     return it->second;
   }
 
+  GraphGetPlan& FindGraphGetPlan(std::uint64_t handle) {
+    const auto it = graph_get_plans_.find(handle);
+    if (it == graph_get_plans_.end()) {
+      throw py::value_error("DSA_ROW graph DirectGet binding was not found");
+    }
+    return it->second;
+  }
+
   void FinishGetPlan(std::uint64_t handle, bool /*success*/) {
     const auto get_it = get_plans_.find(handle);
     if (get_it == get_plans_.end()) return;
@@ -1669,6 +1833,11 @@ class DsaRowRuntime final {
     // registrations against that exact region.  This path is intentionally
     // best-effort for destruction after an exception.
     if (access_operator_ != nullptr) {
+      for (auto& entry : graph_get_plans_) {
+        (void)access_operator_->ReleaseDsaDirectBatchGetGraph(
+            &entry.second.native_binding);
+      }
+      graph_get_plans_.clear();
       (void)access_operator_->Shutdown();
     }
     access_operator_.reset();
@@ -1683,6 +1852,7 @@ class DsaRowRuntime final {
     put_plans_.clear();
     accesses_.clear();
     get_plans_.clear();
+    graph_get_plans_.clear();
     free_blocks_.clear();
     block_states_.clear();
     cell_blocks_.clear();
@@ -1715,6 +1885,7 @@ class DsaRowRuntime final {
   std::unordered_map<std::uint64_t, PutPlan> put_plans_;
   std::unordered_map<std::uint64_t, AccessPlan> accesses_;
   std::unordered_map<std::uint64_t, GetPlan> get_plans_;
+  std::unordered_map<std::uint64_t, GraphGetPlan> graph_get_plans_;
 };
 
 }  // namespace
@@ -1771,6 +1942,8 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def(py::init<>())
       .def_static("probe_dsa_row_payload_abi",
                   &DsaRowRuntime::ProbeDsaRowPayloadAbi)
+      .def_static("probe_dsa_row_graph_direct_get_abi",
+                  &DsaRowRuntime::ProbeDsaRowGraphDirectGetAbi)
       .def("initialize_dsa_row_index", &DsaRowRuntime::InitializeDsaRowIndex,
            py::arg("layout"), py::arg("geometry"), py::arg("ddr_block_count"),
            py::arg("npu_config") = py::none(),
@@ -1804,6 +1977,21 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("flat_indices"), py::arg("token_offsets"), py::arg("mask"),
            py::arg("destination_indices"), py::arg("output_cache"),
            py::arg("stream") = py::none())
+      .def("prewarm_graph_direct_batch_get_device",
+           &DsaRowRuntime::PrewarmGraphDirectBatchGetDevice,
+           py::arg("flat_indices"), py::arg("token_offsets"), py::arg("mask"),
+           py::arg("destination_indices"), py::arg("output_cache"),
+           "Prewarm one fixed-address DirectGet for ACL graph capture. Tensor "
+           "contents may change between graph replays, but their addresses and "
+           "the output cache must stay fixed until release.")
+      .def("capture_graph_direct_batch_get",
+           &DsaRowRuntime::CaptureGraphDirectBatchGet, py::arg("binding"),
+           py::arg("stream") = py::none(),
+           "Enqueue a prewarmed DirectGet while capturing an ACL graph; this "
+           "performs no Direct-HCCP registration or synchronization.")
+      .def("release_graph_direct_batch_get",
+           &DsaRowRuntime::ReleaseGraphDirectBatchGet, py::arg("binding"),
+           "Release a prewarmed DirectGet after its ACL graph is destroyed.")
       .def("execute_prepared_direct_batch_get",
            &DsaRowRuntime::ExecutePreparedDirectBatchGet, py::arg("plan"))
       .def("settle_direct_batch_get", &DsaRowRuntime::SettleDirectBatchGet,

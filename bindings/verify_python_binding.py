@@ -37,10 +37,13 @@ def main() -> int:
             or not hasattr(kvaf, "DsaRowRuntime")
             or kvaf.DsaRowRuntime.probe_dsa_row_payload_abi()
             != "torch_npu_packed_v1"
+            or kvaf.DsaRowRuntime.probe_dsa_row_graph_direct_get_abi()
+            != "graph_direct_get_v1"
         ):
             raise RuntimeError(
                 "KVAF Direct-HCCP binding does not export the production "
-                "DsaRowRuntime torch_npu_packed_v1 payload ABI"
+                "DsaRowRuntime torch_npu_packed_v1 payload ABI and "
+                "graph_direct_get_v1 graph ABI"
             )
     return 0
 
