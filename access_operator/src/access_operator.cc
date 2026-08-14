@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <limits>
 #include <string>
@@ -278,33 +279,37 @@ Status BuildDsaDirectBatchGetKernelArgs(
   return Status::OK();
 }
 
-void LogBatchGetDeviceStatus(const BatchGetExecutionState& execution,
-                             std::uint32_t npu_core_count) {
+// AIV status lives in device memory.  Copying it to the host after every
+// Decode-layer DirectGet adds a hidden D2H synchronization and defeats the
+// payload path's latency goal.  Keep verification opt-in for bring-up and
+// fault triage; when requested it is a strict Status, never a log-only hint.
+bool IsEnabledByEnvironment(const char* name) {
+  const char* value = std::getenv(name);
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+Status CheckBatchGetDeviceStatus(const BatchGetExecutionState& execution,
+                                 std::uint32_t npu_core_count) {
   std::vector<KvafBatchGetCoreStatus> statuses(npu_core_count);
   const aclError copy_result = aclrtMemcpy(
       statuses.data(), statuses.size() * sizeof(statuses.front()),
       execution.status, execution.status_bytes, ACL_MEMCPY_DEVICE_TO_HOST);
   if (copy_result != ACL_SUCCESS) {
-    std::fprintf(stderr,
-                 "[KVAF_AIV] BATCH_GET_STATUS_LOG_ERROR aclrtMemcpy=%d\n",
-                 static_cast<int>(copy_result));
-    return;
+    return Internal("failed to copy AIV BatchGet device status: aclrtMemcpy=" +
+                    std::to_string(static_cast<int>(copy_result)));
   }
   for (std::uint32_t core = 0; core < npu_core_count; ++core) {
     const KvafBatchGetCoreStatus& status = statuses[core];
     if (status.magic != KVAF_AIV_BATCH_GET_STATUS_MAGIC || status.result != 0U) {
-      // Keep device execution faults in the operator diagnostic channel rather
-      // than turning the kernel status buffer into a Python BatchGet result.
-      // Deployments can route this marker through their CANN/plog collection.
-      std::fprintf(stderr,
-                   "[KVAF_AIV] BATCH_GET_DEVICE_ERROR core=%u magic=0x%llx "
-                   "result=%llu processed=%llu failed_request=%llu\n",
-                   core, static_cast<unsigned long long>(status.magic),
-                   static_cast<unsigned long long>(status.result),
-                   static_cast<unsigned long long>(status.processed_request_count),
-                   static_cast<unsigned long long>(status.failed_request_index));
+      return Internal(
+          "AIV BatchGet device failure: core=" + std::to_string(core) +
+          " magic=" + std::to_string(status.magic) +
+          " result=" + std::to_string(status.result) +
+          " processed=" + std::to_string(status.processed_request_count) +
+          " failed_request=" + std::to_string(status.failed_request_index));
     }
   }
+  return Status::OK();
 }
 
 }  // namespace
@@ -498,7 +503,11 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
     if (sync_result != ACL_SUCCESS) {
       return Internal("BatchGet stream synchronization failed");
     }
-    LogBatchGetDeviceStatus(impl_->execution, impl_->config.npu_core_count);
+    if (IsEnabledByEnvironment("KVAF_VERIFY_AIV_BATCH_GET_STATUS")) {
+      status = CheckBatchGetDeviceStatus(impl_->execution,
+                                         impl_->config.npu_core_count);
+      if (!status.ok()) return status;
+    }
   } else {
     // The demo transport caches zero-reference registrations until shutdown.
     // Releasing after an externally captured launch keeps KVAF graph-agnostic;
@@ -549,7 +558,14 @@ Status DefaultAccessOperator::ExecuteDsaDirectBatchGet(
     if (sync_result != ACL_SUCCESS) {
       return Internal("DSA_ROW DirectGet stream synchronization failed");
     }
-    LogBatchGetDeviceStatus(impl_->execution, impl_->config.npu_core_count);
+    // Production DSA decode never D2H-copies this diagnostic buffer.  Set the
+    // opt-in flag only while debugging a transport/kernel issue; any device
+    // status failure is then propagated to Python as a hard error.
+    if (IsEnabledByEnvironment("KVAF_DSA_VERIFY_AIV_GET_STATUS")) {
+      status = CheckBatchGetDeviceStatus(impl_->execution,
+                                         impl_->config.npu_core_count);
+      if (!status.ok()) return status;
+    }
   } else {
     KvafBatchGetLocalBufferRelease(local_buffer);
   }
