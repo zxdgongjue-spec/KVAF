@@ -206,6 +206,78 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
   return Status::OK();
 }
 
+// Build the same Direct-HCCP launch ABI without involving a legacy
+// AccessTable/KeyId.  The DSA row directory is already a device-resident
+// address table and `flat_indices` are its deterministic row-major indices.
+Status BuildDsaDirectBatchGetKernelArgs(
+    const DsaDirectBatchGetRequest& request, std::uint32_t npu_core_count,
+    std::uint32_t jettys_per_core, const BatchGetExecutionState& execution,
+    KvafExecuteBatchGetKernelArgs* arguments) {
+  if (arguments == nullptr || !request.flat_indices.has_elements<std::int32_t>() ||
+      !request.token_offsets.has_elements<std::int32_t>() ||
+      !request.output_indices.has_elements<std::int32_t>() ||
+      request.mask.data == nullptr || !request.output.valid() ||
+      request.output_block_bytes == 0 ||
+      request.max_token_offset == 0 ||
+      request.output.bytes % request.output_block_bytes != 0 ||
+      request.flat_indices.device != DeviceKind::kNpu ||
+      request.token_offsets.device != DeviceKind::kNpu ||
+      request.mask.device != DeviceKind::kNpu ||
+      request.output_indices.device != DeviceKind::kNpu ||
+      request.output.device != DeviceKind::kNpu ||
+      request.address_table.device != DeviceKind::kNpu ||
+      request.valid_table.device != DeviceKind::kNpu ||
+      request.address_table.data == nullptr || request.valid_table.data == nullptr ||
+      request.address_table.bytes == 0 ||
+      request.address_table.bytes % sizeof(Address) != 0 ||
+      request.valid_table.bytes != request.address_table.bytes / sizeof(Address) ||
+      request.flat_indices.bytes % sizeof(std::int32_t) != 0 ||
+      request.token_offsets.bytes != request.flat_indices.bytes ||
+      request.output_indices.bytes != request.flat_indices.bytes ||
+      request.mask.bytes != request.flat_indices.bytes / sizeof(std::int32_t) ||
+      execution.status == nullptr ||
+      execution.status_bytes < static_cast<std::size_t>(npu_core_count) *
+                                   sizeof(KvafBatchGetCoreStatus) ||
+      execution.queue_state == nullptr ||
+      execution.queue_state_bytes <
+          static_cast<std::size_t>(npu_core_count) * jettys_per_core *
+              sizeof(KvafBatchGetQueueState)) {
+    return InvalidArgument(
+        "DSA_ROW DirectGet request does not satisfy the NPU buffer contract");
+  }
+
+  const std::size_t request_count =
+      request.flat_indices.bytes / sizeof(std::int32_t);
+  const std::size_t output_rows =
+      request.output.bytes / request.output_block_bytes;
+  const std::size_t directory_cells =
+      request.address_table.bytes / sizeof(Address);
+  if (!FitsU32(directory_cells) || !FitsU32(request_count) ||
+      !FitsU32(output_rows) || !FitsU32(request.output_block_bytes)) {
+    return InvalidArgument("DSA_ROW DirectGet dimensions exceed the device ABI");
+  }
+
+  *arguments = KvafExecuteBatchGetKernelArgs{};
+  arguments->address_table = PointerValue(request.address_table.data);
+  arguments->valid_table = PointerValue(request.valid_table.data);
+  arguments->indices = PointerValue(request.flat_indices.data);
+  arguments->token_offsets = PointerValue(request.token_offsets.data);
+  arguments->mask = PointerValue(request.mask.data);
+  arguments->output_indices = PointerValue(request.output_indices.data);
+  arguments->output = PointerValue(request.output.data);
+  arguments->core_status = PointerValue(execution.status);
+  arguments->queue_state = PointerValue(execution.queue_state);
+  arguments->table_capacity = static_cast<std::uint32_t>(directory_cells);
+  arguments->request_capacity = static_cast<std::uint32_t>(request_count);
+  arguments->output_rows = static_cast<std::uint32_t>(output_rows);
+  arguments->block_bytes =
+      static_cast<std::uint32_t>(request.output_block_bytes);
+  arguments->block_count = npu_core_count;
+  arguments->jettys_per_core = jettys_per_core;
+  arguments->max_token_offset = request.max_token_offset;
+  return Status::OK();
+}
+
 void LogBatchGetDeviceStatus(const BatchGetExecutionState& execution,
                              std::uint32_t npu_core_count) {
   std::vector<KvafBatchGetCoreStatus> statuses(npu_core_count);
@@ -436,6 +508,54 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   return Status::OK();
 }
 
+Status DefaultAccessOperator::ExecuteDsaDirectBatchGet(
+    const DsaDirectBatchGetRequest& request) {
+  if (!impl_->initialized || impl_->transport == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  if (request.stream == nullptr) {
+    return InvalidArgument(
+        "DSA_ROW DirectGet requires a caller-owned ACL stream");
+  }
+  KvafExecuteBatchGetKernelArgs arguments{};
+  Status status = BuildDsaDirectBatchGetKernelArgs(
+      request, impl_->config.npu_core_count, impl_->config.jettys_per_core,
+      impl_->execution, &arguments);
+  if (!status.ok()) {
+    return status;
+  }
+
+  KvafBatchGetLocalBuffer* local_buffer = nullptr;
+  std::uint64_t channel_entity = 0;
+  if (KvafBatchGetLocalBufferAcquire(
+          impl_->transport, reinterpret_cast<void*>(arguments.output),
+          request.output.bytes, &local_buffer,
+          &channel_entity) != KVAF_BATCH_GET_SUCCESS ||
+      local_buffer == nullptr || channel_entity == 0) {
+    return Internal("failed to acquire caller output for DSA_ROW DirectGet");
+  }
+  arguments.channel_entity = channel_entity;
+
+  const aclrtStream stream = static_cast<aclrtStream>(request.stream);
+  const int32_t launch_result = KvafExecuteBatchGetLaunch(&arguments, stream);
+  if (launch_result != KVAF_BATCH_GET_SUCCESS) {
+    KvafBatchGetLocalBufferRelease(local_buffer);
+    return Internal("failed to launch DSA_ROW DirectGet");
+  }
+  if (request.synchronize) {
+    const aclError sync_result = aclrtSynchronizeStream(stream);
+    KvafBatchGetLocalBufferRelease(local_buffer);
+    if (sync_result != ACL_SUCCESS) {
+      return Internal("DSA_ROW DirectGet stream synchronization failed");
+    }
+    LogBatchGetDeviceStatus(impl_->execution, impl_->config.npu_core_count);
+  } else {
+    KvafBatchGetLocalBufferRelease(local_buffer);
+  }
+  return Status::OK();
+}
+
 Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
   if (!impl_->initialized) {
     return Status::NotInitialized("AccessOperator has not been initialized");
@@ -572,6 +692,100 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
     first = next;
   }
   return Status::OK();
+}
+
+Status DefaultAccessOperator::ExecuteDsaFullBlockPut(
+    const DsaFullBlockPutRequest& request) {
+  if (!impl_->initialized) {
+    return Status::NotInitialized("AccessOperator has not been initialized");
+  }
+  if (request.source.device != DeviceKind::kNpu || !request.source.valid() ||
+      request.source_offsets.empty() || request.stream == nullptr ||
+      request.source_offsets.size() != request.lengths.size() ||
+      request.source_offsets.size() != request.destination_addresses.size()) {
+    return InvalidArgument(
+        "DSA_ROW full-block Put does not satisfy the NPU source contract");
+  }
+  for (std::size_t index = 0; index < request.source_offsets.size(); ++index) {
+    const std::uint64_t offset = request.source_offsets[index];
+    const std::uint64_t length = request.lengths[index];
+    if (length == 0 || request.destination_addresses[index] == 0 ||
+        offset > request.source.bytes || length > request.source.bytes - offset) {
+      return InvalidArgument(
+          "DSA_ROW full-block Put source or destination is outside its arena");
+    }
+  }
+
+#if defined(KVAF_ENABLE_AIV_BATCH_PUT)
+  if (impl_->batch_put_transport == nullptr) {
+    return Status::NotImplemented(
+        "DSA_ROW requires an AIV Direct-HCCP BatchPut kernel; configure "
+        "batch_put_kernel_object_path");
+  }
+  const std::size_t rows = request.source_offsets.size();
+  if (!FitsU32(rows)) {
+    return InvalidArgument("DSA_ROW full-block Put row count exceeds the device ABI");
+  }
+  BatchPutExecutionState& execution = impl_->batch_put_execution;
+  Status status = EnsureBatchPutMetadataCapacity(rows, &execution);
+  if (!status.ok()) {
+    return status;
+  }
+  std::uint64_t* const host_offsets = execution.host_metadata.data();
+  std::uint64_t* const host_lengths = host_offsets + rows;
+  std::uint64_t* const host_destinations = host_lengths + rows;
+  std::copy(request.source_offsets.begin(), request.source_offsets.end(),
+            host_offsets);
+  std::copy(request.lengths.begin(), request.lengths.end(), host_lengths);
+  std::copy(request.destination_addresses.begin(),
+            request.destination_addresses.end(), host_destinations);
+
+  const std::size_t metadata_bytes = rows * 3U * sizeof(std::uint64_t);
+  if (aclrtMemcpy(execution.metadata, metadata_bytes,
+                  execution.host_metadata.data(), metadata_bytes,
+                  ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
+    return Internal("failed to upload DSA_ROW full-block Put metadata");
+  }
+
+  KvafBatchPutLocalBuffer* local_buffer = nullptr;
+  if (KvafBatchPutLocalBufferAcquire(
+          impl_->batch_put_transport, const_cast<void*>(request.source.data),
+          request.source.bytes, &local_buffer) != KVAF_BATCH_PUT_SUCCESS ||
+      local_buffer == nullptr) {
+    return Internal("failed to acquire DSA_ROW packed HBM source for BatchPut");
+  }
+
+  KvafExecuteBatchPutKernelArgs arguments{};
+  arguments.input = PointerValue(request.source.data);
+  arguments.input_offsets = PointerValue(execution.metadata);
+  arguments.lengths = PointerValue(
+      static_cast<const std::uint8_t*>(execution.metadata) +
+      rows * sizeof(std::uint64_t));
+  arguments.destination_addresses = PointerValue(
+      static_cast<const std::uint8_t*>(execution.metadata) +
+      rows * 2U * sizeof(std::uint64_t));
+  arguments.core_status = PointerValue(execution.core_status);
+  arguments.input_bytes = request.source.bytes;
+  arguments.row_count = static_cast<std::uint32_t>(rows);
+  arguments.aiv_core_count = impl_->config.npu_core_count;
+  for (KvafBatchPutCoreStatus& core_status : execution.host_core_status) {
+    core_status = KvafBatchPutCoreStatus{};
+  }
+  const int32_t result = KvafExecuteBatchPutSync(
+      local_buffer, &arguments, static_cast<aclrtStream>(request.stream),
+      execution.host_core_status.data(),
+      static_cast<std::uint32_t>(execution.host_core_status.size()));
+  KvafBatchPutLocalBufferRelease(local_buffer);
+  if (result != KVAF_BATCH_PUT_SUCCESS) {
+    LogBatchPutDeviceStatus(execution, impl_->config.npu_core_count, result);
+    return Internal("AIV Direct-HCCP DSA_ROW full-block Put failed");
+  }
+  return Status::OK();
+#else
+  (void)request;
+  return Status::NotImplemented(
+      "DSA_ROW requires KVAF_ENABLE_AIV_BATCH_PUT=ON");
+#endif
 }
 
 }  // namespace kvaf

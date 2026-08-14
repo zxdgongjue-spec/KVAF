@@ -18,6 +18,40 @@ struct BatchPutExecRequest {
   BatchPutExecutionOptions execution;
 };
 
+// DSA_ROW bypasses the legacy KeyId/MetaManager allocation path completely.
+// These two address-mode requests are deliberately expressed in terms of the
+// caller-owned packed NPU buffers and the DSA row-major directory.  They are
+// not part of AccessOperator's virtual interface because only the CANN-backed
+// DefaultAccessOperator can issue Direct-HCCP transfers.
+struct DsaFullBlockPutRequest {
+  // One contiguous packed HBM source.  Each offset/length/destination triplet
+  // describes one full logical DSA block.  destination_addresses are absolute
+  // Host-DDR UBAs allocated by the DSA_ROW arena, never KeyId lookups.
+  ConstBufferView source;
+  std::vector<std::uint64_t> source_offsets;
+  std::vector<std::uint64_t> lengths;
+  std::vector<Address> destination_addresses;
+  void* stream{nullptr};
+};
+
+struct DsaDirectBatchGetRequest {
+  // Device directory planes indexed by flat_index.  token_offsets contains
+  // the packed-token offset inside each logical block, so the AIV kernel reads
+  // `address_table[flat_index] + token_offsets[i] * output_block_bytes`.
+  ConstBufferView address_table;
+  ConstBufferView valid_table;
+  ConstBufferView flat_indices;
+  ConstBufferView token_offsets;
+  ConstBufferView mask;
+  ConstBufferView output_indices;
+  MutableBufferView output;
+  std::uint64_t output_block_bytes{0};
+  // Required when token_offsets is present.  For C8 DSA this is 128.
+  std::uint32_t max_token_offset{0};
+  void* stream{nullptr};
+  bool synchronize{true};
+};
+
 // KV Access Operator 是 Runtime 的数据面依赖。Runtime 管理远端 DDR
 // 生命周期和 Meta 可见性；Operator 只负责初始化链路并执行同步搬运。
 class AccessOperator {
@@ -68,6 +102,13 @@ class DefaultAccessOperator final : public AccessOperator {
   Status Shutdown() override;
   Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
   Status ExecuteBatchPut(const BatchPutExecRequest& request) override;
+
+  // DSA_ROW native data plane.  These methods require the Direct-HCCP AIV
+  // kernels configured at construction time; they intentionally have no ACL
+  // memcpy fallback because falling back would silently reintroduce a
+  // host-side payload path into the production DSA/KVAF route.
+  Status ExecuteDsaFullBlockPut(const DsaFullBlockPutRequest& request);
+  Status ExecuteDsaDirectBatchGet(const DsaDirectBatchGetRequest& request);
 
  private:
   struct Impl;

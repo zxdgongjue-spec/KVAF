@@ -82,6 +82,11 @@ typedef struct KvafExecuteBatchGetKernelArgs {
   uint64_t address_table;       // uint64[table_capacity], absolute Host DDR UBA
   uint64_t valid_table;         // uint8[table_capacity]
   uint64_t indices;             // int32[request_capacity]
+  // Optional int32[request_capacity].  A zero pointer preserves the original
+  // full-block behavior.  DSA_ROW supplies packed-token offsets so the kernel
+  // can read a 656 B token directly from a full 128-token DDR block without a
+  // KSC staging/copy path.
+  uint64_t token_offsets;
   uint64_t mask;                // uint8[request_capacity]
   uint64_t output_indices;      // int32[request_capacity]
   uint64_t output;              // caller-owned HBM output; must match entity
@@ -95,6 +100,9 @@ typedef struct KvafExecuteBatchGetKernelArgs {
   uint32_t block_count;
   // Zero preserves the phase-one ABI and selects one Jetty per AIV core.
   uint32_t jettys_per_core;
+  // Required only when token_offsets is non-null.  It prevents a malformed
+  // DSA descriptor from reading into an adjacent logical DDR block.
+  uint32_t max_token_offset;
 } KvafExecuteBatchGetKernelArgs;
 
 #if defined(__cplusplus)
@@ -104,7 +112,7 @@ static_assert(sizeof(KvafBatchGetQueueState) == KVAF_AIV_BATCH_GET_QUEUE_STATE_B
               "KvafBatchGetQueueState ABI changed");
 static_assert(sizeof(KvafBatchGetDirectUrmaEntity) == 192,
               "KvafBatchGetDirectUrmaEntity ABI changed");
-static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 96,
+static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 112,
               "KvafExecuteBatchGetKernelArgs ABI changed");
 #endif
 

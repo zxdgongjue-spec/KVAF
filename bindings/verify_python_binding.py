@@ -25,10 +25,14 @@ def main() -> int:
             or not hasattr(kvaf, "DeviceAccessTable")
             or not hasattr(kvaf, "AclGraph")
             or not hasattr(kvaf.NpuRuntime, "batch_free")
+            or not hasattr(kvaf, "DsaRowRuntime")
+            or kvaf.DsaRowRuntime.probe_dsa_row_payload_abi()
+            != "torch_npu_packed_v1"
         ):
             raise RuntimeError(
                 "KVAF AIV binding does not export NpuRuntime, DeviceAccessTable, "
-                "AclGraph, and NpuRuntime.batch_free"
+                "AclGraph, NpuRuntime.batch_free, and the production "
+                "DsaRowRuntime torch_npu_packed_v1 payload ABI"
             )
     return 0
 

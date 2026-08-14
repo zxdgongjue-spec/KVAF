@@ -35,6 +35,12 @@ if hasattr(_native, "NpuRuntime"):
     AclGraph = _native.AclGraph
     DeviceAccessTable = _native.DeviceAccessTable
 
+# Only CANN builds with the Direct-HCCP Put route export this production
+# payload binding.  It is intentionally distinct from DsaRowMockRuntime so
+# vLLM can fail closed instead of ever routing packed C8 data through CPU.
+if hasattr(_native, "DsaRowRuntime"):
+    DsaRowRuntime = _native.DsaRowRuntime
+
 __all__ = [
     "AccessTable",
     "Runtime",
@@ -57,3 +63,6 @@ if hasattr(_native, "NpuRuntime"):
         "AclGraph",
         "DeviceAccessTable",
     ]
+
+if hasattr(_native, "DsaRowRuntime"):
+    __all__ += ["DsaRowRuntime"]
