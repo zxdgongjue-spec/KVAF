@@ -38,6 +38,13 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
       KVAF_ENABLE_AIV_BATCH_GET=1
       _GLIBCXX_USE_CXX11_ABI=0
   )
+  # DsaRowRuntime owns the Direct-HCCP BatchPut payload path.  The source
+  # intentionally hides that binding unless the matching data-plane backend
+  # is built, so propagate the option to the pybind target as well.
+  if(KVAF_ENABLE_AIV_BATCH_PUT)
+    target_compile_definitions(_kvaf PRIVATE KVAF_ENABLE_AIV_BATCH_PUT=1)
+    list(APPEND KVAF_PYTHON_BINDING_PREFLIGHT_ARGS --require-dsa-row)
+  endif()
   # _kvaf directly links the AIV host shared object. Keep its build-tree
   # location in the extension RPATH so PYTHONPATH=build/python is sufficient
   # for the direct Python integration test.

@@ -9,6 +9,7 @@ import argparse
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--require-aiv", action="store_true")
+    parser.add_argument("--require-dsa-row", action="store_true")
     options = parser.parse_args()
 
     import kvaf
@@ -25,13 +26,20 @@ def main() -> int:
             or not hasattr(kvaf, "DeviceAccessTable")
             or not hasattr(kvaf, "AclGraph")
             or not hasattr(kvaf.NpuRuntime, "batch_free")
+        ):
+            raise RuntimeError(
+                "KVAF AIV binding does not export NpuRuntime, DeviceAccessTable, "
+                "AclGraph, and NpuRuntime.batch_free"
+            )
+    if options.require_dsa_row:
+        if (
+            not options.require_aiv
             or not hasattr(kvaf, "DsaRowRuntime")
             or kvaf.DsaRowRuntime.probe_dsa_row_payload_abi()
             != "torch_npu_packed_v1"
         ):
             raise RuntimeError(
-                "KVAF AIV binding does not export NpuRuntime, DeviceAccessTable, "
-                "AclGraph, NpuRuntime.batch_free, and the production "
+                "KVAF Direct-HCCP binding does not export the production "
                 "DsaRowRuntime torch_npu_packed_v1 payload ABI"
             )
     return 0
