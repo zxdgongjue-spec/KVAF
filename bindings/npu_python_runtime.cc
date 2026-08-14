@@ -753,8 +753,15 @@ class DsaRowRuntime final {
     const NpuTensorView source =
         GetNpuTensorView(cache, "DSA_ROW full-block Put source cache");
     const std::uint64_t byte_capacity = DictU64(layer_cache, "byte_capacity");
-    if (source.bytes < byte_capacity) {
-      throw py::value_error("DSA_ROW layer cache Tensor is smaller than byte_capacity");
+    const auto binding = bound_layers_.find(layer);
+    if (binding == bound_layers_.end() ||
+        binding->second.byte_capacity != byte_capacity ||
+        binding->second.row_capacity != DictU64(layer_cache, "row_capacity") ||
+        GetNpuTensorView(binding->second.cache,
+                         "DSA_ROW bound resident cache").data != source.data ||
+        source.bytes < byte_capacity) {
+      throw py::value_error(
+          "DSA_ROW layer cache does not match its bound packed-cache view");
     }
 
     std::vector<LayerBlock> blocks;
@@ -981,7 +988,13 @@ class DsaRowRuntime final {
     const py::object output = output_cache[cache_name];
     const NpuTensorView output_view =
         GetNpuTensorView(output, "DSA_ROW DirectGet output cache");
-    if (byte_capacity == 0 || row_capacity == 0 || output_view.bytes < byte_capacity ||
+    const auto binding = bound_layers_.find(output_layer);
+    if (binding == bound_layers_.end() ||
+        binding->second.byte_capacity != byte_capacity ||
+        binding->second.row_capacity != row_capacity ||
+        GetNpuTensorView(binding->second.cache,
+                         "DSA_ROW bound output cache").data != output_view.data ||
+        byte_capacity == 0 || row_capacity == 0 || output_view.bytes < byte_capacity ||
         byte_capacity % layout_.packed_token_bytes != 0 ||
         row_capacity > byte_capacity / layout_.packed_token_bytes) {
       throw py::value_error("DSA_ROW DirectGet output cache capacity is invalid");
@@ -1075,7 +1088,13 @@ class DsaRowRuntime final {
         GetNpuTensorView(mask, "DSA_ROW DirectGet mask");
     const NpuTensorView destination_view = GetNpuTensorView(
         destination_indices, "DSA_ROW DirectGet destination_indices");
-    if (byte_capacity == 0 || row_capacity == 0 ||
+    const auto binding = bound_layers_.find(output_layer);
+    if (binding == bound_layers_.end() ||
+        binding->second.byte_capacity != byte_capacity ||
+        binding->second.row_capacity != row_capacity ||
+        GetNpuTensorView(binding->second.cache,
+                         "DSA_ROW bound output cache").data != output_view.data ||
+        byte_capacity == 0 || row_capacity == 0 ||
         output_view.bytes < byte_capacity ||
         byte_capacity % layout_.packed_token_bytes != 0 ||
         row_capacity > byte_capacity / layout_.packed_token_bytes ||
