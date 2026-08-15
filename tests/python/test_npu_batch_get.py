@@ -324,7 +324,14 @@ def main() -> int:
 
         def execute(output: object, stream: object | None = None) -> None:
             runtime.batch_get(
-                device_table, indices, offsets, mask, output_indices, output, stream
+                address_table,
+                valid_table,
+                indices,
+                offsets,
+                mask,
+                output_indices,
+                output,
+                stream,
             )
 
         print("RUNTIME_NPU_PHASE_BEGIN phase=runtime_batch_get")

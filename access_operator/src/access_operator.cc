@@ -169,7 +169,7 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
       request.device_access_table.addresses.bytes % sizeof(Address) != 0 ||
       request.device_access_table.valid.bytes !=
           request.device_access_table.addresses.bytes / sizeof(Address) ||
-      request.output_block_bytes == 0 || exec.host_access_table.size == 0 ||
+      request.output_block_bytes == 0 ||
       request.indices.bytes % sizeof(std::int32_t) != 0 ||
       request.offsets.bytes != request.indices.bytes ||
       request.output_indices.bytes != request.indices.bytes ||

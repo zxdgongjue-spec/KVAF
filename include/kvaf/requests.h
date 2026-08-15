@@ -52,6 +52,9 @@ struct AccessTableDeviceView {
 };
 
 struct BatchGetRequest {
+  // CPU BatchGet 必须提供有效 handle。NPU BatchGet 使用 DeviceAccessTable
+  // 重载时也会提供 handle，以便 Runtime 验证 Host 表生命周期；
+  // 直接传入 addresses/valid Tensor 时 handle 可为空。
   AccessTableHandle access_table;
 
   // indices/offsets/output_indices 为 int32[n]；offsets 是表项内的字节偏移。
@@ -64,7 +67,7 @@ struct BatchGetRequest {
   MutableBufferView output;
   std::uint64_t output_block_bytes{0};
 
-  // CPU path 留空。NPU path 必须提供与 handle 对应的稳定 Device 表。
+  // CPU path 留空。NPU path 必须提供调用方持有的稳定 Device 表。
   AccessTableDeviceView device_access_table;
 };
 
@@ -102,6 +105,7 @@ struct BatchGetExecutionOptions {
 
 // Runtime 向 AccessOperator 提交的 BatchGet 描述。
 struct BatchGetExecRequest {
+  // 直接传入 NPU addresses/valid Tensor 时 Host view 可为空。
   AccessTableView host_access_table;
   const BatchGetRequest* request{nullptr};
   BatchGetExecutionOptions execution;

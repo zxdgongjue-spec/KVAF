@@ -243,9 +243,12 @@ Status Runtime::BatchGet(const BatchGetRequest& request,
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
-  const AccessTableState* table = FindAccessTable(request.access_table);
-  if (table == nullptr) {
-    return Status::NotFound("AccessTable handle was not found");
+  const AccessTableState* table = nullptr;
+  if (request.access_table.opaque != 0) {
+    table = FindAccessTable(request.access_table);
+    if (table == nullptr) {
+      return Status::NotFound("AccessTable handle was not found");
+    }
   }
   if (!request.indices.has_elements<std::int32_t>() ||
       !request.offsets.has_elements<std::int32_t>() ||
@@ -289,18 +292,28 @@ Status Runtime::BatchGet(const BatchGetRequest& request,
       return Status::InvalidArgument(
           "NPU BatchGet requires matching caller-provided device AccessTable buffers");
     }
-    if (!table->has_uniform_valid_length ||
-        (table->has_valid_entries &&
-         table->uniform_valid_length != kBatchGetAddressTableEntryBytes)) {
+    if (table != nullptr &&
+        (!table->has_uniform_valid_length ||
+         (table->has_valid_entries &&
+          table->uniform_valid_length != kBatchGetAddressTableEntryBytes))) {
       return Status::InvalidArgument(
           "NPU BatchGet requires 128 * 656-byte AccessTable entries");
     }
-  } else if (!request.device_access_table.empty()) {
-    return Status::InvalidArgument("CPU BatchGet must not provide device AccessTable buffers");
+  } else {
+    if (table == nullptr) {
+      return Status::InvalidArgument("CPU BatchGet requires an AccessTable handle");
+    }
+    if (!request.device_access_table.empty()) {
+      return Status::InvalidArgument(
+          "CPU BatchGet must not provide device AccessTable buffers");
+    }
   }
 
-  const AccessTableView view{table->addresses.data(), table->lengths.data(),
-                             table->valid.data(), table->addresses.size()};
+  AccessTableView view{};
+  if (table != nullptr) {
+    view = AccessTableView{table->addresses.data(), table->lengths.data(),
+                           table->valid.data(), table->addresses.size()};
+  }
   return access_operator_.ExecuteBatchGet(
       BatchGetExecRequest{view, &request, execution});
 }
