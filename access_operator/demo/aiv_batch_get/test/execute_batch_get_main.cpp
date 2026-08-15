@@ -175,13 +175,16 @@ void AccumulateQueueExpectations(const std::vector<uint8_t> &mask, const Options
     for (uint32_t request = begin; request < end; ++request) {
       active += mask[request] != 0U;
     }
-    const uint64_t total_posts = (active + 31U) / 32U;
+    const uint64_t total_posts =
+        (active + KVAF_AIV_BATCH_GET_WQES_PER_POST - 1U) /
+        KVAF_AIV_BATCH_GET_WQES_PER_POST;
     for (uint32_t jetty = 0U; jetty < options.jettys_per_core; ++jetty) {
       uint64_t assigned_requests = 0U;
       for (uint64_t post = jetty; post < total_posts;
            post += options.jettys_per_core) {
-        assigned_requests +=
-            std::min<uint64_t>(32U, active - post * 32U);
+        assigned_requests += std::min<uint64_t>(
+            KVAF_AIV_BATCH_GET_WQES_PER_POST,
+            active - post * KVAF_AIV_BATCH_GET_WQES_PER_POST);
       }
       QueueExpectation &expectation =
           (*expectations)[static_cast<uint64_t>(core) *

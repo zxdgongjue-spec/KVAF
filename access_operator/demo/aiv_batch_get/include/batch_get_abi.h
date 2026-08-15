@@ -10,6 +10,15 @@ enum {
   KVAF_AIV_BATCH_GET_QUEUE_STATE_BYTES = 64,
   KVAF_AIV_BATCH_GET_MAX_AIV_CORES = 48,
   KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE = 2,
+  // ExecuteBatchGet forms this many 64-B READ WQEs before ringing one
+  // USER_CTL SQ doorbell.  This is a scheduling constant, not a wire-layout
+  // or public-struct ABI field: the AIV kernel and its graph test include this
+  // header so a rebuilt kernel and verifier always agree on queue accounting.
+  //
+  // 128 WQEs consume 8 KiB per UB bank.  With two banks plus the fixed
+  // 16,384-entry descriptor arrays and validation scratch, the total remains
+  // 8 KiB below KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES (160 KiB).
+  KVAF_AIV_BATCH_GET_WQES_PER_POST = 128,
   // Shared local-memory contract used by the AIV kernel and launcher.
   KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES = 160 * 1024,
 };

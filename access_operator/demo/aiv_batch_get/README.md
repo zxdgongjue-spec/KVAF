@@ -55,7 +55,7 @@ addresses receive a new local MR and entity table but reuse the transport.
 ## What is included
 
 - `kernel/execute_batch_get_aiv.asc`: SIMT-compacts requests,
-  caches each active request's table index and request ID in UB, generates 32
+  caches each active request's table index and request ID in UB, generates 128
   UDMA READ WQEs in parallel, and overlaps vector fill, MTE3 UB-to-SQ copies,
   and scalar doorbells with two UB banks. It never uses MTE to dereference Host
   DDR.
@@ -83,7 +83,7 @@ UB arrays containing the active table indices and original request IDs. The
 caller must guarantee that each AIV owns at most 16384 mask entries whose value
 is nonzero. Before touching the SQ, the kernel rejects an active count beyond
 that capacity or a per-Jetty assignment that fills the entire SQ.
-The phase-two scheduler assigns complete 32-WQE posts to the core's Jettys in
+The phase-two scheduler assigns complete 128-WQE posts to the core's Jettys in
 round-robin order. Each Jetty has an independent persistent SQ producer and CQ
 consumer index. Only the last READ assigned to each used Jetty requests a CQE;
 the kernel drains one CQE from every used Jetty before reporting the batch
@@ -137,6 +137,15 @@ DEVICE_ID=0 DYNAMIC_OUTPUT_SMOKE=1 WARMUP=1 ITERATIONS=1 \
 bash scripts/run_execute_batch_get.sh
 
 DEVICE_ID=0 GRAPH_REPLAYS=4 GRAPH_WARMUP=1 GRAPH_ITERATIONS=5 \
+bash scripts/run_execute_batch_get_graph.sh
+
+# B=10 C8 worst-case DirectGet envelope: 10 x 2048 packed 656-B tokens.
+# This is also the acceptance test for the 128-WQE submission grouping.  It
+# validates every replay's output bytes, core status and persistent SQ/CQ
+# accounting, so an accidentally stale 32-WQE kernel object cannot pass.
+DEVICE_ID=0 TABLE_CAPACITY=20480 REQUESTS=20480 OUTPUT_ROWS=20480 \
+BLOCK_BYTES=656 SOURCE_STRIDE=656 AIV_CORES=2 JETTYS_PER_CORE=2 \
+ACTIVE_PERCENT=100 GRAPH_REPLAYS=4 GRAPH_WARMUP=1 GRAPH_ITERATIONS=5 \
 bash scripts/run_execute_batch_get_graph.sh
 ```
 
