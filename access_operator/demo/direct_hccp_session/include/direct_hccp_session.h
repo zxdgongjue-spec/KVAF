@@ -17,15 +17,18 @@ struct DirectHccpSession;
 bool VerboseLoggingEnabled();
 void VerboseLog(const char* format, ...);
 
-// Acquires the RA/HDC service for {physical_device_id, hdc_type}.  The first
-// caller performs RaInit(host), rtOpenNetService and RaInit(device); later
-// callers only take a reference.  The caller must pair every success with
-// ReleaseDirectHccpSession after all of its RaCtx resources are gone.
+// Acquires the RA/HDC service for {physical_device_id, hdc_type}. The first
+// caller initializes host RA and the HDC service. Device RA is either owned by
+// KVAF after a successful RaInit or borrowed when HCCL already owns a
+// compatible device RA. Later callers only take a reference. The caller must
+// pair every success with ReleaseDirectHccpSession after all of its RaCtx
+// resources are gone.
 bool AcquireDirectHccpSession(uint32_t physical_device_id, uint32_t hdc_type,
                               DirectHccpSession **session);
 
-// Releases a reference.  The last release tears down device and host RA in
-// that order.  Callers keep ownership of their own data-plane resources.
+// Releases a reference. The last release tears down only RA instances owned by
+// KVAF; a borrowed HCCL device RA remains live. Callers keep ownership of their
+// own data-plane resources.
 void ReleaseDirectHccpSession(DirectHccpSession *session);
 
 }  // namespace kvaf::direct_hccp
