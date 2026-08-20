@@ -58,11 +58,11 @@ struct BatchGetRequest {
   AccessTableHandle access_table;
 
   // indices/offsets/output_indices 为 int32[n]；offsets 是表项内的字节偏移。
+  // miss_count 为 int32[1]，只有三个请求数组的 [0, miss_count) 前缀有效。
   // 每个有效请求固定搬运 656B，offset + 656 不得越过 128 * 656B 表项。
-  // mask 为空时所有请求均有效。
   ConstBufferView indices;
   ConstBufferView offsets;
-  ConstBufferView mask;
+  ConstBufferView miss_count;
   ConstBufferView output_indices;
   MutableBufferView output;
   std::uint64_t output_block_bytes{0};

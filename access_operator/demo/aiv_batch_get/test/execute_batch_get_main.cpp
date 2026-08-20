@@ -36,8 +36,7 @@ struct Options {
   uint32_t jettys_per_core = 2U;
   uint32_t warmup = 10U;
   uint32_t iterations = 50U;
-  uint32_t mask_every = 0U;
-  uint32_t active_every = 0U;
+  uint32_t miss_count = UINT32_MAX;
   uint32_t active_percent = 5U;
   // Zero selects the normal launch/synchronize test.  A nonzero value
   // captures the ExecuteBatchGet launch once, then replays the captured model
@@ -57,10 +56,7 @@ uint8_t PatternByte(uint32_t slot, uint32_t byte) {
 }
 
 bool RequestIsActive(uint32_t request, const Options &options) {
-  if (options.active_every != 0U) {
-    return request % options.active_every == 0U;
-  }
-  return options.mask_every == 0U || request % options.mask_every != 0U;
+  return request < options.miss_count;
 }
 
 bool ParseU32(const char *text, uint32_t *value) {
@@ -103,10 +99,8 @@ bool ParseOptions(int argc, char **argv, Options *options) {
       if (!ParseU32(argv[++index], &options->warmup)) return false;
     } else if (arg == "--iterations" && index + 1 < argc) {
       if (!ParseU32(argv[++index], &options->iterations)) return false;
-    } else if (arg == "--mask-every" && index + 1 < argc) {
-      if (!ParseU32(argv[++index], &options->mask_every)) return false;
-    } else if (arg == "--active-every" && index + 1 < argc) {
-      if (!ParseU32(argv[++index], &options->active_every)) return false;
+    } else if (arg == "--miss-count" && index + 1 < argc) {
+      if (!ParseU32(argv[++index], &options->miss_count)) return false;
     } else if (arg == "--active-percent" && index + 1 < argc) {
       if (!ParseU32(argv[++index], &options->active_percent)) return false;
     } else if (arg == "--graph-replays" && index + 1 < argc) {
@@ -121,16 +115,21 @@ bool ParseOptions(int argc, char **argv, Options *options) {
       return false;
     }
   }
-  return !options->kernel.empty() && ReadEnvU32("DEVICE_ID", &options->device) &&
+  const bool parsed =
+      !options->kernel.empty() && ReadEnvU32("DEVICE_ID", &options->device) &&
          ReadEnvU32("TABLE_CAPACITY", &options->table_capacity) && ReadEnvU32("REQUESTS", &options->requests) &&
          ReadEnvU32("OUTPUT_ROWS", &options->output_rows) && ReadEnvU32("BLOCK_BYTES", &options->block_bytes) &&
          ReadEnvU32("SOURCE_STRIDE", &options->source_stride) && ReadEnvU32("AIV_CORES", &options->aiv_cores) &&
          ReadEnvU32("JETTYS_PER_CORE", &options->jettys_per_core) &&
          ReadEnvU32("WARMUP", &options->warmup) && ReadEnvU32("ITERATIONS", &options->iterations) &&
-         ReadEnvU32("MASK_EVERY", &options->mask_every) &&
-         ReadEnvU32("ACTIVE_EVERY", &options->active_every) &&
+         ReadEnvU32("MISS_COUNT", &options->miss_count) &&
          ReadEnvU32("ACTIVE_PERCENT", &options->active_percent) &&
-         ReadEnvU32("DYNAMIC_OUTPUT_SMOKE", &options->dynamic_output_smoke) && options->table_capacity != 0U &&
+         ReadEnvU32("DYNAMIC_OUTPUT_SMOKE", &options->dynamic_output_smoke);
+  if (!parsed) return false;
+  if (options->miss_count == UINT32_MAX) {
+    options->miss_count = options->requests;
+  }
+  return options->table_capacity != 0U &&
          options->requests != 0U && options->requests <= options->output_rows && options->output_rows != 0U &&
          options->block_bytes == kTransferBytes &&
          options->source_stride == kEntryBytes &&
@@ -140,7 +139,8 @@ bool ParseOptions(int argc, char **argv, Options *options) {
          options->aiv_cores <= options->requests && options->iterations != 0U &&
          options->active_percent >= 1U && options->active_percent <= 100U &&
          options->graph_iterations != 0U && options->dynamic_output_smoke <= 1U &&
-         (options->mask_every == 0U || options->active_every == 0U);
+         options->miss_count <= options->requests &&
+         options->miss_count <= static_cast<uint32_t>(INT32_MAX);
 }
 
 bool CheckAcl(aclError error, const char *step) {
@@ -171,16 +171,16 @@ struct QueueExpectation {
 void AccumulateQueueExpectations(const std::vector<uint8_t> &mask, const Options &options,
                                  std::vector<QueueExpectation> *expectations) {
   if (expectations == nullptr) return;
+  const uint64_t miss_count = static_cast<uint64_t>(
+      std::count_if(mask.begin(), mask.end(),
+                    [](uint8_t entry) { return entry != 0U; }));
   for (uint32_t core = 0U; core < options.aiv_cores; ++core) {
     const uint32_t begin = static_cast<uint32_t>(
-        (static_cast<uint64_t>(options.requests) * core) / options.aiv_cores);
+        (miss_count * core) / options.aiv_cores);
     const uint32_t end = static_cast<uint32_t>(
-        (static_cast<uint64_t>(options.requests) * (core + 1U)) /
+        (miss_count * (core + 1U)) /
         options.aiv_cores);
-    uint64_t active = 0U;
-    for (uint32_t request = begin; request < end; ++request) {
-      active += mask[request] != 0U;
-    }
+    const uint64_t active = end - begin;
     const uint64_t total_posts = (active + 31U) / 32U;
     for (uint32_t jetty = 0U; jetty < options.jettys_per_core; ++jetty) {
       uint64_t assigned_requests = 0U;
@@ -211,11 +211,11 @@ bool Validate(const std::vector<uint8_t> &output, const std::vector<uint64_t> &a
   const uint64_t active_total =
       static_cast<uint64_t>(std::count_if(mask.begin(), mask.end(), [](uint8_t entry) { return entry != 0U; }));
   for (uint32_t core = 0U; core < options.aiv_cores; ++core) {
-    const uint32_t begin = static_cast<uint32_t>((static_cast<uint64_t>(options.requests) * core) / options.aiv_cores);
-    const uint32_t end = static_cast<uint32_t>((static_cast<uint64_t>(options.requests) * (core + 1U)) /
-                                               options.aiv_cores);
-    uint64_t active = 0U;
-    for (uint32_t request = begin; request < end; ++request) active += mask[request] != 0U;
+    const uint32_t begin = static_cast<uint32_t>(
+        (active_total * core) / options.aiv_cores);
+    const uint32_t end = static_cast<uint32_t>(
+        (active_total * (core + 1U)) / options.aiv_cores);
+    const uint64_t active = end - begin;
     const auto &status = statuses[core];
     const QueueExpectation &primary_expectation =
         expectations[static_cast<uint64_t>(core) * options.jettys_per_core];
@@ -302,7 +302,7 @@ void PrepareGraphReplayInputs(uint32_t replay, const uint8_t *source, const Opti
                               std::vector<int32_t> *offsets,
                               std::vector<uint8_t> *mask, std::vector<int32_t> *output_indices) {
   const uint32_t address_shift = replay % options.table_capacity;
-  const bool sparse_mask = options.mask_every != 0U || options.active_every != 0U;
+  const bool sparse_prefix = options.miss_count != options.requests;
   for (uint32_t entry = 0U; entry < options.table_capacity; ++entry) {
     const uint32_t source_slot = (entry + address_shift) % options.table_capacity;
     (*address_table)[entry] = reinterpret_cast<uint64_t>(source) +
@@ -314,20 +314,26 @@ void PrepareGraphReplayInputs(uint32_t replay, const uint8_t *source, const Opti
         static_cast<int32_t>(((request + replay) % kRowsPerEntry) *
                              kTransferBytes);
     (*mask)[request] = RequestIsActive(request, options) ? 1U : 0U;
-    // Keep sparse output rows stable so a row written by an earlier replay is
-    // never reinterpreted as a masked row during byte-for-byte validation.
-    const uint32_t output_row = sparse_mask ? request : request + replay;
+    // Keep inactive output rows stable so a row written by an earlier replay
+    // is never reinterpreted as inactive during byte-for-byte validation.
+    const uint32_t output_row = sparse_prefix ? request : request + replay;
     (*output_indices)[request] = static_cast<int32_t>(output_row % options.output_rows);
   }
 }
 
-bool CopyGraphReplayInputs(aclrtStream stream, void *device_address_table, void *device_indices, void *device_mask,
+bool CopyGraphReplayInputs(aclrtStream stream, void *device_address_table, void *device_indices,
+                           void *device_miss_count,
                            void *device_offsets, void *device_output_indices,
                            const std::vector<uint64_t> &address_table,
                            const std::vector<int32_t> &indices,
                            const std::vector<int32_t> &offsets,
                            const std::vector<uint8_t> &mask,
-                           const std::vector<int32_t> &output_indices) {
+                           const std::vector<int32_t> &output_indices,
+                           int32_t *miss_count) {
+  if (miss_count == nullptr) return false;
+  *miss_count = static_cast<int32_t>(
+      std::count_if(mask.begin(), mask.end(),
+                    [](uint8_t entry) { return entry != 0U; }));
   return CheckAcl(aclrtMemcpyAsync(device_address_table, address_table.size() * sizeof(uint64_t),
                                    address_table.data(), address_table.size() * sizeof(uint64_t),
                                    ACL_MEMCPY_HOST_TO_DEVICE, stream),
@@ -338,9 +344,10 @@ bool CopyGraphReplayInputs(aclrtStream stream, void *device_address_table, void 
          CheckAcl(aclrtMemcpyAsync(device_offsets, offsets.size() * sizeof(int32_t), offsets.data(),
                                    offsets.size() * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE, stream),
                   "graph copy offsets") &&
-         CheckAcl(aclrtMemcpyAsync(device_mask, mask.size(), mask.data(), mask.size(), ACL_MEMCPY_HOST_TO_DEVICE,
-                                   stream),
-                  "graph copy mask") &&
+         CheckAcl(aclrtMemcpyAsync(device_miss_count, sizeof(*miss_count),
+                                   miss_count, sizeof(*miss_count),
+                                   ACL_MEMCPY_HOST_TO_DEVICE, stream),
+                  "graph copy miss_count") &&
          CheckAcl(aclrtMemcpyAsync(device_output_indices, output_indices.size() * sizeof(int32_t),
                                    output_indices.data(), output_indices.size() * sizeof(int32_t),
                                    ACL_MEMCPY_HOST_TO_DEVICE, stream),
@@ -355,8 +362,8 @@ int main(int argc, char **argv) {
   if (!ParseOptions(argc, argv, &options)) {
     std::cerr << "usage: kvaf_execute_batch_get_test --kernel <kvaf_execute_batch_get_kernels.o> "
                  "[--device N --table-capacity N --requests N --output-rows N --block-bytes N "
-                 "--source-stride N --aiv-cores N --jettys-per-core N --warmup N --iterations N --mask-every N "
-                 "--active-every N --active-percent N "
+                 "--source-stride N --aiv-cores N --jettys-per-core N --warmup N --iterations N --miss-count N "
+                 "--active-percent N "
                  "--graph-replays N --graph-warmup N --graph-iterations N --dynamic-output-smoke 0|1]\n";
     return 2;
   }
@@ -382,9 +389,9 @@ int main(int argc, char **argv) {
   void *device_valid_table = nullptr;
   void *device_indices = nullptr;
   void *device_offsets = nullptr;
-  void *device_mask = nullptr;
+  void *device_miss_count = nullptr;
   void *device_eager_indices = nullptr;
-  void *device_eager_mask = nullptr;
+  void *device_eager_miss_counts = nullptr;
   void *device_output_indices = nullptr;
   void *device_status = nullptr;
   void *device_queue = nullptr;
@@ -404,13 +411,14 @@ int main(int argc, char **argv) {
   std::vector<int32_t> offsets(options.requests);
   std::vector<uint8_t> mask(options.requests, 1U);
   std::vector<int32_t> output_indices(options.requests);
+  int32_t miss_count = static_cast<int32_t>(options.miss_count);
   std::vector<KvafBatchGetCoreStatus> statuses(options.aiv_cores);
   std::vector<KvafBatchGetQueueState> queues(
       static_cast<uint64_t>(options.aiv_cores) * options.jettys_per_core);
   std::vector<QueueExpectation> queue_expectations(queues.size());
   std::vector<int32_t> eager_indices;
   std::vector<uint8_t> eager_masks;
-  std::vector<uint64_t> eager_active_counts;
+  std::vector<int32_t> eager_miss_counts;
   std::vector<uint8_t> output(output_bytes);
   std::vector<double> elapsed_ms;
   uint64_t measured_active_total = 0U;
@@ -469,7 +477,8 @@ int main(int argc, char **argv) {
       !CheckAcl(aclrtMalloc(&device_valid_table, valid_table.size(), ACL_MEM_MALLOC_HUGE_FIRST), "allocate valid_table") ||
       !CheckAcl(aclrtMalloc(&device_indices, indices.size() * sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST), "allocate indices") ||
       !CheckAcl(aclrtMalloc(&device_offsets, offsets.size() * sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST), "allocate offsets") ||
-      !CheckAcl(aclrtMalloc(&device_mask, mask.size(), ACL_MEM_MALLOC_HUGE_FIRST), "allocate mask") ||
+      !CheckAcl(aclrtMalloc(&device_miss_count, sizeof(miss_count), ACL_MEM_MALLOC_HUGE_FIRST),
+                "allocate miss_count") ||
       !CheckAcl(aclrtMalloc(&device_output_indices, output_indices.size() * sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST),
                 "allocate output_indices") ||
       !CheckAcl(aclrtMalloc(&device_status, statuses.size() * sizeof(statuses[0]), ACL_MEM_MALLOC_HUGE_FIRST),
@@ -484,7 +493,8 @@ int main(int argc, char **argv) {
                              indices.size() * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE), "copy indices") ||
       !CheckAcl(aclrtMemcpy(device_offsets, offsets.size() * sizeof(int32_t), offsets.data(),
                              offsets.size() * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE), "copy offsets") ||
-      !CheckAcl(aclrtMemcpy(device_mask, mask.size(), mask.data(), mask.size(), ACL_MEMCPY_HOST_TO_DEVICE), "copy mask") ||
+      !CheckAcl(aclrtMemcpy(device_miss_count, sizeof(miss_count), &miss_count,
+                             sizeof(miss_count), ACL_MEMCPY_HOST_TO_DEVICE), "copy miss_count") ||
       !CheckAcl(aclrtMemcpy(device_output_indices, output_indices.size() * sizeof(int32_t), output_indices.data(),
                              output_indices.size() * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE), "copy output_indices") ||
       !CheckAcl(aclrtMemset(output_hbm, output_bytes, 0, output_bytes), "clear output") ||
@@ -513,13 +523,13 @@ int main(int argc, char **argv) {
   if (!CheckKvaf(KvafExecuteBatchGetLoadKernel(options.kernel.c_str()), "load ExecuteBatchGet kernel")) goto cleanup;
   std::cout << "PHASE_KERNEL_REGISTERED cores=" << options.aiv_cores
             << " jettys_per_core=" << options.jettys_per_core
-            << " contract=address_table_absolute_uba_plus_mask_plus_output_scatter\n";
+            << " contract=address_table_absolute_uba_plus_miss_count_prefix_plus_output_scatter\n";
 
   args.address_table = reinterpret_cast<uint64_t>(device_address_table);
   args.valid_table = reinterpret_cast<uint64_t>(device_valid_table);
   args.indices = reinterpret_cast<uint64_t>(device_indices);
   args.offsets = reinterpret_cast<uint64_t>(device_offsets);
-  args.mask = reinterpret_cast<uint64_t>(device_mask);
+  args.miss_count = reinterpret_cast<uint64_t>(device_miss_count);
   args.output_indices = reinterpret_cast<uint64_t>(device_output_indices);
   args.output = reinterpret_cast<uint64_t>(output_hbm);
   args.core_status = reinterpret_cast<uint64_t>(device_status);
@@ -618,7 +628,7 @@ int main(int argc, char **argv) {
     // per-replay updates below are writes into the already-fixed device
     // tensors, just as an upstream graph node would do.
     std::cout << "GRAPH_CAPTURE_CONTRACT api=aclmdlRI fixed_tensor_addresses=1 "
-                 "dynamic_device_contents=address_table_indices_mask_output_indices "
+                 "dynamic_device_contents=address_table_indices_miss_count_output_indices "
                  "replays="
               << options.graph_replays << " aiv_cores=" << options.aiv_cores
               << " jettys_per_core=" << options.jettys_per_core
@@ -645,8 +655,10 @@ int main(int argc, char **argv) {
 
     for (uint32_t replay = 0U; replay < options.graph_replays; ++replay) {
       PrepareGraphReplayInputs(replay, source, options, &address_table, &indices, &offsets, &mask, &output_indices);
-      if (!CopyGraphReplayInputs(stream, device_address_table, device_indices, device_mask, device_offsets,
-                                 device_output_indices, address_table, indices, offsets, mask, output_indices)) {
+      if (!CopyGraphReplayInputs(stream, device_address_table, device_indices,
+                                 device_miss_count, device_offsets,
+                                 device_output_indices, address_table, indices,
+                                 offsets, mask, output_indices, &miss_count)) {
         goto cleanup;
       }
       std::cout << "GRAPH_REPLAY_INPUT_UPDATED replay=" << replay
@@ -688,8 +700,10 @@ int main(int argc, char **argv) {
       const uint32_t epoch = options.graph_replays + warmup;
       std::cout << "GRAPH_PERF_WARMUP_STEP_BEGIN iteration=" << warmup << " epoch=" << epoch << '\n';
       PrepareGraphReplayInputs(epoch, source, options, &address_table, &indices, &offsets, &mask, &output_indices);
-      if (!CopyGraphReplayInputs(stream, device_address_table, device_indices, device_mask, device_offsets,
-                                 device_output_indices, address_table, indices, offsets, mask, output_indices)) goto cleanup;
+      if (!CopyGraphReplayInputs(stream, device_address_table, device_indices,
+                                 device_miss_count, device_offsets,
+                                 device_output_indices, address_table, indices,
+                                 offsets, mask, output_indices, &miss_count)) goto cleanup;
       std::cout << "GRAPH_PERF_WARMUP_INPUT_ENQUEUED iteration=" << warmup << '\n';
       AccumulateQueueExpectations(mask, options, &queue_expectations);
       if (!CheckAcl(aclmdlRIExecuteAsync(graph_model, stream), "graph performance warmup replay")) goto cleanup;
@@ -705,8 +719,10 @@ int main(int argc, char **argv) {
       std::cout << "GRAPH_PERF_MEASURED_STEP_BEGIN iteration=" << iteration << " epoch=" << epoch << '\n';
       PrepareGraphReplayInputs(epoch, source, options, &address_table, &indices, &offsets, &mask, &output_indices);
       const auto begin = std::chrono::steady_clock::now();
-      if (!CopyGraphReplayInputs(stream, device_address_table, device_indices, device_mask, device_offsets,
-                                 device_output_indices, address_table, indices, offsets, mask, output_indices)) goto cleanup;
+      if (!CopyGraphReplayInputs(stream, device_address_table, device_indices,
+                                 device_miss_count, device_offsets,
+                                 device_output_indices, address_table, indices,
+                                 offsets, mask, output_indices, &miss_count)) goto cleanup;
       std::cout << "GRAPH_PERF_MEASURED_INPUT_ENQUEUED iteration=" << iteration << '\n';
       AccumulateQueueExpectations(mask, options, &queue_expectations);
       if (!CheckAcl(aclmdlRIExecuteAsync(graph_model, stream), "measured graph replay")) goto cleanup;
@@ -751,13 +767,13 @@ int main(int argc, char **argv) {
   }
 
   // Match the Python performance benchmark: materialize one independent
-  // random indices/mask pair for every warmup and measured sample before the
-  // benchmark starts.  Keeping the pairs in flat device buffers lets the
+  // random indices/miss-count pair for every warmup and measured sample before
+  // the benchmark starts. Keeping the inputs in flat device buffers lets the
   // timed loop select a sample by pointer only; random generation and H2D
   // copies remain outside host_submit_to_stream_completion.
   eager_indices.resize(static_cast<size_t>(eager_request_entries));
   eager_masks.resize(static_cast<size_t>(eager_request_entries));
-  eager_active_counts.resize(static_cast<size_t>(eager_sample_count));
+  eager_miss_counts.resize(static_cast<size_t>(eager_sample_count));
   {
     std::mt19937 random(kEagerRandomSeed);
     std::uniform_int_distribution<uint32_t> index_distribution(
@@ -771,30 +787,38 @@ int main(int argc, char **argv) {
       for (uint32_t request = 0U; request < options.requests; ++request) {
         eager_indices[sample_offset + request] =
             static_cast<int32_t>(index_distribution(random));
-        const uint8_t is_active = mask_distribution(random) ? 1U : 0U;
-        eager_masks[sample_offset + request] = is_active;
-        active += is_active;
+        active += mask_distribution(random) ? 1U : 0U;
       }
-      eager_active_counts[static_cast<size_t>(sample)] = active;
+      std::fill_n(eager_masks.data() + sample_offset, options.requests, 0U);
+      std::fill_n(eager_masks.data() + sample_offset,
+                  static_cast<size_t>(active), 1U);
+      eager_miss_counts[static_cast<size_t>(sample)] =
+          static_cast<int32_t>(active);
     }
   }
   if (!CheckAcl(aclrtMalloc(&device_eager_indices,
                              eager_indices.size() * sizeof(eager_indices[0]),
                              ACL_MEM_MALLOC_HUGE_FIRST),
                 "allocate eager sample indices") ||
-      !CheckAcl(aclrtMalloc(&device_eager_mask, eager_masks.size(),
+      !CheckAcl(aclrtMalloc(&device_eager_miss_counts,
+                             eager_miss_counts.size() *
+                                 sizeof(eager_miss_counts[0]),
                              ACL_MEM_MALLOC_HUGE_FIRST),
-                "allocate eager sample masks") ||
+                "allocate eager sample miss counts") ||
       !CheckAcl(aclrtMemcpy(device_eager_indices,
                              eager_indices.size() * sizeof(eager_indices[0]),
                              eager_indices.data(),
                              eager_indices.size() * sizeof(eager_indices[0]),
                              ACL_MEMCPY_HOST_TO_DEVICE),
                 "copy eager sample indices") ||
-      !CheckAcl(aclrtMemcpy(device_eager_mask, eager_masks.size(),
-                             eager_masks.data(), eager_masks.size(),
+      !CheckAcl(aclrtMemcpy(device_eager_miss_counts,
+                             eager_miss_counts.size() *
+                                 sizeof(eager_miss_counts[0]),
+                             eager_miss_counts.data(),
+                             eager_miss_counts.size() *
+                                 sizeof(eager_miss_counts[0]),
                              ACL_MEMCPY_HOST_TO_DEVICE),
-                "copy eager sample masks")) {
+                "copy eager sample miss counts")) {
     goto cleanup;
   }
   std::cout << "EAGER_RANDOM_INPUTS_READY samples=" << eager_sample_count
@@ -808,7 +832,9 @@ int main(int argc, char **argv) {
         static_cast<size_t>(static_cast<uint64_t>(warmup) * options.requests);
     args.indices = reinterpret_cast<uint64_t>(device_eager_indices) +
                    sample_offset * sizeof(eager_indices[0]);
-    args.mask = reinterpret_cast<uint64_t>(device_eager_mask) + sample_offset;
+    args.miss_count =
+        reinterpret_cast<uint64_t>(device_eager_miss_counts) +
+        static_cast<size_t>(warmup) * sizeof(eager_miss_counts[0]);
     std::copy_n(eager_indices.data() + sample_offset, options.requests,
                 indices.data());
     std::copy_n(eager_masks.data() + sample_offset, options.requests,
@@ -842,12 +868,15 @@ int main(int argc, char **argv) {
         static_cast<size_t>(sample * options.requests);
     args.indices = reinterpret_cast<uint64_t>(device_eager_indices) +
                    sample_offset * sizeof(eager_indices[0]);
-    args.mask = reinterpret_cast<uint64_t>(device_eager_mask) + sample_offset;
+    args.miss_count =
+        reinterpret_cast<uint64_t>(device_eager_miss_counts) +
+        static_cast<size_t>(sample) * sizeof(eager_miss_counts[0]);
     std::copy_n(eager_indices.data() + sample_offset, options.requests,
                 indices.data());
     std::copy_n(eager_masks.data() + sample_offset, options.requests,
                 mask.data());
-    measured_active_total += eager_active_counts[static_cast<size_t>(sample)];
+    measured_active_total += static_cast<uint64_t>(
+        eager_miss_counts[static_cast<size_t>(sample)]);
     AccumulateQueueExpectations(mask, options, &queue_expectations);
     const auto begin = std::chrono::steady_clock::now();
     if (!CheckKvaf(KvafExecuteBatchGetLaunch(&args, stream), "measured launch") ||
@@ -896,9 +925,9 @@ cleanup:
   if (device_queue != nullptr) (void)aclrtFree(device_queue);
   if (device_status != nullptr) (void)aclrtFree(device_status);
   if (device_output_indices != nullptr) (void)aclrtFree(device_output_indices);
-  if (device_eager_mask != nullptr) (void)aclrtFree(device_eager_mask);
+  if (device_eager_miss_counts != nullptr) (void)aclrtFree(device_eager_miss_counts);
   if (device_eager_indices != nullptr) (void)aclrtFree(device_eager_indices);
-  if (device_mask != nullptr) (void)aclrtFree(device_mask);
+  if (device_miss_count != nullptr) (void)aclrtFree(device_miss_count);
   if (device_indices != nullptr) (void)aclrtFree(device_indices);
   if (device_offsets != nullptr) (void)aclrtFree(device_offsets);
   if (device_valid_table != nullptr) (void)aclrtFree(device_valid_table);

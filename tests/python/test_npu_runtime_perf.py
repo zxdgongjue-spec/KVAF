@@ -171,7 +171,7 @@ def print_kernel_profile(
         "KERNEL_PROFILE_CONTRACT "
         f"clock_mhz={clock_mhz} unit=ms samples={len(samples)} "
         f"aiv_cores={npu_core_count} jettys_per_core={jettys_per_core} "
-        "setup=entity_and_queue compact=mask_and_index_compaction "
+        "setup=entity_queue_and_miss_count compact=removed_direct_prefix "
         "post=wqe_fill_sq_copy_and_doorbell "
         "transfer_window=first_doorbell_to_all_cq_complete "
         "completion_wait=cq_poll_until_udma_complete "
@@ -369,9 +369,9 @@ def main(batch: int = 16) -> int:
         # Pre-create only the source data for one token-level request plan per
         # warmup/measured sample. source_token_ids select one of
         # table_capacity * 128 remote tokens, destination_slots select random
-        # output rows, and each batch item contributes a random miss_count <
-        # 2048. BatchGet tensors are derived from these immediately before the
-        # corresponding sample call.
+        # output rows, and each call contributes one random miss_count smaller
+        # than the request capacity. BatchGet tensors are derived from these
+        # immediately before the corresponding sample call.
         probability = active_percent / 100.0
         sample_count = warmup + iterations
         source_token_id_batches = []
@@ -399,10 +399,10 @@ def main(batch: int = 16) -> int:
 
             miss_count = (
                 torch.rand(
-                    (batch, REQUESTS_PER_BATCH - 1), device=device
+                    (requests - 1,), device=device
                 )
                 < probability
-            ).sum(dim=1).to(torch.int32)
+            ).sum().reshape(1).to(torch.int32)
             torch.npu.synchronize()
             source_plan_ready = time.perf_counter()
 
@@ -424,18 +424,18 @@ def main(batch: int = 16) -> int:
                 )
 
         miss_count_host = torch.stack(miss_count_batches).cpu()
-        if bool((miss_count_host >= REQUESTS_PER_BATCH).any().item()):
-            raise AssertionError("miss_count must be smaller than 2048")
+        if bool((miss_count_host >= requests).any().item()):
+            raise AssertionError("miss_count must be smaller than request capacity")
         mean_active_requests = float(miss_count_host.sum().item()) / sample_count
         target_active_requests = requests * probability
         print(
             "RUNTIME_PERF_BATCH_GET_INPUTS_READY "
             f"samples={sample_count} total_tokens={total_tokens} "
-            f"requests_per_sample={requests} requests_per_batch=2048 "
+            f"requests_per_sample={requests} "
             f"mean_active_requests={mean_active_requests:.3f} "
             f"target_active_requests={target_active_requests:.3f} "
             "source_token_ids=random destination_slots=random_permutation "
-            "mask_layout=miss_count_prefix"
+            "request_layout=miss_count_prefix"
         )
         for stage in (
             "source_token_ids",
@@ -463,16 +463,9 @@ def main(batch: int = 16) -> int:
             torch.npu.synchronize()
             output_indices = destination_slots.clone()
             torch.npu.synchronize()
-            mask = (
-                torch.arange(
-                    REQUESTS_PER_BATCH, dtype=torch.int32, device=device
-                ).unsqueeze(0)
-                < miss_count.unsqueeze(1)
-            ).reshape(requests).to(torch.uint8)
-            torch.npu.synchronize()
-            warmup_inputs.append((indices, offsets, output_indices, mask))
+            warmup_inputs.append((indices, offsets, output_indices, miss_count))
             runtime.batch_get(
-                device_table, indices, offsets, mask, output_indices, output
+                device_table, indices, offsets, miss_count, output_indices, output
             )
         torch.npu.synchronize()
         warmup_inputs.clear()
@@ -482,7 +475,6 @@ def main(batch: int = 16) -> int:
             "indices": [],
             "offsets": [],
             "output_indices": [],
-            "mask": [],
             "prepare_inputs": [],
             "submit": [],
             "synchronize": [],
@@ -514,26 +506,14 @@ def main(batch: int = 16) -> int:
             input_profile_samples["output_indices"].append(
                 (time.perf_counter() - begin) * 1000.0
             )
-
-            begin = time.perf_counter()
-            mask = (
-                torch.arange(
-                    REQUESTS_PER_BATCH, dtype=torch.int32, device=device
-                ).unsqueeze(0)
-                < miss_count.unsqueeze(1)
-            ).reshape(requests).to(torch.uint8)
-            torch.npu.synchronize()
             inputs_ready = time.perf_counter()
-            input_profile_samples["mask"].append(
-                (inputs_ready - begin) * 1000.0
-            )
             input_profile_samples["prepare_inputs"].append(
                 (inputs_ready - sample_begin) * 1000.0
             )
 
             begin = inputs_ready
             runtime.batch_get(
-                device_table, indices, offsets, mask, output_indices, output
+                device_table, indices, offsets, miss_count, output_indices, output
             )
             submitted = time.perf_counter()
             torch.npu.synchronize()
@@ -556,7 +536,6 @@ def main(batch: int = 16) -> int:
             "indices",
             "offsets",
             "output_indices",
-            "mask",
             "prepare_inputs",
             "submit",
             "synchronize",

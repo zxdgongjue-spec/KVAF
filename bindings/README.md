@@ -23,12 +23,13 @@ buffer 写入地址稳定的 NPU tensor，再调用 `replay`。`source` 的所�
 `DeviceAccessTable`，其中保存 NPU `addresses` / `valid` Tensor；
 `NpuRuntime.prepare_access_table` 同时接受 Python key 序列或一维、连续的 CPU
 `torch.int64` Tensor；大表应使用后者，避免 Python 逐元素转换。
-`NpuRuntime.batch_get(device_access_table, indices, offsets, mask, output_indices,
+`NpuRuntime.batch_get(device_access_table, indices, offsets, miss_count, output_indices,
 output, stream=None, synchronize=False)` 直接接收 NPU Tensor，也支持以
-`batch_get(addresses, valid, indices, offsets, mask, output_indices, output, ...)`
+`batch_get(addresses, valid, indices, offsets, miss_count, output_indices, output, ...)`
 传入调用方持有的设备表 Tensor。它不暴露 data pointer、字节数、
 output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数由 output Tensor
-第 0 维之后的连续元素推导，也不返回伪装成完成时间的数值。
+第 0 维之后的连续元素推导。`miss_count` 必须是单元素 `torch.int32` NPU Tensor，
+仅 `indices`、`offsets` 和 `output_indices` 的对应前缀参与搬运。
 
 `NpuRuntime(batch_get_kernel_object_path, device_id=0, npu_core_count=1,
 batch_put_kernel_object_path="", jettys_per_core=2)` 的 `jettys_per_core` 参数同时

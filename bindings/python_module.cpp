@@ -116,20 +116,22 @@ class MockAccessOperator final : public AccessOperator {
       return InvalidArgument("mock operator supports CPU buffers only");
     }
 
-    const auto count = request.indices.bytes / sizeof(std::int32_t);
+    const auto capacity = request.indices.bytes / sizeof(std::int32_t);
+    const std::int32_t miss_count =
+        *static_cast<const std::int32_t*>(request.miss_count.data);
+    if (miss_count < 0 || static_cast<std::size_t>(miss_count) > capacity) {
+      return InvalidArgument("BatchGet miss_count is outside the request capacity");
+    }
+    const auto count = static_cast<std::size_t>(miss_count);
     const auto* indices = static_cast<const std::int32_t*>(request.indices.data);
     const auto* offsets = static_cast<const std::int32_t*>(request.offsets.data);
     const auto* output_indices =
         static_cast<const std::int32_t*>(request.output_indices.data);
-    const auto* mask = request.mask.data == nullptr
-                           ? nullptr
-                           : static_cast<const std::uint8_t*>(request.mask.data);
     auto* output = static_cast<std::uint8_t*>(request.output.data);
     const std::size_t output_rows =
         request.output.bytes / request.output_block_bytes;
 
     for (std::size_t i = 0; i < count; ++i) {
-      if (mask != nullptr && mask[i] == 0) continue;
       if (indices[i] < 0 ||
           static_cast<std::size_t>(indices[i]) >= exec.host_access_table.size ||
           exec.host_access_table.valid[indices[i]] == 0) {
@@ -279,9 +281,9 @@ class PythonRuntime final {
   void BatchGet(const AccessTableHandle& handle,
                 const std::vector<std::int32_t>& indices,
                 const std::vector<std::int32_t>& offsets,
+                std::int32_t miss_count,
                 const std::vector<std::int32_t>& output_indices,
-                py::bytearray output, std::uint64_t output_block_bytes,
-                py::object mask) {
+                py::bytearray output, std::uint64_t output_block_bytes) {
     if (indices.empty() || indices.size() != offsets.size() ||
         indices.size() != output_indices.size()) {
       throw py::value_error(
@@ -290,13 +292,10 @@ class PythonRuntime final {
     if (output_block_bytes == 0) {
       throw py::value_error("BatchGet output_block_bytes must be non-zero");
     }
-
-    std::vector<std::uint8_t> mask_values;
-    if (!mask.is_none()) {
-      mask_values = mask.cast<std::vector<std::uint8_t>>();
-      if (mask_values.size() != indices.size()) {
-        throw py::value_error("BatchGet mask must have one value per index");
-      }
+    if (miss_count < 0 ||
+        static_cast<std::size_t>(miss_count) > indices.size()) {
+      throw py::value_error(
+          "BatchGet miss_count must be between zero and the request capacity");
     }
 
     char* output_data = PyByteArray_AsString(output.ptr());
@@ -304,11 +303,6 @@ class PythonRuntime final {
     if (output_data == nullptr || output_size <= 0) {
       throw py::value_error("BatchGet output must be a non-empty bytearray");
     }
-    const ConstBufferView mask_view = mask_values.empty()
-                                          ? ConstBufferView{}
-                                          : ConstBufferView{mask_values.data(),
-                                                            mask_values.size(),
-                                                            DeviceKind::kCpu};
     const BatchGetRequest request{
         handle,
         ConstBufferView{indices.data(),
@@ -317,7 +311,7 @@ class PythonRuntime final {
         ConstBufferView{offsets.data(),
                         offsets.size() * sizeof(offsets.front()),
                         DeviceKind::kCpu},
-        mask_view,
+        ConstBufferView{&miss_count, sizeof(miss_count), DeviceKind::kCpu},
         ConstBufferView{output_indices.data(),
                         output_indices.size() * sizeof(output_indices.front()),
                         DeviceKind::kCpu},
@@ -376,9 +370,9 @@ PYBIND11_MODULE(_kvaf, m) {
            py::arg("access_table"))
       .def("batch_get", &kvaf::PythonRuntime::BatchGet,
            py::arg("access_table"), py::arg("indices"),
-           py::arg("offsets"),
+           py::arg("offsets"), py::arg("miss_count"),
            py::arg("output_indices"), py::arg("output"),
-           py::arg("output_block_bytes"), py::arg("mask") = py::none())
+           py::arg("output_block_bytes"))
       .def("batch_free", &kvaf::PythonRuntime::BatchFree, py::arg("keys"))
       .def("_fail_next_put", &kvaf::PythonRuntime::FailNextPut,
            "Test hook: make the next BatchPut fail before Meta commit.")

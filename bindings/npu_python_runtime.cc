@@ -406,12 +406,12 @@ class NpuRuntime final {
   // addresses/valid Tensors alive until their stream completes BatchGet.
   void BatchGet(const DeviceAccessTable& access_table,
                 const py::object& indices, const py::object& offsets,
-                const py::object& mask,
+                const py::object& miss_count,
                 const py::object& output_indices, const py::object& output,
                 const py::object& stream, bool synchronize) {
     BatchGetImpl(access_table.source(), access_table.addresses(),
-                 access_table.valid(), indices, offsets, mask, output_indices,
-                 output, stream, synchronize);
+                 access_table.valid(), indices, offsets, miss_count,
+                 output_indices, output, stream, synchronize);
   }
 
   // This overload accepts a caller-owned device table directly. Since bare
@@ -421,40 +421,40 @@ class NpuRuntime final {
                            const py::object& valid,
                            const py::object& indices,
                            const py::object& offsets,
-                           const py::object& mask,
+                           const py::object& miss_count,
                            const py::object& output_indices,
                            const py::object& output,
                            const py::object& stream, bool synchronize) {
-    BatchGetImpl(AccessTableHandle{}, addresses, valid, indices, offsets, mask,
-                 output_indices, output, stream, synchronize);
+    BatchGetImpl(AccessTableHandle{}, addresses, valid, indices, offsets,
+                 miss_count, output_indices, output, stream, synchronize);
   }
 
  private:
   void BatchGetImpl(const AccessTableHandle& access_table,
                     const py::object& addresses, const py::object& valid,
                     const py::object& indices, const py::object& offsets,
-                    const py::object& mask,
+                    const py::object& miss_count,
                     const py::object& output_indices,
                     const py::object& output, const py::object& stream,
                     bool synchronize) {
     const NpuTensorView index_view = GetNpuTensorView(indices, "indices");
     const NpuTensorView offset_view = GetNpuTensorView(offsets, "offsets");
-    const NpuTensorView mask_view = GetNpuTensorView(mask, "mask");
+    const NpuTensorView miss_count_view =
+        GetNpuTensorView(miss_count, "miss_count");
     const NpuTensorView output_index_view =
         GetNpuTensorView(output_indices, "output_indices");
     const NpuTensorView output_view = GetNpuTensorView(output, "output");
     const NpuTensorView address_view = GetNpuTensorView(addresses, "addresses");
     const NpuTensorView valid_view = GetNpuTensorView(valid, "valid");
     if (index_view.shape.size() != 1 || offset_view.shape.size() != 1 ||
-        mask_view.shape.size() != 1 ||
         output_index_view.shape.size() != 1 || output_view.shape.size() < 2 ||
         index_view.element_bytes != sizeof(std::int32_t) ||
         offset_view.element_bytes != sizeof(std::int32_t) ||
         output_index_view.element_bytes != sizeof(std::int32_t) ||
-        mask_view.element_bytes != sizeof(std::uint8_t) ||
+        miss_count_view.element_bytes != sizeof(std::int32_t) ||
+        miss_count_view.bytes != sizeof(std::int32_t) ||
         index_view.bytes != offset_view.bytes ||
         index_view.bytes != output_index_view.bytes ||
-        mask_view.bytes != index_view.bytes / sizeof(std::int32_t) ||
         address_view.element_bytes != sizeof(Address) ||
         valid_view.element_bytes != sizeof(std::uint8_t) ||
         valid_view.bytes != address_view.bytes / sizeof(Address) ||
@@ -472,7 +472,8 @@ class NpuRuntime final {
         access_table,
         ConstBufferView{index_view.data, index_view.bytes, DeviceKind::kNpu},
         ConstBufferView{offset_view.data, offset_view.bytes, DeviceKind::kNpu},
-        ConstBufferView{mask_view.data, mask_view.bytes, DeviceKind::kNpu},
+        ConstBufferView{miss_count_view.data, miss_count_view.bytes,
+                        DeviceKind::kNpu},
         ConstBufferView{output_index_view.data, output_index_view.bytes,
                         DeviceKind::kNpu},
         MutableBufferView{output_view.data, output_view.bytes, DeviceKind::kNpu},
@@ -565,14 +566,14 @@ void BindNpuPythonRuntime(py::module_& module) {
            "Copy the latest timeline and disable BatchGet kernel profiling.")
       .def("batch_get", &NpuRuntime::BatchGet,
            py::arg("device_access_table"), py::arg("indices"), py::arg("offsets"),
-           py::arg("mask"),
+           py::arg("miss_count"),
            py::arg("output_indices"), py::arg("output"),
            py::arg("stream") = py::none(), py::arg("synchronize") = false,
            "Submit BatchGet from NPU Tensors. stream=None uses torch.npu.current_stream(); "
            "the default returns after enqueueing work on that stream.")
       .def("batch_get", &NpuRuntime::BatchGetFromTensors,
            py::arg("addresses"), py::arg("valid"), py::arg("indices"),
-           py::arg("offsets"), py::arg("mask"), py::arg("output_indices"),
+           py::arg("offsets"), py::arg("miss_count"), py::arg("output_indices"),
            py::arg("output"), py::arg("stream") = py::none(),
            py::arg("synchronize") = false,
            "Submit BatchGet from caller-owned NPU addresses and valid Tensors. "

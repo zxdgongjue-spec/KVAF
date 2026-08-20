@@ -161,7 +161,9 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
       request.indices.device != request.output.device ||
       request.indices.device != DeviceKind::kNpu ||
       request.output_indices.device != DeviceKind::kNpu ||
-      request.mask.data == nullptr || request.mask.device != DeviceKind::kNpu ||
+      !request.miss_count.has_elements<std::int32_t>() ||
+      request.miss_count.bytes != sizeof(std::int32_t) ||
+      request.miss_count.device != DeviceKind::kNpu ||
       request.output.device != DeviceKind::kNpu ||
       request.device_access_table.addresses.device != DeviceKind::kNpu ||
       request.device_access_table.valid.device != DeviceKind::kNpu ||
@@ -173,7 +175,6 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
       request.indices.bytes % sizeof(std::int32_t) != 0 ||
       request.offsets.bytes != request.indices.bytes ||
       request.output_indices.bytes != request.indices.bytes ||
-      request.mask.bytes != request.indices.bytes / sizeof(std::int32_t) ||
       execution.status == nullptr ||
       execution.status_bytes < static_cast<std::size_t>(npu_core_count) *
                                    sizeof(KvafBatchGetCoreStatus) ||
@@ -197,7 +198,7 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
   arguments->valid_table = PointerValue(request.device_access_table.valid.data);
   arguments->indices = PointerValue(request.indices.data);
   arguments->offsets = PointerValue(request.offsets.data);
-  arguments->mask = PointerValue(request.mask.data);
+  arguments->miss_count = PointerValue(request.miss_count.data);
   arguments->output_indices = PointerValue(request.output_indices.data);
   arguments->output = PointerValue(request.output.data);
   arguments->core_status = PointerValue(execution.status);

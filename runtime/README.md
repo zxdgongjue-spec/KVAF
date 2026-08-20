@@ -17,7 +17,7 @@ AccessOperator，并把调用方已经准备好的输入/输出 buffer 交给数
 - `PrepareAccessTable` / `GetAccessTableView` / `ReleaseAccessTable`：持有
   MetaManager 稳定读锁，生成一维 address/length/valid 表，并在 Release 时
   解锁。
-- `BatchGet`：校验调用方的 index、mask、output 和（NPU 路径）Device
+- `BatchGet`：校验调用方的 index、miss-count、output 和（NPU 路径）Device
   AccessTable buffer 后，向调用方 stream 提交 `AccessOperator::ExecuteBatchGet`。
   Python 默认不在 KVAF 内同步；同一 stream 的后续操作自然按序执行。
 - `BatchFree`：将删除请求交给 MetaManager；仍被 AccessTable 持有的 Key
@@ -31,7 +31,7 @@ Runtime 持有且负责释放：内部 DDR、AccessTable 状态和 Key 稳定性
 
 调用方持有且必须在其 BatchGet 所在 stream 完成前保持有效：BatchPut 的连续 `input` buffer、
 与 Key 一一对应的 Host `input_offsets` / `lengths` 元数据、BatchGet 的
-index/mask/output-index/output buffer，以及 NPU 上的 address/valid 表。Runtime
+index/miss-count/output-index/output buffer，以及 NPU 上的 address/valid 表。Runtime
 不会为这些调用方 buffer 分配、释放、隐式复制或注册链路。
 
 `BatchPutRequest` 的输入语义为：`keys[i]` 的源数据位于
@@ -69,8 +69,8 @@ source handle 必须在此后才可 `ReleaseAccessTable`。Runtime 不额外注�
 address/valid Tensor。
 
 `valid` 是每个 AccessTable entry 的安全位：`1` 表示可访问，`0` 表示 padding
-或无效 entry。AIV kernel 对 `mask=1 && valid=0` 返回设备侧 `kInvalidLookup`，
-且不会对该地址发起 UDMA 读；padding 应由 Adapter 同时以 `mask=0` 跳过。
+或无效 entry。调用方必须只把有效访问放进 `[0, miss_count)` 请求前缀；该前缀
+之外的容量行不会被 AIV kernel 读取或搬运。
 当前 InMemory MetaManager 对不存在的 Key 在 `PrepareAccessTable` 的
 `LockKeys` 阶段直接返回 `kNotFound`，因此不会产生一张含该 Key 的
 `valid=0` 表。
@@ -130,8 +130,8 @@ timeout 240s python3 tests/python/test_npu_batch_get.py
 
 该脚本用小规模 case 验证 Runtime 初始化、调用方 Device Tensor、Runtime
 materialize 的 `DeviceAccessTable`、BatchGet 输出字节、`output A -> B -> A` 的 local-buffer 缓存复用及
-teardown。它以 `KVAF_NPU_ACTIVE_PERCENT` 构造稀疏 mask（例如 `5` 表示 5% 请求
-有效），只为 `mask=1` 的请求写入 KV；随后可用 Runtime 的 ACL D2H mock
+teardown。它以 `KVAF_NPU_ACTIVE_PERCENT` 决定 `miss_count`（例如 `5` 表示约 5%
+请求有效），只为 `[0, miss_count)` 前缀写入 KV；随后可用 Runtime 的 ACL D2H mock
 `batch_put` 将 caller-owned NPU source Tensor 写入 Runtime-owned DDR。该小型
 BatchGet 用例不传 BatchPut kernel，因而不启动 Direct-HCCP BatchPut transport。
 每个 AIV core 默认使用 2 个 Jetty；可通过 `KVAF_NPU_JETTYS_PER_CORE=1` 切换为
@@ -157,8 +157,8 @@ capture 中只 capture `runtime.batch_get(..., stream=capture_stream)`。
 
 每次 replay 前，Python 在同一 ACL stream 上以
 `AclGraph.copy_host_to_device_async` 更新固定地址的 `address_table`、`indices`、
-`mask`、`output_indices`；capture 中的 BatchGet 参数和所有 NPU tensor 地址不变。正常
-性能口径是 `graph_replay_to_stream_completion`：四项 H2D 更新会在 replay 前完成并同步，
+`miss_count`、`output_indices`；capture 中的 BatchGet 参数和所有 NPU tensor 地址不变。正常
+性能口径是 `graph_replay_to_stream_completion`：五项 H2D 更新会在 replay 前完成并同步，
 不进入计时窗口；计时仅包含 graph replay 到同一 stream 完成，与 eager 的
 `runtime_batch_get_call_to_stream_completion` 口径对齐。默认 graph 的 warmup/iterations
 与 eager 一律使用相同的 `KVAF_NPU_WARMUP` / `KVAF_NPU_ITERATIONS` 采样计划。
@@ -238,13 +238,13 @@ BatchGet/Put 的每个样本均在 Runtime 调用后由调用方 `torch.npu.sync
 
 每个 BatchGet 样本在 `[0, table_capacity * 128)` 中生成
 `source_token_ids[batch * 2048]`，`destination_slots` 是输出行的随机排列。每个
-batch item 单独生成小于 2048 的 `miss_count`；所有 miss_count 的期望总数约为
+sample 生成一个小于请求容量的单元素 NPU `int32 miss_count`，其期望值约为
 `batch * 2048 * active_percent`。数据构造阶段只保存这三项；每个 sample 调用
 BatchGet 前再生成 `indices = source_token_ids // 128`、
 `offsets = (source_token_ids % 128) * 656`、由 `destination_slots` 物化的
-`output_indices`，以及每个 2048-request 分段前 `miss_count[i]` 个为 1、其余为 0
-的 `mask`。正式 sample 会分别输出 `batch_get_indices`、`batch_get_offsets`、
-`batch_get_output_indices`、`batch_get_mask`、`batch_get_prepare_inputs`、
+`output_indices`；只有三个数组的 `[0, miss_count)` 前缀会被搬运，不再生成 mask。
+正式 sample 会分别输出 `batch_get_indices`、`batch_get_offsets`、
+`batch_get_output_indices`、`batch_get_prepare_inputs`、
 `batch_get_submit`、`batch_get_synchronize`、`batch_get` 和
 `batch_get_sample_total` 的 `PERF_RESULT`。原始数据构造还会输出
 `batch_get_source_token_ids`、`batch_get_destination_slots`、

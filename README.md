@@ -74,8 +74,8 @@ runtime.batch_put(
 )
 table = runtime.prepare_access_table([1])
 output = bytearray(656)
-runtime.batch_get(table, indices=[0], offsets=[0], output_indices=[0], output=output,
-                  output_block_bytes=656)
+runtime.batch_get(table, indices=[0], offsets=[0], miss_count=1,
+                  output_indices=[0], output=output, output_block_bytes=656)
 runtime.release_access_table(table)
 runtime.shutdown()
 ```

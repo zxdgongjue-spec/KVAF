@@ -151,13 +151,13 @@ def main() -> int:
         return 2
 
     # A sparse Device AccessTable can be much larger than the number of valid
-    # remote KV blocks. Only active requests receive a valid table entry; all
-    # masked-out requests are ignored by the kernel.
-    mask_values = [1 if request % 100 < active_percent else 0 for request in range(requests)]
-    active_request_positions = [
-        request for request, enabled in enumerate(mask_values) if enabled
-    ]
-    active_requests = len(active_request_positions)
+    # remote KV blocks. BatchGet consumes only the compact request prefix
+    # [0, miss_count); the remaining request-capacity rows are ignored.
+    active_requests = sum(
+        1 for request in range(requests) if request % 100 < active_percent
+    )
+    active_request_positions = list(range(active_requests))
+    mask_values = [1] * active_requests + [0] * (requests - active_requests)
     if active_requests > table_capacity:
         print(
             "FAIL: KVAF_NPU_TABLE_CAPACITY must be at least the number of active requests",
@@ -165,7 +165,7 @@ def main() -> int:
         )
         return 2
     # Runtime creates a capacity-sized NPU AccessTable. Valid entries occupy
-    # its compact prefix; masked requests use index zero because their lookup
+    # its compact prefix; inactive request-capacity rows use index zero because
     # is skipped by the AIV kernel.
     indices_values = [0] * requests
     offsets_values = [0] * requests
@@ -313,7 +313,9 @@ def main() -> int:
         )
         indices = torch.tensor(indices_values, dtype=torch.int32, device=device)
         offsets = torch.tensor(offsets_values, dtype=torch.int32, device=device)
-        mask = torch.tensor(mask_values, dtype=torch.uint8, device=device)
+        miss_count = torch.tensor(
+            [active_requests], dtype=torch.int32, device=device
+        )
         output_indices = torch.tensor(output_indices_values, dtype=torch.int32, device=device)
         output_a = torch.zeros(
             (output_rows, block_bytes), dtype=torch.uint8, device=device
@@ -328,7 +330,7 @@ def main() -> int:
                 valid_table,
                 indices,
                 offsets,
-                mask,
+                miss_count,
                 output_indices,
                 output,
                 stream,
@@ -426,7 +428,7 @@ def main() -> int:
             graph_address_table_host = bytearray(tensor_bytes(address_table))
             graph_indices_host = array("i", indices_values)
             graph_offsets_host = array("i", offsets_values)
-            graph_mask_host = bytearray(mask_values)
+            graph_miss_count_host = array("i", [active_requests])
             graph_output_indices_host = array("i", output_indices_values)
             if (
                 graph_indices_host.itemsize != 4
@@ -475,8 +477,8 @@ def main() -> int:
                     graph_offsets_host, capture_stream
                 )
                 graph.copy_host_to_device_async(
-                    int(mask.data_ptr()), tensor_bytes(mask), graph_mask_host,
-                    capture_stream
+                    int(miss_count.data_ptr()), tensor_bytes(miss_count),
+                    graph_miss_count_host, capture_stream
                 )
                 graph.copy_host_to_device_async(
                     int(output_indices.data_ptr()), tensor_bytes(output_indices),
@@ -490,7 +492,7 @@ def main() -> int:
                 f"address_table_bytes={len(graph_address_table_host)} "
                 f"indices_bytes={len(graph_indices_host) * graph_indices_host.itemsize} "
                 f"offsets_bytes={len(graph_offsets_host) * graph_offsets_host.itemsize} "
-                f"mask_bytes={len(graph_mask_host)} "
+                f"miss_count_bytes={graph_miss_count_host.itemsize} "
                 f"output_indices_bytes={len(graph_output_indices_host) * graph_output_indices_host.itemsize}"
             )
             print("RUNTIME_NPU_PHASE_BEGIN phase=graph_capture")

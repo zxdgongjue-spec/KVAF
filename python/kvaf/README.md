@@ -19,6 +19,8 @@ output = bytearray(64)  # 调用方拥有 BatchGet 的输出 buffer
 runtime.batch_get(
     table,
     indices=[0],
+    offsets=[0],
+    miss_count=1,
     output_indices=[0],
     output=output,
     output_block_bytes=64,
@@ -46,20 +48,24 @@ CPU Mock 仅用于本地功能验证；它不等同于 A5/CANN 的设备内存�
 `DeviceAccessTable`，再调用：
 
 ```python
-runtime.batch_get(device_table, indices, offsets, mask, output_indices, output)
+runtime.batch_get(
+    device_table, indices, offsets, miss_count, output_indices, output
+)
 # 或直接传入 DeviceAccessTable 中的两个 Tensor：
 runtime.batch_get(
     device_table.addresses,
     device_table.valid,
     indices,
     offsets,
-    mask,
+    miss_count,
     output_indices,
     output,
 )
 ```
 
-其中所有数据参数均为连续 NPU Tensor；输出行字节数从 `output.shape[0]` 推导，默认
+其中所有数据参数均为连续 NPU Tensor；`miss_count` 是单元素 `torch.int32` NPU
+Tensor，只有三个请求数组的 `[0, miss_count)` 前缀会被执行。输出行字节数从
+`output.shape[0]` 推导，默认
 使用 `torch.npu.current_stream()` 且只提交不主动同步。AIV 内部 status/queue 不属于
 Python API。直接传入 `addresses` / `valid` 时，调用方需自行保证表项指向
 `128 * 656B` 的远端区域，并保持 Tensor 有效直到 stream 执行完成。
