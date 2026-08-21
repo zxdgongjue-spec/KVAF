@@ -4,8 +4,8 @@
 #include <memory>
 #include <vector>
 
-#include "kvaf/status.h"
-#include "kvaf/types.h"
+#include "status.h"
+#include "types.h"
 
 namespace kvaf {
 

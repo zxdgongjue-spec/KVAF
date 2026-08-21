@@ -7,7 +7,7 @@ A5 AIV BatchGet/BatchPut demo/adapter。
 
 ```text
 kvaf/
-├── include/kvaf/          # 模块间共享的占位类型和请求描述
+├── common/include/        # 模块间共享的类型、请求与 Status
 ├── runtime/               # KVAF Runtime
 ├── meta_manager/          # Meta Manager
 ├── access_operator/       # KV Access Operator
@@ -33,56 +33,79 @@ Runtime target 依赖另外两个 target，因此后续可以由 Runtime 统一�
 内部 DDR 初始化、同步 BatchPut、Prepare/Release AccessTable、同步 BatchGet
 和 BatchFree；真实数据搬运由注入的 `AccessOperator` 实现提供。
 
-## 构建
+## 构建、部署与测试
 
-以下命令需要在本目录（`kvaf/`）下执行。
+以下命令均在本目录（`kvaf/`）执行。统一入口是 `build.sh`，它使用独立的
+`build-cpu/` 与 `build-npu/`，不会混用两类 CMake 配置。
 
-```bash
-cmake -S . -B build
-cmake --build build
-```
+### CPU 服务机
 
-Python 定义的功能测试可用以下命令运行：
-
-```bash
-cmake -S . -B build -DBUILD_TESTING=ON -DKVAF_BUILD_PYTHON=ON
-cmake --build build -j
-ctest --test-dir build --output-on-failure
-```
-
-详细 Runtime 生命周期、测试边界和 A5/CANN 集成命令见
-[`runtime/README.md`](runtime/README.md)。
-
-如需编译 Python 注册模块，需要环境中提供 `pybind11`，并显式开启：
+CPU 服务机需要平台已经提供 UB 驱动、`/dev/uburma` 和可工作的 `liburma`。它不需要
+CANN、HCCP、ACL 或 NPU 驱动。`build.sh cpu` 会自动拉取固定版本的 UMDK 源码作为头文件
+依赖；若系统没有 `liburma.so`，会在本地编译该 UMDK 的 `urma` target，不执行全局安装。
 
 ```bash
-cmake -S . -B build -DKVAF_BUILD_PYTHON=ON
-cmake --build build
+./build.sh cpu
+
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28999
 ```
 
-构建后，Python 直接创建并调用 Runtime；没有 stdin/stdout driver 或
-`subprocess.run`：
+可通过 `KVAF_UMDK_ROOT=/path/to/umdk` 或
+`KVAF_URMA_LIBRARY=/path/to/liburma.so ./build.sh cpu` 覆盖自动发现。服务启动后应先看到
+`[KVAF_CPU] CANDIDATE_DISCOVERED` 和 `LISTEN`；不需要手工传入 EID。`--ub-device` 与
+`--eid-index` 仅用于诊断固定候选。
 
-```python
-import kvaf
+### NPU 服务机
 
-runtime = kvaf.Runtime()  # 当前注入进程内 CPU Mock AccessOperator
-runtime.initialize(ddr_bytes=256, slot_size=64)
-payload = b"value"
-runtime.batch_put(
-    keys=[1], input=payload, input_offsets=[0], lengths=[len(payload)]
-)
-table = runtime.prepare_access_table([1])
-output = bytearray(64)
-runtime.batch_get(table, indices=[0], output_indices=[0], output=output,
-                  output_block_bytes=64)
-runtime.release_access_table(table)
-runtime.shutdown()
+NPU 服务机需要已安装并已生效的 CANN、驱动和 `torch_npu` 环境。构建脚本会自动为所选
+`PYTHON` 安装缺失的 `pybind11`，但不会安装厂商 CANN/驱动包。
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh  # 按实际 CANN 路径调整
+export ASCEND_CANN_PACKAGE_PATH=/path/to/cann
+
+./build.sh npu
 ```
 
-Mock API 走 Runtime/MetaManager 的实际代码路径，适合本地功能测试。它不把
-MPS 当作 NPU；A5/CANN 集成需要 NPU Python backend。启用该 backend 后，Python
-从 `runtime.access_table_view(handle, device="npu")` 得到可直接使用的
-`DeviceAccessTable`，并以 NPU Tensor 调用 `kvaf.NpuRuntime.batch_get`；不传
-`data_ptr()`、字节数或 AIV 内部的 status/queue buffer。完整构建和测试命令见
+若 CANN 路径未通过环境变量提供，脚本会尝试常见的 Ascend 安装路径；找不到时会在配置前
+退出并提示设置 `ASCEND_CANN_PACKAGE_PATH`。
+
+### 机内或跨机端到端验证
+
+先在 CPU 机启动服务，再在 NPU 机执行。NPU 只需要 CPU 服务的 `IP:Port`；EID、UB device
+与 CLOS / pair-info fallback 都由 Runtime 自动发现和真实 RMA probe 选择。
+
+```bash
+export KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999
+export DEVICE_ID=0
+
+tests/run_remote_cpu_e2e.sh "$PWD/build-npu"
+```
+
+测试通过时，NPU 侧会完成 Runtime 初始化、AIV BatchPut/BatchGet 正确性校验和 teardown；
+CPU 侧会出现 `REGION_ALLOCATED`、`CHANNEL_CREATED` 与 `REGION_RELEASE`。数据面是 UB/RMA，
+TCP 只用于 region、token 与 Jetty 控制信息交换。
+
+Runtime API 性能测试使用相同的已启动 CPU 服务：
+
+```bash
+KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 DEVICE_ID=0 \
+  tests/run_remote_cpu_runtime_perf.sh "$PWD/build-npu"
+```
+
+该脚本在开始采样前执行 BatchPut → BatchGet 正确性 preflight；只有该阶段通过后的
+`PERF_RESULT` 才是有效性能结果。可用 `KVAF_REMOTE_CPU_PERF_TIMEOUT` 调整总超时。
+
+### 本地无硬件检查
+
+本地 Mock 不验证 UMDK 或 AIV 数据面，但可验证 Runtime/MetaManager/Python 基础接口：
+
+```bash
+cmake -S . -B build-local -DBUILD_TESTING=ON -DKVAF_BUILD_PYTHON=ON
+cmake --build build-local --parallel
+ctest --test-dir build-local --output-on-failure
+```
+
+详细 Runtime 生命周期、buffer 所有权与 AIV 性能口径见
 [`runtime/README.md`](runtime/README.md)。

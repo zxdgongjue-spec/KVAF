@@ -1,4 +1,6 @@
-#include "direct_hccp_session.h"
+#include "direct_hccp/direct_hccp_session.h"
+
+// Process-scoped Direct-HCCP bootstrap for access-operator transports.
 
 #include <chrono>
 #include <cstdarg>
@@ -12,7 +14,7 @@
 #include <thread>
 #include <unordered_map>
 
-#include "direct_hccp_abi.h"
+#include "direct_hccp/direct_hccp_abi.h"
 
 namespace kvaf::direct_hccp {
 
@@ -48,7 +50,9 @@ struct DirectHccpSession {
   RaDeinitFn ra_deinit = nullptr;
   RtOpenNetServiceFn rt_open_net_service = nullptr;
   uint32_t reference_count = 0U;
-  bool host_ra_initialized = false;
+  // This is the NPU process's peer-online RA bootstrap mode. It creates no
+  // CPU Runtime resource and is required before the device-side HDC context.
+  bool peer_ra_initialized = false;
   bool device_ra_initialized = false;
 };
 
@@ -191,10 +195,10 @@ void CallRaDeinitBestEffort(DirectHccpSession *session, uint32_t mode, const cha
 }
 
 bool Bootstrap(DirectHccpSession *session) {
-  if (!CallRaInit(session, kPeerOnline, "host_cpu")) {
+  if (!CallRaInit(session, kPeerOnline, "peer_online")) {
     return false;
   }
-  session->host_ra_initialized = true;
+  session->peer_ra_initialized = true;
 
   const std::string hdc_service_argument = "--hdcType=" + std::to_string(session->key.hdc_type);
   RtProcExtParam parameter{};
@@ -208,16 +212,16 @@ bool Bootstrap(DirectHccpSession *session) {
     std::fprintf(stderr,
                  "[KVAF_AIV] DIRECT_HCCP_SESSION_SERVICE_FAILED physical=%u ret=%d hdc_type=%u\n",
                  session->key.physical_device_id, service_ret, session->key.hdc_type);
-    CallRaDeinitBestEffort(session, kPeerOnline, "host_cpu");
-    session->host_ra_initialized = false;
+    CallRaDeinitBestEffort(session, kPeerOnline, "peer_online");
+    session->peer_ra_initialized = false;
     return false;
   }
   VerboseLog("[KVAF_AIV] DIRECT_HCCP_SESSION_SERVICE_READY physical=%u hdc_type=%u\n",
              session->key.physical_device_id, session->key.hdc_type);
 
   if (!CallRaInit(session, kOfflineHdc, "device_aiv")) {
-    CallRaDeinitBestEffort(session, kPeerOnline, "host_cpu");
-    session->host_ra_initialized = false;
+    CallRaDeinitBestEffort(session, kPeerOnline, "peer_online");
+    session->peer_ra_initialized = false;
     return false;
   }
   session->device_ra_initialized = true;
@@ -231,8 +235,8 @@ void DestroySession(DirectHccpSession *session) {
   if (session->device_ra_initialized) {
     CallRaDeinitBestEffort(session, kOfflineHdc, "device_aiv");
   }
-  if (session->host_ra_initialized) {
-    CallRaDeinitBestEffort(session, kPeerOnline, "host_cpu");
+  if (session->peer_ra_initialized) {
+    CallRaDeinitBestEffort(session, kPeerOnline, "peer_online");
   }
   CloseLibraries(session);
 }

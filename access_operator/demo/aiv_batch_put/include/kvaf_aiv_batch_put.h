@@ -22,9 +22,10 @@ enum KvafBatchPutResult {
 typedef struct KvafBatchPutTransport KvafBatchPutTransport;
 typedef struct KvafBatchPutLocalBuffer KvafBatchPutLocalBuffer;
 
-int32_t KvafBatchPutTransportCreate(void *host_ddr, uint64_t host_ddr_bytes,
-                                    uint32_t aiv_core_count, uint32_t jettys_per_core,
-                                    KvafBatchPutTransport **transport);
+int32_t KvafBatchPutTransportCreateWithPeerLink(
+    void *host_ddr, uint64_t host_ddr_bytes, uint32_t aiv_core_count,
+    uint32_t jettys_per_core, void *peer_link,
+    const uint8_t *peer_local_eid, KvafBatchPutTransport **transport);
 void KvafBatchPutTransportDestroy(KvafBatchPutTransport *transport);
 
 int32_t KvafBatchPutLocalBufferAcquire(KvafBatchPutTransport *transport,

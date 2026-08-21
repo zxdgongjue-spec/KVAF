@@ -23,10 +23,9 @@ set(KVAF_AIV_DEMO_BIN_DIR "${CMAKE_BINARY_DIR}/bin")
 file(MAKE_DIRECTORY "${KVAF_AIV_DEMO_BIN_DIR}")
 
 if(NOT TARGET kvaf_direct_hccp_session)
-  add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../direct_hccp_session"
+  add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../src/direct_hccp"
                    "${CMAKE_CURRENT_BINARY_DIR}/direct_hccp_session")
 endif()
 
 add_subdirectory(kernel)
 add_subdirectory(host)
-add_subdirectory(test)

@@ -11,9 +11,9 @@
 #include <vector>
 
 #include "access_table_python.h"
-#include "kvaf/access_operator/access_operator.h"
-#include "kvaf/meta_manager/meta_manager.h"
-#include "kvaf/runtime/runtime.h"
+#include "access_operator.h"
+#include "meta_manager.h"
+#include "runtime.h"
 
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
 #include "acl_graph_python.h"
@@ -200,8 +200,8 @@ class PythonRuntime final {
       : meta_manager_(CreateInMemoryMetaManager()),
         allocator_(CreateHostDdrMemoryAllocator()),
         access_operator_(std::make_unique<MockAccessOperator>()),
-        runtime_(std::make_unique<Runtime>(*meta_manager_, *access_operator_,
-                                           *allocator_)) {}
+        runtime_(std::make_unique<RuntimeCore>(*meta_manager_, *access_operator_,
+                                               *allocator_)) {}
 
   void Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
     ThrowIfError(runtime_->Initialize(
@@ -323,7 +323,7 @@ class PythonRuntime final {
   std::unique_ptr<MetaManager> meta_manager_;
   std::unique_ptr<DdrMemoryAllocator> allocator_;
   std::unique_ptr<MockAccessOperator> access_operator_;
-  std::unique_ptr<Runtime> runtime_;
+  std::unique_ptr<RuntimeCore> runtime_;
 };
 
 }  // namespace

@@ -47,14 +47,15 @@ The kernel trusts per-request metadata and does not validate it before
 publishing WQEs. The caller must ensure that every length is nonzero and fits
 the 32-bit WQE byte-count field, every source range is inside `input_bytes`,
 and every destination range is inside the Host DDR region passed to
-`KvafBatchPutTransportCreate`. Invalid metadata is unsupported and may result
+`KvafBatchPutTransportCreateWithPeerLink`. Invalid metadata is unsupported and may result
 in a transport or completion error.
 
 ## Resource lifecycle
 
 ```cpp
-KvafBatchPutTransportCreate(host_ddr, host_ddr_bytes, aiv_core_count,
-                            jettys_per_core, &transport);
+KvafBatchPutTransportCreateWithPeerLink(host_ddr, host_ddr_bytes, aiv_core_count,
+                                        jettys_per_core, peer_link, npu_local_eid,
+                                        &transport);
 KvafBatchPutLocalBufferAcquire(transport, input_hbm, input_bytes, &local_buffer);
 
 KvafExecuteBatchPutSync(local_buffer, &args, stream, statuses, aiv_core_count);

@@ -3,13 +3,14 @@ add_library(kvaf_access_operator INTERFACE)
 target_include_directories(kvaf_access_operator
   INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../include
 )
+
+target_link_libraries(kvaf_access_operator INTERFACE kvaf_common)
 
 target_compile_features(kvaf_access_operator INTERFACE cxx_std_17)
 
 if(KVAF_ENABLE_AIV_BATCH_GET)
-  add_subdirectory(demo/direct_hccp_session)
+  add_subdirectory(src/direct_hccp)
   add_subdirectory(demo/aiv_batch_get)
   if(KVAF_ENABLE_AIV_BATCH_PUT)
     add_subdirectory(demo/aiv_batch_put)
@@ -22,7 +23,6 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
   target_include_directories(kvaf_default_access_operator
     PUBLIC
       ${CMAKE_CURRENT_SOURCE_DIR}/include
-      ${CMAKE_CURRENT_SOURCE_DIR}/../include
     PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/demo/aiv_batch_get/include
       ${ASCEND_CANN_PACKAGE_PATH}/include

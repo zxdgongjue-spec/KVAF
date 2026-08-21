@@ -1,10 +1,11 @@
-pybind11_add_module(_kvaf python_module.cpp)
+pybind11_add_module(_kvaf src/python_module.cpp)
 
 target_link_libraries(_kvaf PRIVATE kvaf_runtime)
 
 target_include_directories(_kvaf
   PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../meta_manager/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../access_operator/include
@@ -14,13 +15,14 @@ set(KVAF_PYTHON_BINDING_PREFLIGHT_ARGS)
 
 if(KVAF_ENABLE_AIV_BATCH_GET)
   target_sources(_kvaf PRIVATE
-    acl_python_utils.cc
-    acl_graph_python.cc
-    npu_python_runtime.cc
+    src/acl_python_utils.cc
+    src/acl_graph_python.cc
+    src/npu_python_runtime.cc
   )
   target_link_libraries(_kvaf
     PRIVATE
       kvaf_default_access_operator
+      kvaf_npu_runtime
       kvaf_execute_batch_get_host
       ascendcl
   )

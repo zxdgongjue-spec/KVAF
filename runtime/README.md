@@ -25,6 +25,48 @@ AccessOperator，并把调用方已经准备好的输入/输出 buffer 交给数
 
 异步接口、BatchPut 图捕获管理及图对象生命周期不在本次 POC 范围。
 
+## CPU Runtime 服务与 NPU Link
+
+`Runtime` 是角色接口；`RuntimeCore` 保留已有的 DDR、MetaManager 与 Operator
+编排。当前 `NpuRuntime` 持有 NPU 数据面，`CpuRuntime` 持有 CPU DDR、UMDK
+segment/token/Jetty 与会话。TCP 监听是无状态的 `RuntimeService`：它只接收连接并
+分发给 Runtime，不拥有硬件资源。
+
+CPU 服务只需要 UB 驱动、`/dev/uburma`、UMDK 公开头文件和 `liburma.so`；不链接
+或加载 CANN、HCCP、ACL。仓库根目录的统一构建入口会自动拉取固定 UMDK 源码，并在系统
+缺少 `liburma.so` 时只构建所需的 UMDK `urma` target：
+
+```bash
+cd /path/to/kvaf
+./build.sh cpu
+
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28999
+```
+
+默认自动枚举所有可用 UMDK UB device/EID；`--ub-device NAME` 和
+`--eid-index N` 仅用于诊断。CPU 端可同时保持多个 NPU session，NPU 正常
+`shutdown` 后会释放对应 DDR、segment、token 与 Jetty。
+
+NPU 应用只配置 CPU 服务地址，不配置 EID 或 UDMA device：
+
+```python
+runtime = kvaf.NpuRuntime(batch_get_kernel, device_id=0,
+                          batch_put_kernel_object_path=batch_put_kernel)
+runtime.link_to("141.61.92.71:28999")
+runtime.initialize(ddr_bytes, block_bytes)
+```
+
+`link_to` 必须在 `initialize` 前调用。初始化会从 HCCL root-info 读取当前物理卡的
+CLOS PG EID、追加 `/proc/asdrv_ub/pair_info` fallback，并组合 CPU UMDK 候选。只有
+64B AIV WRITE 与 CQ 完成成功的 EID 对才会被选中；这同时验证 DDR 注册、segment
+import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 初始化的前置条件；
+未建立 CPU 服务 Link 时，`initialize` 会返回 `InvalidState`。
+
+现有 `tests/run_remote_cpu_e2e.sh` 与
+`tests/run_remote_cpu_runtime_perf.sh` 接受 `KVAF_CPU_SERVICE_ADDR`，但该变量
+只由测试脚本转换为上述 `link_to` 调用，不再是 Runtime 内部配置来源。
+
 ## 资源所有权
 
 Runtime 持有且负责释放：内部 DDR、AccessTable 状态和 Key 稳定性锁。
@@ -110,20 +152,13 @@ Python 脚本创建 NPU Tensor；通过 Runtime materialize `DeviceAccessTable`�
 直接传入 `batch_get`：
 
 ```bash
-cmake -S . -B build-aiv -DBUILD_TESTING=ON \
-  -DKVAF_BUILD_PYTHON=ON \
-  -DKVAF_ENABLE_AIV_BATCH_GET=ON \
-  -DKVAF_ENABLE_AIV_BATCH_PUT=ON \
-  -DASCEND_CANN_PACKAGE_PATH="$ASCEND_CANN_PACKAGE_PATH"
-cmake --build build-aiv -j
+./build.sh npu
 
-KVAF_RUN_NPU_TESTS=1 \
-KVAF_AIV_BATCH_GET_KERNEL="$PWD/build-aiv/bin/kvaf_execute_batch_get_kernels.o" \
+KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 \
 DEVICE_ID=0 \
-PYTHONPATH="$PWD/build-aiv/python" \
 KVAF_NPU_ACTIVE_PERCENT=5 \
 KVAF_NPU_JETTYS_PER_CORE=2 \
-timeout 240s python3 tests/python/test_npu_batch_get.py
+tests/run_remote_cpu_e2e.sh "$PWD/build-npu"
 ```
 
 该脚本用小规模 case 验证 Runtime 初始化、调用方 Device Tensor、Runtime
@@ -193,32 +228,9 @@ Direct-HCCP BatchPut 路径，不使用 demo test binary 或 ACL D2H mock。默�
 验证，再执行 warmup 和正式采样，最后重新校验采样结果。测试会输出 `PERF_RESULT`，统计
 `runtime.batch_put()` 到 stream 完成的 mean、p50、p90、p99 和有效 GB/s。
 
-BatchPut 的 Runtime binding 依赖 BatchGet 的公共 NPU Runtime 构建，因此需要同时
-打开两个 AIV 选项。首次运行或源码更新后，先构建：
-
-```bash
-export ASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/cann-9.1.0
-cmake -S . -B build-aiv \
-  -DBUILD_TESTING=ON \
-  -DKVAF_BUILD_PYTHON=ON \
-  -DKVAF_ENABLE_AIV_BATCH_GET=ON \
-  -DKVAF_ENABLE_AIV_BATCH_PUT=ON \
-  -DASCEND_CANN_PACKAGE_PATH="$ASCEND_CANN_PACKAGE_PATH"
-cmake --build build-aiv -j
-```
-
-构建成功后，确认两个 kernel object 和 Python binding 都存在，再运行端到端测试：
-
-```bash
-KVAF_RUN_NPU_TESTS=1 \
-KVAF_BATCH_GET_KERNEL="$PWD/build-aiv/bin/kvaf_execute_batch_get_kernels.o" \
-KVAF_BATCH_PUT_KERNEL="$PWD/build-aiv/bin/kvaf_execute_batch_put_kernels.o" \
-DEVICE_ID=0 \
-PYTHONPATH="$PWD/build-aiv/python" \
-KVAF_NPU_WARMUP=1 \
-KVAF_NPU_ITERATIONS=5 \
-timeout 240s python3 tests/python/test_npu_batch_put.py
-```
+BatchPut 的 Runtime binding 依赖 BatchGet 的公共 NPU Runtime 构建，因此
+`build.sh npu` 一次构建两个 AIV kernel、host transport 与 Python binding。端到端
+正确性入口与上节相同；它会在 BatchGet 前验证 AIV Direct-HCCP BatchPut。
 
 测试规模复用 BatchGet 的 `KVAF_NPU_REQUESTS`、`KVAF_NPU_BLOCK_BYTES`、
 `KVAF_NPU_CORE_COUNT`、`KVAF_NPU_JETTYS_PER_CORE`、`KVAF_NPU_WARMUP` 和
@@ -235,12 +247,10 @@ BatchGet/Put 的每个样本均在 Runtime 调用后由调用方 `torch.npu.sync
 结束；随机输入与数据填充不进入样本计时。
 
 ```bash
-KVAF_RUN_NPU_TESTS=1 \
-KVAF_AIV_BATCH_GET_KERNEL="$PWD/build-aiv/bin/kvaf_execute_batch_get_kernels.o" \
-KVAF_BATCH_PUT_KERNEL="$PWD/build-aiv/bin/kvaf_execute_batch_put_kernels.o" \
+KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 \
 DEVICE_ID=0 \
-PYTHONPATH="$PWD/build-aiv/python" \
-timeout 1800s python3 tests/python/test_npu_runtime_perf.py
+KVAF_REMOTE_CPU_PERF_TIMEOUT=1800 \
+tests/run_remote_cpu_runtime_perf.sh "$PWD/build-npu"
 ```
 
 默认 `batch=16`，即全表 2,097,152 key、每次 BatchGet 32,768 requests、`block_bytes=576`、

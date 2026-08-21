@@ -13,23 +13,12 @@
 #include "access_table_python.h"
 #include "acl/acl.h"
 #include "acl_python_utils.h"
-#include "batch_get_abi.h"
-#include "kvaf/access_operator/access_operator.h"
-#include "kvaf/meta_manager/meta_manager.h"
-#include "kvaf/runtime/runtime.h"
+#include "npu_runtime.h"
 
 namespace py = pybind11;
 
 namespace kvaf {
 namespace {
-
-Status InvalidArgument(std::string message) {
-  return Status::InvalidArgument(std::move(message));
-}
-
-Status Internal(std::string message) {
-  return Status::Internal(std::move(message));
-}
 
 void ThrowIfError(const Status& status) {
   if (status.ok()) return;
@@ -54,45 +43,6 @@ void ThrowIfAclError(aclError error, const char* operation) {
                            " failed with ACL error " +
                            std::to_string(static_cast<int>(error)));
 }
-
-class AclHostDdrAllocator final : public DdrMemoryAllocator {
- public:
-  Status Allocate(const RuntimeInitRequest& request,
-                  RemoteRegionDesc* region) override {
-    if (region == nullptr || request.ddr_device != DeviceKind::kCpu ||
-        request.ddr_bytes == 0 || request.slot_size == 0 ||
-        request.ddr_bytes % request.slot_size != 0) {
-      return InvalidArgument("invalid ACL Host DDR allocation request");
-    }
-    if (address_ != nullptr) {
-      return Status::Error(StatusCode::kInvalidState,
-                           "ACL Host DDR is already allocated");
-    }
-    if (aclrtMallocHost(&address_, request.ddr_bytes) != ACL_SUCCESS) {
-      return Status::Error(StatusCode::kOutOfMemory,
-                           "aclrtMallocHost failed for Runtime DDR");
-    }
-    *region = RemoteRegionDesc{reinterpret_cast<Address>(address_),
-                               request.ddr_bytes, request.slot_size,
-                               DeviceKind::kCpu};
-    return Status::OK();
-  }
-
-  Status Release(const RemoteRegionDesc& region) override {
-    if (address_ == nullptr || reinterpret_cast<Address>(address_) != region.base) {
-      return Status::Error(StatusCode::kNotFound,
-                           "Runtime DDR allocation was not found");
-    }
-    const aclError error = aclrtFreeHost(address_);
-    address_ = nullptr;
-    return error == ACL_SUCCESS
-               ? Status::OK()
-               : Internal("aclrtFreeHost failed for Runtime DDR");
-  }
-
- private:
-  void* address_{nullptr};
-};
 
 void* PointerFromValue(std::uint64_t pointer) {
   return reinterpret_cast<void*>(static_cast<std::uintptr_t>(pointer));
@@ -198,57 +148,30 @@ aclrtStream ResolveStream(const py::object& stream) {
   return acl_python::StreamFromPython(torch.attr("npu").attr("current_stream")());
 }
 
-class NpuRuntime final {
+class NpuPythonRuntime final {
  public:
-  NpuRuntime(std::string batch_get_kernel_object_path, std::uint32_t device_id,
-             std::uint32_t npu_core_count,
-             std::string batch_put_kernel_object_path,
-             std::uint32_t jettys_per_core)
-      : device_id_(device_id), npu_core_count_(npu_core_count),
-        jettys_per_core_(jettys_per_core),
-        meta_manager_(CreateInMemoryMetaManager()) {
-    if (batch_get_kernel_object_path.empty() || npu_core_count == 0 ||
-        npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
-        jettys_per_core == 0 ||
-        jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE) {
-      throw py::value_error("invalid NPU Runtime configuration");
-    }
+  NpuPythonRuntime(std::string batch_get_kernel_object_path, std::uint32_t device_id,
+                   std::uint32_t npu_core_count, std::string batch_put_kernel_object_path,
+                   std::uint32_t jettys_per_core)
+      : native_(std::make_unique<::kvaf::NpuRuntime>(NpuRuntimeOptions{
+            std::move(batch_get_kernel_object_path), std::move(batch_put_kernel_object_path),
+            device_id, npu_core_count, jettys_per_core})) {}
 
-    // torch_npu owns process-wide ACL initialisation/finalisation. The binding
-    // therefore only selects the requested device; it never calls aclFinalize
-    // or aclrtResetDevice. The Python caller supplies an optional stream for
-    // each BatchGet, so external framework graph capture stays outside KVAF.
-    ThrowIfAclError(aclrtSetDevice(device_id_), "aclrtSetDevice");
-
-    allocator_ = std::make_unique<AclHostDdrAllocator>();
-    access_operator_ = std::make_unique<DefaultAccessOperator>(
-        AccessOperatorConfig{std::move(batch_get_kernel_object_path),
-                             std::move(batch_put_kernel_object_path),
-                             npu_core_count_, jettys_per_core_});
-    runtime_ = std::make_unique<Runtime>(*meta_manager_, *access_operator_,
-                                         *allocator_);
+  void LinkTo(std::string address) {
+    ThrowIfError(native_->LinkTo(LinkTarget{std::move(address)}));
   }
-
-  ~NpuRuntime() { CloseNoThrow(); }
-
-  NpuRuntime(const NpuRuntime&) = delete;
-  NpuRuntime& operator=(const NpuRuntime&) = delete;
 
   void Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
-    ThrowIfError(runtime_->Initialize(
-        RuntimeInitRequest{ddr_bytes, slot_size, DeviceKind::kCpu}));
+    ThrowIfError(native_->Initialize(ddr_bytes, slot_size));
   }
 
-  bool Initialized() const {
-    return runtime_ != nullptr && runtime_->initialized();
-  }
-
-  std::uint32_t DeviceId() const { return device_id_; }
-  std::uint32_t NpuCoreCount() const { return npu_core_count_; }
-  std::uint32_t JettysPerCore() const { return jettys_per_core_; }
+  bool Initialized() const { return native_->initialized(); }
+  std::uint32_t DeviceId() const { return native_->device_id(); }
+  std::uint32_t NpuCoreCount() const { return native_->npu_core_count(); }
+  std::uint32_t JettysPerCore() const { return native_->jettys_per_core(); }
 
   py::dict RemoteRegion() const {
-    const RemoteRegionDesc& region = runtime_->remote_region();
+    const RemoteRegionDesc& region = native_->core().remote_region();
     py::dict result;
     result["base"] = region.base;
     result["length"] = region.length;
@@ -284,7 +207,7 @@ class NpuRuntime final {
       }
     }
     const aclrtStream acl_stream = ResolveStream(stream);
-    ThrowIfError(runtime_->BatchPut(BatchPutRequest{
+    ThrowIfError(native_->core().BatchPut(BatchPutRequest{
         keys,
         ConstBufferView{source_view.data, source_view.bytes, DeviceKind::kNpu},
         input_offsets,
@@ -294,7 +217,7 @@ class NpuRuntime final {
   AccessTableHandle PrepareAccessTable(const py::object& keys) {
     std::vector<KeyId> copied_keys = CopyPrepareKeys(keys);
     AccessTableHandle handle;
-    ThrowIfError(runtime_->PrepareAccessTable(
+    ThrowIfError(native_->core().PrepareAccessTable(
         AccessTablePrepareRequest{std::move(copied_keys)}, &handle));
     return handle;
   }
@@ -303,7 +226,7 @@ class NpuRuntime final {
                              const std::string& device,
                              std::uint64_t capacity) const {
     kvaf::AccessTableView view;
-    ThrowIfError(runtime_->GetAccessTableView(handle, &view));
+    ThrowIfError(native_->core().GetAccessTableView(handle, &view));
     if (device == "cpu") {
       return python_binding::MakeAccessTableView(view);
     }
@@ -320,7 +243,7 @@ class NpuRuntime final {
     }
 
     py::module_ torch = py::module_::import("torch");
-    const std::string npu_device = "npu:" + std::to_string(device_id_);
+    const std::string npu_device = "npu:" + std::to_string(native_->device_id());
     py::object addresses = torch.attr("empty")(
         py::make_tuple(capacity), py::arg("dtype") = torch.attr("int64"),
         py::arg("device") = npu_device);
@@ -353,7 +276,7 @@ class NpuRuntime final {
   }
 
   void ReleaseAccessTable(const AccessTableHandle& handle) {
-    ThrowIfError(runtime_->ReleaseAccessTable(handle));
+    ThrowIfError(native_->core().ReleaseAccessTable(handle));
   }
 
   // BatchFree is a control-plane operation.  It deliberately takes the same
@@ -362,7 +285,7 @@ class NpuRuntime final {
   // a second representation solely for the NPU Runtime binding.
   void BatchFree(const py::object& keys) {
     std::vector<KeyId> copied_keys = CopyPrepareKeys(keys);
-    ThrowIfError(runtime_->BatchFree(BatchFreeRequest{std::move(copied_keys)}));
+    ThrowIfError(native_->core().BatchFree(BatchFreeRequest{std::move(copied_keys)}));
   }
 
   // Tensor ownership remains with Python. KVAF creates no output Tensor and
@@ -415,34 +338,17 @@ class NpuRuntime final {
             ConstBufferView{address_view.data, address_view.bytes, DeviceKind::kNpu},
             ConstBufferView{valid_view.data, valid_view.bytes, DeviceKind::kNpu}}};
     const aclrtStream acl_stream = ResolveStream(stream);
-    ThrowIfError(runtime_->BatchGet(
+    ThrowIfError(native_->core().BatchGet(
         request, BatchGetExecutionOptions{acl_stream,
                                            synchronize}));
   }
 
   void Shutdown() {
-    if (runtime_ != nullptr && runtime_->initialized()) {
-      ThrowIfError(runtime_->Shutdown());
-    }
+    ThrowIfError(native_->Shutdown());
   }
 
  private:
-  void CloseNoThrow() {
-    if (runtime_ != nullptr && runtime_->initialized()) {
-      (void)runtime_->Shutdown();
-    }
-    runtime_.reset();
-    access_operator_.reset();
-    allocator_.reset();
-  }
-
-  std::uint32_t device_id_{0};
-  std::uint32_t npu_core_count_{0};
-  std::uint32_t jettys_per_core_{2};
-  std::unique_ptr<MetaManager> meta_manager_;
-  std::unique_ptr<AclHostDdrAllocator> allocator_;
-  std::unique_ptr<DefaultAccessOperator> access_operator_;
-  std::unique_ptr<Runtime> runtime_;
+  std::unique_ptr<::kvaf::NpuRuntime> native_;
 };
 
 }  // namespace
@@ -455,39 +361,41 @@ void BindNpuPythonRuntime(py::module_& module) {
         return table.source().opaque;
       });
 
-  py::class_<NpuRuntime>(module, "NpuRuntime")
+  py::class_<NpuPythonRuntime>(module, "NpuRuntime")
       .def(py::init<std::string, std::uint32_t, std::uint32_t, std::string,
                     std::uint32_t>(),
            py::arg("batch_get_kernel_object_path"), py::arg("device_id") = 0,
            py::arg("npu_core_count") = 1,
            py::arg("batch_put_kernel_object_path") = "",
            py::arg("jettys_per_core") = 2)
-      .def("initialize", &NpuRuntime::Initialize, py::arg("ddr_bytes"),
+      .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
+           "Connect this NPU Runtime to a CPU Runtime service before initialize.")
+      .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),
            py::arg("slot_size"))
-      .def("shutdown", &NpuRuntime::Shutdown)
-      .def_property_readonly("initialized", &NpuRuntime::Initialized)
-      .def_property_readonly("device_id", &NpuRuntime::DeviceId)
-      .def_property_readonly("npu_core_count", &NpuRuntime::NpuCoreCount)
-      .def_property_readonly("jettys_per_core", &NpuRuntime::JettysPerCore)
-      .def_property_readonly("remote_region", &NpuRuntime::RemoteRegion)
-      .def("batch_put", &NpuRuntime::BatchPut, py::arg("keys"),
+      .def("shutdown", &NpuPythonRuntime::Shutdown)
+      .def_property_readonly("initialized", &NpuPythonRuntime::Initialized)
+      .def_property_readonly("device_id", &NpuPythonRuntime::DeviceId)
+      .def_property_readonly("npu_core_count", &NpuPythonRuntime::NpuCoreCount)
+      .def_property_readonly("jettys_per_core", &NpuPythonRuntime::JettysPerCore)
+      .def_property_readonly("remote_region", &NpuPythonRuntime::RemoteRegion)
+      .def("batch_put", &NpuPythonRuntime::BatchPut, py::arg("keys"),
            py::arg("source"), py::arg("input_offsets"), py::arg("lengths"),
            py::arg("stream") = py::none(),
            "Synchronously write variable-size packed NPU blocks. input_offsets and "
            "lengths are CPU integer sequences with one entry per key; "
            "stream=None uses torch.npu.current_stream().")
-      .def("prepare_access_table", &NpuRuntime::PrepareAccessTable,
+      .def("prepare_access_table", &NpuPythonRuntime::PrepareAccessTable,
            py::arg("keys"))
-      .def("access_table_view", &NpuRuntime::AccessTableView,
+      .def("access_table_view", &NpuPythonRuntime::AccessTableView,
            py::arg("access_table"), py::arg("device") = "cpu",
            py::arg("capacity") = 0)
-      .def("release_access_table", &NpuRuntime::ReleaseAccessTable,
+      .def("release_access_table", &NpuPythonRuntime::ReleaseAccessTable,
            py::arg("access_table"))
-      .def("batch_free", &NpuRuntime::BatchFree, py::arg("keys"),
+      .def("batch_free", &NpuPythonRuntime::BatchFree, py::arg("keys"),
            "Release the supplied keys from the Runtime metadata store. keys "
            "accepts a Python key sequence or a contiguous one-dimensional "
            "CPU torch.int64 Tensor.")
-      .def("batch_get", &NpuRuntime::BatchGet,
+      .def("batch_get", &NpuPythonRuntime::BatchGet,
            py::arg("device_access_table"), py::arg("indices"), py::arg("mask"),
            py::arg("output_indices"), py::arg("output"),
            py::arg("stream") = py::none(), py::arg("synchronize") = false,
