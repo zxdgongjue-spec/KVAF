@@ -288,41 +288,6 @@ class NpuPythonRuntime final {
     ThrowIfError(native_->core().BatchFree(BatchFreeRequest{std::move(copied_keys)}));
   }
 
-  void StartBatchGetKernelProfile() {
-    ThrowIfError(native_->SetBatchGetKernelProfiling(true));
-  }
-
-  py::list BatchGetKernelProfileSnapshot() const {
-    std::vector<BatchGetKernelProfile> profiles;
-    ThrowIfError(native_->CopyBatchGetKernelProfiles(&profiles));
-    py::list result;
-    for (std::size_t core = 0; core < profiles.size(); ++core) {
-      const BatchGetKernelProfile& profile = profiles[core];
-      py::dict item;
-      item["core"] = core;
-      item["kernel_start_cycle"] = profile.kernel_start_cycle;
-      item["setup_done_cycle"] = profile.setup_done_cycle;
-      item["compact_done_cycle"] = profile.compact_done_cycle;
-      item["first_doorbell_cycle"] = profile.first_doorbell_cycle;
-      item["post_done_cycle"] = profile.post_done_cycle;
-      item["completion_done_cycle"] = profile.completion_done_cycle;
-      item["kernel_finish_cycle"] = profile.kernel_finish_cycle;
-      item["active_requests"] = profile.active_requests;
-      item["total_posts"] = profile.total_posts;
-      item["jetty_completion_wait_cycles"] =
-          profile.jetty_completion_wait_cycles;
-      item["jetty_completion_polls"] = profile.jetty_completion_polls;
-      result.append(std::move(item));
-    }
-    return result;
-  }
-
-  py::list StopBatchGetKernelProfile() {
-    py::list result = BatchGetKernelProfileSnapshot();
-    ThrowIfError(native_->SetBatchGetKernelProfiling(false));
-    return result;
-  }
-
   // Tensor ownership remains with Python. KVAF creates no output Tensor and
   // only retains its internal Direct-HCCP execution state; callers must keep
   // input/output Tensors and either the DeviceAccessTable or the direct
@@ -462,15 +427,6 @@ void BindNpuPythonRuntime(py::module_& module) {
            "Release the supplied keys from the Runtime metadata store. keys "
            "accepts a Python key sequence or a contiguous one-dimensional "
            "CPU torch.int64 Tensor.")
-      .def("start_batch_get_kernel_profile",
-           &NpuPythonRuntime::StartBatchGetKernelProfile,
-           "Enable the per-core BatchGet kernel cycle timeline.")
-      .def("batch_get_kernel_profile",
-           &NpuPythonRuntime::BatchGetKernelProfileSnapshot,
-           "Copy the latest completed per-core BatchGet kernel timeline.")
-      .def("stop_batch_get_kernel_profile",
-           &NpuPythonRuntime::StopBatchGetKernelProfile,
-           "Copy the latest timeline and disable BatchGet kernel profiling.")
       .def("batch_get", &NpuPythonRuntime::BatchGet,
            py::arg("device_access_table"), py::arg("indices"), py::arg("offsets"),
            py::arg("mask"),

@@ -254,15 +254,7 @@ BatchGet/Put 的每个样本均在 Runtime 调用后由调用方 `torch.npu.sync
 分组的 `miss_count`。调用前再派生 `indices = source_token_ids // 128`、
 `offsets = (source_token_ids % 128) * 656`、`output_indices` 和 mask。输入计划与
 BatchGet Tensor 构造都在计时窗口外完成并同步，不输出输入构造阶段耗时。
-脚本仅输出 submit、synchronize、BatchGet 以及可选 Kernel timeline 的
-`PERF_RESULT`。
-
-设置 `KVAF_RUNTIME_PERF_KERNEL_PROFILE=1` 可启用逐 AIV core cycle timeline，覆盖
-setup、compact、post、首个 doorbell 到 CQ 完成、completion wait、finalize 和总耗时；
-同时输出各 core 的 active requests、post 数、各 Jetty CQ wait 与 poll 均值。A5
-默认按 1000 MHz 换算，其他平台可通过
-`KVAF_RUNTIME_PERF_KERNEL_PROFILE_CLOCK_MHZ` 指定时钟频率。profile D2H 读取发生在
-对应 host BatchGet 计时结束之后。
+脚本仅输出 submit、synchronize 和 BatchGet 的 `PERF_RESULT`。
 
 ```bash
 KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 \

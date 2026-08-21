@@ -419,21 +419,6 @@ NpuRuntime::~NpuRuntime() {
   }
 }
 
-Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled) {
-  if (impl_->access_operator == nullptr) {
-    return Status::NotInitialized("NpuRuntime has not been linked");
-  }
-  return impl_->access_operator->SetBatchGetKernelProfiling(enabled);
-}
-
-Status NpuRuntime::CopyBatchGetKernelProfiles(
-    std::vector<BatchGetKernelProfile>* profiles) const {
-  if (impl_->access_operator == nullptr) {
-    return Status::NotInitialized("NpuRuntime has not been linked");
-  }
-  return impl_->access_operator->CopyBatchGetKernelProfiles(profiles);
-}
-
 Status NpuRuntime::LinkTo(const LinkTarget& target) {
   if (target.address.empty()) return Status::InvalidArgument("NpuRuntime LinkTo requires peer host:port");
   if (initialized()) return Status::InvalidState("NpuRuntime LinkTo must run before initialize");

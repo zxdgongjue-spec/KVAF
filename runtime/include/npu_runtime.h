@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <vector>
 
 #include "runtime.h"
 
@@ -34,10 +33,6 @@ class NpuRuntime final : public Runtime {
   std::uint32_t device_id() const;
   std::uint32_t npu_core_count() const;
   std::uint32_t jettys_per_core() const;
-
-  Status SetBatchGetKernelProfiling(bool enabled);
-  Status CopyBatchGetKernelProfiles(
-      std::vector<BatchGetKernelProfile>* profiles) const;
 
   Status LinkTo(const LinkTarget& target) override;
   Status AcceptLink(const LinkTarget& peer) override;

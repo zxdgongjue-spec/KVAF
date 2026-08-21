@@ -46,10 +46,6 @@ stream 时使用 `torch.npu.current_stream()`。KVAF 不创建、不保存或销
 图 capture、replay 和生命周期仍由上层框架负责。同一 stream 上的后续 Torch/ACL 操作
 自然按序；跨 stream 依赖由调用方建立。
 
-性能诊断可调用 `start_batch_get_kernel_profile()` 开启逐 core cycle 采集，
-`batch_get_kernel_profile()` 获取最新 snapshot，或用
-`stop_batch_get_kernel_profile()` 获取最后一次 snapshot 并关闭采集。
-
 Binding 不负责 vLLM 适配。后续只在 Runtime、Meta Manager 和 KV Access Operator 的 C++ 接口稳定后，将需要暴露的类和方法注册到 Python。
 
 CacheOS-vLLM Adaptor 属于 vLLM 侧实现，不放在本目录。
