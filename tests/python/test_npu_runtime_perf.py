@@ -482,57 +482,29 @@ def main(batch: int = 16) -> int:
             f"phase=full_table requests={validation_requests} block_bytes={block_bytes}"
         )
 
-        # Pre-create only source plans. Tensor derivation is profiled directly
-        # before the corresponding BatchGet call.
+        # Pre-create source plans. All input construction is excluded from
+        # BatchGet timing.
         probability = active_percent / 100.0
         sample_count = warmup + iterations
         request_groups = requests // REQUESTS_PER_BATCH
         source_token_id_batches = []
         destination_slot_batches = []
         miss_count_batches = []
-        source_profile_samples: dict[str, list[float]] = {
-            "source_token_ids": [],
-            "destination_slots": [],
-            "miss_count": [],
-            "source_plan": [],
-        }
-        for sample_index in range(sample_count):
-            sample_begin = time.perf_counter()
+        for _ in range(sample_count):
             source_token_ids = torch.randint(
                 0, total_tokens, (requests,), dtype=torch.int32, device=device
             )
-            torch.npu.synchronize()
-            source_token_ids_ready = time.perf_counter()
-
             destination_slots = torch.randperm(requests, device=device).to(torch.int32)
-            torch.npu.synchronize()
-            destination_slots_ready = time.perf_counter()
-
             miss_count = (
                 torch.rand(
                     (request_groups, REQUESTS_PER_BATCH - 1), device=device
                 )
                 < probability
             ).sum(dim=1).to(torch.int32)
-            torch.npu.synchronize()
-            source_plan_ready = time.perf_counter()
-
             source_token_id_batches.append(source_token_ids)
             destination_slot_batches.append(destination_slots)
             miss_count_batches.append(miss_count)
-            if sample_index >= warmup:
-                source_profile_samples["source_token_ids"].append(
-                    (source_token_ids_ready - sample_begin) * 1000.0
-                )
-                source_profile_samples["destination_slots"].append(
-                    (destination_slots_ready - source_token_ids_ready) * 1000.0
-                )
-                source_profile_samples["miss_count"].append(
-                    (source_plan_ready - destination_slots_ready) * 1000.0
-                )
-                source_profile_samples["source_plan"].append(
-                    (source_plan_ready - sample_begin) * 1000.0
-                )
+        torch.npu.synchronize()
 
         miss_count_host = torch.stack(miss_count_batches).cpu()
         if bool((miss_count_host >= REQUESTS_PER_BATCH).any().item()):
@@ -548,17 +520,6 @@ def main(batch: int = 16) -> int:
             "source_token_ids=random destination_slots=random_permutation "
             "mask_layout=miss_count_prefix"
         )
-        for stage in (
-            "source_token_ids",
-            "destination_slots",
-            "miss_count",
-            "source_plan",
-        ):
-            print_samples(
-                f"batch_get_{stage}", source_profile_samples[stage], warmup,
-                f"{requests}_requests_per_call",
-            )
-
         print("RUNTIME_PERF_PHASE_BEGIN phase=batch_get")
         if kernel_profile:
             runtime.start_batch_get_kernel_profile()
@@ -569,11 +530,8 @@ def main(batch: int = 16) -> int:
             miss_count_batches[:warmup],
         ):
             indices = source_token_ids // ROWS_PER_ENTRY
-            torch.npu.synchronize()
             offsets = (source_token_ids % ROWS_PER_ENTRY) * WQE_BYTES
-            torch.npu.synchronize()
             output_indices = destination_slots.clone()
-            torch.npu.synchronize()
             mask = (
                 torch.arange(
                     REQUESTS_PER_BATCH, dtype=torch.int32, device=device
@@ -590,44 +548,16 @@ def main(batch: int = 16) -> int:
 
         batch_get_samples: list[float] = []
         kernel_profile_samples: list[list[dict[str, object]]] = []
-        input_profile_samples: dict[str, list[float]] = {
-            "indices": [],
-            "offsets": [],
-            "output_indices": [],
-            "mask": [],
-            "prepare_inputs": [],
-            "submit": [],
-            "synchronize": [],
-            "sample_total": [],
-        }
+        submit_samples: list[float] = []
+        synchronize_samples: list[float] = []
         for source_token_ids, destination_slots, miss_count in zip(
             source_token_id_batches[warmup:],
             destination_slot_batches[warmup:],
             miss_count_batches[warmup:],
         ):
-            sample_begin = time.perf_counter()
-            begin = sample_begin
             indices = source_token_ids // ROWS_PER_ENTRY
-            torch.npu.synchronize()
-            input_profile_samples["indices"].append(
-                (time.perf_counter() - begin) * 1000.0
-            )
-
-            begin = time.perf_counter()
             offsets = (source_token_ids % ROWS_PER_ENTRY) * WQE_BYTES
-            torch.npu.synchronize()
-            input_profile_samples["offsets"].append(
-                (time.perf_counter() - begin) * 1000.0
-            )
-
-            begin = time.perf_counter()
             output_indices = destination_slots.clone()
-            torch.npu.synchronize()
-            input_profile_samples["output_indices"].append(
-                (time.perf_counter() - begin) * 1000.0
-            )
-
-            begin = time.perf_counter()
             mask = (
                 torch.arange(
                     REQUESTS_PER_BATCH, dtype=torch.int32, device=device
@@ -635,59 +565,34 @@ def main(batch: int = 16) -> int:
                 < miss_count.unsqueeze(1)
             ).reshape(requests).to(torch.uint8)
             torch.npu.synchronize()
-            inputs_ready = time.perf_counter()
-            input_profile_samples["mask"].append(
-                (inputs_ready - begin) * 1000.0
-            )
-            input_profile_samples["prepare_inputs"].append(
-                (inputs_ready - sample_begin) * 1000.0
-            )
 
-            begin = inputs_ready
+            begin = time.perf_counter()
             runtime.batch_get(
                 device_table, indices, offsets, mask, output_indices, output
             )
             submitted = time.perf_counter()
             torch.npu.synchronize()
             completed = time.perf_counter()
-            input_profile_samples["submit"].append(
-                (submitted - begin) * 1000.0
-            )
-            input_profile_samples["synchronize"].append(
-                (completed - submitted) * 1000.0
-            )
+            submit_samples.append((submitted - begin) * 1000.0)
+            synchronize_samples.append((completed - submitted) * 1000.0)
             batch_get_samples.append((completed - begin) * 1000.0)
-            input_profile_samples["sample_total"].append(
-                (completed - sample_begin) * 1000.0
-            )
             if kernel_profile:
                 kernel_profile_samples.append(
                     list(runtime.batch_get_kernel_profile())
                 )
 
-        for stage in (
-            "indices",
-            "offsets",
-            "output_indices",
-            "mask",
-            "prepare_inputs",
-            "submit",
-            "synchronize",
-        ):
-            print_samples(
-                f"batch_get_{stage}", input_profile_samples[stage], warmup,
-                f"{requests}_requests_per_call",
-            )
+        print_samples(
+            "batch_get_submit", submit_samples, warmup,
+            f"{requests}_requests_per_call",
+        )
+        print_samples(
+            "batch_get_synchronize", synchronize_samples, warmup,
+            f"{requests}_requests_per_call",
+        )
         print_samples(
             "batch_get", batch_get_samples, warmup,
             f"{mean_active_requests:.3f}_mean_active_of_{requests}_requests_per_call",
             int(mean_active_requests * block_bytes),
-        )
-        print_samples(
-            "batch_get_sample_total",
-            input_profile_samples["sample_total"],
-            warmup,
-            f"{requests}_requests_per_call",
         )
         if kernel_profile:
             print_kernel_profile(

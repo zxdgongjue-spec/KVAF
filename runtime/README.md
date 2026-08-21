@@ -252,9 +252,10 @@ BatchGet/Put 的每个样本均在 Runtime 调用后由调用方 `torch.npu.sync
 
 每个 BatchGet 样本先生成 `source_token_ids`、随机输出位置和每 2048-request
 分组的 `miss_count`。调用前再派生 `indices = source_token_ids // 128`、
-`offsets = (source_token_ids % 128) * 656`、`output_indices` 和 mask。脚本分别输出
-输入计划、indices、offsets、output indices、mask、总输入准备、提交、同步、
-BatchGet 以及端到端 sample 的 `PERF_RESULT`。
+`offsets = (source_token_ids % 128) * 656`、`output_indices` 和 mask。输入计划与
+BatchGet Tensor 构造都在计时窗口外完成并同步，不输出输入构造阶段耗时。
+脚本仅输出 submit、synchronize、BatchGet 以及可选 Kernel timeline 的
+`PERF_RESULT`。
 
 设置 `KVAF_RUNTIME_PERF_KERNEL_PROFILE=1` 可启用逐 AIV core cycle timeline，覆盖
 setup、compact、post、首个 doorbell 到 CQ 完成、completion wait、finalize 和总耗时；
