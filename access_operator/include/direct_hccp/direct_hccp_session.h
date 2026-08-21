@@ -1,5 +1,5 @@
-#ifndef KVAF_DIRECT_HCCP_SESSION_H_
-#define KVAF_DIRECT_HCCP_SESSION_H_
+#ifndef KVAF_ACCESS_OPERATOR_DIRECT_HCCP_SESSION_H_
+#define KVAF_ACCESS_OPERATOR_DIRECT_HCCP_SESSION_H_
 
 #include <cstdint>
 
@@ -18,7 +18,8 @@ bool VerboseLoggingEnabled();
 void VerboseLog(const char* format, ...);
 
 // Acquires the RA/HDC service for {physical_device_id, hdc_type}.  The first
-// caller performs RaInit(host), rtOpenNetService and RaInit(device); later
+// caller performs the peer-online and device RA bootstrap plus
+// rtOpenNetService; later
 // callers only take a reference.  The caller must pair every success with
 // ReleaseDirectHccpSession after all of its RaCtx resources are gone.
 bool AcquireDirectHccpSession(uint32_t physical_device_id, uint32_t hdc_type,
@@ -30,4 +31,4 @@ void ReleaseDirectHccpSession(DirectHccpSession *session);
 
 }  // namespace kvaf::direct_hccp
 
-#endif  // KVAF_DIRECT_HCCP_SESSION_H_
+#endif  // KVAF_ACCESS_OPERATOR_DIRECT_HCCP_SESSION_H_

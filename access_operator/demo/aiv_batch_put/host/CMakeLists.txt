@@ -7,6 +7,7 @@ target_compile_options(kvaf_execute_batch_put_host PRIVATE -O2 -fno-common -fno-
 target_link_directories(kvaf_execute_batch_put_host PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/lib64")
 target_link_libraries(kvaf_execute_batch_put_host PRIVATE
   kvaf_direct_hccp_session
+  kvaf_peer_link
   -Wl,--no-as-needed c_sec unified_dlog ascendc_runtime ascendalog ascendcl runtime error_manager
   stdc++ dl pthread)
 add_dependencies(kvaf_execute_batch_put_host kvaf_execute_batch_put_kernel)

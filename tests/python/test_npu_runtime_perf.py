@@ -28,6 +28,7 @@ WARMUP = 3
 ITERATIONS = 1000
 ACTIVE_PERCENT = 5
 BLOCK_BYTES = 512 + 64
+MAX_ACTIVE_REQUESTS_PER_AIV = 16384
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -38,8 +39,14 @@ def percentile(values: list[float], fraction: float) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
-def print_samples(operation: str, samples: list[float], warmup: int, units: str) -> None:
-    print(
+def print_samples(
+    operation: str,
+    samples: list[float],
+    warmup: int,
+    units: str,
+    payload_bytes_per_call: int = 0,
+) -> None:
+    result = (
         "PERF_RESULT "
         f"operation={operation} samples={len(samples)} warmup_excluded={warmup} "
         f"mean_ms={statistics.mean(samples):.3f} "
@@ -48,6 +55,17 @@ def print_samples(operation: str, samples: list[float], warmup: int, units: str)
         f"p99_ms={percentile(samples, 0.99):.3f} "
         f"units={units}"
     )
+    if payload_bytes_per_call > 0:
+        useful_gibps = (
+            payload_bytes_per_call
+            / (statistics.mean(samples) / 1000.0)
+            / (1024.0**3)
+        )
+        result += (
+            f" payload_bytes_per_call={payload_bytes_per_call} "
+            f"useful_GiBps={useful_gibps:.3f}"
+        )
+    print(result)
 
 
 def main(batch: int = 16) -> int:
@@ -79,10 +97,17 @@ def main(batch: int = 16) -> int:
         os.environ.get("KVAF_RUNTIME_PERF_ACTIVE_PERCENT", str(ACTIVE_PERCENT))
     )
     block_bytes = int(os.environ.get("KVAF_RUNTIME_PERF_BLOCK_BYTES", str(BLOCK_BYTES)))
-    table_capacity = batch * PUT_BATCH_SIZE * 1024
-    requests = batch * 2048
-    source_stride = block_bytes
+    source_stride = int(
+        os.environ.get("KVAF_RUNTIME_PERF_SOURCE_STRIDE", str(block_bytes))
+    )
+    table_capacity = int(
+        os.environ.get(
+            "KVAF_RUNTIME_PERF_TABLE_CAPACITY", str(batch * PUT_BATCH_SIZE * 1024)
+        )
+    )
+    requests = int(os.environ.get("KVAF_RUNTIME_PERF_REQUESTS", str(batch * 2048)))
     total_put_batches = table_capacity // PUT_BATCH_SIZE
+    full_validation_capacity = npu_core_count * MAX_ACTIVE_REQUESTS_PER_AIV
     if not (
         batch > 0
         and npu_core_count > 0
@@ -91,10 +116,22 @@ def main(batch: int = 16) -> int:
         and iterations > 0
         and 1 <= active_percent <= 100
         and block_bytes > 0
+        and source_stride >= block_bytes
+        and requests > 0
+        and requests <= full_validation_capacity
+        and table_capacity >= PUT_BATCH_SIZE
+        and table_capacity % PUT_BATCH_SIZE == 0
         and total_put_batches >= warmup + iterations
     ):
-        print("FAIL: invalid KVAF_RUNTIME_PERF_* configuration", file=sys.stderr)
+        print(
+            "FAIL: invalid KVAF_RUNTIME_PERF_* configuration "
+            f"(requests={requests}, aiv_cores={npu_core_count}, "
+            f"full_validation_capacity={full_validation_capacity})",
+            file=sys.stderr,
+        )
         return 2
+    active_requests = max(1, requests * active_percent // 100)
+    ddr_bytes = table_capacity * source_stride
 
     kernel = Path(
         os.environ.get(
@@ -131,30 +168,73 @@ def main(batch: int = 16) -> int:
 
     torch.npu.set_device(device_id)
     device = f"npu:{device_id}"
-    kv_data = torch.empty((PUT_BATCH_SIZE, block_bytes), dtype=torch.uint8, device=device)
+    row_pattern = torch.arange(block_bytes, dtype=torch.int64, device=device).to(torch.uint8)
+    kv_data = row_pattern.repeat(PUT_BATCH_SIZE, 1).contiguous()
     output_indices = torch.arange(requests, dtype=torch.int32, device=device)
     output = torch.empty((requests, block_bytes), dtype=torch.uint8, device=device)
     runtime = kvaf.NpuRuntime(
         str(kernel), device_id, npu_core_count, str(batch_put_kernel),
         jettys_per_core,
     )
+    remote_cpu_service = os.environ.get("KVAF_CPU_SERVICE_ADDR")
+    if not remote_cpu_service:
+        print("FAIL: KVAF_CPU_SERVICE_ADDR must name the separately running CPU service", file=sys.stderr)
+        return 2
+    runtime.link_to(remote_cpu_service)
     table = None
     device_table = None
+    preflight_table = None
     try:
         print(
             "RUNTIME_PERF_CONFIG "
-            f"table_capacity={table_capacity} put_batch_size={PUT_BATCH_SIZE} "
-            f"requests={requests} block_bytes={block_bytes} aiv_cores={npu_core_count} "
-            f"jettys_per_core={jettys_per_core} "
-            f"active_percent={active_percent} warmup={warmup} iterations={iterations} "
-            "batch_put_backend=aiv_direct_hccp"
+            f"transport=cpu_service_link batch={batch} table_capacity={table_capacity} "
+            f"ddr_bytes={ddr_bytes} put_batch_size={PUT_BATCH_SIZE} "
+            f"requests={requests} active_percent={active_percent} "
+            f"active_requests={active_requests} block_bytes={block_bytes} source_stride={source_stride} "
+            f"aiv_cores={npu_core_count} jettys_per_core={jettys_per_core} "
+            f"warmup={warmup} iterations={iterations} "
+            "batch_put_backend=aiv_direct_hccp timing=call_to_stream_completion"
         )
 
-        # Initialize and Shutdown run once: they are lifecycle operations, not
-        # a steady-state dataplane metric.
         print("RUNTIME_PERF_PHASE_BEGIN phase=initialize")
+        begin = time.perf_counter()
         runtime.initialize(table_capacity * block_bytes, source_stride)
+        initialize_ms = (time.perf_counter() - begin) * 1000.0
+        print(f"PERF_RESULT operation=initialize samples=1 elapsed_ms={initialize_ms:.3f} kind=lifecycle")
         print("RUNTIME_PERF_PHASE_DONE phase=initialize")
+
+        # Verify the complete CPU-DDR data path before accepting steady-state samples.
+        print("RUNTIME_PERF_PHASE_BEGIN phase=correctness_preflight")
+        preflight_keys = list(range(table_capacity + 1, table_capacity + PUT_BATCH_SIZE + 1))
+        runtime.batch_put(preflight_keys, kv_data, offsets, lengths)
+        torch.npu.synchronize()
+        preflight_table = runtime.prepare_access_table(preflight_keys)
+        preflight_device_table = runtime.access_table_view(
+            preflight_table, device="npu", capacity=PUT_BATCH_SIZE
+        )
+        preflight_indices = torch.arange(PUT_BATCH_SIZE, dtype=torch.int32, device=device)
+        preflight_mask = torch.ones(PUT_BATCH_SIZE, dtype=torch.uint8, device=device)
+        preflight_output = torch.empty(
+            (PUT_BATCH_SIZE, block_bytes), dtype=torch.uint8, device=device
+        )
+        runtime.batch_get(
+            preflight_device_table,
+            preflight_indices,
+            preflight_mask,
+            preflight_indices,
+            preflight_output,
+        )
+        torch.npu.synchronize()
+        if not torch.equal(preflight_output, kv_data):
+            raise AssertionError("Runtime performance preflight BatchPut/BatchGet validation failed")
+        runtime.release_access_table(preflight_table)
+        preflight_table = None
+        runtime.batch_free(preflight_keys)
+        print(
+            "RUNTIME_PERF_CORRECTNESS_PASS "
+            f"phase=preflight requests={PUT_BATCH_SIZE} block_bytes={block_bytes}"
+        )
+        print("RUNTIME_PERF_PHASE_DONE phase=correctness_preflight")
 
         print("RUNTIME_PERF_PHASE_BEGIN phase=batch_put")
         for key_batch in key_batches[:warmup]:
@@ -168,7 +248,8 @@ def main(batch: int = 16) -> int:
             batch_put_samples.append((time.perf_counter() - begin) * 1000.0)
         print_samples(
             "batch_put", batch_put_samples, warmup,
-            f"{PUT_BATCH_SIZE}_kv_blocks_per_call"
+            f"{PUT_BATCH_SIZE}_kv_blocks_per_call",
+            PUT_BATCH_SIZE * block_bytes,
         )
 
         # Finish the one-time data population. It is deliberately excluded
@@ -179,7 +260,6 @@ def main(batch: int = 16) -> int:
         torch.npu.synchronize()
         print("RUNTIME_PERF_PHASE_DONE phase=batch_put")
 
-        # PrepareAccessTable is CPU-only. Measure the requested full table once.
         print("RUNTIME_PERF_PHASE_BEGIN phase=prepare_access_table")
         begin = time.perf_counter()
         table = runtime.prepare_access_table(prepare_keys)
@@ -191,8 +271,6 @@ def main(batch: int = 16) -> int:
         )
         print("RUNTIME_PERF_PHASE_DONE phase=prepare_access_table")
 
-        # Materialize the full device table once. This is the caller-visible
-        # Runtime H2D path; it is intentionally separate from BatchGet timing.
         print("RUNTIME_PERF_PHASE_BEGIN phase=access_table_view_npu")
         torch.npu.synchronize()
         begin = time.perf_counter()
@@ -208,18 +286,41 @@ def main(batch: int = 16) -> int:
         )
         print("RUNTIME_PERF_PHASE_DONE phase=access_table_view_npu")
 
-        # Pre-create different random request tensors. This setup is excluded
-        # from BatchGet samples; each sample measures Runtime enqueue through
-        # completion of its caller-owned current stream.
-        probability = active_percent / 100.0
+        validation_requests = min(requests, table_capacity)
+        validation_indices = torch.arange(validation_requests, dtype=torch.int32, device=device)
+        validation_mask = torch.ones(validation_requests, dtype=torch.uint8, device=device)
+        validation_output = torch.empty(
+            (validation_requests, block_bytes), dtype=torch.uint8, device=device
+        )
+        runtime.batch_get(
+            device_table,
+            validation_indices,
+            validation_mask,
+            validation_indices,
+            validation_output,
+        )
+        torch.npu.synchronize()
+        if not torch.equal(validation_output, row_pattern.expand(validation_requests, -1)):
+            raise AssertionError("Runtime performance BatchGet validation failed")
+        print(
+            "RUNTIME_PERF_CORRECTNESS_PASS "
+            f"phase=full_table requests={validation_requests} block_bytes={block_bytes}"
+        )
+
+        # Pre-create random accesses with an exact active count. This setup is
+        # excluded from BatchGet samples; every sample ends at stream completion.
         indices_batches = [
             torch.randint(0, table_capacity, (requests,), dtype=torch.int32, device=device)
             for _ in range(warmup + iterations)
         ]
-        mask_batches = [
-            (torch.rand(requests, device=device) < probability).to(torch.uint8)
-            for _ in range(warmup + iterations)
-        ]
+        mask_batches = []
+        for _ in range(warmup + iterations):
+            mask = torch.zeros(requests, dtype=torch.uint8, device=device)
+            if active_requests == requests:
+                mask.fill_(1)
+            else:
+                mask[torch.randperm(requests, device=device)[:active_requests]] = 1
+            mask_batches.append(mask)
         torch.npu.synchronize()
 
         print("RUNTIME_PERF_PHASE_BEGIN phase=batch_get")
@@ -236,7 +337,8 @@ def main(batch: int = 16) -> int:
             batch_get_samples.append((time.perf_counter() - begin) * 1000.0)
         print_samples(
             "batch_get", batch_get_samples, warmup,
-            f"{requests}_requests_per_call"
+            f"{active_requests}_active_of_{requests}_requests_per_call",
+            active_requests * block_bytes,
         )
         print("RUNTIME_PERF_PHASE_DONE phase=batch_get")
 
@@ -274,10 +376,15 @@ def main(batch: int = 16) -> int:
         return 0
     finally:
         print("RUNTIME_PERF_PHASE_BEGIN phase=shutdown")
+        if preflight_table is not None and runtime.initialized:
+            runtime.release_access_table(preflight_table)
         if table is not None and runtime.initialized:
             runtime.release_access_table(table)
         if runtime.initialized:
+            begin = time.perf_counter()
             runtime.shutdown()
+            shutdown_ms = (time.perf_counter() - begin) * 1000.0
+            print(f"PERF_RESULT operation=shutdown samples=1 elapsed_ms={shutdown_ms:.3f} kind=lifecycle")
         print("RUNTIME_PERF_PHASE_DONE phase=shutdown")
 
 

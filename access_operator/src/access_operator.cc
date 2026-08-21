@@ -1,4 +1,4 @@
-#include "kvaf/access_operator/access_operator.h"
+#include "access_operator.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -12,7 +12,7 @@
 #include "acl/acl.h"
 #include "batch_get_abi.h"
 #include "kvaf_aiv_batch_get.h"
-#include "kvaf/meta_manager/meta_manager.h"
+#include "meta_manager.h"
 
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
 #include "batch_put_abi.h"
@@ -268,6 +268,14 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
       impl_->config.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE) {
     return InvalidArgument("invalid AccessOperator initialization config");
   }
+  if (impl_->config.peer_link == nullptr) {
+    return InvalidState("AccessOperator requires an established Runtime Link");
+  }
+  if (std::all_of(impl_->config.peer_local_eid.begin(),
+                  impl_->config.peer_local_eid.end(),
+                  [](std::uint8_t value) { return value == 0U; })) {
+    return InvalidArgument("Runtime Link requires a Runtime-selected local EID");
+  }
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   if (!impl_->config.batch_put_kernel_object_path.empty() &&
       (impl_->config.npu_core_count > KVAF_AIV_BATCH_PUT_MAX_AIV_CORES ||
@@ -283,9 +291,10 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
   }
 
   KvafBatchGetTransport* transport = nullptr;
-  const int32_t result = KvafBatchGetTransportCreate(
+  const int32_t result = KvafBatchGetTransportCreateWithPeerLink(
       reinterpret_cast<void*>(remote_region.base), remote_region.length,
-      impl_->config.npu_core_count, impl_->config.jettys_per_core, &transport);
+      impl_->config.npu_core_count, impl_->config.jettys_per_core,
+      impl_->config.peer_link.get(), impl_->config.peer_local_eid.data(), &transport);
   if (result != KVAF_BATCH_GET_SUCCESS || transport == nullptr) {
     return Internal("failed to create reusable BatchGet transport");
   }
@@ -328,10 +337,11 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     }
 
     KvafBatchPutTransport* batch_put_transport = nullptr;
-    const int32_t batch_put_result = KvafBatchPutTransportCreate(
+    const int32_t batch_put_result = KvafBatchPutTransportCreateWithPeerLink(
         reinterpret_cast<void*>(remote_region.base), remote_region.length,
-        impl_->config.npu_core_count,
-        impl_->config.jettys_per_core, &batch_put_transport);
+        impl_->config.npu_core_count, impl_->config.jettys_per_core,
+        impl_->config.peer_link.get(), impl_->config.peer_local_eid.data(),
+        &batch_put_transport);
     if (batch_put_result != KVAF_BATCH_PUT_SUCCESS ||
         batch_put_transport == nullptr) {
       (void)aclrtFree(impl_->execution.queue_state);

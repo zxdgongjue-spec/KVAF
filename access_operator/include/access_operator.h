@@ -1,16 +1,22 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
 
-#include "kvaf/requests.h"
-#include "kvaf/status.h"
-#include "kvaf/types.h"
+#include "requests.h"
+#include "status.h"
+#include "types.h"
+
+namespace kvaf::peer {
+class PeerLink;
+}
 
 namespace kvaf {
 
 struct PutAccessDesc;
+using PeerLink = peer::PeerLink;
 
 struct BatchPutExecRequest {
   const BatchPutRequest* request{nullptr};
@@ -42,6 +48,10 @@ struct AccessOperatorConfig {
   std::uint32_t npu_core_count{0};
   // Direct-HCCP Jettys assigned to each AIV core.
   std::uint32_t jettys_per_core{2};
+  // Runtime supplies the selected local EID. Operator transports consume it;
+  // they do not discover EIDs or make topology decisions.
+  std::array<std::uint8_t, 16> peer_local_eid{};
+  std::shared_ptr<PeerLink> peer_link;
 };
 
 // Default synchronous NPU data-plane implementation.

@@ -1,7 +1,8 @@
-#ifndef KVAF_AIV_DIRECT_HCCP_ABI_H_
-#define KVAF_AIV_DIRECT_HCCP_ABI_H_
+#ifndef KVAF_ACCESS_OPERATOR_DIRECT_HCCP_ABI_H_
+#define KVAF_ACCESS_OPERATOR_DIRECT_HCCP_ABI_H_
 
-// Minimal C ABI used by the demo to call CANN's RA implementation directly.
+// Minimal C ABI used by KVAF's direct operator transport to call CANN's RA
+// implementation directly.
 // This is deliberately not an HCOMM interface: on A5 the symbols are resolved
 // from libra.so (with libhccp compatibility fallbacks). Keep these layouts in
 // one place because RA is an implementation ABI, not a stable CANN application
@@ -37,6 +38,7 @@ enum JettyMode : uint32_t {
 };
 
 enum JettyImportMode : uint32_t {
+  kJettyImportNormal = 0,
   kJettyImportExp = 1,
 };
 
@@ -337,4 +339,4 @@ inline constexpr uint32_t CtpFlag() { return 1U; }
 
 }  // namespace kvaf::direct_hccp
 
-#endif  // KVAF_AIV_DIRECT_HCCP_ABI_H_
+#endif  // KVAF_ACCESS_OPERATOR_DIRECT_HCCP_ABI_H_

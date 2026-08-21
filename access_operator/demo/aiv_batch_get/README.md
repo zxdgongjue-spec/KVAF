@@ -34,8 +34,9 @@ KvafBatchGetTransport *transport = nullptr;
 KvafBatchGetLocalBuffer *output_binding = nullptr;
 uint64_t entity = 0;
 uint32_t jettys_per_core = 2;
-KvafBatchGetTransportCreate(host_ddr, host_ddr_bytes, aiv_cores,
-                            jettys_per_core, &transport);
+KvafBatchGetTransportCreateWithPeerLink(host_ddr, host_ddr_bytes, aiv_cores,
+                                        jettys_per_core, peer_link, npu_local_eid,
+                                        &transport);
 KvafBatchGetLocalBufferAcquire(transport, output_hbm, output_bytes,
                                &output_binding, &entity);
 args.output = reinterpret_cast<uint64_t>(output_hbm);
@@ -157,8 +158,8 @@ completion and excludes input generation, H2D upload, warmup and validation.
 
 ## Graph boundary
 
-`KvafBatchGetTransportCreate(host_ddr, ...)` creates only the reusable EID,
-Host-DDR and queue resources. Before capture, the caller acquires the fixed
+`KvafBatchGetTransportCreateWithPeerLink(host_ddr, ..., peer_link, npu_local_eid, ...)`
+creates only the reusable peer-link, DDR import and queue resources. Before capture, the caller acquires the fixed
 graph output through `KvafBatchGetLocalBufferAcquire(transport, output, ...)`.
 That call returns an opaque local-buffer handle and a device entity table whose
 local HBM address/token match `args.output`; capture contains only the AIV

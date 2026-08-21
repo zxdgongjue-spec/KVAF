@@ -8,6 +8,9 @@ option(KVAF_ENABLE_AIV_BATCH_GET
 option(KVAF_ENABLE_AIV_BATCH_PUT
        "Build the CANN-backed Direct-HCCP BatchPut data plane"
        ${KVAF_ENABLE_AIV_BATCH_GET})
+option(KVAF_BUILD_REMOTE_CPU_SERVICE
+       "Build the liburma-only persistent CPU DDR/Jetty service"
+       OFF)
 
 if(KVAF_ENABLE_AIV_BATCH_PUT AND NOT KVAF_ENABLE_AIV_BATCH_GET)
   message(FATAL_ERROR
@@ -32,6 +35,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 include(CTest)
 
+add_subdirectory(common)
 add_subdirectory(meta_manager)
 add_subdirectory(access_operator)
 add_subdirectory(runtime)

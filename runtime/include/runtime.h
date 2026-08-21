@@ -2,16 +2,49 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
-#include "kvaf/access_operator/access_operator.h"
-#include "kvaf/meta_manager/meta_manager.h"
-#include "kvaf/requests.h"
-#include "kvaf/status.h"
-#include "kvaf/types.h"
+#include "access_operator.h"
+#include "meta_manager.h"
+#include "requests.h"
+#include "status.h"
+#include "types.h"
 
 namespace kvaf {
+
+// Runtime roles share Link lifecycle but do not necessarily support the same
+// data-plane operations. A target intentionally carries only host:port for
+// the first CPU--NPU deployment; EID and UB routing stay inside KVAF.
+struct LinkTarget {
+  std::string address;
+};
+
+using LinkId = std::uint64_t;
+
+struct RuntimeCapabilities {
+  bool batch_get{false};
+  bool batch_put{false};
+  bool incoming_links{false};
+  bool outgoing_links{false};
+};
+
+// Role-neutral Runtime interface. RuntimeService dispatches incoming control
+// connections through this interface; concrete role runtimes own all hardware
+// resources and decide which Link directions they currently support.
+class Runtime {
+ public:
+  virtual ~Runtime() = default;
+
+  virtual Status LinkTo(const LinkTarget& target) = 0;
+  virtual Status AcceptLink(const LinkTarget& peer) = 0;
+  virtual Status ReleaseLink(LinkId link_id) = 0;
+  virtual Status ServeConnection(int connection_fd) = 0;
+  virtual Status Shutdown() = 0;
+  virtual bool initialized() const = 0;
+  virtual RuntimeCapabilities capabilities() const = 0;
+};
 
 // Runtime 通过该接口申请并释放内部远端 DDR。硬件实现可以在 Allocate 中
 // 使用 ACL/HComm；测试实现可以使用普通 Host 内存。返回的 base 必须可被
@@ -29,17 +62,18 @@ class DdrMemoryAllocator {
 // 与实际 ACL/HComm 注册流程匹配的 allocator。
 std::unique_ptr<DdrMemoryAllocator> CreateHostDdrMemoryAllocator();
 
-// Runtime 是同步 POC 的控制面入口：它拥有 DDR 生命周期，编排
+// RuntimeCore 是同步 POC 的控制面实现：它拥有 DDR 生命周期，编排
 // MetaManager 的 Put/Lock/Lookup/Free 语义，并把数据面请求交给 Operator。
-class Runtime {
+// 角色 Runtime 通过组合它实现当前 NPU KV 访问能力。
+class RuntimeCore {
  public:
-  Runtime(MetaManager& meta_manager, AccessOperator& access_operator,
-          DdrMemoryAllocator& ddr_allocator);
+  RuntimeCore(MetaManager& meta_manager, AccessOperator& access_operator,
+              DdrMemoryAllocator& ddr_allocator);
 
-  ~Runtime();
+  ~RuntimeCore();
 
-  Runtime(const Runtime&) = delete;
-  Runtime& operator=(const Runtime&) = delete;
+  RuntimeCore(const RuntimeCore&) = delete;
+  RuntimeCore& operator=(const RuntimeCore&) = delete;
 
   Status Initialize(const RuntimeInitRequest& request);
   Status Shutdown();

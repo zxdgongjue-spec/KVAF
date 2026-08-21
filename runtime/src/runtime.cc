@@ -1,4 +1,4 @@
-#include "kvaf/runtime/runtime.h"
+#include "runtime.h"
 
 #include <cstdint>
 #include <memory>
@@ -61,19 +61,19 @@ std::unique_ptr<DdrMemoryAllocator> CreateHostDdrMemoryAllocator() {
   return std::make_unique<HostDdrMemoryAllocator>();
 }
 
-Runtime::Runtime(MetaManager& meta_manager, AccessOperator& access_operator,
-                 DdrMemoryAllocator& ddr_allocator)
+RuntimeCore::RuntimeCore(MetaManager& meta_manager, AccessOperator& access_operator,
+                         DdrMemoryAllocator& ddr_allocator)
     : meta_manager_(meta_manager),
       access_operator_(access_operator),
       ddr_allocator_(ddr_allocator) {}
 
-Runtime::~Runtime() {
+RuntimeCore::~RuntimeCore() {
   if (initialized_) {
     (void)Shutdown();
   }
 }
 
-Status Runtime::Initialize(const RuntimeInitRequest& request) {
+Status RuntimeCore::Initialize(const RuntimeInitRequest& request) {
   if (initialized_) {
     return Status::InvalidState("Runtime has already been initialized");
   }
@@ -110,7 +110,7 @@ Status Runtime::Initialize(const RuntimeInitRequest& request) {
   return Status::OK();
 }
 
-Status Runtime::Shutdown() {
+Status RuntimeCore::Shutdown() {
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
@@ -138,8 +138,8 @@ Status Runtime::Shutdown() {
   return first_error;
 }
 
-Status Runtime::PrepareAccessTable(const AccessTablePrepareRequest& request,
-                                   AccessTableHandle* handle) {
+Status RuntimeCore::PrepareAccessTable(const AccessTablePrepareRequest& request,
+                                       AccessTableHandle* handle) {
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
@@ -205,8 +205,8 @@ Status Runtime::PrepareAccessTable(const AccessTablePrepareRequest& request,
   return Status::OK();
 }
 
-Status Runtime::GetAccessTableView(const AccessTableHandle& handle,
-                                   AccessTableView* view) const {
+Status RuntimeCore::GetAccessTableView(const AccessTableHandle& handle,
+                                       AccessTableView* view) const {
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
@@ -222,7 +222,7 @@ Status Runtime::GetAccessTableView(const AccessTableHandle& handle,
   return Status::OK();
 }
 
-Status Runtime::ReleaseAccessTable(const AccessTableHandle& handle) {
+Status RuntimeCore::ReleaseAccessTable(const AccessTableHandle& handle) {
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
@@ -238,8 +238,8 @@ Status Runtime::ReleaseAccessTable(const AccessTableHandle& handle) {
   return Status::OK();
 }
 
-Status Runtime::BatchGet(const BatchGetRequest& request,
-                         const BatchGetExecutionOptions& execution) {
+Status RuntimeCore::BatchGet(const BatchGetRequest& request,
+                             const BatchGetExecutionOptions& execution) {
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
@@ -299,8 +299,8 @@ Status Runtime::BatchGet(const BatchGetRequest& request,
       BatchGetExecRequest{view, &request, execution});
 }
 
-Status Runtime::BatchPut(const BatchPutRequest& request,
-                         BatchPutExecutionOptions execution) {
+Status RuntimeCore::BatchPut(const BatchPutRequest& request,
+                             BatchPutExecutionOptions execution) {
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
@@ -340,7 +340,7 @@ Status Runtime::BatchPut(const BatchPutRequest& request,
   return meta_manager_.CommitPut(put_context);
 }
 
-Status Runtime::BatchFree(const BatchFreeRequest& request) {
+Status RuntimeCore::BatchFree(const BatchFreeRequest& request) {
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
@@ -350,13 +350,13 @@ Status Runtime::BatchFree(const BatchFreeRequest& request) {
   return meta_manager_.BatchFree(request.keys);
 }
 
-Runtime::AccessTableState* Runtime::FindAccessTable(
+RuntimeCore::AccessTableState* RuntimeCore::FindAccessTable(
     const AccessTableHandle& handle) {
   const auto it = access_tables_.find(handle.opaque);
   return it == access_tables_.end() ? nullptr : it->second.get();
 }
 
-const Runtime::AccessTableState* Runtime::FindAccessTable(
+const RuntimeCore::AccessTableState* RuntimeCore::FindAccessTable(
     const AccessTableHandle& handle) const {
   const auto it = access_tables_.find(handle.opaque);
   return it == access_tables_.end() ? nullptr : it->second.get();

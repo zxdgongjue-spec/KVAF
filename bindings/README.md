@@ -2,6 +2,8 @@
 
 本目录是 KVAF C++ 核心与 Python 之间的可选绑定层，使用 Pybind11 构建 `_kvaf` 原生扩展。
 
+`include/` 存放 Binding 内部共享头，`src/` 存放扩展实现；Python 包与构建后导入校验脚本保留在本目录。
+
 当前 Binding 用于验证以下链路：
 
 ```text
@@ -31,6 +33,8 @@ output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数�
 `NpuRuntime(batch_get_kernel_object_path, device_id=0, npu_core_count=1,
 batch_put_kernel_object_path="", jettys_per_core=2)` 的 `jettys_per_core` 参数同时
 配置 BatchGet 和 BatchPut 每个 AIV core 使用的 Jetty 数量，可选 1 或 2 个独立 Jetty。
+远程 CPU DDR 只增加 `runtime.link_to("CPU_IP:port")`，必须在 `initialize` 前调用；
+EID、UMDK device 与候选 RMA 验证由 C++ Runtime 自动完成，Python 不传递这些硬件细节。
 `batch_put(keys, packed_input, input_offsets, lengths, stream=None)` 接收 caller-owned
 NPU packed input 和每条 block 的 CPU 整数 metadata；同步写入完成后才返回。未传
 BatchPut kernel 时，该方法保留 ACL D2H mock，便于只验证 BatchGet 的构建。

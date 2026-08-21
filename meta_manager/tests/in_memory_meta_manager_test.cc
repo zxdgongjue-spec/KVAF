@@ -1,4 +1,4 @@
-#include "kvaf/meta_manager/meta_manager.h"
+#include "meta_manager.h"
 
 #include <cstdint>
 #include <functional>
