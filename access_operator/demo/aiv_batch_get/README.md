@@ -16,13 +16,15 @@ registration; each HBM output is registered separately as a local UDMA range.
 | `address_table` | `uint64[table_capacity]` | Absolute Host DDR UBAs, produced by the meta layer. |
 | `valid_table` | `uint8[table_capacity]` | A zero entry makes its lookup invalid. |
 | `indices` | `int32[request_capacity]` | Logical entries requested by this batch. |
+| `offsets` | `int32[request_capacity]` | Byte offset inside the selected 128 * 656B entry. |
 | `mask` | `uint8[request_capacity]` | Zero skips that request without changing the graph shape. |
 | `output_indices` | `int32[request_capacity]` | Destination row in `output`. |
-| `output` | `uint8[output_rows * block_bytes]` | Contiguous Device HBM output. |
+| `output` | `uint8[output_rows * 656]` | Contiguous Device HBM output. |
 
-For an active request `i`, the kernel reads `block_bytes` from
-`address_table[indices[i]]` and stores it at
-`output + output_indices[i] * block_bytes`. This is exactly the initial
+For an active request `i`, the kernel reads exactly 656 bytes from
+`address_table[indices[i]] + offsets[i]` and stores it at
+`output + output_indices[i] * 656`. Each address-table entry spans
+`128 * 656` bytes, so `offsets[i] + 656` must stay within that entry. This is the
 fixed-block, single-output-scatter scope; duplicate output rows are not
 rejected and have last-completion-wins semantics.
 
@@ -117,7 +119,7 @@ If that header is absent from both the CANN toolkit and asc-devkit, install the
 asc-devkit package matching the target CANN version before building; mixing
 headers from a different CANN release is not supported.
 
-The eager default is 4096 requests of 1024 bytes, 4 KiB source stride, four
+The eager default is 4096 requests of 656 bytes, 83968-byte source stride, four
 AIVs, two Jettys per AIV, and a 5% active probability. As in
 `tests/python/test_npu_runtime_perf.py`, every warmup and measured sample uses
 its own random indices/mask pair. All pairs are generated and copied to the
@@ -129,7 +131,7 @@ Useful overrides:
 
 ```bash
 DEVICE_ID=0 TABLE_CAPACITY=256 REQUESTS=10 OUTPUT_ROWS=200 \
-BLOCK_BYTES=1024 SOURCE_STRIDE=4096 AIV_CORES=1 JETTYS_PER_CORE=2 ACTIVE_PERCENT=20 \
+BLOCK_BYTES=656 SOURCE_STRIDE=83968 AIV_CORES=1 JETTYS_PER_CORE=2 ACTIVE_PERCENT=20 \
 WARMUP=1 ITERATIONS=1 bash scripts/run_execute_batch_get.sh
 
 # Proves TransportCreate -> Acquire(A) -> Acquire(B) -> re-Acquire(A), then
@@ -156,6 +158,14 @@ capture, HCCP setup and final D2H validation are excluded. The normal metric
 is `host_submit_to_stream_completion`; it includes only launch through stream
 completion and excludes input generation, H2D upload, warmup and validation.
 
+The Python Runtime benchmark can opt into the same per-core AIV timeline with
+`KVAF_RUNTIME_PERF_KERNEL_PROFILE=1`. It reports setup, mask/index compact,
+WQE/SQ post, first-doorbell-to-CQ transfer, completion wait and finalization.
+`KVAF_RUNTIME_PERF_KERNEL_PROFILE_CLOCK_MHZ` controls raw `GetSystemCycle`
+conversion (1000 by default for A5). Profiling reuses the reserved status area;
+when disabled, the kernel executes no cycle reads and the ABI stride remains
+384 bytes.
+
 ## Graph boundary
 
 `KvafBatchGetTransportCreateWithPeerLink(host_ddr, ..., peer_link, npu_local_eid, ...)`
@@ -164,7 +174,7 @@ graph output through `KvafBatchGetLocalBufferAcquire(transport, output, ...)`.
 That call returns an opaque local-buffer handle and a device entity table whose
 local HBM address/token match `args.output`; capture contains only the AIV
 kernel launch. One graph therefore serves replay-time changes to addresses,
-validity, request indices, mask and output rows. A different output allocation
+validity, request indices, offsets, mask and output rows. A different output allocation
 uses its own acquire result and graph instance; eager launches may select any
 cached acquire result at runtime. A capacity, block-size, AIV-count or
 Jetty-count change also needs a new session/captured graph. After all stream

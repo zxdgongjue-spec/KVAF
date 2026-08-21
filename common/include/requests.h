@@ -8,6 +8,11 @@
 
 namespace kvaf {
 
+inline constexpr std::uint64_t kBatchGetTransferBytes = 656;
+inline constexpr std::uint64_t kBatchGetAddressTableEntryCount = 128;
+inline constexpr std::uint64_t kBatchGetAddressTableEntryBytes =
+    kBatchGetAddressTableEntryCount * kBatchGetTransferBytes;
+
 // Runtime 初始化时由 Runtime 自己申请并注册的远端 DDR 资源规格。
 // BatchGet 的调用方 buffer 不属于这里：它们由上层在每次调用前准备。
 struct RuntimeInitRequest {
@@ -47,16 +52,22 @@ struct AccessTableDeviceView {
 };
 
 struct BatchGetRequest {
+  // CPU BatchGet 必须提供有效 handle。NPU BatchGet 使用 DeviceAccessTable
+  // 重载时也会提供 handle，以便 Runtime 验证 Host 表生命周期；
+  // 直接传入 addresses/valid Tensor 时 handle 可为空。
   AccessTableHandle access_table;
 
-  // indices/output_indices 为 int32[n]；mask 为空时所有请求均有效。
+  // indices/offsets/output_indices 为 int32[n]；offsets 是表项内的字节偏移。
+  // 每个有效请求固定搬运 656B，offset + 656 不得越过 128 * 656B 表项。
+  // mask 为空时所有请求均有效。
   ConstBufferView indices;
+  ConstBufferView offsets;
   ConstBufferView mask;
   ConstBufferView output_indices;
   MutableBufferView output;
   std::uint64_t output_block_bytes{0};
 
-  // CPU path 留空。NPU path 必须提供与 handle 对应的稳定 Device 表。
+  // CPU path 留空。NPU path 必须提供调用方持有的稳定 Device 表。
   AccessTableDeviceView device_access_table;
 };
 
@@ -94,6 +105,7 @@ struct BatchGetExecutionOptions {
 
 // Runtime 向 AccessOperator 提交的 BatchGet 描述。
 struct BatchGetExecRequest {
+  // 直接传入 NPU addresses/valid Tensor 时 Host view 可为空。
   AccessTableView host_access_table;
   const BatchGetRequest* request{nullptr};
   BatchGetExecutionOptions execution;

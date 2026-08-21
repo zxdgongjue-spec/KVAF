@@ -10,15 +10,43 @@ enum {
   KVAF_AIV_BATCH_GET_QUEUE_STATE_BYTES = 64,
   KVAF_AIV_BATCH_GET_MAX_AIV_CORES = 48,
   KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE = 2,
+  KVAF_AIV_BATCH_GET_WQE_DATA_BYTES = 656,
+  KVAF_AIV_BATCH_GET_ADDRESS_TABLE_ENTRY_COUNT = 128,
+  KVAF_AIV_BATCH_GET_ADDRESS_TABLE_ENTRY_BYTES =
+      KVAF_AIV_BATCH_GET_ADDRESS_TABLE_ENTRY_COUNT *
+      KVAF_AIV_BATCH_GET_WQE_DATA_BYTES,
   // Shared local-memory contract used by the AIV kernel and launcher.
   KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES = 160 * 1024,
 };
 
 static const uint64_t KVAF_AIV_BATCH_GET_STATUS_MAGIC = 0x4b5641464247444fULL;
+static const uint64_t KVAF_AIV_BATCH_GET_PROFILE_MAGIC =
+    0x4b56414650524f46ULL;  // "KVAFPROF"
+
+// Optional, per-core kernel timeline. The host enables collection by placing
+// KVAF_AIV_BATCH_GET_PROFILE_MAGIC in `magic` before launch. The kernel keeps
+// the magic in its output, so repeated launches can reuse the same status
+// buffer. GetSystemCycle frequency is platform-specific and the caller must
+// supply the clock MHz when converting cycles to time.
+typedef struct KvafBatchGetCoreProfile {
+  uint64_t magic;
+  uint64_t kernel_start_cycle;
+  uint64_t setup_done_cycle;
+  uint64_t compact_done_cycle;
+  uint64_t first_doorbell_cycle;
+  uint64_t post_done_cycle;
+  uint64_t completion_done_cycle;
+  uint64_t kernel_finish_cycle;
+  uint64_t active_requests;
+  uint64_t total_posts;
+  uint64_t jetty_completion_wait_cycles[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE];
+  uint64_t jetty_completion_polls[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE];
+  uint64_t reserved[26];
+} KvafBatchGetCoreProfile;
 
 // Keep the historical 384-byte stride even though ExecuteBatchGet uses only
-// the first cache line.  This keeps the verified host/device allocation ABI
-// stable while reserving space for future non-hot diagnostics.
+// the first cache line on the normal path. This keeps the verified host/device
+// allocation ABI stable while using the reserved area for opt-in profiling.
 typedef struct KvafBatchGetCoreStatus {
   uint64_t magic;
   uint64_t processed_request_count;
@@ -29,7 +57,7 @@ typedef struct KvafBatchGetCoreStatus {
   uint64_t cq_consumer_index;
   uint64_t failed_request_index;
   uint64_t last_wqe_protocol;
-  uint64_t reserved[40];
+  KvafBatchGetCoreProfile profile;
 } KvafBatchGetCoreStatus;
 
 // Persistent, AIV-owned software indices for one USER_CTL SQ/CQ pair. Queue
@@ -77,11 +105,13 @@ typedef struct KvafBatchGetDirectUrmaEntity {
 
 // Fixed-shape graph ABI. `output` and `channel_entity` must identify the same
 // LocalBufferAcquire result. During capture/replay both addresses stay fixed;
-// address/valid/index/mask/output-index contents may change between replays.
+// address/valid/index/offset/mask/output-index contents may change between
+// replays.
 typedef struct KvafExecuteBatchGetKernelArgs {
   uint64_t address_table;       // uint64[table_capacity], absolute Host DDR UBA
   uint64_t valid_table;         // uint8[table_capacity]
   uint64_t indices;             // int32[request_capacity]
+  uint64_t offsets;             // int32[request_capacity], byte offset in entry
   uint64_t mask;                // uint8[request_capacity]
   uint64_t output_indices;      // int32[request_capacity]
   uint64_t output;              // caller-owned HBM output; must match entity
@@ -100,11 +130,13 @@ typedef struct KvafExecuteBatchGetKernelArgs {
 #if defined(__cplusplus)
 static_assert(sizeof(KvafBatchGetCoreStatus) == KVAF_AIV_BATCH_GET_STATUS_BYTES,
               "KvafBatchGetCoreStatus ABI changed");
+static_assert(sizeof(KvafBatchGetCoreProfile) == 320,
+              "KvafBatchGetCoreProfile ABI changed");
 static_assert(sizeof(KvafBatchGetQueueState) == KVAF_AIV_BATCH_GET_QUEUE_STATE_BYTES,
               "KvafBatchGetQueueState ABI changed");
 static_assert(sizeof(KvafBatchGetDirectUrmaEntity) == 192,
               "KvafBatchGetDirectUrmaEntity ABI changed");
-static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 96,
+static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 104,
               "KvafExecuteBatchGetKernelArgs ABI changed");
 #endif
 

@@ -288,28 +288,94 @@ class NpuPythonRuntime final {
     ThrowIfError(native_->core().BatchFree(BatchFreeRequest{std::move(copied_keys)}));
   }
 
+  void StartBatchGetKernelProfile() {
+    ThrowIfError(native_->SetBatchGetKernelProfiling(true));
+  }
+
+  py::list BatchGetKernelProfileSnapshot() const {
+    std::vector<BatchGetKernelProfile> profiles;
+    ThrowIfError(native_->CopyBatchGetKernelProfiles(&profiles));
+    py::list result;
+    for (std::size_t core = 0; core < profiles.size(); ++core) {
+      const BatchGetKernelProfile& profile = profiles[core];
+      py::dict item;
+      item["core"] = core;
+      item["kernel_start_cycle"] = profile.kernel_start_cycle;
+      item["setup_done_cycle"] = profile.setup_done_cycle;
+      item["compact_done_cycle"] = profile.compact_done_cycle;
+      item["first_doorbell_cycle"] = profile.first_doorbell_cycle;
+      item["post_done_cycle"] = profile.post_done_cycle;
+      item["completion_done_cycle"] = profile.completion_done_cycle;
+      item["kernel_finish_cycle"] = profile.kernel_finish_cycle;
+      item["active_requests"] = profile.active_requests;
+      item["total_posts"] = profile.total_posts;
+      item["jetty_completion_wait_cycles"] =
+          profile.jetty_completion_wait_cycles;
+      item["jetty_completion_polls"] = profile.jetty_completion_polls;
+      result.append(std::move(item));
+    }
+    return result;
+  }
+
+  py::list StopBatchGetKernelProfile() {
+    py::list result = BatchGetKernelProfileSnapshot();
+    ThrowIfError(native_->SetBatchGetKernelProfiling(false));
+    return result;
+  }
+
   // Tensor ownership remains with Python. KVAF creates no output Tensor and
   // only retains its internal Direct-HCCP execution state; callers must keep
-  // input/output Tensors and the DeviceAccessTable alive until their stream
-  // completes the BatchGet operation.
+  // input/output Tensors and either the DeviceAccessTable or the direct
+  // addresses/valid Tensors alive until their stream completes BatchGet.
   void BatchGet(const DeviceAccessTable& access_table,
-                const py::object& indices, const py::object& mask,
+                const py::object& indices, const py::object& offsets,
+                const py::object& mask,
                 const py::object& output_indices, const py::object& output,
                 const py::object& stream, bool synchronize) {
+    BatchGetImpl(access_table.source(), access_table.addresses(),
+                 access_table.valid(), indices, offsets, mask, output_indices,
+                 output, stream, synchronize);
+  }
+
+  // This overload accepts a caller-owned device table directly. Since bare
+  // Tensors carry no AccessTableHandle, Runtime validates their NPU layout but
+  // cannot validate a corresponding Host AccessTable lifetime or entry length.
+  void BatchGetFromTensors(const py::object& addresses,
+                           const py::object& valid,
+                           const py::object& indices,
+                           const py::object& offsets,
+                           const py::object& mask,
+                           const py::object& output_indices,
+                           const py::object& output,
+                           const py::object& stream, bool synchronize) {
+    BatchGetImpl(AccessTableHandle{}, addresses, valid, indices, offsets, mask,
+                 output_indices, output, stream, synchronize);
+  }
+
+ private:
+  void BatchGetImpl(const AccessTableHandle& access_table,
+                    const py::object& addresses, const py::object& valid,
+                    const py::object& indices, const py::object& offsets,
+                    const py::object& mask,
+                    const py::object& output_indices,
+                    const py::object& output, const py::object& stream,
+                    bool synchronize) {
     const NpuTensorView index_view = GetNpuTensorView(indices, "indices");
+    const NpuTensorView offset_view = GetNpuTensorView(offsets, "offsets");
     const NpuTensorView mask_view = GetNpuTensorView(mask, "mask");
     const NpuTensorView output_index_view =
         GetNpuTensorView(output_indices, "output_indices");
     const NpuTensorView output_view = GetNpuTensorView(output, "output");
-    const NpuTensorView address_view =
-        GetNpuTensorView(access_table.addresses(), "device_access_table.addresses");
-    const NpuTensorView valid_view =
-        GetNpuTensorView(access_table.valid(), "device_access_table.valid");
-    if (index_view.shape.size() != 1 || mask_view.shape.size() != 1 ||
+    const NpuTensorView address_view = GetNpuTensorView(addresses, "addresses");
+    const NpuTensorView valid_view = GetNpuTensorView(valid, "valid");
+    if (index_view.shape.size() != 1 || offset_view.shape.size() != 1 ||
+        mask_view.shape.size() != 1 ||
         output_index_view.shape.size() != 1 || output_view.shape.size() < 2 ||
         index_view.element_bytes != sizeof(std::int32_t) ||
+        offset_view.element_bytes != sizeof(std::int32_t) ||
         output_index_view.element_bytes != sizeof(std::int32_t) ||
         mask_view.element_bytes != sizeof(std::uint8_t) ||
+        index_view.bytes != offset_view.bytes ||
         index_view.bytes != output_index_view.bytes ||
         mask_view.bytes != index_view.bytes / sizeof(std::int32_t) ||
         address_view.element_bytes != sizeof(Address) ||
@@ -322,13 +388,13 @@ class NpuPythonRuntime final {
     const std::uint64_t output_rows =
         static_cast<std::uint64_t>(output_view.shape.front());
     const std::uint64_t output_block_bytes = output_view.bytes / output_rows;
-    if (output_block_bytes == 0 ||
-        output_block_bytes > std::numeric_limits<std::uint32_t>::max()) {
-      throw py::value_error("BatchGet output Tensor has an invalid row size");
+    if (output_block_bytes != kBatchGetTransferBytes) {
+      throw py::value_error("BatchGet output Tensor rows must each be 656 bytes");
     }
     const BatchGetRequest request{
-        access_table.source(),
+        access_table,
         ConstBufferView{index_view.data, index_view.bytes, DeviceKind::kNpu},
+        ConstBufferView{offset_view.data, offset_view.bytes, DeviceKind::kNpu},
         ConstBufferView{mask_view.data, mask_view.bytes, DeviceKind::kNpu},
         ConstBufferView{output_index_view.data, output_index_view.bytes,
                         DeviceKind::kNpu},
@@ -343,6 +409,7 @@ class NpuPythonRuntime final {
                                            synchronize}));
   }
 
+ public:
   void Shutdown() {
     ThrowIfError(native_->Shutdown());
   }
@@ -395,12 +462,30 @@ void BindNpuPythonRuntime(py::module_& module) {
            "Release the supplied keys from the Runtime metadata store. keys "
            "accepts a Python key sequence or a contiguous one-dimensional "
            "CPU torch.int64 Tensor.")
+      .def("start_batch_get_kernel_profile",
+           &NpuPythonRuntime::StartBatchGetKernelProfile,
+           "Enable the per-core BatchGet kernel cycle timeline.")
+      .def("batch_get_kernel_profile",
+           &NpuPythonRuntime::BatchGetKernelProfileSnapshot,
+           "Copy the latest completed per-core BatchGet kernel timeline.")
+      .def("stop_batch_get_kernel_profile",
+           &NpuPythonRuntime::StopBatchGetKernelProfile,
+           "Copy the latest timeline and disable BatchGet kernel profiling.")
       .def("batch_get", &NpuPythonRuntime::BatchGet,
-           py::arg("device_access_table"), py::arg("indices"), py::arg("mask"),
+           py::arg("device_access_table"), py::arg("indices"), py::arg("offsets"),
+           py::arg("mask"),
            py::arg("output_indices"), py::arg("output"),
            py::arg("stream") = py::none(), py::arg("synchronize") = false,
            "Submit BatchGet from NPU Tensors. stream=None uses torch.npu.current_stream(); "
-           "the default returns after enqueueing work on that stream.");
+           "the default returns after enqueueing work on that stream.")
+      .def("batch_get", &NpuPythonRuntime::BatchGetFromTensors,
+           py::arg("addresses"), py::arg("valid"), py::arg("indices"),
+           py::arg("offsets"), py::arg("mask"), py::arg("output_indices"),
+           py::arg("output"), py::arg("stream") = py::none(),
+           py::arg("synchronize") = false,
+           "Submit BatchGet from caller-owned NPU addresses and valid Tensors. "
+           "stream=None uses torch.npu.current_stream(); the default returns "
+           "after enqueueing work on that stream.");
 }
 
 }  // namespace kvaf

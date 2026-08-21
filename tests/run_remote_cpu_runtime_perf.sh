@@ -19,7 +19,7 @@ KVAF_PUT_KERNEL="$KVAF_BUILD_DIR/bin/kvaf_execute_batch_put_kernels.o"
 
 : "${KVAF_CPU_SERVICE_ADDR:=127.0.0.1:28999}"
 : "${DEVICE_ID:=0}"
-: "${KVAF_REMOTE_CPU_PERF_TIMEOUT:=600}"
+: "${KVAF_REMOTE_CPU_PERF_TIMEOUT:=1800}"
 
 [[ "$KVAF_REMOTE_CPU_PERF_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || {
   echo "ERROR: KVAF_REMOTE_CPU_PERF_TIMEOUT must be a positive integer in seconds" >&2

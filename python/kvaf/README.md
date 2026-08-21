@@ -19,6 +19,7 @@ output = bytearray(64)  # 调用方拥有 BatchGet 的输出 buffer
 runtime.batch_get(
     table,
     indices=[0],
+    offsets=[0],
     output_indices=[0],
     output=output,
     output_block_bytes=64,
@@ -46,10 +47,22 @@ CPU Mock 仅用于本地功能验证；它不等同于 A5/CANN 的设备内存�
 `DeviceAccessTable`，再调用：
 
 ```python
-runtime.batch_get(device_table, indices, mask, output_indices, output)
+runtime.batch_get(device_table, indices, offsets, mask, output_indices, output)
+# 也可直接传调用方持有的设备表 Tensor：
+runtime.batch_get(
+    device_table.addresses,
+    device_table.valid,
+    indices,
+    offsets,
+    mask,
+    output_indices,
+    output,
+)
 ```
 
 其中所有数据参数均为连续 NPU Tensor；输出行字节数从 `output.shape[0]` 推导，默认
 使用 `torch.npu.current_stream()` 且只提交不主动同步。AIV 内部 status/queue 不属于
-Python API。`AclGraph` 由 Python 调用方持有，直接封装 ACL Runtime Graph 的
+Python API。每个远端表项固定包含 `128 * 656B`，`offsets` 是表项内字节偏移，
+每个有效请求读取 656B。直接传 `addresses` / `valid` 时，调用方负责表项布局和
+Tensor 生命周期。`AclGraph` 由 Python 调用方持有，直接封装 ACL Runtime Graph 的
 capture / replay / synchronize / reset；图对象不属于 Runtime 或 Operator。

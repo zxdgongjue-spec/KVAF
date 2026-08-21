@@ -26,6 +26,10 @@ import kvaf
 
 from backend import detect_torch_backend
 
+WQE_BYTES = 656
+ROWS_PER_ENTRY = 128
+ENTRY_BYTES = ROWS_PER_ENTRY * WQE_BYTES
+
 
 def pattern(slot: int, block_bytes: int) -> bytes:
     return bytes((slot * 131 + byte * 17 + (byte >> 3)) & 0xFF for byte in range(block_bytes))
@@ -117,8 +121,8 @@ def main() -> int:
     table_capacity = int(os.environ.get("KVAF_NPU_TABLE_CAPACITY", "8"))
     requests = int(os.environ.get("KVAF_NPU_REQUESTS", "8"))
     output_rows = int(os.environ.get("KVAF_NPU_OUTPUT_ROWS", "8"))
-    block_bytes = int(os.environ.get("KVAF_NPU_BLOCK_BYTES", "1024"))
-    source_stride = int(os.environ.get("KVAF_NPU_SOURCE_STRIDE", "4096"))
+    block_bytes = int(os.environ.get("KVAF_NPU_BLOCK_BYTES", str(WQE_BYTES)))
+    source_stride = int(os.environ.get("KVAF_NPU_SOURCE_STRIDE", str(ENTRY_BYTES)))
     npu_core_count = int(
         os.environ.get("KVAF_NPU_CORE_COUNT", os.environ.get("KVAF_NPU_AIV_CORES", "1"))
     )
@@ -134,8 +138,8 @@ def main() -> int:
         table_capacity > 0
         and requests > 0
         and requests <= output_rows
-        and block_bytes > 0
-        and source_stride >= block_bytes
+        and block_bytes == WQE_BYTES
+        and source_stride == ENTRY_BYTES
         and npu_core_count > 0
         and npu_core_count <= requests
         and 1 <= jettys_per_core <= 2
@@ -166,10 +170,14 @@ def main() -> int:
     # its compact prefix; masked requests use index zero because their lookup
     # is skipped by the AIV kernel.
     indices_values = [0] * requests
+    offsets_values = [0] * requests
     payload_slots: list[int | None] = [None] * requests
     for payload_slot, request in enumerate(active_request_positions):
         indices_values[request] = payload_slot
-        payload_slots[request] = payload_slot
+        offsets_values[request] = (request % ROWS_PER_ENTRY) * WQE_BYTES
+        payload_slots[request] = (
+            payload_slot * ROWS_PER_ENTRY + offsets_values[request] // WQE_BYTES
+        )
     output_indices_values = [output_rows - 1 - request for request in range(requests)]
     # Exercise the public variable-size BatchPut contract independently of
     # BatchGet's fixed-block kernel contract through the same Direct-HCCP
@@ -261,13 +269,15 @@ def main() -> int:
 
         print("RUNTIME_NPU_PHASE_BEGIN phase=batch_put")
         active_keys = list(range(1, active_requests + 1))
-        source_rows = torch.arange(active_requests, dtype=torch.int64).unsqueeze(1)
+        source_rows = torch.arange(
+            active_requests * ROWS_PER_ENTRY, dtype=torch.int64
+        ).unsqueeze(1)
         source_bytes = torch.arange(block_bytes, dtype=torch.int64).unsqueeze(0)
         source = (
             (source_rows * 131 + source_bytes * 17 + (source_bytes >> 3)) & 0xFF
         ).to(torch.uint8).contiguous().to(device)
-        active_offsets = [row * block_bytes for row in range(active_requests)]
-        active_lengths = [block_bytes] * active_requests
+        active_offsets = [row * ENTRY_BYTES for row in range(active_requests)]
+        active_lengths = [ENTRY_BYTES] * active_requests
         runtime.batch_put(active_keys, source, active_offsets, active_lengths)
         print(
             "RUNTIME_NPU_PHASE_DONE phase=batch_put "
@@ -301,6 +311,7 @@ def main() -> int:
             f"valid_entries={active_requests} table_capacity={table_capacity}"
         )
         indices = torch.tensor(indices_values, dtype=torch.int32, device=device)
+        offsets = torch.tensor(offsets_values, dtype=torch.int32, device=device)
         mask = torch.tensor(mask_values, dtype=torch.uint8, device=device)
         output_indices = torch.tensor(output_indices_values, dtype=torch.int32, device=device)
         output_a = torch.zeros(
@@ -312,7 +323,14 @@ def main() -> int:
 
         def execute(output: object, stream: object | None = None) -> None:
             runtime.batch_get(
-                device_table, indices, mask, output_indices, output, stream
+                address_table,
+                valid_table,
+                indices,
+                offsets,
+                mask,
+                output_indices,
+                output,
+                stream,
             )
 
         print("RUNTIME_NPU_PHASE_BEGIN phase=runtime_batch_get")
@@ -406,9 +424,14 @@ def main() -> int:
             host_addresses_buffer = bytearray(host_view["addresses"])
             graph_address_table_host = bytearray(tensor_bytes(address_table))
             graph_indices_host = array("i", indices_values)
+            graph_offsets_host = array("i", offsets_values)
             graph_mask_host = bytearray(mask_values)
             graph_output_indices_host = array("i", output_indices_values)
-            if graph_indices_host.itemsize != 4 or graph_output_indices_host.itemsize != 4:
+            if (
+                graph_indices_host.itemsize != 4
+                or graph_offsets_host.itemsize != 4
+                or graph_output_indices_host.itemsize != 4
+            ):
                 raise AssertionError("graph int32 staging requires four-byte Python ints")
 
             def prepare_graph_inputs(epoch: int) -> list[int | None]:
@@ -426,9 +449,11 @@ def main() -> int:
                     payload_slot = payload_slots[request]
                     if payload_slot is None:
                         raise AssertionError("active request is missing a payload slot")
+                    source_entry = (indices_values[request] + epoch) % active_requests
                     expected_payload_slots[request] = (
-                        payload_slot + epoch
-                    ) % active_requests
+                        source_entry * ROWS_PER_ENTRY
+                        + offsets_values[request] // WQE_BYTES
+                    )
                 return expected_payload_slots
 
             def enqueue_graph_inputs(trace: str | None = None) -> None:
@@ -441,6 +466,10 @@ def main() -> int:
                 graph.copy_host_to_device_async(
                     int(indices.data_ptr()), tensor_bytes(indices),
                     graph_indices_host, capture_stream
+                )
+                graph.copy_host_to_device_async(
+                    int(offsets.data_ptr()), tensor_bytes(offsets),
+                    graph_offsets_host, capture_stream
                 )
                 graph.copy_host_to_device_async(
                     int(mask.data_ptr()), tensor_bytes(mask), graph_mask_host,
@@ -457,6 +486,7 @@ def main() -> int:
                 "RUNTIME_NPU_GRAPH_HOST_INPUTS_READY "
                 f"address_table_bytes={len(graph_address_table_host)} "
                 f"indices_bytes={len(graph_indices_host) * graph_indices_host.itemsize} "
+                f"offsets_bytes={len(graph_offsets_host) * graph_offsets_host.itemsize} "
                 f"mask_bytes={len(graph_mask_host)} "
                 f"output_indices_bytes={len(graph_output_indices_host) * graph_output_indices_host.itemsize}"
             )

@@ -2,8 +2,9 @@
 """NPU Runtime steady-state performance benchmark.
 
 This is intentionally a direct Python/pybind benchmark, not a CTest case.
-It measures Runtime calls only: caller inputs are created before the timed
-loops, and NPU calls end each sample with an external stream synchronize.
+Source request plans are created before the timed loops, BatchGet tensors are
+derived immediately before each call, and every sample ends with an external
+NPU stream synchronize.
 """
 
 from __future__ import annotations
@@ -25,9 +26,14 @@ AIV_CORES = 32
 JETTYS_PER_CORE = 2
 PUT_BATCH_SIZE = 128
 WARMUP = 3
-ITERATIONS = 1000
+ITERATIONS = 100
 ACTIVE_PERCENT = 5
-BLOCK_BYTES = 512 + 64
+KERNEL_PROFILE_CLOCK_MHZ = 1000
+BLOCK_BYTES = 656
+WQE_BYTES = 656
+ROWS_PER_ENTRY = 128
+ENTRY_BYTES = ROWS_PER_ENTRY * WQE_BYTES
+REQUESTS_PER_BATCH = 2048
 MAX_ACTIVE_REQUESTS_PER_AIV = 16384
 
 
@@ -68,6 +74,144 @@ def print_samples(
     print(result)
 
 
+def print_kernel_profile(
+    samples: list[list[dict[str, object]]],
+    warmup: int,
+    clock_mhz: int,
+    npu_core_count: int,
+    jettys_per_core: int,
+    requests: int,
+) -> None:
+    if not samples or any(len(sample) != npu_core_count for sample in samples):
+        raise AssertionError("BatchGet kernel profile sample/core count mismatch")
+
+    def elapsed_ms(profile: dict[str, object], begin: str, end: str) -> float:
+        return (int(profile[end]) - int(profile[begin])) / clock_mhz / 1000.0
+
+    stage_samples: dict[str, list[float]] = {
+        "kernel_wall": [],
+        "kernel_total": [],
+        "kernel_setup": [],
+        "kernel_compact": [],
+        "kernel_post": [],
+        "kernel_transfer_window": [],
+        "kernel_completion_wait": [],
+        "kernel_finalize": [],
+    }
+    per_core: list[dict[str, float]] = [
+        {
+            "total_ms": 0.0,
+            "setup_ms": 0.0,
+            "compact_ms": 0.0,
+            "post_ms": 0.0,
+            "completion_wait_ms": 0.0,
+            "finalize_ms": 0.0,
+            "active_requests": 0.0,
+            "total_posts": 0.0,
+            "jetty0_wait_ms": 0.0,
+            "jetty0_polls": 0.0,
+            "jetty1_wait_ms": 0.0,
+            "jetty1_polls": 0.0,
+        }
+        for _ in range(npu_core_count)
+    ]
+    for sample in samples:
+        stage_samples["kernel_wall"].append(
+            (
+                max(int(profile["kernel_finish_cycle"]) for profile in sample)
+                - min(int(profile["kernel_start_cycle"]) for profile in sample)
+            )
+            / clock_mhz
+            / 1000.0
+        )
+        critical = {
+            "kernel_total": 0.0,
+            "kernel_setup": 0.0,
+            "kernel_compact": 0.0,
+            "kernel_post": 0.0,
+            "kernel_transfer_window": 0.0,
+            "kernel_completion_wait": 0.0,
+            "kernel_finalize": 0.0,
+        }
+        for profile in sample:
+            core = int(profile["core"])
+            total = elapsed_ms(profile, "kernel_start_cycle", "kernel_finish_cycle")
+            setup = elapsed_ms(profile, "kernel_start_cycle", "setup_done_cycle")
+            compact = elapsed_ms(profile, "setup_done_cycle", "compact_done_cycle")
+            post = elapsed_ms(profile, "compact_done_cycle", "post_done_cycle")
+            completion = elapsed_ms(
+                profile, "post_done_cycle", "completion_done_cycle"
+            )
+            finalize = elapsed_ms(
+                profile, "completion_done_cycle", "kernel_finish_cycle"
+            )
+            first_doorbell = int(profile["first_doorbell_cycle"])
+            transfer = (
+                0.0
+                if first_doorbell == 0
+                else (int(profile["completion_done_cycle"]) - first_doorbell)
+                / clock_mhz
+                / 1000.0
+            )
+            critical["kernel_total"] = max(critical["kernel_total"], total)
+            critical["kernel_setup"] = max(critical["kernel_setup"], setup)
+            critical["kernel_compact"] = max(critical["kernel_compact"], compact)
+            critical["kernel_post"] = max(critical["kernel_post"], post)
+            critical["kernel_transfer_window"] = max(
+                critical["kernel_transfer_window"], transfer
+            )
+            critical["kernel_completion_wait"] = max(
+                critical["kernel_completion_wait"], completion
+            )
+            critical["kernel_finalize"] = max(
+                critical["kernel_finalize"], finalize
+            )
+            accumulator = per_core[core]
+            accumulator["total_ms"] += total
+            accumulator["setup_ms"] += setup
+            accumulator["compact_ms"] += compact
+            accumulator["post_ms"] += post
+            accumulator["completion_wait_ms"] += completion
+            accumulator["finalize_ms"] += finalize
+            accumulator["active_requests"] += int(profile["active_requests"])
+            accumulator["total_posts"] += int(profile["total_posts"])
+            waits = list(profile["jetty_completion_wait_cycles"])
+            polls = list(profile["jetty_completion_polls"])
+            for jetty in range(2):
+                accumulator[f"jetty{jetty}_wait_ms"] += (
+                    int(waits[jetty]) / clock_mhz / 1000.0
+                )
+                accumulator[f"jetty{jetty}_polls"] += int(polls[jetty])
+        for stage, value in critical.items():
+            stage_samples[stage].append(value)
+
+    print(
+        "KERNEL_PROFILE_CONTRACT "
+        f"clock_mhz={clock_mhz} unit=ms samples={len(samples)} "
+        f"aiv_cores={npu_core_count} jettys_per_core={jettys_per_core} "
+        "setup=entity_and_queue compact=mask_and_index_compaction "
+        "post=wqe_fill_sq_copy_and_doorbell "
+        "transfer_window=first_doorbell_to_all_cq_complete "
+        "completion_wait=cq_poll_until_udma_complete "
+        "profile_overhead_included=1 d2h_outside_host_metric=1"
+    )
+    for stage, values in stage_samples.items():
+        print_samples(
+            f"batch_get_{stage}", values, warmup,
+            f"{requests}_requests_per_call",
+        )
+    divisor = float(len(samples))
+    for core, accumulator in enumerate(per_core):
+        print(
+            "KERNEL_PROFILE_CORE "
+            f"core={core} samples={len(samples)} "
+            + " ".join(
+                f"{name}_mean={value / divisor:.6f}"
+                for name, value in accumulator.items()
+            )
+        )
+
+
 def main(batch: int = 16) -> int:
     backend = detect_torch_backend()
     if backend.name != "npu":
@@ -96,16 +240,26 @@ def main(batch: int = 16) -> int:
     active_percent = int(
         os.environ.get("KVAF_RUNTIME_PERF_ACTIVE_PERCENT", str(ACTIVE_PERCENT))
     )
+    kernel_profile = int(os.environ.get("KVAF_RUNTIME_PERF_KERNEL_PROFILE", "0"))
+    kernel_profile_clock_mhz = int(
+        os.environ.get(
+            "KVAF_RUNTIME_PERF_KERNEL_PROFILE_CLOCK_MHZ",
+            str(KERNEL_PROFILE_CLOCK_MHZ),
+        )
+    )
     block_bytes = int(os.environ.get("KVAF_RUNTIME_PERF_BLOCK_BYTES", str(BLOCK_BYTES)))
     source_stride = int(
-        os.environ.get("KVAF_RUNTIME_PERF_SOURCE_STRIDE", str(block_bytes))
+        os.environ.get("KVAF_RUNTIME_PERF_SOURCE_STRIDE", str(ENTRY_BYTES))
     )
     table_capacity = int(
         os.environ.get(
             "KVAF_RUNTIME_PERF_TABLE_CAPACITY", str(batch * PUT_BATCH_SIZE * 1024)
         )
     )
-    requests = int(os.environ.get("KVAF_RUNTIME_PERF_REQUESTS", str(batch * 2048)))
+    requests = int(
+        os.environ.get("KVAF_RUNTIME_PERF_REQUESTS", str(batch * REQUESTS_PER_BATCH))
+    )
+    total_tokens = table_capacity * ROWS_PER_ENTRY
     total_put_batches = table_capacity // PUT_BATCH_SIZE
     full_validation_capacity = npu_core_count * MAX_ACTIVE_REQUESTS_PER_AIV
     if not (
@@ -115,9 +269,12 @@ def main(batch: int = 16) -> int:
         and warmup >= 0
         and iterations > 0
         and 1 <= active_percent <= 100
-        and block_bytes > 0
-        and source_stride >= block_bytes
+        and block_bytes == WQE_BYTES
+        and source_stride == ENTRY_BYTES
+        and kernel_profile in (0, 1)
+        and kernel_profile_clock_mhz > 0
         and requests > 0
+        and requests % REQUESTS_PER_BATCH == 0
         and requests <= full_validation_capacity
         and table_capacity >= PUT_BATCH_SIZE
         and table_capacity % PUT_BATCH_SIZE == 0
@@ -163,14 +320,17 @@ def main(batch: int = 16) -> int:
         all_keys[batch_index * PUT_BATCH_SIZE : (batch_index + 1) * PUT_BATCH_SIZE]
         for batch_index in range(total_put_batches)
     ]
-    offsets = [row * block_bytes for row in range(PUT_BATCH_SIZE)]
-    lengths = [block_bytes] * PUT_BATCH_SIZE
+    put_offsets = [row * ENTRY_BYTES for row in range(PUT_BATCH_SIZE)]
+    lengths = [ENTRY_BYTES] * PUT_BATCH_SIZE
 
     torch.npu.set_device(device_id)
     device = f"npu:{device_id}"
-    row_pattern = torch.arange(block_bytes, dtype=torch.int64, device=device).to(torch.uint8)
-    kv_data = row_pattern.repeat(PUT_BATCH_SIZE, 1).contiguous()
-    output_indices = torch.arange(requests, dtype=torch.int32, device=device)
+    token_rows = torch.arange(ROWS_PER_ENTRY, dtype=torch.int64, device=device).unsqueeze(1)
+    token_bytes = torch.arange(WQE_BYTES, dtype=torch.int64, device=device).unsqueeze(0)
+    entry_pattern = (
+        (token_rows * 131 + token_bytes * 17 + (token_bytes >> 3)) & 0xFF
+    ).to(torch.uint8).contiguous()
+    kv_data = entry_pattern.reshape(1, ENTRY_BYTES).repeat(PUT_BATCH_SIZE, 1)
     output = torch.empty((requests, block_bytes), dtype=torch.uint8, device=device)
     runtime = kvaf.NpuRuntime(
         str(kernel), device_id, npu_core_count, str(batch_put_kernel),
@@ -188,17 +348,20 @@ def main(batch: int = 16) -> int:
         print(
             "RUNTIME_PERF_CONFIG "
             f"transport=cpu_service_link batch={batch} table_capacity={table_capacity} "
-            f"ddr_bytes={ddr_bytes} put_batch_size={PUT_BATCH_SIZE} "
+            f"total_tokens={total_tokens} ddr_bytes={ddr_bytes} "
+            f"put_batch_size={PUT_BATCH_SIZE} "
             f"requests={requests} active_percent={active_percent} "
             f"active_requests={active_requests} block_bytes={block_bytes} source_stride={source_stride} "
             f"aiv_cores={npu_core_count} jettys_per_core={jettys_per_core} "
             f"warmup={warmup} iterations={iterations} "
+            f"kernel_profile={kernel_profile} "
+            f"kernel_profile_clock_mhz={kernel_profile_clock_mhz} "
             "batch_put_backend=aiv_direct_hccp timing=call_to_stream_completion"
         )
 
         print("RUNTIME_PERF_PHASE_BEGIN phase=initialize")
         begin = time.perf_counter()
-        runtime.initialize(table_capacity * block_bytes, source_stride)
+        runtime.initialize(ddr_bytes, source_stride)
         initialize_ms = (time.perf_counter() - begin) * 1000.0
         print(f"PERF_RESULT operation=initialize samples=1 elapsed_ms={initialize_ms:.3f} kind=lifecycle")
         print("RUNTIME_PERF_PHASE_DONE phase=initialize")
@@ -206,13 +369,14 @@ def main(batch: int = 16) -> int:
         # Verify the complete CPU-DDR data path before accepting steady-state samples.
         print("RUNTIME_PERF_PHASE_BEGIN phase=correctness_preflight")
         preflight_keys = list(range(table_capacity + 1, table_capacity + PUT_BATCH_SIZE + 1))
-        runtime.batch_put(preflight_keys, kv_data, offsets, lengths)
+        runtime.batch_put(preflight_keys, kv_data, put_offsets, lengths)
         torch.npu.synchronize()
         preflight_table = runtime.prepare_access_table(preflight_keys)
         preflight_device_table = runtime.access_table_view(
             preflight_table, device="npu", capacity=PUT_BATCH_SIZE
         )
         preflight_indices = torch.arange(PUT_BATCH_SIZE, dtype=torch.int32, device=device)
+        preflight_offsets = torch.zeros(PUT_BATCH_SIZE, dtype=torch.int32, device=device)
         preflight_mask = torch.ones(PUT_BATCH_SIZE, dtype=torch.uint8, device=device)
         preflight_output = torch.empty(
             (PUT_BATCH_SIZE, block_bytes), dtype=torch.uint8, device=device
@@ -220,12 +384,16 @@ def main(batch: int = 16) -> int:
         runtime.batch_get(
             preflight_device_table,
             preflight_indices,
+            preflight_offsets,
             preflight_mask,
             preflight_indices,
             preflight_output,
         )
         torch.npu.synchronize()
-        if not torch.equal(preflight_output, kv_data):
+        if not torch.equal(
+            preflight_output,
+            entry_pattern[0].expand(PUT_BATCH_SIZE, -1),
+        ):
             raise AssertionError("Runtime performance preflight BatchPut/BatchGet validation failed")
         runtime.release_access_table(preflight_table)
         preflight_table = None
@@ -238,25 +406,25 @@ def main(batch: int = 16) -> int:
 
         print("RUNTIME_PERF_PHASE_BEGIN phase=batch_put")
         for key_batch in key_batches[:warmup]:
-            runtime.batch_put(key_batch, kv_data, offsets, lengths)
+            runtime.batch_put(key_batch, kv_data, put_offsets, lengths)
         torch.npu.synchronize()
         batch_put_samples: list[float] = []
         for key_batch in key_batches[warmup : warmup + iterations]:
             begin = time.perf_counter()
-            runtime.batch_put(key_batch, kv_data, offsets, lengths)
+            runtime.batch_put(key_batch, kv_data, put_offsets, lengths)
             torch.npu.synchronize()
             batch_put_samples.append((time.perf_counter() - begin) * 1000.0)
         print_samples(
             "batch_put", batch_put_samples, warmup,
             f"{PUT_BATCH_SIZE}_kv_blocks_per_call",
-            PUT_BATCH_SIZE * block_bytes,
+            PUT_BATCH_SIZE * ENTRY_BYTES,
         )
 
         # Finish the one-time data population. It is deliberately excluded
         # from BatchPut samples, but is necessary for a full AccessTable and
         # valid random BatchGet indices.
         for key_batch in key_batches[warmup + iterations :]:
-            runtime.batch_put(key_batch, kv_data, offsets, lengths)
+            runtime.batch_put(key_batch, kv_data, put_offsets, lengths)
         torch.npu.synchronize()
         print("RUNTIME_PERF_PHASE_DONE phase=batch_put")
 
@@ -288,6 +456,9 @@ def main(batch: int = 16) -> int:
 
         validation_requests = min(requests, table_capacity)
         validation_indices = torch.arange(validation_requests, dtype=torch.int32, device=device)
+        validation_offsets = (
+            validation_indices % ROWS_PER_ENTRY
+        ) * WQE_BYTES
         validation_mask = torch.ones(validation_requests, dtype=torch.uint8, device=device)
         validation_output = torch.empty(
             (validation_requests, block_bytes), dtype=torch.uint8, device=device
@@ -295,51 +466,239 @@ def main(batch: int = 16) -> int:
         runtime.batch_get(
             device_table,
             validation_indices,
+            validation_offsets,
             validation_mask,
             validation_indices,
             validation_output,
         )
         torch.npu.synchronize()
-        if not torch.equal(validation_output, row_pattern.expand(validation_requests, -1)):
+        expected_validation = entry_pattern[
+            validation_indices.to(torch.int64) % ROWS_PER_ENTRY
+        ]
+        if not torch.equal(validation_output, expected_validation):
             raise AssertionError("Runtime performance BatchGet validation failed")
         print(
             "RUNTIME_PERF_CORRECTNESS_PASS "
             f"phase=full_table requests={validation_requests} block_bytes={block_bytes}"
         )
 
-        # Pre-create random accesses with an exact active count. This setup is
-        # excluded from BatchGet samples; every sample ends at stream completion.
-        indices_batches = [
-            torch.randint(0, table_capacity, (requests,), dtype=torch.int32, device=device)
-            for _ in range(warmup + iterations)
-        ]
-        mask_batches = []
-        for _ in range(warmup + iterations):
-            mask = torch.zeros(requests, dtype=torch.uint8, device=device)
-            if active_requests == requests:
-                mask.fill_(1)
-            else:
-                mask[torch.randperm(requests, device=device)[:active_requests]] = 1
-            mask_batches.append(mask)
-        torch.npu.synchronize()
+        # Pre-create only source plans. Tensor derivation is profiled directly
+        # before the corresponding BatchGet call.
+        probability = active_percent / 100.0
+        sample_count = warmup + iterations
+        request_groups = requests // REQUESTS_PER_BATCH
+        source_token_id_batches = []
+        destination_slot_batches = []
+        miss_count_batches = []
+        source_profile_samples: dict[str, list[float]] = {
+            "source_token_ids": [],
+            "destination_slots": [],
+            "miss_count": [],
+            "source_plan": [],
+        }
+        for sample_index in range(sample_count):
+            sample_begin = time.perf_counter()
+            source_token_ids = torch.randint(
+                0, total_tokens, (requests,), dtype=torch.int32, device=device
+            )
+            torch.npu.synchronize()
+            source_token_ids_ready = time.perf_counter()
+
+            destination_slots = torch.randperm(requests, device=device).to(torch.int32)
+            torch.npu.synchronize()
+            destination_slots_ready = time.perf_counter()
+
+            miss_count = (
+                torch.rand(
+                    (request_groups, REQUESTS_PER_BATCH - 1), device=device
+                )
+                < probability
+            ).sum(dim=1).to(torch.int32)
+            torch.npu.synchronize()
+            source_plan_ready = time.perf_counter()
+
+            source_token_id_batches.append(source_token_ids)
+            destination_slot_batches.append(destination_slots)
+            miss_count_batches.append(miss_count)
+            if sample_index >= warmup:
+                source_profile_samples["source_token_ids"].append(
+                    (source_token_ids_ready - sample_begin) * 1000.0
+                )
+                source_profile_samples["destination_slots"].append(
+                    (destination_slots_ready - source_token_ids_ready) * 1000.0
+                )
+                source_profile_samples["miss_count"].append(
+                    (source_plan_ready - destination_slots_ready) * 1000.0
+                )
+                source_profile_samples["source_plan"].append(
+                    (source_plan_ready - sample_begin) * 1000.0
+                )
+
+        miss_count_host = torch.stack(miss_count_batches).cpu()
+        if bool((miss_count_host >= REQUESTS_PER_BATCH).any().item()):
+            raise AssertionError("miss_count must be smaller than 2048")
+        mean_active_requests = float(miss_count_host.sum().item()) / sample_count
+        target_active_requests = requests * probability
+        print(
+            "RUNTIME_PERF_BATCH_GET_INPUTS_READY "
+            f"samples={sample_count} total_tokens={total_tokens} "
+            f"requests_per_sample={requests} requests_per_group=2048 "
+            f"mean_active_requests={mean_active_requests:.3f} "
+            f"target_active_requests={target_active_requests:.3f} "
+            "source_token_ids=random destination_slots=random_permutation "
+            "mask_layout=miss_count_prefix"
+        )
+        for stage in (
+            "source_token_ids",
+            "destination_slots",
+            "miss_count",
+            "source_plan",
+        ):
+            print_samples(
+                f"batch_get_{stage}", source_profile_samples[stage], warmup,
+                f"{requests}_requests_per_call",
+            )
 
         print("RUNTIME_PERF_PHASE_BEGIN phase=batch_get")
-        for index, mask in zip(indices_batches[:warmup], mask_batches[:warmup]):
-            runtime.batch_get(device_table, index, mask, output_indices, output)
-        torch.npu.synchronize()
-        batch_get_samples: list[float] = []
-        for index, mask in zip(
-            indices_batches[warmup:], mask_batches[warmup:]
+        if kernel_profile:
+            runtime.start_batch_get_kernel_profile()
+        warmup_inputs = []
+        for source_token_ids, destination_slots, miss_count in zip(
+            source_token_id_batches[:warmup],
+            destination_slot_batches[:warmup],
+            miss_count_batches[:warmup],
         ):
-            begin = time.perf_counter()
-            runtime.batch_get(device_table, index, mask, output_indices, output)
+            indices = source_token_ids // ROWS_PER_ENTRY
             torch.npu.synchronize()
-            batch_get_samples.append((time.perf_counter() - begin) * 1000.0)
+            offsets = (source_token_ids % ROWS_PER_ENTRY) * WQE_BYTES
+            torch.npu.synchronize()
+            output_indices = destination_slots.clone()
+            torch.npu.synchronize()
+            mask = (
+                torch.arange(
+                    REQUESTS_PER_BATCH, dtype=torch.int32, device=device
+                ).unsqueeze(0)
+                < miss_count.unsqueeze(1)
+            ).reshape(requests).to(torch.uint8)
+            torch.npu.synchronize()
+            warmup_inputs.append((indices, offsets, output_indices, mask))
+            runtime.batch_get(
+                device_table, indices, offsets, mask, output_indices, output
+            )
+        torch.npu.synchronize()
+        warmup_inputs.clear()
+
+        batch_get_samples: list[float] = []
+        kernel_profile_samples: list[list[dict[str, object]]] = []
+        input_profile_samples: dict[str, list[float]] = {
+            "indices": [],
+            "offsets": [],
+            "output_indices": [],
+            "mask": [],
+            "prepare_inputs": [],
+            "submit": [],
+            "synchronize": [],
+            "sample_total": [],
+        }
+        for source_token_ids, destination_slots, miss_count in zip(
+            source_token_id_batches[warmup:],
+            destination_slot_batches[warmup:],
+            miss_count_batches[warmup:],
+        ):
+            sample_begin = time.perf_counter()
+            begin = sample_begin
+            indices = source_token_ids // ROWS_PER_ENTRY
+            torch.npu.synchronize()
+            input_profile_samples["indices"].append(
+                (time.perf_counter() - begin) * 1000.0
+            )
+
+            begin = time.perf_counter()
+            offsets = (source_token_ids % ROWS_PER_ENTRY) * WQE_BYTES
+            torch.npu.synchronize()
+            input_profile_samples["offsets"].append(
+                (time.perf_counter() - begin) * 1000.0
+            )
+
+            begin = time.perf_counter()
+            output_indices = destination_slots.clone()
+            torch.npu.synchronize()
+            input_profile_samples["output_indices"].append(
+                (time.perf_counter() - begin) * 1000.0
+            )
+
+            begin = time.perf_counter()
+            mask = (
+                torch.arange(
+                    REQUESTS_PER_BATCH, dtype=torch.int32, device=device
+                ).unsqueeze(0)
+                < miss_count.unsqueeze(1)
+            ).reshape(requests).to(torch.uint8)
+            torch.npu.synchronize()
+            inputs_ready = time.perf_counter()
+            input_profile_samples["mask"].append(
+                (inputs_ready - begin) * 1000.0
+            )
+            input_profile_samples["prepare_inputs"].append(
+                (inputs_ready - sample_begin) * 1000.0
+            )
+
+            begin = inputs_ready
+            runtime.batch_get(
+                device_table, indices, offsets, mask, output_indices, output
+            )
+            submitted = time.perf_counter()
+            torch.npu.synchronize()
+            completed = time.perf_counter()
+            input_profile_samples["submit"].append(
+                (submitted - begin) * 1000.0
+            )
+            input_profile_samples["synchronize"].append(
+                (completed - submitted) * 1000.0
+            )
+            batch_get_samples.append((completed - begin) * 1000.0)
+            input_profile_samples["sample_total"].append(
+                (completed - sample_begin) * 1000.0
+            )
+            if kernel_profile:
+                kernel_profile_samples.append(
+                    list(runtime.batch_get_kernel_profile())
+                )
+
+        for stage in (
+            "indices",
+            "offsets",
+            "output_indices",
+            "mask",
+            "prepare_inputs",
+            "submit",
+            "synchronize",
+        ):
+            print_samples(
+                f"batch_get_{stage}", input_profile_samples[stage], warmup,
+                f"{requests}_requests_per_call",
+            )
         print_samples(
             "batch_get", batch_get_samples, warmup,
-            f"{active_requests}_active_of_{requests}_requests_per_call",
-            active_requests * block_bytes,
+            f"{mean_active_requests:.3f}_mean_active_of_{requests}_requests_per_call",
+            int(mean_active_requests * block_bytes),
         )
+        print_samples(
+            "batch_get_sample_total",
+            input_profile_samples["sample_total"],
+            warmup,
+            f"{requests}_requests_per_call",
+        )
+        if kernel_profile:
+            print_kernel_profile(
+                kernel_profile_samples,
+                warmup,
+                kernel_profile_clock_mhz,
+                npu_core_count,
+                jettys_per_core,
+                requests,
+            )
+            runtime.stop_batch_get_kernel_profile()
         print("RUNTIME_PERF_PHASE_DONE phase=batch_get")
 
         # The full-table lock must be released before BatchFree can reclaim its

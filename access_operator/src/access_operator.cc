@@ -151,9 +151,12 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
   }
   const BatchGetRequest& request = *exec.request;
   if (!request.indices.has_elements<std::int32_t>() ||
+      !request.offsets.has_elements<std::int32_t>() ||
       !request.output_indices.has_elements<std::int32_t>() ||
-      !request.output.valid() || request.output_block_bytes == 0 ||
+      !request.output.valid() ||
+      request.output_block_bytes != kBatchGetTransferBytes ||
       request.output.bytes % request.output_block_bytes != 0 ||
+      request.indices.device != request.offsets.device ||
       request.indices.device != request.output_indices.device ||
       request.indices.device != request.output.device ||
       request.indices.device != DeviceKind::kNpu ||
@@ -166,8 +169,9 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
       request.device_access_table.addresses.bytes % sizeof(Address) != 0 ||
       request.device_access_table.valid.bytes !=
           request.device_access_table.addresses.bytes / sizeof(Address) ||
-      request.output_block_bytes == 0 || exec.host_access_table.size == 0 ||
+      request.output_block_bytes == 0 ||
       request.indices.bytes % sizeof(std::int32_t) != 0 ||
+      request.offsets.bytes != request.indices.bytes ||
       request.output_indices.bytes != request.indices.bytes ||
       request.mask.bytes != request.indices.bytes / sizeof(std::int32_t) ||
       execution.status == nullptr ||
@@ -192,6 +196,7 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
   arguments->address_table = PointerValue(request.device_access_table.addresses.data);
   arguments->valid_table = PointerValue(request.device_access_table.valid.data);
   arguments->indices = PointerValue(request.indices.data);
+  arguments->offsets = PointerValue(request.offsets.data);
   arguments->mask = PointerValue(request.mask.data);
   arguments->output_indices = PointerValue(request.output_indices.data);
   arguments->output = PointerValue(request.output.data);
@@ -200,7 +205,7 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
   arguments->table_capacity = static_cast<std::uint32_t>(device_table_entries);
   arguments->request_capacity = static_cast<std::uint32_t>(request_count);
   arguments->output_rows = static_cast<std::uint32_t>(output_rows);
-  arguments->block_bytes = static_cast<std::uint32_t>(request.output_block_bytes);
+  arguments->block_bytes = KVAF_AIV_BATCH_GET_WQE_DATA_BYTES;
   arguments->block_count = npu_core_count;
   arguments->jettys_per_core = jettys_per_core;
   return Status::OK();
@@ -452,6 +457,88 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
     // Releasing after an externally captured launch keeps KVAF graph-agnostic;
     // the caller owns stream completion and tensor lifetime.
     KvafBatchGetLocalBufferRelease(local_buffer);
+  }
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::SetBatchGetKernelProfiling(bool enabled) {
+  if (!impl_->initialized || impl_->execution.status == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  std::vector<KvafBatchGetCoreStatus> statuses(
+      impl_->config.npu_core_count);
+  if (enabled) {
+    for (KvafBatchGetCoreStatus& status : statuses) {
+      status.profile.magic = KVAF_AIV_BATCH_GET_PROFILE_MAGIC;
+    }
+  }
+  if (aclrtMemcpy(impl_->execution.status, impl_->execution.status_bytes,
+                  statuses.data(), statuses.size() * sizeof(statuses.front()),
+                  ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
+    return Internal("failed to configure BatchGet kernel profiling");
+  }
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
+    std::vector<BatchGetKernelProfile>* profiles) const {
+  if (profiles == nullptr) {
+    return InvalidArgument("BatchGet kernel profile output must not be null");
+  }
+  if (!impl_->initialized || impl_->execution.status == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  std::vector<KvafBatchGetCoreStatus> statuses(
+      impl_->config.npu_core_count);
+  if (aclrtMemcpy(statuses.data(), statuses.size() * sizeof(statuses.front()),
+                  impl_->execution.status, impl_->execution.status_bytes,
+                  ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
+    return Internal("failed to copy BatchGet kernel profiles");
+  }
+  profiles->clear();
+  profiles->reserve(statuses.size());
+  for (const KvafBatchGetCoreStatus& status : statuses) {
+    const KvafBatchGetCoreProfile& source = status.profile;
+    const bool invalid_doorbell =
+        (source.first_doorbell_cycle != 0U &&
+         (source.first_doorbell_cycle < source.compact_done_cycle ||
+          source.first_doorbell_cycle > source.post_done_cycle)) ||
+        (status.result == 0U && source.active_requests != 0U &&
+         source.first_doorbell_cycle == 0U) ||
+        (source.active_requests == 0U &&
+         source.first_doorbell_cycle != 0U);
+    if (status.magic != KVAF_AIV_BATCH_GET_STATUS_MAGIC ||
+        status.result != 0U ||
+        source.magic != KVAF_AIV_BATCH_GET_PROFILE_MAGIC ||
+        source.kernel_start_cycle > source.setup_done_cycle ||
+        source.setup_done_cycle > source.compact_done_cycle ||
+        source.compact_done_cycle > source.post_done_cycle ||
+        source.post_done_cycle > source.completion_done_cycle ||
+        source.completion_done_cycle > source.kernel_finish_cycle ||
+        invalid_doorbell) {
+      profiles->clear();
+      return Internal("BatchGet kernel returned an invalid profile timeline");
+    }
+    BatchGetKernelProfile destination;
+    destination.kernel_start_cycle = source.kernel_start_cycle;
+    destination.setup_done_cycle = source.setup_done_cycle;
+    destination.compact_done_cycle = source.compact_done_cycle;
+    destination.first_doorbell_cycle = source.first_doorbell_cycle;
+    destination.post_done_cycle = source.post_done_cycle;
+    destination.completion_done_cycle = source.completion_done_cycle;
+    destination.kernel_finish_cycle = source.kernel_finish_cycle;
+    destination.active_requests = source.active_requests;
+    destination.total_posts = source.total_posts;
+    for (std::size_t jetty = 0;
+         jetty < destination.jetty_completion_wait_cycles.size(); ++jetty) {
+      destination.jetty_completion_wait_cycles[jetty] =
+          source.jetty_completion_wait_cycles[jetty];
+      destination.jetty_completion_polls[jetty] =
+          source.jetty_completion_polls[jetty];
+    }
+    profiles->push_back(destination);
   }
   return Status::OK();
 }

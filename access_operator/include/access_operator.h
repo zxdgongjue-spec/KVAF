@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "requests.h"
 #include "status.h"
@@ -54,6 +55,20 @@ struct AccessOperatorConfig {
   std::shared_ptr<PeerLink> peer_link;
 };
 
+struct BatchGetKernelProfile {
+  std::uint64_t kernel_start_cycle{0};
+  std::uint64_t setup_done_cycle{0};
+  std::uint64_t compact_done_cycle{0};
+  std::uint64_t first_doorbell_cycle{0};
+  std::uint64_t post_done_cycle{0};
+  std::uint64_t completion_done_cycle{0};
+  std::uint64_t kernel_finish_cycle{0};
+  std::uint64_t active_requests{0};
+  std::uint64_t total_posts{0};
+  std::array<std::uint64_t, 2> jetty_completion_wait_cycles{};
+  std::array<std::uint64_t, 2> jetty_completion_polls{};
+};
+
 // Default synchronous NPU data-plane implementation.
 //
 // Initialize creates reusable BatchGet and (when configured) BatchPut
@@ -78,6 +93,12 @@ class DefaultAccessOperator final : public AccessOperator {
   Status Shutdown() override;
   Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
   Status ExecuteBatchPut(const BatchPutExecRequest& request) override;
+
+  // Profiling is opt-in and uses the reserved per-core status area. Callers
+  // must complete the BatchGet stream before copying the latest snapshot.
+  Status SetBatchGetKernelProfiling(bool enabled);
+  Status CopyBatchGetKernelProfiles(
+      std::vector<BatchGetKernelProfile>* profiles) const;
 
  private:
   struct Impl;

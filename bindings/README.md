@@ -25,10 +25,12 @@ buffer 写入地址稳定的 NPU tensor，再调用 `replay`。`source` 的所�
 `DeviceAccessTable`，其中保存 NPU `addresses` / `valid` Tensor；
 `NpuRuntime.prepare_access_table` 同时接受 Python key 序列或一维、连续的 CPU
 `torch.int64` Tensor；大表应使用后者，避免 Python 逐元素转换。
-`NpuRuntime.batch_get(device_access_table, indices, mask, output_indices, output,
-stream=None, synchronize=False)` 直接接收 NPU Tensor。它不暴露 data pointer、字节数、
+`NpuRuntime.batch_get(device_access_table, indices, offsets, mask, output_indices,
+output, stream=None, synchronize=False)` 直接接收 NPU Tensor，也支持
+`batch_get(addresses, valid, indices, offsets, mask, output_indices, output, ...)`
+重载，以使用调用方持有的设备表 Tensor。它不暴露 data pointer、字节数、
 output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数由 output Tensor
-第 0 维之后的连续元素推导，也不返回伪装成完成时间的数值。
+第 0 维之后的连续元素推导并固定为 656B，也不返回伪装成完成时间的数值。
 
 `NpuRuntime(batch_get_kernel_object_path, device_id=0, npu_core_count=1,
 batch_put_kernel_object_path="", jettys_per_core=2)` 的 `jettys_per_core` 参数同时
@@ -43,6 +45,10 @@ BatchPut kernel 时，该方法保留 ACL D2H mock，便于只验证 BatchGet �
 stream 时使用 `torch.npu.current_stream()`。KVAF 不创建、不保存或销毁调用方的 stream；
 图 capture、replay 和生命周期仍由上层框架负责。同一 stream 上的后续 Torch/ACL 操作
 自然按序；跨 stream 依赖由调用方建立。
+
+性能诊断可调用 `start_batch_get_kernel_profile()` 开启逐 core cycle 采集，
+`batch_get_kernel_profile()` 获取最新 snapshot，或用
+`stop_batch_get_kernel_profile()` 获取最后一次 snapshot 并关闭采集。
 
 Binding 不负责 vLLM 适配。后续只在 Runtime、Meta Manager 和 KV Access Operator 的 C++ 接口稳定后，将需要暴露的类和方法注册到 Python。
 
