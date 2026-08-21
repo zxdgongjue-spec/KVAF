@@ -1,25 +1,51 @@
 # KVAF
 
-KVAF 是面向 NPU KV Cache 的 Runtime 原型。它将 CPU DDR 资源服务与 NPU
-BatchGet/BatchPut 数据面拆为两个独立进程：CPU 进程持有 DDR 和 UMDK 资源，NPU
-进程持有 CANN、AIV 算子、元数据和 Python 调用入口。
+KVAF 是面向 KV Cache 的 Runtime。它负责管理 KV block 在远端 DDR 中的地址、
+生命周期和访问一致性，并通过可替换的 AccessOperator 执行 BatchPut/BatchGet
+数据搬运。当前硬件实现使用 NPU AIV 算子通过 UB/RMA 访问 CPU DDR；本地 Mock
+实现用于不具备硬件环境时验证 Runtime 语义。
+
+KVAF 不实现 Prefix Cache 策略、调度器或 vLLM 业务逻辑。上层 Adapter 负责将模型
+请求映射为 Key、block 和 Tensor；KVAF 负责这些 Key 对应的远端存储和批量访问。
 
 ```text
-CPU 主机                                              NPU 主机
-────────                                              ────────
-kvaf_cpu_service                                      kvaf.NpuRuntime
-  CpuRuntime                                            LinkTo(cpu_ip:port)
-  - CPU DDR                                             - MetaManager
-  - UMDK segment / token / Jetty                        - AIV BatchPut / BatchGet
-  - session 资源回收                                   - NPU AccessTable
-        │                                                        │
-        └──────── TCP：DDR 申请、EID、CTP、QP key ──────────────┘
-                                                                 │
-                                  UB / RMA：AIV 直接读写 CPU DDR
+调用方 / vLLM Adapter（仓外）
+             │ Key、KV block、NPU Tensor
+             ▼
+        KVAF Runtime
+        RuntimeCore
+     ┌───────┴────────┐
+     ▼                ▼
+MetaManager      AccessOperator
+Key → DDR 地址    BatchPut / BatchGet 数据面
+     │                │
+     └───────┬────────┘
+             ▼
+         远端 DDR region
 ```
 
-TCP 只承载控制信息；KV 数据不会经过 TCP。NPU AIV kernel 完成实际的 UB/RMA
-读写。
+## Runtime 核心能力
+
+`RuntimeCore` 组合 `MetaManager`、`AccessOperator` 和内部 DDR allocator，提供
+同步的 KV 生命周期：
+
+| 接口 | 语义 |
+| --- | --- |
+| `Initialize` | 申请并注册一块可管理的远端 DDR，初始化数据面并向 MetaManager 注册 region。任一步失败都会释放已获得资源。 |
+| `BatchPut` | 先由 MetaManager 为 Key 预留 slot，再由 Operator 搬运数据；搬运成功后提交映射，失败则回滚预留 slot。 |
+| `PrepareAccessTable` | 对一批 Key 建立稳定读快照，生成扁平的 address/length/valid 访问表。 |
+| `BatchGet` | 使用 AccessTable 和调用方输入提交批量读取；NPU 路径默认只向指定 stream 入队。 |
+| `ReleaseAccessTable` | 释放稳定读快照，解除 Key 的 pin。 |
+| `BatchFree` | 回收 Key 的 DDR slot；仍被 AccessTable 持有的 Key 不会被提前释放。 |
+| `Shutdown` | 关闭数据面、释放远端 DDR 和 Runtime 内部状态。 |
+
+MetaManager 是内存态的 Key → 远端地址映射。它将写入分为“预留、搬运、提交”三个
+阶段，避免写入失败的 Key 被读路径看到；读路径通过稳定快照避免 BatchGet 与 BatchFree
+并发时访问失效地址。
+
+调用方持有输入/输出 buffer、NPU Tensor 和 stream；KVAF 持有远端 DDR、元数据、
+AccessTable 锁和内部传输资源。调用方必须在同一 BatchGet stream 完成前保持相关 Tensor
+和 `DeviceAccessTable` 有效。
 
 ## 模块
 
@@ -32,7 +58,27 @@ TCP 只承载控制信息；KV 数据不会经过 TCP。NPU AIV kernel 完成实
 | `bindings/` | 可选的 pybind 模块，导出 Python `kvaf.NpuRuntime` 和 Mock Runtime。 |
 | `tests/` | Python Mock 测试、CPU 服务/NPU 进程端到端测试和 Runtime 性能测试。 |
 
-## 已支持能力
+## CPU/NPU 分离部署
+
+CPU/NPU 分离是当前 AIV 数据面的部署方式：CPU 进程提供远端 DDR 和 UMDK 资源，
+NPU 进程运行 KVAF RuntimeCore、MetaManager 和 AIV AccessOperator。
+
+```text
+CPU 主机                                              NPU 主机
+────────                                              ────────
+kvaf_cpu_service                                      kvaf.NpuRuntime
+  CpuRuntime                                            RuntimeCore
+  - CPU DDR                                             - MetaManager
+  - UMDK segment / token / Jetty                        - AIV BatchPut / BatchGet
+  - session 资源回收                                   - NPU AccessTable
+        │                                                        │
+        └──────── TCP：DDR 申请、EID、CTP、QP key ──────────────┘
+                                                                 │
+                                  UB / RMA：AIV 直接读写 CPU DDR
+```
+
+TCP 只承载控制信息；KV 数据不会经过 TCP。NPU AIV kernel 完成实际的 UB/RMA
+读写。
 
 ### CPU Runtime
 
