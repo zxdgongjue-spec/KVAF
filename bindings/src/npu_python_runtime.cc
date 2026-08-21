@@ -150,12 +150,22 @@ aclrtStream ResolveStream(const py::object& stream) {
 
 class NpuPythonRuntime final {
  public:
-  NpuPythonRuntime(std::string batch_get_kernel_object_path, std::uint32_t device_id,
-                   std::uint32_t npu_core_count, std::string batch_put_kernel_object_path,
-                   std::uint32_t jettys_per_core)
-      : native_(std::make_unique<::kvaf::NpuRuntime>(NpuRuntimeOptions{
-            std::move(batch_get_kernel_object_path), std::move(batch_put_kernel_object_path),
-            device_id, npu_core_count, jettys_per_core})) {}
+  NpuPythonRuntime(std::string batch_get_kernel_object_path,
+                   std::uint32_t batch_get_token_bytes,
+                   std::uint32_t batch_get_tokens_per_block,
+                   std::uint32_t device_id, std::uint32_t npu_core_count,
+                   std::string batch_put_kernel_object_path,
+                   std::uint32_t jettys_per_core) {
+    NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
+                              batch_get_token_bytes,
+                              batch_get_tokens_per_block};
+    options.batch_put_kernel_object_path =
+        std::move(batch_put_kernel_object_path);
+    options.device_id = device_id;
+    options.npu_core_count = npu_core_count;
+    options.jettys_per_core = jettys_per_core;
+    native_ = std::make_unique<::kvaf::NpuRuntime>(std::move(options));
+  }
 
   void LinkTo(std::string address) {
     ThrowIfError(native_->LinkTo(LinkTarget{std::move(address)}));
@@ -169,6 +179,12 @@ class NpuPythonRuntime final {
   std::uint32_t DeviceId() const { return native_->device_id(); }
   std::uint32_t NpuCoreCount() const { return native_->npu_core_count(); }
   std::uint32_t JettysPerCore() const { return native_->jettys_per_core(); }
+  std::uint32_t BatchGetTokenBytes() const {
+    return native_->batch_get_token_bytes();
+  }
+  std::uint32_t BatchGetTokensPerBlock() const {
+    return native_->batch_get_tokens_per_block();
+  }
 
   py::dict RemoteRegion() const {
     const RemoteRegionDesc& region = native_->core().remote_region();
@@ -353,8 +369,9 @@ class NpuPythonRuntime final {
     const std::uint64_t output_rows =
         static_cast<std::uint64_t>(output_view.shape.front());
     const std::uint64_t output_block_bytes = output_view.bytes / output_rows;
-    if (output_block_bytes != kBatchGetTransferBytes) {
-      throw py::value_error("BatchGet output Tensor rows must each be 656 bytes");
+    if (output_block_bytes != native_->batch_get_token_bytes()) {
+      throw py::value_error(
+          "BatchGet output Tensor row size does not match batch_get_token_bytes");
     }
     const BatchGetRequest request{
         access_table,
@@ -365,6 +382,7 @@ class NpuPythonRuntime final {
                         DeviceKind::kNpu},
         MutableBufferView{output_view.data, output_view.bytes, DeviceKind::kNpu},
         output_block_bytes,
+        native_->batch_get_tokens_per_block(),
         AccessTableDeviceView{
             ConstBufferView{address_view.data, address_view.bytes, DeviceKind::kNpu},
             ConstBufferView{valid_view.data, valid_view.bytes, DeviceKind::kNpu}}};
@@ -394,9 +412,11 @@ void BindNpuPythonRuntime(py::module_& module) {
       });
 
   py::class_<NpuPythonRuntime>(module, "NpuRuntime")
-      .def(py::init<std::string, std::uint32_t, std::uint32_t, std::string,
-                    std::uint32_t>(),
-           py::arg("batch_get_kernel_object_path"), py::arg("device_id") = 0,
+      .def(py::init<std::string, std::uint32_t, std::uint32_t, std::uint32_t,
+                    std::uint32_t, std::string, std::uint32_t>(),
+           py::arg("batch_get_kernel_object_path"),
+           py::arg("batch_get_token_bytes"),
+           py::arg("batch_get_tokens_per_block"), py::arg("device_id") = 0,
            py::arg("npu_core_count") = 1,
            py::arg("batch_put_kernel_object_path") = "",
            py::arg("jettys_per_core") = 2)
@@ -409,6 +429,10 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def_property_readonly("device_id", &NpuPythonRuntime::DeviceId)
       .def_property_readonly("npu_core_count", &NpuPythonRuntime::NpuCoreCount)
       .def_property_readonly("jettys_per_core", &NpuPythonRuntime::JettysPerCore)
+      .def_property_readonly("batch_get_token_bytes",
+                             &NpuPythonRuntime::BatchGetTokenBytes)
+      .def_property_readonly("batch_get_tokens_per_block",
+                             &NpuPythonRuntime::BatchGetTokensPerBlock)
       .def_property_readonly("remote_region", &NpuPythonRuntime::RemoteRegion)
       .def("batch_put", &NpuPythonRuntime::BatchPut, py::arg("keys"),
            py::arg("source"), py::arg("input_offsets"), py::arg("lengths"),

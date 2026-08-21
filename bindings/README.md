@@ -30,10 +30,15 @@ output, stream=None, synchronize=False)` 直接接收 NPU Tensor，也支持
 `batch_get(addresses, valid, indices, offsets, mask, output_indices, output, ...)`
 重载，以使用调用方持有的设备表 Tensor。它不暴露 data pointer、字节数、
 output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数由 output Tensor
-第 0 维之后的连续元素推导并固定为 656B，也不返回伪装成完成时间的数值。
+第 0 维之后的连续元素推导，并必须与配置的 `batch_get_token_bytes`
+一致；接口不返回伪装成完成时间的数值。
 
-`NpuRuntime(batch_get_kernel_object_path, device_id=0, npu_core_count=1,
-batch_put_kernel_object_path="", jettys_per_core=2)` 的 `jettys_per_core` 参数同时
+`NpuRuntime(batch_get_kernel_object_path, batch_get_token_bytes,
+batch_get_tokens_per_block, device_id=0, npu_core_count=1,
+batch_put_kernel_object_path="", jettys_per_core=2)` 要求显式传入单 token KV
+字节数和每个 KV block 中的 token 数，两个参数均无默认值；
+每个 AccessTable entry 大小为两者乘积。
+`jettys_per_core` 参数同时
 配置 BatchGet 和 BatchPut 每个 AIV core 使用的 Jetty 数量，可选 1 或 2 个独立 Jetty。
 远程 CPU DDR 只增加 `runtime.link_to("CPU_IP:port")`，必须在 `initialize` 前调用；
 EID、UMDK device 与候选 RMA 验证由 C++ Runtime 自动完成，Python 不传递这些硬件细节。

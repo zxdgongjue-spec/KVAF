@@ -62,7 +62,9 @@ runtime.batch_get(
 
 其中所有数据参数均为连续 NPU Tensor；输出行字节数从 `output.shape[0]` 推导，默认
 使用 `torch.npu.current_stream()` 且只提交不主动同步。AIV 内部 status/queue 不属于
-Python API。每个远端表项固定包含 `128 * 656B`，`offsets` 是表项内字节偏移，
-每个有效请求读取 656B。直接传 `addresses` / `valid` 时，调用方负责表项布局和
+Python API。`NpuRuntime` 的 `batch_get_token_bytes` 配置单 token KV 大小，
+`batch_get_tokens_per_block` 配置每个 block 的 token 数；AccessTable entry 大小为
+两者乘积。这两个构造参数无默认值，必须显式传入。`offsets`
+是表项内字节偏移。直接传 `addresses` / `valid` 时，调用方负责表项布局和
 Tensor 生命周期。`AclGraph` 由 Python 调用方持有，直接封装 ACL Runtime Graph 的
 capture / replay / synchronize / reset；图对象不属于 Runtime 或 Operator。

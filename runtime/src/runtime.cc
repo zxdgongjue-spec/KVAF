@@ -1,6 +1,7 @@
 #include "runtime.h"
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <new>
 #include <string>
@@ -277,9 +278,15 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
   }
 
   if (request.indices.device == DeviceKind::kNpu) {
-    if (request.output_block_bytes != kBatchGetTransferBytes) {
-      return Status::InvalidArgument("NPU BatchGet output rows must each be 656 bytes");
+    if (request.tokens_per_block == 0 ||
+        request.output_block_bytes >
+            std::numeric_limits<std::uint64_t>::max() /
+                request.tokens_per_block) {
+      return Status::InvalidArgument(
+          "NPU BatchGet requires a valid tokens_per_block layout");
     }
+    const std::uint64_t address_table_entry_bytes =
+        request.tokens_per_block * request.output_block_bytes;
     if (request.device_access_table.empty() ||
         request.device_access_table.addresses.data == nullptr ||
         request.device_access_table.valid.data == nullptr ||
@@ -295,9 +302,9 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
     if (table != nullptr &&
         (!table->has_uniform_valid_length ||
          (table->has_valid_entries &&
-          table->uniform_valid_length != kBatchGetAddressTableEntryBytes))) {
+          table->uniform_valid_length != address_table_entry_bytes))) {
       return Status::InvalidArgument(
-          "NPU BatchGet requires 128 * 656-byte AccessTable entries");
+          "NPU BatchGet AccessTable entries do not match the configured layout");
     }
   } else {
     if (table == nullptr) {

@@ -106,9 +106,9 @@ class RuntimeCore {
     std::vector<std::uint64_t> lengths;
     std::vector<std::uint8_t> valid;
 
-    // NPU BatchGet requires every valid lookup entry to describe one
-    // 128 * 656-byte address-table entry. Compute the invariant once while
-    // preparing the table rather than rescanning it for every BatchGet.
+    // NPU BatchGet requires every valid lookup entry to match its configured
+    // tokens_per_block * output_block_bytes layout. Compute the invariant once
+    // while preparing the table rather than rescanning it for every BatchGet.
     bool has_valid_entries{false};
     bool has_uniform_valid_length{true};
     std::uint64_t uniform_valid_length{0};

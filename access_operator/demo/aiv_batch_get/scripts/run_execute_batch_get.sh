@@ -14,8 +14,10 @@ toolkit=${ASCEND_CANN_PACKAGE_PATH:-${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend
 : "${TABLE_CAPACITY:=4096}"
 : "${REQUESTS:=4096}"
 : "${OUTPUT_ROWS:=${REQUESTS}}"
-: "${BLOCK_BYTES:=656}"
-: "${SOURCE_STRIDE:=83968}"
+: "${TOKEN_BYTES:?TOKEN_BYTES must configure the KV bytes per token}"
+: "${TOKENS_PER_BLOCK:?TOKENS_PER_BLOCK must configure the tokens per block}"
+BLOCK_BYTES=${TOKEN_BYTES}
+: "${SOURCE_STRIDE:=$((TOKEN_BYTES * TOKENS_PER_BLOCK))}"
 : "${AIV_CORES:=4}"
 : "${JETTYS_PER_CORE:=2}"
 : "${WARMUP:=10}"
@@ -67,7 +69,7 @@ if dumper=$(command -v asc_dumper 2>/dev/null) && ldd "${dumper}" 2>/dev/null | 
   ldd "${dumper}" 2>&1 | tee -a "${log_file}" >&2 || true
   exit 2
 fi
-echo "[EXECUTE_BATCH_GET] contract=npu_execute_address_table_to_udma_read device=${DEVICE_ID} table=${TABLE_CAPACITY} requests=${REQUESTS} output_rows=${OUTPUT_ROWS} block_bytes=${BLOCK_BYTES} stride=${SOURCE_STRIDE} aiv_cores=${AIV_CORES} jettys_per_core=${JETTYS_PER_CORE} mask_every=${MASK_EVERY} active_every=${ACTIVE_EVERY} active_percent=${ACTIVE_PERCENT} dynamic_output_smoke=${DYNAMIC_OUTPUT_SMOKE} graph_replays=${GRAPH_REPLAYS} graph_warmup=${GRAPH_WARMUP} graph_iterations=${GRAPH_ITERATIONS} timeout=${timeout_seconds} toolkit_lib=${cann_lib}" | tee "${log_file}"
+echo "[EXECUTE_BATCH_GET] contract=npu_execute_address_table_to_udma_read device=${DEVICE_ID} table=${TABLE_CAPACITY} requests=${REQUESTS} output_rows=${OUTPUT_ROWS} token_bytes=${TOKEN_BYTES} tokens_per_block=${TOKENS_PER_BLOCK} block_bytes=${SOURCE_STRIDE} stride=${SOURCE_STRIDE} aiv_cores=${AIV_CORES} jettys_per_core=${JETTYS_PER_CORE} mask_every=${MASK_EVERY} active_every=${ACTIVE_EVERY} active_percent=${ACTIVE_PERCENT} dynamic_output_smoke=${DYNAMIC_OUTPUT_SMOKE} graph_replays=${GRAPH_REPLAYS} graph_warmup=${GRAPH_WARMUP} graph_iterations=${GRAPH_ITERATIONS} timeout=${timeout_seconds} toolkit_lib=${cann_lib}" | tee "${log_file}"
 
 set +e
 timeout "${timeout_seconds}" "${test_binary}" --kernel "${kernel}" \

@@ -10,11 +10,6 @@ enum {
   KVAF_AIV_BATCH_GET_QUEUE_STATE_BYTES = 64,
   KVAF_AIV_BATCH_GET_MAX_AIV_CORES = 48,
   KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE = 2,
-  KVAF_AIV_BATCH_GET_WQE_DATA_BYTES = 656,
-  KVAF_AIV_BATCH_GET_ADDRESS_TABLE_ENTRY_COUNT = 128,
-  KVAF_AIV_BATCH_GET_ADDRESS_TABLE_ENTRY_BYTES =
-      KVAF_AIV_BATCH_GET_ADDRESS_TABLE_ENTRY_COUNT *
-      KVAF_AIV_BATCH_GET_WQE_DATA_BYTES,
   // Shared local-memory contract used by the AIV kernel and launcher.
   KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES = 160 * 1024,
 };
@@ -98,7 +93,8 @@ typedef struct KvafExecuteBatchGetKernelArgs {
   uint32_t table_capacity;
   uint32_t request_capacity;
   uint32_t output_rows;
-  uint32_t block_bytes;
+  uint32_t token_bytes;         // bytes transferred for one token/WQE
+  uint32_t tokens_per_block;    // tokens stored in one address-table block
   uint32_t block_count;
   // Zero preserves the phase-one ABI and selects one Jetty per AIV core.
   uint32_t jettys_per_core;
@@ -111,7 +107,7 @@ static_assert(sizeof(KvafBatchGetQueueState) == KVAF_AIV_BATCH_GET_QUEUE_STATE_B
               "KvafBatchGetQueueState ABI changed");
 static_assert(sizeof(KvafBatchGetDirectUrmaEntity) == 192,
               "KvafBatchGetDirectUrmaEntity ABI changed");
-static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 104,
+static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 112,
               "KvafExecuteBatchGetKernelArgs ABI changed");
 #endif
 

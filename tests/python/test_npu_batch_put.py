@@ -89,6 +89,17 @@ def main() -> int:
     device_id = int(os.environ.get("DEVICE_ID", "0"))
     rows = int(os.environ.get("KVAF_NPU_REQUESTS", "4096"))
     block_bytes = int(os.environ.get("KVAF_NPU_BLOCK_BYTES", "1024"))
+    token_bytes_text = os.environ.get("KVAF_NPU_TOKEN_BYTES")
+    tokens_per_block_text = os.environ.get("KVAF_NPU_TOKENS_PER_BLOCK")
+    if token_bytes_text is None or tokens_per_block_text is None:
+        print(
+            "FAIL: KVAF_NPU_TOKEN_BYTES and KVAF_NPU_TOKENS_PER_BLOCK "
+            "must both be configured",
+            file=sys.stderr,
+        )
+        return 2
+    token_bytes = int(token_bytes_text)
+    tokens_per_block = int(tokens_per_block_text)
     npu_core_count = int(
         os.environ.get("KVAF_NPU_CORE_COUNT", os.environ.get("KVAF_NPU_AIV_CORES", "32"))
     )
@@ -98,6 +109,8 @@ def main() -> int:
     if not (
         rows > 0
         and block_bytes > 0
+        and token_bytes > 0
+        and tokens_per_block > 0
         and 0 < npu_core_count <= rows
         and 1 <= jettys_per_core <= 2
         and warmup >= 0
@@ -123,10 +136,12 @@ def main() -> int:
 
     runtime = kvaf.NpuRuntime(
         str(batch_get_kernel),
-        device_id,
-        npu_core_count,
-        str(batch_put_kernel),
-        jettys_per_core,
+        batch_get_token_bytes=token_bytes,
+        batch_get_tokens_per_block=tokens_per_block,
+        device_id=device_id,
+        npu_core_count=npu_core_count,
+        batch_put_kernel_object_path=str(batch_put_kernel),
+        jettys_per_core=jettys_per_core,
     )
     remote_cpu_service = os.environ.get("KVAF_CPU_SERVICE_ADDR")
     if not remote_cpu_service:
@@ -138,6 +153,8 @@ def main() -> int:
         print(
             "RUNTIME_NPU_BATCH_PUT_CONFIG "
             f"rows={rows} block_bytes={block_bytes} npu_cores={npu_core_count} "
+            f"batch_get_token_bytes={token_bytes} "
+            f"batch_get_tokens_per_block={tokens_per_block} "
             f"jettys_per_core={jettys_per_core} warmup={warmup} "
             f"iterations={iterations} backend=aiv_direct_hccp"
         )

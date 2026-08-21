@@ -28,10 +28,6 @@ PUT_BATCH_SIZE = 128
 WARMUP = 3
 ITERATIONS = 100
 ACTIVE_PERCENT = 5
-BLOCK_BYTES = 656
-WQE_BYTES = 656
-ROWS_PER_ENTRY = 128
-ENTRY_BYTES = ROWS_PER_ENTRY * WQE_BYTES
 REQUESTS_PER_BATCH = 2048
 MAX_ACTIVE_REQUESTS_PER_AIV = 16384
 
@@ -101,9 +97,22 @@ def main(batch: int = 16) -> int:
     active_percent = int(
         os.environ.get("KVAF_RUNTIME_PERF_ACTIVE_PERCENT", str(ACTIVE_PERCENT))
     )
-    block_bytes = int(os.environ.get("KVAF_RUNTIME_PERF_BLOCK_BYTES", str(BLOCK_BYTES)))
+    token_bytes_text = os.environ.get("KVAF_RUNTIME_PERF_TOKEN_BYTES")
+    tokens_per_block_text = os.environ.get(
+        "KVAF_RUNTIME_PERF_TOKENS_PER_BLOCK"
+    )
+    if token_bytes_text is None or tokens_per_block_text is None:
+        print(
+            "FAIL: KVAF_RUNTIME_PERF_TOKEN_BYTES and "
+            "KVAF_RUNTIME_PERF_TOKENS_PER_BLOCK must both be configured",
+            file=sys.stderr,
+        )
+        return 2
+    token_bytes = int(token_bytes_text)
+    tokens_per_block = int(tokens_per_block_text)
+    block_bytes = token_bytes * tokens_per_block
     source_stride = int(
-        os.environ.get("KVAF_RUNTIME_PERF_SOURCE_STRIDE", str(ENTRY_BYTES))
+        os.environ.get("KVAF_RUNTIME_PERF_SOURCE_STRIDE", str(block_bytes))
     )
     table_capacity = int(
         os.environ.get(
@@ -113,7 +122,7 @@ def main(batch: int = 16) -> int:
     requests = int(
         os.environ.get("KVAF_RUNTIME_PERF_REQUESTS", str(batch * REQUESTS_PER_BATCH))
     )
-    total_tokens = table_capacity * ROWS_PER_ENTRY
+    total_tokens = table_capacity * tokens_per_block
     total_put_batches = table_capacity // PUT_BATCH_SIZE
     full_validation_capacity = npu_core_count * MAX_ACTIVE_REQUESTS_PER_AIV
     if not (
@@ -123,8 +132,9 @@ def main(batch: int = 16) -> int:
         and warmup >= 0
         and iterations > 0
         and 1 <= active_percent <= 100
-        and block_bytes == WQE_BYTES
-        and source_stride == ENTRY_BYTES
+        and token_bytes > 0
+        and tokens_per_block > 0
+        and source_stride == block_bytes
         and requests > 0
         and requests % REQUESTS_PER_BATCH == 0
         and requests <= full_validation_capacity
@@ -172,21 +182,35 @@ def main(batch: int = 16) -> int:
         all_keys[batch_index * PUT_BATCH_SIZE : (batch_index + 1) * PUT_BATCH_SIZE]
         for batch_index in range(total_put_batches)
     ]
-    put_offsets = [row * ENTRY_BYTES for row in range(PUT_BATCH_SIZE)]
-    lengths = [ENTRY_BYTES] * PUT_BATCH_SIZE
+    put_offsets = [row * block_bytes for row in range(PUT_BATCH_SIZE)]
+    lengths = [block_bytes] * PUT_BATCH_SIZE
 
     torch.npu.set_device(device_id)
     device = f"npu:{device_id}"
-    token_rows = torch.arange(ROWS_PER_ENTRY, dtype=torch.int64, device=device).unsqueeze(1)
-    token_bytes = torch.arange(WQE_BYTES, dtype=torch.int64, device=device).unsqueeze(0)
+    token_rows = torch.arange(
+        tokens_per_block, dtype=torch.int64, device=device
+    ).unsqueeze(1)
+    token_byte_indices = torch.arange(
+        token_bytes, dtype=torch.int64, device=device
+    ).unsqueeze(0)
     entry_pattern = (
-        (token_rows * 131 + token_bytes * 17 + (token_bytes >> 3)) & 0xFF
+        (
+            token_rows * 131
+            + token_byte_indices * 17
+            + (token_byte_indices >> 3)
+        )
+        & 0xFF
     ).to(torch.uint8).contiguous()
-    kv_data = entry_pattern.reshape(1, ENTRY_BYTES).repeat(PUT_BATCH_SIZE, 1)
-    output = torch.empty((requests, block_bytes), dtype=torch.uint8, device=device)
+    kv_data = entry_pattern.reshape(1, block_bytes).repeat(PUT_BATCH_SIZE, 1)
+    output = torch.empty((requests, token_bytes), dtype=torch.uint8, device=device)
     runtime = kvaf.NpuRuntime(
-        str(kernel), device_id, npu_core_count, str(batch_put_kernel),
-        jettys_per_core,
+        str(kernel),
+        batch_get_token_bytes=token_bytes,
+        batch_get_tokens_per_block=tokens_per_block,
+        device_id=device_id,
+        npu_core_count=npu_core_count,
+        batch_put_kernel_object_path=str(batch_put_kernel),
+        jettys_per_core=jettys_per_core,
     )
     remote_cpu_service = os.environ.get("KVAF_CPU_SERVICE_ADDR")
     if not remote_cpu_service:
@@ -203,7 +227,9 @@ def main(batch: int = 16) -> int:
             f"total_tokens={total_tokens} ddr_bytes={ddr_bytes} "
             f"put_batch_size={PUT_BATCH_SIZE} "
             f"requests={requests} active_percent={active_percent} "
-            f"active_requests={active_requests} block_bytes={block_bytes} source_stride={source_stride} "
+            f"active_requests={active_requests} token_bytes={token_bytes} "
+            f"tokens_per_block={tokens_per_block} block_bytes={block_bytes} "
+            f"source_stride={source_stride} "
             f"aiv_cores={npu_core_count} jettys_per_core={jettys_per_core} "
             f"warmup={warmup} iterations={iterations} "
             "batch_put_backend=aiv_direct_hccp timing=call_to_stream_completion"
@@ -229,7 +255,7 @@ def main(batch: int = 16) -> int:
         preflight_offsets = torch.zeros(PUT_BATCH_SIZE, dtype=torch.int32, device=device)
         preflight_mask = torch.ones(PUT_BATCH_SIZE, dtype=torch.uint8, device=device)
         preflight_output = torch.empty(
-            (PUT_BATCH_SIZE, block_bytes), dtype=torch.uint8, device=device
+            (PUT_BATCH_SIZE, token_bytes), dtype=torch.uint8, device=device
         )
         runtime.batch_get(
             preflight_device_table,
@@ -250,7 +276,7 @@ def main(batch: int = 16) -> int:
         runtime.batch_free(preflight_keys)
         print(
             "RUNTIME_PERF_CORRECTNESS_PASS "
-            f"phase=preflight requests={PUT_BATCH_SIZE} block_bytes={block_bytes}"
+            f"phase=preflight requests={PUT_BATCH_SIZE} token_bytes={token_bytes}"
         )
         print("RUNTIME_PERF_PHASE_DONE phase=correctness_preflight")
 
@@ -267,7 +293,7 @@ def main(batch: int = 16) -> int:
         print_samples(
             "batch_put", batch_put_samples, warmup,
             f"{PUT_BATCH_SIZE}_kv_blocks_per_call",
-            PUT_BATCH_SIZE * ENTRY_BYTES,
+            PUT_BATCH_SIZE * block_bytes,
         )
 
         # Finish the one-time data population. It is deliberately excluded
@@ -307,11 +333,11 @@ def main(batch: int = 16) -> int:
         validation_requests = min(requests, table_capacity)
         validation_indices = torch.arange(validation_requests, dtype=torch.int32, device=device)
         validation_offsets = (
-            validation_indices % ROWS_PER_ENTRY
-        ) * WQE_BYTES
+            validation_indices % tokens_per_block
+        ) * token_bytes
         validation_mask = torch.ones(validation_requests, dtype=torch.uint8, device=device)
         validation_output = torch.empty(
-            (validation_requests, block_bytes), dtype=torch.uint8, device=device
+            (validation_requests, token_bytes), dtype=torch.uint8, device=device
         )
         runtime.batch_get(
             device_table,
@@ -323,13 +349,13 @@ def main(batch: int = 16) -> int:
         )
         torch.npu.synchronize()
         expected_validation = entry_pattern[
-            validation_indices.to(torch.int64) % ROWS_PER_ENTRY
+            validation_indices.to(torch.int64) % tokens_per_block
         ]
         if not torch.equal(validation_output, expected_validation):
             raise AssertionError("Runtime performance BatchGet validation failed")
         print(
             "RUNTIME_PERF_CORRECTNESS_PASS "
-            f"phase=full_table requests={validation_requests} block_bytes={block_bytes}"
+            f"phase=full_table requests={validation_requests} token_bytes={token_bytes}"
         )
 
         # Pre-create source plans. All input construction is excluded from
@@ -377,8 +403,8 @@ def main(batch: int = 16) -> int:
             destination_slot_batches[:warmup],
             miss_count_batches[:warmup],
         ):
-            indices = source_token_ids // ROWS_PER_ENTRY
-            offsets = (source_token_ids % ROWS_PER_ENTRY) * WQE_BYTES
+            indices = source_token_ids // tokens_per_block
+            offsets = (source_token_ids % tokens_per_block) * token_bytes
             output_indices = destination_slots.clone()
             mask = (
                 torch.arange(
@@ -402,8 +428,8 @@ def main(batch: int = 16) -> int:
             destination_slot_batches[warmup:],
             miss_count_batches[warmup:],
         ):
-            indices = source_token_ids // ROWS_PER_ENTRY
-            offsets = (source_token_ids % ROWS_PER_ENTRY) * WQE_BYTES
+            indices = source_token_ids // tokens_per_block
+            offsets = (source_token_ids % tokens_per_block) * token_bytes
             output_indices = destination_slots.clone()
             mask = (
                 torch.arange(
@@ -435,7 +461,7 @@ def main(batch: int = 16) -> int:
         print_samples(
             "batch_get", batch_get_samples, warmup,
             f"{mean_active_requests:.3f}_mean_active_of_{requests}_requests_per_call",
-            int(mean_active_requests * block_bytes),
+            int(mean_active_requests * token_bytes),
         )
         print("RUNTIME_PERF_PHASE_DONE phase=batch_get")
 

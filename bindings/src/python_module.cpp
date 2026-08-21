@@ -142,9 +142,7 @@ class MockAccessOperator final : public AccessOperator {
 
       const std::size_t table_index = static_cast<std::size_t>(indices[i]);
       const std::uint64_t length = exec.host_access_table.lengths[table_index];
-      if (offsets[i] < 0 ||
-          static_cast<std::uint32_t>(offsets[i]) >
-              kBatchGetAddressTableEntryBytes - kBatchGetTransferBytes) {
+      if (offsets[i] < 0) {
         return InvalidArgument("BatchGet offset is outside the AccessTable entry");
       }
       const std::uint64_t offset_bytes =
@@ -324,6 +322,7 @@ class PythonRuntime final {
         MutableBufferView{output_data, static_cast<std::size_t>(output_size),
                           DeviceKind::kCpu},
         output_block_bytes,
+        0,
         AccessTableDeviceView{}};
     ThrowIfError(runtime_->BatchGet(request));
   }

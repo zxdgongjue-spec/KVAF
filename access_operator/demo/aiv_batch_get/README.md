@@ -16,15 +16,16 @@ registration; each HBM output is registered separately as a local UDMA range.
 | `address_table` | `uint64[table_capacity]` | Absolute Host DDR UBAs, produced by the meta layer. |
 | `valid_table` | `uint8[table_capacity]` | A zero entry makes its lookup invalid. |
 | `indices` | `int32[request_capacity]` | Logical entries requested by this batch. |
-| `offsets` | `int32[request_capacity]` | Byte offset inside the selected 128 * 656B entry. |
+| `offsets` | `int32[request_capacity]` | Byte offset inside the selected KV block. |
 | `mask` | `uint8[request_capacity]` | Zero skips that request without changing the graph shape. |
 | `output_indices` | `int32[request_capacity]` | Destination row in `output`. |
-| `output` | `uint8[output_rows * 656]` | Contiguous Device HBM output. |
+| `output` | `uint8[output_rows * token_bytes]` | Contiguous Device HBM output. |
 
-For an active request `i`, the kernel reads exactly 656 bytes from
+For an active request `i`, the kernel reads exactly `token_bytes` from
 `address_table[indices[i]] + offsets[i]` and stores it at
-`output + output_indices[i] * 656`. Each address-table entry spans
-`128 * 656` bytes, so `offsets[i] + 656` must stay within that entry. This is the
+`output + output_indices[i] * token_bytes`. Each address-table entry spans
+`tokens_per_block * token_bytes`, so the requested token must stay within that
+block. This is the
 fixed-block, single-output-scatter scope; duplicate output rows are not
 rejected and have last-completion-wins semantics.
 
@@ -119,8 +120,9 @@ If that header is absent from both the CANN toolkit and asc-devkit, install the
 asc-devkit package matching the target CANN version before building; mixing
 headers from a different CANN release is not supported.
 
-The eager default is 4096 requests of 656 bytes, 83968-byte source stride, four
-AIVs, two Jettys per AIV, and a 5% active probability. As in
+The eager runner requires `TOKEN_BYTES` and `TOKENS_PER_BLOCK`; neither has a
+default. The other defaults are 4096 requests, four AIVs, two Jettys per AIV,
+and a 5% active probability. As in
 `tests/python/test_npu_runtime_perf.py`, every warmup and measured sample uses
 its own random indices/mask pair. All pairs are generated and copied to the
 device before the benchmark starts. Results are written beneath `results/`;
@@ -131,15 +133,17 @@ Useful overrides:
 
 ```bash
 DEVICE_ID=0 TABLE_CAPACITY=256 REQUESTS=10 OUTPUT_ROWS=200 \
-BLOCK_BYTES=656 SOURCE_STRIDE=83968 AIV_CORES=1 JETTYS_PER_CORE=2 ACTIVE_PERCENT=20 \
+TOKEN_BYTES=320 TOKENS_PER_BLOCK=64 AIV_CORES=1 JETTYS_PER_CORE=2 ACTIVE_PERCENT=20 \
 WARMUP=1 ITERATIONS=1 bash scripts/run_execute_batch_get.sh
 
 # Proves TransportCreate -> Acquire(A) -> Acquire(B) -> re-Acquire(A), then
 # releases both local-buffer references without rebuilding EID/CTP/Jettys.
-DEVICE_ID=0 DYNAMIC_OUTPUT_SMOKE=1 WARMUP=1 ITERATIONS=1 \
+DEVICE_ID=0 TOKEN_BYTES=656 TOKENS_PER_BLOCK=128 \
+DYNAMIC_OUTPUT_SMOKE=1 WARMUP=1 ITERATIONS=1 \
 bash scripts/run_execute_batch_get.sh
 
-DEVICE_ID=0 GRAPH_REPLAYS=4 GRAPH_WARMUP=1 GRAPH_ITERATIONS=5 \
+DEVICE_ID=0 TOKEN_BYTES=656 TOKENS_PER_BLOCK=128 \
+GRAPH_REPLAYS=4 GRAPH_WARMUP=1 GRAPH_ITERATIONS=5 \
 bash scripts/run_execute_batch_get_graph.sh
 ```
 
