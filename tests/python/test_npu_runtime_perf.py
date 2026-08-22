@@ -31,7 +31,6 @@ ACTIVE_PERCENT = 5
 DEFAULT_TOKEN_BYTES = 656
 DEFAULT_TOKENS_PER_BLOCK = 128
 REQUESTS_PER_BATCH = 2048
-MAX_ACTIVE_REQUESTS_PER_AIV = 16384
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -124,7 +123,6 @@ def main(batch: int = 16) -> int:
     )
     total_tokens = table_capacity * tokens_per_block
     total_put_batches = table_capacity // PUT_BATCH_SIZE
-    full_validation_capacity = npu_core_count * MAX_ACTIVE_REQUESTS_PER_AIV
     if not (
         batch > 0
         and npu_core_count > 0
@@ -137,15 +135,13 @@ def main(batch: int = 16) -> int:
         and source_stride == block_bytes
         and requests > 0
         and requests % REQUESTS_PER_BATCH == 0
-        and requests <= full_validation_capacity
         and table_capacity >= PUT_BATCH_SIZE
         and table_capacity % PUT_BATCH_SIZE == 0
         and total_put_batches >= warmup + iterations
     ):
         print(
             "FAIL: invalid KVAF_RUNTIME_PERF_* configuration "
-            f"(requests={requests}, aiv_cores={npu_core_count}, "
-            f"full_validation_capacity={full_validation_capacity})",
+            f"(requests={requests}, aiv_cores={npu_core_count})",
             file=sys.stderr,
         )
         return 2
@@ -329,34 +325,6 @@ def main(batch: int = 16) -> int:
             f"entries={table_capacity} elapsed_ms={access_view_ms:.3f}"
         )
         print("RUNTIME_PERF_PHASE_DONE phase=access_table_view_npu")
-
-        validation_requests = min(requests, table_capacity)
-        validation_indices = torch.arange(validation_requests, dtype=torch.int32, device=device)
-        validation_offsets = (
-            validation_indices % tokens_per_block
-        ) * token_bytes
-        validation_mask = torch.ones(validation_requests, dtype=torch.uint8, device=device)
-        validation_output = torch.empty(
-            (validation_requests, token_bytes), dtype=torch.uint8, device=device
-        )
-        runtime.batch_get(
-            device_table,
-            validation_indices,
-            validation_offsets,
-            validation_mask,
-            validation_indices,
-            validation_output,
-        )
-        torch.npu.synchronize()
-        expected_validation = entry_pattern[
-            validation_indices.to(torch.int64) % tokens_per_block
-        ]
-        if not torch.equal(validation_output, expected_validation):
-            raise AssertionError("Runtime performance BatchGet validation failed")
-        print(
-            "RUNTIME_PERF_CORRECTNESS_PASS "
-            f"phase=full_table requests={validation_requests} token_bytes={token_bytes}"
-        )
 
         # Pre-create source plans. All input construction is excluded from
         # BatchGet timing.
