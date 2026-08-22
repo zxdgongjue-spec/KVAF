@@ -1,30 +1,14 @@
 # KVAF
 
-KVAF 是面向 KV Cache 的 Runtime。它负责管理 KV block 在远端 DDR 中的地址、
-生命周期和访问一致性，并通过可替换的 AccessOperator 执行 BatchPut/BatchGet
-数据搬运。当前硬件实现使用 NPU AIV 算子通过 UB/RMA 访问 CPU DDR；本地 Mock
-实现用于不具备硬件环境时验证 Runtime 语义。
+KVAF 是面向 KV Cache 的 Runtime。它负责管理 KV block 在存储设备（DDR）中的地址、
+生命周期和访问一致性，并提供高性能的 BatchPut/BatchGet
+数据搬运能力。
 
-KVAF 不实现 Prefix Cache 策略、调度器或 vLLM 业务逻辑。上层 Adapter 负责将模型
-请求映射为 Key、block 和 Tensor；KVAF 负责这些 Key 对应的远端存储和批量访问。
+当前目录包含 KVAF 同步 Runtime POC、MetaManager 地址管理实现，以及可选的
+A5 AIV BatchGet/BatchPut demo/adapter。
 
-```text
-调用方 / vLLM Adapter（仓外）
-             │ Key、KV block、NPU Tensor
-             ▼
-        KVAF Runtime
-        RuntimeCore
-     ┌───────┴────────┐
-     ▼                ▼
-MetaManager      AccessOperator
-Key → DDR 地址    BatchPut / BatchGet 数据面
-     │                │
-     └───────┬────────┘
-             ▼
-         远端 DDR region
-```
 
-## Runtime 核心能力
+## KVAF-Runtime 核心能力
 
 `RuntimeCore` 组合 `MetaManager`、`AccessOperator` 和内部 DDR allocator，提供
 同步的 KV 生命周期：
@@ -48,7 +32,32 @@ AccessTable 锁和内部传输资源。调用方必须在同一 BatchGet stream 
 和 `DeviceAccessTable` 有效。
 
 ## 模块
+```text
+kvaf/
+├── common/include/        # 模块间共享的类型、请求与 Status
+├── runtime/               # KVAF Runtime
+├── meta_manager/          # Meta Manager
+├── access_operator/       # KV Access Operator
+├── bindings/              # 可选的 Python/Pybind 注册入口
+└── python/kvaf/           # Python 包入口
+```
 
+```text
+调用方 / vLLM Adapter（仓外）
+             │ Key、KV block、NPU Tensor
+             ▼
+        KVAF Runtime
+        RuntimeCore
+     ┌───────┴────────┐
+     ▼                ▼
+MetaManager      AccessOperator
+Key → DDR 地址    BatchPut / BatchGet 数据面
+     │                │
+     └───────┬────────┘
+             ▼
+         远端 DDR region
+```
+`CacheOS-vLLM Adaptor` 不属于当前代码仓；它后续在 vLLM 侧实现
 | 模块 | 职责 |
 | --- | --- |
 | `common/` | 跨模块共享的类型、请求和 `Status`。 |
@@ -60,7 +69,7 @@ AccessTable 锁和内部传输资源。调用方必须在同一 BatchGet stream 
 
 ## CPU/NPU 分离部署
 
-CPU/NPU 分离是当前 AIV 数据面的部署方式：CPU 进程提供远端 DDR 和 UMDK 资源，
+CPU/NPU 分离是当前 AIV 数据面的部署方式：CPU 进程提供远端 DDR 资源，
 NPU 进程运行 KVAF RuntimeCore、MetaManager 和 AIV AccessOperator。
 
 ```text
@@ -77,13 +86,12 @@ kvaf_cpu_service                                      kvaf.NpuRuntime
                                   UB / RMA：AIV 直接读写 CPU DDR
 ```
 
-TCP 只承载控制信息；KV 数据不会经过 TCP。NPU AIV kernel 完成实际的 UB/RMA
-读写。
+TCP 用于交换控制信息，初始化UB建链；KV 数据 通过 NPU AIV kernel 完成实际的读写。
 
 ### CPU Runtime
 
-`CpuRuntime` 由独立的 `kvaf_cpu_service` 进程创建。它只依赖 UB 驱动、UMDK
-公开头文件和 `liburma.so`，不依赖 CANN、HCCP、ACL 或 NPU 驱动。
+`CpuRuntime` 由独立的 `kvaf_cpu_service` 进程创建。依赖于 UB 驱动、UMDK
+公开头文件和 `liburma.so`（无须 CANN、HCCP、ACL 或 NPU 驱动）。
 
 - 自动枚举可用 UMDK device/EID；
 - 为 NPU session 申请 CPU DDR，并注册 UMDK segment 和 token；
@@ -91,12 +99,9 @@ TCP 只承载控制信息；KV 数据不会经过 TCP。NPU AIV kernel 完成实
 - 支持多个独立 session；NPU 正常 shutdown 后回收其 DDR、segment、token 和 Jetty；
 - `RuntimeService` 只负责 TCP 监听和连接分发，资源生命周期由 `CpuRuntime` 管理。
 
-CPU Runtime 当前不执行 BatchGet 或 BatchPut 算子。
-
 ### NPU Runtime
 
-`NpuRuntime` 在连接 CPU 服务后初始化远端 DDR，并组合 MetaManager 与
-AccessOperator。
+`NpuRuntime` 在连接 CPU 服务后初始化远端 DDR。
 
 - `link_to(cpu_ip:port)` 后申请 CPU DDR 并建立 CPU–NPU 链路；
 - 自动发现 NPU 本端 EID：优先使用 HCCL rootinfo 中与当前物理卡匹配的 CLOS PG EID，
@@ -121,9 +126,6 @@ session 恢复、多个 peer 的选择和 CPU 侧数据面不属于当前范围�
 | NPU kernel 构建 | CANN 路径中需要 `include/acl/acl.h`、`tools/ccec_compiler/bin` 和 SIMT 开发头 `simt_api/device_atomic_functions.h`。 |
 | 两端网络 | NPU 能通过 TCP 访问 CPU 服务地址；UB 网络和平台拓扑已配置。 |
 
-`build.sh` 不安装 CANN、驱动或 UB 驱动。这些由平台环境提供。CPU 构建若没有可用的
-UMDK 源码，会拉取固定版本的 UMDK；若系统没有 `liburma.so`，只构建所需 `urma`
-target，不执行全局安装。
 
 ## 构建
 
@@ -164,8 +166,7 @@ export ASCEND_SIMT_API_DIR=/path/to/simt/include
 ./build.sh npu
 ```
 
-如果 SIMT 开发头位于 `${ASCEND_CANN_PACKAGE_PATH}/include`，无需设置
-`ASCEND_SIMT_API_DIR`。构建结果包括：
+构建结果包括：
 
 ```text
 build-npu/python/kvaf/
@@ -173,9 +174,6 @@ build-npu/bin/kvaf_execute_batch_get_kernels.o
 build-npu/bin/kvaf_execute_batch_put_kernels.o
 ```
 
-`build.sh npu` 会为所选 `PYTHON` 安装缺失的 `pybind11`。如遇到
-`simt_api/device_atomic_functions.h` 缺失，请安装与当前 CANN 匹配的 SIMT/asc-devkit
-开发包，或将 `ASCEND_SIMT_API_DIR` 指向实际头文件所在的 include 目录。
 
 ## 启动与端到端验证
 
@@ -188,8 +186,7 @@ build-npu/bin/kvaf_execute_batch_put_kernels.o
   --listen 0.0.0.0 --port 28999
 ```
 
-服务会自动发现 UB device/EID，并打印 `CANDIDATE_DISCOVERED` 与 `LISTEN`。只有诊断
-固定候选时才需要传入 `--ub-device NAME --eid-index N`。
+服务会自动发现 UB device/EID，并打印 `CANDIDATE_DISCOVERED` 与 `LISTEN`。也可按需要传入 `--ub-device NAME --eid-index N` 来选定对应的端口。
 
 ### 2. 运行 NPU 端到端测试
 
@@ -268,18 +265,3 @@ runtime.shutdown()
 输入/输出 Tensor 和 `DeviceAccessTable` 有效；Runtime 只管理内部 DDR、元数据和内部
 传输资源。
 
-## 本地无硬件检查
-
-本地 Mock 不验证 UMDK、CANN 或 AIV 数据面，但可验证 Runtime、MetaManager 和 pybind
-基础接口：
-
-```bash
-cmake -S . -B build-local \
-  -DBUILD_TESTING=ON \
-  -DKVAF_BUILD_PYTHON=ON
-cmake --build build-local --parallel
-ctest --test-dir build-local --output-on-failure
-```
-
-更多 Runtime 生命周期、AccessTable 所有权、AIV Tensor 契约和性能指标说明见
-[`runtime/README.md`](runtime/README.md)。
