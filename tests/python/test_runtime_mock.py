@@ -66,6 +66,7 @@ class RuntimeMockTests(unittest.TestCase):
         self.kvaf.batch_get(
             table,
             indices=[1, 0],
+            offsets=[0, 0],
             output_indices=[0, 1],
             output=output,
             output_block_bytes=8,
@@ -101,7 +102,7 @@ class RuntimeMockTests(unittest.TestCase):
         self.batch_put([7], [self.payload([187])])
         table = self.kvaf.prepare_access_table([7])
         output = bytearray(4)
-        self.kvaf.batch_get(table, [0], [0], output, output_block_bytes=4)
+        self.kvaf.batch_get(table, [0], [0], [0], output, output_block_bytes=4)
         self.assertEqual(output, bytes.fromhex("bb000000"))
         self.kvaf.release_access_table(table)
 
@@ -111,9 +112,9 @@ class RuntimeMockTests(unittest.TestCase):
         table = self.kvaf.prepare_access_table([9])
         self.kvaf._fail_next_get()
         with self.assertRaises(RuntimeError):
-            self.kvaf.batch_get(table, [0], [0], bytearray(4), output_block_bytes=4)
+            self.kvaf.batch_get(table, [0], [0], [0], bytearray(4), output_block_bytes=4)
         with self.assertRaises(ValueError):
-            self.kvaf.batch_get(table, [1], [0], bytearray(4), output_block_bytes=4)
+            self.kvaf.batch_get(table, [1], [0], [0], bytearray(4), output_block_bytes=4)
         # A data-plane failure does not leak the stable-read lock.
         self.kvaf.release_access_table(table)
         self.kvaf.batch_free([9])
@@ -128,7 +129,30 @@ class RuntimeMockTests(unittest.TestCase):
         table = self.kvaf.prepare_access_table([1])
         self.kvaf.shutdown()
         with self.assertRaises(RuntimeError):
-            self.kvaf.batch_get(table, [0], [0], bytearray(4), output_block_bytes=4)
+            self.kvaf.batch_get(table, [0], [0], [0], bytearray(4), output_block_bytes=4)
+
+    def test_get_uses_configured_token_size_and_block_layout(self) -> None:
+        token_bytes = 7
+        tokens_per_block = 3
+        block_bytes = tokens_per_block * token_bytes
+        self.kvaf.initialize(ddr_bytes=block_bytes, slot_size=block_bytes)
+        block = bytearray(block_bytes)
+        block[:token_bytes] = bytes([0x11]) * token_bytes
+        block[token_bytes : 2 * token_bytes] = bytes([0x22]) * token_bytes
+        self.batch_put([17], [block])
+        table = self.kvaf.prepare_access_table([17])
+        output = bytearray(token_bytes)
+        self.kvaf.batch_get(
+            table, indices=[0], offsets=[token_bytes], output_indices=[0],
+            output=output, output_block_bytes=token_bytes,
+        )
+        self.assertEqual(output, bytes([0x22]) * token_bytes)
+        with self.assertRaises(ValueError):
+            self.kvaf.batch_get(
+                table, indices=[0], offsets=[block_bytes], output_indices=[0],
+                output=bytearray(token_bytes), output_block_bytes=token_bytes,
+            )
+        self.kvaf.release_access_table(table)
 
     def test_put_rejects_out_of_range_variable_block(self) -> None:
         self.kvaf.initialize(ddr_bytes=64, slot_size=32)
