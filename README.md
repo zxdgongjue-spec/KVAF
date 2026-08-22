@@ -137,13 +137,8 @@ session 恢复、多个 peer 的选择和 CPU 侧数据面不属于当前范围�
 ./build.sh cpu
 ```
 
-可按环境显式提供 UMDK 路径或动态库：
-
-```bash
-KVAF_UMDK_ROOT=/path/to/umdk \
-KVAF_URMA_LIBRARY=/path/to/liburma.so \
-./build.sh cpu
-```
+默认 UMDK 路径为仓库同级的 `../third_party/umdk`，`liburma.so` 会自动从该目录或
+系统库路径发现；只有非默认环境才需要设置 `KVAF_UMDK_ROOT` 或 `KVAF_URMA_LIBRARY`。
 
 构建结果为：
 
@@ -153,16 +148,12 @@ build-cpu/runtime/kvaf_cpu_service
 
 ### 构建 NPU Runtime 与 Python binding
 
-先加载与驱动匹配的 CANN 环境，并设置工具包根目录：
+默认使用 `/usr/local/Ascend/ascend-toolkit/latest`；使用其他 CANN 版本时，将两处路径
+替换为实际安装目录。
 
 ```bash
-source /path/to/cann/set_env.sh
-export ASCEND_CANN_PACKAGE_PATH=/path/to/cann
-
-# 若 SIMT 开发头安装在独立目录，设置其上级 include 目录。
-# 该目录下必须存在 simt_api/device_atomic_functions.h。
-export ASCEND_SIMT_API_DIR=/path/to/simt/include
-
+source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
+export ASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/ascend-toolkit/latest
 ./build.sh npu
 ```
 
@@ -264,4 +255,3 @@ runtime.shutdown()
 `link_to()` 必须先于 `initialize()` 调用。调用方需要在 BatchGet 所在 stream 完成前保持
 输入/输出 Tensor 和 `DeviceAccessTable` 有效；Runtime 只管理内部 DDR、元数据和内部
 传输资源。
-
