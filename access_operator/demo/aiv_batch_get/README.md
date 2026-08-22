@@ -16,13 +16,16 @@ registration; each HBM output is registered separately as a local UDMA range.
 | `address_table` | `uint64[table_capacity]` | Absolute Host DDR UBAs, produced by the meta layer. |
 | `valid_table` | `uint8[table_capacity]` | A zero entry makes its lookup invalid. |
 | `indices` | `int32[request_capacity]` | Logical entries requested by this batch. |
+| `offsets` | `int32[request_capacity]` | Byte offset inside the selected KV block. |
 | `mask` | `uint8[request_capacity]` | Zero skips that request without changing the graph shape. |
 | `output_indices` | `int32[request_capacity]` | Destination row in `output`. |
-| `output` | `uint8[output_rows * block_bytes]` | Contiguous Device HBM output. |
+| `output` | `uint8[output_rows * token_bytes]` | Contiguous Device HBM output. |
 
-For an active request `i`, the kernel reads `block_bytes` from
-`address_table[indices[i]]` and stores it at
-`output + output_indices[i] * block_bytes`. This is exactly the initial
+For an active request `i`, the kernel reads exactly `token_bytes` from
+`address_table[indices[i]] + offsets[i]` and stores it at
+`output + output_indices[i] * token_bytes`. Each address-table entry spans
+`tokens_per_block * token_bytes`, so the requested token must stay within that
+block. This is the
 fixed-block, single-output-scatter scope; duplicate output rows are not
 rejected and have last-completion-wins semantics.
 
@@ -64,10 +67,9 @@ addresses receive a new local MR and entity table but reuse the transport.
   Host-DDR registration, per-output HBM-MR cache, and up to two private
   USER_CTL SQ/CQ/Jettys per AIV.
 - `host/execute_batch_get_loader.cpp`: ACL binary load and AIV launch.
-- `test/execute_batch_get_main.cpp`: eager correctness/performance test and
-  ACL graph capture/replay test. Every graph functional replay changes fixed
-  tensor contents and checks output bytes, status and queues.
-- Three scripts: build, eager run, graph run.
+- Runtime/Python integration coverage lives in
+  `tests/python/test_npu_batch_get.py` and
+  `tests/python/test_npu_runtime_perf.py`.
 
 The checked Direct-HCCP declarations in `include/direct_hccp_abi.h` are the
 minimum private driver ABI needed to create the queue resources. They must be
@@ -95,66 +97,32 @@ the one-Jetty phase-one path remains selectable with `JETTYS_PER_CORE=1`.
 The ACL launcher explicitly reserves 160 KiB of AIV local memory for the two
 WQE banks, compacted table-index/request-ID arrays and SIMT validation scratch.
 
-## Build and run on A5
+## Build and validate on A5
 
 ```bash
-cd access_operator/demo/aiv_batch_get
-bash scripts/build.sh
-DEVICE_ID=0 bash scripts/run_execute_batch_get.sh
-DEVICE_ID=0 bash scripts/run_execute_batch_get_graph.sh
+./build.sh npu
+
+KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 \
+DEVICE_ID=0 \
+KVAF_NPU_TOKEN_BYTES=656 \
+KVAF_NPU_TOKENS_PER_BLOCK=128 \
+KVAF_NPU_ACTIVE_PERCENT=5 \
+tests/run_remote_cpu_e2e.sh "$PWD/build-npu"
 ```
 
 The kernel uses the Ascend C SIMT API. The build automatically checks the
 toolkit's top-level `include/simt_api` directory and the older tikcpp layouts.
 If asc-devkit is installed separately, point the build at the directory that
-contains `simt_api/device_atomic_functions.h`:
+contains `simt_api/device_atomic_functions.h` before invoking the root build:
 
 ```bash
-ASCEND_SIMT_API_DIR=/path/to/asc-devkit/include bash scripts/build.sh
+ASCEND_SIMT_API_DIR=/path/to/asc-devkit/include ./build.sh npu
 ```
 
 If that header is absent from both the CANN toolkit and asc-devkit, install the
 asc-devkit package matching the target CANN version before building; mixing
-headers from a different CANN release is not supported.
-
-The eager default is 4096 requests of 1024 bytes, 4 KiB source stride, four
-AIVs, two Jettys per AIV, and a 5% active probability. As in
-`tests/python/test_npu_runtime_perf.py`, every warmup and measured sample uses
-its own random indices/mask pair. All pairs are generated and copied to the
-device before the benchmark starts. Results are written beneath `results/`;
-`feedback.txt` contains
-the outcome, key phase markers, run log, and any locally copied PLOG files.
-
-Useful overrides:
-
-```bash
-DEVICE_ID=0 TABLE_CAPACITY=256 REQUESTS=10 OUTPUT_ROWS=200 \
-BLOCK_BYTES=1024 SOURCE_STRIDE=4096 AIV_CORES=1 JETTYS_PER_CORE=2 ACTIVE_PERCENT=20 \
-WARMUP=1 ITERATIONS=1 bash scripts/run_execute_batch_get.sh
-
-# Proves TransportCreate -> Acquire(A) -> Acquire(B) -> re-Acquire(A), then
-# releases both local-buffer references without rebuilding EID/CTP/Jettys.
-DEVICE_ID=0 DYNAMIC_OUTPUT_SMOKE=1 WARMUP=1 ITERATIONS=1 \
-bash scripts/run_execute_batch_get.sh
-
-DEVICE_ID=0 GRAPH_REPLAYS=4 GRAPH_WARMUP=1 GRAPH_ITERATIONS=5 \
-bash scripts/run_execute_batch_get_graph.sh
-```
-
-For the eager benchmark, `ACTIVE_PERCENT=N` controls the independent Bernoulli
-mask probability for every sample; random generation and the one-time H2D
-upload are excluded from timing. `MASK_EVERY=N` and `ACTIVE_EVERY=N` remain
-deterministic functional controls for the dynamic-output smoke test and graph
-replay: the former masks request IDs divisible by `N`, while the latter
-activates only request IDs divisible by `N`; the two options are mutually
-exclusive.
-
-The graph performance metric is
-`graph_input_update_to_stream_completion`: updates into the fixed lookup
-tensors, captured graph execution, and stream completion are included;
-capture, HCCP setup and final D2H validation are excluded. The normal metric
-is `host_submit_to_stream_completion`; it includes only launch through stream
-completion and excludes input generation, H2D upload, warmup and validation.
+headers from a different CANN release is not supported. The example above uses
+656 bytes per token, 128 tokens per block, and a 5% active probability.
 
 ## Graph boundary
 
@@ -164,7 +132,7 @@ graph output through `KvafBatchGetLocalBufferAcquire(transport, output, ...)`.
 That call returns an opaque local-buffer handle and a device entity table whose
 local HBM address/token match `args.output`; capture contains only the AIV
 kernel launch. One graph therefore serves replay-time changes to addresses,
-validity, request indices, mask and output rows. A different output allocation
+validity, request indices, offsets, mask and output rows. A different output allocation
 uses its own acquire result and graph instance; eager launches may select any
 cached acquire result at runtime. A capacity, block-size, AIV-count or
 Jetty-count change also needs a new session/captured graph. After all stream

@@ -1,6 +1,7 @@
 #include "runtime.h"
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <new>
 #include <string>
@@ -243,15 +244,20 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
-  const AccessTableState* table = FindAccessTable(request.access_table);
-  if (table == nullptr) {
-    return Status::NotFound("AccessTable handle was not found");
+  const AccessTableState* table = nullptr;
+  if (request.access_table.opaque != 0) {
+    table = FindAccessTable(request.access_table);
+    if (table == nullptr) {
+      return Status::NotFound("AccessTable handle was not found");
+    }
   }
   if (!request.indices.has_elements<std::int32_t>() ||
+      !request.offsets.has_elements<std::int32_t>() ||
       !request.output_indices.has_elements<std::int32_t>() ||
+      request.indices.bytes != request.offsets.bytes ||
       request.indices.bytes != request.output_indices.bytes) {
     return Status::InvalidArgument(
-        "indices and output_indices must be equally sized int32 buffers");
+        "indices, offsets, and output_indices must be equally sized int32 buffers");
   }
   const std::size_t request_count =
       request.indices.bytes / sizeof(std::int32_t);
@@ -265,12 +271,22 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
       request.output.bytes % request.output_block_bytes != 0) {
     return Status::InvalidArgument("output must contain whole non-empty output blocks");
   }
-  if (request.indices.device != request.output_indices.device ||
+  if (request.indices.device != request.offsets.device ||
+      request.indices.device != request.output_indices.device ||
       request.indices.device != request.output.device) {
     return Status::InvalidArgument("BatchGet input and output buffers must share a device");
   }
 
   if (request.indices.device == DeviceKind::kNpu) {
+    if (request.tokens_per_block == 0 ||
+        request.output_block_bytes >
+            std::numeric_limits<std::uint64_t>::max() /
+                request.tokens_per_block) {
+      return Status::InvalidArgument(
+          "NPU BatchGet requires a valid tokens_per_block layout");
+    }
+    const std::uint64_t address_table_entry_bytes =
+        request.tokens_per_block * request.output_block_bytes;
     if (request.device_access_table.empty() ||
         request.device_access_table.addresses.data == nullptr ||
         request.device_access_table.valid.data == nullptr ||
@@ -283,18 +299,28 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
       return Status::InvalidArgument(
           "NPU BatchGet requires matching caller-provided device AccessTable buffers");
     }
-    if (!table->has_uniform_valid_length ||
-        (table->has_valid_entries &&
-         table->uniform_valid_length != request.output_block_bytes)) {
+    if (table != nullptr &&
+        (!table->has_uniform_valid_length ||
+         (table->has_valid_entries &&
+          table->uniform_valid_length != address_table_entry_bytes))) {
       return Status::InvalidArgument(
-          "NPU BatchGet requires one fixed block length in its AccessTable");
+          "NPU BatchGet AccessTable entries do not match the configured layout");
     }
-  } else if (!request.device_access_table.empty()) {
-    return Status::InvalidArgument("CPU BatchGet must not provide device AccessTable buffers");
+  } else {
+    if (table == nullptr) {
+      return Status::InvalidArgument("CPU BatchGet requires an AccessTable handle");
+    }
+    if (!request.device_access_table.empty()) {
+      return Status::InvalidArgument(
+          "CPU BatchGet must not provide device AccessTable buffers");
+    }
   }
 
-  const AccessTableView view{table->addresses.data(), table->lengths.data(),
-                             table->valid.data(), table->addresses.size()};
+  AccessTableView view{};
+  if (table != nullptr) {
+    view = AccessTableView{table->addresses.data(), table->lengths.data(),
+                           table->valid.data(), table->addresses.size()};
+  }
   return access_operator_.ExecuteBatchGet(
       BatchGetExecRequest{view, &request, execution});
 }

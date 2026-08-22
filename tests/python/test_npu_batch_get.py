@@ -26,9 +26,12 @@ import kvaf
 
 from backend import detect_torch_backend
 
+DEFAULT_TOKEN_BYTES = 656
+DEFAULT_TOKENS_PER_BLOCK = 128
 
-def pattern(slot: int, block_bytes: int) -> bytes:
-    return bytes((slot * 131 + byte * 17 + (byte >> 3)) & 0xFF for byte in range(block_bytes))
+
+def pattern(slot: int, token_bytes: int) -> bytes:
+    return bytes((slot * 131 + byte * 17 + (byte >> 3)) & 0xFF for byte in range(token_bytes))
 
 
 def tensor_bytes(tensor: object) -> int:
@@ -53,15 +56,15 @@ def validate_output(
     mask: Iterable[int],
     output_indices: Iterable[int],
     payload_slots: Iterable[int | None],
-    block_bytes: int,
+    token_bytes: int,
 ) -> None:
-    zero_block = bytes(block_bytes)
+    zero_block = bytes(token_bytes)
     payload_cache: dict[int, bytes] = {}
     for request, (enabled, row, payload_slot) in enumerate(
         zip(mask, output_indices, payload_slots)
     ):
-        offset = row * block_bytes
-        actual = output[offset : offset + block_bytes]
+        offset = row * token_bytes
+        actual = output[offset : offset + token_bytes]
         if enabled and payload_slot is None:
             raise AssertionError(f"missing expected payload for active request={request}")
         if not enabled:
@@ -69,7 +72,7 @@ def validate_output(
         else:
             expected = payload_cache.get(payload_slot)
             if expected is None:
-                expected = pattern(payload_slot, block_bytes)
+                expected = pattern(payload_slot, token_bytes)
                 payload_cache[payload_slot] = expected
         if actual != expected:
             raise AssertionError(f"output mismatch for request={request}, row={row}")
@@ -117,8 +120,16 @@ def main() -> int:
     table_capacity = int(os.environ.get("KVAF_NPU_TABLE_CAPACITY", "8"))
     requests = int(os.environ.get("KVAF_NPU_REQUESTS", "8"))
     output_rows = int(os.environ.get("KVAF_NPU_OUTPUT_ROWS", "8"))
-    block_bytes = int(os.environ.get("KVAF_NPU_BLOCK_BYTES", "1024"))
-    source_stride = int(os.environ.get("KVAF_NPU_SOURCE_STRIDE", "4096"))
+    token_bytes = int(
+        os.environ.get("KVAF_NPU_TOKEN_BYTES", str(DEFAULT_TOKEN_BYTES))
+    )
+    tokens_per_block = int(
+        os.environ.get(
+            "KVAF_NPU_TOKENS_PER_BLOCK", str(DEFAULT_TOKENS_PER_BLOCK)
+        )
+    )
+    block_bytes = token_bytes * tokens_per_block
+    source_stride = int(os.environ.get("KVAF_NPU_SOURCE_STRIDE", str(block_bytes)))
     npu_core_count = int(
         os.environ.get("KVAF_NPU_CORE_COUNT", os.environ.get("KVAF_NPU_AIV_CORES", "1"))
     )
@@ -134,8 +145,9 @@ def main() -> int:
         table_capacity > 0
         and requests > 0
         and requests <= output_rows
-        and block_bytes > 0
-        and source_stride >= block_bytes
+        and token_bytes > 0
+        and tokens_per_block > 0
+        and source_stride == block_bytes
         and npu_core_count > 0
         and npu_core_count <= requests
         and 1 <= jettys_per_core <= 2
@@ -166,10 +178,14 @@ def main() -> int:
     # its compact prefix; masked requests use index zero because their lookup
     # is skipped by the AIV kernel.
     indices_values = [0] * requests
+    offsets_values = [0] * requests
     payload_slots: list[int | None] = [None] * requests
     for payload_slot, request in enumerate(active_request_positions):
         indices_values[request] = payload_slot
-        payload_slots[request] = payload_slot
+        offsets_values[request] = (request % tokens_per_block) * token_bytes
+        payload_slots[request] = (
+            payload_slot * tokens_per_block + offsets_values[request] // token_bytes
+        )
     output_indices_values = [output_rows - 1 - request for request in range(requests)]
     # Exercise the public variable-size BatchPut contract independently of
     # BatchGet's fixed-block kernel contract through the same Direct-HCCP
@@ -194,9 +210,13 @@ def main() -> int:
     torch.npu.set_device(device_id)
     device = f"npu:{device_id}"
     runtime = kvaf.NpuRuntime(
-        str(kernel), device_id, npu_core_count,
-        str(batch_put_kernel),
-        jettys_per_core,
+        str(kernel),
+        batch_get_token_bytes=token_bytes,
+        batch_get_tokens_per_block=tokens_per_block,
+        device_id=device_id,
+        npu_core_count=npu_core_count,
+        batch_put_kernel_object_path=str(batch_put_kernel),
+        jettys_per_core=jettys_per_core,
     )
     runtime.link_to(remote_cpu_service)
     table = None
@@ -207,6 +227,7 @@ def main() -> int:
             "RUNTIME_NPU_SPARSE_LAYOUT "
             f"table_capacity={table_capacity} requests={requests} "
             f"active_percent={active_percent} active_requests={active_requests} "
+            f"token_bytes={token_bytes} tokens_per_block={tokens_per_block} "
             f"block_bytes={block_bytes} source_stride={source_stride} "
             f"npu_cores={npu_core_count} jettys_per_core={jettys_per_core} "
             "batch_put_backend=aiv_direct_hccp"
@@ -261,8 +282,10 @@ def main() -> int:
 
         print("RUNTIME_NPU_PHASE_BEGIN phase=batch_put")
         active_keys = list(range(1, active_requests + 1))
-        source_rows = torch.arange(active_requests, dtype=torch.int64).unsqueeze(1)
-        source_bytes = torch.arange(block_bytes, dtype=torch.int64).unsqueeze(0)
+        source_rows = torch.arange(
+            active_requests * tokens_per_block, dtype=torch.int64
+        ).unsqueeze(1)
+        source_bytes = torch.arange(token_bytes, dtype=torch.int64).unsqueeze(0)
         source = (
             (source_rows * 131 + source_bytes * 17 + (source_bytes >> 3)) & 0xFF
         ).to(torch.uint8).contiguous().to(device)
@@ -272,7 +295,7 @@ def main() -> int:
         print(
             "RUNTIME_NPU_PHASE_DONE phase=batch_put "
             f"blocks={active_requests} layout=packed_offsets_lengths "
-            f"block_bytes={block_bytes}"
+            f"token_bytes={token_bytes} tokens_per_block={tokens_per_block}"
         )
 
         print("RUNTIME_NPU_PHASE_BEGIN phase=prepare_access_table")
@@ -301,10 +324,11 @@ def main() -> int:
             f"valid_entries={active_requests} table_capacity={table_capacity}"
         )
         indices = torch.tensor(indices_values, dtype=torch.int32, device=device)
+        offsets = torch.tensor(offsets_values, dtype=torch.int32, device=device)
         mask = torch.tensor(mask_values, dtype=torch.uint8, device=device)
         output_indices = torch.tensor(output_indices_values, dtype=torch.int32, device=device)
         output_a = torch.zeros(
-            (output_rows, block_bytes), dtype=torch.uint8, device=device
+            (output_rows, token_bytes), dtype=torch.uint8, device=device
         )
         output_b = torch.zeros_like(output_a)
         torch.npu.synchronize()
@@ -312,7 +336,14 @@ def main() -> int:
 
         def execute(output: object, stream: object | None = None) -> None:
             runtime.batch_get(
-                device_table, indices, mask, output_indices, output, stream
+                address_table,
+                valid_table,
+                indices,
+                offsets,
+                mask,
+                output_indices,
+                output,
+                stream,
             )
 
         print("RUNTIME_NPU_PHASE_BEGIN phase=runtime_batch_get")
@@ -320,7 +351,7 @@ def main() -> int:
         torch.npu.synchronize()
         validate_output(
             tensor_to_bytes(output_a), mask_values, output_indices_values,
-            payload_slots, block_bytes
+            payload_slots, token_bytes
         )
         print(f"RUNTIME_NPU_BATCH_GET_VALIDATION_PASS requests={requests}")
 
@@ -331,13 +362,13 @@ def main() -> int:
         torch.npu.synchronize()
         validate_output(
             tensor_to_bytes(output_b), mask_values, output_indices_values,
-            payload_slots, block_bytes
+            payload_slots, token_bytes
         )
         execute(output_a)
         torch.npu.synchronize()
         validate_output(
             tensor_to_bytes(output_a), mask_values, output_indices_values,
-            payload_slots, block_bytes
+            payload_slots, token_bytes
         )
         print("RUNTIME_NPU_DYNAMIC_OUTPUT_VALIDATION_PASS sequence=A_B_A")
 
@@ -353,18 +384,18 @@ def main() -> int:
         print("RUNTIME_NPU_PHASE_BEGIN phase=post_perf_validation")
         validate_output(
             tensor_to_bytes(output_a), mask_values, output_indices_values,
-            payload_slots, block_bytes
+            payload_slots, token_bytes
         )
         print("RUNTIME_NPU_PHASE_DONE phase=post_perf_validation")
 
         mean_ms = statistics.mean(samples)
         useful_gibps = (
-            active_requests * block_bytes / (1024.0**3) / (mean_ms / 1000.0)
+            active_requests * token_bytes / (1024.0**3) / (mean_ms / 1000.0)
         )
         print(
             "PERF_RESULT metric=runtime_batch_get_call_to_stream_completion "
             f"samples={iterations} warmup_excluded={warmup} "
-            f"active_requests={active_requests} block_bytes={block_bytes} "
+            f"active_requests={active_requests} token_bytes={token_bytes} "
             f"npu_cores={npu_core_count} mean_ms={mean_ms:.3f} "
             f"p50_ms={percentile(samples, 0.50):.3f} "
             f"p90_ms={percentile(samples, 0.90):.3f} "
@@ -406,9 +437,14 @@ def main() -> int:
             host_addresses_buffer = bytearray(host_view["addresses"])
             graph_address_table_host = bytearray(tensor_bytes(address_table))
             graph_indices_host = array("i", indices_values)
+            graph_offsets_host = array("i", offsets_values)
             graph_mask_host = bytearray(mask_values)
             graph_output_indices_host = array("i", output_indices_values)
-            if graph_indices_host.itemsize != 4 or graph_output_indices_host.itemsize != 4:
+            if (
+                graph_indices_host.itemsize != 4
+                or graph_offsets_host.itemsize != 4
+                or graph_output_indices_host.itemsize != 4
+            ):
                 raise AssertionError("graph int32 staging requires four-byte Python ints")
 
             def prepare_graph_inputs(epoch: int) -> list[int | None]:
@@ -426,9 +462,11 @@ def main() -> int:
                     payload_slot = payload_slots[request]
                     if payload_slot is None:
                         raise AssertionError("active request is missing a payload slot")
+                    source_entry = (indices_values[request] + epoch) % active_requests
                     expected_payload_slots[request] = (
-                        payload_slot + epoch
-                    ) % active_requests
+                        source_entry * tokens_per_block
+                        + offsets_values[request] // token_bytes
+                    )
                 return expected_payload_slots
 
             def enqueue_graph_inputs(trace: str | None = None) -> None:
@@ -441,6 +479,10 @@ def main() -> int:
                 graph.copy_host_to_device_async(
                     int(indices.data_ptr()), tensor_bytes(indices),
                     graph_indices_host, capture_stream
+                )
+                graph.copy_host_to_device_async(
+                    int(offsets.data_ptr()), tensor_bytes(offsets),
+                    graph_offsets_host, capture_stream
                 )
                 graph.copy_host_to_device_async(
                     int(mask.data_ptr()), tensor_bytes(mask), graph_mask_host,
@@ -457,6 +499,7 @@ def main() -> int:
                 "RUNTIME_NPU_GRAPH_HOST_INPUTS_READY "
                 f"address_table_bytes={len(graph_address_table_host)} "
                 f"indices_bytes={len(graph_indices_host) * graph_indices_host.itemsize} "
+                f"offsets_bytes={len(graph_offsets_host) * graph_offsets_host.itemsize} "
                 f"mask_bytes={len(graph_mask_host)} "
                 f"output_indices_bytes={len(graph_output_indices_host) * graph_output_indices_host.itemsize}"
             )
@@ -514,7 +557,7 @@ def main() -> int:
                     mask_values,
                     output_indices_values,
                     graph_payload_slots,
-                    block_bytes,
+                    token_bytes,
                 )
                 print(f"RUNTIME_NPU_GRAPH_REPLAY_VALIDATION_PASS replay={replay}")
 
@@ -560,16 +603,16 @@ def main() -> int:
                 mask_values,
                 output_indices_values,
                 graph_payload_slots,
-                block_bytes,
+                token_bytes,
             )
             graph_mean_ms = statistics.mean(graph_samples)
             graph_useful_gibps = (
-                active_requests * block_bytes / (1024.0**3) / (graph_mean_ms / 1000.0)
+                active_requests * token_bytes / (1024.0**3) / (graph_mean_ms / 1000.0)
             )
             print(
                 "GRAPH_PERF_RESULT metric=graph_replay_to_stream_completion "
                 f"samples={graph_iterations} warmup_excluded={graph_warmup} "
-                f"active_requests={active_requests} block_bytes={block_bytes} "
+                f"active_requests={active_requests} token_bytes={token_bytes} "
                 f"npu_cores={npu_core_count} mean_ms={graph_mean_ms:.3f} "
                 f"p50_ms={percentile(graph_samples, 0.50):.3f} "
                 f"p90_ms={percentile(graph_samples, 0.90):.3f} "

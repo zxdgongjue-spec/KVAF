@@ -17,7 +17,7 @@ enum {
 static const uint64_t KVAF_AIV_BATCH_GET_STATUS_MAGIC = 0x4b5641464247444fULL;
 
 // Keep the historical 384-byte stride even though ExecuteBatchGet uses only
-// the first cache line.  This keeps the verified host/device allocation ABI
+// the first cache line. This keeps the verified host/device allocation ABI
 // stable while reserving space for future non-hot diagnostics.
 typedef struct KvafBatchGetCoreStatus {
   uint64_t magic;
@@ -77,11 +77,13 @@ typedef struct KvafBatchGetDirectUrmaEntity {
 
 // Fixed-shape graph ABI. `output` and `channel_entity` must identify the same
 // LocalBufferAcquire result. During capture/replay both addresses stay fixed;
-// address/valid/index/mask/output-index contents may change between replays.
+// address/valid/index/offset/mask/output-index contents may change between
+// replays.
 typedef struct KvafExecuteBatchGetKernelArgs {
   uint64_t address_table;       // uint64[table_capacity], absolute Host DDR UBA
   uint64_t valid_table;         // uint8[table_capacity]
   uint64_t indices;             // int32[request_capacity]
+  uint64_t offsets;             // int32[request_capacity], byte offset in entry
   uint64_t mask;                // uint8[request_capacity]
   uint64_t output_indices;      // int32[request_capacity]
   uint64_t output;              // caller-owned HBM output; must match entity
@@ -91,7 +93,8 @@ typedef struct KvafExecuteBatchGetKernelArgs {
   uint32_t table_capacity;
   uint32_t request_capacity;
   uint32_t output_rows;
-  uint32_t block_bytes;
+  uint32_t token_bytes;         // bytes transferred for one token/WQE
+  uint32_t tokens_per_block;    // tokens stored in one address-table block
   uint32_t block_count;
   // Zero preserves the phase-one ABI and selects one Jetty per AIV core.
   uint32_t jettys_per_core;
@@ -104,7 +107,7 @@ static_assert(sizeof(KvafBatchGetQueueState) == KVAF_AIV_BATCH_GET_QUEUE_STATE_B
               "KvafBatchGetQueueState ABI changed");
 static_assert(sizeof(KvafBatchGetDirectUrmaEntity) == 192,
               "KvafBatchGetDirectUrmaEntity ABI changed");
-static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 96,
+static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 112,
               "KvafExecuteBatchGetKernelArgs ABI changed");
 #endif
 

@@ -402,7 +402,9 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
   if (impl_->config.batch_get_kernel_object_path.empty() || impl_->options.npu_core_count == 0U ||
       impl_->options.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->options.jettys_per_core == 0U ||
-      impl_->options.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE) {
+      impl_->options.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
+      impl_->options.batch_get_token_bytes == 0U ||
+      impl_->options.batch_get_tokens_per_block == 0U) {
     throw std::invalid_argument("invalid NPU Runtime configuration");
   }
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS) {
@@ -548,6 +550,12 @@ const RuntimeCore& NpuRuntime::core() const {
 std::uint32_t NpuRuntime::device_id() const { return impl_->options.device_id; }
 std::uint32_t NpuRuntime::npu_core_count() const { return impl_->options.npu_core_count; }
 std::uint32_t NpuRuntime::jettys_per_core() const { return impl_->options.jettys_per_core; }
+std::uint32_t NpuRuntime::batch_get_token_bytes() const {
+  return impl_->options.batch_get_token_bytes;
+}
+std::uint32_t NpuRuntime::batch_get_tokens_per_block() const {
+  return impl_->options.batch_get_tokens_per_block;
+}
 
 Status NpuRuntime::AcceptLink(const LinkTarget&) {
   return Status::NotImplemented("NpuRuntime does not accept links in the CPU--NPU deployment");

@@ -50,7 +50,8 @@ extern "C" int32_t KvafExecuteBatchGetLaunch(const KvafExecuteBatchGetKernelArgs
                                                 aclrtStream stream) {
   if (!g_loaded || g_function == nullptr || arguments == nullptr || stream == nullptr ||
       arguments->block_count == 0U || arguments->block_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
-      arguments->request_capacity == 0U || arguments->block_bytes == 0U ||
+      arguments->request_capacity == 0U || arguments->offsets == 0U ||
+      arguments->token_bytes == 0U || arguments->tokens_per_block == 0U ||
       arguments->jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE) {
     return KVAF_BATCH_GET_INVALID_ARGUMENT;
   }

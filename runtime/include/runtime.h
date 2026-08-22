@@ -106,8 +106,8 @@ class RuntimeCore {
     std::vector<std::uint64_t> lengths;
     std::vector<std::uint8_t> valid;
 
-    // The current NPU BatchGet ABI has one block_bytes value per launch, not
-    // one length per lookup entry. Compute this table-wide invariant once
+    // NPU BatchGet requires every valid lookup entry to match its configured
+    // tokens_per_block * output_block_bytes layout. Compute the invariant once
     // while preparing the table rather than rescanning it for every BatchGet.
     bool has_valid_entries{false};
     bool has_uniform_valid_length{true};

@@ -3,13 +3,23 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "runtime.h"
 
 namespace kvaf {
 
 struct NpuRuntimeOptions {
+  NpuRuntimeOptions(std::string kernel_object_path,
+                    std::uint32_t token_bytes,
+                    std::uint32_t tokens_per_block)
+      : batch_get_kernel_object_path(std::move(kernel_object_path)),
+        batch_get_token_bytes(token_bytes),
+        batch_get_tokens_per_block(tokens_per_block) {}
+
   std::string batch_get_kernel_object_path;
+  std::uint32_t batch_get_token_bytes;
+  std::uint32_t batch_get_tokens_per_block;
   std::string batch_put_kernel_object_path;
   std::uint32_t device_id{0U};
   std::uint32_t npu_core_count{1U};
@@ -33,6 +43,8 @@ class NpuRuntime final : public Runtime {
   std::uint32_t device_id() const;
   std::uint32_t npu_core_count() const;
   std::uint32_t jettys_per_core() const;
+  std::uint32_t batch_get_token_bytes() const;
+  std::uint32_t batch_get_tokens_per_block() const;
 
   Status LinkTo(const LinkTarget& target) override;
   Status AcceptLink(const LinkTarget& peer) override;

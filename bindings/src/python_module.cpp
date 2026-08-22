@@ -1,6 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -109,6 +110,7 @@ class MockAccessOperator final : public AccessOperator {
 
     const BatchGetRequest& request = *exec.request;
     if (request.indices.device != DeviceKind::kCpu ||
+        request.offsets.device != DeviceKind::kCpu ||
         request.output_indices.device != DeviceKind::kCpu ||
         request.output.device != DeviceKind::kCpu) {
       return InvalidArgument("mock operator supports CPU buffers only");
@@ -116,6 +118,7 @@ class MockAccessOperator final : public AccessOperator {
 
     const auto count = request.indices.bytes / sizeof(std::int32_t);
     const auto* indices = static_cast<const std::int32_t*>(request.indices.data);
+    const auto* offsets = static_cast<const std::int32_t*>(request.offsets.data);
     const auto* output_indices =
         static_cast<const std::int32_t*>(request.output_indices.data);
     const auto* mask = request.mask.data == nullptr
@@ -139,16 +142,24 @@ class MockAccessOperator final : public AccessOperator {
 
       const std::size_t table_index = static_cast<std::size_t>(indices[i]);
       const std::uint64_t length = exec.host_access_table.lengths[table_index];
-      if (length > request.output_block_bytes) {
-        return InvalidArgument("BatchGet output block is smaller than source data");
+      if (offsets[i] < 0) {
+        return InvalidArgument("BatchGet offset is outside the AccessTable entry");
       }
+      const std::uint64_t offset_bytes =
+          static_cast<std::uint64_t>(offsets[i]);
+      if (offset_bytes >= length) {
+        return InvalidArgument("BatchGet offset is outside source data");
+      }
+      const std::uint64_t copy_bytes =
+          std::min(length - offset_bytes, request.output_block_bytes);
       std::uint8_t* destination =
           output + static_cast<std::size_t>(output_indices[i]) *
                        request.output_block_bytes;
       std::memcpy(destination,
                   reinterpret_cast<const void*>(
-                      exec.host_access_table.addresses[table_index]),
-                  static_cast<std::size_t>(length));
+                      exec.host_access_table.addresses[table_index] +
+                      offset_bytes),
+                  static_cast<std::size_t>(copy_bytes));
     }
     return Status::OK();
   }
@@ -265,12 +276,14 @@ class PythonRuntime final {
 
   void BatchGet(const AccessTableHandle& handle,
                 const std::vector<std::int32_t>& indices,
+                const std::vector<std::int32_t>& offsets,
                 const std::vector<std::int32_t>& output_indices,
                 py::bytearray output, std::uint64_t output_block_bytes,
                 py::object mask) {
-    if (indices.empty() || indices.size() != output_indices.size()) {
+    if (indices.empty() || indices.size() != offsets.size() ||
+        indices.size() != output_indices.size()) {
       throw py::value_error(
-          "BatchGet indices and output_indices must be non-empty and equal in size");
+          "BatchGet indices, offsets, and output_indices must be non-empty and equal in size");
     }
     if (output_block_bytes == 0) {
       throw py::value_error("BatchGet output_block_bytes must be non-zero");
@@ -299,6 +312,9 @@ class PythonRuntime final {
         ConstBufferView{indices.data(),
                         indices.size() * sizeof(indices.front()),
                         DeviceKind::kCpu},
+        ConstBufferView{offsets.data(),
+                        offsets.size() * sizeof(offsets.front()),
+                        DeviceKind::kCpu},
         mask_view,
         ConstBufferView{output_indices.data(),
                         output_indices.size() * sizeof(output_indices.front()),
@@ -306,6 +322,7 @@ class PythonRuntime final {
         MutableBufferView{output_data, static_cast<std::size_t>(output_size),
                           DeviceKind::kCpu},
         output_block_bytes,
+        0,
         AccessTableDeviceView{}};
     ThrowIfError(runtime_->BatchGet(request));
   }
@@ -358,6 +375,7 @@ PYBIND11_MODULE(_kvaf, m) {
            py::arg("access_table"))
       .def("batch_get", &kvaf::PythonRuntime::BatchGet,
            py::arg("access_table"), py::arg("indices"),
+           py::arg("offsets"),
            py::arg("output_indices"), py::arg("output"),
            py::arg("output_block_bytes"), py::arg("mask") = py::none())
       .def("batch_free", &kvaf::PythonRuntime::BatchFree, py::arg("keys"))
