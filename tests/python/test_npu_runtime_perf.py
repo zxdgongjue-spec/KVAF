@@ -28,6 +28,8 @@ PUT_BATCH_SIZE = 128
 WARMUP = 3
 ITERATIONS = 100
 ACTIVE_PERCENT = 5
+DEFAULT_TOKEN_BYTES = 656
+DEFAULT_TOKENS_PER_BLOCK = 128
 REQUESTS_PER_BATCH = 2048
 MAX_ACTIVE_REQUESTS_PER_AIV = 16384
 
@@ -97,19 +99,17 @@ def main(batch: int = 16) -> int:
     active_percent = int(
         os.environ.get("KVAF_RUNTIME_PERF_ACTIVE_PERCENT", str(ACTIVE_PERCENT))
     )
-    token_bytes_text = os.environ.get("KVAF_RUNTIME_PERF_TOKEN_BYTES")
-    tokens_per_block_text = os.environ.get(
-        "KVAF_RUNTIME_PERF_TOKENS_PER_BLOCK"
-    )
-    if token_bytes_text is None or tokens_per_block_text is None:
-        print(
-            "FAIL: KVAF_RUNTIME_PERF_TOKEN_BYTES and "
-            "KVAF_RUNTIME_PERF_TOKENS_PER_BLOCK must both be configured",
-            file=sys.stderr,
+    token_bytes = int(
+        os.environ.get(
+            "KVAF_RUNTIME_PERF_TOKEN_BYTES", str(DEFAULT_TOKEN_BYTES)
         )
-        return 2
-    token_bytes = int(token_bytes_text)
-    tokens_per_block = int(tokens_per_block_text)
+    )
+    tokens_per_block = int(
+        os.environ.get(
+            "KVAF_RUNTIME_PERF_TOKENS_PER_BLOCK",
+            str(DEFAULT_TOKENS_PER_BLOCK),
+        )
+    )
     block_bytes = token_bytes * tokens_per_block
     source_stride = int(
         os.environ.get("KVAF_RUNTIME_PERF_SOURCE_STRIDE", str(block_bytes))

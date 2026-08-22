@@ -26,6 +26,10 @@ import kvaf
 
 from backend import detect_torch_backend
 
+DEFAULT_TOKEN_BYTES = 656
+DEFAULT_TOKENS_PER_BLOCK = 128
+
+
 def pattern(slot: int, token_bytes: int) -> bytes:
     return bytes((slot * 131 + byte * 17 + (byte >> 3)) & 0xFF for byte in range(token_bytes))
 
@@ -116,17 +120,14 @@ def main() -> int:
     table_capacity = int(os.environ.get("KVAF_NPU_TABLE_CAPACITY", "8"))
     requests = int(os.environ.get("KVAF_NPU_REQUESTS", "8"))
     output_rows = int(os.environ.get("KVAF_NPU_OUTPUT_ROWS", "8"))
-    token_bytes_text = os.environ.get("KVAF_NPU_TOKEN_BYTES")
-    tokens_per_block_text = os.environ.get("KVAF_NPU_TOKENS_PER_BLOCK")
-    if token_bytes_text is None or tokens_per_block_text is None:
-        print(
-            "FAIL: KVAF_NPU_TOKEN_BYTES and KVAF_NPU_TOKENS_PER_BLOCK "
-            "must both be configured",
-            file=sys.stderr,
+    token_bytes = int(
+        os.environ.get("KVAF_NPU_TOKEN_BYTES", str(DEFAULT_TOKEN_BYTES))
+    )
+    tokens_per_block = int(
+        os.environ.get(
+            "KVAF_NPU_TOKENS_PER_BLOCK", str(DEFAULT_TOKENS_PER_BLOCK)
         )
-        return 2
-    token_bytes = int(token_bytes_text)
-    tokens_per_block = int(tokens_per_block_text)
+    )
     block_bytes = token_bytes * tokens_per_block
     source_stride = int(os.environ.get("KVAF_NPU_SOURCE_STRIDE", str(block_bytes)))
     npu_core_count = int(

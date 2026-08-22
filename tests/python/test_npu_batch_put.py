@@ -15,6 +15,9 @@ import kvaf
 
 from backend import detect_torch_backend
 
+DEFAULT_BATCH_GET_TOKEN_BYTES = 656
+DEFAULT_BATCH_GET_TOKENS_PER_BLOCK = 128
+
 
 def percentile(values: list[float], fraction: float) -> float:
     ordered = sorted(values)
@@ -89,17 +92,17 @@ def main() -> int:
     device_id = int(os.environ.get("DEVICE_ID", "0"))
     rows = int(os.environ.get("KVAF_NPU_REQUESTS", "4096"))
     block_bytes = int(os.environ.get("KVAF_NPU_BLOCK_BYTES", "1024"))
-    token_bytes_text = os.environ.get("KVAF_NPU_TOKEN_BYTES")
-    tokens_per_block_text = os.environ.get("KVAF_NPU_TOKENS_PER_BLOCK")
-    if token_bytes_text is None or tokens_per_block_text is None:
-        print(
-            "FAIL: KVAF_NPU_TOKEN_BYTES and KVAF_NPU_TOKENS_PER_BLOCK "
-            "must both be configured",
-            file=sys.stderr,
+    token_bytes = int(
+        os.environ.get(
+            "KVAF_NPU_TOKEN_BYTES", str(DEFAULT_BATCH_GET_TOKEN_BYTES)
         )
-        return 2
-    token_bytes = int(token_bytes_text)
-    tokens_per_block = int(tokens_per_block_text)
+    )
+    tokens_per_block = int(
+        os.environ.get(
+            "KVAF_NPU_TOKENS_PER_BLOCK",
+            str(DEFAULT_BATCH_GET_TOKENS_PER_BLOCK),
+        )
+    )
     npu_core_count = int(
         os.environ.get("KVAF_NPU_CORE_COUNT", os.environ.get("KVAF_NPU_AIV_CORES", "32"))
     )

@@ -275,19 +275,18 @@ KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 \
 DEVICE_ID=0 \
 KVAF_RUNTIME_PERF_TOKEN_BYTES=656 \
 KVAF_RUNTIME_PERF_TOKENS_PER_BLOCK=128 \
-KVAF_REMOTE_CPU_PERF_TIMEOUT=1800 \
+KVAF_REMOTE_CPU_PERF_TIMEOUT=600 \
 tests/run_remote_cpu_runtime_perf.sh "$PWD/build-npu"
 ```
 
-测试默认 `batch=16`，`token_bytes` 和 `tokens_per_block` 无默认值，
-必须分别通过 `KVAF_RUNTIME_PERF_TOKEN_BYTES` 和
-`KVAF_RUNTIME_PERF_TOKENS_PER_BLOCK` 显式配置。例如传入 656 和 128 时，
+测试默认 `batch=16`、`token_bytes=656`、`tokens_per_block=128`，
 全表为 2,097,152 个 83,968B entry，每次 BatchGet 32,768 requests、32 个 AIV core、
 每 core 2 个 Jetty、3 次 warmup 与
 100 个样本。可用
 `KVAF_RUNTIME_PERF_BATCH`、
 `KVAF_RUNTIME_PERF_AIV_CORES`、`KVAF_RUNTIME_PERF_WARMUP`、
-`KVAF_RUNTIME_PERF_ITERATIONS` 和 `KVAF_RUNTIME_PERF_ACTIVE_PERCENT` 覆盖；
+`KVAF_RUNTIME_PERF_ITERATIONS`、`KVAF_RUNTIME_PERF_ACTIVE_PERCENT`、
+`KVAF_RUNTIME_PERF_TOKEN_BYTES` 和 `KVAF_RUNTIME_PERF_TOKENS_PER_BLOCK` 覆盖；
 Jetty 数量可通过
 `KVAF_RUNTIME_PERF_JETTYS_PER_CORE` 覆盖。全量 data population 会写入 2,097,152 个
 逻辑 KV entry；脚本显式配置 AIV Direct-HCCP BatchPut kernel，BatchPut 性能样本
