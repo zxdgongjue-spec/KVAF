@@ -15,6 +15,12 @@ enum {
   KVAF_AIV_BATCH_GET_ADDRESS_TABLE_ENTRY_BYTES =
       KVAF_AIV_BATCH_GET_ADDRESS_TABLE_ENTRY_COUNT *
       KVAF_AIV_BATCH_GET_WQE_DATA_BYTES,
+  // A graph-stable NPU control tensor for a fused ExactScan + Get operator.
+  // It contains exactly 16 uint64 words so Python can expose it as
+  // torch.int64[16] without an ABI-specific tensor dtype.
+  KVAF_FUSED_BATCH_GET_CONTROL_WORDS = 16,
+  KVAF_FUSED_BATCH_GET_CONTROL_BYTES =
+      KVAF_FUSED_BATCH_GET_CONTROL_WORDS * sizeof(uint64_t),
   // Shared local-memory contract used by the AIV kernel and launcher.
   KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES = 160 * 1024,
 };
@@ -22,6 +28,9 @@ enum {
 static const uint64_t KVAF_AIV_BATCH_GET_STATUS_MAGIC = 0x4b5641464247444fULL;
 static const uint64_t KVAF_AIV_BATCH_GET_PROFILE_MAGIC =
     0x4b56414650524f46ULL;  // "KVAFPROF"
+static const uint64_t KVAF_FUSED_BATCH_GET_CONTROL_MAGIC =
+    0x4b56414646555345ULL;  // "KVAFFUSE"
+static const uint64_t KVAF_FUSED_BATCH_GET_CONTROL_VERSION = 1ULL;
 
 // Optional, per-core kernel timeline. The host enables collection by placing
 // KVAF_AIV_BATCH_GET_PROFILE_MAGIC in `magic` before launch. The kernel keeps
@@ -127,6 +136,31 @@ typedef struct KvafExecuteBatchGetKernelArgs {
   uint32_t jettys_per_core;
 } KvafExecuteBatchGetKernelArgs;
 
+// Cold-path control block for a fused, full-completion BatchGet path.
+//
+// The block itself resides in caller-owned HBM.  KVAF fills it only after it
+// has registered `output` with Direct-HCCP, so channel_entity carries valid
+// SQ/CQ/token state for that exact output range.  Descriptor pointers are not
+// stored here: the fused operator supplies its per-chunk descriptor buffers
+// when it constructs a KvafExecuteBatchGetKernelArgs for one lane.
+//
+// Field order is part of the cross-repository ABI.  Keep it at 16 uint64
+// words.  A fused operator splits the 2-worker tables by the ABI strides
+// below and invokes RunKvafFullBatchGetCore with block_count=1 for each lane.
+typedef struct KvafFusedBatchGetControl {
+  uint64_t magic;
+  uint64_t version;
+  uint64_t channel_entity;
+  uint64_t queue_state;
+  uint64_t core_status;
+  uint64_t output;
+  uint64_t output_rows;
+  uint64_t block_count;
+  uint64_t jettys_per_core;
+  uint64_t block_bytes;
+  uint64_t reserved[6];
+} KvafFusedBatchGetControl;
+
 #if defined(__cplusplus)
 static_assert(sizeof(KvafBatchGetCoreStatus) == KVAF_AIV_BATCH_GET_STATUS_BYTES,
               "KvafBatchGetCoreStatus ABI changed");
@@ -138,6 +172,9 @@ static_assert(sizeof(KvafBatchGetDirectUrmaEntity) == 192,
               "KvafBatchGetDirectUrmaEntity ABI changed");
 static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 104,
               "KvafExecuteBatchGetKernelArgs ABI changed");
+static_assert(sizeof(KvafFusedBatchGetControl) ==
+                  KVAF_FUSED_BATCH_GET_CONTROL_BYTES,
+              "KvafFusedBatchGetControl ABI changed");
 #endif
 
 #endif  // KVAF_AIV_BATCH_GET_ABI_H_

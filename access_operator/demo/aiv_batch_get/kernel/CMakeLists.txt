@@ -66,6 +66,7 @@ add_custom_command(
   COMMAND "${KVAF_LLD}" -m aicorelinux -Ttext=0 "${KVAF_EXECUTE_KERNEL_TMP}" -static
           -o "${KVAF_EXECUTE_KERNEL_OBJECT}"
   DEPENDS "${KVAF_EXECUTE_KERNEL_SOURCE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/kvaf_fused_full_get_device.h"
           "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_abi.h"
           "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"
   VERBATIM)

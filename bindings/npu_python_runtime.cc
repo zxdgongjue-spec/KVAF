@@ -879,6 +879,7 @@ class NpuRuntime final {
 
   void Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
     EnsureNoNativeGetLane("initialize");
+    EnsureNoFusedBatchGetControl("initialize");
     ThrowIfError(runtime_->Initialize(
         RuntimeInitRequest{ddr_bytes, slot_size, DeviceKind::kCpu}));
   }
@@ -910,6 +911,10 @@ class NpuRuntime final {
                 const std::vector<std::uint64_t>& lengths,
                 const py::object& stream) {
     EnsureNoNativeGetLane("batch_put");
+    // A fused Get reads the Runtime-owned DDR region directly from AIV.  A
+    // concurrent Put could alter the same payload or metadata lifetime while
+    // the graph is still using its fixed DeviceAccessTable.
+    EnsureNoFusedBatchGetControl("batch_put");
     if (!Initialized()) {
       throw std::runtime_error("Runtime has not been initialized");
     }
@@ -938,6 +943,9 @@ class NpuRuntime final {
 
   AccessTableHandle PrepareAccessTable(const py::object& keys) {
     EnsureNoNativeGetLane("prepare_access_table");
+    // This may allocate/replace Runtime metadata that a captured fused graph
+    // still treats as stable for its current layer.
+    EnsureNoFusedBatchGetControl("prepare_access_table");
     std::vector<KeyId> copied_keys = CopyPrepareKeys(keys);
     AccessTableHandle handle;
     ThrowIfError(runtime_->PrepareAccessTable(
@@ -1001,6 +1009,9 @@ class NpuRuntime final {
 
   void ReleaseAccessTable(const AccessTableHandle& handle) {
     EnsureNoNativeGetLane("release_access_table");
+    // Releasing an AccessTable can return remote slots to Runtime metadata
+    // even though a fused ExactScan + Get graph still owns its device view.
+    EnsureNoFusedBatchGetControl("release_access_table");
     ThrowIfError(runtime_->ReleaseAccessTable(handle));
   }
 
@@ -1010,17 +1021,20 @@ class NpuRuntime final {
   // a second representation solely for the NPU Runtime binding.
   void BatchFree(const py::object& keys) {
     EnsureNoNativeGetLane("batch_free");
+    EnsureNoFusedBatchGetControl("batch_free");
     std::vector<KeyId> copied_keys = CopyPrepareKeys(keys);
     ThrowIfError(runtime_->BatchFree(BatchFreeRequest{std::move(copied_keys)}));
   }
 
   void StartBatchGetKernelProfile() {
     EnsureNoNativeGetLane("start_batch_get_kernel_profile");
+    EnsureNoFusedBatchGetControl("start_batch_get_kernel_profile");
     ThrowIfError(access_operator_->SetBatchGetKernelProfiling(true));
   }
 
   py::list BatchGetKernelProfileSnapshot() const {
     EnsureNoNativeGetLane("batch_get_kernel_profile");
+    EnsureNoFusedBatchGetControl("batch_get_kernel_profile");
     std::vector<kvaf::BatchGetKernelProfile> profiles;
     ThrowIfError(access_operator_->CopyBatchGetKernelProfiles(&profiles));
     py::list result;
@@ -1047,6 +1061,7 @@ class NpuRuntime final {
 
   py::list StopBatchGetKernelProfile() {
     EnsureNoNativeGetLane("stop_batch_get_kernel_profile");
+    EnsureNoFusedBatchGetControl("stop_batch_get_kernel_profile");
     py::list result = BatchGetKernelProfileSnapshot();
     ThrowIfError(access_operator_->SetBatchGetKernelProfiling(false));
     return result;
@@ -1062,6 +1077,7 @@ class NpuRuntime final {
                 const py::object& output_indices, const py::object& output,
                 const py::object& stream, bool synchronize) {
     EnsureNoNativeGetLane("batch_get");
+    EnsureNoFusedBatchGetControl("batch_get");
     BatchGetImpl(access_table.source(), access_table.addresses(),
                  access_table.valid(), indices, offsets, mask, output_indices,
                  output, stream, synchronize);
@@ -1079,6 +1095,7 @@ class NpuRuntime final {
                            const py::object& output,
                            const py::object& stream, bool synchronize) {
     EnsureNoNativeGetLane("batch_get");
+    EnsureNoFusedBatchGetControl("batch_get");
     BatchGetImpl(AccessTableHandle{}, addresses, valid, indices, offsets, mask,
                  output_indices, output, stream, synchronize);
   }
@@ -1102,6 +1119,7 @@ class NpuRuntime final {
     if (!Initialized()) {
       throw std::runtime_error("Runtime has not been initialized");
     }
+    EnsureNoFusedBatchGetControl("create_native_get_submit_lane");
     if (native_get_lane_ != nullptr) {
       EnsureNativeGetLaneOwner("create_native_get_submit_lane");
       throw py::value_error("native Get submit lane already exists");
@@ -1126,6 +1144,7 @@ class NpuRuntime final {
   }
 
   void BindNativeGetOutput(const py::object& output) {
+    EnsureNoFusedBatchGetControl("bind_native_get_output");
     NativeGetSubmitLane& lane = RequireNativeGetLane("bind_native_get_output");
     const NpuTensorView output_view = GetNpuTensorView(output, "native Get output");
     if (output_view.shape.size() < 2 || output_view.shape.front() <= 0 ||
@@ -1229,6 +1248,61 @@ class NpuRuntime final {
     native_get_lane_copy_stream_keepalive_ = py::none();
   }
 
+  // Bind the fixed output registration and the persistent two-worker SQ/CQ
+  // state that a device-side fused ExactScan + Get operator consumes.  The
+  // control tensor is intentionally plain NPU torch.int64[16], not a Python
+  // object with hidden host state: the fused kernel can load every pointer it
+  // needs directly from HBM during graph replay.
+  void BindFusedBatchGetControl(const py::object& output,
+                                const py::object& control) {
+    EnsureNoNativeGetLane("bind_fused_batch_get_control");
+    if (!Initialized()) {
+      throw std::runtime_error("Runtime has not been initialized");
+    }
+    if (fused_batch_get_control_bound_) {
+      throw py::value_error("fused BatchGet control is already bound");
+    }
+    const NpuTensorView output_view =
+        GetNpuTensorView(output, "fused BatchGet output");
+    const NpuTensorView control_view =
+        GetNpuTensorView(control, "fused BatchGet control");
+    if (output_view.shape.size() < 2 || output_view.shape.front() <= 0 ||
+        output_view.bytes %
+                static_cast<std::size_t>(output_view.shape.front()) != 0 ||
+        output_view.bytes /
+                static_cast<std::size_t>(output_view.shape.front()) !=
+            kBatchGetTransferBytes) {
+      throw py::value_error(
+          "fused BatchGet output Tensor rows must each be 656 bytes");
+    }
+    if (control_view.shape.size() != 1 ||
+        control_view.shape.front() !=
+            static_cast<py::ssize_t>(KVAF_FUSED_BATCH_GET_CONTROL_WORDS) ||
+        control_view.element_bytes != sizeof(std::uint64_t) ||
+        py::str(control.attr("dtype")).cast<std::string>() != "torch.int64") {
+      throw py::value_error(
+          "fused BatchGet control must be contiguous NPU torch.int64[16]");
+    }
+    ThrowIfError(access_operator_->BindFusedBatchGetControl(
+        MutableBufferView{output_view.data, output_view.bytes, DeviceKind::kNpu},
+        MutableBufferView{control_view.data, control_view.bytes,
+                          DeviceKind::kNpu}));
+    fused_batch_get_control_bound_ = true;
+    fused_batch_get_output_keepalive_ = output;
+    fused_batch_get_control_keepalive_ = control;
+  }
+
+  void ReleaseFusedBatchGetControl() {
+    if (!fused_batch_get_control_bound_) {
+      return;
+    }
+    EnsureNoNativeGetLane("release_fused_batch_get_control");
+    ThrowIfError(access_operator_->ReleaseFusedBatchGetControl());
+    fused_batch_get_control_bound_ = false;
+    fused_batch_get_output_keepalive_ = py::none();
+    fused_batch_get_control_keepalive_ = py::none();
+  }
+
  private:
   BatchGetRequest BuildBatchGetRequest(
       const AccessTableHandle& access_table, const py::object& addresses,
@@ -1302,6 +1376,12 @@ class NpuRuntime final {
     // the cold HBM registration.  Close rejects an unretired slot rather than
     // guessing whether a later QSFA reader is still using the payload.
     DestroyNativeGetSubmitLane();
+    if (fused_batch_get_control_bound_) {
+      throw py::value_error(
+          "shutdown is forbidden while fused BatchGet control is bound; "
+          "wait for the final fused reader and call "
+          "release_fused_batch_get_control() first");
+    }
     if (runtime_ != nullptr && runtime_->initialized()) {
       ThrowIfError(runtime_->Shutdown());
     }
@@ -1335,6 +1415,15 @@ class NpuRuntime final {
     }
   }
 
+  void EnsureNoFusedBatchGetControl(const char* operation) const {
+    if (fused_batch_get_control_bound_) {
+      throw py::value_error(
+          std::string(operation) +
+          " is forbidden while fused BatchGet control owns this Runtime; "
+          "wait for the final fused reader and release the control first");
+    }
+  }
+
   void CloseNoThrow() {
     // Destruction is normally preceded by the Python-visible shutdown(),
     // which enforces terminal completion.  Do not call Runtime::Shutdown
@@ -1348,6 +1437,20 @@ class NpuRuntime final {
       (void)native_get_lane_output_keepalive_.release();
       (void)native_get_lane_request_keepalive_.release();
       (void)native_get_lane_.release();
+      (void)runtime_.release();
+      (void)access_operator_.release();
+      (void)allocator_.release();
+      (void)meta_manager_.release();
+      return;
+    }
+    if (fused_batch_get_control_bound_) {
+      // The Python-visible release method requires the caller to establish
+      // the terminal reader.  At exception-time destruction we cannot prove
+      // that a captured fused graph stopped reading the output, so preserve
+      // the Runtime, transport and both Tensor references rather than freeing
+      // Direct-HCCP state underneath an in-flight AIV.
+      (void)fused_batch_get_output_keepalive_.release();
+      (void)fused_batch_get_control_keepalive_.release();
       (void)runtime_.release();
       (void)access_operator_.release();
       (void)allocator_.release();
@@ -1377,6 +1480,9 @@ class NpuRuntime final {
   py::object native_get_lane_copy_stream_keepalive_;
   py::object native_get_lane_output_keepalive_;
   py::object native_get_lane_request_keepalive_;
+  bool fused_batch_get_control_bound_{false};
+  py::object fused_batch_get_output_keepalive_;
+  py::object fused_batch_get_control_keepalive_;
 };
 
 }  // namespace
@@ -1469,6 +1575,18 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("destroy_native_get_submit_lane",
            &NpuRuntime::DestroyNativeGetSubmitLane,
            "Stop the worker and release the fixed HBM binding. The slot must be reaped.")
+      .def("bind_fused_batch_get_control",
+           &NpuRuntime::BindFusedBatchGetControl, py::arg("output"),
+           py::arg("control"),
+           "Cold-bind fixed output HBM and write a graph-stable uint64[16] "
+           "Direct-HCCP control block for the two-lane fused Get path. "
+           "Requires Runtime npu_core_count=2 and jettys_per_core=1; ordinary "
+           "and native-lane BatchGet remain unavailable until release. The "
+           "caller must first complete earlier ordinary Get work from this Runtime.")
+      .def("release_fused_batch_get_control",
+           &NpuRuntime::ReleaseFusedBatchGetControl,
+           "Release the fused Get HBM registration after the final fused "
+           "consumer has completed. This method does not synchronize a stream.")
       .def("batch_get", &NpuRuntime::BatchGet,
            py::arg("device_access_table"), py::arg("indices"), py::arg("offsets"),
            py::arg("mask"),

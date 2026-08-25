@@ -253,12 +253,28 @@ struct DefaultAccessOperator::Impl {
     std::uint64_t channel_entity{0};
   };
 
+  // One fused MIX invocation owns both Direct-HCCP workers.  This binding
+  // retains the cold LocalBufferAcquire registration and exposes only its
+  // device-resident ABI through a caller-owned KvafFusedBatchGetControl.
+  // It deliberately has no hot host submit method: the fused AIV helper owns
+  // SQ PI, CQ CI, doorbells, and completion polling itself.
+  struct FusedBatchGetControlBinding {
+    void* output{nullptr};
+    std::size_t output_bytes{0};
+    void* control{nullptr};
+    std::size_t control_bytes{0};
+    KvafBatchGetLocalBuffer* local_buffer{nullptr};
+    std::uint64_t channel_entity{0};
+    bool active{false};
+  };
+
   AccessOperatorConfig config;
   RemoteRegionDesc remote_region;
   KvafBatchGetTransport* transport{nullptr};
   BatchGetExecutionState execution;
   std::vector<BoundBatchGetOutput> bound_outputs;
   BatchGetOutputBindingId next_bound_output_id{1};
+  FusedBatchGetControlBinding fused_control;
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   KvafBatchPutTransport* batch_put_transport{nullptr};
   BatchPutExecutionState batch_put_execution;
@@ -387,6 +403,17 @@ Status DefaultAccessOperator::Shutdown() {
     return Status::OK();
   }
 
+  // A fused Get owns a Direct-HCCP local-HBM registration that can still be
+  // read by a graph-replayed AIV. Unlike an ordinary host submission there is
+  // no host completion object to prove that the final reader has retired.
+  // Fail closed: the caller must establish its terminal event, then call
+  // ReleaseFusedBatchGetControl explicitly before shutting down the Runtime.
+  if (impl_->fused_control.active) {
+    return Status::Busy(
+        "Shutdown is forbidden while fused BatchGet control is bound; "
+        "wait for the final fused reader and release the control first");
+  }
+
   // Callers must complete all submitted streams before Runtime::Shutdown,
   // including the default enqueue-only Python BatchGet path.
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
@@ -425,6 +452,12 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   if (!impl_->initialized || impl_->transport == nullptr) {
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
+  }
+  if (impl_->fused_control.active) {
+    return Status::Error(
+        StatusCode::kBusy,
+        "ordinary BatchGet is forbidden while fused BatchGet control owns "
+        "the Direct-HCCP SQ/CQ state");
   }
   if (exec.execution.stream == nullptr) {
     return InvalidArgument("NPU BatchGet requires a caller-owned ACL stream");
@@ -478,6 +511,12 @@ Status DefaultAccessOperator::BindBatchGetOutput(
   if (!impl_->initialized || impl_->transport == nullptr) {
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
+  }
+  if (impl_->fused_control.active) {
+    return Status::Error(
+        StatusCode::kBusy,
+        "native BatchGet output binding is forbidden while fused BatchGet "
+        "control owns the Direct-HCCP SQ/CQ state");
   }
   if (!output.valid() || output.device != DeviceKind::kNpu ||
       output.bytes % kBatchGetTransferBytes != 0) {
@@ -540,6 +579,12 @@ Status DefaultAccessOperator::ExecuteBoundBatchGet(
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
   }
+  if (impl_->fused_control.active) {
+    return Status::Error(
+        StatusCode::kBusy,
+        "bound BatchGet is forbidden while fused BatchGet control owns the "
+        "Direct-HCCP SQ/CQ state");
+  }
   if (exec.execution.stream == nullptr) {
     return InvalidArgument("NPU BatchGet requires a caller-owned ACL stream");
   }
@@ -577,6 +622,103 @@ Status DefaultAccessOperator::ExecuteBoundBatchGet(
     }
     LogBatchGetDeviceStatus(impl_->execution, impl_->config.npu_core_count);
   }
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::BindFusedBatchGetControl(
+    const MutableBufferView& output, const MutableBufferView& control) {
+  if (!impl_->initialized || impl_->transport == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  if (impl_->fused_control.active) {
+    return Status::Error(StatusCode::kAlreadyExists,
+                         "fused BatchGet control is already bound");
+  }
+  // Existing enqueue-only BatchGet calls intentionally do not retain a host
+  // completion object.  A cold caller must therefore drain any earlier
+  // ordinary Get before claiming this state; once active, the checks above
+  // prevent new ordinary/native submissions from racing the two AIV lanes.
+  // A fused 31+1 MIX operator has exactly two Get lanes.  Its custom kernel
+  // turns each lane into a block_count=1 view of the two-worker state below.
+  if (impl_->config.npu_core_count != 2U ||
+      impl_->config.jettys_per_core != 1U) {
+    return InvalidArgument(
+        "fused BatchGet control requires npu_core_count=2 and "
+        "jettys_per_core=1");
+  }
+  if (!impl_->bound_outputs.empty()) {
+    return Status::Error(
+        StatusCode::kBusy,
+        "fused BatchGet control requires no active native BatchGet output "
+        "binding");
+  }
+  if (!output.valid() || output.device != DeviceKind::kNpu ||
+      output.bytes % kBatchGetTransferBytes != 0U) {
+    return InvalidArgument(
+        "fused BatchGet output must be an NPU buffer with 656-byte rows");
+  }
+  if (!control.valid() || control.device != DeviceKind::kNpu ||
+      control.bytes != sizeof(KvafFusedBatchGetControl)) {
+    return InvalidArgument(
+        "fused BatchGet control must be an NPU uint64[16] buffer");
+  }
+  if (output.data == control.data || impl_->execution.status == nullptr ||
+      impl_->execution.queue_state == nullptr) {
+    return InvalidArgument("invalid fused BatchGet control/output state");
+  }
+
+  KvafBatchGetLocalBuffer* local_buffer = nullptr;
+  std::uint64_t channel_entity = 0U;
+  if (KvafBatchGetLocalBufferAcquire(impl_->transport, output.data,
+                                     output.bytes, &local_buffer,
+                                     &channel_entity) !=
+          KVAF_BATCH_GET_SUCCESS ||
+      local_buffer == nullptr || channel_entity == 0U) {
+    if (local_buffer != nullptr) {
+      KvafBatchGetLocalBufferRelease(local_buffer);
+    }
+    return Internal("failed to bind fused BatchGet output");
+  }
+
+  KvafFusedBatchGetControl host_control{};
+  host_control.magic = KVAF_FUSED_BATCH_GET_CONTROL_MAGIC;
+  host_control.version = KVAF_FUSED_BATCH_GET_CONTROL_VERSION;
+  host_control.channel_entity = channel_entity;
+  host_control.queue_state = PointerValue(impl_->execution.queue_state);
+  host_control.core_status = PointerValue(impl_->execution.status);
+  host_control.output = PointerValue(output.data);
+  host_control.output_rows =
+      static_cast<std::uint64_t>(output.bytes / kBatchGetTransferBytes);
+  host_control.block_count = impl_->config.npu_core_count;
+  host_control.jettys_per_core = impl_->config.jettys_per_core;
+  host_control.block_bytes = kBatchGetTransferBytes;
+  if (aclrtMemcpy(control.data, control.bytes, &host_control,
+                  sizeof(host_control), ACL_MEMCPY_HOST_TO_DEVICE) !=
+      ACL_SUCCESS) {
+    KvafBatchGetLocalBufferRelease(local_buffer);
+    return Internal("failed to write fused BatchGet device control");
+  }
+
+  impl_->fused_control = Impl::FusedBatchGetControlBinding{
+      output.data, output.bytes, control.data, control.bytes, local_buffer,
+      channel_entity, true};
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::ReleaseFusedBatchGetControl() {
+  if (!impl_->initialized || impl_->transport == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  if (!impl_->fused_control.active) {
+    return Status::NotFound("fused BatchGet control is not bound");
+  }
+  // The caller must already have observed the terminal reader.  This method
+  // never synchronizes a stream because it is a cold lifecycle boundary, not
+  // a hidden host-side completion path.
+  KvafBatchGetLocalBufferRelease(impl_->fused_control.local_buffer);
+  impl_->fused_control = Impl::FusedBatchGetControlBinding{};
   return Status::OK();
 }
 
@@ -665,6 +807,14 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
 Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
   if (!impl_->initialized) {
     return Status::NotInitialized("AccessOperator has not been initialized");
+  }
+  // NpuRuntime rejects BatchPut before it mutates Runtime metadata.  Keep the
+  // same protection here as a second boundary for direct C++ users: an AIV
+  // fused Get reads this transport's remote payload and fixed output view.
+  if (impl_->fused_control.active) {
+    return Status::Busy(
+        "BatchPut is forbidden while fused BatchGet control owns the "
+        "Direct-HCCP read state");
   }
   if (exec.request == nullptr || exec.put_desc == nullptr ||
       exec.request->keys.empty() || exec.request->input.data == nullptr ||

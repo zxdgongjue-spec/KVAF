@@ -106,6 +106,20 @@ class DefaultAccessOperator final : public AccessOperator {
   Status ExecuteBoundBatchGet(const BatchGetExecRequest& request,
                               BatchGetOutputBindingId binding_id);
 
+  // Cold-bind the exact two-worker Direct-HCCP state that a fused device
+  // operator needs. `control` is a caller-owned NPU uint64[16] buffer; KVAF
+  // writes KvafFusedBatchGetControl into it after registering `output`.
+  // The binding is intentionally exclusive with ordinary and native-lane
+  // BatchGet because all paths would otherwise mutate the same SQ/CQ state.
+  // The NPU Runtime binding also freezes BatchPut, BatchFree and AccessTable
+  // prepare/release for this interval, so the graph keeps a stable DDR
+  // payload and DeviceAccessTable view.
+  // Before binding, the caller must complete any earlier ordinary Get from
+  // this Runtime; the caller must wait for every fused reader before release.
+  Status BindFusedBatchGetControl(const MutableBufferView& output,
+                                  const MutableBufferView& control);
+  Status ReleaseFusedBatchGetControl();
+
   // Profiling is opt-in and uses the reserved per-core status area. Callers
   // must complete the BatchGet stream before copying the latest snapshot.
   Status SetBatchGetKernelProfiling(bool enabled);
