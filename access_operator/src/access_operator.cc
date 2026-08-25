@@ -39,6 +39,11 @@ struct BatchGetExecutionState {
   std::size_t status_bytes{0};
   void* queue_state{nullptr};
   std::size_t queue_state_bytes{0};
+  void* profile_ring{nullptr};
+  std::size_t profile_ring_bytes{0};
+  std::uint32_t profile_ring_capacity{0};
+  std::uint32_t profile_ring_stride_bytes{0};
+  std::uint64_t profile_min_cycles{0};
 };
 
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
@@ -141,6 +146,97 @@ bool FitsU32(std::uint64_t value) {
   return value <= std::numeric_limits<std::uint32_t>::max();
 }
 
+Status ConfigureBatchGetProfileRing(BatchGetExecutionState* execution,
+                                    std::uint32_t npu_core_count,
+                                    std::uint32_t history_capacity,
+                                    std::uint64_t min_total_cycles) {
+  if (execution == nullptr || npu_core_count == 0U ||
+      history_capacity == 0U) {
+    return InvalidArgument("invalid BatchGet profile ring configuration");
+  }
+  constexpr std::size_t kHeaderBytes = sizeof(KvafBatchGetProfileRingHeader);
+  constexpr std::size_t kRecordBytes = sizeof(KvafBatchGetProfileRecord);
+  if (history_capacity >
+      (std::numeric_limits<std::uint32_t>::max() - kHeaderBytes) /
+          kRecordBytes) {
+    return InvalidArgument("BatchGet profile history capacity is too large");
+  }
+  const std::size_t stride_bytes =
+      kHeaderBytes + static_cast<std::size_t>(history_capacity) * kRecordBytes;
+  if (npu_core_count > std::numeric_limits<std::size_t>::max() / stride_bytes) {
+    return InvalidArgument("BatchGet profile ring allocation overflows");
+  }
+  const std::size_t total_bytes =
+      static_cast<std::size_t>(npu_core_count) * stride_bytes;
+  const bool allocate_new_ring = execution->profile_ring == nullptr;
+  if (!allocate_new_ring) {
+    if (execution->profile_ring_capacity != history_capacity ||
+        execution->profile_ring_stride_bytes != stride_bytes ||
+        execution->profile_min_cycles != min_total_cycles) {
+      return InvalidState(
+          "BatchGet profile configuration cannot change after allocation; "
+          "configure it before graph capture");
+    }
+  } else {
+    void* profile_ring = nullptr;
+    if (aclrtMalloc(&profile_ring, total_bytes, ACL_MEM_MALLOC_HUGE_FIRST) !=
+        ACL_SUCCESS) {
+      return Internal("failed to allocate BatchGet profile history ring");
+    }
+    execution->profile_ring = profile_ring;
+    execution->profile_ring_bytes = total_bytes;
+    execution->profile_ring_capacity = history_capacity;
+    execution->profile_ring_stride_bytes =
+        static_cast<std::uint32_t>(stride_bytes);
+    execution->profile_min_cycles = min_total_cycles;
+  }
+
+  std::vector<std::uint8_t> host_ring(execution->profile_ring_bytes, 0U);
+  for (std::uint32_t core = 0; core < npu_core_count; ++core) {
+    auto* header = reinterpret_cast<KvafBatchGetProfileRingHeader*>(
+        host_ring.data() + static_cast<std::size_t>(core) *
+                               execution->profile_ring_stride_bytes);
+    header->magic = KVAF_AIV_BATCH_GET_PROFILE_RING_MAGIC;
+    header->capacity = execution->profile_ring_capacity;
+  }
+  if (aclrtMemcpy(execution->profile_ring, execution->profile_ring_bytes,
+                  host_ring.data(), host_ring.size(),
+                  ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
+    if (allocate_new_ring) {
+      (void)aclrtFree(execution->profile_ring);
+      execution->profile_ring = nullptr;
+      execution->profile_ring_bytes = 0;
+      execution->profile_ring_capacity = 0;
+      execution->profile_ring_stride_bytes = 0;
+      execution->profile_min_cycles = 0;
+    }
+    return Internal("failed to initialize BatchGet profile history ring");
+  }
+  return Status::OK();
+}
+
+BatchGetKernelProfile CopyKernelProfile(
+    const KvafBatchGetCoreProfile& source) {
+  BatchGetKernelProfile destination;
+  destination.kernel_start_cycle = source.kernel_start_cycle;
+  destination.setup_done_cycle = source.setup_done_cycle;
+  destination.compact_done_cycle = source.compact_done_cycle;
+  destination.first_doorbell_cycle = source.first_doorbell_cycle;
+  destination.post_done_cycle = source.post_done_cycle;
+  destination.completion_done_cycle = source.completion_done_cycle;
+  destination.kernel_finish_cycle = source.kernel_finish_cycle;
+  destination.active_requests = source.active_requests;
+  destination.total_posts = source.total_posts;
+  for (std::size_t jetty = 0;
+       jetty < destination.jetty_completion_wait_cycles.size(); ++jetty) {
+    destination.jetty_completion_wait_cycles[jetty] =
+        source.jetty_completion_wait_cycles[jetty];
+    destination.jetty_completion_polls[jetty] =
+        source.jetty_completion_polls[jetty];
+  }
+  return destination;
+}
+
 Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
                                std::uint32_t npu_core_count,
                                std::uint32_t jettys_per_core,
@@ -202,12 +298,16 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
   arguments->output = PointerValue(request.output.data);
   arguments->core_status = PointerValue(execution.status);
   arguments->queue_state = PointerValue(execution.queue_state);
+  arguments->profile_ring = PointerValue(execution.profile_ring);
+  arguments->profile_min_cycles = execution.profile_min_cycles;
   arguments->table_capacity = static_cast<std::uint32_t>(device_table_entries);
   arguments->request_capacity = static_cast<std::uint32_t>(request_count);
   arguments->output_rows = static_cast<std::uint32_t>(output_rows);
   arguments->block_bytes = KVAF_AIV_BATCH_GET_WQE_DATA_BYTES;
   arguments->block_count = npu_core_count;
   arguments->jettys_per_core = jettys_per_core;
+  arguments->profile_ring_capacity = execution.profile_ring_capacity;
+  arguments->profile_ring_stride_bytes = execution.profile_ring_stride_bytes;
   return Status::OK();
 }
 
@@ -395,6 +495,9 @@ Status DefaultAccessOperator::Shutdown() {
   if (impl_->execution.status != nullptr) {
     (void)aclrtFree(impl_->execution.status);
   }
+  if (impl_->execution.profile_ring != nullptr) {
+    (void)aclrtFree(impl_->execution.profile_ring);
+  }
   impl_->transport = nullptr;
   impl_->execution = BatchGetExecutionState{};
   impl_->remote_region = RemoteRegionDesc{};
@@ -451,10 +554,20 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   return Status::OK();
 }
 
-Status DefaultAccessOperator::SetBatchGetKernelProfiling(bool enabled) {
+Status DefaultAccessOperator::SetBatchGetKernelProfiling(
+    bool enabled, std::uint32_t history_capacity,
+    std::uint64_t min_total_cycles) {
   if (!impl_->initialized || impl_->execution.status == nullptr) {
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
+  }
+  if (enabled) {
+    Status ring_status = ConfigureBatchGetProfileRing(
+        &impl_->execution, impl_->config.npu_core_count, history_capacity,
+        min_total_cycles);
+    if (!ring_status.ok()) {
+      return ring_status;
+    }
   }
   std::vector<KvafBatchGetCoreStatus> statuses(
       impl_->config.npu_core_count);
@@ -511,24 +624,72 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
       profiles->clear();
       return Internal("BatchGet kernel returned an invalid profile timeline");
     }
-    BatchGetKernelProfile destination;
-    destination.kernel_start_cycle = source.kernel_start_cycle;
-    destination.setup_done_cycle = source.setup_done_cycle;
-    destination.compact_done_cycle = source.compact_done_cycle;
-    destination.first_doorbell_cycle = source.first_doorbell_cycle;
-    destination.post_done_cycle = source.post_done_cycle;
-    destination.completion_done_cycle = source.completion_done_cycle;
-    destination.kernel_finish_cycle = source.kernel_finish_cycle;
-    destination.active_requests = source.active_requests;
-    destination.total_posts = source.total_posts;
-    for (std::size_t jetty = 0;
-         jetty < destination.jetty_completion_wait_cycles.size(); ++jetty) {
-      destination.jetty_completion_wait_cycles[jetty] =
-          source.jetty_completion_wait_cycles[jetty];
-      destination.jetty_completion_polls[jetty] =
-          source.jetty_completion_polls[jetty];
+    profiles->push_back(CopyKernelProfile(source));
+  }
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::CopyBatchGetKernelProfileHistory(
+    BatchGetKernelProfileHistory* history) const {
+  if (history == nullptr) {
+    return InvalidArgument("BatchGet profile history output must not be null");
+  }
+  if (!impl_->initialized || impl_->execution.profile_ring == nullptr ||
+      impl_->execution.profile_ring_capacity == 0U) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "BatchGet profile history has not been enabled");
+  }
+  std::vector<std::uint8_t> host_ring(impl_->execution.profile_ring_bytes);
+  if (aclrtMemcpy(host_ring.data(), host_ring.size(),
+                  impl_->execution.profile_ring,
+                  impl_->execution.profile_ring_bytes,
+                  ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
+    return Internal("failed to copy BatchGet profile history");
+  }
+
+  history->capacity = impl_->execution.profile_ring_capacity;
+  history->sample_counts.clear();
+  history->record_counts.clear();
+  history->records.clear();
+  history->sample_counts.reserve(impl_->config.npu_core_count);
+  history->record_counts.reserve(impl_->config.npu_core_count);
+  for (std::uint32_t core = 0; core < impl_->config.npu_core_count; ++core) {
+    const auto* header = reinterpret_cast<const KvafBatchGetProfileRingHeader*>(
+        host_ring.data() + static_cast<std::size_t>(core) *
+                               impl_->execution.profile_ring_stride_bytes);
+    if (header->magic != KVAF_AIV_BATCH_GET_PROFILE_RING_MAGIC ||
+        header->capacity != impl_->execution.profile_ring_capacity) {
+      return Internal("BatchGet profile history header is invalid");
     }
-    profiles->push_back(destination);
+    history->sample_counts.push_back(header->sample_count);
+    history->record_counts.push_back(header->record_count);
+    const std::uint64_t retained_count = std::min<std::uint64_t>(
+        header->record_count, impl_->execution.profile_ring_capacity);
+    const std::uint64_t first_record_sequence =
+        header->record_count - retained_count;
+    const auto* records = reinterpret_cast<const KvafBatchGetProfileRecord*>(
+        reinterpret_cast<const std::uint8_t*>(header) +
+        sizeof(KvafBatchGetProfileRingHeader));
+    for (std::uint64_t record_sequence = first_record_sequence;
+         record_sequence < header->record_count; ++record_sequence) {
+      const KvafBatchGetProfileRecord& source =
+          records[record_sequence % impl_->execution.profile_ring_capacity];
+      if (source.profile.magic != KVAF_AIV_BATCH_GET_PROFILE_MAGIC) {
+        return Internal("BatchGet profile history record is invalid");
+      }
+      BatchGetKernelProfileRecord destination;
+      destination.core = core;
+      destination.sequence = source.sequence;
+      destination.result = source.result;
+      destination.processed_request_count = source.processed_request_count;
+      destination.completed_batch_count = source.completed_batch_count;
+      destination.sq_producer_index = source.sq_producer_index;
+      destination.cq_consumer_index = source.cq_consumer_index;
+      destination.failed_request_index = source.failed_request_index;
+      destination.last_wqe_protocol = source.last_wqe_protocol;
+      destination.profile = CopyKernelProfile(source.profile);
+      history->records.push_back(std::move(destination));
+    }
   }
   return Status::OK();
 }

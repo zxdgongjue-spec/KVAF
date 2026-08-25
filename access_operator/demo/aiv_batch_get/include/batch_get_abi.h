@@ -22,6 +22,8 @@ enum {
 static const uint64_t KVAF_AIV_BATCH_GET_STATUS_MAGIC = 0x4b5641464247444fULL;
 static const uint64_t KVAF_AIV_BATCH_GET_PROFILE_MAGIC =
     0x4b56414650524f46ULL;  // "KVAFPROF"
+static const uint64_t KVAF_AIV_BATCH_GET_PROFILE_RING_MAGIC =
+    0x4b5641465052494eULL;  // "KVAFPRIN"
 
 // Optional, per-core kernel timeline. The host enables collection by placing
 // KVAF_AIV_BATCH_GET_PROFILE_MAGIC in `magic` before launch. The kernel keeps
@@ -59,6 +61,32 @@ typedef struct KvafBatchGetCoreStatus {
   uint64_t last_wqe_protocol;
   KvafBatchGetCoreProfile profile;
 } KvafBatchGetCoreStatus;
+
+// Per-core, device-resident profile history. The AIV core owning one entry
+// writes this structure, so no device atomic is needed. `sample_count` tracks
+// every profiled kernel call; `record_count` tracks calls that passed the
+// host-configured duration threshold and were written into the ring.
+typedef struct KvafBatchGetProfileRingHeader {
+  uint64_t magic;
+  uint64_t sample_count;
+  uint64_t record_count;
+  uint64_t capacity;
+} KvafBatchGetProfileRingHeader;
+
+// Keep the complete hardware timeline plus the final queue/status values for
+// one AIV core invocation. `sequence` is local to that core and monotonically
+// increases even when duration filtering skips a record.
+typedef struct KvafBatchGetProfileRecord {
+  uint64_t sequence;
+  uint64_t result;
+  uint64_t processed_request_count;
+  uint64_t completed_batch_count;
+  uint64_t sq_producer_index;
+  uint64_t cq_consumer_index;
+  uint64_t failed_request_index;
+  uint64_t last_wqe_protocol;
+  KvafBatchGetCoreProfile profile;
+} KvafBatchGetProfileRecord;
 
 // Persistent, AIV-owned software indices for one USER_CTL SQ/CQ pair. Queue
 // arrays are core-major: [block_count][jettys_per_core].
@@ -125,6 +153,12 @@ typedef struct KvafExecuteBatchGetKernelArgs {
   uint32_t block_count;
   // Zero preserves the phase-one ABI and selects one Jetty per AIV core.
   uint32_t jettys_per_core;
+  // Optional fixed device ring: one Header + capacity Records per core.
+  // These trailing fields preserve the pre-profile argument layout.
+  uint64_t profile_ring;
+  uint64_t profile_min_cycles;
+  uint32_t profile_ring_capacity;
+  uint32_t profile_ring_stride_bytes;
 } KvafExecuteBatchGetKernelArgs;
 
 #if defined(__cplusplus)
@@ -132,11 +166,15 @@ static_assert(sizeof(KvafBatchGetCoreStatus) == KVAF_AIV_BATCH_GET_STATUS_BYTES,
               "KvafBatchGetCoreStatus ABI changed");
 static_assert(sizeof(KvafBatchGetCoreProfile) == 320,
               "KvafBatchGetCoreProfile ABI changed");
+static_assert(sizeof(KvafBatchGetProfileRingHeader) == 32,
+              "KvafBatchGetProfileRingHeader ABI changed");
+static_assert(sizeof(KvafBatchGetProfileRecord) == 384,
+              "KvafBatchGetProfileRecord ABI changed");
 static_assert(sizeof(KvafBatchGetQueueState) == KVAF_AIV_BATCH_GET_QUEUE_STATE_BYTES,
               "KvafBatchGetQueueState ABI changed");
 static_assert(sizeof(KvafBatchGetDirectUrmaEntity) == 192,
               "KvafBatchGetDirectUrmaEntity ABI changed");
-static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 104,
+static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 128,
               "KvafExecuteBatchGetKernelArgs ABI changed");
 #endif
 

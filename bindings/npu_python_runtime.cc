@@ -70,6 +70,22 @@ void ThrowIfAclError(aclError error, const char* operation) {
                            std::to_string(static_cast<int>(error)));
 }
 
+void AddBatchGetKernelProfileFields(py::dict* item,
+                                   const BatchGetKernelProfile& profile) {
+  (*item)["kernel_start_cycle"] = profile.kernel_start_cycle;
+  (*item)["setup_done_cycle"] = profile.setup_done_cycle;
+  (*item)["compact_done_cycle"] = profile.compact_done_cycle;
+  (*item)["first_doorbell_cycle"] = profile.first_doorbell_cycle;
+  (*item)["post_done_cycle"] = profile.post_done_cycle;
+  (*item)["completion_done_cycle"] = profile.completion_done_cycle;
+  (*item)["kernel_finish_cycle"] = profile.kernel_finish_cycle;
+  (*item)["active_requests"] = profile.active_requests;
+  (*item)["total_posts"] = profile.total_posts;
+  (*item)["jetty_completion_wait_cycles"] =
+      profile.jetty_completion_wait_cycles;
+  (*item)["jetty_completion_polls"] = profile.jetty_completion_polls;
+}
+
 class AclHostDdrAllocator final : public DdrMemoryAllocator {
  public:
   Status Allocate(const RuntimeInitRequest& request,
@@ -397,8 +413,10 @@ class NpuRuntime final {
         BatchFreeRequest{std::move(copied_keys), layer_id}));
   }
 
-  void StartBatchGetKernelProfile() {
-    ThrowIfError(access_operator_->SetBatchGetKernelProfiling(true));
+  void StartBatchGetKernelProfile(std::uint32_t history_capacity,
+                                  std::uint64_t min_total_cycles) {
+    ThrowIfError(access_operator_->SetBatchGetKernelProfiling(
+        true, history_capacity, min_total_cycles));
   }
 
   py::list BatchGetKernelProfileSnapshot() const {
@@ -409,20 +427,35 @@ class NpuRuntime final {
       const kvaf::BatchGetKernelProfile& profile = profiles[core];
       py::dict item;
       item["core"] = core;
-      item["kernel_start_cycle"] = profile.kernel_start_cycle;
-      item["setup_done_cycle"] = profile.setup_done_cycle;
-      item["compact_done_cycle"] = profile.compact_done_cycle;
-      item["first_doorbell_cycle"] = profile.first_doorbell_cycle;
-      item["post_done_cycle"] = profile.post_done_cycle;
-      item["completion_done_cycle"] = profile.completion_done_cycle;
-      item["kernel_finish_cycle"] = profile.kernel_finish_cycle;
-      item["active_requests"] = profile.active_requests;
-      item["total_posts"] = profile.total_posts;
-      item["jetty_completion_wait_cycles"] =
-          profile.jetty_completion_wait_cycles;
-      item["jetty_completion_polls"] = profile.jetty_completion_polls;
+      AddBatchGetKernelProfileFields(&item, profile);
       result.append(std::move(item));
     }
+    return result;
+  }
+
+  py::dict BatchGetKernelProfileHistory() const {
+    kvaf::BatchGetKernelProfileHistory history;
+    ThrowIfError(access_operator_->CopyBatchGetKernelProfileHistory(&history));
+    py::dict result;
+    result["capacity"] = history.capacity;
+    result["sample_counts"] = history.sample_counts;
+    result["record_counts"] = history.record_counts;
+    py::list records;
+    for (const kvaf::BatchGetKernelProfileRecord& profile : history.records) {
+      py::dict item;
+      item["core"] = profile.core;
+      item["sequence"] = profile.sequence;
+      item["result"] = profile.result;
+      item["processed_request_count"] = profile.processed_request_count;
+      item["completed_batch_count"] = profile.completed_batch_count;
+      item["sq_producer_index"] = profile.sq_producer_index;
+      item["cq_consumer_index"] = profile.cq_consumer_index;
+      item["failed_request_index"] = profile.failed_request_index;
+      item["last_wqe_protocol"] = profile.last_wqe_protocol;
+      AddBatchGetKernelProfileFields(&item, profile.profile);
+      records.append(std::move(item));
+    }
+    result["records"] = std::move(records);
     return result;
   }
 
@@ -591,10 +624,17 @@ void BindNpuPythonRuntime(py::module_& module) {
            "CPU torch.int64 Tensor.")
       .def("start_batch_get_kernel_profile",
            &NpuRuntime::StartBatchGetKernelProfile,
-           "Enable the per-core BatchGet kernel cycle timeline.")
+           py::arg("history_capacity") = 1,
+           py::arg("min_total_cycles") = 0,
+           "Enable per-core BatchGet hardware timelines and a fixed device "
+           "history ring. Configure before graph capture.")
       .def("batch_get_kernel_profile",
            &NpuRuntime::BatchGetKernelProfileSnapshot,
            "Copy the latest completed per-core BatchGet kernel timeline.")
+      .def("batch_get_kernel_profile_history",
+           &NpuRuntime::BatchGetKernelProfileHistory,
+           "Copy retained per-core BatchGet hardware timelines after stream "
+           "completion; never call this from graph capture/replay.")
       .def("stop_batch_get_kernel_profile",
            &NpuRuntime::StopBatchGetKernelProfile,
            "Copy the latest timeline and disable BatchGet kernel profiling.")

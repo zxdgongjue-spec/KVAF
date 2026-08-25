@@ -60,6 +60,26 @@ struct BatchGetKernelProfile {
   std::array<std::uint64_t, 2> jetty_completion_polls{};
 };
 
+struct BatchGetKernelProfileRecord {
+  std::uint32_t core{0};
+  std::uint64_t sequence{0};
+  std::uint64_t result{0};
+  std::uint64_t processed_request_count{0};
+  std::uint64_t completed_batch_count{0};
+  std::uint64_t sq_producer_index{0};
+  std::uint64_t cq_consumer_index{0};
+  std::uint64_t failed_request_index{0};
+  std::uint64_t last_wqe_protocol{0};
+  BatchGetKernelProfile profile;
+};
+
+struct BatchGetKernelProfileHistory {
+  std::uint32_t capacity{0};
+  std::vector<std::uint64_t> sample_counts;
+  std::vector<std::uint64_t> record_counts;
+  std::vector<BatchGetKernelProfileRecord> records;
+};
+
 // Default synchronous NPU data-plane implementation.
 //
 // Initialize creates reusable BatchGet and (when configured) BatchPut
@@ -85,11 +105,17 @@ class DefaultAccessOperator final : public AccessOperator {
   Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
   Status ExecuteBatchPut(const BatchPutExecRequest& request) override;
 
-  // Profiling is opt-in and uses the reserved per-core status area. Callers
-  // must complete the BatchGet stream before copying the latest snapshot.
-  Status SetBatchGetKernelProfiling(bool enabled);
+  // Profiling is opt-in. `history_capacity` records are retained per AIV core
+  // in a device-resident ring; `min_total_cycles` filters the ring only, not
+  // the latest per-core status snapshot. Configure it before graph capture.
+  // Callers must complete the BatchGet stream before copying a snapshot.
+  Status SetBatchGetKernelProfiling(bool enabled,
+                                    std::uint32_t history_capacity = 1,
+                                    std::uint64_t min_total_cycles = 0);
   Status CopyBatchGetKernelProfiles(
       std::vector<BatchGetKernelProfile>* profiles) const;
+  Status CopyBatchGetKernelProfileHistory(
+      BatchGetKernelProfileHistory* history) const;
 
  private:
   struct Impl;

@@ -46,6 +46,12 @@ layer 分区初始 free-slot FIFO 的入队顺序。默认 `fifo` 按物理 slot
 `shuffled` 以 seed 对每层 slot 做一次确定性打乱后再入 FIFO。BatchFree/AbortPut
 归还的 slot 始终追加到队尾，不会再次随机化。
 
+`NpuRuntime.start_batch_get_kernel_profile(history_capacity=1,
+min_total_cycles=0)` 在图捕获前为每个 AIV core 配置固定 HBM profile ring。
+kernel 内部记录 setup、mask/index compact、WQE/doorbell、CQ completion、每
+个 Jetty 的 poll/wait 和最终状态；`batch_get_kernel_profile_history()` 只能在
+stream 完成后从控制面读取，不能在 graph capture/replay 中调用。
+
 `AclGraph` 与 `NpuRuntime.batch_get` 可接收调用方持有的 `torch.npu.Stream`；后者省略
 stream 时使用 `torch.npu.current_stream()`。KVAF 不创建、不保存或销毁调用方的 stream；
 图 capture、replay 和生命周期仍由上层框架负责。同一 stream 上的后续 Torch/ACL 操作
