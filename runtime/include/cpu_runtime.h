@@ -12,6 +12,10 @@ struct CpuRuntimeOptions {
   std::string ub_device;
   bool has_eid_index{false};
   std::uint32_t eid_index{0};
+  // Request that UMDK pins the CPU DDR pages when registering each segment.
+  // Kept opt-in because a KVAF service can register hundreds of GiB across
+  // sessions, which consumes locked physical memory for the service lifetime.
+  bool pin_ddr{false};
 };
 
 // CPU endpoint Runtime. It owns only CPU-side UMDK resources and sessions;

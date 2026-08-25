@@ -423,7 +423,8 @@ struct Region {
 
 class CpuService {
  public:
-  explicit CpuService(UrmaResourcePool* resource_pool) : resource_pool_(resource_pool) {}
+  explicit CpuService(UrmaResourcePool* resource_pool, bool pin_ddr)
+      : resource_pool_(resource_pool), pin_ddr_(pin_ddr) {}
   ~CpuService() { ReleaseAll(); }
 
   uint32_t CandidateCount() const {
@@ -462,12 +463,12 @@ class CpuService {
     flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
     flag.bs.cacheable = URMA_NON_CACHEABLE;
     // Keep the CPU DDR registration equivalent to the existing HCCP host-memory
-    // path. LOCAL_WRITE is deliberately absent: it was rejected by the deployed
-    // UDMA driver, whereas remote atomic and non-pinned registration are part of
-    // the established host-DDR contract.
+    // path. LOCAL_WRITE is deliberately absent because it was rejected by the
+    // deployed UDMA driver.  UMDK defines non_pin=0 as pages pinned and
+    // non_pin=1 as non-pinned; pinning is an opt-in service policy.
     flag.bs.access = URMA_ACCESS_REMOTE_READ | URMA_ACCESS_REMOTE_WRITE |
                      URMA_ACCESS_REMOTE_ATOMIC;
-    flag.bs.non_pin = 1U;
+    flag.bs.non_pin = pin_ddr_ ? 0U : 1U;
     flag.bs.token_id_valid = 1U;
     urma_seg_cfg_t config{};
     config.va = reinterpret_cast<uint64_t>(region->memory);
@@ -504,9 +505,9 @@ class CpuService {
     }
     regions_.emplace(id, std::move(region));
     Log("[KVAF_CPU] REGION_ALLOCATED session=%" PRIu64 " candidate=%u ub_device=%s eid_index=%u "
-        "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x reg_flags=0x%x\n",
+        "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x ddr_pin=%s reg_flags=0x%x\n",
         id, candidate_id, resources->device_name().c_str(), resources->eid_index(), bytes,
-        response->peer_base, response->token_id, flag.value);
+        response->peer_base, response->token_id, pin_ddr_ ? "pinned" : "non_pinned", flag.value);
     return Result::kOk;
   }
 
@@ -688,6 +689,7 @@ class CpuService {
   }
 
   UrmaResourcePool* resource_pool_ = nullptr;
+  bool pin_ddr_ = false;
   uint64_t next_region_id_ = 1U;
   uint32_t next_token_ = 1U;
   uint32_t next_psn_ = 1U;
@@ -794,7 +796,8 @@ Status CpuRuntime::Initialize(const CpuRuntimeOptions& options) {
   if (!impl->resources.Initialize(options.ub_device, options.has_eid_index, options.eid_index)) {
     return Status::Internal("CpuRuntime failed to initialize UMDK resources");
   }
-  impl->service = std::make_unique<CpuService>(&impl->resources);
+  impl->service = std::make_unique<CpuService>(&impl->resources, options.pin_ddr);
+  Log("[KVAF_CPU] DDR_REGISTRATION pin=%s\n", options.pin_ddr ? "pinned" : "non_pinned");
   impl_ = std::move(impl);
   return Status::OK();
 }

@@ -99,6 +99,11 @@ TCP 用于交换控制信息，初始化UB建链；KV 数据 通过 NPU AIV kern
 - 支持多个独立 session；NPU 正常 shutdown 后回收其 DDR、segment、token 和 Jetty；
 - `RuntimeService` 只负责 TCP 监听和连接分发，资源生命周期由 `CpuRuntime` 管理。
 
+默认使用 UMDK 的非 pinned 注册（`non_pin=1`）。传入 CPU service 的 `--pin-ddr` 会以
+`non_pin=0` 注册每个 DDR segment，使 UMDK 固定其物理页直到对应 session 释放；适合排查
+长尾 Direct-HCCP 延迟。它会占用等量锁定物理内存，需保证服务端总 DDR 配额（所有 session
+之和）有足够的可用内存。
+
 ### NPU Runtime
 
 `NpuRuntime` 在连接 CPU 服务后初始化远端 DDR。
@@ -174,10 +179,10 @@ build-npu/bin/kvaf_execute_batch_put_kernels.o
 
 ```bash
 ./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28999
+  --listen 0.0.0.0 --port 28999 --pin-ddr
 ```
 
-服务会自动发现 UB device/EID，并打印 `CANDIDATE_DISCOVERED` 与 `LISTEN`。也可按需要传入 `--ub-device NAME --eid-index N` 来选定对应的端口。
+服务会自动发现 UB device/EID，并打印 `CANDIDATE_DISCOVERED` 与 `LISTEN`。也可按需要传入 `--ub-device NAME --eid-index N` 来选定对应的端口；不传 `--pin-ddr` 则保留既有的 non-pinned DDR 注册。
 
 ### 2. 运行 NPU 端到端测试
 

@@ -11,9 +11,10 @@ namespace {
 
 void PrintUsage(const char* program) {
   std::fprintf(stderr,
-               "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N]\n"
+               "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] [--pin-ddr]\n"
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
-               "candidates are discovered automatically. The service requires only liburma and /dev/uburma.\n",
+               "candidates are discovered automatically. --pin-ddr registers CPU DDR with pinned pages. "
+               "The service requires only liburma and /dev/uburma.\n",
                program);
 }
 
@@ -62,6 +63,8 @@ int main(int argc, char** argv) {
         return 2;
       }
       cpu_options.has_eid_index = true;
+    } else if (argument == "--pin-ddr") {
+      cpu_options.pin_ddr = true;
     } else {
       PrintUsage(argv[0]);
       return 2;

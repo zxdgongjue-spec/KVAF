@@ -41,12 +41,16 @@ cd /path/to/kvaf
 ./build.sh cpu
 
 ./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28999
+  --listen 0.0.0.0 --port 28999 --pin-ddr
 ```
 
 默认自动枚举所有可用 UMDK UB device/EID；`--ub-device NAME` 和
 `--eid-index N` 仅用于诊断。CPU 端可同时保持多个 NPU session，NPU 正常
 `shutdown` 后会释放对应 DDR、segment、token 与 Jetty。
+
+`--pin-ddr` 使 CPU service 用 UMDK pinned 模式（`non_pin=0`）注册每个 DDR
+segment，固定物理页至 session 释放。默认不传此参数，保持原 non-pinned 模式；pinned
+模式会消耗与已注册 DDR 等量的锁定物理内存。
 
 NPU 应用只配置 CPU 服务地址，不配置 EID 或 UDMA device：
 
