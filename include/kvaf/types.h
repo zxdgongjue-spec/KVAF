@@ -17,6 +17,13 @@ enum class DeviceKind {
   kNpu,
 };
 
+// Controls only the initial order in which a layer's free DDR slots enter
+// MetaManager's FIFO queue. Reclaimed slots always return to the queue tail.
+enum class SlotAllocationOrder {
+  kFifo = 0,
+  kShuffled,
+};
+
 // 远端 DDR 区域。base 是可供 AccessOperator 使用的绝对地址（UBA）。
 // Runtime 通过 DdrMemoryAllocator 创建并持有该区域的生命周期。
 struct RemoteRegionDesc {
@@ -28,6 +35,10 @@ struct RemoteRegionDesc {
   // fixed per-layer ranges so different transformer layers never interleave
   // their DDR allocations.
   std::uint32_t layer_count{1};
+  SlotAllocationOrder slot_allocation_order{SlotAllocationOrder::kFifo};
+  // Used only when slot_allocation_order is kShuffled. A fixed seed makes the
+  // initial allocation layout reproducible across runs.
+  std::uint64_t slot_shuffle_seed{0};
 };
 
 // 调用方拥有的只读/可写 buffer 描述。Runtime 不申请、释放或注册这些

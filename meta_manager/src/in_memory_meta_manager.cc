@@ -1,10 +1,13 @@
 #include "kvaf/meta_manager/meta_manager.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <numeric>
 #include <queue>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -138,6 +141,10 @@ class InMemoryMetaManager final : public MetaManager {
       return InvalidArgument(
           "remote region slot count must divide evenly across layer_count");
     }
+    if (region.slot_allocation_order != SlotAllocationOrder::kFifo &&
+        region.slot_allocation_order != SlotAllocationOrder::kShuffled) {
+      return InvalidArgument("remote region slot_allocation_order is invalid");
+    }
 
     const std::uint64_t slots_per_layer = slot_count / region.layer_count;
     std::vector<std::queue<std::size_t>> free_slots_by_layer(
@@ -145,8 +152,19 @@ class InMemoryMetaManager final : public MetaManager {
     for (std::uint32_t layer_id = 0; layer_id < region.layer_count;
          ++layer_id) {
       auto& free_slots = free_slots_by_layer[layer_id];
-      for (std::uint64_t slot_id = 0; slot_id < slots_per_layer; ++slot_id) {
-        free_slots.push(static_cast<std::size_t>(slot_id));
+      std::vector<std::size_t> slot_order(
+          static_cast<std::size_t>(slots_per_layer));
+      std::iota(slot_order.begin(), slot_order.end(), std::size_t{0});
+      if (region.slot_allocation_order == SlotAllocationOrder::kShuffled) {
+        // Give each layer a distinct, deterministic permutation while keeping
+        // the seed supplied by Python sufficient to reproduce the layout.
+        std::mt19937_64 generator(
+            region.slot_shuffle_seed +
+            0x9e3779b97f4a7c15ULL * static_cast<std::uint64_t>(layer_id));
+        std::shuffle(slot_order.begin(), slot_order.end(), generator);
+      }
+      for (std::size_t slot_id : slot_order) {
+        free_slots.push(slot_id);
       }
     }
 

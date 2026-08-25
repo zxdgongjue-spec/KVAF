@@ -31,6 +31,21 @@ Status Internal(std::string message) {
   return Status::Internal(std::move(message));
 }
 
+SlotAllocationOrder ParseSlotAllocationOrder(const std::string& value) {
+  if (value == "fifo") {
+    return SlotAllocationOrder::kFifo;
+  }
+  if (value == "shuffled") {
+    return SlotAllocationOrder::kShuffled;
+  }
+  throw py::value_error(
+      "slot_allocation_order must be 'fifo' or 'shuffled'");
+}
+
+const char* SlotAllocationOrderName(SlotAllocationOrder order) {
+  return order == SlotAllocationOrder::kShuffled ? "shuffled" : "fifo";
+}
+
 void ThrowIfError(const Status& status) {
   if (status.ok()) return;
   const std::string message = status.message().empty()
@@ -235,10 +250,14 @@ class NpuRuntime final {
   NpuRuntime& operator=(const NpuRuntime&) = delete;
 
   void Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size,
-                  std::uint32_t layer_count) {
+                  std::uint32_t layer_count,
+                  const std::string& slot_allocation_order,
+                  std::uint64_t slot_shuffle_seed) {
     ThrowIfError(runtime_->Initialize(
         RuntimeInitRequest{ddr_bytes, slot_size, DeviceKind::kCpu,
-                           layer_count}));
+                           layer_count,
+                           ParseSlotAllocationOrder(slot_allocation_order),
+                           slot_shuffle_seed}));
   }
 
   bool Initialized() const {
@@ -256,6 +275,9 @@ class NpuRuntime final {
     result["length"] = region.length;
     result["slot_size"] = region.slot_size;
     result["layer_count"] = region.layer_count;
+    result["slot_allocation_order"] =
+        SlotAllocationOrderName(region.slot_allocation_order);
+    result["slot_shuffle_seed"] = region.slot_shuffle_seed;
     result["slots_per_layer"] =
         region.layer_count == 0 || region.slot_size == 0
             ? 0
@@ -540,7 +562,9 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("batch_put_kernel_object_path") = "",
            py::arg("jettys_per_core") = 2)
       .def("initialize", &NpuRuntime::Initialize, py::arg("ddr_bytes"),
-           py::arg("slot_size"), py::arg("layer_count") = 1)
+           py::arg("slot_size"), py::arg("layer_count") = 1,
+           py::arg("slot_allocation_order") = "fifo",
+           py::arg("slot_shuffle_seed") = 0)
       .def("shutdown", &NpuRuntime::Shutdown)
       .def_property_readonly("initialized", &NpuRuntime::Initialized)
       .def_property_readonly("device_id", &NpuRuntime::DeviceId)

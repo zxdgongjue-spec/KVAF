@@ -41,6 +41,11 @@ BatchPut kernel 时，该方法保留 ACL D2H mock，便于只验证 BatchGet �
 `prepare_access_table(keys, layer_id=0)` 与 `batch_free(keys, layer_id=0)` 必须使用
 对应的同一层号；局部 key 可在不同层重复。
 
+`initialize(..., slot_allocation_order="fifo", slot_shuffle_seed=0)` 控制每个
+layer 分区初始 free-slot FIFO 的入队顺序。默认 `fifo` 按物理 slot 地址递增；
+`shuffled` 以 seed 对每层 slot 做一次确定性打乱后再入 FIFO。BatchFree/AbortPut
+归还的 slot 始终追加到队尾，不会再次随机化。
+
 `AclGraph` 与 `NpuRuntime.batch_get` 可接收调用方持有的 `torch.npu.Stream`；后者省略
 stream 时使用 `torch.npu.current_stream()`。KVAF 不创建、不保存或销毁调用方的 stream；
 图 capture、replay 和生命周期仍由上层框架负责。同一 stream 上的后续 Torch/ACL 操作

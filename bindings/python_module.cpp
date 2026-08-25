@@ -34,6 +34,21 @@ Status Internal(std::string message) {
   return Status::Internal(std::move(message));
 }
 
+SlotAllocationOrder ParseSlotAllocationOrder(const std::string& value) {
+  if (value == "fifo") {
+    return SlotAllocationOrder::kFifo;
+  }
+  if (value == "shuffled") {
+    return SlotAllocationOrder::kShuffled;
+  }
+  throw py::value_error(
+      "slot_allocation_order must be 'fifo' or 'shuffled'");
+}
+
+const char* SlotAllocationOrderName(SlotAllocationOrder order) {
+  return order == SlotAllocationOrder::kShuffled ? "shuffled" : "fifo";
+}
+
 bool IsCContiguous(const py::buffer_info& info) {
   std::size_t expected_stride = static_cast<std::size_t>(info.itemsize);
   for (py::ssize_t dimension = info.ndim - 1; dimension >= 0; --dimension) {
@@ -217,10 +232,14 @@ class PythonRuntime final {
                                            *allocator_)) {}
 
   void Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size,
-                  std::uint32_t layer_count) {
+                  std::uint32_t layer_count,
+                  const std::string& slot_allocation_order,
+                  std::uint64_t slot_shuffle_seed) {
     ThrowIfError(runtime_->Initialize(
         RuntimeInitRequest{ddr_bytes, slot_size, DeviceKind::kCpu,
-                           layer_count}));
+                           layer_count,
+                           ParseSlotAllocationOrder(slot_allocation_order),
+                           slot_shuffle_seed}));
   }
 
   void Shutdown() { ThrowIfError(runtime_->Shutdown()); }
@@ -234,6 +253,9 @@ class PythonRuntime final {
     result["length"] = region.length;
     result["slot_size"] = region.slot_size;
     result["layer_count"] = region.layer_count;
+    result["slot_allocation_order"] =
+        SlotAllocationOrderName(region.slot_allocation_order);
+    result["slot_shuffle_seed"] = region.slot_shuffle_seed;
     result["slots_per_layer"] =
         region.layer_count == 0 || region.slot_size == 0
             ? 0
@@ -372,6 +394,8 @@ PYBIND11_MODULE(_kvaf, m) {
       .def(py::init<>())
       .def("initialize", &kvaf::PythonRuntime::Initialize, py::arg("ddr_bytes"),
            py::arg("slot_size"), py::arg("layer_count") = 1,
+           py::arg("slot_allocation_order") = "fifo",
+           py::arg("slot_shuffle_seed") = 0,
            "Allocate Runtime-owned host DDR and initialize the mock operator.")
       .def("shutdown", &kvaf::PythonRuntime::Shutdown)
       .def_property_readonly("initialized", &kvaf::PythonRuntime::Initialized)

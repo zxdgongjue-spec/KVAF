@@ -84,6 +84,10 @@ Status Runtime::Initialize(const RuntimeInitRequest& request) {
     return Status::InvalidArgument(
         "Runtime layer_count must be greater than zero");
   }
+  if (request.slot_allocation_order != SlotAllocationOrder::kFifo &&
+      request.slot_allocation_order != SlotAllocationOrder::kShuffled) {
+    return Status::InvalidArgument("Runtime slot_allocation_order is invalid");
+  }
 
   RemoteRegionDesc remote_region;
   Status status = ddr_allocator_.Allocate(request, &remote_region);
@@ -104,6 +108,8 @@ Status Runtime::Initialize(const RuntimeInitRequest& request) {
         "Runtime DDR slot count must divide evenly across layer_count");
   }
   remote_region.layer_count = request.layer_count;
+  remote_region.slot_allocation_order = request.slot_allocation_order;
+  remote_region.slot_shuffle_seed = request.slot_shuffle_seed;
 
   status = access_operator_.Initialize(remote_region);
   if (!status.ok()) {

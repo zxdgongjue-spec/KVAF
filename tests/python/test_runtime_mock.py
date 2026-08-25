@@ -110,6 +110,47 @@ class RuntimeMockTests(unittest.TestCase):
         self.assertEqual(output, bytes.fromhex("bb000000"))
         self.kvaf.release_access_table(table)
 
+    def test_initial_slot_order_can_be_shuffled_deterministically(self) -> None:
+        slot_size = 64
+        slot_count = 8
+        self.kvaf.initialize(
+            ddr_bytes=slot_count * slot_size,
+            slot_size=slot_size,
+            slot_allocation_order="shuffled",
+            slot_shuffle_seed=1234,
+        )
+        self.assertEqual(
+            self.kvaf.remote_region["slot_allocation_order"], "shuffled"
+        )
+        self.assertEqual(self.kvaf.remote_region["slot_shuffle_seed"], 1234)
+
+        self.batch_put(
+            list(range(slot_count)),
+            [self.payload([index]) for index in range(slot_count)],
+        )
+        table = self.kvaf.prepare_access_table(list(range(slot_count)))
+        try:
+            addresses = list(self.kvaf.access_table_view(table)["addresses"])
+            first_address = min(addresses)
+            self.assertEqual(
+                sorted(addresses),
+                [first_address + slot_size * index for index in range(slot_count)],
+            )
+            self.assertNotEqual(
+                addresses,
+                [first_address + slot_size * index for index in range(slot_count)],
+            )
+        finally:
+            self.kvaf.release_access_table(table)
+
+        with self.assertRaises(ValueError):
+            invalid_runtime = kvaf.Runtime()
+            invalid_runtime.initialize(
+                ddr_bytes=slot_count * slot_size,
+                slot_size=slot_size,
+                slot_allocation_order="random",
+            )
+
     def test_layer_partition_scopes_keys_and_addresses(self) -> None:
         """One Runtime keeps each layer in a separate contiguous DDR range."""
         slot_size = 64

@@ -22,6 +22,10 @@ struct RuntimeInitRequest {
   // Number of equal-sized logical layer regions inside the one Runtime-owned
   // DDR allocation. Each layer receives an independent contiguous slot range.
   std::uint32_t layer_count{1};
+  // Initialize every layer's FIFO free queue either in physical slot order or
+  // with one deterministic shuffle. This does not change recycle ordering.
+  SlotAllocationOrder slot_allocation_order{SlotAllocationOrder::kFifo};
+  std::uint64_t slot_shuffle_seed{0};
 };
 
 // 以扁平 Key 顺序准备 AccessTable。POC 的 Operator 使用一维表；上层
