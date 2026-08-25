@@ -508,8 +508,7 @@ bool AlignRange(uint64_t address, uint64_t bytes, uint64_t *aligned_address, uin
 }
 
 bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle, uint32_t token_id,
-                    uint32_t token_value, void *address, uint64_t bytes, bool non_pin, const char *role,
-                    DirectMemory *memory) {
+                    uint32_t token_value, void *address, uint64_t bytes, const char *role, DirectMemory *memory) {
   uint64_t aligned_address = 0U;
   uint64_t aligned_bytes = 0U;
   if (memory == nullptr || address == nullptr || !AlignRange(reinterpret_cast<uint64_t>(address), bytes,
@@ -519,7 +518,7 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
   hccp::MrRegInfo info{};
   info.in.mem.addr = aligned_address;
   info.in.mem.size = aligned_bytes;
-  info.in.ub.flags = hccp::MemRegFlags(non_pin);
+  info.in.ub.flags = hccp::MemRegFlags(true);
   info.in.ub.token_value = token_value;
   info.in.ub.token_id_handle = token_handle;
   const int ret = api.lmem_register(context, &info, &memory->handle);
@@ -538,10 +537,9 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
   memory->key_bytes = info.out.key.size;
   std::memcpy(memory->key, info.out.key.value, memory->key_bytes);
   std::fprintf(stderr,
-               "[KVAF_AIV] DIRECT_MEMORY_REGISTERED role=%s token_id=0x%x host_or_hbm_va=0x%llx bytes=%llu "
-               "memory=%s\n",
+               "[KVAF_AIV] DIRECT_MEMORY_REGISTERED role=%s token_id=0x%x host_or_hbm_va=0x%llx bytes=%llu\n",
                role, memory->token_id, static_cast<unsigned long long>(aligned_address),
-               static_cast<unsigned long long>(aligned_bytes), non_pin ? "non_pinned" : "pinned");
+               static_cast<unsigned long long>(aligned_bytes));
   return true;
 }
 
@@ -598,7 +596,7 @@ bool AcquireLocalBuffer(KvafBatchGetTransport *transport, void *output_hbm, uint
   if (!AllocateToken(transport->api, transport->device_context, "device_local_hbm", &candidate->token_handle,
                      &token_id) ||
       !RegisterMemory(transport->api, transport->device_context, candidate->token_handle, token_id,
-                      transport->device_transport_token_value, output_hbm, output_hbm_bytes, true, "device_hbm",
+                      transport->device_transport_token_value, output_hbm, output_hbm_bytes, "device_hbm",
                       &candidate->memory)) {
     ReleaseLocalBufferResources(transport, candidate.get());
     return false;
@@ -1024,7 +1022,7 @@ extern "C" int32_t KvafBatchGetTransportCreate(void *host_ddr, uint64_t host_ddr
     const uint32_t token_value = MakeTokenValue(state->api, identity.physical_device_id);
     state->device_transport_token_value = token_value;
     if (!RegisterMemory(state->api, state->host_context, state->host_token_handle, host_token_id, token_value,
-                        host_ddr, host_ddr_bytes, false, "host_ddr", &state->host_memory) ||
+                        host_ddr, host_ddr_bytes, "host_ddr", &state->host_memory) ||
         !ImportRemoteMemory(state->api, state->device_context, state->host_memory,
                             &state->device_host_memory_import)) {
       goto failed;
