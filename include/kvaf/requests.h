@@ -19,12 +19,18 @@ struct RuntimeInitRequest {
   std::uint64_t ddr_bytes{0};
   std::uint64_t slot_size{0};
   DeviceKind ddr_device{DeviceKind::kCpu};
+  // Number of equal-sized logical layer regions inside the one Runtime-owned
+  // DDR allocation. Each layer receives an independent contiguous slot range.
+  std::uint32_t layer_count{1};
 };
 
 // 以扁平 Key 顺序准备 AccessTable。POC 的 Operator 使用一维表；上层
 // 需要保留自己的逻辑 shape，并以 indices 指向这张表。
 struct AccessTablePrepareRequest {
   std::vector<KeyId> flat_keys;
+  // flat_keys are local to this layer. BatchGet consumes the resulting
+  // addresses, so it does not need a layer id of its own.
+  std::uint32_t layer_id{0};
 };
 
 // Runtime 内部 AccessTable 的只读宿主视图。view 只在关联 Handle 有效时
@@ -81,6 +87,9 @@ struct BatchPutRequest {
   ConstBufferView input;
   std::vector<std::uint64_t> input_offsets;
   std::vector<std::uint64_t> lengths;
+  // keys are scoped to one DDR layer region. The default retains the legacy
+  // single-layer Runtime ABI.
+  std::uint32_t layer_id{0};
 };
 
 // BatchPut V1 is synchronous, but the Direct-HCCP launch still needs the
@@ -92,6 +101,7 @@ struct BatchPutExecutionOptions {
 
 struct BatchFreeRequest {
   std::vector<KeyId> keys;
+  std::uint32_t layer_id{0};
 };
 
 // 一次 BatchGet 提交使用的调用方 stream。Runtime 不解释 stream 的具体

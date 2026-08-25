@@ -62,7 +62,8 @@ class MetaManager {
   virtual Status PreparePut(const std::vector<KeyId>& flat_keys,
                             const std::vector<std::uint64_t>& lengths,
                             PutContext* put_context,
-                            PutAccessDesc* put_desc) = 0;
+                            PutAccessDesc* put_desc,
+                            std::uint32_t layer_id = 0) = 0;
 
   // 将 PreparePut 预留的地址正式提交为可见映射。
   virtual Status CommitPut(const PutContext& put_context) = 0;
@@ -74,7 +75,8 @@ class MetaManager {
   // 成功后，这批 key 对应的记录会被 pin，直到 UnlockKeys 才允许 free 回收。
   virtual Status LockKeys(const std::vector<KeyId>& flat_keys,
                           MetaManagerLockMode lock_mode,
-                          LockContext* lock_context) = 0;
+                          LockContext* lock_context,
+                          std::uint32_t layer_id = 0) = 0;
 
   // 读取 LockKeys 固定下来的那一版地址信息。
   // 如果 key 顺序不匹配，或者锁定期间记录发生变化，则返回错误。
@@ -86,7 +88,8 @@ class MetaManager {
   virtual Status UnlockKeys(const LockContext& lock_context) = 0;
 
   // 释放一批 key 当前占用的 slot，并放回空闲队列。
-  virtual Status BatchFree(const std::vector<KeyId>& flat_keys) = 0;
+  virtual Status BatchFree(const std::vector<KeyId>& flat_keys,
+                           std::uint32_t layer_id = 0) = 0;
 };
 
 // 创建一个基于内存数据结构的 MetaManager POC 实现。

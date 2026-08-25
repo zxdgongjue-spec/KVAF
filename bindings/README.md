@@ -33,9 +33,13 @@ output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数�
 `NpuRuntime(batch_get_kernel_object_path, device_id=0, npu_core_count=1,
 batch_put_kernel_object_path="", jettys_per_core=2)` 的 `jettys_per_core` 参数同时
 配置 BatchGet 和 BatchPut 每个 AIV core 使用的 Jetty 数量，可选 1 或 2 个独立 Jetty。
-`batch_put(keys, packed_input, input_offsets, lengths, stream=None)` 接收 caller-owned
+`initialize(ddr_bytes, slot_size, layer_count=1)` 可将单个 Runtime DDR 等分为
+多个连续 layer 区。随后
+`batch_put(keys, packed_input, input_offsets, lengths, stream=None, layer_id=0)` 接收 caller-owned
 NPU packed input 和每条 block 的 CPU 整数 metadata；同步写入完成后才返回。未传
 BatchPut kernel 时，该方法保留 ACL D2H mock，便于只验证 BatchGet 的构建。
+`prepare_access_table(keys, layer_id=0)` 与 `batch_free(keys, layer_id=0)` 必须使用
+对应的同一层号；局部 key 可在不同层重复。
 
 `AclGraph` 与 `NpuRuntime.batch_get` 可接收调用方持有的 `torch.npu.Stream`；后者省略
 stream 时使用 `torch.npu.current_stream()`。KVAF 不创建、不保存或销毁调用方的 stream；

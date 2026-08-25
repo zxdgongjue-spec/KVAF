@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -19,8 +20,29 @@ struct AddressRecord {
   std::uint64_t record_id{0};
   Address uba{0};
   std::uint64_t valid_length{0};
+  std::uint32_t layer_id{0};
   std::size_t slot_id{0};
   std::uint32_t pin_count{0};
+};
+
+// A caller key is meaningful only within one transformer's layer partition.
+// Keeping the pair in the metadata index permits every layer to use the same
+// compact local key range (for example pool_row * qcap + block_q).
+struct LayerKey {
+  std::uint32_t layer_id{0};
+  KeyId key{0};
+
+  bool operator==(const LayerKey& other) const {
+    return layer_id == other.layer_id && key == other.key;
+  }
+};
+
+struct LayerKeyHash {
+  std::size_t operator()(const LayerKey& key) const {
+    const std::size_t first = std::hash<std::uint32_t>{}(key.layer_id);
+    const std::size_t second = std::hash<KeyId>{}(key.key);
+    return first ^ (second + 0x9e3779b9U + (first << 6U) + (first >> 2U));
+  }
 };
 
 // key 到当前可见记录的索引项。
@@ -30,7 +52,7 @@ struct KeyEntry {
 
 // PreparePut 阶段的临时预留项。
 struct PendingPutItem {
-  KeyId key{0};
+  LayerKey layer_key;
   std::size_t slot_id{0};
   std::uint64_t valid_length{0};
 };
@@ -107,13 +129,31 @@ class InMemoryMetaManager final : public MetaManager {
       return AlreadyExists("remote region has already been registered");
     }
 
-    region_ = region;
-    region_registered_ = true;
-
-    const std::uint64_t slot_count = region.length / region.slot_size;
-    for (std::uint64_t i = 0; i < slot_count; ++i) {
-      free_slots_.push(static_cast<std::size_t>(i));
+    if (region.layer_count == 0) {
+      return InvalidArgument(
+          "remote region layer_count must be greater than zero");
     }
+    const std::uint64_t slot_count = region.length / region.slot_size;
+    if (slot_count % region.layer_count != 0) {
+      return InvalidArgument(
+          "remote region slot count must divide evenly across layer_count");
+    }
+
+    const std::uint64_t slots_per_layer = slot_count / region.layer_count;
+    std::vector<std::queue<std::size_t>> free_slots_by_layer(
+        region.layer_count);
+    for (std::uint32_t layer_id = 0; layer_id < region.layer_count;
+         ++layer_id) {
+      auto& free_slots = free_slots_by_layer[layer_id];
+      for (std::uint64_t slot_id = 0; slot_id < slots_per_layer; ++slot_id) {
+        free_slots.push(static_cast<std::size_t>(slot_id));
+      }
+    }
+
+    region_ = region;
+    slots_per_layer_ = slots_per_layer;
+    free_slots_by_layer_ = std::move(free_slots_by_layer);
+    region_registered_ = true;
 
     return Status::OK();
   }
@@ -122,7 +162,8 @@ class InMemoryMetaManager final : public MetaManager {
   Status PreparePut(const std::vector<KeyId>& flat_keys,
                     const std::vector<std::uint64_t>& lengths,
                     PutContext* put_context,
-                    PutAccessDesc* put_desc) override {
+                    PutAccessDesc* put_desc,
+                    std::uint32_t layer_id) override {
     if (put_context == nullptr || put_desc == nullptr) {
       return InvalidArgument("put_context and put_desc must not be null");
     }
@@ -140,9 +181,15 @@ class InMemoryMetaManager final : public MetaManager {
     if (!region_registered_) {
       return NotInitialized("remote region has not been registered");
     }
-    if (free_slots_.size() < flat_keys.size()) {
+    Status status = ValidateLayerId(layer_id);
+    if (!status.ok()) {
+      return status;
+    }
+    auto& free_slots = free_slots_by_layer_[layer_id];
+    if (free_slots.size() < flat_keys.size()) {
       return Status::Error(StatusCode::kOutOfMemory,
-                           "not enough free slots for PreparePut");
+                           "not enough free slots in requested layer for "
+                           "PreparePut");
     }
 
     for (std::size_t i = 0; i < flat_keys.size(); ++i) {
@@ -152,8 +199,9 @@ class InMemoryMetaManager final : public MetaManager {
       if (lengths[i] > region_.slot_size) {
         return InvalidArgument("PreparePut length exceeds slot_size");
       }
-      if (key_index_.find(flat_keys[i]) != key_index_.end() ||
-          pending_keys_.find(flat_keys[i]) != pending_keys_.end()) {
+      const LayerKey layer_key{layer_id, flat_keys[i]};
+      if (key_index_.find(layer_key) != key_index_.end() ||
+          pending_keys_.find(layer_key) != pending_keys_.end()) {
         return AlreadyExists("PreparePut key already exists or is pending");
       }
     }
@@ -166,15 +214,16 @@ class InMemoryMetaManager final : public MetaManager {
 
     // slot 在这里离开 free queue，但在 CommitPut 前仍然不可见。
     for (std::size_t i = 0; i < flat_keys.size(); ++i) {
-      const std::size_t slot_id = free_slots_.front();
-      free_slots_.pop();
+      const std::size_t slot_id = free_slots.front();
+      free_slots.pop();
 
-      const Address address = SlotAddress(slot_id);
+      const LayerKey layer_key{layer_id, flat_keys[i]};
+      const Address address = SlotAddress(layer_id, slot_id);
       pending_context.items.push_back(
-          PendingPutItem{flat_keys[i], slot_id, lengths[i]});
+          PendingPutItem{layer_key, slot_id, lengths[i]});
       put_desc->entries.push_back(
           PutAllocation{flat_keys[i], address, lengths[i]});
-      pending_keys_.insert(flat_keys[i]);
+      pending_keys_.insert(layer_key);
     }
 
     pending_puts_.emplace(ctx_id, std::move(pending_context));
@@ -199,7 +248,7 @@ class InMemoryMetaManager final : public MetaManager {
     }
 
     for (const PendingPutItem& item : pending_it->second.items) {
-      if (key_index_.find(item.key) != key_index_.end()) {
+      if (key_index_.find(item.layer_key) != key_index_.end()) {
         return InvalidState("CommitPut found an already committed key");
       }
     }
@@ -208,13 +257,14 @@ class InMemoryMetaManager final : public MetaManager {
     for (const PendingPutItem& item : pending_it->second.items) {
       AddressRecord record;
       record.record_id = next_record_id_++;
-      record.uba = SlotAddress(item.slot_id);
+      record.uba = SlotAddress(item.layer_key.layer_id, item.slot_id);
       record.valid_length = item.valid_length;
+      record.layer_id = item.layer_key.layer_id;
       record.slot_id = item.slot_id;
       record.pin_count = 0;
 
-      key_index_.emplace(item.key, KeyEntry{record});
-      pending_keys_.erase(item.key);
+      key_index_.emplace(item.layer_key, KeyEntry{record});
+      pending_keys_.erase(item.layer_key);
     }
 
     pending_puts_.erase(pending_it);
@@ -238,8 +288,8 @@ class InMemoryMetaManager final : public MetaManager {
     }
 
     for (const PendingPutItem& item : pending_it->second.items) {
-      free_slots_.push(item.slot_id);
-      pending_keys_.erase(item.key);
+      free_slots_by_layer_[item.layer_key.layer_id].push(item.slot_id);
+      pending_keys_.erase(item.layer_key);
     }
 
     pending_puts_.erase(pending_it);
@@ -249,7 +299,8 @@ class InMemoryMetaManager final : public MetaManager {
   // 为一批 key 建立稳定读快照，并通过 pin_count 阻止并发 free。
   Status LockKeys(const std::vector<KeyId>& flat_keys,
                   MetaManagerLockMode lock_mode,
-                  LockContext* lock_context) override {
+                  LockContext* lock_context,
+                  std::uint32_t layer_id) override {
     if (lock_context == nullptr) {
       return InvalidArgument("lock_context must not be null");
     }
@@ -264,11 +315,15 @@ class InMemoryMetaManager final : public MetaManager {
     if (!region_registered_) {
       return NotInitialized("remote region has not been registered");
     }
+    Status status = ValidateLayerId(layer_id);
+    if (!status.ok()) {
+      return status;
+    }
 
     std::vector<LockedItem> items;
     items.reserve(flat_keys.size());
     for (KeyId key : flat_keys) {
-      auto key_it = key_index_.find(key);
+      auto key_it = key_index_.find(LayerKey{layer_id, key});
       if (key_it == key_index_.end()) {
         // Pins are taken while building the snapshot so this path needs to
         // roll them back if a later key is missing.
@@ -372,7 +427,8 @@ class InMemoryMetaManager final : public MetaManager {
 
   // 释放一批 key 占用的 slot。
   // 先整体校验，再统一回收，保持 batch 级 all-or-nothing 语义。
-  Status BatchFree(const std::vector<KeyId>& flat_keys) override {
+  Status BatchFree(const std::vector<KeyId>& flat_keys,
+                   std::uint32_t layer_id) override {
     if (flat_keys.empty()) {
       return InvalidArgument("BatchFree requires at least one key");
     }
@@ -384,11 +440,15 @@ class InMemoryMetaManager final : public MetaManager {
     if (!region_registered_) {
       return NotInitialized("remote region has not been registered");
     }
+    Status status = ValidateLayerId(layer_id);
+    if (!status.ok()) {
+      return status;
+    }
 
     std::vector<std::size_t> slots_to_recycle;
     slots_to_recycle.reserve(flat_keys.size());
     for (KeyId key : flat_keys) {
-      auto key_it = key_index_.find(key);
+      auto key_it = key_index_.find(LayerKey{layer_id, key});
       if (key_it == key_index_.end()) {
         return NotFound("BatchFree key was not found");
       }
@@ -402,29 +462,40 @@ class InMemoryMetaManager final : public MetaManager {
     }
 
     for (KeyId key : flat_keys) {
-      key_index_.erase(key);
+      key_index_.erase(LayerKey{layer_id, key});
     }
 
     for (std::size_t slot_id : slots_to_recycle) {
-      free_slots_.push(slot_id);
+      free_slots_by_layer_[layer_id].push(slot_id);
     }
 
     return Status::OK();
   }
 
  private:
-  Address SlotAddress(std::size_t slot_id) const {
-    return region_.base + static_cast<Address>(slot_id) * region_.slot_size;
+  Status ValidateLayerId(std::uint32_t layer_id) const {
+    if (layer_id >= region_.layer_count) {
+      return InvalidArgument("layer_id is outside registered remote region");
+    }
+    return Status::OK();
+  }
+
+  Address SlotAddress(std::uint32_t layer_id, std::size_t slot_id) const {
+    const std::uint64_t absolute_slot =
+        static_cast<std::uint64_t>(layer_id) * slots_per_layer_ + slot_id;
+    return region_.base +
+           static_cast<Address>(absolute_slot) * region_.slot_size;
   }
 
   // 当前 POC 使用一把总锁保护元数据和空闲 slot 队列。
   std::mutex meta_mutex_;
   bool region_registered_{false};
   RemoteRegionDesc region_;
-  std::queue<std::size_t> free_slots_;
-  std::unordered_map<KeyId, KeyEntry> key_index_;
+  std::uint64_t slots_per_layer_{0};
+  std::vector<std::queue<std::size_t>> free_slots_by_layer_;
+  std::unordered_map<LayerKey, KeyEntry, LayerKeyHash> key_index_;
   std::unordered_map<std::uint64_t, PendingPutContext> pending_puts_;
-  std::unordered_set<KeyId> pending_keys_;
+  std::unordered_set<LayerKey, LayerKeyHash> pending_keys_;
   std::unordered_map<std::uint64_t, ActiveLockContext> lock_contexts_;
   std::uint64_t next_record_id_{1};
   std::uint64_t next_put_context_id_{1};

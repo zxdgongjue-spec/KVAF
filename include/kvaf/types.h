@@ -24,6 +24,10 @@ struct RemoteRegionDesc {
   std::uint64_t length{0};
   std::uint64_t slot_size{0};
   DeviceKind device{DeviceKind::kCpu};
+  // One Runtime owns one physical region. MetaManager may subdivide it into
+  // fixed per-layer ranges so different transformer layers never interleave
+  // their DDR allocations.
+  std::uint32_t layer_count{1};
 };
 
 // 调用方拥有的只读/可写 buffer 描述。Runtime 不申请、释放或注册这些

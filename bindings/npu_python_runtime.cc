@@ -234,9 +234,11 @@ class NpuRuntime final {
   NpuRuntime(const NpuRuntime&) = delete;
   NpuRuntime& operator=(const NpuRuntime&) = delete;
 
-  void Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
+  void Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size,
+                  std::uint32_t layer_count) {
     ThrowIfError(runtime_->Initialize(
-        RuntimeInitRequest{ddr_bytes, slot_size, DeviceKind::kCpu}));
+        RuntimeInitRequest{ddr_bytes, slot_size, DeviceKind::kCpu,
+                           layer_count}));
   }
 
   bool Initialized() const {
@@ -253,6 +255,11 @@ class NpuRuntime final {
     result["base"] = region.base;
     result["length"] = region.length;
     result["slot_size"] = region.slot_size;
+    result["layer_count"] = region.layer_count;
+    result["slots_per_layer"] =
+        region.layer_count == 0 || region.slot_size == 0
+            ? 0
+            : region.length / region.slot_size / region.layer_count;
     result["device"] = "cpu";
     return result;
   }
@@ -264,7 +271,7 @@ class NpuRuntime final {
   void BatchPut(const std::vector<KeyId>& keys, const py::object& source,
                 const std::vector<std::uint64_t>& input_offsets,
                 const std::vector<std::uint64_t>& lengths,
-                const py::object& stream) {
+                const py::object& stream, std::uint32_t layer_id) {
     if (!Initialized()) {
       throw std::runtime_error("Runtime has not been initialized");
     }
@@ -288,14 +295,16 @@ class NpuRuntime final {
         keys,
         ConstBufferView{source_view.data, source_view.bytes, DeviceKind::kNpu},
         input_offsets,
-        lengths}, BatchPutExecutionOptions{acl_stream}));
+        lengths,
+        layer_id}, BatchPutExecutionOptions{acl_stream}));
   }
 
-  AccessTableHandle PrepareAccessTable(const py::object& keys) {
+  AccessTableHandle PrepareAccessTable(const py::object& keys,
+                                       std::uint32_t layer_id) {
     std::vector<KeyId> copied_keys = CopyPrepareKeys(keys);
     AccessTableHandle handle;
     ThrowIfError(runtime_->PrepareAccessTable(
-        AccessTablePrepareRequest{std::move(copied_keys)}, &handle));
+        AccessTablePrepareRequest{std::move(copied_keys), layer_id}, &handle));
     return handle;
   }
 
@@ -360,9 +369,10 @@ class NpuRuntime final {
   // Python key forms as PrepareAccessTable (a Python key sequence or a
   // contiguous one-dimensional CPU torch.int64 Tensor), rather than imposing
   // a second representation solely for the NPU Runtime binding.
-  void BatchFree(const py::object& keys) {
+  void BatchFree(const py::object& keys, std::uint32_t layer_id) {
     std::vector<KeyId> copied_keys = CopyPrepareKeys(keys);
-    ThrowIfError(runtime_->BatchFree(BatchFreeRequest{std::move(copied_keys)}));
+    ThrowIfError(runtime_->BatchFree(
+        BatchFreeRequest{std::move(copied_keys), layer_id}));
   }
 
   void StartBatchGetKernelProfile() {
@@ -530,7 +540,7 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("batch_put_kernel_object_path") = "",
            py::arg("jettys_per_core") = 2)
       .def("initialize", &NpuRuntime::Initialize, py::arg("ddr_bytes"),
-           py::arg("slot_size"))
+           py::arg("slot_size"), py::arg("layer_count") = 1)
       .def("shutdown", &NpuRuntime::Shutdown)
       .def_property_readonly("initialized", &NpuRuntime::Initialized)
       .def_property_readonly("device_id", &NpuRuntime::DeviceId)
@@ -539,18 +549,19 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def_property_readonly("remote_region", &NpuRuntime::RemoteRegion)
       .def("batch_put", &NpuRuntime::BatchPut, py::arg("keys"),
            py::arg("source"), py::arg("input_offsets"), py::arg("lengths"),
-           py::arg("stream") = py::none(),
+           py::arg("stream") = py::none(), py::arg("layer_id") = 0,
            "Synchronously write variable-size packed NPU blocks. input_offsets and "
            "lengths are CPU integer sequences with one entry per key; "
            "stream=None uses torch.npu.current_stream().")
       .def("prepare_access_table", &NpuRuntime::PrepareAccessTable,
-           py::arg("keys"))
+           py::arg("keys"), py::arg("layer_id") = 0)
       .def("access_table_view", &NpuRuntime::AccessTableView,
            py::arg("access_table"), py::arg("device") = "cpu",
            py::arg("capacity") = 0)
       .def("release_access_table", &NpuRuntime::ReleaseAccessTable,
            py::arg("access_table"))
       .def("batch_free", &NpuRuntime::BatchFree, py::arg("keys"),
+           py::arg("layer_id") = 0,
            "Release the supplied keys from the Runtime metadata store. keys "
            "accepts a Python key sequence or a contiguous one-dimensional "
            "CPU torch.int64 Tensor.")

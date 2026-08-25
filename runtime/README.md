@@ -23,6 +23,17 @@ AccessOperator，并把调用方已经准备好的输入/输出 buffer 交给数
 - `BatchFree`：将删除请求交给 MetaManager；仍被 AccessTable 持有的 Key
   会返回 `kBusy`。
 
+### 单 Runtime 分层 DDR
+
+`Initialize(ddr_bytes, slot_size, layer_count=1)` 可将一个 Runtime 注册的
+单片 DDR 等分为 `layer_count` 个连续 slot 区。每个区有独立的 FIFO 分配器，
+因此不同层的 KV 永不交错；同层中按 BatchPut 到达顺序连续分配。
+
+分层模式下 `BatchPutRequest::layer_id`、
+`AccessTablePrepareRequest::layer_id` 和 `BatchFreeRequest::layer_id` 必须使用
+同一个层号。`key` 只在该层内唯一，因此不同层可以复用相同局部 key。BatchGet
+仍只消费已 materialize 的地址表，不增加 layer 参数。
+
 异步接口、BatchPut 图捕获管理及图对象生命周期不在本次 POC 范围。
 
 ## 资源所有权

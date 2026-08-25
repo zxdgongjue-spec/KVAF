@@ -36,7 +36,9 @@ class RuntimeMockTests(unittest.TestCase):
     def payload(self, values: list[int]) -> bytes:
         return test_payload(values, self.backend)
 
-    def batch_put(self, keys: list[int], blocks: list[bytes]) -> None:
+    def batch_put(
+        self, keys: list[int], blocks: list[bytes], *, layer_id: int = 0
+    ) -> None:
         """Submit variable-size blocks through the public packed-input API."""
         packed = bytearray()
         input_offsets: list[int] = []
@@ -45,7 +47,9 @@ class RuntimeMockTests(unittest.TestCase):
             input_offsets.append(len(packed))
             lengths.append(len(block))
             packed.extend(block)
-        self.kvaf.batch_put(keys, packed, input_offsets, lengths)
+        self.kvaf.batch_put(
+            keys, packed, input_offsets, lengths, layer_id=layer_id
+        )
 
     def test_put_prepare_get_release_and_slot_reuse(self) -> None:
         self.kvaf.initialize(ddr_bytes=256, slot_size=64)
@@ -105,6 +109,90 @@ class RuntimeMockTests(unittest.TestCase):
         self.kvaf.batch_get(table, [0], [0], [0], output, output_block_bytes=4)
         self.assertEqual(output, bytes.fromhex("bb000000"))
         self.kvaf.release_access_table(table)
+
+    def test_layer_partition_scopes_keys_and_addresses(self) -> None:
+        """One Runtime keeps each layer in a separate contiguous DDR range."""
+        slot_size = 64
+        slots_per_layer = 4
+        layer_count = 78
+        self.kvaf.initialize(
+            ddr_bytes=slot_size * slots_per_layer * layer_count,
+            slot_size=slot_size,
+            layer_count=layer_count,
+        )
+        self.assertEqual(self.kvaf.remote_region["layer_count"], layer_count)
+        self.assertEqual(
+            self.kvaf.remote_region["slots_per_layer"], slots_per_layer
+        )
+
+        # Local key 7 is valid independently in each layer. A layer-local
+        # BatchPut must allocate from that layer's fixed DDR subregion.
+        self.batch_put(
+            layer_id=0,
+            keys=[7, 8],
+            blocks=[self.payload([0x10]), self.payload([0x11])],
+        )
+        self.batch_put(
+            layer_id=1,
+            keys=[7, 8],
+            blocks=[self.payload([0x20]), self.payload([0x21])],
+        )
+        self.batch_put(
+            layer_id=77,
+            keys=[9],
+            blocks=[self.payload([0x30])],
+        )
+
+        layer0 = self.kvaf.prepare_access_table([7, 8], layer_id=0)
+        layer1 = self.kvaf.prepare_access_table([7, 8], layer_id=1)
+        layer77 = self.kvaf.prepare_access_table([9], layer_id=77)
+        try:
+            view0 = self.kvaf.access_table_view(layer0)
+            view1 = self.kvaf.access_table_view(layer1)
+            view77 = self.kvaf.access_table_view(layer77)
+            self.assertEqual(
+                view0["addresses"][1] - view0["addresses"][0], slot_size
+            )
+            self.assertEqual(
+                view1["addresses"][1] - view1["addresses"][0], slot_size
+            )
+            self.assertEqual(
+                view1["addresses"][0] - view0["addresses"][0],
+                slots_per_layer * slot_size,
+            )
+            self.assertEqual(
+                view77["addresses"][0] - view1["addresses"][0],
+                (77 - 1) * slots_per_layer * slot_size,
+            )
+
+            output = bytearray(4)
+            self.kvaf.batch_get(
+                layer1,
+                indices=[0],
+                offsets=[0],
+                output_indices=[0],
+                output=output,
+                output_block_bytes=4,
+            )
+            self.assertEqual(output, bytes.fromhex("20000000"))
+        finally:
+            self.kvaf.release_access_table(layer0)
+            self.kvaf.release_access_table(layer1)
+            self.kvaf.release_access_table(layer77)
+
+        # The same local key is not visible through a different layer id.
+        with self.assertRaises(ValueError):
+            self.kvaf.prepare_access_table([7], layer_id=99)
+        with self.assertRaises(KeyError):
+            self.kvaf.prepare_access_table([9], layer_id=0)
+
+        self.kvaf.batch_free([7, 8], layer_id=0)
+        self.kvaf.batch_free([7, 8], layer_id=1)
+        self.kvaf.batch_free([9], layer_id=77)
+
+    def test_layer_count_must_divide_slot_count(self) -> None:
+        with self.assertRaises(ValueError):
+            self.kvaf.initialize(ddr_bytes=4 * 64, slot_size=64, layer_count=3)
 
     def test_get_failure_preserves_lifecycle_and_invalid_index_is_rejected(self) -> None:
         self.kvaf.initialize(ddr_bytes=128, slot_size=64)

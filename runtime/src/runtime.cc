@@ -80,6 +80,10 @@ Status Runtime::Initialize(const RuntimeInitRequest& request) {
   if (!access_tables_.empty()) {
     return Status::InvalidState("Runtime has unreleased AccessTables");
   }
+  if (request.layer_count == 0) {
+    return Status::InvalidArgument(
+        "Runtime layer_count must be greater than zero");
+  }
 
   RemoteRegionDesc remote_region;
   Status status = ddr_allocator_.Allocate(request, &remote_region);
@@ -89,8 +93,17 @@ Status Runtime::Initialize(const RuntimeInitRequest& request) {
   if (remote_region.length == 0 || remote_region.slot_size == 0 ||
       remote_region.length % remote_region.slot_size != 0) {
     (void)ddr_allocator_.Release(remote_region);
-    return Status::InvalidArgument("DDR allocator returned an invalid remote region");
+    return Status::InvalidArgument(
+        "DDR allocator returned an invalid remote region");
   }
+  const std::uint64_t slot_count =
+      remote_region.length / remote_region.slot_size;
+  if (slot_count % request.layer_count != 0) {
+    (void)ddr_allocator_.Release(remote_region);
+    return Status::InvalidArgument(
+        "Runtime DDR slot count must divide evenly across layer_count");
+  }
+  remote_region.layer_count = request.layer_count;
 
   status = access_operator_.Initialize(remote_region);
   if (!status.ok()) {
@@ -153,7 +166,7 @@ Status Runtime::PrepareAccessTable(const AccessTablePrepareRequest& request,
   LockContext lock_context;
   Status status = meta_manager_.LockKeys(
       request.flat_keys, MetaManagerLockMode::kStableReadAllowAppend,
-      &lock_context);
+      &lock_context, request.layer_id);
   if (!status.ok()) {
     return status;
   }
@@ -344,7 +357,8 @@ Status Runtime::BatchPut(const BatchPutRequest& request,
   PutContext put_context;
   PutAccessDesc put_desc;
   Status status = meta_manager_.PreparePut(request.keys, request.lengths,
-                                           &put_context, &put_desc);
+                                           &put_context, &put_desc,
+                                           request.layer_id);
   if (!status.ok()) {
     return status;
   }
@@ -366,7 +380,7 @@ Status Runtime::BatchFree(const BatchFreeRequest& request) {
   if (request.keys.empty()) {
     return Status::InvalidArgument("BatchFree requires at least one key");
   }
-  return meta_manager_.BatchFree(request.keys);
+  return meta_manager_.BatchFree(request.keys, request.layer_id);
 }
 
 Runtime::AccessTableState* Runtime::FindAccessTable(
