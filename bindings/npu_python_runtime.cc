@@ -2,6 +2,7 @@
 
 #include <pybind11/stl.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -210,6 +211,21 @@ std::string StatusMessage(const Status& status, const char* operation) {
   return std::string(operation) + ": " + detail;
 }
 
+// The lane normally sleeps while idle.  The explicit spin mode is only a
+// performance probe: it keeps one host CPU busy so that a Post() does not pay
+// the scheduler wake-up tail of condition_variable.  It must remain opt-in
+// until an end-to-end runtime can reserve an appropriate CPU for the worker.
+enum class NativeGetWorkerWaitMode : std::uint8_t {
+  kCv,
+  kDedicatedSpin,
+};
+
+struct NativeGetReapTiming {
+  double terminal_sync_us{0.0};
+  double reclaim_wait_us{0.0};
+  double total_us{0.0};
+};
+
 // A deliberately narrow eager-only submission lane.  It has one worker and
 // one caller-owned copy stream because Direct-HCCP's queue/status state is
 // shared inside DefaultAccessOperator; it is not a general multi-stream Get
@@ -220,12 +236,14 @@ class NativeGetSubmitLane final {
   NativeGetSubmitLane(DefaultAccessOperator& access_operator,
                       std::uint32_t device_id, aclrtStream copy_stream,
                       bool bind_stream_resource,
-                      std::uint32_t expected_get_vector_cores)
+                      std::uint32_t expected_get_vector_cores,
+                      NativeGetWorkerWaitMode worker_wait_mode)
       : access_operator_(access_operator),
         device_id_(device_id),
         copy_stream_(copy_stream),
         bind_stream_resource_(bind_stream_resource),
-        expected_get_vector_cores_(expected_get_vector_cores) {}
+        expected_get_vector_cores_(expected_get_vector_cores),
+        worker_wait_mode_(worker_wait_mode) {}
 
   ~NativeGetSubmitLane() { CloseNoThrow(); }
 
@@ -366,6 +384,7 @@ class NativeGetSubmitLane final {
     worker_start_time_ = std::chrono::steady_clock::time_point{};
     worker_issue_time_ = std::chrono::steady_clock::time_point{};
     state_ = State::kPosted;
+    worker_wake_epoch_.fetch_add(1, std::memory_order_release);
     cv_.notify_all();
     return Status::OK();
   }
@@ -448,7 +467,8 @@ class NativeGetSubmitLane final {
     return Status::OK();
   }
 
-  Status Reap() {
+  Status Reap(NativeGetReapTiming* timing) {
+    const auto reap_enter = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lock(mu_);
     if (state_ == State::kFailed) {
       return Internal(worker_error_.empty() ? "native Get lane failed"
@@ -459,6 +479,7 @@ class NativeGetSubmitLane final {
                            "native Get lane requires a recorded terminal event before reap");
     }
     lock.unlock();
+    const auto terminal_sync_enter = std::chrono::steady_clock::now();
     if (aclrtSynchronizeEvent(terminal_done_) != ACL_SUCCESS) {
       lock.lock();
       if (state_ == State::kTerminal) {
@@ -466,6 +487,7 @@ class NativeGetSubmitLane final {
       }
       return Internal("native Get terminal event synchronization failed");
     }
+    const auto terminal_sync_leave = std::chrono::steady_clock::now();
     lock.lock();
     if (state_ != State::kTerminal) {
       return Status::Error(StatusCode::kInvalidState,
@@ -475,6 +497,8 @@ class NativeGetSubmitLane final {
     // resetting worker-owned events can still be explicitly closed safely.
     consumer_may_read_output_ = false;
     state_ = State::kReclaim;
+    const auto reclaim_wait_enter = std::chrono::steady_clock::now();
+    worker_wake_epoch_.fetch_add(1, std::memory_order_release);
     cv_.notify_all();
     cv_.wait(lock, [this] {
       return state_ == State::kFree || state_ == State::kFailed || stopping_;
@@ -487,6 +511,14 @@ class NativeGetSubmitLane final {
     if (state_ != State::kFree) {
       return Status::Error(StatusCode::kInvalidState,
                            "native Get lane stopped while reclaiming events");
+    }
+    const auto reap_leave = std::chrono::steady_clock::now();
+    if (timing != nullptr) {
+      timing->terminal_sync_us =
+          DurationUs(terminal_sync_enter, terminal_sync_leave);
+      timing->reclaim_wait_us =
+          DurationUs(reclaim_wait_enter, reap_leave);
+      timing->total_us = DurationUs(reap_enter, reap_leave);
     }
     return Status::OK();
   }
@@ -562,6 +594,16 @@ class NativeGetSubmitLane final {
     return std::chrono::duration<double, std::micro>(end - begin).count();
   }
 
+  static void CpuRelax() {
+#if defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield" ::: "memory");
+#elif defined(__x86_64__) || defined(__i386__)
+    __asm__ __volatile__("pause" ::: "memory");
+#else
+    std::this_thread::yield();
+#endif
+  }
+
   void FailLocked(std::string error) {
     worker_error_ = std::move(error);
     state_ = State::kFailed;
@@ -613,9 +655,25 @@ class NativeGetSubmitLane final {
       BatchGetOutputBindingId output_binding_id = 0;
       {
         std::unique_lock<std::mutex> lock(mu_);
-        cv_.wait(lock, [this] {
-          return stopping_ || state_ == State::kPosted || state_ == State::kReclaim;
-        });
+        if (worker_wait_mode_ == NativeGetWorkerWaitMode::kCv) {
+          cv_.wait(lock, [this] {
+            return stopping_ || state_ == State::kPosted ||
+                   state_ == State::kReclaim;
+          });
+        } else if (!stopping_ && state_ != State::kPosted &&
+                   state_ != State::kReclaim) {
+          // Snapshot while holding mu_: Post()/Reap() must acquire the same
+          // mutex before changing state and incrementing the epoch, so this
+          // cannot lose a notification between the state check and unlock.
+          const std::uint64_t observed_epoch =
+              worker_wake_epoch_.load(std::memory_order_acquire);
+          lock.unlock();
+          while (worker_wake_epoch_.load(std::memory_order_acquire) ==
+                 observed_epoch) {
+            CpuRelax();
+          }
+          lock.lock();
+        }
         if (stopping_) {
           break;
         }
@@ -643,6 +701,12 @@ class NativeGetSubmitLane final {
             state_ = State::kFree;
             cv_.notify_all();
           }
+          continue;
+        }
+        if (state_ != State::kPosted) {
+          // A CV/spin wake can race a caller finishing Arm().  That state is
+          // not worker work; take another idle wait without treating it as a
+          // submission error.
           continue;
         }
         job = job_;
@@ -687,6 +751,7 @@ class NativeGetSubmitLane final {
     {
       std::lock_guard<std::mutex> lock(mu_);
       stopping_ = true;
+      worker_wake_epoch_.fetch_add(1, std::memory_order_release);
       cv_.notify_all();
     }
     if (worker_.joinable()) {
@@ -748,6 +813,7 @@ class NativeGetSubmitLane final {
   aclrtStream copy_stream_{nullptr};
   bool bind_stream_resource_{false};
   std::uint32_t expected_get_vector_cores_{0};
+  NativeGetWorkerWaitMode worker_wait_mode_{NativeGetWorkerWaitMode::kCv};
   void* stream_resource_library_{nullptr};
   UseStreamResourceFn use_stream_resource_{nullptr};
   UseStreamResourceFn unuse_stream_resource_{nullptr};
@@ -764,6 +830,7 @@ class NativeGetSubmitLane final {
   std::chrono::steady_clock::time_point post_time_;
   std::chrono::steady_clock::time_point worker_start_time_;
   std::chrono::steady_clock::time_point worker_issue_time_;
+  std::atomic<std::uint64_t> worker_wake_epoch_{0};
   mutable std::mutex mu_;
   std::condition_variable cv_;
   std::thread worker_;
@@ -1030,7 +1097,8 @@ class NpuRuntime final {
   // consumer (QSFA in the real path) has been queued.
   void CreateNativeGetSubmitLane(const py::object& copy_stream,
                                  bool bind_stream_resource,
-                                 std::uint32_t expected_get_vector_cores) {
+                                 std::uint32_t expected_get_vector_cores,
+                                 const std::string& worker_wait) {
     if (!Initialized()) {
       throw std::runtime_error("Runtime has not been initialized");
     }
@@ -1038,10 +1106,19 @@ class NpuRuntime final {
       EnsureNativeGetLaneOwner("create_native_get_submit_lane");
       throw py::value_error("native Get submit lane already exists");
     }
+    NativeGetWorkerWaitMode worker_wait_mode;
+    if (worker_wait == "cv") {
+      worker_wait_mode = NativeGetWorkerWaitMode::kCv;
+    } else if (worker_wait == "dedicated_spin") {
+      worker_wait_mode = NativeGetWorkerWaitMode::kDedicatedSpin;
+    } else {
+      throw py::value_error(
+          "native Get worker_wait must be 'cv' or 'dedicated_spin'");
+    }
     const aclrtStream raw_copy_stream = ResolveStream(copy_stream);
     auto lane = std::make_unique<NativeGetSubmitLane>(
         *access_operator_, device_id_, raw_copy_stream, bind_stream_resource,
-        expected_get_vector_cores);
+        expected_get_vector_cores, worker_wait_mode);
     ThrowIfError(lane->Initialize());
     native_get_lane_copy_stream_keepalive_ = copy_stream;
     native_get_lane_ = std::move(lane);
@@ -1118,14 +1195,20 @@ class NpuRuntime final {
     ThrowIfError(lane.RecordTerminal(ResolveStream(terminal_stream)));
   }
 
-  void ReapNativeGet() {
+  py::dict ReapNativeGet() {
     NativeGetSubmitLane& lane = RequireNativeGetLane("reap_native_get");
+    NativeGetReapTiming timing;
     Status status;
     {
       py::gil_scoped_release release;
-      status = lane.Reap();
+      status = lane.Reap(&timing);
     }
     ThrowIfError(status);
+    py::dict result;
+    result["terminal_sync_wait_us"] = timing.terminal_sync_us;
+    result["event_reclaim_wait_us"] = timing.reclaim_wait_us;
+    result["total_us"] = timing.total_us;
+    return result;
   }
 
   void DestroyNativeGetSubmitLane() {
@@ -1352,11 +1435,13 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("copy_stream"),
            py::arg("bind_stream_resource") = false,
            py::arg("expected_get_vector_cores") = 0,
+           py::arg("worker_wait") = "cv",
            "Create the eager-only, single-worker Get submission lane. "
            "The worker exclusively owns copy_stream submissions until "
            "destroy_native_get_submit_lane(). The caller must first complete "
            "all earlier eager Get work from this Runtime and use the creating "
-           "host thread for every native-lane call.")
+           "host thread for every native-lane call. worker_wait='dedicated_spin' "
+           "is an opt-in host-CPU latency probe, not the default runtime policy.")
       .def("bind_native_get_output", &NpuRuntime::BindNativeGetOutput,
            py::arg("output"),
            "Cold-bind one fixed HBM output Tensor for native Get. The binding "
@@ -1379,7 +1464,8 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("terminal_stream"),
            "Record the final-reader terminal on the already-armed consumer stream.")
       .def("reap_native_get", &NpuRuntime::ReapNativeGet,
-           "Wait until the terminal event has completed and make the fixed slot reusable.")
+           "Wait until the terminal event has completed and make the fixed slot reusable. "
+           "Returns terminal-sync, event-reclaim, and total host timings in microseconds.")
       .def("destroy_native_get_submit_lane",
            &NpuRuntime::DestroyNativeGetSubmitLane,
            "Stop the worker and release the fixed HBM binding. The slot must be reaped.")
