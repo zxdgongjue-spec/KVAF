@@ -13,6 +13,10 @@ target_include_directories(_kvaf
 set(KVAF_PYTHON_BINDING_PREFLIGHT_ARGS)
 
 if(KVAF_ENABLE_AIV_BATCH_GET)
+  # The eager native Get submit lane owns a persistent C++ worker. Keep the
+  # threading and dlsym dependencies explicit instead of relying on
+  # incidental transitive linkage from ACL/PyTorch.
+  find_package(Threads REQUIRED)
   target_sources(_kvaf PRIVATE
     acl_python_utils.cc
     acl_graph_python.cc
@@ -23,6 +27,8 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
       kvaf_default_access_operator
       kvaf_execute_batch_get_host
       ascendcl
+      Threads::Threads
+      ${CMAKE_DL_LIBS}
   )
   if(KVAF_ENABLE_AIV_BATCH_PUT)
     target_link_libraries(_kvaf PRIVATE kvaf_execute_batch_put_host)

@@ -60,6 +60,14 @@ struct BatchGetKernelProfile {
   std::array<std::uint64_t, 2> jetty_completion_polls{};
 };
 
+// A bound output is a cold-path Direct-HCCP registration for one fixed HBM
+// output range. The ID deliberately has no scheduling semantics: it only
+// identifies the cached local-memory registration and its channel entity.
+// It does not own the HBM allocation; the caller must keep that allocation
+// alive and must not release a binding until every stream that can read its
+// output has completed.
+using BatchGetOutputBindingId = std::uint64_t;
+
 // Default synchronous NPU data-plane implementation.
 //
 // Initialize creates reusable BatchGet and (when configured) BatchPut
@@ -84,6 +92,19 @@ class DefaultAccessOperator final : public AccessOperator {
   Status Shutdown() override;
   Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
   Status ExecuteBatchPut(const BatchPutExecRequest& request) override;
+
+  // Split the eager Get path into a cold output-registration phase and a hot
+  // launch phase. Stage-5 fixed slots bind their HBM output once, so the
+  // submit lane never performs LocalBufferAcquire on a decode critical path.
+  // These are deliberately not general concurrent APIs: Bind/Release must
+  // run while the native lane is idle or stopped, and ExecuteBoundBatchGet is
+  // reserved for that lane's single worker. A host mutex would not make the
+  // underlying async Direct-HCCP queues safe for multiple workers.
+  Status BindBatchGetOutput(const MutableBufferView& output,
+                            BatchGetOutputBindingId* binding_id);
+  Status ReleaseBatchGetOutput(BatchGetOutputBindingId binding_id);
+  Status ExecuteBoundBatchGet(const BatchGetExecRequest& request,
+                              BatchGetOutputBindingId binding_id);
 
   // Profiling is opt-in and uses the reserved per-core status area. Callers
   // must complete the BatchGet stream before copying the latest snapshot.

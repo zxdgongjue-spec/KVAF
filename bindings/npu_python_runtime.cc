@@ -2,11 +2,16 @@
 
 #include <pybind11/stl.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
+#include <dlfcn.h>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -198,6 +203,577 @@ aclrtStream ResolveStream(const py::object& stream) {
   return acl_python::StreamFromPython(torch.attr("npu").attr("current_stream")());
 }
 
+std::string StatusMessage(const Status& status, const char* operation) {
+  const std::string detail = status.message().empty()
+                                 ? "unknown KVAF error"
+                                 : status.message();
+  return std::string(operation) + ": " + detail;
+}
+
+// A deliberately narrow eager-only submission lane.  It has one worker and
+// one caller-owned copy stream because Direct-HCCP's queue/status state is
+// shared inside DefaultAccessOperator; it is not a general multi-stream Get
+// scheduler.  Python owns every Tensor reference, while this class owns only
+// POD BatchGetRequest fields and ACL events.
+class NativeGetSubmitLane final {
+ public:
+  NativeGetSubmitLane(DefaultAccessOperator& access_operator,
+                      std::uint32_t device_id, aclrtStream copy_stream,
+                      bool bind_stream_resource,
+                      std::uint32_t expected_get_vector_cores)
+      : access_operator_(access_operator),
+        device_id_(device_id),
+        copy_stream_(copy_stream),
+        bind_stream_resource_(bind_stream_resource),
+        expected_get_vector_cores_(expected_get_vector_cores) {}
+
+  ~NativeGetSubmitLane() { CloseNoThrow(); }
+
+  NativeGetSubmitLane(const NativeGetSubmitLane&) = delete;
+  NativeGetSubmitLane& operator=(const NativeGetSubmitLane&) = delete;
+
+  Status Initialize() {
+    if (copy_stream_ == nullptr) {
+      return InvalidArgument("native Get lane requires a copy stream");
+    }
+    if (expected_get_vector_cores_ != 0 && !bind_stream_resource_) {
+      return InvalidArgument(
+          "native Get worker vector verification requires a stream resource binding");
+    }
+    if (aclrtCreateEvent(&descriptor_ready_) != ACL_SUCCESS ||
+        aclrtCreateEvent(&get_done_) != ACL_SUCCESS ||
+        aclrtCreateEvent(&terminal_done_) != ACL_SUCCESS ||
+        aclrtCreateEvent(&worker_ready_) != ACL_SUCCESS) {
+      DestroyEventsNoThrow();
+      return Internal("failed to create native Get lane ACL events");
+    }
+    if (bind_stream_resource_) {
+      stream_resource_library_ = dlopen("libascendcl.so", RTLD_NOW | RTLD_LOCAL);
+      if (stream_resource_library_ == nullptr) {
+        DestroyEventsNoThrow();
+        return Internal("failed to load libascendcl.so for native Get quota");
+      }
+      use_stream_resource_ = reinterpret_cast<UseStreamResourceFn>(
+          dlsym(stream_resource_library_, "aclrtUseStreamResInCurrentThread"));
+      unuse_stream_resource_ = reinterpret_cast<UseStreamResourceFn>(
+          dlsym(stream_resource_library_, "aclrtUnuseStreamResInCurrentThread"));
+      if (expected_get_vector_cores_ != 0) {
+        get_current_thread_resource_ =
+            reinterpret_cast<GetCurrentThreadResourceFn>(
+                dlsym(stream_resource_library_, "aclrtGetResInCurrentThread"));
+      }
+      if (use_stream_resource_ == nullptr || unuse_stream_resource_ == nullptr) {
+        DestroyEventsNoThrow();
+        CloseStreamResourceLibraryNoThrow();
+        return Internal("CANN has no native Get stream-resource TLS API");
+      }
+      if (expected_get_vector_cores_ != 0 &&
+          get_current_thread_resource_ == nullptr) {
+        DestroyEventsNoThrow();
+        CloseStreamResourceLibraryNoThrow();
+        return Internal("CANN cannot verify native Get worker vector quota");
+      }
+    }
+
+    worker_ = std::thread(&NativeGetSubmitLane::WorkerMain, this);
+    std::unique_lock<std::mutex> lock(mu_);
+    cv_.wait(lock, [this] { return worker_initialized_; });
+    if (!worker_error_.empty()) {
+      const std::string error = worker_error_;
+      lock.unlock();
+      StopWorkerNoThrow();
+      DestroyEventsNoThrow();
+      CloseStreamResourceLibraryNoThrow();
+      return Internal(error);
+    }
+    lock.unlock();
+    if (aclrtSynchronizeEvent(worker_ready_) != ACL_SUCCESS) {
+      StopWorkerNoThrow();
+      DestroyEventsNoThrow();
+      CloseStreamResourceLibraryNoThrow();
+      return Internal("native Get worker cannot submit to the copy stream");
+    }
+    return Status::OK();
+  }
+
+  Status BindOutput(const MutableBufferView& output) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (state_ != State::kFree) {
+      return Status::Error(StatusCode::kBusy,
+                           "native Get lane has an in-flight job");
+    }
+    if (output_binding_id_ != 0) {
+      return Status::Error(StatusCode::kAlreadyExists,
+                           "native Get lane output is already bound");
+    }
+    if (!output.valid() || output.device != DeviceKind::kNpu ||
+        output.bytes % kBatchGetTransferBytes != 0) {
+      return InvalidArgument(
+          "native Get lane output must be an NPU buffer with 656-byte rows");
+    }
+    BatchGetOutputBindingId binding_id = 0;
+    Status status = access_operator_.BindBatchGetOutput(output, &binding_id);
+    if (!status.ok()) {
+      return status;
+    }
+    output_ = output;
+    output_binding_id_ = binding_id;
+    return Status::OK();
+  }
+
+  // Descriptor Tensor identities are fixed for the lane lifetime. Their
+  // contents may be updated in-place by the producer stream before Post(),
+  // but changing a pointer requires an idle-lane Prepare() first.
+  Status Prepare(const BatchGetRequest& request) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (state_ != State::kFree) {
+      return Status::Error(StatusCode::kBusy,
+                           "native Get lane has an in-flight job");
+    }
+    if (output_binding_id_ == 0 || request.output.data != output_.data ||
+        request.output.bytes != output_.bytes) {
+      return InvalidArgument(
+          "native Get request output does not match the bound HBM slot");
+    }
+    prepared_request_ = request;
+    has_prepared_request_ = true;
+    return Status::OK();
+  }
+
+  // This is the hot host path: it only orders already-prepared descriptor
+  // buffers, records one event, and wakes the worker.  It must not validate
+  // Python Tensors or acquire a Direct-HCCP output registration.
+  Status Post(aclrtStream producer_stream) {
+    if (producer_stream == nullptr) {
+      return InvalidArgument("native Get lane requires a producer stream");
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    if (state_ != State::kFree) {
+      return Status::Error(StatusCode::kBusy,
+                           "native Get lane slot is not free");
+    }
+    if (!has_prepared_request_) {
+      return Status::Error(StatusCode::kInvalidState,
+                           "native Get lane requires prepare_native_get first");
+    }
+    if (aclrtRecordEvent(descriptor_ready_, producer_stream) != ACL_SUCCESS) {
+      return Internal("failed to record native Get descriptor-ready event");
+    }
+    job_ = prepared_request_;
+    worker_error_.clear();
+    consumer_may_read_output_ = false;
+    post_time_ = std::chrono::steady_clock::now();
+    worker_start_time_ = std::chrono::steady_clock::time_point{};
+    worker_issue_time_ = std::chrono::steady_clock::time_point{};
+    state_ = State::kPosted;
+    cv_.notify_all();
+    return Status::OK();
+  }
+
+  Status Arm(aclrtStream consumer_stream, double* post_to_worker_start_us,
+             double* worker_issue_us, double* post_to_issue_us,
+             double* arm_wait_us) {
+    if (consumer_stream == nullptr) {
+      return InvalidArgument("native Get lane requires a consumer stream");
+    }
+    const auto arm_enter = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lock(mu_);
+    cv_.wait(lock, [this] {
+      return state_ == State::kIssued || state_ == State::kFailed || stopping_;
+    });
+    if (state_ == State::kFailed) {
+      return Internal(worker_error_.empty()
+                          ? "native Get worker failed before event record"
+                          : worker_error_);
+    }
+    if (state_ != State::kIssued) {
+      return Status::Error(StatusCode::kInvalidState,
+                           "native Get lane stopped before event record");
+    }
+    const auto worker_start_time = worker_start_time_;
+    const auto issue_time = worker_issue_time_;
+    lock.unlock();
+    if (aclrtStreamWaitEvent(consumer_stream, get_done_) != ACL_SUCCESS) {
+      lock.lock();
+      if (state_ == State::kIssued) {
+        FailLocked("failed to arm native Get completion event on consumer stream");
+      }
+      return Internal("failed to arm native Get completion event on consumer stream");
+    }
+    const auto arm_leave = std::chrono::steady_clock::now();
+    lock.lock();
+    if (state_ != State::kIssued) {
+      // The dependency has already been accepted by consumer_stream.  Do not
+      // release the HBM slot unless a terminal event later proves that every
+      // consumer has completed.
+      consumer_may_read_output_ = true;
+      FailLocked("native Get lane state changed while arming completion");
+      return Status::Error(StatusCode::kInvalidState,
+                           "native Get lane state changed while arming completion");
+    }
+    consumer_may_read_output_ = true;
+    state_ = State::kArmed;
+    if (post_to_worker_start_us != nullptr) {
+      *post_to_worker_start_us = DurationUs(post_time_, worker_start_time);
+    }
+    if (worker_issue_us != nullptr) {
+      *worker_issue_us = DurationUs(worker_start_time, issue_time);
+    }
+    if (post_to_issue_us != nullptr) {
+      *post_to_issue_us = DurationUs(post_time_, issue_time);
+    }
+    if (arm_wait_us != nullptr) {
+      *arm_wait_us = DurationUs(arm_enter, arm_leave);
+    }
+    return Status::OK();
+  }
+
+  Status RecordTerminal(aclrtStream terminal_stream) {
+    if (terminal_stream == nullptr) {
+      return InvalidArgument("native Get lane requires a terminal stream");
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    if (state_ != State::kArmed) {
+      return Status::Error(StatusCode::kInvalidState,
+                           "native Get completion must be armed before terminal record");
+    }
+    if (aclrtRecordEvent(terminal_done_, terminal_stream) != ACL_SUCCESS) {
+      // A consumer dependency has already been queued.  Without a terminal
+      // event there is no proof that it stopped reading this output slot, so
+      // the lane enters quarantine rather than being made reusable.
+      FailLocked("failed to record native Get terminal event");
+      return Internal("failed to record native Get terminal event");
+    }
+    state_ = State::kTerminal;
+    return Status::OK();
+  }
+
+  Status Reap() {
+    std::unique_lock<std::mutex> lock(mu_);
+    if (state_ == State::kFailed) {
+      return Internal(worker_error_.empty() ? "native Get lane failed"
+                                             : worker_error_);
+    }
+    if (state_ != State::kTerminal) {
+      return Status::Error(StatusCode::kInvalidState,
+                           "native Get lane requires a recorded terminal event before reap");
+    }
+    lock.unlock();
+    if (aclrtSynchronizeEvent(terminal_done_) != ACL_SUCCESS) {
+      lock.lock();
+      if (state_ == State::kTerminal) {
+        FailLocked("native Get terminal event synchronization failed");
+      }
+      return Internal("native Get terminal event synchronization failed");
+    }
+    lock.lock();
+    if (state_ != State::kTerminal) {
+      return Status::Error(StatusCode::kInvalidState,
+                           "native Get lane state changed while reaping terminal");
+    }
+    // The final reader is now known to have completed.  A later failure while
+    // resetting worker-owned events can still be explicitly closed safely.
+    consumer_may_read_output_ = false;
+    state_ = State::kReclaim;
+    cv_.notify_all();
+    cv_.wait(lock, [this] {
+      return state_ == State::kFree || state_ == State::kFailed || stopping_;
+    });
+    if (state_ == State::kFailed) {
+      return Internal(worker_error_.empty()
+                          ? "native Get lane failed while reclaiming events"
+                          : worker_error_);
+    }
+    if (state_ != State::kFree) {
+      return Status::Error(StatusCode::kInvalidState,
+                           "native Get lane stopped while reclaiming events");
+    }
+    return Status::OK();
+  }
+
+  bool Idle() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return state_ == State::kFree;
+  }
+
+  Status Close() {
+    State state;
+    bool consumer_may_read_output = false;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      state = state_;
+      consumer_may_read_output = consumer_may_read_output_;
+    }
+    if (state != State::kFree && state != State::kFailed) {
+      return Status::Error(StatusCode::kBusy,
+                           "native Get lane still owns an in-flight slot");
+    }
+    if (state == State::kFailed && consumer_may_read_output) {
+      return Status::Error(
+          StatusCode::kInvalidState,
+          "native Get lane failed after a consumer dependency was armed; "
+          "terminal completion is unknown, so the HBM binding is quarantined");
+    }
+    StopWorkerNoThrow();
+    if (aclrtSynchronizeStream(copy_stream_) != ACL_SUCCESS) {
+      std::lock_guard<std::mutex> lock(mu_);
+      FailLocked("native Get lane close could not synchronize its copy stream");
+      return Internal("native Get lane close could not synchronize its copy stream");
+    }
+    if (output_binding_id_ != 0) {
+      const Status release = access_operator_.ReleaseBatchGetOutput(output_binding_id_);
+      if (!release.ok()) {
+        std::lock_guard<std::mutex> lock(mu_);
+        FailLocked(StatusMessage(release, "native Get lane close release failed"));
+        return release;
+      }
+      output_binding_id_ = 0;
+      output_ = MutableBufferView{};
+    }
+    prepared_request_ = BatchGetRequest{};
+    has_prepared_request_ = false;
+    DestroyEventsNoThrow();
+    CloseStreamResourceLibraryNoThrow();
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      state_ = State::kFree;
+      consumer_may_read_output_ = false;
+    }
+    return Status::OK();
+  }
+
+ private:
+  using UseStreamResourceFn = aclError (*)(aclrtStream);
+  using GetCurrentThreadResourceFn =
+      aclError (*)(aclrtDevResLimitType, std::uint32_t*);
+
+  enum class State : std::uint8_t {
+    kFree,
+    kPosted,
+    kIssued,
+    kArmed,
+    kTerminal,
+    kReclaim,
+    kFailed,
+  };
+
+  static double DurationUs(std::chrono::steady_clock::time_point begin,
+                           std::chrono::steady_clock::time_point end) {
+    return std::chrono::duration<double, std::micro>(end - begin).count();
+  }
+
+  void FailLocked(std::string error) {
+    worker_error_ = std::move(error);
+    state_ = State::kFailed;
+    cv_.notify_all();
+  }
+
+  void WorkerMain() {
+    std::string init_error;
+    bool stream_resource_bound = false;
+    if (aclrtSetDevice(device_id_) != ACL_SUCCESS) {
+      init_error = "native Get worker aclrtSetDevice failed";
+    } else if (bind_stream_resource_) {
+      if (use_stream_resource_(copy_stream_) != ACL_SUCCESS) {
+        init_error = "native Get worker failed to bind copy-stream resource quota";
+      } else {
+        stream_resource_bound = true;
+      }
+    }
+    if (init_error.empty() && expected_get_vector_cores_ != 0) {
+      std::uint32_t observed_vector_cores = 0;
+      if (get_current_thread_resource_(ACL_RT_DEV_RES_VECTOR_CORE,
+                                       &observed_vector_cores) != ACL_SUCCESS) {
+        init_error = "native Get worker could not read its vector quota";
+      } else if (observed_vector_cores != expected_get_vector_cores_) {
+        init_error = "native Get worker vector quota differs from the requested value";
+      }
+    }
+    if (init_error.empty() &&
+        aclrtRecordEvent(worker_ready_, copy_stream_) != ACL_SUCCESS) {
+      init_error = "native Get worker failed to record copy-stream readiness";
+    }
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      worker_initialized_ = true;
+      if (!init_error.empty()) {
+        worker_error_ = init_error;
+      }
+      cv_.notify_all();
+    }
+    if (!init_error.empty()) {
+      if (stream_resource_bound && unuse_stream_resource_ != nullptr) {
+        (void)unuse_stream_resource_(copy_stream_);
+      }
+      return;
+    }
+
+    while (true) {
+      BatchGetRequest job;
+      BatchGetOutputBindingId output_binding_id = 0;
+      {
+        std::unique_lock<std::mutex> lock(mu_);
+        cv_.wait(lock, [this] {
+          return stopping_ || state_ == State::kPosted || state_ == State::kReclaim;
+        });
+        if (stopping_) {
+          break;
+        }
+        if (state_ == State::kReclaim) {
+          lock.unlock();
+          const aclError descriptor_reset =
+              aclrtResetEvent(descriptor_ready_, copy_stream_);
+          const aclError get_reset =
+              descriptor_reset == ACL_SUCCESS
+                  ? aclrtResetEvent(get_done_, copy_stream_)
+                  : descriptor_reset;
+          const aclError terminal_reset =
+              get_reset == ACL_SUCCESS
+                  ? aclrtResetEvent(terminal_done_, copy_stream_)
+                  : get_reset;
+          const aclError reset_sync =
+              terminal_reset == ACL_SUCCESS
+                  ? aclrtSynchronizeStream(copy_stream_)
+                  : terminal_reset;
+          lock.lock();
+          if (reset_sync != ACL_SUCCESS) {
+            FailLocked("native Get worker failed to reclaim ACL events");
+          } else {
+            job_ = BatchGetRequest{};
+            state_ = State::kFree;
+            cv_.notify_all();
+          }
+          continue;
+        }
+        job = job_;
+        output_binding_id = output_binding_id_;
+      }
+
+      const auto worker_start_time = std::chrono::steady_clock::now();
+      std::string launch_error;
+      if (aclrtStreamWaitEvent(copy_stream_, descriptor_ready_) != ACL_SUCCESS) {
+        launch_error = "native Get worker failed to wait for descriptor-ready event";
+      } else {
+        const Status launch = access_operator_.ExecuteBoundBatchGet(
+            BatchGetExecRequest{AccessTableView{}, &job,
+                                BatchGetExecutionOptions{copy_stream_, false}},
+            output_binding_id);
+        if (!launch.ok()) {
+          launch_error = StatusMessage(launch, "native Get worker launch failed");
+        } else if (aclrtRecordEvent(get_done_, copy_stream_) != ACL_SUCCESS) {
+          launch_error = "native Get worker failed to record completion event";
+        }
+      }
+
+      std::lock_guard<std::mutex> lock(mu_);
+      worker_start_time_ = worker_start_time;
+      worker_issue_time_ = std::chrono::steady_clock::now();
+      if (!launch_error.empty()) {
+        FailLocked(std::move(launch_error));
+      } else if (state_ == State::kPosted) {
+        state_ = State::kIssued;
+        cv_.notify_all();
+      } else {
+        FailLocked("native Get worker observed an invalid slot state");
+      }
+    }
+
+    if (stream_resource_bound && unuse_stream_resource_ != nullptr) {
+      (void)unuse_stream_resource_(copy_stream_);
+    }
+  }
+
+  void StopWorkerNoThrow() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      stopping_ = true;
+      cv_.notify_all();
+    }
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+  }
+
+  void DestroyEventsNoThrow() {
+    if (worker_ready_ != nullptr) {
+      (void)aclrtDestroyEvent(worker_ready_);
+      worker_ready_ = nullptr;
+    }
+    if (terminal_done_ != nullptr) {
+      (void)aclrtDestroyEvent(terminal_done_);
+      terminal_done_ = nullptr;
+    }
+    if (get_done_ != nullptr) {
+      (void)aclrtDestroyEvent(get_done_);
+      get_done_ = nullptr;
+    }
+    if (descriptor_ready_ != nullptr) {
+      (void)aclrtDestroyEvent(descriptor_ready_);
+      descriptor_ready_ = nullptr;
+    }
+  }
+
+  void CloseStreamResourceLibraryNoThrow() {
+    if (stream_resource_library_ != nullptr) {
+      (void)dlclose(stream_resource_library_);
+      stream_resource_library_ = nullptr;
+    }
+    use_stream_resource_ = nullptr;
+    unuse_stream_resource_ = nullptr;
+    get_current_thread_resource_ = nullptr;
+  }
+
+  void CloseNoThrow() {
+    // A destructor can run during Python exception/interpreter teardown, when
+    // the caller may not have supplied the final-reader event.  Releasing the
+    // HBM registration in that state would be worse than a bounded process
+    // teardown leak, so only the explicit Close() path destroys an idle lane.
+    if (!Idle()) {
+      // The worker may be blocked in a device operation or its consumer may
+      // still read the fixed HBM output.  A destructor cannot prove either
+      // completion, so it intentionally does not join or release here.
+      return;
+    }
+    StopWorkerNoThrow();
+    if (output_binding_id_ != 0) {
+      (void)access_operator_.ReleaseBatchGetOutput(output_binding_id_);
+      output_binding_id_ = 0;
+    }
+    DestroyEventsNoThrow();
+    CloseStreamResourceLibraryNoThrow();
+  }
+
+  DefaultAccessOperator& access_operator_;
+  std::uint32_t device_id_{0};
+  aclrtStream copy_stream_{nullptr};
+  bool bind_stream_resource_{false};
+  std::uint32_t expected_get_vector_cores_{0};
+  void* stream_resource_library_{nullptr};
+  UseStreamResourceFn use_stream_resource_{nullptr};
+  UseStreamResourceFn unuse_stream_resource_{nullptr};
+  GetCurrentThreadResourceFn get_current_thread_resource_{nullptr};
+  aclrtEvent descriptor_ready_{nullptr};
+  aclrtEvent get_done_{nullptr};
+  aclrtEvent terminal_done_{nullptr};
+  aclrtEvent worker_ready_{nullptr};
+  MutableBufferView output_;
+  BatchGetOutputBindingId output_binding_id_{0};
+  BatchGetRequest prepared_request_;
+  bool has_prepared_request_{false};
+  BatchGetRequest job_;
+  std::chrono::steady_clock::time_point post_time_;
+  std::chrono::steady_clock::time_point worker_start_time_;
+  std::chrono::steady_clock::time_point worker_issue_time_;
+  mutable std::mutex mu_;
+  std::condition_variable cv_;
+  std::thread worker_;
+  State state_{State::kFree};
+  bool consumer_may_read_output_{false};
+  bool stopping_{false};
+  bool worker_initialized_{false};
+  std::string worker_error_;
+};
+
 class NpuRuntime final {
  public:
   NpuRuntime(std::string batch_get_kernel_object_path, std::uint32_t device_id,
@@ -235,6 +811,7 @@ class NpuRuntime final {
   NpuRuntime& operator=(const NpuRuntime&) = delete;
 
   void Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
+    EnsureNoNativeGetLane("initialize");
     ThrowIfError(runtime_->Initialize(
         RuntimeInitRequest{ddr_bytes, slot_size, DeviceKind::kCpu}));
   }
@@ -265,6 +842,7 @@ class NpuRuntime final {
                 const std::vector<std::uint64_t>& input_offsets,
                 const std::vector<std::uint64_t>& lengths,
                 const py::object& stream) {
+    EnsureNoNativeGetLane("batch_put");
     if (!Initialized()) {
       throw std::runtime_error("Runtime has not been initialized");
     }
@@ -292,6 +870,7 @@ class NpuRuntime final {
   }
 
   AccessTableHandle PrepareAccessTable(const py::object& keys) {
+    EnsureNoNativeGetLane("prepare_access_table");
     std::vector<KeyId> copied_keys = CopyPrepareKeys(keys);
     AccessTableHandle handle;
     ThrowIfError(runtime_->PrepareAccessTable(
@@ -302,6 +881,7 @@ class NpuRuntime final {
   py::object AccessTableView(const AccessTableHandle& handle,
                              const std::string& device,
                              std::uint64_t capacity) const {
+    EnsureNoNativeGetLane("access_table_view");
     kvaf::AccessTableView view;
     ThrowIfError(runtime_->GetAccessTableView(handle, &view));
     if (device == "cpu") {
@@ -353,6 +933,7 @@ class NpuRuntime final {
   }
 
   void ReleaseAccessTable(const AccessTableHandle& handle) {
+    EnsureNoNativeGetLane("release_access_table");
     ThrowIfError(runtime_->ReleaseAccessTable(handle));
   }
 
@@ -361,15 +942,18 @@ class NpuRuntime final {
   // contiguous one-dimensional CPU torch.int64 Tensor), rather than imposing
   // a second representation solely for the NPU Runtime binding.
   void BatchFree(const py::object& keys) {
+    EnsureNoNativeGetLane("batch_free");
     std::vector<KeyId> copied_keys = CopyPrepareKeys(keys);
     ThrowIfError(runtime_->BatchFree(BatchFreeRequest{std::move(copied_keys)}));
   }
 
   void StartBatchGetKernelProfile() {
+    EnsureNoNativeGetLane("start_batch_get_kernel_profile");
     ThrowIfError(access_operator_->SetBatchGetKernelProfiling(true));
   }
 
   py::list BatchGetKernelProfileSnapshot() const {
+    EnsureNoNativeGetLane("batch_get_kernel_profile");
     std::vector<kvaf::BatchGetKernelProfile> profiles;
     ThrowIfError(access_operator_->CopyBatchGetKernelProfiles(&profiles));
     py::list result;
@@ -395,6 +979,7 @@ class NpuRuntime final {
   }
 
   py::list StopBatchGetKernelProfile() {
+    EnsureNoNativeGetLane("stop_batch_get_kernel_profile");
     py::list result = BatchGetKernelProfileSnapshot();
     ThrowIfError(access_operator_->SetBatchGetKernelProfiling(false));
     return result;
@@ -409,6 +994,7 @@ class NpuRuntime final {
                 const py::object& mask,
                 const py::object& output_indices, const py::object& output,
                 const py::object& stream, bool synchronize) {
+    EnsureNoNativeGetLane("batch_get");
     BatchGetImpl(access_table.source(), access_table.addresses(),
                  access_table.valid(), indices, offsets, mask, output_indices,
                  output, stream, synchronize);
@@ -425,18 +1011,147 @@ class NpuRuntime final {
                            const py::object& output_indices,
                            const py::object& output,
                            const py::object& stream, bool synchronize) {
+    EnsureNoNativeGetLane("batch_get");
     BatchGetImpl(AccessTableHandle{}, addresses, valid, indices, offsets, mask,
                  output_indices, output, stream, synchronize);
   }
 
+  // Eager-only host-submission escape hatch for the LI/Get overlap probe.
+  // It deliberately exposes no ticket, retry, or general scheduler: one
+  // Runtime owns one fixed HBM output, one prepared descriptor view, and one
+  // worker-owned copy stream. Before creating it, the caller must complete
+  // every earlier eager Get issued by this Runtime; Direct-HCCP queue/status
+  // state is shared and a host mutex cannot isolate an older device launch.
+  // All native-lane calls must remain on the creating host thread. This keeps
+  // the single-worker probe from racing Python-side destroy/shutdown while
+  // Arm/Reap intentionally release the GIL around their blocking portions.
+  // The public event methods only express device ordering and final-reader
+  // lifetime; callers must use record_native_get_terminal after their last
+  // consumer (QSFA in the real path) has been queued.
+  void CreateNativeGetSubmitLane(const py::object& copy_stream,
+                                 bool bind_stream_resource,
+                                 std::uint32_t expected_get_vector_cores) {
+    if (!Initialized()) {
+      throw std::runtime_error("Runtime has not been initialized");
+    }
+    if (native_get_lane_ != nullptr) {
+      EnsureNativeGetLaneOwner("create_native_get_submit_lane");
+      throw py::value_error("native Get submit lane already exists");
+    }
+    const aclrtStream raw_copy_stream = ResolveStream(copy_stream);
+    auto lane = std::make_unique<NativeGetSubmitLane>(
+        *access_operator_, device_id_, raw_copy_stream, bind_stream_resource,
+        expected_get_vector_cores);
+    ThrowIfError(lane->Initialize());
+    native_get_lane_copy_stream_keepalive_ = copy_stream;
+    native_get_lane_ = std::move(lane);
+    native_get_lane_owner_thread_ = std::this_thread::get_id();
+  }
+
+  void BindNativeGetOutput(const py::object& output) {
+    NativeGetSubmitLane& lane = RequireNativeGetLane("bind_native_get_output");
+    const NpuTensorView output_view = GetNpuTensorView(output, "native Get output");
+    if (output_view.shape.size() < 2 || output_view.shape.front() <= 0 ||
+        output_view.bytes % static_cast<std::size_t>(output_view.shape.front()) != 0 ||
+        output_view.bytes / static_cast<std::size_t>(output_view.shape.front()) !=
+            kBatchGetTransferBytes) {
+      throw py::value_error("native Get output Tensor rows must each be 656 bytes");
+    }
+    ThrowIfError(lane.BindOutput(
+        MutableBufferView{output_view.data, output_view.bytes, DeviceKind::kNpu}));
+    native_get_lane_output_keepalive_ = output;
+  }
+
+  void PrepareNativeGet(const py::object& addresses, const py::object& valid,
+                        const py::object& indices, const py::object& offsets,
+                        const py::object& mask,
+                        const py::object& output_indices,
+                        const py::object& output) {
+    NativeGetSubmitLane& lane = RequireNativeGetLane("prepare_native_get");
+    const BatchGetRequest request = BuildBatchGetRequest(
+        AccessTableHandle{}, addresses, valid, indices, offsets, mask,
+        output_indices, output);
+    // The worker sees raw pointers only. Store the Python references only
+    // after C++ accepted the prepared POD request, so a rejected re-prepare
+    // cannot drop the references of a job that is still in flight.
+    py::tuple pending_keepalive = py::make_tuple(
+        addresses, valid, indices, offsets, mask, output_indices, output);
+    ThrowIfError(lane.Prepare(request));
+    native_get_lane_request_keepalive_ = std::move(pending_keepalive);
+  }
+
+  void PostNativeGet(const py::object& producer_stream) {
+    NativeGetSubmitLane& lane = RequireNativeGetLane("post_native_get");
+    const aclrtStream raw_producer_stream = ResolveStream(producer_stream);
+    Status status;
+    {
+      py::gil_scoped_release release;
+      status = lane.Post(raw_producer_stream);
+    }
+    ThrowIfError(status);
+  }
+
+  py::dict ArmNativeGet(const py::object& consumer_stream) {
+    NativeGetSubmitLane& lane = RequireNativeGetLane("arm_native_get");
+    double post_to_worker_start_us = 0.0;
+    double worker_issue_us = 0.0;
+    double post_to_issue_us = 0.0;
+    double arm_wait_us = 0.0;
+    const aclrtStream raw_consumer_stream = ResolveStream(consumer_stream);
+    Status status;
+    {
+      py::gil_scoped_release release;
+      status = lane.Arm(raw_consumer_stream, &post_to_worker_start_us,
+                        &worker_issue_us, &post_to_issue_us, &arm_wait_us);
+    }
+    ThrowIfError(status);
+    py::dict result;
+    result["post_to_worker_start_us"] = post_to_worker_start_us;
+    result["worker_issue_us"] = worker_issue_us;
+    result["post_to_worker_issue_us"] = post_to_issue_us;
+    result["arm_wait_us"] = arm_wait_us;
+    return result;
+  }
+
+  void RecordNativeGetTerminal(const py::object& terminal_stream) {
+    NativeGetSubmitLane& lane = RequireNativeGetLane("record_native_get_terminal");
+    ThrowIfError(lane.RecordTerminal(ResolveStream(terminal_stream)));
+  }
+
+  void ReapNativeGet() {
+    NativeGetSubmitLane& lane = RequireNativeGetLane("reap_native_get");
+    Status status;
+    {
+      py::gil_scoped_release release;
+      status = lane.Reap();
+    }
+    ThrowIfError(status);
+  }
+
+  void DestroyNativeGetSubmitLane() {
+    if (native_get_lane_ == nullptr) {
+      return;
+    }
+    EnsureNativeGetLaneOwner("destroy_native_get_submit_lane");
+    Status status;
+    {
+      py::gil_scoped_release release;
+      status = native_get_lane_->Close();
+    }
+    ThrowIfError(status);
+    native_get_lane_.reset();
+    native_get_lane_owner_thread_ = std::thread::id{};
+    native_get_lane_request_keepalive_ = py::none();
+    native_get_lane_output_keepalive_ = py::none();
+    native_get_lane_copy_stream_keepalive_ = py::none();
+  }
+
  private:
-  void BatchGetImpl(const AccessTableHandle& access_table,
-                    const py::object& addresses, const py::object& valid,
-                    const py::object& indices, const py::object& offsets,
-                    const py::object& mask,
-                    const py::object& output_indices,
-                    const py::object& output, const py::object& stream,
-                    bool synchronize) {
+  BatchGetRequest BuildBatchGetRequest(
+      const AccessTableHandle& access_table, const py::object& addresses,
+      const py::object& valid, const py::object& indices,
+      const py::object& offsets, const py::object& mask,
+      const py::object& output_indices, const py::object& output) const {
     const NpuTensorView index_view = GetNpuTensorView(indices, "indices");
     const NpuTensorView offset_view = GetNpuTensorView(offsets, "offsets");
     const NpuTensorView mask_view = GetNpuTensorView(mask, "mask");
@@ -468,7 +1183,7 @@ class NpuRuntime final {
     if (output_block_bytes != kBatchGetTransferBytes) {
       throw py::value_error("BatchGet output Tensor rows must each be 656 bytes");
     }
-    const BatchGetRequest request{
+    return BatchGetRequest{
         access_table,
         ConstBufferView{index_view.data, index_view.bytes, DeviceKind::kNpu},
         ConstBufferView{offset_view.data, offset_view.bytes, DeviceKind::kNpu},
@@ -480,6 +1195,18 @@ class NpuRuntime final {
         AccessTableDeviceView{
             ConstBufferView{address_view.data, address_view.bytes, DeviceKind::kNpu},
             ConstBufferView{valid_view.data, valid_view.bytes, DeviceKind::kNpu}}};
+  }
+
+  void BatchGetImpl(const AccessTableHandle& access_table,
+                    const py::object& addresses, const py::object& valid,
+                    const py::object& indices, const py::object& offsets,
+                    const py::object& mask,
+                    const py::object& output_indices,
+                    const py::object& output, const py::object& stream,
+                    bool synchronize) {
+    const BatchGetRequest request = BuildBatchGetRequest(
+        access_table, addresses, valid, indices, offsets, mask, output_indices,
+        output);
     const aclrtStream acl_stream = ResolveStream(stream);
     ThrowIfError(runtime_->BatchGet(
         request, BatchGetExecutionOptions{acl_stream,
@@ -488,13 +1215,65 @@ class NpuRuntime final {
 
  public:
   void Shutdown() {
+    // Explicitly close the worker before Runtime tears down its transport and
+    // the cold HBM registration.  Close rejects an unretired slot rather than
+    // guessing whether a later QSFA reader is still using the payload.
+    DestroyNativeGetSubmitLane();
     if (runtime_ != nullptr && runtime_->initialized()) {
       ThrowIfError(runtime_->Shutdown());
     }
   }
 
  private:
+  NativeGetSubmitLane& RequireNativeGetLane(const char* operation) {
+    if (native_get_lane_ == nullptr) {
+      throw py::value_error(std::string(operation) +
+                            " requires create_native_get_submit_lane");
+    }
+    EnsureNativeGetLaneOwner(operation);
+    return *native_get_lane_;
+  }
+
+  void EnsureNativeGetLaneOwner(const char* operation) const {
+    if (native_get_lane_owner_thread_ != std::thread::id{} &&
+        native_get_lane_owner_thread_ != std::this_thread::get_id()) {
+      throw py::value_error(
+          std::string(operation) +
+          " must run on the host thread that created this native Get lane");
+    }
+  }
+
+  void EnsureNoNativeGetLane(const char* operation) const {
+    if (native_get_lane_ != nullptr) {
+      throw py::value_error(
+          std::string(operation) +
+          " is forbidden while native Get submit lane owns this Runtime; "
+          "reap and destroy the lane first");
+    }
+  }
+
   void CloseNoThrow() {
+    // Destruction is normally preceded by the Python-visible shutdown(),
+    // which enforces terminal completion.  Do not call Runtime::Shutdown
+    // behind a live lane during exceptional teardown: DefaultAccessOperator
+    // would release its transport while an HCCP Get might still be in flight.
+    if (native_get_lane_ != nullptr && !native_get_lane_->Idle()) {
+      // Keep Tensor/stream references alive together with the deliberately
+      // leaked emergency objects.  This branch is only an exception-safety
+      // backstop; normal callers must reap+destroy explicitly.
+      (void)native_get_lane_copy_stream_keepalive_.release();
+      (void)native_get_lane_output_keepalive_.release();
+      (void)native_get_lane_request_keepalive_.release();
+      (void)native_get_lane_.release();
+      (void)runtime_.release();
+      (void)access_operator_.release();
+      (void)allocator_.release();
+      (void)meta_manager_.release();
+      return;
+    }
+    if (native_get_lane_ != nullptr) {
+      native_get_lane_.reset();
+    }
     if (runtime_ != nullptr && runtime_->initialized()) {
       (void)runtime_->Shutdown();
     }
@@ -510,6 +1289,11 @@ class NpuRuntime final {
   std::unique_ptr<AclHostDdrAllocator> allocator_;
   std::unique_ptr<DefaultAccessOperator> access_operator_;
   std::unique_ptr<Runtime> runtime_;
+  std::unique_ptr<NativeGetSubmitLane> native_get_lane_;
+  std::thread::id native_get_lane_owner_thread_;
+  py::object native_get_lane_copy_stream_keepalive_;
+  py::object native_get_lane_output_keepalive_;
+  py::object native_get_lane_request_keepalive_;
 };
 
 }  // namespace
@@ -563,6 +1347,42 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("stop_batch_get_kernel_profile",
            &NpuRuntime::StopBatchGetKernelProfile,
            "Copy the latest timeline and disable BatchGet kernel profiling.")
+      .def("create_native_get_submit_lane",
+           &NpuRuntime::CreateNativeGetSubmitLane,
+           py::arg("copy_stream"),
+           py::arg("bind_stream_resource") = false,
+           py::arg("expected_get_vector_cores") = 0,
+           "Create the eager-only, single-worker Get submission lane. "
+           "The worker exclusively owns copy_stream submissions until "
+           "destroy_native_get_submit_lane(). The caller must first complete "
+           "all earlier eager Get work from this Runtime and use the creating "
+           "host thread for every native-lane call.")
+      .def("bind_native_get_output", &NpuRuntime::BindNativeGetOutput,
+           py::arg("output"),
+           "Cold-bind one fixed HBM output Tensor for native Get. The binding "
+           "remains live until the lane is destroyed after terminal completion.")
+      .def("prepare_native_get", &NpuRuntime::PrepareNativeGet,
+           py::arg("addresses"), py::arg("valid"), py::arg("indices"),
+           py::arg("offsets"), py::arg("mask"), py::arg("output_indices"),
+           py::arg("output"),
+           "Cold-validate and retain stable descriptor/output Tensor identities "
+           "for the native lane. Descriptor contents may be updated in-place.")
+      .def("post_native_get", &NpuRuntime::PostNativeGet,
+           py::arg("producer_stream"),
+           "Hot-post the prepared request: record descriptor readiness and wake "
+           "the C++ worker without Python Tensor validation or HBM registration.")
+      .def("arm_native_get", &NpuRuntime::ArmNativeGet,
+           py::arg("consumer_stream"),
+           "After submitting LI/QSFA, wait until the worker has recorded the "
+           "Get completion event and enqueue its dependency on consumer_stream.")
+      .def("record_native_get_terminal", &NpuRuntime::RecordNativeGetTerminal,
+           py::arg("terminal_stream"),
+           "Record the final-reader terminal on the already-armed consumer stream.")
+      .def("reap_native_get", &NpuRuntime::ReapNativeGet,
+           "Wait until the terminal event has completed and make the fixed slot reusable.")
+      .def("destroy_native_get_submit_lane",
+           &NpuRuntime::DestroyNativeGetSubmitLane,
+           "Stop the worker and release the fixed HBM binding. The slot must be reaped.")
       .def("batch_get", &NpuRuntime::BatchGet,
            py::arg("device_access_table"), py::arg("indices"), py::arg("offsets"),
            py::arg("mask"),

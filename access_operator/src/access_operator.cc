@@ -245,10 +245,20 @@ void LogBatchGetDeviceStatus(const BatchGetExecutionState& execution,
 struct DefaultAccessOperator::Impl {
   explicit Impl(AccessOperatorConfig init_config) : config(std::move(init_config)) {}
 
+  struct BoundBatchGetOutput {
+    BatchGetOutputBindingId id{0};
+    void* output{nullptr};
+    std::size_t output_bytes{0};
+    KvafBatchGetLocalBuffer* local_buffer{nullptr};
+    std::uint64_t channel_entity{0};
+  };
+
   AccessOperatorConfig config;
   RemoteRegionDesc remote_region;
   KvafBatchGetTransport* transport{nullptr};
   BatchGetExecutionState execution;
+  std::vector<BoundBatchGetOutput> bound_outputs;
+  BatchGetOutputBindingId next_bound_output_id{1};
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   KvafBatchPutTransport* batch_put_transport{nullptr};
   BatchPutExecutionState batch_put_execution;
@@ -386,6 +396,15 @@ Status DefaultAccessOperator::Shutdown() {
   }
   impl_->batch_put_transport = nullptr;
 #endif
+  // Bound outputs deliberately retain their LocalBufferAcquire reference so
+  // the decode hot path does not touch registration state.  Runtime shutdown
+  // is only legal after all caller streams have completed, so releasing here
+  // is safe and keeps transport ownership balanced.
+  for (const Impl::BoundBatchGetOutput& binding : impl_->bound_outputs) {
+    KvafBatchGetLocalBufferRelease(binding.local_buffer);
+  }
+  impl_->bound_outputs.clear();
+  impl_->next_bound_output_id = 1;
   if (impl_->transport != nullptr) {
     KvafBatchGetTransportDestroy(impl_->transport);
   }
@@ -447,6 +466,116 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
     // Releasing after an externally captured launch keeps KVAF graph-agnostic;
     // the caller owns stream completion and tensor lifetime.
     KvafBatchGetLocalBufferRelease(local_buffer);
+  }
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::BindBatchGetOutput(
+    const MutableBufferView& output, BatchGetOutputBindingId* binding_id) {
+  if (binding_id == nullptr) {
+    return InvalidArgument("BatchGet output binding id must not be null");
+  }
+  if (!impl_->initialized || impl_->transport == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  if (!output.valid() || output.device != DeviceKind::kNpu ||
+      output.bytes % kBatchGetTransferBytes != 0) {
+    return InvalidArgument(
+        "BatchGet bound output must be an NPU buffer with 656-byte rows");
+  }
+  for (const Impl::BoundBatchGetOutput& binding : impl_->bound_outputs) {
+    if (binding.output == output.data && binding.output_bytes == output.bytes) {
+      return Status::Error(
+          StatusCode::kAlreadyExists,
+          "BatchGet output is already bound; one lane owns one fixed output");
+    }
+  }
+
+  KvafBatchGetLocalBuffer* local_buffer = nullptr;
+  std::uint64_t channel_entity = 0;
+  if (KvafBatchGetLocalBufferAcquire(impl_->transport, output.data, output.bytes,
+                                     &local_buffer, &channel_entity) !=
+          KVAF_BATCH_GET_SUCCESS ||
+      local_buffer == nullptr || channel_entity == 0) {
+    if (local_buffer != nullptr) {
+      KvafBatchGetLocalBufferRelease(local_buffer);
+    }
+    return Internal("failed to bind caller output for BatchGet");
+  }
+  if (impl_->next_bound_output_id == 0) {
+    KvafBatchGetLocalBufferRelease(local_buffer);
+    return Internal("BatchGet output binding id overflow");
+  }
+  const BatchGetOutputBindingId id = impl_->next_bound_output_id++;
+  impl_->bound_outputs.push_back(
+      Impl::BoundBatchGetOutput{id, output.data, output.bytes, local_buffer,
+                                 channel_entity});
+  *binding_id = id;
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::ReleaseBatchGetOutput(
+    BatchGetOutputBindingId binding_id) {
+  if (!impl_->initialized || impl_->transport == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  const auto it = std::find_if(
+      impl_->bound_outputs.begin(), impl_->bound_outputs.end(),
+      [binding_id](const Impl::BoundBatchGetOutput& binding) {
+        return binding.id == binding_id;
+      });
+  if (it == impl_->bound_outputs.end()) {
+    return Status::NotFound("BatchGet output binding was not found");
+  }
+  KvafBatchGetLocalBufferRelease(it->local_buffer);
+  impl_->bound_outputs.erase(it);
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::ExecuteBoundBatchGet(
+    const BatchGetExecRequest& exec, BatchGetOutputBindingId binding_id) {
+  if (!impl_->initialized || impl_->transport == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  if (exec.execution.stream == nullptr) {
+    return InvalidArgument("NPU BatchGet requires a caller-owned ACL stream");
+  }
+  const auto it = std::find_if(
+      impl_->bound_outputs.begin(), impl_->bound_outputs.end(),
+      [binding_id](const Impl::BoundBatchGetOutput& binding) {
+        return binding.id == binding_id;
+      });
+  if (it == impl_->bound_outputs.end()) {
+    return Status::NotFound("BatchGet output binding was not found");
+  }
+  if (exec.request == nullptr || exec.request->output.data != it->output ||
+      exec.request->output.bytes != it->output_bytes) {
+    return InvalidArgument(
+        "bound BatchGet request output does not match its fixed HBM binding");
+  }
+
+  KvafExecuteBatchGetKernelArgs arguments{};
+  Status status = BuildBatchGetKernelArgs(
+      exec, impl_->config.npu_core_count, impl_->config.jettys_per_core,
+      impl_->execution, &arguments);
+  if (!status.ok()) {
+    return status;
+  }
+  arguments.channel_entity = it->channel_entity;
+
+  const aclrtStream stream = static_cast<aclrtStream>(exec.execution.stream);
+  if (KvafExecuteBatchGetLaunch(&arguments, stream) !=
+      KVAF_BATCH_GET_SUCCESS) {
+    return Internal("failed to launch bound BatchGet");
+  }
+  if (exec.execution.synchronize) {
+    if (aclrtSynchronizeStream(stream) != ACL_SUCCESS) {
+      return Internal("bound BatchGet stream synchronization failed");
+    }
+    LogBatchGetDeviceStatus(impl_->execution, impl_->config.npu_core_count);
   }
   return Status::OK();
 }
