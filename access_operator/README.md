@@ -20,7 +20,7 @@ caller-owned buffer 与远端 DDR 组织为一次数据搬运。它不拥有 Key
 | `ExecuteBatchPut(request)` | 已支持，同步 eager | 使用 caller-owned packed NPU `input`、每条 CPU `input_offsets/lengths` 和 Runtime `PreparePut` 返回的地址。Operator 将 metadata 上传到 NPU，调用 AIV Direct-HCCP WRITE，并在成功后由 Runtime CommitPut；失败则 Runtime AbortPut。未配置 BatchPut kernel 时保留 ACL D2H mock 供本地/BatchGet-only 构建使用。 |
 | `Shutdown()` | 已支持 | 释放两个独立 transport 及其缓存的 local HBM MR；最后一个 transport 才释放共享 RA/HDC session。调用方必须先完成所有外部 stream/graph 工作。 |
 
-当前 BatchGet 是固定大小 block 的 POC：NPU 侧 `indices`、`mask`、
+当前 BatchGet 是固定大小 block 的 POC：NPU 侧 `indices`、`miss_count`、
 `output_indices`、device AccessTable 与 `output` 都由调用方提供；`status` 和
 `queue_state` 由 Operator 内部申请。Python 通过 `DeviceAccessTable` 和 Tensor
 调用，不传裸指针/字节数。没有公开的 `BindBatchGetOutput` API。

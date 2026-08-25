@@ -17,11 +17,11 @@ registration; each HBM output is registered separately as a local UDMA range.
 | `valid_table` | `uint8[table_capacity]` | A zero entry makes its lookup invalid. |
 | `indices` | `int32[request_capacity]` | Logical entries requested by this batch. |
 | `offsets` | `int32[request_capacity]` | Byte offset inside the selected KV block. |
-| `mask` | `uint8[request_capacity]` | Zero skips that request without changing the graph shape. |
+| `miss_count` | `int32[1]` | Number of valid requests in the compact request prefix. |
 | `output_indices` | `int32[request_capacity]` | Destination row in `output`. |
 | `output` | `uint8[output_rows * token_bytes]` | Contiguous Device HBM output. |
 
-For an active request `i`, the kernel reads exactly `token_bytes` from
+For each request `i` in `[0, miss_count)`, the kernel reads exactly `token_bytes` from
 `address_table[indices[i]] + offsets[i]` and stores it at
 `output + output_indices[i] * token_bytes`. Each address-table entry spans
 `tokens_per_block * token_bytes`, so the requested token must stay within that
@@ -58,11 +58,10 @@ addresses receive a new local MR and entity table but reuse the transport.
 
 ## What is included
 
-- `kernel/execute_batch_get_aiv.asc`: SIMT-compacts requests,
-  caches each active request's table index and request ID in UB, generates 32
-  UDMA READ WQEs in parallel, and overlaps vector fill, MTE3 UB-to-SQ copies,
-  and scalar doorbells with two UB banks. It never uses MTE to dereference Host
-  DDR.
+- `kernel/execute_batch_get_aiv.asc`: partitions the compact request prefix
+  across AIV cores, generates 32 UDMA READ WQEs in parallel directly from the
+  caller-owned request arrays, and overlaps vector fill, MTE3 UB-to-SQ copies,
+  and scalar doorbells with two UB banks. It never uses MTE to dereference Host DDR.
 - `host/batch_get_host.cpp`: CPU/device EID discovery, Direct-HCCP transport,
   Host-DDR registration, per-output HBM-MR cache, and up to two private
   USER_CTL SQ/CQ/Jettys per AIV.
@@ -81,11 +80,11 @@ The data path keeps the public KVAF ABI and the verified Direct-HCCP WQE token
 fields. It does not copy the AIV_URMA benchmark's server/client handshake,
 control-region writes, fixed 64K request shape, or per-launch CQ reset.
 
-Each AIV compacts its complete request partition once into parallel 16384-entry
-UB arrays containing the active table indices and original request IDs. The
-caller must guarantee that each AIV owns at most 16384 mask entries whose value
-is nonzero. Before touching the SQ, the kernel rejects an active count beyond
-that capacity or a per-Jetty assignment that fills the entire SQ.
+The caller compacts valid requests into `[0, miss_count)` before submission.
+The kernel validates `miss_count` against `request_capacity`, partitions that
+prefix directly across AIV cores, and reads `indices`, `offsets`, and
+`output_indices` from global memory while materializing WQEs. Before touching
+the SQ, it rejects a per-Jetty assignment that fills the entire SQ.
 The phase-two scheduler assigns complete 32-WQE posts to the core's Jettys in
 round-robin order. Each Jetty has an independent persistent SQ producer and CQ
 consumer index. Only the last READ assigned to each used Jetty requests a CQE;
@@ -95,7 +94,7 @@ submitted through another Jetty. A core with one post uses only Jetty 0, while
 the one-Jetty phase-one path remains selectable with `JETTYS_PER_CORE=1`.
 
 The ACL launcher explicitly reserves 160 KiB of AIV local memory for the two
-WQE banks, compacted table-index/request-ID arrays and SIMT validation scratch.
+WQE banks and optional SIMT validation scratch.
 
 ## Build and validate on A5
 
@@ -132,7 +131,7 @@ graph output through `KvafBatchGetLocalBufferAcquire(transport, output, ...)`.
 That call returns an opaque local-buffer handle and a device entity table whose
 local HBM address/token match `args.output`; capture contains only the AIV
 kernel launch. One graph therefore serves replay-time changes to addresses,
-validity, request indices, offsets, mask and output rows. A different output allocation
+validity, request indices, offsets, miss count and output rows. A different output allocation
 uses its own acquire result and graph instance; eager launches may select any
 cached acquire result at runtime. A capacity, block-size, AIV-count or
 Jetty-count change also needs a new session/captured graph. After all stream

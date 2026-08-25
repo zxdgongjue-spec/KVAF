@@ -53,7 +53,7 @@ def percentile(values: list[float], fraction: float) -> float:
 
 def validate_output(
     output: bytes,
-    mask: Iterable[int],
+    request_enabled: Iterable[int],
     output_indices: Iterable[int],
     payload_slots: Iterable[int | None],
     token_bytes: int,
@@ -61,7 +61,7 @@ def validate_output(
     zero_block = bytes(token_bytes)
     payload_cache: dict[int, bytes] = {}
     for request, (enabled, row, payload_slot) in enumerate(
-        zip(mask, output_indices, payload_slots)
+        zip(request_enabled, output_indices, payload_slots)
     ):
         offset = row * token_bytes
         actual = output[offset : offset + token_bytes]
@@ -162,12 +162,12 @@ def main() -> int:
 
     # A sparse Device AccessTable can be much larger than the number of valid
     # remote KV blocks. Only active requests receive a valid table entry; all
-    # masked-out requests are ignored by the kernel.
-    mask_values = [1 if request % 100 < active_percent else 0 for request in range(requests)]
-    active_request_positions = [
-        request for request, enabled in enumerate(mask_values) if enabled
-    ]
-    active_requests = len(active_request_positions)
+    # requests outside the compact active prefix are ignored by the kernel.
+    active_requests = sum(
+        1 for request in range(requests) if request % 100 < active_percent
+    )
+    active_request_positions = list(range(active_requests))
+    request_enabled = [1] * active_requests + [0] * (requests - active_requests)
     if active_requests > table_capacity:
         print(
             "FAIL: KVAF_NPU_TABLE_CAPACITY must be at least the number of active requests",
@@ -175,7 +175,7 @@ def main() -> int:
         )
         return 2
     # Runtime creates a capacity-sized NPU AccessTable. Valid entries occupy
-    # its compact prefix; masked requests use index zero because their lookup
+    # its compact prefix; inactive requests use index zero because their lookup
     # is skipped by the AIV kernel.
     indices_values = [0] * requests
     offsets_values = [0] * requests
@@ -325,7 +325,7 @@ def main() -> int:
         )
         indices = torch.tensor(indices_values, dtype=torch.int32, device=device)
         offsets = torch.tensor(offsets_values, dtype=torch.int32, device=device)
-        mask = torch.tensor(mask_values, dtype=torch.uint8, device=device)
+        miss_count = torch.tensor([active_requests], dtype=torch.int32, device=device)
         output_indices = torch.tensor(output_indices_values, dtype=torch.int32, device=device)
         output_a = torch.zeros(
             (output_rows, token_bytes), dtype=torch.uint8, device=device
@@ -340,7 +340,7 @@ def main() -> int:
                 valid_table,
                 indices,
                 offsets,
-                mask,
+                miss_count,
                 output_indices,
                 output,
                 stream,
@@ -350,7 +350,7 @@ def main() -> int:
         execute(output_a)
         torch.npu.synchronize()
         validate_output(
-            tensor_to_bytes(output_a), mask_values, output_indices_values,
+            tensor_to_bytes(output_a), request_enabled, output_indices_values,
             payload_slots, token_bytes
         )
         print(f"RUNTIME_NPU_BATCH_GET_VALIDATION_PASS requests={requests}")
@@ -361,13 +361,13 @@ def main() -> int:
         execute(output_b)
         torch.npu.synchronize()
         validate_output(
-            tensor_to_bytes(output_b), mask_values, output_indices_values,
+            tensor_to_bytes(output_b), request_enabled, output_indices_values,
             payload_slots, token_bytes
         )
         execute(output_a)
         torch.npu.synchronize()
         validate_output(
-            tensor_to_bytes(output_a), mask_values, output_indices_values,
+            tensor_to_bytes(output_a), request_enabled, output_indices_values,
             payload_slots, token_bytes
         )
         print("RUNTIME_NPU_DYNAMIC_OUTPUT_VALIDATION_PASS sequence=A_B_A")
@@ -383,7 +383,7 @@ def main() -> int:
             samples.append((time.perf_counter() - begin) * 1000.0)
         print("RUNTIME_NPU_PHASE_BEGIN phase=post_perf_validation")
         validate_output(
-            tensor_to_bytes(output_a), mask_values, output_indices_values,
+            tensor_to_bytes(output_a), request_enabled, output_indices_values,
             payload_slots, token_bytes
         )
         print("RUNTIME_NPU_PHASE_DONE phase=post_perf_validation")
@@ -438,11 +438,12 @@ def main() -> int:
             graph_address_table_host = bytearray(tensor_bytes(address_table))
             graph_indices_host = array("i", indices_values)
             graph_offsets_host = array("i", offsets_values)
-            graph_mask_host = bytearray(mask_values)
+            graph_miss_count_host = array("i", [active_requests])
             graph_output_indices_host = array("i", output_indices_values)
             if (
                 graph_indices_host.itemsize != 4
                 or graph_offsets_host.itemsize != 4
+                or graph_miss_count_host.itemsize != 4
                 or graph_output_indices_host.itemsize != 4
             ):
                 raise AssertionError("graph int32 staging requires four-byte Python ints")
@@ -485,7 +486,8 @@ def main() -> int:
                     graph_offsets_host, capture_stream
                 )
                 graph.copy_host_to_device_async(
-                    int(mask.data_ptr()), tensor_bytes(mask), graph_mask_host,
+                    int(miss_count.data_ptr()), tensor_bytes(miss_count),
+                    graph_miss_count_host,
                     capture_stream
                 )
                 graph.copy_host_to_device_async(
@@ -500,7 +502,7 @@ def main() -> int:
                 f"address_table_bytes={len(graph_address_table_host)} "
                 f"indices_bytes={len(graph_indices_host) * graph_indices_host.itemsize} "
                 f"offsets_bytes={len(graph_offsets_host) * graph_offsets_host.itemsize} "
-                f"mask_bytes={len(graph_mask_host)} "
+                f"miss_count_bytes={len(graph_miss_count_host) * graph_miss_count_host.itemsize} "
                 f"output_indices_bytes={len(graph_output_indices_host) * graph_output_indices_host.itemsize}"
             )
             print("RUNTIME_NPU_PHASE_BEGIN phase=graph_capture")
@@ -554,7 +556,7 @@ def main() -> int:
                 print(f"RUNTIME_NPU_GRAPH_STREAM_DONE replay={replay}")
                 validate_output(
                     tensor_to_bytes(output_a),
-                    mask_values,
+                    request_enabled,
                     output_indices_values,
                     graph_payload_slots,
                     token_bytes,
@@ -600,7 +602,7 @@ def main() -> int:
             )
             validate_output(
                 tensor_to_bytes(output_a),
-                mask_values,
+                request_enabled,
                 output_indices_values,
                 graph_payload_slots,
                 token_bytes,

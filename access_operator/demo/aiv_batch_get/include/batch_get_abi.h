@@ -77,14 +77,14 @@ typedef struct KvafBatchGetDirectUrmaEntity {
 
 // Fixed-shape graph ABI. `output` and `channel_entity` must identify the same
 // LocalBufferAcquire result. During capture/replay both addresses stay fixed;
-// address/valid/index/offset/mask/output-index contents may change between
+// address/valid/index/offset/miss-count/output-index contents may change between
 // replays.
 typedef struct KvafExecuteBatchGetKernelArgs {
   uint64_t address_table;       // uint64[table_capacity], absolute Host DDR UBA
   uint64_t valid_table;         // uint8[table_capacity]
   uint64_t indices;             // int32[request_capacity]
   uint64_t offsets;             // int32[request_capacity], byte offset in entry
-  uint64_t mask;                // uint8[request_capacity]
+  uint64_t miss_count;          // int32[1], valid request-prefix length
   uint64_t output_indices;      // int32[request_capacity]
   uint64_t output;              // caller-owned HBM output; must match entity
   uint64_t core_status;         // KvafBatchGetCoreStatus[block_count]

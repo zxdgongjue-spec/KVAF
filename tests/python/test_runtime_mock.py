@@ -67,6 +67,7 @@ class RuntimeMockTests(unittest.TestCase):
             table,
             indices=[1, 0],
             offsets=[0, 0],
+            miss_count=2,
             output_indices=[0, 1],
             output=output,
             output_block_bytes=8,
@@ -102,7 +103,7 @@ class RuntimeMockTests(unittest.TestCase):
         self.batch_put([7], [self.payload([187])])
         table = self.kvaf.prepare_access_table([7])
         output = bytearray(4)
-        self.kvaf.batch_get(table, [0], [0], [0], output, output_block_bytes=4)
+        self.kvaf.batch_get(table, [0], [0], 1, [0], output, output_block_bytes=4)
         self.assertEqual(output, bytes.fromhex("bb000000"))
         self.kvaf.release_access_table(table)
 
@@ -112,9 +113,13 @@ class RuntimeMockTests(unittest.TestCase):
         table = self.kvaf.prepare_access_table([9])
         self.kvaf._fail_next_get()
         with self.assertRaises(RuntimeError):
-            self.kvaf.batch_get(table, [0], [0], [0], bytearray(4), output_block_bytes=4)
+            self.kvaf.batch_get(
+                table, [0], [0], 1, [0], bytearray(4), output_block_bytes=4
+            )
         with self.assertRaises(ValueError):
-            self.kvaf.batch_get(table, [1], [0], [0], bytearray(4), output_block_bytes=4)
+            self.kvaf.batch_get(
+                table, [1], [0], 1, [0], bytearray(4), output_block_bytes=4
+            )
         # A data-plane failure does not leak the stable-read lock.
         self.kvaf.release_access_table(table)
         self.kvaf.batch_free([9])
@@ -129,7 +134,9 @@ class RuntimeMockTests(unittest.TestCase):
         table = self.kvaf.prepare_access_table([1])
         self.kvaf.shutdown()
         with self.assertRaises(RuntimeError):
-            self.kvaf.batch_get(table, [0], [0], [0], bytearray(4), output_block_bytes=4)
+            self.kvaf.batch_get(
+                table, [0], [0], 1, [0], bytearray(4), output_block_bytes=4
+            )
 
     def test_get_uses_configured_token_size_and_block_layout(self) -> None:
         token_bytes = 7
@@ -143,14 +150,45 @@ class RuntimeMockTests(unittest.TestCase):
         table = self.kvaf.prepare_access_table([17])
         output = bytearray(token_bytes)
         self.kvaf.batch_get(
-            table, indices=[0], offsets=[token_bytes], output_indices=[0],
+            table, indices=[0], offsets=[token_bytes], miss_count=1,
+            output_indices=[0],
             output=output, output_block_bytes=token_bytes,
         )
         self.assertEqual(output, bytes([0x22]) * token_bytes)
         with self.assertRaises(ValueError):
             self.kvaf.batch_get(
-                table, indices=[0], offsets=[block_bytes], output_indices=[0],
+                table, indices=[0], offsets=[block_bytes], miss_count=1,
+                output_indices=[0],
                 output=bytearray(token_bytes), output_block_bytes=token_bytes,
+            )
+        self.kvaf.release_access_table(table)
+
+    def test_get_processes_only_miss_count_prefix(self) -> None:
+        self.kvaf.initialize(ddr_bytes=64, slot_size=64)
+        self.batch_put([21], [self.payload([0x11, 0x22, 0x33, 0x44])])
+        table = self.kvaf.prepare_access_table([21])
+
+        output = bytearray(8)
+        self.kvaf.batch_get(
+            table,
+            indices=[0, 999],
+            offsets=[0, -1],
+            miss_count=1,
+            output_indices=[0, 999],
+            output=output,
+            output_block_bytes=4,
+        )
+        self.assertEqual(output, bytes.fromhex("1122334400000000"))
+
+        with self.assertRaises(ValueError):
+            self.kvaf.batch_get(
+                table,
+                indices=[0, 0],
+                offsets=[0, 0],
+                miss_count=3,
+                output_indices=[0, 1],
+                output=bytearray(8),
+                output_block_bytes=4,
             )
         self.kvaf.release_access_table(table)
 
