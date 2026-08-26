@@ -668,6 +668,17 @@ Status DefaultAccessOperator::BindFusedBatchGetControl(
     return InvalidArgument("invalid fused BatchGet control/output state");
   }
 
+  // `control` is usually created by torch.zeros on the caller's current
+  // stream.  That fill is asynchronous.  The raw ACL H2D copy below is not
+  // ordered with the PyTorch stream, so without this cold-boundary drain the
+  // earlier zero-fill can complete after the copy and erase the whole control
+  // block.  This API is deliberately outside graph replay: pay the device
+  // fence once here, then publish a stable control block for every replay.
+  if (aclrtSynchronizeDevice() != ACL_SUCCESS) {
+    return Internal(
+        "failed to synchronize device before binding fused BatchGet control");
+  }
+
   KvafBatchGetLocalBuffer* local_buffer = nullptr;
   std::uint64_t channel_entity = 0U;
   if (KvafBatchGetLocalBufferAcquire(impl_->transport, output.data,
@@ -698,6 +709,15 @@ Status DefaultAccessOperator::BindFusedBatchGetControl(
       ACL_SUCCESS) {
     KvafBatchGetLocalBufferRelease(local_buffer);
     return Internal("failed to write fused BatchGet device control");
+  }
+
+  // Keep publication atomic from the caller's perspective: do not mark the
+  // binding active until the complete 128-byte control block is visible in
+  // HBM.  This is still a one-time cold lifecycle cost.
+  if (aclrtSynchronizeDevice() != ACL_SUCCESS) {
+    KvafBatchGetLocalBufferRelease(local_buffer);
+    return Internal(
+        "failed to synchronize device after binding fused BatchGet control");
   }
 
   impl_->fused_control = Impl::FusedBatchGetControlBinding{
