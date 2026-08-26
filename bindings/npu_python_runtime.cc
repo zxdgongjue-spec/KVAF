@@ -1254,7 +1254,8 @@ class NpuRuntime final {
   // object with hidden host state: the fused kernel can load every pointer it
   // needs directly from HBM during graph replay.
   void BindFusedBatchGetControl(const py::object& output,
-                                const py::object& control) {
+                                const py::object& control,
+                                const py::object& producer_stream) {
     EnsureNoNativeGetLane("bind_fused_batch_get_control");
     if (!Initialized()) {
       throw std::runtime_error("Runtime has not been initialized");
@@ -1262,6 +1263,16 @@ class NpuRuntime final {
     if (fused_batch_get_control_bound_) {
       throw py::value_error("fused BatchGet control is already bound");
     }
+    // The control and output tensors are normally allocated or prepared on a
+    // PyTorch stream.  BindFusedBatchGetControl publishes the cold control
+    // block with raw ACL calls, which do not inherit that stream's ordering.
+    // Drain the explicit producer stream first so an earlier torch.zeros (or
+    // any caller-side initialization) cannot later overwrite the KVAF copy.
+    // This is a one-time lifecycle fence before graph capture, never a replay
+    // path synchronization.
+    const aclrtStream raw_producer_stream = ResolveStream(producer_stream);
+    ThrowIfAclError(aclrtSynchronizeStream(raw_producer_stream),
+                    "aclrtSynchronizeStream before fused BatchGet bind");
     const NpuTensorView output_view =
         GetNpuTensorView(output, "fused BatchGet output");
     const NpuTensorView control_view =
@@ -1577,12 +1588,14 @@ void BindNpuPythonRuntime(py::module_& module) {
            "Stop the worker and release the fixed HBM binding. The slot must be reaped.")
       .def("bind_fused_batch_get_control",
            &NpuRuntime::BindFusedBatchGetControl, py::arg("output"),
-           py::arg("control"),
+           py::arg("control"), py::arg("producer_stream") = py::none(),
            "Cold-bind fixed output HBM and write a graph-stable uint64[16] "
            "Direct-HCCP control block for the two-lane fused Get path. "
            "Requires Runtime npu_core_count=2 and jettys_per_core=1; ordinary "
            "and native-lane BatchGet remain unavailable until release. The "
-           "caller must first complete earlier ordinary Get work from this Runtime.")
+           "caller must first complete earlier ordinary Get work from this Runtime. "
+           "producer_stream orders any earlier PyTorch writes to output/control; "
+           "None selects torch.npu.current_stream().")
       .def("release_fused_batch_get_control",
            &NpuRuntime::ReleaseFusedBatchGetControl,
            "Release the fused Get HBM registration after the final fused "
