@@ -1334,6 +1334,7 @@ class NpuRuntime final {
   void BindStreamingBatchGetControl(const py::sequence& layer_ids,
                                     const py::sequence& outputs,
                                     const py::sequence& controls,
+                                    const py::object& queue_leases,
                                     std::uint32_t queue_count,
                                     const py::object& producer_stream) {
     EnsureNoNativeGetLane("bind_streaming_batch_get_control");
@@ -1348,6 +1349,15 @@ class NpuRuntime final {
       throw py::value_error(
           "streaming BatchGet layer_ids, outputs, and controls must be "
           "non-empty sequences of equal length");
+    }
+    const NpuTensorView queue_leases_view =
+        GetNpuTensorView(queue_leases, "streaming BatchGet queue_leases");
+    if (queue_leases_view.shape.size() != 1 ||
+        queue_leases_view.element_bytes != sizeof(std::int32_t) ||
+        queue_leases_view.shape.front() != static_cast<std::int64_t>(queue_count) ||
+        py::str(queue_leases.attr("dtype")).cast<std::string>() != "torch.int32") {
+      throw py::value_error(
+          "streaming BatchGet queue_leases must be a contiguous NPU torch.int32[queue_count]");
     }
 
     std::vector<StreamingBatchGetLayerBinding> bindings;
@@ -1386,11 +1396,15 @@ class NpuRuntime final {
     const aclrtStream raw_producer_stream = ResolveStream(producer_stream);
     ThrowIfAclError(aclrtSynchronizeStream(raw_producer_stream),
                     "aclrtSynchronizeStream before streaming BatchGet bind");
-    ThrowIfError(access_operator_->BindStreamingBatchGetControl(bindings,
-                                                                 queue_count));
+    ThrowIfError(access_operator_->BindStreamingBatchGetControl(
+        bindings,
+        MutableBufferView{queue_leases_view.data, queue_leases_view.bytes,
+                          DeviceKind::kNpu},
+        queue_count));
     streaming_batch_get_control_bound_ = true;
     streaming_batch_get_output_keepalives_ = std::move(output_keepalives);
     streaming_batch_get_control_keepalives_ = std::move(control_keepalives);
+    streaming_batch_get_queue_leases_keepalive_ = queue_leases;
   }
 
   // Publish the graph-stable descriptor-pointer table for every queue of
@@ -1543,6 +1557,7 @@ class NpuRuntime final {
     streaming_batch_get_output_keepalives_.clear();
     streaming_batch_get_control_keepalives_.clear();
     streaming_batch_get_template_keepalives_.clear();
+    streaming_batch_get_queue_leases_keepalive_ = py::none();
   }
 
   std::string StreamingBatchGetControlDiagnostic() const {
@@ -1754,6 +1769,7 @@ class NpuRuntime final {
       LeakPyObjects(&streaming_batch_get_output_keepalives_);
       LeakPyObjects(&streaming_batch_get_control_keepalives_);
       LeakPyObjects(&streaming_batch_get_template_keepalives_);
+      (void)streaming_batch_get_queue_leases_keepalive_.release();
       (void)runtime_.release();
       (void)access_operator_.release();
       (void)allocator_.release();
@@ -1790,6 +1806,7 @@ class NpuRuntime final {
   std::vector<py::object> streaming_batch_get_output_keepalives_;
   std::vector<py::object> streaming_batch_get_control_keepalives_;
   std::vector<py::object> streaming_batch_get_template_keepalives_;
+  py::object streaming_batch_get_queue_leases_keepalive_;
 };
 
 }  // namespace
@@ -1900,14 +1917,15 @@ void BindNpuPythonRuntime(py::module_& module) {
            "consumer has completed. This method does not synchronize a stream.")
       .def("bind_streaming_batch_get_control",
            &NpuRuntime::BindStreamingBatchGetControl, py::arg("layer_ids"),
-           py::arg("outputs"), py::arg("controls"),
+           py::arg("outputs"), py::arg("controls"), py::arg("queue_leases"),
            py::arg("queue_count"),
            py::arg("producer_stream") = py::none(),
            "Cold-bind a complete layer-keyed streaming Direct-HCCP table. "
            "layer_ids, outputs, and controls are equal-length non-empty sequences; "
            "each control is a graph-stable NPU torch.int64[16] "
-           "KvafStreamingBatchGetControl. All layers share one int32 queue-pool "
-           "lease table of queue_count entries; any LI producer may lease a queue. "
+           "KvafStreamingBatchGetControl. queue_leases is the graph-visible "
+           "NPU torch.int32[queue_count] table written by LI atomics and used "
+           "verbatim by the control; any LI producer may lease a queue. "
            "No layer can be hot-rebound: release the entire table only after all "
            "terminal readers complete. ordinary and native-lane BatchGet remain "
            "unavailable while the table is live.")

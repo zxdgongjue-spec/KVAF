@@ -202,6 +202,14 @@ class DefaultAccessOperator final : public AccessOperator {
   // Cold-bind a fixed set of per-layer Direct-HCCP outputs and controls for a
   // streaming fused operator. Each layer receives its own LocalBufferAcquire
   // registration and KvafStreamingBatchGetControl uint64[16] control.
+  //
+  // `queue_leases` is caller-owned graph-visible NPU int32[queue_count]
+  // storage.  The device LI producer atomically acquires entries in this
+  // exact allocation, so it must be the same allocation that the captured
+  // graph passes to the streaming LI op.  Keeping leases internal to KVAF
+  // would make control.queue_leases differ from the graph resource and would
+  // either silently disable the device-side path or make its lifetime
+  // unverifiable.
   // `layer_id` is a caller
   // supplied stable key; it must be unique in this table.  There is no
   // per-layer hot rebind: release the whole table after the terminal reader,
@@ -213,6 +221,7 @@ class DefaultAccessOperator final : public AccessOperator {
   // same Direct-HCCP SQ/CQ state.
   Status BindStreamingBatchGetControl(
       const std::vector<StreamingBatchGetLayerBinding>& layers,
+      const MutableBufferView& queue_leases,
       std::uint32_t queue_count);
   Status ConfigureStreamingBatchGetQueueTemplates(
       const std::vector<StreamingBatchGetLayerTemplates>& layers);

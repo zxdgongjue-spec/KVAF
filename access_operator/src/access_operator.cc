@@ -950,6 +950,7 @@ Status DefaultAccessOperator::ReleaseFusedBatchGetControl() {
 
 Status DefaultAccessOperator::BindStreamingBatchGetControl(
     const std::vector<StreamingBatchGetLayerBinding>& layers,
+    const MutableBufferView& queue_leases,
     std::uint32_t queue_count) {
   if (!impl_->initialized || impl_->transport == nullptr) {
     return Status::Error(StatusCode::kNotInitialized,
@@ -1040,24 +1041,30 @@ Status DefaultAccessOperator::BindStreamingBatchGetControl(
   const std::size_t queue_lease_bytes =
       static_cast<std::size_t>(queue_count) *
       KVAF_STREAMING_BATCH_GET_QUEUE_LEASE_BYTES;
+  if (queue_leases.kind != DeviceKind::kNpu || queue_leases.data == nullptr ||
+      queue_leases.bytes != queue_lease_bytes) {
+    return InvalidArgument(
+        "streaming BatchGet queue_leases must be one graph-visible NPU "
+        "int32 entry per queue");
+  }
+  for (const StreamingBatchGetLayerBinding& layer : layers) {
+    if (BufferRangesOverlap(queue_leases, layer.output) ||
+        BufferRangesOverlap(queue_leases, layer.control)) {
+      return InvalidArgument(
+          "streaming BatchGet queue_leases must not alias a layer output or control");
+    }
+  }
   const std::size_t descriptor_scratch_bytes =
       static_cast<std::size_t>(queue_count) *
       sizeof(KvafStreamingBatchGetDescriptorScratch);
-  void* queue_leases = nullptr;
   void* descriptor_scratch = nullptr;
-  if (aclrtMalloc(&queue_leases, queue_lease_bytes,
-                  ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
-      queue_leases == nullptr ||
-      aclrtMemset(queue_leases, queue_lease_bytes, 0,
+  if (aclrtMemset(queue_leases.data, queue_lease_bytes, 0,
                   queue_lease_bytes) != ACL_SUCCESS ||
       aclrtMalloc(&descriptor_scratch, descriptor_scratch_bytes,
                   ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
       descriptor_scratch == nullptr ||
       aclrtMemset(descriptor_scratch, descriptor_scratch_bytes, 0,
                   descriptor_scratch_bytes) != ACL_SUCCESS) {
-    if (queue_leases != nullptr) {
-      (void)aclrtFree(queue_leases);
-    }
     if (descriptor_scratch != nullptr) {
       (void)aclrtFree(descriptor_scratch);
     }
@@ -1067,7 +1074,7 @@ Status DefaultAccessOperator::BindStreamingBatchGetControl(
 
   std::vector<Impl::StreamingBatchGetLayerControlBinding> pending;
   pending.reserve(layers.size());
-  const auto release_pending = [&pending, &queue_leases, &descriptor_scratch]() {
+  const auto release_pending = [&pending, &descriptor_scratch]() {
     for (const Impl::StreamingBatchGetLayerControlBinding& bound : pending) {
       if (bound.descriptor_templates != nullptr) {
         (void)aclrtFree(bound.descriptor_templates);
@@ -1075,10 +1082,6 @@ Status DefaultAccessOperator::BindStreamingBatchGetControl(
       KvafBatchGetLocalBufferRelease(bound.local_buffer);
     }
     pending.clear();
-    if (queue_leases != nullptr) {
-      (void)aclrtFree(queue_leases);
-      queue_leases = nullptr;
-    }
     if (descriptor_scratch != nullptr) {
       (void)aclrtFree(descriptor_scratch);
       descriptor_scratch = nullptr;
@@ -1128,7 +1131,7 @@ Status DefaultAccessOperator::BindStreamingBatchGetControl(
     host_control.queue_state = PointerValue(impl_->execution.queue_state);
     host_control.core_status = PointerValue(impl_->execution.status);
     host_control.output = PointerValue(layer.output.data);
-    host_control.queue_leases = PointerValue(queue_leases);
+    host_control.queue_leases = PointerValue(queue_leases.data);
     host_control.descriptor_scratch = PointerValue(descriptor_scratch);
     host_control.queue_count = queue_count;
     // `output` must stay the complete LocalBufferAcquire base because the
@@ -1170,7 +1173,9 @@ Status DefaultAccessOperator::BindStreamingBatchGetControl(
         "failed to synchronize device after binding streaming BatchGet control");
   }
   impl_->streaming_control.layers = std::move(pending);
-  impl_->streaming_control.queue_leases = queue_leases;
+  // queue_leases is caller owned and kept alive by NpuRuntime.  Do not free
+  // it in ReleaseStreamingBatchGetControl; the caller owns its graph tensor.
+  impl_->streaming_control.queue_leases = queue_leases.data;
   impl_->streaming_control.queue_lease_bytes = queue_lease_bytes;
   impl_->streaming_control.descriptor_scratch = descriptor_scratch;
   impl_->streaming_control.descriptor_scratch_bytes = descriptor_scratch_bytes;
@@ -1395,9 +1400,6 @@ Status DefaultAccessOperator::ReleaseStreamingBatchGetControl() {
       (void)aclrtFree(bound.descriptor_templates);
     }
     KvafBatchGetLocalBufferRelease(bound.local_buffer);
-  }
-  if (impl_->streaming_control.queue_leases != nullptr) {
-    (void)aclrtFree(impl_->streaming_control.queue_leases);
   }
   if (impl_->streaming_control.descriptor_scratch != nullptr) {
     (void)aclrtFree(impl_->streaming_control.descriptor_scratch);
