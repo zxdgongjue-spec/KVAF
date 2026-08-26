@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -141,6 +142,174 @@ bool FitsU32(std::uint64_t value) {
   return value <= std::numeric_limits<std::uint32_t>::max();
 }
 
+Status ValidateFusedBatchGetQueueCount(const AccessOperatorConfig& config,
+                                       std::uint32_t queue_count) {
+  if (queue_count == 0U ||
+      queue_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES) {
+    return InvalidArgument(
+        "fused BatchGet queue_count must be in [1, "
+        + std::to_string(KVAF_AIV_BATCH_GET_MAX_AIV_CORES) + "]");
+  }
+  if (queue_count > config.npu_core_count) {
+    return InvalidArgument(
+        "fused BatchGet queue_count=" + std::to_string(queue_count) +
+        " exceeds Runtime npu_core_count=" +
+        std::to_string(config.npu_core_count));
+  }
+  // The device-side Begin/TryRetire/Finish primitive treats one selected
+  // worker as one AIV-owned USER_CTL SQ/CQ pair.  It does not yet carry a
+  // per-worker Jetty selector, so a fused control must keep this dimension
+  // fixed at one even when an ordinary Runtime was configured differently.
+  if (config.jettys_per_core != 1U) {
+    return InvalidArgument(
+        "fused BatchGet control requires jettys_per_core=1; "
+        "queue_count selects one Direct-HCCP queue per worker");
+  }
+  return Status::OK();
+}
+
+Status ValidateFusedBatchGetBuffers(const MutableBufferView& output,
+                                    const MutableBufferView& control,
+                                    const char* binding_name) {
+  if (!output.valid() || output.device != DeviceKind::kNpu ||
+      output.bytes % kBatchGetTransferBytes != 0U) {
+    return InvalidArgument(std::string(binding_name) +
+                           " output must be an NPU buffer with 656-byte rows");
+  }
+  if (output.bytes / kBatchGetTransferBytes >
+      std::numeric_limits<std::uint32_t>::max()) {
+    return InvalidArgument(std::string(binding_name) +
+                           " output row count exceeds the device uint32 ABI");
+  }
+  if (!control.valid() || control.device != DeviceKind::kNpu ||
+      control.bytes != sizeof(KvafFusedBatchGetControl)) {
+    return InvalidArgument(std::string(binding_name) +
+                           " control must be an NPU uint64[16] buffer");
+  }
+  if (output.data == control.data) {
+    return InvalidArgument(std::string(binding_name) +
+                           " output and control must not alias");
+  }
+  return Status::OK();
+}
+
+Status ValidateStreamingBatchGetBuffers(const MutableBufferView& output,
+                                        const MutableBufferView& control,
+                                        const char* binding_name) {
+  if (!output.valid() || output.device != DeviceKind::kNpu ||
+      output.bytes % kBatchGetTransferBytes != 0U) {
+    return InvalidArgument(std::string(binding_name) +
+                           " output must be an NPU buffer with 656-byte rows");
+  }
+  if (output.bytes / kBatchGetTransferBytes >
+      std::numeric_limits<std::uint32_t>::max()) {
+    return InvalidArgument(std::string(binding_name) +
+                           " output row count exceeds the device uint32 ABI");
+  }
+  if (!control.valid() || control.device != DeviceKind::kNpu ||
+      control.bytes != sizeof(KvafStreamingBatchGetControl)) {
+    return InvalidArgument(std::string(binding_name) +
+                           " control must be an NPU uint64[16] buffer");
+  }
+  if (output.data == control.data) {
+    return InvalidArgument(std::string(binding_name) +
+                           " output and control must not alias");
+  }
+  return Status::OK();
+}
+
+bool BufferRangesOverlap(const MutableBufferView& left,
+                         const MutableBufferView& right) {
+  if (!left.valid() || !right.valid()) {
+    return false;
+  }
+  const std::uint64_t left_begin = PointerValue(left.data);
+  const std::uint64_t right_begin = PointerValue(right.data);
+  if (left.bytes > std::numeric_limits<std::uint64_t>::max() - left_begin ||
+      right.bytes > std::numeric_limits<std::uint64_t>::max() - right_begin) {
+    // Treat an unrepresentable range as overlapping so the caller fails
+    // closed rather than accepting an ambiguous HBM address span.
+    return true;
+  }
+  const std::uint64_t left_end = left_begin + left.bytes;
+  const std::uint64_t right_end = right_begin + right.bytes;
+  return left_begin < right_end && right_begin < left_end;
+}
+
+bool SameBufferRange(const MutableBufferView& left,
+                     const MutableBufferView& right) {
+  return left.data == right.data && left.bytes == right.bytes &&
+         left.device == right.device;
+}
+
+Status BuildStreamingBatchGetQueueTemplate(
+    const StreamingBatchGetQueueTemplate& source, std::uint32_t queue_count,
+    std::uint64_t private_output_rows,
+    KvafStreamingBatchGetDescriptorScratch* destination,
+    const std::string& label) {
+  if (destination == nullptr || source.queue_id >= queue_count ||
+      private_output_rows == 0U) {
+    return InvalidArgument(label + " has an invalid queue id or private arena");
+  }
+  const MutableBufferView* const buffers[] = {
+      &source.address_table, &source.valid_table, &source.indices,
+      &source.offsets, &source.mask, &source.output_indices};
+  for (const MutableBufferView* buffer : buffers) {
+    if (buffer == nullptr || !buffer->valid() ||
+        buffer->device != DeviceKind::kNpu) {
+      return InvalidArgument(label + " requires non-empty NPU descriptor buffers");
+    }
+  }
+  if (source.address_table.bytes % sizeof(std::uint64_t) != 0U ||
+      source.valid_table.bytes !=
+          source.address_table.bytes / sizeof(std::uint64_t) ||
+      source.indices.bytes % sizeof(std::int32_t) != 0U ||
+      source.offsets.bytes != source.indices.bytes ||
+      source.output_indices.bytes != source.indices.bytes ||
+      source.mask.bytes != source.indices.bytes / sizeof(std::int32_t)) {
+    return InvalidArgument(label + " descriptor buffers do not satisfy the "
+                           "address/valid and request-vector ABI");
+  }
+  const std::uint64_t table_capacity =
+      source.address_table.bytes / sizeof(std::uint64_t);
+  const std::uint64_t request_capacity =
+      source.indices.bytes / sizeof(std::int32_t);
+  if (!FitsU32(table_capacity) || !FitsU32(request_capacity) ||
+      table_capacity == 0U || request_capacity == 0U ||
+      request_capacity > KVAF_AIV_BATCH_GET_DENSE_REQUEST_CAPACITY) {
+    return InvalidArgument(label + " capacity exceeds the streaming dense "
+                           "Direct-HCCP ABI");
+  }
+  constexpr std::size_t kDescriptorBufferCount =
+      sizeof(buffers) / sizeof(buffers[0]);
+  for (std::size_t left = 0; left < kDescriptorBufferCount; ++left) {
+    for (std::size_t right = left + 1U; right < kDescriptorBufferCount;
+         ++right) {
+      if (BufferRangesOverlap(*buffers[left], *buffers[right])) {
+        return InvalidArgument(label + " descriptor buffers must not alias");
+      }
+    }
+  }
+  const std::uint64_t private_base =
+      static_cast<std::uint64_t>(source.queue_id) * private_output_rows;
+  if (!FitsU32(private_base)) {
+    return InvalidArgument(label + " private output-row base exceeds uint32");
+  }
+  *destination = KvafStreamingBatchGetDescriptorScratch{};
+  destination->address_table = PointerValue(source.address_table.data);
+  destination->valid_table = PointerValue(source.valid_table.data);
+  destination->indices = PointerValue(source.indices.data);
+  destination->offsets = PointerValue(source.offsets.data);
+  destination->mask = PointerValue(source.mask.data);
+  destination->output_indices = PointerValue(source.output_indices.data);
+  destination->table_capacity = static_cast<std::uint32_t>(table_capacity);
+  destination->request_capacity = static_cast<std::uint32_t>(request_capacity);
+  destination->active_request_count = 0U;
+  destination->private_output_row_base =
+      static_cast<std::uint32_t>(private_base);
+  return Status::OK();
+}
+
 Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
                                std::uint32_t npu_core_count,
                                std::uint32_t jettys_per_core,
@@ -253,11 +422,10 @@ struct DefaultAccessOperator::Impl {
     std::uint64_t channel_entity{0};
   };
 
-  // One fused MIX invocation owns both Direct-HCCP workers.  This binding
-  // retains the cold LocalBufferAcquire registration and exposes only its
-  // device-resident ABI through a caller-owned KvafFusedBatchGetControl.
-  // It deliberately has no hot host submit method: the fused AIV helper owns
-  // SQ PI, CQ CI, doorbells, and completion polling itself.
+  // One fused invocation retains a cold LocalBufferAcquire registration and
+  // exposes only its device-resident ABI through a caller-owned
+  // KvafFusedBatchGetControl. It deliberately has no hot host submit method:
+  // the fused AIV helper owns SQ PI, CQ CI, doorbells, and completion polling.
   struct FusedBatchGetControlBinding {
     void* output{nullptr};
     std::size_t output_bytes{0};
@@ -265,6 +433,37 @@ struct DefaultAccessOperator::Impl {
     std::size_t control_bytes{0};
     KvafBatchGetLocalBuffer* local_buffer{nullptr};
     std::uint64_t channel_entity{0};
+    std::uint32_t queue_count{0};
+    bool active{false};
+  };
+
+  struct StreamingBatchGetLayerControlBinding {
+    std::uint32_t layer_id{0};
+    void* output{nullptr};
+    std::size_t output_bytes{0};
+    void* control{nullptr};
+    std::size_t control_bytes{0};
+    KvafBatchGetLocalBuffer* local_buffer{nullptr};
+    std::uint64_t channel_entity{0};
+    void* descriptor_templates{nullptr};
+    std::size_t descriptor_template_bytes{0};
+    std::uint64_t private_output_rows{0};
+    std::uint64_t private_output_stride_bytes{0};
+    bool templates_configured{false};
+  };
+
+  // The streaming table is a single cold lifecycle object.  It permits a
+  // captured layer graph to select a pre-published control by its stable
+  // layer id, but it does not permit a single entry to be replaced while any
+  // graph may still read the table.
+  struct StreamingBatchGetControlBinding {
+    std::vector<StreamingBatchGetLayerControlBinding> layers;
+    void* queue_leases{nullptr};
+    std::size_t queue_lease_bytes{0};
+    void* descriptor_scratch{nullptr};
+    std::size_t descriptor_scratch_bytes{0};
+    std::uint32_t queue_count{0};
+    std::uint64_t bind_epoch{0};
     bool active{false};
   };
 
@@ -275,11 +474,20 @@ struct DefaultAccessOperator::Impl {
   std::vector<BoundBatchGetOutput> bound_outputs;
   BatchGetOutputBindingId next_bound_output_id{1};
   FusedBatchGetControlBinding fused_control;
+  StreamingBatchGetControlBinding streaming_control;
+  std::uint64_t streaming_bind_count{0};
+  std::uint64_t streaming_release_count{0};
+  std::uint64_t streaming_template_configure_count{0};
+  std::uint64_t next_streaming_bind_epoch{1};
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   KvafBatchPutTransport* batch_put_transport{nullptr};
   BatchPutExecutionState batch_put_execution;
 #endif
   bool initialized{false};
+
+  bool HasDeviceFusedBatchGetControl() const {
+    return fused_control.active || streaming_control.active;
+  }
 };
 
 DefaultAccessOperator::DefaultAccessOperator(AccessOperatorConfig config)
@@ -403,15 +611,14 @@ Status DefaultAccessOperator::Shutdown() {
     return Status::OK();
   }
 
-  // A fused Get owns a Direct-HCCP local-HBM registration that can still be
-  // read by a graph-replayed AIV. Unlike an ordinary host submission there is
-  // no host completion object to prove that the final reader has retired.
-  // Fail closed: the caller must establish its terminal event, then call
-  // ReleaseFusedBatchGetControl explicitly before shutting down the Runtime.
-  if (impl_->fused_control.active) {
+  // A fused or streaming Get owns Direct-HCCP local-HBM registrations that
+  // can still be read by graph-replayed AIV code. Unlike an ordinary host
+  // submission there is no host completion object to prove that the final
+  // reader has retired. Fail closed at this cold lifecycle boundary.
+  if (impl_->HasDeviceFusedBatchGetControl()) {
     return Status::Busy(
-        "Shutdown is forbidden while fused BatchGet control is bound; "
-        "wait for the final fused reader and release the control first");
+        "Shutdown is forbidden while fused or streaming BatchGet control is "
+        "bound; wait for the final fused reader and release the control first");
   }
 
   // Callers must complete all submitted streams before Runtime::Shutdown,
@@ -453,10 +660,11 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
   }
-  if (impl_->fused_control.active) {
+  if (impl_->HasDeviceFusedBatchGetControl()) {
     return Status::Error(
         StatusCode::kBusy,
-        "ordinary BatchGet is forbidden while fused BatchGet control owns "
+        "ordinary BatchGet is forbidden while fused or streaming BatchGet "
+        "control owns "
         "the Direct-HCCP SQ/CQ state");
   }
   if (exec.execution.stream == nullptr) {
@@ -512,11 +720,11 @@ Status DefaultAccessOperator::BindBatchGetOutput(
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
   }
-  if (impl_->fused_control.active) {
+  if (impl_->HasDeviceFusedBatchGetControl()) {
     return Status::Error(
         StatusCode::kBusy,
-        "native BatchGet output binding is forbidden while fused BatchGet "
-        "control owns the Direct-HCCP SQ/CQ state");
+        "native BatchGet output binding is forbidden while fused or streaming "
+        "BatchGet control owns the Direct-HCCP SQ/CQ state");
   }
   if (!output.valid() || output.device != DeviceKind::kNpu ||
       output.bytes % kBatchGetTransferBytes != 0) {
@@ -579,11 +787,11 @@ Status DefaultAccessOperator::ExecuteBoundBatchGet(
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
   }
-  if (impl_->fused_control.active) {
+  if (impl_->HasDeviceFusedBatchGetControl()) {
     return Status::Error(
         StatusCode::kBusy,
-        "bound BatchGet is forbidden while fused BatchGet control owns the "
-        "Direct-HCCP SQ/CQ state");
+        "bound BatchGet is forbidden while fused or streaming BatchGet "
+        "control owns the Direct-HCCP SQ/CQ state");
   }
   if (exec.execution.stream == nullptr) {
     return InvalidArgument("NPU BatchGet requires a caller-owned ACL stream");
@@ -627,25 +835,29 @@ Status DefaultAccessOperator::ExecuteBoundBatchGet(
 
 Status DefaultAccessOperator::BindFusedBatchGetControl(
     const MutableBufferView& output, const MutableBufferView& control) {
+  // Preserve the original public call shape and two-worker behavior. New
+  // callers opt into an explicit queue count through the overload below.
+  return BindFusedBatchGetControl(output, control, 2U);
+}
+
+Status DefaultAccessOperator::BindFusedBatchGetControl(
+    const MutableBufferView& output, const MutableBufferView& control,
+    std::uint32_t queue_count) {
   if (!impl_->initialized || impl_->transport == nullptr) {
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
   }
-  if (impl_->fused_control.active) {
+  if (impl_->HasDeviceFusedBatchGetControl()) {
     return Status::Error(StatusCode::kAlreadyExists,
-                         "fused BatchGet control is already bound");
+                         "a fused or streaming BatchGet control is already bound");
   }
   // Existing enqueue-only BatchGet calls intentionally do not retain a host
   // completion object.  A cold caller must therefore drain any earlier
   // ordinary Get before claiming this state; once active, the checks above
-  // prevent new ordinary/native submissions from racing the two AIV lanes.
-  // A fused 31+1 MIX operator has exactly two Get lanes.  Its custom kernel
-  // turns each lane into a block_count=1 view of the two-worker state below.
-  if (impl_->config.npu_core_count != 2U ||
-      impl_->config.jettys_per_core != 1U) {
-    return InvalidArgument(
-        "fused BatchGet control requires npu_core_count=2 and "
-        "jettys_per_core=1");
+  // prevent new ordinary/native submissions from racing the selected queues.
+  Status status = ValidateFusedBatchGetQueueCount(impl_->config, queue_count);
+  if (!status.ok()) {
+    return status;
   }
   if (!impl_->bound_outputs.empty()) {
     return Status::Error(
@@ -653,15 +865,9 @@ Status DefaultAccessOperator::BindFusedBatchGetControl(
         "fused BatchGet control requires no active native BatchGet output "
         "binding");
   }
-  if (!output.valid() || output.device != DeviceKind::kNpu ||
-      output.bytes % kBatchGetTransferBytes != 0U) {
-    return InvalidArgument(
-        "fused BatchGet output must be an NPU buffer with 656-byte rows");
-  }
-  if (!control.valid() || control.device != DeviceKind::kNpu ||
-      control.bytes != sizeof(KvafFusedBatchGetControl)) {
-    return InvalidArgument(
-        "fused BatchGet control must be an NPU uint64[16] buffer");
+  status = ValidateFusedBatchGetBuffers(output, control, "fused BatchGet");
+  if (!status.ok()) {
+    return status;
   }
   if (output.data == control.data || impl_->execution.status == nullptr ||
       impl_->execution.queue_state == nullptr) {
@@ -701,7 +907,7 @@ Status DefaultAccessOperator::BindFusedBatchGetControl(
   host_control.output = PointerValue(output.data);
   host_control.output_rows =
       static_cast<std::uint64_t>(output.bytes / kBatchGetTransferBytes);
-  host_control.block_count = impl_->config.npu_core_count;
+  host_control.block_count = queue_count;
   host_control.jettys_per_core = impl_->config.jettys_per_core;
   host_control.block_bytes = kBatchGetTransferBytes;
   if (aclrtMemcpy(control.data, control.bytes, &host_control,
@@ -722,7 +928,7 @@ Status DefaultAccessOperator::BindFusedBatchGetControl(
 
   impl_->fused_control = Impl::FusedBatchGetControlBinding{
       output.data, output.bytes, control.data, control.bytes, local_buffer,
-      channel_entity, true};
+      channel_entity, queue_count, true};
   return Status::OK();
 }
 
@@ -739,6 +945,547 @@ Status DefaultAccessOperator::ReleaseFusedBatchGetControl() {
   // a hidden host-side completion path.
   KvafBatchGetLocalBufferRelease(impl_->fused_control.local_buffer);
   impl_->fused_control = Impl::FusedBatchGetControlBinding{};
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::BindStreamingBatchGetControl(
+    const std::vector<StreamingBatchGetLayerBinding>& layers,
+    std::uint32_t queue_count) {
+  if (!impl_->initialized || impl_->transport == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  if (impl_->HasDeviceFusedBatchGetControl()) {
+    return Status::Error(
+        StatusCode::kAlreadyExists,
+        "a fused or streaming BatchGet control is already bound; "
+        "streaming bindings may only be replaced after releasing the whole "
+        "table at a cold lifecycle boundary");
+  }
+  if (layers.empty()) {
+    return InvalidArgument(
+        "streaming BatchGet control requires at least one layer binding");
+  }
+  Status status = ValidateFusedBatchGetQueueCount(impl_->config, queue_count);
+  if (!status.ok()) {
+    return status;
+  }
+  if (!impl_->bound_outputs.empty()) {
+    return Status::Error(
+        StatusCode::kBusy,
+        "streaming BatchGet control requires no active native BatchGet output "
+        "binding");
+  }
+  if (impl_->execution.status == nullptr || impl_->execution.queue_state == nullptr) {
+    return InvalidArgument("invalid streaming BatchGet execution state");
+  }
+
+  // Validate the entire table before creating one LocalBufferAcquire
+  // registration. This makes a malformed later entry fail without changing
+  // the existing Runtime state.
+  for (std::size_t index = 0; index < layers.size(); ++index) {
+    const StreamingBatchGetLayerBinding& layer = layers[index];
+    const std::string label =
+        "streaming BatchGet layer " + std::to_string(layer.layer_id);
+    status = ValidateStreamingBatchGetBuffers(layer.output, layer.control,
+                                              label.c_str());
+    if (!status.ok()) {
+      return status;
+    }
+    const std::uint64_t output_rows =
+        static_cast<std::uint64_t>(layer.output.bytes / kBatchGetTransferBytes);
+    if (output_rows < queue_count || output_rows % queue_count != 0U) {
+      return InvalidArgument(
+          "streaming BatchGet layer_id=" + std::to_string(layer.layer_id) +
+          " output rows=" + std::to_string(output_rows) +
+          " must split into queue_count=" + std::to_string(queue_count) +
+          " non-empty private output regions");
+    }
+    for (std::size_t previous = 0; previous < index; ++previous) {
+      const StreamingBatchGetLayerBinding& earlier = layers[previous];
+      if (earlier.layer_id == layer.layer_id) {
+        return InvalidArgument(
+            "streaming BatchGet layer_id=" + std::to_string(layer.layer_id) +
+            " appears more than once; hot per-layer rebind is unsupported");
+      }
+      if (earlier.output.data == layer.output.data &&
+          earlier.output.bytes == layer.output.bytes) {
+        return InvalidArgument(
+            "streaming BatchGet layer_id=" + std::to_string(layer.layer_id) +
+            " reuses another layer's output registration; provide one fixed "
+            "output range per layer");
+      }
+      if (earlier.control.data == layer.control.data) {
+        return InvalidArgument(
+            "streaming BatchGet layer_id=" + std::to_string(layer.layer_id) +
+            " reuses another layer's control buffer");
+      }
+      if (earlier.output.data == layer.control.data ||
+          earlier.control.data == layer.output.data) {
+        return InvalidArgument(
+            "streaming BatchGet output and control buffers must not cross-alias "
+            "between layers");
+      }
+    }
+  }
+
+  // As with the single-control path, all caller tensor initialization must be
+  // visible before raw ACL H2D publication starts. This is intentionally a
+  // cold bind, never a graph-replay synchronization.
+  if (aclrtSynchronizeDevice() != ACL_SUCCESS) {
+    return Internal(
+        "failed to synchronize device before binding streaming BatchGet control");
+  }
+
+  const std::size_t queue_lease_bytes =
+      static_cast<std::size_t>(queue_count) *
+      KVAF_STREAMING_BATCH_GET_QUEUE_LEASE_BYTES;
+  const std::size_t descriptor_scratch_bytes =
+      static_cast<std::size_t>(queue_count) *
+      sizeof(KvafStreamingBatchGetDescriptorScratch);
+  void* queue_leases = nullptr;
+  void* descriptor_scratch = nullptr;
+  if (aclrtMalloc(&queue_leases, queue_lease_bytes,
+                  ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
+      queue_leases == nullptr ||
+      aclrtMemset(queue_leases, queue_lease_bytes, 0,
+                  queue_lease_bytes) != ACL_SUCCESS ||
+      aclrtMalloc(&descriptor_scratch, descriptor_scratch_bytes,
+                  ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
+      descriptor_scratch == nullptr ||
+      aclrtMemset(descriptor_scratch, descriptor_scratch_bytes, 0,
+                  descriptor_scratch_bytes) != ACL_SUCCESS) {
+    if (queue_leases != nullptr) {
+      (void)aclrtFree(queue_leases);
+    }
+    if (descriptor_scratch != nullptr) {
+      (void)aclrtFree(descriptor_scratch);
+    }
+    return Internal(
+        "failed to allocate streaming BatchGet queue-pool lease or descriptor table");
+  }
+
+  std::vector<Impl::StreamingBatchGetLayerControlBinding> pending;
+  pending.reserve(layers.size());
+  const auto release_pending = [&pending, &queue_leases, &descriptor_scratch]() {
+    for (const Impl::StreamingBatchGetLayerControlBinding& bound : pending) {
+      if (bound.descriptor_templates != nullptr) {
+        (void)aclrtFree(bound.descriptor_templates);
+      }
+      KvafBatchGetLocalBufferRelease(bound.local_buffer);
+    }
+    pending.clear();
+    if (queue_leases != nullptr) {
+      (void)aclrtFree(queue_leases);
+      queue_leases = nullptr;
+    }
+    if (descriptor_scratch != nullptr) {
+      (void)aclrtFree(descriptor_scratch);
+      descriptor_scratch = nullptr;
+    }
+  };
+  for (const StreamingBatchGetLayerBinding& layer : layers) {
+    KvafBatchGetLocalBuffer* local_buffer = nullptr;
+    std::uint64_t channel_entity = 0U;
+    if (KvafBatchGetLocalBufferAcquire(impl_->transport, layer.output.data,
+                                       layer.output.bytes, &local_buffer,
+                                       &channel_entity) !=
+            KVAF_BATCH_GET_SUCCESS ||
+        local_buffer == nullptr || channel_entity == 0U) {
+      if (local_buffer != nullptr) {
+        KvafBatchGetLocalBufferRelease(local_buffer);
+      }
+      release_pending();
+      return Internal(
+          "failed to register streaming BatchGet output for layer_id=" +
+          std::to_string(layer.layer_id));
+    }
+
+    // Templates are layer-private and graph-stable. The shared scratch table
+    // below holds only a leased queue's active wave, whereas this allocation
+    // preserves each layer's fixed descriptor pointers/capacities across
+    // earlier/later layer replays.
+    void* descriptor_templates = nullptr;
+    if (aclrtMalloc(&descriptor_templates, descriptor_scratch_bytes,
+                    ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
+        descriptor_templates == nullptr ||
+        aclrtMemset(descriptor_templates, descriptor_scratch_bytes, 0,
+                    descriptor_scratch_bytes) != ACL_SUCCESS) {
+      if (descriptor_templates != nullptr) {
+        (void)aclrtFree(descriptor_templates);
+      }
+      KvafBatchGetLocalBufferRelease(local_buffer);
+      release_pending();
+      return Internal(
+          "failed to allocate streaming descriptor templates for layer_id=" +
+          std::to_string(layer.layer_id));
+    }
+
+    KvafStreamingBatchGetControl host_control{};
+    host_control.magic = KVAF_STREAMING_BATCH_GET_CONTROL_MAGIC;
+    host_control.version = KVAF_STREAMING_BATCH_GET_CONTROL_VERSION;
+    host_control.channel_entity = channel_entity;
+    host_control.queue_state = PointerValue(impl_->execution.queue_state);
+    host_control.core_status = PointerValue(impl_->execution.status);
+    host_control.output = PointerValue(layer.output.data);
+    host_control.queue_leases = PointerValue(queue_leases);
+    host_control.descriptor_scratch = PointerValue(descriptor_scratch);
+    host_control.queue_count = queue_count;
+    // `output` must stay the complete LocalBufferAcquire base because the
+    // direct device helper validates entity.local_hbm_address == args.output.
+    // Per-queue privacy is represented by final absolute output_indices in
+    // non-overlapping row intervals, not by changing args.output.
+    host_control.output_rows = static_cast<std::uint64_t>(
+        layer.output.bytes / kBatchGetTransferBytes);
+    host_control.private_output_stride_bytes =
+        static_cast<std::uint64_t>(layer.output.bytes / queue_count);
+    host_control.output_offset_bytes = 0U;
+    host_control.jettys_per_core = impl_->config.jettys_per_core;
+    host_control.block_bytes = kBatchGetTransferBytes;
+    host_control.descriptor_templates = PointerValue(descriptor_templates);
+    host_control.descriptor_template_count = queue_count;
+    if (aclrtMemcpy(layer.control.data, layer.control.bytes, &host_control,
+                    sizeof(host_control), ACL_MEMCPY_HOST_TO_DEVICE) !=
+        ACL_SUCCESS) {
+      (void)aclrtFree(descriptor_templates);
+      KvafBatchGetLocalBufferRelease(local_buffer);
+      release_pending();
+      return Internal(
+          "failed to write streaming BatchGet control for layer_id=" +
+          std::to_string(layer.layer_id));
+    }
+    pending.push_back(Impl::StreamingBatchGetLayerControlBinding{
+        layer.layer_id, layer.output.data, layer.output.bytes, layer.control.data,
+        layer.control.bytes, local_buffer, channel_entity, descriptor_templates,
+        descriptor_scratch_bytes, host_control.output_rows,
+        host_control.private_output_stride_bytes, false});
+  }
+
+  // Publish the table atomically from the caller's perspective: no layer is
+  // marked active until every control and the shared int32 queue-owner table
+  // has reached HBM.
+  if (aclrtSynchronizeDevice() != ACL_SUCCESS) {
+    release_pending();
+    return Internal(
+        "failed to synchronize device after binding streaming BatchGet control");
+  }
+  impl_->streaming_control.layers = std::move(pending);
+  impl_->streaming_control.queue_leases = queue_leases;
+  impl_->streaming_control.queue_lease_bytes = queue_lease_bytes;
+  impl_->streaming_control.descriptor_scratch = descriptor_scratch;
+  impl_->streaming_control.descriptor_scratch_bytes = descriptor_scratch_bytes;
+  impl_->streaming_control.queue_count = queue_count;
+  impl_->streaming_control.bind_epoch = impl_->next_streaming_bind_epoch++;
+  impl_->streaming_control.active = true;
+  ++impl_->streaming_bind_count;
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::ConfigureStreamingBatchGetQueueTemplates(
+    const std::vector<StreamingBatchGetLayerTemplates>& layers) {
+  if (!impl_->initialized || impl_->transport == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  if (!impl_->streaming_control.active) {
+    return Status::NotFound(
+        "streaming BatchGet control table must be bound before templates");
+  }
+  Impl::StreamingBatchGetControlBinding& table = impl_->streaming_control;
+  if (layers.size() != table.layers.size()) {
+    return InvalidArgument(
+        "streaming descriptor templates must list every bound layer exactly once");
+  }
+  for (const Impl::StreamingBatchGetLayerControlBinding& bound : table.layers) {
+    if (bound.templates_configured) {
+      return InvalidState(
+          "streaming descriptor templates are already configured; release the "
+          "whole table before a cold rebind");
+    }
+  }
+
+  struct ResolvedLayerTemplates {
+    Impl::StreamingBatchGetLayerControlBinding* binding{nullptr};
+    std::vector<KvafStreamingBatchGetDescriptorScratch> templates;
+  };
+  struct BufferReference {
+    const MutableBufferView* view{nullptr};
+    std::uint32_t layer_id{0};
+    std::uint32_t queue_id{0};
+    std::uint32_t role{0};
+  };
+  constexpr std::uint32_t kAddressTableRole = 0U;
+  constexpr std::uint32_t kValidTableRole = 1U;
+
+  std::vector<ResolvedLayerTemplates> resolved;
+  std::vector<BufferReference> references;
+  resolved.reserve(layers.size());
+  references.reserve(layers.size() * table.queue_count * 6U);
+  for (const StreamingBatchGetLayerTemplates& supplied : layers) {
+    auto binding = std::find_if(
+        table.layers.begin(), table.layers.end(),
+        [&supplied](const Impl::StreamingBatchGetLayerControlBinding& candidate) {
+          return candidate.layer_id == supplied.layer_id;
+        });
+    if (binding == table.layers.end()) {
+      return InvalidArgument(
+          "streaming descriptor templates name an unbound layer_id=" +
+          std::to_string(supplied.layer_id));
+    }
+    const bool duplicate_layer = std::any_of(
+        resolved.begin(), resolved.end(), [&binding](const ResolvedLayerTemplates& item) {
+          return item.binding == &*binding;
+        });
+    if (duplicate_layer) {
+      return InvalidArgument(
+          "streaming descriptor templates repeat layer_id=" +
+          std::to_string(supplied.layer_id));
+    }
+    if (supplied.queues.size() != table.queue_count) {
+      return InvalidArgument(
+          "streaming descriptor templates for layer_id=" +
+          std::to_string(supplied.layer_id) + " must contain queue_count=" +
+          std::to_string(table.queue_count) + " entries");
+    }
+
+    ResolvedLayerTemplates item;
+    item.binding = &*binding;
+    item.templates.resize(table.queue_count);
+    std::vector<bool> seen_queue(table.queue_count, false);
+    for (const StreamingBatchGetQueueTemplate& queue : supplied.queues) {
+      if (queue.queue_id >= table.queue_count || seen_queue[queue.queue_id]) {
+        return InvalidArgument(
+            "streaming descriptor templates for layer_id=" +
+            std::to_string(supplied.layer_id) +
+            " must contain each queue_id exactly once");
+      }
+      seen_queue[queue.queue_id] = true;
+      const std::string label =
+          "streaming descriptor template layer_id=" +
+          std::to_string(supplied.layer_id) + " queue_id=" +
+          std::to_string(queue.queue_id);
+      // Descriptor vectors are LI-owned mutable scratch, never a view onto a
+      // registered private output arena, a graph-stable control block, or
+      // KVAF's shared lease/active-descriptor tables. Rejecting all of those
+      // aliases here prevents a malformed cold template from turning a later
+      // device-only replay into a persistent mapping/output corruption.
+      const MutableBufferView* const queue_buffers[] = {
+          &queue.address_table, &queue.valid_table, &queue.indices,
+          &queue.offsets, &queue.mask, &queue.output_indices};
+      const MutableBufferView shared_lease{
+          table.queue_leases, table.queue_lease_bytes, DeviceKind::kNpu};
+      const MutableBufferView shared_scratch{
+          table.descriptor_scratch, table.descriptor_scratch_bytes,
+          DeviceKind::kNpu};
+      for (const MutableBufferView* queue_buffer : queue_buffers) {
+        if (BufferRangesOverlap(*queue_buffer, shared_lease) ||
+            BufferRangesOverlap(*queue_buffer, shared_scratch)) {
+          return InvalidArgument(label +
+                                 " descriptor buffer aliases shared "
+                                 "queue-pool state");
+        }
+        for (const Impl::StreamingBatchGetLayerControlBinding& reserved :
+             table.layers) {
+          const MutableBufferView reserved_output{
+              reserved.output, reserved.output_bytes, DeviceKind::kNpu};
+          const MutableBufferView reserved_control{
+              reserved.control, reserved.control_bytes, DeviceKind::kNpu};
+          const MutableBufferView reserved_templates{
+              reserved.descriptor_templates, reserved.descriptor_template_bytes,
+              DeviceKind::kNpu};
+          if (BufferRangesOverlap(*queue_buffer, reserved_output) ||
+              BufferRangesOverlap(*queue_buffer, reserved_control) ||
+              BufferRangesOverlap(*queue_buffer, reserved_templates)) {
+            return InvalidArgument(label +
+                                   " descriptor buffer aliases a reserved "
+                                   "streaming output/control/template range");
+          }
+        }
+      }
+      Status status = BuildStreamingBatchGetQueueTemplate(
+          queue, table.queue_count, binding->private_output_rows,
+          &item.templates[queue.queue_id], label);
+      if (!status.ok()) {
+        return status;
+      }
+      for (std::uint32_t role = 0U;
+           role < sizeof(queue_buffers) / sizeof(queue_buffers[0]); ++role) {
+        references.push_back(BufferReference{queue_buffers[role],
+                                             supplied.layer_id, queue.queue_id,
+                                             role});
+      }
+    }
+    resolved.push_back(std::move(item));
+  }
+  if (resolved.size() != table.layers.size()) {
+    return InvalidArgument(
+        "streaming descriptor templates omit at least one bound layer");
+  }
+
+  // Address/valid tables may intentionally be shared identically by multiple
+  // queues. Every mutable descriptor vector must be disjoint across every
+  // queue/layer, and a partial overlapping static table is rejected too.
+  for (std::size_t left = 0; left < references.size(); ++left) {
+    for (std::size_t right = left + 1U; right < references.size(); ++right) {
+      const BufferReference& a = references[left];
+      const BufferReference& b = references[right];
+      if (!BufferRangesOverlap(*a.view, *b.view)) {
+        continue;
+      }
+      const bool same_shareable_role =
+          (a.role == kAddressTableRole && b.role == kAddressTableRole) ||
+          (a.role == kValidTableRole && b.role == kValidTableRole);
+      if (same_shareable_role && SameBufferRange(*a.view, *b.view)) {
+        continue;
+      }
+      return InvalidArgument(
+          "streaming descriptor template buffers overlap: layer_id=" +
+          std::to_string(a.layer_id) + " queue_id=" +
+          std::to_string(a.queue_id) + " conflicts with layer_id=" +
+          std::to_string(b.layer_id) + " queue_id=" +
+          std::to_string(b.queue_id));
+    }
+  }
+
+  // This is a cold pre-capture publication. It deliberately synchronizes
+  // only here: replaying LI never asks the host to rewrite a descriptor.
+  if (aclrtSynchronizeDevice() != ACL_SUCCESS) {
+    return Internal(
+        "failed to synchronize device before configuring streaming templates");
+  }
+  for (const ResolvedLayerTemplates& item : resolved) {
+    if (item.binding == nullptr || item.binding->descriptor_templates == nullptr ||
+        item.binding->descriptor_template_bytes !=
+            item.templates.size() *
+                sizeof(KvafStreamingBatchGetDescriptorScratch) ||
+        aclrtMemcpy(item.binding->descriptor_templates,
+                    item.binding->descriptor_template_bytes,
+                    item.templates.data(),
+                    item.templates.size() *
+                        sizeof(KvafStreamingBatchGetDescriptorScratch),
+                    ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
+      return Internal("failed to publish a streaming descriptor template table");
+    }
+  }
+  if (aclrtSynchronizeDevice() != ACL_SUCCESS) {
+    return Internal(
+        "failed to synchronize device after configuring streaming templates");
+  }
+  for (const ResolvedLayerTemplates& item : resolved) {
+    item.binding->templates_configured = true;
+  }
+  ++impl_->streaming_template_configure_count;
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::ReleaseStreamingBatchGetControl() {
+  if (!impl_->initialized || impl_->transport == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  if (!impl_->streaming_control.active) {
+    return Status::NotFound("streaming BatchGet control table is not bound");
+  }
+  // The caller must already have observed the terminal reader for every
+  // layer. This remains a cold lifecycle operation and intentionally does
+  // not synchronize a stream behind the caller's back.
+  for (const Impl::StreamingBatchGetLayerControlBinding& bound :
+       impl_->streaming_control.layers) {
+    if (bound.descriptor_templates != nullptr) {
+      (void)aclrtFree(bound.descriptor_templates);
+    }
+    KvafBatchGetLocalBufferRelease(bound.local_buffer);
+  }
+  if (impl_->streaming_control.queue_leases != nullptr) {
+    (void)aclrtFree(impl_->streaming_control.queue_leases);
+  }
+  if (impl_->streaming_control.descriptor_scratch != nullptr) {
+    (void)aclrtFree(impl_->streaming_control.descriptor_scratch);
+  }
+  impl_->streaming_control = Impl::StreamingBatchGetControlBinding{};
+  ++impl_->streaming_release_count;
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::DescribeStreamingBatchGetControl(
+    std::string* diagnostic) const {
+  if (diagnostic == nullptr) {
+    return InvalidArgument("streaming BatchGet diagnostic output is null");
+  }
+  if (!impl_->initialized || impl_->transport == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  if (!impl_->streaming_control.active) {
+    return Status::NotFound("streaming BatchGet control table is not bound");
+  }
+  const Impl::StreamingBatchGetControlBinding& table =
+      impl_->streaming_control;
+  std::ostringstream message;
+  message << "KVAF_STREAMING_CONTROL epoch=" << table.bind_epoch
+          << " bind_count=" << impl_->streaming_bind_count
+          << " release_count=" << impl_->streaming_release_count
+          << " template_configure_count="
+          << impl_->streaming_template_configure_count
+          << " queue_count=" << table.queue_count
+          << " layers=" << table.layers.size() << " queue_leases=0x"
+          << std::hex << PointerValue(table.queue_leases)
+          << " descriptor_scratch=0x" << PointerValue(table.descriptor_scratch)
+          << std::dec << " lease_bytes=" << table.queue_lease_bytes
+          << " scratch_bytes=" << table.descriptor_scratch_bytes;
+  for (const Impl::StreamingBatchGetLayerControlBinding& layer : table.layers) {
+    message << " | layer=" << layer.layer_id << " control=0x" << std::hex
+            << PointerValue(layer.control) << " output=0x"
+            << PointerValue(layer.output) << " entity=0x"
+            << layer.channel_entity << std::dec
+            << " templates=0x" << std::hex
+            << PointerValue(layer.descriptor_templates) << std::dec
+            << " template_bytes=" << layer.descriptor_template_bytes
+            << " templates_configured="
+            << (layer.templates_configured ? 1 : 0)
+            << " private_rows=" << layer.private_output_rows
+            << " private_stride=" << layer.private_output_stride_bytes;
+  }
+  *diagnostic = message.str();
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::GetStreamingBatchGetControlSnapshot(
+    StreamingBatchGetControlSnapshot* snapshot) const {
+  if (snapshot == nullptr) {
+    return InvalidArgument("streaming BatchGet snapshot output is null");
+  }
+  if (!impl_->initialized || impl_->transport == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  StreamingBatchGetControlSnapshot result;
+  result.magic = KVAF_STREAMING_BATCH_GET_CONTROL_MAGIC;
+  result.version = KVAF_STREAMING_BATCH_GET_CONTROL_VERSION;
+  result.bind_count = impl_->streaming_bind_count;
+  result.release_count = impl_->streaming_release_count;
+  result.template_configure_count = impl_->streaming_template_configure_count;
+  const Impl::StreamingBatchGetControlBinding& table =
+      impl_->streaming_control;
+  result.active = table.active;
+  if (table.active) {
+    result.bind_epoch = table.bind_epoch;
+    result.queue_count = table.queue_count;
+    result.queue_lease_address = PointerValue(table.queue_leases);
+    result.descriptor_scratch_address = PointerValue(table.descriptor_scratch);
+    result.queue_lease_bytes = table.queue_lease_bytes;
+    result.descriptor_scratch_bytes = table.descriptor_scratch_bytes;
+    result.layers.reserve(table.layers.size());
+    for (const Impl::StreamingBatchGetLayerControlBinding& layer :
+         table.layers) {
+      result.layers.push_back(StreamingBatchGetLayerSnapshot{
+          layer.layer_id, PointerValue(layer.output), PointerValue(layer.control),
+          layer.channel_entity, PointerValue(layer.descriptor_templates),
+          layer.descriptor_template_bytes, layer.private_output_rows,
+          layer.private_output_stride_bytes, layer.templates_configured});
+    }
+  }
+  *snapshot = std::move(result);
   return Status::OK();
 }
 
@@ -828,13 +1575,14 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
   if (!impl_->initialized) {
     return Status::NotInitialized("AccessOperator has not been initialized");
   }
-  // NpuRuntime rejects BatchPut before it mutates Runtime metadata.  Keep the
+  // NpuRuntime rejects BatchPut before it mutates Runtime metadata. Keep the
   // same protection here as a second boundary for direct C++ users: an AIV
-  // fused Get reads this transport's remote payload and fixed output view.
-  if (impl_->fused_control.active) {
+  // fused or streaming Get reads this transport's remote payload and fixed
+  // output view.
+  if (impl_->HasDeviceFusedBatchGetControl()) {
     return Status::Busy(
-        "BatchPut is forbidden while fused BatchGet control owns the "
-        "Direct-HCCP read state");
+        "BatchPut is forbidden while fused or streaming BatchGet control "
+        "owns the Direct-HCCP read state");
   }
   if (exec.request == nullptr || exec.put_desc == nullptr ||
       exec.request->keys.empty() || exec.request->input.data == nullptr ||

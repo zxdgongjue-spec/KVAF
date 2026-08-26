@@ -144,6 +144,30 @@ NpuTensorView GetNpuTensorView(const py::object& tensor, const char* name) {
       tensor.attr("shape").cast<std::vector<py::ssize_t>>()};
 }
 
+void ValidateFusedBatchGetOutputTensor(const NpuTensorView& output,
+                                       const std::string& label) {
+  if (output.shape.size() < 2 || output.shape.front() <= 0 ||
+      output.bytes % static_cast<std::size_t>(output.shape.front()) != 0 ||
+      output.bytes / static_cast<std::size_t>(output.shape.front()) !=
+          kBatchGetTransferBytes) {
+    throw py::value_error(label +
+                          " Tensor rows must each be 656 bytes");
+  }
+}
+
+void ValidateFusedBatchGetControlTensor(const NpuTensorView& control,
+                                        const py::object& tensor,
+                                        const std::string& label) {
+  if (control.shape.size() != 1 ||
+      control.shape.front() !=
+          static_cast<py::ssize_t>(KVAF_FUSED_BATCH_GET_CONTROL_WORDS) ||
+      control.element_bytes != sizeof(std::uint64_t) ||
+      py::str(tensor.attr("dtype")).cast<std::string>() != "torch.int64") {
+    throw py::value_error(label +
+                          " must be contiguous NPU torch.int64[16]");
+  }
+}
+
 std::vector<KeyId> CopyPrepareKeys(const py::object& keys) {
   // A full AccessTable can contain millions of keys. Accepting a CPU int64
   // Tensor avoids Pybind iterating millions of Python int objects before the
@@ -1248,20 +1272,21 @@ class NpuRuntime final {
     native_get_lane_copy_stream_keepalive_ = py::none();
   }
 
-  // Bind the fixed output registration and the persistent two-worker SQ/CQ
-  // state that a device-side fused ExactScan + Get operator consumes.  The
-  // control tensor is intentionally plain NPU torch.int64[16], not a Python
-  // object with hidden host state: the fused kernel can load every pointer it
-  // needs directly from HBM during graph replay.
+  // Bind the fixed output registration and Direct-HCCP SQ/CQ state that a
+  // device-side fused ExactScan + Get operator consumes. The control tensor
+  // is intentionally plain NPU torch.int64[16], not a Python object with
+  // hidden host state: the fused kernel can load every pointer it needs
+  // directly from HBM during graph replay.
   void BindFusedBatchGetControl(const py::object& output,
                                 const py::object& control,
-                                const py::object& producer_stream) {
+                                const py::object& producer_stream,
+                                std::uint32_t queue_count) {
     EnsureNoNativeGetLane("bind_fused_batch_get_control");
     if (!Initialized()) {
       throw std::runtime_error("Runtime has not been initialized");
     }
-    if (fused_batch_get_control_bound_) {
-      throw py::value_error("fused BatchGet control is already bound");
+    if (HasFusedOrStreamingBatchGetControl()) {
+      throw py::value_error("a fused or streaming BatchGet control is already bound");
     }
     // The control and output tensors are normally allocated or prepared on a
     // PyTorch stream.  BindFusedBatchGetControl publishes the cold control
@@ -1277,27 +1302,14 @@ class NpuRuntime final {
         GetNpuTensorView(output, "fused BatchGet output");
     const NpuTensorView control_view =
         GetNpuTensorView(control, "fused BatchGet control");
-    if (output_view.shape.size() < 2 || output_view.shape.front() <= 0 ||
-        output_view.bytes %
-                static_cast<std::size_t>(output_view.shape.front()) != 0 ||
-        output_view.bytes /
-                static_cast<std::size_t>(output_view.shape.front()) !=
-            kBatchGetTransferBytes) {
-      throw py::value_error(
-          "fused BatchGet output Tensor rows must each be 656 bytes");
-    }
-    if (control_view.shape.size() != 1 ||
-        control_view.shape.front() !=
-            static_cast<py::ssize_t>(KVAF_FUSED_BATCH_GET_CONTROL_WORDS) ||
-        control_view.element_bytes != sizeof(std::uint64_t) ||
-        py::str(control.attr("dtype")).cast<std::string>() != "torch.int64") {
-      throw py::value_error(
-          "fused BatchGet control must be contiguous NPU torch.int64[16]");
-    }
+    ValidateFusedBatchGetOutputTensor(output_view, "fused BatchGet output");
+    ValidateFusedBatchGetControlTensor(control_view, control,
+                                       "fused BatchGet control");
     ThrowIfError(access_operator_->BindFusedBatchGetControl(
         MutableBufferView{output_view.data, output_view.bytes, DeviceKind::kNpu},
         MutableBufferView{control_view.data, control_view.bytes,
-                          DeviceKind::kNpu}));
+                          DeviceKind::kNpu},
+        queue_count));
     fused_batch_get_control_bound_ = true;
     fused_batch_get_output_keepalive_ = output;
     fused_batch_get_control_keepalive_ = control;
@@ -1312,6 +1324,269 @@ class NpuRuntime final {
     fused_batch_get_control_bound_ = false;
     fused_batch_get_output_keepalive_ = py::none();
     fused_batch_get_control_keepalive_ = py::none();
+  }
+
+  // Cold-bind a layer-keyed table for the streaming producer-owned queue
+  // pool. All controls share one HBM int32[queue_count] lease table, while
+  // each layer retains its own registered output/entity table. There is no
+  // hot per-layer update: callers release the entire table after the final
+  // graph reader, then bind a replacement at a cold graph lifecycle point.
+  void BindStreamingBatchGetControl(const py::sequence& layer_ids,
+                                    const py::sequence& outputs,
+                                    const py::sequence& controls,
+                                    std::uint32_t queue_count,
+                                    const py::object& producer_stream) {
+    EnsureNoNativeGetLane("bind_streaming_batch_get_control");
+    if (!Initialized()) {
+      throw std::runtime_error("Runtime has not been initialized");
+    }
+    if (HasFusedOrStreamingBatchGetControl()) {
+      throw py::value_error("a fused or streaming BatchGet control is already bound");
+    }
+    const py::ssize_t count = py::len(layer_ids);
+    if (count <= 0 || py::len(outputs) != count || py::len(controls) != count) {
+      throw py::value_error(
+          "streaming BatchGet layer_ids, outputs, and controls must be "
+          "non-empty sequences of equal length");
+    }
+
+    std::vector<StreamingBatchGetLayerBinding> bindings;
+    std::vector<py::object> output_keepalives;
+    std::vector<py::object> control_keepalives;
+    bindings.reserve(static_cast<std::size_t>(count));
+    output_keepalives.reserve(static_cast<std::size_t>(count));
+    control_keepalives.reserve(static_cast<std::size_t>(count));
+    for (py::ssize_t index = 0; index < count; ++index) {
+      const py::ssize_t layer_id_value = layer_ids[index].cast<py::ssize_t>();
+      if (layer_id_value < 0 ||
+          static_cast<std::uint64_t>(layer_id_value) >
+              std::numeric_limits<std::uint32_t>::max()) {
+        throw py::value_error("streaming BatchGet layer_ids must fit uint32");
+      }
+      py::object output = outputs[index].cast<py::object>();
+      py::object control = controls[index].cast<py::object>();
+      const NpuTensorView output_view =
+          GetNpuTensorView(output, "streaming BatchGet output");
+      const NpuTensorView control_view =
+          GetNpuTensorView(control, "streaming BatchGet control");
+      const std::string label =
+          "streaming BatchGet layer " + std::to_string(layer_id_value);
+      ValidateFusedBatchGetOutputTensor(output_view, label + " output");
+      ValidateFusedBatchGetControlTensor(control_view, control,
+                                         label + " control");
+      bindings.push_back(StreamingBatchGetLayerBinding{
+          static_cast<std::uint32_t>(layer_id_value),
+          MutableBufferView{output_view.data, output_view.bytes, DeviceKind::kNpu},
+          MutableBufferView{control_view.data, control_view.bytes,
+                            DeviceKind::kNpu}});
+      output_keepalives.push_back(std::move(output));
+      control_keepalives.push_back(std::move(control));
+    }
+
+    const aclrtStream raw_producer_stream = ResolveStream(producer_stream);
+    ThrowIfAclError(aclrtSynchronizeStream(raw_producer_stream),
+                    "aclrtSynchronizeStream before streaming BatchGet bind");
+    ThrowIfError(access_operator_->BindStreamingBatchGetControl(bindings,
+                                                                 queue_count));
+    streaming_batch_get_control_bound_ = true;
+    streaming_batch_get_output_keepalives_ = std::move(output_keepalives);
+    streaming_batch_get_control_keepalives_ = std::move(control_keepalives);
+  }
+
+  // Publish the graph-stable descriptor-pointer table for every queue of
+  // every already-bound streaming layer.  This is intentionally a cold
+  // lifecycle operation: the LI AIV code later copies the selected queue's
+  // template, fills only that queue's candidate vectors/count, and rings its
+  // own doorbell.  There is no host-side descriptor rewrite during capture or
+  // replay.
+  void ConfigureStreamingBatchGetQueueTemplates(
+      const py::sequence& layer_ids, const py::sequence& queue_ids,
+      const py::sequence& address_tables, const py::sequence& valid_tables,
+      const py::sequence& indices, const py::sequence& offsets,
+      const py::sequence& masks, const py::sequence& output_indices,
+      const py::object& producer_stream) {
+    EnsureNoNativeGetLane("configure_streaming_batch_get_queue_templates");
+    if (!Initialized()) {
+      throw std::runtime_error("Runtime has not been initialized");
+    }
+    if (!streaming_batch_get_control_bound_) {
+      throw py::value_error(
+          "configure_streaming_batch_get_queue_templates requires a bound "
+          "streaming BatchGet control table");
+    }
+    const py::ssize_t count = py::len(layer_ids);
+    if (count <= 0 || py::len(queue_ids) != count ||
+        py::len(address_tables) != count || py::len(valid_tables) != count ||
+        py::len(indices) != count || py::len(offsets) != count ||
+        py::len(masks) != count || py::len(output_indices) != count) {
+      throw py::value_error(
+          "streaming descriptor templates require non-empty equal-length "
+          "layer_ids, queue_ids, address_tables, valid_tables, indices, "
+          "offsets, masks, and output_indices sequences");
+    }
+
+    const auto checked_layer_id = [](const py::object& value,
+                                     const char* name) -> std::uint32_t {
+      const py::ssize_t converted = value.cast<py::ssize_t>();
+      if (converted < 0 ||
+          static_cast<std::uint64_t>(converted) >
+              std::numeric_limits<std::uint32_t>::max()) {
+        throw py::value_error(std::string(name) + " must fit uint32");
+      }
+      return static_cast<std::uint32_t>(converted);
+    };
+    const auto validate_vector = [](const NpuTensorView& view,
+                                    const py::object& tensor,
+                                    std::size_t element_bytes,
+                                    const char* dtype,
+                                    const std::string& label) {
+      if (view.shape.size() != 1 || view.element_bytes != element_bytes ||
+          py::str(tensor.attr("dtype")).cast<std::string>() != dtype) {
+        throw py::value_error(label + " must be a contiguous one-dimensional " +
+                              std::string(dtype) + " NPU Tensor");
+      }
+    };
+
+    std::vector<StreamingBatchGetLayerTemplates> templates;
+    std::vector<py::object> keepalives;
+    templates.reserve(static_cast<std::size_t>(count));
+    keepalives.reserve(static_cast<std::size_t>(count) * 6U);
+    for (py::ssize_t index = 0; index < count; ++index) {
+      py::object layer_id_object = layer_ids[index].cast<py::object>();
+      py::object queue_id_object = queue_ids[index].cast<py::object>();
+      const std::uint32_t layer_id =
+          checked_layer_id(layer_id_object, "streaming descriptor layer_id");
+      const std::uint32_t queue_id =
+          checked_layer_id(queue_id_object, "streaming descriptor queue_id");
+      py::object address_table = address_tables[index].cast<py::object>();
+      py::object valid_table = valid_tables[index].cast<py::object>();
+      py::object index_vector = indices[index].cast<py::object>();
+      py::object offset_vector = offsets[index].cast<py::object>();
+      py::object mask = masks[index].cast<py::object>();
+      py::object output_index_vector = output_indices[index].cast<py::object>();
+      const std::string label =
+          "streaming descriptor layer=" + std::to_string(layer_id) +
+          " queue=" + std::to_string(queue_id);
+      const NpuTensorView address_view =
+          GetNpuTensorView(address_table, (label + " address_table").c_str());
+      const NpuTensorView valid_view =
+          GetNpuTensorView(valid_table, (label + " valid_table").c_str());
+      const NpuTensorView index_view =
+          GetNpuTensorView(index_vector, (label + " indices").c_str());
+      const NpuTensorView offset_view =
+          GetNpuTensorView(offset_vector, (label + " offsets").c_str());
+      const NpuTensorView mask_view =
+          GetNpuTensorView(mask, (label + " mask").c_str());
+      const NpuTensorView output_index_view = GetNpuTensorView(
+          output_index_vector, (label + " output_indices").c_str());
+      validate_vector(address_view, address_table, sizeof(std::uint64_t),
+                      "torch.int64", label + " address_table");
+      validate_vector(valid_view, valid_table, sizeof(std::uint8_t),
+                      "torch.uint8", label + " valid_table");
+      validate_vector(index_view, index_vector, sizeof(std::int32_t),
+                      "torch.int32", label + " indices");
+      validate_vector(offset_view, offset_vector, sizeof(std::int32_t),
+                      "torch.int32", label + " offsets");
+      validate_vector(mask_view, mask, sizeof(std::uint8_t), "torch.uint8",
+                      label + " mask");
+      validate_vector(output_index_view, output_index_vector,
+                      sizeof(std::int32_t), "torch.int32",
+                      label + " output_indices");
+
+      StreamingBatchGetLayerTemplates* layer_templates = nullptr;
+      for (StreamingBatchGetLayerTemplates& candidate : templates) {
+        if (candidate.layer_id == layer_id) {
+          layer_templates = &candidate;
+          break;
+        }
+      }
+      if (layer_templates == nullptr) {
+        templates.push_back(StreamingBatchGetLayerTemplates{});
+        templates.back().layer_id = layer_id;
+        layer_templates = &templates.back();
+      }
+      layer_templates->queues.push_back(StreamingBatchGetQueueTemplate{
+          queue_id,
+          MutableBufferView{address_view.data, address_view.bytes,
+                            DeviceKind::kNpu},
+          MutableBufferView{valid_view.data, valid_view.bytes, DeviceKind::kNpu},
+          MutableBufferView{index_view.data, index_view.bytes, DeviceKind::kNpu},
+          MutableBufferView{offset_view.data, offset_view.bytes,
+                            DeviceKind::kNpu},
+          MutableBufferView{mask_view.data, mask_view.bytes, DeviceKind::kNpu},
+          MutableBufferView{output_index_view.data, output_index_view.bytes,
+                            DeviceKind::kNpu}});
+      keepalives.push_back(std::move(address_table));
+      keepalives.push_back(std::move(valid_table));
+      keepalives.push_back(std::move(index_vector));
+      keepalives.push_back(std::move(offset_vector));
+      keepalives.push_back(std::move(mask));
+      keepalives.push_back(std::move(output_index_vector));
+    }
+
+    const aclrtStream raw_producer_stream = ResolveStream(producer_stream);
+    ThrowIfAclError(
+        aclrtSynchronizeStream(raw_producer_stream),
+        "aclrtSynchronizeStream before streaming descriptor template configure");
+    ThrowIfError(
+        access_operator_->ConfigureStreamingBatchGetQueueTemplates(templates));
+    streaming_batch_get_template_keepalives_ = std::move(keepalives);
+  }
+
+  void ReleaseStreamingBatchGetControl() {
+    if (!streaming_batch_get_control_bound_) {
+      return;
+    }
+    EnsureNoNativeGetLane("release_streaming_batch_get_control");
+    ThrowIfError(access_operator_->ReleaseStreamingBatchGetControl());
+    streaming_batch_get_control_bound_ = false;
+    streaming_batch_get_output_keepalives_.clear();
+    streaming_batch_get_control_keepalives_.clear();
+    streaming_batch_get_template_keepalives_.clear();
+  }
+
+  std::string StreamingBatchGetControlDiagnostic() const {
+    std::string diagnostic;
+    ThrowIfError(access_operator_->DescribeStreamingBatchGetControl(
+        &diagnostic));
+    return diagnostic;
+  }
+
+  py::dict StreamingBatchGetPoolSnapshot() const {
+    StreamingBatchGetControlSnapshot snapshot;
+    ThrowIfError(access_operator_->GetStreamingBatchGetControlSnapshot(
+        &snapshot));
+    py::dict result;
+    result["magic"] = snapshot.magic;
+    result["version"] = snapshot.version;
+    result["active"] = snapshot.active;
+    result["bind_epoch"] = snapshot.bind_epoch;
+    result["bind_count"] = snapshot.bind_count;
+    result["release_count"] = snapshot.release_count;
+    result["template_configure_count"] = snapshot.template_configure_count;
+    result["queue_count"] = snapshot.queue_count;
+    result["queue_lease_address"] = snapshot.queue_lease_address;
+    result["queue_lease_bytes"] = snapshot.queue_lease_bytes;
+    result["descriptor_scratch_address"] = snapshot.descriptor_scratch_address;
+    result["descriptor_scratch_bytes"] = snapshot.descriptor_scratch_bytes;
+    py::list layers;
+    for (const StreamingBatchGetLayerSnapshot& layer : snapshot.layers) {
+      py::dict entry;
+      entry["layer_id"] = layer.layer_id;
+      entry["output_address"] = layer.output_address;
+      entry["control_address"] = layer.control_address;
+      entry["channel_entity_address"] = layer.channel_entity_address;
+      entry["descriptor_template_address"] =
+          layer.descriptor_template_address;
+      entry["descriptor_template_bytes"] = layer.descriptor_template_bytes;
+      entry["templates_configured"] = layer.templates_configured;
+      entry["private_output_rows"] = layer.private_output_rows;
+      entry["private_output_stride_bytes"] =
+          layer.private_output_stride_bytes;
+      layers.append(std::move(entry));
+    }
+    result["layers"] = std::move(layers);
+    return result;
   }
 
  private:
@@ -1387,11 +1662,11 @@ class NpuRuntime final {
     // the cold HBM registration.  Close rejects an unretired slot rather than
     // guessing whether a later QSFA reader is still using the payload.
     DestroyNativeGetSubmitLane();
-    if (fused_batch_get_control_bound_) {
+    if (HasFusedOrStreamingBatchGetControl()) {
       throw py::value_error(
-          "shutdown is forbidden while fused BatchGet control is bound; "
-          "wait for the final fused reader and call "
-          "release_fused_batch_get_control() first");
+          "shutdown is forbidden while fused or streaming BatchGet control "
+          "is bound; wait for the final fused reader and release the "
+          "control first");
     }
     if (runtime_ != nullptr && runtime_->initialized()) {
       ThrowIfError(runtime_->Shutdown());
@@ -1426,13 +1701,27 @@ class NpuRuntime final {
     }
   }
 
+  bool HasFusedOrStreamingBatchGetControl() const {
+    return fused_batch_get_control_bound_ || streaming_batch_get_control_bound_;
+  }
+
   void EnsureNoFusedBatchGetControl(const char* operation) const {
-    if (fused_batch_get_control_bound_) {
+    if (HasFusedOrStreamingBatchGetControl()) {
       throw py::value_error(
           std::string(operation) +
-          " is forbidden while fused BatchGet control owns this Runtime; "
+          " is forbidden while fused or streaming BatchGet control owns this Runtime; "
           "wait for the final fused reader and release the control first");
     }
+  }
+
+  static void LeakPyObjects(std::vector<py::object>* objects) {
+    if (objects == nullptr) {
+      return;
+    }
+    for (py::object& object : *objects) {
+      (void)object.release();
+    }
+    objects->clear();
   }
 
   void CloseNoThrow() {
@@ -1454,7 +1743,7 @@ class NpuRuntime final {
       (void)meta_manager_.release();
       return;
     }
-    if (fused_batch_get_control_bound_) {
+    if (HasFusedOrStreamingBatchGetControl()) {
       // The Python-visible release method requires the caller to establish
       // the terminal reader.  At exception-time destruction we cannot prove
       // that a captured fused graph stopped reading the output, so preserve
@@ -1462,6 +1751,9 @@ class NpuRuntime final {
       // Direct-HCCP state underneath an in-flight AIV.
       (void)fused_batch_get_output_keepalive_.release();
       (void)fused_batch_get_control_keepalive_.release();
+      LeakPyObjects(&streaming_batch_get_output_keepalives_);
+      LeakPyObjects(&streaming_batch_get_control_keepalives_);
+      LeakPyObjects(&streaming_batch_get_template_keepalives_);
       (void)runtime_.release();
       (void)access_operator_.release();
       (void)allocator_.release();
@@ -1494,6 +1786,10 @@ class NpuRuntime final {
   bool fused_batch_get_control_bound_{false};
   py::object fused_batch_get_output_keepalive_;
   py::object fused_batch_get_control_keepalive_;
+  bool streaming_batch_get_control_bound_{false};
+  std::vector<py::object> streaming_batch_get_output_keepalives_;
+  std::vector<py::object> streaming_batch_get_control_keepalives_;
+  std::vector<py::object> streaming_batch_get_template_keepalives_;
 };
 
 }  // namespace
@@ -1589,9 +1885,11 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("bind_fused_batch_get_control",
            &NpuRuntime::BindFusedBatchGetControl, py::arg("output"),
            py::arg("control"), py::arg("producer_stream") = py::none(),
+           py::arg("queue_count") = 2,
            "Cold-bind fixed output HBM and write a graph-stable uint64[16] "
-           "Direct-HCCP control block for the two-lane fused Get path. "
-           "Requires Runtime npu_core_count=2 and jettys_per_core=1; ordinary "
+           "Direct-HCCP control block for the legacy fused Get path. "
+           "queue_count selects [1, npu_core_count] queues and requires "
+           "jettys_per_core=1; ordinary "
            "and native-lane BatchGet remain unavailable until release. The "
            "caller must first complete earlier ordinary Get work from this Runtime. "
            "producer_stream orders any earlier PyTorch writes to output/control; "
@@ -1600,6 +1898,49 @@ void BindNpuPythonRuntime(py::module_& module) {
            &NpuRuntime::ReleaseFusedBatchGetControl,
            "Release the fused Get HBM registration after the final fused "
            "consumer has completed. This method does not synchronize a stream.")
+      .def("bind_streaming_batch_get_control",
+           &NpuRuntime::BindStreamingBatchGetControl, py::arg("layer_ids"),
+           py::arg("outputs"), py::arg("controls"),
+           py::arg("queue_count"),
+           py::arg("producer_stream") = py::none(),
+           "Cold-bind a complete layer-keyed streaming Direct-HCCP table. "
+           "layer_ids, outputs, and controls are equal-length non-empty sequences; "
+           "each control is a graph-stable NPU torch.int64[16] "
+           "KvafStreamingBatchGetControl. All layers share one int32 queue-pool "
+           "lease table of queue_count entries; any LI producer may lease a queue. "
+           "No layer can be hot-rebound: release the entire table only after all "
+           "terminal readers complete. ordinary and native-lane BatchGet remain "
+           "unavailable while the table is live.")
+      .def("configure_streaming_batch_get_queue_templates",
+           &NpuRuntime::ConfigureStreamingBatchGetQueueTemplates,
+           py::arg("layer_ids"), py::arg("queue_ids"),
+           py::arg("address_tables"), py::arg("valid_tables"),
+           py::arg("indices"), py::arg("offsets"), py::arg("masks"),
+           py::arg("output_indices"),
+           py::arg("producer_stream") = py::none(),
+           "Cold-publish one graph-stable descriptor template for every "
+           "(layer_id, queue_id) in the already-bound streaming table. Each "
+           "argument is a same-length sequence. address_tables are NPU int64 "
+           "vectors; valid_tables and masks are NPU uint8 vectors; indices, "
+           "offsets, and output_indices are NPU int32 vectors. A layer must "
+           "supply every queue exactly once. Address/valid tables may be "
+           "identically shared; all mutable descriptor vectors must be "
+           "non-overlapping. This can run once before graph capture only; LI "
+           "later copies the template and overwrites candidate data/count "
+           "without a host hot-submit.")
+      .def("release_streaming_batch_get_control",
+           &NpuRuntime::ReleaseStreamingBatchGetControl,
+           "Release every streaming layer registration and its shared queue-pool "
+           "lease table after all terminal graph readers have completed. This "
+           "method does not synchronize a stream.")
+      .def("streaming_batch_get_control_diagnostic",
+           &NpuRuntime::StreamingBatchGetControlDiagnostic,
+           "Return a compact cold-path diagnostic with queue-pool, descriptor "
+           "scratch, and per-layer private-output ABI addresses/counts.")
+      .def("streaming_pool_snapshot", &NpuRuntime::StreamingBatchGetPoolSnapshot,
+           "Return a structured read-only streaming-pool snapshot: control "
+           "magic/version, queue count, shared lease/scratch addresses, per-layer "
+           "private arenas/templates, and host lifecycle counters.")
       .def("batch_get", &NpuRuntime::BatchGet,
            py::arg("device_access_table"), py::arg("indices"), py::arg("offsets"),
            py::arg("mask"),

@@ -68,6 +68,76 @@ struct BatchGetKernelProfile {
 // output has completed.
 using BatchGetOutputBindingId = std::uint64_t;
 
+// One entry in a cold, layer-keyed Direct-HCCP binding table.  The caller
+// owns both NPU tensors and must keep them alive until the streaming table is
+// released.  `control` receives KvafStreamingBatchGetControl, a distinct
+// graph-stable uint64[16] ABI with a shared queue-pool lease table. Its
+// queue_count can be smaller than the Runtime's total transport queue count.
+//
+// This is deliberately a lifecycle table, not a hot submission API.  All
+// entries are registered and published together before graph capture.  KVAF
+// rejects adding, replacing, or rebinding one layer while the table is live.
+struct StreamingBatchGetLayerBinding {
+  std::uint32_t layer_id{0};
+  MutableBufferView output;
+  MutableBufferView control;
+};
+
+// One graph-stable descriptor template for a single queue of a streaming
+// layer. The address/valid table may be shared by multiple queue templates;
+// indices/offsets/mask/output_indices are queue-private mutable slices that
+// the LI kernel fills during replay. KVAF derives capacities and the private
+// output-row base from the supplied buffers and cold-bound output arena.
+struct StreamingBatchGetQueueTemplate {
+  std::uint32_t queue_id{0};
+  MutableBufferView address_table;
+  MutableBufferView valid_table;
+  MutableBufferView indices;
+  MutableBufferView offsets;
+  MutableBufferView mask;
+  MutableBufferView output_indices;
+};
+
+// Templates for one already-bound layer. Every bound layer must be listed
+// exactly once and must provide exactly one template for each queue id in
+// [0, queue_count). This is a cold pre-capture API; no queue template can be
+// replaced while the streaming table is live.
+struct StreamingBatchGetLayerTemplates {
+  std::uint32_t layer_id{0};
+  std::vector<StreamingBatchGetQueueTemplate> queues;
+};
+
+// Read-only cold-path introspection for the streaming queue pool. The three
+// lifecycle counters are host lifecycle counters only; they deliberately do
+// not claim a race-free live count of device-held leases during graph replay.
+struct StreamingBatchGetLayerSnapshot {
+  std::uint32_t layer_id{0};
+  std::uint64_t output_address{0};
+  std::uint64_t control_address{0};
+  std::uint64_t channel_entity_address{0};
+  std::uint64_t descriptor_template_address{0};
+  std::uint64_t descriptor_template_bytes{0};
+  std::uint64_t private_output_rows{0};
+  std::uint64_t private_output_stride_bytes{0};
+  bool templates_configured{false};
+};
+
+struct StreamingBatchGetControlSnapshot {
+  std::uint64_t magic{0};
+  std::uint64_t version{0};
+  std::uint64_t bind_epoch{0};
+  std::uint64_t bind_count{0};
+  std::uint64_t release_count{0};
+  std::uint64_t template_configure_count{0};
+  std::uint64_t queue_lease_address{0};
+  std::uint64_t descriptor_scratch_address{0};
+  std::uint64_t queue_lease_bytes{0};
+  std::uint64_t descriptor_scratch_bytes{0};
+  std::uint32_t queue_count{0};
+  bool active{false};
+  std::vector<StreamingBatchGetLayerSnapshot> layers;
+};
+
 // Default synchronous NPU data-plane implementation.
 //
 // Initialize creates reusable BatchGet and (when configured) BatchPut
@@ -106,9 +176,15 @@ class DefaultAccessOperator final : public AccessOperator {
   Status ExecuteBoundBatchGet(const BatchGetExecRequest& request,
                               BatchGetOutputBindingId binding_id);
 
-  // Cold-bind the exact two-worker Direct-HCCP state that a fused device
-  // operator needs. `control` is a caller-owned NPU uint64[16] buffer; KVAF
-  // writes KvafFusedBatchGetControl into it after registering `output`.
+  // Cold-bind Direct-HCCP state that a fused device operator needs. `control`
+  // is a caller-owned NPU uint64[16] buffer; KVAF writes the stable legacy
+  // KvafFusedBatchGetControl ABI into it after registering `output`.
+  //
+  // The legacy two-argument overload preserves the original two-queue
+  // contract. New users must pass queue_count explicitly. queue_count selects
+  // the first queue_count transport queues and must be in
+  // [1, npu_core_count]; the current device helper still requires exactly one
+  // Jetty per selected queue.
   // The binding is intentionally exclusive with ordinary and native-lane
   // BatchGet because all paths would otherwise mutate the same SQ/CQ state.
   // The NPU Runtime binding also freezes BatchPut, BatchFree and AccessTable
@@ -118,7 +194,37 @@ class DefaultAccessOperator final : public AccessOperator {
   // this Runtime; the caller must wait for every fused reader before release.
   Status BindFusedBatchGetControl(const MutableBufferView& output,
                                   const MutableBufferView& control);
+  Status BindFusedBatchGetControl(const MutableBufferView& output,
+                                  const MutableBufferView& control,
+                                  std::uint32_t queue_count);
   Status ReleaseFusedBatchGetControl();
+
+  // Cold-bind a fixed set of per-layer Direct-HCCP outputs and controls for a
+  // streaming fused operator. Each layer receives its own LocalBufferAcquire
+  // registration and KvafStreamingBatchGetControl uint64[16] control.
+  // `layer_id` is a caller
+  // supplied stable key; it must be unique in this table.  There is no
+  // per-layer hot rebind: release the whole table after the terminal reader,
+  // then bind a new table at a cold lifecycle boundary.
+  //
+  // The table is mutually exclusive with the single-control API, ordinary
+  // BatchGet, native BatchGet lanes, and metadata-mutating Runtime paths for
+  // the same reason as the legacy control: all would otherwise mutate the
+  // same Direct-HCCP SQ/CQ state.
+  Status BindStreamingBatchGetControl(
+      const std::vector<StreamingBatchGetLayerBinding>& layers,
+      std::uint32_t queue_count);
+  Status ConfigureStreamingBatchGetQueueTemplates(
+      const std::vector<StreamingBatchGetLayerTemplates>& layers);
+  Status ReleaseStreamingBatchGetControl();
+
+  // Compact cold-path diagnostic for remote validation. It never touches a
+  // Direct-HCCP queue and is safe only while the streaming table is live.
+  // The returned text identifies queue_count, shared lease/scratch addresses,
+  // and each fixed layer control/output registration.
+  Status DescribeStreamingBatchGetControl(std::string* diagnostic) const;
+  Status GetStreamingBatchGetControlSnapshot(
+      StreamingBatchGetControlSnapshot* snapshot) const;
 
   // Profiling is opt-in and uses the reserved per-core status area. Callers
   // must complete the BatchGet stream before copying the latest snapshot.
