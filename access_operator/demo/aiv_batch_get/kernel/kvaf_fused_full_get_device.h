@@ -6,12 +6,23 @@
 // ExecuteBatchGet is currently built as a standalone AIV kernel in
 // execute_batch_get_aiv.asc.  A MIX kernel cannot launch that global kernel
 // as a child.  This header instead includes the same single-source device
-// implementation with its standalone entry point suppressed, so a fused
-// operator can call
-// kvaf_fused_get::RunKvafFullBatchGetCore(args, core) or its bounded P1
-// counterpart `RunKvafDenseBatchGetCore256(args, active_request_count, core)`
-// inline. Keeping one source of truth is deliberate: the Direct-HCCP WQE and
-// CQ protocol must not drift between the normal BatchGet path and the fused
+// implementation with its standalone entry point suppressed.  A fused
+// operator can either call the compatibility helper
+// `RunKvafDenseBatchGetCore256(args, active_request_count, core)`, or use the
+// explicit transaction sequence below:
+//
+//   KvafDenseBatchGetTransaction txn;
+//   BeginKvafDenseBatchGetPostOnly(args, count, core, &txn);
+//   // Run ExactScan tiles and occasionally TryRetireKvafDenseBatchGet(...).
+//   FinishKvafDenseBatchGet(args, &txn);
+//
+// PostOnly has exactly the historical validation/WQE/SQ-doorbell semantics;
+// only the CQ wait moves outside it.  There is deliberately one transaction
+// per pre-bound queue: a caller must retire or finish a wave before posting a
+// later wave on the same queue.  The existing queue ABI has no multi-flight
+// CQ ledger, so relaxing that rule would make descriptor/WQE order ambiguous.
+// Keeping one source of truth is deliberate: the Direct-HCCP WQE and CQ
+// protocol must not drift between the normal BatchGet path and the fused
 // path.
 //
 // The caller owns `core`: it is a KVAF transport-worker ordinal in
