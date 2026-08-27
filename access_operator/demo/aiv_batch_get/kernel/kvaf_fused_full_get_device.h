@@ -47,6 +47,15 @@
 
 namespace kvaf_fused_get {
 
+// `batch_get_abi.h` is intentionally a C-compatible, global-namespace ABI:
+// host code, the standalone AIV kernel, and a fused AscendC operator all use
+// the same byte layout.  Expose the two streaming records through this device
+// helper namespace as aliases, rather than creating a second C++ wrapper
+// type.  That gives fused clients one coherent API while preserving the
+// host/HBM ABI exactly.
+using ::KvafStreamingBatchGetControl;
+using ::KvafStreamingBatchGetDescriptorScratch;
+
 // Caller-local lease state. It is intentionally not stored in HBM: the
 // globally shared state is only the int32 owner table referenced by the
 // graph-stable KvafStreamingBatchGetControl. `owner_tag` is positive and
@@ -99,6 +108,100 @@ struct KvafStreamingBatchGetReady {
   uint32_t ready;
   uint64_t result;
 };
+
+// AscendC treats GM and local memory as distinct C++ address spaces.  A
+// compiler-generated struct copy such as `local = *gm` is rejected even when
+// every field is a scalar.  Keep the control ABI identical, but transfer it
+// field-by-field at the explicit GM/local boundary.  There are two entry
+// points because a SIMT service must call a SIMT callee, while LI's scalar
+// hook runs on AIC.
+__aicore__ inline bool LoadKvafStreamingBatchGetControlFromGmForAicore(
+    __gm__ const KvafStreamingBatchGetControl* source,
+    KvafStreamingBatchGetControl* destination) {
+  if (source == nullptr || destination == nullptr) {
+    return false;
+  }
+  destination->magic = source->magic;
+  destination->version = source->version;
+  destination->channel_entity = source->channel_entity;
+  destination->queue_state = source->queue_state;
+  destination->core_status = source->core_status;
+  destination->output = source->output;
+  destination->queue_leases = source->queue_leases;
+  destination->descriptor_scratch = source->descriptor_scratch;
+  destination->queue_count = source->queue_count;
+  destination->output_rows = source->output_rows;
+  destination->private_output_stride_bytes = source->private_output_stride_bytes;
+  destination->output_offset_bytes = source->output_offset_bytes;
+  destination->jettys_per_core = source->jettys_per_core;
+  destination->block_bytes = source->block_bytes;
+  destination->descriptor_templates = source->descriptor_templates;
+  destination->descriptor_template_count = source->descriptor_template_count;
+  return true;
+}
+
+__simt_callee__ inline bool LoadKvafStreamingBatchGetControlFromGmForSimt(
+    __gm__ const KvafStreamingBatchGetControl* source,
+    KvafStreamingBatchGetControl* destination) {
+  if (source == nullptr || destination == nullptr) {
+    return false;
+  }
+  destination->magic = source->magic;
+  destination->version = source->version;
+  destination->channel_entity = source->channel_entity;
+  destination->queue_state = source->queue_state;
+  destination->core_status = source->core_status;
+  destination->output = source->output;
+  destination->queue_leases = source->queue_leases;
+  destination->descriptor_scratch = source->descriptor_scratch;
+  destination->queue_count = source->queue_count;
+  destination->output_rows = source->output_rows;
+  destination->private_output_stride_bytes = source->private_output_stride_bytes;
+  destination->output_offset_bytes = source->output_offset_bytes;
+  destination->jettys_per_core = source->jettys_per_core;
+  destination->block_bytes = source->block_bytes;
+  destination->descriptor_templates = source->descriptor_templates;
+  destination->descriptor_template_count = source->descriptor_template_count;
+  return true;
+}
+
+__aicore__ inline bool LoadKvafStreamingBatchGetDescriptorScratchFromGm(
+    __gm__ const KvafStreamingBatchGetDescriptorScratch* source,
+    KvafStreamingBatchGetDescriptorScratch* destination) {
+  if (source == nullptr || destination == nullptr) {
+    return false;
+  }
+  destination->address_table = source->address_table;
+  destination->valid_table = source->valid_table;
+  destination->indices = source->indices;
+  destination->offsets = source->offsets;
+  destination->mask = source->mask;
+  destination->output_indices = source->output_indices;
+  destination->table_capacity = source->table_capacity;
+  destination->request_capacity = source->request_capacity;
+  destination->active_request_count = source->active_request_count;
+  destination->private_output_row_base = source->private_output_row_base;
+  return true;
+}
+
+__aicore__ inline bool StoreKvafStreamingBatchGetDescriptorScratchToGm(
+    __gm__ KvafStreamingBatchGetDescriptorScratch* destination,
+    const KvafStreamingBatchGetDescriptorScratch& source) {
+  if (destination == nullptr) {
+    return false;
+  }
+  destination->address_table = source.address_table;
+  destination->valid_table = source.valid_table;
+  destination->indices = source.indices;
+  destination->offsets = source.offsets;
+  destination->mask = source.mask;
+  destination->output_indices = source.output_indices;
+  destination->table_capacity = source.table_capacity;
+  destination->request_capacity = source.request_capacity;
+  destination->active_request_count = source.active_request_count;
+  destination->private_output_row_base = source.private_output_row_base;
+  return true;
+}
 
 __simt_callee__ inline bool IsKvafStreamingBatchGetControlValidForLease(
     const KvafStreamingBatchGetControl& control) {
@@ -189,7 +292,10 @@ inline void KvafStreamingBatchGetAcquireSimtService(
   if (result == nullptr || control_gm == nullptr) {
     return;
   }
-  const KvafStreamingBatchGetControl control = *control_gm;
+  KvafStreamingBatchGetControl control{};
+  if (!LoadKvafStreamingBatchGetControlFromGmForSimt(control_gm, &control)) {
+    return;
+  }
   KvafStreamingBatchGetLease lease{};
   if (TryAcquireKvafStreamingBatchGetQueueFromSimt(
           control, producer_id, start_hint, &lease)) {
@@ -286,7 +392,9 @@ __aicore__ inline bool LoadKvafStreamingBatchGetQueueTemplate(
   if (source == nullptr) {
     return false;
   }
-  *descriptor = *source;
+  if (!LoadKvafStreamingBatchGetDescriptorScratchFromGm(source, descriptor)) {
+    return false;
+  }
   // A configured template intentionally has active_request_count == 0. It
   // becomes a valid wave only after the producer has written its own compact
   // candidate arrays and sets a nonzero count before Publish.
@@ -360,10 +468,9 @@ __aicore__ inline bool PublishKvafStreamingBatchGetDescriptorScratch(
   }
   __gm__ KvafStreamingBatchGetDescriptorScratch* const scratch =
       GetKvafStreamingBatchGetDescriptorScratch(control, queue_id);
-  if (scratch == nullptr) {
+  if (!StoreKvafStreamingBatchGetDescriptorScratchToGm(scratch, descriptor)) {
     return false;
   }
-  *scratch = descriptor;
   // The following Begin may hand the queue to Direct-HCCP immediately. Keep
   // descriptor publication ordered before its SQ WQE materialization.
   AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
@@ -418,26 +525,27 @@ __aicore__ inline bool BuildKvafStreamingBatchGetQueueArgs(
   }
   __gm__ const KvafStreamingBatchGetDescriptorScratch* const scratch =
       GetKvafStreamingBatchGetDescriptorScratch(control, queue_id);
-  if (scratch == nullptr || scratch->address_table == 0U ||
-      scratch->valid_table == 0U || scratch->indices == 0U ||
-      scratch->offsets == 0U || scratch->mask == 0U ||
-      scratch->output_indices == 0U ||
-      scratch->table_capacity == 0U || scratch->request_capacity == 0U ||
-      scratch->request_capacity > kDenseRequestCapacity ||
-      scratch->active_request_count == 0U ||
-      scratch->active_request_count > scratch->request_capacity ||
+  KvafStreamingBatchGetDescriptorScratch descriptor{};
+  if (!LoadKvafStreamingBatchGetDescriptorScratchFromGm(scratch, &descriptor) ||
+      descriptor.address_table == 0U || descriptor.valid_table == 0U ||
+      descriptor.indices == 0U || descriptor.offsets == 0U ||
+      descriptor.mask == 0U || descriptor.output_indices == 0U ||
+      descriptor.table_capacity == 0U || descriptor.request_capacity == 0U ||
+      descriptor.request_capacity > kDenseRequestCapacity ||
+      descriptor.active_request_count == 0U ||
+      descriptor.active_request_count > descriptor.request_capacity ||
       control.output_rows > UINT32_MAX ||
       !ValidateKvafStreamingBatchGetPrivateOutputIndices(
-          control, queue_id, *scratch)) {
+          control, queue_id, descriptor)) {
     return false;
   }
 
-  queue_args->address_table = scratch->address_table;
-  queue_args->valid_table = scratch->valid_table;
-  queue_args->indices = scratch->indices;
-  queue_args->offsets = scratch->offsets;
-  queue_args->mask = scratch->mask;
-  queue_args->output_indices = scratch->output_indices;
+  queue_args->address_table = descriptor.address_table;
+  queue_args->valid_table = descriptor.valid_table;
+  queue_args->indices = descriptor.indices;
+  queue_args->offsets = descriptor.offsets;
+  queue_args->mask = descriptor.mask;
+  queue_args->output_indices = descriptor.output_indices;
   // Keep the full registration base to satisfy the unchanged Direct-HCCP
   // entity check. The descriptor's validated absolute output indices select
   // this queue's private slot arena inside that allocation.
@@ -448,13 +556,13 @@ __aicore__ inline bool BuildKvafStreamingBatchGetQueueArgs(
       control.channel_entity + queue_id * sizeof(KvafBatchGetDirectUrmaEntity);
   queue_args->queue_state =
       control.queue_state + queue_id * sizeof(KvafBatchGetQueueState);
-  queue_args->table_capacity = scratch->table_capacity;
-  queue_args->request_capacity = scratch->request_capacity;
+  queue_args->table_capacity = descriptor.table_capacity;
+  queue_args->request_capacity = descriptor.request_capacity;
   queue_args->output_rows = static_cast<uint32_t>(control.output_rows);
   queue_args->block_bytes = static_cast<uint32_t>(control.block_bytes);
   queue_args->block_count = 1U;
   queue_args->jettys_per_core = 1U;
-  *active_request_count = scratch->active_request_count;
+  *active_request_count = descriptor.active_request_count;
   return true;
 }
 
@@ -587,7 +695,10 @@ inline void KvafStreamingBatchGetReleaseSimtService(
   if (result == nullptr || control_gm == nullptr) {
     return;
   }
-  const KvafStreamingBatchGetControl control = *control_gm;
+  KvafStreamingBatchGetControl control{};
+  if (!LoadKvafStreamingBatchGetControlFromGmForSimt(control_gm, &control)) {
+    return;
+  }
   KvafStreamingBatchGetLease lease{queue_id, owner_tag,
                                     kStreamingBatchGetLeaseTerminal, 0U};
   if (ReleaseKvafStreamingBatchGetQueueFromSimt(control, &lease)) {
