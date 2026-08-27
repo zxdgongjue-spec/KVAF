@@ -49,11 +49,12 @@ struct DirectHccpSession {
   RaInitFn ra_init = nullptr;
   RaDeinitFn ra_deinit = nullptr;
   RtOpenNetServiceFn rt_open_net_service = nullptr;
+  std::string ra_library_name;
   uint32_t reference_count = 0U;
   // This is the NPU process's peer-online RA bootstrap mode. It creates no
   // CPU Runtime resource and is required before the device-side HDC context.
-  bool peer_ra_initialized = false;
-  bool device_ra_initialized = false;
+  bool peer_ra_owned = false;
+  bool device_ra_owned = false;
 };
 
 namespace {
@@ -61,6 +62,9 @@ namespace {
 constexpr uint32_t kPeerOnline = 0U;
 constexpr uint32_t kOfflineHdc = 1U;
 constexpr int kInitAgain = 128001;
+// HCCL maps this RA return value to REPEAT_RAINIT_ERROR_CODE. It means a
+// compatible RA instance already exists for this device in the process.
+constexpr int kRepeatRaInit = 328002;
 constexpr uint32_t kRetryMs = 10U;
 constexpr uint32_t kTimeoutMs = 10000U;
 
@@ -88,6 +92,7 @@ void CloseLibraries(DirectHccpSession *session) {
   session->ra_init = nullptr;
   session->ra_deinit = nullptr;
   session->rt_open_net_service = nullptr;
+  session->ra_library_name.clear();
 }
 
 bool LoadSessionApi(DirectHccpSession *session) {
@@ -102,6 +107,7 @@ bool LoadSessionApi(DirectHccpSession *session) {
     session->ra_init = reinterpret_cast<RaInitFn>(dlsym(session->ra_library, "RaInit"));
     session->ra_deinit = reinterpret_cast<RaDeinitFn>(dlsym(session->ra_library, "RaDeinit"));
     if (session->ra_init != nullptr && session->ra_deinit != nullptr) {
+      session->ra_library_name = candidate;
       break;
     }
     dlclose(session->ra_library);
@@ -136,10 +142,14 @@ bool LoadSessionApi(DirectHccpSession *session) {
     CloseLibraries(session);
     return false;
   }
+  std::fprintf(stderr,
+               "[KVAF_AIV] DIRECT_HCCP_SESSION_API_READY ra_library=%s "
+               "device_ra_policy=ra_init_ret_328002_reuse\n",
+               session->ra_library_name.c_str());
   return true;
 }
 
-bool CallRaInit(DirectHccpSession *session, uint32_t mode, const char *role) {
+int CallRaInitWithRetry(DirectHccpSession *session, uint32_t mode, const char *role) {
   RaInitConfig config{};
   config.phy_id = session->key.physical_device_id;
   config.nic_position = mode;
@@ -153,16 +163,59 @@ bool CallRaInit(DirectHccpSession *session, uint32_t mode, const char *role) {
       VerboseLog(
           "[KVAF_AIV] DIRECT_HCCP_SESSION_RA_READY role=%s physical=%u mode=%u hdc_type=%u\n",
           role, session->key.physical_device_id, mode, session->key.hdc_type);
-      return true;
+      return 0;
     }
     if (ret != kInitAgain) {
       break;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(kRetryMs));
   } while (std::chrono::steady_clock::now() < deadline);
+  return ret;
+}
+
+bool CallRaInit(DirectHccpSession *session, uint32_t mode, const char *role) {
+  const int ret = CallRaInitWithRetry(session, mode, role);
+  if (ret == 0) {
+    return true;
+  }
   std::fprintf(stderr,
                "[KVAF_AIV] DIRECT_HCCP_SESSION_RA_INIT_FAILED role=%s physical=%u mode=%u ret=%d timeout_ms=%u\n",
                role, session->key.physical_device_id, mode, ret, kTimeoutMs);
+  return false;
+}
+
+// HCCL can initialize device-side PID/HDC RA before KVAF creates its
+// Direct-HCCP transport. In that case RaInit returns 328002. RaInit's return
+// value is the compatibility signal used by HCCL itself, including when HCCL
+// and KVAF resolve RA through different library images. KVAF therefore owns
+// and deinitializes device RA only after a successful RaInit; on 328002 it
+// borrows the existing RA while retaining independent data-plane resources.
+bool EnsureDeviceRa(DirectHccpSession *session) {
+  if (session == nullptr) {
+    return false;
+  }
+  const int ret = CallRaInitWithRetry(session, kOfflineHdc, "device_aiv");
+  if (ret == 0) {
+    session->device_ra_owned = true;
+    std::fprintf(stderr,
+                 "[KVAF_AIV] DIRECT_HCCP_SESSION_RA_OWNED "
+                 "role=device_aiv physical=%u hdc_type=%u\n",
+                 session->key.physical_device_id, session->key.hdc_type);
+    return true;
+  }
+  if (ret == kRepeatRaInit) {
+    session->device_ra_owned = false;
+    std::fprintf(stderr,
+                 "[KVAF_AIV] DIRECT_HCCP_SESSION_RA_REUSED "
+                 "role=device_aiv physical=%u hdc_type=%u "
+                 "source=ra_init_ret_328002\n",
+                 session->key.physical_device_id, session->key.hdc_type);
+    return true;
+  }
+  std::fprintf(stderr,
+               "[KVAF_AIV] DIRECT_HCCP_SESSION_RA_INIT_FAILED "
+               "role=device_aiv physical=%u mode=%u ret=%d timeout_ms=%u\n",
+               session->key.physical_device_id, kOfflineHdc, ret, kTimeoutMs);
   return false;
 }
 
@@ -198,7 +251,7 @@ bool Bootstrap(DirectHccpSession *session) {
   if (!CallRaInit(session, kPeerOnline, "peer_online")) {
     return false;
   }
-  session->peer_ra_initialized = true;
+  session->peer_ra_owned = true;
 
   const std::string hdc_service_argument = "--hdcType=" + std::to_string(session->key.hdc_type);
   RtProcExtParam parameter{};
@@ -213,18 +266,17 @@ bool Bootstrap(DirectHccpSession *session) {
                  "[KVAF_AIV] DIRECT_HCCP_SESSION_SERVICE_FAILED physical=%u ret=%d hdc_type=%u\n",
                  session->key.physical_device_id, service_ret, session->key.hdc_type);
     CallRaDeinitBestEffort(session, kPeerOnline, "peer_online");
-    session->peer_ra_initialized = false;
+    session->peer_ra_owned = false;
     return false;
   }
   VerboseLog("[KVAF_AIV] DIRECT_HCCP_SESSION_SERVICE_READY physical=%u hdc_type=%u\n",
              session->key.physical_device_id, session->key.hdc_type);
 
-  if (!CallRaInit(session, kOfflineHdc, "device_aiv")) {
+  if (!EnsureDeviceRa(session)) {
     CallRaDeinitBestEffort(session, kPeerOnline, "peer_online");
-    session->peer_ra_initialized = false;
+    session->peer_ra_owned = false;
     return false;
   }
-  session->device_ra_initialized = true;
   return true;
 }
 
@@ -232,10 +284,10 @@ void DestroySession(DirectHccpSession *session) {
   if (session == nullptr) {
     return;
   }
-  if (session->device_ra_initialized) {
+  if (session->device_ra_owned) {
     CallRaDeinitBestEffort(session, kOfflineHdc, "device_aiv");
   }
-  if (session->peer_ra_initialized) {
+  if (session->peer_ra_owned) {
     CallRaDeinitBestEffort(session, kPeerOnline, "peer_online");
   }
   CloseLibraries(session);
