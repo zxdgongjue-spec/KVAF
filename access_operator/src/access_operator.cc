@@ -1041,7 +1041,7 @@ Status DefaultAccessOperator::BindStreamingBatchGetControl(
   const std::size_t queue_lease_bytes =
       static_cast<std::size_t>(queue_count) *
       KVAF_STREAMING_BATCH_GET_QUEUE_LEASE_BYTES;
-  if (queue_leases.kind != DeviceKind::kNpu || queue_leases.data == nullptr ||
+  if (queue_leases.device != DeviceKind::kNpu || queue_leases.data == nullptr ||
       queue_leases.bytes != queue_lease_bytes) {
     return InvalidArgument(
         "streaming BatchGet queue_leases must be one graph-visible NPU "
