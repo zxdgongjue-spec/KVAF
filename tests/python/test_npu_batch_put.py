@@ -117,7 +117,10 @@ def main() -> int:
     )
     runtime.link_to(cpu_service)
     total_bytes = sum(row_lengths)
-    runtime.initialize(total_bytes * 2, maximum)
+    # MetaManager allocates one fixed-size remote slot per row.  The peer
+    # allocator requires ddr_bytes to be an exact multiple of slot_size;
+    # variable payload bytes cannot be used directly as the region size.
+    runtime.initialize(rows * maximum, maximum)
     try:
         print(f"BATCH_PUT_CONFIG rows={rows} groups={group_count} min_bytes={minimum} max_bytes={maximum} total_bytes={total_bytes} cores={cores} jettys_per_core={jettys}")
         single_source = [torch.cat(sources)]
