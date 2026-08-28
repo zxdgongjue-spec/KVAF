@@ -58,10 +58,10 @@ struct BatchPutExecutionState {
 
 struct BatchPutMetadataLayout {
   std::size_t source_descriptors{0};
-  std::size_t source_indices{0};
   std::size_t input_offsets{0};
   std::size_t lengths{0};
   std::size_t destinations{0};
+  std::size_t source_indices{0};
   std::size_t bytes{0};
 };
 
@@ -74,13 +74,14 @@ BatchPutMetadataLayout MakeBatchPutMetadataLayout(std::size_t sources,
                                                    std::size_t rows) {
   BatchPutMetadataLayout layout;
   layout.source_descriptors = 0;
-  layout.source_indices =
+  layout.input_offsets =
+      layout.source_descriptors +
       sources * sizeof(KvafBatchPutSourceDescriptor);
-  layout.input_offsets = AlignToU64(
-      layout.source_indices + rows * sizeof(std::uint32_t));
   layout.lengths = layout.input_offsets + rows * sizeof(std::uint64_t);
   layout.destinations = layout.lengths + rows * sizeof(std::uint64_t);
-  layout.bytes = layout.destinations + rows * sizeof(std::uint64_t);
+  layout.source_indices =
+      layout.destinations + rows * sizeof(std::uint64_t);
+  layout.bytes = layout.source_indices + rows * sizeof(std::uint32_t);
   return layout;
 }
 
@@ -546,13 +547,6 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
         MakeBatchPutMetadataLayout(sources, rows);
     auto* const host_metadata = reinterpret_cast<std::uint8_t*>(
         execution.host_metadata.data());
-    std::memcpy(host_metadata + layout.source_indices,
-                exec.plan->source_indices.data(),
-                rows * sizeof(std::uint32_t));
-    const std::size_t source_indices_end =
-        layout.source_indices + rows * sizeof(std::uint32_t);
-    std::memset(host_metadata + source_indices_end, 0,
-                layout.input_offsets - source_indices_end);
     std::memcpy(host_metadata + layout.input_offsets,
                 exec.plan->offsets.data(), rows * sizeof(std::uint64_t));
     std::memcpy(host_metadata + layout.lengths, exec.plan->lengths.data(),
@@ -591,6 +585,9 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
                   &descriptor, sizeof(descriptor));
       local_buffers.push_back(local_buffer);
     }
+    std::memcpy(host_metadata + layout.source_indices,
+                exec.plan->source_indices.data(),
+                rows * sizeof(std::uint32_t));
 
     if (aclrtMemcpy(execution.metadata, layout.bytes,
                     execution.host_metadata.data(), layout.bytes,
