@@ -257,10 +257,8 @@ class PythonRuntime final {
         throw py::value_error(
             "BatchPut group keys, input_offsets, and lengths must be non-empty and equal in size");
       }
-      py::buffer input = py::buffer::ensure(inputs[group_index]);
-      if (!input) {
-        throw py::type_error("BatchPut input entries must support the buffer protocol");
-      }
+      py::buffer input =
+          py::reinterpret_borrow<py::buffer>(inputs[group_index]);
       const py::buffer_info info = input.request();
       if (info.ptr == nullptr || info.size <= 0 || info.itemsize <= 0 ||
           !IsCContiguous(info) ||
