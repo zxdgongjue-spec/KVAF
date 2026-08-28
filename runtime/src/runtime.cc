@@ -330,34 +330,64 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
-  if (request.keys.empty() || request.input.data == nullptr ||
-      request.input.bytes == 0 ||
-      request.keys.size() != request.input_offsets.size() ||
-      request.keys.size() != request.lengths.size()) {
+  if (request.groups.empty() ||
+      request.groups.size() > std::numeric_limits<std::uint32_t>::max()) {
     return Status::InvalidArgument(
-        "BatchPut keys, input_offsets, and lengths must be non-empty and equal in size");
+        "BatchPut group count must be non-zero and fit the execution ABI");
   }
 
-  for (std::size_t index = 0; index < request.keys.size(); ++index) {
-    const std::uint64_t offset = request.input_offsets[index];
-    const std::uint64_t length = request.lengths[index];
-    if (length == 0 || offset > request.input.bytes ||
-        length > request.input.bytes - offset) {
+  std::size_t rows = 0;
+  for (const BatchPutGroup& group : request.groups) {
+    if (group.keys.empty() || group.input.data == nullptr ||
+        group.input.bytes == 0 ||
+        group.keys.size() != group.input_offsets.size() ||
+        group.keys.size() != group.lengths.size() ||
+        group.keys.size() > std::numeric_limits<std::size_t>::max() - rows) {
       return Status::InvalidArgument(
-          "BatchPut input_offsets and lengths must describe bytes inside input");
+          "BatchPut group keys, input_offsets, and lengths must be non-empty and equal in size");
     }
+    for (std::size_t index = 0; index < group.keys.size(); ++index) {
+      const std::uint64_t offset = group.input_offsets[index];
+      const std::uint64_t length = group.lengths[index];
+      if (length == 0 || offset > group.input.bytes ||
+          length > group.input.bytes - offset) {
+        return Status::InvalidArgument(
+            "BatchPut input_offsets and lengths must describe bytes inside input");
+      }
+    }
+    rows += group.keys.size();
+  }
+
+  BatchPutExecutionPlan plan;
+  plan.flat_keys.reserve(rows);
+  plan.sources.reserve(request.groups.size());
+  plan.source_indices.reserve(rows);
+  plan.offsets.reserve(rows);
+  plan.lengths.reserve(rows);
+  for (std::size_t group_index = 0; group_index < request.groups.size();
+       ++group_index) {
+    const BatchPutGroup& group = request.groups[group_index];
+    plan.sources.push_back(group.input);
+    plan.flat_keys.insert(plan.flat_keys.end(), group.keys.begin(),
+                          group.keys.end());
+    plan.source_indices.insert(plan.source_indices.end(), group.keys.size(),
+                               static_cast<std::uint32_t>(group_index));
+    plan.offsets.insert(plan.offsets.end(), group.input_offsets.begin(),
+                        group.input_offsets.end());
+    plan.lengths.insert(plan.lengths.end(), group.lengths.begin(),
+                        group.lengths.end());
   }
 
   PutContext put_context;
   PutAccessDesc put_desc;
-  Status status = meta_manager_.PreparePut(request.keys, request.lengths,
+  Status status = meta_manager_.PreparePut(plan.flat_keys, plan.lengths,
                                            &put_context, &put_desc);
   if (!status.ok()) {
     return status;
   }
 
   status = access_operator_.ExecuteBatchPut(
-      BatchPutExecRequest{&request, &put_desc, execution});
+      BatchPutExecRequest{&plan, &put_desc, execution});
   if (!status.ok()) {
     (void)meta_manager_.AbortPut(put_context);
     return status;

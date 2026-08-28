@@ -68,15 +68,26 @@ struct BatchGetRequest {
   AccessTableDeviceView device_access_table;
 };
 
-struct BatchPutRequest {
+struct BatchPutGroup {
   std::vector<KeyId> keys;
-
-  // A caller-owned, contiguous buffer containing all source blocks.  It may
-  // reside on CPU or NPU memory; Runtime never packs, copies, owns, or
-  // releases it. input_offsets[i] and lengths[i] describe the source bytes
-  // for keys[i].
   ConstBufferView input;
   std::vector<std::uint64_t> input_offsets;
+  std::vector<std::uint64_t> lengths;
+};
+
+// Each group owns one caller-provided packed input view. keys[i] maps to the
+// byte range [input_offsets[i], input_offsets[i] + lengths[i]) in that view.
+struct BatchPutRequest {
+  std::vector<BatchPutGroup> groups;
+};
+
+// Runtime flattens grouped input once. AccessOperator consumes this contiguous
+// control-plane representation and does not re-walk the nested request.
+struct BatchPutExecutionPlan {
+  std::vector<KeyId> flat_keys;
+  std::vector<ConstBufferView> sources;
+  std::vector<std::uint32_t> source_indices;
+  std::vector<std::uint64_t> offsets;
   std::vector<std::uint64_t> lengths;
 };
 

@@ -169,24 +169,29 @@ class MockAccessOperator final : public AccessOperator {
       fail_next_put_ = false;
       return Internal("configured mock BatchPut failure");
     }
-    if (!initialized_ || exec.request == nullptr || exec.put_desc == nullptr ||
-        exec.request->input.data == nullptr || exec.request->input.bytes == 0 ||
-        exec.request->keys.size() != exec.request->input_offsets.size() ||
-        exec.request->keys.size() != exec.request->lengths.size() ||
-        exec.request->keys.size() != exec.put_desc->entries.size()) {
+    if (!initialized_ || exec.plan == nullptr || exec.put_desc == nullptr ||
+        exec.plan->flat_keys.empty() ||
+        exec.plan->flat_keys.size() != exec.plan->source_indices.size() ||
+        exec.plan->flat_keys.size() != exec.plan->offsets.size() ||
+        exec.plan->flat_keys.size() != exec.plan->lengths.size() ||
+        exec.plan->flat_keys.size() != exec.put_desc->entries.size()) {
       return InvalidArgument("invalid mock BatchPut request");
     }
 
-    const auto* input = static_cast<const std::uint8_t*>(exec.request->input.data);
-    for (std::size_t i = 0; i < exec.request->keys.size(); ++i) {
-      const std::uint64_t offset = exec.request->input_offsets[i];
-      const std::uint64_t length = exec.request->lengths[i];
+    for (std::size_t i = 0; i < exec.plan->flat_keys.size(); ++i) {
+      const std::uint32_t source_index = exec.plan->source_indices[i];
+      if (source_index >= exec.plan->sources.size()) {
+        return InvalidArgument("invalid mock BatchPut source index");
+      }
+      const ConstBufferView& source = exec.plan->sources[source_index];
+      const auto* input = static_cast<const std::uint8_t*>(source.data);
+      const std::uint64_t offset = exec.plan->offsets[i];
+      const std::uint64_t length = exec.plan->lengths[i];
       const PutAllocation& target = exec.put_desc->entries[i];
-      if (exec.request->input.device != DeviceKind::kCpu || length == 0 ||
-          offset > exec.request->input.bytes ||
-          length > exec.request->input.bytes - offset ||
+      if (source.device != DeviceKind::kCpu || length == 0 ||
+          offset > source.bytes || length > source.bytes - offset ||
           length != target.reserved_length ||
-          target.key != exec.request->keys[i]) {
+          target.key != exec.plan->flat_keys[i]) {
         return InvalidArgument("invalid mock BatchPut block");
       }
       std::memcpy(reinterpret_cast<void*>(target.address),
@@ -233,28 +238,48 @@ class PythonRuntime final {
     return result;
   }
 
-  // input_offsets and lengths are host metadata for the caller-owned packed
-  // input buffer. Runtime uses lengths for PreparePut; hardware operators can
-  // upload the same arrays as their per-request execution descriptors.
-  void BatchPut(const std::vector<KeyId>& keys, const py::buffer& input,
-                const std::vector<std::uint64_t>& input_offsets,
-                const std::vector<std::uint64_t>& lengths) {
-    const py::buffer_info info = input.request();
-    if (info.ptr == nullptr || info.size <= 0 || info.itemsize <= 0 ||
-        !IsCContiguous(info) ||
-        static_cast<std::size_t>(info.size) >
-            std::numeric_limits<std::size_t>::max() /
-                static_cast<std::size_t>(info.itemsize)) {
-      throw py::value_error("BatchPut input must be a non-empty contiguous buffer");
+  void BatchPut(std::vector<std::vector<KeyId>> keys,
+                const py::list& inputs,
+                std::vector<std::vector<std::uint64_t>> input_offsets,
+                std::vector<std::vector<std::uint64_t>> lengths) {
+    if (keys.empty() || keys.size() != static_cast<std::size_t>(inputs.size()) ||
+        keys.size() != input_offsets.size() || keys.size() != lengths.size()) {
+      throw py::value_error(
+          "BatchPut keys, inputs, input_offsets, and lengths must have equal outer sizes");
     }
-    ThrowIfError(runtime_->BatchPut(BatchPutRequest{
-        keys,
-        ConstBufferView{info.ptr,
-                        static_cast<std::size_t>(info.size) *
-                            static_cast<std::size_t>(info.itemsize),
-                        DeviceKind::kCpu},
-        input_offsets,
-        lengths}));
+
+    BatchPutRequest request;
+    request.groups.reserve(keys.size());
+    for (std::size_t group_index = 0; group_index < keys.size(); ++group_index) {
+      if (keys[group_index].empty() ||
+          keys[group_index].size() != input_offsets[group_index].size() ||
+          keys[group_index].size() != lengths[group_index].size()) {
+        throw py::value_error(
+            "BatchPut group keys, input_offsets, and lengths must be non-empty and equal in size");
+      }
+      py::buffer input = py::buffer::ensure(inputs[group_index]);
+      if (!input) {
+        throw py::type_error("BatchPut input entries must support the buffer protocol");
+      }
+      const py::buffer_info info = input.request();
+      if (info.ptr == nullptr || info.size <= 0 || info.itemsize <= 0 ||
+          !IsCContiguous(info) ||
+          static_cast<std::size_t>(info.size) >
+              std::numeric_limits<std::size_t>::max() /
+                  static_cast<std::size_t>(info.itemsize)) {
+        throw py::value_error(
+            "BatchPut input must be a non-empty contiguous buffer");
+      }
+      request.groups.push_back(BatchPutGroup{
+          std::move(keys[group_index]),
+          ConstBufferView{info.ptr,
+                          static_cast<std::size_t>(info.size) *
+                              static_cast<std::size_t>(info.itemsize),
+                          DeviceKind::kCpu},
+          std::move(input_offsets[group_index]),
+          std::move(lengths[group_index])});
+    }
+    ThrowIfError(runtime_->BatchPut(request));
   }
 
   AccessTableHandle PrepareAccessTable(const std::vector<KeyId>& keys) {

@@ -165,7 +165,7 @@ def main() -> int:
 
         def execute() -> None:
             nonlocal committed
-            runtime.batch_put(keys, source, offsets, lengths)
+            runtime.batch_put([keys], [source], [offsets], [lengths])
             committed = True
 
         def release() -> None:

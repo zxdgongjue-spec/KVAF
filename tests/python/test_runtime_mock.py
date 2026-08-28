@@ -45,7 +45,7 @@ class RuntimeMockTests(unittest.TestCase):
             input_offsets.append(len(packed))
             lengths.append(len(block))
             packed.extend(block)
-        self.kvaf.batch_put(keys, packed, input_offsets, lengths)
+        self.kvaf.batch_put([keys], [packed], [input_offsets], [lengths])
 
     def test_put_prepare_get_release_and_slot_reuse(self) -> None:
         self.kvaf.initialize(ddr_bytes=256, slot_size=64)
@@ -158,10 +158,10 @@ class RuntimeMockTests(unittest.TestCase):
         self.kvaf.initialize(ddr_bytes=64, slot_size=32)
         with self.assertRaises(ValueError):
             self.kvaf.batch_put(
-                keys=[1],
-                input=bytearray([1, 2, 3]),
-                input_offsets=[2],
-                lengths=[2],
+                keys=[[1]],
+                input=[bytearray([1, 2, 3])],
+                input_offsets=[[2]],
+                lengths=[[2]],
             )
 
 

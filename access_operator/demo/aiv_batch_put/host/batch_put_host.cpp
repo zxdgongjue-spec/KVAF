@@ -51,8 +51,6 @@ struct KvafBatchPutLocalBuffer {
   DirectMemory memory{};
   uint64_t input_hbm_address = 0U;
   uint64_t input_hbm_bytes = 0U;
-  void *device_entities = nullptr;
-  uint64_t device_channel_entity = 0U;
   uint32_t reference_count = 0U;
 };
 
@@ -73,6 +71,7 @@ struct KvafBatchPutTransport {
   void *device_peer_memory_import = nullptr;
   std::array<DirectAivWorker, kMaxDirectAivWorkers> workers{};
   std::array<KvafBatchPutDirectUrmaEntity, kMaxDirectAivWorkers> entity_templates{};
+  void *device_entities = nullptr;
   void *device_queue_state = nullptr;
   std::vector<std::unique_ptr<KvafBatchPutLocalBuffer>> local_buffers{};
   std::mutex mutex{};
@@ -232,9 +231,6 @@ void ReleaseTransport(KvafBatchPutTransport *transport) {
     return;
   }
   for (const auto &local : transport->local_buffers) {
-    if (local->device_entities != nullptr) {
-      (void)aclrtFree(local->device_entities);
-    }
     if (transport->api.lmem_unregister != nullptr && transport->device_context != nullptr &&
         local->memory.handle != nullptr) {
       (void)transport->api.lmem_unregister(transport->device_context, local->memory.handle);
@@ -245,6 +241,10 @@ void ReleaseTransport(KvafBatchPutTransport *transport) {
     }
   }
   transport->local_buffers.clear();
+  if (transport->device_entities != nullptr) {
+    (void)aclrtFree(transport->device_entities);
+    transport->device_entities = nullptr;
+  }
   if (transport->device_queue_state != nullptr) {
     (void)aclrtFree(transport->device_queue_state);
     transport->device_queue_state = nullptr;
@@ -287,6 +287,9 @@ int32_t CreateBatchPutTransport(void *host_ddr, uint64_t host_ddr_bytes,
   uint32_t device_transport_token_id = 0U;
   const uint64_t queue_bytes =
       static_cast<uint64_t>(state->worker_count) * sizeof(KvafBatchPutQueueState);
+  const uint64_t entity_bytes =
+      static_cast<uint64_t>(state->worker_count) *
+      sizeof(KvafBatchPutDirectUrmaEntity);
 
   if (!hccp::GetCurrentNpuPhysicalDeviceId(&physical_device_id)) {
     std::fprintf(stderr, "[KVAF_AIV] unable to resolve physical device id from selected ACL device\n");
@@ -380,7 +383,13 @@ int32_t CreateBatchPutTransport(void *host_ddr, uint64_t host_ddr_bytes,
       }
     }
   }
-  if (aclrtMalloc(&state->device_queue_state, queue_bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
+  if (aclrtMalloc(&state->device_entities, entity_bytes,
+                  ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
+      state->device_entities == nullptr ||
+      aclrtMemcpy(state->device_entities, entity_bytes,
+                  state->entity_templates.data(), entity_bytes,
+                  ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS ||
+      aclrtMalloc(&state->device_queue_state, queue_bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
       state->device_queue_state == nullptr ||
       aclrtMemset(state->device_queue_state, queue_bytes, 0, queue_bytes) != ACL_SUCCESS) {
     std::fprintf(stderr,
@@ -451,29 +460,6 @@ extern "C" int32_t KvafBatchPutLocalBufferAcquire(KvafBatchPutTransport *transpo
     return KVAF_BATCH_PUT_DIRECT_HCCP_ERROR;
   }
 
-  auto entities = transport->entity_templates;
-  for (uint32_t entity_index = 0U; entity_index < transport->worker_count; ++entity_index) {
-    entities[entity_index].local_hbm_address = input_address;
-    entities[entity_index].local_hbm_size = input_device_bytes;
-    entities[entity_index].local_token_id = candidate->memory.token_id;
-    entities[entity_index].local_token_value = candidate->memory.token_value;
-  }
-  const uint64_t entity_bytes =
-      static_cast<uint64_t>(transport->worker_count) * sizeof(entities.front());
-  if (aclrtMalloc(&candidate->device_entities, entity_bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
-      candidate->device_entities == nullptr ||
-      aclrtMemcpy(candidate->device_entities, entity_bytes, entities.data(), entity_bytes,
-                  ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
-    if (candidate->device_entities != nullptr) (void)aclrtFree(candidate->device_entities);
-    if (candidate->memory.handle != nullptr && transport->api.lmem_unregister != nullptr) {
-      (void)transport->api.lmem_unregister(transport->device_context, candidate->memory.handle);
-    }
-    if (candidate->token_handle != nullptr && transport->api.token_free != nullptr) {
-      (void)transport->api.token_free(transport->device_context, candidate->token_handle);
-    }
-    return KVAF_BATCH_PUT_RUNTIME_ERROR;
-  }
-  candidate->device_channel_entity = reinterpret_cast<uint64_t>(candidate->device_entities);
   candidate->reference_count = 1U;
   *local_buffer = candidate.get();
   transport->local_buffers.push_back(std::move(candidate));
@@ -498,24 +484,37 @@ extern "C" void KvafBatchPutLocalBufferRelease(KvafBatchPutLocalBuffer *local_bu
   --local_buffer->reference_count;
 }
 
-extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer,
+extern "C" int32_t KvafBatchPutLocalBufferDescribe(
+    const KvafBatchPutLocalBuffer *local_buffer,
+    KvafBatchPutSourceDescriptor *descriptor) {
+  if (local_buffer == nullptr || local_buffer->reference_count == 0U ||
+      local_buffer->transport == nullptr || descriptor == nullptr ||
+      local_buffer->input_hbm_address == 0U ||
+      local_buffer->memory.token_id == 0U) {
+    return KVAF_BATCH_PUT_INVALID_ARGUMENT;
+  }
+  descriptor->base_address = local_buffer->input_hbm_address;
+  descriptor->local_token_id = local_buffer->memory.token_id;
+  descriptor->reserved = 0U;
+  return KVAF_BATCH_PUT_SUCCESS;
+}
+
+extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutTransport *transport,
                                             const KvafExecuteBatchPutKernelArgs *arguments,
                                             aclrtStream stream,
                                             KvafBatchPutCoreStatus *core_status,
                                             uint32_t core_status_count) {
-  if (local_buffer == nullptr || local_buffer->reference_count == 0U ||
-      local_buffer->transport == nullptr || arguments == nullptr || stream == nullptr || core_status == nullptr ||
-      arguments->input == 0U || arguments->input_offsets == 0U || arguments->lengths == 0U ||
+  if (transport == nullptr || arguments == nullptr || stream == nullptr || core_status == nullptr ||
+      arguments->source_descriptors == 0U || arguments->source_indices == 0U ||
+      arguments->input_offsets == 0U || arguments->lengths == 0U ||
       arguments->destination_addresses == 0U || arguments->core_status == 0U ||
-      arguments->input_bytes == 0U || arguments->row_count == 0U ||
+      arguments->row_count == 0U ||
       arguments->aiv_core_count == 0U || arguments->aiv_core_count != core_status_count ||
-      arguments->aiv_core_count != local_buffer->transport->aiv_core_count ||
-      arguments->input != local_buffer->input_hbm_address ||
-      arguments->input_bytes > local_buffer->input_hbm_bytes) {
+      arguments->aiv_core_count != transport->aiv_core_count ||
+      transport->device_entities == nullptr) {
     return KVAF_BATCH_PUT_INVALID_ARGUMENT;
   }
 
-  KvafBatchPutTransport *transport = local_buffer->transport;
   std::lock_guard<std::mutex> launch_lock(transport->launch_mutex);
   const uint64_t status_bytes = static_cast<uint64_t>(core_status_count) * sizeof(*core_status);
   const aclError clear_result =
@@ -527,7 +526,7 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
   }
   KvafExecuteBatchPutLaunchArgs launch_args{};
   launch_args.request = *arguments;
-  launch_args.channel_entity = local_buffer->device_channel_entity;
+  launch_args.channel_entity = reinterpret_cast<uint64_t>(transport->device_entities);
   launch_args.queue_state = reinterpret_cast<uint64_t>(transport->device_queue_state);
   launch_args.jettys_per_core = transport->jettys_per_core;
   int32_t result = KvafExecuteBatchPutLaunchInternal(&launch_args, stream);

@@ -492,9 +492,11 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                        peer_candidate, candidate_count, npu_index, candidate.source.c_str(),
                        static_cast<unsigned long long>(probe_bytes));
           last = impl_->runtime_core->BatchPut(
-              BatchPutRequest{{std::numeric_limits<KeyId>::max()},
-                              ConstBufferView{impl_->probe_buffer, probe_bytes, DeviceKind::kNpu},
-                              {0U}, {probe_bytes}},
+              BatchPutRequest{{BatchPutGroup{
+                  {std::numeric_limits<KeyId>::max()},
+                  ConstBufferView{impl_->probe_buffer, probe_bytes,
+                                  DeviceKind::kNpu},
+                  {0U}, {probe_bytes}}}},
               BatchPutExecutionOptions{stream});
           if (last.ok()) last = impl_->runtime_core->BatchFree(BatchFreeRequest{{std::numeric_limits<KeyId>::max()}});
           if (last.ok()) {

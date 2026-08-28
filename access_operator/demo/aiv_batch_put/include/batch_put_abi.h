@@ -38,15 +38,21 @@ typedef struct KvafBatchPutCoreStatus {
   uint64_t reserved[38];
 } KvafBatchPutCoreStatus;
 
-// Runtime-facing eager BatchPut V1 ABI. All pointer fields are device
-// addresses. The three metadata arrays contain exactly row_count entries.
+typedef struct KvafBatchPutSourceDescriptor {
+  uint64_t base_address;
+  uint32_t local_token_id;
+  uint32_t reserved;
+} KvafBatchPutSourceDescriptor;
+
+// All pointer fields are device addresses. Per-row arrays contain row_count
+// entries; source_descriptors contains one entry per caller input tensor.
 typedef struct KvafExecuteBatchPutKernelArgs {
-  uint64_t input;                 // uint8[input_bytes]
+  uint64_t source_descriptors;    // KvafBatchPutSourceDescriptor[source_count]
+  uint64_t source_indices;        // uint32[row_count]
   uint64_t input_offsets;         // uint64[row_count]
   uint64_t lengths;               // uint64[row_count]
   uint64_t destination_addresses; // uint64[row_count]
   uint64_t core_status;           // KvafBatchPutCoreStatus[aiv_core_count]
-  uint64_t input_bytes;
   uint32_t row_count;
   uint32_t aiv_core_count;
 } KvafExecuteBatchPutKernelArgs;
@@ -54,6 +60,8 @@ typedef struct KvafExecuteBatchPutKernelArgs {
 #if defined(__cplusplus)
 static_assert(sizeof(KvafBatchPutCoreStatus) == KVAF_AIV_BATCH_PUT_STATUS_BYTES,
               "KvafBatchPutCoreStatus ABI changed");
+static_assert(sizeof(KvafBatchPutSourceDescriptor) == 16,
+              "KvafBatchPutSourceDescriptor ABI changed");
 static_assert(sizeof(KvafExecuteBatchPutKernelArgs) == 56,
               "KvafExecuteBatchPutKernelArgs ABI changed");
 #endif
