@@ -15,6 +15,9 @@ import kvaf
 
 from backend import detect_torch_backend
 
+DEFAULT_BATCH_GET_TOKEN_BYTES = 656
+DEFAULT_BATCH_GET_TOKENS_PER_BLOCK = 128
+
 
 def percentile(values: list[float], fraction: float) -> float:
     ordered = sorted(values)
@@ -71,8 +74,14 @@ def main() -> int:
     jettys = int(os.environ.get("KVAF_NPU_JETTYS_PER_CORE", "2"))
     warmup = int(os.environ.get("KVAF_NPU_WARMUP", "1"))
     iterations = int(os.environ.get("KVAF_NPU_ITERATIONS", "5"))
+    batch_get_token_bytes = int(os.environ.get(
+        "KVAF_NPU_TOKEN_BYTES", str(DEFAULT_BATCH_GET_TOKEN_BYTES)))
+    batch_get_tokens_per_block = int(os.environ.get(
+        "KVAF_NPU_TOKENS_PER_BLOCK", str(DEFAULT_BATCH_GET_TOKENS_PER_BLOCK)))
     if not (rows > 0 and 0 < group_count <= rows and 0 < minimum <= maximum and
-            0 < cores <= rows and 1 <= jettys <= 2 and warmup >= 0 and iterations > 0):
+            0 < cores <= rows and 1 <= jettys <= 2 and warmup >= 0 and
+            iterations > 0 and batch_get_token_bytes > 0 and
+            batch_get_tokens_per_block > 0):
         print("FAIL: invalid KVAF_NPU_* configuration", file=sys.stderr)
         return 2
 
@@ -100,7 +109,10 @@ def main() -> int:
         length_groups.append(group_lengths)
 
     runtime = kvaf.NpuRuntime(
-        str(get_kernel), device_id=device_id, npu_core_count=cores,
+        str(get_kernel),
+        batch_get_token_bytes=batch_get_token_bytes,
+        batch_get_tokens_per_block=batch_get_tokens_per_block,
+        device_id=device_id, npu_core_count=cores,
         batch_put_kernel_object_path=str(put_kernel), jettys_per_core=jettys,
     )
     runtime.link_to(cpu_service)
