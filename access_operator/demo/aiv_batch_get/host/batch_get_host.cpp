@@ -547,22 +547,50 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
   return true;
 }
 
-void ReleaseLocalBufferResources(KvafBatchGetTransport *transport, KvafBatchGetLocalBuffer *local) {
-  if (transport == nullptr || local == nullptr) return;
+static bool ReportTeardownResult(const char *phase, const char *resource, int result) {
+  if (result == 0) {
+    return true;
+  }
+  std::fprintf(stderr,
+               "[KVAF_AIV] DIRECT_HCCP_TEARDOWN_ERROR phase=%s resource=%s ret=%d\n",
+               phase, resource, result);
+  return false;
+}
+
+// A local HBM registration and its device entity table are referenced by the
+// AIV-side Jetty until the Jetty/CQ teardown has completed.  In particular,
+// do not move this helper ahead of queue teardown in ReleaseTransport:
+// doing so lets HCCP release a queue whose WQE state still points at freed
+// host allocation metadata and can surface later as glibc heap corruption.
+bool ReleaseLocalBufferResources(KvafBatchGetTransport *transport,
+                                 KvafBatchGetLocalBuffer *local) {
+  if (transport == nullptr || local == nullptr) return true;
+  bool success = true;
   if (local->device_entities != nullptr) {
-    (void)aclrtFree(local->device_entities);
-    local->device_entities = nullptr;
-    local->device_channel_entity = 0U;
+    const int result = static_cast<int>(aclrtFree(local->device_entities));
+    success = ReportTeardownResult("release_local_buffers", "device_entities", result) && success;
+    if (result == 0) {
+      local->device_entities = nullptr;
+      local->device_channel_entity = 0U;
+    }
   }
   if (local->memory.handle != nullptr && transport->api.lmem_unregister != nullptr &&
       transport->device_context != nullptr) {
-    (void)transport->api.lmem_unregister(transport->device_context, local->memory.handle);
-    local->memory.handle = nullptr;
+    const int result = transport->api.lmem_unregister(transport->device_context, local->memory.handle);
+    success = ReportTeardownResult("release_local_buffers", "device_hbm_memory", result) && success;
+    if (result == 0) {
+      local->memory.handle = nullptr;
+    }
   }
-  if (local->token_handle != nullptr && transport->api.token_free != nullptr && transport->device_context != nullptr) {
-    (void)transport->api.token_free(transport->device_context, local->token_handle);
-    local->token_handle = nullptr;
+  if (local->token_handle != nullptr && transport->api.token_free != nullptr &&
+      transport->device_context != nullptr) {
+    const int result = transport->api.token_free(transport->device_context, local->token_handle);
+    success = ReportTeardownResult("release_local_buffers", "device_hbm_token", result) && success;
+    if (result == 0) {
+      local->token_handle = nullptr;
+    }
   }
+  return success;
 }
 
 bool AcquireLocalBuffer(KvafBatchGetTransport *transport, void *output_hbm, uint64_t output_hbm_bytes,
@@ -883,82 +911,157 @@ void ReleaseTransport(KvafBatchGetTransport *transport) {
     return;
   }
   std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=begin\n");
-  if (!transport->local_buffers.empty()) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=release_local_buffers count=%zu\n",
-                 transport->local_buffers.size());
-    for (const auto &local : transport->local_buffers) {
-      if (local != nullptr) ReleaseLocalBufferResources(transport, local.get());
-    }
-  }
+  // The Direct-HCCP queue owns references to local device HBM registrations.
+  // Tear down every imported/local queue first, then retire those buffers.
+  // If any queue operation fails, preserve all dependent resources for the
+  // process lifetime instead of freeing memory that the driver may still use.
+  bool queue_teardown_ok = true;
   if (transport->api.qp_unimport != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=unimport_jettys\n");
     for (uint32_t worker_index = 0U;
          worker_index < transport->worker_count; ++worker_index) {
       DirectAivWorker &worker = transport->workers[worker_index];
       if (transport->host_context != nullptr && worker.host_device_target_jetty != nullptr) {
-        (void)transport->api.qp_unimport(transport->host_context, worker.host_device_target_jetty);
+        const int result = transport->api.qp_unimport(transport->host_context,
+                                                      worker.host_device_target_jetty);
+        queue_teardown_ok = ReportTeardownResult("unimport_jettys", "host_device_target", result) &&
+                            queue_teardown_ok;
+        if (result == 0) worker.host_device_target_jetty = nullptr;
       }
       if (transport->device_context != nullptr && worker.device_host_target_jetty != nullptr) {
-        (void)transport->api.qp_unimport(transport->device_context, worker.device_host_target_jetty);
+        const int result = transport->api.qp_unimport(transport->device_context,
+                                                      worker.device_host_target_jetty);
+        queue_teardown_ok = ReportTeardownResult("unimport_jettys", "device_host_target", result) &&
+                            queue_teardown_ok;
+        if (result == 0) worker.device_host_target_jetty = nullptr;
       }
     }
   }
-  if (transport->api.qp_destroy != nullptr) {
+  if (queue_teardown_ok && transport->api.qp_destroy != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=destroy_jettys\n");
     for (uint32_t worker_index = 0U;
          worker_index < transport->worker_count; ++worker_index) {
       DirectAivWorker &worker = transport->workers[worker_index];
       if (worker.device_user_ctl_jetty.handle != nullptr) {
-        (void)transport->api.qp_destroy(worker.device_user_ctl_jetty.handle);
+        const int result = transport->api.qp_destroy(worker.device_user_ctl_jetty.handle);
+        queue_teardown_ok = ReportTeardownResult("destroy_jettys", "device_user_ctl", result) &&
+                            queue_teardown_ok;
+        if (result == 0) worker.device_user_ctl_jetty.handle = nullptr;
       }
       if (worker.host_standard_jetty.handle != nullptr) {
-        (void)transport->api.qp_destroy(worker.host_standard_jetty.handle);
+        const int result = transport->api.qp_destroy(worker.host_standard_jetty.handle);
+        queue_teardown_ok = ReportTeardownResult("destroy_jettys", "host_standard", result) &&
+                            queue_teardown_ok;
+        if (result == 0) worker.host_standard_jetty.handle = nullptr;
       }
     }
   }
-  if (transport->api.cq_destroy != nullptr) {
+  if (queue_teardown_ok && transport->api.cq_destroy != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=destroy_completion_queues\n");
     for (uint32_t worker_index = 0U;
          worker_index < transport->worker_count; ++worker_index) {
       DirectAivWorker &worker = transport->workers[worker_index];
       if (transport->device_context != nullptr && worker.device_user_ctl_cq != nullptr) {
-        (void)transport->api.cq_destroy(transport->device_context, worker.device_user_ctl_cq);
+        const int result = transport->api.cq_destroy(transport->device_context, worker.device_user_ctl_cq);
+        queue_teardown_ok = ReportTeardownResult("destroy_completion_queues", "device_user_ctl", result) &&
+                            queue_teardown_ok;
+        if (result == 0) worker.device_user_ctl_cq = nullptr;
       }
       if (transport->host_context != nullptr && worker.host_normal_cq != nullptr) {
-        (void)transport->api.cq_destroy(transport->host_context, worker.host_normal_cq);
+        const int result = transport->api.cq_destroy(transport->host_context, worker.host_normal_cq);
+        queue_teardown_ok = ReportTeardownResult("destroy_completion_queues", "host_normal", result) &&
+                            queue_teardown_ok;
+        if (result == 0) worker.host_normal_cq = nullptr;
       }
     }
+  }
+  if (!queue_teardown_ok) {
+    std::fprintf(stderr,
+                 "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=retain_transport_resources "
+                 "reason=queue_teardown_failed\n");
+    // Retain the complete transport until process exit.  A failed queue
+    // teardown may still have driver references to worker/import metadata,
+    // so deleting even the C++ wrapper would reintroduce an exit-time UAF.
+    return;
+  }
+  bool transport_teardown_ok = true;
+  if (!transport->local_buffers.empty()) {
+    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=release_local_buffers count=%zu\n",
+                 transport->local_buffers.size());
+    for (const auto &local : transport->local_buffers) {
+      if (local != nullptr) {
+        transport_teardown_ok = ReleaseLocalBufferResources(transport, local.get()) &&
+                                transport_teardown_ok;
+      }
+    }
+    if (transport_teardown_ok) transport->local_buffers.clear();
   }
   if (transport->api.rmem_unimport != nullptr && transport->device_context != nullptr &&
       transport->device_host_memory_import != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=unimport_host_memory\n");
-    (void)transport->api.rmem_unimport(transport->device_context, transport->device_host_memory_import);
+    const int result = transport->api.rmem_unimport(transport->device_context,
+                                                    transport->device_host_memory_import);
+    transport_teardown_ok = ReportTeardownResult("unimport_host_memory", "host_memory", result) &&
+                            transport_teardown_ok;
+    if (result == 0) transport->device_host_memory_import = nullptr;
   }
   if (transport->api.lmem_unregister != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=unregister_memory\n");
     if (transport->host_context != nullptr && transport->host_memory.handle != nullptr) {
-      (void)transport->api.lmem_unregister(transport->host_context, transport->host_memory.handle);
+      const int result = transport->api.lmem_unregister(transport->host_context, transport->host_memory.handle);
+      transport_teardown_ok = ReportTeardownResult("unregister_memory", "host_ddr", result) &&
+                              transport_teardown_ok;
+      if (result == 0) transport->host_memory.handle = nullptr;
     }
   }
   if (transport->api.token_free != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=free_tokens\n");
     if (transport->device_context != nullptr) {
       if (transport->device_transport_token_handle != nullptr) {
-        (void)transport->api.token_free(transport->device_context, transport->device_transport_token_handle);
+        const int result = transport->api.token_free(transport->device_context,
+                                                     transport->device_transport_token_handle);
+        transport_teardown_ok = ReportTeardownResult("free_tokens", "device_transport", result) &&
+                                transport_teardown_ok;
+        if (result == 0) transport->device_transport_token_handle = nullptr;
       }
     }
     if (transport->host_context != nullptr && transport->host_token_handle != nullptr) {
-      (void)transport->api.token_free(transport->host_context, transport->host_token_handle);
+      const int result = transport->api.token_free(transport->host_context, transport->host_token_handle);
+      transport_teardown_ok = ReportTeardownResult("free_tokens", "host_cpu", result) &&
+                              transport_teardown_ok;
+      if (result == 0) transport->host_token_handle = nullptr;
     }
+  }
+  if (!transport_teardown_ok) {
+    std::fprintf(stderr,
+                 "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=retain_transport_resources "
+                 "reason=memory_teardown_failed\n");
+    // Do not close the DSO/session or destroy wrapper metadata after a
+    // failed driver release.  This diagnostic leak is safer than freeing a
+    // resource that Direct-HCCP might still access.
+    return;
   }
   if (transport->api.ctx_deinit != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=deinit_contexts\n");
     if (transport->device_context != nullptr) {
-      (void)transport->api.ctx_deinit(transport->device_context);
+      const int result = transport->api.ctx_deinit(transport->device_context);
+      transport_teardown_ok = ReportTeardownResult("deinit_contexts", "device_aiv", result) &&
+                              transport_teardown_ok;
+      if (result == 0) transport->device_context = nullptr;
     }
     if (transport->host_context != nullptr) {
-      (void)transport->api.ctx_deinit(transport->host_context);
+      const int result = transport->api.ctx_deinit(transport->host_context);
+      transport_teardown_ok = ReportTeardownResult("deinit_contexts", "host_cpu", result) &&
+                              transport_teardown_ok;
+      if (result == 0) transport->host_context = nullptr;
     }
+  }
+  if (!transport_teardown_ok) {
+    std::fprintf(stderr,
+                 "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=retain_transport_resources "
+                 "reason=context_teardown_failed\n");
+    // See the queue/memory failure cases above: retain the whole transport.
+    return;
   }
   if (transport->session != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=release_session\n");
