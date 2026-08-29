@@ -23,12 +23,21 @@ void VerboseLog(const char* format, ...);
 // compatible device RA. Later callers only take a reference. The caller must
 // pair every success with ReleaseDirectHccpSession after all of its RaCtx
 // resources are gone.
+//
+// The RA/HDC bootstrap itself is process-owned after its first successful
+// initialization.  Releasing the final transport only drops the logical
+// lease; it intentionally does not RaDeinit or dlclose the service DSOs.
+// CANN can retain service/TLS callbacks until process exit, so unloading them
+// at a Runtime boundary races those callbacks even after all KVAF CQ work has
+// retired.  Per-transport RaCtx, token, MR, CQ and Jetty resources remain
+// caller-owned and are still released normally.
 bool AcquireDirectHccpSession(uint32_t physical_device_id, uint32_t hdc_type,
                               DirectHccpSession **session);
 
-// Releases a reference. The last release tears down only RA instances owned by
-// KVAF; a borrowed HCCL device RA remains live. Callers keep ownership of their
-// own data-plane resources.
+// Releases a logical transport reference.  A zero reference count leaves the
+// initialized process-owned RA/HDC service resident for a later Runtime; it
+// is reclaimed by process exit rather than a hot Runtime teardown.  Callers
+// keep ownership of their own data-plane resources.
 void ReleaseDirectHccpSession(DirectHccpSession *session);
 
 }  // namespace kvaf::direct_hccp

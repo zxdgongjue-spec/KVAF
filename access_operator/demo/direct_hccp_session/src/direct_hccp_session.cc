@@ -341,10 +341,21 @@ void ReleaseDirectHccpSession(DirectHccpSession *session) {
                session->key.physical_device_id, session->key.hdc_type, session->reference_count);
     return;
   }
-  VerboseLog("[KVAF_AIV] DIRECT_HCCP_SESSION_DESTROY physical=%u hdc_type=%u\n",
-             session->key.physical_device_id, session->key.hdc_type);
-  DestroySession(session);
-  g_sessions.erase(found);
+  // `rtOpenNetService` has no symmetric close primitive.  CANN can keep
+  // service/TLS callbacks alive after all Direct-HCCP CQ work has retired;
+  // calling RaDeinit or dlclose here therefore leaves a use-after-unload
+  // window at Python process exit.  Keep only this process-level bootstrap
+  // resident.  Every transport still destroys its own RaCtx, MR, token, CQ,
+  // Jetty and local-buffer resources before reaching this function.
+  //
+  // The map entry deliberately remains at refs=0 so the next NpuRuntime on
+  // the same physical NPU reuses the compatible service without another
+  // RaInit/rtOpenNetService round.  The OS reclaims the process-owned service
+  // state at process exit.
+  VerboseLog(
+      "[KVAF_AIV] DIRECT_HCCP_SESSION_IDLE physical=%u hdc_type=%u "
+      "refs=0 lifetime=process\n",
+      session->key.physical_device_id, session->key.hdc_type);
 }
 
 }  // namespace kvaf::direct_hccp

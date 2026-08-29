@@ -70,14 +70,35 @@ int main() {
   }
 
   kvaf::direct_hccp::ReleaseDirectHccpSession(session);
-  const bool reused_ra_preserved =
-      Check(host_deinit() == 1, "owned host RA was not deinitialized") &&
-      Check(device_deinit() == 0, "borrowed device RA must not be deinitialized");
-  if (!reused_ra_preserved) {
+  const bool process_owned_bootstrap_preserved =
+      Check(host_deinit() == 0,
+            "process-owned host RA must not be deinitialized at Runtime release") &&
+      Check(device_deinit() == 0,
+            "borrowed device RA must not be deinitialized at Runtime release");
+  if (!process_owned_bootstrap_preserved) {
     dlclose(runtime_library);
     dlclose(ra_library);
     return 1;
   }
+
+  // A later Runtime on the same NPU must reuse the process-owned bootstrap
+  // instead of starting a second RA/service instance.
+  session = nullptr;
+  if (!Check(kvaf::direct_hccp::AcquireDirectHccpSession(4U, 18U, &session),
+             "AcquireDirectHccpSession did not reuse the idle process session") ||
+      !Check(session != nullptr, "reused session is null") ||
+      !Check(host_init() == 1, "reused process session unexpectedly reinitialized host RA") ||
+      !Check(device_init() == 1, "reused process session unexpectedly reinitialized device RA") ||
+      !Check(service_calls() == 1,
+             "reused process session unexpectedly reopened network service")) {
+    if (session != nullptr) {
+      kvaf::direct_hccp::ReleaseDirectHccpSession(session);
+    }
+    dlclose(runtime_library);
+    dlclose(ra_library);
+    return 1;
+  }
+  kvaf::direct_hccp::ReleaseDirectHccpSession(session);
 
   reset();
   set_device_init_result(0);
@@ -93,10 +114,11 @@ int main() {
     return 1;
   }
   kvaf::direct_hccp::ReleaseDirectHccpSession(session);
-  const bool owned_ra_released =
+  const bool owned_ra_process_pinned =
       Check(device_init() == 1, "owned device RA was not initialized exactly once") &&
-      Check(device_deinit() == 1, "owned device RA was not deinitialized");
+      Check(device_deinit() == 0,
+            "owned device RA must remain process-owned after Runtime release");
   dlclose(runtime_library);
   dlclose(ra_library);
-  return owned_ra_released ? 0 : 1;
+  return owned_ra_process_pinned ? 0 : 1;
 }

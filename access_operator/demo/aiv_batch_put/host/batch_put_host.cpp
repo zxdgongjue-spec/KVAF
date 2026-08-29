@@ -426,9 +426,13 @@ void CloseDirectHccp(DirectHccpApi *api) {
   if (api == nullptr) {
     return;
   }
-  if (api->library != nullptr) {
-    dlclose(api->library);
-  }
+  // `libra` backs Direct-HCCP contexts as well as RA/HDC service/TLS state.
+  // The session bootstrap is process-owned after a successful transport
+  // create, and CANN has no close counterpart for rtOpenNetService.  Dropping
+  // this DSO at a Runtime boundary can therefore leave an exit callback
+  // pointing into unloaded code.  The LoadDirectHccp failure path still
+  // dlcloses its never-published handle; a successfully published transport
+  // only clears these per-transport function pointers here.
   *api = {};
 }
 
