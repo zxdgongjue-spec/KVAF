@@ -1392,8 +1392,53 @@ Status DefaultAccessOperator::ReleaseStreamingBatchGetControl() {
     return Status::NotFound("streaming BatchGet control table is not bound");
   }
   // The caller must already have observed the terminal reader for every
-  // layer. This remains a cold lifecycle operation and intentionally does
-  // not synchronize a stream behind the caller's back.
+  // layer. This is a cold terminal-drain boundary, never a graph-replay
+  // operation.  Synchronize the device before reading graph-visible owner
+  // words: a host D2H copy without that edge could observe a stale zero while
+  // an earlier graph stream still owns an SQ/CQ pair.
+  //
+  // Do not infer that a caller has satisfied that contract merely because it
+  // asked to tear the table down.  In particular, a device-side lease-release
+  // CAS mismatch leaves the queue owner word nonzero on purpose: the runtime
+  // can no longer prove exclusive SQ/CQ ownership, so freeing the registered
+  // output/entity state here could race a stale Direct-HCCP completion. Read
+  // the graph-visible owner table before releasing any resource and retain
+  // the whole table as a quarantine if any entry is still held.
+  const Impl::StreamingBatchGetControlBinding& table =
+      impl_->streaming_control;
+  const std::size_t lease_count = table.queue_lease_bytes / sizeof(std::int32_t);
+  if (table.queue_leases == nullptr ||
+      table.queue_lease_bytes !=
+          static_cast<std::size_t>(table.queue_count) * sizeof(std::int32_t) ||
+      lease_count != table.queue_count) {
+    return Internal(
+        "streaming BatchGet control has an invalid queue-lease table at teardown");
+  }
+  if (aclrtSynchronizeDevice() != ACL_SUCCESS) {
+    return Internal(
+        "failed to drain device before reading streaming BatchGet queue leases");
+  }
+  std::vector<std::int32_t> lease_snapshot(lease_count, 0);
+  if (aclrtMemcpy(lease_snapshot.data(), table.queue_lease_bytes,
+                  table.queue_leases, table.queue_lease_bytes,
+                  ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
+    return Internal(
+        "failed to read streaming BatchGet queue leases before teardown");
+  }
+  const auto held = std::find_if(
+      lease_snapshot.begin(), lease_snapshot.end(),
+      [](std::int32_t owner_tag) { return owner_tag != 0; });
+  if (held != lease_snapshot.end()) {
+    const std::size_t queue_id =
+        static_cast<std::size_t>(std::distance(lease_snapshot.begin(), held));
+    std::ostringstream message;
+    message << "streaming BatchGet control teardown is quarantined: queue_id="
+            << queue_id << " owner_tag=" << *held
+            << " remains nonzero after the caller's terminal drain; "
+               "do not free or rebind this control until recovery has "
+               "resolved the queue";
+    return Status::Error(StatusCode::kBusy, message.str());
+  }
   for (const Impl::StreamingBatchGetLayerControlBinding& bound :
        impl_->streaming_control.layers) {
     if (bound.descriptor_templates != nullptr) {
