@@ -134,20 +134,18 @@ if(KVAF_BUILD_NPU_SERVICE)
   if(NOT KVAF_NPU_URMA_INCLUDE_DIR)
     message(FATAL_ERROR "KVAF_BUILD_NPU_SERVICE requires urma_api.h")
   endif()
-  add_library(kvaf_npu_service_runtime STATIC src/npu_service.cc)
-  target_include_directories(kvaf_npu_service_runtime
-    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../access_operator/include
-            ${ASCEND_CANN_PACKAGE_PATH}/include
-            ${KVAF_NPU_URMA_INCLUDE_DIR})
-  target_link_libraries(kvaf_npu_service_runtime
-    PUBLIC kvaf_runtime
-    PRIVATE kvaf_direct_hccp_session ascendcl ${CMAKE_DL_LIBS} pthread)
-  target_link_directories(kvaf_npu_service_runtime PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/lib64)
-  target_compile_features(kvaf_npu_service_runtime PUBLIC cxx_std_17)
+  target_sources(kvaf_npu_runtime PRIVATE src/npu_service.cc)
+  target_compile_definitions(kvaf_npu_runtime PRIVATE KVAF_BUILD_NPU_SERVICE=1)
+  target_include_directories(kvaf_npu_runtime PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../access_operator/include
+    ${ASCEND_CANN_PACKAGE_PATH}/include
+    ${KVAF_NPU_URMA_INCLUDE_DIR})
+  target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_direct_hccp_session
+    ascendcl ${CMAKE_DL_LIBS} pthread)
+  target_link_directories(kvaf_npu_runtime PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/lib64)
 
   add_executable(kvaf_npu_service src/npu_service_main.cc)
-  target_link_libraries(kvaf_npu_service PRIVATE kvaf_npu_service_runtime kvaf_runtime)
+  target_link_libraries(kvaf_npu_service PRIVATE kvaf_npu_runtime kvaf_runtime)
   target_link_directories(kvaf_npu_service PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/lib64)
   target_compile_features(kvaf_npu_service PRIVATE cxx_std_17)
 endif()

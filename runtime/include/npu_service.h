@@ -11,7 +11,8 @@ struct NpuServiceOptions {
   std::uint32_t device_id{0U};
   // Index in the discovered NPU EID list. The HDC context index is fixed at
   // zero to match the existing AIV InitContext() implementation.
-  std::uint32_t eid_index{9U};
+  std::uint32_t eid_index{0U};
+  bool has_eid_index{false};
 };
 
 // NPU-side control service. It owns device HBM and exports provider-created

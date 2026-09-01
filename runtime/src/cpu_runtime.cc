@@ -801,6 +801,12 @@ void HandleClient(int fd, CpuService* service) {
       SendStatus(fd, command, service->Release(request.session_id));
       return;
     }
+    case Command::kAllocateHbmRegion:
+    case Command::kReleaseHbmRegion:
+      // HBM ownership belongs to NpuService; a CPU service never accepts
+      // these commands.
+      SendStatus(fd, command, Result::kInvalidRequest);
+      return;
   }
   SendStatus(fd, command, Result::kInvalidRequest);
 }
@@ -850,7 +856,7 @@ Status CpuRuntime::InitializeClient(const CpuRuntimeClientOptions& options) {
   CpuUrmaTransportOptions transport_options;
   transport_options.peer_address = peer_address;
   transport_options.ub_device = options.ub_device;
-  transport_options.has_eid_index = true;
+  transport_options.has_eid_index = options.has_eid_index;
   transport_options.eid_index = options.eid_index;
   transport_options.remote_hbm = true;
   transport_options.remote_device_id = options.device_id;

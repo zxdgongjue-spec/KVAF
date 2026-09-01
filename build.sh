@@ -123,8 +123,9 @@ build_cpu() {
     -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON \
     -DKVAF_URMA_ROOT="$umdk_root" \
     -DKVAF_URMA_LIBRARY="$urma_library"
-  cmake --build "$build_dir" --target kvaf_cpu_service --parallel "$jobs"
+  cmake --build "$build_dir" --target kvaf_cpu_service kvaf_cpu_runtime_npu_hbm_e2e --parallel "$jobs"
   echo "[KVAF_BUILD] CPU service: $build_dir/runtime/kvaf_cpu_service"
+  echo "[KVAF_BUILD] CPU NPU-HBM client: $build_dir/runtime/kvaf_cpu_runtime_npu_hbm_e2e"
 }
 
 find_cann_root() {
@@ -147,9 +148,11 @@ build_npu() {
   local python_bin="${PYTHON:-python3}"
   local cann_root
   local pybind11_dir
+  local umdk_root="${KVAF_UMDK_ROOT:-$KVAF_ROOT/../third_party/umdk}"
 
   require_command cmake
   require_command "$python_bin"
+  ensure_umdk_source "$umdk_root"
   cann_root="$(find_cann_root)"
   [[ -n "$cann_root" ]] || die "CANN toolkit was not found; source CANN set_env.sh or set ASCEND_CANN_PACKAGE_PATH"
   if ! "$python_bin" -m pybind11 --cmakedir >/dev/null 2>&1; then
@@ -164,7 +167,9 @@ build_npu() {
     -DKVAF_ENABLE_AIV_BATCH_GET=ON \
     -DKVAF_ENABLE_AIV_BATCH_PUT=ON \
     -DASCEND_CANN_PACKAGE_PATH="$cann_root" \
-    -Dpybind11_DIR="$pybind11_dir"
+    -Dpybind11_DIR="$pybind11_dir" \
+    -DKVAF_BUILD_NPU_SERVICE=ON \
+    -DKVAF_URMA_ROOT="$umdk_root"
   cmake --build "$build_dir" --parallel "$jobs"
   echo "[KVAF_BUILD] NPU Python package: $build_dir/python/kvaf"
   echo "[KVAF_BUILD] BatchGet kernel: $build_dir/bin/kvaf_execute_batch_get_kernels.o"

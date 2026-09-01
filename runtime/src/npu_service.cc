@@ -9,6 +9,7 @@
 #include <fcntl.h>
 
 #include <array>
+#include <chrono>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -16,6 +17,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -68,6 +70,7 @@ struct HbmRegion {
   void* memory{nullptr};
   std::uint64_t bytes{0U};
   void* lmem_handle{nullptr};
+  void* token_id_handle{nullptr};
   std::uint32_t token_id{0U};
   std::uint32_t token_value{0U};
   std::array<std::uint8_t, kSegKeyBytes> segment_key{};
@@ -184,14 +187,18 @@ struct NpuService::Impl {
 
   Status Initialize(const NpuServiceOptions& options) {
     if (initialized) return Status::InvalidState("NpuService already initialized");
+    const auto fail = [this](Status status) {
+      (void)Shutdown();
+      return status;
+    };
     if (aclrtSetDevice(options.device_id) != ACL_SUCCESS)
-      return Status::Internal("aclrtSetDevice failed");
+      return fail(Status::Internal("aclrtSetDevice failed"));
     if (!direct_hccp::LoadDirectHccp(&api))
-      return Status::NotImplemented("Direct-HCCP RA symbols are unavailable");
+      return fail(Status::NotImplemented("Direct-HCCP RA symbols are unavailable"));
     if (!direct_hccp::GetCurrentNpuPhysicalDeviceId(&physical_device_id))
-      return Status::Internal("cannot resolve NPU physical device id");
+      return fail(Status::Internal("cannot resolve NPU physical device id"));
     if (!direct_hccp::AcquireDirectHccpSession(physical_device_id, kHdcType, &session))
-      return Status::Internal("failed to acquire Direct-HCCP session");
+      return fail(Status::Internal("failed to acquire Direct-HCCP session"));
 
     direct_hccp::CtxInitCfg cfg{};
     cfg.mode = direct_hccp::kOfflineHdc;
@@ -200,16 +207,47 @@ struct NpuService::Impl {
     // Match the existing AIV host InitContext() exactly: the context EID
     // index is always zero; only the discovered EID value varies by device.
     attr.ub.eid_index = 0U;
-    if (!DiscoverNpuEid(physical_device_id, options.eid_index, &attr.ub.eid))
-      return Status::NotFound("NPU service could not select an EID from HCCL rootinfo");
+    bool eid_selected = false;
+    if (api.get_dev_eid_info_num != nullptr && api.get_dev_eid_info_list != nullptr) {
+      direct_hccp::Eid route_eid{};
+      if (ReadPairInfoEid(physical_device_id, &route_eid)) {
+        direct_hccp::RaInfo ra_info{direct_hccp::kOfflineHdc, physical_device_id};
+        std::uint32_t count = 0U;
+        if (api.get_dev_eid_info_num(ra_info, &count) == 0 && count != 0U) {
+          std::vector<direct_hccp::DevEidInfo> list(count);
+          if (api.get_dev_eid_info_list(ra_info, list.data(), &count) == 0) {
+            std::uint32_t selected = UINT32_MAX;
+            if (options.has_eid_index && options.eid_index < count) {
+              selected = options.eid_index;
+            } else {
+              for (std::uint32_t i = 0; i < count; ++i) {
+                if (std::memcmp(list[i].eid.raw, route_eid.raw, sizeof(route_eid.raw)) == 0) {
+                  selected = i;
+                  break;
+                }
+              }
+            }
+            if (selected != UINT32_MAX) {
+              attr.ub.eid = list[selected].eid;
+              eid_selected = true;
+              std::fprintf(stderr, "[KVAF_NPU] EID_SELECTED source=%s list_index=%u eid_index=%u\n",
+                           options.has_eid_index ? "explicit" : "pair_info.remote_eid", selected,
+                           list[selected].eid_index);
+            }
+          }
+        }
+      }
+    }
+    if (!eid_selected && !DiscoverNpuEid(physical_device_id, options.eid_index, &attr.ub.eid))
+      return fail(Status::NotFound("NPU service could not select an EID from HCCL rootinfo"));
     std::memcpy(local_eid.data(), attr.ub.eid.raw, local_eid.size());
     const int ctx_rc = api.ctx_init(&cfg, &attr, &context);
     if (ctx_rc != 0 || context == nullptr) {
       std::fprintf(stderr, "[KVAF_NPU] RaCtxInit failed rc=%d physical=%u ctx_eid_index=%u eid_list_index=%u eid=",
                    ctx_rc, physical_device_id, attr.ub.eid_index, options.eid_index);
       for (std::uint8_t byte : local_eid) std::fprintf(stderr, "%02x", byte);
-      std::fprintf(stderr, "\\n");
-      return Status::Internal("RaCtxInit failed");
+      std::fprintf(stderr, "\n");
+      return fail(Status::Internal("RaCtxInit failed"));
     }
     initialized = true;
     return Status::OK();
@@ -240,18 +278,25 @@ struct NpuService::Impl {
     region->bytes = request.hbm_bytes;
     if (aclrtMalloc(&region->memory, request.hbm_bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS)
       return Result::kResourceError;
+    direct_hccp::TokenId token_id{};
+    if (api.token_alloc == nullptr ||
+        api.token_alloc(context, &token_id, &region->token_id_handle) != 0 ||
+        region->token_id_handle == nullptr) {
+      Release(region.get());
+      return Result::kResourceError;
+    }
+    region->token_id = token_id.token_id;
     direct_hccp::MrRegInfo reg{};
     reg.in.mem.addr = reinterpret_cast<std::uint64_t>(region->memory);
     reg.in.mem.size = request.hbm_bytes;
-    reg.in.ub.flags = direct_hccp::MemRegFlagsDeviceMemory(true);
+    reg.in.ub.flags = direct_hccp::MemRegFlags(true);
     reg.in.ub.token_value = 0xABCFU;
+    reg.in.ub.token_id_handle = region->token_id_handle;
     if (api.lmem_register(context, &reg, &region->lmem_handle) != 0 ||
         region->lmem_handle == nullptr) {
-      (void)aclrtFree(region->memory);
-      region->memory = nullptr;
+      Release(region.get());
       return Result::kResourceError;
     }
-    region->token_id = reg.out.ub.token_id;
     region->token_value = reg.in.ub.token_value;
     region->segment_key_bytes = sizeof(urma_seg_t);
     std::memcpy(region->segment_key.data(), reg.out.key.value, region->segment_key_bytes);
@@ -277,6 +322,7 @@ struct NpuService::Impl {
     qp_attr.transport_mode = direct_hccp::kReliableMessage;
     qp_attr.ub.mode = direct_hccp::kJettyStandard;
     qp_attr.ub.flag = direct_hccp::JettyFlagShareJfr();
+    qp_attr.ub.token_id_handle = region->token_id_handle;
     qp_attr.ub.jfs_flag = direct_hccp::JfsFlagErrorSuspend();
     qp_attr.ub.priority = 2U;
     qp_attr.ub.rnr_retry = 7U;
@@ -325,7 +371,7 @@ struct NpuService::Impl {
     if (it == regions.end()) return Result::kNotFound;
     HbmRegion& region = *it->second;
     if (region.jetty_key_bytes == 0U || request.local_qp_key_bytes == 0U) {
-      std::fprintf(stderr, "[KVAF_NPU] CHANNEL_FAILED stage=descriptor session=%llu local_key_bytes=%u jetty_key_bytes=%u\\n",
+      std::fprintf(stderr, "[KVAF_NPU] CHANNEL_FAILED stage=descriptor session=%llu local_key_bytes=%u jetty_key_bytes=%u\n",
                    static_cast<unsigned long long>(request.session_id), request.local_qp_key_bytes,
                    region.jetty_key_bytes);
       return Result::kResourceError;
@@ -345,27 +391,31 @@ struct NpuService::Impl {
       void* async_request = nullptr;
       const int submit_rc = api.get_tp_info_async(context, &cfg, &info, &count, &async_request);
       if (submit_rc == 0 && async_request != nullptr) {
-        for (int attempt = 0; attempt < 10000; ++attempt) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        for (int attempt = 0; std::chrono::steady_clock::now() < deadline; ++attempt) {
           int result = 0;
           const int rc = api.get_async_req_result(async_request, &result);
-          if (rc == 128301) continue;
+          if (rc == 128301) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+          }
           std::fprintf(stderr,
                        "[KVAF_NPU] CHANNEL_CTP_RESULT api_rc=%d result=%d count=%u tp=0x%llx local_eid=",
                        rc, result, count, static_cast<unsigned long long>(info.tp_handle));
           for (std::uint8_t byte : local_eid) std::fprintf(stderr, "%02x", byte);
           std::fprintf(stderr, " peer_eid=");
           for (std::uint8_t byte : request.local_eid) std::fprintf(stderr, "%02x", byte);
-          std::fprintf(stderr, "\\n");
+          std::fprintf(stderr, "\n");
           if (rc == 0 && result == 0 && count != 0U) local_tp = info.tp_handle;
           break;
         }
       } else {
-        std::fprintf(stderr, "[KVAF_NPU] CHANNEL_FAILED stage=get_tp_info submit_rc=%d count=%u request=%p errno=%d\\n",
+        std::fprintf(stderr, "[KVAF_NPU] CHANNEL_FAILED stage=get_tp_info submit_rc=%d count=%u request=%p errno=%d\n",
                      submit_rc, count, async_request, errno);
       }
     }
     if (local_tp == 0U || request.local_tp_handle == 0U) {
-      std::fprintf(stderr, "[KVAF_NPU] CHANNEL_FAILED stage=get_tp_info local_tp=0x%llx peer_tp=0x%llx\\n",
+      std::fprintf(stderr, "[KVAF_NPU] CHANNEL_FAILED stage=get_tp_info local_tp=0x%llx peer_tp=0x%llx\n",
                    static_cast<unsigned long long>(local_tp),
                    static_cast<unsigned long long>(request.local_tp_handle));
       return Result::kResourceError;
@@ -376,9 +426,10 @@ struct NpuService::Impl {
                                         request.local_qp_key_bytes, region.token_value,
                                         local_tp, request.local_tp_handle, 1U,
                                         request.local_psn, "npu_service", &import_info,
-                                        &region.peer_target_jetty))
-        std::fprintf(stderr, "[KVAF_NPU] CHANNEL_FAILED stage=import_cpu_jetty\\n");
+                                        &region.peer_target_jetty)) {
+        std::fprintf(stderr, "[KVAF_NPU] CHANNEL_FAILED stage=import_cpu_jetty\n");
         return Result::kResourceError;
+      }
     }
     response->peer_qp_key_bytes = region.jetty_key_bytes;
     std::memcpy(response->peer_qp_key, region.jetty_key.data(), kQpKeyBytes);
@@ -404,6 +455,10 @@ struct NpuService::Impl {
     if (region->lmem_handle != nullptr && api.lmem_unregister != nullptr) {
       (void)api.lmem_unregister(context, region->lmem_handle);
       region->lmem_handle = nullptr;
+    }
+    if (region->token_id_handle != nullptr && api.token_free != nullptr) {
+      (void)api.token_free(context, region->token_id_handle);
+      region->token_id_handle = nullptr;
     }
     if (region->memory != nullptr) {
       (void)aclrtFree(region->memory);

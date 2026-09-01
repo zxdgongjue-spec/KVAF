@@ -1,4 +1,4 @@
-#include "npu_service.h"
+#include "npu_runtime.h"
 #include "runtime_service.h"
 
 #include <cstdio>
@@ -17,12 +17,12 @@ int main(int argc, char** argv) {
     if (arg == "--listen") service_options.address = argv[++i];
     else if (arg == "--port") service_options.port = static_cast<std::uint16_t>(std::strtoul(argv[++i], nullptr, 10));
     else if (arg == "--device-id") npu_options.device_id = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
-    else if (arg == "--eid-index") npu_options.eid_index = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+    else if (arg == "--eid-index") { npu_options.eid_index = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10)); npu_options.has_eid_index = true; }
     else if (arg == "--help") { std::fprintf(stderr, "Usage: %s [--listen ADDRESS] [--port PORT] [--device-id N] [--eid-index N]\n", argv[0]); return 0; }
     else { std::fprintf(stderr, "unknown argument: %s\n", arg.c_str()); return 2; }
   }
-  kvaf::NpuService service;
-  const kvaf::Status init = service.Initialize(npu_options);
+  kvaf::NpuRuntime service(npu_options);
+  const kvaf::Status init = service.InitializeHbmService();
   if (!init.ok()) { std::fprintf(stderr, "[KVAF_NPU] %s\n", init.message().c_str()); return 1; }
   const kvaf::Status status = kvaf::RuntimeService(service_options).Serve(service);
   std::fprintf(stderr, "[KVAF_NPU] %s\n", status.message().c_str());

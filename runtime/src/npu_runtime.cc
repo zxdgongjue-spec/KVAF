@@ -374,6 +374,11 @@ struct NpuRuntime::Impl {
     config.jettys_per_core = options.jettys_per_core;
   }
 
+#if defined(KVAF_BUILD_NPU_SERVICE)
+  explicit Impl(NpuServiceOptions init_options)
+      : options("", 0U, 0U), hbm_options(std::move(init_options)), hbm_mode(true) {}
+#endif
+
   void CreateCore() {
     meta_manager = CreateInMemoryMetaManager();
     access_operator = std::make_unique<DefaultAccessOperator>(config);
@@ -395,6 +400,11 @@ struct NpuRuntime::Impl {
   std::shared_ptr<peer::PeerLink> peer_link;
   std::unique_ptr<DefaultAccessOperator> access_operator;
   std::unique_ptr<RuntimeCore> runtime_core;
+#if defined(KVAF_BUILD_NPU_SERVICE)
+  std::unique_ptr<NpuService> hbm_service;
+  NpuServiceOptions hbm_options{};
+#endif
+  bool hbm_mode{false};
   void* probe_buffer{nullptr};
 };
 
@@ -412,6 +422,17 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
   }
 }
 
+NpuRuntime::NpuRuntime(NpuServiceOptions options)
+#if defined(KVAF_BUILD_NPU_SERVICE)
+    : impl_(std::make_unique<Impl>(std::move(options))) {
+  impl_->hbm_service = std::make_unique<NpuService>();
+#else
+    : impl_(std::make_unique<Impl>(NpuRuntimeOptions("", 0U, 0U))) {
+  (void)options;
+  throw std::runtime_error("NpuRuntime HBM provider was not built");
+#endif
+}
+
 NpuRuntime::~NpuRuntime() {
   if (impl_ != nullptr) {
     (void)Shutdown();
@@ -422,6 +443,7 @@ NpuRuntime::~NpuRuntime() {
 }
 
 Status NpuRuntime::LinkTo(const LinkTarget& target) {
+  if (impl_->hbm_mode) return Status::InvalidState("HBM provider NpuRuntime cannot LinkTo");
   if (target.address.empty()) return Status::InvalidArgument("NpuRuntime LinkTo requires peer host:port");
   if (initialized()) return Status::InvalidState("NpuRuntime LinkTo must run before initialize");
   if (impl_->peer_link != nullptr) return Status::InvalidState("NpuRuntime already has a PeerLink");
@@ -440,6 +462,7 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
 }
 
 Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
+  if (impl_->hbm_mode) return Status::InvalidState("HBM provider NpuRuntime uses InitializeHbmService");
   const RuntimeInitRequest request{ddr_bytes, slot_size, DeviceKind::kCpu};
   if (initialized()) return Status::InvalidState("NpuRuntime has already been initialized");
   if (impl_->peer_link == nullptr || impl_->peer_allocator == nullptr ||
@@ -537,14 +560,25 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   return last;
 }
 
+Status NpuRuntime::InitializeHbmService() {
+#if defined(KVAF_BUILD_NPU_SERVICE)
+  if (!impl_->hbm_mode || impl_->hbm_service == nullptr) {
+    return Status::InvalidState("InitializeHbmService requires HBM provider mode");
+  }
+  return impl_->hbm_service->Initialize(impl_->hbm_options);
+#else
+  return Status::NotImplemented("NpuRuntime HBM provider was not built");
+#endif
+}
+
 RuntimeCore& NpuRuntime::core() {
-  if (impl_->runtime_core == nullptr) {
+  if (impl_->hbm_mode || impl_->runtime_core == nullptr) {
     throw std::logic_error("NpuRuntime requires LinkTo before core access");
   }
   return *impl_->runtime_core;
 }
 const RuntimeCore& NpuRuntime::core() const {
-  if (impl_->runtime_core == nullptr) {
+  if (impl_->hbm_mode || impl_->runtime_core == nullptr) {
     throw std::logic_error("NpuRuntime requires LinkTo before core access");
   }
   return *impl_->runtime_core;
@@ -559,11 +593,19 @@ std::uint32_t NpuRuntime::batch_get_tokens_per_block() const {
   return impl_->options.batch_get_tokens_per_block;
 }
 
-Status NpuRuntime::AcceptLink(const LinkTarget&) {
+Status NpuRuntime::AcceptLink(const LinkTarget& peer) {
+#if defined(KVAF_BUILD_NPU_SERVICE)
+  if (impl_->hbm_mode) return impl_->hbm_service->AcceptLink(peer);
+#else
+  (void)peer;
+#endif
   return Status::NotImplemented("NpuRuntime does not accept links in the CPU--NPU deployment");
 }
 
 Status NpuRuntime::ReleaseLink(LinkId link_id) {
+#if defined(KVAF_BUILD_NPU_SERVICE)
+  if (impl_->hbm_mode) return impl_->hbm_service->ReleaseLink(link_id);
+#endif
   if (link_id != 1U || impl_->peer_link == nullptr) return Status::NotFound("PeerLink was not found");
   const Status shutdown = Shutdown();
   if (!shutdown.ok()) return shutdown;
@@ -577,12 +619,22 @@ Status NpuRuntime::ReleaseLink(LinkId link_id) {
   return Status::OK();
 }
 
-Status NpuRuntime::ServeConnection(int) {
+Status NpuRuntime::ServeConnection(int connection_fd) {
+#if defined(KVAF_BUILD_NPU_SERVICE)
+  if (impl_->hbm_mode) return impl_->hbm_service->ServeConnection(connection_fd);
+#else
+  (void)connection_fd;
+#endif
   return Status::NotImplemented("NpuRuntime has no incoming control service in this deployment");
 }
 
 Status NpuRuntime::Shutdown() {
   if (impl_ == nullptr) return Status::OK();
+#if defined(KVAF_BUILD_NPU_SERVICE)
+  if (impl_->hbm_mode) {
+    return impl_->hbm_service != nullptr ? impl_->hbm_service->Shutdown() : Status::OK();
+  }
+#endif
   const Status status = impl_->runtime_core != nullptr && impl_->runtime_core->initialized()
                             ? impl_->runtime_core->Shutdown()
                             : Status::OK();
@@ -591,10 +643,23 @@ Status NpuRuntime::Shutdown() {
 }
 
 bool NpuRuntime::initialized() const {
-  return impl_ != nullptr && impl_->runtime_core != nullptr && impl_->runtime_core->initialized();
+  return impl_ != nullptr &&
+#if defined(KVAF_BUILD_NPU_SERVICE)
+         (impl_->hbm_mode
+              ? (impl_->hbm_service != nullptr && impl_->hbm_service->initialized())
+              : (impl_->runtime_core != nullptr && impl_->runtime_core->initialized()));
+#else
+         !impl_->hbm_mode && impl_->runtime_core != nullptr && impl_->runtime_core->initialized();
+#endif
 }
 
 RuntimeCapabilities NpuRuntime::capabilities() const {
+#if defined(KVAF_BUILD_NPU_SERVICE)
+  if (impl_->hbm_mode) {
+    return impl_->hbm_service != nullptr ? impl_->hbm_service->capabilities()
+                                         : RuntimeCapabilities{};
+  }
+#endif
   return RuntimeCapabilities{true, !impl_->config.batch_put_kernel_object_path.empty(), false, true};
 }
 

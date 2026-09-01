@@ -21,6 +21,7 @@ struct CpuRuntimeClientOptions {
   std::uint64_t hbm_bytes{0U};
   std::uint64_t slot_size{0U};
   std::string ub_device;
+  bool has_eid_index{false};
   std::uint32_t eid_index{0U};
   std::uint32_t device_id{0U};
 };

@@ -15,6 +15,7 @@ struct Options {
   std::uint64_t slot_size{4096U};
   std::string ub_device;
   std::uint32_t eid_index{0U};
+  bool has_eid_index{false};
   std::uint32_t device_id{0U};
 };
 
@@ -51,7 +52,10 @@ bool Parse(int argc, char** argv, Options* options) {
     else if (arg == "--bytes" && !ParseU64(argv[++i], &options->bytes)) return false;
     else if (arg == "--slot-size" && !ParseU64(argv[++i], &options->slot_size)) return false;
     else if (arg == "--ub-device") options->ub_device = argv[++i];
-    else if (arg == "--eid-index" && !ParseU32(argv[++i], &options->eid_index)) return false;
+    else if (arg == "--eid-index") {
+      if (!ParseU32(argv[++i], &options->eid_index)) return false;
+      options->has_eid_index = true;
+    }
     else if (arg == "--device-id" && !ParseU32(argv[++i], &options->device_id)) return false;
     else return false;
   }
@@ -76,6 +80,7 @@ int main(int argc, char** argv) {
   client.peer_address = options.peer;
   client.ub_device = options.ub_device;
   client.eid_index = options.eid_index;
+  client.has_eid_index = options.has_eid_index;
   client.device_id = options.device_id;
   kvaf::Status status = runtime.InitializeClient(client);
   if (!status.ok()) {

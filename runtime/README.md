@@ -70,6 +70,39 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 `batch_get_token_bytes` 和 `batch_get_tokens_per_block` 无默认值，
 构造 `NpuRuntime` 时必须显式传入。
 
+## CPU Runtime 访问 NPU HBM
+
+当 CPU 需要直接读写 NPU HBM 时，NPU 侧运行 `kvaf_npu_service`，CPU 侧使用
+`CpuRuntime::InitializeClient`。NPU 侧的命令行服务由 `NpuRuntime` 的 HBM provider
+模式承载（`NpuRuntime(NpuServiceOptions)` + `InitializeHbmService()`）；两者复用同一套 `PeerLink` 控制协议：NPU service
+负责 `aclrtMalloc` HBM、Direct-HCCP segment/token/Jetty 注册和 EID 选择；CPU Runtime
+负责 UMDK 本地 buffer、CTP/Jetty 导入，并通过 URMA 发起 READ/WRITE。HBM 的
+`urma_seg_t` descriptor 在 TCP 上原样传输，不依赖 `urma_admin`。
+
+构建：
+
+```bash
+./build.sh npu
+./build.sh cpu
+```
+
+启动 NPU HBM service（默认监听 `127.0.0.1:28999`）：
+
+```bash
+build-npu/runtime/kvaf_npu_service --listen 0.0.0.0 --port 28999 --device-id 0
+```
+
+CPU 侧可通过 `CpuRuntime::InitializeClient` 建链并使用 `RuntimeCore::BatchPut` /
+`BatchGet`。仓库中的 `runtime/kvaf_cpu_runtime_npu_hbm_e2e` 是最小验证程序：
+
+```bash
+build-cpu/runtime/kvaf_cpu_runtime_npu_hbm_e2e \
+  --peer <npu-host>:28999 --bytes 4096 --slot-size 4096 --device-id 0
+```
+
+`--eid-index` 仅在需要固定候选时指定；默认由 CPU UMDK 和 NPU `pair_info`/RA EID
+列表自动选择。
+
 现有 `tests/run_remote_cpu_e2e.sh` 与
 `tests/run_remote_cpu_runtime_perf.sh` 接受 `KVAF_CPU_SERVICE_ADDR`，但该变量
 只由测试脚本转换为上述 `link_to` 调用，不再是 Runtime 内部配置来源。
