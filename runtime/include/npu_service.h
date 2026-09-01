@@ -9,7 +9,9 @@ namespace kvaf {
 
 struct NpuServiceOptions {
   std::uint32_t device_id{0U};
-  std::uint32_t eid_index{0U};
+  // Index in the discovered NPU EID list. The HDC context index is kept at
+  // the value used by the existing HBM path (1) and is intentionally separate.
+  std::uint32_t eid_index{9U};
 };
 
 // NPU-side control service. It owns device HBM and exports provider-created

@@ -163,16 +163,17 @@ struct NpuService::Impl {
     cfg.mode = direct_hccp::kOfflineHdc;
     direct_hccp::CtxInitAttr attr{};
     attr.phy_id = physical_device_id;
-    // The HDC context index is provider-specific (the existing HBM path uses
-    // index 0); the routable EID is selected from HCCL CLOS metadata.
-    attr.ub.eid_index = 0U;
+    // Keep the context index separate from the EID-list selector. The
+    // existing HBM path uses context index 1 while selecting its routable EID
+    // from another position in the discovered list.
+    attr.ub.eid_index = 1U;
     if (!DiscoverNpuEid(physical_device_id, options.eid_index, &attr.ub.eid))
       return Status::NotFound("NPU service could not select an EID from HCCL rootinfo");
     std::memcpy(local_eid.data(), attr.ub.eid.raw, local_eid.size());
     const int ctx_rc = api.ctx_init(&cfg, &attr, &context);
     if (ctx_rc != 0 || context == nullptr) {
-      std::fprintf(stderr, "[KVAF_NPU] RaCtxInit failed rc=%d physical=%u eid_index=%u eid=",
-                   ctx_rc, physical_device_id, attr.ub.eid_index);
+      std::fprintf(stderr, "[KVAF_NPU] RaCtxInit failed rc=%d physical=%u ctx_eid_index=%u eid_list_index=%u eid=",
+                   ctx_rc, physical_device_id, attr.ub.eid_index, options.eid_index);
       for (std::uint8_t byte : local_eid) std::fprintf(stderr, "%02x", byte);
       std::fprintf(stderr, "\\n");
       return Status::Internal("RaCtxInit failed");
