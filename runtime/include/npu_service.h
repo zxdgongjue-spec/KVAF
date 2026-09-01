@@ -9,8 +9,8 @@ namespace kvaf {
 
 struct NpuServiceOptions {
   std::uint32_t device_id{0U};
-  // Index in the discovered NPU EID list. The HDC context index is kept at
-  // the value used by the existing HBM path (1) and is intentionally separate.
+  // Index in the discovered NPU EID list. The HDC context index is fixed at
+  // zero to match the existing AIV InitContext() implementation.
   std::uint32_t eid_index{9U};
 };
 

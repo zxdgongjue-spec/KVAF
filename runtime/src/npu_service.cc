@@ -197,10 +197,9 @@ struct NpuService::Impl {
     cfg.mode = direct_hccp::kOfflineHdc;
     direct_hccp::CtxInitAttr attr{};
     attr.phy_id = physical_device_id;
-    // Keep the context index separate from the EID-list selector. The
-    // existing HBM path uses context index 1 while selecting its routable EID
-    // from another position in the discovered list.
-    attr.ub.eid_index = 1U;
+    // Match the existing AIV host InitContext() exactly: the context EID
+    // index is always zero; only the discovered EID value varies by device.
+    attr.ub.eid_index = 0U;
     if (!DiscoverNpuEid(physical_device_id, options.eid_index, &attr.ub.eid))
       return Status::NotFound("NPU service could not select an EID from HCCL rootinfo");
     std::memcpy(local_eid.data(), attr.ub.eid.raw, local_eid.size());
@@ -350,6 +349,13 @@ struct NpuService::Impl {
           int result = 0;
           const int rc = api.get_async_req_result(async_request, &result);
           if (rc == 128301) continue;
+          std::fprintf(stderr,
+                       "[KVAF_NPU] CHANNEL_CTP_RESULT api_rc=%d result=%d count=%u tp=0x%llx local_eid=",
+                       rc, result, count, static_cast<unsigned long long>(info.tp_handle));
+          for (std::uint8_t byte : local_eid) std::fprintf(stderr, "%02x", byte);
+          std::fprintf(stderr, " peer_eid=");
+          for (std::uint8_t byte : request.local_eid) std::fprintf(stderr, "%02x", byte);
+          std::fprintf(stderr, "\\n");
           if (rc == 0 && result == 0 && count != 0U) local_tp = info.tp_handle;
           break;
         }
