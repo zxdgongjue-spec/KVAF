@@ -82,7 +82,8 @@ struct HbmRegion {
 // CtxInitAttr; the remaining provider metadata is intentionally opaque.
 struct RaEidInfo {
   direct_hccp::Eid eid{};
-  std::uint32_t reserved[4]{};
+  std::uint32_t eid_index{0U};
+  std::uint32_t reserved{0U};
 };
 struct RaInfo {
   std::int32_t mode{0};
