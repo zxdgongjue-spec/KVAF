@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cctype>
 #include <cerrno>
 #include <cstdio>
@@ -18,6 +19,7 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <urma_api.h>
@@ -273,9 +275,10 @@ int main(int argc, char** argv) {
       if (!ok) std::fprintf(stderr, "[HBM_TEST][NPU] get_tp_info_async failed ret=%d request=%p count=%u\n", submit_ret, async_request, count);
       int result = 0;
       bool completed = false;
-      for (int tries = 0; ok && tries < 10000; ++tries) {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+      while (ok && std::chrono::steady_clock::now() < deadline) {
         const int rc = state.api.get_async_req_result(async_request, &result);
-        if (rc == 128301) continue;
+        if (rc == 128301) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
         ok = rc == 0 && result == 0 && count != 0U && tp.tp_handle != 0U;
         completed = true;
         if (!ok) std::fprintf(stderr, "[HBM_TEST][NPU] get_tp_info_async completion failed api_ret=%d result=%d count=%u tp=0x%llx\n", rc, result, count, static_cast<unsigned long long>(tp.tp_handle));
