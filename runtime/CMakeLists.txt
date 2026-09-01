@@ -1,12 +1,3 @@
-add_library(kvaf_peer_link STATIC src/peer_link.cc)
-
-target_include_directories(kvaf_peer_link
-  PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
-target_link_libraries(kvaf_peer_link PUBLIC kvaf_common pthread)
-target_compile_features(kvaf_peer_link PUBLIC cxx_std_17)
-
 add_library(kvaf_runtime
   src/runtime.cc
   src/runtime_service.cc

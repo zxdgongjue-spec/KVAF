@@ -43,6 +43,15 @@ include(CTest)
 
 add_subdirectory(common)
 add_subdirectory(meta_manager)
+
+# PeerLink is shared by the Direct-HCCP transport (under access_operator) and
+# the Runtime targets. Define it before access_operator so the shared library
+# receives an actual target dependency instead of an unresolved -l flag.
+add_library(kvaf_peer_link STATIC runtime/src/peer_link.cc)
+target_include_directories(kvaf_peer_link PUBLIC runtime/include)
+target_link_libraries(kvaf_peer_link PUBLIC kvaf_common pthread)
+target_compile_features(kvaf_peer_link PUBLIC cxx_std_17)
+
 add_subdirectory(access_operator)
 add_subdirectory(runtime)
 
