@@ -89,6 +89,11 @@ def print_kernel_profile(
         "kernel_compact": [],
         "kernel_post": [],
         "kernel_wqe_fill": [],
+        "kernel_wqe_lookup_address": [],
+        "kernel_wqe_control": [],
+        "kernel_wqe_encode": [],
+        "kernel_wqe_ub_store": [],
+        "kernel_wqe_fill_overhead": [],
         "kernel_sq_copy": [],
         "kernel_doorbell": [],
         "kernel_post_overhead": [],
@@ -103,6 +108,11 @@ def print_kernel_profile(
             "compact_ms": 0.0,
             "post_ms": 0.0,
             "wqe_fill_ms": 0.0,
+            "wqe_lookup_address_ms": 0.0,
+            "wqe_control_ms": 0.0,
+            "wqe_encode_ms": 0.0,
+            "wqe_ub_store_ms": 0.0,
+            "wqe_fill_overhead_ms": 0.0,
             "sq_copy_ms": 0.0,
             "doorbell_ms": 0.0,
             "post_overhead_ms": 0.0,
@@ -130,6 +140,11 @@ def print_kernel_profile(
             "kernel_compact": 0.0,
             "kernel_post": 0.0,
             "kernel_wqe_fill": 0.0,
+            "kernel_wqe_lookup_address": 0.0,
+            "kernel_wqe_control": 0.0,
+            "kernel_wqe_encode": 0.0,
+            "kernel_wqe_ub_store": 0.0,
+            "kernel_wqe_fill_overhead": 0.0,
             "kernel_sq_copy": 0.0,
             "kernel_doorbell": 0.0,
             "kernel_post_overhead": 0.0,
@@ -150,6 +165,28 @@ def print_kernel_profile(
                 profile, "completion_done_cycle", "kernel_finish_cycle"
             )
             wqe_fill = int(profile["wqe_fill_cycles"]) / clock_mhz / 1000.0
+            wqe_lookup_address = (
+                int(profile["wqe_lookup_address_cycles"])
+                / clock_mhz
+                / 1000.0
+            )
+            wqe_control = (
+                int(profile["wqe_control_cycles"]) / clock_mhz / 1000.0
+            )
+            wqe_encode = (
+                int(profile["wqe_encode_cycles"]) / clock_mhz / 1000.0
+            )
+            wqe_ub_store = (
+                int(profile["wqe_ub_store_cycles"]) / clock_mhz / 1000.0
+            )
+            wqe_fill_overhead = max(
+                0.0,
+                wqe_fill
+                - wqe_lookup_address
+                - wqe_control
+                - wqe_encode
+                - wqe_ub_store,
+            )
             sq_copy = int(profile["sq_copy_cycles"]) / clock_mhz / 1000.0
             doorbell = int(profile["doorbell_cycles"]) / clock_mhz / 1000.0
             post_overhead = max(0.0, post - wqe_fill - sq_copy - doorbell)
@@ -167,6 +204,21 @@ def print_kernel_profile(
             critical["kernel_post"] = max(critical["kernel_post"], post)
             critical["kernel_wqe_fill"] = max(
                 critical["kernel_wqe_fill"], wqe_fill
+            )
+            critical["kernel_wqe_lookup_address"] = max(
+                critical["kernel_wqe_lookup_address"], wqe_lookup_address
+            )
+            critical["kernel_wqe_control"] = max(
+                critical["kernel_wqe_control"], wqe_control
+            )
+            critical["kernel_wqe_encode"] = max(
+                critical["kernel_wqe_encode"], wqe_encode
+            )
+            critical["kernel_wqe_ub_store"] = max(
+                critical["kernel_wqe_ub_store"], wqe_ub_store
+            )
+            critical["kernel_wqe_fill_overhead"] = max(
+                critical["kernel_wqe_fill_overhead"], wqe_fill_overhead
             )
             critical["kernel_sq_copy"] = max(
                 critical["kernel_sq_copy"], sq_copy
@@ -192,6 +244,11 @@ def print_kernel_profile(
             accumulator["compact_ms"] += compact
             accumulator["post_ms"] += post
             accumulator["wqe_fill_ms"] += wqe_fill
+            accumulator["wqe_lookup_address_ms"] += wqe_lookup_address
+            accumulator["wqe_control_ms"] += wqe_control
+            accumulator["wqe_encode_ms"] += wqe_encode
+            accumulator["wqe_ub_store_ms"] += wqe_ub_store
+            accumulator["wqe_fill_overhead_ms"] += wqe_fill_overhead
             accumulator["sq_copy_ms"] += sq_copy
             accumulator["doorbell_ms"] += doorbell
             accumulator["post_overhead_ms"] += post_overhead
@@ -214,6 +271,8 @@ def print_kernel_profile(
         f"clock_mhz={clock_mhz} unit=ms samples={len(samples)} "
         f"aiv_cores={npu_core_count} jettys_per_core={jettys_per_core} "
         "schedule=serial_stages_no_overlap wqe_fill=simt_32_lanes "
+        "wqe_fill_detail=lookup_address_plus_control_plus_encode_plus_ub_store "
+        "wqe_fill_detail_clock=simt_lane0 "
         "sq_copy=waited_mte3 doorbell=per_post_after_sq_copy "
         "stage_sync=pipe_all barrier_overhead_included=1 "
         "setup=entity_queue_and_miss_count compact=removed_direct_prefix "

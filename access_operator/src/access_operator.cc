@@ -555,6 +555,11 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
     destination.wqe_fill_cycles = source.wqe_fill_cycles;
     destination.sq_copy_cycles = source.sq_copy_cycles;
     destination.doorbell_cycles = source.doorbell_cycles;
+    destination.wqe_lookup_address_cycles =
+        source.wqe_lookup_address_cycles;
+    destination.wqe_control_cycles = source.wqe_control_cycles;
+    destination.wqe_encode_cycles = source.wqe_encode_cycles;
+    destination.wqe_ub_store_cycles = source.wqe_ub_store_cycles;
     profiles->push_back(destination);
   }
   return Status::OK();

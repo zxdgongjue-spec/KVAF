@@ -49,7 +49,15 @@ typedef struct KvafBatchGetCoreProfile {
   uint64_t wqe_fill_cycles;
   uint64_t sq_copy_cycles;
   uint64_t doorbell_cycles;
-  uint64_t reserved[23];
+  // Lane-0 SIMT clock deltas accumulated across posts. FillBatchGetReadWqes
+  // launches exactly one 32-lane warp, so lane 0 observes the warp's stalls
+  // while avoiding per-lane profile storage. The four counters exclude the
+  // VF launch, PIPE_ALL and Scalar-side setup included in wqe_fill_cycles.
+  uint64_t wqe_lookup_address_cycles;
+  uint64_t wqe_control_cycles;
+  uint64_t wqe_encode_cycles;
+  uint64_t wqe_ub_store_cycles;
+  uint64_t reserved[19];
 } KvafBatchGetCoreProfile;
 
 // Keep the historical 384-byte stride even though ExecuteBatchGet uses only

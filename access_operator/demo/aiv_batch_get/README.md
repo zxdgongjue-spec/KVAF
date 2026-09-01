@@ -167,12 +167,20 @@ The Python Runtime benchmark can opt into the per-core AIV timeline with
 32-lane SIMT WQE fill, waited SQ copy, per-post doorbell,
 first-doorbell-to-CQ transfer,
 CQ completion wait and finalization. `KVAF_RUNTIME_PERF_KERNEL_PROFILE_CLOCK_MHZ` controls raw
-`GetSystemCycle` conversion (1000 by default for A5). Profiling reuses the
+`GetSystemCycle`/SIMT `clock()` conversion (1000 by default for A5). Profiling reuses the
 reserved `KvafBatchGetCoreStatus` bytes; when disabled, the kernel executes no
 cycle reads and the normal ABI stride remains 384 bytes.
 The report emits `batch_get_kernel_wqe_fill`,
+`batch_get_kernel_wqe_lookup_address`, `batch_get_kernel_wqe_control`,
+`batch_get_kernel_wqe_encode`, `batch_get_kernel_wqe_ub_store`,
+`batch_get_kernel_wqe_fill_overhead`,
 `batch_get_kernel_sq_copy`, `batch_get_kernel_doorbell`, and
 `batch_get_kernel_post_overhead` alongside the existing total/setup/CQ metrics.
+The four Fill-WQE sub-stages use the SIMT `clock()` value observed by lane 0
+of the single 32-lane warp and are accumulated across posts. Fill overhead is
+the outer `wqe_fill` duration minus those four sub-stages, so it includes VF
+launch, PIPE_ALL, Scalar setup and profiling overhead. These diagnostics
+require the target CANN SDK's `utils/debug/asc_time.h` support.
 
 ```bash
 KVAF_RUNTIME_PERF_KERNEL_PROFILE=1 \

@@ -44,6 +44,25 @@ if(NOT KVAF_SIMT_API_DIR)
 endif()
 message(STATUS "BatchGet SIMT API root: ${KVAF_SIMT_API_DIR}")
 
+find_path(KVAF_SIMT_TIME_API_DIR NAMES utils/debug/asc_time.h HINTS
+  "${KVAF_SIMT_API_DIR}"
+  "${ASCEND_CANN_PACKAGE_PATH}/include"
+  "${ASCEND_CANN_PACKAGE_PATH}/include/ascendc"
+  "${ASCEND_CANN_PACKAGE_PATH}/compiler/include"
+  "${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/include"
+  "${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include"
+  "${ASCEND_CANN_PACKAGE_PATH}/x86_64-linux/include"
+  "${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw/include"
+  "${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw/lib"
+  "${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw")
+if(NOT KVAF_SIMT_TIME_API_DIR)
+  message(FATAL_ERROR
+    "utils/debug/asc_time.h was not found. The BatchGet kernel requires the "
+    "SIMT clock API to profile Fill WQE internals. "
+    "ASCEND_CANN_PACKAGE_PATH=${ASCEND_CANN_PACKAGE_PATH}")
+endif()
+message(STATUS "BatchGet SIMT clock API root: ${KVAF_SIMT_TIME_API_DIR}")
+
 set(KVAF_KERNEL_INCLUDES
   "-I${KVAF_KERNEL_OPERATOR_DIR}"
   "-I${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw/lib"
@@ -51,6 +70,7 @@ set(KVAF_KERNEL_INCLUDES
   "-I${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw/interface"
   "-I${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw/impl"
   "-I${KVAF_SIMT_API_DIR}"
+  "-I${KVAF_SIMT_TIME_API_DIR}"
   "-I${ASCEND_CANN_PACKAGE_PATH}/tikcpp/tikcfw"
   "-I${ASCEND_CANN_PACKAGE_PATH}/tikcpp/tikcfw/interface"
   "-I${ASCEND_CANN_PACKAGE_PATH}/tikcpp/tikcfw/impl"
@@ -68,6 +88,7 @@ add_custom_command(
   DEPENDS "${KVAF_EXECUTE_KERNEL_SOURCE}"
           "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_abi.h"
           "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"
+          "${KVAF_SIMT_TIME_API_DIR}/utils/debug/asc_time.h"
   VERBATIM)
 add_custom_target(kvaf_execute_batch_get_kernel ALL DEPENDS "${KVAF_EXECUTE_KERNEL_OBJECT}")
 add_custom_command(TARGET kvaf_execute_batch_get_kernel POST_BUILD

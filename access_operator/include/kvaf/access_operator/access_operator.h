@@ -61,6 +61,10 @@ struct BatchGetKernelProfile {
   std::uint64_t wqe_fill_cycles{0};
   std::uint64_t sq_copy_cycles{0};
   std::uint64_t doorbell_cycles{0};
+  std::uint64_t wqe_lookup_address_cycles{0};
+  std::uint64_t wqe_control_cycles{0};
+  std::uint64_t wqe_encode_cycles{0};
+  std::uint64_t wqe_ub_store_cycles{0};
 };
 
 // Default synchronous NPU data-plane implementation.

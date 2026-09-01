@@ -392,6 +392,11 @@ class NpuRuntime final {
       item["wqe_fill_cycles"] = profile.wqe_fill_cycles;
       item["sq_copy_cycles"] = profile.sq_copy_cycles;
       item["doorbell_cycles"] = profile.doorbell_cycles;
+      item["wqe_lookup_address_cycles"] =
+          profile.wqe_lookup_address_cycles;
+      item["wqe_control_cycles"] = profile.wqe_control_cycles;
+      item["wqe_encode_cycles"] = profile.wqe_encode_cycles;
+      item["wqe_ub_store_cycles"] = profile.wqe_ub_store_cycles;
       result.append(std::move(item));
     }
     return result;
