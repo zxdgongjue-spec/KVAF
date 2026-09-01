@@ -215,6 +215,7 @@ def print_kernel_profile(
         f"aiv_cores={npu_core_count} jettys_per_core={jettys_per_core} "
         "schedule=serial_stages_no_overlap wqe_fill=simt_32_lanes "
         "sq_copy=waited_mte3 doorbell=per_post_after_sq_copy "
+        "stage_sync=pipe_all barrier_overhead_included=1 "
         "setup=entity_queue_and_miss_count compact=removed_direct_prefix "
         "post=wqe_fill_plus_sq_copy_plus_doorbell_plus_loop_overhead "
         "transfer_window=first_doorbell_to_all_cq_complete "

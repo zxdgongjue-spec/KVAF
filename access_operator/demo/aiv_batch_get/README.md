@@ -89,6 +89,11 @@ rings that post's doorbell, then starts the next post. Thus the implementation
 keeps the same work partition, WQE contents, UB layout and submission cadence;
 only cross-post stage overlap is removed.
 
+Every stage boundary uses `PipeBarrier<PIPE_ALL>()`. This deliberately drains
+all instruction pipelines before the next Scalar `GetSystemCycle()` sample, so
+the reported fill, SQ-copy and doorbell durations are complete stage wall
+times. Barrier overhead is included in the diagnostic measurements.
+
 Only the last READ assigned to each used Jetty requests a CQE; the kernel
 drains one CQE from every used Jetty before reporting the batch complete. UDMA
 from an already-rung post may execute while the kernel prepares a later post,
