@@ -168,8 +168,15 @@ struct NpuService::Impl {
     attr.ub.eid_index = 0U;
     if (!DiscoverNpuEid(physical_device_id, options.eid_index, &attr.ub.eid))
       return Status::NotFound("NPU service could not select an EID from HCCL rootinfo");
-    if (api.ctx_init(&cfg, &attr, &context) != 0 || context == nullptr)
+    std::memcpy(local_eid.data(), attr.ub.eid.raw, local_eid.size());
+    const int ctx_rc = api.ctx_init(&cfg, &attr, &context);
+    if (ctx_rc != 0 || context == nullptr) {
+      std::fprintf(stderr, "[KVAF_NPU] RaCtxInit failed rc=%d physical=%u eid_index=%u eid=",
+                   ctx_rc, physical_device_id, attr.ub.eid_index);
+      for (std::uint8_t byte : local_eid) std::fprintf(stderr, "%02x", byte);
+      std::fprintf(stderr, "\\n");
       return Status::Internal("RaCtxInit failed");
+    }
     initialized = true;
     return Status::OK();
   }
@@ -283,8 +290,12 @@ struct NpuService::Impl {
     auto it = regions.find(request.session_id);
     if (it == regions.end()) return Result::kNotFound;
     HbmRegion& region = *it->second;
-    if (region.jetty_key_bytes == 0U || request.local_qp_key_bytes == 0U)
+    if (region.jetty_key_bytes == 0U || request.local_qp_key_bytes == 0U) {
+      std::fprintf(stderr, "[KVAF_NPU] CHANNEL_FAILED stage=descriptor session=%llu local_key_bytes=%u jetty_key_bytes=%u\\n",
+                   static_cast<unsigned long long>(request.session_id), request.local_qp_key_bytes,
+                   region.jetty_key_bytes);
       return Result::kResourceError;
+    }
     // Import the CPU Jetty into the NPU context so the provider can route
     // one-sided operations to the HBM owner. CTP lookup is asynchronous in
     // the HDC ABI and returns an opaque TP handle.
@@ -293,12 +304,13 @@ struct NpuService::Impl {
       direct_hccp::GetTpCfg cfg{};
       cfg.flag = direct_hccp::CtpFlag();
       cfg.transport_mode = direct_hccp::kReliableMessage;
-      std::memcpy(cfg.local_eid.raw, region.eid.data(), region.eid.size());
+      std::memcpy(cfg.local_eid.raw, local_eid.data(), local_eid.size());
       std::memcpy(cfg.peer_eid.raw, request.local_eid, kEidBytes);
       direct_hccp::TpInfo info{};
       std::uint32_t count = 1U;
       void* async_request = nullptr;
-      if (api.get_tp_info_async(context, &cfg, &info, &count, &async_request) == 0 && async_request != nullptr) {
+      const int submit_rc = api.get_tp_info_async(context, &cfg, &info, &count, &async_request);
+      if (submit_rc == 0 && async_request != nullptr) {
         for (int attempt = 0; attempt < 10000; ++attempt) {
           int result = 0;
           const int rc = api.get_async_req_result(async_request, &result);
@@ -306,9 +318,17 @@ struct NpuService::Impl {
           if (rc == 0 && result == 0 && count != 0U) local_tp = info.tp_handle;
           break;
         }
+      } else {
+        std::fprintf(stderr, "[KVAF_NPU] CHANNEL_FAILED stage=get_tp_info submit_rc=%d count=%u request=%p errno=%d\\n",
+                     submit_rc, count, async_request, errno);
       }
     }
-    if (local_tp == 0U || request.local_tp_handle == 0U) return Result::kResourceError;
+    if (local_tp == 0U || request.local_tp_handle == 0U) {
+      std::fprintf(stderr, "[KVAF_NPU] CHANNEL_FAILED stage=get_tp_info local_tp=0x%llx peer_tp=0x%llx\\n",
+                   static_cast<unsigned long long>(local_tp),
+                   static_cast<unsigned long long>(request.local_tp_handle));
+      return Result::kResourceError;
+    }
     {
       direct_hccp::QpImportInfoT import_info{};
       if (!direct_hccp::ImportPeerJetty(api, context, request.local_qp_key,
@@ -316,6 +336,7 @@ struct NpuService::Impl {
                                         local_tp, request.local_tp_handle, 1U,
                                         request.local_psn, "npu_service", &import_info,
                                         &region.peer_target_jetty))
+        std::fprintf(stderr, "[KVAF_NPU] CHANNEL_FAILED stage=import_cpu_jetty\\n");
         return Result::kResourceError;
     }
     response->peer_qp_key_bytes = region.jetty_key_bytes;
@@ -418,6 +439,7 @@ struct NpuService::Impl {
   DirectHccpSession* session{nullptr};
   void* context{nullptr};
   std::uint32_t physical_device_id{0U};
+  std::array<std::uint8_t, peer::kEidBytes> local_eid{};
   std::uint64_t next_session{1U};
   bool initialized{false};
   std::unordered_map<std::uint64_t, std::unique_ptr<HbmRegion>> regions;
