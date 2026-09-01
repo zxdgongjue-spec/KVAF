@@ -82,7 +82,7 @@ def main() -> int:
             sample_offsets = [0, len(sample_blocks[0]),
                               len(sample_blocks[0]) + len(sample_blocks[1])]
             begin = time.perf_counter()
-            runtime.batch_put([sample_keys], [sample_packed], [sample_offsets], lengths)
+            runtime.batch_put([sample_keys], [sample_packed], [sample_offsets], [lengths])
             put_ms = (time.perf_counter() - begin) * 1000.0
             sample_table = runtime.prepare_access_table(sample_keys)
             sample_output = bytearray(len(sample_blocks) * 32)
