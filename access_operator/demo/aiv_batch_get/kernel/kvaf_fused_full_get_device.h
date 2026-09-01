@@ -896,6 +896,44 @@ __simt_callee__ inline bool TryClaimKvafP8PrivateAllocatingFromSimt(
   return true;
 }
 
+// SIMT owns the narrow reservation and immutable-payload write.  The P8
+// executor performs its DDR publication barrier from its enclosing AICore
+// phase before it lets a second SIMT service expose either directory entry.
+// Keeping that barrier outside this SIMT callable is intentional: CANN does
+// not permit a SIMT VF to call the AICore-only payload publisher.
+__simt_callee__ inline bool BeginKvafP8PrivateAllocatingPayloadFromSimt(
+    __gm__ KvafP8PrivateRecord* record,
+    const KvafP8WaveIdentity& identity, uint64_t source_offset,
+    uint64_t object_offset, int32_t output_index) {
+  if (record == nullptr || identity.forward_epoch == 0U ||
+      identity.owner_tag <= 0 || identity.queue_generation == 0U ||
+      identity.post_sequence == 0U || output_index < 0) {
+    return false;
+  }
+  if (!TryClaimKvafP8PrivateAllocatingFromSimt(record)) {
+    return false;
+  }
+
+  // Do not write state here.  A racing ForwardTerminal may permanently win
+  // ALLOCATING -> QUARANTINED; immutable field writes cannot revive it, and
+  // the later map-commit service will refuse to publish positive directory
+  // entries unless the state is still ALLOCATING.
+  record->magic = kKvafP8WaveRecordMagic;
+  record->version = kKvafP8WaveRecordVersion;
+  record->forward_epoch = identity.forward_epoch;
+  record->graph_replay_generation = identity.graph_replay_generation;
+  record->layer_control_index = identity.layer_control_index;
+  record->queue_id = identity.queue_id;
+  record->queue_generation = identity.queue_generation;
+  record->post_sequence = identity.post_sequence;
+  record->source_offset = source_offset;
+  record->object_offset = object_offset;
+  record->output_index = output_index;
+  record->owner_tag = identity.owner_tag;
+  AscendC::Simt::ThreadFence();
+  return true;
+}
+
 __simt_callee__ inline bool TryPromoteKvafP8PrivateAllocatingToPendingFromSimt(
     __gm__ KvafP8PrivateRecord* record) {
   if (record == nullptr) {

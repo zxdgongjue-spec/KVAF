@@ -94,6 +94,7 @@ def main() -> None:
         "TryRetireKvafP8Wave",
         "FinishKvafP8Wave",
         "PrepareKvafP8PrivateRecord",
+        "BeginKvafP8PrivateAllocatingPayloadFromSimt",
         "FinalizeKvafP8PrivateRecord",
         "ReleaseKvafP8PrivateRecordAfterQsfaTerminal",
         "ReleaseKvafP8PendingPrivateRecordAfterNoPost",
@@ -342,6 +343,27 @@ def main() -> None:
         "private_record->state = kKvafP8PrivateQuarantined",
     ):
         assert token in p8_private, token
+
+    # A P8 private-row producer crosses the SIMT/AICore boundary in two
+    # phases: SIMT reserves and writes immutable payload, then the enclosing
+    # AICore phase performs the DDR publication barrier before SIMT maps and
+    # promotes PENDING.  A SIMT callable must never reach the AICore-only
+    # record helpers; CANN otherwise fails inside the Bisheng frontend.
+    p8_private_allocating_payload = _between(
+        text,
+        "__simt_callee__ inline bool BeginKvafP8PrivateAllocatingPayloadFromSimt(",
+        "__simt_callee__ inline bool TryPromoteKvafP8PrivateAllocatingToPendingFromSimt(",
+    )
+    for token in (
+        "TryClaimKvafP8PrivateAllocatingFromSimt(record)",
+        "record->magic = kKvafP8WaveRecordMagic",
+        "record->owner_tag = identity.owner_tag",
+        "AscendC::Simt::ThreadFence()",
+    ):
+        assert token in p8_private_allocating_payload, token
+    assert "PrepareKvafP8PrivateRecord(" not in p8_private_allocating_payload
+    assert "PublishKvafP8PrivateAllocatingPayloadToGm(" not in p8_private_allocating_payload
+    assert "DataSyncBarrier<" not in p8_private_allocating_payload
 
     p8_private_release = _between(
         text,
