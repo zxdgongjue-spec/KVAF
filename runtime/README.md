@@ -243,15 +243,12 @@ sample 生成一个小于请求容量的单元素 NPU `int32 miss_count`，其�
 BatchGet 前再生成 `indices = source_token_ids // 128`、
 `offsets = (source_token_ids % 128) * 656`、由 `destination_slots` 物化的
 `output_indices`；只有三个数组的 `[0, miss_count)` 前缀会被搬运，不再生成 mask。
-正式 sample 会分别输出 `batch_get_indices`、`batch_get_offsets`、
-`batch_get_output_indices`、`batch_get_prepare_inputs`、
-`batch_get_submit`、`batch_get_synchronize`、`batch_get` 和
-`batch_get_sample_total` 的 `PERF_RESULT`。原始数据构造还会输出
-`batch_get_source_token_ids`、`batch_get_destination_slots`、
-`batch_get_miss_count` 和合计 `batch_get_source_plan`。各阶段均在 NPU 同步后记录
-墙钟耗时；`batch_get_prepare_inputs` 覆盖全部输入派生，
-`batch_get_sample_total` 覆盖输入派生开始至 BatchGet stream 完成。warmup 执行
-同样的阶段同步但不进入统计。
+输入构造和派生不记录耗时，也不纳入 BatchGet 端到端指标。正式
+sample 只输出 `batch_get_submit`、`batch_get_synchronize` 和 `batch_get` 的
+`PERF_RESULT`；`batch_get` 从 Runtime 调用前开始计时，到调用方完成
+`torch.npu.synchronize()` 为止。`batch_get` 还输出 `useful_GiBps`，按所有
+正式 sample 的实际 `miss_count * block_bytes` 总字节数除以 BatchGet 总耗时
+计算。warmup 执行同样的同步，但不进入统计。
 
 设置 `KVAF_RUNTIME_PERF_KERNEL_PROFILE=1` 可启用 BatchGet AIV 核函数的
 逐核 cycle timeline，并在每个正式 sample stream 完成后读取状态。输出覆盖
@@ -261,7 +258,9 @@ BatchGet 前再生成 `indices = source_token_ids // 128`、
 poll 均值。A5 默认按 1000 MHz 换算；其他平台可通过
 `KVAF_RUNTIME_PERF_KERNEL_PROFILE_CLOCK_MHZ` 指定 `GetSystemCycle` 时钟频率。
 profile 的 cycle read 开销包含在 kernel 指标中，每次 D2H profile 读取发生在 host
-BatchGet 计时结束后。
+BatchGet 计时结束后。`batch_get_kernel_total` 会输出第二个
+`useful_GiBps`，用相同的实际搬运字节数除以所有正式 sample 的核内
+总时延（每个 sample 取各 AIV core 总时延的最大值）计算。
 
 ```bash
 KVAF_RUN_NPU_TESTS=1 \
