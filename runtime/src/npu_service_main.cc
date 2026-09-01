@@ -16,7 +16,7 @@ int main(int argc, char** argv) {
     }
     if (arg == "--listen") service_options.address = argv[++i];
     else if (arg == "--port") service_options.port = static_cast<std::uint16_t>(std::strtoul(argv[++i], nullptr, 10));
-    else if (arg == "--device-id") npu_options.device_id = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+    else if (arg == "--device-id") { npu_options.device_id = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10)); npu_options.has_device_id = true; }
     else if (arg == "--eid-index") { npu_options.eid_index = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10)); npu_options.has_eid_index = true; }
     else if (arg == "--help") { std::fprintf(stderr, "Usage: %s [--listen ADDRESS] [--port PORT] [--device-id N] [--eid-index N]\n", argv[0]); return 0; }
     else { std::fprintf(stderr, "unknown argument: %s\n", arg.c_str()); return 2; }

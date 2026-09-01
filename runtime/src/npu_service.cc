@@ -187,18 +187,30 @@ struct NpuService::Impl {
 
   Status Initialize(const NpuServiceOptions& options) {
     if (initialized) return Status::InvalidState("NpuService already initialized");
-    const auto fail = [this](Status status) {
-      (void)Shutdown();
-      return status;
-    };
-    if (aclrtSetDevice(options.device_id) != ACL_SUCCESS)
-      return fail(Status::Internal("aclrtSetDevice failed"));
     if (!direct_hccp::LoadDirectHccp(&api))
-      return fail(Status::NotImplemented("Direct-HCCP RA symbols are unavailable"));
+      return Status::NotImplemented("Direct-HCCP RA symbols are unavailable");
+    initialized = true;
+    if (options.has_device_id) {
+      const Result result = EnsureDevice(options.device_id, options.eid_index, options.has_eid_index);
+      if (result != Result::kOk) {
+        (void)Shutdown();
+        return Status::Internal("NPU service failed to initialize requested device");
+      }
+    }
+    return Status::OK();
+  }
+
+  Result EnsureDevice(std::uint32_t device_id, std::uint32_t eid_index,
+                      bool has_eid_index) {
+    if (device_ready) {
+      return device_id == active_device_id ? Result::kOk : Result::kResourceError;
+    }
+    if (aclrtSetDevice(device_id) != ACL_SUCCESS)
+      return Result::kResourceError;
     if (!direct_hccp::GetCurrentNpuPhysicalDeviceId(&physical_device_id))
-      return fail(Status::Internal("cannot resolve NPU physical device id"));
+      return Result::kResourceError;
     if (!direct_hccp::AcquireDirectHccpSession(physical_device_id, kHdcType, &session))
-      return fail(Status::Internal("failed to acquire Direct-HCCP session"));
+      return Result::kResourceError;
 
     direct_hccp::CtxInitCfg cfg{};
     cfg.mode = direct_hccp::kOfflineHdc;
@@ -217,8 +229,8 @@ struct NpuService::Impl {
           std::vector<direct_hccp::DevEidInfo> list(count);
           if (api.get_dev_eid_info_list(ra_info, list.data(), &count) == 0) {
             std::uint32_t selected = UINT32_MAX;
-            if (options.has_eid_index && options.eid_index < count) {
-              selected = options.eid_index;
+            if (has_eid_index && eid_index < count) {
+              selected = eid_index;
             } else {
               for (std::uint32_t i = 0; i < count; ++i) {
                 if (std::memcmp(list[i].eid.raw, route_eid.raw, sizeof(route_eid.raw)) == 0) {
@@ -231,29 +243,33 @@ struct NpuService::Impl {
               attr.ub.eid = list[selected].eid;
               eid_selected = true;
               std::fprintf(stderr, "[KVAF_NPU] EID_SELECTED source=%s list_index=%u eid_index=%u\n",
-                           options.has_eid_index ? "explicit" : "pair_info.remote_eid", selected,
+                           has_eid_index ? "explicit" : "pair_info.remote_eid", selected,
                            list[selected].eid_index);
             }
           }
         }
       }
     }
-    if (!eid_selected && !DiscoverNpuEid(physical_device_id, options.eid_index, &attr.ub.eid))
-      return fail(Status::NotFound("NPU service could not select an EID from HCCL rootinfo"));
+    if (!eid_selected && !DiscoverNpuEid(physical_device_id, has_eid_index ? eid_index : 0U, &attr.ub.eid)) {
+      (void)ShutdownDevice();
+      return Result::kResourceError;
+    }
     std::memcpy(local_eid.data(), attr.ub.eid.raw, local_eid.size());
     const int ctx_rc = api.ctx_init(&cfg, &attr, &context);
     if (ctx_rc != 0 || context == nullptr) {
       std::fprintf(stderr, "[KVAF_NPU] RaCtxInit failed rc=%d physical=%u ctx_eid_index=%u eid_list_index=%u eid=",
-                   ctx_rc, physical_device_id, attr.ub.eid_index, options.eid_index);
+                   ctx_rc, physical_device_id, attr.ub.eid_index, eid_index);
       for (std::uint8_t byte : local_eid) std::fprintf(stderr, "%02x", byte);
       std::fprintf(stderr, "\n");
-      return fail(Status::Internal("RaCtxInit failed"));
+      (void)ShutdownDevice();
+      return Result::kResourceError;
     }
-    initialized = true;
-    return Status::OK();
+    active_device_id = device_id;
+    device_ready = true;
+    return Result::kOk;
   }
 
-  Status Shutdown() {
+  void ShutdownDevice() {
     for (auto& entry : regions) Release(entry.second.get());
     regions.clear();
     if (context != nullptr && api.ctx_deinit != nullptr) {
@@ -264,6 +280,12 @@ struct NpuService::Impl {
       direct_hccp::ReleaseDirectHccpSession(session);
       session = nullptr;
     }
+    local_eid.fill(0U);
+    device_ready = false;
+  }
+
+  Status Shutdown() {
+    ShutdownDevice();
     if (api.library != nullptr) direct_hccp::CloseDirectHccp(&api);
     initialized = false;
     return Status::OK();
@@ -274,6 +296,9 @@ struct NpuService::Impl {
     if (!initialized || response == nullptr || request.hbm_bytes == 0U ||
         request.slot_size == 0U || request.hbm_bytes % request.slot_size != 0U)
       return Result::kInvalidRequest;
+    const Result device_result = EnsureDevice(
+        request.device_id, request.eid_index, request.eid_index != UINT32_MAX);
+    if (device_result != Result::kOk) return device_result;
     auto region = std::make_unique<HbmRegion>();
     region->bytes = request.hbm_bytes;
     if (aclrtMalloc(&region->memory, request.hbm_bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS)
@@ -535,9 +560,11 @@ struct NpuService::Impl {
   DirectHccpSession* session{nullptr};
   void* context{nullptr};
   std::uint32_t physical_device_id{0U};
+  std::uint32_t active_device_id{0U};
   std::array<std::uint8_t, peer::kEidBytes> local_eid{};
   std::uint64_t next_session{1U};
   bool initialized{false};
+  bool device_ready{false};
   std::unordered_map<std::uint64_t, std::unique_ptr<HbmRegion>> regions;
 };
 

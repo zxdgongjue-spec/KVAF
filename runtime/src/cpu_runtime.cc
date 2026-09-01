@@ -48,7 +48,10 @@ class PeerHbmAllocator final : public DdrMemoryAllocator {
     if (status.ok()) allocated_ = {};
     return status;
   }
-  void SetDevice(std::uint32_t id, std::uint32_t eid) { device_id_ = id; eid_index_ = eid; }
+  void SetDevice(std::uint32_t id, std::uint32_t eid, bool has_eid_index) {
+    device_id_ = id;
+    eid_index_ = has_eid_index ? eid : UINT32_MAX;
+  }
   const peer::PeerRegion& region() const { return allocated_; }
  private:
   std::shared_ptr<peer::PeerLink> link_;
@@ -852,7 +855,7 @@ Status CpuRuntime::InitializeClient(const CpuRuntimeClientOptions& options) {
   impl->client_mode = true;
   impl->peer_link = std::make_shared<peer::PeerLink>(peer_address);
   impl->hbm_allocator = std::make_unique<PeerHbmAllocator>(impl->peer_link);
-  impl->hbm_allocator->SetDevice(options.device_id, options.eid_index);
+  impl->hbm_allocator->SetDevice(options.device_id, options.eid_index, options.has_eid_index);
   CpuUrmaTransportOptions transport_options;
   transport_options.peer_address = peer_address;
   transport_options.ub_device = options.ub_device;
@@ -860,7 +863,7 @@ Status CpuRuntime::InitializeClient(const CpuRuntimeClientOptions& options) {
   transport_options.eid_index = options.eid_index;
   transport_options.remote_hbm = true;
   transport_options.remote_device_id = options.device_id;
-  transport_options.remote_eid_index = options.eid_index;
+  transport_options.remote_eid_index = options.has_eid_index ? options.eid_index : UINT32_MAX;
   impl->access_operator = std::make_unique<CpuUrmaAccessOperator>(transport_options, impl->peer_link);
   impl->meta_manager = CreateInMemoryMetaManager();
   impl->runtime_core = std::make_unique<RuntimeCore>(*impl->meta_manager, *impl->access_operator,

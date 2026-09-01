@@ -86,10 +86,11 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 ./build.sh cpu
 ```
 
-启动 NPU HBM service（默认监听 `127.0.0.1:28999`）：
+启动 NPU HBM service（默认监听 `127.0.0.1:28999`）。不指定 `--device-id` 时，服务会在 CPU
+第一次申请时按请求选择 NPU device，并缓存该 device 的 HBM context：
 
 ```bash
-build-npu/runtime/kvaf_npu_service --listen 0.0.0.0 --port 28999 --device-id 0
+build-npu/runtime/kvaf_npu_service --listen 0.0.0.0 --port 28999
 ```
 
 CPU 侧可通过 `CpuRuntime::InitializeClient` 建链并使用 `RuntimeCore::BatchPut` /
@@ -101,7 +102,8 @@ build-cpu/runtime/kvaf_cpu_runtime_npu_hbm_e2e \
 ```
 
 `--eid-index` 仅在需要固定候选时指定；默认由 CPU UMDK 和 NPU `pair_info`/RA EID
-列表自动选择。
+列表自动选择。NPU service 的 region/session 表支持同时存在多块 HBM；每块 region
+独立注册 segment、Jetty 和 token，并按 session 释放。
 
 现有 `tests/run_remote_cpu_e2e.sh` 与
 `tests/run_remote_cpu_runtime_perf.sh` 接受 `KVAF_CPU_SERVICE_ADDR`，但该变量

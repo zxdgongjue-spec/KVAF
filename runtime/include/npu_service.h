@@ -9,6 +9,8 @@ namespace kvaf {
 
 struct NpuServiceOptions {
   std::uint32_t device_id{0U};
+  // If false, the device is selected lazily from AllocateHbmRegion requests.
+  bool has_device_id{false};
   // Index in the discovered NPU EID list. The HDC context index is fixed at
   // zero to match the existing AIV InitContext() implementation.
   std::uint32_t eid_index{0U};
