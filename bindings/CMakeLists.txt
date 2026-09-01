@@ -2,6 +2,12 @@ pybind11_add_module(_kvaf src/python_module.cpp)
 
 target_link_libraries(_kvaf PRIVATE kvaf_runtime)
 
+if(KVAF_BUILD_REMOTE_CPU_SERVICE)
+  target_link_libraries(_kvaf PRIVATE kvaf_cpu_runtime)
+  target_compile_definitions(_kvaf PRIVATE KVAF_BUILD_REMOTE_CPU_SERVICE=1)
+  target_include_directories(_kvaf PRIVATE ${KVAF_URMA_INCLUDE_DIR})
+endif()
+
 target_include_directories(_kvaf
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include

@@ -33,6 +33,18 @@ if(KVAF_BUILD_PYTHON)
       )
     endif()
   endif()
+
+  if(KVAF_BUILD_REMOTE_CPU_SERVICE)
+    add_test(
+      NAME kvaf_cpu_runtime_npu_hbm_python
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/python/test_cpu_runtime_npu_hbm.py"
+    )
+    set_tests_properties(kvaf_cpu_runtime_npu_hbm_python PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}/python"
+      TIMEOUT 240
+    )
+  endif()
 else()
   message(STATUS
     "Skipping direct Runtime Python tests; configure with -DKVAF_BUILD_PYTHON=ON")

@@ -16,6 +16,10 @@
 #include "meta_manager.h"
 #include "runtime.h"
 
+#if defined(KVAF_BUILD_REMOTE_CPU_SERVICE)
+#include "cpu_runtime.h"
+#endif
+
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
 #include "acl_graph_python.h"
 #include "npu_python_runtime.h"
@@ -366,6 +370,130 @@ class PythonRuntime final {
   std::unique_ptr<RuntimeCore> runtime_;
 };
 
+#if defined(KVAF_BUILD_REMOTE_CPU_SERVICE)
+class CpuPythonRuntime final {
+ public:
+  void Initialize(const std::string& peer, std::uint64_t hbm_bytes,
+                  std::uint64_t slot_size, std::uint32_t device_id,
+                  const std::string& ub_device, py::object eid_index) {
+    CpuRuntimeClientOptions options;
+    options.peer_address = peer;
+    options.hbm_bytes = hbm_bytes;
+    options.slot_size = slot_size;
+    options.device_id = device_id;
+    options.ub_device = ub_device;
+    if (!eid_index.is_none()) {
+      options.eid_index = eid_index.cast<std::uint32_t>();
+      options.has_eid_index = true;
+    }
+    ThrowIfError(native_.InitializeClient(options));
+  }
+
+  void Shutdown() { ThrowIfError(native_.Shutdown()); }
+  bool Initialized() const { return native_.initialized(); }
+
+  py::dict RemoteRegion() const {
+    const RemoteRegionDesc& region = native_.core().remote_region();
+    py::dict result;
+    result["base"] = region.base;
+    result["length"] = region.length;
+    result["slot_size"] = region.slot_size;
+    result["device"] = "npu";
+    return result;
+  }
+
+  void BatchPut(std::vector<std::vector<KeyId>> keys, const py::list& inputs,
+                std::vector<std::vector<std::uint64_t>> input_offsets,
+                std::vector<std::vector<std::uint64_t>> lengths) {
+    if (keys.empty() || keys.size() != static_cast<std::size_t>(inputs.size()) ||
+        keys.size() != input_offsets.size() || keys.size() != lengths.size()) {
+      throw py::value_error("BatchPut arguments must have equal outer sizes");
+    }
+    BatchPutRequest request;
+    request.groups.reserve(keys.size());
+    for (std::size_t group = 0; group < keys.size(); ++group) {
+      if (keys[group].empty() || keys[group].size() != input_offsets[group].size() ||
+          keys[group].size() != lengths[group].size()) {
+        throw py::value_error("BatchPut group arguments must have equal non-empty sizes");
+      }
+      py::buffer input = py::reinterpret_borrow<py::buffer>(inputs[group]);
+      const py::buffer_info info = input.request();
+      if (info.ptr == nullptr || info.size <= 0 || info.itemsize <= 0 ||
+          !IsCContiguous(info)) {
+        throw py::value_error("BatchPut input must be a non-empty contiguous buffer");
+      }
+      const std::size_t bytes = static_cast<std::size_t>(info.size) *
+                                static_cast<std::size_t>(info.itemsize);
+      request.groups.push_back(BatchPutGroup{
+          std::move(keys[group]),
+          ConstBufferView{info.ptr, bytes, DeviceKind::kCpu},
+          std::move(input_offsets[group]), std::move(lengths[group])});
+    }
+    ThrowIfError(native_.core().BatchPut(request));
+  }
+
+  AccessTableHandle PrepareAccessTable(const std::vector<KeyId>& keys) {
+    AccessTableHandle handle;
+    ThrowIfError(native_.core().PrepareAccessTable(
+        AccessTablePrepareRequest{keys}, &handle));
+    return handle;
+  }
+
+  py::dict AccessTableView(const AccessTableHandle& handle) const {
+    kvaf::AccessTableView view;
+    ThrowIfError(native_.core().GetAccessTableView(handle, &view));
+    return python_binding::MakeAccessTableView(view);
+  }
+
+  void ReleaseAccessTable(const AccessTableHandle& handle) {
+    ThrowIfError(native_.core().ReleaseAccessTable(handle));
+  }
+
+  void BatchGet(const AccessTableHandle& handle,
+                const std::vector<std::int32_t>& indices,
+                const std::vector<std::int32_t>& offsets,
+                const std::vector<std::int32_t>& output_indices,
+                py::bytearray output, std::uint64_t output_block_bytes,
+                py::object mask) {
+    if (indices.empty() || indices.size() != offsets.size() ||
+        indices.size() != output_indices.size() || output_block_bytes == 0U) {
+      throw py::value_error("BatchGet arguments are invalid or have mismatched sizes");
+    }
+    std::vector<std::uint8_t> mask_values;
+    if (!mask.is_none()) {
+      mask_values = mask.cast<std::vector<std::uint8_t>>();
+      if (mask_values.size() != indices.size()) {
+        throw py::value_error("BatchGet mask must match indices size");
+      }
+    }
+    char* output_data = PyByteArray_AsString(output.ptr());
+    const Py_ssize_t output_size = PyByteArray_Size(output.ptr());
+    if (output_data == nullptr || output_size <= 0) {
+      throw py::value_error("BatchGet output must be a non-empty bytearray");
+    }
+    const ConstBufferView mask_view = mask_values.empty()
+        ? ConstBufferView{}
+        : ConstBufferView{mask_values.data(), mask_values.size(), DeviceKind::kCpu};
+    const BatchGetRequest request{
+        handle,
+        ConstBufferView{indices.data(), indices.size() * sizeof(std::int32_t), DeviceKind::kCpu},
+        ConstBufferView{offsets.data(), offsets.size() * sizeof(std::int32_t), DeviceKind::kCpu},
+        mask_view,
+        ConstBufferView{output_indices.data(), output_indices.size() * sizeof(std::int32_t), DeviceKind::kCpu},
+        MutableBufferView{output_data, static_cast<std::size_t>(output_size), DeviceKind::kCpu},
+        output_block_bytes, 0, AccessTableDeviceView{}};
+    ThrowIfError(native_.core().BatchGet(request));
+  }
+
+  void BatchFree(const std::vector<KeyId>& keys) {
+    ThrowIfError(native_.core().BatchFree(BatchFreeRequest{keys}));
+  }
+
+ private:
+  CpuRuntime native_;
+};
+#endif
+
 }  // namespace
 }  // namespace kvaf
 
@@ -421,5 +549,29 @@ PYBIND11_MODULE(_kvaf, m) {
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
   kvaf::BindNpuPythonRuntime(m);
   kvaf::BindAclGraph(m);
+#endif
+#if defined(KVAF_BUILD_REMOTE_CPU_SERVICE)
+  py::class_<kvaf::CpuPythonRuntime>(m, "CpuRuntime")
+      .def(py::init<>())
+      .def("initialize", &kvaf::CpuPythonRuntime::Initialize,
+           py::arg("peer"), py::arg("hbm_bytes"), py::arg("slot_size"),
+           py::arg("device_id") = 0, py::arg("ub_device") = "",
+           py::arg("eid_index") = py::none())
+      .def("shutdown", &kvaf::CpuPythonRuntime::Shutdown)
+      .def_property_readonly("initialized", &kvaf::CpuPythonRuntime::Initialized)
+      .def_property_readonly("remote_region", &kvaf::CpuPythonRuntime::RemoteRegion)
+      .def("batch_put", &kvaf::CpuPythonRuntime::BatchPut,
+           py::arg("keys"), py::arg("input"), py::arg("input_offsets"), py::arg("lengths"))
+      .def("prepare_access_table", &kvaf::CpuPythonRuntime::PrepareAccessTable,
+           py::arg("keys"))
+      .def("access_table_view", &kvaf::CpuPythonRuntime::AccessTableView,
+           py::arg("access_table"))
+      .def("release_access_table", &kvaf::CpuPythonRuntime::ReleaseAccessTable,
+           py::arg("access_table"))
+      .def("batch_get", &kvaf::CpuPythonRuntime::BatchGet,
+           py::arg("access_table"), py::arg("indices"), py::arg("offsets"),
+           py::arg("output_indices"), py::arg("output"),
+           py::arg("output_block_bytes"), py::arg("mask") = py::none())
+      .def("batch_free", &kvaf::CpuPythonRuntime::BatchFree, py::arg("keys"));
 #endif
 }

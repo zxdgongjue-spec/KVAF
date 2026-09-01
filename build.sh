@@ -103,11 +103,14 @@ ensure_umdk_source() {
 build_cpu() {
   local build_dir="$1"
   local jobs="$2"
+  local python_bin="${PYTHON:-python3}"
+  local pybind11_dir
   local umdk_root="${KVAF_UMDK_ROOT:-$KVAF_ROOT/../third_party/umdk}"
   local umdk_build_dir="${KVAF_UMDK_BUILD_DIR:-$umdk_root/build-kvaf}"
   local urma_library
 
   require_command cmake
+  require_command "$python_bin"
   ensure_umdk_source "$umdk_root"
   urma_library="$(find_urma_library "$umdk_root" "$umdk_build_dir")"
   if [[ -z "$urma_library" ]]; then
@@ -118,9 +121,16 @@ build_cpu() {
     urma_library="$(find_urma_library "$umdk_root" "$umdk_build_dir")"
   fi
   [[ -n "$urma_library" ]] || die "unable to find liburma.so after UMDK setup"
+  if ! "$python_bin" -m pybind11 --cmakedir >/dev/null 2>&1; then
+    echo "[KVAF_BUILD] installing pybind11 for $python_bin"
+    "$python_bin" -m pip install --user pybind11
+  fi
+  pybind11_dir="$($python_bin -m pybind11 --cmakedir)"
 
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
+    -DKVAF_BUILD_PYTHON=ON \
     -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON \
+    -Dpybind11_DIR="$pybind11_dir" \
     -DKVAF_URMA_ROOT="$umdk_root" \
     -DKVAF_URMA_LIBRARY="$urma_library"
   cmake --build "$build_dir" --target kvaf_cpu_service kvaf_cpu_runtime_npu_hbm_e2e --parallel "$jobs"

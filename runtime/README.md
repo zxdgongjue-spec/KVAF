@@ -101,6 +101,10 @@ build-cpu/runtime/kvaf_cpu_runtime_npu_hbm_e2e \
   --peer <npu-host>:28999 --bytes 4096 --slot-size 4096 --device-id 0
 ```
 
+启用 CPU Python binding 后，`kvaf.CpuRuntime` 提供相同的 packed-input、AccessTable、
+`batch_put`/`batch_get` 接口；`tests/python/test_cpu_runtime_npu_hbm.py` 和
+`tests/run_cpu_runtime_npu_hbm_python.sh` 用于硬件联调。
+
 `--eid-index` 仅在需要固定候选时指定；默认由 CPU UMDK 和 NPU `pair_info`/RA EID
 列表自动选择。NPU service 的 region/session 表支持同时存在多块 HBM；每块 region
 独立注册 segment、Jetty 和 token，并按 session 释放。
