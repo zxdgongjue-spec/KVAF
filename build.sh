@@ -14,12 +14,13 @@ die() {
 
 usage() {
   cat <<'EOF'
-Usage: ./build.sh <cpu|npu> [--build-dir DIR] [--jobs N]
+Usage: ./build.sh <cpu|npu|hbm-rw> [--build-dir DIR] [--jobs N]
 
 cpu  Builds the liburma-only CPU Runtime service. If liburma is not installed,
      it clones and builds the pinned UMDK source beside this repository.
 npu  Builds the CANN AIV BatchGet/BatchPut Runtime and Python binding. It
      installs pybind11 for the selected Python interpreter when necessary.
+hbm-rw Builds the standalone CPU URMA -> NPU HBM read/write test.
 
 Environment overrides:
   KVAF_UMDK_ROOT       UMDK source/header root for the CPU build
@@ -170,9 +171,41 @@ build_npu() {
   echo "[KVAF_BUILD] BatchPut kernel: $build_dir/bin/kvaf_execute_batch_put_kernels.o"
 }
 
+build_hbm_rw() {
+  local build_dir="$1"
+  local jobs="$2"
+  local cann_root
+  local umdk_root="${KVAF_UMDK_ROOT:-$KVAF_ROOT/../third_party/umdk}"
+  local umdk_build_dir="${KVAF_UMDK_BUILD_DIR:-$umdk_root/build-kvaf}"
+  local urma_library
+  require_command cmake
+  ensure_umdk_source "$umdk_root"
+  urma_library="$(find_urma_library "$umdk_root" "$umdk_build_dir")"
+  if [[ -z "$urma_library" ]]; then
+    echo "[KVAF_BUILD] liburma.so not found; building bundled UMDK without TPS/HW drivers"
+    cmake -S "$umdk_root" -B "$umdk_build_dir" \
+      -DTPS=disable -DHW=disable -DURMA_INSTALL=disable
+    cmake --build "$umdk_build_dir" --target urma --parallel "$jobs"
+    urma_library="$(find_urma_library "$umdk_root" "$umdk_build_dir")"
+  fi
+  [[ -n "$urma_library" ]] || die "unable to find liburma.so after UMDK setup"
+  cann_root="$(find_cann_root)"
+  [[ -n "$cann_root" ]] || die "CANN toolkit was not found; set ASCEND_CANN_PACKAGE_PATH"
+  cmake -S "$KVAF_ROOT" -B "$build_dir" \
+    -DBUILD_TESTING=ON \
+    -DKVAF_ENABLE_AIV_BATCH_GET=OFF \
+    -DKVAF_ENABLE_AIV_BATCH_PUT=OFF \
+    -DKVAF_BUILD_HBM_RW_TEST=ON \
+    -DASCEND_CANN_PACKAGE_PATH="$cann_root" \
+    -DKVAF_URMA_ROOT="$umdk_root" \
+    -DKVAF_HBM_TEST_URMA_LIBRARY="$urma_library"
+  cmake --build "$build_dir" --target kvaf_npu_hbm_server kvaf_cpu_hbm_client --parallel "$jobs"
+  echo "[KVAF_BUILD] HBM test binaries: $build_dir/tests/kvaf_npu_hbm_server and $build_dir/tests/kvaf_cpu_hbm_client"
+}
+
 mode="${1:-}"
 case "$mode" in
-  cpu|npu) shift ;;
+  cpu|npu|hbm-rw) shift ;;
   -h|--help|help) usage; exit 0 ;;
   *) usage >&2; exit 2 ;;
 esac
@@ -196,8 +229,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || die "KVAF_BUILD_JOBS must be a positive integer"
-if [[ "$mode" == cpu ]]; then
-  build_cpu "$build_dir" "$jobs"
-else
-  build_npu "$build_dir" "$jobs"
-fi
+case "$mode" in
+  cpu) build_cpu "$build_dir" "$jobs" ;;
+  npu) build_npu "$build_dir" "$jobs" ;;
+  hbm-rw) build_hbm_rw "$build_dir" "$jobs" ;;
+esac

@@ -11,6 +11,9 @@ option(KVAF_ENABLE_AIV_BATCH_PUT
 option(KVAF_BUILD_REMOTE_CPU_SERVICE
        "Build the liburma-only persistent CPU DDR/Jetty service"
        OFF)
+option(KVAF_BUILD_HBM_RW_TEST
+       "Build the standalone CPU URMA to NPU HBM read/write test"
+       OFF)
 
 if(KVAF_ENABLE_AIV_BATCH_PUT AND NOT KVAF_ENABLE_AIV_BATCH_GET)
   message(FATAL_ERROR

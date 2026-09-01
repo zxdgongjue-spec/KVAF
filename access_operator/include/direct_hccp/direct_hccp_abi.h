@@ -275,6 +275,19 @@ struct RaInfo {
   uint32_t phy_id;
 };
 
+// Returned by RaGetDevEidInfoList. Keep the fixed-width layout identical to
+// HCCP's public ABI; only eid/eid_index are consumed by the HBM test.
+struct DevEidInfo {
+  char name[64];
+  uint32_t type;
+  uint32_t eid_index;
+  Eid eid;
+  uint32_t die_id;
+  uint32_t chip_id;
+  uint32_t func_id;
+  uint32_t dev_feature;
+};
+
 // Bootstrap ABI for the HCCP resource service.  RaCtx* assumes its matching
 // PEER/HDC resource agent has already been initialized.
 struct RaInitConfig {
@@ -317,6 +330,8 @@ using GetTpInfoFn = int (*)(void *, GetTpCfg *, TpInfo *, uint32_t *);
 using GetTpInfoAsyncFn = int (*)(void *, GetTpCfg *, TpInfo *, uint32_t *, void **);
 using AsyncReqResultFn = int (*)(void *, int *);
 using GetRandomFn = int (*)(RaInfo *, uint32_t *);
+using GetDevEidInfoNumFn = int (*)(RaInfo, uint32_t *);
+using GetDevEidInfoListFn = int (*)(RaInfo, DevEidInfo *, uint32_t *);
 using RaInitFn = int (*)(RaInitConfig *);
 using RaDeinitFn = int (*)(RaInitConfig *);
 using RtOpenNetServiceFn = int (*)(RtNetServiceOpenArgs *);

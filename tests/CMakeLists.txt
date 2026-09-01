@@ -40,3 +40,37 @@ endif()
 
 # Runtime tests are Python-only. Mock and NPU integration coverage call the
 # pybind API directly; no subprocess driver is built or invoked.
+
+if(KVAF_BUILD_HBM_RW_TEST)
+  set(KVAF_URMA_ROOT "" CACHE PATH "UMDK source or installation root")
+  find_path(KVAF_HBM_TEST_URMA_INCLUDE_DIR urma_api.h
+    HINTS "${KVAF_URMA_ROOT}/include" "${CMAKE_SOURCE_DIR}/../third_party/umdk/include")
+  find_library(KVAF_HBM_TEST_URMA_LIBRARY NAMES urma
+    HINTS "${KVAF_URMA_ROOT}/lib64" "${KVAF_URMA_ROOT}/lib" /lib64 /usr/lib64)
+  if(NOT KVAF_HBM_TEST_URMA_INCLUDE_DIR OR NOT KVAF_HBM_TEST_URMA_LIBRARY)
+    message(FATAL_ERROR "KVAF_BUILD_HBM_RW_TEST requires urma_api.h and liburma")
+  endif()
+
+  add_executable(kvaf_npu_hbm_server npu_hbm_server.cc)
+  target_include_directories(kvaf_npu_hbm_server PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/access_operator/include
+    ${KVAF_HBM_TEST_URMA_INCLUDE_DIR}
+    ${ASCEND_CANN_PACKAGE_PATH}/include)
+  target_link_directories(kvaf_npu_hbm_server PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/lib64)
+  target_link_libraries(kvaf_npu_hbm_server PRIVATE
+    kvaf_direct_hccp_session kvaf_peer_link ascendcl ${CMAKE_DL_LIBS} pthread)
+  get_filename_component(KVAF_HBM_TEST_URMA_LIBRARY_DIR "${KVAF_HBM_TEST_URMA_LIBRARY}" DIRECTORY)
+
+  add_executable(kvaf_cpu_hbm_client cpu_hbm_client.cc)
+  target_include_directories(kvaf_cpu_hbm_client PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/access_operator/include
+    ${KVAF_HBM_TEST_URMA_INCLUDE_DIR})
+  target_link_libraries(kvaf_cpu_hbm_client PRIVATE
+    ${KVAF_HBM_TEST_URMA_LIBRARY} ${CMAKE_DL_LIBS} pthread)
+  set_property(TARGET kvaf_cpu_hbm_client APPEND PROPERTY BUILD_RPATH
+    "${KVAF_HBM_TEST_URMA_LIBRARY_DIR}")
+  set_property(TARGET kvaf_npu_hbm_server APPEND PROPERTY BUILD_RPATH
+    "${KVAF_HBM_TEST_URMA_LIBRARY_DIR}" "${ASCEND_CANN_PACKAGE_PATH}/lib64")
+endif()

@@ -37,6 +37,8 @@ struct DirectHccpApi {
   GetTpInfoAsyncFn get_tp_info_async{nullptr};
   AsyncReqResultFn get_async_req_result{nullptr};
   GetRandomFn get_random{nullptr};
+  GetDevEidInfoNumFn get_dev_eid_info_num{nullptr};
+  GetDevEidInfoListFn get_dev_eid_info_list{nullptr};
 };
 
 struct DirectMemory {
