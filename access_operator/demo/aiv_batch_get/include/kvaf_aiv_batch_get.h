@@ -21,11 +21,12 @@ enum {
 typedef struct KvafBatchGetTransport KvafBatchGetTransport;
 typedef struct KvafBatchGetLocalBuffer KvafBatchGetLocalBuffer;
 
-// Transport owns only the reusable CPU-EID <-> device-EID path and Host DDR.
+// Transport owns only the reusable peer-EID path and remote DDR registration.
 // It deliberately accepts no caller-owned HBM buffer.
-int32_t KvafBatchGetTransportCreate(void *host_ddr, uint64_t host_ddr_bytes,
-                                    uint32_t aiv_core_count, uint32_t jettys_per_core,
-                                    KvafBatchGetTransport **transport);
+int32_t KvafBatchGetTransportCreateWithPeerLink(
+    void *host_ddr, uint64_t host_ddr_bytes, uint32_t aiv_core_count,
+    uint32_t jettys_per_core, void *peer_link,
+    const uint8_t *peer_local_eid, KvafBatchGetTransport **transport);
 void KvafBatchGetTransportDestroy(KvafBatchGetTransport *transport);
 
 // Acquire registers/caches one caller-owned HBM output range. Re-acquiring

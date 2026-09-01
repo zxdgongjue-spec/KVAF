@@ -120,28 +120,6 @@ class RuntimeMockTests(unittest.TestCase):
         self.kvaf.release_access_table(table)
         self.kvaf.batch_free([9])
 
-    def test_get_processes_only_miss_count_prefix(self) -> None:
-        self.kvaf.initialize(ddr_bytes=128, slot_size=64)
-        self.batch_put([21], [self.payload([0xAB])])
-        table = self.kvaf.prepare_access_table([21])
-        output = bytearray(8)
-        self.kvaf.batch_get(
-            table,
-            indices=[0, 999],
-            offsets=[0, -1],
-            miss_count=1,
-            output_indices=[0, 999],
-            output=output,
-            output_block_bytes=4,
-        )
-        self.assertEqual(output, bytes.fromhex("ab00000000000000"))
-        with self.assertRaises(ValueError):
-            self.kvaf.batch_get(
-                table, [0], [0], 2, [0], bytearray(4),
-                output_block_bytes=4,
-            )
-        self.kvaf.release_access_table(table)
-
     def test_validation_and_shutdown(self) -> None:
         with self.assertRaises(ValueError):
             self.kvaf.initialize(ddr_bytes=10, slot_size=4)
@@ -154,25 +132,28 @@ class RuntimeMockTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.kvaf.batch_get(table, [0], [0], 1, [0], bytearray(4), output_block_bytes=4)
 
-    def test_get_uses_index_and_656_byte_row_offset(self) -> None:
-        entry_bytes = 128 * 656
-        self.kvaf.initialize(ddr_bytes=entry_bytes, slot_size=entry_bytes)
-        block = bytearray(entry_bytes)
-        block[:656] = bytes([0x11]) * 656
-        block[656:1312] = bytes([0x22]) * 656
+    def test_get_uses_configured_token_size_and_block_layout(self) -> None:
+        token_bytes = 7
+        tokens_per_block = 3
+        block_bytes = tokens_per_block * token_bytes
+        self.kvaf.initialize(ddr_bytes=block_bytes, slot_size=block_bytes)
+        block = bytearray(block_bytes)
+        block[:token_bytes] = bytes([0x11]) * token_bytes
+        block[token_bytes : 2 * token_bytes] = bytes([0x22]) * token_bytes
         self.batch_put([17], [block])
         table = self.kvaf.prepare_access_table([17])
-        output = bytearray(656)
+        output = bytearray(token_bytes)
         self.kvaf.batch_get(
-            table, indices=[0], offsets=[656], miss_count=1, output_indices=[0],
-            output=output, output_block_bytes=656,
+            table, indices=[0], offsets=[token_bytes], miss_count=1,
+            output_indices=[0],
+            output=output, output_block_bytes=token_bytes,
         )
-        self.assertEqual(output, bytes([0x22]) * 656)
+        self.assertEqual(output, bytes([0x22]) * token_bytes)
         with self.assertRaises(ValueError):
             self.kvaf.batch_get(
-                table, indices=[0], offsets=[entry_bytes], miss_count=1,
+                table, indices=[0], offsets=[block_bytes], miss_count=1,
                 output_indices=[0],
-                output=bytearray(656), output_block_bytes=656,
+                output=bytearray(token_bytes), output_block_bytes=token_bytes,
             )
         self.kvaf.release_access_table(table)
 

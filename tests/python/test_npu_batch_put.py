@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import ctypes
 import os
 from pathlib import Path
 import statistics
@@ -15,6 +14,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kvaf
 
 from backend import detect_torch_backend
+
+DEFAULT_BATCH_GET_TOKEN_BYTES = 656
+DEFAULT_BATCH_GET_TOKENS_PER_BLOCK = 128
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -28,23 +30,20 @@ def percentile(values: list[float], fraction: float) -> float:
 def validate_batch(
     runtime: object,
     keys: list[int],
-    expected: bytes,
     rows: int,
     block_bytes: int,
 ) -> None:
     table = runtime.prepare_access_table(keys)
     try:
         view = runtime.access_table_view(table)
-        addresses = list(view["addresses"])
         if list(view["lengths"]) != [block_bytes] * rows:
             raise AssertionError("committed BatchPut lengths do not match")
         if list(view["valid"]) != [1] * rows:
             raise AssertionError("committed BatchPut entries are not valid")
-        for row, address in enumerate(addresses):
-            begin = row * block_bytes
-            actual = ctypes.string_at(address, block_bytes)
-            if actual != expected[begin : begin + block_bytes]:
-                raise AssertionError(f"BatchPut payload mismatch row={row}")
+        # DDR belongs to the CPU service process. The companion BatchGet
+        # integration test validates the bytes through AIV UB rather than
+        # dereferencing a remote process address from Python.
+        print("RUNTIME_NPU_REMOTE_CPU_DIRECT_DEREFERENCE_SKIPPED")
     finally:
         runtime.release_access_table(table)
 
@@ -93,6 +92,17 @@ def main() -> int:
     device_id = int(os.environ.get("DEVICE_ID", "0"))
     rows = int(os.environ.get("KVAF_NPU_REQUESTS", "4096"))
     block_bytes = int(os.environ.get("KVAF_NPU_BLOCK_BYTES", "1024"))
+    token_bytes = int(
+        os.environ.get(
+            "KVAF_NPU_TOKEN_BYTES", str(DEFAULT_BATCH_GET_TOKEN_BYTES)
+        )
+    )
+    tokens_per_block = int(
+        os.environ.get(
+            "KVAF_NPU_TOKENS_PER_BLOCK",
+            str(DEFAULT_BATCH_GET_TOKENS_PER_BLOCK),
+        )
+    )
     npu_core_count = int(
         os.environ.get("KVAF_NPU_CORE_COUNT", os.environ.get("KVAF_NPU_AIV_CORES", "32"))
     )
@@ -102,6 +112,8 @@ def main() -> int:
     if not (
         rows > 0
         and block_bytes > 0
+        and token_bytes > 0
+        and tokens_per_block > 0
         and 0 < npu_core_count <= rows
         and 1 <= jettys_per_core <= 2
         and warmup >= 0
@@ -119,7 +131,6 @@ def main() -> int:
     source_host = (
         (source_rows * 131 + source_bytes * 17 + (source_bytes >> 3)) & 0xFF
     ).to(torch.uint8).contiguous()
-    expected = source_host.numpy().tobytes()
     source = source_host.to(device)
     offsets = [row * block_bytes for row in range(rows)]
     lengths = [block_bytes] * rows
@@ -128,16 +139,25 @@ def main() -> int:
 
     runtime = kvaf.NpuRuntime(
         str(batch_get_kernel),
-        device_id,
-        npu_core_count,
-        str(batch_put_kernel),
-        jettys_per_core,
+        batch_get_token_bytes=token_bytes,
+        batch_get_tokens_per_block=tokens_per_block,
+        device_id=device_id,
+        npu_core_count=npu_core_count,
+        batch_put_kernel_object_path=str(batch_put_kernel),
+        jettys_per_core=jettys_per_core,
     )
+    remote_cpu_service = os.environ.get("KVAF_CPU_SERVICE_ADDR")
+    if not remote_cpu_service:
+        print("FAIL: KVAF_CPU_SERVICE_ADDR must name the separately running CPU service", file=sys.stderr)
+        return 2
+    runtime.link_to(remote_cpu_service)
     committed = False
     try:
         print(
             "RUNTIME_NPU_BATCH_PUT_CONFIG "
             f"rows={rows} block_bytes={block_bytes} npu_cores={npu_core_count} "
+            f"batch_get_token_bytes={token_bytes} "
+            f"batch_get_tokens_per_block={tokens_per_block} "
             f"jettys_per_core={jettys_per_core} warmup={warmup} "
             f"iterations={iterations} backend=aiv_direct_hccp"
         )
@@ -156,7 +176,7 @@ def main() -> int:
         print("RUNTIME_NPU_PHASE_BEGIN phase=runtime_batch_put")
         execute()
         torch.npu.synchronize()
-        validate_batch(runtime, keys, expected, rows, block_bytes)
+        validate_batch(runtime, keys, rows, block_bytes)
         print(f"RUNTIME_NPU_BATCH_PUT_VALIDATION_PASS rows={rows}")
         release()
 
@@ -176,7 +196,7 @@ def main() -> int:
         print("RUNTIME_NPU_PHASE_DONE phase=runtime_batch_put")
 
         print("RUNTIME_NPU_PHASE_BEGIN phase=post_perf_validation")
-        validate_batch(runtime, keys, expected, rows, block_bytes)
+        validate_batch(runtime, keys, rows, block_bytes)
         release()
         print("RUNTIME_NPU_PHASE_DONE phase=post_perf_validation")
 

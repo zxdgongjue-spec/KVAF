@@ -80,7 +80,7 @@ sequenceDiagram
 
 ## 对外接口
 
-接口定义见 [meta_manager.h](C:/Urma/KVAF/meta_manager/include/kvaf/meta_manager/meta_manager.h:1)。
+接口定义见 [meta_manager.h](include/meta_manager.h)。
 
 - `RegisterRemoteRegion`
   注册 region，初始化空闲 slot 队列。

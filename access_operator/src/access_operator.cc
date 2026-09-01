@@ -1,4 +1,4 @@
-#include "kvaf/access_operator/access_operator.h"
+#include "access_operator.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -12,7 +12,7 @@
 #include "acl/acl.h"
 #include "batch_get_abi.h"
 #include "kvaf_aiv_batch_get.h"
-#include "kvaf/meta_manager/meta_manager.h"
+#include "meta_manager.h"
 
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
 #include "batch_put_abi.h"
@@ -154,7 +154,8 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
       !request.offsets.has_elements<std::int32_t>() ||
       !request.output_indices.has_elements<std::int32_t>() ||
       !request.output.valid() ||
-      request.output_block_bytes != kBatchGetTransferBytes ||
+      request.output_block_bytes == 0 ||
+      request.tokens_per_block == 0 ||
       request.output.bytes % request.output_block_bytes != 0 ||
       request.indices.device != request.offsets.device ||
       request.indices.device != request.output_indices.device ||
@@ -171,7 +172,6 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
       request.device_access_table.addresses.bytes % sizeof(Address) != 0 ||
       request.device_access_table.valid.bytes !=
           request.device_access_table.addresses.bytes / sizeof(Address) ||
-      request.output_block_bytes == 0 ||
       request.indices.bytes % sizeof(std::int32_t) != 0 ||
       request.offsets.bytes != request.indices.bytes ||
       request.output_indices.bytes != request.indices.bytes ||
@@ -190,7 +190,8 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
   const std::size_t device_table_entries =
       request.device_access_table.addresses.bytes / sizeof(Address);
   if (!FitsU32(device_table_entries) || !FitsU32(request_count) ||
-      !FitsU32(output_rows) || !FitsU32(request.output_block_bytes)) {
+      !FitsU32(output_rows) || !FitsU32(request.output_block_bytes) ||
+      !FitsU32(request.tokens_per_block)) {
     return InvalidArgument("BatchGet dimensions exceed the device ABI");
   }
   *arguments = KvafExecuteBatchGetKernelArgs{};
@@ -206,7 +207,10 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
   arguments->table_capacity = static_cast<std::uint32_t>(device_table_entries);
   arguments->request_capacity = static_cast<std::uint32_t>(request_count);
   arguments->output_rows = static_cast<std::uint32_t>(output_rows);
-  arguments->block_bytes = KVAF_AIV_BATCH_GET_WQE_DATA_BYTES;
+  arguments->token_bytes =
+      static_cast<std::uint32_t>(request.output_block_bytes);
+  arguments->tokens_per_block =
+      static_cast<std::uint32_t>(request.tokens_per_block);
   arguments->block_count = npu_core_count;
   arguments->jettys_per_core = jettys_per_core;
   return Status::OK();
@@ -274,6 +278,14 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
       impl_->config.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE) {
     return InvalidArgument("invalid AccessOperator initialization config");
   }
+  if (impl_->config.peer_link == nullptr) {
+    return InvalidState("AccessOperator requires an established Runtime Link");
+  }
+  if (std::all_of(impl_->config.peer_local_eid.begin(),
+                  impl_->config.peer_local_eid.end(),
+                  [](std::uint8_t value) { return value == 0U; })) {
+    return InvalidArgument("Runtime Link requires a Runtime-selected local EID");
+  }
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   if (!impl_->config.batch_put_kernel_object_path.empty() &&
       (impl_->config.npu_core_count > KVAF_AIV_BATCH_PUT_MAX_AIV_CORES ||
@@ -289,9 +301,10 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
   }
 
   KvafBatchGetTransport* transport = nullptr;
-  const int32_t result = KvafBatchGetTransportCreate(
+  const int32_t result = KvafBatchGetTransportCreateWithPeerLink(
       reinterpret_cast<void*>(remote_region.base), remote_region.length,
-      impl_->config.npu_core_count, impl_->config.jettys_per_core, &transport);
+      impl_->config.npu_core_count, impl_->config.jettys_per_core,
+      impl_->config.peer_link.get(), impl_->config.peer_local_eid.data(), &transport);
   if (result != KVAF_BATCH_GET_SUCCESS || transport == nullptr) {
     return Internal("failed to create reusable BatchGet transport");
   }
@@ -334,10 +347,11 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     }
 
     KvafBatchPutTransport* batch_put_transport = nullptr;
-    const int32_t batch_put_result = KvafBatchPutTransportCreate(
+    const int32_t batch_put_result = KvafBatchPutTransportCreateWithPeerLink(
         reinterpret_cast<void*>(remote_region.base), remote_region.length,
-        impl_->config.npu_core_count,
-        impl_->config.jettys_per_core, &batch_put_transport);
+        impl_->config.npu_core_count, impl_->config.jettys_per_core,
+        impl_->config.peer_link.get(), impl_->config.peer_local_eid.data(),
+        &batch_put_transport);
     if (batch_put_result != KVAF_BATCH_PUT_SUCCESS ||
         batch_put_transport == nullptr) {
       (void)aclrtFree(impl_->execution.queue_state);
