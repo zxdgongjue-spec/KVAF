@@ -1,5 +1,7 @@
 #include "cpu_urma_access_operator.h"
 
+#include "meta_manager.h"
+
 #include <limits>
 #include <utility>
 
