@@ -33,6 +33,29 @@ enum {
   // One int32 owner word per Direct-HCCP queue: 0 means free and a positive
   // value is the producer-owned lease tag (normally 1 + LI producer id).
   KVAF_STREAMING_BATCH_GET_QUEUE_LEASE_BYTES = sizeof(int32_t),
+  // P8 keeps one forward-owned, fixed four-cache-line transaction record per
+  // Direct-HCCP queue.  Host code allocates this as torch.int64[Q, 32]; the
+  // device-only layout embeds the existing DenseBatchGet transaction in the
+  // matching 256-byte slot.  This is a bounded queue ledger, not a
+  // per-candidate ticket allocation.
+  KVAF_P8_WAVE_RECORD_BYTES = 256,
+  KVAF_P8_WAVE_RECORD_WORDS =
+      KVAF_P8_WAVE_RECORD_BYTES / sizeof(uint64_t),
+  // One durable ownership record per row of the P8 private HBM arena.  The
+  // P8 executor uses a graph-stable int64[N, 10] backing tensor rather than
+  // reusing the legacy queue-private output partition.  This lets a CQ-
+  // terminal queue be returned to the dynamic pool while QSFA still owns the
+  // payload in the separately claimed private slot.
+  KVAF_P8_PRIVATE_RECORD_BYTES = 80,
+  KVAF_P8_PRIVATE_RECORD_WORDS =
+      KVAF_P8_PRIVATE_RECORD_BYTES / sizeof(uint64_t),
+  // A graph-stable P8 forward control is [forward_epoch,
+  // graph_replay_generation, layer_control_index, phase].  It is deliberately
+  // separate from the streaming transport control so the latter remains
+  // compatible with earlier BatchGet users.
+  KVAF_P8_FORWARD_CONTROL_WORDS = 4,
+  KVAF_P8_FORWARD_CONTROL_BYTES =
+      KVAF_P8_FORWARD_CONTROL_WORDS * sizeof(uint64_t),
   // Shared local-memory contract used by the AIV kernel and launcher.
   KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES = 160 * 1024,
 };
