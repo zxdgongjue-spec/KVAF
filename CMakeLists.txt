@@ -14,6 +14,9 @@ option(KVAF_BUILD_REMOTE_CPU_SERVICE
 option(KVAF_BUILD_HBM_RW_TEST
        "Build the standalone CPU URMA to NPU HBM read/write test"
        OFF)
+option(KVAF_BUILD_NPU_SERVICE
+       "Build the NPU HBM control service (requires CANN and Direct-HCCP)"
+       OFF)
 
 if(KVAF_ENABLE_AIV_BATCH_PUT AND NOT KVAF_ENABLE_AIV_BATCH_GET)
   message(FATAL_ERROR

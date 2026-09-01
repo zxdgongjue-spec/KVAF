@@ -20,6 +20,9 @@ struct PeerRegion {
   uint32_t segment_key_bytes = 0U;
   std::array<uint8_t, kEidBytes> eid{};
   std::array<uint8_t, kSegKeyBytes> segment_key{};
+  uint32_t jetty_key_bytes = 0U;
+  std::array<uint8_t, kQpKeyBytes> jetty_key{};
+  bool device_memory = false;
 };
 
 // Per-Runtime peer control-plane client. Its endpoint is explicit: Runtime
@@ -34,8 +37,15 @@ class PeerLink {
   Status GetCandidateCount(uint32_t* candidate_count) const;
   Status AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
                         uint32_t candidate_id, PeerRegion* region);
+  Status AllocateHbmRegion(uint64_t hbm_bytes, uint64_t slot_size,
+                           uint32_t device_id, uint32_t eid_index,
+                           PeerRegion* region);
   Status ReleaseRegion(uint64_t base);
+  Status ReleaseHbmRegion(uint64_t session_id);
   Status LookupRegion(uint64_t base, PeerRegion* region) const;
+  // Register a descriptor obtained by an out-of-band allocator (for example
+  // RuntimeCore's NPU HBM allocator) so channel setup can use the same API.
+  Status RememberRegion(const PeerRegion& region);
   Status CreateChannel(
       uint64_t region_base, const uint8_t local_qp_key[kQpKeyBytes],
       uint32_t local_qp_key_bytes, const uint8_t local_eid[kEidBytes],

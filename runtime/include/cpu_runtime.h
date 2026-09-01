@@ -6,12 +6,23 @@
 
 #include "runtime.h"
 
+namespace kvaf { class RuntimeCore; }
+
 namespace kvaf {
 
 struct CpuRuntimeOptions {
   std::string ub_device;
   bool has_eid_index{false};
   std::uint32_t eid_index{0};
+};
+
+struct CpuRuntimeClientOptions {
+  std::string peer_address;
+  std::uint64_t hbm_bytes{0U};
+  std::uint64_t slot_size{0U};
+  std::string ub_device;
+  std::uint32_t eid_index{0U};
+  std::uint32_t device_id{0U};
 };
 
 // CPU endpoint Runtime. It owns only CPU-side UMDK resources and sessions;
@@ -25,6 +36,9 @@ class CpuRuntime final : public Runtime {
   CpuRuntime& operator=(const CpuRuntime&) = delete;
 
   Status Initialize(const CpuRuntimeOptions& options);
+  Status InitializeClient(const CpuRuntimeClientOptions& options);
+  RuntimeCore& core();
+  const RuntimeCore& core() const;
 
   Status LinkTo(const LinkTarget& target) override;
   Status AcceptLink(const LinkTarget& peer) override;
@@ -37,6 +51,7 @@ class CpuRuntime final : public Runtime {
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  std::string pending_peer_address_;
 };
 
 }  // namespace kvaf
