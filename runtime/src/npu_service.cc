@@ -8,7 +8,10 @@
 
 #include <array>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
+#include <cctype>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -77,20 +80,68 @@ struct HbmRegion {
   void* peer_target_jetty{nullptr};
 };
 
-// RA exposes the NPU EID list through symbols that are not present in the
-// public Direct-HCCP header. The first field is the same 16-byte EID used by
-// CtxInitAttr; the remaining provider metadata is intentionally opaque.
-struct RaEidInfo {
-  direct_hccp::Eid eid{};
-  std::uint32_t eid_index{0U};
-  std::uint32_t reserved{0U};
-};
-struct RaInfo {
-  std::int32_t mode{0};
-  std::uint32_t phy_id{0};
-};
-using GetEidNumFn = int (*)(RaInfo, std::uint32_t*);
-using GetEidListFn = int (*)(RaInfo, RaEidInfo*, std::uint32_t*);
+bool ParseEidHex(const std::string& text, direct_hccp::Eid* eid) {
+  if (eid == nullptr || text.size() != 32U) return false;
+  auto hex = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  for (std::size_t i = 0; i < 16U; ++i) {
+    const int hi = hex(text[i * 2U]);
+    const int lo = hex(text[i * 2U + 1U]);
+    if (hi < 0 || lo < 0) return false;
+    eid->raw[i] = static_cast<std::uint8_t>((hi << 4U) | lo);
+  }
+  return true;
+}
+
+bool DiscoverNpuEid(std::uint32_t physical, std::uint32_t index,
+                    direct_hccp::Eid* eid) {
+  const char* configured = std::getenv("KVAF_HCCL_ROOTINFO_PATH");
+  const std::string path = configured != nullptr && configured[0] != '\0'
+                               ? configured : "/etc/hccl_rootinfo.json";
+  std::ifstream input(path);
+  if (!input.is_open() || eid == nullptr) return false;
+  bool selected = false, layer_one = false, clos = false, expect_addr = false;
+  std::uint32_t found_device = 0U;
+  std::string line;
+  std::vector<direct_hccp::Eid> candidates;
+  while (std::getline(input, line)) {
+    const auto field = [&](const char* name, std::uint32_t* value) {
+      const std::string marker = std::string{"\""} + name + "\"";
+      const std::size_t pos = line.find(marker);
+      const std::size_t colon = pos == std::string::npos ? std::string::npos : line.find(':', pos);
+      if (colon == std::string::npos) return false;
+      const std::size_t first = line.find_first_of("0123456789", colon + 1U);
+      if (first == std::string::npos) return false;
+      *value = static_cast<std::uint32_t>(std::strtoul(line.c_str() + first, nullptr, 10));
+      return true;
+    };
+    std::uint32_t value = 0U;
+    if (field("device_id", &value)) {
+      selected = value == physical; found_device = found_device || selected;
+      layer_one = clos = expect_addr = false; continue;
+    }
+    if (!selected) continue;
+    if (field("net_layer", &value)) { layer_one = value == 1U; clos = expect_addr = false; continue; }
+    if (!layer_one) continue;
+    if (line.find("\"net_type\"") != std::string::npos) { clos = line.find("\"CLOS\"") != std::string::npos; continue; }
+    if (clos && line.find("\"addr_type\"") != std::string::npos) { expect_addr = line.find("\"EID\"") != std::string::npos; continue; }
+    if (!expect_addr) continue;
+    const std::size_t pos = line.find("\"addr\"");
+    const std::size_t first = pos == std::string::npos ? std::string::npos : line.find('"', line.find(':', pos) + 1U);
+    const std::size_t second = first == std::string::npos ? std::string::npos : line.find('"', first + 1U);
+    if (second == std::string::npos) continue;
+    direct_hccp::Eid candidate{};
+    if (ParseEidHex(line.substr(first + 1U, second - first - 1U), &candidate)) candidates.push_back(candidate);
+    expect_addr = false;
+  }
+  if (!found_device || index >= candidates.size()) return false;
+  *eid = candidates[index];
+  return true;
+}
 
 }  // namespace
 
@@ -112,21 +163,11 @@ struct NpuService::Impl {
     cfg.mode = direct_hccp::kOfflineHdc;
     direct_hccp::CtxInitAttr attr{};
     attr.phy_id = physical_device_id;
-    attr.ub.eid_index = options.eid_index;
-    auto get_eid_num = reinterpret_cast<GetEidNumFn>(dlsym(api.library, "RaGetDevEidInfoNum"));
-    auto get_eid_list = reinterpret_cast<GetEidListFn>(dlsym(api.library, "RaGetDevEidInfoList"));
-    if (get_eid_num == nullptr || get_eid_list == nullptr)
-      return Status::NotImplemented("Direct-HCCP EID discovery symbols are unavailable");
-    RaInfo ra_info{static_cast<std::int32_t>(direct_hccp::kOfflineHdc), physical_device_id};
-    std::uint32_t eid_count = 0U;
-    if (get_eid_num(ra_info, &eid_count) != 0 || eid_count == 0U)
-      return Status::NotFound("NPU service found no HDC EID candidates");
-    std::vector<RaEidInfo> eid_list(eid_count);
-    if (get_eid_list(ra_info, eid_list.data(), &eid_count) != 0 ||
-        options.eid_index >= eid_count)
-      return Status::InvalidArgument("NPU service eid-index is outside the discovered EID list");
-    std::memcpy(attr.ub.eid.raw, eid_list[options.eid_index].eid.raw,
-                sizeof(attr.ub.eid.raw));
+    // The HDC context index is provider-specific (the existing HBM path uses
+    // index 0); the routable EID is selected from HCCL CLOS metadata.
+    attr.ub.eid_index = 0U;
+    if (!DiscoverNpuEid(physical_device_id, options.eid_index, &attr.ub.eid))
+      return Status::NotFound("NPU service could not select an EID from HCCL rootinfo");
     if (api.ctx_init(&cfg, &attr, &context) != 0 || context == nullptr)
       return Status::Internal("RaCtxInit failed");
     initialized = true;
