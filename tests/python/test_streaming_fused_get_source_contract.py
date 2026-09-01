@@ -35,6 +35,7 @@ def main() -> None:
         "StoreKvafStreamingBatchGetDescriptorScratchToGm",
     ):
         assert token in text, token
+    assert "record.state <= kKvafP8WaveFillingClaimed" in text
 
     # P8 makes the PostOnly -> CQ lifecycle forward-owned.  The record is a
     # fixed four-cache-line entry per transport queue, so it cannot silently
@@ -57,6 +58,9 @@ def main() -> None:
         "MarkKvafP8ForwardAbortFromSimt",
         "MarkKvafP8ForwardAbortFromAicore",
         "IsKvafP8PrivateViewReadyForQsfa",
+        "kKvafP8WaveFilling",
+        "kKvafP8WaveFillingReleaseClaimed",
+        "kKvafP8WaveFillingClaimed",
         "kKvafP8WavePostIntent",
         "kKvafP8WavePosted",
         "kKvafP8WaveDrainClaimed",
@@ -65,6 +69,26 @@ def main() -> None:
         "kKvafP8WaveQuarantined",
         "TryClaimKvafP8WaveDrainFromAicore",
         "TryClaimKvafP8UnpostedWaveDrainFromAicore",
+        "BeginKvafP8WaveFilling",
+        "BeginAndPublishKvafP8WaveFilling",
+        "IsKvafP8WaveRecordAllZero",
+        "IsKvafP8WaveRecordAdmissibleForFilling",
+        "PublishKvafP8FillingPostIntentPayloadToGm",
+        "TryTransitionKvafP8FillingStateFromSimt",
+        "TryTransitionKvafP8FillingStateFromAicore",
+        "TryClaimKvafP8WaveFillingAdmissionFromAicore",
+        "QuarantineKvafP8WaveFillingClaimedFromAicore",
+        "PublishKvafP8WaveFillingClaimedPayloadToGm",
+        "CommitKvafP8WaveMutablePayloadAndStateFromAicore",
+        "TryCommitKvafP8WaveStateLastFromSimt",
+        "CommitKvafP8ClaimedUnpostedWaveReleaseFromAicore",
+        "TryCommitKvafP8ClaimedUnpostedWaveReleaseFromSimt",
+        "QuarantineKvafP8FillingStateFromAicore",
+        "QuarantineKvafP8PostIntentStateFromAicore",
+        "ArmKvafP8WaveFillingForExternalWrites",
+        "PromoteKvafP8WaveFillingToPostIntent",
+        "ReleaseKvafP8FillingLeaseAfterProvenNoWork",
+        "IsKvafP8WaveFillingProvenNoWork",
         "PrepareKvafP8WavePostIntent",
         "PostKvafP8Wave",
         "TryRetireKvafP8Wave",
@@ -121,6 +145,130 @@ def main() -> None:
         "VF_CALL<KvafP8WaveDrainClaimSimtService>",
     ):
         assert token in p8_drain_claim, token
+    assert "static_cast<int32_t>(kKvafP8WaveFilling)" not in p8_drain_claim
+    assert (
+        "static_cast<int32_t>(kKvafP8WaveFillingReleaseClaimed)"
+        not in p8_drain_claim
+    )
+
+    # A pre-doorbell state transition cannot use a normal GM Store: terminal
+    # recovery may have already made the record QUARANTINED.  The allowed
+    # edges are deliberately enumerated in a SIMT CAS endpoint.
+    p8_filling_transition = _between(
+        text,
+        "__simt_callee__ inline bool TryTransitionKvafP8FillingStateFromSimt(",
+        "// A deterministic Begin/Post rejection",
+    )
+    for token in (
+        "asc_atomic_cas(",
+        "kKvafP8WaveFillingReleaseClaimed",
+        "kKvafP8WaveFillingClaimed",
+        "kKvafP8WavePostIntent",
+        "kKvafP8WaveQuarantined",
+        "kKvafP8WaveFree",
+        "VF_CALL<KvafP8FillingStateTransitionSimtService>",
+        "TryTransitionKvafP8FillingStateFromAicore",
+    ):
+        assert token in p8_filling_transition, token
+
+    # A local PostOnly/CQ/Finish result must never overwrite a concurrent
+    # terminal state with a full GM record.  State-last commits are deliberately
+    # restricted to post, drain, and owned-release edges.
+    p8_state_last_edges = _between(
+        text,
+        "__aicore__ inline bool IsKvafP8WaveStateLastCommitEdgeAllowed(",
+        "__aicore__ inline bool IsKvafP8WaveStateLastPayloadValid(",
+    )
+    for token in (
+        "kKvafP8WavePostIntent",
+        "kKvafP8WaveDrainClaimed",
+        "kKvafP8WaveFinalized",
+        "kKvafP8WavePosted",
+        "kKvafP8WaveFree",
+        "kKvafP8WaveQuarantined",
+    ):
+        assert token in p8_state_last_edges, token
+
+    p8_state_last_commit = _between(
+        text,
+        "__aicore__ inline bool CommitKvafP8WaveMutablePayloadAndStateFromAicore(",
+        "// Admission uses a separate claim",
+    )
+    for token in (
+        "KvafP8WaveIdentityEquals",
+        "LoadKvafP8WaveRecordFromGm",
+        "PublishKvafP8WaveStateLastMutablePayloadToGm",
+        "DataSyncBarrier<AscendC::MemDsbT::DDR>()",
+        "VF_CALL<KvafP8WaveStateLastCommitSimtService>",
+    ):
+        assert token in p8_state_last_commit, token
+    assert "StoreKvafP8WaveRecordToGm" not in p8_state_last_commit
+
+    # The only DRAIN_CLAIMED -> FREE edge is a separately named no-post
+    # release proof.  It must not broaden the regular CQ state-last API: the
+    # record must still prove POST_REJECTED/no private payload, publish its
+    # mutable words, and CAS the state last.
+    p8_claimed_unposted_release = _between(
+        text,
+        "__aicore__ inline bool CommitKvafP8ClaimedUnpostedWaveReleaseFromAicore(",
+        "// Admission uses a separate claim",
+    )
+    for token in (
+        "IsKvafP8ClaimedUnpostedWaveReleasePayloadValid",
+        "kKvafP8WaveDrainClaimed",
+        "kKvafP8WaveFree",
+        "kKvafP8WaveOutcomePostRejected",
+        "kDenseBatchGetFailed",
+        "PublishKvafP8WaveStateLastMutablePayloadToGm",
+        "DataSyncBarrier<AscendC::MemDsbT::DDR>()",
+        "VF_CALL<KvafP8ClaimedUnpostedWaveReleaseSimtService>",
+    ):
+        assert token in p8_claimed_unposted_release, token
+    assert "StoreKvafP8WaveRecordToGm" not in p8_claimed_unposted_release
+    p8_claimed_unposted_release_cas = _between(
+        text,
+        "TryCommitKvafP8ClaimedUnpostedWaveReleaseFromSimt(",
+        "__simt_vf__ __aicore__ LAUNCH_BOUND(1)\ninline void "
+        "KvafP8ClaimedUnpostedWaveReleaseSimtService(",
+    )
+    for token in (
+        "asc_atomic_cas(",
+        "kKvafP8WaveDrainClaimed",
+        "kKvafP8WaveFree",
+        "AscendC::Simt::ThreadFence()",
+    ):
+        assert token in p8_claimed_unposted_release_cas, token
+
+    p8_admission_claim = _between(
+        text,
+        "__simt_callee__ inline bool TryClaimKvafP8WaveFillingAdmissionFromSimt(",
+        "// A deterministic Begin/Post rejection",
+    )
+    for token in (
+        "asc_atomic_cas(",
+        "kKvafP8WaveFree",
+        "kKvafP8WaveFillingClaimed",
+        "TryClaimKvafP8WaveFillingAdmissionFromAicore",
+        "TryQuarantineKvafP8WaveFillingClaimedFromSimt",
+        "QuarantineKvafP8WaveFillingClaimedFromAicore",
+    ):
+        assert token in p8_admission_claim, token
+
+    p8_post_intent_quarantine = _between(
+        text,
+        "__aicore__ inline bool QuarantineKvafP8PostIntentStateFromAicore(",
+        "// Publish only the payload which turns an already durable FILLING record",
+    )
+    for token in (
+        "LoadKvafP8WaveRecordFromGm",
+        "KvafP8WaveIdentityEquals",
+        "kKvafP8WavePostIntent",
+        "kKvafP8WaveQuarantined",
+        "TryTransitionKvafP8FillingStateFromAicore",
+        "kKvafP8WaveOutcomePostIntentQuarantined",
+    ):
+        assert token in p8_post_intent_quarantine, token
+    assert "StoreKvafP8WaveRecordToGm" not in p8_post_intent_quarantine
 
     # A deterministic Begin/Post rejection is a normal bounded defer, not an
     # ambiguous POST_INTENT.  It still receives a separate GM drain claim so
@@ -257,12 +405,27 @@ def main() -> None:
         "TryQuarantineKvafP8WaveFromSimt",
         "TryQuarantineKvafP8PrivateFromSimt",
         "kKvafP8WaveOutcomeForwardTerminalQuarantined",
+        "kKvafP8WaveFilling",
+        "kKvafP8WaveFillingReleaseClaimed",
+        "kKvafP8WaveFillingClaimed",
         "kKvafP8WaveQuarantined",
         "kKvafP8PrivateQuarantined",
         "sweep quarantines the bounded resources",
     ):
         assert token in p8_terminal, token
     assert "ReleaseKvafStreamingBatchGetQueueFromAicore" not in p8_terminal
+
+    p8_wave_terminal = _between(
+        text,
+        "__aicore__ inline bool QuarantineKvafP8WaveAtForwardTerminal(",
+        "__simt_callee__ inline bool TryQuarantineKvafP8PrivateFromSimt(",
+    )
+    claimed_index = p8_wave_terminal.index("kKvafP8WaveFillingClaimed")
+    identity_index = p8_wave_terminal.index(
+        "KvafP8ForwardTerminalOwnsIdentity"
+    )
+    assert claimed_index < identity_index
+    assert "StoreKvafP8WaveRecordToGm" not in p8_wave_terminal
 
     # P8 must not weaken the existing streaming range guard globally.  Legacy
     # callers remain queue-private; only the P8 helper may select an absolute
@@ -368,6 +531,107 @@ def main() -> None:
     ):
         assert token in p8_prepare, token
 
+    # P8's first durable point is now FILLING rather than POST_INTENT.  It
+    # appears immediately after the queue lease gains its complete identity,
+    # and an explicit, durable marker changes before *any* descriptor/private
+    # record/request-ledger write.  That lets an empty pre-doorbell exit prove
+    # it has no externally visible work; every other pre-doorbell exit remains
+    # quarantined rather than guessing from post_committed alone.
+    p8_filling_begin = _between(
+        text,
+        "__aicore__ inline bool BeginKvafP8WaveFilling(",
+        "__aicore__ inline bool KvafP8WaveFillingMatchesLeaseAndIdentity(",
+    )
+    for token in (
+        "kKvafP8WaveFilling",
+        "kKvafP8FillingNoWorkProof",
+        "identity.queue_id != lease.queue_id",
+        "identity.owner_tag != lease.owner_tag",
+        "owners[lease.queue_id] != lease.owner_tag",
+        "kKvafP8ForwardPhaseAdmitPost",
+    ):
+        assert token in p8_filling_begin, token
+
+    p8_filling_admit = _between(
+        text,
+        "__aicore__ inline bool BeginAndPublishKvafP8WaveFilling(",
+        "__aicore__ inline bool KvafP8WaveFillingMatchesLeaseAndIdentity(",
+    )
+    for token in (
+        "BeginKvafP8WaveFilling",
+        "TryClaimKvafP8WaveFillingAdmissionFromAicore",
+        "PublishKvafP8WaveFillingClaimedPayloadToGm",
+        "QuarantineKvafP8WaveFillingClaimedFromAicore",
+        "kKvafP8WaveFillingClaimed",
+        "TryTransitionKvafP8FillingStateFromAicore",
+        "IsKvafP8WaveRecordValid",
+        "IsKvafP8WaveRecordAdmissibleForFilling",
+        "LoadKvafP8WaveRecordFromGm",
+    ):
+        assert token in p8_filling_admit, token
+    assert "PublishKvafP8WaveRecordToGm" not in p8_filling_admit
+    assert "StoreKvafP8WaveRecordToGm" not in p8_filling_admit
+
+    p8_filling_arm = _between(
+        text,
+        "__aicore__ inline bool ArmKvafP8WaveFillingForExternalWrites(",
+        "// A FILLING record can be returned without a HCCP drain",
+    )
+    for token in (
+        "LoadKvafP8WaveRecordFromGm",
+        "KvafP8WaveFillingMatchesLeaseAndIdentity",
+        "kKvafP8FillingNoWorkProof",
+        "kKvafP8FillingExposureProof",
+        "record_gm->reserved[1] = kKvafP8FillingExposureProof",
+        "QuarantineKvafP8FillingStateFromAicore",
+        "kKvafP8WaveOutcomeFillingQuarantined",
+    ):
+        assert token in p8_filling_arm, token
+    assert "PublishKvafP8WaveRecordToGm(record_gm, *record)" not in p8_filling_arm
+
+    p8_filling_promote = _between(
+        text,
+        "__aicore__ inline bool PromoteKvafP8WaveFillingToPostIntent(",
+        "// Compatibility-only direct constructor",
+    )
+    for token in (
+        "LoadKvafP8WaveRecordFromGm",
+        "KvafP8WaveFillingMatchesLeaseAndIdentity",
+        "kKvafP8FillingExposureProof",
+        "ValidateKvafP8DescriptorPrivateLedger",
+        "SnapshotKvafP8QueueIndices",
+        "PublishKvafP8FillingPostIntentPayloadToGm",
+        "TryTransitionKvafP8FillingStateFromAicore",
+        "record->state = kKvafP8WavePostIntent",
+    ):
+        assert token in p8_filling_promote, token
+    assert "PublishKvafP8WaveRecordToGm(record_gm, *record)" not in p8_filling_promote
+    assert "StoreKvafP8WaveRecordToGm(record_gm, *record)" not in p8_filling_promote
+
+    p8_filling_release = _between(
+        text,
+        "__aicore__ inline bool ReleaseKvafP8FillingLeaseAfterProvenNoWork(",
+        "__aicore__ inline bool SnapshotKvafP8QueueIndices(",
+    )
+    for token in (
+        "LoadKvafP8WaveRecordFromGm",
+        "IsKvafP8WaveFillingProvenNoWork",
+        "lease.state != kStreamingBatchGetLeaseHeld",
+        "lease.queue_id != identity.queue_id",
+        "lease.owner_tag != identity.owner_tag",
+        "KvafStreamingBatchGetReleaseSimtService",
+        "kKvafP8WaveFillingReleaseClaimed",
+        "TryTransitionKvafP8FillingStateFromAicore",
+        "IsKvafP8WaveFillingReleaseClaimedProvenNoWork",
+        "kKvafP8WaveOutcomeReleaseCasQuarantined",
+        "kKvafP8WaveOutcomeFillingQuarantined",
+        "record->state = kKvafP8WaveFree",
+    ):
+        assert token in p8_filling_release, token
+    assert "PublishKvafP8WaveRecordToGm(record_gm, *record)" not in p8_filling_release
+    assert "StoreKvafP8WaveRecordToGm(record_gm, *record)" not in p8_filling_release
+    assert "BeginKvafDenseBatchGetPostOnly" not in p8_filling_release
+
     p8_unposted = _between(
         text,
         "__aicore__ inline bool ReleaseKvafP8UnpostedWave(",
@@ -375,6 +639,8 @@ def main() -> None:
     )
     assert "record->state == kKvafP8WavePostIntent" in p8_unposted
     assert "kKvafP8WaveOutcomePostIntentQuarantined" in p8_unposted
+    assert "record->state == kKvafP8WaveFilling" in p8_unposted
+    assert "kKvafP8WaveOutcomeFillingQuarantined" in p8_unposted
 
     p8_claimed_unposted = _between(
         text,

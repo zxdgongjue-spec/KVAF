@@ -199,6 +199,25 @@ enum KvafP8WaveState : uint32_t {
   // ambiguity leaves the transport non-reusable until the cold recovery path
   // proves it quiescent. Never rewrite this state to FREE in an AIV kernel.
   kKvafP8WaveQuarantined = 6U,
+  // The lease has been acquired and its complete forward/replay/queue
+  // identity has been durably published, but no descriptor, private record,
+  // request ledger, or HCCP doorbell may have been exposed yet.  This value
+  // is deliberately appended: the graph-stable record ABI and all legacy
+  // state numbers above remain unchanged.
+  kKvafP8WaveFilling = 7U,
+  // A proven-empty FILLING record has one worker that owns the final
+  // owner-table CAS-to-zero.  It exists solely to close the race with a
+  // forward-terminal sweep: the worker must commit this state to FREE with a
+  // second CAS, never overwrite a concurrent QUARANTINED terminal result.
+  kKvafP8WaveFillingReleaseClaimed = 8U,
+  // Admission ownership is claimed *before* a producer writes the new wave
+  // identity or any mutable record payload.  The prior record can be either
+  // a valid FREE entry or an all-zero first-use allocation, so a terminal
+  // sweep must treat this state as quarantinable even when the identity has
+  // not been initialized yet.  Once the payload is DDR-visible, the producer
+  // commits CLAIMED -> FILLING with a second CAS.  Appending this value keeps
+  // the graph-stable 256-byte record ABI and all existing state numbers.
+  kKvafP8WaveFillingClaimed = 9U,
 };
 
 enum KvafP8WaveOutcome : uint32_t {
@@ -211,7 +230,20 @@ enum KvafP8WaveOutcome : uint32_t {
   kKvafP8WaveOutcomeReleaseCasQuarantined = 6U,
   kKvafP8WaveOutcomePostIntentQuarantined = 7U,
   kKvafP8WaveOutcomeForwardTerminalQuarantined = 8U,
+  // A FILLING record was not proved empty, could not be matched to its
+  // lease/identity, or could not prove its owner-CAS release.  It is sticky
+  // until the cold recovery path resets the graph-stable arena.
+  kKvafP8WaveOutcomeFillingQuarantined = 9U,
 };
+
+// `KvafP8WaveRecord::reserved[1]` is a two-value durable proof while the
+// record is in FILLING.  A worker obtains `NoWork` immediately after its
+// queue-lease record is published.  It must atomically publish `Exposure`
+// before it writes *any* descriptor, private-slot record, or request ledger.
+// Therefore an interrupted FILLING record can return a queue only with the
+// NoWork proof; every other pre-doorbell exit is quarantined.
+constexpr uint64_t kKvafP8FillingNoWorkProof = 0x5038464E4F574F52ULL;
+constexpr uint64_t kKvafP8FillingExposureProof = 0x5038464558504F53ULL;
 
 struct KvafP8WaveIdentity {
   uint64_t forward_epoch;
@@ -225,6 +257,22 @@ struct KvafP8WaveIdentity {
 };
 static_assert(sizeof(KvafP8WaveIdentity) == 48U,
               "P8 wave identity ABI changed");
+
+// `owner_tag` proves a queue-lease CAS, but it is not a complete transaction
+// identity.  Every P8 transition that crosses a graph-visible boundary must
+// compare all identity fields, including the reserved word (which is required
+// to be deterministic for replay).  Do not weaken this to owner_tag/queue_id:
+// that would allow an old forward or graph replay to adopt a later wave.
+__aicore__ inline bool KvafP8WaveIdentityEquals(
+    const KvafP8WaveIdentity& left, const KvafP8WaveIdentity& right) {
+  return left.forward_epoch == right.forward_epoch &&
+         left.graph_replay_generation == right.graph_replay_generation &&
+         left.layer_control_index == right.layer_control_index &&
+         left.queue_id == right.queue_id &&
+         left.queue_generation == right.queue_generation &&
+         left.post_sequence == right.post_sequence &&
+         left.owner_tag == right.owner_tag && left.reserved0 == right.reserved0;
+}
 
 // The runtime owns one graph-stable forward-control record per P8 layer.
 // It is deliberately tiny: it is not a ticket or an unbounded scheduler
@@ -257,6 +305,16 @@ enum KvafP8ForwardFlags : uint64_t {
   kKvafP8ForwardFlagModelTerminalObserved = 1ULL << 4U,
 };
 
+// P8 keeps the graph-wide arena lease token in the otherwise unused high
+// 32 bits of `flags`.  The low 32 bits remain the graph-visible flag ABI
+// above and are still the only bits touched by the concurrent abort CAS.
+// This is deliberately a generation token, not another forward identity.
+// Terminal-before-reuse is the primary correctness rule; the token is a
+// no-extra-tensor defensive CAS check if a graph-ordering violation would
+// otherwise let a delayed terminal observe a later lease.
+constexpr uint32_t kKvafP8ForwardLeaseGenerationShift = 32U;
+constexpr uint64_t kKvafP8ForwardRuntimeFlagsMask = 0xFFFFFFFFULL;
+
 struct KvafP8ForwardControl {
   uint64_t forward_epoch;
   uint64_t graph_replay_generation;
@@ -266,6 +324,27 @@ struct KvafP8ForwardControl {
 };
 static_assert(sizeof(KvafP8ForwardControl) == KVAF_P8_FORWARD_CONTROL_BYTES,
               "P8 forward control ABI changed");
+
+__aicore__ inline uint32_t GetKvafP8ForwardLeaseGeneration(
+    const KvafP8ForwardControl& control) {
+  return static_cast<uint32_t>(
+      control.flags >> kKvafP8ForwardLeaseGenerationShift);
+}
+
+// Admission is the only writer of the high word and runs before P8 workers
+// are launched.  Write that word independently so a concurrent low-word
+// ABORT CAS can never be accidentally erased by a stale 64-bit RMW.
+__aicore__ inline bool StoreKvafP8ForwardLeaseGenerationToGm(
+    __gm__ KvafP8ForwardControl* control, uint32_t generation) {
+  if (control == nullptr || generation == 0U) {
+    return false;
+  }
+  __gm__ uint32_t* const high_word =
+      reinterpret_cast<__gm__ uint32_t*>(&(control->flags)) + 1U;
+  *high_word = generation;
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  return *high_word == generation;
+}
 
 __aicore__ inline bool IsKvafP8ForwardControlValid(
     const KvafP8ForwardControl& control) {
@@ -474,6 +553,10 @@ struct KvafP8WaveRecord {
   uint32_t private_ready_published;
   uint32_t post_committed;
   KvafDenseBatchGetTransaction transaction;
+  // reserved[0] is the CQ-observed diagnostic marker.  reserved[1] is the
+  // FILLING no-work/exposure proof below; it is intentionally inside the
+  // existing fixed 256-byte ABI rather than a new side ledger.  The remaining
+  // entries stay zero unless a future version documents a graph-visible use.
   uint64_t reserved[5];
 };
 static_assert(sizeof(KvafDenseBatchGetTransaction) == 104U,
@@ -500,6 +583,20 @@ enum KvafP8PrivateState : uint32_t {
   // graph-stable private-record ABI or interpreting old quarantine bytes as a
   // reusable state.
   kKvafP8PrivateReleaseClaimed = 5U,
+  // A worker owns this row before it has made a fully identified PENDING
+  // record visible.  It exists to close FREE -> PENDING publication: writing
+  // identity while the row still says FREE lets another worker claim it,
+  // while writing PENDING before identity lets ForwardTerminal quarantine an
+  // unknown owner.  ALLOCATING is non-consumable; terminal treats it as an
+  // unresolved resource and quarantines it rather than trying to reuse it.
+  kKvafP8PrivateAllocating = 6U,
+  // Both source/object directory entries are claimed (-2) and their producer
+  // exclusively owns the subsequent -2 -> positive-map publication. A
+  // terminal sweep must not mutate this state or either directory: doing so
+  // between a producer check and its CAS would leave a stale positive map.
+  // It latches the arena unhealthy instead, leaving the bounded row for cold
+  // recovery. This state is never consumable by QSFA.
+  kKvafP8PrivateMapPublishing = 7U,
 };
 
 struct KvafP8PrivateRecord {
@@ -553,7 +650,7 @@ __aicore__ inline bool IsKvafP8WaveRecordValid(
   return record.magic == kKvafP8WaveRecordMagic &&
          record.version == kKvafP8WaveRecordVersion &&
          record.identity.owner_tag > 0 &&
-         record.state <= kKvafP8WaveQuarantined;
+         record.state <= kKvafP8WaveFillingClaimed;
 }
 
 // Explicit field-wise transfers preserve the P8 record ABI across the GM/AIC
@@ -620,7 +717,10 @@ __aicore__ inline bool StoreKvafP8WaveRecordToGm(
   }
   destination->magic = source.magic;
   destination->version = source.version;
-  destination->state = source.state;
+  // `state` is the publication word.  Generic writes are retained for cold
+  // setup/diagnostics only; hot P8 paths use the exact expected-state CAS
+  // helpers below.  Even here, never make a partially written identity look
+  // consumable by exposing its state first.
   destination->identity.forward_epoch = source.identity.forward_epoch;
   destination->identity.graph_replay_generation =
       source.identity.graph_replay_generation;
@@ -662,6 +762,8 @@ __aicore__ inline bool StoreKvafP8WaveRecordToGm(
   for (uint32_t index = 0U; index < 5U; ++index) {
     destination->reserved[index] = source.reserved[index];
   }
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  destination->state = source.state;
   return true;
 }
 
@@ -689,7 +791,7 @@ __aicore__ inline bool IsKvafP8PrivateRecordValid(
     const KvafP8PrivateRecord& record) {
   return record.magic == kKvafP8WaveRecordMagic &&
          record.version == kKvafP8WaveRecordVersion &&
-         record.state <= kKvafP8PrivateReleaseClaimed;
+         record.state <= kKvafP8PrivateMapPublishing;
 }
 
 // Keep all GM/local transfers field-wise.  A P8 drain phase reads an old
@@ -725,7 +827,9 @@ __aicore__ inline bool StoreKvafP8PrivateRecordToGm(
   }
   destination->magic = source.magic;
   destination->version = source.version;
-  destination->state = source.state;
+  // Payload/identity are always visible before a state consumer can observe
+  // the terminal state.  Initial FREE->ALLOCATING/PENDING publication does
+  // not use this generic store: it uses the explicit CAS protocol below.
   destination->forward_epoch = source.forward_epoch;
   destination->graph_replay_generation = source.graph_replay_generation;
   destination->layer_control_index = source.layer_control_index;
@@ -736,6 +840,8 @@ __aicore__ inline bool StoreKvafP8PrivateRecordToGm(
   destination->object_offset = source.object_offset;
   destination->output_index = source.output_index;
   destination->owner_tag = source.owner_tag;
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  destination->state = source.state;
   return true;
 }
 
@@ -764,6 +870,140 @@ __aicore__ inline bool PrepareKvafP8PrivateRecord(
   record->object_offset = object_offset;
   record->output_index = output_index;
   record->owner_tag = identity.owner_tag;
+  return true;
+}
+
+// The private output row has one additional publication protocol beyond the
+// normal READY/FAILED transitions.  A state CAS first reserves the physical
+// row, payload/identity are written while it is ALLOCATING, and only after
+// both source/object maps are positive does the producer CAS it to PENDING.
+// This makes an interrupted allocation durable and terminal-visible without
+// allowing a stale full-record Store to revive the slot.
+__simt_callee__ inline bool TryClaimKvafP8PrivateAllocatingFromSimt(
+    __gm__ KvafP8PrivateRecord* record) {
+  if (record == nullptr) {
+    return false;
+  }
+  __gm__ int32_t* const state =
+      reinterpret_cast<__gm__ int32_t*>(&(record->state));
+  const int32_t observed = asc_atomic_cas(
+      state, static_cast<int32_t>(kKvafP8PrivateFree),
+      static_cast<int32_t>(kKvafP8PrivateAllocating));
+  if (observed != static_cast<int32_t>(kKvafP8PrivateFree)) {
+    return false;
+  }
+  AscendC::Simt::ThreadFence();
+  return true;
+}
+
+__simt_callee__ inline bool TryPromoteKvafP8PrivateAllocatingToPendingFromSimt(
+    __gm__ KvafP8PrivateRecord* record) {
+  if (record == nullptr) {
+    return false;
+  }
+  __gm__ int32_t* const state =
+      reinterpret_cast<__gm__ int32_t*>(&(record->state));
+  const int32_t observed = asc_atomic_cas(
+      state, static_cast<int32_t>(kKvafP8PrivateAllocating),
+      static_cast<int32_t>(kKvafP8PrivatePending));
+  if (observed != static_cast<int32_t>(kKvafP8PrivateAllocating)) {
+    return false;
+  }
+  AscendC::Simt::ThreadFence();
+  return true;
+}
+
+// This producer-only transition closes the window between transient (-2)
+// directory claims and their positive publication. ForwardTerminal may
+// quarantine ALLOCATING before this CAS, but deliberately never changes
+// MAP_PUBLISHING while the producer owns the two directory words.
+__simt_callee__ inline bool TryClaimKvafP8PrivateMapPublishingFromSimt(
+    __gm__ KvafP8PrivateRecord* record) {
+  if (record == nullptr) {
+    return false;
+  }
+  __gm__ int32_t* const state =
+      reinterpret_cast<__gm__ int32_t*>(&(record->state));
+  const int32_t observed = asc_atomic_cas(
+      state, static_cast<int32_t>(kKvafP8PrivateAllocating),
+      static_cast<int32_t>(kKvafP8PrivateMapPublishing));
+  if (observed != static_cast<int32_t>(kKvafP8PrivateAllocating)) {
+    return false;
+  }
+  AscendC::Simt::ThreadFence();
+  return true;
+}
+
+__simt_callee__ inline bool
+TryPromoteKvafP8PrivateMapPublishingToPendingFromSimt(
+    __gm__ KvafP8PrivateRecord* record) {
+  if (record == nullptr) {
+    return false;
+  }
+  __gm__ int32_t* const state =
+      reinterpret_cast<__gm__ int32_t*>(&(record->state));
+  const int32_t observed = asc_atomic_cas(
+      state, static_cast<int32_t>(kKvafP8PrivateMapPublishing),
+      static_cast<int32_t>(kKvafP8PrivatePending));
+  if (observed != static_cast<int32_t>(kKvafP8PrivateMapPublishing)) {
+    return false;
+  }
+  AscendC::Simt::ThreadFence();
+  return true;
+}
+
+// `ALLOCATING` deliberately has no consumer semantics.  A producer uses this
+// narrow transition on every pre-PENDING failure instead of full-storing a
+// local record: ForwardTerminal may have won ALLOCATING -> QUARANTINED while
+// the producer was publishing identity or claiming a directory entry.
+__simt_callee__ inline bool TryQuarantineKvafP8PrivateAllocatingFromSimt(
+    __gm__ KvafP8PrivateRecord* record) {
+  if (record == nullptr) {
+    return false;
+  }
+  __gm__ int32_t* const state =
+      reinterpret_cast<__gm__ int32_t*>(&(record->state));
+  const int32_t observed = asc_atomic_cas(
+      state, static_cast<int32_t>(kKvafP8PrivateAllocating),
+      static_cast<int32_t>(kKvafP8PrivateQuarantined));
+  if (observed != static_cast<int32_t>(kKvafP8PrivateAllocating)) {
+    return false;
+  }
+  AscendC::Simt::ThreadFence();
+  return true;
+}
+
+// Publish the complete immutable ownership payload without touching state.
+// The caller must have already claimed FREE -> ALLOCATING and must still
+// complete the final ALLOCATING -> PENDING CAS itself.  Keeping the state
+// unchanged here is what makes a racing terminal quarantine win permanently.
+__aicore__ inline bool PublishKvafP8PrivateAllocatingPayloadToGm(
+    __gm__ KvafP8PrivateRecord* destination,
+    const KvafP8PrivateRecord& pending_record) {
+  if (destination == nullptr ||
+      !IsKvafP8PrivateRecordValid(pending_record) ||
+      pending_record.state != kKvafP8PrivatePending ||
+      pending_record.forward_epoch == 0U ||
+      pending_record.owner_tag <= 0 ||
+      pending_record.queue_generation == 0U ||
+      pending_record.post_sequence == 0U ||
+      pending_record.output_index < 0) {
+    return false;
+  }
+  destination->magic = pending_record.magic;
+  destination->version = pending_record.version;
+  destination->forward_epoch = pending_record.forward_epoch;
+  destination->graph_replay_generation =
+      pending_record.graph_replay_generation;
+  destination->layer_control_index = pending_record.layer_control_index;
+  destination->queue_id = pending_record.queue_id;
+  destination->queue_generation = pending_record.queue_generation;
+  destination->post_sequence = pending_record.post_sequence;
+  destination->source_offset = pending_record.source_offset;
+  destination->object_offset = pending_record.object_offset;
+  destination->output_index = pending_record.output_index;
+  destination->owner_tag = pending_record.owner_tag;
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
   return true;
 }
 
@@ -824,6 +1064,92 @@ __aicore__ inline bool FinalizeKvafP8PrivateRecord(
   }
   private_record->state = payload_ready ? kKvafP8PrivateReady
                                          : kKvafP8PrivateFailed;
+  return true;
+}
+
+// Publish a CQ-terminal private state without ever writing a full local
+// record back to GM.  ForwardTerminal may concurrently seal PENDING as
+// QUARANTINED; the state CAS is therefore the only legal publication edge.
+// The immutable identity was already published by the ALLOCATING protocol and
+// is rechecked both before and after the CAS.
+__simt_callee__ inline bool TryCommitKvafP8PrivateTerminalFromSimt(
+    __gm__ KvafP8PrivateRecord* record, uint32_t desired_state,
+    __ubuf__ KvafP8PrivateReleaseResult* result) {
+  if (record == nullptr || result == nullptr ||
+      (desired_state != kKvafP8PrivateReady &&
+       desired_state != kKvafP8PrivateFailed)) {
+    return false;
+  }
+  result->success = 0U;
+  result->observed_state = kKvafP8PrivateFree;
+  result->source_observed = -1;
+  result->object_observed = -1;
+  __gm__ int32_t* const state =
+      reinterpret_cast<__gm__ int32_t*>(&(record->state));
+  const int32_t observed = asc_atomic_cas(
+      state, static_cast<int32_t>(kKvafP8PrivatePending),
+      static_cast<int32_t>(desired_state));
+  result->observed_state = static_cast<uint32_t>(observed);
+  if (observed != static_cast<int32_t>(kKvafP8PrivatePending)) {
+    return false;
+  }
+  AscendC::Simt::ThreadFence();
+  result->success = 1U;
+  return true;
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(1)
+inline void KvafP8PrivateTerminalCommitSimtService(
+    __gm__ KvafP8PrivateRecord* record, uint32_t desired_state,
+    __ubuf__ KvafP8PrivateReleaseResult* result) {
+  (void)TryCommitKvafP8PrivateTerminalFromSimt(record, desired_state, result);
+}
+
+__aicore__ inline bool CommitKvafP8PrivateTerminalFromAicore(
+    __gm__ KvafP8PrivateRecord* record_gm,
+    const KvafP8WaveIdentity& expected_identity, bool payload_ready,
+    __ubuf__ KvafP8PrivateReleaseResult* result, event_t simt_event,
+    KvafP8PrivateRecord* committed_record) {
+  if (record_gm == nullptr || result == nullptr) {
+    return false;
+  }
+  KvafP8PrivateRecord observed{};
+  if (!LoadKvafP8PrivateRecordFromGm(record_gm, &observed) ||
+      !HasKvafP8PrivateRecordCompleteIdentity(observed) ||
+      observed.state != kKvafP8PrivatePending ||
+      !KvafP8PrivateRecordMatchesIdentity(observed, expected_identity)) {
+    return false;
+  }
+  const uint32_t desired_state = payload_ready ? kKvafP8PrivateReady
+                                                : kKvafP8PrivateFailed;
+  // Identity/payload are immutable for this edge, but retain an explicit DDR
+  // ordering boundary before the state becomes visible to QSFA/release.
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  result->success = 0U;
+  result->observed_state = kKvafP8PrivateFree;
+  result->source_observed = -1;
+  result->object_observed = -1;
+  set_flag(PIPE_S, PIPE_V, simt_event);
+  wait_flag(PIPE_S, PIPE_V, simt_event);
+  AscendC::Simt::VF_CALL<KvafP8PrivateTerminalCommitSimtService>(
+      AscendC::Simt::Dim3{1U, 1U, 1U}, record_gm, desired_state, result);
+  set_flag(PIPE_V, PIPE_S, simt_event);
+  wait_flag(PIPE_V, PIPE_S, simt_event);
+  if (result->success == 0U ||
+      result->observed_state != kKvafP8PrivatePending) {
+    return false;
+  }
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  KvafP8PrivateRecord committed{};
+  if (!LoadKvafP8PrivateRecordFromGm(record_gm, &committed) ||
+      !HasKvafP8PrivateRecordCompleteIdentity(committed) ||
+      committed.state != desired_state ||
+      !KvafP8PrivateRecordMatchesIdentity(committed, expected_identity)) {
+    return false;
+  }
+  if (committed_record != nullptr) {
+    *committed_record = committed;
+  }
   return true;
 }
 
@@ -1125,13 +1451,14 @@ __aicore__ inline bool ReleaseKvafP8PrivateRecordAfterQsfaTerminal(
       record.graph_replay_generation !=
           forward_control.graph_replay_generation ||
       record.layer_control_index != forward_control.layer_control_index) {
-    if (IsKvafP8PrivateRecordValid(record)) {
-      record.state = kKvafP8PrivateQuarantined;
-      (void)StoreKvafP8PrivateRecordToGm(record_gm, record);
-      private_ready[private_ready_index] = static_cast<int32_t>(
-          kKvafP8PrivateQuarantined);
-      AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
-    }
+    // The claim already moved READY/FAILED -> RELEASE_CLAIMED.  Do not
+    // resurrect a terminal transition with a full local Store; narrow-CAS
+    // that exact state to QUARANTINED instead.
+    (void)QuarantineKvafP8PrivateReleaseClaimedFromAicore(
+        record_gm, result, simt_event);
+    private_ready[private_ready_index] = static_cast<int32_t>(
+        kKvafP8PrivateQuarantined);
+    AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
     return false;
   }
   if (!ClearKvafP8PrivateMappingsFromAicore(
@@ -1140,8 +1467,8 @@ __aicore__ inline bool ReleaseKvafP8PrivateRecordAfterQsfaTerminal(
     // A partial CAS is deliberately terminally non-reusable.  It may leave
     // one directory entry cleared, but no next claim can safely infer that the
     // other entry or payload is reusable.
-    record.state = kKvafP8PrivateQuarantined;
-    (void)StoreKvafP8PrivateRecordToGm(record_gm, record);
+    (void)QuarantineKvafP8PrivateReleaseClaimedFromAicore(
+        record_gm, result, simt_event);
     private_ready[private_ready_index] = static_cast<int32_t>(
         kKvafP8PrivateQuarantined);
     AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
@@ -1256,20 +1583,18 @@ __aicore__ inline bool ReleaseKvafP8PendingPrivateRecordAfterNoPost(
       static_cast<uint64_t>(record.output_index) != private_ready_index ||
       private_ready[private_ready_index] !=
           static_cast<int32_t>(kKvafP8PrivatePending)) {
-    if (IsKvafP8PrivateRecordValid(record)) {
-      record.state = kKvafP8PrivateQuarantined;
-      (void)StoreKvafP8PrivateRecordToGm(record_gm, record);
-      private_ready[private_ready_index] = static_cast<int32_t>(
-          kKvafP8PrivateQuarantined);
-      AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
-    }
+    (void)QuarantineKvafP8PrivateReleaseClaimedFromAicore(
+        record_gm, result, simt_event);
+    private_ready[private_ready_index] = static_cast<int32_t>(
+        kKvafP8PrivateQuarantined);
+    AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
     return false;
   }
   if (!ClearKvafP8PrivateMappingsFromAicore(
           source_to_slot, object_to_slot, record.source_offset,
           record.object_offset, record.output_index, result, simt_event)) {
-    record.state = kKvafP8PrivateQuarantined;
-    (void)StoreKvafP8PrivateRecordToGm(record_gm, record);
+    (void)QuarantineKvafP8PrivateReleaseClaimedFromAicore(
+        record_gm, result, simt_event);
     private_ready[private_ready_index] = static_cast<int32_t>(
         kKvafP8PrivateQuarantined);
     AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
@@ -1333,8 +1658,14 @@ inline void KvafP8WaveForwardTerminalSimtService(
 }
 
 // Returns true only when this exact forward/replay/layer owns a record which
-// is already FREE/QUARANTINED or has just been atomically quarantined.  The
-// caller must treat false as a foreign/corrupt/racing record and must not free
+// is already FREE/QUARANTINED or has just been atomically quarantined.  This
+// deliberately includes durable FILLING (`kKvafP8WaveFilling`) and
+// FILLING_RELEASE_CLAIMED (`kKvafP8WaveFillingReleaseClaimed`) records:
+// terminal recovery cannot infer whether an interrupted producer crossed the
+// descriptor/private/ledger exposure edge, or whether a release claimant will
+// reach its final FREE CAS, so it quarantines rather than guessing or
+// releasing a lease.  The caller must treat false as a foreign/corrupt/racing
+// record and must not free
 // its queue lease.  The mandatory pre-terminal admission gate rules out a new
 // forward's ABA reuse between the pre-CAS identity read and post-CAS reload.
 __aicore__ inline bool QuarantineKvafP8WaveAtForwardTerminal(
@@ -1347,8 +1678,28 @@ __aicore__ inline bool QuarantineKvafP8WaveAtForwardTerminal(
   result->success = 0U;
   result->observed_state = kKvafP8WaveFree;
   KvafP8WaveRecord record{};
-  if (!LoadKvafP8WaveRecordFromGm(record_gm, &record) ||
-      !IsKvafP8WaveRecordValid(record) ||
+  if (!LoadKvafP8WaveRecordFromGm(record_gm, &record)) {
+    return false;
+  }
+  // FILLING_CLAIMED is deliberately entered before the new identity is
+  // field-wise visible.  It is the one terminal state whose ownership cannot
+  // be checked against ForwardControl; terminal must seal it by state alone
+  // rather than leave a partially initialized queue slot reusable.
+  if (record.state == kKvafP8WaveFillingClaimed) {
+    set_flag(PIPE_S, PIPE_V, simt_event);
+    wait_flag(PIPE_S, PIPE_V, simt_event);
+    AscendC::Simt::VF_CALL<KvafP8WaveForwardTerminalSimtService>(
+        AscendC::Simt::Dim3{1U, 1U, 1U}, record_gm,
+        kKvafP8WaveFillingClaimed, result);
+    set_flag(PIPE_V, PIPE_S, simt_event);
+    wait_flag(PIPE_V, PIPE_S, simt_event);
+    KvafP8WaveRecord quarantined{};
+    return result->success != 0U &&
+           result->observed_state == kKvafP8WaveFillingClaimed &&
+           LoadKvafP8WaveRecordFromGm(record_gm, &quarantined) &&
+           quarantined.state == kKvafP8WaveQuarantined;
+  }
+  if (!IsKvafP8WaveRecordValid(record) ||
       !KvafP8ForwardTerminalOwnsIdentity(forward_control, record.identity)) {
     return false;
   }
@@ -1371,8 +1722,11 @@ __aicore__ inline bool QuarantineKvafP8WaveAtForwardTerminal(
       !KvafP8ForwardTerminalOwnsIdentity(forward_control, record.identity)) {
     return false;
   }
-  record.outcome = kKvafP8WaveOutcomeForwardTerminalQuarantined;
-  (void)StoreKvafP8WaveRecordToGm(record_gm, record);
+  // The CAS above owns only the state word.  Do not full-store `record` here:
+  // a producer which was publishing mutable post/drain payload when terminal
+  // won may still have a newer local snapshot.  State is already terminal;
+  // publish just the diagnostic outcome.
+  record_gm->outcome = kKvafP8WaveOutcomeForwardTerminalQuarantined;
   AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
   return true;
 }
@@ -1408,6 +1762,127 @@ inline void KvafP8PrivateForwardTerminalSimtService(
     __gm__ KvafP8PrivateRecord* record, uint32_t expected_state,
     __ubuf__ KvafP8ForwardTerminalResult* result) {
   (void)TryQuarantineKvafP8PrivateFromSimt(record, expected_state, result);
+}
+
+// ALLOCATING is intentionally allowed to have an incomplete identity: it is
+// the only state whose state-CAS happens before its ownership fields are
+// published.  The P8 arena lease rules out a concurrent forward, so a forward
+// terminal sweep may always seal that raw state.  If the producer had already
+// reached the map-claim edge, its immutable offsets are now durable and the
+// sweep rolls back only the transient -2 markers.  It never clears a
+// non-negative mapping: that would make an uncertain payload reusable.
+constexpr int32_t kKvafP8PrivateDirectoryUnmapped = -1;
+constexpr int32_t kKvafP8PrivateDirectoryClaiming = -2;
+
+__aicore__ inline bool QuarantineKvafP8PrivateAllocatingAtForwardTerminal(
+    __gm__ KvafP8PrivateRecord* record_gm,
+    const KvafP8ForwardControl& forward_control,
+    __gm__ int32_t* source_to_slot, uint64_t source_to_slot_count,
+    __gm__ int32_t* object_to_slot, uint64_t object_to_slot_count,
+    __gm__ int32_t* private_ready, uint64_t private_ready_index,
+    __ubuf__ KvafP8ForwardTerminalResult* result, event_t simt_event) {
+  if (record_gm == nullptr || private_ready == nullptr || result == nullptr) {
+    return false;
+  }
+  result->success = 0U;
+  result->observed_state = kKvafP8PrivateFree;
+  KvafP8PrivateRecord before{};
+  if (!LoadKvafP8PrivateRecordFromGm(record_gm, &before) ||
+      before.state != kKvafP8PrivateAllocating) {
+    return false;
+  }
+  set_flag(PIPE_S, PIPE_V, simt_event);
+  wait_flag(PIPE_S, PIPE_V, simt_event);
+  AscendC::Simt::VF_CALL<KvafP8PrivateForwardTerminalSimtService>(
+      AscendC::Simt::Dim3{1U, 1U, 1U}, record_gm,
+      kKvafP8PrivateAllocating, result);
+  set_flag(PIPE_V, PIPE_S, simt_event);
+  wait_flag(PIPE_V, PIPE_S, simt_event);
+  KvafP8PrivateRecord after{};
+  if (result->success == 0U ||
+      result->observed_state != kKvafP8PrivateAllocating ||
+      !LoadKvafP8PrivateRecordFromGm(record_gm, &after) ||
+      after.state != kKvafP8PrivateQuarantined) {
+    return false;
+  }
+  // A complete identity proves the producer passed its identity publish
+  // barrier.  Only then may its bounded map offsets be dereferenced.
+  if (HasKvafP8PrivateRecordCompleteIdentity(after) &&
+      after.output_index >= 0 &&
+      static_cast<uint64_t>(after.output_index) == private_ready_index &&
+      after.source_offset < source_to_slot_count &&
+      after.object_offset < object_to_slot_count &&
+      IsKvafP8ForwardControlValid(forward_control) &&
+      forward_control.phase == kKvafP8ForwardPhaseForwardTerminal &&
+      after.forward_epoch == forward_control.forward_epoch &&
+      after.graph_replay_generation ==
+          forward_control.graph_replay_generation &&
+      after.layer_control_index == forward_control.layer_control_index) {
+    if (source_to_slot != nullptr) {
+      (void)asc_atomic_cas(source_to_slot + after.source_offset,
+                           kKvafP8PrivateDirectoryClaiming,
+                           kKvafP8PrivateDirectoryUnmapped);
+    }
+    if (object_to_slot != nullptr) {
+      (void)asc_atomic_cas(object_to_slot + after.object_offset,
+                           kKvafP8PrivateDirectoryClaiming,
+                           kKvafP8PrivateDirectoryUnmapped);
+    }
+  }
+  private_ready[private_ready_index] = static_cast<int32_t>(
+      kKvafP8PrivateQuarantined);
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  return true;
+}
+
+// A POST worker may have made a private PENDING record visible while its wave
+// is still FILLING or POST_INTENT, then lose a control/identity proof before
+// it can ring the doorbell.  That is not a ForwardTerminal operation, but it
+// has the same ownership requirement: never full-store an AIC-local record
+// over a concurrent terminal transition.  This narrow CAS can only seal the
+// exact PENDING record owned by `identity`; anything else remains unavailable
+// for the graph terminal sweep/cold recovery path.
+__aicore__ inline bool QuarantineKvafP8PrivatePendingFromAicore(
+    __gm__ KvafP8PrivateRecord* record_gm,
+    const KvafP8WaveIdentity& identity,
+    __gm__ int32_t* private_ready, uint64_t private_ready_index,
+    __ubuf__ KvafP8ForwardTerminalResult* result, event_t simt_event) {
+  if (record_gm == nullptr || private_ready == nullptr || result == nullptr) {
+    return false;
+  }
+  KvafP8PrivateRecord before{};
+  if (!LoadKvafP8PrivateRecordFromGm(record_gm, &before) ||
+      !IsKvafP8PrivateRecordValid(before) ||
+      before.state != kKvafP8PrivatePending ||
+      !KvafP8PrivateRecordMatchesIdentity(before, identity) ||
+      before.output_index < 0 ||
+      static_cast<uint64_t>(before.output_index) != private_ready_index) {
+    return false;
+  }
+  result->success = 0U;
+  result->observed_state = kKvafP8PrivateFree;
+  set_flag(PIPE_S, PIPE_V, simt_event);
+  wait_flag(PIPE_S, PIPE_V, simt_event);
+  AscendC::Simt::VF_CALL<KvafP8PrivateForwardTerminalSimtService>(
+      AscendC::Simt::Dim3{1U, 1U, 1U}, record_gm,
+      kKvafP8PrivatePending, result);
+  set_flag(PIPE_V, PIPE_S, simt_event);
+  wait_flag(PIPE_V, PIPE_S, simt_event);
+  KvafP8PrivateRecord after{};
+  if (result->success == 0U ||
+      result->observed_state != kKvafP8PrivatePending ||
+      !LoadKvafP8PrivateRecordFromGm(record_gm, &after) ||
+      !IsKvafP8PrivateRecordValid(after) ||
+      after.state != kKvafP8PrivateQuarantined ||
+      !KvafP8PrivateRecordMatchesIdentity(after, identity) ||
+      after.output_index < 0 ||
+      static_cast<uint64_t>(after.output_index) != private_ready_index) {
+    return false;
+  }
+  private_ready[private_ready_index] = static_cast<int32_t>(
+      kKvafP8PrivateQuarantined);
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  return true;
 }
 
 __aicore__ inline bool KvafP8PrivateRecordBelongsToForwardTerminal(
@@ -2238,8 +2713,11 @@ __aicore__ inline bool PublishKvafP8PrivateTerminalRecords(
     const KvafStreamingBatchGetControl& control,
     const KvafP8ForwardControl& forward_control,
     __gm__ KvafP8PrivateRecord* private_records,
-    uint64_t private_record_count, KvafP8WaveRecord* record) {
+    uint64_t private_record_count,
+    __ubuf__ KvafP8PrivateReleaseResult* transition_result,
+    event_t simt_event, KvafP8WaveRecord* record) {
   if (private_records == nullptr || record == nullptr ||
+      transition_result == nullptr ||
       !IsKvafP8WaveRecordValid(*record) ||
       !KvafP8ForwardControlMatchesIdentity(
           forward_control, record->identity, kKvafP8ForwardPhaseDrain) ||
@@ -2282,11 +2760,11 @@ __aicore__ inline bool PublishKvafP8PrivateTerminalRecords(
     if (!LoadKvafP8PrivateRecordFromGm(
             private_records + static_cast<uint64_t>(output_index),
             &private_record) ||
-        !FinalizeKvafP8PrivateRecord(&private_record, *record,
-                                      payload_ready) ||
-        !StoreKvafP8PrivateRecordToGm(
+        !KvafP8PrivateRecordMatchesWave(private_record, *record) ||
+        !CommitKvafP8PrivateTerminalFromAicore(
             private_records + static_cast<uint64_t>(output_index),
-            private_record)) {
+            record->identity, payload_ready, transition_result, simt_event,
+            &private_record)) {
       return false;
     }
   }
@@ -2477,7 +2955,8 @@ __aicore__ inline bool ReleaseKvafStreamingBatchGetQueueFromAicore(
 // a non-blocking claim: losing workers continue score work or defer instead
 // of spinning.  A disrupted claimant leaves DRAIN_CLAIMED for forward
 // terminal recovery, which quarantines rather than guessing whether a CQ was
-// consumed.
+// consumed.  The CAS accepts POSTED only: FILLING and POST_INTENT are
+// pre-doorbell states and must never be treated as a CQ-drainable wave.
 __simt_callee__ inline bool TryClaimKvafP8WaveDrainFromSimt(
     __gm__ KvafP8WaveRecord* record,
     __ubuf__ KvafP8WaveDrainClaimResult* result) {
@@ -2526,6 +3005,552 @@ __aicore__ inline bool TryClaimKvafP8WaveDrainFromAicore(
   wait_flag(PIPE_V, PIPE_S, simt_event);
   return result->success != 0U &&
          result->observed_state == kKvafP8WavePosted;
+}
+
+// FILLING and its admission-claim predecessor have narrow transitions that
+// must not be implemented as a normal GM Store.  Forward-terminal recovery may race an empty producer after it
+// has acquired a queue lease.  A full-record write after that recovery wins
+// would silently resurrect a QUARANTINED record.  Keep the permitted edges
+// deliberately narrow and use the same single-thread SIMT CAS service as the
+// queue and CQ-drain ownership protocols:
+//
+//   FILLING -> POST_INTENT              (descriptor/ledger are published)
+//   FILLING -> FILLING_RELEASE_CLAIMED  (proved empty, one release owner)
+//   FILLING -> QUARANTINED              (failed closed)
+//   FILLING_RELEASE_CLAIMED -> FREE     (owner-table CAS succeeded)
+//   FILLING_RELEASE_CLAIMED -> QUARANTINED (release failure/terminal)
+//   POST_INTENT -> QUARANTINED          (pre-PostOnly control failure)
+//   FILLING_CLAIMED -> FILLING          (identity/payload is published)
+//   FILLING_CLAIMED -> QUARANTINED      (admission/terminal failure)
+//
+// No other state may use this endpoint.  In particular, CQ drain continues
+// to accept POSTED only, so a durable FILLING record can never be mistaken
+// for a doorbelled transaction.
+__simt_callee__ inline bool TryTransitionKvafP8FillingStateFromSimt(
+    __gm__ KvafP8WaveRecord* record, uint32_t expected_state,
+    uint32_t desired_state, __ubuf__ KvafP8WaveDrainClaimResult* result) {
+  if (record == nullptr || result == nullptr) {
+    return false;
+  }
+  result->success = 0U;
+  result->observed_state = kKvafP8WaveFree;
+  const bool is_filling_edge =
+      expected_state == kKvafP8WaveFilling &&
+      (desired_state == kKvafP8WavePostIntent ||
+       desired_state == kKvafP8WaveFillingReleaseClaimed ||
+       desired_state == kKvafP8WaveQuarantined);
+  const bool is_release_claimed_edge =
+      expected_state == kKvafP8WaveFillingReleaseClaimed &&
+      (desired_state == kKvafP8WaveFree ||
+       desired_state == kKvafP8WaveQuarantined);
+  const bool is_post_intent_quarantine_edge =
+      expected_state == kKvafP8WavePostIntent &&
+      desired_state == kKvafP8WaveQuarantined;
+  const bool is_admission_claimed_edge =
+      expected_state == kKvafP8WaveFillingClaimed &&
+      (desired_state == kKvafP8WaveFilling ||
+       desired_state == kKvafP8WaveQuarantined);
+  if (!is_filling_edge && !is_release_claimed_edge &&
+      !is_post_intent_quarantine_edge && !is_admission_claimed_edge) {
+    return false;
+  }
+  __gm__ int32_t* const state =
+      reinterpret_cast<__gm__ int32_t*>(&(record->state));
+  const int32_t observed = asc_atomic_cas(
+      state, static_cast<int32_t>(expected_state),
+      static_cast<int32_t>(desired_state));
+  result->observed_state = static_cast<uint32_t>(observed);
+  if (observed != static_cast<int32_t>(expected_state)) {
+    return false;
+  }
+  AscendC::Simt::ThreadFence();
+  result->success = 1U;
+  return true;
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(1)
+inline void KvafP8FillingStateTransitionSimtService(
+    __gm__ KvafP8WaveRecord* record, uint32_t expected_state,
+    uint32_t desired_state, __ubuf__ KvafP8WaveDrainClaimResult* result) {
+  (void)TryTransitionKvafP8FillingStateFromSimt(
+      record, expected_state, desired_state, result);
+}
+
+__aicore__ inline bool TryTransitionKvafP8FillingStateFromAicore(
+    __gm__ KvafP8WaveRecord* record, uint32_t expected_state,
+    uint32_t desired_state, __ubuf__ KvafP8WaveDrainClaimResult* result,
+    event_t simt_event) {
+  if (record == nullptr || result == nullptr) {
+    return false;
+  }
+  result->success = 0U;
+  result->observed_state = kKvafP8WaveFree;
+  set_flag(PIPE_S, PIPE_V, simt_event);
+  wait_flag(PIPE_S, PIPE_V, simt_event);
+  AscendC::Simt::VF_CALL<KvafP8FillingStateTransitionSimtService>(
+      AscendC::Simt::Dim3{1U, 1U, 1U}, record, expected_state,
+      desired_state, result);
+  set_flag(PIPE_V, PIPE_S, simt_event);
+  wait_flag(PIPE_V, PIPE_S, simt_event);
+  if (result->success == 0U || result->observed_state != expected_state) {
+    return false;
+  }
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  return true;
+}
+
+// State-last commit protocol ------------------------------------------------
+//
+// A P8 wave is durable GM state shared by the producer, dynamic CQ drain
+// workers, and the forward-terminal sweep.  Therefore a worker must never
+// turn a locally-mutated `KvafP8WaveRecord` into truth with a full GM Store:
+// that could overwrite a terminal QUARANTINED state which won while the
+// worker was inside PostOnly/Retire/Finish.  The narrow helpers below provide
+// the only transition boundary for the post/drain/release states used by P8:
+//
+//   1. reload and prove the complete identity plus expected state;
+//   2. write only mutable payload words and issue a DDR publish barrier;
+//   3. CAS the state word from expected -> desired; and
+//   4. reload to prove the committed state still belongs to this identity.
+//
+// The payload-first ordering is intentional.  A competing terminal CAS may
+// win after step 2, in which case this worker's final CAS fails and cannot
+// resurrect the wave.  It must not write another field after that failure.
+// Fields that establish the admitted wave (magic/version/identity, request
+// count, and the pre-Post queue indices) are immutable at these boundaries.
+
+__aicore__ inline bool IsKvafP8WaveStateLastCommitEdgeAllowed(
+    uint32_t expected_state, uint32_t desired_state) {
+  const bool post_intent_edge =
+      expected_state == kKvafP8WavePostIntent &&
+      (desired_state == kKvafP8WavePosted ||
+       desired_state == kKvafP8WaveFinalized ||
+       desired_state == kKvafP8WaveQuarantined);
+  const bool drain_claimed_edge =
+      expected_state == kKvafP8WaveDrainClaimed &&
+      (desired_state == kKvafP8WavePosted ||
+       desired_state == kKvafP8WaveFinalized ||
+       desired_state == kKvafP8WaveQuarantined);
+  const bool finalized_edge =
+      expected_state == kKvafP8WaveFinalized &&
+      (desired_state == kKvafP8WaveFree ||
+       desired_state == kKvafP8WaveQuarantined);
+  return post_intent_edge || drain_claimed_edge || finalized_edge;
+}
+
+__aicore__ inline bool IsKvafP8WaveStateLastPayloadValid(
+    const KvafP8WaveRecord& observed, const KvafP8WaveRecord& payload,
+    uint32_t expected_state, uint32_t desired_state,
+    const KvafP8WaveIdentity& expected_identity) {
+  if (!IsKvafP8WaveRecordValid(observed) ||
+      !IsKvafP8WaveRecordValid(payload) ||
+      observed.state != expected_state || payload.state != desired_state ||
+      !KvafP8WaveIdentityEquals(observed.identity, expected_identity) ||
+      !KvafP8WaveIdentityEquals(payload.identity, expected_identity) ||
+      observed.magic != payload.magic || observed.version != payload.version ||
+      observed.sq_producer_before != payload.sq_producer_before ||
+      observed.cq_consumer_before != payload.cq_consumer_before ||
+      observed.request_count != payload.request_count) {
+    return false;
+  }
+  // reserved[0] is the CQ-observed marker and is mutable with the drain
+  // payload.  The FILLING proof and remaining reserved words must never be
+  // republished by a post/drain worker from a stale local record.
+  for (uint32_t index = 1U; index < 5U; ++index) {
+    if (observed.reserved[index] != payload.reserved[index]) {
+      return false;
+    }
+  }
+  if (desired_state == kKvafP8WavePosted) {
+    return payload.post_committed == 1U &&
+           payload.transaction.state == kDenseBatchGetInFlight &&
+           payload.transaction.finalized == 0U;
+  }
+  if (desired_state == kKvafP8WaveFinalized) {
+    return payload.transaction.finalized != 0U;
+  }
+  if (desired_state == kKvafP8WaveFree) {
+    // This edge is legal only after the caller has obtained the exact
+    // owner-table release proof.  It cannot free a possibly posted wave.
+    return payload.post_committed == 0U &&
+           payload.transaction.finalized != 0U;
+  }
+  // QUARANTINED is terminal by state alone.  The caller supplies the
+  // diagnostic outcome in `payload`, but no non-terminal transaction fact is
+  // used to make a quarantined record reusable.
+  return desired_state == kKvafP8WaveQuarantined;
+}
+
+// Publish only fields that are allowed to change after POST_INTENT.  In
+// particular, this deliberately does not touch `state`, identity, request
+// count, pre-Post queue indices, FILLING proof, or any fixed-record ABI
+// layout.  It is private to the state-last commit helper below.
+__aicore__ inline bool PublishKvafP8WaveStateLastMutablePayloadToGm(
+    __gm__ KvafP8WaveRecord* record_gm,
+    const KvafP8WaveRecord& payload) {
+  if (record_gm == nullptr) {
+    return false;
+  }
+  record_gm->sq_producer_after = payload.sq_producer_after;
+  record_gm->cq_consumer_after = payload.cq_consumer_after;
+  record_gm->outcome = payload.outcome;
+  record_gm->private_ready_published = payload.private_ready_published;
+  record_gm->post_committed = payload.post_committed;
+  record_gm->transaction.active_count = payload.transaction.active_count;
+  record_gm->transaction.total_posts = payload.transaction.total_posts;
+  record_gm->transaction.failed_request = payload.transaction.failed_request;
+  record_gm->transaction.last_wqe = payload.transaction.last_wqe;
+  record_gm->transaction.first_doorbell_cycle =
+      payload.transaction.first_doorbell_cycle;
+  record_gm->transaction.profile_start_cycle =
+      payload.transaction.profile_start_cycle;
+  record_gm->transaction.profile_setup_done_cycle =
+      payload.transaction.profile_setup_done_cycle;
+  record_gm->transaction.profile_compact_done_cycle =
+      payload.transaction.profile_compact_done_cycle;
+  record_gm->transaction.profile_post_done_cycle =
+      payload.transaction.profile_post_done_cycle;
+  record_gm->transaction.profile_completion_done_cycle =
+      payload.transaction.profile_completion_done_cycle;
+  record_gm->transaction.result = payload.transaction.result;
+  record_gm->transaction.completion_polls =
+      payload.transaction.completion_polls;
+  record_gm->transaction.state = payload.transaction.state;
+  record_gm->transaction.profile_enabled =
+      payload.transaction.profile_enabled;
+  record_gm->transaction.finalized = payload.transaction.finalized;
+  record_gm->reserved[0] = payload.reserved[0];
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  return true;
+}
+
+__simt_callee__ inline bool TryCommitKvafP8WaveStateLastFromSimt(
+    __gm__ KvafP8WaveRecord* record, uint32_t expected_state,
+    uint32_t desired_state, __ubuf__ KvafP8WaveDrainClaimResult* result) {
+  const bool post_intent_edge =
+      expected_state == kKvafP8WavePostIntent &&
+      (desired_state == kKvafP8WavePosted ||
+       desired_state == kKvafP8WaveFinalized ||
+       desired_state == kKvafP8WaveQuarantined);
+  const bool drain_claimed_edge =
+      expected_state == kKvafP8WaveDrainClaimed &&
+      (desired_state == kKvafP8WavePosted ||
+       desired_state == kKvafP8WaveFinalized ||
+       desired_state == kKvafP8WaveQuarantined);
+  const bool finalized_edge =
+      expected_state == kKvafP8WaveFinalized &&
+      (desired_state == kKvafP8WaveFree ||
+       desired_state == kKvafP8WaveQuarantined);
+  if (record == nullptr || result == nullptr ||
+      (!post_intent_edge && !drain_claimed_edge && !finalized_edge)) {
+    return false;
+  }
+  result->success = 0U;
+  result->observed_state = kKvafP8WaveFree;
+  __gm__ int32_t* const state =
+      reinterpret_cast<__gm__ int32_t*>(&(record->state));
+  const int32_t observed = asc_atomic_cas(
+      state, static_cast<int32_t>(expected_state),
+      static_cast<int32_t>(desired_state));
+  result->observed_state = static_cast<uint32_t>(observed);
+  if (observed != static_cast<int32_t>(expected_state)) {
+    return false;
+  }
+  AscendC::Simt::ThreadFence();
+  result->success = 1U;
+  return true;
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(1)
+inline void KvafP8WaveStateLastCommitSimtService(
+    __gm__ KvafP8WaveRecord* record, uint32_t expected_state,
+    uint32_t desired_state, __ubuf__ KvafP8WaveDrainClaimResult* result) {
+  (void)TryCommitKvafP8WaveStateLastFromSimt(
+      record, expected_state, desired_state, result);
+}
+
+__aicore__ inline bool CommitKvafP8WaveMutablePayloadAndStateFromAicore(
+    __gm__ KvafP8WaveRecord* record_gm,
+    const KvafP8WaveIdentity& expected_identity, uint32_t expected_state,
+    uint32_t desired_state, const KvafP8WaveRecord& payload,
+    __ubuf__ KvafP8WaveDrainClaimResult* transition_result,
+    event_t simt_event, KvafP8WaveRecord* committed_record) {
+  if (record_gm == nullptr || transition_result == nullptr ||
+      !IsKvafP8WaveStateLastCommitEdgeAllowed(expected_state, desired_state)) {
+    return false;
+  }
+  KvafP8WaveRecord observed{};
+  if (!LoadKvafP8WaveRecordFromGm(record_gm, &observed) ||
+      !IsKvafP8WaveStateLastPayloadValid(
+          observed, payload, expected_state, desired_state,
+          expected_identity) ||
+      !PublishKvafP8WaveStateLastMutablePayloadToGm(record_gm, payload)) {
+    return false;
+  }
+  transition_result->success = 0U;
+  transition_result->observed_state = kKvafP8WaveFree;
+  set_flag(PIPE_S, PIPE_V, simt_event);
+  wait_flag(PIPE_S, PIPE_V, simt_event);
+  AscendC::Simt::VF_CALL<KvafP8WaveStateLastCommitSimtService>(
+      AscendC::Simt::Dim3{1U, 1U, 1U}, record_gm, expected_state,
+      desired_state, transition_result);
+  set_flag(PIPE_V, PIPE_S, simt_event);
+  wait_flag(PIPE_V, PIPE_S, simt_event);
+  if (transition_result->success == 0U ||
+      transition_result->observed_state != expected_state) {
+    return false;
+  }
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  KvafP8WaveRecord committed{};
+  if (!LoadKvafP8WaveRecordFromGm(record_gm, &committed) ||
+      !IsKvafP8WaveRecordValid(committed) ||
+      committed.state != desired_state ||
+      !KvafP8WaveIdentityEquals(committed.identity, expected_identity)) {
+    return false;
+  }
+  if (committed_record != nullptr) {
+    (void)LoadKvafP8WaveRecordFromGm(record_gm, committed_record);
+  }
+  return true;
+}
+
+// The normal state-last helper intentionally does not allow
+// DRAIN_CLAIMED -> FREE: that broad edge would make it too easy for a CQ
+// drain to recycle a queue before a possibly-posted transaction has reached
+// its terminal/private-publication proof.  There is exactly one exception.
+// A worker which atomically claimed a durable POST_REJECTED FINALIZED record,
+// released every associated PENDING private row, and then successfully
+// released the queue owner may make its record reusable.  Keep that exception
+// in this dedicated proof so native P8 code cannot fall back to a raw full
+// record Store after `ReleaseKvafP8ClaimedUnpostedWaveAfterPrivateCleanup`.
+//
+// The input `payload` is the caller-local record returned by that release
+// helper: it has state FREE, but its immutable identity/ledger evidence is
+// retained.  We publish only mutable transaction/outcome words, issue the
+// DDR barrier, then CAS the durable state last.  A terminal quarantine that
+// wins the CAS keeps the record non-reusable; this helper never resurrects it.
+__aicore__ inline bool IsKvafP8ClaimedUnpostedWaveReleasePayloadValid(
+    const KvafP8WaveRecord& observed, const KvafP8WaveRecord& payload,
+    const KvafP8WaveIdentity& expected_identity) {
+  if (!IsKvafP8WaveStateLastPayloadValid(
+          observed, payload, kKvafP8WaveDrainClaimed, kKvafP8WaveFree,
+          expected_identity)) {
+    return false;
+  }
+  // A deterministic no-post wave is the only safe DRAIN_CLAIMED -> FREE
+  // case.  It cannot have published a usable private payload or observed a
+  // CQ.  `total_posts` is deliberately not required to be zero: PostOnly
+  // computes it before descriptor validation, even when it never rings SQ.
+  return observed.post_committed == 0U &&
+         payload.post_committed == 0U &&
+         observed.outcome == kKvafP8WaveOutcomePostRejected &&
+         payload.outcome == kKvafP8WaveOutcomePostRejected &&
+         observed.private_ready_published == 0U &&
+         payload.private_ready_published == 0U &&
+         observed.reserved[0] == 0U && payload.reserved[0] == 0U &&
+         observed.transaction.state == kDenseBatchGetFailed &&
+         payload.transaction.state == kDenseBatchGetFailed &&
+         observed.transaction.finalized != 0U &&
+         payload.transaction.finalized != 0U;
+}
+
+__simt_callee__ inline bool
+TryCommitKvafP8ClaimedUnpostedWaveReleaseFromSimt(
+    __gm__ KvafP8WaveRecord* record,
+    __ubuf__ KvafP8WaveDrainClaimResult* result) {
+  if (record == nullptr || result == nullptr) {
+    return false;
+  }
+  result->success = 0U;
+  result->observed_state = kKvafP8WaveFree;
+  __gm__ int32_t* const state =
+      reinterpret_cast<__gm__ int32_t*>(&(record->state));
+  const int32_t observed = asc_atomic_cas(
+      state, static_cast<int32_t>(kKvafP8WaveDrainClaimed),
+      static_cast<int32_t>(kKvafP8WaveFree));
+  result->observed_state = static_cast<uint32_t>(observed);
+  if (observed != static_cast<int32_t>(kKvafP8WaveDrainClaimed)) {
+    return false;
+  }
+  AscendC::Simt::ThreadFence();
+  result->success = 1U;
+  return true;
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(1)
+inline void KvafP8ClaimedUnpostedWaveReleaseSimtService(
+    __gm__ KvafP8WaveRecord* record,
+    __ubuf__ KvafP8WaveDrainClaimResult* result) {
+  (void)TryCommitKvafP8ClaimedUnpostedWaveReleaseFromSimt(record, result);
+}
+
+// State-last durable completion for the sole deterministic no-post release
+// edge.  It preserves the P8 record ABI and exposes no generic
+// DRAIN_CLAIMED -> FREE transition.
+__aicore__ inline bool CommitKvafP8ClaimedUnpostedWaveReleaseFromAicore(
+    __gm__ KvafP8WaveRecord* record_gm,
+    const KvafP8WaveIdentity& expected_identity,
+    const KvafP8WaveRecord& payload,
+    __ubuf__ KvafP8WaveDrainClaimResult* transition_result,
+    event_t simt_event, KvafP8WaveRecord* committed_record) {
+  if (record_gm == nullptr || transition_result == nullptr) {
+    return false;
+  }
+  KvafP8WaveRecord observed{};
+  if (!LoadKvafP8WaveRecordFromGm(record_gm, &observed) ||
+      !IsKvafP8ClaimedUnpostedWaveReleasePayloadValid(
+          observed, payload, expected_identity) ||
+      !PublishKvafP8WaveStateLastMutablePayloadToGm(record_gm, payload)) {
+    return false;
+  }
+  transition_result->success = 0U;
+  transition_result->observed_state = kKvafP8WaveFree;
+  set_flag(PIPE_S, PIPE_V, simt_event);
+  wait_flag(PIPE_S, PIPE_V, simt_event);
+  AscendC::Simt::VF_CALL<KvafP8ClaimedUnpostedWaveReleaseSimtService>(
+      AscendC::Simt::Dim3{1U, 1U, 1U}, record_gm, transition_result);
+  set_flag(PIPE_V, PIPE_S, simt_event);
+  wait_flag(PIPE_V, PIPE_S, simt_event);
+  if (transition_result->success == 0U ||
+      transition_result->observed_state != kKvafP8WaveDrainClaimed) {
+    return false;
+  }
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  KvafP8WaveRecord committed{};
+  if (!LoadKvafP8WaveRecordFromGm(record_gm, &committed) ||
+      !IsKvafP8WaveRecordValid(committed) ||
+      committed.state != kKvafP8WaveFree ||
+      !KvafP8WaveIdentityEquals(committed.identity, expected_identity) ||
+      committed.magic != payload.magic ||
+      committed.version != payload.version ||
+      committed.sq_producer_before != payload.sq_producer_before ||
+      committed.cq_consumer_before != payload.cq_consumer_before ||
+      committed.request_count != payload.request_count ||
+      committed.sq_producer_after != payload.sq_producer_after ||
+      committed.cq_consumer_after != payload.cq_consumer_after ||
+      committed.outcome != kKvafP8WaveOutcomePostRejected ||
+      committed.private_ready_published != 0U ||
+      committed.post_committed != 0U ||
+      committed.reserved[0] != 0U ||
+      committed.transaction.state != kDenseBatchGetFailed ||
+      committed.transaction.finalized == 0U) {
+    return false;
+  }
+  if (committed_record != nullptr) {
+    (void)LoadKvafP8WaveRecordFromGm(record_gm, committed_record);
+  }
+  return true;
+}
+
+// Admission uses a separate claim because a first-use graph-stable slot is
+// all zero and therefore has no complete identity to validate yet.  Claiming
+// only the state word first prevents two dynamic producers from both seeing
+// FREE and then full-storing different identities into the same queue record.
+// A forward terminal may always CAS CLAIMED -> QUARANTINED without inspecting
+// identity; this is what closes the identity-publication interruption window.
+__simt_callee__ inline bool TryClaimKvafP8WaveFillingAdmissionFromSimt(
+    __gm__ KvafP8WaveRecord* record,
+    __ubuf__ KvafP8WaveDrainClaimResult* result) {
+  if (record == nullptr || result == nullptr) {
+    return false;
+  }
+  result->success = 0U;
+  result->observed_state = kKvafP8WaveFree;
+  __gm__ int32_t* const state =
+      reinterpret_cast<__gm__ int32_t*>(&(record->state));
+  const int32_t observed = asc_atomic_cas(
+      state, static_cast<int32_t>(kKvafP8WaveFree),
+      static_cast<int32_t>(kKvafP8WaveFillingClaimed));
+  result->observed_state = static_cast<uint32_t>(observed);
+  if (observed != static_cast<int32_t>(kKvafP8WaveFree)) {
+    return false;
+  }
+  AscendC::Simt::ThreadFence();
+  result->success = 1U;
+  return true;
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(1)
+inline void KvafP8WaveFillingAdmissionClaimSimtService(
+    __gm__ KvafP8WaveRecord* record,
+    __ubuf__ KvafP8WaveDrainClaimResult* result) {
+  (void)TryClaimKvafP8WaveFillingAdmissionFromSimt(record, result);
+}
+
+__aicore__ inline bool TryClaimKvafP8WaveFillingAdmissionFromAicore(
+    __gm__ KvafP8WaveRecord* record,
+    __ubuf__ KvafP8WaveDrainClaimResult* result, event_t simt_event) {
+  if (record == nullptr || result == nullptr) {
+    return false;
+  }
+  result->success = 0U;
+  result->observed_state = kKvafP8WaveFree;
+  set_flag(PIPE_S, PIPE_V, simt_event);
+  wait_flag(PIPE_S, PIPE_V, simt_event);
+  AscendC::Simt::VF_CALL<KvafP8WaveFillingAdmissionClaimSimtService>(
+      AscendC::Simt::Dim3{1U, 1U, 1U}, record, result);
+  set_flag(PIPE_V, PIPE_S, simt_event);
+  wait_flag(PIPE_V, PIPE_S, simt_event);
+  if (result->success == 0U ||
+      result->observed_state != kKvafP8WaveFree) {
+    return false;
+  }
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  return true;
+}
+
+__simt_callee__ inline bool TryQuarantineKvafP8WaveFillingClaimedFromSimt(
+    __gm__ KvafP8WaveRecord* record,
+    __ubuf__ KvafP8WaveDrainClaimResult* result) {
+  if (record == nullptr || result == nullptr) {
+    return false;
+  }
+  result->success = 0U;
+  result->observed_state = kKvafP8WaveFree;
+  __gm__ int32_t* const state =
+      reinterpret_cast<__gm__ int32_t*>(&(record->state));
+  const int32_t observed = asc_atomic_cas(
+      state, static_cast<int32_t>(kKvafP8WaveFillingClaimed),
+      static_cast<int32_t>(kKvafP8WaveQuarantined));
+  result->observed_state = static_cast<uint32_t>(observed);
+  if (observed != static_cast<int32_t>(kKvafP8WaveFillingClaimed)) {
+    return false;
+  }
+  AscendC::Simt::ThreadFence();
+  result->success = 1U;
+  return true;
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(1)
+inline void KvafP8WaveFillingClaimedQuarantineSimtService(
+    __gm__ KvafP8WaveRecord* record,
+    __ubuf__ KvafP8WaveDrainClaimResult* result) {
+  (void)TryQuarantineKvafP8WaveFillingClaimedFromSimt(record, result);
+}
+
+// This deliberately does not update outcome or identity after the CAS.  A
+// producer may have been interrupted halfway through its field-wise payload
+// publication, so the only safe terminal fact is the QUARANTINED state word.
+__aicore__ inline bool QuarantineKvafP8WaveFillingClaimedFromAicore(
+    __gm__ KvafP8WaveRecord* record,
+    __ubuf__ KvafP8WaveDrainClaimResult* result, event_t simt_event) {
+  if (record == nullptr || result == nullptr) {
+    return false;
+  }
+  result->success = 0U;
+  result->observed_state = kKvafP8WaveFree;
+  set_flag(PIPE_S, PIPE_V, simt_event);
+  wait_flag(PIPE_S, PIPE_V, simt_event);
+  AscendC::Simt::VF_CALL<KvafP8WaveFillingClaimedQuarantineSimtService>(
+      AscendC::Simt::Dim3{1U, 1U, 1U}, record, result);
+  set_flag(PIPE_V, PIPE_S, simt_event);
+  wait_flag(PIPE_V, PIPE_S, simt_event);
+  if (result->success == 0U ||
+      result->observed_state != kKvafP8WaveFillingClaimed) {
+    return false;
+  }
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  return true;
 }
 
 // A deterministic Begin/Post rejection is different from POST_INTENT
@@ -2589,16 +3614,11 @@ __aicore__ inline bool TryClaimKvafP8UnpostedWaveDrainFromAicore(
 
 // P8 phase helpers ---------------------------------------------------------
 //
-// A P8 executor invokes these helpers in short graph-visible phases:
-//
-//   descriptor/ledger publish -> PreparePostIntent -> STORE+DDR barrier
-//   -> PostOnly -> STORE+DDR barrier -> TryRetire/Finish -> private terminal
-//   publish -> ReleaseAfterPrivateTerminal.
-//
-// The helpers intentionally do not store a record to GM themselves.  The
-// caller owns that explicit publish edge, which prevents an implementation
-// from accidentally ringing a doorbell before the descriptor and P8 record
-// become visible to the same forward's drain phase.
+// A P8 executor invokes these helpers in short graph-visible phases.  Every
+// phase that changes the durable wave state must use the state-last CAS
+// helpers below; there is intentionally no generic full-record GM publisher
+// for PostOnly/CQ/Finish paths.  This prevents an AIC-local drain snapshot
+// from overwriting a terminal quarantine after the snapshot was taken.
 
 __aicore__ inline void QuarantineKvafP8WaveRecord(
     KvafP8WaveRecord* record, KvafP8WaveOutcome outcome) {
@@ -2607,6 +3627,536 @@ __aicore__ inline void QuarantineKvafP8WaveRecord(
   }
   record->state = kKvafP8WaveQuarantined;
   record->outcome = static_cast<uint32_t>(outcome);
+}
+
+// Fail-close one of the two pre-doorbell FILLING states without a full-record
+// Store.  The CAS is the ownership boundary; publishing `outcome` afterwards
+// is safe only for the worker that won that CAS.  A loser must not write any
+// field because its observed record may already be the forward-terminal
+// QUARANTINED state.
+__aicore__ inline bool QuarantineKvafP8FillingStateFromAicore(
+    __gm__ KvafP8WaveRecord* record_gm, uint32_t expected_state,
+    KvafP8WaveOutcome outcome,
+    __ubuf__ KvafP8WaveDrainClaimResult* transition_result,
+    event_t simt_event, KvafP8WaveRecord* record) {
+  if (!TryTransitionKvafP8FillingStateFromAicore(
+          record_gm, expected_state, kKvafP8WaveQuarantined,
+          transition_result, simt_event)) {
+    return false;
+  }
+  record_gm->outcome = static_cast<uint32_t>(outcome);
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  if (record != nullptr) {
+    record->state = kKvafP8WaveQuarantined;
+    record->outcome = static_cast<uint32_t>(outcome);
+  }
+  return true;
+}
+
+// A successful FILLING -> POST_INTENT commit makes descriptor/private/ledger
+// state externally visible, but it has not rung the HCCP doorbell yet.  If
+// the executor cannot reload a matching AdmitPost control word immediately
+// before PostOnly, it must make that ambiguity durable.  Do not use a normal
+// full-record Store here: ForwardTerminal may have won the same race.  The
+// GM reload + complete identity check prevents a stale producer from
+// quarantining a later forward's wave that reused the queue id.
+__aicore__ inline bool QuarantineKvafP8PostIntentStateFromAicore(
+    __gm__ KvafP8WaveRecord* record_gm,
+    const KvafP8WaveIdentity& expected_identity,
+    __ubuf__ KvafP8WaveDrainClaimResult* transition_result,
+    event_t simt_event, KvafP8WaveRecord* record) {
+  KvafP8WaveRecord observed{};
+  if (record_gm == nullptr || transition_result == nullptr ||
+      !LoadKvafP8WaveRecordFromGm(record_gm, &observed) ||
+      !IsKvafP8WaveRecordValid(observed) ||
+      observed.state != kKvafP8WavePostIntent ||
+      !KvafP8WaveIdentityEquals(observed.identity, expected_identity)) {
+    return false;
+  }
+  if (!TryTransitionKvafP8FillingStateFromAicore(
+          record_gm, kKvafP8WavePostIntent, kKvafP8WaveQuarantined,
+          transition_result, simt_event)) {
+    return false;
+  }
+  record_gm->outcome =
+      static_cast<uint32_t>(kKvafP8WaveOutcomePostIntentQuarantined);
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  if (record != nullptr) {
+    record->state = kKvafP8WaveQuarantined;
+    record->outcome =
+        static_cast<uint32_t>(kKvafP8WaveOutcomePostIntentQuarantined);
+  }
+  return true;
+}
+
+// Publish only the payload which turns an already durable FILLING record
+// into a ready POST_INTENT candidate.  Do not write `state`, `outcome`, or
+// identity here: a terminal sweep may have CASed FILLING to QUARANTINED while
+// validation was running.  The following FILLING -> POST_INTENT CAS decides
+// whether this payload becomes live; if it loses, the record stays
+// QUARANTINED and no HCCP Post is allowed.
+__aicore__ inline bool PublishKvafP8FillingPostIntentPayloadToGm(
+    __gm__ KvafP8WaveRecord* record_gm,
+    const KvafP8WaveRecord& record) {
+  if (record_gm == nullptr || !IsKvafP8WaveRecordValid(record) ||
+      record.state != kKvafP8WaveFilling ||
+      record.reserved[1] != kKvafP8FillingExposureProof) {
+    return false;
+  }
+  record_gm->sq_producer_before = record.sq_producer_before;
+  record_gm->cq_consumer_before = record.cq_consumer_before;
+  record_gm->request_count = record.request_count;
+  // Clear the no-work/exposure proof before the state CAS.  The state remains
+  // FILLING until that CAS succeeds, so this can only make a racing terminal
+  // more conservative; it can never make it release a descriptor-bearing
+  // wave as empty.
+  record_gm->reserved[1] = 0U;
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  return true;
+}
+
+// `FILLING` exists specifically to close the old lease-acquire -> descriptor
+// publication hole.  The owner table CAS is necessary but not sufficient:
+// if a dynamic task exits after the CAS and before a durable record exists,
+// no later drain/terminal phase can decide whether it is safe to reuse that
+// queue.  `BeginAndPublishKvafP8WaveFilling` claims the state word first,
+// then publishes this fully initialized record before touching any externally
+// visible descriptor, private record, or request-ledger byte.
+__aicore__ inline bool BeginKvafP8WaveFilling(
+    const KvafStreamingBatchGetControl& control,
+    const KvafP8ForwardControl& forward_control,
+    const KvafStreamingBatchGetLease& lease,
+    const KvafP8WaveIdentity& identity, KvafP8WaveRecord* record) {
+  if (record == nullptr) {
+    return false;
+  }
+  ResetKvafP8WaveRecord(record, identity);
+  if (!IsKvafStreamingBatchGetControlValidForAicore(control) ||
+      lease.state != kStreamingBatchGetLeaseHeld || lease.owner_tag <= 0 ||
+      lease.queue_id >= control.queue_count || identity.forward_epoch == 0U ||
+      identity.queue_generation == 0U || identity.post_sequence == 0U ||
+      identity.reserved0 != 0U || identity.queue_id != lease.queue_id ||
+      identity.owner_tag != lease.owner_tag ||
+      !KvafP8ForwardControlMatchesIdentity(
+          forward_control, identity, kKvafP8ForwardPhaseAdmitPost)) {
+    QuarantineKvafP8WaveRecord(record,
+                                kKvafP8WaveOutcomeFillingQuarantined);
+    return false;
+  }
+  __gm__ const int32_t* const owners =
+      reinterpret_cast<__gm__ const int32_t*>(control.queue_leases);
+  if (owners == nullptr || owners[lease.queue_id] != lease.owner_tag) {
+    QuarantineKvafP8WaveRecord(record,
+                                kKvafP8WaveOutcomeFillingQuarantined);
+    return false;
+  }
+  record->state = kKvafP8WaveFilling;
+  // This marker is the only normal proof that no external P8 work has been
+  // exposed.  ArmKvafP8WaveFillingForExternalWrites clears that proof before
+  // any descriptor/private/ledger mutation.
+  record->reserved[1] = kKvafP8FillingNoWorkProof;
+  return true;
+}
+
+// A graph-stable wave slot is admitted only from a fresh all-zero allocation
+// or a previously completed, valid FREE record.  Do not overwrite a malformed
+// or non-FREE record: after a process interruption it may still describe a
+// queue/private lifetime which only cold recovery can prove quiescent.
+__aicore__ inline bool IsKvafP8WaveRecordAllZero(
+    const KvafP8WaveRecord& record) {
+  if (record.magic != 0U || record.version != 0U || record.state != 0U ||
+      record.identity.forward_epoch != 0U ||
+      record.identity.graph_replay_generation != 0U ||
+      record.identity.layer_control_index != 0U || record.identity.queue_id != 0U ||
+      record.identity.queue_generation != 0U ||
+      record.identity.post_sequence != 0U || record.identity.owner_tag != 0 ||
+      record.identity.reserved0 != 0U || record.sq_producer_before != 0U ||
+      record.cq_consumer_before != 0U || record.sq_producer_after != 0U ||
+      record.cq_consumer_after != 0U || record.request_count != 0U ||
+      record.outcome != 0U || record.private_ready_published != 0U ||
+      record.post_committed != 0U || record.transaction.active_count != 0U ||
+      record.transaction.total_posts != 0U ||
+      record.transaction.failed_request != 0U ||
+      record.transaction.last_wqe != 0U ||
+      record.transaction.first_doorbell_cycle != 0U ||
+      record.transaction.profile_start_cycle != 0U ||
+      record.transaction.profile_setup_done_cycle != 0U ||
+      record.transaction.profile_compact_done_cycle != 0U ||
+      record.transaction.profile_post_done_cycle != 0U ||
+      record.transaction.profile_completion_done_cycle != 0U ||
+      record.transaction.result != 0U ||
+      record.transaction.completion_polls != 0U ||
+      record.transaction.state != 0U ||
+      record.transaction.profile_enabled != 0U ||
+      record.transaction.finalized != 0U) {
+    return false;
+  }
+  for (uint32_t index = 0U; index < 5U; ++index) {
+    if (record.reserved[index] != 0U) {
+      return false;
+    }
+  }
+  return true;
+}
+
+__aicore__ inline bool IsKvafP8WaveRecordAdmissibleForFilling(
+    const KvafP8WaveRecord& record) {
+  return IsKvafP8WaveRecordAllZero(record) ||
+         (IsKvafP8WaveRecordValid(record) &&
+          record.state == kKvafP8WaveFree);
+}
+
+// Publish a complete FILLING payload while the state word is already held in
+// FILLING_CLAIMED.  This is deliberately field-wise and omits `state`: a
+// terminal worker can CAS CLAIMED -> QUARANTINED at any point, and this
+// producer must never revive that terminal result with a stale full-record
+// Store.  If terminal wins while this helper is writing, its state stays
+// QUARANTINED and the final CLAIMED -> FILLING CAS below fails closed.
+__aicore__ inline bool PublishKvafP8WaveFillingClaimedPayloadToGm(
+    __gm__ KvafP8WaveRecord* record_gm,
+    const KvafP8WaveRecord& record) {
+  if (record_gm == nullptr || !IsKvafP8WaveRecordValid(record) ||
+      record.state != kKvafP8WaveFilling) {
+    return false;
+  }
+  record_gm->magic = record.magic;
+  record_gm->version = record.version;
+  record_gm->identity.forward_epoch = record.identity.forward_epoch;
+  record_gm->identity.graph_replay_generation =
+      record.identity.graph_replay_generation;
+  record_gm->identity.layer_control_index = record.identity.layer_control_index;
+  record_gm->identity.queue_id = record.identity.queue_id;
+  record_gm->identity.queue_generation = record.identity.queue_generation;
+  record_gm->identity.post_sequence = record.identity.post_sequence;
+  record_gm->identity.owner_tag = record.identity.owner_tag;
+  record_gm->identity.reserved0 = record.identity.reserved0;
+  record_gm->sq_producer_before = record.sq_producer_before;
+  record_gm->cq_consumer_before = record.cq_consumer_before;
+  record_gm->sq_producer_after = record.sq_producer_after;
+  record_gm->cq_consumer_after = record.cq_consumer_after;
+  record_gm->request_count = record.request_count;
+  record_gm->outcome = record.outcome;
+  record_gm->private_ready_published = record.private_ready_published;
+  record_gm->post_committed = record.post_committed;
+  record_gm->transaction.active_count = record.transaction.active_count;
+  record_gm->transaction.total_posts = record.transaction.total_posts;
+  record_gm->transaction.failed_request = record.transaction.failed_request;
+  record_gm->transaction.last_wqe = record.transaction.last_wqe;
+  record_gm->transaction.first_doorbell_cycle =
+      record.transaction.first_doorbell_cycle;
+  record_gm->transaction.profile_start_cycle =
+      record.transaction.profile_start_cycle;
+  record_gm->transaction.profile_setup_done_cycle =
+      record.transaction.profile_setup_done_cycle;
+  record_gm->transaction.profile_compact_done_cycle =
+      record.transaction.profile_compact_done_cycle;
+  record_gm->transaction.profile_post_done_cycle =
+      record.transaction.profile_post_done_cycle;
+  record_gm->transaction.profile_completion_done_cycle =
+      record.transaction.profile_completion_done_cycle;
+  record_gm->transaction.result = record.transaction.result;
+  record_gm->transaction.completion_polls =
+      record.transaction.completion_polls;
+  record_gm->transaction.state = record.transaction.state;
+  record_gm->transaction.profile_enabled =
+      record.transaction.profile_enabled;
+  record_gm->transaction.finalized = record.transaction.finalized;
+  for (uint32_t index = 0U; index < 5U; ++index) {
+    record_gm->reserved[index] = record.reserved[index];
+  }
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  return true;
+}
+
+// Preferred P8 admission entry point.  It first claims FREE/all-zero state
+// atomically, then writes identity/payload, then commits CLAIMED -> FILLING.
+// This closes the old check-FREE then full-Store race between two dynamic
+// producers and gives ForwardTerminal a state it can quarantine even before
+// the new identity is complete.
+__aicore__ inline bool BeginAndPublishKvafP8WaveFilling(
+    __gm__ KvafP8WaveRecord* record_gm,
+    const KvafStreamingBatchGetControl& control,
+    const KvafP8ForwardControl& forward_control,
+    const KvafStreamingBatchGetLease& lease,
+    const KvafP8WaveIdentity& identity,
+    __ubuf__ KvafP8WaveDrainClaimResult* transition_result,
+    event_t simt_event, KvafP8WaveRecord* record) {
+  KvafP8WaveRecord prior{};
+  if (record_gm == nullptr ||
+      !LoadKvafP8WaveRecordFromGm(record_gm, &prior) ||
+      !IsKvafP8WaveRecordAdmissibleForFilling(prior)) {
+    // A non-FREE or malformed slot is not overwritten.  The caller must set
+    // the forward-abort gate and retain its held lease for terminal/cold
+    // recovery rather than risking an ABA overwrite.
+    return false;
+  }
+  // This is the only write to the state word before the complete identity is
+  // visible.  A terminal sweep may now safely quarantine the slot without
+  // trying to interpret partial payload bytes.
+  if (!TryClaimKvafP8WaveFillingAdmissionFromAicore(
+          record_gm, transition_result, simt_event)) {
+    return false;
+  }
+  const bool begun = BeginKvafP8WaveFilling(
+      control, forward_control, lease, identity, record);
+  if (!begun || record == nullptr || !IsKvafP8WaveRecordValid(*record) ||
+      !PublishKvafP8WaveFillingClaimedPayloadToGm(record_gm, *record)) {
+    (void)QuarantineKvafP8WaveFillingClaimedFromAicore(
+        record_gm, transition_result, simt_event);
+    return false;
+  }
+  // State is the final admission commit edge.  No field is written after a
+  // failed CAS because the terminal worker may own the QUARANTINED record.
+  if (!TryTransitionKvafP8FillingStateFromAicore(
+          record_gm, kKvafP8WaveFillingClaimed, kKvafP8WaveFilling,
+          transition_result, simt_event)) {
+    return false;
+  }
+  KvafP8WaveRecord committed{};
+  if (!LoadKvafP8WaveRecordFromGm(record_gm, &committed) ||
+      !IsKvafP8WaveRecordValid(committed) ||
+      committed.state != kKvafP8WaveFilling ||
+      !KvafP8WaveIdentityEquals(committed.identity, identity)) {
+    return false;
+  }
+  (void)LoadKvafP8WaveRecordFromGm(record_gm, record);
+  return true;
+}
+
+__aicore__ inline bool KvafP8WaveFillingMatchesLeaseAndIdentity(
+    const KvafStreamingBatchGetControl& control,
+    const KvafP8ForwardControl& forward_control,
+    const KvafStreamingBatchGetLease& lease,
+    const KvafP8WaveIdentity& identity,
+    const KvafP8WaveRecord& record) {
+  if (!IsKvafP8WaveRecordValid(record) ||
+      record.state != kKvafP8WaveFilling ||
+      !KvafP8WaveIdentityEquals(record.identity, identity) ||
+      !IsKvafStreamingBatchGetControlValidForAicore(control) ||
+      lease.state != kStreamingBatchGetLeaseHeld || lease.owner_tag <= 0 ||
+      lease.queue_id >= control.queue_count ||
+      identity.forward_epoch == 0U || identity.queue_generation == 0U ||
+      identity.post_sequence == 0U || identity.reserved0 != 0U ||
+      identity.queue_id != lease.queue_id ||
+      identity.owner_tag != lease.owner_tag ||
+      !KvafP8ForwardControlMatchesIdentity(
+          forward_control, identity, kKvafP8ForwardPhaseAdmitPost)) {
+    return false;
+  }
+  __gm__ const int32_t* const owners =
+      reinterpret_cast<__gm__ const int32_t*>(control.queue_leases);
+  return owners != nullptr && owners[lease.queue_id] == lease.owner_tag;
+}
+
+// This is the mandatory pre-exposure edge.  It must be called and durably
+// published *before* writing descriptor scratch, private-slot records, or
+// request-ledger entries.  The marker lets a later no-work exit distinguish
+// a genuinely empty FILLING record from one whose producer was interrupted
+// after making any external state visible.
+__aicore__ inline bool ArmKvafP8WaveFillingForExternalWrites(
+    __gm__ KvafP8WaveRecord* record_gm,
+    const KvafStreamingBatchGetControl& control,
+    const KvafP8ForwardControl& forward_control,
+    const KvafStreamingBatchGetLease& lease,
+    const KvafP8WaveIdentity& identity,
+    __ubuf__ KvafP8WaveDrainClaimResult* transition_result,
+    event_t simt_event, KvafP8WaveRecord* record) {
+  if (record_gm == nullptr || record == nullptr ||
+      !LoadKvafP8WaveRecordFromGm(record_gm, record)) {
+    return false;
+  }
+  if (!KvafP8WaveFillingMatchesLeaseAndIdentity(
+          control, forward_control, lease, identity, *record) ||
+      record->reserved[1] != kKvafP8FillingNoWorkProof) {
+    if (IsKvafP8WaveRecordValid(*record) &&
+        record->state == kKvafP8WaveFilling) {
+      (void)QuarantineKvafP8FillingStateFromAicore(
+          record_gm, kKvafP8WaveFilling,
+          kKvafP8WaveOutcomeFillingQuarantined, transition_result,
+          simt_event, record);
+    }
+    return false;
+  }
+  // This one-word publish is intentionally not a full-record Store.  A
+  // racing terminal may already have changed state to QUARANTINED; writing
+  // the exposure proof does not revive it, and the later FILLING ->
+  // POST_INTENT CAS will then fail closed before any doorbell is possible.
+  record->reserved[1] = kKvafP8FillingExposureProof;
+  record_gm->reserved[1] = kKvafP8FillingExposureProof;
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  return true;
+}
+
+// A FILLING record can be returned without a HCCP drain only while the
+// durable no-work proof remains intact.  It is deliberately stronger than
+// checking `post_committed == 0`: descriptor/private/ledger bytes may have
+// been exposed without a doorbell, in which case another graph invocation
+// cannot prove they are harmless.  Those paths must quarantine instead.
+__aicore__ inline bool IsKvafP8WaveFillingStateProvenNoWork(
+    const KvafP8WaveRecord& record, uint32_t expected_state) {
+  if (!IsKvafP8WaveRecordValid(record) ||
+      (expected_state != kKvafP8WaveFilling &&
+       expected_state != kKvafP8WaveFillingReleaseClaimed) ||
+      record.state != expected_state ||
+      record.identity.forward_epoch == 0U ||
+      record.identity.queue_generation == 0U ||
+      record.identity.post_sequence == 0U || record.identity.owner_tag <= 0 ||
+      record.identity.reserved0 != 0U ||
+      record.request_count != 0U ||
+      record.outcome != kKvafP8WaveOutcomeNone ||
+      record.private_ready_published != 0U || record.post_committed != 0U ||
+      record.reserved[1] != kKvafP8FillingNoWorkProof ||
+      record.sq_producer_before != 0U || record.cq_consumer_before != 0U ||
+      record.sq_producer_after != 0U || record.cq_consumer_after != 0U ||
+      record.transaction.active_count != 0U ||
+      record.transaction.total_posts != 0U ||
+      record.transaction.failed_request != UINT64_MAX ||
+      record.transaction.last_wqe != 0U ||
+      record.transaction.first_doorbell_cycle != 0U ||
+      record.transaction.profile_start_cycle != 0U ||
+      record.transaction.profile_setup_done_cycle != 0U ||
+      record.transaction.profile_compact_done_cycle != 0U ||
+      record.transaction.profile_post_done_cycle != 0U ||
+      record.transaction.profile_completion_done_cycle != 0U ||
+      record.transaction.result != kSuccess ||
+      record.transaction.completion_polls != 0U ||
+      record.transaction.state != kDenseBatchGetIdle ||
+      record.transaction.profile_enabled != 0U ||
+      record.transaction.finalized != 0U) {
+    return false;
+  }
+  for (uint32_t index = 0U; index < 5U; ++index) {
+    if (index != 1U && record.reserved[index] != 0U) {
+      return false;
+    }
+  }
+  return true;
+}
+
+__aicore__ inline bool IsKvafP8WaveFillingProvenNoWork(
+    const KvafP8WaveRecord& record) {
+  return IsKvafP8WaveFillingStateProvenNoWork(
+      record, kKvafP8WaveFilling);
+}
+
+__aicore__ inline bool IsKvafP8WaveFillingReleaseClaimedProvenNoWork(
+    const KvafP8WaveRecord& record) {
+  return IsKvafP8WaveFillingStateProvenNoWork(
+      record, kKvafP8WaveFillingReleaseClaimed);
+}
+
+// This is the only normal pre-doorbell release endpoint.  It loads the
+// durable FILLING record, re-proves exact forward/lease ownership and the
+// no-work marker, then first CASes FILLING -> FILLING_RELEASE_CLAIMED before
+// it performs the owner-table CAS.  The second state CAS to FREE is required
+// even after a successful owner-table release: a forward-terminal sweep may
+// have quarantined the claimed record in the interim, and this helper must
+// never overwrite that durable outcome.  A failed proof or CAS is durably
+// QUARANTINED; the caller must then set the shared forward-abort gate rather
+// than treating a local `hasWave` flag as authority.
+__aicore__ inline bool ReleaseKvafP8FillingLeaseAfterProvenNoWork(
+    __gm__ const KvafStreamingBatchGetControl* control_gm,
+    const KvafP8ForwardControl& forward_control,
+    const KvafStreamingBatchGetLease& lease,
+    __ubuf__ KvafStreamingBatchGetLeaseResult* lease_result,
+    __ubuf__ KvafP8WaveDrainClaimResult* transition_result,
+    event_t simt_event, __gm__ KvafP8WaveRecord* record_gm,
+    KvafP8WaveRecord* record) {
+  if (control_gm == nullptr || lease_result == nullptr ||
+      transition_result == nullptr || record_gm == nullptr || record == nullptr ||
+      !LoadKvafP8WaveRecordFromGm(record_gm, record)) {
+    return false;
+  }
+  KvafStreamingBatchGetControl control{};
+  const KvafP8WaveIdentity identity = record->identity;
+  const bool identity_matches_forward =
+      IsKvafP8ForwardControlValid(forward_control) &&
+      forward_control.phase == kKvafP8ForwardPhaseAdmitPost &&
+      forward_control.forward_epoch == identity.forward_epoch &&
+      forward_control.graph_replay_generation ==
+          identity.graph_replay_generation &&
+      forward_control.layer_control_index == identity.layer_control_index;
+  if (!LoadKvafStreamingBatchGetControlFromGmForAicore(control_gm, &control) ||
+      !IsKvafP8WaveFillingProvenNoWork(*record) ||
+      !identity_matches_forward || lease.state != kStreamingBatchGetLeaseHeld ||
+      lease.queue_id != identity.queue_id ||
+      lease.owner_tag != identity.owner_tag ||
+      identity.queue_id >= control.queue_count) {
+    if (IsKvafP8WaveRecordValid(*record) &&
+        record->state == kKvafP8WaveFilling) {
+      (void)QuarantineKvafP8FillingStateFromAicore(
+          record_gm, kKvafP8WaveFilling,
+          kKvafP8WaveOutcomeFillingQuarantined, transition_result,
+          simt_event, record);
+    }
+    return false;
+  }
+  __gm__ const int32_t* const owners =
+      reinterpret_cast<__gm__ const int32_t*>(control.queue_leases);
+  if (owners == nullptr || owners[identity.queue_id] != identity.owner_tag) {
+    (void)QuarantineKvafP8FillingStateFromAicore(
+        record_gm, kKvafP8WaveFilling,
+        kKvafP8WaveOutcomeFillingQuarantined, transition_result,
+        simt_event, record);
+    return false;
+  }
+
+  // Claim the only normal pre-doorbell release ownership before touching the
+  // queue-owner table.  If a terminal sweep won first, this fails closed and
+  // no producer-side write is permitted afterwards.
+  if (!TryTransitionKvafP8FillingStateFromAicore(
+          record_gm, kKvafP8WaveFilling,
+          kKvafP8WaveFillingReleaseClaimed, transition_result,
+          simt_event)) {
+    return false;
+  }
+  record->state = kKvafP8WaveFillingReleaseClaimed;
+
+  // Re-load after the claim.  This proves that no terminal/quarantine state
+  // or identity mutation is hidden behind an AIC-local copy before the
+  // irreversible owner-table CAS.
+  if (!LoadKvafP8WaveRecordFromGm(record_gm, record) ||
+      !IsKvafP8WaveFillingReleaseClaimedProvenNoWork(*record) ||
+      !KvafP8WaveIdentityEquals(record->identity, identity) ||
+      !identity_matches_forward || lease.state != kStreamingBatchGetLeaseHeld ||
+      lease.queue_id != identity.queue_id ||
+      lease.owner_tag != identity.owner_tag || owners == nullptr ||
+      owners[identity.queue_id] != identity.owner_tag) {
+    (void)QuarantineKvafP8FillingStateFromAicore(
+        record_gm, kKvafP8WaveFillingReleaseClaimed,
+        kKvafP8WaveOutcomeFillingQuarantined, transition_result,
+        simt_event, record);
+    return false;
+  }
+  lease_result->queue_id = identity.queue_id;
+  lease_result->owner_tag = identity.owner_tag;
+  lease_result->success = 0U;
+  lease_result->reserved0 = 0U;
+  set_flag(PIPE_S, PIPE_V, simt_event);
+  wait_flag(PIPE_S, PIPE_V, simt_event);
+  AscendC::Simt::VF_CALL<KvafStreamingBatchGetReleaseSimtService>(
+      AscendC::Simt::Dim3{1U, 1U, 1U}, control_gm, identity.queue_id,
+      identity.owner_tag, lease_result);
+  set_flag(PIPE_V, PIPE_S, simt_event);
+  wait_flag(PIPE_V, PIPE_S, simt_event);
+  if (lease_result->success == 0U) {
+    (void)QuarantineKvafP8FillingStateFromAicore(
+        record_gm, kKvafP8WaveFillingReleaseClaimed,
+        kKvafP8WaveOutcomeReleaseCasQuarantined, transition_result,
+        simt_event, record);
+    return false;
+  }
+  // Do not full-store the local record here: a terminal worker could have
+  // changed RELEASE_CLAIMED to QUARANTINED after the owner table was cleared.
+  // Only this exact CAS may make the record reusable.
+  if (!TryTransitionKvafP8FillingStateFromAicore(
+          record_gm, kKvafP8WaveFillingReleaseClaimed,
+          kKvafP8WaveFree, transition_result, simt_event)) {
+    return false;
+  }
+  record->state = kKvafP8WaveFree;
+  record->reserved[1] = 0U;
+  return true;
 }
 
 __aicore__ inline bool SnapshotKvafP8QueueIndices(
@@ -2623,11 +4173,98 @@ __aicore__ inline bool SnapshotKvafP8QueueIndices(
   return true;
 }
 
-// Construct the durable pre-doorbell intent.  The caller must first publish
-// its descriptor scratch and candidate ledger, then store this record to GM
-// and issue a DDR barrier before calling PostKvafP8Wave.  A record left in
-// POST_INTENT after an interrupted launch is *ambiguous*: recovery must
-// quarantine its queue rather than guessing whether HCCP saw a doorbell.
+// FILLING -> POST_INTENT is the only supported P8 pre-doorbell transition.
+// `ArmKvafP8WaveFillingForExternalWrites` must already have durably changed
+// the no-work marker before the caller materializes descriptor scratch,
+// private PENDING rows, or its request ledger.  This helper reloads the GM
+// record and proves all of the following before it lets PostOnly see that
+// work:
+//   * the state is exactly FILLING;
+//   * every identity word and the held queue lease still match;
+//   * the owner table still contains the exact owner tag;
+//   * the external-write marker was durably armed; and
+//   * descriptor/private/ledger values agree on the same identity.
+//
+// Any failure after the external-write marker is visible is conservatively
+// persisted as QUARANTINED.  It must not call a no-post release helper: a
+// later terminal sweep owns cold recovery and the forward abort gate owns
+// mathematical fallback.
+__aicore__ inline bool PromoteKvafP8WaveFillingToPostIntent(
+    __gm__ KvafP8WaveRecord* record_gm,
+    const KvafStreamingBatchGetControl& control,
+    const KvafP8ForwardControl& forward_control,
+    const KvafStreamingBatchGetLease& lease,
+    const KvafP8WaveIdentity& identity, uint32_t request_count,
+    __gm__ const KvafP8PrivateRecord* private_records,
+    uint64_t private_record_count,
+    __gm__ const int64_t* request_source_offsets,
+    __gm__ const int64_t* request_object_offsets,
+    __gm__ const int32_t* request_output_indices,
+    uint32_t request_ledger_capacity,
+    __ubuf__ KvafP8WaveDrainClaimResult* transition_result,
+    event_t simt_event, KvafP8WaveRecord* record) {
+  if (record_gm == nullptr || transition_result == nullptr || record == nullptr ||
+      !LoadKvafP8WaveRecordFromGm(record_gm, record)) {
+    return false;
+  }
+  if (!KvafP8WaveFillingMatchesLeaseAndIdentity(
+          control, forward_control, lease, identity, *record) ||
+      record->reserved[1] != kKvafP8FillingExposureProof ||
+      request_count == 0U || request_count > kDenseRequestCapacity) {
+    if (IsKvafP8WaveRecordValid(*record) &&
+        record->state == kKvafP8WaveFilling) {
+      (void)QuarantineKvafP8FillingStateFromAicore(
+          record_gm, kKvafP8WaveFilling,
+          kKvafP8WaveOutcomeFillingQuarantined, transition_result,
+          simt_event, record);
+    }
+    return false;
+  }
+
+  KvafExecuteBatchGetKernelArgs args{};
+  uint32_t active_request_count = 0U;
+  if (!BuildKvafP8StreamingBatchGetQueueArgs(
+          control, lease.queue_id, identity, private_records,
+          private_record_count, &args, &active_request_count) ||
+      active_request_count != request_count ||
+      !ValidateKvafP8DescriptorPrivateLedger(
+          control, identity, private_records, private_record_count,
+          request_source_offsets, request_object_offsets,
+          request_output_indices, request_ledger_capacity, request_count) ||
+      !SnapshotKvafP8QueueIndices(args, &record->sq_producer_before,
+                                   &record->cq_consumer_before)) {
+    (void)QuarantineKvafP8FillingStateFromAicore(
+        record_gm, kKvafP8WaveFilling,
+        kKvafP8WaveOutcomeFillingQuarantined, transition_result,
+        simt_event, record);
+    return false;
+  }
+  record->request_count = request_count;
+  if (!PublishKvafP8FillingPostIntentPayloadToGm(record_gm, *record)) {
+    (void)QuarantineKvafP8FillingStateFromAicore(
+        record_gm, kKvafP8WaveFilling,
+        kKvafP8WaveOutcomeFillingQuarantined, transition_result,
+        simt_event, record);
+    return false;
+  }
+  // State publication is the final commit edge.  The payload and every
+  // descriptor/private/ledger byte are already DDR-visible; a terminal
+  // quarantine which races this CAS wins, and PostOnly is then forbidden.
+  if (!TryTransitionKvafP8FillingStateFromAicore(
+          record_gm, kKvafP8WaveFilling, kKvafP8WavePostIntent,
+          transition_result, simt_event)) {
+    return false;
+  }
+  record->reserved[1] = 0U;
+  record->state = kKvafP8WavePostIntent;
+  return true;
+}
+
+// Compatibility-only direct constructor for pre-P8 callers.  New P8 code
+// must call BeginKvafP8WaveFilling -> Publish -> ArmForExternalWrites ->
+// PromoteKvafP8WaveFillingToPostIntent so a lease is never invisible across
+// a graph replay/exception boundary.  A record left in POST_INTENT after an
+// interrupted launch is still ambiguous and must be quarantined.
 __aicore__ inline bool PrepareKvafP8WavePostIntent(
     const KvafStreamingBatchGetControl& control,
     const KvafP8ForwardControl& forward_control,
@@ -3046,6 +4683,12 @@ __aicore__ inline bool ReleaseKvafP8UnpostedWave(
         record->state == kKvafP8WavePostIntent) {
       QuarantineKvafP8WaveRecord(record,
                                   kKvafP8WaveOutcomePostIntentQuarantined);
+    }
+    if (record != nullptr && IsKvafP8WaveRecordValid(*record) &&
+        (record->state == kKvafP8WaveFilling ||
+         record->state == kKvafP8WaveFillingReleaseClaimed)) {
+      QuarantineKvafP8WaveRecord(record,
+                                  kKvafP8WaveOutcomeFillingQuarantined);
     }
     return false;
   }
