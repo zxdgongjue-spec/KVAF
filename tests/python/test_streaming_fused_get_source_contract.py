@@ -43,13 +43,22 @@ def main() -> None:
         "struct KvafP8WaveIdentity",
         "struct KvafP8WaveRecord",
         "struct KvafP8PrivateRecord",
+        "struct KvafP8ForwardControl",
+        "struct KvafP8WaveDrainClaimResult",
         "static_assert(sizeof(KvafP8WaveRecord) == 256U",
         "static_assert(sizeof(KvafP8PrivateRecord) == KVAF_P8_PRIVATE_RECORD_BYTES",
+        "LoadKvafP8ForwardControlFromGm",
+        "StoreKvafP8ForwardControlToGm",
+        "KvafP8ForwardControlMatchesIdentity",
+        "MarkKvafP8ForwardAbort",
+        "IsKvafP8PrivateViewReadyForQsfa",
         "kKvafP8WavePostIntent",
         "kKvafP8WavePosted",
+        "kKvafP8WaveDrainClaimed",
         "kKvafP8WaveCqObserved",
         "kKvafP8WaveFinalized",
         "kKvafP8WaveQuarantined",
+        "TryClaimKvafP8WaveDrainFromAicore",
         "PrepareKvafP8WavePostIntent",
         "PostKvafP8Wave",
         "TryRetireKvafP8Wave",
@@ -59,6 +68,9 @@ def main() -> None:
         "ReleaseKvafP8PrivateRecordAfterQsfaTerminal",
         "KvafP8PrivateRecordMatchesIdentity",
         "ValidateKvafP8PrivateOutputIndices",
+        "ValidateKvafP8DescriptorPrivateLedger",
+        "ValidateKvafP8PrivateTerminalPublication",
+        "PublishKvafP8PrivateTerminalRecords",
         "PublishKvafP8BatchGetDescriptorScratch",
         "BuildKvafP8StreamingBatchGetQueueArgs",
         "ReleaseKvafP8WaveAfterPrivateReady",
@@ -75,6 +87,22 @@ def main() -> None:
     assert "kCqTimeout" in p8_try_retire
     assert "kKvafP8WaveOutcomeCqTimeoutQuarantined" in p8_try_retire
     assert "record->cq_consumer_after == record->cq_consumer_before" in p8_try_retire
+    assert "record->state = kKvafP8WavePosted" in p8_try_retire
+    assert "record->reserved[0] = kKvafP8WaveCqObserved" in p8_try_retire
+
+    p8_drain_claim = _between(
+        text,
+        "__simt_callee__ inline bool TryClaimKvafP8WaveDrainFromSimt(",
+        "// P8 phase helpers",
+    )
+    for token in (
+        "asc_atomic_cas(",
+        "kKvafP8WavePosted",
+        "kKvafP8WaveDrainClaimed",
+        "TryClaimKvafP8WaveDrainFromAicore",
+        "VF_CALL<KvafP8WaveDrainClaimSimtService>",
+    ):
+        assert token in p8_drain_claim, token
 
     p8_release = _between(
         text,
@@ -84,6 +112,7 @@ def main() -> None:
     for token in (
         "record->private_ready_published == 0U",
         "kKvafP8WaveOutcomeReleaseCasQuarantined",
+        "ValidateKvafP8PrivateTerminalPublication",
         "ReleaseKvafStreamingBatchGetQueueFromAicore",
     ):
         assert token in p8_release, token
@@ -156,6 +185,21 @@ def main() -> None:
     assert "ValidateKvafP8PrivateOutputIndices" in p8_build
     assert "ValidateKvafStreamingBatchGetPrivateOutputIndices" not in p8_build
 
+    p8_ledger = _between(
+        text,
+        "__aicore__ inline bool ValidateKvafP8DescriptorPrivateLedger(",
+        "// The only P8 private-terminal publisher.",
+    )
+    for token in (
+        "request_source_offsets",
+        "request_object_offsets",
+        "request_output_indices",
+        "private_record.source_offset",
+        "private_record.object_offset",
+        "KvafP8PrivateRecordMatchesIdentity",
+    ):
+        assert token in p8_ledger, token
+
     # The durable P8 phases must all rebuild Direct-HCCP arguments through
     # the P8 validator.  Falling back to the legacy builder at even one phase
     # would either reject a legitimate globally claimed row or silently make
@@ -181,6 +225,21 @@ def main() -> None:
         phase = _between(text, start, end)
         assert "BuildKvafP8StreamingBatchGetQueueArgs" in phase
         assert "BuildKvafStreamingBatchGetQueueArgs" not in phase
+
+    p8_prepare = _between(
+        text,
+        "__aicore__ inline bool PrepareKvafP8WavePostIntent(",
+        "// Execute the one irreversible step.",
+    )
+    for token in (
+        "KvafP8ForwardControl",
+        "request_source_offsets",
+        "request_object_offsets",
+        "request_output_indices",
+        "ValidateKvafP8DescriptorPrivateLedger",
+        "kKvafP8ForwardPhaseAdmitPost",
+    ):
+        assert token in p8_prepare, token
 
     p8_unposted = _between(
         text,

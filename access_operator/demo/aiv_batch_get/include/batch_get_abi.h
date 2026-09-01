@@ -50,9 +50,9 @@ enum {
   KVAF_P8_PRIVATE_RECORD_WORDS =
       KVAF_P8_PRIVATE_RECORD_BYTES / sizeof(uint64_t),
   // A graph-stable P8 forward control is [forward_epoch,
-  // graph_replay_generation, layer_control_index, phase].  It is deliberately
-  // separate from the streaming transport control so the latter remains
-  // compatible with earlier BatchGet users.
+  // graph_replay_generation, packed(layer_control_index, phase), flags].
+  // It is deliberately separate from the streaming transport control so the
+  // latter remains compatible with earlier BatchGet users.
   KVAF_P8_FORWARD_CONTROL_WORDS = 4,
   KVAF_P8_FORWARD_CONTROL_BYTES =
       KVAF_P8_FORWARD_CONTROL_WORDS * sizeof(uint64_t),

@@ -87,6 +87,18 @@ struct KvafStreamingBatchGetLeaseResult {
 static_assert(sizeof(KvafStreamingBatchGetLeaseResult) == 16U,
               "streaming queue lease UB hand-off ABI changed");
 
+// A queue-owner lease alone does not serialize later CQ-drain graph phases:
+// several dynamic AIV tasks can all observe the same durable POSTED wave.
+// This small UB hand-off records a second CAS claim on the wave state itself.
+// It keeps ownership dynamic (any worker may drain) while making one CQ wave
+// single-consumer.
+struct KvafP8WaveDrainClaimResult {
+  uint32_t success;
+  uint32_t observed_state;
+};
+static_assert(sizeof(KvafP8WaveDrainClaimResult) == 8U,
+              "P8 drain-claim UB hand-off ABI changed");
+
 // A caller-local wave combines the leased queue-specific argument view with
 // the existing verified Direct-HCCP transaction. It is one active wave per
 // lease; the existing SQ/CQ ABI deliberately does not support multiple
@@ -125,7 +137,10 @@ struct KvafStreamingBatchGetReady {
 // `owner_tag` is retained only as the CAS ownership proof.  It is not enough
 // to identify a wave after a graph replay or a terminal recovery path.
 constexpr uint64_t kKvafP8WaveRecordMagic = 0x4B56414650385756ULL;  // "KVAFP8WV"
-constexpr uint32_t kKvafP8WaveRecordVersion = 1U;
+// Version 2 adds the forward-control and private-owner checks below.  The
+// record remains ABI-size compatible, but an old graph-stable allocation must
+// never be accepted as a current P8 transaction merely because its bytes fit.
+constexpr uint32_t kKvafP8WaveRecordVersion = 2U;
 
 enum KvafP8WaveState : uint32_t {
   // No lease, no ambiguous transport ownership.
@@ -135,15 +150,18 @@ enum KvafP8WaveState : uint32_t {
   kKvafP8WavePostIntent = 1U,
   // BeginKvafDenseBatchGetPostOnly returned InFlight; a late CQ is possible.
   kKvafP8WavePosted = 2U,
+  // Exactly one dynamic drain worker atomically owns this durable GM record.
+  // A second worker must skip rather than probe/finish/release the same CQ.
+  kKvafP8WaveDrainClaimed = 3U,
   // A CQE was observed and the transaction is eligible for Finish.
-  kKvafP8WaveCqObserved = 3U,
+  kKvafP8WaveCqObserved = 4U,
   // Finish has published the KVAF terminal status. A private READY/FAILED
   // publication may follow, but the queue cannot be reused yet.
-  kKvafP8WaveFinalized = 4U,
+  kKvafP8WaveFinalized = 5U,
   // A timeout, identity mismatch, release-CAS failure, or POST_INTENT
   // ambiguity leaves the transport non-reusable until the cold recovery path
   // proves it quiescent. Never rewrite this state to FREE in an AIV kernel.
-  kKvafP8WaveQuarantined = 5U,
+  kKvafP8WaveQuarantined = 6U,
 };
 
 enum KvafP8WaveOutcome : uint32_t {
@@ -169,6 +187,126 @@ struct KvafP8WaveIdentity {
 };
 static_assert(sizeof(KvafP8WaveIdentity) == 48U,
               "P8 wave identity ABI changed");
+
+// The runtime owns one graph-stable forward-control record per P8 layer.
+// It is deliberately tiny: it is not a ticket or an unbounded scheduler
+// ledger.  Its purpose is to let every independently launched P8 phase prove
+// that the GM wave/private record belongs to *this* forward/replay/layer
+// before it touches a Direct-HCCP queue or exposes a private HBM payload.
+//
+// `flags` is a forward-wide fail-closed gate.  When an identity, CQ or release
+// failure quarantines a wave, the executor sets ABORT|PRIVATE_VIEW_DISABLED
+// before QSFA.  Exact reconcile/GuaranteedRecall then owns the layer result;
+// QSFA must not consume even an earlier READY speculative slot from this
+// aborting forward.
+enum KvafP8ForwardPhase : uint32_t {
+  kKvafP8ForwardPhaseInvalid = 0U,
+  kKvafP8ForwardPhaseAdmitPost = 1U,
+  kKvafP8ForwardPhaseDrain = 2U,
+  kKvafP8ForwardPhaseQsfaTerminal = 3U,
+  kKvafP8ForwardPhaseForwardTerminal = 4U,
+};
+
+enum KvafP8ForwardFlags : uint64_t {
+  kKvafP8ForwardFlagNone = 0U,
+  kKvafP8ForwardFlagAbort = 1ULL << 0U,
+  kKvafP8ForwardFlagPrivateViewDisabled = 1ULL << 1U,
+  // Set by RuntimeResources only after this layer's exact Top-K *and*
+  // Guaranteed Recall are terminal.  Speculation may not make QSFA visible
+  // by setting this bit on its own.
+  kKvafP8ForwardFlagExactInputReady = 1ULL << 2U,
+  kKvafP8ForwardFlagQsfaTerminalObserved = 1ULL << 3U,
+  kKvafP8ForwardFlagModelTerminalObserved = 1ULL << 4U,
+};
+
+struct KvafP8ForwardControl {
+  uint64_t forward_epoch;
+  uint64_t graph_replay_generation;
+  uint32_t layer_control_index;
+  uint32_t phase;
+  uint64_t flags;
+};
+static_assert(sizeof(KvafP8ForwardControl) == KVAF_P8_FORWARD_CONTROL_BYTES,
+              "P8 forward control ABI changed");
+
+__aicore__ inline bool IsKvafP8ForwardControlValid(
+    const KvafP8ForwardControl& control) {
+  return control.forward_epoch != 0U &&
+         control.phase >= kKvafP8ForwardPhaseAdmitPost &&
+         control.phase <= kKvafP8ForwardPhaseForwardTerminal;
+}
+
+// P8 phases may run in distinct graph invocations.  Keep their GM/local
+// boundary explicit rather than relying on an aggregate load that AscendC
+// treats differently across address spaces.
+__aicore__ inline bool LoadKvafP8ForwardControlFromGm(
+    __gm__ const KvafP8ForwardControl* source,
+    KvafP8ForwardControl* destination) {
+  if (source == nullptr || destination == nullptr) {
+    return false;
+  }
+  destination->forward_epoch = source->forward_epoch;
+  destination->graph_replay_generation = source->graph_replay_generation;
+  destination->layer_control_index = source->layer_control_index;
+  destination->phase = source->phase;
+  destination->flags = source->flags;
+  return IsKvafP8ForwardControlValid(*destination);
+}
+
+__aicore__ inline bool StoreKvafP8ForwardControlToGm(
+    __gm__ KvafP8ForwardControl* destination,
+    const KvafP8ForwardControl& source) {
+  if (destination == nullptr || !IsKvafP8ForwardControlValid(source)) {
+    return false;
+  }
+  destination->forward_epoch = source.forward_epoch;
+  destination->graph_replay_generation = source.graph_replay_generation;
+  destination->layer_control_index = source.layer_control_index;
+  destination->phase = source.phase;
+  destination->flags = source.flags;
+  return true;
+}
+
+__aicore__ inline bool KvafP8ForwardControlMatchesIdentity(
+    const KvafP8ForwardControl& control,
+    const KvafP8WaveIdentity& identity,
+    KvafP8ForwardPhase expected_phase) {
+  return IsKvafP8ForwardControlValid(control) &&
+         control.phase == expected_phase &&
+         (control.flags & (kKvafP8ForwardFlagAbort |
+                           kKvafP8ForwardFlagPrivateViewDisabled)) == 0U &&
+         control.forward_epoch == identity.forward_epoch &&
+         control.graph_replay_generation ==
+             identity.graph_replay_generation &&
+         control.layer_control_index == identity.layer_control_index;
+}
+
+// A caller that cannot prove a wave belongs to the current forward must not
+// leave its prior READY data visible to QSFA.  This is intentionally a small
+// monotonic flag operation; cold runtime teardown owns recovery of any
+// quarantined Direct-HCCP resource.
+__aicore__ inline void MarkKvafP8ForwardAbort(
+    __gm__ KvafP8ForwardControl* control) {
+  if (control == nullptr) {
+    return;
+  }
+  control->flags |= kKvafP8ForwardFlagAbort |
+                    kKvafP8ForwardFlagPrivateViewDisabled;
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+}
+
+// The P8 private view is merely a performance input to QSFA.  It becomes
+// readable only once RuntimeResources has completed exact Top-K and the
+// Guaranteed Recall fill for this layer.  This helper deliberately has no
+// path that lets a successful speculative CQ substitute for that proof.
+__aicore__ inline bool IsKvafP8PrivateViewReadyForQsfa(
+    const KvafP8ForwardControl& control) {
+  return IsKvafP8ForwardControlValid(control) &&
+         control.phase == kKvafP8ForwardPhaseQsfaTerminal &&
+         (control.flags & (kKvafP8ForwardFlagAbort |
+                           kKvafP8ForwardFlagPrivateViewDisabled)) == 0U &&
+         (control.flags & kKvafP8ForwardFlagExactInputReady) != 0U;
+}
 
 // Keep the record exactly four cache lines.  The reserved tail is intentional:
 // P8 must not grow a variable-size device ledger when candidate bursts occur.
@@ -227,7 +365,12 @@ struct KvafP8PrivateRecord {
   uint64_t source_offset;
   uint64_t object_offset;
   int32_t output_index;
-  uint32_t reserved0;
+  // Keep the P8 private record coupled to the exact queue owner that filled
+  // it.  This reuses the old padding so the graph-stable tensor remains
+  // int64[N, 10].  `owner_tag` alone is not a complete wave identity, but it
+  // closes the otherwise missing owner check when paired with generation and
+  // post sequence.
+  int32_t owner_tag;
 };
 static_assert(sizeof(KvafP8PrivateRecord) == KVAF_P8_PRIVATE_RECORD_BYTES,
               "P8 private record ABI changed");
@@ -389,7 +532,7 @@ __aicore__ inline void ResetKvafP8PrivateRecord(
   record->source_offset = 0U;
   record->object_offset = 0U;
   record->output_index = -1;
-  record->reserved0 = 0U;
+  record->owner_tag = 0;
 }
 
 __aicore__ inline bool IsKvafP8PrivateRecordValid(
@@ -420,7 +563,7 @@ __aicore__ inline bool LoadKvafP8PrivateRecordFromGm(
   destination->source_offset = source->source_offset;
   destination->object_offset = source->object_offset;
   destination->output_index = source->output_index;
-  destination->reserved0 = source->reserved0;
+  destination->owner_tag = source->owner_tag;
   return true;
 }
 
@@ -442,7 +585,7 @@ __aicore__ inline bool StoreKvafP8PrivateRecordToGm(
   destination->source_offset = source.source_offset;
   destination->object_offset = source.object_offset;
   destination->output_index = source.output_index;
-  destination->reserved0 = source.reserved0;
+  destination->owner_tag = source.owner_tag;
   return true;
 }
 
@@ -470,6 +613,7 @@ __aicore__ inline bool PrepareKvafP8PrivateRecord(
   record->source_offset = source_offset;
   record->object_offset = object_offset;
   record->output_index = output_index;
+  record->owner_tag = identity.owner_tag;
   return true;
 }
 
@@ -486,7 +630,8 @@ __aicore__ inline bool KvafP8PrivateRecordMatchesWave(
          private_record.queue_id == wave_record.identity.queue_id &&
          private_record.queue_generation ==
              wave_record.identity.queue_generation &&
-         private_record.post_sequence == wave_record.identity.post_sequence;
+         private_record.post_sequence == wave_record.identity.post_sequence &&
+         private_record.owner_tag == wave_record.identity.owner_tag;
 }
 
 // P8 validates a candidate descriptor against the immutable identity that
@@ -504,7 +649,8 @@ __aicore__ inline bool KvafP8PrivateRecordMatchesIdentity(
          private_record.layer_control_index == identity.layer_control_index &&
          private_record.queue_id == identity.queue_id &&
          private_record.queue_generation == identity.queue_generation &&
-         private_record.post_sequence == identity.post_sequence;
+         private_record.post_sequence == identity.post_sequence &&
+         private_record.owner_tag == identity.owner_tag;
 }
 
 __aicore__ inline bool FinalizeKvafP8PrivateRecord(
@@ -528,14 +674,19 @@ __aicore__ inline bool FinalizeKvafP8PrivateRecord(
 // descriptor/CQ lifetime ended at Finalized; this record protects the HBM
 // payload and its source/object mapping independently.
 __aicore__ inline bool ReleaseKvafP8PrivateRecordAfterQsfaTerminal(
-    KvafP8PrivateRecord* private_record, uint64_t forward_epoch,
-    uint64_t graph_replay_generation, uint32_t layer_control_index) {
+    KvafP8PrivateRecord* private_record,
+    const KvafP8ForwardControl& forward_control) {
   if (private_record == nullptr || !IsKvafP8PrivateRecordValid(*private_record) ||
       (private_record->state != kKvafP8PrivateReady &&
        private_record->state != kKvafP8PrivateFailed) ||
-      private_record->forward_epoch != forward_epoch ||
-      private_record->graph_replay_generation != graph_replay_generation ||
-      private_record->layer_control_index != layer_control_index) {
+      !IsKvafP8ForwardControlValid(forward_control) ||
+      forward_control.phase != kKvafP8ForwardPhaseQsfaTerminal ||
+      !IsKvafP8PrivateViewReadyForQsfa(forward_control) ||
+      (forward_control.flags & kKvafP8ForwardFlagQsfaTerminalObserved) == 0U ||
+      private_record->forward_epoch != forward_control.forward_epoch ||
+      private_record->graph_replay_generation !=
+          forward_control.graph_replay_generation ||
+      private_record->layer_control_index != forward_control.layer_control_index) {
     if (private_record != nullptr && IsKvafP8PrivateRecordValid(*private_record)) {
       private_record->state = kKvafP8PrivateQuarantined;
     }
@@ -1181,6 +1332,194 @@ __aicore__ inline bool BuildKvafP8StreamingBatchGetQueueArgs(
   return true;
 }
 
+// A P8 caller is never allowed to invent `private_ready_published`.  This
+// bounded check ties the exact descriptor rows that Direct-HCCP received to
+// the durable private records that protect their payloads.  It is deliberately
+// outside the score loop: a wave has at most kDenseRequestCapacity rows and
+// the check happens only once after CQ terminal.
+__aicore__ inline bool ValidateKvafP8PrivateTerminalPublication(
+    const KvafStreamingBatchGetControl& control,
+    const KvafP8ForwardControl& forward_control,
+    __gm__ const KvafP8PrivateRecord* private_records,
+    uint64_t private_record_count, const KvafP8WaveRecord& record) {
+  if (!IsKvafStreamingBatchGetControlValidForAicore(control) ||
+      private_records == nullptr || private_record_count != control.output_rows ||
+      !IsKvafP8WaveRecordValid(record) ||
+      !KvafP8ForwardControlMatchesIdentity(
+          forward_control, record.identity, kKvafP8ForwardPhaseDrain) ||
+      record.state != kKvafP8WaveFinalized ||
+      record.private_ready_published == 0U ||
+      record.request_count == 0U ||
+      record.request_count > kDenseRequestCapacity ||
+      record.identity.queue_id >= control.queue_count) {
+    return false;
+  }
+  __gm__ const KvafStreamingBatchGetDescriptorScratch* const scratch =
+      GetKvafStreamingBatchGetDescriptorScratch(control,
+                                                 record.identity.queue_id);
+  KvafStreamingBatchGetDescriptorScratch descriptor{};
+  if (!LoadKvafStreamingBatchGetDescriptorScratchFromGm(scratch, &descriptor) ||
+      descriptor.output_indices == 0U ||
+      descriptor.active_request_count != record.request_count ||
+      descriptor.active_request_count == 0U ||
+      descriptor.active_request_count > descriptor.request_capacity ||
+      descriptor.request_capacity > kDenseRequestCapacity) {
+    return false;
+  }
+  __gm__ const int32_t* const output_indices =
+      reinterpret_cast<__gm__ const int32_t*>(descriptor.output_indices);
+  for (uint32_t request = 0U; request < descriptor.active_request_count;
+       ++request) {
+    const int32_t output_index = output_indices[request];
+    if (output_index < 0 ||
+        static_cast<uint64_t>(output_index) >= private_record_count) {
+      return false;
+    }
+    for (uint32_t prior = 0U; prior < request; ++prior) {
+      if (output_indices[prior] == output_index) {
+        return false;
+      }
+    }
+    KvafP8PrivateRecord private_record{};
+    if (!LoadKvafP8PrivateRecordFromGm(
+            private_records + static_cast<uint64_t>(output_index),
+            &private_record) ||
+        (private_record.state != kKvafP8PrivateReady &&
+         private_record.state != kKvafP8PrivateFailed) ||
+        !KvafP8PrivateRecordMatchesWave(private_record, record)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// The descriptor alone names an HBM output row and a table/offset.  P8 also
+// retains the source/object ledger used to construct that descriptor so a
+// self-consistent but wrong mapping cannot be posted to Direct-HCCP.  This is
+// bounded by one dense wave and is checked only at POST_INTENT.
+__aicore__ inline bool ValidateKvafP8DescriptorPrivateLedger(
+    const KvafStreamingBatchGetControl& control,
+    const KvafP8WaveIdentity& identity,
+    __gm__ const KvafP8PrivateRecord* private_records,
+    uint64_t private_record_count,
+    __gm__ const int64_t* request_source_offsets,
+    __gm__ const int64_t* request_object_offsets,
+    __gm__ const int32_t* request_output_indices,
+    uint32_t request_ledger_capacity, uint32_t request_count) {
+  if (!IsKvafStreamingBatchGetControlValidForAicore(control) ||
+      private_records == nullptr ||
+      private_record_count != control.output_rows ||
+      request_source_offsets == nullptr || request_object_offsets == nullptr ||
+      request_output_indices == nullptr || request_ledger_capacity == 0U ||
+      request_count == 0U || request_count > request_ledger_capacity ||
+      request_count > kDenseRequestCapacity || identity.queue_id >= control.queue_count) {
+    return false;
+  }
+  __gm__ const KvafStreamingBatchGetDescriptorScratch* const scratch =
+      GetKvafStreamingBatchGetDescriptorScratch(control, identity.queue_id);
+  KvafStreamingBatchGetDescriptorScratch descriptor{};
+  if (!LoadKvafStreamingBatchGetDescriptorScratchFromGm(scratch, &descriptor) ||
+      descriptor.output_indices == 0U ||
+      descriptor.active_request_count != request_count ||
+      descriptor.request_capacity < request_count) {
+    return false;
+  }
+  __gm__ const int32_t* const descriptor_output_indices =
+      reinterpret_cast<__gm__ const int32_t*>(descriptor.output_indices);
+  const uint64_t base =
+      static_cast<uint64_t>(identity.queue_id) * request_ledger_capacity;
+  for (uint32_t request = 0U; request < request_count; ++request) {
+    const int32_t output_index = descriptor_output_indices[request];
+    const int32_t ledger_output_index = request_output_indices[base + request];
+    const int64_t ledger_source_offset = request_source_offsets[base + request];
+    const int64_t ledger_object_offset = request_object_offsets[base + request];
+    if (output_index < 0 || output_index != ledger_output_index ||
+        ledger_source_offset < 0 || ledger_object_offset < 0 ||
+        static_cast<uint64_t>(output_index) >= private_record_count) {
+      return false;
+    }
+    KvafP8PrivateRecord private_record{};
+    if (!LoadKvafP8PrivateRecordFromGm(
+        private_records + static_cast<uint64_t>(output_index),
+            &private_record) ||
+        private_record.source_offset != static_cast<uint64_t>(ledger_source_offset) ||
+        private_record.object_offset != static_cast<uint64_t>(ledger_object_offset) ||
+        !KvafP8PrivateRecordMatchesIdentity(private_record, identity)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// The only P8 private-terminal publisher.  It finalizes every descriptor row
+// from the terminal CQ result, publishes those records to GM, rechecks the
+// bounded set, and only then sets `private_ready_published`.  A malformed
+// row does not become a recoverable "best effort" result: its wave is
+// quarantined by the caller and the forward disables the private P8 view.
+__aicore__ inline bool PublishKvafP8PrivateTerminalRecords(
+    const KvafStreamingBatchGetControl& control,
+    const KvafP8ForwardControl& forward_control,
+    __gm__ KvafP8PrivateRecord* private_records,
+    uint64_t private_record_count, KvafP8WaveRecord* record) {
+  if (private_records == nullptr || record == nullptr ||
+      !IsKvafP8WaveRecordValid(*record) ||
+      !KvafP8ForwardControlMatchesIdentity(
+          forward_control, record->identity, kKvafP8ForwardPhaseDrain) ||
+      record->state != kKvafP8WaveFinalized ||
+      record->request_count == 0U ||
+      record->request_count > kDenseRequestCapacity ||
+      record->identity.queue_id >= control.queue_count) {
+    return false;
+  }
+  __gm__ const KvafStreamingBatchGetDescriptorScratch* const scratch =
+      GetKvafStreamingBatchGetDescriptorScratch(control,
+                                                 record->identity.queue_id);
+  KvafStreamingBatchGetDescriptorScratch descriptor{};
+  if (!LoadKvafStreamingBatchGetDescriptorScratchFromGm(scratch, &descriptor) ||
+      descriptor.output_indices == 0U ||
+      descriptor.active_request_count != record->request_count ||
+      descriptor.active_request_count == 0U ||
+      descriptor.active_request_count > descriptor.request_capacity ||
+      descriptor.request_capacity > kDenseRequestCapacity ||
+      private_record_count != control.output_rows) {
+    return false;
+  }
+  const bool payload_ready =
+      record->outcome == kKvafP8WaveOutcomeSuccess;
+  __gm__ const int32_t* const output_indices =
+      reinterpret_cast<__gm__ const int32_t*>(descriptor.output_indices);
+  for (uint32_t request = 0U; request < descriptor.active_request_count;
+       ++request) {
+    const int32_t output_index = output_indices[request];
+    if (output_index < 0 ||
+        static_cast<uint64_t>(output_index) >= private_record_count) {
+      return false;
+    }
+    for (uint32_t prior = 0U; prior < request; ++prior) {
+      if (output_indices[prior] == output_index) {
+        return false;
+      }
+    }
+    KvafP8PrivateRecord private_record{};
+    if (!LoadKvafP8PrivateRecordFromGm(
+            private_records + static_cast<uint64_t>(output_index),
+            &private_record) ||
+        !FinalizeKvafP8PrivateRecord(&private_record, *record,
+                                      payload_ready) ||
+        !StoreKvafP8PrivateRecordToGm(
+            private_records + static_cast<uint64_t>(output_index),
+            private_record)) {
+      return false;
+    }
+  }
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  record->private_ready_published = 1U;
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  return ValidateKvafP8PrivateTerminalPublication(
+      control, forward_control, private_records, private_record_count,
+      *record);
+}
+
 // Begin a previously acquired lease. On failure it leaves the queue lease
 // held but marks the wave terminal, so the caller can release it immediately
 // through ReleaseKvafStreamingBatchGetQueue without risking an in-flight CQ.
@@ -1354,6 +1693,63 @@ __aicore__ inline bool ReleaseKvafStreamingBatchGetQueueFromAicore(
   return true;
 }
 
+// P8 has two independent ownership domains.  The queue-lease owner protects
+// descriptor/SQ/CQ memory from another producer; this CAS protects the
+// *durable wave record* from two later graph drain tasks.  It is deliberately
+// a non-blocking claim: losing workers continue score work or defer instead
+// of spinning.  A disrupted claimant leaves DRAIN_CLAIMED for forward
+// terminal recovery, which quarantines rather than guessing whether a CQ was
+// consumed.
+__simt_callee__ inline bool TryClaimKvafP8WaveDrainFromSimt(
+    __gm__ KvafP8WaveRecord* record,
+    __ubuf__ KvafP8WaveDrainClaimResult* result) {
+  if (record == nullptr || result == nullptr) {
+    return false;
+  }
+  result->success = 0U;
+  result->observed_state = kKvafP8WaveFree;
+  __gm__ int32_t* const state =
+      reinterpret_cast<__gm__ int32_t*>(&(record->state));
+  const int32_t observed = asc_atomic_cas(
+      state, static_cast<int32_t>(kKvafP8WavePosted),
+      static_cast<int32_t>(kKvafP8WaveDrainClaimed));
+  result->observed_state = static_cast<uint32_t>(observed);
+  if (observed != static_cast<int32_t>(kKvafP8WavePosted)) {
+    return false;
+  }
+  AscendC::Simt::ThreadFence();
+  result->success = 1U;
+  return true;
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(1)
+inline void KvafP8WaveDrainClaimSimtService(
+    __gm__ KvafP8WaveRecord* record,
+    __ubuf__ KvafP8WaveDrainClaimResult* result) {
+  (void)TryClaimKvafP8WaveDrainFromSimt(record, result);
+}
+
+// The caller must reload and validate the claimed GM record before touching
+// HCCP.  It must persist either POSTED (CQ still pending), FINALIZED/FREE, or
+// QUARANTINED before returning; no AIC-local `hasWave` state is authoritative.
+__aicore__ inline bool TryClaimKvafP8WaveDrainFromAicore(
+    __gm__ KvafP8WaveRecord* record,
+    __ubuf__ KvafP8WaveDrainClaimResult* result, event_t simt_event) {
+  if (record == nullptr || result == nullptr) {
+    return false;
+  }
+  result->success = 0U;
+  result->observed_state = kKvafP8WaveFree;
+  set_flag(PIPE_S, PIPE_V, simt_event);
+  wait_flag(PIPE_S, PIPE_V, simt_event);
+  AscendC::Simt::VF_CALL<KvafP8WaveDrainClaimSimtService>(
+      AscendC::Simt::Dim3{1U, 1U, 1U}, record, result);
+  set_flag(PIPE_V, PIPE_S, simt_event);
+  wait_flag(PIPE_V, PIPE_S, simt_event);
+  return result->success != 0U &&
+         result->observed_state == kKvafP8WavePosted;
+}
+
 // P8 phase helpers ---------------------------------------------------------
 //
 // A P8 executor invokes these helpers in short graph-visible phases:
@@ -1397,17 +1793,24 @@ __aicore__ inline bool SnapshotKvafP8QueueIndices(
 // quarantine its queue rather than guessing whether HCCP saw a doorbell.
 __aicore__ inline bool PrepareKvafP8WavePostIntent(
     const KvafStreamingBatchGetControl& control,
+    const KvafP8ForwardControl& forward_control,
     const KvafStreamingBatchGetLease& lease,
     const KvafP8WaveIdentity& identity, uint32_t request_count,
     __gm__ const KvafP8PrivateRecord* private_records,
     uint64_t private_record_count,
+    __gm__ const int64_t* request_source_offsets,
+    __gm__ const int64_t* request_object_offsets,
+    __gm__ const int32_t* request_output_indices,
+    uint32_t request_ledger_capacity,
     KvafP8WaveRecord* record) {
   if (record == nullptr || request_count == 0U ||
       request_count > kDenseRequestCapacity ||
       lease.state != kStreamingBatchGetLeaseHeld || lease.owner_tag <= 0 ||
       identity.owner_tag != lease.owner_tag || identity.queue_id != lease.queue_id ||
       identity.forward_epoch == 0U || identity.queue_generation == 0U ||
-      identity.post_sequence == 0U || identity.queue_id >= control.queue_count) {
+      identity.post_sequence == 0U || identity.queue_id >= control.queue_count ||
+      !KvafP8ForwardControlMatchesIdentity(
+          forward_control, identity, kKvafP8ForwardPhaseAdmitPost)) {
     if (record != nullptr) {
       ResetKvafP8WaveRecord(record, identity);
       QuarantineKvafP8WaveRecord(record, kKvafP8WaveOutcomeIdentityQuarantined);
@@ -1428,7 +1831,11 @@ __aicore__ inline bool PrepareKvafP8WavePostIntent(
   if (!BuildKvafP8StreamingBatchGetQueueArgs(
           control, lease.queue_id, identity, private_records,
           private_record_count, &args, &active_request_count) ||
-      active_request_count != request_count) {
+      active_request_count != request_count ||
+      !ValidateKvafP8DescriptorPrivateLedger(
+          control, identity, private_records, private_record_count,
+          request_source_offsets, request_object_offsets,
+          request_output_indices, request_ledger_capacity, request_count)) {
     ResetKvafP8WaveRecord(record, identity);
     QuarantineKvafP8WaveRecord(record, kKvafP8WaveOutcomeIdentityQuarantined);
     return false;
@@ -1452,6 +1859,7 @@ __aicore__ inline bool PrepareKvafP8WavePostIntent(
 // failure must drain or quarantine -- never roll back as if it was unposted.
 __aicore__ inline bool PostKvafP8Wave(
     const KvafStreamingBatchGetControl& control,
+    const KvafP8ForwardControl& forward_control,
     __gm__ const KvafP8PrivateRecord* private_records,
     uint64_t private_record_count, KvafP8WaveRecord* record) {
   if (record == nullptr || !IsKvafP8WaveRecordValid(*record) ||
@@ -1464,7 +1872,9 @@ __aicore__ inline bool PostKvafP8Wave(
   }
   const KvafP8WaveIdentity identity = record->identity;
   if (!IsKvafStreamingBatchGetControlValidForAicore(control) ||
-      identity.queue_id >= control.queue_count) {
+      identity.queue_id >= control.queue_count ||
+      !KvafP8ForwardControlMatchesIdentity(
+          forward_control, identity, kKvafP8ForwardPhaseAdmitPost)) {
     QuarantineKvafP8WaveRecord(record, kKvafP8WaveOutcomeIdentityQuarantined);
     return false;
   }
@@ -1512,17 +1922,24 @@ __aicore__ inline bool PostKvafP8Wave(
 // has published status and the caller has published private FAILED.
 __aicore__ inline bool TryRetireKvafP8Wave(
     const KvafStreamingBatchGetControl& control,
+    const KvafP8ForwardControl& forward_control,
     __gm__ const KvafP8PrivateRecord* private_records,
     uint64_t private_record_count, KvafP8WaveRecord* record) {
   if (record == nullptr || !IsKvafP8WaveRecordValid(*record) ||
-      record->state != kKvafP8WavePosted || record->post_committed == 0U) {
+      record->state != kKvafP8WaveDrainClaimed ||
+      record->post_committed == 0U) {
     return false;
   }
   const KvafP8WaveIdentity identity = record->identity;
+  __gm__ const int32_t* const owners =
+      reinterpret_cast<__gm__ const int32_t*>(control.queue_leases);
   KvafExecuteBatchGetKernelArgs args{};
   uint32_t active_request_count = 0U;
   if (!IsKvafStreamingBatchGetControlValidForAicore(control) ||
       identity.queue_id >= control.queue_count ||
+      owners == nullptr || owners[identity.queue_id] != identity.owner_tag ||
+      !KvafP8ForwardControlMatchesIdentity(
+          forward_control, identity, kKvafP8ForwardPhaseDrain) ||
       !BuildKvafP8StreamingBatchGetQueueArgs(
           control, identity.queue_id, identity, private_records,
           private_record_count, &args, &active_request_count) ||
@@ -1534,6 +1951,9 @@ __aicore__ inline bool TryRetireKvafP8Wave(
   (void)SnapshotKvafP8QueueIndices(args, &record->sq_producer_after,
                                     &record->cq_consumer_after);
   if (record->transaction.state == kDenseBatchGetInFlight) {
+    // The caller persists POSTED before returning.  That is the only normal
+    // hand-off back to another dynamic drain worker after this CAS claim.
+    record->state = kKvafP8WavePosted;
     return false;
   }
   if (record->transaction.state == kDenseBatchGetFailed &&
@@ -1546,7 +1966,11 @@ __aicore__ inline bool TryRetireKvafP8Wave(
   if (record->transaction.state == kDenseBatchGetRetired ||
       (record->transaction.state == kDenseBatchGetFailed &&
        record->cq_consumer_after != record->cq_consumer_before)) {
-    record->state = kKvafP8WaveCqObserved;
+    // Keep the durable drain claim through Finish/private publication.  The
+    // terminal CQ fact is represented by the verified transaction and this
+    // diagnostic marker; changing state to a freely callable CQ_OBSERVED
+    // value would let a second worker finish/release a wave it never claimed.
+    record->reserved[0] = kKvafP8WaveCqObserved;
     return true;
   }
   QuarantineKvafP8WaveRecord(record, kKvafP8WaveOutcomeIdentityQuarantined);
@@ -1559,19 +1983,24 @@ __aicore__ inline bool TryRetireKvafP8Wave(
 // later final read gates only private-slot reuse, not queue reuse.
 __aicore__ inline bool FinishKvafP8Wave(
     const KvafStreamingBatchGetControl& control,
+    const KvafP8ForwardControl& forward_control,
     __gm__ const KvafP8PrivateRecord* private_records,
     uint64_t private_record_count, KvafP8WaveRecord* record) {
   if (record == nullptr || !IsKvafP8WaveRecordValid(*record) ||
-      (record->state != kKvafP8WavePosted &&
-       record->state != kKvafP8WaveCqObserved) ||
+      record->state != kKvafP8WaveDrainClaimed ||
       record->post_committed == 0U) {
     return false;
   }
   const KvafP8WaveIdentity identity = record->identity;
+  __gm__ const int32_t* const owners =
+      reinterpret_cast<__gm__ const int32_t*>(control.queue_leases);
   KvafExecuteBatchGetKernelArgs args{};
   uint32_t active_request_count = 0U;
   if (!IsKvafStreamingBatchGetControlValidForAicore(control) ||
       identity.queue_id >= control.queue_count ||
+      owners == nullptr || owners[identity.queue_id] != identity.owner_tag ||
+      !KvafP8ForwardControlMatchesIdentity(
+          forward_control, identity, kKvafP8ForwardPhaseDrain) ||
       !BuildKvafP8StreamingBatchGetQueueArgs(
           control, identity.queue_id, identity, private_records,
           private_record_count, &args, &active_request_count) ||
@@ -1579,8 +2008,8 @@ __aicore__ inline bool FinishKvafP8Wave(
     QuarantineKvafP8WaveRecord(record, kKvafP8WaveOutcomeIdentityQuarantined);
     return false;
   }
-  if (record->state == kKvafP8WavePosted) {
-    (void)TryRetireKvafP8Wave(control, private_records,
+  if (record->transaction.state == kDenseBatchGetInFlight) {
+    (void)TryRetireKvafP8Wave(control, forward_control, private_records,
                                private_record_count, record);
   }
   if (record->state == kKvafP8WaveQuarantined) {
@@ -1594,7 +2023,9 @@ __aicore__ inline bool FinishKvafP8Wave(
     }
     return false;
   }
-  if (record->state != kKvafP8WaveCqObserved) {
+  if (record->state != kKvafP8WaveDrainClaimed ||
+      (record->transaction.state != kDenseBatchGetRetired &&
+       record->transaction.state != kDenseBatchGetFailed)) {
     return false;
   }
   FinishKvafDenseBatchGet(args, &record->transaction);
@@ -1618,6 +2049,9 @@ __aicore__ inline bool FinishKvafP8Wave(
 // until the QSFA terminal phase proves their last read is complete.
 __aicore__ inline bool ReleaseKvafP8WaveAfterPrivateReady(
     __gm__ const KvafStreamingBatchGetControl* control_gm,
+    const KvafP8ForwardControl& forward_control,
+    __gm__ const KvafP8PrivateRecord* private_records,
+    uint64_t private_record_count,
     __ubuf__ KvafStreamingBatchGetLeaseResult* lease_result,
     event_t simt_event, KvafP8WaveRecord* record) {
   if (control_gm == nullptr || lease_result == nullptr || record == nullptr ||
@@ -1625,7 +2059,18 @@ __aicore__ inline bool ReleaseKvafP8WaveAfterPrivateReady(
       record->state != kKvafP8WaveFinalized ||
       record->post_committed == 0U ||
       record->private_ready_published == 0U ||
-      record->transaction.finalized == 0U) {
+      record->transaction.finalized == 0U ||
+      !KvafP8ForwardControlMatchesIdentity(
+          forward_control, record->identity, kKvafP8ForwardPhaseDrain)) {
+    return false;
+  }
+  KvafStreamingBatchGetControl control{};
+  if (!LoadKvafStreamingBatchGetControlFromGmForAicore(control_gm, &control) ||
+      !ValidateKvafP8PrivateTerminalPublication(
+          control, forward_control, private_records, private_record_count,
+          *record)) {
+    QuarantineKvafP8WaveRecord(record,
+                                kKvafP8WaveOutcomeIdentityQuarantined);
     return false;
   }
   KvafStreamingBatchGetWave wave{};
@@ -1651,12 +2096,15 @@ __aicore__ inline bool ReleaseKvafP8WaveAfterPrivateReady(
 // crossed the hardware visibility boundary without updating post_committed.
 __aicore__ inline bool ReleaseKvafP8UnpostedWave(
     __gm__ const KvafStreamingBatchGetControl* control_gm,
+    const KvafP8ForwardControl& forward_control,
     __ubuf__ KvafStreamingBatchGetLeaseResult* lease_result,
     event_t simt_event, KvafP8WaveRecord* record) {
   if (control_gm == nullptr || lease_result == nullptr || record == nullptr ||
       !IsKvafP8WaveRecordValid(*record) || record->post_committed != 0U ||
       record->state != kKvafP8WaveFinalized ||
-      record->outcome != kKvafP8WaveOutcomePostRejected) {
+      record->outcome != kKvafP8WaveOutcomePostRejected ||
+      !KvafP8ForwardControlMatchesIdentity(
+          forward_control, record->identity, kKvafP8ForwardPhaseDrain)) {
     if (record != nullptr && IsKvafP8WaveRecordValid(*record) &&
         record->state == kKvafP8WavePostIntent) {
       QuarantineKvafP8WaveRecord(record,
