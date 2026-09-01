@@ -15,7 +15,7 @@ readonly test_program="$root_dir/tests/python/test_cpu_runtime_npu_hbm.py"
   exit 1
 }
 
-: "${KVAF_NPU_SERVICE_ADDR:=127.0.0.1:28999}"
+: "${KVAF_NPU_SERVICE_ADDR:=${KVAF_CPU_SERVICE_ADDR:-127.0.0.1:28999}}"
 : "${DEVICE_ID:=0}"
 export KVAF_NPU_SERVICE_ADDR DEVICE_ID
 export PYTHONPATH="$build_dir/python${PYTHONPATH:+:$PYTHONPATH}"

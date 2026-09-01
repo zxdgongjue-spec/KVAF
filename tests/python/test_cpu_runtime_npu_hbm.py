@@ -18,7 +18,8 @@ def main() -> int:
         print("SKIP: CPU Runtime Python binding was not built")
         return 0
 
-    peer = os.environ.get("KVAF_NPU_SERVICE_ADDR", "127.0.0.1:28999")
+    peer = (os.environ.get("KVAF_NPU_SERVICE_ADDR") or
+            os.environ.get("KVAF_CPU_SERVICE_ADDR") or "127.0.0.1:28999")
     device_id = int(os.environ.get("DEVICE_ID", "0"))
     eid_index = os.environ.get("EID_INDEX")
     hbm_bytes = int(os.environ.get("KVAF_HBM_BYTES", "16384"))
