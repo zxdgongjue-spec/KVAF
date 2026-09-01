@@ -492,6 +492,29 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
   profiles->reserve(statuses.size());
   for (const KvafBatchGetCoreStatus& status : statuses) {
     const KvafBatchGetCoreProfile& source = status.profile;
+    const bool fill_copy_sum_overflows =
+        source.wqe_fill_cycles > std::numeric_limits<std::uint64_t>::max() -
+                                     source.sq_copy_cycles;
+    const std::uint64_t fill_copy_cycles =
+        fill_copy_sum_overflows
+            ? 0U
+            : source.wqe_fill_cycles + source.sq_copy_cycles;
+    const bool serial_stage_sum_overflows =
+        fill_copy_sum_overflows ||
+        fill_copy_cycles > std::numeric_limits<std::uint64_t>::max() -
+                               source.doorbell_cycles;
+    const std::uint64_t serial_stage_cycles =
+        serial_stage_sum_overflows
+            ? 0U
+            : fill_copy_cycles + source.doorbell_cycles;
+    const std::uint64_t post_cycles =
+        source.post_done_cycle >= source.compact_done_cycle
+            ? source.post_done_cycle - source.compact_done_cycle
+            : 0U;
+    const bool invalid_serial_stages =
+        serial_stage_sum_overflows ||
+        source.post_done_cycle < source.compact_done_cycle ||
+        serial_stage_cycles > post_cycles;
     const bool invalid_doorbell =
         (source.first_doorbell_cycle != 0U &&
          (source.first_doorbell_cycle < source.compact_done_cycle ||
@@ -508,7 +531,7 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
         source.compact_done_cycle > source.post_done_cycle ||
         source.post_done_cycle > source.completion_done_cycle ||
         source.completion_done_cycle > source.kernel_finish_cycle ||
-        invalid_doorbell) {
+        invalid_doorbell || invalid_serial_stages) {
       profiles->clear();
       return Internal("BatchGet kernel returned an invalid profile timeline");
     }
@@ -529,6 +552,9 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
       destination.jetty_completion_polls[jetty] =
           source.jetty_completion_polls[jetty];
     }
+    destination.wqe_fill_cycles = source.wqe_fill_cycles;
+    destination.sq_copy_cycles = source.sq_copy_cycles;
+    destination.doorbell_cycles = source.doorbell_cycles;
     profiles->push_back(destination);
   }
   return Status::OK();

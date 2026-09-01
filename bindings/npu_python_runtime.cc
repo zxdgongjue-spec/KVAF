@@ -389,6 +389,9 @@ class NpuRuntime final {
       item["jetty_completion_wait_cycles"] =
           profile.jetty_completion_wait_cycles;
       item["jetty_completion_polls"] = profile.jetty_completion_polls;
+      item["wqe_fill_cycles"] = profile.wqe_fill_cycles;
+      item["sq_copy_cycles"] = profile.sq_copy_cycles;
+      item["doorbell_cycles"] = profile.doorbell_cycles;
       result.append(std::move(item));
     }
     return result;

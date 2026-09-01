@@ -43,7 +43,13 @@ typedef struct KvafBatchGetCoreProfile {
   uint64_t total_posts;
   uint64_t jetty_completion_wait_cycles[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE];
   uint64_t jetty_completion_polls[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE];
-  uint64_t reserved[26];
+  // Accumulated stage durations for the serial, no-pipeline kernel. These
+  // counters split the legacy compact_done -> post_done interval without
+  // changing the 320-byte profile ABI. They are zero when profiling is off.
+  uint64_t wqe_fill_cycles;
+  uint64_t sq_copy_cycles;
+  uint64_t doorbell_cycles;
+  uint64_t reserved[23];
 } KvafBatchGetCoreProfile;
 
 // Keep the historical 384-byte stride even though ExecuteBatchGet uses only

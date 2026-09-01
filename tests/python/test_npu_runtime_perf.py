@@ -88,6 +88,10 @@ def print_kernel_profile(
         "kernel_setup": [],
         "kernel_compact": [],
         "kernel_post": [],
+        "kernel_wqe_fill": [],
+        "kernel_sq_copy": [],
+        "kernel_doorbell": [],
+        "kernel_post_overhead": [],
         "kernel_transfer_window": [],
         "kernel_completion_wait": [],
         "kernel_finalize": [],
@@ -98,6 +102,10 @@ def print_kernel_profile(
             "setup_ms": 0.0,
             "compact_ms": 0.0,
             "post_ms": 0.0,
+            "wqe_fill_ms": 0.0,
+            "sq_copy_ms": 0.0,
+            "doorbell_ms": 0.0,
+            "post_overhead_ms": 0.0,
             "completion_wait_ms": 0.0,
             "finalize_ms": 0.0,
             "active_requests": 0.0,
@@ -121,6 +129,10 @@ def print_kernel_profile(
             "kernel_setup": 0.0,
             "kernel_compact": 0.0,
             "kernel_post": 0.0,
+            "kernel_wqe_fill": 0.0,
+            "kernel_sq_copy": 0.0,
+            "kernel_doorbell": 0.0,
+            "kernel_post_overhead": 0.0,
             "kernel_transfer_window": 0.0,
             "kernel_completion_wait": 0.0,
             "kernel_finalize": 0.0,
@@ -137,6 +149,10 @@ def print_kernel_profile(
             finalize = elapsed_ms(
                 profile, "completion_done_cycle", "kernel_finish_cycle"
             )
+            wqe_fill = int(profile["wqe_fill_cycles"]) / clock_mhz / 1000.0
+            sq_copy = int(profile["sq_copy_cycles"]) / clock_mhz / 1000.0
+            doorbell = int(profile["doorbell_cycles"]) / clock_mhz / 1000.0
+            post_overhead = max(0.0, post - wqe_fill - sq_copy - doorbell)
             first_doorbell = int(profile["first_doorbell_cycle"])
             transfer = (
                 0.0
@@ -149,6 +165,18 @@ def print_kernel_profile(
             critical["kernel_setup"] = max(critical["kernel_setup"], setup)
             critical["kernel_compact"] = max(critical["kernel_compact"], compact)
             critical["kernel_post"] = max(critical["kernel_post"], post)
+            critical["kernel_wqe_fill"] = max(
+                critical["kernel_wqe_fill"], wqe_fill
+            )
+            critical["kernel_sq_copy"] = max(
+                critical["kernel_sq_copy"], sq_copy
+            )
+            critical["kernel_doorbell"] = max(
+                critical["kernel_doorbell"], doorbell
+            )
+            critical["kernel_post_overhead"] = max(
+                critical["kernel_post_overhead"], post_overhead
+            )
             critical["kernel_transfer_window"] = max(
                 critical["kernel_transfer_window"], transfer
             )
@@ -163,6 +191,10 @@ def print_kernel_profile(
             accumulator["setup_ms"] += setup
             accumulator["compact_ms"] += compact
             accumulator["post_ms"] += post
+            accumulator["wqe_fill_ms"] += wqe_fill
+            accumulator["sq_copy_ms"] += sq_copy
+            accumulator["doorbell_ms"] += doorbell
+            accumulator["post_overhead_ms"] += post_overhead
             accumulator["completion_wait_ms"] += completion
             accumulator["finalize_ms"] += finalize
             accumulator["active_requests"] += int(profile["active_requests"])
@@ -181,8 +213,10 @@ def print_kernel_profile(
         "KERNEL_PROFILE_CONTRACT "
         f"clock_mhz={clock_mhz} unit=ms samples={len(samples)} "
         f"aiv_cores={npu_core_count} jettys_per_core={jettys_per_core} "
+        "schedule=serial_stages_no_overlap wqe_fill=simt_32_lanes "
+        "sq_copy=waited_mte3 doorbell=per_post_after_sq_copy "
         "setup=entity_queue_and_miss_count compact=removed_direct_prefix "
-        "post=wqe_fill_sq_copy_and_doorbell "
+        "post=wqe_fill_plus_sq_copy_plus_doorbell_plus_loop_overhead "
         "transfer_window=first_doorbell_to_all_cq_complete "
         "completion_wait=cq_poll_until_udma_complete "
         "profile_overhead_included=1 d2h_outside_host_metric=1"
