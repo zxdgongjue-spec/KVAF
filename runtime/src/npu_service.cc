@@ -4,7 +4,9 @@
 #include <urma_api.h>
 #include <dlfcn.h>
 #include <sys/socket.h>
+#include <sys/file.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #include <array>
 #include <cerrno>
@@ -97,6 +99,39 @@ bool ParseEidHex(const std::string& text, direct_hccp::Eid* eid) {
   return true;
 }
 
+bool ReadPairInfoEid(std::uint32_t physical, direct_hccp::Eid* eid) {
+  constexpr char kDevPath[] = "/proc/asdrv_ub/dev_id";
+  constexpr char kPairPath[] = "/proc/asdrv_ub/pair_info";
+  constexpr char kLockPath[] = "/tmp/kvaf_npu_runtime_asdrv_ub.lock";
+  const int lock_fd = open(kLockPath, O_CREAT | O_RDWR, 0600);
+  if (lock_fd < 0 || flock(lock_fd, LOCK_EX) != 0) {
+    if (lock_fd >= 0) close(lock_fd);
+    return false;
+  }
+  bool found = false;
+  { std::ofstream selector(kDevPath); if (selector.is_open()) {
+      selector << physical << '\n'; selector.close(); std::ifstream input(kPairPath);
+      std::string line; bool selected = false, active = false; std::uint32_t active_count = 0, eid_count = 0;
+      while (std::getline(input, line)) {
+        if (line.find("Dev id info.") != std::string::npos) {
+          selected = line.find("dev_id=" + std::to_string(physical) + ";") != std::string::npos;
+          active = false; continue;
+        }
+        if (!selected) continue;
+        if (line.find("chan_id=") != std::string::npos) {
+          active = line.find("flag=1") != std::string::npos; if (active) ++active_count; continue;
+        }
+        const std::size_t pos = line.find("remote_eid:");
+        if (!active || pos == std::string::npos) continue;
+        std::string compact;
+        for (unsigned char c : line.substr(pos + 11U)) if (std::isxdigit(c)) compact.push_back(static_cast<char>(c));
+        if (ParseEidHex(compact, eid)) ++eid_count;
+      }
+      found = selected && active_count == 1U && eid_count == 1U;
+    }}
+  (void)flock(lock_fd, LOCK_UN); close(lock_fd); return found;
+}
+
 bool DiscoverNpuEid(std::uint32_t physical, std::uint32_t index,
                     direct_hccp::Eid* eid) {
   const char* configured = std::getenv("KVAF_HCCL_ROOTINFO_PATH");
@@ -138,9 +173,8 @@ bool DiscoverNpuEid(std::uint32_t physical, std::uint32_t index,
     if (ParseEidHex(line.substr(first + 1U, second - first - 1U), &candidate)) candidates.push_back(candidate);
     expect_addr = false;
   }
-  if (!found_device || index >= candidates.size()) return false;
-  *eid = candidates[index];
-  return true;
+  if (found_device && index < candidates.size()) { *eid = candidates[index]; return true; }
+  return ReadPairInfoEid(physical, eid);
 }
 
 }  // namespace
