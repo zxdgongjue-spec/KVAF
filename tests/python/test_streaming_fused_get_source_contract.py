@@ -45,12 +45,17 @@ def main() -> None:
         "struct KvafP8PrivateRecord",
         "struct KvafP8ForwardControl",
         "struct KvafP8WaveDrainClaimResult",
+        "struct KvafP8ForwardAbortResult",
+        "struct KvafP8PrivateReleaseResult",
+        "struct KvafP8ForwardTerminalResult",
         "static_assert(sizeof(KvafP8WaveRecord) == 256U",
         "static_assert(sizeof(KvafP8PrivateRecord) == KVAF_P8_PRIVATE_RECORD_BYTES",
         "LoadKvafP8ForwardControlFromGm",
         "StoreKvafP8ForwardControlToGm",
         "KvafP8ForwardControlMatchesIdentity",
         "MarkKvafP8ForwardAbort",
+        "MarkKvafP8ForwardAbortFromSimt",
+        "MarkKvafP8ForwardAbortFromAicore",
         "IsKvafP8PrivateViewReadyForQsfa",
         "kKvafP8WavePostIntent",
         "kKvafP8WavePosted",
@@ -66,6 +71,14 @@ def main() -> None:
         "PrepareKvafP8PrivateRecord",
         "FinalizeKvafP8PrivateRecord",
         "ReleaseKvafP8PrivateRecordAfterQsfaTerminal",
+        "TryClaimKvafP8PrivateReleaseFromSimt",
+        "TryClaimKvafP8PrivateReleaseFromAicore",
+        "ClearKvafP8PrivateMappingsFromSimt",
+        "ClearKvafP8PrivateMappingsFromAicore",
+        "CommitKvafP8PrivateReleaseFromSimt",
+        "CommitKvafP8PrivateReleaseFromAicore",
+        "QuarantineKvafP8WaveAtForwardTerminal",
+        "QuarantineKvafP8PrivateAtForwardTerminal",
         "KvafP8PrivateRecordMatchesIdentity",
         "ValidateKvafP8PrivateOutputIndices",
         "ValidateKvafP8DescriptorPrivateLedger",
@@ -104,6 +117,26 @@ def main() -> None:
     ):
         assert token in p8_drain_claim, token
 
+    p8_abort = _between(
+        text,
+        "__simt_callee__ inline bool MarkKvafP8ForwardAbortFromSimt(",
+        "// Forward-terminal owns a record",
+    )
+    for token in (
+        "asc_atomic_cas(",
+        "kKvafP8ForwardAbortLowMask",
+        "AscendC::Simt::ThreadFence()",
+        "MarkKvafP8ForwardAbortFromAicore",
+        "VF_CALL<KvafP8ForwardAbortSimtService>",
+        "Compatibility-only helper",
+    ):
+        assert token in p8_abort, token
+    # A regular GM OR remains only as a documented compatibility/setup API;
+    # the P8 executor must use the SIMT-backed AIC entry point.
+    assert p8_abort.index("MarkKvafP8ForwardAbortFromAicore") < p8_abort.index(
+        "Compatibility-only helper"
+    )
+
     p8_release = _between(
         text,
         "__aicore__ inline bool ReleaseKvafP8WaveAfterPrivateReady(",
@@ -131,11 +164,59 @@ def main() -> None:
         "kKvafP8PrivatePending",
         "kKvafP8PrivateReady",
         "kKvafP8PrivateFailed",
+        "kKvafP8PrivateReleaseClaimed",
         "KvafP8PrivateRecordMatchesWave",
         "ReleaseKvafP8PrivateRecordAfterQsfaTerminal",
         "private_record->state = kKvafP8PrivateQuarantined",
     ):
         assert token in p8_private, token
+
+    p8_private_release = _between(
+        text,
+        "__simt_callee__ inline bool TryClaimKvafP8PrivateReleaseFromSimt(",
+        "// -------------------------------------------------------------------------\n// Forward-terminal fail-closed sweep",
+    )
+    for token in (
+        "kKvafP8PrivateReady",
+        "kKvafP8PrivateFailed",
+        "kKvafP8PrivateReleaseClaimed",
+        "asc_atomic_cas(",
+        "ClearKvafP8PrivateMappingsFromSimt",
+        "ClearKvafP8PrivateMappingsFromAicore",
+        "CommitKvafP8PrivateReleaseFromSimt",
+        "CommitKvafP8PrivateReleaseFromAicore",
+        "private_ready[private_ready_index]",
+        "static_cast<int32_t>(result->observed_state)",
+        "Map entries are now proven absent",
+    ):
+        assert token in p8_private_release, token
+    # The compatibility-local helper is deliberately not allowed to reset a
+    # private record to FREE before the GM mapping CAS evidence exists.
+    compat_release = _between(
+        text,
+        "__aicore__ inline bool ReleaseKvafP8PrivateRecordAfterQsfaTerminal(\n    KvafP8PrivateRecord*",
+        "// SIMT-side ownership claim",
+    )
+    assert "ResetKvafP8PrivateRecord(private_record)" not in compat_release
+    assert "kKvafP8PrivateReleaseClaimed" in compat_release
+
+    p8_terminal = _between(
+        text,
+        "// Forward-terminal fail-closed sweep",
+        "// AscendC treats GM and local memory",
+    )
+    for token in (
+        "QuarantineKvafP8WaveAtForwardTerminal",
+        "QuarantineKvafP8PrivateAtForwardTerminal",
+        "TryQuarantineKvafP8WaveFromSimt",
+        "TryQuarantineKvafP8PrivateFromSimt",
+        "kKvafP8WaveOutcomeForwardTerminalQuarantined",
+        "kKvafP8WaveQuarantined",
+        "kKvafP8PrivateQuarantined",
+        "sweep quarantines the bounded resources",
+    ):
+        assert token in p8_terminal, token
+    assert "ReleaseKvafStreamingBatchGetQueueFromAicore" not in p8_terminal
 
     # P8 must not weaken the existing streaming range guard globally.  Legacy
     # callers remain queue-private; only the P8 helper may select an absolute
