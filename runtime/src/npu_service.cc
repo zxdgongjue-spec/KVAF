@@ -2,6 +2,7 @@
 
 #include <acl/acl.h>
 #include <urma_api.h>
+#include <dlfcn.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -11,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 #include "direct_hccp/direct_hccp_remote_transport.h"
 #include "direct_hccp/direct_hccp_session.h"
@@ -75,6 +77,20 @@ struct HbmRegion {
   void* peer_target_jetty{nullptr};
 };
 
+// RA exposes the NPU EID list through symbols that are not present in the
+// public Direct-HCCP header. The first field is the same 16-byte EID used by
+// CtxInitAttr; the remaining provider metadata is intentionally opaque.
+struct RaEidInfo {
+  direct_hccp::Eid eid{};
+  std::uint32_t reserved[4]{};
+};
+struct RaInfo {
+  std::int32_t mode{0};
+  std::uint32_t phy_id{0};
+};
+using GetEidNumFn = int (*)(RaInfo, std::uint32_t*);
+using GetEidListFn = int (*)(RaInfo, RaEidInfo*, std::uint32_t*);
+
 }  // namespace
 
 struct NpuService::Impl {
@@ -96,6 +112,20 @@ struct NpuService::Impl {
     direct_hccp::CtxInitAttr attr{};
     attr.phy_id = physical_device_id;
     attr.ub.eid_index = options.eid_index;
+    auto get_eid_num = reinterpret_cast<GetEidNumFn>(dlsym(api.library, "RaGetDevEidInfoNum"));
+    auto get_eid_list = reinterpret_cast<GetEidListFn>(dlsym(api.library, "RaGetDevEidInfoList"));
+    if (get_eid_num == nullptr || get_eid_list == nullptr)
+      return Status::NotImplemented("Direct-HCCP EID discovery symbols are unavailable");
+    RaInfo ra_info{static_cast<std::int32_t>(direct_hccp::kOfflineHdc), physical_device_id};
+    std::uint32_t eid_count = 0U;
+    if (get_eid_num(ra_info, &eid_count) != 0 || eid_count == 0U)
+      return Status::NotFound("NPU service found no HDC EID candidates");
+    std::vector<RaEidInfo> eid_list(eid_count);
+    if (get_eid_list(ra_info, eid_list.data(), &eid_count) != 0 ||
+        options.eid_index >= eid_count)
+      return Status::InvalidArgument("NPU service eid-index is outside the discovered EID list");
+    std::memcpy(attr.ub.eid.raw, eid_list[options.eid_index].eid.raw,
+                sizeof(attr.ub.eid.raw));
     if (api.ctx_init(&cfg, &attr, &context) != 0 || context == nullptr)
       return Status::Internal("RaCtxInit failed");
     initialized = true;
