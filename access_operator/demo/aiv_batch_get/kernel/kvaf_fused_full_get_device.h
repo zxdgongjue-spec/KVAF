@@ -1774,6 +1774,38 @@ inline void KvafP8PrivateForwardTerminalSimtService(
 constexpr int32_t kKvafP8PrivateDirectoryUnmapped = -1;
 constexpr int32_t kKvafP8PrivateDirectoryClaiming = -2;
 
+// The ALLOCATING terminal path rolls back only transient -2 directory
+// claims.  It runs after the private-record state has already transitioned to
+// QUARANTINED, so this remains deliberately best-effort: a missing/changed
+// entry is left unavailable rather than being repaired or reused.  Crucially,
+// the two GM CAS operations belong to a SIMT callee.  CANN's MIX compiler
+// exposes asc_atomic_cas only in that address-space/domain; calling it from
+// the AIC wrapper below either selects the UB overload or fails name lookup.
+__simt_callee__ inline void
+RollbackKvafP8PrivateAllocatingDirectoryClaimsFromSimt(
+    __gm__ int32_t* source_to_slot, __gm__ int32_t* object_to_slot,
+    uint64_t source_offset, uint64_t object_offset) {
+  if (source_to_slot != nullptr) {
+    (void)asc_atomic_cas(source_to_slot + source_offset,
+                         kKvafP8PrivateDirectoryClaiming,
+                         kKvafP8PrivateDirectoryUnmapped);
+  }
+  if (object_to_slot != nullptr) {
+    (void)asc_atomic_cas(object_to_slot + object_offset,
+                         kKvafP8PrivateDirectoryClaiming,
+                         kKvafP8PrivateDirectoryUnmapped);
+  }
+  AscendC::Simt::ThreadFence();
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(1)
+inline void KvafP8PrivateAllocatingDirectoryRollbackSimtService(
+    __gm__ int32_t* source_to_slot, __gm__ int32_t* object_to_slot,
+    uint64_t source_offset, uint64_t object_offset) {
+  RollbackKvafP8PrivateAllocatingDirectoryClaimsFromSimt(
+      source_to_slot, object_to_slot, source_offset, object_offset);
+}
+
 __aicore__ inline bool QuarantineKvafP8PrivateAllocatingAtForwardTerminal(
     __gm__ KvafP8PrivateRecord* record_gm,
     const KvafP8ForwardControl& forward_control,
@@ -1818,15 +1850,15 @@ __aicore__ inline bool QuarantineKvafP8PrivateAllocatingAtForwardTerminal(
       after.graph_replay_generation ==
           forward_control.graph_replay_generation &&
       after.layer_control_index == forward_control.layer_control_index) {
-    if (source_to_slot != nullptr) {
-      (void)asc_atomic_cas(source_to_slot + after.source_offset,
-                           kKvafP8PrivateDirectoryClaiming,
-                           kKvafP8PrivateDirectoryUnmapped);
-    }
-    if (object_to_slot != nullptr) {
-      (void)asc_atomic_cas(object_to_slot + after.object_offset,
-                           kKvafP8PrivateDirectoryClaiming,
-                           kKvafP8PrivateDirectoryUnmapped);
+    if (source_to_slot != nullptr || object_to_slot != nullptr) {
+      set_flag(PIPE_S, PIPE_V, simt_event);
+      wait_flag(PIPE_S, PIPE_V, simt_event);
+      AscendC::Simt::VF_CALL<
+          KvafP8PrivateAllocatingDirectoryRollbackSimtService>(
+          AscendC::Simt::Dim3{1U, 1U, 1U}, source_to_slot, object_to_slot,
+          after.source_offset, after.object_offset);
+      set_flag(PIPE_V, PIPE_S, simt_event);
+      wait_flag(PIPE_V, PIPE_S, simt_event);
     }
   }
   private_ready[private_ready_index] = static_cast<int32_t>(

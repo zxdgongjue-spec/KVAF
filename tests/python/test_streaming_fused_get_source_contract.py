@@ -415,6 +415,40 @@ def main() -> None:
         assert token in p8_terminal, token
     assert "ReleaseKvafStreamingBatchGetQueueFromAicore" not in p8_terminal
 
+    # CANN MIX exposes GM atomic CAS through the SIMT callable domain.  The
+    # ALLOCATING terminal path used to issue its two directory CAS operations
+    # from an AIC helper, which compiles as an illegal UB-pointer overload.
+    # Keep the rollback best-effort but require the same VF_CALL boundary as
+    # every other P8 GM atomic transition.
+    p8_allocating_rollback_simt = _between(
+        text,
+        "__simt_callee__ inline void\n"
+        "RollbackKvafP8PrivateAllocatingDirectoryClaimsFromSimt(",
+        "__aicore__ inline bool QuarantineKvafP8PrivateAllocatingAtForwardTerminal(",
+    )
+    for token in (
+        "asc_atomic_cas(",
+        "source_to_slot + source_offset",
+        "object_to_slot + object_offset",
+        "kKvafP8PrivateDirectoryClaiming",
+        "kKvafP8PrivateDirectoryUnmapped",
+        "AscendC::Simt::ThreadFence()",
+        "KvafP8PrivateAllocatingDirectoryRollbackSimtService",
+    ):
+        assert token in p8_allocating_rollback_simt, token
+
+    p8_allocating_terminal = _between(
+        text,
+        "__aicore__ inline bool QuarantineKvafP8PrivateAllocatingAtForwardTerminal(",
+        "// A POST worker may have made a private PENDING record visible",
+    )
+    assert "asc_atomic_cas(" not in p8_allocating_terminal
+    assert (
+        "VF_CALL<\n"
+        "          KvafP8PrivateAllocatingDirectoryRollbackSimtService>"
+        in p8_allocating_terminal
+    )
+
     p8_wave_terminal = _between(
         text,
         "__aicore__ inline bool QuarantineKvafP8WaveAtForwardTerminal(",
