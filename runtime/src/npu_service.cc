@@ -384,6 +384,11 @@ struct NpuService::Impl {
   Result Release(std::uint64_t id) {
     auto it = regions.find(id);
     if (it == regions.end()) return Result::kNotFound;
+    std::fprintf(stderr, "[KVAF_NPU] HBM_RELEASE session=%llu base=0x%llx bytes=%llu\n",
+                 static_cast<unsigned long long>(id),
+                 static_cast<unsigned long long>(it->second->memory == nullptr ? 0U :
+                     reinterpret_cast<std::uintptr_t>(it->second->memory)),
+                 static_cast<unsigned long long>(it->second->bytes));
     Release(it->second.get());
     regions.erase(it);
     return Result::kOk;

@@ -44,8 +44,13 @@ class PeerHbmAllocator final : public DdrMemoryAllocator {
   }
   Status Release(const RemoteRegionDesc&) override {
     if (allocated_.base == 0U) return Status::NotFound("HBM region not allocated");
+    std::fprintf(stderr, "[KVAF_CPU] HBM_RELEASE_REQUEST session=%llu base=0x%llx\n",
+                 static_cast<unsigned long long>(allocated_.session_id),
+                 static_cast<unsigned long long>(allocated_.base));
     Status status = link_->ReleaseHbmRegion(allocated_.session_id);
     if (status.ok()) allocated_ = {};
+    else std::fprintf(stderr, "[KVAF_CPU] HBM_RELEASE_FAILED session=%llu reason=%s\n",
+                      static_cast<unsigned long long>(allocated_.session_id), status.message().c_str());
     return status;
   }
   void SetDevice(std::uint32_t id, std::uint32_t eid, bool has_eid_index) {
@@ -918,10 +923,11 @@ Status CpuRuntime::ServeConnection(int connection_fd) {
 
 Status CpuRuntime::Shutdown() {
   if (impl_ == nullptr) return Status::OK();
+  Status status = Status::OK();
   if (impl_->client_mode && impl_->runtime_core != nullptr && impl_->runtime_core->initialized())
-    (void)impl_->runtime_core->Shutdown();
+    status = impl_->runtime_core->Shutdown();
   impl_.reset();
-  return Status::OK();
+  return status;
 }
 
 bool CpuRuntime::initialized() const { return impl_ != nullptr; }
