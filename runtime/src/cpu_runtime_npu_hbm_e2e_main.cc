@@ -44,6 +44,7 @@ void Usage(const char* program) {
 bool Parse(int argc, char** argv, Options* options) {
   for (int i = 1; i < argc; ++i) {
     const std::string arg(argv[i]);
+    if (arg == "--") continue;
     if (arg == "--help" || arg == "-h") return false;
     if (i + 1 >= argc) return false;
     if (arg == "--peer") options->peer = argv[++i];

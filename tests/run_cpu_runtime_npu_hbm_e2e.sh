@@ -10,6 +10,9 @@ fi
 readonly KVAF_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly peer="$1"
 shift
+if [[ "${1:-}" == "--" ]]; then
+  shift
+fi
 readonly build_dir="${KVAF_CPU_RUNTIME_BUILD_DIR:-$KVAF_ROOT/build-cpu}"
 
 "$KVAF_ROOT/build.sh" cpu --build-dir "$build_dir"
