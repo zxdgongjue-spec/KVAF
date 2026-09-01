@@ -220,6 +220,7 @@ void Cleanup(State* s) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  setvbuf(stdout, nullptr, _IONBF, 0);
   std::uint16_t port = 29888U;
   std::uint32_t device_id = 0U, eid_index = 0U, npu_list_index = 0U;
   std::uint64_t bytes = 4096U;
@@ -248,6 +249,7 @@ int main(int argc, char** argv) {
   if (fd < 0) { Cleanup(&state); return 1; }
   Hello hello{};
   bool ok = ReadAll(fd, &hello, sizeof(hello)) && hello.magic == kMagic && hello.version == kVersion;
+  if (!ok) std::fprintf(stderr, "[HBM_TEST][NPU] invalid hello or client disconnected magic=0x%x version=%u\n", hello.magic, hello.version);
   Export out{};
   out.magic = kMagic; out.version = kVersion; out.hbm_bytes = bytes; out.token_value = state.token_value;
   out.segment_key_bytes = state.segment_key_bytes; out.jetty_key_bytes = state.jetty_info.key.size;
@@ -255,23 +257,31 @@ int main(int argc, char** argv) {
   std::memcpy(out.segment_key, state.segment_key.data(), state.segment_key_bytes);
   std::memcpy(out.jetty_key, state.jetty_info.key.value, state.jetty_info.key.size);
   ok = ok && WriteAll(fd, &out, sizeof(out));
+  if (!ok) std::fprintf(stderr, "[HBM_TEST][NPU] export response failed\n");
   if (ok) {
     ChannelRequest request{};
     ok = ReadAll(fd, &request, sizeof(request)) && request.magic == kMagic && request.version == kVersion;
+    if (!ok) std::fprintf(stderr, "[HBM_TEST][NPU] invalid channel request or client disconnected magic=0x%x version=%u\n", request.magic, request.version);
     ChannelResponse response{};
     if (ok) {
       GetTpCfg cfg{}; cfg.flag = CtpFlag(); cfg.transport_mode = kReliableMessage;
       std::memcpy(cfg.local_eid.raw, state.eid.data(), state.eid.size());
       std::memcpy(cfg.peer_eid.raw, request.local_eid, kEidBytes);
       TpInfo tp{}; std::uint32_t count = 1U; void* async_request = nullptr;
-      ok = state.api.get_tp_info_async(state.context, &cfg, &tp, &count, &async_request) == 0 && async_request != nullptr;
+      const int submit_ret = state.api.get_tp_info_async(state.context, &cfg, &tp, &count, &async_request);
+      ok = submit_ret == 0 && async_request != nullptr;
+      if (!ok) std::fprintf(stderr, "[HBM_TEST][NPU] get_tp_info_async failed ret=%d request=%p count=%u\n", submit_ret, async_request, count);
       int result = 0;
+      bool completed = false;
       for (int tries = 0; ok && tries < 10000; ++tries) {
         const int rc = state.api.get_async_req_result(async_request, &result);
         if (rc == 128301) continue;
         ok = rc == 0 && result == 0 && count != 0U && tp.tp_handle != 0U;
+        completed = true;
+        if (!ok) std::fprintf(stderr, "[HBM_TEST][NPU] get_tp_info_async completion failed api_ret=%d result=%d count=%u tp=0x%llx\n", rc, result, count, static_cast<unsigned long long>(tp.tp_handle));
         break;
       }
+      if (ok && !completed) { ok = false; std::fprintf(stderr, "[HBM_TEST][NPU] get_tp_info_async completion timeout\n"); }
       if (request.local_key_bytes == 0U || request.local_key_bytes > kQpKeyBytes) ok = false;
       QpImportInfoT import_info{};
       void* target = nullptr;
@@ -288,7 +298,9 @@ int main(int argc, char** argv) {
         import_info.in.ub.exp_import_cfg.tx_psn = 1U;
         import_info.in.ub.exp_import_cfg.rx_psn = request.local_psn;
         import_info.in.ub.tp_type = CtpProtocolType();
-        ok = state.api.qp_import(state.context, &import_info, &target) == 0 && target != nullptr;
+        const int import_ret = state.api.qp_import(state.context, &import_info, &target);
+        ok = import_ret == 0 && target != nullptr;
+        if (!ok) std::fprintf(stderr, "[HBM_TEST][NPU] CPU jetty import failed ret=%d target=%p key_bytes=%u local_tp=0x%llx peer_tp=0x%llx\n", import_ret, target, request.local_key_bytes, static_cast<unsigned long long>(tp.tp_handle), static_cast<unsigned long long>(request.local_tp));
         if (ok) state.imported_cpu_jetty = target;
       }
       response.status = ok ? 0 : -1; response.peer_psn = 1U; response.peer_tp = tp.tp_handle;
