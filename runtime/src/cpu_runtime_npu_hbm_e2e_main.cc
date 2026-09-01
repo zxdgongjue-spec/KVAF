@@ -45,19 +45,32 @@ void Usage(const char* program) {
 bool Parse(int argc, char** argv, Options* options) {
   for (int i = 1; i < argc; ++i) {
     const std::string arg(argv[i]);
-    if (arg == "--") continue;
     if (arg == "--help" || arg == "-h") return false;
-    if (i + 1 >= argc) return false;
-    if (arg == "--peer") options->peer = argv[++i];
-    else if (arg == "--bytes" && !ParseU64(argv[++i], &options->bytes)) return false;
-    else if (arg == "--slot-size" && !ParseU64(argv[++i], &options->slot_size)) return false;
-    else if (arg == "--ub-device") options->ub_device = argv[++i];
-    else if (arg == "--eid-index") {
-      if (!ParseU32(argv[++i], &options->eid_index)) return false;
+    if (arg == "--") continue;
+    const auto value = [&](const char** out) {
+      if (i + 1 >= argc) return false;
+      *out = argv[++i];
+      return true;
+    };
+    const char* text = nullptr;
+    if (arg == "--peer") {
+      if (!value(&text)) return false;
+      options->peer = text;
+    } else if (arg == "--bytes") {
+      if (!value(&text) || !ParseU64(text, &options->bytes)) return false;
+    } else if (arg == "--slot-size") {
+      if (!value(&text) || !ParseU64(text, &options->slot_size)) return false;
+    } else if (arg == "--ub-device") {
+      if (!value(&text)) return false;
+      options->ub_device = text;
+    } else if (arg == "--eid-index") {
+      if (!value(&text) || !ParseU32(text, &options->eid_index)) return false;
       options->has_eid_index = true;
+    } else if (arg == "--device-id") {
+      if (!value(&text) || !ParseU32(text, &options->device_id)) return false;
+    } else {
+      return false;
     }
-    else if (arg == "--device-id" && !ParseU32(argv[++i], &options->device_id)) return false;
-    else return false;
   }
   return !options->peer.empty() && options->bytes != 0U && options->slot_size != 0U &&
          options->bytes % options->slot_size == 0U;
