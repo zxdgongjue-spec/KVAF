@@ -64,6 +64,7 @@ def main() -> None:
         "kKvafP8WaveFinalized",
         "kKvafP8WaveQuarantined",
         "TryClaimKvafP8WaveDrainFromAicore",
+        "TryClaimKvafP8UnpostedWaveDrainFromAicore",
         "PrepareKvafP8WavePostIntent",
         "PostKvafP8Wave",
         "TryRetireKvafP8Wave",
@@ -71,6 +72,9 @@ def main() -> None:
         "PrepareKvafP8PrivateRecord",
         "FinalizeKvafP8PrivateRecord",
         "ReleaseKvafP8PrivateRecordAfterQsfaTerminal",
+        "ReleaseKvafP8PendingPrivateRecordAfterNoPost",
+        "TryClaimKvafP8PrivateNoPostReleaseFromAicore",
+        "QuarantineKvafP8PrivateReleaseClaimedFromAicore",
         "TryClaimKvafP8PrivateReleaseFromSimt",
         "TryClaimKvafP8PrivateReleaseFromAicore",
         "ClearKvafP8PrivateMappingsFromSimt",
@@ -87,6 +91,7 @@ def main() -> None:
         "PublishKvafP8BatchGetDescriptorScratch",
         "BuildKvafP8StreamingBatchGetQueueArgs",
         "ReleaseKvafP8WaveAfterPrivateReady",
+        "ReleaseKvafP8ClaimedUnpostedWaveAfterPrivateCleanup",
         "ReleaseKvafP8UnpostedWave",
         "DataSyncBarrier<AscendC::MemDsbT::DDR>()",
     ):
@@ -116,6 +121,25 @@ def main() -> None:
         "VF_CALL<KvafP8WaveDrainClaimSimtService>",
     ):
         assert token in p8_drain_claim, token
+
+    # A deterministic Begin/Post rejection is a normal bounded defer, not an
+    # ambiguous POST_INTENT.  It still receives a separate GM drain claim so
+    # only one dynamic worker clears its PENDING private map entries and
+    # returns the descriptor queue.  It must never share the ordinary POSTED
+    # CQ-claim endpoint, because there is no CQ to poll in this branch.
+    p8_no_post_claim = _between(
+        text,
+        "__simt_callee__ inline bool TryClaimKvafP8UnpostedWaveDrainFromSimt(",
+        "// P8 phase helpers",
+    )
+    for token in (
+        "asc_atomic_cas(",
+        "kKvafP8WaveFinalized",
+        "kKvafP8WaveDrainClaimed",
+        "TryClaimKvafP8UnpostedWaveDrainFromAicore",
+        "VF_CALL<KvafP8UnpostedWaveDrainClaimSimtService>",
+    ):
+        assert token in p8_no_post_claim, token
 
     p8_abort = _between(
         text,
@@ -199,6 +223,28 @@ def main() -> None:
     )
     assert "ResetKvafP8PrivateRecord(private_record)" not in compat_release
     assert "kKvafP8PrivateReleaseClaimed" in compat_release
+
+    # No-post cleanup is deliberately distinct from QSFA terminal release:
+    # it can only claim PENDING after a proven PostRejected wave, then uses
+    # the same exact source/object CAS evidence before the private row becomes
+    # FREE.  This prevents a harmless deterministic no-post from leaking the
+    # bounded private pool while preserving fail-closed behavior on ambiguity.
+    p8_no_post_private = _between(
+        text,
+        "__simt_callee__ inline bool TryClaimKvafP8PrivateNoPostReleaseFromSimt(",
+        "// -------------------------------------------------------------------------\n// Forward-terminal fail-closed sweep",
+    )
+    for token in (
+        "kKvafP8PrivatePending",
+        "kKvafP8PrivateReleaseClaimed",
+        "KvafP8ForwardControlMatchesIdentity",
+        "ClearKvafP8PrivateMappingsFromAicore",
+        "CommitKvafP8PrivateReleaseFromAicore",
+        "QuarantineKvafP8PrivateReleaseClaimedFromAicore",
+        "ReleaseKvafP8PendingPrivateRecordAfterNoPost",
+        "private_ready[private_ready_index]",
+    ):
+        assert token in p8_no_post_private, token
 
     p8_terminal = _between(
         text,
@@ -329,6 +375,23 @@ def main() -> None:
     )
     assert "record->state == kKvafP8WavePostIntent" in p8_unposted
     assert "kKvafP8WaveOutcomePostIntentQuarantined" in p8_unposted
+
+    p8_claimed_unposted = _between(
+        text,
+        "__aicore__ inline bool ReleaseKvafP8ClaimedUnpostedWaveAfterPrivateCleanup(",
+        "// Only a *proved unposted* wave",
+    )
+    for token in (
+        "kKvafP8WaveDrainClaimed",
+        "kKvafP8WaveOutcomePostRejected",
+        "record->post_committed != 0U",
+        "request_source_offsets[request]",
+        "request_object_offsets[request]",
+        "for (uint32_t prior = 0U; prior < request; ++prior)",
+        "kKvafP8PrivateFree",
+        "ReleaseKvafStreamingBatchGetQueueFromAicore",
+    ):
+        assert token in p8_claimed_unposted, token
 
     # These four copies were valid in the standalone compilation context but
     # invalid when the same helper is embedded in an AscendC mixed operator.

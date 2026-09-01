@@ -1039,6 +1039,59 @@ __aicore__ inline bool CommitKvafP8PrivateReleaseFromAicore(
          result->observed_state == kKvafP8PrivateReleaseClaimed;
 }
 
+// A failed RELEASE_CLAIMED -> FREE commit must never be silently treated as
+// a reusable slot.  In the normal case the state is still RELEASE_CLAIMED, so
+// a second CAS can seal it as QUARANTINED.  If that CAS sees any other state,
+// the caller has lost ownership proof and must leave the row unavailable for
+// forward-terminal recovery rather than overwrite a potentially newer owner.
+__simt_callee__ inline bool TryQuarantineKvafP8PrivateReleaseClaimedFromSimt(
+    __gm__ KvafP8PrivateRecord* record,
+    __ubuf__ KvafP8PrivateReleaseResult* result) {
+  if (record == nullptr || result == nullptr) {
+    return false;
+  }
+  result->success = 0U;
+  result->observed_state = kKvafP8PrivateFree;
+  __gm__ int32_t* const state =
+      reinterpret_cast<__gm__ int32_t*>(&(record->state));
+  const int32_t observed = asc_atomic_cas(
+      state, static_cast<int32_t>(kKvafP8PrivateReleaseClaimed),
+      static_cast<int32_t>(kKvafP8PrivateQuarantined));
+  result->observed_state = static_cast<uint32_t>(observed);
+  if (observed != static_cast<int32_t>(kKvafP8PrivateReleaseClaimed)) {
+    return false;
+  }
+  AscendC::Simt::ThreadFence();
+  result->success = 1U;
+  return true;
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(1)
+inline void KvafP8PrivateReleaseFailureQuarantineSimtService(
+    __gm__ KvafP8PrivateRecord* record,
+    __ubuf__ KvafP8PrivateReleaseResult* result) {
+  (void)TryQuarantineKvafP8PrivateReleaseClaimedFromSimt(record, result);
+}
+
+__aicore__ inline bool QuarantineKvafP8PrivateReleaseClaimedFromAicore(
+    __gm__ KvafP8PrivateRecord* record,
+    __ubuf__ KvafP8PrivateReleaseResult* result, event_t simt_event) {
+  if (record == nullptr || result == nullptr) {
+    return false;
+  }
+  result->success = 0U;
+  result->observed_state = kKvafP8PrivateFree;
+  set_flag(PIPE_S, PIPE_V, simt_event);
+  wait_flag(PIPE_S, PIPE_V, simt_event);
+  AscendC::Simt::VF_CALL<
+      KvafP8PrivateReleaseFailureQuarantineSimtService>(
+      AscendC::Simt::Dim3{1U, 1U, 1U}, record, result);
+  set_flag(PIPE_V, PIPE_S, simt_event);
+  wait_flag(PIPE_V, PIPE_S, simt_event);
+  return result->success != 0U &&
+         result->observed_state == kKvafP8PrivateReleaseClaimed;
+}
+
 // The complete normal release protocol.  `private_ready_index` is supplied by
 // the executor's fixed row partition and must equal record.output_index.  The
 // helper intentionally does not accept capacities: callers validate all
@@ -1102,7 +1155,132 @@ __aicore__ inline bool ReleaseKvafP8PrivateRecordAfterQsfaTerminal(
   AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
   if (!CommitKvafP8PrivateReleaseFromAicore(record_gm, result, simt_event)) {
     // No map points to the row any longer, but its ownership transition was
-    // not proved.  Keep it unavailable and surface an explicit quarantine.
+    // not proved.  Seal RELEASE_CLAIMED as QUARANTINED when ownership is still
+    // ours; otherwise retain the unknown record for forward-terminal recovery.
+    (void)QuarantineKvafP8PrivateReleaseClaimedFromAicore(
+        record_gm, result, simt_event);
+    private_ready[private_ready_index] = static_cast<int32_t>(
+        kKvafP8PrivateQuarantined);
+    AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+    return false;
+  }
+  return true;
+}
+
+// A POST_REJECTED wave has no HCCP payload and therefore never reaches QSFA.
+// Its private records are nevertheless already PENDING and visible through
+// source/object mapping directories.  Releasing them with the normal QSFA
+// endpoint would be incorrect: that endpoint requires READY/FAILED plus the
+// QSFA terminal flag.  This is the narrowly scoped no-post counterpart.  It
+// is legal only after a dynamic drain worker claimed the durable rejected wave
+// and revalidated the same forward/replay/layer identity in DRAIN phase.
+//
+// The transition remains exactly as strict as the QSFA path:
+// PENDING -> RELEASE_CLAIMED -> exact map CAS clear -> FREE.  A partial clear
+// or a stale identity quarantines the row; it is never "repaired" locally.
+__simt_callee__ inline bool TryClaimKvafP8PrivateNoPostReleaseFromSimt(
+    __gm__ KvafP8PrivateRecord* record,
+    __ubuf__ KvafP8PrivateReleaseResult* result) {
+  if (record == nullptr || result == nullptr) {
+    return false;
+  }
+  result->success = 0U;
+  result->observed_state = kKvafP8PrivateFree;
+  result->source_observed = -1;
+  result->object_observed = -1;
+  __gm__ int32_t* const state =
+      reinterpret_cast<__gm__ int32_t*>(&(record->state));
+  const int32_t observed = asc_atomic_cas(
+      state, static_cast<int32_t>(kKvafP8PrivatePending),
+      static_cast<int32_t>(kKvafP8PrivateReleaseClaimed));
+  result->observed_state = static_cast<uint32_t>(observed);
+  if (observed != static_cast<int32_t>(kKvafP8PrivatePending)) {
+    return false;
+  }
+  AscendC::Simt::ThreadFence();
+  result->success = 1U;
+  return true;
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(1)
+inline void KvafP8PrivateNoPostReleaseClaimSimtService(
+    __gm__ KvafP8PrivateRecord* record,
+    __ubuf__ KvafP8PrivateReleaseResult* result) {
+  (void)TryClaimKvafP8PrivateNoPostReleaseFromSimt(record, result);
+}
+
+__aicore__ inline bool TryClaimKvafP8PrivateNoPostReleaseFromAicore(
+    __gm__ KvafP8PrivateRecord* record,
+    __ubuf__ KvafP8PrivateReleaseResult* result, event_t simt_event) {
+  if (record == nullptr || result == nullptr) {
+    return false;
+  }
+  result->success = 0U;
+  result->observed_state = kKvafP8PrivateFree;
+  result->source_observed = -1;
+  result->object_observed = -1;
+  set_flag(PIPE_S, PIPE_V, simt_event);
+  wait_flag(PIPE_S, PIPE_V, simt_event);
+  AscendC::Simt::VF_CALL<KvafP8PrivateNoPostReleaseClaimSimtService>(
+      AscendC::Simt::Dim3{1U, 1U, 1U}, record, result);
+  set_flag(PIPE_V, PIPE_S, simt_event);
+  wait_flag(PIPE_V, PIPE_S, simt_event);
+  return result->success != 0U &&
+         result->observed_state == kKvafP8PrivatePending;
+}
+
+__aicore__ inline bool ReleaseKvafP8PendingPrivateRecordAfterNoPost(
+    __gm__ KvafP8PrivateRecord* record_gm,
+    const KvafP8ForwardControl& forward_control,
+    const KvafP8WaveIdentity& identity,
+    __gm__ int32_t* source_to_slot, __gm__ int32_t* object_to_slot,
+    __gm__ int32_t* private_ready, uint64_t private_ready_index,
+    __ubuf__ KvafP8PrivateReleaseResult* result, event_t simt_event) {
+  if (record_gm == nullptr || source_to_slot == nullptr ||
+      object_to_slot == nullptr || private_ready == nullptr ||
+      result == nullptr ||
+      !KvafP8ForwardControlMatchesIdentity(
+          forward_control, identity, kKvafP8ForwardPhaseDrain)) {
+    return false;
+  }
+  if (!TryClaimKvafP8PrivateNoPostReleaseFromAicore(
+          record_gm, result, simt_event)) {
+    return false;
+  }
+  KvafP8PrivateRecord record{};
+  if (!LoadKvafP8PrivateRecordFromGm(record_gm, &record) ||
+      !HasKvafP8PrivateRecordCompleteIdentity(record) ||
+      record.state != kKvafP8PrivateReleaseClaimed ||
+      !KvafP8PrivateRecordMatchesIdentity(record, identity) ||
+      record.output_index < 0 ||
+      static_cast<uint64_t>(record.output_index) != private_ready_index ||
+      private_ready[private_ready_index] !=
+          static_cast<int32_t>(kKvafP8PrivatePending)) {
+    if (IsKvafP8PrivateRecordValid(record)) {
+      record.state = kKvafP8PrivateQuarantined;
+      (void)StoreKvafP8PrivateRecordToGm(record_gm, record);
+      private_ready[private_ready_index] = static_cast<int32_t>(
+          kKvafP8PrivateQuarantined);
+      AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+    }
+    return false;
+  }
+  if (!ClearKvafP8PrivateMappingsFromAicore(
+          source_to_slot, object_to_slot, record.source_offset,
+          record.object_offset, record.output_index, result, simt_event)) {
+    record.state = kKvafP8PrivateQuarantined;
+    (void)StoreKvafP8PrivateRecordToGm(record_gm, record);
+    private_ready[private_ready_index] = static_cast<int32_t>(
+        kKvafP8PrivateQuarantined);
+    AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+    return false;
+  }
+  private_ready[private_ready_index] = static_cast<int32_t>(
+      kKvafP8PrivateFree);
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  if (!CommitKvafP8PrivateReleaseFromAicore(record_gm, result, simt_event)) {
+    (void)QuarantineKvafP8PrivateReleaseClaimedFromAicore(
+        record_gm, result, simt_event);
     private_ready[private_ready_index] = static_cast<int32_t>(
         kKvafP8PrivateQuarantined);
     AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
@@ -2350,6 +2528,65 @@ __aicore__ inline bool TryClaimKvafP8WaveDrainFromAicore(
          result->observed_state == kKvafP8WavePosted;
 }
 
+// A deterministic Begin/Post rejection is different from POST_INTENT
+// ambiguity.  The former leaves a durable FINALIZED record with
+// `post_committed == 0` and no CQ can exist; retaining that fact lets a later
+// dynamic drain worker return the fixed descriptor queue *and* the PENDING
+// private rows without turning an ordinary no-post into permanent capacity
+// loss.  It still needs its own GM CAS: two later graph invocations must not
+// both clear the same source/object directory entries.
+//
+// The state CAS deliberately does not inspect `outcome` or `post_committed`.
+// Those fields are loaded and verified by the caller after the claim.  This is
+// the same fail-closed pattern as a normal CQ drain: a corrupt FINALIZED
+// record becomes QUARANTINED, never a candidate for an unsafe release.
+__simt_callee__ inline bool TryClaimKvafP8UnpostedWaveDrainFromSimt(
+    __gm__ KvafP8WaveRecord* record,
+    __ubuf__ KvafP8WaveDrainClaimResult* result) {
+  if (record == nullptr || result == nullptr) {
+    return false;
+  }
+  result->success = 0U;
+  result->observed_state = kKvafP8WaveFree;
+  __gm__ int32_t* const state =
+      reinterpret_cast<__gm__ int32_t*>(&(record->state));
+  const int32_t observed = asc_atomic_cas(
+      state, static_cast<int32_t>(kKvafP8WaveFinalized),
+      static_cast<int32_t>(kKvafP8WaveDrainClaimed));
+  result->observed_state = static_cast<uint32_t>(observed);
+  if (observed != static_cast<int32_t>(kKvafP8WaveFinalized)) {
+    return false;
+  }
+  AscendC::Simt::ThreadFence();
+  result->success = 1U;
+  return true;
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(1)
+inline void KvafP8UnpostedWaveDrainClaimSimtService(
+    __gm__ KvafP8WaveRecord* record,
+    __ubuf__ KvafP8WaveDrainClaimResult* result) {
+  (void)TryClaimKvafP8UnpostedWaveDrainFromSimt(record, result);
+}
+
+__aicore__ inline bool TryClaimKvafP8UnpostedWaveDrainFromAicore(
+    __gm__ KvafP8WaveRecord* record,
+    __ubuf__ KvafP8WaveDrainClaimResult* result, event_t simt_event) {
+  if (record == nullptr || result == nullptr) {
+    return false;
+  }
+  result->success = 0U;
+  result->observed_state = kKvafP8WaveFree;
+  set_flag(PIPE_S, PIPE_V, simt_event);
+  wait_flag(PIPE_S, PIPE_V, simt_event);
+  AscendC::Simt::VF_CALL<KvafP8UnpostedWaveDrainClaimSimtService>(
+      AscendC::Simt::Dim3{1U, 1U, 1U}, record, result);
+  set_flag(PIPE_V, PIPE_S, simt_event);
+  wait_flag(PIPE_V, PIPE_S, simt_event);
+  return result->success != 0U &&
+         result->observed_state == kKvafP8WaveFinalized;
+}
+
 // P8 phase helpers ---------------------------------------------------------
 //
 // A P8 executor invokes these helpers in short graph-visible phases:
@@ -2672,6 +2909,106 @@ __aicore__ inline bool ReleaseKvafP8WaveAfterPrivateReady(
     QuarantineKvafP8WaveRecord(record,
                                 kKvafP8WaveOutcomeIdentityQuarantined);
     return false;
+  }
+  KvafStreamingBatchGetWave wave{};
+  wave.lease.queue_id = record->identity.queue_id;
+  wave.lease.owner_tag = record->identity.owner_tag;
+  wave.lease.state = kStreamingBatchGetLeaseTerminal;
+  wave.lease.reserved0 = 0U;
+  wave.transaction = record->transaction;
+  if (!ReleaseKvafStreamingBatchGetQueueFromAicore(control_gm, lease_result,
+                                                     simt_event, &wave)) {
+    QuarantineKvafP8WaveRecord(record,
+                                kKvafP8WaveOutcomeReleaseCasQuarantined);
+    return false;
+  }
+  record->state = kKvafP8WaveFree;
+  record->post_committed = 0U;
+  return true;
+}
+
+// The deterministic no-post companion to ReleaseKvafP8WaveAfterPrivateReady.
+// It is intentionally separate from the historical unposted helper below:
+// this endpoint receives a record that has already been atomically claimed by
+// a P8 dynamic drain worker (FINALIZED -> DRAIN_CLAIMED), and therefore makes
+// the single-consumer ownership proof explicit.  Every PENDING private row
+// must first have completed ReleaseKvafP8PendingPrivateRecordAfterNoPost;
+// otherwise this helper quarantines the wave rather than returning its queue.
+__aicore__ inline bool ReleaseKvafP8ClaimedUnpostedWaveAfterPrivateCleanup(
+    __gm__ const KvafStreamingBatchGetControl* control_gm,
+    const KvafP8ForwardControl& forward_control,
+    __gm__ const KvafP8PrivateRecord* private_records,
+    uint64_t private_record_count,
+    __gm__ const int64_t* request_source_offsets,
+    __gm__ const int64_t* request_object_offsets,
+    __gm__ const int32_t* request_output_indices,
+    uint32_t request_ledger_capacity,
+    __ubuf__ KvafStreamingBatchGetLeaseResult* lease_result,
+    event_t simt_event, KvafP8WaveRecord* record) {
+  if (control_gm == nullptr || private_records == nullptr ||
+      request_source_offsets == nullptr || request_object_offsets == nullptr ||
+      request_output_indices == nullptr || lease_result == nullptr ||
+      record == nullptr || !IsKvafP8WaveRecordValid(*record) ||
+      record->state != kKvafP8WaveDrainClaimed ||
+      record->post_committed != 0U ||
+      record->outcome != kKvafP8WaveOutcomePostRejected ||
+      record->transaction.finalized == 0U ||
+      !KvafP8ForwardControlMatchesIdentity(
+          forward_control, record->identity, kKvafP8ForwardPhaseDrain)) {
+    if (record != nullptr && IsKvafP8WaveRecordValid(*record)) {
+      QuarantineKvafP8WaveRecord(record,
+                                  kKvafP8WaveOutcomeIdentityQuarantined);
+    }
+    return false;
+  }
+  // Load the actual control after the basic identity gate so a stale caller
+  // cannot use a later runtime's queue table to free this record.  We cannot
+  // reuse ValidateKvafP8DescriptorPrivateLedger here: that pre-doorbell
+  // validator correctly requires PENDING rows, whereas every no-post row has
+  // already passed its exact mapping-clear protocol and is now FREE.
+  KvafStreamingBatchGetControl control{};
+  if (!LoadKvafStreamingBatchGetControlFromGmForAicore(control_gm, &control) ||
+      !IsKvafStreamingBatchGetControlValidForAicore(control) ||
+      record->identity.queue_id >= control.queue_count ||
+      private_record_count != control.output_rows ||
+      record->request_count == 0U ||
+      record->request_count > request_ledger_capacity ||
+      record->request_count > kDenseRequestCapacity) {
+    QuarantineKvafP8WaveRecord(record,
+                                kKvafP8WaveOutcomeIdentityQuarantined);
+    return false;
+  }
+  for (uint32_t request = 0U; request < record->request_count; ++request) {
+    const int32_t output_index = request_output_indices[request];
+    if (output_index < 0 ||
+        static_cast<uint64_t>(output_index) >= private_record_count) {
+      QuarantineKvafP8WaveRecord(record,
+                                  kKvafP8WaveOutcomeIdentityQuarantined);
+      return false;
+    }
+    KvafP8PrivateRecord private_record{};
+    if (!LoadKvafP8PrivateRecordFromGm(
+            private_records + static_cast<uint64_t>(output_index),
+            &private_record) ||
+        !KvafP8PrivateRecordMatchesIdentity(private_record,
+                                             record->identity) ||
+        private_record.output_index != output_index ||
+        private_record.state != kKvafP8PrivateFree ||
+        private_record.source_offset != static_cast<uint64_t>(
+            request_source_offsets[request]) ||
+        private_record.object_offset != static_cast<uint64_t>(
+            request_object_offsets[request])) {
+      QuarantineKvafP8WaveRecord(record,
+                                  kKvafP8WaveOutcomeIdentityQuarantined);
+      return false;
+    }
+    for (uint32_t prior = 0U; prior < request; ++prior) {
+      if (request_output_indices[prior] == output_index) {
+        QuarantineKvafP8WaveRecord(record,
+                                    kKvafP8WaveOutcomeIdentityQuarantined);
+        return false;
+      }
+    }
   }
   KvafStreamingBatchGetWave wave{};
   wave.lease.queue_id = record->identity.queue_id;
