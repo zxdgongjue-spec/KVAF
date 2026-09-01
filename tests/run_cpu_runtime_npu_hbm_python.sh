@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 1 ]]; then
-  echo "Usage: $0 /absolute/path/to/kvaf/build-cpu" >&2
+if [[ $# -gt 1 ]]; then
+  echo "Usage: $0 [build-cpu-directory]" >&2
   exit 2
 fi
 
-readonly build_dir="$1"
 readonly root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly build_dir="${1:-${KVAF_CPU_RUNTIME_BUILD_DIR:-$root_dir/build-cpu}}"
 readonly test_program="$root_dir/tests/python/test_cpu_runtime_npu_hbm.py"
 
 [[ -d "$build_dir/python/kvaf" ]] || {
-  echo "ERROR: CPU Python binding not found under $build_dir/python/kvaf" >&2
+  echo "ERROR: CPU Python binding not found under $build_dir/python/kvaf; run ./build.sh cpu first" >&2
   exit 1
 }
 
