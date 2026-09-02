@@ -491,13 +491,22 @@ struct CpuUrmaTransport::Impl {
     observed_attr.mask = JETTY_STATE;
     const urma_status_t query_status =
         urma_query_jetty(local_jetty_, &observed_cfg, &observed_attr);
+    urma_cr_t flushed{};
+    const int flushed_count = urma_flush_jetty(local_jetty_, 1, &flushed);
+    std::string flush_info = ", flush_count=" + std::to_string(flushed_count);
+    if (flushed_count > 0) {
+      flush_info += ", flush_status=" + std::to_string(static_cast<int>(flushed.status)) +
+                     ", flush_ctx=0x" +
+                     std::to_string(static_cast<unsigned long long>(flushed.user_ctx));
+    }
     return Status::Internal("timed out waiting for SGL completion (op=" +
                            std::string(write ? "WRITE" : "READ") +
                            ", num_sge=" + std::to_string(count) +
                            ", jetty_query_status=" +
                            std::to_string(static_cast<int>(query_status)) +
                            ", jetty_state=" +
-                           std::to_string(static_cast<unsigned>(observed_attr.state)) + ")");
+                           std::to_string(static_cast<unsigned>(observed_attr.state)) +
+                           flush_info + ")");
   }
 
   Status TransferDirect(bool write, std::uint64_t offset, void* data, std::size_t bytes) {
