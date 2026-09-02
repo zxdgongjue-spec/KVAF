@@ -7,7 +7,7 @@
 namespace kvaf::hbm_test {
 
 constexpr std::uint32_t kMagic = 0x4b564842U;  // KVHB
-constexpr std::uint16_t kVersion = 1U;
+constexpr std::uint16_t kVersion = 2U;
 constexpr std::uint32_t kHdcType = 18U;
 
 #pragma pack(push, 1)
@@ -51,6 +51,12 @@ struct ChannelResponse {
   std::uint64_t peer_tp;
   std::uint32_t peer_key_bytes;
   std::uint8_t peer_key[direct_hccp::kQpKeyBytes];
+};
+
+struct Done {
+  std::uint32_t magic;
+  std::uint16_t version;
+  std::uint16_t status;
 };
 #pragma pack(pop)
 

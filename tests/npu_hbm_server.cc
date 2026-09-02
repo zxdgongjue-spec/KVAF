@@ -250,7 +250,8 @@ int main(int argc, char** argv) {
   close(listener);
   if (fd < 0) { Cleanup(&state); return 1; }
   Hello hello{};
-  bool ok = ReadAll(fd, &hello, sizeof(hello)) && hello.magic == kMagic && hello.version == kVersion;
+  bool ok = ReadAll(fd, &hello, sizeof(hello)) && hello.magic == kMagic &&
+            hello.version == kVersion && hello.bytes == bytes;
   if (!ok) std::fprintf(stderr, "[HBM_TEST][NPU] invalid hello or client disconnected magic=0x%x version=%u\n", hello.magic, hello.version);
   Export out{};
   out.magic = kMagic; out.version = kVersion; out.hbm_bytes = bytes; out.token_value = state.token_value;
@@ -310,6 +311,14 @@ int main(int argc, char** argv) {
       response.peer_key_bytes = state.jetty_info.key.size;
       std::memcpy(response.peer_key, state.jetty_info.key.value, response.peer_key_bytes);
       ok = WriteAll(fd, &response, sizeof(response));
+      if (ok) {
+        // Keep the HBM allocation and imported jetty alive until the CPU has
+        // completed its benchmark and byte-validation pass.
+        Done done{};
+        ok = ReadAll(fd, &done, sizeof(done)) && done.magic == kMagic &&
+             done.version == kVersion && done.status == 0;
+        if (!ok) std::fprintf(stderr, "[HBM_TEST][NPU] client completion handshake failed\n");
+      }
     }
   }
   close(fd); Cleanup(&state); return ok ? 0 : 1;
