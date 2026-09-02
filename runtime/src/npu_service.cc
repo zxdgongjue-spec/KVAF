@@ -38,6 +38,7 @@ constexpr std::uint32_t kCqDepth = 16384U;
 // with the final CQE. Keep the target queue at the benchmark's 1024-WR wave.
 constexpr std::uint32_t kSqDepth = 1024U;
 constexpr std::uint32_t kRqDepth = 1024U;
+constexpr std::size_t kMaxPeerJettys = 16U;
 
 bool ReadAll(int fd, void* data, std::size_t bytes) {
   auto* p = static_cast<std::uint8_t*>(data);
@@ -87,7 +88,9 @@ struct HbmRegion {
   void* qp_handle{nullptr};
   direct_hccp::CqInfo cq_info{};
   direct_hccp::QpCreateInfo qp_info{};
-  void* peer_target_jetty{nullptr};
+  // One imported CPU Jetty is retained for each CPU-side initiator Jetty.
+  // The exported HBM target Jetty itself is shared by those channels.
+  std::vector<void*> peer_target_jettys{};
 };
 
 struct DeviceState {
@@ -420,6 +423,11 @@ struct NpuService::Impl {
     auto it = regions.find(request.session_id);
     if (it == regions.end()) return Result::kNotFound;
     HbmRegion& region = *it->second;
+    if (region.peer_target_jettys.size() >= kMaxPeerJettys) {
+      std::fprintf(stderr, "[KVAF_NPU] CHANNEL_FAILED stage=peer_jetty_limit limit=%zu\n",
+                   kMaxPeerJettys);
+      return Result::kResourceError;
+    }
     DeviceState* device = region.owner;
     if (device == nullptr || device->context == nullptr) return Result::kResourceError;
     (void)aclrtSetDevice(device->device_id);
@@ -475,19 +483,23 @@ struct NpuService::Impl {
     }
     {
       direct_hccp::QpImportInfoT import_info{};
+      void* peer_target_jetty = nullptr;
       if (!direct_hccp::ImportPeerJetty(api, device->context, request.local_qp_key,
                                         request.local_qp_key_bytes, region.token_value,
                                         local_tp, request.local_tp_handle, 1U,
                                         request.local_psn, "npu_service", &import_info,
-                                        &region.peer_target_jetty)) {
+                                        &peer_target_jetty)) {
         std::fprintf(stderr, "[KVAF_NPU] CHANNEL_FAILED stage=import_cpu_jetty\n");
         return Result::kResourceError;
       }
+      region.peer_target_jettys.push_back(peer_target_jetty);
     }
     response->peer_qp_key_bytes = region.jetty_key_bytes;
     std::memcpy(response->peer_qp_key, region.jetty_key.data(), kQpKeyBytes);
     response->peer_tp_handle = local_tp;
     response->peer_psn = 1U;
+    std::fprintf(stderr, "[KVAF_NPU] CHANNEL_READY imported_cpu_jettys=%zu\n",
+                 region.peer_target_jettys.size());
     return Result::kOk;
   }
 
@@ -496,10 +508,14 @@ struct NpuService::Impl {
     DeviceState* device = region->owner;
     if (device == nullptr) return;
     (void)aclrtSetDevice(device->device_id);
-    if (region->peer_target_jetty != nullptr && api.qp_unimport != nullptr) {
-      (void)api.qp_unimport(device->context, region->peer_target_jetty);
-      region->peer_target_jetty = nullptr;
+    if (api.qp_unimport != nullptr) {
+      for (void* peer_target_jetty : region->peer_target_jettys) {
+        if (peer_target_jetty != nullptr) {
+          (void)api.qp_unimport(device->context, peer_target_jetty);
+        }
+      }
     }
+    region->peer_target_jettys.clear();
     if (region->qp_handle != nullptr && api.qp_destroy != nullptr) {
       (void)api.qp_destroy(region->qp_handle);
       region->qp_handle = nullptr;

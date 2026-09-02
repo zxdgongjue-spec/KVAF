@@ -24,6 +24,7 @@ namespace {
 
 constexpr std::uint32_t kJfcDepth = 1024;
 constexpr std::uint32_t kJettyDepth = 1024;
+constexpr std::uint32_t kMaxJettyCount = 16;
 constexpr std::uint32_t kMaxSge = 16;
 constexpr std::uint32_t kPageBytes = 4096;
 constexpr std::uint32_t kKeyBytes = sizeof(urma_jetty_id_t) + sizeof(urma_transport_mode_t);
@@ -67,8 +68,10 @@ struct CpuUrmaTransport::Impl {
 
   Status Initialize(const CpuUrmaTransportOptions& options) {
     if (options.peer_address.empty() || options.region_bytes == 0 ||
-        options.region_bytes > std::numeric_limits<std::size_t>::max()) {
-      return Status::InvalidArgument("CPU URMA transport requires peer_address and non-zero region_bytes");
+        options.region_bytes > std::numeric_limits<std::size_t>::max() ||
+        options.jetty_count == 0U || options.jetty_count > kMaxJettyCount) {
+      return Status::InvalidArgument(
+          "CPU URMA transport requires peer_address, non-zero region_bytes, and jetty_count in [1,16]");
     }
     options_ = options;
     // URMA is process-wide.  The ACL/HBM runtime may have initialized it
@@ -191,10 +194,6 @@ struct CpuUrmaTransport::Impl {
         max_sge_ = std::min<std::uint32_t>(kMaxSge, device_attr.dev_cap.max_jfs_sge);
       }
     }
-    urma_jfc_cfg_t jfc_cfg{};
-    jfc_cfg.depth = kJfcDepth;
-    jfc_ = urma_create_jfc(context_, &jfc_cfg);
-    if (jfc_ == nullptr) return Error("urma_create_jfc");
     get_tp_list_ = reinterpret_cast<GetTpList>(dlsym(RTLD_DEFAULT, "urma_get_tp_list"));
     import_jetty_ex_ = reinterpret_cast<ImportJettyEx>(dlsym(RTLD_DEFAULT, "urma_import_jetty_ex"));
     if (get_tp_list_ == nullptr || import_jetty_ex_ == nullptr) {
@@ -238,83 +237,109 @@ struct CpuUrmaTransport::Impl {
     remote_seg_handle_ = urma_import_seg(context_, &remote_seg_, &remote_token, 0, import_flag);
     if (remote_seg_handle_ == nullptr) return Error("urma_import_seg");
 
-    urma_jfr_cfg_t jfr_cfg{};
-    jfr_cfg.depth = kJettyDepth;
-    jfr_cfg.trans_mode = URMA_TM_RM;
-    jfr_cfg.max_sge = 1;
-    jfr_cfg.jfc = jfc_;
-    jfr_cfg.token_value.token = region.token_value;
-    jfr_ = urma_create_jfr(context_, &jfr_cfg);
-    if (jfr_ == nullptr) return Error("urma_create_jfr");
-    urma_jetty_cfg_t jetty_cfg{};
-    jetty_cfg.flag.bs.share_jfr = URMA_SHARE_JFR;
-    jetty_cfg.jfs_cfg.depth = kJettyDepth;
-    jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
-    jetty_cfg.jfs_cfg.priority = URMA_MAX_PRIORITY;
-    jetty_cfg.jfs_cfg.max_sge = static_cast<std::uint8_t>(max_sge_);
-    jetty_cfg.jfs_cfg.max_rsge = 1;
-    jetty_cfg.jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
-    jetty_cfg.jfs_cfg.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
-    jetty_cfg.jfs_cfg.jfc = jfc_;
-    jetty_cfg.shared.jfr = jfr_;
-    jetty_cfg.shared.jfc = jfc_;
-    local_jetty_ = urma_create_jetty(context_, &jetty_cfg);
-    if (local_jetty_ == nullptr) return Error("urma_create_jetty");
-    std::fprintf(stderr,
-                 "[KVAF_CPU_URMA] JETTY_CFG trans_mode=%u max_sge=%u max_rsge=%u "
-                 "priority=%u rnr_retry=%u err_timeout=%u\n",
-                 static_cast<unsigned>(local_jetty_->jetty_cfg.jfs_cfg.trans_mode),
-                 static_cast<unsigned>(local_jetty_->jetty_cfg.jfs_cfg.max_sge),
-                 static_cast<unsigned>(local_jetty_->jetty_cfg.jfs_cfg.max_rsge),
-                 static_cast<unsigned>(local_jetty_->jetty_cfg.jfs_cfg.priority),
-                 static_cast<unsigned>(local_jetty_->jetty_cfg.jfs_cfg.rnr_retry),
-                 static_cast<unsigned>(local_jetty_->jetty_cfg.jfs_cfg.err_timeout));
+    jfcs_.reserve(options.jetty_count);
+    jfrs_.reserve(options.jetty_count);
+    local_jettys_.reserve(options.jetty_count);
+    remote_jettys_.reserve(options.jetty_count);
+    for (std::uint32_t jetty_index = 0U; jetty_index < options.jetty_count;
+         ++jetty_index) {
+      urma_jfc_cfg_t jfc_cfg{};
+      jfc_cfg.depth = kJfcDepth;
+      urma_jfc_t* jfc = urma_create_jfc(context_, &jfc_cfg);
+      if (jfc == nullptr) return Error("urma_create_jfc");
+      jfcs_.push_back(jfc);
 
-    std::uint64_t local_tp = 0;
-    TpQuery query{};
-    query.flag = 1;
-    query.trans_mode = static_cast<std::uint32_t>(URMA_TM_RM);
-    std::memcpy(query.local_eid, context_->eid.raw, 16);
-    std::memcpy(query.peer_eid, region.eid.data(), 16);
-    TpInfo info{};
-    std::uint32_t tp_count = 1;
-    if (get_tp_list_(context_, &query, &tp_count, &info) != 0 || tp_count == 0 || info.tp_handle == 0) {
-      return Error("urma_get_tp_list");
+      urma_jfr_cfg_t jfr_cfg{};
+      jfr_cfg.depth = kJettyDepth;
+      jfr_cfg.trans_mode = URMA_TM_RM;
+      jfr_cfg.max_sge = 1;
+      jfr_cfg.jfc = jfc;
+      jfr_cfg.token_value.token = region.token_value;
+      urma_jfr_t* jfr = urma_create_jfr(context_, &jfr_cfg);
+      if (jfr == nullptr) return Error("urma_create_jfr");
+      jfrs_.push_back(jfr);
+
+      urma_jetty_cfg_t jetty_cfg{};
+      jetty_cfg.flag.bs.share_jfr = URMA_SHARE_JFR;
+      jetty_cfg.jfs_cfg.depth = kJettyDepth;
+      jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
+      jetty_cfg.jfs_cfg.priority = URMA_MAX_PRIORITY;
+      jetty_cfg.jfs_cfg.max_sge = static_cast<std::uint8_t>(max_sge_);
+      jetty_cfg.jfs_cfg.max_rsge = 1;
+      jetty_cfg.jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
+      jetty_cfg.jfs_cfg.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
+      jetty_cfg.jfs_cfg.jfc = jfc;
+      jetty_cfg.shared.jfr = jfr;
+      jetty_cfg.shared.jfc = jfc;
+      urma_jetty_t* local_jetty = urma_create_jetty(context_, &jetty_cfg);
+      if (local_jetty == nullptr) return Error("urma_create_jetty");
+      local_jettys_.push_back(local_jetty);
+      std::fprintf(stderr,
+                   "[KVAF_CPU_URMA] JETTY index=%u trans_mode=%u max_sge=%u "
+                   "max_rsge=%u depth=%u\n",
+                   jetty_index,
+                   static_cast<unsigned>(local_jetty->jetty_cfg.jfs_cfg.trans_mode),
+                   static_cast<unsigned>(local_jetty->jetty_cfg.jfs_cfg.max_sge),
+                   static_cast<unsigned>(local_jetty->jetty_cfg.jfs_cfg.max_rsge),
+                   kJettyDepth);
+
+      TpQuery query{};
+      query.flag = 1;
+      query.trans_mode = static_cast<std::uint32_t>(URMA_TM_RM);
+      std::memcpy(query.local_eid, context_->eid.raw, 16);
+      std::memcpy(query.peer_eid, region.eid.data(), 16);
+      TpInfo info{};
+      std::uint32_t tp_count = 1;
+      if (get_tp_list_(context_, &query, &tp_count, &info) != 0 ||
+          tp_count == 0 || info.tp_handle == 0) {
+        return Error("urma_get_tp_list");
+      }
+      std::array<std::uint8_t, peer::kQpKeyBytes> local_key{};
+      std::memcpy(local_key.data(), &local_jetty->jetty_id,
+                  sizeof(local_jetty->jetty_id));
+      const urma_transport_mode_t mode = local_jetty->jetty_cfg.jfs_cfg.trans_mode;
+      std::memcpy(local_key.data() + sizeof(local_jetty->jetty_id), &mode,
+                  sizeof(mode));
+      std::array<std::uint8_t, peer::kQpKeyBytes> peer_key{};
+      std::uint32_t peer_key_bytes = 0;
+      std::uint64_t peer_tp = 0;
+      std::uint32_t peer_psn = 0;
+      status = link_->CreateChannel(region.base, local_key.data(), kKeyBytes,
+                                    context_->eid.raw, region.token_value,
+                                    info.tp_handle, 1, &peer_key,
+                                    &peer_key_bytes, &peer_tp, &peer_psn);
+      if (!status.ok()) return status;
+      RemoteJettyEx remote{};
+      std::memcpy(&remote.jetty_id, peer_key.data(), sizeof(remote.jetty_id));
+      std::memcpy(&remote.trans_mode,
+                  peer_key.data() + sizeof(remote.jetty_id),
+                  sizeof(remote.trans_mode));
+      remote.policy = static_cast<std::uint32_t>(URMA_JETTY_GRP_POLICY_RR);
+      remote.type = static_cast<std::uint32_t>(URMA_JETTY);
+      urma_import_jetty_flag_t jetty_flag{};
+      jetty_flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
+      remote.flag.value = jetty_flag.value;
+      // URMA_CTP is enum value 1 in the expanded import ABI.
+      remote.tp_type = 1U;
+      ActiveTp active{};
+      active.tp_handle = info.tp_handle;
+      active.peer_tp_handle = peer_tp;
+      active.tx_psn = 1;
+      active.rx_psn = peer_psn;
+      urma_token_t peer_token{};
+      peer_token.token = region.token_value;
+      urma_target_jetty_t* remote_jetty =
+          import_jetty_ex_(context_, &remote, &peer_token, &active);
+      if (remote_jetty == nullptr) return Error("urma_import_jetty_ex");
+      remote_jettys_.push_back(remote_jetty);
     }
-    local_tp = info.tp_handle;
-    std::array<std::uint8_t, peer::kQpKeyBytes> local_key{};
-    std::memcpy(local_key.data(), &local_jetty_->jetty_id, sizeof(local_jetty_->jetty_id));
-    const urma_transport_mode_t mode = local_jetty_->jetty_cfg.jfs_cfg.trans_mode;
-    std::memcpy(local_key.data() + sizeof(local_jetty_->jetty_id), &mode, sizeof(mode));
-    std::array<std::uint8_t, peer::kQpKeyBytes> peer_key{};
-    std::uint32_t peer_key_bytes = 0;
-    std::uint64_t peer_tp = 0;
-    std::uint32_t peer_psn = 0;
-    status = link_->CreateChannel(region.base, local_key.data(), kKeyBytes, context_->eid.raw,
-                                  region.token_value, local_tp, 1, &peer_key, &peer_key_bytes,
-                                  &peer_tp, &peer_psn);
-    if (!status.ok()) return status;
-    RemoteJettyEx remote{};
-    std::memcpy(&remote.jetty_id, peer_key.data(), sizeof(remote.jetty_id));
-    std::memcpy(&remote.trans_mode, peer_key.data() + sizeof(remote.jetty_id), sizeof(remote.trans_mode));
-    remote.policy = static_cast<std::uint32_t>(URMA_JETTY_GRP_POLICY_RR);
-    remote.type = static_cast<std::uint32_t>(URMA_JETTY);
-    urma_import_jetty_flag_t jetty_flag{};
-    jetty_flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
-    remote.flag.value = jetty_flag.value;
-    // URMA_CTP is enum value 1 in the expanded import ABI.  Some installed
-    // headers do not expose the enum symbol, while CpuRuntime already uses
-    // this value for the same liburma entry point.
-    remote.tp_type = 1U;
-    ActiveTp active{};
-    active.tp_handle = local_tp;
-    active.peer_tp_handle = peer_tp;
-    active.tx_psn = 1;
-    active.rx_psn = peer_psn;
-    urma_token_t peer_token{};
-    peer_token.token = region.token_value;
-    remote_jetty_ = import_jetty_ex_(context_, &remote, &peer_token, &active);
-    if (remote_jetty_ == nullptr) return Error("urma_import_jetty_ex");
+    if (local_jettys_.empty()) return Error("no CPU Jettys created");
+    jfc_ = jfcs_[0];
+    jfr_ = jfrs_[0];
+    local_jetty_ = local_jettys_[0];
+    remote_jetty_ = remote_jettys_[0];
+    std::fprintf(stderr, "[KVAF_CPU_URMA] JETTYS_READY count=%zu depth=%u\n",
+                 local_jettys_.size(), kJettyDepth);
     initialized_ = true;
     return Status::OK();
   }
@@ -585,13 +610,30 @@ struct CpuUrmaTransport::Impl {
                        const CpuUrmaTransport::HostSge* buffers, std::size_t count) {
     constexpr std::uint64_t kBatchCtxBase = 0xBA7C0000ULL;
     if (!initialized_) return Status::InvalidState("CPU URMA transport is not initialized");
+    const std::size_t jetty_count = local_jettys_.size();
+    // The NPU side currently exposes one target Jetty with a 1024-entry RQ.
+    // Multiple CPU initiator Jettys parallelize that wave; they do not enlarge
+    // the single remote receive queue.
     if (buffers == nullptr || count == 0U || offset > remote_region_.length ||
-        count > kJettyDepth) {
+        jetty_count == 0U || count > kJettyDepth) {
       return Status::InvalidArgument("invalid batch transfer");
     }
-    std::vector<urma_sge_t> local(count);
-    std::vector<urma_sge_t> remote(count);
-    std::vector<urma_jfs_wr_t> wrs(count);
+
+    struct BatchQueue {
+      std::vector<urma_sge_t> local;
+      std::vector<urma_sge_t> remote;
+      std::vector<urma_jfs_wr_t> wrs;
+    };
+    std::vector<std::size_t> queue_counts(jetty_count, 0U);
+    for (std::size_t i = 0U; i < count; ++i) ++queue_counts[i % jetty_count];
+    std::vector<BatchQueue> queues(jetty_count);
+    for (std::size_t jetty = 0U; jetty < jetty_count; ++jetty) {
+      queues[jetty].local.resize(queue_counts[jetty]);
+      queues[jetty].remote.resize(queue_counts[jetty]);
+      queues[jetty].wrs.resize(queue_counts[jetty]);
+    }
+
+    std::vector<std::size_t> queue_positions(jetty_count, 0U);
     std::uint64_t total = 0U;
     for (std::size_t i = 0; i < count; ++i) {
       if (buffers[i].data == nullptr || buffers[i].bytes == 0U ||
@@ -605,60 +647,109 @@ struct CpuUrmaTransport::Impl {
         Status status = RegisterHostBuffer(buffers[i].data, buffers[i].bytes, &host);
         if (!status.ok()) return status;
       }
-      local[i] = {reinterpret_cast<std::uint64_t>(buffers[i].data),
-                  static_cast<std::uint32_t>(buffers[i].bytes), host->segment};
-      remote[i] = {remote_region_.base + offset + total,
-                   static_cast<std::uint32_t>(buffers[i].bytes), remote_seg_handle_};
-      wrs[i] = {};
-      wrs[i].opcode = write ? URMA_OPC_WRITE : URMA_OPC_READ;
-      wrs[i].flag.bs.complete_enable = (i + 1U == count) ? 1U : 0U;
-      wrs[i].tjetty = remote_jetty_;
-      wrs[i].user_ctx = kBatchCtxBase + i;
+      const std::size_t jetty = i % jetty_count;
+      const std::size_t position = queue_positions[jetty]++;
+      BatchQueue& queue = queues[jetty];
+      queue.local[position] = {
+          reinterpret_cast<std::uint64_t>(buffers[i].data),
+          static_cast<std::uint32_t>(buffers[i].bytes), host->segment};
+      queue.remote[position] = {
+          remote_region_.base + offset + total,
+          static_cast<std::uint32_t>(buffers[i].bytes), remote_seg_handle_};
+      queue.wrs[position] = {};
+      queue.wrs[position].opcode = write ? URMA_OPC_WRITE : URMA_OPC_READ;
+      queue.wrs[position].flag.bs.complete_enable =
+          (position + 1U == queue.wrs.size()) ? 1U : 0U;
+      queue.wrs[position].tjetty = remote_jettys_[jetty];
+      queue.wrs[position].user_ctx =
+          kBatchCtxBase + (static_cast<std::uint64_t>(jetty) << 32U) + position;
       if (write) {
-        wrs[i].rw.src = {&local[i], 1U};
-        wrs[i].rw.dst = {&remote[i], 1U};
+        queue.wrs[position].rw.src = {&queue.local[position], 1U};
+        queue.wrs[position].rw.dst = {&queue.remote[position], 1U};
       } else {
-        wrs[i].rw.src = {&remote[i], 1U};
-        wrs[i].rw.dst = {&local[i], 1U};
+        queue.wrs[position].rw.src = {&queue.remote[position], 1U};
+        queue.wrs[position].rw.dst = {&queue.local[position], 1U};
       }
-      wrs[i].next = i + 1U < count ? &wrs[i + 1U] : nullptr;
+      queue.wrs[position].next =
+          position + 1U < queue.wrs.size() ? &queue.wrs[position + 1U] : nullptr;
       total += buffers[i].bytes;
     }
-    urma_jfs_wr_t* bad = nullptr;
-    const auto start = std::chrono::steady_clock::now();
-    std::fprintf(stderr, "[KVAF_CPU_URMA] BATCH_POST wrs=%zu bytes=%llu\n",
-                 count, static_cast<unsigned long long>(total));
-    const urma_status_t post_status = urma_post_jetty_send_wr(local_jetty_, wrs.data(), &bad);
-    if (post_status != URMA_SUCCESS) {
-      return Status::Internal("batch post failed (status=" +
-                             std::to_string(static_cast<int>(post_status)) +
-                             ", bad_index=" +
-                             std::to_string(bad == nullptr ? count : static_cast<std::size_t>(bad - wrs.data())) +
-                             ", count=" + std::to_string(count) + ")");
-    }
-    const std::uint64_t expected_ctx = kBatchCtxBase + count - 1U;
-    const auto deadline = start + std::chrono::seconds(5);
-    while (std::chrono::steady_clock::now() < deadline) {
-      urma_cr_t cr{};
-      const int polled = urma_poll_jfc(jfc_, 1, &cr);
-      if (polled < 0) return Error("urma_poll_jfc for batch");
-      if (polled == 1) {
-        if (cr.status != URMA_CR_SUCCESS || cr.user_ctx != expected_ctx) {
-          return Status::Internal("batch completion failed (status=" +
-                                 std::to_string(static_cast<int>(cr.status)) +
-                                 ", user_ctx=" + std::to_string(static_cast<unsigned long long>(cr.user_ctx)) +
-                                 ", expected_ctx=" + std::to_string(static_cast<unsigned long long>(expected_ctx)) + ")");
-        }
-        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - start).count();
-        std::fprintf(stderr, "[KVAF_CPU_URMA] BATCH_COMPLETE wrs=%zu bytes=%llu elapsed_ns=%lld\n",
-                     count, static_cast<unsigned long long>(total), static_cast<long long>(elapsed));
-        return Status::OK();
+
+    for (std::size_t jetty = 0U; jetty < jetty_count; ++jetty) {
+      if (queues[jetty].wrs.empty()) continue;
+      if (queues[jetty].wrs.back().flag.bs.complete_enable == 0U) {
+        return Status::Internal("batch queue has no completion fence");
       }
-      std::this_thread::yield();
     }
-    return Status::Internal("timed out waiting for batch completion (wrs=" +
-                           std::to_string(count) + ")");
+
+    const auto start = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "[KVAF_CPU_URMA] BATCH_POST wrs=%zu jettys=%zu bytes=%llu\n",
+                 count, jetty_count, static_cast<unsigned long long>(total));
+    for (std::size_t jetty = 0U; jetty < jetty_count; ++jetty) {
+      BatchQueue& queue = queues[jetty];
+      if (queue.wrs.empty()) continue;
+      urma_jfs_wr_t* bad = nullptr;
+      const urma_status_t post_status =
+          urma_post_jetty_send_wr(local_jettys_[jetty], queue.wrs.data(), &bad);
+      if (post_status != URMA_SUCCESS) {
+        return Status::Internal(
+            "batch post failed (jetty=" + std::to_string(jetty) +
+            ", status=" + std::to_string(static_cast<int>(post_status)) +
+            ", bad_index=" +
+            std::to_string(bad == nullptr
+                               ? queue.wrs.size()
+                               : static_cast<std::size_t>(bad - queue.wrs.data())) +
+            ", count=" + std::to_string(queue.wrs.size()) + ")");
+      }
+    }
+
+    const auto deadline = start + std::chrono::seconds(5);
+    for (std::size_t jetty = 0U; jetty < jetty_count; ++jetty) {
+      BatchQueue& queue = queues[jetty];
+      if (queue.wrs.empty()) continue;
+      const std::uint64_t expected_ctx = queue.wrs.back().user_ctx;
+      bool completed = false;
+      while (std::chrono::steady_clock::now() < deadline) {
+        urma_cr_t cr{};
+        const int polled = urma_poll_jfc(jfcs_[jetty], 1, &cr);
+        if (polled < 0) return Error("urma_poll_jfc for batch");
+        if (polled == 1) {
+          if (cr.status != URMA_CR_SUCCESS || cr.user_ctx != expected_ctx) {
+            return Status::Internal(
+                "batch completion failed (jetty=" + std::to_string(jetty) +
+                ", status=" + std::to_string(static_cast<int>(cr.status)) +
+                ", user_ctx=" +
+                std::to_string(static_cast<unsigned long long>(cr.user_ctx)) +
+                ", expected_ctx=" +
+                std::to_string(static_cast<unsigned long long>(expected_ctx)) +
+                ")");
+          }
+          completed = true;
+          break;
+        }
+        std::this_thread::yield();
+      }
+      if (!completed) {
+        urma_jetty_cfg_t observed_cfg{};
+        urma_jetty_attr_t observed_attr{};
+        observed_attr.mask = JETTY_STATE;
+        const urma_status_t query_status =
+            urma_query_jetty(local_jettys_[jetty], &observed_cfg, &observed_attr);
+        return Status::Internal(
+            "timed out waiting for batch completion (jetty=" +
+            std::to_string(jetty) + ", jetty_query_status=" +
+            std::to_string(static_cast<int>(query_status)) +
+            ", jetty_state=" +
+            std::to_string(static_cast<unsigned>(observed_attr.state)) + ")");
+      }
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    std::fprintf(stderr,
+                 "[KVAF_CPU_URMA] BATCH_COMPLETE wrs=%zu jettys=%zu bytes=%llu elapsed_ns=%lld\n",
+                 count, jetty_count, static_cast<unsigned long long>(total),
+                 static_cast<long long>(elapsed));
+    return Status::OK();
   }
 
   Status TransferDeviceWrite(std::uint64_t offset, const void* device_source,
@@ -770,9 +861,18 @@ struct CpuUrmaTransport::Impl {
 
   Status Shutdown() {
     initialized_ = false;
-    if (remote_jetty_ != nullptr) { (void)urma_unimport_jetty(remote_jetty_); remote_jetty_ = nullptr; }
-    if (local_jetty_ != nullptr) { (void)urma_delete_jetty(local_jetty_); local_jetty_ = nullptr; }
-    if (jfr_ != nullptr) { (void)urma_delete_jfr(jfr_); jfr_ = nullptr; }
+    for (auto* remote_jetty : remote_jettys_) {
+      if (remote_jetty != nullptr) (void)urma_unimport_jetty(remote_jetty);
+    }
+    remote_jettys_.clear();
+    for (auto* local_jetty : local_jettys_) {
+      if (local_jetty != nullptr) (void)urma_delete_jetty(local_jetty);
+    }
+    local_jettys_.clear();
+    for (auto* jfr : jfrs_) {
+      if (jfr != nullptr) (void)urma_delete_jfr(jfr);
+    }
+    jfrs_.clear();
     if (remote_seg_handle_ != nullptr) { (void)urma_unimport_seg(remote_seg_handle_); remote_seg_handle_ = nullptr; }
     for (auto& entry : direct_host_buffers_) {
       if (entry.segment != nullptr) (void)urma_unregister_seg(entry.segment);
@@ -785,7 +885,14 @@ struct CpuUrmaTransport::Impl {
       remote_region_ = {};
     }
     owns_remote_region_ = false;
-    if (jfc_ != nullptr) { (void)urma_delete_jfc(jfc_); jfc_ = nullptr; }
+    for (auto* jfc : jfcs_) {
+      if (jfc != nullptr) (void)urma_delete_jfc(jfc);
+    }
+    jfcs_.clear();
+    jfc_ = nullptr;
+    jfr_ = nullptr;
+    local_jetty_ = nullptr;
+    remote_jetty_ = nullptr;
     if (context_ != nullptr) { (void)urma_delete_context(context_); context_ = nullptr; }
     if (urma_initialized_ && urma_owned_) { (void)urma_uninit(); }
     urma_initialized_ = false;
@@ -807,6 +914,10 @@ struct CpuUrmaTransport::Impl {
   urma_seg_t remote_seg_{};
   std::uint32_t eid_index_{0};
   std::uint32_t max_sge_{1};
+  std::vector<urma_jfc_t*> jfcs_;
+  std::vector<urma_jfr_t*> jfrs_;
+  std::vector<urma_jetty_t*> local_jettys_;
+  std::vector<urma_target_jetty_t*> remote_jettys_;
   bool urma_initialized_{false};
   bool urma_owned_{false};
   bool initialized_{false};

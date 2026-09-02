@@ -36,6 +36,9 @@ struct CpuUrmaTransportOptions {
   bool remote_hbm{false};
   std::uint32_t remote_device_id{0};
   std::uint32_t remote_eid_index{0};
+  // Number of independent local Jettys used by batch transfers. Each Jetty
+  // owns its JFC/JFR/SQ and establishes its own CTP to the remote target.
+  std::uint32_t jetty_count{1};
   bool has_external_region{false};
   peer::PeerRegion external_region{};
 };

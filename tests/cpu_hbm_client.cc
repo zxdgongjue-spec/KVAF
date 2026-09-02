@@ -20,6 +20,7 @@ struct Options {
   std::size_t block_bytes{656};
   std::size_t iterations{1};
   std::size_t warmup{1};
+  std::uint32_t jetty_count{1};
   std::uint64_t host_space_bytes{0};
   std::uint64_t seed{0x6b766166ULL};
   std::string ub_device;
@@ -49,7 +50,7 @@ void Usage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s HOST[:PORT] [PORT] [--blocks N] [--block-bytes N] "
                "[--host-space-bytes N[K|M|G|T]] [--iterations N] [--warmup N] "
-               "[--seed N] [--ub-device NAME] "
+               "[--jettys N] [--seed N] [--ub-device NAME] "
                "[--eid-index N] [--device-id N]\n",
                program);
 }
@@ -98,6 +99,8 @@ bool Parse(int argc, char** argv, Options* options) {
       options->block_bytes = number;
     }
     else if (arg == "--host-space-bytes" && ParseBytes(value, &options->host_space_bytes)) {}
+    else if ((arg == "--jettys" || arg == "--jetty-count") &&
+             ParseU32(value, &options->jetty_count)) {}
     else if (arg == "--iterations" && ParseU64(value, &number)) options->iterations = number;
     else if (arg == "--warmup" && ParseU64(value, &number)) options->warmup = number;
     else if (arg == "--seed" && ParseU64(value, &options->seed)) {}
@@ -210,11 +213,11 @@ int main(int argc, char** argv) {
   std::fprintf(stderr,
                "[HBM_TEST][CPU] START peer=%s blocks=%zu block_bytes=%zu payload_bytes=%llu "
                "host_address_space_bytes=%llu "
-               "iterations=%zu warmup=%zu remote_device=%u\n",
+               "iterations=%zu warmup=%zu jettys=%u remote_device=%u\n",
                options.peer.c_str(), options.blocks, options.block_bytes,
                static_cast<unsigned long long>(total_bytes),
                static_cast<unsigned long long>(host_space_bytes), options.iterations,
-               options.warmup, options.device_id);
+               options.warmup, options.jetty_count, options.device_id);
   std::fprintf(stderr, "[HBM_TEST][CPU] DATA_PATH=direct-registered-host-memory\n");
 
   kvaf::CpuUrmaTransportOptions transport_options;
@@ -226,6 +229,7 @@ int main(int argc, char** argv) {
   transport_options.remote_hbm = true;
   transport_options.remote_device_id = options.device_id;
   transport_options.remote_eid_index = options.has_eid_index ? options.eid_index : UINT32_MAX;
+  transport_options.jetty_count = options.jetty_count;
   kvaf::CpuUrmaTransport transport;
   kvaf::Status status = transport.Initialize(transport_options);
   if (!status.ok()) {
@@ -233,8 +237,9 @@ int main(int argc, char** argv) {
                  status.message().c_str());
     return 1;
   }
-  std::fprintf(stderr, "[HBM_TEST][CPU] CHANNEL_READY remote_bytes=%llu\n",
-               static_cast<unsigned long long>(transport.region_bytes()));
+  std::fprintf(stderr, "[HBM_TEST][CPU] CHANNEL_READY remote_bytes=%llu jettys=%u\n",
+               static_cast<unsigned long long>(transport.region_bytes()),
+               options.jetty_count);
 
   // Reserve the requested virtual address space, but touch only the selected
   // blocks. This keeps the HBM allocation at payload_bytes while allowing a
