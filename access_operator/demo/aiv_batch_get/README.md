@@ -15,19 +15,24 @@ registration; each HBM output is registered separately as a local UDMA range.
 | --- | --- | --- |
 | `address_table` | `uint64[table_capacity]` | Absolute Host DDR UBAs, produced by the meta layer. |
 | `valid_table` | `uint8[table_capacity]` | A zero entry makes its lookup invalid. |
-| `indices` | `int32[request_capacity]` | Logical entries requested by this batch. |
-| `offsets` | `int32[request_capacity]` | Byte offset inside the selected `128 * block_bytes` entry. |
+| `indices` | `int32[request_capacity]` | Logical entries. The temporary 5-SGE benchmark consumes one sequential entry per WQE, so the tail of this fixed-size array is intentionally unused. |
+| `offsets` | `int32[request_capacity]` | Byte offsets. The temporary benchmark consumes the offset paired with each used `indices` entry. |
 | `mask` | `uint8[request_capacity]` | Zero skips that request without changing the graph shape. |
 | `output_indices` | `int32[request_capacity]` | Destination row in `output`. |
 | `output` | `uint8[output_rows * block_bytes]` | Contiguous Device HBM output. |
 
-For an active request `i`, the kernel reads exactly `block_bytes` bytes from
-`address_table[indices[i]] + offsets[i]` and stores it at
-`output + output_indices[i] * block_bytes`. Each address-table entry spans
-`128 * block_bytes`, so `offsets[i] + block_bytes` must stay within that entry.
-The default block size is 656B; 1024B and other positive sizes that fit the
-device ABI can be selected per Runtime call. Duplicate output rows are not
-rejected and have last-completion-wins semantics.
+This branch currently uses a deliberately temporary performance contract. Each
+AIV partition is split into groups of up to five requests. Although A5 UDMA
+READ permits six local SGEs, five makes the complete WQE exactly 128 bytes.
+One READ WQE uses
+the next sequential `indices/offsets` pair as its single contiguous remote
+source and scatters consecutive `block_bytes` chunks to up to five sequential
+`output_indices` entries. Thus a per-core partition with `N` outputs consumes
+only `ceil(N / 5)` entries from the beginning of its `indices/offsets`
+partition; the remaining entries stay unused because READ permits only one
+remote source SGE. An offset near the end of an entry is clamped so the complete group remains inside its
+`128 * block_bytes` entry. Duplicate output rows are not rejected and have
+last-completion-wins semantics.
 
 The local-memory lifetime is intentionally separate from the shared
 transport:
@@ -58,11 +63,10 @@ addresses receive a new local MR and entity table but reuse the transport.
 
 ## What is included
 
-- `kernel/execute_batch_get_aiv.asc`: SIMT-compacts requests,
-  caches each active request's table index and request ID in UB, generates 32
-  UDMA READ WQEs in parallel, and overlaps vector fill, MTE3 UB-to-SQ copies,
-  and scalar doorbells with two UB banks. It never uses MTE to dereference Host
-  DDR.
+- `kernel/execute_batch_get_aiv.asc`: consumes the compact request prefix,
+  generates 32 five-local-SGE UDMA READ WQEs (up to 160 requests) in parallel,
+  and overlaps vector fill, MTE3 UB-to-SQ copies, and scalar doorbells with two
+  UB banks. It never uses MTE to dereference Host DDR.
 - `host/batch_get_host.cpp`: CPU/device EID discovery, Direct-HCCP transport,
   Host-DDR registration, per-output HBM-MR cache, and up to two private
   USER_CTL SQ/CQ/Jettys per AIV.
@@ -82,21 +86,24 @@ The data path keeps the public KVAF ABI and the verified Direct-HCCP WQE token
 fields. It does not copy the AIV_URMA benchmark's server/client handshake,
 control-region writes, fixed 64K request shape, or per-launch CQ reset.
 
-Each AIV compacts its complete request partition once into parallel 16384-entry
-UB arrays containing the active table indices and original request IDs. The
-caller must guarantee that each AIV owns at most 16384 mask entries whose value
-is nonzero. Before touching the SQ, the kernel rejects an active count beyond
-that capacity or a per-Jetty assignment that fills the entire SQ.
-The phase-two scheduler assigns complete 32-WQE posts to the core's Jettys in
+Each AIV consumes its assigned range of the compact request prefix directly.
+Every full logical READ WQE contains five 16-byte local SGEs after its 48-byte
+header, occupies exactly two 64-byte WQEBBs, and transfers `5 * block_bytes` bytes
+from one contiguous remote range. A short final group uses its actual SGE and
+WQEBB count. Before touching the SQ, the kernel rejects a per-Jetty WQEBB
+assignment that fills the entire SQ.
+
+The scheduler assigns complete 32-WQE/160-request posts to the core's Jettys in
 round-robin order. Each Jetty has an independent persistent SQ producer and CQ
-consumer index. Only the last READ assigned to each used Jetty requests a CQE;
+consumer index. SQ producer indices and doorbells count WQEBBs, not logical
+WQEs. Only the last READ assigned to each used Jetty requests a CQE;
 the kernel drains one CQE from every used Jetty before reporting the batch
 complete. This is required because a CQE on one Jetty does not fence READs
 submitted through another Jetty. A core with one post uses only Jetty 0, while
 the one-Jetty phase-one path remains selectable with `JETTYS_PER_CORE=1`.
 
 The ACL launcher explicitly reserves 160 KiB of AIV local memory for the two
-WQE banks, compacted table-index/request-ID arrays and SIMT validation scratch.
+WQE banks and SIMT validation scratch.
 
 ## Build and run on A5
 
@@ -136,7 +143,8 @@ DEVICE_ID=0 TABLE_CAPACITY=256 REQUESTS=10 OUTPUT_ROWS=200 \
 BLOCK_BYTES=656 SOURCE_STRIDE=83968 AIV_CORES=1 JETTYS_PER_CORE=2 ACTIVE_PERCENT=20 \
 WARMUP=1 ITERATIONS=1 bash scripts/run_execute_batch_get.sh
 
-# Exercise 1024-byte READ WQEs. SOURCE_STRIDE defaults to 128 * BLOCK_BYTES.
+# Exercise 1024-byte local SGEs (up to 5120 bytes per full READ WQE).
+# SOURCE_STRIDE defaults to 128 * BLOCK_BYTES.
 DEVICE_ID=0 BLOCK_BYTES=1024 AIV_CORES=1 JETTYS_PER_CORE=2 \
 WARMUP=1 ITERATIONS=5 bash scripts/run_execute_batch_get.sh
 

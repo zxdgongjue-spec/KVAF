@@ -23,6 +23,18 @@ constexpr uint32_t kDefaultBlockBytes =
     KVAF_AIV_BATCH_GET_DEFAULT_BLOCK_BYTES;
 constexpr uint32_t kRowsPerEntry =
     KVAF_AIV_BATCH_GET_ADDRESS_TABLE_ENTRY_COUNT;
+constexpr uint32_t kSgesPerReadWqe = 5U;
+constexpr uint32_t kWqesPerPost = 32U;
+constexpr uint32_t kRequestsPerPost = kSgesPerReadWqe * kWqesPerPost;
+
+uint64_t WqebbsForRequestCount(uint64_t request_count) {
+  const uint64_t full_wqes = request_count / kSgesPerReadWqe;
+  const uint32_t tail_sges =
+      static_cast<uint32_t>(request_count % kSgesPerReadWqe);
+  const uint64_t tail_wqebbs =
+      tail_sges == 0U ? 0U : (48U + tail_sges * 16U + 63U) / 64U;
+  return full_wqes * 2U + tail_wqebbs;
+}
 
 struct Options {
   uint32_t device = 0U;
@@ -187,20 +199,23 @@ void AccumulateQueueExpectations(const std::vector<uint8_t> &mask, const Options
         (miss_count * (core + 1U)) /
         options.aiv_cores);
     const uint64_t active = end - begin;
-    const uint64_t total_posts = (active + 31U) / 32U;
+    const uint64_t total_posts =
+        (active + kRequestsPerPost - 1U) / kRequestsPerPost;
     for (uint32_t jetty = 0U; jetty < options.jettys_per_core; ++jetty) {
-      uint64_t assigned_requests = 0U;
+      uint64_t assigned_wqebbs = 0U;
       for (uint64_t post = jetty; post < total_posts;
            post += options.jettys_per_core) {
-        assigned_requests +=
-            std::min<uint64_t>(32U, active - post * 32U);
+        const uint64_t request_offset = post * kRequestsPerPost;
+        const uint64_t post_requests = std::min<uint64_t>(
+            kRequestsPerPost, active - request_offset);
+        assigned_wqebbs += WqebbsForRequestCount(post_requests);
       }
       QueueExpectation &expectation =
           (*expectations)[static_cast<uint64_t>(core) *
                               options.jettys_per_core +
                           jetty];
-      expectation.sq_producer_index += assigned_requests;
-      expectation.completed_batch_count += assigned_requests != 0U;
+      expectation.sq_producer_index += assigned_wqebbs;
+      expectation.completed_batch_count += assigned_wqebbs != 0U;
     }
   }
 }
@@ -274,17 +289,44 @@ bool Validate(const std::vector<uint8_t> &output, const std::vector<uint64_t> &a
       }
       continue;
     }
-    const uint64_t source_offset = address_table[static_cast<uint32_t>(indices[request])] -
-                                   reinterpret_cast<uint64_t>(source) +
-                                   static_cast<uint32_t>(offsets[request]);
+    uint32_t core_begin = 0U;
+    uint32_t core_end = 0U;
+    for (uint32_t core = 0U; core < options.aiv_cores; ++core) {
+      const uint32_t candidate_begin = static_cast<uint32_t>(
+          (active_total * core) / options.aiv_cores);
+      const uint32_t candidate_end = static_cast<uint32_t>(
+          (active_total * (core + 1U)) / options.aiv_cores);
+      if (request >= candidate_begin && request < candidate_end) {
+        core_begin = candidate_begin;
+        core_end = candidate_end;
+        break;
+      }
+    }
+    const uint32_t group_begin =
+        core_begin + (request - core_begin) / kSgesPerReadWqe *
+                         kSgesPerReadWqe;
+    const uint32_t remote_request =
+        core_begin + (group_begin - core_begin) / kSgesPerReadWqe;
+    const uint32_t group_sges =
+        std::min<uint32_t>(kSgesPerReadWqe, core_end - group_begin);
+    const uint32_t group_lane = request - group_begin;
+    const uint32_t max_remote_offset =
+        (kRowsPerEntry - group_sges) * options.block_bytes;
+    const uint32_t group_remote_offset = std::min<uint32_t>(
+        static_cast<uint32_t>(offsets[remote_request]), max_remote_offset);
+    const uint64_t source_offset =
+        address_table[static_cast<uint32_t>(indices[remote_request])] -
+        reinterpret_cast<uint64_t>(source) + group_remote_offset +
+        static_cast<uint64_t>(group_lane) * options.block_bytes;
     for (uint32_t byte = 0U; byte < options.block_bytes; ++byte) {
       const uint8_t actual = output[static_cast<uint64_t>(output_indices[request]) * options.block_bytes + byte];
       const uint8_t expected = source[source_offset + byte];
       if (actual != expected) {
         std::cerr << "[KVAF_EXECUTE] validation mismatch stage=" << stage << " request=" << request
                   << " source_uba=0x" << std::hex
-                  << address_table[static_cast<uint32_t>(indices[request])] +
-                         static_cast<uint32_t>(offsets[request])
+                  << address_table[static_cast<uint32_t>(indices[remote_request])] +
+                         group_remote_offset +
+                         static_cast<uint64_t>(group_lane) * options.block_bytes
                   << std::dec << " output_row=" << output_indices[request] << " byte=" << byte
                   << " expected=" << static_cast<uint32_t>(expected) << " actual="
                   << static_cast<uint32_t>(actual) << '\n';
@@ -294,7 +336,7 @@ bool Validate(const std::vector<uint8_t> &output, const std::vector<uint64_t> &a
   }
   std::cout << "EXECUTE_BATCH_GET_VALIDATION stage=" << stage << " active_requests=" << active_total
             << " masked_requests=" << (options.requests - active_total) << " table_mode=absolute_host_uba"
-            << " output_layout=scatter_rows jettys_per_core="
+            << " remote_layout=contiguous_group local_sges=5 output_layout=scatter_rows jettys_per_core="
             << options.jettys_per_core << "\n";
   return true;
 }

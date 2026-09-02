@@ -117,10 +117,11 @@ typedef struct KvafBatchGetDirectUrmaEntity {
 typedef struct KvafExecuteBatchGetKernelArgs {
   uint64_t address_table;       // uint64[table_capacity], absolute Host DDR UBA
   uint64_t valid_table;         // uint8[table_capacity]
+  // Temporary multi-SGE benchmark: one sequential entry is consumed per WQE.
   uint64_t indices;             // int32[request_capacity]
   uint64_t offsets;             // int32[request_capacity], byte offset in entry
   uint64_t miss_count;          // int32[1], valid request-prefix length
-  uint64_t output_indices;      // int32[request_capacity]
+  uint64_t output_indices;      // int32[request_capacity], one per local SGE
   uint64_t output;              // caller-owned HBM output; must match entity
   uint64_t core_status;         // KvafBatchGetCoreStatus[block_count]
   uint64_t channel_entity;      // Entity[block_count * jettys_per_core]
@@ -128,7 +129,9 @@ typedef struct KvafExecuteBatchGetKernelArgs {
   uint32_t table_capacity;
   uint32_t request_capacity;
   uint32_t output_rows;
-  uint32_t block_bytes;         // Per-request READ length and output row size
+  // Per-local-SGE length and output row size. The benchmark kernel groups up
+  // to five requests into one contiguous-remote READ WQE.
+  uint32_t block_bytes;
   uint32_t block_count;
   // Zero preserves the phase-one ABI and selects one Jetty per AIV core.
   uint32_t jettys_per_core;

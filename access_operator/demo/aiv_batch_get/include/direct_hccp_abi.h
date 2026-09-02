@@ -68,6 +68,27 @@ struct CtxInitAttr {
   uint32_t reserved[16];
 };
 
+// RaGetDevBaseAttr output. Only sq_max_sge is consumed by BatchGet, but the
+// complete private-ABI footprint is retained so libra can populate the record
+// without writing beyond it.
+struct DevBaseAttr {
+  uint32_t sq_max_depth;
+  uint32_t rq_max_depth;
+  uint32_t sq_max_sge;
+  uint32_t rq_max_sge;
+  uint32_t ub[42];
+  uint32_t max_read_size;
+  uint32_t max_write_size;
+  uint64_t max_msg_size;
+  uint32_t reserved[12];
+};
+
+static_assert(sizeof(DevBaseAttr) == 248, "RaGetDevBaseAttr ABI changed");
+static_assert(offsetof(DevBaseAttr, sq_max_sge) == 8,
+              "RaGetDevBaseAttr sqMaxSge offset changed");
+static_assert(offsetof(DevBaseAttr, max_read_size) == 184,
+              "RaGetDevBaseAttr maxReadSize offset changed");
+
 struct TokenId {
   uint32_t token_id;
 };
@@ -297,6 +318,7 @@ struct RtNetServiceOpenArgs {
 // not link HCOMM or need an HCOMM source tree.
 using CtxInitFn = int (*)(CtxInitCfg *, CtxInitAttr *, void **);
 using CtxDeinitFn = int (*)(void *);
+using GetDevBaseAttrFn = int (*)(void *, DevBaseAttr *);
 using TokenAllocFn = int (*)(void *, TokenId *, void **);
 using TokenFreeFn = int (*)(void *, void *);
 using LmemRegisterFn = int (*)(void *, MrRegInfo *, void **);

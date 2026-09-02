@@ -37,6 +37,7 @@ constexpr uint32_t kHostStandardSqDepth = 8192U;
 constexpr uint32_t kDeviceUserCtlSqDepth = 8192U;
 constexpr uint32_t kWqeBytes = 64U;
 constexpr uint32_t kWqebbPerWqe = 4U;
+constexpr uint32_t kBatchGetSgesPerWqe = 5U;
 constexpr uint32_t kDeviceUserCtlCqDepth = 16384U;
 constexpr uint32_t kDeviceRqDepth = 256U;
 constexpr uint32_t kCtpTpCount = 1U;
@@ -71,6 +72,7 @@ struct DirectHccpApi {
   void *library = nullptr;
   hccp::CtxInitFn ctx_init = nullptr;
   hccp::CtxDeinitFn ctx_deinit = nullptr;
+  hccp::GetDevBaseAttrFn get_dev_base_attr = nullptr;
   hccp::TokenAllocFn token_alloc = nullptr;
   hccp::TokenFreeFn token_free = nullptr;
   hccp::LmemRegisterFn lmem_register = nullptr;
@@ -398,6 +400,7 @@ bool LoadDirectHccp(DirectHccpApi *api) {
   const bool loaded =
       LoadSymbol(api->library, "RaCtxInit", &api->ctx_init) &&
       LoadSymbol(api->library, "RaCtxDeinit", &api->ctx_deinit) &&
+      LoadSymbol(api->library, "RaGetDevBaseAttr", &api->get_dev_base_attr) &&
       LoadSymbol(api->library, "RaCtxTokenIdAlloc", &api->token_alloc) &&
       LoadSymbol(api->library, "RaCtxTokenIdFree", &api->token_free) &&
       LoadSymbol(api->library, "RaCtxLmemRegister", &api->lmem_register) &&
@@ -476,6 +479,25 @@ bool InitContext(const DirectHccpApi &api, int32_t mode, uint32_t physical_devic
   }
   std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_CONTEXT_READY role=%s mode=%d physical=%u context=%p\n",
                role, mode, physical_device_id, *context);
+  return true;
+}
+
+bool CheckMultiSgeCapability(const DirectHccpApi &api, void *context,
+                             const char *role) {
+  hccp::DevBaseAttr attr{};
+  const int ret = api.get_dev_base_attr(context, &attr);
+  if (ret != 0 || attr.sq_max_sge < kBatchGetSgesPerWqe) {
+    std::fprintf(stderr,
+                 "[KVAF_AIV] DIRECT_MULTI_SGE_UNSUPPORTED role=%s "
+                 "required_sge=%u sq_max_sge=%u ret=%d\n",
+                 role, kBatchGetSgesPerWqe, attr.sq_max_sge, ret);
+    return false;
+  }
+  std::fprintf(stderr,
+               "[KVAF_AIV] DIRECT_MULTI_SGE_READY role=%s required_sge=%u "
+               "sq_max_sge=%u max_read_size=%u\n",
+               role, kBatchGetSgesPerWqe, attr.sq_max_sge,
+               attr.max_read_size);
   return true;
 }
 
@@ -1013,6 +1035,8 @@ extern "C" int32_t KvafBatchGetTransportCreate(void *host_ddr, uint64_t host_ddr
                    &state->host_context) ||
       !InitContext(state->api, hccp::kOfflineHdc, identity.physical_device_id, pair.device_eid, "device_aiv",
                    &state->device_context) ||
+      !CheckMultiSgeCapability(state->api, state->device_context,
+                               "device_aiv") ||
       !AllocateToken(state->api, state->host_context, "host_cpu", &state->host_token_handle, &host_token_id) ||
       !AllocateToken(state->api, state->device_context, "device_transport", &state->device_transport_token_handle,
                      &device_transport_token_id)) {

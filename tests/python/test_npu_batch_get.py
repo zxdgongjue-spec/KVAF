@@ -29,6 +29,7 @@ from backend import detect_torch_backend
 
 DEFAULT_BLOCK_BYTES = 656
 ROWS_PER_ENTRY = 128
+SGES_PER_READ_WQE = 5
 
 
 def pattern(slot: int, block_bytes: int) -> bytes:
@@ -50,6 +51,36 @@ def percentile(values: list[float], fraction: float) -> float:
     lower = int(position)
     upper = min(lower + 1, len(ordered) - 1)
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
+def grouped_payload_slots(
+    indices: list[int],
+    offsets: list[int],
+    active_requests: int,
+    core_count: int,
+    block_bytes: int,
+    entry_epoch: int = 0,
+) -> list[int | None]:
+    """Expected payloads for one remote segment scattered to five local SGEs."""
+    expected: list[int | None] = [None] * len(indices)
+    for core in range(core_count):
+        begin = active_requests * core // core_count
+        end = active_requests * (core + 1) // core_count
+        for group_index, group_begin in enumerate(
+            range(begin, end, SGES_PER_READ_WQE)
+        ):
+            sge_count = min(SGES_PER_READ_WQE, end - group_begin)
+            remote_request = begin + group_index
+            source_entry = (
+                indices[remote_request] + entry_epoch
+            ) % active_requests
+            source_row = offsets[remote_request] // block_bytes
+            source_row = min(source_row, ROWS_PER_ENTRY - sge_count)
+            for lane in range(sge_count):
+                expected[group_begin + lane] = (
+                    source_entry * ROWS_PER_ENTRY + source_row + lane
+                )
+    return expected
 
 
 def validate_output(
@@ -174,13 +205,13 @@ def main() -> int:
     # is skipped by the AIV kernel.
     indices_values = [0] * requests
     offsets_values = [0] * requests
-    payload_slots: list[int | None] = [None] * requests
     for payload_slot, request in enumerate(active_request_positions):
         indices_values[request] = payload_slot
         offsets_values[request] = (request % ROWS_PER_ENTRY) * block_bytes
-        payload_slots[request] = (
-            payload_slot * ROWS_PER_ENTRY + offsets_values[request] // block_bytes
-        )
+    payload_slots = grouped_payload_slots(
+        indices_values, offsets_values, active_requests, npu_core_count,
+        block_bytes
+    )
     output_indices_values = [output_rows - 1 - request for request in range(requests)]
     # Exercise the public variable-size BatchPut contract independently of
     # BatchGet's fixed-block kernel contract. Supplying KVAF_BATCH_PUT_KERNEL
@@ -444,7 +475,6 @@ def main() -> int:
 
             def prepare_graph_inputs(epoch: int) -> list[int | None]:
                 """Update only host staging data; device addresses stay fixed."""
-                expected_payload_slots = list(payload_slots)
                 for payload_slot in range(active_requests):
                     source_slot = (payload_slot + epoch) % active_requests
                     address = struct.unpack_from(
@@ -453,18 +483,10 @@ def main() -> int:
                     struct.pack_into(
                         "<Q", graph_address_table_host, payload_slot * 8, address
                     )
-                for request in active_request_positions:
-                    payload_slot = payload_slots[request]
-                    if payload_slot is None:
-                        raise AssertionError("active request is missing a payload slot")
-                    source_entry = (
-                        indices_values[request] + epoch
-                    ) % active_requests
-                    expected_payload_slots[request] = (
-                        source_entry * ROWS_PER_ENTRY + offsets_values[request]
-                        // block_bytes
-                    )
-                return expected_payload_slots
+                return grouped_payload_slots(
+                    indices_values, offsets_values, active_requests,
+                    npu_core_count, block_bytes, epoch
+                )
 
             def enqueue_graph_inputs(trace: str | None = None) -> None:
                 if trace is not None:
