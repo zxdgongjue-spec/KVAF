@@ -1,6 +1,8 @@
 #ifndef KVAF_LAYER_RESIDENT_GET_DEVICE_H_
 #define KVAF_LAYER_RESIDENT_GET_DEVICE_H_
 
+#include <climits>
+
 // Device-side Direct-HCCP building block for the P9 product boundary:
 //
 //   ExactScoreScan / CandidateCompact
@@ -392,6 +394,63 @@ __aicore__ inline bool ValidateKvafLayerResidentOutputIndices(
   return true;
 }
 
+// Append one logical KV object to a queue-local dense descriptor. Candidate
+// admission and fixed resident-slot assignment stay in the source-derived C8
+// operator; KVAF owns the proven Direct-HCCP table/offset encoding so the two
+// call sites cannot drift. This only fills a descriptor. The caller must
+// publish the completed wave (DDR barrier) and then call Begin.
+__aicore__ inline bool AppendKvafLayerResidentRequest(
+    const KvafLayerResidentBatchGetControl& control,
+    KvafLayerResidentBatchGetDescriptorScratch* descriptor,
+    uint32_t kv_object, uint32_t rows_per_entry, int32_t output_row) {
+  if (descriptor == nullptr || rows_per_entry == 0U ||
+      !IsKvafLayerResidentBatchGetControlValidForAicore(control) ||
+      descriptor->address_table == 0U || descriptor->valid_table == 0U ||
+      descriptor->indices == 0U || descriptor->offsets == 0U ||
+      descriptor->mask == 0U || descriptor->output_indices == 0U ||
+      descriptor->table_capacity == 0U || descriptor->request_capacity == 0U ||
+      descriptor->request_capacity > KVAF_AIV_BATCH_GET_DENSE_REQUEST_CAPACITY ||
+      descriptor->active_request_count >= descriptor->request_capacity ||
+      descriptor->reserved0 != 0U || output_row < 0) {
+    return false;
+  }
+  const uint64_t resident_end =
+      control.resident_row_base + control.resident_row_count;
+  if (static_cast<uint64_t>(output_row) < control.resident_row_base ||
+      static_cast<uint64_t>(output_row) >= resident_end) {
+    return false;
+  }
+  const uint32_t table_index = kv_object / rows_per_entry;
+  if (table_index >= descriptor->table_capacity) {
+    return false;
+  }
+  const uint64_t byte_offset =
+      static_cast<uint64_t>(kv_object % rows_per_entry) * control.block_bytes;
+  if (byte_offset > static_cast<uint64_t>(INT32_MAX)) {
+    return false;
+  }
+  const uint32_t request = descriptor->active_request_count;
+  __gm__ int32_t* const indices =
+      reinterpret_cast<__gm__ int32_t*>(descriptor->indices);
+  __gm__ int32_t* const offsets =
+      reinterpret_cast<__gm__ int32_t*>(descriptor->offsets);
+  __gm__ uint8_t* const mask =
+      reinterpret_cast<__gm__ uint8_t*>(descriptor->mask);
+  __gm__ int32_t* const output_indices =
+      reinterpret_cast<__gm__ int32_t*>(descriptor->output_indices);
+  for (uint32_t earlier = 0U; earlier < request; ++earlier) {
+    if (output_indices[earlier] == output_row) {
+      return false;
+    }
+  }
+  indices[request] = static_cast<int32_t>(table_index);
+  offsets[request] = static_cast<int32_t>(byte_offset);
+  mask[request] = 1U;
+  output_indices[request] = output_row;
+  descriptor->active_request_count = request + 1U;
+  return true;
+}
+
 __aicore__ inline bool PublishKvafLayerResidentDescriptor(
     const KvafLayerResidentBatchGetControl& control,
     const KvafLayerResidentQueueLease& lease,
@@ -558,6 +617,86 @@ __aicore__ inline bool FinishKvafLayerResidentBatchGet(
   terminal->reserved0 = 0U;
   terminal->result = wave->transaction.result;
   return terminal->success != 0U;
+}
+
+// Return a queue which was successfully leased but was never made visible to
+// Direct-HCCP.  This is deliberately distinct from the terminal-CQ return
+// below: it is valid only while the lease is still Held, before descriptor
+// Publish or Begin.  It never fabricates a transaction or a terminal state.
+//
+// A caller that has passed Publish/Begin must use the normal
+// PostOnly -> TryRetire -> Finish -> terminal return path, even if a later
+// validation step fails.  The owner-tag CAS makes a failed return observable:
+// keep the Held lease for diagnosis instead of silently forgetting it.
+__simt_callee__ inline bool ReturnKvafLayerResidentUnpostedQueueFromSimt(
+    const KvafLayerResidentBatchGetControl& control,
+    KvafLayerResidentQueueLease* lease) {
+  if (lease == nullptr || lease->state != kLayerResidentQueueHeld ||
+      lease->owner_tag <= 0 || lease->queue_id >= control.queue_count ||
+      !IsKvafLayerResidentBatchGetControlValidForLease(control)) {
+    return false;
+  }
+  __gm__ int32_t* const owners =
+      reinterpret_cast<__gm__ int32_t*>(control.queue_leases);
+  AscendC::Simt::ThreadFence();
+  if (asc_atomic_cas(owners + lease->queue_id, lease->owner_tag, 0) !=
+      lease->owner_tag) {
+    return false;
+  }
+  AscendC::Simt::ThreadFence();
+  lease->owner_tag = 0;
+  lease->state = kLayerResidentQueueIdle;
+  return true;
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(1)
+inline void KvafLayerResidentReturnUnpostedSimtService(
+    __gm__ const KvafLayerResidentBatchGetControl* control_gm,
+    uint32_t queue_id, int32_t owner_tag,
+    __ubuf__ KvafLayerResidentQueueLeaseResult* result) {
+  if (control_gm == nullptr || result == nullptr) {
+    return;
+  }
+  KvafLayerResidentBatchGetControl control{};
+  if (!LoadKvafLayerResidentBatchGetControlFromGmForSimt(control_gm,
+                                                         &control)) {
+    return;
+  }
+  KvafLayerResidentQueueLease lease{queue_id, owner_tag,
+                                     kLayerResidentQueueHeld, 0U};
+  if (ReturnKvafLayerResidentUnpostedQueueFromSimt(control, &lease)) {
+    result->queue_id = queue_id;
+    result->owner_tag = 0;
+    result->success = 1U;
+    result->reserved0 = 0U;
+  }
+}
+
+__aicore__ inline bool ReturnKvafLayerResidentUnpostedQueueFromAicore(
+    __gm__ const KvafLayerResidentBatchGetControl* control_gm,
+    __ubuf__ KvafLayerResidentQueueLeaseResult* result, event_t simt_event,
+    KvafLayerResidentQueueLease* lease) {
+  if (control_gm == nullptr || result == nullptr || lease == nullptr ||
+      lease->state != kLayerResidentQueueHeld || lease->owner_tag <= 0) {
+    return false;
+  }
+  result->queue_id = lease->queue_id;
+  result->owner_tag = lease->owner_tag;
+  result->success = 0U;
+  result->reserved0 = 0U;
+  set_flag(PIPE_S, PIPE_V, simt_event);
+  wait_flag(PIPE_S, PIPE_V, simt_event);
+  AscendC::Simt::VF_CALL<KvafLayerResidentReturnUnpostedSimtService>(
+      AscendC::Simt::Dim3{1U, 1U, 1U}, control_gm, lease->queue_id,
+      lease->owner_tag, result);
+  set_flag(PIPE_V, PIPE_S, simt_event);
+  wait_flag(PIPE_V, PIPE_S, simt_event);
+  if (result->success == 0U) {
+    return false;
+  }
+  lease->owner_tag = 0;
+  lease->state = kLayerResidentQueueIdle;
+  return true;
 }
 
 // This releases an SQ/CQ *queue* after its terminal CQ; it never releases,

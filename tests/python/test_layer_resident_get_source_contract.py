@@ -43,8 +43,10 @@ def main() -> None:
 
     for token in (
         "TryAcquireKvafLayerResidentQueueFromAicore",
+        "AppendKvafLayerResidentRequest",
         "PublishKvafLayerResidentDescriptor",
         "ValidateKvafLayerResidentOutputIndices",
+        "ReturnKvafLayerResidentUnpostedQueueFromAicore",
         "BeginKvafLayerResidentBatchGet",
         "TryRetireKvafLayerResidentBatchGet",
         "FinishKvafLayerResidentBatchGet",
@@ -86,6 +88,18 @@ def main() -> None:
     ):
         assert token in validate, token
 
+    append = _between(
+        helper,
+        "__aicore__ inline bool AppendKvafLayerResidentRequest(",
+        "__aicore__ inline bool PublishKvafLayerResidentDescriptor(",
+    )
+    for token in (
+        "kv_object / rows_per_entry",
+        "control.block_bytes",
+        "output_indices[earlier] == output_row",
+    ):
+        assert token in append, token
+
     finish = _between(
         helper,
         "__aicore__ inline bool FinishKvafLayerResidentBatchGet(",
@@ -93,6 +107,29 @@ def main() -> None:
     )
     assert "FinishKvafDenseBatchGet" in finish
     assert "kDenseBatchGetRetired" in finish
+
+    unposted_return = _between(
+        helper,
+        "__simt_callee__ inline bool ReturnKvafLayerResidentUnpostedQueueFromSimt(",
+        "// This releases an SQ/CQ *queue*",
+    )
+    for token in (
+        "kLayerResidentQueueHeld",
+        "asc_atomic_cas(owners + lease->queue_id, lease->owner_tag, 0)",
+        "KvafLayerResidentReturnUnpostedSimtService",
+        "ReturnKvafLayerResidentUnpostedQueueFromAicore",
+        "lease->state = kLayerResidentQueueIdle",
+    ):
+        assert token in unposted_return, token
+    # An unposted return is specifically not a synthetic CQ terminal.  If a
+    # doorbell may have happened, only the normal terminal drain is allowed.
+    for forbidden in (
+        "kLayerResidentQueueTerminal",
+        "KvafDenseBatchGetTransaction",
+        "BeginKvafDenseBatchGetPostOnly",
+        "FinishKvafDenseBatchGet",
+    ):
+        assert forbidden not in unposted_return, forbidden
 
     assert "struct LayerResidentBatchGetBinding" in public
     for token in (
