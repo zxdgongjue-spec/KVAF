@@ -24,6 +24,7 @@ namespace {
 
 constexpr std::uint32_t kJfcDepth = 1024;
 constexpr std::uint32_t kJettyDepth = 1024;
+constexpr std::uint32_t kMaxSge = 16;
 constexpr std::uint32_t kPageBytes = 4096;
 constexpr std::uint32_t kKeyBytes = sizeof(urma_jetty_id_t) + sizeof(urma_transport_mode_t);
 // AIV/Direct-HCCP and liburma expose the same routing EID prefix but may
@@ -186,6 +187,9 @@ struct CpuUrmaTransport::Impl {
                    device_attr.dev_cap.max_jfs_sge,
                    device_attr.dev_cap.max_jfs_rsge,
                    device_attr.dev_cap.max_jfr_sge);
+      if (device_attr.dev_cap.max_jfs_sge != 0U) {
+        max_sge_ = std::min<std::uint32_t>(kMaxSge, device_attr.dev_cap.max_jfs_sge);
+      }
     }
     urma_jfc_cfg_t jfc_cfg{};
     jfc_cfg.depth = kJfcDepth;
@@ -247,7 +251,7 @@ struct CpuUrmaTransport::Impl {
     jetty_cfg.jfs_cfg.depth = kJettyDepth;
     jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
     jetty_cfg.jfs_cfg.priority = URMA_MAX_PRIORITY;
-    jetty_cfg.jfs_cfg.max_sge = 1;
+    jetty_cfg.jfs_cfg.max_sge = static_cast<std::uint8_t>(max_sge_);
     jetty_cfg.jfs_cfg.max_rsge = 1;
     jetty_cfg.jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
     jetty_cfg.jfs_cfg.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
@@ -392,6 +396,95 @@ struct CpuUrmaTransport::Impl {
   Status RegisterDirectHostMemory(void* base, std::size_t bytes) {
     RegisteredHostBuffer* ignored = nullptr;
     return RegisterHostBuffer(base, bytes, &ignored);
+  }
+
+  Status TransferSgl(bool write, std::uint64_t offset,
+                     const CpuUrmaTransport::HostSge* buffers, std::size_t count) {
+    if (!initialized_) return Status::InvalidState("CPU URMA transport is not initialized");
+    if (buffers == nullptr || count == 0U || count > max_sge_ ||
+        offset > remote_region_.length) {
+      return Status::InvalidArgument("invalid SGL transfer");
+    }
+    std::vector<urma_sge_t> local(count);
+    std::uint64_t total = 0U;
+    for (std::size_t i = 0; i < count; ++i) {
+      if (buffers[i].data == nullptr || buffers[i].bytes == 0U ||
+          buffers[i].bytes > std::numeric_limits<std::uint32_t>::max() ||
+          total > std::numeric_limits<std::uint64_t>::max() - buffers[i].bytes) {
+        return Status::InvalidArgument("invalid SGL entry");
+      }
+      total += buffers[i].bytes;
+      RegisteredHostBuffer* host = FindRegisteredHostBuffer(buffers[i].data, buffers[i].bytes);
+      if (host == nullptr) {
+        Status status = RegisterHostBuffer(buffers[i].data, buffers[i].bytes, &host);
+        if (!status.ok()) return status;
+      }
+      local[i].addr = reinterpret_cast<std::uint64_t>(buffers[i].data);
+      local[i].len = static_cast<std::uint32_t>(buffers[i].bytes);
+      local[i].tseg = host->segment;
+    }
+    if (total == 0U || total > remote_region_.length - offset ||
+        total > std::numeric_limits<std::uint32_t>::max()) {
+      return Status::InvalidArgument("SGL transfer exceeds remote region");
+    }
+    urma_sge_t remote{};
+    remote.addr = remote_region_.base + offset;
+    remote.len = static_cast<std::uint32_t>(total);
+    remote.tseg = remote_seg_handle_;
+    urma_sg_t local_sg{local.data(), static_cast<std::uint32_t>(count)};
+    urma_sg_t remote_sg{&remote, 1U};
+    urma_jfs_wr_t wr{};
+    wr.opcode = write ? URMA_OPC_WRITE : URMA_OPC_READ;
+    wr.flag.bs.complete_enable = 1;
+    wr.tjetty = remote_jetty_;
+    wr.user_ctx = 0xD1CFULL;
+    if (write) {
+      wr.rw.src = local_sg;
+      wr.rw.dst = remote_sg;
+    } else {
+      wr.rw.src = remote_sg;
+      wr.rw.dst = local_sg;
+    }
+    urma_jfs_wr_t* bad = nullptr;
+    const urma_status_t post_status = urma_post_jetty_send_wr(local_jetty_, &wr, &bad);
+    if (post_status != URMA_SUCCESS) {
+      return Status::Internal("urma_post_jetty_send_wr for SGL failed (status=" +
+                             std::to_string(static_cast<int>(post_status)) +
+                             ", bad_wr=" +
+                             std::to_string(reinterpret_cast<std::uintptr_t>(bad)) +
+                             ", num_sge=" + std::to_string(count) + ", errno=" +
+                             std::to_string(errno) + ")");
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+      urma_cr_t cr{};
+      const int polled = urma_poll_jfc(jfc_, 1, &cr);
+      if (polled < 0) return Error("urma_poll_jfc for SGL");
+      if (polled == 1) {
+        if (cr.status != URMA_CR_SUCCESS || cr.user_ctx != 0xD1CFULL) {
+          return Status::Internal("SGL URMA completion reported failure (status=" +
+                                 std::to_string(static_cast<int>(cr.status)) +
+                                 ", completion_len=" + std::to_string(cr.completion_len) +
+                                 ", user_ctx=0x" +
+                                 std::to_string(static_cast<unsigned long long>(cr.user_ctx)) +
+                                 ", num_sge=" + std::to_string(count) + ")");
+        }
+        return Status::OK();
+      }
+      std::this_thread::yield();
+    }
+    urma_jetty_cfg_t observed_cfg{};
+    urma_jetty_attr_t observed_attr{};
+    observed_attr.mask = JETTY_STATE;
+    const urma_status_t query_status =
+        urma_query_jetty(local_jetty_, &observed_cfg, &observed_attr);
+    return Status::Internal("timed out waiting for SGL completion (op=" +
+                           std::string(write ? "WRITE" : "READ") +
+                           ", num_sge=" + std::to_string(count) +
+                           ", jetty_query_status=" +
+                           std::to_string(static_cast<int>(query_status)) +
+                           ", jetty_state=" +
+                           std::to_string(static_cast<unsigned>(observed_attr.state)) + ")");
   }
 
   Status TransferDirect(bool write, std::uint64_t offset, void* data, std::size_t bytes) {
@@ -611,6 +704,7 @@ struct CpuUrmaTransport::Impl {
   urma_target_seg_t* remote_seg_handle_{nullptr};
   urma_seg_t remote_seg_{};
   std::uint32_t eid_index_{0};
+  std::uint32_t max_sge_{1};
   bool urma_initialized_{false};
   bool urma_owned_{false};
   bool initialized_{false};
@@ -626,6 +720,10 @@ Status CpuUrmaTransport::Initialize(const CpuUrmaTransportOptions& options) { re
 Status CpuUrmaTransport::Write(std::uint64_t offset, const void* source, std::size_t bytes) {
   return impl_->TransferDirect(true, offset, const_cast<void*>(source), bytes);
 }
+Status CpuUrmaTransport::WriteSgl(std::uint64_t offset, const HostSge* sources,
+                                  std::size_t count) {
+  return impl_->TransferSgl(true, offset, sources, count);
+}
 Status CpuUrmaTransport::RegisterDirectHostMemory(void* base, std::size_t bytes) {
   return impl_->RegisterDirectHostMemory(base, bytes);
 }
@@ -636,8 +734,13 @@ Status CpuUrmaTransport::WriteDeviceMemory(std::uint64_t offset, const void* dev
 Status CpuUrmaTransport::Read(std::uint64_t offset, void* destination, std::size_t bytes) {
   return impl_->TransferDirect(false, offset, destination, bytes);
 }
+Status CpuUrmaTransport::ReadSgl(std::uint64_t offset, const HostSge* destinations,
+                                 std::size_t count) {
+  return impl_->TransferSgl(false, offset, destinations, count);
+}
 Status CpuUrmaTransport::Shutdown() { return impl_->Shutdown(); }
 bool CpuUrmaTransport::initialized() const { return impl_->initialized_; }
 std::uint64_t CpuUrmaTransport::region_bytes() const { return impl_->remote_region_.length; }
+std::uint32_t CpuUrmaTransport::max_sge() const { return impl_->max_sge_; }
 
 }  // namespace kvaf

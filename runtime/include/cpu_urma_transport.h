@@ -52,6 +52,11 @@ class CpuUrmaTransport final {
   // Uses the caller's host buffer directly as the URMA SGE. The segment is
   // registered and cached on first use, so no bounce-buffer copy is made.
   Status Write(std::uint64_t remote_offset, const void* source, std::size_t bytes);
+  struct HostSge {
+    void* data;
+    std::size_t bytes;
+  };
+  Status WriteSgl(std::uint64_t remote_offset, const HostSge* sources, std::size_t count);
   // Register one page-aligned host region once. Direct transfers from any
   // sub-range of this region then reuse the same URMA segment.
   Status RegisterDirectHostMemory(void* base, std::size_t bytes);
@@ -64,10 +69,12 @@ class CpuUrmaTransport final {
   Status WriteDeviceMemory(std::uint64_t remote_offset, const void* device_source,
                            std::size_t bytes);
   Status Read(std::uint64_t remote_offset, void* destination, std::size_t bytes);
+  Status ReadSgl(std::uint64_t remote_offset, const HostSge* destinations, std::size_t count);
   Status Shutdown();
 
   bool initialized() const;
   std::uint64_t region_bytes() const;
+  std::uint32_t max_sge() const;
 
  private:
   struct Impl;

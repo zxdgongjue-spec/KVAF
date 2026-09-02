@@ -62,3 +62,9 @@ achieved CPU-initiated URMA payload rate, not raw HBM silicon bandwidth; with
 
 The test accepts explicit EIDs for diagnostics, but the default path follows
 the pair-info local/remote EID rule used by the H2D script.
+
+`--sgl-size N` controls the number of local host SGEs carried by one URMA WR;
+the default is `1`. For example, `--sgl-size 2` sends two 656-byte blocks in
+one WR. This requires multi-SGE support in the active provider and both ends
+of the data path; a device reporting `max_jfs_sge` only describes the local
+CPU capability and does not guarantee that the remote HBM path accepts it.
