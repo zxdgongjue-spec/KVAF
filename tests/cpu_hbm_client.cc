@@ -21,6 +21,7 @@
 #include <fstream>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <urma_api.h>
@@ -104,8 +105,10 @@ bool Transfer(State* s, bool write, std::size_t index, std::uint64_t offset, std
   urma_sge_t remote{}; remote.addr = s->remote_va + offset; remote.len = static_cast<std::uint32_t>(bytes); remote.tseg = s->remote_seg;
   urma_jfs_wr_t wr{}; wr.opcode = write ? URMA_OPC_WRITE : URMA_OPC_READ; wr.flag.bs.complete_enable = 1; wr.tjetty = s->remote_jetty; wr.user_ctx = user_ctx;
   if (write) { wr.rw.src = {&local, 1}; wr.rw.dst = {&remote, 1}; } else { wr.rw.src = {&remote, 1}; wr.rw.dst = {&local, 1}; }
-  urma_jfs_wr_t* bad = nullptr; if (urma_post_jetty_send_wr(s->jetty, &wr, &bad) != URMA_SUCCESS) { std::fprintf(stderr, "[HBM_TEST][CPU] transfer post failed op=%s index=%zu\n", write ? "WRITE" : "READ", index); return false; }
-  for (int i = 0; i < 500000; ++i) { urma_cr_t cr{}; const int n = urma_poll_jfc(s->jfc, 1, &cr); if (n < 0) return false; if (n == 1) { if (cr.status != URMA_CR_SUCCESS || cr.user_ctx != user_ctx) std::fprintf(stderr, "[HBM_TEST][CPU] transfer completion failed op=%s index=%zu status=%d ctx=0x%llx\n", write ? "WRITE" : "READ", index, static_cast<int>(cr.status), static_cast<unsigned long long>(cr.user_ctx)); return cr.status == URMA_CR_SUCCESS && cr.user_ctx == user_ctx; } }
+  urma_jfs_wr_t* bad = nullptr; const auto post_ret = urma_post_jetty_send_wr(s->jetty, &wr, &bad); if (post_ret != URMA_SUCCESS) { std::fprintf(stderr, "[HBM_TEST][CPU] transfer post failed op=%s index=%zu ret=%d bad=%p\n", write ? "WRITE" : "READ", index, static_cast<int>(post_ret), static_cast<void*>(bad)); return false; }
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (std::chrono::steady_clock::now() < deadline) { urma_cr_t cr{}; const int n = urma_poll_jfc(s->jfc, 1, &cr); if (n < 0) { std::fprintf(stderr, "[HBM_TEST][CPU] transfer CQ poll failed op=%s index=%zu\n", write ? "WRITE" : "READ", index); return false; } if (n == 1) { if (cr.status != URMA_CR_SUCCESS || cr.user_ctx != user_ctx) std::fprintf(stderr, "[HBM_TEST][CPU] transfer completion failed op=%s index=%zu status=%d ctx=0x%llx\n", write ? "WRITE" : "READ", index, static_cast<int>(cr.status), static_cast<unsigned long long>(cr.user_ctx)); return cr.status == URMA_CR_SUCCESS && cr.user_ctx == user_ctx; } std::this_thread::yield(); }
+  std::fprintf(stderr, "[HBM_TEST][CPU] transfer CQ timeout op=%s index=%zu\n", write ? "WRITE" : "READ", index);
   return false;
 }
 

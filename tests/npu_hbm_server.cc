@@ -345,6 +345,7 @@ int main(int argc, char** argv) {
       response.peer_key_bytes = state.jetty_info.key.size;
       std::memcpy(response.peer_key, state.jetty_info.key.value, response.peer_key_bytes);
       ok = WriteAll(fd, &response, sizeof(response));
+      if (ok) std::fprintf(stderr, "[HBM_TEST][NPU] CHANNEL_READY peer_tp=0x%llx key_bytes=%u\n", static_cast<unsigned long long>(response.peer_tp), response.peer_key_bytes);
       if (ok) {
         // Keep the HBM allocation and imported jetty alive until the CPU has
         // completed its benchmark and byte-validation pass.
