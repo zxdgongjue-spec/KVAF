@@ -128,7 +128,7 @@ bool RunPass(State* s, bool write, const std::vector<std::size_t>& order, std::s
 
 int main(int argc, char** argv) {
   if (argc < 2) return 2;
-  std::string host = argv[1]; std::uint16_t port = 29888; std::size_t blocks = 1, block_bytes = 656, iterations = 1, warmup = 1; std::uint64_t seed = 0x6b766166ULL; std::array<std::uint8_t, 16> wanted{}; bool have = false; std::uint32_t eid_index = 0, physical = 0, remote_device_id = 0;
+  std::string host = argv[1]; std::uint16_t port = 29888; std::size_t blocks = 1, block_bytes = 656, iterations = 1, warmup = 1; std::uint64_t seed = 0x6b766166ULL; std::array<std::uint8_t, 16> wanted{}; bool have = false; bool local_physical_explicit = false; std::uint32_t eid_index = 0, physical = 0, remote_device_id = 0;
   int arg_start = 2; if (arg_start < argc && argv[arg_start][0] != '-') port = static_cast<std::uint16_t>(std::strtoul(argv[arg_start++], nullptr, 0));
   else {
     const std::size_t colon = host.rfind(':');
@@ -141,12 +141,13 @@ int main(int argc, char** argv) {
     }
   }
   for (int i = arg_start; i < argc; ++i) { const std::string a = argv[i]; if (i + 1 >= argc) return 2;
-    if (a == "--blocks") blocks = std::strtoull(argv[++i], nullptr, 0); else if (a == "--block-bytes") block_bytes = std::strtoull(argv[++i], nullptr, 0); else if (a == "--iterations") iterations = std::strtoull(argv[++i], nullptr, 0); else if (a == "--warmup") warmup = std::strtoull(argv[++i], nullptr, 0); else if (a == "--seed") seed = std::strtoull(argv[++i], nullptr, 0); else if (a == "--bytes") { block_bytes = std::strtoull(argv[++i], nullptr, 0); blocks = 1; } else if (a == "--device-id") remote_device_id = std::strtoul(argv[++i], nullptr, 0); else if (a == "--local-physical") physical = std::strtoul(argv[++i], nullptr, 0); else if (a == "--eid-index") eid_index = std::strtoul(argv[++i], nullptr, 0);
+    if (a == "--blocks") blocks = std::strtoull(argv[++i], nullptr, 0); else if (a == "--block-bytes") block_bytes = std::strtoull(argv[++i], nullptr, 0); else if (a == "--iterations") iterations = std::strtoull(argv[++i], nullptr, 0); else if (a == "--warmup") warmup = std::strtoull(argv[++i], nullptr, 0); else if (a == "--seed") seed = std::strtoull(argv[++i], nullptr, 0); else if (a == "--bytes") { block_bytes = std::strtoull(argv[++i], nullptr, 0); blocks = 1; } else if (a == "--device-id") remote_device_id = std::strtoul(argv[++i], nullptr, 0); else if (a == "--local-physical") { physical = std::strtoul(argv[++i], nullptr, 0); local_physical_explicit = true; } else if (a == "--eid-index") eid_index = std::strtoul(argv[++i], nullptr, 0);
     else if (a == "--host-eid") { const char* t = argv[++i]; if (std::strlen(t) != 32) return 2; auto h = [](char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; }; for (int j = 0; j < 16; ++j) { const int x = h(t[2 * j]), y = h(t[2 * j + 1]); if (x < 0 || y < 0) return 2; wanted[j] = static_cast<std::uint8_t>((x << 4) | y); } have = true; } else return 2;
   }
   if (blocks == 0 || block_bytes == 0 || iterations == 0 || blocks > UINT64_MAX / block_bytes || block_bytes > UINT32_MAX) return 2;
+  if (!local_physical_explicit) physical = remote_device_id;
   const std::uint64_t total_bytes = static_cast<std::uint64_t>(blocks * block_bytes);
-  std::fprintf(stderr, "[HBM_TEST][CPU] START host=%s port=%u blocks=%zu block_bytes=%zu total_bytes=%llu iterations=%zu warmup=%zu\n", host.c_str(), port, blocks, block_bytes, static_cast<unsigned long long>(total_bytes), iterations, warmup);
+  std::fprintf(stderr, "[HBM_TEST][CPU] START host=%s port=%u blocks=%zu block_bytes=%zu total_bytes=%llu iterations=%zu warmup=%zu remote_device=%u local_physical=%u\n", host.c_str(), port, blocks, block_bytes, static_cast<unsigned long long>(total_bytes), iterations, warmup, remote_device_id, physical);
   urma_init_attr_t init{}; if (urma_init(&init) != URMA_SUCCESS) { LogFail("urma_init"); return 1; } if (!have && !PairInfoLocalEid(physical, &wanted)) { LogFail("local_eid_discovery"); return 1; }
   const int fd = Connect(host, port); if (fd < 0) { LogFail("connect"); return 1; }
   AllocateHbmRegionRequest alloc{}; alloc.header = MakeHeader(Command::kAllocateHbmRegion, sizeof(alloc)); alloc.hbm_bytes = total_bytes; alloc.slot_size = block_bytes; alloc.device_id = remote_device_id; alloc.eid_index = eid_index;

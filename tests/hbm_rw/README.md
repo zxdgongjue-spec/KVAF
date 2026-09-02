@@ -31,6 +31,10 @@ tests/run_hbm_rw_client.sh <npu-host> 29888 \
   --blocks 1024 --block-bytes 656 --device-id 0 --eid-index 0
 ```
 
+For a CPU/NPU co-located host, `--device-id` is also used to select the local
+pair-info physical device unless `--local-physical` is supplied. On separate
+hosts, use `--local-physical` for the CPU-side physical device.
+
 The client registers a local host buffer, imports the NPU HBM segment, creates
 the CTP/Jetty pair, performs one CPU-originated WRITE and one READ, then checks
 CQ completion and byte equality. The server keeps the HBM registration alive
