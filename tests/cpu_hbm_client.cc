@@ -6,9 +6,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
-#include <memory>
 #include <random>
 #include <string>
+#include <sys/mman.h>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -19,6 +20,7 @@ struct Options {
   std::size_t block_bytes{656};
   std::size_t iterations{1};
   std::size_t warmup{1};
+  std::uint64_t host_space_bytes{0};
   std::uint64_t seed{0x6b766166ULL};
   std::string ub_device;
   bool has_eid_index{false};
@@ -46,9 +48,31 @@ bool ParseU32(const char* text, std::uint32_t* value) {
 void Usage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s HOST[:PORT] [PORT] [--blocks N] [--block-bytes N] "
-               "[--iterations N] [--warmup N] [--seed N] [--ub-device NAME] "
+               "[--host-space-bytes N[K|M|G|T]] [--iterations N] [--warmup N] "
+               "[--seed N] [--ub-device NAME] "
                "[--eid-index N] [--device-id N]\n",
                program);
+}
+
+bool ParseBytes(const char* text, std::uint64_t* value) {
+  if (text == nullptr || value == nullptr || *text == '\0') return false;
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(text, &end, 0);
+  if (end == text) return false;
+  std::uint64_t multiplier = 1U;
+  if (*end != '\0') {
+    if (end[1] != '\0') return false;
+    switch (*end) {
+      case 'k': case 'K': multiplier = 1ULL << 10U; break;
+      case 'm': case 'M': multiplier = 1ULL << 20U; break;
+      case 'g': case 'G': multiplier = 1ULL << 30U; break;
+      case 't': case 'T': multiplier = 1ULL << 40U; break;
+      default: return false;
+    }
+  }
+  if (parsed > std::numeric_limits<std::uint64_t>::max() / multiplier) return false;
+  *value = static_cast<std::uint64_t>(parsed) * multiplier;
+  return true;
 }
 
 bool Parse(int argc, char** argv, Options* options) {
@@ -73,6 +97,7 @@ bool Parse(int argc, char** argv, Options* options) {
       options->blocks = 1;
       options->block_bytes = number;
     }
+    else if (arg == "--host-space-bytes" && ParseBytes(value, &options->host_space_bytes)) {}
     else if (arg == "--iterations" && ParseU64(value, &number)) options->iterations = number;
     else if (arg == "--warmup" && ParseU64(value, &number)) options->warmup = number;
     else if (arg == "--seed" && ParseU64(value, &options->seed)) {}
@@ -98,6 +123,18 @@ struct Stats {
 
 struct HostBlock {
   std::uint8_t* data{nullptr};
+};
+
+struct MappedRegion {
+  std::uint8_t* data{nullptr};
+  std::size_t bytes{0};
+
+  MappedRegion() = default;
+  ~MappedRegion() {
+    if (data != nullptr) (void)munmap(data, bytes);
+  }
+  MappedRegion(const MappedRegion&) = delete;
+  MappedRegion& operator=(const MappedRegion&) = delete;
 };
 
 bool RunPass(kvaf::CpuUrmaTransport* transport, bool write,
@@ -159,12 +196,25 @@ int main(int argc, char** argv) {
     return argc > 1 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h") ? 0 : 2;
   }
   const std::uint64_t total_bytes = static_cast<std::uint64_t>(options.blocks) * options.block_bytes;
+  const std::uint64_t host_space_bytes =
+      options.host_space_bytes == 0U ? total_bytes : options.host_space_bytes;
+  if (host_space_bytes < total_bytes ||
+      host_space_bytes / options.block_bytes < options.blocks ||
+      host_space_bytes > std::numeric_limits<std::size_t>::max()) {
+    std::fprintf(stderr,
+                 "[HBM_TEST][CPU] invalid host address space bytes=%llu for blocks=%zu block_bytes=%zu\n",
+                 static_cast<unsigned long long>(host_space_bytes), options.blocks,
+                 options.block_bytes);
+    return 2;
+  }
   std::fprintf(stderr,
-               "[HBM_TEST][CPU] START peer=%s blocks=%zu block_bytes=%zu total_bytes=%llu "
+               "[HBM_TEST][CPU] START peer=%s blocks=%zu block_bytes=%zu payload_bytes=%llu "
+               "host_address_space_bytes=%llu "
                "iterations=%zu warmup=%zu remote_device=%u\n",
                options.peer.c_str(), options.blocks, options.block_bytes,
-               static_cast<unsigned long long>(total_bytes), options.iterations, options.warmup,
-               options.device_id);
+               static_cast<unsigned long long>(total_bytes),
+               static_cast<unsigned long long>(host_space_bytes), options.iterations,
+               options.warmup, options.device_id);
   std::fprintf(stderr, "[HBM_TEST][CPU] DATA_PATH=direct-registered-host-memory\n");
 
   kvaf::CpuUrmaTransportOptions transport_options;
@@ -186,22 +236,37 @@ int main(int argc, char** argv) {
   std::fprintf(stderr, "[HBM_TEST][CPU] CHANNEL_READY remote_bytes=%llu\n",
                static_cast<unsigned long long>(transport.region_bytes()));
 
-  // Separate allocations intentionally produce non-contiguous/random host addresses.
+  // Reserve the requested virtual address space, but touch only the selected
+  // blocks. This keeps the HBM allocation at payload_bytes while allowing a
+  // 100G host address-space placement test.
   std::mt19937_64 rng(options.seed);
   const std::size_t page_bytes = 4096U;
+  if (static_cast<std::size_t>(host_space_bytes) >
+      std::numeric_limits<std::size_t>::max() - (page_bytes - 1U)) {
+    std::fprintf(stderr, "[HBM_TEST][CPU] host address space size overflows page rounding\n");
+    (void)transport.Shutdown();
+    return 1;
+  }
   const std::size_t allocation_bytes =
-      (total_bytes + page_bytes - 1U) / page_bytes * page_bytes;
-  std::unique_ptr<std::uint8_t, decltype(&std::free)> storage(nullptr, &std::free);
-  void* storage_address = nullptr;
-  if (posix_memalign(&storage_address, page_bytes, allocation_bytes) != 0 ||
-      storage_address == nullptr) {
-    std::fprintf(stderr, "[HBM_TEST][CPU] host region allocation failed bytes=%zu\n",
+      (static_cast<std::size_t>(host_space_bytes) + page_bytes - 1U) /
+      page_bytes * page_bytes;
+  int mmap_flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_NORESERVE
+  mmap_flags |= MAP_NORESERVE;
+#endif
+  void* storage_address = mmap(nullptr, allocation_bytes, PROT_READ | PROT_WRITE,
+                               mmap_flags, -1, 0);
+  MappedRegion storage;
+  if (storage_address == MAP_FAILED) {
+    std::fprintf(stderr, "[HBM_TEST][CPU] host address-space reservation failed bytes=%zu\n",
                  allocation_bytes);
     (void)transport.Shutdown();
     return 1;
   }
-  storage.reset(static_cast<std::uint8_t*>(storage_address));
-  status = transport.RegisterDirectHostMemory(storage.get(), total_bytes);
+  storage.data = static_cast<std::uint8_t*>(storage_address);
+  storage.bytes = allocation_bytes;
+  status = transport.RegisterDirectHostMemory(
+      storage.data, static_cast<std::size_t>(host_space_bytes));
   if (!status.ok()) {
     std::fprintf(stderr, "[HBM_TEST][CPU] FAILED stage=host_region_register: %s\n",
                  status.message().c_str());
@@ -211,11 +276,17 @@ int main(int argc, char** argv) {
   std::vector<HostBlock> blocks(options.blocks);
   std::vector<std::vector<std::uint8_t>> expected(
       options.blocks, std::vector<std::uint8_t>(options.block_bytes));
-  std::vector<std::size_t> slots(options.blocks);
-  for (std::size_t i = 0; i < options.blocks; ++i) slots[i] = i;
-  std::shuffle(slots.begin(), slots.end(), rng);
+  const std::uint64_t slot_count = host_space_bytes / options.block_bytes;
+  std::uniform_int_distribution<std::uint64_t> slot_distribution(0U, slot_count - 1U);
+  std::unordered_set<std::uint64_t> used_slots;
+  used_slots.reserve(options.blocks * 2U);
   for (std::size_t i = 0; i < options.blocks; ++i) {
-    blocks[i].data = storage.get() + slots[i] * options.block_bytes;
+    std::uint64_t slot = 0U;
+    do {
+      slot = slot_distribution(rng);
+    } while (!used_slots.insert(slot).second);
+    blocks[i].data = storage.data +
+                     static_cast<std::size_t>(slot * options.block_bytes);
     for (std::size_t j = 0; j < options.block_bytes; ++j) {
       blocks[i].data[j] = static_cast<std::uint8_t>(rng());
       expected[i][j] = blocks[i].data[j];

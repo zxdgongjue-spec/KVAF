@@ -40,18 +40,22 @@ bounce-buffer memcpy is performed.
 
 ## Random 656-byte block benchmark
 
-The CPU client allocates one page-aligned host region and registers it as one
-URMA segment. It places `n` 656-byte blocks at shuffled offsets inside that
-region; transfer order is also shuffled while remote offsets remain contiguous
-as `i * block_bytes`:
+The CPU client reserves one page-aligned host virtual address space and
+registers it as one URMA segment. It touches only `n` non-overlapping 656-byte
+blocks at random offsets inside that space; transfer order is also shuffled
+while remote HBM offsets remain contiguous as `i * block_bytes`. The host
+address-space size is independent from the HBM allocation size:
 
 ```bash
 tests/run_hbm_rw_client.sh <npu-host> 29888 \
-  --blocks 10000 --block-bytes 656 --iterations 10 --warmup 1 --seed 1
+  --blocks 1024 --block-bytes 656 --host-space-bytes 100G \
+  --iterations 10 --warmup 1 --seed 1
 ```
 
-The server allocates the matching total HBM size from the CPU request; no
-matching `--bytes` argument is required on the NPU host.
+The CPU `AllocateHbmRegionRequest` still carries only
+`1024 * 656 = 671744` bytes, so the NPU allocates that amount of contiguous
+HBM. `--host-space-bytes` controls only the CPU-side virtual address range;
+it does not increase the remote HBM allocation.
 
 Bandwidth is calculated from the wall-clock interval covering all WR
 submissions and matching CQ completions. Per-operation latency is measured from
