@@ -462,6 +462,19 @@ struct CpuUrmaTransport::Impl {
       if (polled < 0) return Error("urma_poll_jfc for SGL");
       if (polled == 1) {
         if (cr.status != URMA_CR_SUCCESS || cr.user_ctx != 0xD1CFULL) {
+          std::fprintf(stderr,
+                       "[KVAF_CPU_URMA] SGL_CQE_ERROR op=%s num_sge=%zu status=%d "
+                       "completion_len=%u user_ctx=0x%llx\n",
+                       write ? "WRITE" : "READ", count, static_cast<int>(cr.status),
+                       cr.completion_len,
+                       static_cast<unsigned long long>(cr.user_ctx));
+          for (std::size_t i = 0; i < local.size(); ++i) {
+            std::fprintf(stderr,
+                         "[KVAF_CPU_URMA] SGL_ENTRY index=%zu addr=0x%llx len=%u "
+                         "token_id=%u\n",
+                         i, static_cast<unsigned long long>(local[i].addr), local[i].len,
+                         local[i].tseg == nullptr ? 0U : local[i].tseg->seg.token_id);
+          }
           return Status::Internal("SGL URMA completion reported failure (status=" +
                                  std::to_string(static_cast<int>(cr.status)) +
                                  ", completion_len=" + std::to_string(cr.completion_len) +

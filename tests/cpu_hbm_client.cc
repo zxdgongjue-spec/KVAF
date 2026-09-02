@@ -25,6 +25,7 @@ struct Options {
   std::uint32_t eid_index{0};
   std::uint32_t device_id{0};
   std::size_t sgl_size{1};
+  std::string sgl_pattern{"random"};
 };
 
 bool ParseU64(const char* text, std::uint64_t* value) {
@@ -48,7 +49,8 @@ void Usage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s HOST[:PORT] [PORT] [--blocks N] [--block-bytes N] "
                "[--iterations N] [--warmup N] [--seed N] [--ub-device NAME] "
-               "[--eid-index N] [--device-id N] [--sgl-size N]\n",
+               "[--eid-index N] [--device-id N] [--sgl-size N] "
+               "[--sgl-pattern random|adjacent|same]\n",
                program);
 }
 
@@ -81,6 +83,11 @@ bool Parse(int argc, char** argv, Options* options) {
     else if (arg == "--eid-index" && ParseU32(value, &options->eid_index)) options->has_eid_index = true;
     else if (arg == "--device-id" && ParseU32(value, &options->device_id)) {}
     else if (arg == "--sgl-size" && ParseU64(value, &number)) options->sgl_size = number;
+    else if (arg == "--sgl-pattern" &&
+             (std::string(value) == "random" || std::string(value) == "adjacent" ||
+              std::string(value) == "same")) {
+      options->sgl_pattern = value;
+    }
     else return false;
   }
   return options->blocks != 0 && options->block_bytes != 0 && options->iterations != 0 &&
@@ -201,6 +208,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   std::fprintf(stderr, "[HBM_TEST][CPU] SGL_SIZE=%zu\n", options.sgl_size);
+  std::fprintf(stderr, "[HBM_TEST][CPU] SGL_PATTERN=%s\n", options.sgl_pattern.c_str());
 
   // Separate allocations intentionally produce non-contiguous/random host addresses.
   std::mt19937_64 rng(options.seed);
@@ -229,7 +237,7 @@ int main(int argc, char** argv) {
       options.blocks, std::vector<std::uint8_t>(options.block_bytes));
   std::vector<std::size_t> slots(options.blocks);
   for (std::size_t i = 0; i < options.blocks; ++i) slots[i] = i;
-  std::shuffle(slots.begin(), slots.end(), rng);
+  if (options.sgl_pattern == "random") std::shuffle(slots.begin(), slots.end(), rng);
   for (std::size_t i = 0; i < options.blocks; ++i) {
     blocks[i].data = storage.get() + slots[i] * options.block_bytes;
     for (std::size_t j = 0; j < options.block_bytes; ++j) {
@@ -237,9 +245,12 @@ int main(int argc, char** argv) {
       expected[i][j] = blocks[i].data[j];
     }
   }
+  if (options.sgl_pattern == "same") {
+    for (std::size_t i = 1; i < options.blocks; ++i) blocks[i].data = blocks[0].data;
+  }
   std::vector<std::size_t> order(options.blocks);
   for (std::size_t i = 0; i < options.blocks; ++i) order[i] = i;
-  std::shuffle(order.begin(), order.end(), rng);
+  if (options.sgl_pattern == "random") std::shuffle(order.begin(), order.end(), rng);
 
   Stats warmup_stats;
   if (options.warmup != 0 && !RunPass(&transport, true, &blocks, order, options.block_bytes,
@@ -261,10 +272,12 @@ int main(int argc, char** argv) {
     return 1;
   }
   bool verified = true;
-  for (std::size_t i = 0; i < blocks.size(); ++i) {
-    verified = verified && std::equal(blocks[i].data,
-                                      blocks[i].data + options.block_bytes,
-                                      expected[i].begin());
+  if (options.sgl_pattern != "same") {
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+      verified = verified && std::equal(blocks[i].data,
+                                        blocks[i].data + options.block_bytes,
+                                        expected[i].begin());
+    }
   }
   PrintStats("WRITE", write_stats);
   PrintStats("READ", read_stats);
