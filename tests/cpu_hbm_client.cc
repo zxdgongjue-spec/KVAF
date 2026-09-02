@@ -265,14 +265,6 @@ int main(int argc, char** argv) {
   }
   storage.data = static_cast<std::uint8_t*>(storage_address);
   storage.bytes = allocation_bytes;
-  status = transport.RegisterDirectHostMemory(
-      storage.data, static_cast<std::size_t>(host_space_bytes));
-  if (!status.ok()) {
-    std::fprintf(stderr, "[HBM_TEST][CPU] FAILED stage=host_region_register: %s\n",
-                 status.message().c_str());
-    (void)transport.Shutdown();
-    return 1;
-  }
   std::vector<HostBlock> blocks(options.blocks);
   std::vector<std::vector<std::uint8_t>> expected(
       options.blocks, std::vector<std::uint8_t>(options.block_bytes));
@@ -291,6 +283,18 @@ int main(int argc, char** argv) {
       blocks[i].data[j] = static_cast<std::uint8_t>(rng());
       expected[i][j] = blocks[i].data[j];
     }
+  }
+  // Fault in the selected pages before registering the encompassing segment.
+  // Providers that validate VA-to-page mappings during registration can then
+  // accept the sparse 100G virtual range without requiring all pages to be
+  // physically resident.
+  status = transport.RegisterDirectHostMemory(
+      storage.data, static_cast<std::size_t>(host_space_bytes));
+  if (!status.ok()) {
+    std::fprintf(stderr, "[HBM_TEST][CPU] FAILED stage=host_region_register: %s\n",
+                 status.message().c_str());
+    (void)transport.Shutdown();
+    return 1;
   }
   std::vector<std::size_t> order(options.blocks);
   for (std::size_t i = 0; i < options.blocks; ++i) order[i] = i;
