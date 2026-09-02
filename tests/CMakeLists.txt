@@ -75,16 +75,6 @@ if(KVAF_BUILD_HBM_RW_TEST)
     kvaf_direct_hccp_session kvaf_peer_link ascendcl ${CMAKE_DL_LIBS} pthread)
   get_filename_component(KVAF_HBM_TEST_URMA_LIBRARY_DIR "${KVAF_HBM_TEST_URMA_LIBRARY}" DIRECTORY)
 
-  add_executable(kvaf_cpu_hbm_client cpu_hbm_client.cc)
-  target_include_directories(kvaf_cpu_hbm_client PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/runtime/include
-    ${CMAKE_SOURCE_DIR}/access_operator/include
-    ${KVAF_HBM_TEST_URMA_INCLUDE_DIR})
-  target_link_libraries(kvaf_cpu_hbm_client PRIVATE
-    ${KVAF_HBM_TEST_URMA_LIBRARY} ${CMAKE_DL_LIBS} pthread)
-  set_property(TARGET kvaf_cpu_hbm_client APPEND PROPERTY BUILD_RPATH
-    "${KVAF_HBM_TEST_URMA_LIBRARY_DIR}")
   set_property(TARGET kvaf_npu_hbm_server APPEND PROPERTY BUILD_RPATH
     "${KVAF_HBM_TEST_URMA_LIBRARY_DIR}" "${ASCEND_CANN_PACKAGE_PATH}/lib64")
 endif()

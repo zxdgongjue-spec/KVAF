@@ -49,9 +49,12 @@ class CpuUrmaTransport final {
   CpuUrmaTransport& operator=(const CpuUrmaTransport&) = delete;
 
   Status Initialize(const CpuUrmaTransportOptions& options);
-  // The probe copies through an internally registered host buffer. This keeps
-  // the API convenient for tests while preserving URMA's registration rule.
+  // Uses the caller's host buffer directly as the URMA SGE. The segment is
+  // registered and cached on first use, so no bounce-buffer copy is made.
   Status Write(std::uint64_t remote_offset, const void* source, std::size_t bytes);
+  // Register one page-aligned host region once. Direct transfers from any
+  // sub-range of this region then reuse the same URMA segment.
+  Status RegisterDirectHostMemory(void* base, std::size_t bytes);
   // Attempts a direct CPU URMA WRITE from device memory (for example an
   // aclrtMalloc HBM pointer), without a KVAF host-side memcpy. The pointer
   // must remain valid until this call returns. Failure means the active

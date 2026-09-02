@@ -92,6 +92,18 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   target_link_libraries(kvaf_cpu_runtime_npu_hbm_e2e PRIVATE kvaf_cpu_runtime)
   target_compile_features(kvaf_cpu_runtime_npu_hbm_e2e PRIVATE cxx_std_17)
 
+  # Standalone HBM benchmark uses the exact same CpuUrmaTransport control/data
+  # path as CpuRuntime.  Keep the benchmark entry point here so a normal
+  # `build.sh cpu` build produces it without pulling in the custom test wire
+  # protocol or a second URMA implementation.
+  add_executable(kvaf_cpu_hbm_client ../tests/cpu_hbm_client.cc)
+  target_include_directories(kvaf_cpu_hbm_client PRIVATE
+    "${KVAF_URMA_INCLUDE_DIR}")
+  target_link_libraries(kvaf_cpu_hbm_client PRIVATE kvaf_cpu_urma_transport)
+  target_compile_features(kvaf_cpu_hbm_client PRIVATE cxx_std_17)
+  set_property(TARGET kvaf_cpu_hbm_client APPEND PROPERTY BUILD_RPATH
+    "${KVAF_URMA_LIBRARY_DIR}")
+
   if(KVAF_BUILD_CPU_URMA_PROBE)
     if(NOT ASCEND_CANN_PACKAGE_PATH OR
        NOT EXISTS "${ASCEND_CANN_PACKAGE_PATH}/include/acl/acl.h")

@@ -13,6 +13,7 @@
 #include <limits>
 #include <memory>
 #include <thread>
+#include <vector>
 
 #include <urma_api.h>
 
@@ -187,33 +188,6 @@ struct CpuUrmaTransport::Impl {
       return Status::NotImplemented("liburma lacks CTP-aware import APIs");
     }
 
-    if (posix_memalign(&buffer_, kPageBytes, static_cast<std::size_t>(options.region_bytes)) != 0 ||
-        buffer_ == nullptr) return Error("posix_memalign");
-    std::memset(buffer_, 0, static_cast<std::size_t>(options.region_bytes));
-    token_value_ = 1;
-    token_id_ = urma_alloc_token_id(context_);
-    if (token_id_ == nullptr) return Error("urma_alloc_token_id");
-    urma_seg_cfg_t seg_cfg{};
-    seg_cfg.va = reinterpret_cast<std::uint64_t>(buffer_);
-    seg_cfg.len = options.region_bytes;
-    seg_cfg.token_id = token_id_;
-    seg_cfg.token_value.token = token_value_;
-    seg_cfg.flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
-    // UMDK releases use different names for local-only registration. Keep the
-    // probe source-compatible with both the deployed CPU service headers and
-    // older public UMDK headers.
-#if defined(URMA_ACCESS_LOCAL_WRITE)
-    seg_cfg.flag.bs.access = URMA_ACCESS_LOCAL_WRITE;
-#elif defined(URMA_ACCESS_LOCAL_ONLY)
-    seg_cfg.flag.bs.access = URMA_ACCESS_LOCAL_ONLY;
-#else
-    seg_cfg.flag.bs.access = 1U;
-#endif
-    seg_cfg.flag.bs.non_pin = 1;
-    seg_cfg.flag.bs.token_id_valid = 1;
-    local_seg_ = urma_register_seg(context_, &seg_cfg);
-    if (local_seg_ == nullptr) return Error("urma_register_seg");
-
     link_ = std::make_unique<peer::PeerLink>(options.peer_address);
     peer::PeerRegion region{};
     Status status = Status::OK();
@@ -320,18 +294,101 @@ struct CpuUrmaTransport::Impl {
     return Status::OK();
   }
 
-  Status Transfer(bool write, std::uint64_t offset, void* data, std::size_t bytes) {
+  struct RegisteredHostBuffer {
+    const void* address{nullptr};
+    std::size_t bytes{0};
+    urma_token_id_t* token_id{nullptr};
+    urma_target_seg_t* segment{nullptr};
+  };
+
+  RegisteredHostBuffer* FindRegisteredHostBuffer(const void* address, std::size_t bytes) {
+    const auto requested = reinterpret_cast<std::uintptr_t>(address);
+    for (auto& entry : direct_host_buffers_) {
+      const auto base = reinterpret_cast<std::uintptr_t>(entry.address);
+      if (requested >= base && bytes <= entry.bytes && requested - base <= entry.bytes - bytes) {
+        return &entry;
+      }
+    }
+    return nullptr;
+  }
+
+  Status RegisterHostBuffer(const void* address, std::size_t bytes,
+                            RegisteredHostBuffer** result) {
+    if (result == nullptr || address == nullptr || bytes == 0) {
+      return Status::InvalidArgument("invalid direct host buffer");
+    }
+    if (auto* existing = FindRegisteredHostBuffer(address, bytes); existing != nullptr) {
+      *result = existing;
+      return Status::OK();
+    }
+    const auto requested = reinterpret_cast<std::uintptr_t>(address);
+    const auto base = requested & ~static_cast<std::uintptr_t>(kPageBytes - 1U);
+    if (bytes > std::numeric_limits<std::uintptr_t>::max() - requested) {
+      return Status::InvalidArgument("direct host buffer range overflow");
+    }
+    const auto end = requested + bytes;
+    if (end > std::numeric_limits<std::uintptr_t>::max() - (kPageBytes - 1U)) {
+      return Status::InvalidArgument("direct host buffer range overflow");
+    }
+    const auto rounded_end = (end + kPageBytes - 1U) &
+                             ~static_cast<std::uintptr_t>(kPageBytes - 1U);
+    if (rounded_end < base) return Status::InvalidArgument("direct host buffer range overflow");
+    auto* token_id = urma_alloc_token_id(context_);
+    if (token_id == nullptr) return Error("urma_alloc_token_id for direct host buffer");
+    urma_seg_cfg_t cfg{};
+    cfg.va = static_cast<std::uint64_t>(base);
+    // UB providers register page-granular ranges. Direct callers must keep
+    // the backing allocation valid through this rounded-up length.
+    cfg.len = rounded_end - base;
+    cfg.token_id = token_id;
+    cfg.token_value.token = 0xD1CE0000U + static_cast<std::uint32_t>(direct_host_buffers_.size() + 1U);
+    cfg.flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
+#if defined(URMA_ACCESS_LOCAL_WRITE)
+    cfg.flag.bs.access = URMA_ACCESS_LOCAL_WRITE;
+#elif defined(URMA_ACCESS_LOCAL_ONLY)
+    cfg.flag.bs.access = URMA_ACCESS_LOCAL_ONLY;
+#else
+    cfg.flag.bs.access = 1U;
+#endif
+    cfg.flag.bs.non_pin = 1;
+    cfg.flag.bs.token_id_valid = 1;
+    auto* segment = urma_register_seg(context_, &cfg);
+    if (segment == nullptr) {
+      const int registration_errno = errno;
+      (void)urma_free_token_id(token_id);
+      errno = registration_errno;
+      return Status::Internal("urma_register_seg for direct host buffer failed (va=0x" +
+                             std::to_string(reinterpret_cast<std::uintptr_t>(address)) +
+                             ", bytes=" + std::to_string(cfg.len) +
+                             ", errno=" + std::to_string(registration_errno) + ")");
+    }
+    direct_host_buffers_.push_back(RegisteredHostBuffer{
+        reinterpret_cast<const void*>(base), static_cast<std::size_t>(cfg.len), token_id, segment});
+    *result = &direct_host_buffers_.back();
+    return Status::OK();
+  }
+
+  Status RegisterDirectHostMemory(void* base, std::size_t bytes) {
+    RegisteredHostBuffer* ignored = nullptr;
+    return RegisterHostBuffer(base, bytes, &ignored);
+  }
+
+  Status TransferDirect(bool write, std::uint64_t offset, void* data, std::size_t bytes) {
     if (!initialized_) return Status::InvalidState("CPU URMA transport is not initialized");
-    if (data == nullptr || bytes == 0 || offset > remote_region_.length || bytes > remote_region_.length - offset ||
-        bytes > std::numeric_limits<std::uint32_t>::max()) return Status::InvalidArgument("invalid transfer range");
-    // The probe owns one registered host segment.  User buffers are copied
-    // through this registered bounce buffer; a production backend can replace
-    // this with per-buffer registration or a registration cache.
-    if (write) std::memcpy(buffer_, data, bytes);
+    if (data == nullptr || bytes == 0 || offset > remote_region_.length ||
+        bytes > remote_region_.length - offset || bytes > std::numeric_limits<std::uint32_t>::max()) {
+      return Status::InvalidArgument("invalid direct transfer range");
+    }
+    RegisteredHostBuffer* host = nullptr;
+    host = FindRegisteredHostBuffer(data, bytes);
+    if (host == nullptr) {
+      Status status = RegisterHostBuffer(data, bytes, &host);
+      if (!status.ok()) return status;
+    }
     urma_sge_t local{};
-    local.addr = reinterpret_cast<std::uint64_t>(buffer_);
+    local.addr = reinterpret_cast<std::uint64_t>(data);
     local.len = static_cast<std::uint32_t>(bytes);
-    local.tseg = local_seg_;
+    local.tseg = host->segment;
     urma_sge_t remote{};
     remote.addr = remote_region_.base + offset;
     remote.len = static_cast<std::uint32_t>(bytes);
@@ -340,24 +397,32 @@ struct CpuUrmaTransport::Impl {
     wr.opcode = write ? URMA_OPC_WRITE : URMA_OPC_READ;
     wr.flag.bs.complete_enable = 1;
     wr.tjetty = remote_jetty_;
-    wr.user_ctx = 0xC0DE;
-    if (write) { wr.rw.src = {&local, 1}; wr.rw.dst = {&remote, 1}; }
-    else { wr.rw.src = {&remote, 1}; wr.rw.dst = {&local, 1}; }
+    wr.user_ctx = 0xD1CE;
+    if (write) {
+      wr.rw.src = {&local, 1};
+      wr.rw.dst = {&remote, 1};
+    } else {
+      wr.rw.src = {&remote, 1};
+      wr.rw.dst = {&local, 1};
+    }
     urma_jfs_wr_t* bad = nullptr;
-    if (urma_post_jetty_send_wr(local_jetty_, &wr, &bad) != URMA_SUCCESS) return Error("urma_post_jetty_send_wr");
+    if (urma_post_jetty_send_wr(local_jetty_, &wr, &bad) != URMA_SUCCESS) {
+      return Error("urma_post_jetty_send_wr for direct host buffer");
+    }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (std::chrono::steady_clock::now() < deadline) {
       urma_cr_t cr{};
       const int polled = urma_poll_jfc(jfc_, 1, &cr);
-      if (polled < 0) return Error("urma_poll_jfc");
+      if (polled < 0) return Error("urma_poll_jfc for direct host buffer");
       if (polled == 1) {
-        if (cr.status != URMA_CR_SUCCESS || cr.user_ctx != 0xC0DE) return Status::Internal("URMA completion reported failure");
-        if (!write) std::memcpy(data, buffer_, bytes);
+        if (cr.status != URMA_CR_SUCCESS || cr.user_ctx != 0xD1CE) {
+          return Status::Internal("direct host buffer URMA completion reported failure");
+        }
         return Status::OK();
       }
       std::this_thread::yield();
     }
-    return Status::Internal("timed out waiting for URMA completion");
+    return Status::Internal("timed out waiting for direct host buffer completion");
   }
 
   Status TransferDeviceWrite(std::uint64_t offset, const void* device_source,
@@ -453,15 +518,17 @@ struct CpuUrmaTransport::Impl {
     if (local_jetty_ != nullptr) { (void)urma_delete_jetty(local_jetty_); local_jetty_ = nullptr; }
     if (jfr_ != nullptr) { (void)urma_delete_jfr(jfr_); jfr_ = nullptr; }
     if (remote_seg_handle_ != nullptr) { (void)urma_unimport_seg(remote_seg_handle_); remote_seg_handle_ = nullptr; }
-    if (local_seg_ != nullptr) { (void)urma_unregister_seg(local_seg_); local_seg_ = nullptr; }
-    if (token_id_ != nullptr) { (void)urma_free_token_id(token_id_); token_id_ = nullptr; }
+    for (auto& entry : direct_host_buffers_) {
+      if (entry.segment != nullptr) (void)urma_unregister_seg(entry.segment);
+      if (entry.token_id != nullptr) (void)urma_free_token_id(entry.token_id);
+    }
+    direct_host_buffers_.clear();
     if (owns_remote_region_ && link_ != nullptr && remote_region_.base != 0) {
       if (remote_region_.device_memory) (void)link_->ReleaseHbmRegion(remote_region_.session_id);
       else (void)link_->ReleaseRegion(remote_region_.base);
       remote_region_ = {};
     }
     owns_remote_region_ = false;
-    if (buffer_ != nullptr) { free(buffer_); buffer_ = nullptr; }
     if (jfc_ != nullptr) { (void)urma_delete_jfc(jfc_); jfc_ = nullptr; }
     if (context_ != nullptr) { (void)urma_delete_context(context_); context_ = nullptr; }
     if (urma_initialized_ && urma_owned_) { (void)urma_uninit(); }
@@ -480,17 +547,14 @@ struct CpuUrmaTransport::Impl {
   urma_jfr_t* jfr_{nullptr};
   urma_jetty_t* local_jetty_{nullptr};
   urma_target_jetty_t* remote_jetty_{nullptr};
-  urma_token_id_t* token_id_{nullptr};
-  urma_target_seg_t* local_seg_{nullptr};
   urma_target_seg_t* remote_seg_handle_{nullptr};
   urma_seg_t remote_seg_{};
-  void* buffer_{nullptr};
   std::uint32_t eid_index_{0};
-  std::uint32_t token_value_{0};
   bool urma_initialized_{false};
   bool urma_owned_{false};
   bool initialized_{false};
   bool owns_remote_region_{false};
+  std::vector<RegisteredHostBuffer> direct_host_buffers_;
   GetTpList get_tp_list_{nullptr};
   ImportJettyEx import_jetty_ex_{nullptr};
 };
@@ -499,14 +563,17 @@ CpuUrmaTransport::CpuUrmaTransport() : impl_(std::make_unique<Impl>()) {}
 CpuUrmaTransport::~CpuUrmaTransport() = default;
 Status CpuUrmaTransport::Initialize(const CpuUrmaTransportOptions& options) { return impl_->Initialize(options); }
 Status CpuUrmaTransport::Write(std::uint64_t offset, const void* source, std::size_t bytes) {
-  return impl_->Transfer(true, offset, const_cast<void*>(source), bytes);
+  return impl_->TransferDirect(true, offset, const_cast<void*>(source), bytes);
+}
+Status CpuUrmaTransport::RegisterDirectHostMemory(void* base, std::size_t bytes) {
+  return impl_->RegisterDirectHostMemory(base, bytes);
 }
 Status CpuUrmaTransport::WriteDeviceMemory(std::uint64_t offset, const void* device_source,
                                            std::size_t bytes) {
   return impl_->TransferDeviceWrite(offset, device_source, bytes);
 }
 Status CpuUrmaTransport::Read(std::uint64_t offset, void* destination, std::size_t bytes) {
-  return impl_->Transfer(false, offset, destination, bytes);
+  return impl_->TransferDirect(false, offset, destination, bytes);
 }
 Status CpuUrmaTransport::Shutdown() { return impl_->Shutdown(); }
 bool CpuUrmaTransport::initialized() const { return impl_->initialized_; }

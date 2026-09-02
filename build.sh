@@ -20,7 +20,8 @@ cpu  Builds the liburma-only CPU Runtime service. If liburma is not installed,
      it clones and builds the pinned UMDK source beside this repository.
 npu  Builds the CANN AIV BatchGet/BatchPut Runtime and Python binding. It
      installs pybind11 for the selected Python interpreter when necessary.
-hbm-rw Builds the standalone CPU URMA -> NPU HBM read/write test.
+hbm-rw Builds the standalone benchmark together with the production CPU URMA
+       transport and NPU HBM service.
 
 Environment overrides:
   KVAF_UMDK_ROOT       UMDK source/header root for the CPU build
@@ -128,12 +129,13 @@ build_cpu() {
   pybind11_dir="$($python_bin -m pybind11 --cmakedir)"
 
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
+    -DBUILD_TESTING=ON \
     -DKVAF_BUILD_PYTHON=ON \
     -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON \
     -Dpybind11_DIR="$pybind11_dir" \
     -DKVAF_URMA_ROOT="$umdk_root" \
     -DKVAF_URMA_LIBRARY="$urma_library"
-  cmake --build "$build_dir" --target kvaf_cpu_service kvaf_cpu_runtime_npu_hbm_e2e _kvaf --parallel "$jobs"
+  cmake --build "$build_dir" --target kvaf_cpu_service kvaf_cpu_runtime_npu_hbm_e2e kvaf_cpu_hbm_client _kvaf --parallel "$jobs"
   echo "[KVAF_BUILD] CPU service: $build_dir/runtime/kvaf_cpu_service"
   echo "[KVAF_BUILD] CPU NPU-HBM client: $build_dir/runtime/kvaf_cpu_runtime_npu_hbm_e2e"
   echo "[KVAF_BUILD] CPU Python binding: $build_dir/python/kvaf"
@@ -209,14 +211,15 @@ build_hbm_rw() {
   [[ -n "$cann_root" ]] || die "CANN toolkit was not found; set ASCEND_CANN_PACKAGE_PATH"
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
     -DBUILD_TESTING=ON \
-    -DKVAF_ENABLE_AIV_BATCH_GET=OFF \
+    -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON \
+    -DKVAF_ENABLE_AIV_BATCH_GET=ON \
     -DKVAF_ENABLE_AIV_BATCH_PUT=OFF \
-    -DKVAF_BUILD_HBM_RW_TEST=ON \
+    -DKVAF_BUILD_NPU_SERVICE=ON \
     -DASCEND_CANN_PACKAGE_PATH="$cann_root" \
     -DKVAF_URMA_ROOT="$umdk_root" \
-    -DKVAF_HBM_TEST_URMA_LIBRARY="$urma_library"
-  cmake --build "$build_dir" --target kvaf_npu_hbm_server kvaf_cpu_hbm_client --parallel "$jobs"
-  echo "[KVAF_BUILD] HBM test binaries: $build_dir/tests/kvaf_npu_hbm_server and $build_dir/tests/kvaf_cpu_hbm_client"
+    -DKVAF_URMA_LIBRARY="$urma_library"
+  cmake --build "$build_dir" --target kvaf_npu_service kvaf_cpu_hbm_client --parallel "$jobs"
+  echo "[KVAF_BUILD] HBM test binaries: $build_dir/runtime/kvaf_npu_service and $build_dir/runtime/kvaf_cpu_hbm_client"
 }
 
 mode="${1:-}"

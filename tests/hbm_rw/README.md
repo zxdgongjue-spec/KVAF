@@ -1,51 +1,49 @@
 # CPU -> NPU HBM read/write test
 
-This is an isolated two-process hardware test. It does not use `RuntimeCore`,
-the KV metadata path, or the production `PeerLink` protocol.
+This is a two-process hardware test. The benchmark loop is standalone, but
+its control plane and URMA data plane are the production `PeerLink` and
+`CpuUrmaTransport` used by `CpuRuntime`.
 
 Build on a host that has both CANN and UMDK/liburma:
 
 ```bash
 ./build.sh hbm-rw --build-dir build-hbm-rw
+
+# Equivalent split builds are also supported:
+# ./build.sh cpu --build-dir build-cpu
+# ./build.sh npu --build-dir build-npu
 ```
 
-On the NPU host, the server listens for a CPU `AllocateHbmRegionRequest`.
-The CPU request carries the HBM size, slot size, remote `device_id`, and EID
-list index; the NPU then calls `aclrtMalloc`, registers the segment, and
-returns the descriptor. The server-side `--device-id`/`--bytes` options are
-optional compatibility checks (the CPU request is authoritative):
+On the NPU host, run the production `kvaf_npu_service`. It listens for the
+CPU `AllocateHbmRegionRequest`; the CPU request carries the HBM size, slot
+size, remote `device_id`, and EID list index. The NPU service then calls
+`aclrtMalloc`, registers the segment, and returns the descriptor:
 
 ```bash
 tests/run_hbm_rw_server.sh --port 29888
 ```
 
-`--eid-index` is the context EID index. For diagnostics, bypass pair-info
-matching with `--npu-eid-list-index N`; `--eid HEX` remains an explicit EID
-override.
-
-On the CPU host, `local_eid` is read from `pair_info`; pass `--host-eid HEX`
-only when overriding discovery:
+`--eid-index` is the NPU EID list index. The CPU-side URMA device/EID is
+discovered by `CpuUrmaTransport`; use `--ub-device` or `--eid-index` only to
+constrain that local discovery.
 
 ```bash
 tests/run_hbm_rw_client.sh <npu-host> 29888 \
   --blocks 1024 --block-bytes 656 --device-id 0 --eid-index 0
 ```
 
-For a CPU/NPU co-located host, `--device-id` is also used to select the local
-pair-info physical device unless `--local-physical` is supplied. On separate
-hosts, use `--local-physical` for the CPU-side physical device.
-
-The client registers a local host buffer, imports the NPU HBM segment, creates
-the CTP/Jetty pair, performs one CPU-originated WRITE and one READ, then checks
-CQ completion and byte equality. The server keeps the HBM registration alive
-until the client has completed the transfers.
+The client calls `CpuUrmaTransport::Initialize`, which sends the allocation
+request, imports the segment, and creates the CTP/Jetty pair through
+`PeerLink`. Each benchmark operation uses the direct registered host-memory
+path (`Write`/`Read`), so the block address itself is the URMA SGE and no
+bounce-buffer memcpy is performed.
 
 ## Random 656-byte block benchmark
 
-The CPU client also benchmarks `n` independently allocated, page-aligned host
-blocks. Their transfer order is shuffled (remote offsets remain contiguous as
-`i * block_bytes`), exercising scattered CPU source addresses writing to one
-contiguous HBM allocation:
+The CPU client allocates one page-aligned host region and registers it as one
+URMA segment. It places `n` 656-byte blocks at shuffled offsets inside that
+region; transfer order is also shuffled while remote offsets remain contiguous
+as `i * block_bytes`:
 
 ```bash
 tests/run_hbm_rw_client.sh <npu-host> 29888 \
