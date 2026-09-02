@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "direct_hccp/direct_hccp_abi.h"
+#include "peer_protocol.h"
 
 namespace kvaf::hbm_test {
 

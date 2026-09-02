@@ -30,6 +30,7 @@
 namespace {
 using namespace kvaf::direct_hccp;
 using namespace kvaf::hbm_test;
+namespace peer = kvaf::peer;
 
 struct State {
   DirectHccpApi api{};
@@ -44,6 +45,7 @@ struct State {
   std::array<std::uint8_t, kEidBytes> eid{};
   QpCreateInfo jetty_info{};
   std::array<std::uint8_t, kMemKeyBytes> segment_key{};
+  std::uint32_t token_id = 0;
   std::uint32_t segment_key_bytes = 0;
   std::uint32_t token_value = 0xABCFU;
   std::uint32_t physical = 0;
@@ -168,7 +170,9 @@ bool Init(State* state, std::uint32_t device_id, std::uint32_t eid_index,
   CtxInitCfg cfg{kOfflineHdc};
   CtxInitAttr attr{};
   attr.phy_id = state->physical;
-  attr.ub.eid_index = eid_index;
+  // AllocateHbmRegionRequest::eid_index is the discovered NPU EID list index;
+  // the HDC context itself uses the fixed context index used by the runtime.
+  attr.ub.eid_index = 0U;
   std::memcpy(attr.ub.eid.raw, eid->data(), eid->size());
   if (state->api.ctx_init(&cfg, &attr, &state->context) != 0 || state->context == nullptr) return false;
   CqInfo cq{};
@@ -202,6 +206,7 @@ bool Init(State* state, std::uint32_t device_id, std::uint32_t eid_index,
   state->segment_key_bytes = mr.out.key.size;
   if (state->segment_key_bytes == 0U || state->segment_key_bytes > kMemKeyBytes) return false;
   std::memcpy(state->segment_key.data(), mr.out.key.value, state->segment_key_bytes);
+  state->token_id = mr.out.ub.token_id;
   std::fprintf(stderr, "[HBM_TEST][NPU] READY physical=%u device=%u hbm=0x%llx bytes=%llu eid_index=%u\n",
                state->physical, device_id, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(state->hbm)),
                static_cast<unsigned long long>(bytes), eid_index);
@@ -224,8 +229,9 @@ void Cleanup(State* s) {
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
   std::uint16_t port = 29888U;
-  std::uint32_t device_id = 0U, eid_index = 0U, npu_list_index = 0U;
-  std::uint64_t bytes = 4096U;
+  std::uint32_t device_id = 0U, npu_list_index = 0U;
+  std::uint64_t bytes_hint = 0U;
+  bool device_id_explicit = false;
   std::array<std::uint8_t, kEidBytes> eid{};
   bool have_eid = false;
   bool list_index_explicit = false;
@@ -233,34 +239,62 @@ int main(int argc, char** argv) {
     if (i + 1 >= argc) return 2;
     const std::string arg(argv[i]);
     if (arg == "--port") port = static_cast<std::uint16_t>(std::strtoul(argv[++i], nullptr, 0));
-    else if (arg == "--device-id") device_id = std::strtoul(argv[++i], nullptr, 0);
-    else if (arg == "--eid-index") eid_index = std::strtoul(argv[++i], nullptr, 0);
+    else if (arg == "--device-id") { device_id = std::strtoul(argv[++i], nullptr, 0); device_id_explicit = true; }
+    else if (arg == "--eid-index") npu_list_index = std::strtoul(argv[++i], nullptr, 0);
     else if (arg == "--npu-eid-list-index") { npu_list_index = std::strtoul(argv[++i], nullptr, 0); list_index_explicit = true; }
-    else if (arg == "--bytes") bytes = std::strtoull(argv[++i], nullptr, 0);
+    else if (arg == "--bytes") bytes_hint = std::strtoull(argv[++i], nullptr, 0);
     else if (arg == "--eid") have_eid = ParseEid(argv[++i], &eid);
     else return 2;
   }
-  if (bytes == 0U || aclrtSetDevice(static_cast<int32_t>(device_id)) != ACL_SUCCESS) return 1;
-  State state;
-  if (!Init(&state, device_id, eid_index, !have_eid, list_index_explicit, npu_list_index, &eid, bytes)) { Cleanup(&state); return 1; }
   const int listener = Listen(port);
-  if (listener < 0) { Cleanup(&state); return 1; }
+  if (listener < 0) return 1;
   std::fprintf(stdout, "[HBM_TEST][NPU] LISTEN port=%u\n", port);
   const int fd = accept(listener, nullptr, nullptr);
   close(listener);
-  if (fd < 0) { Cleanup(&state); return 1; }
-  Hello hello{};
-  bool ok = ReadAll(fd, &hello, sizeof(hello)) && hello.magic == kMagic &&
-            hello.version == kVersion && hello.bytes == bytes;
-  if (!ok) std::fprintf(stderr, "[HBM_TEST][NPU] invalid hello or client disconnected magic=0x%x version=%u\n", hello.magic, hello.version);
-  Export out{};
-  out.magic = kMagic; out.version = kVersion; out.hbm_bytes = bytes; out.token_value = state.token_value;
-  out.segment_key_bytes = state.segment_key_bytes; out.jetty_key_bytes = state.jetty_info.key.size;
-  std::memcpy(out.peer_eid, state.eid.data(), state.eid.size());
-  std::memcpy(out.segment_key, state.segment_key.data(), state.segment_key_bytes);
-  std::memcpy(out.jetty_key, state.jetty_info.key.value, state.jetty_info.key.size);
-  ok = ok && WriteAll(fd, &out, sizeof(out));
-  if (!ok) std::fprintf(stderr, "[HBM_TEST][NPU] export response failed\n");
+  if (fd < 0) return 1;
+  peer::MessageHeader header{};
+  peer::AllocateHbmRegionRequest request{};
+  bool ok = ReadAll(fd, &header, sizeof(header)) &&
+            header.magic == peer::kProtocolMagic && header.version == peer::kProtocolVersion &&
+            header.command == static_cast<std::uint16_t>(peer::Command::kAllocateHbmRegion) &&
+            header.bytes == sizeof(request) &&
+            ReadAll(fd, reinterpret_cast<std::uint8_t*>(&request) + sizeof(header), sizeof(request) - sizeof(header));
+  if (ok) request.header = header;
+  if (ok && device_id_explicit && request.device_id != device_id) ok = false;
+  if (ok && bytes_hint != 0U && request.hbm_bytes != bytes_hint) ok = false;
+  if (ok && (request.hbm_bytes == 0U || request.slot_size == 0U ||
+             request.hbm_bytes % request.slot_size != 0U)) ok = false;
+  peer::AllocateHbmRegionResponse out{};
+  out.header = peer::MakeHeader(peer::Command::kAllocateHbmRegion, sizeof(out));
+  out.header.command = peer::ResponseCommand(peer::Command::kAllocateHbmRegion);
+  State state;
+  if (ok) {
+    const bool use_explicit_list = list_index_explicit || request.eid_index != UINT32_MAX;
+    const std::uint32_t selected_list_index = list_index_explicit ? npu_list_index : request.eid_index;
+    if (aclrtSetDevice(static_cast<int32_t>(request.device_id)) != ACL_SUCCESS ||
+        !Init(&state, request.device_id, request.eid_index, !have_eid,
+              use_explicit_list, selected_list_index, &eid, request.hbm_bytes)) {
+      ok = false;
+    }
+  }
+  if (ok) {
+    out.result = static_cast<std::int32_t>(peer::Result::kOk);
+    out.session_id = 1U;
+    out.hbm_bytes = request.hbm_bytes;
+    urma_seg_t exported_segment{};
+    std::memcpy(&exported_segment, state.segment_key.data(), sizeof(exported_segment));
+    out.hbm_base = exported_segment.ubva.va;
+    out.token_id = state.token_id;
+    out.token_value = state.token_value;
+    out.segment_key_bytes = state.segment_key_bytes;
+    out.jetty_key_bytes = state.jetty_info.key.size;
+    std::memcpy(out.peer_eid, state.eid.data(), state.eid.size());
+    std::memcpy(out.segment_key, state.segment_key.data(), state.segment_key_bytes);
+    std::memcpy(out.jetty_key, state.jetty_info.key.value, state.jetty_info.key.size);
+  } else {
+    out.result = static_cast<std::int32_t>(peer::Result::kInvalidRequest);
+  }
+  if (!WriteAll(fd, &out, sizeof(out))) ok = false;
   if (ok) {
     ChannelRequest request{};
     ok = ReadAll(fd, &request, sizeof(request)) && request.magic == kMagic && request.version == kVersion;

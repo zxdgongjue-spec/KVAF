@@ -66,6 +66,7 @@ if(KVAF_BUILD_HBM_RW_TEST)
   add_executable(kvaf_npu_hbm_server npu_hbm_server.cc)
   target_include_directories(kvaf_npu_hbm_server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/runtime/include
     ${CMAKE_SOURCE_DIR}/access_operator/include
     ${KVAF_HBM_TEST_URMA_INCLUDE_DIR}
     ${ASCEND_CANN_PACKAGE_PATH}/include)
@@ -77,6 +78,7 @@ if(KVAF_BUILD_HBM_RW_TEST)
   add_executable(kvaf_cpu_hbm_client cpu_hbm_client.cc)
   target_include_directories(kvaf_cpu_hbm_client PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/runtime/include
     ${CMAKE_SOURCE_DIR}/access_operator/include
     ${KVAF_HBM_TEST_URMA_INCLUDE_DIR})
   target_link_libraries(kvaf_cpu_hbm_client PRIVATE
