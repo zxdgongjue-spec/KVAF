@@ -16,8 +16,7 @@ returns the descriptor. The server-side `--device-id`/`--bytes` options are
 optional compatibility checks (the CPU request is authoritative):
 
 ```bash
-tests/run_hbm_rw_server.sh build-hbm-rw \
-  --port 29888
+tests/run_hbm_rw_server.sh --port 29888
 ```
 
 `--eid-index` is the context EID index. For diagnostics, bypass pair-info
@@ -28,7 +27,7 @@ On the CPU host, `local_eid` is read from `pair_info`; pass `--host-eid HEX`
 only when overriding discovery:
 
 ```bash
-tests/run_hbm_rw_client.sh build-hbm-rw <npu-host> 29888 \
+tests/run_hbm_rw_client.sh <npu-host> 29888 \
   --blocks 1024 --block-bytes 656 --device-id 0 --eid-index 0
 ```
 
@@ -45,7 +44,7 @@ blocks. Their transfer order is shuffled (remote offsets remain contiguous as
 contiguous HBM allocation:
 
 ```bash
-tests/run_hbm_rw_client.sh build-hbm-rw <npu-host> 29888 \
+tests/run_hbm_rw_client.sh <npu-host> 29888 \
   --blocks 10000 --block-bytes 656 --iterations 10 --warmup 1 --seed 1
 ```
 
