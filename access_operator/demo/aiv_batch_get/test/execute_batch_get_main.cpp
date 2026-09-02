@@ -299,6 +299,50 @@ bool Validate(const std::vector<uint8_t> &output, const std::vector<uint64_t> &a
   return true;
 }
 
+bool ResolveRequestAddresses(
+    const std::vector<uint64_t> &address_table,
+    const std::vector<int32_t> &indices,
+    const std::vector<int32_t> &offsets,
+    const std::vector<int32_t> &output_indices, uint64_t output_base,
+    const Options &options, std::vector<uint64_t> *remote_addresses,
+    std::vector<uint64_t> *local_addresses) {
+  if (remote_addresses == nullptr || local_addresses == nullptr ||
+      indices.size() != options.requests || offsets.size() != options.requests ||
+      output_indices.size() != options.requests ||
+      address_table.size() != options.table_capacity) {
+    return false;
+  }
+  remote_addresses->resize(options.requests);
+  local_addresses->resize(options.requests);
+  const uint64_t entry_bytes =
+      static_cast<uint64_t>(kRowsPerEntry) * options.block_bytes;
+  for (uint32_t request = 0U; request < options.requests; ++request) {
+    const int32_t index = indices[request];
+    const int32_t offset = offsets[request];
+    const int32_t output_row = output_indices[request];
+    if (index < 0 || static_cast<uint32_t>(index) >= options.table_capacity ||
+        offset < 0 || output_row < 0 ||
+        static_cast<uint32_t>(output_row) >= options.output_rows ||
+        entry_bytes < options.block_bytes ||
+        static_cast<uint32_t>(offset) > entry_bytes - options.block_bytes) {
+      return false;
+    }
+    const uint64_t remote_base = address_table[static_cast<uint32_t>(index)];
+    const uint64_t remote_address =
+        remote_base + static_cast<uint32_t>(offset);
+    const uint64_t local_offset =
+        static_cast<uint64_t>(static_cast<uint32_t>(output_row)) *
+        options.block_bytes;
+    const uint64_t local_address = output_base + local_offset;
+    if (remote_address < remote_base || local_address < output_base) {
+      return false;
+    }
+    (*remote_addresses)[request] = remote_address;
+    (*local_addresses)[request] = local_address;
+  }
+  return true;
+}
+
 // This deliberately changes only data inside already-allocated device
 // tensors.  It is the graph contract: addresses/shape/args stay fixed across
 // replay, while a new AccessTable epoch resolves the same logical indices to
@@ -327,37 +371,33 @@ void PrepareGraphReplayInputs(uint32_t replay, const uint8_t *source, const Opti
   }
 }
 
-bool CopyGraphReplayInputs(aclrtStream stream, void *device_address_table, void *device_indices,
+bool CopyGraphReplayInputs(aclrtStream stream, void *device_remote_addresses,
+                           void *device_local_addresses,
                            void *device_miss_count,
-                           void *device_offsets, void *device_output_indices,
-                           const std::vector<uint64_t> &address_table,
-                           const std::vector<int32_t> &indices,
-                           const std::vector<int32_t> &offsets,
+                           const std::vector<uint64_t> &remote_addresses,
+                           const std::vector<uint64_t> &local_addresses,
                            const std::vector<uint8_t> &mask,
-                           const std::vector<int32_t> &output_indices,
                            int32_t *miss_count) {
   if (miss_count == nullptr) return false;
   *miss_count = static_cast<int32_t>(
       std::count_if(mask.begin(), mask.end(),
                     [](uint8_t entry) { return entry != 0U; }));
-  return CheckAcl(aclrtMemcpyAsync(device_address_table, address_table.size() * sizeof(uint64_t),
-                                   address_table.data(), address_table.size() * sizeof(uint64_t),
+  return CheckAcl(aclrtMemcpyAsync(device_remote_addresses,
+                                   remote_addresses.size() * sizeof(uint64_t),
+                                   remote_addresses.data(),
+                                   remote_addresses.size() * sizeof(uint64_t),
                                    ACL_MEMCPY_HOST_TO_DEVICE, stream),
-                  "graph copy address_table") &&
-         CheckAcl(aclrtMemcpyAsync(device_indices, indices.size() * sizeof(int32_t), indices.data(),
-                                   indices.size() * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE, stream),
-                  "graph copy indices") &&
-         CheckAcl(aclrtMemcpyAsync(device_offsets, offsets.size() * sizeof(int32_t), offsets.data(),
-                                   offsets.size() * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE, stream),
-                  "graph copy offsets") &&
+                  "graph copy remote_addresses") &&
+         CheckAcl(aclrtMemcpyAsync(device_local_addresses,
+                                   local_addresses.size() * sizeof(uint64_t),
+                                   local_addresses.data(),
+                                   local_addresses.size() * sizeof(uint64_t),
+                                   ACL_MEMCPY_HOST_TO_DEVICE, stream),
+                  "graph copy local_addresses") &&
          CheckAcl(aclrtMemcpyAsync(device_miss_count, sizeof(*miss_count),
                                    miss_count, sizeof(*miss_count),
                                    ACL_MEMCPY_HOST_TO_DEVICE, stream),
-                  "graph copy miss_count") &&
-         CheckAcl(aclrtMemcpyAsync(device_output_indices, output_indices.size() * sizeof(int32_t),
-                                   output_indices.data(), output_indices.size() * sizeof(int32_t),
-                                   ACL_MEMCPY_HOST_TO_DEVICE, stream),
-                  "graph copy output_indices");
+                  "graph copy miss_count");
 }
 
 }  // namespace
@@ -383,7 +423,7 @@ int main(int argc, char **argv) {
   if (source_bytes > std::numeric_limits<size_t>::max() ||
       output_bytes > std::numeric_limits<size_t>::max() ||
       eager_request_entries >
-          std::numeric_limits<size_t>::max() / sizeof(int32_t)) return 2;
+          std::numeric_limits<size_t>::max() / sizeof(uint64_t)) return 2;
 
   int exit_code = 1;
   uint32_t device_count = 0U;
@@ -391,14 +431,11 @@ int main(int argc, char **argv) {
   void *source_ddr = nullptr;
   void *output_hbm = nullptr;
   void *alternate_output_hbm = nullptr;
-  void *device_address_table = nullptr;
-  void *device_valid_table = nullptr;
-  void *device_indices = nullptr;
-  void *device_offsets = nullptr;
+  void *device_remote_addresses = nullptr;
+  void *device_local_addresses = nullptr;
   void *device_miss_count = nullptr;
-  void *device_eager_indices = nullptr;
+  void *device_eager_remote_addresses = nullptr;
   void *device_eager_miss_counts = nullptr;
-  void *device_output_indices = nullptr;
   void *device_status = nullptr;
   void *device_queue = nullptr;
   KvafBatchGetTransport *transport = nullptr;
@@ -412,17 +449,19 @@ int main(int argc, char **argv) {
   uint8_t *source = nullptr;
   KvafExecuteBatchGetKernelArgs args{};
   std::vector<uint64_t> address_table(options.table_capacity);
-  std::vector<uint8_t> valid_table(options.table_capacity, 1U);
   std::vector<int32_t> indices(options.requests);
   std::vector<int32_t> offsets(options.requests);
   std::vector<uint8_t> mask(options.requests, 1U);
   std::vector<int32_t> output_indices(options.requests);
+  std::vector<uint64_t> remote_addresses(options.requests);
+  std::vector<uint64_t> local_addresses(options.requests);
   int32_t miss_count = static_cast<int32_t>(options.miss_count);
   std::vector<KvafBatchGetCoreStatus> statuses(options.aiv_cores);
   std::vector<KvafBatchGetQueueState> queues(
       static_cast<uint64_t>(options.aiv_cores) * options.jettys_per_core);
   std::vector<QueueExpectation> queue_expectations(queues.size());
   std::vector<int32_t> eager_indices;
+  std::vector<uint64_t> eager_remote_addresses;
   std::vector<uint8_t> eager_masks;
   std::vector<int32_t> eager_miss_counts;
   std::vector<uint8_t> output(output_bytes);
@@ -477,32 +516,45 @@ int main(int argc, char **argv) {
       output_indices[request] = kExampleRows[request];
     }
   }
-  if (!CheckAcl(aclrtMalloc(&output_hbm, output_bytes, ACL_MEM_MALLOC_HUGE_FIRST), "allocate output HBM") ||
-      !CheckAcl(aclrtMalloc(&device_address_table, address_table.size() * sizeof(uint64_t), ACL_MEM_MALLOC_HUGE_FIRST),
-                "allocate address_table") ||
-      !CheckAcl(aclrtMalloc(&device_valid_table, valid_table.size(), ACL_MEM_MALLOC_HUGE_FIRST), "allocate valid_table") ||
-      !CheckAcl(aclrtMalloc(&device_indices, indices.size() * sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST), "allocate indices") ||
-      !CheckAcl(aclrtMalloc(&device_offsets, offsets.size() * sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST), "allocate offsets") ||
+  if (!CheckAcl(aclrtMalloc(&output_hbm, output_bytes, ACL_MEM_MALLOC_HUGE_FIRST),
+                "allocate output HBM")) {
+    goto cleanup;
+  }
+  if (!ResolveRequestAddresses(
+          address_table, indices, offsets, output_indices,
+          reinterpret_cast<uint64_t>(output_hbm), options,
+          &remote_addresses, &local_addresses)) {
+    std::cerr << "[KVAF_EXECUTE] failed to pre-resolve request addresses\n";
+    goto cleanup;
+  }
+  if (!CheckAcl(aclrtMalloc(&device_remote_addresses,
+                             remote_addresses.size() * sizeof(uint64_t),
+                             ACL_MEM_MALLOC_HUGE_FIRST),
+                "allocate remote_addresses") ||
+      !CheckAcl(aclrtMalloc(&device_local_addresses,
+                             local_addresses.size() * sizeof(uint64_t),
+                             ACL_MEM_MALLOC_HUGE_FIRST),
+                "allocate local_addresses") ||
       !CheckAcl(aclrtMalloc(&device_miss_count, sizeof(miss_count), ACL_MEM_MALLOC_HUGE_FIRST),
                 "allocate miss_count") ||
-      !CheckAcl(aclrtMalloc(&device_output_indices, output_indices.size() * sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST),
-                "allocate output_indices") ||
       !CheckAcl(aclrtMalloc(&device_status, statuses.size() * sizeof(statuses[0]), ACL_MEM_MALLOC_HUGE_FIRST),
                 "allocate status") ||
       !CheckAcl(aclrtMalloc(&device_queue, queues.size() * sizeof(queues[0]), ACL_MEM_MALLOC_HUGE_FIRST),
                 "allocate queue state") ||
-      !CheckAcl(aclrtMemcpy(device_address_table, address_table.size() * sizeof(uint64_t), address_table.data(),
-                             address_table.size() * sizeof(uint64_t), ACL_MEMCPY_HOST_TO_DEVICE), "copy address_table") ||
-      !CheckAcl(aclrtMemcpy(device_valid_table, valid_table.size(), valid_table.data(), valid_table.size(),
-                             ACL_MEMCPY_HOST_TO_DEVICE), "copy valid_table") ||
-      !CheckAcl(aclrtMemcpy(device_indices, indices.size() * sizeof(int32_t), indices.data(),
-                             indices.size() * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE), "copy indices") ||
-      !CheckAcl(aclrtMemcpy(device_offsets, offsets.size() * sizeof(int32_t), offsets.data(),
-                             offsets.size() * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE), "copy offsets") ||
+      !CheckAcl(aclrtMemcpy(device_remote_addresses,
+                             remote_addresses.size() * sizeof(uint64_t),
+                             remote_addresses.data(),
+                             remote_addresses.size() * sizeof(uint64_t),
+                             ACL_MEMCPY_HOST_TO_DEVICE),
+                "copy remote_addresses") ||
+      !CheckAcl(aclrtMemcpy(device_local_addresses,
+                             local_addresses.size() * sizeof(uint64_t),
+                             local_addresses.data(),
+                             local_addresses.size() * sizeof(uint64_t),
+                             ACL_MEMCPY_HOST_TO_DEVICE),
+                "copy local_addresses") ||
       !CheckAcl(aclrtMemcpy(device_miss_count, sizeof(miss_count), &miss_count,
                              sizeof(miss_count), ACL_MEMCPY_HOST_TO_DEVICE), "copy miss_count") ||
-      !CheckAcl(aclrtMemcpy(device_output_indices, output_indices.size() * sizeof(int32_t), output_indices.data(),
-                             output_indices.size() * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE), "copy output_indices") ||
       !CheckAcl(aclrtMemset(output_hbm, output_bytes, 0, output_bytes), "clear output") ||
       !CheckAcl(aclrtMemset(device_status, statuses.size() * sizeof(statuses[0]), 0, statuses.size() * sizeof(statuses[0])),
                 "clear status") ||
@@ -529,21 +581,16 @@ int main(int argc, char **argv) {
   if (!CheckKvaf(KvafExecuteBatchGetLoadKernel(options.kernel.c_str()), "load ExecuteBatchGet kernel")) goto cleanup;
   std::cout << "PHASE_KERNEL_REGISTERED cores=" << options.aiv_cores
             << " jettys_per_core=" << options.jettys_per_core
-            << " contract=address_table_absolute_uba_plus_miss_count_prefix_plus_output_scatter\n";
+            << " contract=pre_resolved_remote_and_local_addresses_plus_miss_count_prefix\n";
 
-  args.address_table = reinterpret_cast<uint64_t>(device_address_table);
-  args.valid_table = reinterpret_cast<uint64_t>(device_valid_table);
-  args.indices = reinterpret_cast<uint64_t>(device_indices);
-  args.offsets = reinterpret_cast<uint64_t>(device_offsets);
+  args.remote_addresses = reinterpret_cast<uint64_t>(device_remote_addresses);
+  args.local_addresses = reinterpret_cast<uint64_t>(device_local_addresses);
   args.miss_count = reinterpret_cast<uint64_t>(device_miss_count);
-  args.output_indices = reinterpret_cast<uint64_t>(device_output_indices);
   args.output = reinterpret_cast<uint64_t>(output_hbm);
   args.core_status = reinterpret_cast<uint64_t>(device_status);
   args.channel_entity = primary_entity_table;
   args.queue_state = reinterpret_cast<uint64_t>(device_queue);
-  args.table_capacity = options.table_capacity;
   args.request_capacity = options.requests;
-  args.output_rows = options.output_rows;
   args.block_bytes = options.block_bytes;
   args.block_count = options.aiv_cores;
   args.jettys_per_core = options.jettys_per_core;
@@ -575,6 +622,18 @@ int main(int argc, char **argv) {
       std::cerr << "[KVAF_EXECUTE] alternate output did not receive an independent local-buffer entity\n";
       goto cleanup;
     }
+    if (!ResolveRequestAddresses(
+            address_table, indices, offsets, output_indices,
+            reinterpret_cast<uint64_t>(alternate_output_hbm), options,
+            &remote_addresses, &local_addresses) ||
+        !CheckAcl(aclrtMemcpy(device_local_addresses,
+                              local_addresses.size() * sizeof(uint64_t),
+                              local_addresses.data(),
+                              local_addresses.size() * sizeof(uint64_t),
+                              ACL_MEMCPY_HOST_TO_DEVICE),
+                  "copy alternate local_addresses")) {
+      goto cleanup;
+    }
     args.output = reinterpret_cast<uint64_t>(alternate_output_hbm);
     args.channel_entity = alternate_entity_table;
     AccumulateQueueExpectations(mask, options, &queue_expectations);
@@ -599,6 +658,18 @@ int main(int argc, char **argv) {
                    "re-acquire primary caller-owned output HBM") ||
         primary_reacquired_buffer != primary_local_buffer || primary_reacquired_entity_table != primary_entity_table) {
       std::cerr << "[KVAF_EXECUTE] primary local-buffer cache contract failed\n";
+      goto cleanup;
+    }
+    if (!ResolveRequestAddresses(
+            address_table, indices, offsets, output_indices,
+            reinterpret_cast<uint64_t>(output_hbm), options,
+            &remote_addresses, &local_addresses) ||
+        !CheckAcl(aclrtMemcpy(device_local_addresses,
+                              local_addresses.size() * sizeof(uint64_t),
+                              local_addresses.data(),
+                              local_addresses.size() * sizeof(uint64_t),
+                              ACL_MEMCPY_HOST_TO_DEVICE),
+                  "restore primary local_addresses")) {
       goto cleanup;
     }
     args.output = reinterpret_cast<uint64_t>(output_hbm);
@@ -634,7 +705,7 @@ int main(int argc, char **argv) {
     // per-replay updates below are writes into the already-fixed device
     // tensors, just as an upstream graph node would do.
     std::cout << "GRAPH_CAPTURE_CONTRACT api=aclmdlRI fixed_tensor_addresses=1 "
-                 "dynamic_device_contents=address_table_indices_miss_count_output_indices "
+                 "dynamic_device_contents=remote_addresses_local_addresses_miss_count "
                  "replays="
               << options.graph_replays << " aiv_cores=" << options.aiv_cores
               << " jettys_per_core=" << options.jettys_per_core
@@ -661,10 +732,14 @@ int main(int argc, char **argv) {
 
     for (uint32_t replay = 0U; replay < options.graph_replays; ++replay) {
       PrepareGraphReplayInputs(replay, source, options, &address_table, &indices, &offsets, &mask, &output_indices);
-      if (!CopyGraphReplayInputs(stream, device_address_table, device_indices,
-                                 device_miss_count, device_offsets,
-                                 device_output_indices, address_table, indices,
-                                 offsets, mask, output_indices, &miss_count)) {
+      if (!ResolveRequestAddresses(
+              address_table, indices, offsets, output_indices,
+              reinterpret_cast<uint64_t>(output_hbm), options,
+              &remote_addresses, &local_addresses) ||
+          !CopyGraphReplayInputs(stream, device_remote_addresses,
+                                 device_local_addresses, device_miss_count,
+                                 remote_addresses, local_addresses, mask,
+                                 &miss_count)) {
         goto cleanup;
       }
       std::cout << "GRAPH_REPLAY_INPUT_UPDATED replay=" << replay
@@ -706,10 +781,14 @@ int main(int argc, char **argv) {
       const uint32_t epoch = options.graph_replays + warmup;
       std::cout << "GRAPH_PERF_WARMUP_STEP_BEGIN iteration=" << warmup << " epoch=" << epoch << '\n';
       PrepareGraphReplayInputs(epoch, source, options, &address_table, &indices, &offsets, &mask, &output_indices);
-      if (!CopyGraphReplayInputs(stream, device_address_table, device_indices,
-                                 device_miss_count, device_offsets,
-                                 device_output_indices, address_table, indices,
-                                 offsets, mask, output_indices, &miss_count)) goto cleanup;
+      if (!ResolveRequestAddresses(
+              address_table, indices, offsets, output_indices,
+              reinterpret_cast<uint64_t>(output_hbm), options,
+              &remote_addresses, &local_addresses) ||
+          !CopyGraphReplayInputs(stream, device_remote_addresses,
+                                 device_local_addresses, device_miss_count,
+                                 remote_addresses, local_addresses, mask,
+                                 &miss_count)) goto cleanup;
       std::cout << "GRAPH_PERF_WARMUP_INPUT_ENQUEUED iteration=" << warmup << '\n';
       AccumulateQueueExpectations(mask, options, &queue_expectations);
       if (!CheckAcl(aclmdlRIExecuteAsync(graph_model, stream), "graph performance warmup replay")) goto cleanup;
@@ -724,11 +803,15 @@ int main(int argc, char **argv) {
       const uint32_t epoch = options.graph_replays + options.graph_warmup + iteration;
       std::cout << "GRAPH_PERF_MEASURED_STEP_BEGIN iteration=" << iteration << " epoch=" << epoch << '\n';
       PrepareGraphReplayInputs(epoch, source, options, &address_table, &indices, &offsets, &mask, &output_indices);
+      if (!ResolveRequestAddresses(
+              address_table, indices, offsets, output_indices,
+              reinterpret_cast<uint64_t>(output_hbm), options,
+              &remote_addresses, &local_addresses)) goto cleanup;
       const auto begin = std::chrono::steady_clock::now();
-      if (!CopyGraphReplayInputs(stream, device_address_table, device_indices,
-                                 device_miss_count, device_offsets,
-                                 device_output_indices, address_table, indices,
-                                 offsets, mask, output_indices, &miss_count)) goto cleanup;
+      if (!CopyGraphReplayInputs(stream, device_remote_addresses,
+                                 device_local_addresses, device_miss_count,
+                                 remote_addresses, local_addresses, mask,
+                                 &miss_count)) goto cleanup;
       std::cout << "GRAPH_PERF_MEASURED_INPUT_ENQUEUED iteration=" << iteration << '\n';
       AccumulateQueueExpectations(mask, options, &queue_expectations);
       if (!CheckAcl(aclmdlRIExecuteAsync(graph_model, stream), "measured graph replay")) goto cleanup;
@@ -773,11 +856,13 @@ int main(int argc, char **argv) {
   }
 
   // Match the Python performance benchmark: materialize one independent
-  // random indices/miss-count pair for every warmup and measured sample before
-  // the benchmark starts. Keeping the inputs in flat device buffers lets the
+  // random lookup/miss-count pair for every warmup and measured sample before
+  // the benchmark starts, then pre-resolve each lookup to a remote address.
+  // Keeping the inputs in flat device buffers lets the
   // timed loop select a sample by pointer only; random generation and H2D
   // copies remain outside host_submit_to_stream_completion.
   eager_indices.resize(static_cast<size_t>(eager_request_entries));
+  eager_remote_addresses.resize(static_cast<size_t>(eager_request_entries));
   eager_masks.resize(static_cast<size_t>(eager_request_entries));
   eager_miss_counts.resize(static_cast<size_t>(eager_sample_count));
   {
@@ -791,8 +876,12 @@ int main(int argc, char **argv) {
           static_cast<size_t>(sample * options.requests);
       uint64_t active = 0U;
       for (uint32_t request = 0U; request < options.requests; ++request) {
+        const uint32_t table_index = index_distribution(random);
         eager_indices[sample_offset + request] =
-            static_cast<int32_t>(index_distribution(random));
+            static_cast<int32_t>(table_index);
+        eager_remote_addresses[sample_offset + request] =
+            address_table[table_index] +
+            static_cast<uint32_t>(offsets[request]);
         active += mask_distribution(random) ? 1U : 0U;
       }
       std::fill_n(eager_masks.data() + sample_offset, options.requests, 0U);
@@ -802,21 +891,24 @@ int main(int argc, char **argv) {
           static_cast<int32_t>(active);
     }
   }
-  if (!CheckAcl(aclrtMalloc(&device_eager_indices,
-                             eager_indices.size() * sizeof(eager_indices[0]),
+  if (!CheckAcl(aclrtMalloc(&device_eager_remote_addresses,
+                             eager_remote_addresses.size() *
+                                 sizeof(eager_remote_addresses[0]),
                              ACL_MEM_MALLOC_HUGE_FIRST),
-                "allocate eager sample indices") ||
+                "allocate eager sample remote_addresses") ||
       !CheckAcl(aclrtMalloc(&device_eager_miss_counts,
                              eager_miss_counts.size() *
                                  sizeof(eager_miss_counts[0]),
                              ACL_MEM_MALLOC_HUGE_FIRST),
                 "allocate eager sample miss counts") ||
-      !CheckAcl(aclrtMemcpy(device_eager_indices,
-                             eager_indices.size() * sizeof(eager_indices[0]),
-                             eager_indices.data(),
-                             eager_indices.size() * sizeof(eager_indices[0]),
+      !CheckAcl(aclrtMemcpy(device_eager_remote_addresses,
+                             eager_remote_addresses.size() *
+                                 sizeof(eager_remote_addresses[0]),
+                             eager_remote_addresses.data(),
+                             eager_remote_addresses.size() *
+                                 sizeof(eager_remote_addresses[0]),
                              ACL_MEMCPY_HOST_TO_DEVICE),
-                "copy eager sample indices") ||
+                "copy eager sample remote_addresses") ||
       !CheckAcl(aclrtMemcpy(device_eager_miss_counts,
                              eager_miss_counts.size() *
                                  sizeof(eager_miss_counts[0]),
@@ -836,13 +928,16 @@ int main(int argc, char **argv) {
   for (uint32_t warmup = 0U; warmup < options.warmup; ++warmup) {
     const size_t sample_offset =
         static_cast<size_t>(static_cast<uint64_t>(warmup) * options.requests);
-    args.indices = reinterpret_cast<uint64_t>(device_eager_indices) +
-                   sample_offset * sizeof(eager_indices[0]);
+    args.remote_addresses =
+        reinterpret_cast<uint64_t>(device_eager_remote_addresses) +
+        sample_offset * sizeof(eager_remote_addresses[0]);
     args.miss_count =
         reinterpret_cast<uint64_t>(device_eager_miss_counts) +
         static_cast<size_t>(warmup) * sizeof(eager_miss_counts[0]);
     std::copy_n(eager_indices.data() + sample_offset, options.requests,
                 indices.data());
+    std::copy_n(eager_remote_addresses.data() + sample_offset,
+                options.requests, remote_addresses.data());
     std::copy_n(eager_masks.data() + sample_offset, options.requests,
                 mask.data());
     AccumulateQueueExpectations(mask, options, &queue_expectations);
@@ -872,13 +967,16 @@ int main(int argc, char **argv) {
     const uint64_t sample = static_cast<uint64_t>(options.warmup) + iteration;
     const size_t sample_offset =
         static_cast<size_t>(sample * options.requests);
-    args.indices = reinterpret_cast<uint64_t>(device_eager_indices) +
-                   sample_offset * sizeof(eager_indices[0]);
+    args.remote_addresses =
+        reinterpret_cast<uint64_t>(device_eager_remote_addresses) +
+        sample_offset * sizeof(eager_remote_addresses[0]);
     args.miss_count =
         reinterpret_cast<uint64_t>(device_eager_miss_counts) +
         static_cast<size_t>(sample) * sizeof(eager_miss_counts[0]);
     std::copy_n(eager_indices.data() + sample_offset, options.requests,
                 indices.data());
+    std::copy_n(eager_remote_addresses.data() + sample_offset,
+                options.requests, remote_addresses.data());
     std::copy_n(eager_masks.data() + sample_offset, options.requests,
                 mask.data());
     measured_active_total += static_cast<uint64_t>(
@@ -930,14 +1028,11 @@ cleanup:
   if (transport != nullptr) KvafBatchGetTransportDestroy(transport);
   if (device_queue != nullptr) (void)aclrtFree(device_queue);
   if (device_status != nullptr) (void)aclrtFree(device_status);
-  if (device_output_indices != nullptr) (void)aclrtFree(device_output_indices);
   if (device_eager_miss_counts != nullptr) (void)aclrtFree(device_eager_miss_counts);
-  if (device_eager_indices != nullptr) (void)aclrtFree(device_eager_indices);
+  if (device_eager_remote_addresses != nullptr) (void)aclrtFree(device_eager_remote_addresses);
   if (device_miss_count != nullptr) (void)aclrtFree(device_miss_count);
-  if (device_indices != nullptr) (void)aclrtFree(device_indices);
-  if (device_offsets != nullptr) (void)aclrtFree(device_offsets);
-  if (device_valid_table != nullptr) (void)aclrtFree(device_valid_table);
-  if (device_address_table != nullptr) (void)aclrtFree(device_address_table);
+  if (device_local_addresses != nullptr) (void)aclrtFree(device_local_addresses);
+  if (device_remote_addresses != nullptr) (void)aclrtFree(device_remote_addresses);
   if (alternate_output_hbm != nullptr) (void)aclrtFree(alternate_output_hbm);
   if (output_hbm != nullptr) (void)aclrtFree(output_hbm);
   if (source_ddr != nullptr) (void)aclrtFreeHost(source_ddr);

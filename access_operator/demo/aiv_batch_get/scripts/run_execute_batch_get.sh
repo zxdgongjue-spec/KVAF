@@ -66,7 +66,7 @@ if dumper=$(command -v asc_dumper 2>/dev/null) && ldd "${dumper}" 2>/dev/null | 
   ldd "${dumper}" 2>&1 | tee -a "${log_file}" >&2 || true
   exit 2
 fi
-echo "[EXECUTE_BATCH_GET] contract=npu_execute_address_table_to_udma_read request_layout=miss_count_prefix device=${DEVICE_ID} table=${TABLE_CAPACITY} requests=${REQUESTS} miss_count=${MISS_COUNT} output_rows=${OUTPUT_ROWS} block_bytes=${BLOCK_BYTES} stride=${SOURCE_STRIDE} aiv_cores=${AIV_CORES} jettys_per_core=${JETTYS_PER_CORE} active_percent=${ACTIVE_PERCENT} dynamic_output_smoke=${DYNAMIC_OUTPUT_SMOKE} graph_replays=${GRAPH_REPLAYS} graph_warmup=${GRAPH_WARMUP} graph_iterations=${GRAPH_ITERATIONS} timeout=${timeout_seconds} toolkit_lib=${cann_lib}" | tee "${log_file}"
+echo "[EXECUTE_BATCH_GET] contract=npu_execute_pre_resolved_addresses_to_udma_read request_layout=miss_count_prefix device=${DEVICE_ID} table=${TABLE_CAPACITY} requests=${REQUESTS} miss_count=${MISS_COUNT} output_rows=${OUTPUT_ROWS} block_bytes=${BLOCK_BYTES} stride=${SOURCE_STRIDE} aiv_cores=${AIV_CORES} jettys_per_core=${JETTYS_PER_CORE} active_percent=${ACTIVE_PERCENT} dynamic_output_smoke=${DYNAMIC_OUTPUT_SMOKE} graph_replays=${GRAPH_REPLAYS} graph_warmup=${GRAPH_WARMUP} graph_iterations=${GRAPH_ITERATIONS} timeout=${timeout_seconds} toolkit_lib=${cann_lib}" | tee "${log_file}"
 
 set +e
 timeout "${timeout_seconds}" "${test_binary}" --kernel "${kernel}" \

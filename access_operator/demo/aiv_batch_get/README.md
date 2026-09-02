@@ -1,33 +1,31 @@
 # A5 AIV ExecuteBatchGet (minimal)
 
 This directory is the smallest standalone implementation of the NPU-side
-`ExecuteBatchGet` path: an AIV kernel looks up fixed-shape device tensors and
-submits UDMA READ WQEs that move selected Host DDR blocks into a scattered HBM
-output buffer. It does not include historical throughput experiments, SHMEM,
-or the optional Python/Torch adapter.
+`ExecuteBatchGet` path: an AIV kernel consumes pre-resolved request addresses
+and submits UDMA READ WQEs that move selected Host DDR blocks into a scattered
+HBM output buffer. It does not include historical throughput experiments,
+SHMEM, or the optional Python/Torch adapter.
 
 ## Operator contract
 
-All lookup tensors are device-resident.  The transport owns the Host-DDR
-registration; each HBM output is registered separately as a local UDMA range.
+Lookup and output-row resolution happen before the kernel launch. The
+transport owns the Host-DDR registration; each HBM output is registered
+separately as a local UDMA range.
 
 | Tensor | Type / shape | Meaning |
 | --- | --- | --- |
-| `address_table` | `uint64[table_capacity]` | Absolute Host DDR UBAs, produced by the meta layer. |
-| `valid_table` | `uint8[table_capacity]` | A zero entry makes its lookup invalid. |
-| `indices` | `int32[request_capacity]` | Logical entries requested by this batch. |
-| `offsets` | `int32[request_capacity]` | Byte offset inside the selected `128 * block_bytes` entry. |
-| `mask` | `uint8[request_capacity]` | Zero skips that request without changing the graph shape. |
-| `output_indices` | `int32[request_capacity]` | Destination row in `output`. |
+| `remote_addresses` | `uint64[request_capacity]` | Absolute Host DDR UBA for each request. |
+| `local_addresses` | `uint64[request_capacity]` | Absolute output HBM address for each request. |
+| `miss_count` | `int32[1]` | Valid request-prefix length. |
 | `output` | `uint8[output_rows * block_bytes]` | Contiguous Device HBM output. |
 
-For an active request `i`, the kernel reads exactly `block_bytes` bytes from
-`address_table[indices[i]] + offsets[i]` and stores it at
-`output + output_indices[i] * block_bytes`. Each address-table entry spans
-`128 * block_bytes`, so `offsets[i] + block_bytes` must stay within that entry.
-The default block size is 656B; 1024B and other positive sizes that fit the
-device ABI can be selected per Runtime call. Duplicate output rows are not
-rejected and have last-completion-wins semantics.
+For an active request `i < miss_count`, the kernel reads exactly `block_bytes`
+bytes from `remote_addresses[i]` and stores it at `local_addresses[i]`. The
+caller must resolve and validate both arrays against the registered Host-DDR
+and output-HBM ranges before launch. The default block size is 656B; 1024B and
+other positive sizes that fit the device ABI can be selected per Runtime call.
+Duplicate local addresses are not rejected and have last-completion-wins
+semantics.
 
 The local-memory lifetime is intentionally separate from the shared
 transport:
@@ -43,6 +41,8 @@ KvafBatchGetLocalBufferAcquire(transport, output_hbm, output_bytes,
                                &output_binding, &entity);
 args.output = reinterpret_cast<uint64_t>(output_hbm);
 args.channel_entity = entity;
+args.remote_addresses = reinterpret_cast<uint64_t>(remote_addresses_device);
+args.local_addresses = reinterpret_cast<uint64_t>(local_addresses_device);
 args.block_bytes = block_bytes;
 args.jettys_per_core = jettys_per_core;
 // args.queue_state points to a zero-initialized
@@ -58,11 +58,10 @@ addresses receive a new local MR and entity table but reuse the transport.
 
 ## What is included
 
-- `kernel/execute_batch_get_aiv.asc`: SIMT-compacts requests,
-  caches each active request's table index and request ID in UB, generates 32
-  UDMA READ WQEs in parallel, and overlaps vector fill, MTE3 UB-to-SQ copies,
-  and scalar doorbells with two UB banks. It never uses MTE to dereference Host
-  DDR.
+- `kernel/execute_batch_get_aiv.asc`: reads pre-resolved address pairs,
+  generates 32 UDMA READ WQEs in parallel, and overlaps vector fill, MTE3
+  UB-to-SQ copies, and scalar doorbells with two UB banks. It never uses MTE to
+  dereference Host DDR.
 - `host/batch_get_host.cpp`: CPU/device EID discovery, Direct-HCCP transport,
   Host-DDR registration, per-output HBM-MR cache, and up to two private
   USER_CTL SQ/CQ/Jettys per AIV.
@@ -82,11 +81,10 @@ The data path keeps the public KVAF ABI and the verified Direct-HCCP WQE token
 fields. It does not copy the AIV_URMA benchmark's server/client handshake,
 control-region writes, fixed 64K request shape, or per-launch CQ reset.
 
-Each AIV compacts its complete request partition once into parallel 16384-entry
-UB arrays containing the active table indices and original request IDs. The
-caller must guarantee that each AIV owns at most 16384 mask entries whose value
-is nonzero. Before touching the SQ, the kernel rejects an active count beyond
-that capacity or a per-Jetty assignment that fills the entire SQ.
+The caller provides a compact request prefix and resolves each request to one
+remote/local address pair before launch. Each AIV consumes its contiguous
+partition of that prefix. Before touching the SQ, the kernel rejects a
+per-Jetty assignment that fills the entire SQ.
 The phase-two scheduler assigns complete 32-WQE posts to the core's Jettys in
 round-robin order. Each Jetty has an independent persistent SQ producer and CQ
 consumer index. Only the last READ assigned to each used Jetty requests a CQE;
@@ -96,7 +94,7 @@ submitted through another Jetty. A core with one post uses only Jetty 0, while
 the one-Jetty phase-one path remains selectable with `JETTYS_PER_CORE=1`.
 
 The ACL launcher explicitly reserves 160 KiB of AIV local memory for the two
-WQE banks, compacted table-index/request-ID arrays and SIMT validation scratch.
+WQE banks and SIMT validation scratch.
 
 ## Build and run on A5
 
@@ -124,8 +122,9 @@ The eager default is 4096 requests of 656 bytes, tightly packed in
 `128 * block_bytes` source entries, with four AIVs, two Jettys per AIV, and a
 5% active probability. As in
 `tests/python/test_npu_runtime_perf.py`, every warmup and measured sample uses
-its own random indices/mask pair. All pairs are generated and copied to the
-device before the benchmark starts. Results are written beneath `results/`;
+its own random indices/mask pair. All lookups are pre-resolved to remote
+addresses and copied to the device before the benchmark starts. Results are
+written beneath `results/`;
 `feedback.txt` contains
 the outcome, key phase markers, run log, and any locally copied PLOG files.
 
@@ -158,8 +157,8 @@ activates only request IDs divisible by `N`; the two options are mutually
 exclusive.
 
 The graph performance metric is
-`graph_input_update_to_stream_completion`: updates into the fixed lookup
-tensors, captured graph execution, and stream completion are included;
+`graph_input_update_to_stream_completion`: updates into the fixed resolved
+address tensors, captured graph execution, and stream completion are included;
 capture, HCCP setup and final D2H validation are excluded. The normal metric
 is `host_submit_to_stream_completion`; it includes only launch through stream
 completion and excludes input generation, H2D upload, warmup and validation.
@@ -179,10 +178,10 @@ Host-DDR and queue resources. Before capture, the caller acquires the fixed
 graph output through `KvafBatchGetLocalBufferAcquire(transport, output, ...)`.
 That call returns an opaque local-buffer handle and a device entity table whose
 local HBM address/token match `args.output`; capture contains only the AIV
-kernel launch. One graph therefore serves replay-time changes to addresses,
-validity, request indices, mask and output rows. A different output allocation
-uses its own acquire result and graph instance; eager launches may select any
-cached acquire result at runtime. A capacity, block-size, AIV-count or
+kernel launch. One graph therefore serves replay-time changes to the resolved
+remote/local address contents and request-prefix length. A different output
+allocation uses its own acquire result and graph instance; eager launches may
+select any cached acquire result at runtime. A capacity, block-size, AIV-count or
 Jetty-count change also needs a new session/captured graph. After all stream
 work completes,
 release local buffers before destroying the transport.
