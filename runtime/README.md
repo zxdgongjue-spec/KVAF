@@ -333,3 +333,11 @@ Jetty 数量可通过
 填充。
 脚本以 CPU `torch.int64` Tensor 传入全量 Prepare key，避免 Python `list[int]` 转换污染
 这项控制面性能数据。
+CPU Runtime C++ e2e 入口也支持批量 block 参数，会直接调用生产路径的
+`RuntimeCore::BatchPut`/`BatchGet`：
+
+```bash
+build-cpu/runtime/kvaf_cpu_runtime_npu_hbm_e2e \
+  --peer 127.0.0.1:29888 --device-id 3 \
+  --blocks 1024 --block-bytes 656 --iterations 10 --warmup 5
+```
