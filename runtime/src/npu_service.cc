@@ -376,6 +376,8 @@ struct NpuService::Impl {
       Release(region.get());
       return Result::kResourceError;
     }
+    std::fprintf(stderr, "[KVAF_NPU] TARGET_QUEUE sq_depth=%u rq_depth=%u\n",
+                 qp_attr.sq_depth, qp_attr.rq_depth);
     region->jetty_key_bytes = region->qp_info.key.size;
     if (region->jetty_key_bytes > region->jetty_key.size()) {
       Release(region.get());

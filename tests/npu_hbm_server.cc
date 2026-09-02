@@ -32,6 +32,11 @@ using namespace kvaf::direct_hccp;
 using namespace kvaf::hbm_test;
 namespace peer = kvaf::peer;
 
+// One benchmark batch contains one WR per block. Keep the target Jetty large
+// enough to accept the complete 1024-WR post list in a single submission.
+constexpr std::uint32_t kTargetSqDepth = 1024U;
+constexpr std::uint32_t kTargetRqDepth = 1024U;
+
 struct State {
   DirectHccpApi api{};
   DirectHccpSession* session = nullptr;
@@ -185,8 +190,8 @@ bool Init(State* state, std::uint32_t device_id, std::uint32_t eid_index,
   qp.scq_handle = state->cq;
   qp.rcq_handle = state->cq;
   qp.srq_handle = state->cq;
-  qp.sq_depth = 16U;
-  qp.rq_depth = 256U;
+  qp.sq_depth = kTargetSqDepth;
+  qp.rq_depth = kTargetRqDepth;
   qp.transport_mode = kReliableMessage;
   qp.ub.mode = kJettyStandard;
   qp.ub.flag = JettyFlagShareJfr();
@@ -195,6 +200,8 @@ bool Init(State* state, std::uint32_t device_id, std::uint32_t eid_index,
   qp.ub.jfs_flag = JfsFlagErrorSuspend();
   if (state->api.qp_create(state->context, &qp, &state->jetty_info, &state->jetty) != 0 ||
       state->jetty == nullptr || state->jetty_info.key.size == 0U || state->jetty_info.key.size > kQpKeyBytes) return false;
+  std::fprintf(stderr, "[HBM_TEST][NPU] TARGET_QUEUE sq_depth=%u rq_depth=%u\n",
+               kTargetSqDepth, kTargetRqDepth);
   if (aclrtMalloc(&state->hbm, bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS) return false;
   MrRegInfo mr{};
   mr.in.mem.addr = reinterpret_cast<std::uint64_t>(state->hbm);
