@@ -218,6 +218,9 @@ Status ValidateStreamingBatchGetBuffers(const MutableBufferView& output,
   return Status::OK();
 }
 
+bool BufferRangesOverlap(const MutableBufferView& left,
+                         const MutableBufferView& right);
+
 Status ValidateLayerResidentBatchGetBinding(
     const LayerResidentBatchGetBinding& binding, const char* binding_name) {
   if (!binding.output.valid() || binding.output.device != DeviceKind::kNpu ||
@@ -239,7 +242,7 @@ Status ValidateLayerResidentBatchGetBinding(
     return InvalidArgument(std::string(binding_name) +
                            " control must be an NPU uint64[16] buffer");
   }
-  if (binding.output.data == binding.control.data) {
+  if (BufferRangesOverlap(binding.output, binding.control)) {
     return InvalidArgument(std::string(binding_name) +
                            " output and control must not alias");
   }

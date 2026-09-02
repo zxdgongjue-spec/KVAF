@@ -17,10 +17,19 @@
 // is returned to the invocation-local pool after CQ, while the output remains
 // in its fixed canonical resident slot for QSFA.
 
-#ifndef KVAF_LAYER_RESIDENT_GET_DEVICE_EMBEDDED
-#define KVAF_LAYER_RESIDENT_GET_DEVICE_EMBEDDED 1
+// execute_batch_get_aiv.asc contains both the reusable dense Direct-HCCP
+// helpers and, unless this *exact* guard is present, a standalone global
+// kernel entrypoint.  P9 imports only the helpers into a source-derived C8
+// operator, so it must use the guard owned by that header.  Preserve a guard
+// supplied by an enclosing target rather than unconditionally undefining it.
+#ifndef KVAF_FUSED_FULL_GET_DEVICE_EMBEDDED
+#define KVAF_LAYER_RESIDENT_OWNS_DENSE_EMBED_GUARD 1
+#define KVAF_FUSED_FULL_GET_DEVICE_EMBEDDED 1
+#endif
 #include "execute_batch_get_aiv.asc"
-#undef KVAF_LAYER_RESIDENT_GET_DEVICE_EMBEDDED
+#ifdef KVAF_LAYER_RESIDENT_OWNS_DENSE_EMBED_GUARD
+#undef KVAF_FUSED_FULL_GET_DEVICE_EMBEDDED
+#undef KVAF_LAYER_RESIDENT_OWNS_DENSE_EMBED_GUARD
 #endif
 
 #include "simt_api/cpp/kernel_simt_warp_level_intf.h"
@@ -29,6 +38,23 @@ namespace kvaf_layer_resident_get {
 
 using ::KvafLayerResidentBatchGetControl;
 using ::KvafLayerResidentBatchGetDescriptorScratch;
+// Keep the dependency on the existing dense Direct-HCCP primitive explicit:
+// no global using-directive is allowed across the P9/C8 boundary.
+using kvaf_fused_get::BeginKvafDenseBatchGetPostOnly;
+using kvaf_fused_get::FinishKvafDenseBatchGet;
+using kvaf_fused_get::kDenseBatchGetFailed;
+using kvaf_fused_get::kDenseBatchGetInFlight;
+using kvaf_fused_get::kDenseBatchGetRetired;
+using kvaf_fused_get::kDenseRequestCapacity;
+using kvaf_fused_get::kInvalidArgs;
+using kvaf_fused_get::kSuccess;
+using kvaf_fused_get::KvafBatchGetCoreStatus;
+using kvaf_fused_get::KvafBatchGetDirectUrmaEntity;
+using kvaf_fused_get::KvafBatchGetQueueState;
+using kvaf_fused_get::KvafDenseBatchGetTransaction;
+using kvaf_fused_get::KvafExecuteBatchGetKernelArgs;
+using kvaf_fused_get::ResetDenseBatchGetTransaction;
+using kvaf_fused_get::TryRetireKvafDenseBatchGet;
 
 enum KvafLayerResidentQueueLeaseState : uint32_t {
   kLayerResidentQueueIdle = 0U,

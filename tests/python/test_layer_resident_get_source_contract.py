@@ -53,6 +53,11 @@ def main() -> None:
         "TryRetireKvafDenseBatchGet",
         "FinishKvafDenseBatchGet",
         "DataSyncBarrier<AscendC::MemDsbT::DDR>()",
+        "KVAF_FUSED_FULL_GET_DEVICE_EMBEDDED",
+        "KVAF_LAYER_RESIDENT_OWNS_DENSE_EMBED_GUARD",
+        "using kvaf_fused_get::BeginKvafDenseBatchGetPostOnly",
+        "using kvaf_fused_get::KvafDenseBatchGetTransaction",
+        "using kvaf_fused_get::kSuccess",
     ):
         assert token in helper, token
 
