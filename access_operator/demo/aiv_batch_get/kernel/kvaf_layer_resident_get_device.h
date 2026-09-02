@@ -45,7 +45,6 @@ using kvaf_fused_get::FinishKvafDenseBatchGet;
 using kvaf_fused_get::kDenseBatchGetFailed;
 using kvaf_fused_get::kDenseBatchGetInFlight;
 using kvaf_fused_get::kDenseBatchGetRetired;
-using kvaf_fused_get::kDenseRequestCapacity;
 using kvaf_fused_get::kInvalidArgs;
 using kvaf_fused_get::kSuccess;
 using kvaf_fused_get::KvafBatchGetCoreStatus;
@@ -357,7 +356,7 @@ __aicore__ inline bool LoadKvafLayerResidentQueueTemplate(
          descriptor->indices != 0U && descriptor->offsets != 0U &&
          descriptor->mask != 0U && descriptor->output_indices != 0U &&
          descriptor->table_capacity != 0U && descriptor->request_capacity != 0U &&
-         descriptor->request_capacity <= kDenseRequestCapacity &&
+         descriptor->request_capacity <= KVAF_AIV_BATCH_GET_DENSE_REQUEST_CAPACITY &&
          descriptor->active_request_count == 0U && descriptor->reserved0 == 0U;
 }
 
@@ -370,7 +369,7 @@ __aicore__ inline bool ValidateKvafLayerResidentOutputIndices(
     const KvafLayerResidentBatchGetDescriptorScratch& descriptor) {
   if (descriptor.output_indices == 0U || descriptor.active_request_count == 0U ||
       descriptor.active_request_count > descriptor.request_capacity ||
-      descriptor.request_capacity > kDenseRequestCapacity) {
+      descriptor.request_capacity > KVAF_AIV_BATCH_GET_DENSE_REQUEST_CAPACITY) {
     return false;
   }
   __gm__ const int32_t* const output_indices =
@@ -404,7 +403,7 @@ __aicore__ inline bool PublishKvafLayerResidentDescriptor(
       descriptor.offsets == 0U || descriptor.mask == 0U ||
       descriptor.output_indices == 0U || descriptor.table_capacity == 0U ||
       descriptor.request_capacity == 0U ||
-      descriptor.request_capacity > kDenseRequestCapacity ||
+      descriptor.request_capacity > KVAF_AIV_BATCH_GET_DENSE_REQUEST_CAPACITY ||
       descriptor.active_request_count == 0U ||
       descriptor.active_request_count > descriptor.request_capacity ||
       descriptor.reserved0 != 0U ||
@@ -458,7 +457,7 @@ __aicore__ inline bool BuildKvafLayerResidentQueueArgs(
       descriptor.indices == 0U || descriptor.offsets == 0U ||
       descriptor.mask == 0U || descriptor.output_indices == 0U ||
       descriptor.table_capacity == 0U || descriptor.request_capacity == 0U ||
-      descriptor.request_capacity > kDenseRequestCapacity ||
+      descriptor.request_capacity > KVAF_AIV_BATCH_GET_DENSE_REQUEST_CAPACITY ||
       descriptor.active_request_count == 0U ||
       descriptor.active_request_count > descriptor.request_capacity ||
       descriptor.reserved0 != 0U ||

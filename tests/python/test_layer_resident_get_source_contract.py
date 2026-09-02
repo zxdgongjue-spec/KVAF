@@ -58,6 +58,7 @@ def main() -> None:
         "using kvaf_fused_get::BeginKvafDenseBatchGetPostOnly",
         "using kvaf_fused_get::KvafDenseBatchGetTransaction",
         "using kvaf_fused_get::kSuccess",
+        "KVAF_AIV_BATCH_GET_DENSE_REQUEST_CAPACITY",
     ):
         assert token in helper, token
 
