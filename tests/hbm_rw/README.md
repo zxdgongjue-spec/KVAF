@@ -67,20 +67,21 @@ achieved CPU-initiated URMA payload rate, not raw HBM silicon bandwidth; with
 The test accepts explicit EIDs for diagnostics, but the default path follows
 the pair-info local/remote EID rule used by the H2D script.
 
-Each block is one single-SGE WR. With `--jettys N`, the client creates `N`
-independent local JFC/JFR/Jetty/CTP resources and assigns requests to Jettys
-round-robin. It posts every per-Jetty WR list first, then polls one final CQE
-from each used Jetty. Thus `blocks=1024` measures the elapsed time for
-submitting and completing all 1024 requests, while `--jettys` controls the
-number of parallel queue paths. The target HBM Jetty is shared by these
-channels and remains sized for the 1024-WR wave; increasing `--jettys` does
-not increase the maximum requests in one logical batch. The current resource
-limit is 16 CPU Jettys per channel.
+Each block is one single-SGE WR. With `--jettys N` (or its alias
+`--threads N`), the client creates `N` independent local
+JFC/JFR/Jetty/CTP resources and starts one persistent worker thread per Jetty.
+Requests are assigned round-robin; workers post their WR lists and poll their
+own final CQE concurrently. Thus `blocks=1024` measures the elapsed time for
+submitting and completing all 1024 requests, while `--threads`/`--jettys`
+controls the number of parallel queue paths. The target HBM Jetty is shared by
+these channels and remains sized for the 1024-WR wave; increasing the worker
+count does not increase the maximum requests in one logical batch. The current
+resource limit is 16 CPU Jettys per channel.
 
 For example:
 
 ```bash
 tests/run_hbm_rw_client.sh <npu-host> 29888 \
-  --blocks 1024 --block-bytes 656 --jettys 4 \
+  --blocks 1024 --block-bytes 656 --threads 4 \
   --iterations 10 --warmup 1
 ```

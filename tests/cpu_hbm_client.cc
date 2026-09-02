@@ -50,7 +50,7 @@ void Usage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s HOST[:PORT] [PORT] [--blocks N] [--block-bytes N] "
                "[--host-space-bytes N[K|M|G|T]] [--iterations N] [--warmup N] "
-               "[--jettys N] [--seed N] [--ub-device NAME] "
+               "[--jettys N|--threads N] [--seed N] [--ub-device NAME] "
                "[--eid-index N] [--device-id N]\n",
                program);
 }
@@ -99,7 +99,7 @@ bool Parse(int argc, char** argv, Options* options) {
       options->block_bytes = number;
     }
     else if (arg == "--host-space-bytes" && ParseBytes(value, &options->host_space_bytes)) {}
-    else if ((arg == "--jettys" || arg == "--jetty-count") &&
+    else if ((arg == "--jettys" || arg == "--jetty-count" || arg == "--threads") &&
              ParseU32(value, &options->jetty_count)) {}
     else if (arg == "--iterations" && ParseU64(value, &number)) options->iterations = number;
     else if (arg == "--warmup" && ParseU64(value, &number)) options->warmup = number;
@@ -213,11 +213,11 @@ int main(int argc, char** argv) {
   std::fprintf(stderr,
                "[HBM_TEST][CPU] START peer=%s blocks=%zu block_bytes=%zu payload_bytes=%llu "
                "host_address_space_bytes=%llu "
-               "iterations=%zu warmup=%zu jettys=%u remote_device=%u\n",
+               "iterations=%zu warmup=%zu jettys=%u threads=%u remote_device=%u\n",
                options.peer.c_str(), options.blocks, options.block_bytes,
                static_cast<unsigned long long>(total_bytes),
                static_cast<unsigned long long>(host_space_bytes), options.iterations,
-               options.warmup, options.jetty_count, options.device_id);
+               options.warmup, options.jetty_count, options.jetty_count, options.device_id);
   std::fprintf(stderr, "[HBM_TEST][CPU] DATA_PATH=direct-registered-host-memory\n");
 
   kvaf::CpuUrmaTransportOptions transport_options;

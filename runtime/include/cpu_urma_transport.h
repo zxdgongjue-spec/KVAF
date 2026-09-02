@@ -73,7 +73,8 @@ class CpuUrmaTransport final {
                            std::size_t bytes);
   Status Read(std::uint64_t remote_offset, void* destination, std::size_t bytes);
   // Posts one WR per HostSge as a linked list and waits only for the final
-  // completion. The ordered RM queue makes that completion the batch fence.
+  // completion. With jetty_count > 1, the list is sharded round-robin and one
+  // persistent worker thread owns each Jetty; all shards run concurrently.
   Status WriteBatch(std::uint64_t remote_offset, const HostSge* sources, std::size_t count);
   Status ReadBatch(std::uint64_t remote_offset, const HostSge* destinations, std::size_t count);
   Status ReadSgl(std::uint64_t remote_offset, const HostSge* destinations, std::size_t count);
