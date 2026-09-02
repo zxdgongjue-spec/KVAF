@@ -10,11 +10,16 @@ enum {
   KVAF_AIV_BATCH_GET_QUEUE_STATE_BYTES = 64,
   KVAF_AIV_BATCH_GET_MAX_AIV_CORES = 48,
   KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE = 2,
-  KVAF_AIV_BATCH_GET_WQE_DATA_BYTES = 656,
+  KVAF_AIV_BATCH_GET_DEFAULT_BLOCK_BYTES = 656,
   KVAF_AIV_BATCH_GET_ADDRESS_TABLE_ENTRY_COUNT = 128,
+  KVAF_AIV_BATCH_GET_MAX_BLOCK_BYTES =
+      0x7fffffffU / KVAF_AIV_BATCH_GET_ADDRESS_TABLE_ENTRY_COUNT,
+  // Legacy default-layout aliases. Kernel launches use args.block_bytes.
+  KVAF_AIV_BATCH_GET_WQE_DATA_BYTES =
+      KVAF_AIV_BATCH_GET_DEFAULT_BLOCK_BYTES,
   KVAF_AIV_BATCH_GET_ADDRESS_TABLE_ENTRY_BYTES =
       KVAF_AIV_BATCH_GET_ADDRESS_TABLE_ENTRY_COUNT *
-      KVAF_AIV_BATCH_GET_WQE_DATA_BYTES,
+      KVAF_AIV_BATCH_GET_DEFAULT_BLOCK_BYTES,
   // Shared local-memory contract used by the AIV kernel and launcher.
   KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES = 160 * 1024,
 };
@@ -123,7 +128,7 @@ typedef struct KvafExecuteBatchGetKernelArgs {
   uint32_t table_capacity;
   uint32_t request_capacity;
   uint32_t output_rows;
-  uint32_t block_bytes;
+  uint32_t block_bytes;         // Per-request READ length and output row size
   uint32_t block_count;
   // Zero preserves the phase-one ABI and selects one Jetty per AIV core.
   uint32_t jettys_per_core;

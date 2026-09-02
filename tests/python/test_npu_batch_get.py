@@ -27,9 +27,8 @@ import kvaf
 
 from backend import detect_torch_backend
 
-WQE_BYTES = 656
+DEFAULT_BLOCK_BYTES = 656
 ROWS_PER_ENTRY = 128
-ENTRY_BYTES = ROWS_PER_ENTRY * WQE_BYTES
 
 
 def pattern(slot: int, block_bytes: int) -> bytes:
@@ -119,8 +118,13 @@ def main() -> int:
     table_capacity = int(os.environ.get("KVAF_NPU_TABLE_CAPACITY", "8"))
     requests = int(os.environ.get("KVAF_NPU_REQUESTS", "8"))
     output_rows = int(os.environ.get("KVAF_NPU_OUTPUT_ROWS", "8"))
-    block_bytes = int(os.environ.get("KVAF_NPU_BLOCK_BYTES", str(WQE_BYTES)))
-    source_stride = int(os.environ.get("KVAF_NPU_SOURCE_STRIDE", str(ENTRY_BYTES)))
+    block_bytes = int(
+        os.environ.get("KVAF_NPU_BLOCK_BYTES", str(DEFAULT_BLOCK_BYTES))
+    )
+    entry_bytes = ROWS_PER_ENTRY * block_bytes
+    source_stride = int(
+        os.environ.get("KVAF_NPU_SOURCE_STRIDE", str(entry_bytes))
+    )
     npu_core_count = int(
         os.environ.get("KVAF_NPU_CORE_COUNT", os.environ.get("KVAF_NPU_AIV_CORES", "1"))
     )
@@ -136,8 +140,9 @@ def main() -> int:
         table_capacity > 0
         and requests > 0
         and requests <= output_rows
-        and block_bytes == WQE_BYTES
-        and source_stride == ENTRY_BYTES
+        and block_bytes > 0
+        and entry_bytes <= 0x7FFFFFFF
+        and source_stride >= entry_bytes
         and npu_core_count > 0
         and npu_core_count <= requests
         and 1 <= jettys_per_core <= 2
@@ -172,9 +177,9 @@ def main() -> int:
     payload_slots: list[int | None] = [None] * requests
     for payload_slot, request in enumerate(active_request_positions):
         indices_values[request] = payload_slot
-        offsets_values[request] = (request % ROWS_PER_ENTRY) * WQE_BYTES
+        offsets_values[request] = (request % ROWS_PER_ENTRY) * block_bytes
         payload_slots[request] = (
-            payload_slot * ROWS_PER_ENTRY + offsets_values[request] // WQE_BYTES
+            payload_slot * ROWS_PER_ENTRY + offsets_values[request] // block_bytes
         )
     output_indices_values = [output_rows - 1 - request for request in range(requests)]
     # Exercise the public variable-size BatchPut contract independently of
@@ -277,8 +282,8 @@ def main() -> int:
         source = (
             (source_rows * 131 + source_bytes * 17 + (source_bytes >> 3)) & 0xFF
         ).to(torch.uint8).contiguous().to(device)
-        active_offsets = [row * ENTRY_BYTES for row in range(active_requests)]
-        active_lengths = [ENTRY_BYTES] * active_requests
+        active_offsets = [row * entry_bytes for row in range(active_requests)]
+        active_lengths = [entry_bytes] * active_requests
         runtime.batch_put(active_keys, source, active_offsets, active_lengths)
         print(
             "RUNTIME_NPU_PHASE_DONE phase=batch_put "
@@ -457,7 +462,7 @@ def main() -> int:
                     ) % active_requests
                     expected_payload_slots[request] = (
                         source_entry * ROWS_PER_ENTRY + offsets_values[request]
-                        // WQE_BYTES
+                        // block_bytes
                     )
                 return expected_payload_slots
 

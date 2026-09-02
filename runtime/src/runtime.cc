@@ -1,6 +1,7 @@
 #include "kvaf/runtime/runtime.h"
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <new>
 #include <string>
@@ -287,8 +288,12 @@ Status Runtime::BatchGet(const BatchGetRequest& request,
   }
 
   if (request.indices.device == DeviceKind::kNpu) {
-    if (request.output_block_bytes != kBatchGetTransferBytes) {
-      return Status::InvalidArgument("NPU BatchGet output rows must each be 656 bytes");
+    if (request.output_block_bytes > kBatchGetMaxTransferBytes ||
+        request.output_block_bytes >
+            std::numeric_limits<std::uint64_t>::max() /
+                kBatchGetAddressTableEntryCount) {
+      return Status::InvalidArgument(
+          "NPU BatchGet output row size exceeds the device ABI");
     }
     if (request.device_access_table.empty() ||
         request.device_access_table.addresses.data == nullptr ||
@@ -302,12 +307,14 @@ Status Runtime::BatchGet(const BatchGetRequest& request,
       return Status::InvalidArgument(
           "NPU BatchGet requires matching caller-provided device AccessTable buffers");
     }
+    const std::uint64_t expected_entry_bytes =
+        BatchGetAddressTableEntryBytes(request.output_block_bytes);
     if (table != nullptr &&
         (!table->has_uniform_valid_length ||
          (table->has_valid_entries &&
-          table->uniform_valid_length != kBatchGetAddressTableEntryBytes))) {
+          table->uniform_valid_length != expected_entry_bytes))) {
       return Status::InvalidArgument(
-          "NPU BatchGet requires 128 * 656-byte AccessTable entries");
+          "NPU BatchGet AccessTable entries must each contain 128 output blocks");
     }
   } else {
     if (table == nullptr) {

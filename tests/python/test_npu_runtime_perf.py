@@ -30,9 +30,7 @@ ITERATIONS = 100
 ACTIVE_PERCENT = 5
 KERNEL_PROFILE_CLOCK_MHZ = 1000
 BLOCK_BYTES = 656
-WQE_BYTES = 656
 ROWS_PER_ENTRY = 128
-ENTRY_BYTES = ROWS_PER_ENTRY * WQE_BYTES
 REQUESTS_PER_BATCH = 2048
 
 
@@ -249,10 +247,11 @@ def main(batch: int = 16) -> int:
         )
     )
     block_bytes = int(os.environ.get("KVAF_RUNTIME_PERF_BLOCK_BYTES", str(BLOCK_BYTES)))
+    entry_bytes = ROWS_PER_ENTRY * block_bytes
     table_capacity = batch * PUT_BATCH_SIZE * 8
     requests = batch * REQUESTS_PER_BATCH
     total_tokens = table_capacity * ROWS_PER_ENTRY
-    source_stride = ENTRY_BYTES
+    source_stride = entry_bytes
     total_put_batches = table_capacity // PUT_BATCH_SIZE
     if not (
         batch > 0
@@ -261,7 +260,8 @@ def main(batch: int = 16) -> int:
         and warmup >= 0
         and iterations > 0
         and 1 <= active_percent <= 100
-        and block_bytes == WQE_BYTES
+        and block_bytes > 0
+        and entry_bytes <= 0x7FFFFFFF
         and kernel_profile in (0, 1)
         and kernel_profile_clock_mhz > 0
         and total_put_batches >= warmup + iterations
@@ -299,12 +299,14 @@ def main(batch: int = 16) -> int:
         all_keys[batch_index * PUT_BATCH_SIZE : (batch_index + 1) * PUT_BATCH_SIZE]
         for batch_index in range(total_put_batches)
     ]
-    put_offsets = [row * ENTRY_BYTES for row in range(PUT_BATCH_SIZE)]
-    lengths = [ENTRY_BYTES] * PUT_BATCH_SIZE
+    put_offsets = [row * entry_bytes for row in range(PUT_BATCH_SIZE)]
+    lengths = [entry_bytes] * PUT_BATCH_SIZE
 
     torch.npu.set_device(device_id)
     device = f"npu:{device_id}"
-    kv_data = torch.empty((PUT_BATCH_SIZE, ENTRY_BYTES), dtype=torch.uint8, device=device)
+    kv_data = torch.empty(
+        (PUT_BATCH_SIZE, entry_bytes), dtype=torch.uint8, device=device
+    )
     output = torch.empty((requests, block_bytes), dtype=torch.uint8, device=device)
     runtime = kvaf.NpuRuntime(
         str(kernel), device_id, npu_core_count, str(batch_put_kernel),
@@ -328,7 +330,7 @@ def main(batch: int = 16) -> int:
         # Initialize and Shutdown run once: they are lifecycle operations, not
         # a steady-state dataplane metric.
         print("RUNTIME_PERF_PHASE_BEGIN phase=initialize")
-        runtime.initialize(table_capacity * ENTRY_BYTES, source_stride)
+        runtime.initialize(table_capacity * entry_bytes, source_stride)
         print("RUNTIME_PERF_PHASE_DONE phase=initialize")
 
         print("RUNTIME_PERF_PHASE_BEGIN phase=batch_put")
@@ -442,7 +444,7 @@ def main(batch: int = 16) -> int:
         ):
             indices = source_token_ids // ROWS_PER_ENTRY
             torch.npu.synchronize()
-            offsets = (source_token_ids % ROWS_PER_ENTRY) * WQE_BYTES
+            offsets = (source_token_ids % ROWS_PER_ENTRY) * block_bytes
             torch.npu.synchronize()
             output_indices = destination_slots.clone()
             torch.npu.synchronize()
@@ -466,7 +468,7 @@ def main(batch: int = 16) -> int:
             indices = source_token_ids // ROWS_PER_ENTRY
             torch.npu.synchronize()
 
-            offsets = (source_token_ids % ROWS_PER_ENTRY) * WQE_BYTES
+            offsets = (source_token_ids % ROWS_PER_ENTRY) * block_bytes
             torch.npu.synchronize()
 
             output_indices = destination_slots.clone()

@@ -8,10 +8,24 @@
 
 namespace kvaf {
 
-inline constexpr std::uint64_t kBatchGetTransferBytes = 656;
+// Default retained for callers that do not select a block size explicitly.
+// NPU BatchGet carries the actual transfer size in
+// BatchGetRequest::output_block_bytes.
+inline constexpr std::uint64_t kBatchGetDefaultTransferBytes = 656;
+inline constexpr std::uint64_t kBatchGetTransferBytes =
+    kBatchGetDefaultTransferBytes;
 inline constexpr std::uint64_t kBatchGetAddressTableEntryCount = 128;
+inline constexpr std::uint64_t kBatchGetMaxTransferBytes =
+    0x7fffffffULL / kBatchGetAddressTableEntryCount;
+// Legacy default-layout size. Runtime validation uses the request-specific
+// block size instead of this constant.
 inline constexpr std::uint64_t kBatchGetAddressTableEntryBytes =
     kBatchGetAddressTableEntryCount * kBatchGetTransferBytes;
+
+constexpr std::uint64_t BatchGetAddressTableEntryBytes(
+    std::uint64_t block_bytes) {
+  return kBatchGetAddressTableEntryCount * block_bytes;
+}
 
 // Runtime 初始化时由 Runtime 自己申请并注册的远端 DDR 资源规格。
 // BatchGet 的调用方 buffer 不属于这里：它们由上层在每次调用前准备。
@@ -59,7 +73,8 @@ struct BatchGetRequest {
 
   // indices/offsets/output_indices 为 int32[n]；offsets 是表项内的字节偏移。
   // miss_count 为 int32[1]，只有三个请求数组的 [0, miss_count) 前缀有效。
-  // 每个有效请求固定搬运 656B，offset + 656 不得越过 128 * 656B 表项。
+  // 每个有效请求搬运 output_block_bytes；offset 加该长度不得
+  // 越过 128 * output_block_bytes 表项。
   ConstBufferView indices;
   ConstBufferView offsets;
   ConstBufferView miss_count;

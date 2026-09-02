@@ -19,19 +19,20 @@
 namespace {
 
 constexpr uint32_t kEagerRandomSeed = 0x4b564146U;
-constexpr uint32_t kTransferBytes = KVAF_AIV_BATCH_GET_WQE_DATA_BYTES;
+constexpr uint32_t kDefaultBlockBytes =
+    KVAF_AIV_BATCH_GET_DEFAULT_BLOCK_BYTES;
 constexpr uint32_t kRowsPerEntry =
     KVAF_AIV_BATCH_GET_ADDRESS_TABLE_ENTRY_COUNT;
-constexpr uint32_t kEntryBytes =
-    KVAF_AIV_BATCH_GET_ADDRESS_TABLE_ENTRY_BYTES;
 
 struct Options {
   uint32_t device = 0U;
   uint32_t table_capacity = 4096U;
   uint32_t requests = 4096U;
   uint32_t output_rows = 4096U;
-  uint32_t block_bytes = kTransferBytes;
-  uint32_t source_stride = kEntryBytes;
+  uint32_t block_bytes = kDefaultBlockBytes;
+  // Zero means derive the tightly packed 128-row entry size after parsing
+  // block_bytes.
+  uint32_t source_stride = 0U;
   uint32_t aiv_cores = 4U;
   uint32_t jettys_per_core = 2U;
   uint32_t warmup = 10U;
@@ -129,10 +130,15 @@ bool ParseOptions(int argc, char **argv, Options *options) {
   if (options->miss_count == UINT32_MAX) {
     options->miss_count = options->requests;
   }
+  const uint64_t entry_bytes =
+      static_cast<uint64_t>(kRowsPerEntry) * options->block_bytes;
+  if (options->source_stride == 0U && entry_bytes <= INT32_MAX) {
+    options->source_stride = static_cast<uint32_t>(entry_bytes);
+  }
   return options->table_capacity != 0U &&
          options->requests != 0U && options->requests <= options->output_rows && options->output_rows != 0U &&
-         options->block_bytes == kTransferBytes &&
-         options->source_stride == kEntryBytes &&
+         options->block_bytes != 0U && entry_bytes <= INT32_MAX &&
+         options->source_stride >= entry_bytes &&
          options->aiv_cores != 0U && options->aiv_cores <= KVAF_AIV_BATCH_GET_MAX_AIV_CORES &&
          options->jettys_per_core != 0U &&
          options->jettys_per_core <= KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE &&
@@ -312,7 +318,7 @@ void PrepareGraphReplayInputs(uint32_t replay, const uint8_t *source, const Opti
     (*indices)[request] = static_cast<int32_t>(request % options.table_capacity);
     (*offsets)[request] =
         static_cast<int32_t>(((request + replay) % kRowsPerEntry) *
-                             kTransferBytes);
+                             options.block_bytes);
     (*mask)[request] = RequestIsActive(request, options) ? 1U : 0U;
     // Keep inactive output rows stable so a row written by an earlier replay
     // is never reinterpreted as inactive during byte-for-byte validation.
@@ -457,7 +463,7 @@ int main(int argc, char **argv) {
   for (uint32_t request = 0U; request < options.requests; ++request) {
     indices[request] = static_cast<int32_t>(options.table_capacity - 1U - (request % options.table_capacity));
     offsets[request] =
-        static_cast<int32_t>((request % kRowsPerEntry) * kTransferBytes);
+        static_cast<int32_t>((request % kRowsPerEntry) * options.block_bytes);
     output_indices[request] = static_cast<int32_t>(options.output_rows - 1U - request);
     mask[request] = RequestIsActive(request, options) ? 1U : 0U;
   }

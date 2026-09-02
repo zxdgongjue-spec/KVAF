@@ -465,9 +465,6 @@ class NpuRuntime final {
     const std::uint64_t output_rows =
         static_cast<std::uint64_t>(output_view.shape.front());
     const std::uint64_t output_block_bytes = output_view.bytes / output_rows;
-    if (output_block_bytes != kBatchGetTransferBytes) {
-      throw py::value_error("BatchGet output Tensor rows must each be 656 bytes");
-    }
     const BatchGetRequest request{
         access_table,
         ConstBufferView{index_view.data, index_view.bytes, DeviceKind::kNpu},

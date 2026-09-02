@@ -72,9 +72,9 @@ class Runtime {
     std::vector<std::uint64_t> lengths;
     std::vector<std::uint8_t> valid;
 
-    // NPU BatchGet requires every valid lookup entry to describe one
-    // 128 * 656-byte address-table entry. Compute the invariant once while
-    // preparing the table rather than rescanning it for every BatchGet.
+    // NPU BatchGet requires every valid lookup entry to have the same length.
+    // The expected 128 * output_block_bytes size is checked per BatchGet
+    // without rescanning the table.
     bool has_valid_entries{false};
     bool has_uniform_valid_length{true};
     std::uint64_t uniform_valid_length{0};

@@ -16,16 +16,17 @@ registration; each HBM output is registered separately as a local UDMA range.
 | `address_table` | `uint64[table_capacity]` | Absolute Host DDR UBAs, produced by the meta layer. |
 | `valid_table` | `uint8[table_capacity]` | A zero entry makes its lookup invalid. |
 | `indices` | `int32[request_capacity]` | Logical entries requested by this batch. |
-| `offsets` | `int32[request_capacity]` | Byte offset inside the selected 128 * 656B entry. |
+| `offsets` | `int32[request_capacity]` | Byte offset inside the selected `128 * block_bytes` entry. |
 | `mask` | `uint8[request_capacity]` | Zero skips that request without changing the graph shape. |
 | `output_indices` | `int32[request_capacity]` | Destination row in `output`. |
-| `output` | `uint8[output_rows * 656]` | Contiguous Device HBM output. |
+| `output` | `uint8[output_rows * block_bytes]` | Contiguous Device HBM output. |
 
-For an active request `i`, the kernel reads exactly 656 bytes from
+For an active request `i`, the kernel reads exactly `block_bytes` bytes from
 `address_table[indices[i]] + offsets[i]` and stores it at
-`output + output_indices[i] * 656`. Each address-table entry spans
-`128 * 656` bytes, so `offsets[i] + 656` must stay within that entry. This is the
-fixed-block, single-output-scatter scope; duplicate output rows are not
+`output + output_indices[i] * block_bytes`. Each address-table entry spans
+`128 * block_bytes`, so `offsets[i] + block_bytes` must stay within that entry.
+The default block size is 656B; 1024B and other positive sizes that fit the
+device ABI can be selected per Runtime call. Duplicate output rows are not
 rejected and have last-completion-wins semantics.
 
 The local-memory lifetime is intentionally separate from the shared
@@ -42,6 +43,7 @@ KvafBatchGetLocalBufferAcquire(transport, output_hbm, output_bytes,
                                &output_binding, &entity);
 args.output = reinterpret_cast<uint64_t>(output_hbm);
 args.channel_entity = entity;
+args.block_bytes = block_bytes;
 args.jettys_per_core = jettys_per_core;
 // args.queue_state points to a zero-initialized
 // KvafBatchGetQueueState[aiv_cores * jettys_per_core] array.
@@ -118,8 +120,9 @@ If that header is absent from both the CANN toolkit and asc-devkit, install the
 asc-devkit package matching the target CANN version before building; mixing
 headers from a different CANN release is not supported.
 
-The eager default is 4096 requests of 1024 bytes, 4 KiB source stride, four
-AIVs, two Jettys per AIV, and a 5% active probability. As in
+The eager default is 4096 requests of 656 bytes, tightly packed in
+`128 * block_bytes` source entries, with four AIVs, two Jettys per AIV, and a
+5% active probability. As in
 `tests/python/test_npu_runtime_perf.py`, every warmup and measured sample uses
 its own random indices/mask pair. All pairs are generated and copied to the
 device before the benchmark starts. Results are written beneath `results/`;
@@ -132,6 +135,10 @@ Useful overrides:
 DEVICE_ID=0 TABLE_CAPACITY=256 REQUESTS=10 OUTPUT_ROWS=200 \
 BLOCK_BYTES=656 SOURCE_STRIDE=83968 AIV_CORES=1 JETTYS_PER_CORE=2 ACTIVE_PERCENT=20 \
 WARMUP=1 ITERATIONS=1 bash scripts/run_execute_batch_get.sh
+
+# Exercise 1024-byte READ WQEs. SOURCE_STRIDE defaults to 128 * BLOCK_BYTES.
+DEVICE_ID=0 BLOCK_BYTES=1024 AIV_CORES=1 JETTYS_PER_CORE=2 \
+WARMUP=1 ITERATIONS=5 bash scripts/run_execute_batch_get.sh
 
 # Proves TransportCreate -> Acquire(A) -> Acquire(B) -> re-Acquire(A), then
 # releases both local-buffer references without rebuilding EID/CTP/Jettys.

@@ -75,8 +75,9 @@ address/valid Tensor。
 `LockKeys` 阶段直接返回 `kNotFound`，因此不会产生一张含该 Key 的
 `valid=0` 表。
 
-当前 AIV BatchGet ABI 固定每个 WQE 读取 656B，且每个 NPU AccessTable valid
-entry 必须是 `128 * 656B`。`indices[i]` 选择 entry，`offsets[i]` 提供 entry 内
+当前 AIV BatchGet ABI 由输出 Tensor 的行宽动态决定每个 WQE 的读取长度，
+每个 NPU AccessTable valid entry 必须是 `128 * output_block_bytes`。
+`indices[i]` 选择 entry，`offsets[i]` 提供 entry 内
 字节偏移，最终远端地址为 `address_table[indices[i]] + offsets[i]`。Runtime 在
 `PrepareAccessTable` 时一次性
 计算这一不变量，之后每次 BatchGet 只做 O(1) 比较；不会在数据面热路径重新扫描
@@ -241,7 +242,7 @@ BatchGet/Put 的每个样本均在 Runtime 调用后由调用方 `torch.npu.sync
 sample 生成一个小于请求容量的单元素 NPU `int32 miss_count`，其期望值约为
 `batch * 2048 * active_percent`。数据构造阶段只保存这三项；每个 sample 调用
 BatchGet 前再生成 `indices = source_token_ids // 128`、
-`offsets = (source_token_ids % 128) * 656`、由 `destination_slots` 物化的
+`offsets = (source_token_ids % 128) * block_bytes`、由 `destination_slots` 物化的
 `output_indices`；只有三个数组的 `[0, miss_count)` 前缀会被搬运，不再生成 mask。
 输入构造和派生不记录耗时，也不纳入 BatchGet 端到端指标。正式
 sample 只输出 `batch_get_submit`、`batch_get_synchronize` 和 `batch_get` 的
@@ -271,8 +272,21 @@ PYTHONPATH="$PWD/build-aiv/python" \
 timeout 1800s python3 tests/python/test_npu_runtime_perf.py
 ```
 
-默认 `batch=16`，即全表 16,384 个 `128 * 656B` entry、每次 BatchGet 32,768
-requests、每个 WQE 656B、32 个 AIV core、每 core 2 个 Jetty、3 次 warmup 与
+测试 1024B 读取时只需覆盖 block 大小；脚本会同步将 entry 长度和
+offset 步长调整为 1024B 布局：
+
+```bash
+KVAF_RUNTIME_PERF_BLOCK_BYTES=1024 \
+KVAF_RUN_NPU_TESTS=1 \
+KVAF_BATCH_GET_KERNEL="$PWD/build-aiv/bin/kvaf_execute_batch_get_kernels.o" \
+KVAF_BATCH_PUT_KERNEL="$PWD/build-aiv/bin/kvaf_execute_batch_put_kernels.o" \
+PYTHONPATH="$PWD/build-aiv/python" \
+python3 tests/python/test_npu_runtime_perf.py
+```
+
+默认 `batch=16`，即全表 16,384 个 `128 * block_bytes` entry、每次 BatchGet
+32,768 requests、默认每个 WQE 656B、32 个 AIV core、每 core 2 个 Jetty、
+3 次 warmup 与
 100 个样本。可用
 `KVAF_RUNTIME_PERF_BATCH`、
 `KVAF_RUNTIME_PERF_AIV_CORES`、`KVAF_RUNTIME_PERF_WARMUP`、

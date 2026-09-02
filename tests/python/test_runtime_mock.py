@@ -154,25 +154,27 @@ class RuntimeMockTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.kvaf.batch_get(table, [0], [0], 1, [0], bytearray(4), output_block_bytes=4)
 
-    def test_get_uses_index_and_656_byte_row_offset(self) -> None:
-        entry_bytes = 128 * 656
+    def test_get_uses_configurable_1024_byte_row_offset(self) -> None:
+        block_bytes = 1024
+        entry_bytes = 128 * block_bytes
         self.kvaf.initialize(ddr_bytes=entry_bytes, slot_size=entry_bytes)
         block = bytearray(entry_bytes)
-        block[:656] = bytes([0x11]) * 656
-        block[656:1312] = bytes([0x22]) * 656
+        block[:block_bytes] = bytes([0x11]) * block_bytes
+        block[block_bytes : 2 * block_bytes] = bytes([0x22]) * block_bytes
         self.batch_put([17], [block])
         table = self.kvaf.prepare_access_table([17])
-        output = bytearray(656)
+        output = bytearray(block_bytes)
         self.kvaf.batch_get(
-            table, indices=[0], offsets=[656], miss_count=1, output_indices=[0],
-            output=output, output_block_bytes=656,
+            table, indices=[0], offsets=[block_bytes], miss_count=1,
+            output_indices=[0], output=output,
+            output_block_bytes=block_bytes,
         )
-        self.assertEqual(output, bytes([0x22]) * 656)
+        self.assertEqual(output, bytes([0x22]) * block_bytes)
         with self.assertRaises(ValueError):
             self.kvaf.batch_get(
                 table, indices=[0], offsets=[entry_bytes], miss_count=1,
                 output_indices=[0],
-                output=bytearray(656), output_block_bytes=656,
+                output=bytearray(block_bytes), output_block_bytes=block_bytes,
             )
         self.kvaf.release_access_table(table)
 
