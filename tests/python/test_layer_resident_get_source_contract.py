@@ -64,6 +64,19 @@ def main() -> None:
     ):
         assert token in helper, token
 
+    # The C-compatible batch_get ABI intentionally declares these wire
+    # records in global scope.  Only DenseBatchGet helpers are namespaced.
+    # Keeping this distinction explicit prevents a source-derived C8 OPP from
+    # failing late in the AscendC compiler after an expensive package stage.
+    for global_abi_type in (
+        "KvafBatchGetCoreStatus",
+        "KvafBatchGetDirectUrmaEntity",
+        "KvafBatchGetQueueState",
+        "KvafExecuteBatchGetKernelArgs",
+    ):
+        assert f"using ::{global_abi_type};" in helper, global_abi_type
+        assert f"using kvaf_fused_get::{global_abi_type};" not in helper, global_abi_type
+
     # The P9 boundary is intentionally smaller than P8: no private arena,
     # forward identity, replay identity, or payload-release state belongs in
     # the canonical-resident device helper.

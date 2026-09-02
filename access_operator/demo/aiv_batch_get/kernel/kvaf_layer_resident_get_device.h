@@ -49,11 +49,15 @@ using kvaf_fused_get::kDenseBatchGetInFlight;
 using kvaf_fused_get::kDenseBatchGetRetired;
 using kvaf_fused_get::kInvalidArgs;
 using kvaf_fused_get::kSuccess;
-using kvaf_fused_get::KvafBatchGetCoreStatus;
-using kvaf_fused_get::KvafBatchGetDirectUrmaEntity;
-using kvaf_fused_get::KvafBatchGetQueueState;
+// batch_get_abi.h is deliberately a C-compatible, global ABI header.  The
+// dense helpers below live in kvaf_fused_get, but these wire records do not;
+// alias them from global scope so a nested C8 include cannot reinterpret their
+// linkage or namespace.
+using ::KvafBatchGetCoreStatus;
+using ::KvafBatchGetDirectUrmaEntity;
+using ::KvafBatchGetQueueState;
 using kvaf_fused_get::KvafDenseBatchGetTransaction;
-using kvaf_fused_get::KvafExecuteBatchGetKernelArgs;
+using ::KvafExecuteBatchGetKernelArgs;
 using kvaf_fused_get::ResetDenseBatchGetTransaction;
 using kvaf_fused_get::TryRetireKvafDenseBatchGet;
 
