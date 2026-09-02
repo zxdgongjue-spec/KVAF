@@ -69,6 +69,10 @@ class CpuUrmaTransport final {
   Status WriteDeviceMemory(std::uint64_t remote_offset, const void* device_source,
                            std::size_t bytes);
   Status Read(std::uint64_t remote_offset, void* destination, std::size_t bytes);
+  // Posts one WR per HostSge as a linked list and waits only for the final
+  // completion. The ordered RM queue makes that completion the batch fence.
+  Status WriteBatch(std::uint64_t remote_offset, const HostSge* sources, std::size_t count);
+  Status ReadBatch(std::uint64_t remote_offset, const HostSge* destinations, std::size_t count);
   Status ReadSgl(std::uint64_t remote_offset, const HostSge* destinations, std::size_t count);
   Status Shutdown();
 

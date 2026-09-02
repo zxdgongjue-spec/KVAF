@@ -581,6 +581,86 @@ struct CpuUrmaTransport::Impl {
         std::to_string(static_cast<unsigned>(observed_attr.state)) + ")");
   }
 
+  Status TransferBatch(bool write, std::uint64_t offset,
+                       const CpuUrmaTransport::HostSge* buffers, std::size_t count) {
+    constexpr std::uint64_t kBatchCtxBase = 0xBA7C0000ULL;
+    if (!initialized_) return Status::InvalidState("CPU URMA transport is not initialized");
+    if (buffers == nullptr || count == 0U || offset > remote_region_.length ||
+        count > kJettyDepth) {
+      return Status::InvalidArgument("invalid batch transfer");
+    }
+    std::vector<urma_sge_t> local(count);
+    std::vector<urma_sge_t> remote(count);
+    std::vector<urma_jfs_wr_t> wrs(count);
+    std::uint64_t total = 0U;
+    for (std::size_t i = 0; i < count; ++i) {
+      if (buffers[i].data == nullptr || buffers[i].bytes == 0U ||
+          buffers[i].bytes > std::numeric_limits<std::uint32_t>::max() ||
+          total > remote_region_.length - offset ||
+          buffers[i].bytes > remote_region_.length - offset - total) {
+        return Status::InvalidArgument("invalid batch entry");
+      }
+      RegisteredHostBuffer* host = FindRegisteredHostBuffer(buffers[i].data, buffers[i].bytes);
+      if (host == nullptr) {
+        Status status = RegisterHostBuffer(buffers[i].data, buffers[i].bytes, &host);
+        if (!status.ok()) return status;
+      }
+      local[i] = {reinterpret_cast<std::uint64_t>(buffers[i].data),
+                  static_cast<std::uint32_t>(buffers[i].bytes), host->segment};
+      remote[i] = {remote_region_.base + offset + total,
+                   static_cast<std::uint32_t>(buffers[i].bytes), remote_seg_handle_};
+      wrs[i] = {};
+      wrs[i].opcode = write ? URMA_OPC_WRITE : URMA_OPC_READ;
+      wrs[i].flag.bs.complete_enable = (i + 1U == count) ? 1U : 0U;
+      wrs[i].tjetty = remote_jetty_;
+      wrs[i].user_ctx = kBatchCtxBase + i;
+      if (write) {
+        wrs[i].rw.src = {&local[i], 1U};
+        wrs[i].rw.dst = {&remote[i], 1U};
+      } else {
+        wrs[i].rw.src = {&remote[i], 1U};
+        wrs[i].rw.dst = {&local[i], 1U};
+      }
+      wrs[i].next = i + 1U < count ? &wrs[i + 1U] : nullptr;
+      total += buffers[i].bytes;
+    }
+    urma_jfs_wr_t* bad = nullptr;
+    const auto start = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "[KVAF_CPU_URMA] BATCH_POST wrs=%zu bytes=%llu\n",
+                 count, static_cast<unsigned long long>(total));
+    const urma_status_t post_status = urma_post_jetty_send_wr(local_jetty_, wrs.data(), &bad);
+    if (post_status != URMA_SUCCESS) {
+      return Status::Internal("batch post failed (status=" +
+                             std::to_string(static_cast<int>(post_status)) +
+                             ", bad_index=" +
+                             std::to_string(bad == nullptr ? count : static_cast<std::size_t>(bad - wrs.data())) +
+                             ", count=" + std::to_string(count) + ")");
+    }
+    const std::uint64_t expected_ctx = kBatchCtxBase + count - 1U;
+    const auto deadline = start + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+      urma_cr_t cr{};
+      const int polled = urma_poll_jfc(jfc_, 1, &cr);
+      if (polled < 0) return Error("urma_poll_jfc for batch");
+      if (polled == 1) {
+        if (cr.status != URMA_CR_SUCCESS || cr.user_ctx != expected_ctx) {
+          return Status::Internal("batch completion failed (status=" +
+                                 std::to_string(static_cast<int>(cr.status)) +
+                                 ", user_ctx=" + std::to_string(static_cast<unsigned long long>(cr.user_ctx)) +
+                                 ", expected_ctx=" + std::to_string(static_cast<unsigned long long>(expected_ctx)) + ")");
+        }
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        std::fprintf(stderr, "[KVAF_CPU_URMA] BATCH_COMPLETE wrs=%zu bytes=%llu elapsed_ns=%lld\n",
+                     count, static_cast<unsigned long long>(total), static_cast<long long>(elapsed));
+        return Status::OK();
+      }
+      std::this_thread::yield();
+    }
+    return Status::Internal("timed out waiting for batch completion (wrs=" +
+                           std::to_string(count) + ")");
+  }
+
   Status TransferDeviceWrite(std::uint64_t offset, const void* device_source,
                              std::size_t bytes) {
     if (!initialized_) return Status::InvalidState("CPU URMA transport is not initialized");
@@ -755,6 +835,14 @@ Status CpuUrmaTransport::WriteDeviceMemory(std::uint64_t offset, const void* dev
 }
 Status CpuUrmaTransport::Read(std::uint64_t offset, void* destination, std::size_t bytes) {
   return impl_->TransferDirect(false, offset, destination, bytes);
+}
+Status CpuUrmaTransport::WriteBatch(std::uint64_t offset, const HostSge* sources,
+                                    std::size_t count) {
+  return impl_->TransferBatch(true, offset, sources, count);
+}
+Status CpuUrmaTransport::ReadBatch(std::uint64_t offset, const HostSge* destinations,
+                                   std::size_t count) {
+  return impl_->TransferBatch(false, offset, destinations, count);
 }
 Status CpuUrmaTransport::ReadSgl(std::uint64_t offset, const HostSge* destinations,
                                  std::size_t count) {

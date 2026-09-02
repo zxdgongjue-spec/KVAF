@@ -24,8 +24,6 @@ struct Options {
   bool has_eid_index{false};
   std::uint32_t eid_index{0};
   std::uint32_t device_id{0};
-  std::size_t sgl_size{1};
-  std::string sgl_pattern{"random"};
 };
 
 bool ParseU64(const char* text, std::uint64_t* value) {
@@ -49,8 +47,7 @@ void Usage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s HOST[:PORT] [PORT] [--blocks N] [--block-bytes N] "
                "[--iterations N] [--warmup N] [--seed N] [--ub-device NAME] "
-               "[--eid-index N] [--device-id N] [--sgl-size N] "
-               "[--sgl-pattern random|adjacent|same]\n",
+               "[--eid-index N] [--device-id N]\n",
                program);
 }
 
@@ -82,12 +79,6 @@ bool Parse(int argc, char** argv, Options* options) {
     else if (arg == "--ub-device") options->ub_device = value;
     else if (arg == "--eid-index" && ParseU32(value, &options->eid_index)) options->has_eid_index = true;
     else if (arg == "--device-id" && ParseU32(value, &options->device_id)) {}
-    else if (arg == "--sgl-size" && ParseU64(value, &number)) options->sgl_size = number;
-    else if (arg == "--sgl-pattern" &&
-             (std::string(value) == "random" || std::string(value) == "adjacent" ||
-              std::string(value) == "same")) {
-      options->sgl_pattern = value;
-    }
     else return false;
   }
   return options->blocks != 0 && options->block_bytes != 0 && options->iterations != 0 &&
@@ -96,7 +87,7 @@ bool Parse(int argc, char** argv, Options* options) {
 }
 
 struct Stats {
-  std::uint64_t ops{0};
+  std::uint64_t batches{0};
   std::uint64_t blocks{0};
   std::uint64_t bytes{0};
   std::uint64_t sum_ns{0};
@@ -112,40 +103,33 @@ struct HostBlock {
 bool RunPass(kvaf::CpuUrmaTransport* transport, bool write,
              std::vector<HostBlock>* blocks,
              const std::vector<std::size_t>& order, std::size_t block_bytes,
-             std::size_t iterations, std::size_t sgl_size, Stats* stats) {
+             std::size_t iterations, Stats* stats) {
   if (transport == nullptr || blocks == nullptr || stats == nullptr) return false;
   const auto wall_start = std::chrono::steady_clock::now();
   for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
-    for (std::size_t position = 0; position < order.size();) {
-      const std::size_t sgl_count = std::min(sgl_size, order.size() - position);
-      std::vector<kvaf::CpuUrmaTransport::HostSge> sges(sgl_count);
-      std::uint64_t sgl_bytes = 0U;
-      for (std::size_t i = 0; i < sgl_count; ++i) {
-        const std::size_t block_index = order[position + i];
-        sges[i] = {(*blocks)[block_index].data, block_bytes};
-        sgl_bytes += block_bytes;
-      }
-      const auto start = std::chrono::steady_clock::now();
-      const std::uint64_t offset = static_cast<std::uint64_t>(position) * block_bytes;
-      const kvaf::Status status = write
-          ? transport->WriteSgl(offset, sges.data(), sges.size())
-          : transport->ReadSgl(offset, sges.data(), sges.size());
-      if (!status.ok()) {
-        std::fprintf(stderr, "[HBM_TEST][CPU] %s failed sgl_position=%zu: %s\n",
-                     write ? "WRITE" : "READ", position, status.message().c_str());
-        return false;
-      }
-      const auto elapsed = static_cast<std::uint64_t>(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now() - start).count());
-      ++stats->ops;
-      stats->blocks += sgl_count;
-      stats->bytes += sgl_bytes;
-      stats->sum_ns += elapsed;
-      stats->min_ns = std::min(stats->min_ns, elapsed);
-      stats->max_ns = std::max(stats->max_ns, elapsed);
-      position += sgl_count;
+    std::vector<kvaf::CpuUrmaTransport::HostSge> requests(order.size());
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        const std::size_t block_index = order[i];
+      requests[i] = {(*blocks)[block_index].data, block_bytes};
     }
+    const auto start = std::chrono::steady_clock::now();
+    const kvaf::Status status = write
+        ? transport->WriteBatch(0U, requests.data(), requests.size())
+        : transport->ReadBatch(0U, requests.data(), requests.size());
+    if (!status.ok()) {
+      std::fprintf(stderr, "[HBM_TEST][CPU] %s failed batch_wrs=%zu: %s\n",
+                   write ? "WRITE" : "READ", requests.size(), status.message().c_str());
+      return false;
+    }
+    const auto elapsed = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count());
+    ++stats->batches;
+    stats->blocks += order.size();
+    stats->bytes += static_cast<std::uint64_t>(order.size()) * block_bytes;
+    stats->sum_ns += elapsed;
+    stats->min_ns = std::min(stats->min_ns, elapsed);
+    stats->max_ns = std::max(stats->max_ns, elapsed);
   }
   stats->wall_ns = static_cast<std::uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -156,12 +140,13 @@ bool RunPass(kvaf::CpuUrmaTransport* transport, bool write,
 void PrintStats(const char* name, const Stats& stats) {
   const double bandwidth = stats.wall_ns == 0
       ? 0.0 : stats.bytes * 1e9 / stats.wall_ns / (1024.0 * 1024.0);
-  const double average = stats.ops == 0 ? 0.0 : stats.sum_ns / static_cast<double>(stats.ops);
-  std::printf("[HBM_TEST][CPU] %-5s bytes=%llu blocks=%llu wrs=%llu bandwidth=%.2f MiB/s "
-              "avg_wr_latency=%.3f us min=%.3f us max=%.3f us\n",
+  const double average = stats.batches == 0 ? 0.0 : stats.sum_ns / static_cast<double>(stats.batches);
+  std::printf("[HBM_TEST][CPU] %-5s bytes=%llu blocks=%llu wrs=%llu batches=%llu "
+              "bandwidth=%.2f MiB/s avg_batch_latency=%.3f us min=%.3f us max=%.3f us\n",
               name, static_cast<unsigned long long>(stats.bytes),
               static_cast<unsigned long long>(stats.blocks),
-              static_cast<unsigned long long>(stats.ops), bandwidth, average / 1000.0,
+              static_cast<unsigned long long>(stats.blocks),
+              static_cast<unsigned long long>(stats.batches), bandwidth, average / 1000.0,
               stats.min_ns / 1000.0, stats.max_ns / 1000.0);
 }
 
@@ -200,15 +185,6 @@ int main(int argc, char** argv) {
   }
   std::fprintf(stderr, "[HBM_TEST][CPU] CHANNEL_READY remote_bytes=%llu\n",
                static_cast<unsigned long long>(transport.region_bytes()));
-  if (options.sgl_size == 0U || options.sgl_size > transport.max_sge()) {
-    std::fprintf(stderr,
-                 "[HBM_TEST][CPU] FAILED stage=sgl_size requested=%zu max_sge=%u\n",
-                 options.sgl_size, transport.max_sge());
-    (void)transport.Shutdown();
-    return 1;
-  }
-  std::fprintf(stderr, "[HBM_TEST][CPU] SGL_SIZE=%zu\n", options.sgl_size);
-  std::fprintf(stderr, "[HBM_TEST][CPU] SGL_PATTERN=%s\n", options.sgl_pattern.c_str());
 
   // Separate allocations intentionally produce non-contiguous/random host addresses.
   std::mt19937_64 rng(options.seed);
@@ -237,7 +213,7 @@ int main(int argc, char** argv) {
       options.blocks, std::vector<std::uint8_t>(options.block_bytes));
   std::vector<std::size_t> slots(options.blocks);
   for (std::size_t i = 0; i < options.blocks; ++i) slots[i] = i;
-  if (options.sgl_pattern == "random") std::shuffle(slots.begin(), slots.end(), rng);
+  std::shuffle(slots.begin(), slots.end(), rng);
   for (std::size_t i = 0; i < options.blocks; ++i) {
     blocks[i].data = storage.get() + slots[i] * options.block_bytes;
     for (std::size_t j = 0; j < options.block_bytes; ++j) {
@@ -245,39 +221,34 @@ int main(int argc, char** argv) {
       expected[i][j] = blocks[i].data[j];
     }
   }
-  if (options.sgl_pattern == "same") {
-    for (std::size_t i = 1; i < options.blocks; ++i) blocks[i].data = blocks[0].data;
-  }
   std::vector<std::size_t> order(options.blocks);
   for (std::size_t i = 0; i < options.blocks; ++i) order[i] = i;
-  if (options.sgl_pattern == "random") std::shuffle(order.begin(), order.end(), rng);
+  std::shuffle(order.begin(), order.end(), rng);
 
   Stats warmup_stats;
   if (options.warmup != 0 && !RunPass(&transport, true, &blocks, order, options.block_bytes,
-                                      options.warmup, options.sgl_size, &warmup_stats)) {
+                                      options.warmup, &warmup_stats)) {
     (void)transport.Shutdown();
     return 1;
   }
   Stats write_stats;
   if (!RunPass(&transport, true, &blocks, order, options.block_bytes,
-               options.iterations, options.sgl_size, &write_stats)) {
+               options.iterations, &write_stats)) {
     (void)transport.Shutdown();
     return 1;
   }
   for (auto& block : blocks) std::fill_n(block.data, options.block_bytes, 0);
   Stats read_stats;
   if (!RunPass(&transport, false, &blocks, order, options.block_bytes,
-               options.iterations, options.sgl_size, &read_stats)) {
+               options.iterations, &read_stats)) {
     (void)transport.Shutdown();
     return 1;
   }
   bool verified = true;
-  if (options.sgl_pattern != "same") {
-    for (std::size_t i = 0; i < blocks.size(); ++i) {
-      verified = verified && std::equal(blocks[i].data,
-                                        blocks[i].data + options.block_bytes,
-                                        expected[i].begin());
-    }
+  for (std::size_t i = 0; i < blocks.size(); ++i) {
+    verified = verified && std::equal(blocks[i].data,
+                                      blocks[i].data + options.block_bytes,
+                                      expected[i].begin());
   }
   PrintStats("WRITE", write_stats);
   PrintStats("READ", read_stats);

@@ -34,8 +34,10 @@ using direct_hccp::DirectHccpSession;
 
 constexpr std::uint32_t kHdcType = 18U;
 constexpr std::uint32_t kCqDepth = 16384U;
-constexpr std::uint32_t kSqDepth = 256U;
-constexpr std::uint32_t kRqDepth = 256U;
+// The benchmark submits one WR per block and fences the whole request list
+// with the final CQE. Keep the target queue at the benchmark's 1024-WR wave.
+constexpr std::uint32_t kSqDepth = 1024U;
+constexpr std::uint32_t kRqDepth = 1024U;
 
 bool ReadAll(int fd, void* data, std::size_t bytes) {
   auto* p = static_cast<std::uint8_t*>(data);

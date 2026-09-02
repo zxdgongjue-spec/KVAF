@@ -63,14 +63,8 @@ achieved CPU-initiated URMA payload rate, not raw HBM silicon bandwidth; with
 The test accepts explicit EIDs for diagnostics, but the default path follows
 the pair-info local/remote EID rule used by the H2D script.
 
-`--sgl-size N` controls the number of local host SGEs carried by one URMA WR;
-the default is `1`. For example, `--sgl-size 2` sends two 656-byte blocks in
-one WR. This requires multi-SGE support in the active provider and both ends
-of the data path; a device reporting `max_jfs_sge` only describes the local
-CPU capability and does not guarantee that the remote HBM path accepts it.
-
-The probe branch also accepts `--sgl-pattern random|adjacent|same`:
-`random` keeps shuffled block addresses and order, `adjacent` uses consecutive
-addresses in one registered segment, and `same` repeats one address in every
-SGE. The latter two patterns help identify whether a failure is caused by SGE
-count or by particular address layouts.
+Each block is one single-SGE WR. A pass builds one linked WR list for all
+blocks, submits the list once, sets completion only on the final WR, and then
+polls the CQ. Thus `blocks=1024` measures the elapsed time for submitting and
+completing all 1024 requests, without requiring multi-SGE support. The target
+HBM queue is sized for this 1024-WR wave.
