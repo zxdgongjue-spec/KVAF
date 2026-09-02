@@ -30,6 +30,14 @@ enum {
   KVAF_STREAMING_BATCH_GET_CONTROL_WORDS = 16,
   KVAF_STREAMING_BATCH_GET_CONTROL_BYTES =
       KVAF_STREAMING_BATCH_GET_CONTROL_WORDS * sizeof(uint64_t),
+  // P9 uses a separate graph-visible control for one layer-local
+  // ExactScan + SpeculativeGet invocation.  Its destination is a fixed,
+  // canonical resident-row interval in the layer's registered KV output;
+  // it is deliberately not a P8 private arena and carries no forward/replay
+  // ownership fields.  Like the other device controls it stays uint64[16].
+  KVAF_LAYER_RESIDENT_BATCH_GET_CONTROL_WORDS = 16,
+  KVAF_LAYER_RESIDENT_BATCH_GET_CONTROL_BYTES =
+      KVAF_LAYER_RESIDENT_BATCH_GET_CONTROL_WORDS * sizeof(uint64_t),
   // One int32 owner word per Direct-HCCP queue: 0 means free and a positive
   // value is the producer-owned lease tag (normally 1 + LI producer id).
   KVAF_STREAMING_BATCH_GET_QUEUE_LEASE_BYTES = sizeof(int32_t),
@@ -69,6 +77,9 @@ static const uint64_t KVAF_FUSED_BATCH_GET_CONTROL_VERSION = 1ULL;
 static const uint64_t KVAF_STREAMING_BATCH_GET_CONTROL_MAGIC =
     0x4b5641465354524dULL;  // "KVAFSTRM"
 static const uint64_t KVAF_STREAMING_BATCH_GET_CONTROL_VERSION = 1ULL;
+static const uint64_t KVAF_LAYER_RESIDENT_BATCH_GET_CONTROL_MAGIC =
+    0x4b5641464c525347ULL;  // "KVAFLRSG"
+static const uint64_t KVAF_LAYER_RESIDENT_BATCH_GET_CONTROL_VERSION = 1ULL;
 
 // Optional, per-core kernel timeline. The host enables collection by placing
 // KVAF_AIV_BATCH_GET_PROFILE_MAGIC in `magic` before launch. The kernel keeps
@@ -282,6 +293,59 @@ typedef struct KvafStreamingBatchGetControl {
   uint64_t descriptor_template_count;
 } KvafStreamingBatchGetControl;
 
+// One descriptor template/scratch record for a layer-resident speculative
+// wave.  It intentionally has the same descriptor-vector layout as the
+// verified dense Direct-HCCP primitive, but has no private-output base.  The
+// fixed canonical resident interval belongs to the enclosing control, and
+// every output index is validated against it before the SQ doorbell.
+//
+// `reserved0` must be zero in version 1.  Keeping this record at 64 bytes
+// lets the host allocate one cache-line descriptor per Direct-HCCP queue.
+typedef struct KvafLayerResidentBatchGetDescriptorScratch {
+  uint64_t address_table;
+  uint64_t valid_table;
+  uint64_t indices;
+  uint64_t offsets;
+  uint64_t mask;
+  uint64_t output_indices;
+  uint32_t table_capacity;
+  uint32_t request_capacity;
+  uint32_t active_request_count;
+  uint32_t reserved0;
+} KvafLayerResidentBatchGetDescriptorScratch;
+
+// Layer-local canonical-resident Direct-HCCP control.  The output allocation
+// is registered once with KVAF, but a fused operator may only direct Get
+// writes to [resident_row_base, resident_row_base + resident_row_count).
+// CandidateCompact assigns every candidate a unique, pre-reserved row in
+// that interval; after Exact Top-K, Guaranteed Recall uses unused rows from
+// the same interval.  The operator drains all posts before return, so no
+// resident row, queue, descriptor, or control state survives into another
+// layer/forward invocation.
+//
+// `queue_leases` is only a bounded *in-invocation* SQ/CQ ownership table:
+// zero is idle and a positive producer tag owns a queue until its CQ is
+// terminal.  It is unrelated to resident-slot lifetime and intentionally
+// has no epoch, replay, private-slot, release, or quarantine ABI.
+typedef struct KvafLayerResidentBatchGetControl {
+  uint64_t magic;
+  uint64_t version;
+  uint64_t channel_entity;
+  uint64_t queue_state;
+  uint64_t core_status;
+  uint64_t output;
+  uint64_t queue_leases;
+  uint64_t descriptor_scratch;
+  uint64_t queue_count;
+  uint64_t output_rows;
+  uint64_t resident_row_base;
+  uint64_t resident_row_count;
+  uint64_t jettys_per_core;
+  uint64_t block_bytes;
+  uint64_t descriptor_templates;
+  uint64_t descriptor_template_count;
+} KvafLayerResidentBatchGetControl;
+
 #if defined(__cplusplus)
 static_assert(sizeof(KvafBatchGetCoreStatus) == KVAF_AIV_BATCH_GET_STATUS_BYTES,
               "KvafBatchGetCoreStatus ABI changed");
@@ -301,6 +365,11 @@ static_assert(sizeof(KvafStreamingBatchGetControl) ==
               "KvafStreamingBatchGetControl ABI changed");
 static_assert(sizeof(KvafStreamingBatchGetDescriptorScratch) == 64,
               "KvafStreamingBatchGetDescriptorScratch ABI changed");
+static_assert(sizeof(KvafLayerResidentBatchGetControl) ==
+                  KVAF_LAYER_RESIDENT_BATCH_GET_CONTROL_BYTES,
+              "KvafLayerResidentBatchGetControl ABI changed");
+static_assert(sizeof(KvafLayerResidentBatchGetDescriptorScratch) == 64,
+              "KvafLayerResidentBatchGetDescriptorScratch ABI changed");
 #endif
 
 #endif  // KVAF_AIV_BATCH_GET_ABI_H_

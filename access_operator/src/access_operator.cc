@@ -218,6 +218,34 @@ Status ValidateStreamingBatchGetBuffers(const MutableBufferView& output,
   return Status::OK();
 }
 
+Status ValidateLayerResidentBatchGetBinding(
+    const LayerResidentBatchGetBinding& binding, const char* binding_name) {
+  if (!binding.output.valid() || binding.output.device != DeviceKind::kNpu ||
+      binding.output.bytes % kBatchGetTransferBytes != 0U) {
+    return InvalidArgument(std::string(binding_name) +
+                           " output must be an NPU buffer with 656-byte rows");
+  }
+  const std::uint64_t output_rows =
+      binding.output.bytes / kBatchGetTransferBytes;
+  if (output_rows > std::numeric_limits<std::uint32_t>::max() ||
+      binding.resident_row_count == 0U ||
+      binding.resident_row_base >= output_rows ||
+      binding.resident_row_count > output_rows - binding.resident_row_base) {
+    return InvalidArgument(std::string(binding_name) +
+                           " resident row interval is outside the output");
+  }
+  if (!binding.control.valid() || binding.control.device != DeviceKind::kNpu ||
+      binding.control.bytes != sizeof(KvafLayerResidentBatchGetControl)) {
+    return InvalidArgument(std::string(binding_name) +
+                           " control must be an NPU uint64[16] buffer");
+  }
+  if (binding.output.data == binding.control.data) {
+    return InvalidArgument(std::string(binding_name) +
+                           " output and control must not alias");
+  }
+  return Status::OK();
+}
+
 bool BufferRangesOverlap(const MutableBufferView& left,
                          const MutableBufferView& right) {
   if (!left.valid() || !right.valid()) {
@@ -307,6 +335,67 @@ Status BuildStreamingBatchGetQueueTemplate(
   destination->active_request_count = 0U;
   destination->private_output_row_base =
       static_cast<std::uint32_t>(private_base);
+  return Status::OK();
+}
+
+Status BuildLayerResidentBatchGetQueueTemplate(
+    const LayerResidentBatchGetQueueTemplate& source,
+    std::uint32_t queue_count,
+    KvafLayerResidentBatchGetDescriptorScratch* destination,
+    const std::string& label) {
+  if (destination == nullptr || source.queue_id >= queue_count) {
+    return InvalidArgument(label + " has an invalid queue id");
+  }
+  const MutableBufferView* const buffers[] = {
+      &source.address_table, &source.valid_table, &source.indices,
+      &source.offsets, &source.mask, &source.output_indices};
+  for (const MutableBufferView* buffer : buffers) {
+    if (buffer == nullptr || !buffer->valid() ||
+        buffer->device != DeviceKind::kNpu) {
+      return InvalidArgument(label + " requires non-empty NPU descriptor buffers");
+    }
+  }
+  if (source.address_table.bytes % sizeof(std::uint64_t) != 0U ||
+      source.valid_table.bytes !=
+          source.address_table.bytes / sizeof(std::uint64_t) ||
+      source.indices.bytes % sizeof(std::int32_t) != 0U ||
+      source.offsets.bytes != source.indices.bytes ||
+      source.output_indices.bytes != source.indices.bytes ||
+      source.mask.bytes != source.indices.bytes / sizeof(std::int32_t)) {
+    return InvalidArgument(label + " descriptor buffers do not satisfy the "
+                           "address/valid and request-vector ABI");
+  }
+  const std::uint64_t table_capacity =
+      source.address_table.bytes / sizeof(std::uint64_t);
+  const std::uint64_t request_capacity =
+      source.indices.bytes / sizeof(std::int32_t);
+  if (!FitsU32(table_capacity) || !FitsU32(request_capacity) ||
+      table_capacity == 0U || request_capacity == 0U ||
+      request_capacity > KVAF_AIV_BATCH_GET_DENSE_REQUEST_CAPACITY) {
+    return InvalidArgument(label + " capacity exceeds the layer-resident "
+                           "dense Direct-HCCP ABI");
+  }
+  constexpr std::size_t kDescriptorBufferCount =
+      sizeof(buffers) / sizeof(buffers[0]);
+  for (std::size_t left = 0; left < kDescriptorBufferCount; ++left) {
+    for (std::size_t right = left + 1U; right < kDescriptorBufferCount;
+         ++right) {
+      if (BufferRangesOverlap(*buffers[left], *buffers[right])) {
+        return InvalidArgument(label + " descriptor buffers must not alias");
+      }
+    }
+  }
+  *destination = KvafLayerResidentBatchGetDescriptorScratch{};
+  destination->address_table = PointerValue(source.address_table.data);
+  destination->valid_table = PointerValue(source.valid_table.data);
+  destination->indices = PointerValue(source.indices.data);
+  destination->offsets = PointerValue(source.offsets.data);
+  destination->mask = PointerValue(source.mask.data);
+  destination->output_indices = PointerValue(source.output_indices.data);
+  destination->table_capacity = static_cast<std::uint32_t>(table_capacity);
+  destination->request_capacity = static_cast<std::uint32_t>(request_capacity);
+  destination->active_request_count = 0U;
+  destination->reserved0 = 0U;
   return Status::OK();
 }
 
@@ -467,6 +556,30 @@ struct DefaultAccessOperator::Impl {
     bool active{false};
   };
 
+  // P9 owns one layer-local canonical resident interval.  This is distinct
+  // from the legacy streaming table: there is no private-output partition,
+  // bind epoch, forward identity, or payload-reclamation state.
+  struct LayerResidentBatchGetControlBinding {
+    std::uint32_t layer_id{0};
+    void* output{nullptr};
+    std::size_t output_bytes{0};
+    void* control{nullptr};
+    std::size_t control_bytes{0};
+    KvafBatchGetLocalBuffer* local_buffer{nullptr};
+    std::uint64_t channel_entity{0};
+    void* queue_leases{nullptr};
+    std::size_t queue_lease_bytes{0};
+    void* descriptor_scratch{nullptr};
+    std::size_t descriptor_scratch_bytes{0};
+    void* descriptor_templates{nullptr};
+    std::size_t descriptor_template_bytes{0};
+    std::uint32_t queue_count{0};
+    std::uint32_t resident_row_base{0};
+    std::uint32_t resident_row_count{0};
+    bool templates_configured{false};
+    bool active{false};
+  };
+
   AccessOperatorConfig config;
   RemoteRegionDesc remote_region;
   KvafBatchGetTransport* transport{nullptr};
@@ -475,6 +588,7 @@ struct DefaultAccessOperator::Impl {
   BatchGetOutputBindingId next_bound_output_id{1};
   FusedBatchGetControlBinding fused_control;
   StreamingBatchGetControlBinding streaming_control;
+  LayerResidentBatchGetControlBinding layer_resident_control;
   std::uint64_t streaming_bind_count{0};
   std::uint64_t streaming_release_count{0};
   std::uint64_t streaming_template_configure_count{0};
@@ -486,7 +600,8 @@ struct DefaultAccessOperator::Impl {
   bool initialized{false};
 
   bool HasDeviceFusedBatchGetControl() const {
-    return fused_control.active || streaming_control.active;
+    return fused_control.active || streaming_control.active ||
+           layer_resident_control.active;
   }
 };
 
@@ -611,13 +726,13 @@ Status DefaultAccessOperator::Shutdown() {
     return Status::OK();
   }
 
-  // A fused or streaming Get owns Direct-HCCP local-HBM registrations that
+  // A fused, streaming, or layer-resident Get owns Direct-HCCP local-HBM registrations that
   // can still be read by graph-replayed AIV code. Unlike an ordinary host
   // submission there is no host completion object to prove that the final
   // reader has retired. Fail closed at this cold lifecycle boundary.
   if (impl_->HasDeviceFusedBatchGetControl()) {
     return Status::Busy(
-        "Shutdown is forbidden while fused or streaming BatchGet control is "
+        "Shutdown is forbidden while fused, streaming, or layer-resident BatchGet control is "
         "bound; wait for the final fused reader and release the control first");
   }
 
@@ -945,6 +1060,324 @@ Status DefaultAccessOperator::ReleaseFusedBatchGetControl() {
   // a hidden host-side completion path.
   KvafBatchGetLocalBufferRelease(impl_->fused_control.local_buffer);
   impl_->fused_control = Impl::FusedBatchGetControlBinding{};
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::BindLayerResidentBatchGetControl(
+    const LayerResidentBatchGetBinding& binding,
+    const MutableBufferView& queue_leases, std::uint32_t queue_count) {
+  if (!impl_->initialized || impl_->transport == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  if (impl_->HasDeviceFusedBatchGetControl()) {
+    return Status::Error(
+        StatusCode::kAlreadyExists,
+        "a fused, streaming, or layer-resident BatchGet control is already bound");
+  }
+  Status status = ValidateFusedBatchGetQueueCount(impl_->config, queue_count);
+  if (!status.ok()) {
+    return status;
+  }
+  if (!impl_->bound_outputs.empty()) {
+    return Status::Error(
+        StatusCode::kBusy,
+        "layer-resident BatchGet control requires no active native BatchGet "
+        "output binding");
+  }
+  status = ValidateLayerResidentBatchGetBinding(binding,
+                                                 "layer-resident BatchGet");
+  if (!status.ok()) {
+    return status;
+  }
+  if (impl_->execution.status == nullptr || impl_->execution.queue_state == nullptr) {
+    return InvalidArgument("invalid layer-resident BatchGet execution state");
+  }
+  const std::size_t queue_lease_bytes =
+      static_cast<std::size_t>(queue_count) * sizeof(std::int32_t);
+  if (!queue_leases.valid() || queue_leases.device != DeviceKind::kNpu ||
+      queue_leases.bytes != queue_lease_bytes ||
+      BufferRangesOverlap(queue_leases, binding.output) ||
+      BufferRangesOverlap(queue_leases, binding.control)) {
+    return InvalidArgument(
+        "layer-resident queue_leases must be a disjoint NPU int32[queue_count]");
+  }
+  // This is a cold publication, before graph capture.  It orders PyTorch
+  // tensor initialization before raw ACL control/registration publication.
+  if (aclrtSynchronizeDevice() != ACL_SUCCESS) {
+    return Internal("failed to synchronize device before binding "
+                    "layer-resident BatchGet control");
+  }
+  const std::size_t descriptor_bytes =
+      static_cast<std::size_t>(queue_count) *
+      sizeof(KvafLayerResidentBatchGetDescriptorScratch);
+  void* descriptor_scratch = nullptr;
+  void* descriptor_templates = nullptr;
+  if (aclrtMemset(queue_leases.data, queue_lease_bytes, 0,
+                  queue_lease_bytes) != ACL_SUCCESS ||
+      aclrtMalloc(&descriptor_scratch, descriptor_bytes,
+                  ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
+      descriptor_scratch == nullptr ||
+      aclrtMemset(descriptor_scratch, descriptor_bytes, 0,
+                  descriptor_bytes) != ACL_SUCCESS ||
+      aclrtMalloc(&descriptor_templates, descriptor_bytes,
+                  ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
+      descriptor_templates == nullptr ||
+      aclrtMemset(descriptor_templates, descriptor_bytes, 0,
+                  descriptor_bytes) != ACL_SUCCESS) {
+    if (descriptor_templates != nullptr) {
+      (void)aclrtFree(descriptor_templates);
+    }
+    if (descriptor_scratch != nullptr) {
+      (void)aclrtFree(descriptor_scratch);
+    }
+    return Internal("failed to allocate layer-resident descriptor state");
+  }
+
+  KvafBatchGetLocalBuffer* local_buffer = nullptr;
+  std::uint64_t channel_entity = 0U;
+  if (KvafBatchGetLocalBufferAcquire(impl_->transport, binding.output.data,
+                                     binding.output.bytes, &local_buffer,
+                                     &channel_entity) !=
+          KVAF_BATCH_GET_SUCCESS ||
+      local_buffer == nullptr || channel_entity == 0U) {
+    if (local_buffer != nullptr) {
+      KvafBatchGetLocalBufferRelease(local_buffer);
+    }
+    (void)aclrtFree(descriptor_templates);
+    (void)aclrtFree(descriptor_scratch);
+    return Internal("failed to register layer-resident BatchGet output");
+  }
+
+  KvafLayerResidentBatchGetControl host_control{};
+  host_control.magic = KVAF_LAYER_RESIDENT_BATCH_GET_CONTROL_MAGIC;
+  host_control.version = KVAF_LAYER_RESIDENT_BATCH_GET_CONTROL_VERSION;
+  host_control.channel_entity = channel_entity;
+  host_control.queue_state = PointerValue(impl_->execution.queue_state);
+  host_control.core_status = PointerValue(impl_->execution.status);
+  host_control.output = PointerValue(binding.output.data);
+  host_control.queue_leases = PointerValue(queue_leases.data);
+  host_control.descriptor_scratch = PointerValue(descriptor_scratch);
+  host_control.queue_count = queue_count;
+  host_control.output_rows =
+      static_cast<std::uint64_t>(binding.output.bytes / kBatchGetTransferBytes);
+  host_control.resident_row_base = binding.resident_row_base;
+  host_control.resident_row_count = binding.resident_row_count;
+  host_control.jettys_per_core = impl_->config.jettys_per_core;
+  host_control.block_bytes = kBatchGetTransferBytes;
+  host_control.descriptor_templates = PointerValue(descriptor_templates);
+  host_control.descriptor_template_count = queue_count;
+  if (aclrtMemcpy(binding.control.data, binding.control.bytes, &host_control,
+                  sizeof(host_control), ACL_MEMCPY_HOST_TO_DEVICE) !=
+      ACL_SUCCESS ||
+      aclrtSynchronizeDevice() != ACL_SUCCESS) {
+    KvafBatchGetLocalBufferRelease(local_buffer);
+    (void)aclrtFree(descriptor_templates);
+    (void)aclrtFree(descriptor_scratch);
+    return Internal("failed to publish layer-resident BatchGet control");
+  }
+  impl_->layer_resident_control = Impl::LayerResidentBatchGetControlBinding{
+      binding.layer_id,
+      binding.output.data,
+      binding.output.bytes,
+      binding.control.data,
+      binding.control.bytes,
+      local_buffer,
+      channel_entity,
+      queue_leases.data,
+      queue_lease_bytes,
+      descriptor_scratch,
+      descriptor_bytes,
+      descriptor_templates,
+      descriptor_bytes,
+      queue_count,
+      binding.resident_row_base,
+      binding.resident_row_count,
+      false,
+      true};
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::ConfigureLayerResidentBatchGetQueueTemplates(
+    const std::vector<LayerResidentBatchGetQueueTemplate>& queues) {
+  if (!impl_->initialized || impl_->transport == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  Impl::LayerResidentBatchGetControlBinding& binding =
+      impl_->layer_resident_control;
+  if (!binding.active) {
+    return Status::NotFound(
+        "layer-resident BatchGet control must be bound before templates");
+  }
+  if (binding.templates_configured) {
+    return InvalidState(
+        "layer-resident descriptor templates are already configured; "
+        "release the control before a cold rebind");
+  }
+  if (queues.size() != binding.queue_count) {
+    return InvalidArgument(
+        "layer-resident descriptor templates must contain exactly queue_count entries");
+  }
+  struct BufferReference {
+    const MutableBufferView* view{nullptr};
+    std::uint32_t queue_id{0};
+    std::uint32_t role{0};
+  };
+  constexpr std::uint32_t kAddressTableRole = 0U;
+  constexpr std::uint32_t kValidTableRole = 1U;
+  std::vector<KvafLayerResidentBatchGetDescriptorScratch> templates(
+      binding.queue_count);
+  std::vector<bool> seen(binding.queue_count, false);
+  std::vector<BufferReference> references;
+  references.reserve(queues.size() * 6U);
+  const MutableBufferView control_view{binding.control, binding.control_bytes,
+                                       DeviceKind::kNpu};
+  const MutableBufferView output_view{binding.output, binding.output_bytes,
+                                      DeviceKind::kNpu};
+  const MutableBufferView lease_view{binding.queue_leases,
+                                     binding.queue_lease_bytes,
+                                     DeviceKind::kNpu};
+  const MutableBufferView scratch_view{binding.descriptor_scratch,
+                                       binding.descriptor_scratch_bytes,
+                                       DeviceKind::kNpu};
+  const MutableBufferView template_view{binding.descriptor_templates,
+                                        binding.descriptor_template_bytes,
+                                        DeviceKind::kNpu};
+  for (const LayerResidentBatchGetQueueTemplate& queue : queues) {
+    if (queue.queue_id >= binding.queue_count || seen[queue.queue_id]) {
+      return InvalidArgument(
+          "layer-resident descriptor templates must contain each queue_id once");
+    }
+    seen[queue.queue_id] = true;
+    const MutableBufferView* const buffers[] = {
+        &queue.address_table, &queue.valid_table, &queue.indices,
+        &queue.offsets, &queue.mask, &queue.output_indices};
+    for (std::uint32_t role = 0U;
+         role < sizeof(buffers) / sizeof(buffers[0]); ++role) {
+      const MutableBufferView* const buffer = buffers[role];
+      if (BufferRangesOverlap(*buffer, control_view) ||
+          BufferRangesOverlap(*buffer, output_view) ||
+          BufferRangesOverlap(*buffer, lease_view) ||
+          BufferRangesOverlap(*buffer, scratch_view) ||
+          BufferRangesOverlap(*buffer, template_view)) {
+        return InvalidArgument(
+            "layer-resident descriptor buffer aliases control, resident output, "
+            "or queue state");
+      }
+      references.push_back(BufferReference{buffer, queue.queue_id, role});
+    }
+    Status status = BuildLayerResidentBatchGetQueueTemplate(
+        queue, binding.queue_count, &templates[queue.queue_id],
+        "layer-resident descriptor template queue_id=" +
+            std::to_string(queue.queue_id));
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  for (bool queue_seen : seen) {
+    if (!queue_seen) {
+      return InvalidArgument(
+          "layer-resident descriptor templates omit a queue_id");
+    }
+  }
+  // Address/valid tables are immutable and may be shared identically by all
+  // queues. Candidate vectors are queue-owned mutable storage and must be
+  // disjoint; a partial static-table overlap is likewise invalid.
+  for (std::size_t left = 0; left < references.size(); ++left) {
+    for (std::size_t right = left + 1U; right < references.size(); ++right) {
+      const BufferReference& a = references[left];
+      const BufferReference& b = references[right];
+      if (!BufferRangesOverlap(*a.view, *b.view)) {
+        continue;
+      }
+      const bool same_shareable_role =
+          (a.role == kAddressTableRole && b.role == kAddressTableRole) ||
+          (a.role == kValidTableRole && b.role == kValidTableRole);
+      if (same_shareable_role && SameBufferRange(*a.view, *b.view)) {
+        continue;
+      }
+      return InvalidArgument(
+          "layer-resident descriptor template buffers overlap: queue_id=" +
+          std::to_string(a.queue_id) + " conflicts with queue_id=" +
+          std::to_string(b.queue_id));
+    }
+  }
+  if (aclrtSynchronizeDevice() != ACL_SUCCESS ||
+      aclrtMemcpy(binding.descriptor_templates,
+                  binding.descriptor_template_bytes, templates.data(),
+                  templates.size() * sizeof(templates.front()),
+                  ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS ||
+      aclrtSynchronizeDevice() != ACL_SUCCESS) {
+    return Internal("failed to publish layer-resident descriptor templates");
+  }
+  binding.templates_configured = true;
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::ReleaseLayerResidentBatchGetControl() {
+  if (!impl_->initialized || impl_->transport == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  Impl::LayerResidentBatchGetControlBinding& binding =
+      impl_->layer_resident_control;
+  if (!binding.active) {
+    return Status::NotFound("layer-resident BatchGet control is not bound");
+  }
+  // This is only a cold teardown assertion.  The fused operator itself must
+  // have drained all waves before returning; a nonzero queue word proves it
+  // did not, so do not drop the registered resident allocation underneath it.
+  if (aclrtSynchronizeDevice() != ACL_SUCCESS) {
+    return Internal("failed to synchronize before layer-resident teardown");
+  }
+  std::vector<std::int32_t> owners(binding.queue_count, 0);
+  if (aclrtMemcpy(owners.data(), binding.queue_lease_bytes,
+                  binding.queue_leases, binding.queue_lease_bytes,
+                  ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
+    return Internal("failed to read layer-resident queue ownership");
+  }
+  for (std::uint32_t queue_id = 0; queue_id < binding.queue_count;
+       ++queue_id) {
+    if (owners[queue_id] != 0) {
+      return Status::Busy(
+          "layer-resident fused operator has an unterminated Direct-HCCP "
+          "queue; join all posts before release");
+    }
+  }
+  if (binding.descriptor_templates != nullptr) {
+    (void)aclrtFree(binding.descriptor_templates);
+  }
+  if (binding.descriptor_scratch != nullptr) {
+    (void)aclrtFree(binding.descriptor_scratch);
+  }
+  KvafBatchGetLocalBufferRelease(binding.local_buffer);
+  binding = Impl::LayerResidentBatchGetControlBinding{};
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::DescribeLayerResidentBatchGetControl(
+    std::string* diagnostic) const {
+  if (diagnostic == nullptr) {
+    return InvalidArgument("layer-resident BatchGet diagnostic output is null");
+  }
+  if (!impl_->initialized || !impl_->layer_resident_control.active) {
+    return Status::NotFound("layer-resident BatchGet control is not bound");
+  }
+  const Impl::LayerResidentBatchGetControlBinding& binding =
+      impl_->layer_resident_control;
+  std::ostringstream message;
+  message << "KVAF_LAYER_RESIDENT_CONTROL layer=" << binding.layer_id
+          << " queue_count=" << binding.queue_count
+          << " resident_row_base=" << binding.resident_row_base
+          << " resident_row_count=" << binding.resident_row_count
+          << " output=0x" << std::hex << PointerValue(binding.output)
+          << " control=0x" << PointerValue(binding.control)
+          << " queues=0x" << PointerValue(binding.queue_leases)
+          << " templates=0x" << PointerValue(binding.descriptor_templates)
+          << std::dec << " templates_configured="
+          << (binding.templates_configured ? 1 : 0);
+  *diagnostic = message.str();
   return Status::OK();
 }
 

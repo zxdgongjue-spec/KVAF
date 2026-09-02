@@ -107,6 +107,25 @@ struct StreamingBatchGetLayerTemplates {
   std::vector<StreamingBatchGetQueueTemplate> queues;
 };
 
+// Cold binding for the P9 layer-local canonical-resident fused Get route.
+// `resident_row_base/count` name a fixed interval of `output` that is already
+// reserved by the caller for this layer's speculative + final-recall KV rows.
+// The fused operator must join every Direct-HCCP post before it returns; KVAF
+// never reclaims, remaps, or shares this resident interval with another
+// layer/forward.
+struct LayerResidentBatchGetBinding {
+  std::uint32_t layer_id{0};
+  MutableBufferView output;
+  MutableBufferView control;
+  std::uint32_t resident_row_base{0};
+  std::uint32_t resident_row_count{0};
+};
+
+// Descriptor vectors have the established Direct-HCCP dense ABI.  Unlike a
+// StreamingBatchGet queue, `output_indices` are absolute canonical resident
+// rows in the binding's fixed interval, not queue-private rows.
+using LayerResidentBatchGetQueueTemplate = StreamingBatchGetQueueTemplate;
+
 // Read-only cold-path introspection for the streaming queue pool. The three
 // lifecycle counters are host lifecycle counters only; they deliberately do
 // not claim a race-free live count of device-held leases during graph replay.
@@ -234,6 +253,20 @@ class DefaultAccessOperator final : public AccessOperator {
   Status DescribeStreamingBatchGetControl(std::string* diagnostic) const;
   Status GetStreamingBatchGetControlSnapshot(
       StreamingBatchGetControlSnapshot* snapshot) const;
+
+  // P9's layer-resident route is intentionally a single layer-local control,
+  // not a table that survives graph replays.  The caller must bind one fixed
+  // resident interval, configure fixed descriptor vectors, then use it only
+  // from the one fused layer operator that drains all CQ work before return.
+  // `queue_leases` is NPU int32[queue_count] storage used only while that
+  // operator is executing; it does not describe resident-slot ownership.
+  Status BindLayerResidentBatchGetControl(
+      const LayerResidentBatchGetBinding& binding,
+      const MutableBufferView& queue_leases, std::uint32_t queue_count);
+  Status ConfigureLayerResidentBatchGetQueueTemplates(
+      const std::vector<LayerResidentBatchGetQueueTemplate>& queues);
+  Status ReleaseLayerResidentBatchGetControl();
+  Status DescribeLayerResidentBatchGetControl(std::string* diagnostic) const;
 
   // Profiling is opt-in and uses the reserved per-core status area. Callers
   // must complete the BatchGet stream before copying the latest snapshot.
