@@ -178,6 +178,15 @@ struct CpuUrmaTransport::Impl {
     }
     context_ = urma_create_context(device_, eid_index_);
     if (context_ == nullptr) return Error("urma_create_context");
+    urma_device_attr_t device_attr{};
+    if (urma_query_device(device_, &device_attr) == URMA_SUCCESS) {
+      std::fprintf(stderr,
+                   "[KVAF_CPU_URMA] DEVICE_CAP max_jfs_sge=%u max_jfs_rsge=%u "
+                   "max_jfr_sge=%u\n",
+                   device_attr.dev_cap.max_jfs_sge,
+                   device_attr.dev_cap.max_jfs_rsge,
+                   device_attr.dev_cap.max_jfr_sge);
+    }
     urma_jfc_cfg_t jfc_cfg{};
     jfc_cfg.depth = kJfcDepth;
     jfc_ = urma_create_jfc(context_, &jfc_cfg);
@@ -237,13 +246,25 @@ struct CpuUrmaTransport::Impl {
     jetty_cfg.flag.bs.share_jfr = URMA_SHARE_JFR;
     jetty_cfg.jfs_cfg.depth = kJettyDepth;
     jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
+    jetty_cfg.jfs_cfg.priority = URMA_MAX_PRIORITY;
     jetty_cfg.jfs_cfg.max_sge = 1;
     jetty_cfg.jfs_cfg.max_rsge = 1;
+    jetty_cfg.jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
+    jetty_cfg.jfs_cfg.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
     jetty_cfg.jfs_cfg.jfc = jfc_;
     jetty_cfg.shared.jfr = jfr_;
     jetty_cfg.shared.jfc = jfc_;
     local_jetty_ = urma_create_jetty(context_, &jetty_cfg);
     if (local_jetty_ == nullptr) return Error("urma_create_jetty");
+    std::fprintf(stderr,
+                 "[KVAF_CPU_URMA] JETTY_CFG trans_mode=%u max_sge=%u max_rsge=%u "
+                 "priority=%u rnr_retry=%u err_timeout=%u\n",
+                 static_cast<unsigned>(local_jetty_->jetty_cfg.jfs_cfg.trans_mode),
+                 static_cast<unsigned>(local_jetty_->jetty_cfg.jfs_cfg.max_sge),
+                 static_cast<unsigned>(local_jetty_->jetty_cfg.jfs_cfg.max_rsge),
+                 static_cast<unsigned>(local_jetty_->jetty_cfg.jfs_cfg.priority),
+                 static_cast<unsigned>(local_jetty_->jetty_cfg.jfs_cfg.rnr_retry),
+                 static_cast<unsigned>(local_jetty_->jetty_cfg.jfs_cfg.err_timeout));
 
     std::uint64_t local_tp = 0;
     TpQuery query{};
@@ -406,8 +427,13 @@ struct CpuUrmaTransport::Impl {
       wr.rw.dst = {&local, 1};
     }
     urma_jfs_wr_t* bad = nullptr;
-    if (urma_post_jetty_send_wr(local_jetty_, &wr, &bad) != URMA_SUCCESS) {
-      return Error("urma_post_jetty_send_wr for direct host buffer");
+    const urma_status_t post_status = urma_post_jetty_send_wr(local_jetty_, &wr, &bad);
+    if (post_status != URMA_SUCCESS) {
+      return Status::Internal("urma_post_jetty_send_wr for direct host buffer failed (status=" +
+                             std::to_string(static_cast<int>(post_status)) +
+                             ", bad_wr=" +
+                             std::to_string(reinterpret_cast<std::uintptr_t>(bad)) +
+                             ", errno=" + std::to_string(errno) + ")");
     }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (std::chrono::steady_clock::now() < deadline) {
@@ -416,13 +442,28 @@ struct CpuUrmaTransport::Impl {
       if (polled < 0) return Error("urma_poll_jfc for direct host buffer");
       if (polled == 1) {
         if (cr.status != URMA_CR_SUCCESS || cr.user_ctx != 0xD1CE) {
-          return Status::Internal("direct host buffer URMA completion reported failure");
+          return Status::Internal("direct host buffer URMA completion reported failure (status=" +
+                                 std::to_string(static_cast<int>(cr.status)) +
+                                 ", completion_len=" + std::to_string(cr.completion_len) +
+                                 ", user_ctx=0x" +
+                                 std::to_string(static_cast<unsigned long long>(cr.user_ctx)) +
+                                 ")");
         }
         return Status::OK();
       }
       std::this_thread::yield();
     }
-    return Status::Internal("timed out waiting for direct host buffer completion");
+    urma_jetty_cfg_t observed_cfg{};
+    urma_jetty_attr_t observed_attr{};
+    observed_attr.mask = JETTY_STATE;
+    const urma_status_t query_status =
+        urma_query_jetty(local_jetty_, &observed_cfg, &observed_attr);
+    return Status::Internal(
+        std::string("timed out waiting for direct host buffer completion (op=") +
+        (write ? "WRITE" : "READ") + ", offset=" + std::to_string(offset) +
+        ", bytes=" + std::to_string(bytes) + ", jetty_query_status=" +
+        std::to_string(static_cast<int>(query_status)) + ", jetty_state=" +
+        std::to_string(static_cast<unsigned>(observed_attr.state)) + ")");
   }
 
   Status TransferDeviceWrite(std::uint64_t offset, const void* device_source,
@@ -483,8 +524,13 @@ struct CpuUrmaTransport::Impl {
     wr.rw.dst = {&remote, 1};
     urma_jfs_wr_t* bad = nullptr;
     Status result = Status::OK();
-    if (urma_post_jetty_send_wr(local_jetty_, &wr, &bad) != URMA_SUCCESS) {
-      result = Status::Internal("HBM direct URMA WRITE submission failed; device memory may not be DMA-addressable");
+    const urma_status_t post_status = urma_post_jetty_send_wr(local_jetty_, &wr, &bad);
+    if (post_status != URMA_SUCCESS) {
+      result = Status::Internal(
+          "HBM direct URMA WRITE submission failed (status=" +
+          std::to_string(static_cast<int>(post_status)) + ", bad_wr=" +
+          std::to_string(reinterpret_cast<std::uintptr_t>(bad)) + ", errno=" +
+          std::to_string(errno) + "); device memory may not be DMA-addressable");
     } else {
       const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
       bool completed = false;
@@ -498,14 +544,29 @@ struct CpuUrmaTransport::Impl {
         }
         if (polled == 1) {
           if (cr.status != URMA_CR_SUCCESS || cr.user_ctx != 0xD3A1CEULL) {
-            result = Status::Internal("HBM direct URMA WRITE completion reported failure");
+            result = Status::Internal(
+                "HBM direct URMA WRITE completion reported failure (status=" +
+                std::to_string(static_cast<int>(cr.status)) +
+                ", completion_len=" + std::to_string(cr.completion_len) +
+                ", user_ctx=0x" +
+                std::to_string(static_cast<unsigned long long>(cr.user_ctx)) + ")");
           }
           completed = true;
           break;
         }
         std::this_thread::yield();
       }
-      if (!completed) result = Status::Internal("timed out waiting for HBM URMA WRITE completion");
+      if (!completed) {
+        urma_jetty_cfg_t observed_cfg{};
+        urma_jetty_attr_t observed_attr{};
+        observed_attr.mask = JETTY_STATE;
+        const urma_status_t query_status =
+            urma_query_jetty(local_jetty_, &observed_cfg, &observed_attr);
+        result = Status::Internal(
+            "timed out waiting for HBM URMA WRITE completion (jetty_query_status=" +
+            std::to_string(static_cast<int>(query_status)) + ", jetty_state=" +
+            std::to_string(static_cast<unsigned>(observed_attr.state)) + ")");
+      }
     }
     (void)urma_unregister_seg(device_seg);
     (void)urma_free_token_id(device_token_id);
