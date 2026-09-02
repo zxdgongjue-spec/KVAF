@@ -73,7 +73,11 @@ bool WriteAll(int fd, const void* data, std::size_t bytes) {
 }
 int Connect(const std::string& host, std::uint16_t port) {
   addrinfo hints{}; hints.ai_socktype = SOCK_STREAM; hints.ai_family = AF_UNSPEC; addrinfo* list = nullptr;
-  if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &list) != 0) return -1;
+  const int gai = getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &list);
+  if (gai != 0) {
+    std::fprintf(stderr, "[HBM_TEST][CPU] getaddrinfo(%s:%u) failed: %s\n", host.c_str(), port, gai_strerror(gai));
+    return -1;
+  }
   int fd = -1; int last_errno = 0;
   for (auto* a = list; a; a = a->ai_next) { fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol); if (fd >= 0 && connect(fd, a->ai_addr, a->ai_addrlen) == 0) break; last_errno = errno; if (fd >= 0) close(fd); fd = -1; }
   freeaddrinfo(list); if (fd < 0) std::fprintf(stderr, "[HBM_TEST][CPU] connect failed: %s\n", std::strerror(last_errno));
@@ -122,6 +126,16 @@ int main(int argc, char** argv) {
   if (argc < 2) return 2;
   std::string host = argv[1]; std::uint16_t port = 29888; std::size_t blocks = 1, block_bytes = 656, iterations = 1, warmup = 1; std::uint64_t seed = 0x6b766166ULL; std::array<std::uint8_t, 16> wanted{}; bool have = false; std::uint32_t eid_index = 0, physical = 0, remote_device_id = 0;
   int arg_start = 2; if (arg_start < argc && argv[arg_start][0] != '-') port = static_cast<std::uint16_t>(std::strtoul(argv[arg_start++], nullptr, 0));
+  else {
+    const std::size_t colon = host.rfind(':');
+    if (colon != std::string::npos && colon != 0U && colon + 1U < host.size()) {
+      const std::string port_text = host.substr(colon + 1U);
+      char* end = nullptr; const unsigned long parsed = std::strtoul(port_text.c_str(), &end, 10);
+      if (end != port_text.c_str() && *end == '\0' && parsed <= UINT16_MAX) {
+        port = static_cast<std::uint16_t>(parsed); host.resize(colon);
+      }
+    }
+  }
   for (int i = arg_start; i < argc; ++i) { const std::string a = argv[i]; if (i + 1 >= argc) return 2;
     if (a == "--blocks") blocks = std::strtoull(argv[++i], nullptr, 0); else if (a == "--block-bytes") block_bytes = std::strtoull(argv[++i], nullptr, 0); else if (a == "--iterations") iterations = std::strtoull(argv[++i], nullptr, 0); else if (a == "--warmup") warmup = std::strtoull(argv[++i], nullptr, 0); else if (a == "--seed") seed = std::strtoull(argv[++i], nullptr, 0); else if (a == "--bytes") { block_bytes = std::strtoull(argv[++i], nullptr, 0); blocks = 1; } else if (a == "--device-id") remote_device_id = std::strtoul(argv[++i], nullptr, 0); else if (a == "--local-physical") physical = std::strtoul(argv[++i], nullptr, 0); else if (a == "--eid-index") eid_index = std::strtoul(argv[++i], nullptr, 0);
     else if (a == "--host-eid") { const char* t = argv[++i]; if (std::strlen(t) != 32) return 2; auto h = [](char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; }; for (int j = 0; j < 16; ++j) { const int x = h(t[2 * j]), y = h(t[2 * j + 1]); if (x < 0 || y < 0) return 2; wanted[j] = static_cast<std::uint8_t>((x << 4) | y); } have = true; } else return 2;
