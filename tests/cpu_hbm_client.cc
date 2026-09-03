@@ -153,13 +153,13 @@ bool RunPass(kvaf::CpuUrmaTransport* transport, bool write,
              const std::vector<std::size_t>& order, std::size_t block_bytes,
              std::size_t iterations, Stats* stats) {
   if (transport == nullptr || blocks == nullptr || stats == nullptr) return false;
+  std::vector<kvaf::CpuUrmaTransport::HostSge> requests(order.size());
+  for (std::size_t i = 0; i < order.size(); ++i) {
+    const std::size_t block_index = order[i];
+    requests[i] = {(*blocks)[block_index].data, block_bytes};
+  }
   const auto wall_start = std::chrono::steady_clock::now();
   for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
-    std::vector<kvaf::CpuUrmaTransport::HostSge> requests(order.size());
-    for (std::size_t i = 0; i < order.size(); ++i) {
-        const std::size_t block_index = order[i];
-      requests[i] = {(*blocks)[block_index].data, block_bytes};
-    }
     const auto start = std::chrono::steady_clock::now();
     const kvaf::Status status = write
         ? transport->WriteBatch(0U, requests.data(), requests.size())

@@ -75,7 +75,7 @@ struct CpuUrmaTransport::Impl {
   struct BatchJob {
     bool write{false};
     std::vector<BatchQueue> queues;
-    std::vector<CpuUrmaTransport::HostSge> buffers;
+    const CpuUrmaTransport::HostSge* buffers{nullptr};
     std::vector<std::uint64_t> remote_offsets;
     std::vector<urma_target_seg_t*> host_segments;
     std::vector<std::string> errors;
@@ -83,7 +83,7 @@ struct CpuUrmaTransport::Impl {
     std::size_t ready_workers{0U};
     std::size_t done_workers{0U};
     bool go{false};
-    bool complete{false};
+    std::uint64_t generation{0U};
     std::chrono::steady_clock::time_point start{};
     std::chrono::steady_clock::time_point deadline{};
   };
@@ -227,18 +227,19 @@ struct CpuUrmaTransport::Impl {
   }
 
   void BatchWorkerLoop(std::size_t worker) {
-    std::shared_ptr<BatchJob> last_job;
+    std::uint64_t last_generation = 0U;
     for (;;) {
-      std::shared_ptr<BatchJob> job;
+      BatchJob* job = nullptr;
       {
         std::unique_lock<std::mutex> lock(batch_mutex_);
         batch_cv_.wait(lock, [&] {
           return batch_stop_ ||
-                 (active_batch_ != nullptr && active_batch_ != last_job);
+                 (active_batch_ != nullptr &&
+                  active_batch_->generation != last_generation);
         });
         if (batch_stop_) return;
         job = active_batch_;
-        last_job = job;
+        last_generation = job->generation;
         ++job->ready_workers;
         batch_cv_.notify_all();
         batch_cv_.wait(lock, [&] { return batch_stop_ || job->go; });
@@ -246,11 +247,9 @@ struct CpuUrmaTransport::Impl {
       }
       job->errors[worker] = PrepareBatchWorker(*job, worker);
       {
-        std::unique_lock<std::mutex> lock(batch_mutex_);
+        std::lock_guard<std::mutex> lock(batch_mutex_);
         ++job->done_workers;
         batch_cv_.notify_all();
-        batch_cv_.wait(lock, [&] { return batch_stop_ || job->complete; });
-        if (batch_stop_) return;
       }
     }
   }
@@ -569,6 +568,17 @@ struct CpuUrmaTransport::Impl {
                  local_jettys_.size(), options.worker_count, kJettyDepth);
     batch_stop_ = false;
     batch_worker_count_ = options.worker_count;
+    batch_workspace_.queues.resize(local_jettys_.size());
+    const std::size_t queue_capacity =
+        (kJettyDepth + local_jettys_.size() - 1U) / local_jettys_.size();
+    for (auto& queue : batch_workspace_.queues) {
+      queue.local.reserve(queue_capacity);
+      queue.remote.reserve(queue_capacity);
+      queue.wrs.reserve(queue_capacity);
+    }
+    batch_workspace_.remote_offsets.reserve(kJettyDepth);
+    batch_workspace_.host_segments.reserve(kJettyDepth);
+    batch_workspace_.errors.reserve(batch_worker_count_);
     if (!StartBatchWorkers(batch_worker_count_)) {
       return Status::Internal("failed to start Jetty worker threads");
     }
@@ -853,18 +863,22 @@ struct CpuUrmaTransport::Impl {
 
     std::vector<std::size_t> queue_counts(jetty_count, 0U);
     for (std::size_t i = 0U; i < count; ++i) ++queue_counts[i % jetty_count];
-    auto job = std::make_shared<BatchJob>();
-    job->write = write;
-    job->buffers.assign(buffers, buffers + count);
-    job->remote_offsets.resize(count);
-    job->host_segments.resize(count);
-    job->queues.resize(jetty_count);
-    job->errors.resize(batch_worker_count_);
-    job->active_workers = batch_worker_count_ - 1U;
+    BatchJob& job = batch_workspace_;
+    job.write = write;
+    job.buffers = buffers;
+    job.remote_offsets.resize(count);
+    job.host_segments.resize(count);
+    job.queues.resize(jetty_count);
+    job.errors.assign(batch_worker_count_, {});
+    job.active_workers = batch_worker_count_ - 1U;
+    job.ready_workers = 0U;
+    job.done_workers = 0U;
+    job.go = false;
+    ++job.generation;
     for (std::size_t jetty = 0U; jetty < jetty_count; ++jetty) {
-      job->queues[jetty].local.resize(queue_counts[jetty]);
-      job->queues[jetty].remote.resize(queue_counts[jetty]);
-      job->queues[jetty].wrs.resize(queue_counts[jetty]);
+      job.queues[jetty].local.resize(queue_counts[jetty]);
+      job.queues[jetty].remote.resize(queue_counts[jetty]);
+      job.queues[jetty].wrs.resize(queue_counts[jetty]);
     }
 
     std::uint64_t total = 0U;
@@ -880,49 +894,48 @@ struct CpuUrmaTransport::Impl {
         Status status = RegisterHostBuffer(buffers[i].data, buffers[i].bytes, &host);
         if (!status.ok()) return status;
       }
-      job->remote_offsets[i] = offset + total;
-      job->host_segments[i] = host->segment;
+      job.remote_offsets[i] = offset + total;
+      job.host_segments[i] = host->segment;
       total += buffers[i].bytes;
     }
 
-    job->start = std::chrono::steady_clock::now();
-    job->deadline = job->start + std::chrono::seconds(5);
+    job.start = std::chrono::steady_clock::now();
+    job.deadline = job.start + std::chrono::seconds(5);
     std::fprintf(stderr, "[KVAF_CPU_URMA] BATCH_POST wrs=%zu jettys=%zu workers=%zu bytes=%llu\n",
                  count, jetty_count, batch_worker_count_, static_cast<unsigned long long>(total));
-    if (job->active_workers != 0U) {
+    if (job.active_workers != 0U) {
       std::unique_lock<std::mutex> lock(batch_mutex_);
-      active_batch_ = job;
+      active_batch_ = &job;
       batch_cv_.notify_all();
-      batch_cv_.wait(lock, [&] { return job->ready_workers == job->active_workers; });
-      job->go = true;
+      batch_cv_.wait(lock, [&] { return job.ready_workers == job.active_workers; });
+      job.go = true;
       batch_cv_.notify_all();
     }
-    job->errors[0] = PrepareBatchWorker(*job, 0U);
-    if (job->active_workers != 0U) {
+    job.errors[0] = PrepareBatchWorker(job, 0U);
+    if (job.active_workers != 0U) {
       std::unique_lock<std::mutex> lock(batch_mutex_);
-      batch_cv_.wait(lock, [&] { return job->done_workers == job->active_workers; });
+      batch_cv_.wait(lock, [&] { return job.done_workers == job.active_workers; });
     }
     std::string transport_error;
     bool preparation_failed = false;
-    for (const auto& error : job->errors) {
+    for (const auto& error : job.errors) {
       if (!error.empty()) {
         preparation_failed = true;
         break;
       }
     }
-    if (!preparation_failed) transport_error = RunBatchWorker(*job, 0U, true);
+    if (!preparation_failed) transport_error = RunBatchWorker(job, 0U, true);
     {
       std::lock_guard<std::mutex> lock(batch_mutex_);
-      job->complete = true;
-      active_batch_.reset();
+      active_batch_ = nullptr;
       batch_cv_.notify_all();
     }
     if (!transport_error.empty()) return Status::Internal(transport_error);
-    for (const auto& error : job->errors) {
+    for (const auto& error : job.errors) {
       if (!error.empty()) return Status::Internal(error);
     }
     const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now() - job->start).count();
+        std::chrono::steady_clock::now() - job.start).count();
     std::fprintf(stderr,
                  "[KVAF_CPU_URMA] BATCH_COMPLETE wrs=%zu jettys=%zu workers=%zu bytes=%llu elapsed_ns=%lld\n",
                  count, jetty_count, batch_worker_count_, static_cast<unsigned long long>(total),
@@ -1100,7 +1113,8 @@ struct CpuUrmaTransport::Impl {
   std::mutex batch_submit_mutex_;
   std::mutex batch_mutex_;
   std::condition_variable batch_cv_;
-  std::shared_ptr<BatchJob> active_batch_;
+  BatchJob batch_workspace_;
+  BatchJob* active_batch_{nullptr};
   std::vector<std::thread> batch_workers_;
   std::size_t batch_worker_count_{1U};
   bool batch_stop_{false};
