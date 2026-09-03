@@ -22,6 +22,7 @@ struct Options {
   std::size_t warmup{1};
   std::uint32_t jetty_count{1};
   std::uint32_t worker_count{1};
+  bool aiv_thread_mode{false};
   bool jetty_count_explicit{false};
   std::uint64_t host_space_bytes{0};
   std::uint64_t seed{0x6b766166ULL};
@@ -52,7 +53,8 @@ void Usage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s HOST[:PORT] [PORT] [--blocks N] [--block-bytes N] "
                "[--host-space-bytes N[K|M|G|T]] [--iterations N] [--warmup N] "
-               "[--jettys N] [--threads N] [--seed N] [--ub-device NAME] "
+               "[--jettys N] [--threads N] [--thread-mode prepare|aiv] "
+               "[--seed N] [--ub-device NAME] "
                "[--eid-index N] [--device-id N]\n",
                program);
 }
@@ -107,6 +109,11 @@ bool Parse(int argc, char** argv, Options* options) {
     }
     else if (arg == "--threads" && ParseU32(value, &options->worker_count)) {
       if (!options->jetty_count_explicit) options->jetty_count = options->worker_count;
+    }
+    else if (arg == "--thread-mode") {
+      if (std::string(value) == "aiv") options->aiv_thread_mode = true;
+      else if (std::string(value) == "prepare") options->aiv_thread_mode = false;
+      else return false;
     }
     else if (arg == "--iterations" && ParseU64(value, &number)) options->iterations = number;
     else if (arg == "--warmup" && ParseU64(value, &number)) options->warmup = number;
@@ -221,11 +228,12 @@ int main(int argc, char** argv) {
   std::fprintf(stderr,
                "[HBM_TEST][CPU] START peer=%s blocks=%zu block_bytes=%zu payload_bytes=%llu "
                "host_address_space_bytes=%llu "
-               "iterations=%zu warmup=%zu jettys=%u threads=%u remote_device=%u\n",
+               "iterations=%zu warmup=%zu jettys=%u threads=%u thread_mode=%s remote_device=%u\n",
                options.peer.c_str(), options.blocks, options.block_bytes,
                static_cast<unsigned long long>(total_bytes),
                static_cast<unsigned long long>(host_space_bytes), options.iterations,
-               options.warmup, options.jetty_count, options.worker_count, options.device_id);
+               options.warmup, options.jetty_count, options.worker_count,
+               options.aiv_thread_mode ? "aiv" : "prepare", options.device_id);
   std::fprintf(stderr, "[HBM_TEST][CPU] DATA_PATH=direct-registered-host-memory\n");
 
   kvaf::CpuUrmaTransportOptions transport_options;
@@ -239,6 +247,7 @@ int main(int argc, char** argv) {
   transport_options.remote_eid_index = options.has_eid_index ? options.eid_index : UINT32_MAX;
   transport_options.jetty_count = options.jetty_count;
   transport_options.worker_count = options.worker_count;
+  transport_options.aiv_thread_mode = options.aiv_thread_mode;
   kvaf::CpuUrmaTransport transport;
   kvaf::Status status = transport.Initialize(transport_options);
   if (!status.ok()) {

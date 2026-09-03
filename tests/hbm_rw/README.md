@@ -80,10 +80,18 @@ channels and remains sized for the 1024-WR wave; increasing the worker count
 does not increase the maximum requests in one logical batch. The current
 resource limit is 16 CPU Jettys per channel.
 
+`--thread-mode aiv` enables the AIV-style experimental path. Each persistent
+worker owns a disjoint set of Jettys end-to-end: it prepares the WRs, posts all
+of its assigned Jettys, and then polls one fence CQE from each Jetty. The main
+thread acts as worker 0, and the hot path has no ready/go barrier. Use this mode
+to determine whether the active liburma/provider can benefit from parallel
+independent Jetty producers; `prepare` remains the default baseline.
+
 For example:
 
 ```bash
 tests/run_hbm_rw_client.sh <npu-host> 29888 \
-  --blocks 1024 --block-bytes 656 --threads 4 \
+  --blocks 1024 --block-bytes 656 --jettys 4 --threads 4 \
+  --thread-mode aiv \
   --iterations 10 --warmup 1
 ```

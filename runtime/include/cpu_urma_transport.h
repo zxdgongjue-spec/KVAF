@@ -42,6 +42,9 @@ struct CpuUrmaTransportOptions {
   // Number of persistent CPU workers used by batch transfers. A worker may
   // own multiple Jettys; each Jetty still has exactly one producer.
   std::uint32_t worker_count{1};
+  // When true, each worker owns its Jettys end-to-end: prepare, post, and CQ
+  // polling. When false, workers only prepare WRs and the caller owns URMA IO.
+  bool aiv_thread_mode{false};
   bool has_external_region{false};
   peer::PeerRegion external_region{};
 };
