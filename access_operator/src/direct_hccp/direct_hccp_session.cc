@@ -342,10 +342,13 @@ void ReleaseDirectHccpSession(DirectHccpSession *session) {
                session->key.physical_device_id, session->key.hdc_type, session->reference_count);
     return;
   }
-  VerboseLog("[KVAF_AIV] DIRECT_HCCP_SESSION_DESTROY physical=%u hdc_type=%u\n",
+  // rtOpenNetService has no symmetric close primitive.  Its RA/HDC service
+  // and TLS callbacks can outlive a Runtime, so RaDeinit/dlclose here can
+  // unload code still reachable during later cleanup or process exit.  Keep
+  // the successfully bootstrapped session in the process map at refs=0; a
+  // later Runtime on this NPU reuses it and the OS reclaims it at process exit.
+  VerboseLog("[KVAF_AIV] DIRECT_HCCP_SESSION_IDLE physical=%u hdc_type=%u refs=0 lifetime=process\n",
              session->key.physical_device_id, session->key.hdc_type);
-  DestroySession(session);
-  g_sessions.erase(found);
 }
 
 }  // namespace kvaf::direct_hccp

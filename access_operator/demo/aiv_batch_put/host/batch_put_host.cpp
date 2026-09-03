@@ -231,6 +231,55 @@ void ReleaseTransport(KvafBatchPutTransport *transport) {
   if (transport == nullptr) {
     return;
   }
+
+  // Queue objects can retain references to the local entity table and HBM MR.
+  // Retire every imported Jetty, SQ and CQ before releasing any of those
+  // dependent allocations.  If a queue cannot be retired, retain the complete
+  // transport for process exit rather than freeing memory the driver may still
+  // dereference.
+  bool queues_retired = true;
+  if (transport->api.qp_unimport != nullptr) {
+    for (uint32_t index = 0U; index < transport->worker_count; ++index) {
+      DirectAivWorker &worker = transport->workers[index];
+      if (transport->device_context != nullptr && worker.device_peer_target_jetty != nullptr) {
+        if (transport->api.qp_unimport(transport->device_context,
+                                       worker.device_peer_target_jetty) != 0) {
+          queues_retired = false;
+        } else {
+          worker.device_peer_target_jetty = nullptr;
+        }
+      }
+    }
+  }
+  if (queues_retired && transport->api.qp_destroy != nullptr) {
+    for (uint32_t index = 0U; index < transport->worker_count; ++index) {
+      DirectAivWorker &worker = transport->workers[index];
+      if (worker.device_user_ctl_jetty.handle != nullptr) {
+        if (transport->api.qp_destroy(worker.device_user_ctl_jetty.handle) != 0) {
+          queues_retired = false;
+        } else {
+          worker.device_user_ctl_jetty.handle = nullptr;
+        }
+      }
+    }
+  }
+  if (queues_retired && transport->api.cq_destroy != nullptr) {
+    for (uint32_t index = 0U; index < transport->worker_count; ++index) {
+      DirectAivWorker &worker = transport->workers[index];
+      if (transport->device_context != nullptr && worker.device_user_ctl_cq != nullptr) {
+        if (transport->api.cq_destroy(transport->device_context,
+                                      worker.device_user_ctl_cq) != 0) {
+          queues_retired = false;
+        } else {
+          worker.device_user_ctl_cq = nullptr;
+        }
+      }
+    }
+  }
+  if (!queues_retired) {
+    return;
+  }
+
   for (const auto &local : transport->local_buffers) {
     if (local->device_entities != nullptr) {
       (void)aclrtFree(local->device_entities);

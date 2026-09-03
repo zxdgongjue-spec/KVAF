@@ -157,7 +157,10 @@ bool LoadDirectHccp(DirectHccpApi* api) {
 
 void CloseDirectHccp(DirectHccpApi* api) {
   if (api == nullptr) return;
-  if (api->library != nullptr) dlclose(api->library);
+  // A successfully published transport shares the RA/HDC process bootstrap.
+  // Keep this DSO mapped until process exit: RA can retain service/TLS
+  // callbacks after an individual Runtime has torn down its queues.
+  // LoadDirectHccp still dlcloses an API handle that failed before publication.
   *api = {};
 }
 
