@@ -69,13 +69,13 @@ the pair-info local/remote EID rule used by the H2D script.
 
 Each block is one single-SGE WR. With `--jettys N`, the client creates `N`
 independent local JFC/JFR/Jetty/CTP resources. `--threads M` controls how many
-persistent CPU workers drive those Jettys; a worker may own multiple Jettys,
-but each Jetty still has exactly one producer. A worker posts all of its Jetty
-lists before polling their final CQEs, matching the AIV post-then-wait model.
-By default `--threads` is 1, so `--jettys N` keeps the low-overhead single
-worker/multi-Jetty path. Thus `blocks=1024` measures the elapsed time for
-submitting and completing all 1024 requests, while `--threads` enables an
-explicit CPU-parallel experiment. The target HBM Jetty is shared by these
+persistent CPU workers prepare the WR/SGE arrays; the main thread remains the
+only URMA submitter and CQ poller, avoiding liburma context-lock contention.
+Each worker prepares disjoint Jetty queues in parallel, then the main thread
+posts every Jetty list before polling final CQEs. By default `--threads` is 1,
+which is the low-overhead baseline. Thus `blocks=1024` measures the elapsed
+time for submitting and completing all 1024 requests, while `--threads` enables
+parallel CPU-side request preparation. The target HBM Jetty is shared by these
 channels and remains sized for the 1024-WR wave; increasing the worker count
 does not increase the maximum requests in one logical batch. The current
 resource limit is 16 CPU Jettys per channel.

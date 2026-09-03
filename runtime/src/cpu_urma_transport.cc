@@ -75,20 +75,60 @@ struct CpuUrmaTransport::Impl {
   struct BatchJob {
     bool write{false};
     std::vector<BatchQueue> queues;
+    std::vector<CpuUrmaTransport::HostSge> buffers;
+    std::vector<std::uint64_t> remote_offsets;
+    std::vector<urma_target_seg_t*> host_segments;
     std::vector<std::string> errors;
     std::size_t active_workers{0U};
     std::size_t ready_workers{0U};
     std::size_t done_workers{0U};
     bool go{false};
+    bool complete{false};
     std::chrono::steady_clock::time_point start{};
     std::chrono::steady_clock::time_point deadline{};
   };
 
-  std::string RunBatchWorker(BatchJob& job, std::size_t worker) {
-    // Keep submission and completion polling in the same worker, but submit
-    // every Jetty owned by this worker before waiting for any CQE. This is the
-    // host analogue of AIV's post-all-queues-then-wait design.
-    for (std::size_t jetty = worker; jetty < local_jettys_.size(); jetty += batch_worker_count_) {
+  std::string PrepareBatchWorker(BatchJob& job, std::size_t worker) {
+    for (std::size_t jetty = worker; jetty < local_jettys_.size();
+         jetty += batch_worker_count_) {
+      BatchQueue& queue = job.queues[jetty];
+      for (std::size_t position = 0U; position < queue.wrs.size(); ++position) {
+        const std::size_t index = position * local_jettys_.size() + jetty;
+        const auto& buffer = job.buffers[index];
+        queue.local[position] = {
+            reinterpret_cast<std::uint64_t>(buffer.data),
+            static_cast<std::uint32_t>(buffer.bytes), job.host_segments[index]};
+        queue.remote[position] = {
+            remote_region_.base + job.remote_offsets[index],
+            static_cast<std::uint32_t>(buffer.bytes), remote_seg_handle_};
+        queue.wrs[position] = {};
+        queue.wrs[position].opcode = job.write ? URMA_OPC_WRITE : URMA_OPC_READ;
+        queue.wrs[position].flag.bs.complete_enable =
+            (position + 1U == queue.wrs.size()) ? 1U : 0U;
+        queue.wrs[position].tjetty = remote_jettys_[jetty];
+        queue.wrs[position].user_ctx =
+            0xBA7C0000ULL + (static_cast<std::uint64_t>(jetty) << 32U) + position;
+        if (job.write) {
+          queue.wrs[position].rw.src = {&queue.local[position], 1U};
+          queue.wrs[position].rw.dst = {&queue.remote[position], 1U};
+        } else {
+          queue.wrs[position].rw.src = {&queue.remote[position], 1U};
+          queue.wrs[position].rw.dst = {&queue.local[position], 1U};
+        }
+        queue.wrs[position].next =
+            position + 1U < queue.wrs.size() ? &queue.wrs[position + 1U] : nullptr;
+      }
+    }
+    return {};
+  }
+
+  std::string RunBatchWorker(BatchJob& job, std::size_t worker, bool all_jettys) {
+    // URMA submission and CQ polling stay on one thread to avoid provider-wide
+    // context locks. The optional workers only prepare disjoint WR arrays;
+    // this keeps the data-plane ordering identical to the fast baseline.
+    const std::size_t first_jetty = all_jettys ? 0U : worker;
+    const std::size_t jetty_stride = all_jettys ? 1U : batch_worker_count_;
+    for (std::size_t jetty = first_jetty; jetty < local_jettys_.size(); jetty += jetty_stride) {
       BatchQueue& queue = job.queues[jetty];
       if (queue.wrs.empty()) continue;
       urma_jfs_wr_t* bad = nullptr;
@@ -104,7 +144,7 @@ struct CpuUrmaTransport::Impl {
                ", count=" + std::to_string(queue.wrs.size()) + ")";
       }
     }
-    if (batch_worker_count_ == 1U) {
+    if (all_jettys) {
       // Preserve the low-overhead baseline: after posting every Jetty, drain
       // each JFC in order without polling empty queues round-robin.
       for (std::size_t jetty = 0U; jetty < local_jettys_.size(); ++jetty) {
@@ -144,12 +184,12 @@ struct CpuUrmaTransport::Impl {
     }
     std::vector<bool> completed(local_jettys_.size(), false);
     std::size_t remaining = 0U;
-    for (std::size_t jetty = worker; jetty < local_jettys_.size(); jetty += batch_worker_count_) {
+    for (std::size_t jetty = first_jetty; jetty < local_jettys_.size(); jetty += jetty_stride) {
       if (!job.queues[jetty].wrs.empty()) ++remaining;
     }
     while (remaining != 0U && std::chrono::steady_clock::now() < job.deadline) {
       bool made_progress = false;
-      for (std::size_t jetty = worker; jetty < local_jettys_.size(); jetty += batch_worker_count_) {
+      for (std::size_t jetty = first_jetty; jetty < local_jettys_.size(); jetty += jetty_stride) {
         if (completed[jetty] || job.queues[jetty].wrs.empty()) continue;
         urma_cr_t cr{};
         const int polled = urma_poll_jfc(jfcs_[jetty], 1, &cr);
@@ -171,7 +211,7 @@ struct CpuUrmaTransport::Impl {
       if (!made_progress) std::this_thread::yield();
     }
     if (remaining == 0U) return {};
-    for (std::size_t jetty = worker; jetty < local_jettys_.size(); jetty += batch_worker_count_) {
+    for (std::size_t jetty = first_jetty; jetty < local_jettys_.size(); jetty += jetty_stride) {
       if (completed[jetty] || job.queues[jetty].wrs.empty()) continue;
       urma_jetty_cfg_t observed_cfg{};
       urma_jetty_attr_t observed_attr{};
@@ -204,11 +244,13 @@ struct CpuUrmaTransport::Impl {
         batch_cv_.wait(lock, [&] { return batch_stop_ || job->go; });
         if (batch_stop_) return;
       }
-      job->errors[worker] = RunBatchWorker(*job, worker);
+      job->errors[worker] = PrepareBatchWorker(*job, worker);
       {
-        std::lock_guard<std::mutex> lock(batch_mutex_);
+        std::unique_lock<std::mutex> lock(batch_mutex_);
         ++job->done_workers;
         batch_cv_.notify_all();
+        batch_cv_.wait(lock, [&] { return batch_stop_ || job->complete; });
+        if (batch_stop_) return;
       }
     }
   }
@@ -798,7 +840,6 @@ struct CpuUrmaTransport::Impl {
 
   Status TransferBatch(bool write, std::uint64_t offset,
                        const CpuUrmaTransport::HostSge* buffers, std::size_t count) {
-    constexpr std::uint64_t kBatchCtxBase = 0xBA7C0000ULL;
     if (!initialized_) return Status::InvalidState("CPU URMA transport is not initialized");
     std::unique_lock<std::mutex> submit_lock(batch_submit_mutex_);
     const std::size_t jetty_count = local_jettys_.size();
@@ -814,6 +855,9 @@ struct CpuUrmaTransport::Impl {
     for (std::size_t i = 0U; i < count; ++i) ++queue_counts[i % jetty_count];
     auto job = std::make_shared<BatchJob>();
     job->write = write;
+    job->buffers.assign(buffers, buffers + count);
+    job->remote_offsets.resize(count);
+    job->host_segments.resize(count);
     job->queues.resize(jetty_count);
     job->errors.resize(batch_worker_count_);
     job->active_workers = batch_worker_count_ - 1U;
@@ -823,7 +867,6 @@ struct CpuUrmaTransport::Impl {
       job->queues[jetty].wrs.resize(queue_counts[jetty]);
     }
 
-    std::vector<std::size_t> queue_positions(jetty_count, 0U);
     std::uint64_t total = 0U;
     for (std::size_t i = 0; i < count; ++i) {
       if (buffers[i].data == nullptr || buffers[i].bytes == 0U ||
@@ -837,39 +880,9 @@ struct CpuUrmaTransport::Impl {
         Status status = RegisterHostBuffer(buffers[i].data, buffers[i].bytes, &host);
         if (!status.ok()) return status;
       }
-      const std::size_t jetty = i % jetty_count;
-      const std::size_t position = queue_positions[jetty]++;
-      BatchQueue& queue = job->queues[jetty];
-      queue.local[position] = {
-          reinterpret_cast<std::uint64_t>(buffers[i].data),
-          static_cast<std::uint32_t>(buffers[i].bytes), host->segment};
-      queue.remote[position] = {
-          remote_region_.base + offset + total,
-          static_cast<std::uint32_t>(buffers[i].bytes), remote_seg_handle_};
-      queue.wrs[position] = {};
-      queue.wrs[position].opcode = write ? URMA_OPC_WRITE : URMA_OPC_READ;
-      queue.wrs[position].flag.bs.complete_enable =
-          (position + 1U == queue.wrs.size()) ? 1U : 0U;
-      queue.wrs[position].tjetty = remote_jettys_[jetty];
-      queue.wrs[position].user_ctx =
-          kBatchCtxBase + (static_cast<std::uint64_t>(jetty) << 32U) + position;
-      if (write) {
-        queue.wrs[position].rw.src = {&queue.local[position], 1U};
-        queue.wrs[position].rw.dst = {&queue.remote[position], 1U};
-      } else {
-        queue.wrs[position].rw.src = {&queue.remote[position], 1U};
-        queue.wrs[position].rw.dst = {&queue.local[position], 1U};
-      }
-      queue.wrs[position].next =
-          position + 1U < queue.wrs.size() ? &queue.wrs[position + 1U] : nullptr;
+      job->remote_offsets[i] = offset + total;
+      job->host_segments[i] = host->segment;
       total += buffers[i].bytes;
-    }
-
-    for (std::size_t jetty = 0U; jetty < jetty_count; ++jetty) {
-      if (job->queues[jetty].wrs.empty()) continue;
-      if (job->queues[jetty].wrs.back().flag.bs.complete_enable == 0U) {
-        return Status::Internal("batch queue has no completion fence");
-      }
     }
 
     job->start = std::chrono::steady_clock::now();
@@ -884,13 +897,27 @@ struct CpuUrmaTransport::Impl {
       job->go = true;
       batch_cv_.notify_all();
     }
-    job->errors[0] = RunBatchWorker(*job, 0U);
+    job->errors[0] = PrepareBatchWorker(*job, 0U);
     if (job->active_workers != 0U) {
       std::unique_lock<std::mutex> lock(batch_mutex_);
       batch_cv_.wait(lock, [&] { return job->done_workers == job->active_workers; });
+    }
+    std::string transport_error;
+    bool preparation_failed = false;
+    for (const auto& error : job->errors) {
+      if (!error.empty()) {
+        preparation_failed = true;
+        break;
+      }
+    }
+    if (!preparation_failed) transport_error = RunBatchWorker(*job, 0U, true);
+    {
+      std::lock_guard<std::mutex> lock(batch_mutex_);
+      job->complete = true;
       active_batch_.reset();
       batch_cv_.notify_all();
     }
+    if (!transport_error.empty()) return Status::Internal(transport_error);
     for (const auto& error : job->errors) {
       if (!error.empty()) return Status::Internal(error);
     }
