@@ -729,13 +729,15 @@ Status DefaultAccessOperator::Shutdown() {
     return Status::OK();
   }
 
-  // A fused, streaming, or layer-resident Get owns Direct-HCCP local-HBM registrations that
+  // A fused, streaming, or canonical-resident Get owns Direct-HCCP local-HBM
+  // registrations that
   // can still be read by graph-replayed AIV code. Unlike an ordinary host
   // submission there is no host completion object to prove that the final
   // reader has retired. Fail closed at this cold lifecycle boundary.
   if (impl_->HasDeviceFusedBatchGetControl()) {
     return Status::Busy(
-        "Shutdown is forbidden while fused, streaming, or layer-resident BatchGet control is "
+        "Shutdown is forbidden while fused, streaming, or canonical-resident "
+        "BatchGet control is "
         "bound; wait for the final fused reader and release the control first");
   }
 
@@ -781,7 +783,8 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   if (impl_->HasDeviceFusedBatchGetControl()) {
     return Status::Error(
         StatusCode::kBusy,
-        "ordinary BatchGet is forbidden while fused or streaming BatchGet "
+        "ordinary BatchGet is forbidden while fused, streaming, or "
+        "forward-resident BatchGet "
         "control owns "
         "the Direct-HCCP SQ/CQ state");
   }
@@ -841,8 +844,9 @@ Status DefaultAccessOperator::BindBatchGetOutput(
   if (impl_->HasDeviceFusedBatchGetControl()) {
     return Status::Error(
         StatusCode::kBusy,
-        "native BatchGet output binding is forbidden while fused or streaming "
-        "BatchGet control owns the Direct-HCCP SQ/CQ state");
+        "native BatchGet output binding is forbidden while fused, streaming, "
+        "or forward-resident BatchGet control owns the Direct-HCCP SQ/CQ "
+        "state");
   }
   if (!output.valid() || output.device != DeviceKind::kNpu ||
       output.bytes % kBatchGetTransferBytes != 0) {
@@ -908,7 +912,8 @@ Status DefaultAccessOperator::ExecuteBoundBatchGet(
   if (impl_->HasDeviceFusedBatchGetControl()) {
     return Status::Error(
         StatusCode::kBusy,
-        "bound BatchGet is forbidden while fused or streaming BatchGet "
+        "bound BatchGet is forbidden while fused, streaming, or "
+        "forward-resident BatchGet "
         "control owns the Direct-HCCP SQ/CQ state");
   }
   if (exec.execution.stream == nullptr) {
@@ -966,8 +971,10 @@ Status DefaultAccessOperator::BindFusedBatchGetControl(
                          "AccessOperator has not been initialized");
   }
   if (impl_->HasDeviceFusedBatchGetControl()) {
-    return Status::Error(StatusCode::kAlreadyExists,
-                         "a fused or streaming BatchGet control is already bound");
+    return Status::Error(
+        StatusCode::kAlreadyExists,
+        "a fused, streaming, or forward-resident BatchGet control is already "
+        "bound");
   }
   // Existing enqueue-only BatchGet calls intentionally do not retain a host
   // completion object.  A cold caller must therefore drain any earlier
@@ -1076,7 +1083,8 @@ Status DefaultAccessOperator::BindLayerResidentBatchGetControl(
   if (impl_->HasDeviceFusedBatchGetControl()) {
     return Status::Error(
         StatusCode::kAlreadyExists,
-        "a fused, streaming, or layer-resident BatchGet control is already bound");
+        "a fused, streaming, or canonical-resident BatchGet control is already "
+        "bound");
   }
   Status status = ValidateFusedBatchGetQueueCount(impl_->config, queue_count);
   if (!status.ok()) {
@@ -1384,6 +1392,37 @@ Status DefaultAccessOperator::DescribeLayerResidentBatchGetControl(
   return Status::OK();
 }
 
+Status DefaultAccessOperator::BindForwardResidentBatchGetControl(
+    const ForwardResidentBatchGetBinding& binding,
+    const MutableBufferView& queue_leases, std::uint32_t queue_count) {
+  // The P10 API deliberately shares the hardened P9 cold-binding machinery:
+  // both paths describe one fixed canonical resident interval and one bounded
+  // queue pool.  Keeping a single registration path preserves the upstream
+  // descriptor-alias validation and unposted-lease rollback behaviour.
+  return BindLayerResidentBatchGetControl(binding, queue_leases, queue_count);
+}
+
+Status DefaultAccessOperator::ConfigureForwardResidentBatchGetQueueTemplates(
+    const std::vector<ForwardResidentBatchGetQueueTemplate>& queues) {
+  return ConfigureLayerResidentBatchGetQueueTemplates(queues);
+}
+
+Status DefaultAccessOperator::ReleaseForwardResidentBatchGetControl() {
+  return ReleaseLayerResidentBatchGetControl();
+}
+
+Status DefaultAccessOperator::DescribeForwardResidentBatchGetControl(
+    std::string* diagnostic) const {
+  Status status = DescribeLayerResidentBatchGetControl(diagnostic);
+  if (status.ok() && diagnostic != nullptr) {
+    const std::string prefix = "KVAF_LAYER_RESIDENT_CONTROL";
+    if (diagnostic->compare(0, prefix.size(), prefix) == 0) {
+      diagnostic->replace(0, prefix.size(), "KVAF_FORWARD_RESIDENT_CONTROL");
+    }
+  }
+  return status;
+}
+
 Status DefaultAccessOperator::BindStreamingBatchGetControl(
     const std::vector<StreamingBatchGetLayerBinding>& layers,
     const MutableBufferView& queue_leases,
@@ -1395,7 +1434,8 @@ Status DefaultAccessOperator::BindStreamingBatchGetControl(
   if (impl_->HasDeviceFusedBatchGetControl()) {
     return Status::Error(
         StatusCode::kAlreadyExists,
-        "a fused or streaming BatchGet control is already bound; "
+        "a fused, streaming, or forward-resident BatchGet control is already "
+        "bound; "
         "streaming bindings may only be replaced after releasing the whole "
         "table at a cold lifecycle boundary");
   }
@@ -2060,11 +2100,12 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
   }
   // NpuRuntime rejects BatchPut before it mutates Runtime metadata. Keep the
   // same protection here as a second boundary for direct C++ users: an AIV
-  // fused or streaming Get reads this transport's remote payload and fixed
-  // output view.
+  // fused, streaming, or forward-resident Get reads this transport's remote
+  // payload and fixed output view.
   if (impl_->HasDeviceFusedBatchGetControl()) {
     return Status::Busy(
-        "BatchPut is forbidden while fused or streaming BatchGet control "
+        "BatchPut is forbidden while fused, streaming, or forward-resident "
+        "BatchGet control "
         "owns the Direct-HCCP read state");
   }
   if (exec.request == nullptr || exec.put_desc == nullptr ||

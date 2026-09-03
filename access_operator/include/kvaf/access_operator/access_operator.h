@@ -126,6 +126,15 @@ struct LayerResidentBatchGetBinding {
 // rows in the binding's fixed interval, not queue-private rows.
 using LayerResidentBatchGetQueueTemplate = StreamingBatchGetQueueTemplate;
 
+// P10 uses the same cold binding and dense descriptor-vector storage as the
+// hardened layer-resident path.  The forward name carries the tighter caller
+// contract (one fixed resident arena for the fused forward); an alias avoids
+// a second raw ACL/HCCP registration implementation that could drift from the
+// already fixed bind/rollback path.
+using ForwardResidentBatchGetBinding = LayerResidentBatchGetBinding;
+using ForwardResidentBatchGetQueueTemplate =
+    LayerResidentBatchGetQueueTemplate;
+
 // Read-only cold-path introspection for the streaming queue pool. The three
 // lifecycle counters are host lifecycle counters only; they deliberately do
 // not claim a race-free live count of device-held leases during graph replay.
@@ -267,6 +276,18 @@ class DefaultAccessOperator final : public AccessOperator {
       const std::vector<LayerResidentBatchGetQueueTemplate>& queues);
   Status ReleaseLayerResidentBatchGetControl();
   Status DescribeLayerResidentBatchGetControl(std::string* diagnostic) const;
+
+  // P10's forward-owned spelling is a compatibility façade over the same
+  // hardened canonical-resident control.  It deliberately retains the one
+  // binding implementation so the upstream global ABI aliases and unposted
+  // queue rollback semantics apply to both entrypoints.
+  Status BindForwardResidentBatchGetControl(
+      const ForwardResidentBatchGetBinding& binding,
+      const MutableBufferView& queue_leases, std::uint32_t queue_count);
+  Status ConfigureForwardResidentBatchGetQueueTemplates(
+      const std::vector<ForwardResidentBatchGetQueueTemplate>& queues);
+  Status ReleaseForwardResidentBatchGetControl();
+  Status DescribeForwardResidentBatchGetControl(std::string* diagnostic) const;
 
   // Profiling is opt-in and uses the reserved per-core status area. Callers
   // must complete the BatchGet stream before copying the latest snapshot.

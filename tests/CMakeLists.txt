@@ -12,6 +12,12 @@ if(KVAF_BUILD_PYTHON)
 
   if(KVAF_ENABLE_AIV_BATCH_GET)
     add_test(
+      NAME kvaf_forward_resident_get_source_contract
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/python/test_forward_resident_get_source_contract.py"
+    )
+
+    add_test(
       NAME kvaf_npu_batch_get_python
       COMMAND "${Python3_EXECUTABLE}"
               "${CMAKE_CURRENT_SOURCE_DIR}/python/test_npu_batch_get.py"

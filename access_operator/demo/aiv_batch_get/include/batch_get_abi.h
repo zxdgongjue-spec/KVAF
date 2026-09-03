@@ -38,6 +38,13 @@ enum {
   KVAF_LAYER_RESIDENT_BATCH_GET_CONTROL_WORDS = 16,
   KVAF_LAYER_RESIDENT_BATCH_GET_CONTROL_BYTES =
       KVAF_LAYER_RESIDENT_BATCH_GET_CONTROL_WORDS * sizeof(uint64_t),
+  // Forward-resident is the P10 name for the same fixed canonical-resident
+  // wire layout.  Keep the P9 layer-resident ABI intact for existing clients;
+  // the two names intentionally share one 16-word control rather than create
+  // a second raw Direct-HCCP registration protocol.
+  KVAF_FORWARD_RESIDENT_BATCH_GET_CONTROL_WORDS = 16,
+  KVAF_FORWARD_RESIDENT_BATCH_GET_CONTROL_BYTES =
+      KVAF_FORWARD_RESIDENT_BATCH_GET_CONTROL_WORDS * sizeof(uint64_t),
   // One int32 owner word per Direct-HCCP queue: 0 means free and a positive
   // value is the producer-owned lease tag (normally 1 + LI producer id).
   KVAF_STREAMING_BATCH_GET_QUEUE_LEASE_BYTES = sizeof(int32_t),
@@ -80,6 +87,13 @@ static const uint64_t KVAF_STREAMING_BATCH_GET_CONTROL_VERSION = 1ULL;
 static const uint64_t KVAF_LAYER_RESIDENT_BATCH_GET_CONTROL_MAGIC =
     0x4b5641464c525347ULL;  // "KVAFLRSG"
 static const uint64_t KVAF_LAYER_RESIDENT_BATCH_GET_CONTROL_VERSION = 1ULL;
+// Forward-resident is deliberately an ABI alias, not a competing magic
+// namespace.  This keeps the P10 device helper compatible with the upstream
+// layer-resident host binding and preserves its post/rollback fixes.
+static const uint64_t KVAF_FORWARD_RESIDENT_BATCH_GET_CONTROL_MAGIC =
+    0x4b5641464c525347ULL;  // Same "KVAFLRSG" wire magic.
+static const uint64_t KVAF_FORWARD_RESIDENT_BATCH_GET_CONTROL_VERSION =
+    1ULL;
 
 // Optional, per-core kernel timeline. The host enables collection by placing
 // KVAF_AIV_BATCH_GET_PROFILE_MAGIC in `magic` before launch. The kernel keeps
@@ -346,6 +360,15 @@ typedef struct KvafLayerResidentBatchGetControl {
   uint64_t descriptor_template_count;
 } KvafLayerResidentBatchGetControl;
 
+// P10's forward-resident helper deliberately reuses the already deployed
+// layer-resident control/storage ABI.  It changes the caller contract
+// (forward-owned fixed rows and Begin-owned descriptor publish), not the
+// Direct-HCCP wire layout.  Alias rather than duplicate so every upstream
+// validation, global ABI alias, and rollback fix remains one implementation.
+typedef KvafLayerResidentBatchGetDescriptorScratch
+    KvafForwardResidentBatchGetDescriptorScratch;
+typedef KvafLayerResidentBatchGetControl KvafForwardResidentBatchGetControl;
+
 #if defined(__cplusplus)
 static_assert(sizeof(KvafBatchGetCoreStatus) == KVAF_AIV_BATCH_GET_STATUS_BYTES,
               "KvafBatchGetCoreStatus ABI changed");
@@ -370,6 +393,11 @@ static_assert(sizeof(KvafLayerResidentBatchGetControl) ==
               "KvafLayerResidentBatchGetControl ABI changed");
 static_assert(sizeof(KvafLayerResidentBatchGetDescriptorScratch) == 64,
               "KvafLayerResidentBatchGetDescriptorScratch ABI changed");
+static_assert(sizeof(KvafForwardResidentBatchGetControl) ==
+                  KVAF_FORWARD_RESIDENT_BATCH_GET_CONTROL_BYTES,
+              "KvafForwardResidentBatchGetControl ABI changed");
+static_assert(sizeof(KvafForwardResidentBatchGetDescriptorScratch) == 64,
+              "KvafForwardResidentBatchGetDescriptorScratch ABI changed");
 #endif
 
 #endif  // KVAF_AIV_BATCH_GET_ABI_H_
