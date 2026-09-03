@@ -364,6 +364,29 @@ bool DiscoverNpuLocalEidCandidates(std::uint32_t logical_device_id,
   return false;
 }
 
+// Keep this aligned with the BatchPut AIV kernel. A real 128-KiB KV dump
+// spreads roughly one 32-WQE post across every AIV core. The startup probe
+// deliberately uses the same fan-out, but only 64 bytes per WQE: it validates
+// every queue/CQ lane without retaining an 80+ MiB source buffer for process
+// lifetime. The extra one-row post reaches each configured additional jetty.
+constexpr std::uint64_t kBatchPutProbeWqesPerPost = 32U;
+constexpr std::uint64_t kBatchPutProbeBytesPerRow = 64U;
+
+std::uint64_t BatchPutStartupProbeRows(std::uint64_t ddr_bytes,
+                                       std::uint64_t slot_size,
+                                       std::uint32_t npu_core_count,
+                                       std::uint32_t jettys_per_core) {
+  if (ddr_bytes == 0U || slot_size == 0U || npu_core_count == 0U ||
+      jettys_per_core == 0U) {
+    return 0U;
+  }
+  const std::uint64_t rows_per_core =
+      kBatchPutProbeWqesPerPost + static_cast<std::uint64_t>(jettys_per_core - 1U);
+  const std::uint64_t desired_rows =
+      static_cast<std::uint64_t>(npu_core_count) * rows_per_core;
+  return std::min(ddr_bytes / slot_size, desired_rows);
+}
+
 }  // namespace
 
 struct NpuRuntime::Impl {
@@ -475,34 +498,59 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                    EidToHex(candidate.eid).c_str());
       last = impl_->runtime_core->Initialize(request);
       if (last.ok()) {
-        const std::uint64_t probe_bytes = std::min<std::uint64_t>(slot_size, 64U);
+        const std::uint64_t probe_bytes =
+            std::min<std::uint64_t>(slot_size, kBatchPutProbeBytesPerRow);
+        const std::uint64_t probe_rows = BatchPutStartupProbeRows(
+            ddr_bytes, slot_size, impl_->options.npu_core_count,
+            impl_->options.jettys_per_core);
+        const std::uint64_t probe_total_bytes = probe_rows * probe_bytes;
         aclrtStream stream = nullptr;
-        std::uint8_t pattern = 0xA5U;
-        if (probe_bytes == 0U ||
-            aclrtMalloc(&impl_->probe_buffer, probe_bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
+        if (probe_bytes == 0U || probe_rows == 0U ||
+            aclrtMalloc(&impl_->probe_buffer, probe_total_bytes,
+                        ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
             impl_->probe_buffer == nullptr ||
-            aclrtMemcpy(impl_->probe_buffer, probe_bytes, &pattern, sizeof(pattern),
-                        ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS ||
+            aclrtMemset(impl_->probe_buffer, probe_total_bytes, 0xA5U,
+                        probe_total_bytes) != ACL_SUCCESS ||
             aclrtCreateStream(&stream) != ACL_SUCCESS || stream == nullptr) {
           last = Internal("failed to prepare peer candidate RMA probe");
         } else {
+          std::vector<KeyId> probe_keys;
+          std::vector<std::uint64_t> probe_offsets;
+          std::vector<std::uint64_t> probe_lengths;
+          probe_keys.reserve(static_cast<std::size_t>(probe_rows));
+          probe_offsets.reserve(static_cast<std::size_t>(probe_rows));
+          probe_lengths.reserve(static_cast<std::size_t>(probe_rows));
+          for (std::uint64_t row = 0U; row < probe_rows; ++row) {
+            probe_keys.push_back(std::numeric_limits<KeyId>::max() - row);
+            probe_offsets.push_back(row * probe_bytes);
+            probe_lengths.push_back(probe_bytes);
+          }
           std::fprintf(stderr,
                        "[KVAF_AIV] PEER_LINK_EID_PAIR_RMA_PROBE_BEGIN peer_candidate=%u/%u "
-                       "npu_candidate=%zu npu_source=%s bytes=%llu\n",
+                       "npu_candidate=%zu npu_source=%s rows=%llu bytes_per_row=%llu "
+                       "source_bytes=%llu cores=%u jettys_per_core=%u\n",
                        peer_candidate, candidate_count, npu_index, candidate.source.c_str(),
-                       static_cast<unsigned long long>(probe_bytes));
+                       static_cast<unsigned long long>(probe_rows),
+                       static_cast<unsigned long long>(probe_bytes),
+                       static_cast<unsigned long long>(probe_total_bytes),
+                       impl_->options.npu_core_count, impl_->options.jettys_per_core);
           last = impl_->runtime_core->BatchPut(
-              BatchPutRequest{{std::numeric_limits<KeyId>::max()},
-                              ConstBufferView{impl_->probe_buffer, probe_bytes, DeviceKind::kNpu},
-                              {0U}, {probe_bytes}},
+              BatchPutRequest{probe_keys,
+                              ConstBufferView{impl_->probe_buffer,
+                                              static_cast<std::size_t>(probe_total_bytes),
+                                              DeviceKind::kNpu},
+                              probe_offsets, probe_lengths},
               BatchPutExecutionOptions{stream});
-          if (last.ok()) last = impl_->runtime_core->BatchFree(BatchFreeRequest{{std::numeric_limits<KeyId>::max()}});
+          if (last.ok()) {
+            last = impl_->runtime_core->BatchFree(BatchFreeRequest{probe_keys});
+          }
           if (last.ok()) {
             std::fprintf(stderr,
                          "[KVAF_AIV] PEER_LINK_EID_PAIR_RMA_PROBE_READY peer_candidate=%u/%u "
-                         "npu_candidate=%zu npu_source=%s bytes=%llu\n",
+                         "npu_candidate=%zu npu_source=%s rows=%llu source_bytes=%llu\n",
                          peer_candidate, candidate_count, npu_index, candidate.source.c_str(),
-                         static_cast<unsigned long long>(probe_bytes));
+                         static_cast<unsigned long long>(probe_rows),
+                         static_cast<unsigned long long>(probe_total_bytes));
           }
         }
         if (stream != nullptr && aclrtDestroyStream(stream) != ACL_SUCCESS && last.ok()) {
@@ -512,7 +560,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       if (last.ok()) {
         std::fprintf(stderr,
                      "[KVAF_AIV] PEER_LINK_EID_PAIR_SELECTED peer_candidate=%u/%u npu_candidate=%zu/%zu "
-                     "npu_source=%s validation=aiv_write_cq\n",
+                     "npu_source=%s validation=aiv_write_cq_all_lanes\n",
                      peer_candidate, candidate_count, npu_index, npu_candidates.size(), candidate.source.c_str());
         return Status::OK();
       }
