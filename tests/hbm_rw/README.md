@@ -91,6 +91,12 @@ mode, each Jetty is submitted in 32-WR chunks by default, approximating AIV's
 `prepare` mode keeps one post call per Jetty. This is an API-level approximation:
 `urma_post_jetty_send_wr` may coalesce or implement doorbells internally.
 
+`--thread-mode omp` uses an OpenMP `parallel for` to build the disjoint WR/SGE
+entries. It does not call URMA from the OpenMP loop; submission and CQ polling
+remain serialized by the caller. The mode is available only when the CPU build
+finds OpenMP, and is intended to compare CPU-side WQE preparation against the
+persistent-worker and single-thread baselines.
+
 For example:
 
 ```bash

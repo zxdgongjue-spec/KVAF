@@ -38,6 +38,7 @@ endif()
 
 if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   find_package(Threads REQUIRED)
+  find_package(OpenMP QUIET)
   set(KVAF_URMA_ROOT "" CACHE PATH "UMDK source or installation root")
   find_path(KVAF_URMA_INCLUDE_DIR urma_api.h
     HINTS
@@ -63,6 +64,12 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   target_link_libraries(kvaf_cpu_urma_transport
     PUBLIC kvaf_peer_link kvaf_common
     PRIVATE "${KVAF_URMA_LIBRARY}" "${CMAKE_DL_LIBS}" Threads::Threads)
+  if(OpenMP_CXX_FOUND)
+    target_link_libraries(kvaf_cpu_urma_transport PRIVATE OpenMP::OpenMP_CXX)
+    message(STATUS "KVAF CPU URMA transport: OpenMP enabled")
+  else()
+    message(STATUS "KVAF CPU URMA transport: OpenMP unavailable (omp mode disabled)")
+  endif()
   target_compile_features(kvaf_cpu_urma_transport PUBLIC cxx_std_17)
 
   add_library(kvaf_cpu_urma_access_operator STATIC src/cpu_urma_access_operator.cc)
