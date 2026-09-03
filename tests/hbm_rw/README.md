@@ -67,15 +67,17 @@ achieved CPU-initiated URMA payload rate, not raw HBM silicon bandwidth; with
 The test accepts explicit EIDs for diagnostics, but the default path follows
 the pair-info local/remote EID rule used by the H2D script.
 
-Each block is one single-SGE WR. With `--jettys N` (or its alias
-`--threads N`), the client creates `N` independent local
-JFC/JFR/Jetty/CTP resources and starts one persistent worker thread per Jetty.
-Requests are assigned round-robin; workers post their WR lists and poll their
-own final CQE concurrently. Thus `blocks=1024` measures the elapsed time for
-submitting and completing all 1024 requests, while `--threads`/`--jettys`
-controls the number of parallel queue paths. The target HBM Jetty is shared by
-these channels and remains sized for the 1024-WR wave; increasing the worker
-count does not increase the maximum requests in one logical batch. The current
+Each block is one single-SGE WR. With `--jettys N`, the client creates `N`
+independent local JFC/JFR/Jetty/CTP resources. `--threads M` controls how many
+persistent CPU workers drive those Jettys; a worker may own multiple Jettys,
+but each Jetty still has exactly one producer. A worker posts all of its Jetty
+lists before polling their final CQEs, matching the AIV post-then-wait model.
+By default `--threads` is 1, so `--jettys N` keeps the low-overhead single
+worker/multi-Jetty path. Thus `blocks=1024` measures the elapsed time for
+submitting and completing all 1024 requests, while `--threads` enables an
+explicit CPU-parallel experiment. The target HBM Jetty is shared by these
+channels and remains sized for the 1024-WR wave; increasing the worker count
+does not increase the maximum requests in one logical batch. The current
 resource limit is 16 CPU Jettys per channel.
 
 For example:

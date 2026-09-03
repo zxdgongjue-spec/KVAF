@@ -39,6 +39,9 @@ struct CpuUrmaTransportOptions {
   // Number of independent local Jettys used by batch transfers. Each Jetty
   // owns its JFC/JFR/SQ and establishes its own CTP to the remote target.
   std::uint32_t jetty_count{1};
+  // Number of persistent CPU workers used by batch transfers. A worker may
+  // own multiple Jettys; each Jetty still has exactly one producer.
+  std::uint32_t worker_count{1};
   bool has_external_region{false};
   peer::PeerRegion external_region{};
 };
@@ -73,8 +76,8 @@ class CpuUrmaTransport final {
                            std::size_t bytes);
   Status Read(std::uint64_t remote_offset, void* destination, std::size_t bytes);
   // Posts one WR per HostSge as a linked list and waits only for the final
-  // completion. With jetty_count > 1, the list is sharded round-robin and one
-  // persistent worker thread owns each Jetty; all shards run concurrently.
+  // completion. Jettys are sharded across persistent workers. Each worker
+  // posts all of its Jetty lists before polling their final completions.
   Status WriteBatch(std::uint64_t remote_offset, const HostSge* sources, std::size_t count);
   Status ReadBatch(std::uint64_t remote_offset, const HostSge* destinations, std::size_t count);
   Status ReadSgl(std::uint64_t remote_offset, const HostSge* destinations, std::size_t count);

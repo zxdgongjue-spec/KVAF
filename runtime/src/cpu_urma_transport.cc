@@ -84,28 +84,78 @@ struct CpuUrmaTransport::Impl {
     std::chrono::steady_clock::time_point deadline{};
   };
 
-  std::string RunBatchQueue(BatchJob& job, std::size_t jetty) {
-    BatchQueue& queue = job.queues[jetty];
-    if (queue.wrs.empty()) return {};
-    urma_jfs_wr_t* bad = nullptr;
-    const urma_status_t post_status =
-        urma_post_jetty_send_wr(local_jettys_[jetty],
-                                 queue.wrs.data(), &bad);
-    if (post_status != URMA_SUCCESS) {
-      return "batch post failed (jetty=" + std::to_string(jetty) +
-             ", status=" + std::to_string(static_cast<int>(post_status)) +
-             ", bad_index=" +
-             std::to_string(bad == nullptr
-                                ? queue.wrs.size()
-                                : static_cast<std::size_t>(bad - queue.wrs.data())) +
-             ", count=" + std::to_string(queue.wrs.size()) + ")";
+  std::string RunBatchWorker(BatchJob& job, std::size_t worker) {
+    // Keep submission and completion polling in the same worker, but submit
+    // every Jetty owned by this worker before waiting for any CQE. This is the
+    // host analogue of AIV's post-all-queues-then-wait design.
+    for (std::size_t jetty = worker; jetty < local_jettys_.size(); jetty += batch_worker_count_) {
+      BatchQueue& queue = job.queues[jetty];
+      if (queue.wrs.empty()) continue;
+      urma_jfs_wr_t* bad = nullptr;
+      const urma_status_t post_status =
+          urma_post_jetty_send_wr(local_jettys_[jetty], queue.wrs.data(), &bad);
+      if (post_status != URMA_SUCCESS) {
+        return "batch post failed (jetty=" + std::to_string(jetty) +
+               ", status=" + std::to_string(static_cast<int>(post_status)) +
+               ", bad_index=" +
+               std::to_string(bad == nullptr
+                                  ? queue.wrs.size()
+                                  : static_cast<std::size_t>(bad - queue.wrs.data())) +
+               ", count=" + std::to_string(queue.wrs.size()) + ")";
+      }
     }
-    const std::uint64_t expected_ctx = queue.wrs.back().user_ctx;
-    while (std::chrono::steady_clock::now() < job.deadline) {
-      urma_cr_t cr{};
-      const int polled = urma_poll_jfc(jfcs_[jetty], 1, &cr);
-      if (polled < 0) return "urma_poll_jfc for batch (jetty=" + std::to_string(jetty) + ")";
-      if (polled == 1) {
+    if (batch_worker_count_ == 1U) {
+      // Preserve the low-overhead baseline: after posting every Jetty, drain
+      // each JFC in order without polling empty queues round-robin.
+      for (std::size_t jetty = 0U; jetty < local_jettys_.size(); ++jetty) {
+        BatchQueue& queue = job.queues[jetty];
+        if (queue.wrs.empty()) continue;
+        const std::uint64_t expected_ctx = queue.wrs.back().user_ctx;
+        bool completed = false;
+        while (std::chrono::steady_clock::now() < job.deadline) {
+          urma_cr_t cr{};
+          const int polled = urma_poll_jfc(jfcs_[jetty], 1, &cr);
+          if (polled < 0) return "urma_poll_jfc for batch (jetty=" + std::to_string(jetty) + ")";
+          if (polled != 1) continue;
+          if (cr.status != URMA_CR_SUCCESS || cr.user_ctx != expected_ctx) {
+            return "batch completion failed (jetty=" + std::to_string(jetty) +
+                   ", status=" + std::to_string(static_cast<int>(cr.status)) +
+                   ", user_ctx=" +
+                   std::to_string(static_cast<unsigned long long>(cr.user_ctx)) +
+                   ", expected_ctx=" +
+                   std::to_string(static_cast<unsigned long long>(expected_ctx)) + ")";
+          }
+          completed = true;
+          break;
+        }
+        if (!completed) {
+          urma_jetty_cfg_t observed_cfg{};
+          urma_jetty_attr_t observed_attr{};
+          observed_attr.mask = JETTY_STATE;
+          const urma_status_t query_status =
+              urma_query_jetty(local_jettys_[jetty], &observed_cfg, &observed_attr);
+          return "timed out waiting for batch completion (jetty=" +
+                 std::to_string(jetty) + ", jetty_query_status=" +
+                 std::to_string(static_cast<int>(query_status)) + ", jetty_state=" +
+                 std::to_string(static_cast<unsigned>(observed_attr.state)) + ")";
+        }
+      }
+      return {};
+    }
+    std::vector<bool> completed(local_jettys_.size(), false);
+    std::size_t remaining = 0U;
+    for (std::size_t jetty = worker; jetty < local_jettys_.size(); jetty += batch_worker_count_) {
+      if (!job.queues[jetty].wrs.empty()) ++remaining;
+    }
+    while (remaining != 0U && std::chrono::steady_clock::now() < job.deadline) {
+      bool made_progress = false;
+      for (std::size_t jetty = worker; jetty < local_jettys_.size(); jetty += batch_worker_count_) {
+        if (completed[jetty] || job.queues[jetty].wrs.empty()) continue;
+        urma_cr_t cr{};
+        const int polled = urma_poll_jfc(jfcs_[jetty], 1, &cr);
+        if (polled < 0) return "urma_poll_jfc for batch (jetty=" + std::to_string(jetty) + ")";
+        if (polled != 1) continue;
+        const std::uint64_t expected_ctx = job.queues[jetty].wrs.back().user_ctx;
         if (cr.status != URMA_CR_SUCCESS || cr.user_ctx != expected_ctx) {
           return "batch completion failed (jetty=" + std::to_string(jetty) +
                  ", status=" + std::to_string(static_cast<int>(cr.status)) +
@@ -114,22 +164,29 @@ struct CpuUrmaTransport::Impl {
                  ", expected_ctx=" +
                  std::to_string(static_cast<unsigned long long>(expected_ctx)) + ")";
         }
-        return {};
+        completed[jetty] = true;
+        --remaining;
+        made_progress = true;
       }
-      std::this_thread::yield();
+      if (!made_progress) std::this_thread::yield();
     }
-    urma_jetty_cfg_t observed_cfg{};
-    urma_jetty_attr_t observed_attr{};
-    observed_attr.mask = JETTY_STATE;
-    const urma_status_t query_status =
-        urma_query_jetty(local_jettys_[jetty], &observed_cfg, &observed_attr);
-    return "timed out waiting for batch completion (jetty=" +
-           std::to_string(jetty) + ", jetty_query_status=" +
-           std::to_string(static_cast<int>(query_status)) + ", jetty_state=" +
-           std::to_string(static_cast<unsigned>(observed_attr.state)) + ")";
+    if (remaining == 0U) return {};
+    for (std::size_t jetty = worker; jetty < local_jettys_.size(); jetty += batch_worker_count_) {
+      if (completed[jetty] || job.queues[jetty].wrs.empty()) continue;
+      urma_jetty_cfg_t observed_cfg{};
+      urma_jetty_attr_t observed_attr{};
+      observed_attr.mask = JETTY_STATE;
+      const urma_status_t query_status =
+          urma_query_jetty(local_jettys_[jetty], &observed_cfg, &observed_attr);
+      return "timed out waiting for batch completion (jetty=" +
+             std::to_string(jetty) + ", jetty_query_status=" +
+             std::to_string(static_cast<int>(query_status)) + ", jetty_state=" +
+             std::to_string(static_cast<unsigned>(observed_attr.state)) + ")";
+    }
+    return "timed out waiting for batch completion";
   }
 
-  void BatchWorkerLoop(std::size_t jetty) {
+  void BatchWorkerLoop(std::size_t worker) {
     std::shared_ptr<BatchJob> last_job;
     for (;;) {
       std::shared_ptr<BatchJob> job;
@@ -142,13 +199,12 @@ struct CpuUrmaTransport::Impl {
         if (batch_stop_) return;
         job = active_batch_;
         last_job = job;
-        if (job->queues[jetty].wrs.empty()) continue;
         ++job->ready_workers;
         batch_cv_.notify_all();
         batch_cv_.wait(lock, [&] { return batch_stop_ || job->go; });
         if (batch_stop_) return;
       }
-      job->errors[jetty] = RunBatchQueue(*job, jetty);
+      job->errors[worker] = RunBatchWorker(*job, worker);
       {
         std::lock_guard<std::mutex> lock(batch_mutex_);
         ++job->done_workers;
@@ -159,9 +215,11 @@ struct CpuUrmaTransport::Impl {
 
   bool StartBatchWorkers(std::size_t count) {
     try {
-      batch_workers_.reserve(count);
-      for (std::size_t jetty = 0U; jetty < count; ++jetty) {
-        batch_workers_.emplace_back(&Impl::BatchWorkerLoop, this, jetty);
+      batch_workers_.reserve(count > 0U ? count - 1U : 0U);
+      // The caller executes worker 0. Only workers 1..N-1 need background
+      // threads, which avoids a context switch on every synchronous batch.
+      for (std::size_t worker = 1U; worker < count; ++worker) {
+        batch_workers_.emplace_back(&Impl::BatchWorkerLoop, this, worker);
       }
       return true;
     } catch (...) {
@@ -195,9 +253,10 @@ struct CpuUrmaTransport::Impl {
   Status Initialize(const CpuUrmaTransportOptions& options) {
     if (options.peer_address.empty() || options.region_bytes == 0 ||
         options.region_bytes > std::numeric_limits<std::size_t>::max() ||
-        options.jetty_count == 0U || options.jetty_count > kMaxJettyCount) {
+        options.jetty_count == 0U || options.jetty_count > kMaxJettyCount ||
+        options.worker_count == 0U || options.worker_count > options.jetty_count) {
       return Status::InvalidArgument(
-          "CPU URMA transport requires peer_address, non-zero region_bytes, and jetty_count in [1,16]");
+          "CPU URMA transport requires peer_address, non-zero region_bytes, jetty_count in [1,16], and worker_count in [1,jetty_count]");
     }
     options_ = options;
     // URMA is process-wide.  The ACL/HBM runtime may have initialized it
@@ -464,10 +523,11 @@ struct CpuUrmaTransport::Impl {
     jfr_ = jfrs_[0];
     local_jetty_ = local_jettys_[0];
     remote_jetty_ = remote_jettys_[0];
-    std::fprintf(stderr, "[KVAF_CPU_URMA] JETTYS_READY count=%zu depth=%u\n",
-                 local_jettys_.size(), kJettyDepth);
+    std::fprintf(stderr, "[KVAF_CPU_URMA] JETTYS_READY count=%zu workers=%u depth=%u\n",
+                 local_jettys_.size(), options.worker_count, kJettyDepth);
     batch_stop_ = false;
-    if (!StartBatchWorkers(local_jettys_.size())) {
+    batch_worker_count_ = options.worker_count;
+    if (!StartBatchWorkers(batch_worker_count_)) {
       return Status::Internal("failed to start Jetty worker threads");
     }
     initialized_ = true;
@@ -755,11 +815,8 @@ struct CpuUrmaTransport::Impl {
     auto job = std::make_shared<BatchJob>();
     job->write = write;
     job->queues.resize(jetty_count);
-    job->errors.resize(jetty_count);
-    job->active_workers = 0U;
-    for (const std::size_t queue_count : queue_counts) {
-      if (queue_count != 0U) ++job->active_workers;
-    }
+    job->errors.resize(batch_worker_count_);
+    job->active_workers = batch_worker_count_ - 1U;
     for (std::size_t jetty = 0U; jetty < jetty_count; ++jetty) {
       job->queues[jetty].local.resize(queue_counts[jetty]);
       job->queues[jetty].remote.resize(queue_counts[jetty]);
@@ -817,15 +874,19 @@ struct CpuUrmaTransport::Impl {
 
     job->start = std::chrono::steady_clock::now();
     job->deadline = job->start + std::chrono::seconds(5);
-    std::fprintf(stderr, "[KVAF_CPU_URMA] BATCH_POST wrs=%zu jettys=%zu bytes=%llu\n",
-                 count, jetty_count, static_cast<unsigned long long>(total));
-    {
+    std::fprintf(stderr, "[KVAF_CPU_URMA] BATCH_POST wrs=%zu jettys=%zu workers=%zu bytes=%llu\n",
+                 count, jetty_count, batch_worker_count_, static_cast<unsigned long long>(total));
+    if (job->active_workers != 0U) {
       std::unique_lock<std::mutex> lock(batch_mutex_);
       active_batch_ = job;
       batch_cv_.notify_all();
       batch_cv_.wait(lock, [&] { return job->ready_workers == job->active_workers; });
       job->go = true;
       batch_cv_.notify_all();
+    }
+    job->errors[0] = RunBatchWorker(*job, 0U);
+    if (job->active_workers != 0U) {
+      std::unique_lock<std::mutex> lock(batch_mutex_);
       batch_cv_.wait(lock, [&] { return job->done_workers == job->active_workers; });
       active_batch_.reset();
       batch_cv_.notify_all();
@@ -836,8 +897,8 @@ struct CpuUrmaTransport::Impl {
     const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - job->start).count();
     std::fprintf(stderr,
-                 "[KVAF_CPU_URMA] BATCH_COMPLETE wrs=%zu jettys=%zu bytes=%llu elapsed_ns=%lld\n",
-                 count, jetty_count, static_cast<unsigned long long>(total),
+                 "[KVAF_CPU_URMA] BATCH_COMPLETE wrs=%zu jettys=%zu workers=%zu bytes=%llu elapsed_ns=%lld\n",
+                 count, jetty_count, batch_worker_count_, static_cast<unsigned long long>(total),
                  static_cast<long long>(elapsed));
     return Status::OK();
   }
@@ -1014,6 +1075,7 @@ struct CpuUrmaTransport::Impl {
   std::condition_variable batch_cv_;
   std::shared_ptr<BatchJob> active_batch_;
   std::vector<std::thread> batch_workers_;
+  std::size_t batch_worker_count_{1U};
   bool batch_stop_{false};
   bool urma_initialized_{false};
   bool urma_owned_{false};

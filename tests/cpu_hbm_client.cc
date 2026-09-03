@@ -21,6 +21,8 @@ struct Options {
   std::size_t iterations{1};
   std::size_t warmup{1};
   std::uint32_t jetty_count{1};
+  std::uint32_t worker_count{1};
+  bool jetty_count_explicit{false};
   std::uint64_t host_space_bytes{0};
   std::uint64_t seed{0x6b766166ULL};
   std::string ub_device;
@@ -50,7 +52,7 @@ void Usage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s HOST[:PORT] [PORT] [--blocks N] [--block-bytes N] "
                "[--host-space-bytes N[K|M|G|T]] [--iterations N] [--warmup N] "
-               "[--jettys N|--threads N] [--seed N] [--ub-device NAME] "
+               "[--jettys N] [--threads N] [--seed N] [--ub-device NAME] "
                "[--eid-index N] [--device-id N]\n",
                program);
 }
@@ -99,8 +101,13 @@ bool Parse(int argc, char** argv, Options* options) {
       options->block_bytes = number;
     }
     else if (arg == "--host-space-bytes" && ParseBytes(value, &options->host_space_bytes)) {}
-    else if ((arg == "--jettys" || arg == "--jetty-count" || arg == "--threads") &&
-             ParseU32(value, &options->jetty_count)) {}
+    else if ((arg == "--jettys" || arg == "--jetty-count") &&
+             ParseU32(value, &options->jetty_count)) {
+      options->jetty_count_explicit = true;
+    }
+    else if (arg == "--threads" && ParseU32(value, &options->worker_count)) {
+      if (!options->jetty_count_explicit) options->jetty_count = options->worker_count;
+    }
     else if (arg == "--iterations" && ParseU64(value, &number)) options->iterations = number;
     else if (arg == "--warmup" && ParseU64(value, &number)) options->warmup = number;
     else if (arg == "--seed" && ParseU64(value, &options->seed)) {}
@@ -110,6 +117,7 @@ bool Parse(int argc, char** argv, Options* options) {
     else return false;
   }
   return options->blocks != 0 && options->block_bytes != 0 && options->iterations != 0 &&
+         options->worker_count != 0 && options->worker_count <= options->jetty_count &&
          options->blocks <= std::numeric_limits<std::uint64_t>::max() / options->block_bytes &&
          options->block_bytes <= std::numeric_limits<std::uint32_t>::max();
 }
@@ -217,7 +225,7 @@ int main(int argc, char** argv) {
                options.peer.c_str(), options.blocks, options.block_bytes,
                static_cast<unsigned long long>(total_bytes),
                static_cast<unsigned long long>(host_space_bytes), options.iterations,
-               options.warmup, options.jetty_count, options.jetty_count, options.device_id);
+               options.warmup, options.jetty_count, options.worker_count, options.device_id);
   std::fprintf(stderr, "[HBM_TEST][CPU] DATA_PATH=direct-registered-host-memory\n");
 
   kvaf::CpuUrmaTransportOptions transport_options;
@@ -230,6 +238,7 @@ int main(int argc, char** argv) {
   transport_options.remote_device_id = options.device_id;
   transport_options.remote_eid_index = options.has_eid_index ? options.eid_index : UINT32_MAX;
   transport_options.jetty_count = options.jetty_count;
+  transport_options.worker_count = options.worker_count;
   kvaf::CpuUrmaTransport transport;
   kvaf::Status status = transport.Initialize(transport_options);
   if (!status.ok()) {
