@@ -128,17 +128,26 @@ struct CpuUrmaTransport::Impl {
     for (std::size_t jetty = first_jetty; jetty < local_jettys_.size(); jetty += jetty_stride) {
       BatchQueue& queue = job.queues[jetty];
       if (queue.wrs.empty()) continue;
-      urma_jfs_wr_t* bad = nullptr;
-      const urma_status_t post_status =
-          urma_post_jetty_send_wr(local_jettys_[jetty], queue.wrs.data(), &bad);
-      if (post_status != URMA_SUCCESS) {
-        return "batch post failed (jetty=" + std::to_string(jetty) +
-               ", status=" + std::to_string(static_cast<int>(post_status)) +
-               ", bad_index=" +
-               std::to_string(bad == nullptr
-                                  ? queue.wrs.size()
-                                  : static_cast<std::size_t>(bad - queue.wrs.data())) +
-               ", count=" + std::to_string(queue.wrs.size()) + ")";
+      const std::size_t post_count = wqes_per_doorbell_ == 0U
+          ? queue.wrs.size() : static_cast<std::size_t>(wqes_per_doorbell_);
+      for (std::size_t begin = 0U; begin < queue.wrs.size(); begin += post_count) {
+        const std::size_t end = std::min(begin + post_count, queue.wrs.size());
+        // URMA follows next pointers, so terminate this chunk before posting.
+        // The next batch rebuilds the links; no provider-visible state depends
+        // on the host-side next pointer after the call returns.
+        queue.wrs[end - 1U].next = nullptr;
+        urma_jfs_wr_t* bad = nullptr;
+        const urma_status_t post_status =
+            urma_post_jetty_send_wr(local_jettys_[jetty], &queue.wrs[begin], &bad);
+        if (post_status != URMA_SUCCESS) {
+          return "batch post failed (jetty=" + std::to_string(jetty) +
+                 ", status=" + std::to_string(static_cast<int>(post_status)) +
+                 ", bad_index=" +
+                 std::to_string(bad == nullptr
+                                    ? end
+                                    : begin + static_cast<std::size_t>(bad - &queue.wrs[begin])) +
+                 ", count=" + std::to_string(queue.wrs.size()) + ")";
+        }
       }
     }
     // Match the AIV core path: all assigned queues are posted first, then one
@@ -246,7 +255,8 @@ struct CpuUrmaTransport::Impl {
     if (options.peer_address.empty() || options.region_bytes == 0 ||
         options.region_bytes > std::numeric_limits<std::size_t>::max() ||
         options.jetty_count == 0U || options.jetty_count > kMaxJettyCount ||
-        options.worker_count == 0U || options.worker_count > options.jetty_count) {
+        options.worker_count == 0U || options.worker_count > options.jetty_count ||
+        options.wqes_per_doorbell > kJettyDepth) {
       return Status::InvalidArgument(
           "CPU URMA transport requires peer_address, non-zero region_bytes, jetty_count in [1,16], and worker_count in [1,jetty_count]");
     }
@@ -515,12 +525,15 @@ struct CpuUrmaTransport::Impl {
     jfr_ = jfrs_[0];
     local_jetty_ = local_jettys_[0];
     remote_jetty_ = remote_jettys_[0];
-    std::fprintf(stderr, "[KVAF_CPU_URMA] JETTYS_READY count=%zu workers=%u mode=%s depth=%u\n",
-                 local_jettys_.size(), options.worker_count,
-                 options.aiv_thread_mode ? "aiv" : "prepare", kJettyDepth);
     batch_stop_ = false;
     batch_worker_count_ = options.worker_count;
     aiv_thread_mode_ = options.aiv_thread_mode;
+    wqes_per_doorbell_ = options.wqes_per_doorbell != 0U
+        ? options.wqes_per_doorbell
+        : (aiv_thread_mode_ ? 32U : 0U);
+    std::fprintf(stderr, "[KVAF_CPU_URMA] JETTYS_READY count=%zu workers=%u mode=%s wqes_per_doorbell=%zu depth=%u\n",
+                 local_jettys_.size(), options.worker_count,
+                 options.aiv_thread_mode ? "aiv" : "prepare", wqes_per_doorbell_, kJettyDepth);
     batch_workspace_.queues.resize(local_jettys_.size());
     const std::size_t queue_capacity =
         (kJettyDepth + local_jettys_.size() - 1U) / local_jettys_.size();
@@ -1073,6 +1086,7 @@ struct CpuUrmaTransport::Impl {
   std::vector<std::thread> batch_workers_;
   std::size_t batch_worker_count_{1U};
   bool aiv_thread_mode_{false};
+  std::size_t wqes_per_doorbell_{0U};
   bool batch_stop_{false};
   bool urma_initialized_{false};
   bool urma_owned_{false};

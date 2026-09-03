@@ -85,13 +85,17 @@ worker owns a disjoint set of Jettys end-to-end: it prepares the WRs, posts all
 of its assigned Jettys, and then polls one fence CQE from each Jetty. The main
 thread acts as worker 0, and the hot path has no ready/go barrier. Use this mode
 to determine whether the active liburma/provider can benefit from parallel
-independent Jetty producers; `prepare` remains the default baseline.
+independent Jetty producers; `prepare` remains the default baseline. In AIV
+mode, each Jetty is submitted in 32-WR chunks by default, approximating AIV's
+32-WQE post/doorbell cadence. Override this with `--doorbell-wqes N`; zero in
+`prepare` mode keeps one post call per Jetty. This is an API-level approximation:
+`urma_post_jetty_send_wr` may coalesce or implement doorbells internally.
 
 For example:
 
 ```bash
 tests/run_hbm_rw_client.sh <npu-host> 29888 \
   --blocks 1024 --block-bytes 656 --jettys 4 --threads 4 \
-  --thread-mode aiv \
+  --thread-mode aiv --doorbell-wqes 32 \
   --iterations 10 --warmup 1
 ```

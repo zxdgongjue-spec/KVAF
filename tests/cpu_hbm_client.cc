@@ -23,6 +23,7 @@ struct Options {
   std::uint32_t jetty_count{1};
   std::uint32_t worker_count{1};
   bool aiv_thread_mode{false};
+  std::uint32_t wqes_per_doorbell{0};
   bool jetty_count_explicit{false};
   std::uint64_t host_space_bytes{0};
   std::uint64_t seed{0x6b766166ULL};
@@ -54,6 +55,7 @@ void Usage(const char* program) {
                "Usage: %s HOST[:PORT] [PORT] [--blocks N] [--block-bytes N] "
                "[--host-space-bytes N[K|M|G|T]] [--iterations N] [--warmup N] "
                "[--jettys N] [--threads N] [--thread-mode prepare|aiv] "
+               "[--doorbell-wqes N] "
                "[--seed N] [--ub-device NAME] "
                "[--eid-index N] [--device-id N]\n",
                program);
@@ -115,6 +117,7 @@ bool Parse(int argc, char** argv, Options* options) {
       else if (std::string(value) == "prepare") options->aiv_thread_mode = false;
       else return false;
     }
+    else if (arg == "--doorbell-wqes" && ParseU32(value, &options->wqes_per_doorbell)) {}
     else if (arg == "--iterations" && ParseU64(value, &number)) options->iterations = number;
     else if (arg == "--warmup" && ParseU64(value, &number)) options->warmup = number;
     else if (arg == "--seed" && ParseU64(value, &options->seed)) {}
@@ -125,6 +128,7 @@ bool Parse(int argc, char** argv, Options* options) {
   }
   return options->blocks != 0 && options->block_bytes != 0 && options->iterations != 0 &&
          options->worker_count != 0 && options->worker_count <= options->jetty_count &&
+         options->wqes_per_doorbell <= 1024U &&
          options->blocks <= std::numeric_limits<std::uint64_t>::max() / options->block_bytes &&
          options->block_bytes <= std::numeric_limits<std::uint32_t>::max();
 }
@@ -248,6 +252,7 @@ int main(int argc, char** argv) {
   transport_options.jetty_count = options.jetty_count;
   transport_options.worker_count = options.worker_count;
   transport_options.aiv_thread_mode = options.aiv_thread_mode;
+  transport_options.wqes_per_doorbell = options.wqes_per_doorbell;
   kvaf::CpuUrmaTransport transport;
   kvaf::Status status = transport.Initialize(transport_options);
   if (!status.ok()) {

@@ -45,6 +45,9 @@ struct CpuUrmaTransportOptions {
   // When true, each worker owns its Jettys end-to-end: prepare, post, and CQ
   // polling. When false, workers only prepare WRs and the caller owns URMA IO.
   bool aiv_thread_mode{false};
+  // Number of WRs submitted per urma_post_jetty_send_wr call. Zero keeps one
+  // call per Jetty; AIV-style experiments typically use 32.
+  std::uint32_t wqes_per_doorbell{0};
   bool has_external_region{false};
   peer::PeerRegion external_region{};
 };
