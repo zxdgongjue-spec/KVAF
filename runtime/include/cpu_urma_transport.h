@@ -46,6 +46,9 @@ struct CpuUrmaTransportOptions {
   // polling. When false, workers only prepare WRs and the caller owns URMA IO.
   bool aiv_thread_mode{false};
   bool openmp_thread_mode{false};
+  // Number of OpenMP threads used only to prepare WR/SGE entries. Zero falls
+  // back to worker_count for compatibility with the original omp mode.
+  std::uint32_t omp_thread_count{0};
   // Number of WRs submitted per urma_post_jetty_send_wr call. Zero keeps one
   // call per Jetty; AIV-style experiments typically use 32.
   std::uint32_t wqes_per_doorbell{0};

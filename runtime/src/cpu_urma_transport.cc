@@ -126,7 +126,7 @@ struct CpuUrmaTransport::Impl {
 
   std::string PrepareBatchOpenMp(BatchJob& job) {
 #if defined(_OPENMP)
-#pragma omp parallel for schedule(static) num_threads(batch_worker_count_)
+#pragma omp parallel for schedule(static) num_threads(openmp_thread_count_)
     for (std::int64_t request = 0; request < static_cast<std::int64_t>(job.count); ++request) {
       const std::size_t index = static_cast<std::size_t>(request);
       const std::size_t jetty = index % local_jettys_.size();
@@ -297,10 +297,12 @@ struct CpuUrmaTransport::Impl {
     if (options.peer_address.empty() || options.region_bytes == 0 ||
         options.region_bytes > std::numeric_limits<std::size_t>::max() ||
         options.jetty_count == 0U || options.jetty_count > kMaxJettyCount ||
-        options.worker_count == 0U || options.worker_count > options.jetty_count ||
+        options.worker_count == 0U ||
+        (!options.openmp_thread_mode && options.worker_count > options.jetty_count) ||
+        options.omp_thread_count > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
         options.wqes_per_doorbell > kJettyDepth) {
       return Status::InvalidArgument(
-          "CPU URMA transport requires peer_address, non-zero region_bytes, jetty_count in [1,16], and worker_count in [1,jetty_count]");
+          "CPU URMA transport requires peer_address, non-zero region_bytes, jetty_count in [1,16], a non-zero worker_count (not greater than jetty_count outside omp mode), and omp_thread_count <= INT_MAX");
     }
     options_ = options;
     // URMA is process-wide.  The ACL/HBM runtime may have initialized it
@@ -571,11 +573,13 @@ struct CpuUrmaTransport::Impl {
     batch_worker_count_ = options.worker_count;
     aiv_thread_mode_ = options.aiv_thread_mode;
     openmp_thread_mode_ = options.openmp_thread_mode;
+    openmp_thread_count_ = options.omp_thread_count != 0U
+        ? options.omp_thread_count : options.worker_count;
     wqes_per_doorbell_ = options.wqes_per_doorbell != 0U
         ? options.wqes_per_doorbell
         : (aiv_thread_mode_ ? 32U : 0U);
-    std::fprintf(stderr, "[KVAF_CPU_URMA] JETTYS_READY count=%zu workers=%u mode=%s wqes_per_doorbell=%zu depth=%u\n",
-                 local_jettys_.size(), options.worker_count,
+    std::fprintf(stderr, "[KVAF_CPU_URMA] JETTYS_READY count=%zu workers=%u omp_threads=%u mode=%s wqes_per_doorbell=%zu depth=%u\n",
+                 local_jettys_.size(), options.worker_count, openmp_thread_count_,
                  options.openmp_thread_mode ? "omp" :
                      (options.aiv_thread_mode ? "aiv" : "prepare"),
                  wqes_per_doorbell_, kJettyDepth);
@@ -1136,6 +1140,7 @@ struct CpuUrmaTransport::Impl {
   BatchJob* active_batch_{nullptr};
   std::vector<std::thread> batch_workers_;
   std::size_t batch_worker_count_{1U};
+  std::uint32_t openmp_thread_count_{1U};
   bool aiv_thread_mode_{false};
   bool openmp_thread_mode_{false};
   std::size_t wqes_per_doorbell_{0U};

@@ -95,7 +95,11 @@ mode, each Jetty is submitted in 32-WR chunks by default, approximating AIV's
 entries. It does not call URMA from the OpenMP loop; submission and CQ polling
 remain serialized by the caller. The mode is available only when the CPU build
 finds OpenMP, and is intended to compare CPU-side WQE preparation against the
-persistent-worker and single-thread baselines.
+persistent-worker and single-thread baselines. Use `--omp-threads N` to control
+the OpenMP team independently of the Jetty count. If omitted, it falls back to
+`--threads N` for compatibility. For example, with `--jettys 1`,
+`--omp-threads 4`, and `--thread-mode omp`, four threads prepare the WQEs for one Jetty while the
+caller still serializes all URMA post/poll operations.
 
 For example:
 
