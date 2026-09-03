@@ -122,13 +122,18 @@ void LogBatchPutDeviceStatus(const BatchPutExecutionState& execution,
     std::fprintf(stderr,
                  "[KVAF_AIV] BATCH_PUT_DEVICE_ERROR core=%u magic=0x%llx "
                  "result=%llu processed=%llu failed_request=%llu cq_status=%llu "
-                 "cq_sub_status=%llu\n",
+                 "cq_sub_status=%llu completed_batches=%llu sq_pi=%llu cq_ci=%llu "
+                 "last_wqe=0x%llx\n",
                  core, static_cast<unsigned long long>(status.magic),
                  static_cast<unsigned long long>(status.result),
                  static_cast<unsigned long long>(status.processed_request_count),
                  static_cast<unsigned long long>(status.failed_request_index),
                  static_cast<unsigned long long>(status.cq_status),
-                 static_cast<unsigned long long>(status.cq_sub_status));
+                 static_cast<unsigned long long>(status.cq_sub_status),
+                 static_cast<unsigned long long>(status.completed_batch_count),
+                 static_cast<unsigned long long>(status.sq_producer_index),
+                 static_cast<unsigned long long>(status.cq_consumer_index),
+                 static_cast<unsigned long long>(status.last_wqe_protocol));
   }
 }
 #endif
