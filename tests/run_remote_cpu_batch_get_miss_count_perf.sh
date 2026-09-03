@@ -19,16 +19,14 @@ KVAF_BATCH_GET_MISS_COUNTS=(32 64 128 256 512 1024 2048 4096 8192)
   exit 1
 }
 
-# GetSystemCycle frequency is platform-specific. When this optional value is
-# supplied, cycles / MHz is also reported as microseconds.
-: "${KVAF_BATCH_GET_KERNEL_CLOCK_MHZ:=}"
-if [[ -n "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" ]]; then
-  if [[ ! "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] ||
-    ! awk -v value="$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" \
-      'BEGIN { exit !(value > 0) }'; then
-    echo "ERROR: KVAF_BATCH_GET_KERNEL_CLOCK_MHZ must be a positive number" >&2
-    exit 2
-  fi
+# GetSystemCycle frequency is platform-specific. Use 1000 MHz by default and
+# allow the target environment to override it for cycle-to-microsecond output.
+: "${KVAF_BATCH_GET_KERNEL_CLOCK_MHZ:=1000}"
+if [[ ! "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] ||
+  ! awk -v value="$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" \
+    'BEGIN { exit !(value > 0) }'; then
+  echo "ERROR: KVAF_BATCH_GET_KERNEL_CLOCK_MHZ must be a positive number" >&2
+  exit 2
 fi
 
 : "${KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR:=}"
@@ -56,10 +54,11 @@ extract_field() {
 
 token_bytes_values=()
 miss_count_values=()
-mean_cycles_values=()
-p50_cycles_values=()
-p90_cycles_values=()
-p99_cycles_values=()
+mean_us_values=()
+p50_us_values=()
+p90_us_values=()
+p99_us_values=()
+p50_gbps_values=()
 
 for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
   echo "BATCH_GET_TOKEN_SWEEP_BEGIN token_bytes=$token_bytes"
@@ -91,10 +90,19 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
     p99_cycles="$(extract_field "$profile_result" p99_cycles)"
     token_bytes_values+=("$token_bytes")
     miss_count_values+=("$miss_count")
-    mean_cycles_values+=("$mean_cycles")
-    p50_cycles_values+=("$p50_cycles")
-    p90_cycles_values+=("$p90_cycles")
-    p99_cycles_values+=("$p99_cycles")
+    mean_us="$(awk -v cycles="$mean_cycles" -v mhz="$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" 'BEGIN { printf "%.3f", cycles / mhz }')"
+    p50_us="$(awk -v cycles="$p50_cycles" -v mhz="$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" 'BEGIN { printf "%.3f", cycles / mhz }')"
+    p90_us="$(awk -v cycles="$p90_cycles" -v mhz="$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" 'BEGIN { printf "%.3f", cycles / mhz }')"
+    p99_us="$(awk -v cycles="$p99_cycles" -v mhz="$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" 'BEGIN { printf "%.3f", cycles / mhz }')"
+    payload_bytes=$((miss_count * token_bytes))
+    p50_gbps="$(awk -v byte_count="$payload_bytes" -v cycle_count="$p50_cycles" \
+      -v mhz="$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" \
+      'BEGIN { printf "%.3f", (cycle_count > 0 ? byte_count * mhz / cycle_count / 1000 : 0) }')"
+    mean_us_values+=("$mean_us")
+    p50_us_values+=("$p50_us")
+    p90_us_values+=("$p90_us")
+    p99_us_values+=("$p99_us")
+    p50_gbps_values+=("$p50_gbps")
 
     result=(
       "BATCH_GET_MISS_SWEEP_RESULT"
@@ -104,40 +112,33 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
       "p50_cycles=$p50_cycles"
       "p90_cycles=$p90_cycles"
       "p99_cycles=$p99_cycles"
+      "clock_mhz=$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ"
+      "mean_us=$mean_us"
+      "p50_us=$p50_us"
+      "p90_us=$p90_us"
+      "p99_us=$p99_us"
+      "payload_bytes=$payload_bytes"
+      "p50_GBps=$p50_gbps"
     )
-    if [[ -n "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" ]]; then
-      mean_us="$(awk -v cycles="$mean_cycles" -v mhz="$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" 'BEGIN { printf "%.3f", cycles / mhz }')"
-      p50_us="$(awk -v cycles="$p50_cycles" -v mhz="$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" 'BEGIN { printf "%.3f", cycles / mhz }')"
-      p90_us="$(awk -v cycles="$p90_cycles" -v mhz="$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" 'BEGIN { printf "%.3f", cycles / mhz }')"
-      p99_us="$(awk -v cycles="$p99_cycles" -v mhz="$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" 'BEGIN { printf "%.3f", cycles / mhz }')"
-      result+=(
-        "clock_mhz=$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ"
-        "mean_us=$mean_us"
-        "p50_us=$p50_us"
-        "p90_us=$p90_us"
-        "p99_us=$p99_us"
-      )
-    fi
     printf '%s\n' "${result[*]}"
     echo "BATCH_GET_MISS_SWEEP_DONE token_bytes=$token_bytes miss_count=$miss_count"
   done
   echo "BATCH_GET_TOKEN_SWEEP_DONE token_bytes=$token_bytes"
 done
 
-printf '\nBATCH_GET_MISS_SWEEP_SUMMARY combinations=%s units=cycles aggregation=max_elapsed_across_cores\n' \
-  "${#mean_cycles_values[@]}"
-printf '%-12s %-12s %15s %15s %15s %15s\n' \
-  token_bytes miss_count mean_cycles p50_cycles p90_cycles p99_cycles
-for index in "${!mean_cycles_values[@]}"; do
-  printf '%-12s %-12s %15s %15s %15s %15s\n' \
+printf '\nBATCH_GET_MISS_SWEEP_SUMMARY combinations=%s units=us clock_mhz=%s aggregation=max_elapsed_across_cores\n' \
+  "${#mean_us_values[@]}" "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ"
+printf '%-12s %-12s %15s %15s %15s %15s %15s\n' \
+  token_bytes miss_count mean_us p50_us p90_us p99_us p50_GB/s
+for index in "${!mean_us_values[@]}"; do
+  printf '%-12s %-12s %15s %15s %15s %15s %15s\n' \
     "${token_bytes_values[$index]}" \
     "${miss_count_values[$index]}" \
-    "${mean_cycles_values[$index]}" \
-    "${p50_cycles_values[$index]}" \
-    "${p90_cycles_values[$index]}" \
-    "${p99_cycles_values[$index]}"
+    "${mean_us_values[$index]}" \
+    "${p50_us_values[$index]}" \
+    "${p90_us_values[$index]}" \
+    "${p99_us_values[$index]}" \
+    "${p50_gbps_values[$index]}"
 done
 
-if [[ -n "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" ]]; then
-  echo "BATCH_GET_MISS_SWEEP_CLOCK clock_mhz=$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ conversion=cycles_per_mhz_to_us"
-fi
+echo "BATCH_GET_MISS_SWEEP_CLOCK clock_mhz=$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ conversion=cycles_per_mhz_to_us"
