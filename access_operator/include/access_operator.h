@@ -49,6 +49,11 @@ struct AccessOperatorConfig {
   std::uint32_t npu_core_count{0};
   // Direct-HCCP Jettys assigned to each AIV core.
   std::uint32_t jettys_per_core{2};
+  // Preserve the MTP BatchGet ABI end-to-end.  A forward-resident control
+  // publishes these values verbatim to its device executor instead of
+  // assuming any second descriptor layout.
+  std::uint32_t batch_get_token_bytes{0};
+  std::uint32_t batch_get_tokens_per_block{0};
   // Runtime supplies the selected local EID. Operator transports consume it;
   // they do not discover EIDs or make topology decisions.
   std::array<std::uint8_t, 16> peer_local_eid{};
@@ -67,6 +72,32 @@ struct BatchGetKernelProfile {
   std::uint64_t total_posts{0};
   std::array<std::uint64_t, 2> jetty_completion_wait_cycles{};
   std::array<std::uint64_t, 2> jetty_completion_polls{};
+};
+
+// Cold binding for one forward-owned MTP resident payload.  `output` is
+// registered exactly once with Direct-HCCP and the device executor may write
+// only the caller-reserved [resident_row_base, resident_row_base +
+// resident_row_count) interval.  The caller retains all tensors until the
+// enclosing forward has drained its terminal CQ work and QSFA has consumed
+// the fixed rows.
+struct LayerResidentBatchGetBinding {
+  std::uint32_t layer_id{0};
+  MutableBufferView output;
+  MutableBufferView control;
+  std::uint32_t resident_row_base{0};
+  std::uint32_t resident_row_count{0};
+};
+
+// One queue-local descriptor vector set.  `miss_count` is an NPU int32[1]
+// compact-prefix counter; it is not a per-request bitmap.
+struct LayerResidentBatchGetQueueTemplate {
+  std::uint32_t queue_id{0};
+  MutableBufferView address_table;
+  MutableBufferView valid_table;
+  MutableBufferView indices;
+  MutableBufferView offsets;
+  MutableBufferView miss_count;
+  MutableBufferView output_indices;
 };
 
 // Default synchronous NPU data-plane implementation.
@@ -99,6 +130,17 @@ class DefaultAccessOperator final : public AccessOperator {
   Status SetBatchGetKernelProfiling(bool enabled);
   Status CopyBatchGetKernelProfiles(
       std::vector<BatchGetKernelProfile>* profiles) const;
+
+  // MTP forward-resident Direct-HCCP API.  These are cold setup/teardown
+  // operations only: the fused device operator owns PostOnly/CQ polling on
+  // its graph streams; there is no Python/GIL hot submit path.
+  Status BindLayerResidentBatchGetControl(
+      const LayerResidentBatchGetBinding& binding,
+      const MutableBufferView& queue_leases, std::uint32_t queue_count);
+  Status ConfigureLayerResidentBatchGetQueueTemplates(
+      const std::vector<LayerResidentBatchGetQueueTemplate>& queues);
+  Status ReleaseLayerResidentBatchGetControl();
+  Status DescribeLayerResidentBatchGetControl(std::string* diagnostic) const;
 
  private:
   struct Impl;

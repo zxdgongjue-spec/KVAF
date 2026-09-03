@@ -372,6 +372,8 @@ struct NpuRuntime::Impl {
     config.batch_put_kernel_object_path = options.batch_put_kernel_object_path;
     config.npu_core_count = options.npu_core_count;
     config.jettys_per_core = options.jettys_per_core;
+    config.batch_get_token_bytes = options.batch_get_token_bytes;
+    config.batch_get_tokens_per_block = options.batch_get_tokens_per_block;
   }
 
   void CreateCore() {
@@ -572,6 +574,45 @@ Status NpuRuntime::CopyBatchGetKernelProfiles(
         "NpuRuntime requires LinkTo before reading BatchGet profiling");
   }
   return impl_->access_operator->CopyBatchGetKernelProfiles(profiles);
+}
+
+Status NpuRuntime::BindLayerResidentBatchGetControl(
+    const LayerResidentBatchGetBinding& binding,
+    const MutableBufferView& queue_leases, std::uint32_t queue_count) {
+  if (impl_->access_operator == nullptr) {
+    return Status::NotInitialized(
+        "NpuRuntime requires LinkTo before binding layer-resident BatchGet");
+  }
+  return impl_->access_operator->BindLayerResidentBatchGetControl(
+      binding, queue_leases, queue_count);
+}
+
+Status NpuRuntime::ConfigureLayerResidentBatchGetQueueTemplates(
+    const std::vector<LayerResidentBatchGetQueueTemplate>& queues) {
+  if (impl_->access_operator == nullptr) {
+    return Status::NotInitialized(
+        "NpuRuntime requires LinkTo before configuring layer-resident BatchGet");
+  }
+  return impl_->access_operator->ConfigureLayerResidentBatchGetQueueTemplates(
+      queues);
+}
+
+Status NpuRuntime::ReleaseLayerResidentBatchGetControl() {
+  if (impl_->access_operator == nullptr) {
+    return Status::NotInitialized(
+        "NpuRuntime requires LinkTo before releasing layer-resident BatchGet");
+  }
+  return impl_->access_operator->ReleaseLayerResidentBatchGetControl();
+}
+
+Status NpuRuntime::DescribeLayerResidentBatchGetControl(
+    std::string* diagnostic) const {
+  if (impl_->access_operator == nullptr) {
+    return Status::NotInitialized(
+        "NpuRuntime requires LinkTo before describing layer-resident BatchGet");
+  }
+  return impl_->access_operator->DescribeLayerResidentBatchGetControl(
+      diagnostic);
 }
 
 Status NpuRuntime::AcceptLink(const LinkTarget&) {

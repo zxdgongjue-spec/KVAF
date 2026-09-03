@@ -10,6 +10,13 @@ enum {
   KVAF_AIV_BATCH_GET_QUEUE_STATE_BYTES = 64,
   KVAF_AIV_BATCH_GET_MAX_AIV_CORES = 48,
   KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE = 2,
+  // One cold-bound, graph-visible control for the MTP forward-resident
+  // Direct-HCCP route.  This deliberately keeps the deployed MTP BatchGet
+  // wire ABI below (miss_count + token_bytes + tokens_per_block); it is not
+  // compatible with the later mask/block_bytes experimental ABI.
+  KVAF_LAYER_RESIDENT_BATCH_GET_CONTROL_WORDS = 16,
+  KVAF_LAYER_RESIDENT_BATCH_GET_CONTROL_BYTES =
+      KVAF_LAYER_RESIDENT_BATCH_GET_CONTROL_WORDS * sizeof(uint64_t),
   // Shared local-memory contract used by the AIV kernel and launcher.
   KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES = 160 * 1024,
 };
@@ -17,6 +24,9 @@ enum {
 static const uint64_t KVAF_AIV_BATCH_GET_STATUS_MAGIC = 0x4b5641464247444fULL;
 static const uint64_t KVAF_AIV_BATCH_GET_PROFILE_MAGIC =
     0x4b56414650524f46ULL;  // "KVAFPROF"
+static const uint64_t KVAF_LAYER_RESIDENT_BATCH_GET_CONTROL_MAGIC =
+    0x4b5641464d545052ULL;  // "KVAFMTPR"
+static const uint64_t KVAF_LAYER_RESIDENT_BATCH_GET_CONTROL_VERSION = 1ULL;
 
 // Optional, per-core kernel timeline. The host enables collection by placing
 // KVAF_AIV_BATCH_GET_PROFILE_MAGIC in `magic` before launch. The kernel keeps
@@ -125,6 +135,49 @@ typedef struct KvafExecuteBatchGetKernelArgs {
   uint32_t jettys_per_core;
 } KvafExecuteBatchGetKernelArgs;
 
+// One graph-stable descriptor template for one Direct-HCCP queue in the MTP
+// forward-resident route.  Every vector has the already deployed 112-byte
+// ExecuteBatchGet ABI: `miss_count` is an NPU int32[1] written by the device
+// executor, while token_bytes and tokens_per_block stay part of the cold
+// control.  Do not replace miss_count with a mask here: MTP graph validation
+// and the AIV kernel both consume the compact prefix count.
+typedef struct KvafLayerResidentBatchGetDescriptorScratch {
+  uint64_t address_table;
+  uint64_t valid_table;
+  uint64_t indices;
+  uint64_t offsets;
+  uint64_t miss_count;
+  uint64_t output_indices;
+  uint32_t table_capacity;
+  uint32_t request_capacity;
+  uint32_t token_bytes;
+  uint32_t tokens_per_block;
+} KvafLayerResidentBatchGetDescriptorScratch;
+
+// Cold-bound Direct-HCCP state for one forward-owned MTP resident payload.
+// Rows in [resident_row_base, resident_row_base + resident_row_count) are
+// fixed by the caller before the forward starts; the device executor may only
+// populate those rows.  The queue lease table protects only SQ/CQ ownership.
+// It never owns, clears, remaps, or recycles resident rows.
+typedef struct KvafLayerResidentBatchGetControl {
+  uint64_t magic;
+  uint64_t version;
+  uint64_t channel_entity;
+  uint64_t queue_state;
+  uint64_t core_status;
+  uint64_t output;
+  uint64_t queue_leases;
+  uint64_t descriptor_templates;
+  uint64_t queue_count;
+  uint64_t output_rows;
+  uint64_t resident_row_base;
+  uint64_t resident_row_count;
+  uint64_t jettys_per_core;
+  uint64_t token_bytes;
+  uint64_t tokens_per_block;
+  uint64_t descriptor_template_count;
+} KvafLayerResidentBatchGetControl;
+
 #if defined(__cplusplus)
 static_assert(sizeof(KvafBatchGetCoreStatus) == KVAF_AIV_BATCH_GET_STATUS_BYTES,
               "KvafBatchGetCoreStatus ABI changed");
@@ -136,6 +189,11 @@ static_assert(sizeof(KvafBatchGetDirectUrmaEntity) == 192,
               "KvafBatchGetDirectUrmaEntity ABI changed");
 static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 112,
               "KvafExecuteBatchGetKernelArgs ABI changed");
+static_assert(sizeof(KvafLayerResidentBatchGetDescriptorScratch) == 64,
+              "KvafLayerResidentBatchGetDescriptorScratch ABI changed");
+static_assert(sizeof(KvafLayerResidentBatchGetControl) ==
+                  KVAF_LAYER_RESIDENT_BATCH_GET_CONTROL_BYTES,
+              "KvafLayerResidentBatchGetControl ABI changed");
 #endif
 
 #endif  // KVAF_AIV_BATCH_GET_ABI_H_

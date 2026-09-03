@@ -369,6 +369,221 @@ class NpuPythonRuntime final {
                  miss_count, output_indices, output, stream, synchronize);
   }
 
+  // Cold-bind a forward-owned canonical resident payload.  This method does
+  // not issue a Get: it publishes the MTP 112-byte BatchGet ABI state that a
+  // graph-resident device executor later consumes with PostOnly/CQ drain.
+  // Keeping this registration separate from BatchGet prevents Python/GIL
+  // submission from entering the score-tile hot path.
+  void BindLayerResidentBatchGetControl(
+      std::uint32_t layer_id, const py::object& resident_payload,
+      const py::object& control, std::uint32_t slot_base,
+      std::uint32_t slot_count, const py::object& queue_leases,
+      std::uint32_t queue_count, const py::object& producer_stream) {
+    if (!Initialized()) {
+      throw std::runtime_error("Runtime has not been initialized");
+    }
+    if (layer_resident_batch_get_control_bound_) {
+      throw py::value_error(
+          "layer-resident BatchGet control is already bound; release after "
+          "the forward terminal before rebinding");
+    }
+    const NpuTensorView payload_view = GetNpuTensorView(
+        resident_payload, "layer-resident resident_payload");
+    const NpuTensorView control_view = GetNpuTensorView(
+        control, "layer-resident BatchGet control");
+    const NpuTensorView leases_view = GetNpuTensorView(
+        queue_leases, "layer-resident BatchGet queue_leases");
+    const std::uint32_t token_bytes = native_->batch_get_token_bytes();
+    if (token_bytes == 0U || payload_view.shape.size() < 1U ||
+        payload_view.shape.front() <= 0 ||
+        payload_view.bytes % token_bytes != 0U ||
+        payload_view.bytes / token_bytes !=
+            static_cast<std::uint64_t>(payload_view.shape.front())) {
+      throw py::value_error(
+          "layer-resident resident_payload must have one full MTP token row "
+          "per first-dimension slot");
+    }
+    const std::uint64_t payload_rows = payload_view.bytes / token_bytes;
+    if (payload_rows > std::numeric_limits<std::uint32_t>::max() ||
+        slot_count == 0U || slot_base >= payload_rows ||
+        slot_count > payload_rows - slot_base) {
+      throw py::value_error(
+          "layer-resident slot_base/slot_count must select a non-empty fixed "
+          "interval inside resident_payload");
+    }
+    if (control_view.shape.size() != 1U ||
+        control_view.shape.front() != 16 ||
+        control_view.element_bytes != sizeof(std::uint64_t) ||
+        py::str(control.attr("dtype")).cast<std::string>() != "torch.int64") {
+      throw py::value_error(
+          "layer-resident control must be contiguous NPU torch.int64[16]");
+    }
+    if (leases_view.shape.size() != 1U ||
+        leases_view.shape.front() != static_cast<py::ssize_t>(queue_count) ||
+        leases_view.element_bytes != sizeof(std::int32_t) ||
+        py::str(queue_leases.attr("dtype")).cast<std::string>() !=
+            "torch.int32") {
+      throw py::value_error(
+          "layer-resident queue_leases must be contiguous NPU "
+          "torch.int32[queue_count]");
+    }
+
+    // Inputs normally originate from torch.zeros/current-stream initialization.
+    // The cold fence makes that producer visible before raw ACL registration
+    // and control publication; it is never called from device tile execution.
+    ThrowIfAclError(aclrtSynchronizeStream(ResolveStream(producer_stream)),
+                    "aclrtSynchronizeStream before layer-resident BatchGet bind");
+    ThrowIfError(native_->BindLayerResidentBatchGetControl(
+        LayerResidentBatchGetBinding{
+            layer_id,
+            MutableBufferView{payload_view.data, payload_view.bytes,
+                              DeviceKind::kNpu},
+            MutableBufferView{control_view.data, control_view.bytes,
+                              DeviceKind::kNpu},
+            slot_base,
+            slot_count},
+        MutableBufferView{leases_view.data, leases_view.bytes,
+                          DeviceKind::kNpu},
+        queue_count));
+    layer_resident_batch_get_control_bound_ = true;
+    layer_resident_batch_get_payload_keepalive_ = resident_payload;
+    layer_resident_batch_get_control_keepalive_ = control;
+    layer_resident_batch_get_queue_leases_keepalive_ = queue_leases;
+  }
+
+  // Publish one immutable descriptor-template record per queue.  MTP's
+  // ExecuteBatchGet ABI uses a compact prefix length (`miss_counts[q]` is
+  // torch.int32[1]) rather than a per-request bitmap.
+  void ConfigureLayerResidentBatchGetQueueTemplates(
+      const py::sequence& queue_ids, const py::sequence& address_tables,
+      const py::sequence& valid_tables, const py::sequence& indices,
+      const py::sequence& offsets, const py::sequence& miss_counts,
+      const py::sequence& output_indices, const py::object& producer_stream) {
+    if (!Initialized() || !layer_resident_batch_get_control_bound_) {
+      throw py::value_error(
+          "layer-resident descriptor templates require a bound control");
+    }
+    const py::ssize_t count = py::len(queue_ids);
+    if (count <= 0 || py::len(address_tables) != count ||
+        py::len(valid_tables) != count || py::len(indices) != count ||
+        py::len(offsets) != count || py::len(miss_counts) != count ||
+        py::len(output_indices) != count) {
+      throw py::value_error(
+          "layer-resident template sequences must be non-empty and "
+          "equal-length");
+    }
+    const auto checked_queue_id = [](const py::object& value) {
+      const py::ssize_t converted = value.cast<py::ssize_t>();
+      if (converted < 0 ||
+          static_cast<std::uint64_t>(converted) >
+              std::numeric_limits<std::uint32_t>::max()) {
+        throw py::value_error("layer-resident queue_id must fit uint32");
+      }
+      return static_cast<std::uint32_t>(converted);
+    };
+    const auto validate_vector = [](const NpuTensorView& view,
+                                    const py::object& tensor,
+                                    std::size_t element_bytes,
+                                    const char* dtype,
+                                    const std::string& label) {
+      if (view.shape.size() != 1U || view.element_bytes != element_bytes ||
+          py::str(tensor.attr("dtype")).cast<std::string>() != dtype) {
+        throw py::value_error(label + " must be a contiguous one-dimensional " +
+                              std::string(dtype) + " NPU Tensor");
+      }
+    };
+
+    std::vector<LayerResidentBatchGetQueueTemplate> templates;
+    std::vector<py::object> keepalives;
+    templates.reserve(static_cast<std::size_t>(count));
+    keepalives.reserve(static_cast<std::size_t>(count) * 6U);
+    for (py::ssize_t index = 0; index < count; ++index) {
+      const std::uint32_t queue_id =
+          checked_queue_id(queue_ids[index].cast<py::object>());
+      py::object address_table = address_tables[index].cast<py::object>();
+      py::object valid_table = valid_tables[index].cast<py::object>();
+      py::object index_vector = indices[index].cast<py::object>();
+      py::object offset_vector = offsets[index].cast<py::object>();
+      py::object miss_count = miss_counts[index].cast<py::object>();
+      py::object output_index_vector =
+          output_indices[index].cast<py::object>();
+      const std::string label =
+          "layer-resident descriptor queue=" + std::to_string(queue_id);
+      const NpuTensorView address_view =
+          GetNpuTensorView(address_table, (label + " address_table").c_str());
+      const NpuTensorView valid_view =
+          GetNpuTensorView(valid_table, (label + " valid_table").c_str());
+      const NpuTensorView index_view =
+          GetNpuTensorView(index_vector, (label + " indices").c_str());
+      const NpuTensorView offset_view =
+          GetNpuTensorView(offset_vector, (label + " offsets").c_str());
+      const NpuTensorView miss_count_view =
+          GetNpuTensorView(miss_count, (label + " miss_count").c_str());
+      const NpuTensorView output_index_view = GetNpuTensorView(
+          output_index_vector, (label + " output_indices").c_str());
+      validate_vector(address_view, address_table, sizeof(std::uint64_t),
+                      "torch.int64", label + " address_table");
+      validate_vector(valid_view, valid_table, sizeof(std::uint8_t),
+                      "torch.uint8", label + " valid_table");
+      validate_vector(index_view, index_vector, sizeof(std::int32_t),
+                      "torch.int32", label + " indices");
+      validate_vector(offset_view, offset_vector, sizeof(std::int32_t),
+                      "torch.int32", label + " offsets");
+      validate_vector(miss_count_view, miss_count, sizeof(std::int32_t),
+                      "torch.int32", label + " miss_count");
+      if (miss_count_view.bytes != sizeof(std::int32_t)) {
+        throw py::value_error(label + " miss_count must be torch.int32[1]");
+      }
+      validate_vector(output_index_view, output_index_vector,
+                      sizeof(std::int32_t), "torch.int32",
+                      label + " output_indices");
+      templates.push_back(LayerResidentBatchGetQueueTemplate{
+          queue_id,
+          MutableBufferView{address_view.data, address_view.bytes,
+                            DeviceKind::kNpu},
+          MutableBufferView{valid_view.data, valid_view.bytes,
+                            DeviceKind::kNpu},
+          MutableBufferView{index_view.data, index_view.bytes,
+                            DeviceKind::kNpu},
+          MutableBufferView{offset_view.data, offset_view.bytes,
+                            DeviceKind::kNpu},
+          MutableBufferView{miss_count_view.data, miss_count_view.bytes,
+                            DeviceKind::kNpu},
+          MutableBufferView{output_index_view.data, output_index_view.bytes,
+                            DeviceKind::kNpu}});
+      keepalives.push_back(std::move(address_table));
+      keepalives.push_back(std::move(valid_table));
+      keepalives.push_back(std::move(index_vector));
+      keepalives.push_back(std::move(offset_vector));
+      keepalives.push_back(std::move(miss_count));
+      keepalives.push_back(std::move(output_index_vector));
+    }
+    ThrowIfAclError(
+        aclrtSynchronizeStream(ResolveStream(producer_stream)),
+        "aclrtSynchronizeStream before layer-resident template configure");
+    ThrowIfError(native_->ConfigureLayerResidentBatchGetQueueTemplates(
+        templates));
+    layer_resident_batch_get_template_keepalives_ = std::move(keepalives);
+  }
+
+  void ReleaseLayerResidentBatchGetControl() {
+    if (!layer_resident_batch_get_control_bound_) {
+      return;
+    }
+    ThrowIfError(native_->ReleaseLayerResidentBatchGetControl());
+    layer_resident_batch_get_control_bound_ = false;
+    layer_resident_batch_get_payload_keepalive_ = py::none();
+    layer_resident_batch_get_control_keepalive_ = py::none();
+    layer_resident_batch_get_queue_leases_keepalive_ = py::none();
+    layer_resident_batch_get_template_keepalives_.clear();
+  }
+
+  std::string LayerResidentBatchGetControlDiagnostic() const {
+    std::string diagnostic;
+    ThrowIfError(native_->DescribeLayerResidentBatchGetControl(&diagnostic));
+    return diagnostic;
+  }
+
  private:
   void BatchGetImpl(const AccessTableHandle& access_table,
                     const py::object& addresses, const py::object& valid,
@@ -436,6 +651,11 @@ class NpuPythonRuntime final {
 
  private:
   std::unique_ptr<::kvaf::NpuRuntime> native_;
+  bool layer_resident_batch_get_control_bound_{false};
+  py::object layer_resident_batch_get_payload_keepalive_{py::none()};
+  py::object layer_resident_batch_get_control_keepalive_{py::none()};
+  py::object layer_resident_batch_get_queue_leases_keepalive_{py::none()};
+  std::vector<py::object> layer_resident_batch_get_template_keepalives_;
 };
 
 }  // namespace
@@ -497,6 +717,37 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("stop_batch_get_kernel_profile",
            &NpuPythonRuntime::StopBatchGetKernelProfile,
            "Copy the latest timeline and disable BatchGet kernel profiling.")
+      .def("bind_layer_resident_batch_get_control",
+           &NpuPythonRuntime::BindLayerResidentBatchGetControl,
+           py::arg("layer_id"), py::arg("resident_payload"),
+           py::arg("control"), py::arg("slot_base"), py::arg("slot_count"),
+           py::arg("queue_leases"), py::arg("queue_count"),
+           py::arg("stream") = py::none(),
+           "Cold-bind one layer's fixed resident payload interval and a "
+           "graph-visible NPU torch.int64[16] MTP control. resident_payload "
+           "has one batch_get_token_bytes row per slot; slot_base/slot_count "
+           "select rows the device executor may populate. queue_leases is "
+           "NPU torch.int32[queue_count]. This method never posts a Get from "
+           "Python; PostOnly/CQ drain remain in the device graph.")
+      .def("configure_layer_resident_batch_get_queue_templates",
+           &NpuPythonRuntime::ConfigureLayerResidentBatchGetQueueTemplates,
+           py::arg("queue_ids"), py::arg("address_tables"),
+           py::arg("valid_tables"), py::arg("indices"), py::arg("offsets"),
+           py::arg("miss_counts"), py::arg("output_indices"),
+           py::arg("stream") = py::none(),
+           "Cold-publish one MTP 112-byte BatchGet descriptor template per "
+           "queue. queue_ids cover the pool exactly once. addresses are NPU "
+           "torch.int64 vectors, valid is torch.uint8, indices/offsets/"
+           "output_indices are torch.int32 vectors, and miss_counts are "
+           "torch.int32[1] compact-prefix counters (not masks).")
+      .def("release_layer_resident_batch_get_control",
+           &NpuPythonRuntime::ReleaseLayerResidentBatchGetControl,
+           "Release the cold Direct-HCCP registration only after the forward "
+           "has terminally drained every queue lease. Resident payload slots "
+           "are caller-owned and never cleared or remapped by KVAF.")
+      .def("layer_resident_batch_get_control_diagnostic",
+           &NpuPythonRuntime::LayerResidentBatchGetControlDiagnostic,
+           "Return the MTP layer-resident cold binding diagnostic.")
       .def("batch_get", &NpuPythonRuntime::BatchGet,
            py::arg("device_access_table"), py::arg("indices"), py::arg("offsets"),
            py::arg("miss_count"),

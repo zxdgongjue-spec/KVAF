@@ -53,6 +53,17 @@ class NpuRuntime final : public Runtime {
   Status CopyBatchGetKernelProfiles(
       std::vector<BatchGetKernelProfile>* profiles) const;
 
+  // Cold MTP forward-resident Direct-HCCP setup.  The Python binding retains
+  // ownership of the graph tensors; Runtime only registers the fixed output
+  // range and publishes the 112-byte BatchGet ABI control/template records.
+  Status BindLayerResidentBatchGetControl(
+      const LayerResidentBatchGetBinding& binding,
+      const MutableBufferView& queue_leases, std::uint32_t queue_count);
+  Status ConfigureLayerResidentBatchGetQueueTemplates(
+      const std::vector<LayerResidentBatchGetQueueTemplate>& queues);
+  Status ReleaseLayerResidentBatchGetControl();
+  Status DescribeLayerResidentBatchGetControl(std::string* diagnostic) const;
+
   Status LinkTo(const LinkTarget& target) override;
   Status AcceptLink(const LinkTarget& peer) override;
   Status ReleaseLink(LinkId link_id) override;
