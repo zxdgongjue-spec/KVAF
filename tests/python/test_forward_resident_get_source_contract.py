@@ -18,6 +18,7 @@ DEVICE = (
     ROOT
     / "access_operator/demo/aiv_batch_get/kernel/kvaf_forward_resident_get_device.h"
 )
+DENSE = ROOT / "access_operator/demo/aiv_batch_get/kernel/execute_batch_get_aiv.asc"
 HOST = ROOT / "access_operator/src/access_operator.cc"
 PUBLIC = ROOT / "access_operator/include/kvaf/access_operator/access_operator.h"
 
@@ -31,6 +32,7 @@ def _between(text: str, start: str, end: str) -> str:
 def main() -> None:
     abi = ABI.read_text()
     device = DEVICE.read_text()
+    dense = DENSE.read_text()
     host = HOST.read_text()
     public = PUBLIC.read_text()
 
@@ -67,7 +69,8 @@ def main() -> None:
     )
     assert "resident_row_base" in validation
     assert "resident_end" in validation
-    assert "output_indices[earlier] == row" in validation
+    assert "ReadGmByPassDCache<int32_t>" in validation
+    assert "output_indices + earlier" in validation
 
     queue_args = _between(
         device,
@@ -91,6 +94,64 @@ def main() -> None:
     assert begin.index("PublishKvafForwardResidentDescriptor(") < begin.index(
         "BuildKvafForwardResidentQueueArgs("
     )
+
+    append = _between(
+        device,
+        "__aicore__ inline void PrepareKvafForwardResidentDescriptorVectorsForPublication(",
+        "// `BeginKvafForwardResidentBatchGet`",
+    )
+    # AICore publishes the dense vectors that a SIMT `asc_ldcg` reader
+    # materializes into HCCP WQEs.  Keep both sides on the non-DCache path;
+    # ordinary stores can expose a prior descriptor generation after reuse.
+    for token in (
+        "PrepareKvafForwardResidentDescriptorVectorsForPublication(*descriptor)",
+        "WriteGmByPassDCache<int32_t>(indices + request",
+        "WriteGmByPassDCache<int32_t>(offsets + request",
+        "WriteGmByPassDCache<uint8_t>(mask + request, 1U)",
+        "WriteGmByPassDCache<int32_t>(output_indices + request",
+    ):
+        assert token in append, token
+    assert append.index("PrepareKvafForwardResidentDescriptorVectorsForPublication(") < append.index(
+        "WriteGmByPassDCache<int32_t>(indices + request"
+    )
+    prepare_vectors = _between(
+        device,
+        "__aicore__ inline void PrepareKvafForwardResidentDescriptorVectorsForPublication(",
+        "__aicore__ inline bool AppendKvafForwardResidentRequest(",
+    )
+    for token in (
+        "kvaf_fused_get::CleanCacheLines(",
+        "descriptor.indices",
+        "descriptor.offsets",
+        "descriptor.mask",
+        "descriptor.output_indices",
+        "DataSyncBarrier<AscendC::MemDsbT::DDR>()",
+    ):
+        assert token in prepare_vectors, token
+
+    store = _between(
+        device,
+        "__aicore__ inline bool StoreKvafForwardResidentDescriptorToGm(",
+        "// The resident arena is fixed",
+    )
+    count_store = "WriteGmByPassDCache<uint32_t>(&destination->active_request_count"
+    assert count_store in store
+    assert store.index("DataSyncBarrier<AscendC::MemDsbT::DDR>()") < store.index(
+        count_store
+    )
+
+    # Direct-HCCP writes HBM behind the AIV's cache.  The exact output rows
+    # must be cleaned and invalidated before the doorbell; doing so after CQ
+    # would risk writing stale pre-DMA data back over the payload.
+    assert "PrepareDenseBatchGetOutputForInboundDma(" in dense
+    dense_begin = _between(
+        dense,
+        "__aicore__ inline void BeginKvafDenseBatchGetPostOnly(",
+        "// Probe the one CQE",
+    )
+    assert dense_begin.index("ValidateDenseBatchGetDescriptors(") < dense_begin.index(
+        "PrepareDenseBatchGetOutputForInboundDma("
+    ) < dense_begin.index("PostDenseBatchGetRequests(")
 
     # The P10 device header must not inherit an old fixed output partition or
     # cross-forward recovery protocol.  It is acceptable for the repository

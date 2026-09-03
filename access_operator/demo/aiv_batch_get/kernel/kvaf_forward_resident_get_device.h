@@ -155,16 +155,30 @@ __aicore__ inline bool LoadKvafForwardResidentDescriptorFromGm(
   if (source == nullptr || destination == nullptr) {
     return false;
   }
-  destination->address_table = source->address_table;
-  destination->valid_table = source->valid_table;
-  destination->indices = source->indices;
-  destination->offsets = source->offsets;
-  destination->mask = source->mask;
-  destination->output_indices = source->output_indices;
-  destination->table_capacity = source->table_capacity;
-  destination->request_capacity = source->request_capacity;
-  destination->active_request_count = source->active_request_count;
-  destination->reserved0 = source->reserved0;
+  // The dense SIMT WQE materializer consumes descriptor vectors with
+  // `asc_ldcg`.  Keep the AICore reload on the same non-DCache path so a
+  // reused descriptor record cannot mix one generation's header with another
+  // generation's vector addresses/count.
+  destination->address_table = ReadGmByPassDCache<uint64_t>(
+      const_cast<__gm__ uint64_t*>(&source->address_table));
+  destination->valid_table = ReadGmByPassDCache<uint64_t>(
+      const_cast<__gm__ uint64_t*>(&source->valid_table));
+  destination->indices = ReadGmByPassDCache<uint64_t>(
+      const_cast<__gm__ uint64_t*>(&source->indices));
+  destination->offsets = ReadGmByPassDCache<uint64_t>(
+      const_cast<__gm__ uint64_t*>(&source->offsets));
+  destination->mask = ReadGmByPassDCache<uint64_t>(
+      const_cast<__gm__ uint64_t*>(&source->mask));
+  destination->output_indices = ReadGmByPassDCache<uint64_t>(
+      const_cast<__gm__ uint64_t*>(&source->output_indices));
+  destination->table_capacity = ReadGmByPassDCache<uint32_t>(
+      const_cast<__gm__ uint32_t*>(&source->table_capacity));
+  destination->request_capacity = ReadGmByPassDCache<uint32_t>(
+      const_cast<__gm__ uint32_t*>(&source->request_capacity));
+  destination->active_request_count = ReadGmByPassDCache<uint32_t>(
+      const_cast<__gm__ uint32_t*>(&source->active_request_count));
+  destination->reserved0 = ReadGmByPassDCache<uint32_t>(
+      const_cast<__gm__ uint32_t*>(&source->reserved0));
   return true;
 }
 
@@ -174,16 +188,27 @@ __aicore__ inline bool StoreKvafForwardResidentDescriptorToGm(
   if (destination == nullptr) {
     return false;
   }
-  destination->address_table = source.address_table;
-  destination->valid_table = source.valid_table;
-  destination->indices = source.indices;
-  destination->offsets = source.offsets;
-  destination->mask = source.mask;
-  destination->output_indices = source.output_indices;
-  destination->table_capacity = source.table_capacity;
-  destination->request_capacity = source.request_capacity;
-  destination->active_request_count = source.active_request_count;
-  destination->reserved0 = source.reserved0;
+  // Publish immutable descriptor fields first.  `active_request_count` is
+  // the release word for this scratch record and must never become visible
+  // before its vector pointers and capacities are globally visible.
+  WriteGmByPassDCache<uint64_t>(&destination->address_table,
+                                source.address_table);
+  WriteGmByPassDCache<uint64_t>(&destination->valid_table,
+                                source.valid_table);
+  WriteGmByPassDCache<uint64_t>(&destination->indices, source.indices);
+  WriteGmByPassDCache<uint64_t>(&destination->offsets, source.offsets);
+  WriteGmByPassDCache<uint64_t>(&destination->mask, source.mask);
+  WriteGmByPassDCache<uint64_t>(&destination->output_indices,
+                                source.output_indices);
+  WriteGmByPassDCache<uint32_t>(&destination->table_capacity,
+                                source.table_capacity);
+  WriteGmByPassDCache<uint32_t>(&destination->request_capacity,
+                                source.request_capacity);
+  WriteGmByPassDCache<uint32_t>(&destination->reserved0, source.reserved0);
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  WriteGmByPassDCache<uint32_t>(&destination->active_request_count,
+                                source.active_request_count);
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
   return true;
 }
 
@@ -379,13 +404,15 @@ __aicore__ inline bool ValidateKvafForwardResidentOutputIndices(
       control.resident_row_base + control.resident_row_count;
   for (uint32_t request = 0U; request < descriptor.active_request_count;
        ++request) {
-    const int32_t row = output_indices[request];
+    const int32_t row = ReadGmByPassDCache<int32_t>(
+        const_cast<__gm__ int32_t*>(output_indices + request));
     if (row < 0 || static_cast<uint64_t>(row) < control.resident_row_base ||
         static_cast<uint64_t>(row) >= resident_end) {
       return false;
     }
     for (uint32_t earlier = 0U; earlier < request; ++earlier) {
-      if (output_indices[earlier] == row) {
+      if (ReadGmByPassDCache<int32_t>(
+              const_cast<__gm__ int32_t*>(output_indices + earlier)) == row) {
         return false;
       }
     }
@@ -396,6 +423,33 @@ __aicore__ inline bool ValidateKvafForwardResidentOutputIndices(
 // Append translates one already-admitted KV object into the dense Direct-HCCP
 // vector ABI.  It does not allocate or reclaim a resident row; the enclosing
 // Stage-B executor must have fixed the row before this method is called.
+//
+// The vectors are reused queue-local GM storage.  Before the first bypass
+// write of a new dense wave, evict any old AICore DCache lines for the whole
+// bounded vector range.  A later clean of an old dirty cache line would
+// otherwise be able to overwrite a newer bypass-published descriptor entry.
+__aicore__ inline void PrepareKvafForwardResidentDescriptorVectorsForPublication(
+    const KvafForwardResidentBatchGetDescriptorScratch& descriptor) {
+  if (descriptor.indices == 0U || descriptor.offsets == 0U ||
+      descriptor.mask == 0U || descriptor.output_indices == 0U ||
+      descriptor.request_capacity == 0U) {
+    return;
+  }
+  const uint64_t count = descriptor.request_capacity;
+  kvaf_fused_get::CleanCacheLines(
+      reinterpret_cast<__gm__ uint8_t*>(descriptor.indices),
+      count * sizeof(int32_t));
+  kvaf_fused_get::CleanCacheLines(
+      reinterpret_cast<__gm__ uint8_t*>(descriptor.offsets),
+      count * sizeof(int32_t));
+  kvaf_fused_get::CleanCacheLines(
+      reinterpret_cast<__gm__ uint8_t*>(descriptor.mask), count);
+  kvaf_fused_get::CleanCacheLines(
+      reinterpret_cast<__gm__ uint8_t*>(descriptor.output_indices),
+      count * sizeof(int32_t));
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+}
+
 __aicore__ inline bool AppendKvafForwardResidentRequest(
     const KvafForwardResidentBatchGetControl& control,
     KvafForwardResidentBatchGetDescriptorScratch* descriptor,
@@ -435,15 +489,23 @@ __aicore__ inline bool AppendKvafForwardResidentRequest(
       reinterpret_cast<__gm__ uint8_t*>(descriptor->mask);
   __gm__ int32_t* const output_indices =
       reinterpret_cast<__gm__ int32_t*>(descriptor->output_indices);
+  if (request == 0U) {
+    PrepareKvafForwardResidentDescriptorVectorsForPublication(*descriptor);
+  }
   for (uint32_t earlier = 0U; earlier < request; ++earlier) {
-    if (output_indices[earlier] == output_row) {
+    if (ReadGmByPassDCache<int32_t>(output_indices + earlier) == output_row) {
       return false;
     }
   }
-  indices[request] = static_cast<int32_t>(table_index);
-  offsets[request] = static_cast<int32_t>(byte_offset);
-  mask[request] = 1U;
-  output_indices[request] = output_row;
+  // The dense transport's SIMT WQE materializer reads these exact vectors
+  // with `asc_ldcg`, not normal GM indexing.  Ordinary AICore cached stores
+  // can leave an earlier wave visible to that reader after descriptor reuse.
+  WriteGmByPassDCache<int32_t>(indices + request,
+                               static_cast<int32_t>(table_index));
+  WriteGmByPassDCache<int32_t>(offsets + request,
+                               static_cast<int32_t>(byte_offset));
+  WriteGmByPassDCache<uint8_t>(mask + request, 1U);
+  WriteGmByPassDCache<int32_t>(output_indices + request, output_row);
   descriptor->active_request_count = request + 1U;
   return true;
 }
