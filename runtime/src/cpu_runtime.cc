@@ -164,13 +164,6 @@ class UrmaResources {
           selected_device_name_.c_str(), eid_index, errno);
       return false;
     }
-    urma_jfc_cfg_t jfc_cfg{};
-    jfc_cfg.depth = kJfcDepth;
-    completion_queue_ = urma_create_jfc(context_, &jfc_cfg);
-    if (completion_queue_ == nullptr) {
-      Log("[KVAF_CPU] urma_create_jfc failed depth=%u errno=%d\n", kJfcDepth, errno);
-      return false;
-    }
     get_tp_list_ = reinterpret_cast<UrmaGetTpListFn>(dlsym(RTLD_DEFAULT, "urma_get_tp_list"));
     import_jetty_ex_ = reinterpret_cast<UrmaImportJettyExFn>(dlsym(RTLD_DEFAULT, "urma_import_jetty_ex"));
     if (get_tp_list_ == nullptr || import_jetty_ex_ == nullptr) {
@@ -188,10 +181,6 @@ class UrmaResources {
   }
 
   void Shutdown() {
-    if (completion_queue_ != nullptr) {
-      (void)urma_delete_jfc(completion_queue_);
-      completion_queue_ = nullptr;
-    }
     if (context_ != nullptr) {
       (void)urma_delete_context(context_);
       context_ = nullptr;
@@ -199,7 +188,6 @@ class UrmaResources {
   }
 
   urma_context_t* context() const { return context_; }
-  urma_jfc_t* completion_queue() const { return completion_queue_; }
   const std::string& device_name() const { return selected_device_name_; }
   uint32_t eid_index() const { return eid_index_; }
 
@@ -263,7 +251,6 @@ class UrmaResources {
   uint32_t eid_index_ = 0U;
   urma_device_t* device_ = nullptr;
   urma_context_t* context_ = nullptr;
-  urma_jfc_t* completion_queue_ = nullptr;
   UrmaGetTpListFn get_tp_list_ = nullptr;
   UrmaImportJettyExFn import_jetty_ex_ = nullptr;
 };
@@ -404,10 +391,37 @@ class UrmaResourcePool {
 };
 
 struct Channel {
+  urma_jfc_t* local_jfc = nullptr;
   urma_jfr_t* local_jfr = nullptr;
   urma_jetty_t* local_jetty = nullptr;
   urma_target_jetty_t* remote_jetty = nullptr;
 };
+
+// A remote NPU uses each exported CPU Jetty as an independent target.  Keep
+// its completion resources equally independent: sharing one never-polled JFC
+// across all target JFRs allows unrelated AIV lanes to consume each other's
+// completion credits.  The order is the UMDK ownership order.
+void ReleaseChannel(Channel* channel) {
+  if (channel == nullptr) {
+    return;
+  }
+  if (channel->remote_jetty != nullptr) {
+    (void)urma_unimport_jetty(channel->remote_jetty);
+    channel->remote_jetty = nullptr;
+  }
+  if (channel->local_jetty != nullptr) {
+    (void)urma_delete_jetty(channel->local_jetty);
+    channel->local_jetty = nullptr;
+  }
+  if (channel->local_jfr != nullptr) {
+    (void)urma_delete_jfr(channel->local_jfr);
+    channel->local_jfr = nullptr;
+  }
+  if (channel->local_jfc != nullptr) {
+    (void)urma_delete_jfc(channel->local_jfc);
+    channel->local_jfc = nullptr;
+  }
+}
 
 struct Region {
   uint64_t id = 0U;
@@ -536,19 +550,12 @@ class CpuService {
     Channel channel{};
     uint64_t cpu_tp_handle = 0U;
     const uint32_t cpu_psn = NextPsn();
-    if (!CreateLocalJetty(region.resources, region.token_value, &channel.local_jfr, &channel.local_jetty) ||
+    if (!CreateLocalJetty(region.resources, region.token_value, &channel.local_jfc,
+                          &channel.local_jfr, &channel.local_jetty) ||
         !region.resources->GetCtpForPeer(request.local_eid, &cpu_tp_handle) ||
         !ImportRemoteJetty(region.resources, request.local_qp_key, request.peer_token_value, cpu_tp_handle,
                            request.local_tp_handle, cpu_psn, request.local_psn, &channel.remote_jetty)) {
-      if (channel.remote_jetty != nullptr) {
-        (void)urma_unimport_jetty(channel.remote_jetty);
-      }
-      if (channel.local_jetty != nullptr) {
-        (void)urma_delete_jetty(channel.local_jetty);
-      }
-      if (channel.local_jfr != nullptr) {
-        (void)urma_delete_jfr(channel.local_jfr);
-      }
+      ReleaseChannel(&channel);
       return Result::kResourceError;
     }
     std::memcpy(response->peer_qp_key, &channel.local_jetty->jetty_id,
@@ -559,6 +566,8 @@ class CpuService {
     response->peer_tp_handle = cpu_tp_handle;
     response->peer_psn = cpu_psn;
     region.channels.push_back(channel);
+    Log("[KVAF_CPU] CHANNEL_JFC_READY session=%" PRIu64 " jfc_id=%u depth=%u\n",
+        region.id, channel.local_jfc->jfc_id.id, kJfcDepth);
     Log("[KVAF_CPU] CHANNEL_CREATED session=%" PRIu64 " local_jetty=%u remote_jetty=%u cpu_tp=0x%llx "
         "cpu_psn=0x%x\n",
         region.id, channel.local_jetty->jetty_id.id, channel.remote_jetty->id.id,
@@ -595,42 +604,55 @@ class CpuService {
     return next_psn_;
   }
 
-  bool CreateLocalJetty(UrmaResources* resources, uint32_t token_value, urma_jfr_t** jfr,
-                        urma_jetty_t** jetty) {
-    if (resources == nullptr || jfr == nullptr || jetty == nullptr) {
+  bool CreateLocalJetty(UrmaResources* resources, uint32_t token_value, urma_jfc_t** jfc,
+                        urma_jfr_t** jfr, urma_jetty_t** jetty) {
+    if (resources == nullptr || jfc == nullptr || jfr == nullptr || jetty == nullptr) {
       return false;
     }
+    *jfc = nullptr;
     *jfr = nullptr;
     *jetty = nullptr;
+    urma_jfc_cfg_t jfc_config{};
+    jfc_config.depth = kJfcDepth;
+    *jfc = urma_create_jfc(resources->context(), &jfc_config);
+    if (*jfc == nullptr) {
+      Log("[KVAF_CPU] urma_create_jfc failed scope=channel depth=%u errno=%d\n",
+          kJfcDepth, errno);
+      return false;
+    }
     urma_jfs_cfg_t jfs{};
     jfs.depth = kJettyDepth;
     jfs.trans_mode = URMA_TM_RM;
     jfs.max_sge = 1U;
-    jfs.jfc = resources->completion_queue();
+    jfs.jfc = *jfc;
     urma_jfr_cfg_t jfr_config{};
     jfr_config.depth = kJettyDepth;
     jfr_config.trans_mode = URMA_TM_RM;
     jfr_config.max_sge = 1U;
-    jfr_config.jfc = resources->completion_queue();
+    jfr_config.jfc = *jfc;
     jfr_config.token_value.token = token_value;
     jfr_config.flag.bs.tag_matching = URMA_NO_TAG_MATCHING;
     *jfr = urma_create_jfr(resources->context(), &jfr_config);
     if (*jfr == nullptr) {
       Log("[KVAF_CPU] urma_create_jfr failed depth=%u token=0x%x errno=%d\n", kJettyDepth,
           token_value, errno);
+      (void)urma_delete_jfc(*jfc);
+      *jfc = nullptr;
       return false;
     }
     urma_jetty_cfg_t config{};
     config.flag.bs.share_jfr = URMA_SHARE_JFR;
     config.jfs_cfg = jfs;
     config.shared.jfr = *jfr;
-    config.shared.jfc = resources->completion_queue();
+    config.shared.jfc = *jfc;
     *jetty = urma_create_jetty(resources->context(), &config);
     if (*jetty == nullptr) {
       Log("[KVAF_CPU] urma_create_jetty failed depth=%u token=0x%x errno=%d\n", kJettyDepth,
           token_value, errno);
       (void)urma_delete_jfr(*jfr);
       *jfr = nullptr;
+      (void)urma_delete_jfc(*jfc);
+      *jfc = nullptr;
       return false;
     }
     return true;
@@ -655,15 +677,7 @@ class CpuService {
       return;
     }
     for (auto iterator = region->channels.rbegin(); iterator != region->channels.rend(); ++iterator) {
-      if (iterator->remote_jetty != nullptr) {
-        (void)urma_unimport_jetty(iterator->remote_jetty);
-      }
-      if (iterator->local_jetty != nullptr) {
-        (void)urma_delete_jetty(iterator->local_jetty);
-      }
-      if (iterator->local_jfr != nullptr) {
-        (void)urma_delete_jfr(iterator->local_jfr);
-      }
+      ReleaseChannel(&*iterator);
     }
     region->channels.clear();
     if (region->segment != nullptr) {
