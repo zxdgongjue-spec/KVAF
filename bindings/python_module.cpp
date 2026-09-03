@@ -316,7 +316,8 @@ class PythonRuntime final {
         MutableBufferView{output_data, static_cast<std::size_t>(output_size),
                           DeviceKind::kCpu},
         output_block_bytes,
-        AccessTableDeviceView{}};
+        ConstBufferView{},
+        ConstBufferView{}};
     ThrowIfError(runtime_->BatchGet(request));
   }
 

@@ -3,8 +3,8 @@
 
 This is intentionally a direct Python/pybind benchmark, not a CTest case.
 It measures Runtime calls only: source request plans are created before the
-timed loops, BatchGet tensors are derived immediately before each call, and
-NPU calls end each sample with an external stream synchronize.
+timed loops, final remote/local BatchGet address tensors are derived before
+each call, and NPU calls end each sample with an external stream synchronize.
 """
 
 from __future__ import annotations
@@ -443,14 +443,21 @@ def main(batch: int = 16) -> int:
             miss_count_batches[:warmup],
         ):
             indices = source_token_ids // ROWS_PER_ENTRY
-            torch.npu.synchronize()
             offsets = (source_token_ids % ROWS_PER_ENTRY) * block_bytes
+            remote_addresses = (
+                device_table.addresses[indices.to(torch.int64)]
+                + offsets.to(torch.int64)
+            )
+            local_addresses = (
+                destination_slots.to(torch.int64) * block_bytes
+                + int(output.data_ptr())
+            )
             torch.npu.synchronize()
-            output_indices = destination_slots.clone()
-            torch.npu.synchronize()
-            warmup_inputs.append((indices, offsets, output_indices, miss_count))
+            warmup_inputs.append(
+                (remote_addresses, local_addresses, miss_count)
+            )
             runtime.batch_get(
-                device_table, indices, offsets, miss_count, output_indices, output
+                remote_addresses, local_addresses, miss_count, output
             )
         torch.npu.synchronize()
         warmup_inputs.clear()
@@ -466,17 +473,20 @@ def main(batch: int = 16) -> int:
             miss_count_batches[warmup:],
         ):
             indices = source_token_ids // ROWS_PER_ENTRY
-            torch.npu.synchronize()
-
             offsets = (source_token_ids % ROWS_PER_ENTRY) * block_bytes
-            torch.npu.synchronize()
-
-            output_indices = destination_slots.clone()
+            remote_addresses = (
+                device_table.addresses[indices.to(torch.int64)]
+                + offsets.to(torch.int64)
+            )
+            local_addresses = (
+                destination_slots.to(torch.int64) * block_bytes
+                + int(output.data_ptr())
+            )
             torch.npu.synchronize()
 
             begin = time.perf_counter()
             runtime.batch_get(
-                device_table, indices, offsets, miss_count, output_indices, output
+                remote_addresses, local_addresses, miss_count, output
             )
             submitted = time.perf_counter()
             torch.npu.synchronize()

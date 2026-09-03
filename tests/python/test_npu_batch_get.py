@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Direct pybind + torch_npu integration test for NPU Runtime data movement.
 
-The test owns BatchGet input/output Tensors and obtains a directly usable NPU
-DeviceAccessTable from Runtime. Direct-HCCP status and queue buffers stay
-inside the operator. Before the BatchGet flow, it validates the temporary NPU
+The test owns BatchGet input/output Tensors, obtains an NPU DeviceAccessTable
+from Runtime, and resolves it into final remote/local address Tensors before
+calling BatchGet. Direct-HCCP status and queue buffers stay inside the
+operator. Before the BatchGet flow, it validates the temporary NPU
 BatchPut mock or configured AIV BatchPut path with a packed variable-size input
 Tensor, CPU offset/length metadata, and direct Host DDR byte checks. No native
 runner process is launched.
@@ -316,27 +317,38 @@ def main() -> int:
             "RUNTIME_NPU_PHASE_DONE phase=runtime_access_table_materialize "
             f"valid_entries={active_requests} table_capacity={table_capacity}"
         )
-        indices = torch.tensor(indices_values, dtype=torch.int32, device=device)
-        offsets = torch.tensor(offsets_values, dtype=torch.int32, device=device)
+        indices = torch.tensor(indices_values, dtype=torch.int64, device=device)
+        offsets = torch.tensor(offsets_values, dtype=torch.int64, device=device)
         miss_count = torch.tensor(
             [active_requests], dtype=torch.int32, device=device
         )
-        output_indices = torch.tensor(output_indices_values, dtype=torch.int32, device=device)
+        output_indices = torch.tensor(
+            output_indices_values, dtype=torch.int64, device=device
+        )
         output_a = torch.zeros(
             (output_rows, block_bytes), dtype=torch.uint8, device=device
         )
         output_b = torch.zeros_like(output_a)
+        remote_addresses = address_table[indices] + offsets
+        local_addresses_a = (
+            output_indices * block_bytes + int(output_a.data_ptr())
+        )
+        local_addresses_b = (
+            output_indices * block_bytes + int(output_b.data_ptr())
+        )
+        local_addresses_by_output = {
+            int(output_a.data_ptr()): local_addresses_a,
+            int(output_b.data_ptr()): local_addresses_b,
+        }
         torch.npu.synchronize()
         print("RUNTIME_NPU_PHASE_DONE phase=caller_buffer_setup")
 
         def execute(output: object, stream: object | None = None) -> None:
+            local_addresses = local_addresses_by_output[int(output.data_ptr())]
             runtime.batch_get(
-                address_table,
-                valid_table,
-                indices,
-                offsets,
+                remote_addresses,
+                local_addresses,
                 miss_count,
-                output_indices,
                 output,
                 stream,
             )
@@ -424,35 +436,20 @@ def main() -> int:
             print("RUNTIME_NPU_PHASE_BEGIN phase=graph_object")
             graph = kvaf.AclGraph()
             print("RUNTIME_NPU_PHASE_DONE phase=graph_object")
-            # The graph captures only BatchGet. Its caller-owned device
+            # The graph captures only BatchGet. Its caller-owned direct-address
             # tensors keep their addresses, while this host staging storage
-            # updates their contents on the same ACL stream before each
-            # replay. This is the AIV demo's verified graph contract.
+            # updates remote address contents on the same ACL stream before
+            # each replay.
             host_view = runtime.access_table_view(table, device="cpu")
             host_addresses_buffer = bytearray(host_view["addresses"])
-            graph_address_table_host = bytearray(tensor_bytes(address_table))
-            graph_indices_host = array("i", indices_values)
-            graph_offsets_host = array("i", offsets_values)
+            graph_remote_addresses_host = bytearray(tensor_bytes(remote_addresses))
             graph_miss_count_host = array("i", [active_requests])
-            graph_output_indices_host = array("i", output_indices_values)
-            if (
-                graph_indices_host.itemsize != 4
-                or graph_offsets_host.itemsize != 4
-                or graph_output_indices_host.itemsize != 4
-            ):
+            if graph_miss_count_host.itemsize != 4:
                 raise AssertionError("graph int32 staging requires four-byte Python ints")
 
             def prepare_graph_inputs(epoch: int) -> list[int | None]:
                 """Update only host staging data; device addresses stay fixed."""
                 expected_payload_slots = list(payload_slots)
-                for payload_slot in range(active_requests):
-                    source_slot = (payload_slot + epoch) % active_requests
-                    address = struct.unpack_from(
-                        "<Q", host_addresses_buffer, source_slot * 8
-                    )[0]
-                    struct.pack_into(
-                        "<Q", graph_address_table_host, payload_slot * 8, address
-                    )
                 for request in active_request_positions:
                     payload_slot = payload_slots[request]
                     if payload_slot is None:
@@ -460,6 +457,13 @@ def main() -> int:
                     source_entry = (
                         indices_values[request] + epoch
                     ) % active_requests
+                    remote_address = struct.unpack_from(
+                        "<Q", host_addresses_buffer, source_entry * 8
+                    )[0] + offsets_values[request]
+                    struct.pack_into(
+                        "<Q", graph_remote_addresses_host, request * 8,
+                        remote_address
+                    )
                     expected_payload_slots[request] = (
                         source_entry * ROWS_PER_ENTRY + offsets_values[request]
                         // block_bytes
@@ -470,35 +474,20 @@ def main() -> int:
                 if trace is not None:
                     print(f"RUNTIME_NPU_GRAPH_INPUT_UPDATE_BEGIN replay={trace}")
                 graph.copy_host_to_device_async(
-                    int(address_table.data_ptr()), tensor_bytes(address_table),
-                    graph_address_table_host, capture_stream
-                )
-                graph.copy_host_to_device_async(
-                    int(indices.data_ptr()), tensor_bytes(indices),
-                    graph_indices_host, capture_stream
-                )
-                graph.copy_host_to_device_async(
-                    int(offsets.data_ptr()), tensor_bytes(offsets),
-                    graph_offsets_host, capture_stream
+                    int(remote_addresses.data_ptr()), tensor_bytes(remote_addresses),
+                    graph_remote_addresses_host, capture_stream
                 )
                 graph.copy_host_to_device_async(
                     int(miss_count.data_ptr()), tensor_bytes(miss_count),
                     graph_miss_count_host, capture_stream
-                )
-                graph.copy_host_to_device_async(
-                    int(output_indices.data_ptr()), tensor_bytes(output_indices),
-                    graph_output_indices_host, capture_stream
                 )
                 if trace is not None:
                     print(f"RUNTIME_NPU_GRAPH_INPUT_UPDATE_ENQUEUED replay={trace}")
 
             print(
                 "RUNTIME_NPU_GRAPH_HOST_INPUTS_READY "
-                f"address_table_bytes={len(graph_address_table_host)} "
-                f"indices_bytes={len(graph_indices_host) * graph_indices_host.itemsize} "
-                f"offsets_bytes={len(graph_offsets_host) * graph_offsets_host.itemsize} "
-                f"miss_count_bytes={graph_miss_count_host.itemsize} "
-                f"output_indices_bytes={len(graph_output_indices_host) * graph_output_indices_host.itemsize}"
+                f"remote_addresses_bytes={len(graph_remote_addresses_host)} "
+                f"miss_count_bytes={graph_miss_count_host.itemsize}"
             )
             print("RUNTIME_NPU_PHASE_BEGIN phase=graph_capture")
             # output_a was already used by eager A -> B -> A above, so its

@@ -82,7 +82,7 @@ runtime.shutdown()
 
 Mock API 走 Runtime/MetaManager 的实际代码路径，适合本地功能测试。它不把
 MPS 当作 NPU；A5/CANN 集成需要 NPU Python backend。启用该 backend 后，Python
-从 `runtime.access_table_view(handle, device="npu")` 得到可直接使用的
-`DeviceAccessTable`，并以 NPU Tensor 调用 `kvaf.NpuRuntime.batch_get`；不传
-`data_ptr()`、字节数或 AIV 内部的 status/queue buffer。完整构建和测试命令见
+可从 `runtime.access_table_view(handle, device="npu")` 取得地址表，在调用方生成
+`remote_addresses/local_addresses` NPU Tensor，再调用 `kvaf.NpuRuntime.batch_get`；
+AIV 内部的 status/queue buffer 不对外暴露。完整构建和测试命令见
 [`runtime/README.md`](runtime/README.md)。

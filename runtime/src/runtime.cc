@@ -1,7 +1,6 @@
 #include "kvaf/runtime/runtime.h"
 
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <new>
 #include <string>
@@ -172,22 +171,6 @@ Status Runtime::PrepareAccessTable(const AccessTablePrepareRequest& request,
     return Status::InvalidState("MetaManager returned an invalid AccessTable lookup");
   }
 
-  bool has_valid_entries = false;
-  bool has_uniform_valid_length = true;
-  std::uint64_t uniform_valid_length = 0;
-  for (std::size_t index = 0; index < lookup.valid.size(); ++index) {
-    if (lookup.valid[index] == 0) {
-      continue;
-    }
-    if (!has_valid_entries) {
-      has_valid_entries = true;
-      uniform_valid_length = lookup.lengths[index];
-    } else if (lookup.lengths[index] != uniform_valid_length) {
-      has_uniform_valid_length = false;
-      break;
-    }
-  }
-
   const std::uint64_t id = next_access_table_id_++;
   if (id == 0) {
     (void)meta_manager_.UnlockKeys(lock_context);
@@ -198,9 +181,6 @@ Status Runtime::PrepareAccessTable(const AccessTablePrepareRequest& request,
   table->addresses = std::move(lookup.addresses);
   table->lengths = std::move(lookup.lengths);
   table->valid = std::move(lookup.valid);
-  table->has_valid_entries = has_valid_entries;
-  table->has_uniform_valid_length = has_uniform_valid_length;
-  table->uniform_valid_length = uniform_valid_length;
   access_tables_.emplace(id, std::move(table));
   *handle = AccessTableHandle{id};
   return Status::OK();
@@ -244,26 +224,8 @@ Status Runtime::BatchGet(const BatchGetRequest& request,
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
-  const AccessTableState* table = nullptr;
-  if (request.access_table.opaque != 0) {
-    table = FindAccessTable(request.access_table);
-    if (table == nullptr) {
-      return Status::NotFound("AccessTable handle was not found");
-    }
-  }
-  if (!request.indices.has_elements<std::int32_t>() ||
-      !request.offsets.has_elements<std::int32_t>() ||
-      !request.output_indices.has_elements<std::int32_t>() ||
-      request.indices.bytes != request.offsets.bytes ||
-      request.indices.bytes != request.output_indices.bytes) {
-    return Status::InvalidArgument(
-        "indices, offsets, and output_indices must be equally sized int32 buffers");
-  }
-  const std::size_t request_count =
-      request.indices.bytes / sizeof(std::int32_t);
   if (!request.miss_count.has_elements<std::int32_t>() ||
-      request.miss_count.bytes != sizeof(std::int32_t) ||
-      request.miss_count.device != request.indices.device) {
+      request.miss_count.bytes != sizeof(std::int32_t)) {
     return Status::InvalidArgument(
         "miss_count must be a single int32 on the BatchGet device");
   }
@@ -272,67 +234,60 @@ Status Runtime::BatchGet(const BatchGetRequest& request,
       request.output.bytes % request.output_block_bytes != 0) {
     return Status::InvalidArgument("output must contain whole non-empty output blocks");
   }
-  if (request.indices.device != request.offsets.device ||
-      request.indices.device != request.output_indices.device ||
-      request.indices.device != request.output.device) {
-    return Status::InvalidArgument("BatchGet input and output buffers must share a device");
-  }
-
-  if (request.indices.device == DeviceKind::kCpu) {
+  if (request.output.device == DeviceKind::kCpu) {
+    const AccessTableState* table = FindAccessTable(request.access_table);
+    if (table == nullptr) {
+      return Status::NotFound("CPU BatchGet AccessTable handle was not found");
+    }
+    if (!request.indices.has_elements<std::int32_t>() ||
+        !request.offsets.has_elements<std::int32_t>() ||
+        !request.output_indices.has_elements<std::int32_t>() ||
+        request.indices.bytes != request.offsets.bytes ||
+        request.indices.bytes != request.output_indices.bytes ||
+        request.indices.device != DeviceKind::kCpu ||
+        request.offsets.device != DeviceKind::kCpu ||
+        request.output_indices.device != DeviceKind::kCpu ||
+        request.miss_count.device != DeviceKind::kCpu ||
+        !request.remote_addresses.empty() ||
+        !request.local_addresses.empty()) {
+      return Status::InvalidArgument(
+          "CPU BatchGet requires equally sized int32 lookup buffers");
+    }
+    const std::size_t request_count =
+        request.indices.bytes / sizeof(std::int32_t);
     const std::int32_t miss_count =
         *static_cast<const std::int32_t*>(request.miss_count.data);
     if (miss_count < 0 || static_cast<std::size_t>(miss_count) > request_count) {
       return Status::InvalidArgument(
           "miss_count must be between zero and the BatchGet request capacity");
     }
+    const AccessTableView view{table->addresses.data(), table->lengths.data(),
+                               table->valid.data(), table->addresses.size()};
+    return access_operator_.ExecuteBatchGet(
+        BatchGetExecRequest{view, &request, execution});
   }
 
-  if (request.indices.device == DeviceKind::kNpu) {
-    if (request.output_block_bytes > kBatchGetMaxTransferBytes ||
-        request.output_block_bytes >
-            std::numeric_limits<std::uint64_t>::max() /
-                kBatchGetAddressTableEntryCount) {
+  if (request.output.device == DeviceKind::kNpu) {
+    if (request.access_table.opaque != 0 || !request.indices.empty() ||
+        !request.offsets.empty() || !request.output_indices.empty() ||
+        !request.remote_addresses.has_elements<Address>() ||
+        !request.local_addresses.has_elements<Address>() ||
+        request.remote_addresses.bytes != request.local_addresses.bytes ||
+        request.remote_addresses.device != DeviceKind::kNpu ||
+        request.local_addresses.device != DeviceKind::kNpu ||
+        request.miss_count.device != DeviceKind::kNpu) {
+      return Status::InvalidArgument(
+          "NPU BatchGet requires equally sized uint64 remote/local address buffers");
+    }
+    if (request.output_block_bytes > kBatchGetMaxTransferBytes) {
       return Status::InvalidArgument(
           "NPU BatchGet output row size exceeds the device ABI");
     }
-    if (request.device_access_table.empty() ||
-        request.device_access_table.addresses.data == nullptr ||
-        request.device_access_table.valid.data == nullptr ||
-        request.device_access_table.addresses.bytes == 0 ||
-        request.device_access_table.addresses.bytes % sizeof(Address) != 0 ||
-        request.device_access_table.valid.bytes !=
-            request.device_access_table.addresses.bytes / sizeof(Address) ||
-        request.device_access_table.addresses.device != DeviceKind::kNpu ||
-        request.device_access_table.valid.device != DeviceKind::kNpu) {
-      return Status::InvalidArgument(
-          "NPU BatchGet requires matching caller-provided device AccessTable buffers");
-    }
-    const std::uint64_t expected_entry_bytes =
-        BatchGetAddressTableEntryBytes(request.output_block_bytes);
-    if (table != nullptr &&
-        (!table->has_uniform_valid_length ||
-         (table->has_valid_entries &&
-          table->uniform_valid_length != expected_entry_bytes))) {
-      return Status::InvalidArgument(
-          "NPU BatchGet AccessTable entries must each contain 128 output blocks");
-    }
-  } else {
-    if (table == nullptr) {
-      return Status::InvalidArgument("CPU BatchGet requires an AccessTable handle");
-    }
-    if (!request.device_access_table.empty()) {
-      return Status::InvalidArgument(
-          "CPU BatchGet must not provide device AccessTable buffers");
-    }
+    return access_operator_.ExecuteBatchGet(
+        BatchGetExecRequest{AccessTableView{}, &request, execution});
   }
 
-  AccessTableView view{};
-  if (table != nullptr) {
-    view = AccessTableView{table->addresses.data(), table->lengths.data(),
-                           table->valid.data(), table->addresses.size()};
-  }
-  return access_operator_.ExecuteBatchGet(
-      BatchGetExecRequest{view, &request, execution});
+  return Status::InvalidArgument("BatchGet output device is not supported");
 }
 
 Status Runtime::BatchPut(const BatchPutRequest& request,

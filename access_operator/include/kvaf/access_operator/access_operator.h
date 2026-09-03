@@ -64,8 +64,9 @@ struct BatchGetKernelProfile {
 //
 // Initialize creates reusable BatchGet and (when configured) BatchPut
 // transports for Runtime-owned Host DDR.
-// ExecuteBatchGet obtains a LocalBuffer from the caller-owned output in the
-// request. Direct-HCCP queue/status buffers remain internal to the operator;
+// ExecuteBatchGet consumes caller-resolved remote/local address tensors and
+// obtains a LocalBuffer from the caller-owned output in the request.
+// Direct-HCCP queue/status buffers remain internal to the operator;
 // launch ordering is defined by the caller stream passed with each request.
 // ExecuteBatchPut uses the Direct-HCCP AIV eager path when a BatchPut kernel
 // path is configured; otherwise it retains the synchronous ACL D2H mock for

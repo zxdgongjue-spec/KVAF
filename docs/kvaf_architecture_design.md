@@ -367,7 +367,9 @@ AccessTableHandle
 
 #### 3.4.2 BatchGet、BatchGetAsync
 
-`BatchGet` 不接收原始 Key，也不负责 Key 到地址的查询。调用方必须先通过 `PrepareAccessTable` 获得 `AccessTableHandle`，再使用相对索引 Tensor 指定本次需要访问的 KV Block。
+`BatchGet` 不接收原始 Key。CPU Mock 路径仍通过 `AccessTableHandle` 和逻辑索引完成
+功能验证；NPU 路径要求调用方在进入 Runtime 前完成查表、源偏移和目标行解析，直接
+提供每个请求的绝对 remote/local 地址。
 
 ##### 接口定义
 
@@ -385,47 +387,45 @@ BatchGetAsync(
 
 ```text
 BatchGetRequest
-├── access_table: AccessTableHandle
-├── indices: Tensor
 ├── miss_count: Tensor
-├── output_buffers: List[Tensor]
-├── output_indices: Tensor
-└── options: optional BatchGetOptions
+├── output: Tensor
+├── output_block_bytes: uint64
+├── CPU: access_table / indices / offsets / output_indices
+└── NPU: remote_addresses / local_addresses
 ```
 
 其中：
 
-- `access_table`：由 `PrepareAccessTable` 返回的 AccessTable，包含 KV Block 的地址、实际长度和有效性信息；
-- `indices`：描述本次访问使用的 AccessTable 相对索引。POC 采用固定形状的 `int32` Tensor，`indices[b][i]` 表示第 `b` 个请求的第 `i` 个 KV Block 在 AccessTable 中的索引，Prefix Key 到 indices 的展开、索引生成以及 Batch 组织由 CacheOS-vLLM Adaptor 或 KVIP 完成；
-- `miss_count`：单元素 `int32` Tensor，表示请求数组有效前缀的长度；只有 `[0, miss_count)` 内的 `indices`、`offsets` 和 `output_indices` 会被执行，其余位置仅作为固定容量占位；
-- `output_buffers`：由调用方准备的目标 Tensor 列表，KVAF 将 KV 数据直接写入这些 Tensor。当前允许 Tensor 为多维结构，具体的输出布局和组织方式后续结合 vLLM Adaptor 再确定；
-- `output_indices`：描述每个输入索引对应的输出相对位置，形状与 `indices` 一致。当前约定 `output_buffers[b]` 与 `indices[b]` 对应，`output_indices[b][i][c1,c2,c3]` 指定 `indices[b][i]` 对应的数据应写入 `output_buffers[c1][c2][c3]` 中的哪个位置，其取值必须位于对应输出 Tensor 的有效范围内。多维输出 Tensor 下的具体索引展开规则后续确定；
-- `options`：可选的执行配置，例如硬件算法展开位置，具体字段和语义在 KV Access Operator 设计中确定。。
+- `miss_count`：单元素 `int32` Tensor，表示请求数组有效前缀的长度；
+- `output`：由调用方准备并持有的目标 Tensor；
+- CPU 逻辑字段：`access_table`、`indices`、`offsets`、`output_indices`，仅供 Mock 路径；
+- NPU 直接地址字段：等长的 `uint64 remote_addresses[n]` 和
+  `uint64 local_addresses[n]`，只有 `[0, miss_count)` 前缀会被搬运。
 
-Runtime 不根据 Python 对象类型猜测 CPU 或 NPU 执行路径。`access_table`、`indices`、`miss_count`、`output_indices` 和 `output_buffers` 应位于同一设备上，具体设备由各 Tensor 的 `device` 属性表达；只有 NPU Tensor 路径支持图模式。
+Runtime 根据 output buffer 的 `device` 选择 CPU/NPU 契约，不在两种契约之间隐式
+生成或搬运地址 Tensor；只有 NPU direct-address 路径支持图模式。
 
 ##### Runtime 与 KV Access Operator 的交互
 
 Runtime 在提交 BatchGet 前，负责校验请求中 Tensor 的基本类型、形状和相互关系：
 
-1. `indices` 使用 POC 约定的 `int32` 类型；
-2. `miss_count` 是单元素 `int32` Tensor；CPU 路径由 Runtime、NPU 路径由 Device kernel 校验其值位于 `[0, indices.numel()]`；
-3. `output_indices` 与 `indices` 形状一致，并使用 POC 约定的 `int32` 相对位置索引类型；
-4. `output_buffers` 中的 Tensor 位于同一设备，目标容量能够容纳 `size_table` 指定的实际数据长度；
-5. `output_indices` 指向的输出位置在对应 `output_buffers` 的有效范围内，output_indices.shape[:-1] == indices.shape, output_indices.shape[-1] == len(output_buffers.shape)。
+1. `miss_count` 是单元素 `int32` Tensor；
+2. CPU 路径校验三个逻辑数组均为等长 `int32` buffer；
+3. NPU 路径校验 remote/local 地址数组均为等长的一维 8-byte Device buffer；
+4. NPU 地址数组的元素数构成 request capacity，Device kernel 校验
+   `miss_count` 位于该容量范围内；
+5. output 的存储与地址数组由调用方保持到提交 stream 完成。
 
-Runtime 不在此处单独校验 `indices` 是否访问了 AccessTable 的 Padding 项。KV Access Operator 只读取 `[0, miss_count)` 前缀；该前缀中的位置如果对应无效的 AccessTable 项，则返回执行错误，前缀之外不发起数据搬运。
+NPU Runtime 不再接收 AccessTable，因此无法反向校验 direct address 是否来自有效表项；
+地址正确性和对应 Key 锁的生命周期由调用方负责。
 
 校验通过后，Runtime 将请求转换为 KV Access Operator 使用的执行描述：
 
 ```text
 BatchGetExecRequest
-├── access_table: AccessTableView
-├── indices: TensorView
-├── miss_count: TensorView
-├── output_buffers: TensorListView
-├── output_indices: TensorView
-└── options: optional BatchGetOptions
+├── request: BatchGetRequest
+├── host_access_table: CPU-only AccessTableView
+└── execution: stream / synchronize
 ```
 
 并调用：
@@ -440,17 +440,19 @@ ExecuteBatchGet(
 
 BatchGet 的输入和输出需要与目标执行路径匹配，POC 暂不隐式完成 CPU/NPU 之间的动态搬运：
 
-| 执行路径 | AccessTable | 输入 Tensor | 输出 Buffer | 处理方式 |
-| --- | --- | --- | --- | --- |
-| Host CPU 路径 | `device="cpu"` | CPU Tensor | CPU Tensor | CPU 侧完成索引处理和数据搬运，主要用于功能验证 |
-| 非图 NPU 路径 | `device="npu"` | NPU Tensor | NPU Tensor | NPU Tensor 和输出 Buffer 可以在提交请求前按需申请，Device 侧完成索引处理和数据搬运 |
-| 图 NPU 路径 | Capture 前准备且地址稳定的 NPU AccessTable | 图内 NPU Tensor | 图内地址稳定的 NPU Tensor | 索引处理和 KV 数据搬运均作为图内执行路径 |
+| 执行路径 | 地址输入 | 输出 Buffer | 处理方式 |
+| --- | --- | --- | --- |
+| Host CPU 路径 | AccessTable + 逻辑索引 | CPU Tensor | CPU 侧完成查表和数据搬运，主要用于功能验证 |
+| 非图 NPU 路径 | caller-resolved remote/local Tensor | NPU Tensor | Operator 直接生成 WQE 并搬运 |
+| 图 NPU 路径 | 地址稳定的 remote/local Tensor | 地址稳定的 NPU Tensor | Replay 前只更新固定地址 Tensor 的内容 |
 
-图模式下，`BatchGet` 使用的 AccessTable、`indices` 和 `miss_count` 的 Shape、`output_buffers` 的布局和容量以及具体执行路径需要在 Graph Capture 阶段确定。Graph Replay 阶段只更新设备侧 Tensor 中的索引和有效前缀长度等数据，不执行 Host 侧 Key 解析、Meta 查询或动态内存申请。
+图模式下，remote/local 地址 Tensor、`miss_count` 和 output 的 Shape 与设备地址需要在
+Graph Capture 阶段确定。Graph Replay 前可更新地址内容和有效前缀长度，不执行 Host
+侧 Key 解析、Meta 查询或动态内存申请。
 
 ##### 返回语义
 
-- `BatchGet` 在索引处理和 KV 数据搬运完成、输出 Tensor 已经写入后返回 `Status`；
+- `BatchGet` 在地址前缀的数据搬运完成、输出 Tensor 已经写入后返回 `Status`；
 - POC 采用整批成功或整批失败的语义，不返回单个 KV Block 的部分成功结果；
 - `BatchGet` 不改变 Meta 映射，也不更新或刷新 `AccessTableHandle` 中已经准备好的地址表。
  
@@ -822,7 +824,10 @@ POC 阶段，Meta Manager 以单卡、单实例为管理边界，只管理一块
 
 KV Access Operator 是 KVAF Runtime 内部负责实际 KV 数据搬运的算子模块。它不维护 Key 到地址的映射，也不负责 Prefix Key、Forward 或 KV 生命周期管理；它只消费 Runtime 已经准备好的访问描述和数据 Tensor，并将一次 KV 访问请求转换为具体的硬件执行计划。
 
-对于 BatchGet，KV Access Operator 接收 AccessTable、`indices`、`miss_count`、`output_indices` 和输出 Tensor，直接处理请求数组的有效前缀并完成间接查表、目标地址计算以及 KV 数据搬运。对于 BatchPut，它接收源数据 Tensor 和 Meta Manager 返回的远端访问描述，完成数据写入。
+对于 NPU BatchGet，KV Access Operator 接收调用方已经解析好的
+`remote_addresses`、`local_addresses`、`miss_count` 和输出 Tensor，只处理有效前缀
+并完成 KV 数据搬运，不再执行间接查表或目标地址乘加。对于 BatchPut，它接收源数据
+Tensor 和 Meta Manager 返回的远端访问描述，完成数据写入。
 
 
 ### 5.2 对外接口
@@ -832,7 +837,7 @@ KV Access Operator 是 KVAF Runtime 内部负责实际 KV 数据搬运的算子�
 | 接口 | 输入 | 输出 | 功能 | 接口限制 |
 | --- | --- | --- | --- | --- |
 | `ExecuteBatchPut` | `BatchPutExecRequest` | 完成状态 | 根据远端访问描述，将一批源数据搬运到远端 DDR | 支持连续和离散访问；不负责提交 Meta 映射；返回成功仅表示数据搬运完成 |
-| `ExecuteBatchGet` | `BatchGetExecRequest` | 完成状态 | 根据 AccessTable、索引、miss count 和输出索引完成查表及 KV 数据搬运 | AccessTable、输入 Tensor 和输出 Tensor 的设备必须与执行路径匹配；有效前缀之外不得发起搬运 |
+| `ExecuteBatchGet` | `BatchGetExecRequest` | 完成状态 | 根据 remote/local 地址和 miss count 完成 KV 数据搬运 | 地址 Tensor 和输出 Tensor 必须位于 NPU；有效前缀之外不得发起搬运 |
 
 POC 阶段，Operator 统一支持连续和离散 KV Block 访问，采用整批成功或整批失败的语义，不返回单个 Block 的部分成功结果。Operator 不修改 Meta 映射，也不负责释放远端地址区间。
 
@@ -842,8 +847,8 @@ Operator 的执行状态以一次请求为生命周期，不长期保存 Key 映
 
 ```text
 Operator Request
-├── AccessTableView
-├── Index / MissCount View
+├── Remote / Local Address View
+├── MissCount View
 ├── Output Tensor View
 ├── TransferPlan
 ├── SelectedBackend
@@ -852,8 +857,8 @@ Operator Request
 
 其中：
 
-- `AccessTableView`：访问地址、长度和有效性字段的只读视图；
-- `Index / MissCount View`：本次请求要访问的 AccessTable 索引及有效前缀长度；
+- `Remote / Local Address View`：调用方解析好的绝对源/目标地址；
+- `MissCount View`：本次请求的有效前缀长度；
 - `Output Tensor View`：输出 Tensor 的地址、Shape、Stride、dtype 和目标位置；
 - `TransferPlan`：根据输入访问模式生成的内部搬运计划，包括源地址、目标地址、长度、顺序和执行依赖；
 - `SelectedBackend`：Selector 选择的 CPU、AICPU、AIV 或 CCU 执行路径；
@@ -868,25 +873,22 @@ TransferPlan 和具体硬件 Descriptor 都是请求级临时数据。Graph Capt
 ```text
 Runtime.BatchGet
     → ExecuteBatchGet
-    → 规范化 Tensor 和 AccessTable View
+    → 校验 direct-address Tensor
     → Selector 选择硬件及执行路径
     → Executor 生成 TransferPlan
     → Template 生成硬件执行描述
-    → HComm 执行查表和数据搬运
+    → HComm 执行数据搬运
     → 返回 Status
 ```
 
 Operator 接收到请求后，按照以下逻辑处理：
 
-1. 读取 `indices`，将其解释为 AccessTable 索引，而不是 Key 或远端地址；
-2. 读取 `miss_count`，把 `[0, miss_count)` 作为唯一有效请求范围；
-3. 对有效索引查找对应的 UBA 和 Length；
-4. 根据 `output_indices` 计算目标 Tensor 中的写入位置；
-5. 由选定的硬件路径直接完成这些前缀请求的数据搬运。
+1. 读取 `miss_count`，把 `[0, miss_count)` 作为唯一有效请求范围；
+2. 读取该前缀的 `remote_addresses` 和 `local_addresses`；
+3. 由选定的硬件路径直接完成这些请求的数据搬运。
 
-`miss_count` 之后的容量位置不发起搬运。当有效前缀位置对应 AccessTable Padding 或无效地址时，Operator 返回执行错误，不产生部分成功结果。
-
-Operator 可以采用 `torch.gather`、自定义 Device Kernel 或硬件专用查表逻辑完成间接查表，但这些实现不改变 Runtime 对外接口。
+`miss_count` 之后的容量位置不发起搬运。地址解析由调用方完成，因此 Operator 热路径
+不包含 `gather`、AccessTable 读取或 output row 乘法。
 
 
 #### 5.4.2 BatchPut 执行流程
@@ -1004,9 +1006,9 @@ DecodeKVContext
 ├── prefix / block metadata
 ├── kv_block_keys: KVBlockKeyView
 ├── access_table_handle: AccessTableHandle
-├── indices: Tensor
+├── remote_addresses: Tensor
+├── local_addresses: Tensor
 ├── miss_count: Tensor
-├── output_indices: Tensor
 ├── output_buffers: TensorList
 └── state: Prepared | Submitted | Completed | Released
 ```
@@ -1016,11 +1018,12 @@ DecodeKVContext
 - `vllm_batch_info` 保存 Batch、Sequence、Layer 或其他上层组织信息，但这些信息不会传入 KVAF Meta Manager；
 - `kv_block_keys` 是由 Adaptor 根据 vLLM 的 Block 标识生成的 KVAF Key；
 - `access_table_handle` 由 `PrepareAccessTable` 返回，Adaptor 负责在使用完成后调用 `ReleaseAccessTable`；
-- `indices`、`miss_count` 和 `output_indices` 是面向 KVAF BatchGet 的设备 Tensor；
+- `remote_addresses`、`local_addresses` 和 `miss_count` 是面向 NPU BatchGet 的设备 Tensor；
 - `output_buffers` 的底层内存由 vLLM 或上层服务管理，Adaptor 不负责释放这些 Tensor；
 - `state` 用于约束 Prepare、Get、Release 的调用顺序。
 
-Adaptor 不保存远端 UBA，也不自行维护 Key 到远端地址的映射。所有地址信息都通过 AccessTableHandle 和 KVAF Runtime 获取。
+Adaptor 不自行维护 Key 到远端地址的持久映射；它从 AccessTable 获取本轮 UBA，并在
+调用 BatchGet 前物化最终 remote/local 地址 Tensor。
 
 ### 6.4 Adaptor 接口详情
 TBD：待6.2明确后重构当前单元，以下内容仅供参考
@@ -1033,7 +1036,7 @@ PrepareDecodeKV
     → 生成 KV Block Keys
     → 组织 Key 的逻辑形状和 row_offsets
     → 调用 KVAF.PrepareAccessTable
-    → 准备 indices、miss_count、output_indices
+    → 解析 remote_addresses、local_addresses、miss_count
     → 返回 DecodeKVContext
 ```
 
@@ -1051,15 +1054,14 @@ Adaptor 将 `DecodeKVContext` 中的字段组装为 KVAF `BatchGetRequest`：
 
 ```text
 BatchGetRequest
-├── access_table: context.access_table_handle
-├── indices: context.indices
+├── remote_addresses: context.remote_addresses
+├── local_addresses: context.local_addresses
 ├── miss_count: context.miss_count
-├── output_buffers: context.output_buffers
-├── output_indices: context.output_indices
-└── options
+└── output: context.output_buffers
 ```
 
-然后调用 `KVAF.BatchGet` 或 `KVAF.BatchGetAsync`。Adaptor 不执行查表、地址计算或数据搬运，只负责参数转换和上层生命周期管理。
+然后调用 `KVAF.BatchGet` 或 `KVAF.BatchGetAsync`。Adaptor 负责调用前的查表与地址
+计算，KVAF Access Operator 负责数据搬运。
 
 #### 6.4.3 PutKV
 
@@ -1093,12 +1095,12 @@ Adaptor 是 vLLM Graph 与 KVAF Runtime 之间的边界。图模式下采用以�
     vLLM Batch/Prefix 信息
         → PrepareDecodeKV
         → PrepareAccessTable
-        → 准备稳定的 NPU AccessTable、Output Buffer 和输入 Tensor
+        → 准备稳定的 remote/local 地址 Tensor 和 Output Buffer
 
 图内：
-    更新 indices / miss_count / output_indices 的设备侧数值
+    更新 remote_addresses / local_addresses / miss_count 的设备侧数值
         → KVAF.BatchGet
-        → KV Access Operator 查表和搬运
+        → KV Access Operator 直接搬运
 ```
 
 图 Replay 阶段不执行字符串 Key 解析、Host Meta 查询、动态 Tensor 创建或动态地址分配。Adaptor 只更新已经分配的设备 Tensor 内容，Batch Size、Shape、容量和输出布局保持稳定。

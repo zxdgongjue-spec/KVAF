@@ -20,10 +20,10 @@ caller-owned buffer 与远端 DDR 组织为一次数据搬运。它不拥有 Key
 | `ExecuteBatchPut(request)` | 已支持，同步 eager | 使用 caller-owned packed NPU `input`、每条 CPU `input_offsets/lengths` 和 Runtime `PreparePut` 返回的地址。Operator 将 metadata 上传到 NPU，调用 AIV Direct-HCCP WRITE，并在成功后由 Runtime CommitPut；失败则 Runtime AbortPut。未配置 BatchPut kernel 时保留 ACL D2H mock 供本地/BatchGet-only 构建使用。 |
 | `Shutdown()` | 已支持 | 释放两个独立 transport 及其缓存的 local HBM MR；最后一个 transport 才释放共享 RA/HDC session。调用方必须先完成所有外部 stream/graph 工作。 |
 
-当前 BatchGet 是固定大小 block 的 POC：NPU 侧 `indices`、`mask`、
-`output_indices`、device AccessTable 与 `output` 都由调用方提供；`status` 和
-`queue_state` 由 Operator 内部申请。Python 通过 `DeviceAccessTable` 和 Tensor
-调用，不传裸指针/字节数。没有公开的 `BindBatchGetOutput` API。
+当前 BatchGet 是固定大小 block 的 POC：NPU 调用方在进入 Runtime 前完成查表和
+输出行解析，直接提供 `remote_addresses`、`local_addresses`、`miss_count` 与
+`output` Tensor；`status` 和 `queue_state` 由 Operator 内部申请。没有公开的
+`BindBatchGetOutput` API。
 
 ## 生命周期
 
@@ -63,7 +63,7 @@ Runtime.Shutdown
 `LocalBufferAcquire/Release` 是 demo host 库的内部协作接口，Operator 上层只调用
 `Runtime.BatchGet/BatchPut`。默认 BatchGet 提交路径不替调用方同步；外部 graph capture 只能使用已预热、
 因而命中 transport cache 的 output，并由 Python/框架保证 graph replay 完成后才释放
-tensor、AccessTable 和 Runtime。KVAF 不创建、保存或 replay 任何图对象。
+地址 tensor、其指向的远端内存、output 和 Runtime。KVAF 不创建、保存或 replay 任何图对象。
 
 ## 构建范围
 

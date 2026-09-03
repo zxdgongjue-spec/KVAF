@@ -45,29 +45,21 @@ CPU Mock 仅用于本地功能验证；它不等同于 A5/CANN 的设备内存�
 启用 AIV CANN 构建时，额外导出 `kvaf.NpuRuntime`、`kvaf.DeviceAccessTable` 与
 `kvaf.AclGraph`。使用 NPU BatchGet 时先调用
 `runtime.access_table_view(table, device="npu", capacity=N)` 得到
-`DeviceAccessTable`，再调用：
+`DeviceAccessTable`，调用方在 Runtime 外完成查表和输出地址计算，再调用：
 
 ```python
-runtime.batch_get(
-    device_table, indices, offsets, miss_count, output_indices, output
+indices64 = indices.to(torch.int64)
+remote_addresses = device_table.addresses[indices64] + offsets.to(torch.int64)
+local_addresses = (
+    output_indices.to(torch.int64) * output.shape[1] + output.data_ptr()
 )
-# 或直接传入 DeviceAccessTable 中的两个 Tensor：
-runtime.batch_get(
-    device_table.addresses,
-    device_table.valid,
-    indices,
-    offsets,
-    miss_count,
-    output_indices,
-    output,
-)
+runtime.batch_get(remote_addresses, local_addresses, miss_count, output)
 ```
 
-其中所有数据参数均为连续 NPU Tensor；`miss_count` 是单元素 `torch.int32` NPU
-Tensor，只有三个请求数组的 `[0, miss_count)` 前缀会被执行。输出行字节数从
+其中地址参数是等长的一维 8-byte 连续 NPU Tensor；`miss_count` 是单元素
+`torch.int32` NPU Tensor，只有地址数组的 `[0, miss_count)` 前缀会被执行。输出行字节数从
 `output.shape[0]` 推导，默认
 使用 `torch.npu.current_stream()` 且只提交不主动同步。AIV 内部 status/queue 不属于
-Python API。直接传入 `addresses` / `valid` 时，调用方需自行保证表项指向
-`128 * 656B` 的远端区域，并保持 Tensor 有效直到 stream 执行完成。
+Python API。调用方必须保证两个地址数组、远端内存和 output 有效直到 stream 执行完成。
 `AclGraph` 由 Python 调用方持有，直接封装 ACL Runtime Graph 的
 capture / replay / synchronize / reset；图对象不属于 Runtime 或 Operator。

@@ -42,8 +42,8 @@ struct AccessTablePrepareRequest {
 };
 
 // Runtime 内部 AccessTable 的只读宿主视图。view 只在关联 Handle 有效时
-// 可用；绑定层可将其中 address/valid materialize 为直接传给 NPU BatchGet
-// 的 DeviceAccessTable。
+// 可用；绑定层可将其中 address/valid materialize 为 DeviceAccessTable，
+// 再由调用方解析为 NPU BatchGet 的最终地址数组。
 struct AccessTableView {
   const Address* addresses{nullptr};
   const std::uint64_t* lengths{nullptr};
@@ -51,30 +51,11 @@ struct AccessTableView {
   std::size_t size{0};
 };
 
-// NPU BatchGet 使用的 device AccessTable buffer。C++ Runtime 不拥有这些
-// buffer；Python binding 可从 AccessTableHandle materialize 一个直接可用的
-// DeviceAccessTable。其 entry 数可以大于 Host AccessTable，以支持固定容量
-// 的调用方 Tensor。
-struct AccessTableDeviceView {
-  ConstBufferView addresses;
-  ConstBufferView valid;
-
-  bool empty() const {
-    return addresses.data == nullptr && addresses.bytes == 0 &&
-           valid.data == nullptr && valid.bytes == 0;
-  }
-};
-
 struct BatchGetRequest {
-  // CPU BatchGet 必须提供有效 handle。NPU BatchGet 使用 DeviceAccessTable
-  // 重载时也会提供 handle，以便 Runtime 验证 Host 表生命周期；
-  // 直接传入 addresses/valid Tensor 时 handle 可为空。
+  // CPU BatchGet 必须提供有效 handle；NPU direct-address BatchGet 留空。
   AccessTableHandle access_table;
 
-  // indices/offsets/output_indices 为 int32[n]；offsets 是表项内的字节偏移。
-  // miss_count 为 int32[1]，只有三个请求数组的 [0, miss_count) 前缀有效。
-  // 每个有效请求搬运 output_block_bytes；offset 加该长度不得
-  // 越过 128 * output_block_bytes 表项。
+  // CPU path 使用的逻辑查表输入。NPU path 必须全部留空。
   ConstBufferView indices;
   ConstBufferView offsets;
   ConstBufferView miss_count;
@@ -82,8 +63,12 @@ struct BatchGetRequest {
   MutableBufferView output;
   std::uint64_t output_block_bytes{0};
 
-  // CPU path 留空。NPU path 必须提供调用方持有的稳定 Device 表。
-  AccessTableDeviceView device_access_table;
+  // NPU path 使用的最终绝对地址，均为 uint64[request_capacity]。只有
+  // [0, miss_count) 前缀会被搬运。调用方负责在提交前完成查表与偏移计算，
+  // 并保证地址数组、远端内存和 output 在 stream 完成前保持有效。
+  // CPU path 必须将这两个 view 留空。
+  ConstBufferView remote_addresses;
+  ConstBufferView local_addresses;
 };
 
 struct BatchPutRequest {
@@ -120,7 +105,7 @@ struct BatchGetExecutionOptions {
 
 // Runtime 向 AccessOperator 提交的 BatchGet 描述。
 struct BatchGetExecRequest {
-  // 直接传入 NPU addresses/valid Tensor 时 Host view 可为空。
+  // NPU direct-address path 不使用 Host view。
   AccessTableView host_access_table;
   const BatchGetRequest* request{nullptr};
   BatchGetExecutionOptions execution;

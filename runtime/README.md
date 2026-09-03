@@ -52,7 +52,7 @@ buffer，由 `DefaultAccessOperator.Initialize` 申请并在 `Shutdown` 释放�
 其 completion status 并以 `[KVAF_AIV] BATCH_GET_DEVICE_ERROR` 诊断日志记录
 设备侧错误；它不会成为 Python 的额外返回值。
 
-## 当前 POC 的 NPU AccessTable 边界
+## 当前 POC 的 NPU 地址解析边界
 
 `PrepareAccessTable` 生成 Runtime-owned 的扁平 Host `address/length/valid` 表并
 持有对应 Key 锁。C++ `GetAccessTableView` 返回指向三段连续 Host 内存的 non-owning
@@ -60,13 +60,22 @@ view，不是 Tensor，也不会复制数据。
 
 Python `NpuRuntime.access_table_view(handle, device="npu", capacity=N)` 则创建
 `DeviceAccessTable`：它持有 `addresses: torch.int64[N]` 和 `valid: torch.uint8[N]`
-两个 NPU Tensor，并在图外完成一次 Host-to-NPU materialize。这个对象可直接传给
-`NpuRuntime.batch_get`，调用者无需再传 `access_table` handle、裸指针、字节数或
-手写 scatter。`capacity` 可大于有效 key 数；有效数据位于前缀，其余 `valid=0`。
+两个 NPU Tensor，并在图外完成一次 Host-to-NPU materialize。`capacity` 可大于
+有效 key 数；有效数据位于前缀，其余 `valid=0`。
 
-`DeviceAccessTable` 及其两个 Tensor 必须存活到关联 BatchGet stream 完成，且其
-source handle 必须在此后才可 `ReleaseAccessTable`。Runtime 不额外注册 caller 的
-address/valid Tensor。
+NPU `batch_get` 不再接收 DeviceAccessTable、`indices`、`offsets` 或
+`output_indices`。调用方在进入 Runtime 前计算两个最终地址 Tensor：
+
+```python
+remote_addresses = address_table[indices.to(torch.int64)] + offsets.to(torch.int64)
+local_addresses = output.data_ptr() + output_indices.to(torch.int64) * block_bytes
+runtime.batch_get(remote_addresses, local_addresses, miss_count, output)
+```
+
+两个地址 Tensor 必须等长、一维、每元素 8 byte，并在关联 stream 完成前保持有效。
+`local_addresses` 必须落在本次 `output` 的注册范围内。调用方还必须保留远端地址所
+依赖的 AccessTable handle/Key 锁，完成后才能 `ReleaseAccessTable`；Runtime 不再从
+BatchGet 参数中反向推断或校验该生命周期。
 
 `valid` 是每个 AccessTable entry 的安全位：`1` 表示可访问，`0` 表示 padding
 或无效 entry。调用方必须只把有效访问放进 `[0, miss_count)` 请求前缀；该前缀
@@ -75,13 +84,9 @@ address/valid Tensor。
 `LockKeys` 阶段直接返回 `kNotFound`，因此不会产生一张含该 Key 的
 `valid=0` 表。
 
-当前 AIV BatchGet ABI 由输出 Tensor 的行宽动态决定每个 WQE 的读取长度，
-每个 NPU AccessTable valid entry 必须是 `128 * output_block_bytes`。
-`indices[i]` 选择 entry，`offsets[i]` 提供 entry 内
-字节偏移，最终远端地址为 `address_table[indices[i]] + offsets[i]`。Runtime 在
-`PrepareAccessTable` 时一次性
-计算这一不变量，之后每次 BatchGet 只做 O(1) 比较；不会在数据面热路径重新扫描
-整张表。
+当前 AIV BatchGet ABI 由输出 Tensor 的行宽动态决定每个 WQE 的读取长度。Runtime、
+Access Operator 和 AIV WQE Fill 均不再执行间接查表或输出行乘法；它们只透传并读取
+`remote_addresses[i]` 和 `local_addresses[i]`。
 
 设备侧 `core_status.result`（例如 `kInvalidLookup`）是 Operator 内部诊断状态，
 不是 Python BatchGet 的输入/输出。显式 `synchronize=True` 时会记录错误 marker；
@@ -109,8 +114,8 @@ AIV 或 Direct-HCCP 的替身，因此不能作为 NPU 数据面验证结论。
 
 `KVAF_ENABLE_AIV_BATCH_GET=ON` 配合 `KVAF_BUILD_PYTHON=ON` 会构建 merged
 demo 的 kernel/host 库、`DefaultAccessOperator` 和 `kvaf.NpuRuntime`。
-Python 脚本创建 NPU Tensor；通过 Runtime materialize `DeviceAccessTable`，然后
-直接传入 `batch_get`：
+Python 脚本通过 Runtime materialize `DeviceAccessTable`，在调用方解析出最终
+remote/local 地址 Tensor，然后传入 `batch_get`：
 
 ```bash
 cmake -S . -B build-aiv -DBUILD_TESTING=ON \
@@ -129,8 +134,8 @@ KVAF_NPU_JETTYS_PER_CORE=2 \
 timeout 240s python3 tests/python/test_npu_batch_get.py
 ```
 
-该脚本用小规模 case 验证 Runtime 初始化、调用方 Device Tensor、Runtime
-materialize 的 `DeviceAccessTable`、BatchGet 输出字节、`output A -> B -> A` 的 local-buffer 缓存复用及
+该脚本用小规模 case 验证 Runtime 初始化、Runtime materialize 的
+`DeviceAccessTable`、调用方地址解析、BatchGet 输出字节、`output A -> B -> A` 的 local-buffer 缓存复用及
 teardown。它以 `KVAF_NPU_ACTIVE_PERCENT` 决定 `miss_count`（例如 `5` 表示约 5%
 请求有效），只为 `[0, miss_count)` 前缀写入 KV；随后可用 Runtime 的 ACL D2H mock
 `batch_put` 将 caller-owned NPU source Tensor 写入 Runtime-owned DDR。该小型
@@ -157,9 +162,9 @@ Runtime 与 AccessOperator 不创建或保存图。`AclGraph` 是 pybind 暴露�
 capture 中只 capture `runtime.batch_get(..., stream=capture_stream)`。
 
 每次 replay 前，Python 在同一 ACL stream 上以
-`AclGraph.copy_host_to_device_async` 更新固定地址的 `address_table`、`indices`、
-`miss_count`、`output_indices`；capture 中的 BatchGet 参数和所有 NPU tensor 地址不变。正常
-性能口径是 `graph_replay_to_stream_completion`：五项 H2D 更新会在 replay 前完成并同步，
+`AclGraph.copy_host_to_device_async` 更新固定地址的 `remote_addresses` 和
+`miss_count`；`local_addresses` 与 output 布局保持不变，capture 中的 BatchGet 参数和
+所有 NPU tensor 地址不变。正常性能口径是 `graph_replay_to_stream_completion`：两项 H2D 更新会在 replay 前完成并同步，
 不进入计时窗口；计时仅包含 graph replay 到同一 stream 完成，与 eager 的
 `runtime_batch_get_call_to_stream_completion` 口径对齐。默认 graph 的 warmup/iterations
 与 eager 一律使用相同的 `KVAF_NPU_WARMUP` / `KVAF_NPU_ITERATIONS` 采样计划。
@@ -241,9 +246,8 @@ BatchGet/Put 的每个样本均在 Runtime 调用后由调用方 `torch.npu.sync
 `source_token_ids[batch * 2048]`，`destination_slots` 是输出行的随机排列。每个
 sample 生成一个小于请求容量的单元素 NPU `int32 miss_count`，其期望值约为
 `batch * 2048 * active_percent`。数据构造阶段只保存这三项；每个 sample 调用
-BatchGet 前再生成 `indices = source_token_ids // 128`、
-`offsets = (source_token_ids % 128) * block_bytes`、由 `destination_slots` 物化的
-`output_indices`；只有三个数组的 `[0, miss_count)` 前缀会被搬运，不再生成 mask。
+BatchGet 前在调用方生成最终 `remote_addresses` 和 `local_addresses`；只有地址数组的
+`[0, miss_count)` 前缀会被搬运，不再生成 mask。
 输入构造和派生不记录耗时，也不纳入 BatchGet 端到端指标。正式
 sample 只输出 `batch_get_submit`、`batch_get_synchronize` 和 `batch_get` 的
 `PERF_RESULT`；`batch_get` 从 Runtime 调用前开始计时，到调用方完成

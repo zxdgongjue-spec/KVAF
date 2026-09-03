@@ -150,31 +150,19 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
     return InvalidArgument("BatchGet request and arguments must not be null");
   }
   const BatchGetRequest& request = *exec.request;
-  if (!request.indices.has_elements<std::int32_t>() ||
-      !request.offsets.has_elements<std::int32_t>() ||
-      !request.output_indices.has_elements<std::int32_t>() ||
+  if (!request.remote_addresses.has_elements<Address>() ||
+      !request.local_addresses.has_elements<Address>() ||
+      request.remote_addresses.bytes != request.local_addresses.bytes ||
       !request.output.valid() ||
       request.output_block_bytes == 0 ||
       request.output_block_bytes > kBatchGetMaxTransferBytes ||
       request.output.bytes % request.output_block_bytes != 0 ||
-      request.indices.device != request.offsets.device ||
-      request.indices.device != request.output_indices.device ||
-      request.indices.device != request.output.device ||
-      request.indices.device != DeviceKind::kNpu ||
-      request.output_indices.device != DeviceKind::kNpu ||
+      request.remote_addresses.device != DeviceKind::kNpu ||
+      request.local_addresses.device != DeviceKind::kNpu ||
       !request.miss_count.has_elements<std::int32_t>() ||
       request.miss_count.bytes != sizeof(std::int32_t) ||
       request.miss_count.device != DeviceKind::kNpu ||
       request.output.device != DeviceKind::kNpu ||
-      request.device_access_table.addresses.device != DeviceKind::kNpu ||
-      request.device_access_table.valid.device != DeviceKind::kNpu ||
-      request.device_access_table.addresses.bytes == 0 ||
-      request.device_access_table.addresses.bytes % sizeof(Address) != 0 ||
-      request.device_access_table.valid.bytes !=
-          request.device_access_table.addresses.bytes / sizeof(Address) ||
-      request.indices.bytes % sizeof(std::int32_t) != 0 ||
-      request.offsets.bytes != request.indices.bytes ||
-      request.output_indices.bytes != request.indices.bytes ||
       execution.status == nullptr ||
       execution.status_bytes < static_cast<std::size_t>(npu_core_count) *
                                    sizeof(KvafBatchGetCoreStatus) ||
@@ -185,27 +173,19 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
     return InvalidArgument("BatchGet request does not satisfy the NPU buffer contract");
   }
 
-  const std::size_t request_count = request.indices.bytes / sizeof(std::int32_t);
-  const std::size_t output_rows = request.output.bytes / request.output_block_bytes;
-  const std::size_t device_table_entries =
-      request.device_access_table.addresses.bytes / sizeof(Address);
-  if (!FitsU32(device_table_entries) || !FitsU32(request_count) ||
-      !FitsU32(output_rows) || !FitsU32(request.output_block_bytes)) {
+  const std::size_t request_count =
+      request.remote_addresses.bytes / sizeof(Address);
+  if (!FitsU32(request_count) || !FitsU32(request.output_block_bytes)) {
     return InvalidArgument("BatchGet dimensions exceed the device ABI");
   }
   *arguments = KvafExecuteBatchGetKernelArgs{};
-  arguments->address_table = PointerValue(request.device_access_table.addresses.data);
-  arguments->valid_table = PointerValue(request.device_access_table.valid.data);
-  arguments->indices = PointerValue(request.indices.data);
-  arguments->offsets = PointerValue(request.offsets.data);
+  arguments->remote_addresses = PointerValue(request.remote_addresses.data);
+  arguments->local_addresses = PointerValue(request.local_addresses.data);
   arguments->miss_count = PointerValue(request.miss_count.data);
-  arguments->output_indices = PointerValue(request.output_indices.data);
   arguments->output = PointerValue(request.output.data);
   arguments->core_status = PointerValue(execution.status);
   arguments->queue_state = PointerValue(execution.queue_state);
-  arguments->table_capacity = static_cast<std::uint32_t>(device_table_entries);
   arguments->request_capacity = static_cast<std::uint32_t>(request_count);
-  arguments->output_rows = static_cast<std::uint32_t>(output_rows);
   arguments->block_bytes =
       static_cast<std::uint32_t>(request.output_block_bytes);
   arguments->block_count = npu_core_count;
