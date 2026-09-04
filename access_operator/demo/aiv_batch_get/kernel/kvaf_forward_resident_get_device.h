@@ -124,6 +124,9 @@ enum KvafForwardResidentBeginStatus : uint32_t {
   kForwardResidentBeginStateRetired = 9U,
   kForwardResidentBeginStateFailedSuccess = 10U,
   kForwardResidentBeginStateUnknown = 11U,
+  // A nonzero but nonexact producer-index advance proves that descriptor
+  // publication may have reached HCCP.  It is deliberately not releasable.
+  kForwardResidentBeginSqProducerDeltaMismatch = 12U,
 };
 
 // AscendC cannot use compiler-generated struct assignment across the GM/local
@@ -659,11 +662,30 @@ __aicore__ inline bool BuildKvafForwardResidentQueueArgs(
 // These wrappers intentionally contain no alternative HCCP protocol.  They
 // delegate to the unchanged dense PostOnly / nonblocking CQ probe / terminal
 // Finish ABI once a dynamic queue and descriptor have been admitted.
-__aicore__ inline uint32_t ClassifyKvafForwardResidentBegin(
-    uint64_t result, uint32_t state) {
-  if (result == kSuccess && state == kDenseBatchGetInFlight) {
-    return kForwardResidentBeginPosted;
+// Read the durable SQ producer receipt outside the large PostOnly closure.
+// Direct bypass loads plus a DDR DSB make this independent of the compiler's
+// writeback of the local dense transaction record.
+__aicore__ inline bool SnapshotKvafForwardResidentQueueProgress(
+    const KvafExecuteBatchGetKernelArgs& args, uint32_t* initialized,
+    uint64_t* sq_producer_index) {
+  if (args.queue_state == 0U || initialized == nullptr ||
+      sq_producer_index == nullptr) {
+    return false;
   }
+  __gm__ KvafBatchGetQueueState* const queue =
+      reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args.queue_state);
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  *initialized = ReadGmByPassDCache<uint32_t>(&queue->initialized);
+  *sq_producer_index =
+      ReadGmByPassDCache<uint64_t>(&queue->sq_producer_index);
+  return true;
+}
+
+// Transaction scalar output may prove a validation failure, but may not prove
+// that a post happened.  POSTED is returned only from an exact durable SQ PI
+// delta in BeginKvafForwardResidentBatchGetPostOnly below.
+__aicore__ inline uint32_t ClassifyKvafForwardResidentBeginWithoutPost(
+    uint64_t result, uint32_t state) {
   switch (result) {
     case kInvalidArgs:
       return kForwardResidentBeginInvalidArgs;
@@ -741,11 +763,40 @@ __aicore__ inline uint32_t BeginKvafForwardResidentBatchGetPostOnly(
           &active_request_count)) {
     return kForwardResidentBeginInvalidArgs;
   }
+  uint32_t sq_initialized_before = 0U;
+  uint64_t sq_producer_before = 0U;
+  if (!SnapshotKvafForwardResidentQueueProgress(
+          args, &sq_initialized_before, &sq_producer_before)) {
+    return kForwardResidentBeginInvalidArgs;
+  }
   KvafDenseBatchGetTransaction transaction{};
   BeginKvafDenseBatchGetPostOnly(args, active_request_count, 0U,
                                  &transaction);
-  return ClassifyKvafForwardResidentBegin(transaction.result,
-                                          transaction.state);
+  uint32_t sq_initialized_after = 0U;
+  uint64_t sq_producer_after = 0U;
+  if (!SnapshotKvafForwardResidentQueueProgress(
+          args, &sq_initialized_after, &sq_producer_after)) {
+    return kForwardResidentBeginResultUnknown;
+  }
+
+  // First use initializes PI to zero, then advances it once per exact dense
+  // request.  Unsigned subtraction intentionally remains correct across a
+  // 64-bit producer-index wrap.  With the held queue lease, any nonzero
+  // nonexact delta is ambiguous/partial commit and must retain the lease.
+  if (sq_initialized_after != 0U) {
+    const uint64_t sq_producer_baseline =
+        sq_initialized_before != 0U ? sq_producer_before : 0U;
+    const uint64_t sq_producer_delta =
+        sq_producer_after - sq_producer_baseline;
+    if (sq_producer_delta == static_cast<uint64_t>(active_request_count)) {
+      return kForwardResidentBeginPosted;
+    }
+    if (sq_producer_delta != 0U) {
+      return kForwardResidentBeginSqProducerDeltaMismatch;
+    }
+  }
+  return ClassifyKvafForwardResidentBeginWithoutPost(transaction.result,
+                                                     transaction.state);
 }
 
 // Rebuild the CQ-drain record from inputs that are immutable for the held

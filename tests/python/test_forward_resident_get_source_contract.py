@@ -102,7 +102,20 @@ def main() -> None:
     )
     assert "KvafForwardResidentBatchGetWave*" not in begin
     assert "KvafDenseBatchGetTransaction transaction{}" in begin
-    assert "return ClassifyKvafForwardResidentBegin(" in begin
+    # A compiler-local dense transaction writeback cannot prove that HCCP was
+    # posted.  The Begin boundary must instead require the exact durable SQ
+    # producer-index advance for this wave.
+    assert "SnapshotKvafForwardResidentQueueProgress(" in begin
+    assert "sq_producer_delta == static_cast<uint64_t>(active_request_count)" in begin
+    assert "return kForwardResidentBeginPosted;" in begin
+    assert "kForwardResidentBeginSqProducerDeltaMismatch" in begin
+    assert "return ClassifyKvafForwardResidentBeginWithoutPost(" in begin
+    assert "return ClassifyKvafForwardResidentBegin(" not in begin
+    exact_delta = "sq_producer_delta == static_cast<uint64_t>(active_request_count)"
+    partial_delta = "if (sq_producer_delta != 0U)"
+    assert begin.index(exact_delta) < begin.index(partial_delta) < begin.index(
+        "return kForwardResidentBeginSqProducerDeltaMismatch;"
+    ) < begin.index("return ClassifyKvafForwardResidentBeginWithoutPost(")
     assert "!IsKvafForwardResidentBatchGetControlValidForAicore(control)" in begin
 
     rehydrate = _between(
@@ -130,6 +143,16 @@ def main() -> None:
     )
     assert "kForwardResidentBeginPosted = 0U" in begin_status
     assert "kForwardResidentBeginResultUnknown" in begin_status
+    assert "kForwardResidentBeginSqProducerDeltaMismatch" in begin_status
+
+    no_post = _between(
+        device,
+        "__aicore__ inline bool KvafForwardResidentBeginHasNoPost(",
+        "// The sole HCCP PostOnly boundary.",
+    )
+    # Partial/ambiguous PI progress is never permitted to recycle its queue.
+    assert "kForwardResidentBeginSqProducerDeltaMismatch" not in no_post
+    assert "kForwardResidentBeginResultUnknown" not in no_post
 
     append = _between(
         device,
@@ -188,6 +211,26 @@ def main() -> None:
     assert dense_begin.index("ValidateDenseBatchGetDescriptors(") < dense_begin.index(
         "PrepareDenseBatchGetOutputForInboundDma("
     ) < dense_begin.index("PostDenseBatchGetRequests(")
+    assert "WriteGmByPassDCache<uint32_t>(&queues->initialized, 1U)" in dense_begin
+    assert "WriteGmByPassDCache<uint64_t>(&queues->sq_producer_index, 0U)" in dense_begin
+
+    dense_commit = _between(
+        dense,
+        "__aicore__ inline void CommitPostScalarStage(",
+        "__aicore__ inline void PostActiveRequests(",
+    )
+    assert "WriteGmByPassDCache<uint64_t>(&queue->sq_producer_index" in dense_commit
+    assert dense_commit.index("WriteGmByPassDCache<uint64_t>(") < dense_commit.index(
+        "DataSyncBarrier<MemDsbT::DDR>()"
+    ) < dense_commit.index("st_dev(")
+
+    for token in (
+        "constexpr uint32_t kDenseBatchGetReservedWqeUbBytes = 4096U;",
+        "constexpr uint32_t kDenseBatchGetPostOnlyScratchCeiling = 135168U;",
+        "kDenseBatchGetReservedWqeUbBytes == kDenseWqeBanksBytes",
+        "kDenseBatchGetPostOnlyScratchCeiling == kActiveCountUbOffset",
+    ):
+        assert token in dense, token
 
     # Dense PostOnly is a bounded alternative to mask compaction, not an
     # alternative UB address space. Its VF materializer and MTE3 copier must
