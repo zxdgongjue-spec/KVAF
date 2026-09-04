@@ -9,17 +9,12 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <condition_variable>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
-#if defined(_OPENMP)
-#include <omp.h>
-#endif
-
 #include <urma_api.h>
 
 #include "peer_link.h"
@@ -82,50 +77,11 @@ struct CpuUrmaTransport::Impl {
     std::size_t count{0U};
     std::vector<std::uint64_t> remote_offsets;
     std::vector<urma_target_seg_t*> host_segments;
-    std::vector<std::string> errors;
-    std::size_t active_workers{0U};
-    std::size_t done_workers{0U};
-    std::uint64_t generation{0U};
     std::chrono::steady_clock::time_point start{};
     std::chrono::steady_clock::time_point deadline{};
   };
 
-  std::string PrepareBatchWorker(BatchJob& job, std::size_t worker) {
-    for (std::size_t jetty = worker; jetty < local_jettys_.size();
-         jetty += batch_worker_count_) {
-      BatchQueue& queue = job.queues[jetty];
-      for (std::size_t position = 0U; position < queue.wrs.size(); ++position) {
-        const std::size_t index = position * local_jettys_.size() + jetty;
-        const auto& buffer = job.buffers[index];
-        queue.local[position] = {
-            reinterpret_cast<std::uint64_t>(buffer.data),
-            static_cast<std::uint32_t>(buffer.bytes), job.host_segments[index]};
-        queue.remote[position] = {
-            remote_region_.base + job.remote_offsets[index],
-            static_cast<std::uint32_t>(buffer.bytes), remote_seg_handle_};
-        queue.wrs[position] = {};
-        queue.wrs[position].opcode = job.write ? URMA_OPC_WRITE : URMA_OPC_READ;
-        queue.wrs[position].flag.bs.complete_enable =
-            (position + 1U == queue.wrs.size()) ? 1U : 0U;
-        queue.wrs[position].tjetty = remote_jettys_[jetty];
-        queue.wrs[position].user_ctx =
-            0xBA7C0000ULL + (static_cast<std::uint64_t>(jetty) << 32U) + position;
-        if (job.write) {
-          queue.wrs[position].rw.src = {&queue.local[position], 1U};
-          queue.wrs[position].rw.dst = {&queue.remote[position], 1U};
-        } else {
-          queue.wrs[position].rw.src = {&queue.remote[position], 1U};
-          queue.wrs[position].rw.dst = {&queue.local[position], 1U};
-        }
-        queue.wrs[position].next =
-            position + 1U < queue.wrs.size() ? &queue.wrs[position + 1U] : nullptr;
-      }
-    }
-    return {};
-  }
-
-  std::string PrepareBatchOpenMp(BatchJob& job) {
-#if defined(_OPENMP)
+  void PrepareBatch(BatchJob& job) {
 #pragma omp parallel for schedule(static) num_threads(openmp_thread_count_)
     for (std::int64_t request = 0; request < static_cast<std::int64_t>(job.count); ++request) {
       const std::size_t index = static_cast<std::size_t>(request);
@@ -156,18 +112,10 @@ struct CpuUrmaTransport::Impl {
       queue.wrs[position].next =
           position + 1U < queue.wrs.size() ? &queue.wrs[position + 1U] : nullptr;
     }
-    return {};
-#else
-    return "OpenMP mode requested but transport was not built with OpenMP";
-#endif
   }
 
-  std::string RunBatchWorker(BatchJob& job, std::size_t worker, bool all_jettys) {
-    // In prepare mode the caller drives every Jetty. In AIV mode each worker
-    // drives only its disjoint Jetty set, preserving one producer per Jetty.
-    const std::size_t first_jetty = all_jettys ? 0U : worker;
-    const std::size_t jetty_stride = all_jettys ? 1U : batch_worker_count_;
-    for (std::size_t jetty = first_jetty; jetty < local_jettys_.size(); jetty += jetty_stride) {
+  std::string PostAndPollBatch(BatchJob& job) {
+    for (std::size_t jetty = 0U; jetty < local_jettys_.size(); ++jetty) {
       BatchQueue& queue = job.queues[jetty];
       if (queue.wrs.empty()) continue;
       const std::size_t post_count = wqes_per_doorbell_ == 0U
@@ -192,9 +140,8 @@ struct CpuUrmaTransport::Impl {
         }
       }
     }
-    // Match the AIV core path: all assigned queues are posted first, then one
-    // fence CQE is drained from every used queue.
-    for (std::size_t jetty = first_jetty; jetty < local_jettys_.size(); jetty += jetty_stride) {
+    // Post every queue before draining one fence CQE from each used queue.
+    for (std::size_t jetty = 0U; jetty < local_jettys_.size(); ++jetty) {
       BatchQueue& queue = job.queues[jetty];
       if (queue.wrs.empty()) continue;
       const std::uint64_t expected_ctx = queue.wrs.back().user_ctx;
@@ -229,80 +176,18 @@ struct CpuUrmaTransport::Impl {
     return {};
   }
 
-  void BatchWorkerLoop(std::size_t worker) {
-    std::uint64_t last_generation = 0U;
-    for (;;) {
-      BatchJob* job = nullptr;
-      {
-        std::unique_lock<std::mutex> lock(batch_mutex_);
-        batch_cv_.wait(lock, [&] {
-          return batch_stop_ ||
-                 (active_batch_ != nullptr &&
-                  active_batch_->generation != last_generation);
-        });
-        if (batch_stop_) return;
-        job = active_batch_;
-        last_generation = job->generation;
-      }
-      job->errors[worker] = PrepareBatchWorker(*job, worker);
-      if (aiv_thread_mode_ && job->errors[worker].empty()) {
-        job->errors[worker] = RunBatchWorker(*job, worker, false);
-      }
-      {
-        std::lock_guard<std::mutex> lock(batch_mutex_);
-        ++job->done_workers;
-        batch_cv_.notify_all();
-      }
-    }
-  }
-
-  bool StartBatchWorkers(std::size_t count) {
-    try {
-      batch_workers_.reserve(count > 0U ? count - 1U : 0U);
-      // The caller executes worker 0. Only workers 1..N-1 need background
-      // threads, which avoids a context switch on every synchronous batch.
-      for (std::size_t worker = 1U; worker < count; ++worker) {
-        batch_workers_.emplace_back(&Impl::BatchWorkerLoop, this, worker);
-      }
-      return true;
-    } catch (...) {
-      {
-        std::lock_guard<std::mutex> lock(batch_mutex_);
-        batch_stop_ = true;
-        batch_cv_.notify_all();
-      }
-      for (auto& worker : batch_workers_) {
-        if (worker.joinable()) worker.join();
-      }
-      batch_workers_.clear();
-      return false;
-    }
-  }
-
-  void StopBatchWorkers() {
-    {
-      std::lock_guard<std::mutex> lock(batch_mutex_);
-      batch_stop_ = true;
-      batch_cv_.notify_all();
-    }
-    for (auto& worker : batch_workers_) {
-      if (worker.joinable()) worker.join();
-    }
-    batch_workers_.clear();
-  }
-
   ~Impl() { (void)Shutdown(); }
 
   Status Initialize(const CpuUrmaTransportOptions& options) {
     if (options.peer_address.empty() || options.region_bytes == 0 ||
         options.region_bytes > std::numeric_limits<std::size_t>::max() ||
         options.jetty_count == 0U || options.jetty_count > kMaxJettyCount ||
-        options.worker_count == 0U ||
-        (!options.openmp_thread_mode && options.worker_count > options.jetty_count) ||
+        options.omp_thread_count == 0U ||
         options.omp_thread_count > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
         options.wqes_per_doorbell > kJettyDepth) {
       return Status::InvalidArgument(
-          "CPU URMA transport requires peer_address, non-zero region_bytes, jetty_count in [1,16], a non-zero worker_count (not greater than jetty_count outside omp mode), and omp_thread_count <= INT_MAX");
+          "CPU URMA transport requires peer_address, non-zero region_bytes, "
+          "jetty_count in [1,16], and omp_thread_count in [1,INT_MAX]");
     }
     options_ = options;
     // URMA is process-wide.  The ACL/HBM runtime may have initialized it
@@ -569,19 +454,10 @@ struct CpuUrmaTransport::Impl {
     jfr_ = jfrs_[0];
     local_jetty_ = local_jettys_[0];
     remote_jetty_ = remote_jettys_[0];
-    batch_stop_ = false;
-    batch_worker_count_ = options.worker_count;
-    aiv_thread_mode_ = options.aiv_thread_mode;
-    openmp_thread_mode_ = options.openmp_thread_mode;
-    openmp_thread_count_ = options.omp_thread_count != 0U
-        ? options.omp_thread_count : options.worker_count;
-    wqes_per_doorbell_ = options.wqes_per_doorbell != 0U
-        ? options.wqes_per_doorbell
-        : (aiv_thread_mode_ ? 32U : 0U);
-    std::fprintf(stderr, "[KVAF_CPU_URMA] JETTYS_READY count=%zu workers=%u omp_threads=%u mode=%s wqes_per_doorbell=%zu depth=%u\n",
-                 local_jettys_.size(), options.worker_count, openmp_thread_count_,
-                 options.openmp_thread_mode ? "omp" :
-                     (options.aiv_thread_mode ? "aiv" : "prepare"),
+    openmp_thread_count_ = options.omp_thread_count;
+    wqes_per_doorbell_ = options.wqes_per_doorbell;
+    std::fprintf(stderr, "[KVAF_CPU_URMA] JETTYS_READY count=%zu omp_threads=%u wqes_per_doorbell=%zu depth=%u\n",
+                 local_jettys_.size(), openmp_thread_count_,
                  wqes_per_doorbell_, kJettyDepth);
     batch_workspace_.queues.resize(local_jettys_.size());
     const std::size_t queue_capacity =
@@ -593,10 +469,6 @@ struct CpuUrmaTransport::Impl {
     }
     batch_workspace_.remote_offsets.reserve(kJettyDepth);
     batch_workspace_.host_segments.reserve(kJettyDepth);
-    batch_workspace_.errors.reserve(batch_worker_count_);
-    if (!openmp_thread_mode_ && !StartBatchWorkers(batch_worker_count_)) {
-      return Status::Internal("failed to start Jetty worker threads");
-    }
     initialized_ = true;
     return Status::OK();
   }
@@ -885,11 +757,6 @@ struct CpuUrmaTransport::Impl {
     job.remote_offsets.resize(count);
     job.host_segments.resize(count);
     job.queues.resize(jetty_count);
-    job.errors.assign(batch_worker_count_, {});
-    job.active_workers = (openmp_thread_mode_ || batch_worker_count_ == 1U)
-        ? 0U : batch_worker_count_ - 1U;
-    job.done_workers = 0U;
-    ++job.generation;
     for (std::size_t jetty = 0U; jetty < jetty_count; ++jetty) {
       job.queues[jetty].local.resize(queue_counts[jetty]);
       job.queues[jetty].remote.resize(queue_counts[jetty]);
@@ -916,53 +783,17 @@ struct CpuUrmaTransport::Impl {
 
     job.start = std::chrono::steady_clock::now();
     job.deadline = job.start + std::chrono::seconds(5);
-    std::fprintf(stderr, "[KVAF_CPU_URMA] BATCH_POST wrs=%zu jettys=%zu workers=%zu mode=%s bytes=%llu\n",
-                 count, jetty_count, batch_worker_count_,
-                 openmp_thread_mode_ ? "omp" : (aiv_thread_mode_ ? "aiv" : "prepare"),
+    std::fprintf(stderr, "[KVAF_CPU_URMA] BATCH_POST wrs=%zu jettys=%zu omp_threads=%u bytes=%llu\n",
+                 count, jetty_count, openmp_thread_count_,
                  static_cast<unsigned long long>(total));
-    if (openmp_thread_mode_) {
-      job.errors[0] = PrepareBatchOpenMp(job);
-    } else if (job.active_workers != 0U) {
-      std::unique_lock<std::mutex> lock(batch_mutex_);
-      active_batch_ = &job;
-      batch_cv_.notify_all();
-    }
-    if (!openmp_thread_mode_) job.errors[0] = PrepareBatchWorker(job, 0U);
-    if (aiv_thread_mode_ && !openmp_thread_mode_ && job.errors[0].empty()) {
-      job.errors[0] = RunBatchWorker(job, 0U, false);
-    }
-    if (job.active_workers != 0U) {
-      std::unique_lock<std::mutex> lock(batch_mutex_);
-      batch_cv_.wait(lock, [&] { return job.done_workers == job.active_workers; });
-    }
-    std::string transport_error;
-    bool preparation_failed = false;
-    for (const auto& error : job.errors) {
-      if (!error.empty()) {
-        preparation_failed = true;
-        break;
-      }
-    }
-    // Both prepare and omp modes leave URMA submission/CQ polling to the
-    // caller. Only aiv mode performs IO inside its Jetty workers.
-    if (!aiv_thread_mode_ && !preparation_failed) {
-      transport_error = RunBatchWorker(job, 0U, true);
-    }
-    {
-      std::lock_guard<std::mutex> lock(batch_mutex_);
-      active_batch_ = nullptr;
-      batch_cv_.notify_all();
-    }
+    PrepareBatch(job);
+    const std::string transport_error = PostAndPollBatch(job);
     if (!transport_error.empty()) return Status::Internal(transport_error);
-    for (const auto& error : job.errors) {
-      if (!error.empty()) return Status::Internal(error);
-    }
     const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - job.start).count();
     std::fprintf(stderr,
-                 "[KVAF_CPU_URMA] BATCH_COMPLETE wrs=%zu jettys=%zu workers=%zu mode=%s bytes=%llu elapsed_ns=%lld\n",
-                 count, jetty_count, batch_worker_count_,
-                 openmp_thread_mode_ ? "omp" : (aiv_thread_mode_ ? "aiv" : "prepare"),
+                 "[KVAF_CPU_URMA] BATCH_COMPLETE wrs=%zu jettys=%zu omp_threads=%u bytes=%llu elapsed_ns=%lld\n",
+                 count, jetty_count, openmp_thread_count_,
                  static_cast<unsigned long long>(total),
                  static_cast<long long>(elapsed));
     return Status::OK();
@@ -1077,7 +908,6 @@ struct CpuUrmaTransport::Impl {
 
   Status Shutdown() {
     initialized_ = false;
-    StopBatchWorkers();
     for (auto* remote_jetty : remote_jettys_) {
       if (remote_jetty != nullptr) (void)urma_unimport_jetty(remote_jetty);
     }
@@ -1136,17 +966,9 @@ struct CpuUrmaTransport::Impl {
   std::vector<urma_jetty_t*> local_jettys_;
   std::vector<urma_target_jetty_t*> remote_jettys_;
   std::mutex batch_submit_mutex_;
-  std::mutex batch_mutex_;
-  std::condition_variable batch_cv_;
   BatchJob batch_workspace_;
-  BatchJob* active_batch_{nullptr};
-  std::vector<std::thread> batch_workers_;
-  std::size_t batch_worker_count_{1U};
   std::uint32_t openmp_thread_count_{1U};
-  bool aiv_thread_mode_{false};
-  bool openmp_thread_mode_{false};
   std::size_t wqes_per_doorbell_{0U};
-  bool batch_stop_{false};
   bool urma_initialized_{false};
   bool urma_owned_{false};
   bool initialized_{false};

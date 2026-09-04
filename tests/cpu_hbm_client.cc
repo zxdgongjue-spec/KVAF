@@ -21,12 +21,8 @@ struct Options {
   std::size_t iterations{1};
   std::size_t warmup{1};
   std::uint32_t jetty_count{1};
-  std::uint32_t worker_count{1};
-  std::uint32_t omp_thread_count{0};
-  bool aiv_thread_mode{false};
-  bool openmp_thread_mode{false};
+  std::uint32_t omp_thread_count{1};
   std::uint32_t wqes_per_doorbell{0};
-  bool jetty_count_explicit{false};
   std::uint64_t host_space_bytes{0};
   std::uint64_t seed{0x6b766166ULL};
   std::string ub_device;
@@ -56,8 +52,7 @@ void Usage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s HOST[:PORT] [PORT] [--blocks N] [--block-bytes N] "
                "[--host-space-bytes N[K|M|G|T]] [--iterations N] [--warmup N] "
-               "[--jettys N] [--threads N] [--omp-threads N] "
-               "[--thread-mode prepare|aiv|omp] "
+               "[--jettys N] [--omp-threads N] "
                "[--doorbell-wqes N] "
                "[--seed N] [--ub-device NAME] "
                "[--eid-index N] [--device-id N]\n",
@@ -109,19 +104,8 @@ bool Parse(int argc, char** argv, Options* options) {
     }
     else if (arg == "--host-space-bytes" && ParseBytes(value, &options->host_space_bytes)) {}
     else if ((arg == "--jettys" || arg == "--jetty-count") &&
-             ParseU32(value, &options->jetty_count)) {
-      options->jetty_count_explicit = true;
-    }
-    else if (arg == "--threads" && ParseU32(value, &options->worker_count)) {
-      if (!options->jetty_count_explicit) options->jetty_count = options->worker_count;
-    }
+             ParseU32(value, &options->jetty_count)) {}
     else if (arg == "--omp-threads" && ParseU32(value, &options->omp_thread_count)) {}
-    else if (arg == "--thread-mode") {
-      if (std::string(value) == "aiv") options->aiv_thread_mode = true;
-      else if (std::string(value) == "omp") options->openmp_thread_mode = true;
-      else if (std::string(value) == "prepare") options->aiv_thread_mode = false;
-      else return false;
-    }
     else if (arg == "--doorbell-wqes" && ParseU32(value, &options->wqes_per_doorbell)) {}
     else if (arg == "--iterations" && ParseU64(value, &number)) options->iterations = number;
     else if (arg == "--warmup" && ParseU64(value, &number)) options->warmup = number;
@@ -132,9 +116,7 @@ bool Parse(int argc, char** argv, Options* options) {
     else return false;
   }
   return options->blocks != 0 && options->block_bytes != 0 && options->iterations != 0 &&
-         !(options->aiv_thread_mode && options->openmp_thread_mode) &&
-         options->worker_count != 0 &&
-         (options->openmp_thread_mode || options->worker_count <= options->jetty_count) &&
+         options->jetty_count != 0 && options->omp_thread_count != 0 &&
          options->omp_thread_count <= static_cast<std::uint32_t>(std::numeric_limits<int>::max()) &&
          options->wqes_per_doorbell <= 1024U &&
          options->blocks <= std::numeric_limits<std::uint64_t>::max() / options->block_bytes &&
@@ -240,15 +222,12 @@ int main(int argc, char** argv) {
   std::fprintf(stderr,
                "[HBM_TEST][CPU] START peer=%s blocks=%zu block_bytes=%zu payload_bytes=%llu "
                "host_address_space_bytes=%llu "
-               "iterations=%zu warmup=%zu jettys=%u threads=%u omp_threads=%u "
-               "thread_mode=%s remote_device=%u\n",
+               "iterations=%zu warmup=%zu jettys=%u omp_threads=%u remote_device=%u\n",
                options.peer.c_str(), options.blocks, options.block_bytes,
                static_cast<unsigned long long>(total_bytes),
                static_cast<unsigned long long>(host_space_bytes), options.iterations,
-               options.warmup, options.jetty_count, options.worker_count,
-               options.omp_thread_count != 0U ? options.omp_thread_count : options.worker_count,
-               options.openmp_thread_mode ? "omp" :
-                   (options.aiv_thread_mode ? "aiv" : "prepare"), options.device_id);
+               options.warmup, options.jetty_count, options.omp_thread_count,
+               options.device_id);
   std::fprintf(stderr, "[HBM_TEST][CPU] DATA_PATH=direct-registered-host-memory\n");
 
   kvaf::CpuUrmaTransportOptions transport_options;
@@ -261,9 +240,6 @@ int main(int argc, char** argv) {
   transport_options.remote_device_id = options.device_id;
   transport_options.remote_eid_index = options.has_eid_index ? options.eid_index : UINT32_MAX;
   transport_options.jetty_count = options.jetty_count;
-  transport_options.worker_count = options.worker_count;
-  transport_options.aiv_thread_mode = options.aiv_thread_mode;
-  transport_options.openmp_thread_mode = options.openmp_thread_mode;
   transport_options.omp_thread_count = options.omp_thread_count;
   transport_options.wqes_per_doorbell = options.wqes_per_doorbell;
   kvaf::CpuUrmaTransport transport;

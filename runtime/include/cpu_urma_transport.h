@@ -39,18 +39,11 @@ struct CpuUrmaTransportOptions {
   // Number of independent local Jettys used by batch transfers. Each Jetty
   // owns its JFC/JFR/SQ and establishes its own CTP to the remote target.
   std::uint32_t jetty_count{1};
-  // Number of persistent CPU workers used by batch transfers. A worker may
-  // own multiple Jettys; each Jetty still has exactly one producer.
-  std::uint32_t worker_count{1};
-  // When true, each worker owns its Jettys end-to-end: prepare, post, and CQ
-  // polling. When false, workers only prepare WRs and the caller owns URMA IO.
-  bool aiv_thread_mode{false};
-  bool openmp_thread_mode{false};
-  // Number of OpenMP threads used only to prepare WR/SGE entries. Zero falls
-  // back to worker_count for compatibility with the original omp mode.
-  std::uint32_t omp_thread_count{0};
+  // Number of OpenMP threads used to prepare WR/SGE entries. URMA submission
+  // and CQ polling stay on the calling thread.
+  std::uint32_t omp_thread_count{1};
   // Number of WRs submitted per urma_post_jetty_send_wr call. Zero keeps one
-  // call per Jetty; AIV-style experiments typically use 32.
+  // linked-list submission per Jetty.
   std::uint32_t wqes_per_doorbell{0};
   bool has_external_region{false};
   peer::PeerRegion external_region{};
@@ -85,9 +78,8 @@ class CpuUrmaTransport final {
   Status WriteDeviceMemory(std::uint64_t remote_offset, const void* device_source,
                            std::size_t bytes);
   Status Read(std::uint64_t remote_offset, void* destination, std::size_t bytes);
-  // Posts one WR per HostSge as a linked list and waits only for the final
-  // completion. Jettys are sharded across persistent workers. Each worker
-  // posts all of its Jetty lists before polling their final completions.
+  // Builds one WR per HostSge with OpenMP, posts every Jetty list from the
+  // calling thread, then waits for one final completion per Jetty.
   Status WriteBatch(std::uint64_t remote_offset, const HostSge* sources, std::size_t count);
   Status ReadBatch(std::uint64_t remote_offset, const HostSge* destinations, std::size_t count);
   Status ReadSgl(std::uint64_t remote_offset, const HostSge* destinations, std::size_t count);

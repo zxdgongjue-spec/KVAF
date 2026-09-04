@@ -68,44 +68,22 @@ The test accepts explicit EIDs for diagnostics, but the default path follows
 the pair-info local/remote EID rule used by the H2D script.
 
 Each block is one single-SGE WR. With `--jettys N`, the client creates `N`
-independent local JFC/JFR/Jetty/CTP resources. `--threads M` controls how many
-persistent CPU workers prepare the WR/SGE arrays; the main thread remains the
-only URMA submitter and CQ poller, avoiding liburma context-lock contention.
-Each worker prepares disjoint Jetty queues in parallel, then the main thread
-posts every Jetty list before polling final CQEs. By default `--threads` is 1,
-which is the low-overhead baseline. Thus `blocks=1024` measures the elapsed
-time for submitting and completing all 1024 requests, while `--threads` enables
-parallel CPU-side request preparation. The target HBM Jetty is shared by these
-channels and remains sized for the 1024-WR wave; increasing the worker count
-does not increase the maximum requests in one logical batch. The current
-resource limit is 16 CPU Jettys per channel.
+independent local JFC/JFR/Jetty/CTP resources. An OpenMP `parallel for` builds
+the disjoint WR/SGE entries, then the calling thread posts every Jetty list and
+polls one final CQE per Jetty. `--omp-threads N` controls only WQE preparation;
+it is independent of `--jettys N` and defaults to 1. The current resource limit
+is 16 CPU Jettys per channel and 1024 requests per logical batch.
 
-`--thread-mode aiv` enables the AIV-style experimental path. Each persistent
-worker owns a disjoint set of Jettys end-to-end: it prepares the WRs, posts all
-of its assigned Jettys, and then polls one fence CQE from each Jetty. The main
-thread acts as worker 0, and the hot path has no ready/go barrier. Use this mode
-to determine whether the active liburma/provider can benefit from parallel
-independent Jetty producers; `prepare` remains the default baseline. In AIV
-mode, each Jetty is submitted in 32-WR chunks by default, approximating AIV's
-32-WQE post/doorbell cadence. Override this with `--doorbell-wqes N`; zero in
-`prepare` mode keeps one post call per Jetty. This is an API-level approximation:
-`urma_post_jetty_send_wr` may coalesce or implement doorbells internally.
-
-`--thread-mode omp` uses an OpenMP `parallel for` to build the disjoint WR/SGE
-entries. It does not call URMA from the OpenMP loop; submission and CQ polling
-remain serialized by the caller. The mode is available only when the CPU build
-finds OpenMP, and is intended to compare CPU-side WQE preparation against the
-persistent-worker and single-thread baselines. Use `--omp-threads N` to control
-the OpenMP team independently of the Jetty count. If omitted, it falls back to
-`--threads N` for compatibility. For example, with `--jettys 1`,
-`--omp-threads 4`, and `--thread-mode omp`, four threads prepare the WQEs for one Jetty while the
-caller still serializes all URMA post/poll operations.
+`--doorbell-wqes N` optionally splits each Jetty list into groups of `N` WRs.
+Zero, the default, submits one linked list per Jetty. This is an API-level
+approximation: `urma_post_jetty_send_wr` may coalesce or implement doorbells
+internally.
 
 For example:
 
 ```bash
 tests/run_hbm_rw_client.sh <npu-host> 29888 \
-  --blocks 1024 --block-bytes 656 --jettys 4 --threads 4 \
-  --thread-mode aiv --doorbell-wqes 32 \
+  --blocks 1024 --block-bytes 656 --jettys 4 --omp-threads 4 \
+  --doorbell-wqes 32 \
   --iterations 10 --warmup 1
 ```
