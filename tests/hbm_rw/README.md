@@ -74,6 +74,19 @@ polls one final CQE per Jetty. `--omp-threads N` controls only WQE preparation;
 it is independent of `--jettys N` and defaults to 1. The current resource limit
 is 16 CPU Jettys per channel and 1024 requests per logical batch.
 
+Use `--sgl-size N` to combine `N` blocks into one WR with `N` local SGEs. The
+default `N=1` uses the OpenMP batch path above. Values greater than one use the
+transport's `WriteSgl`/`ReadSgl` path and must not exceed the device's reported
+`max_jfs_sge` value.
+
+For example, this sends 1024 blocks as 512 two-SGE WRs:
+
+```bash
+tests/run_hbm_rw_client.sh <npu-host> 29888 \
+  --blocks 1024 --block-bytes 656 --sgl-size 2 \
+  --iterations 10 --warmup 1
+```
+
 `--doorbell-wqes N` optionally splits each Jetty list into groups of `N` WRs.
 Zero, the default, submits one linked list per Jetty. This is an API-level
 approximation: `urma_post_jetty_send_wr` may coalesce or implement doorbells
