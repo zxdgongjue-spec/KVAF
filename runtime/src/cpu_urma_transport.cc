@@ -943,7 +943,9 @@ struct CpuUrmaTransport::Impl {
         break;
       }
     }
-    if (!aiv_thread_mode_ && !openmp_thread_mode_ && !preparation_failed) {
+    // Both prepare and omp modes leave URMA submission/CQ polling to the
+    // caller. Only aiv mode performs IO inside its Jetty workers.
+    if (!aiv_thread_mode_ && !preparation_failed) {
       transport_error = RunBatchWorker(job, 0U, true);
     }
     {
