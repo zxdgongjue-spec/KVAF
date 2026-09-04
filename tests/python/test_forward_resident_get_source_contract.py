@@ -59,6 +59,11 @@ def main() -> None:
         "FinishKvafDenseBatchGet",
         "ReturnKvafForwardResidentUnpostedQueueFromAicore",
         "ReturnKvafForwardResidentQueueFromAicore",
+        # The forward-resident wrapper lives in a different namespace from
+        # the dense Direct-HCCP implementation.  Keep every dense state used
+        # by ClassifyKvafForwardResidentBegin explicitly imported; otherwise
+        # AscendC fails only during the expensive Stage-B OPP build.
+        "using kvaf_fused_get::kDenseBatchGetIdle;",
     ):
         assert token in device, token
 

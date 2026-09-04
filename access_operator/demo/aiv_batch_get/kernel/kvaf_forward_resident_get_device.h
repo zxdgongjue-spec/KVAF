@@ -47,6 +47,7 @@ using ::KvafForwardResidentBatchGetDescriptorScratch;
 using kvaf_fused_get::BeginKvafDenseBatchGetPostOnly;
 using kvaf_fused_get::FinishKvafDenseBatchGet;
 using kvaf_fused_get::kDenseBatchGetFailed;
+using kvaf_fused_get::kDenseBatchGetIdle;
 using kvaf_fused_get::kDenseBatchGetInFlight;
 using kvaf_fused_get::kDenseBatchGetRetired;
 using kvaf_fused_get::kInvalidArgs;
