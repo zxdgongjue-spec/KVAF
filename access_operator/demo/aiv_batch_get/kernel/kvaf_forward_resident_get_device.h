@@ -50,6 +50,11 @@ using kvaf_fused_get::kDenseBatchGetFailed;
 using kvaf_fused_get::kDenseBatchGetInFlight;
 using kvaf_fused_get::kDenseBatchGetRetired;
 using kvaf_fused_get::kInvalidArgs;
+using kvaf_fused_get::kInvalidEntity;
+using kvaf_fused_get::kInvalidLookup;
+using kvaf_fused_get::kInvalidOutput;
+using kvaf_fused_get::kInvalidQueue;
+using kvaf_fused_get::kQueueFull;
 using kvaf_fused_get::kSuccess;
 using kvaf_fused_get::KvafDenseBatchGetTransaction;
 using kvaf_fused_get::ResetDenseBatchGetTransaction;
@@ -95,6 +100,30 @@ struct KvafForwardResidentBatchGetTerminal {
 };
 static_assert(sizeof(KvafForwardResidentBatchGetTerminal) == 24U,
               "forward-resident terminal ABI changed");
+
+// `BeginKvafDenseBatchGetPostOnly` mutates a large transaction record while it
+// constructs WQEs and rings the doorbell.  A P10 companion must not use that
+// record as an out-parameter across its larger score-executor closure: the
+// AICore compiler can otherwise lose a nested writeback even though the HCCP
+// side effects already happened.  The Begin boundary therefore returns this
+// small scalar result only.  A successful caller rehydrates its drain record
+// from the immutable control + the exact descriptor it just published.
+enum KvafForwardResidentBeginStatus : uint32_t {
+  kForwardResidentBeginPosted = 0U,
+  kForwardResidentBeginInvalidArgs = 1U,
+  kForwardResidentBeginInvalidEntity = 2U,
+  kForwardResidentBeginInvalidQueue = 3U,
+  kForwardResidentBeginInvalidLookup = 4U,
+  kForwardResidentBeginQueueFull = 5U,
+  kForwardResidentBeginInvalidOutput = 6U,
+  // These cannot prove whether the doorbell was reached.  Callers must keep
+  // the queue leased and fail the forward rather than recycle it.
+  kForwardResidentBeginResultUnknown = 7U,
+  kForwardResidentBeginStateIdle = 8U,
+  kForwardResidentBeginStateRetired = 9U,
+  kForwardResidentBeginStateFailedSuccess = 10U,
+  kForwardResidentBeginStateUnknown = 11U,
+};
 
 // AscendC cannot use compiler-generated struct assignment across the GM/local
 // address-space boundary.  Keep the AIC and SIMT loaders separate because the
@@ -564,18 +593,13 @@ __aicore__ inline bool PublishKvafForwardResidentDescriptor(
   return true;
 }
 
-__aicore__ inline bool BuildKvafForwardResidentQueueArgs(
+__aicore__ inline bool BuildKvafForwardResidentQueueArgsFromDescriptor(
     const KvafForwardResidentBatchGetControl& control, uint32_t queue_id,
+    const KvafForwardResidentBatchGetDescriptorScratch& descriptor,
     KvafExecuteBatchGetKernelArgs* args, uint32_t* active_request_count) {
   if (args == nullptr || active_request_count == nullptr ||
       !IsKvafForwardResidentBatchGetControlValidForAicore(control) ||
-      queue_id >= control.queue_count || control.output_rows > UINT32_MAX) {
-    return false;
-  }
-  __gm__ const KvafForwardResidentBatchGetDescriptorScratch* const scratch =
-      GetKvafForwardResidentDescriptorScratch(control, queue_id);
-  KvafForwardResidentBatchGetDescriptorScratch descriptor{};
-  if (!LoadKvafForwardResidentDescriptorFromGm(scratch, &descriptor) ||
+      queue_id >= control.queue_count || control.output_rows > UINT32_MAX ||
       descriptor.address_table == 0U || descriptor.valid_table == 0U ||
       descriptor.indices == 0U || descriptor.offsets == 0U ||
       descriptor.mask == 0U || descriptor.output_indices == 0U ||
@@ -612,23 +636,91 @@ __aicore__ inline bool BuildKvafForwardResidentQueueArgs(
   return true;
 }
 
+// P10's Begin/rehydrate pair already owns one exact local descriptor.  It
+// calls the descriptor form above and never reloads a potentially unrelated
+// GM record through a mutable wave out-parameter.  Keep this reload helper
+// for callers that intentionally start from queue-owned descriptor scratch.
+__aicore__ inline bool BuildKvafForwardResidentQueueArgs(
+    const KvafForwardResidentBatchGetControl& control, uint32_t queue_id,
+    KvafExecuteBatchGetKernelArgs* args, uint32_t* active_request_count) {
+  if (!IsKvafForwardResidentBatchGetControlValidForAicore(control) ||
+      queue_id >= control.queue_count) {
+    return false;
+  }
+  __gm__ const KvafForwardResidentBatchGetDescriptorScratch* const scratch =
+      GetKvafForwardResidentDescriptorScratch(control, queue_id);
+  KvafForwardResidentBatchGetDescriptorScratch descriptor{};
+  return LoadKvafForwardResidentDescriptorFromGm(scratch, &descriptor) &&
+      BuildKvafForwardResidentQueueArgsFromDescriptor(
+          control, queue_id, descriptor, args, active_request_count);
+}
+
 // These wrappers intentionally contain no alternative HCCP protocol.  They
 // delegate to the unchanged dense PostOnly / nonblocking CQ probe / terminal
 // Finish ABI once a dynamic queue and descriptor have been admitted.
-__aicore__ inline bool BeginKvafForwardResidentBatchGet(
+__aicore__ inline uint32_t ClassifyKvafForwardResidentBegin(
+    uint64_t result, uint32_t state) {
+  if (result == kSuccess && state == kDenseBatchGetInFlight) {
+    return kForwardResidentBeginPosted;
+  }
+  switch (result) {
+    case kInvalidArgs:
+      return kForwardResidentBeginInvalidArgs;
+    case kInvalidEntity:
+      return kForwardResidentBeginInvalidEntity;
+    case kInvalidQueue:
+      return kForwardResidentBeginInvalidQueue;
+    case kInvalidLookup:
+      return kForwardResidentBeginInvalidLookup;
+    case kQueueFull:
+      return kForwardResidentBeginQueueFull;
+    case kInvalidOutput:
+      return kForwardResidentBeginInvalidOutput;
+    default:
+      break;
+  }
+  if (result != kSuccess) {
+    return kForwardResidentBeginResultUnknown;
+  }
+  switch (state) {
+    case kDenseBatchGetIdle:
+      return kForwardResidentBeginStateIdle;
+    case kDenseBatchGetRetired:
+      return kForwardResidentBeginStateRetired;
+    case kDenseBatchGetFailed:
+      return kForwardResidentBeginStateFailedSuccess;
+    default:
+      return kForwardResidentBeginStateUnknown;
+  }
+}
+
+// All returned non-POSTED statuses below arise before `PostDense...` is
+// invoked.  Only these statuses may safely release a held queue lease.  An
+// unknown scalar result is intentionally not considered proof of no-post.
+__aicore__ inline bool KvafForwardResidentBeginHasNoPost(uint32_t status) {
+  return status == kForwardResidentBeginInvalidArgs ||
+      status == kForwardResidentBeginInvalidEntity ||
+      status == kForwardResidentBeginInvalidQueue ||
+      status == kForwardResidentBeginInvalidLookup ||
+      status == kForwardResidentBeginQueueFull ||
+      status == kForwardResidentBeginInvalidOutput;
+}
+
+// The sole HCCP PostOnly boundary.  It intentionally has no wave output
+// parameter: the dense transaction is local to this closure and its outcome
+// crosses the compiler/domain boundary as one scalar.  On POSTED, the caller
+// must call `InitializeKvafForwardResidentPostedWaveForDrain` before it polls
+// CQ.  That routine reloads the already-published queue scratch; it does not
+// modify it.
+__aicore__ inline uint32_t BeginKvafForwardResidentBatchGetPostOnly(
     const KvafForwardResidentBatchGetControl& control,
     const KvafForwardResidentQueueLease& lease,
-    const KvafForwardResidentBatchGetDescriptorScratch& descriptor,
-    KvafForwardResidentBatchGetWave* wave) {
-  if (wave == nullptr) {
-    return false;
-  }
-  wave->lease = lease;
-  ResetDenseBatchGetTransaction(&wave->transaction);
+    const KvafForwardResidentBatchGetDescriptorScratch& descriptor) {
   uint32_t active_request_count = 0U;
   __gm__ const int32_t* const owners =
       reinterpret_cast<__gm__ const int32_t*>(control.queue_leases);
-  if (lease.state != kForwardResidentQueueHeld || lease.owner_tag <= 0 ||
+  if (!IsKvafForwardResidentBatchGetControlValidForAicore(control) ||
+      lease.state != kForwardResidentQueueHeld || lease.owner_tag <= 0 ||
       lease.queue_id >= control.queue_count ||
       owners[lease.queue_id] != lease.owner_tag ||
       // Publish is deliberately inside Begin.  It stores this wave's exact
@@ -636,22 +728,85 @@ __aicore__ inline bool BeginKvafForwardResidentBatchGet(
       // lets the unchanged dense primitive materialize WQEs/doorbell.  A
       // previous valid scratch record can therefore never be posted merely
       // because a caller skipped a separate helper call.
-      !PublishKvafForwardResidentDescriptor(control, lease, descriptor) ||
-      !BuildKvafForwardResidentQueueArgs(control, lease.queue_id,
-                                         &wave->queue_args,
-                                         &active_request_count)) {
-    wave->transaction.result = kInvalidArgs;
-    wave->transaction.state = kDenseBatchGetFailed;
-    wave->transaction.finalized = 1U;
-    wave->lease.state = kForwardResidentQueueTerminal;
+      !PublishKvafForwardResidentDescriptor(control, lease, descriptor)) {
+    return kForwardResidentBeginInvalidArgs;
+  }
+
+  // Construct the short-lived dense ABI record locally.  No caller-owned
+  // wave receives an address-space write from the large PostOnly closure.
+  KvafExecuteBatchGetKernelArgs args{};
+  if (!BuildKvafForwardResidentQueueArgsFromDescriptor(
+          control, lease.queue_id, descriptor, &args,
+          &active_request_count)) {
+    return kForwardResidentBeginInvalidArgs;
+  }
+  KvafDenseBatchGetTransaction transaction{};
+  BeginKvafDenseBatchGetPostOnly(args, active_request_count, 0U,
+                                 &transaction);
+  return ClassifyKvafForwardResidentBegin(transaction.result,
+                                          transaction.state);
+}
+
+// Rebuild the CQ-drain record from inputs that are immutable for the held
+// queue.  This is called only after the scalar Begin result proves POSTED;
+// it never constructs a descriptor, publishes GM state, or rings a doorbell.
+// P10 does not enable standalone BatchGet profiling, so rehydration leaves
+// those optional telemetry fields at their ResetDense... values instead of
+// inventing timestamps that were not observed here.
+__aicore__ inline bool InitializeKvafForwardResidentPostedWaveForDrain(
+    const KvafForwardResidentBatchGetControl& control,
+    const KvafForwardResidentQueueLease& lease,
+    uint32_t expected_active_request_count,
+    KvafForwardResidentBatchGetWave* wave) {
+  if (wave == nullptr || expected_active_request_count == 0U ||
+      !IsKvafForwardResidentBatchGetControlValidForAicore(control) ||
+      lease.state != kForwardResidentQueueHeld || lease.owner_tag <= 0 ||
+      lease.queue_id >= control.queue_count) {
     return false;
   }
-  BeginKvafDenseBatchGetPostOnly(wave->queue_args, active_request_count, 0U,
-                                 &wave->transaction);
-  wave->lease.state = wave->transaction.state == kDenseBatchGetInFlight
-                          ? kForwardResidentQueuePosted
-                          : kForwardResidentQueueTerminal;
-  return wave->lease.state == kForwardResidentQueuePosted;
+  __gm__ const int32_t* const owners =
+      reinterpret_cast<__gm__ const int32_t*>(control.queue_leases);
+  if (owners[lease.queue_id] != lease.owner_tag) {
+    return false;
+  }
+  KvafExecuteBatchGetKernelArgs args{};
+  uint32_t active_request_count = 0U;
+  if (!BuildKvafForwardResidentQueueArgs(
+          control, lease.queue_id, &args, &active_request_count) ||
+      active_request_count != expected_active_request_count) {
+    return false;
+  }
+
+  wave->lease.queue_id = lease.queue_id;
+  wave->lease.owner_tag = lease.owner_tag;
+  wave->lease.state = kForwardResidentQueuePosted;
+  wave->lease.reserved0 = 0U;
+  wave->queue_args.address_table = args.address_table;
+  wave->queue_args.valid_table = args.valid_table;
+  wave->queue_args.indices = args.indices;
+  wave->queue_args.offsets = args.offsets;
+  wave->queue_args.mask = args.mask;
+  wave->queue_args.output_indices = args.output_indices;
+  wave->queue_args.output = args.output;
+  wave->queue_args.core_status = args.core_status;
+  wave->queue_args.channel_entity = args.channel_entity;
+  wave->queue_args.queue_state = args.queue_state;
+  wave->queue_args.table_capacity = args.table_capacity;
+  wave->queue_args.request_capacity = args.request_capacity;
+  wave->queue_args.output_rows = args.output_rows;
+  wave->queue_args.block_bytes = args.block_bytes;
+  wave->queue_args.block_count = args.block_count;
+  wave->queue_args.jettys_per_core = args.jettys_per_core;
+
+  ResetDenseBatchGetTransaction(&wave->transaction);
+  wave->transaction.active_count = active_request_count;
+  wave->transaction.total_posts =
+      (static_cast<uint64_t>(active_request_count) +
+       kvaf_fused_get::kWqesPerPost - 1U) /
+      kvaf_fused_get::kWqesPerPost;
+  wave->transaction.result = kSuccess;
+  wave->transaction.state = kDenseBatchGetInFlight;
+  return true;
 }
 
 __aicore__ inline void TryRetireKvafForwardResidentBatchGet(

@@ -74,26 +74,57 @@ def main() -> None:
 
     queue_args = _between(
         device,
-        "__aicore__ inline bool BuildKvafForwardResidentQueueArgs(",
-        "// These wrappers intentionally contain no alternative HCCP protocol.",
+        "__aicore__ inline bool BuildKvafForwardResidentQueueArgsFromDescriptor(",
+        "// P10's Begin/rehydrate pair already owns one exact local descriptor.",
     )
     assert "args->output = control.output" in queue_args
     assert "private_output" not in queue_args
 
     begin = _between(
         device,
-        "__aicore__ inline bool BeginKvafForwardResidentBatchGet(",
-        "__aicore__ inline void TryRetireKvafForwardResidentBatchGet(",
+        "__aicore__ inline uint32_t BeginKvafForwardResidentBatchGetPostOnly(",
+        "__aicore__ inline bool InitializeKvafForwardResidentPostedWaveForDrain(",
     )
     # The descriptor publication is not a caller-optional helper.  Begin
-    # receives the local wave descriptor and must publish it (including the
-    # DDR barrier in the helper) before it reloads queue arguments and can
-    # invoke the established PostOnly primitive.
+    # receives the local descriptor and must publish it (including the DDR
+    # barrier in the helper) before it invokes the established PostOnly
+    # primitive.  Crucially it cannot write a caller-owned wave while the
+    # large AICore PostOnly closure is executing.
     assert "const KvafForwardResidentBatchGetDescriptorScratch& descriptor" in begin
     assert "PublishKvafForwardResidentDescriptor(control, lease, descriptor)" in begin
     assert begin.index("PublishKvafForwardResidentDescriptor(") < begin.index(
-        "BuildKvafForwardResidentQueueArgs("
+        "BeginKvafDenseBatchGetPostOnly("
     )
+    assert "KvafForwardResidentBatchGetWave*" not in begin
+    assert "KvafDenseBatchGetTransaction transaction{}" in begin
+    assert "return ClassifyKvafForwardResidentBegin(" in begin
+    assert "!IsKvafForwardResidentBatchGetControlValidForAicore(control)" in begin
+
+    rehydrate = _between(
+        device,
+        "__aicore__ inline bool InitializeKvafForwardResidentPostedWaveForDrain(",
+        "__aicore__ inline void TryRetireKvafForwardResidentBatchGet(",
+    )
+    for token in (
+        "IsKvafForwardResidentBatchGetControlValidForAicore(control)",
+        "BuildKvafForwardResidentQueueArgs(",
+        "active_request_count != expected_active_request_count",
+        "wave->lease.state = kForwardResidentQueuePosted",
+        "wave->transaction.state = kDenseBatchGetInFlight",
+        "ResetDenseBatchGetTransaction(&wave->transaction)",
+    ):
+        assert token in rehydrate, token
+    assert "PublishKvafForwardResidentDescriptor(" not in rehydrate
+    assert "BeginKvafDenseBatchGetPostOnly(" not in rehydrate
+
+    assert "KvafForwardResidentBeginHasNoPost" in device
+    begin_status = _between(
+        device,
+        "enum KvafForwardResidentBeginStatus",
+        "// AscendC cannot use compiler-generated struct assignment",
+    )
+    assert "kForwardResidentBeginPosted = 0U" in begin_status
+    assert "kForwardResidentBeginResultUnknown" in begin_status
 
     append = _between(
         device,
