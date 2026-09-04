@@ -153,6 +153,37 @@ def main() -> None:
         "PrepareDenseBatchGetOutputForInboundDma("
     ) < dense_begin.index("PostDenseBatchGetRequests(")
 
+    # Dense PostOnly is a bounded alternative to mask compaction, not an
+    # alternative UB address space. Its VF materializer and MTE3 copier must
+    # use the same two static get_imm() WQE banks as normal BatchGet. Passing
+    # an AICore-local __ubuf__ array through VF_CALL can let SQ consume
+    # stale/zero WQEs while the CQ terminal still looks successful.
+    dense_fill = _between(
+        dense,
+        "inline void FillDenseBatchGetReadWqes(",
+        "__aicore__ inline void PrepareDensePostVectorStage(",
+    )
+    assert "uint32_t ub_base_offset" in dense_fill
+    assert "get_imm(ub_base_offset + slot * kWqeBytes)" in dense_fill
+    assert "__ubuf__ uint8_t *wqe_bank" not in dense_fill
+
+    dense_post = _between(
+        dense,
+        "__aicore__ inline void PrepareDensePostVectorStage(",
+        "// Dense P1 descriptors have already passed",
+    )
+    for token in (
+        "const uint32_t ub_base_offset = bank_id * kWqeBankBytes",
+        "get_imm(ub_base_offset)",
+        "get_imm(ub_base_offset + first_count * kWqeBytes)",
+        "PrepareDensePostMte3Stage(&prepared_posts[final_bank], 0U",
+    ):
+        assert token in dense_post, token
+    assert "wqe_banks" not in dense_post
+    assert "__ubuf__ uint8_t *wqe_bank" not in dense_post
+    assert "dense_wqe_words" not in dense_begin
+    assert "dense_wqe_banks" not in dense_begin
+
     # The P10 device header must not inherit an old fixed output partition or
     # cross-forward recovery protocol.  It is acceptable for the repository
     # to retain legacy types elsewhere; this is a precise target-path guard.
