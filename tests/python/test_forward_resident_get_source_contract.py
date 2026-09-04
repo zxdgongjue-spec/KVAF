@@ -54,16 +54,16 @@ def main() -> None:
         "AppendKvafForwardResidentRequest",
         "PublishKvafForwardResidentDescriptor",
         "DataSyncBarrier<AscendC::MemDsbT::DDR>()",
-        "BeginKvafDenseBatchGetPostOnly",
+        "BeginKvafDenseBatchGetPostOnlyScalar",
         "TryRetireKvafDenseBatchGet",
         "FinishKvafDenseBatchGet",
         "ReturnKvafForwardResidentUnpostedQueueFromAicore",
         "ReturnKvafForwardResidentQueueFromAicore",
         # The forward-resident wrapper lives in a different namespace from
-        # the dense Direct-HCCP implementation.  Keep every dense state used
-        # by ClassifyKvafForwardResidentBegin explicitly imported; otherwise
-        # AscendC fails only during the expensive Stage-B OPP build.
-        "using kvaf_fused_get::kDenseBatchGetIdle;",
+        # the dense Direct-HCCP implementation.  The Begin boundary must use
+        # the compact scalar helper, while the later CQ drain may still own a
+        # transaction in its local wave record.
+        "using kvaf_fused_get::BeginKvafDenseBatchGetPostOnlyScalar;",
     ):
         assert token in device, token
 
@@ -92,30 +92,31 @@ def main() -> None:
     )
     # The descriptor publication is not a caller-optional helper.  Begin
     # receives the local descriptor and must publish it (including the DDR
-    # barrier in the helper) before it invokes the established PostOnly
-    # primitive.  Crucially it cannot write a caller-owned wave while the
-    # large AICore PostOnly closure is executing.
+    # barrier in the helper) before it invokes the established scalar
+    # PostOnly primitive.  Crucially it cannot construct or pass a
+    # caller-owned dense transaction while the larger C8 closure executes.
     assert "const KvafForwardResidentBatchGetDescriptorScratch& descriptor" in begin
     assert "PublishKvafForwardResidentDescriptor(control, lease, descriptor)" in begin
     assert begin.index("PublishKvafForwardResidentDescriptor(") < begin.index(
-        "BeginKvafDenseBatchGetPostOnly("
+        "BeginKvafDenseBatchGetPostOnlyScalar("
     )
     assert "KvafForwardResidentBatchGetWave*" not in begin
-    assert "KvafDenseBatchGetTransaction transaction{}" in begin
-    # A compiler-local dense transaction writeback cannot prove that HCCP was
-    # posted.  The Begin boundary must instead require the exact durable SQ
-    # producer-index advance for this wave.
+    assert "KvafDenseBatchGetTransaction transaction" not in begin
+    assert "BeginKvafDenseBatchGetPostOnly(" not in begin
+    # A compact scalar result cannot prove that HCCP was posted.  The Begin
+    # boundary must instead require the exact durable SQ producer-index
+    # advance for this wave.
     assert "SnapshotKvafForwardResidentQueueProgress(" in begin
     assert "sq_producer_delta == static_cast<uint64_t>(active_request_count)" in begin
     assert "return kForwardResidentBeginPosted;" in begin
     assert "kForwardResidentBeginSqProducerDeltaMismatch" in begin
-    assert "return ClassifyKvafForwardResidentBeginWithoutPost(" in begin
+    assert "return ClassifyKvafForwardResidentScalarBeginWithoutPost(" in begin
     assert "return ClassifyKvafForwardResidentBegin(" not in begin
     exact_delta = "sq_producer_delta == static_cast<uint64_t>(active_request_count)"
     partial_delta = "if (sq_producer_delta != 0U)"
     assert begin.index(exact_delta) < begin.index(partial_delta) < begin.index(
         "return kForwardResidentBeginSqProducerDeltaMismatch;"
-    ) < begin.index("return ClassifyKvafForwardResidentBeginWithoutPost(")
+    ) < begin.index("return ClassifyKvafForwardResidentScalarBeginWithoutPost(")
     assert "!IsKvafForwardResidentBatchGetControlValidForAicore(control)" in begin
 
     rehydrate = _between(
@@ -203,16 +204,38 @@ def main() -> None:
     # must be cleaned and invalidated before the doorbell; doing so after CQ
     # would risk writing stale pre-DMA data back over the payload.
     assert "PrepareDenseBatchGetOutputForInboundDma(" in dense
-    dense_begin = _between(
+    dense_legacy_begin = _between(
         dense,
         "__aicore__ inline void BeginKvafDenseBatchGetPostOnly(",
+        "// Forward-resident P10 needs the verified Dense PostOnly protocol",
+    )
+    assert dense_legacy_begin.index("ValidateDenseBatchGetDescriptors(") < dense_legacy_begin.index(
+        "PrepareDenseBatchGetOutputForInboundDma("
+    ) < dense_legacy_begin.index("PostDenseBatchGetRequests(")
+    assert "KvafDenseBatchGetTransaction" in dense_legacy_begin
+    assert "WriteGmByPassDCache<uint32_t>(&queues->initialized, 1U)" in dense_legacy_begin
+    assert "WriteGmByPassDCache<uint64_t>(&queues->sq_producer_index, 0U)" in dense_legacy_begin
+
+    # P10 never sends the large transaction record through its Begin closure.
+    # Its scalar helper reuses the same validated Dense PostOnly steps, and
+    # initializes queue state through bypass loads/stores so a later tile
+    # cannot observe a stale DCache copy of the durable PI receipt.
+    dense_scalar_begin = _between(
+        dense,
+        "__aicore__ inline uint64_t BeginKvafDenseBatchGetPostOnlyScalar(",
         "// Probe the one CQE",
     )
-    assert dense_begin.index("ValidateDenseBatchGetDescriptors(") < dense_begin.index(
+    assert "KvafDenseBatchGetTransaction" not in dense_scalar_begin
+    assert dense_scalar_begin.index("ValidateDenseBatchGetDescriptors(") < dense_scalar_begin.index(
         "PrepareDenseBatchGetOutputForInboundDma("
-    ) < dense_begin.index("PostDenseBatchGetRequests(")
-    assert "WriteGmByPassDCache<uint32_t>(&queues->initialized, 1U)" in dense_begin
-    assert "WriteGmByPassDCache<uint64_t>(&queues->sq_producer_index, 0U)" in dense_begin
+    ) < dense_scalar_begin.index("PostDenseBatchGetRequests(")
+    for token in (
+        "ReadGmByPassDCache<uint32_t>(&queues->initialized)",
+        "ReadGmByPassDCache<uint32_t>(&queues->magic)",
+        "WriteGmByPassDCache<uint32_t>(&queues->initialized, 1U)",
+        "WriteGmByPassDCache<uint64_t>(&queues->sq_producer_index, 0U)",
+    ):
+        assert token in dense_scalar_begin, token
 
     dense_commit = _between(
         dense,
@@ -223,6 +246,42 @@ def main() -> None:
     assert dense_commit.index("WriteGmByPassDCache<uint64_t>(") < dense_commit.index(
         "DataSyncBarrier<MemDsbT::DDR>()"
     ) < dense_commit.index("st_dev(")
+
+    dense_post_requests = _between(
+        dense,
+        "__aicore__ inline void PostDenseBatchGetRequests(",
+        "// Dense P1 descriptors have already passed",
+    )
+    assert "ReadGmByPassDCache<uint64_t>(" in dense_post_requests
+    assert "&queues[jetty].sq_producer_index" in dense_post_requests
+    assert "current_heads[jetty] = queues[jetty].sq_producer_index;" not in dense_post_requests
+
+    dense_retire = _between(
+        dense,
+        "__aicore__ inline void TryRetireKvafDenseBatchGet(",
+        "// Terminal drain/final publication.",
+    )
+    for token in (
+        "ReadGmByPassDCache<uint64_t>(&queue->cq_consumer_index)",
+        "ReadGmByPassDCache<uint64_t>(&queue->completed_batch_count)",
+        "WriteGmByPassDCache<uint64_t>(&queue->cq_consumer_index",
+        "WriteGmByPassDCache<uint64_t>(&queue->completed_batch_count",
+        "DataSyncBarrier<MemDsbT::DDR>()",
+    ):
+        assert token in dense_retire, token
+
+    dense_finish = _between(
+        dense,
+        "__aicore__ inline void FinishKvafDenseBatchGet(",
+        "// Compatibility wrapper retained",
+    )
+    for token in (
+        "WriteGmByPassDCache<uint64_t>(&queue->last_error",
+        "ReadGmByPassDCache<uint64_t>(&queue->completed_batch_count)",
+        "ReadGmByPassDCache<uint64_t>(&queue->sq_producer_index)",
+        "ReadGmByPassDCache<uint64_t>(&queue->cq_consumer_index)",
+    ):
+        assert token in dense_finish, token
 
     for token in (
         "constexpr uint32_t kDenseBatchGetReservedWqeUbBytes = 4096U;",
@@ -260,8 +319,8 @@ def main() -> None:
         assert token in dense_post, token
     assert "wqe_banks" not in dense_post
     assert "__ubuf__ uint8_t *wqe_bank" not in dense_post
-    assert "dense_wqe_words" not in dense_begin
-    assert "dense_wqe_banks" not in dense_begin
+    assert "dense_wqe_words" not in dense_legacy_begin
+    assert "dense_wqe_banks" not in dense_legacy_begin
 
     # The P10 device header must not inherit an old fixed output partition or
     # cross-forward recovery protocol.  It is acceptable for the repository

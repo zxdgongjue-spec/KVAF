@@ -44,10 +44,9 @@ using ::KvafBatchGetQueueState;
 using ::KvafExecuteBatchGetKernelArgs;
 using ::KvafForwardResidentBatchGetControl;
 using ::KvafForwardResidentBatchGetDescriptorScratch;
-using kvaf_fused_get::BeginKvafDenseBatchGetPostOnly;
+using kvaf_fused_get::BeginKvafDenseBatchGetPostOnlyScalar;
 using kvaf_fused_get::FinishKvafDenseBatchGet;
 using kvaf_fused_get::kDenseBatchGetFailed;
-using kvaf_fused_get::kDenseBatchGetIdle;
 using kvaf_fused_get::kDenseBatchGetInFlight;
 using kvaf_fused_get::kDenseBatchGetRetired;
 using kvaf_fused_get::kInvalidArgs;
@@ -102,13 +101,12 @@ struct KvafForwardResidentBatchGetTerminal {
 static_assert(sizeof(KvafForwardResidentBatchGetTerminal) == 24U,
               "forward-resident terminal ABI changed");
 
-// `BeginKvafDenseBatchGetPostOnly` mutates a large transaction record while it
-// constructs WQEs and rings the doorbell.  A P10 companion must not use that
-// record as an out-parameter across its larger score-executor closure: the
-// AICore compiler can otherwise lose a nested writeback even though the HCCP
-// side effects already happened.  The Begin boundary therefore returns this
-// small scalar result only.  A successful caller rehydrates its drain record
-// from the immutable control + the exact descriptor it just published.
+// The legacy `BeginKvafDenseBatchGetPostOnly` mutates a large transaction
+// record while it constructs WQEs and rings the doorbell.  P10 instead calls
+// the scalar form: it cannot lose a nested transaction writeback across the
+// score-executor closure because no transaction crosses that boundary.  A
+// successful caller rehydrates its drain record from immutable control + the
+// exact descriptor it just published.
 enum KvafForwardResidentBeginStatus : uint32_t {
   kForwardResidentBeginPosted = 0U,
   kForwardResidentBeginInvalidArgs = 1U,
@@ -681,11 +679,13 @@ __aicore__ inline bool SnapshotKvafForwardResidentQueueProgress(
   return true;
 }
 
-// Transaction scalar output may prove a validation failure, but may not prove
-// that a post happened.  POSTED is returned only from an exact durable SQ PI
-// delta in BeginKvafForwardResidentBatchGetPostOnly below.
-__aicore__ inline uint32_t ClassifyKvafForwardResidentBeginWithoutPost(
-    uint64_t result, uint32_t state) {
+// A scalar Dense PostOnly result may prove a pre-doorbell validation failure,
+// but may not prove that a post happened.  POSTED is returned only from an
+// exact durable SQ PI delta in BeginKvafForwardResidentBatchGetPostOnly
+// below.  In particular, a scalar success with no PI advance is unknown, not
+// an unposted queue that may be returned to another wave.
+__aicore__ inline uint32_t ClassifyKvafForwardResidentScalarBeginWithoutPost(
+    uint64_t result) {
   switch (result) {
     case kInvalidArgs:
       return kForwardResidentBeginInvalidArgs;
@@ -702,19 +702,7 @@ __aicore__ inline uint32_t ClassifyKvafForwardResidentBeginWithoutPost(
     default:
       break;
   }
-  if (result != kSuccess) {
-    return kForwardResidentBeginResultUnknown;
-  }
-  switch (state) {
-    case kDenseBatchGetIdle:
-      return kForwardResidentBeginStateIdle;
-    case kDenseBatchGetRetired:
-      return kForwardResidentBeginStateRetired;
-    case kDenseBatchGetFailed:
-      return kForwardResidentBeginStateFailedSuccess;
-    default:
-      return kForwardResidentBeginStateUnknown;
-  }
+  return kForwardResidentBeginResultUnknown;
 }
 
 // All returned non-POSTED statuses below arise before `PostDense...` is
@@ -730,11 +718,11 @@ __aicore__ inline bool KvafForwardResidentBeginHasNoPost(uint32_t status) {
 }
 
 // The sole HCCP PostOnly boundary.  It intentionally has no wave output
-// parameter: the dense transaction is local to this closure and its outcome
-// crosses the compiler/domain boundary as one scalar.  On POSTED, the caller
-// must call `InitializeKvafForwardResidentPostedWaveForDrain` before it polls
-// CQ.  That routine reloads the already-published queue scratch; it does not
-// modify it.
+// parameter and does not instantiate a KvafDenseBatchGetTransaction: P10's
+// compact Dense helper keeps its validation/result scalar local to the
+// HCCP-posting call.  On POSTED, the caller must call
+// `InitializeKvafForwardResidentPostedWaveForDrain` before it polls CQ.  That
+// routine reloads the already-published queue scratch; it does not modify it.
 __aicore__ inline uint32_t BeginKvafForwardResidentBatchGetPostOnly(
     const KvafForwardResidentBatchGetControl& control,
     const KvafForwardResidentQueueLease& lease,
@@ -755,8 +743,9 @@ __aicore__ inline uint32_t BeginKvafForwardResidentBatchGetPostOnly(
     return kForwardResidentBeginInvalidArgs;
   }
 
-  // Construct the short-lived dense ABI record locally.  No caller-owned
-  // wave receives an address-space write from the large PostOnly closure.
+  // The compact Dense helper performs the established validation and
+  // PostOnly protocol, but returns one scalar result instead of accepting a
+  // large transaction out-parameter across the fused C8 closure.
   KvafExecuteBatchGetKernelArgs args{};
   if (!BuildKvafForwardResidentQueueArgsFromDescriptor(
           control, lease.queue_id, descriptor, &args,
@@ -769,9 +758,8 @@ __aicore__ inline uint32_t BeginKvafForwardResidentBatchGetPostOnly(
           args, &sq_initialized_before, &sq_producer_before)) {
     return kForwardResidentBeginInvalidArgs;
   }
-  KvafDenseBatchGetTransaction transaction{};
-  BeginKvafDenseBatchGetPostOnly(args, active_request_count, 0U,
-                                 &transaction);
+  const uint64_t scalar_result =
+      BeginKvafDenseBatchGetPostOnlyScalar(args, active_request_count, 0U);
   uint32_t sq_initialized_after = 0U;
   uint64_t sq_producer_after = 0U;
   if (!SnapshotKvafForwardResidentQueueProgress(
@@ -795,8 +783,7 @@ __aicore__ inline uint32_t BeginKvafForwardResidentBatchGetPostOnly(
       return kForwardResidentBeginSqProducerDeltaMismatch;
     }
   }
-  return ClassifyKvafForwardResidentBeginWithoutPost(transaction.result,
-                                                     transaction.state);
+  return ClassifyKvafForwardResidentScalarBeginWithoutPost(scalar_result);
 }
 
 // Rebuild the CQ-drain record from inputs that are immutable for the held
