@@ -2590,6 +2590,8 @@ __aicore__ inline bool BuildKvafStreamingBatchGetQueueArgs(
   queue_args->block_bytes = static_cast<uint32_t>(control.block_bytes);
   queue_args->block_count = 1U;
   queue_args->jettys_per_core = 1U;
+  queue_args->selection_mode = KVAF_BATCH_GET_SELECTION_DENSE_MASK;
+  queue_args->reserved0 = 0U;
   *active_request_count = descriptor.active_request_count;
   return true;
 }
@@ -2651,6 +2653,8 @@ __aicore__ inline bool BuildKvafP8StreamingBatchGetQueueArgs(
   queue_args->block_bytes = static_cast<uint32_t>(control.block_bytes);
   queue_args->block_count = 1U;
   queue_args->jettys_per_core = 1U;
+  queue_args->selection_mode = KVAF_BATCH_GET_SELECTION_DENSE_MASK;
+  queue_args->reserved0 = 0U;
   *active_request_count = descriptor.active_request_count;
   return true;
 }

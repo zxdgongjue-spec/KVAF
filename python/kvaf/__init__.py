@@ -22,6 +22,7 @@ create_mock_runtime = _native.create_mock_runtime
 runtime = _native.runtime
 meta_manager = _native.meta_manager
 access_operator = _native.access_operator
+AIV_BATCH_GET_COMPACT_COUNT_ABI = getattr(_native, "AIV_BATCH_GET_COMPACT_COUNT_ABI", 0)
 
 if hasattr(_native, "NpuRuntime"):
     NpuRuntime = _native.NpuRuntime
@@ -36,6 +37,7 @@ __all__ = [
     "runtime",
     "meta_manager",
     "access_operator",
+    "AIV_BATCH_GET_COMPACT_COUNT_ABI",
 ]
 
 if hasattr(_native, "NpuRuntime"):

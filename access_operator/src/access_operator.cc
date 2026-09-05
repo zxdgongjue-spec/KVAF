@@ -411,6 +411,15 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
     return InvalidArgument("BatchGet request and arguments must not be null");
   }
   const BatchGetRequest& request = *exec.request;
+  const bool compact_count =
+      request.selection_mode == BatchGetSelectionMode::kCompactCount;
+  if (request.selection_mode != BatchGetSelectionMode::kDenseMask &&
+      !compact_count) {
+    return InvalidArgument("unknown BatchGet selection mode");
+  }
+  const std::size_t selection_bytes = compact_count
+      ? sizeof(std::int32_t)
+      : request.indices.bytes / sizeof(std::int32_t);
   if (!request.indices.has_elements<std::int32_t>() ||
       !request.offsets.has_elements<std::int32_t>() ||
       !request.output_indices.has_elements<std::int32_t>() ||
@@ -434,7 +443,7 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
       request.indices.bytes % sizeof(std::int32_t) != 0 ||
       request.offsets.bytes != request.indices.bytes ||
       request.output_indices.bytes != request.indices.bytes ||
-      request.mask.bytes != request.indices.bytes / sizeof(std::int32_t) ||
+      request.mask.bytes != selection_bytes ||
       execution.status == nullptr ||
       execution.status_bytes < static_cast<std::size_t>(npu_core_count) *
                                    sizeof(KvafBatchGetCoreStatus) ||
@@ -469,6 +478,9 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
   arguments->block_bytes = KVAF_AIV_BATCH_GET_WQE_DATA_BYTES;
   arguments->block_count = npu_core_count;
   arguments->jettys_per_core = jettys_per_core;
+  arguments->selection_mode = compact_count
+      ? KVAF_BATCH_GET_SELECTION_COMPACT_COUNT
+      : KVAF_BATCH_GET_SELECTION_DENSE_MASK;
   return Status::OK();
 }
 

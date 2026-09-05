@@ -260,7 +260,17 @@ Status Runtime::BatchGet(const BatchGetRequest& request,
   }
   const std::size_t request_count =
       request.indices.bytes / sizeof(std::int32_t);
-  if (!request.mask.empty() &&
+  if (request.selection_mode == BatchGetSelectionMode::kCompactCount) {
+    if (request.indices.device != DeviceKind::kNpu ||
+        !request.mask.valid() ||
+        request.mask.bytes != sizeof(std::int32_t) ||
+        request.mask.device != DeviceKind::kNpu) {
+      return Status::InvalidArgument(
+          "compact BatchGet selection must be caller-owned NPU int32[1]");
+    }
+  } else if (request.selection_mode != BatchGetSelectionMode::kDenseMask) {
+    return Status::InvalidArgument("unknown BatchGet selection mode");
+  } else if (!request.mask.empty() &&
       (!request.mask.valid() || request.mask.bytes != request_count ||
        request.mask.device != request.indices.device)) {
     return Status::InvalidArgument("mask must match indices when provided");

@@ -52,7 +52,9 @@ extern "C" int32_t KvafExecuteBatchGetLaunch(const KvafExecuteBatchGetKernelArgs
       arguments->block_count == 0U || arguments->block_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       arguments->request_capacity == 0U || arguments->offsets == 0U ||
       arguments->block_bytes != KVAF_AIV_BATCH_GET_WQE_DATA_BYTES ||
-      arguments->jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE) {
+      arguments->jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
+      arguments->selection_mode > KVAF_BATCH_GET_SELECTION_COMPACT_COUNT ||
+      arguments->reserved0 != 0U) {
     return KVAF_BATCH_GET_INVALID_ARGUMENT;
   }
   aclrtLaunchKernelAttr attrs[4]{};

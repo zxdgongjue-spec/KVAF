@@ -549,6 +549,8 @@ __aicore__ inline bool BuildKvafLayerResidentQueueArgs(
   args->block_bytes = static_cast<uint32_t>(control.block_bytes);
   args->block_count = 1U;
   args->jettys_per_core = 1U;
+  args->selection_mode = KVAF_BATCH_GET_SELECTION_DENSE_MASK;
+  args->reserved0 = 0U;
   *active_request_count = descriptor.active_request_count;
   return true;
 }

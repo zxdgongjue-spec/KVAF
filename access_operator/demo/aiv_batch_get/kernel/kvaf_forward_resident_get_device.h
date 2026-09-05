@@ -651,6 +651,8 @@ __aicore__ inline bool BuildKvafForwardResidentQueueArgsFromDescriptor(
   args->block_bytes = static_cast<uint32_t>(control.block_bytes);
   args->block_count = 1U;
   args->jettys_per_core = 1U;
+  args->selection_mode = KVAF_BATCH_GET_SELECTION_DENSE_MASK;
+  args->reserved0 = 0U;
   *active_request_count = descriptor.active_request_count;
   return true;
 }
@@ -738,6 +740,8 @@ __aicore__ inline bool BuildKvafForwardResidentQueueArgsForPostedDrain(
   args->block_bytes = static_cast<uint32_t>(control.block_bytes);
   args->block_count = 1U;
   args->jettys_per_core = 1U;
+  args->selection_mode = KVAF_BATCH_GET_SELECTION_DENSE_MASK;
+  args->reserved0 = 0U;
   *active_request_count = published_active_request_count;
   return true;
 }
@@ -854,6 +858,8 @@ __aicore__ inline uint32_t BeginKvafForwardResidentBatchGetPostOnly(
   args.block_bytes = static_cast<uint32_t>(control.block_bytes);
   args.block_count = 1U;
   args.jettys_per_core = 1U;
+  args.selection_mode = KVAF_BATCH_GET_SELECTION_DENSE_MASK;
+  args.reserved0 = 0U;
   active_request_count = descriptor.active_request_count;
 
   // The compact Dense helper performs the established validation and
@@ -943,6 +949,8 @@ __aicore__ inline bool InitializeKvafForwardResidentPostedWaveForDrain(
   wave->queue_args.block_bytes = args.block_bytes;
   wave->queue_args.block_count = args.block_count;
   wave->queue_args.jettys_per_core = args.jettys_per_core;
+  wave->queue_args.selection_mode = args.selection_mode;
+  wave->queue_args.reserved0 = args.reserved0;
 
   ResetDenseBatchGetTransaction(&wave->transaction);
   wave->transaction.active_count = active_request_count;

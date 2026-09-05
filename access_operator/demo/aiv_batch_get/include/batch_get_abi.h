@@ -73,6 +73,9 @@ enum {
       KVAF_P8_FORWARD_CONTROL_WORDS * sizeof(uint64_t),
   // Shared local-memory contract used by the AIV kernel and launcher.
   KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES = 160 * 1024,
+  KVAF_BATCH_GET_SELECTION_DENSE_MASK = 0,
+  KVAF_BATCH_GET_SELECTION_COMPACT_COUNT = 1,
+  KVAF_AIV_BATCH_GET_COMPACT_COUNT_ABI = 1,
 };
 
 static const uint64_t KVAF_AIV_BATCH_GET_STATUS_MAGIC = 0x4b5641464247444fULL;
@@ -184,7 +187,7 @@ typedef struct KvafExecuteBatchGetKernelArgs {
   uint64_t valid_table;         // uint8[table_capacity]
   uint64_t indices;             // int32[request_capacity]
   uint64_t offsets;             // int32[request_capacity], byte offset in entry
-  uint64_t mask;                // uint8[request_capacity]
+  uint64_t mask;                // uint8[capacity] or device int32[1], by mode
   uint64_t output_indices;      // int32[request_capacity]
   uint64_t output;              // caller-owned HBM output; must match entity
   uint64_t core_status;         // KvafBatchGetCoreStatus[block_count]
@@ -197,6 +200,12 @@ typedef struct KvafExecuteBatchGetKernelArgs {
   uint32_t block_count;
   // Zero preserves the phase-one ABI and selects one Jetty per AIV core.
   uint32_t jettys_per_core;
+  // Dense is unchanged. Compact count consumes int32[1] at `mask` on device
+  // and divides that prefix across workers, without dense-mask expansion.
+  // This extends the launch POD ABI from 104 to 112 bytes. Rebuild the host,
+  // kernel and all fused source consumers together; do not mix old binaries.
+  uint32_t selection_mode;
+  uint32_t reserved0;
 } KvafExecuteBatchGetKernelArgs;
 
 // Cold-path control block for a fused, full-completion BatchGet path.
@@ -378,7 +387,7 @@ static_assert(sizeof(KvafBatchGetQueueState) == KVAF_AIV_BATCH_GET_QUEUE_STATE_B
               "KvafBatchGetQueueState ABI changed");
 static_assert(sizeof(KvafBatchGetDirectUrmaEntity) == 192,
               "KvafBatchGetDirectUrmaEntity ABI changed");
-static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 104,
+static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 112,
               "KvafExecuteBatchGetKernelArgs ABI changed");
 static_assert(sizeof(KvafFusedBatchGetControl) ==
                   KVAF_FUSED_BATCH_GET_CONTROL_BYTES,

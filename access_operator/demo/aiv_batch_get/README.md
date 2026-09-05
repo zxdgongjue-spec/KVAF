@@ -17,7 +17,7 @@ registration; each HBM output is registered separately as a local UDMA range.
 | `valid_table` | `uint8[table_capacity]` | A zero entry makes its lookup invalid. |
 | `indices` | `int32[request_capacity]` | Logical entries requested by this batch. |
 | `offsets` | `int32[request_capacity]` | Byte offset inside the selected 128 * 656B entry. |
-| `mask` | `uint8[request_capacity]` | Zero skips that request without changing the graph shape. |
+| `mask` | `uint8[request_capacity]` or `int32[1]` | Dense mode skips zero entries; compact-count mode selects the native LIDU descriptor prefix. |
 | `output_indices` | `int32[request_capacity]` | Destination row in `output`. |
 | `output` | `uint8[output_rows * 656]` | Contiguous Device HBM output. |
 
@@ -27,6 +27,17 @@ For an active request `i`, the kernel reads exactly 656 bytes from
 `128 * 656` bytes, so `offsets[i] + 656` must stay within that entry. This is the
 fixed-block, single-output-scatter scope; duplicate output rows are not
 rejected and have last-completion-wins semantics.
+
+Set `selection_mode=KVAF_BATCH_GET_SELECTION_COMPACT_COUNT` to consume the
+caller-owned device `int32[1]` count at `mask`; mode zero retains the dense
+mask behavior. Only the kernel reads the count, after the producer's stream
+dependency. Negative or over-capacity counts produce an invalid-arguments
+device status before any post. A zero count produces no READs. The active
+prefix is balanced across workers, then uses the existing 32-WQE posting
+and CQ-completion path; the fused helper's 256-row wave limit does not apply
+to this ordinary BatchGet call. The existing 16384-active-requests/AIV and
+SQ-capacity bounds still apply. `KvafExecuteBatchGetKernelArgs` is now 112
+bytes: rebuild the host library, kernel object and fused consumers together.
 
 The local-memory lifetime is intentionally separate from the shared
 transport:

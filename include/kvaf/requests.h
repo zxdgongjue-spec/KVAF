@@ -51,6 +51,15 @@ struct AccessTableDeviceView {
   }
 };
 
+// Both modes retain the caller-owned selection buffer in `mask`. Compact
+// count is the native MTP LIDU ABI: int32[1] specifies an already-compacted
+// prefix of the fixed-capacity descriptor vectors. Only the NPU kernel may
+// read its value; Runtime must not synchronize or expand it to a dense mask.
+enum class BatchGetSelectionMode : std::uint32_t {
+  kDenseMask = 0,
+  kCompactCount = 1,
+};
+
 struct BatchGetRequest {
   // CPU BatchGet 必须提供有效 handle。NPU BatchGet 使用 DeviceAccessTable
   // 重载时也会提供 handle，以便 Runtime 验证 Host 表生命周期；
@@ -69,6 +78,10 @@ struct BatchGetRequest {
 
   // CPU path 留空。NPU path 必须提供调用方持有的稳定 Device 表。
   AccessTableDeviceView device_access_table;
+
+  // Default preserves the existing uint8[n] mask API (and CPU empty-mask
+  // semantics). Compact count is NPU-only and requires mask=int32[1].
+  BatchGetSelectionMode selection_mode{BatchGetSelectionMode::kDenseMask};
 };
 
 struct BatchPutRequest {

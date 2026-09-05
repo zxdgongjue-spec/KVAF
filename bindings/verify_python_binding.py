@@ -22,6 +22,7 @@ def main() -> int:
             or not hasattr(kvaf.NpuRuntime, "start_batch_get_kernel_profile")
             or not hasattr(kvaf.NpuRuntime, "batch_get_kernel_profile")
             or not hasattr(kvaf.NpuRuntime, "stop_batch_get_kernel_profile")
+            or kvaf.AIV_BATCH_GET_COMPACT_COUNT_ABI != 1
         ):
             raise RuntimeError(
                 "KVAF AIV binding does not export NpuRuntime, DeviceAccessTable, "

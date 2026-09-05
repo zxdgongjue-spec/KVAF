@@ -68,6 +68,7 @@ add_custom_command(
   DEPENDS "${KVAF_EXECUTE_KERNEL_SOURCE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/kvaf_fused_full_get_device.h"
           "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_abi.h"
+          "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_compact_prefix.h"
           "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"
   VERBATIM)
 add_custom_target(kvaf_execute_batch_get_kernel ALL DEPENDS "${KVAF_EXECUTE_KERNEL_OBJECT}")

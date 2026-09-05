@@ -1095,6 +1095,10 @@ class NpuRuntime final {
   // only retains its internal Direct-HCCP execution state; callers must keep
   // input/output Tensors and either the DeviceAccessTable or the direct
   // addresses/valid Tensors alive until their stream completes BatchGet.
+  // `mask` accepts either the legacy uint8[N] dense mask or MTP LIDU's
+  // caller-owned int32[1] compact-prefix count. The latter is read only by
+  // the NPU kernel after the producer stream dependency; no host count is
+  // inspected and no intermediate mask/control allocation is introduced.
   void BatchGet(const DeviceAccessTable& access_table,
                 const py::object& indices, const py::object& offsets,
                 const py::object& mask,
@@ -1801,16 +1805,25 @@ class NpuRuntime final {
     const NpuTensorView output_view = GetNpuTensorView(output, "output");
     const NpuTensorView address_view = GetNpuTensorView(addresses, "addresses");
     const NpuTensorView valid_view = GetNpuTensorView(valid, "valid");
+    const std::string selection_dtype =
+        py::str(mask.attr("dtype")).cast<std::string>();
+    const bool compact_count =
+        selection_dtype == "torch.int32" && mask_view.shape.size() == 1 &&
+        mask_view.shape.front() == 1 &&
+        mask_view.element_bytes == sizeof(std::int32_t);
+    const bool dense_mask =
+        selection_dtype == "torch.uint8" &&
+        mask_view.element_bytes == sizeof(std::uint8_t) &&
+        mask_view.bytes == index_view.bytes / sizeof(std::int32_t);
     if (index_view.shape.size() != 1 || offset_view.shape.size() != 1 ||
         mask_view.shape.size() != 1 ||
         output_index_view.shape.size() != 1 || output_view.shape.size() < 2 ||
         index_view.element_bytes != sizeof(std::int32_t) ||
         offset_view.element_bytes != sizeof(std::int32_t) ||
         output_index_view.element_bytes != sizeof(std::int32_t) ||
-        mask_view.element_bytes != sizeof(std::uint8_t) ||
+        (!compact_count && !dense_mask) ||
         index_view.bytes != offset_view.bytes ||
         index_view.bytes != output_index_view.bytes ||
-        mask_view.bytes != index_view.bytes / sizeof(std::int32_t) ||
         address_view.element_bytes != sizeof(Address) ||
         valid_view.element_bytes != sizeof(std::uint8_t) ||
         valid_view.bytes != address_view.bytes / sizeof(Address) ||
@@ -1835,7 +1848,9 @@ class NpuRuntime final {
         output_block_bytes,
         AccessTableDeviceView{
             ConstBufferView{address_view.data, address_view.bytes, DeviceKind::kNpu},
-            ConstBufferView{valid_view.data, valid_view.bytes, DeviceKind::kNpu}}};
+            ConstBufferView{valid_view.data, valid_view.bytes, DeviceKind::kNpu}},
+        compact_count ? BatchGetSelectionMode::kCompactCount
+                      : BatchGetSelectionMode::kDenseMask};
   }
 
   void BatchGetImpl(const AccessTableHandle& access_table,
@@ -2006,6 +2021,8 @@ class NpuRuntime final {
 }  // namespace
 
 void BindNpuPythonRuntime(py::module_& module) {
+  module.attr("AIV_BATCH_GET_COMPACT_COUNT_ABI") =
+      py::int_(static_cast<int>(KVAF_AIV_BATCH_GET_COMPACT_COUNT_ABI));
   py::class_<DeviceAccessTable>(module, "DeviceAccessTable")
       .def_property_readonly("addresses", &DeviceAccessTable::addresses)
       .def_property_readonly("valid", &DeviceAccessTable::valid)
@@ -2192,6 +2209,7 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("output_indices"), py::arg("output"),
            py::arg("stream") = py::none(), py::arg("synchronize") = false,
            "Submit BatchGet from NPU Tensors. stream=None uses torch.npu.current_stream(); "
+           "mask is uint8[N] or native MTP compact-count int32[1]; "
            "the default returns after enqueueing work on that stream.")
       .def("batch_get", &NpuRuntime::BatchGetFromTensors,
            py::arg("addresses"), py::arg("valid"), py::arg("indices"),
@@ -2199,6 +2217,7 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("output"), py::arg("stream") = py::none(),
            py::arg("synchronize") = false,
            "Submit BatchGet from caller-owned NPU addresses and valid Tensors. "
+           "mask is uint8[N] or native MTP compact-count int32[1], consumed on device. "
            "stream=None uses torch.npu.current_stream(); the default returns "
            "after enqueueing work on that stream.");
 }
