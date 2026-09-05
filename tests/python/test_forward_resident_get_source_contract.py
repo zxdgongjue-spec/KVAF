@@ -112,10 +112,33 @@ def main() -> None:
     queue_args = _between(
         device,
         "__aicore__ inline bool BuildKvafForwardResidentQueueArgsFromDescriptor(",
-        "// P10's Begin/rehydrate pair already owns one exact local descriptor.",
+        "// Keep this full-validation reload helper for independent callers",
     )
     assert "args->output = control.output" in queue_args
     assert "private_output" not in queue_args
+    assert "ValidateKvafForwardResidentOutputIndices(control, descriptor)" in queue_args
+
+    # `Publish` retains its original three-argument source API and remains
+    # the one descriptor-publish gate.  It performs complete
+    # range/duplicate validation and DDR publication; Begin may only reuse
+    # its local descriptor immediately after that success.
+    publish = _between(
+        device,
+        "__aicore__ inline bool PublishKvafForwardResidentDescriptor(",
+        "__aicore__ inline bool BuildKvafForwardResidentQueueArgsFromDescriptor(",
+    )
+    for token in (
+        "ValidateKvafForwardResidentOutputIndices(control, descriptor)",
+        "StoreKvafForwardResidentDescriptorToGm(scratch, descriptor)",
+        "DataSyncBarrier<AscendC::MemDsbT::DDR>()",
+        "control.output_rows > UINT32_MAX",
+    ):
+        assert token in publish, token
+    assert "const KvafForwardResidentBatchGetDescriptorScratch& descriptor)" in publish
+    assert "KvafExecuteBatchGetKernelArgs* published_args" not in publish
+    assert publish.index("ValidateKvafForwardResidentOutputIndices(") < publish.index(
+        "StoreKvafForwardResidentDescriptorToGm("
+    )
 
     begin = _between(
         device,
@@ -132,6 +155,16 @@ def main() -> None:
     assert begin.index("PublishKvafForwardResidentDescriptor(") < begin.index(
         "BeginKvafDenseBatchGetPostOnlyScalar("
     )
+    assert "BuildKvafForwardResidentQueueArgsFromDescriptor(" not in begin
+    for token in (
+        "args.output = control.output",
+        "args.queue_state =",
+        "active_request_count = descriptor.active_request_count",
+    ):
+        assert token in begin, token
+    assert begin.index("PublishKvafForwardResidentDescriptor(") < begin.index(
+        "args.address_table ="
+    ) < begin.index("SnapshotKvafForwardResidentQueueProgress(")
     assert "KvafForwardResidentBatchGetWave*" not in begin
     assert "KvafDenseBatchGetTransaction transaction" not in begin
     assert "BeginKvafDenseBatchGetPostOnly(" not in begin
@@ -158,7 +191,7 @@ def main() -> None:
     )
     for token in (
         "IsKvafForwardResidentBatchGetControlValidForAicore(control)",
-        "BuildKvafForwardResidentQueueArgs(",
+        "BuildKvafForwardResidentQueueArgsForPostedDrain(",
         "active_request_count != expected_active_request_count",
         "wave->lease.state = kForwardResidentQueuePosted",
         "wave->transaction.state = kDenseBatchGetInFlight",
@@ -167,6 +200,28 @@ def main() -> None:
         assert token in rehydrate, token
     assert "PublishKvafForwardResidentDescriptor(" not in rehydrate
     assert "BeginKvafDenseBatchGetPostOnly(" not in rehydrate
+    assert "BuildKvafForwardResidentQueueArgs(" not in rehydrate
+    assert "LoadKvafForwardResidentDescriptorFromGm(" not in rehydrate
+
+    drain_args = _between(
+        device,
+        "__aicore__ inline bool BuildKvafForwardResidentQueueArgsForPostedDrain(",
+        "// These wrappers intentionally contain no alternative HCCP protocol.",
+    )
+    # Rehydration must obtain CQ/PI ownership from the immutable template and
+    # compare the durable descriptor release word, rather than reload and
+    # re-run the full O(n^2) vector validation after a proven post.
+    for token in (
+        "LoadKvafForwardResidentQueueTemplate(control, lease,",
+        "ReadGmByPassDCache<uint32_t>(",
+        "&scratch->active_request_count",
+        "published_active_request_count != expected_active_request_count",
+        "control.output_rows > UINT32_MAX",
+        "args->queue_state =",
+        "args->output = control.output",
+    ):
+        assert token in drain_args, token
+    assert "ValidateKvafForwardResidentOutputIndices(" not in drain_args
 
     assert "KvafForwardResidentBeginHasNoPost" in device
     begin_status = _between(

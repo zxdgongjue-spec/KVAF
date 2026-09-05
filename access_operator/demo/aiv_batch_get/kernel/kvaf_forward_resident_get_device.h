@@ -105,8 +105,8 @@ static_assert(sizeof(KvafForwardResidentBatchGetTerminal) == 24U,
 // record while it constructs WQEs and rings the doorbell.  P10 instead calls
 // the scalar form: it cannot lose a nested transaction writeback across the
 // score-executor closure because no transaction crosses that boundary.  A
-// successful caller rehydrates its drain record from immutable control + the
-// exact descriptor it just published.
+// successful caller rehydrates its drain record from the immutable queue
+// template plus the published descriptor's single release word.
 enum KvafForwardResidentBeginStatus : uint32_t {
   kForwardResidentBeginPosted = 0U,
   kForwardResidentBeginInvalidArgs = 1U,
@@ -569,7 +569,8 @@ __aicore__ inline bool PublishKvafForwardResidentDescriptor(
     const KvafForwardResidentBatchGetDescriptorScratch& descriptor) {
   if (!IsKvafForwardResidentBatchGetControlValidForAicore(control) ||
       lease.state != kForwardResidentQueueHeld || lease.owner_tag <= 0 ||
-      lease.queue_id >= control.queue_count || descriptor.address_table == 0U ||
+      lease.queue_id >= control.queue_count || control.output_rows > UINT32_MAX ||
+      descriptor.address_table == 0U ||
       descriptor.valid_table == 0U || descriptor.indices == 0U ||
       descriptor.offsets == 0U || descriptor.mask == 0U ||
       descriptor.output_indices == 0U || descriptor.table_capacity == 0U ||
@@ -654,10 +655,10 @@ __aicore__ inline bool BuildKvafForwardResidentQueueArgsFromDescriptor(
   return true;
 }
 
-// P10's Begin/rehydrate pair already owns one exact local descriptor.  It
-// calls the descriptor form above and never reloads a potentially unrelated
-// GM record through a mutable wave out-parameter.  Keep this reload helper
-// for callers that intentionally start from queue-owned descriptor scratch.
+// Keep this full-validation reload helper for independent callers that
+// intentionally start from queue-owned descriptor scratch.  P10's Begin path
+// does not call it: its just-published local descriptor has already passed
+// the same complete validation at the publication boundary.
 __aicore__ inline bool BuildKvafForwardResidentQueueArgs(
     const KvafForwardResidentBatchGetControl& control, uint32_t queue_id,
     KvafExecuteBatchGetKernelArgs* args, uint32_t* active_request_count) {
@@ -671,6 +672,74 @@ __aicore__ inline bool BuildKvafForwardResidentQueueArgs(
   return LoadKvafForwardResidentDescriptorFromGm(scratch, &descriptor) &&
       BuildKvafForwardResidentQueueArgsFromDescriptor(
           control, queue_id, descriptor, args, active_request_count);
+}
+
+// Rehydrate after a durable POSTED proof without reloading/revalidating the
+// mutable candidate vectors.  The held queue lease prevents another producer
+// from changing this queue's scratch/template.  We still bypass-read the
+// scratch release word to prove that the caller's expected count is the exact
+// descriptor count that was published, then derive every CQ-visible address
+// from the cold immutable template.  CQ/PI state therefore remains the same
+// queue state used by Begin, while no second O(n^2) duplicate scan is needed.
+__aicore__ inline bool BuildKvafForwardResidentQueueArgsForPostedDrain(
+    const KvafForwardResidentBatchGetControl& control,
+    const KvafForwardResidentQueueLease& lease,
+    uint32_t expected_active_request_count,
+    KvafExecuteBatchGetKernelArgs* args, uint32_t* active_request_count) {
+  if (args == nullptr || active_request_count == nullptr ||
+      expected_active_request_count == 0U ||
+      !IsKvafForwardResidentBatchGetControlValidForAicore(control) ||
+      lease.state != kForwardResidentQueueHeld || lease.owner_tag <= 0 ||
+      lease.queue_id >= control.queue_count || control.output_rows > UINT32_MAX ||
+      ReadKvafForwardResidentQueueOwner(control, lease.queue_id) !=
+          lease.owner_tag) {
+    return false;
+  }
+
+  KvafForwardResidentBatchGetDescriptorScratch descriptor_template{};
+  if (!LoadKvafForwardResidentQueueTemplate(control, lease,
+                                             &descriptor_template)) {
+    return false;
+  }
+  __gm__ const KvafForwardResidentBatchGetDescriptorScratch* const scratch =
+      GetKvafForwardResidentDescriptorScratch(control, lease.queue_id);
+  if (scratch == nullptr) {
+    return false;
+  }
+  // `active_request_count` is the release word written after all descriptor
+  // fields.  It is the only mutable descriptor field relevant after the SQ
+  // PI proof; the Dense CQ path never reads candidate vectors again.
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  const uint32_t published_active_request_count =
+      ReadGmByPassDCache<uint32_t>(
+          const_cast<__gm__ uint32_t*>(&scratch->active_request_count));
+  if (published_active_request_count != expected_active_request_count ||
+      published_active_request_count > descriptor_template.request_capacity) {
+    return false;
+  }
+
+  args->address_table = descriptor_template.address_table;
+  args->valid_table = descriptor_template.valid_table;
+  args->indices = descriptor_template.indices;
+  args->offsets = descriptor_template.offsets;
+  args->mask = descriptor_template.mask;
+  args->output_indices = descriptor_template.output_indices;
+  args->output = control.output;
+  args->core_status = control.core_status +
+                      lease.queue_id * sizeof(KvafBatchGetCoreStatus);
+  args->channel_entity =
+      control.channel_entity +
+      lease.queue_id * sizeof(KvafBatchGetDirectUrmaEntity);
+  args->queue_state =
+      control.queue_state + lease.queue_id * sizeof(KvafBatchGetQueueState);
+  args->table_capacity = descriptor_template.table_capacity;
+  args->request_capacity = descriptor_template.request_capacity;
+  args->output_rows = static_cast<uint32_t>(control.output_rows);
+  args->block_bytes = static_cast<uint32_t>(control.block_bytes);
+  args->block_count = 1U;
+  args->jettys_per_core = 1U;
+  *active_request_count = published_active_request_count;
+  return true;
 }
 
 // These wrappers intentionally contain no alternative HCCP protocol.  They
@@ -738,12 +807,14 @@ __aicore__ inline bool KvafForwardResidentBeginHasNoPost(uint32_t status) {
 // compact Dense helper keeps its validation/result scalar local to the
 // HCCP-posting call.  On POSTED, the caller must call
 // `InitializeKvafForwardResidentPostedWaveForDrain` before it polls CQ.  That
-// routine reloads the already-published queue scratch; it does not modify it.
+// routine checks the already-published count release word and rebuilds CQ
+// arguments from the immutable queue template; it does not modify scratch.
 __aicore__ inline uint32_t BeginKvafForwardResidentBatchGetPostOnly(
     const KvafForwardResidentBatchGetControl& control,
     const KvafForwardResidentQueueLease& lease,
     const KvafForwardResidentBatchGetDescriptorScratch& descriptor) {
   uint32_t active_request_count = 0U;
+  KvafExecuteBatchGetKernelArgs args{};
   if (!IsKvafForwardResidentBatchGetControlValidForAicore(control) ||
       lease.state != kForwardResidentQueueHeld || lease.owner_tag <= 0 ||
       lease.queue_id >= control.queue_count ||
@@ -758,15 +829,36 @@ __aicore__ inline uint32_t BeginKvafForwardResidentBatchGetPostOnly(
     return kForwardResidentBeginInvalidArgs;
   }
 
+  // This local construction is intentionally adjacent to the successful
+  // Publish call above.  It is not a public unchecked builder: Publish has
+  // completed the range/duplicate validation plus descriptor DDR release,
+  // and the following scalar PostOnly call consumes these exact local args.
+  args.address_table = descriptor.address_table;
+  args.valid_table = descriptor.valid_table;
+  args.indices = descriptor.indices;
+  args.offsets = descriptor.offsets;
+  args.mask = descriptor.mask;
+  args.output_indices = descriptor.output_indices;
+  // Preserve the full LocalBufferAcquire base required by the unmodified
+  // Direct-HCCP entity; descriptors select absolute resident rows within it.
+  args.output = control.output;
+  args.core_status =
+      control.core_status + lease.queue_id * sizeof(KvafBatchGetCoreStatus);
+  args.channel_entity = control.channel_entity +
+                        lease.queue_id * sizeof(KvafBatchGetDirectUrmaEntity);
+  args.queue_state =
+      control.queue_state + lease.queue_id * sizeof(KvafBatchGetQueueState);
+  args.table_capacity = descriptor.table_capacity;
+  args.request_capacity = descriptor.request_capacity;
+  args.output_rows = static_cast<uint32_t>(control.output_rows);
+  args.block_bytes = static_cast<uint32_t>(control.block_bytes);
+  args.block_count = 1U;
+  args.jettys_per_core = 1U;
+  active_request_count = descriptor.active_request_count;
+
   // The compact Dense helper performs the established validation and
   // PostOnly protocol, but returns one scalar result instead of accepting a
   // large transaction out-parameter across the fused C8 closure.
-  KvafExecuteBatchGetKernelArgs args{};
-  if (!BuildKvafForwardResidentQueueArgsFromDescriptor(
-          control, lease.queue_id, descriptor, &args,
-          &active_request_count)) {
-    return kForwardResidentBeginInvalidArgs;
-  }
   uint32_t sq_initialized_before = 0U;
   uint64_t sq_producer_before = 0U;
   if (!SnapshotKvafForwardResidentQueueProgress(
@@ -824,8 +916,9 @@ __aicore__ inline bool InitializeKvafForwardResidentPostedWaveForDrain(
   }
   KvafExecuteBatchGetKernelArgs args{};
   uint32_t active_request_count = 0U;
-  if (!BuildKvafForwardResidentQueueArgs(
-          control, lease.queue_id, &args, &active_request_count) ||
+  if (!BuildKvafForwardResidentQueueArgsForPostedDrain(
+          control, lease, expected_active_request_count, &args,
+          &active_request_count) ||
       active_request_count != expected_active_request_count) {
     return false;
   }
