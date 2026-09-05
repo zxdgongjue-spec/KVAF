@@ -116,11 +116,6 @@ Status RuntimeCore::Shutdown() {
     return Status::NotInitialized("Runtime has not been initialized");
   }
 
-  // A device data plane can refuse teardown while a fused context is leased
-  // or DMA completion is uncertain. Keep DDR and metadata locks intact then.
-  const Status operator_status = access_operator_.Shutdown();
-  if (!operator_status.ok()) return operator_status;
-
   Status first_error = Status::OK();
   for (const auto& entry : access_tables_) {
     const Status status = meta_manager_.UnlockKeys(entry.second->lock_context);
@@ -130,6 +125,10 @@ Status RuntimeCore::Shutdown() {
   }
   access_tables_.clear();
 
+  const Status operator_status = access_operator_.Shutdown();
+  if (!operator_status.ok() && first_error.ok()) {
+    first_error = operator_status;
+  }
   const Status release_status = ddr_allocator_.Release(remote_region_);
   if (!release_status.ok() && first_error.ok()) {
     first_error = release_status;

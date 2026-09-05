@@ -67,10 +67,7 @@ add_custom_command(
           -o "${KVAF_EXECUTE_KERNEL_OBJECT}"
   DEPENDS "${KVAF_EXECUTE_KERNEL_SOURCE}"
           "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_abi.h"
-          "${KVAF_AIV_DEMO_INCLUDE_DIR}/kvaf_batch_get_device.h"
-          "${KVAF_AIV_DEMO_INCLUDE_DIR}/kvaf_batch_get_device_policy.h"
           "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"
-          "${KVAF_SIMT_API_DIR}/simt_api/asc_simt.h"
   VERBATIM)
 add_custom_target(kvaf_execute_batch_get_kernel ALL DEPENDS "${KVAF_EXECUTE_KERNEL_OBJECT}")
 add_custom_command(TARGET kvaf_execute_batch_get_kernel POST_BUILD

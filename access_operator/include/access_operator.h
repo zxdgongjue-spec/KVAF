@@ -69,24 +69,6 @@ struct BatchGetKernelProfile {
   std::array<std::uint64_t, 2> jetty_completion_polls{};
 };
 
-// Borrowed device resources for a caller-launched fused kernel. KVAF retains
-// the registrations and queue storage until ReleaseFusedBatchGetContext.
-// Queue cursors are persistent: never clear them between kernel invocations.
-// The caller keeps output HBM alive and submits all uses sequentially on one
-// stream. This is a host API record, not a device tensor serialization ABI.
-struct FusedBatchGetContext {
-  std::uint64_t lease_id{0};
-  std::uint64_t device_channel_entity{0};
-  std::uint64_t device_queue_state{0};
-  std::uint64_t device_core_status{0};
-  std::uint64_t output_address{0};
-  std::uint64_t output_bytes{0};
-  std::uint32_t worker_count{0};
-  std::uint32_t jettys_per_core{0};
-  std::uint32_t token_bytes{0};
-  std::uint32_t tokens_per_block{0};
-};
-
 // Default synchronous NPU data-plane implementation.
 //
 // Initialize creates reusable BatchGet and (when configured) BatchPut
@@ -111,17 +93,6 @@ class DefaultAccessOperator final : public AccessOperator {
   Status Shutdown() override;
   Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
   Status ExecuteBatchPut(const BatchPutExecRequest& request) override;
-
-  Status AcquireFusedBatchGetContext(
-      void* output, std::uint64_t output_bytes, std::uint32_t token_bytes,
-      std::uint32_t tokens_per_block, FusedBatchGetContext* context);
-  // Synchronizes the supplied stream and checks the device queue result.
-  // A failed release keeps the lease and registrations alive. In particular,
-  // a CQ timeout cannot be treated as proof that DMA has stopped. Shutdown
-  // refuses an active lease; after a transport fault the caller must retain
-  // the output allocation and stop execution until device/process teardown.
-  Status ReleaseFusedBatchGetContext(const FusedBatchGetContext& context,
-                                    void* stream);
 
   // Profiling is opt-in and uses the reserved per-core status area. Callers
   // must complete the BatchGet stream before copying the latest snapshot.

@@ -38,32 +38,5 @@ else()
     "Skipping direct Runtime Python tests; configure with -DKVAF_BUILD_PYTHON=ON")
 endif()
 
-# Compile the real host operator against a private fake ACL/transport surface.
-# This validates resource leases on developer machines without claiming any
-# device transfer or kernel execution coverage.
-add_executable(kvaf_fused_batch_get_context_test
-  fused_batch_get_context_test.cc
-  ../access_operator/src/access_operator.cc)
-target_include_directories(kvaf_fused_batch_get_context_test PRIVATE
-  fused_context_stubs
-  ../access_operator/demo/aiv_batch_get/include)
-target_link_libraries(kvaf_fused_batch_get_context_test PRIVATE
-  kvaf_runtime kvaf_meta_manager kvaf_peer_link)
-add_test(NAME kvaf_fused_batch_get_context_host
-  COMMAND kvaf_fused_batch_get_context_test)
-
-# Also compile the NpuRuntime forwarding API against the same declarations;
-# this is a host syntax check and deliberately has no runtime/device backend.
-add_library(kvaf_fused_npu_runtime_syntax OBJECT ../runtime/src/npu_runtime.cc)
-target_include_directories(kvaf_fused_npu_runtime_syntax PRIVATE
-  fused_context_stubs
-  ../access_operator/demo/aiv_batch_get/include)
-target_link_libraries(kvaf_fused_npu_runtime_syntax PRIVATE kvaf_runtime)
-
-add_executable(kvaf_batch_get_device_control_test
-  ../access_operator/demo/aiv_batch_get/kernel/tests/test_batch_get_device.cpp)
-target_include_directories(kvaf_batch_get_device_control_test PRIVATE
-  ../access_operator/demo/aiv_batch_get/kernel/tests
-  ../access_operator/demo/aiv_batch_get/include)
-add_test(NAME kvaf_batch_get_device_control_host
-  COMMAND kvaf_batch_get_device_control_test)
+# Runtime tests are Python-only. Mock and NPU integration coverage call the
+# pybind API directly; no subprocess driver is built or invoked.
