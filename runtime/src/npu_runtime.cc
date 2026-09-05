@@ -437,7 +437,12 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
 
 NpuRuntime::~NpuRuntime() {
   if (impl_ != nullptr) {
-    (void)Shutdown();
+    if (!Shutdown().ok()) {
+      std::fprintf(stderr, "[KVAF_AIV] FUSED_RUNTIME_RETAINED_ON_DESTRUCTION "
+                           "reason=teardown_not_safe\n");
+      (void)impl_.release();
+      return;
+    }
     impl_->runtime_core.reset();
     impl_->access_operator.reset();
     impl_->ReleaseProbe();
@@ -626,6 +631,24 @@ Status NpuRuntime::AcceptLink(const LinkTarget&) {
   return Status::NotImplemented("NpuRuntime does not accept links in the CPU--NPU deployment");
 }
 
+Status NpuRuntime::AcquireFusedBatchGetContext(
+    void* output, std::uint64_t output_bytes, FusedBatchGetContext* context) {
+  if (!initialized() || impl_->access_operator == nullptr) {
+    return Status::NotInitialized("initialize the linked Runtime before acquiring a fused context");
+  }
+  return impl_->access_operator->AcquireFusedBatchGetContext(
+      output, output_bytes, impl_->options.batch_get_token_bytes,
+      impl_->options.batch_get_tokens_per_block, context);
+}
+
+Status NpuRuntime::ReleaseFusedBatchGetContext(
+    const FusedBatchGetContext& context, void* stream) {
+  if (!initialized() || impl_->access_operator == nullptr) {
+    return Status::NotInitialized("Runtime has no fused BatchGet context");
+  }
+  return impl_->access_operator->ReleaseFusedBatchGetContext(context, stream);
+}
+
 Status NpuRuntime::ReleaseLink(LinkId link_id) {
   if (link_id != 1U || impl_->peer_link == nullptr) return Status::NotFound("PeerLink was not found");
   const Status shutdown = Shutdown();
@@ -649,6 +672,7 @@ Status NpuRuntime::Shutdown() {
   const Status status = impl_->runtime_core != nullptr && impl_->runtime_core->initialized()
                             ? impl_->runtime_core->Shutdown()
                             : Status::OK();
+  if (!status.ok()) return status;
   impl_->ReleaseProbe();
   return status;
 }

@@ -101,6 +101,29 @@ buffer，由 `DefaultAccessOperator.Initialize` 申请并在 `Shutdown` 释放�
 其 completion status 并以 `[KVAF_AIV] BATCH_GET_DEVICE_ERROR` 诊断日志记录
 设备侧错误；它不会成为 Python 的额外返回值。
 
+## 融合算子的 C++ BatchGet 上下文
+
+`NpuRuntime::AcquireFusedBatchGetContext(output, output_bytes, &context)`
+复用已经 `LinkTo`、`Initialize` 的通信链路，注册调用方的目标 HBM，并独占借出
+`FusedBatchGetContext`。上下文包含 device `channel_entity`、`queue_state`、
+`core_status` 地址，目标 HBM 地址和长度，以及 worker/Jetty 数与 token/block 布局。
+该接口不启动 BatchGet kernel；调用方把这些资源传给自己的融合算子。
+
+Acquire 只在初始化阶段同步一次 device，以排空此前普通 BatchGet。融合算子随后
+可在同一 stream 上反复使用同一个上下文，保留 SQ/CQ 游标；不得每次清零队列。
+借用期间普通 `BatchGet`、第二次 Acquire 和会重置 status 的 profiling 配置返回
+`Busy`。调用方仍负责使地址表、DDR Key 锁和目标 HBM 在所有使用期间有效，且不得
+并发提交两个使用同一上下文的算子。该记录是 Host API，融合算子的 tensor ABI
+由调用方显式构造，不应依赖其 C++ 内存布局。
+
+`ReleaseFusedBatchGetContext(context, stream)` 同步实际 launch stream，确认各
+队列没有 transport error 后归还注册引用。纯输入预检错误没有未决 DMA，可以
+正常归还；算子是否成功仍由调用方检查自己的输出状态。CQ 错误、超时、stream
+同步失败或无法读取队列状态则隔离上下文，保留注册与 DDR；后续 Release 不会因
+清零错误字段而重新成功，Shutdown 返回 `Busy`。此时调用方必须保留目标 HBM 并
+停止继续计算，直到 device/process teardown。析构也不会强行注销可能被迟到 DMA
+访问的资源。当前新增接口只面向 C++，未添加 Python binding。
+
 ## 当前 POC 的 NPU AccessTable 边界
 
 `PrepareAccessTable` 生成 Runtime-owned 的扁平 Host `address/length/valid` 表并

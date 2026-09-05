@@ -1,0 +1,823 @@
+#ifndef KVAF_BATCH_GET_DEVICE_H_
+#define KVAF_BATCH_GET_DEVICE_H_
+
+#include "kernel_operator.h"
+#if defined(__CCE_AICORE__)
+#include "simt_api/asc_simt.h"
+#endif
+#include "batch_get_abi.h"
+#include "kvaf_batch_get_device_policy.h"
+
+// Graph-safe ExecuteBatchGet data path.  The Direct-HCCP transport and WQE
+// protocol remain the verified KVAF ABI. The caller supplies a compact request
+// prefix, so WQE materialization and round-robin multi-Jetty SQ submission can
+// consume indices/offsets/output_indices directly without mask compaction.
+namespace kvaf_device {
+
+using namespace AscendC;
+
+constexpr uint32_t kEntityMagic = 0x4b564155U;  // "KVAU"
+constexpr uint32_t kEntityVersion = 1U;
+constexpr uint32_t kQueueMagic = 0x4b564151U;   // "KVAQ"
+constexpr uint32_t kReadOpcode = 0x6U;
+constexpr uint32_t kWqeBytes = 64U;
+constexpr uint32_t kWqesPerPost = 32U;
+constexpr uint32_t kWqeBankBytes = kWqesPerPost * kWqeBytes;
+constexpr uint32_t kWqeBankCount = 2U;
+constexpr uint32_t kValidationThreads = 1024U;
+constexpr uint32_t kScratchEventId = 2U;
+constexpr uint32_t kCqeProbeBytes = 32U;
+constexpr uint32_t kCqConsumerMask = 0x003fffffU;
+constexpr uint32_t kMaxCqPolls = 20000U;
+constexpr uint64_t kCacheLineBytes = 64U;
+constexpr uint32_t kLocalMemoryBytes =
+    KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES;
+
+// UB layout. WQE banks are consumed by MTE3 while the vector pipeline fills
+// the other bank. Validation scratch follows the two banks; the old compacted
+// request arrays are no longer needed.
+constexpr uint32_t kValidationFailureIdsUbOffset =
+    kWqeBankBytes * kWqeBankCount;
+constexpr uint32_t kValidationFailureIdsUbBytes =
+    kValidationThreads * sizeof(uint32_t);
+constexpr uint32_t kValidationFailureCodesUbOffset =
+    kValidationFailureIdsUbOffset + kValidationFailureIdsUbBytes;
+constexpr uint32_t kValidationFailureCodesUbBytes =
+    kValidationThreads * sizeof(uint32_t);
+
+static_assert(kValidationFailureCodesUbOffset +
+                      kValidationFailureCodesUbBytes <=
+                  kLocalMemoryBytes,
+              "BatchGet UB scratch exceeds configured local memory");
+
+enum ExecuteResult : uint64_t {
+  kSuccess = 0U,
+  kInvalidArgs = 1U,
+  kInvalidEntity = 2U,
+  kInvalidQueue = 3U,
+  kInvalidLookup = 4U,
+  kQueueFull = 5U,
+  kCqTimeout = 6U,
+  kCqError = 7U,
+  kInvalidOutput = 8U,
+  kQueuePoisoned = 9U,
+};
+
+struct PreparedPost {
+  uint64_t sq_base_address;
+  uint64_t sq_db_address;
+  uint64_t queue_state_address;
+  uint64_t current_head;
+  uint64_t next_head;
+  uint32_t sq_depth;
+  uint32_t wqe_count;
+  uint32_t event_id;
+};
+
+struct PendingPost {
+  uint64_t sq_db_address;
+  uint64_t queue_state_address;
+  uint64_t next_head;
+  uint32_t event_id;
+};
+
+__aicore__ inline void CleanCacheLines(__gm__ uint8_t *address,
+                                       uint64_t bytes) {
+  if (address == nullptr || bytes == 0U) {
+    return;
+  }
+  const uint64_t first =
+      reinterpret_cast<uint64_t>(address) & ~(kCacheLineBytes - 1U);
+  const uint64_t last =
+      (reinterpret_cast<uint64_t>(address) + bytes - 1U) &
+      ~(kCacheLineBytes - 1U);
+  GlobalTensor<uint8_t> global;
+  global.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t *>(first));
+  for (uint64_t offset = 0U; offset <= last - first;
+       offset += kCacheLineBytes) {
+    DataCacheCleanAndInvalid<uint8_t, CacheLine::SINGLE_CACHE_LINE,
+                             DcciDst::CACHELINE_OUT>(global[offset]);
+  }
+}
+
+__aicore__ inline uint32_t WqeControl(bool completion, uint32_t owner) {
+  const uint32_t place_order = completion ? 0x2U : 0x1U;
+  return (place_order << 16U) | (1U << 18U) | (1U << 20U) |
+         (static_cast<uint32_t>(completion) << 21U) | (1U << 28U) |
+         (1U << 29U) | ((owner & 1U) << 31U);
+}
+
+__aicore__ inline void WriteStatus(__gm__ KvafBatchGetCoreStatus *status,
+                                   uint64_t result, uint64_t processed,
+                                   uint64_t completed, uint64_t sq_pi,
+                                   uint64_t cq_ci, uint64_t failed_request,
+                                   uint64_t last_wqe) {
+  status->magic = KVAF_AIV_BATCH_GET_STATUS_MAGIC;
+  status->processed_request_count = processed;
+  status->result = result;
+  status->completed_batch_count = completed;
+  status->sq_producer_index = sq_pi;
+  status->cq_consumer_index = cq_ci;
+  status->failed_request_index = failed_request;
+  status->last_wqe_protocol = last_wqe;
+}
+
+__aicore__ inline void WriteProfile(
+    __gm__ KvafBatchGetCoreStatus *status, uint64_t start_cycle,
+    uint64_t setup_done_cycle, uint64_t compact_done_cycle,
+    uint64_t first_doorbell_cycle, uint64_t post_done_cycle,
+    uint64_t completion_done_cycle, uint64_t finish_cycle,
+    uint64_t active_requests, uint64_t total_posts,
+    const uint64_t *jetty_completion_wait_cycles,
+    const uint32_t *jetty_completion_polls) {
+  status->profile.magic = KVAF_AIV_BATCH_GET_PROFILE_MAGIC;
+  status->profile.kernel_start_cycle = start_cycle;
+  status->profile.setup_done_cycle = setup_done_cycle;
+  status->profile.compact_done_cycle = compact_done_cycle;
+  status->profile.first_doorbell_cycle = first_doorbell_cycle;
+  status->profile.post_done_cycle = post_done_cycle;
+  status->profile.completion_done_cycle = completion_done_cycle;
+  status->profile.kernel_finish_cycle = finish_cycle;
+  status->profile.active_requests = active_requests;
+  status->profile.total_posts = total_posts;
+#pragma unroll
+  for (uint32_t jetty = 0U;
+       jetty < KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE; ++jetty) {
+    status->profile.jetty_completion_wait_cycles[jetty] =
+        jetty_completion_wait_cycles[jetty];
+    status->profile.jetty_completion_polls[jetty] =
+        jetty_completion_polls[jetty];
+  }
+}
+
+__aicore__ inline void ConfigureUbToGmCopy() {
+  uint64_t loop_size = 1U | (1ULL << 21U);
+  set_loop_size_ubtoout(loop_size);
+  set_loop1_stride_ubtoout(0U);
+  set_loop2_stride_ubtoout(0U);
+  set_atomic_none();
+}
+
+__aicore__ inline void CopyUbToGm(__gm__ void *destination,
+                                  __ubuf__ void *source, uint64_t bytes) {
+  uint64_t config0 = 1ULL << 4U;
+  config0 |= bytes << 25U;
+  copy_ubuf_to_gm_align_v2(reinterpret_cast<__gm__ float *>(destination),
+                           reinterpret_cast<__ubuf__ float *>(source),
+                           config0, 0U);
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(1024)
+inline void ValidateBatchGetRequests(
+    __gm__ const uint64_t *address_table,
+    __gm__ const uint8_t *valid_table, __gm__ const int32_t *indices,
+    __gm__ const int32_t *offsets,
+    __gm__ const int32_t *output_indices,
+    uint32_t request_begin, uint32_t request_end, uint32_t table_capacity,
+    uint32_t output_rows, uint32_t token_bytes, uint32_t tokens_per_block,
+    uint64_t remote_base,
+    uint64_t remote_bytes, uint64_t local_bytes,
+    __ubuf__ uint32_t *failure_request_ids,
+    __ubuf__ uint32_t *failure_codes) {
+  const uint32_t thread = threadIdx.x;
+  uint32_t first_failure = UINT32_MAX;
+  uint32_t first_failure_code = static_cast<uint32_t>(kSuccess);
+
+  for (uint64_t request_value =
+           static_cast<uint64_t>(request_begin) + thread;
+       request_value < request_end;
+       request_value += kValidationThreads) {
+    const uint32_t request = static_cast<uint32_t>(request_value);
+    if (first_failure != UINT32_MAX) {
+      continue;
+    }
+
+    const int32_t table_index = indices[request];
+    const int32_t offset = offsets[request];
+    const int32_t output_row = output_indices[request];
+    if (table_index < 0 ||
+        static_cast<uint32_t>(table_index) >= table_capacity ||
+        valid_table[table_index] == 0U) {
+      first_failure = request;
+      first_failure_code = static_cast<uint32_t>(kInvalidLookup);
+      continue;
+    }
+    const uint64_t block_bytes =
+        static_cast<uint64_t>(token_bytes) * tokens_per_block;
+    if (offset < 0 ||
+        static_cast<uint64_t>(offset) > block_bytes - token_bytes) {
+      first_failure = request;
+      first_failure_code = static_cast<uint32_t>(kInvalidLookup);
+      continue;
+    }
+    if (output_row < 0 || static_cast<uint32_t>(output_row) >= output_rows ||
+        local_bytes < token_bytes ||
+        static_cast<uint64_t>(output_row) >
+            (local_bytes - token_bytes) / token_bytes) {
+      first_failure = request;
+      first_failure_code = static_cast<uint32_t>(kInvalidOutput);
+      continue;
+    }
+
+    const uint64_t table_base = address_table[table_index];
+    if (remote_bytes < block_bytes || table_base < remote_base ||
+        table_base - remote_base > remote_bytes - block_bytes) {
+      first_failure = request;
+      first_failure_code = static_cast<uint32_t>(kInvalidLookup);
+      continue;
+    }
+    const uint64_t remote_address =
+        table_base + static_cast<uint32_t>(offset);
+    if (remote_address < table_base) {
+      first_failure = request;
+      first_failure_code = static_cast<uint32_t>(kInvalidLookup);
+      continue;
+    }
+    if (remote_bytes < token_bytes || remote_address < remote_base ||
+        remote_address - remote_base > remote_bytes - token_bytes) {
+      first_failure = request;
+      first_failure_code = static_cast<uint32_t>(kInvalidLookup);
+    }
+  }
+
+  failure_request_ids[thread] = first_failure;
+  failure_codes[thread] = first_failure_code;
+}
+
+__aicore__ inline void RunBatchGetValidation(
+    __gm__ const uint64_t *address_table,
+    __gm__ const uint8_t *valid_table, __gm__ const int32_t *indices,
+    __gm__ const int32_t *offsets,
+    __gm__ const int32_t *output_indices,
+    uint32_t request_begin, uint32_t request_end, uint32_t table_capacity,
+    uint32_t output_rows, uint32_t token_bytes, uint32_t tokens_per_block,
+    uint64_t remote_base,
+    uint64_t remote_bytes, uint64_t local_bytes, uint64_t *result,
+    uint64_t *failed_request) {
+  __ubuf__ uint32_t *failure_request_ids =
+      reinterpret_cast<__ubuf__ uint32_t *>(
+          get_imm(kValidationFailureIdsUbOffset));
+  __ubuf__ uint32_t *failure_codes =
+      reinterpret_cast<__ubuf__ uint32_t *>(
+          get_imm(kValidationFailureCodesUbOffset));
+  set_flag(PIPE_S, PIPE_V, static_cast<event_t>(kScratchEventId));
+  wait_flag(PIPE_S, PIPE_V, static_cast<event_t>(kScratchEventId));
+  AscendC::Simt::VF_CALL<ValidateBatchGetRequests>(
+      AscendC::Simt::Dim3{kValidationThreads, 1U, 1U}, address_table,
+      valid_table, indices, offsets, output_indices, request_begin, request_end,
+      table_capacity, output_rows, token_bytes, tokens_per_block, remote_base,
+      remote_bytes, local_bytes, failure_request_ids, failure_codes);
+  set_flag(PIPE_V, PIPE_S, static_cast<event_t>(kScratchEventId));
+  wait_flag(PIPE_V, PIPE_S, static_cast<event_t>(kScratchEventId));
+
+  uint32_t first_failure = UINT32_MAX;
+  uint32_t first_failure_code = static_cast<uint32_t>(kSuccess);
+  for (uint32_t thread = 0U; thread < kValidationThreads; ++thread) {
+    if (failure_request_ids[thread] < first_failure) {
+      first_failure = failure_request_ids[thread];
+      first_failure_code = failure_codes[thread];
+    }
+  }
+  if (first_failure != UINT32_MAX) {
+    *result = first_failure_code;
+    *failed_request = first_failure;
+  }
+}
+
+__simt_vf__ __aicore__ LAUNCH_BOUND(32)
+inline void FillBatchGetReadWqes(
+    __gm__ const int32_t *indices,
+    __gm__ const int32_t *output_indices,
+    __gm__ const int32_t *offsets,
+    __gm__ const uint64_t *address_table, uint32_t request_begin,
+    uint32_t request_offset,
+    uint32_t token_bytes, uint64_t output_base, uint64_t current_head,
+    uint32_t wqe_count, uint32_t completion_on_last_wqe,
+    uint32_t ub_base_offset, uint32_t sq_depth,
+    uint32_t tp_id, uint32_t remote_token_id,
+    uint32_t remote_token_value, uint32_t local_token_id,
+    uint64_t remote_eid_low, uint64_t remote_eid_high) {
+  const uint32_t slot = threadIdx.x;
+  if (slot >= wqe_count) {
+    return;
+  }
+
+  const uint32_t request = request_begin + request_offset + slot;
+  const uint32_t table_index = static_cast<uint32_t>(indices[request]);
+  const uint32_t output_row =
+      static_cast<uint32_t>(output_indices[request]);
+  const uint64_t remote_address =
+      address_table[table_index] + static_cast<uint32_t>(offsets[request]);
+  const uint64_t local_address =
+      output_base + static_cast<uint64_t>(output_row) * token_bytes;
+  const uint64_t wqe_pi = current_head + slot;
+  const uint32_t owner =
+      1U - static_cast<uint32_t>((wqe_pi / sq_depth) & 1U);
+  const bool completion =
+      completion_on_last_wqe != 0U && slot + 1U == wqe_count;
+  const uint32_t place_order = completion ? 0x2U : 0x1U;
+
+  uint32_t words[16];
+  words[0] = (place_order << 16U) | (1U << 18U) | (1U << 20U) |
+             (static_cast<uint32_t>(completion) << 21U) | (1U << 28U) |
+             (1U << 29U) | ((owner & 1U) << 31U);
+  words[1] = kReadOpcode << 8U;
+  words[2] = (tp_id & 0x00ffffffU) | 0x01000000U;
+  words[3] = remote_token_id & 0x000fffffU;
+  words[4] = static_cast<uint32_t>(remote_eid_low);
+  words[5] = static_cast<uint32_t>(remote_eid_low >> 32U);
+  words[6] = static_cast<uint32_t>(remote_eid_high);
+  words[7] = static_cast<uint32_t>(remote_eid_high >> 32U);
+  words[8] = remote_token_value;
+  words[9] = 0U;
+  words[10] = static_cast<uint32_t>(remote_address);
+  words[11] = static_cast<uint32_t>(remote_address >> 32U);
+  words[12] = token_bytes;
+  words[13] = local_token_id;
+  words[14] = static_cast<uint32_t>(local_address);
+  words[15] = static_cast<uint32_t>(local_address >> 32U);
+
+  __ubuf__ uint32_t *wqe_words =
+      reinterpret_cast<__ubuf__ uint32_t *>(
+          get_imm(ub_base_offset + slot * kWqeBytes));
+#pragma unroll
+  for (uint32_t word = 0U; word < 16U; ++word) {
+    wqe_words[word] = words[word];
+  }
+}
+
+__aicore__ inline void PreparePostVectorStage(
+    __gm__ const int32_t *indices,
+    __gm__ const int32_t *output_indices,
+    __gm__ const int32_t *offsets,
+    __gm__ const uint64_t *address_table, uint32_t request_begin,
+    uint32_t request_offset,
+    uint32_t token_bytes, uint64_t output_base, uint64_t current_head,
+    uint32_t wqe_count, uint32_t completion_on_last_wqe,
+    uint32_t bank_id, uint32_t wait_for_bank_reuse,
+    __gm__ const KvafBatchGetDirectUrmaEntity *entity,
+    __gm__ KvafBatchGetQueueState *queue,
+    PreparedPost *prepared) {
+  if (wait_for_bank_reuse != 0U) {
+    wait_flag(PIPE_MTE3, PIPE_V, static_cast<event_t>(bank_id));
+  }
+
+  const uint64_t remote_eid_low =
+      *reinterpret_cast<__gm__ const uint64_t *>(entity->remote_eid);
+  const uint64_t remote_eid_high =
+      *reinterpret_cast<__gm__ const uint64_t *>(&(entity->remote_eid[8]));
+  const uint32_t ub_base_offset = bank_id * kWqeBankBytes;
+  AscendC::Simt::VF_CALL<FillBatchGetReadWqes>(
+      AscendC::Simt::Dim3{kWqesPerPost, 1U, 1U}, indices, output_indices,
+      offsets, address_table, request_begin, request_offset, token_bytes,
+      output_base, current_head, wqe_count,
+      completion_on_last_wqe, ub_base_offset,
+      entity->sq_depth, entity->tp_id, entity->remote_token_id,
+      entity->remote_token_value, entity->local_token_id, remote_eid_low,
+      remote_eid_high);
+  set_flag(PIPE_V, PIPE_MTE3, static_cast<event_t>(bank_id));
+
+  prepared->sq_base_address = entity->sq_va;
+  prepared->sq_db_address = entity->sq_db_va;
+  prepared->queue_state_address = reinterpret_cast<uint64_t>(queue);
+  prepared->current_head = current_head;
+  prepared->next_head = current_head + wqe_count;
+  prepared->sq_depth = entity->sq_depth;
+  prepared->wqe_count = wqe_count;
+  prepared->event_id = bank_id;
+}
+
+__aicore__ inline void CopyPreparedPostToSq(const PreparedPost *prepared) {
+  const uint32_t ring_head =
+      static_cast<uint32_t>(prepared->current_head % prepared->sq_depth);
+  const uint32_t ub_base_offset = prepared->event_id * kWqeBankBytes;
+  if (ring_head + prepared->wqe_count <= prepared->sq_depth) {
+    CopyUbToGm(
+        reinterpret_cast<__gm__ void *>(
+            prepared->sq_base_address +
+            static_cast<uint64_t>(ring_head) * kWqeBytes),
+        reinterpret_cast<__ubuf__ void *>(get_imm(ub_base_offset)),
+        static_cast<uint64_t>(prepared->wqe_count) * kWqeBytes);
+    return;
+  }
+
+  const uint32_t first_count = prepared->sq_depth - ring_head;
+  CopyUbToGm(
+      reinterpret_cast<__gm__ void *>(
+          prepared->sq_base_address +
+          static_cast<uint64_t>(ring_head) * kWqeBytes),
+      reinterpret_cast<__ubuf__ void *>(get_imm(ub_base_offset)),
+      static_cast<uint64_t>(first_count) * kWqeBytes);
+  CopyUbToGm(
+      reinterpret_cast<__gm__ void *>(prepared->sq_base_address),
+      reinterpret_cast<__ubuf__ void *>(
+          get_imm(ub_base_offset + first_count * kWqeBytes)),
+      static_cast<uint64_t>(prepared->wqe_count - first_count) *
+          kWqeBytes);
+}
+
+__aicore__ inline void PreparePostMte3Stage(const PreparedPost *prepared,
+                                            uint32_t release_bank_to_vector,
+                                            PendingPost *pending) {
+  wait_flag(PIPE_V, PIPE_MTE3,
+            static_cast<event_t>(prepared->event_id));
+  CopyPreparedPostToSq(prepared);
+  set_flag(PIPE_MTE3, PIPE_S,
+           static_cast<event_t>(prepared->event_id));
+  if (release_bank_to_vector != 0U) {
+    set_flag(PIPE_MTE3, PIPE_V,
+             static_cast<event_t>(prepared->event_id));
+  }
+  pending->next_head = prepared->next_head;
+  pending->sq_db_address = prepared->sq_db_address;
+  pending->queue_state_address = prepared->queue_state_address;
+  pending->event_id = prepared->event_id;
+}
+
+__aicore__ inline void CommitPostScalarStage(const PendingPost *pending) {
+  wait_flag(PIPE_MTE3, PIPE_S,
+            static_cast<event_t>(pending->event_id));
+  __gm__ KvafBatchGetQueueState *const queue =
+      reinterpret_cast<__gm__ KvafBatchGetQueueState *>(
+          pending->queue_state_address);
+  queue->sq_producer_index = pending->next_head;
+  st_dev(static_cast<uint32_t>(pending->next_head),
+         reinterpret_cast<__gm__ uint32_t *>(pending->sq_db_address), 0);
+}
+
+__aicore__ inline void PostDirectRequests(
+    __gm__ const int32_t *indices,
+    __gm__ const int32_t *output_indices,
+    __gm__ const int32_t *offsets,
+    __gm__ const uint64_t *address_table, uint32_t request_begin,
+    uint32_t request_count,
+    uint32_t token_bytes, uint32_t jettys_per_core,
+    __gm__ const KvafBatchGetDirectUrmaEntity *entities,
+    __gm__ KvafBatchGetQueueState *queues, uint32_t profile_enabled,
+    uint64_t *first_doorbell_cycle, uint64_t *last_wqe) {
+  PreparedPost prepared_posts[kWqeBankCount];
+  PendingPost pending_posts[kWqeBankCount];
+  uint64_t current_heads[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE];
+  for (uint32_t jetty = 0U; jetty < jettys_per_core; ++jetty) {
+    current_heads[jetty] = queues[jetty].sq_producer_index;
+  }
+  const uint32_t total_posts =
+      (static_cast<uint64_t>(request_count) + kWqesPerPost - 1U) / kWqesPerPost;
+
+  for (uint32_t post_index = 0U; post_index < total_posts; ++post_index) {
+    if (post_index != 0U) {
+      const uint32_t previous_post = post_index - 1U;
+      const uint32_t previous_bank = previous_post % kWqeBankCount;
+      const uint32_t release_bank_to_vector =
+          previous_post + kWqeBankCount < total_posts;
+      PreparePostMte3Stage(&prepared_posts[previous_bank],
+                           release_bank_to_vector,
+                           &pending_posts[previous_bank]);
+    }
+
+    const uint32_t bank_id = post_index % kWqeBankCount;
+    const uint32_t jetty = post_index % jettys_per_core;
+    const uint32_t request_offset = post_index * kWqesPerPost;
+    uint32_t wqe_count = request_count - request_offset;
+    if (wqe_count > kWqesPerPost) {
+      wqe_count = kWqesPerPost;
+    }
+    const uint32_t completion_on_last_wqe =
+        post_index + jettys_per_core >= total_posts;
+    __gm__ const KvafBatchGetDirectUrmaEntity *const entity =
+        entities + jetty;
+    __gm__ KvafBatchGetQueueState *const queue = queues + jetty;
+    PreparePostVectorStage(
+        indices, output_indices, offsets, address_table, request_begin,
+        request_offset, token_bytes,
+        entity->local_hbm_address,
+        current_heads[jetty], wqe_count, completion_on_last_wqe, bank_id,
+        post_index >= kWqeBankCount, entity, queue,
+        &prepared_posts[bank_id]);
+    current_heads[jetty] += wqe_count;
+
+    if (post_index + 1U == total_posts) {
+      const uint64_t last_pi = current_heads[jetty] - 1U;
+      const uint32_t last_owner =
+          1U - static_cast<uint32_t>((last_pi / entity->sq_depth) & 1U);
+      *last_wqe = WqeControl(true, last_owner);
+    }
+
+    if (post_index >= kWqeBankCount) {
+      const uint32_t commit_bank =
+          (post_index - kWqeBankCount) % kWqeBankCount;
+      CommitPostScalarStage(&pending_posts[commit_bank]);
+      if (profile_enabled != 0U && *first_doorbell_cycle == 0U) {
+        *first_doorbell_cycle =
+            static_cast<uint64_t>(AscendC::GetSystemCycle());
+      }
+    }
+  }
+
+  if (total_posts != 0U) {
+    const uint32_t final_post = total_posts - 1U;
+    const uint32_t final_bank = final_post % kWqeBankCount;
+    PreparePostMte3Stage(&prepared_posts[final_bank], 0U,
+                         &pending_posts[final_bank]);
+    if (total_posts > 1U) {
+      const uint32_t penultimate_bank =
+          (total_posts - 2U) % kWqeBankCount;
+      CommitPostScalarStage(&pending_posts[penultimate_bank]);
+      if (profile_enabled != 0U && *first_doorbell_cycle == 0U) {
+        *first_doorbell_cycle =
+            static_cast<uint64_t>(AscendC::GetSystemCycle());
+      }
+    }
+    CommitPostScalarStage(&pending_posts[final_bank]);
+    if (profile_enabled != 0U && *first_doorbell_cycle == 0U) {
+      *first_doorbell_cycle =
+          static_cast<uint64_t>(AscendC::GetSystemCycle());
+    }
+  }
+}
+
+__aicore__ inline uint32_t ActiveRequestsForJetty(
+    uint32_t active_request_count, uint32_t jetty,
+    uint32_t jettys_per_core) {
+  const uint32_t total_posts =
+      (static_cast<uint64_t>(active_request_count) + kWqesPerPost - 1U) / kWqesPerPost;
+  uint32_t assigned = 0U;
+  for (uint32_t post = jetty; post < total_posts;
+       post += jettys_per_core) {
+    const uint32_t active_offset = post * kWqesPerPost;
+    uint32_t wqe_count = active_request_count - active_offset;
+    if (wqe_count > kWqesPerPost) {
+      wqe_count = kWqesPerPost;
+    }
+    assigned += wqe_count;
+  }
+  return assigned;
+}
+
+__aicore__ inline uint64_t WaitForCompletion(
+    __gm__ const KvafBatchGetDirectUrmaEntity *entity,
+    __gm__ KvafBatchGetQueueState *queue, uint32_t *poll_count) {
+  const uint32_t slot =
+      static_cast<uint32_t>(queue->cq_consumer_index % entity->cq_depth);
+  __gm__ uint8_t *const cqe_address =
+      reinterpret_cast<__gm__ uint8_t *>(entity->cq_va) +
+      static_cast<uint64_t>(slot) * entity->cqe_size;
+  for (uint32_t poll = 0U; poll < kMaxCqPolls; ++poll) {
+    CleanCacheLines(cqe_address, kCqeProbeBytes);
+    __asm__ __volatile__("");
+    const uint32_t cqe_word =
+        *reinterpret_cast<__gm__ uint32_t *>(cqe_address);
+    __asm__ __volatile__("");
+    const uint8_t owner = static_cast<uint8_t>((cqe_word >> 2U) & 1U);
+    const uint8_t expected = static_cast<uint8_t>(
+        (queue->cq_consumer_index / entity->cq_depth) & 1U);
+    if ((owner ^ expected) == 0U) {
+      continue;
+    }
+    const uint8_t sub_status =
+        static_cast<uint8_t>((cqe_word >> 16U) & 0xffU);
+    const uint8_t status =
+        static_cast<uint8_t>((cqe_word >> 24U) & 0xffU);
+    ++queue->cq_consumer_index;
+    st_dev(static_cast<uint32_t>(queue->cq_consumer_index) &
+               kCqConsumerMask,
+           reinterpret_cast<__gm__ uint32_t *>(entity->cq_db_va), 0);
+    *poll_count = poll + 1U;
+    return status == 0U && sub_status == 0U ? kSuccess : kCqError;
+  }
+  *poll_count = kMaxCqPolls;
+  return kCqTimeout;
+}
+
+// One ordinary device call on an exclusively owned queue group. Call only after
+// draining prior local pipes and releasing overlapping UB and hard events:
+// this engine owns raw UB from byte zero and local events 0, 1, 2. A poisoned
+// queue requires transport recovery; clearing last_error while READs might
+// still be in flight is unsafe. args.miss_count is not consumed here.
+__aicore__ inline uint64_t KvafBatchGetDevice(
+    const KvafExecuteBatchGetKernelArgs &args, uint32_t logical_owner,
+    uint32_t request_begin, uint32_t request_count) {
+  const uint32_t core = logical_owner;
+  const uint32_t jettys_per_core =
+      args.jettys_per_core == 0U ? 1U : args.jettys_per_core;
+  if (args.block_count == 0U || core >= args.block_count ||
+      args.block_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
+      jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
+      args.address_table == 0U || args.valid_table == 0U ||
+      args.indices == 0U || args.offsets == 0U ||
+      args.output_indices == 0U || args.output == 0U ||
+      args.core_status == 0U || args.channel_entity == 0U ||
+      args.queue_state == 0U || args.table_capacity == 0U ||
+      args.request_capacity == 0U || args.output_rows == 0U ||
+      args.token_bytes == 0U || args.tokens_per_block == 0U) {
+    if (args.core_status != 0U && core < args.block_count &&
+        args.block_count <= KVAF_AIV_BATCH_GET_MAX_AIV_CORES) {
+      __gm__ KvafBatchGetCoreStatus *const invalid_status =
+          reinterpret_cast<__gm__ KvafBatchGetCoreStatus *>(args.core_status) + core;
+      WriteStatus(invalid_status, kInvalidArgs, 0U, 0U, 0U, 0U, UINT64_MAX, 0U);
+      CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(invalid_status),
+                      sizeof(KvafBatchGetCoreStatus));
+    }
+    return kInvalidArgs;
+  }
+
+  const bool miss_count_valid =
+      BatchGetRequestRangeValid(args.request_capacity, request_begin,
+                                request_count);
+
+  __gm__ KvafBatchGetCoreStatus *const status =
+      reinterpret_cast<__gm__ KvafBatchGetCoreStatus *>(args.core_status) +
+      core;
+  const bool profile_enabled =
+      status->profile.magic == KVAF_AIV_BATCH_GET_PROFILE_MAGIC;
+  const uint64_t profile_start_cycle =
+      profile_enabled ? static_cast<uint64_t>(AscendC::GetSystemCycle()) : 0U;
+  __gm__ KvafBatchGetQueueState *const queues =
+      reinterpret_cast<__gm__ KvafBatchGetQueueState *>(args.queue_state) +
+      static_cast<uint64_t>(core) * jettys_per_core;
+  __gm__ const KvafBatchGetDirectUrmaEntity *const entities =
+      reinterpret_cast<__gm__ const KvafBatchGetDirectUrmaEntity *>(
+          args.channel_entity) +
+      static_cast<uint64_t>(core) * jettys_per_core;
+
+  uint64_t result = miss_count_valid ? kSuccess : kInvalidArgs;
+  uint64_t failed_request = UINT64_MAX;
+  uint64_t active_count = 0U;
+  uint64_t last_wqe = 0U;
+  uint64_t first_doorbell_cycle = 0U;
+  uint64_t total_posts = 0U;
+  uint32_t completion_polls[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE] = {
+      0U, 0U};
+  uint64_t completion_wait_cycles[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE] = {
+      0U, 0U};
+  const uint32_t begin = request_begin;
+  const uint32_t end = miss_count_valid ? request_begin + request_count : begin;
+  uint32_t minimum_sq_depth = UINT32_MAX;
+
+  for (uint32_t jetty = 0U; jetty < jettys_per_core; ++jetty) {
+    __gm__ const KvafBatchGetDirectUrmaEntity *const entity =
+        entities + jetty;
+    if (entity->magic != kEntityMagic ||
+        entity->version != kEntityVersion ||
+        entity->local_hbm_address == 0U ||
+        entity->local_hbm_address != args.output ||
+        entity->local_hbm_size < args.token_bytes ||
+        entity->local_token_id == 0U ||
+        entity->remote_host_ddr_address == 0U ||
+        entity->remote_host_ddr_size < args.token_bytes ||
+        entity->sq_va == 0U || entity->sq_db_va == 0U ||
+        entity->sq_depth < 2U || entity->wqe_size != kWqeBytes ||
+        entity->cq_va == 0U || entity->cq_db_va == 0U ||
+        entity->cq_depth == 0U || entity->cqe_size < kCqeProbeBytes ||
+        (jetty != 0U &&
+         (entity->remote_host_ddr_address !=
+              entities[0].remote_host_ddr_address ||
+          entity->remote_host_ddr_size !=
+              entities[0].remote_host_ddr_size ||
+          entity->remote_token_id != entities[0].remote_token_id ||
+          entity->remote_token_value != entities[0].remote_token_value ||
+          entity->local_hbm_address != entities[0].local_hbm_address ||
+          entity->local_hbm_size != entities[0].local_hbm_size ||
+          entity->local_token_id != entities[0].local_token_id ||
+          entity->local_token_value != entities[0].local_token_value))) {
+      result = kInvalidEntity;
+    }
+    if (entity->sq_depth < minimum_sq_depth) {
+      minimum_sq_depth = entity->sq_depth;
+    }
+  }
+  for (uint32_t jetty = 0U;
+       result == kSuccess && jetty < jettys_per_core; ++jetty) {
+    __gm__ KvafBatchGetQueueState *const queue = queues + jetty;
+    // A previous timed-out READ can still write HBM. Never reset it on a
+    // later row, launch or graph replay.
+    if (queue->last_error != 0U) {
+      result = kQueuePoisoned;
+    } else if (queue->initialized != 0U && queue->magic != kQueueMagic) {
+      result = kInvalidQueue;
+    }
+    if (result == kSuccess && queue->initialized == 0U) {
+      queue->magic = kQueueMagic;
+      queue->initialized = 1U;
+      queue->sq_producer_index = 0U;
+      queue->cq_consumer_index = 0U;
+      queue->completed_batch_count = 0U;
+      queue->last_error = 0U;
+    }
+  }
+
+  __gm__ const uint64_t *const address_table =
+      reinterpret_cast<__gm__ const uint64_t *>(args.address_table);
+  __gm__ const uint8_t *const valid_table =
+      reinterpret_cast<__gm__ const uint8_t *>(args.valid_table);
+  __gm__ const int32_t *const indices =
+      reinterpret_cast<__gm__ const int32_t *>(args.indices);
+  __gm__ const int32_t *const offsets =
+      reinterpret_cast<__gm__ const int32_t *>(args.offsets);
+  __gm__ const int32_t *const output_indices =
+      reinterpret_cast<__gm__ const int32_t *>(args.output_indices);
+  const uint64_t profile_setup_done_cycle =
+      profile_enabled ? static_cast<uint64_t>(AscendC::GetSystemCycle()) : 0U;
+  const uint64_t profile_compact_done_cycle = profile_setup_done_cycle;
+
+  // Validate every active descriptor before materializing WQEs. Invalid
+  // caller metadata must fail closed: do not read outside either address
+  // table and never issue a Direct-HCCP doorbell with an unchecked address.
+  if (result == kSuccess) {
+    RunBatchGetValidation(
+        address_table, valid_table, indices, offsets, output_indices,
+        begin, end, args.table_capacity, args.output_rows, args.token_bytes,
+        args.tokens_per_block,
+        entities[0].remote_host_ddr_address,
+        entities[0].remote_host_ddr_size, entities[0].local_hbm_size,
+        &result, &failed_request);
+  }
+
+  uint64_t profile_post_done_cycle = profile_compact_done_cycle;
+  if (result == kSuccess && request_count != 0U) {
+    ConfigureUbToGmCopy();
+  }
+
+  // Validate the complete prefix above before the first post. Submit bounded
+  // windows and wait for all used Jetty fences before recycling SQ entries.
+  // The shallowest SQ gives a conservative limit for round-robin posting.
+  while (result == kSuccess && active_count < request_count) {
+    const uint32_t remaining = request_count - static_cast<uint32_t>(active_count);
+    const uint32_t window_count =
+        BatchGetWindowRequestCount(remaining, minimum_sq_depth);
+    if (window_count == 0U) {
+      result = kQueueFull;
+      break;
+    }
+    const uint32_t window_posts =
+        (static_cast<uint64_t>(window_count) + kWqesPerPost - 1U) / kWqesPerPost;
+    PostDirectRequests(indices, output_indices, offsets, address_table,
+                       begin + static_cast<uint32_t>(active_count), window_count,
+                       args.token_bytes, jettys_per_core, entities, queues,
+                       static_cast<uint32_t>(profile_enabled),
+                       &first_doorbell_cycle, &last_wqe);
+    active_count += window_count;
+    total_posts += window_posts;
+    if (profile_enabled) {
+      profile_post_done_cycle =
+          static_cast<uint64_t>(AscendC::GetSystemCycle());
+    }
+
+    const uint32_t used_jettys =
+        window_posts < jettys_per_core ? window_posts : jettys_per_core;
+    // An earlier Jetty error stops future windows but does not skip a fence
+    // already submitted on another Jetty in this window.
+    for (uint32_t jetty = 0U; jetty < used_jettys; ++jetty) {
+      const uint64_t wait_start_cycle =
+          profile_enabled
+              ? static_cast<uint64_t>(AscendC::GetSystemCycle()) : 0U;
+      uint32_t polls = 0U;
+      const uint64_t completion_result =
+          WaitForCompletion(entities + jetty, queues + jetty, &polls);
+      completion_polls[jetty] += polls;
+      if (profile_enabled) {
+        completion_wait_cycles[jetty] +=
+            static_cast<uint64_t>(AscendC::GetSystemCycle()) - wait_start_cycle;
+      }
+      if (completion_result == kSuccess) {
+        ++queues[jetty].completed_batch_count;
+      } else if (result == kSuccess) {
+        result = completion_result;
+      }
+    }
+  }
+  const uint64_t profile_completion_done_cycle =
+      profile_enabled ? static_cast<uint64_t>(AscendC::GetSystemCycle()) : 0U;
+  // A descriptor failure before posting leaves transport healthy. A failure
+  // after posting poisons the owner group until the host retires/recreates it.
+  // Preserve the original error when rejecting an already poisoned queue.
+  if (result != kSuccess && active_count != 0U) {
+    for (uint32_t jetty = 0U; jetty < jettys_per_core; ++jetty) {
+      if (queues[jetty].last_error == 0U) {
+        queues[jetty].last_error = result;
+      }
+    }
+  }
+  WriteStatus(status, result, active_count, queues[0].completed_batch_count,
+              queues[0].sq_producer_index, queues[0].cq_consumer_index,
+              failed_request, last_wqe);
+  if (profile_enabled) {
+    const uint64_t profile_finish_cycle =
+        static_cast<uint64_t>(AscendC::GetSystemCycle());
+    WriteProfile(status, profile_start_cycle, profile_setup_done_cycle,
+                 profile_compact_done_cycle, first_doorbell_cycle,
+                 profile_post_done_cycle, profile_completion_done_cycle,
+                 profile_finish_cycle, active_count, total_posts,
+                 completion_wait_cycles, completion_polls);
+  }
+  CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(queues),
+                  static_cast<uint64_t>(jettys_per_core) *
+                      sizeof(KvafBatchGetQueueState));
+  CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(status),
+                  sizeof(KvafBatchGetCoreStatus));
+  return result;
+}
+
+}  // namespace kvaf_device
+
+#endif  // KVAF_BATCH_GET_DEVICE_H_

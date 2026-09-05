@@ -6,6 +6,7 @@
 #include <utility>
 #include <vector>
 
+#include "access_operator.h"
 #include "runtime.h"
 
 namespace kvaf {
@@ -52,6 +53,15 @@ class NpuRuntime final : public Runtime {
   Status SetBatchGetKernelProfiling(bool enabled);
   Status CopyBatchGetKernelProfiles(
       std::vector<BatchGetKernelProfile>* profiles) const;
+
+  // Acquire once before fused launches. KVAF registers this caller-owned HBM
+  // output and exclusively leases its BatchGet queues; ordinary BatchGet and
+  // another acquisition are rejected until release. All uses of the returned
+  // context must run sequentially on one caller stream.
+  Status AcquireFusedBatchGetContext(void* output, std::uint64_t output_bytes,
+                                    FusedBatchGetContext* context);
+  Status ReleaseFusedBatchGetContext(const FusedBatchGetContext& context,
+                                    void* stream);
 
   Status LinkTo(const LinkTarget& target) override;
   Status AcceptLink(const LinkTarget& peer) override;
