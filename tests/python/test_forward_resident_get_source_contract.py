@@ -77,6 +77,38 @@ def main() -> None:
     assert "ReadGmByPassDCache<int32_t>" in validation
     assert "output_indices + earlier" in validation
 
+    # Queue acquire/release runs in SIMT while descriptor preparation and
+    # PostOnly run in AICore.  Those AICore checks must not use an ordinary GM
+    # load of a lease word that a preceding SIMT CAS has just changed: cached
+    # zero would incorrectly reject a valid queue before descriptor publish.
+    owner_load = _between(
+        device,
+        "__aicore__ inline int32_t ReadKvafForwardResidentQueueOwner(",
+        "__aicore__ inline __gm__ KvafForwardResidentBatchGetDescriptorScratch*",
+    )
+    assert "ReadGmByPassDCache<int32_t>(owners + queue_id)" in owner_load
+    for function_start, function_end in (
+        (
+            "__aicore__ inline bool LoadKvafForwardResidentQueueTemplate(",
+            "// CandidateCompact owns cross-wave unique-slot admission.",
+        ),
+        (
+            "__aicore__ inline bool PublishKvafForwardResidentDescriptor(",
+            "__aicore__ inline bool BuildKvafForwardResidentQueueArgsFromDescriptor(",
+        ),
+        (
+            "__aicore__ inline uint32_t BeginKvafForwardResidentBatchGetPostOnly(",
+            "__aicore__ inline bool InitializeKvafForwardResidentPostedWaveForDrain(",
+        ),
+        (
+            "__aicore__ inline bool InitializeKvafForwardResidentPostedWaveForDrain(",
+            "__aicore__ inline void TryRetireKvafForwardResidentBatchGet(",
+        ),
+    ):
+        queue_owner_check = _between(device, function_start, function_end)
+        assert "ReadKvafForwardResidentQueueOwner(control, lease.queue_id)" in queue_owner_check
+        assert "owners[lease.queue_id]" not in queue_owner_check
+
     queue_args = _between(
         device,
         "__aicore__ inline bool BuildKvafForwardResidentQueueArgsFromDescriptor(",

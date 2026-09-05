@@ -282,6 +282,24 @@ __simt_callee__ inline bool IsKvafForwardResidentBatchGetControlValidForLease(
          control.block_bytes == KVAF_AIV_BATCH_GET_WQE_DATA_BYTES;
 }
 
+// Queue ownership is acquired and released by SIMT atomics, then inspected by
+// the AICore-side descriptor/PostOnly path.  A normal AICore GM load is not a
+// valid observation of that cross-domain hand-off: it may retain the old
+// `0` lease word in DCache after SIMT has successfully installed owner_tag.
+// Keep every AICore ownership validation on the bypass path, just as the
+// Direct-HCCP SQ/CQ progress fields are read below.  This is an ordering/read
+// fix only; it does not change queue ownership or the forward-resident ABI.
+__aicore__ inline int32_t ReadKvafForwardResidentQueueOwner(
+    const KvafForwardResidentBatchGetControl& control, uint32_t queue_id) {
+  if (!IsKvafForwardResidentBatchGetControlValidForAicore(control) ||
+      queue_id >= control.queue_count) {
+    return 0;
+  }
+  __gm__ int32_t* const owners =
+      reinterpret_cast<__gm__ int32_t*>(control.queue_leases);
+  return ReadGmByPassDCache<int32_t>(owners + queue_id);
+}
+
 __aicore__ inline __gm__ KvafForwardResidentBatchGetDescriptorScratch*
 GetKvafForwardResidentDescriptorScratch(
     const KvafForwardResidentBatchGetControl& control, uint32_t queue_id) {
@@ -398,9 +416,8 @@ __aicore__ inline bool LoadKvafForwardResidentQueueTemplate(
       !IsKvafForwardResidentBatchGetControlValidForAicore(control)) {
     return false;
   }
-  __gm__ const int32_t* const owners =
-      reinterpret_cast<__gm__ const int32_t*>(control.queue_leases);
-  if (owners[lease.queue_id] != lease.owner_tag) {
+  if (ReadKvafForwardResidentQueueOwner(control, lease.queue_id) !=
+      lease.owner_tag) {
     return false;
   }
   __gm__ const KvafForwardResidentBatchGetDescriptorScratch* const source =
@@ -564,9 +581,8 @@ __aicore__ inline bool PublishKvafForwardResidentDescriptor(
       !ValidateKvafForwardResidentOutputIndices(control, descriptor)) {
     return false;
   }
-  __gm__ const int32_t* const owners =
-      reinterpret_cast<__gm__ const int32_t*>(control.queue_leases);
-  if (owners[lease.queue_id] != lease.owner_tag) {
+  if (ReadKvafForwardResidentQueueOwner(control, lease.queue_id) !=
+      lease.owner_tag) {
     return false;
   }
   __gm__ const KvafForwardResidentBatchGetDescriptorScratch* const template_record =
@@ -728,12 +744,11 @@ __aicore__ inline uint32_t BeginKvafForwardResidentBatchGetPostOnly(
     const KvafForwardResidentQueueLease& lease,
     const KvafForwardResidentBatchGetDescriptorScratch& descriptor) {
   uint32_t active_request_count = 0U;
-  __gm__ const int32_t* const owners =
-      reinterpret_cast<__gm__ const int32_t*>(control.queue_leases);
   if (!IsKvafForwardResidentBatchGetControlValidForAicore(control) ||
       lease.state != kForwardResidentQueueHeld || lease.owner_tag <= 0 ||
       lease.queue_id >= control.queue_count ||
-      owners[lease.queue_id] != lease.owner_tag ||
+      ReadKvafForwardResidentQueueOwner(control, lease.queue_id) !=
+          lease.owner_tag ||
       // Publish is deliberately inside Begin.  It stores this wave's exact
       // descriptor, executes the GM/DDR visibility barrier, and only then
       // lets the unchanged dense primitive materialize WQEs/doorbell.  A
@@ -803,9 +818,8 @@ __aicore__ inline bool InitializeKvafForwardResidentPostedWaveForDrain(
       lease.queue_id >= control.queue_count) {
     return false;
   }
-  __gm__ const int32_t* const owners =
-      reinterpret_cast<__gm__ const int32_t*>(control.queue_leases);
-  if (owners[lease.queue_id] != lease.owner_tag) {
+  if (ReadKvafForwardResidentQueueOwner(control, lease.queue_id) !=
+      lease.owner_tag) {
     return false;
   }
   KvafExecuteBatchGetKernelArgs args{};
