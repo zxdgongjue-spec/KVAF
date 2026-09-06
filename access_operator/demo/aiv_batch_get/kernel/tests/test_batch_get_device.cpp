@@ -76,12 +76,42 @@ void TestSmallQueue() {
 }
 }  // namespace
 
+void TestAsyncFinalWindow() {
+  Fixture fixture;
+  kvaf_device::AsyncBatchGet pending;
+  assert(kvaf_device::KvafBatchGetDevice(fixture.args, 1U, 7U, 2048U, &pending) == 0U);
+  assert(pending.used_jettys != 0U);
+  const uint32_t doorbells = fixture.Doorbells();
+  assert(kvaf_device::KvafBatchGetDevice(fixture.args, 1U, 7U, 1U, &pending) ==
+         kvaf_device::kInvalidQueue);
+  assert(fixture.Doorbells() == doorbells);
+  assert(kvaf_device::KvafBatchGetWait(pending) == 0U);
+  assert(pending.used_jettys == 0U);
+  fixture.VerifyPayload(7U, 2048U);
+  assert(kvaf_device::KvafBatchGetWait(pending) == 0U);
+}
+
+void TestAsyncTimeoutPoisonsOwner() {
+  Fixture fixture(4096U);
+  fixture.transport[2]->timeout = true;
+  kvaf_device::AsyncBatchGet pending;
+  assert(kvaf_device::KvafBatchGetDevice(fixture.args, 1U, 7U, 64U, &pending) == 0U);
+  assert(kvaf_device::KvafBatchGetWait(pending) == kvaf_device::kCqTimeout);
+  assert(pending.used_jettys == 2U);
+  assert(fixture.queues[3].completed_batch_count == 1U);
+  assert(fixture.queues[2].last_error != 0U && fixture.queues[3].last_error != 0U);
+  assert(kvaf_device::KvafBatchGetDevice(fixture.args, 1U, 7U, 1U, &pending) ==
+         kvaf_device::kCqTimeout);
+}
+
 int main() {
+  TestAsyncFinalWindow();
+  TestAsyncTimeoutPoisonsOwner();
   TestWindowedPrefixAndPersistentQueues();
   TestFullPrefixValidationBeforeFirstPost();
   TestTimeoutOrErrorDrainsPeerAndPoisonsQueue(true);
   TestTimeoutOrErrorDrainsPeerAndPoisonsQueue(false);
   TestEmptyAndInvalidRanges();
   TestSmallQueue();
-  std::puts("PASS: shared BatchGet CPU control-flow model (6 scenarios; no NPU/transport execution)");
+  std::puts("PASS: shared BatchGet CPU control-flow model (8 scenarios; no NPU/transport execution)");
 }

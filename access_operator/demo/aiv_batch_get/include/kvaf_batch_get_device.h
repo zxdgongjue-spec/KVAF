@@ -12,7 +12,13 @@
 // protocol remain the verified KVAF ABI. The caller supplies a compact request
 // prefix, so WQE materialization and round-robin multi-Jetty SQ submission can
 // consume indices/offsets/output_indices directly without mask compaction.
+#ifndef KVAF_BATCH_GET_SCRATCH_BASE
+#define KVAF_BATCH_GET_SCRATCH_BASE 0U
+#endif
+
 namespace kvaf_device {
+constexpr uint32_t kScratchBase = KVAF_BATCH_GET_SCRATCH_BASE;
+
 
 using namespace AscendC;
 
@@ -37,7 +43,7 @@ constexpr uint32_t kLocalMemoryBytes =
 // the other bank. Validation scratch follows the two banks; the old compacted
 // request arrays are no longer needed.
 constexpr uint32_t kValidationFailureIdsUbOffset =
-    kWqeBankBytes * kWqeBankCount;
+    kScratchBase + kWqeBankBytes * kWqeBankCount;
 constexpr uint32_t kValidationFailureIdsUbBytes =
     kValidationThreads * sizeof(uint32_t);
 constexpr uint32_t kValidationFailureCodesUbOffset =
@@ -366,7 +372,7 @@ __aicore__ inline void PreparePostVectorStage(
       *reinterpret_cast<__gm__ const uint64_t *>(entity->remote_eid);
   const uint64_t remote_eid_high =
       *reinterpret_cast<__gm__ const uint64_t *>(&(entity->remote_eid[8]));
-  const uint32_t ub_base_offset = bank_id * kWqeBankBytes;
+  const uint32_t ub_base_offset = kScratchBase + bank_id * kWqeBankBytes;
   AscendC::Simt::VF_CALL<FillBatchGetReadWqes>(
       AscendC::Simt::Dim3{kWqesPerPost, 1U, 1U}, indices, output_indices,
       offsets, address_table, request_begin, request_offset, token_bytes,
@@ -390,7 +396,7 @@ __aicore__ inline void PreparePostVectorStage(
 __aicore__ inline void CopyPreparedPostToSq(const PreparedPost *prepared) {
   const uint32_t ring_head =
       static_cast<uint32_t>(prepared->current_head % prepared->sq_depth);
-  const uint32_t ub_base_offset = prepared->event_id * kWqeBankBytes;
+  const uint32_t ub_base_offset = kScratchBase + prepared->event_id * kWqeBankBytes;
   if (ring_head + prepared->wqe_count <= prepared->sq_depth) {
     CopyUbToGm(
         reinterpret_cast<__gm__ void *>(
@@ -591,12 +597,49 @@ __aicore__ inline uint64_t WaitForCompletion(
 
 // One ordinary device call on an exclusively owned queue group. Call only after
 // draining prior local pipes and releasing overlapping UB and hard events:
-// this engine owns raw UB from byte zero and local events 0, 1, 2. A poisoned
+// this engine owns raw UB starting at kScratchBase and local events 0, 1, 2. A poisoned
 // queue requires transport recovery; clearing last_error while READs might
 // still be in flight is unsafe. args.miss_count is not consumed here.
+// Scalar lifetime state only: no UB pointers survive submission.
+struct AsyncBatchGet {
+  uint64_t entities = 0U;
+  uint64_t queues = 0U;
+  uint32_t used_jettys = 0U;
+  uint32_t jettys_per_core = 0U;
+  uint64_t error = kSuccess;
+};
+
+__aicore__ inline uint64_t KvafBatchGetWait(AsyncBatchGet &pending) {
+  if (pending.error != kSuccess) { return pending.error; }
+  if (pending.used_jettys == 0U) { return kSuccess; }
+  auto *queues = reinterpret_cast<__gm__ KvafBatchGetQueueState *>(pending.queues);
+  auto *entities = reinterpret_cast<__gm__ const KvafBatchGetDirectUrmaEntity *>(pending.entities);
+  uint64_t result = kSuccess;
+  for (uint32_t jetty = 0U; jetty < pending.used_jettys; ++jetty) {
+    uint32_t polls = 0U;
+    const uint64_t completed = WaitForCompletion(entities + jetty, queues + jetty, &polls);
+    if (completed == kSuccess) { ++queues[jetty].completed_batch_count; }
+    else if (result == kSuccess) { result = completed; }
+  }
+  if (result != kSuccess) {
+    pending.error = result;
+    for (uint32_t jetty = 0U; jetty < pending.jettys_per_core; ++jetty) {
+      if (queues[jetty].last_error == 0U) { queues[jetty].last_error = result; }
+    }
+  } else {
+    pending.used_jettys = 0U;
+  }
+  CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(queues),
+      pending.jettys_per_core * sizeof(KvafBatchGetQueueState));
+  return result;
+}
+
 __aicore__ inline uint64_t KvafBatchGetDevice(
     const KvafExecuteBatchGetKernelArgs &args, uint32_t logical_owner,
-    uint32_t request_begin, uint32_t request_count) {
+    uint32_t request_begin, uint32_t request_count, AsyncBatchGet *pending = nullptr) {
+  if (pending != nullptr && (pending->error != kSuccess || pending->used_jettys != 0U)) {
+    return pending->error != kSuccess ? pending->error : kInvalidQueue;
+  }
   const uint32_t core = logical_owner;
   const uint32_t jettys_per_core =
       args.jettys_per_core == 0U ? 1U : args.jettys_per_core;
@@ -765,6 +808,13 @@ __aicore__ inline uint64_t KvafBatchGetDevice(
 
     const uint32_t used_jettys =
         window_posts < jettys_per_core ? window_posts : jettys_per_core;
+    if (pending != nullptr && active_count == request_count) {
+      pending->entities = reinterpret_cast<uint64_t>(entities);
+      pending->queues = reinterpret_cast<uint64_t>(queues);
+      pending->used_jettys = used_jettys;
+      pending->jettys_per_core = jettys_per_core;
+      break; // Last SQ window overlaps the caller's next compute group.
+    }
     // An earlier Jetty error stops future windows but does not skip a fence
     // already submitted on another Jetty in this window.
     for (uint32_t jetty = 0U; jetty < used_jettys; ++jetty) {
@@ -787,7 +837,8 @@ __aicore__ inline uint64_t KvafBatchGetDevice(
     }
   }
   const uint64_t profile_completion_done_cycle =
-      profile_enabled ? static_cast<uint64_t>(AscendC::GetSystemCycle()) : 0U;
+      (profile_enabled && (pending == nullptr || pending->used_jettys == 0U))
+          ? static_cast<uint64_t>(AscendC::GetSystemCycle()) : 0U;
   // A descriptor failure before posting leaves transport healthy. A failure
   // after posting poisons the owner group until the host retires/recreates it.
   // Preserve the original error when rejecting an already poisoned queue.
