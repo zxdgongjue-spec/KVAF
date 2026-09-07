@@ -162,6 +162,28 @@ void equivalence() {
  }
 }
 void duplicate_gate() {
+ for(uint32_t n=1;n<=256;++n) {
+  Fixture batch;
+  // Permuted, descending, singleton and full-capacity waves. Validate only
+  // private scratch is sorted; GM request order and canaries stay unchanged.
+  for(uint32_t i=0;i<n;++i) batch.seeds[i*4+3]=1000+n-1-i;
+  if(n%2==0) for(uint32_t i=0;i<n;++i) {
+   const uint32_t j=(i*73+19)%n;
+   const int32_t swap=batch.seeds[i*4+3];
+   batch.seeds[i*4+3]=batch.seeds[j*4+3]; batch.seeds[j*4+3]=swap;
+  }
+  assert(batch.build(n));
+  auto original=batch.outputs;
+  assert(ValidateKvafForwardResidentOutputIndices(batch.control,batch.descriptor));
+  assert(batch.outputs==original); batch.guards();
+  if(n>1) {
+   for(uint32_t dup=1;dup<n;++dup) {
+    batch.outputs=original; batch.outputs[dup+1]=batch.outputs[1];
+    assert(!ValidateKvafForwardResidentOutputIndices(batch.control,batch.descriptor));
+    batch.guards();
+   }
+  }
+ }
  Fixture f; f.seeds[63*4+3]=f.seeds[4*4+3];
  assert(f.build(64)); // Sole Publish gate, not Append, owns duplicate rejection.
  assert(!ValidateKvafForwardResidentOutputIndices(f.control,f.descriptor));

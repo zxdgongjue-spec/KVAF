@@ -486,11 +486,34 @@ __aicore__ inline bool ValidateKvafForwardResidentOutputIndices(
         static_cast<uint64_t>(row) >= resident_end) {
       return false;
     }
-    for (uint32_t earlier = 0U; earlier < request; ++earlier) {
-      if (output_indices[earlier] == row) {
-        return false;
-      }
+  }
+  // Sort ONLY the private UB copy, never descriptor GM order. Heap sort has
+  // bounded O(N log N) work and no recursion/extra scratch; pairwise checking
+  // grows to8128 comparisons at128 requests. The complete uniqueness gate
+  // remains before any descriptor publication or doorbell.
+  __ubuf__ int32_t* sorted = reinterpret_cast<__ubuf__ int32_t*>(get_imm(0U));
+  const uint32_t count = descriptor.active_request_count;
+  for (uint32_t step = count / 2U + count - 1U; step > 0U; --step) {
+    const bool heapify = step >= count;
+    uint32_t root = heapify ? step - count : 0U;
+    const uint32_t end = heapify ? count : step;
+    if (!heapify) {
+      const int32_t swap = sorted[0];
+      sorted[0] = sorted[end];
+      sorted[end] = swap;
     }
+    const int32_t value = sorted[root];
+    while (root * 2U + 1U < end) {
+      uint32_t child = root * 2U + 1U;
+      if (child + 1U < end && sorted[child] < sorted[child + 1U]) { ++child; }
+      if (value >= sorted[child]) { break; }
+      sorted[root] = sorted[child];
+      root = child;
+    }
+    sorted[root] = value;
+  }
+  for (uint32_t i = 1U; i < count; ++i) {
+    if (sorted[i - 1U] == sorted[i]) { return false; }
   }
   return true;
 }

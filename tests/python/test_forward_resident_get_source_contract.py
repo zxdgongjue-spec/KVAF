@@ -76,7 +76,9 @@ def main() -> None:
     assert "resident_end" in validation
     assert "ReadGmByPassDCache<int32_t>" not in validation
     assert "AscendC::DataCopyPad(local_indices, global_indices" in validation
-    assert "output_indices[earlier]" in validation
+    assert "output_indices[earlier]" not in validation
+    assert "sorted[i - 1U] == sorted[i]" in validation
+    assert "root * 2U + 1U < end" in validation
     assert "get_imm(0U)" in validation
     assert "kDenseBatchGetReservedWqeUbBytes" in validation
     assert validation.index("HardEvent::MTE2_S") < validation.index(
