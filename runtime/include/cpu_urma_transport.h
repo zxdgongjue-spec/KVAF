@@ -73,6 +73,10 @@ class CpuUrmaTransport final {
     std::size_t bytes;
   };
   Status WriteSgl(std::uint64_t remote_offset, const HostSge* sources, std::size_t count);
+  // Builds one WR per SGL group, distributes the WRs across all configured
+  // Jettys, posts the complete set, then polls one completion fence per Jetty.
+  Status WriteSglBatch(std::uint64_t remote_offset, const HostSge* sources,
+                       std::size_t count, std::size_t sgl_size);
   // Register one page-aligned host region once. Direct transfers from any
   // sub-range of this region then reuse the same URMA segment.
   Status RegisterDirectHostMemory(void* base, std::size_t bytes);
@@ -90,6 +94,8 @@ class CpuUrmaTransport final {
   Status WriteBatch(std::uint64_t remote_offset, const HostSge* sources, std::size_t count);
   Status ReadBatch(std::uint64_t remote_offset, const HostSge* destinations, std::size_t count);
   Status ReadSgl(std::uint64_t remote_offset, const HostSge* destinations, std::size_t count);
+  Status ReadSglBatch(std::uint64_t remote_offset, const HostSge* destinations,
+                      std::size_t count, std::size_t sgl_size);
   Status Shutdown();
 
   bool initialized() const;

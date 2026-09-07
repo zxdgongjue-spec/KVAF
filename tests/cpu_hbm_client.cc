@@ -209,36 +209,30 @@ bool RunSglPass(kvaf::CpuUrmaTransport* transport, bool write,
     return false;
   }
   const auto wall_start = std::chrono::steady_clock::now();
-  std::vector<kvaf::CpuUrmaTransport::HostSge> sges(sgl_size);
+  std::vector<kvaf::CpuUrmaTransport::HostSge> requests(order.size());
+  for (std::size_t i = 0U; i < order.size(); ++i) {
+    requests[i] = {(*blocks)[order[i]].data, block_bytes};
+  }
   for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
-    for (std::size_t position = 0U; position < order.size();) {
-      const std::size_t sgl_count = std::min(sgl_size, order.size() - position);
-      for (std::size_t i = 0U; i < sgl_count; ++i) {
-        sges[i] = {(*blocks)[order[position + i]].data, block_bytes};
-      }
-      const auto start = std::chrono::steady_clock::now();
-      const std::uint64_t offset = static_cast<std::uint64_t>(position) * block_bytes;
-      const kvaf::Status status = write
-          ? transport->WriteSgl(offset, sges.data(), sgl_count)
-          : transport->ReadSgl(offset, sges.data(), sgl_count);
-      if (!status.ok()) {
-        std::fprintf(stderr, "[HBM_TEST][CPU] %s failed sgl_position=%zu num_sge=%zu: %s\n",
-                     write ? "WRITE" : "READ", position, sgl_count,
-                     status.message().c_str());
-        return false;
-      }
-      const auto elapsed = static_cast<std::uint64_t>(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now() - start).count());
-      ++stats->batches;
-      ++stats->wrs;
-      stats->blocks += sgl_count;
-      stats->bytes += static_cast<std::uint64_t>(sgl_count) * block_bytes;
-      stats->sum_ns += elapsed;
-      stats->min_ns = std::min(stats->min_ns, elapsed);
-      stats->max_ns = std::max(stats->max_ns, elapsed);
-      position += sgl_count;
+    const auto start = std::chrono::steady_clock::now();
+    const kvaf::Status status = write
+        ? transport->WriteSglBatch(0U, requests.data(), requests.size(), sgl_size)
+        : transport->ReadSglBatch(0U, requests.data(), requests.size(), sgl_size);
+    if (!status.ok()) {
+      std::fprintf(stderr, "[HBM_TEST][CPU] %s failed sgl_size=%zu: %s\n",
+                   write ? "WRITE" : "READ", sgl_size, status.message().c_str());
+      return false;
     }
+    const auto elapsed = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count());
+    ++stats->batches;
+    stats->wrs += (requests.size() + sgl_size - 1U) / sgl_size;
+    stats->blocks += requests.size();
+    stats->bytes += static_cast<std::uint64_t>(requests.size()) * block_bytes;
+    stats->sum_ns += elapsed;
+    stats->min_ns = std::min(stats->min_ns, elapsed);
+    stats->max_ns = std::max(stats->max_ns, elapsed);
   }
   stats->wall_ns = static_cast<std::uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
