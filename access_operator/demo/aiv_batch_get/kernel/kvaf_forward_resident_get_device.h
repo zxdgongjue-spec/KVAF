@@ -446,21 +446,48 @@ __aicore__ inline bool ValidateKvafForwardResidentOutputIndices(
       descriptor.request_capacity > KVAF_AIV_BATCH_GET_DENSE_REQUEST_CAPACITY) {
     return false;
   }
-  __gm__ const int32_t* const output_indices =
-      reinterpret_cast<__gm__ const int32_t*>(descriptor.output_indices);
+  // This validation precedes WQE construction. The preceding PostOnly has
+  // committed both banks (CommitPostScalarStage waits for MTE3 before the
+  // doorbell), and HCCP reads the copied SQ in GM, never these UB banks.
+  // Reuse the first 1 KiB of that reserved aperture until the next Post
+  // materializes its WQEs. No static array/TBuf or additional UB is allocated.
+  // Previously every pair reread GM: 64 requests incurred 2016 uncached
+  // reads here and another 2016 in per-request Append. A single bounded DMA
+  // plus local comparisons preserves the complete duplicate/range gate.
+  static_assert(KVAF_AIV_BATCH_GET_DENSE_REQUEST_CAPACITY * sizeof(int32_t) <=
+                    kvaf_fused_get::kDenseBatchGetReservedWqeUbBytes,
+                "forward validation scratch exceeds idle WQE banks");
+  AscendC::LocalTensor<int32_t> local_indices;
+  AscendC::TBuffAddr local_address{};
+  local_address.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECIN);
+  local_indices.SetAddr(local_address);
+  local_indices.InitBuffer(0U, KVAF_AIV_BATCH_GET_DENSE_REQUEST_CAPACITY);
+  AscendC::GlobalTensor<int32_t> global_indices;
+  global_indices.SetGlobalBuffer(
+      reinterpret_cast<__gm__ int32_t*>(descriptor.output_indices));
+  const AscendC::DataCopyExtParams copy_params{
+      1U, descriptor.active_request_count * static_cast<uint32_t>(sizeof(int32_t)),
+      0U, 0U, 0U};
+  const AscendC::DataCopyPadExtParams<int32_t> pad_params{false, 0U, 0U, 0};
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID6);
+  AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID6);
+  AscendC::DataCopyPad(local_indices, global_indices, copy_params, pad_params);
+  AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID6);
+  AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID6);
+  __ubuf__ const int32_t* const output_indices =
+      reinterpret_cast<__ubuf__ const int32_t*>(get_imm(0U));
   const uint64_t resident_end =
       control.resident_row_base + control.resident_row_count;
   for (uint32_t request = 0U; request < descriptor.active_request_count;
        ++request) {
-    const int32_t row = ReadGmByPassDCache<int32_t>(
-        const_cast<__gm__ int32_t*>(output_indices + request));
+    const int32_t row = output_indices[request];
     if (row < 0 || static_cast<uint64_t>(row) < control.resident_row_base ||
         static_cast<uint64_t>(row) >= resident_end) {
       return false;
     }
     for (uint32_t earlier = 0U; earlier < request; ++earlier) {
-      if (ReadGmByPassDCache<int32_t>(
-              const_cast<__gm__ int32_t*>(output_indices + earlier)) == row) {
+      if (output_indices[earlier] == row) {
         return false;
       }
     }
@@ -555,6 +582,62 @@ __aicore__ inline bool AppendKvafForwardResidentRequest(
   WriteGmByPassDCache<uint8_t>(mask + request, 1U);
   WriteGmByPassDCache<int32_t>(output_indices + request, output_row);
   descriptor->active_request_count = request + 1U;
+  return true;
+}
+
+// Dense-wave construction from an existing bounded UB seed array. Unlike
+// incremental Append this path never rereads earlier output indices from GM.
+// The sole Publish gate below validates range AND uniqueness before any WQE
+// or doorbell. Thus duplicate seeds are still rejected; this is not an
+// unchecked/trusted transport entrypoint and cannot bypass publication.
+// The source is a strided int32 view, so KVAF does not depend on P10's seed ABI.
+__aicore__ inline bool BuildKvafForwardResidentRequestsFromSeedWords(
+    const KvafForwardResidentBatchGetControl& control,
+    KvafForwardResidentBatchGetDescriptorScratch* descriptor,
+    __ubuf__ const int32_t* seed_words, uint32_t count,
+    uint32_t stride_words, uint32_t object_word, uint32_t output_word,
+    uint32_t rows_per_entry) {
+  if (descriptor == nullptr || seed_words == nullptr || count == 0U ||
+      stride_words == 0U || object_word >= stride_words ||
+      output_word >= stride_words || rows_per_entry == 0U ||
+      !IsKvafForwardResidentBatchGetControlValidForAicore(control) ||
+      descriptor->address_table == 0U || descriptor->valid_table == 0U ||
+      descriptor->indices == 0U || descriptor->offsets == 0U ||
+      descriptor->mask == 0U || descriptor->output_indices == 0U ||
+      descriptor->table_capacity == 0U || descriptor->request_capacity == 0U ||
+      descriptor->request_capacity > KVAF_AIV_BATCH_GET_DENSE_REQUEST_CAPACITY ||
+      count > descriptor->request_capacity || descriptor->active_request_count != 0U ||
+      descriptor->reserved0 != 0U) {
+    return false;
+  }
+  const uint64_t resident_end = control.resident_row_base + control.resident_row_count;
+  // Finish all input validation before touching a reused descriptor vector.
+  for (uint32_t request = 0U; request < count; ++request) {
+    const int32_t object = seed_words[static_cast<uint64_t>(request) * stride_words + object_word];
+    const int32_t output = seed_words[static_cast<uint64_t>(request) * stride_words + output_word];
+    if (object < 0 || output < 0 ||
+        static_cast<uint32_t>(object) / rows_per_entry >= descriptor->table_capacity ||
+        static_cast<uint64_t>(static_cast<uint32_t>(object) % rows_per_entry) *
+            control.block_bytes > static_cast<uint64_t>(INT32_MAX) ||
+        static_cast<uint64_t>(output) < control.resident_row_base ||
+        static_cast<uint64_t>(output) >= resident_end) {
+      return false;
+    }
+  }
+  PrepareKvafForwardResidentDescriptorVectorsForPublication(*descriptor);
+  for (uint32_t request = 0U; request < count; ++request) {
+    const uint32_t object = static_cast<uint32_t>(
+        seed_words[static_cast<uint64_t>(request) * stride_words + object_word]);
+    const int32_t output = seed_words[static_cast<uint64_t>(request) * stride_words + output_word];
+    WriteGmByPassDCache<int32_t>(reinterpret_cast<__gm__ int32_t*>(descriptor->indices) + request,
+        static_cast<int32_t>(object / rows_per_entry));
+    WriteGmByPassDCache<int32_t>(reinterpret_cast<__gm__ int32_t*>(descriptor->offsets) + request,
+        static_cast<int32_t>(static_cast<uint64_t>(object % rows_per_entry) * control.block_bytes));
+    WriteGmByPassDCache<uint8_t>(reinterpret_cast<__gm__ uint8_t*>(descriptor->mask) + request, 1U);
+    WriteGmByPassDCache<int32_t>(reinterpret_cast<__gm__ int32_t*>(descriptor->output_indices) + request,
+        output);
+  }
+  descriptor->active_request_count = count;
   return true;
 }
 

@@ -74,8 +74,40 @@ def main() -> None:
     )
     assert "resident_row_base" in validation
     assert "resident_end" in validation
-    assert "ReadGmByPassDCache<int32_t>" in validation
-    assert "output_indices + earlier" in validation
+    assert "ReadGmByPassDCache<int32_t>" not in validation
+    assert "AscendC::DataCopyPad(local_indices, global_indices" in validation
+    assert "output_indices[earlier]" in validation
+    assert "get_imm(0U)" in validation
+    assert "kDenseBatchGetReservedWqeUbBytes" in validation
+    assert validation.index("HardEvent::MTE2_S") < validation.index(
+        "output_indices[request]"
+    )
+    bulk = _between(
+        device,
+        "__aicore__ inline bool BuildKvafForwardResidentRequestsFromSeedWords(",
+        "// `BeginKvafForwardResidentBatchGet` is the only caller-facing transition",
+    )
+    assert "ReadGmByPassDCache" not in bulk
+    assert "earlier" not in bulk
+    assert (
+        "PrepareKvafForwardResidentDescriptorVectorsForPublication(*descriptor)" in bulk
+    )
+    assert "descriptor->active_request_count = count" in bulk
+    # Validation may temporarily reuse the WQE bank only because PostOnly
+    # returns after the final MTE3->SQ copy commit. Pending HCCP reads use SQ
+    # GM, not UB; pending CQ does not extend WQE UB's lifetime.
+    commit = _between(
+        dense,
+        "__aicore__ inline void CommitPostScalarStage(",
+        "__aicore__ inline void PostActiveRequests(",
+    )
+    assert "wait_flag(PIPE_MTE3, PIPE_S" in commit
+    dense_posts = _between(
+        dense,
+        "__aicore__ inline void PostDenseBatchGetRequests(",
+        "// Dense P1 descriptors have already passed",
+    )
+    assert "CommitPostScalarStage(&pending_posts[final_bank])" in dense_posts
 
     # Queue acquire/release runs in SIMT while descriptor preparation and
     # PostOnly run in AICore.  Those AICore checks must not use an ordinary GM
@@ -106,7 +138,10 @@ def main() -> None:
         ),
     ):
         queue_owner_check = _between(device, function_start, function_end)
-        assert "ReadKvafForwardResidentQueueOwner(control, lease.queue_id)" in queue_owner_check
+        assert (
+            "ReadKvafForwardResidentQueueOwner(control, lease.queue_id)"
+            in queue_owner_check
+        )
         assert "owners[lease.queue_id]" not in queue_owner_check
 
     queue_args = _between(
@@ -162,9 +197,11 @@ def main() -> None:
         "active_request_count = descriptor.active_request_count",
     ):
         assert token in begin, token
-    assert begin.index("PublishKvafForwardResidentDescriptor(") < begin.index(
-        "args.address_table ="
-    ) < begin.index("SnapshotKvafForwardResidentQueueProgress(")
+    assert (
+        begin.index("PublishKvafForwardResidentDescriptor(")
+        < begin.index("args.address_table =")
+        < begin.index("SnapshotKvafForwardResidentQueueProgress(")
+    )
     assert "KvafForwardResidentBatchGetWave*" not in begin
     assert "KvafDenseBatchGetTransaction transaction" not in begin
     assert "BeginKvafDenseBatchGetPostOnly(" not in begin
@@ -179,9 +216,12 @@ def main() -> None:
     assert "return ClassifyKvafForwardResidentBegin(" not in begin
     exact_delta = "sq_producer_delta == static_cast<uint64_t>(active_request_count)"
     partial_delta = "if (sq_producer_delta != 0U)"
-    assert begin.index(exact_delta) < begin.index(partial_delta) < begin.index(
-        "return kForwardResidentBeginSqProducerDeltaMismatch;"
-    ) < begin.index("return ClassifyKvafForwardResidentScalarBeginWithoutPost(")
+    assert (
+        begin.index(exact_delta)
+        < begin.index(partial_delta)
+        < begin.index("return kForwardResidentBeginSqProducerDeltaMismatch;")
+        < begin.index("return ClassifyKvafForwardResidentScalarBeginWithoutPost(")
+    )
     assert "!IsKvafForwardResidentBatchGetControlValidForAicore(control)" in begin
 
     rehydrate = _between(
@@ -258,9 +298,9 @@ def main() -> None:
         "WriteGmByPassDCache<int32_t>(output_indices + request",
     ):
         assert token in append, token
-    assert append.index("PrepareKvafForwardResidentDescriptorVectorsForPublication(") < append.index(
-        "WriteGmByPassDCache<int32_t>(indices + request"
-    )
+    assert append.index(
+        "PrepareKvafForwardResidentDescriptorVectorsForPublication("
+    ) < append.index("WriteGmByPassDCache<int32_t>(indices + request")
     prepare_vectors = _between(
         device,
         "__aicore__ inline void PrepareKvafForwardResidentDescriptorVectorsForPublication(",
@@ -296,12 +336,19 @@ def main() -> None:
         "__aicore__ inline void BeginKvafDenseBatchGetPostOnly(",
         "// Forward-resident P10 needs the verified Dense PostOnly protocol",
     )
-    assert dense_legacy_begin.index("ValidateDenseBatchGetDescriptors(") < dense_legacy_begin.index(
-        "PrepareDenseBatchGetOutputForInboundDma("
-    ) < dense_legacy_begin.index("PostDenseBatchGetRequests(")
+    assert (
+        dense_legacy_begin.index("ValidateDenseBatchGetDescriptors(")
+        < dense_legacy_begin.index("PrepareDenseBatchGetOutputForInboundDma(")
+        < dense_legacy_begin.index("PostDenseBatchGetRequests(")
+    )
     assert "KvafDenseBatchGetTransaction" in dense_legacy_begin
-    assert "WriteGmByPassDCache<uint32_t>(&queues->initialized, 1U)" in dense_legacy_begin
-    assert "WriteGmByPassDCache<uint64_t>(&queues->sq_producer_index, 0U)" in dense_legacy_begin
+    assert (
+        "WriteGmByPassDCache<uint32_t>(&queues->initialized, 1U)" in dense_legacy_begin
+    )
+    assert (
+        "WriteGmByPassDCache<uint64_t>(&queues->sq_producer_index, 0U)"
+        in dense_legacy_begin
+    )
 
     # P10 never sends the large transaction record through its Begin closure.
     # Its scalar helper reuses the same validated Dense PostOnly steps, and
@@ -313,9 +360,11 @@ def main() -> None:
         "// Probe the one CQE",
     )
     assert "KvafDenseBatchGetTransaction" not in dense_scalar_begin
-    assert dense_scalar_begin.index("ValidateDenseBatchGetDescriptors(") < dense_scalar_begin.index(
-        "PrepareDenseBatchGetOutputForInboundDma("
-    ) < dense_scalar_begin.index("PostDenseBatchGetRequests(")
+    assert (
+        dense_scalar_begin.index("ValidateDenseBatchGetDescriptors(")
+        < dense_scalar_begin.index("PrepareDenseBatchGetOutputForInboundDma(")
+        < dense_scalar_begin.index("PostDenseBatchGetRequests(")
+    )
     for token in (
         "ReadGmByPassDCache<uint32_t>(&queues->initialized)",
         "ReadGmByPassDCache<uint32_t>(&queues->magic)",
@@ -330,9 +379,11 @@ def main() -> None:
         "__aicore__ inline void PostActiveRequests(",
     )
     assert "WriteGmByPassDCache<uint64_t>(&queue->sq_producer_index" in dense_commit
-    assert dense_commit.index("WriteGmByPassDCache<uint64_t>(") < dense_commit.index(
-        "DataSyncBarrier<MemDsbT::DDR>()"
-    ) < dense_commit.index("st_dev(")
+    assert (
+        dense_commit.index("WriteGmByPassDCache<uint64_t>(")
+        < dense_commit.index("DataSyncBarrier<MemDsbT::DDR>()")
+        < dense_commit.index("st_dev(")
+    )
 
     dense_post_requests = _between(
         dense,
@@ -341,7 +392,10 @@ def main() -> None:
     )
     assert "ReadGmByPassDCache<uint64_t>(" in dense_post_requests
     assert "&queues[jetty].sq_producer_index" in dense_post_requests
-    assert "current_heads[jetty] = queues[jetty].sq_producer_index;" not in dense_post_requests
+    assert (
+        "current_heads[jetty] = queues[jetty].sq_producer_index;"
+        not in dense_post_requests
+    )
 
     dense_retire = _between(
         dense,
@@ -423,8 +477,7 @@ def main() -> None:
         assert forbidden not in device, forbidden
 
     assert (
-        "using ForwardResidentBatchGetBinding = LayerResidentBatchGetBinding;"
-        in public
+        "using ForwardResidentBatchGetBinding = LayerResidentBatchGetBinding;" in public
     )
     for token in (
         "BindForwardResidentBatchGetControl",
