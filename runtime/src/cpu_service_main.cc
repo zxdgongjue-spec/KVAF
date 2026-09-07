@@ -12,10 +12,12 @@ namespace {
 void PrintUsage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] "
-               "[--host-allocator posix|acl]\n"
+               "[--host-allocator posix|acl] "
+               "[--memory-page-mode default|thp|hugetlb-2m]\n"
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
                "candidates are discovered automatically. The default posix allocator requires only liburma "
-               "and /dev/uburma; the acl allocator dynamically loads libascendcl.so.\n",
+               "and /dev/uburma; the acl allocator dynamically loads libascendcl.so. Non-default memory "
+               "page modes require the posix allocator.\n",
                program);
 }
 
@@ -27,6 +29,23 @@ bool ParseUnsigned(const char* text, std::uint32_t maximum, std::uint32_t* value
   if (errno != 0 || end == text || *end != '\0' || parsed > maximum) return false;
   *value = static_cast<std::uint32_t>(parsed);
   return true;
+}
+
+bool ParseMemoryPageMode(const std::string& text, kvaf::CpuMemoryPageMode* mode) {
+  if (mode == nullptr) return false;
+  if (text == "default") {
+    *mode = kvaf::CpuMemoryPageMode::kDefault;
+    return true;
+  }
+  if (text == "thp") {
+    *mode = kvaf::CpuMemoryPageMode::kTransparentHugePage;
+    return true;
+  }
+  if (text == "hugetlb-2m") {
+    *mode = kvaf::CpuMemoryPageMode::kHugeTlb2M;
+    return true;
+  }
+  return false;
 }
 
 }  // namespace
@@ -41,7 +60,8 @@ int main(int argc, char** argv) {
       return 0;
     }
     if ((argument == "--listen" || argument == "--port" || argument == "--ub-device" ||
-         argument == "--eid-index" || argument == "--host-allocator") && index + 1 >= argc) {
+         argument == "--eid-index" || argument == "--host-allocator" ||
+         argument == "--memory-page-mode") && index + 1 >= argc) {
       PrintUsage(argv[0]);
       return 2;
     }
@@ -72,6 +92,12 @@ int main(int argc, char** argv) {
         cpu_options.host_allocator = kvaf::CpuHostAllocator::kAcl;
       } else {
         std::fprintf(stderr, "invalid --host-allocator (expected posix or acl)\n");
+        return 2;
+      }
+    } else if (argument == "--memory-page-mode") {
+      if (!ParseMemoryPageMode(argv[++index], &cpu_options.memory_page_mode)) {
+        std::fprintf(stderr,
+                     "invalid --memory-page-mode; expected default, thp, or hugetlb-2m\n");
         return 2;
       }
     } else {
