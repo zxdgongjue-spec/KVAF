@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -49,6 +50,20 @@ struct RemoteJettyEx {
   std::uint32_t tp_type;
   std::uint32_t reserved_after_tp_type;
 };
+// The deployed liburma uses the expanded SGE ABI (addr, len, tseg,
+// user_tseg), which is 32 bytes. Older public headers omit user_tseg and
+// declare urma_sge_t as 24 bytes. A one-entry SGL hides this stride mismatch,
+// but every entry after the first is decoded at the wrong address. Keep SGL
+// storage in the expanded wire layout and cast only at the API boundary.
+struct SglSgeAbi {
+  std::uint64_t addr;
+  std::uint32_t len;
+  urma_target_seg_t* tseg;
+  void* user_tseg;
+};
+static_assert(sizeof(SglSgeAbi) == 32 && offsetof(SglSgeAbi, tseg) == 16 &&
+                  offsetof(SglSgeAbi, user_tseg) == 24,
+              "unexpected expanded URMA SGE ABI");
 struct TpQuery { std::uint32_t flag; std::uint32_t trans_mode;
   std::uint8_t local_eid[16]; std::uint8_t peer_eid[16]; };
 struct TpInfo { std::uint64_t tp_handle; };
@@ -624,7 +639,7 @@ struct CpuUrmaTransport::Impl {
         offset > remote_region_.length) {
       return Status::InvalidArgument("invalid SGL transfer");
     }
-    std::vector<urma_sge_t> local(count);
+    std::vector<SglSgeAbi> local(count);
     std::uint64_t total = 0U;
     for (std::size_t i = 0; i < count; ++i) {
       if (buffers[i].data == nullptr || buffers[i].bytes == 0U ||
@@ -646,12 +661,13 @@ struct CpuUrmaTransport::Impl {
         total > std::numeric_limits<std::uint32_t>::max()) {
       return Status::InvalidArgument("SGL transfer exceeds remote region");
     }
-    urma_sge_t remote{};
+    SglSgeAbi remote{};
     remote.addr = remote_region_.base + offset;
     remote.len = static_cast<std::uint32_t>(total);
     remote.tseg = remote_seg_handle_;
-    urma_sg_t local_sg{local.data(), static_cast<std::uint32_t>(count)};
-    urma_sg_t remote_sg{&remote, 1U};
+    urma_sg_t local_sg{reinterpret_cast<urma_sge_t*>(local.data()),
+                       static_cast<std::uint32_t>(count)};
+    urma_sg_t remote_sg{reinterpret_cast<urma_sge_t*>(&remote), 1U};
     urma_jfs_wr_t wr{};
     wr.opcode = write ? URMA_OPC_WRITE : URMA_OPC_READ;
     wr.flag.bs.complete_enable = 1;
