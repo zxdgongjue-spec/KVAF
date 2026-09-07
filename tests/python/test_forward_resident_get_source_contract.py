@@ -93,6 +93,11 @@ def main() -> None:
         "PrepareKvafForwardResidentDescriptorVectorsForPublication(*descriptor)" in bulk
     )
     assert "descriptor->active_request_count = count" in bulk
+    assert "WriteGmByPassDCache" not in bulk
+    assert "vector_bytes * 3U + vector_capacity" in bulk
+    assert "seed_begin < scratch_end" in bulk
+    assert bulk.count("AscendC::DataCopyPad(global_") == 4
+    assert bulk.index("HardEvent::MTE3_S") < bulk.index("descriptor->active_request_count = count")
     # Validation may temporarily reuse the WQE bank only because PostOnly
     # returns after the final MTE3->SQ copy commit. Pending HCCP reads use SQ
     # GM, not UB; pending CQ does not extend WQE UB's lifetime.

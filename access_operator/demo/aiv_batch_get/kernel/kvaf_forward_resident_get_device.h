@@ -624,19 +624,68 @@ __aicore__ inline bool BuildKvafForwardResidentRequestsFromSeedWords(
       return false;
     }
   }
+  // PostOnly has committed the preceding wave's WQEs into the SQ in GM;
+  // pending HCCP/CQ does NOT read these UB banks. Borrow their idle aperture
+  // until the next Post materializes WQEs, exactly as the validation below.
+  // Three int32 arrays and one byte mask fit even at the 256-request limit.
+  // No extra TBuf and no cross-domain SIMT call are introduced.
+  constexpr uint32_t vector_capacity = KVAF_AIV_BATCH_GET_DENSE_REQUEST_CAPACITY;
+  constexpr uint32_t vector_bytes = vector_capacity * sizeof(int32_t);
+  static_assert(vector_bytes % 32U == 0U && vector_capacity % 32U == 0U,
+                "descriptor scratch arrays must be datablock aligned");
+  static_assert(vector_bytes * 3U + vector_capacity <=
+                    kvaf_fused_get::kDenseBatchGetReservedWqeUbBytes,
+                "descriptor publication exceeds idle WQE banks");
+  const uint64_t seed_begin = reinterpret_cast<uint64_t>(seed_words);
+  const uint64_t seed_bytes = static_cast<uint64_t>(count) * stride_words * sizeof(int32_t);
+  const uint64_t scratch_begin = reinterpret_cast<uint64_t>(get_imm(0U));
+  const uint64_t scratch_end = scratch_begin + vector_bytes * 3U + vector_capacity;
+  if (seed_begin < scratch_end && scratch_begin < seed_begin + seed_bytes) {
+    return false;  // A caller may not store live seeds in the borrowed aperture.
+  }
   PrepareKvafForwardResidentDescriptorVectorsForPublication(*descriptor);
+  AscendC::TBuffAddr address{};
+  address.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECIN);
+  AscendC::LocalTensor<int32_t> local_indices, local_offsets, local_outputs;
+  AscendC::LocalTensor<uint8_t> local_mask;
+  local_indices.SetAddr(address);
+  local_indices.InitBuffer(0U, vector_capacity);
+  local_offsets.SetAddr(address);
+  local_offsets.InitBuffer(vector_bytes, vector_capacity);
+  local_outputs.SetAddr(address);
+  local_outputs.InitBuffer(vector_bytes * 2U, vector_capacity);
+  local_mask.SetAddr(address);
+  local_mask.InitBuffer(vector_bytes * 3U, vector_capacity);
   for (uint32_t request = 0U; request < count; ++request) {
     const uint32_t object = static_cast<uint32_t>(
         seed_words[static_cast<uint64_t>(request) * stride_words + object_word]);
     const int32_t output = seed_words[static_cast<uint64_t>(request) * stride_words + output_word];
-    WriteGmByPassDCache<int32_t>(reinterpret_cast<__gm__ int32_t*>(descriptor->indices) + request,
-        static_cast<int32_t>(object / rows_per_entry));
-    WriteGmByPassDCache<int32_t>(reinterpret_cast<__gm__ int32_t*>(descriptor->offsets) + request,
-        static_cast<int32_t>(static_cast<uint64_t>(object % rows_per_entry) * control.block_bytes));
-    WriteGmByPassDCache<uint8_t>(reinterpret_cast<__gm__ uint8_t*>(descriptor->mask) + request, 1U);
-    WriteGmByPassDCache<int32_t>(reinterpret_cast<__gm__ int32_t*>(descriptor->output_indices) + request,
-        output);
+    local_indices.SetValue(request, static_cast<int32_t>(object / rows_per_entry));
+    local_offsets.SetValue(request, static_cast<int32_t>(
+        static_cast<uint64_t>(object % rows_per_entry) * control.block_bytes));
+    local_mask.SetValue(request, 1U);
+    local_outputs.SetValue(request, output);
   }
+  AscendC::GlobalTensor<int32_t> global_indices, global_offsets, global_outputs;
+  AscendC::GlobalTensor<uint8_t> global_mask;
+  global_indices.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(descriptor->indices));
+  global_offsets.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(descriptor->offsets));
+  global_outputs.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(descriptor->output_indices));
+  global_mask.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(descriptor->mask));
+  const AscendC::DataCopyExtParams words{
+      1U, count * static_cast<uint32_t>(sizeof(int32_t)), 0U, 0U, 0U};
+  const AscendC::DataCopyExtParams bytes{1U, count, 0U, 0U, 0U};
+  AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID6);
+  AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID6);
+  AscendC::DataCopyPad(global_indices, local_indices, words);
+  AscendC::DataCopyPad(global_offsets, local_offsets, words);
+  AscendC::DataCopyPad(global_outputs, local_outputs, words);
+  AscendC::DataCopyPad(global_mask, local_mask, bytes);
+  // This edge must precede both the count publication and validation's
+  // MTE2 reuse of UB. A DDR barrier alone does not complete an MTE3 DMA.
+  AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID6);
+  AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID6);
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
   descriptor->active_request_count = count;
   return true;
 }

@@ -60,21 +60,39 @@ template<class T> struct LocalTensor {
  void InitBuffer(uint32_t offset,uint32_t n) {
   assert(offset+n*sizeof(T)<=ub.size()); pointer=reinterpret_cast<T*>(get_imm(offset)); capacity=n;
  }
+ void SetValue(uint32_t i,T value) { assert(i<capacity); pointer[i]=value; }
 };
 template<class T> struct GlobalTensor { T* pointer; void SetGlobalBuffer(T* p) { pointer=p; } };
 struct DataCopyExtParams { uint32_t blockCount,blockLen,srcStride,dstStride,rsv; };
 template<class T> struct DataCopyPadExtParams { bool pad; uint32_t left,right; T value; };
-enum class HardEvent { S_MTE2, MTE2_S };
+enum class HardEvent { S_MTE2, MTE2_S, S_MTE3, MTE3_S };
 uint32_t event_state=0;
+struct PendingCopy { void* dst; const void* src; uint32_t bytes; };
+std::vector<PendingCopy> pending;
 template<HardEvent E> void SetFlag(int event) {
  assert(event==6);
  if(E==HardEvent::S_MTE2) { assert(event_state==0); event_state=1; }
- else { assert(event_state==3); event_state=4; }
+ else if(E==HardEvent::MTE2_S) { assert(event_state==3); event_state=4; }
+ else if(E==HardEvent::S_MTE3) { assert(event_state==0); event_state=5; }
+ else { assert(event_state==6 && pending.size()==4); event_state=7; }
 }
 template<HardEvent E> void WaitFlag(int event) {
  assert(event==6);
  if(E==HardEvent::S_MTE2) { assert(event_state==1); event_state=2; }
- else { assert(event_state==4); event_state=0; }
+ else if(E==HardEvent::MTE2_S) { assert(event_state==4); event_state=0; }
+ else if(E==HardEvent::S_MTE3) { assert(event_state==5); event_state=6; }
+ else {
+  assert(event_state==7);
+  for(const auto& p:pending) { std::memcpy(p.dst,p.src,p.bytes); dma_bytes+=p.bytes; }
+  pending.clear(); event_state=0;
+ }
+}
+template<class T> void DataCopyPad(GlobalTensor<T>& global,LocalTensor<T>& local,
+ const DataCopyExtParams& p) {
+ assert(event_state==6 && p.blockCount==1 && !p.srcStride && !p.dstStride);
+ assert((p.blockLen+31U)/32U*32U<=local.capacity*sizeof(T));
+ // Delayed completion exposes a missing MTE3->S wait before UB reuse.
+ pending.push_back({global.pointer,local.pointer,p.blockLen});
 }
 template<class T> void DataCopyPad(LocalTensor<T>& local,GlobalTensor<T>& global,
  const DataCopyExtParams& p,const DataCopyPadExtParams<T>& pad) {
@@ -126,10 +144,14 @@ struct Fixture {
 void equivalence() {
  for(uint32_t n:{1U,2U,14U,63U,64U,65U,255U,256U}) {
   Fixture bulk,legacy; bypass_reads=bypass_writes=dma_bytes=0; ub.fill(0xa7);
-  assert(bulk.build(n)); assert(bypass_reads==0 && bypass_writes==4*n);
+  assert(bulk.build(n)); assert(bypass_reads==0 && bypass_writes==0 && dma_bytes==13*n);
+  assert(AscendC::pending.empty() && AscendC::event_state==0);
+  const auto before_validation=ub;
   assert(ValidateKvafForwardResidentOutputIndices(bulk.control,bulk.descriptor));
-  assert(bypass_reads==0 && dma_bytes==4*n && AscendC::event_state==0);
-  for(uint32_t byte=(4*n+31U)/32U*32U;byte<ub.size();++byte) assert(ub[byte]==0xa7);
+  assert(bypass_reads==0 && dma_bytes==17*n && AscendC::event_state==0);
+  for(uint32_t byte=(4*n+31U)/32U*32U;byte<ub.size();++byte)
+   assert(ub[byte]==before_validation[byte]);
+  for(uint32_t byte=3328;byte<ub.size();++byte) assert(ub[byte]==0xa7);
   for(uint32_t i=0;i<n;++i) assert(AppendKvafForwardResidentRequest(
     legacy.control,&legacy.descriptor,legacy.seeds[i*4+2],128,legacy.seeds[i*4+3]));
   assert(bypass_reads==static_cast<uint64_t>(n)*(n-1U)/2U);
@@ -157,7 +179,8 @@ void invalid_inputs() {
   if(kind==3) f.seeds[7*4+3]=6000;
   if(kind==4) f.control.magic=0;
   if(kind==5) f.descriptor.active_request_count=1;
-  bypass_writes=0; assert(!f.build(64)); assert(bypass_writes==0); f.guards();
+  bypass_writes=dma_bytes=0; assert(!f.build(64));
+  assert(bypass_writes==0 && dma_bytes==0); f.guards();
  }
  Fixture f;
  assert(!f.build(0) && !f.build(257));
@@ -165,6 +188,12 @@ void invalid_inputs() {
    f.seeds.data(),64,4,4,3,128));
  assert(!BuildKvafForwardResidentRequestsFromSeedWords(f.control,&f.descriptor,
    f.seeds.data(),64,4,2,3,0));
+ // Live source seeds inside the borrowed aperture must be rejected.
+ std::memcpy(ub.data(),f.seeds.data(),64*4*sizeof(int32_t));
+ dma_bytes=0;
+ assert(!BuildKvafForwardResidentRequestsFromSeedWords(f.control,&f.descriptor,
+   reinterpret_cast<const int32_t*>(ub.data()),64,4,2,3,128));
+ assert(dma_bytes==0 && AscendC::pending.empty());
 }
 void reuse() {
  Fixture f;
