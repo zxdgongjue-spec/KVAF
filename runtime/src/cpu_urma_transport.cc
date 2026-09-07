@@ -6,9 +6,7 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -17,7 +15,6 @@
 #include <mutex>
 #include <thread>
 #include <vector>
-#include <omp.h>
 #include <urma_api.h>
 
 #include "peer_link.h"
@@ -82,18 +79,6 @@ struct CpuUrmaTransport::Impl {
     std::vector<std::uint64_t> remote_offsets;
     std::vector<urma_target_seg_t*> host_segments;
     std::chrono::steady_clock::time_point deadline{};
-  };
-
-  // A pipeline slot contains one doorbell-sized wave.  Two slots are enough
-  // to let the OpenMP producer prepare wave N+1 while the submitter posts
-  // wave N.  A slot is released only after its fence CQEs have been polled.
-  struct PipelineSlot {
-    std::vector<BatchQueue> queues;
-    std::vector<std::uint64_t> expected_ctx;
-    std::size_t ready_workers{0U};
-    std::size_t free_epoch{0U};
-    std::mutex state_mutex;
-    std::condition_variable state_cv;
   };
 
   void PrepareBatchEntry(BatchJob& job, std::size_t index) {
@@ -168,287 +153,53 @@ struct CpuUrmaTransport::Impl {
     return PostBatchChunk(job, 0U, max_queue_size);
   }
 
-  void PreparePipelineEntry(const BatchJob& plan, PipelineSlot& slot,
-                            std::size_t jetty, std::size_t position,
-                            std::size_t global_index, std::size_t wave) {
-    BatchQueue& queue = slot.queues[jetty];
-    const auto& buffer = plan.buffers[global_index];
-    urma_target_seg_t* host_segment = plan.single_host_segment != nullptr
-        ? plan.single_host_segment : plan.host_segments[global_index];
-    queue.local[position] = {
-        reinterpret_cast<std::uint64_t>(buffer.data),
-        static_cast<std::uint32_t>(buffer.bytes), host_segment};
-    queue.remote[position] = {
-        remote_region_.base + plan.remote_offsets[global_index],
-        static_cast<std::uint32_t>(buffer.bytes), remote_seg_handle_};
-    queue.wrs[position] = {};
-    queue.wrs[position].opcode = plan.write ? URMA_OPC_WRITE : URMA_OPC_READ;
-    queue.wrs[position].flag.bs.complete_enable = 0U;
-    queue.wrs[position].tjetty = remote_jettys_[jetty];
-    queue.wrs[position].user_ctx =
-        0xBA7C0000ULL + (static_cast<std::uint64_t>(wave) << 16U) +
-        (static_cast<std::uint64_t>(jetty) << 8U) + position;
-    if (plan.write) {
-      queue.wrs[position].rw.src = {&queue.local[position], 1U};
-      queue.wrs[position].rw.dst = {&queue.remote[position], 1U};
-    } else {
-      queue.wrs[position].rw.src = {&queue.remote[position], 1U};
-      queue.wrs[position].rw.dst = {&queue.local[position], 1U};
-    }
-    queue.wrs[position].next =
-        position + 1U < queue.wrs.size() ? &queue.wrs[position + 1U] : nullptr;
-  }
-
-  void ResizePipelineSlot(const BatchJob& plan, PipelineSlot& slot,
-                          std::size_t begin) {
-    const std::size_t chunk_size = wqes_per_doorbell_;
-    slot.expected_ctx.assign(local_jettys_.size(), 0U);
-    for (std::size_t jetty = 0U; jetty < local_jettys_.size(); ++jetty) {
-      const std::size_t total = plan.queues[jetty].wrs.size();
-      const std::size_t remaining = begin < total ? total - begin : 0U;
-      const std::size_t entries = std::min(chunk_size, remaining);
-      slot.queues[jetty].local.resize(entries);
-      slot.queues[jetty].remote.resize(entries);
-      slot.queues[jetty].wrs.resize(entries);
-    }
-  }
-
-  std::string PostPipelineSlot(PipelineSlot& slot) {
-    for (std::size_t jetty = 0U; jetty < local_jettys_.size(); ++jetty) {
-      BatchQueue& queue = slot.queues[jetty];
-      if (queue.wrs.empty()) continue;
-      urma_jfs_wr_t* bad = nullptr;
-      const urma_status_t post_status =
-          urma_post_jetty_send_wr(local_jettys_[jetty], &queue.wrs.front(), &bad);
-      if (post_status != URMA_SUCCESS) {
-        return "pipeline post failed (jetty=" + std::to_string(jetty) +
-               ", status=" + std::to_string(static_cast<int>(post_status)) +
-               ", bad_wr=" + std::to_string(reinterpret_cast<std::uintptr_t>(bad)) +
-               ")";
-      }
-    }
-    return {};
-  }
-
-  std::string PollPipelineSlot(PipelineSlot& slot,
-                               std::chrono::steady_clock::time_point deadline) {
-    for (std::size_t jetty = 0U; jetty < local_jettys_.size(); ++jetty) {
-      if (slot.queues[jetty].wrs.empty()) continue;
-      bool completed = false;
-      while (std::chrono::steady_clock::now() < deadline) {
-        urma_cr_t cr{};
-        const int polled = urma_poll_jfc(jfcs_[jetty], 1, &cr);
-        if (polled < 0) return "urma_poll_jfc for pipeline slot";
-        if (polled != 1) continue;
-        if (cr.status != URMA_CR_SUCCESS ||
-            cr.user_ctx != slot.expected_ctx[jetty]) {
-          return "pipeline completion failed (jetty=" + std::to_string(jetty) +
-                 ", status=" + std::to_string(static_cast<int>(cr.status)) +
-                 ", user_ctx=" +
-                 std::to_string(static_cast<unsigned long long>(cr.user_ctx)) +
-                 ", expected_ctx=" +
-                 std::to_string(static_cast<unsigned long long>(slot.expected_ctx[jetty])) +
-                 ")";
-        }
-        completed = true;
-        break;
-      }
-      if (!completed) return "timed out waiting for pipeline completion";
-    }
-    return {};
-  }
-
-  std::string PrepareAndPostDoubleBuffered(
-      BatchJob& plan, std::uint64_t* prepare_ns, std::uint64_t* post_ns,
-      std::uint64_t* poll_ns) {
+  std::string PrepareAndPostStreaming(BatchJob& job,
+                                      std::uint64_t* prepare_ns,
+                                      std::uint64_t* post_ns) {
     const std::size_t chunk_size = wqes_per_doorbell_;
     const std::size_t jetty_count = local_jettys_.size();
     std::size_t max_queue_size = 0U;
-    for (const auto& queue : plan.queues) {
+    for (const auto& queue : job.queues) {
       max_queue_size = std::max(max_queue_size, queue.wrs.size());
     }
-    const std::size_t waves = (max_queue_size + chunk_size - 1U) / chunk_size;
-    if (waves == 0U) {
-      *prepare_ns = *post_ns = *poll_ns = 0U;
-      return {};
-    }
-    PipelineSlot& slot0 = pipeline_slots_[0];
-    PipelineSlot& slot1 = pipeline_slots_[1];
-    {
-      std::lock_guard<std::mutex> state_lock(slot0.state_mutex);
-      slot0.free_epoch = 0U;
-      slot0.ready_workers = 0U;
-    }
-    {
-      std::lock_guard<std::mutex> state_lock(slot1.state_mutex);
-      slot1.free_epoch = 1U;
-      slot1.ready_workers = 0U;
-    }
-    const std::size_t workers = openmp_thread_count_ > 1U
-        ? openmp_thread_count_ - 1U : 0U;
-    std::atomic<bool> failed{false};
-    std::string error;
-    std::uint64_t prepare_total = 0U;
-    std::uint64_t post_total = 0U;
-    std::uint64_t poll_total = 0U;
-
-    // Publish the initial two generations before workers enter the parallel
-    // region.  Later generations are resized by the submitter immediately
-    // after polling the slot that is about to be reused.
-    ResizePipelineSlot(plan, slot0, 0U);
-    if (waves > 1U) ResizePipelineSlot(plan, slot1, chunk_size);
-
-    if (workers == 0U) {
-      // A single OpenMP thread cannot overlap producer and submitter. Keep a
-      // correct sequential fallback for --omp-threads 1.
-      for (std::size_t wave = 0U; wave < waves; ++wave) {
-        PipelineSlot& slot = (wave & 1U) == 0U ? slot0 : slot1;
-        const std::size_t begin = wave * chunk_size;
-        const auto prepare_start = std::chrono::steady_clock::now();
-        ResizePipelineSlot(plan, slot, begin);
-        for (std::size_t jetty = 0U; jetty < jetty_count; ++jetty) {
-          BatchQueue& queue = slot.queues[jetty];
-          for (std::size_t position = 0U; position < queue.wrs.size(); ++position) {
-            const std::size_t global_index = (begin + position) * jetty_count + jetty;
-            PreparePipelineEntry(plan, slot, jetty, position, global_index, wave);
-          }
-          if (!queue.wrs.empty()) {
-            queue.wrs.back().flag.bs.complete_enable = 1U;
-            queue.wrs.back().next = nullptr;
-            slot.expected_ctx[jetty] = queue.wrs.back().user_ctx;
-          }
-        }
-        const auto prepare_end = std::chrono::steady_clock::now();
-        const auto post_start = prepare_end;
-        error = PostPipelineSlot(slot);
-        const auto post_end = std::chrono::steady_clock::now();
-        const auto poll_start = post_end;
-        if (error.empty()) error = PollPipelineSlot(slot, plan.deadline);
-        const auto poll_end = std::chrono::steady_clock::now();
-        prepare_total += static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(prepare_end - prepare_start).count());
-        post_total += static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(post_end - post_start).count());
-        poll_total += static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(poll_end - poll_start).count());
-        if (!error.empty()) break;
-      }
-      *prepare_ns = prepare_total;
-      *post_ns = post_total;
-      *poll_ns = poll_total;
-      return error;
-    }
-
+    std::string post_error;
+    std::uint64_t accumulated_prepare_ns = 0U;
+    std::uint64_t accumulated_post_ns = 0U;
+    auto prepare_start = std::chrono::steady_clock::now();
 #pragma omp parallel num_threads(openmp_thread_count_)
     {
-      const int tid = omp_get_thread_num();
-      if (tid == 0) {
-        for (std::size_t wave = 0U; wave < waves && !failed.load(); ++wave) {
-          PipelineSlot& slot = (wave & 1U) == 0U ? slot0 : slot1;
-          const auto prepare_start = std::chrono::steady_clock::now();
-          {
-            std::unique_lock<std::mutex> state_lock(slot.state_mutex);
-            slot.state_cv.wait(state_lock, [&] {
-              return slot.ready_workers >= workers ||
-                     failed.load(std::memory_order_acquire);
-            });
-          }
-          prepare_total += static_cast<std::uint64_t>(
+      for (std::size_t begin = 0U; begin < max_queue_size; begin += chunk_size) {
+        const std::size_t entries = jetty_count * chunk_size;
+#pragma omp for schedule(static)
+        for (std::int64_t flat = 0; flat < static_cast<std::int64_t>(entries); ++flat) {
+          const std::size_t flat_index = static_cast<std::size_t>(flat);
+          const std::size_t jetty = flat_index / chunk_size;
+          const std::size_t position = begin + flat_index % chunk_size;
+          if (position >= job.queues[jetty].wrs.size()) continue;
+          const std::size_t request = position * jetty_count + jetty;
+          PrepareBatchEntry(job, request);
+        }
+#pragma omp master
+        {
+          const auto prepare_end = std::chrono::steady_clock::now();
+          accumulated_prepare_ns += static_cast<std::uint64_t>(
               std::chrono::duration_cast<std::chrono::nanoseconds>(
-                  std::chrono::steady_clock::now() - prepare_start).count());
-          if (failed.load(std::memory_order_acquire)) break;
-          for (std::size_t jetty = 0U; jetty < jetty_count; ++jetty) {
-            BatchQueue& queue = slot.queues[jetty];
-            if (!queue.wrs.empty()) {
-              queue.wrs.back().flag.bs.complete_enable = 1U;
-              queue.wrs.back().next = nullptr;
-              slot.expected_ctx[jetty] = queue.wrs.back().user_ctx;
-            }
-          }
-          const auto post_start = std::chrono::steady_clock::now();
-          error = PostPipelineSlot(slot);
-          post_total += static_cast<std::uint64_t>(
-              std::chrono::duration_cast<std::chrono::nanoseconds>(
-                  std::chrono::steady_clock::now() - post_start).count());
-          if (!error.empty()) {
-            failed.store(true, std::memory_order_release);
-            slot0.state_cv.notify_all();
-            slot1.state_cv.notify_all();
-            break;
-          }
-          if (wave > 0U) {
-            PipelineSlot& old = (wave & 1U) == 0U ? slot1 : slot0;
-            const auto poll_start = std::chrono::steady_clock::now();
-            error = PollPipelineSlot(old, plan.deadline);
-            poll_total += static_cast<std::uint64_t>(
+                  prepare_end - prepare_start).count());
+          if (post_error.empty()) {
+            const auto post_start = prepare_end;
+            post_error = PostBatchChunk(job, begin, chunk_size);
+            accumulated_post_ns += static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - poll_start).count());
-            if (!error.empty()) {
-              failed.store(true, std::memory_order_release);
-              slot0.state_cv.notify_all();
-              slot1.state_cv.notify_all();
-              break;
-            }
-            if (wave + 1U < waves) {
-              ResizePipelineSlot(plan, old, (wave + 1U) * chunk_size);
-              {
-                std::lock_guard<std::mutex> state_lock(old.state_mutex);
-                old.ready_workers = 0U;
-                old.free_epoch = wave + 1U;
-              }
-              old.state_cv.notify_all();
-            }
+                    std::chrono::steady_clock::now() - post_start).count());
           }
+          prepare_start = std::chrono::steady_clock::now();
         }
-        if (!failed.load(std::memory_order_acquire)) {
-          PipelineSlot& last = ((waves - 1U) & 1U) == 0U ? slot0 : slot1;
-          const auto poll_start = std::chrono::steady_clock::now();
-          error = PollPipelineSlot(last, plan.deadline);
-          poll_total += static_cast<std::uint64_t>(
-              std::chrono::duration_cast<std::chrono::nanoseconds>(
-                  std::chrono::steady_clock::now() - poll_start).count());
-          if (!error.empty()) {
-            failed.store(true, std::memory_order_release);
-            slot0.state_cv.notify_all();
-            slot1.state_cv.notify_all();
-          }
-        }
-      } else {
-        const std::size_t worker = static_cast<std::size_t>(tid - 1);
-        for (std::size_t wave = 0U; wave < waves; ++wave) {
-          PipelineSlot& slot = (wave & 1U) == 0U ? slot0 : slot1;
-          {
-            std::unique_lock<std::mutex> state_lock(slot.state_mutex);
-            slot.state_cv.wait(state_lock, [&] {
-              return slot.free_epoch == wave ||
-                     failed.load(std::memory_order_acquire);
-            });
-          }
-          if (failed.load(std::memory_order_acquire)) break;
-          const std::size_t begin = wave * chunk_size;
-          for (std::size_t jetty = 0U; jetty < jetty_count; ++jetty) {
-            const std::size_t entries = slot.queues[jetty].wrs.size();
-            for (std::size_t position = worker; position < entries;
-                 position += workers) {
-              const std::size_t global_index =
-                  (begin + position) * jetty_count + jetty;
-              PreparePipelineEntry(plan, slot, jetty, position,
-                                   global_index, wave);
-            }
-          }
-          {
-            std::lock_guard<std::mutex> state_lock(slot.state_mutex);
-            ++slot.ready_workers;
-          }
-          slot.state_cv.notify_one();
-          if (failed.load(std::memory_order_acquire)) break;
-        }
+#pragma omp barrier
       }
     }
-    *prepare_ns = prepare_total;
-    *post_ns = post_total;
-    *poll_ns = poll_total;
-    return error;
+    *prepare_ns = accumulated_prepare_ns;
+    *post_ns = accumulated_post_ns;
+    return post_error;
   }
 
   std::string PollBatch(BatchJob& job) {
@@ -502,11 +253,6 @@ struct CpuUrmaTransport::Impl {
           "jetty_count in [1,16], and omp_thread_count in [1,INT_MAX]");
     }
     options_ = options;
-    // The pipeline uses one OpenMP submitter plus (N-1) producers.  Disable
-    // dynamic teams so the requested team size is honored and the producer
-    // completion counters cannot wait for threads that were never created.
-    omp_set_dynamic(0);
-    omp_set_num_threads(static_cast<int>(options.omp_thread_count));
     // URMA is process-wide.  The ACL/HBM runtime may have initialized it
     // before this transport is constructed, in which case liburma returns
     // EEXIST and the existing instance must be reused.  Only the caller that
@@ -771,7 +517,7 @@ struct CpuUrmaTransport::Impl {
     jfr_ = jfrs_[0];
     local_jetty_ = local_jettys_[0];
     remote_jetty_ = remote_jettys_[0];
-    openmp_thread_count_ = static_cast<std::uint32_t>(omp_get_max_threads());
+    openmp_thread_count_ = options.omp_thread_count;
     wqes_per_doorbell_ = options.wqes_per_doorbell;
     std::fprintf(stderr, "[KVAF_CPU_URMA] JETTYS_READY count=%zu omp_threads=%u wqes_per_doorbell=%zu depth=%u\n",
                  local_jettys_.size(), openmp_thread_count_,
@@ -786,18 +532,6 @@ struct CpuUrmaTransport::Impl {
     }
     batch_workspace_.remote_offsets.reserve(kJettyDepth);
     batch_workspace_.host_segments.reserve(kJettyDepth);
-    for (auto& slot : pipeline_slots_) {
-      slot.queues.resize(local_jettys_.size());
-      slot.expected_ctx.resize(local_jettys_.size());
-      for (auto& queue : slot.queues) {
-        queue.local.reserve(wqes_per_doorbell_ == 0U ? queue_capacity
-                                                    : wqes_per_doorbell_);
-        queue.remote.reserve(wqes_per_doorbell_ == 0U ? queue_capacity
-                                                      : wqes_per_doorbell_);
-        queue.wrs.reserve(wqes_per_doorbell_ == 0U ? queue_capacity
-                                                   : wqes_per_doorbell_);
-      }
-    }
     initialized_ = true;
     return Status::OK();
   }
@@ -1134,15 +868,10 @@ struct CpuUrmaTransport::Impl {
     std::uint64_t post_ns = 0U;
     std::string post_error;
     if (wqes_per_doorbell_ != 0U) {
-      // Double-buffered mode overlaps OpenMP WQE preparation for the next
-      // doorbell wave with submission of the current wave.  A slot is reused
-      // only after its completion CQEs have been drained.
-      std::uint64_t pipeline_poll_ns = 0U;
-      post_error = PrepareAndPostDoubleBuffered(
-          job, &prepare_ns, &post_ns, &pipeline_poll_ns);
-      // Polling is performed inside the pipeline helper and is accounted for
-      // separately below; preserve the phase value for the caller.
-      last_batch_timing_.poll_ns = pipeline_poll_ns;
+      // Streaming mode prepares one doorbell-sized wave and submits it before
+      // preparing the next wave. The single OpenMP master thread is the only
+      // caller of liburma; worker threads only write disjoint WR/SGE entries.
+      post_error = PrepareAndPostStreaming(job, &prepare_ns, &post_ns);
     } else {
       const auto prepare_start = std::chrono::steady_clock::now();
       PrepareBatch(job);
@@ -1156,15 +885,12 @@ struct CpuUrmaTransport::Impl {
           std::chrono::duration_cast<std::chrono::nanoseconds>(post_end - post_start).count());
     }
     const auto poll_start = std::chrono::steady_clock::now();
-    const std::string poll_error =
-        (post_error.empty() && wqes_per_doorbell_ == 0U) ? PollBatch(job) : post_error;
+    const std::string poll_error = post_error.empty() ? PollBatch(job) : post_error;
     const auto poll_end = std::chrono::steady_clock::now();
     last_batch_timing_.prepare_ns = prepare_ns;
     last_batch_timing_.post_ns = post_ns;
-    if (wqes_per_doorbell_ == 0U) {
-      last_batch_timing_.poll_ns = static_cast<std::uint64_t>(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(poll_end - poll_start).count());
-    }
+    last_batch_timing_.poll_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(poll_end - poll_start).count());
     const std::string transport_error = post_error.empty() ? poll_error : post_error;
     if (!transport_error.empty()) return Status::Internal(transport_error);
     return Status::OK();
@@ -1339,7 +1065,6 @@ struct CpuUrmaTransport::Impl {
   std::vector<urma_target_jetty_t*> remote_jettys_;
   std::mutex batch_submit_mutex_;
   BatchJob batch_workspace_;
-  std::array<PipelineSlot, 2> pipeline_slots_{};
   std::uint32_t openmp_thread_count_{1U};
   std::size_t wqes_per_doorbell_{0U};
   CpuUrmaTransport::BatchTiming last_batch_timing_{};
