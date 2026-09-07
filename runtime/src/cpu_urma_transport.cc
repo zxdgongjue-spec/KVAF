@@ -90,8 +90,8 @@ struct CpuUrmaTransport::Impl {
   struct PipelineSlot {
     std::vector<BatchQueue> queues;
     std::vector<std::uint64_t> expected_ctx;
-    std::atomic<std::size_t> ready_workers{0U};
-    std::atomic<std::size_t> free_epoch{0U};
+    std::size_t ready_workers{0U};
+    std::size_t free_epoch{0U};
     std::mutex state_mutex;
     std::condition_variable state_cv;
   };
@@ -274,10 +274,16 @@ struct CpuUrmaTransport::Impl {
     }
     PipelineSlot& slot0 = pipeline_slots_[0];
     PipelineSlot& slot1 = pipeline_slots_[1];
-    slot0.free_epoch.store(0U, std::memory_order_release);
-    slot1.free_epoch.store(1U, std::memory_order_release);
-    slot0.ready_workers.store(0U, std::memory_order_release);
-    slot1.ready_workers.store(0U, std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> state_lock(slot0.state_mutex);
+      slot0.free_epoch = 0U;
+      slot0.ready_workers = 0U;
+    }
+    {
+      std::lock_guard<std::mutex> state_lock(slot1.state_mutex);
+      slot1.free_epoch = 1U;
+      slot1.ready_workers = 0U;
+    }
     const std::size_t workers = openmp_thread_count_ > 1U
         ? openmp_thread_count_ - 1U : 0U;
     std::atomic<bool> failed{false};
@@ -343,7 +349,7 @@ struct CpuUrmaTransport::Impl {
           {
             std::unique_lock<std::mutex> state_lock(slot.state_mutex);
             slot.state_cv.wait(state_lock, [&] {
-              return slot.ready_workers.load(std::memory_order_acquire) >= workers ||
+              return slot.ready_workers >= workers ||
                      failed.load(std::memory_order_acquire);
             });
           }
@@ -385,10 +391,10 @@ struct CpuUrmaTransport::Impl {
             }
             if (wave + 1U < waves) {
               ResizePipelineSlot(plan, old, (wave + 1U) * chunk_size);
-              old.ready_workers.store(0U, std::memory_order_release);
               {
                 std::lock_guard<std::mutex> state_lock(old.state_mutex);
-                old.free_epoch.store(wave + 1U, std::memory_order_release);
+                old.ready_workers = 0U;
+                old.free_epoch = wave + 1U;
               }
               old.state_cv.notify_all();
             }
@@ -411,9 +417,12 @@ struct CpuUrmaTransport::Impl {
         const std::size_t worker = static_cast<std::size_t>(tid - 1);
         for (std::size_t wave = 0U; wave < waves; ++wave) {
           PipelineSlot& slot = (wave & 1U) == 0U ? slot0 : slot1;
-          while (slot.free_epoch.load(std::memory_order_acquire) != wave) {
-            if (failed.load(std::memory_order_acquire)) break;
-            std::this_thread::yield();
+          {
+            std::unique_lock<std::mutex> state_lock(slot.state_mutex);
+            slot.state_cv.wait(state_lock, [&] {
+              return slot.free_epoch == wave ||
+                     failed.load(std::memory_order_acquire);
+            });
           }
           if (failed.load(std::memory_order_acquire)) break;
           const std::size_t begin = wave * chunk_size;
@@ -427,7 +436,10 @@ struct CpuUrmaTransport::Impl {
                                    global_index, wave);
             }
           }
-          slot.ready_workers.fetch_add(1U, std::memory_order_release);
+          {
+            std::lock_guard<std::mutex> state_lock(slot.state_mutex);
+            ++slot.ready_workers;
+          }
           slot.state_cv.notify_one();
           if (failed.load(std::memory_order_acquire)) break;
         }
@@ -494,6 +506,7 @@ struct CpuUrmaTransport::Impl {
     // dynamic teams so the requested team size is honored and the producer
     // completion counters cannot wait for threads that were never created.
     omp_set_dynamic(0);
+    omp_set_num_threads(static_cast<int>(options.omp_thread_count));
     // URMA is process-wide.  The ACL/HBM runtime may have initialized it
     // before this transport is constructed, in which case liburma returns
     // EEXIST and the existing instance must be reused.  Only the caller that
@@ -758,7 +771,7 @@ struct CpuUrmaTransport::Impl {
     jfr_ = jfrs_[0];
     local_jetty_ = local_jettys_[0];
     remote_jetty_ = remote_jettys_[0];
-    openmp_thread_count_ = options.omp_thread_count;
+    openmp_thread_count_ = static_cast<std::uint32_t>(omp_get_max_threads());
     wqes_per_doorbell_ = options.wqes_per_doorbell;
     std::fprintf(stderr, "[KVAF_CPU_URMA] JETTYS_READY count=%zu omp_threads=%u wqes_per_doorbell=%zu depth=%u\n",
                  local_jettys_.size(), openmp_thread_count_,
