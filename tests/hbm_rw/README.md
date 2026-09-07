@@ -93,10 +93,13 @@ tests/run_hbm_rw_client.sh <npu-host> 29888 \
   --iterations 10 --warmup 1
 ```
 
-`--doorbell-wqes N` optionally splits each Jetty list into groups of `N` WRs.
-Zero, the default, submits one linked list per Jetty. This is an API-level
-approximation: `urma_post_jetty_send_wr` may coalesce or implement doorbells
-internally.
+`--doorbell-wqes N` controls the streaming wave size for each Jetty. For
+non-zero `N`, OpenMP prepares one `N`-WR wave per Jetty and the master thread
+immediately posts that wave before the next wave is prepared. Zero, the
+default, uses the baseline that prepares the complete Jetty list before
+submitting it once. This is an API-level approximation: the provider may
+coalesce or implement doorbells internally. With four Jettys and `N=32`, one
+wave prepares up to 128 WRs and then performs four 32-WR submissions.
 
 For example:
 

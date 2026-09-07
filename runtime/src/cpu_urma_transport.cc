@@ -81,68 +81,125 @@ struct CpuUrmaTransport::Impl {
     std::chrono::steady_clock::time_point deadline{};
   };
 
+  void PrepareBatchEntry(BatchJob& job, std::size_t index) {
+    const std::size_t jetty = index % local_jettys_.size();
+    const std::size_t position = index / local_jettys_.size();
+    BatchQueue& queue = job.queues[jetty];
+    const auto& buffer = job.buffers[index];
+    urma_target_seg_t* host_segment = job.single_host_segment != nullptr
+        ? job.single_host_segment : job.host_segments[index];
+    queue.local[position] = {
+        reinterpret_cast<std::uint64_t>(buffer.data),
+        static_cast<std::uint32_t>(buffer.bytes), host_segment};
+    queue.remote[position] = {
+        remote_region_.base + job.remote_offsets[index],
+        static_cast<std::uint32_t>(buffer.bytes), remote_seg_handle_};
+    queue.wrs[position] = {};
+    queue.wrs[position].opcode = job.write ? URMA_OPC_WRITE : URMA_OPC_READ;
+    queue.wrs[position].flag.bs.complete_enable =
+        (position + 1U == queue.wrs.size()) ? 1U : 0U;
+    queue.wrs[position].tjetty = remote_jettys_[jetty];
+    queue.wrs[position].user_ctx =
+        0xBA7C0000ULL + (static_cast<std::uint64_t>(jetty) << 32U) + position;
+    if (job.write) {
+      queue.wrs[position].rw.src = {&queue.local[position], 1U};
+      queue.wrs[position].rw.dst = {&queue.remote[position], 1U};
+    } else {
+      queue.wrs[position].rw.src = {&queue.remote[position], 1U};
+      queue.wrs[position].rw.dst = {&queue.local[position], 1U};
+    }
+    queue.wrs[position].next =
+        position + 1U < queue.wrs.size() ? &queue.wrs[position + 1U] : nullptr;
+  }
+
   void PrepareBatch(BatchJob& job) {
 #pragma omp parallel for schedule(static) num_threads(openmp_thread_count_)
     for (std::int64_t request = 0; request < static_cast<std::int64_t>(job.count); ++request) {
-      const std::size_t index = static_cast<std::size_t>(request);
-      const std::size_t jetty = index % local_jettys_.size();
-      const std::size_t position = index / local_jettys_.size();
-      BatchQueue& queue = job.queues[jetty];
-      const auto& buffer = job.buffers[index];
-      urma_target_seg_t* host_segment = job.single_host_segment != nullptr
-          ? job.single_host_segment : job.host_segments[index];
-      queue.local[position] = {
-          reinterpret_cast<std::uint64_t>(buffer.data),
-          static_cast<std::uint32_t>(buffer.bytes), host_segment};
-      queue.remote[position] = {
-          remote_region_.base + job.remote_offsets[index],
-          static_cast<std::uint32_t>(buffer.bytes), remote_seg_handle_};
-      queue.wrs[position] = {};
-      queue.wrs[position].opcode = job.write ? URMA_OPC_WRITE : URMA_OPC_READ;
-      queue.wrs[position].flag.bs.complete_enable =
-          (position + 1U == queue.wrs.size()) ? 1U : 0U;
-      queue.wrs[position].tjetty = remote_jettys_[jetty];
-      queue.wrs[position].user_ctx =
-          0xBA7C0000ULL + (static_cast<std::uint64_t>(jetty) << 32U) + position;
-      if (job.write) {
-        queue.wrs[position].rw.src = {&queue.local[position], 1U};
-        queue.wrs[position].rw.dst = {&queue.remote[position], 1U};
-      } else {
-        queue.wrs[position].rw.src = {&queue.remote[position], 1U};
-        queue.wrs[position].rw.dst = {&queue.local[position], 1U};
-      }
-      queue.wrs[position].next =
-          position + 1U < queue.wrs.size() ? &queue.wrs[position + 1U] : nullptr;
+      PrepareBatchEntry(job, static_cast<std::size_t>(request));
     }
   }
 
-  std::string PostBatch(BatchJob& job) {
+  std::string PostBatchChunk(BatchJob& job, std::size_t begin,
+                             std::size_t chunk_size) {
     for (std::size_t jetty = 0U; jetty < local_jettys_.size(); ++jetty) {
       BatchQueue& queue = job.queues[jetty];
-      if (queue.wrs.empty()) continue;
-      const std::size_t post_count = wqes_per_doorbell_ == 0U
-          ? queue.wrs.size() : static_cast<std::size_t>(wqes_per_doorbell_);
-      for (std::size_t begin = 0U; begin < queue.wrs.size(); begin += post_count) {
-        const std::size_t end = std::min(begin + post_count, queue.wrs.size());
-        // URMA follows next pointers, so terminate this chunk before posting.
-        // The next batch rebuilds the links; no provider-visible state depends
-        // on the host-side next pointer after the call returns.
-        queue.wrs[end - 1U].next = nullptr;
-        urma_jfs_wr_t* bad = nullptr;
-        const urma_status_t post_status =
-            urma_post_jetty_send_wr(local_jettys_[jetty], &queue.wrs[begin], &bad);
-        if (post_status != URMA_SUCCESS) {
-          return "batch post failed (jetty=" + std::to_string(jetty) +
-                 ", status=" + std::to_string(static_cast<int>(post_status)) +
-                 ", bad_index=" +
-                 std::to_string(bad == nullptr
-                                    ? end
-                                    : begin + static_cast<std::size_t>(bad - &queue.wrs[begin])) +
-                 ", count=" + std::to_string(queue.wrs.size()) + ")";
-        }
+      if (begin >= queue.wrs.size()) continue;
+      const std::size_t end = std::min(begin + chunk_size, queue.wrs.size());
+      // URMA follows next pointers, so terminate this chunk before posting.
+      // The next batch rebuilds the links; no provider-visible state depends
+      // on the host-side next pointer after the call returns.
+      queue.wrs[end - 1U].next = nullptr;
+      urma_jfs_wr_t* bad = nullptr;
+      const urma_status_t post_status =
+          urma_post_jetty_send_wr(local_jettys_[jetty], &queue.wrs[begin], &bad);
+      if (post_status != URMA_SUCCESS) {
+        return "batch post failed (jetty=" + std::to_string(jetty) +
+               ", status=" + std::to_string(static_cast<int>(post_status)) +
+               ", bad_index=" +
+               std::to_string(bad == nullptr
+                                  ? end
+                                  : begin + static_cast<std::size_t>(bad - &queue.wrs[begin])) +
+               ", count=" + std::to_string(queue.wrs.size()) + ")";
       }
     }
     return {};
+  }
+
+  std::string PostBatch(BatchJob& job) {
+    std::size_t max_queue_size = 0U;
+    for (const auto& queue : job.queues) {
+      max_queue_size = std::max(max_queue_size, queue.wrs.size());
+    }
+    return PostBatchChunk(job, 0U, max_queue_size);
+  }
+
+  std::string PrepareAndPostStreaming(BatchJob& job,
+                                      std::uint64_t* prepare_ns,
+                                      std::uint64_t* post_ns) {
+    const std::size_t chunk_size = wqes_per_doorbell_;
+    const std::size_t jetty_count = local_jettys_.size();
+    std::size_t max_queue_size = 0U;
+    for (const auto& queue : job.queues) {
+      max_queue_size = std::max(max_queue_size, queue.wrs.size());
+    }
+    std::string post_error;
+    std::uint64_t accumulated_prepare_ns = 0U;
+    std::uint64_t accumulated_post_ns = 0U;
+    auto prepare_start = std::chrono::steady_clock::now();
+#pragma omp parallel num_threads(openmp_thread_count_)
+    {
+      for (std::size_t begin = 0U; begin < max_queue_size; begin += chunk_size) {
+        const std::size_t entries = jetty_count * chunk_size;
+#pragma omp for schedule(static)
+        for (std::int64_t flat = 0; flat < static_cast<std::int64_t>(entries); ++flat) {
+          const std::size_t flat_index = static_cast<std::size_t>(flat);
+          const std::size_t jetty = flat_index / chunk_size;
+          const std::size_t position = begin + flat_index % chunk_size;
+          if (position >= job.queues[jetty].wrs.size()) continue;
+          const std::size_t request = position * jetty_count + jetty;
+          PrepareBatchEntry(job, request);
+        }
+#pragma omp master
+        {
+          const auto prepare_end = std::chrono::steady_clock::now();
+          accumulated_prepare_ns += static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  prepare_end - prepare_start).count());
+          if (post_error.empty()) {
+            const auto post_start = prepare_end;
+            post_error = PostBatchChunk(job, begin, chunk_size);
+            accumulated_post_ns += static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - post_start).count());
+          }
+          prepare_start = std::chrono::steady_clock::now();
+        }
+#pragma omp barrier
+      }
+    }
+    *prepare_ns = accumulated_prepare_ns;
+    *post_ns = accumulated_post_ns;
+    return post_error;
   }
 
   std::string PollBatch(BatchJob& job) {
@@ -807,19 +864,31 @@ struct CpuUrmaTransport::Impl {
     }
 
     job.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    const auto prepare_start = std::chrono::steady_clock::now();
-    PrepareBatch(job);
-    const auto prepare_end = std::chrono::steady_clock::now();
-    const auto post_start = prepare_end;
-    const std::string post_error = PostBatch(job);
-    const auto post_end = std::chrono::steady_clock::now();
-    const auto poll_start = post_end;
+    std::uint64_t prepare_ns = 0U;
+    std::uint64_t post_ns = 0U;
+    std::string post_error;
+    if (wqes_per_doorbell_ != 0U) {
+      // Streaming mode prepares one doorbell-sized wave and submits it before
+      // preparing the next wave. The single OpenMP master thread is the only
+      // caller of liburma; worker threads only write disjoint WR/SGE entries.
+      post_error = PrepareAndPostStreaming(job, &prepare_ns, &post_ns);
+    } else {
+      const auto prepare_start = std::chrono::steady_clock::now();
+      PrepareBatch(job);
+      const auto prepare_end = std::chrono::steady_clock::now();
+      const auto post_start = prepare_end;
+      post_error = PostBatch(job);
+      const auto post_end = std::chrono::steady_clock::now();
+      prepare_ns = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(prepare_end - prepare_start).count());
+      post_ns = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(post_end - post_start).count());
+    }
+    const auto poll_start = std::chrono::steady_clock::now();
     const std::string poll_error = post_error.empty() ? PollBatch(job) : post_error;
     const auto poll_end = std::chrono::steady_clock::now();
-    last_batch_timing_.prepare_ns = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(prepare_end - prepare_start).count());
-    last_batch_timing_.post_ns = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(post_end - post_start).count());
+    last_batch_timing_.prepare_ns = prepare_ns;
+    last_batch_timing_.post_ns = post_ns;
     last_batch_timing_.poll_ns = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(poll_end - poll_start).count());
     const std::string transport_error = post_error.empty() ? poll_error : post_error;

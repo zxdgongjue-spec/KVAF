@@ -42,8 +42,9 @@ struct CpuUrmaTransportOptions {
   // Number of OpenMP threads used to prepare WR/SGE entries. URMA submission
   // and CQ polling stay on the calling thread.
   std::uint32_t omp_thread_count{1};
-  // Number of WRs submitted per urma_post_jetty_send_wr call. Zero keeps one
-  // linked-list submission per Jetty.
+  // Streaming wave size and number of WRs submitted per
+  // urma_post_jetty_send_wr call. Zero prepares and submits one full linked
+  // list per Jetty.
   std::uint32_t wqes_per_doorbell{0};
   bool has_external_region{false};
   peer::PeerRegion external_region{};
