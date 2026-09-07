@@ -44,6 +44,35 @@ cd /path/to/kvaf
   --listen 0.0.0.0 --port 28999
 ```
 
+CPU DDR region 支持三种页分配模式，通过 CPU 服务启动参数选择：
+
+```bash
+# 保留原行为：4 KiB 对齐的普通匿名内存；操作系统仍可能自行使用 THP。
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28999 --memory-page-mode default
+
+# 2 MiB 对齐，MADV_HUGEPAGE，并在注册前主动触页；是否全部合并仍由 Linux THP 决定。
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28999 --memory-page-mode thp
+
+# 显式从预留的 2 MiB hugetlb 池分配；region 字节数必须是 2 MiB 的整数倍。
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28999 --memory-page-mode hugetlb-2m
+```
+
+`hugetlb-2m` 不会在失败时静默回退。启动服务前必须在目标 NUMA node
+预留足够的 2 MiB hugepages；例如默认 2 GiB region 至少需要 1024 页：
+
+```bash
+grep -E 'HugePages|Hugepagesize' /proc/meminfo
+sudo sysctl -w vm.nr_hugepages=1100
+```
+
+需要固定 NUMA 位置时，应在 UB device 所在 node 启动服务，例如
+`numactl --cpunodebind=N --membind=N ...`。`REGION_ALLOCATED` 日志会记录
+`page_mode`。THP 模式还应通过 `/proc/<pid>/smaps` 的 `AnonHugePages` 验证实际
+合并量；Linux 使用大页并不保证 UDMA/IOMMU 一定保留相同的页表粒度。
+
 默认自动枚举所有可用 UMDK UB device/EID；`--ub-device NAME` 和
 `--eid-index N` 仅用于诊断。CPU 端可同时保持多个 NPU session，NPU 正常
 `shutdown` 后会释放对应 DDR、segment、token 与 Jetty。

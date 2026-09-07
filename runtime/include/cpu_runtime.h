@@ -8,10 +8,17 @@
 
 namespace kvaf {
 
+enum class CpuMemoryPageMode {
+  kDefault,
+  kTransparentHugePage,
+  kHugeTlb2M,
+};
+
 struct CpuRuntimeOptions {
   std::string ub_device;
   bool has_eid_index{false};
   std::uint32_t eid_index{0};
+  CpuMemoryPageMode memory_page_mode{CpuMemoryPageMode::kDefault};
 };
 
 // CPU endpoint Runtime. It owns only CPU-side UMDK resources and sessions;
