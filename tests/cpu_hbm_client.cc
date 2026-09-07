@@ -136,6 +136,10 @@ struct Stats {
   std::uint64_t min_ns{std::numeric_limits<std::uint64_t>::max()};
   std::uint64_t max_ns{0};
   std::uint64_t wall_ns{0};
+  std::uint64_t prepare_ns{0};
+  std::uint64_t post_ns{0};
+  std::uint64_t poll_ns{0};
+  std::uint64_t phase_samples{0};
 };
 
 struct HostBlock {
@@ -175,6 +179,7 @@ bool RunPass(kvaf::CpuUrmaTransport* transport, bool write,
                    write ? "WRITE" : "READ", requests.size(), status.message().c_str());
       return false;
     }
+    const auto timing = transport->last_batch_timing();
     const auto elapsed = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - start).count());
@@ -185,6 +190,10 @@ bool RunPass(kvaf::CpuUrmaTransport* transport, bool write,
     stats->sum_ns += elapsed;
     stats->min_ns = std::min(stats->min_ns, elapsed);
     stats->max_ns = std::max(stats->max_ns, elapsed);
+    stats->prepare_ns += timing.prepare_ns;
+    stats->post_ns += timing.post_ns;
+    stats->poll_ns += timing.poll_ns;
+    ++stats->phase_samples;
   }
   stats->wall_ns = static_cast<std::uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -248,6 +257,14 @@ void PrintStats(const char* name, const Stats& stats) {
               static_cast<unsigned long long>(stats.wrs),
               static_cast<unsigned long long>(stats.batches), bandwidth, average / 1000.0,
               stats.min_ns / 1000.0, stats.max_ns / 1000.0);
+  if (stats.phase_samples != 0U) {
+    const double samples = static_cast<double>(stats.phase_samples);
+    std::printf("[HBM_TEST][CPU] %-5s_PHASE avg_prepare=%.3f us avg_post=%.3f us "
+                "avg_poll=%.3f us\n",
+                name, stats.prepare_ns / samples / 1000.0,
+                stats.post_ns / samples / 1000.0,
+                stats.poll_ns / samples / 1000.0);
+  }
 }
 
 }  // namespace

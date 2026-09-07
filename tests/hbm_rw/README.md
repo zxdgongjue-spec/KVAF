@@ -64,6 +64,12 @@ registration, import, connection setup, and warmup are excluded. This is the
 achieved CPU-initiated URMA payload rate, not raw HBM silicon bandwidth; with
 656-byte messages it includes per-WR protocol and CQ overhead.
 
+Per-batch transport logs are disabled so terminal I/O does not distort the
+measurement. For the single-SGE OpenMP batch path, the final summary also
+reports average `prepare`, `post`, and `poll` time. The explicitly registered
+host address space is cached as one URMA segment, so batch transfers reuse its
+`tseg` directly instead of searching the registration list for every block.
+
 The test accepts explicit EIDs for diagnostics, but the default path follows
 the pair-info local/remote EID rule used by the H2D script.
 

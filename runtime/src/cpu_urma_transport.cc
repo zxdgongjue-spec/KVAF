@@ -75,9 +75,9 @@ struct CpuUrmaTransport::Impl {
     std::vector<BatchQueue> queues;
     const CpuUrmaTransport::HostSge* buffers{nullptr};
     std::size_t count{0U};
+    urma_target_seg_t* single_host_segment{nullptr};
     std::vector<std::uint64_t> remote_offsets;
     std::vector<urma_target_seg_t*> host_segments;
-    std::chrono::steady_clock::time_point start{};
     std::chrono::steady_clock::time_point deadline{};
   };
 
@@ -89,9 +89,11 @@ struct CpuUrmaTransport::Impl {
       const std::size_t position = index / local_jettys_.size();
       BatchQueue& queue = job.queues[jetty];
       const auto& buffer = job.buffers[index];
+      urma_target_seg_t* host_segment = job.single_host_segment != nullptr
+          ? job.single_host_segment : job.host_segments[index];
       queue.local[position] = {
           reinterpret_cast<std::uint64_t>(buffer.data),
-          static_cast<std::uint32_t>(buffer.bytes), job.host_segments[index]};
+          static_cast<std::uint32_t>(buffer.bytes), host_segment};
       queue.remote[position] = {
           remote_region_.base + job.remote_offsets[index],
           static_cast<std::uint32_t>(buffer.bytes), remote_seg_handle_};
@@ -114,7 +116,7 @@ struct CpuUrmaTransport::Impl {
     }
   }
 
-  std::string PostAndPollBatch(BatchJob& job) {
+  std::string PostBatch(BatchJob& job) {
     for (std::size_t jetty = 0U; jetty < local_jettys_.size(); ++jetty) {
       BatchQueue& queue = job.queues[jetty];
       if (queue.wrs.empty()) continue;
@@ -140,6 +142,10 @@ struct CpuUrmaTransport::Impl {
         }
       }
     }
+    return {};
+  }
+
+  std::string PollBatch(BatchJob& job) {
     // Post every queue before draining one fence CQE from each used queue.
     for (std::size_t jetty = 0U; jetty < local_jettys_.size(); ++jetty) {
       BatchQueue& queue = job.queues[jetty];
@@ -548,8 +554,10 @@ struct CpuUrmaTransport::Impl {
   }
 
   Status RegisterDirectHostMemory(void* base, std::size_t bytes) {
-    RegisteredHostBuffer* ignored = nullptr;
-    return RegisterHostBuffer(base, bytes, &ignored);
+    RegisteredHostBuffer* host = nullptr;
+    Status status = RegisterHostBuffer(base, bytes, &host);
+    if (status.ok()) explicit_host_region_ = *host;
+    return status;
   }
 
   Status TransferSgl(bool write, std::uint64_t offset,
@@ -755,8 +763,8 @@ struct CpuUrmaTransport::Impl {
     job.buffers = buffers;
     job.count = count;
     job.remote_offsets.resize(count);
-    job.host_segments.resize(count);
     job.queues.resize(jetty_count);
+    job.single_host_segment = nullptr;
     for (std::size_t jetty = 0U; jetty < jetty_count; ++jetty) {
       job.queues[jetty].local.resize(queue_counts[jetty]);
       job.queues[jetty].remote.resize(queue_counts[jetty]);
@@ -764,6 +772,7 @@ struct CpuUrmaTransport::Impl {
     }
 
     std::uint64_t total = 0U;
+    bool use_explicit_host_region = explicit_host_region_.segment != nullptr;
     for (std::size_t i = 0; i < count; ++i) {
       if (buffers[i].data == nullptr || buffers[i].bytes == 0U ||
           buffers[i].bytes > std::numeric_limits<std::uint32_t>::max() ||
@@ -771,31 +780,50 @@ struct CpuUrmaTransport::Impl {
           buffers[i].bytes > remote_region_.length - offset - total) {
         return Status::InvalidArgument("invalid batch entry");
       }
-      RegisteredHostBuffer* host = FindRegisteredHostBuffer(buffers[i].data, buffers[i].bytes);
-      if (host == nullptr) {
-        Status status = RegisterHostBuffer(buffers[i].data, buffers[i].bytes, &host);
-        if (!status.ok()) return status;
+      if (use_explicit_host_region) {
+        const auto& host = explicit_host_region_;
+        const auto requested = reinterpret_cast<std::uintptr_t>(buffers[i].data);
+        const auto base = reinterpret_cast<std::uintptr_t>(host.address);
+        if (requested < base || buffers[i].bytes > host.bytes ||
+            requested - base > host.bytes - buffers[i].bytes) {
+          use_explicit_host_region = false;
+        }
       }
       job.remote_offsets[i] = offset + total;
-      job.host_segments[i] = host->segment;
       total += buffers[i].bytes;
     }
+    if (use_explicit_host_region) {
+      job.single_host_segment = explicit_host_region_.segment;
+    } else {
+      job.host_segments.resize(count);
+      for (std::size_t i = 0; i < count; ++i) {
+        RegisteredHostBuffer* host = FindRegisteredHostBuffer(buffers[i].data, buffers[i].bytes);
+        if (host == nullptr) {
+          Status status = RegisterHostBuffer(buffers[i].data, buffers[i].bytes, &host);
+          if (!status.ok()) return status;
+        }
+        job.host_segments[i] = host->segment;
+      }
+    }
 
-    job.start = std::chrono::steady_clock::now();
-    job.deadline = job.start + std::chrono::seconds(5);
-    std::fprintf(stderr, "[KVAF_CPU_URMA] BATCH_POST wrs=%zu jettys=%zu omp_threads=%u bytes=%llu\n",
-                 count, jetty_count, openmp_thread_count_,
-                 static_cast<unsigned long long>(total));
+    job.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const auto prepare_start = std::chrono::steady_clock::now();
     PrepareBatch(job);
-    const std::string transport_error = PostAndPollBatch(job);
+    const auto prepare_end = std::chrono::steady_clock::now();
+    const auto post_start = prepare_end;
+    const std::string post_error = PostBatch(job);
+    const auto post_end = std::chrono::steady_clock::now();
+    const auto poll_start = post_end;
+    const std::string poll_error = post_error.empty() ? PollBatch(job) : post_error;
+    const auto poll_end = std::chrono::steady_clock::now();
+    last_batch_timing_.prepare_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(prepare_end - prepare_start).count());
+    last_batch_timing_.post_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(post_end - post_start).count());
+    last_batch_timing_.poll_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(poll_end - poll_start).count());
+    const std::string transport_error = post_error.empty() ? poll_error : post_error;
     if (!transport_error.empty()) return Status::Internal(transport_error);
-    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now() - job.start).count();
-    std::fprintf(stderr,
-                 "[KVAF_CPU_URMA] BATCH_COMPLETE wrs=%zu jettys=%zu omp_threads=%u bytes=%llu elapsed_ns=%lld\n",
-                 count, jetty_count, openmp_thread_count_,
-                 static_cast<unsigned long long>(total),
-                 static_cast<long long>(elapsed));
     return Status::OK();
   }
 
@@ -926,6 +954,7 @@ struct CpuUrmaTransport::Impl {
       if (entry.token_id != nullptr) (void)urma_free_token_id(entry.token_id);
     }
     direct_host_buffers_.clear();
+    explicit_host_region_ = {};
     if (owns_remote_region_ && link_ != nullptr && remote_region_.base != 0) {
       if (remote_region_.device_memory) (void)link_->ReleaseHbmRegion(remote_region_.session_id);
       else (void)link_->ReleaseRegion(remote_region_.base);
@@ -969,11 +998,13 @@ struct CpuUrmaTransport::Impl {
   BatchJob batch_workspace_;
   std::uint32_t openmp_thread_count_{1U};
   std::size_t wqes_per_doorbell_{0U};
+  CpuUrmaTransport::BatchTiming last_batch_timing_{};
   bool urma_initialized_{false};
   bool urma_owned_{false};
   bool initialized_{false};
   bool owns_remote_region_{false};
   std::vector<RegisteredHostBuffer> direct_host_buffers_;
+  RegisteredHostBuffer explicit_host_region_{};
   GetTpList get_tp_list_{nullptr};
   ImportJettyEx import_jetty_ex_{nullptr};
 };
@@ -1014,5 +1045,8 @@ Status CpuUrmaTransport::Shutdown() { return impl_->Shutdown(); }
 bool CpuUrmaTransport::initialized() const { return impl_->initialized_; }
 std::uint64_t CpuUrmaTransport::region_bytes() const { return impl_->remote_region_.length; }
 std::uint32_t CpuUrmaTransport::max_sge() const { return impl_->max_sge_; }
+CpuUrmaTransport::BatchTiming CpuUrmaTransport::last_batch_timing() const {
+  return impl_->last_batch_timing_;
+}
 
 }  // namespace kvaf

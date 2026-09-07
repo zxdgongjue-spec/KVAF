@@ -51,6 +51,12 @@ struct CpuUrmaTransportOptions {
 
 class CpuUrmaTransport final {
  public:
+  struct BatchTiming {
+    std::uint64_t prepare_ns{0};
+    std::uint64_t post_ns{0};
+    std::uint64_t poll_ns{0};
+  };
+
   CpuUrmaTransport();
   ~CpuUrmaTransport();
 
@@ -88,6 +94,7 @@ class CpuUrmaTransport final {
   bool initialized() const;
   std::uint64_t region_bytes() const;
   std::uint32_t max_sge() const;
+  BatchTiming last_batch_timing() const;
 
  private:
   struct Impl;
