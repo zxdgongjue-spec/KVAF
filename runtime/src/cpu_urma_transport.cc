@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -91,6 +92,8 @@ struct CpuUrmaTransport::Impl {
     std::vector<std::uint64_t> expected_ctx;
     std::atomic<std::size_t> ready_workers{0U};
     std::atomic<std::size_t> free_epoch{0U};
+    std::mutex state_mutex;
+    std::condition_variable state_cv;
   };
 
   void PrepareBatchEntry(BatchJob& job, std::size_t index) {
@@ -337,9 +340,12 @@ struct CpuUrmaTransport::Impl {
         for (std::size_t wave = 0U; wave < waves && !failed.load(); ++wave) {
           PipelineSlot& slot = (wave & 1U) == 0U ? slot0 : slot1;
           const auto prepare_start = std::chrono::steady_clock::now();
-          while (slot.ready_workers.load(std::memory_order_acquire) < workers) {
-            if (failed.load(std::memory_order_acquire)) break;
-            std::this_thread::yield();
+          {
+            std::unique_lock<std::mutex> state_lock(slot.state_mutex);
+            slot.state_cv.wait(state_lock, [&] {
+              return slot.ready_workers.load(std::memory_order_acquire) >= workers ||
+                     failed.load(std::memory_order_acquire);
+            });
           }
           prepare_total += static_cast<std::uint64_t>(
               std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -360,6 +366,8 @@ struct CpuUrmaTransport::Impl {
                   std::chrono::steady_clock::now() - post_start).count());
           if (!error.empty()) {
             failed.store(true, std::memory_order_release);
+            slot0.state_cv.notify_all();
+            slot1.state_cv.notify_all();
             break;
           }
           if (wave > 0U) {
@@ -371,12 +379,18 @@ struct CpuUrmaTransport::Impl {
                     std::chrono::steady_clock::now() - poll_start).count());
             if (!error.empty()) {
               failed.store(true, std::memory_order_release);
+              slot0.state_cv.notify_all();
+              slot1.state_cv.notify_all();
               break;
             }
             if (wave + 1U < waves) {
               ResizePipelineSlot(plan, old, (wave + 1U) * chunk_size);
               old.ready_workers.store(0U, std::memory_order_release);
-              old.free_epoch.store(wave + 1U, std::memory_order_release);
+              {
+                std::lock_guard<std::mutex> state_lock(old.state_mutex);
+                old.free_epoch.store(wave + 1U, std::memory_order_release);
+              }
+              old.state_cv.notify_all();
             }
           }
         }
@@ -387,7 +401,11 @@ struct CpuUrmaTransport::Impl {
           poll_total += static_cast<std::uint64_t>(
               std::chrono::duration_cast<std::chrono::nanoseconds>(
                   std::chrono::steady_clock::now() - poll_start).count());
-          if (!error.empty()) failed.store(true, std::memory_order_release);
+          if (!error.empty()) {
+            failed.store(true, std::memory_order_release);
+            slot0.state_cv.notify_all();
+            slot1.state_cv.notify_all();
+          }
         }
       } else {
         const std::size_t worker = static_cast<std::size_t>(tid - 1);
@@ -410,6 +428,7 @@ struct CpuUrmaTransport::Impl {
             }
           }
           slot.ready_workers.fetch_add(1U, std::memory_order_release);
+          slot.state_cv.notify_one();
           if (failed.load(std::memory_order_acquire)) break;
         }
       }
