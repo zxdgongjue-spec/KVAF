@@ -61,6 +61,7 @@ template <typename T> struct GlobalTensor {
   T *ptr = nullptr;
   void SetGlobalBuffer(T *value) { ptr = value; }
   T GetValue(uint64_t offset) const { return ptr[offset]; }
+  T *GetPhyAddr() const { return ptr; }
   void SetValue(uint64_t offset, T value) { ptr[offset] = value; }
   GlobalTensor operator[](uint64_t offset) const { return {ptr + offset}; }
 };
