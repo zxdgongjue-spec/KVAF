@@ -45,8 +45,15 @@ using kvaf::peer::kEidBytes;
 using kvaf::peer::kQpKeyBytes;
 using kvaf::peer::kSegKeyBytes;
 
-constexpr uint32_t kJettyDepth = 8192U;
-constexpr uint32_t kJfcDepth = 16384U;
+// Match the Host STANDARD Jetty profile used by the legacy in-process HCCP
+// transport. Keep the send and receive depths separate: the old QP used an
+// 8192-entry SQ but only a 256-entry RQ.
+constexpr uint32_t kHostJfsDepth = 8192U;
+constexpr uint32_t kHostJfrDepth = 256U;
+constexpr uint32_t kHostJfcDepth = 16384U;
+constexpr uint8_t kHostJettyPriority = 2U;
+constexpr uint8_t kHostJettyRnrRetry = 7U;
+constexpr uint8_t kHostJettyErrTimeout = 16U;
 constexpr uint32_t kJettyKeyBytes = sizeof(urma_jetty_id_t) + sizeof(urma_transport_mode_t);
 // HCCP reports the NPU's USER_CTL Jetty key as a 32-byte record on the
 // deployed CANN release.  Its first 28 bytes are the public UMDK Jetty id
@@ -580,11 +587,15 @@ class CpuService {
     response->peer_psn = cpu_psn;
     region.channels.push_back(channel);
     Log("[KVAF_CPU] CHANNEL_JFC_READY session=%" PRIu64 " jfc_id=%u depth=%u\n",
-        region.id, channel.local_jfc->jfc_id.id, kJfcDepth);
+        region.id, channel.local_jfc->jfc_id.id, kHostJfcDepth);
     Log("[KVAF_CPU] CHANNEL_CREATED session=%" PRIu64 " local_jetty=%u remote_jetty=%u cpu_tp=0x%llx "
-        "cpu_psn=0x%x\n",
+        "cpu_psn=0x%x jfs_depth=%u jfr_depth=%u priority=%u rnr_retry=%u "
+        "err_timeout=%u error_suspend=1\n",
         region.id, channel.local_jetty->jetty_id.id, channel.remote_jetty->id.id,
-        static_cast<unsigned long long>(cpu_tp_handle), cpu_psn);
+        static_cast<unsigned long long>(cpu_tp_handle), cpu_psn, kHostJfsDepth,
+        kHostJfrDepth, static_cast<unsigned int>(kHostJettyPriority),
+        static_cast<unsigned int>(kHostJettyRnrRetry),
+        static_cast<unsigned int>(kHostJettyErrTimeout));
     return Result::kOk;
   }
 
@@ -715,20 +726,24 @@ class CpuService {
     *jfr = nullptr;
     *jetty = nullptr;
     urma_jfc_cfg_t jfc_config{};
-    jfc_config.depth = kJfcDepth;
+    jfc_config.depth = kHostJfcDepth;
     *jfc = urma_create_jfc(resources->context(), &jfc_config);
     if (*jfc == nullptr) {
       Log("[KVAF_CPU] urma_create_jfc failed scope=channel depth=%u errno=%d\n",
-          kJfcDepth, errno);
+          kHostJfcDepth, errno);
       return false;
     }
     urma_jfs_cfg_t jfs{};
-    jfs.depth = kJettyDepth;
+    jfs.depth = kHostJfsDepth;
+    jfs.flag.bs.error_suspend = 1U;
     jfs.trans_mode = URMA_TM_RM;
+    jfs.priority = kHostJettyPriority;
     jfs.max_sge = 1U;
+    jfs.rnr_retry = kHostJettyRnrRetry;
+    jfs.err_timeout = kHostJettyErrTimeout;
     jfs.jfc = *jfc;
     urma_jfr_cfg_t jfr_config{};
-    jfr_config.depth = kJettyDepth;
+    jfr_config.depth = kHostJfrDepth;
     jfr_config.trans_mode = URMA_TM_RM;
     jfr_config.max_sge = 1U;
     jfr_config.jfc = *jfc;
@@ -736,7 +751,7 @@ class CpuService {
     jfr_config.flag.bs.tag_matching = URMA_NO_TAG_MATCHING;
     *jfr = urma_create_jfr(resources->context(), &jfr_config);
     if (*jfr == nullptr) {
-      Log("[KVAF_CPU] urma_create_jfr failed depth=%u token=0x%x errno=%d\n", kJettyDepth,
+      Log("[KVAF_CPU] urma_create_jfr failed depth=%u token=0x%x errno=%d\n", kHostJfrDepth,
           token_value, errno);
       (void)urma_delete_jfc(*jfc);
       *jfc = nullptr;
@@ -749,8 +764,8 @@ class CpuService {
     config.shared.jfc = *jfc;
     *jetty = urma_create_jetty(resources->context(), &config);
     if (*jetty == nullptr) {
-      Log("[KVAF_CPU] urma_create_jetty failed depth=%u token=0x%x errno=%d\n", kJettyDepth,
-          token_value, errno);
+      Log("[KVAF_CPU] urma_create_jetty failed jfs_depth=%u jfr_depth=%u token=0x%x errno=%d\n",
+          kHostJfsDepth, kHostJfrDepth, token_value, errno);
       (void)urma_delete_jfr(*jfr);
       *jfr = nullptr;
       (void)urma_delete_jfc(*jfc);
