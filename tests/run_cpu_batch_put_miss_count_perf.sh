@@ -36,7 +36,10 @@ else
   mkdir -p "$KVAF_CPU_BATCH_PUT_SWEEP_LOG_DIR"
 fi
 : "${KVAF_CPU_BATCH_PUT_SWEEP_CSV:=$KVAF_CPU_BATCH_PUT_SWEEP_LOG_DIR/cpu_batch_put_sweep_summary.csv}"
-mkdir -p "$(dirname "$KVAF_CPU_BATCH_PUT_SWEEP_CSV")"
+: "${KVAF_CPU_BATCH_PUT_COMPARISON_CSV:=$KVAF_CPU_BATCH_PUT_SWEEP_LOG_DIR/cpu_batch_put_transport_total.csv}"
+mkdir -p \
+  "$(dirname "$KVAF_CPU_BATCH_PUT_SWEEP_CSV")" \
+  "$(dirname "$KVAF_CPU_BATCH_PUT_COMPARISON_CSV")"
 echo "CPU_BATCH_PUT_SWEEP_LOG_DIR path=$KVAF_CPU_BATCH_PUT_SWEEP_LOG_DIR"
 
 extract_field() {
@@ -63,6 +66,9 @@ extract_result() {
 printf '%s\n' \
   'token_bytes,miss_count,payload_bytes,call_mean_us,call_p50_us,call_p90_us,call_p99_us,total_mean_us,total_p50_us,total_p90_us,total_p99_us,prepare_mean_us,prepare_p50_us,prepare_p90_us,prepare_p99_us,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us,p50_GBps' \
   >"$KVAF_CPU_BATCH_PUT_SWEEP_CSV"
+printf '%s\n' \
+  'token_bytes,miss_count,mean_us,p50_us,p90_us,p99_us,p50_GBps' \
+  >"$KVAF_CPU_BATCH_PUT_COMPARISON_CSV"
 
 for token_bytes in "${KVAF_TOKEN_BYTES[@]}"; do
   echo "CPU_BATCH_PUT_TOKEN_SWEEP_BEGIN token_bytes=$token_bytes"
@@ -122,6 +128,10 @@ for token_bytes in "${KVAF_TOKEN_BYTES[@]}"; do
       "$post_mean_us" "$post_p50_us" "$post_p90_us" "$post_p99_us" \
       "$completion_mean_us" "$completion_p50_us" "$completion_p90_us" \
       "$completion_p99_us" "$p50_gbps" >>"$KVAF_CPU_BATCH_PUT_SWEEP_CSV"
+    printf '%s,%s,%s,%s,%s,%s,%s\n' \
+      "$token_bytes" "$miss_count" "$total_mean_us" "$total_p50_us" \
+      "$total_p90_us" "$total_p99_us" "$p50_gbps" \
+      >>"$KVAF_CPU_BATCH_PUT_COMPARISON_CSV"
     echo "CPU_BATCH_PUT_MISS_SWEEP_RESULT token_bytes=$token_bytes miss_count=$miss_count total_mean_us=$total_mean_us total_p50_us=$total_p50_us prepare_mean_us=$prepare_mean_us post_mean_us=$post_mean_us completion_wait_mean_us=$completion_mean_us p50_GBps=$p50_gbps"
     echo "CPU_BATCH_PUT_MISS_SWEEP_DONE token_bytes=$token_bytes miss_count=$miss_count"
   done
@@ -148,3 +158,4 @@ print_summary transport_prepare 12
 print_summary transport_post 16
 print_summary transport_completion_wait 20
 echo "CPU_BATCH_PUT_SWEEP_CSV_WRITTEN path=$KVAF_CPU_BATCH_PUT_SWEEP_CSV"
+echo "CPU_BATCH_PUT_COMPARISON_CSV_WRITTEN path=$KVAF_CPU_BATCH_PUT_COMPARISON_CSV rows=$(( ${#KVAF_TOKEN_BYTES[@]} * ${#KVAF_MISS_COUNTS[@]} ))"

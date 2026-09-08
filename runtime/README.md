@@ -125,9 +125,23 @@ CPU URMA transport/operator 的源码归属 `access_operator/include/cpu_urma` �
 URMA WQE：
 
 ```bash
+mkdir -p "$PWD/results/cpu_batch_put"
+
+KVAF_CPU_BATCH_PUT_SWEEP_LOG_DIR="$PWD/results/cpu_batch_put" \
 tests/run_cpu_batch_put_miss_count_perf.sh "$PWD/build-cpu" \
-  --request-length 8192 --jettys 4 --omp-threads 8 --doorbell-wqes 32
+  --peer 127.0.0.1:29888 --device-id 3 \
+  --request-length 8192 --jettys 4 --omp-threads 8 --doorbell-wqes 32 \
+  --iterations 1000 --warmup 5
 ```
+
+脚本默认扫描 `token_bytes={128,256,512,656,1024,2048,4096}` 和
+`miss_count={32,64,128,256,512,1024,2048,4096,8192}`，共 63 种组合；因此
+`request_length` 至少要设为 8192。每个组合的原始日志及分阶段详细结果写入上述目录，
+`cpu_batch_put_sweep_summary.csv` 保存 runtime call、transport total、prepare、post 和
+completion wait；`cpu_batch_put_transport_total.csv` 则只保存便于和 AIV 对比的列：
+`token_bytes,miss_count,mean_us,p50_us,p90_us,p99_us,p50_GBps`。这些延迟和吞吐均以
+CPU URMA transport total 为统计口径。可用 `KVAF_CPU_BATCH_PUT_COMPARISON_CSV` 覆盖
+精简 CSV 的输出路径。
 
 `--eid-index` 仅在需要固定候选时指定；默认由 CPU UMDK 和 NPU `pair_info`/RA EID
 列表自动选择。NPU service 的 region/session 表支持同时存在多块 HBM；每块 region
