@@ -1,6 +1,9 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
+#include <mutex>
+#include <vector>
 
 #include "access_operator.h"
 #include "cpu_urma_transport.h"
@@ -25,6 +28,9 @@ class CpuUrmaAccessOperator final : public AccessOperator {
   CpuUrmaTransport transport_;
   std::shared_ptr<peer::PeerLink> link_;
   RemoteRegionDesc region_{};
+  std::mutex batch_mutex_;
+  std::vector<CpuUrmaTransport::HostSge> batch_buffers_;
+  std::vector<std::uint64_t> batch_remote_offsets_;
   bool initialized_{false};
 };
 

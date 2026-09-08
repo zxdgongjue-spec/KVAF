@@ -1,9 +1,9 @@
 #ifndef KVAF_RUNTIME_CPU_URMA_TRANSPORT_H_
 #define KVAF_RUNTIME_CPU_URMA_TRANSPORT_H_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
-#include <array>
 #include <memory>
 #include <string>
 
@@ -74,11 +74,18 @@ class CpuUrmaTransport final {
   // one completion fence per Jetty.
   Status WriteSglBatch(std::uint64_t remote_offset, const HostSge* sources,
                        std::size_t count, std::size_t sgl_size);
+  // Transfers independent remote/local address pairs. Each entry becomes one
+  // WR, allowing Runtime BatchGet/BatchPut to submit non-contiguous addresses
+  // in one operation instead of waiting after every entry.
+  Status WriteBatch(const std::uint64_t* remote_offsets,
+                    const HostSge* sources, std::size_t count);
   // Register one page-aligned host region once. SGL transfers from any
   // sub-range of this region then reuse the same URMA segment.
   Status RegisterDirectHostMemory(void* base, std::size_t bytes);
   Status ReadSglBatch(std::uint64_t remote_offset, const HostSge* destinations,
                       std::size_t count, std::size_t sgl_size);
+  Status ReadBatch(const std::uint64_t* remote_offsets,
+                   const HostSge* destinations, std::size_t count);
   Status Shutdown();
 
   bool initialized() const;

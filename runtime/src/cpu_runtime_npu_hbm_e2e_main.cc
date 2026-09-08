@@ -17,6 +17,9 @@ struct Options {
   std::uint32_t eid_index{0U};
   bool has_eid_index{false};
   std::uint32_t device_id{0U};
+  std::uint32_t jetty_count{1U};
+  std::uint32_t omp_thread_count{1U};
+  std::uint32_t wqes_per_doorbell{0U};
 };
 
 bool ParseU64(const char* text, std::uint64_t* value) {
@@ -38,7 +41,8 @@ bool ParseU32(const char* text, std::uint32_t* value) {
 void Usage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s --peer HOST:PORT [--bytes N] [--slot-size N] "
-               "[--ub-device NAME] [--eid-index N] [--device-id N]\n",
+               "[--ub-device NAME] [--eid-index N] [--device-id N] "
+               "[--jettys N] [--omp-threads N] [--doorbell-wqes N]\n",
                program);
 }
 
@@ -68,12 +72,20 @@ bool Parse(int argc, char** argv, Options* options) {
       options->has_eid_index = true;
     } else if (arg == "--device-id") {
       if (!value(&text) || !ParseU32(text, &options->device_id)) return false;
+    } else if (arg == "--jettys") {
+      if (!value(&text) || !ParseU32(text, &options->jetty_count)) return false;
+    } else if (arg == "--omp-threads") {
+      if (!value(&text) || !ParseU32(text, &options->omp_thread_count)) return false;
+    } else if (arg == "--doorbell-wqes") {
+      if (!value(&text) || !ParseU32(text, &options->wqes_per_doorbell)) return false;
     } else {
       return false;
     }
   }
   return !options->peer.empty() && options->bytes != 0U && options->slot_size != 0U &&
-         options->bytes % options->slot_size == 0U;
+         options->bytes % options->slot_size == 0U &&
+         options->jetty_count != 0U && options->omp_thread_count != 0U &&
+         options->wqes_per_doorbell <= 1024U;
 }
 
 }  // namespace
@@ -95,6 +107,9 @@ int main(int argc, char** argv) {
   client.eid_index = options.eid_index;
   client.has_eid_index = options.has_eid_index;
   client.device_id = options.device_id;
+  client.jetty_count = options.jetty_count;
+  client.omp_thread_count = options.omp_thread_count;
+  client.wqes_per_doorbell = options.wqes_per_doorbell;
   kvaf::Status status = runtime.InitializeClient(client);
   if (!status.ok()) {
     std::fprintf(stderr, "[KVAF_CPU_NPU_E2E] initialize failed: %s\n", status.message().c_str());

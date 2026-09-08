@@ -869,6 +869,9 @@ Status CpuRuntime::InitializeClient(const CpuRuntimeClientOptions& options) {
   transport_options.remote_hbm = true;
   transport_options.remote_device_id = options.device_id;
   transport_options.remote_eid_index = options.has_eid_index ? options.eid_index : UINT32_MAX;
+  transport_options.jetty_count = options.jetty_count;
+  transport_options.omp_thread_count = options.omp_thread_count;
+  transport_options.wqes_per_doorbell = options.wqes_per_doorbell;
   impl->access_operator = std::make_unique<CpuUrmaAccessOperator>(transport_options, impl->peer_link);
   impl->meta_manager = CreateInMemoryMetaManager();
   impl->runtime_core = std::make_unique<RuntimeCore>(*impl->meta_manager, *impl->access_operator,

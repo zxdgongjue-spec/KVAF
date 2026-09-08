@@ -65,6 +65,11 @@ def initialize_runtime(hbm_bytes: int, slot_size: int) -> object:
         device_id=device_id,
         ub_device=ub_device,
         eid_index=eid_index,
+        jetty_count=int(os.environ.get("KVAF_CPU_URMA_JETTYS", "1")),
+        omp_thread_count=int(os.environ.get("KVAF_CPU_URMA_OMP_THREADS", "1")),
+        wqes_per_doorbell=int(
+            os.environ.get("KVAF_CPU_URMA_DOORBELL_WQES", "0")
+        ),
     )
     return runtime
 

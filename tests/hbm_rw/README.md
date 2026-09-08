@@ -78,7 +78,7 @@ independent local JFC/JFR/Jetty/CTP resources. An OpenMP `parallel for` builds
 the disjoint WR/SGE entries, then the calling thread posts every Jetty list and
 polls one final CQE per Jetty. `--omp-threads N` controls only WQE preparation;
 it is independent of `--jettys N` and defaults to 1. The current resource limit
-is 16 CPU Jettys per channel and 1024 requests per logical batch.
+is 16 CPU Jettys per channel and 1024 outstanding WRs per Jetty.
 
 Use `--sgl-size N` to combine `N` blocks into one WR with `N` local SGEs. The
 default `N=1` uses the OpenMP batch path above. Values greater than one use the

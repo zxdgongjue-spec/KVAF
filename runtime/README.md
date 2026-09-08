@@ -98,12 +98,22 @@ CPU 侧可通过 `CpuRuntime::InitializeClient` 建链并使用 `RuntimeCore::Ba
 
 ```bash
 build-cpu/runtime/kvaf_cpu_runtime_npu_hbm_e2e \
-  --peer <npu-host>:28999 --bytes 4096 --slot-size 4096 --device-id 0
+  --peer <npu-host>:28999 --bytes 4096 --slot-size 4096 --device-id 0 \
+  --jettys 2 --omp-threads 2 --doorbell-wqes 32
 ```
+
+CPU operator 会先把 BatchGet/BatchPut 解析为离散的远端 offset 和本地 buffer，
+再用一个 URMA batch 分配给多个 Jetty；每个 Jetty 只在最后一个 strong-order WR
+上请求 CQE。`wqes_per_doorbell > 0` 时，transport 每准备一波就立即提交，让前一波
+传输与后一波 host 侧准备重叠；值为 0 时先准备完整链表再提交。三项默认值仍为
+`jetty_count=1`、`omp_thread_count=1` 和 `wqes_per_doorbell=0`，应根据实际
+`prepare/post/poll` 计时选择配置。
 
 启用 CPU Python binding 后，`kvaf.CpuRuntime` 提供相同的 packed-input、AccessTable、
 `batch_put`/`batch_get` 接口；`tests/python/test_cpu_runtime_npu_hbm.py` 和
-`tests/run_cpu_runtime_npu_hbm_python.sh` 用于硬件联调。
+`tests/run_cpu_runtime_npu_hbm_python.sh` 用于硬件联调。Python 测试通过
+`KVAF_CPU_URMA_JETTYS`、`KVAF_CPU_URMA_OMP_THREADS` 和
+`KVAF_CPU_URMA_DOORBELL_WQES` 设置上述参数。
 
 `--eid-index` 仅在需要固定候选时指定；默认由 CPU UMDK 和 NPU `pair_info`/RA EID
 列表自动选择。NPU service 的 region/session 表支持同时存在多块 HBM；每块 region

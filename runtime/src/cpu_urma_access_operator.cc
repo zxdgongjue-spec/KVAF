@@ -40,9 +40,18 @@ Status CpuUrmaAccessOperator::Shutdown() {
 
 Status CpuUrmaAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& request) {
   if (!initialized_) return Status::NotInitialized("CPU URMA operator is not initialized");
+  std::unique_lock<std::mutex> batch_lock(batch_mutex_);
   if (request.plan == nullptr || request.put_desc == nullptr ||
-      request.plan->lengths.size() != request.put_desc->entries.size())
+      request.plan->lengths.empty() ||
+      request.plan->lengths.size() != request.put_desc->entries.size() ||
+      request.plan->lengths.size() != request.plan->source_indices.size() ||
+      request.plan->lengths.size() != request.plan->offsets.size())
     return Status::InvalidArgument("invalid BatchPut execution plan");
+
+  batch_buffers_.clear();
+  batch_remote_offsets_.clear();
+  batch_buffers_.reserve(request.put_desc->entries.size());
+  batch_remote_offsets_.reserve(request.put_desc->entries.size());
   for (std::size_t i = 0; i < request.put_desc->entries.size(); ++i) {
     const auto& allocation = request.put_desc->entries[i];
     const std::uint32_t source_index = request.plan->source_indices[i];
@@ -57,28 +66,44 @@ Status CpuUrmaAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& request
         bytes > region_.length - (allocation.address - region_.base))
       return Status::InvalidArgument("BatchPut entry is outside its buffer or remote region");
     const auto* data = static_cast<const std::uint8_t*>(source.data) + source_offset;
-    const CpuUrmaTransport::HostSge source_sge{const_cast<std::uint8_t*>(data),
-                                               static_cast<std::size_t>(bytes)};
-    const Status status = transport_.WriteSglBatch(allocation.address - region_.base,
-                                                   &source_sge, 1U, 1U);
-    if (!status.ok()) return status;
+    batch_buffers_.push_back(CpuUrmaTransport::HostSge{
+        const_cast<std::uint8_t*>(data), static_cast<std::size_t>(bytes)});
+    batch_remote_offsets_.push_back(allocation.address - region_.base);
   }
-  return Status::OK();
+  return transport_.WriteBatch(batch_remote_offsets_.data(),
+                               batch_buffers_.data(), batch_buffers_.size());
 }
 
 Status CpuUrmaAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& request) {
   if (!initialized_) return Status::NotInitialized("CPU URMA operator is not initialized");
+  std::unique_lock<std::mutex> batch_lock(batch_mutex_);
   if (request.request == nullptr || request.host_access_table.addresses == nullptr ||
       request.host_access_table.lengths == nullptr || request.host_access_table.valid == nullptr)
     return Status::InvalidArgument("CPU BatchGet requires a host AccessTable");
   const BatchGetRequest& batch = *request.request;
   if (!batch.indices.has_elements<std::int32_t>() || !batch.offsets.has_elements<std::int32_t>() ||
-      !batch.output_indices.has_elements<std::int32_t>() || !batch.output.valid())
+      !batch.output_indices.has_elements<std::int32_t>() || !batch.output.valid() ||
+      batch.indices.bytes != batch.offsets.bytes ||
+      batch.indices.bytes != batch.output_indices.bytes ||
+      batch.output_block_bytes == 0U ||
+      batch.output_block_bytes > std::numeric_limits<std::size_t>::max())
     return Status::InvalidArgument("invalid CPU BatchGet buffers");
+  const std::size_t request_count =
+      batch.indices.bytes / sizeof(std::int32_t);
+  if (!batch.mask.empty() &&
+      (!batch.mask.valid() || batch.mask.bytes != request_count)) {
+    return Status::InvalidArgument("invalid CPU BatchGet mask");
+  }
   const auto* indices = static_cast<const std::int32_t*>(batch.indices.data);
   const auto* offsets = static_cast<const std::int32_t*>(batch.offsets.data);
   const auto* output_indices = static_cast<const std::int32_t*>(batch.output_indices.data);
-  for (std::size_t i = 0; i < batch.indices.bytes / sizeof(std::int32_t); ++i) {
+  const auto* mask = static_cast<const std::uint8_t*>(batch.mask.data);
+  batch_buffers_.clear();
+  batch_remote_offsets_.clear();
+  batch_buffers_.reserve(request_count);
+  batch_remote_offsets_.reserve(request_count);
+  for (std::size_t i = 0; i < request_count; ++i) {
+    if (mask != nullptr && mask[i] == 0U) continue;
     const std::int32_t index = indices[i];
     const std::int32_t offset = offsets[i];
     const std::int32_t output_index = output_indices[i];
@@ -90,9 +115,11 @@ Status CpuUrmaAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& request
         batch.output_block_bytes == 0U ||
         batch.output_block_bytes > length - static_cast<std::uint64_t>(offset))
       return Status::InvalidArgument("CPU BatchGet offset exceeds entry length");
-    const std::uint64_t destination_offset = static_cast<std::uint64_t>(output_index) * batch.output_block_bytes;
-    if (destination_offset > batch.output.bytes || batch.output_block_bytes > batch.output.bytes - destination_offset)
+    const std::uint64_t output_row = static_cast<std::uint64_t>(output_index);
+    if (output_row >= batch.output.bytes / batch.output_block_bytes)
       return Status::InvalidArgument("CPU BatchGet output index exceeds output buffer");
+    const std::uint64_t destination_offset =
+        output_row * batch.output_block_bytes;
     const Address address = request.host_access_table.addresses[index];
     const std::uint64_t remote_offset = address < region_.base ? region_.length + 1U
                                                                : address - region_.base;
@@ -101,13 +128,18 @@ Status CpuUrmaAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& request
         batch.output_block_bytes > region_.length - remote_offset - static_cast<std::uint64_t>(offset))
       return Status::InvalidArgument("CPU BatchGet remote address is invalid");
     auto* destination = static_cast<std::uint8_t*>(batch.output.data) + destination_offset;
-    const CpuUrmaTransport::HostSge destination_sge{destination,
-                                                    static_cast<std::size_t>(batch.output_block_bytes)};
-    const Status status = transport_.ReadSglBatch(
-        remote_offset + static_cast<std::uint64_t>(offset), &destination_sge, 1U, 1U);
-    if (!status.ok()) return status;
+    batch_buffers_.push_back(CpuUrmaTransport::HostSge{
+        destination, static_cast<std::size_t>(batch.output_block_bytes)});
+    batch_remote_offsets_.push_back(remote_offset +
+                                    static_cast<std::uint64_t>(offset));
   }
-  return Status::OK();
+  if (batch_buffers_.empty()) return Status::OK();
+  // Prefer one segment for the contiguous output. Providers that reject the
+  // larger registration still fall back to per-entry registration below.
+  (void)transport_.RegisterDirectHostMemory(batch.output.data,
+                                            batch.output.bytes);
+  return transport_.ReadBatch(batch_remote_offsets_.data(),
+                              batch_buffers_.data(), batch_buffers_.size());
 }
 
 }  // namespace kvaf
