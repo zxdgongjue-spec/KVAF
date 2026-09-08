@@ -70,6 +70,7 @@ def initialize_runtime(hbm_bytes: int, slot_size: int) -> object:
         wqes_per_doorbell=int(
             os.environ.get("KVAF_CPU_URMA_DOORBELL_WQES", "0")
         ),
+        sgl_size=int(os.environ.get("KVAF_CPU_URMA_SGL_SIZE", "1")),
     )
     return runtime
 

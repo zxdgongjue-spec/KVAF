@@ -109,11 +109,21 @@ CPU operator 会先把 BatchGet/BatchPut 解析为离散的远端 offset 和本�
 `jetty_count=1`、`omp_thread_count=1` 和 `wqes_per_doorbell=0`，应根据实际
 `prepare/post/poll` 计时选择配置。
 
+`CpuRuntime.initialize(..., sgl_size=8)` 可启用多 SGL（默认 1，上限为设备能力与 16
+中的较小值，超限会报错）。每条 WR 最多包含 `sgl_size` 个本地片段，使用一个连续的
+远端 SGE；只有按请求顺序相邻的 HBM 范围才会合并，遇到 slot 间隙、地址回绕或合计
+长度超过 uint32 上限时拆成新的 WR，尾组可以不足 `sgl_size`。本地源 buffer 可以
+分散，不需要复制拼接；同样的分组规则也适用于 CPU BatchGet 的 READ。
+每个 Jetty 的 1024 深度和 `wqes_per_doorbell` 都按 WR 数计算：1024 行连续 HBM
+目标、SGL=8 时是 128 条 WR；8192 行则是 1024 条 WR，4 个 Jetty 可在一个容量批次
+内完成。日志中的 `CPU_BATCH_PUT_SGL_RESULT` 输出实际 WR 数的最小值与最大值，便于
+发现碎片导致的合并不足。
+
 启用 CPU Python binding 后，`kvaf.CpuRuntime` 提供相同的 packed-input、AccessTable、
 `batch_put`/`batch_get` 接口；`tests/python/test_cpu_runtime_npu_hbm.py` 和
 `tests/run_cpu_runtime_npu_hbm_python.sh` 用于硬件联调。Python 测试通过
 `KVAF_CPU_URMA_JETTYS`、`KVAF_CPU_URMA_OMP_THREADS` 和
-`KVAF_CPU_URMA_DOORBELL_WQES` 设置上述参数。
+`KVAF_CPU_URMA_DOORBELL_WQES`、`KVAF_CPU_URMA_SGL_SIZE` 设置上述参数。
 
 CPU URMA transport/operator 的源码归属 `access_operator/include/cpu_urma` 和
 `access_operator/src/cpu_urma`；Runtime 仅负责 HBM region、MetaManager 和 operator
@@ -125,13 +135,13 @@ CPU URMA transport/operator 的源码归属 `access_operator/include/cpu_urma` �
 URMA WQE：
 
 ```bash
-mkdir -p "$PWD/results/cpu_batch_put"
+mkdir -p "$PWD/results/cpu_batch_put_sgl8"
 
-KVAF_CPU_BATCH_PUT_SWEEP_LOG_DIR="$PWD/results/cpu_batch_put" \
+KVAF_CPU_BATCH_PUT_SWEEP_LOG_DIR="$PWD/results/cpu_batch_put_sgl8" \
 tests/run_cpu_batch_put_miss_count_perf.sh "$PWD/build-cpu" \
   --peer 127.0.0.1:29888 --device-id 3 \
   --request-length 8192 --jettys 4 --omp-threads 8 --doorbell-wqes 32 \
-  --iterations 1000 --warmup 5
+  --sgl-size 8 --iterations 1000 --warmup 5
 ```
 
 脚本默认扫描 `token_bytes={128,256,512,656,1024,2048,4096}` 和

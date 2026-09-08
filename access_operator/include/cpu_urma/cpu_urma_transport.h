@@ -46,6 +46,8 @@ struct CpuUrmaTransportOptions {
   // urma_post_jetty_send_wr call. Zero prepares and submits one full linked
   // list per Jetty.
   std::uint32_t wqes_per_doorbell{0};
+  // Maximum local SGEs per production WR; only adjacent remote ranges merge.
+  std::uint32_t sgl_size{1};
   bool has_external_region{false};
   peer::PeerRegion external_region{};
 };
@@ -59,6 +61,7 @@ class CpuUrmaTransport final {
     // Wall time after acquiring the submission lock through final completion.
     // Includes validation, workspace/segment lookup and gaps between chunks.
     std::uint64_t total_ns{0};
+    std::uint64_t wr_count{0};
   };
 
   CpuUrmaTransport();
@@ -79,7 +82,8 @@ class CpuUrmaTransport final {
                        std::size_t count, std::size_t sgl_size);
   // CPU BatchPut path: transfer packed CPU DRAM rows into independent HBM
   // destinations. This is the CPU-initiated equivalent of AIV BatchGet READs.
-  // Each entry becomes one WR and the batch shares completion fences.
+  // Adjacent remote rows share a WR up to options.sgl_size; gaps start a new
+  // WR. Queue capacity is applied after grouping, with shared completion fences.
   Status WriteBatch(const std::uint64_t* remote_offsets,
                     const HostSge* sources, std::size_t count);
   // Register one page-aligned host region once. SGL transfers from any

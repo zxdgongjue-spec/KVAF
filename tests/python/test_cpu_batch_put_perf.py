@@ -85,6 +85,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=environment_int("KVAF_CPU_URMA_DOORBELL_WQES", 0),
     )
     parser.add_argument(
+        "--sgl-size",
+        type=int,
+        default=environment_int("KVAF_CPU_URMA_SGL_SIZE", 1),
+        help="maximum local SGEs per WR; merges rows with adjacent HBM targets",
+    )
+    parser.add_argument(
         "--device-id", type=int, default=environment_int("DEVICE_ID", 0)
     )
     parser.add_argument(
@@ -120,6 +126,8 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "jettys and omp-threads must be positive"
     if args.doorbell_wqes < 0 or args.doorbell_wqes > 1024:
         return "doorbell-wqes must be in [0, 1024]"
+    if args.sgl_size <= 0 or args.sgl_size > 16:
+        return "sgl-size must be in [1, 16] and within the device SGE limit"
     return None
 
 
@@ -178,7 +186,7 @@ def validate_timing(timing: dict, call_ns: int) -> dict[str, int]:
         raise ValueError(
             "transport wall-clock timing is unavailable; rebuild the CPU Python binding"
         )
-    names = ("prepare_ns", "post_ns", "poll_ns", "total_ns")
+    names = ("prepare_ns", "post_ns", "poll_ns", "total_ns", "wr_count")
     for name in names:
         value = timing.get(name)
         if type(value) is not int or value < 0:
@@ -232,6 +240,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"request_length={args.request_length} miss_count={args.miss_count} "
         f"token_bytes={args.token_bytes} payload_bytes={payload_bytes} "
         f"jettys={args.jettys} omp_threads={args.omp_threads} "
+        f"sgl_size={args.sgl_size} "
         f"doorbell_wqes={args.doorbell_wqes} warmup={args.warmup} "
         f"iterations={args.iterations}"
     )
@@ -247,6 +256,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             jetty_count=args.jettys,
             omp_thread_count=args.omp_threads,
             wqes_per_doorbell=args.doorbell_wqes,
+            sgl_size=args.sgl_size,
         )
 
         def execute() -> None:
@@ -302,6 +312,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         post_samples: list[int] = []
         poll_samples: list[int] = []
         total_samples: list[int] = []
+        wr_counts: list[int] = []
         print("CPU_BATCH_PUT_PERF_PHASE_BEGIN phase=batch_put")
         for _ in range(args.iterations):
             begin_ns = time.perf_counter_ns()
@@ -309,6 +320,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             completed_ns = time.perf_counter_ns()
             call_ns = completed_ns - begin_ns
             timing = validate_timing(dict(runtime.last_batch_timing), call_ns)
+            minimum_wrs = (args.miss_count + args.sgl_size - 1) // args.sgl_size
+            if not minimum_wrs <= timing["wr_count"] <= args.miss_count:
+                raise ValueError("transport WR count is inconsistent with miss-count/sgl-size")
+            wr_counts.append(timing["wr_count"])
             call_samples.append(call_ns)
             prepare_samples.append(timing["prepare_ns"])
             post_samples.append(timing["post_ns"])
@@ -316,6 +331,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             total_samples.append(timing["total_ns"])
             free_active()
 
+        print(
+            "CPU_BATCH_PUT_SGL_RESULT "
+            f"requested_sgl_size={args.sgl_size} "
+            f"wr_count_min={min(wr_counts)} wr_count_max={max(wr_counts)}"
+        )
         for operation, samples in (
             ("batch_put", call_samples),
             ("batch_put_transport_total", total_samples),

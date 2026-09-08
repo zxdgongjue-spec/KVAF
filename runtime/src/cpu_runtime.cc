@@ -872,6 +872,7 @@ Status CpuRuntime::InitializeClient(const CpuRuntimeClientOptions& options) {
   transport_options.jetty_count = options.jetty_count;
   transport_options.omp_thread_count = options.omp_thread_count;
   transport_options.wqes_per_doorbell = options.wqes_per_doorbell;
+  transport_options.sgl_size = options.sgl_size;
   impl->access_operator = std::make_unique<CpuUrmaAccessOperator>(transport_options, impl->peer_link);
   impl->meta_manager = CreateInMemoryMetaManager();
   impl->runtime_core = std::make_unique<RuntimeCore>(*impl->meta_manager, *impl->access_operator,
@@ -903,7 +904,7 @@ CpuRuntimeBatchTiming CpuRuntime::last_batch_timing() const {
   const CpuUrmaTransport::BatchTiming timing =
       impl_->access_operator->last_batch_timing();
   return CpuRuntimeBatchTiming{timing.prepare_ns, timing.post_ns,
-                               timing.poll_ns, timing.total_ns};
+                               timing.poll_ns, timing.total_ns, timing.wr_count};
 }
 
 Status CpuRuntime::LinkTo(const LinkTarget& target) {
