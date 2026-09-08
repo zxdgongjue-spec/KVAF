@@ -35,9 +35,17 @@ if [[ -z "$KVAF_CPU_BATCH_PUT_SWEEP_LOG_DIR" ]]; then
 else
   mkdir -p "$KVAF_CPU_BATCH_PUT_SWEEP_LOG_DIR"
 fi
-# Keep the previous comparison-path override as an alias for the single CSV.
-: "${KVAF_CPU_BATCH_PUT_SWEEP_CSV:=${KVAF_CPU_BATCH_PUT_COMPARISON_CSV:-$KVAF_CPU_BATCH_PUT_SWEEP_LOG_DIR/cpu_batch_put_transport_total.csv}}"
-mkdir -p "$(dirname "$KVAF_CPU_BATCH_PUT_SWEEP_CSV")"
+: "${KVAF_CPU_BATCH_PUT_SWEEP_CSV:=$KVAF_CPU_BATCH_PUT_SWEEP_LOG_DIR/cpu_batch_put_sweep_summary.csv}"
+: "${KVAF_CPU_BATCH_PUT_COMPARISON_CSV:=$KVAF_CPU_BATCH_PUT_SWEEP_LOG_DIR/cpu_batch_put_transport_total.csv}"
+mkdir -p "$(dirname "$KVAF_CPU_BATCH_PUT_SWEEP_CSV")" \
+  "$(dirname "$KVAF_CPU_BATCH_PUT_COMPARISON_CSV")"
+summary_path="$(cd "$(dirname "$KVAF_CPU_BATCH_PUT_SWEEP_CSV")" && pwd -P)/$(basename "$KVAF_CPU_BATCH_PUT_SWEEP_CSV")"
+transport_path="$(cd "$(dirname "$KVAF_CPU_BATCH_PUT_COMPARISON_CSV")" && pwd -P)/$(basename "$KVAF_CPU_BATCH_PUT_COMPARISON_CSV")"
+if [[ "$summary_path" == "$transport_path" ||
+      "$KVAF_CPU_BATCH_PUT_SWEEP_CSV" -ef "$KVAF_CPU_BATCH_PUT_COMPARISON_CSV" ]]; then
+  echo "ERROR: runtime and transport CSV paths must be different" >&2
+  exit 2
+fi
 echo "CPU_BATCH_PUT_SWEEP_LOG_DIR path=$KVAF_CPU_BATCH_PUT_SWEEP_LOG_DIR"
 
 extract_field() {
@@ -61,9 +69,22 @@ extract_result() {
     "$log_file"
 }
 
-printf '%s\n' \
-  'token_bytes,miss_count,mean_us,p50_us,p90_us,p99_us,p50_GBps' \
-  >"$KVAF_CPU_BATCH_PUT_SWEEP_CSV"
+result_to_csv() {
+  local token="$1" miss="$2" record="$3"
+  local mean p50 p90 p99 gbps
+  mean="$(extract_field "$record" mean_us)" || return 1
+  p50="$(extract_field "$record" p50_us)" || return 1
+  p90="$(extract_field "$record" p90_us)" || return 1
+  p99="$(extract_field "$record" p99_us)" || return 1
+  # Keep the bandwidth computed from this operation's unrounded ns samples.
+  gbps="$(extract_field "$record" p50_GBps)" || return 1
+  printf '%s,%s,%s,%s,%s,%s,%s\n' "$token" "$miss" "$mean" "$p50" "$p90" "$p99" "$gbps"
+}
+
+for csv_file in "$KVAF_CPU_BATCH_PUT_SWEEP_CSV" "$KVAF_CPU_BATCH_PUT_COMPARISON_CSV"; do
+  printf '%s\n' \
+    'token_bytes,miss_count,mean_us,p50_us,p90_us,p99_us,p50_GBps' >"$csv_file"
+done
 
 for token_bytes in "${KVAF_TOKEN_BYTES[@]}"; do
   echo "CPU_BATCH_PUT_TOKEN_SWEEP_BEGIN token_bytes=$token_bytes"
@@ -80,30 +101,32 @@ for token_bytes in "${KVAF_TOKEN_BYTES[@]}"; do
       exit "$status"
     fi
 
+    call_result="$(extract_result "$log_file" batch_put)"
     total_result="$(extract_result "$log_file" batch_put_transport_total)"
-    if [[ -z "$total_result" ]]; then
+    if [[ -z "$call_result" || -z "$total_result" ]]; then
       echo "ERROR: incomplete CPU BatchPut results for token_bytes=$token_bytes miss_count=$miss_count" >&2
       exit 1
     fi
 
-    total_mean_us="$(extract_field "$total_result" mean_us)"
-    total_p50_us="$(extract_field "$total_result" p50_us)"
-    total_p90_us="$(extract_field "$total_result" p90_us)"
-    total_p99_us="$(extract_field "$total_result" p99_us)"
-    # The producer uses unrounded nanosecond samples from this same operation.
-    p50_gbps="$(extract_field "$total_result" p50_GBps)"
-
-    printf '%s,%s,%s,%s,%s,%s,%s\n' \
-      "$token_bytes" "$miss_count" "$total_mean_us" "$total_p50_us" \
-      "$total_p90_us" "$total_p99_us" "$p50_gbps" \
-      >>"$KVAF_CPU_BATCH_PUT_SWEEP_CSV"
-    echo "CPU_BATCH_PUT_MISS_SWEEP_RESULT token_bytes=$token_bytes miss_count=$miss_count mean_us=$total_mean_us p50_us=$total_p50_us p90_us=$total_p90_us p99_us=$total_p99_us p50_GBps=$p50_gbps"
+    if ! call_row="$(result_to_csv "$token_bytes" "$miss_count" "$call_result")" ||
+       ! total_row="$(result_to_csv "$token_bytes" "$miss_count" "$total_result")"; then
+      echo "ERROR: incomplete CPU BatchPut metrics for token_bytes=$token_bytes miss_count=$miss_count" >&2
+      exit 1
+    fi
+    printf '%s\n' "$call_row" >>"$KVAF_CPU_BATCH_PUT_SWEEP_CSV"
+    printf '%s\n' "$total_row" >>"$KVAF_CPU_BATCH_PUT_COMPARISON_CSV"
+    echo "CPU_BATCH_PUT_MISS_SWEEP_RESULT scope=runtime_call csv=$call_row"
+    echo "CPU_BATCH_PUT_MISS_SWEEP_RESULT scope=transport_total csv=$total_row"
     echo "CPU_BATCH_PUT_MISS_SWEEP_DONE token_bytes=$token_bytes miss_count=$miss_count"
   done
   echo "CPU_BATCH_PUT_TOKEN_SWEEP_DONE token_bytes=$token_bytes"
 done
 
-printf '\nCPU_BATCH_PUT_SWEEP_SUMMARY combinations=%s units=us\n' \
+printf '\nCPU_BATCH_PUT_SWEEP_SUMMARY scope=runtime_call combinations=%s units=us\n' \
   "$(( ${#KVAF_TOKEN_BYTES[@]} * ${#KVAF_MISS_COUNTS[@]} ))"
 cat "$KVAF_CPU_BATCH_PUT_SWEEP_CSV"
 echo "CPU_BATCH_PUT_SWEEP_CSV_WRITTEN path=$KVAF_CPU_BATCH_PUT_SWEEP_CSV rows=$(( ${#KVAF_TOKEN_BYTES[@]} * ${#KVAF_MISS_COUNTS[@]} ))"
+printf '\nCPU_BATCH_PUT_SWEEP_SUMMARY scope=transport_total combinations=%s units=us\n' \
+  "$(( ${#KVAF_TOKEN_BYTES[@]} * ${#KVAF_MISS_COUNTS[@]} ))"
+cat "$KVAF_CPU_BATCH_PUT_COMPARISON_CSV"
+echo "CPU_BATCH_PUT_COMPARISON_CSV_WRITTEN path=$KVAF_CPU_BATCH_PUT_COMPARISON_CSV rows=$(( ${#KVAF_TOKEN_BYTES[@]} * ${#KVAF_MISS_COUNTS[@]} ))"

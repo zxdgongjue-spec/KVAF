@@ -119,6 +119,15 @@ CPU operator 会先把 BatchGet/BatchPut 解析为离散的远端 offset 和本�
 内完成。日志中的 `CPU_BATCH_PUT_SGL_RESULT` 输出实际 WR 数的最小值与最大值，便于
 发现碎片导致的合并不足。
 
+这里的 SGL 分组由实际 HBM 地址决定，与 BatchPut 接口的 input group 无关：同一
+input group 内遇到远端空洞也要拆分，不同 input group 的相邻条目在远端首尾相接时
+也可以合并。当前配置 `max_rsge=1`，并未启用多远端 SGE。
+
+OpenMP 线程只并行准备 WR/SGE，提交与完成轮询仍由调用线程执行。每波准备结束和
+提交结束都需要线程同步；线程多于实际 WR 数或可用 CPU 核数时，空闲等待和调度
+开销可能让延迟更高，尤其是小 miss_count 或较大的 sgl_size。建议在相同 CPU 绑定
+和负载下比较 `--omp-threads 1/2/4/8`，再决定是否增加线程数。
+
 启用 CPU Python binding 后，`kvaf.CpuRuntime` 提供相同的 packed-input、AccessTable、
 `batch_put`/`batch_get` 接口；`tests/python/test_cpu_runtime_npu_hbm.py` 和
 `tests/run_cpu_runtime_npu_hbm_python.sh` 用于硬件联调。Python 测试通过
@@ -146,13 +155,18 @@ tests/run_cpu_batch_put_miss_count_perf.sh "$PWD/build-cpu" \
 
 脚本默认扫描 `token_bytes={128,256,512,656,1024,2048,4096}` 和
 `miss_count={32,64,128,256,512,1024,2048,4096,8192}`，共 63 种组合；因此
-`request_length` 至少要设为 8192。结果仅生成一份 `cpu_batch_put_transport_total.csv`，
-包含 63 行数据和表头 `token_bytes,miss_count,mean_us,p50_us,p90_us,p99_us,p50_GBps`。
-延迟采用 CPU URMA transport total，`p50_GBps = token_bytes × miss_count / p50_ns`（十进制
-GB/s），分母使用未格式化的纳秒分位数，避免从 CSV 的三位小数微秒值反算造成误差。
-可用 `KVAF_CPU_BATCH_PUT_SWEEP_CSV` 覆盖 CSV 输出路径；此前的
-`KVAF_CPU_BATCH_PUT_COMPARISON_CSV` 仍可作为兼容别名，前者优先。每个组合的原始日志
-仍保存在上述目录，便于排查失败。
+`request_length` 至少要设为 8192。生成两份 CSV，每份均包含 63 行数据和表头
+`token_bytes,miss_count,mean_us,p50_us,p90_us,p99_us,p50_GBps`：
+
+- `cpu_batch_put_sweep_summary.csv`：完整 `runtime.batch_put()` 调用的延迟和带宽，
+  可用 `KVAF_CPU_BATCH_PUT_SWEEP_CSV` 覆盖路径。
+- `cpu_batch_put_transport_total.csv`：CPU URMA transport 的延迟和带宽，
+  可用 `KVAF_CPU_BATCH_PUT_COMPARISON_CSV` 覆盖路径。
+
+两份文件各自使用对应操作的原始纳秒分位数计算
+`p50_GBps = token_bytes × miss_count / p50_ns`（十进制 GB/s），避免从 CSV 的三位
+小数微秒值反算造成误差。两个路径必须不同。每个组合的原始日志保存在上述目录，
+便于排查失败。
 
 `transport total` 从取得 transport 提交锁后开始，直到整个请求的最后一个完成通知
 被确认；包含 transport 内的参数校验、工作区准备、segment 查找/回退注册、WR/SGE

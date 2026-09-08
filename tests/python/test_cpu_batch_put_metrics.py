@@ -122,7 +122,7 @@ class MetricsTest(unittest.TestCase):
             self.assertEqual(len(data), 32 * token)
             self.assertEqual(len({data[i * token:(i + 1) * token] for i in range(32)}), 32)
 
-    def test_sweep_selects_transport_record_for_all_63_combinations(self):
+    def test_sweep_uses_each_scope_for_all_63_combinations(self):
         # Run the real aggregator with an isolated runner emitting both scopes.
         with tempfile.TemporaryDirectory(prefix="kvaf_metrics_") as tmp:
             root = Path(tmp)
@@ -154,25 +154,54 @@ perf.print_samples("batch_put", [10000, 10010], 0, 8192, miss, token)
                                  env=env, text=True, capture_output=True)
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
             files = list((root / "results").glob("*.csv"))
-            self.assertEqual(len(files), 1)
-            with files[0].open() as stream:
+            self.assertEqual(len(files), 2)
+            summary = root / "results" / "cpu_batch_put_sweep_summary.csv"
+            transport = root / "results" / "cpu_batch_put_transport_total.csv"
+            with transport.open() as stream:
                 rows = list(csv.reader(stream))
+            with summary.open() as stream:
+                call_rows = list(csv.reader(stream))
             self.assertEqual(rows[0], ["token_bytes", "miss_count", "mean_us", "p50_us",
                                        "p90_us", "p99_us", "p50_GBps"])
             pairs = [(token, miss) for token in (128, 256, 512, 656, 1024, 2048, 4096)
                      for miss in (32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)]
             self.assertEqual(len(rows), 64)
+            self.assertEqual(len(call_rows), 64)
+            self.assertEqual(call_rows[0], rows[0])
             for row, (token, miss) in zip(rows[1:], pairs):
                 self.assertEqual(row, [str(token), str(miss), f"{1.0005:.3f}",
                                        f"{1.0005:.3f}", "1.001", "1.001",
                                        f"{token * miss / 1000.5:.3f}"])
+            for row, (token, miss) in zip(call_rows[1:], pairs):
+                self.assertEqual(row, [str(token), str(miss), "10.005", "10.005",
+                                       "10.009", "10.010", f"{token * miss / 10005:.3f}"])
             # Missing records/failed runners must never produce a data row.
             runner.write_text("#!/usr/bin/env bash\nexit 0\n")
             run = subprocess.run(["bash", str(sweep), str(root / "build")],
                                  env=env, text=True, capture_output=True)
             self.assertNotEqual(run.returncode, 0)
             self.assertIn("incomplete CPU BatchPut results", run.stderr)
-            self.assertEqual(len(files[0].read_text().splitlines()), 1)
+            for path in files:
+                self.assertEqual(len(path.read_text().splitlines()), 1)
+            # A partial record must not append a valid-looking row to either file.
+            runner.write_text('''#!/usr/bin/env bash
+echo 'PERF_RESULT operation=batch_put mean_us=10 p50_us=10 p90_us=10 p99_us=10 p50_GBps=1'
+echo 'PERF_RESULT operation=batch_put_transport_total mean_us=1 p50_us=1 p90_us=1 p99_us=1'
+''')
+            run = subprocess.run(["bash", str(sweep), str(root / "build")],
+                                 env=env, text=True, capture_output=True)
+            self.assertNotEqual(run.returncode, 0)
+            self.assertIn("incomplete CPU BatchPut metrics", run.stderr)
+            for path in files:
+                self.assertEqual(len(path.read_text().splitlines()), 1)
+            # Different scopes must not overwrite the same file, even via aliases.
+            summary.write_text("existing result\n")
+            env["KVAF_CPU_BATCH_PUT_COMPARISON_CSV"] = str(summary.parent) + "/./" + summary.name
+            run = subprocess.run(["bash", str(sweep), str(root / "build")],
+                                 env=env, text=True, capture_output=True)
+            self.assertEqual(run.returncode, 2)
+            self.assertIn("CSV paths must be different", run.stderr)
+            self.assertEqual(summary.read_text(), "existing result\n")
 
 
 if __name__ == "__main__":
