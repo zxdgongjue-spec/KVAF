@@ -477,8 +477,9 @@ __aicore__ inline bool ValidateKvafForwardResidentOutputIndices(
   // This validation precedes WQE construction. The preceding PostOnly has
   // committed both banks (CommitPostScalarStage waits for MTE3 before the
   // doorbell), and HCCP reads the copied SQ in GM, never these UB banks.
-  // Reuse the first 1 KiB of that reserved aperture until the next Post
-  // materializes its WQEs. No static array/TBuf or additional UB is allocated.
+  // Reuse up to 3 KiB of that reserved aperture until the next Post
+  // materializes its WQEs: 1 KiB indices, up to 2 KiB exact hash table.
+  // No static array/TBuf or additional UB is allocated.
   // Previously every pair reread GM: 64 requests incurred 2016 uncached
   // reads here and another 2016 in per-request Append. A single bounded DMA
   // plus local comparisons preserves the complete duplicate/range gate.
@@ -515,33 +516,49 @@ __aicore__ inline bool ValidateKvafForwardResidentOutputIndices(
       return false;
     }
   }
-  // Sort ONLY the private UB copy, never descriptor GM order. Heap sort has
-  // bounded O(N log N) work and no recursion/extra scratch; pairwise checking
-  // grows to8128 comparisons at128 requests. The complete uniqueness gate
-  // remains before any descriptor publication or doorbell.
-  __ubuf__ int32_t* sorted = reinterpret_cast<__ubuf__ int32_t*>(get_imm(0U));
+  // Exact membership, not a probabilistic filter. Use the idle WQE aperture
+  // for a <=50%-full hash table instead of scalar heap-sort UB read/writes.
+  // Full row equality resolves collisions; bounded probing preserves the
+  // complete duplicate gate even for adversarial slot distributions.
+  constexpr uint32_t kHashOffset =
+      KVAF_AIV_BATCH_GET_DENSE_REQUEST_CAPACITY * sizeof(int32_t);
+  static_assert(kHashOffset + 2U * KVAF_AIV_BATCH_GET_DENSE_REQUEST_CAPACITY *
+                    sizeof(int32_t) <=
+                    kvaf_fused_get::kDenseBatchGetReservedWqeUbBytes,
+                "validation hash exceeds idle WQE banks");
+  __ubuf__ int32_t* const table =
+      reinterpret_cast<__ubuf__ int32_t*>(get_imm(kHashOffset));
   const uint32_t count = descriptor.active_request_count;
-  for (uint32_t step = count / 2U + count - 1U; step > 0U; --step) {
-    const bool heapify = step >= count;
-    uint32_t root = heapify ? step - count : 0U;
-    const uint32_t end = heapify ? count : step;
-    if (!heapify) {
-      const int32_t swap = sorted[0];
-      sorted[0] = sorted[end];
-      sorted[end] = swap;
-    }
-    const int32_t value = sorted[root];
-    while (root * 2U + 1U < end) {
-      uint32_t child = root * 2U + 1U;
-      if (child + 1U < end && sorted[child] < sorted[child + 1U]) { ++child; }
-      if (value >= sorted[child]) { break; }
-      sorted[root] = sorted[child];
-      root = child;
-    }
-    sorted[root] = value;
+  uint32_t capacity = 2U;
+  while (capacity < count * 2U) {
+    capacity *= 2U;
   }
-  for (uint32_t i = 1U; i < count; ++i) {
-    if (sorted[i - 1U] == sorted[i]) { return false; }
+  for (uint32_t i = 0U; i < capacity; ++i) {
+    table[i] = -1;
+  }
+  for (uint32_t i = 0U; i < count; ++i) {
+    const int32_t value = output_indices[i];
+    uint32_t hash = static_cast<uint32_t>(value);
+    hash ^= hash >> 16U;
+    hash *= 0x9e3779b1U;
+    hash ^= hash >> 16U;
+    uint32_t bucket = hash & (capacity - 1U);
+    bool inserted = false;
+    for (uint32_t probe = 0U; probe < capacity; ++probe) {
+      const int32_t old = table[bucket];
+      if (old == value) {
+        return false;
+      }
+      if (old == -1) {
+        table[bucket] = value;
+        inserted = true;
+        break;
+      }
+      bucket = (bucket + 1U) & (capacity - 1U);
+    }
+    if (!inserted) {
+      return false;
+    }
   }
   return true;
 }

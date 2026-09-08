@@ -149,8 +149,12 @@ void equivalence() {
   const auto before_validation=ub;
   assert(ValidateKvafForwardResidentOutputIndices(bulk.control,bulk.descriptor));
   assert(bypass_reads==0 && dma_bytes==17*n && AscendC::event_state==0);
-  for(uint32_t byte=(4*n+31U)/32U*32U;byte<ub.size();++byte)
-   assert(ub[byte]==before_validation[byte]);
+  uint32_t hash_capacity=2;
+  while(hash_capacity<2*n) hash_capacity*=2;
+  const uint32_t input_end=(4*n+31U)/32U*32U;
+  for(uint32_t byte=0;byte<ub.size();++byte)
+   if(byte>=input_end && (byte<1024U || byte>=1024U+4U*hash_capacity))
+    assert(ub[byte]==before_validation[byte]);
   for(uint32_t byte=3328;byte<ub.size();++byte) assert(ub[byte]==0xa7);
   for(uint32_t i=0;i<n;++i) assert(AppendKvafForwardResidentRequest(
     legacy.control,&legacy.descriptor,legacy.seeds[i*4+2],128,legacy.seeds[i*4+3]));
@@ -165,7 +169,7 @@ void duplicate_gate() {
  for(uint32_t n=1;n<=256;++n) {
   Fixture batch;
   // Permuted, descending, singleton and full-capacity waves. Validate only
-  // private scratch is sorted; GM request order and canaries stay unchanged.
+  // private hash scratch is used; GM request order and canaries stay unchanged.
   for(uint32_t i=0;i<n;++i) batch.seeds[i*4+3]=1000+n-1-i;
   if(n%2==0) for(uint32_t i=0;i<n;++i) {
    const uint32_t j=(i*73+19)%n;
@@ -190,6 +194,34 @@ void duplicate_gate() {
  f.outputs[64]=f.outputs[1]-1;
  assert(!ValidateKvafForwardResidentOutputIndices(f.control,f.descriptor));
  f.outputs[64]=6000;
+ assert(!ValidateKvafForwardResidentOutputIndices(f.control,f.descriptor));
+}
+void hash_collisions() {
+ Fixture f;
+ f.control.resident_row_base=0; f.control.resident_row_count=INT32_MAX;
+ f.control.output_rows=INT32_MAX;
+ // Deliberately force every key into one bucket, including wrap at table end.
+ // Collision resolution must retain all distinct keys and reject every
+ // duplicate position without modifying GM or the unused UB tail.
+ uint32_t count=0;
+ for(uint32_t value=0;count<256;++value) {
+  uint32_t hash=value;
+  hash^=hash>>16U; hash*=0x9e3779b1U; hash^=hash>>16U;
+  if((hash&511U)==511U) f.seeds[(count++)*4+3]=value;
+ }
+ assert(f.build(256));
+ const auto original=f.outputs;
+ ub.fill(0xa7);
+ assert(ValidateKvafForwardResidentOutputIndices(f.control,f.descriptor));
+ assert(original==f.outputs);
+ for(uint32_t byte=3072;byte<ub.size();++byte) assert(ub[byte]==0xa7);
+ for(uint32_t dup=2;dup<=256;++dup) {
+  f.outputs=original; f.outputs[dup]=original[1];
+  assert(!ValidateKvafForwardResidentOutputIndices(f.control,f.descriptor));
+  f.guards();
+ }
+ // Empty-table sentinel -1 must never be accepted as an output row.
+ f.outputs=original; f.outputs[128]=-1;
  assert(!ValidateKvafForwardResidentOutputIndices(f.control,f.descriptor));
 }
 void invalid_inputs() {
@@ -230,6 +262,7 @@ void reuse() {
 int main(int argc,char**argv) {
  assert(argc==2); std::string name=argv[1];
  if(name=="equivalence") equivalence(); else if(name=="duplicates") duplicate_gate();
+ else if(name=="collisions") hash_collisions();
  else if(name=="invalid") invalid_inputs(); else if(name=="reuse") reuse(); else return 2;
  std::cout<<"KVAF_BULK_DESCRIPTOR_ACTUAL_CPP_PASS case="<<name<<" npu_proof=0\n";
 }
@@ -286,7 +319,7 @@ class ForwardResidentBulkDescriptorNativeTest(unittest.TestCase):
             raise AssertionError(result.stdout + result.stderr)
 
     def test_actual_bulk_descriptor_values_validation_and_reuse(self):
-        for name in ("equivalence", "duplicates", "invalid", "reuse"):
+        for name in ("equivalence", "duplicates", "collisions", "invalid", "reuse"):
             with self.subTest(case=name):
                 result = subprocess.run(
                     [str(self.binary), name], capture_output=True, text=True

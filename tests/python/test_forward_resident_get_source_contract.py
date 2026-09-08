@@ -9,6 +9,7 @@ protects that boundary before an expensive CANN compile.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 
@@ -77,8 +78,9 @@ def main() -> None:
     assert "ReadGmByPassDCache<int32_t>" not in validation
     assert "AscendC::DataCopyPad(local_indices, global_indices" in validation
     assert "output_indices[earlier]" not in validation
-    assert "sorted[i - 1U] == sorted[i]" in validation
-    assert "root * 2U + 1U < end" in validation
+    assert "old == value" in validation
+    assert "probe < capacity" in validation
+    assert re.search(r"if \(!inserted\)\s*\{\s*return false;\s*\}", validation)
     assert "get_imm(0U)" in validation
     assert "kDenseBatchGetReservedWqeUbBytes" in validation
     assert validation.index("HardEvent::MTE2_S") < validation.index(
