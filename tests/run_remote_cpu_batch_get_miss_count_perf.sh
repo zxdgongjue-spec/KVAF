@@ -50,6 +50,20 @@ extract_field() {
   return 1
 }
 
+extract_profile_result() {
+  local log_file="$1"
+  local operation="$2"
+  awk -v target="operation=$operation" \
+    '$1 == "PERF_RESULT" && $2 == target { result = $0 } END { print result }' \
+    "$log_file"
+}
+
+cycles_to_us() {
+  local cycles="$1"
+  awk -v cycles="$cycles" -v mhz="$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" \
+    'BEGIN { printf "%.3f", cycles / mhz }'
+}
+
 token_bytes_values=()
 miss_count_values=()
 mean_us_values=()
@@ -57,6 +71,14 @@ p50_us_values=()
 p90_us_values=()
 p99_us_values=()
 p50_gbps_values=()
+post_mean_us_values=()
+post_p50_us_values=()
+post_p90_us_values=()
+post_p99_us_values=()
+completion_wait_mean_us_values=()
+completion_wait_p50_us_values=()
+completion_wait_p90_us_values=()
+completion_wait_p99_us_values=()
 
 for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
   echo "BATCH_GET_TOKEN_SWEEP_BEGIN token_bytes=$token_bytes"
@@ -75,29 +97,51 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
       exit "$status"
     fi
 
-    profile_result="$(
-      awk '$1 == "PERF_RESULT" && $2 == "operation=batch_get_kernel_total" { result = $0 } END { print result }' \
-        "$log_file"
+    total_profile_result="$(
+      extract_profile_result "$log_file" batch_get_kernel_total
     )"
-    if [[ -z "$profile_result" ]]; then
-      echo "ERROR: no batch_get_kernel_total PERF_RESULT for token_bytes=$token_bytes miss_count=$miss_count" >&2
+    post_profile_result="$(
+      extract_profile_result "$log_file" batch_get_kernel_post
+    )"
+    completion_wait_profile_result="$(
+      extract_profile_result "$log_file" batch_get_kernel_completion_wait
+    )"
+    if [[ -z "$total_profile_result" || -z "$post_profile_result" ||
+      -z "$completion_wait_profile_result" ]]; then
+      echo "ERROR: incomplete kernel profile results for token_bytes=$token_bytes miss_count=$miss_count" >&2
       exit 1
     fi
 
-    mean_ms="$(extract_field "$profile_result" mean_ms)"
-    p50_ms="$(extract_field "$profile_result" p50_ms)"
-    p90_ms="$(extract_field "$profile_result" p90_ms)"
-    p99_ms="$(extract_field "$profile_result" p99_ms)"
-    mean_cycles="$(extract_field "$profile_result" mean_cycles)"
-    p50_cycles="$(extract_field "$profile_result" p50_cycles)"
-    p90_cycles="$(extract_field "$profile_result" p90_cycles)"
-    p99_cycles="$(extract_field "$profile_result" p99_cycles)"
+    mean_ms="$(extract_field "$total_profile_result" mean_ms)"
+    p50_ms="$(extract_field "$total_profile_result" p50_ms)"
+    p90_ms="$(extract_field "$total_profile_result" p90_ms)"
+    p99_ms="$(extract_field "$total_profile_result" p99_ms)"
+    mean_cycles="$(extract_field "$total_profile_result" mean_cycles)"
+    p50_cycles="$(extract_field "$total_profile_result" p50_cycles)"
+    p90_cycles="$(extract_field "$total_profile_result" p90_cycles)"
+    p99_cycles="$(extract_field "$total_profile_result" p99_cycles)"
+    post_mean_cycles="$(extract_field "$post_profile_result" mean_cycles)"
+    post_p50_cycles="$(extract_field "$post_profile_result" p50_cycles)"
+    post_p90_cycles="$(extract_field "$post_profile_result" p90_cycles)"
+    post_p99_cycles="$(extract_field "$post_profile_result" p99_cycles)"
+    completion_wait_mean_cycles="$(extract_field "$completion_wait_profile_result" mean_cycles)"
+    completion_wait_p50_cycles="$(extract_field "$completion_wait_profile_result" p50_cycles)"
+    completion_wait_p90_cycles="$(extract_field "$completion_wait_profile_result" p90_cycles)"
+    completion_wait_p99_cycles="$(extract_field "$completion_wait_profile_result" p99_cycles)"
     token_bytes_values+=("$token_bytes")
     miss_count_values+=("$miss_count")
-    mean_us="$(awk -v cycles="$mean_cycles" -v mhz="$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" 'BEGIN { printf "%.3f", cycles / mhz }')"
-    p50_us="$(awk -v cycles="$p50_cycles" -v mhz="$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" 'BEGIN { printf "%.3f", cycles / mhz }')"
-    p90_us="$(awk -v cycles="$p90_cycles" -v mhz="$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" 'BEGIN { printf "%.3f", cycles / mhz }')"
-    p99_us="$(awk -v cycles="$p99_cycles" -v mhz="$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" 'BEGIN { printf "%.3f", cycles / mhz }')"
+    mean_us="$(cycles_to_us "$mean_cycles")"
+    p50_us="$(cycles_to_us "$p50_cycles")"
+    p90_us="$(cycles_to_us "$p90_cycles")"
+    p99_us="$(cycles_to_us "$p99_cycles")"
+    post_mean_us="$(cycles_to_us "$post_mean_cycles")"
+    post_p50_us="$(cycles_to_us "$post_p50_cycles")"
+    post_p90_us="$(cycles_to_us "$post_p90_cycles")"
+    post_p99_us="$(cycles_to_us "$post_p99_cycles")"
+    completion_wait_mean_us="$(cycles_to_us "$completion_wait_mean_cycles")"
+    completion_wait_p50_us="$(cycles_to_us "$completion_wait_p50_cycles")"
+    completion_wait_p90_us="$(cycles_to_us "$completion_wait_p90_cycles")"
+    completion_wait_p99_us="$(cycles_to_us "$completion_wait_p99_cycles")"
     payload_bytes=$((miss_count * token_bytes))
     p50_gbps="$(awk -v byte_count="$payload_bytes" -v cycle_count="$p50_cycles" \
       -v mhz="$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" \
@@ -107,6 +151,14 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
     p90_us_values+=("$p90_us")
     p99_us_values+=("$p99_us")
     p50_gbps_values+=("$p50_gbps")
+    post_mean_us_values+=("$post_mean_us")
+    post_p50_us_values+=("$post_p50_us")
+    post_p90_us_values+=("$post_p90_us")
+    post_p99_us_values+=("$post_p99_us")
+    completion_wait_mean_us_values+=("$completion_wait_mean_us")
+    completion_wait_p50_us_values+=("$completion_wait_p50_us")
+    completion_wait_p90_us_values+=("$completion_wait_p90_us")
+    completion_wait_p99_us_values+=("$completion_wait_p99_us")
 
     result=(
       "BATCH_GET_MISS_SWEEP_RESULT"
@@ -125,6 +177,14 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
       "p50_us=$p50_us"
       "p90_us=$p90_us"
       "p99_us=$p99_us"
+      "post_mean_us=$post_mean_us"
+      "post_p50_us=$post_p50_us"
+      "post_p90_us=$post_p90_us"
+      "post_p99_us=$post_p99_us"
+      "completion_wait_mean_us=$completion_wait_mean_us"
+      "completion_wait_p50_us=$completion_wait_p50_us"
+      "completion_wait_p90_us=$completion_wait_p90_us"
+      "completion_wait_p99_us=$completion_wait_p99_us"
       "payload_bytes=$payload_bytes"
       "p50_GBps=$p50_gbps"
     )
@@ -136,6 +196,7 @@ done
 
 printf '\nBATCH_GET_MISS_SWEEP_SUMMARY combinations=%s units=us clock_mhz=%s aggregation=max_elapsed_across_cores\n' \
   "${#mean_us_values[@]}" "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ"
+printf 'BATCH_GET_MISS_SWEEP_STAGE_SUMMARY stage=kernel_total\n'
 printf '%-12s %-12s %15s %15s %15s %15s %15s\n' \
   token_bytes miss_count mean_us p50_us p90_us p99_us p50_GB/s
 for index in "${!mean_us_values[@]}"; do
@@ -149,21 +210,56 @@ for index in "${!mean_us_values[@]}"; do
     "${p50_gbps_values[$index]}"
 done
 
+printf '\nBATCH_GET_MISS_SWEEP_STAGE_SUMMARY stage=kernel_post\n'
+printf '%-12s %-12s %15s %15s %15s %15s\n' \
+  token_bytes miss_count mean_us p50_us p90_us p99_us
+for index in "${!post_mean_us_values[@]}"; do
+  printf '%-12s %-12s %15s %15s %15s %15s\n' \
+    "${token_bytes_values[$index]}" \
+    "${miss_count_values[$index]}" \
+    "${post_mean_us_values[$index]}" \
+    "${post_p50_us_values[$index]}" \
+    "${post_p90_us_values[$index]}" \
+    "${post_p99_us_values[$index]}"
+done
+
+printf '\nBATCH_GET_MISS_SWEEP_STAGE_SUMMARY stage=kernel_completion_wait\n'
+printf '%-12s %-12s %15s %15s %15s %15s\n' \
+  token_bytes miss_count mean_us p50_us p90_us p99_us
+for index in "${!completion_wait_mean_us_values[@]}"; do
+  printf '%-12s %-12s %15s %15s %15s %15s\n' \
+    "${token_bytes_values[$index]}" \
+    "${miss_count_values[$index]}" \
+    "${completion_wait_mean_us_values[$index]}" \
+    "${completion_wait_p50_us_values[$index]}" \
+    "${completion_wait_p90_us_values[$index]}" \
+    "${completion_wait_p99_us_values[$index]}"
+done
+
 echo "BATCH_GET_MISS_SWEEP_CLOCK clock_mhz=$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ conversion=cycles_per_mhz_to_us"
 
 : "${KVAF_BATCH_GET_MISS_SWEEP_CSV:=$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR/batch_get_miss_sweep_summary.csv}"
 mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
 {
-  printf 'token_bytes,miss_count,mean_us,p50_us,p90_us,p99_us,p50_GBps\n'
+  printf '%s\n' \
+    'token_bytes,miss_count,mean_us,p50_us,p90_us,p99_us,p50_GBps,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us'
   for index in "${!mean_us_values[@]}"; do
-    printf '%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "${token_bytes_values[$index]}" \
       "${miss_count_values[$index]}" \
       "${mean_us_values[$index]}" \
       "${p50_us_values[$index]}" \
       "${p90_us_values[$index]}" \
       "${p99_us_values[$index]}" \
-      "${p50_gbps_values[$index]}"
+      "${p50_gbps_values[$index]}" \
+      "${post_mean_us_values[$index]}" \
+      "${post_p50_us_values[$index]}" \
+      "${post_p90_us_values[$index]}" \
+      "${post_p99_us_values[$index]}" \
+      "${completion_wait_mean_us_values[$index]}" \
+      "${completion_wait_p50_us_values[$index]}" \
+      "${completion_wait_p90_us_values[$index]}" \
+      "${completion_wait_p99_us_values[$index]}"
   done
 } >"$KVAF_BATCH_GET_MISS_SWEEP_CSV"
 echo "BATCH_GET_MISS_SWEEP_CSV_WRITTEN path=$KVAF_BATCH_GET_MISS_SWEEP_CSV rows=${#mean_us_values[@]}"
