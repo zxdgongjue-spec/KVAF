@@ -119,7 +119,10 @@ CPU URMA transport/operator 的源码归属 `access_operator/include/cpu_urma` �
 `access_operator/src/cpu_urma`；Runtime 仅负责 HBM region、MetaManager 和 operator
 注入。CPU BatchPut 的 `CPU DRAM -> HBM` 数据流对应 AIV BatchGet，CPU BatchGet 的
 `HBM -> CPU DRAM` 数据流对应 AIV BatchPut。可用下面的脚本按与 AIV BatchGet
-相同的 token-bytes/miss-count 组合测试 CPU BatchPut：
+相同的 token-bytes/miss-count 组合测试 CPU BatchPut。测试始终传入
+`request_length` 容量的 keys、offsets、lengths 和 packed input，并由显式
+`miss_count` 只执行紧凑前缀 `[0, miss_count)`；未激活的尾部不会分配 slot 或生成
+URMA WQE：
 
 ```bash
 tests/run_cpu_batch_put_miss_count_perf.sh "$PWD/build-cpu" \

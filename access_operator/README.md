@@ -23,8 +23,9 @@ CPU 与 AIV 的函数名描述各自 Runtime 视角，因此应按数据流对�
 | `ExecuteBatchGet` | NPU HBM -> CPU DRAM | AIV `ExecuteBatchPut` 的 HBM -> Host DDR WRITE |
 
 两种后端都实现 `AccessOperator::ExecuteBatchGet/ExecuteBatchPut`。CPU BatchPut 接受
-Runtime 已展平的 packed input、offset、length 和 `PreparePut` 目标地址；对于固定
-token 大小和紧凑请求前缀，它与最新版 AIV BatchGet 的逐请求数据语义一致。
+固定容量的 packed input、offset、length 和显式 `miss_count`；Runtime 只展平紧凑
+前缀 `[0, miss_count)`，再把它与 `PreparePut` 目标地址交给 Operator。未激活尾部不
+参与校验、slot 分配或 WQE 生成，与最新版 AIV BatchGet 的 direct-prefix 语义一致。
 
 ## 当前接口与能力
 

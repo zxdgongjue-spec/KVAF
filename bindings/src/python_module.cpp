@@ -245,7 +245,8 @@ class PythonRuntime final {
   void BatchPut(std::vector<std::vector<KeyId>> keys,
                 const py::list& inputs,
                 std::vector<std::vector<std::uint64_t>> input_offsets,
-                std::vector<std::vector<std::uint64_t>> lengths) {
+                std::vector<std::vector<std::uint64_t>> lengths,
+                py::object miss_count) {
     if (keys.empty() || keys.size() != static_cast<std::size_t>(inputs.size()) ||
         keys.size() != input_offsets.size() || keys.size() != lengths.size()) {
       throw py::value_error(
@@ -280,6 +281,13 @@ class PythonRuntime final {
                           DeviceKind::kCpu},
           std::move(input_offsets[group_index]),
           std::move(lengths[group_index])});
+    }
+    if (!miss_count.is_none()) {
+      const std::int64_t count = miss_count.cast<std::int64_t>();
+      if (count < 0) {
+        throw py::value_error("BatchPut miss_count must be non-negative");
+      }
+      request.miss_count = static_cast<std::size_t>(count);
     }
     ThrowIfError(runtime_->BatchPut(request));
   }
@@ -420,7 +428,8 @@ class CpuPythonRuntime final {
 
   void BatchPut(std::vector<std::vector<KeyId>> keys, const py::list& inputs,
                 std::vector<std::vector<std::uint64_t>> input_offsets,
-                std::vector<std::vector<std::uint64_t>> lengths) {
+                std::vector<std::vector<std::uint64_t>> lengths,
+                py::object miss_count) {
     if (keys.empty() || keys.size() != static_cast<std::size_t>(inputs.size()) ||
         keys.size() != input_offsets.size() || keys.size() != lengths.size()) {
       throw py::value_error("BatchPut arguments must have equal outer sizes");
@@ -444,6 +453,13 @@ class CpuPythonRuntime final {
           std::move(keys[group]),
           ConstBufferView{info.ptr, bytes, DeviceKind::kCpu},
           std::move(input_offsets[group]), std::move(lengths[group])});
+    }
+    if (!miss_count.is_none()) {
+      const std::int64_t count = miss_count.cast<std::int64_t>();
+      if (count < 0) {
+        throw py::value_error("BatchPut miss_count must be non-negative");
+      }
+      request.miss_count = static_cast<std::size_t>(count);
     }
     ThrowIfError(native_.core().BatchPut(request));
   }
@@ -533,7 +549,8 @@ PYBIND11_MODULE(_kvaf, m) {
       .def_property_readonly("initialized", &kvaf::PythonRuntime::Initialized)
       .def_property_readonly("remote_region", &kvaf::PythonRuntime::RemoteRegion)
       .def("batch_put", &kvaf::PythonRuntime::BatchPut, py::arg("keys"),
-           py::arg("input"), py::arg("input_offsets"), py::arg("lengths"))
+           py::arg("input"), py::arg("input_offsets"), py::arg("lengths"),
+           py::arg("miss_count") = py::none())
       .def("prepare_access_table", &kvaf::PythonRuntime::PrepareAccessTable,
            py::arg("keys"))
       .def("access_table_view", &kvaf::PythonRuntime::AccessTableView,
@@ -581,7 +598,8 @@ PYBIND11_MODULE(_kvaf, m) {
       .def_property_readonly("last_batch_timing",
                              &kvaf::CpuPythonRuntime::LastBatchTiming)
       .def("batch_put", &kvaf::CpuPythonRuntime::BatchPut,
-           py::arg("keys"), py::arg("input"), py::arg("input_offsets"), py::arg("lengths"))
+           py::arg("keys"), py::arg("input"), py::arg("input_offsets"),
+           py::arg("lengths"), py::arg("miss_count") = py::none())
       .def("prepare_access_table", &kvaf::CpuPythonRuntime::PrepareAccessTable,
            py::arg("keys"))
       .def("access_table_view", &kvaf::CpuPythonRuntime::AccessTableView,

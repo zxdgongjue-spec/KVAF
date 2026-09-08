@@ -519,7 +519,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                   {std::numeric_limits<KeyId>::max()},
                   ConstBufferView{impl_->probe_buffer, probe_bytes,
                                   DeviceKind::kNpu},
-                  {0U}, {probe_bytes}}}},
+                  {0U}, {probe_bytes}}}, std::nullopt},
               BatchPutExecutionOptions{stream});
           if (last.ok()) last = impl_->runtime_core->BatchFree(BatchFreeRequest{{std::numeric_limits<KeyId>::max()}});
           if (last.ok()) {

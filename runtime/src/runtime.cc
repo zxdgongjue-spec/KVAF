@@ -1,5 +1,6 @@
 #include "runtime.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -346,36 +347,49 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
       return Status::InvalidArgument(
           "BatchPut group keys, input_offsets, and lengths must be non-empty and equal in size");
     }
-    for (std::size_t index = 0; index < group.keys.size(); ++index) {
+    rows += group.keys.size();
+  }
+
+  const std::size_t active_rows = request.miss_count.value_or(rows);
+  if (active_rows > rows) {
+    return Status::InvalidArgument(
+        "BatchPut miss_count must be between zero and the request capacity");
+  }
+  if (active_rows == 0) {
+    return Status::OK();
+  }
+
+  BatchPutExecutionPlan plan;
+  plan.flat_keys.reserve(active_rows);
+  plan.sources.reserve(request.groups.size());
+  plan.source_indices.reserve(active_rows);
+  plan.offsets.reserve(active_rows);
+  plan.lengths.reserve(active_rows);
+  std::size_t remaining = active_rows;
+  for (std::size_t group_index = 0; group_index < request.groups.size();
+       ++group_index) {
+    const BatchPutGroup& group = request.groups[group_index];
+    plan.sources.push_back(group.input);
+    const std::size_t group_active = std::min(remaining, group.keys.size());
+    for (std::size_t index = 0; index < group_active; ++index) {
       const std::uint64_t offset = group.input_offsets[index];
       const std::uint64_t length = group.lengths[index];
       if (length == 0 || offset > group.input.bytes ||
           length > group.input.bytes - offset) {
         return Status::InvalidArgument(
-            "BatchPut input_offsets and lengths must describe bytes inside input");
+            "BatchPut active input_offsets and lengths must describe bytes inside input");
       }
     }
-    rows += group.keys.size();
-  }
-
-  BatchPutExecutionPlan plan;
-  plan.flat_keys.reserve(rows);
-  plan.sources.reserve(request.groups.size());
-  plan.source_indices.reserve(rows);
-  plan.offsets.reserve(rows);
-  plan.lengths.reserve(rows);
-  for (std::size_t group_index = 0; group_index < request.groups.size();
-       ++group_index) {
-    const BatchPutGroup& group = request.groups[group_index];
-    plan.sources.push_back(group.input);
     plan.flat_keys.insert(plan.flat_keys.end(), group.keys.begin(),
-                          group.keys.end());
-    plan.source_indices.insert(plan.source_indices.end(), group.keys.size(),
+                          group.keys.begin() + group_active);
+    plan.source_indices.insert(plan.source_indices.end(), group_active,
                                static_cast<std::uint32_t>(group_index));
     plan.offsets.insert(plan.offsets.end(), group.input_offsets.begin(),
-                        group.input_offsets.end());
+                        group.input_offsets.begin() + group_active);
     plan.lengths.insert(plan.lengths.end(), group.lengths.begin(),
-                        group.lengths.end());
+                        group.lengths.begin() + group_active);
+    remaining -= group_active;
+    if (remaining == 0) break;
   }
 
   PutContext put_context;

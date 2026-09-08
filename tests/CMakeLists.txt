@@ -1,5 +1,12 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+add_executable(kvaf_runtime_batch_put_prefix_test
+  runtime_batch_put_prefix_test.cc)
+target_link_libraries(kvaf_runtime_batch_put_prefix_test PRIVATE kvaf_runtime)
+target_compile_features(kvaf_runtime_batch_put_prefix_test PRIVATE cxx_std_17)
+add_test(NAME kvaf_runtime_batch_put_prefix
+  COMMAND kvaf_runtime_batch_put_prefix_test)
+
 if(KVAF_BUILD_PYTHON)
   add_test(
     NAME kvaf_runtime_mock_python
@@ -50,8 +57,8 @@ else()
     "Skipping direct Runtime Python tests; configure with -DKVAF_BUILD_PYTHON=ON")
 endif()
 
-# Runtime tests are Python-only. Mock and NPU integration coverage call the
-# pybind API directly; no subprocess driver is built or invoked.
+# Python tests cover the public binding. The compact-prefix C++ test protects
+# Runtime filtering before MetaManager and AccessOperator execution.
 
 if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   # Standalone coverage uses the production transport owned by

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "types.h"
@@ -79,6 +80,12 @@ struct BatchPutGroup {
 // byte range [input_offsets[i], input_offsets[i] + lengths[i]) in that view.
 struct BatchPutRequest {
   std::vector<BatchPutGroup> groups;
+
+  // Fixed-capacity callers may provide the compact active-prefix length used
+  // by the latest AIV BatchGet contract. It applies to the flattened group
+  // order. When absent, every row is active. A value of zero is a valid no-op;
+  // inactive suffix descriptors are ignored.
+  std::optional<std::size_t> miss_count;
 };
 
 // Runtime flattens grouped input once. AccessOperator consumes this contiguous

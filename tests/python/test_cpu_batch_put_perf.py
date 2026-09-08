@@ -2,9 +2,9 @@
 """Measure CPU Runtime BatchPut from packed CPU DRAM into remote NPU HBM.
 
 The benchmark uses the same compact-prefix shape as the latest AIV BatchGet
-benchmark: ``request_length`` is the fixed capacity and ``miss_count`` is the
-number of active rows. Only the active prefix is submitted because the public
-BatchPut API has no inactive descriptors.
+benchmark: ``request_length`` is the fixed descriptor/buffer capacity and
+``miss_count`` is the number of active rows. Full-capacity inputs are passed to
+BatchPut, which consumes only the active prefix.
 """
 
 from __future__ import annotations
@@ -113,8 +113,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def validate_args(args: argparse.Namespace) -> str | None:
     if args.request_length <= 0 or args.request_length > MAX_INT32:
         return "request-length must be in [1, INT32_MAX]"
-    if args.miss_count <= 0 or args.miss_count > args.request_length:
-        return "miss-count must be in [1, request-length]"
+    if args.miss_count < 0 or args.miss_count > args.request_length:
+        return "miss-count must be in [0, request-length]"
     if args.token_bytes <= 0 or args.token_bytes > MAX_INT32:
         return "token-bytes must be in [1, INT32_MAX]"
     if args.warmup < 0 or args.iterations <= 0:
@@ -186,10 +186,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     slot_size = args.token_bytes
     hbm_bytes = args.request_length * slot_size
     payload_bytes = args.miss_count * args.token_bytes
-    keys = list(range(1, args.miss_count + 1))
-    offsets = [row * args.token_bytes for row in range(args.miss_count)]
-    lengths = [args.token_bytes] * args.miss_count
-    source = make_source(payload_bytes)
+    keys = list(range(1, args.request_length + 1))
+    offsets = [row * args.token_bytes for row in range(args.request_length)]
+    lengths = [args.token_bytes] * args.request_length
+    source = make_source(args.request_length * args.token_bytes)
+    active_keys = keys[: args.miss_count]
 
     runtime = kvaf.CpuRuntime()
     print(
@@ -215,7 +216,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
         def execute() -> None:
-            runtime.batch_put([keys], [source], [offsets], [lengths])
+            runtime.batch_put(
+                [keys],
+                [source],
+                [offsets],
+                [lengths],
+                miss_count=args.miss_count,
+            )
+
+        def free_active() -> None:
+            if active_keys:
+                runtime.batch_free(active_keys)
 
         def read_timing() -> dict[str, int]:
             timing = dict(runtime.last_batch_timing)
@@ -223,23 +234,24 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         print("CPU_BATCH_PUT_PERF_PHASE_BEGIN phase=correctness_preflight")
         execute()
-        table = runtime.prepare_access_table(keys)
-        output = bytearray(payload_bytes)
-        try:
-            rows = list(range(args.miss_count))
-            runtime.batch_get(
-                table,
-                rows,
-                [0] * args.miss_count,
-                rows,
-                output,
-                args.token_bytes,
-            )
-            if bytes(output) != source:
-                raise AssertionError("CPU BatchPut payload validation failed")
-        finally:
-            runtime.release_access_table(table)
-        runtime.batch_free(keys)
+        if active_keys:
+            table = runtime.prepare_access_table(active_keys)
+            output = bytearray(payload_bytes)
+            try:
+                rows = list(range(args.miss_count))
+                runtime.batch_get(
+                    table,
+                    rows,
+                    [0] * args.miss_count,
+                    rows,
+                    output,
+                    args.token_bytes,
+                )
+                if bytes(output) != source[:payload_bytes]:
+                    raise AssertionError("CPU BatchPut payload validation failed")
+            finally:
+                runtime.release_access_table(table)
+        free_active()
         print(
             "CPU_BATCH_PUT_CORRECTNESS_PASS "
             f"miss_count={args.miss_count} token_bytes={args.token_bytes}"
@@ -249,7 +261,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("CPU_BATCH_PUT_PERF_PHASE_BEGIN phase=warmup")
         for _ in range(args.warmup):
             execute()
-            runtime.batch_free(keys)
+            free_active()
         print(
             "CPU_BATCH_PUT_PERF_PHASE_DONE "
             f"phase=warmup iterations={args.warmup}"
@@ -271,7 +283,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             post_samples.append(timing["post_ns"])
             poll_samples.append(timing["poll_ns"])
             total_samples.append(timing["total_ns"])
-            runtime.batch_free(keys)
+            free_active()
 
         for operation, samples in (
             ("batch_put", call_samples),
