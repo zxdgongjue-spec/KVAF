@@ -11,9 +11,11 @@ namespace {
 
 void PrintUsage(const char* program) {
   std::fprintf(stderr,
-               "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N]\n"
+               "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] "
+               "[--host-allocator posix|acl]\n"
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
-               "candidates are discovered automatically. The service requires only liburma and /dev/uburma.\n",
+               "candidates are discovered automatically. The default posix allocator requires only liburma "
+               "and /dev/uburma; the acl allocator dynamically loads libascendcl.so.\n",
                program);
 }
 
@@ -39,7 +41,7 @@ int main(int argc, char** argv) {
       return 0;
     }
     if ((argument == "--listen" || argument == "--port" || argument == "--ub-device" ||
-         argument == "--eid-index") && index + 1 >= argc) {
+         argument == "--eid-index" || argument == "--host-allocator") && index + 1 >= argc) {
       PrintUsage(argv[0]);
       return 2;
     }
@@ -62,6 +64,16 @@ int main(int argc, char** argv) {
         return 2;
       }
       cpu_options.has_eid_index = true;
+    } else if (argument == "--host-allocator") {
+      const std::string allocator(argv[++index]);
+      if (allocator == "posix") {
+        cpu_options.host_allocator = kvaf::CpuHostAllocator::kPosix;
+      } else if (allocator == "acl") {
+        cpu_options.host_allocator = kvaf::CpuHostAllocator::kAcl;
+      } else {
+        std::fprintf(stderr, "invalid --host-allocator (expected posix or acl)\n");
+        return 2;
+      }
     } else {
       PrintUsage(argv[0]);
       return 2;

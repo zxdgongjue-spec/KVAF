@@ -32,8 +32,8 @@ AccessOperator，并把调用方已经准备好的输入/输出 buffer 交给数
 segment/token/Jetty 与会话。TCP 监听是无状态的 `RuntimeService`：它只接收连接并
 分发给 Runtime，不拥有硬件资源。
 
-CPU 服务只需要 UB 驱动、`/dev/uburma`、UMDK 公开头文件和 `liburma.so`；不链接
-或加载 CANN、HCCP、ACL。仓库根目录的统一构建入口会自动拉取固定 UMDK 源码，并在系统
+CPU 服务默认只需要 UB 驱动、`/dev/uburma`、UMDK 公开头文件和 `liburma.so`；不链接
+CANN、HCCP 或 ACL。仓库根目录的统一构建入口会自动拉取固定 UMDK 源码，并在系统
 缺少 `liburma.so` 时只构建所需的 UMDK `urma` target：
 
 ```bash
@@ -42,6 +42,16 @@ cd /path/to/kvaf
 
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28999
+```
+
+为对比旧版 `aclrtMallocHost` 内存路径，可在安装了 CANN 的 CPU 服务机上使用
+`--host-allocator acl`。该模式运行时动态加载 `libascendcl.so`，不改变默认构建依赖：
+
+```bash
+LD_LIBRARY_PATH=/path/to/cann/lib64:${LD_LIBRARY_PATH:-} \
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28999 \
+  --host-allocator acl
 ```
 
 默认自动枚举所有可用 UMDK UB device/EID；`--ub-device NAME` 和
