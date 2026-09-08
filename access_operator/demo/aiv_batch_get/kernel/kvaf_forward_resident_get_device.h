@@ -343,12 +343,40 @@ __simt_callee__ inline bool TryAcquireKvafForwardResidentQueueFromSimt(
       reinterpret_cast<__gm__ int32_t*>(control.queue_leases);
   for (uint32_t probe = 0U; probe < queue_count; ++probe) {
     const uint32_t queue_id = (first_queue + probe) % queue_count;
-    if (asc_atomic_cas(owners + queue_id, 0, owner_tag) == 0) {
+    // Test-and-test-and-set: a busy queue does not need an atomic RMW.
+    // A free observation is only a hint; the CAS remains the sole owner.
+    if (asc_ldcg(owners + queue_id) == 0 &&
+        asc_atomic_cas(owners + queue_id, 0, owner_tag) == 0) {
       AscendC::Simt::ThreadFence();
       lease->queue_id = queue_id;
       lease->owner_tag = owner_tag;
       lease->state = kForwardResidentQueueHeld;
       lease->reserved0 = 0U;
+      return true;
+    }
+  }
+  return false;
+}
+
+// Avoid entering a SIMT service (and its two Scalar/Vector handoffs) merely
+// to discover that every queue is busy. Control is immutable for this
+// invocation. Owners are NOT cached: only bypass loads may observe release
+// by another worker. This helper grants no lease and writes no state.
+__aicore__ inline bool FindKvafForwardResidentAvailableQueueForAicore(
+    const KvafForwardResidentBatchGetControl& control, uint32_t start_hint,
+    uint32_t* queue_hint) {
+  if (queue_hint == nullptr ||
+      !IsKvafForwardResidentBatchGetControlValidForAicore(control)) {
+    return false;
+  }
+  __gm__ int32_t* const owners =
+      reinterpret_cast<__gm__ int32_t*>(control.queue_leases);
+  const uint32_t count = static_cast<uint32_t>(control.queue_count);
+  const uint32_t first = start_hint % count;
+  for (uint32_t probe = 0U; probe < count; ++probe) {
+    const uint32_t queue = (first + probe) % count;
+    if (ReadGmByPassDCache<int32_t>(owners + queue) == 0) {
+      *queue_hint = queue;
       return true;
     }
   }
