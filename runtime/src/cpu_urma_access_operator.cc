@@ -57,8 +57,10 @@ Status CpuUrmaAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& request
         bytes > region_.length - (allocation.address - region_.base))
       return Status::InvalidArgument("BatchPut entry is outside its buffer or remote region");
     const auto* data = static_cast<const std::uint8_t*>(source.data) + source_offset;
-    const Status status = transport_.Write(allocation.address - region_.base, data,
-                                           static_cast<std::size_t>(bytes));
+    const CpuUrmaTransport::HostSge source_sge{const_cast<std::uint8_t*>(data),
+                                               static_cast<std::size_t>(bytes)};
+    const Status status = transport_.WriteSglBatch(allocation.address - region_.base,
+                                                   &source_sge, 1U, 1U);
     if (!status.ok()) return status;
   }
   return Status::OK();
@@ -99,8 +101,10 @@ Status CpuUrmaAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& request
         batch.output_block_bytes > region_.length - remote_offset - static_cast<std::uint64_t>(offset))
       return Status::InvalidArgument("CPU BatchGet remote address is invalid");
     auto* destination = static_cast<std::uint8_t*>(batch.output.data) + destination_offset;
-    const Status status = transport_.Read(remote_offset + static_cast<std::uint64_t>(offset),
-                                          destination, static_cast<std::size_t>(batch.output_block_bytes));
+    const CpuUrmaTransport::HostSge destination_sge{destination,
+                                                    static_cast<std::size_t>(batch.output_block_bytes)};
+    const Status status = transport_.ReadSglBatch(
+        remote_offset + static_cast<std::uint64_t>(offset), &destination_sge, 1U, 1U);
     if (!status.ok()) return status;
   }
   return Status::OK();

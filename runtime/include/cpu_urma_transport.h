@@ -65,35 +65,18 @@ class CpuUrmaTransport final {
   CpuUrmaTransport& operator=(const CpuUrmaTransport&) = delete;
 
   Status Initialize(const CpuUrmaTransportOptions& options);
-  // Uses the caller's host buffer directly as the URMA SGE. The segment is
-  // registered and cached on first use, so no bounce-buffer copy is made.
-  Status Write(std::uint64_t remote_offset, const void* source, std::size_t bytes);
   struct HostSge {
     void* data;
     std::size_t bytes;
   };
-  Status WriteSgl(std::uint64_t remote_offset, const HostSge* sources, std::size_t count);
-  // Builds one WR per SGL group, distributes the WRs across all configured
-  // Jettys, posts the complete set, then polls one completion fence per Jetty.
+  // Builds one WR per SGL group, prepares the WQEs with OpenMP, distributes
+  // them across all configured Jettys, posts the complete batch, then polls
+  // one completion fence per Jetty.
   Status WriteSglBatch(std::uint64_t remote_offset, const HostSge* sources,
                        std::size_t count, std::size_t sgl_size);
-  // Register one page-aligned host region once. Direct transfers from any
+  // Register one page-aligned host region once. SGL transfers from any
   // sub-range of this region then reuse the same URMA segment.
   Status RegisterDirectHostMemory(void* base, std::size_t bytes);
-  // Attempts a direct CPU URMA WRITE from device memory (for example an
-  // aclrtMalloc HBM pointer), without a KVAF host-side memcpy. The pointer
-  // must remain valid until this call returns. Failure means the active
-  // liburma/provider cannot register or transmit from that device-memory
-  // address. The API does not claim that a provider never uses internal
-  // staging; that is a provider/driver implementation detail.
-  Status WriteDeviceMemory(std::uint64_t remote_offset, const void* device_source,
-                           std::size_t bytes);
-  Status Read(std::uint64_t remote_offset, void* destination, std::size_t bytes);
-  // Builds one WR per HostSge with OpenMP, posts every Jetty list from the
-  // calling thread, then waits for one final completion per Jetty.
-  Status WriteBatch(std::uint64_t remote_offset, const HostSge* sources, std::size_t count);
-  Status ReadBatch(std::uint64_t remote_offset, const HostSge* destinations, std::size_t count);
-  Status ReadSgl(std::uint64_t remote_offset, const HostSge* destinations, std::size_t count);
   Status ReadSglBatch(std::uint64_t remote_offset, const HostSge* destinations,
                       std::size_t count, std::size_t sgl_size);
   Status Shutdown();

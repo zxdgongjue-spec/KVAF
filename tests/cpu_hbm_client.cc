@@ -158,50 +158,7 @@ struct MappedRegion {
   MappedRegion& operator=(const MappedRegion&) = delete;
 };
 
-bool RunPass(kvaf::CpuUrmaTransport* transport, bool write,
-             std::vector<HostBlock>* blocks,
-             const std::vector<std::size_t>& order, std::size_t block_bytes,
-             std::size_t iterations, Stats* stats) {
-  if (transport == nullptr || blocks == nullptr || stats == nullptr) return false;
-  std::vector<kvaf::CpuUrmaTransport::HostSge> requests(order.size());
-  for (std::size_t i = 0; i < order.size(); ++i) {
-    const std::size_t block_index = order[i];
-    requests[i] = {(*blocks)[block_index].data, block_bytes};
-  }
-  const auto wall_start = std::chrono::steady_clock::now();
-  for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
-    const auto start = std::chrono::steady_clock::now();
-    const kvaf::Status status = write
-        ? transport->WriteBatch(0U, requests.data(), requests.size())
-        : transport->ReadBatch(0U, requests.data(), requests.size());
-    if (!status.ok()) {
-      std::fprintf(stderr, "[HBM_TEST][CPU] %s failed batch_wrs=%zu: %s\n",
-                   write ? "WRITE" : "READ", requests.size(), status.message().c_str());
-      return false;
-    }
-    const auto timing = transport->last_batch_timing();
-    const auto elapsed = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - start).count());
-    ++stats->batches;
-    stats->wrs += requests.size();
-    stats->blocks += order.size();
-    stats->bytes += static_cast<std::uint64_t>(order.size()) * block_bytes;
-    stats->sum_ns += elapsed;
-    stats->min_ns = std::min(stats->min_ns, elapsed);
-    stats->max_ns = std::max(stats->max_ns, elapsed);
-    stats->prepare_ns += timing.prepare_ns;
-    stats->post_ns += timing.post_ns;
-    stats->poll_ns += timing.poll_ns;
-    ++stats->phase_samples;
-  }
-  stats->wall_ns = static_cast<std::uint64_t>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::steady_clock::now() - wall_start).count());
-  return true;
-}
-
-bool RunSglPass(kvaf::CpuUrmaTransport* transport, bool write,
+bool RunBatchPass(kvaf::CpuUrmaTransport* transport, bool write,
                 std::vector<HostBlock>* blocks,
                 const std::vector<std::size_t>& order, std::size_t block_bytes,
                 std::size_t iterations, std::size_t sgl_size, Stats* stats) {
@@ -223,6 +180,7 @@ bool RunSglPass(kvaf::CpuUrmaTransport* transport, bool write,
                    write ? "WRITE" : "READ", sgl_size, status.message().c_str());
       return false;
     }
+    const auto timing = transport->last_batch_timing();
     const auto elapsed = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - start).count());
@@ -233,6 +191,10 @@ bool RunSglPass(kvaf::CpuUrmaTransport* transport, bool write,
     stats->sum_ns += elapsed;
     stats->min_ns = std::min(stats->min_ns, elapsed);
     stats->max_ns = std::max(stats->max_ns, elapsed);
+    stats->prepare_ns += timing.prepare_ns;
+    stats->post_ns += timing.post_ns;
+    stats->poll_ns += timing.poll_ns;
+    ++stats->phase_samples;
   }
   stats->wall_ns = static_cast<std::uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -391,11 +353,7 @@ int main(int argc, char** argv) {
 
   Stats warmup_stats;
   const auto run_pass = [&](bool write, std::size_t iterations, Stats* stats) {
-    if (options.sgl_size == 1U) {
-      return RunPass(&transport, write, &blocks, order, options.block_bytes,
-                     iterations, stats);
-    }
-    return RunSglPass(&transport, write, &blocks, order, options.block_bytes,
+    return RunBatchPass(&transport, write, &blocks, order, options.block_bytes,
                       iterations, options.sgl_size, stats);
   };
   if (options.warmup != 0 && !run_pass(true, options.warmup, &warmup_stats)) {
