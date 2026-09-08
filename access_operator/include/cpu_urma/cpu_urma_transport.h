@@ -1,5 +1,5 @@
-#ifndef KVAF_RUNTIME_CPU_URMA_TRANSPORT_H_
-#define KVAF_RUNTIME_CPU_URMA_TRANSPORT_H_
+#ifndef KVAF_ACCESS_OPERATOR_CPU_URMA_TRANSPORT_H_
+#define KVAF_ACCESS_OPERATOR_CPU_URMA_TRANSPORT_H_
 
 #include <array>
 #include <cstddef>
@@ -12,9 +12,9 @@
 
 namespace kvaf {
 
-// A small CPU-only URMA data-plane client.  It deliberately keeps the
-// control-plane dependency at PeerLink and exposes only byte transfers, so it
-// can later be wrapped by TransportRuntime without changing the URMA setup.
+// CPU-side URMA data plane shared by the production AccessOperator and its
+// hardware benchmarks. PeerLink supplies the control-plane channel; this
+// class owns only the local URMA resources and synchronous byte transfers.
 struct CpuUrmaTransportOptions {
   std::string peer_address;  // host:port of kvaf_cpu_service
   std::string ub_device;     // empty: first usable UB device
@@ -74,9 +74,9 @@ class CpuUrmaTransport final {
   // one completion fence per Jetty.
   Status WriteSglBatch(std::uint64_t remote_offset, const HostSge* sources,
                        std::size_t count, std::size_t sgl_size);
-  // Transfers independent remote/local address pairs. Each entry becomes one
-  // WR, allowing Runtime BatchGet/BatchPut to submit non-contiguous addresses
-  // in one operation instead of waiting after every entry.
+  // CPU BatchPut path: transfer packed CPU DRAM rows into independent HBM
+  // destinations. This is the CPU-initiated equivalent of AIV BatchGet READs.
+  // Each entry becomes one WR and the batch shares completion fences.
   Status WriteBatch(const std::uint64_t* remote_offsets,
                     const HostSge* sources, std::size_t count);
   // Register one page-aligned host region once. SGL transfers from any
@@ -84,6 +84,8 @@ class CpuUrmaTransport final {
   Status RegisterDirectHostMemory(void* base, std::size_t bytes);
   Status ReadSglBatch(std::uint64_t remote_offset, const HostSge* destinations,
                       std::size_t count, std::size_t sgl_size);
+  // CPU BatchGet path: transfer independent HBM rows into CPU DRAM. This is
+  // the CPU-initiated equivalent of AIV BatchPut WRITEs.
   Status ReadBatch(const std::uint64_t* remote_offsets,
                    const HostSge* destinations, std::size_t count);
   Status Shutdown();
@@ -100,4 +102,4 @@ class CpuUrmaTransport final {
 
 }  // namespace kvaf
 
-#endif  // KVAF_RUNTIME_CPU_URMA_TRANSPORT_H_
+#endif  // KVAF_ACCESS_OPERATOR_CPU_URMA_TRANSPORT_H_

@@ -115,6 +115,17 @@ CPU operator 会先把 BatchGet/BatchPut 解析为离散的远端 offset 和本�
 `KVAF_CPU_URMA_JETTYS`、`KVAF_CPU_URMA_OMP_THREADS` 和
 `KVAF_CPU_URMA_DOORBELL_WQES` 设置上述参数。
 
+CPU URMA transport/operator 的源码归属 `access_operator/include/cpu_urma` 和
+`access_operator/src/cpu_urma`；Runtime 仅负责 HBM region、MetaManager 和 operator
+注入。CPU BatchPut 的 `CPU DRAM -> HBM` 数据流对应 AIV BatchGet，CPU BatchGet 的
+`HBM -> CPU DRAM` 数据流对应 AIV BatchPut。可用下面的脚本按与 AIV BatchGet
+相同的 token-bytes/miss-count 组合测试 CPU BatchPut：
+
+```bash
+tests/run_cpu_batch_put_miss_count_perf.sh "$PWD/build-cpu" \
+  --request-length 8192 --jettys 4 --omp-threads 8 --doorbell-wqes 32
+```
+
 `--eid-index` 仅在需要固定候选时指定；默认由 CPU UMDK 和 NPU `pair_info`/RA EID
 列表自动选择。NPU service 的 region/session 表支持同时存在多块 HBM；每块 region
 独立注册 segment、Jetty 和 token，并按 session 释放。

@@ -1,6 +1,6 @@
 #include "cpu_runtime.h"
 #include "peer_protocol.h"
-#include "cpu_urma_access_operator.h"
+#include "cpu_urma/cpu_urma_access_operator.h"
 #include "peer_link.h"
 
 #include <dlfcn.h>
@@ -892,6 +892,18 @@ const RuntimeCore& CpuRuntime::core() const {
   if (impl_ == nullptr || !impl_->client_mode || impl_->runtime_core == nullptr)
     throw std::logic_error("CpuRuntime core is available only in client mode");
   return *impl_->runtime_core;
+}
+
+CpuRuntimeBatchTiming CpuRuntime::last_batch_timing() const {
+  if (impl_ == nullptr || !impl_->client_mode ||
+      impl_->access_operator == nullptr) {
+    throw std::logic_error(
+        "CpuRuntime batch timing is available only in client mode");
+  }
+  const CpuUrmaTransport::BatchTiming timing =
+      impl_->access_operator->last_batch_timing();
+  return CpuRuntimeBatchTiming{timing.prepare_ns, timing.post_ns,
+                               timing.poll_ns};
 }
 
 Status CpuRuntime::LinkTo(const LinkTarget& target) {

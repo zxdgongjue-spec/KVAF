@@ -9,6 +9,7 @@ import argparse
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--require-aiv", action="store_true")
+    parser.add_argument("--require-cpu-urma", action="store_true")
     options = parser.parse_args()
 
     import kvaf
@@ -23,6 +24,16 @@ def main() -> int:
             raise RuntimeError(
                 "KVAF AIV binding does not export NpuRuntime, DeviceAccessTable, "
                 "AclGraph, and NpuRuntime.batch_free"
+            )
+    if options.require_cpu_urma:
+        if (
+            not hasattr(kvaf, "CpuRuntime")
+            or not hasattr(kvaf.CpuRuntime, "batch_put")
+            or not hasattr(kvaf.CpuRuntime, "last_batch_timing")
+        ):
+            raise RuntimeError(
+                "KVAF CPU binding does not export CpuRuntime.batch_put and "
+                "CpuRuntime.last_batch_timing"
             )
     return 0
 

@@ -219,7 +219,7 @@ build_hbm_rw() {
     -DKVAF_URMA_ROOT="$umdk_root" \
     -DKVAF_URMA_LIBRARY="$urma_library"
   cmake --build "$build_dir" --target kvaf_npu_service kvaf_cpu_hbm_client --parallel "$jobs"
-  echo "[KVAF_BUILD] HBM test binaries: $build_dir/runtime/kvaf_npu_service and $build_dir/runtime/kvaf_cpu_hbm_client"
+  echo "[KVAF_BUILD] HBM test binaries: $build_dir/runtime/kvaf_npu_service and $build_dir/tests/kvaf_cpu_hbm_client"
 }
 
 mode="${1:-}"

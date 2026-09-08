@@ -407,6 +407,17 @@ class CpuPythonRuntime final {
     return result;
   }
 
+  py::dict LastBatchTiming() const {
+    const CpuRuntimeBatchTiming timing = native_.last_batch_timing();
+    py::dict result;
+    result["prepare_ns"] = timing.prepare_ns;
+    result["post_ns"] = timing.post_ns;
+    result["poll_ns"] = timing.poll_ns;
+    result["total_ns"] =
+        timing.prepare_ns + timing.post_ns + timing.poll_ns;
+    return result;
+  }
+
   void BatchPut(std::vector<std::vector<KeyId>> keys, const py::list& inputs,
                 std::vector<std::vector<std::uint64_t>> input_offsets,
                 std::vector<std::vector<std::uint64_t>> lengths) {
@@ -567,6 +578,8 @@ PYBIND11_MODULE(_kvaf, m) {
       .def("shutdown", &kvaf::CpuPythonRuntime::Shutdown)
       .def_property_readonly("initialized", &kvaf::CpuPythonRuntime::Initialized)
       .def_property_readonly("remote_region", &kvaf::CpuPythonRuntime::RemoteRegion)
+      .def_property_readonly("last_batch_timing",
+                             &kvaf::CpuPythonRuntime::LastBatchTiming)
       .def("batch_put", &kvaf::CpuPythonRuntime::BatchPut,
            py::arg("keys"), py::arg("input"), py::arg("input_offsets"), py::arg("lengths"))
       .def("prepare_access_table", &kvaf::CpuPythonRuntime::PrepareAccessTable,

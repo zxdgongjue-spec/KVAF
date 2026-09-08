@@ -38,39 +38,10 @@ endif()
 
 if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   find_package(Threads REQUIRED)
-  find_package(OpenMP REQUIRED COMPONENTS CXX)
-  set(KVAF_URMA_ROOT "" CACHE PATH "UMDK source or installation root")
-  find_path(KVAF_URMA_INCLUDE_DIR urma_api.h
-    HINTS
-      "${KVAF_URMA_ROOT}/include"
-      "${CMAKE_SOURCE_DIR}/../third_party/umdk/include"
-      /usr/include /usr/local/include
-  )
-  find_library(KVAF_URMA_LIBRARY NAMES urma
-    HINTS
-      "${KVAF_URMA_ROOT}/lib64"
-      "${KVAF_URMA_ROOT}/lib"
-      /lib64 /usr/lib64 /usr/local/lib64
-  )
   if(NOT KVAF_URMA_INCLUDE_DIR OR NOT KVAF_URMA_LIBRARY)
     message(FATAL_ERROR
-      "KVAF_BUILD_REMOTE_CPU_SERVICE requires urma_api.h and liburma; set KVAF_URMA_ROOT")
+      "CPU URMA AccessOperator did not configure urma_api.h and liburma")
   endif()
-
-  add_library(kvaf_cpu_urma_transport STATIC src/cpu_urma_transport.cc)
-  target_include_directories(kvaf_cpu_urma_transport
-    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
-    PRIVATE "${KVAF_URMA_INCLUDE_DIR}")
-  target_link_libraries(kvaf_cpu_urma_transport
-    PUBLIC kvaf_peer_link kvaf_common
-    PRIVATE "${KVAF_URMA_LIBRARY}" "${CMAKE_DL_LIBS}" Threads::Threads)
-  target_link_libraries(kvaf_cpu_urma_transport PRIVATE OpenMP::OpenMP_CXX)
-  target_compile_features(kvaf_cpu_urma_transport PUBLIC cxx_std_17)
-
-  add_library(kvaf_cpu_urma_access_operator STATIC src/cpu_urma_access_operator.cc)
-  target_include_directories(kvaf_cpu_urma_access_operator PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_link_libraries(kvaf_cpu_urma_access_operator PUBLIC kvaf_runtime kvaf_cpu_urma_transport)
-  target_compile_features(kvaf_cpu_urma_access_operator PUBLIC cxx_std_17)
 
   add_library(kvaf_cpu_runtime STATIC src/cpu_runtime.cc)
   target_include_directories(kvaf_cpu_runtime
@@ -93,18 +64,6 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   add_executable(kvaf_cpu_runtime_npu_hbm_e2e src/cpu_runtime_npu_hbm_e2e_main.cc)
   target_link_libraries(kvaf_cpu_runtime_npu_hbm_e2e PRIVATE kvaf_cpu_runtime)
   target_compile_features(kvaf_cpu_runtime_npu_hbm_e2e PRIVATE cxx_std_17)
-
-  # Standalone HBM benchmark uses the exact same CpuUrmaTransport control/data
-  # path as CpuRuntime.  Keep the benchmark entry point here so a normal
-  # `build.sh cpu` build produces it without pulling in the custom test wire
-  # protocol or a second URMA implementation.
-  add_executable(kvaf_cpu_hbm_client ../tests/cpu_hbm_client.cc)
-  target_include_directories(kvaf_cpu_hbm_client PRIVATE
-    "${KVAF_URMA_INCLUDE_DIR}")
-  target_link_libraries(kvaf_cpu_hbm_client PRIVATE kvaf_cpu_urma_transport)
-  target_compile_features(kvaf_cpu_hbm_client PRIVATE cxx_std_17)
-  set_property(TARGET kvaf_cpu_hbm_client APPEND PROPERTY BUILD_RPATH
-    "${KVAF_URMA_LIBRARY_DIR}")
 
   if(KVAF_BUILD_CPU_URMA_PROBE)
     if(NOT ASCEND_CANN_PACKAGE_PATH OR

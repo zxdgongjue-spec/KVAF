@@ -53,6 +53,19 @@ endif()
 # Runtime tests are Python-only. Mock and NPU integration coverage call the
 # pybind API directly; no subprocess driver is built or invoked.
 
+if(KVAF_BUILD_REMOTE_CPU_SERVICE)
+  # Standalone coverage uses the production transport owned by
+  # access_operator; it does not carry a second URMA implementation.
+  add_executable(kvaf_cpu_hbm_client cpu_hbm_client.cc)
+  target_include_directories(kvaf_cpu_hbm_client PRIVATE
+    "${KVAF_URMA_INCLUDE_DIR}")
+  target_link_libraries(kvaf_cpu_hbm_client PRIVATE kvaf_cpu_urma_transport)
+  target_compile_features(kvaf_cpu_hbm_client PRIVATE cxx_std_17)
+  get_filename_component(KVAF_CPU_URMA_LIBRARY_DIR "${KVAF_URMA_LIBRARY}" DIRECTORY)
+  set_property(TARGET kvaf_cpu_hbm_client APPEND PROPERTY BUILD_RPATH
+    "${KVAF_CPU_URMA_LIBRARY_DIR}")
+endif()
+
 if(KVAF_BUILD_HBM_RW_TEST)
   set(KVAF_URMA_ROOT "" CACHE PATH "UMDK source or installation root")
   find_path(KVAF_HBM_TEST_URMA_INCLUDE_DIR urma_api.h

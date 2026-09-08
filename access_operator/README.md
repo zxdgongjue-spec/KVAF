@@ -11,6 +11,21 @@ caller-owned buffer 与远端 DDR 组织为一次数据搬运。它不拥有 Key
 `DefaultAccessOperator`；它是唯一的 NPU 实现入口，不向上层暴露 AIV/AICPU 等
 路径选择。
 
+CPU 到 NPU HBM 的生产实现位于 `include/cpu_urma` 和 `src/cpu_urma`，构建为
+`kvaf_cpu_urma_access_operator`。Runtime 只创建并注入该实现，不再在 `runtime/`
+目录维护 CPU URMA 数据面副本。
+
+CPU 与 AIV 的函数名描述各自 Runtime 视角，因此应按数据流对应：
+
+| CPU AccessOperator | 传输方向 | 对应 AIV 数据面 |
+| --- | --- | --- |
+| `ExecuteBatchPut` | CPU DRAM -> NPU HBM | AIV `ExecuteBatchGet` 的 Host DDR -> HBM READ |
+| `ExecuteBatchGet` | NPU HBM -> CPU DRAM | AIV `ExecuteBatchPut` 的 HBM -> Host DDR WRITE |
+
+两种后端都实现 `AccessOperator::ExecuteBatchGet/ExecuteBatchPut`。CPU BatchPut 接受
+Runtime 已展平的 packed input、offset、length 和 `PreparePut` 目标地址；对于固定
+token 大小和紧凑请求前缀，它与最新版 AIV BatchGet 的逐请求数据语义一致。
+
 ## 当前接口与能力
 
 | 接口 | 当前行为 | 目的 |
@@ -67,7 +82,9 @@ tensor、AccessTable 和 Runtime。KVAF 不创建、保存或 replay 任何图�
 
 ## 构建范围
 
-不带 CANN 时只构建接口和 CPU Mock，用于本地 Python 测试。启用
+不带 CANN 时默认只构建接口和 CPU Mock，用于本地 Python 测试。启用
+`KVAF_BUILD_REMOTE_CPU_SERVICE=ON` 时额外构建 `src/cpu_urma` 下的正式 CPU
+URMA transport/operator。启用
 `KVAF_ENABLE_AIV_BATCH_GET=ON` 时构建 `DefaultAccessOperator` 和 BatchGet demo；
 `KVAF_ENABLE_AIV_BATCH_PUT=ON`（默认随前者启用）时额外构建 BatchPut demo 与
 Direct-HCCP Runtime adapter。名称中的 AIV 只保留在 demo/kernel 实现目录，非 Runtime

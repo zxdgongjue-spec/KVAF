@@ -29,6 +29,12 @@ struct CpuRuntimeClientOptions {
   std::uint32_t wqes_per_doorbell{0U};
 };
 
+struct CpuRuntimeBatchTiming {
+  std::uint64_t prepare_ns{0U};
+  std::uint64_t post_ns{0U};
+  std::uint64_t poll_ns{0U};
+};
+
 // CPU endpoint Runtime. It owns only CPU-side UMDK resources and sessions;
 // RuntimeService owns the listening socket and calls ServeConnection.
 class CpuRuntime final : public Runtime {
@@ -43,6 +49,7 @@ class CpuRuntime final : public Runtime {
   Status InitializeClient(const CpuRuntimeClientOptions& options);
   RuntimeCore& core();
   const RuntimeCore& core() const;
+  CpuRuntimeBatchTiming last_batch_timing() const;
 
   Status LinkTo(const LinkTarget& target) override;
   Status AcceptLink(const LinkTarget& peer) override;

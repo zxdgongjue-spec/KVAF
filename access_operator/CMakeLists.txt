@@ -9,6 +9,10 @@ target_link_libraries(kvaf_access_operator INTERFACE kvaf_common)
 
 target_compile_features(kvaf_access_operator INTERFACE cxx_std_17)
 
+if(KVAF_BUILD_REMOTE_CPU_SERVICE)
+  add_subdirectory(src/cpu_urma)
+endif()
+
 if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_BUILD_HBM_RW_TEST)
   add_subdirectory(src/direct_hccp)
 endif()

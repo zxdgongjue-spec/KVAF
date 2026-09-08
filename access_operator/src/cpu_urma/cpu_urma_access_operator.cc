@@ -1,4 +1,4 @@
-#include "cpu_urma_access_operator.h"
+#include "cpu_urma/cpu_urma_access_operator.h"
 
 #include "meta_manager.h"
 
@@ -52,6 +52,7 @@ Status CpuUrmaAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& request
   batch_remote_offsets_.clear();
   batch_buffers_.reserve(request.put_desc->entries.size());
   batch_remote_offsets_.reserve(request.put_desc->entries.size());
+  batch_used_sources_.assign(request.plan->sources.size(), 0U);
   for (std::size_t i = 0; i < request.put_desc->entries.size(); ++i) {
     const auto& allocation = request.put_desc->entries[i];
     const std::uint32_t source_index = request.plan->source_indices[i];
@@ -60,7 +61,8 @@ Status CpuUrmaAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& request
     const auto& source = request.plan->sources[source_index];
     const std::uint64_t source_offset = request.plan->offsets[i];
     const std::uint64_t bytes = request.plan->lengths[i];
-    if (!source.valid() || source_offset > source.bytes || bytes > source.bytes - source_offset ||
+    if (!source.valid() || source.device != DeviceKind::kCpu ||
+        source_offset > source.bytes || bytes > source.bytes - source_offset ||
         allocation.address < region_.base ||
         allocation.address - region_.base > region_.length ||
         bytes > region_.length - (allocation.address - region_.base))
@@ -69,9 +71,25 @@ Status CpuUrmaAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& request
     batch_buffers_.push_back(CpuUrmaTransport::HostSge{
         const_cast<std::uint8_t*>(data), static_cast<std::size_t>(bytes)});
     batch_remote_offsets_.push_back(allocation.address - region_.base);
+    batch_used_sources_[source_index] = 1U;
+  }
+  // AIV BatchGet binds its complete HBM output before posting READs. For the
+  // corresponding CPU DRAM -> HBM flow, bind each complete packed CPU input
+  // once so all row SGEs reuse the same registered host segment. Providers
+  // that reject the larger range fall back to per-row registration below.
+  for (std::size_t index = 0; index < request.plan->sources.size(); ++index) {
+    if (batch_used_sources_[index] == 0U) continue;
+    const ConstBufferView& source = request.plan->sources[index];
+    (void)transport_.RegisterDirectHostMemory(
+        const_cast<void*>(source.data), source.bytes);
   }
   return transport_.WriteBatch(batch_remote_offsets_.data(),
                                batch_buffers_.data(), batch_buffers_.size());
+}
+
+CpuUrmaTransport::BatchTiming CpuUrmaAccessOperator::last_batch_timing() const {
+  std::unique_lock<std::mutex> batch_lock(batch_mutex_);
+  return transport_.last_batch_timing();
 }
 
 Status CpuUrmaAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& request) {
