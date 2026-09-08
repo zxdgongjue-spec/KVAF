@@ -56,6 +56,9 @@ class CpuUrmaTransport final {
     std::uint64_t prepare_ns{0};
     std::uint64_t post_ns{0};
     std::uint64_t poll_ns{0};
+    // Wall time after acquiring the submission lock through final completion.
+    // Includes validation, workspace/segment lookup and gaps between chunks.
+    std::uint64_t total_ns{0};
   };
 
   CpuUrmaTransport();

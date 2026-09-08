@@ -1,5 +1,9 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+add_test(NAME kvaf_cpu_batch_put_metrics
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/python/test_cpu_batch_put_metrics.py")
+
 add_executable(kvaf_runtime_batch_put_prefix_test
   runtime_batch_put_prefix_test.cc)
 target_link_libraries(kvaf_runtime_batch_put_prefix_test PRIVATE kvaf_runtime)

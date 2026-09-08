@@ -903,7 +903,7 @@ CpuRuntimeBatchTiming CpuRuntime::last_batch_timing() const {
   const CpuUrmaTransport::BatchTiming timing =
       impl_->access_operator->last_batch_timing();
   return CpuRuntimeBatchTiming{timing.prepare_ns, timing.post_ns,
-                               timing.poll_ns};
+                               timing.poll_ns, timing.total_ns};
 }
 
 Status CpuRuntime::LinkTo(const LinkTarget& target) {

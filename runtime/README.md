@@ -138,10 +138,28 @@ tests/run_cpu_batch_put_miss_count_perf.sh "$PWD/build-cpu" \
 `miss_count={32,64,128,256,512,1024,2048,4096,8192}`，共 63 种组合；因此
 `request_length` 至少要设为 8192。结果仅生成一份 `cpu_batch_put_transport_total.csv`，
 包含 63 行数据和表头 `token_bytes,miss_count,mean_us,p50_us,p90_us,p99_us,p50_GBps`。
-延迟采用 CPU URMA transport total，`p50_GBps = token_bytes × miss_count / p50_us / 1000`。
+延迟采用 CPU URMA transport total，`p50_GBps = token_bytes × miss_count / p50_ns`（十进制
+GB/s），分母使用未格式化的纳秒分位数，避免从 CSV 的三位小数微秒值反算造成误差。
 可用 `KVAF_CPU_BATCH_PUT_SWEEP_CSV` 覆盖 CSV 输出路径；此前的
 `KVAF_CPU_BATCH_PUT_COMPARISON_CSV` 仍可作为兼容别名，前者优先。每个组合的原始日志
 仍保存在上述目录，便于排查失败。
+
+`transport total` 从取得 transport 提交锁后开始，直到整个请求的最后一个完成通知
+被确认；包含 transport 内的参数校验、工作区准备、segment 查找/回退注册、WR/SGE
+准备、提交、轮询和超过队列容量时各批次之间的间隙。不包含 Python binding、Runtime
+元数据处理、operator 组装/预注册和取得提交锁之前的等待。它是软件观测的 transport
+有效带宽，不能等同于硬件纯链路带宽。`prepare/post/poll` 保留为分段诊断，三者之和
+不再冒充完整 `total_ns`。
+
+原始日志中 `batch_put` 和 `batch_put_transport_total` 各自的 `p50_GBps` 分别采用
+各自的 p50 延迟；`useful_GBps` 使用各自的平均延迟。均值和分位数均先对每次完整调用
+取样，再排除预热进行统计，分位数采用排序后的线性插值。
+
+更新此次计时实现后，需要重新编译 CPU Python binding（例如
+`cmake --build build-cpu -j`），测试会拒绝缺少 `total_scope=transport_call` 的旧 binding。
+请使用新输出目录重新测量；旧版 `cpu_batch_put_sweep_summary.csv` 的 `p50_GBps` 也是
+transport 口径，与旧 `cpu_batch_put_transport_total.csv` 相同，并非端到端带宽。
+历史文件不会被自动删除，旧的分段计时也无法补算成新的完整 transport 耗时。
 
 `--eid-index` 仅在需要固定候选时指定；默认由 CPU UMDK 和 NPU `pair_info`/RA EID
 列表自动选择。NPU service 的 region/session 表支持同时存在多块 HBM；每块 region

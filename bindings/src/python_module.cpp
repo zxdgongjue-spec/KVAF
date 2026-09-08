@@ -421,8 +421,8 @@ class CpuPythonRuntime final {
     result["prepare_ns"] = timing.prepare_ns;
     result["post_ns"] = timing.post_ns;
     result["poll_ns"] = timing.poll_ns;
-    result["total_ns"] =
-        timing.prepare_ns + timing.post_ns + timing.poll_ns;
+    result["total_ns"] = timing.total_ns;
+    result["total_scope"] = "transport_call";
     return result;
   }
 

@@ -33,6 +33,7 @@ struct CpuRuntimeBatchTiming {
   std::uint64_t prepare_ns{0U};
   std::uint64_t post_ns{0U};
   std::uint64_t poll_ns{0U};
+  std::uint64_t total_ns{0U};
 };
 
 // CPU endpoint Runtime. It owns only CPU-side UMDK resources and sessions;

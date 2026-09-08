@@ -86,13 +86,12 @@ for token_bytes in "${KVAF_TOKEN_BYTES[@]}"; do
       exit 1
     fi
 
-    payload_bytes=$((token_bytes * miss_count))
     total_mean_us="$(extract_field "$total_result" mean_us)"
     total_p50_us="$(extract_field "$total_result" p50_us)"
     total_p90_us="$(extract_field "$total_result" p90_us)"
     total_p99_us="$(extract_field "$total_result" p99_us)"
-    p50_gbps="$(awk -v bytes="$payload_bytes" -v us="$total_p50_us" \
-      'BEGIN { printf "%.3f", (us > 0 ? bytes / us / 1000 : 0) }')"
+    # The producer uses unrounded nanosecond samples from this same operation.
+    p50_gbps="$(extract_field "$total_result" p50_GBps)"
 
     printf '%s,%s,%s,%s,%s,%s,%s\n' \
       "$token_bytes" "$miss_count" "$total_mean_us" "$total_p50_us" \

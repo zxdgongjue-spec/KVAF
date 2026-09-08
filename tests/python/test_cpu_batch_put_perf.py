@@ -16,9 +16,6 @@ import sys
 import time
 from typing import Sequence
 
-import kvaf
-
-
 DEFAULT_REQUEST_LENGTH = 8192
 DEFAULT_TOKEN_BYTES = 656
 DEFAULT_WARMUP = 5
@@ -113,8 +110,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def validate_args(args: argparse.Namespace) -> str | None:
     if args.request_length <= 0 or args.request_length > MAX_INT32:
         return "request-length must be in [1, INT32_MAX]"
-    if args.miss_count < 0 or args.miss_count > args.request_length:
-        return "miss-count must be in [0, request-length]"
+    if args.miss_count <= 0 or args.miss_count > args.request_length:
+        return "miss-count must be in [1, request-length] for transport measurements"
     if args.token_bytes <= 0 or args.token_bytes > MAX_INT32:
         return "token-bytes must be in [1, INT32_MAX]"
     if args.warmup < 0 or args.iterations <= 0:
@@ -142,6 +139,12 @@ def print_samples(
     miss_count: int,
     token_bytes: int,
 ) -> None:
+    if not samples_ns or any(value < 0 for value in samples_ns):
+        raise ValueError("timing samples must be non-empty and non-negative")
+    if operation in {"batch_put", "batch_put_transport_total"} and any(
+        value == 0 for value in samples_ns
+    ):
+        raise ValueError("call/transport timing samples must be positive")
     mean_ns = statistics.mean(samples_ns)
     p50_ns = percentile(samples_ns, 0.50)
     p90_ns = percentile(samples_ns, 0.90)
@@ -159,18 +162,46 @@ def print_samples(
     if operation in {"batch_put", "batch_put_transport_total"}:
         payload_bytes = miss_count * token_bytes
         useful_gbps = payload_bytes / mean_ns if mean_ns > 0 else 0.0
+        # Compute before formatting latency: rounded microseconds can distort
+        # bandwidth for small transfers. This is throughput at median latency,
+        # not the median of per-sample reciprocals.
+        p50_gbps = payload_bytes / p50_ns
         result += (
             f" payload_bytes_per_call={payload_bytes} "
-            f"useful_GBps={useful_gbps:.3f}"
+            f"useful_GBps={useful_gbps:.3f} p50_GBps={p50_gbps:.3f}"
         )
     print(result)
 
 
-def make_source(total_bytes: int) -> bytes:
+def validate_timing(timing: dict, call_ns: int) -> dict[str, int]:
+    if timing.get("total_scope") != "transport_call":
+        raise ValueError(
+            "transport wall-clock timing is unavailable; rebuild the CPU Python binding"
+        )
+    names = ("prepare_ns", "post_ns", "poll_ns", "total_ns")
+    for name in names:
+        value = timing.get(name)
+        if type(value) is not int or value < 0:
+            raise ValueError(f"invalid transport timing {name}={value!r}")
+    total = timing["total_ns"]
+    if total <= 0 or total > call_ns:
+        raise ValueError("transport total must be positive and within the Runtime call")
+    if sum(timing[name] for name in names[:3]) > total:
+        raise ValueError("transport stages exceed the measured transport total")
+    return {name: timing[name] for name in names}
+
+
+def make_source(total_bytes: int, token_bytes: int) -> bytes:
     pattern = bytes((index * 17 + 29) & 0xFF for index in range(256))
-    return (pattern * ((total_bytes + len(pattern) - 1) // len(pattern)))[
+    source = bytearray((pattern * ((total_bytes + len(pattern) - 1) // len(pattern)))[
         :total_bytes
-    ]
+    ])
+    # Repeated 256-byte patterns hide row/addressing swaps for common token
+    # sizes. Tag each row so the readback preflight can detect those errors.
+    tag_bytes = min(8, token_bytes)
+    for row, offset in enumerate(range(0, total_bytes, token_bytes)):
+        source[offset : offset + tag_bytes] = row.to_bytes(8, "little")[:tag_bytes]
+    return bytes(source)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -179,6 +210,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if error is not None:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2
+    import kvaf
+
     if not hasattr(kvaf, "CpuRuntime"):
         print("SKIP: CPU Runtime Python binding was not built")
         return 0
@@ -189,7 +222,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     keys = list(range(1, args.request_length + 1))
     offsets = [row * args.token_bytes for row in range(args.request_length)]
     lengths = [args.token_bytes] * args.request_length
-    source = make_source(args.request_length * args.token_bytes)
+    source = make_source(args.request_length * args.token_bytes, args.token_bytes)
     active_keys = keys[: args.miss_count]
 
     runtime = kvaf.CpuRuntime()
@@ -202,6 +235,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"doorbell_wqes={args.doorbell_wqes} warmup={args.warmup} "
         f"iterations={args.iterations}"
     )
+    print("CPU_BATCH_PUT_TIMING_SCOPE total=transport_call bandwidth=payload_over_latency bytes_unit=decimal_GB")
     try:
         runtime.initialize(
             args.peer,
@@ -227,10 +261,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         def free_active() -> None:
             if active_keys:
                 runtime.batch_free(active_keys)
-
-        def read_timing() -> dict[str, int]:
-            timing = dict(runtime.last_batch_timing)
-            return {name: int(value) for name, value in timing.items()}
 
         print("CPU_BATCH_PUT_PERF_PHASE_BEGIN phase=correctness_preflight")
         execute()
@@ -277,8 +307,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             begin_ns = time.perf_counter_ns()
             execute()
             completed_ns = time.perf_counter_ns()
-            timing = read_timing()
-            call_samples.append(completed_ns - begin_ns)
+            call_ns = completed_ns - begin_ns
+            timing = validate_timing(dict(runtime.last_batch_timing), call_ns)
+            call_samples.append(call_ns)
             prepare_samples.append(timing["prepare_ns"])
             post_samples.append(timing["post_ns"])
             poll_samples.append(timing["poll_ns"])

@@ -740,8 +740,18 @@ struct CpuUrmaTransport::Impl {
                           const std::uint64_t* remote_offsets,
                           std::size_t count, std::size_t sgl_size) {
     std::unique_lock<std::mutex> submit_lock(batch_submit_mutex_);
-    return TransferSglBatchLocked(write, offset, buffers, remote_offsets, count,
-                                  sgl_size);
+    const auto start = std::chrono::steady_clock::now();
+    last_batch_timing_ = {};
+    const Status status = TransferSglBatchLocked(
+        write, offset, buffers, remote_offsets, count, sgl_size);
+    if (!status.ok()) {
+      last_batch_timing_ = {};
+      return status;
+    }
+    last_batch_timing_.total_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count());
+    return Status::OK();
   }
 
   Status TransferBatch(bool write, const std::uint64_t* remote_offsets,
@@ -754,17 +764,25 @@ struct CpuUrmaTransport::Impl {
       return Status::InvalidArgument("invalid non-contiguous batch transfer");
     }
     std::unique_lock<std::mutex> submit_lock(batch_submit_mutex_);
+    const auto start = std::chrono::steady_clock::now();
+    last_batch_timing_ = {};
     const std::size_t batch_capacity = kJettyDepth * local_jettys_.size();
     CpuUrmaTransport::BatchTiming total_timing{};
     for (std::size_t begin = 0U; begin < count; begin += batch_capacity) {
       const std::size_t chunk = std::min(batch_capacity, count - begin);
       const Status status = TransferSglBatchLocked(
           write, 0U, buffers + begin, remote_offsets + begin, chunk, 1U);
-      if (!status.ok()) return status;
+      if (!status.ok()) {
+        last_batch_timing_ = {};
+        return status;
+      }
       total_timing.prepare_ns += last_batch_timing_.prepare_ns;
       total_timing.post_ns += last_batch_timing_.post_ns;
       total_timing.poll_ns += last_batch_timing_.poll_ns;
     }
+    total_timing.total_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count());
     last_batch_timing_ = total_timing;
     return Status::OK();
   }
