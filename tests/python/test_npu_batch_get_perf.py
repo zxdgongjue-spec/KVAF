@@ -15,6 +15,8 @@ environment variables:
     --token-bytes          KVAF_BATCH_GET_PERF_TOKEN_BYTES
     --miss-count           KVAF_BATCH_GET_PERF_MISS_COUNT
     --kernel-profile       KVAF_BATCH_GET_PERF_KERNEL_PROFILE=1
+    --kernel-profile-clock-mhz
+                           KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ
 """
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ DEFAULT_JETTYS_PER_CORE = 2
 DEFAULT_WARMUP = 3
 DEFAULT_ITERATIONS = 100
 DEFAULT_POPULATE_CHUNK_ENTRIES = 128
+DEFAULT_KERNEL_PROFILE_CLOCK_MHZ = 1000
 MAX_INT32 = (1 << 31) - 1
 MAX_UINT64 = (1 << 64) - 1
 
@@ -152,13 +155,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--kernel-profile",
         dest="kernel_profile",
         action="store_true",
-        help="collect the latest per-core AIV kernel cycle timeline per sample",
+        help="collect the per-core AIV kernel timeline for every measured sample",
     )
     kernel_profile.add_argument(
         "--no-kernel-profile",
         dest="kernel_profile",
         action="store_false",
         help="disable AIV kernel cycle profiling",
+    )
+    parser.add_argument(
+        "--kernel-profile-clock-mhz",
+        type=int,
+        default=environment_int(
+            "KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ",
+            environment_int(
+                "KVAF_RUNTIME_PERF_KERNEL_PROFILE_CLOCK_MHZ",
+                DEFAULT_KERNEL_PROFILE_CLOCK_MHZ,
+            ),
+        ),
+        help="AIV clock used to convert profile cycles to milliseconds",
     )
     parser.set_defaults(
         kernel_profile=environment_bool("KVAF_BATCH_GET_PERF_KERNEL_PROFILE")
@@ -194,6 +209,8 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "iterations must be positive"
     if args.populate_chunk_entries <= 0:
         return "populate-chunk-entries must be positive"
+    if args.kernel_profile_clock_mhz <= 0:
+        return "kernel-profile-clock-mhz must be positive"
     return None
 
 
@@ -237,52 +254,164 @@ def print_samples(
     print(result)
 
 
-def kernel_elapsed_cycles(profiles: list[dict[str, object]]) -> int:
-    if not profiles:
-        raise AssertionError("BatchGet kernel profile snapshot is empty")
-    return max(
-        int(profile["kernel_finish_cycle"]) - int(profile["kernel_start_cycle"])
-        for profile in profiles
-    )
-
-
-def print_kernel_profile_samples(
-    samples: list[int],
+def print_kernel_profile(
+    samples: list[list[dict[str, object]]],
     warmup: int,
+    clock_mhz: int,
+    npu_core_count: int,
+    jettys_per_core: int,
     request_length: int,
     miss_count: int,
-    profiles: list[dict[str, object]],
+    token_bytes: int,
 ) -> None:
-    float_samples = [float(sample) for sample in samples]
+    if not samples or any(len(sample) != npu_core_count for sample in samples):
+        raise AssertionError("BatchGet kernel profile sample/core count mismatch")
+
+    def elapsed_ms(profile: dict[str, object], begin: str, end: str) -> float:
+        return (int(profile[end]) - int(profile[begin])) / clock_mhz / 1000.0
+
+    stage_samples: dict[str, list[float]] = {
+        "kernel_wall": [],
+        "kernel_total": [],
+        "kernel_setup": [],
+        "kernel_compact": [],
+        "kernel_post": [],
+        "kernel_transfer_window": [],
+        "kernel_completion_wait": [],
+        "kernel_finalize": [],
+    }
+    per_core: list[dict[str, float]] = [
+        {
+            "total_ms": 0.0,
+            "setup_ms": 0.0,
+            "compact_ms": 0.0,
+            "post_ms": 0.0,
+            "completion_wait_ms": 0.0,
+            "finalize_ms": 0.0,
+            "active_requests": 0.0,
+            "total_posts": 0.0,
+            "jetty0_wait_ms": 0.0,
+            "jetty0_polls": 0.0,
+            "jetty1_wait_ms": 0.0,
+            "jetty1_polls": 0.0,
+        }
+        for _ in range(npu_core_count)
+    ]
+    for sample in samples:
+        stage_samples["kernel_wall"].append(
+            (
+                max(int(profile["kernel_finish_cycle"]) for profile in sample)
+                - min(int(profile["kernel_start_cycle"]) for profile in sample)
+            )
+            / clock_mhz
+            / 1000.0
+        )
+        critical: dict[str, float] = {
+            "kernel_total": 0.0,
+            "kernel_setup": 0.0,
+            "kernel_compact": 0.0,
+            "kernel_post": 0.0,
+            "kernel_transfer_window": 0.0,
+            "kernel_completion_wait": 0.0,
+            "kernel_finalize": 0.0,
+        }
+        for profile in sample:
+            core = int(profile["core"])
+            total = elapsed_ms(profile, "kernel_start_cycle", "kernel_finish_cycle")
+            setup = elapsed_ms(profile, "kernel_start_cycle", "setup_done_cycle")
+            compact = elapsed_ms(profile, "setup_done_cycle", "compact_done_cycle")
+            post = elapsed_ms(profile, "compact_done_cycle", "post_done_cycle")
+            completion = elapsed_ms(
+                profile, "post_done_cycle", "completion_done_cycle"
+            )
+            finalize = elapsed_ms(
+                profile, "completion_done_cycle", "kernel_finish_cycle"
+            )
+            first_doorbell = int(profile["first_doorbell_cycle"])
+            transfer = (
+                0.0
+                if first_doorbell == 0
+                else (
+                    int(profile["completion_done_cycle"]) - first_doorbell
+                )
+                / clock_mhz
+                / 1000.0
+            )
+            critical["kernel_total"] = max(critical["kernel_total"], total)
+            critical["kernel_setup"] = max(critical["kernel_setup"], setup)
+            critical["kernel_compact"] = max(critical["kernel_compact"], compact)
+            critical["kernel_post"] = max(critical["kernel_post"], post)
+            critical["kernel_transfer_window"] = max(
+                critical["kernel_transfer_window"], transfer
+            )
+            critical["kernel_completion_wait"] = max(
+                critical["kernel_completion_wait"], completion
+            )
+            critical["kernel_finalize"] = max(
+                critical["kernel_finalize"], finalize
+            )
+            accumulator = per_core[core]
+            accumulator["total_ms"] += total
+            accumulator["setup_ms"] += setup
+            accumulator["compact_ms"] += compact
+            accumulator["post_ms"] += post
+            accumulator["completion_wait_ms"] += completion
+            accumulator["finalize_ms"] += finalize
+            accumulator["active_requests"] += int(profile["active_requests"])
+            accumulator["total_posts"] += int(profile["total_posts"])
+            waits = list(profile["jetty_completion_wait_cycles"])
+            polls = list(profile["jetty_completion_polls"])
+            for jetty in range(2):
+                accumulator[f"jetty{jetty}_wait_ms"] += (
+                    int(waits[jetty]) / clock_mhz / 1000.0
+                )
+                accumulator[f"jetty{jetty}_polls"] += int(polls[jetty])
+        for stage, value in critical.items():
+            stage_samples[stage].append(value)
+
     print(
-        "PERF_RESULT "
-        f"operation=batch_get_kernel samples={len(samples)} "
-        f"warmup_excluded={warmup} request_length={request_length} "
-        f"miss_count={miss_count} "
-        f"mean_cycles={statistics.mean(float_samples):.3f} "
-        f"p50_cycles={percentile(float_samples, 0.50):.3f} "
-        f"p90_cycles={percentile(float_samples, 0.90):.3f} "
-        f"p99_cycles={percentile(float_samples, 0.99):.3f} "
-        "aggregation=max_elapsed_across_cores"
+        "KERNEL_PROFILE_CONTRACT "
+        f"clock_mhz={clock_mhz} unit=ms samples={len(samples)} "
+        f"aiv_cores={npu_core_count} jettys_per_core={jettys_per_core} "
+        f"request_length={request_length} miss_count={miss_count} "
+        "setup=entity_queue_and_miss_count compact=removed_direct_prefix "
+        "post=descriptor_validation_wqe_fill_sq_copy_and_doorbell "
+        "transfer_window=first_doorbell_to_all_cq_complete "
+        "completion_wait=cq_poll_until_udma_complete "
+        "profile_overhead_included=1 d2h_outside_host_metric=1"
     )
-    for profile in profiles:
-        start = int(profile["kernel_start_cycle"])
-        setup_done = int(profile["setup_done_cycle"])
-        compact_done = int(profile["compact_done_cycle"])
-        post_done = int(profile["post_done_cycle"])
-        completion_done = int(profile["completion_done_cycle"])
-        finish = int(profile["kernel_finish_cycle"])
+    total_useful_bytes = len(samples) * miss_count * token_bytes
+    for stage, values in stage_samples.items():
+        cycle_values = [value * clock_mhz * 1000.0 for value in values]
+        useful_gibps = ""
+        if stage == "kernel_total":
+            useful_gibps = (
+                " useful_GiBps="
+                f"{total_useful_bytes / (1024.0**3) / (sum(values) / 1000.0):.3f}"
+            )
         print(
-            "BATCH_GET_KERNEL_PROFILE "
-            f"sample=last core={int(profile['core'])} "
-            f"kernel_cycles={finish - start} "
-            f"setup_cycles={setup_done - start} "
-            f"compact_cycles={compact_done - setup_done} "
-            f"validate_and_post_cycles={post_done - compact_done} "
-            f"completion_cycles={completion_done - post_done} "
-            f"finish_cycles={finish - completion_done} "
-            f"active_requests={int(profile['active_requests'])} "
-            f"total_posts={int(profile['total_posts'])}"
+            "PERF_RESULT "
+            f"operation=batch_get_{stage} samples={len(values)} "
+            f"warmup_excluded={warmup} "
+            f"mean_ms={statistics.mean(values):.3f} "
+            f"p50_ms={percentile(values, 0.50):.3f} "
+            f"p90_ms={percentile(values, 0.90):.3f} "
+            f"p99_ms={percentile(values, 0.99):.3f} "
+            f"mean_cycles={statistics.mean(cycle_values):.3f} "
+            f"p50_cycles={percentile(cycle_values, 0.50):.3f} "
+            f"p90_cycles={percentile(cycle_values, 0.90):.3f} "
+            f"p99_cycles={percentile(cycle_values, 0.99):.3f} "
+            f"units={request_length}_requests_per_call{useful_gibps}"
+        )
+    divisor = float(len(samples))
+    for core, accumulator in enumerate(per_core):
+        print(
+            "KERNEL_PROFILE_CORE "
+            f"core={core} samples={len(samples)} "
+            + " ".join(
+                f"{name}_mean={value / divisor:.6f}"
+                for name, value in accumulator.items()
+            )
         )
 
 
@@ -422,6 +551,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"jettys_per_core={args.jettys_per_core} warmup={args.warmup} "
             f"iterations={args.iterations} seed={args.seed} "
             f"kernel_profile={int(args.kernel_profile)} "
+            f"kernel_profile_clock_mhz={args.kernel_profile_clock_mhz} "
             "timing=call_to_stream_completion"
         )
 
@@ -538,8 +668,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         submit_samples: list[float] = []
         synchronize_samples: list[float] = []
         batch_get_samples: list[float] = []
-        kernel_cycle_samples: list[int] = []
-        last_kernel_profiles: list[dict[str, object]] = []
+        kernel_profile_samples: list[list[dict[str, object]]] = []
         for _ in range(args.iterations):
             indices, offsets, output_indices = create_request_plan()
             # Request generation and Tensor work are deliberately excluded.
@@ -561,8 +690,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             synchronize_samples.append((completed - submitted) * 1000.0)
             batch_get_samples.append((completed - begin) * 1000.0)
             if args.kernel_profile:
-                last_kernel_profiles = list(runtime.batch_get_kernel_profile())
-                kernel_cycle_samples.append(kernel_elapsed_cycles(last_kernel_profiles))
+                kernel_profile_samples.append(
+                    list(runtime.batch_get_kernel_profile())
+                )
 
         print_samples(
             "batch_get_submit",
@@ -589,12 +719,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             token_bytes,
         )
         if args.kernel_profile:
-            print_kernel_profile_samples(
-                kernel_cycle_samples,
+            print_kernel_profile(
+                kernel_profile_samples,
                 args.warmup,
+                args.kernel_profile_clock_mhz,
+                args.aiv_cores,
+                args.jettys_per_core,
                 request_length,
                 miss_count_value,
-                last_kernel_profiles,
+                token_bytes,
             )
             runtime.stop_batch_get_kernel_profile()
             kernel_profile_started = False

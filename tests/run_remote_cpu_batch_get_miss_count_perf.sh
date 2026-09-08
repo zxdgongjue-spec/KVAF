@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sweep BatchGet token sizes and exact miss counts, then summarize AIV cycles.
+# Sweep BatchGet token sizes and exact miss counts, then summarize AIV time.
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
@@ -20,12 +20,10 @@ KVAF_BATCH_GET_MISS_COUNTS=(32 64 128 256 512 1024 2048 4096 8192)
 }
 
 # GetSystemCycle frequency is platform-specific. Use 1000 MHz by default and
-# allow the target environment to override it for cycle-to-microsecond output.
+# pass the same value to the Python profiler for cycle-to-millisecond output.
 : "${KVAF_BATCH_GET_KERNEL_CLOCK_MHZ:=1000}"
-if [[ ! "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] ||
-  ! awk -v value="$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" \
-    'BEGIN { exit !(value > 0) }'; then
-  echo "ERROR: KVAF_BATCH_GET_KERNEL_CLOCK_MHZ must be a positive number" >&2
+if [[ ! "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: KVAF_BATCH_GET_KERNEL_CLOCK_MHZ must be a positive integer" >&2
   exit 2
 fi
 
@@ -67,7 +65,9 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
     log_file="$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR/token_bytes_${token_bytes}_miss_count_${miss_count}.log"
     if "$KVAF_BATCH_GET_PERF_RUNNER" "$KVAF_BUILD_DIR" "$@" \
       --token-bytes "$token_bytes" --miss-count "$miss_count" \
-      --kernel-profile 2>&1 | tee "$log_file"; then
+      --kernel-profile \
+      --kernel-profile-clock-mhz "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" \
+      2>&1 | tee "$log_file"; then
       :
     else
       status=$?
@@ -76,14 +76,18 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
     fi
 
     profile_result="$(
-      awk '$1 == "PERF_RESULT" && $2 == "operation=batch_get_kernel" { result = $0 } END { print result }' \
+      awk '$1 == "PERF_RESULT" && $2 == "operation=batch_get_kernel_total" { result = $0 } END { print result }' \
         "$log_file"
     )"
     if [[ -z "$profile_result" ]]; then
-      echo "ERROR: no batch_get_kernel PERF_RESULT for token_bytes=$token_bytes miss_count=$miss_count" >&2
+      echo "ERROR: no batch_get_kernel_total PERF_RESULT for token_bytes=$token_bytes miss_count=$miss_count" >&2
       exit 1
     fi
 
+    mean_ms="$(extract_field "$profile_result" mean_ms)"
+    p50_ms="$(extract_field "$profile_result" p50_ms)"
+    p90_ms="$(extract_field "$profile_result" p90_ms)"
+    p99_ms="$(extract_field "$profile_result" p99_ms)"
     mean_cycles="$(extract_field "$profile_result" mean_cycles)"
     p50_cycles="$(extract_field "$profile_result" p50_cycles)"
     p90_cycles="$(extract_field "$profile_result" p90_cycles)"
@@ -108,6 +112,10 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
       "BATCH_GET_MISS_SWEEP_RESULT"
       "token_bytes=$token_bytes"
       "miss_count=$miss_count"
+      "mean_ms=$mean_ms"
+      "p50_ms=$p50_ms"
+      "p90_ms=$p90_ms"
+      "p99_ms=$p99_ms"
       "mean_cycles=$mean_cycles"
       "p50_cycles=$p50_cycles"
       "p90_cycles=$p90_cycles"
