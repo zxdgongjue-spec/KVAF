@@ -19,7 +19,7 @@ KERNEL = ROOT / "access_operator/demo/aiv_batch_get/kernel"
 
 def actual_function(source, name):
     matches = list(
-        re.finditer(r"__aicore__ inline (?:bool|void) " + name + r"\(", source)
+        re.finditer(r"(?:__simt_vf__ )?__aicore__ (?:LAUNCH_BOUND\(32\)\s*)?inline (?:bool|void) " + name + r"\(", source)
     )
     if len(matches) != 1:
         raise AssertionError("missing/duplicate actual function: " + name)
@@ -42,9 +42,37 @@ PREFIX = r"""
 #include <iostream>
 #include <string>
 #include <vector>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 #define __aicore__
+#define __simt_vf__
+#define LAUNCH_BOUND(n)
 #define __gm__
 #define __ubuf__
+struct ThreadIndex { uint32_t x; };
+thread_local ThreadIndex threadIdx;
+struct WarpBarrier {
+ std::mutex lock; std::condition_variable cv; uint32_t arrived=0, generation=0;
+ void wait() {
+  std::unique_lock<std::mutex> guard(lock); const auto observed=generation;
+  if(++arrived==32U) { arrived=0; ++generation; cv.notify_all(); }
+  else cv.wait(guard,[&]{return generation!=observed;});
+ }
+} warp_barrier;
+std::array<uint32_t,32> warp_values;
+void asc_syncthreads() { warp_barrier.wait(); }
+uint32_t asc_ballot(int predicate) {
+ warp_values[threadIdx.x]=predicate!=0; asc_syncthreads();
+ uint32_t bits=0; for(uint32_t i=0;i<32;++i) bits|=warp_values[i]<<i;
+ asc_syncthreads(); return bits;
+}
+uint32_t asc_shfl_down(uint32_t value,uint32_t delta) {
+ warp_values[threadIdx.x]=value; asc_syncthreads();
+ const uint32_t result=warp_values[std::min(threadIdx.x+delta,31U)];
+ asc_syncthreads(); return result;
+}
+template<class T> T asc_ldcg(T* p) { static_assert(!std::is_const<T>::value); return *p; }
 constexpr int EVENT_ID6=6;
 alignas(64) std::array<uint8_t,4096> ub;
 uint64_t bypass_reads=0, bypass_writes=0, dma_bytes=0;
@@ -65,7 +93,7 @@ template<class T> struct LocalTensor {
 template<class T> struct GlobalTensor { T* pointer; void SetGlobalBuffer(T* p) { pointer=p; } };
 struct DataCopyExtParams { uint32_t blockCount,blockLen,srcStride,dstStride,rsv; };
 template<class T> struct DataCopyPadExtParams { bool pad; uint32_t left,right; T value; };
-enum class HardEvent { S_MTE2, MTE2_S, S_MTE3, MTE3_S };
+enum class HardEvent { S_MTE2, MTE2_S, S_MTE3, MTE3_S, S_V, V_S };
 uint32_t event_state=0;
 struct PendingCopy { void* dst; const void* src; uint32_t bytes; };
 std::vector<PendingCopy> pending;
@@ -74,6 +102,8 @@ template<HardEvent E> void SetFlag(int event) {
  if(E==HardEvent::S_MTE2) { assert(event_state==0); event_state=1; }
  else if(E==HardEvent::MTE2_S) { assert(event_state==3); event_state=4; }
  else if(E==HardEvent::S_MTE3) { assert(event_state==0); event_state=5; }
+ else if(E==HardEvent::S_V) { assert(event_state==0); event_state=8; }
+ else if(E==HardEvent::V_S) { assert(event_state==9); event_state=10; }
  else { assert(event_state==6 && pending.size()==4); event_state=7; }
 }
 template<HardEvent E> void WaitFlag(int event) {
@@ -81,11 +111,22 @@ template<HardEvent E> void WaitFlag(int event) {
  if(E==HardEvent::S_MTE2) { assert(event_state==1); event_state=2; }
  else if(E==HardEvent::MTE2_S) { assert(event_state==4); event_state=0; }
  else if(E==HardEvent::S_MTE3) { assert(event_state==5); event_state=6; }
+ else if(E==HardEvent::S_V) { assert(event_state==8); event_state=9; }
+ else if(E==HardEvent::V_S) { assert(event_state==10); event_state=0; }
  else {
   assert(event_state==7);
   for(const auto& p:pending) { std::memcpy(p.dst,p.src,p.bytes); dma_bytes+=p.bytes; }
   pending.clear(); event_state=0;
  }
+}
+namespace Simt {
+struct Dim3 { uint32_t x,y,z; };
+template<auto Fn,class... Args> void VF_CALL(Dim3 dims,Args... args) {
+ assert(dims.x==32 && dims.y==1 && dims.z==1 && event_state==9);
+ std::vector<std::thread> threads;
+ for(uint32_t lane=0;lane<32;++lane) threads.emplace_back([=]{threadIdx.x=lane; Fn(args...);});
+ for(auto& thread:threads) thread.join();
+}
 }
 template<class T> void DataCopyPad(GlobalTensor<T>& global,LocalTensor<T>& local,
  const DataCopyExtParams& p) {
@@ -107,6 +148,7 @@ template<class T> void DataCopyPad(LocalTensor<T>& local,GlobalTensor<T>& global
 }
 namespace kvaf_fused_get {
 constexpr uint32_t kDenseBatchGetReservedWqeUbBytes=4096;
+constexpr uint32_t kDenseBatchGetPostOnlyScratchCeiling=135168;
 void CleanCacheLines(uint8_t*,uint64_t) {}
 }
 """
@@ -155,7 +197,7 @@ void equivalence() {
   for(uint32_t byte=0;byte<ub.size();++byte)
    if(byte>=input_end && (byte<1024U || byte>=1024U+4U*hash_capacity))
     assert(ub[byte]==before_validation[byte]);
-  for(uint32_t byte=3328;byte<ub.size();++byte) assert(ub[byte]==0xa7);
+  for(uint32_t byte=3332;byte<ub.size();++byte) assert(ub[byte]==0xa7);
   for(uint32_t i=0;i<n;++i) assert(AppendKvafForwardResidentRequest(
     legacy.control,&legacy.descriptor,legacy.seeds[i*4+2],128,legacy.seeds[i*4+3]));
   assert(bypass_reads==static_cast<uint64_t>(n)*(n-1U)/2U);
@@ -259,11 +301,80 @@ void reuse() {
   assert(ValidateKvafForwardResidentOutputIndices(f.control,f.descriptor)); f.guards();
  }
 }
+void native_vectors() {
+ for(uint32_t n: {1U,2U,14U,31U,32U,33U,64U}) {
+  Fixture direct,legacy;
+  ub.fill(0xa7);
+  auto* words=reinterpret_cast<int32_t*>(ub.data());
+  for(uint32_t i=0;i<n;++i) {
+   words[i]=direct.seeds[i*4+2]/128;
+   words[64+i]=(direct.seeds[i*4+2]%128)*656;
+   words[128+i]=direct.seeds[i*4+3];
+   ub[768+i]=1;
+  }
+  const auto original=ub;
+  dma_bytes=0;
+  assert(PublishKvafForwardResidentRequestVectors(direct.control,&direct.descriptor,0,64,n));
+  assert(ub==original && dma_bytes==13*n && AscendC::pending.empty() && AscendC::event_state==0);
+  assert(legacy.build(n));
+  assert(direct.indices==legacy.indices && direct.outputs==legacy.outputs &&
+         direct.offsets==legacy.offsets && direct.masks==legacy.masks);
+  direct.guards();legacy.guards();
+ }
+ Fixture f;
+ for(uint32_t n: {0U,65U}) assert(!PublishKvafForwardResidentRequestVectors(f.control,&f.descriptor,0,64,n));
+ assert(!PublishKvafForwardResidentRequestVectors(f.control,&f.descriptor,1,64,1));
+ assert(!PublishKvafForwardResidentRequestVectors(f.control,&f.descriptor,0,63,1));
+ assert(!PublishKvafForwardResidentRequestVectors(f.control,&f.descriptor,UINT32_MAX-31,64,1));
+}
+
+void dense_preflight() {
+ std::array<int32_t,256> indices,offsets,outputs;
+ std::array<uint64_t,256> addresses;
+ std::array<uint8_t,256> valid;
+ KvafBatchGetDirectUrmaEntity entity{};
+ auto reset=[&] {
+  entity.local_hbm_size=256ULL*656;
+  entity.remote_host_ddr_address=0x10000000;
+  entity.remote_host_ddr_size=256ULL*kAddressTableEntryBytes;
+  for(uint32_t i=0;i<256;++i) {
+   indices[i]=i;offsets[i]=0;outputs[i]=255-i;valid[i]=1;
+   addresses[i]=entity.remote_host_ddr_address+i*kAddressTableEntryBytes;
+  }
+ };
+ auto check=[&](uint32_t n,uint64_t expected,uint64_t request) {
+  uint64_t code=99,failed=99;ub.fill(0xa7);
+  ValidateDenseBatchGetDescriptors(addresses.data(),valid.data(),indices.data(),offsets.data(),
+    outputs.data(),n,256,256,656,&entity,&code,&failed);
+  assert(code==expected && failed==request && AscendC::event_state==0);
+  for(uint32_t i=8;i<4096;++i) assert(ub[i]==0xa7);
+ };
+ for(uint32_t n: {0U,1U,31U,32U,33U,64U,255U,256U}) {reset();check(n,kSuccess,UINT64_MAX);}
+ for(uint32_t position: {0U,1U,31U,32U,127U,255U}) for(uint32_t fault=0;fault<9;++fault) {
+  reset();
+  if(fault==0) indices[position]=-1;
+  if(fault==1) indices[position]=256;
+  if(fault==2) valid[position]=0;
+  if(fault==3) offsets[position]=-1;
+  if(fault==4) offsets[position]=kAddressTableEntryBytes-kTransferBytes+1;
+  if(fault==5) outputs[position]=-1;
+  if(fault==6) outputs[position]=256;
+  if(fault==7) addresses[position]=entity.remote_host_ddr_address-1;
+  if(fault==8) addresses[position]=entity.remote_host_ddr_address+entity.remote_host_ddr_size;
+  check(256,(fault==5 || fault==6)?kInvalidOutput:kInvalidLookup,position);
+ }
+ reset();indices[33]=-1;outputs[31]=-1;check(256,kInvalidOutput,31); // different lanes/errors
+ reset();entity.local_hbm_size=655;check(256,kInvalidOutput,0);
+ reset();entity.remote_host_ddr_size=kAddressTableEntryBytes-1;check(256,kInvalidLookup,0);
+ reset();entity.remote_host_ddr_address=UINT64_MAX-10;addresses[0]=UINT64_MAX-10;offsets[0]=656;
+ check(1,kInvalidLookup,0); // wrapped remote address
+}
 int main(int argc,char**argv) {
  assert(argc==2); std::string name=argv[1];
  if(name=="equivalence") equivalence(); else if(name=="duplicates") duplicate_gate();
  else if(name=="collisions") hash_collisions();
- else if(name=="invalid") invalid_inputs(); else if(name=="reuse") reuse(); else return 2;
+ else if(name=="invalid") invalid_inputs(); else if(name=="reuse") reuse();
+ else if(name=="native_vectors") native_vectors(); else if(name=="dense_preflight") dense_preflight(); else return 2;
  std::cout<<"KVAF_BULK_DESCRIPTOR_ACTUAL_CPP_PASS case="<<name<<" npu_proof=0\n";
 }
 """
@@ -287,16 +398,25 @@ class ForwardResidentBulkDescriptorNativeTest(unittest.TestCase):
                 "IsKvafForwardResidentBatchGetControlValidForAicore",
                 "PrepareKvafForwardResidentDescriptorVectorsForPublication",
                 "AppendKvafForwardResidentRequest",
+                "BuildKvafForwardResidentVectorsSimt",
                 "BuildKvafForwardResidentRequestsFromSeedWords",
+                "PublishKvafForwardResidentRequestVectors",
                 "ValidateKvafForwardResidentOutputIndices",
             )
         ]
+        dense = (KERNEL / "execute_batch_get_aiv.asc").read_text()
+        functions += [actual_function(dense, name) for name in (
+            "ValidateDenseBatchGetDescriptorsSimt", "ValidateDenseBatchGetDescriptors")]
         path = Path(cls.scratch.name) / "actual.cpp"
         path.write_text(
             PREFIX
             + '\n#include "'
             + str(KERNEL.parent / "include/batch_get_abi.h")
             + '"\n'
+            + "using namespace AscendC;\n"
+            + "constexpr uint32_t kSuccess=0,kInvalidLookup=4,kInvalidOutput=8;\n"
+            + "constexpr uint32_t kTransferBytes=KVAF_AIV_BATCH_GET_WQE_DATA_BYTES;\n"
+            + "constexpr uint32_t kAddressTableEntryBytes=KVAF_AIV_BATCH_GET_ADDRESS_TABLE_ENTRY_BYTES;\n"
             + "\n".join(functions)
             + CASES
         )
@@ -308,6 +428,9 @@ class ForwardResidentBulkDescriptorNativeTest(unittest.TestCase):
                 "-O1",
                 "-Wall",
                 "-Wextra",
+                "-pthread",
+                "-fsanitize=address,undefined",
+                "-fno-omit-frame-pointer",
                 str(path),
                 "-o",
                 str(cls.binary),
@@ -319,7 +442,7 @@ class ForwardResidentBulkDescriptorNativeTest(unittest.TestCase):
             raise AssertionError(result.stdout + result.stderr)
 
     def test_actual_bulk_descriptor_values_validation_and_reuse(self):
-        for name in ("equivalence", "duplicates", "collisions", "invalid", "reuse"):
+        for name in ("equivalence", "duplicates", "collisions", "invalid", "reuse", "native_vectors", "dense_preflight"):
             with self.subTest(case=name):
                 result = subprocess.run(
                     [str(self.binary), name], capture_output=True, text=True

@@ -659,6 +659,36 @@ __aicore__ inline bool AppendKvafForwardResidentRequest(
 // or doorbell. Thus duplicate seeds are still rejected; this is not an
 // unchecked/trusted transport entrypoint and cannot bypass publication.
 // The source is a strided int32 view, so KVAF does not depend on P10's seed ABI.
+__simt_vf__ __aicore__ LAUNCH_BOUND(32)
+inline void BuildKvafForwardResidentVectorsSimt(
+    __ubuf__ const int32_t* seed_words, uint32_t count, uint32_t stride,
+    uint32_t object_word, uint32_t output_word, uint32_t rows_per_entry,
+    uint32_t table_capacity, uint32_t block_bytes,
+    uint64_t resident_begin, uint64_t resident_end,
+    __ubuf__ int32_t* indices, __ubuf__ int32_t* offsets,
+    __ubuf__ int32_t* outputs, __ubuf__ uint8_t* mask,
+    __ubuf__ uint32_t* invalid) {
+  int32_t bad = 0;
+  for (uint32_t request = threadIdx.x; request < count; request += 32U) {
+    const int32_t object = seed_words[static_cast<uint64_t>(request) * stride + object_word];
+    const int32_t output = seed_words[static_cast<uint64_t>(request) * stride + output_word];
+    const uint64_t offset = static_cast<uint64_t>(static_cast<uint32_t>(object) % rows_per_entry) * block_bytes;
+    if (object < 0 || output < 0 ||
+        static_cast<uint32_t>(object) / rows_per_entry >= table_capacity ||
+        offset > INT32_MAX || static_cast<uint64_t>(output) < resident_begin ||
+        static_cast<uint64_t>(output) >= resident_end) {
+      bad = 1;
+      continue;
+    }
+    indices[request] = static_cast<int32_t>(static_cast<uint32_t>(object) / rows_per_entry);
+    offsets[request] = static_cast<int32_t>(offset);
+    outputs[request] = output;
+    mask[request] = 1U;
+  }
+  const uint32_t errors = asc_ballot(bad);
+  if (threadIdx.x == 0U) { invalid[0] = errors; }
+}
+
 __aicore__ inline bool BuildKvafForwardResidentRequestsFromSeedWords(
     const KvafForwardResidentBatchGetControl& control,
     KvafForwardResidentBatchGetDescriptorScratch* descriptor,
@@ -679,39 +709,27 @@ __aicore__ inline bool BuildKvafForwardResidentRequestsFromSeedWords(
     return false;
   }
   const uint64_t resident_end = control.resident_row_base + control.resident_row_count;
-  // Finish all input validation before touching a reused descriptor vector.
-  for (uint32_t request = 0U; request < count; ++request) {
-    const int32_t object = seed_words[static_cast<uint64_t>(request) * stride_words + object_word];
-    const int32_t output = seed_words[static_cast<uint64_t>(request) * stride_words + output_word];
-    if (object < 0 || output < 0 ||
-        static_cast<uint32_t>(object) / rows_per_entry >= descriptor->table_capacity ||
-        static_cast<uint64_t>(static_cast<uint32_t>(object) % rows_per_entry) *
-            control.block_bytes > static_cast<uint64_t>(INT32_MAX) ||
-        static_cast<uint64_t>(output) < control.resident_row_base ||
-        static_cast<uint64_t>(output) >= resident_end) {
-      return false;
-    }
-  }
   // PostOnly has committed the preceding wave's WQEs into the SQ in GM;
   // pending HCCP/CQ does NOT read these UB banks. Borrow their idle aperture
   // until the next Post materializes WQEs, exactly as the validation below.
   // Three int32 arrays and one byte mask fit even at the 256-request limit.
-  // No extra TBuf and no cross-domain SIMT call are introduced.
+  // No extra TBuf. One SIMT warp validates/builds independent descriptors;
+  // no GM vector or count is published until its reduced status is valid.
   constexpr uint32_t vector_capacity = KVAF_AIV_BATCH_GET_DENSE_REQUEST_CAPACITY;
   constexpr uint32_t vector_bytes = vector_capacity * sizeof(int32_t);
   static_assert(vector_bytes % 32U == 0U && vector_capacity % 32U == 0U,
                 "descriptor scratch arrays must be datablock aligned");
-  static_assert(vector_bytes * 3U + vector_capacity <=
+  constexpr uint32_t status_offset = vector_bytes * 3U + vector_capacity;
+  static_assert(status_offset + sizeof(uint32_t) <=
                     kvaf_fused_get::kDenseBatchGetReservedWqeUbBytes,
                 "descriptor publication exceeds idle WQE banks");
   const uint64_t seed_begin = reinterpret_cast<uint64_t>(seed_words);
   const uint64_t seed_bytes = static_cast<uint64_t>(count) * stride_words * sizeof(int32_t);
   const uint64_t scratch_begin = reinterpret_cast<uint64_t>(get_imm(0U));
-  const uint64_t scratch_end = scratch_begin + vector_bytes * 3U + vector_capacity;
+  const uint64_t scratch_end = scratch_begin + status_offset + sizeof(uint32_t);
   if (seed_begin < scratch_end && scratch_begin < seed_begin + seed_bytes) {
     return false;  // A caller may not store live seeds in the borrowed aperture.
   }
-  PrepareKvafForwardResidentDescriptorVectorsForPublication(*descriptor);
   AscendC::TBuffAddr address{};
   address.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECIN);
   AscendC::LocalTensor<int32_t> local_indices, local_offsets, local_outputs;
@@ -724,16 +742,21 @@ __aicore__ inline bool BuildKvafForwardResidentRequestsFromSeedWords(
   local_outputs.InitBuffer(vector_bytes * 2U, vector_capacity);
   local_mask.SetAddr(address);
   local_mask.InitBuffer(vector_bytes * 3U, vector_capacity);
-  for (uint32_t request = 0U; request < count; ++request) {
-    const uint32_t object = static_cast<uint32_t>(
-        seed_words[static_cast<uint64_t>(request) * stride_words + object_word]);
-    const int32_t output = seed_words[static_cast<uint64_t>(request) * stride_words + output_word];
-    local_indices.SetValue(request, static_cast<int32_t>(object / rows_per_entry));
-    local_offsets.SetValue(request, static_cast<int32_t>(
-        static_cast<uint64_t>(object % rows_per_entry) * control.block_bytes));
-    local_mask.SetValue(request, 1U);
-    local_outputs.SetValue(request, output);
-  }
+  auto* invalid = reinterpret_cast<__ubuf__ uint32_t*>(get_imm(status_offset));
+  AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID6);
+  AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID6);
+  AscendC::Simt::VF_CALL<BuildKvafForwardResidentVectorsSimt>(
+      AscendC::Simt::Dim3{32U, 1U, 1U}, seed_words, count, stride_words,
+      object_word, output_word, rows_per_entry, descriptor->table_capacity,
+      control.block_bytes, control.resident_row_base, resident_end,
+      reinterpret_cast<__ubuf__ int32_t*>(get_imm(0U)),
+      reinterpret_cast<__ubuf__ int32_t*>(get_imm(vector_bytes)),
+      reinterpret_cast<__ubuf__ int32_t*>(get_imm(vector_bytes * 2U)),
+      reinterpret_cast<__ubuf__ uint8_t*>(get_imm(vector_bytes * 3U)), invalid);
+  AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+  AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+  if (invalid[0] != 0U) { return false; }
+  PrepareKvafForwardResidentDescriptorVectorsForPublication(*descriptor);
   AscendC::GlobalTensor<int32_t> global_indices, global_offsets, global_outputs;
   AscendC::GlobalTensor<uint8_t> global_mask;
   global_indices.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(descriptor->indices));
@@ -751,6 +774,52 @@ __aicore__ inline bool BuildKvafForwardResidentRequestsFromSeedWords(
   AscendC::DataCopyPad(global_mask, local_mask, bytes);
   // This edge must precede both the count publication and validation's
   // MTE2 reuse of UB. A DDR barrier alone does not complete an MTE3 DMA.
+  AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID6);
+  AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID6);
+  AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+  descriptor->active_request_count = count;
+  return true;
+}
+
+// Publish an already constructed bounded native vector batch. This is not
+// a trusted/unchecked Begin: range/duplicate validation and Dense's exact
+// registered-address validation still run before any WQE/doorbell. The
+// vector owner must retain UB until this MTE3 completion; GM until CQ.
+__aicore__ inline bool PublishKvafForwardResidentRequestVectors(
+    const KvafForwardResidentBatchGetControl& control,
+    KvafForwardResidentBatchGetDescriptorScratch* descriptor,
+    uint32_t ub_offset, uint32_t vector_capacity, uint32_t count) {
+  if (descriptor == nullptr || !IsKvafForwardResidentBatchGetControlValidForAicore(control) ||
+      count == 0U || count > vector_capacity || vector_capacity % 32U != 0U ||
+      vector_capacity > KVAF_AIV_BATCH_GET_DENSE_REQUEST_CAPACITY ||
+      count > descriptor->request_capacity || descriptor->active_request_count != 0U ||
+      descriptor->indices == 0U || descriptor->offsets == 0U || descriptor->mask == 0U ||
+      descriptor->output_indices == 0U || ub_offset % 32U != 0U ||
+      static_cast<uint64_t>(ub_offset) + 13U * vector_capacity >
+          kvaf_fused_get::kDenseBatchGetPostOnlyScratchCeiling) { return false; }
+  AscendC::TBuffAddr address{};
+  address.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECIN);
+  AscendC::LocalTensor<int32_t> indices, offsets, outputs;
+  AscendC::LocalTensor<uint8_t> mask;
+  indices.SetAddr(address); indices.InitBuffer(ub_offset, vector_capacity);
+  offsets.SetAddr(address); offsets.InitBuffer(ub_offset + 4U * vector_capacity, vector_capacity);
+  outputs.SetAddr(address); outputs.InitBuffer(ub_offset + 8U * vector_capacity, vector_capacity);
+  mask.SetAddr(address); mask.InitBuffer(ub_offset + 12U * vector_capacity, vector_capacity);
+  AscendC::GlobalTensor<int32_t> index_gm, offset_gm, output_gm;
+  AscendC::GlobalTensor<uint8_t> mask_gm;
+  index_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(descriptor->indices));
+  offset_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(descriptor->offsets));
+  output_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(descriptor->output_indices));
+  mask_gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(descriptor->mask));
+  PrepareKvafForwardResidentDescriptorVectorsForPublication(*descriptor);
+  const AscendC::DataCopyExtParams words{1U, count * 4U, 0U, 0U, 0U};
+  const AscendC::DataCopyExtParams bytes{1U, count, 0U, 0U, 0U};
+  AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID6);
+  AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID6);
+  AscendC::DataCopyPad(index_gm, indices, words);
+  AscendC::DataCopyPad(offset_gm, offsets, words);
+  AscendC::DataCopyPad(output_gm, outputs, words);
+  AscendC::DataCopyPad(mask_gm, mask, bytes);
   AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID6);
   AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID6);
   AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
