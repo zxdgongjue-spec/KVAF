@@ -70,25 +70,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--jettys",
-        type=int,
-        default=environment_int("KVAF_CPU_URMA_JETTYS", 1),
-    )
-    parser.add_argument(
-        "--omp-threads",
-        type=int,
-        default=environment_int("KVAF_CPU_URMA_OMP_THREADS", 1),
-    )
-    parser.add_argument(
         "--doorbell-wqes",
         type=int,
         default=environment_int("KVAF_CPU_URMA_DOORBELL_WQES", 0),
-    )
-    parser.add_argument(
-        "--sgl-size",
-        type=int,
-        default=environment_int("KVAF_CPU_URMA_SGL_SIZE", 1),
-        help="maximum local SGEs per WR; merges rows with adjacent HBM targets",
     )
     parser.add_argument(
         "--remote-sgl-size",
@@ -128,14 +112,10 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "token-bytes must be in [1, INT32_MAX]"
     if args.warmup < 0 or args.iterations <= 0:
         return "warmup must be non-negative and iterations must be positive"
-    if args.jettys <= 0 or args.omp_threads <= 0:
-        return "jettys and omp-threads must be positive"
     if args.doorbell_wqes < 0 or args.doorbell_wqes > 1024:
         return "doorbell-wqes must be in [0, 1024]"
-    if args.sgl_size <= 0 or args.sgl_size > 16:
-        return "sgl-size must be in [1, 16] and within the device SGE limit"
-    if args.remote_sgl_size <= 0 or args.remote_sgl_size > 255:
-        return "remote-sgl-size must be in [1, 255] and within the device remote SGE limit"
+    if args.remote_sgl_size <= 0 or args.remote_sgl_size > 0xFFFFFFFF:
+        return "remote-sgl-size must be a positive uint32; hardware capacity is applied by transport"
     return None
 
 
@@ -247,8 +227,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"peer={args.peer} device_id={args.device_id} "
         f"request_length={args.request_length} miss_count={args.miss_count} "
         f"token_bytes={args.token_bytes} payload_bytes={payload_bytes} "
-        f"jettys={args.jettys} omp_threads={args.omp_threads} "
-        f"sgl_size={args.sgl_size} remote_sgl_size={args.remote_sgl_size} "
+        f"remote_sgl_size={args.remote_sgl_size} "
         f"doorbell_wqes={args.doorbell_wqes} warmup={args.warmup} "
         f"iterations={args.iterations}"
     )
@@ -261,10 +240,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             device_id=args.device_id,
             ub_device=args.ub_device,
             eid_index=args.eid_index,
-            jetty_count=args.jettys,
-            omp_thread_count=args.omp_threads,
             wqes_per_doorbell=args.doorbell_wqes,
-            sgl_size=args.sgl_size,
             remote_sgl_size=args.remote_sgl_size,
         )
 
@@ -329,10 +305,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             completed_ns = time.perf_counter_ns()
             call_ns = completed_ns - begin_ns
             timing = validate_timing(dict(runtime.last_batch_timing), call_ns)
-            rows_per_wr = args.remote_sgl_size if args.remote_sgl_size > 1 else args.sgl_size
+            rows_per_wr = args.remote_sgl_size
             minimum_wrs = (args.miss_count + rows_per_wr - 1) // rows_per_wr
             if not minimum_wrs <= timing["wr_count"] <= args.miss_count:
-                raise ValueError("transport WR count is inconsistent with miss-count/sgl-size")
+                raise ValueError("transport WR count is inconsistent with miss-count/remote-sgl-size")
             wr_counts.append(timing["wr_count"])
             call_samples.append(call_ns)
             prepare_samples.append(timing["prepare_ns"])
@@ -343,7 +319,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         print(
             "CPU_BATCH_PUT_SGL_RESULT "
-            f"requested_sgl_size={args.sgl_size} "
             f"wr_count_min={min(wr_counts)} wr_count_max={max(wr_counts)} "
             f"requested_remote_sgl_size={args.remote_sgl_size}"
         )

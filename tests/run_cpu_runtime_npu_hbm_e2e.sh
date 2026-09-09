@@ -3,7 +3,7 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <npu-service-host:port> [--bytes N] [--slot-size N] [--ub-device NAME] [--eid-index N] [--device-id N] [--jettys N] [--omp-threads N] [--doorbell-wqes N]" >&2
+  echo "Usage: $0 <npu-service-host:port> [--bytes N] [--slot-size N] [--ub-device NAME] [--eid-index N] [--device-id N] [--doorbell-wqes N]" >&2
   exit 2
 fi
 

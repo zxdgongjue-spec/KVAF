@@ -1,8 +1,11 @@
 #include "cpu_urma/sgl_batch_plan.h"
+#include "cpu_urma/jetty_batch_dispatch.h"
 
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <chrono>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -10,108 +13,11 @@
 
 namespace {
 using kvaf::CpuUrmaTransport;
-using kvaf::cpu_urma_detail::PlanSglGroups;
 using kvaf::cpu_urma_detail::PlanWriteScatterGroups;
 using kvaf::cpu_urma_detail::SglGroup;
 
 void Check(bool ok, const char* message) {
   if (!ok) throw std::runtime_error(message);
-}
-
-void ContiguousAndTail() {
-  std::uint8_t byte = 0;
-  for (const auto token : {128U, 256U, 512U, 656U, 1024U, 2048U, 4096U}) {
-    for (const auto count : {1U, 7U, 32U, 1024U, 8192U, 32769U}) {
-      std::vector<CpuUrmaTransport::HostSge> buffers(count, {&byte, token});
-      std::vector<std::uint64_t> offsets(count);
-      for (std::size_t i = 0; i < count; ++i) offsets[i] = i * token;
-      for (const auto limit : {1U, 2U, 3U, 8U, 16U}) {
-        std::vector<SglGroup> groups;
-        Check(PlanSglGroups(buffers.data(), offsets.data(), count, limit,
-                            static_cast<std::uint64_t>(count) * token, &groups).ok(),
-              "contiguous plan failed");
-        Check(groups.size() == (count + limit - 1U) / limit, "incorrect WR count");
-        std::size_t next = 0;
-        for (const auto& group : groups) {
-          Check(group.first == next, "dropped or duplicated rows");
-          Check(group.count == std::min<std::size_t>(limit, count - next), "tail size");
-          Check(group.bytes == group.count * token, "incorrect remote SGE length");
-          next += group.count;
-        }
-        Check(next == count, "not all rows covered");
-        if (count == 32769U && limit == 8U) {
-          Check(groups.size() == 4097U && groups[4096].first == 32768U,
-                "queue-capacity boundary must use WRs rather than rows");
-        }
-      }
-    }
-  }
-}
-
-void FragmentedAndScatterSources() {
-  // Includes ascending runs, a gap, backward address movement, and variable
-  // lengths. The extra invalid suffix must not be consumed by a prefix plan.
-  const std::array<std::uint64_t, 8> offsets{16, 19, 40, 42, 0, 4, 7, 999};
-  const std::array<std::size_t, 8> lengths{3, 5, 2, 6, 4, 3, 1, 0};
-  std::array<std::array<std::uint8_t, 12>, 8> sources{};
-  std::array<CpuUrmaTransport::HostSge, 8> buffers{};
-  for (std::size_t i = 0; i < 7; ++i) {
-    sources[i].fill(static_cast<std::uint8_t>(i + 1));
-    buffers[i] = {sources[i].data() + 1, lengths[i]};
-  }
-  std::vector<SglGroup> groups;
-  Check(PlanSglGroups(buffers.data(), offsets.data(), 7, 8, 64, &groups).ok(),
-        "fragmented plan failed");
-  Check(groups.size() == 3 && groups[0].count == 2 && groups[1].count == 2 &&
-        groups[2].count == 3, "remote gaps must split groups");
-  std::array<std::uint8_t, 64> expected, actual;
-  expected.fill(0xEE);
-  actual.fill(0xEE);
-  for (std::size_t i = 0; i < 7; ++i)
-    std::memcpy(expected.data() + offsets[i], buffers[i].data, lengths[i]);
-  // Emulate the hardware's local-SGL -> single remote-range gather semantics.
-  for (const auto& group : groups) {
-    auto destination = offsets[group.first];
-    for (std::size_t i = group.first; i < group.first + group.count; ++i) {
-      std::memcpy(actual.data() + destination, buffers[i].data, buffers[i].bytes);
-      destination += buffers[i].bytes;
-    }
-    Check(destination == offsets[group.first] + group.bytes, "remote range length");
-  }
-  Check(actual == expected, "gather changed data or overwrote a remote gap");
-  // READ uses the same grouping with the local SGL as the destination.
-  for (const auto& group : groups) {
-    auto source = offsets[group.first];
-    for (std::size_t i = group.first; i < group.first + group.count; ++i) {
-      Check(std::memcmp(actual.data() + source, buffers[i].data, buffers[i].bytes) == 0,
-            "READ scatter would use the wrong remote bytes");
-      source += buffers[i].bytes;
-    }
-  }
-  Check(!PlanSglGroups(buffers.data(), offsets.data(), 8, 8, 64, &groups).ok(),
-        "invalid active row accepted");
-  Check(groups.empty(), "failed plan left partial WRs");
-}
-
-void LengthAndRangeLimits() {
-  std::uint8_t byte = 0;
-  constexpr std::uint64_t max_length = std::numeric_limits<std::uint32_t>::max();
-  // Planning never dereferences these synthetic large buffers.
-  CpuUrmaTransport::HostSge buffers[]{{&byte, max_length - 1}, {&byte, 2}};
-  std::uint64_t offsets[]{0, max_length - 1};
-  std::vector<SglGroup> groups;
-  Check(PlanSglGroups(buffers, offsets, 2, 8, max_length + 1, &groups).ok(), "large rows");
-  Check(groups.size() == 2, "aggregate remote length overflow was not split");
-  Check(!PlanSglGroups(buffers, offsets, 2, 8, max_length, &groups).ok(), "remote overflow");
-  offsets[0] = std::numeric_limits<std::uint64_t>::max() - 1;
-  Check(!PlanSglGroups(buffers, offsets, 1, 8,
-                       std::numeric_limits<std::uint64_t>::max(), &groups).ok(),
-        "remote address addition overflow");
-  offsets[0] = 0;
-  buffers[0].bytes = max_length + 1;
-  Check(!PlanSglGroups(buffers, offsets, 1, 8, max_length + 1, &groups).ok(),
-        "oversized individual row accepted");
-  Check(!PlanSglGroups(buffers, offsets, 1, 0, max_length + 1, &groups).ok(), "zero SGL");
 }
 
 void PackedWriteScatter() {
@@ -131,33 +37,36 @@ void PackedWriteScatter() {
       std::memcpy(expected.data() + offsets[i], buffers[i].data, bytes);
       cursor += bytes;
     }
-    std::vector<SglGroup> groups;
-    Check(PlanWriteScatterGroups(buffers.data(), offsets.data(), count, 31,
-                                  actual.size(), &groups).ok(), "WRITE scatter plan failed");
-    Check(groups.size() == (count + 30) / 31, "WRITE scatter WQE count");
-    std::size_t next = 0;
-    // Exercise group rebasing at a 1024-WQE queue boundary as transport does.
-    for (std::size_t begin = 0; begin < groups.size(); begin += 1024) {
-      const auto base_row = groups[begin].first;
-      const auto* chunk_buffers = buffers.data() + base_row;
-      const auto* chunk_offsets = offsets.data() + base_row;
-      for (std::size_t g = begin; g < std::min(begin + 1024, groups.size()); ++g) {
-        const auto& group = groups[g];
-        Check(group.first == next && group.count == std::min<std::size_t>(31, count - next),
-              "WRITE scatter rows missing or duplicated");
-        const auto first = group.first - base_row;
-        const auto* local = static_cast<const std::uint8_t*>(chunk_buffers[first].data);
-        std::size_t consumed = 0;
-        for (std::size_t j = 0; j < group.count; ++j) {
-          const auto bytes = chunk_buffers[first + j].bytes;
-          std::memcpy(actual.data() + chunk_offsets[first + j], local + consumed, bytes);
-          consumed += bytes;
+    for (const std::size_t limit : {1U, 31U, 64U, 128U}) {
+      std::fill(actual.begin(), actual.end(), 0xEE);
+      std::vector<SglGroup> groups;
+      Check(PlanWriteScatterGroups(buffers.data(), offsets.data(), count, limit,
+                                    actual.size(), &groups).ok(), "WRITE scatter plan failed");
+      Check(groups.size() == (count + limit - 1) / limit, "WRITE scatter WQE count");
+      std::size_t next = 0;
+      // Exercise group rebasing at a 1024-WQE queue boundary as transport does.
+      for (std::size_t begin = 0; begin < groups.size(); begin += 1024) {
+        const auto base_row = groups[begin].first;
+        const auto* chunk_buffers = buffers.data() + base_row;
+        const auto* chunk_offsets = offsets.data() + base_row;
+        for (std::size_t g = begin; g < std::min(begin + 1024, groups.size()); ++g) {
+          const auto& group = groups[g];
+          Check(group.first == next && group.count == std::min<std::size_t>(limit, count - next),
+                "WRITE scatter rows missing or duplicated");
+          const auto first = group.first - base_row;
+          const auto* local = static_cast<const std::uint8_t*>(chunk_buffers[first].data);
+          std::size_t consumed = 0;
+          for (std::size_t j = 0; j < group.count; ++j) {
+            const auto bytes = chunk_buffers[first + j].bytes;
+            std::memcpy(actual.data() + chunk_offsets[first + j], local + consumed, bytes);
+            consumed += bytes;
+          }
+          Check(consumed == group.bytes, "WRITE source/destination length mismatch");
+          next += group.count;
         }
-        Check(consumed == group.bytes, "WRITE source/destination length mismatch");
-        next += group.count;
       }
+      Check(next == count && actual == expected, "WRITE scatter data or remote gaps corrupted");
     }
-    Check(next == count && actual == expected, "WRITE scatter data or remote gaps corrupted");
   }
 }
 
@@ -191,15 +100,65 @@ void WriteScatterLimits() {
   Check(!PlanWriteScatterGroups(large, large_offsets, 2, 31, max_length + 1, &groups).ok(),
         "zero length WRITE row accepted");
 }
+
+void JettyChunkSubmission() {
+  for (const std::size_t count : {0U, 1U, 97U, 1024U}) {
+    for (const std::size_t chunk : {0U, 1U, 32U, 1024U}) {
+      std::vector<bool> ready(count, false);
+      std::size_t submitted = 0;
+      kvaf::cpu_urma_detail::DispatchJettyChunks(count, chunk,
+          [&](std::size_t begin, std::size_t end) {
+            Check(begin == submitted, "prepared next chunk before posting current chunk");
+            for (auto i = begin; i < end; ++i) ready[i] = true;
+          },
+          [&](std::size_t begin, std::size_t end) {
+            Check(begin == submitted, "submission order changed");
+            for (auto i = begin; i < end; ++i) Check(ready[i], "posted unprepared WQE");
+            if (end < count) Check(!ready[end], "prepared future chunks before current post");
+            submitted = end;
+            return true;
+          });
+      Check(submitted == count, "chunk tail lost");
+    }
+  }
+  std::size_t prepared = 0, posts = 0;
+  kvaf::cpu_urma_detail::DispatchJettyChunks(97, 32,
+      [&](std::size_t, std::size_t end) { prepared = end; },
+      [&](std::size_t, std::size_t) { return ++posts != 2; });
+  Check(prepared == 64 && posts == 2, "continued after a failed submission");
+
+  // Hold worker 0 in preparation until worker 1 has submitted. Each queue
+  // must make progress without waiting for preparation of the other queue.
+  std::promise<void> preparing, posted;
+  auto preparing_future = preparing.get_future();
+  auto posted_future = posted.get_future();
+  auto first = std::async(std::launch::async, [&] {
+    kvaf::cpu_urma_detail::DispatchJettyChunks(2, 1,
+        [&](std::size_t begin, std::size_t) {
+          if (begin == 0) {
+            preparing.set_value();
+            Check(posted_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+                  "Jetty workers cannot progress independently");
+          }
+        }, [](std::size_t, std::size_t) { return true; });
+  });
+  auto second = std::async(std::launch::async, [&] {
+    Check(preparing_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+          "first worker did not start");
+    kvaf::cpu_urma_detail::DispatchJettyChunks(1, 1,
+        [](std::size_t, std::size_t) {},
+        [&](std::size_t, std::size_t) { posted.set_value(); return true; });
+  });
+  first.get();
+  second.get();
+}
 }  // namespace
 
 int main() {
   try {
-    ContiguousAndTail();
-    FragmentedAndScatterSources();
-    LengthAndRangeLimits();
     PackedWriteScatter();
     WriteScatterLimits();
+    JettyChunkSubmission();
     std::cout << "CPU URMA SGL planning tests passed\n";
     return 0;
   } catch (const std::exception& error) {

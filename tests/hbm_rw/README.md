@@ -73,39 +73,22 @@ host address space is cached as one URMA segment, so batch transfers reuse its
 The test accepts explicit EIDs for diagnostics, but the default path follows
 the pair-info local/remote EID rule used by the H2D script.
 
-Each block is one single-SGE WR. With `--jettys N`, the client creates `N`
-independent local JFC/JFR/Jetty/CTP resources. An OpenMP `parallel for` builds
-the disjoint WR/SGE entries, then the calling thread posts every Jetty list and
-polls one final CQE per Jetty. `--omp-threads N` controls only WQE preparation;
-it is independent of `--jettys N` and defaults to 1. The current resource limit
-is 16 CPU Jettys per channel and 1024 outstanding WRs per Jetty.
+Each block is one single-SGE WR. The transport uses two fixed Jettys and two
+OpenMP workers. Each worker owns one Jetty, prepares its WR/SGE entries and
+submits each chunk directly. The caller polls the final CQE per Jetty after
+the workers join. Each Jetty supports 1024 outstanding WRs; this standalone
+single-SGE probe accepts at most 2048 blocks per batch.
 
-Use `--sgl-size N` to combine `N` blocks into one WR with `N` local SGEs. The
-default `N=1` uses the OpenMP batch path above. Values greater than one use the
-transport's `WriteSgl`/`ReadSgl` path and must not exceed the device's reported
-`max_jfs_sge` value.
-
-For example, this sends 1024 blocks as 512 two-SGE WRs:
+`--doorbell-wqes N` controls the maximum WRs in each worker's submission.
+Zero, the default, submits the complete list for that Jetty. With `N=32`,
+each worker independently prepares and posts up to 32 WRs at a time. This
+is an API-level batch size; the provider implements the actual doorbell.
 
 ```bash
 tests/run_hbm_rw_client.sh <npu-host> 29888 \
-  --blocks 1024 --block-bytes 656 --sgl-size 2 \
+  --blocks 1024 --block-bytes 656 --doorbell-wqes 32 \
   --iterations 10 --warmup 1
 ```
 
-`--doorbell-wqes N` controls the streaming wave size for each Jetty. For
-non-zero `N`, OpenMP prepares one `N`-WR wave per Jetty and the master thread
-immediately posts that wave before the next wave is prepared. Zero, the
-default, uses the baseline that prepares the complete Jetty list before
-submitting it once. This is an API-level approximation: the provider may
-coalesce or implement doorbells internally. With four Jettys and `N=32`, one
-wave prepares up to 128 WRs and then performs four 32-WR submissions.
-
-For example:
-
-```bash
-tests/run_hbm_rw_client.sh <npu-host> 29888 \
-  --blocks 1024 --block-bytes 656 --jettys 4 --omp-threads 4 \
-  --doorbell-wqes 32 \
-  --iterations 10 --warmup 1
-```
+For packed CPU data to multiple remote addresses, use the production
+`run_cpu_batch_put_perf.sh` script with `--remote-sgl-size N`.

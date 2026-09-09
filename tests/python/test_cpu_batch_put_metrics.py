@@ -62,11 +62,13 @@ class MetricsTest(unittest.TestCase):
             with self.subTest(samples=samples), self.assertRaises(ValueError):
                 perf.print_samples("batch_put_transport_total", samples, 0, 32, 32, 128)
         self.assertIsNotNone(perf.validate_args(perf.parse_args(["--miss-count", "0"])))
-        for size in (0, 17):
-            self.assertIsNotNone(perf.validate_args(perf.parse_args(["--sgl-size", str(size)])))
-        for size in (0, 256):
+        for size in (0, -1, 0x100000000):
             self.assertIsNotNone(perf.validate_args(perf.parse_args(["--remote-sgl-size", str(size)])))
-        self.assertIsNone(perf.validate_args(perf.parse_args(["--remote-sgl-size", "31"])))
+        for size in (31, 32, 256, 1024, 0xFFFFFFFF):
+            self.assertIsNone(perf.validate_args(perf.parse_args(["--remote-sgl-size", str(size)])))
+        for removed in ("--sgl-size", "--jettys", "--omp-threads"):
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                perf.parse_args([removed, "1"])
 
     def test_preflight_and_warmup_excluded_and_timing_read_before_free(self):
         class FakeRuntime:
@@ -77,14 +79,14 @@ class MetricsTest(unittest.TestCase):
 
             def initialize(self, *args, **kwargs):
                 self.scatter = kwargs["remote_sgl_size"] == 31
-                assert kwargs["sgl_size"] == (1 if self.scatter else 8)
+                assert not {"sgl_size", "jetty_count", "omp_thread_count"}.intersection(kwargs)
                 self.initialized = True
 
             def batch_put(self, keys, sources, offsets, lengths, miss_count):
                 self.payload = sources[0][:sum(lengths[0][:miss_count])]
                 self.last_batch_timing = dict(total_scope="transport_call", total_ns=next(self.totals),
                                              prepare_ns=100, post_ns=200, poll_ns=300,
-                                             wr_count=2 if self.scatter else 4)
+                                             wr_count=2 if self.scatter else 32)
 
             def batch_free(self, keys):
                 self.last_batch_timing = None
@@ -108,7 +110,7 @@ class MetricsTest(unittest.TestCase):
              contextlib.redirect_stdout(out):
             self.assertEqual(perf.main(["--request-length", "64", "--miss-count", "32",
                                         "--token-bytes", "128", "--warmup", "1",
-                                        "--iterations", "4", "--sgl-size", "8"]), 0)
+                                        "--iterations", "4", "--remote-sgl-size", "1"]), 0)
         result = records(out.getvalue())
         total = result["batch_put_transport_total"]
         self.assertEqual(total["samples"], "4")
@@ -118,7 +120,7 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(total["p99_us"], "19.700")
         self.assertEqual(total["p50_GBps"], "0.455")
         self.assertEqual(result["batch_put"]["p50_GBps"], "0.046")
-        self.assertIn("requested_sgl_size=8 wr_count_min=4 wr_count_max=4", out.getvalue())
+        self.assertIn("wr_count_min=32 wr_count_max=32 requested_remote_sgl_size=1", out.getvalue())
         # With 32 packed rows, remote SGL=31 permits two WQEs despite local
         # SGL=1. The benchmark must validate against the remote grouping limit.
         scatter_out = io.StringIO()
@@ -128,7 +130,7 @@ class MetricsTest(unittest.TestCase):
              contextlib.redirect_stdout(scatter_out):
             self.assertEqual(perf.main(["--request-length", "64", "--miss-count", "32",
                                         "--token-bytes", "128", "--warmup", "1",
-                                        "--iterations", "4", "--sgl-size", "1",
+                                        "--iterations", "4",
                                         "--remote-sgl-size", "31"]), 0)
         self.assertIn("wr_count_min=2 wr_count_max=2 requested_remote_sgl_size=31",
                       scatter_out.getvalue())
@@ -158,7 +160,7 @@ sys.path.insert(0, os.environ["METRICS_MODULE_DIR"])
 import test_cpu_batch_put_perf as perf
 token = int(sys.argv[sys.argv.index("--token-bytes") + 1])
 miss = int(sys.argv[sys.argv.index("--miss-count") + 1])
-assert sys.argv[sys.argv.index("--sgl-size") + 1] == "8"
+assert sys.argv[sys.argv.index("--remote-sgl-size") + 1] == "1"
 perf.print_samples("batch_put_transport_total", [1000, 1001], 0, 8192, miss, token)
 perf.print_samples("batch_put", [10000, 10010], 0, 8192, miss, token)
 ''')
@@ -167,7 +169,7 @@ perf.print_samples("batch_put", [10000, 10010], 0, 8192, miss, token)
             env.update(METRICS_PYTHON=sys.executable, METRICS_FIXTURE=str(fixture),
                        METRICS_MODULE_DIR=str(Path(__file__).resolve().parent),
                        KVAF_CPU_BATCH_PUT_SWEEP_LOG_DIR=str(root / "results"))
-            run = subprocess.run(["bash", str(sweep), str(root / "build"), "--sgl-size", "8"],
+            run = subprocess.run(["bash", str(sweep), str(root / "build"), "--remote-sgl-size", "1"],
                                  env=env, text=True, capture_output=True)
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
             files = list((root / "results").glob("*.csv"))

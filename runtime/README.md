@@ -99,65 +99,47 @@ CPU 侧可通过 `CpuRuntime::InitializeClient` 建链并使用 `RuntimeCore::Ba
 ```bash
 build-cpu/runtime/kvaf_cpu_runtime_npu_hbm_e2e \
   --peer <npu-host>:28999 --bytes 4096 --slot-size 4096 --device-id 0 \
-  --jettys 2 --omp-threads 2 --doorbell-wqes 32
+  --doorbell-wqes 32
 ```
 
-CPU operator 会先把 BatchGet/BatchPut 解析为离散的远端 offset 和本地 buffer，
-再用一个 URMA batch 分配给多个 Jetty；每个 Jetty 只在最后一个 strong-order WR
-上请求 CQE。`wqes_per_doorbell > 0` 时，transport 每准备一波就立即提交，让前一波
-传输与后一波 host 侧准备重叠；值为 0 时先准备完整链表再提交。三项默认值仍为
-`jetty_count=1`、`omp_thread_count=1` 和 `wqes_per_doorbell=0`，应根据实际
-`prepare/post/poll` 计时选择配置。
+CPU URMA 固定创建 2 个 Jetty，并使用 2 个 OpenMP worker，每条 WR 的本地
+SGE 数固定为 1。常量位于 `cpu_urma_transport.cc`：`kJettyCount`、
+`kOmpThreadCount`、`kLocalSgeCount`。不再提供 `jetty_count`、`omp_thread_count`、
+`sgl_size` 初始化参数或对应命令行选项。
 
-`CpuRuntime.initialize(..., sgl_size=8)` 可启用多 SGL（默认 1，上限为设备能力与 16
-中的较小值，超限会报错）。每条 WR 最多包含 `sgl_size` 个本地片段，使用一个连续的
-远端 SGE；只有按请求顺序相邻的 HBM 范围才会合并，遇到 slot 间隙、地址回绕或合计
-长度超过 uint32 上限时拆成新的 WR，尾组可以不足 `sgl_size`。本地源 buffer 可以
-分散，不需要复制拼接；同样的分组规则也适用于 CPU BatchGet 的 READ。
-每个 Jetty 的 1024 深度和 `wqes_per_doorbell` 都按 WR 数计算：1024 行连续 HBM
-目标、SGL=8 时是 128 条 WR；8192 行则是 1024 条 WR，4 个 Jetty 可在一个容量批次
-内完成。日志中的 `CPU_BATCH_PUT_SGL_RESULT` 输出实际 WR 数的最小值与最大值，便于
-发现碎片导致的合并不足。
+每个 worker 独占一个 Jetty 的 WR 链表、SQ 和提交操作，构造好一批就直接提交，
+不需要等待另一个 Jetty 的构造完成。`wqes_per_doorbell > 0` 控制每批 WR 数，
+为 0（默认）时每个 worker 构造完整 Jetty 链表后提交；两种方式都由 worker
+自行下发。每个 Jetty 最后一个 WR 使用 strong-order 并请求 CQE，worker 汇合后
+由调用线程轮询完成。队列深度为每个 Jetty 1024 个 WR。
 
-这里的 SGL 分组由实际 HBM 地址决定，与 BatchPut 接口的 input group 无关：同一
-input group 内遇到远端空洞也要拆分，不同 input group 的相邻条目在远端首尾相接时
-也可以合并。默认 `remote_sgl_size=1`，使用上述本地 gather 路径。
+`CpuRuntime.initialize(..., remote_sgl_size=N)` 控制 WRITE 的远端 SGL 分组。
+默认 1 是单条 WR 对应一条数据的基线。大于 1 时，一个连续本地 DDR SGE 可以
+写入多个指定 HBM 地址，不增加 host memcpy；本地地址不连续、达到有效远端 SGE
+数量或累计长度超过 uint32 上限时拆分 WR。READ 保持每条 WR 一个本地和一个远端
+SGE。已注册的完整 CPU 输入复用原 segment；否则查找或注册覆盖整个源区间的 segment。
 
-CPU BatchPut 可通过 `CpuRuntime.initialize(..., remote_sgl_size=31)` 启用远端
-scatter SGL：每条 WRITE WR 使用一个连续的本地 DDR SGE，并携带最多 31 个远端
-SGE，每个远端 SGE 对应一条数据的地址和长度，HBM 目标可以不连续。数据按请求顺序
-映射，不增加 host memcpy；本地行不首尾相接、达到远端 SGE 数量上限或累计长度
-超过 uint32 上限时拆分 WR。该模式下 WRITE 按 `remote_sgl_size` 分组；
-`sgl_size` 仍控制 READ 及默认 WRITE gather 路径。参数默认 1，超出设备
-`max_jfs_rsge` 或 Jetty 配置字段上限会报错，不会静默降级。
+不设固定的 31 上限。请求值为正 uint32，实际每条 WR 的远端 SGE 数上限取请求值、
+设备 `max_jfs_rsge` 和 Jetty ABI 字段容量中的较小值。例如请求 128、设备报告 31，
+实际按最多 31 个分组；日志同时打印请求值和生效值。6000 条连续本地行在生效值为 1
+时生成 6000 个 WQE，为 31 时生成 194 个（累计长度未超限）。
 
-例如设备报告 `max_jfs_sge=13, max_jfs_rsge=31` 时，设置 `sgl_size=1,
-remote_sgl_size=31`，3000 条连续 CPU 行可形成 97 个 WRITE WQE，6000 条形成
-194 个（每条及每组长度均在限制内）。本地只用一个 SGE，因此 31 个远端目标不受
-本地 13 个 SGE 上限约束。已注册的完整 CPU 输入会复用原 segment；否则为每组连续
-源区间查找或注册能够覆盖整个区间的 segment。
-
-硬件验证和性能测试可使用：
+基线命令：
 
 ```bash
 tests/run_cpu_batch_put_perf.sh /absolute/path/to/build-cpu \
-  --miss-count 3000 --sgl-size 1 --remote-sgl-size 31
+  --request-length 8192 --miss-count 6000 --token-bytes 576 \
+  --remote-sgl-size 1 --warmup 50 --iterations 500
 ```
 
-脚本先执行 BatchPut/BatchGet 数据校验，再记录实际 `wr_count` 与端到端耗时。
-`KVAF_CPU_URMA_REMOTE_SGL_SIZE=31` 也可用于 Python HBM 集成测试和性能脚本。
-设备能力查询通过后，仍需以实际 WRITE 提交及回读验证 provider 的多远端 SGE 行为。
+对比测试仅修改 `--remote-sgl-size`。脚本先做 BatchPut/BatchGet 数据校验，再记录
+实际 `wr_count` 和端到端耗时。`prepare_ns`、`post_ns` 取构造和提交合计耗时最长
+worker 的两项时间，不把并行 worker 的时间相加；`poll_ns` 为汇合后完成等待时间，
+`total_ns` 为包含注册、校验、线程调度和所有容量批次的 transport 总墙钟时间。
 
-OpenMP 线程只并行准备 WR/SGE，提交与完成轮询仍由调用线程执行。每波准备结束和
-提交结束都需要线程同步；线程多于实际 WR 数或可用 CPU 核数时，空闲等待和调度
-开销可能让延迟更高，尤其是小 miss_count 或较大的 sgl_size。建议在相同 CPU 绑定
-和负载下比较 `--omp-threads 1/2/4/8`，再决定是否增加线程数。
-
-启用 CPU Python binding 后，`kvaf.CpuRuntime` 提供相同的 packed-input、AccessTable、
-`batch_put`/`batch_get` 接口；`tests/python/test_cpu_runtime_npu_hbm.py` 和
-`tests/run_cpu_runtime_npu_hbm_python.sh` 用于硬件联调。Python 测试通过
-`KVAF_CPU_URMA_JETTYS`、`KVAF_CPU_URMA_OMP_THREADS` 和
-`KVAF_CPU_URMA_DOORBELL_WQES`、`KVAF_CPU_URMA_SGL_SIZE` 设置上述参数。
+Python HBM 集成测试与性能脚本支持 `KVAF_CPU_URMA_REMOTE_SGL_SIZE` 和
+`KVAF_CPU_URMA_DOORBELL_WQES`。设备上的实际 WRITE 提交及回读校验用于确认
+provider 的多远端 SGE 行为。
 
 CPU URMA transport/operator 的源码归属 `access_operator/include/cpu_urma` 和
 `access_operator/src/cpu_urma`；Runtime 仅负责 HBM region、MetaManager 和 operator
@@ -174,8 +156,8 @@ mkdir -p "$PWD/results/cpu_batch_put_sgl8"
 KVAF_CPU_BATCH_PUT_SWEEP_LOG_DIR="$PWD/results/cpu_batch_put_sgl8" \
 tests/run_cpu_batch_put_miss_count_perf.sh "$PWD/build-cpu" \
   --peer 127.0.0.1:29888 --device-id 3 \
-  --request-length 8192 --jettys 4 --omp-threads 8 --doorbell-wqes 32 \
-  --sgl-size 8 --iterations 1000 --warmup 5
+  --request-length 8192 --doorbell-wqes 32 \
+  --remote-sgl-size 8 --iterations 1000 --warmup 5
 ```
 
 脚本默认扫描 `token_bytes={128,256,512,656,1024,2048,4096}` 和
