@@ -24,8 +24,8 @@
 namespace kvaf {
 namespace {
 
-constexpr std::uint32_t kJfcDepth = 1024;
-constexpr std::uint32_t kJettyDepth = 1024;
+constexpr std::uint32_t kJfcDepth = 16384;
+constexpr std::uint32_t kJettyDepth = 8192;
 constexpr std::uint32_t kJettyCount = 2;
 constexpr std::uint32_t kOmpThreadCount = 2;
 constexpr std::uint32_t kLocalSgeCount = 1;
