@@ -326,9 +326,11 @@ class NpuPythonRuntime final {
       item["kernel_finish_cycle"] = profile.kernel_finish_cycle;
       item["active_requests"] = profile.active_requests;
       item["total_posts"] = profile.total_posts;
+      item["request_begin"] = profile.request_begin;
       item["jetty_completion_wait_cycles"] =
           profile.jetty_completion_wait_cycles;
       item["jetty_completion_polls"] = profile.jetty_completion_polls;
+      item["wqe_completion_cycles"] = profile.wqe_completion_cycles;
       result.append(std::move(item));
     }
     return result;
@@ -490,10 +492,10 @@ void BindNpuPythonRuntime(py::module_& module) {
            "CPU torch.int64 Tensor.")
       .def("start_batch_get_kernel_profile",
            &NpuPythonRuntime::StartBatchGetKernelProfile,
-           "Enable the per-core BatchGet kernel cycle timeline.")
+           "Enable the per-core BatchGet timeline and per-WQE completion cycles.")
       .def("batch_get_kernel_profile",
            &NpuPythonRuntime::BatchGetKernelProfileSnapshot,
-           "Copy the latest completed per-core BatchGet kernel timeline.")
+           "Copy the latest per-core timeline and per-WQE completion cycles.")
       .def("stop_batch_get_kernel_profile",
            &NpuPythonRuntime::StopBatchGetKernelProfile,
            "Copy the latest timeline and disable BatchGet kernel profiling.")

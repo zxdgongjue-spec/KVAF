@@ -39,6 +39,14 @@ struct BatchGetExecutionState {
   std::size_t status_bytes{0};
   void* queue_state{nullptr};
   std::size_t queue_state_bytes{0};
+  void* wqe_completion_cycles{nullptr};
+  std::size_t wqe_completion_cycle_capacity{0};
+  // A profiling launch may still be queued when a larger trace is requested.
+  // Retain superseded allocations until Shutdown instead of invalidating an
+  // address captured by an in-flight kernel.
+  std::vector<void*> retired_wqe_completion_cycles;
+  std::size_t latest_profile_request_capacity{0};
+  bool profiling_enabled{false};
 };
 
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
@@ -144,6 +152,32 @@ std::uint64_t PointerValue(const void* pointer) {
 
 bool FitsU32(std::uint64_t value) {
   return value <= std::numeric_limits<std::uint32_t>::max();
+}
+
+Status EnsureBatchGetCompletionCycleCapacity(
+    std::size_t request_capacity, BatchGetExecutionState* execution) {
+  if (execution == nullptr || request_capacity == 0 ||
+      request_capacity > std::numeric_limits<std::size_t>::max() /
+                             sizeof(std::uint64_t)) {
+    return InvalidArgument("BatchGet completion trace capacity is invalid");
+  }
+  if (request_capacity <= execution->wqe_completion_cycle_capacity) {
+    return Status::OK();
+  }
+
+  void* completion_cycles = nullptr;
+  const std::size_t bytes = request_capacity * sizeof(std::uint64_t);
+  if (aclrtMalloc(&completion_cycles, bytes, ACL_MEM_MALLOC_HUGE_FIRST) !=
+      ACL_SUCCESS) {
+    return Internal("failed to allocate BatchGet WQE completion trace");
+  }
+  if (execution->wqe_completion_cycles != nullptr) {
+    execution->retired_wqe_completion_cycles.push_back(
+        execution->wqe_completion_cycles);
+  }
+  execution->wqe_completion_cycles = completion_cycles;
+  execution->wqe_completion_cycle_capacity = request_capacity;
+  return Status::OK();
 }
 
 Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
@@ -415,6 +449,13 @@ Status DefaultAccessOperator::Shutdown() {
   if (impl_->execution.status != nullptr) {
     (void)aclrtFree(impl_->execution.status);
   }
+  if (impl_->execution.wqe_completion_cycles != nullptr) {
+    (void)aclrtFree(impl_->execution.wqe_completion_cycles);
+  }
+  for (void* completion_cycles :
+       impl_->execution.retired_wqe_completion_cycles) {
+    (void)aclrtFree(completion_cycles);
+  }
   impl_->transport = nullptr;
   impl_->execution = BatchGetExecutionState{};
   impl_->remote_region = RemoteRegionDesc{};
@@ -431,11 +472,22 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
     return InvalidArgument("NPU BatchGet requires a caller-owned ACL stream");
   }
   KvafExecuteBatchGetKernelArgs arguments{};
+  std::size_t profile_request_capacity = 0U;
   Status status = BuildBatchGetKernelArgs(
       exec, impl_->config.npu_core_count, impl_->config.jettys_per_core,
       impl_->execution, &arguments);
   if (!status.ok()) {
     return status;
+  }
+  if (impl_->execution.profiling_enabled) {
+    status = EnsureBatchGetCompletionCycleCapacity(
+        arguments.request_capacity, &impl_->execution);
+    if (!status.ok()) {
+      return status;
+    }
+    arguments.wqe_completion_cycles =
+        PointerValue(impl_->execution.wqe_completion_cycles);
+    profile_request_capacity = arguments.request_capacity;
   }
 
   KvafBatchGetLocalBuffer* local_buffer = nullptr;
@@ -454,6 +506,10 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   if (launch_result != KVAF_BATCH_GET_SUCCESS) {
     KvafBatchGetLocalBufferRelease(local_buffer);
     return Internal("failed to launch BatchGet");
+  }
+  if (impl_->execution.profiling_enabled) {
+    impl_->execution.latest_profile_request_capacity =
+        profile_request_capacity;
   }
   if (exec.execution.synchronize) {
     const aclError sync_result = aclrtSynchronizeStream(stream);
@@ -488,6 +544,8 @@ Status DefaultAccessOperator::SetBatchGetKernelProfiling(bool enabled) {
                   ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
     return Internal("failed to configure BatchGet kernel profiling");
   }
+  impl_->execution.profiling_enabled = enabled;
+  impl_->execution.latest_profile_request_capacity = 0U;
   return Status::OK();
 }
 
@@ -500,6 +558,12 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
   }
+  if (!impl_->execution.profiling_enabled ||
+      impl_->execution.wqe_completion_cycles == nullptr ||
+      impl_->execution.latest_profile_request_capacity == 0U) {
+    return InvalidState(
+        "BatchGet WQE completion profiling has no completed launch");
+  }
   std::vector<KvafBatchGetCoreStatus> statuses(
       impl_->config.npu_core_count);
   if (aclrtMemcpy(statuses.data(), statuses.size() * sizeof(statuses.front()),
@@ -509,6 +573,7 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
   }
   profiles->clear();
   profiles->reserve(statuses.size());
+  std::size_t traced_request_count = 0U;
   for (const KvafBatchGetCoreStatus& status : statuses) {
     const KvafBatchGetCoreProfile& source = status.profile;
     const bool invalid_doorbell =
@@ -531,6 +596,15 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
       profiles->clear();
       return Internal("BatchGet kernel returned an invalid profile timeline");
     }
+    const std::size_t core_request_begin = traced_request_count;
+    if (source.active_requests >
+        impl_->execution.latest_profile_request_capacity -
+            traced_request_count) {
+      profiles->clear();
+      return Internal("BatchGet kernel returned an invalid WQE trace length");
+    }
+    traced_request_count +=
+        static_cast<std::size_t>(source.active_requests);
     BatchGetKernelProfile destination;
     destination.kernel_start_cycle = source.kernel_start_cycle;
     destination.setup_done_cycle = source.setup_done_cycle;
@@ -541,6 +615,7 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
     destination.kernel_finish_cycle = source.kernel_finish_cycle;
     destination.active_requests = source.active_requests;
     destination.total_posts = source.total_posts;
+    destination.request_begin = core_request_begin;
     for (std::size_t jetty = 0;
          jetty < destination.jetty_completion_wait_cycles.size(); ++jetty) {
       destination.jetty_completion_wait_cycles[jetty] =
@@ -549,6 +624,35 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
           source.jetty_completion_polls[jetty];
     }
     profiles->push_back(destination);
+  }
+
+  std::vector<std::uint64_t> completion_cycles(traced_request_count);
+  if (!completion_cycles.empty() &&
+      aclrtMemcpy(completion_cycles.data(),
+                  completion_cycles.size() * sizeof(completion_cycles.front()),
+                  impl_->execution.wqe_completion_cycles,
+                  completion_cycles.size() * sizeof(completion_cycles.front()),
+                  ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
+    profiles->clear();
+    return Internal("failed to copy BatchGet WQE completion trace");
+  }
+
+  std::size_t trace_offset = 0U;
+  for (BatchGetKernelProfile& profile : *profiles) {
+    const std::size_t core_request_count =
+        static_cast<std::size_t>(profile.active_requests);
+    profile.wqe_completion_cycles.assign(
+        completion_cycles.begin() + trace_offset,
+        completion_cycles.begin() + trace_offset + core_request_count);
+    for (const std::uint64_t cycle : profile.wqe_completion_cycles) {
+      if (cycle < profile.first_doorbell_cycle ||
+          cycle > profile.completion_done_cycle) {
+        profiles->clear();
+        return Internal(
+            "BatchGet kernel returned an invalid WQE completion cycle");
+      }
+    }
+    trace_offset += core_request_count;
   }
   return Status::OK();
 }

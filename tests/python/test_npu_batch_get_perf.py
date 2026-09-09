@@ -328,6 +328,23 @@ def print_kernel_profile(
                 profile, "completion_done_cycle", "kernel_finish_cycle"
             )
             first_doorbell = int(profile["first_doorbell_cycle"])
+            wqe_completion_cycles = [
+                int(cycle) for cycle in profile["wqe_completion_cycles"]
+            ]
+            active_requests = int(profile["active_requests"])
+            if len(wqe_completion_cycles) != active_requests:
+                raise AssertionError(
+                    "BatchGet WQE completion trace length does not match "
+                    "active_requests"
+                )
+            if any(
+                cycle < first_doorbell
+                or cycle > int(profile["completion_done_cycle"])
+                for cycle in wqe_completion_cycles
+            ):
+                raise AssertionError(
+                    "BatchGet WQE completion cycle is outside the kernel timeline"
+                )
             transfer = (
                 0.0
                 if first_doorbell == 0
@@ -357,7 +374,7 @@ def print_kernel_profile(
             accumulator["post_ms"] += post
             accumulator["completion_wait_ms"] += completion
             accumulator["finalize_ms"] += finalize
-            accumulator["active_requests"] += int(profile["active_requests"])
+            accumulator["active_requests"] += active_requests
             accumulator["total_posts"] += int(profile["total_posts"])
             waits = list(profile["jetty_completion_wait_cycles"])
             polls = list(profile["jetty_completion_polls"])
@@ -378,6 +395,7 @@ def print_kernel_profile(
         "post=descriptor_validation_wqe_fill_sq_copy_and_doorbell "
         "transfer_window=first_doorbell_to_all_cq_complete "
         "completion_wait=cq_poll_until_udma_complete "
+        "wqe_completion=cycle_when_aiv_observes_each_cqe "
         "profile_overhead_included=1 d2h_outside_host_metric=1"
     )
     total_useful_bytes = len(samples) * miss_count * token_bytes

@@ -115,6 +115,10 @@ typedef struct KvafExecuteBatchGetKernelArgs {
   uint64_t core_status;         // KvafBatchGetCoreStatus[block_count]
   uint64_t channel_entity;      // Entity[block_count * jettys_per_core]
   uint64_t queue_state;         // QueueState[block_count * jettys_per_core]
+  // Optional uint64[request_capacity] trace. When kernel profiling is enabled,
+  // every READ WQE requests a CQE and the AIV stores the cycle at which that
+  // CQE is observed at the corresponding original request index.
+  uint64_t wqe_completion_cycles;
   uint32_t table_capacity;
   uint32_t request_capacity;
   uint32_t output_rows;
@@ -134,7 +138,7 @@ static_assert(sizeof(KvafBatchGetQueueState) == KVAF_AIV_BATCH_GET_QUEUE_STATE_B
               "KvafBatchGetQueueState ABI changed");
 static_assert(sizeof(KvafBatchGetDirectUrmaEntity) == 192,
               "KvafBatchGetDirectUrmaEntity ABI changed");
-static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 112,
+static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 120,
               "KvafExecuteBatchGetKernelArgs ABI changed");
 #endif
 

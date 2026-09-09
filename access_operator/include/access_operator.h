@@ -65,8 +65,12 @@ struct BatchGetKernelProfile {
   std::uint64_t kernel_finish_cycle{0};
   std::uint64_t active_requests{0};
   std::uint64_t total_posts{0};
+  std::uint64_t request_begin{0};
   std::array<std::uint64_t, 2> jetty_completion_wait_cycles{};
   std::array<std::uint64_t, 2> jetty_completion_polls{};
+  // Per-request cycles for the request range assigned to this core, in the
+  // same order as the original BatchGet request prefix.
+  std::vector<std::uint64_t> wqe_completion_cycles;
 };
 
 // Default synchronous NPU data-plane implementation.
@@ -94,7 +98,8 @@ class DefaultAccessOperator final : public AccessOperator {
   Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
   Status ExecuteBatchPut(const BatchPutExecRequest& request) override;
 
-  // Profiling is opt-in and uses the reserved per-core status area. Callers
+  // Profiling is opt-in. Besides the per-core timeline, it requests one CQE
+  // per READ WQE and records the cycle at which each CQE is observed. Callers
   // must complete the BatchGet stream before copying the latest snapshot.
   Status SetBatchGetKernelProfiling(bool enabled);
   Status CopyBatchGetKernelProfiles(

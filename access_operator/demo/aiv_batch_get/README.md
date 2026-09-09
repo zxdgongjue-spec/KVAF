@@ -86,11 +86,20 @@ prefix directly. Before touching the SQ, the kernel rejects an invalid
 descriptor or a per-Jetty assignment that fills the entire SQ.
 The phase-two scheduler assigns complete 32-WQE posts to the core's Jettys in
 round-robin order. Each Jetty has an independent persistent SQ producer and CQ
-consumer index. Only the last READ assigned to each used Jetty requests a CQE;
-the kernel drains one CQE from every used Jetty before reporting the batch
-complete. This is required because a CQE on one Jetty does not fence READs
-submitted through another Jetty. A core with one post uses only Jetty 0, while
+consumer index. Normally only the last READ assigned to each used Jetty
+requests a CQE, and the kernel drains one CQE from every used Jetty before
+reporting the batch complete. This is required because a CQE on one Jetty does
+not fence READs submitted through another Jetty. When kernel profiling is
+enabled, every READ WQE requests a CQE instead. The kernel polls used Jettys in
+round-robin order and records the cycle at which each CQE is observed, indexed
+by the original request position. A core with one post uses only Jetty 0, while
 the one-Jetty phase-one path remains selectable with `JETTYS_PER_CORE=1`.
+
+The Python `batch_get_kernel_profile()` result exposes these observations as
+`request_begin` plus `wqe_completion_cycles`. A completion cycle is an AIV
+observation timestamp after the CQE becomes visible, not a NIC wire timestamp.
+Per-WQE profiling is diagnostic: the additional CQ traffic, cache invalidation,
+polling and trace writes intentionally change the measured workload.
 
 The ACL launcher explicitly reserves 160 KiB of AIV local memory for the two
 WQE banks, compacted table-index/request-ID arrays and SIMT validation scratch.
