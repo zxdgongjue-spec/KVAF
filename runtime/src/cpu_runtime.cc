@@ -873,6 +873,7 @@ Status CpuRuntime::InitializeClient(const CpuRuntimeClientOptions& options) {
   transport_options.omp_thread_count = options.omp_thread_count;
   transport_options.wqes_per_doorbell = options.wqes_per_doorbell;
   transport_options.sgl_size = options.sgl_size;
+  transport_options.remote_sgl_size = options.remote_sgl_size;
   impl->access_operator = std::make_unique<CpuUrmaAccessOperator>(transport_options, impl->peer_link);
   impl->meta_manager = CreateInMemoryMetaManager();
   impl->runtime_core = std::make_unique<RuntimeCore>(*impl->meta_manager, *impl->access_operator,

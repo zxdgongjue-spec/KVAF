@@ -28,6 +28,7 @@ struct CpuRuntimeClientOptions {
   std::uint32_t omp_thread_count{1U};
   std::uint32_t wqes_per_doorbell{0U};
   std::uint32_t sgl_size{1U};
+  std::uint32_t remote_sgl_size{1U};
 };
 
 struct CpuRuntimeBatchTiming {

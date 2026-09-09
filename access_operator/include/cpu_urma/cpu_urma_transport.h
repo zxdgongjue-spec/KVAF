@@ -48,6 +48,9 @@ struct CpuUrmaTransportOptions {
   std::uint32_t wqes_per_doorbell{0};
   // Maximum local SGEs per production WR; only adjacent remote ranges merge.
   std::uint32_t sgl_size{1};
+  // WRITE only: values > 1 enable one contiguous local SGE -> multiple
+  // remote SGEs. Bounded by device max_jfs_rsge, independently of sgl_size.
+  std::uint32_t remote_sgl_size{1};
   bool has_external_region{false};
   peer::PeerRegion external_region{};
 };
@@ -82,8 +85,10 @@ class CpuUrmaTransport final {
                        std::size_t count, std::size_t sgl_size);
   // CPU BatchPut path: transfer packed CPU DRAM rows into independent HBM
   // destinations. This is the CPU-initiated equivalent of AIV BatchGet READs.
-  // Adjacent remote rows share a WR up to options.sgl_size; gaps start a new
-  // WR. Queue capacity is applied after grouping, with shared completion fences.
+  // With remote_sgl_size > 1, adjacent local rows share one source SGE and
+  // a WR containing up to remote_sgl_size remote destinations. Otherwise,
+  // adjacent remote rows share a WR up to sgl_size local SGEs.
+  // Queue capacity is applied after grouping, with shared completion fences.
   Status WriteBatch(const std::uint64_t* remote_offsets,
                     const HostSge* sources, std::size_t count);
   // Register one page-aligned host region once. SGL transfers from any

@@ -385,7 +385,8 @@ class CpuPythonRuntime final {
                   std::uint64_t slot_size, std::uint32_t device_id,
                   const std::string& ub_device, py::object eid_index,
                   std::uint32_t jetty_count, std::uint32_t omp_thread_count,
-                  std::uint32_t wqes_per_doorbell, std::uint32_t sgl_size) {
+                  std::uint32_t wqes_per_doorbell, std::uint32_t sgl_size,
+                  std::uint32_t remote_sgl_size) {
     CpuRuntimeClientOptions options;
     options.peer_address = peer;
     options.hbm_bytes = hbm_bytes;
@@ -396,6 +397,7 @@ class CpuPythonRuntime final {
     options.omp_thread_count = omp_thread_count;
     options.wqes_per_doorbell = wqes_per_doorbell;
     options.sgl_size = sgl_size;
+    options.remote_sgl_size = remote_sgl_size;
     if (!eid_index.is_none()) {
       options.eid_index = eid_index.cast<std::uint32_t>();
       options.has_eid_index = true;
@@ -593,7 +595,8 @@ PYBIND11_MODULE(_kvaf, m) {
            py::arg("device_id") = 0, py::arg("ub_device") = "",
            py::arg("eid_index") = py::none(), py::arg("jetty_count") = 1,
            py::arg("omp_thread_count") = 1,
-           py::arg("wqes_per_doorbell") = 0, py::arg("sgl_size") = 1)
+           py::arg("wqes_per_doorbell") = 0, py::arg("sgl_size") = 1,
+           py::arg("remote_sgl_size") = 1)
       .def("shutdown", &kvaf::CpuPythonRuntime::Shutdown)
       .def_property_readonly("initialized", &kvaf::CpuPythonRuntime::Initialized)
       .def_property_readonly("remote_region", &kvaf::CpuPythonRuntime::RemoteRegion)

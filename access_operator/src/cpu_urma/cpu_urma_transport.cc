@@ -91,6 +91,7 @@ struct CpuUrmaTransport::Impl {
     const CpuUrmaTransport::HostSge* buffers{nullptr};
     std::size_t count{0U};
     std::size_t sgl_size{0U};
+    std::size_t remote_sgl_size{1U};
     std::size_t wr_count{0U};
     const cpu_urma_detail::SglGroup* groups{nullptr};
     urma_target_seg_t* single_host_segment{nullptr};
@@ -106,9 +107,11 @@ struct CpuUrmaTransport::Impl {
     const std::size_t first = job.groups != nullptr
         ? job.groups[wr_index].first - job.groups[0].first
         : wr_index * job.sgl_size;
-    const std::size_t num_sge = job.groups != nullptr
+    const std::size_t row_count = job.groups != nullptr
         ? job.groups[wr_index].count
         : std::min(job.sgl_size, job.count - first);
+    const bool scatter = job.remote_sgl_size > 1U;
+    const std::size_t num_sge = scatter ? 1U : row_count;
     SglBatchQueue& queue = job.queues[jetty];
     SglSgeAbi* local = queue.local.data() + position * job.sgl_size;
     std::uint64_t bytes = 0U;
@@ -116,15 +119,21 @@ struct CpuUrmaTransport::Impl {
       const auto& buffer = job.buffers[first + i];
       local[i] = {};
       local[i].addr = reinterpret_cast<std::uint64_t>(buffer.data);
-      local[i].len = static_cast<std::uint32_t>(buffer.bytes);
+      local[i].len = static_cast<std::uint32_t>(
+          scatter ? job.groups[wr_index].bytes : buffer.bytes);
       local[i].tseg = job.single_host_segment != nullptr
           ? job.single_host_segment : job.host_segments[first + i];
-      bytes += buffer.bytes;
+      bytes += local[i].len;
     }
-    queue.remote[position] = {};
-    queue.remote[position].addr = remote_region_.base + job.remote_offsets[first];
-    queue.remote[position].len = static_cast<std::uint32_t>(bytes);
-    queue.remote[position].tseg = remote_seg_handle_;
+    SglSgeAbi* remote = queue.remote.data() + position * job.remote_sgl_size;
+    const std::size_t remote_count = scatter ? row_count : 1U;
+    for (std::size_t i = 0U; i < remote_count; ++i) {
+      remote[i] = {};
+      remote[i].addr = remote_region_.base + job.remote_offsets[first + i];
+      remote[i].len = static_cast<std::uint32_t>(
+          scatter ? job.buffers[first + i].bytes : bytes);
+      remote[i].tseg = remote_seg_handle_;
+    }
     urma_jfs_wr_t& wr = queue.wrs[position];
     wr = {};
     wr.opcode = job.write ? URMA_OPC_WRITE : URMA_OPC_READ;
@@ -142,8 +151,8 @@ struct CpuUrmaTransport::Impl {
     local_sg.sge = reinterpret_cast<urma_sge_t*>(local);
     local_sg.num_sge = static_cast<std::uint32_t>(num_sge);
     urma_sg_t remote_sg{};
-    remote_sg.sge = reinterpret_cast<urma_sge_t*>(&queue.remote[position]);
-    remote_sg.num_sge = 1U;
+    remote_sg.sge = reinterpret_cast<urma_sge_t*>(remote);
+    remote_sg.num_sge = static_cast<std::uint32_t>(remote_count);
     if (job.write) {
       wr.rw.src = local_sg;
       wr.rw.dst = remote_sg;
@@ -393,6 +402,7 @@ struct CpuUrmaTransport::Impl {
     context_ = urma_create_context(device_, eid_index_);
     if (context_ == nullptr) return Error("urma_create_context");
     urma_device_attr_t device_attr{};
+    max_rsge_ = 1U;
     if (urma_query_device(device_, &device_attr) == URMA_SUCCESS) {
       std::fprintf(stderr,
                    "[KVAF_CPU_URMA] DEVICE_CAP max_jfs_sge=%u max_jfs_rsge=%u "
@@ -403,6 +413,10 @@ struct CpuUrmaTransport::Impl {
       if (device_attr.dev_cap.max_jfs_sge != 0U) {
         max_sge_ = std::min<std::uint32_t>(kMaxSge, device_attr.dev_cap.max_jfs_sge);
       }
+      if (device_attr.dev_cap.max_jfs_rsge != 0U) {
+        max_rsge_ = std::min<std::uint32_t>(
+            std::numeric_limits<std::uint8_t>::max(), device_attr.dev_cap.max_jfs_rsge);
+      }
     }
     if (options.sgl_size > max_sge_) {
       return Status::InvalidArgument("requested sgl_size=" +
@@ -410,6 +424,12 @@ struct CpuUrmaTransport::Impl {
           std::to_string(max_sge_));
     }
     batch_sgl_size_ = options.sgl_size;
+    if (options.remote_sgl_size == 0U || options.remote_sgl_size > max_rsge_) {
+      return Status::InvalidArgument("requested remote_sgl_size=" +
+          std::to_string(options.remote_sgl_size) + " exceeds device max_rsge=" +
+          std::to_string(max_rsge_) + " or is zero");
+    }
+    batch_remote_sgl_size_ = options.remote_sgl_size;
     get_tp_list_ = reinterpret_cast<GetTpList>(dlsym(RTLD_DEFAULT, "urma_get_tp_list"));
     import_jetty_ex_ = reinterpret_cast<ImportJettyEx>(dlsym(RTLD_DEFAULT, "urma_import_jetty_ex"));
     if (get_tp_list_ == nullptr || import_jetty_ex_ == nullptr) {
@@ -481,7 +501,7 @@ struct CpuUrmaTransport::Impl {
       jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
       jetty_cfg.jfs_cfg.priority = URMA_MAX_PRIORITY;
       jetty_cfg.jfs_cfg.max_sge = static_cast<std::uint8_t>(max_sge_);
-      jetty_cfg.jfs_cfg.max_rsge = 1;
+      jetty_cfg.jfs_cfg.max_rsge = static_cast<std::uint8_t>(batch_remote_sgl_size_);
       jetty_cfg.jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
       jetty_cfg.jfs_cfg.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
       jetty_cfg.jfs_cfg.jfc = jfc;
@@ -552,9 +572,9 @@ struct CpuUrmaTransport::Impl {
     if (local_jettys_.empty()) return Error("no CPU Jettys created");
     openmp_thread_count_ = options.omp_thread_count;
     wqes_per_doorbell_ = options.wqes_per_doorbell;
-    std::fprintf(stderr, "[KVAF_CPU_URMA] JETTYS_READY count=%zu omp_threads=%u wqes_per_doorbell=%zu sgl_size=%zu depth=%u\n",
+    std::fprintf(stderr, "[KVAF_CPU_URMA] JETTYS_READY count=%zu omp_threads=%u wqes_per_doorbell=%zu sgl_size=%zu remote_sgl_size=%zu depth=%u\n",
                  local_jettys_.size(), openmp_thread_count_,
-                 wqes_per_doorbell_, batch_sgl_size_, kJettyDepth);
+                 wqes_per_doorbell_, batch_sgl_size_, batch_remote_sgl_size_, kJettyDepth);
     initialized_ = true;
     return Status::OK();
   }
@@ -645,10 +665,13 @@ struct CpuUrmaTransport::Impl {
                                 const std::uint64_t* remote_offsets,
                                 std::size_t count, std::size_t sgl_size,
                                 const cpu_urma_detail::SglGroup* groups = nullptr,
-                                std::size_t group_count = 0U) {
+                                std::size_t group_count = 0U,
+                                std::size_t remote_sgl_size = 1U) {
     if (!initialized_) return Status::InvalidState("CPU URMA transport is not initialized");
     if (buffers == nullptr || count == 0U || sgl_size == 0U ||
-        sgl_size > max_sge_ || offset > remote_region_.length) {
+        sgl_size > max_sge_ || offset > remote_region_.length ||
+        remote_sgl_size == 0U || remote_sgl_size > batch_remote_sgl_size_ ||
+        (remote_sgl_size > 1U && (!write || groups == nullptr || remote_offsets == nullptr))) {
       return Status::InvalidArgument("invalid SGL batch transfer");
     }
     if (remote_offsets != nullptr && groups == nullptr && sgl_size != 1U) {
@@ -665,6 +688,7 @@ struct CpuUrmaTransport::Impl {
     job.buffers = buffers;
     job.count = count;
     job.sgl_size = sgl_size;
+    job.remote_sgl_size = remote_sgl_size;
     job.wr_count = wr_count;
     job.groups = groups;
     job.single_host_segment = nullptr;
@@ -673,7 +697,7 @@ struct CpuUrmaTransport::Impl {
     for (std::size_t i = 0U; i < wr_count; ++i) ++queue_counts[i % local_jettys_.size()];
     for (std::size_t jetty = 0U; jetty < local_jettys_.size(); ++jetty) {
       job.queues[jetty].local.resize(queue_counts[jetty] * sgl_size);
-      job.queues[jetty].remote.resize(queue_counts[jetty]);
+      job.queues[jetty].remote.resize(queue_counts[jetty] * remote_sgl_size);
       job.queues[jetty].wrs.resize(queue_counts[jetty]);
     }
     job.remote_offsets.resize(count);
@@ -713,6 +737,17 @@ struct CpuUrmaTransport::Impl {
     }
     if (use_explicit_host_region) {
       job.single_host_segment = explicit_host_region_.segment;
+    } else if (remote_sgl_size > 1U) {
+      // Register each entire contiguous source span: a single SGE must use
+      // one segment covering all rows, even across page/registration boundaries.
+      for (std::size_t i = 0U; i < group_count; ++i) {
+        const std::size_t first = groups[i].first - groups[0].first;
+        RegisteredHostBuffer* host = nullptr;
+        const Status status = RegisterHostBuffer(
+            buffers[first].data, static_cast<std::size_t>(groups[i].bytes), &host);
+        if (!status.ok()) return status;
+        job.host_segments[first] = host->segment;
+      }
     } else {
       for (std::size_t i = 0U; i < count; ++i) {
         RegisteredHostBuffer* host = FindRegisteredHostBuffer(
@@ -795,9 +830,14 @@ struct CpuUrmaTransport::Impl {
     const auto start = std::chrono::steady_clock::now();
     last_batch_timing_ = {};
     const std::size_t batch_capacity = kJettyDepth * local_jettys_.size();
-    const Status plan_status = cpu_urma_detail::PlanSglGroups(
-        buffers, remote_offsets, count, batch_sgl_size_, remote_region_.length,
-        &batch_groups_);
+    const bool scatter = write && batch_remote_sgl_size_ > 1U;
+    const Status plan_status = scatter
+        ? cpu_urma_detail::PlanWriteScatterGroups(
+            buffers, remote_offsets, count, batch_remote_sgl_size_, remote_region_.length,
+            &batch_groups_)
+        : cpu_urma_detail::PlanSglGroups(
+            buffers, remote_offsets, count, batch_sgl_size_, remote_region_.length,
+            &batch_groups_);
     if (!plan_status.ok()) return plan_status;
     CpuUrmaTransport::BatchTiming total_timing{};
     for (std::size_t begin = 0U; begin < batch_groups_.size(); begin += batch_capacity) {
@@ -807,7 +847,8 @@ struct CpuUrmaTransport::Impl {
       const std::size_t row_count = last_group.first + last_group.count - first_row;
       const Status status = TransferSglBatchLocked(
           write, 0U, buffers + first_row, remote_offsets + first_row,
-          row_count, batch_sgl_size_, batch_groups_.data() + begin, chunk);
+          row_count, scatter ? 1U : batch_sgl_size_, batch_groups_.data() + begin, chunk,
+          scatter ? batch_remote_sgl_size_ : 1U);
       if (!status.ok()) {
         last_batch_timing_ = {};
         return status;
@@ -871,6 +912,7 @@ struct CpuUrmaTransport::Impl {
   urma_seg_t remote_seg_{};
   std::uint32_t eid_index_{0};
   std::uint32_t max_sge_{1};
+  std::uint32_t max_rsge_{1};
   std::vector<urma_jfc_t*> jfcs_;
   std::vector<urma_jfr_t*> jfrs_;
   std::vector<urma_jetty_t*> local_jettys_;
@@ -880,6 +922,7 @@ struct CpuUrmaTransport::Impl {
   std::uint32_t openmp_thread_count_{1U};
   std::size_t wqes_per_doorbell_{0U};
   std::size_t batch_sgl_size_{1U};
+  std::size_t batch_remote_sgl_size_{1U};
   std::vector<cpu_urma_detail::SglGroup> batch_groups_;
   CpuUrmaTransport::BatchTiming last_batch_timing_{};
   bool urma_initialized_{false};

@@ -91,6 +91,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="maximum local SGEs per WR; merges rows with adjacent HBM targets",
     )
     parser.add_argument(
+        "--remote-sgl-size",
+        type=int,
+        default=environment_int("KVAF_CPU_URMA_REMOTE_SGL_SIZE", 1),
+        help="WRITE remote SGEs per WR; >1 combines contiguous CPU rows into one source SGE",
+    )
+    parser.add_argument(
         "--device-id", type=int, default=environment_int("DEVICE_ID", 0)
     )
     parser.add_argument(
@@ -128,6 +134,8 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "doorbell-wqes must be in [0, 1024]"
     if args.sgl_size <= 0 or args.sgl_size > 16:
         return "sgl-size must be in [1, 16] and within the device SGE limit"
+    if args.remote_sgl_size <= 0 or args.remote_sgl_size > 255:
+        return "remote-sgl-size must be in [1, 255] and within the device remote SGE limit"
     return None
 
 
@@ -240,7 +248,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"request_length={args.request_length} miss_count={args.miss_count} "
         f"token_bytes={args.token_bytes} payload_bytes={payload_bytes} "
         f"jettys={args.jettys} omp_threads={args.omp_threads} "
-        f"sgl_size={args.sgl_size} "
+        f"sgl_size={args.sgl_size} remote_sgl_size={args.remote_sgl_size} "
         f"doorbell_wqes={args.doorbell_wqes} warmup={args.warmup} "
         f"iterations={args.iterations}"
     )
@@ -257,6 +265,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             omp_thread_count=args.omp_threads,
             wqes_per_doorbell=args.doorbell_wqes,
             sgl_size=args.sgl_size,
+            remote_sgl_size=args.remote_sgl_size,
         )
 
         def execute() -> None:
@@ -320,7 +329,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             completed_ns = time.perf_counter_ns()
             call_ns = completed_ns - begin_ns
             timing = validate_timing(dict(runtime.last_batch_timing), call_ns)
-            minimum_wrs = (args.miss_count + args.sgl_size - 1) // args.sgl_size
+            rows_per_wr = args.remote_sgl_size if args.remote_sgl_size > 1 else args.sgl_size
+            minimum_wrs = (args.miss_count + rows_per_wr - 1) // rows_per_wr
             if not minimum_wrs <= timing["wr_count"] <= args.miss_count:
                 raise ValueError("transport WR count is inconsistent with miss-count/sgl-size")
             wr_counts.append(timing["wr_count"])
@@ -334,7 +344,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             "CPU_BATCH_PUT_SGL_RESULT "
             f"requested_sgl_size={args.sgl_size} "
-            f"wr_count_min={min(wr_counts)} wr_count_max={max(wr_counts)}"
+            f"wr_count_min={min(wr_counts)} wr_count_max={max(wr_counts)} "
+            f"requested_remote_sgl_size={args.remote_sgl_size}"
         )
         for operation, samples in (
             ("batch_put", call_samples),

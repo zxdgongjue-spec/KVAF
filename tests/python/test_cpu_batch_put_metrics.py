@@ -64,6 +64,9 @@ class MetricsTest(unittest.TestCase):
         self.assertIsNotNone(perf.validate_args(perf.parse_args(["--miss-count", "0"])))
         for size in (0, 17):
             self.assertIsNotNone(perf.validate_args(perf.parse_args(["--sgl-size", str(size)])))
+        for size in (0, 256):
+            self.assertIsNotNone(perf.validate_args(perf.parse_args(["--remote-sgl-size", str(size)])))
+        self.assertIsNone(perf.validate_args(perf.parse_args(["--remote-sgl-size", "31"])))
 
     def test_preflight_and_warmup_excluded_and_timing_read_before_free(self):
         class FakeRuntime:
@@ -73,14 +76,15 @@ class MetricsTest(unittest.TestCase):
                 self.totals = iter([99999999, 88888888, 6001, 10000, 20000, 8000])
 
             def initialize(self, *args, **kwargs):
-                assert kwargs["sgl_size"] == 8
+                self.scatter = kwargs["remote_sgl_size"] == 31
+                assert kwargs["sgl_size"] == (1 if self.scatter else 8)
                 self.initialized = True
 
             def batch_put(self, keys, sources, offsets, lengths, miss_count):
                 self.payload = sources[0][:sum(lengths[0][:miss_count])]
                 self.last_batch_timing = dict(total_scope="transport_call", total_ns=next(self.totals),
                                              prepare_ns=100, post_ns=200, poll_ns=300,
-                                             wr_count=4)
+                                             wr_count=2 if self.scatter else 4)
 
             def batch_free(self, keys):
                 self.last_batch_timing = None
@@ -115,6 +119,19 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(total["p50_GBps"], "0.455")
         self.assertEqual(result["batch_put"]["p50_GBps"], "0.046")
         self.assertIn("requested_sgl_size=8 wr_count_min=4 wr_count_max=4", out.getvalue())
+        # With 32 packed rows, remote SGL=31 permits two WQEs despite local
+        # SGL=1. The benchmark must validate against the remote grouping limit.
+        scatter_out = io.StringIO()
+        with patch.dict(sys.modules, {"kvaf": types.SimpleNamespace(CpuRuntime=FakeRuntime)}), \
+             patch.object(perf.time, "perf_counter_ns", side_effect=[
+                 0, 60010, 100000, 200000, 300000, 500000, 600000, 680000]), \
+             contextlib.redirect_stdout(scatter_out):
+            self.assertEqual(perf.main(["--request-length", "64", "--miss-count", "32",
+                                        "--token-bytes", "128", "--warmup", "1",
+                                        "--iterations", "4", "--sgl-size", "1",
+                                        "--remote-sgl-size", "31"]), 0)
+        self.assertIn("wr_count_min=2 wr_count_max=2 requested_remote_sgl_size=31",
+                      scatter_out.getvalue())
 
     def test_preflight_payload_distinguishes_rows(self):
         for token in (128, 256, 512, 656, 1024, 2048, 4096):

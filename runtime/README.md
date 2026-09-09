@@ -121,7 +121,32 @@ CPU operator 会先把 BatchGet/BatchPut 解析为离散的远端 offset 和本�
 
 这里的 SGL 分组由实际 HBM 地址决定，与 BatchPut 接口的 input group 无关：同一
 input group 内遇到远端空洞也要拆分，不同 input group 的相邻条目在远端首尾相接时
-也可以合并。当前配置 `max_rsge=1`，并未启用多远端 SGE。
+也可以合并。默认 `remote_sgl_size=1`，使用上述本地 gather 路径。
+
+CPU BatchPut 可通过 `CpuRuntime.initialize(..., remote_sgl_size=31)` 启用远端
+scatter SGL：每条 WRITE WR 使用一个连续的本地 DDR SGE，并携带最多 31 个远端
+SGE，每个远端 SGE 对应一条数据的地址和长度，HBM 目标可以不连续。数据按请求顺序
+映射，不增加 host memcpy；本地行不首尾相接、达到远端 SGE 数量上限或累计长度
+超过 uint32 上限时拆分 WR。该模式下 WRITE 按 `remote_sgl_size` 分组；
+`sgl_size` 仍控制 READ 及默认 WRITE gather 路径。参数默认 1，超出设备
+`max_jfs_rsge` 或 Jetty 配置字段上限会报错，不会静默降级。
+
+例如设备报告 `max_jfs_sge=13, max_jfs_rsge=31` 时，设置 `sgl_size=1,
+remote_sgl_size=31`，3000 条连续 CPU 行可形成 97 个 WRITE WQE，6000 条形成
+194 个（每条及每组长度均在限制内）。本地只用一个 SGE，因此 31 个远端目标不受
+本地 13 个 SGE 上限约束。已注册的完整 CPU 输入会复用原 segment；否则为每组连续
+源区间查找或注册能够覆盖整个区间的 segment。
+
+硬件验证和性能测试可使用：
+
+```bash
+tests/run_cpu_batch_put_perf.sh /absolute/path/to/build-cpu \
+  --miss-count 3000 --sgl-size 1 --remote-sgl-size 31
+```
+
+脚本先执行 BatchPut/BatchGet 数据校验，再记录实际 `wr_count` 与端到端耗时。
+`KVAF_CPU_URMA_REMOTE_SGL_SIZE=31` 也可用于 Python HBM 集成测试和性能脚本。
+设备能力查询通过后，仍需以实际 WRITE 提交及回读验证 provider 的多远端 SGE 行为。
 
 OpenMP 线程只并行准备 WR/SGE，提交与完成轮询仍由调用线程执行。每波准备结束和
 提交结束都需要线程同步；线程多于实际 WR 数或可用 CPU 核数时，空闲等待和调度
