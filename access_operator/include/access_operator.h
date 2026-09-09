@@ -19,7 +19,7 @@ struct PutAccessDesc;
 using PeerLink = peer::PeerLink;
 
 struct BatchPutExecRequest {
-  const BatchPutRequest* request{nullptr};
+  const BatchPutExecutionPlan* plan{nullptr};
   const PutAccessDesc* put_desc{nullptr};
   BatchPutExecutionOptions execution;
 };
@@ -63,8 +63,8 @@ struct AccessOperatorConfig {
 // launch ordering is defined by the caller stream passed with each request.
 // ExecuteBatchPut uses the Direct-HCCP AIV eager path when a BatchPut kernel
 // path is configured; otherwise it retains the synchronous ACL D2H mock for
-// local/BatchGet-only builds. Both paths consume the packed variable-size
-// BatchPutRequest contract and leave transaction visibility to Runtime.
+// local/BatchGet-only builds. Both paths consume the grouped variable-size
+// BatchPut execution plan and leave transaction visibility to Runtime.
 // This class is built only with KVAF_ENABLE_AIV_BATCH_GET=ON.
 class DefaultAccessOperator final : public AccessOperator {
  public:

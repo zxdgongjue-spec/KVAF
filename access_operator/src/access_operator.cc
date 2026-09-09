@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <utility>
@@ -49,10 +50,40 @@ struct BatchGetExecutionState {
 struct BatchPutExecutionState {
   void* metadata{nullptr};
   void* core_status{nullptr};
-  std::size_t metadata_capacity{0};
+  std::size_t metadata_capacity_bytes{0};
   std::vector<std::uint64_t> host_metadata;
   std::vector<KvafBatchPutCoreStatus> host_core_status;
+  std::vector<KvafBatchPutLocalBuffer*> local_buffers;
 };
+
+struct BatchPutMetadataLayout {
+  std::size_t source_descriptors{0};
+  std::size_t input_offsets{0};
+  std::size_t lengths{0};
+  std::size_t destinations{0};
+  std::size_t source_indices{0};
+  std::size_t bytes{0};
+};
+
+std::size_t AlignToU64(std::size_t bytes) {
+  return (bytes + sizeof(std::uint64_t) - 1U) &
+         ~(sizeof(std::uint64_t) - 1U);
+}
+
+BatchPutMetadataLayout MakeBatchPutMetadataLayout(std::size_t sources,
+                                                   std::size_t rows) {
+  BatchPutMetadataLayout layout;
+  layout.source_descriptors = 0;
+  layout.input_offsets =
+      layout.source_descriptors +
+      sources * sizeof(KvafBatchPutSourceDescriptor);
+  layout.lengths = layout.input_offsets + rows * sizeof(std::uint64_t);
+  layout.destinations = layout.lengths + rows * sizeof(std::uint64_t);
+  layout.source_indices =
+      layout.destinations + rows * sizeof(std::uint64_t);
+  layout.bytes = layout.source_indices + rows * sizeof(std::uint32_t);
+  return layout;
+}
 
 void ReleaseBatchPutExecutionState(BatchPutExecutionState* execution) {
   if (execution == nullptr) {
@@ -86,21 +117,23 @@ Status InitializeBatchPutExecutionState(std::uint32_t npu_core_count,
   return Status::OK();
 }
 
-Status EnsureBatchPutMetadataCapacity(std::size_t rows,
+Status EnsureBatchPutMetadataCapacity(std::size_t sources, std::size_t rows,
                                       BatchPutExecutionState* execution) {
-  if (execution == nullptr || rows == 0 ||
-      rows > std::numeric_limits<std::size_t>::max() /
-                 (3U * sizeof(std::uint64_t))) {
+  if (execution == nullptr || sources == 0 || rows == 0 || sources > rows ||
+      rows > (std::numeric_limits<std::size_t>::max() - 7U) / 44U) {
     return InvalidArgument("BatchPut metadata dimensions are invalid");
   }
-  execution->host_metadata.resize(rows * 3U);
-  if (rows <= execution->metadata_capacity) {
+  const BatchPutMetadataLayout layout =
+      MakeBatchPutMetadataLayout(sources, rows);
+  execution->host_metadata.resize(AlignToU64(layout.bytes) /
+                                  sizeof(std::uint64_t));
+  if (layout.bytes <= execution->metadata_capacity_bytes) {
     return Status::OK();
   }
 
-  const std::size_t bytes = rows * 3U * sizeof(std::uint64_t);
   void* metadata = nullptr;
-  if (aclrtMalloc(&metadata, bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
+  if (aclrtMalloc(&metadata, layout.bytes, ACL_MEM_MALLOC_HUGE_FIRST) !=
+      ACL_SUCCESS) {
     return Internal("failed to grow BatchPut device metadata buffers");
   }
 
@@ -108,7 +141,7 @@ Status EnsureBatchPutMetadataCapacity(std::size_t rows,
     (void)aclrtFree(execution->metadata);
   }
   execution->metadata = metadata;
-  execution->metadata_capacity = rows;
+  execution->metadata_capacity_bytes = layout.bytes;
   return Status::OK();
 }
 
@@ -469,23 +502,27 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
   if (!impl_->initialized) {
     return Status::NotInitialized("AccessOperator has not been initialized");
   }
-  if (exec.request == nullptr || exec.put_desc == nullptr ||
-      exec.request->keys.empty() || exec.request->input.data == nullptr ||
-      exec.request->input.bytes == 0 ||
-      exec.request->keys.size() != exec.request->input_offsets.size() ||
-      exec.request->keys.size() != exec.request->lengths.size() ||
-      exec.request->keys.size() != exec.put_desc->entries.size()) {
-    return InvalidArgument("BatchPut request does not satisfy the NPU mock contract");
+  if (exec.plan == nullptr || exec.put_desc == nullptr ||
+      exec.plan->flat_keys.empty() || exec.plan->sources.empty() ||
+      exec.plan->flat_keys.size() != exec.plan->source_indices.size() ||
+      exec.plan->flat_keys.size() != exec.plan->offsets.size() ||
+      exec.plan->flat_keys.size() != exec.plan->lengths.size() ||
+      exec.plan->flat_keys.size() != exec.put_desc->entries.size()) {
+    return InvalidArgument("BatchPut request does not satisfy the NPU contract");
   }
 
-  const auto* input = static_cast<const std::uint8_t*>(exec.request->input.data);
-  for (std::size_t index = 0; index < exec.request->keys.size(); ++index) {
-    const std::uint64_t offset = exec.request->input_offsets[index];
-    const std::uint64_t length = exec.request->lengths[index];
+  for (std::size_t index = 0; index < exec.plan->flat_keys.size(); ++index) {
+    const std::uint32_t source_index = exec.plan->source_indices[index];
+    if (source_index >= exec.plan->sources.size()) {
+      return InvalidArgument("BatchPut source index is invalid");
+    }
+    const ConstBufferView& source = exec.plan->sources[source_index];
+    const std::uint64_t offset = exec.plan->offsets[index];
+    const std::uint64_t length = exec.plan->lengths[index];
     const PutAllocation& destination = exec.put_desc->entries[index];
-    if (length == 0 || offset > exec.request->input.bytes ||
-        length > exec.request->input.bytes - offset ||
-        exec.request->input.device != DeviceKind::kNpu ||
+    if (source.data == nullptr || source.bytes == 0 || length == 0 ||
+        offset > source.bytes || length > source.bytes - offset ||
+        source.device != DeviceKind::kNpu ||
         destination.address == 0 || destination.reserved_length != length) {
       return InvalidArgument("BatchPut source and destination blocks do not match");
     }
@@ -497,51 +534,84 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
       return InvalidArgument("AIV BatchPut requires a caller-owned ACL stream");
     }
     BatchPutExecutionState& execution = impl_->batch_put_execution;
-    const std::size_t rows = exec.request->keys.size();
-    if (!FitsU32(rows)) {
+    const std::size_t rows = exec.plan->flat_keys.size();
+    const std::size_t sources = exec.plan->sources.size();
+    if (!FitsU32(rows) || !FitsU32(sources)) {
       return InvalidArgument("BatchPut row count exceeds the device ABI");
     }
-    Status status = EnsureBatchPutMetadataCapacity(rows, &execution);
+    Status status = EnsureBatchPutMetadataCapacity(sources, rows, &execution);
     if (!status.ok()) {
       return status;
     }
-    std::uint64_t* const host_offsets = execution.host_metadata.data();
-    std::uint64_t* const host_lengths = host_offsets + rows;
-    std::uint64_t* const host_destinations = host_lengths + rows;
-    std::copy(exec.request->input_offsets.begin(),
-              exec.request->input_offsets.end(), host_offsets);
-    std::copy(exec.request->lengths.begin(), exec.request->lengths.end(),
-              host_lengths);
+    const BatchPutMetadataLayout layout =
+        MakeBatchPutMetadataLayout(sources, rows);
+    auto* const host_metadata = reinterpret_cast<std::uint8_t*>(
+        execution.host_metadata.data());
+    std::memcpy(host_metadata + layout.input_offsets,
+                exec.plan->offsets.data(), rows * sizeof(std::uint64_t));
+    std::memcpy(host_metadata + layout.lengths, exec.plan->lengths.data(),
+                rows * sizeof(std::uint64_t));
+    auto* const host_destinations = reinterpret_cast<std::uint64_t*>(
+        host_metadata + layout.destinations);
     for (std::size_t index = 0; index < rows; ++index) {
       host_destinations[index] = exec.put_desc->entries[index].address;
     }
 
-    const std::size_t metadata_bytes = rows * 3U * sizeof(std::uint64_t);
-    if (aclrtMemcpy(execution.metadata, metadata_bytes,
-                    execution.host_metadata.data(), metadata_bytes,
+    std::vector<KvafBatchPutLocalBuffer*>& local_buffers =
+        execution.local_buffers;
+    local_buffers.clear();
+    local_buffers.reserve(sources);
+    for (std::size_t source_index = 0; source_index < sources; ++source_index) {
+      const ConstBufferView& source = exec.plan->sources[source_index];
+      KvafBatchPutLocalBuffer* local_buffer = nullptr;
+      KvafBatchPutSourceDescriptor descriptor{};
+      if (KvafBatchPutLocalBufferAcquire(
+              impl_->batch_put_transport, const_cast<void*>(source.data),
+              source.bytes, &local_buffer) != KVAF_BATCH_PUT_SUCCESS ||
+          local_buffer == nullptr ||
+          KvafBatchPutLocalBufferDescribe(local_buffer, &descriptor) !=
+              KVAF_BATCH_PUT_SUCCESS) {
+        if (local_buffer != nullptr) {
+          KvafBatchPutLocalBufferRelease(local_buffer);
+        }
+        for (KvafBatchPutLocalBuffer* acquired : local_buffers) {
+          KvafBatchPutLocalBufferRelease(acquired);
+        }
+        local_buffers.clear();
+        return Internal("failed to acquire caller inputs for BatchPut");
+      }
+      std::memcpy(host_metadata + layout.source_descriptors +
+                      source_index * sizeof(descriptor),
+                  &descriptor, sizeof(descriptor));
+      local_buffers.push_back(local_buffer);
+    }
+    std::memcpy(host_metadata + layout.source_indices,
+                exec.plan->source_indices.data(),
+                rows * sizeof(std::uint32_t));
+
+    if (aclrtMemcpy(execution.metadata, layout.bytes,
+                    execution.host_metadata.data(), layout.bytes,
                     ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
+      for (KvafBatchPutLocalBuffer* local_buffer : local_buffers) {
+        KvafBatchPutLocalBufferRelease(local_buffer);
+      }
+      local_buffers.clear();
       return Internal("failed to upload BatchPut metadata to NPU");
     }
 
-    KvafBatchPutLocalBuffer* local_buffer = nullptr;
-    if (KvafBatchPutLocalBufferAcquire(
-            impl_->batch_put_transport, const_cast<void*>(exec.request->input.data),
-            exec.request->input.bytes, &local_buffer) != KVAF_BATCH_PUT_SUCCESS ||
-        local_buffer == nullptr) {
-      return Internal("failed to acquire caller input for BatchPut");
-    }
-
     KvafExecuteBatchPutKernelArgs arguments{};
-    arguments.input = PointerValue(exec.request->input.data);
-    arguments.input_offsets = PointerValue(execution.metadata);
-    arguments.lengths = PointerValue(
-        static_cast<const std::uint8_t*>(execution.metadata) +
-        rows * sizeof(std::uint64_t));
+    const auto* const device_metadata =
+        static_cast<const std::uint8_t*>(execution.metadata);
+    arguments.source_descriptors = PointerValue(
+        device_metadata + layout.source_descriptors);
+    arguments.source_indices = PointerValue(
+        device_metadata + layout.source_indices);
+    arguments.input_offsets = PointerValue(
+        device_metadata + layout.input_offsets);
+    arguments.lengths = PointerValue(device_metadata + layout.lengths);
     arguments.destination_addresses = PointerValue(
-        static_cast<const std::uint8_t*>(execution.metadata) +
-        rows * 2U * sizeof(std::uint64_t));
+        device_metadata + layout.destinations);
     arguments.core_status = PointerValue(execution.core_status);
-    arguments.input_bytes = exec.request->input.bytes;
     arguments.row_count = static_cast<std::uint32_t>(rows);
     arguments.aiv_core_count = impl_->config.npu_core_count;
 
@@ -549,11 +619,14 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
       core_status = KvafBatchPutCoreStatus{};
     }
     const int32_t result = KvafExecuteBatchPutSync(
-        local_buffer, &arguments,
+        impl_->batch_put_transport, &arguments,
         static_cast<aclrtStream>(exec.execution.stream),
         execution.host_core_status.data(),
         static_cast<std::uint32_t>(execution.host_core_status.size()));
-    KvafBatchPutLocalBufferRelease(local_buffer);
+    for (KvafBatchPutLocalBuffer* local_buffer : local_buffers) {
+      KvafBatchPutLocalBufferRelease(local_buffer);
+    }
+    local_buffers.clear();
     if (result != KVAF_BATCH_PUT_SUCCESS) {
       LogBatchPutDeviceStatus(execution, impl_->config.npu_core_count, result);
       return Internal("AIV Direct-HCCP BatchPut execution failed");
@@ -567,20 +640,25 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
   // packed variable-length contract by coalescing only adjacent source and
   // destination ranges; non-contiguous ranges remain separate copies.
   std::size_t first = 0;
-  while (first < exec.request->keys.size()) {
+  while (first < exec.plan->flat_keys.size()) {
+    const std::uint32_t source_index = exec.plan->source_indices[first];
+    const ConstBufferView& source = exec.plan->sources[source_index];
+    const auto* input = static_cast<const std::uint8_t*>(source.data);
     const PutAllocation& first_destination = exec.put_desc->entries[first];
     const std::size_t first_offset =
-        static_cast<std::size_t>(exec.request->input_offsets[first]);
-    std::size_t bytes = static_cast<std::size_t>(exec.request->lengths[first]);
+        static_cast<std::size_t>(exec.plan->offsets[first]);
+    std::size_t bytes = static_cast<std::size_t>(exec.plan->lengths[first]);
     std::size_t next = first + 1;
-    while (next < exec.request->keys.size()) {
+    while (next < exec.plan->flat_keys.size()) {
       const PutAllocation& previous_destination = exec.put_desc->entries[next - 1];
       const PutAllocation& next_destination = exec.put_desc->entries[next];
       const std::size_t next_offset =
-          static_cast<std::size_t>(exec.request->input_offsets[next]);
+          static_cast<std::size_t>(exec.plan->offsets[next]);
       const std::size_t next_bytes =
-          static_cast<std::size_t>(exec.request->lengths[next]);
-      const bool contiguous_input = next_offset == first_offset + bytes;
+          static_cast<std::size_t>(exec.plan->lengths[next]);
+      const bool contiguous_input =
+          exec.plan->source_indices[next] == source_index &&
+          next_offset == first_offset + bytes;
       const bool contiguous_destination =
           next_destination.address >= previous_destination.address &&
           next_destination.address - previous_destination.address ==

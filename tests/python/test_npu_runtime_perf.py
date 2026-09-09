@@ -241,7 +241,9 @@ def main(batch: int = 16) -> int:
         # Verify the complete CPU-DDR data path before accepting steady-state samples.
         print("RUNTIME_PERF_PHASE_BEGIN phase=correctness_preflight")
         preflight_keys = list(range(table_capacity + 1, table_capacity + PUT_BATCH_SIZE + 1))
-        runtime.batch_put(preflight_keys, kv_data, put_offsets, lengths)
+        runtime.batch_put(
+            [preflight_keys], [kv_data], [put_offsets], [lengths]
+        )
         torch.npu.synchronize()
         preflight_table = runtime.prepare_access_table(preflight_keys)
         preflight_device_table = runtime.access_table_view(
@@ -278,12 +280,12 @@ def main(batch: int = 16) -> int:
 
         print("RUNTIME_PERF_PHASE_BEGIN phase=batch_put")
         for key_batch in key_batches[:warmup]:
-            runtime.batch_put(key_batch, kv_data, put_offsets, lengths)
+            runtime.batch_put([key_batch], [kv_data], [put_offsets], [lengths])
         torch.npu.synchronize()
         batch_put_samples: list[float] = []
         for key_batch in key_batches[warmup : warmup + iterations]:
             begin = time.perf_counter()
-            runtime.batch_put(key_batch, kv_data, put_offsets, lengths)
+            runtime.batch_put([key_batch], [kv_data], [put_offsets], [lengths])
             torch.npu.synchronize()
             batch_put_samples.append((time.perf_counter() - begin) * 1000.0)
         print_samples(
@@ -296,7 +298,7 @@ def main(batch: int = 16) -> int:
         # from BatchPut samples, but is necessary for a full AccessTable and
         # valid random BatchGet indices.
         for key_batch in key_batches[warmup + iterations :]:
-            runtime.batch_put(key_batch, kv_data, put_offsets, lengths)
+            runtime.batch_put([key_batch], [kv_data], [put_offsets], [lengths])
         torch.npu.synchronize()
         print("RUNTIME_PERF_PHASE_DONE phase=batch_put")
 

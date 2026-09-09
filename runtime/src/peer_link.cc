@@ -221,6 +221,74 @@ bool ReleaseRegionAt(const std::string& endpoint, const PeerRegion& region, std:
   return true;
 }
 
+bool AllocateHbmRegionAt(const std::string& endpoint, uint64_t hbm_bytes,
+                         uint64_t slot_size, uint32_t device_id,
+                         uint32_t eid_index, PeerRegion* region,
+                         std::string* error) {
+  if (region == nullptr || hbm_bytes == 0U || slot_size == 0U ||
+      hbm_bytes % slot_size != 0U) {
+    SetError(error, "invalid peer HBM allocation request");
+    return false;
+  }
+  AllocateHbmRegionRequest request{};
+  request.header = MakeHeader(Command::kAllocateHbmRegion, sizeof(request));
+  request.hbm_bytes = hbm_bytes;
+  request.slot_size = slot_size;
+  request.device_id = device_id;
+  request.eid_index = eid_index;
+  AllocateHbmRegionResponse response{};
+  if (!Exchange(endpoint, request, &response, error) ||
+      !IsValidResponseHeader(response.header, Command::kAllocateHbmRegion,
+                             sizeof(response)) ||
+      !ResultOk(static_cast<Result>(response.result), error) ||
+      response.session_id == 0U || response.hbm_base == 0U ||
+      response.hbm_bytes != hbm_bytes || response.token_id == 0U ||
+      response.token_value == 0U || response.segment_key_bytes == 0U ||
+      response.segment_key_bytes > kSegKeyBytes ||
+      response.jetty_key_bytes == 0U || response.jetty_key_bytes > kQpKeyBytes) {
+    if (error != nullptr && error->empty())
+      *error = "NPU service returned an invalid HBM descriptor";
+    return false;
+  }
+  PeerRegion allocated{};
+  allocated.session_id = response.session_id;
+  allocated.base = response.hbm_base;
+  allocated.length = response.hbm_bytes;
+  allocated.token_id = response.token_id;
+  allocated.token_value = response.token_value;
+  allocated.segment_key_bytes = response.segment_key_bytes;
+  allocated.jetty_key_bytes = response.jetty_key_bytes;
+  allocated.device_memory = true;
+  std::memcpy(allocated.eid.data(), response.peer_eid, allocated.eid.size());
+  std::memcpy(allocated.segment_key.data(), response.segment_key,
+              allocated.segment_key.size());
+  std::memcpy(allocated.jetty_key.data(), response.jetty_key,
+              allocated.jetty_key.size());
+  *region = allocated;
+  return true;
+}
+
+bool ReleaseHbmRegionAt(const std::string& endpoint, uint64_t session_id,
+                        std::string* error) {
+  if (session_id == 0U) {
+    SetError(error, "invalid HBM session id");
+    return false;
+  }
+  ReleaseHbmRegionRequest request{};
+  request.header = MakeHeader(Command::kReleaseHbmRegion, sizeof(request));
+  request.session_id = session_id;
+  StatusResponse response{};
+  if (!Exchange(endpoint, request, &response, error) ||
+      !IsValidResponseHeader(response.header, Command::kReleaseHbmRegion,
+                             sizeof(response)) ||
+      !ResultOk(static_cast<Result>(response.result), error)) {
+    if (error != nullptr && error->empty())
+      *error = "NPU service returned an invalid HBM release response";
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 PeerLink::PeerLink(std::string address) : address_(std::move(address)) {}
@@ -244,6 +312,20 @@ Status PeerLink::AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
   return Status::OK();
 }
 
+Status PeerLink::AllocateHbmRegion(uint64_t hbm_bytes, uint64_t slot_size,
+                                   uint32_t device_id, uint32_t eid_index,
+                                   PeerRegion* region) {
+  std::string error;
+  PeerRegion allocated{};
+  if (!AllocateHbmRegionAt(address_, hbm_bytes, slot_size, device_id, eid_index,
+                           &allocated, &error)) {
+    return ToStatus("peer HBM allocation failed", std::move(error));
+  }
+  regions_[allocated.base] = allocated;
+  if (region != nullptr) *region = allocated;
+  return Status::OK();
+}
+
 Status PeerLink::ReleaseRegion(uint64_t base) {
   const auto found = regions_.find(base);
   if (found == regions_.end()) return Status::NotFound("peer region was not found");
@@ -255,11 +337,32 @@ Status PeerLink::ReleaseRegion(uint64_t base) {
   return Status::OK();
 }
 
+Status PeerLink::ReleaseHbmRegion(uint64_t session_id) {
+  auto found = std::find_if(regions_.begin(), regions_.end(),
+                            [session_id](const auto& entry) {
+                              return entry.second.session_id == session_id &&
+                                     entry.second.device_memory;
+                            });
+  if (found == regions_.end()) return Status::NotFound("peer HBM region was not found");
+  std::string error;
+  if (!ReleaseHbmRegionAt(address_, session_id, &error))
+    return ToStatus("peer HBM release failed", std::move(error));
+  regions_.erase(found);
+  return Status::OK();
+}
+
 Status PeerLink::LookupRegion(uint64_t base, PeerRegion* region) const {
   if (region == nullptr) return Status::InvalidArgument("peer region output must not be null");
   const auto found = regions_.find(base);
   if (found == regions_.end()) return Status::NotFound("peer region was not found");
   *region = found->second;
+  return Status::OK();
+}
+
+Status PeerLink::RememberRegion(const PeerRegion& region) {
+  if (region.base == 0U || region.length == 0U || region.session_id == 0U)
+    return Status::InvalidArgument("invalid peer region descriptor");
+  regions_[region.base] = region;
   return Status::OK();
 }
 

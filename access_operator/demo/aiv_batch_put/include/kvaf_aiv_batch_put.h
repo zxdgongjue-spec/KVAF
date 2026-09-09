@@ -32,12 +32,15 @@ int32_t KvafBatchPutLocalBufferAcquire(KvafBatchPutTransport *transport,
                                        void *input_device, uint64_t input_device_bytes,
                                        KvafBatchPutLocalBuffer **local_buffer);
 void KvafBatchPutLocalBufferRelease(KvafBatchPutLocalBuffer *local_buffer);
+int32_t KvafBatchPutLocalBufferDescribe(
+    const KvafBatchPutLocalBuffer *local_buffer,
+    KvafBatchPutSourceDescriptor *descriptor);
 
 int32_t KvafExecuteBatchPutLoadKernel(const char *kernel_object_path);
 
 // Synchronous eager execution: launch, stream synchronization, status copy
 // and core-status checking all finish before this function returns.
-int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer,
+int32_t KvafExecuteBatchPutSync(KvafBatchPutTransport *transport,
                                const KvafExecuteBatchPutKernelArgs *arguments,
                                aclrtStream stream,
                                KvafBatchPutCoreStatus *core_status,

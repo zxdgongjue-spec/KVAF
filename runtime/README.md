@@ -70,6 +70,132 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 `batch_get_token_bytes` 和 `batch_get_tokens_per_block` 无默认值，
 构造 `NpuRuntime` 时必须显式传入。
 
+## CPU Runtime 访问 NPU HBM
+
+当 CPU 需要直接读写 NPU HBM 时，NPU 侧运行 `kvaf_npu_service`，CPU 侧使用
+`CpuRuntime::InitializeClient`。NPU 侧的命令行服务由 `NpuRuntime` 的 HBM provider
+模式承载（`NpuRuntime(NpuServiceOptions)` + `InitializeHbmService()`）；两者复用同一套 `PeerLink` 控制协议：NPU service
+负责 `aclrtMalloc` HBM、Direct-HCCP segment/token/Jetty 注册和 EID 选择；CPU Runtime
+负责 UMDK 本地 buffer、CTP/Jetty 导入，并通过 URMA 发起 READ/WRITE。HBM 的
+`urma_seg_t` descriptor 在 TCP 上原样传输，不依赖 `urma_admin`。
+
+构建：
+
+```bash
+./build.sh npu
+./build.sh cpu
+```
+
+启动 NPU HBM service（默认监听 `127.0.0.1:28999`）。不指定 `--device-id` 时，服务会在 CPU
+第一次申请时按请求选择 NPU device，并缓存该 device 的 HBM context：
+
+```bash
+build-npu/runtime/kvaf_npu_service --listen 0.0.0.0 --port 28999
+```
+
+CPU 侧可通过 `CpuRuntime::InitializeClient` 建链并使用 `RuntimeCore::BatchPut` /
+`BatchGet`。仓库中的 `runtime/kvaf_cpu_runtime_npu_hbm_e2e` 是最小验证程序：
+
+```bash
+build-cpu/runtime/kvaf_cpu_runtime_npu_hbm_e2e \
+  --peer <npu-host>:28999 --bytes 4096 --slot-size 4096 --device-id 0 \
+  --doorbell-wqes 32
+```
+
+CPU URMA 固定创建 2 个 Jetty，并使用 2 个 OpenMP worker，每条 WR 的本地
+SGE 数固定为 1。常量位于 `cpu_urma_transport.cc`：`kJettyCount`、
+`kOmpThreadCount`、`kLocalSgeCount`。不再提供 `jetty_count`、`omp_thread_count`、
+`sgl_size` 初始化参数或对应命令行选项。
+
+每个 worker 独占一个 Jetty 的 WR 链表、SQ 和提交操作，构造好一批就直接提交，
+不需要等待另一个 Jetty 的构造完成。`wqes_per_doorbell > 0` 控制每批 WR 数，
+为 0（默认）时每个 worker 构造完整 Jetty 链表后提交；两种方式都由 worker
+自行下发。每个 Jetty 最后一个 WR 使用 strong-order 并请求 CQE，worker 汇合后
+由调用线程轮询完成。队列深度为每个 Jetty 1024 个 WR。
+
+`CpuRuntime.initialize(..., remote_sgl_size=N)` 控制 WRITE 的远端 SGL 分组。
+默认 1 是单条 WR 对应一条数据的基线。大于 1 时，一个连续本地 DDR SGE 可以
+写入多个指定 HBM 地址，不增加 host memcpy；本地地址不连续、达到有效远端 SGE
+数量或累计长度超过 uint32 上限时拆分 WR。READ 保持每条 WR 一个本地和一个远端
+SGE。已注册的完整 CPU 输入复用原 segment；否则查找或注册覆盖整个源区间的 segment。
+
+不设固定的 31 上限。请求值为正 uint32，实际每条 WR 的远端 SGE 数上限取请求值、
+设备 `max_jfs_rsge` 和 Jetty ABI 字段容量中的较小值。例如请求 128、设备报告 31，
+实际按最多 31 个分组；日志同时打印请求值和生效值。6000 条连续本地行在生效值为 1
+时生成 6000 个 WQE，为 31 时生成 194 个（累计长度未超限）。
+
+基线命令：
+
+```bash
+tests/run_cpu_batch_put_perf.sh /absolute/path/to/build-cpu \
+  --request-length 8192 --miss-count 6000 --token-bytes 576 \
+  --remote-sgl-size 1 --warmup 50 --iterations 500
+```
+
+对比测试仅修改 `--remote-sgl-size`。脚本先做 BatchPut/BatchGet 数据校验，再记录
+实际 `wr_count` 和端到端耗时。`prepare_ns`、`post_ns` 取构造和提交合计耗时最长
+worker 的两项时间，不把并行 worker 的时间相加；`poll_ns` 为汇合后完成等待时间，
+`total_ns` 为包含注册、校验、线程调度和所有容量批次的 transport 总墙钟时间。
+
+Python HBM 集成测试与性能脚本支持 `KVAF_CPU_URMA_REMOTE_SGL_SIZE` 和
+`KVAF_CPU_URMA_DOORBELL_WQES`。设备上的实际 WRITE 提交及回读校验用于确认
+provider 的多远端 SGE 行为。
+
+CPU URMA transport/operator 的源码归属 `access_operator/include/cpu_urma` 和
+`access_operator/src/cpu_urma`；Runtime 仅负责 HBM region、MetaManager 和 operator
+注入。CPU BatchPut 的 `CPU DRAM -> HBM` 数据流对应 AIV BatchGet，CPU BatchGet 的
+`HBM -> CPU DRAM` 数据流对应 AIV BatchPut。可用下面的脚本按与 AIV BatchGet
+相同的 token-bytes/miss-count 组合测试 CPU BatchPut。测试始终传入
+`request_length` 容量的 keys、offsets、lengths 和 packed input，并由显式
+`miss_count` 只执行紧凑前缀 `[0, miss_count)`；未激活的尾部不会分配 slot 或生成
+URMA WQE：
+
+```bash
+mkdir -p "$PWD/results/cpu_batch_put_sgl8"
+
+KVAF_CPU_BATCH_PUT_SWEEP_LOG_DIR="$PWD/results/cpu_batch_put_sgl8" \
+tests/run_cpu_batch_put_miss_count_perf.sh "$PWD/build-cpu" \
+  --peer 127.0.0.1:29888 --device-id 3 \
+  --request-length 8192 --doorbell-wqes 32 \
+  --remote-sgl-size 8 --iterations 1000 --warmup 5
+```
+
+脚本默认扫描 `token_bytes={128,256,512,656,1024,2048,4096}` 和
+`miss_count={32,64,128,256,512,1024,2048,4096,8192}`，共 63 种组合；因此
+`request_length` 至少要设为 8192。生成两份 CSV，每份均包含 63 行数据和表头
+`token_bytes,miss_count,mean_us,p50_us,p90_us,p99_us,p50_GBps`：
+
+- `cpu_batch_put_sweep_summary.csv`：完整 `runtime.batch_put()` 调用的延迟和带宽，
+  可用 `KVAF_CPU_BATCH_PUT_SWEEP_CSV` 覆盖路径。
+- `cpu_batch_put_transport_total.csv`：CPU URMA transport 的延迟和带宽，
+  可用 `KVAF_CPU_BATCH_PUT_COMPARISON_CSV` 覆盖路径。
+
+两份文件各自使用对应操作的原始纳秒分位数计算
+`p50_GBps = token_bytes × miss_count / p50_ns`（十进制 GB/s），避免从 CSV 的三位
+小数微秒值反算造成误差。两个路径必须不同。每个组合的原始日志保存在上述目录，
+便于排查失败。
+
+`transport total` 从取得 transport 提交锁后开始，直到整个请求的最后一个完成通知
+被确认；包含 transport 内的参数校验、工作区准备、segment 查找/回退注册、WR/SGE
+准备、提交、轮询和超过队列容量时各批次之间的间隙。不包含 Python binding、Runtime
+元数据处理、operator 组装/预注册和取得提交锁之前的等待。它是软件观测的 transport
+有效带宽，不能等同于硬件纯链路带宽。`prepare/post/poll` 保留为分段诊断，三者之和
+不再冒充完整 `total_ns`。
+
+原始日志中 `batch_put` 和 `batch_put_transport_total` 各自的 `p50_GBps` 分别采用
+各自的 p50 延迟；`useful_GBps` 使用各自的平均延迟。均值和分位数均先对每次完整调用
+取样，再排除预热进行统计，分位数采用排序后的线性插值。
+
+更新此次计时实现后，需要重新编译 CPU Python binding（例如
+`cmake --build build-cpu -j`），测试会拒绝缺少 `total_scope=transport_call` 的旧 binding。
+请使用新输出目录重新测量；旧版 `cpu_batch_put_sweep_summary.csv` 的 `p50_GBps` 也是
+transport 口径，与旧 `cpu_batch_put_transport_total.csv` 相同，并非端到端带宽。
+历史文件不会被自动删除，旧的分段计时也无法补算成新的完整 transport 耗时。
+
+`--eid-index` 仅在需要固定候选时指定；默认由 CPU UMDK 和 NPU `pair_info`/RA EID
+列表自动选择。NPU service 的 region/session 表支持同时存在多块 HBM；每块 region
+独立注册 segment、Jetty 和 token，并按 session 释放。
+
 现有 `tests/run_remote_cpu_e2e.sh` 与
 `tests/run_remote_cpu_runtime_perf.sh` 接受 `KVAF_CPU_SERVICE_ADDR`，但该变量
 只由测试脚本转换为上述 `link_to` 调用，不再是 Runtime 内部配置来源。

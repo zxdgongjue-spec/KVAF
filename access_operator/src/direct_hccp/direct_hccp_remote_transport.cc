@@ -33,6 +33,11 @@ bool LoadSymbol(void* library, const char* name, Function* function) {
   return false;
 }
 
+template <typename Function>
+void LoadOptionalSymbol(void* library, const char* name, Function* function) {
+  *function = reinterpret_cast<Function>(dlsym(library, name));
+}
+
 std::uint32_t MakePeerCtpPsn(const DirectHccpApi& api,
                              std::uint32_t physical_device_id,
                              const char* role) {
@@ -146,6 +151,10 @@ bool LoadDirectHccp(DirectHccpApi* api) {
       LoadSymbol(api->library, "RaGetTpInfoListAsync", &api->get_tp_info_async) &&
       LoadSymbol(api->library, "RaGetAsyncReqResult", &api->get_async_req_result);
   api->get_random = reinterpret_cast<GetRandomFn>(dlsym(api->library, "RaGetSecRandom"));
+  // EID enumeration is needed by the standalone HBM test, but is optional for
+  // existing AIV transports so older libra builds remain usable.
+  LoadOptionalSymbol(api->library, "RaGetDevEidInfoNum", &api->get_dev_eid_info_num);
+  LoadOptionalSymbol(api->library, "RaGetDevEidInfoList", &api->get_dev_eid_info_list);
   if (!loaded) {
     dlclose(api->library);
     *api = {};

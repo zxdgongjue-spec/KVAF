@@ -45,7 +45,7 @@ class RuntimeMockTests(unittest.TestCase):
             input_offsets.append(len(packed))
             lengths.append(len(block))
             packed.extend(block)
-        self.kvaf.batch_put(keys, packed, input_offsets, lengths)
+        self.kvaf.batch_put([keys], [packed], [input_offsets], [lengths])
 
     def test_put_prepare_get_release_and_slot_reuse(self) -> None:
         self.kvaf.initialize(ddr_bytes=256, slot_size=64)
@@ -158,10 +158,49 @@ class RuntimeMockTests(unittest.TestCase):
         self.kvaf.initialize(ddr_bytes=64, slot_size=32)
         with self.assertRaises(ValueError):
             self.kvaf.batch_put(
-                keys=[1],
-                input=bytearray([1, 2, 3]),
-                input_offsets=[2],
-                lengths=[2],
+                keys=[[1]],
+                input=[bytearray([1, 2, 3])],
+                input_offsets=[[2]],
+                lengths=[[2]],
+            )
+
+    def test_put_compact_prefix_ignores_inactive_suffix(self) -> None:
+        self.kvaf.initialize(ddr_bytes=128, slot_size=32)
+        source = bytearray([0x11, 0x22, 0x33, 0x44])
+        self.kvaf.batch_put(
+            keys=[[201, 202, 201, 203]],
+            input=[source],
+            input_offsets=[[0, 1, 999, 999]],
+            lengths=[[1, 1, 0, 0]],
+            miss_count=2,
+        )
+
+        table = self.kvaf.prepare_access_table([201, 202])
+        output = bytearray(2)
+        self.kvaf.batch_get(
+            table, [0, 1], [0, 0], [0, 1], output, output_block_bytes=1
+        )
+        self.assertEqual(output, bytes([0x11, 0x22]))
+        self.kvaf.release_access_table(table)
+        with self.assertRaises(KeyError):
+            self.kvaf.prepare_access_table([203])
+
+        self.kvaf.batch_put(
+            keys=[[301]],
+            input=[source],
+            input_offsets=[[999]],
+            lengths=[[0]],
+            miss_count=0,
+        )
+        with self.assertRaises(KeyError):
+            self.kvaf.prepare_access_table([301])
+        with self.assertRaises(ValueError):
+            self.kvaf.batch_put(
+                keys=[[401]],
+                input=[source],
+                input_offsets=[[0]],
+                lengths=[[1]],
+                miss_count=2,
             )
 
 

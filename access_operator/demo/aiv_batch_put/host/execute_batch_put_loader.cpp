@@ -51,7 +51,7 @@ extern "C" int32_t KvafExecuteBatchPutLaunchInternal(const KvafExecuteBatchPutLa
   if (!g_loaded || g_function == nullptr || arguments == nullptr || stream == nullptr ||
       arguments->request.aiv_core_count == 0U ||
       arguments->request.aiv_core_count > KVAF_AIV_BATCH_PUT_MAX_AIV_CORES ||
-      arguments->request.row_count == 0U || arguments->request.input_bytes == 0U ||
+      arguments->request.row_count == 0U ||
       arguments->channel_entity == 0U || arguments->queue_state == 0U ||
       arguments->jettys_per_core == 0U ||
       arguments->jettys_per_core > KVAF_AIV_BATCH_PUT_MAX_JETTYS_PER_CORE) {

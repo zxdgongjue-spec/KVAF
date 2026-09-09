@@ -254,7 +254,8 @@ def main() -> int:
         ).contiguous()
         torch.npu.synchronize()
         runtime.batch_put(
-            variable_keys, variable_input, variable_offsets, variable_lengths
+            [variable_keys], [variable_input], [variable_offsets],
+            [variable_lengths]
         )
         print("RUNTIME_NPU_PHASE_DONE phase=batch_put_variable_execute")
         print("RUNTIME_NPU_PHASE_BEGIN phase=batch_put_variable_access_table")
@@ -291,7 +292,9 @@ def main() -> int:
         ).to(torch.uint8).contiguous().to(device)
         active_offsets = [row * block_bytes for row in range(active_requests)]
         active_lengths = [block_bytes] * active_requests
-        runtime.batch_put(active_keys, source, active_offsets, active_lengths)
+        runtime.batch_put(
+            [active_keys], [source], [active_offsets], [active_lengths]
+        )
         print(
             "RUNTIME_NPU_PHASE_DONE phase=batch_put "
             f"blocks={active_requests} layout=packed_offsets_lengths "

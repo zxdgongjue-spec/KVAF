@@ -196,38 +196,50 @@ class NpuPythonRuntime final {
     return result;
   }
 
-  // The caller owns one contiguous NPU input tensor; CPU offset/length
-  // metadata describes its variable-size blocks for the duration of
-  // Runtime::BatchPut. When batch_put_kernel_object_path was configured,
-  // the Direct-HCCP implementation synchronously completes this stream.
-  void BatchPut(const std::vector<KeyId>& keys, const py::object& source,
-                const std::vector<std::uint64_t>& input_offsets,
-                const std::vector<std::uint64_t>& lengths,
+  void BatchPut(std::vector<std::vector<KeyId>> keys,
+                const py::list& inputs,
+                std::vector<std::vector<std::uint64_t>> input_offsets,
+                std::vector<std::vector<std::uint64_t>> lengths,
                 const py::object& stream) {
     if (!Initialized()) {
       throw std::runtime_error("Runtime has not been initialized");
     }
-    if (keys.empty() || keys.size() != input_offsets.size() ||
-        keys.size() != lengths.size()) {
+    if (keys.empty() || keys.size() != static_cast<std::size_t>(inputs.size()) ||
+        keys.size() != input_offsets.size() || keys.size() != lengths.size()) {
       throw py::value_error(
-          "BatchPut keys, input_offsets, and lengths must be non-empty and equal in size");
+          "BatchPut keys, inputs, input_offsets, and lengths must have equal outer sizes");
     }
-    const NpuTensorView source_view = GetNpuTensorView(source, "BatchPut source");
-    for (std::size_t index = 0; index < keys.size(); ++index) {
-      const std::uint64_t offset = input_offsets[index];
-      const std::uint64_t length = lengths[index];
-      if (length == 0 || offset > source_view.bytes ||
-          length > source_view.bytes - offset) {
+
+    BatchPutRequest request;
+    request.groups.reserve(keys.size());
+    for (std::size_t group_index = 0; group_index < keys.size(); ++group_index) {
+      if (keys[group_index].empty() ||
+          keys[group_index].size() != input_offsets[group_index].size() ||
+          keys[group_index].size() != lengths[group_index].size()) {
         throw py::value_error(
-            "BatchPut input_offsets and lengths must describe bytes inside source");
+            "BatchPut group keys, input_offsets, and lengths must be non-empty and equal in size");
       }
+      const NpuTensorView source_view = GetNpuTensorView(
+          py::reinterpret_borrow<py::object>(inputs[group_index]),
+          "BatchPut input");
+      for (std::size_t index = 0; index < keys[group_index].size(); ++index) {
+        const std::uint64_t offset = input_offsets[group_index][index];
+        const std::uint64_t length = lengths[group_index][index];
+        if (length == 0 || offset > source_view.bytes ||
+            length > source_view.bytes - offset) {
+          throw py::value_error(
+              "BatchPut input_offsets and lengths must describe bytes inside input");
+        }
+      }
+      request.groups.push_back(BatchPutGroup{
+          std::move(keys[group_index]),
+          ConstBufferView{source_view.data, source_view.bytes, DeviceKind::kNpu},
+          std::move(input_offsets[group_index]),
+          std::move(lengths[group_index])});
     }
     const aclrtStream acl_stream = ResolveStream(stream);
-    ThrowIfError(native_->core().BatchPut(BatchPutRequest{
-        keys,
-        ConstBufferView{source_view.data, source_view.bytes, DeviceKind::kNpu},
-        input_offsets,
-        lengths}, BatchPutExecutionOptions{acl_stream}));
+    ThrowIfError(native_->core().BatchPut(request,
+                                           BatchPutExecutionOptions{acl_stream}));
   }
 
   AccessTableHandle PrepareAccessTable(const py::object& keys) {
@@ -435,10 +447,9 @@ void BindNpuPythonRuntime(py::module_& module) {
                              &NpuPythonRuntime::BatchGetTokensPerBlock)
       .def_property_readonly("remote_region", &NpuPythonRuntime::RemoteRegion)
       .def("batch_put", &NpuPythonRuntime::BatchPut, py::arg("keys"),
-           py::arg("source"), py::arg("input_offsets"), py::arg("lengths"),
+           py::arg("input"), py::arg("input_offsets"), py::arg("lengths"),
            py::arg("stream") = py::none(),
-           "Synchronously write variable-size packed NPU blocks. input_offsets and "
-           "lengths are CPU integer sequences with one entry per key; "
+           "Synchronously write groups of variable-size packed NPU blocks. "
            "stream=None uses torch.npu.current_stream().")
       .def("prepare_access_table", &NpuPythonRuntime::PrepareAccessTable,
            py::arg("keys"))

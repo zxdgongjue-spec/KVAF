@@ -11,6 +11,15 @@ option(KVAF_ENABLE_AIV_BATCH_PUT
 option(KVAF_BUILD_REMOTE_CPU_SERVICE
        "Build the liburma-only persistent CPU DDR/Jetty service"
        OFF)
+option(KVAF_BUILD_HBM_RW_TEST
+       "Build the standalone CPU URMA to NPU HBM read/write test"
+       OFF)
+option(KVAF_BUILD_CPU_URMA_PROBE
+       "Build the CPU URMA probe tools"
+       OFF)
+option(KVAF_BUILD_NPU_SERVICE
+       "Build the NPU HBM control service"
+       OFF)
 
 if(KVAF_ENABLE_AIV_BATCH_PUT AND NOT KVAF_ENABLE_AIV_BATCH_GET)
   message(FATAL_ERROR
@@ -37,6 +46,15 @@ include(CTest)
 
 add_subdirectory(common)
 add_subdirectory(meta_manager)
+
+# PeerLink is shared by the Direct-HCCP transport (under access_operator) and
+# the Runtime targets. Define it before access_operator so the shared library
+# receives an actual target dependency instead of an unresolved -l flag.
+add_library(kvaf_peer_link STATIC runtime/src/peer_link.cc)
+target_include_directories(kvaf_peer_link PUBLIC runtime/include)
+target_link_libraries(kvaf_peer_link PUBLIC kvaf_common pthread)
+target_compile_features(kvaf_peer_link PUBLIC cxx_std_17)
+
 add_subdirectory(access_operator)
 add_subdirectory(runtime)
 

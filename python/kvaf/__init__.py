@@ -28,6 +28,9 @@ if hasattr(_native, "NpuRuntime"):
     AclGraph = _native.AclGraph
     DeviceAccessTable = _native.DeviceAccessTable
 
+if hasattr(_native, "CpuRuntime"):
+    CpuRuntime = _native.CpuRuntime
+
 __all__ = [
     "AccessTable",
     "Runtime",
@@ -44,3 +47,6 @@ if hasattr(_native, "NpuRuntime"):
         "AclGraph",
         "DeviceAccessTable",
     ]
+
+if hasattr(_native, "CpuRuntime"):
+    __all__.append("CpuRuntime")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Direct pybind + torch_npu integration test for Runtime BatchPut."""
+"""Variable-length single-Tensor versus Tensor-list BatchPut benchmark."""
 
 from __future__ import annotations
 
@@ -27,23 +27,19 @@ def percentile(values: list[float], fraction: float) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
-def validate_batch(
-    runtime: object,
-    keys: list[int],
-    rows: int,
-    block_bytes: int,
-) -> None:
+def make_lengths(rows: int, minimum: int, maximum: int) -> list[int]:
+    span = maximum - minimum + 1
+    return [minimum + ((row * 131 + 17) % span) for row in range(rows)]
+
+
+def validate(runtime: object, keys: list[int], expected_lengths: list[int]) -> None:
     table = runtime.prepare_access_table(keys)
     try:
         view = runtime.access_table_view(table)
-        if list(view["lengths"]) != [block_bytes] * rows:
-            raise AssertionError("committed BatchPut lengths do not match")
-        if list(view["valid"]) != [1] * rows:
-            raise AssertionError("committed BatchPut entries are not valid")
-        # DDR belongs to the CPU service process. The companion BatchGet
-        # integration test validates the bytes through AIV UB rather than
-        # dereferencing a remote process address from Python.
-        print("RUNTIME_NPU_REMOTE_CPU_DIRECT_DEREFERENCE_SKIPPED")
+        if list(view["lengths"]) != expected_lengths:
+            raise AssertionError("BatchPut committed lengths do not match")
+        if list(view["valid"]) != [1] * len(keys):
+            raise AssertionError("BatchPut committed valid entries do not match")
     finally:
         runtime.release_access_table(table)
 
@@ -51,181 +47,114 @@ def validate_batch(
 def main() -> int:
     backend = detect_torch_backend()
     if backend.name != "npu":
-        print(
-            "SKIP: NPU integration requires torch_npu and an available NPU; "
-            f"detected {backend.name} ({backend.reason})."
-        )
+        print(f"SKIP: NPU required; detected {backend.name} ({backend.reason})")
         return 0
-    if not hasattr(kvaf, "NpuRuntime"):
-        print(
-            "SKIP: kvaf was not built with -DKVAF_ENABLE_AIV_BATCH_GET=ON, "
-            "-DKVAF_ENABLE_AIV_BATCH_PUT=ON, and -DKVAF_BUILD_PYTHON=ON."
-        )
-        return 0
-    if os.environ.get("KVAF_RUN_NPU_TESTS") != "1":
-        print("SKIP: set KVAF_RUN_NPU_TESTS=1 on the CANN target")
+    if not hasattr(kvaf, "NpuRuntime") or os.environ.get("KVAF_RUN_NPU_TESTS") != "1":
+        print("SKIP: build the NPU binding and set KVAF_RUN_NPU_TESTS=1")
         return 0
 
-    batch_put_kernel = Path(os.environ.get("KVAF_BATCH_PUT_KERNEL", ""))
-    if not batch_put_kernel.is_file():
-        print(
-            "FAIL: KVAF_BATCH_PUT_KERNEL must name the built BatchPut kernel object",
-            file=sys.stderr,
-        )
-        return 2
-    batch_get_kernel = Path(
-        os.environ.get(
-            "KVAF_BATCH_GET_KERNEL",
-            os.environ.get(
-                "KVAF_AIV_BATCH_GET_KERNEL",
-                str(batch_put_kernel.with_name("kvaf_execute_batch_get_kernels.o")),
-            ),
-        )
-    )
-    if not batch_get_kernel.is_file():
-        print(
-            "FAIL: KVAF_BATCH_GET_KERNEL must name the built BatchGet kernel object",
-            file=sys.stderr,
-        )
-        return 2
-
-    device_id = int(os.environ.get("DEVICE_ID", "0"))
-    rows = int(os.environ.get("KVAF_NPU_REQUESTS", "4096"))
-    block_bytes = int(os.environ.get("KVAF_NPU_BLOCK_BYTES", "1024"))
-    token_bytes = int(
-        os.environ.get(
-            "KVAF_NPU_TOKEN_BYTES", str(DEFAULT_BATCH_GET_TOKEN_BYTES)
-        )
-    )
-    tokens_per_block = int(
-        os.environ.get(
-            "KVAF_NPU_TOKENS_PER_BLOCK",
-            str(DEFAULT_BATCH_GET_TOKENS_PER_BLOCK),
-        )
-    )
-    npu_core_count = int(
-        os.environ.get("KVAF_NPU_CORE_COUNT", os.environ.get("KVAF_NPU_AIV_CORES", "32"))
-    )
-    jettys_per_core = int(os.environ.get("KVAF_NPU_JETTYS_PER_CORE", "2"))
-    warmup = int(os.environ.get("KVAF_NPU_WARMUP", "1"))
-    iterations = int(os.environ.get("KVAF_NPU_ITERATIONS", "5"))
-    if not (
-        rows > 0
-        and block_bytes > 0
-        and token_bytes > 0
-        and tokens_per_block > 0
-        and 0 < npu_core_count <= rows
-        and 1 <= jettys_per_core <= 2
-        and warmup >= 0
-        and iterations > 0
-    ):
-        print("FAIL: invalid KVAF_NPU_* configuration", file=sys.stderr)
+    put_kernel = Path(os.environ.get("KVAF_BATCH_PUT_KERNEL", ""))
+    get_kernel = Path(os.environ.get(
+        "KVAF_BATCH_GET_KERNEL",
+        str(put_kernel.with_name("kvaf_execute_batch_get_kernels.o")),
+    ))
+    cpu_service = os.environ.get("KVAF_CPU_SERVICE_ADDR")
+    if not put_kernel.is_file() or not get_kernel.is_file() or not cpu_service:
+        print("FAIL: kernel paths and KVAF_CPU_SERVICE_ADDR are required", file=sys.stderr)
         return 2
 
     torch = backend.torch
     assert torch is not None
+    device_id = int(os.environ.get("DEVICE_ID", "0"))
+    rows = int(os.environ.get("KVAF_NPU_REQUESTS", "4096"))
+    group_count = int(os.environ.get("KVAF_NPU_INPUT_GROUPS", "4"))
+    minimum = int(os.environ.get("KVAF_NPU_MIN_BLOCK_BYTES", "512"))
+    maximum = int(os.environ.get("KVAF_NPU_MAX_BLOCK_BYTES", "2048"))
+    cores = int(os.environ.get("KVAF_NPU_CORE_COUNT", "32"))
+    jettys = int(os.environ.get("KVAF_NPU_JETTYS_PER_CORE", "2"))
+    warmup = int(os.environ.get("KVAF_NPU_WARMUP", "1"))
+    iterations = int(os.environ.get("KVAF_NPU_ITERATIONS", "5"))
+    batch_get_token_bytes = int(os.environ.get(
+        "KVAF_NPU_TOKEN_BYTES", str(DEFAULT_BATCH_GET_TOKEN_BYTES)))
+    batch_get_tokens_per_block = int(os.environ.get(
+        "KVAF_NPU_TOKENS_PER_BLOCK", str(DEFAULT_BATCH_GET_TOKENS_PER_BLOCK)))
+    if not (rows > 0 and 0 < group_count <= rows and 0 < minimum <= maximum and
+            0 < cores <= rows and 1 <= jettys <= 2 and warmup >= 0 and
+            iterations > 0 and batch_get_token_bytes > 0 and
+            batch_get_tokens_per_block > 0):
+        print("FAIL: invalid KVAF_NPU_* configuration", file=sys.stderr)
+        return 2
+
     torch.npu.set_device(device_id)
     device = f"npu:{device_id}"
-    source_rows = torch.arange(rows, dtype=torch.int64).unsqueeze(1)
-    source_bytes = torch.arange(block_bytes, dtype=torch.int64).unsqueeze(0)
-    source_host = (
-        (source_rows * 131 + source_bytes * 17 + (source_bytes >> 3)) & 0xFF
-    ).to(torch.uint8).contiguous()
-    source = source_host.to(device)
-    offsets = [row * block_bytes for row in range(rows)]
-    lengths = [block_bytes] * rows
-    keys = list(range(1, rows + 1))
-    torch.npu.synchronize()
+    row_lengths = make_lengths(rows, minimum, maximum)
+    sources: list[object] = []
+    offsets: list[list[int]] = []
+    key_groups: list[list[int]] = []
+    length_groups: list[list[int]] = []
+    for group in range(group_count):
+        begin = rows * group // group_count
+        end = rows * (group + 1) // group_count
+        group_lengths = row_lengths[begin:end]
+        group_offsets: list[int] = []
+        cursor = 0
+        for length in group_lengths:
+            group_offsets.append(cursor)
+            cursor += length
+        byte_index = torch.arange(cursor, dtype=torch.int64, device=device)
+        source = ((byte_index * 17 + begin * 131 + group) & 0xFF).to(torch.uint8).contiguous()
+        sources.append(source)
+        offsets.append(group_offsets)
+        key_groups.append(list(range(begin + 1, end + 1)))
+        length_groups.append(group_lengths)
 
     runtime = kvaf.NpuRuntime(
-        str(batch_get_kernel),
-        batch_get_token_bytes=token_bytes,
-        batch_get_tokens_per_block=tokens_per_block,
-        device_id=device_id,
-        npu_core_count=npu_core_count,
-        batch_put_kernel_object_path=str(batch_put_kernel),
-        jettys_per_core=jettys_per_core,
+        str(get_kernel),
+        batch_get_token_bytes=batch_get_token_bytes,
+        batch_get_tokens_per_block=batch_get_tokens_per_block,
+        device_id=device_id, npu_core_count=cores,
+        batch_put_kernel_object_path=str(put_kernel), jettys_per_core=jettys,
     )
-    remote_cpu_service = os.environ.get("KVAF_CPU_SERVICE_ADDR")
-    if not remote_cpu_service:
-        print("FAIL: KVAF_CPU_SERVICE_ADDR must name the separately running CPU service", file=sys.stderr)
-        return 2
-    runtime.link_to(remote_cpu_service)
-    committed = False
+    runtime.link_to(cpu_service)
+    total_bytes = sum(row_lengths)
+    # MetaManager allocates one fixed-size remote slot per row.  The peer
+    # allocator requires ddr_bytes to be an exact multiple of slot_size;
+    # variable payload bytes cannot be used directly as the region size.
+    runtime.initialize(rows * maximum, maximum)
     try:
-        print(
-            "RUNTIME_NPU_BATCH_PUT_CONFIG "
-            f"rows={rows} block_bytes={block_bytes} npu_cores={npu_core_count} "
-            f"batch_get_token_bytes={token_bytes} "
-            f"batch_get_tokens_per_block={tokens_per_block} "
-            f"jettys_per_core={jettys_per_core} warmup={warmup} "
-            f"iterations={iterations} backend=aiv_direct_hccp"
-        )
-        runtime.initialize(rows * block_bytes, block_bytes)
+        print(f"BATCH_PUT_CONFIG rows={rows} groups={group_count} min_bytes={minimum} max_bytes={maximum} total_bytes={total_bytes} cores={cores} jettys_per_core={jettys}")
+        single_source = [torch.cat(sources)]
+        single_offsets = [[sum(row_lengths[:row]) for row in range(rows)]]
+        plans = [("single_tensor", [list(range(1, rows + 1))], single_source, single_offsets, [row_lengths])]
+        plans.append(("tensor_list", key_groups, sources, offsets, length_groups))
+        for name, keys, inputs, input_offsets, lengths in plans:
+            flat_keys = [key for group in keys for key in group]
 
-        def execute() -> None:
-            nonlocal committed
-            runtime.batch_put(keys, source, offsets, lengths)
-            committed = True
+            def execute() -> None:
+                runtime.batch_put(keys, inputs, input_offsets, lengths)
 
-        def release() -> None:
-            nonlocal committed
-            runtime.batch_free(keys)
-            committed = False
-
-        print("RUNTIME_NPU_PHASE_BEGIN phase=runtime_batch_put")
-        execute()
-        torch.npu.synchronize()
-        validate_batch(runtime, keys, rows, block_bytes)
-        print(f"RUNTIME_NPU_BATCH_PUT_VALIDATION_PASS rows={rows}")
-        release()
-
-        for _ in range(warmup):
-            execute()
-            release()
-        torch.npu.synchronize()
-
-        samples = []
-        for iteration in range(iterations):
-            begin = time.perf_counter()
             execute()
             torch.npu.synchronize()
-            samples.append((time.perf_counter() - begin) * 1000.0)
-            if iteration + 1 < iterations:
-                release()
-        print("RUNTIME_NPU_PHASE_DONE phase=runtime_batch_put")
-
-        print("RUNTIME_NPU_PHASE_BEGIN phase=post_perf_validation")
-        validate_batch(runtime, keys, rows, block_bytes)
-        release()
-        print("RUNTIME_NPU_PHASE_DONE phase=post_perf_validation")
-
-        mean_ms = statistics.mean(samples)
-        useful_gbps = rows * block_bytes / 1_000_000_000.0 / (mean_ms / 1000.0)
-        print(
-            "PERF_RESULT metric=runtime_batch_put_call_to_stream_completion "
-            f"samples={iterations} warmup_excluded={warmup} rows={rows} "
-            f"block_bytes={block_bytes} npu_cores={npu_core_count} "
-            f"mean_ms={mean_ms:.3f} "
-            f"p50_ms={percentile(samples, 0.50):.3f} "
-            f"p90_ms={percentile(samples, 0.90):.3f} "
-            f"p99_ms={percentile(samples, 0.99):.3f} "
-            f"useful_GBps={useful_gbps:.3f}"
-        )
+            validate(runtime, flat_keys, row_lengths)
+            runtime.batch_free(flat_keys)
+            for _ in range(warmup):
+                execute()
+                runtime.batch_free(flat_keys)
+            torch.npu.synchronize()
+            samples: list[float] = []
+            for _ in range(iterations):
+                begin = time.perf_counter()
+                execute()
+                torch.npu.synchronize()
+                samples.append((time.perf_counter() - begin) * 1000.0)
+                runtime.batch_free(flat_keys)
+            mean = statistics.mean(samples)
+            gbps = total_bytes / 1_000_000_000.0 / (mean / 1000.0)
+            print(f"PERF_RESULT metric=batch_put layout={name} samples={iterations} warmup={warmup} rows={rows} total_bytes={total_bytes} mean_ms={mean:.3f} p50_ms={percentile(samples, .5):.3f} p90_ms={percentile(samples, .9):.3f} p99_ms={percentile(samples, .99):.3f} useful_GBps={gbps:.3f}")
         return 0
-    except Exception as error:
-        print(
-            "RUNTIME_NPU_BATCH_PUT_UNHANDLED_ERROR "
-            f"type={type(error).__name__} message={error}",
-            file=sys.stderr,
-        )
-        raise
     finally:
         if runtime.initialized:
-            if committed:
-                runtime.batch_free(keys)
             runtime.shutdown()
-        print("RUNTIME_NPU_PHASE_DONE phase=teardown")
 
 
 if __name__ == "__main__":

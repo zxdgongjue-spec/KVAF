@@ -22,12 +22,8 @@ typedef struct KvafBatchPutQueueState {
 typedef struct KvafBatchPutDirectUrmaEntity {
   uint32_t magic;
   uint32_t version;
-  uint64_t local_hbm_address;
-  uint64_t local_hbm_size;
   uint64_t remote_host_ddr_address;
   uint64_t remote_host_ddr_size;
-  uint32_t local_token_id;
-  uint32_t local_token_value;
   uint32_t remote_token_id;
   uint32_t remote_token_value;
   uint64_t sq_va;
@@ -43,7 +39,7 @@ typedef struct KvafBatchPutDirectUrmaEntity {
   uint32_t cq_depth;
   uint32_t cqe_size;
   uint32_t reserved0;
-  uint64_t reserved[7];
+  uint64_t reserved[10];
 } KvafBatchPutDirectUrmaEntity;
 
 // Private launch envelope. Runtime callers never construct or own these

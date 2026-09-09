@@ -23,6 +23,10 @@ enum class Command : uint16_t {
   kCreateChannel = 2U,
   kReleaseRegion = 3U,
   kGetCandidateCount = 4U,
+  // NPU service owns device HBM.  The response carries the provider-created
+  // segment key and Jetty descriptor; the CPU peer imports both with liburma.
+  kAllocateHbmRegion = 5U,
+  kReleaseHbmRegion = 6U,
 };
 
 enum class Result : int32_t {
@@ -72,6 +76,38 @@ struct AllocateRegionResponse {
   uint8_t segment_key[kSegKeyBytes];
 };
 
+// HBM descriptors intentionally use fixed-size wire fields.  segment_key is
+// copied verbatim from the provider's MemKey.value (never reconstructed), and
+// jetty_key is the public UMDK Jetty id/mode record exported by the NPU side.
+struct AllocateHbmRegionRequest {
+  MessageHeader header;
+  uint64_t hbm_bytes;
+  uint64_t slot_size;
+  uint32_t device_id;
+  uint32_t eid_index;
+};
+
+struct AllocateHbmRegionResponse {
+  MessageHeader header;
+  int32_t result;
+  uint32_t segment_key_bytes;
+  uint64_t session_id;
+  uint64_t hbm_bytes;
+  uint64_t hbm_base;
+  uint32_t token_id;
+  uint32_t token_value;
+  uint32_t jetty_key_bytes;
+  uint32_t reserved;
+  uint8_t peer_eid[kEidBytes];
+  uint8_t segment_key[kSegKeyBytes];
+  uint8_t jetty_key[kQpKeyBytes];
+};
+
+struct ReleaseHbmRegionRequest {
+  MessageHeader header;
+  uint64_t session_id;
+};
+
 struct CreateChannelRequest {
   MessageHeader header;
   uint64_t session_id;
@@ -112,6 +148,9 @@ static_assert(sizeof(CandidateCountRequest) == 12U, "candidate count request ABI
 static_assert(sizeof(CandidateCountResponse) == 20U, "candidate count response ABI changed");
 static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed");
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");
+static_assert(sizeof(AllocateHbmRegionRequest) == 36U, "HBM allocate request ABI changed");
+static_assert(sizeof(AllocateHbmRegionResponse) == 204U, "HBM allocate response ABI changed");
+static_assert(sizeof(ReleaseHbmRegionRequest) == 20U, "HBM release request ABI changed");
 
 inline constexpr uint16_t ResponseCommand(Command command) {
   return static_cast<uint16_t>(command) | 0x8000U;

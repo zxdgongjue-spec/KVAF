@@ -1,5 +1,6 @@
 #include "runtime.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -330,34 +331,77 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
-  if (request.keys.empty() || request.input.data == nullptr ||
-      request.input.bytes == 0 ||
-      request.keys.size() != request.input_offsets.size() ||
-      request.keys.size() != request.lengths.size()) {
+  if (request.groups.empty() ||
+      request.groups.size() > std::numeric_limits<std::uint32_t>::max()) {
     return Status::InvalidArgument(
-        "BatchPut keys, input_offsets, and lengths must be non-empty and equal in size");
+        "BatchPut group count must be non-zero and fit the execution ABI");
   }
 
-  for (std::size_t index = 0; index < request.keys.size(); ++index) {
-    const std::uint64_t offset = request.input_offsets[index];
-    const std::uint64_t length = request.lengths[index];
-    if (length == 0 || offset > request.input.bytes ||
-        length > request.input.bytes - offset) {
+  std::size_t rows = 0;
+  for (const BatchPutGroup& group : request.groups) {
+    if (group.keys.empty() || group.input.data == nullptr ||
+        group.input.bytes == 0 ||
+        group.keys.size() != group.input_offsets.size() ||
+        group.keys.size() != group.lengths.size() ||
+        group.keys.size() > std::numeric_limits<std::size_t>::max() - rows) {
       return Status::InvalidArgument(
-          "BatchPut input_offsets and lengths must describe bytes inside input");
+          "BatchPut group keys, input_offsets, and lengths must be non-empty and equal in size");
     }
+    rows += group.keys.size();
+  }
+
+  const std::size_t active_rows = request.miss_count.value_or(rows);
+  if (active_rows > rows) {
+    return Status::InvalidArgument(
+        "BatchPut miss_count must be between zero and the request capacity");
+  }
+  if (active_rows == 0) {
+    return Status::OK();
+  }
+
+  BatchPutExecutionPlan plan;
+  plan.flat_keys.reserve(active_rows);
+  plan.sources.reserve(request.groups.size());
+  plan.source_indices.reserve(active_rows);
+  plan.offsets.reserve(active_rows);
+  plan.lengths.reserve(active_rows);
+  std::size_t remaining = active_rows;
+  for (std::size_t group_index = 0; group_index < request.groups.size();
+       ++group_index) {
+    const BatchPutGroup& group = request.groups[group_index];
+    plan.sources.push_back(group.input);
+    const std::size_t group_active = std::min(remaining, group.keys.size());
+    for (std::size_t index = 0; index < group_active; ++index) {
+      const std::uint64_t offset = group.input_offsets[index];
+      const std::uint64_t length = group.lengths[index];
+      if (length == 0 || offset > group.input.bytes ||
+          length > group.input.bytes - offset) {
+        return Status::InvalidArgument(
+            "BatchPut active input_offsets and lengths must describe bytes inside input");
+      }
+    }
+    plan.flat_keys.insert(plan.flat_keys.end(), group.keys.begin(),
+                          group.keys.begin() + group_active);
+    plan.source_indices.insert(plan.source_indices.end(), group_active,
+                               static_cast<std::uint32_t>(group_index));
+    plan.offsets.insert(plan.offsets.end(), group.input_offsets.begin(),
+                        group.input_offsets.begin() + group_active);
+    plan.lengths.insert(plan.lengths.end(), group.lengths.begin(),
+                        group.lengths.begin() + group_active);
+    remaining -= group_active;
+    if (remaining == 0) break;
   }
 
   PutContext put_context;
   PutAccessDesc put_desc;
-  Status status = meta_manager_.PreparePut(request.keys, request.lengths,
+  Status status = meta_manager_.PreparePut(plan.flat_keys, plan.lengths,
                                            &put_context, &put_desc);
   if (!status.ok()) {
     return status;
   }
 
   status = access_operator_.ExecuteBatchPut(
-      BatchPutExecRequest{&request, &put_desc, execution});
+      BatchPutExecRequest{&plan, &put_desc, execution});
   if (!status.ok()) {
     (void)meta_manager_.AbortPut(put_context);
     return status;

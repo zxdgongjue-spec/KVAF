@@ -1,5 +1,23 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+add_test(NAME kvaf_cpu_batch_put_metrics
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/python/test_cpu_batch_put_metrics.py")
+
+add_executable(kvaf_cpu_urma_sgl_plan_test cpu_urma_sgl_plan_test.cc)
+target_include_directories(kvaf_cpu_urma_sgl_plan_test PRIVATE
+  "${CMAKE_SOURCE_DIR}/access_operator/include")
+target_link_libraries(kvaf_cpu_urma_sgl_plan_test PRIVATE kvaf_peer_link)
+target_compile_features(kvaf_cpu_urma_sgl_plan_test PRIVATE cxx_std_17)
+add_test(NAME kvaf_cpu_urma_sgl_plan COMMAND kvaf_cpu_urma_sgl_plan_test)
+
+add_executable(kvaf_runtime_batch_put_prefix_test
+  runtime_batch_put_prefix_test.cc)
+target_link_libraries(kvaf_runtime_batch_put_prefix_test PRIVATE kvaf_runtime)
+target_compile_features(kvaf_runtime_batch_put_prefix_test PRIVATE cxx_std_17)
+add_test(NAME kvaf_runtime_batch_put_prefix
+  COMMAND kvaf_runtime_batch_put_prefix_test)
+
 if(KVAF_BUILD_PYTHON)
   add_test(
     NAME kvaf_runtime_mock_python
@@ -33,10 +51,61 @@ if(KVAF_BUILD_PYTHON)
       )
     endif()
   endif()
+
+  if(KVAF_BUILD_REMOTE_CPU_SERVICE)
+    add_test(
+      NAME kvaf_cpu_runtime_npu_hbm_python
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/python/test_cpu_runtime_npu_hbm.py"
+    )
+    set_tests_properties(kvaf_cpu_runtime_npu_hbm_python PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}/python"
+      TIMEOUT 240
+    )
+  endif()
 else()
   message(STATUS
     "Skipping direct Runtime Python tests; configure with -DKVAF_BUILD_PYTHON=ON")
 endif()
 
-# Runtime tests are Python-only. Mock and NPU integration coverage call the
-# pybind API directly; no subprocess driver is built or invoked.
+# Python tests cover the public binding. The compact-prefix C++ test protects
+# Runtime filtering before MetaManager and AccessOperator execution.
+
+if(KVAF_BUILD_REMOTE_CPU_SERVICE)
+  # Standalone coverage uses the production transport owned by
+  # access_operator; it does not carry a second URMA implementation.
+  add_executable(kvaf_cpu_hbm_client cpu_hbm_client.cc)
+  target_include_directories(kvaf_cpu_hbm_client PRIVATE
+    "${KVAF_URMA_INCLUDE_DIR}")
+  target_link_libraries(kvaf_cpu_hbm_client PRIVATE kvaf_cpu_urma_transport)
+  target_compile_features(kvaf_cpu_hbm_client PRIVATE cxx_std_17)
+  get_filename_component(KVAF_CPU_URMA_LIBRARY_DIR "${KVAF_URMA_LIBRARY}" DIRECTORY)
+  set_property(TARGET kvaf_cpu_hbm_client APPEND PROPERTY BUILD_RPATH
+    "${KVAF_CPU_URMA_LIBRARY_DIR}")
+endif()
+
+if(KVAF_BUILD_HBM_RW_TEST)
+  set(KVAF_URMA_ROOT "" CACHE PATH "UMDK source or installation root")
+  find_path(KVAF_HBM_TEST_URMA_INCLUDE_DIR urma_api.h
+    HINTS "${KVAF_URMA_ROOT}/include" "${CMAKE_SOURCE_DIR}/../third_party/umdk/include")
+  find_library(KVAF_HBM_TEST_URMA_LIBRARY NAMES urma
+    HINTS "${KVAF_URMA_ROOT}/lib64" "${KVAF_URMA_ROOT}/lib" /lib64 /usr/lib64)
+  if(NOT KVAF_HBM_TEST_URMA_INCLUDE_DIR OR NOT KVAF_HBM_TEST_URMA_LIBRARY)
+    message(FATAL_ERROR "KVAF_BUILD_HBM_RW_TEST requires urma_api.h and liburma")
+  endif()
+
+  add_executable(kvaf_npu_hbm_server npu_hbm_server.cc)
+  target_include_directories(kvaf_npu_hbm_server PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/runtime/include
+    ${CMAKE_SOURCE_DIR}/access_operator/include
+    ${KVAF_HBM_TEST_URMA_INCLUDE_DIR}
+    ${ASCEND_CANN_PACKAGE_PATH}/include)
+  target_link_directories(kvaf_npu_hbm_server PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/lib64)
+  target_link_libraries(kvaf_npu_hbm_server PRIVATE
+    kvaf_direct_hccp_session kvaf_peer_link ascendcl ${CMAKE_DL_LIBS} pthread)
+  get_filename_component(KVAF_HBM_TEST_URMA_LIBRARY_DIR "${KVAF_HBM_TEST_URMA_LIBRARY}" DIRECTORY)
+
+  set_property(TARGET kvaf_npu_hbm_server APPEND PROPERTY BUILD_RPATH
+    "${KVAF_HBM_TEST_URMA_LIBRARY_DIR}" "${ASCEND_CANN_PACKAGE_PATH}/lib64")
+endif()

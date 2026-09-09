@@ -208,6 +208,39 @@ tests/run_remote_cpu_runtime_perf.sh "$PWD/build-npu"
 
 脚本先执行完整数据路径正确性 preflight；通过后输出各 Runtime API 的
 `PERF_RESULT`，包括初始化、BatchPut、AccessTable、BatchGet、BatchFree 和 shutdown。
+
+### 4. 变长 BatchPut：单 Tensor 与 Tensor list 对比
+
+该测试同时执行两种布局：`single_tensor` 将所有 block 拼成一个 packed
+NPU Tensor；`tensor_list` 将相同的 block 按 `KVAF_NPU_INPUT_GROUPS` 拆成多个
+NPU Tensor。两种布局使用相同的每行变长数据和总字节数，输出 mean/p50/p90/p99
+以及 useful GB/s，并校验提交后的长度和 valid 标记。
+
+CPU 服务保持运行时，在 NPU 主机执行：
+
+```bash
+tests/run_remote_cpu_batch_put.sh "$PWD/build-npu"
+```
+
+可调参数示例：
+
+```bash
+KVAF_NPU_REQUESTS=4096 \
+KVAF_NPU_INPUT_GROUPS=8 \
+KVAF_NPU_MIN_BLOCK_BYTES=256 \
+KVAF_NPU_MAX_BLOCK_BYTES=4096 \
+KVAF_NPU_CORE_COUNT=32 \
+KVAF_NPU_WARMUP=2 \
+KVAF_NPU_ITERATIONS=10 \
+KVAF_CPU_SERVICE_ADDR=<cpu-ip>:28999 \
+tests/run_remote_cpu_batch_put.sh "$PWD/build-npu"
+```
+
+数据长度由确定性公式生成：
+`length[row] = min + ((row * 131 + 17) % (max - min + 1))`。
+每个 group 的 Tensor 只包含该 group 的 block，`input_offsets` 是 Tensor 内的局部
+偏移；单 Tensor 对比项会重新计算拼接后的全局偏移。该脚本需要已经构建好的
+BatchGet/BatchPut kernel 和 NPU Python binding。
 默认总超时为 600 秒，可通过 `KVAF_REMOTE_CPU_PERF_TIMEOUT` 调整。
 
 性能场景可通过以下变量调整：

@@ -5,6 +5,7 @@
 #include <string>
 #include <utility>
 
+#include "npu_service.h"
 #include "runtime.h"
 
 namespace kvaf {
@@ -31,12 +32,16 @@ struct NpuRuntimeOptions {
 class NpuRuntime final : public Runtime {
  public:
   explicit NpuRuntime(NpuRuntimeOptions options);
+  // HBM provider mode. The service owns HBM and accepts CPU Runtime links;
+  // the AIV kernel configuration is not required in this mode.
+  explicit NpuRuntime(NpuServiceOptions options);
   ~NpuRuntime() override;
 
   NpuRuntime(const NpuRuntime&) = delete;
   NpuRuntime& operator=(const NpuRuntime&) = delete;
 
   Status Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size);
+  Status InitializeHbmService();
   RuntimeCore& core();
   const RuntimeCore& core() const;
 

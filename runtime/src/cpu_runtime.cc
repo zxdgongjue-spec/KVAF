@@ -1,5 +1,7 @@
 #include "cpu_runtime.h"
 #include "peer_protocol.h"
+#include "cpu_urma/cpu_urma_access_operator.h"
+#include "peer_link.h"
 
 #include <dlfcn.h>
 #include <sys/socket.h>
@@ -17,6 +19,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -25,6 +28,42 @@
 
 namespace kvaf {
 namespace {
+
+class PeerHbmAllocator final : public DdrMemoryAllocator {
+ public:
+  explicit PeerHbmAllocator(std::shared_ptr<peer::PeerLink> link) : link_(std::move(link)) {}
+  Status Allocate(const RuntimeInitRequest& request, RemoteRegionDesc* region) override {
+    if (region == nullptr || link_ == nullptr || request.ddr_bytes == 0U || request.slot_size == 0U)
+      return Status::InvalidArgument("invalid HBM allocation request");
+    if (allocated_.base != 0U) return Status::InvalidState("HBM region already allocated");
+    Status status = link_->AllocateHbmRegion(request.ddr_bytes, request.slot_size,
+                                             device_id_, eid_index_, &allocated_);
+    if (!status.ok()) return status;
+    *region = RemoteRegionDesc{allocated_.base, allocated_.length, request.slot_size, DeviceKind::kNpu};
+    return Status::OK();
+  }
+  Status Release(const RemoteRegionDesc&) override {
+    if (allocated_.base == 0U) return Status::NotFound("HBM region not allocated");
+    std::fprintf(stderr, "[KVAF_CPU] HBM_RELEASE_REQUEST session=%llu base=0x%llx\n",
+                 static_cast<unsigned long long>(allocated_.session_id),
+                 static_cast<unsigned long long>(allocated_.base));
+    Status status = link_->ReleaseHbmRegion(allocated_.session_id);
+    if (status.ok()) allocated_ = {};
+    else std::fprintf(stderr, "[KVAF_CPU] HBM_RELEASE_FAILED session=%llu reason=%s\n",
+                      static_cast<unsigned long long>(allocated_.session_id), status.message().c_str());
+    return status;
+  }
+  void SetDevice(std::uint32_t id, std::uint32_t eid, bool has_eid_index) {
+    device_id_ = id;
+    eid_index_ = has_eid_index ? eid : UINT32_MAX;
+  }
+  const peer::PeerRegion& region() const { return allocated_; }
+ private:
+  std::shared_ptr<peer::PeerLink> link_;
+  peer::PeerRegion allocated_{};
+  std::uint32_t device_id_{0U};
+  std::uint32_t eid_index_{0U};
+};
 
 using kvaf::peer::AllocateRegionRequest;
 using kvaf::peer::AllocateRegionResponse;
@@ -770,6 +809,12 @@ void HandleClient(int fd, CpuService* service) {
       SendStatus(fd, command, service->Release(request.session_id));
       return;
     }
+    case Command::kAllocateHbmRegion:
+    case Command::kReleaseHbmRegion:
+      // HBM ownership belongs to NpuService; a CPU service never accepts
+      // these commands.
+      SendStatus(fd, command, Result::kInvalidRequest);
+      return;
   }
   SendStatus(fd, command, Result::kInvalidRequest);
 }
@@ -779,6 +824,12 @@ void HandleClient(int fd, CpuService* service) {
 struct CpuRuntime::Impl {
   UrmaResourcePool resources;
   std::unique_ptr<CpuService> service;
+  std::shared_ptr<peer::PeerLink> peer_link;
+  std::unique_ptr<PeerHbmAllocator> hbm_allocator;
+  std::unique_ptr<CpuUrmaAccessOperator> access_operator;
+  std::unique_ptr<MetaManager> meta_manager;
+  std::unique_ptr<RuntimeCore> runtime_core;
+  bool client_mode{false};
 };
 
 CpuRuntime::CpuRuntime() = default;
@@ -799,8 +850,66 @@ Status CpuRuntime::Initialize(const CpuRuntimeOptions& options) {
   return Status::OK();
 }
 
-Status CpuRuntime::LinkTo(const LinkTarget&) {
-  return Status::NotImplemented("CpuRuntime does not initiate links in the CPU--NPU deployment");
+Status CpuRuntime::InitializeClient(const CpuRuntimeClientOptions& options) {
+  if (impl_ != nullptr) return Status::InvalidState("CpuRuntime has already been initialized");
+  const std::string peer_address = options.peer_address.empty() ? pending_peer_address_ : options.peer_address;
+  if (peer_address.empty() || options.hbm_bytes == 0U || options.slot_size == 0U ||
+      options.hbm_bytes % options.slot_size != 0U)
+    return Status::InvalidArgument("CPU HBM client requires peer address and valid HBM size");
+  auto impl = std::make_unique<Impl>();
+  impl->client_mode = true;
+  impl->peer_link = std::make_shared<peer::PeerLink>(peer_address);
+  impl->hbm_allocator = std::make_unique<PeerHbmAllocator>(impl->peer_link);
+  impl->hbm_allocator->SetDevice(options.device_id, options.eid_index, options.has_eid_index);
+  CpuUrmaTransportOptions transport_options;
+  transport_options.peer_address = peer_address;
+  transport_options.ub_device = options.ub_device;
+  transport_options.has_eid_index = options.has_eid_index;
+  transport_options.eid_index = options.eid_index;
+  transport_options.remote_hbm = true;
+  transport_options.remote_device_id = options.device_id;
+  transport_options.remote_eid_index = options.has_eid_index ? options.eid_index : UINT32_MAX;
+  transport_options.wqes_per_doorbell = options.wqes_per_doorbell;
+  transport_options.remote_sgl_size = options.remote_sgl_size;
+  impl->access_operator = std::make_unique<CpuUrmaAccessOperator>(transport_options, impl->peer_link);
+  impl->meta_manager = CreateInMemoryMetaManager();
+  impl->runtime_core = std::make_unique<RuntimeCore>(*impl->meta_manager, *impl->access_operator,
+                                                     *impl->hbm_allocator);
+  const Status status = impl->runtime_core->Initialize(
+      RuntimeInitRequest{options.hbm_bytes, options.slot_size, DeviceKind::kNpu});
+  if (!status.ok()) return status;
+  impl_ = std::move(impl);
+  return Status::OK();
+}
+
+RuntimeCore& CpuRuntime::core() {
+  if (impl_ == nullptr || !impl_->client_mode || impl_->runtime_core == nullptr)
+    throw std::logic_error("CpuRuntime core is available only in client mode");
+  return *impl_->runtime_core;
+}
+const RuntimeCore& CpuRuntime::core() const {
+  if (impl_ == nullptr || !impl_->client_mode || impl_->runtime_core == nullptr)
+    throw std::logic_error("CpuRuntime core is available only in client mode");
+  return *impl_->runtime_core;
+}
+
+CpuRuntimeBatchTiming CpuRuntime::last_batch_timing() const {
+  if (impl_ == nullptr || !impl_->client_mode ||
+      impl_->access_operator == nullptr) {
+    throw std::logic_error(
+        "CpuRuntime batch timing is available only in client mode");
+  }
+  const CpuUrmaTransport::BatchTiming timing =
+      impl_->access_operator->last_batch_timing();
+  return CpuRuntimeBatchTiming{timing.prepare_ns, timing.post_ns,
+                               timing.poll_ns, timing.total_ns, timing.wr_count};
+}
+
+Status CpuRuntime::LinkTo(const LinkTarget& target) {
+  if (target.address.empty()) return Status::InvalidArgument("CpuRuntime LinkTo requires peer host:port");
+  if (impl_ != nullptr) return Status::InvalidState("CpuRuntime LinkTo must run before initialize");
+  pending_peer_address_ = target.address;
+  return Status::OK();
 }
 
 Status CpuRuntime::AcceptLink(const LinkTarget&) {
@@ -809,6 +918,10 @@ Status CpuRuntime::AcceptLink(const LinkTarget&) {
 
 Status CpuRuntime::ReleaseLink(LinkId link_id) {
   if (!initialized()) return Status::NotInitialized("CpuRuntime has not been initialized");
+  if (impl_->client_mode) {
+    if (link_id != 1U) return Status::NotFound("CpuRuntime HBM link was not found");
+    return Shutdown();
+  }
   const Result result = impl_->service->Release(link_id);
   if (result == Result::kOk) return Status::OK();
   if (result == Result::kNotFound) return Status::NotFound("CpuRuntime Link was not found");
@@ -824,13 +937,17 @@ Status CpuRuntime::ServeConnection(int connection_fd) {
 
 Status CpuRuntime::Shutdown() {
   if (impl_ == nullptr) return Status::OK();
+  Status status = Status::OK();
+  if (impl_->client_mode && impl_->runtime_core != nullptr && impl_->runtime_core->initialized())
+    status = impl_->runtime_core->Shutdown();
   impl_.reset();
-  return Status::OK();
+  return status;
 }
 
 bool CpuRuntime::initialized() const { return impl_ != nullptr; }
 
 RuntimeCapabilities CpuRuntime::capabilities() const {
+  if (impl_ != nullptr && impl_->client_mode) return RuntimeCapabilities{true, true, false, true};
   return RuntimeCapabilities{false, false, true, false};
 }
 

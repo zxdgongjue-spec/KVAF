@@ -6,8 +6,10 @@ by KVAF Runtime. It does not call MetaManager and does not support graph mode.
 Runtime owns the transaction boundary:
 
 ```text
-PreparePut(keys, lengths)
--> upload destination addresses
+flatten grouped request
+-> PreparePut(flat_keys, lengths)
+-> register/reuse each source Tensor and build SourceDescriptor[S]
+-> upload descriptors and row metadata once
 -> KvafExecuteBatchPutSync
 -> success: CommitPut
 -> failure: AbortPut
@@ -15,24 +17,26 @@ PreparePut(keys, lengths)
 
 ## Data contract
 
-All request arrays are device-resident and contain exactly `row_count`
-entries:
+All request arrays are device-resident. `S` is the number of source Tensors
+and `R` is `row_count`, the total number of rows after group flattening:
 
 | Field | Layout | Meaning |
 | --- | --- | --- |
-| `input` | `uint8[input_bytes]` | Packed NPU HBM input. |
-| `input_offsets` | `uint64[row_count]` | Source byte offset per block. |
-| `lengths` | `uint64[row_count]` | Actual byte length per block. |
-| `destination_addresses` | `uint64[row_count]` | Host DDR destination returned by `PreparePut`. |
+| `source_descriptors` | `KvafBatchPutSourceDescriptor[S]` | Base address and local token id for each source Tensor. |
+| `source_indices` | `uint32[R]` | Source descriptor index per row. |
+| `input_offsets` | `uint64[R]` | Byte offset inside the selected source Tensor. |
+| `lengths` | `uint64[R]` | Actual byte length per block. |
+| `destination_addresses` | `uint64[R]` | Host DDR destination returned by `PreparePut`. |
 | `core_status` | `KvafBatchPutCoreStatus[aiv_core_count]` | Device diagnostic output. |
 
 Request `i` is always:
 
 ```cpp
-source = input + input_offsets[i];
+descriptor = source_descriptors[source_indices[i]];
+source = descriptor.base_address + input_offsets[i];
 target = destination_addresses[i];
 bytes = lengths[i];
-UDMA_WRITE(source, target, bytes);
+UDMA_WRITE(source, descriptor.local_token_id, target, bytes);
 ```
 
 The source payload must already be visible in Global Memory before launch.
@@ -44,9 +48,10 @@ There are no indices, masks, validity tables, table capacities or graph
 capture/replay semantics in V1.
 
 The kernel trusts per-request metadata and does not validate it before
-publishing WQEs. The caller must ensure that every length is nonzero and fits
-the 32-bit WQE byte-count field, every source range is inside `input_bytes`,
-and every destination range is inside the Host DDR region passed to
+publishing WQEs. The caller must ensure every source index selects a valid
+descriptor, every length is nonzero and fits the 32-bit WQE byte-count field,
+every source range is inside its selected Tensor, and every destination range
+is inside the Host DDR region passed to
 `KvafBatchPutTransportCreateWithPeerLink`. Invalid metadata is unsupported and may result
 in a transport or completion error.
 
@@ -56,11 +61,17 @@ in a transport or completion error.
 KvafBatchPutTransportCreateWithPeerLink(host_ddr, host_ddr_bytes, aiv_core_count,
                                         jettys_per_core, peer_link, npu_local_eid,
                                         &transport);
-KvafBatchPutLocalBufferAcquire(transport, input_hbm, input_bytes, &local_buffer);
+for (source : sources) {
+  KvafBatchPutLocalBufferAcquire(transport, source.data, source.bytes,
+                                 &local_buffers[i]);
+  KvafBatchPutLocalBufferDescribe(local_buffers[i], &source_descriptors[i]);
+}
 
-KvafExecuteBatchPutSync(local_buffer, &args, stream, statuses, aiv_core_count);
+KvafExecuteBatchPutSync(transport, &args, stream, statuses, aiv_core_count);
 
-KvafBatchPutLocalBufferRelease(local_buffer);
+for (local_buffer : local_buffers) {
+  KvafBatchPutLocalBufferRelease(local_buffer);
+}
 KvafBatchPutTransportDestroy(transport);
 ```
 
@@ -69,9 +80,9 @@ registration/import and persistent queue state. Each AIV core owns one or two
 independent Jetty slots, each with its own SQ, CQ, doorbells and persistent
 producer/consumer indices. It never registers input HBM.
 
-`LocalBufferAcquire` registers only input HBM. Repeated Acquire with the same
-`(address, bytes)` returns the same opaque handle and reuses its MR/entity.
-Release decrements its use reference; cached
+`LocalBufferAcquire` registers only source HBM and does not create a CTP,
+Jetty, SQ or CQ. Repeated Acquire with the same `(address, bytes)` returns the
+same opaque handle and reuses its MR/token. Release decrements its use reference; cached
 MRs are unregistered by `TransportDestroy`. Inputs using the same transport
 must not execute concurrently because each AIV queue is single-producer; the
 synchronous API serializes launches on that transport.
