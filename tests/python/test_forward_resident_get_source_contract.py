@@ -78,13 +78,18 @@ def main() -> None:
     assert "ReadGmByPassDCache<int32_t>" not in validation
     assert "AscendC::DataCopyPad(local_indices, global_indices" in validation
     assert "output_indices[earlier]" not in validation
-    assert "old == value" in validation
-    assert "probe < capacity" in validation
-    assert re.search(r"if \(!inserted\)\s*\{\s*return false;\s*\}", validation)
+    assert "VF_CALL<ValidateKvafForwardResidentOutputsSimt>" in validation
+    assert "return result[0] == 0U" in validation
+    assert "probe < capacity" not in validation
+    simt_validation = _between(device, "inline void ValidateKvafForwardResidentOutputsSimt(",
+                               "// CandidateCompact owns cross-wave unique-slot admission.")
+    assert "sorted[i] == sorted[i + 1U]" in simt_validation
+    assert "static_cast<uint64_t>(value) >= resident_end" in simt_validation
+    assert "asc_syncthreads();" in simt_validation
     assert "get_imm(0U)" in validation
     assert "kDenseBatchGetReservedWqeUbBytes" in validation
     assert validation.index("HardEvent::MTE2_S") < validation.index(
-        "output_indices[request]"
+        "output_indices[0]"
     )
     bulk = _between(
         device,

@@ -462,6 +462,44 @@ __aicore__ inline bool LoadKvafForwardResidentQueueTemplate(
          descriptor->active_request_count == 0U && descriptor->reserved0 == 0U;
 }
 
+// Exact bounded output validation on 32 SIMT lanes. Sort a private copy,
+// never the original request/output order. Unlike the former Scalar hash
+// loop, work is independent of collisions and distributed across lanes.
+__simt_vf__ __aicore__ LAUNCH_BOUND(32)
+inline void ValidateKvafForwardResidentOutputsSimt(
+    __ubuf__ const int32_t* outputs, __ubuf__ int32_t* sorted,
+    uint32_t count, uint32_t capacity, uint64_t resident_begin,
+    uint64_t resident_end, __ubuf__ uint32_t* result) {
+  int32_t bad = 0;
+  for (uint32_t i = threadIdx.x; i < capacity; i += 32U) {
+    const int32_t value = i < count ? outputs[i] : INT32_MAX;
+    if (i < count && (value < 0 || static_cast<uint64_t>(value) < resident_begin ||
+                     static_cast<uint64_t>(value) >= resident_end)) { bad = 1; }
+    sorted[i] = value;
+  }
+  asc_syncthreads();
+  for (uint32_t width = 2U; width <= capacity; width <<= 1U) {
+    for (uint32_t distance = width >> 1U; distance != 0U; distance >>= 1U) {
+      for (uint32_t i = threadIdx.x; i < capacity; i += 32U) {
+        const uint32_t partner = i ^ distance;
+        if (partner > i) {
+          const int32_t left = sorted[i], right = sorted[partner];
+          if (((i & width) == 0U && left > right) || ((i & width) != 0U && left < right)) {
+            sorted[i] = right;
+            sorted[partner] = left;
+          }
+        }
+      }
+      asc_syncthreads();
+    }
+  }
+  for (uint32_t i = threadIdx.x; i + 1U < count; i += 32U) {
+    if (sorted[i] == sorted[i + 1U]) { bad = 1; }
+  }
+  const uint32_t failures = asc_ballot(bad);
+  if (threadIdx.x == 0U) { result[0] = failures; }
+}
+
 // CandidateCompact owns cross-wave unique-slot admission.  The validation at
 // the doorbell boundary verifies its local half: every output index is an
 // absolute row of this one forward arena, and one dense wave cannot write the
@@ -477,8 +515,8 @@ __aicore__ inline bool ValidateKvafForwardResidentOutputIndices(
   // This validation precedes WQE construction. The preceding PostOnly has
   // committed both banks (CommitPostScalarStage waits for MTE3 before the
   // doorbell), and HCCP reads the copied SQ in GM, never these UB banks.
-  // Reuse up to 3 KiB of that reserved aperture until the next Post
-  // materializes its WQEs: 1 KiB indices, up to 2 KiB exact hash table.
+  // Reuse 2080 bytes of that reserved aperture until the next Post
+  // materializes its WQEs: 1 KiB indices, 1 KiB sorted copy, one result cell.
   // No static array/TBuf or additional UB is allocated.
   // Previously every pair reread GM: 64 requests incurred 2016 uncached
   // reads here and another 2016 in per-request Append. A single bounded DMA
@@ -508,59 +546,31 @@ __aicore__ inline bool ValidateKvafForwardResidentOutputIndices(
       reinterpret_cast<__ubuf__ const int32_t*>(get_imm(0U));
   const uint64_t resident_end =
       control.resident_row_base + control.resident_row_count;
-  for (uint32_t request = 0U; request < descriptor.active_request_count;
-       ++request) {
-    const int32_t row = output_indices[request];
-    if (row < 0 || static_cast<uint64_t>(row) < control.resident_row_base ||
-        static_cast<uint64_t>(row) >= resident_end) {
-      return false;
-    }
-  }
-  // Exact membership, not a probabilistic filter. Use the idle WQE aperture
-  // for a <=50%-full hash table instead of scalar heap-sort UB read/writes.
-  // Full row equality resolves collisions; bounded probing preserves the
-  // complete duplicate gate even for adversarial slot distributions.
-  constexpr uint32_t kHashOffset =
-      KVAF_AIV_BATCH_GET_DENSE_REQUEST_CAPACITY * sizeof(int32_t);
-  static_assert(kHashOffset + 2U * KVAF_AIV_BATCH_GET_DENSE_REQUEST_CAPACITY *
-                    sizeof(int32_t) <=
-                    kvaf_fused_get::kDenseBatchGetReservedWqeUbBytes,
-                "validation hash exceeds idle WQE banks");
-  __ubuf__ int32_t* const table =
-      reinterpret_cast<__ubuf__ int32_t*>(get_imm(kHashOffset));
   const uint32_t count = descriptor.active_request_count;
-  uint32_t capacity = 2U;
-  while (capacity < count * 2U) {
-    capacity *= 2U;
+  if (count == 1U) {
+    const int32_t row = output_indices[0];
+    return row >= 0 && static_cast<uint64_t>(row) >= control.resident_row_base &&
+           static_cast<uint64_t>(row) < resident_end;
   }
-  for (uint32_t i = 0U; i < capacity; ++i) {
-    table[i] = -1;
-  }
-  for (uint32_t i = 0U; i < count; ++i) {
-    const int32_t value = output_indices[i];
-    uint32_t hash = static_cast<uint32_t>(value);
-    hash ^= hash >> 16U;
-    hash *= 0x9e3779b1U;
-    hash ^= hash >> 16U;
-    uint32_t bucket = hash & (capacity - 1U);
-    bool inserted = false;
-    for (uint32_t probe = 0U; probe < capacity; ++probe) {
-      const int32_t old = table[bucket];
-      if (old == value) {
-        return false;
-      }
-      if (old == -1) {
-        table[bucket] = value;
-        inserted = true;
-        break;
-      }
-      bucket = (bucket + 1U) & (capacity - 1U);
-    }
-    if (!inserted) {
-      return false;
-    }
-  }
-  return true;
+  constexpr uint32_t kSortOffset =
+      KVAF_AIV_BATCH_GET_DENSE_REQUEST_CAPACITY * sizeof(int32_t);
+  constexpr uint32_t kResultOffset = 2U * kSortOffset;
+  static_assert(kResultOffset + 32U <=
+                    kvaf_fused_get::kDenseBatchGetReservedWqeUbBytes,
+                "SIMT validation exceeds idle WQE banks");
+  uint32_t capacity = 1U;
+  while (capacity < count) { capacity <<= 1U; }
+  __ubuf__ uint32_t* const result =
+      reinterpret_cast<__ubuf__ uint32_t*>(get_imm(kResultOffset));
+  AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID6);
+  AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID6);
+  AscendC::Simt::VF_CALL<ValidateKvafForwardResidentOutputsSimt>(
+      AscendC::Simt::Dim3{32U, 1U, 1U}, output_indices,
+      reinterpret_cast<__ubuf__ int32_t*>(get_imm(kSortOffset)),
+      count, capacity, control.resident_row_base, resident_end, result);
+  AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+  AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+  return result[0] == 0U;
 }
 
 // Append translates one already-admitted KV object into the dense Direct-HCCP

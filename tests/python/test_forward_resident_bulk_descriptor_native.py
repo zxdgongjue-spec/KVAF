@@ -191,11 +191,12 @@ void equivalence() {
   const auto before_validation=ub;
   assert(ValidateKvafForwardResidentOutputIndices(bulk.control,bulk.descriptor));
   assert(bypass_reads==0 && dma_bytes==17*n && AscendC::event_state==0);
-  uint32_t hash_capacity=2;
-  while(hash_capacity<2*n) hash_capacity*=2;
+  uint32_t sort_capacity=1;
+  while(sort_capacity<n) sort_capacity*=2;
   const uint32_t input_end=(4*n+31U)/32U*32U;
   for(uint32_t byte=0;byte<ub.size();++byte)
-   if(byte>=input_end && (byte<1024U || byte>=1024U+4U*hash_capacity))
+   if(byte>=input_end && (n==1 ||
+      ((byte<1024U || byte>=1024U+4U*sort_capacity) && (byte<2048U || byte>=2052U))))
     assert(ub[byte]==before_validation[byte]);
   for(uint32_t byte=3332;byte<ub.size();++byte) assert(ub[byte]==0xa7);
   for(uint32_t i=0;i<n;++i) assert(AppendKvafForwardResidentRequest(
@@ -211,7 +212,7 @@ void duplicate_gate() {
  for(uint32_t n=1;n<=256;++n) {
   Fixture batch;
   // Permuted, descending, singleton and full-capacity waves. Validate only
-  // private hash scratch is used; GM request order and canaries stay unchanged.
+  // private sort scratch is used; GM request order and canaries stay unchanged.
   for(uint32_t i=0;i<n;++i) batch.seeds[i*4+3]=1000+n-1-i;
   if(n%2==0) for(uint32_t i=0;i<n;++i) {
    const uint32_t j=(i*73+19)%n;
@@ -224,6 +225,10 @@ void duplicate_gate() {
   assert(batch.outputs==original); batch.guards();
   if(n>1) {
    for(uint32_t dup=1;dup<n;++dup) {
+    // Every position at the actual 64/256 request wave sizes; boundary and
+    // middle positions at every other possible count. Real concurrent host
+    // lanes need not repeat 32,640 equivalent sort networks in each build.
+    if(n!=64U && n!=256U && dup!=1U && dup!=n/2U && dup!=n-1U) continue;
     batch.outputs=original; batch.outputs[dup+1]=batch.outputs[1];
     assert(!ValidateKvafForwardResidentOutputIndices(batch.control,batch.descriptor));
     batch.guards();
@@ -236,6 +241,15 @@ void duplicate_gate() {
  f.outputs[64]=f.outputs[1]-1;
  assert(!ValidateKvafForwardResidentOutputIndices(f.control,f.descriptor));
  f.outputs[64]=6000;
+ assert(!ValidateKvafForwardResidentOutputIndices(f.control,f.descriptor));
+ // Padding uses INT32_MAX but it is also a valid representable row. Do
+ // not compare the padded suffix against the last real row as a duplicate.
+ f.descriptor.active_request_count=3;
+ f.control.resident_row_base=static_cast<uint64_t>(INT32_MAX)-10U;
+ f.control.resident_row_count=11U;
+ f.outputs[1]=INT32_MAX;f.outputs[2]=INT32_MAX-1;f.outputs[3]=INT32_MAX-2;
+ assert(ValidateKvafForwardResidentOutputIndices(f.control,f.descriptor));
+ f.outputs[3]=INT32_MAX;
  assert(!ValidateKvafForwardResidentOutputIndices(f.control,f.descriptor));
 }
 void hash_collisions() {
@@ -401,6 +415,7 @@ class ForwardResidentBulkDescriptorNativeTest(unittest.TestCase):
                 "BuildKvafForwardResidentVectorsSimt",
                 "BuildKvafForwardResidentRequestsFromSeedWords",
                 "PublishKvafForwardResidentRequestVectors",
+                "ValidateKvafForwardResidentOutputsSimt",
                 "ValidateKvafForwardResidentOutputIndices",
             )
         ]
