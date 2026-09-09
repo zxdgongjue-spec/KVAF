@@ -133,11 +133,13 @@ struct CpuUrmaTransport::Impl {
     wr = {};
     wr.opcode = job.write ? URMA_OPC_WRITE : URMA_OPC_READ;
     const bool completes_queue = position + 1U == queue.wrs.size();
-    // Match the AIV batching contract: relaxed placement for the body and a
-    // strongly ordered final WR whose CQE fences this Jetty's batch.
-    wr.flag.bs.place_order =
-        completes_queue ? URMA_STRONG_ORDER : URMA_RELAX_ORDER;
-    wr.flag.bs.comp_order = 1U;
+    // WRITE matches the comparison benchmark: keep both ordering flags zero.
+    // READ retains its existing ordering contract.
+    if (!job.write) {
+      wr.flag.bs.place_order =
+          completes_queue ? URMA_STRONG_ORDER : URMA_RELAX_ORDER;
+      wr.flag.bs.comp_order = 1U;
+    }
     wr.flag.bs.complete_enable = completes_queue ? 1U : 0U;
     wr.tjetty = remote_jettys_[jetty];
     wr.user_ctx = 0x5A1B0000ULL +
