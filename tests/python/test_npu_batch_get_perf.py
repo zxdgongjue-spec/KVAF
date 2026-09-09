@@ -687,7 +687,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         synchronize_samples: list[float] = []
         batch_get_samples: list[float] = []
         kernel_profile_samples: list[list[dict[str, object]]] = []
-        for _ in range(args.iterations):
+        for sample_index in range(args.iterations):
             indices, offsets, output_indices = create_request_plan()
             # Request generation and Tensor work are deliberately excluded.
             torch.npu.synchronize()
@@ -708,9 +708,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             synchronize_samples.append((completed - submitted) * 1000.0)
             batch_get_samples.append((completed - begin) * 1000.0)
             if args.kernel_profile:
-                kernel_profile_samples.append(
-                    list(runtime.batch_get_kernel_profile())
-                )
+                snapshot = list(runtime.batch_get_kernel_profile())
+                for profile in snapshot:
+                    core = int(profile["core"])
+                    request_begin = int(profile["request_begin"])
+                    first_doorbell_cycle = int(profile["first_doorbell_cycle"])
+                    post_done_cycle = int(profile["post_done_cycle"])
+                    for request_offset, completion_cycle_value in enumerate(
+                        profile["wqe_completion_cycles"]
+                    ):
+                        completion_cycle = int(completion_cycle_value)
+                        print(
+                            "WQE_COMPLETION "
+                            f"sample={sample_index} core={core} "
+                            f"request={request_begin + request_offset} "
+                            f"cycle={completion_cycle} "
+                            "from_first_doorbell_cycles="
+                            f"{completion_cycle - first_doorbell_cycle} "
+                            "from_post_done_cycles="
+                            f"{completion_cycle - post_done_cycle}"
+                        )
+                kernel_profile_samples.append(snapshot)
 
         print_samples(
             "batch_get_submit",
