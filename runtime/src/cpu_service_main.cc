@@ -12,7 +12,7 @@ namespace {
 void PrintUsage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] "
-               "[--memory-page-mode default|thp|hugetlb-2m]\n"
+               "[--memory-page-mode default|base-4k|thp|hugetlb-2m]\n"
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
                "candidates are discovered automatically. The default memory page mode preserves the existing "
                "4-KiB-aligned allocation. The service requires only liburma and /dev/uburma.\n",
@@ -33,6 +33,10 @@ bool ParseMemoryPageMode(const std::string& text, kvaf::CpuMemoryPageMode* mode)
   if (mode == nullptr) return false;
   if (text == "default") {
     *mode = kvaf::CpuMemoryPageMode::kDefault;
+    return true;
+  }
+  if (text == "base-4k") {
+    *mode = kvaf::CpuMemoryPageMode::kBasePage4K;
     return true;
   }
   if (text == "thp") {
@@ -84,7 +88,7 @@ int main(int argc, char** argv) {
     } else if (argument == "--memory-page-mode") {
       if (!ParseMemoryPageMode(argv[++index], &cpu_options.memory_page_mode)) {
         std::fprintf(stderr,
-                     "invalid --memory-page-mode; expected default, thp, or hugetlb-2m\n");
+                     "invalid --memory-page-mode; expected default, base-4k, thp, or hugetlb-2m\n");
         return 2;
       }
     } else {

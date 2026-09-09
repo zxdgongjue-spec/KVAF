@@ -605,6 +605,8 @@ class CpuService {
     switch (memory_page_mode_) {
       case CpuMemoryPageMode::kDefault:
         return "default";
+      case CpuMemoryPageMode::kBasePage4K:
+        return "base-4k";
       case CpuMemoryPageMode::kTransparentHugePage:
         return "thp";
       case CpuMemoryPageMode::kHugeTlb2M:
@@ -619,6 +621,26 @@ class CpuService {
       return false;
     }
     const std::size_t bytes = static_cast<std::size_t>(region->bytes);
+    if (memory_page_mode_ == CpuMemoryPageMode::kBasePage4K) {
+      void* const memory = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      if (memory == MAP_FAILED) {
+        Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=base_4k_mmap bytes=%" PRIu64
+            " errno=%d\n",
+            region->bytes, errno);
+        return false;
+      }
+      if (madvise(memory, bytes, MADV_NOHUGEPAGE) != 0) {
+        Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=madvise_nohugepage bytes=%" PRIu64
+            " errno=%d\n",
+            region->bytes, errno);
+        (void)munmap(memory, bytes);
+        return false;
+      }
+      region->memory = memory;
+      region->allocation_kind = Region::AllocationKind::kMmap;
+      return true;
+    }
     if (memory_page_mode_ == CpuMemoryPageMode::kHugeTlb2M) {
       if (bytes % kHugePage2MBytes != 0U) {
         Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=hugetlb_size bytes=%" PRIu64

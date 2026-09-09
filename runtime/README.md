@@ -44,12 +44,16 @@ cd /path/to/kvaf
   --listen 0.0.0.0 --port 28999
 ```
 
-CPU DDR region 支持三种页分配模式，通过 CPU 服务启动参数选择：
+CPU DDR region 支持四种页分配模式，通过 CPU 服务启动参数选择：
 
 ```bash
 # 保留原行为：4 KiB 对齐的普通匿名内存；操作系统仍可能自行使用 THP。
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28999 --memory-page-mode default
+
+# 显式使用基础页：独立匿名 VMA + MADV_NOHUGEPAGE，不受节点 THP=always 策略影响。
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28999 --memory-page-mode base-4k
 
 # 2 MiB 对齐，MADV_HUGEPAGE，并在注册前主动触页；是否全部合并仍由 Linux THP 决定。
 ./build-cpu/runtime/kvaf_cpu_service \
@@ -59,6 +63,13 @@ CPU DDR region 支持三种页分配模式，通过 CPU 服务启动参数选择
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28999 --memory-page-mode hugetlb-2m
 ```
+
+`base-4k` 只对当前 CPU service 分配的 DDR region 禁用 THP，不修改
+`/sys/kernel/mm/transparent_hugepage/*` 的节点全局策略；分配时若
+`MADV_NOHUGEPAGE` 失败则直接拒绝请求，不会静默回退。它适合在节点设置为
+`THP=always` 时建立稳定的基础页对照组。测试期间应确认服务日志包含
+`page_mode=base-4k`，并通过 `/proc/<pid>/smaps` 验证对应 region 的
+`AnonHugePages` 为 0。
 
 `hugetlb-2m` 不会在失败时静默回退。启动服务前必须在目标 NUMA node
 预留足够的 2 MiB hugepages；例如默认 2 GiB region 至少需要 1024 页：
