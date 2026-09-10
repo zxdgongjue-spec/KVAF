@@ -110,6 +110,35 @@ WRITE 并等待 CQ；第一组成功即选用，失败则释放本次资源后�
 客户端的 `--ub-device`、`--eid-index` 只筛选 CPU 本地候选。
 候选查询使用控制协议 v5，CPU 客户端与 NPU 服务端需要一起重新构建、重启。
 
+逐条比较 EID 链路带宽，可在 CPU 侧运行独立测试（`./build.sh cpu` 会构建该程序）：
+
+```bash
+./build-cpu/tests/kvaf_cpu_urma_eid_perf \
+  --peer 127.0.0.1:29888 --device-id 3 \
+  --output results/cpu_urma_eid_bandwidth.csv
+```
+
+`--peer` 指向已启动的 NPU HBM service；按部署修改地址、端口和 NPU device ID。
+测试遍历所有本地 UB 设备的非零 EID × 指定 NPU device 的全部候选 EID。
+每次固定一个组合，建立两条独立 Jetty 通道，探测成功后执行完整 WRITE/READ
+回读校验，再 warmup 和采样，最后再次回读校验。失败组合记录原因后继续下一组，
+不会自动切换到另一条链路。每组结束先销毁 transport 再释放远端 HBM；若释放失败，
+停止遍历并保留已收集的结果。
+
+默认 `--count 8192 --token-bytes 4096 --remote-sgl-size 1 --warmup 5 --iterations 100`，
+即每次 WRITE 32 MiB，8192 条 WR；本地和远端行地址均连续。所有组合使用相同负载，
+固定 2 个 Jetty、2 个 OpenMP worker，`wqes_per_doorbell=0`。这些负载选项可按需修改。
+测量范围为现有 `transport.total_ns`（包含分组、参数检查、segment 查找、WR 构造、
+提交和完成等待），不包含建链、预注册内存、回读校验和 warmup，也不经过 Runtime/Python。
+`mean_GBps = payload_bytes / mean_ns`，使用十进制 GB/s。
+
+CSV 每个 EID 组合一行，写完立即 flush；包括两端设备/EID index/EID、导出的 segment EID、
+状态及错误、负载参数、实际 WR 数、平均/p50/p99 延迟、平均/p50 带宽和 prepare/post/
+completion wait 平均耗时。`remote_sgl_size` 列是请求值，实际分组仍按设备能力限制，
+可结合 `wr_count_min/max` 和 transport 日志确认。失败行的性能字段留空。
+终端最后输出成功组合按平均带宽降序排列的 `EID_PERF_RANK`，以及包含 CSV 路径的
+`EID_PERF_SUMMARY`。无成功组合或资源清理失败时返回非零退出码。
+
 CPU URMA 固定创建 2 个 Jetty，并使用 2 个 OpenMP worker，每条 WR 的本地
 SGE 数固定为 1。常量位于 `cpu_urma_transport.cc`：`kJettyCount`、
 `kOmpThreadCount`、`kLocalSgeCount`。不再提供 `jetty_count`、`omp_thread_count`、

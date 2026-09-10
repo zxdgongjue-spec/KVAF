@@ -31,6 +31,10 @@ target_include_directories(kvaf_peer_hbm_eid_test PRIVATE "${CMAKE_SOURCE_DIR}/r
 target_link_libraries(kvaf_peer_hbm_eid_test PRIVATE kvaf_peer_link)
 add_test(NAME kvaf_peer_hbm_eid COMMAND kvaf_peer_hbm_eid_test)
 
+add_executable(kvaf_cpu_urma_eid_perf_metrics_test cpu_urma_eid_perf_metrics_test.cc)
+target_compile_features(kvaf_cpu_urma_eid_perf_metrics_test PRIVATE cxx_std_17)
+add_test(NAME kvaf_cpu_urma_eid_perf_metrics COMMAND kvaf_cpu_urma_eid_perf_metrics_test)
+
 if(KVAF_BUILD_PYTHON)
   add_test(
     NAME kvaf_runtime_mock_python
@@ -85,6 +89,10 @@ endif()
 # Runtime filtering before MetaManager and AccessOperator execution.
 
 if(KVAF_BUILD_REMOTE_CPU_SERVICE)
+  add_executable(kvaf_cpu_urma_eid_perf cpu_urma_eid_perf.cc)
+  target_include_directories(kvaf_cpu_urma_eid_perf PRIVATE "${KVAF_URMA_INCLUDE_DIR}")
+  target_link_libraries(kvaf_cpu_urma_eid_perf PRIVATE kvaf_cpu_urma_transport "${KVAF_URMA_LIBRARY}")
+  target_compile_features(kvaf_cpu_urma_eid_perf PRIVATE cxx_std_17)
   # Standalone coverage uses the production transport owned by
   # access_operator; it does not carry a second URMA implementation.
   add_executable(kvaf_cpu_hbm_client cpu_hbm_client.cc)
@@ -94,6 +102,8 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   target_compile_features(kvaf_cpu_hbm_client PRIVATE cxx_std_17)
   get_filename_component(KVAF_CPU_URMA_LIBRARY_DIR "${KVAF_URMA_LIBRARY}" DIRECTORY)
   set_property(TARGET kvaf_cpu_hbm_client APPEND PROPERTY BUILD_RPATH
+    "${KVAF_CPU_URMA_LIBRARY_DIR}")
+  set_property(TARGET kvaf_cpu_urma_eid_perf APPEND PROPERTY BUILD_RPATH
     "${KVAF_CPU_URMA_LIBRARY_DIR}")
 endif()
 
