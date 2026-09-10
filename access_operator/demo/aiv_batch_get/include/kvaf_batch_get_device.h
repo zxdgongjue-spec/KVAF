@@ -607,7 +607,16 @@ struct AsyncBatchGet {
   uint32_t used_jettys = 0U;
   uint32_t jettys_per_core = 0U;
   uint64_t error = kSuccess;
+  // Opt-in, invocation-local entity validation cache. The caller must keep
+  // the registered entity immutable until this state is destroyed.
+  uint64_t validated_entities = 0U;
+  uint64_t validated_output = 0U;
+  uint32_t validated_token_bytes = 0U;
+  uint32_t validated_jettys = 0U;
+  uint32_t validated_sq_depth = 0U;
 };
+
+#define KVAF_BATCH_GET_ENTITY_CACHE_VERSION 1
 
 __aicore__ inline uint64_t KvafBatchGetWait(AsyncBatchGet &pending) {
   if (pending.error != kSuccess) { return pending.error; }
@@ -636,7 +645,8 @@ __aicore__ inline uint64_t KvafBatchGetWait(AsyncBatchGet &pending) {
 
 __aicore__ inline uint64_t KvafBatchGetDevice(
     const KvafExecuteBatchGetKernelArgs &args, uint32_t logical_owner,
-    uint32_t request_begin, uint32_t request_count, AsyncBatchGet *pending = nullptr) {
+    uint32_t request_begin, uint32_t request_count, AsyncBatchGet *pending = nullptr,
+    bool reuse_immutable_entity = false) {
   if (pending != nullptr && (pending->error != kSuccess || pending->used_jettys != 0U)) {
     return pending->error != kSuccess ? pending->error : kInvalidQueue;
   }
@@ -696,8 +706,13 @@ __aicore__ inline uint64_t KvafBatchGetDevice(
   const uint32_t begin = request_begin;
   const uint32_t end = miss_count_valid ? request_begin + request_count : begin;
   uint32_t minimum_sq_depth = UINT32_MAX;
-
-  for (uint32_t jetty = 0U; jetty < jettys_per_core; ++jetty) {
+  const bool cached_entity = reuse_immutable_entity && pending != nullptr &&
+      pending->validated_entities == reinterpret_cast<uint64_t>(entities) &&
+      pending->validated_output == args.output &&
+      pending->validated_token_bytes == args.token_bytes &&
+      pending->validated_jettys == jettys_per_core && pending->validated_sq_depth >= 2U;
+  if (cached_entity) { minimum_sq_depth = pending->validated_sq_depth; }
+  for (uint32_t jetty = 0U; !cached_entity && jetty < jettys_per_core; ++jetty) {
     __gm__ const KvafBatchGetDirectUrmaEntity *const entity =
         entities + jetty;
     if (entity->magic != kEntityMagic ||
@@ -729,6 +744,15 @@ __aicore__ inline uint64_t KvafBatchGetDevice(
       minimum_sq_depth = entity->sq_depth;
     }
   }
+  if (!cached_entity && result == kSuccess && reuse_immutable_entity && pending != nullptr) {
+    pending->validated_entities = reinterpret_cast<uint64_t>(entities);
+    pending->validated_output = args.output;
+    pending->validated_token_bytes = args.token_bytes;
+    pending->validated_jettys = jettys_per_core;
+    pending->validated_sq_depth = minimum_sq_depth;
+  }
+  // Queue poison, request bounds, active addresses and SQ windows are dynamic:
+  // never bypass them with the immutable entity cache.
   for (uint32_t jetty = 0U;
        result == kSuccess && jetty < jettys_per_core; ++jetty) {
     __gm__ KvafBatchGetQueueState *const queue = queues + jetty;

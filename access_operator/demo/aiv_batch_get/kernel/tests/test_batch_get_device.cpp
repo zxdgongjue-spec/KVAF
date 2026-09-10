@@ -104,7 +104,31 @@ void TestAsyncTimeoutPoisonsOwner() {
          kvaf_device::kCqTimeout);
 }
 
+void TestInvocationEntityCacheKeepsDynamicValidation() {
+  Fixture fixture;
+  kvaf_device::AsyncBatchGet pending;
+  assert(kvaf_device::KvafBatchGetDevice(fixture.args, 1U, 7U, 65U, &pending, true) == 0U);
+  assert(pending.validated_entities != 0U && pending.validated_sq_depth >= 2U);
+  assert(kvaf_device::KvafBatchGetWait(pending) == 0U);
+  assert(kvaf_device::KvafBatchGetDevice(fixture.args, 1U, 7U, 65U, &pending, true) == 0U);
+  assert(kvaf_device::KvafBatchGetWait(pending) == 0U);
+  fixture.VerifyPayload(7U, 65U);
+  const auto posted = fixture.Doorbells();
+  fixture.indices[7] = -1;
+  assert(kvaf_device::KvafBatchGetDevice(fixture.args, 1U, 7U, 65U, &pending, true) ==
+         kvaf_device::kInvalidLookup);
+  assert(fixture.Doorbells() == posted);
+  fixture.indices[7] = 0;
+  assert(kvaf_device::KvafBatchGetDevice(fixture.args, 1U, kCapacity, 1U, &pending, true) ==
+         kvaf_device::kInvalidArgs);
+  fixture.queues[2].last_error = kvaf_device::kCqTimeout;
+  assert(kvaf_device::KvafBatchGetDevice(fixture.args, 1U, 7U, 1U, &pending, true) ==
+         kvaf_device::kQueuePoisoned);
+  assert(fixture.Doorbells() == posted);
+}
+
 int main() {
+  TestInvocationEntityCacheKeepsDynamicValidation();
   TestAsyncFinalWindow();
   TestAsyncTimeoutPoisonsOwner();
   TestWindowedPrefixAndPersistentQueues();
@@ -113,5 +137,5 @@ int main() {
   TestTimeoutOrErrorDrainsPeerAndPoisonsQueue(false);
   TestEmptyAndInvalidRanges();
   TestSmallQueue();
-  std::puts("PASS: shared BatchGet CPU control-flow model (8 scenarios; no NPU/transport execution)");
+  std::puts("PASS: shared BatchGet CPU control-flow model (9 scenarios; no NPU/transport execution)");
 }
