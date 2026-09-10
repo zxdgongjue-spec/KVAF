@@ -107,11 +107,19 @@ SGE 数固定为 1。常量位于 `cpu_urma_transport.cc`：`kJettyCount`、
 `kOmpThreadCount`、`kLocalSgeCount`。不再提供 `jetty_count`、`omp_thread_count`、
 `sgl_size` 初始化参数或对应命令行选项。
 
+每个 CPU Jetty 的 `CreateChannel` 请求都会在 NPU 服务端创建独立的目标
+Jetty 和 CQ；两条通道共享 HBM segment、token 和设备 context。服务端
+`CHANNEL_READY` 日志中的 `channel_index`、`target_jetty_id` 和
+`target_jfc_id` 可用于确认通道对应关系。释放 HBM session 时先释放各通道，
+再注销并释放 HBM。此行为需要重新构建并重启 `kvaf_npu_service`。
+
 每个 worker 独占一个 Jetty 的 WR 链表、SQ 和提交操作，构造好一批就直接提交，
 不需要等待另一个 Jetty 的构造完成。`wqes_per_doorbell > 0` 控制每批 WR 数，
 为 0（默认）时每个 worker 构造完整 Jetty 链表后提交；两种方式都由 worker
-自行下发。每个 Jetty 最后一个 WR 使用 strong-order 并请求 CQE，worker 汇合后
-由调用线程轮询完成。队列深度为每个 Jetty 1024 个 WR。
+自行下发。每个 Jetty 仅最后一个 WR 请求 CQE，worker 汇合后由调用线程轮询完成。
+WRITE 的 `place_order`、`comp_order` 均为 0，用于与独立测试对照；READ 保留
+末尾 strong-order 和完成顺序设置。CPU JFS/JFR 深度为 8192，JFC 深度为 16384；
+NPU 每条目标通道的 SQ/RQ 深度为 1024，CQ 深度为 16384。
 
 `CpuRuntime.initialize(..., remote_sgl_size=N)` 控制 WRITE 的远端 SGL 分组。
 默认 1 是单条 WR 对应一条数据的基线。大于 1 时，一个连续本地 DDR SGE 可以

@@ -23,6 +23,7 @@
 
 #include "direct_hccp/direct_hccp_remote_transport.h"
 #include "direct_hccp/direct_hccp_session.h"
+#include "npu_target_channel.h"
 #include "peer_protocol.h"
 
 namespace kvaf {
@@ -31,11 +32,11 @@ namespace {
 using namespace peer;
 using direct_hccp::DirectHccpApi;
 using direct_hccp::DirectHccpSession;
+using npu_service_detail::TargetChannel;
 
 constexpr std::uint32_t kHdcType = 18U;
 constexpr std::uint32_t kCqDepth = 16384U;
-// The benchmark submits one WR per block and fences the whole request list
-// with the final CQE. Keep the target queue at the benchmark's 1024-WR wave.
+// Each channel owns a target queue with these depths.
 constexpr std::uint32_t kSqDepth = 1024U;
 constexpr std::uint32_t kRqDepth = 1024U;
 constexpr std::size_t kMaxPeerJettys = 16U;
@@ -84,13 +85,10 @@ struct HbmRegion {
   std::array<std::uint8_t, kQpKeyBytes> jetty_key{};
   std::array<std::uint8_t, kEidBytes> eid{};
   std::uint32_t jetty_key_bytes{0U};
-  void* cq_handle{nullptr};
-  void* qp_handle{nullptr};
-  direct_hccp::CqInfo cq_info{};
-  direct_hccp::QpCreateInfo qp_info{};
-  // One imported CPU Jetty is retained for each CPU-side initiator Jetty.
-  // The exported HBM target Jetty itself is shared by those channels.
-  std::vector<void*> peer_target_jettys{};
+  // Preserve the allocation response's Jetty descriptor for compatibility.
+  // CreateChannel returns a separately owned target for each CPU initiator.
+  std::unique_ptr<TargetChannel> allocation_target;
+  std::vector<std::unique_ptr<TargetChannel>> channels;
 };
 
 struct DeviceState {
@@ -350,43 +348,26 @@ struct NpuService::Impl {
     std::memcpy(&exported_segment, reg.out.key.value, sizeof(exported_segment));
     std::memcpy(region->eid.data(), exported_segment.ubva.eid.raw, region->eid.size());
 
-    // Export a normal UMDK-visible Jetty key. The CPU peer uses this key as
-    // the target Jetty for one-sided READ/WRITE operations.
-    region->cq_info.in.depth = kCqDepth;
-    region->cq_info.in.ub.mode = direct_hccp::kJfcNormal;
-    if (api.cq_create(device->context, &region->cq_info, &region->cq_handle) != 0 ||
-        region->cq_handle == nullptr) {
-      Release(region.get());
-      return Result::kResourceError;
-    }
-    direct_hccp::QpCreateAttr qp_attr{};
-    qp_attr.scq_handle = region->cq_handle;
-    qp_attr.rcq_handle = region->cq_handle;
-    qp_attr.srq_handle = region->cq_handle;
-    qp_attr.sq_depth = kSqDepth;
-    qp_attr.rq_depth = kRqDepth;
-    qp_attr.transport_mode = direct_hccp::kReliableMessage;
-    qp_attr.ub.mode = direct_hccp::kJettyStandard;
-    qp_attr.ub.flag = direct_hccp::JettyFlagShareJfr();
-    qp_attr.ub.token_id_handle = region->token_id_handle;
-    qp_attr.ub.jfs_flag = direct_hccp::JfsFlagErrorSuspend();
-    qp_attr.ub.priority = 2U;
-    qp_attr.ub.rnr_retry = 7U;
-    qp_attr.ub.err_timeout = 16U;
-    qp_attr.ub.token_value = region->token_value;
-    if (api.qp_create(device->context, &qp_attr, &region->qp_info, &region->qp_handle) != 0 ||
-        region->qp_handle == nullptr || region->qp_info.key.size == 0U) {
+    // AllocateHbmRegion's protocol includes a live Jetty key. Actual channel
+    // targets are created later and returned by CreateChannel.
+    region->allocation_target = std::make_unique<TargetChannel>(api, device->context);
+    const Status target_status = region->allocation_target->Initialize(
+        region->token_id_handle, region->token_value, kSqDepth, kRqDepth, kCqDepth);
+    if (!target_status.ok()) {
+      std::fprintf(stderr, "[KVAF_NPU] TARGET_QUEUE_FAILED reason=%s\n",
+                   target_status.message().c_str());
       Release(region.get());
       return Result::kResourceError;
     }
     std::fprintf(stderr, "[KVAF_NPU] TARGET_QUEUE sq_depth=%u rq_depth=%u\n",
-                 qp_attr.sq_depth, qp_attr.rq_depth);
-    region->jetty_key_bytes = region->qp_info.key.size;
+                 kSqDepth, kRqDepth);
+    const auto& allocation_jetty = region->allocation_target->jetty_info();
+    region->jetty_key_bytes = allocation_jetty.key.size;
     if (region->jetty_key_bytes > region->jetty_key.size()) {
       Release(region.get());
       return Result::kResourceError;
     }
-    std::memcpy(region->jetty_key.data(), region->qp_info.key.value,
+    std::memcpy(region->jetty_key.data(), allocation_jetty.key.value,
                 region->jetty_key_bytes);
     region->session_id = next_session++;
     response->result = static_cast<std::int32_t>(Result::kOk);
@@ -423,7 +404,7 @@ struct NpuService::Impl {
     auto it = regions.find(request.session_id);
     if (it == regions.end()) return Result::kNotFound;
     HbmRegion& region = *it->second;
-    if (region.peer_target_jettys.size() >= kMaxPeerJettys) {
+    if (region.channels.size() >= kMaxPeerJettys) {
       std::fprintf(stderr, "[KVAF_NPU] CHANNEL_FAILED stage=peer_jetty_limit limit=%zu\n",
                    kMaxPeerJettys);
       return Result::kResourceError;
@@ -481,25 +462,38 @@ struct NpuService::Impl {
                    static_cast<unsigned long long>(request.local_tp_handle));
       return Result::kResourceError;
     }
-    {
-      direct_hccp::QpImportInfoT import_info{};
-      void* peer_target_jetty = nullptr;
-      if (!direct_hccp::ImportPeerJetty(api, device->context, request.local_qp_key,
-                                        request.local_qp_key_bytes, region.token_value,
-                                        local_tp, request.local_tp_handle, 1U,
-                                        request.local_psn, "npu_service", &import_info,
-                                        &peer_target_jetty)) {
-        std::fprintf(stderr, "[KVAF_NPU] CHANNEL_FAILED stage=import_cpu_jetty\n");
-        return Result::kResourceError;
-      }
-      region.peer_target_jettys.push_back(peer_target_jetty);
+    auto channel = std::make_unique<TargetChannel>(api, device->context);
+    const Status target_status = channel->Initialize(
+        region.token_id_handle, region.token_value, kSqDepth, kRqDepth, kCqDepth);
+    if (!target_status.ok()) {
+      std::fprintf(stderr, "[KVAF_NPU] CHANNEL_FAILED stage=create_target_jetty reason=%s\n",
+                   target_status.message().c_str());
+      return Result::kResourceError;
     }
-    response->peer_qp_key_bytes = region.jetty_key_bytes;
-    std::memcpy(response->peer_qp_key, region.jetty_key.data(), kQpKeyBytes);
+    const auto& target_jetty = channel->jetty_info();
+    if (target_jetty.key.size > sizeof(response->peer_qp_key)) {
+      return Result::kResourceError;
+    }
+    direct_hccp::QpImportInfoT import_info{};
+    if (!direct_hccp::ImportPeerJetty(api, device->context, request.local_qp_key,
+                                      request.local_qp_key_bytes, region.token_value,
+                                      local_tp, request.local_tp_handle, 1U,
+                                      request.local_psn, "npu_service", &import_info,
+                                      channel->peer_jetty_output())) {
+      std::fprintf(stderr, "[KVAF_NPU] CHANNEL_FAILED stage=import_cpu_jetty\n");
+      return Result::kResourceError;
+    }
+    response->peer_qp_key_bytes = target_jetty.key.size;
+    std::memcpy(response->peer_qp_key, target_jetty.key.value, target_jetty.key.size);
     response->peer_tp_handle = local_tp;
     response->peer_psn = 1U;
-    std::fprintf(stderr, "[KVAF_NPU] CHANNEL_READY imported_cpu_jettys=%zu\n",
-                 region.peer_target_jettys.size());
+    std::fprintf(stderr,
+                 "[KVAF_NPU] CHANNEL_READY session=%llu channel_index=%zu "
+                 "target_jetty_id=%u target_jfc_id=%u sq_depth=%u rq_depth=%u cq_depth=%u\n",
+                 static_cast<unsigned long long>(region.session_id), region.channels.size(),
+                 target_jetty.ub.id, channel->cq_info().out.id,
+                 kSqDepth, kRqDepth, kCqDepth);
+    region.channels.push_back(std::move(channel));
     return Result::kOk;
   }
 
@@ -508,22 +502,8 @@ struct NpuService::Impl {
     DeviceState* device = region->owner;
     if (device == nullptr) return;
     (void)aclrtSetDevice(device->device_id);
-    if (api.qp_unimport != nullptr) {
-      for (void* peer_target_jetty : region->peer_target_jettys) {
-        if (peer_target_jetty != nullptr) {
-          (void)api.qp_unimport(device->context, peer_target_jetty);
-        }
-      }
-    }
-    region->peer_target_jettys.clear();
-    if (region->qp_handle != nullptr && api.qp_destroy != nullptr) {
-      (void)api.qp_destroy(region->qp_handle);
-      region->qp_handle = nullptr;
-    }
-    if (region->cq_handle != nullptr && api.cq_destroy != nullptr) {
-      (void)api.cq_destroy(device->context, region->cq_handle);
-      region->cq_handle = nullptr;
-    }
+    region->channels.clear();
+    region->allocation_target.reset();
     if (region->lmem_handle != nullptr && api.lmem_unregister != nullptr) {
       (void)api.lmem_unregister(device->context, region->lmem_handle);
       region->lmem_handle = nullptr;

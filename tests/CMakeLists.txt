@@ -18,6 +18,14 @@ target_compile_features(kvaf_runtime_batch_put_prefix_test PRIVATE cxx_std_17)
 add_test(NAME kvaf_runtime_batch_put_prefix
   COMMAND kvaf_runtime_batch_put_prefix_test)
 
+add_executable(kvaf_npu_target_channel_test npu_target_channel_test.cc)
+target_include_directories(kvaf_npu_target_channel_test PRIVATE
+  "${CMAKE_SOURCE_DIR}/runtime/src"
+  "${CMAKE_SOURCE_DIR}/access_operator/include"
+  "${CMAKE_SOURCE_DIR}/common/include")
+target_compile_features(kvaf_npu_target_channel_test PRIVATE cxx_std_17)
+add_test(NAME kvaf_npu_target_channel COMMAND kvaf_npu_target_channel_test)
+
 if(KVAF_BUILD_PYTHON)
   add_test(
     NAME kvaf_runtime_mock_python
