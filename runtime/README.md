@@ -88,7 +88,7 @@ sudo sysctl -w vm.nr_hugepages=1100
 `--eid-index N` 仅用于诊断。CPU 端可同时保持多个 NPU session，NPU 正常
 `shutdown` 后会释放对应 DDR、segment、token 与 Jetty。
 
-NPU 应用只配置 CPU 服务地址，不配置 EID 或 UDMA device：
+NPU 应用默认只配置 CPU 服务地址，不配置 EID 或 UDMA device：
 
 ```python
 runtime = kvaf.NpuRuntime(
@@ -109,6 +109,14 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 未建立 CPU 服务 Link 时，`initialize` 会返回 `InvalidState`。
 `batch_get_token_bytes` 和 `batch_get_tokens_per_block` 无默认值，
 构造 `NpuRuntime` 时必须显式传入。
+
+需要同时使用多个 NPU EID 时，设置 `NpuRuntimeOptions::npu_eids`（Python
+构造参数同名）。列表中每个 EID 必须是 32 位连续十六进制字符；Runtime
+为每个 EID 建立独立 BatchGet RaCtx、MR import 和 channel，并将
+core/Jetty worker 按 Jetty-major 顺序轮转分配。BatchPut 保持原有单 EID
+实现，使用列表第一项。显式列表不使用 rootinfo/`pair_info` 回退，
+任一 EID 失败即使整组初始化失败。当前这些 NPU 路径仍共享一个已选
+CPU EID 和 DDR region。测试脚本可用逗号分隔的 `KVAF_NPU_EIDS` 传入。
 
 现有 `tests/run_remote_cpu_e2e.sh` 与
 `tests/run_remote_cpu_runtime_perf.sh` 接受 `KVAF_CPU_SERVICE_ADDR`，但该变量
