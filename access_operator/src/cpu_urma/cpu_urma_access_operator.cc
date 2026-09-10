@@ -25,7 +25,10 @@ Status CpuUrmaAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     options_.external_region = descriptor;
   }
   const Status status = transport_.Initialize(options_);
-  if (!status.ok()) return status;
+  if (!status.ok()) {
+    (void)transport_.Shutdown();
+    return status;
+  }
   region_ = remote_region;
   initialized_ = true;
   return Status::OK();
@@ -36,6 +39,11 @@ Status CpuUrmaAccessOperator::Shutdown() {
   initialized_ = false;
   region_ = {};
   return transport_.Shutdown();
+}
+
+Status CpuUrmaAccessOperator::ValidateLink() {
+  std::unique_lock<std::mutex> lock(batch_mutex_);
+  return transport_.ValidateLink();
 }
 
 Status CpuUrmaAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& request) {

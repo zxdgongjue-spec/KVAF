@@ -87,7 +87,7 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 ```
 
 启动 NPU HBM service（默认监听 `127.0.0.1:28999`）。不指定 `--device-id` 时，服务会在 CPU
-第一次申请时按请求选择 NPU device，并缓存该 device 的 HBM context：
+第一次申请时按请求选择 NPU device，并按 device 和 EID 候选缓存 HBM context：
 
 ```bash
 build-npu/runtime/kvaf_npu_service --listen 0.0.0.0 --port 28999
@@ -101,6 +101,14 @@ build-cpu/runtime/kvaf_cpu_runtime_npu_hbm_e2e \
   --peer <npu-host>:28999 --bytes 4096 --slot-size 4096 --device-id 0 \
   --doorbell-wqes 32
 ```
+
+CPU 初始化按 UB 设备名、EID index 顺序遍历本地候选，逐个尝试 NPU 的 EID
+候选。NPU 候选与 AIV 共用发现逻辑：先取指定物理设备的 HCCL CLOS EID，再追加
+去重后的 `pair_info` EID。每组建链后在两个 CPU Jetty 上各做一次最多 64B 的
+WRITE 并等待 CQ；第一组成功即选用，失败则释放本次资源后继续尝试。日志
+`LINK_ATTEMPT`、`LINK_FAILED`、`LINK_SELECTED` 记录所选路径，不进行带宽排名。
+客户端的 `--ub-device`、`--eid-index` 只筛选 CPU 本地候选。
+候选查询使用控制协议 v5，CPU 客户端与 NPU 服务端需要一起重新构建、重启。
 
 CPU URMA 固定创建 2 个 Jetty，并使用 2 个 OpenMP worker，每条 WR 的本地
 SGE 数固定为 1。常量位于 `cpu_urma_transport.cc`：`kJettyCount`、

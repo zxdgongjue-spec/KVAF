@@ -68,6 +68,8 @@ class CpuUrmaTransport final {
   CpuUrmaTransport& operator=(const CpuUrmaTransport&) = delete;
 
   Status Initialize(const CpuUrmaTransportOptions& options);
+  // Verify both Jettys with small WRITEs and completion before selecting a link.
+  Status ValidateLink();
   struct HostSge {
     void* data;
     std::size_t bytes;

@@ -26,6 +26,11 @@ target_include_directories(kvaf_npu_target_channel_test PRIVATE
 target_compile_features(kvaf_npu_target_channel_test PRIVATE cxx_std_17)
 add_test(NAME kvaf_npu_target_channel COMMAND kvaf_npu_target_channel_test)
 
+add_executable(kvaf_peer_hbm_eid_test peer_hbm_eid_test.cc)
+target_include_directories(kvaf_peer_hbm_eid_test PRIVATE "${CMAKE_SOURCE_DIR}/runtime/src")
+target_link_libraries(kvaf_peer_hbm_eid_test PRIVATE kvaf_peer_link)
+add_test(NAME kvaf_peer_hbm_eid COMMAND kvaf_peer_hbm_eid_test)
+
 if(KVAF_BUILD_PYTHON)
   add_test(
     NAME kvaf_runtime_mock_python

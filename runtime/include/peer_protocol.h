@@ -10,10 +10,9 @@
 namespace kvaf::peer {
 
 constexpr uint32_t kProtocolMagic = 0x4b564350U;  // "KVCP"
-// Version 4 adds the initiating peer's EID to CreateChannel. A Jetty key identifies
-// a Jetty only; it is not an EID and cannot be used by peer UMDK CTP lookup.
-// Rejecting older versions prevents that silent ABI mismatch.
-constexpr uint16_t kProtocolVersion = 4U;
+// Version 5 adds NPU EID discovery. HBM allocation's eid_index now indexes
+// the same CLOS/pair-info candidate list, rather than a provider-specific list.
+constexpr uint16_t kProtocolVersion = 5U;
 constexpr uint32_t kQpKeyBytes = 64U;
 constexpr uint32_t kSegKeyBytes = 64U;
 constexpr uint32_t kEidBytes = 16U;
@@ -27,6 +26,7 @@ enum class Command : uint16_t {
   // segment key and Jetty descriptor; the CPU peer imports both with liburma.
   kAllocateHbmRegion = 5U,
   kReleaseHbmRegion = 6U,
+  kGetHbmEidCandidate = 7U,
 };
 
 enum class Result : int32_t {
@@ -103,6 +103,21 @@ struct AllocateHbmRegionResponse {
   uint8_t jetty_key[kQpKeyBytes];
 };
 
+// Candidate indices are used by AllocateHbmRegionRequest.eid_index.
+struct HbmEidCandidateRequest {
+  MessageHeader header;
+  uint32_t device_id;
+  uint32_t candidate_index;
+};
+
+struct HbmEidCandidateResponse {
+  MessageHeader header;
+  int32_t result;
+  uint32_t candidate_count;
+  uint32_t candidate_index;
+  uint8_t eid[kEidBytes];
+};
+
 struct ReleaseHbmRegionRequest {
   MessageHeader header;
   uint64_t session_id;
@@ -151,6 +166,8 @@ static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI chang
 static_assert(sizeof(AllocateHbmRegionRequest) == 36U, "HBM allocate request ABI changed");
 static_assert(sizeof(AllocateHbmRegionResponse) == 204U, "HBM allocate response ABI changed");
 static_assert(sizeof(ReleaseHbmRegionRequest) == 20U, "HBM release request ABI changed");
+static_assert(sizeof(HbmEidCandidateRequest) == 20U, "HBM candidate request ABI changed");
+static_assert(sizeof(HbmEidCandidateResponse) == 40U, "HBM candidate response ABI changed");
 
 inline constexpr uint16_t ResponseCommand(Command command) {
   return static_cast<uint16_t>(command) | 0x8000U;

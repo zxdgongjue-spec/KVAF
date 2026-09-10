@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "peer_protocol.h"
 #include "status.h"
@@ -35,6 +36,8 @@ class PeerLink {
   bool has_region() const { return !regions_.empty(); }
 
   Status GetCandidateCount(uint32_t* candidate_count) const;
+  Status GetHbmEidCandidates(uint32_t device_id,
+                            std::vector<std::array<uint8_t, kEidBytes>>* candidates) const;
   Status AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
                         uint32_t candidate_id, PeerRegion* region);
   Status AllocateHbmRegion(uint64_t hbm_bytes, uint64_t slot_size,

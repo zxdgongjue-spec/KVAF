@@ -58,6 +58,7 @@ class PeerHbmAllocator final : public DdrMemoryAllocator {
     eid_index_ = has_eid_index ? eid : UINT32_MAX;
   }
   const peer::PeerRegion& region() const { return allocated_; }
+  bool has_allocation() const { return allocated_.base != 0U; }
  private:
   std::shared_ptr<peer::PeerLink> link_;
   peer::PeerRegion allocated_{};
@@ -323,11 +324,13 @@ class UrmaResourcePool {
   bool Initialize(const std::string& requested_device, bool eid_index_requested,
                   uint32_t requested_eid_index) {
     urma_init_attr_t init{};
-    if (urma_init(&init) != URMA_SUCCESS) {
+    const int rc = urma_init(&init);
+    if (rc != URMA_SUCCESS && rc != EEXIST && rc != -EEXIST) {
       Log("[KVAF_CPU] urma_init failed\n");
       return false;
     }
     initialized_ = true;
+    owns_urma_ = rc == URMA_SUCCESS;
 
     int device_count = 0;
     urma_device_t** devices = urma_get_device_list(&device_count);
@@ -398,6 +401,8 @@ class UrmaResourcePool {
     return static_cast<uint32_t>(candidates_.size());
   }
 
+  const std::vector<UrmaCandidate>& candidates() const { return candidates_; }
+
   UrmaResources* Get(uint32_t candidate_id) {
     if (candidate_id >= candidates_.size()) {
       Log("[KVAF_CPU] CANDIDATE_REJECTED id=%u reason=out_of_range count=%zu\n", candidate_id,
@@ -433,12 +438,14 @@ class UrmaResourcePool {
   void Shutdown() {
     candidates_.clear();
     if (initialized_) {
-      (void)urma_uninit();
+      if (owns_urma_) (void)urma_uninit();
+      owns_urma_ = false;
       initialized_ = false;
     }
   }
 
   bool initialized_ = false;
+  bool owns_urma_ = false;
   std::vector<UrmaCandidate> candidates_;
 };
 
@@ -811,6 +818,7 @@ void HandleClient(int fd, CpuService* service) {
     }
     case Command::kAllocateHbmRegion:
     case Command::kReleaseHbmRegion:
+    case Command::kGetHbmEidCandidate:
       // HBM ownership belongs to NpuService; a CPU service never accepts
       // these commands.
       SendStatus(fd, command, Result::kInvalidRequest);
@@ -859,27 +867,64 @@ Status CpuRuntime::InitializeClient(const CpuRuntimeClientOptions& options) {
   auto impl = std::make_unique<Impl>();
   impl->client_mode = true;
   impl->peer_link = std::make_shared<peer::PeerLink>(peer_address);
-  impl->hbm_allocator = std::make_unique<PeerHbmAllocator>(impl->peer_link);
-  impl->hbm_allocator->SetDevice(options.device_id, options.eid_index, options.has_eid_index);
-  CpuUrmaTransportOptions transport_options;
-  transport_options.peer_address = peer_address;
-  transport_options.ub_device = options.ub_device;
-  transport_options.has_eid_index = options.has_eid_index;
-  transport_options.eid_index = options.eid_index;
-  transport_options.remote_hbm = true;
-  transport_options.remote_device_id = options.device_id;
-  transport_options.remote_eid_index = options.has_eid_index ? options.eid_index : UINT32_MAX;
-  transport_options.wqes_per_doorbell = options.wqes_per_doorbell;
-  transport_options.remote_sgl_size = options.remote_sgl_size;
-  impl->access_operator = std::make_unique<CpuUrmaAccessOperator>(transport_options, impl->peer_link);
-  impl->meta_manager = CreateInMemoryMetaManager();
-  impl->runtime_core = std::make_unique<RuntimeCore>(*impl->meta_manager, *impl->access_operator,
-                                                     *impl->hbm_allocator);
-  const Status status = impl->runtime_core->Initialize(
-      RuntimeInitRequest{options.hbm_bytes, options.slot_size, DeviceKind::kNpu});
-  if (!status.ok()) return status;
-  impl_ = std::move(impl);
-  return Status::OK();
+  // Keep URMA alive while failed candidate transports are destroyed and retried.
+  if (!impl->resources.Initialize(options.ub_device, options.has_eid_index, options.eid_index)) {
+    return Status::Internal("CPU link candidate discovery failed");
+  }
+  std::vector<std::array<std::uint8_t, peer::kEidBytes>> npu_eids;
+  Status last = impl->peer_link->GetHbmEidCandidates(options.device_id, &npu_eids);
+  if (!last.ok()) return last;
+  for (const auto& cpu : impl->resources.candidates()) {
+    for (std::size_t npu_index = 0U; npu_index < npu_eids.size(); ++npu_index) {
+      Log("[KVAF_CPU] LINK_ATTEMPT ub_device=%s eid_index=%u cpu_eid=",
+          cpu.device_name.c_str(), cpu.eid_index);
+      for (std::uint8_t byte : cpu.eid) std::fprintf(stderr, "%02x", byte);
+      std::fprintf(stderr, " npu_candidate=%zu npu_eid=", npu_index);
+      for (std::uint8_t byte : npu_eids[npu_index]) std::fprintf(stderr, "%02x", byte);
+      std::fprintf(stderr, "\n");
+      impl->hbm_allocator = std::make_unique<PeerHbmAllocator>(impl->peer_link);
+      impl->hbm_allocator->SetDevice(options.device_id, static_cast<std::uint32_t>(npu_index), true);
+      CpuUrmaTransportOptions transport_options;
+      transport_options.peer_address = peer_address;
+      transport_options.ub_device = cpu.device_name;
+      transport_options.has_eid_index = true;
+      transport_options.eid_index = cpu.eid_index;
+      transport_options.has_preferred_eid = true;
+      transport_options.preferred_eid = cpu.eid;
+      transport_options.remote_hbm = true;
+      transport_options.remote_device_id = options.device_id;
+      transport_options.wqes_per_doorbell = options.wqes_per_doorbell;
+      transport_options.remote_sgl_size = options.remote_sgl_size;
+      impl->access_operator = std::make_unique<CpuUrmaAccessOperator>(transport_options, impl->peer_link);
+      impl->meta_manager = CreateInMemoryMetaManager();
+      impl->runtime_core = std::make_unique<RuntimeCore>(*impl->meta_manager, *impl->access_operator,
+                                                       *impl->hbm_allocator);
+      last = impl->runtime_core->Initialize(
+          RuntimeInitRequest{options.hbm_bytes, options.slot_size, DeviceKind::kNpu});
+      if (last.ok()) last = impl->access_operator->ValidateLink();
+      if (last.ok()) {
+        Log("[KVAF_CPU] LINK_SELECTED ub_device=%s eid_index=%u npu_candidate=%zu validation=write_cq\n",
+            cpu.device_name.c_str(), cpu.eid_index, npu_index);
+        impl_ = std::move(impl);
+        return Status::OK();
+      }
+      Log("[KVAF_CPU] LINK_FAILED ub_device=%s eid_index=%u npu_candidate=%zu reason=%s\n",
+          cpu.device_name.c_str(), cpu.eid_index, npu_index, last.message().c_str());
+      if (impl->runtime_core->initialized()) {
+        const Status cleanup = impl->runtime_core->Shutdown();
+        if (!cleanup.ok()) return cleanup;
+      }
+      if (impl->hbm_allocator->has_allocation()) {
+        const Status cleanup = impl->hbm_allocator->Release(RemoteRegionDesc{});
+        if (!cleanup.ok()) return cleanup;
+      }
+      impl->runtime_core.reset();
+      impl->access_operator.reset();
+      impl->meta_manager.reset();
+      impl->hbm_allocator.reset();
+    }
+  }
+  return last;
 }
 
 RuntimeCore& CpuRuntime::core() {

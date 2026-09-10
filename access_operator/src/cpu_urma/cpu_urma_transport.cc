@@ -782,6 +782,22 @@ struct CpuUrmaTransport::Impl {
     return Status::OK();
   }
 
+  Status ValidateLink() {
+    if (!initialized_) return Status::NotInitialized("CPU transport is not initialized");
+    const std::size_t bytes = static_cast<std::size_t>(
+        std::min<std::uint64_t>(64U, std::max<std::uint64_t>(1U, remote_region_.length / 2U)));
+    std::fill(probe_buffer_.begin(), probe_buffer_.end(), 0xA5U);
+    Status status = RegisterDirectHostMemory(probe_buffer_.data(), probe_buffer_.size());
+    if (!status.ok()) return status;
+    const std::uint64_t offsets[] = {0U, remote_region_.length >= 2U ? bytes : 0U};
+    // Reusing the source address prevents grouping: each Jetty gets one WRITE.
+    const CpuUrmaTransport::HostSge sources[] = {
+        {probe_buffer_.data(), bytes}, {probe_buffer_.data(), bytes}};
+    status = TransferBatch(true, offsets, sources, 2U);
+    last_batch_timing_ = {};
+    return status;
+  }
+
   Status Shutdown() {
     initialized_ = false;
     for (auto* remote_jetty : remote_jettys_) {
@@ -841,6 +857,8 @@ struct CpuUrmaTransport::Impl {
   CpuUrmaTransport::BatchTiming last_batch_timing_{};
   bool urma_initialized_{false};
   bool urma_owned_{false};
+  // Registered memory must outlive all WRs and remain allocated until Shutdown.
+  alignas(kPageBytes) std::array<std::uint8_t, kPageBytes> probe_buffer_{};
   bool initialized_{false};
   bool owns_remote_region_{false};
   std::vector<RegisteredHostBuffer> direct_host_buffers_;
@@ -852,6 +870,7 @@ struct CpuUrmaTransport::Impl {
 CpuUrmaTransport::CpuUrmaTransport() : impl_(std::make_unique<Impl>()) {}
 CpuUrmaTransport::~CpuUrmaTransport() = default;
 Status CpuUrmaTransport::Initialize(const CpuUrmaTransportOptions& options) { return impl_->Initialize(options); }
+Status CpuUrmaTransport::ValidateLink() { return impl_->ValidateLink(); }
 Status CpuUrmaTransport::WriteSglBatch(std::uint64_t offset, const HostSge* sources,
                                        std::size_t count) {
   return impl_->TransferSglBatch(true, offset, sources, nullptr, count);
