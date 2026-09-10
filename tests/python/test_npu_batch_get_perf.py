@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kvaf
 
 from backend import detect_torch_backend
+from npu_eids import parse_npu_eids
 
 
 DEFAULT_REQUEST_LENGTH = 32_768
@@ -127,6 +128,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--npu-eids",
+        type=parse_npu_eids,
+        default=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")),
+        help=(
+            "comma-separated local NPU EIDs; workers are striped over all "
+            "listed EIDs (environment: KVAF_NPU_EIDS)"
+        ),
+    )
+    parser.add_argument(
         "--warmup",
         type=int,
         default=environment_int("KVAF_BATCH_GET_PERF_WARMUP", DEFAULT_WARMUP),
@@ -203,6 +213,8 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "miss-count must be between zero and request-length"
     if args.aiv_cores <= 0 or args.aiv_cores > 48:
         return "aiv-cores must be in [1, 48]"
+    if len(args.npu_eids) > args.aiv_cores * args.jettys_per_core:
+        return "npu-eids count must not exceed aiv-cores * jettys-per-core"
     if args.warmup < 0:
         return "warmup must be non-negative"
     if args.iterations <= 0:
@@ -554,6 +566,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         npu_core_count=args.aiv_cores,
         batch_put_kernel_object_path=str(batch_put_kernel),
         jettys_per_core=args.jettys_per_core,
+        npu_eids=args.npu_eids,
     )
     runtime.link_to(remote_cpu_service)
     table = None
@@ -566,7 +579,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"tokens_per_block={tokens_per_block} token_bytes={token_bytes} "
             f"block_bytes={block_bytes} miss_count={miss_count_value} "
             f"ddr_bytes={ddr_bytes} aiv_cores={args.aiv_cores} "
-            f"jettys_per_core={args.jettys_per_core} warmup={args.warmup} "
+            f"jettys_per_core={args.jettys_per_core} eid_paths={len(args.npu_eids) or 1} "
+            f"npu_eids={','.join(args.npu_eids) or 'auto'} warmup={args.warmup} "
             f"iterations={args.iterations} seed={args.seed} "
             f"kernel_profile={int(args.kernel_profile)} "
             f"kernel_profile_clock_mhz={args.kernel_profile_clock_mhz} "

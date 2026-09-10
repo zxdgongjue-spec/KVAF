@@ -1,5 +1,11 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+add_test(
+  NAME kvaf_npu_eid_parser_python
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/python/test_npu_eids.py"
+)
+
 if(KVAF_BUILD_PYTHON)
   add_test(
     NAME kvaf_runtime_mock_python

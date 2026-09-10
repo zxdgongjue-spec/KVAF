@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kvaf
 
 from backend import detect_torch_backend
+from npu_eids import parse_npu_eids
 
 DEFAULT_TOKEN_BYTES = 656
 DEFAULT_TOKENS_PER_BLOCK = 128
@@ -134,6 +135,7 @@ def main() -> int:
         os.environ.get("KVAF_NPU_CORE_COUNT", os.environ.get("KVAF_NPU_AIV_CORES", "1"))
     )
     jettys_per_core = int(os.environ.get("KVAF_NPU_JETTYS_PER_CORE", "2"))
+    npu_eids = parse_npu_eids(os.environ.get("KVAF_NPU_EIDS"))
     active_percent = int(os.environ.get("KVAF_NPU_ACTIVE_PERCENT", "100"))
     warmup = int(os.environ.get("KVAF_NPU_WARMUP", "1"))
     iterations = int(os.environ.get("KVAF_NPU_ITERATIONS", "5"))
@@ -151,6 +153,7 @@ def main() -> int:
         and npu_core_count > 0
         and npu_core_count <= requests
         and 1 <= jettys_per_core <= 2
+        and len(npu_eids) <= npu_core_count * jettys_per_core
         and iterations > 0
         and 1 <= active_percent <= 100
         and graph_replays >= 0
@@ -217,6 +220,7 @@ def main() -> int:
         npu_core_count=npu_core_count,
         batch_put_kernel_object_path=str(batch_put_kernel),
         jettys_per_core=jettys_per_core,
+        npu_eids=npu_eids,
     )
     runtime.link_to(remote_cpu_service)
     table = None
@@ -230,6 +234,8 @@ def main() -> int:
             f"token_bytes={token_bytes} tokens_per_block={tokens_per_block} "
             f"block_bytes={block_bytes} source_stride={source_stride} "
             f"npu_cores={npu_core_count} jettys_per_core={jettys_per_core} "
+            f"eid_paths={len(npu_eids) or 1} "
+            f"npu_eids={','.join(npu_eids) or 'auto'} "
             "batch_put_backend=aiv_direct_hccp"
         )
         if graph_replays:
