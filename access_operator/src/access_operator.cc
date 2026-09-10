@@ -286,10 +286,24 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
   if (impl_->config.peer_link == nullptr) {
     return InvalidState("AccessOperator requires an established Runtime Link");
   }
-  if (std::all_of(impl_->config.peer_local_eid.begin(),
+  const std::size_t worker_count =
+      static_cast<std::size_t>(impl_->config.npu_core_count) *
+      impl_->config.jettys_per_core;
+  if (impl_->config.peer_local_eids.empty() &&
+      std::any_of(impl_->config.peer_local_eid.begin(),
                   impl_->config.peer_local_eid.end(),
-                  [](std::uint8_t value) { return value == 0U; })) {
-    return InvalidArgument("Runtime Link requires a Runtime-selected local EID");
+                  [](std::uint8_t value) { return value != 0U; })) {
+    impl_->config.peer_local_eids.push_back(impl_->config.peer_local_eid);
+  }
+  if (impl_->config.peer_local_eids.empty() ||
+      impl_->config.peer_local_eids.size() > worker_count ||
+      std::any_of(impl_->config.peer_local_eids.begin(),
+                  impl_->config.peer_local_eids.end(),
+                  [](const auto& eid) {
+                    return std::all_of(eid.begin(), eid.end(),
+                                       [](std::uint8_t value) { return value == 0U; });
+                  })) {
+    return InvalidArgument("Runtime Link requires valid Runtime-selected local EIDs");
   }
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   if (!impl_->config.batch_put_kernel_object_path.empty() &&
@@ -306,10 +320,17 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
   }
 
   KvafBatchGetTransport* transport = nullptr;
-  const int32_t result = KvafBatchGetTransportCreateWithPeerLink(
+  static_assert(sizeof(impl_->config.peer_local_eids.front()) == 16U,
+                "NPU EID storage must remain packed");
+  const auto* peer_local_eids = reinterpret_cast<const std::uint8_t*>(
+      impl_->config.peer_local_eids.data());
+  const auto peer_local_eid_count =
+      static_cast<std::uint32_t>(impl_->config.peer_local_eids.size());
+  const int32_t result = KvafBatchGetTransportCreateWithPeerLinkMultiEid(
       reinterpret_cast<void*>(remote_region.base), remote_region.length,
       impl_->config.npu_core_count, impl_->config.jettys_per_core,
-      impl_->config.peer_link.get(), impl_->config.peer_local_eid.data(), &transport);
+      impl_->config.peer_link.get(), peer_local_eids, peer_local_eid_count,
+      &transport);
   if (result != KVAF_BATCH_GET_SUCCESS || transport == nullptr) {
     return Internal("failed to create reusable BatchGet transport");
   }

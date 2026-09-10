@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kvaf
 
 from backend import detect_torch_backend
+from npu_eids import parse_npu_eids
 
 
 AIV_CORES = 32
@@ -93,6 +94,7 @@ def main(batch: int = 16) -> int:
             os.environ.get("KVAF_NPU_JETTYS_PER_CORE", str(JETTYS_PER_CORE)),
         )
     )
+    npu_eids = parse_npu_eids(os.environ.get("KVAF_NPU_EIDS"))
     warmup = int(os.environ.get("KVAF_RUNTIME_PERF_WARMUP", str(WARMUP)))
     iterations = int(os.environ.get("KVAF_RUNTIME_PERF_ITERATIONS", str(ITERATIONS)))
     active_percent = int(
@@ -127,6 +129,7 @@ def main(batch: int = 16) -> int:
         batch > 0
         and npu_core_count > 0
         and 1 <= jettys_per_core <= 2
+        and len(npu_eids) <= npu_core_count * jettys_per_core
         and warmup >= 0
         and iterations > 0
         and 1 <= active_percent <= 100
@@ -207,6 +210,7 @@ def main(batch: int = 16) -> int:
         npu_core_count=npu_core_count,
         batch_put_kernel_object_path=str(batch_put_kernel),
         jettys_per_core=jettys_per_core,
+        npu_eids=npu_eids,
     )
     remote_cpu_service = os.environ.get("KVAF_CPU_SERVICE_ADDR")
     if not remote_cpu_service:
@@ -227,6 +231,8 @@ def main(batch: int = 16) -> int:
             f"tokens_per_block={tokens_per_block} block_bytes={block_bytes} "
             f"source_stride={source_stride} "
             f"aiv_cores={npu_core_count} jettys_per_core={jettys_per_core} "
+            f"eid_paths={len(npu_eids) or 1} "
+            f"npu_eids={','.join(npu_eids) or 'auto'} "
             f"warmup={warmup} iterations={iterations} "
             "batch_put_backend=aiv_direct_hccp timing=call_to_stream_completion"
         )

@@ -52,9 +52,16 @@ KvafBatchGetLocalBufferRelease(output_binding);
 KvafBatchGetTransportDestroy(transport);
 ```
 
+For simultaneous local-EID paths, call
+`KvafBatchGetTransportCreateWithPeerLinkMultiEid` with a packed array of
+16-byte EIDs. It creates one RaCtx and one local/remote MR registration per
+EID, then assigns the existing core/Jetty workers to paths in jetty-major
+round-robin order. The single-EID function above is retained as an ABI wrapper.
+
 An exact repeat of `Acquire(transport, output_hbm, output_bytes, ...)`
 returns the cached binding/entity and increments its use reference. New HBM
-addresses receive a new local MR and entity table but reuse the transport.
+addresses receive one local MR per EID context and a new entity table but reuse
+the transport.
 
 ## What is included
 

@@ -56,6 +56,9 @@ struct DeviceAivJetty {
 };
 
 struct DeviceAivWorkerResources {
+  // Index into the owning transport's EID-path array. Queue and imported
+  // Jetty handles must always be released through that path's RaCtx.
+  std::uint32_t path_index{0U};
   void* device_user_ctl_cq{nullptr};
   CqInfo device_cq_info{};
   DeviceAivJetty device_user_ctl_jetty{};
@@ -63,19 +66,49 @@ struct DeviceAivWorkerResources {
   QpImportInfoT device_peer_import_info{};
 };
 
+// One Direct-HCCP RaCtx per selected local EID. Remote DDR and transport
+// tokens are context-owned, so a multi-EID transport cannot share these
+// handles even when every path targets the same CPU DDR region.
+struct DeviceAivPathResources {
+  std::array<std::uint8_t, kEidBytes> local_eid{};
+  void* device_context{nullptr};
+  void* device_transport_token_handle{nullptr};
+  void* device_peer_memory_import{nullptr};
+};
+
 struct DeviceAivTransportResources {
   DirectHccpApi* api{nullptr};
   DirectHccpSession* session{nullptr};
+  // Legacy single-context fields are retained so BatchPut remains unchanged.
   void* device_context{nullptr};
   void* device_transport_token_handle{nullptr};
   void* device_peer_memory_import{nullptr};
   DeviceAivWorkerResources* workers{nullptr};
   std::uint32_t worker_count{0U};
+  // BatchGet uses these fields when more than one local EID is configured.
+  DeviceAivPathResources* paths{nullptr};
+  std::uint32_t path_count{0U};
 };
 
-// One peer channel is bound to one local AIV Jetty. Runtime has
-// already selected local_eid; this adapter only creates the transport
-// resources required by that selected Link.
+// Queue arrays remain core-major for the AIV ABI, but path assignment is
+// jetty-major so every core's always-used primary Jetty is spread before any
+// secondary Jetty. This also covers every path when path_count does not
+// exceed the total worker count.
+inline constexpr std::uint32_t EidPathIndexForWorker(
+    std::uint32_t core, std::uint32_t jetty_slot,
+    std::uint32_t core_count, std::uint32_t path_count) {
+  return path_count == 0U
+             ? 0U
+             : (jetty_slot * core_count + core) % path_count;
+}
+
+static_assert(EidPathIndexForWorker(0U, 0U, 2U, 2U) == 0U);
+static_assert(EidPathIndexForWorker(1U, 0U, 2U, 2U) == 1U);
+static_assert(EidPathIndexForWorker(0U, 1U, 2U, 3U) == 2U);
+
+// One peer channel is bound to one local AIV Jetty. Runtime has already
+// selected the local EID assigned to this worker; this adapter only creates
+// the transport resources required by that selected path.
 struct PeerChannelRequest {
   PeerLink* link{nullptr};
   const DirectHccpApi* api{nullptr};

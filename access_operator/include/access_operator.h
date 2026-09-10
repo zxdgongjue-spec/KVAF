@@ -49,9 +49,13 @@ struct AccessOperatorConfig {
   std::uint32_t npu_core_count{0};
   // Direct-HCCP Jettys assigned to each AIV core.
   std::uint32_t jettys_per_core{2};
-  // Runtime supplies the selected local EID. Operator transports consume it;
-  // they do not discover EIDs or make topology decisions.
+  // Legacy single-EID input. Kept for source compatibility; peer_local_eids
+  // takes precedence when it is non-empty.
   std::array<std::uint8_t, 16> peer_local_eid{};
+  // Runtime may supply more than one selected local EID. BatchGet creates one
+  // RaCtx per EID and stripes core/Jetty workers over those paths; BatchPut
+  // continues to use peer_local_eid above.
+  std::vector<std::array<std::uint8_t, 16>> peer_local_eids{};
   std::shared_ptr<PeerLink> peer_link;
 };
 

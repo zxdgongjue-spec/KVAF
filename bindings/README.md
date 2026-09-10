@@ -36,13 +36,16 @@ output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数�
 
 `NpuRuntime(batch_get_kernel_object_path, batch_get_token_bytes,
 batch_get_tokens_per_block, device_id=0, npu_core_count=1,
-batch_put_kernel_object_path="", jettys_per_core=2)` 要求显式传入单 token KV
+batch_put_kernel_object_path="", jettys_per_core=2, npu_eids=[])` 要求显式传入单 token KV
 字节数和每个 KV block 中的 token 数，两个参数均无默认值；
 每个 AccessTable entry 大小为两者乘积。
 `jettys_per_core` 参数同时
 配置 BatchGet 和 BatchPut 每个 AIV core 使用的 Jetty 数量，可选 1 或 2 个独立 Jetty。
-远程 CPU DDR 只增加 `runtime.link_to("CPU_IP:port")`，必须在 `initialize` 前调用；
-EID、UMDK device 与候选 RMA 验证由 C++ Runtime 自动完成，Python 不传递这些硬件细节。
+远程 CPU DDR 只增加 `runtime.link_to("CPU_IP:port")`，必须在 `initialize` 前调用。
+`npu_eids=[]` 时 EID、UMDK device 与候选 RMA 验证由 C++ Runtime 自动完成；
+显式传入多个 32 位十六进制 EID 时，Runtime 为每个 EID 创建独立
+BatchGet 路径，并把 core/Jetty worker 轮转分配到这些路径。BatchPut
+保持原有单 EID 实现，使用列表第一项。该列表是严格配置，不会静默回退。
 `batch_put(keys, packed_input, input_offsets, lengths, stream=None)` 接收 caller-owned
 NPU packed input 和每条 block 的 CPU 整数 metadata；同步写入完成后才返回。未传
 BatchPut kernel 时，该方法保留 ACL D2H mock，便于只验证 BatchGet 的构建。
