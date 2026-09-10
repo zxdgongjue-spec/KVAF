@@ -139,6 +139,24 @@ completion wait 平均耗时。`remote_sgl_size` 列是请求值，实际分组�
 终端最后输出成功组合按平均带宽降序排列的 `EID_PERF_RANK`，以及包含 CSV 路径的
 `EID_PERF_SUMMARY`。无成功组合或资源清理失败时返回非零退出码。
 
+绑核对比可使用下面的测试入口，负载和 CSV 格式与上述程序一致：
+
+```bash
+tests/run_cpu_urma_eid_perf_pinned.sh "$PWD/build-cpu" \
+  --peer 127.0.0.1:29888 --device-id 3 \
+  --count 8192 --token-bytes 4096 --remote-sgl-size 1 \
+  --output results/cpu_urma_eid_bandwidth_pinned.csv
+```
+
+脚本在 Linux 上从调用进程允许使用的 CPU 中选两个不同物理核，优先选同一
+NUMA 节点，使用 OpenMP affinity 将两个 worker 分别固定到一个逻辑 CPU。
+每个 worker 仍独占一条 Jetty，负责其 WR 构造和 post；完成轮询仍由调用线程执行。
+`EID_PERF_AFFINITY` 输出目标 CPU/NUMA 节点，OpenMP 的 affinity 日志显示实际线程绑定。
+此方式没有在每批传输中增加设置/恢复 affinity 的系统调用。
+脚本不自动判断 UB 设备所在的 NUMA 节点；需要指定核时，在命令前加
+`taskset -c 8,10`（按实际拓扑修改），脚本会在该集合内选核。
+绑核仅对本次启动的测试进程生效，未绑核基线可直接运行原测试程序并使用另一份 CSV。
+
 CPU URMA 固定创建 2 个 Jetty，并使用 2 个 OpenMP worker，每条 WR 的本地
 SGE 数固定为 1。常量位于 `cpu_urma_transport.cc`：`kJettyCount`、
 `kOmpThreadCount`、`kLocalSgeCount`。不再提供 `jetty_count`、`omp_thread_count`、
