@@ -14,6 +14,10 @@ environment variables:
     --tokens-per-block     KVAF_BATCH_GET_PERF_TOKENS_PER_BLOCK
     --token-bytes          KVAF_BATCH_GET_PERF_TOKEN_BYTES
     --miss-count           KVAF_BATCH_GET_PERF_MISS_COUNT
+    --source-access-pattern
+                           KVAF_BATCH_GET_PERF_SOURCE_ACCESS_PATTERN
+    --output-access-pattern
+                           KVAF_BATCH_GET_PERF_OUTPUT_ACCESS_PATTERN
     --kernel-profile       KVAF_BATCH_GET_PERF_KERNEL_PROFILE=1
     --kernel-profile-clock-mhz
                            KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ
@@ -113,6 +117,29 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             else None
         ),
         help="exact valid request-prefix length; defaults to request-length",
+    )
+    parser.add_argument(
+        "--source-access-pattern",
+        choices=("random", "contiguous", "shuffled-contiguous"),
+        default=os.environ.get(
+            "KVAF_BATCH_GET_PERF_SOURCE_ACCESS_PATTERN", "random"
+        ),
+        help=(
+            "remote CPU DDR read order: random samples the full table, "
+            "contiguous reads an ascending token range, and shuffled-contiguous "
+            "sends the same contiguous range in random order"
+        ),
+    )
+    parser.add_argument(
+        "--output-access-pattern",
+        choices=("random", "contiguous"),
+        default=os.environ.get(
+            "KVAF_BATCH_GET_PERF_OUTPUT_ACCESS_PATTERN", "random"
+        ),
+        help=(
+            "local NPU HBM output order; use contiguous while comparing source "
+            "patterns to isolate remote CPU DDR access behavior"
+        ),
     )
     parser.add_argument(
         "--aiv-cores",
@@ -509,6 +536,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     miss_count_value = args.miss_count
     block_bytes = token_bytes * tokens_per_block
     ddr_bytes = table_capacity * block_bytes
+    total_tokens = table_capacity * tokens_per_block
 
     torch.npu.set_device(device_id)
     torch.manual_seed(args.seed)
@@ -560,6 +588,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"request_length={request_length} table_capacity={table_capacity} "
             f"tokens_per_block={tokens_per_block} token_bytes={token_bytes} "
             f"block_bytes={block_bytes} miss_count={miss_count_value} "
+            f"source_access_pattern={args.source_access_pattern} "
+            f"output_access_pattern={args.output_access_pattern} "
             f"ddr_bytes={ddr_bytes} aiv_cores={args.aiv_cores} "
             f"jettys_per_core={args.jettys_per_core} eid_paths={len(args.npu_eids) or 1} "
             f"npu_eids={','.join(args.npu_eids) or 'auto'} warmup={args.warmup} "
@@ -607,8 +637,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         # prefix and the untouched suffix before collecting timing samples.
         print("BATCH_GET_PERF_PHASE_BEGIN phase=correctness_preflight")
         request_ids = torch.arange(request_length, dtype=torch.int64, device=device)
-        preflight_indices = (request_ids % table_capacity).to(torch.int32)
-        preflight_token_slots = request_ids % tokens_per_block
+        preflight_token_ids = request_ids % total_tokens
+        preflight_indices = (preflight_token_ids // tokens_per_block).to(torch.int32)
+        preflight_token_slots = preflight_token_ids % tokens_per_block
         preflight_offsets = (preflight_token_slots * token_bytes).to(torch.int32)
         preflight_output_indices = request_ids.to(torch.int32)
         output.zero_()
@@ -636,24 +667,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print("BATCH_GET_PERF_PHASE_DONE phase=correctness_preflight")
 
+        # The table is populated in key order and MetaManager allocates fixed
+        # slots FIFO, so linear token IDs map to adjacent remote CPU addresses.
+        # shuffled-contiguous changes only their submission order and keeps the
+        # exact same remote working set as contiguous.
+        contiguous_source_token_ids = request_ids % total_tokens
+
         def create_request_plan() -> tuple[object, object, object]:
-            indices = torch.randint(
-                0,
-                table_capacity,
-                (request_length,),
-                dtype=torch.int32,
-                device=device,
-            )
-            token_slots = torch.randint(
-                0,
-                tokens_per_block,
-                (request_length,),
-                dtype=torch.int32,
-                device=device,
-            )
+            if args.source_access_pattern == "random":
+                # Preserve the established benchmark's full-table random source
+                # distribution as the default behavior.
+                indices = torch.randint(
+                    0,
+                    table_capacity,
+                    (request_length,),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                token_slots = torch.randint(
+                    0,
+                    tokens_per_block,
+                    (request_length,),
+                    dtype=torch.int32,
+                    device=device,
+                )
+            else:
+                source_token_ids = contiguous_source_token_ids
+                if args.source_access_pattern == "shuffled-contiguous":
+                    source_token_ids = source_token_ids[
+                        torch.randperm(request_length, device=device)
+                    ]
+                indices = (source_token_ids // tokens_per_block).to(torch.int32)
+                token_slots = (source_token_ids % tokens_per_block).to(torch.int32)
             offsets = token_slots * token_bytes
-            output_indices = torch.randperm(request_length, device=device).to(
-                torch.int32
+            output_indices = (
+                request_ids.to(torch.int32)
+                if args.output_access_pattern == "contiguous"
+                else torch.randperm(request_length, device=device).to(torch.int32)
             )
             return indices, offsets, output_indices
 
