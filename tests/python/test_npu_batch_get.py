@@ -152,7 +152,7 @@ def main() -> int:
         and source_stride == block_bytes
         and npu_core_count > 0
         and npu_core_count <= requests
-        and 1 <= jettys_per_core <= 2
+        and 1 <= jettys_per_core <= 4
         and len(npu_eids) <= npu_core_count * jettys_per_core
         and iterations > 0
         and 1 <= active_percent <= 100

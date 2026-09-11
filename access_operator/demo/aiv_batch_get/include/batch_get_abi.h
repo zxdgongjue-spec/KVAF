@@ -9,7 +9,7 @@ enum {
   KVAF_AIV_BATCH_GET_STATUS_BYTES = 384,
   KVAF_AIV_BATCH_GET_QUEUE_STATE_BYTES = 64,
   KVAF_AIV_BATCH_GET_MAX_AIV_CORES = 48,
-  KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE = 2,
+  KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE = 4,
   // Shared local-memory contract used by the AIV kernel and launcher.
   KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES = 160 * 1024,
 };
@@ -38,7 +38,9 @@ typedef struct KvafBatchGetCoreProfile {
   uint64_t total_posts;
   uint64_t jetty_completion_wait_cycles[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE];
   uint64_t jetty_completion_polls[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE];
-  uint64_t reserved[26];
+  // Keep this profile at 320 bytes as per-Jetty counters consume more of the
+  // space that was reserved by the original two-Jetty ABI.
+  uint64_t reserved[22];
 } KvafBatchGetCoreProfile;
 
 // Keep the historical 384-byte stride even though ExecuteBatchGet uses only

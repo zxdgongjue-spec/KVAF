@@ -43,6 +43,7 @@ DEFAULT_TOKENS_PER_BLOCK = 128
 DEFAULT_TOKEN_BYTES = 656
 DEFAULT_AIV_CORES = 2
 DEFAULT_JETTYS_PER_CORE = 2
+MAX_JETTYS_PER_CORE = 4
 DEFAULT_WARMUP = 3
 DEFAULT_ITERATIONS = 100
 DEFAULT_POPULATE_CHUNK_ENTRIES = 128
@@ -122,7 +123,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--jettys-per-core",
         type=int,
-        choices=(1, 2),
+        choices=range(1, MAX_JETTYS_PER_CORE + 1),
         default=environment_int(
             "KVAF_BATCH_GET_PERF_JETTYS_PER_CORE", DEFAULT_JETTYS_PER_CORE
         ),
@@ -302,10 +303,11 @@ def print_kernel_profile(
             "finalize_ms": 0.0,
             "active_requests": 0.0,
             "total_posts": 0.0,
-            "jetty0_wait_ms": 0.0,
-            "jetty0_polls": 0.0,
-            "jetty1_wait_ms": 0.0,
-            "jetty1_polls": 0.0,
+            **{
+                name: 0.0
+                for jetty in range(MAX_JETTYS_PER_CORE)
+                for name in (f"jetty{jetty}_wait_ms", f"jetty{jetty}_polls")
+            },
         }
         for _ in range(npu_core_count)
     ]
@@ -373,7 +375,7 @@ def print_kernel_profile(
             accumulator["total_posts"] += int(profile["total_posts"])
             waits = list(profile["jetty_completion_wait_cycles"])
             polls = list(profile["jetty_completion_polls"])
-            for jetty in range(2):
+            for jetty in range(MAX_JETTYS_PER_CORE):
                 accumulator[f"jetty{jetty}_wait_ms"] += (
                     int(waits[jetty]) / clock_mhz / 1000.0
                 )
