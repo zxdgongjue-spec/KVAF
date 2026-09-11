@@ -26,8 +26,8 @@ namespace {
 
 constexpr std::uint32_t kJfcDepth = 16384;
 constexpr std::uint32_t kJettyDepth = 8192;
-constexpr std::uint32_t kJettyCount = 2;
-constexpr std::uint32_t kOmpThreadCount = 2;
+constexpr std::uint32_t kJettyCount = 4;
+constexpr std::uint32_t kOmpThreadCount = 4;
 constexpr std::uint32_t kLocalSgeCount = 1;
 constexpr std::uint32_t kPageBytes = 4096;
 constexpr std::uint32_t kKeyBytes = sizeof(urma_jetty_id_t) + sizeof(urma_transport_mode_t);
@@ -785,17 +785,21 @@ struct CpuUrmaTransport::Impl {
   Status ValidateLink() {
     if (!initialized_) return Status::NotInitialized("CPU transport is not initialized");
     const std::size_t bytes = static_cast<std::size_t>(
-        std::min<std::uint64_t>(64U, std::max<std::uint64_t>(1U, remote_region_.length / 2U)));
+        std::min<std::uint64_t>(64U, std::max<std::uint64_t>(1U, remote_region_.length / kJettyCount)));
     std::fill(probe_buffer_.begin(), probe_buffer_.end(), 0xA5U);
     std::fprintf(stderr, "[KVAF_CPU_URMA] LINK_PROBE stage=register_host\n");
     Status status = RegisterDirectHostMemory(probe_buffer_.data(), probe_buffer_.size());
     if (!status.ok()) return status;
-    const std::uint64_t offsets[] = {0U, remote_region_.length >= 2U ? bytes : 0U};
-    // Reusing the source address prevents grouping: each Jetty gets one WRITE.
-    const CpuUrmaTransport::HostSge sources[] = {
-        {probe_buffer_.data(), bytes}, {probe_buffer_.data(), bytes}};
-    std::fprintf(stderr, "[KVAF_CPU_URMA] LINK_PROBE stage=transfer jettys=2 bytes_per_wr=%zu\n", bytes);
-    status = TransferBatch(true, offsets, sources, 2U);
+    std::array<std::uint64_t, kJettyCount> offsets{};
+    std::array<CpuUrmaTransport::HostSge, kJettyCount> sources{};
+    for (std::size_t jetty = 0; jetty < kJettyCount; ++jetty) {
+      offsets[jetty] = remote_region_.length >= kJettyCount ? jetty * bytes : 0U;
+      // Reusing the source address prevents grouping: every Jetty is probed.
+      sources[jetty] = {probe_buffer_.data(), bytes};
+    }
+    std::fprintf(stderr, "[KVAF_CPU_URMA] LINK_PROBE stage=transfer jettys=%zu bytes_per_wr=%zu\n",
+                 sources.size(), bytes);
+    status = TransferBatch(true, offsets.data(), sources.data(), sources.size());
     std::fprintf(stderr, "[KVAF_CPU_URMA] LINK_PROBE stage=done ok=%d\n", status.ok());
     last_batch_timing_ = {};
     return status;
