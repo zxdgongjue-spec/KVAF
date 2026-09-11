@@ -129,6 +129,7 @@ build_cpu() {
   pybind11_dir="$($python_bin -m pybind11 --cmakedir)"
 
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
+    -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_TESTING=ON \
     -DKVAF_BUILD_PYTHON=ON \
     -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON \

@@ -104,7 +104,7 @@ build-cpu/runtime/kvaf_cpu_runtime_npu_hbm_e2e \
 
 CPU 初始化按 UB 设备名、EID index 顺序遍历本地候选，逐个尝试 NPU 的 EID
 候选。NPU 候选与 AIV 共用发现逻辑：先取指定物理设备的 HCCL CLOS EID，再追加
-去重后的 `pair_info` EID。每组建链后在两个 CPU Jetty 上各做一次最多 64B 的
+去重后的 `pair_info` EID。每组建链后在四个 CPU Jetty 上各做一次最多 64B 的
 WRITE 并等待 CQ；第一组成功即选用，失败则释放本次资源后继续尝试。日志
 `LINK_ATTEMPT`、`LINK_FAILED`、`LINK_SELECTED` 记录所选路径，不进行带宽排名。
 客户端的 `--ub-device`、`--eid-index` 只筛选 CPU 本地候选。
@@ -120,14 +120,14 @@ WRITE 并等待 CQ；第一组成功即选用，失败则释放本次资源后�
 
 `--peer` 指向已启动的 NPU HBM service；按部署修改地址、端口和 NPU device ID。
 测试遍历所有本地 UB 设备的非零 EID × 指定 NPU device 的全部候选 EID。
-每次固定一个组合，建立两条独立 Jetty 通道，探测成功后执行完整 WRITE/READ
+每次固定一个组合，建立四条独立 Jetty 通道，探测成功后执行完整 WRITE/READ
 回读校验，再 warmup 和采样，最后再次回读校验。失败组合记录原因后继续下一组，
 不会自动切换到另一条链路。每组结束先销毁 transport 再释放远端 HBM；若释放失败，
 停止遍历并保留已收集的结果。
 
 默认 `--count 8192 --token-bytes 4096 --remote-sgl-size 1 --warmup 5 --iterations 100`，
 即每次 WRITE 32 MiB，8192 条 WR；本地和远端行地址均连续。所有组合使用相同负载，
-固定 2 个 Jetty、2 个 OpenMP worker，`wqes_per_doorbell=0`。这些负载选项可按需修改。
+固定 4 个 Jetty、4 个 OpenMP worker，`wqes_per_doorbell=0`。这些负载选项可按需修改。
 测量范围为现有 `transport.total_ns`（包含分组、参数检查、segment 查找、WR 构造、
 提交和完成等待），不包含建链、预注册内存、回读校验和 warmup，也不经过 Runtime/Python。
 `mean_GBps = payload_bytes / mean_ns`，使用十进制 GB/s。
@@ -148,22 +148,27 @@ tests/run_cpu_urma_eid_perf_pinned.sh "$PWD/build-cpu" \
   --output results/cpu_urma_eid_bandwidth_pinned.csv
 ```
 
-脚本在 Linux 上从调用进程允许使用的 CPU 中选两个不同物理核，优先选同一
-NUMA 节点，使用 OpenMP affinity 将两个 worker 分别固定到一个逻辑 CPU。
+脚本在 Linux 上从调用进程允许使用的 CPU 中选四个不同物理核，优先选同一
+NUMA 节点，使用 OpenMP affinity 将四个 worker 分别固定到一个逻辑 CPU。
 每个 worker 仍独占一条 Jetty，负责其 WR 构造和 post；完成轮询仍由调用线程执行。
 `EID_PERF_AFFINITY` 输出目标 CPU/NUMA 节点，OpenMP 的 affinity 日志显示实际线程绑定。
 此方式没有在每批传输中增加设置/恢复 affinity 的系统调用。
 脚本不自动判断 UB 设备所在的 NUMA 节点；需要指定核时，在命令前加
-`taskset -c 8,10`（按实际拓扑修改），脚本会在该集合内选核。
+`taskset -c 8,10,12,14`（按实际拓扑修改），脚本会在该集合内选核。
 绑核仅对本次启动的测试进程生效，未绑核基线可直接运行原测试程序并使用另一份 CSV。
 
-CPU URMA 固定创建 2 个 Jetty，并使用 2 个 OpenMP worker，每条 WR 的本地
+CPU 构建脚本显式使用 `CMAKE_BUILD_TYPE=Release`（包括已有构建目录的重新配置）。
+WR/SGE 的固定字段按队列布局复用，条数、READ/WRITE 或远端 SGL 宽度变化时重建；
+每批更新地址、长度和有效 SGE 数，并恢复提交链表。SGL=1 先校验全量输入，
+再直接按行分批，不再生成分组数组。Jetty 的 WR 数使用公式计算。
+
+CPU URMA 固定创建 4 个 Jetty，并使用 4 个 OpenMP worker，每条 WR 的本地
 SGE 数固定为 1。常量位于 `cpu_urma_transport.cc`：`kJettyCount`、
 `kOmpThreadCount`、`kLocalSgeCount`。不再提供 `jetty_count`、`omp_thread_count`、
 `sgl_size` 初始化参数或对应命令行选项。
 
 每个 CPU Jetty 的 `CreateChannel` 请求都会在 NPU 服务端创建独立的目标
-Jetty 和 CQ；两条通道共享 HBM segment、token 和设备 context。服务端
+Jetty 和 CQ；四条通道共享 HBM segment、token 和设备 context。服务端
 `CHANNEL_READY` 日志中的 `channel_index`、`target_jetty_id` 和
 `target_jfc_id` 可用于确认通道对应关系。释放 HBM session 时先释放各通道，
 再注销并释放 HBM。此行为需要重新构建并重启 `kvaf_npu_service`。

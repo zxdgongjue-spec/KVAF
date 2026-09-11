@@ -101,6 +101,23 @@ void WriteScatterLimits() {
         "zero length WRITE row accepted");
 }
 
+void SingleSgeValidation() {
+  std::array<std::uint8_t, 64> data{};
+  std::vector<CpuUrmaTransport::HostSge> buffers(32769, {data.data(), 8});
+  std::vector<std::uint64_t> offsets(buffers.size(), 16);
+  const auto validate = [&] { return kvaf::cpu_urma_detail::ValidateBatchRows(
+      buffers.data(), offsets.data(), buffers.size(), 64); };
+  Check(validate().ok(), "valid single-SGE input");
+  offsets.back() = 60;
+  Check(!validate().ok(), "invalid row beyond first four-Jetty batch accepted");
+  offsets.back() = 16;
+  buffers.back().data = reinterpret_cast<void*>(std::numeric_limits<std::uintptr_t>::max() - 2);
+  Check(!validate().ok(), "local address overflow accepted");
+  buffers.back().data = data.data();
+  buffers.back().bytes = 0;
+  Check(!validate().ok(), "zero row length accepted");
+}
+
 void JettyChunkSubmission() {
   for (const std::size_t count : {0U, 1U, 97U, 1024U}) {
     for (const std::size_t chunk : {0U, 1U, 32U, 1024U}) {
@@ -158,6 +175,7 @@ int main() {
   try {
     PackedWriteScatter();
     WriteScatterLimits();
+    SingleSgeValidation();
     JettyChunkSubmission();
     std::cout << "CPU URMA SGL planning tests passed\n";
     return 0;
