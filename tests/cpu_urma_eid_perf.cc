@@ -172,11 +172,16 @@ Result Measure(const Options& options, const CpuCandidate& cpu, std::uint32_t np
   kvaf::peer::PeerLink link(options.peer);
   kvaf::peer::PeerRegion region{};
   CpuUrmaTransport transport;
+  const auto phase = [](const char* name) {
+    std::cerr << "EID_PERF_PHASE phase=" << name << std::endl;
+  };
   const auto finish = [&](const std::string& stage, const Status& status) {
     result.status = status.ok() ? "ok" : stage;
     result.error = status.message();
+    phase("shutdown");
     (void)transport.Shutdown();
     if (region.session_id != 0U) {
+      phase("release_hbm");
       const auto released = link.ReleaseHbmRegion(region.session_id);
       if (!released.ok()) {
         result.cleanup_ok = false;
@@ -190,6 +195,7 @@ Result Measure(const Options& options, const CpuCandidate& cpu, std::uint32_t np
   };
   const std::size_t payload = options.count * options.token_bytes;
   try {
+    phase("allocate_hbm");
     auto status = link.AllocateHbmRegion(payload, options.token_bytes, options.device_id, npu_index, &region);
     if (!status.ok()) return finish("allocate_failed", status);
     result.segment_eid = Hex(region.eid);
@@ -205,13 +211,19 @@ Result Measure(const Options& options, const CpuCandidate& cpu, std::uint32_t np
     config.external_region = region;
     config.remote_sgl_size = options.remote_sgl_size;
     // This calls one fixed pair directly; no Runtime candidate fallback.
+    phase("initialize");
     status = transport.Initialize(config);
     if (!status.ok()) return finish("connect_failed", status);
+    phase("probe");
     status = transport.ValidateLink();
     if (!status.ok()) return finish("probe_failed", status);
     // Keep the input as the explicit region for the measured WRITE fast path.
+    phase("register_output");
     status = transport.RegisterDirectHostMemory(output.data.get(), output.bytes);
-    if (status.ok()) status = transport.RegisterDirectHostMemory(input.data.get(), input.bytes);
+    if (status.ok()) {
+      phase("register_input");
+      status = transport.RegisterDirectHostMemory(input.data.get(), input.bytes);
+    }
     if (!status.ok()) return finish("register_failed", status);
     const auto write = [&] { return transport.WriteBatch(offsets.data(), sources.data(), sources.size()); };
     const auto verify = [&] {
@@ -221,9 +233,14 @@ Result Measure(const Options& options, const CpuCandidate& cpu, std::uint32_t np
       return std::memcmp(input.data.get(), output.data.get(), payload) == 0
           ? Status::OK() : Status::Internal("payload read-back mismatch");
     };
+    phase("preflight_write");
     status = write();
-    if (status.ok()) status = verify();
+    if (status.ok()) {
+      phase("preflight_read");
+      status = verify();
+    }
     if (!status.ok()) return finish("preflight_failed", status);
+    phase("warmup");
     for (std::size_t i = 0; i < options.warmup; ++i) {
       status = write();
       if (!status.ok()) return finish("warmup_failed", status);
@@ -231,6 +248,7 @@ Result Measure(const Options& options, const CpuCandidate& cpu, std::uint32_t np
     std::vector<std::uint64_t> samples;
     samples.reserve(options.iterations);
     long double prepare = 0, post = 0, poll = 0;
+    phase("measure");
     for (std::size_t i = 0; i < options.iterations; ++i) {
       status = write();
       if (!status.ok()) return finish("transfer_failed", status);
@@ -245,6 +263,7 @@ Result Measure(const Options& options, const CpuCandidate& cpu, std::uint32_t np
       post += timing.post_ns;
       poll += timing.poll_ns;
     }
+    phase("final_read");
     status = verify();
     if (!status.ok()) return finish("verify_failed", status);
     result.stats = kvaf::eid_perf::Summarize(std::move(samples), payload);

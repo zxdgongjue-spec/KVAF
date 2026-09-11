@@ -15,27 +15,6 @@ struct SglGroup {
   std::uint64_t bytes{0};
 };
 
-// SGL=1 needs validation but no group array. Check the entire call before
-// submitting any chunk, including entries beyond the first queue capacity.
-inline Status ValidateBatchRows(const CpuUrmaTransport::HostSge* buffers,
-                                const std::uint64_t* offsets, std::size_t count,
-                                std::uint64_t remote_bytes) {
-  if (buffers == nullptr || offsets == nullptr || count == 0U)
-    return Status::InvalidArgument("invalid batch rows");
-  std::uint64_t total = 0;
-  for (std::size_t i = 0; i < count; ++i) {
-    const auto address = reinterpret_cast<std::uintptr_t>(buffers[i].data);
-    const auto bytes = buffers[i].bytes;
-    if (address == 0U || bytes == 0U || bytes > std::numeric_limits<std::uint32_t>::max() ||
-        bytes > std::numeric_limits<std::uintptr_t>::max() - address ||
-        offsets[i] > remote_bytes || bytes > remote_bytes - offsets[i] ||
-        bytes > std::numeric_limits<std::uint64_t>::max() - total)
-      return Status::InvalidArgument("batch row is outside its buffer or remote region");
-    total += bytes;
-  }
-  return Status::OK();
-}
-
 // WRITE scatter: one contiguous local span feeds up to remote_sgl_size
 // independent remote SGEs. Keep request order and split at local gaps.
 inline Status PlanWriteScatterGroups(const CpuUrmaTransport::HostSge* buffers,

@@ -35,20 +35,6 @@ add_executable(kvaf_cpu_urma_eid_perf_metrics_test cpu_urma_eid_perf_metrics_tes
 target_compile_features(kvaf_cpu_urma_eid_perf_metrics_test PRIVATE cxx_std_17)
 add_test(NAME kvaf_cpu_urma_eid_perf_metrics COMMAND kvaf_cpu_urma_eid_perf_metrics_test)
 
-# Descriptor replay needs public URMA types, but no driver or liburma linkage.
-find_path(KVAF_TEST_URMA_INCLUDE_DIR urma_api.h HINTS
-  "${KVAF_URMA_INCLUDE_DIR}" "${KVAF_URMA_ROOT}/include"
-  "${CMAKE_SOURCE_DIR}/../third_party/umdk/include")
-if(KVAF_TEST_URMA_INCLUDE_DIR)
-  add_executable(kvaf_cpu_urma_wr_batch_test cpu_urma_wr_batch_test.cc)
-  target_include_directories(kvaf_cpu_urma_wr_batch_test PRIVATE
-    "${KVAF_TEST_URMA_INCLUDE_DIR}" "${CMAKE_SOURCE_DIR}/access_operator/src/cpu_urma"
-    "${CMAKE_SOURCE_DIR}/access_operator/include" "${CMAKE_SOURCE_DIR}/runtime/include"
-    "${CMAKE_SOURCE_DIR}/common/include")
-  target_compile_features(kvaf_cpu_urma_wr_batch_test PRIVATE cxx_std_17)
-  add_test(NAME kvaf_cpu_urma_wr_batch COMMAND kvaf_cpu_urma_wr_batch_test)
-endif()
-
 if(KVAF_BUILD_PYTHON)
   add_test(
     NAME kvaf_runtime_mock_python

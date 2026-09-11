@@ -128,8 +128,9 @@ build_cpu() {
   fi
   pybind11_dir="$($python_bin -m pybind11 --cmakedir)"
 
+  # Restore the pre-951ce25 build mode, including cached Release configurations.
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
-    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_BUILD_TYPE= \
     -DBUILD_TESTING=ON \
     -DKVAF_BUILD_PYTHON=ON \
     -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON \

@@ -5,7 +5,7 @@ if [[ $# -eq 0 || "$1" == "--help" || "$1" == "-h" ]]; then
   cat <<'EOF'
 Usage: tests/run_cpu_urma_eid_perf_pinned.sh BUILD_DIR [EID test options]
 
-Run the EID bandwidth sweep with its four OpenMP workers pinned to four
+Run the EID bandwidth sweep with its two OpenMP workers pinned to two
 different physical cores allowed by the caller's CPU affinity.
 Prefer cores in the same NUMA node. Use taskset to restrict CPU selection.
 All remaining arguments are passed to kvaf_cpu_urma_eid_perf unchanged.
@@ -47,14 +47,14 @@ for cpu in sorted(os.sched_getaffinity(0)):
     node = nodes[0].name if nodes else "unknown"
     cores.append((cpu, node))
 
-if len(cores) < 4:
-    sys.exit("ERROR: allow at least four distinct physical cores using taskset/cpuset")
+if len(cores) < 2:
+    sys.exit("ERROR: allow at least two distinct physical cores using taskset/cpuset")
 
-selected = cores[:4]
+selected = cores[:2]
 for first in cores:
-    same_node = [c for c in cores if c[1] == first[1]]
-    if len(same_node) >= 4:
-        selected = same_node[:4]
+    second = next((c for c in cores if c[0] != first[0] and c[1] == first[1]), None)
+    if second is not None:
+        selected = [first, second]
         break
 
 for jetty, (cpu, node) in enumerate(selected):
@@ -65,6 +65,6 @@ PY
 
 # Avoid inherited vendor affinity settings overriding the explicit places.
 unset GOMP_CPU_AFFINITY KMP_AFFINITY KMP_HW_SUBSET
-export OMP_NUM_THREADS=4 OMP_THREAD_LIMIT=4 OMP_DYNAMIC=FALSE
+export OMP_NUM_THREADS=2 OMP_THREAD_LIMIT=2 OMP_DYNAMIC=FALSE
 export OMP_PLACES="$kvaf_places" OMP_PROC_BIND=spread OMP_DISPLAY_AFFINITY=TRUE
 exec "$kvaf_benchmark" "$@"

@@ -68,13 +68,13 @@ class CpuUrmaTransport final {
   CpuUrmaTransport& operator=(const CpuUrmaTransport&) = delete;
 
   Status Initialize(const CpuUrmaTransportOptions& options);
-  // Verify all Jettys with small WRITEs and completion before selecting a link.
+  // Verify both Jettys with small WRITEs and completion before selecting a link.
   Status ValidateLink();
   struct HostSge {
     void* data;
     std::size_t bytes;
   };
-  // One local SGE per WR. Four fixed workers each own a Jetty and prepare
+  // One local SGE per WR. Two fixed workers each own a Jetty and prepare
   // and submit its batches independently; completion is polled after joining.
   Status WriteSglBatch(std::uint64_t remote_offset, const HostSge* sources,
                        std::size_t count);
