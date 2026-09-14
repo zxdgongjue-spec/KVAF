@@ -430,7 +430,7 @@ struct NpuRuntime::Impl {
     config.npu_core_count = options.npu_core_count;
     config.jettys_per_core = options.jettys_per_core;
     // BatchPut is intentionally unchanged and keeps its existing two-Jetty
-    // maximum when BatchGet selects three or four lanes.
+    // maximum when BatchGet selects three to sixteen lanes.
     config.batch_put_jettys_per_core =
         std::min(options.jettys_per_core, std::uint32_t{2U});
   }

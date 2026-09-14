@@ -92,7 +92,7 @@ Each AIV consumes its assigned slice of the compact `[0, miss_count)` request
 prefix directly. Before touching the SQ, the kernel rejects an invalid
 descriptor or a per-Jetty assignment that fills the entire SQ.
 The phase-two scheduler assigns complete 32-WQE posts to the core's Jettys in
-round-robin order, with one to four Jettys supported per core. Each Jetty has an
+round-robin order, with one to sixteen Jettys supported per core. Each Jetty has an
 independent persistent SQ producer and CQ consumer index. Only the last READ
 assigned to each used Jetty requests a CQE;
 the kernel drains one CQE from every used Jetty before reporting the batch

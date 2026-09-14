@@ -72,8 +72,8 @@ struct BatchGetKernelProfile {
   std::uint64_t kernel_finish_cycle{0};
   std::uint64_t active_requests{0};
   std::uint64_t total_posts{0};
-  std::array<std::uint64_t, 4> jetty_completion_wait_cycles{};
-  std::array<std::uint64_t, 4> jetty_completion_polls{};
+  std::array<std::uint64_t, 16> jetty_completion_wait_cycles{};
+  std::array<std::uint64_t, 16> jetty_completion_polls{};
 };
 
 // Default synchronous NPU data-plane implementation.
