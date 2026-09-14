@@ -124,6 +124,10 @@ typedef struct KvafExecuteBatchGetKernelArgs {
   uint32_t block_count;
   // Zero preserves the phase-one ABI and selects one Jetty per AIV core.
   uint32_t jettys_per_core;
+  // V2 kernel ABI: partition the device-side compact prefix across launches.
+  // Zero shard_count selects one shard for zero-initialized direct callers.
+  uint32_t shard_id;
+  uint32_t shard_count;
 } KvafExecuteBatchGetKernelArgs;
 
 #if defined(__cplusplus)
@@ -135,7 +139,7 @@ static_assert(sizeof(KvafBatchGetQueueState) == KVAF_AIV_BATCH_GET_QUEUE_STATE_B
               "KvafBatchGetQueueState ABI changed");
 static_assert(sizeof(KvafBatchGetDirectUrmaEntity) == 192,
               "KvafBatchGetDirectUrmaEntity ABI changed");
-static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 112,
+static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 120,
               "KvafExecuteBatchGetKernelArgs ABI changed");
 #endif
 

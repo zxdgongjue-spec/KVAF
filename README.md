@@ -115,6 +115,9 @@ TCP 用于交换控制信息，初始化UB建链；KV 数据 通过 NPU AIV kern
 - `PrepareAccessTable` / `access_table_view`：为 BatchGet 生成稳定的 CPU 或 NPU
   AccessTable；
 - `BatchGet`：使用 NPU Tensor 发起 AIV 读取；默认仅入队到调用方 stream；
+- 可设置 `batch_get_stream_count=2`，用调用方及一条内部 stream 并发执行请求分片，
+  共用单个 transport；`npu_core_count` 为每路核数，总核数为两者乘积（不超过 48），
+  总 Jetty 数再乘以 `jettys_per_core`。两路完成依赖会汇合到调用方 stream；
 - `BatchFree`：释放 Key 对应的 slot。仍被 AccessTable 持有的 Key 会返回 busy。
 
 一个 `NpuRuntime` 当前连接一个 CPU 服务并使用一个远端 DDR region。异常退出后的
@@ -291,6 +294,46 @@ slot 内 `offsets` 排序；`indices`、`offsets` 和 `output_indices` 使用同
 tests/run_remote_cpu_batch_get_perf.sh /absolute/path/to/build-npu \
   --sort-input-indices
 ```
+
+单/双 stream、单 transport 的参数扫描使用
+`tests/run_remote_cpu_batch_get_dual_stream_perf.sh`。需先重新编译当前分支的 host、
+Python binding 和 AIV kernel，并启动 CPU 服务。快速测试两路各 1 核、各 1 Jetty：
+
+```bash
+KVAF_CPU_SERVICE_ADDR=192.168.1.10:28999 \
+KVAF_BATCH_GET_DUAL_STREAM_TOKEN_BYTES="656" \
+KVAF_BATCH_GET_DUAL_STREAM_MISS_COUNTS="32 1024 8192" \
+KVAF_BATCH_GET_DUAL_STREAM_AIV_CORES="1" \
+KVAF_BATCH_GET_DUAL_STREAM_JETTYS_PER_CORE="1" \
+tests/run_remote_cpu_batch_get_dual_stream_perf.sh /absolute/path/to/build-npu \
+  --warmup 3 --iterations 100
+```
+
+不设置上述扫描变量时，默认扫描 7 种 token 大小、9 种 miss count、每路
+`1 2 4 8 16 24` 核和每核 `1 2 4 8 16 32 64` Jetty，共 2646 组。
+脚本默认双 stream，可用 `--stream-count 1` 或 `--stream-count 2` 选择，也支持
+`KVAF_NPU_BATCH_GET_STREAM_COUNT` 环境变量，命令行参数优先。例如单 stream 扫描：
+
+```bash
+tests/run_remote_cpu_batch_get_dual_stream_perf.sh /absolute/path/to/build-npu \
+  --stream-count 1 --warmup 3 --iterations 100
+```
+
+两种模式沿用上述 `KVAF_BATCH_GET_DUAL_STREAM_*` 扫描变量和默认范围。
+核数始终是**每个 stream 的核数**，总核数为 `stream_count × 每路核数`，上限为 48；
+单 stream 可通过 `KVAF_BATCH_GET_DUAL_STREAM_AIV_CORES="32 48"` 扫描更多核。
+`miss_count` 是整批读取数，各路分片共享这一批请求，带宽分子为
+`miss_count × token_bytes`。主指标使用所有核从最早开始到最晚完成的 `kernel_wall`，
+并在 CSV 中保留单 block 最大耗时、发包、完成等待和整次调用耗时的
+mean/p50/p90/p99。整次调用耗时包含提交和同步，排除请求构造与 profile 回读。
+每组先验证数据和所选 stream 配置，再追加 CSV；失败时停止并保留此前结果和日志。
+
+`KVAF_BATCH_GET_KERNEL_CLOCK_MHZ` 默认 1000，应按目标设备时钟设置。
+`KVAF_BATCH_GET_DUAL_STREAM_LOG_DIR` 可指定日志目录（默认新建临时目录），
+日志文件名包含 stream 数，默认 CSV 分别为 `batch_get_single_stream_summary.csv` 和
+`batch_get_dual_stream_summary.csv`，同一目录可保留两种模式的结果。
+`KVAF_BATCH_GET_DUAL_STREAM_CSV` 可指定汇总路径；复用同名文件会覆盖此前结果。
+`--help` 显示完整参数，其他 benchmark 选项继续透传。
 
 `link_to()` 必须先于 `initialize()` 调用。调用方需要在 BatchGet 所在 stream 完成前保持
 输入/输出 Tensor 和 `DeviceAccessTable` 有效；Runtime 只管理内部 DDR、元数据和内部

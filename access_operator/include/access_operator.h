@@ -46,6 +46,7 @@ struct AccessOperatorConfig {
   // not establish a shared Direct-HCCP ABI.
   std::string batch_get_kernel_object_path;
   std::string batch_put_kernel_object_path;
+  // AIV blocks per BatchGet stream (and for the single BatchPut launch).
   std::uint32_t npu_core_count{0};
   // Direct-HCCP Jettys assigned to each BatchGet AIV core.
   std::uint32_t jettys_per_core{2};
@@ -60,6 +61,9 @@ struct AccessOperatorConfig {
   // continues to use peer_local_eid above.
   std::vector<std::array<std::uint8_t, 16>> peer_local_eids{};
   std::shared_ptr<PeerLink> peer_link;
+  // 1: caller stream only; 2: caller + internal stream, sharing one transport.
+  // Total BatchGet workers = stream_count * npu_core_count * jettys_per_core.
+  std::uint32_t batch_get_stream_count{1};
 };
 
 struct BatchGetKernelProfile {
@@ -83,6 +87,10 @@ struct BatchGetKernelProfile {
 // ExecuteBatchGet obtains a LocalBuffer from the caller-owned output in the
 // request. Direct-HCCP queue/status buffers remain internal to the operator;
 // launch ordering is defined by the caller stream passed with each request.
+// Dual-stream mode joins the internal stream back into the caller stream.
+// Calls/replays using this operator must be ordered; changing caller streams
+// requires an external dependency or completion of the previous call. Graphs
+// must be destroyed before Shutdown, which releases internal stream/events.
 // ExecuteBatchPut uses the Direct-HCCP AIV eager path when a BatchPut kernel
 // path is configured; otherwise it retains the synchronous ACL D2H mock for
 // local/BatchGet-only builds. Both paths consume the packed variable-size

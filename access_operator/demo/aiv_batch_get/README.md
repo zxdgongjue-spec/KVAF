@@ -52,6 +52,57 @@ KvafBatchGetLocalBufferRelease(output_binding);
 KvafBatchGetTransportDestroy(transport);
 ```
 
+## Dual-stream BatchGet
+
+Set `NpuRuntime(..., npu_core_count=C, jettys_per_core=J,
+batch_get_stream_count=2)` to run two kernels sharing one transport. Each
+stream launches `C` AIV blocks; the transport contains `2*C*J` independent
+SQ/CQ pairs. The current total block limit is 48. The default stream count is
+1. BatchPut continues to launch `C` blocks on one stream.
+
+The caller stream records a ready event, the internal stream waits for it,
+and the two kernels read disjoint halves of the live `[0, miss_count)` prefix.
+Each kernel further divides its half among its `C` blocks. Both keep global
+request/output pointers and write through the original `output_indices`.
+Use non-overlapping output destinations. Resource arrays are stream-major:
+`[stream][block][Jetty]` for entity/queue state, `[stream][block]` for status.
+The internal stream records done, and the caller stream waits for done before
+any subsequent work. No host synchronization or device-to-host miss-count
+copy is added to the normal enqueue path. Queue indices persist across calls
+and output changes.
+
+Streams/events are created before capture. The ready/done dependency chain
+captures the side kernel and joins it back into the originating graph stream.
+Warm output registration before capture, order all calls/replays using the
+same Operator, and finish work/destroy graphs before shutting it down. Actual
+kernel overlap and graph behavior must be verified on the target A5/CANN.
+
+The kernel argument ABI is now 120 bytes, with `shard_id` and `shard_count`
+appended. A zero-initialized `shard_count` means one shard. The loader requires
+`KvafExecuteBatchGetAivKernelV2`, so an old binary fails to load instead of
+silently reading the entire prefix twice. **Rebuild both host and AIV kernel.**
+
+The benchmark accepts `--stream-count 2` (or
+`KVAF_NPU_BATCH_GET_STREAM_COUNT=2`); `--aiv-cores` is per stream. Compare equal
+resources with `--stream-count 1 --aiv-cores 2 --jettys-per-core 1` versus
+`--stream-count 2 --aiv-cores 1 --jettys-per-core 1`. Multi-kernel profile
+bandwidth uses `kernel_wall` (earliest start to latest finish), not the maximum
+individual block duration. End-to-end call-to-completion remains the main
+latency metric.
+
+Hardware integration coverage:
+
+```bash
+KVAF_RUN_NPU_TESTS=1 KVAF_NPU_CORE_COUNT=1 \
+KVAF_NPU_JETTYS_PER_CORE=1 KVAF_NPU_BATCH_GET_STREAM_COUNT=2 \
+KVAF_NPU_GRAPH_REPLAYS=4 python3 tests/python/test_npu_batch_get.py
+```
+
+Also set `PYTHONPATH`, `KVAF_BATCH_GET_KERNEL`, `KVAF_BATCH_PUT_KERNEL`, and
+`KVAF_CPU_SERVICE_ADDR` as for the existing NPU tests. This checks output
+switching, caller-stream-only synchronization, zero/one/odd prefix sizes,
+profile coverage and replay with changing device-side miss counts.
+
 For simultaneous local-EID paths, call
 `KvafBatchGetTransportCreateWithPeerLinkMultiEid` with a packed array of
 16-byte EIDs. It creates one RaCtx and one local/remote MR registration per

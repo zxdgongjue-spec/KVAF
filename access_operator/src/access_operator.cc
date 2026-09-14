@@ -11,6 +11,7 @@
 
 #include "acl/acl.h"
 #include "batch_get_abi.h"
+#include "batch_get_stream_group.h"
 #include "kvaf_aiv_batch_get.h"
 #include "meta_manager.h"
 
@@ -259,6 +260,10 @@ struct DefaultAccessOperator::Impl {
   RemoteRegionDesc remote_region;
   KvafBatchGetTransport* transport{nullptr};
   BatchGetExecutionState execution;
+  BatchGetStreamGroup batch_get_streams;
+  std::uint32_t BatchGetCoreCount() const {
+    return config.npu_core_count * config.batch_get_stream_count;
+  }
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   KvafBatchPutTransport* batch_put_transport{nullptr};
   BatchPutExecutionState batch_put_execution;
@@ -279,6 +284,10 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
       impl_->config.batch_get_kernel_object_path.empty() ||
       impl_->config.npu_core_count == 0 ||
       impl_->config.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
+      (impl_->config.batch_get_stream_count != 1U &&
+       impl_->config.batch_get_stream_count != 2U) ||
+      static_cast<std::uint64_t>(impl_->config.npu_core_count) *
+              impl_->config.batch_get_stream_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->config.jettys_per_core == 0 ||
       impl_->config.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE) {
     return InvalidArgument("invalid AccessOperator initialization config");
@@ -287,7 +296,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     return InvalidState("AccessOperator requires an established Runtime Link");
   }
   const std::size_t worker_count =
-      static_cast<std::size_t>(impl_->config.npu_core_count) *
+      static_cast<std::size_t>(impl_->BatchGetCoreCount()) *
       impl_->config.jettys_per_core;
   if (impl_->config.peer_local_eids.empty() &&
       std::any_of(impl_->config.peer_local_eid.begin(),
@@ -335,7 +344,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
       static_cast<std::uint32_t>(impl_->config.peer_local_eids.size());
   const int32_t result = KvafBatchGetTransportCreateWithPeerLinkMultiEid(
       reinterpret_cast<void*>(remote_region.base), remote_region.length,
-      impl_->config.npu_core_count, impl_->config.jettys_per_core,
+      impl_->BatchGetCoreCount(), impl_->config.jettys_per_core,
       impl_->config.peer_link.get(), peer_local_eids, peer_local_eid_count,
       &transport);
   if (result != KVAF_BATCH_GET_SUCCESS || transport == nullptr) {
@@ -343,10 +352,10 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
   }
 
   BatchGetExecutionState execution;
-  execution.status_bytes = static_cast<std::size_t>(impl_->config.npu_core_count) *
+  execution.status_bytes = static_cast<std::size_t>(impl_->BatchGetCoreCount()) *
                            sizeof(KvafBatchGetCoreStatus);
   execution.queue_state_bytes =
-      static_cast<std::size_t>(impl_->config.npu_core_count) *
+      static_cast<std::size_t>(impl_->BatchGetCoreCount()) *
       impl_->config.jettys_per_core *
       sizeof(KvafBatchGetQueueState);
   if (aclrtMalloc(&execution.status, execution.status_bytes,
@@ -417,6 +426,16 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
   }
 #endif
   impl_->initialized = true;
+  const Status stream_status = impl_->batch_get_streams.Initialize(impl_->config.batch_get_stream_count);
+  if (!stream_status.ok()) {
+    (void)Shutdown();
+    return stream_status;
+  }
+  std::fprintf(stderr,
+               "[KVAF_AIV] BATCH_GET_STREAMS_READY streams=%u cores_per_stream=%u "
+               "total_cores=%u jettys_per_core=%u total_jettys=%zu transport_count=1\n",
+               impl_->config.batch_get_stream_count, impl_->config.npu_core_count,
+               impl_->BatchGetCoreCount(), impl_->config.jettys_per_core, worker_count);
   return Status::OK();
 }
 
@@ -427,6 +446,9 @@ Status DefaultAccessOperator::Shutdown() {
 
   // Callers must complete all submitted streams before Runtime::Shutdown,
   // including the default enqueue-only Python BatchGet path.
+  const Status drain_status = impl_->batch_get_streams.Drain();
+  if (!drain_status.ok()) return drain_status;
+  impl_->batch_get_streams.Destroy();
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   ReleaseBatchPutExecutionState(&impl_->batch_put_execution);
   if (impl_->batch_put_transport != nullptr) {
@@ -460,7 +482,7 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   }
   KvafExecuteBatchGetKernelArgs arguments{};
   Status status = BuildBatchGetKernelArgs(
-      exec, impl_->config.npu_core_count, impl_->config.jettys_per_core,
+      exec, impl_->BatchGetCoreCount(), impl_->config.jettys_per_core,
       impl_->execution, &arguments);
   if (!status.ok()) {
     return status;
@@ -478,10 +500,11 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   arguments.channel_entity = channel_entity;
 
   const aclrtStream stream = static_cast<aclrtStream>(exec.execution.stream);
-  const int32_t launch_result = KvafExecuteBatchGetLaunch(&arguments, stream);
-  if (launch_result != KVAF_BATCH_GET_SUCCESS) {
+  arguments.block_count = impl_->config.npu_core_count;
+  const Status launch_status = impl_->batch_get_streams.Launch(arguments, stream);
+  if (!launch_status.ok()) {
     KvafBatchGetLocalBufferRelease(local_buffer);
-    return Internal("failed to launch BatchGet");
+    return launch_status;
   }
   if (exec.execution.synchronize) {
     const aclError sync_result = aclrtSynchronizeStream(stream);
@@ -489,7 +512,7 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
     if (sync_result != ACL_SUCCESS) {
       return Internal("BatchGet stream synchronization failed");
     }
-    LogBatchGetDeviceStatus(impl_->execution, impl_->config.npu_core_count);
+    LogBatchGetDeviceStatus(impl_->execution, impl_->BatchGetCoreCount());
   } else {
     // The demo transport caches zero-reference registrations until shutdown.
     // Releasing after an externally captured launch keeps KVAF graph-agnostic;
@@ -505,7 +528,7 @@ Status DefaultAccessOperator::SetBatchGetKernelProfiling(bool enabled) {
                          "AccessOperator has not been initialized");
   }
   std::vector<KvafBatchGetCoreStatus> statuses(
-      impl_->config.npu_core_count);
+      impl_->BatchGetCoreCount());
   if (enabled) {
     for (KvafBatchGetCoreStatus& status : statuses) {
       status.profile.magic = KVAF_AIV_BATCH_GET_PROFILE_MAGIC;
@@ -529,7 +552,7 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
                          "AccessOperator has not been initialized");
   }
   std::vector<KvafBatchGetCoreStatus> statuses(
-      impl_->config.npu_core_count);
+      impl_->BatchGetCoreCount());
   if (aclrtMemcpy(statuses.data(), statuses.size() * sizeof(statuses.front()),
                   impl_->execution.status, impl_->execution.status_bytes,
                   ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {

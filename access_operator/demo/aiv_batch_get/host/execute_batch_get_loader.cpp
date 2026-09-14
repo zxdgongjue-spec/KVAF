@@ -9,7 +9,9 @@
 #include "acl/acl.h"
 
 namespace {
-constexpr char kKernelName[] = "KvafExecuteBatchGetAivKernel";
+// A new symbol rejects stale binaries that would ignore the shard fields and
+// execute the full request prefix once per stream.
+constexpr char kKernelName[] = "KvafExecuteBatchGetAivKernelV2";
 constexpr uint32_t kKernelTimeoutSeconds = 180U;
 constexpr uint32_t kKernelLocalMemoryBytes =
     KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES;
@@ -54,6 +56,11 @@ extern "C" int32_t KvafExecuteBatchGetLaunch(const KvafExecuteBatchGetKernelArgs
       arguments->miss_count == 0U ||
       arguments->token_bytes == 0U || arguments->tokens_per_block == 0U ||
       arguments->jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE) {
+    return KVAF_BATCH_GET_INVALID_ARGUMENT;
+  }
+  const uint32_t shard_count = arguments->shard_count == 0U ? 1U : arguments->shard_count;
+  if (shard_count > 2U || arguments->shard_id >= shard_count ||
+      static_cast<uint64_t>(arguments->block_count) * shard_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES) {
     return KVAF_BATCH_GET_INVALID_ARGUMENT;
   }
   aclrtLaunchKernelAttr attrs[4]{};

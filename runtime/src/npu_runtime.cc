@@ -429,6 +429,7 @@ struct NpuRuntime::Impl {
     config.batch_put_kernel_object_path = options.batch_put_kernel_object_path;
     config.npu_core_count = options.npu_core_count;
     config.jettys_per_core = options.jettys_per_core;
+    config.batch_get_stream_count = options.batch_get_stream_count;
     // BatchPut is intentionally unchanged and keeps its existing two-Jetty
     // maximum when BatchGet selects three to sixty-four lanes.
     config.batch_put_jettys_per_core =
@@ -464,6 +465,10 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
       impl_->options.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->options.jettys_per_core == 0U ||
       impl_->options.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
+      (impl_->options.batch_get_stream_count != 1U &&
+       impl_->options.batch_get_stream_count != 2U) ||
+      static_cast<std::uint64_t>(impl_->options.npu_core_count) *
+              impl_->options.batch_get_stream_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->options.batch_get_token_bytes == 0U ||
       impl_->options.batch_get_tokens_per_block == 0U) {
     throw std::invalid_argument("invalid NPU Runtime configuration");
@@ -530,10 +535,10 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   }
   const std::size_t worker_count =
       static_cast<std::size_t>(impl_->options.npu_core_count) *
-      impl_->options.jettys_per_core;
+      impl_->options.batch_get_stream_count * impl_->options.jettys_per_core;
   if (explicit_eids && npu_candidates.size() > worker_count) {
     return Status::InvalidArgument(
-        "npu_eids count exceeds npu_core_count * jettys_per_core workers");
+        "npu_eids count exceeds npu_core_count * batch_get_stream_count * jettys_per_core workers");
   }
   // Automatic discovery retains the established first-working-candidate
   // behavior. An explicit list is one atomic multi-EID group: every path must
@@ -736,6 +741,9 @@ const RuntimeCore& NpuRuntime::core() const {
 std::uint32_t NpuRuntime::device_id() const { return impl_->options.device_id; }
 std::uint32_t NpuRuntime::npu_core_count() const { return impl_->options.npu_core_count; }
 std::uint32_t NpuRuntime::jettys_per_core() const { return impl_->options.jettys_per_core; }
+std::uint32_t NpuRuntime::batch_get_stream_count() const {
+  return impl_->options.batch_get_stream_count;
+}
 const std::vector<std::string>& NpuRuntime::npu_eids() const {
   return impl_->options.npu_eids;
 }

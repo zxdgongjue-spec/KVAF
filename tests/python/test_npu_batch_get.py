@@ -135,6 +135,7 @@ def main() -> int:
         os.environ.get("KVAF_NPU_CORE_COUNT", os.environ.get("KVAF_NPU_AIV_CORES", "1"))
     )
     jettys_per_core = int(os.environ.get("KVAF_NPU_JETTYS_PER_CORE", "2"))
+    stream_count = int(os.environ.get("KVAF_NPU_BATCH_GET_STREAM_COUNT", "1"))
     npu_eids = parse_npu_eids(os.environ.get("KVAF_NPU_EIDS"))
     active_percent = int(os.environ.get("KVAF_NPU_ACTIVE_PERCENT", "100"))
     warmup = int(os.environ.get("KVAF_NPU_WARMUP", "1"))
@@ -152,8 +153,10 @@ def main() -> int:
         and source_stride == block_bytes
         and npu_core_count > 0
         and npu_core_count <= requests
+        and stream_count in (1, 2)
+        and npu_core_count * stream_count <= 48
         and 1 <= jettys_per_core <= 64
-        and len(npu_eids) <= npu_core_count * jettys_per_core
+        and len(npu_eids) <= npu_core_count * stream_count * jettys_per_core
         and iterations > 0
         and 1 <= active_percent <= 100
         and graph_replays >= 0
@@ -221,6 +224,7 @@ def main() -> int:
         batch_put_kernel_object_path=str(batch_put_kernel),
         jettys_per_core=jettys_per_core,
         npu_eids=npu_eids,
+        batch_get_stream_count=stream_count,
     )
     runtime.link_to(remote_cpu_service)
     table = None
@@ -234,6 +238,7 @@ def main() -> int:
             f"token_bytes={token_bytes} tokens_per_block={tokens_per_block} "
             f"block_bytes={block_bytes} source_stride={source_stride} "
             f"npu_cores={npu_core_count} jettys_per_core={jettys_per_core} "
+            f"stream_count={stream_count} total_cores={npu_core_count * stream_count} "
             f"eid_paths={len(npu_eids) or 1} "
             f"npu_eids={','.join(npu_eids) or 'auto'} "
             "batch_put_backend=aiv_direct_hccp"
@@ -379,6 +384,31 @@ def main() -> int:
             payload_slots, token_bytes
         )
         print("RUNTIME_NPU_DYNAMIC_OUTPUT_VALIDATION_PASS sequence=A_B_A")
+
+        if stream_count == 2:
+            # Only synchronize the caller stream. A device-wide synchronize
+            # would hide a missing join from the internal BatchGet stream.
+            check_stream = torch.npu.Stream(device=device)
+            runtime.start_batch_get_kernel_profile()
+            for count in (0, 1, min(3, active_requests), active_requests, 0, active_requests):
+                with torch.npu.stream(check_stream):
+                    miss_count.fill_(count)
+                    output_a.zero_()
+                    execute(output_a, check_stream)
+                    observed = output_a.clone()  # Must run after BOTH shards.
+                check_stream.synchronize()
+                validate_output(
+                    tensor_to_bytes(observed), [1] * count + [0] * (requests - count),
+                    output_indices_values, payload_slots, token_bytes
+                )
+                profiles = list(runtime.batch_get_kernel_profile())
+                assert len(profiles) == npu_core_count * stream_count
+                assert sum(int(p["active_requests"]) for p in profiles) == count
+                for shard in range(2):
+                    expected = count * (shard + 1) // 2 - count * shard // 2
+                    assert sum(int(p["active_requests"]) for p in profiles if p["stream"] == shard) == expected
+            runtime.stop_batch_get_kernel_profile()
+            print("RUNTIME_NPU_DUAL_STREAM_VALIDATION_PASS dynamic_miss_count=1 caller_stream_join=1")
 
         for _ in range(warmup):
             execute(output_a)
@@ -627,6 +657,26 @@ def main() -> int:
                 f"p99_ms={percentile(graph_samples, 0.99):.3f} "
                 f"useful_GiBps={graph_useful_gibps:.3f}"
             )
+            if stream_count == 2:
+                # Reuse this exact captured graph with empty, one-element and
+                # odd prefixes. Neither shard's request bounds are baked into
+                # the graph; output outside the live prefix stays untouched.
+                cleared_output = bytearray(tensor_bytes(output_a))
+                graph_payload_slots = prepare_graph_inputs(0)
+                for count in (0, 1, min(3, active_requests), active_requests):
+                    graph_miss_count_host[0] = count
+                    enqueue_graph_inputs()
+                    graph.copy_host_to_device_async(
+                        int(output_a.data_ptr()), len(cleared_output),
+                        cleared_output, capture_stream,
+                    )
+                    replay_graph_on_capture_stream()
+                    graph.synchronize(capture_stream)
+                    validate_output(
+                        tensor_to_bytes(output_a), [1] * count + [0] * (requests - count),
+                        output_indices_values, graph_payload_slots, token_bytes,
+                    )
+                print("RUNTIME_NPU_DUAL_STREAM_GRAPH_VALIDATION_PASS dynamic_miss_count=1")
             graph.reset()
             graph = None
         return 0

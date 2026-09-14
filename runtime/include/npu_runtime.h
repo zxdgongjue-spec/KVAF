@@ -25,13 +25,15 @@ struct NpuRuntimeOptions {
   std::uint32_t batch_get_tokens_per_block;
   std::string batch_put_kernel_object_path;
   std::uint32_t device_id{0U};
-  std::uint32_t npu_core_count{1U};
+  std::uint32_t npu_core_count{1U};  // Per BatchGet stream.
   std::uint32_t jettys_per_core{2U};
   // Optional strict local-EID list. Empty preserves automatic discovery and
   // selects one working EID. Multiple entries create simultaneous BatchGet
   // paths and stripe core/Jetty workers over them in list order. BatchPut
   // remains on the first EID.
   std::vector<std::string> npu_eids{};
+  // Total BatchGet AIV blocks = npu_core_count * batch_get_stream_count.
+  std::uint32_t batch_get_stream_count{1U};
 };
 
 // NPU role Runtime. It owns the current MetaManager, NPU AccessOperator and
@@ -51,11 +53,13 @@ class NpuRuntime final : public Runtime {
   std::uint32_t device_id() const;
   std::uint32_t npu_core_count() const;
   std::uint32_t jettys_per_core() const;
+  std::uint32_t batch_get_stream_count() const;
   const std::vector<std::string>& npu_eids() const;
   std::uint32_t batch_get_token_bytes() const;
   std::uint32_t batch_get_tokens_per_block() const;
 
   Status SetBatchGetKernelProfiling(bool enabled);
+  // Returns stream-major profiles: [batch_get_stream_count][npu_core_count].
   Status CopyBatchGetKernelProfiles(
       std::vector<BatchGetKernelProfile>* profiles) const;
 
