@@ -282,6 +282,16 @@ Runtime 先按 Jetty-major 顺序把每个 core 的主 Jetty 分散到不同 EID
 大批量请求会随各 core/Jetty 的 32-WQE post 自然分摊；很小的请求如果没有启用所有
 Jetty，则不会产生足够 post 使用所有配置路径。
 
+性能测试可以使用 `--sort-input-indices` 对 `miss_count` 有效前缀排序。测试先通过
+`DeviceAccessTable.addresses[indices]` 查到实际远端表项，再按实际 slot ID 和
+slot 内 `offsets` 排序；`indices`、`offsets` 和 `output_indices` 使用同一排列
+同步重排。请求构造与排序不计入 BatchGet 计时：
+
+```bash
+tests/run_remote_cpu_batch_get_perf.sh /absolute/path/to/build-npu \
+  --sort-input-indices
+```
+
 `link_to()` 必须先于 `initialize()` 调用。调用方需要在 BatchGet 所在 stream 完成前保持
 输入/输出 Tensor 和 `DeviceAccessTable` 有效；Runtime 只管理内部 DDR、元数据和内部
 传输资源。
