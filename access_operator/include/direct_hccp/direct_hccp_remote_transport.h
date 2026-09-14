@@ -111,6 +111,8 @@ static_assert(EidPathIndexForWorker(0U, 4U, 1U, 8U) == 4U);
 static_assert(EidPathIndexForWorker(0U, 7U, 1U, 8U) == 7U);
 static_assert(EidPathIndexForWorker(0U, 8U, 1U, 16U) == 8U);
 static_assert(EidPathIndexForWorker(0U, 15U, 1U, 16U) == 15U);
+static_assert(EidPathIndexForWorker(0U, 32U, 1U, 64U) == 32U);
+static_assert(EidPathIndexForWorker(0U, 63U, 1U, 64U) == 63U);
 
 // One peer channel is bound to one local AIV Jetty. Runtime has already
 // selected the local EID assigned to this worker; this adapter only creates

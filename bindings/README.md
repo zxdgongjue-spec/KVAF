@@ -40,8 +40,8 @@ batch_put_kernel_object_path="", jettys_per_core=2, npu_eids=[])` 要求显式�
 字节数和每个 KV block 中的 token 数，两个参数均无默认值；
 每个 AccessTable entry 大小为两者乘积。
 `jettys_per_core` 配置 BatchGet 每个 AIV core 使用的 Jetty 数量，
-可选 1 到 16 个独立 Jetty。BatchPut 保持原有实现：该值为 1 或 2 时
-使用相同数量，BatchGet 配置为 3 到 16 时 BatchPut 仍使用 2 个。
+可选 1 到 64 个独立 Jetty。BatchPut 保持原有实现：该值为 1 或 2 时
+使用相同数量，BatchGet 配置为 3 到 64 时 BatchPut 仍使用 2 个。
 远程 CPU DDR 只增加 `runtime.link_to("CPU_IP:port")`，必须在 `initialize` 前调用。
 `npu_eids=[]` 时 EID、UMDK device 与候选 RMA 验证由 C++ Runtime 自动完成；
 显式传入多个 32 位十六进制 EID 时，Runtime 为每个 EID 创建独立
