@@ -557,13 +557,15 @@ class CpuService {
   }
 
   Result CreateChannel(const CreateChannelRequest& request, CreateChannelResponse* response) {
-    if (response == nullptr || request.local_qp_key_bytes != kNpuJettyKeyBytes ||
+    if (response == nullptr ||
+        (request.local_qp_key_bytes != kJettyKeyBytes &&
+         request.local_qp_key_bytes != kNpuJettyKeyBytes) ||
         std::all_of(request.local_eid, request.local_eid + kEidBytes,
                     [](uint8_t byte) { return byte == 0U; }) ||
         request.peer_token_value == 0U || request.local_tp_handle == 0U || request.local_psn == 0U) {
-      Log("[KVAF_CPU] CHANNEL_REJECTED key_bytes=%u expected_npu_key_bytes=%u token=0x%x npu_tp=0x%llx "
-          "npu_psn=0x%x\n",
-          request.local_qp_key_bytes, kNpuJettyKeyBytes, request.peer_token_value,
+      Log("[KVAF_CPU] CHANNEL_REJECTED key_bytes=%u expected_key_bytes=%u/%u token=0x%x peer_tp=0x%llx "
+          "peer_psn=0x%x\n",
+          request.local_qp_key_bytes, kJettyKeyBytes, kNpuJettyKeyBytes, request.peer_token_value,
           static_cast<unsigned long long>(request.local_tp_handle), request.local_psn);
       return Result::kInvalidRequest;
     }
