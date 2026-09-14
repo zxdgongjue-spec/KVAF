@@ -137,10 +137,11 @@ build_cpu() {
     -Dpybind11_DIR="$pybind11_dir" \
     -DKVAF_URMA_ROOT="$umdk_root" \
     -DKVAF_URMA_LIBRARY="$urma_library"
-  cmake --build "$build_dir" --target kvaf_cpu_service kvaf_cpu_runtime_npu_hbm_e2e kvaf_cpu_hbm_client kvaf_cpu_urma_eid_perf _kvaf --parallel "$jobs"
+  cmake --build "$build_dir" --target kvaf_cpu_service kvaf_cpu_runtime_npu_hbm_e2e kvaf_cpu_hbm_client kvaf_cpu_urma_eid_perf kvaf_cpu_urma_cpu_bw _kvaf --parallel "$jobs"
   echo "[KVAF_BUILD] CPU service: $build_dir/runtime/kvaf_cpu_service"
   echo "[KVAF_BUILD] CPU NPU-HBM client: $build_dir/runtime/kvaf_cpu_runtime_npu_hbm_e2e"
   echo "[KVAF_BUILD] CPU EID bandwidth test: $build_dir/tests/kvaf_cpu_urma_eid_perf"
+  echo "[KVAF_BUILD] CPU-to-CPU bandwidth test: $build_dir/tests/kvaf_cpu_urma_cpu_bw"
   echo "[KVAF_BUILD] CPU Python binding: $build_dir/python/kvaf"
 }
 

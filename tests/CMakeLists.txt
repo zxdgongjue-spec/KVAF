@@ -89,6 +89,10 @@ endif()
 # Runtime filtering before MetaManager and AccessOperator execution.
 
 if(KVAF_BUILD_REMOTE_CPU_SERVICE)
+  add_executable(kvaf_cpu_urma_cpu_bw cpu_urma_cpu_bw.cc)
+  target_link_libraries(kvaf_cpu_urma_cpu_bw PRIVATE kvaf_cpu_urma_transport)
+  target_compile_features(kvaf_cpu_urma_cpu_bw PRIVATE cxx_std_17)
+
   add_executable(kvaf_cpu_urma_eid_perf cpu_urma_eid_perf.cc)
   target_include_directories(kvaf_cpu_urma_eid_perf PRIVATE "${KVAF_URMA_INCLUDE_DIR}")
   target_link_libraries(kvaf_cpu_urma_eid_perf PRIVATE kvaf_cpu_urma_transport "${KVAF_URMA_LIBRARY}")
@@ -101,6 +105,8 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   target_link_libraries(kvaf_cpu_hbm_client PRIVATE kvaf_cpu_urma_transport)
   target_compile_features(kvaf_cpu_hbm_client PRIVATE cxx_std_17)
   get_filename_component(KVAF_CPU_URMA_LIBRARY_DIR "${KVAF_URMA_LIBRARY}" DIRECTORY)
+  set_property(TARGET kvaf_cpu_urma_cpu_bw APPEND PROPERTY BUILD_RPATH
+    "${KVAF_CPU_URMA_LIBRARY_DIR}")
   set_property(TARGET kvaf_cpu_hbm_client APPEND PROPERTY BUILD_RPATH
     "${KVAF_CPU_URMA_LIBRARY_DIR}")
   set_property(TARGET kvaf_cpu_urma_eid_perf APPEND PROPERTY BUILD_RPATH
