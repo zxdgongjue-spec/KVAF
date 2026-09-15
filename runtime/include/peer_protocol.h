@@ -10,9 +10,9 @@
 namespace kvaf::peer {
 
 constexpr uint32_t kProtocolMagic = 0x4b564350U;  // "KVCP"
-// Version 6 also returns the allocated candidate's device name and EID index,
-// allowing sweep reports to identify the selected K-side UB device.
-constexpr uint16_t kProtocolVersion = 6U;
+// Version 7 exposes candidate metadata before allocation so adaptive startup
+// can group EIDs by K-side UB device and benchmark each device only once.
+constexpr uint16_t kProtocolVersion = 7U;
 constexpr uint32_t kQpKeyBytes = 64U;
 constexpr uint32_t kSegKeyBytes = 64U;
 constexpr uint32_t kEidBytes = 16U;
@@ -23,6 +23,7 @@ enum class Command : uint16_t {
   kCreateChannel = 2U,
   kReleaseRegion = 3U,
   kGetCandidateCount = 4U,
+  kGetCandidateInfo = 5U,
 };
 
 enum class Result : int32_t {
@@ -59,6 +60,20 @@ struct CandidateCountResponse {
   uint32_t candidate_count;
   uint32_t device_count;
   uint32_t device_filter_applied;
+};
+
+struct CandidateInfoRequest {
+  MessageHeader header;
+  uint32_t candidate_id;
+};
+
+struct CandidateInfoResponse {
+  MessageHeader header;
+  int32_t result;
+  uint32_t candidate_id;
+  uint32_t device_id;
+  uint32_t eid_index;
+  char device_name[kDeviceNameBytes];
 };
 
 struct AllocateRegionResponse {
@@ -114,6 +129,8 @@ static_assert(sizeof(MessageHeader) == 12U, "wire header ABI changed");
 static_assert(sizeof(AllocateRegionRequest) == 36U, "allocate request ABI changed");
 static_assert(sizeof(CandidateCountRequest) == 12U, "candidate count request ABI changed");
 static_assert(sizeof(CandidateCountResponse) == 28U, "candidate count response ABI changed");
+static_assert(sizeof(CandidateInfoRequest) == 16U, "candidate info request ABI changed");
+static_assert(sizeof(CandidateInfoResponse) == 92U, "candidate info response ABI changed");
 static_assert(sizeof(AllocateRegionResponse) == 200U, "allocate response ABI changed");
 static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed");
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");

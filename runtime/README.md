@@ -143,9 +143,13 @@ runtime.initialize(ddr_bytes, kv_block_bytes)
 - 默认 `False` 保持首个连通候选即选中的行为。
 - 开启后，仅当 K 端显式传入至少一个 `--ub-device` 时执行测速，并在所有显式
   设备中选优，不限制设备数或 EID 数。K 端未指定 `--ub-device` 时，跳过测速并
-  保持原有“首个可用候选”逻辑。自动发现的本地 EID 分别尝试；显式 `npu_eids`
-  仍作为完整多 EID 组，不会拆开或回退。
-- 每个组合先完成原有 WRITE/CQ 验证，再在独立临时 region 中执行真实 BatchGet。
+  保持原有“首个可用候选”逻辑。
+- 寻优单位是 K 端 `ub-device`，不是 EID 组合。每个设备内部按 K EID、N EID 的
+  顺序尝试建链，首个通过建链和 WRITE/CQ 验证的组合代表该设备参加一次测速，
+  该设备剩余 EID 不再测试。显式 `npu_eids` 仍作为一个严格的完整多 EID 组，
+  不会拆开或回退。K 端指定 `--eid-index 0` 时，每个设备只有一个 K EID，自动
+  发现的 N EID 只作为建链回退，因此 4 个设备最多得到 4 个测速结果。
+- 每个设备的可用组合先完成原有 WRITE/CQ 验证，再在独立临时 region 中执行真实 BatchGet。
   固定标定为 `token_bytes=656, miss_count=2048, tokens_per_block=128`，与正式
   workload 的尺寸独立；core/Jetty 配置沿用业务配置。请求对 2048 个 token 做固定
   非顺序排列，输出连续，所有候选使用同一组数据与请求。
@@ -157,7 +161,8 @@ runtime.initialize(ddr_bytes, kv_block_bytes)
   支持现有 `hugetlb-2m` 页模式。每个组合完成后先销毁通道和 region，再释放 NPU
   buffer。全部探测结束后，按排名建立用户请求大小的正式 region，校验连通性，
   最优组合重建失败时尝试下一名；没有可用组合则初始化失败。
-- `UB_DEVICE_PROBE_RESULT` 记录各组合的标定结果，`UB_DEVICE_SELECTED` 记录正式
+- `UB_DEVICE_PROBE_PLAN` 记录各设备可能尝试的建链组合数，
+  `UB_DEVICE_PROBE_RESULT` 每个连通设备最多记录一次标定结果，`UB_DEVICE_SELECTED` 记录正式
   选择；用 `peer_candidate` 对照 K 端 `CANDIDATE_DISCOVERED` 的设备名称/EID。
   结果属于当前 NpuRuntime session，后续 BatchGet/BatchPut 复用该选择；不做运行中
   切换。不同 N 卡可以选不同 K 端设备。
@@ -189,12 +194,12 @@ KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 DEVICE_ID=0 \
 `ub_device`、`peer_candidate`、`peer_eid_index` 和 `npu_eids`，用 Excel 打开时可以
 直接确认整轮测试实际使用的链路。
 
-EID 组合数和建链开销仍影响总启动耗时；沿用现有传输/kernel 超时，当前不新增
+EID 组合数只影响找到每个设备首个可用链路前的回退开销；沿用现有传输/kernel 超时，当前不新增
 整个选优过程的硬时间上限。多卡同时启动会相互争抢带宽，标定效果需要在目标
 部署并发下验证。固定标定点的最优设备也不保证对所有数据尺寸都最优。
 
-**升级要求：**候选查询包含独立设备数和显式过滤标记，region 响应新增设备名称与
-EID index，控制协议升级到 v6。
+**升级要求：**候选查询包含独立设备数和显式过滤标记，region 响应返回设备名称与
+EID index，并支持在分配前查询候选所属设备，控制协议升级到 v7。
 N 端库和 K 端服务必须一起重新构建/部署，即使未开启自适应也不能混用旧协议。
 
 需要同时使用多个 NPU EID 时，设置 `NpuRuntimeOptions::npu_eids`（Python

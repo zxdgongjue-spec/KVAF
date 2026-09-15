@@ -558,8 +558,8 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                  "selection=first_working_candidate\n",
                  impl_->options.device_id, device_count);
   }
-  // EID discovery/group semantics are unchanged. With an explicit K-side
-  // device filter, every EID pair from those named devices remains eligible.
+  // An explicit N-side list remains one strict multi-EID group. Automatically
+  // discovered EIDs are connectivity fallbacks.
   const std::size_t npu_group_count = explicit_eids ? 1U : npu_candidates.size();
   std::vector<detail::StartupCandidate> candidates;
   last = detail::BuildStartupCandidates(candidate_count, npu_group_count,
@@ -803,8 +803,44 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
     impl_->ReleaseProbe();
     return Status::OK();
   };
-  return detail::SelectStartupCandidate(tune_candidates, candidates,
-                                        initialize_candidate, cleanup);
+  if (!tune_candidates) {
+    return detail::SelectStartupCandidate(false, candidates,
+                                          initialize_candidate, cleanup);
+  }
+
+  std::vector<std::vector<detail::StartupCandidate>> device_candidates(device_count);
+  std::vector<std::string> device_names(device_count);
+  for (std::uint32_t peer_candidate = 0U; peer_candidate < candidate_count;
+       ++peer_candidate) {
+    peer::PeerCandidateInfo info{};
+    last = impl_->peer_link->GetCandidateInfo(peer_candidate, &info);
+    if (!last.ok()) return last;
+    if (info.candidate_id != peer_candidate || info.device_id >= device_count) {
+      return Status::Internal("peer Runtime returned invalid candidate metadata");
+    }
+    std::string& known_name = device_names[info.device_id];
+    if (known_name.empty()) {
+      known_name = info.device_name;
+    } else if (known_name != info.device_name) {
+      return Status::Internal("peer Runtime returned inconsistent candidate device grouping");
+    }
+    auto& group = device_candidates[info.device_id];
+    for (std::size_t npu_group = 0U; npu_group < npu_group_count; ++npu_group) {
+      group.push_back(detail::StartupCandidate{peer_candidate, npu_group});
+    }
+  }
+  for (std::size_t device = 0U; device < device_candidates.size(); ++device) {
+    if (device_candidates[device].empty() || device_names[device].empty()) {
+      return Status::Internal("peer Runtime returned incomplete candidate device grouping");
+    }
+    std::fprintf(stderr,
+                 "[KVAF_AIV] UB_DEVICE_PROBE_PLAN device_id=%u peer_device_id=%zu "
+                 "ub_device=%s connectivity_pairs=%zu measurements=1\n",
+                 impl_->options.device_id, device, device_names[device].c_str(),
+                 device_candidates[device].size());
+  }
+  return detail::SelectStartupDeviceCandidate(
+      device_candidates, initialize_candidate, cleanup);
 }
 
 RuntimeCore& NpuRuntime::core() {

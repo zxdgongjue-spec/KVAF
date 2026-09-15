@@ -31,6 +31,8 @@ using kvaf::peer::AllocateRegionRequest;
 using kvaf::peer::AllocateRegionResponse;
 using kvaf::peer::CandidateCountRequest;
 using kvaf::peer::CandidateCountResponse;
+using kvaf::peer::CandidateInfoRequest;
+using kvaf::peer::CandidateInfoResponse;
 using kvaf::peer::Command;
 using kvaf::peer::CreateChannelRequest;
 using kvaf::peer::CreateChannelResponse;
@@ -275,6 +277,7 @@ class UrmaResources {
 
 struct UrmaCandidate {
   uint32_t id = 0U;
+  uint32_t device_id = 0U;
   std::string device_name;
   uint32_t eid_index = 0U;
   std::array<uint8_t, kEidBytes> eid{};
@@ -338,10 +341,16 @@ class UrmaResourcePool {
                            ? left.eid_index < right.eid_index
                            : left.device_name < right.device_name;
               });
+    uint32_t device_id = 0U;
+    std::string previous_device;
     for (uint32_t index = 0U; index < candidates_.size(); ++index) {
       UrmaCandidate& candidate = candidates_[index];
       candidate.id = index;
-      Log("[KVAF_CPU] CANDIDATE_DISCOVERED id=%u ub_device=%s eid_index=%u eid=", candidate.id,
+      if (index != 0U && candidate.device_name != previous_device) ++device_id;
+      candidate.device_id = device_id;
+      previous_device = candidate.device_name;
+      Log("[KVAF_CPU] CANDIDATE_DISCOVERED id=%u device_id=%u ub_device=%s "
+          "eid_index=%u eid=", candidate.id, candidate.device_id,
           candidate.device_name.c_str(), candidate.eid_index);
       for (uint8_t byte : candidate.eid) {
         std::fprintf(stderr, "%02x", byte);
@@ -381,6 +390,17 @@ class UrmaResourcePool {
 
   uint32_t CandidateCount() const {
     return static_cast<uint32_t>(candidates_.size());
+  }
+
+  bool GetInfo(uint32_t candidate_id, UrmaCandidate* info) const {
+    if (info == nullptr || candidate_id >= candidates_.size()) return false;
+    *info = UrmaCandidate{};
+    info->id = candidates_[candidate_id].id;
+    info->device_id = candidates_[candidate_id].device_id;
+    info->device_name = candidates_[candidate_id].device_name;
+    info->eid_index = candidates_[candidate_id].eid_index;
+    info->eid = candidates_[candidate_id].eid;
+    return true;
   }
 
   UrmaResources* Get(uint32_t candidate_id) {
@@ -495,6 +515,27 @@ class CpuService {
   }
 
   bool DeviceFilterApplied() const { return device_filter_applied_; }
+
+  Result GetCandidateInfo(uint32_t candidate_id,
+                          CandidateInfoResponse* response) const {
+    if (response == nullptr || resource_pool_ == nullptr) {
+      return Result::kInvalidRequest;
+    }
+    UrmaCandidate candidate{};
+    if (!resource_pool_->GetInfo(candidate_id, &candidate)) {
+      return Result::kNotFound;
+    }
+    if (candidate.device_name.empty() ||
+        candidate.device_name.size() >= kDeviceNameBytes) {
+      return Result::kResourceError;
+    }
+    response->candidate_id = candidate.id;
+    response->device_id = candidate.device_id;
+    response->eid_index = candidate.eid_index;
+    std::memcpy(response->device_name, candidate.device_name.c_str(),
+                candidate.device_name.size());
+    return Result::kOk;
+  }
 
   Result Allocate(uint64_t bytes, uint64_t slot_size, uint32_t candidate_id,
                   AllocateRegionResponse* response) {
@@ -917,6 +958,25 @@ void HandleClient(int fd, CpuService* service) {
       response.result = static_cast<int32_t>(response.candidate_count == 0U
                                                   ? Result::kResourceError
                                                   : Result::kOk);
+      (void)WriteAll(fd, &response, sizeof(response));
+      return;
+    }
+    case Command::kGetCandidateInfo: {
+      CandidateInfoRequest request{};
+      std::memcpy(&request, &header, sizeof(header));
+      if (!IsValidHeader(header, command, sizeof(request)) ||
+          !ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header),
+                   sizeof(request) - sizeof(header))) {
+        SendStatus(fd, command, Result::kInvalidRequest);
+        return;
+      }
+      CandidateInfoResponse response{};
+      response.header = MakeHeader(command, sizeof(response));
+      response.header.command = ResponseCommand(command);
+      response.result = static_cast<int32_t>(
+          service == nullptr
+              ? Result::kResourceError
+              : service->GetCandidateInfo(request.candidate_id, &response));
       (void)WriteAll(fd, &response, sizeof(response));
       return;
     }

@@ -90,4 +90,41 @@ Status SelectStartupCandidate(bool adaptive,
   return last;
 }
 
+// Adaptive selection treats a peer device as the performance candidate. The
+// entries within each device are connectivity fallbacks (K EID x N EID group),
+// so only the first working entry for that device is benchmarked.
+template <class Initialize, class Cleanup>
+Status SelectStartupDeviceCandidate(
+    const std::vector<std::vector<StartupCandidate>>& devices,
+    Initialize initialize, Cleanup cleanup) {
+  Status last = Status::NotFound("no usable peer device");
+  std::vector<StartupCandidate> ranked;
+  for (const auto& device : devices) {
+    for (auto candidate : device) {
+      bool device_ready = false;
+      last = initialize(candidate, true, &candidate.cycles);
+      if (last.ok()) {
+        if (std::isfinite(candidate.cycles) && candidate.cycles > 0.0) {
+          ranked.push_back(candidate);
+          device_ready = true;
+        } else {
+          last = Status::Internal("startup probe returned invalid kernel timing");
+        }
+      }
+      const Status released = cleanup();
+      if (!released.ok()) return released;
+      if (device_ready) break;
+    }
+  }
+  std::stable_sort(ranked.begin(), ranked.end(),
+                   [](const auto& a, const auto& b) { return a.cycles < b.cycles; });
+  for (auto candidate : ranked) {
+    last = initialize(candidate, false, &candidate.cycles);
+    if (last.ok()) return last;
+    const Status released = cleanup();
+    if (!released.ok()) return released;
+  }
+  return last;
+}
+
 }  // namespace kvaf::detail

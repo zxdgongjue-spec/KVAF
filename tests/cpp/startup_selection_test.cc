@@ -7,6 +7,7 @@
 
 using kvaf::Status;
 using kvaf::detail::SelectStartupCandidate;
+using kvaf::detail::SelectStartupDeviceCandidate;
 using kvaf::detail::BuildStartupCandidates;
 using kvaf::detail::ShouldTuneStartupCandidates;
 using kvaf::detail::StartupCandidate;
@@ -97,5 +98,28 @@ int main() {
   auto cleanup_failure = [&]() { return Status::Internal("cleanup failure"); };
   const auto status = SelectStartupCandidate(true, {{0, 0}, {0, 1}}, failed, cleanup_failure);
   Check(status.message() == "cleanup failure");
+
+  // EIDs and local EIDs are connectivity fallbacks within a UB device. Once
+  // one pair works, remaining pairs from that device are not benchmarked.
+  calls.clear(); releases = 0; allocated = false;
+  const std::vector<std::vector<StartupCandidate>> devices{
+      {{0, 0}, {0, 1}, {1, 0}}, {{2, 0}, {2, 1}}, {{3, 0}}};
+  auto device_initialize = [&](const StartupCandidate& c, bool measure,
+                               double* cycles) {
+    Check(!allocated); allocated = true;
+    calls.emplace_back(c.peer, c.local_group, measure);
+    *cycles = c.peer == 2 ? 20.0 : 30.0;
+    return (c.peer == 0 && c.local_group == 0)
+               ? Status::Internal("unreachable")
+               : Status::OK();
+  };
+  Check(SelectStartupDeviceCandidate(devices, device_initialize, cleanup).ok());
+  Check(calls.size() == 5);
+  Check(calls[0] == std::make_tuple(0U, std::size_t{0}, true));
+  Check(calls[1] == std::make_tuple(0U, std::size_t{1}, true));
+  Check(calls[2] == std::make_tuple(2U, std::size_t{0}, true));
+  Check(calls[3] == std::make_tuple(3U, std::size_t{0}, true));
+  Check(calls.back() == std::make_tuple(2U, std::size_t{0}, false));
+  cleanup();
   std::cout << "startup selection tests passed\n";
 }

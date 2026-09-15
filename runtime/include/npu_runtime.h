@@ -33,7 +33,8 @@ struct NpuRuntimeOptions {
   // remains on the first EID.
   std::vector<std::string> npu_eids{};
   // Opt-in startup BatchGet tuning over explicitly filtered peer devices.
-  // Without a K-side device filter, first-working selection is preserved.
+  // K/N EIDs are connectivity fallbacks; each working peer device is measured
+  // once. Without a K-side device filter, first-working selection is preserved.
   bool adaptive_ub_device{false};
   // Reuse a peer candidate selected by an earlier Runtime in the same test
   // suite. Negative keeps candidate discovery/selection enabled.
