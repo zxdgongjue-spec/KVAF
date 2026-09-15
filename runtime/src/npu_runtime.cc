@@ -571,6 +571,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       candidates.push_back(detail::StartupCandidate{peer, group});
     }
   }
+  std::vector<std::string> peer_candidate_device_names(candidate_count);
   auto initialize_candidate = [&](const detail::StartupCandidate& candidate,
                                   bool measure, double* cycles) -> Status {
     const std::uint32_t peer_candidate = candidate.peer;
@@ -752,8 +753,10 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       if (tune_candidates) {
         std::fprintf(stderr,
                      "[KVAF_AIV] UB_DEVICE_SELECTED device_id=%u peer_candidate=%u "
-                     "npu_group=%zu p50_kernel_cycles=%.0f\n",
-                     impl_->options.device_id, peer_candidate, npu_group, *cycles);
+                     "ub_device=%s npu_group=%zu p50_kernel_cycles=%.0f\n",
+                     impl_->options.device_id, peer_candidate,
+                     peer_candidate_device_names[peer_candidate].c_str(),
+                     npu_group, *cycles);
       }
       return Status::OK();
     }
@@ -802,6 +805,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
     if (info.candidate_id != peer_candidate || info.device_id >= device_count) {
       return Status::Internal("peer Runtime returned invalid candidate metadata");
     }
+    peer_candidate_device_names[peer_candidate] = info.device_name;
     std::string& known_name = device_names[info.device_id];
     if (known_name.empty()) {
       known_name = info.device_name;

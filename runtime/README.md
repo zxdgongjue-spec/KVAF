@@ -178,6 +178,9 @@ KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 DEVICE_ID=0 \
   --adaptive-ub-device --token-bytes 656 --miss-count 2048
 ```
 
+miss-count sweep 生成的 CSV 会为每个 shape 写入 `selected_ub_device` 列；未执行
+自适应选优时该列为空。
+
 EID 组合数只影响找到每个设备首个可用链路前的回退开销；沿用现有
 传输/kernel 超时，当前不新增整个选优过程的硬时间上限。多卡同时启动会相互
 争抢带宽，标定效果需要在目标部署并发下验证。当前选择只代表本次测试 shape。

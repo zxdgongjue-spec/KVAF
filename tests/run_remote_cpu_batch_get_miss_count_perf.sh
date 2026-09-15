@@ -79,6 +79,7 @@ completion_wait_mean_us_values=()
 completion_wait_p50_us_values=()
 completion_wait_p90_us_values=()
 completion_wait_p99_us_values=()
+selected_ub_device_values=()
 
 for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
   echo "BATCH_GET_TOKEN_SWEEP_BEGIN token_bytes=$token_bytes"
@@ -110,6 +111,19 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
       -z "$completion_wait_profile_result" ]]; then
       echo "ERROR: incomplete kernel profile results for token_bytes=$token_bytes miss_count=$miss_count" >&2
       exit 1
+    fi
+
+    selected_record="$(
+      awk '$1 == "[KVAF_AIV]" && $2 == "UB_DEVICE_SELECTED" { result = $0 }
+           END { print result }' "$log_file"
+    )"
+    selected_ub_device=""
+    if [[ -n "$selected_record" ]]; then
+      selected_ub_device="$(extract_field "$selected_record" ub_device)"
+      if [[ -z "$selected_ub_device" ]]; then
+        echo "ERROR: malformed UB_DEVICE_SELECTED record: $selected_record" >&2
+        exit 1
+      fi
     fi
 
     mean_ms="$(extract_field "$total_profile_result" mean_ms)"
@@ -159,11 +173,13 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
     completion_wait_p50_us_values+=("$completion_wait_p50_us")
     completion_wait_p90_us_values+=("$completion_wait_p90_us")
     completion_wait_p99_us_values+=("$completion_wait_p99_us")
+    selected_ub_device_values+=("$selected_ub_device")
 
     result=(
       "BATCH_GET_MISS_SWEEP_RESULT"
       "token_bytes=$token_bytes"
       "miss_count=$miss_count"
+      "selected_ub_device=$selected_ub_device"
       "mean_ms=$mean_ms"
       "p50_ms=$p50_ms"
       "p90_ms=$p90_ms"
@@ -242,11 +258,12 @@ echo "BATCH_GET_MISS_SWEEP_CLOCK clock_mhz=$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ conv
 mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
 {
   printf '%s\n' \
-    'token_bytes,miss_count,mean_us,p50_us,p90_us,p99_us,p50_GBps,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us'
+    'token_bytes,miss_count,selected_ub_device,mean_us,p50_us,p90_us,p99_us,p50_GBps,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us'
   for index in "${!mean_us_values[@]}"; do
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "${token_bytes_values[$index]}" \
       "${miss_count_values[$index]}" \
+      "${selected_ub_device_values[$index]}" \
       "${mean_us_values[$index]}" \
       "${p50_us_values[$index]}" \
       "${p90_us_values[$index]}" \
