@@ -22,8 +22,12 @@ class FakeWorkload:
     def prepare(self):
         if getattr(self.args, "fail_setup", -1) == self.rank:
             raise RuntimeError("injected setup failure")
-        return dict(rank=self.rank, fake=True,
-                    selected_path=dict(npu_eids=["1" * 32], cpu_candidate=(
+        eids = self.args.npu_eids or ["1" * 32]
+        if getattr(self.args, "wrong_eid_rank", -1) == self.rank:
+            eids = ["f" * 32]
+        return dict(rank=self.rank, fake=True, cpu_service=self.args.cpu_service,
+                    requested_npu_eids=self.args.npu_eids,
+                    selected_path=dict(npu_eids=eids, cpu_eid="a" * 32, cpu_candidate=(
                         self.rank if getattr(self.args, "different_paths", False) else 0)))
 
     def arm(self):
@@ -89,6 +93,26 @@ class BatchGetThroughputTest(unittest.TestCase):
         zero = [dict(phase=phase, start_ns=0, end_ns=100, payload_bytes=0, aggregate_GBps=0)
                 for phase in ("solo_0", "solo_1", "concurrent")]
         self.assertIsNone(throughput.summarize(zero)["concurrent"]["speedup_vs_best_solo"])
+        self.assertIsNone(throughput.summarize(zero)["concurrent"]["fraction_of_solo_sum"])
+        self.assertIsNone(throughput.summarize(zero)["concurrent"]["fraction_of_independent_equal_work"])
+        asymmetric = [dict(phase=phase, start_ns=0, end_ns=100,
+                           payload_bytes=bandwidth * 100, aggregate_GBps=bandwidth)
+                      for phase, bandwidth in (("solo_0", 10), ("solo_1", 20), ("concurrent", 24))]
+        combined = throughput.summarize(asymmetric)["concurrent"]
+        self.assertEqual(combined["speedup_vs_best_solo"], 1.2)
+        self.assertEqual(combined["solo_sum_GBps"], 30)
+        self.assertEqual(combined["fraction_of_solo_sum"], 0.8)
+        self.assertEqual(combined["independent_equal_work_GBps"], 20)
+        # Two equal 1000-byte jobs at 10 and 20 GB/s finish in 100 ns, so
+        # 20 GB/s aggregate means no slowdown despite being below 10 + 20.
+        independent = [dict(phase=phase, start_ns=0, end_ns=duration,
+                            payload_bytes=payload, aggregate_GBps=payload / duration)
+                       for phase, duration, payload in (("solo_0", 100, 1000),
+                                                        ("solo_1", 50, 1000),
+                                                        ("concurrent", 100, 2000))]
+        combined = throughput.summarize(independent)["concurrent"]
+        self.assertEqual(combined["fraction_of_solo_sum"], 2 / 3)
+        self.assertEqual(combined["fraction_of_independent_equal_work"], 1.0)
         with self.assertRaises(ValueError):
             throughput.aggregate_window([dict(start_ns=2, submitted_ns=1, end_ns=3, batches=1)], 10)
 
@@ -111,9 +135,45 @@ class BatchGetThroughputTest(unittest.TestCase):
                "[KVAF_AIV] PEER_LINK_EID_GROUP_SELECTED peer_candidate=1/2 npu_eids=" +
                "2" * 32 + "," + "3" * 32 + "\n")
         self.assertEqual(throughput.selected_path(log),
-                         dict(npu_eids=["2" * 32, "3" * 32], cpu_candidate=1))
+                         dict(npu_eids=["2" * 32, "3" * 32], cpu_candidate=1, cpu_eid=None))
         with self.assertRaises(RuntimeError):
             throughput.selected_path("initialization failed")
+
+    def test_cpu_eid_belongs_to_final_successful_attempt(self):
+        log = ("PEER_LINK_EID_PAIR_ATTEMPT peer_candidate=0/2\n"
+               "DIRECT_AIV_WQE_EID_ENCODING ra_host_eid=" + "a" * 32 + "\n"
+               "PEER_LINK_EID_PAIR_ATTEMPT peer_candidate=1/2\n"
+               "DIRECT_AIV_WQE_EID_ENCODING ra_host_eid=" + "b" * 32 + "\n"
+               "PEER_LINK_EID_PAIR_SELECTED peer_candidate=1/2 npu_eid=" + "1" * 32 + "\n")
+        self.assertEqual(throughput.selected_path(log),
+                         dict(npu_eids=["1" * 32], cpu_candidate=1, cpu_eid="b" * 32))
+        missing = log.replace("DIRECT_AIV_WQE_EID_ENCODING ra_host_eid=" + "b" * 32 + "\n", "")
+        self.assertIsNone(throughput.selected_path(missing)["cpu_eid"])
+
+    def test_per_process_route_options_and_precedence(self):
+        eids = ["1" * 32, "2" * 32]
+        args = self.args("--process-count", "2", "--npu-eids", "3" * 32,
+                         "--cpu-service", "shared:123", "--process-npu-eids", *eids,
+                         "--process-cpu-services", "cpu-a:123", "cpu-b:456")
+        for rank in (0, 1):
+            worker = throughput.worker_options(args, rank)
+            self.assertEqual(worker.npu_eids, [eids[rank]])
+            self.assertEqual(worker.cpu_service, ["cpu-a:123", "cpu-b:456"][rank])
+        self.assertEqual(args.npu_eids, ["3" * 32])
+        self.assertEqual(args.cpu_service, "shared:123")
+        args.process_npu_eids = None
+        self.assertEqual(throughput.worker_options(args, 1).npu_eids, ["3" * 32])
+        args.process_cpu_services = None
+        self.assertEqual(throughput.routing_mode(args), "shared")
+        self.assertEqual(throughput.worker_options(args, 1).cpu_service, "shared:123")
+        args.process_npu_eids = [[eids[0]]]
+        self.assertIsNotNone(throughput.validate_args(args))
+        args.process_npu_eids = [[eids[0]], eids]
+        args.aiv_cores = 1
+        self.assertIn("process 1", throughput.validate_args(args))
+        args.process_npu_eids = [[eids[0]], []]
+        args.process_cpu_services = ["cpu-a:123", " "]
+        self.assertIn("process 1", throughput.validate_args(args))
 
     def test_initialization_captures_native_log_and_preserves_errors(self):
         class Runtime:
@@ -126,7 +186,7 @@ class BatchGetThroughputTest(unittest.TestCase):
         log = io.StringIO()
         with contextlib.redirect_stderr(log):
             self.assertEqual(throughput.initialize_with_log(Runtime(), 1, 1, 0),
-                             dict(npu_eids=["1" * 32], cpu_candidate=0))
+                             dict(npu_eids=["1" * 32], cpu_candidate=0, cpu_eid=None))
             with self.assertRaisesRegex(RuntimeError, "initialization failed"):
                 throughput.initialize_with_log(Runtime(), 0, 1, 1)
         self.assertIn("INITIALIZE rank=0", log.getvalue())
@@ -151,6 +211,30 @@ class BatchGetThroughputTest(unittest.TestCase):
                 for validation, window in zip(validations, windows):
                     self.assertGreaterEqual(validation, window["end_ns"])
             self.assertFalse(report["kernel_profile"])
+
+    def test_spawned_workers_use_individual_routes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.args("--process-count", "2", "--repeats", "1",
+                             "--process-npu-eids", "1" * 32, "2" * 32)
+            args.trace_dir = Path(directory)
+            for services in (None, ["cpu-a:123", "cpu-b:456"]):
+                args.process_cpu_services = services
+                # Candidate IDs are service-local; this difference is allowed
+                # when routes were explicitly configured per process.
+                args.different_paths = services is not None
+                with contextlib.redirect_stdout(io.StringIO()):
+                    report = throughput.run_benchmark(args, target=fake_worker)
+                self.assertEqual(report["routing_mode"], "per_process")
+                workers = report["results"][-1]["workers"]
+                for rank, row in enumerate(workers):
+                    self.assertEqual(row["requested_npu_eids"], [str(rank + 1) * 32])
+                    self.assertEqual(row["selected_path"]["npu_eids"], [str(rank + 1) * 32])
+                    self.assertEqual(row["cpu_service"], services[rank] if services else args.cpu_service)
+                self.assertEqual(sum(row["common_window_GBps"] for row in workers),
+                                 report["results"][-1]["aggregate_GBps"])
+            args.wrong_eid_rank = 1
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, "instead of requested"):
+                throughput.run_benchmark(args, target=fake_worker)
 
     def test_single_process_and_failures(self):
         with tempfile.TemporaryDirectory() as directory:

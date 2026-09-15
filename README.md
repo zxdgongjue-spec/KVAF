@@ -381,12 +381,52 @@ python3 tests/python/test_npu_batch_get_throughput.py \
 ```
 
 将 `--process-count` 改成 `2`，并另选输出文件，即可自动测量 `solo_0`、`solo_1`、
-`concurrent` 三个阶段：两个独立进程始终使用同一张卡、同一个 CPU 服务，先全部
+`concurrent` 三个阶段：两个独立进程使用同一张卡，默认连接同一个 CPU 服务，先全部
 初始化和预热，再分别单跑和共同读取。每轮轮换阶段顺序；空闲进程不执行 NPU 工作。
 `--device-id` 默认读取 `DEVICE_ID`（缺省 0），`--cpu-service` 默认读取
 `KVAF_CPU_SERVICE_ADDR`（缺省 `127.0.0.1:28999`）。`--npu-eids` / `KVAF_NPU_EIDS`
 可显式指定两进程共同使用的本端 EID。脚本从各进程成功初始化的日志中记录实际
-NPU EID 和 CPU candidate；两进程选择不一致时停止，避免把不同路径误当作同 EID 对照。
+NPU EID、CPU candidate 和 CPU EID；日志没有 CPU EID 时记录为 `null`。
+默认共享配置模式下，两进程选择不一致时停止，避免把不同路径误当作同 EID 对照。
+
+按进程指定路由时，增加以下参数，值按进程 0、1 的顺序填写：
+
+| 参数 | 含义 |
+| --- | --- |
+| `--process-npu-eids EIDS_0 EIDS_1` | 覆盖共享 NPU EID 配置；每个值是该进程的逗号分隔 EID 列表，`""` 表示自动选择 |
+| `--process-cpu-services HOST_0:PORT_0 HOST_1:PORT_1` | 覆盖共享 CPU 服务配置，可填写相同或不同地址 |
+
+每个参数都必须恰好提供 `process-count` 个值；两个参数可分别使用。按进程参数的
+优先级高于共享参数及其环境变量。比如 `--npu-eids EID_A,EID_B` 表示**每个进程都
+使用两条 EID 路径**，而 `--process-npu-eids EID_A EID_B` 表示**两个进程各用一条路径**。
+每个进程的 EID 数仍不能超过该进程每个 transport 的 worker 数。
+
+两进程使用不同 NPU EID、连接同一个 CPU 服务（先将 `NPU_EID_A`、`NPU_EID_B`
+设置为目标机器上两个可用的 32 位十六进制 EID）：
+
+```bash
+python3 tests/python/test_npu_batch_get_throughput.py \
+  --build-dir "$PWD/build-npu" --process-count 2 \
+  --stream-count 1 --transport-count 1 --aiv-cores 2 --jettys-per-core 1 \
+  --process-npu-eids "$NPU_EID_A" "$NPU_EID_B" \
+  --cpu-service "$KVAF_CPU_SERVICE_ADDR" \
+  --miss-count 8192 --request-length 32768 --token-bytes 656 \
+  --request-bank-size 64 --iterations 20000 --repeats 3 \
+  --output-json /tmp/batch_get_different_npu_eids.json
+```
+
+要分别连接两个已经启动的 CPU 服务，将上面的 `--cpu-service` 替换为：
+
+```bash
+--process-cpu-services "$CPU_SERVICE_A" "$CPU_SERVICE_B"
+```
+
+这里 `CPU_SERVICE_A`、`CPU_SERVICE_B` 均为 `host:port`。也可只设置不同 CPU 服务，
+继续用 `--npu-eids` 指定共享的本端 EID。可组合测试“相同/不同 NPU EID × 相同/不同
+CPU 服务”。指定任一按进程参数后，`routing_mode` 为 `per_process`，允许各路实际
+路径不同，但每路显式指定的 NPU EID 必须与实际选择一致。CPU candidate 编号属于
+各自服务，不能跨服务比较编号来认定相同 CPU EID；实际 CPU EID 会写入结果。
+CPU 服务地址不同也不保证对应不同物理链路，解释结果时需结合实际 EID 和部署位置。
 
 每个进程在计时前生成固定请求库，按 `seed + rank` 设置随机种子，并轮换使用请求。
 预填表、输入排序、输出注册、逐个请求计划的正确性检查和 warmup 都在计时外。
@@ -411,7 +451,15 @@ sum(各活跃进程 iterations × miss_count × token_bytes)
 输出保留每个测量窗口及进程的单调时钟起止值、提交时间、末尾排空时间、开始/结束
 偏差和对共同窗口的带宽贡献。`host_window_overlap_fraction` 只是主机计时窗口的
 重叠比例，不代表 kernel 或链路实际重叠。汇总吞吐按总字节数除以总窗口时间计算，
-并报告双进程相对较快单跑进程的吞吐比。原始结果以 `BATCH_GET_THROUGHPUT_RESULT`
+并报告双进程相对较快单跑进程的吞吐比 `speedup_vs_best_solo`。对于能力不同的两条
+路径，还可查看 `solo_sum_GBps`（两路各自单跑吞吐之和）和 `fraction_of_solo_sum`
+（并发聚合吞吐除以上述和）。但本实验两路工作量相同，快的一路会先结束，所以没有
+争用时的预计聚合吞吐是 `2 × min(两路单跑吞吐)`，而不是两者之和。结果将它记录为
+`independent_equal_work_GBps`，并提供 `fraction_of_independent_equal_work` 与实际
+聚合吞吐对比。例如两路单跑分别 20、40 GB/s，各读取相同字节数，互不干扰时聚合
+吞吐也是 40 GB/s，不能因低于 60 GB/s 就认定存在并发退化。这些比值都不是物理
+链路利用率。每阶段的 worker 结果包含 CPU 服务地址、请求的 NPU EID 和实际选择的
+路径，便于独立比较日志。原始结果以 `BATCH_GET_THROUGHPUT_RESULT`
 逐阶段打印；指定的 JSON 在所有阶段成功并释放资源后写入，复用同名文件会覆盖。
 
 只有所有活跃进程完成计时后，才执行最后一个请求计划的输出检查，避免快的一路校验

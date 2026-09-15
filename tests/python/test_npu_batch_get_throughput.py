@@ -2,7 +2,7 @@
 """Continuous BatchGet throughput, with no per-batch profiling or host sync.
 
 Run directly with --build-dir /path/to/build-npu. Two processes run solo_0,
-solo_1 and concurrent phases against the same CPU service. Preparation and
+solo_1 and concurrent phases with shared or per-process EIDs/CPU services. Preparation and
 validation never overlap another worker's measured phase. Native KVAF and
 PyTorch are imported only inside spawned workers, after selecting the build.
 """
@@ -36,7 +36,14 @@ def parse_args(argv=None):
     parser.add_argument("--transport-count", type=int, choices=(1, 2),
                         default=int(os.environ.get("KVAF_NPU_BATCH_GET_TRANSPORT_COUNT", "1")))
     parser.add_argument("--npu-eids", type=parse_npu_eids,
-                        default=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")))
+                        default=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")),
+                        help="shared default local EID list for all processes")
+    parser.add_argument("--process-npu-eids", type=parse_npu_eids, nargs="+", metavar="EIDS",
+                        help="one comma-separated EID list per process, in rank order; "
+                             "overrides --npu-eids/KVAF_NPU_EIDS; use an empty string for auto")
+    parser.add_argument("--process-cpu-services", nargs="+", metavar="HOST:PORT",
+                        help="one CPU service per process, in rank order; "
+                             "overrides --cpu-service/KVAF_CPU_SERVICE_ADDR")
     for name, default, help_text in (
         ("request-length", 8192, "request array and output capacity per process"),
         ("miss-count", 8192, "requests per BatchGet PER PROCESS, partitioned across its streams"),
@@ -71,6 +78,21 @@ def parse_args(argv=None):
     return args
 
 
+def worker_options(args, rank):
+    """Resolve routing once before spawn; preserve shared defaults otherwise."""
+    resolved = argparse.Namespace(**vars(args))
+    resolved.npu_eids = list(args.npu_eids if args.process_npu_eids is None
+                             else args.process_npu_eids[rank])
+    resolved.cpu_service = (args.cpu_service if args.process_cpu_services is None
+                            else args.process_cpu_services[rank])
+    return resolved
+
+
+def routing_mode(args):
+    return ("shared" if args.process_npu_eids is None and args.process_cpu_services is None
+            else "per_process")
+
+
 def validate_args(args):
     for name in ("request_length", "table_capacity", "tokens_per_block", "token_bytes"):
         if not 1 <= getattr(args, name) <= (1 << 31) - 1:
@@ -87,9 +109,17 @@ def validate_args(args):
         return "two transports require two streams"
     if not 1 <= args.jettys_per_core <= 64:
         return "jettys-per-core must be in [1, 64]"
+    for name in ("process_npu_eids", "process_cpu_services"):
+        values = getattr(args, name)
+        if values is not None and len(values) != args.process_count:
+            return f"{name.replace('_', '-')} requires exactly {args.process_count} values in rank order"
     workers = args.aiv_cores * args.stream_count * args.jettys_per_core
-    if len(args.npu_eids) > workers // args.transport_count:
-        return "npu-eids count exceeds workers per transport"
+    for rank in range(args.process_count):
+        options = worker_options(args, rank)
+        if len(options.npu_eids) > workers // args.transport_count:
+            return f"process {rank}: npu-eids count exceeds workers per transport"
+        if not options.cpu_service.strip():
+            return f"process {rank}: cpu-service must name the remote CPU service"
     for name in ("iterations", "repeats", "request_bank_size", "populate_chunk_entries"):
         if getattr(args, name) <= 0:
             return f"{name.replace('_', '-')} must be positive"
@@ -97,8 +127,6 @@ def validate_args(args):
         return "warmup, device-id and seed must be non-negative"
     if not 0 < args.timeout_seconds < float("inf"):
         return "timeout-seconds must be finite and positive"
-    if not args.cpu_service:
-        return "cpu-service must name the remote CPU service"
     return None
 
 
@@ -145,12 +173,47 @@ def aggregate_window(measurements, payload_per_batch):
 
 def selected_path(log):
     """Use the final successful Runtime selection, not an abandoned probe."""
-    for line in reversed(log.splitlines()):
+    remote_eid = None
+    result = None
+    for line in log.splitlines():
+        if "PEER_LINK_EID_PAIR_ATTEMPT " in line or "PEER_LINK_EID_GROUP_ATTEMPT " in line:
+            remote_eid = None
+        if "DIRECT_AIV_WQE_EID_ENCODING " in line:
+            fields = dict(part.split("=", 1) for part in line.split() if "=" in part)
+            eids = parse_npu_eids(fields.get("ra_host_eid"))
+            if len(eids) != 1:
+                raise RuntimeError("invalid CPU EID in Runtime initialization log")
+            remote_eid = eids[0]
         if "PEER_LINK_EID_PAIR_SELECTED " in line or "PEER_LINK_EID_GROUP_SELECTED " in line:
             fields = dict(part.split("=", 1) for part in line.split() if "=" in part)
-            return dict(npu_eids=parse_npu_eids(fields.get("npu_eids", fields.get("npu_eid"))),
-                        cpu_candidate=int(fields["peer_candidate"].split("/")[0]))
+            result = dict(npu_eids=parse_npu_eids(fields.get("npu_eids", fields.get("npu_eid"))),
+                          cpu_candidate=int(fields["peer_candidate"].split("/")[0]),
+                          cpu_eid=remote_eid)
+    if result is not None:
+        if not result["npu_eids"] or result["cpu_candidate"] < 0:
+            raise RuntimeError("invalid selected EID path in Runtime initialization log")
+        return result
     raise RuntimeError("Runtime did not log its selected EID path; inspect initialization output")
+
+
+def verify_worker_routes(args, ready):
+    paths = []
+    for rank, row in ready.items():
+        options = worker_options(args, rank)
+        configuration = row["configuration"]
+        path = configuration["selected_path"]
+        if configuration["cpu_service"] != options.cpu_service:
+            raise RuntimeError(f"worker {rank} connected to an unexpected CPU service")
+        if options.npu_eids and path["npu_eids"] != options.npu_eids:
+            raise RuntimeError(f"worker {rank} selected NPU EIDs {path['npu_eids']} "
+                               f"instead of requested {options.npu_eids}")
+        paths.append(path)
+    # Default mode remains a same-path comparison. Explicit per-process routes
+    # can select different paths; CPU candidate IDs are scoped to each service.
+    if routing_mode(args) == "shared" and any(path != paths[0] for path in paths):
+        raise RuntimeError("workers selected different NPU EIDs or CPU candidates; "
+                           "set --npu-eids for a shared path, or use "
+                           "--process-npu-eids/--process-cpu-services for different paths")
 
 
 def initialize_with_log(runtime, ddr_bytes, block_bytes, rank):
@@ -257,6 +320,8 @@ class NpuWorkload:
             self.submit(self.plans[index % len(self.plans)])
         torch.npu.synchronize()
         return dict(rank=self.rank, pid=os.getpid(), seed=args.seed + self.rank,
+                    cpu_service=args.cpu_service, requested_npu_eids=args.npu_eids,
+                    device_id=args.device_id,
                     selected_path=path, remote_region=dict(self.runtime.remote_region),
                     stream_count=self.runtime.batch_get_stream_count,
                     transport_count=self.runtime.batch_get_transport_count,
@@ -386,17 +451,14 @@ def run_benchmark(args, target=worker_entry):
     try:
         for rank in range(args.process_count):
             parent, child = context.Pipe()
-            process = context.Process(target=target, args=(args, rank, child))
+            process = context.Process(target=target, args=(worker_options(args, rank), rank, child))
             process.start()
             child.close()
             connections[rank] = parent
             processes.append(process)
         ready = receive_stage(connections, "ready", args.timeout_seconds)
         print("BATCH_GET_THROUGHPUT_READY " + json.dumps(ready, sort_keys=True), flush=True)
-        paths = [row["configuration"]["selected_path"] for row in ready.values()]
-        if any(path != paths[0] for path in paths):
-            raise RuntimeError("workers selected different NPU EIDs or CPU candidates; "
-                               "set --npu-eids explicitly and inspect the CPU candidate logs")
+        verify_worker_routes(args, ready)
         phases = [("single", [0])] if args.process_count == 1 else [
             ("solo_0", [0]), ("solo_1", [1]), ("concurrent", [0, 1])]
         for repeat in range(args.repeats):
@@ -416,8 +478,14 @@ def run_benchmark(args, target=worker_entry):
                 measurements = [measured[rank]["measurement"] for rank in ranks]
                 if any(row["batches"] != args.iterations for row in measurements):
                     raise RuntimeError("worker reported an incomplete submission count")
+                for measurement in measurements:
+                    configuration = ready[measurement["rank"]]["configuration"]
+                    measurement.update(cpu_service=configuration["cpu_service"],
+                                       requested_npu_eids=configuration["requested_npu_eids"],
+                                       selected_path=configuration["selected_path"])
                 row = aggregate_window(measurements, args.miss_count * args.token_bytes)
                 row.update(repeat=repeat, phase=phase, active_processes=len(ranks),
+                           routing_mode=routing_mode(args),
                            total_aiv_cores=len(ranks) * args.stream_count * args.aiv_cores,
                            total_jettys=len(ranks) * args.stream_count * args.aiv_cores * args.jettys_per_core,
                            postflight_pass=True)
@@ -433,7 +501,7 @@ def run_benchmark(args, target=worker_entry):
         return dict(configuration={key: str(value) if isinstance(value, Path) else value
                                    for key, value in vars(args).items()},
                     workers=[ready[rank]["configuration"] for rank in sorted(ready)],
-                    results=results, summary=summarize(results),
+                    results=results, summary=summarize(results), routing_mode=routing_mode(args),
                     timing="host_monotonic_union_including_submission_and_final_drain",
                     units="decimal_GB_per_second", kernel_profile=False,
                     validation="all_plans_before_timing_and_last_plan_after_each_window")
@@ -461,9 +529,22 @@ def summarize(results):
             min_GBps=min(row["aggregate_GBps"] for row in rows),
             max_GBps=max(row["aggregate_GBps"] for row in rows))
     if "concurrent" in summary:
-        best_solo = max(summary["solo_0"]["aggregate_GBps"], summary["solo_1"]["aggregate_GBps"])
+        solo_rates = [summary[phase]["aggregate_GBps"] for phase in ("solo_0", "solo_1")]
+        best_solo = max(solo_rates)
+        solo_sum = sum(solo_rates)
         summary["concurrent"]["speedup_vs_best_solo"] = (
             summary["concurrent"]["aggregate_GBps"] / best_solo if best_solo else None)
+        summary["concurrent"]["solo_sum_GBps"] = solo_sum
+        summary["concurrent"]["fraction_of_solo_sum"] = (
+            summary["concurrent"]["aggregate_GBps"] / solo_sum if solo_sum else None)
+        # Each worker reads the same number of bytes. Even without contention,
+        # the faster worker finishes early: the union window lasts as long as
+        # the slower solo run. Its ideal aggregate rate is 2 * min(solo rates),
+        # not their sum. This matters when EIDs/services have different speeds.
+        independent_rate = 2 * min(solo_rates)
+        summary["concurrent"]["independent_equal_work_GBps"] = independent_rate
+        summary["concurrent"]["fraction_of_independent_equal_work"] = (
+            summary["concurrent"]["aggregate_GBps"] / independent_rate if independent_rate else None)
     return summary
 
 
