@@ -2,11 +2,13 @@
 
 #include <pybind11/stl.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -89,13 +91,17 @@ NpuTensorView GetNpuTensorView(const py::object& tensor, const char* name) {
       tensor.attr("shape").cast<std::vector<py::ssize_t>>()};
 }
 
-std::vector<KeyId> CopyPrepareKeys(const py::object& keys) {
+void CopyPrepareKeysInto(const py::object& keys, std::vector<KeyId>* result) {
+  if (result == nullptr) {
+    throw std::invalid_argument("key output must not be null");
+  }
   // A full AccessTable can contain millions of keys. Accepting a CPU int64
   // Tensor avoids Pybind iterating millions of Python int objects before the
   // Runtime control plane even starts. Runtime's C++ API still owns a vector
   // snapshot, so this performs one contiguous 8-byte copy per key.
   if (!py::hasattr(keys, "data_ptr")) {
-    return keys.cast<std::vector<KeyId>>();
+    *result = keys.cast<std::vector<KeyId>>();
+    return;
   }
   if (!py::hasattr(keys, "numel") || !py::hasattr(keys, "element_size") ||
       !py::hasattr(keys, "is_contiguous") || !py::hasattr(keys, "device") ||
@@ -119,7 +125,60 @@ std::vector<KeyId> CopyPrepareKeys(const py::object& keys) {
   if (data == nullptr) {
     throw py::value_error("PrepareAccessTable Tensor keys must have storage");
   }
-  return std::vector<KeyId>{data, data + static_cast<std::size_t>(count)};
+  const std::size_t size = static_cast<std::size_t>(count);
+  result->resize(size);
+  std::copy(data, data + size, result->begin());
+}
+
+std::vector<KeyId> CopyPrepareKeys(const py::object& keys) {
+  std::vector<KeyId> result;
+  CopyPrepareKeysInto(keys, &result);
+  return result;
+}
+
+void CopyCpuUint64SequenceInto(const py::object& values, const char* name,
+                               std::vector<std::uint64_t>* result) {
+  if (result == nullptr) {
+    throw std::invalid_argument("sequence output must not be null");
+  }
+  if (!py::hasattr(values, "data_ptr")) {
+    *result = values.cast<std::vector<std::uint64_t>>();
+    return;
+  }
+  if (!py::hasattr(values, "numel") ||
+      !py::hasattr(values, "element_size") ||
+      !py::hasattr(values, "is_contiguous") ||
+      !py::hasattr(values, "device") ||
+      !py::hasattr(values, "dim") || !py::hasattr(values, "dtype")) {
+    throw py::type_error(std::string(name) +
+                         " must be a sequence or CPU int64 Tensor");
+  }
+  if (!values.attr("is_contiguous")().cast<bool>() ||
+      values.attr("dim")().cast<int>() != 1 ||
+      py::str(values.attr("device")).cast<std::string>() != "cpu" ||
+      py::str(values.attr("dtype")).cast<std::string>() != "torch.int64" ||
+      values.attr("element_size")().cast<std::size_t>() != sizeof(std::int64_t)) {
+    throw py::value_error(std::string(name) +
+                          " Tensor must be contiguous CPU torch.int64 with one dimension");
+  }
+  const std::uint64_t count = values.attr("numel")().cast<std::uint64_t>();
+  if (count == 0 || count > std::numeric_limits<std::size_t>::max()) {
+    throw py::value_error(std::string(name) + " must be non-empty");
+  }
+  const auto* data = static_cast<const std::int64_t*>(
+      PointerFromValue(values.attr("data_ptr")().cast<std::uint64_t>()));
+  if (data == nullptr) {
+    throw py::value_error(std::string(name) + " Tensor must have storage");
+  }
+  const std::size_t size = static_cast<std::size_t>(count);
+  result->resize(size);
+  for (std::size_t index = 0; index < size; ++index) {
+    if (data[index] < 0) {
+      throw py::value_error(std::string(name) +
+                            " must not contain negative values");
+    }
+    (*result)[index] = static_cast<std::uint64_t>(data[index]);
+  }
 }
 
 class DeviceAccessTable final {
@@ -204,34 +263,30 @@ class NpuPythonRuntime final {
   // metadata describes its variable-size blocks for the duration of
   // Runtime::BatchPut. When batch_put_kernel_object_path was configured,
   // the Direct-HCCP implementation synchronously completes this stream.
-  void BatchPut(const std::vector<KeyId>& keys, const py::object& source,
-                const std::vector<std::uint64_t>& input_offsets,
-                const std::vector<std::uint64_t>& lengths,
+  void BatchPut(const py::object& keys, const py::object& source,
+                const py::object& input_offsets, const py::object& lengths,
                 const py::object& stream) {
     if (!Initialized()) {
       throw std::runtime_error("Runtime has not been initialized");
     }
-    if (keys.empty() || keys.size() != input_offsets.size() ||
-        keys.size() != lengths.size()) {
+    CopyPrepareKeysInto(keys, &batch_put_request_.keys);
+    CopyCpuUint64SequenceInto(input_offsets, "BatchPut input_offsets",
+                              &batch_put_request_.input_offsets);
+    CopyCpuUint64SequenceInto(lengths, "BatchPut lengths",
+                              &batch_put_request_.lengths);
+    if (batch_put_request_.keys.empty() ||
+        batch_put_request_.keys.size() !=
+            batch_put_request_.input_offsets.size() ||
+        batch_put_request_.keys.size() != batch_put_request_.lengths.size()) {
       throw py::value_error(
           "BatchPut keys, input_offsets, and lengths must be non-empty and equal in size");
     }
     const NpuTensorView source_view = GetNpuTensorView(source, "BatchPut source");
-    for (std::size_t index = 0; index < keys.size(); ++index) {
-      const std::uint64_t offset = input_offsets[index];
-      const std::uint64_t length = lengths[index];
-      if (length == 0 || offset > source_view.bytes ||
-          length > source_view.bytes - offset) {
-        throw py::value_error(
-            "BatchPut input_offsets and lengths must describe bytes inside source");
-      }
-    }
     const aclrtStream acl_stream = ResolveStream(stream);
-    ThrowIfError(native_->core().BatchPut(BatchPutRequest{
-        keys,
-        ConstBufferView{source_view.data, source_view.bytes, DeviceKind::kNpu},
-        input_offsets,
-        lengths}, BatchPutExecutionOptions{acl_stream}));
+    batch_put_request_.input =
+        ConstBufferView{source_view.data, source_view.bytes, DeviceKind::kNpu};
+    ThrowIfError(native_->core().BatchPut(
+        batch_put_request_, BatchPutExecutionOptions{acl_stream}));
   }
 
   AccessTableHandle PrepareAccessTable(const py::object& keys) {
@@ -457,6 +512,9 @@ class NpuPythonRuntime final {
 
  private:
   std::unique_ptr<::kvaf::NpuRuntime> native_;
+  // Runtime::BatchPut is synchronous, so these vectors can be reused after
+  // each call and avoid allocator churn in the measured loop.
+  BatchPutRequest batch_put_request_;
 };
 
 }  // namespace
@@ -497,8 +555,9 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("batch_put", &NpuPythonRuntime::BatchPut, py::arg("keys"),
            py::arg("source"), py::arg("input_offsets"), py::arg("lengths"),
            py::arg("stream") = py::none(),
-           "Synchronously write variable-size packed NPU blocks. input_offsets and "
-           "lengths are CPU integer sequences with one entry per key; "
+           "Synchronously write variable-size packed NPU blocks. keys, input_offsets, and "
+           "lengths are CPU integer sequences or contiguous CPU int64 tensors "
+           "with one entry per key; "
            "stream=None uses torch.npu.current_stream().")
       .def("prepare_access_table", &NpuPythonRuntime::PrepareAccessTable,
            py::arg("keys"))

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <utility>
@@ -61,8 +62,10 @@ struct BatchPutExecutionState {
   void* metadata{nullptr};
   void* core_status{nullptr};
   std::size_t metadata_capacity{0};
-  std::vector<std::uint64_t> host_metadata;
-  std::vector<KvafBatchPutCoreStatus> host_core_status;
+  void* host_metadata{nullptr};
+  std::size_t host_metadata_capacity{0};
+  KvafBatchPutCoreStatus* host_core_status{nullptr};
+  std::size_t host_core_status_count{0};
   bool profiling_enabled{false};
   bool host_profiling_enabled{false};
   BatchPutHostProfile last_host_profile{};
@@ -78,6 +81,12 @@ void ReleaseBatchPutExecutionState(BatchPutExecutionState* execution) {
   if (execution->metadata != nullptr) {
     (void)aclrtFree(execution->metadata);
   }
+  if (execution->host_core_status != nullptr) {
+    (void)aclrtFreeHost(execution->host_core_status);
+  }
+  if (execution->host_metadata != nullptr) {
+    (void)aclrtFreeHost(execution->host_metadata);
+  }
   *execution = BatchPutExecutionState{};
 }
 
@@ -87,9 +96,17 @@ Status InitializeBatchPutExecutionState(std::uint32_t npu_core_count,
     return InvalidArgument("invalid BatchPut execution state");
   }
   BatchPutExecutionState state;
-  state.host_core_status.resize(npu_core_count);
   const std::size_t status_bytes =
       static_cast<std::size_t>(npu_core_count) * sizeof(KvafBatchPutCoreStatus);
+  void* host_core_status = nullptr;
+  if (aclrtMallocHost(&host_core_status, status_bytes) != ACL_SUCCESS ||
+      host_core_status == nullptr) {
+    return Internal("failed to allocate pinned BatchPut core status buffer");
+  }
+  state.host_core_status =
+      static_cast<KvafBatchPutCoreStatus*>(host_core_status);
+  state.host_core_status_count = npu_core_count;
+  std::memset(state.host_core_status, 0, status_bytes);
   if (aclrtMalloc(&state.core_status, status_bytes,
                   ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
       aclrtMemset(state.core_status, status_bytes, 0, status_bytes) != ACL_SUCCESS) {
@@ -107,12 +124,23 @@ Status EnsureBatchPutMetadataCapacity(std::size_t rows,
                  (3U * sizeof(std::uint64_t))) {
     return InvalidArgument("BatchPut metadata dimensions are invalid");
   }
-  execution->host_metadata.resize(rows * 3U);
+  const std::size_t bytes = rows * 3U * sizeof(std::uint64_t);
+  if (rows > execution->host_metadata_capacity) {
+    void* host_metadata = nullptr;
+    if (aclrtMallocHost(&host_metadata, bytes) != ACL_SUCCESS ||
+        host_metadata == nullptr) {
+      return Internal("failed to grow pinned BatchPut host metadata buffer");
+    }
+    if (execution->host_metadata != nullptr) {
+      (void)aclrtFreeHost(execution->host_metadata);
+    }
+    execution->host_metadata = host_metadata;
+    execution->host_metadata_capacity = rows;
+  }
   if (rows <= execution->metadata_capacity) {
     return Status::OK();
   }
 
-  const std::size_t bytes = rows * 3U * sizeof(std::uint64_t);
   void* metadata = nullptr;
   if (aclrtMalloc(&metadata, bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
     return Internal("failed to grow BatchPut device metadata buffers");
@@ -531,7 +559,8 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
     }
     const HostClock::time_point metadata_pack_begin =
         host_profiling ? HostClock::now() : HostClock::time_point{};
-    std::uint64_t* const host_offsets = execution.host_metadata.data();
+    std::uint64_t* const host_offsets =
+        static_cast<std::uint64_t*>(execution.host_metadata);
     std::uint64_t* const host_lengths = host_offsets + rows;
     std::uint64_t* const host_destinations = host_lengths + rows;
     std::copy(exec.request->input_offsets.begin(),
@@ -550,17 +579,6 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
     if (host_profiling) {
       host_profile.metadata_bytes = metadata_bytes;
     }
-    const HostClock::time_point metadata_h2d_begin =
-        host_profiling ? HostClock::now() : HostClock::time_point{};
-    if (aclrtMemcpy(execution.metadata, metadata_bytes,
-                    execution.host_metadata.data(), metadata_bytes,
-                    ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
-      return Internal("failed to upload BatchPut metadata to NPU");
-    }
-    if (host_profiling) {
-      host_profile.metadata_h2d_ns =
-          ElapsedNs(metadata_h2d_begin, HostClock::now());
-    }
 
     KvafBatchPutLocalBuffer* local_buffer = nullptr;
     const HostClock::time_point local_buffer_acquire_begin =
@@ -576,6 +594,7 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
           ElapsedNs(local_buffer_acquire_begin, HostClock::now());
     }
 
+    const aclrtStream stream = static_cast<aclrtStream>(exec.execution.stream);
     KvafExecuteBatchPutKernelArgs arguments{};
     arguments.input = PointerValue(exec.request->input.data);
     arguments.input_offsets = PointerValue(execution.metadata);
@@ -590,22 +609,43 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
     arguments.row_count = static_cast<std::uint32_t>(rows);
     arguments.aiv_core_count = impl_->config.npu_core_count;
 
-    for (KvafBatchPutCoreStatus& core_status : execution.host_core_status) {
-      core_status = KvafBatchPutCoreStatus{};
+    std::memset(execution.host_core_status, 0,
+                execution.host_core_status_count *
+                    sizeof(KvafBatchPutCoreStatus));
+    for (std::size_t core = 0; core < execution.host_core_status_count;
+         ++core) {
+      KvafBatchPutCoreStatus& core_status = execution.host_core_status[core];
       if (execution.profiling_enabled) {
         core_status.profile.magic = KVAF_AIV_BATCH_PUT_PROFILE_MAGIC;
       }
     }
+    const HostClock::time_point metadata_h2d_begin =
+        host_profiling ? HostClock::now() : HostClock::time_point{};
+    if (aclrtMemcpyAsync(execution.metadata, metadata_bytes,
+                         execution.host_metadata, metadata_bytes,
+                         ACL_MEMCPY_HOST_TO_DEVICE, stream) != ACL_SUCCESS) {
+      KvafBatchPutLocalBufferRelease(local_buffer);
+      return Internal("failed to enqueue BatchPut metadata upload to NPU");
+    }
+    if (host_profiling) {
+      host_profile.metadata_h2d_ns =
+          ElapsedNs(metadata_h2d_begin, HostClock::now());
+    }
+
     const HostClock::time_point execute_sync_begin =
         host_profiling ? HostClock::now() : HostClock::time_point{};
     const int32_t result = KvafExecuteBatchPutSync(
-        local_buffer, &arguments,
-        static_cast<aclrtStream>(exec.execution.stream),
-        execution.host_core_status.data(),
-        static_cast<std::uint32_t>(execution.host_core_status.size()));
+        local_buffer, &arguments, stream, execution.host_core_status,
+        static_cast<std::uint32_t>(execution.host_core_status_count));
     if (host_profiling) {
       host_profile.execute_sync_ns =
           ElapsedNs(execute_sync_begin, HostClock::now());
+    }
+    if (result != KVAF_BATCH_PUT_SUCCESS) {
+      // The metadata upload may have been accepted even when launch or status
+      // setup subsequently failed. Do not reuse its pinned source buffer until
+      // the stream has stopped reading it.
+      (void)aclrtSynchronizeStream(stream);
     }
     const HostClock::time_point local_buffer_release_begin =
         host_profiling ? HostClock::now() : HostClock::time_point{};
@@ -725,11 +765,16 @@ Status DefaultAccessOperator::CopyBatchPutKernelProfiles(
     return Status::Error(StatusCode::kNotInitialized,
                          "BatchPut transport has not been initialized");
   }
-  const std::vector<KvafBatchPutCoreStatus>& statuses =
-      impl_->batch_put_execution.host_core_status;
+  const BatchPutExecutionState& execution = impl_->batch_put_execution;
+  const KvafBatchPutCoreStatus* statuses = execution.host_core_status;
+  const std::size_t status_count = execution.host_core_status_count;
+  if (statuses == nullptr || status_count == 0U) {
+    return Internal("BatchPut host core status buffer is not initialized");
+  }
   profiles->clear();
-  profiles->reserve(statuses.size());
-  for (const KvafBatchPutCoreStatus& status : statuses) {
+  profiles->reserve(status_count);
+  for (std::size_t core = 0; core < status_count; ++core) {
+    const KvafBatchPutCoreStatus& status = statuses[core];
     const KvafBatchPutCoreProfile& source = status.profile;
     if (status.magic != KVAF_AIV_BATCH_PUT_STATUS_MAGIC ||
         status.result != KVAF_BATCH_PUT_CORE_SUCCESS ||

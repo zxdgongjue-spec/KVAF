@@ -67,7 +67,7 @@ class MetaManager {
   // 将 PreparePut 预留的地址正式提交为可见映射。
   virtual Status CommitPut(const PutContext& put_context) = 0;
 
-  // 放弃一次尚未提交的 put，并把预留 slot 归还到空闲队列。
+  // 放弃一次尚未提交的 put，并把预留 slot 归还到空闲 slot 池。
   virtual Status AbortPut(const PutContext& put_context) = 0;
 
   // 为一批 key 建立稳定读快照。
@@ -85,7 +85,7 @@ class MetaManager {
   // 释放稳定读快照，解除对应记录的 pin。
   virtual Status UnlockKeys(const LockContext& lock_context) = 0;
 
-  // 释放一批 key 当前占用的 slot，并放回空闲队列。
+  // 释放一批 key 当前占用的 slot，并放回空闲 slot 池。
   virtual Status BatchFree(const std::vector<KeyId>& flat_keys) = 0;
 };
 

@@ -234,6 +234,55 @@ void ReleaseTransport(KvafBatchPutTransport *transport) {
   if (transport == nullptr) {
     return;
   }
+
+  // Queue objects can retain references to the local entity table and HBM MR.
+  // Retire every imported Jetty, SQ and CQ before releasing any of those
+  // dependent allocations.  If a queue cannot be retired, retain the complete
+  // transport for process exit rather than freeing memory the driver may still
+  // dereference.
+  bool queues_retired = true;
+  if (transport->api.qp_unimport != nullptr) {
+    for (uint32_t index = 0U; index < transport->worker_count; ++index) {
+      DirectAivWorker &worker = transport->workers[index];
+      if (transport->device_context != nullptr && worker.device_peer_target_jetty != nullptr) {
+        if (transport->api.qp_unimport(transport->device_context,
+                                       worker.device_peer_target_jetty) != 0) {
+          queues_retired = false;
+        } else {
+          worker.device_peer_target_jetty = nullptr;
+        }
+      }
+    }
+  }
+  if (queues_retired && transport->api.qp_destroy != nullptr) {
+    for (uint32_t index = 0U; index < transport->worker_count; ++index) {
+      DirectAivWorker &worker = transport->workers[index];
+      if (worker.device_user_ctl_jetty.handle != nullptr) {
+        if (transport->api.qp_destroy(worker.device_user_ctl_jetty.handle) != 0) {
+          queues_retired = false;
+        } else {
+          worker.device_user_ctl_jetty.handle = nullptr;
+        }
+      }
+    }
+  }
+  if (queues_retired && transport->api.cq_destroy != nullptr) {
+    for (uint32_t index = 0U; index < transport->worker_count; ++index) {
+      DirectAivWorker &worker = transport->workers[index];
+      if (transport->device_context != nullptr && worker.device_user_ctl_cq != nullptr) {
+        if (transport->api.cq_destroy(transport->device_context,
+                                      worker.device_user_ctl_cq) != 0) {
+          queues_retired = false;
+        } else {
+          worker.device_user_ctl_cq = nullptr;
+        }
+      }
+    }
+  }
+  if (!queues_retired) {
+    return;
+  }
+
   for (const auto &local : transport->local_buffers) {
     if (local->device_entities != nullptr) {
       (void)aclrtFree(local->device_entities);
@@ -561,16 +610,17 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
         profiling_enabled ||
         core_status[core].profile.magic == KVAF_AIV_BATCH_PUT_PROFILE_MAGIC;
   }
-  // Preserve the existing memset fast path unless the host needs to seed the
-  // opt-in profile magic before launch.
+  // Status initialization and the kernel are ordered on one stream, so the
+  // host need not block before the launch. core_status is a persistent pinned
+  // host buffer and remains valid until the final stream synchronization.
   const aclError seed_result = profiling_enabled
-                                   ? aclrtMemcpy(
+                                   ? aclrtMemcpyAsync(
                                          reinterpret_cast<void *>(arguments->core_status),
                                          status_bytes, core_status, status_bytes,
-                                         ACL_MEMCPY_HOST_TO_DEVICE)
-                                   : aclrtMemset(
+                                         ACL_MEMCPY_HOST_TO_DEVICE, stream)
+                                   : aclrtMemsetAsync(
                                          reinterpret_cast<void *>(arguments->core_status),
-                                         status_bytes, 0, status_bytes);
+                                         status_bytes, 0, status_bytes, stream);
   if (seed_result != ACL_SUCCESS) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=seed_status acl=%d\n",
                  static_cast<int>(seed_result));
@@ -586,18 +636,20 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=launch result=%d\n", result);
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
+  // Queue the completion status before synchronizing so the host pays one
+  // stream wait for both the AIV kernel and the status D2H copy.
+  const aclError status_copy_result = aclrtMemcpyAsync(
+      core_status, status_bytes, reinterpret_cast<void *>(arguments->core_status),
+      status_bytes, ACL_MEMCPY_DEVICE_TO_HOST, stream);
+  if (status_copy_result != ACL_SUCCESS) {
+    std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=copy_status acl=%d\n",
+                 static_cast<int>(status_copy_result));
+    return KVAF_BATCH_PUT_RUNTIME_ERROR;
+  }
   const aclError synchronize_result = aclrtSynchronizeStream(stream);
   if (synchronize_result != ACL_SUCCESS) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=synchronize acl=%d\n",
                  static_cast<int>(synchronize_result));
-    return KVAF_BATCH_PUT_RUNTIME_ERROR;
-  }
-  const aclError status_copy_result =
-      aclrtMemcpy(core_status, status_bytes, reinterpret_cast<void *>(arguments->core_status), status_bytes,
-                  ACL_MEMCPY_DEVICE_TO_HOST);
-  if (status_copy_result != ACL_SUCCESS) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=copy_status acl=%d\n",
-                 static_cast<int>(status_copy_result));
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
   for (uint32_t core = 0U; core < core_status_count; ++core) {

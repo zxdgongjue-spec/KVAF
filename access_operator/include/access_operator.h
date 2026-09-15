@@ -79,7 +79,8 @@ struct BatchPutHostProfile {
   std::uint64_t prepare_put_ns{0};
   std::uint64_t metadata_reserve_ns{0};
   std::uint64_t metadata_pack_ns{0};
-  // Host-side duration of the metadata upload submission.
+  // Host enqueue time for the asynchronous pinned-host metadata upload. Its
+  // completion is ordered before the kernel on the same stream.
   std::uint64_t metadata_h2d_ns{0};
   std::uint64_t local_buffer_acquire_ns{0};
   std::uint64_t execute_sync_ns{0};

@@ -288,7 +288,7 @@ def print_kernel_profile_samples(
 def validate_payload(
     runtime: object,
     torch: object,
-    keys: list[int],
+    keys: object,
     source: object,
     row_count: int,
     entry_bytes: int,
@@ -392,9 +392,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         torch.uint8
     )
     source = entry_pattern.reshape(1, entry_bytes).repeat(row_count, 1).contiguous()
-    keys = list(range(1, row_count + 1))
-    offsets = [row * entry_bytes for row in range(row_count)]
-    lengths = [entry_bytes] * row_count
+    # Keep control-plane metadata in contiguous CPU tensors. The native
+    # binding copies these buffers once per call instead of converting a
+    # Python integer list element by element through pybind11.
+    keys = torch.arange(1, row_count + 1, dtype=torch.int64, device="cpu")
+    offsets = (
+        torch.arange(row_count, dtype=torch.int64, device="cpu") * entry_bytes
+    ).contiguous()
+    lengths = torch.full((row_count,), entry_bytes, dtype=torch.int64, device="cpu")
+    stream = torch.npu.current_stream()
     torch.npu.synchronize()
 
     runtime = kvaf.NpuRuntime(
@@ -436,7 +442,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         # This call both validates payload and primes the cached input-HBM MR.
         print("BATCH_PUT_PERF_PHASE_BEGIN phase=correctness_preflight")
-        runtime.batch_put(keys, source, offsets, lengths)
+        runtime.batch_put(keys, source, offsets, lengths, stream)
         committed = True
         validate_payload(runtime, torch, keys, source, row_count, entry_bytes, device)
         runtime.batch_free(keys)
@@ -449,7 +455,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         print("BATCH_PUT_PERF_PHASE_BEGIN phase=warmup")
         for _ in range(args.warmup):
-            runtime.batch_put(keys, source, offsets, lengths)
+            runtime.batch_put(keys, source, offsets, lengths, stream)
             committed = True
             runtime.batch_free(keys)
             committed = False
@@ -462,7 +468,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         host_profile_samples: list[dict[str, object]] = []
         for iteration in range(args.iterations):
             begin = time.perf_counter()
-            runtime.batch_put(keys, source, offsets, lengths)
+            runtime.batch_put(keys, source, offsets, lengths, stream)
             completed = time.perf_counter()
             committed = True
             runtime_samples.append((completed - begin) * 1000.0)

@@ -9,7 +9,6 @@
 
 namespace kvaf {
 
-struct BatchGetKernelProfile;
 struct BatchPutHostProfile;
 struct BatchPutKernelProfile;
 struct NpuRuntimeOptions {
