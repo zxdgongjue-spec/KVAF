@@ -160,7 +160,12 @@ runtime.initialize(ddr_bytes, kv_block_bytes)
 - `UB_DEVICE_PROBE_RESULT` 记录各组合的标定结果，`UB_DEVICE_SELECTED` 记录正式
   选择；用 `peer_candidate` 对照 K 端 `CANDIDATE_DISCOVERED` 的设备名称/EID。
   结果属于当前 NpuRuntime session，后续 BatchGet/BatchPut 复用该选择；不做运行中
-  切换或跨进程缓存。不同 N 卡可以选不同 K 端设备。
+  切换。不同 N 卡可以选不同 K 端设备。
+- 多 shape sweep 脚本会在第一个子进程中标定一次，读取
+  `UB_DEVICE_SELECTED` 中的 `peer_candidate` 和 `npu_eids`，随后向其余子进程传入
+  `peer_candidate_id` 与显式 EID。后续 shape 只重建业务 session，不再重复带宽标定。
+  `peer_candidate_id` 仅用于同一个 K 服务进程内的短期复用；K 服务重启或候选配置
+  变化后必须重新标定。
 
 现有性能脚本可直接验证：
 
@@ -169,6 +174,18 @@ KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 DEVICE_ID=0 \
   ./tests/run_remote_cpu_batch_get_perf.sh /absolute/path/to/build-npu \
   --adaptive-ub-device --token-bytes 656 --miss-count 2048
 ```
+
+一次运行多个 shape 时使用 sweep 脚本；整轮只标定一次：
+
+```bash
+KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 DEVICE_ID=0 \
+  ./tests/run_remote_cpu_batch_get_miss_count_perf.sh \
+  /absolute/path/to/build-npu --adaptive-ub-device
+```
+
+日志中的 `BATCH_GET_SWEEP_UB_DEVICE_SELECTED ... reuse=subsequent_shapes` 表示
+脚本已经保存本轮选择；之后每个 shape 应出现 `UB_DEVICE_REUSED`，不应再出现
+`UB_DEVICE_PROBE_RESULT`。
 
 EID 组合数和建链开销仍影响总启动耗时；沿用现有传输/kernel 超时，当前不新增
 整个选优过程的硬时间上限。多卡同时启动会相互争抢带宽，标定效果需要在目标

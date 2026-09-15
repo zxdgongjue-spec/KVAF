@@ -35,6 +35,9 @@ struct NpuRuntimeOptions {
   // Opt-in startup BatchGet tuning over explicitly filtered peer devices.
   // Without a K-side device filter, first-working selection is preserved.
   bool adaptive_ub_device{false};
+  // Reuse a peer candidate selected by an earlier Runtime in the same test
+  // suite. Negative keeps candidate discovery/selection enabled.
+  std::int64_t peer_candidate_id{-1};
 };
 
 // NPU role Runtime. It owns the current MetaManager, NPU AccessOperator and

@@ -465,7 +465,11 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
       impl_->options.jettys_per_core == 0U ||
       impl_->options.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
       impl_->options.batch_get_token_bytes == 0U ||
-      impl_->options.batch_get_tokens_per_block == 0U) {
+      impl_->options.batch_get_tokens_per_block == 0U ||
+      impl_->options.peer_candidate_id < -1 ||
+      (impl_->options.peer_candidate_id >= 0 &&
+       static_cast<std::uint64_t>(impl_->options.peer_candidate_id) >
+           std::numeric_limits<std::uint32_t>::max())) {
     throw std::invalid_argument("invalid NPU Runtime configuration");
   }
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS) {
@@ -519,6 +523,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   if (candidate_count == 0U) {
     return Status::NotFound("peer Runtime returned no UMDK/EID candidates");
   }
+  const bool fixed_peer_candidate = impl_->options.peer_candidate_id >= 0;
   std::vector<NpuLocalEidCandidate> npu_candidates;
   std::string discovery_error;
   const bool explicit_eids = !impl_->options.npu_eids.empty();
@@ -540,9 +545,11 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
     return Status::InvalidArgument(
         "npu_eids count exceeds npu_core_count * jettys_per_core workers");
   }
-  const bool tune_candidates = detail::ShouldTuneStartupCandidates(
-      impl_->options.adaptive_ub_device, device_filter_applied);
-  if (impl_->options.adaptive_ub_device && !device_filter_applied) {
+  const bool tune_candidates = !fixed_peer_candidate &&
+      detail::ShouldTuneStartupCandidates(impl_->options.adaptive_ub_device,
+                                          device_filter_applied);
+  if (!fixed_peer_candidate && impl_->options.adaptive_ub_device &&
+      !device_filter_applied) {
     std::fprintf(stderr,
                  "[KVAF_AIV] UB_DEVICE_ADAPTIVE_SKIPPED device_id=%u "
                  "peer_devices=%u reason=no_explicit_peer_device_filter "
@@ -553,11 +560,10 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   // device filter, every EID pair from those named devices remains eligible.
   const std::size_t npu_group_count = explicit_eids ? 1U : npu_candidates.size();
   std::vector<detail::StartupCandidate> candidates;
-  for (std::uint32_t peer = 0; peer < candidate_count; ++peer) {
-    for (std::size_t group = 0; group < npu_group_count; ++group) {
-      candidates.push_back(detail::StartupCandidate{peer, group});
-    }
-  }
+  last = detail::BuildStartupCandidates(candidate_count, npu_group_count,
+                                        impl_->options.peer_candidate_id,
+                                        &candidates);
+  if (!last.ok()) return last;
   auto initialize_candidate = [&](const detail::StartupCandidate& candidate,
                                   bool measure, double* cycles) -> Status {
     const std::uint32_t peer_candidate = candidate.peer;
@@ -737,8 +743,15 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       if (tune_candidates) {
         std::fprintf(stderr,
                      "[KVAF_AIV] UB_DEVICE_SELECTED device_id=%u peer_candidate=%u "
-                     "npu_group=%zu p50_kernel_cycles=%.0f\n",
-                     impl_->options.device_id, peer_candidate, npu_group, *cycles);
+                     "npu_group=%zu npu_eids=%s p50_kernel_cycles=%.0f\n",
+                     impl_->options.device_id, peer_candidate, npu_group,
+                     group_eids.c_str(), *cycles);
+      } else if (fixed_peer_candidate) {
+        std::fprintf(stderr,
+                     "[KVAF_AIV] UB_DEVICE_REUSED device_id=%u peer_candidate=%u "
+                     "npu_group=%zu npu_eids=%s\n",
+                     impl_->options.device_id, peer_candidate, npu_group,
+                     group_eids.c_str());
       }
       return Status::OK();
     }

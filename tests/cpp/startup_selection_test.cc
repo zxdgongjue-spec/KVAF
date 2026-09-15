@@ -7,6 +7,7 @@
 
 using kvaf::Status;
 using kvaf::detail::SelectStartupCandidate;
+using kvaf::detail::BuildStartupCandidates;
 using kvaf::detail::ShouldTuneStartupCandidates;
 using kvaf::detail::StartupCandidate;
 
@@ -21,6 +22,14 @@ int main() {
   Check(ShouldTuneStartupCandidates(true, true));
   Check(!ShouldTuneStartupCandidates(true, false));
   Check(!ShouldTuneStartupCandidates(false, true));
+
+  std::vector<StartupCandidate> fixed;
+  Check(BuildStartupCandidates(5, 3, 2, &fixed).ok());
+  Check(fixed.size() == 3 && fixed.front().peer == 2 &&
+        fixed.front().local_group == 0 && fixed.back().local_group == 2);
+  Check(!BuildStartupCandidates(5, 1, 5, &fixed).ok());
+  Check(BuildStartupCandidates(2, 2, -1, &fixed).ok());
+  Check(fixed.size() == 4 && fixed.front().peer == 0 && fixed.back().peer == 1);
 
   const std::vector<StartupCandidate> candidates{{0, 0}, {1, 0}, {2, 0}, {3, 0}, {3, 1}};
   std::vector<std::tuple<unsigned, std::size_t, bool>> calls;

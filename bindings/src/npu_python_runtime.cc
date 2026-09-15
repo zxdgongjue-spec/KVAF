@@ -158,7 +158,8 @@ class NpuPythonRuntime final {
                    std::string batch_put_kernel_object_path,
                    std::uint32_t jettys_per_core,
                    std::vector<std::string> npu_eids,
-                   bool adaptive_ub_device) {
+                   bool adaptive_ub_device,
+                   std::int64_t peer_candidate_id) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
                               batch_get_tokens_per_block};
@@ -169,6 +170,7 @@ class NpuPythonRuntime final {
     options.jettys_per_core = jettys_per_core;
     options.npu_eids = std::move(npu_eids);
     options.adaptive_ub_device = adaptive_ub_device;
+    options.peer_candidate_id = peer_candidate_id;
     native_ = std::make_unique<::kvaf::NpuRuntime>(std::move(options));
   }
 
@@ -456,7 +458,7 @@ void BindNpuPythonRuntime(py::module_& module) {
   py::class_<NpuPythonRuntime>(module, "NpuRuntime")
       .def(py::init<std::string, std::uint32_t, std::uint32_t, std::uint32_t,
                     std::uint32_t, std::string, std::uint32_t,
-                    std::vector<std::string>, bool>(),
+                    std::vector<std::string>, bool, std::int64_t>(),
            py::arg("batch_get_kernel_object_path"),
            py::arg("batch_get_token_bytes"),
            py::arg("batch_get_tokens_per_block"), py::arg("device_id") = 0,
@@ -464,7 +466,8 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("batch_put_kernel_object_path") = "",
            py::arg("jettys_per_core") = 2,
            py::arg("npu_eids") = std::vector<std::string>{},
-           py::arg("adaptive_ub_device") = false)
+           py::arg("adaptive_ub_device") = false,
+           py::arg("peer_candidate_id") = -1)
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
            "Connect this NPU Runtime to a CPU Runtime service before initialize.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),

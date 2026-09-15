@@ -168,6 +168,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="startup tuning over explicitly selected K-side UB devices (all EIDs)",
     )
     parser.add_argument(
+        "--peer-candidate-id",
+        type=int,
+        default=-1,
+        help="reuse a K-side candidate selected by an earlier process",
+    )
+    parser.add_argument(
         "--warmup",
         type=int,
         default=environment_int("KVAF_BATCH_GET_PERF_WARMUP", DEFAULT_WARMUP),
@@ -246,6 +252,8 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "aiv-cores must be in [1, 48]"
     if len(args.npu_eids) > args.aiv_cores * args.jettys_per_core:
         return "npu-eids count must not exceed aiv-cores * jettys-per-core"
+    if args.peer_candidate_id < -1 or args.peer_candidate_id > 0xFFFFFFFF:
+        return "peer-candidate-id must be -1 or a uint32 value"
     if args.warmup < 0:
         return "warmup must be non-negative"
     if args.iterations <= 0:
@@ -582,6 +590,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         jettys_per_core=args.jettys_per_core,
         npu_eids=args.npu_eids,
         adaptive_ub_device=args.adaptive_ub_device,
+        peer_candidate_id=args.peer_candidate_id,
     )
     runtime.link_to(remote_cpu_service)
     table = None
@@ -598,6 +607,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"ddr_bytes={ddr_bytes} aiv_cores={args.aiv_cores} "
             f"jettys_per_core={args.jettys_per_core} eid_paths={len(args.npu_eids) or 1} "
             f"npu_eids={','.join(args.npu_eids) or 'auto'} warmup={args.warmup} "
+            f"adaptive_ub_device={int(args.adaptive_ub_device)} "
+            f"peer_candidate_id={args.peer_candidate_id} "
             f"iterations={args.iterations} seed={args.seed} "
             f"kernel_profile={int(args.kernel_profile)} "
             f"kernel_profile_clock_mhz={args.kernel_profile_clock_mhz} "

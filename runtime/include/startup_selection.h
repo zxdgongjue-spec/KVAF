@@ -31,6 +31,32 @@ inline constexpr bool ShouldTuneStartupCandidates(bool adaptive_requested,
   return adaptive_requested && device_filter_applied;
 }
 
+inline Status BuildStartupCandidates(std::uint32_t peer_count,
+                                     std::size_t local_group_count,
+                                     std::int64_t fixed_peer,
+                                     std::vector<StartupCandidate>* candidates) {
+  if (candidates == nullptr || peer_count == 0U || local_group_count == 0U) {
+    return Status::InvalidArgument("invalid startup candidate dimensions");
+  }
+  if (fixed_peer < -1 ||
+      (fixed_peer >= 0 && static_cast<std::uint64_t>(fixed_peer) >= peer_count)) {
+    return Status::InvalidArgument(
+        "peer_candidate_id is outside the K-side candidate range");
+  }
+  candidates->clear();
+  const std::uint32_t peer_begin =
+      fixed_peer >= 0 ? static_cast<std::uint32_t>(fixed_peer) : 0U;
+  const std::uint32_t peer_end = fixed_peer >= 0 ? peer_begin + 1U : peer_count;
+  candidates->reserve(static_cast<std::size_t>(peer_end - peer_begin) *
+                      local_group_count);
+  for (std::uint32_t peer = peer_begin; peer < peer_end; ++peer) {
+    for (std::size_t group = 0; group < local_group_count; ++group) {
+      candidates->push_back(StartupCandidate{peer, group});
+    }
+  }
+  return Status::OK();
+}
+
 // The callback leaves resources alive, even on failure. Cleanup must finish
 // before trying another pair; a cleanup failure is never treated as a slow link.
 // Successful final initialization retains resources for the caller's session.

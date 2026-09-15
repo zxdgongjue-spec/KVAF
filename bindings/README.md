@@ -36,7 +36,8 @@ output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数�
 
 `NpuRuntime(batch_get_kernel_object_path, batch_get_token_bytes,
 batch_get_tokens_per_block, device_id=0, npu_core_count=1,
-batch_put_kernel_object_path="", jettys_per_core=2, npu_eids=[], adaptive_ub_device=False)` 要求显式传入单 token KV
+batch_put_kernel_object_path="", jettys_per_core=2, npu_eids=[],
+adaptive_ub_device=False, peer_candidate_id=-1)` 要求显式传入单 token KV
 字节数和每个 KV block 中的 token 数，两个参数均无默认值；
 每个 AccessTable entry 大小为两者乘积。
 `jettys_per_core` 参数同时
@@ -63,3 +64,5 @@ CacheOS-vLLM Adaptor 属于 vLLM 侧实现，不放在本目录。
 进行 `656 × 2048` BatchGet 标定，并为当前 Runtime 固定最佳组合。K 端用重复的
 `--ub-device NAME` 限定设备；未指定时沿用首个可用候选。默认关闭；用法与协议升级要求见
 [Runtime 启动选优说明](../runtime/README.md#可选启动-ub-device-选优)。
+`peer_candidate_id` 用于测试套件在后续进程中复用本轮已选 K 端候选；同时传入
+选优日志中的 `npu_eids` 可复用完整链路组合。默认 `-1` 表示正常发现或选优。

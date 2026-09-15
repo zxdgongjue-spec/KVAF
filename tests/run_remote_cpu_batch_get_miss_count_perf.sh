@@ -10,7 +10,7 @@ fi
 KVAF_BUILD_DIR="$1"
 shift
 KVAF_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-KVAF_BATCH_GET_PERF_RUNNER="$KVAF_ROOT/tests/run_remote_cpu_batch_get_perf.sh"
+: "${KVAF_BATCH_GET_PERF_RUNNER:=$KVAF_ROOT/tests/run_remote_cpu_batch_get_perf.sh}"
 KVAF_BATCH_GET_TOKEN_BYTES=(128 256 512 656 1024 2048 4096)
 KVAF_BATCH_GET_MISS_COUNTS=(32 64 128 256 512 1024 2048 4096 8192)
 
@@ -80,13 +80,35 @@ completion_wait_p50_us_values=()
 completion_wait_p90_us_values=()
 completion_wait_p99_us_values=()
 
+adaptive_requested=false
+selection_resolved=false
+base_options=()
+selection_options=()
+for option in "$@"; do
+  if [[ "$option" == "--adaptive-ub-device" ]]; then
+    adaptive_requested=true
+  else
+    base_options+=("$option")
+  fi
+done
+
 for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
   echo "BATCH_GET_TOKEN_SWEEP_BEGIN token_bytes=$token_bytes"
   for miss_count in "${KVAF_BATCH_GET_MISS_COUNTS[@]}"; do
     echo "BATCH_GET_MISS_SWEEP_BEGIN token_bytes=$token_bytes miss_count=$miss_count"
     log_file="$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR/token_bytes_${token_bytes}_miss_count_${miss_count}.log"
-    if "$KVAF_BATCH_GET_PERF_RUNNER" "$KVAF_BUILD_DIR" "$@" \
-      --token-bytes "$token_bytes" --miss-count "$miss_count" \
+    run_options=()
+    if ((${#base_options[@]} > 0)); then
+      run_options+=("${base_options[@]}")
+    fi
+    if ((${#selection_options[@]} > 0)); then
+      run_options+=("${selection_options[@]}")
+    fi
+    if [[ "$adaptive_requested" == true && "$selection_resolved" == false ]]; then
+      run_options+=(--adaptive-ub-device)
+    fi
+    run_options+=(--token-bytes "$token_bytes" --miss-count "$miss_count")
+    if "$KVAF_BATCH_GET_PERF_RUNNER" "$KVAF_BUILD_DIR" "${run_options[@]}" \
       --kernel-profile \
       --kernel-profile-clock-mhz "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" \
       2>&1 | tee "$log_file"; then
@@ -95,6 +117,34 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
       status=$?
       echo "BATCH_GET_MISS_SWEEP_FAILED token_bytes=$token_bytes miss_count=$miss_count status=$status" >&2
       exit "$status"
+    fi
+
+    if [[ "$adaptive_requested" == true && "$selection_resolved" == false ]]; then
+      selected_record="$(
+        awk '$1 == "[KVAF_AIV]" && $2 == "UB_DEVICE_SELECTED" { result = $0 }
+             END { print result }' "$log_file"
+      )"
+      if [[ -n "$selected_record" ]]; then
+        selected_peer_candidate="$(extract_field "$selected_record" peer_candidate)"
+        selected_npu_eids="$(extract_field "$selected_record" npu_eids)"
+        if [[ ! "$selected_peer_candidate" =~ ^[0-9]+$ ||
+              ! "$selected_npu_eids" =~ ^[0-9a-f]{32}(,[0-9a-f]{32})*$ ]]; then
+          echo "ERROR: malformed UB_DEVICE_SELECTED record: $selected_record" >&2
+          exit 1
+        fi
+        selection_options=(
+          --peer-candidate-id "$selected_peer_candidate"
+          --npu-eids "$selected_npu_eids"
+        )
+        selection_resolved=true
+        echo "BATCH_GET_SWEEP_UB_DEVICE_SELECTED peer_candidate=$selected_peer_candidate npu_eids=$selected_npu_eids reuse=subsequent_shapes"
+      elif grep -q '^\[KVAF_AIV\] UB_DEVICE_ADAPTIVE_SKIPPED ' "$log_file"; then
+        selection_resolved=true
+        echo "BATCH_GET_SWEEP_UB_DEVICE_ADAPTIVE_SKIPPED reason=no_explicit_peer_device_filter selection=first_working_candidate"
+      else
+        echo "ERROR: adaptive selection produced neither UB_DEVICE_SELECTED nor UB_DEVICE_ADAPTIVE_SKIPPED" >&2
+        exit 1
+      fi
     fi
 
     total_profile_result="$(
