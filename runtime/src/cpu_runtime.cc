@@ -41,6 +41,7 @@ using kvaf::peer::ReleaseRegionRequest;
 using kvaf::peer::ResponseCommand;
 using kvaf::peer::Result;
 using kvaf::peer::StatusResponse;
+using kvaf::peer::kDeviceNameBytes;
 using kvaf::peer::kEidBytes;
 using kvaf::peer::kQpKeyBytes;
 using kvaf::peer::kSegKeyBytes;
