@@ -22,10 +22,14 @@ class FakeWorkload:
     def prepare(self):
         if getattr(self.args, "fail_setup", -1) == self.rank:
             raise RuntimeError("injected setup failure")
-        eids = self.args.npu_eids or ["1" * 32]
+        eids = self.args.npu_eids or [f"{self.args.device_id + 1:032x}"]
         if getattr(self.args, "wrong_eid_rank", -1) == self.rank:
             eids = ["f" * 32]
-        return dict(rank=self.rank, fake=True, cpu_service=self.args.cpu_service,
+        device_id = self.args.device_id
+        if getattr(self.args, "wrong_device_rank", -1) == self.rank:
+            device_id += 1
+        return dict(rank=self.rank, fake=True, device_id=device_id,
+                    cpu_service=self.args.cpu_service,
                     requested_npu_eids=self.args.npu_eids,
                     selected_path=dict(npu_eids=eids, cpu_eid="a" * 32, cpu_candidate=(
                         self.rank if getattr(self.args, "different_paths", False) else 0)))
@@ -175,6 +179,30 @@ class BatchGetThroughputTest(unittest.TestCase):
         args.process_cpu_services = ["cpu-a:123", " "]
         self.assertIn("process 1", throughput.validate_args(args))
 
+    def test_per_process_device_options_and_precedence(self):
+        with patch.dict(os.environ, {"DEVICE_ID": "3"}, clear=True):
+            args = throughput.parse_args(["--build-dir", "/mock/build", "--process-count", "2"])
+            self.assertEqual([throughput.worker_options(args, rank).device_id for rank in (0, 1)],
+                             [3, 3])
+            args = throughput.parse_args(["--build-dir", "/mock/build", "--process-count", "2",
+                                          "--device-id", "4", "--process-device-ids", "0", "1"])
+        self.assertEqual([throughput.worker_options(args, rank).device_id for rank in (0, 1)],
+                         [0, 1])
+        self.assertEqual(args.device_id, 4)
+        self.assertEqual(throughput.routing_mode(args), "per_process")
+        args.process_device_ids = None
+        self.assertEqual([throughput.worker_options(args, rank).device_id for rank in (0, 1)],
+                         [4, 4])
+        self.assertEqual(throughput.routing_mode(args), "shared")
+        for values, error in (([0], "exactly 2"), ([0, -1], "process 1")):
+            with contextlib.redirect_stderr(io.StringIO()) as output, self.assertRaises(SystemExit):
+                self.args("--process-count", "2", "--process-device-ids", *map(str, values))
+            self.assertIn(error, output.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.args("--device-id", "-1")
+        single = self.args("--process-device-ids", "1")
+        self.assertEqual(throughput.worker_options(single, 0).device_id, 1)
+
     def test_initialization_captures_native_log_and_preserves_errors(self):
         class Runtime:
             def initialize(self, ddr, block):
@@ -215,6 +243,7 @@ class BatchGetThroughputTest(unittest.TestCase):
     def test_spawned_workers_use_individual_routes(self):
         with tempfile.TemporaryDirectory() as directory:
             args = self.args("--process-count", "2", "--repeats", "1",
+                             "--process-device-ids", "0", "1",
                              "--process-npu-eids", "1" * 32, "2" * 32)
             args.trace_dir = Path(directory)
             for services in (None, ["cpu-a:123", "cpu-b:456"]):
@@ -227,6 +256,7 @@ class BatchGetThroughputTest(unittest.TestCase):
                 self.assertEqual(report["routing_mode"], "per_process")
                 workers = report["results"][-1]["workers"]
                 for rank, row in enumerate(workers):
+                    self.assertEqual(row["device_id"], rank)
                     self.assertEqual(row["requested_npu_eids"], [str(rank + 1) * 32])
                     self.assertEqual(row["selected_path"]["npu_eids"], [str(rank + 1) * 32])
                     self.assertEqual(row["cpu_service"], services[rank] if services else args.cpu_service)
@@ -235,6 +265,29 @@ class BatchGetThroughputTest(unittest.TestCase):
             args.wrong_eid_rank = 1
             with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, "instead of requested"):
                 throughput.run_benchmark(args, target=fake_worker)
+
+    def test_spawned_workers_use_individual_devices_with_auto_eids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.args("--process-count", "2", "--repeats", "1",
+                             "--process-device-ids", "0", "1")
+            args.trace_dir = Path(directory)
+            for device_ids in ([0, 1], [1, 1]):
+                args.process_device_ids = device_ids
+                with contextlib.redirect_stdout(io.StringIO()):
+                    report = throughput.run_benchmark(args, target=fake_worker)
+                self.assertEqual(report["routing_mode"], "per_process")
+                self.assertEqual(report["configuration"]["process_device_ids"], device_ids)
+                self.assertEqual([worker["device_id"] for worker in report["workers"]], device_ids)
+                for row in report["results"]:
+                    for worker in row["workers"]:
+                        device_id = device_ids[worker["rank"]]
+                        self.assertEqual(worker["device_id"], device_id)
+                        self.assertEqual(worker["selected_path"]["npu_eids"], [f"{device_id + 1:032x}"])
+            args.wrong_device_rank = 1
+            with contextlib.redirect_stdout(io.StringIO()) as output, self.assertRaisesRegex(
+                    RuntimeError, "worker 1 selected device 2 instead of requested 1"):
+                throughput.run_benchmark(args, target=fake_worker)
+            self.assertNotIn("BATCH_GET_THROUGHPUT_BEGIN", output.getvalue())
 
     def test_single_process_and_failures(self):
         with tempfile.TemporaryDirectory() as directory:

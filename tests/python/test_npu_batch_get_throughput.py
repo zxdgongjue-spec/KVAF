@@ -2,8 +2,8 @@
 """Continuous BatchGet throughput, with no per-batch profiling or host sync.
 
 Run directly with --build-dir /path/to/build-npu. Two processes run solo_0,
-solo_1 and concurrent phases with shared or per-process EIDs/CPU services. Preparation and
-validation never overlap another worker's measured phase. Native KVAF and
+solo_1 and concurrent phases with shared or per-process devices/EIDs/CPU services.
+Preparation and validation never overlap another worker's measured phase. Native KVAF and
 PyTorch are imported only inside spawned workers, after selecting the build.
 """
 
@@ -31,6 +31,9 @@ def parse_args(argv=None):
     parser.add_argument("--device-id", type=int, default=int(os.environ.get("DEVICE_ID", "0")))
     parser.add_argument("--process-count", type=int, choices=(1, 2), default=1,
                         help="2: prepare both workers, then measure each alone and both together")
+    parser.add_argument("--process-device-ids", type=int, nargs="+", metavar="DEVICE_ID",
+                        help="one NPU device ID per process, in rank order; "
+                             "overrides --device-id/DEVICE_ID; IDs may be the same or different")
     parser.add_argument("--stream-count", type=int, choices=(1, 2),
                         default=int(os.environ.get("KVAF_NPU_BATCH_GET_STREAM_COUNT", "1")))
     parser.add_argument("--transport-count", type=int, choices=(1, 2),
@@ -81,6 +84,8 @@ def parse_args(argv=None):
 def worker_options(args, rank):
     """Resolve routing once before spawn; preserve shared defaults otherwise."""
     resolved = argparse.Namespace(**vars(args))
+    resolved.device_id = (args.device_id if args.process_device_ids is None
+                          else args.process_device_ids[rank])
     resolved.npu_eids = list(args.npu_eids if args.process_npu_eids is None
                              else args.process_npu_eids[rank])
     resolved.cpu_service = (args.cpu_service if args.process_cpu_services is None
@@ -89,7 +94,8 @@ def worker_options(args, rank):
 
 
 def routing_mode(args):
-    return ("shared" if args.process_npu_eids is None and args.process_cpu_services is None
+    return ("shared" if args.process_device_ids is None and
+            args.process_npu_eids is None and args.process_cpu_services is None
             else "per_process")
 
 
@@ -109,13 +115,15 @@ def validate_args(args):
         return "two transports require two streams"
     if not 1 <= args.jettys_per_core <= 64:
         return "jettys-per-core must be in [1, 64]"
-    for name in ("process_npu_eids", "process_cpu_services"):
+    for name in ("process_device_ids", "process_npu_eids", "process_cpu_services"):
         values = getattr(args, name)
         if values is not None and len(values) != args.process_count:
             return f"{name.replace('_', '-')} requires exactly {args.process_count} values in rank order"
     workers = args.aiv_cores * args.stream_count * args.jettys_per_core
     for rank in range(args.process_count):
         options = worker_options(args, rank)
+        if options.device_id < 0:
+            return f"process {rank}: device-id must be non-negative"
         if len(options.npu_eids) > workers // args.transport_count:
             return f"process {rank}: npu-eids count exceeds workers per transport"
         if not options.cpu_service.strip():
@@ -123,8 +131,8 @@ def validate_args(args):
     for name in ("iterations", "repeats", "request_bank_size", "populate_chunk_entries"):
         if getattr(args, name) <= 0:
             return f"{name.replace('_', '-')} must be positive"
-    if args.warmup < 0 or args.device_id < 0 or args.seed < 0:
-        return "warmup, device-id and seed must be non-negative"
+    if args.warmup < 0 or args.seed < 0:
+        return "warmup and seed must be non-negative"
     if not 0 < args.timeout_seconds < float("inf"):
         return "timeout-seconds must be finite and positive"
     return None
@@ -202,18 +210,22 @@ def verify_worker_routes(args, ready):
         options = worker_options(args, rank)
         configuration = row["configuration"]
         path = configuration["selected_path"]
+        if configuration["device_id"] != options.device_id:
+            raise RuntimeError(f"worker {rank} selected device {configuration['device_id']} "
+                               f"instead of requested {options.device_id}")
         if configuration["cpu_service"] != options.cpu_service:
             raise RuntimeError(f"worker {rank} connected to an unexpected CPU service")
         if options.npu_eids and path["npu_eids"] != options.npu_eids:
             raise RuntimeError(f"worker {rank} selected NPU EIDs {path['npu_eids']} "
                                f"instead of requested {options.npu_eids}")
         paths.append(path)
-    # Default mode remains a same-path comparison. Explicit per-process routes
-    # can select different paths; CPU candidate IDs are scoped to each service.
+    # Default mode remains a same-path comparison. Explicit per-process devices
+    # or routes can select different paths; CPU candidate IDs are service-local.
     if routing_mode(args) == "shared" and any(path != paths[0] for path in paths):
         raise RuntimeError("workers selected different NPU EIDs or CPU candidates; "
                            "set --npu-eids for a shared path, or use "
-                           "--process-npu-eids/--process-cpu-services for different paths")
+                           "--process-device-ids/--process-npu-eids/--process-cpu-services "
+                           "for different devices or paths")
 
 
 def initialize_with_log(runtime, ddr_bytes, block_bytes, rank):
@@ -321,7 +333,7 @@ class NpuWorkload:
         torch.npu.synchronize()
         return dict(rank=self.rank, pid=os.getpid(), seed=args.seed + self.rank,
                     cpu_service=args.cpu_service, requested_npu_eids=args.npu_eids,
-                    device_id=args.device_id,
+                    device_id=torch.npu.current_device(),
                     selected_path=path, remote_region=dict(self.runtime.remote_region),
                     stream_count=self.runtime.batch_get_stream_count,
                     transport_count=self.runtime.batch_get_transport_count,
@@ -480,7 +492,8 @@ def run_benchmark(args, target=worker_entry):
                     raise RuntimeError("worker reported an incomplete submission count")
                 for measurement in measurements:
                     configuration = ready[measurement["rank"]]["configuration"]
-                    measurement.update(cpu_service=configuration["cpu_service"],
+                    measurement.update(device_id=configuration["device_id"],
+                                       cpu_service=configuration["cpu_service"],
                                        requested_npu_eids=configuration["requested_npu_eids"],
                                        selected_path=configuration["selected_path"])
                 row = aggregate_window(measurements, args.miss_count * args.token_bytes)

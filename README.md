@@ -381,7 +381,7 @@ python3 tests/python/test_npu_batch_get_throughput.py \
 ```
 
 将 `--process-count` 改成 `2`，并另选输出文件，即可自动测量 `solo_0`、`solo_1`、
-`concurrent` 三个阶段：两个独立进程使用同一张卡，默认连接同一个 CPU 服务，先全部
+`concurrent` 三个阶段：两个独立进程默认使用同一张卡、连接同一个 CPU 服务，先全部
 初始化和预热，再分别单跑和共同读取。每轮轮换阶段顺序；空闲进程不执行 NPU 工作。
 `--device-id` 默认读取 `DEVICE_ID`（缺省 0），`--cpu-service` 默认读取
 `KVAF_CPU_SERVICE_ADDR`（缺省 `127.0.0.1:28999`）。`--npu-eids` / `KVAF_NPU_EIDS`
@@ -389,14 +389,15 @@ python3 tests/python/test_npu_batch_get_throughput.py \
 NPU EID、CPU candidate 和 CPU EID；日志没有 CPU EID 时记录为 `null`。
 默认共享配置模式下，两进程选择不一致时停止，避免把不同路径误当作同 EID 对照。
 
-按进程指定路由时，增加以下参数，值按进程 0、1 的顺序填写：
+按进程指定设备和路由时，增加以下参数，值按进程 0、1 的顺序填写：
 
 | 参数 | 含义 |
 | --- | --- |
+| `--process-device-ids DEVICE_0 DEVICE_1` | 覆盖 `--device-id` / `DEVICE_ID`；每个值为非负 NPU device ID，可相同或不同 |
 | `--process-npu-eids EIDS_0 EIDS_1` | 覆盖共享 NPU EID 配置；每个值是该进程的逗号分隔 EID 列表，`""` 表示自动选择 |
 | `--process-cpu-services HOST_0:PORT_0 HOST_1:PORT_1` | 覆盖共享 CPU 服务配置，可填写相同或不同地址 |
 
-每个参数都必须恰好提供 `process-count` 个值；两个参数可分别使用。按进程参数的
+每个参数都必须恰好提供 `process-count` 个值；三个参数可分别使用。按进程参数的
 优先级高于共享参数及其环境变量。比如 `--npu-eids EID_A,EID_B` 表示**每个进程都
 使用两条 EID 路径**，而 `--process-npu-eids EID_A EID_B` 表示**两个进程各用一条路径**。
 每个进程的 EID 数仍不能超过该进程每个 transport 的 worker 数。
@@ -427,6 +428,21 @@ CPU 服务”。指定任一按进程参数后，`routing_mode` 为 `per_process
 路径不同，但每路显式指定的 NPU EID 必须与实际选择一致。CPU candidate 编号属于
 各自服务，不能跨服务比较编号来认定相同 CPU EID；实际 CPU EID 会写入结果。
 CPU 服务地址不同也不保证对应不同物理链路，解释结果时需结合实际 EID 和部署位置。
+
+要让进程 0、1 分别使用 device 0、1，在上述命令中增加：
+
+```bash
+--process-device-ids 0 1
+```
+
+每个进程会在自己的 device 上创建 Runtime、请求库和输出，并同步自己的设备。
+指定 EID 时需为各进程填写对应 device 的本端 EID；也可省略 EID 参数，让各设备自动
+选择。仅指定 `--process-device-ids` 也允许两路自动选择不同 EID，仍会校验实际
+device 与请求一致。填写 `--process-device-ids 0 0` 可测同卡；不传则沿用共享
+`--device-id` / `DEVICE_ID`。device ID 使用当前运行环境可见的设备编号。
+`READY`、每条 `RESULT` 的 `workers` 和输出 JSON 均记录各进程的 `device_id`。
+跨卡时，`total_aiv_cores`、`total_jettys` 仍表示所有活跃进程的合计资源数；聚合吞吐
+仍用同一主机的单调时钟公共窗口计算，`solo_0` / `solo_1` / `concurrent` 阶段保持一致。
 
 每个进程在计时前生成固定请求库，按 `seed + rank` 设置随机种子，并轮换使用请求。
 预填表、输入排序、输出注册、逐个请求计划的正确性检查和 warmup 都在计时外。
