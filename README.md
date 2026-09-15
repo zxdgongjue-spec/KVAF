@@ -184,7 +184,7 @@ build-npu/bin/kvaf_execute_batch_put_kernels.o
 重复 `--ub-device NAME` 可限定候选设备白名单；N 端可用
 `adaptive_ub_device=True` 会在 K 端通过 `--ub-device` 显式指定的设备中启动测速选优；
 未指定设备时沿用首个可用候选，设备和 EID 数量均不设硬限制。
-详见 [Runtime 启动选优](runtime/README.md#可选启动-ub-device-选优)；N/K 两端需同时升级至控制协议 v5。
+详见 [Runtime 启动选优](runtime/README.md#可选启动-ub-device-选优)；N/K 两端需同时升级至控制协议 v6。
 
 ### 2. 运行 NPU 端到端测试
 

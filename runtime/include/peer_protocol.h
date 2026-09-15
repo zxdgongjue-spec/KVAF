@@ -10,12 +10,13 @@
 namespace kvaf::peer {
 
 constexpr uint32_t kProtocolMagic = 0x4b564350U;  // "KVCP"
-// Version 5 adds the UB device count and whether an explicit device filter was
-// applied, allowing the initiator to tune only a deliberate peer shortlist.
-constexpr uint16_t kProtocolVersion = 5U;
+// Version 6 also returns the allocated candidate's device name and EID index,
+// allowing sweep reports to identify the selected K-side UB device.
+constexpr uint16_t kProtocolVersion = 6U;
 constexpr uint32_t kQpKeyBytes = 64U;
 constexpr uint32_t kSegKeyBytes = 64U;
 constexpr uint32_t kEidBytes = 16U;
+constexpr uint32_t kDeviceNameBytes = 64U;
 
 enum class Command : uint16_t {
   kAllocateRegion = 1U,
@@ -69,7 +70,9 @@ struct AllocateRegionResponse {
   uint64_t peer_length;
   uint32_t token_id;
   uint32_t token_value;
+  uint32_t peer_eid_index;
   uint8_t peer_eid[kEidBytes];
+  char peer_device_name[kDeviceNameBytes];
   uint8_t segment_key[kSegKeyBytes];
 };
 
@@ -111,6 +114,7 @@ static_assert(sizeof(MessageHeader) == 12U, "wire header ABI changed");
 static_assert(sizeof(AllocateRegionRequest) == 36U, "allocate request ABI changed");
 static_assert(sizeof(CandidateCountRequest) == 12U, "candidate count request ABI changed");
 static_assert(sizeof(CandidateCountResponse) == 28U, "candidate count response ABI changed");
+static_assert(sizeof(AllocateRegionResponse) == 200U, "allocate response ABI changed");
 static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed");
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");
 

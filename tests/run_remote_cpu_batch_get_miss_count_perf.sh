@@ -82,6 +82,11 @@ completion_wait_p99_us_values=()
 
 adaptive_requested=false
 selection_resolved=false
+selection_metadata_resolved=false
+selected_ub_device=""
+selected_peer_candidate=""
+selected_peer_eid_index=""
+selected_npu_eids=""
 base_options=()
 selection_options=()
 for option in "$@"; do
@@ -125,19 +130,19 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
              END { print result }' "$log_file"
       )"
       if [[ -n "$selected_record" ]]; then
-        selected_peer_candidate="$(extract_field "$selected_record" peer_candidate)"
-        selected_npu_eids="$(extract_field "$selected_record" npu_eids)"
-        if [[ ! "$selected_peer_candidate" =~ ^[0-9]+$ ||
-              ! "$selected_npu_eids" =~ ^[0-9a-f]{32}(,[0-9a-f]{32})*$ ]]; then
+        reusable_peer_candidate="$(extract_field "$selected_record" peer_candidate)"
+        reusable_npu_eids="$(extract_field "$selected_record" npu_eids)"
+        if [[ ! "$reusable_peer_candidate" =~ ^[0-9]+$ ||
+              ! "$reusable_npu_eids" =~ ^[0-9a-f]{32}(,[0-9a-f]{32})*$ ]]; then
           echo "ERROR: malformed UB_DEVICE_SELECTED record: $selected_record" >&2
           exit 1
         fi
         selection_options=(
-          --peer-candidate-id "$selected_peer_candidate"
-          --npu-eids "$selected_npu_eids"
+          --peer-candidate-id "$reusable_peer_candidate"
+          --npu-eids "$reusable_npu_eids"
         )
         selection_resolved=true
-        echo "BATCH_GET_SWEEP_UB_DEVICE_SELECTED peer_candidate=$selected_peer_candidate npu_eids=$selected_npu_eids reuse=subsequent_shapes"
+        echo "BATCH_GET_SWEEP_UB_DEVICE_SELECTED peer_candidate=$reusable_peer_candidate npu_eids=$reusable_npu_eids reuse=subsequent_shapes"
       elif grep -q '^\[KVAF_AIV\] UB_DEVICE_ADAPTIVE_SKIPPED ' "$log_file"; then
         selection_resolved=true
         echo "BATCH_GET_SWEEP_UB_DEVICE_ADAPTIVE_SKIPPED reason=no_explicit_peer_device_filter selection=first_working_candidate"
@@ -145,6 +150,30 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
         echo "ERROR: adaptive selection produced neither UB_DEVICE_SELECTED nor UB_DEVICE_ADAPTIVE_SKIPPED" >&2
         exit 1
       fi
+    fi
+
+    if [[ "$selection_metadata_resolved" == false ]]; then
+      active_record="$(
+        awk '$1 == "[KVAF_AIV]" && $2 == "UB_DEVICE_ACTIVE" { result = $0 }
+             END { print result }' "$log_file"
+      )"
+      if [[ -z "$active_record" ]]; then
+        echo "ERROR: runtime did not report UB_DEVICE_ACTIVE" >&2
+        exit 1
+      fi
+      selected_ub_device="$(extract_field "$active_record" ub_device)"
+      selected_peer_candidate="$(extract_field "$active_record" peer_candidate)"
+      selected_peer_eid_index="$(extract_field "$active_record" peer_eid_index)"
+      selected_npu_eids="$(extract_field "$active_record" npu_eids)"
+      if [[ -z "$selected_ub_device" ||
+            ! "$selected_peer_candidate" =~ ^[0-9]+$ ||
+            ! "$selected_peer_eid_index" =~ ^[0-9]+$ ||
+            ! "$selected_npu_eids" =~ ^[0-9a-f]{32}(,[0-9a-f]{32})*$ ]]; then
+        echo "ERROR: malformed UB_DEVICE_ACTIVE record: $active_record" >&2
+        exit 1
+      fi
+      selection_metadata_resolved=true
+      echo "BATCH_GET_MISS_SWEEP_ACTIVE_UB_DEVICE ub_device=$selected_ub_device peer_candidate=$selected_peer_candidate peer_eid_index=$selected_peer_eid_index npu_eids=$selected_npu_eids"
     fi
 
     total_profile_result="$(
@@ -290,11 +319,21 @@ echo "BATCH_GET_MISS_SWEEP_CLOCK clock_mhz=$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ conv
 
 : "${KVAF_BATCH_GET_MISS_SWEEP_CSV:=$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR/batch_get_miss_sweep_summary.csv}"
 mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
+csv_quote() {
+  local value="${1//\"/\"\"}"
+  printf '"%s"' "$value"
+}
+selected_ub_device_csv="$(csv_quote "$selected_ub_device")"
+selected_npu_eids_csv="$(csv_quote "$selected_npu_eids")"
 {
   printf '%s\n' \
-    'token_bytes,miss_count,mean_us,p50_us,p90_us,p99_us,p50_GBps,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us'
+    'ub_device,peer_candidate,peer_eid_index,npu_eids,token_bytes,miss_count,mean_us,p50_us,p90_us,p99_us,p50_GBps,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us'
   for index in "${!mean_us_values[@]}"; do
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+      "$selected_ub_device_csv" \
+      "$selected_peer_candidate" \
+      "$selected_peer_eid_index" \
+      "$selected_npu_eids_csv" \
       "${token_bytes_values[$index]}" \
       "${miss_count_values[$index]}" \
       "${mean_us_values[$index]}" \

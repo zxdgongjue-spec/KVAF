@@ -40,6 +40,8 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
 
   void SetCandidate(std::uint32_t candidate_id) { candidate_id_ = candidate_id; }
   bool has_allocation() const { return allocated_.base != 0U; }
+  const std::string& device_name() const { return allocated_.device_name; }
+  std::uint32_t eid_index() const { return allocated_.eid_index; }
 
   Status Allocate(const RuntimeInitRequest& request, RemoteRegionDesc* region) override {
     if (link_ == nullptr || region == nullptr || request.ddr_device != DeviceKind::kCpu ||
@@ -713,9 +715,12 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       if (last.ok()) {
         std::fprintf(stderr,
                      "[KVAF_AIV] UB_DEVICE_PROBE_RESULT device_id=%u peer_candidate=%u "
-                     "npu_group=%zu token_bytes=%u miss_count=%u warmup=%u samples=%u "
+                     "ub_device=%s peer_eid_index=%u npu_group=%zu token_bytes=%u "
+                     "miss_count=%u warmup=%u samples=%u "
                      "p50_kernel_cycles=%.0f bytes_per_cycle=%.6f\n",
-                     impl_->options.device_id, peer_candidate, npu_group,
+                     impl_->options.device_id, peer_candidate,
+                     impl_->peer_allocator->device_name().c_str(),
+                     impl_->peer_allocator->eid_index(), npu_group,
                      detail::kStartupTokenBytes, detail::kStartupMissCount,
                      detail::kStartupWarmup, detail::kStartupSamples, *cycles,
                      static_cast<double>(detail::kStartupTokenBytes) * detail::kStartupMissCount / *cycles);
@@ -743,16 +748,29 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       if (tune_candidates) {
         std::fprintf(stderr,
                      "[KVAF_AIV] UB_DEVICE_SELECTED device_id=%u peer_candidate=%u "
-                     "npu_group=%zu npu_eids=%s p50_kernel_cycles=%.0f\n",
-                     impl_->options.device_id, peer_candidate, npu_group,
+                     "ub_device=%s peer_eid_index=%u npu_group=%zu npu_eids=%s "
+                     "p50_kernel_cycles=%.0f\n",
+                     impl_->options.device_id, peer_candidate,
+                     impl_->peer_allocator->device_name().c_str(),
+                     impl_->peer_allocator->eid_index(), npu_group,
                      group_eids.c_str(), *cycles);
       } else if (fixed_peer_candidate) {
         std::fprintf(stderr,
                      "[KVAF_AIV] UB_DEVICE_REUSED device_id=%u peer_candidate=%u "
-                     "npu_group=%zu npu_eids=%s\n",
-                     impl_->options.device_id, peer_candidate, npu_group,
+                     "ub_device=%s peer_eid_index=%u npu_group=%zu npu_eids=%s\n",
+                     impl_->options.device_id, peer_candidate,
+                     impl_->peer_allocator->device_name().c_str(),
+                     impl_->peer_allocator->eid_index(), npu_group,
                      group_eids.c_str());
       }
+      std::fprintf(stderr,
+                   "[KVAF_AIV] UB_DEVICE_ACTIVE device_id=%u peer_candidate=%u "
+                   "ub_device=%s peer_eid_index=%u npu_eids=%s selection=%s\n",
+                   impl_->options.device_id, peer_candidate,
+                   impl_->peer_allocator->device_name().c_str(),
+                   impl_->peer_allocator->eid_index(), group_eids.c_str(),
+                   tune_candidates ? "adaptive" :
+                       (fixed_peer_candidate ? "reused" : "first_working"));
       return Status::OK();
     }
     if (group_size == 1U) {

@@ -185,13 +185,16 @@ KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 DEVICE_ID=0 \
 
 日志中的 `BATCH_GET_SWEEP_UB_DEVICE_SELECTED ... reuse=subsequent_shapes` 表示
 脚本已经保存本轮选择；之后每个 shape 应出现 `UB_DEVICE_REUSED`，不应再出现
-`UB_DEVICE_PROBE_RESULT`。
+`UB_DEVICE_PROBE_RESULT`。最终 `batch_get_miss_sweep_summary.csv` 的每一行都会包含
+`ub_device`、`peer_candidate`、`peer_eid_index` 和 `npu_eids`，用 Excel 打开时可以
+直接确认整轮测试实际使用的链路。
 
 EID 组合数和建链开销仍影响总启动耗时；沿用现有传输/kernel 超时，当前不新增
 整个选优过程的硬时间上限。多卡同时启动会相互争抢带宽，标定效果需要在目标
 部署并发下验证。固定标定点的最优设备也不保证对所有数据尺寸都最优。
 
-**升级要求：**候选查询新增独立设备数和显式过滤标记，控制协议从 v4 升到 v5。
+**升级要求：**候选查询包含独立设备数和显式过滤标记，region 响应新增设备名称与
+EID index，控制协议升级到 v6。
 N 端库和 K 端服务必须一起重新构建/部署，即使未开启自适应也不能混用旧协议。
 
 需要同时使用多个 NPU EID 时，设置 `NpuRuntimeOptions::npu_eids`（Python
