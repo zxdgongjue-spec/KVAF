@@ -36,6 +36,9 @@ struct NpuRuntimeOptions {
   // K/N EIDs are connectivity fallbacks; each working peer device is measured
   // once. Without a K-side device filter, first-working selection is preserved.
   bool adaptive_ub_device{false};
+  // BatchGet request count used by adaptive tuning. Performance tools set this
+  // to the current test shape; other callers retain the historical 2048 default.
+  std::uint32_t adaptive_ub_miss_count{2048U};
 };
 
 // NPU role Runtime. It owns the current MetaManager, NPU AccessOperator and

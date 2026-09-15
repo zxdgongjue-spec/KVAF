@@ -135,6 +135,7 @@ runtime = kvaf.NpuRuntime(
     npu_core_count=24,  # 与业务配置保持一致
     batch_put_kernel_object_path=batch_put_kernel,
     adaptive_ub_device=True,
+    adaptive_ub_miss_count=2048,
 )
 runtime.link_to("141.61.92.71:28999")
 runtime.initialize(ddr_bytes, kv_block_bytes)
@@ -149,16 +150,18 @@ runtime.initialize(ddr_bytes, kv_block_bytes)
   该设备剩余 EID 不再测试。显式 `npu_eids` 仍作为一个严格的完整多 EID 组，
   不会拆开或回退。K 端指定 `--eid-index 0` 时，每个设备只有一个 K EID，自动
   发现的 N EID 只作为建链回退，因此 4 个设备最多得到 4 个测速结果。
-- 每个设备的可用组合先完成原有 WRITE/CQ 验证，再在独立临时 region 中执行真实 BatchGet。
-  固定标定为 `token_bytes=656, miss_count=2048, tokens_per_block=128`，与正式
-  workload 的尺寸独立；core/Jetty 配置沿用业务配置。请求对 2048 个 token 做固定
-  非顺序排列，输出连续，所有候选使用同一组数据与请求。
+- 每个设备的可用组合先完成原有 WRITE/CQ 验证，再在独立临时 region 中执行真实
+  BatchGet。标定沿用 Runtime 的 `batch_get_token_bytes` 和
+  `batch_get_tokens_per_block`，请求数由 `adaptive_ub_miss_count` 指定；性能测试脚本
+  会传入当前 shape 的 `miss_count`。core/Jetty 配置沿用业务配置，所有候选使用同一组
+  数据与请求。
 - 先写入并校验数据，预热 1 次、采样 5 次，按每次最慢 core 的 kernel 总周期数
   取中位数，选择耗时最短的组合。相同 N 卡、相同搬运字节数下，这等价于选择最高
   标定带宽。建链、分配和 Host 同步开销不计入排名；日志输出周期数和 bytes/cycle，
   不假定硬件时钟频率。
-- 探测 region 为 82 MiB（slot 大小与 2 MiB 页大小的最小公倍数），串行创建和释放，
-  支持现有 `hugetlb-2m` 页模式。每个组合完成后先销毁通道和 region，再释放 NPU
+- 探测 region 根据当前 block 大小和 miss count 计算，并向上对齐到 block 大小与
+  2 MiB 的最小公倍数，支持现有 `hugetlb-2m` 页模式。各设备串行创建和释放；每个
+  组合完成后先销毁通道和 region，再释放 NPU
   buffer。全部探测结束后，按排名建立用户请求大小的正式 region，校验连通性，
   最优组合重建失败时尝试下一名；没有可用组合则初始化失败。
 - `UB_DEVICE_PROBE_PLAN` 记录各设备可能尝试的建链组合数，
@@ -175,9 +178,9 @@ KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 DEVICE_ID=0 \
   --adaptive-ub-device --token-bytes 656 --miss-count 2048
 ```
 
-EID 组合数只影响找到每个设备首个可用链路前的回退开销；沿用现有传输/kernel 超时，当前不新增
-整个选优过程的硬时间上限。多卡同时启动会相互争抢带宽，标定效果需要在目标
-部署并发下验证。固定标定点的最优设备也不保证对所有数据尺寸都最优。
+EID 组合数只影响找到每个设备首个可用链路前的回退开销；沿用现有
+传输/kernel 超时，当前不新增整个选优过程的硬时间上限。多卡同时启动会相互
+争抢带宽，标定效果需要在目标部署并发下验证。当前选择只代表本次测试 shape。
 
 **升级要求：**候选查询包含独立设备数和显式过滤标记，并支持在分配前查询候选
 所属设备，控制协议从 v4 升到 v6。

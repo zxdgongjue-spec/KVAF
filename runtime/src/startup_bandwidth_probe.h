@@ -15,6 +15,8 @@ namespace kvaf::detail {
 // down RuntimeCore/AccessOperator before destroying the probe, including errors.
 class StartupBandwidthProbe {
  public:
+  explicit StartupBandwidthProbe(StartupProbeConfig config) : config_(config) {}
+
   ~StartupBandwidthProbe() {
     if (stream_ != nullptr) (void)aclrtDestroyStream(stream_);
     for (void* buffer : buffers_) (void)aclrtFree(buffer);
@@ -22,25 +24,33 @@ class StartupBandwidthProbe {
 
   template <class ProfiledOperator>
   Status Run(RuntimeCore& core, ProfiledOperator& op, double* median_cycles) {
-    constexpr std::size_t kPayload = kStartupTokenBytes * kStartupMissCount;
-    constexpr std::size_t kBlockBytes = kStartupTokenBytes * kStartupTokensPerBlock;
-    constexpr std::size_t kBlocks = kStartupMissCount / kStartupTokensPerBlock;
+    StartupProbeLayout layout{};
+    Status status = BuildStartupProbeLayout(config_, &layout);
+    if (!status.ok()) return status;
+    const auto payload = static_cast<std::size_t>(config_.token_bytes) *
+                         config_.miss_count;
+    const auto block_bytes = static_cast<std::size_t>(layout.block_bytes);
+    const auto source_bytes = static_cast<std::size_t>(layout.source_bytes);
+    const auto blocks = (static_cast<std::size_t>(config_.miss_count) +
+                         config_.tokens_per_block - 1U) /
+                        config_.tokens_per_block;
     if (aclrtCreateStream(&stream_) != ACL_SUCCESS) {
       return Status::Internal("startup probe stream creation failed");
     }
 
-    std::vector<std::uint8_t> source(kPayload);
+    std::vector<std::uint8_t> source(source_bytes);
     for (std::size_t i = 0; i < source.size(); ++i) {
-      source[i] = static_cast<std::uint8_t>((i * 17U + i / kStartupTokenBytes) % 251U);
+      source[i] = static_cast<std::uint8_t>(
+          (i * 17U + i / config_.token_bytes) % 251U);
     }
     BatchPutRequest put;
-    for (std::size_t block = 0; block < kBlocks; ++block) {
+    for (std::size_t block = 0; block < blocks; ++block) {
       put.keys.push_back(block);
-      put.input_offsets.push_back(block * kBlockBytes);
-      put.lengths.push_back(kBlockBytes);
+      put.input_offsets.push_back(block * block_bytes);
+      put.lengths.push_back(block_bytes);
     }
     if (!Upload(source.data(), source.size(), &put.input)) return AllocationError();
-    Status status = core.BatchPut(put, BatchPutExecutionOptions{stream_});
+    status = core.BatchPut(put, BatchPutExecutionOptions{stream_});
     if (!status.ok()) return status;
 
     BatchGetRequest get;
@@ -55,33 +65,37 @@ class StartupBandwidthProbe {
       return AllocationError();
     }
 
-    std::vector<std::int32_t> indices(kStartupMissCount);
-    std::vector<std::int32_t> offsets(kStartupMissCount);
-    std::vector<std::int32_t> destinations(kStartupMissCount);
-    std::vector<std::uint8_t> expected(kPayload);
-    for (std::uint32_t row = 0; row < kStartupMissCount; ++row) {
-      // Fixed permutation: each token is read once; every candidate sees the
-      // same nonsequential requests and contiguous output placement.
-      const auto token = (row * 5U) % kStartupMissCount;
-      indices[row] = token / kStartupTokensPerBlock;
-      offsets[row] = (token % kStartupTokensPerBlock) * kStartupTokenBytes;
+    std::vector<std::int32_t> indices(config_.miss_count);
+    std::vector<std::int32_t> offsets(config_.miss_count);
+    std::vector<std::int32_t> destinations(config_.miss_count);
+    std::vector<std::uint8_t> expected(payload);
+    std::uint32_t stride = std::min<std::uint32_t>(5U, config_.miss_count);
+    while (stride > 1U && std::gcd(stride, config_.miss_count) != 1U) --stride;
+    for (std::uint32_t row = 0; row < config_.miss_count; ++row) {
+      // Use a shape-dependent coprime stride so every token is read once and
+      // every device sees the same request order for this shape.
+      const auto token = static_cast<std::uint32_t>(
+          (static_cast<std::uint64_t>(row) * stride) % config_.miss_count);
+      indices[row] = token / config_.tokens_per_block;
+      offsets[row] = (token % config_.tokens_per_block) * config_.token_bytes;
       destinations[row] = row;
-      std::copy_n(source.data() + token * kStartupTokenBytes, kStartupTokenBytes,
-                  expected.data() + row * kStartupTokenBytes);
+      std::copy_n(source.data() + token * config_.token_bytes,
+                  config_.token_bytes,
+                  expected.data() + row * config_.token_bytes);
     }
-    const std::int32_t misses = kStartupMissCount;
+    const std::int32_t misses = static_cast<std::int32_t>(config_.miss_count);
     if (!Upload(indices.data(), indices.size() * sizeof(indices[0]), &get.indices) ||
         !Upload(offsets.data(), offsets.size() * sizeof(offsets[0]), &get.offsets) ||
         !Upload(destinations.data(), destinations.size() * sizeof(destinations[0]),
                 &get.output_indices) ||
         !Upload(&misses, sizeof(misses), &get.miss_count)) return AllocationError();
-    void* output = Allocate(kPayload);
-    if (output == nullptr || aclrtMemset(output, kPayload, 0, kPayload) != ACL_SUCCESS) {
+    void* output = Allocate(payload);
+    if (output == nullptr || aclrtMemset(output, payload, 0, payload) != ACL_SUCCESS) {
       return AllocationError();
     }
-    get.output = MutableBufferView{output, kPayload, DeviceKind::kNpu};
-    get.output_block_bytes = kStartupTokenBytes;
-    get.tokens_per_block = kStartupTokensPerBlock;
+    get.output = MutableBufferView{output, payload, DeviceKind::kNpu};
+    get.output_block_bytes = config_.token_bytes;
+    get.tokens_per_block = config_.tokens_per_block;
     status = op.SetBatchGetKernelProfiling(true);
     if (!status.ok()) return status;
 
@@ -102,12 +116,12 @@ class StartupBandwidthProbe {
             profile.kernel_finish_cycle - profile.kernel_start_cycle);
         active_requests += profile.active_requests;
       }
-      if (active_requests != kStartupMissCount || critical_cycles == 0U) {
+      if (active_requests != config_.miss_count || critical_cycles == 0U) {
         return Status::Internal("startup probe incomplete BatchGet or invalid timing");
       }
       if (sample == 0U) {
-        std::vector<std::uint8_t> actual(kPayload);
-        if (aclrtMemcpy(actual.data(), actual.size(), output, kPayload,
+        std::vector<std::uint8_t> actual(payload);
+        if (aclrtMemcpy(actual.data(), actual.size(), output, payload,
                         ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS || actual != expected) {
           return Status::Internal("startup probe BatchGet data validation failed");
         }
@@ -141,6 +155,7 @@ class StartupBandwidthProbe {
 
   aclrtStream stream_{nullptr};
   std::vector<void*> buffers_;
+  StartupProbeConfig config_;
 };
 
 }  // namespace kvaf::detail

@@ -242,6 +242,8 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "configured table size must fit uint64"
     if args.miss_count < 0 or args.miss_count > args.request_length:
         return "miss-count must be between zero and request-length"
+    if args.adaptive_ub_device and args.miss_count == 0:
+        return "adaptive UB device tuning requires a positive miss-count"
     if args.aiv_cores <= 0 or args.aiv_cores > 48:
         return "aiv-cores must be in [1, 48]"
     if len(args.npu_eids) > args.aiv_cores * args.jettys_per_core:
@@ -582,6 +584,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         jettys_per_core=args.jettys_per_core,
         npu_eids=args.npu_eids,
         adaptive_ub_device=args.adaptive_ub_device,
+        adaptive_ub_miss_count=miss_count_value,
     )
     runtime.link_to(remote_cpu_service)
     table = None

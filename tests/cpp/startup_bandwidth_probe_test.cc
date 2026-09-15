@@ -49,7 +49,8 @@ enum class Fault { None, CorruptData, Incomplete, ZeroTiming, GetFailure, Alloca
 
 class Operator final : public kvaf::AccessOperator {
  public:
-  explicit Operator(Fault fault) : fault_(fault) {}
+  Operator(Fault fault, std::uint32_t miss_count)
+      : fault_(fault), miss_count_(miss_count) {}
   kvaf::Status Initialize(const kvaf::RemoteRegionDesc&) override {
     transport_alive = true;
     return kvaf::Status::OK();
@@ -90,32 +91,44 @@ class Operator final : public kvaf::AccessOperator {
   }
   kvaf::Status CopyBatchGetKernelProfiles(std::vector<kvaf::BatchGetKernelProfile>* out) {
     kvaf::BatchGetKernelProfile p;
-    p.active_requests = fault_ == Fault::Incomplete ? 1023U : 1024U;
+    p.active_requests = fault_ == Fault::Incomplete ? miss_count_ - 1U : miss_count_;
     p.kernel_start_cycle = 100;
     const auto duration = calls <= kvaf::detail::kStartupWarmup ? 10000U : 36U - calls;
     p.kernel_finish_cycle = p.kernel_start_cycle + (fault_ == Fault::ZeroTiming ? 0 : duration);
-    out->assign(2, p);
+    out->assign(1, p);
     return kvaf::Status::OK();
   }
   unsigned calls{0};
  private:
   Fault fault_;
+  std::uint32_t miss_count_;
   bool profiling_{false};
 };
 }  // namespace
 
 int main() {
+  const kvaf::detail::StartupProbeConfig config{128U, 128U, 32U};
+  kvaf::detail::StartupProbeLayout layout{};
+  Check(kvaf::detail::BuildStartupProbeLayout(config, &layout).ok());
+  Check(layout.block_bytes == 16U * 1024U);
+  Check(layout.source_bytes == 16U * 1024U);
+  Check(layout.ddr_bytes == 2U * 1024U * 1024U);
+  kvaf::detail::StartupProbeLayout legacy_layout{};
+  Check(kvaf::detail::BuildStartupProbeLayout({656U, 128U, 2048U},
+                                               &legacy_layout).ok());
+  Check(legacy_layout.ddr_bytes == 82U * 1024U * 1024U);
+  Check(!kvaf::detail::BuildStartupProbeLayout({128U, 128U, 0U}, &layout).ok());
+
   for (const auto fault : {Fault::None, Fault::CorruptData, Fault::Incomplete,
                           Fault::ZeroTiming, Fault::GetFailure, Fault::Allocation}) {
     auto meta = kvaf::CreateInMemoryMetaManager();
     auto allocator = kvaf::CreateHostDdrMemoryAllocator();
-    Operator op(fault);
+    Operator op(fault, config.miss_count);
     kvaf::RuntimeCore core(*meta, op, *allocator);
-    Check(core.Initialize({kvaf::detail::kStartupDdrBytes,
-                           kvaf::detail::kStartupTokenBytes * kvaf::detail::kStartupTokensPerBlock,
+    Check(core.Initialize({layout.ddr_bytes, layout.block_bytes,
                            kvaf::DeviceKind::kCpu}).ok());
     {
-      kvaf::detail::StartupBandwidthProbe probe;
+      kvaf::detail::StartupBandwidthProbe probe(config);
       fail_allocation = fault == Fault::Allocation;
       double median = 0;
       const auto status = probe.Run(core, op, &median);

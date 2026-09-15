@@ -465,7 +465,11 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
       impl_->options.jettys_per_core == 0U ||
       impl_->options.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
       impl_->options.batch_get_token_bytes == 0U ||
-      impl_->options.batch_get_tokens_per_block == 0U) {
+      impl_->options.batch_get_tokens_per_block == 0U ||
+      (impl_->options.adaptive_ub_device &&
+       (impl_->options.adaptive_ub_miss_count == 0U ||
+        impl_->options.adaptive_ub_miss_count >
+            static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())))) {
     throw std::invalid_argument("invalid NPU Runtime configuration");
   }
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS) {
@@ -549,6 +553,15 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                  "selection=first_working_candidate\n",
                  impl_->options.device_id, device_count);
   }
+  const detail::StartupProbeConfig probe_config{
+      impl_->options.batch_get_token_bytes,
+      impl_->options.batch_get_tokens_per_block,
+      impl_->options.adaptive_ub_miss_count};
+  detail::StartupProbeLayout probe_layout{};
+  if (tune_candidates) {
+    last = detail::BuildStartupProbeLayout(probe_config, &probe_layout);
+    if (!last.ok()) return last;
+  }
   // An explicit N-side list remains one strict multi-EID group. Automatically
   // discovered EIDs are connectivity fallbacks.
   const std::size_t npu_group_count = explicit_eids ? 1U : npu_candidates.size();
@@ -563,8 +576,8 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
     const std::uint32_t peer_candidate = candidate.peer;
     const std::size_t npu_group = candidate.local_group;
     const RuntimeInitRequest candidate_request = measure
-        ? RuntimeInitRequest{detail::kStartupDdrBytes,
-                             detail::kStartupTokenBytes * detail::kStartupTokensPerBlock,
+        ? RuntimeInitRequest{probe_layout.ddr_bytes,
+                             probe_layout.block_bytes,
                              DeviceKind::kCpu}
         : request;
     const auto ddr_bytes = candidate_request.ddr_bytes;
@@ -702,7 +715,8 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       }
     }
     if (last.ok() && measure) {
-      impl_->bandwidth_probe = std::make_unique<detail::StartupBandwidthProbe>();
+      impl_->bandwidth_probe =
+          std::make_unique<detail::StartupBandwidthProbe>(probe_config);
       last = impl_->bandwidth_probe->Run(*impl_->runtime_core, *impl_->access_operator, cycles);
       if (last.ok()) {
         std::fprintf(stderr,
@@ -710,9 +724,10 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                      "npu_group=%zu token_bytes=%u miss_count=%u warmup=%u samples=%u "
                      "p50_kernel_cycles=%.0f bytes_per_cycle=%.6f\n",
                      impl_->options.device_id, peer_candidate, npu_group,
-                     detail::kStartupTokenBytes, detail::kStartupMissCount,
+                     probe_config.token_bytes, probe_config.miss_count,
                      detail::kStartupWarmup, detail::kStartupSamples, *cycles,
-                     static_cast<double>(detail::kStartupTokenBytes) * detail::kStartupMissCount / *cycles);
+                     static_cast<double>(probe_config.token_bytes) *
+                         probe_config.miss_count / *cycles);
         return last;
       }
     }
