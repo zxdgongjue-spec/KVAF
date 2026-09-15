@@ -130,6 +130,41 @@ bool GetCandidateCountAt(const std::string& endpoint, uint32_t* candidate_count,
   return true;
 }
 
+bool GetCandidateInfoAt(const std::string& endpoint, uint32_t candidate_id,
+                        PeerCandidateInfo* candidate_info,
+                        std::string* error) {
+  if (candidate_info == nullptr) {
+    SetError(error, "candidate info output must not be null");
+    return false;
+  }
+  CandidateInfoRequest request{};
+  request.header = MakeHeader(Command::kGetCandidateInfo, sizeof(request));
+  request.candidate_id = candidate_id;
+  CandidateInfoResponse response{};
+  if (!Exchange(endpoint, request, &response, error) ||
+      !IsValidResponseHeader(response.header, Command::kGetCandidateInfo,
+                             sizeof(response)) ||
+      !ResultOk(static_cast<Result>(response.result), error) ||
+      response.candidate_id != candidate_id || response.ub_device[0] == '\0' ||
+      std::memchr(response.ub_device, '\0', sizeof(response.ub_device)) ==
+          nullptr ||
+      std::all_of(response.eid, response.eid + kEidBytes,
+                  [](uint8_t byte) { return byte == 0U; })) {
+    if (error != nullptr && error->empty()) {
+      *error = "peer service returned invalid candidate information";
+    }
+    return false;
+  }
+  PeerCandidateInfo discovered{};
+  discovered.candidate_id = response.candidate_id;
+  discovered.eid_index = response.eid_index;
+  discovered.physical_port = response.physical_port;
+  discovered.ub_device = response.ub_device;
+  std::memcpy(discovered.eid.data(), response.eid, discovered.eid.size());
+  *candidate_info = std::move(discovered);
+  return true;
+}
+
 bool AllocateRegionAt(const std::string& endpoint, uint64_t ddr_bytes, uint64_t slot_size,
                       uint32_t candidate_id, PeerRegion* region, std::string* error) {
   if (region == nullptr || ddr_bytes == 0U || slot_size == 0U ||
@@ -230,6 +265,15 @@ Status PeerLink::GetCandidateCount(uint32_t* candidate_count) const {
   return GetCandidateCountAt(address_, candidate_count, &error)
              ? Status::OK()
              : ToStatus("peer candidate discovery failed", std::move(error));
+}
+
+Status PeerLink::GetCandidateInfo(uint32_t candidate_id,
+                                  PeerCandidateInfo* candidate_info) const {
+  std::string error;
+  return GetCandidateInfoAt(address_, candidate_id, candidate_info, &error)
+             ? Status::OK()
+             : ToStatus("peer candidate information discovery failed",
+                        std::move(error));
 }
 
 Status PeerLink::AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,

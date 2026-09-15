@@ -30,6 +30,8 @@ using kvaf::peer::AllocateRegionRequest;
 using kvaf::peer::AllocateRegionResponse;
 using kvaf::peer::CandidateCountRequest;
 using kvaf::peer::CandidateCountResponse;
+using kvaf::peer::CandidateInfoRequest;
+using kvaf::peer::CandidateInfoResponse;
 using kvaf::peer::Command;
 using kvaf::peer::CreateChannelRequest;
 using kvaf::peer::CreateChannelResponse;
@@ -43,6 +45,7 @@ using kvaf::peer::StatusResponse;
 using kvaf::peer::kEidBytes;
 using kvaf::peer::kQpKeyBytes;
 using kvaf::peer::kSegKeyBytes;
+using kvaf::peer::kUnknownPhysicalPort;
 
 constexpr uint32_t kJettyDepth = 8192U;
 constexpr uint32_t kJfcDepth = 16384U;
@@ -272,10 +275,31 @@ struct UrmaCandidate {
   uint32_t id = 0U;
   std::string device_name;
   uint32_t eid_index = 0U;
+  uint32_t physical_port = kUnknownPhysicalPort;
   std::array<uint8_t, kEidBytes> eid{};
   bool unavailable = false;
   std::unique_ptr<UrmaResources> resources;
 };
+
+uint32_t ResolvePhysicalPort(urma_device_t* device) {
+  if (device == nullptr) return kUnknownPhysicalPort;
+  urma_device_attr_t attributes{};
+  if (urma_query_device(device, &attributes) != URMA_SUCCESS) {
+    Log("[KVAF_CPU] CANDIDATE_PORT_QUERY_FAILED ub_device=%s errno=%d\n",
+        device->name, errno);
+    return kUnknownPhysicalPort;
+  }
+  // The public URMA EID record has no port id. A single-port device is the
+  // only case where the mapping is unambiguous without provider-private APIs.
+  return attributes.port_cnt == 1U ? 0U : kUnknownPhysicalPort;
+}
+
+const char* PhysicalPortText(uint32_t physical_port, char* buffer,
+                             size_t buffer_bytes) {
+  if (physical_port == kUnknownPhysicalPort) return "unknown";
+  std::snprintf(buffer, buffer_bytes, "%u", physical_port);
+  return buffer;
+}
 
 class UrmaResourcePool {
  public:
@@ -308,6 +332,7 @@ class UrmaResourcePool {
         Log("[KVAF_CPU] CANDIDATE_ENUM_FAILED ub_device=%s errno=%d\n", device->name, errno);
         continue;
       }
+      const uint32_t physical_port = ResolvePhysicalPort(device);
       for (uint32_t eid_position = 0U; eid_position < eid_count; ++eid_position) {
         const urma_eid_info_t& info = eids[eid_position];
         if ((eid_index_requested && info.eid_index != requested_eid_index) ||
@@ -318,6 +343,7 @@ class UrmaResourcePool {
         UrmaCandidate candidate{};
         candidate.device_name = device->name;
         candidate.eid_index = info.eid_index;
+        candidate.physical_port = physical_port;
         std::memcpy(candidate.eid.data(), info.eid.raw, candidate.eid.size());
         candidates_.push_back(std::move(candidate));
       }
@@ -334,8 +360,12 @@ class UrmaResourcePool {
     for (uint32_t index = 0U; index < candidates_.size(); ++index) {
       UrmaCandidate& candidate = candidates_[index];
       candidate.id = index;
-      Log("[KVAF_CPU] CANDIDATE_DISCOVERED id=%u ub_device=%s eid_index=%u eid=", candidate.id,
-          candidate.device_name.c_str(), candidate.eid_index);
+      char physical_port[16]{};
+      Log("[KVAF_CPU] CANDIDATE_DISCOVERED id=%u ub_device=%s eid_index=%u "
+          "physical_port=%s raw_eid=", candidate.id,
+          candidate.device_name.c_str(), candidate.eid_index,
+          PhysicalPortText(candidate.physical_port, physical_port,
+                           sizeof(physical_port)));
       for (uint8_t byte : candidate.eid) {
         std::fprintf(stderr, "%02x", byte);
       }
@@ -357,6 +387,11 @@ class UrmaResourcePool {
 
   uint32_t CandidateCount() const {
     return static_cast<uint32_t>(candidates_.size());
+  }
+
+  const UrmaCandidate* FindCandidate(uint32_t candidate_id) const {
+    return candidate_id < candidates_.size() ? &candidates_[candidate_id]
+                                             : nullptr;
   }
 
   UrmaResources* Get(uint32_t candidate_id) {
@@ -428,6 +463,23 @@ class CpuService {
 
   uint32_t CandidateCount() const {
     return resource_pool_ == nullptr ? 0U : resource_pool_->CandidateCount();
+  }
+
+  Result DescribeCandidate(uint32_t candidate_id,
+                           CandidateInfoResponse* response) const {
+    if (resource_pool_ == nullptr || response == nullptr) {
+      return Result::kInvalidRequest;
+    }
+    const UrmaCandidate* candidate =
+        resource_pool_->FindCandidate(candidate_id);
+    if (candidate == nullptr) return Result::kNotFound;
+    response->candidate_id = candidate->id;
+    response->eid_index = candidate->eid_index;
+    response->physical_port = candidate->physical_port;
+    std::snprintf(response->ub_device, sizeof(response->ub_device), "%s",
+                  candidate->device_name.c_str());
+    std::memcpy(response->eid, candidate->eid.data(), candidate->eid.size());
+    return Result::kOk;
   }
 
   Result Allocate(uint64_t bytes, uint64_t slot_size, uint32_t candidate_id,
@@ -739,6 +791,25 @@ void HandleClient(int fd, CpuService* service) {
       response.result = static_cast<int32_t>(response.candidate_count == 0U
                                                   ? Result::kResourceError
                                                   : Result::kOk);
+      (void)WriteAll(fd, &response, sizeof(response));
+      return;
+    }
+    case Command::kGetCandidateInfo: {
+      CandidateInfoRequest request{};
+      request.header = header;
+      if (!IsValidHeader(header, command, sizeof(request)) ||
+          !ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header),
+                   sizeof(request) - sizeof(header))) {
+        SendStatus(fd, command, Result::kInvalidRequest);
+        return;
+      }
+      CandidateInfoResponse response{};
+      response.header = MakeHeader(command, sizeof(response));
+      response.header.command = ResponseCommand(command);
+      response.result = static_cast<int32_t>(
+          service == nullptr
+              ? Result::kResourceError
+              : service->DescribeCandidate(request.candidate_id, &response));
       (void)WriteAll(fd, &response, sizeof(response));
       return;
     }

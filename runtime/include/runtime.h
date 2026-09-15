@@ -92,6 +92,8 @@ class RuntimeCore {
       const BatchGetExecutionOptions& execution = BatchGetExecutionOptions{});
   Status BatchPut(const BatchPutRequest& request,
                   BatchPutExecutionOptions execution = {});
+  Status SetBatchPutHostProfiling(bool enabled);
+  Status CopyBatchPutHostProfile(BatchPutHostProfile* profile) const;
   Status BatchFree(const BatchFreeRequest& request);
 
  protected:
@@ -123,6 +125,8 @@ class RuntimeCore {
   std::uint64_t next_access_table_id_{1};
   std::unordered_map<std::uint64_t, std::unique_ptr<AccessTableState>>
       access_tables_;
+  bool batch_put_host_profiling_enabled_{false};
+  BatchPutHostProfile last_batch_put_host_profile_{};
 };
 
 }  // namespace kvaf

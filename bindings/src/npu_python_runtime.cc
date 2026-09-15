@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -155,7 +156,8 @@ class NpuPythonRuntime final {
                    std::uint32_t batch_get_tokens_per_block,
                    std::uint32_t device_id, std::uint32_t npu_core_count,
                    std::string batch_put_kernel_object_path,
-                   std::uint32_t jettys_per_core) {
+                   std::uint32_t jettys_per_core,
+                   std::optional<std::uint32_t> cpu_peer_candidate) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
                               batch_get_tokens_per_block};
@@ -164,6 +166,8 @@ class NpuPythonRuntime final {
     options.device_id = device_id;
     options.npu_core_count = npu_core_count;
     options.jettys_per_core = jettys_per_core;
+    options.has_cpu_peer_candidate = cpu_peer_candidate.has_value();
+    options.cpu_peer_candidate = cpu_peer_candidate.value_or(0U);
     native_ = std::make_unique<::kvaf::NpuRuntime>(std::move(options));
   }
 
@@ -304,6 +308,60 @@ class NpuPythonRuntime final {
     ThrowIfError(native_->core().BatchFree(BatchFreeRequest{std::move(copied_keys)}));
   }
 
+  void StartBatchPutKernelProfile() {
+    ThrowIfError(native_->SetBatchPutKernelProfiling(true));
+  }
+
+  py::list BatchPutKernelProfileSnapshot() const {
+    std::vector<kvaf::BatchPutKernelProfile> profiles;
+    ThrowIfError(native_->CopyBatchPutKernelProfiles(&profiles));
+    py::list result;
+    for (std::size_t core = 0; core < profiles.size(); ++core) {
+      const kvaf::BatchPutKernelProfile& profile = profiles[core];
+      py::dict item;
+      item["core"] = core;
+      item["execute_cycles"] = profile.execute_cycles;
+      item["non_execute_cycles"] = profile.non_execute_cycles;
+      result.append(std::move(item));
+    }
+    return result;
+  }
+
+  py::list StopBatchPutKernelProfile() {
+    py::list result = BatchPutKernelProfileSnapshot();
+    ThrowIfError(native_->SetBatchPutKernelProfiling(false));
+    return result;
+  }
+  void StartBatchPutHostProfile() {
+    ThrowIfError(native_->SetBatchPutHostProfiling(true));
+  }
+
+  py::dict BatchPutHostProfileSnapshot() const {
+    kvaf::BatchPutHostProfile profile;
+    ThrowIfError(native_->CopyBatchPutHostProfile(&profile));
+    py::dict result;
+    result["row_count"] = profile.row_count;
+    result["payload_bytes"] = profile.payload_bytes;
+    result["metadata_bytes"] = profile.metadata_bytes;
+    result["request_validation_ns"] = profile.request_validation_ns;
+    result["prepare_put_ns"] = profile.prepare_put_ns;
+    result["metadata_reserve_ns"] = profile.metadata_reserve_ns;
+    result["metadata_pack_ns"] = profile.metadata_pack_ns;
+    result["metadata_h2d_ns"] = profile.metadata_h2d_ns;
+    result["local_buffer_acquire_ns"] = profile.local_buffer_acquire_ns;
+    result["execute_sync_ns"] = profile.execute_sync_ns;
+    result["local_buffer_release_ns"] = profile.local_buffer_release_ns;
+    result["commit_put_ns"] = profile.commit_put_ns;
+    result["runtime_non_execute_ns"] = profile.runtime_non_execute_ns;
+    result["runtime_e2e_ns"] = profile.runtime_e2e_ns;
+    return result;
+  }
+
+  py::dict StopBatchPutHostProfile() {
+    py::dict result = BatchPutHostProfileSnapshot();
+    ThrowIfError(native_->SetBatchPutHostProfiling(false));
+    return result;
+  }
   // Tensor ownership remains with Python. KVAF creates no output Tensor and
   // only retains its internal Direct-HCCP execution state; callers must keep
   // input/output Tensors and either the DeviceAccessTable or the direct
@@ -413,13 +471,15 @@ void BindNpuPythonRuntime(py::module_& module) {
 
   py::class_<NpuPythonRuntime>(module, "NpuRuntime")
       .def(py::init<std::string, std::uint32_t, std::uint32_t, std::uint32_t,
-                    std::uint32_t, std::string, std::uint32_t>(),
+                    std::uint32_t, std::string, std::uint32_t,
+                    std::optional<std::uint32_t>>(),
            py::arg("batch_get_kernel_object_path"),
            py::arg("batch_get_token_bytes"),
            py::arg("batch_get_tokens_per_block"), py::arg("device_id") = 0,
            py::arg("npu_core_count") = 1,
            py::arg("batch_put_kernel_object_path") = "",
-           py::arg("jettys_per_core") = 2)
+           py::arg("jettys_per_core") = 2,
+           py::arg("cpu_peer_candidate") = std::nullopt)
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
            "Connect this NPU Runtime to a CPU Runtime service before initialize.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),
@@ -451,6 +511,24 @@ void BindNpuPythonRuntime(py::module_& module) {
            "Release the supplied keys from the Runtime metadata store. keys "
            "accepts a Python key sequence or a contiguous one-dimensional "
            "CPU torch.int64 Tensor.")
+      .def("start_batch_put_kernel_profile",
+           &NpuPythonRuntime::StartBatchPutKernelProfile,
+           "Enable the per-core BatchPut kernel timing summary.")
+      .def("batch_put_kernel_profile",
+           &NpuPythonRuntime::BatchPutKernelProfileSnapshot,
+           "Return the latest completed per-core BatchPut kernel timing summary.")
+      .def("stop_batch_put_kernel_profile",
+           &NpuPythonRuntime::StopBatchPutKernelProfile,
+           "Return the latest summary and disable BatchPut kernel profiling.")
+      .def("start_batch_put_host_profile",
+           &NpuPythonRuntime::StartBatchPutHostProfile,
+           "Enable BatchPut Runtime and host-side stage timing.")
+      .def("batch_put_host_profile",
+           &NpuPythonRuntime::BatchPutHostProfileSnapshot,
+           "Return the latest synchronous BatchPut host-side timeline.")
+      .def("stop_batch_put_host_profile",
+           &NpuPythonRuntime::StopBatchPutHostProfile,
+           "Return the latest host-side timeline and disable its timing.")
       .def("batch_get", &NpuPythonRuntime::BatchGet,
            py::arg("device_access_table"), py::arg("indices"), py::arg("offsets"),
            py::arg("mask"),

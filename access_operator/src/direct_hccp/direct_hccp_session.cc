@@ -142,10 +142,9 @@ bool LoadSessionApi(DirectHccpSession *session) {
     CloseLibraries(session);
     return false;
   }
-  std::fprintf(stderr,
-               "[KVAF_AIV] DIRECT_HCCP_SESSION_API_READY ra_library=%s "
-               "device_ra_policy=ra_init_ret_328002_reuse\n",
-               session->ra_library_name.c_str());
+  VerboseLog("[KVAF_AIV] DIRECT_HCCP_SESSION_API_READY ra_library=%s "
+             "device_ra_policy=ra_init_ret_328002_reuse\n",
+             session->ra_library_name.c_str());
   return true;
 }
 
@@ -197,19 +196,17 @@ bool EnsureDeviceRa(DirectHccpSession *session) {
   const int ret = CallRaInitWithRetry(session, kOfflineHdc, "device_aiv");
   if (ret == 0) {
     session->device_ra_owned = true;
-    std::fprintf(stderr,
-                 "[KVAF_AIV] DIRECT_HCCP_SESSION_RA_OWNED "
-                 "role=device_aiv physical=%u hdc_type=%u\n",
-                 session->key.physical_device_id, session->key.hdc_type);
+    VerboseLog("[KVAF_AIV] DIRECT_HCCP_SESSION_RA_OWNED "
+               "role=device_aiv physical=%u hdc_type=%u\n",
+               session->key.physical_device_id, session->key.hdc_type);
     return true;
   }
   if (ret == kRepeatRaInit) {
     session->device_ra_owned = false;
-    std::fprintf(stderr,
-                 "[KVAF_AIV] DIRECT_HCCP_SESSION_RA_REUSED "
-                 "role=device_aiv physical=%u hdc_type=%u "
-                 "source=ra_init_ret_328002\n",
-                 session->key.physical_device_id, session->key.hdc_type);
+    VerboseLog("[KVAF_AIV] DIRECT_HCCP_SESSION_RA_REUSED "
+               "role=device_aiv physical=%u hdc_type=%u "
+               "source=ra_init_ret_328002\n",
+               session->key.physical_device_id, session->key.hdc_type);
     return true;
   }
   std::fprintf(stderr,

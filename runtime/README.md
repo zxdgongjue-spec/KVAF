@@ -247,6 +247,27 @@ BatchPut 的 Runtime binding 依赖 BatchGet 的公共 NPU Runtime 构建，因�
 `build.sh npu` 一次构建两个 AIV kernel、host transport 与 Python binding。端到端
 正确性入口与上节相同；它会在 BatchGet 前验证 AIV Direct-HCCP BatchPut。
 
+`tests/run_remote_cpu_batch_put_kernel_perf.sh` 专门测量 BatchPut AIV kernel。
+它扫描 `entry_bytes` 和 `row_count`，每次先通过 BatchGet 回读验证 payload，再执行
+warmup 和正式采样。kernel 使用每 core 的 `GetSystemCycle()` timeline，汇总取最慢
+core 的 elapsed cycles；有效写带宽按 `row_count * entry_bytes / elapsed` 计算。
+时间换算默认使用 1000 MHz；目标平台的 SystemCycle 频率不同时，通过
+`KVAF_BATCH_PUT_KERNEL_CLOCK_MHZ` 覆盖。频率只影响微秒和 GB/s，不影响原始 cycles。
+
+```bash
+KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 \
+KVAF_BATCH_PUT_KERNEL_CLOCK_MHZ=1000 \
+bash tests/run_remote_cpu_batch_put_kernel_perf.sh "$PWD/build-npu"
+```
+
+如果 sweep 被中断或分段手动续跑，可直接从保留的完整日志重建汇总 CSV；不完整日志
+会被跳过，同一 `entry_bytes/row_count` 的重复结果采用修改时间最新的日志：
+
+```bash
+python3 tests/generate_batch_put_sweep_csv.py results/batch_put_sweep \
+  --clock-mhz 1000
+```
+
 测试规模复用 BatchGet 的 `KVAF_NPU_REQUESTS`、`KVAF_NPU_TOKEN_BYTES`、
 `KVAF_NPU_TOKENS_PER_BLOCK`、
 `KVAF_NPU_CORE_COUNT`、`KVAF_NPU_JETTYS_PER_CORE`、`KVAF_NPU_WARMUP` 和

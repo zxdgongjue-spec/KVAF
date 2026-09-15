@@ -9,6 +9,9 @@
 
 namespace kvaf {
 
+struct BatchGetKernelProfile;
+struct BatchPutHostProfile;
+struct BatchPutKernelProfile;
 struct NpuRuntimeOptions {
   NpuRuntimeOptions(std::string kernel_object_path,
                     std::uint32_t token_bytes,
@@ -24,6 +27,10 @@ struct NpuRuntimeOptions {
   std::uint32_t device_id{0U};
   std::uint32_t npu_core_count{1U};
   std::uint32_t jettys_per_core{2U};
+  // When set, initialize only against this CPU Runtime UMDK/EID candidate.
+  // Otherwise candidates are probed in the CPU service's discovery order.
+  bool has_cpu_peer_candidate{false};
+  std::uint32_t cpu_peer_candidate{0U};
 };
 
 // NPU role Runtime. It owns the current MetaManager, NPU AccessOperator and
@@ -46,6 +53,11 @@ class NpuRuntime final : public Runtime {
   std::uint32_t batch_get_token_bytes() const;
   std::uint32_t batch_get_tokens_per_block() const;
 
+  Status SetBatchPutKernelProfiling(bool enabled);
+  Status CopyBatchPutKernelProfiles(
+      std::vector<BatchPutKernelProfile>* profiles) const;
+  Status SetBatchPutHostProfiling(bool enabled);
+  Status CopyBatchPutHostProfile(BatchPutHostProfile* profile) const;
   Status LinkTo(const LinkTarget& target) override;
   Status AcceptLink(const LinkTarget& peer) override;
   Status ReleaseLink(LinkId link_id) override;

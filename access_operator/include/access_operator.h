@@ -16,6 +16,7 @@ class PeerLink;
 namespace kvaf {
 
 struct PutAccessDesc;
+struct BatchPutHostProfile;
 using PeerLink = peer::PeerLink;
 
 struct BatchPutExecRequest {
@@ -35,6 +36,15 @@ class AccessOperator {
 
   virtual Status ExecuteBatchGet(const BatchGetExecRequest& request) = 0;
   virtual Status ExecuteBatchPut(const BatchPutExecRequest& request) = 0;
+
+  // Host profiling is opt-in because each stage reads a host clock. Default
+  // implementations keep test or alternate operators source-compatible.
+  virtual Status SetBatchPutHostProfiling(bool) {
+    return Status::NotImplemented("BatchPut host profiling is not available");
+  }
+  virtual Status CopyBatchPutHostProfile(BatchPutHostProfile*) const {
+    return Status::NotImplemented("BatchPut host profiling is not available");
+  }
 };
 
 // Configuration for the current NPU-backed default implementation. Transport
@@ -54,6 +64,32 @@ struct AccessOperatorConfig {
   std::shared_ptr<PeerLink> peer_link;
 };
 
+struct BatchPutKernelProfile {
+  std::uint64_t execute_cycles{0};
+  std::uint64_t non_execute_cycles{0};
+};
+// Host-side timing for one successful synchronous BatchPut. The AIV kernel
+// timeline is intentionally separate: these fields expose Runtime and
+// host/ACL work surrounding the device kernel without changing its ABI.
+struct BatchPutHostProfile {
+  std::uint64_t row_count{0};
+  std::uint64_t payload_bytes{0};
+  std::uint64_t metadata_bytes{0};
+  std::uint64_t request_validation_ns{0};
+  std::uint64_t prepare_put_ns{0};
+  std::uint64_t metadata_reserve_ns{0};
+  std::uint64_t metadata_pack_ns{0};
+  // Host-side duration of the metadata upload submission.
+  std::uint64_t metadata_h2d_ns{0};
+  std::uint64_t local_buffer_acquire_ns{0};
+  std::uint64_t execute_sync_ns{0};
+  std::uint64_t local_buffer_release_ns{0};
+  std::uint64_t commit_put_ns{0};
+  // Runtime E2E minus the synchronous data-plane ExecuteBatchPut interval.
+  std::uint64_t runtime_non_execute_ns{0};
+  std::uint64_t runtime_e2e_ns{0};
+
+};
 // Default synchronous NPU data-plane implementation.
 //
 // Initialize creates reusable BatchGet and (when configured) BatchPut
@@ -79,6 +115,13 @@ class DefaultAccessOperator final : public AccessOperator {
   Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
   Status ExecuteBatchPut(const BatchPutExecRequest& request) override;
 
+  // BatchPut is synchronous, so its latest host status already represents a
+  // completed kernel when ExecuteBatchPut returns.
+  Status SetBatchPutKernelProfiling(bool enabled);
+  Status CopyBatchPutKernelProfiles(
+      std::vector<BatchPutKernelProfile>* profiles) const;
+  Status SetBatchPutHostProfiling(bool enabled) override;
+  Status CopyBatchPutHostProfile(BatchPutHostProfile* profile) const override;
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

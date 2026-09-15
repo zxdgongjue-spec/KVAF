@@ -50,6 +50,8 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
   if(KVAF_ENABLE_AIV_BATCH_PUT)
     target_link_libraries(kvaf_default_access_operator
       PRIVATE kvaf_execute_batch_put_host)
+    target_link_libraries(kvaf_default_access_operator
+      PRIVATE kvaf_direct_hccp_session)
     target_compile_definitions(kvaf_default_access_operator
       PRIVATE KVAF_ENABLE_AIV_BATCH_PUT=1)
   endif()

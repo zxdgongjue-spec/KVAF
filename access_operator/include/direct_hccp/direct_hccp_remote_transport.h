@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 
 #include "direct_hccp/direct_hccp_abi.h"
 
@@ -37,6 +38,28 @@ struct DirectHccpApi {
   GetTpInfoAsyncFn get_tp_info_async{nullptr};
   AsyncReqResultFn get_async_req_result{nullptr};
   GetRandomFn get_random{nullptr};
+  // Optional observability symbols.  Older CANN releases do not export
+  // these, so their absence must not prevent data-plane initialization.
+  GetDevEidInfoNumFn get_dev_eid_info_num{nullptr};
+  GetDevEidInfoListFn get_dev_eid_info_list{nullptr};
+};
+
+constexpr std::uint32_t kUnknownEidIndex = UINT32_MAX;
+constexpr std::uint32_t kUnknownPhysicalPort = UINT32_MAX;
+
+// Identity of one local EID as reported by RA and /proc/asdrv_ub/pair_info.
+// `physical_port` is the active pair_info chan_id; it is intentionally kept
+// separate from func_id because the latter is a hardware function identifier,
+// not a port number.
+struct LocalEidIdentity {
+  bool found{false};
+  std::uint32_t eid_index{kUnknownEidIndex};
+  std::string udma_device;
+  std::uint32_t physical_port{kUnknownPhysicalPort};
+  std::uint32_t die_id{0U};
+  std::uint32_t chip_id{0U};
+  std::uint32_t func_id{0U};
+  std::uint32_t dev_feature{0U};
 };
 
 struct DirectMemory {
@@ -98,6 +121,14 @@ bool LoadDirectHccp(DirectHccpApi* api);
 void CloseDirectHccp(DirectHccpApi* api);
 
 bool GetCurrentNpuPhysicalDeviceId(std::uint32_t* physical_device_id);
+
+// Resolve a raw local EID to the provider's real EID index and device name.
+// The port comes from the matching active pair_info chan_id when available.
+// This helper is best-effort to preserve compatibility with older CANN builds.
+bool ResolveLocalEidIdentity(
+    const DirectHccpApi& api, std::uint32_t physical_device_id,
+    const std::array<std::uint8_t, kEidBytes>& eid,
+    LocalEidIdentity* identity);
 void ReleaseDeviceAivTransport(const DeviceAivTransportResources& resources);
 
 // Converts the Link descriptor's raw UMDK token to the AIV WQE token format.
