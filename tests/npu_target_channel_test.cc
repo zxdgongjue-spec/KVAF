@@ -12,6 +12,11 @@ namespace {
 namespace hccp = kvaf::direct_hccp;
 using kvaf::npu_service_detail::TargetChannel;
 
+static_assert((hccp::MemRegFlags(false) & (1U << 11U)) == 0U,
+              "pinned HBM registration must keep non-pin disabled");
+static_assert((hccp::MemRegFlags(true) & (1U << 11U)) != 0U,
+              "non-pin registration flag ABI changed");
+
 void Check(bool ok, const char* message) {
   if (!ok) throw std::runtime_error(message);
 }
