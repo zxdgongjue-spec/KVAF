@@ -60,6 +60,23 @@ stream launches `C` AIV blocks; the transport contains `2*C*J` independent
 SQ/CQ pairs. The current total block limit is 48. The default stream count is
 1. BatchPut continues to launch `C` blocks on one stream.
 
+Set `batch_get_transport_count=2` as well to give each stream its own transport,
+with `C*J` workers per transport and the same total `2*C*J` workers. The default
+is 1; two transports require two streams. Both use the same peer link, DDR
+region, table and output. Each independently creates the contexts for its EID
+list, transport tokens, remote-memory imports and cached output registrations.
+The EID count cannot exceed workers per transport. Queue/status storage stays
+stream-major with disjoint slices, and indices persist across calls. The
+launcher selects each transport's entity table without offsetting into the
+other table. The V2 kernel ABI and CPU wire protocol are unchanged by this
+extension; rebuild the NPU host libraries and binding, retaining the V2 kernel.
+
+`BATCH_GET_TRANSPORT_READY`, `BATCH_GET_TRANSPORT_CONTEXT` and
+`BATCH_GET_TRANSPORT_WORKER` logs correlate transport/stream/core/Jetty with
+context, token, SQ/CQ and local/peer TP handles. RA/HDC sessions are still
+shared within a process; different context-scoped TP handles alone do not
+prove physical TP isolation.
+
 The caller stream records a ready event, the internal stream waits for it,
 and the two kernels read disjoint halves of the live `[0, miss_count)` prefix.
 Each kernel further divides its half among its `C` blocks. Both keep global
@@ -90,11 +107,20 @@ bandwidth uses `kernel_wall` (earliest start to latest finish), not the maximum
 individual block duration. End-to-end call-to-completion remains the main
 latency metric.
 
+Use `--stream-count 2 --transport-count 2` (or
+`KVAF_NPU_BATCH_GET_TRANSPORT_COUNT=2`) for the dual-transport experiment.
+Keep streams, cores, Jettys, batch shape and EIDs identical while comparing
+`--transport-count 1` with `--transport-count 2`. The sweep script validates
+the final initialization attempt's context and queue ownership before
+recording a result. It rejects shared contexts/SQ/CQ, but leaves TP sharing
+as a diagnostic observation. Both modes use the same kernel-wall metric.
+
 Hardware integration coverage:
 
 ```bash
 KVAF_RUN_NPU_TESTS=1 KVAF_NPU_CORE_COUNT=1 \
 KVAF_NPU_JETTYS_PER_CORE=1 KVAF_NPU_BATCH_GET_STREAM_COUNT=2 \
+KVAF_NPU_BATCH_GET_TRANSPORT_COUNT=2 \
 KVAF_NPU_GRAPH_REPLAYS=4 python3 tests/python/test_npu_batch_get.py
 ```
 

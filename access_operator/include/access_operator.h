@@ -57,13 +57,17 @@ struct AccessOperatorConfig {
   // takes precedence when it is non-empty.
   std::array<std::uint8_t, 16> peer_local_eid{};
   // Runtime may supply more than one selected local EID. BatchGet creates one
-  // RaCtx per EID and stripes core/Jetty workers over those paths; BatchPut
+  // RaCtx per EID per transport and stripes workers over those paths; BatchPut
   // continues to use peer_local_eid above.
   std::vector<std::array<std::uint8_t, 16>> peer_local_eids{};
   std::shared_ptr<PeerLink> peer_link;
-  // 1: caller stream only; 2: caller + internal stream, sharing one transport.
+  // 1: caller stream only; 2: caller + internal stream.
   // Total BatchGet workers = stream_count * npu_core_count * jettys_per_core.
   std::uint32_t batch_get_stream_count{1};
+  // 1: shared transport; 2: one transport per stream (requires two streams).
+  // Each transport uses the same EID list and remote region. RA/HDC session
+  // remains process-shared; separate RaCtx handles do not guarantee separate TPs.
+  std::uint32_t batch_get_transport_count{1};
 };
 
 struct BatchGetKernelProfile {

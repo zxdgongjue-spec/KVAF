@@ -15,6 +15,7 @@ environment variables:
     --token-bytes          KVAF_BATCH_GET_PERF_TOKEN_BYTES
     --miss-count           KVAF_BATCH_GET_PERF_MISS_COUNT
     --stream-count         KVAF_NPU_BATCH_GET_STREAM_COUNT (1 or 2)
+    --transport-count      KVAF_NPU_BATCH_GET_TRANSPORT_COUNT (1 or 2)
     --sort-input-indices   KVAF_BATCH_GET_PERF_SORT_INPUT_INDICES=1
     --kernel-profile       KVAF_BATCH_GET_PERF_KERNEL_PROFILE=1
     --kernel-profile-clock-mhz
@@ -128,7 +129,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         choices=(1, 2),
         default=environment_int("KVAF_NPU_BATCH_GET_STREAM_COUNT", 1),
-        help="BatchGet streams sharing one transport; default: 1",
+        help="BatchGet stream count; default: 1",
+    )
+    parser.add_argument(
+        "--transport-count",
+        type=int,
+        choices=(1, 2),
+        default=environment_int("KVAF_NPU_BATCH_GET_TRANSPORT_COUNT", 1),
+        help="1: shared transport; 2: one per stream (requires --stream-count 2)",
     )
     parser.add_argument(
         "--jettys-per-core",
@@ -245,8 +253,10 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "aiv-cores must be in [1, 48]"
     if args.stream_count not in (1, 2) or args.aiv_cores * args.stream_count > 48:
         return "stream-count must be 1 or 2 and aiv-cores * stream-count must not exceed 48"
-    if len(args.npu_eids) > args.aiv_cores * args.stream_count * args.jettys_per_core:
-        return "npu-eids count must not exceed total BatchGet workers"
+    if args.transport_count not in (1, 2) or args.transport_count > args.stream_count:
+        return "transport-count must be 1 or 2; two transports require two streams"
+    if len(args.npu_eids) > args.aiv_cores * args.stream_count * args.jettys_per_core // args.transport_count:
+        return "npu-eids count must not exceed BatchGet workers per transport"
     if args.warmup < 0:
         return "warmup must be non-negative"
     if args.iterations <= 0:
@@ -340,6 +350,7 @@ def print_kernel_profile(
     miss_count: int,
     token_bytes: int,
     stream_count: int = 1,
+    transport_count: int = 1,
 ) -> None:
     if not samples or any(len(sample) != npu_core_count for sample in samples):
         raise AssertionError("BatchGet kernel profile sample/core count mismatch")
@@ -453,6 +464,7 @@ def print_kernel_profile(
         f"aiv_cores={npu_core_count // stream_count} total_aiv_cores={npu_core_count} "
         f"jettys_per_core={jettys_per_core} "
         f"stream_count={stream_count} cores_per_stream={npu_core_count // stream_count} "
+        f"transport_count={transport_count} "
         f"request_length={request_length} miss_count={miss_count} "
         "setup=entity_queue_and_miss_count compact=removed_direct_prefix "
         "post=descriptor_validation_wqe_fill_sq_copy_and_doorbell "
@@ -492,6 +504,7 @@ def print_kernel_profile(
             f"core={core} samples={len(samples)} "
             f"stream={core // (npu_core_count // stream_count)} "
             f"stream_core={core % (npu_core_count // stream_count)} "
+            f"transport={0 if transport_count == 1 else core // (npu_core_count // stream_count)} "
             + " ".join(
                 f"{name}_mean={value / divisor:.6f}"
                 for name, value in accumulator.items()
@@ -622,6 +635,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         jettys_per_core=args.jettys_per_core,
         npu_eids=args.npu_eids,
         batch_get_stream_count=args.stream_count,
+        batch_get_transport_count=args.transport_count,
     )
     runtime.link_to(remote_cpu_service)
     table = None
@@ -635,6 +649,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"block_bytes={block_bytes} miss_count={miss_count_value} "
             f"ddr_bytes={ddr_bytes} aiv_cores={args.aiv_cores} "
             f"stream_count={args.stream_count} total_aiv_cores={args.aiv_cores * args.stream_count} "
+            f"transport_count={args.transport_count} "
             f"jettys_per_core={args.jettys_per_core} eid_paths={len(args.npu_eids) or 1} "
             f"npu_eids={','.join(args.npu_eids) or 'auto'} warmup={args.warmup} "
             f"iterations={args.iterations} seed={args.seed} "
@@ -840,6 +855,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 miss_count_value,
                 token_bytes,
                 args.stream_count,
+                args.transport_count,
             )
             runtime.stop_batch_get_kernel_profile()
             kernel_profile_started = False

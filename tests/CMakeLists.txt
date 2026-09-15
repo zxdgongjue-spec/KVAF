@@ -10,6 +10,11 @@ add_test(
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_stream_config.py"
 )
+add_test(
+  NAME kvaf_batch_get_transport_sweep_python
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_transport_sweep.py"
+)
 
 if(KVAF_BUILD_PYTHON)
   add_test(

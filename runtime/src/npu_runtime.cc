@@ -430,6 +430,7 @@ struct NpuRuntime::Impl {
     config.npu_core_count = options.npu_core_count;
     config.jettys_per_core = options.jettys_per_core;
     config.batch_get_stream_count = options.batch_get_stream_count;
+    config.batch_get_transport_count = options.batch_get_transport_count;
     // BatchPut is intentionally unchanged and keeps its existing two-Jetty
     // maximum when BatchGet selects three to sixty-four lanes.
     config.batch_put_jettys_per_core =
@@ -467,6 +468,9 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
       impl_->options.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
       (impl_->options.batch_get_stream_count != 1U &&
        impl_->options.batch_get_stream_count != 2U) ||
+      (impl_->options.batch_get_transport_count != 1U &&
+       impl_->options.batch_get_transport_count != 2U) ||
+      impl_->options.batch_get_transport_count > impl_->options.batch_get_stream_count ||
       static_cast<std::uint64_t>(impl_->options.npu_core_count) *
               impl_->options.batch_get_stream_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->options.batch_get_token_bytes == 0U ||
@@ -535,10 +539,11 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   }
   const std::size_t worker_count =
       static_cast<std::size_t>(impl_->options.npu_core_count) *
-      impl_->options.batch_get_stream_count * impl_->options.jettys_per_core;
+      impl_->options.batch_get_stream_count * impl_->options.jettys_per_core /
+      impl_->options.batch_get_transport_count;
   if (explicit_eids && npu_candidates.size() > worker_count) {
     return Status::InvalidArgument(
-        "npu_eids count exceeds npu_core_count * batch_get_stream_count * jettys_per_core workers");
+        "npu_eids count exceeds BatchGet workers per transport");
   }
   // Automatic discovery retains the established first-working-candidate
   // behavior. An explicit list is one atomic multi-EID group: every path must
@@ -743,6 +748,9 @@ std::uint32_t NpuRuntime::npu_core_count() const { return impl_->options.npu_cor
 std::uint32_t NpuRuntime::jettys_per_core() const { return impl_->options.jettys_per_core; }
 std::uint32_t NpuRuntime::batch_get_stream_count() const {
   return impl_->options.batch_get_stream_count;
+}
+std::uint32_t NpuRuntime::batch_get_transport_count() const {
+  return impl_->options.batch_get_transport_count;
 }
 const std::vector<std::string>& NpuRuntime::npu_eids() const {
   return impl_->options.npu_eids;

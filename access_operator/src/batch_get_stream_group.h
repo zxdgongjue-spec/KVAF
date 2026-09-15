@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 
@@ -9,8 +10,9 @@
 
 namespace kvaf {
 
-// One transport is viewed as [stream][block][Jetty]. The caller stream runs
-// shard 0; an owned stream runs shard 1. The fork/join also gives graph capture
+// The caller supplies resource bindings for each stream, using one shared or
+// two independent transports. The caller stream runs shard 0; an owned stream
+// runs shard 1. The fork/join also gives graph capture
 // a path from the caller stream into the side stream and back.
 // The owner must serialize submissions/replays and complete caller streams
 // before teardown. This object does not own caller streams or request buffers.
@@ -58,18 +60,19 @@ class BatchGetStreamGroup {
     failed_ = false;
   }
 
-  // base.block_count is the per-stream block count; base pointers cover all
-  // streams. Only resource pointers are sliced; request/output pointers stay
-  // global and the kernel partitions the live device-side miss_count.
-  Status Launch(const KvafExecuteBatchGetKernelArgs& base, aclrtStream caller) {
+  // Each lane already points to its own entity/queue/status slice. Request and
+  // output pointers stay global; the kernel partitions the live miss_count.
+  Status Launch(const std::array<KvafExecuteBatchGetKernelArgs, 2>& lanes,
+                aclrtStream caller) {
     if (failed_) {
       return Status::InvalidState("BatchGet stream group failed; complete outstanding work and reinitialize");
     }
-    if (caller == nullptr || base.block_count == 0U ||
-        (stream_count_ == 2U && (side_stream_ == nullptr || ready_ == nullptr || done_ == nullptr))) {
+    if (caller == nullptr || lanes[0].block_count == 0U ||
+        (stream_count_ == 2U && (side_stream_ == nullptr || ready_ == nullptr || done_ == nullptr ||
+                                lanes[1].block_count != lanes[0].block_count))) {
       return Status::InvalidArgument("invalid BatchGet stream group launch");
     }
-    auto first = base;
+    auto first = lanes[0];
     first.shard_id = 0U;
     first.shard_count = stream_count_;
     if (stream_count_ == 1U) {
@@ -77,13 +80,9 @@ class BatchGetStreamGroup {
                  ? Status::OK() : Status::Internal("failed to launch BatchGet");
     }
 
-    auto second = first;
+    auto second = lanes[1];
     second.shard_id = 1U;
-    const std::uint64_t workers = static_cast<std::uint64_t>(base.block_count) *
-                                 (base.jettys_per_core == 0U ? 1U : base.jettys_per_core);
-    second.channel_entity += workers * sizeof(KvafBatchGetDirectUrmaEntity);
-    second.queue_state += workers * sizeof(KvafBatchGetQueueState);
-    second.core_status += static_cast<std::uint64_t>(base.block_count) * sizeof(KvafBatchGetCoreStatus);
+    second.shard_count = stream_count_;
 
     if (aclrtRecordEvent(ready_, caller) != ACL_SUCCESS ||
         aclrtStreamWaitEvent(side_stream_, ready_) != ACL_SUCCESS) {

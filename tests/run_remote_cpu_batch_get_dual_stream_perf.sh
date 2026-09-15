@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Sweep one- or two-stream BatchGet on one transport. Core counts are per stream.
+# Sweep BatchGet with one/two streams and transports. Core counts are per stream.
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: run_remote_cpu_batch_get_dual_stream_perf.sh /absolute/path/to/build-npu [--stream-count 1|2] [batch-get-perf-options...]
+Usage: run_remote_cpu_batch_get_dual_stream_perf.sh /absolute/path/to/build-npu [--stream-count 1|2] [--transport-count 1|2] [batch-get-perf-options...]
 
 Stream count defaults to KVAF_NPU_BATCH_GET_STREAM_COUNT or 2; --stream-count
-takes precedence. Kernel profiling is enabled. Sweep values override the
+takes precedence. Transport count defaults to KVAF_NPU_BATCH_GET_TRANSPORT_COUNT
+or 1; two transports require two streams. Kernel profiling is enabled. Sweep values override the
 corresponding forwarded options. Other options (e.g. --iterations,
 --request-length, --npu-eids, --sort-input-indices) go to the existing benchmark.
 
@@ -21,6 +22,7 @@ Other environment variables:
   KVAF_BATCH_GET_KERNEL_CLOCK_MHZ             default: 1000 (set for target device)
   KVAF_BATCH_GET_DUAL_STREAM_LOG_DIR          default: a new directory under TMPDIR
   KVAF_BATCH_GET_DUAL_STREAM_CSV              default: LOG_DIR/batch_get_{single,dual}_stream_summary.csv
+                                             two transports add _2_transports before .csv
   KVAF_CPU_SERVICE_ADDR, DEVICE_ID, KVAF_NPU_EIDS, KVAF_REMOTE_CPU_PERF_TIMEOUT
                                              same as run_remote_cpu_batch_get_perf.sh
 
@@ -37,6 +39,7 @@ if [[ "$1" == --help || "$1" == -h ]]; then usage; exit 0; fi
 KVAF_BUILD_DIR="$1"
 shift
 stream_count="${KVAF_NPU_BATCH_GET_STREAM_COUNT-2}"
+transport_count="${KVAF_NPU_BATCH_GET_TRANSPORT_COUNT-1}"
 perf_options=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -46,6 +49,12 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --stream-count=*) stream_count="${1#*=}"; shift ;;
+    --transport-count)
+      [[ $# -ge 2 ]] || { echo "ERROR: --transport-count requires 1 or 2" >&2; exit 2; }
+      transport_count="$2"
+      shift 2
+      ;;
+    --transport-count=*) transport_count="${1#*=}"; shift ;;
     --help|-h) usage; exit 0 ;;
     *) perf_options+=("$1"); shift ;;
   esac
@@ -54,6 +63,14 @@ done
   echo "ERROR: stream-count must be 1 or 2: $stream_count" >&2
   exit 2
 }
+[[ "$transport_count" == 1 || "$transport_count" == 2 ]] || {
+  echo "ERROR: transport-count must be 1 or 2: $transport_count" >&2
+  exit 2
+}
+if (( transport_count > stream_count )); then
+  echo "ERROR: two transports require --stream-count 2" >&2
+  exit 2
+fi
 # Restore forwarded arguments, including the no-options case on Bash 3.
 if [[ ${#perf_options[@]} -gt 0 ]]; then set -- "${perf_options[@]}"; fi
 
@@ -98,28 +115,31 @@ else
 fi
 stream_label=dual
 if [[ "$stream_count" == 1 ]]; then stream_label=single; fi
-: "${KVAF_BATCH_GET_DUAL_STREAM_CSV:=$KVAF_BATCH_GET_DUAL_STREAM_LOG_DIR/batch_get_${stream_label}_stream_summary.csv}"
+transport_suffix=""
+if [[ "$transport_count" == 2 ]]; then transport_suffix="_2_transports"; fi
+: "${KVAF_BATCH_GET_DUAL_STREAM_CSV:=$KVAF_BATCH_GET_DUAL_STREAM_LOG_DIR/batch_get_${stream_label}_stream_summary${transport_suffix}.csv}"
 mkdir -p "$(dirname "$KVAF_BATCH_GET_DUAL_STREAM_CSV")"
 : > "$KVAF_BATCH_GET_DUAL_STREAM_CSV"
 combinations=$((${#token_sizes[@]} * ${#miss_counts[@]} * ${#core_counts[@]} * ${#jetty_counts[@]}))
 echo "BATCH_GET_DUAL_STREAM_LOG_DIR path=$KVAF_BATCH_GET_DUAL_STREAM_LOG_DIR"
 echo "BATCH_GET_DUAL_STREAM_CSV path=$KVAF_BATCH_GET_DUAL_STREAM_CSV"
-echo "BATCH_GET_DUAL_STREAM_PLAN stream_count=$stream_count transport_count=1 core_count_scope=per_stream combinations=$combinations clock_mhz=$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ"
+echo "BATCH_GET_DUAL_STREAM_PLAN stream_count=$stream_count transport_count=$transport_count core_count_scope=per_stream combinations=$combinations clock_mhz=$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ"
 
 # Append after every successful configuration so earlier results survive a later
 # failure. Parse cycle fields rather than rounded millisecond profile values.
 append_result() {
   python3 - "$1" "$KVAF_BATCH_GET_DUAL_STREAM_CSV" "$2" "$3" "$4" "$5" \
-    "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" "$stream_count" <<'PY'
+    "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" "$stream_count" "$transport_count" <<'PY'
 import csv
 import math
 import os
 import sys
 
 log_path, csv_path = sys.argv[1:3]
-token_bytes, miss_count, cores, jettys, clock, streams = map(int, sys.argv[3:])
+token_bytes, miss_count, cores, jettys, clock, streams, transports = map(int, sys.argv[3:])
 total_cores = streams * cores
 records = {}
+resources = {kind: [] for kind in ("BATCH_GET_TRANSPORT_READY", "BATCH_GET_TRANSPORT_CONTEXT", "BATCH_GET_TRANSPORT_WORKER")}
 with open(log_path, encoding="utf-8", errors="replace") as source:
     for line in source:
         parts = line.split()
@@ -130,6 +150,12 @@ with open(log_path, encoding="utf-8", errors="replace") as source:
         fields = dict(part.split("=", 1) for part in parts[1:] if "=" in part)
         key = fields.get("operation") if parts[0] == "PERF_RESULT" else parts[0]
         records[key] = fields
+        if key == "BATCH_GET_TRANSPORT_READY" and fields.get("transport_id") == "0":
+            # Runtime may discard a candidate EID after an initialization probe
+            # and retry. Validate only the final transport group used by the run.
+            resources = {kind: [] for kind in resources}
+        if key in resources:
+            resources[key].append(fields)
 
 def require(record, **expected):
     actual = records.get(record, {})
@@ -144,17 +170,52 @@ def number(record, field):
     return value
 
 try:
-    require("BATCH_GET_STREAMS_READY", streams=streams, transport_count=1,
+    require("BATCH_GET_STREAMS_READY", streams=streams, transport_count=transports,
             cores_per_stream=cores, total_cores=total_cores,
             jettys_per_core=jettys, total_jettys=total_cores * jettys)
     require("BATCH_GET_PERF_CONFIG", stream_count=streams, aiv_cores=cores,
+            transport_count=transports,
             total_aiv_cores=total_cores, jettys_per_core=jettys,
             miss_count=miss_count, token_bytes=token_bytes)
     require("BATCH_GET_PERF_CORRECTNESS_PASS", miss_count=miss_count)
     require("KERNEL_PROFILE_CONTRACT", stream_count=streams, cores_per_stream=cores,
+            transport_count=transports,
             total_aiv_cores=total_cores, jettys_per_core=jettys, clock_mhz=clock)
+    paths = int(records["BATCH_GET_PERF_CONFIG"]["eid_paths"])
+    ready = resources["BATCH_GET_TRANSPORT_READY"]
+    contexts = resources["BATCH_GET_TRANSPORT_CONTEXT"]
+    workers = resources["BATCH_GET_TRANSPORT_WORKER"]
+    expected_contexts = {(t, p) for t in range(transports) for p in range(paths)}
+    context_map = {(int(r["transport_id"]), int(r["eid_path"])): int(r["context"], 16) for r in contexts}
+    if (paths <= 0 or len(ready) != transports or
+            {int(r["transport_id"]) for r in ready} != set(range(transports)) or
+            len(contexts) != len(expected_contexts) or set(context_map) != expected_contexts or
+            len(set(context_map.values())) != len(expected_contexts) or 0 in context_map.values()):
+        raise ValueError("missing or shared BatchGet transport contexts")
+    for r in ready:
+        if (int(r["workers"]) != total_cores * jettys // transports or
+                int(r["cores_per_stream"]) != cores or int(r["eid_paths"]) != paths or
+                int(r["first_stream"]) != (0 if transports == 1 else int(r["transport_id"])) or
+                int(r["stream_count"]) != streams // transports):
+            raise ValueError("unexpected worker allocation per transport")
+    expected_workers = {(s, c, j) for s in range(streams) for c in range(cores) for j in range(jettys)}
+    if (len(workers) != len(expected_workers) or
+            {(int(r["stream"]), int(r["stream_core"]), int(r["jetty_slot"])) for r in workers} != expected_workers):
+        raise ValueError("missing or duplicate BatchGet workers")
+    for r in workers:
+        transport_id = int(r["transport_id"])
+        if (transport_id != (0 if transports == 1 else int(r["stream"])) or
+                int(r["context"], 16) != context_map[(transport_id, int(r["eid_path"]))]):
+            raise ValueError("worker bound to the wrong transport/context")
+    for field in ("sq_va", "cq_va"):
+        addresses = {int(r[field], 16) for r in workers}
+        if len(addresses) != len(expected_workers) or 0 in addresses:
+            raise ValueError(f"shared or missing worker {field}")
+    # TP handles are logged for diagnosis; distinct context-scoped handles do
+    # not prove independent physical TPs. Never infer TP isolation from them.
     row = dict(token_bytes=token_bytes, miss_count=miss_count, stream_count=streams,
-               transport_count=1, cores_per_stream=cores, total_aiv_cores=total_cores,
+               transport_count=transports, context_count=len(context_map),
+               cores_per_stream=cores, total_aiv_cores=total_cores,
                jettys_per_core=jettys, total_jettys=total_cores * jettys,
                payload_bytes=miss_count * token_bytes, clock_mhz=clock,
                samples=int(records["batch_get_kernel_wall"]["samples"]))
@@ -191,10 +252,11 @@ for token_bytes in "${token_sizes[@]}"; do
   for miss_count in "${miss_counts[@]}"; do
     for cores in "${core_counts[@]}"; do
       for jettys in "${jetty_counts[@]}"; do
-        log_file="$KVAF_BATCH_GET_DUAL_STREAM_LOG_DIR/stream_count_${stream_count}_token_bytes_${token_bytes}_miss_count_${miss_count}_cores_per_stream_${cores}_jettys_per_core_${jettys}.log"
-        echo "BATCH_GET_DUAL_STREAM_BEGIN run=$((completed + 1))/$combinations stream_count=$stream_count token_bytes=$token_bytes miss_count=$miss_count cores_per_stream=$cores total_aiv_cores=$((stream_count * cores)) jettys_per_core=$jettys total_jettys=$((stream_count * cores * jettys))"
+        log_file="$KVAF_BATCH_GET_DUAL_STREAM_LOG_DIR/stream_count_${stream_count}_transport_count_${transport_count}_token_bytes_${token_bytes}_miss_count_${miss_count}_cores_per_stream_${cores}_jettys_per_core_${jettys}.log"
+        echo "BATCH_GET_DUAL_STREAM_BEGIN run=$((completed + 1))/$combinations stream_count=$stream_count transport_count=$transport_count token_bytes=$token_bytes miss_count=$miss_count cores_per_stream=$cores total_aiv_cores=$((stream_count * cores)) jettys_per_core=$jettys total_jettys=$((stream_count * cores * jettys))"
         if "$KVAF_BATCH_GET_PERF_RUNNER" "$KVAF_BUILD_DIR" "$@" \
           --stream-count "$stream_count" --token-bytes "$token_bytes" --miss-count "$miss_count" \
+          --transport-count "$transport_count" \
           --aiv-cores "$cores" --jettys-per-core "$jettys" \
           --kernel-profile --kernel-profile-clock-mhz "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" \
           2>&1 | tee "$log_file"; then
@@ -210,15 +272,15 @@ for token_bytes in "${token_sizes[@]}"; do
   done
 done
 
-python3 - "$KVAF_BATCH_GET_DUAL_STREAM_CSV" "$stream_count" <<'PY'
+python3 - "$KVAF_BATCH_GET_DUAL_STREAM_CSV" "$stream_count" "$transport_count" <<'PY'
 import csv
 import sys
 
 with open(sys.argv[1], newline="", encoding="utf-8") as source:
     rows = list(csv.DictReader(source))
-print(f"\nBATCH_GET_DUAL_STREAM_SUMMARY combinations={len(rows)} stream_count={sys.argv[2]} transport_count=1")
+print(f"\nBATCH_GET_DUAL_STREAM_SUMMARY combinations={len(rows)} stream_count={sys.argv[2]} transport_count={sys.argv[3]}")
 print("timing=earliest_kernel_start_to_latest_kernel_finish units=us bandwidth=decimal_GB/s")
-columns = ("token_bytes", "miss_count", "stream_count", "cores_per_stream", "total_aiv_cores",
+columns = ("token_bytes", "miss_count", "stream_count", "transport_count", "cores_per_stream", "total_aiv_cores",
            "jettys_per_core", "total_jettys", "kernel_wall_mean_us", "kernel_wall_p50_us",
            "kernel_wall_p90_us", "kernel_wall_p99_us", "kernel_wall_p50_GBps", "host_p50_us")
 print(" ".join(columns))

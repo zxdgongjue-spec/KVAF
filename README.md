@@ -116,7 +116,8 @@ TCP 用于交换控制信息，初始化UB建链；KV 数据 通过 NPU AIV kern
   AccessTable；
 - `BatchGet`：使用 NPU Tensor 发起 AIV 读取；默认仅入队到调用方 stream；
 - 可设置 `batch_get_stream_count=2`，用调用方及一条内部 stream 并发执行请求分片，
-  共用单个 transport；`npu_core_count` 为每路核数，总核数为两者乘积（不超过 48），
+  默认共用单个 transport；加上 `batch_get_transport_count=2` 可让每路独立创建 transport。
+  `npu_core_count` 为每路核数，总核数为两者乘积（不超过 48），
   总 Jetty 数再乘以 `jettys_per_core`。两路完成依赖会汇合到调用方 stream；
 - `BatchFree`：释放 Key 对应的 slot。仍被 AccessTable 持有的 Key 会返回 busy。
 
@@ -295,7 +296,7 @@ tests/run_remote_cpu_batch_get_perf.sh /absolute/path/to/build-npu \
   --sort-input-indices
 ```
 
-单/双 stream、单 transport 的参数扫描使用
+单/双 stream、单/双 transport 的参数扫描使用
 `tests/run_remote_cpu_batch_get_dual_stream_perf.sh`。需先重新编译当前分支的 host、
 Python binding 和 AIV kernel，并启动 CPU 服务。快速测试两路各 1 核、各 1 Jetty：
 
@@ -334,6 +335,35 @@ mean/p50/p90/p99。整次调用耗时包含提交和同步，排除请求构造�
 `batch_get_dual_stream_summary.csv`，同一目录可保留两种模式的结果。
 `KVAF_BATCH_GET_DUAL_STREAM_CSV` 可指定汇总路径；复用同名文件会覆盖此前结果。
 `--help` 显示完整参数，其他 benchmark 选项继续透传。
+
+`--transport-count 1|2` 控制 BatchGet transport 数（默认 1，也可设置
+`KVAF_NPU_BATCH_GET_TRANSPORT_COUNT`，命令行优先）。2 个 transport 要求 2 个 stream；
+每个 transport 独占该路的 `每路核数 × 每核 Jetty 数` 个 worker，保持总资源数不变。
+两路仍共享 table、同一远端 DDR region 和 output，各自建立通信 context 与内存注册。
+RA/HDC session 在同进程内仍共享，物理 TP 是否独立需要进一步核查。
+
+下面固定两路各 2 核、每核 1 Jetty，对比单/双 transport：
+
+```bash
+export KVAF_BATCH_GET_DUAL_STREAM_TOKEN_BYTES="656"
+export KVAF_BATCH_GET_DUAL_STREAM_MISS_COUNTS="8192"
+export KVAF_BATCH_GET_DUAL_STREAM_AIV_CORES="2"
+export KVAF_BATCH_GET_DUAL_STREAM_JETTYS_PER_CORE="1"
+export KVAF_BATCH_GET_DUAL_STREAM_LOG_DIR="/tmp/kvaf_transport_compare"
+for transports in 1 2; do
+  tests/run_remote_cpu_batch_get_dual_stream_perf.sh /absolute/path/to/build-npu \
+    --stream-count 2 --transport-count "$transports" --warmup 3 --iterations 100
+done
+```
+
+日志文件名包含 stream 和 transport 数；双 transport 默认 CSV 为
+`batch_get_dual_stream_summary_2_transports.csv`，可与单 transport 结果共存。
+CSV 的 `transport_count` 为实际配置，`context_count` 为验证过的 context 数。
+每组检查 `BATCH_GET_TRANSPORT_*` 日志中的 transport 分配、context 和 SQ/CQ 独占性，
+并记录各 Jetty 的本端/远端 TP handle 供排查。context 数等于
+`transport_count × EID 数`，EID 数不能超过每个 transport 的 worker 数。
+从双 stream V2 版本升级时，重编 NPU 端 host、Runtime 和 Python binding 即可；
+CPU 服务和现有 V2 AIV kernel 无需改动。
 
 `link_to()` 必须先于 `initialize()` 调用。调用方需要在 BatchGet 所在 stream 完成前保持
 输入/输出 Tensor 和 `DeviceAccessTable` 有效；Runtime 只管理内部 DDR、元数据和内部

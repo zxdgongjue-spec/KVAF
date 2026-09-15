@@ -37,7 +37,7 @@ output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数�
 `NpuRuntime(batch_get_kernel_object_path, batch_get_token_bytes,
 batch_get_tokens_per_block, device_id=0, npu_core_count=1,
 batch_put_kernel_object_path="", jettys_per_core=2, npu_eids=[],
-batch_get_stream_count=1)` 要求显式传入单 token KV
+batch_get_stream_count=1, batch_get_transport_count=1)` 要求显式传入单 token KV
 字节数和每个 KV block 中的 token 数，两个参数均无默认值；
 每个 AccessTable entry 大小为两者乘积。
 `jettys_per_core` 配置 BatchGet 每个 AIV core 使用的 Jetty 数量，
@@ -45,12 +45,18 @@ batch_get_stream_count=1)` 要求显式传入单 token KV
 使用相同数量，BatchGet 配置为 3 到 64 时 BatchPut 仍使用 2 个。
 `batch_get_stream_count` 可选 1（默认）或 2。`npu_core_count` 表示**每个 stream**
 的 AIV block 数，总 BatchGet block 数为两者乘积，当前不能超过 48。
-双 stream 使用同一个 transport：调用方 stream 执行分片 0，内部 stream 执行分片 1；
+`batch_get_transport_count` 可选 1（默认，共享 transport）或 2（每路独立 transport，
+要求 `batch_get_stream_count=2`）。各 transport 使用相同 EID 列表，分别创建 RaCtx、
+token、远端内存导入和本地 output 注册；仍共享同一个远端 DDR region 和 AccessTable。
+EID 数不能超过每个 transport 的 worker 数。RA/HDC session 在同进程内仍共享，
+不同 context 不保证物理 TP 独立。
+双 stream 中调用方 stream 执行分片 0，内部 stream 执行分片 1；
 各自使用独占的 SQ/CQ 和持久 queue state。分片范围按设备上的实际 `miss_count`
 计算，不回传 CPU。内部 stream 在返回前通过 event 汇合到调用方 stream，
 因此调用方 stream 的后续任务及同步包含两路读取。
 `batch_get_kernel_profile()` 按 `[stream][core]` 返回所有 block 的 profile；
-`core` 是全局编号，`stream` 和 `stream_core` 分别标识路编号和路内编号。
+`core` 是全局编号，`stream` 和 `stream_core` 分别标识路编号和路内编号，
+`transport` 标识所属 BatchGet transport。
 BatchPut 仍为单 stream、`npu_core_count` 个 block。
 远程 CPU DDR 只增加 `runtime.link_to("CPU_IP:port")`，必须在 `initialize` 前调用。
 `npu_eids=[]` 时 EID、UMDK device 与候选 RMA 验证由 C++ Runtime 自动完成；

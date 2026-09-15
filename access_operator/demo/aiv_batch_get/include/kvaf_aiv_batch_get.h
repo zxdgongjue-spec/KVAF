@@ -39,6 +39,12 @@ int32_t KvafBatchGetTransportCreateWithPeerLinkMultiEid(
     KvafBatchGetTransport **transport);
 void KvafBatchGetTransportDestroy(KvafBatchGetTransport *transport);
 
+// Initialization-only diagnostics for correlating stream/transport ownership
+// with context, token, queue and TP handles. No device synchronization.
+void KvafBatchGetTransportLogResources(
+    const KvafBatchGetTransport *transport, uint32_t transport_id,
+    uint32_t first_stream, uint32_t cores_per_stream, uint32_t jettys_per_core);
+
 // Acquire registers/caches one caller-owned HBM output range. Re-acquiring
 // the exact (address, bytes) pair returns the same local-buffer handle and
 // entity table while adding one reference. The returned entity is passed in

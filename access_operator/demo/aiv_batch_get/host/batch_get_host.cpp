@@ -613,6 +613,45 @@ extern "C" int32_t KvafBatchGetLocalBufferAcquire(KvafBatchGetTransport *transpo
   return KVAF_BATCH_GET_SUCCESS;
 }
 
+extern "C" void KvafBatchGetTransportLogResources(
+    const KvafBatchGetTransport *transport, uint32_t transport_id,
+    uint32_t first_stream, uint32_t cores_per_stream, uint32_t jettys_per_core) {
+  if (transport == nullptr || cores_per_stream == 0U || jettys_per_core == 0U) return;
+  const uint64_t workers_per_stream = static_cast<uint64_t>(cores_per_stream) * jettys_per_core;
+  std::fprintf(stderr,
+               "[KVAF_AIV] BATCH_GET_TRANSPORT_READY transport_id=%u first_stream=%u "
+               "stream_count=%llu cores_per_stream=%u workers=%u eid_paths=%zu\n",
+               transport_id, first_stream,
+               static_cast<unsigned long long>(transport->worker_count / workers_per_stream),
+               cores_per_stream, transport->worker_count, transport->paths.size());
+  for (std::size_t index = 0; index < transport->paths.size(); ++index) {
+    const auto &path = transport->paths[index];
+    std::fprintf(stderr,
+                 "[KVAF_AIV] BATCH_GET_TRANSPORT_CONTEXT transport_id=%u eid_path=%zu "
+                 "context=%p session=%p token_handle=%p remote_memory_import=%p eid=%s\n",
+                 transport_id, index, path.device_context, static_cast<void*>(transport->session),
+                 path.device_transport_token_handle, path.device_peer_memory_import,
+                 EidToHex(path.local_eid).c_str());
+  }
+  for (uint32_t index = 0; index < transport->worker_count; ++index) {
+    const auto &worker = transport->workers[index];
+    const auto &entity = transport->entity_templates[index];
+    const auto &tp = worker.device_peer_import_info.in.ub.exp_import_cfg;
+    std::fprintf(stderr,
+                 "[KVAF_AIV] BATCH_GET_TRANSPORT_WORKER transport_id=%u stream=%u "
+                 "stream_core=%u jetty_slot=%u eid_path=%u context=%p jetty_id=%u "
+                 "sq_va=0x%llx cq_va=0x%llx local_tp=0x%llx peer_tp=0x%llx\n",
+                 transport_id, first_stream + static_cast<uint32_t>(index / workers_per_stream),
+                 (index / jettys_per_core) % cores_per_stream, index % jettys_per_core,
+                 worker.path_index, transport->paths[worker.path_index].device_context,
+                 static_cast<unsigned int>(entity.jetty_id),
+                 static_cast<unsigned long long>(entity.sq_va),
+                 static_cast<unsigned long long>(entity.cq_va),
+                 static_cast<unsigned long long>(tp.tp_handle),
+                 static_cast<unsigned long long>(tp.peer_tp_handle));
+  }
+}
+
 extern "C" void KvafBatchGetLocalBufferRelease(KvafBatchGetLocalBuffer *local_buffer) {
   if (local_buffer == nullptr || local_buffer->transport == nullptr) return;
   if (local_buffer->reference_count == 0U) {

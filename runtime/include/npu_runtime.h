@@ -34,6 +34,8 @@ struct NpuRuntimeOptions {
   std::vector<std::string> npu_eids{};
   // Total BatchGet AIV blocks = npu_core_count * batch_get_stream_count.
   std::uint32_t batch_get_stream_count{1U};
+  // Two transports require two streams; each transport owns its EID contexts.
+  std::uint32_t batch_get_transport_count{1U};
 };
 
 // NPU role Runtime. It owns the current MetaManager, NPU AccessOperator and
@@ -54,6 +56,7 @@ class NpuRuntime final : public Runtime {
   std::uint32_t npu_core_count() const;
   std::uint32_t jettys_per_core() const;
   std::uint32_t batch_get_stream_count() const;
+  std::uint32_t batch_get_transport_count() const;
   const std::vector<std::string>& npu_eids() const;
   std::uint32_t batch_get_token_bytes() const;
   std::uint32_t batch_get_tokens_per_block() const;

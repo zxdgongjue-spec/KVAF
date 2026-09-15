@@ -136,6 +136,7 @@ def main() -> int:
     )
     jettys_per_core = int(os.environ.get("KVAF_NPU_JETTYS_PER_CORE", "2"))
     stream_count = int(os.environ.get("KVAF_NPU_BATCH_GET_STREAM_COUNT", "1"))
+    transport_count = int(os.environ.get("KVAF_NPU_BATCH_GET_TRANSPORT_COUNT", "1"))
     npu_eids = parse_npu_eids(os.environ.get("KVAF_NPU_EIDS"))
     active_percent = int(os.environ.get("KVAF_NPU_ACTIVE_PERCENT", "100"))
     warmup = int(os.environ.get("KVAF_NPU_WARMUP", "1"))
@@ -154,9 +155,11 @@ def main() -> int:
         and npu_core_count > 0
         and npu_core_count <= requests
         and stream_count in (1, 2)
+        and transport_count in (1, 2)
+        and transport_count <= stream_count
         and npu_core_count * stream_count <= 48
         and 1 <= jettys_per_core <= 64
-        and len(npu_eids) <= npu_core_count * stream_count * jettys_per_core
+        and len(npu_eids) <= npu_core_count * stream_count * jettys_per_core // transport_count
         and iterations > 0
         and 1 <= active_percent <= 100
         and graph_replays >= 0
@@ -225,6 +228,7 @@ def main() -> int:
         jettys_per_core=jettys_per_core,
         npu_eids=npu_eids,
         batch_get_stream_count=stream_count,
+        batch_get_transport_count=transport_count,
     )
     runtime.link_to(remote_cpu_service)
     table = None
@@ -239,6 +243,7 @@ def main() -> int:
             f"block_bytes={block_bytes} source_stride={source_stride} "
             f"npu_cores={npu_core_count} jettys_per_core={jettys_per_core} "
             f"stream_count={stream_count} total_cores={npu_core_count * stream_count} "
+            f"transport_count={transport_count} "
             f"eid_paths={len(npu_eids) or 1} "
             f"npu_eids={','.join(npu_eids) or 'auto'} "
             "batch_put_backend=aiv_direct_hccp"
@@ -403,6 +408,7 @@ def main() -> int:
                 )
                 profiles = list(runtime.batch_get_kernel_profile())
                 assert len(profiles) == npu_core_count * stream_count
+                assert all(p["transport"] == (0 if transport_count == 1 else p["stream"]) for p in profiles)
                 assert sum(int(p["active_requests"]) for p in profiles) == count
                 for shard in range(2):
                     expected = count * (shard + 1) // 2 - count * shard // 2

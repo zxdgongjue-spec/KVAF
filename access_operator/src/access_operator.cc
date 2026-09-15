@@ -1,10 +1,12 @@
 #include "access_operator.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -41,6 +43,20 @@ struct BatchGetExecutionState {
   void* queue_state{nullptr};
   std::size_t queue_state_bytes{0};
 };
+
+struct BatchGetTransportDeleter {
+  void operator()(KvafBatchGetTransport* transport) const {
+    KvafBatchGetTransportDestroy(transport);
+  }
+};
+using BatchGetTransportOwner = std::unique_ptr<KvafBatchGetTransport, BatchGetTransportDeleter>;
+
+struct BatchGetLocalBufferDeleter {
+  void operator()(KvafBatchGetLocalBuffer* buffer) const {
+    KvafBatchGetLocalBufferRelease(buffer);
+  }
+};
+using BatchGetLocalBufferRef = std::unique_ptr<KvafBatchGetLocalBuffer, BatchGetLocalBufferDeleter>;
 
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
 // BatchPut request metadata is transient from the caller's perspective, but
@@ -258,11 +274,17 @@ struct DefaultAccessOperator::Impl {
 
   AccessOperatorConfig config;
   RemoteRegionDesc remote_region;
-  KvafBatchGetTransport* transport{nullptr};
+  std::array<BatchGetTransportOwner, 2> transports;
   BatchGetExecutionState execution;
   BatchGetStreamGroup batch_get_streams;
   std::uint32_t BatchGetCoreCount() const {
     return config.npu_core_count * config.batch_get_stream_count;
+  }
+  void ReleaseBatchGetResources() {
+    for (auto& transport : transports) transport.reset();
+    if (execution.queue_state != nullptr) (void)aclrtFree(execution.queue_state);
+    if (execution.status != nullptr) (void)aclrtFree(execution.status);
+    execution = BatchGetExecutionState{};
   }
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   KvafBatchPutTransport* batch_put_transport{nullptr};
@@ -274,7 +296,17 @@ struct DefaultAccessOperator::Impl {
 DefaultAccessOperator::DefaultAccessOperator(AccessOperatorConfig config)
     : impl_(std::make_unique<Impl>(std::move(config))) {}
 
-DefaultAccessOperator::~DefaultAccessOperator() { (void)Shutdown(); }
+DefaultAccessOperator::~DefaultAccessOperator() {
+  const auto status = Shutdown();
+  if (!status.ok()) {
+    // A failed drain leaves device work possibly using these registrations.
+    // Preserve them rather than letting unique_ptr tear them down underneath
+    // the device. Explicit Shutdown can be retried before destruction.
+    std::fprintf(stderr, "[KVAF_AIV] BATCH_GET_SHUTDOWN_INCOMPLETE reason=%s resources_retained=1\n",
+                 status.message().c_str());
+    for (auto& transport : impl_->transports) (void)transport.release();
+  }
+}
 
 Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) {
   if (impl_->initialized) {
@@ -286,6 +318,9 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
       impl_->config.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       (impl_->config.batch_get_stream_count != 1U &&
        impl_->config.batch_get_stream_count != 2U) ||
+      (impl_->config.batch_get_transport_count != 1U &&
+       impl_->config.batch_get_transport_count != 2U) ||
+      impl_->config.batch_get_transport_count > impl_->config.batch_get_stream_count ||
       static_cast<std::uint64_t>(impl_->config.npu_core_count) *
               impl_->config.batch_get_stream_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->config.jettys_per_core == 0 ||
@@ -305,14 +340,14 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     impl_->config.peer_local_eids.push_back(impl_->config.peer_local_eid);
   }
   if (impl_->config.peer_local_eids.empty() ||
-      impl_->config.peer_local_eids.size() > worker_count ||
+      impl_->config.peer_local_eids.size() > worker_count / impl_->config.batch_get_transport_count ||
       std::any_of(impl_->config.peer_local_eids.begin(),
                   impl_->config.peer_local_eids.end(),
                   [](const auto& eid) {
                     return std::all_of(eid.begin(), eid.end(),
                                        [](std::uint8_t value) { return value == 0U; });
                   })) {
-    return InvalidArgument("Runtime Link requires valid Runtime-selected local EIDs");
+    return InvalidArgument("Runtime Link requires valid local EIDs, at most one per BatchGet worker per transport");
   }
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   const std::uint32_t batch_put_jettys_per_core =
@@ -335,20 +370,27 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     return Internal("failed to load BatchGet kernel");
   }
 
-  KvafBatchGetTransport* transport = nullptr;
+  std::array<BatchGetTransportOwner, 2> transports;
   static_assert(sizeof(impl_->config.peer_local_eids.front()) == 16U,
                 "NPU EID storage must remain packed");
   const auto* peer_local_eids = reinterpret_cast<const std::uint8_t*>(
       impl_->config.peer_local_eids.data());
   const auto peer_local_eid_count =
       static_cast<std::uint32_t>(impl_->config.peer_local_eids.size());
-  const int32_t result = KvafBatchGetTransportCreateWithPeerLinkMultiEid(
-      reinterpret_cast<void*>(remote_region.base), remote_region.length,
-      impl_->BatchGetCoreCount(), impl_->config.jettys_per_core,
-      impl_->config.peer_link.get(), peer_local_eids, peer_local_eid_count,
-      &transport);
-  if (result != KVAF_BATCH_GET_SUCCESS || transport == nullptr) {
-    return Internal("failed to create reusable BatchGet transport");
+  for (std::uint32_t index = 0; index < impl_->config.batch_get_transport_count; ++index) {
+    KvafBatchGetTransport* transport = nullptr;
+    const int32_t result = KvafBatchGetTransportCreateWithPeerLinkMultiEid(
+        reinterpret_cast<void*>(remote_region.base), remote_region.length,
+        impl_->BatchGetCoreCount() / impl_->config.batch_get_transport_count,
+        impl_->config.jettys_per_core, impl_->config.peer_link.get(),
+        peer_local_eids, peer_local_eid_count, &transport);
+    transports[index].reset(transport);
+    if (result != KVAF_BATCH_GET_SUCCESS || transport == nullptr) {
+      return Internal("failed to create reusable BatchGet transport " + std::to_string(index));
+    }
+    KvafBatchGetTransportLogResources(
+        transport, index, impl_->config.batch_get_transport_count == 1U ? 0U : index,
+        impl_->config.npu_core_count, impl_->config.jettys_per_core);
   }
 
   BatchGetExecutionState execution;
@@ -368,11 +410,10 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
                   execution.queue_state_bytes) != ACL_SUCCESS) {
     if (execution.queue_state != nullptr) (void)aclrtFree(execution.queue_state);
     if (execution.status != nullptr) (void)aclrtFree(execution.status);
-    KvafBatchGetTransportDestroy(transport);
     return Internal("failed to allocate internal BatchGet execution state");
   }
   impl_->remote_region = remote_region;
-  impl_->transport = transport;
+  impl_->transports = std::move(transports);
   impl_->execution = execution;
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   if (!impl_->config.batch_put_kernel_object_path.empty()) {
@@ -380,11 +421,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
         KvafExecuteBatchPutLoadKernel(
             impl_->config.batch_put_kernel_object_path.c_str()) !=
             KVAF_BATCH_PUT_SUCCESS) {
-      (void)aclrtFree(impl_->execution.queue_state);
-      (void)aclrtFree(impl_->execution.status);
-      KvafBatchGetTransportDestroy(impl_->transport);
-      impl_->transport = nullptr;
-      impl_->execution = BatchGetExecutionState{};
+      impl_->ReleaseBatchGetResources();
       return Internal("failed to load BatchPut kernel");
     }
 
@@ -396,11 +433,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
         &batch_put_transport);
     if (batch_put_result != KVAF_BATCH_PUT_SUCCESS ||
         batch_put_transport == nullptr) {
-      (void)aclrtFree(impl_->execution.queue_state);
-      (void)aclrtFree(impl_->execution.status);
-      KvafBatchGetTransportDestroy(impl_->transport);
-      impl_->transport = nullptr;
-      impl_->execution = BatchGetExecutionState{};
+      impl_->ReleaseBatchGetResources();
       return Internal("failed to create reusable BatchPut transport");
     }
     BatchPutExecutionState batch_put_execution;
@@ -408,11 +441,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
         impl_->config.npu_core_count, &batch_put_execution);
     if (!batch_put_status.ok()) {
       KvafBatchPutTransportDestroy(batch_put_transport);
-      (void)aclrtFree(impl_->execution.queue_state);
-      (void)aclrtFree(impl_->execution.status);
-      KvafBatchGetTransportDestroy(impl_->transport);
-      impl_->transport = nullptr;
-      impl_->execution = BatchGetExecutionState{};
+      impl_->ReleaseBatchGetResources();
       return batch_put_status;
     }
     impl_->batch_put_transport = batch_put_transport;
@@ -433,9 +462,10 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
   }
   std::fprintf(stderr,
                "[KVAF_AIV] BATCH_GET_STREAMS_READY streams=%u cores_per_stream=%u "
-               "total_cores=%u jettys_per_core=%u total_jettys=%zu transport_count=1\n",
+               "total_cores=%u jettys_per_core=%u total_jettys=%zu transport_count=%u\n",
                impl_->config.batch_get_stream_count, impl_->config.npu_core_count,
-               impl_->BatchGetCoreCount(), impl_->config.jettys_per_core, worker_count);
+               impl_->BatchGetCoreCount(), impl_->config.jettys_per_core, worker_count,
+               impl_->config.batch_get_transport_count);
   return Status::OK();
 }
 
@@ -456,24 +486,14 @@ Status DefaultAccessOperator::Shutdown() {
   }
   impl_->batch_put_transport = nullptr;
 #endif
-  if (impl_->transport != nullptr) {
-    KvafBatchGetTransportDestroy(impl_->transport);
-  }
-  if (impl_->execution.queue_state != nullptr) {
-    (void)aclrtFree(impl_->execution.queue_state);
-  }
-  if (impl_->execution.status != nullptr) {
-    (void)aclrtFree(impl_->execution.status);
-  }
-  impl_->transport = nullptr;
-  impl_->execution = BatchGetExecutionState{};
+  impl_->ReleaseBatchGetResources();
   impl_->remote_region = RemoteRegionDesc{};
   impl_->initialized = false;
   return Status::OK();
 }
 
 Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
-  if (!impl_->initialized || impl_->transport == nullptr) {
+  if (!impl_->initialized || impl_->transports[0] == nullptr) {
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
   }
@@ -488,37 +508,46 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
     return status;
   }
 
-  KvafBatchGetLocalBuffer* local_buffer = nullptr;
-  std::uint64_t channel_entity = 0;
-  if (KvafBatchGetLocalBufferAcquire(impl_->transport,
-                                     reinterpret_cast<void*>(arguments.output),
-                                     exec.request->output.bytes, &local_buffer,
-                                     &channel_entity) != KVAF_BATCH_GET_SUCCESS ||
-      local_buffer == nullptr || channel_entity == 0) {
-    return Internal("failed to acquire caller output for BatchGet");
+  // Register/cache the same output in each transport before launching either
+  // shard. An acquisition failure can then safely release all references.
+  std::array<BatchGetLocalBufferRef, 2> local_buffers;
+  std::array<std::uint64_t, 2> entities{};
+  for (std::uint32_t index = 0; index < impl_->config.batch_get_transport_count; ++index) {
+    KvafBatchGetLocalBuffer* local_buffer = nullptr;
+    const auto result = KvafBatchGetLocalBufferAcquire(
+        impl_->transports[index].get(), reinterpret_cast<void*>(arguments.output),
+        exec.request->output.bytes, &local_buffer, &entities[index]);
+    local_buffers[index].reset(local_buffer);
+    if (result != KVAF_BATCH_GET_SUCCESS || local_buffer == nullptr || entities[index] == 0U) {
+      return Internal("failed to acquire caller output for BatchGet transport " + std::to_string(index));
+    }
   }
-  arguments.channel_entity = channel_entity;
 
   const aclrtStream stream = static_cast<aclrtStream>(exec.execution.stream);
   arguments.block_count = impl_->config.npu_core_count;
-  const Status launch_status = impl_->batch_get_streams.Launch(arguments, stream);
+  std::array<KvafExecuteBatchGetKernelArgs, 2> lanes{arguments, arguments};
+  const std::uint64_t workers_per_stream =
+      static_cast<std::uint64_t>(impl_->config.npu_core_count) * impl_->config.jettys_per_core;
+  for (std::uint32_t lane = 0; lane < impl_->config.batch_get_stream_count; ++lane) {
+    const auto transport_index = impl_->config.batch_get_transport_count == 1U ? 0U : lane;
+    const auto entity_offset = impl_->config.batch_get_transport_count == 1U ? lane * workers_per_stream : 0U;
+    lanes[lane].channel_entity = entities[transport_index] + entity_offset * sizeof(KvafBatchGetDirectUrmaEntity);
+    lanes[lane].queue_state += lane * workers_per_stream * sizeof(KvafBatchGetQueueState);
+    lanes[lane].core_status += static_cast<std::uint64_t>(lane) * impl_->config.npu_core_count * sizeof(KvafBatchGetCoreStatus);
+  }
+  const Status launch_status = impl_->batch_get_streams.Launch(lanes, stream);
   if (!launch_status.ok()) {
-    KvafBatchGetLocalBufferRelease(local_buffer);
-    return launch_status;
+    return launch_status;  // Transports retain cached registrations through teardown.
   }
   if (exec.execution.synchronize) {
     const aclError sync_result = aclrtSynchronizeStream(stream);
-    KvafBatchGetLocalBufferRelease(local_buffer);
     if (sync_result != ACL_SUCCESS) {
       return Internal("BatchGet stream synchronization failed");
     }
     LogBatchGetDeviceStatus(impl_->execution, impl_->BatchGetCoreCount());
-  } else {
-    // The demo transport caches zero-reference registrations until shutdown.
-    // Releasing after an externally captured launch keeps KVAF graph-agnostic;
-    // the caller owns stream completion and tensor lifetime.
-    KvafBatchGetLocalBufferRelease(local_buffer);
   }
+  // LocalBuffer reference release retains registrations, including for graph
+  // capture and asynchronous calls. Caller buffers stay live through completion.
   return Status::OK();
 }
 

@@ -34,9 +34,27 @@ class BatchGetStreamConfigTest(unittest.TestCase):
     def test_default_and_environment(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(perf.parse_args([]).stream_count, 1)
+            self.assertEqual(perf.parse_args([]).transport_count, 1)
         with patch.dict(os.environ, {"KVAF_NPU_BATCH_GET_STREAM_COUNT": "2"}, clear=True):
             self.assertEqual(perf.parse_args([]).stream_count, 2)
             self.assertEqual(perf.parse_args(["--stream-count", "1"]).stream_count, 1)
+        with patch.dict(os.environ, {"KVAF_NPU_BATCH_GET_TRANSPORT_COUNT": "2"}, clear=True):
+            self.assertEqual(perf.parse_args([]).transport_count, 2)
+            self.assertEqual(perf.parse_args(["--transport-count", "1"]).transport_count, 1)
+
+    def test_transport_topology_and_eid_capacity(self):
+        with patch.dict(os.environ, {}, clear=True):
+            for streams, transports, valid in ((1, 1, True), (2, 1, True), (2, 2, True), (1, 2, False)):
+                with self.subTest(streams=streams, transports=transports):
+                    args = perf.parse_args(["--stream-count", str(streams), "--transport-count", str(transports)])
+                    self.assertEqual(perf.validate_args(args) is None, valid)
+            args = perf.parse_args([
+                "--stream-count", "2", "--transport-count", "2", "--aiv-cores", "1",
+                "--jettys-per-core", "1", "--npu-eids", "1" * 32 + "," + "2" * 32,
+            ])
+            self.assertIsNotNone(perf.validate_args(args))
+            args.jettys_per_core = 2
+            self.assertIsNone(perf.validate_args(args))
 
     def test_two_streams_expand_worker_capacity(self):
         with patch.dict(os.environ, {}, clear=True):

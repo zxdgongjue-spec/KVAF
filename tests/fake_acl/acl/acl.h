@@ -10,11 +10,13 @@ using aclrtEvent = void*;
 constexpr aclError ACL_SUCCESS = 0;
 constexpr std::uint32_t ACL_EVENT_SYNC = 1;
 constexpr int ACL_MEM_MALLOC_HUGE_FIRST = 0;
+constexpr int ACL_MEM_MALLOC_NORMAL_ONLY = 1;
 constexpr int ACL_MEMCPY_HOST_TO_DEVICE = 1;
 constexpr int ACL_MEMCPY_DEVICE_TO_HOST = 2;
 constexpr int ACL_MEMCPY_DEVICE_TO_DEVICE = 3;
 
 aclError aclrtCreateStream(aclrtStream* stream);
+aclError aclrtSetDevice(std::int32_t device);
 aclError aclrtDestroyStream(aclrtStream stream);
 aclError aclrtCreateEventExWithFlag(aclrtEvent* event, std::uint32_t flag);
 aclError aclrtDestroyEvent(aclrtEvent event);
