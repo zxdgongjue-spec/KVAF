@@ -10,9 +10,9 @@
 namespace kvaf::peer {
 
 constexpr uint32_t kProtocolMagic = 0x4b564350U;  // "KVCP"
-// Version 7 exposes candidate metadata before allocation so adaptive startup
+// Version 6 exposes candidate metadata before allocation so adaptive startup
 // can group EIDs by K-side UB device and benchmark each device only once.
-constexpr uint16_t kProtocolVersion = 7U;
+constexpr uint16_t kProtocolVersion = 6U;
 constexpr uint32_t kQpKeyBytes = 64U;
 constexpr uint32_t kSegKeyBytes = 64U;
 constexpr uint32_t kEidBytes = 16U;
@@ -85,9 +85,7 @@ struct AllocateRegionResponse {
   uint64_t peer_length;
   uint32_t token_id;
   uint32_t token_value;
-  uint32_t peer_eid_index;
   uint8_t peer_eid[kEidBytes];
-  char peer_device_name[kDeviceNameBytes];
   uint8_t segment_key[kSegKeyBytes];
 };
 
@@ -131,7 +129,6 @@ static_assert(sizeof(CandidateCountRequest) == 12U, "candidate count request ABI
 static_assert(sizeof(CandidateCountResponse) == 28U, "candidate count response ABI changed");
 static_assert(sizeof(CandidateInfoRequest) == 16U, "candidate info request ABI changed");
 static_assert(sizeof(CandidateInfoResponse) == 92U, "candidate info response ABI changed");
-static_assert(sizeof(AllocateRegionResponse) == 200U, "allocate response ABI changed");
 static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed");
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");
 

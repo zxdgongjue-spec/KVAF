@@ -595,17 +595,7 @@ class CpuService {
     // (rather than transforming it through its private TokenId wrapper).
     response->token_id = region->token_id->token_id;
     response->token_value = region->token_value;
-    response->peer_eid_index = resources->eid_index();
     response->segment_key_bytes = kSegBytes;
-    if (resources->device_name().empty() ||
-        resources->device_name().size() >= kDeviceNameBytes) {
-      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=device_name name=%s\n",
-          resources->device_name().c_str());
-      ReleaseRegion(region.get());
-      return Result::kResourceError;
-    }
-    std::memcpy(response->peer_device_name, resources->device_name().c_str(),
-                resources->device_name().size());
     std::memcpy(response->peer_eid, region->segment->seg.ubva.eid.raw, kEidBytes);
     std::memcpy(response->segment_key, &region->segment->seg, kSegBytes);
     if (response->peer_base == 0U || response->token_id == 0U) {

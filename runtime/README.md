@@ -165,12 +165,7 @@ runtime.initialize(ddr_bytes, kv_block_bytes)
   `UB_DEVICE_PROBE_RESULT` 每个连通设备最多记录一次标定结果，`UB_DEVICE_SELECTED` 记录正式
   选择；用 `peer_candidate` 对照 K 端 `CANDIDATE_DISCOVERED` 的设备名称/EID。
   结果属于当前 NpuRuntime session，后续 BatchGet/BatchPut 复用该选择；不做运行中
-  切换。不同 N 卡可以选不同 K 端设备。
-- 多 shape sweep 脚本会在第一个子进程中标定一次，读取
-  `UB_DEVICE_SELECTED` 中的 `peer_candidate` 和 `npu_eids`，随后向其余子进程传入
-  `peer_candidate_id` 与显式 EID。后续 shape 只重建业务 session，不再重复带宽标定。
-  `peer_candidate_id` 仅用于同一个 K 服务进程内的短期复用；K 服务重启或候选配置
-  变化后必须重新标定。
+  切换或跨进程缓存。不同 N 卡可以选不同 K 端设备。
 
 现有性能脚本可直接验证：
 
@@ -180,26 +175,12 @@ KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 DEVICE_ID=0 \
   --adaptive-ub-device --token-bytes 656 --miss-count 2048
 ```
 
-一次运行多个 shape 时使用 sweep 脚本；整轮只标定一次：
-
-```bash
-KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 DEVICE_ID=0 \
-  ./tests/run_remote_cpu_batch_get_miss_count_perf.sh \
-  /absolute/path/to/build-npu --adaptive-ub-device
-```
-
-日志中的 `BATCH_GET_SWEEP_UB_DEVICE_SELECTED ... reuse=subsequent_shapes` 表示
-脚本已经保存本轮选择；之后每个 shape 应出现 `UB_DEVICE_REUSED`，不应再出现
-`UB_DEVICE_PROBE_RESULT`。最终 `batch_get_miss_sweep_summary.csv` 的每一行都会包含
-`ub_device`、`peer_candidate`、`peer_eid_index` 和 `npu_eids`，用 Excel 打开时可以
-直接确认整轮测试实际使用的链路。
-
 EID 组合数只影响找到每个设备首个可用链路前的回退开销；沿用现有传输/kernel 超时，当前不新增
 整个选优过程的硬时间上限。多卡同时启动会相互争抢带宽，标定效果需要在目标
 部署并发下验证。固定标定点的最优设备也不保证对所有数据尺寸都最优。
 
-**升级要求：**候选查询包含独立设备数和显式过滤标记，region 响应返回设备名称与
-EID index，并支持在分配前查询候选所属设备，控制协议升级到 v7。
+**升级要求：**候选查询包含独立设备数和显式过滤标记，并支持在分配前查询候选
+所属设备，控制协议从 v4 升到 v6。
 N 端库和 K 端服务必须一起重新构建/部署，即使未开启自适应也不能混用旧协议。
 
 需要同时使用多个 NPU EID 时，设置 `NpuRuntimeOptions::npu_eids`（Python

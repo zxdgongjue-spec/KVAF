@@ -199,23 +199,13 @@ bool AllocateRegionAt(const std::string& endpoint, uint64_t ddr_bytes, uint64_t 
     if (error != nullptr && error->empty()) *error = "peer service returned an invalid region descriptor";
     return false;
   }
-  const void* device_name_end =
-      std::memchr(response.peer_device_name, '\0', kDeviceNameBytes);
-  if (response.peer_device_name[0] == '\0' || device_name_end == nullptr) {
-    SetError(error, "peer service returned an invalid UB device name");
-    return false;
-  }
   PeerRegion allocated{};
   allocated.session_id = response.session_id;
   allocated.base = response.peer_base;
   allocated.length = response.peer_length;
   allocated.token_id = response.token_id;
   allocated.token_value = response.token_value;
-  allocated.eid_index = response.peer_eid_index;
   allocated.segment_key_bytes = response.segment_key_bytes;
-  allocated.device_name.assign(
-      response.peer_device_name,
-      static_cast<const char*>(device_name_end) - response.peer_device_name);
   std::memcpy(allocated.eid.data(), response.peer_eid, allocated.eid.size());
   std::memcpy(allocated.segment_key.data(), response.segment_key, allocated.segment_key.size());
   *region = allocated;

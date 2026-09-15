@@ -17,9 +17,7 @@ struct PeerRegion {
   uint64_t length = 0U;
   uint32_t token_id = 0U;
   uint32_t token_value = 0U;
-  uint32_t eid_index = 0U;
   uint32_t segment_key_bytes = 0U;
-  std::string device_name;
   std::array<uint8_t, kEidBytes> eid{};
   std::array<uint8_t, kSegKeyBytes> segment_key{};
 };

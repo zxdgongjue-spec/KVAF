@@ -40,8 +40,6 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
 
   void SetCandidate(std::uint32_t candidate_id) { candidate_id_ = candidate_id; }
   bool has_allocation() const { return allocated_.base != 0U; }
-  const std::string& device_name() const { return allocated_.device_name; }
-  std::uint32_t eid_index() const { return allocated_.eid_index; }
 
   Status Allocate(const RuntimeInitRequest& request, RemoteRegionDesc* region) override {
     if (link_ == nullptr || region == nullptr || request.ddr_device != DeviceKind::kCpu ||
@@ -467,11 +465,7 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
       impl_->options.jettys_per_core == 0U ||
       impl_->options.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
       impl_->options.batch_get_token_bytes == 0U ||
-      impl_->options.batch_get_tokens_per_block == 0U ||
-      impl_->options.peer_candidate_id < -1 ||
-      (impl_->options.peer_candidate_id >= 0 &&
-       static_cast<std::uint64_t>(impl_->options.peer_candidate_id) >
-           std::numeric_limits<std::uint32_t>::max())) {
+      impl_->options.batch_get_tokens_per_block == 0U) {
     throw std::invalid_argument("invalid NPU Runtime configuration");
   }
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS) {
@@ -525,7 +519,6 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   if (candidate_count == 0U) {
     return Status::NotFound("peer Runtime returned no UMDK/EID candidates");
   }
-  const bool fixed_peer_candidate = impl_->options.peer_candidate_id >= 0;
   std::vector<NpuLocalEidCandidate> npu_candidates;
   std::string discovery_error;
   const bool explicit_eids = !impl_->options.npu_eids.empty();
@@ -547,11 +540,9 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
     return Status::InvalidArgument(
         "npu_eids count exceeds npu_core_count * jettys_per_core workers");
   }
-  const bool tune_candidates = !fixed_peer_candidate &&
-      detail::ShouldTuneStartupCandidates(impl_->options.adaptive_ub_device,
-                                          device_filter_applied);
-  if (!fixed_peer_candidate && impl_->options.adaptive_ub_device &&
-      !device_filter_applied) {
+  const bool tune_candidates = detail::ShouldTuneStartupCandidates(
+      impl_->options.adaptive_ub_device, device_filter_applied);
+  if (impl_->options.adaptive_ub_device && !device_filter_applied) {
     std::fprintf(stderr,
                  "[KVAF_AIV] UB_DEVICE_ADAPTIVE_SKIPPED device_id=%u "
                  "peer_devices=%u reason=no_explicit_peer_device_filter "
@@ -562,10 +553,11 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   // discovered EIDs are connectivity fallbacks.
   const std::size_t npu_group_count = explicit_eids ? 1U : npu_candidates.size();
   std::vector<detail::StartupCandidate> candidates;
-  last = detail::BuildStartupCandidates(candidate_count, npu_group_count,
-                                        impl_->options.peer_candidate_id,
-                                        &candidates);
-  if (!last.ok()) return last;
+  for (std::uint32_t peer = 0; peer < candidate_count; ++peer) {
+    for (std::size_t group = 0; group < npu_group_count; ++group) {
+      candidates.push_back(detail::StartupCandidate{peer, group});
+    }
+  }
   auto initialize_candidate = [&](const detail::StartupCandidate& candidate,
                                   bool measure, double* cycles) -> Status {
     const std::uint32_t peer_candidate = candidate.peer;
@@ -715,12 +707,9 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       if (last.ok()) {
         std::fprintf(stderr,
                      "[KVAF_AIV] UB_DEVICE_PROBE_RESULT device_id=%u peer_candidate=%u "
-                     "ub_device=%s peer_eid_index=%u npu_group=%zu token_bytes=%u "
-                     "miss_count=%u warmup=%u samples=%u "
+                     "npu_group=%zu token_bytes=%u miss_count=%u warmup=%u samples=%u "
                      "p50_kernel_cycles=%.0f bytes_per_cycle=%.6f\n",
-                     impl_->options.device_id, peer_candidate,
-                     impl_->peer_allocator->device_name().c_str(),
-                     impl_->peer_allocator->eid_index(), npu_group,
+                     impl_->options.device_id, peer_candidate, npu_group,
                      detail::kStartupTokenBytes, detail::kStartupMissCount,
                      detail::kStartupWarmup, detail::kStartupSamples, *cycles,
                      static_cast<double>(detail::kStartupTokenBytes) * detail::kStartupMissCount / *cycles);
@@ -748,29 +737,9 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       if (tune_candidates) {
         std::fprintf(stderr,
                      "[KVAF_AIV] UB_DEVICE_SELECTED device_id=%u peer_candidate=%u "
-                     "ub_device=%s peer_eid_index=%u npu_group=%zu npu_eids=%s "
-                     "p50_kernel_cycles=%.0f\n",
-                     impl_->options.device_id, peer_candidate,
-                     impl_->peer_allocator->device_name().c_str(),
-                     impl_->peer_allocator->eid_index(), npu_group,
-                     group_eids.c_str(), *cycles);
-      } else if (fixed_peer_candidate) {
-        std::fprintf(stderr,
-                     "[KVAF_AIV] UB_DEVICE_REUSED device_id=%u peer_candidate=%u "
-                     "ub_device=%s peer_eid_index=%u npu_group=%zu npu_eids=%s\n",
-                     impl_->options.device_id, peer_candidate,
-                     impl_->peer_allocator->device_name().c_str(),
-                     impl_->peer_allocator->eid_index(), npu_group,
-                     group_eids.c_str());
+                     "npu_group=%zu p50_kernel_cycles=%.0f\n",
+                     impl_->options.device_id, peer_candidate, npu_group, *cycles);
       }
-      std::fprintf(stderr,
-                   "[KVAF_AIV] UB_DEVICE_ACTIVE device_id=%u peer_candidate=%u "
-                   "ub_device=%s peer_eid_index=%u npu_eids=%s selection=%s\n",
-                   impl_->options.device_id, peer_candidate,
-                   impl_->peer_allocator->device_name().c_str(),
-                   impl_->peer_allocator->eid_index(), group_eids.c_str(),
-                   tune_candidates ? "adaptive" :
-                       (fixed_peer_candidate ? "reused" : "first_working"));
       return Status::OK();
     }
     if (group_size == 1U) {
