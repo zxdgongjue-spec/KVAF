@@ -593,7 +593,7 @@ struct CpuUrmaTransport::Impl {
 #else
     cfg.flag.bs.access = 1U;
 #endif
-    cfg.flag.bs.non_pin = 1;
+    cfg.flag.bs.non_pin = 0;
     cfg.flag.bs.token_id_valid = 1;
     auto* segment = urma_register_seg(context_, &cfg);
     if (segment == nullptr) {
