@@ -365,6 +365,67 @@ CSV 的 `transport_count` 为实际配置，`context_count` 为验证过的 cont
 从双 stream V2 版本升级时，重编 NPU 端 host、Runtime 和 Python binding 即可；
 CPU 服务和现有 V2 AIV kernel 无需改动。
 
+### 连续 BatchGet 吞吐实验
+
+独立入口 `tests/python/test_npu_batch_get_throughput.py` 用于比较持续读取吞吐。
+它不改变原来的逐批延迟测试。使用测试所需的 Python/CANN 环境，直接指定 NPU 构建目录：
+
+```bash
+python3 tests/python/test_npu_batch_get_throughput.py \
+  --build-dir "$PWD/build-npu" --cpu-service 192.168.1.10:28999 \
+  --process-count 1 --stream-count 1 --transport-count 1 \
+  --aiv-cores 2 --jettys-per-core 1 \
+  --miss-count 8192 --request-length 8192 --token-bytes 656 \
+  --request-bank-size 64 --iterations 20000 --repeats 3 \
+  --output-json /tmp/batch_get_continuous_single.json
+```
+
+将 `--process-count` 改成 `2`，并另选输出文件，即可自动测量 `solo_0`、`solo_1`、
+`concurrent` 三个阶段：两个独立进程始终使用同一张卡、同一个 CPU 服务，先全部
+初始化和预热，再分别单跑和共同读取。每轮轮换阶段顺序；空闲进程不执行 NPU 工作。
+`--device-id` 默认读取 `DEVICE_ID`（缺省 0），`--cpu-service` 默认读取
+`KVAF_CPU_SERVICE_ADDR`（缺省 `127.0.0.1:28999`）。`--npu-eids` / `KVAF_NPU_EIDS`
+可显式指定两进程共同使用的本端 EID。脚本从各进程成功初始化的日志中记录实际
+NPU EID 和 CPU candidate；两进程选择不一致时停止，避免把不同路径误当作同 EID 对照。
+
+每个进程在计时前生成固定请求库，按 `seed + rank` 设置随机种子，并轮换使用请求。
+预填表、输入排序、输出注册、逐个请求计划的正确性检查和 warmup 都在计时外。
+kernel profile 始终关闭，忽略旧 benchmark 的 profile 环境开关。计时区间只包含
+`iterations` 次异步 BatchGet 提交和末尾一次同步，没有逐批请求生成、profile 回读、
+同步或 Python 打印。每个进程复用自己的输出；同一 Operator 的提交沿同一 caller
+stream 排序。双 stream 内部保留原有 fork/join。
+
+主结果 `aggregate_GBps` 使用十进制 GB/s：
+
+```text
+sum(各活跃进程 iterations × miss_count × token_bytes)
+--------------------------------------------------
+     max(完成时间) - min(开始提交时间)
+```
+
+**`miss_count`、`iterations`、table 容量和请求库大小都是每个进程的值；
+`aiv-cores` 是每个 stream 的核数。** 例如两个进程各设置 `miss_count=8192`，
+每轮合计读取 16384 个 token。比较相同总请求量时需显式调整这些参数。
+双 stream 对一个进程的 `miss_count` 分片，不增加该进程的有效字节数。
+
+输出保留每个测量窗口及进程的单调时钟起止值、提交时间、末尾排空时间、开始/结束
+偏差和对共同窗口的带宽贡献。`host_window_overlap_fraction` 只是主机计时窗口的
+重叠比例，不代表 kernel 或链路实际重叠。汇总吞吐按总字节数除以总窗口时间计算，
+并报告双进程相对较快单跑进程的吞吐比。原始结果以 `BATCH_GET_THROUGHPUT_RESULT`
+逐阶段打印；指定的 JSON 在所有阶段成功并释放资源后写入，复用同名文件会覆盖。
+
+只有所有活跃进程完成计时后，才执行最后一个请求计划的输出检查，避免快的一路校验
+干扰慢的一路。计时内复用输出，因此不保留每批结果，也不能逐批检查中间被覆盖的
+输出；带宽按已提交并完成最终同步的计划字节数计。表内数据沿用原延迟测试的 token
+模式，各 entry 内容相同。前置检查会验证每个请求计划的 payload 和未触及的输出行。
+主测试期间没有 kernel profile 历史或逐批设备状态回读。
+
+建议增加 `--iterations`（如 1000、10000、50000）检查长窗口吞吐是否稳定，并增加
+`--request-bank-size` 检查重复请求带来的工作集影响。保持 CPU 页模式、NUMA 策略、
+EID 和表布局等条件一致。本入口仍通过 Python 连续提交，尚未实现 graph；如果设备
+时间线仍有提交断档，不能据此认定链路达到上限。本脚本使用当前已编译接口，无需
+为它重新编译 C++/AIV；要求已有包含 `batch_get_transport_count` 的 NPU binding。
+
 `link_to()` 必须先于 `initialize()` 调用。调用方需要在 BatchGet 所在 stream 完成前保持
 输入/输出 Tensor 和 `DeviceAccessTable` 有效；Runtime 只管理内部 DDR、元数据和内部
 传输资源。

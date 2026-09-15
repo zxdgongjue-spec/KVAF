@@ -15,6 +15,11 @@ add_test(
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_transport_sweep.py"
 )
+add_test(
+  NAME kvaf_batch_get_throughput_python
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_throughput.py"
+)
 
 if(KVAF_BUILD_PYTHON)
   add_test(
