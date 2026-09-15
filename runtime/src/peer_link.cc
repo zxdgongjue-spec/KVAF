@@ -112,6 +112,8 @@ bool Exchange(const std::string& endpoint, const Request& request, Response* res
 }
 
 bool GetCandidateCountAt(const std::string& endpoint, uint32_t* candidate_count,
+                         uint32_t* device_count,
+                         bool* device_filter_applied,
                          std::string* error) {
   if (candidate_count == nullptr) {
     SetError(error, "candidate count output must not be null");
@@ -126,7 +128,16 @@ bool GetCandidateCountAt(const std::string& endpoint, uint32_t* candidate_count,
     if (error != nullptr && error->empty()) *error = "peer service returned no usable UMDK/EID candidates";
     return false;
   }
+  if (response.device_count == 0U || response.device_count > response.candidate_count ||
+      response.device_filter_applied > 1U) {
+    SetError(error, "peer service returned invalid device count");
+    return false;
+  }
   *candidate_count = response.candidate_count;
+  if (device_count != nullptr) *device_count = response.device_count;
+  if (device_filter_applied != nullptr) {
+    *device_filter_applied = response.device_filter_applied != 0U;
+  }
   return true;
 }
 
@@ -225,9 +236,11 @@ bool ReleaseRegionAt(const std::string& endpoint, const PeerRegion& region, std:
 
 PeerLink::PeerLink(std::string address) : address_(std::move(address)) {}
 
-Status PeerLink::GetCandidateCount(uint32_t* candidate_count) const {
+Status PeerLink::GetCandidateCount(uint32_t* candidate_count, uint32_t* device_count,
+                                   bool* device_filter_applied) const {
   std::string error;
-  return GetCandidateCountAt(address_, candidate_count, &error)
+  return GetCandidateCountAt(address_, candidate_count, device_count,
+                             device_filter_applied, &error)
              ? Status::OK()
              : ToStatus("peer candidate discovery failed", std::move(error));
 }

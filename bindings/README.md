@@ -36,7 +36,7 @@ output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数�
 
 `NpuRuntime(batch_get_kernel_object_path, batch_get_token_bytes,
 batch_get_tokens_per_block, device_id=0, npu_core_count=1,
-batch_put_kernel_object_path="", jettys_per_core=2, npu_eids=[])` 要求显式传入单 token KV
+batch_put_kernel_object_path="", jettys_per_core=2, npu_eids=[], adaptive_ub_device=False)` 要求显式传入单 token KV
 字节数和每个 KV block 中的 token 数，两个参数均无默认值；
 每个 AccessTable entry 大小为两者乘积。
 `jettys_per_core` 参数同时
@@ -58,3 +58,8 @@ stream 时使用 `torch.npu.current_stream()`。KVAF 不创建、不保存或销
 Binding 不负责 vLLM 适配。后续只在 Runtime、Meta Manager 和 KV Access Operator 的 C++ 接口稳定后，将需要暴露的类和方法注册到 Python。
 
 CacheOS-vLLM Adaptor 属于 vLLM 侧实现，不放在本目录。
+
+`adaptive_ub_device=True` 在启动时对 K 端显式指定 UB device 的全部 EID 候选
+进行 `656 × 2048` BatchGet 标定，并为当前 Runtime 固定最佳组合。K 端用重复的
+`--ub-device NAME` 限定设备；未指定时沿用首个可用候选。默认关闭；用法与协议升级要求见
+[Runtime 启动选优说明](../runtime/README.md#可选启动-ub-device-选优)。

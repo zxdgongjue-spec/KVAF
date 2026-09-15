@@ -10,10 +10,9 @@
 namespace kvaf::peer {
 
 constexpr uint32_t kProtocolMagic = 0x4b564350U;  // "KVCP"
-// Version 4 adds the initiating peer's EID to CreateChannel. A Jetty key identifies
-// a Jetty only; it is not an EID and cannot be used by peer UMDK CTP lookup.
-// Rejecting older versions prevents that silent ABI mismatch.
-constexpr uint16_t kProtocolVersion = 4U;
+// Version 5 adds the UB device count and whether an explicit device filter was
+// applied, allowing the initiator to tune only a deliberate peer shortlist.
+constexpr uint16_t kProtocolVersion = 5U;
 constexpr uint32_t kQpKeyBytes = 64U;
 constexpr uint32_t kSegKeyBytes = 64U;
 constexpr uint32_t kEidBytes = 16U;
@@ -57,6 +56,8 @@ struct CandidateCountResponse {
   MessageHeader header;
   int32_t result;
   uint32_t candidate_count;
+  uint32_t device_count;
+  uint32_t device_filter_applied;
 };
 
 struct AllocateRegionResponse {
@@ -109,7 +110,7 @@ struct StatusResponse {
 static_assert(sizeof(MessageHeader) == 12U, "wire header ABI changed");
 static_assert(sizeof(AllocateRegionRequest) == 36U, "allocate request ABI changed");
 static_assert(sizeof(CandidateCountRequest) == 12U, "candidate count request ABI changed");
-static_assert(sizeof(CandidateCountResponse) == 20U, "candidate count response ABI changed");
+static_assert(sizeof(CandidateCountResponse) == 28U, "candidate count response ABI changed");
 static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed");
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");
 

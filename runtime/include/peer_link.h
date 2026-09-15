@@ -31,7 +31,8 @@ class PeerLink {
   const std::string& address() const { return address_; }
   bool has_region() const { return !regions_.empty(); }
 
-  Status GetCandidateCount(uint32_t* candidate_count) const;
+  Status GetCandidateCount(uint32_t* candidate_count, uint32_t* device_count = nullptr,
+                           bool* device_filter_applied = nullptr) const;
   Status AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
                         uint32_t candidate_id, PeerRegion* region);
   Status ReleaseRegion(uint64_t base);

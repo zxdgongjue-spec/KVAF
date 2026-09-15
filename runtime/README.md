@@ -110,6 +110,73 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 `batch_get_token_bytes` 和 `batch_get_tokens_per_block` 无默认值，
 构造 `NpuRuntime` 时必须显式传入。
 
+### 可选启动 UB device 选优
+
+每张 N 卡可在 K 端显式限定的 UB device 中独立测速选优。
+K 端重复传入 `--ub-device`，只发布这些设备的全部可用 EID，例如：
+
+```bash
+./build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999 \
+  --ub-device udmac0d1e2 \
+  --ub-device udmac0d1e3 \
+  --ub-device udmac1d1e2 \
+  --ub-device udmac1d1e3
+```
+
+未指定白名单时仍枚举所有设备；指定名称没有可用 EID 时服务启动报错。
+N 端在原有构造参数上增加 `adaptive_ub_device=True`：
+
+```python
+runtime = kvaf.NpuRuntime(
+    batch_get_kernel,
+    batch_get_token_bytes=656,
+    batch_get_tokens_per_block=128,
+    device_id=0,
+    npu_core_count=24,  # 与业务配置保持一致
+    batch_put_kernel_object_path=batch_put_kernel,
+    adaptive_ub_device=True,
+)
+runtime.link_to("141.61.92.71:28999")
+runtime.initialize(ddr_bytes, kv_block_bytes)
+```
+
+- 默认 `False` 保持首个连通候选即选中的行为。
+- 开启后，仅当 K 端显式传入至少一个 `--ub-device` 时执行测速，并在所有显式
+  设备中选优，不限制设备数或 EID 数。K 端未指定 `--ub-device` 时，跳过测速并
+  保持原有“首个可用候选”逻辑。自动发现的本地 EID 分别尝试；显式 `npu_eids`
+  仍作为完整多 EID 组，不会拆开或回退。
+- 每个组合先完成原有 WRITE/CQ 验证，再在独立临时 region 中执行真实 BatchGet。
+  固定标定为 `token_bytes=656, miss_count=2048, tokens_per_block=128`，与正式
+  workload 的尺寸独立；core/Jetty 配置沿用业务配置。请求对 2048 个 token 做固定
+  非顺序排列，输出连续，所有候选使用同一组数据与请求。
+- 先写入并校验数据，预热 1 次、采样 5 次，按每次最慢 core 的 kernel 总周期数
+  取中位数，选择耗时最短的组合。相同 N 卡、相同搬运字节数下，这等价于选择最高
+  标定带宽。建链、分配和 Host 同步开销不计入排名；日志输出周期数和 bytes/cycle，
+  不假定硬件时钟频率。
+- 探测 region 为 82 MiB（slot 大小与 2 MiB 页大小的最小公倍数），串行创建和释放，
+  支持现有 `hugetlb-2m` 页模式。每个组合完成后先销毁通道和 region，再释放 NPU
+  buffer。全部探测结束后，按排名建立用户请求大小的正式 region，校验连通性，
+  最优组合重建失败时尝试下一名；没有可用组合则初始化失败。
+- `UB_DEVICE_PROBE_RESULT` 记录各组合的标定结果，`UB_DEVICE_SELECTED` 记录正式
+  选择；用 `peer_candidate` 对照 K 端 `CANDIDATE_DISCOVERED` 的设备名称/EID。
+  结果属于当前 NpuRuntime session，后续 BatchGet/BatchPut 复用该选择；不做运行中
+  切换或跨进程缓存。不同 N 卡可以选不同 K 端设备。
+
+现有性能脚本可直接验证：
+
+```bash
+KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 DEVICE_ID=0 \
+  ./tests/run_remote_cpu_batch_get_perf.sh /absolute/path/to/build-npu \
+  --adaptive-ub-device --token-bytes 656 --miss-count 2048
+```
+
+EID 组合数和建链开销仍影响总启动耗时；沿用现有传输/kernel 超时，当前不新增
+整个选优过程的硬时间上限。多卡同时启动会相互争抢带宽，标定效果需要在目标
+部署并发下验证。固定标定点的最优设备也不保证对所有数据尺寸都最优。
+
+**升级要求：**候选查询新增独立设备数和显式过滤标记，控制协议从 v4 升到 v5。
+N 端库和 K 端服务必须一起重新构建/部署，即使未开启自适应也不能混用旧协议。
+
 需要同时使用多个 NPU EID 时，设置 `NpuRuntimeOptions::npu_eids`（Python
 构造参数同名）。列表中每个 EID 必须是 32 位连续十六进制字符；Runtime
 为每个 EID 建立独立 BatchGet RaCtx、MR import 和 channel，并将

@@ -285,7 +285,7 @@ class UrmaResourcePool {
  public:
   ~UrmaResourcePool() { Shutdown(); }
 
-  bool Initialize(const std::string& requested_device, bool eid_index_requested,
+  bool Initialize(const std::vector<std::string>& requested_devices, bool eid_index_requested,
                   uint32_t requested_eid_index) {
     urma_init_attr_t init{};
     if (urma_init(&init) != URMA_SUCCESS) {
@@ -303,7 +303,9 @@ class UrmaResourcePool {
     for (int device_index = 0; device_index < device_count; ++device_index) {
       urma_device_t* device = devices[device_index];
       if (device == nullptr || device->type != URMA_TRANSPORT_UB ||
-          (!requested_device.empty() && requested_device != device->name)) {
+          (!requested_devices.empty() &&
+           std::find(requested_devices.begin(), requested_devices.end(), device->name) ==
+               requested_devices.end())) {
         continue;
       }
       uint32_t eid_count = 0U;
@@ -347,8 +349,8 @@ class UrmaResourcePool {
     }
     if (candidates_.empty()) {
       Log("[KVAF_CPU] no usable UB EID candidates");
-      if (!requested_device.empty()) {
-        Log(" for ub_device=%s", requested_device.c_str());
+      for (const auto& name : requested_devices) {
+        Log(" requested_ub_device=%s", name.c_str());
       }
       if (eid_index_requested) {
         Log(" eid_index=%u", requested_eid_index);
@@ -356,7 +358,24 @@ class UrmaResourcePool {
       Log("\n");
       return false;
     }
+    for (const auto& name : requested_devices) {
+      if (std::none_of(candidates_.begin(), candidates_.end(),
+                       [&name](const UrmaCandidate& c) { return c.device_name == name; })) {
+        Log("[KVAF_CPU] requested UB device has no usable EID: %s\n", name.c_str());
+        return false;
+      }
+    }
     return true;
+  }
+
+  uint32_t DeviceCount() const {
+    uint32_t count = 0U;
+    std::string previous;
+    for (const auto& candidate : candidates_) {
+      if (candidate.device_name != previous) ++count;
+      previous = candidate.device_name;
+    }
+    return count;
   }
 
   uint32_t CandidateCount() const {
@@ -460,13 +479,21 @@ struct Region {
 
 class CpuService {
  public:
-  CpuService(UrmaResourcePool* resource_pool, CpuMemoryPageMode memory_page_mode)
-      : resource_pool_(resource_pool), memory_page_mode_(memory_page_mode) {}
+  CpuService(UrmaResourcePool* resource_pool, CpuMemoryPageMode memory_page_mode,
+             bool device_filter_applied)
+      : resource_pool_(resource_pool), memory_page_mode_(memory_page_mode),
+        device_filter_applied_(device_filter_applied) {}
   ~CpuService() { ReleaseAll(); }
 
   uint32_t CandidateCount() const {
     return resource_pool_ == nullptr ? 0U : resource_pool_->CandidateCount();
   }
+
+  uint32_t DeviceCount() const {
+    return resource_pool_ == nullptr ? 0U : resource_pool_->DeviceCount();
+  }
+
+  bool DeviceFilterApplied() const { return device_filter_applied_; }
 
   Result Allocate(uint64_t bytes, uint64_t slot_size, uint32_t candidate_id,
                   AllocateRegionResponse* response) {
@@ -824,6 +851,7 @@ class CpuService {
 
   UrmaResourcePool* resource_pool_ = nullptr;
   CpuMemoryPageMode memory_page_mode_{CpuMemoryPageMode::kDefault};
+  bool device_filter_applied_{false};
   uint64_t next_region_id_ = 1U;
   uint32_t next_token_ = 1U;
   uint32_t next_psn_ = 1U;
@@ -872,6 +900,9 @@ void HandleClient(int fd, CpuService* service) {
       response.header = MakeHeader(command, sizeof(response));
       response.header.command = ResponseCommand(command);
       response.candidate_count = service == nullptr ? 0U : service->CandidateCount();
+      response.device_count = service == nullptr ? 0U : service->DeviceCount();
+      response.device_filter_applied =
+          service != nullptr && service->DeviceFilterApplied() ? 1U : 0U;
       response.result = static_cast<int32_t>(response.candidate_count == 0U
                                                   ? Result::kResourceError
                                                   : Result::kOk);
@@ -923,14 +954,21 @@ CpuRuntime::~CpuRuntime() { (void)Shutdown(); }
 
 Status CpuRuntime::Initialize(const CpuRuntimeOptions& options) {
   if (impl_ != nullptr) return Status::InvalidState("CpuRuntime has already been initialized");
-  if (options.has_eid_index && options.ub_device.empty()) {
+  auto devices = options.ub_devices;
+  if (!options.ub_device.empty()) devices.push_back(options.ub_device);
+  if (std::any_of(devices.begin(), devices.end(),
+                  [](const std::string& name) { return name.empty(); })) {
+    return Status::InvalidArgument("UB device names must not be empty");
+  }
+  if (options.has_eid_index && devices.empty()) {
     return Status::InvalidArgument("CpuRuntime eid_index requires ub_device");
   }
   auto impl = std::make_unique<Impl>();
-  if (!impl->resources.Initialize(options.ub_device, options.has_eid_index, options.eid_index)) {
+  if (!impl->resources.Initialize(devices, options.has_eid_index, options.eid_index)) {
     return Status::Internal("CpuRuntime failed to initialize UMDK resources");
   }
-  impl->service = std::make_unique<CpuService>(&impl->resources, options.memory_page_mode);
+  impl->service = std::make_unique<CpuService>(
+      &impl->resources, options.memory_page_mode, !devices.empty());
   impl_ = std::move(impl);
   return Status::OK();
 }

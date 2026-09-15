@@ -32,6 +32,9 @@ struct NpuRuntimeOptions {
   // paths and stripe core/Jetty workers over them in list order. BatchPut
   // remains on the first EID.
   std::vector<std::string> npu_eids{};
+  // Opt-in startup BatchGet tuning over explicitly filtered peer devices.
+  // Without a K-side device filter, first-working selection is preserved.
+  bool adaptive_ub_device{false};
 };
 
 // NPU role Runtime. It owns the current MetaManager, NPU AccessOperator and

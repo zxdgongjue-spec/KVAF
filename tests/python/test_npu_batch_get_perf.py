@@ -164,6 +164,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--adaptive-ub-device", action="store_true",
+        help="startup tuning over explicitly selected K-side UB devices (all EIDs)",
+    )
+    parser.add_argument(
         "--warmup",
         type=int,
         default=environment_int("KVAF_BATCH_GET_PERF_WARMUP", DEFAULT_WARMUP),
@@ -577,6 +581,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         batch_put_kernel_object_path=str(batch_put_kernel),
         jettys_per_core=args.jettys_per_core,
         npu_eids=args.npu_eids,
+        adaptive_ub_device=args.adaptive_ub_device,
     )
     runtime.link_to(remote_cpu_service)
     table = None
