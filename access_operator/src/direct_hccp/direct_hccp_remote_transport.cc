@@ -206,6 +206,11 @@ void LogTpReadback(const DirectHccpApi& api, void* context, std::uint64_t tp,
   scalar(14, "udp_srcport_range", a.udp_srcport_range);
   scalar(15, "spray_en", a.spray_en);
   scalar(16, "udp_global_en", a.udp_global_en);
+  // Bit 17 describes the available SL set, not the selected SL (bit 10).
+  // Some deployed providers return only this field, outside the request mask.
+  if ((state->bitmap & (1U << 17U)) != 0U) {
+    fields << " sl_bitmap=0x" << std::hex << a.sl_bitmap << std::dec;
+  }
   std::fprintf(stderr,
                "[KVAF_LINK_DIAG] pid=%ld side=npu event=tp_readback role=%s context=%p "
                "local_tp=0x%llx status=ok requested_bitmap=0x1ffff returned_bitmap=0x%x%s "

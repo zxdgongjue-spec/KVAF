@@ -76,6 +76,7 @@ CPU 默认未确认 ABI 时也不读取 imported-target 对象里的 TPN，记�
 - 实际 Jetty 状态、实际队列深度和 priority。NPU 的 Jetty 查询接口仅暴露部分属性；未提供的属性不会被请求值冒充。
 - 设备能力里的 `priority_info`：本实现请求 `priority=2`，核对其实际 SL 和支持的 TP 类型。不同设备的映射不必相同。
 - RM/CTP、保序配置、TP 属性的有效 bitmap。没有返回的字段不是数值 0。
+- NPU TP 查询的返回位 17（`0x20000`）对应 `sl_bitmap`，表示可用 SL 集合；标量 `sl` 对应位 10（`0x400`）。仅返回位 17 时只打印 `sl_bitmap`，不能把它当作实际选中的 SL。例如 `sl_bitmap=0x408` 表示集合含 SL 3 和 10，不代表当前使用其中哪一个。
 - EID 到 UB device、GUID、die/function、端口/NUMA 的对应关系；接口没有提供的物理归属仍需驱动工具。
 
 创建成功和属性读回只能定位连接配置，不能直接报告 READ credit 的实时占用。

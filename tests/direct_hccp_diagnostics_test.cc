@@ -17,7 +17,7 @@
 
 namespace h = kvaf::direct_hccp;
 namespace {
-enum class Reply { kSuccess, kSubmitError, kRequestError, kApiError, kTimeout };
+enum class Reply { kSuccess, kSlBitmapOnly, kSubmitError, kRequestError, kApiError, kTimeout };
 Reply reply = Reply::kSuccess;
 int device_queries = 0;
 int jetty_queries = 0;
@@ -104,7 +104,8 @@ int AsyncResult(void* request, int* result) {
     *result = 34;
     return 0;
   }
-  *pending_bitmap = 1U << 10U;
+  *pending_bitmap = reply == Reply::kSlBitmapOnly ? (1U << 17U) : (1U << 10U);
+  pending_attr->sl_bitmap = (1U << 3U) | (1U << 10U);
   pending_attr->sl = 7;
   pending_attr->retry_times_init = 5;  // Should not be printed: returned bit 0 is clear.
   return 0;
@@ -204,11 +205,19 @@ int main() {
     Require(device_queries == 1 && jetty_queries == 1 && tp_queries == 1, "missing queries");
     Require(output.find("priority=2 sl=7 tp_type=0x2") != std::string::npos, "priority mapping");
     Require(output.find("returned_bitmap=0x400 sl=7") != std::string::npos, "TP readback bitmap");
+    Require(output.find(" sl_bitmap=") == std::string::npos, "invalid SL bitmap printed");
     Require(output.find(" retry_times_init=") == std::string::npos, "invalid TP field printed");
     Require(output.find("modify_mask=0x0 state_valid=1 state=1 rx_threshold_valid=1 rx_threshold=99") !=
                 std::string::npos, "Jetty modify mask wrongly invalidated successful query");
     Require(output.find("endpoint=peer source=exported_key status=ok eid=") != std::string::npos,
             "missing peer identity");
+    reply = Reply::kSlBitmapOnly;
+    output = Capture([] { Exercise(Api()); });
+    Require(output.find("returned_bitmap=0x20000 sl_bitmap=0x408 read_outstanding=") !=
+                std::string::npos, "provider's only valid field (available SL set) was omitted");
+    Require(output.find("returned_bitmap=0x20000 sl=") == std::string::npos,
+            "available SL set was confused with selected SL");
+    reply = Reply::kSuccess;
     auto missing = Api();
     missing.get_dev_base_attr = nullptr;
     missing.qp_query_batch = nullptr;
