@@ -543,9 +543,12 @@ struct CpuUrmaTransport::Impl {
     }
     if (local_jettys_.empty()) return Error("no CPU Jettys created");
     wqes_per_doorbell_ = options.wqes_per_doorbell;
-    std::fprintf(stderr, "[KVAF_CPU_URMA] JETTYS_READY count=%zu omp_threads=%u wqes_per_doorbell=%zu local_sge=1 requested_remote_sgl_size=%u remote_sgl_size=%zu depth=%u\n",
+    window_bytes_ = options.window_bytes;
+    std::fprintf(stderr, "[KVAF_CPU_URMA] JETTYS_READY count=%zu omp_threads=%u wqes_per_doorbell=%zu window_bytes=%llu local_sge=1 requested_remote_sgl_size=%u remote_sgl_size=%zu depth=%u\n",
                  local_jettys_.size(), options.jetty_count,
-                 wqes_per_doorbell_, options.remote_sgl_size, batch_remote_sgl_size_, kJettyDepth);
+                 wqes_per_doorbell_,
+                 static_cast<unsigned long long>(window_bytes_),
+                 options.remote_sgl_size, batch_remote_sgl_size_, kJettyDepth);
     initialized_ = true;
     return Status::OK();
   }
@@ -739,15 +742,45 @@ struct CpuUrmaTransport::Impl {
     std::unique_lock<std::mutex> submit_lock(batch_submit_mutex_);
     const auto start = std::chrono::steady_clock::now();
     last_batch_timing_ = {};
-    const Status status = TransferSglBatchLocked(
-        write, offset, buffers, remote_offsets, count);
-    if (!status.ok()) {
-      last_batch_timing_ = {};
-      return status;
+    CpuUrmaTransport::BatchTiming total_timing{};
+    std::size_t begin = 0U;
+    std::uint64_t contiguous_offset = offset;
+    while (begin < count) {
+      std::size_t end = begin;
+      std::uint64_t chunk_bytes = 0U;
+      while (end < count) {
+        const std::uint64_t bytes = buffers[end].bytes;
+        if (end != begin && window_bytes_ != 0U &&
+            bytes > window_bytes_ - std::min(window_bytes_, chunk_bytes)) {
+          break;
+        }
+        if (chunk_bytes > std::numeric_limits<std::uint64_t>::max() - bytes) {
+          last_batch_timing_ = {};
+          return Status::InvalidArgument("SGL batch byte count overflows");
+        }
+        chunk_bytes += bytes;
+        ++end;
+        if (window_bytes_ != 0U && chunk_bytes >= window_bytes_) break;
+      }
+      const Status status = TransferSglBatchLocked(
+          write, contiguous_offset, buffers + begin,
+          remote_offsets == nullptr ? nullptr : remote_offsets + begin,
+          end - begin);
+      if (!status.ok()) {
+        last_batch_timing_ = {};
+        return status;
+      }
+      total_timing.prepare_ns += last_batch_timing_.prepare_ns;
+      total_timing.post_ns += last_batch_timing_.post_ns;
+      total_timing.poll_ns += last_batch_timing_.poll_ns;
+      total_timing.wr_count += last_batch_timing_.wr_count;
+      contiguous_offset += chunk_bytes;
+      begin = end;
     }
-    last_batch_timing_.total_ns = static_cast<std::uint64_t>(
+    total_timing.total_ns = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - start).count());
+    last_batch_timing_ = total_timing;
     return Status::OK();
   }
 
@@ -873,6 +906,7 @@ struct CpuUrmaTransport::Impl {
   std::mutex batch_submit_mutex_;
   SglBatchJob sgl_batch_workspace_;
   std::size_t wqes_per_doorbell_{0U};
+  std::uint64_t window_bytes_{0U};
   std::size_t batch_remote_sgl_size_{1U};
   std::vector<cpu_urma_detail::SglGroup> batch_groups_;
   CpuUrmaTransport::BatchTiming last_batch_timing_{};

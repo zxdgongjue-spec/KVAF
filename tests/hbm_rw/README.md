@@ -84,6 +84,12 @@ Zero, the default, submits the complete list for that Jetty. With `N=32`,
 each worker independently prepares and posts up to 32 WRs at a time. This
 is an API-level batch size; the provider implements the actual doorbell.
 
+`--window-bytes N` is an experimental completion window for diagnosing
+large-batch stalls. Zero keeps the normal behavior. A non-zero value splits
+one logical transfer into byte-bounded sub-batches and waits for completion
+between them; for example, `--window-bytes 4M` compares an 8 MiB transfer as
+two completed 4 MiB windows against the default single 8 MiB submission.
+
 ```bash
 tests/run_hbm_rw_client.sh <npu-host> 29888 \
   --blocks 1024 --block-bytes 656 --doorbell-wqes 32 \

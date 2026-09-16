@@ -45,6 +45,10 @@ struct CpuUrmaTransportOptions {
   std::uint32_t remote_sgl_size{1};
   // Number of independent Jettys and OpenMP submission workers.
   std::uint32_t jetty_count{4};
+  // Experimental completion window for contiguous SGL batches. Zero submits
+  // the entire logical batch; otherwise each completed sub-batch contains at
+  // most this many bytes (unless one SGE alone is larger).
+  std::uint64_t window_bytes{0};
   bool has_external_region{false};
   peer::PeerRegion external_region{};
 };

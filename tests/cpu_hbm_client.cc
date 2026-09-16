@@ -28,6 +28,7 @@ struct Options {
   std::uint32_t eid_index{0};
   std::uint32_t device_id{0};
   std::uint32_t jetty_count{4};
+  std::uint64_t window_bytes{0};
 };
 
 bool ParseU64(const char* text, std::uint64_t* value) {
@@ -53,7 +54,8 @@ void Usage(const char* program) {
                "[--host-space-bytes N[K|M|G|T]] [--iterations N] [--warmup N] "
                "[--doorbell-wqes N] "
                "[--seed N] [--ub-device NAME] "
-               "[--eid-index N] [--device-id N] [--jettys N]\n",
+               "[--eid-index N] [--device-id N] [--jettys N] "
+               "[--window-bytes N[K|M|G|T]]\n",
                program);
 }
 
@@ -109,6 +111,7 @@ bool Parse(int argc, char** argv, Options* options) {
     else if (arg == "--eid-index" && ParseU32(value, &options->eid_index)) options->has_eid_index = true;
     else if (arg == "--device-id" && ParseU32(value, &options->device_id)) {}
     else if (arg == "--jettys" && ParseU32(value, &options->jetty_count)) {}
+    else if (arg == "--window-bytes" && ParseBytes(value, &options->window_bytes)) {}
     else return false;
   }
   return options->blocks != 0 && options->block_bytes != 0 && options->iterations != 0 &&
@@ -238,12 +241,13 @@ int main(int argc, char** argv) {
                "[HBM_TEST][CPU] START peer=%s blocks=%zu block_bytes=%zu payload_bytes=%llu "
                "host_address_space_bytes=%llu "
                "iterations=%zu warmup=%zu "
-               "remote_device=%u\n",
+               "remote_device=%u jettys=%u window_bytes=%llu\n",
                options.peer.c_str(), options.blocks, options.block_bytes,
                static_cast<unsigned long long>(total_bytes),
                static_cast<unsigned long long>(host_space_bytes), options.iterations,
                options.warmup,
-               options.device_id);
+               options.device_id, options.jetty_count,
+               static_cast<unsigned long long>(options.window_bytes));
   std::fprintf(stderr, "[HBM_TEST][CPU] DATA_PATH=direct-registered-host-memory\n");
 
   kvaf::CpuUrmaTransportOptions transport_options;
@@ -257,6 +261,7 @@ int main(int argc, char** argv) {
   transport_options.remote_eid_index = options.has_eid_index ? options.eid_index : UINT32_MAX;
   transport_options.wqes_per_doorbell = options.wqes_per_doorbell;
   transport_options.jetty_count = options.jetty_count;
+  transport_options.window_bytes = options.window_bytes;
   kvaf::CpuUrmaTransport transport;
   kvaf::Status status = transport.Initialize(transport_options);
   if (!status.ok()) {
