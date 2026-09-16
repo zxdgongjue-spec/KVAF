@@ -320,12 +320,11 @@ echo "BATCH_GET_MISS_SWEEP_CLOCK clock_mhz=$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ conv
 mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
 {
   printf '%s\n' \
-    'token_bytes,miss_count,selected_ub_device,mean_us,p50_us,p90_us,p99_us,p50_GBps,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us'
+    'token_bytes,miss_count,mean_us,p50_us,p90_us,p99_us,p50_GBps,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us,selected_ub_device'
   for index in "${!mean_us_values[@]}"; do
     printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "${token_bytes_values[$index]}" \
       "${miss_count_values[$index]}" \
-      "${selected_ub_device_values[$index]}" \
       "${mean_us_values[$index]}" \
       "${p50_us_values[$index]}" \
       "${p90_us_values[$index]}" \
@@ -338,7 +337,8 @@ mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
       "${completion_wait_mean_us_values[$index]}" \
       "${completion_wait_p50_us_values[$index]}" \
       "${completion_wait_p90_us_values[$index]}" \
-      "${completion_wait_p99_us_values[$index]}"
+      "${completion_wait_p99_us_values[$index]}" \
+      "${selected_ub_device_values[$index]}"
   done
 } >"$KVAF_BATCH_GET_MISS_SWEEP_CSV"
 echo "BATCH_GET_MISS_SWEEP_CSV_WRITTEN path=$KVAF_BATCH_GET_MISS_SWEEP_CSV rows=${#mean_us_values[@]}"

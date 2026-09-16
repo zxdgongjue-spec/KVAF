@@ -61,7 +61,7 @@ grep -q '^BATCH_GET_UB_DEVICE_CALIBRATION_DONE selected_ub_device=udmac1d1e2 reu
   "$temp_dir/output.log"
 [[ "$(grep -c '^\[KVAF_AIV\] UB_DEVICE_SELECTED ' "$temp_dir/output.log")" == 1 ]]
 [[ "$(grep -c '^\[KVAF_AIV\] UB_DEVICE_REUSED ' "$temp_dir/output.log")" == 63 ]]
-awk -F, 'NR == 1 { if ($3 != "selected_ub_device") exit 1; next }
-           $3 != "udmac1d1e2" { exit 1 }
+awk -F, 'NR == 1 { if ($NF != "selected_ub_device") exit 1; next }
+           $NF != "udmac1d1e2" { exit 1 }
            END { if (NR != 64) exit 1 }' "$temp_dir/summary.csv"
 echo "batch get sweep UB device reuse test passed"
