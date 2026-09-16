@@ -90,3 +90,7 @@ target_include_directories(kvaf_direct_hccp_diagnostics_test PRIVATE
 target_link_libraries(kvaf_direct_hccp_diagnostics_test PRIVATE
   ${CMAKE_DL_LIBS} Threads::Threads)
 add_test(NAME kvaf_direct_hccp_diagnostics COMMAND kvaf_direct_hccp_diagnostics_test)
+
+add_executable(kvaf_urma_diagnostic_compat_test urma_diagnostic_compat_test.cc)
+target_include_directories(kvaf_urma_diagnostic_compat_test PRIVATE ../runtime/src)
+add_test(NAME kvaf_urma_diagnostic_compat COMMAND kvaf_urma_diagnostic_compat_test)

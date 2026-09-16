@@ -1,5 +1,6 @@
 #include "cpu_runtime.h"
 #include "peer_protocol.h"
+#include "urma_diagnostic_compat.h"
 
 #include <dlfcn.h>
 #include <sys/mman.h>
@@ -447,7 +448,7 @@ class UrmaResources {
       LinkDiagnosticLog("event=jetty_config session=%" PRIu64 " local_jetty=%s source=request "
                         "mode=%u jfs_depth=%u jfr_depth=%u jfc_depth=%u priority=%u "
                         "rnr_retry=%u err_timeout=%u error_suspend=1 share_jfr=1 "
-                        "jfs_max_sge=1 jfr_max_sge=1 order_type=0",
+                        "jfs_max_sge=1 jfr_max_sge=1 order_type=not_explicitly_set",
                         session, local_id.c_str(), static_cast<unsigned int>(URMA_TM_RM),
                         kHostJfsDepth, kHostJfrDepth, kHostJfcDepth,
                         static_cast<unsigned int>(kHostJettyPriority),
@@ -477,7 +478,7 @@ class UrmaResources {
           // this mask is not a returned validity bitmap (unlike TP attributes).
           LinkDiagnosticLog("event=jetty_config session=%" PRIu64 " local_jetty=%s source=jetty_query "
                             "queried_id=%u mode=%u state=%u modify_mask=0x%x rx_threshold=%u jfs_depth=%u priority=%u "
-                            "rnr_retry=%u err_timeout=%u error_suspend=%u order_type=%u "
+                            "rnr_retry=%u err_timeout=%u error_suspend=%u order_type=%s jfs_flags=0x%x "
                             "jfs_max_sge=%u jfs_max_rsge=%u max_inline_data=%u share_jfr=%u "
                             "jfs_jfc_ref=%p expected_jfc_ref=%p",
                             session, local_id.c_str(), config.id, static_cast<unsigned int>(config.jfs_cfg.trans_mode),
@@ -485,7 +486,9 @@ class UrmaResources {
                             config.jfs_cfg.depth, static_cast<unsigned int>(config.jfs_cfg.priority),
                             static_cast<unsigned int>(config.jfs_cfg.rnr_retry),
                             static_cast<unsigned int>(config.jfs_cfg.err_timeout),
-                            config.jfs_cfg.flag.bs.error_suspend, config.jfs_cfg.flag.bs.order_type,
+                            config.jfs_cfg.flag.bs.error_suspend,
+                            detail::DiagnosticJfsOrderType(config.jfs_cfg.flag, 0).c_str(),
+                            config.jfs_cfg.flag.value,
                             static_cast<unsigned int>(config.jfs_cfg.max_sge),
                             static_cast<unsigned int>(config.jfs_cfg.max_rsge), config.jfs_cfg.max_inline_data,
                             config.flag.bs.share_jfr, static_cast<void*>(config.jfs_cfg.jfc),

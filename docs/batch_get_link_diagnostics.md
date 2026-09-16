@@ -30,6 +30,8 @@ CPU 使用编译所选的 `urma_api.h` 类型调用查询接口。请保持头�
 
 可选 API 缺失、驱动不支持、查询失败会记录为 unavailable/unsupported/failed，不中断正常建链。CPU 构建时检查 TP 属性 API 的声明；旧头没有声明时跳过该项，不自行猜测扩展结构。改变 UMDK 头目录后，应重新配置 CMake；必要时清除 `KVAF_HAVE_URMA_TP_ATTR_API` 缓存项。
 
+旧版头文件没有 JFS `order_type` 时输出 `order_type=unavailable`，同时保留原始 `jfs_flags`。不会把旧 ABI 的保留位解释成新字段，也不会把缺失字段报告为数值 0。
+
 ## 2. 日志如何关联
 
 新增日志使用 `LINK_DIAG` 标识。保留旧的 `CHANNEL_CREATED`、`BATCH_GET_TRANSPORT_WORKER`、`PEER_LINK_JETTY_IMPORT_READY` 和 `BATCH_GET_THROUGHPUT_READY`，它们提供 session、stream/core/slot 和测试 rank 的对应关系。
