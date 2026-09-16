@@ -17,6 +17,7 @@ constexpr int ACL_MEMCPY_DEVICE_TO_DEVICE = 3;
 
 aclError aclrtCreateStream(aclrtStream* stream);
 aclError aclrtSetDevice(std::int32_t device);
+aclError aclrtGetDevice(std::int32_t* device);
 aclError aclrtDestroyStream(aclrtStream stream);
 aclError aclrtCreateEventExWithFlag(aclrtEvent* event, std::uint32_t flag);
 aclError aclrtDestroyEvent(aclrtEvent event);

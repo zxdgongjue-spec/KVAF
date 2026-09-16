@@ -20,6 +20,11 @@ add_test(
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_throughput.py"
 )
+add_test(
+  NAME kvaf_urma_dfx_python
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/python/test_urma_dfx.py"
+)
 
 if(KVAF_BUILD_PYTHON)
   add_test(
@@ -71,3 +76,17 @@ target_include_directories(kvaf_batch_get_stream_test PRIVATE
   ../common/include
   ../meta_manager/include)
 add_test(NAME kvaf_batch_get_stream_host COMMAND kvaf_batch_get_stream_test)
+
+# Exercise the real Direct-HCCP initialization diagnostics with a fake provider.
+find_package(Threads REQUIRED)
+add_executable(kvaf_direct_hccp_diagnostics_test
+  direct_hccp_diagnostics_test.cc
+  ../access_operator/src/direct_hccp/direct_hccp_remote_transport.cc)
+target_include_directories(kvaf_direct_hccp_diagnostics_test PRIVATE
+  fake_acl
+  ../access_operator/include
+  ../runtime/include
+  ../common/include)
+target_link_libraries(kvaf_direct_hccp_diagnostics_test PRIVATE
+  ${CMAKE_DL_LIBS} Threads::Threads)
+add_test(NAME kvaf_direct_hccp_diagnostics COMMAND kvaf_direct_hccp_diagnostics_test)

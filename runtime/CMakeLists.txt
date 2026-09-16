@@ -75,6 +75,25 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
     PRIVATE "${KVAF_URMA_LIBRARY}" "${CMAKE_DL_LIBS}" Threads::Threads)
   target_compile_features(kvaf_cpu_runtime PUBLIC cxx_std_17)
 
+  # TP diagnostics are optional: older public UMDK headers do not declare
+  # this API. Use the installed declaration instead of guessing its ABI.
+  include(CheckCXXSourceCompiles)
+  include(CMakePushCheckState)
+  cmake_push_check_state(RESET)
+  set(CMAKE_REQUIRED_INCLUDES "${KVAF_URMA_INCLUDE_DIR}")
+  check_cxx_source_compiles([=[
+    #include <urma_api.h>
+    int main() {
+      using Query = decltype(&urma_get_tp_attr);
+      urma_tp_attr_value_t value{};
+      return sizeof(Query) == 0 || sizeof(value) == 0;
+    }
+  ]=] KVAF_HAVE_URMA_TP_ATTR_API)
+  cmake_pop_check_state()
+  if(KVAF_HAVE_URMA_TP_ATTR_API)
+    target_compile_definitions(kvaf_cpu_runtime PRIVATE KVAF_HAVE_URMA_TP_ATTR_API=1)
+  endif()
+
   add_executable(kvaf_cpu_service src/cpu_service_main.cc)
   target_link_libraries(kvaf_cpu_service PRIVATE kvaf_cpu_runtime kvaf_runtime)
   get_filename_component(KVAF_URMA_LIBRARY_DIR "${KVAF_URMA_LIBRARY}" DIRECTORY)

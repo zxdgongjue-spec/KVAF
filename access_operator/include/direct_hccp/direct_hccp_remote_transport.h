@@ -37,6 +37,9 @@ struct DirectHccpApi {
   GetTpInfoAsyncFn get_tp_info_async{nullptr};
   AsyncReqResultFn get_async_req_result{nullptr};
   GetRandomFn get_random{nullptr};
+  GetDevBaseAttrFn get_dev_base_attr{nullptr};
+  QpQueryBatchFn qp_query_batch{nullptr};
+  GetTpAttrAsyncFn get_tp_attr_async{nullptr};
 };
 
 struct DirectMemory {
@@ -137,6 +140,16 @@ struct PeerChannel {
 
 bool LoadDirectHccp(DirectHccpApi* api);
 void CloseDirectHccp(DirectHccpApi* api);
+
+bool LinkDiagnosticsEnabled();
+void LogLinkContextDiagnostics(const DirectHccpApi& api, void* context,
+                              std::uint32_t physical_device_id,
+                              const std::array<std::uint8_t, kEidBytes>& eid,
+                              const char* role);
+void LogLinkCqDiagnostics(void* context, const CqInfo& info, void* handle,
+                          const char* role);
+void LogLinkJettyDiagnostics(const DirectHccpApi& api, void* context,
+                             void* jetty, const char* role, const char* phase);
 
 bool GetCurrentNpuPhysicalDeviceId(std::uint32_t* physical_device_id);
 void ReleaseDeviceAivTransport(const DeviceAivTransportResources& resources);

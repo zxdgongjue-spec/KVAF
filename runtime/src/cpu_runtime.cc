@@ -142,6 +142,105 @@ void Log(const char* format, ...) {
   va_end(arguments);
 }
 
+bool LinkDiagnosticsEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("KVAF_LINK_DIAGNOSTICS");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
+// Keep each diagnostic record intact when several control-plane threads log.
+// These helpers run during setup only, and must not change link success/errno.
+void LinkDiagnosticLog(const char* format, ...) __attribute__((format(printf, 1, 2)));
+
+void LinkDiagnosticLog(const char* format, ...) {
+  const int saved_errno = errno;
+  flockfile(stderr);
+  std::fprintf(stderr, "[KVAF_LINK_DIAG] side=cpu pid=%ld ", static_cast<long>(getpid()));
+  va_list arguments;
+  va_start(arguments, format);
+  std::vfprintf(stderr, format, arguments);
+  va_end(arguments);
+  std::fputc('\n', stderr);
+  funlockfile(stderr);
+  errno = saved_errno;
+}
+
+template <typename Function>
+void RunLinkDiagnostics(Function&& function) noexcept {
+  if (!LinkDiagnosticsEnabled()) return;
+  const int saved_errno = errno;
+  try {
+    function();
+  } catch (...) {
+    LinkDiagnosticLog("event=diagnostics_failed reason=exception link_action=continue");
+  }
+  errno = saved_errno;
+}
+
+std::string DiagnosticHex(const uint8_t* bytes, std::size_t size) {
+  constexpr char digits[] = "0123456789abcdef";
+  std::string result(size * 2U, '0');
+  for (std::size_t i = 0; i < size; ++i) {
+    result[2U * i] = digits[bytes[i] >> 4U];
+    result[2U * i + 1U] = digits[bytes[i] & 15U];
+  }
+  return result;
+}
+
+std::string DiagnosticJettyId(const urma_jetty_id_t& id) {
+  return DiagnosticHex(id.eid.raw, sizeof(id.eid.raw)) + ":" +
+         std::to_string(id.uasid) + ":" + std::to_string(id.id);
+}
+
+void LogDiagnosticSymbol(const char* name, const void* symbol) {
+  Dl_info info{};
+  const bool found = symbol != nullptr && dladdr(symbol, &info) != 0;
+  LinkDiagnosticLog("event=library_symbol symbol=%s status=%s library=%s",
+                    name, symbol == nullptr ? "unavailable" : "available",
+                    found && info.dli_fname != nullptr ? info.dli_fname : "unavailable");
+}
+
+// Old public URMA headers have no priority_info. Never reinterpret their device
+// attribute buffer as a newer layout just to expose this optional information.
+template <typename Capability>
+auto LogPriorityMapping(const Capability& capability, const void* context, int)
+    -> decltype(capability.priority_info[0].SL,
+                capability.priority_info[0].tp_type.value, void()) {
+  for (std::size_t priority = 0;
+       priority < sizeof(capability.priority_info) / sizeof(capability.priority_info[0]);
+       ++priority) {
+    const auto& mapping = capability.priority_info[priority];
+    LinkDiagnosticLog("event=priority_mapping context=%p source=device_query priority=%zu "
+                      "sl=%u tp_type_bitmap=0x%x requested_priority=%u",
+                      context, priority, mapping.SL, mapping.tp_type.value,
+                      static_cast<unsigned int>(kHostJettyPriority));
+  }
+}
+
+template <typename Capability>
+void LogPriorityMapping(const Capability&, const void* context, long) {
+  LinkDiagnosticLog("event=priority_mapping context=%p status=unavailable "
+                    "reason=header_field_unavailable", context);
+}
+
+#if defined(KVAF_HAVE_URMA_TP_ATTR_API) && KVAF_HAVE_URMA_TP_ATTR_API
+template <typename Attributes>
+auto LogOptionalTpSlBitmap(const Attributes& attr, uint32_t bitmap,
+                           const void* context, uint64_t session, uint64_t tp, int)
+    -> decltype(attr.sl_bitmap, void()) {
+  if ((bitmap & (1U << 17U)) != 0U) {
+    LinkDiagnosticLog("event=tp_attribute context=%p session=%" PRIu64
+                      " local_ctp=0x%" PRIx64 " source=tp_query name=sl_bitmap value=0x%x",
+                      context, session, tp, static_cast<unsigned int>(attr.sl_bitmap));
+  }
+}
+
+template <typename Attributes>
+void LogOptionalTpSlBitmap(const Attributes&, uint32_t, const void*, uint64_t, uint64_t, long) {}
+#endif
+
 class HostMemoryAllocator {
  public:
   ~HostMemoryAllocator() { Shutdown(); }
@@ -307,6 +406,7 @@ class UrmaResources {
       std::fprintf(stderr, "%02x", byte);
     }
     std::fprintf(stderr, "\n");
+    DiagnoseContext();
     return true;
   }
 
@@ -320,6 +420,115 @@ class UrmaResources {
   urma_context_t* context() const { return context_; }
   const std::string& device_name() const { return selected_device_name_; }
   uint32_t eid_index() const { return eid_index_; }
+
+  void DiagnoseChannel(uint64_t session, std::size_t channel_index,
+                       urma_jetty_t* local, urma_jfr_t* jfr, urma_jfc_t* jfc,
+                       urma_target_jetty_t* remote, const CreateChannelRequest& request,
+                       uint64_t local_ctp, uint32_t local_psn) const noexcept {
+    RunLinkDiagnostics([&] {
+      const std::string local_id = DiagnosticJettyId(local->jetty_id);
+      const std::string remote_id = DiagnosticJettyId(remote->id);
+      LinkDiagnosticLog("event=channel_map session=%" PRIu64 " channel_index=%zu context=%p "
+                        "ub_device=%s eid_index=%u local_eid=%s peer_eid=%s "
+                        "id_format=eid:uasid:id local_jetty=%s remote_jetty=%s jfr=%s jfc=%s "
+                        "local_ctp=0x%" PRIx64 " peer_ctp=0x%" PRIx64
+                        " local_import_tpn=%u peer_tpn=unavailable "
+                        "peer_tpn_reason=not_exchanged local_psn=0x%x peer_psn=0x%x "
+                        "psn_source=import_request ctp_source=lookup "
+                        "import_tpn_source=imported_target_object",
+                        session, channel_index, static_cast<void*>(context_),
+                        selected_device_name_.c_str(), eid_index_,
+                        DiagnosticHex(context_->eid.raw, kEidBytes).c_str(),
+                        DiagnosticHex(request.local_eid, kEidBytes).c_str(),
+                        local_id.c_str(), remote_id.c_str(),
+                        DiagnosticJettyId(jfr->jfr_id).c_str(),
+                        DiagnosticJettyId(jfc->jfc_id).c_str(), local_ctp,
+                        request.local_tp_handle, remote->tp.tpn, local_psn, request.local_psn);
+      LinkDiagnosticLog("event=jetty_config session=%" PRIu64 " local_jetty=%s source=request "
+                        "mode=%u jfs_depth=%u jfr_depth=%u jfc_depth=%u priority=%u "
+                        "rnr_retry=%u err_timeout=%u error_suspend=1 share_jfr=1 "
+                        "jfs_max_sge=1 jfr_max_sge=1 order_type=0",
+                        session, local_id.c_str(), static_cast<unsigned int>(URMA_TM_RM),
+                        kHostJfsDepth, kHostJfrDepth, kHostJfcDepth,
+                        static_cast<unsigned int>(kHostJettyPriority),
+                        static_cast<unsigned int>(kHostJettyRnrRetry),
+                        static_cast<unsigned int>(kHostJettyErrTimeout));
+      LinkDiagnosticLog("event=jfc_config session=%" PRIu64 " jfc=%s source=created_object "
+                        "depth=%u hardware_readback=false",
+                        session, DiagnosticJettyId(jfc->jfc_id).c_str(), jfc->jfc_cfg.depth);
+
+      const auto query_jetty = reinterpret_cast<decltype(&urma_query_jetty)>(
+          dlsym(RTLD_DEFAULT, "urma_query_jetty"));
+      if (query_jetty == nullptr) {
+        LinkDiagnosticLog("event=jetty_query session=%" PRIu64 " local_jetty=%s "
+                          "status=unavailable reason=symbol_unavailable", session, local_id.c_str());
+      } else {
+        urma_jetty_cfg_t config{};
+        urma_jetty_attr_t attr{};
+        errno = 0;
+        const int status = query_jetty(local, &config, &attr);
+        const int query_errno = errno;
+        if (status != 0) {
+          LinkDiagnosticLog("event=jetty_query session=%" PRIu64 " local_jetty=%s "
+                            "status=failed result=%d errno=%d", session, local_id.c_str(),
+                            status, query_errno);
+        } else {
+          // URMA query writes state/threshold and clears the modification mask;
+          // this mask is not a returned validity bitmap (unlike TP attributes).
+          LinkDiagnosticLog("event=jetty_config session=%" PRIu64 " local_jetty=%s source=jetty_query "
+                            "queried_id=%u mode=%u state=%u modify_mask=0x%x rx_threshold=%u jfs_depth=%u priority=%u "
+                            "rnr_retry=%u err_timeout=%u error_suspend=%u order_type=%u "
+                            "jfs_max_sge=%u jfs_max_rsge=%u max_inline_data=%u share_jfr=%u "
+                            "jfs_jfc_ref=%p expected_jfc_ref=%p",
+                            session, local_id.c_str(), config.id, static_cast<unsigned int>(config.jfs_cfg.trans_mode),
+                            static_cast<unsigned int>(attr.state), attr.mask, attr.rx_threshold,
+                            config.jfs_cfg.depth, static_cast<unsigned int>(config.jfs_cfg.priority),
+                            static_cast<unsigned int>(config.jfs_cfg.rnr_retry),
+                            static_cast<unsigned int>(config.jfs_cfg.err_timeout),
+                            config.jfs_cfg.flag.bs.error_suspend, config.jfs_cfg.flag.bs.order_type,
+                            static_cast<unsigned int>(config.jfs_cfg.max_sge),
+                            static_cast<unsigned int>(config.jfs_cfg.max_rsge), config.jfs_cfg.max_inline_data,
+                            config.flag.bs.share_jfr, static_cast<void*>(config.jfs_cfg.jfc),
+                            static_cast<void*>(jfc));
+          if (config.flag.bs.share_jfr != 0U) {
+            LinkDiagnosticLog("event=jetty_queue_map session=%" PRIu64 " local_jetty=%s "
+                              "source=jetty_query jfr_ref=%p expected_jfr_ref=%p "
+                              "shared_jfc_ref=%p expected_jfc_ref=%p",
+                              session, local_id.c_str(), static_cast<void*>(config.shared.jfr),
+                              static_cast<void*>(jfr), static_cast<void*>(config.shared.jfc),
+                              static_cast<void*>(jfc));
+          }
+        }
+      }
+
+      const auto query_jfr = reinterpret_cast<decltype(&urma_query_jfr)>(
+          dlsym(RTLD_DEFAULT, "urma_query_jfr"));
+      if (query_jfr == nullptr) {
+        LinkDiagnosticLog("event=jfr_query session=%" PRIu64 " local_jetty=%s "
+                          "status=unavailable reason=symbol_unavailable", session, local_id.c_str());
+      } else {
+        urma_jfr_cfg_t config{};
+        urma_jfr_attr_t attr{};
+        errno = 0;
+        const int status = query_jfr(jfr, &config, &attr);
+        const int query_errno = errno;
+        if (status != 0) {
+          LinkDiagnosticLog("event=jfr_query session=%" PRIu64 " local_jetty=%s "
+                            "status=failed result=%d errno=%d", session, local_id.c_str(),
+                            status, query_errno);
+        } else {
+          LinkDiagnosticLog("event=jfr_config session=%" PRIu64 " local_jetty=%s source=jfr_query "
+                            "queried_id=%u depth=%u mode=%u max_sge=%u state=%u modify_mask=0x%x rx_threshold=%u "
+                            "jfc_ref=%p expected_jfc_ref=%p",
+                            session, local_id.c_str(), config.id, config.depth,
+                            static_cast<unsigned int>(config.trans_mode),
+                            static_cast<unsigned int>(config.max_sge), static_cast<unsigned int>(attr.state),
+                            attr.mask, attr.rx_threshold, static_cast<void*>(config.jfc), static_cast<void*>(jfc));
+        }
+      }
+      DiagnoseTp(session, local_ctp);
+    });
+  }
 
   bool GetCtpForPeer(const uint8_t peer_eid[kEidBytes], uint64_t* tp_handle) const {
     if (peer_eid == nullptr || tp_handle == nullptr || get_tp_list_ == nullptr || context_ == nullptr) {
@@ -377,6 +586,120 @@ class UrmaResources {
   }
 
  private:
+  void DiagnoseContext() const noexcept {
+    RunLinkDiagnostics([&] {
+      LinkDiagnosticLog("event=context_ready context=%p ub_device=%s eid_index=%u eid=%s "
+                        "header_device_attr_bytes=%zu header_jetty_cfg_bytes=%zu "
+                        "header_import_flag_bytes=%zu import_ex_remote_bytes=%zu",
+                        static_cast<void*>(context_), selected_device_name_.c_str(), eid_index_,
+                        DiagnosticHex(context_->eid.raw, kEidBytes).c_str(), sizeof(urma_device_attr_t),
+                        sizeof(urma_jetty_cfg_t), sizeof(urma_import_jetty_flag_t), sizeof(UrmaExtRjetty));
+      for (const char* name : {"urma_init", "urma_create_jetty", "urma_import_jetty_ex",
+                               "urma_query_device", "urma_query_jetty", "urma_query_jfr",
+                               "urma_get_tp_attr"}) {
+        LogDiagnosticSymbol(name, dlsym(RTLD_DEFAULT, name));
+      }
+      const auto query = reinterpret_cast<decltype(&urma_query_device)>(
+          dlsym(RTLD_DEFAULT, "urma_query_device"));
+      if (query == nullptr) {
+        LinkDiagnosticLog("event=device_query context=%p status=unavailable reason=symbol_unavailable",
+                          static_cast<void*>(context_));
+        return;
+      }
+      urma_device_attr_t attr{};
+      errno = 0;
+      const int status = query(device_, &attr);
+      const int query_errno = errno;
+      if (status != 0) {
+        LinkDiagnosticLog("event=device_query context=%p status=failed result=%d errno=%d",
+                          static_cast<void*>(context_), status, query_errno);
+        return;
+      }
+      LinkDiagnosticLog("event=device_config context=%p source=device_query ub_device=%s guid=%s "
+                        "port_count=%u max_jetty=%u max_jfs=%u max_jfr=%u max_jfc=%u "
+                        "max_jfs_depth=%u max_jfr_depth=%u max_jfc_depth=%u",
+                        static_cast<void*>(context_), selected_device_name_.c_str(),
+                        DiagnosticHex(attr.guid.raw, sizeof(attr.guid.raw)).c_str(),
+                        static_cast<unsigned int>(attr.port_cnt), attr.dev_cap.max_jetty,
+                        attr.dev_cap.max_jfs, attr.dev_cap.max_jfr, attr.dev_cap.max_jfc,
+                        attr.dev_cap.max_jfs_depth, attr.dev_cap.max_jfr_depth, attr.dev_cap.max_jfc_depth);
+      LogPriorityMapping(attr.dev_cap, context_, 0);
+      const std::size_t capacity = sizeof(attr.port_attr) / sizeof(attr.port_attr[0]);
+      for (std::size_t i = 0; i < std::min<std::size_t>(attr.port_cnt, capacity); ++i) {
+        const auto& port = attr.port_attr[i];
+        LinkDiagnosticLog("event=port_config context=%p source=device_query port_array_index=%zu "
+                          "state_enum=%u active_width_enum=%u active_speed_enum=%u "
+                          "active_mtu_enum=%u max_mtu_enum=%u eid_port_association=unavailable",
+                          static_cast<void*>(context_), i, static_cast<unsigned int>(port.state),
+                          static_cast<unsigned int>(port.active_width), static_cast<unsigned int>(port.active_speed),
+                          static_cast<unsigned int>(port.active_mtu), static_cast<unsigned int>(port.max_mtu));
+      }
+    });
+  }
+
+  void DiagnoseTp(uint64_t session, uint64_t local_ctp) const {
+#if defined(KVAF_HAVE_URMA_TP_ATTR_API) && KVAF_HAVE_URMA_TP_ATTR_API
+    const auto query = reinterpret_cast<decltype(&urma_get_tp_attr)>(
+        dlsym(RTLD_DEFAULT, "urma_get_tp_attr"));
+    if (query == nullptr) {
+      LinkDiagnosticLog("event=tp_query context=%p session=%" PRIu64 " local_ctp=0x%" PRIx64
+                        " status=unavailable reason=symbol_unavailable",
+                        static_cast<void*>(context_), session, local_ctp);
+      return;
+    }
+    urma_tp_attr_value_t attr{};
+    // Current URMA treats count/bitmap as outputs. Initialize the documented
+    // base fields as well for providers which accept an input request mask.
+    constexpr uint32_t requested_bitmap = 0xfffU;
+    uint8_t count = 12U;
+    uint32_t bitmap = requested_bitmap;
+    errno = 0;
+    const int status = query(context_, local_ctp, &count, &bitmap, &attr);
+    const int query_errno = errno;
+    LinkDiagnosticLog("event=tp_query context=%p session=%" PRIu64 " local_ctp=0x%" PRIx64
+                      " status=%s result=%d errno=%d header_attr_bytes=%zu requested_bitmap=0x%x",
+                      static_cast<void*>(context_), session, local_ctp,
+                      status == 0 ? "ok" : "failed", status, query_errno, sizeof(attr), requested_bitmap);
+    if (status != 0) return;
+    LinkDiagnosticLog("event=tp_valid_fields context=%p session=%" PRIu64 " local_ctp=0x%" PRIx64
+                      " source=tp_query returned_count=%u returned_bitmap=0x%x absent_fields=unavailable",
+                      static_cast<void*>(context_), session, local_ctp,
+                      static_cast<unsigned int>(count), bitmap);
+    const auto number = [&](unsigned int bit, const char* name, unsigned int value) {
+      if ((bitmap & (1U << bit)) != 0U) {
+        LinkDiagnosticLog("event=tp_attribute context=%p session=%" PRIu64 " local_ctp=0x%" PRIx64
+                          " source=tp_query name=%s value=%u",
+                          static_cast<void*>(context_), session, local_ctp, name, value);
+      }
+    };
+    const auto address = [&](unsigned int bit, const char* name, const uint8_t* value, std::size_t size) {
+      if ((bitmap & (1U << bit)) != 0U) {
+        LinkDiagnosticLog("event=tp_attribute context=%p session=%" PRIu64 " local_ctp=0x%" PRIx64
+                          " source=tp_query name=%s value=%s",
+                          static_cast<void*>(context_), session, local_ctp, name,
+                          DiagnosticHex(value, size).c_str());
+      }
+    };
+    number(0, "retry_times_init", attr.retry_times_init);
+    number(1, "at", attr.at);
+    address(2, "sip", attr.sip, sizeof(attr.sip));
+    address(3, "dip", attr.dip, sizeof(attr.dip));
+    address(4, "sma", attr.sma, sizeof(attr.sma));
+    address(5, "dma", attr.dma, sizeof(attr.dma));
+    number(6, "vlan_id", attr.vlan_id);
+    number(7, "vlan_en", attr.vlan_en);
+    number(8, "dscp", attr.dscp);
+    number(9, "at_times", attr.at_times);
+    number(10, "sl", attr.sl);
+    number(11, "ttl", attr.ttl);
+    LogOptionalTpSlBitmap(attr, bitmap, context_, session, local_ctp, 0);
+#else
+    LinkDiagnosticLog("event=tp_query context=%p session=%" PRIu64 " local_ctp=0x%" PRIx64
+                      " status=unavailable reason=header_api_unavailable",
+                      static_cast<void*>(context_), session, local_ctp);
+#endif
+  }
+
   std::string selected_device_name_;
   uint32_t eid_index_ = 0U;
   urma_device_t* device_ = nullptr;
@@ -715,6 +1038,9 @@ class CpuService {
         kHostJfrDepth, static_cast<unsigned int>(kHostJettyPriority),
         static_cast<unsigned int>(kHostJettyRnrRetry),
         static_cast<unsigned int>(kHostJettyErrTimeout));
+    region.resources->DiagnoseChannel(region.id, region.channels.size() - 1U,
+                                     channel.local_jetty, channel.local_jfr, channel.local_jfc,
+                                     channel.remote_jetty, request, cpu_tp_handle, cpu_psn);
     return Result::kOk;
   }
 

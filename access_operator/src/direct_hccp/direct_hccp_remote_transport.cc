@@ -1,10 +1,15 @@
 #include "direct_hccp/direct_hccp_remote_transport.h"
 
 #include <chrono>
+#include <atomic>
+#include <cerrno>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <dlfcn.h>
 #include <string>
+#include <memory>
+#include <sstream>
 #include <thread>
 #include <unistd.h>
 
@@ -24,6 +29,190 @@ constexpr std::uint32_t kAivWqeBytes = 64U;
 constexpr std::uint32_t kAivWqebbsPerWqe = 4U;
 using PeerRegion = peer::PeerRegion;
 using AclrtGetPhyDevIdByLogicDevId = int32_t (*)(int32_t, int32_t*);
+
+template <typename Function>
+void RunLinkDiagnostics(const Function& function) noexcept {
+  if (!LinkDiagnosticsEnabled()) return;
+  const int saved_errno = errno;
+  try {
+    function();
+  } catch (...) {
+    std::fprintf(stderr,
+                 "[KVAF_LINK_DIAG] pid=%ld side=npu event=diagnostic status=failed reason=cpp_exception\n",
+                 static_cast<long>(getpid()));
+  }
+  errno = saved_errno;
+}
+
+std::string HexBytes(const std::uint8_t* bytes, std::size_t size) {
+  static constexpr char digits[] = "0123456789abcdef";
+  std::string result(size * 2U, '0');
+  for (std::size_t i = 0; i < size; ++i) {
+    result[i * 2U] = digits[bytes[i] >> 4U];
+    result[i * 2U + 1U] = digits[bytes[i] & 15U];
+  }
+  return result;
+}
+
+template <typename Function>
+void LoadDiagnosticSymbol(void* library, const char* name, Function* function) {
+  void* symbol = dlsym(library, name);
+  *function = reinterpret_cast<Function>(symbol);
+  Dl_info origin{};
+  const bool located = symbol != nullptr && dladdr(symbol, &origin) != 0;
+  std::fprintf(stderr,
+               "[KVAF_LINK_DIAG] pid=%ld side=npu event=api symbol=%s status=%s dso=%s\n",
+               static_cast<long>(getpid()), name, symbol == nullptr ? "unavailable" : "available",
+               located && origin.dli_fname != nullptr ? origin.dli_fname : "unknown");
+}
+
+void LogJettyIdentity(const QpKey& key, const char* endpoint, void* context,
+                      const char* role) {
+  // CPU's packed peer key has a 28-byte wire representation; RA exports
+  // the same fields with its eight-byte-aligned struct padded to 32 bytes.
+  constexpr std::size_t kIdentityPrefixBytes = offsetof(JettyKeyIdentity, transport_mode) + sizeof(std::uint32_t);
+  if (key.size != kIdentityPrefixBytes && key.size != sizeof(JettyKeyIdentity)) {
+    std::fprintf(stderr,
+                 "[KVAF_LINK_DIAG] pid=%ld side=npu event=jetty_identity role=%s context=%p "
+                 "endpoint=%s source=exported_key status=unavailable key_bytes=%u expected_bytes=28_or_32\n",
+                 static_cast<long>(getpid()), role, context, endpoint, key.size);
+    return;
+  }
+  JettyKeyIdentity id{};
+  std::memcpy(&id, key.value, kIdentityPrefixBytes);
+  std::fprintf(stderr,
+               "[KVAF_LINK_DIAG] pid=%ld side=npu event=jetty_identity role=%s context=%p "
+               "endpoint=%s source=exported_key status=ok eid=%s uasid=%u jetty_id=%u transport_mode=%u\n",
+               static_cast<long>(getpid()), role, context, endpoint,
+               HexBytes(id.eid.raw, kEidBytes).c_str(), id.uasid, id.id, id.transport_mode);
+}
+
+void LogJettyReadback(const DirectHccpApi& api, void* context, void* jetty,
+                      const char* role, const char* phase) {
+  if (api.qp_query_batch == nullptr) {
+    std::fprintf(stderr,
+                 "[KVAF_LINK_DIAG] pid=%ld side=npu event=jetty_readback role=%s context=%p "
+                 "jetty=%p status=unavailable reason=missing_symbol phase=%s\n",
+                 static_cast<long>(getpid()), role, context, jetty, phase);
+    return;
+  }
+  JettyAttr attr{};
+  std::uint32_t count = 1U;
+  void* handles[] = {jetty};
+  const int ret = api.qp_query_batch(handles, &attr, &count);
+  // JettyAttr.mask is a modify mask, not a query-validity bitmap. UMDK's
+  // query path may return mask=0 while populating both state and threshold.
+  std::fprintf(stderr,
+               "[KVAF_LINK_DIAG] pid=%ld side=npu event=jetty_readback role=%s context=%p "
+               "jetty=%p status=%s ret=%d returned_count=%u modify_mask=0x%x state_valid=%u state=%u "
+               "rx_threshold_valid=%u rx_threshold=%u config_readback=not_exposed_by_ra_query "
+               "phase=%s\n",
+               static_cast<long>(getpid()), role, context, jetty,
+               ret == 0 && count == 1U ? "ok" : "failed", ret, count, attr.mask,
+               ret == 0 && count == 1U, attr.state,
+               ret == 0 && count == 1U, attr.rx_threshold, phase);
+}
+
+// A timed-out HDC request can retain pointers to both fields until its
+// asynchronous reply is consumed. Keep the allocation alive until process
+// exit on timeout (there is no cancellation API), and stop further optional
+// TP queries so a nonresponding service adds at most one 250 ms wait.
+struct DiagnosticTpReadback {
+  std::uint32_t bitmap{0x1ffffU};
+  TpAttr attr{};
+};
+std::atomic<bool> diagnostic_tp_queries_disabled{false};
+
+void LogTpReadback(const DirectHccpApi& api, void* context, std::uint64_t tp,
+                   const char* role) {
+  if (api.get_tp_attr_async == nullptr || api.get_async_req_result == nullptr ||
+      diagnostic_tp_queries_disabled.load()) {
+    std::fprintf(stderr,
+                 "[KVAF_LINK_DIAG] pid=%ld side=npu event=tp_readback role=%s context=%p "
+                 "local_tp=0x%llx status=unavailable reason=%s\n",
+                 static_cast<long>(getpid()), role, context,
+                 static_cast<unsigned long long>(tp),
+                 diagnostic_tp_queries_disabled.load() ? "previous_timeout" : "missing_symbol");
+    return;
+  }
+  auto state = std::make_unique<DiagnosticTpReadback>();
+  void* request = nullptr;
+  const int submitted = api.get_tp_attr_async(context, tp, &state->bitmap, &state->attr, &request);
+  if (submitted != 0 || request == nullptr) {
+    // A nonconforming provider returning a request on an error must not get
+    // a dangling output pointer either. No further queries after this case.
+    if (request != nullptr) {
+      (void)state.release();
+      diagnostic_tp_queries_disabled.store(true);
+    }
+    std::fprintf(stderr,
+                 "[KVAF_LINK_DIAG] pid=%ld side=npu event=tp_readback role=%s context=%p "
+                 "local_tp=0x%llx status=failed phase=submit ret=%d request=%p retained_buffer=%u\n",
+                 static_cast<long>(getpid()), role, context,
+                 static_cast<unsigned long long>(tp), submitted, request, request != nullptr);
+    return;
+  }
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+  int result = 0;
+  int ret = 0;
+  for (;;) {
+    ret = api.get_async_req_result(request, &result);
+    if (ret != kHccpAsyncAgain) break;
+    if (std::chrono::steady_clock::now() >= deadline) {
+      diagnostic_tp_queries_disabled.store(true);
+      (void)state.release();
+      std::fprintf(stderr,
+                   "[KVAF_LINK_DIAG] pid=%ld side=npu event=tp_readback role=%s context=%p "
+                   "local_tp=0x%llx status=timeout timeout_ms=250 request=%p "
+                   "output_lifetime=process_exit further_tp_queries=disabled\n",
+                   static_cast<long>(getpid()), role, context,
+                   static_cast<unsigned long long>(tp), request);
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  // RaGetAsyncReqResult consumes the request on every terminal return.
+  if (ret != 0 || result != 0) {
+    std::fprintf(stderr,
+                 "[KVAF_LINK_DIAG] pid=%ld side=npu event=tp_readback role=%s context=%p "
+                 "local_tp=0x%llx status=failed phase=complete ret=%d request_ret=%d\n",
+                 static_cast<long>(getpid()), role, context,
+                 static_cast<unsigned long long>(tp), ret, result);
+    return;
+  }
+  const auto& a = state->attr;
+  std::ostringstream fields;
+  const auto scalar = [&](unsigned bit, const char* name, unsigned value) {
+    if ((state->bitmap & (1U << bit)) != 0U) fields << ' ' << name << '=' << value;
+  };
+  const auto bytes = [&](unsigned bit, const char* name, const std::uint8_t* value,
+                         std::size_t size) {
+    if ((state->bitmap & (1U << bit)) != 0U) fields << ' ' << name << '=' << HexBytes(value, size);
+  };
+  scalar(0, "retry_times_init", a.retry_times_init);
+  scalar(1, "at", a.at);
+  bytes(2, "sip", a.sip, sizeof(a.sip));
+  bytes(3, "dip", a.dip, sizeof(a.dip));
+  bytes(4, "smac", a.sma, sizeof(a.sma));
+  bytes(5, "dmac", a.dma, sizeof(a.dma));
+  scalar(6, "vlan_id", a.vlan_id);
+  scalar(7, "vlan_en", a.vlan_en);
+  scalar(8, "dscp", a.dscp);
+  scalar(9, "at_times", a.at_times);
+  scalar(10, "sl", a.sl);
+  scalar(11, "ttl", a.ttl);
+  scalar(12, "ack_udp_srcport", a.ack_udp_srcport);
+  scalar(13, "data_udp_srcport", a.data_udp_srcport);
+  scalar(14, "udp_srcport_range", a.udp_srcport_range);
+  scalar(15, "spray_en", a.spray_en);
+  scalar(16, "udp_global_en", a.udp_global_en);
+  std::fprintf(stderr,
+               "[KVAF_LINK_DIAG] pid=%ld side=npu event=tp_readback role=%s context=%p "
+               "local_tp=0x%llx status=ok requested_bitmap=0x1ffff returned_bitmap=0x%x%s "
+               "read_outstanding=not_exposed credit=not_exposed mtu=not_exposed\n",
+               static_cast<long>(getpid()), role, context,
+               static_cast<unsigned long long>(tp), state->bitmap, fields.str().c_str());
+}
 
 template <typename Function>
 bool LoadSymbol(void* library, const char* name, Function* function) {
@@ -117,6 +306,79 @@ bool GetPeerCtp(const DirectHccpApi& api, void* context,
 
 }  // namespace
 
+bool LinkDiagnosticsEnabled() {
+  const char* value = std::getenv("KVAF_LINK_DIAGNOSTICS");
+  return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+void LogLinkContextDiagnostics(const DirectHccpApi& api, void* context,
+                              std::uint32_t physical_device_id,
+                              const std::array<std::uint8_t, kEidBytes>& eid,
+                              const char* role) {
+  RunLinkDiagnostics([&] {
+    if (api.get_dev_base_attr == nullptr) {
+      std::fprintf(stderr,
+                   "[KVAF_LINK_DIAG] pid=%ld side=npu event=device_readback role=%s context=%p "
+                   "physical_device=%u eid=%s status=unavailable reason=missing_symbol\n",
+                   static_cast<long>(getpid()), role, context, physical_device_id,
+                   HexBytes(eid.data(), eid.size()).c_str());
+      return;
+    }
+    DevBaseAttr attr{};
+    const int ret = api.get_dev_base_attr(context, &attr);
+    if (ret != 0) {
+      std::fprintf(stderr,
+                   "[KVAF_LINK_DIAG] pid=%ld side=npu event=device_readback role=%s context=%p "
+                   "physical_device=%u eid=%s status=failed ret=%d\n",
+                   static_cast<long>(getpid()), role, context, physical_device_id,
+                   HexBytes(eid.data(), eid.size()).c_str(), ret);
+      return;
+    }
+    std::fprintf(stderr,
+                 "[KVAF_LINK_DIAG] pid=%ld side=npu event=device_readback role=%s context=%p "
+                 "physical_device=%u eid=%s status=ok source=ra_context_cached_device_attr "
+                 "chip_id=%u die_id=%u func_id=%u ue_id=%u "
+                 "sq_max_depth=%u rq_max_depth=%u sq_max_sge=%u rq_max_sge=%u "
+                 "max_jfs_inline_len=%u max_jfs_rsge=%u max_read_size=%u max_write_size=%u "
+                 "max_msg_size=%llu rm_tp_cap=0x%x rc_tp_cap=0x%x um_tp_cap=0x%x tp_feature=0x%x\n",
+                 static_cast<long>(getpid()), role, context, physical_device_id,
+                 HexBytes(eid.data(), eid.size()).c_str(), attr.ub.chip_id, attr.ub.die_id,
+                 attr.ub.func_id, attr.ub.func_id, attr.sq_max_depth, attr.rq_max_depth,
+                 attr.sq_max_sge, attr.rq_max_sge, attr.ub.max_jfs_inline_len,
+                 attr.ub.max_jfs_rsge, attr.max_read_size, attr.max_write_size,
+                 static_cast<unsigned long long>(attr.max_msg_size), attr.ub.rm_tp_cap,
+                 attr.ub.rc_tp_cap, attr.ub.um_tp_cap, attr.ub.tp_feature);
+    // HCCP RsUbGetUeInfo assigns DevBaseAttr.ub.funcId from ueInfo.ue_id.
+    for (std::uint32_t priority = 0; priority < 16U; ++priority) {
+      std::fprintf(stderr,
+                   "[KVAF_LINK_DIAG] pid=%ld side=npu event=priority_mapping role=%s context=%p "
+                   "priority=%u sl=%u tp_type=0x%x source=device_readback ctp_supported=%u\n",
+                   static_cast<long>(getpid()), role, context, priority,
+                   attr.ub.priority_info[priority].sl, attr.ub.priority_info[priority].tp_type,
+                   (attr.ub.priority_info[priority].tp_type & 2U) != 0U);
+    }
+  });
+}
+
+void LogLinkCqDiagnostics(void* context, const CqInfo& info, void* handle,
+                          const char* role) {
+  RunLinkDiagnostics([&] {
+    std::fprintf(stderr,
+                 "[KVAF_LINK_DIAG] pid=%ld side=npu event=cq_mapping role=%s context=%p cq=%p "
+                 "requested_mode=%u requested_depth=%u returned_jfc_id=%u returned_cq_va=0x%llx "
+                 "returned_cq_buffer_va=0x%llx returned_cq_db_va=0x%llx returned_cqe_bytes=%u\n",
+                 static_cast<long>(getpid()), role, context, handle, info.in.ub.mode, info.in.depth,
+                 info.out.id, static_cast<unsigned long long>(info.out.va),
+                 static_cast<unsigned long long>(info.out.buffer_addr),
+                 static_cast<unsigned long long>(info.out.swdb_addr), info.out.cqe_size);
+  });
+}
+
+void LogLinkJettyDiagnostics(const DirectHccpApi& api, void* context,
+                             void* jetty, const char* role, const char* phase) {
+  RunLinkDiagnostics([&] { LogJettyReadback(api, context, jetty, role, phase); });
+}
+
 bool LoadDirectHccp(DirectHccpApi* api) {
   if (api == nullptr) return false;
   for (const char* candidate : {"libra.so", "libra.so.0", "libhccp.so", "libhccp.so.0"}) {
@@ -151,6 +413,19 @@ bool LoadDirectHccp(DirectHccpApi* api) {
     *api = {};
     return false;
   }
+  RunLinkDiagnostics([&] {
+    LoadDiagnosticSymbol(api->library, "RaGetDevBaseAttr", &api->get_dev_base_attr);
+    LoadDiagnosticSymbol(api->library, "RaCtxQpQueryBatch", &api->qp_query_batch);
+    LoadDiagnosticSymbol(api->library, "RaGetTpAttrAsync", &api->get_tp_attr_async);
+    Dl_info origin{};
+    const bool located = dladdr(reinterpret_cast<void*>(api->ctx_init), &origin) != 0;
+    std::fprintf(stderr,
+                 "[KVAF_LINK_DIAG] pid=%ld side=npu event=abi symbol=RaCtxInit dso=%s "
+                 "dev_base_attr_bytes=%zu jetty_attr_bytes=%zu tp_attr_bytes=%zu "
+                 "jetty_key_identity_bytes=%zu phase=initialization_only\n",
+                 static_cast<long>(getpid()), located && origin.dli_fname != nullptr ? origin.dli_fname : "unknown",
+                 sizeof(DevBaseAttr), sizeof(JettyAttr), sizeof(TpAttr), sizeof(JettyKeyIdentity));
+  });
   std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TRANSPORT_API_READY backend=RaCtx_no_HCOMM\n");
   return true;
 }
@@ -432,6 +707,27 @@ bool CreateDeviceAivJetty(const DirectHccpApi& api, void* context,
                role, sq_depth, attr.ub.ext_mode.sqebb_num, attr.ub.ext_mode.sq.buffer_size,
                static_cast<unsigned long long>(jetty_info->ub.sq_buffer_va),
                static_cast<unsigned long long>(jetty_info->ub.wqebb_size));
+  RunLinkDiagnostics([&] {
+    std::fprintf(stderr,
+                 "[KVAF_LINK_DIAG] pid=%ld side=npu event=jetty_mapping role=%s context=%p "
+                 "jetty=%p scq=%p rcq=%p srq=%p requested_transport_mode=%u requested_mode=%u "
+                 "requested_sq_depth=%u requested_rq_depth=%u requested_sqebb_num=%u "
+                 "requested_sq_bytes=%u requested_priority=%u requested_rnr_retry=%u requested_err_timeout=%u "
+                 "requested_jetty_flags=0x%x requested_jfs_flags=0x%x requested_cstm_flags=0x%x "
+                 "returned_uasid=%u returned_jetty_id=%u returned_sq_va=0x%llx returned_sq_db_va=0x%llx "
+                 "returned_wqebb_bytes=%llu\n",
+                 static_cast<long>(getpid()), role, context, *jetty_handle,
+                 cq_handle, cq_handle, cq_handle, attr.transport_mode, attr.ub.mode,
+                 attr.sq_depth, attr.rq_depth, attr.ub.ext_mode.sqebb_num,
+                 attr.ub.ext_mode.sq.buffer_size, attr.ub.priority, attr.ub.rnr_retry,
+                 attr.ub.err_timeout, attr.ub.flag, attr.ub.jfs_flag, attr.ub.ext_mode.cstm_flag,
+                 jetty_info->ub.uasid, jetty_info->ub.id,
+                 static_cast<unsigned long long>(jetty_info->ub.sq_buffer_va),
+                 static_cast<unsigned long long>(jetty_info->ub.db_addr),
+                 static_cast<unsigned long long>(jetty_info->ub.wqebb_size));
+    LogJettyIdentity(jetty_info->key, "local", context, role);
+    LogJettyReadback(api, context, *jetty_handle, role, "after_create_before_import");
+  });
   return true;
 }
 
@@ -480,6 +776,32 @@ bool CreatePeerChannel(const PeerChannelRequest& request,
                  request.role);
     return false;
   }
+  RunLinkDiagnostics([&] {
+    QpKey remote_key{};
+    remote_key.size = static_cast<std::uint8_t>(peer_qp_key_bytes);
+    std::memcpy(remote_key.value, peer_qp_key.data(), peer_qp_key_bytes);
+    LogJettyIdentity(request.local_jetty_info->key, "local", request.device_context, request.role);
+    LogJettyIdentity(remote_key, "peer", request.device_context, request.role);
+    std::fprintf(stderr,
+                 "[KVAF_LINK_DIAG] pid=%ld side=npu event=channel_mapping role=%s context=%p "
+                 "physical_device=%u local_eid=%s peer_eid=%s local_uasid=%u local_jetty_id=%u "
+                 "local_tp=0x%llx peer_tp=0x%llx returned_local_tpn=%u peer_tpn=unavailable "
+                 "tx_psn=0x%x rx_psn=0x%x requested_tag=0 requested_tp_type=%u requested_import_flags=0x%x "
+                 "target_jetty=%p returned_target_jetty=0x%llx peer_base=0x%llx peer_bytes=%llu\n",
+                 static_cast<long>(getpid()), request.role, request.device_context,
+                 request.physical_device_id,
+                 HexBytes(request.local_eid->data(), request.local_eid->size()).c_str(),
+                 HexBytes(request.peer_eid->data(), request.peer_eid->size()).c_str(),
+                 request.local_jetty_info->ub.uasid, request.local_jetty_info->ub.id,
+                 static_cast<unsigned long long>(local_tp_handle),
+                 static_cast<unsigned long long>(peer_tp_handle), channel->local_import_info.out.ub.tpn,
+                 local_psn, peer_psn, CtpProtocolType(), ImportFlagPlainTextToken(),
+                 channel->local_target_jetty,
+                 static_cast<unsigned long long>(channel->local_import_info.out.ub.target_jetty_handle),
+                 static_cast<unsigned long long>(request.peer_base),
+                 static_cast<unsigned long long>(request.peer_memory->registered_bytes));
+    LogTpReadback(*request.api, request.device_context, local_tp_handle, request.role);
+  });
   return true;
 }
 

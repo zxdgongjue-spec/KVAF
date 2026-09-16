@@ -240,6 +240,25 @@ class BatchGetThroughputTest(unittest.TestCase):
                     self.assertGreaterEqual(validation, window["end_ns"])
             self.assertFalse(report["kernel_profile"])
 
+    def test_dfx_clock_anchors_are_outside_all_worker_windows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.args("--process-count", "2", "--repeats", "1")
+            args.trace_dir = Path(directory)
+            with patch.dict(os.environ, {"KVAF_LINK_DIAGNOSTICS": "1"}), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                report = throughput.run_benchmark(args, target=fake_worker)
+            markers = [json.loads(line.split(" ", 1)[1]) for line in output.getvalue().splitlines()
+                       if line.startswith("BATCH_GET_DFX_PHASE ")]
+            self.assertEqual(len(markers), 6)
+            for row in report["results"]:
+                anchors = row["diagnostic_clock_anchors"]
+                self.assertLessEqual(anchors["before_start"]["monotonic_after_ns"], row["start_ns"])
+                self.assertGreaterEqual(anchors["after_measure"]["monotonic_before_ns"], row["end_ns"])
+                for event, anchor in anchors.items():
+                    self.assertLessEqual(anchor["monotonic_before_ns"], anchor["monotonic_after_ns"])
+                    self.assertGreater(anchor["unix_ns"], 0)
+                    self.assertIn(dict(repeat=row["repeat"], phase=row["phase"], event=event, **anchor), markers)
+
     def test_spawned_workers_use_individual_routes(self):
         with tempfile.TemporaryDirectory() as directory:
             args = self.args("--process-count", "2", "--repeats", "1",

@@ -234,6 +234,85 @@ struct GetTpCfg {
   Eid peer_eid;
 };
 
+// Optional diagnostic ABI from HCCP hccp_ctx.h / hccp_ctx_tp.h. These
+// readbacks are best effort; they do not participate in channel creation.
+struct DevBaseAttr {
+  uint32_t sq_max_depth;
+  uint32_t rq_max_depth;
+  uint32_t sq_max_sge;
+  uint32_t rq_max_sge;
+  struct {
+    uint32_t max_jfs_inline_len;
+    uint32_t max_jfs_rsge;
+    uint32_t die_id;
+    uint32_t chip_id;
+    uint32_t func_id;
+    uint32_t rm_tp_cap;
+    uint32_t rc_tp_cap;
+    uint32_t um_tp_cap;
+    uint32_t tp_feature;
+    struct { uint32_t sl; uint32_t tp_type; } priority_info[16];
+    uint32_t reserved0;
+  } ub;
+  uint32_t max_read_size;
+  uint32_t max_write_size;
+  uint64_t max_msg_size;
+  uint32_t reserved[12];
+};
+
+struct JettyAttr {
+  uint32_t mask;
+  uint32_t rx_threshold;
+  uint32_t state;
+  uint32_t reserved[2];
+};
+
+#pragma pack(push, 1)
+struct TpAttr {
+  uint8_t retry_times_init : 3;
+  uint8_t at : 5;
+  uint8_t sip[16];
+  uint8_t dip[16];
+  uint8_t sma[6];
+  uint8_t dma[6];
+  uint16_t vlan_id : 12;
+  uint8_t vlan_en : 1;
+  uint8_t dscp : 6;
+  uint8_t at_times : 5;
+  uint8_t sl : 4;
+  uint8_t ttl;
+  uint16_t ack_udp_srcport;
+  uint16_t data_udp_srcport;
+  uint8_t udp_srcport_range : 4;
+  uint8_t spray_en : 1;
+  uint8_t udp_global_en : 1;
+  uint8_t reserved0 : 2;
+  uint16_t sl_bitmap;
+  uint8_t dscp_config_mode : 1;
+  uint8_t reserved1 : 7;
+  uint8_t reserved[70];
+};
+#pragma pack(pop)
+
+// The exported UB QpKey contains RsJettyKeyInfo (32 bytes on RA, or a
+// 28-byte packed peer key). Only known sizes are decoded by diagnostics.
+struct JettyKeyIdentity {
+  Eid eid;
+  uint32_t uasid;
+  uint32_t id;
+  uint32_t transport_mode;
+};
+
+static_assert(sizeof(DevBaseAttr) == 248);
+static_assert(offsetof(DevBaseAttr, ub.priority_info) == 52);
+static_assert(offsetof(DevBaseAttr, max_msg_size) == 192);
+static_assert(sizeof(JettyAttr) == 20);
+static_assert(sizeof(TpAttr) == 128);
+static_assert(offsetof(TpAttr, sip) == 1);
+static_assert(offsetof(TpAttr, ttl) == 49);
+static_assert(offsetof(TpAttr, reserved) == 58);
+static_assert(sizeof(JettyKeyIdentity) == 32);
+
 struct JettyImportExpCfg {
   uint64_t tp_handle;
   uint64_t peer_tp_handle;
@@ -317,6 +396,9 @@ using GetTpInfoFn = int (*)(void *, GetTpCfg *, TpInfo *, uint32_t *);
 using GetTpInfoAsyncFn = int (*)(void *, GetTpCfg *, TpInfo *, uint32_t *, void **);
 using AsyncReqResultFn = int (*)(void *, int *);
 using GetRandomFn = int (*)(RaInfo *, uint32_t *);
+using GetDevBaseAttrFn = int (*)(void *, DevBaseAttr *);
+using QpQueryBatchFn = int (*)(void **, JettyAttr *, uint32_t *);
+using GetTpAttrAsyncFn = int (*)(void *, uint64_t, uint32_t *, TpAttr *, void **);
 using RaInitFn = int (*)(RaInitConfig *);
 using RaDeinitFn = int (*)(RaInitConfig *);
 using RtOpenNetServiceFn = int (*)(RtNetServiceOpenArgs *);

@@ -12,6 +12,7 @@
 #include <new>
 #include <string>
 #include <vector>
+#include <unistd.h>
 
 #include "acl/acl.h"
 #include "direct_hccp/direct_hccp_abi.h"
@@ -128,6 +129,7 @@ bool InitContext(const DirectHccpApi &api, int32_t mode, uint32_t physical_devic
   }
   std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_CONTEXT_READY role=%s mode=%d physical=%u context=%p\n",
                role, mode, physical_device_id, *context);
+  hccp::LogLinkContextDiagnostics(api, *context, physical_device_id, eid, role);
   return true;
 }
 
@@ -348,6 +350,7 @@ bool CreateCq(const DirectHccpApi &api, void *context, uint32_t mode, uint32_t d
                "[KVAF_AIV] DIRECT_CQ_READY role=%s mode=%u jfc_id=%u cq_va=0x%llx cqe_size=%u db_va=0x%llx\n",
                role, mode, info->out.id, static_cast<unsigned long long>(info->out.buffer_addr),
                info->out.cqe_size, static_cast<unsigned long long>(info->out.swdb_addr));
+  hccp::LogLinkCqDiagnostics(context, *info, *handle, role);
   return true;
 }
 
@@ -494,6 +497,9 @@ int32_t CreateBatchGetTransport(void *host_ddr, uint64_t host_ddr_bytes,
     }
     worker.device_peer_import_info = channel.local_import_info;
     worker.device_peer_target_jetty = channel.local_target_jetty;
+    hccp::LogLinkJettyDiagnostics(state->api, path.device_context,
+                                  worker.device_user_ctl_jetty.handle,
+                                  device_ctp_role.c_str(), "after_peer_import");
   }
 
   {
@@ -649,6 +655,26 @@ extern "C" void KvafBatchGetTransportLogResources(
                  static_cast<unsigned long long>(entity.cq_va),
                  static_cast<unsigned long long>(tp.tp_handle),
                  static_cast<unsigned long long>(tp.peer_tp_handle));
+    if (hccp::LinkDiagnosticsEnabled()) {
+      std::fprintf(stderr,
+                   "[KVAF_LINK_DIAG] pid=%ld side=npu event=batch_get_worker transport_id=%u stream=%u "
+                   "stream_core=%u jetty_slot=%u eid_path=%u context=%p local_uasid=%u local_jetty_id=%u "
+                   "local_tpn=%u local_tp=0x%llx peer_tp=0x%llx sq_va=0x%llx sq_db_va=0x%llx "
+                   "jfc_id=%u cq_va=0x%llx cq_db_va=0x%llx sq_depth_wqebbs=%u "
+                   "cq_depth_requested=%u wqebb_bytes=%u cqe_bytes=%u\n",
+                   static_cast<long>(getpid()), transport_id,
+                   first_stream + static_cast<uint32_t>(index / workers_per_stream),
+                   (index / jettys_per_core) % cores_per_stream, index % jettys_per_core,
+                   worker.path_index, transport->paths[worker.path_index].device_context,
+                   worker.device_user_ctl_jetty.info.ub.uasid, static_cast<unsigned int>(entity.jetty_id),
+                   entity.tp_id, static_cast<unsigned long long>(tp.tp_handle),
+                   static_cast<unsigned long long>(tp.peer_tp_handle),
+                   static_cast<unsigned long long>(entity.sq_va),
+                   static_cast<unsigned long long>(entity.sq_db_va), entity.jfc_id,
+                   static_cast<unsigned long long>(entity.cq_va),
+                   static_cast<unsigned long long>(entity.cq_db_va), entity.sq_depth,
+                   entity.cq_depth, entity.wqe_size, entity.cqe_size);
+    }
   }
 }
 

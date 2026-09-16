@@ -150,6 +150,14 @@ def measure_batches(submit, synchronize, plans, iterations, clock=time.monotonic
                 batches=iterations)
 
 
+def diagnostic_clock_anchor():
+    """Bracket wall time so external DFX can be aligned to worker monotonic time."""
+    before = time.monotonic_ns()
+    wall = time.time_ns()
+    after = time.monotonic_ns()
+    return dict(monotonic_before_ns=before, unix_ns=wall, monotonic_after_ns=after)
+
+
 def aggregate_window(measurements, payload_per_batch):
     """Use the union window, never add rates computed over different windows."""
     if not measurements:
@@ -458,6 +466,7 @@ def receive_stage(connections, kind, timeout):
 
 def run_benchmark(args, target=worker_entry):
     context = multiprocessing.get_context("spawn")
+    link_diagnostics = os.environ.get("KVAF_LINK_DIAGNOSTICS") == "1"
     connections, processes = {}, []
     results = []
     try:
@@ -480,10 +489,21 @@ def run_benchmark(args, target=worker_entry):
                 for connection in active.values():
                     connection.send(dict(kind="arm"))
                 receive_stage(active, "armed", args.timeout_seconds)
+                clock_anchors = {}
+                if link_diagnostics:
+                    clock_anchors["before_start"] = diagnostic_clock_anchor()
+                    print("BATCH_GET_DFX_PHASE " + json.dumps(dict(
+                        repeat=repeat, phase=phase, event="before_start",
+                        **clock_anchors["before_start"]), sort_keys=True), flush=True)
                 print(f"BATCH_GET_THROUGHPUT_BEGIN repeat={repeat} phase={phase}", flush=True)
                 for connection in active.values():
                     connection.send(dict(kind="start"))
                 measured = receive_stage(active, "measured", args.timeout_seconds)
+                if link_diagnostics:
+                    clock_anchors["after_measure"] = diagnostic_clock_anchor()
+                    print("BATCH_GET_DFX_PHASE " + json.dumps(dict(
+                        repeat=repeat, phase=phase, event="after_measure",
+                        **clock_anchors["after_measure"]), sort_keys=True), flush=True)
                 for connection in active.values():
                     connection.send(dict(kind="validate"))
                 receive_stage(active, "validated", args.timeout_seconds)
@@ -502,6 +522,8 @@ def run_benchmark(args, target=worker_entry):
                            total_aiv_cores=len(ranks) * args.stream_count * args.aiv_cores,
                            total_jettys=len(ranks) * args.stream_count * args.aiv_cores * args.jettys_per_core,
                            postflight_pass=True)
+                if link_diagnostics:
+                    row["diagnostic_clock_anchors"] = clock_anchors
                 results.append(row)
                 print("BATCH_GET_THROUGHPUT_RESULT " + json.dumps(row, sort_keys=True), flush=True)
         for connection in connections.values():
