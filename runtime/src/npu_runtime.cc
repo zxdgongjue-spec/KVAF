@@ -467,6 +467,8 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
       impl_->options.batch_get_token_bytes == 0U ||
       impl_->options.batch_get_tokens_per_block == 0U ||
       (impl_->options.adaptive_ub_device &&
+       !impl_->options.peer_ub_device.empty()) ||
+      (impl_->options.adaptive_ub_device &&
        (impl_->options.adaptive_ub_miss_count == 0U ||
         impl_->options.adaptive_ub_miss_count >
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())))) {
@@ -544,6 +546,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
     return Status::InvalidArgument(
         "npu_eids count exceeds npu_core_count * jettys_per_core workers");
   }
+  const bool fixed_peer_device = !impl_->options.peer_ub_device.empty();
   const bool tune_candidates = detail::ShouldTuneStartupCandidates(
       impl_->options.adaptive_ub_device, device_filter_applied);
   if (impl_->options.adaptive_ub_device && !device_filter_applied) {
@@ -565,13 +568,44 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   // An explicit N-side list remains one strict multi-EID group. Automatically
   // discovered EIDs are connectivity fallbacks.
   const std::size_t npu_group_count = explicit_eids ? 1U : npu_candidates.size();
+  std::vector<std::string> peer_candidate_device_names(candidate_count);
+  std::vector<std::uint32_t> eligible_peer_candidates;
+  if (fixed_peer_device) {
+    for (std::uint32_t peer_candidate = 0U; peer_candidate < candidate_count;
+         ++peer_candidate) {
+      peer::PeerCandidateInfo info{};
+      last = impl_->peer_link->GetCandidateInfo(peer_candidate, &info);
+      if (!last.ok()) return last;
+      if (info.candidate_id != peer_candidate || info.device_id >= device_count) {
+        return Status::Internal("peer Runtime returned invalid candidate metadata");
+      }
+      peer_candidate_device_names[peer_candidate] = info.device_name;
+      if (info.device_name == impl_->options.peer_ub_device) {
+        eligible_peer_candidates.push_back(peer_candidate);
+      }
+    }
+    if (eligible_peer_candidates.empty()) {
+      return Status::NotFound("peer Runtime did not advertise fixed UB device " +
+                              impl_->options.peer_ub_device);
+    }
+    std::fprintf(stderr,
+                 "[KVAF_AIV] UB_DEVICE_REUSE_PLAN device_id=%u ub_device=%s "
+                 "peer_candidates=%zu measurements=0\n",
+                 impl_->options.device_id,
+                 impl_->options.peer_ub_device.c_str(),
+                 eligible_peer_candidates.size());
+  } else {
+    for (std::uint32_t peer_candidate = 0U; peer_candidate < candidate_count;
+         ++peer_candidate) {
+      eligible_peer_candidates.push_back(peer_candidate);
+    }
+  }
   std::vector<detail::StartupCandidate> candidates;
-  for (std::uint32_t peer = 0; peer < candidate_count; ++peer) {
+  for (std::uint32_t peer : eligible_peer_candidates) {
     for (std::size_t group = 0; group < npu_group_count; ++group) {
       candidates.push_back(detail::StartupCandidate{peer, group});
     }
   }
-  std::vector<std::string> peer_candidate_device_names(candidate_count);
   auto initialize_candidate = [&](const detail::StartupCandidate& candidate,
                                   bool measure, double* cycles) -> Status {
     const std::uint32_t peer_candidate = candidate.peer;
@@ -757,6 +791,12 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                      impl_->options.device_id, peer_candidate,
                      peer_candidate_device_names[peer_candidate].c_str(),
                      npu_group, *cycles);
+      } else if (fixed_peer_device) {
+        std::fprintf(stderr,
+                     "[KVAF_AIV] UB_DEVICE_REUSED device_id=%u peer_candidate=%u "
+                     "ub_device=%s npu_group=%zu\n",
+                     impl_->options.device_id, peer_candidate,
+                     impl_->options.peer_ub_device.c_str(), npu_group);
       }
       return Status::OK();
     }
@@ -791,8 +831,14 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
     return Status::OK();
   };
   if (!tune_candidates) {
-    return detail::SelectStartupCandidate(false, candidates,
+    last = detail::SelectStartupCandidate(false, candidates,
                                           initialize_candidate, cleanup);
+    if (!last.ok() && fixed_peer_device) {
+      return Status::Internal("failed to initialize fixed peer UB device " +
+                              impl_->options.peer_ub_device + ": " +
+                              last.message());
+    }
+    return last;
   }
 
   std::vector<std::vector<detail::StartupCandidate>> device_candidates(device_count);

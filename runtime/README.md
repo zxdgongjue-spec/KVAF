@@ -102,6 +102,9 @@ runtime.link_to("141.61.92.71:28999")
 runtime.initialize(ddr_bytes, kv_block_bytes)
 ```
 
+已知设备名时也可设置 `peer_ub_device="udmac0d1e2"`，只在该设备的 EID 中按
+连通性选择，不执行带宽标定。`peer_ub_device` 与 `adaptive_ub_device=True` 互斥。
+
 `link_to` 必须在 `initialize` 前调用。初始化会从 HCCL root-info 读取当前物理卡的
 CLOS PG EID、追加 `/proc/asdrv_ub/pair_info` fallback，并组合 CPU UMDK 候选。只有
 64B AIV WRITE 与 CQ 完成成功的 EID 对才会被选中；这同时验证 DDR 注册、segment
@@ -152,9 +155,9 @@ runtime.initialize(ddr_bytes, kv_block_bytes)
   发现的 N EID 只作为建链回退，因此 4 个设备最多得到 4 个测速结果。
 - 每个设备的可用组合先完成原有 WRITE/CQ 验证，再在独立临时 region 中执行真实
   BatchGet。标定沿用 Runtime 的 `batch_get_token_bytes` 和
-  `batch_get_tokens_per_block`，请求数由 `adaptive_ub_miss_count` 指定；性能测试脚本
-  会传入当前 shape 的 `miss_count`。core/Jetty 配置沿用业务配置，所有候选使用同一组
-  数据与请求。
+  `batch_get_tokens_per_block`，请求数由 `adaptive_ub_miss_count` 指定。单次性能测试
+  会传入当前 shape 的 `miss_count`；miss-count sweep 固定用 `656 × 2048` 校准一次。
+  core/Jetty 配置沿用业务配置，所有候选使用同一组数据与请求。
 - 先写入并校验数据，预热 1 次、采样 5 次，按每次最慢 core 的 kernel 总周期数
   取中位数，选择耗时最短的组合。相同 N 卡、相同搬运字节数下，这等价于选择最高
   标定带宽。建链、分配和 Host 同步开销不计入排名；日志输出周期数和 bytes/cycle，
@@ -168,7 +171,7 @@ runtime.initialize(ddr_bytes, kv_block_bytes)
   `UB_DEVICE_PROBE_RESULT` 每个连通设备最多记录一次标定结果，`UB_DEVICE_SELECTED` 记录正式
   选择；用 `peer_candidate` 对照 K 端 `CANDIDATE_DISCOVERED` 的设备名称/EID。
   结果属于当前 NpuRuntime session，后续 BatchGet/BatchPut 复用该选择；不做运行中
-  切换或跨进程缓存。不同 N 卡可以选不同 K 端设备。
+  切换。不同 N 卡可以选不同 K 端设备。
 
 现有性能脚本可直接验证：
 
@@ -178,12 +181,16 @@ KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 DEVICE_ID=0 \
   --adaptive-ub-device --token-bytes 656 --miss-count 2048
 ```
 
-miss-count sweep 生成的 CSV 会为每个 shape 写入 `selected_ub_device` 列；未执行
-自适应选优时该列为空。
+miss-count sweep 传入 `--adaptive-ub-device` 时，会先自动启动一个 `656 × 2048`
+校准进程，保存 `UB_DEVICE_SELECTED` 的设备名，再以 `peer_ub_device` 固定该设备运行
+全部正式 shape；用户只需启动一次脚本。后续进程仍独立建链，同一设备内保留 EID
+回退，但不再执行带宽标定。CSV 为每个 shape 写入 `selected_ub_device`；未执行自适应
+选优或固定设备时该列为空。
 
 EID 组合数只影响找到每个设备首个可用链路前的回退开销；沿用现有
 传输/kernel 超时，当前不新增整个选优过程的硬时间上限。多卡同时启动会相互
-争抢带宽，标定效果需要在目标部署并发下验证。当前选择只代表本次测试 shape。
+争抢带宽，标定效果需要在目标部署并发下验证。sweep 的固定选择代表 `656 × 2048`
+校准 shape。
 
 **升级要求：**候选查询包含独立设备数和显式过滤标记，并支持在分配前查询候选
 所属设备，控制协议从 v4 升到 v6。

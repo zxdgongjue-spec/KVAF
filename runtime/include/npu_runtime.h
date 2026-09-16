@@ -39,6 +39,9 @@ struct NpuRuntimeOptions {
   // BatchGet request count used by adaptive tuning. Performance tools set this
   // to the current test shape; other callers retain the historical 2048 default.
   std::uint32_t adaptive_ub_miss_count{2048U};
+  // Optional strict K-side UB device selected by an earlier Runtime process.
+  // Its EIDs remain connectivity fallbacks, but no bandwidth tuning is run.
+  std::string peer_ub_device{};
 };
 
 // NPU role Runtime. It owns the current MetaManager, NPU AccessOperator and

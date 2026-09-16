@@ -26,6 +26,7 @@ environment variables:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from pathlib import Path
 import statistics
@@ -168,6 +169,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="startup tuning over explicitly selected K-side UB devices (all EIDs)",
     )
     parser.add_argument(
+        "--peer-ub-device",
+        default="",
+        help="strict K-side UB device selected by an earlier process",
+    )
+    parser.add_argument(
+        "--adaptive-calibration-only",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--warmup",
         type=int,
         default=environment_int("KVAF_BATCH_GET_PERF_WARMUP", DEFAULT_WARMUP),
@@ -244,6 +255,10 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "miss-count must be between zero and request-length"
     if args.adaptive_ub_device and args.miss_count == 0:
         return "adaptive UB device tuning requires a positive miss-count"
+    if args.adaptive_ub_device and args.peer_ub_device:
+        return "adaptive-ub-device and peer-ub-device are mutually exclusive"
+    if args.adaptive_calibration_only and not args.adaptive_ub_device:
+        return "adaptive-calibration-only requires adaptive-ub-device"
     if args.aiv_cores <= 0 or args.aiv_cores > 48:
         return "aiv-cores must be in [1, 48]"
     if len(args.npu_eids) > args.aiv_cores * args.jettys_per_core:
@@ -536,11 +551,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     assert torch is not None
     device_id = int(os.environ.get("DEVICE_ID", "0"))
     request_length = args.request_length
-    table_capacity = args.table_capacity
     token_bytes = args.token_bytes
     tokens_per_block = args.tokens_per_block
     miss_count_value = args.miss_count
     block_bytes = token_bytes * tokens_per_block
+    table_capacity = args.table_capacity
+    if args.adaptive_calibration_only:
+        table_capacity = math.lcm(block_bytes, 2 * 1024 * 1024) // block_bytes
     ddr_bytes = table_capacity * block_bytes
     total_tokens = table_capacity * tokens_per_block
 
@@ -585,6 +602,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         npu_eids=args.npu_eids,
         adaptive_ub_device=args.adaptive_ub_device,
         adaptive_ub_miss_count=miss_count_value,
+        peer_ub_device=args.peer_ub_device,
     )
     runtime.link_to(remote_cpu_service)
     table = None
@@ -601,6 +619,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"ddr_bytes={ddr_bytes} aiv_cores={args.aiv_cores} "
             f"jettys_per_core={args.jettys_per_core} eid_paths={len(args.npu_eids) or 1} "
             f"npu_eids={','.join(args.npu_eids) or 'auto'} warmup={args.warmup} "
+            f"adaptive_ub_device={int(args.adaptive_ub_device)} "
+            f"peer_ub_device={args.peer_ub_device or 'auto'} "
             f"iterations={args.iterations} seed={args.seed} "
             f"kernel_profile={int(args.kernel_profile)} "
             f"kernel_profile_clock_mhz={args.kernel_profile_clock_mhz} "
@@ -610,6 +630,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("BATCH_GET_PERF_PHASE_BEGIN phase=initialize")
         runtime.initialize(ddr_bytes, block_bytes)
         print("BATCH_GET_PERF_PHASE_DONE phase=initialize")
+        if args.adaptive_calibration_only:
+            print("BATCH_GET_PERF_ADAPTIVE_CALIBRATION_DONE")
+            return 0
 
         print("BATCH_GET_PERF_PHASE_BEGIN phase=populate_table")
         populated = 0

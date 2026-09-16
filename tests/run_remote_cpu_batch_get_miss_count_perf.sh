@@ -10,7 +10,7 @@ fi
 KVAF_BUILD_DIR="$1"
 shift
 KVAF_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-KVAF_BATCH_GET_PERF_RUNNER="$KVAF_ROOT/tests/run_remote_cpu_batch_get_perf.sh"
+: "${KVAF_BATCH_GET_PERF_RUNNER:=$KVAF_ROOT/tests/run_remote_cpu_batch_get_perf.sh}"
 KVAF_BATCH_GET_TOKEN_BYTES=(128 256 512 656 1024 2048 4096)
 KVAF_BATCH_GET_MISS_COUNTS=(32 64 128 256 512 1024 2048 4096 8192)
 
@@ -64,6 +64,58 @@ cycles_to_us() {
     'BEGIN { printf "%.3f", cycles / mhz }'
 }
 
+adaptive_requested=false
+base_options=()
+for option in "$@"; do
+  if [[ "$option" == "--adaptive-ub-device" ]]; then
+    adaptive_requested=true
+  else
+    base_options+=("$option")
+  fi
+done
+
+selected_ub_device=""
+sweep_options=()
+if ((${#base_options[@]} > 0)); then
+  sweep_options=("${base_options[@]}")
+fi
+if [[ "$adaptive_requested" == true ]]; then
+  calibration_token_bytes=656
+  calibration_miss_count=2048
+  calibration_log="$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR/ub_device_calibration.log"
+  echo "BATCH_GET_UB_DEVICE_CALIBRATION_BEGIN token_bytes=$calibration_token_bytes miss_count=$calibration_miss_count"
+  if "$KVAF_BATCH_GET_PERF_RUNNER" "$KVAF_BUILD_DIR" \
+    ${base_options[@]+"${base_options[@]}"} \
+    --adaptive-ub-device \
+    --adaptive-calibration-only \
+    --request-length "$calibration_miss_count" \
+    --token-bytes "$calibration_token_bytes" \
+    --miss-count "$calibration_miss_count" \
+    --no-kernel-profile \
+    2>&1 | tee "$calibration_log"; then
+    :
+  else
+    status=$?
+    echo "BATCH_GET_UB_DEVICE_CALIBRATION_FAILED status=$status" >&2
+    exit "$status"
+  fi
+  selected_record="$(
+    awk '$1 == "[KVAF_AIV]" && $2 == "UB_DEVICE_SELECTED" { result = $0 }
+         END { print result }' "$calibration_log"
+  )"
+  if [[ -z "$selected_record" ]]; then
+    echo "ERROR: adaptive calibration did not select a UB device; ensure K uses an explicit --ub-device list" >&2
+    exit 1
+  fi
+  selected_ub_device="$(extract_field "$selected_record" ub_device)"
+  if [[ -z "$selected_ub_device" ]]; then
+    echo "ERROR: malformed UB_DEVICE_SELECTED record: $selected_record" >&2
+    exit 1
+  fi
+  sweep_options+=(--peer-ub-device "$selected_ub_device")
+  echo "BATCH_GET_UB_DEVICE_CALIBRATION_DONE selected_ub_device=$selected_ub_device reuse=subsequent_shapes"
+fi
+
 token_bytes_values=()
 miss_count_values=()
 mean_us_values=()
@@ -86,7 +138,8 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
   for miss_count in "${KVAF_BATCH_GET_MISS_COUNTS[@]}"; do
     echo "BATCH_GET_MISS_SWEEP_BEGIN token_bytes=$token_bytes miss_count=$miss_count"
     log_file="$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR/token_bytes_${token_bytes}_miss_count_${miss_count}.log"
-    if "$KVAF_BATCH_GET_PERF_RUNNER" "$KVAF_BUILD_DIR" "$@" \
+    if "$KVAF_BATCH_GET_PERF_RUNNER" "$KVAF_BUILD_DIR" \
+      ${sweep_options[@]+"${sweep_options[@]}"} \
       --token-bytes "$token_bytes" --miss-count "$miss_count" \
       --kernel-profile \
       --kernel-profile-clock-mhz "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" \
@@ -113,17 +166,26 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
       exit 1
     fi
 
-    selected_record="$(
-      awk '$1 == "[KVAF_AIV]" && $2 == "UB_DEVICE_SELECTED" { result = $0 }
+    active_record="$(
+      awk '$1 == "[KVAF_AIV]" && ($2 == "UB_DEVICE_SELECTED" || $2 == "UB_DEVICE_REUSED") { result = $0 }
            END { print result }' "$log_file"
     )"
-    selected_ub_device=""
-    if [[ -n "$selected_record" ]]; then
-      selected_ub_device="$(extract_field "$selected_record" ub_device)"
-      if [[ -z "$selected_ub_device" ]]; then
-        echo "ERROR: malformed UB_DEVICE_SELECTED record: $selected_record" >&2
+    shape_ub_device="$selected_ub_device"
+    if [[ -n "$active_record" ]]; then
+      active_ub_device="$(extract_field "$active_record" ub_device)"
+      if [[ -z "$active_ub_device" ]]; then
+        echo "ERROR: malformed UB device record: $active_record" >&2
         exit 1
       fi
+      if [[ -n "$shape_ub_device" && "$active_ub_device" != "$shape_ub_device" ]]; then
+        echo "ERROR: fixed UB device changed from $shape_ub_device to $active_ub_device" >&2
+        exit 1
+      fi
+      shape_ub_device="$active_ub_device"
+    fi
+    if [[ "$adaptive_requested" == true && -z "$shape_ub_device" ]]; then
+      echo "ERROR: fixed UB device was not reported for token_bytes=$token_bytes miss_count=$miss_count" >&2
+      exit 1
     fi
 
     mean_ms="$(extract_field "$total_profile_result" mean_ms)"
@@ -173,13 +235,13 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
     completion_wait_p50_us_values+=("$completion_wait_p50_us")
     completion_wait_p90_us_values+=("$completion_wait_p90_us")
     completion_wait_p99_us_values+=("$completion_wait_p99_us")
-    selected_ub_device_values+=("$selected_ub_device")
+    selected_ub_device_values+=("$shape_ub_device")
 
     result=(
       "BATCH_GET_MISS_SWEEP_RESULT"
       "token_bytes=$token_bytes"
       "miss_count=$miss_count"
-      "selected_ub_device=$selected_ub_device"
+      "selected_ub_device=$shape_ub_device"
       "mean_ms=$mean_ms"
       "p50_ms=$p50_ms"
       "p90_ms=$p90_ms"

@@ -56,3 +56,8 @@ target_include_directories(kvaf_startup_bandwidth_probe_test PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/../runtime/src")
 target_link_libraries(kvaf_startup_bandwidth_probe_test PRIVATE kvaf_runtime)
 add_test(NAME kvaf_startup_bandwidth_probe COMMAND kvaf_startup_bandwidth_probe_test)
+
+add_test(
+  NAME kvaf_batch_get_sweep_ub_device_reuse
+  COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/test_batch_get_sweep_ub_device_reuse.sh"
+)
