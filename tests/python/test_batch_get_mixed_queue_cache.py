@@ -80,7 +80,7 @@ alignas(64) uint8_t ub[160*1024];
 uintptr_t get_imm(uint32_t offset) {return reinterpret_cast<uintptr_t>(ub+offset);}
 constexpr uint32_t kEntityMagic=0x4b564155U,kEntityVersion=1,kQueueMagic=0x4b564151U,
   kTransferBytes=656,kWqeBytes=64,kCqeProbeBytes=32,kCqConsumerMask=0x003fffffU,
-  kMaxCqPolls=20,kWqesPerPost=32,kActiveRequestCapacity=16384,
+  kMaxCqPolls=20,kWqesPerPost=32,kActiveRequestCapacity=16384,kDenseRequestCapacity=256,
   kActiveTableIndicesUbOffset=4096,kActiveRequestIdsUbOffset=69632;
 enum ExecuteResult:uint64_t {kSuccess=0,kInvalidArgs=1,kInvalidEntity=2,kInvalidQueue=3,
   kInvalidLookup=4,kQueueFull=5,kCqTimeout=6,kCqError=7,kInvalidOutput=8};
@@ -104,6 +104,16 @@ void PostActiveRequests(const uint32_t*,const uint32_t*,const int32_t*,const int
   *cqe=((1U-((hardware_cq/e->cq_depth)&1U))<<2U)|(inject_error?1U<<24U:0U);
   ++hardware_cq;
 }
+void ValidateDenseBatchGetDescriptors(const uint64_t*,const uint8_t*,const int32_t*,const int32_t*,
+  const int32_t*,uint32_t,uint32_t,uint32_t,uint32_t,const KvafBatchGetDirectUrmaEntity*,uint64_t* result,uint64_t*) {
+  *result=0;
+}
+void PrepareDenseBatchGetOutputForInboundDma(const int32_t*,uint32_t,uint64_t,uint32_t) {}
+void PostDenseBatchGetRequests(const int32_t*,const int32_t*,const int32_t*,const uint64_t*,
+  uint32_t count,uint32_t block_bytes,uint32_t jettys,const KvafBatchGetDirectUrmaEntity* e,
+  ModelQueue* q,uint32_t profile,uint64_t* doorbell,uint64_t* last) {
+  PostActiveRequests(nullptr,nullptr,nullptr,nullptr,nullptr,count,block_bytes,jettys,e,q,profile,doorbell,last);
+}
 """
 
 MAIN = r"""
@@ -126,13 +136,15 @@ int main() {
     a.request_capacity=a.output_rows=8192;a.block_bytes=656;a.selection_mode=KVAF_BATCH_GET_SELECTION_COMPACT_COUNT;
     hardware_sq=hardware_cq=0;
     for(unsigned epoch=0;epoch<12;++epoch) {
-      // A dense owner completes a speculative batch, all queue words bypass.
+      // Execute the actual dense state machine before the terminal Full Get.
       lane=epoch%2;
-      WriteGmByPassDCache<uint32_t>(&q.magic,kQueueMagic);
-      WriteGmByPassDCache<uint32_t>(&q.initialized,1U);
-      hardware_sq+=18;
-      WriteGmByPassDCache<uint64_t>(&q.sq_producer_index,hardware_sq);
-      WriteGmByPassDCache<uint64_t>(&q.cq_consumer_index,hardware_cq);
+      a.request_capacity=256;
+      KvafDenseBatchGetTransaction transaction;
+      BeginKvafDenseBatchGetPostOnly(a,18,0,&transaction);
+      assert(transaction.state==kDenseBatchGetInFlight);
+      FinishKvafDenseBatchGet(a,&transaction);
+      assert(transaction.result==0 && transaction.finalized==1);
+      a.request_capacity=8192;
       // Terminal SEND can land on the other AIV, with a different cache view.
       lane=1-lane;q.cache.Clean();
       RunKvafFullBatchGetCore(a,0);
@@ -142,7 +154,7 @@ int main() {
       assert(ReadGmByPassDCache<uint64_t>(&q.cq_consumer_index)==hardware_cq);
       assert(status.sq_producer_index==hardware_sq);
       assert(status.cq_consumer_index==hardware_cq);
-      assert(status.completed_batch_count==(count?epoch+1:0));
+      assert(status.completed_batch_count==(count?2:1)*(epoch+1));
     }
     // Error/timeout must remain errors; no fabricated completion/reset.
     if(count) for(unsigned kind=0;kind<2;++kind) {
@@ -190,6 +202,10 @@ def test_actual_full_get_preserves_dense_bypass_queue_across_epochs(tmp_path):
     source = (DEMO / "kernel/execute_batch_get_aiv.asc").read_text()
     program = SDK + "\n".join(function(source, name) for name in (
         "WriteStatus", "ActiveRequestsForJetty", "WaitForCompletion", "RunKvafFullBatchGetCore",
+    ))
+    program += source[source.index("enum DenseBatchGetTransactionState"):source.index("// Begin performs")]
+    program += "\n".join(function(source, name) for name in (
+        "BeginKvafDenseBatchGetPostOnly", "TryRetireKvafDenseBatchGet", "FinishKvafDenseBatchGet",
     )) + MAIN
     executable = tmp_path / "queue_replay"
     built = subprocess.run([compiler, "-std=c++17", "-O0", "-fsanitize=address,undefined",
@@ -199,3 +215,12 @@ def test_actual_full_get_preserves_dense_bypass_queue_across_epochs(tmp_path):
     run = subprocess.run([str(executable)], text=True, capture_output=True)
     assert run.returncode == 0, run.stderr
     assert "KVAF_MIXED_QUEUE_CACHE_PASS" in run.stdout
+
+
+def test_full_post_loads_the_same_durable_pi_that_commit_publishes():
+    source = (DEMO / "kernel/execute_batch_get_aiv.asc").read_text()
+    post = function(source, "PostActiveRequests")
+    commit = function(source, "CommitPostScalarStage")
+    assert "ReadGmByPassDCache<uint64_t>(\n        &queues[jetty].sq_producer_index)" in post
+    assert "current_heads[jetty] = queues[jetty].sq_producer_index" not in post
+    assert "WriteGmByPassDCache<uint64_t>(&queue->sq_producer_index" in commit

@@ -12,7 +12,7 @@
 
 投机路径和公共 Post 提交函数已经使用绕过 AIV 本地数据缓存的读写：发送位置直接提交到显存。旧 Full Get 却通过普通访问读取这条状态，再在 CQ 完成后修改同一缓存行中的完成位置和计数。当这条缓存行被写回时，发送位置的旧副本也随之被写回。
 
-CPU 回归测试调用实际 `RunKvafFullBatchGetCore` 和 `WaitForCompletion` 源函数，只将设备缓存及传输动作建模。输入让发送位置从18推进到35；旧代码在终态刷新后退回18，测试因此失败。这不是拿一个重写算法冒充真实 HCCP 仿真：测试不验证网络、带宽、WQE硬件执行，也不能给出真机时延。
+CPU 回归测试调用实际 `RunKvafFullBatchGetCore`、`WaitForCompletion` 和 Dense 的 Begin/TryRetire/Finish 源函数，只将设备缓存及传输动作建模。输入让发送位置从18推进到35；旧代码在终态刷新后退回18，测试因此失败。这不是拿一个重写算法冒充真实 HCCP 仿真：测试不验证网络、带宽、WQE硬件执行，也不能给出真机时延。
 
 ## 修改
 
@@ -26,3 +26,5 @@ CPU 回归测试调用实际 `RunKvafFullBatchGetCore` 和 `WaitForCompletion` �
 实际 Full Get 函数的 ASan/UBSan CPU回归覆盖：60轮混合调用，24轮原生调用，零行与非零行交替，CQ owner回绕，发送位置跨SQ深度，CQ错误和超时。旧代码在非零首批失败，修复后通过。
 
 CPU模型只证明在独立缓存与显存视图下，状态更新不再倒退。CANN编译和真机连续 Eager／Graph 验证应分别记录；没有真机通过记录之前，不声明完整故障或性能目标已经解决。
+
+本机 `cann-sim91` 已从仓库获取 `ef00d948b5ca696f736a09c513bc5a1b10da91c0`，CANN9.1 的 `kvaf_execute_batch_get_kernel` 编译通过（`/tmp/kvaf-queue-ef00d94/bin/kvaf_execute_batch_get_kernels.o`）。这只是一项编译结果，不是模拟器完成 HCCP 传输的证明。
