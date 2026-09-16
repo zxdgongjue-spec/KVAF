@@ -135,7 +135,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--output-access-pattern",
         choices=("random", "contiguous"),
         default=os.environ.get(
-            "KVAF_BATCH_GET_PERF_OUTPUT_ACCESS_PATTERN", "random"
+            "KVAF_BATCH_GET_PERF_OUTPUT_ACCESS_PATTERN", "contiguous"
         ),
         help=(
             "local NPU HBM output order; use contiguous while comparing source "
