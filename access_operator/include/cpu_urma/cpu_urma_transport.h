@@ -49,6 +49,12 @@ struct CpuUrmaTransportOptions {
   // the entire logical batch; otherwise each completed sub-batch contains at
   // most this many bytes (unless one SGE alone is larger).
   std::uint64_t window_bytes{0};
+  // Experimental per-Jetty sliding window. Zero keeps linked-list batch
+  // submission. Otherwise WRs are posted individually while at most this
+  // many remain without a completion fence.
+  std::uint32_t stream_depth{0};
+  // Completion fence interval used by stream_depth.
+  std::uint32_t cq_mod{100};
   bool has_external_region{false};
   peer::PeerRegion external_region{};
 };

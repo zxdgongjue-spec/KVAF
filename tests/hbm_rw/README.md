@@ -90,6 +90,17 @@ one logical transfer into byte-bounded sub-batches and waits for completion
 between them; for example, `--window-bytes 4M` compares an 8 MiB transfer as
 two completed 4 MiB windows against the default single 8 MiB submission.
 
+`--stream-depth N --cq-mod M` enables the per-Jetty sliding-window path used
+to compare against `urma_perftest`. It posts individual WRs until each Jetty
+has `N` outstanding, requests a CQE every `M` WRs, and immediately replenishes
+the queue when that CQE arrives. Start with perftest's defaults:
+
+```bash
+./build-cpu/tests/kvaf_cpu_hbm_client HOST:PORT \
+  --blocks 2048 --block-bytes 4096 --jettys 1 \
+  --stream-depth 128 --cq-mod 100 --warmup 20 --iterations 200
+```
+
 ```bash
 tests/run_hbm_rw_client.sh <npu-host> 29888 \
   --blocks 1024 --block-bytes 656 --doorbell-wqes 32 \

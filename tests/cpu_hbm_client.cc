@@ -29,6 +29,8 @@ struct Options {
   std::uint32_t device_id{0};
   std::uint32_t jetty_count{4};
   std::uint64_t window_bytes{0};
+  std::uint32_t stream_depth{0};
+  std::uint32_t cq_mod{100};
 };
 
 bool ParseU64(const char* text, std::uint64_t* value) {
@@ -55,7 +57,8 @@ void Usage(const char* program) {
                "[--doorbell-wqes N] "
                "[--seed N] [--ub-device NAME] "
                "[--eid-index N] [--device-id N] [--jettys N] "
-               "[--window-bytes N[K|M|G|T]]\n",
+               "[--window-bytes N[K|M|G|T]] [--stream-depth N] "
+               "[--cq-mod N]\n",
                program);
 }
 
@@ -112,11 +115,16 @@ bool Parse(int argc, char** argv, Options* options) {
     else if (arg == "--device-id" && ParseU32(value, &options->device_id)) {}
     else if (arg == "--jettys" && ParseU32(value, &options->jetty_count)) {}
     else if (arg == "--window-bytes" && ParseBytes(value, &options->window_bytes)) {}
+    else if (arg == "--stream-depth" && ParseU32(value, &options->stream_depth)) {}
+    else if (arg == "--cq-mod" && ParseU32(value, &options->cq_mod)) {}
     else return false;
   }
   return options->blocks != 0 && options->block_bytes != 0 && options->iterations != 0 &&
          options->wqes_per_doorbell <= 1024U &&
          options->jetty_count >= 1U && options->jetty_count <= 16U &&
+         options->stream_depth <= 8192U &&
+         (options->stream_depth == 0U ||
+          (options->cq_mod != 0U && options->cq_mod <= options->stream_depth)) &&
          options->blocks <= std::numeric_limits<std::uint64_t>::max() / options->block_bytes &&
          options->block_bytes <= std::numeric_limits<std::uint32_t>::max();
 }
@@ -241,13 +249,15 @@ int main(int argc, char** argv) {
                "[HBM_TEST][CPU] START peer=%s blocks=%zu block_bytes=%zu payload_bytes=%llu "
                "host_address_space_bytes=%llu "
                "iterations=%zu warmup=%zu "
-               "remote_device=%u jettys=%u window_bytes=%llu\n",
+               "remote_device=%u jettys=%u window_bytes=%llu "
+               "stream_depth=%u cq_mod=%u\n",
                options.peer.c_str(), options.blocks, options.block_bytes,
                static_cast<unsigned long long>(total_bytes),
                static_cast<unsigned long long>(host_space_bytes), options.iterations,
                options.warmup,
                options.device_id, options.jetty_count,
-               static_cast<unsigned long long>(options.window_bytes));
+               static_cast<unsigned long long>(options.window_bytes),
+               options.stream_depth, options.cq_mod);
   std::fprintf(stderr, "[HBM_TEST][CPU] DATA_PATH=direct-registered-host-memory\n");
 
   kvaf::CpuUrmaTransportOptions transport_options;
@@ -262,6 +272,8 @@ int main(int argc, char** argv) {
   transport_options.wqes_per_doorbell = options.wqes_per_doorbell;
   transport_options.jetty_count = options.jetty_count;
   transport_options.window_bytes = options.window_bytes;
+  transport_options.stream_depth = options.stream_depth;
+  transport_options.cq_mod = options.cq_mod;
   kvaf::CpuUrmaTransport transport;
   kvaf::Status status = transport.Initialize(transport_options);
   if (!status.ok()) {
