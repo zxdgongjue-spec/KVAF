@@ -27,6 +27,7 @@ struct Options {
   bool has_eid_index{false};
   std::uint32_t eid_index{0};
   std::uint32_t device_id{0};
+  std::uint32_t jetty_count{4};
 };
 
 bool ParseU64(const char* text, std::uint64_t* value) {
@@ -52,7 +53,7 @@ void Usage(const char* program) {
                "[--host-space-bytes N[K|M|G|T]] [--iterations N] [--warmup N] "
                "[--doorbell-wqes N] "
                "[--seed N] [--ub-device NAME] "
-               "[--eid-index N] [--device-id N]\n",
+               "[--eid-index N] [--device-id N] [--jettys N]\n",
                program);
 }
 
@@ -107,10 +108,12 @@ bool Parse(int argc, char** argv, Options* options) {
     else if (arg == "--ub-device") options->ub_device = value;
     else if (arg == "--eid-index" && ParseU32(value, &options->eid_index)) options->has_eid_index = true;
     else if (arg == "--device-id" && ParseU32(value, &options->device_id)) {}
+    else if (arg == "--jettys" && ParseU32(value, &options->jetty_count)) {}
     else return false;
   }
   return options->blocks != 0 && options->block_bytes != 0 && options->iterations != 0 &&
          options->wqes_per_doorbell <= 1024U &&
+         options->jetty_count >= 1U && options->jetty_count <= 16U &&
          options->blocks <= std::numeric_limits<std::uint64_t>::max() / options->block_bytes &&
          options->block_bytes <= std::numeric_limits<std::uint32_t>::max();
 }
@@ -253,6 +256,7 @@ int main(int argc, char** argv) {
   transport_options.remote_device_id = options.device_id;
   transport_options.remote_eid_index = options.has_eid_index ? options.eid_index : UINT32_MAX;
   transport_options.wqes_per_doorbell = options.wqes_per_doorbell;
+  transport_options.jetty_count = options.jetty_count;
   kvaf::CpuUrmaTransport transport;
   kvaf::Status status = transport.Initialize(transport_options);
   if (!status.ok()) {

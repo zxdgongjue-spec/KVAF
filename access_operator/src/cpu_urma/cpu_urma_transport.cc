@@ -26,8 +26,7 @@ namespace {
 
 constexpr std::uint32_t kJfcDepth = 16384;
 constexpr std::uint32_t kJettyDepth = 8192;
-constexpr std::uint32_t kJettyCount = 4;
-constexpr std::uint32_t kOmpThreadCount = 4;
+constexpr std::uint32_t kMaxJettyCount = 16;
 constexpr std::uint32_t kLocalSgeCount = 1;
 constexpr std::uint32_t kPageBytes = 4096;
 constexpr std::uint32_t kKeyBytes = sizeof(urma_jetty_id_t) + sizeof(urma_transport_mode_t);
@@ -170,12 +169,12 @@ struct CpuUrmaTransport::Impl {
       std::uint64_t post_ns{0};
       std::string error;
     };
-    std::array<WorkerResult, kJettyCount> results{};
+    std::vector<WorkerResult> results(job.queues.size());
     const std::size_t chunk_size = wqes_per_doorbell_ == 0U
         ? kJettyDepth : wqes_per_doorbell_;
     // A worker owns the entire Jetty chain, SQ and doorbell. No other worker
     // writes or submits that queue, so no per-wave barrier is necessary.
-#pragma omp parallel for schedule(static, 1) num_threads(kOmpThreadCount)
+#pragma omp parallel for schedule(static, 1) num_threads(static_cast<int>(job.queues.size()))
     for (std::int64_t index = 0; index < static_cast<std::int64_t>(job.queues.size()); ++index) {
       const auto jetty = static_cast<std::size_t>(index);
       auto& queue = job.queues[jetty];
@@ -261,10 +260,12 @@ struct CpuUrmaTransport::Impl {
   Status Initialize(const CpuUrmaTransportOptions& options) {
     if (options.peer_address.empty() || options.region_bytes == 0 ||
         options.region_bytes > std::numeric_limits<std::size_t>::max() ||
-        options.wqes_per_doorbell > kJettyDepth || options.remote_sgl_size == 0U) {
+        options.wqes_per_doorbell > kJettyDepth || options.remote_sgl_size == 0U ||
+        options.jetty_count == 0U || options.jetty_count > kMaxJettyCount) {
       return Status::InvalidArgument(
           "CPU URMA transport requires peer_address, non-zero region_bytes, "
-          "non-zero remote_sgl_size and wqes_per_doorbell in [0,1024]");
+          "non-zero remote_sgl_size, jetty_count in [1,16] and "
+          "wqes_per_doorbell in [0,8192]");
     }
     // URMA is process-wide.  The ACL/HBM runtime may have initialized it
     // before this transport is constructed, in which case liburma returns
@@ -378,11 +379,23 @@ struct CpuUrmaTransport::Impl {
     max_rsge_ = 1U;
     if (urma_query_device(device_, &device_attr) == URMA_SUCCESS) {
       std::fprintf(stderr,
-                   "[KVAF_CPU_URMA] DEVICE_CAP max_jfs_sge=%u max_jfs_rsge=%u "
-                   "max_jfr_sge=%u\n",
+                   "[KVAF_CPU_URMA] DEVICE_CAP max_jfs=%u max_jfr=%u max_jetty=%u "
+                   "max_jfc_depth=%u max_jfs_depth=%u max_jfr_depth=%u "
+                   "max_jfs_sge=%u max_jfs_rsge=%u max_jfr_sge=%u "
+                   "max_msg_size=%llu page_size_cap=0x%llx max_oor_cnt=%u mn=%u\n",
+                   device_attr.dev_cap.max_jfs,
+                   device_attr.dev_cap.max_jfr,
+                   device_attr.dev_cap.max_jetty,
+                   device_attr.dev_cap.max_jfc_depth,
+                   device_attr.dev_cap.max_jfs_depth,
+                   device_attr.dev_cap.max_jfr_depth,
                    device_attr.dev_cap.max_jfs_sge,
                    device_attr.dev_cap.max_jfs_rsge,
-                   device_attr.dev_cap.max_jfr_sge);
+                   device_attr.dev_cap.max_jfr_sge,
+                   static_cast<unsigned long long>(device_attr.dev_cap.max_msg_size),
+                   static_cast<unsigned long long>(device_attr.dev_cap.page_size_cap),
+                   device_attr.dev_cap.max_oor_cnt,
+                   device_attr.dev_cap.mn);
       if (device_attr.dev_cap.max_jfs_rsge != 0U) {
         max_rsge_ = std::min<std::uint32_t>(
             std::numeric_limits<std::uint8_t>::max(), device_attr.dev_cap.max_jfs_rsge);
@@ -432,11 +445,11 @@ struct CpuUrmaTransport::Impl {
     remote_seg_handle_ = urma_import_seg(context_, &remote_seg_, &remote_token, 0, import_flag);
     if (remote_seg_handle_ == nullptr) return Error("urma_import_seg");
 
-    jfcs_.reserve(kJettyCount);
-    jfrs_.reserve(kJettyCount);
-    local_jettys_.reserve(kJettyCount);
-    remote_jettys_.reserve(kJettyCount);
-    for (std::uint32_t jetty_index = 0U; jetty_index < kJettyCount;
+    jfcs_.reserve(options.jetty_count);
+    jfrs_.reserve(options.jetty_count);
+    local_jettys_.reserve(options.jetty_count);
+    remote_jettys_.reserve(options.jetty_count);
+    for (std::uint32_t jetty_index = 0U; jetty_index < options.jetty_count;
          ++jetty_index) {
       urma_jfc_cfg_t jfc_cfg{};
       jfc_cfg.depth = kJfcDepth;
@@ -531,7 +544,7 @@ struct CpuUrmaTransport::Impl {
     if (local_jettys_.empty()) return Error("no CPU Jettys created");
     wqes_per_doorbell_ = options.wqes_per_doorbell;
     std::fprintf(stderr, "[KVAF_CPU_URMA] JETTYS_READY count=%zu omp_threads=%u wqes_per_doorbell=%zu local_sge=1 requested_remote_sgl_size=%u remote_sgl_size=%zu depth=%u\n",
-                 local_jettys_.size(), kOmpThreadCount,
+                 local_jettys_.size(), options.jetty_count,
                  wqes_per_doorbell_, options.remote_sgl_size, batch_remote_sgl_size_, kJettyDepth);
     initialized_ = true;
     return Status::OK();
@@ -785,15 +798,16 @@ struct CpuUrmaTransport::Impl {
   Status ValidateLink() {
     if (!initialized_) return Status::NotInitialized("CPU transport is not initialized");
     const std::size_t bytes = static_cast<std::size_t>(
-        std::min<std::uint64_t>(64U, std::max<std::uint64_t>(1U, remote_region_.length / kJettyCount)));
+        std::min<std::uint64_t>(64U, std::max<std::uint64_t>(
+            1U, remote_region_.length / local_jettys_.size())));
     std::fill(probe_buffer_.begin(), probe_buffer_.end(), 0xA5U);
     std::fprintf(stderr, "[KVAF_CPU_URMA] LINK_PROBE stage=register_host\n");
     Status status = RegisterDirectHostMemory(probe_buffer_.data(), probe_buffer_.size());
     if (!status.ok()) return status;
-    std::array<std::uint64_t, kJettyCount> offsets{};
-    std::array<CpuUrmaTransport::HostSge, kJettyCount> sources{};
-    for (std::size_t jetty = 0; jetty < kJettyCount; ++jetty) {
-      offsets[jetty] = remote_region_.length >= kJettyCount ? jetty * bytes : 0U;
+    std::vector<std::uint64_t> offsets(local_jettys_.size());
+    std::vector<CpuUrmaTransport::HostSge> sources(local_jettys_.size());
+    for (std::size_t jetty = 0; jetty < local_jettys_.size(); ++jetty) {
+      offsets[jetty] = remote_region_.length >= local_jettys_.size() ? jetty * bytes : 0U;
       // Reusing the source address prevents grouping: every Jetty is probed.
       sources[jetty] = {probe_buffer_.data(), bytes};
     }

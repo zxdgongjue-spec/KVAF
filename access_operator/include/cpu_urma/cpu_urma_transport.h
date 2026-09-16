@@ -43,6 +43,8 @@ struct CpuUrmaTransportOptions {
   // WRITE only: values > 1 enable one contiguous local SGE -> multiple
   // remote SGEs. Requests above device capacity are split across WRs.
   std::uint32_t remote_sgl_size{1};
+  // Number of independent Jettys and OpenMP submission workers.
+  std::uint32_t jetty_count{4};
   bool has_external_region{false};
   peer::PeerRegion external_region{};
 };

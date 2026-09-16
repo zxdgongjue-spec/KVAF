@@ -240,10 +240,8 @@ struct NpuService::Impl {
     direct_hccp::MrRegInfo reg{};
     reg.in.mem.addr = reinterpret_cast<std::uint64_t>(region->memory);
     reg.in.mem.size = request.hbm_bytes;
-    // aclrtMalloc returns resident HBM. Keep its pages pinned in the URMA MR;
-    // non-pin registration falls onto a much slower translation path once
-    // the transfer spans more than the provider's cached page window.
-    reg.in.ub.flags = direct_hccp::MemRegFlags(false);
+    // Direct HCCP registers device HBM through its non-pin device-memory path.
+    reg.in.ub.flags = direct_hccp::MemRegFlags(true);
     reg.in.ub.token_value = 0xABCFU;
     reg.in.ub.token_id_handle = region->token_id_handle;
     if (api.lmem_register(device->context, &reg, &region->lmem_handle) != 0 ||

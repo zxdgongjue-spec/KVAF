@@ -199,6 +199,7 @@ build-npu/bin/kvaf_execute_batch_put_kernels.o
 客户端可通过 `--ub-device NAME --eid-index N` 指定本地端口，
 `--peer-candidate-id N` 选择服务端打印的 candidate id（默认 0）。
 `--doorbell-wqes N` 设置每次提交的 WR 数，0 表示每个 Jetty 一次提交完整链表。
+`--jettys N` 设置 1 到 16 个独立 Jetty；提交使用相同数量的 OpenMP 线程，默认 4。
 两端需要配置好 UB 网络；TCP 仅用于交换资源描述，不承载测量的数据。
 
 ### 2. 运行 NPU 端到端测试
