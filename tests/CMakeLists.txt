@@ -94,3 +94,41 @@ add_test(NAME kvaf_direct_hccp_diagnostics COMMAND kvaf_direct_hccp_diagnostics_
 add_executable(kvaf_urma_diagnostic_compat_test urma_diagnostic_compat_test.cc)
 target_include_directories(kvaf_urma_diagnostic_compat_test PRIVATE ../runtime/src)
 add_test(NAME kvaf_urma_diagnostic_compat COMMAND kvaf_urma_diagnostic_compat_test)
+
+if(KVAF_BUILD_REMOTE_CPU_SERVICE)
+  # Compile the production CPU diagnostics with the selected SDK and a fake
+  # provider. Keep these targets independent of kvaf_cpu_runtime's ABI opt-in.
+  foreach(mode IN ITEMS unconfirmed confirmed)
+    set(cpu_diag_target "kvaf_cpu_urma_diagnostics_${mode}_test")
+    add_executable(${cpu_diag_target} cpu_urma_diagnostics_test.cc)
+    target_include_directories(${cpu_diag_target} PRIVATE
+      "${KVAF_URMA_INCLUDE_DIR}"
+      ../runtime/include ../runtime/src ../common/include
+      ../access_operator/include ../meta_manager/include)
+    target_compile_options(${cpu_diag_target} PRIVATE -ffunction-sections -fdata-sections)
+    target_link_libraries(${cpu_diag_target} PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+    if(KVAF_HAVE_URMA_TP_ATTR_API)
+      target_compile_definitions(${cpu_diag_target} PRIVATE KVAF_HAVE_URMA_TP_ATTR_API=1)
+    endif()
+    if(mode STREQUAL "confirmed")
+      target_compile_definitions(${cpu_diag_target} PRIVATE
+        KVAF_CPU_URMA_QUERY_ABI_CONFIRMED=1 KVAF_CPU_URMA_TEST_EXPECT_CONFIRMED=1)
+    endif()
+    # Retain only the four dlsym query entry points and the called production
+    # paths. Unused service code is discarded without linking real liburma.
+    if(APPLE)
+      target_compile_definitions(${cpu_diag_target} PRIVATE MAP_HUGETLB=0 MADV_HUGEPAGE=0)
+      target_link_options(${cpu_diag_target} PRIVATE -Wl,-dead_strip -Wl,-exported_symbol,_main)
+    else()
+      target_link_options(${cpu_diag_target} PRIVATE -Wl,--gc-sections)
+    endif()
+    foreach(query IN ITEMS urma_query_device urma_query_jetty urma_query_jfr urma_get_tp_attr)
+      if(APPLE)
+        target_link_options(${cpu_diag_target} PRIVATE "-Wl,-exported_symbol,_${query}")
+      else()
+        target_link_options(${cpu_diag_target} PRIVATE "-Wl,--export-dynamic-symbol=${query}")
+      endif()
+    endforeach()
+    add_test(NAME "kvaf_cpu_urma_diagnostics_${mode}" COMMAND ${cpu_diag_target})
+  endforeach()
+endif()

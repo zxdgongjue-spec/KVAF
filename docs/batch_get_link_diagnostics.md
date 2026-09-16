@@ -7,7 +7,7 @@
 CPU 和 NPU 两端都需要重新编译对应的 host/runtime 代码：
 
 ```bash
-# CPU 机器，使用原来的 UMDK/库配置
+# CPU 机器；新增 CPU 属性查询默认禁用，先保留资源映射日志
 ./build.sh cpu
 
 # NPU 机器，使用原来的 CANN 配置
@@ -22,13 +22,32 @@ export KVAF_LINK_DIAGNOSTICS=1
 
 随后用原来的命令启动 CPU 服务和 NPU benchmark，分别保存完整 stdout/stderr。若有两个 CPU 服务，两者都设置这个环境变量并分别保存日志。NPU 的子进程会继承它。
 
-默认关闭；只有值为 `1` 时开启。查询发生在初始化、创建或导入通信资源时，不进入 BatchGet 的测量循环。不增加累计 CQ 错误留存。
+运行时诊断默认关闭；只有值为 `1` 时开启。开启后仍会打印端点身份、请求参数、符号所在 DSO 路径和资源映射。**新增的 CPU 属性查询另受编译选项 `KVAF_CPU_URMA_QUERY_ABI_CONFIRMED` 控制，默认 `OFF`**：`urma_query_device`、`urma_query_jetty`、`urma_query_jfr` 和 `urma_get_tp_attr` 均不调用，并输出 `reason=abi_not_confirmed`。这表示没有读取该属性，不能解释为属性值为 0；NPU 诊断不受这个 CPU 选项控制。
+
+允许执行的查询发生在初始化、创建或导入通信资源时，不进入 BatchGet 的测量循环。不增加累计 CQ 错误留存。
 
 连续吞吐脚本在该开关开启时，额外输出 `BATCH_GET_DFX_PHASE`：每个阶段提交前、全部 worker 完成后的墙钟/monotonic 对照点，并将它们保存到结果的 `diagnostic_clock_anchors`。它们不改变原来的带宽分母，也不在测量循环中查询设备。
 
-CPU 使用编译所选的 `urma_api.h` 类型调用查询接口。请保持头文件、liburma 和 provider 版本配套；构建默认使用的 UMDK 头不一定与机器上额外安装的 CANN/UMDK 库相同。诊断日志包含符号所在 DSO 路径，快照中的进程 maps 可进一步核对实际加载的 provider。
+CPU 查询使用编译所选的 `urma_api.h` 类型，必须与运行时实际加载的 liburma 及 provider 配套。**旧版头文件能够编译、动态库里存在同名符号，都不证明 ABI 兼容。** 查询函数若按另一版结构的大小或字段布局写入，可能破坏调用方内存；函数返回成功甚至打印出部分合理字段，也不能排除这种问题。不能通过猜测字段偏移、增大缓冲区或忽略异常字段来认定 ABI 已匹配。
 
-可选 API 缺失、驱动不支持、查询失败会记录为 unavailable/unsupported/failed，不中断正常建链。CPU 构建时检查 TP 属性 API 的声明；旧头没有声明时跳过该项，不自行猜测扩展结构。改变 UMDK 头目录后，应重新配置 CMake；必要时清除 `KVAF_HAVE_URMA_TP_ATTR_API` 缓存项。
+当前 `build.sh cpu` 会从 `KVAF_UMDK_ROOT` 或默认的 `../third_party/umdk` 取得头文件；缺少源码时克隆固定的 `br_UMDK_24.12.0_LTS` 分支。但 liburma 会单独查找：可来自 `KVAF_URMA_LIBRARY`、UMDK 目录或系统库目录，只有找不到时才构建随附 UMDK。因此可能出现“固定旧版头文件 + 系统新版 liburma/provider”的组合，脚本成功完成不代表二者配套。CMake 的 `KVAF_URMA_INCLUDE_DIR` 还可能保留之前配置的头文件路径。诊断日志中的 DSO 路径和进程 maps 用于核实实际加载位置，不能单凭文件名推断版本兼容。
+
+目前优先使用第 3 节的**配套外部 `urma_admin` 只读快照**获取 CPU 属性；它在独立进程运行，不把外部库的查询输出写入 KVAF 服务进程。仍需使用与部署栈配套的工具，并保留其退出状态与原始输出。若使用尚未包含默认禁用保护的旧二进制，临时恢复时，在原 CPU 服务启动命令前加 `env KVAF_LINK_DIAGNOSTICS=0`，其余参数保持原样；重新编译本版后可开启映射日志而继续跳过这些查询。
+
+只有取得与部署 liburma/provider 配套的 SDK 头文件，并确认相关查询结构的 ABI 后，才在 CPU 构建配置中显式启用 `-DKVAF_CPU_URMA_QUERY_ABI_CONFIRMED=ON`。例如，在已配置的 `build-cpu` 上，使用**已核实**的头文件目录及库路径重新配置：
+
+```bash
+# 前提：这两个变量指向已确认与实际部署栈配套的 SDK/库；不要仅为消除 skip 而开启。
+cmake -S . -B build-cpu \
+  -DKVAF_URMA_INCLUDE_DIR="$VERIFIED_URMA_INCLUDE_DIR" \
+  -DKVAF_URMA_LIBRARY="$VERIFIED_URMA_LIBRARY" \
+  -DKVAF_CPU_URMA_QUERY_ABI_CONFIRMED=ON
+cmake --build build-cpu --target kvaf_cpu_service --parallel
+```
+
+这个选项是对 ABI 已核实的显式确认，**不会自动检测或修复 ABI**。没有配套 SDK 时保持 `OFF`；已开启过的构建目录可通过重新配置 `-DKVAF_CPU_URMA_QUERY_ABI_CONFIRMED=OFF` 并重新编译恢复默认行为。
+
+在 ABI 已确认且查询被允许的前提下，可选 API 缺失、驱动不支持、查询返回失败会记录为 unavailable/unsupported/failed，不中断正常建链；这些返回值处理不能防止不兼容 ABI 导致的内存破坏。CPU 构建时检查 TP 属性 API 的声明；旧头没有声明时跳过该项，不自行猜测扩展结构。改变 UMDK 头目录后，应重新配置 CMake 并核对 `KVAF_URMA_INCLUDE_DIR`；必要时清除 `KVAF_HAVE_URMA_TP_ATTR_API` 缓存项。
 
 旧版头文件没有 JFS `order_type` 时输出 `order_type=unavailable`，同时保留原始 `jfs_flags`。不会把旧 ABI 的保留位解释成新字段，也不会把缺失字段报告为数值 0。
 
@@ -50,7 +69,9 @@ CPU 使用编译所选的 `urma_api.h` 类型调用查询接口。请保持头�
 4. BatchPut 的初始化也会创建资源；按 role 和 `BATCH_GET_TRANSPORT_WORKER` 区分 BatchGet 活跃资源，不能把全部已创建 Jetty 当成测量阶段的活跃 Jetty。
 5. 不同 TPN 只证明软件使用了不同的传输对象；是否落到同一个硬件事务资源池、SL 队列或物理端口，需要设备映射/DFX 信息。
 
-查询结果按来源区分：请求配置、创建/导入返回值、query 读回值。特别关注：
+CPU 默认未确认 ABI 时也不读取 imported-target 对象里的 TPN，记录 `local_import_tpn=unavailable import_tpn_source=abi_not_confirmed`；这部分需从配套外部工具补充，不能用 TP handle 替代。
+
+查询结果按来源区分：请求配置、创建/导入返回值、query 读回值。默认跳过 CPU query 时，日志中的请求值和创建返回值仍可用于连接关联，但不能冒充 CPU 实际属性读回值；用外部工具补充可读属性。特别关注：
 
 - 实际 Jetty 状态、实际队列深度和 priority。NPU 的 Jetty 查询接口仅暴露部分属性；未提供的属性不会被请求值冒充。
 - 设备能力里的 `priority_info`：本实现请求 `priority=2`，核对其实际 SL 和支持的 TP 类型。不同设备的映射不必相同。
@@ -86,7 +107,7 @@ python3 tests/collect_urma_dfx.py \
 
 快照退出码：`0` 为全部采集项成功，`1` 为存在缺失/失败但结果已保存，`2` 为输出目录等致命错误。以 `manifest.json` 逐项状态为准；部分旧版本不支持某些查询时仍可利用其余结果。
 
-**资源快照要在 NPU runtime 关闭前采集。** benchmark 退出后 CPU 服务进程虽然还在，session 的 Jetty/TP 也可能已经释放。手动来不及抓的 Jetty 身份和创建后读回值已保存在应用日志；不要拿下一次运行重新分配的 ID 解释上一次结果。
+**资源快照要在 NPU runtime 关闭前采集。** benchmark 退出后 CPU 服务进程虽然还在，session 的 Jetty/TP 也可能已经释放。手动来不及抓的 Jetty 身份、创建返回值，以及被允许且成功查询的读回值保存在应用日志；CPU 默认跳过的属性没有读回记录。不要拿下一次运行重新分配的 ID 解释上一次结果。
 
 ## 4. 真正的运行期硬件 DFX 怎么采
 

@@ -429,14 +429,18 @@ class UrmaResources {
     RunLinkDiagnostics([&] {
       const std::string local_id = DiagnosticJettyId(local->jetty_id);
       const std::string remote_id = DiagnosticJettyId(remote->id);
+      // The identity prefix used by the data path does not establish the ABI
+      // of the imported-target tail. Do not report its TPN without confirmation.
+      const std::string imported_tpn = detail::CpuUrmaQueryAbiConfirmed()
+                                           ? std::to_string(remote->tp.tpn) : "unavailable";
       LinkDiagnosticLog("event=channel_map session=%" PRIu64 " channel_index=%zu context=%p "
                         "ub_device=%s eid_index=%u local_eid=%s peer_eid=%s "
                         "id_format=eid:uasid:id local_jetty=%s remote_jetty=%s jfr=%s jfc=%s "
                         "local_ctp=0x%" PRIx64 " peer_ctp=0x%" PRIx64
-                        " local_import_tpn=%u peer_tpn=unavailable "
+                        " local_import_tpn=%s peer_tpn=unavailable "
                         "peer_tpn_reason=not_exchanged local_psn=0x%x peer_psn=0x%x "
                         "psn_source=import_request ctp_source=lookup "
-                        "import_tpn_source=imported_target_object",
+                        "import_tpn_source=%s",
                         session, channel_index, static_cast<void*>(context_),
                         selected_device_name_.c_str(), eid_index_,
                         DiagnosticHex(context_->eid.raw, kEidBytes).c_str(),
@@ -444,7 +448,8 @@ class UrmaResources {
                         local_id.c_str(), remote_id.c_str(),
                         DiagnosticJettyId(jfr->jfr_id).c_str(),
                         DiagnosticJettyId(jfc->jfc_id).c_str(), local_ctp,
-                        request.local_tp_handle, remote->tp.tpn, local_psn, request.local_psn);
+                        request.local_tp_handle, imported_tpn.c_str(), local_psn, request.local_psn,
+                        detail::CpuUrmaQueryAbiConfirmed() ? "imported_target_object" : "abi_not_confirmed");
       LinkDiagnosticLog("event=jetty_config session=%" PRIu64 " local_jetty=%s source=request "
                         "mode=%u jfs_depth=%u jfr_depth=%u jfc_depth=%u priority=%u "
                         "rnr_retry=%u err_timeout=%u error_suspend=1 share_jfr=1 "
@@ -454,9 +459,18 @@ class UrmaResources {
                         static_cast<unsigned int>(kHostJettyPriority),
                         static_cast<unsigned int>(kHostJettyRnrRetry),
                         static_cast<unsigned int>(kHostJettyErrTimeout));
-      LinkDiagnosticLog("event=jfc_config session=%" PRIu64 " jfc=%s source=created_object "
+      LinkDiagnosticLog("event=jfc_config session=%" PRIu64 " jfc=%s source=request "
                         "depth=%u hardware_readback=false",
-                        session, DiagnosticJettyId(jfc->jfc_id).c_str(), jfc->jfc_cfg.depth);
+                        session, DiagnosticJettyId(jfc->jfc_id).c_str(), kHostJfcDepth);
+
+      if (!detail::CpuUrmaQueryAbiConfirmed()) {
+        for (const char* event : {"jetty_query", "jfr_query", "tp_query"}) {
+          LinkDiagnosticLog("event=%s session=%" PRIu64 " local_jetty=%s "
+                            "status=skipped reason=abi_not_confirmed readback=external_urma_admin",
+                            event, session, local_id.c_str());
+        }
+        return;
+      }
 
       const auto query_jetty = reinterpret_cast<decltype(&urma_query_jetty)>(
           dlsym(RTLD_DEFAULT, "urma_query_jetty"));
@@ -593,14 +607,20 @@ class UrmaResources {
     RunLinkDiagnostics([&] {
       LinkDiagnosticLog("event=context_ready context=%p ub_device=%s eid_index=%u eid=%s "
                         "header_device_attr_bytes=%zu header_jetty_cfg_bytes=%zu "
-                        "header_import_flag_bytes=%zu import_ex_remote_bytes=%zu",
+                        "header_import_flag_bytes=%zu import_ex_remote_bytes=%zu cpu_query_abi_confirmed=%u",
                         static_cast<void*>(context_), selected_device_name_.c_str(), eid_index_,
                         DiagnosticHex(context_->eid.raw, kEidBytes).c_str(), sizeof(urma_device_attr_t),
-                        sizeof(urma_jetty_cfg_t), sizeof(urma_import_jetty_flag_t), sizeof(UrmaExtRjetty));
+                        sizeof(urma_jetty_cfg_t), sizeof(urma_import_jetty_flag_t), sizeof(UrmaExtRjetty),
+                        static_cast<unsigned int>(detail::CpuUrmaQueryAbiConfirmed()));
       for (const char* name : {"urma_init", "urma_create_jetty", "urma_import_jetty_ex",
                                "urma_query_device", "urma_query_jetty", "urma_query_jfr",
                                "urma_get_tp_attr"}) {
         LogDiagnosticSymbol(name, dlsym(RTLD_DEFAULT, name));
+      }
+      if (!detail::CpuUrmaQueryAbiConfirmed()) {
+        LinkDiagnosticLog("event=device_query context=%p status=skipped reason=abi_not_confirmed "
+                          "readback=external_urma_admin", static_cast<void*>(context_));
+        return;
       }
       const auto query = reinterpret_cast<decltype(&urma_query_device)>(
           dlsym(RTLD_DEFAULT, "urma_query_device"));
@@ -641,6 +661,12 @@ class UrmaResources {
   }
 
   void DiagnoseTp(uint64_t session, uint64_t local_ctp) const {
+    if (!detail::CpuUrmaQueryAbiConfirmed()) {
+      LinkDiagnosticLog("event=tp_query context=%p session=%" PRIu64 " local_ctp=0x%" PRIx64
+                        " status=skipped reason=abi_not_confirmed readback=external_urma_admin",
+                        static_cast<void*>(context_), session, local_ctp);
+      return;
+    }
 #if defined(KVAF_HAVE_URMA_TP_ATTR_API) && KVAF_HAVE_URMA_TP_ATTR_API
     const auto query = reinterpret_cast<decltype(&urma_get_tp_attr)>(
         dlsym(RTLD_DEFAULT, "urma_get_tp_attr"));

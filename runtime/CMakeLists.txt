@@ -47,6 +47,9 @@ endif()
 
 if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   find_package(Threads REQUIRED)
+  option(KVAF_CPU_URMA_QUERY_ABI_CONFIRMED
+    "Enable CPU diagnostic queries only after verifying the deployed URMA header/library/provider ABI"
+    OFF)
   set(KVAF_URMA_ROOT "" CACHE PATH "UMDK source or installation root")
   find_path(KVAF_URMA_INCLUDE_DIR urma_api.h
     HINTS
@@ -74,6 +77,9 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
     PUBLIC kvaf_runtime
     PRIVATE "${KVAF_URMA_LIBRARY}" "${CMAKE_DL_LIBS}" Threads::Threads)
   target_compile_features(kvaf_cpu_runtime PUBLIC cxx_std_17)
+  if(KVAF_CPU_URMA_QUERY_ABI_CONFIRMED)
+    target_compile_definitions(kvaf_cpu_runtime PRIVATE KVAF_CPU_URMA_QUERY_ABI_CONFIRMED=1)
+  endif()
 
   # TP diagnostics are optional: older public UMDK headers do not declare
   # this API. Use the installed declaration instead of guessing its ABI.
