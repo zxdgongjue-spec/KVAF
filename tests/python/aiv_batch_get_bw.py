@@ -20,7 +20,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--peer", required=True, help="CPU service HOST:PORT")
     parser.add_argument("--build-dir", type=Path, default=ROOT / "build-npu")
-    parser.add_argument("--allocator", choices=("torch", "acl-normal"), default="torch")
+    parser.add_argument("--allocator", choices=("torch", "acl-normal", "acl-huge"), default="torch")
     parser.add_argument("--blocks", type=int, default=1024)
     parser.add_argument("--block-bytes", type=int, default=4096)
     parser.add_argument("--cores", type=int, default=32)
@@ -82,6 +82,16 @@ def summarize(payload_bytes, samples):
     )
 
 
+def make_output(args, torch, kvaf):
+    if args.allocator == "torch":
+        return torch.empty(
+            (args.blocks, args.block_bytes), dtype=torch.uint8, device=f"npu:{args.device_id}"
+        )
+    return kvaf.NormalHbmBuffer(
+        args.blocks, args.block_bytes, args.device_id, huge_first=args.allocator == "acl-huge"
+    )
+
+
 def run(args):
     build = args.build_dir.resolve()
     get_kernel = build / "bin/kvaf_execute_batch_get_kernels.o"
@@ -106,11 +116,7 @@ def run(args):
         (rows * 131 + (rows >> 8) * 29 + columns * 17 + (columns >> 3)) & 255
     ).to(torch.uint8)
     source = source_host.to(device)
-    output = (
-        torch.empty((args.blocks, args.block_bytes), dtype=torch.uint8, device=device)
-        if args.allocator == "torch"
-        else kvaf.NormalHbmBuffer(args.blocks, args.block_bytes, args.device_id)
-    )
+    output = make_output(args, torch, kvaf)
     runtime = kvaf.NpuRuntime(
         str(get_kernel),
         batch_get_token_bytes=args.block_bytes,

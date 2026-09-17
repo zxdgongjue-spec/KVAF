@@ -61,7 +61,7 @@ struct NpuTensorView {
 class NormalHbmBuffer final {
  public:
   NormalHbmBuffer(std::size_t rows, std::size_t row_bytes,
-                  std::uint32_t device_id)
+                  std::uint32_t device_id, bool huge_first)
       : rows_(rows), row_bytes_(row_bytes), device_id_(device_id) {
     if (rows == 0 || row_bytes == 0 ||
         rows > static_cast<std::size_t>(std::numeric_limits<py::ssize_t>::max()) ||
@@ -76,8 +76,9 @@ class NormalHbmBuffer final {
     if (current != static_cast<int32_t>(device_id)) {
       throw py::value_error("set the current NPU device before allocating NormalHbmBuffer");
     }
-    ThrowIfAclError(aclrtMalloc(&data_, bytes_, ACL_MEM_MALLOC_NORMAL_ONLY),
-                    "aclrtMalloc NORMAL_ONLY");
+    const auto policy = huge_first ? ACL_MEM_MALLOC_HUGE_FIRST : ACL_MEM_MALLOC_NORMAL_ONLY;
+    ThrowIfAclError(aclrtMalloc(&data_, bytes_, policy),
+                    huge_first ? "aclrtMalloc HUGE_FIRST" : "aclrtMalloc NORMAL_ONLY");
     if (data_ == nullptr) throw std::runtime_error("aclrtMalloc returned null HBM");
   }
 
@@ -506,8 +507,9 @@ class NpuPythonRuntime final {
 
 void BindNpuPythonRuntime(py::module_& module) {
   py::class_<NormalHbmBuffer>(module, "NormalHbmBuffer")
-      .def(py::init<std::size_t, std::size_t, std::uint32_t>(),
-           py::arg("rows"), py::arg("row_bytes"), py::arg("device_id") = 0)
+      .def(py::init<std::size_t, std::size_t, std::uint32_t, bool>(),
+           py::arg("rows"), py::arg("row_bytes"), py::arg("device_id") = 0,
+           py::arg("huge_first") = false)
       .def("data_ptr", &NormalHbmBuffer::DataPtr)
       .def_property_readonly("bytes", &NormalHbmBuffer::Bytes)
       .def("cpu", &NormalHbmBuffer::Cpu,

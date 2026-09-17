@@ -501,8 +501,8 @@ saved to the temporary log named in the PASS/FAIL line.
 # CPU host: keep this service running.
 ./build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999
 
-# NPU host: use the same build for both output allocators.
-for allocator in torch acl-normal; do
+# NPU host: use the same build for all output allocators.
+for allocator in torch acl-normal acl-huge; do
   python3 tests/python/aiv_batch_get_bw.py \
     --peer CPU_HOST:28999 --build-dir build-npu \
     --allocator "$allocator" --blocks 2048 --block-bytes 4096 \
@@ -523,6 +523,13 @@ bypassing the Torch allocator. The raw buffer is accepted only as BatchGet
 output; it is not a Torch Tensor. Allocation and CPU readback validation are
 outside the timed loop. The benchmark releases the buffer after Runtime
 shutdown, because Runtime caches its Direct-HCCP registration.
+
+The focused `aiv_batch_get_bw.py` test also accepts `--allocator acl-huge`.
+It uses the same raw buffer and `aclrtMalloc` call as `acl-normal`, changing
+only the policy to `ACL_MEM_MALLOC_HUGE_FIRST`. Allocation size, registration
+and timing are unchanged; it does not use the Torch memory pool. HUGE_FIRST
+prefers huge pages but may fall back to normal pages, so the mode name does
+not prove the actual page size. Rebuild the NPU binding before using it.
 
 After rebuilding `build-npu`, set the same settings for both runs:
 

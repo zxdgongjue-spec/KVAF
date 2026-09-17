@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import Mock
 
 import aiv_batch_get_bw as bw
 
@@ -29,6 +30,20 @@ class BandwidthTest(unittest.TestCase):
             with self.subTest(flag=flag), self.assertRaises(SystemExit):
                 with contextlib.redirect_stderr(io.StringIO()):
                     bw.parse_args(["--peer", "host:28999", flag, value])
+
+    def test_acl_allocation_policy(self):
+        for allocator, huge_first in (("acl-normal", False), ("acl-huge", True)):
+            with self.subTest(allocator=allocator):
+                args = bw.parse_args([
+                    "--peer", "host:28999", "--allocator", allocator, "--device-id", "4",
+                    "--blocks", "2048", "--block-bytes", "4096",
+                ])
+                kvaf = Mock()
+                output = bw.make_output(args, None, kvaf)
+                kvaf.NormalHbmBuffer.assert_called_once_with(
+                    2048, 4096, 4, huge_first=huge_first
+                )
+                self.assertIs(output, kvaf.NormalHbmBuffer.return_value)
 
     def test_completed_payload_rate(self):
         result = bw.summarize(4 * 1024 * 1024, [100_000, 200_000])
