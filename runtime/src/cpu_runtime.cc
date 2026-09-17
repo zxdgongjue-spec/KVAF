@@ -54,7 +54,7 @@ using kvaf::peer::kSegKeyBytes;
 constexpr uint32_t kHostJfsDepth = 8192U;
 constexpr uint32_t kHostJfrDepth = 256U;
 constexpr uint32_t kHostJfcDepth = 16384U;
-constexpr uint8_t kHostJettyPriority = 2U;
+constexpr uint8_t kHostJettyPriority = 15U;
 constexpr uint8_t kHostJettyRnrRetry = 7U;
 constexpr uint8_t kHostJettyErrTimeout = 16U;
 constexpr uint32_t kJettyKeyBytes = sizeof(urma_jetty_id_t) + sizeof(urma_transport_mode_t);
