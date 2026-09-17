@@ -117,7 +117,7 @@ def main(batch: int = 16) -> int:
     )
     table_capacity = int(
         os.environ.get(
-            "KVAF_RUNTIME_PERF_TABLE_CAPACITY", str(batch * PUT_BATCH_SIZE * 1024)
+            "KVAF_RUNTIME_PERF_TABLE_CAPACITY", str(batch * 1024 * 78)
         )
     )
     requests = int(
