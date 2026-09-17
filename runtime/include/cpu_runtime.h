@@ -8,11 +8,6 @@
 
 namespace kvaf {
 
-enum class CpuHostAllocator : std::uint8_t {
-  kPosix = 0,
-  kAcl = 1,
-};
-
 enum class CpuMemoryPageMode {
   kDefault,
   kTransparentHugePage,
@@ -23,7 +18,6 @@ struct CpuRuntimeOptions {
   std::string ub_device;
   bool has_eid_index{false};
   std::uint32_t eid_index{0};
-  CpuHostAllocator host_allocator{CpuHostAllocator::kPosix};
   CpuMemoryPageMode memory_page_mode{CpuMemoryPageMode::kDefault};
 };
 

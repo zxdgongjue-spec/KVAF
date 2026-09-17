@@ -130,10 +130,6 @@ static_assert(sizeof(UrmaExtActiveTpCfg) == 40U, "UMDK expanded Jetty config ABI
 using UrmaGetTpListFn = int (*)(urma_context_t*, UrmaExtGetTpCfg*, uint32_t*, UrmaExtTpInfo*);
 using UrmaImportJettyExFn = urma_target_jetty_t* (*)(urma_context_t*, UrmaExtRjetty*, urma_token_t*,
                                                       UrmaExtActiveTpCfg*);
-using AclInitFn = int (*)(const char*);
-using AclFinalizeFn = int (*)();
-using AclrtMallocHostFn = int (*)(void**, size_t);
-using AclrtFreeHostFn = int (*)(void*);
 
 void Log(const char* format, ...) {
   va_list arguments;
@@ -141,115 +137,6 @@ void Log(const char* format, ...) {
   std::vfprintf(stderr, format, arguments);
   va_end(arguments);
 }
-
-class HostMemoryAllocator {
- public:
-  ~HostMemoryAllocator() { Shutdown(); }
-
-  bool Initialize(CpuHostAllocator kind) {
-    kind_ = kind;
-    if (kind_ == CpuHostAllocator::kPosix) {
-      Log("[KVAF_CPU] HOST_ALLOCATOR_READY kind=posix alignment=%zu\n", kBasePageBytes);
-      return true;
-    }
-
-    for (const char* library_name : {"libascendcl.so", "libascendcl.so.1"}) {
-      library_ = dlopen(library_name, RTLD_NOW | RTLD_LOCAL);
-      if (library_ != nullptr) {
-        library_name_ = library_name;
-        break;
-      }
-    }
-    if (library_ == nullptr) {
-      Log("[KVAF_CPU] HOST_ALLOCATOR_INIT_FAILED kind=acl stage=dlopen error=%s\n", dlerror());
-      return false;
-    }
-    acl_init_ = reinterpret_cast<AclInitFn>(dlsym(library_, "aclInit"));
-    acl_finalize_ = reinterpret_cast<AclFinalizeFn>(dlsym(library_, "aclFinalize"));
-    acl_malloc_host_ = reinterpret_cast<AclrtMallocHostFn>(dlsym(library_, "aclrtMallocHost"));
-    acl_free_host_ = reinterpret_cast<AclrtFreeHostFn>(dlsym(library_, "aclrtFreeHost"));
-    if (acl_init_ == nullptr || acl_finalize_ == nullptr || acl_malloc_host_ == nullptr ||
-        acl_free_host_ == nullptr) {
-      Log("[KVAF_CPU] HOST_ALLOCATOR_INIT_FAILED kind=acl stage=dlsym init=%p finalize=%p "
-          "malloc_host=%p free_host=%p\n",
-          reinterpret_cast<void*>(acl_init_), reinterpret_cast<void*>(acl_finalize_),
-          reinterpret_cast<void*>(acl_malloc_host_), reinterpret_cast<void*>(acl_free_host_));
-      Shutdown();
-      return false;
-    }
-    const int status = acl_init_(nullptr);
-    if (status != 0) {
-      Log("[KVAF_CPU] HOST_ALLOCATOR_INIT_FAILED kind=acl stage=aclInit status=%d\n", status);
-      Shutdown();
-      return false;
-    }
-    acl_initialized_ = true;
-    Log("[KVAF_CPU] HOST_ALLOCATOR_READY kind=acl library=%s\n", library_name_.c_str());
-    return true;
-  }
-
-  bool Allocate(uint64_t bytes, std::size_t alignment, void** memory, int* status) const {
-    if (memory == nullptr || status == nullptr || bytes == 0U ||
-        bytes > std::numeric_limits<size_t>::max() || alignment == 0U) {
-      return false;
-    }
-    *memory = nullptr;
-    if (kind_ == CpuHostAllocator::kAcl) {
-      *status = acl_malloc_host_(memory, static_cast<size_t>(bytes));
-      return *status == 0 && *memory != nullptr;
-    }
-    *status = posix_memalign(memory, alignment, static_cast<size_t>(bytes));
-    return *status == 0 && *memory != nullptr;
-  }
-
-  void Release(void* memory) const {
-    if (memory == nullptr) {
-      return;
-    }
-    if (kind_ == CpuHostAllocator::kAcl) {
-      const int status = acl_free_host_(memory);
-      if (status != 0) {
-        Log("[KVAF_CPU] HOST_ALLOCATOR_RELEASE_WARNING kind=acl memory=%p status=%d\n",
-            memory, status);
-      }
-      return;
-    }
-    free(memory);
-  }
-
-  const char* name() const {
-    return kind_ == CpuHostAllocator::kAcl ? "acl" : "posix";
-  }
-
- private:
-  void Shutdown() {
-    if (acl_initialized_ && acl_finalize_ != nullptr) {
-      const int status = acl_finalize_();
-      if (status != 0) {
-        Log("[KVAF_CPU] HOST_ALLOCATOR_FINALIZE_WARNING kind=acl status=%d\n", status);
-      }
-    }
-    acl_initialized_ = false;
-    acl_init_ = nullptr;
-    acl_finalize_ = nullptr;
-    acl_malloc_host_ = nullptr;
-    acl_free_host_ = nullptr;
-    if (library_ != nullptr) {
-      dlclose(library_);
-      library_ = nullptr;
-    }
-    library_name_.clear();
-  }
-
-  CpuHostAllocator kind_ = CpuHostAllocator::kPosix;
-  void* library_ = nullptr;
-  std::string library_name_;
-  AclInitFn acl_init_ = nullptr;
-  AclFinalizeFn acl_finalize_ = nullptr;
-  AclrtMallocHostFn acl_malloc_host_ = nullptr;
-  AclrtFreeHostFn acl_free_host_ = nullptr;
-  bool acl_initialized_ = false;
-};
 
 bool ReadAll(int fd, void* data, size_t bytes) {
   auto* cursor = static_cast<uint8_t*>(data);
@@ -573,10 +460,8 @@ struct Region {
 
 class CpuService {
  public:
-  CpuService(UrmaResourcePool* resource_pool, HostMemoryAllocator* host_allocator,
-             CpuMemoryPageMode memory_page_mode)
+  CpuService(UrmaResourcePool* resource_pool, CpuMemoryPageMode memory_page_mode)
       : resource_pool_(resource_pool),
-        host_allocator_(host_allocator),
         memory_page_mode_(memory_page_mode) {}
   ~CpuService() { ReleaseAll(); }
 
@@ -587,8 +472,7 @@ class CpuService {
   Result Allocate(uint64_t bytes, uint64_t slot_size, uint32_t candidate_id,
                   AllocateRegionResponse* response) {
     if (response == nullptr || bytes == 0U || slot_size == 0U || bytes % slot_size != 0U ||
-        bytes > std::numeric_limits<size_t>::max() || resource_pool_ == nullptr ||
-        host_allocator_ == nullptr) {
+        bytes > std::numeric_limits<size_t>::max() || resource_pool_ == nullptr) {
       return Result::kInvalidRequest;
     }
     UrmaResources* resources = resource_pool_->Get(candidate_id);
@@ -656,10 +540,9 @@ class CpuService {
     regions_.emplace(id, std::move(region));
     Log("[KVAF_CPU] REGION_ALLOCATED session=%" PRIu64 " candidate=%u ub_device=%s eid_index=%u "
         "bytes=%" PRIu64 " base=0x%" PRIx64
-        " token_id=0x%x reg_flags=0x%x allocator=%s page_mode=%s\n",
+        " token_id=0x%x reg_flags=0x%x page_mode=%s\n",
         id, candidate_id, resources->device_name().c_str(), resources->eid_index(), bytes,
-        response->peer_base, response->token_id, flag.value, host_allocator_->name(),
-        MemoryPageModeName());
+        response->peer_base, response->token_id, flag.value, MemoryPageModeName());
     return Result::kOk;
   }
 
@@ -744,7 +627,7 @@ class CpuService {
   }
 
   bool AllocateMemory(Region* region) {
-    if (region == nullptr || host_allocator_ == nullptr || region->bytes == 0U ||
+    if (region == nullptr || region->bytes == 0U ||
         region->bytes > std::numeric_limits<std::size_t>::max()) {
       return false;
     }
@@ -774,25 +657,24 @@ class CpuService {
         memory_page_mode_ == CpuMemoryPageMode::kTransparentHugePage
             ? kHugePage2MBytes
             : kBasePageBytes;
-    int allocation_status = 0;
-    if (!host_allocator_->Allocate(region->bytes, alignment, &region->memory,
-                                   &allocation_status)) {
-      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=host_allocator allocator=%s bytes=%" PRIu64
+    const int allocation_status =
+        posix_memalign(&region->memory, alignment, bytes);
+    if (allocation_status != 0 || region->memory == nullptr) {
+      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=posix_memalign bytes=%" PRIu64
           " alignment=%zu status=%d memory=%p page_mode=%s\n",
-          host_allocator_->name(), region->bytes, alignment, allocation_status,
-          region->memory, MemoryPageModeName());
+          region->bytes, alignment, allocation_status, region->memory,
+          MemoryPageModeName());
       if (region->memory != nullptr) {
-        host_allocator_->Release(region->memory);
+        free(region->memory);
         region->memory = nullptr;
       }
       return false;
     }
     if ((reinterpret_cast<uintptr_t>(region->memory) & (alignment - 1U)) != 0U) {
-      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=alignment allocator=%s bytes=%" PRIu64
+      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=alignment bytes=%" PRIu64
           " required_alignment=%zu memory=%p page_mode=%s\n",
-          host_allocator_->name(), region->bytes, alignment, region->memory,
-          MemoryPageModeName());
-      host_allocator_->Release(region->memory);
+          region->bytes, alignment, region->memory, MemoryPageModeName());
+      free(region->memory);
       region->memory = nullptr;
       return false;
     }
@@ -801,7 +683,7 @@ class CpuService {
         Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=madvise_hugepage bytes=%" PRIu64
             " errno=%d\n",
             region->bytes, errno);
-        host_allocator_->Release(region->memory);
+        free(region->memory);
         region->memory = nullptr;
         return false;
       }
@@ -920,7 +802,7 @@ class CpuService {
       if (region->allocation_kind == Region::AllocationKind::kMmap) {
         (void)munmap(region->memory, static_cast<std::size_t>(region->bytes));
       } else {
-        host_allocator_->Release(region->memory);
+        free(region->memory);
       }
       region->memory = nullptr;
     }
@@ -934,7 +816,6 @@ class CpuService {
   }
 
   UrmaResourcePool* resource_pool_ = nullptr;
-  HostMemoryAllocator* host_allocator_ = nullptr;
   CpuMemoryPageMode memory_page_mode_{CpuMemoryPageMode::kDefault};
   uint64_t next_region_id_ = 1U;
   uint32_t next_token_ = 1U;
@@ -1026,7 +907,6 @@ void HandleClient(int fd, CpuService* service) {
 
 struct CpuRuntime::Impl {
   UrmaResourcePool resources;
-  HostMemoryAllocator host_allocator;
   std::unique_ptr<CpuService> service;
 };
 
@@ -1039,20 +919,12 @@ Status CpuRuntime::Initialize(const CpuRuntimeOptions& options) {
   if (options.has_eid_index && options.ub_device.empty()) {
     return Status::InvalidArgument("CpuRuntime eid_index requires ub_device");
   }
-  if (options.host_allocator == CpuHostAllocator::kAcl &&
-      options.memory_page_mode != CpuMemoryPageMode::kDefault) {
-    return Status::InvalidArgument(
-        "CpuRuntime non-default memory page modes require the posix Host allocator");
-  }
   auto impl = std::make_unique<Impl>();
-  if (!impl->host_allocator.Initialize(options.host_allocator)) {
-    return Status::Internal("CpuRuntime failed to initialize Host memory allocator");
-  }
   if (!impl->resources.Initialize(options.ub_device, options.has_eid_index, options.eid_index)) {
     return Status::Internal("CpuRuntime failed to initialize UMDK resources");
   }
   impl->service = std::make_unique<CpuService>(
-      &impl->resources, &impl->host_allocator, options.memory_page_mode);
+      &impl->resources, options.memory_page_mode);
   impl_ = std::move(impl);
   return Status::OK();
 }
