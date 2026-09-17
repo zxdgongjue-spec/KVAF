@@ -36,7 +36,7 @@ transport:
 KvafBatchGetTransport *transport = nullptr;
 KvafBatchGetLocalBuffer *output_binding = nullptr;
 uint64_t entity = 0;
-uint32_t jettys_per_core = 2;
+uint32_t jettys_per_core = 1;
 KvafBatchGetTransportCreateWithPeerLink(host_ddr, host_ddr_bytes, aiv_cores,
                                         jettys_per_core, peer_link, npu_local_eid,
                                         &transport);

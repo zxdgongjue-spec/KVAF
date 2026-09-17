@@ -458,9 +458,9 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("batch_get_kernel_object_path"),
            py::arg("batch_get_token_bytes"),
            py::arg("batch_get_tokens_per_block"), py::arg("device_id") = 0,
-           py::arg("npu_core_count") = 1,
+           py::arg("npu_core_count") = 2,
            py::arg("batch_put_kernel_object_path") = "",
-           py::arg("jettys_per_core") = 2,
+           py::arg("jettys_per_core") = 1,
            py::arg("npu_eids") = std::vector<std::string>{})
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
            "Connect this NPU Runtime to a CPU Runtime service before initialize.")

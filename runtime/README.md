@@ -209,7 +209,6 @@ DEVICE_ID=0 \
 KVAF_NPU_TOKEN_BYTES=656 \
 KVAF_NPU_TOKENS_PER_BLOCK=128 \
 KVAF_NPU_ACTIVE_PERCENT=5 \
-KVAF_NPU_JETTYS_PER_CORE=2 \
 tests/run_remote_cpu_e2e.sh "$PWD/build-npu"
 ```
 
@@ -219,8 +218,8 @@ teardown。它以 `KVAF_NPU_ACTIVE_PERCENT` 决定 `miss_count`（例如 `5` 表
 请求有效），只为 `[0, miss_count)` 前缀写入 KV；随后可用 Runtime 的 ACL D2H mock
 `batch_put` 将 caller-owned NPU source Tensor 写入 Runtime-owned DDR。该小型
 BatchGet 用例不传 BatchPut kernel，因而不启动 Direct-HCCP BatchPut transport。
-每个 AIV core 默认使用 2 个 Jetty；可通过 `KVAF_NPU_JETTYS_PER_CORE=1` 切换为
-单 Jetty 验证。
+默认使用 2 个 AIV core，每个 core 使用 1 个 Jetty；可通过
+`KVAF_NPU_CORE_COUNT` 和 `KVAF_NPU_JETTYS_PER_CORE` 覆盖。
 
 设置 `KVAF_NPU_GRAPH_REPLAYS` 可在同一个 Python 用例中额外运行 Python-owned 的
 raw `kvaf.AclGraph` 图模式：
