@@ -11,16 +11,14 @@ namespace kvaf {
 
 enum class CpuMemoryPageMode {
   kDefault,
-  kBasePage4K,
   kTransparentHugePage,
-  kHugeTlb2M,
 };
 
 struct CpuRuntimeOptions {
   std::string ub_device;  // Legacy single-device filter.
   bool has_eid_index{false};
   std::uint32_t eid_index{0};
-  CpuMemoryPageMode memory_page_mode{CpuMemoryPageMode::kDefault};
+  CpuMemoryPageMode memory_page_mode{CpuMemoryPageMode::kTransparentHugePage};
   std::vector<std::string> ub_devices;  // Empty discovers all; combined with ub_device.
 };
 

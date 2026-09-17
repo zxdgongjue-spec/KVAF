@@ -44,44 +44,22 @@ cd /path/to/kvaf
   --listen 0.0.0.0 --port 28999
 ```
 
-CPU DDR region 支持四种页分配模式，通过 CPU 服务启动参数选择：
+CPU DDR region 支持两种页分配模式；未指定时默认使用 `thp`：
 
 ```bash
-# 保留原行为：4 KiB 对齐的普通匿名内存；操作系统仍可能自行使用 THP。
+# 默认模式：2 MiB 对齐，MADV_HUGEPAGE，并在注册前主动触页；
+# 是否全部合并仍由 Linux THP 决定。
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28999
+
+# 保留原始普通内存行为：4 KiB 对齐，操作系统仍可能自行使用 THP。
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28999 --memory-page-mode default
-
-# 显式使用基础页：独立匿名 VMA + MADV_NOHUGEPAGE，不受节点 THP=always 策略影响。
-./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28999 --memory-page-mode base-4k
-
-# 2 MiB 对齐，MADV_HUGEPAGE，并在注册前主动触页；是否全部合并仍由 Linux THP 决定。
-./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28999 --memory-page-mode thp
-
-# 显式从预留的 2 MiB hugetlb 池分配；region 字节数必须是 2 MiB 的整数倍。
-./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28999 --memory-page-mode hugetlb-2m
-```
-
-`base-4k` 只对当前 CPU service 分配的 DDR region 禁用 THP，不修改
-`/sys/kernel/mm/transparent_hugepage/*` 的节点全局策略；分配时若
-`MADV_NOHUGEPAGE` 失败则直接拒绝请求，不会静默回退。它适合在节点设置为
-`THP=always` 时建立稳定的基础页对照组。测试期间应确认服务日志包含
-`page_mode=base-4k`，并通过 `/proc/<pid>/smaps` 验证对应 region 的
-`AnonHugePages` 为 0。
-
-`hugetlb-2m` 不会在失败时静默回退。启动服务前必须在目标 NUMA node
-预留足够的 2 MiB hugepages；例如默认 2 GiB region 至少需要 1024 页：
-
-```bash
-grep -E 'HugePages|Hugepagesize' /proc/meminfo
-sudo sysctl -w vm.nr_hugepages=1100
 ```
 
 需要固定 NUMA 位置时，应在 UB device 所在 node 启动服务，例如
 `numactl --cpunodebind=N --membind=N ...`。`REGION_ALLOCATED` 日志会记录
-`page_mode`。THP 模式还应通过 `/proc/<pid>/smaps` 的 `AnonHugePages` 验证实际
+`page_mode`。默认 THP 模式还应通过 `/proc/<pid>/smaps` 的 `AnonHugePages` 验证实际
 合并量；Linux 使用大页并不保证 UDMA/IOMMU 一定保留相同的页表粒度。
 
 默认自动枚举所有可用 UMDK UB device/EID；`--ub-device NAME` 和
@@ -163,7 +141,7 @@ runtime.initialize(ddr_bytes, kv_block_bytes)
   标定带宽。建链、分配和 Host 同步开销不计入排名；日志输出周期数和 bytes/cycle，
   不假定硬件时钟频率。
 - 探测 region 根据当前 block 大小和 miss count 计算，并向上对齐到 block 大小与
-  2 MiB 的最小公倍数，支持现有 `hugetlb-2m` 页模式。各设备串行创建和释放；每个
+  2 MiB 的最小公倍数，使默认 THP 模式具备完整 2 MiB 页的地址和长度条件。各设备串行创建和释放；每个
   组合完成后先销毁通道和 region，再释放 NPU
   buffer。全部探测结束后，按排名建立用户请求大小的正式 region，校验连通性，
   最优组合重建失败时尝试下一名；没有可用组合则初始化失败。

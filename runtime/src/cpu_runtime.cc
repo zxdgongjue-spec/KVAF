@@ -66,14 +66,6 @@ constexpr uint32_t kSegBytes = sizeof(urma_seg_t);
 constexpr std::size_t kBasePageBytes = 4096U;
 constexpr std::size_t kHugePage2MBytes = 2U * 1024U * 1024U;
 
-#ifndef MAP_HUGE_SHIFT
-#define MAP_HUGE_SHIFT 26
-#endif
-
-#ifndef MAP_HUGE_2MB
-#define MAP_HUGE_2MB (21 << MAP_HUGE_SHIFT)
-#endif
-
 static_assert(sizeof(urma_jetty_id_t) == 24U, "UMDK Jetty id ABI changed");
 static_assert(kJettyKeyBytes == 28U, "HCCP UMDK Jetty key ABI changed");
 static_assert(kSegBytes == 48U, "HCCP UMDK segment ABI changed");
@@ -481,17 +473,11 @@ void ReleaseChannel(Channel* channel) {
 }
 
 struct Region {
-  enum class AllocationKind {
-    kHeap,
-    kMmap,
-  };
-
   uint64_t id = 0U;
   uint32_t candidate_id = 0U;
   UrmaResources* resources = nullptr;
   void* memory = nullptr;
   uint64_t bytes = 0U;
-  AllocationKind allocation_kind = AllocationKind::kHeap;
   urma_token_id_t* token_id = nullptr;
   urma_target_seg_t* segment = nullptr;
   uint32_t token_value = 0U;
@@ -685,12 +671,8 @@ class CpuService {
     switch (memory_page_mode_) {
       case CpuMemoryPageMode::kDefault:
         return "default";
-      case CpuMemoryPageMode::kBasePage4K:
-        return "base-4k";
       case CpuMemoryPageMode::kTransparentHugePage:
         return "thp";
-      case CpuMemoryPageMode::kHugeTlb2M:
-        return "hugetlb-2m";
     }
     return "unknown";
   }
@@ -701,47 +683,6 @@ class CpuService {
       return false;
     }
     const std::size_t bytes = static_cast<std::size_t>(region->bytes);
-    if (memory_page_mode_ == CpuMemoryPageMode::kBasePage4K) {
-      void* const memory = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-      if (memory == MAP_FAILED) {
-        Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=base_4k_mmap bytes=%" PRIu64
-            " errno=%d\n",
-            region->bytes, errno);
-        return false;
-      }
-      if (madvise(memory, bytes, MADV_NOHUGEPAGE) != 0) {
-        Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=madvise_nohugepage bytes=%" PRIu64
-            " errno=%d\n",
-            region->bytes, errno);
-        (void)munmap(memory, bytes);
-        return false;
-      }
-      region->memory = memory;
-      region->allocation_kind = Region::AllocationKind::kMmap;
-      return true;
-    }
-    if (memory_page_mode_ == CpuMemoryPageMode::kHugeTlb2M) {
-      if (bytes % kHugePage2MBytes != 0U) {
-        Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=hugetlb_size bytes=%" PRIu64
-            " hugepage_bytes=%zu reason=not_aligned\n",
-            region->bytes, kHugePage2MBytes);
-        return false;
-      }
-      void* const memory = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB,
-                                -1, 0);
-      if (memory == MAP_FAILED) {
-        Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=hugetlb_mmap bytes=%" PRIu64
-            " hugepage_bytes=%zu errno=%d\n",
-            region->bytes, kHugePage2MBytes, errno);
-        return false;
-      }
-      region->memory = memory;
-      region->allocation_kind = Region::AllocationKind::kMmap;
-      return true;
-    }
-
     const std::size_t alignment =
         memory_page_mode_ == CpuMemoryPageMode::kTransparentHugePage
             ? kHugePage2MBytes
@@ -875,11 +816,7 @@ class CpuService {
       region->token_id = nullptr;
     }
     if (region->memory != nullptr) {
-      if (region->allocation_kind == Region::AllocationKind::kMmap) {
-        (void)munmap(region->memory, static_cast<std::size_t>(region->bytes));
-      } else {
-        free(region->memory);
-      }
+      free(region->memory);
       region->memory = nullptr;
     }
   }
@@ -892,7 +829,7 @@ class CpuService {
   }
 
   UrmaResourcePool* resource_pool_ = nullptr;
-  CpuMemoryPageMode memory_page_mode_{CpuMemoryPageMode::kDefault};
+  CpuMemoryPageMode memory_page_mode_{CpuMemoryPageMode::kTransparentHugePage};
   bool device_filter_applied_{false};
   uint64_t next_region_id_ = 1U;
   uint32_t next_token_ = 1U;
