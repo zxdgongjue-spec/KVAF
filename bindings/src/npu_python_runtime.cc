@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <string>
@@ -53,6 +54,85 @@ struct NpuTensorView {
   std::size_t bytes{0};
   std::size_t element_bytes{0};
   std::vector<py::ssize_t> shape;
+};
+
+// Diagnostic output allocation matching NpuService, without the Torch pool.
+// The caller must retain this buffer until stream completion and Runtime shutdown.
+class NormalHbmBuffer final {
+ public:
+  NormalHbmBuffer(std::size_t rows, std::size_t row_bytes,
+                  std::uint32_t device_id)
+      : rows_(rows), row_bytes_(row_bytes), device_id_(device_id) {
+    if (rows == 0 || row_bytes == 0 ||
+        rows > static_cast<std::size_t>(std::numeric_limits<py::ssize_t>::max()) ||
+        row_bytes > static_cast<std::size_t>(std::numeric_limits<py::ssize_t>::max()) ||
+        rows > std::numeric_limits<std::size_t>::max() / row_bytes ||
+        device_id > static_cast<std::uint32_t>(std::numeric_limits<int32_t>::max())) {
+      throw py::value_error("NormalHbmBuffer requires valid rows, row_bytes and device_id");
+    }
+    bytes_ = rows * row_bytes;
+    int32_t current = -1;
+    ThrowIfAclError(aclrtGetDevice(&current), "aclrtGetDevice");
+    if (current != static_cast<int32_t>(device_id)) {
+      throw py::value_error("set the current NPU device before allocating NormalHbmBuffer");
+    }
+    ThrowIfAclError(aclrtMalloc(&data_, bytes_, ACL_MEM_MALLOC_NORMAL_ONLY),
+                    "aclrtMalloc NORMAL_ONLY");
+    if (data_ == nullptr) throw std::runtime_error("aclrtMalloc returned null HBM");
+  }
+
+  ~NormalHbmBuffer() {
+    if (data_ == nullptr) return;
+    int32_t current = -1;
+    const bool have_current = aclrtGetDevice(&current) == ACL_SUCCESS;
+    const bool switch_device = !have_current || current != static_cast<int32_t>(device_id_);
+    if (switch_device && aclrtSetDevice(static_cast<int32_t>(device_id_)) != ACL_SUCCESS) {
+      std::fprintf(stderr, "[KVAF_HBM] cannot select device to free buffer\n");
+      return;
+    }
+    const aclError result = aclrtFree(data_);
+    if (result != ACL_SUCCESS) {
+      std::fprintf(stderr, "[KVAF_HBM] aclrtFree failed error=%d\n", static_cast<int>(result));
+    }
+    if (switch_device && have_current) (void)aclrtSetDevice(current);
+  }
+
+  NormalHbmBuffer(const NormalHbmBuffer&) = delete;
+  NormalHbmBuffer& operator=(const NormalHbmBuffer&) = delete;
+
+  std::uint32_t DeviceId() const { return device_id_; }
+  std::uint64_t DataPtr() const { return reinterpret_cast<std::uintptr_t>(data_); }
+  std::size_t Bytes() const { return bytes_; }
+
+  NpuTensorView View() const {
+    return NpuTensorView{data_, bytes_, 1U,
+                        {static_cast<py::ssize_t>(rows_),
+                         static_cast<py::ssize_t>(row_bytes_)}};
+  }
+
+  py::object Cpu() const {
+    int32_t current = -1;
+    ThrowIfAclError(aclrtGetDevice(&current), "aclrtGetDevice");
+    if (current != static_cast<int32_t>(device_id_)) {
+      throw py::value_error("NormalHbmBuffer.cpu requires its NPU device to be current");
+    }
+    ThrowIfAclError(aclrtSynchronizeDevice(), "aclrtSynchronizeDevice");
+    py::module_ torch = py::module_::import("torch");
+    py::object host = torch.attr("empty")(
+        py::make_tuple(rows_, row_bytes_), py::arg("dtype") = torch.attr("uint8"),
+        py::arg("device") = "cpu");
+    void* destination = PointerFromValue(host.attr("data_ptr")().cast<std::uint64_t>());
+    ThrowIfAclError(aclrtMemcpy(destination, bytes_, data_, bytes_, ACL_MEMCPY_DEVICE_TO_HOST),
+                    "aclrtMemcpy HBM output to CPU");
+    return host;
+  }
+
+ private:
+  void* data_{nullptr};
+  std::size_t rows_{0U};
+  std::size_t row_bytes_{0U};
+  std::size_t bytes_{0U};
+  std::uint32_t device_id_{0U};
 };
 
 NpuTensorView GetNpuTensorView(const py::object& tensor, const char* name) {
@@ -358,7 +438,16 @@ class NpuPythonRuntime final {
     const NpuTensorView mask_view = GetNpuTensorView(mask, "mask");
     const NpuTensorView output_index_view =
         GetNpuTensorView(output_indices, "output_indices");
-    const NpuTensorView output_view = GetNpuTensorView(output, "output");
+    NpuTensorView output_view;
+    if (py::isinstance<NormalHbmBuffer>(output)) {
+      const auto& buffer = output.cast<const NormalHbmBuffer&>();
+      if (buffer.DeviceId() != native_->device_id()) {
+        throw py::value_error("HBM output device does not match Runtime device");
+      }
+      output_view = buffer.View();
+    } else {
+      output_view = GetNpuTensorView(output, "output");
+    }
     const NpuTensorView address_view = GetNpuTensorView(addresses, "addresses");
     const NpuTensorView valid_view = GetNpuTensorView(valid, "valid");
     if (index_view.shape.size() != 1 || offset_view.shape.size() != 1 ||
@@ -416,6 +505,14 @@ class NpuPythonRuntime final {
 }  // namespace
 
 void BindNpuPythonRuntime(py::module_& module) {
+  py::class_<NormalHbmBuffer>(module, "NormalHbmBuffer")
+      .def(py::init<std::size_t, std::size_t, std::uint32_t>(),
+           py::arg("rows"), py::arg("row_bytes"), py::arg("device_id") = 0)
+      .def("data_ptr", &NormalHbmBuffer::DataPtr)
+      .def_property_readonly("bytes", &NormalHbmBuffer::Bytes)
+      .def("cpu", &NormalHbmBuffer::Cpu,
+           "Synchronize and copy diagnostic HBM output to a CPU uint8 Tensor.");
+
   py::class_<DeviceAccessTable>(module, "DeviceAccessTable")
       .def_property_readonly("addresses", &DeviceAccessTable::addresses)
       .def_property_readonly("valid", &DeviceAccessTable::valid)

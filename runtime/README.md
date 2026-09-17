@@ -487,3 +487,38 @@ Jetty 数量可通过
 填充。
 脚本以 CPU `torch.int64` Tensor 传入全量 Prepare key，避免 Python `list[int]` 转换污染
 这项控制面性能数据。
+
+### AIV BatchGet HBM Allocation Comparison
+
+`KVAF_RUNTIME_PERF_HBM_ALLOCATOR=torch` (default) uses the caller's
+`torch.empty` output. `acl-normal` uses an owned `NormalHbmBuffer` allocated
+with `aclrtMalloc(ACL_MEM_MALLOC_NORMAL_ONLY)`, matching NpuService and
+bypassing the Torch allocator. The raw buffer is accepted only as BatchGet
+output; it is not a Torch Tensor. Allocation and CPU readback validation are
+outside the timed loop. The benchmark releases the buffer after Runtime
+shutdown, because Runtime caches its Direct-HCCP registration.
+
+After rebuilding `build-npu`, set the same settings for both runs:
+
+```bash
+export KVAF_CPU_SERVICE_ADDR=CPU_HOST:28999
+export DEVICE_ID=0
+export KVAF_RUNTIME_PERF_REQUESTS=2048
+export KVAF_RUNTIME_PERF_TOKEN_BYTES=4096
+export KVAF_RUNTIME_PERF_TOKENS_PER_BLOCK=1
+export KVAF_RUNTIME_PERF_TABLE_CAPACITY=32768
+export KVAF_RUNTIME_PERF_ACTIVE_PERCENT=100
+export KVAF_RUNTIME_PERF_WARMUP=20
+export KVAF_RUNTIME_PERF_ITERATIONS=200
+
+KVAF_RUNTIME_PERF_HBM_ALLOCATOR=torch \
+  tests/run_remote_cpu_runtime_perf.sh "$PWD/build-npu"
+KVAF_RUNTIME_PERF_HBM_ALLOCATOR=acl-normal \
+  tests/run_remote_cpu_runtime_perf.sh "$PWD/build-npu"
+```
+
+Both modes allocate an 8 MiB output and populate 128 MiB of remote CPU memory.
+The existing miss-count contract allows at most 2047 active requests per
+2048-request group, so the actual payload is 8 MiB minus 4 KiB. Compare the
+`operation=batch_get` result, whose timing includes stream completion, and
+check `RUNTIME_PERF_CORRECTNESS_PASS phase=batch_get`.
