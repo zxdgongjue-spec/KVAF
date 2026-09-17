@@ -306,9 +306,16 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     return InvalidArgument("Runtime Link requires valid Runtime-selected local EIDs");
   }
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
+  const std::uint32_t batch_put_jettys_per_core =
+      impl_->config.batch_put_jettys_per_core == 0U
+          ? std::min(
+                impl_->config.jettys_per_core,
+                static_cast<std::uint32_t>(
+                    KVAF_AIV_BATCH_PUT_MAX_JETTYS_PER_CORE))
+          : impl_->config.batch_put_jettys_per_core;
   if (!impl_->config.batch_put_kernel_object_path.empty() &&
       (impl_->config.npu_core_count > KVAF_AIV_BATCH_PUT_MAX_AIV_CORES ||
-       impl_->config.jettys_per_core >
+       batch_put_jettys_per_core >
            KVAF_AIV_BATCH_PUT_MAX_JETTYS_PER_CORE)) {
     return InvalidArgument("invalid BatchPut transport configuration");
   }
@@ -375,7 +382,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     KvafBatchPutTransport* batch_put_transport = nullptr;
     const int32_t batch_put_result = KvafBatchPutTransportCreateWithPeerLink(
         reinterpret_cast<void*>(remote_region.base), remote_region.length,
-        impl_->config.npu_core_count, impl_->config.jettys_per_core,
+        impl_->config.npu_core_count, batch_put_jettys_per_core,
         impl_->config.peer_link.get(), impl_->config.peer_local_eid.data(),
         &batch_put_transport);
     if (batch_put_result != KVAF_BATCH_PUT_SUCCESS ||
@@ -406,7 +413,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
                  "jettys_per_core=%u "
                  "metadata_staging=reusable\n",
                  impl_->config.npu_core_count,
-                 impl_->config.jettys_per_core);
+                 batch_put_jettys_per_core);
   }
 #endif
   impl_->initialized = true;

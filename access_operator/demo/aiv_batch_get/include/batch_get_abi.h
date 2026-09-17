@@ -6,10 +6,10 @@
 // Shared host/AIV ABI for the graph-safe ExecuteBatchGet kernel.  These
 // records are copied verbatim between host code, HBM and the AIV kernel.
 enum {
-  KVAF_AIV_BATCH_GET_STATUS_BYTES = 384,
+  KVAF_AIV_BATCH_GET_STATUS_BYTES = 1216,
   KVAF_AIV_BATCH_GET_QUEUE_STATE_BYTES = 64,
   KVAF_AIV_BATCH_GET_MAX_AIV_CORES = 48,
-  KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE = 2,
+  KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE = 64,
   // Shared local-memory contract used by the AIV kernel and launcher.
   KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES = 160 * 1024,
 };
@@ -38,12 +38,13 @@ typedef struct KvafBatchGetCoreProfile {
   uint64_t total_posts;
   uint64_t jetty_completion_wait_cycles[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE];
   uint64_t jetty_completion_polls[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE];
-  uint64_t reserved[26];
+  // Keep this profile at eighteen cache lines while retaining expansion room
+  // after the sixty-four per-Jetty wait and poll counters.
+  uint64_t reserved[6];
 } KvafBatchGetCoreProfile;
 
-// Keep the historical 384-byte stride even though ExecuteBatchGet uses only
-// the first cache line on the normal path. This keeps the verified host/device
-// allocation ABI stable while using the reserved area for opt-in profiling.
+// ExecuteBatchGet uses only the first cache line on the normal path. The
+// remaining cache lines carry the opt-in per-Jetty profiling payload.
 typedef struct KvafBatchGetCoreStatus {
   uint64_t magic;
   uint64_t processed_request_count;
@@ -128,7 +129,7 @@ typedef struct KvafExecuteBatchGetKernelArgs {
 #if defined(__cplusplus)
 static_assert(sizeof(KvafBatchGetCoreStatus) == KVAF_AIV_BATCH_GET_STATUS_BYTES,
               "KvafBatchGetCoreStatus ABI changed");
-static_assert(sizeof(KvafBatchGetCoreProfile) == 320,
+static_assert(sizeof(KvafBatchGetCoreProfile) == 1152,
               "KvafBatchGetCoreProfile ABI changed");
 static_assert(sizeof(KvafBatchGetQueueState) == KVAF_AIV_BATCH_GET_QUEUE_STATE_BYTES,
               "KvafBatchGetQueueState ABI changed");

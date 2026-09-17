@@ -105,6 +105,14 @@ inline constexpr std::uint32_t EidPathIndexForWorker(
 static_assert(EidPathIndexForWorker(0U, 0U, 2U, 2U) == 0U);
 static_assert(EidPathIndexForWorker(1U, 0U, 2U, 2U) == 1U);
 static_assert(EidPathIndexForWorker(0U, 1U, 2U, 3U) == 2U);
+static_assert(EidPathIndexForWorker(0U, 2U, 1U, 4U) == 2U);
+static_assert(EidPathIndexForWorker(0U, 3U, 1U, 4U) == 3U);
+static_assert(EidPathIndexForWorker(0U, 4U, 1U, 8U) == 4U);
+static_assert(EidPathIndexForWorker(0U, 7U, 1U, 8U) == 7U);
+static_assert(EidPathIndexForWorker(0U, 8U, 1U, 16U) == 8U);
+static_assert(EidPathIndexForWorker(0U, 15U, 1U, 16U) == 15U);
+static_assert(EidPathIndexForWorker(0U, 32U, 1U, 64U) == 32U);
+static_assert(EidPathIndexForWorker(0U, 63U, 1U, 64U) == 63U);
 
 // One peer channel is bound to one local AIV Jetty. Runtime has already
 // selected the local EID assigned to this worker; this adapter only creates

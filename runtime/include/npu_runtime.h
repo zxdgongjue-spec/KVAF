@@ -25,8 +25,8 @@ struct NpuRuntimeOptions {
   std::uint32_t batch_get_tokens_per_block;
   std::string batch_put_kernel_object_path;
   std::uint32_t device_id{0U};
-  std::uint32_t npu_core_count{1U};
-  std::uint32_t jettys_per_core{2U};
+  std::uint32_t npu_core_count{2U};
+  std::uint32_t jettys_per_core{1U};
   // Optional strict local-EID list. Empty preserves automatic discovery and
   // selects one working EID. Multiple entries create simultaneous BatchGet
   // paths and stripe core/Jetty workers over them in list order. BatchPut

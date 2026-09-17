@@ -53,15 +53,24 @@ export KVAF_BATCH_GET_PERF_RUNNER="$mock_runner"
 export KVAF_MOCK_COUNT_FILE="$temp_dir/count"
 export KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR="$temp_dir/logs"
 export KVAF_BATCH_GET_MISS_SWEEP_CSV="$temp_dir/summary.csv"
+export KVAF_BATCH_GET_TOKEN_BYTES_VALUES="656 1024"
+export KVAF_BATCH_GET_MISS_COUNT_VALUES="2048 4096"
+export KVAF_BATCH_GET_AIV_CORE_VALUES="1 2"
+export KVAF_BATCH_GET_JETTYS_PER_CORE_VALUES="1 2"
 "$KVAF_ROOT/tests/run_remote_cpu_batch_get_miss_count_perf.sh" \
   "$temp_dir/fake-build" --adaptive-ub-device >"$temp_dir/output.log"
 
-[[ "$(<"$KVAF_MOCK_COUNT_FILE")" == 64 ]]
+[[ "$(<"$KVAF_MOCK_COUNT_FILE")" == 17 ]]
 grep -q '^BATCH_GET_UB_DEVICE_CALIBRATION_DONE selected_ub_device=udmac1d1e2 reuse=subsequent_shapes$' \
   "$temp_dir/output.log"
 [[ "$(grep -c '^\[KVAF_AIV\] UB_DEVICE_SELECTED ' "$temp_dir/output.log")" == 1 ]]
-[[ "$(grep -c '^\[KVAF_AIV\] UB_DEVICE_REUSED ' "$temp_dir/output.log")" == 63 ]]
-awk -F, 'NR == 1 { if ($NF != "selected_ub_device") exit 1; next }
+[[ "$(grep -c '^\[KVAF_AIV\] UB_DEVICE_REUSED ' "$temp_dir/output.log")" == 16 ]]
+awk -F, 'NR == 1 {
+             if ($1 != "token_bytes" || $2 != "miss_count" ||
+                 $3 != "aiv_cores" || $4 != "jettys_per_core" ||
+                 $NF != "selected_ub_device") exit 1
+             next
+           }
            $NF != "udmac1d1e2" { exit 1 }
-           END { if (NR != 64) exit 1 }' "$temp_dir/summary.csv"
+           END { if (NR != 17) exit 1 }' "$temp_dir/summary.csv"
 echo "batch get sweep UB device reuse test passed"

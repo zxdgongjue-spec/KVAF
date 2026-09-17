@@ -47,8 +47,11 @@ struct AccessOperatorConfig {
   std::string batch_get_kernel_object_path;
   std::string batch_put_kernel_object_path;
   std::uint32_t npu_core_count{0};
-  // Direct-HCCP Jettys assigned to each AIV core.
-  std::uint32_t jettys_per_core{2};
+  // Direct-HCCP Jettys assigned to each BatchGet AIV core.
+  std::uint32_t jettys_per_core{1};
+  // BatchPut retains its independent one-or-two-Jetty implementation. Zero
+  // derives min(jettys_per_core, 2); a direct caller may explicitly select 1/2.
+  std::uint32_t batch_put_jettys_per_core{0};
   // Legacy single-EID input. Kept for source compatibility; peer_local_eids
   // takes precedence when it is non-empty.
   std::array<std::uint8_t, 16> peer_local_eid{};
@@ -69,8 +72,8 @@ struct BatchGetKernelProfile {
   std::uint64_t kernel_finish_cycle{0};
   std::uint64_t active_requests{0};
   std::uint64_t total_posts{0};
-  std::array<std::uint64_t, 2> jetty_completion_wait_cycles{};
-  std::array<std::uint64_t, 2> jetty_completion_polls{};
+  std::array<std::uint64_t, 64> jetty_completion_wait_cycles{};
+  std::array<std::uint64_t, 64> jetty_completion_polls{};
 };
 
 // Default synchronous NPU data-plane implementation.

@@ -386,7 +386,7 @@ bool CreateDeviceAivJetty(const DirectHccpApi& api, void* context,
   attr.ub.jfs_flag = JfsFlagErrorSuspend();
   attr.ub.token_id_handle = token_handle;
   attr.ub.token_value = token_value;
-  attr.ub.priority = 2U;
+  attr.ub.priority = 15U;
   attr.ub.rnr_retry = 7U;
   attr.ub.err_timeout = 16U;
   attr.ub.ext_mode.sqebb_num = sq_depth;

@@ -246,9 +246,9 @@ runtime = kvaf.NpuRuntime(
     batch_get_token_bytes=656,
     batch_get_tokens_per_block=128,
     device_id=0,
-    npu_core_count=1,
+    npu_core_count=2,
     batch_put_kernel_object_path="build-npu/bin/kvaf_execute_batch_put_kernels.o",
-    jettys_per_core=2,
+    jettys_per_core=1,
     # 可选：每项是32位连续十六进制；空列表保持单 EID 自动发现。
     npu_eids=[
         "00112233445566778899aabbccddeeff",
@@ -279,12 +279,17 @@ NPU 本端 EID，它们连接到同一个已选 CPU EID/DDR region；CPU 侧多 
 ```bash
 KVAF_NPU_EIDS=00112233445566778899aabbccddeeff,102132435465768798a9bacbdcedfe0f \
 tests/run_remote_cpu_batch_get_perf.sh /absolute/path/to/build-npu \
-  --aiv-cores 2 --jettys-per-core 2
+  --aiv-cores 2 --jettys-per-core 1
 ```
 
 Runtime 先按 Jetty-major 顺序把每个 core 的主 Jetty 分散到不同 EID，再分配次 Jetty。
-大批量请求会随各 core/Jetty 的 32-WQE post 自然分摊；很小的请求如果没有启用所有
+大批量请求会随各 core/Jetty 的 128-WQE post 自然分摊；每个 core 支持 1 到 64 个
+Jetty。很小的请求如果没有启用所有
 Jetty，则不会产生足够 post 使用所有配置路径。
+
+性能测试可以使用 `--sort-input-indices` 对 `miss_count` 有效前缀排序。测试按实际
+远端地址和 slot 内 offset 排序，并同步重排 `indices`、`offsets` 和
+`output_indices`；请求构造和排序不计入 BatchGet 计时。
 
 `link_to()` 必须先于 `initialize()` 调用。调用方需要在 BatchGet 所在 stream 完成前保持
 输入/输出 Tensor 和 `DeviceAccessTable` 有效；Runtime 只管理内部 DDR、元数据和内部

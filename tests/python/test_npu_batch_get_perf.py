@@ -18,6 +18,7 @@ environment variables:
                            KVAF_BATCH_GET_PERF_SOURCE_ACCESS_PATTERN
     --output-access-pattern
                            KVAF_BATCH_GET_PERF_OUTPUT_ACCESS_PATTERN
+    --sort-input-indices   KVAF_BATCH_GET_PERF_SORT_INPUT_INDICES=1
     --kernel-profile       KVAF_BATCH_GET_PERF_KERNEL_PROFILE=1
     --kernel-profile-clock-mhz
                            KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ
@@ -48,6 +49,7 @@ DEFAULT_TOKENS_PER_BLOCK = 128
 DEFAULT_TOKEN_BYTES = 656
 DEFAULT_AIV_CORES = 2
 DEFAULT_JETTYS_PER_CORE = 1
+MAX_JETTYS_PER_CORE = 64
 DEFAULT_WARMUP = 3
 DEFAULT_ITERATIONS = 100
 DEFAULT_POPULATE_CHUNK_ENTRIES = 128
@@ -150,7 +152,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--jettys-per-core",
         type=int,
-        choices=(1, 2),
+        choices=range(1, MAX_JETTYS_PER_CORE + 1),
         default=environment_int(
             "KVAF_BATCH_GET_PERF_JETTYS_PER_CORE", DEFAULT_JETTYS_PER_CORE
         ),
@@ -202,6 +204,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         default=environment_int("KVAF_BATCH_GET_PERF_SEED", 20260903),
     )
+    input_order = parser.add_mutually_exclusive_group()
+    input_order.add_argument(
+        "--sort-input-indices",
+        dest="sort_input_indices",
+        action="store_true",
+        help=(
+            "sort the active request prefix by the table-resolved entry and then offsets; "
+            "offsets and output_indices follow the same permutation"
+        ),
+    )
+    input_order.add_argument(
+        "--no-sort-input-indices",
+        dest="sort_input_indices",
+        action="store_false",
+        help="keep the generated request prefix in its configured order",
+    )
     kernel_profile = parser.add_mutually_exclusive_group()
     kernel_profile.add_argument(
         "--kernel-profile",
@@ -228,7 +246,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="AIV clock used to convert profile cycles to milliseconds",
     )
     parser.set_defaults(
-        kernel_profile=environment_bool("KVAF_BATCH_GET_PERF_KERNEL_PROFILE")
+        kernel_profile=environment_bool("KVAF_BATCH_GET_PERF_KERNEL_PROFILE"),
+        sort_input_indices=environment_bool(
+            "KVAF_BATCH_GET_PERF_SORT_INPUT_INDICES"
+        ),
     )
     args = parser.parse_args(argv)
     if args.miss_count is None:
@@ -280,6 +301,38 @@ def percentile(values: list[float], fraction: float) -> float:
     lower = int(position)
     upper = min(lower + 1, len(ordered) - 1)
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
+def sort_request_plan_prefix(
+    torch: object,
+    address_table: object,
+    indices: object,
+    offsets: object,
+    output_indices: object,
+    active_count: int,
+) -> tuple[object, object, object]:
+    """Sort active requests by resolved table entry and offset."""
+    if active_count <= 1:
+        return indices, offsets, output_indices
+
+    active_indices = indices[:active_count]
+    active_offsets = offsets[:active_count]
+    active_output_indices = output_indices[:active_count]
+    entry_addresses = address_table.index_select(
+        0, active_indices.to(torch.int64)
+    )
+    # Every valid table entry owns one non-overlapping, fixed-size block, so
+    # sorting the resolved remote byte address is equivalent to sorting first
+    # by the actual slot ID and then by the offset inside that slot.
+    sort_keys = entry_addresses + active_offsets.to(torch.int64)
+    _, permutation = torch.sort(sort_keys)
+    sorted_indices = active_indices.index_select(0, permutation)
+    sorted_offsets = active_offsets.index_select(0, permutation)
+    sorted_output_indices = active_output_indices.index_select(0, permutation)
+    indices[:active_count].copy_(sorted_indices)
+    offsets[:active_count].copy_(sorted_offsets)
+    output_indices[:active_count].copy_(sorted_output_indices)
+    return indices, offsets, output_indices
 
 
 def print_samples(
@@ -350,10 +403,11 @@ def print_kernel_profile(
             "finalize_ms": 0.0,
             "active_requests": 0.0,
             "total_posts": 0.0,
-            "jetty0_wait_ms": 0.0,
-            "jetty0_polls": 0.0,
-            "jetty1_wait_ms": 0.0,
-            "jetty1_polls": 0.0,
+            **{
+                name: 0.0
+                for jetty in range(MAX_JETTYS_PER_CORE)
+                for name in (f"jetty{jetty}_wait_ms", f"jetty{jetty}_polls")
+            },
         }
         for _ in range(npu_core_count)
     ]
@@ -421,7 +475,7 @@ def print_kernel_profile(
             accumulator["total_posts"] += int(profile["total_posts"])
             waits = list(profile["jetty_completion_wait_cycles"])
             polls = list(profile["jetty_completion_polls"])
-            for jetty in range(2):
+            for jetty in range(MAX_JETTYS_PER_CORE):
                 accumulator[f"jetty{jetty}_wait_ms"] += (
                     int(waits[jetty]) / clock_mhz / 1000.0
                 )
@@ -622,6 +676,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"adaptive_ub_device={int(args.adaptive_ub_device)} "
             f"peer_ub_device={args.peer_ub_device or 'auto'} "
             f"iterations={args.iterations} seed={args.seed} "
+            f"sort_input_indices={int(args.sort_input_indices)} "
             f"kernel_profile={int(args.kernel_profile)} "
             f"kernel_profile_clock_mhz={args.kernel_profile_clock_mhz} "
             "timing=call_to_stream_completion"
@@ -673,6 +728,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         preflight_token_slots = preflight_token_ids % tokens_per_block
         preflight_offsets = (preflight_token_slots * token_bytes).to(torch.int32)
         preflight_output_indices = request_ids.to(torch.int32)
+        if args.sort_input_indices:
+            (
+                preflight_indices,
+                preflight_offsets,
+                preflight_output_indices,
+            ) = sort_request_plan_prefix(
+                torch,
+                device_table.addresses,
+                preflight_indices,
+                preflight_offsets,
+                preflight_output_indices,
+                miss_count_value,
+            )
         output.zero_()
         runtime.batch_get(
             device_table,
@@ -736,6 +804,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.output_access_pattern == "contiguous"
                 else torch.randperm(request_length, device=device).to(torch.int32)
             )
+            if args.sort_input_indices:
+                indices, offsets, output_indices = sort_request_plan_prefix(
+                    torch,
+                    device_table.addresses,
+                    indices,
+                    offsets,
+                    output_indices,
+                    miss_count_value,
+                )
             return indices, offsets, output_indices
 
         if args.kernel_profile:

@@ -132,9 +132,9 @@ def main() -> int:
     block_bytes = token_bytes * tokens_per_block
     source_stride = int(os.environ.get("KVAF_NPU_SOURCE_STRIDE", str(block_bytes)))
     npu_core_count = int(
-        os.environ.get("KVAF_NPU_CORE_COUNT", os.environ.get("KVAF_NPU_AIV_CORES", "1"))
+        os.environ.get("KVAF_NPU_CORE_COUNT", os.environ.get("KVAF_NPU_AIV_CORES", "2"))
     )
-    jettys_per_core = int(os.environ.get("KVAF_NPU_JETTYS_PER_CORE", "2"))
+    jettys_per_core = int(os.environ.get("KVAF_NPU_JETTYS_PER_CORE", "1"))
     npu_eids = parse_npu_eids(os.environ.get("KVAF_NPU_EIDS"))
     active_percent = int(os.environ.get("KVAF_NPU_ACTIVE_PERCENT", "100"))
     warmup = int(os.environ.get("KVAF_NPU_WARMUP", "1"))
@@ -152,7 +152,7 @@ def main() -> int:
         and source_stride == block_bytes
         and npu_core_count > 0
         and npu_core_count <= requests
-        and 1 <= jettys_per_core <= 2
+        and 1 <= jettys_per_core <= 64
         and len(npu_eids) <= npu_core_count * jettys_per_core
         and iterations > 0
         and 1 <= active_percent <= 100

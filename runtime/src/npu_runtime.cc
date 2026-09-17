@@ -431,6 +431,10 @@ struct NpuRuntime::Impl {
     config.batch_put_kernel_object_path = options.batch_put_kernel_object_path;
     config.npu_core_count = options.npu_core_count;
     config.jettys_per_core = options.jettys_per_core;
+    // BatchPut retains its existing two-Jetty maximum when BatchGet selects
+    // three to sixty-four Jettys per core.
+    config.batch_put_jettys_per_core =
+        std::min(options.jettys_per_core, std::uint32_t{2U});
   }
 
   void CreateCore() {
@@ -663,7 +667,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
           std::min<std::uint64_t>(slot_size, kBatchPutProbeBytesPerRow);
       const std::uint64_t probe_rows = BatchPutStartupProbeRows(
           ddr_bytes, slot_size, impl_->options.npu_core_count,
-          impl_->options.jettys_per_core);
+          impl_->config.batch_put_jettys_per_core);
       const std::uint64_t probe_total_bytes = probe_rows * probe_bytes;
       aclrtStream stream = nullptr;
       if (probe_bytes == 0U || probe_rows == 0U ||
@@ -698,7 +702,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                        static_cast<unsigned long long>(probe_bytes),
                        static_cast<unsigned long long>(probe_total_bytes),
                        impl_->options.npu_core_count,
-                       impl_->options.jettys_per_core);
+                       impl_->config.batch_put_jettys_per_core);
         } else {
           std::fprintf(stderr,
                        "[KVAF_AIV] PEER_LINK_EID_GROUP_RMA_PROBE_BEGIN "
@@ -711,7 +715,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                        static_cast<unsigned long long>(probe_bytes),
                        static_cast<unsigned long long>(probe_total_bytes),
                        impl_->options.npu_core_count,
-                       impl_->options.jettys_per_core);
+                       impl_->config.batch_put_jettys_per_core);
         }
         last = impl_->runtime_core->BatchPut(
             BatchPutRequest{probe_keys,
