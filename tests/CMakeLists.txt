@@ -8,6 +8,10 @@ add_test(NAME kvaf_npu_hbm_allocator
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_npu_hbm_allocator.py")
 
+add_test(NAME kvaf_aiv_batch_get_bw
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/python/test_aiv_batch_get_bw.py")
+
 add_executable(kvaf_cpu_urma_sgl_plan_test cpu_urma_sgl_plan_test.cc)
 target_include_directories(kvaf_cpu_urma_sgl_plan_test PRIVATE
   "${CMAKE_SOURCE_DIR}/access_operator/include")

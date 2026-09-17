@@ -490,6 +490,32 @@ Jetty 数量可通过
 
 ### AIV BatchGet HBM Allocation Comparison
 
+For a focused benchmark with three terminal summary lines, use the independent
+test below. It populates only the requested CPU region once and measures only
+BatchGet through device completion. Every request is active (no miss-count
+grouping). Preparation, preflight, warmup, verification and teardown are outside
+the measured samples. The complete native output and failure traceback are
+saved to the temporary log named in the PASS/FAIL line.
+
+```bash
+# CPU host: keep this service running.
+./build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999
+
+# NPU host: use the same build for both output allocators.
+for allocator in torch acl-normal; do
+  python3 tests/python/aiv_batch_get_bw.py \
+    --peer CPU_HOST:28999 --build-dir build-npu \
+    --allocator "$allocator" --blocks 2048 --block-bytes 4096 \
+    --cores 32 --jettys-per-core 2 --warmup 20 --iterations 200
+done
+```
+
+`--blocks 1024 --block-bytes 4096` transfers exactly 4 MiB;
+`--blocks 2048 --block-bytes 4096` transfers exactly 8 MiB. For the same 8 MiB
+with fewer WRs, use `--blocks 128 --block-bytes 65536`. The default address
+pattern is sequential; `--pattern random` uses fixed-seed permutations of
+both source and destination rows. Each iteration reuses that request plan.
+
 `KVAF_RUNTIME_PERF_HBM_ALLOCATOR=torch` (default) uses the caller's
 `torch.empty` output. `acl-normal` uses an owned `NormalHbmBuffer` allocated
 with `aclrtMalloc(ACL_MEM_MALLOC_NORMAL_ONLY)`, matching NpuService and
