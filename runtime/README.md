@@ -79,6 +79,9 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 负责 UMDK 本地 buffer、CTP/Jetty 导入，并通过 URMA 发起 READ/WRITE。HBM 的
 `urma_seg_t` descriptor 在 TCP 上原样传输，不依赖 `urma_admin`。
 
+HBM 使用 `aclrtMalloc(ACL_MEM_MALLOC_HUGE_FIRST)` 优先分配大页；大页不足时
+可能回退到普通页。Direct-HCCP 注册仍使用 non-pin device-memory 路径。
+
 构建：
 
 ```bash
@@ -518,7 +521,7 @@ both source and destination rows. Each iteration reuses that request plan.
 
 `KVAF_RUNTIME_PERF_HBM_ALLOCATOR=torch` (default) uses the caller's
 `torch.empty` output. `acl-normal` uses an owned `NormalHbmBuffer` allocated
-with `aclrtMalloc(ACL_MEM_MALLOC_NORMAL_ONLY)`, matching NpuService and
+with `aclrtMalloc(ACL_MEM_MALLOC_NORMAL_ONLY)`, matching the previous NpuService policy and
 bypassing the Torch allocator. The raw buffer is accepted only as BatchGet
 output; it is not a Torch Tensor. Allocation and CPU readback validation are
 outside the timed loop. The benchmark releases the buffer after Runtime

@@ -227,7 +227,7 @@ struct NpuService::Impl {
     region->owner = device;
     region->bytes = request.hbm_bytes;
     if (aclrtSetDevice(device->device_id) != ACL_SUCCESS ||
-        aclrtMalloc(&region->memory, request.hbm_bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS)
+        aclrtMalloc(&region->memory, request.hbm_bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS)
       return Result::kResourceError;
     direct_hccp::TokenId token_id{};
     if (api.token_alloc == nullptr ||
