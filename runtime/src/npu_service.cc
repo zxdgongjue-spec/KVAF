@@ -107,6 +107,10 @@ struct NpuService::Impl {
     if (initialized) return Status::InvalidState("NpuService already initialized");
     if (!direct_hccp::LoadDirectHccp(&api))
       return Status::NotImplemented("Direct-HCCP RA symbols are unavailable");
+    hbm_huge_first = options.hbm_huge_first;
+    std::fprintf(stderr, "[KVAF_NPU] HBM_ALLOCATOR mode=%s policy=%s non_pin=1\n",
+                 hbm_huge_first ? "huge" : "normal",
+                 hbm_huge_first ? "HUGE_FIRST" : "NORMAL_ONLY");
     initialized = true;
     if (options.has_device_id) {
       const std::vector<std::array<std::uint8_t, kEidBytes>>* candidates = nullptr;
@@ -226,8 +230,9 @@ struct NpuService::Impl {
     auto region = std::make_unique<HbmRegion>();
     region->owner = device;
     region->bytes = request.hbm_bytes;
+    const auto policy = hbm_huge_first ? ACL_MEM_MALLOC_HUGE_FIRST : ACL_MEM_MALLOC_NORMAL_ONLY;
     if (aclrtSetDevice(device->device_id) != ACL_SUCCESS ||
-        aclrtMalloc(&region->memory, request.hbm_bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS)
+        aclrtMalloc(&region->memory, request.hbm_bytes, policy) != ACL_SUCCESS)
       return Result::kResourceError;
     direct_hccp::TokenId token_id{};
     if (api.token_alloc == nullptr ||
@@ -520,6 +525,7 @@ struct NpuService::Impl {
   DirectHccpSession* session{nullptr};
   std::uint64_t next_session{1U};
   bool initialized{false};
+  bool hbm_huge_first{true};
   std::map<std::pair<std::uint32_t, std::uint32_t>,
            std::unique_ptr<DeviceState>> devices;
   std::unordered_map<std::uint32_t, std::vector<std::array<std::uint8_t, kEidBytes>>> eid_candidates;

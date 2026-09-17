@@ -15,6 +15,7 @@ struct NpuServiceOptions {
   // zero to match the existing AIV InitContext() implementation.
   std::uint32_t eid_index{0U};
   bool has_eid_index{false};
+  bool hbm_huge_first{true};
 };
 
 // NPU-side control service. It owns device HBM and exports provider-created

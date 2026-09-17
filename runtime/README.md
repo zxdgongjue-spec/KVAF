@@ -79,8 +79,11 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 负责 UMDK 本地 buffer、CTP/Jetty 导入，并通过 URMA 发起 READ/WRITE。HBM 的
 `urma_seg_t` descriptor 在 TCP 上原样传输，不依赖 `urma_admin`。
 
-HBM 使用 `aclrtMalloc(ACL_MEM_MALLOC_HUGE_FIRST)` 优先分配大页；大页不足时
-可能回退到普通页。Direct-HCCP 注册仍使用 non-pin device-memory 路径。
+HBM 分配策略由 `--hbm-allocator normal|huge` 配置，默认 `huge`：
+`normal` 使用 `ACL_MEM_MALLOC_NORMAL_ONLY`，`huge` 使用
+`ACL_MEM_MALLOC_HUGE_FIRST` 优先分配大页，大页不足时可能回退到普通页。
+启动日志 `HBM_ALLOCATOR` 打印所选策略（不代表实际页大小）。两种模式的
+Direct-HCCP 注册都使用 non-pin device-memory 路径。切换模式需要重启服务。
 
 构建：
 
