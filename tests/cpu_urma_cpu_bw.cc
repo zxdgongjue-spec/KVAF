@@ -27,8 +27,7 @@ void Usage(const char* program) {
   std::printf("Usage: %s --peer HOST:PORT [--blocks 8192] [--block-bytes 4096] "
               "[--warmup 5] [--iterations 100] [--ub-device NAME] "
               "[--eid-index N] [--peer-candidate-id N] [--doorbell-wqes N] "
-              "[--jettys N] [--window-bytes N] [--stream-depth N] "
-              "[--cq-mod N]\n",
+              "[--jettys N]\n",
               program);
 }
 
@@ -65,20 +64,11 @@ Options Parse(int argc, char** argv) {
       options.transport.wqes_per_doorbell = static_cast<std::uint32_t>(Number(value, 8192));
     } else if (flag == "--jettys") {
       options.transport.jetty_count = static_cast<std::uint32_t>(Number(value, 16));
-    } else if (flag == "--window-bytes") {
-      options.transport.window_bytes = Number(value, UINT64_MAX);
-    } else if (flag == "--stream-depth") {
-      options.transport.stream_depth = static_cast<std::uint32_t>(Number(value, 8192));
-    } else if (flag == "--cq-mod") {
-      options.transport.cq_mod = static_cast<std::uint32_t>(Number(value, 8192));
     } else throw std::invalid_argument("unknown option: " + flag);
   }
   if (options.transport.peer_address.empty() || options.blocks == 0 ||
       options.block_bytes == 0 || options.iterations == 0 ||
       options.transport.jetty_count == 0U ||
-      (options.transport.stream_depth != 0U &&
-       (options.transport.cq_mod == 0U ||
-        options.transport.cq_mod > options.transport.stream_depth)) ||
       options.blocks > (SIZE_MAX - (kPageBytes - 1)) / options.block_bytes)
     throw std::invalid_argument("peer, blocks, block-bytes and iterations must be valid and non-zero");
   options.transport.region_bytes = options.blocks * options.block_bytes;

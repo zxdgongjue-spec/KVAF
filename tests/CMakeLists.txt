@@ -1,5 +1,12 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+add_executable(kvaf_cpu_hbm_client_options_test cpu_hbm_client_options_test.cc)
+target_include_directories(kvaf_cpu_hbm_client_options_test PRIVATE
+  "${CMAKE_SOURCE_DIR}/access_operator/include")
+target_link_libraries(kvaf_cpu_hbm_client_options_test PRIVATE kvaf_peer_link)
+target_compile_features(kvaf_cpu_hbm_client_options_test PRIVATE cxx_std_17)
+add_test(NAME kvaf_cpu_hbm_client_options COMMAND kvaf_cpu_hbm_client_options_test)
+
 add_test(NAME kvaf_cpu_batch_put_metrics
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_cpu_batch_put_metrics.py")

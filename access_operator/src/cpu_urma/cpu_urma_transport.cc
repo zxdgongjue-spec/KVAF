@@ -90,9 +90,7 @@ struct CpuUrmaTransport::Impl {
   struct SglBatchJob {
     bool write{false};
     const CpuUrmaTransport::HostSge* buffers{nullptr};
-    std::size_t count{0U};
     std::size_t remote_sgl_size{1U};
-    std::size_t wr_count{0U};
     const cpu_urma_detail::SglGroup* groups{nullptr};
     urma_target_seg_t* single_host_segment{nullptr};
     std::vector<SglBatchQueue> queues;
@@ -255,130 +253,17 @@ struct CpuUrmaTransport::Impl {
     return {};
   }
 
-  std::string StreamSglBatch(SglBatchJob& job,
-                             std::uint64_t* prepare_ns,
-                             std::uint64_t* post_ns,
-                             std::uint64_t* poll_ns) {
-    std::vector<std::uint64_t> prepare_times(job.queues.size(), 0U);
-#pragma omp parallel for schedule(static, 1) num_threads(static_cast<int>(job.queues.size()))
-    for (std::int64_t index = 0;
-         index < static_cast<std::int64_t>(job.queues.size()); ++index) {
-      const auto jetty = static_cast<std::size_t>(index);
-      const auto start = std::chrono::steady_clock::now();
-      auto& queue = job.queues[jetty];
-      for (std::size_t position = 0U; position < queue.wrs.size(); ++position) {
-        PrepareSglBatchEntry(job, position * job.queues.size() + jetty);
-        auto& wr = queue.wrs[position];
-        const bool fenced = (position + 1U) % cq_mod_ == 0U ||
-                            position + 1U == queue.wrs.size();
-        wr.next = nullptr;
-        wr.flag.bs.complete_enable = fenced ? 1U : 0U;
-        if (!job.write && fenced) wr.flag.bs.place_order = URMA_STRONG_ORDER;
-      }
-      prepare_times[jetty] = static_cast<std::uint64_t>(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now() - start).count());
-    }
-    *prepare_ns = *std::max_element(prepare_times.begin(), prepare_times.end());
-
-    struct StreamState {
-      std::size_t posted{0U};
-      std::size_t completed{0U};
-    };
-    std::vector<StreamState> states(job.queues.size());
-    std::size_t remaining = 0U;
-    for (const auto& queue : job.queues) remaining += queue.wrs.size();
-
-    auto post_available = [&](std::size_t jetty) -> std::string {
-      auto& state = states[jetty];
-      auto& queue = job.queues[jetty];
-      while (state.posted < queue.wrs.size() &&
-             state.posted - state.completed < stream_depth_) {
-        urma_jfs_wr_t* bad = nullptr;
-        const auto start = std::chrono::steady_clock::now();
-        const auto status = urma_post_jetty_send_wr(
-            local_jettys_[jetty], &queue.wrs[state.posted], &bad);
-        *post_ns += static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - start).count());
-        if (status != URMA_SUCCESS) {
-          return "stream post failed (jetty=" + std::to_string(jetty) +
-                 ", position=" + std::to_string(state.posted) +
-                 ", status=" + std::to_string(static_cast<int>(status)) +
-                 ", bad_wr=" +
-                 std::to_string(reinterpret_cast<std::uintptr_t>(bad)) + ")";
-        }
-        ++state.posted;
-      }
-      return {};
-    };
-
-    for (std::size_t jetty = 0U; jetty < states.size(); ++jetty) {
-      const std::string error = post_available(jetty);
-      if (!error.empty()) return error;
-    }
-    while (remaining != 0U && std::chrono::steady_clock::now() < job.deadline) {
-      bool progressed = false;
-      for (std::size_t jetty = 0U; jetty < states.size(); ++jetty) {
-        auto& state = states[jetty];
-        if (state.completed == job.queues[jetty].wrs.size()) continue;
-        urma_cr_t cr{};
-        const auto poll_start = std::chrono::steady_clock::now();
-        const int polled = urma_poll_jfc(jfcs_[jetty], 1, &cr);
-        *poll_ns += static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - poll_start).count());
-        if (polled < 0) {
-          return "stream poll failed (jetty=" + std::to_string(jetty) + ")";
-        }
-        if (polled == 0) continue;
-        const std::uint64_t base = 0x5A1B0000ULL +
-            (static_cast<std::uint64_t>(jetty) << 32U);
-        if (cr.status != URMA_CR_SUCCESS || cr.user_ctx < base) {
-          return "stream completion failed (jetty=" + std::to_string(jetty) +
-                 ", status=" + std::to_string(static_cast<int>(cr.status)) +
-                 ", user_ctx=" +
-                 std::to_string(static_cast<unsigned long long>(cr.user_ctx)) + ")";
-        }
-        const std::uint64_t position64 = cr.user_ctx - base;
-        if (position64 >= job.queues[jetty].wrs.size()) {
-          return "stream completion position out of range (jetty=" +
-                 std::to_string(jetty) + ")";
-        }
-        const std::size_t completed = static_cast<std::size_t>(position64) + 1U;
-        if (completed <= state.completed || completed > state.posted ||
-            job.queues[jetty].wrs[completed - 1U].flag.bs.complete_enable == 0U) {
-          return "unexpected stream completion (jetty=" +
-                 std::to_string(jetty) + ", completed=" +
-                 std::to_string(completed) + ")";
-        }
-        remaining -= completed - state.completed;
-        state.completed = completed;
-        progressed = true;
-        const std::string error = post_available(jetty);
-        if (!error.empty()) return error;
-      }
-      (void)progressed;
-    }
-    if (remaining != 0U) return "timed out waiting for stream completions";
-    return {};
-  }
-
   ~Impl() { (void)Shutdown(); }
 
   Status Initialize(const CpuUrmaTransportOptions& options) {
     if (options.peer_address.empty() || options.region_bytes == 0 ||
         options.region_bytes > std::numeric_limits<std::size_t>::max() ||
         options.wqes_per_doorbell > kJettyDepth || options.remote_sgl_size == 0U ||
-        options.jetty_count == 0U || options.jetty_count > kMaxJettyCount ||
-        options.stream_depth > kJettyDepth ||
-        (options.stream_depth != 0U &&
-         (options.cq_mod == 0U || options.cq_mod > options.stream_depth))) {
+        options.jetty_count == 0U || options.jetty_count > kMaxJettyCount) {
       return Status::InvalidArgument(
           "CPU URMA transport requires peer_address, non-zero region_bytes, "
           "non-zero remote_sgl_size, jetty_count in [1,16] and "
-          "wqes_per_doorbell and stream_depth in [0,8192], and cq_mod in "
-          "[1,stream_depth] when streaming");
+          "wqes_per_doorbell in [0,8192]");
     }
     // URMA is process-wide.  The ACL/HBM runtime may have initialized it
     // before this transport is constructed, in which case liburma returns
@@ -656,14 +541,9 @@ struct CpuUrmaTransport::Impl {
     }
     if (local_jettys_.empty()) return Error("no CPU Jettys created");
     wqes_per_doorbell_ = options.wqes_per_doorbell;
-    window_bytes_ = options.window_bytes;
-    stream_depth_ = options.stream_depth;
-    cq_mod_ = options.cq_mod;
-    std::fprintf(stderr, "[KVAF_CPU_URMA] JETTYS_READY count=%zu omp_threads=%u wqes_per_doorbell=%zu window_bytes=%llu stream_depth=%zu cq_mod=%zu local_sge=1 requested_remote_sgl_size=%u remote_sgl_size=%zu depth=%u\n",
+    std::fprintf(stderr, "[KVAF_CPU_URMA] JETTYS_READY count=%zu omp_threads=%u wqes_per_doorbell=%zu local_sge=1 requested_remote_sgl_size=%u remote_sgl_size=%zu depth=%u\n",
                  local_jettys_.size(), options.jetty_count,
                  wqes_per_doorbell_,
-                 static_cast<unsigned long long>(window_bytes_),
-                 stream_depth_, cq_mod_,
                  options.remote_sgl_size, batch_remote_sgl_size_, kJettyDepth);
     initialized_ = true;
     return Status::OK();
@@ -772,9 +652,7 @@ struct CpuUrmaTransport::Impl {
     SglBatchJob& job = sgl_batch_workspace_;
     job.write = write;
     job.buffers = buffers;
-    job.count = count;
     job.remote_sgl_size = remote_sgl_size;
-    job.wr_count = wr_count;
     job.groups = groups;
     job.single_host_segment = nullptr;
     job.queues.resize(local_jettys_.size());
@@ -838,30 +716,19 @@ struct CpuUrmaTransport::Impl {
     job.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     std::uint64_t prepare_ns = 0U;
     std::uint64_t post_ns = 0U;
-    std::uint64_t poll_ns = 0U;
-    std::string post_error;
-    std::string poll_error;
     const auto dispatch_start = std::chrono::steady_clock::now();
     const auto setup_ns = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             dispatch_start - setup_start).count());
-    std::uint64_t dispatch_ns = 0U;
-    if (stream_depth_ != 0U) {
-      post_error = StreamSglBatch(job, &prepare_ns, &post_ns, &poll_ns);
-      dispatch_ns = static_cast<std::uint64_t>(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now() - dispatch_start).count());
-    } else {
-      post_error = PrepareAndPostSglBatch(job, &prepare_ns, &post_ns);
-      const auto poll_start = std::chrono::steady_clock::now();
-      dispatch_ns = static_cast<std::uint64_t>(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-              poll_start - dispatch_start).count());
-      poll_error = post_error.empty() ? PollSglBatch(job) : post_error;
-      poll_ns = static_cast<std::uint64_t>(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now() - poll_start).count());
-    }
+    const auto post_error = PrepareAndPostSglBatch(job, &prepare_ns, &post_ns);
+    const auto poll_start = std::chrono::steady_clock::now();
+    const auto dispatch_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            poll_start - dispatch_start).count());
+    const auto poll_error = post_error.empty() ? PollSglBatch(job) : post_error;
+    const auto poll_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - poll_start).count());
     last_batch_timing_.prepare_ns = prepare_ns;
     last_batch_timing_.post_ns = post_ns;
     last_batch_timing_.poll_ns = poll_ns;
@@ -880,47 +747,15 @@ struct CpuUrmaTransport::Impl {
     std::unique_lock<std::mutex> submit_lock(batch_submit_mutex_);
     const auto start = std::chrono::steady_clock::now();
     last_batch_timing_ = {};
-    CpuUrmaTransport::BatchTiming total_timing{};
-    std::size_t begin = 0U;
-    std::uint64_t contiguous_offset = offset;
-    while (begin < count) {
-      std::size_t end = begin;
-      std::uint64_t chunk_bytes = 0U;
-      while (end < count) {
-        const std::uint64_t bytes = buffers[end].bytes;
-        if (end != begin && window_bytes_ != 0U &&
-            bytes > window_bytes_ - std::min(window_bytes_, chunk_bytes)) {
-          break;
-        }
-        if (chunk_bytes > std::numeric_limits<std::uint64_t>::max() - bytes) {
-          last_batch_timing_ = {};
-          return Status::InvalidArgument("SGL batch byte count overflows");
-        }
-        chunk_bytes += bytes;
-        ++end;
-        if (window_bytes_ != 0U && chunk_bytes >= window_bytes_) break;
-      }
-      const Status status = TransferSglBatchLocked(
-          write, contiguous_offset, buffers + begin,
-          remote_offsets == nullptr ? nullptr : remote_offsets + begin,
-          end - begin);
-      if (!status.ok()) {
-        last_batch_timing_ = {};
-        return status;
-      }
-      total_timing.prepare_ns += last_batch_timing_.prepare_ns;
-      total_timing.post_ns += last_batch_timing_.post_ns;
-      total_timing.poll_ns += last_batch_timing_.poll_ns;
-      total_timing.setup_ns += last_batch_timing_.setup_ns;
-      total_timing.dispatch_ns += last_batch_timing_.dispatch_ns;
-      total_timing.wr_count += last_batch_timing_.wr_count;
-      contiguous_offset += chunk_bytes;
-      begin = end;
+    const Status status = TransferSglBatchLocked(
+        write, offset, buffers, remote_offsets, count);
+    if (!status.ok()) {
+      last_batch_timing_ = {};
+      return status;
     }
-    total_timing.total_ns = static_cast<std::uint64_t>(
+    last_batch_timing_.total_ns = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - start).count());
-    last_batch_timing_ = total_timing;
     return Status::OK();
   }
 
@@ -1048,9 +883,6 @@ struct CpuUrmaTransport::Impl {
   std::mutex batch_submit_mutex_;
   SglBatchJob sgl_batch_workspace_;
   std::size_t wqes_per_doorbell_{0U};
-  std::uint64_t window_bytes_{0U};
-  std::size_t stream_depth_{0U};
-  std::size_t cq_mod_{100U};
   std::size_t batch_remote_sgl_size_{1U};
   std::vector<cpu_urma_detail::SglGroup> batch_groups_;
   CpuUrmaTransport::BatchTiming last_batch_timing_{};

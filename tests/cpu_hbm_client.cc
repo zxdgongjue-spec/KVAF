@@ -30,9 +30,7 @@ struct Options {
   std::uint32_t eid_index{0};
   std::uint32_t device_id{0};
   std::uint32_t jetty_count{4};
-  std::uint64_t window_bytes{0};
-  std::uint32_t stream_depth{0};
-  std::uint32_t cq_mod{100};
+  std::uint32_t remote_sgl_size{1};
 };
 
 bool ParseU64(const char* text, std::uint64_t* value) {
@@ -59,8 +57,7 @@ void Usage(const char* program) {
                "[--doorbell-wqes N] "
                "[--seed N] [--ub-device NAME] "
                "[--eid-index N] [--device-id N] [--jettys N] "
-               "[--window-bytes N[K|M|G|T]] [--stream-depth N] "
-               "[--cq-mod N]\n",
+               "[--remote-sgl-size N]\n",
                program);
 }
 
@@ -103,10 +100,6 @@ bool Parse(int argc, char** argv, Options* options) {
     std::uint64_t number = 0;
     if (arg == "--blocks" && ParseU64(value, &number)) options->blocks = number;
     else if (arg == "--block-bytes" && ParseU64(value, &number)) options->block_bytes = number;
-    else if (arg == "--bytes" && ParseU64(value, &number)) {
-      options->blocks = 1;
-      options->block_bytes = number;
-    }
     else if (arg == "--host-space-bytes" && ParseBytes(value, &options->host_space_bytes)) {}
     else if (arg == "--doorbell-wqes" && ParseU32(value, &options->wqes_per_doorbell)) {}
     else if (arg == "--iterations" && ParseU64(value, &number)) options->iterations = number;
@@ -116,17 +109,13 @@ bool Parse(int argc, char** argv, Options* options) {
     else if (arg == "--eid-index" && ParseU32(value, &options->eid_index)) options->has_eid_index = true;
     else if (arg == "--device-id" && ParseU32(value, &options->device_id)) {}
     else if (arg == "--jettys" && ParseU32(value, &options->jetty_count)) {}
-    else if (arg == "--window-bytes" && ParseBytes(value, &options->window_bytes)) {}
-    else if (arg == "--stream-depth" && ParseU32(value, &options->stream_depth)) {}
-    else if (arg == "--cq-mod" && ParseU32(value, &options->cq_mod)) {}
+    else if (arg == "--remote-sgl-size" && ParseU32(value, &options->remote_sgl_size)) {}
     else return false;
   }
   return options->blocks != 0 && options->block_bytes != 0 && options->iterations != 0 &&
          options->wqes_per_doorbell <= 1024U &&
          options->jetty_count >= 1U && options->jetty_count <= 16U &&
-         options->stream_depth <= 8192U &&
-         (options->stream_depth == 0U ||
-          (options->cq_mod != 0U && options->cq_mod <= options->stream_depth)) &&
+         options->remote_sgl_size != 0U &&
          options->blocks <= std::numeric_limits<std::uint64_t>::max() / options->block_bytes &&
          options->block_bytes <= std::numeric_limits<std::uint32_t>::max();
 }
@@ -168,19 +157,37 @@ struct MappedRegion {
 bool RunBatchPass(kvaf::CpuUrmaTransport* transport, bool write,
                 std::vector<HostBlock>* blocks,
                 const std::vector<std::size_t>& order, std::size_t block_bytes,
-                std::size_t iterations, Stats* stats) {
+                std::size_t iterations, Stats* stats,
+                std::uint32_t remote_sgl_size = 1U) {
   if (transport == nullptr || blocks == nullptr || stats == nullptr) {
     return false;
   }
   const auto wall_start = std::chrono::steady_clock::now();
+  const bool scatter_write = write && remote_sgl_size > 1U;
+  std::vector<std::size_t> positions;
+  std::vector<std::uint64_t> remote_offsets;
+  if (scatter_write) {
+    positions.resize(order.size());
+    remote_offsets.resize(order.size());
+    for (std::size_t i = 0U; i < order.size(); ++i) positions[i] = i;
+    // Keep the original HBM mapping while making contiguous local rows adjacent.
+    std::sort(positions.begin(), positions.end(), [&](std::size_t a, std::size_t b) {
+      return reinterpret_cast<std::uintptr_t>((*blocks)[order[a]].data) <
+             reinterpret_cast<std::uintptr_t>((*blocks)[order[b]].data);
+    });
+  }
   std::vector<kvaf::CpuUrmaTransport::HostSge> requests(order.size());
   for (std::size_t i = 0U; i < order.size(); ++i) {
-    requests[i] = {(*blocks)[order[i]].data, block_bytes};
+    const std::size_t position = scatter_write ? positions[i] : i;
+    requests[i] = {(*blocks)[order[position]].data, block_bytes};
+    if (scatter_write) remote_offsets[i] = static_cast<std::uint64_t>(position) * block_bytes;
   }
   for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
     const auto start = std::chrono::steady_clock::now();
     const kvaf::Status status = write
-        ? transport->WriteSglBatch(0U, requests.data(), requests.size())
+        ? (scatter_write
+               ? transport->WriteBatch(remote_offsets.data(), requests.data(), requests.size())
+               : transport->WriteSglBatch(0U, requests.data(), requests.size()))
         : transport->ReadSglBatch(0U, requests.data(), requests.size());
     if (!status.ok()) {
       std::fprintf(stderr, "[HBM_TEST][CPU] %s failed: %s\n",
@@ -212,7 +219,7 @@ bool RunBatchPass(kvaf::CpuUrmaTransport* transport, bool write,
   return true;
 }
 
-void PrintStats(const char* name, const Stats& stats, bool streaming) {
+void PrintStats(const char* name, const Stats& stats) {
   const double bandwidth = stats.wall_ns == 0
       ? 0.0 : stats.bytes * 1e9 / stats.wall_ns / (1024.0 * 1024.0);
   const double average = stats.batches == 0 ? 0.0 : stats.sum_ns / static_cast<double>(stats.batches);
@@ -230,18 +237,15 @@ void PrintStats(const char* name, const Stats& stats, bool streaming) {
                 name, stats.prepare_ns / samples / 1000.0,
                 stats.post_ns / samples / 1000.0,
                 stats.poll_ns / samples / 1000.0);
-    // Streaming dispatch already includes CQ polling; do not count it twice.
-    const auto poll_wait_ns = streaming ? 0U : stats.poll_ns;
-    const auto covered_ns = stats.setup_ns + stats.dispatch_ns + poll_wait_ns;
+    const auto covered_ns = stats.setup_ns + stats.dispatch_ns + stats.poll_ns;
     const auto other_ns = stats.total_ns > covered_ns
         ? stats.total_ns - covered_ns : 0U;
     std::printf("[HBM_TEST][CPU] %-5s_WALL avg_setup=%.3f us "
-                "%s=%.3f us avg_poll_wait=%.3f us avg_other=%.3f us "
+                "avg_submit_wall=%.3f us avg_poll_wait=%.3f us avg_other=%.3f us "
                 "avg_total=%.3f us\n",
                 name, stats.setup_ns / samples / 1000.0,
-                streaming ? "avg_stream_wall" : "avg_submit_wall",
                 stats.dispatch_ns / samples / 1000.0,
-                poll_wait_ns / samples / 1000.0,
+                stats.poll_ns / samples / 1000.0,
                 other_ns / samples / 1000.0,
                 stats.total_ns / samples / 1000.0);
   }
@@ -284,15 +288,14 @@ int main(int argc, char** argv) {
                "[HBM_TEST][CPU] START peer=%s blocks=%zu block_bytes=%zu payload_bytes=%llu "
                "host_address_space_bytes=%llu "
                "iterations=%zu warmup=%zu "
-               "remote_device=%u jettys=%u window_bytes=%llu "
-               "stream_depth=%u cq_mod=%u omp_wait_policy=ACTIVE\n",
+               "remote_device=%u jettys=%u remote_sgl_size=%u "
+               "write_order=%s omp_wait_policy=ACTIVE\n",
                options.peer.c_str(), options.blocks, options.block_bytes,
                static_cast<unsigned long long>(total_bytes),
                static_cast<unsigned long long>(host_space_bytes), options.iterations,
                options.warmup,
-               options.device_id, options.jetty_count,
-               static_cast<unsigned long long>(options.window_bytes),
-               options.stream_depth, options.cq_mod);
+               options.device_id, options.jetty_count, options.remote_sgl_size,
+               options.remote_sgl_size > 1U ? "local-address" : "random");
   std::fprintf(stderr, "[HBM_TEST][CPU] DATA_PATH=direct-registered-host-memory\n");
 
   kvaf::CpuUrmaTransportOptions transport_options;
@@ -306,9 +309,7 @@ int main(int argc, char** argv) {
   transport_options.remote_eid_index = options.has_eid_index ? options.eid_index : UINT32_MAX;
   transport_options.wqes_per_doorbell = options.wqes_per_doorbell;
   transport_options.jetty_count = options.jetty_count;
-  transport_options.window_bytes = options.window_bytes;
-  transport_options.stream_depth = options.stream_depth;
-  transport_options.cq_mod = options.cq_mod;
+  transport_options.remote_sgl_size = options.remote_sgl_size;
   kvaf::CpuUrmaTransport transport;
   kvaf::Status status = transport.Initialize(transport_options);
   if (!status.ok()) {
@@ -386,7 +387,7 @@ int main(int argc, char** argv) {
   Stats warmup_stats;
   const auto run_pass = [&](bool write, std::size_t iterations, Stats* stats) {
     return RunBatchPass(&transport, write, &blocks, order, options.block_bytes,
-                      iterations, stats);
+                      iterations, stats, options.remote_sgl_size);
   };
   if (options.warmup != 0 && !run_pass(true, options.warmup, &warmup_stats)) {
     (void)transport.Shutdown();
@@ -409,8 +410,8 @@ int main(int argc, char** argv) {
                                       blocks[i].data + options.block_bytes,
                                       expected[i].begin());
   }
-  PrintStats("WRITE", write_stats, options.stream_depth != 0U);
-  PrintStats("READ", read_stats, options.stream_depth != 0U);
+  PrintStats("WRITE", write_stats);
+  PrintStats("READ", read_stats);
   std::printf("[HBM_TEST][CPU] %s blocks=%zu block_bytes=%zu seed=%llu\n",
               verified ? "PASS" : "FAIL", options.blocks, options.block_bytes,
               static_cast<unsigned long long>(options.seed));

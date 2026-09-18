@@ -36,7 +36,7 @@ struct CpuUrmaTransportOptions {
   bool remote_hbm{false};
   std::uint32_t remote_device_id{0};
   std::uint32_t remote_eid_index{0};
-  // Streaming wave size and number of WRs submitted per
+  // Number of WRs submitted per
   // urma_post_jetty_send_wr call. Zero prepares and submits one full linked
   // list per Jetty.
   std::uint32_t wqes_per_doorbell{0};
@@ -45,16 +45,6 @@ struct CpuUrmaTransportOptions {
   std::uint32_t remote_sgl_size{1};
   // Number of independent Jettys and OpenMP submission workers.
   std::uint32_t jetty_count{4};
-  // Experimental completion window for contiguous SGL batches. Zero submits
-  // the entire logical batch; otherwise each completed sub-batch contains at
-  // most this many bytes (unless one SGE alone is larger).
-  std::uint64_t window_bytes{0};
-  // Experimental per-Jetty sliding window. Zero keeps linked-list batch
-  // submission. Otherwise WRs are posted individually while at most this
-  // many remain without a completion fence.
-  std::uint32_t stream_depth{0};
-  // Completion fence interval used by stream_depth.
-  std::uint32_t cq_mod{100};
   bool has_external_region{false};
   peer::PeerRegion external_region{};
 };
@@ -74,7 +64,6 @@ class CpuUrmaTransport final {
     // Validation, workspace sizing and host segment selection per sub-batch.
     std::uint64_t setup_ns{0};
     // Entire prepare/post call, including OpenMP scheduling and joining.
-    // In streaming mode this includes interleaved submission and CQ polling.
     std::uint64_t dispatch_ns{0};
   };
 
@@ -91,8 +80,8 @@ class CpuUrmaTransport final {
     void* data;
     std::size_t bytes;
   };
-  // One local SGE per WR. Four fixed workers each own a Jetty and prepare
-  // and submit its batches independently; completion is polled after joining.
+  // One local SGE per WR. Each worker owns a Jetty and prepares
+  // and submits its batches independently; completion is polled after joining.
   Status WriteSglBatch(std::uint64_t remote_offset, const HostSge* sources,
                        std::size_t count);
   // CPU BatchPut path: transfer packed CPU DRAM rows into independent HBM

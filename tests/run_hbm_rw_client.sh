@@ -6,7 +6,7 @@ if [[ -n "${1:-}" && ( -x "$1/runtime/kvaf_cpu_hbm_client" || -x "$1/tests/kvaf_
   build_dir="$1"; shift
 fi
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 [build-dir] <npu-host> [port] [--host-eid HEX] [client options]" >&2
+  echo "Usage: $0 [build-dir] <npu-host> [port] [client options]" >&2
   exit 2
 fi
 host="$1"; shift
