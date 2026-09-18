@@ -36,13 +36,21 @@ if ((count == 1)); then
   [[ "$adaptive" == true && "$calibration_only" == true ]]
   [[ -z "$peer_device" && "$token_bytes" == 656 ]]
   [[ "$miss_count" == 2048 && "$request_length" == 2048 ]]
-  echo '[KVAF_AIV] UB_DEVICE_SELECTED device_id=7 peer_candidate=2 ub_device=udmac1d1e2 npu_group=0 p50_kernel_cycles=100'
+  if [[ "${KVAF_MOCK_MODE:-selected}" == skipped ]]; then
+    echo '[KVAF_AIV] UB_DEVICE_ADAPTIVE_SKIPPED device_id=7 peer_devices=50 reason=no_explicit_peer_device_filter selection=first_working_candidate'
+  else
+    echo '[KVAF_AIV] UB_DEVICE_SELECTED device_id=7 peer_candidate=2 ub_device=udmac1d1e2 npu_group=0 p50_kernel_cycles=100'
+  fi
   exit 0
 fi
 
 [[ "$adaptive" == false && "$calibration_only" == false ]]
-[[ "$peer_device" == udmac1d1e2 ]]
-echo '[KVAF_AIV] UB_DEVICE_REUSED device_id=7 peer_candidate=2 ub_device=udmac1d1e2 npu_group=0'
+if [[ "${KVAF_MOCK_MODE:-selected}" == skipped ]]; then
+  [[ -z "$peer_device" ]]
+else
+  [[ "$peer_device" == udmac1d1e2 ]]
+  echo '[KVAF_AIV] UB_DEVICE_REUSED device_id=7 peer_candidate=2 ub_device=udmac1d1e2 npu_group=0'
+fi
 for operation in batch_get_kernel_total batch_get_kernel_post batch_get_kernel_completion_wait; do
   echo "PERF_RESULT operation=$operation mean_ms=0.001 p50_ms=0.001 p90_ms=0.001 p99_ms=0.001 mean_cycles=1 p50_cycles=1 p90_cycles=1 p99_cycles=1"
 done
@@ -73,4 +81,19 @@ awk -F, 'NR == 1 {
            }
            $NF != "udmac1d1e2" { exit 1 }
            END { if (NR != 17) exit 1 }' "$temp_dir/summary.csv"
+
+export KVAF_MOCK_MODE=skipped
+export KVAF_MOCK_COUNT_FILE="$temp_dir/skipped-count"
+export KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR="$temp_dir/skipped-logs"
+export KVAF_BATCH_GET_MISS_SWEEP_CSV="$temp_dir/skipped-summary.csv"
+"$KVAF_ROOT/tests/run_remote_cpu_batch_get_miss_count_perf.sh" \
+  "$temp_dir/fake-build" --adaptive-ub-device >"$temp_dir/skipped-output.log"
+
+[[ "$(<"$KVAF_MOCK_COUNT_FILE")" == 17 ]]
+grep -q '^BATCH_GET_UB_DEVICE_CALIBRATION_SKIPPED reason=no_explicit_peer_device_filter reuse=first_working_candidate$' \
+  "$temp_dir/skipped-output.log"
+[[ "$(grep -c '^\[KVAF_AIV\] UB_DEVICE_REUSED ' "$temp_dir/skipped-output.log")" == 0 ]]
+awk -F, 'NR == 1 { if ($NF != "selected_ub_device") exit 1; next }
+           NF != 18 || $18 != "" { exit 1 }
+           END { if (NR != 17) exit 1 }' "$temp_dir/skipped-summary.csv"
 echo "batch get sweep UB device reuse test passed"

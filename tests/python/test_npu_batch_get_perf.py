@@ -619,32 +619,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     torch.manual_seed(args.seed)
     device = f"npu:{device_id}"
 
-    # Every table entry contains the same deterministic token pattern. Reusing
-    # a bounded source Tensor keeps setup memory independent of table capacity;
-    # each BatchPut still allocates a distinct remote entry for every key.
-    token_rows = torch.arange(
-        tokens_per_block, dtype=torch.int64, device=device
-    ).unsqueeze(1)
-    token_byte_indices = torch.arange(
-        token_bytes, dtype=torch.int64, device=device
-    ).unsqueeze(0)
-    entry_pattern = (
-        (
-            (token_rows * 131 + token_byte_indices * 17 + (token_byte_indices >> 3))
-            & 0xFF
-        )
-        .to(torch.uint8)
-        .contiguous()
-    )
-    populate_entries = min(args.populate_chunk_entries, table_capacity)
-    populate_source = entry_pattern.reshape(1, block_bytes).repeat(populate_entries, 1)
-    populate_offsets = [row * block_bytes for row in range(populate_entries)]
-    populate_lengths = [block_bytes] * populate_entries
-    output = torch.empty(
-        (request_length, token_bytes), dtype=torch.uint8, device=device
-    )
-    miss_count = torch.tensor([miss_count_value], dtype=torch.int32, device=device)
-
     runtime = kvaf.NpuRuntime(
         str(kernel),
         batch_get_token_bytes=token_bytes,
@@ -688,6 +662,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.adaptive_calibration_only:
             print("BATCH_GET_PERF_ADAPTIVE_CALIBRATION_DONE")
             return 0
+
+        # Every table entry contains the same deterministic token pattern. Reusing
+        # a bounded source Tensor keeps setup memory independent of table capacity;
+        # each BatchPut still allocates a distinct remote entry for every key.
+        token_rows = torch.arange(
+            tokens_per_block, dtype=torch.int64, device=device
+        ).unsqueeze(1)
+        token_byte_indices = torch.arange(
+            token_bytes, dtype=torch.int64, device=device
+        ).unsqueeze(0)
+        entry_pattern = (
+            (
+                (token_rows * 131 + token_byte_indices * 17 + (token_byte_indices >> 3))
+                & 0xFF
+            )
+            .to(torch.uint8)
+            .contiguous()
+        )
+        populate_entries = min(args.populate_chunk_entries, table_capacity)
+        populate_source = entry_pattern.reshape(1, block_bytes).repeat(populate_entries, 1)
+        populate_offsets = [row * block_bytes for row in range(populate_entries)]
+        populate_lengths = [block_bytes] * populate_entries
+        output = torch.empty(
+            (request_length, token_bytes), dtype=torch.uint8, device=device
+        )
+        miss_count = torch.tensor([miss_count_value], dtype=torch.int32, device=device)
 
         print("BATCH_GET_PERF_PHASE_BEGIN phase=populate_table")
         populated = 0

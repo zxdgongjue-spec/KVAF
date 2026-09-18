@@ -86,6 +86,7 @@ for option in "$@"; do
 done
 
 selected_ub_device=""
+adaptive_selection_skipped=false
 sweep_options=()
 if ((${#base_options[@]} > 0)); then
   sweep_options=("${base_options[@]}")
@@ -114,17 +115,22 @@ if [[ "$adaptive_requested" == true ]]; then
     awk '$1 == "[KVAF_AIV]" && $2 == "UB_DEVICE_SELECTED" { result = $0 }
          END { print result }' "$calibration_log"
   )"
-  if [[ -z "$selected_record" ]]; then
+  if [[ -n "$selected_record" ]]; then
+    selected_ub_device="$(extract_field "$selected_record" ub_device)"
+    if [[ -z "$selected_ub_device" ]]; then
+      echo "ERROR: malformed UB_DEVICE_SELECTED record: $selected_record" >&2
+      exit 1
+    fi
+    sweep_options+=(--peer-ub-device "$selected_ub_device")
+    echo "BATCH_GET_UB_DEVICE_CALIBRATION_DONE selected_ub_device=$selected_ub_device reuse=subsequent_shapes"
+  elif awk '$1 == "[KVAF_AIV]" && $2 == "UB_DEVICE_ADAPTIVE_SKIPPED" { found = 1 }
+             END { exit !found }' "$calibration_log"; then
+    adaptive_selection_skipped=true
+    echo "BATCH_GET_UB_DEVICE_CALIBRATION_SKIPPED reason=no_explicit_peer_device_filter reuse=first_working_candidate"
+  else
     echo "ERROR: adaptive calibration did not select a UB device; ensure K uses an explicit --ub-device list" >&2
     exit 1
   fi
-  selected_ub_device="$(extract_field "$selected_record" ub_device)"
-  if [[ -z "$selected_ub_device" ]]; then
-    echo "ERROR: malformed UB_DEVICE_SELECTED record: $selected_record" >&2
-    exit 1
-  fi
-  sweep_options+=(--peer-ub-device "$selected_ub_device")
-  echo "BATCH_GET_UB_DEVICE_CALIBRATION_DONE selected_ub_device=$selected_ub_device reuse=subsequent_shapes"
 fi
 
 token_bytes_values=()
@@ -201,7 +207,8 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
           fi
           shape_ub_device="$active_ub_device"
         fi
-        if [[ "$adaptive_requested" == true && -z "$shape_ub_device" ]]; then
+        if [[ "$adaptive_requested" == true && "$adaptive_selection_skipped" == false &&
+          -z "$shape_ub_device" ]]; then
           echo "ERROR: fixed UB device was not reported for token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core" >&2
           exit 1
         fi

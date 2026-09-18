@@ -6,10 +6,11 @@
 #include <tuple>
 
 using kvaf::Status;
-using kvaf::detail::SelectStartupCandidate;
 using kvaf::detail::SelectStartupDeviceCandidate;
 using kvaf::detail::ShouldTuneStartupCandidates;
 using kvaf::detail::StartupCandidate;
+
+namespace {
 
 void Check(bool condition) {
   if (!condition) {
@@ -18,12 +19,13 @@ void Check(bool condition) {
   }
 }
 
+}  // namespace
+
 int main() {
   Check(ShouldTuneStartupCandidates(true, true));
   Check(!ShouldTuneStartupCandidates(true, false));
   Check(!ShouldTuneStartupCandidates(false, true));
 
-  const std::vector<StartupCandidate> candidates{{0, 0}, {1, 0}, {2, 0}, {3, 0}, {3, 1}};
   std::vector<std::tuple<unsigned, std::size_t, bool>> calls;
   bool allocated = false;
   int releases = 0;
@@ -33,84 +35,66 @@ int main() {
     ++releases;
     return Status::OK();
   };
-  auto initialize = [&](const StartupCandidate& c, bool measure, double* cycles) {
+
+  // Each device contributes only its first usable EID/N-EID pair. Invalid
+  // timings are rejected, so the next pair for that device is tried.
+  const std::vector<std::vector<StartupCandidate>> devices{
+      {{0, 0}, {0, 1}}, {{1, 0}, {1, 1}}, {{2, 0}, {2, 1}}};
+  auto initialize = [&](const StartupCandidate& candidate, bool measure,
+                        double* cycles) {
     Check(!allocated);
     allocated = true;
-    calls.emplace_back(c.peer, c.local_group, measure);
-    *cycles = c.local_group == 1 ? 5.0 : 100.0 - c.peer * 10.0;
-    if (c.peer == 1) return Status::Internal("unreachable");
+    calls.emplace_back(candidate.peer, candidate.local_group, measure);
+    if (candidate.peer == 0 && candidate.local_group == 0) {
+      return Status::Internal("unreachable");
+    }
+    if (candidate.peer == 2 && candidate.local_group == 0) {
+      *cycles = std::numeric_limits<double>::quiet_NaN();
+      return Status::OK();
+    }
+    *cycles = candidate.peer == 1 ? 20.0 : 30.0;
     return Status::OK();
   };
-  // Candidate count has no hard cap; every explicitly shortlisted EID pair is measured.
-  Check(SelectStartupCandidate(true, candidates, initialize, cleanup).ok());
+  Check(SelectStartupDeviceCandidate(devices, initialize, cleanup).ok());
   Check(calls.size() == 6 && releases == 5 && allocated);
-  Check(calls.back() == std::make_tuple(3U, std::size_t{1}, false));
+  Check(calls[0] == std::make_tuple(0U, std::size_t{0}, true));
+  Check(calls[1] == std::make_tuple(0U, std::size_t{1}, true));
+  Check(calls[2] == std::make_tuple(1U, std::size_t{0}, true));
+  Check(calls[3] == std::make_tuple(2U, std::size_t{0}, true));
+  Check(calls[4] == std::make_tuple(2U, std::size_t{1}, true));
+  Check(calls[5] == std::make_tuple(1U, std::size_t{0}, false));
   cleanup();
 
-  calls.clear(); releases = 0;
-  Check(SelectStartupCandidate(false, candidates, initialize, cleanup).ok());
-  Check(calls.size() == 1 && !std::get<2>(calls.front()) && releases == 0);
-  cleanup();
-  // Selection has no process-global winner: another N card can prefer peer 0.
-  auto other_card = [&](const StartupCandidate& c, bool measure, double* cycles) {
-    Check(!allocated); allocated = true;
-    calls.emplace_back(c.peer, c.local_group, measure);
-    *cycles = 10.0 + c.peer;
-    return Status::OK();
-  };
-  Check(SelectStartupCandidate(true, candidates, other_card, cleanup).ok());
-  Check(std::get<0>(calls.back()) == 0);
-  cleanup();
-
-  // Failed winner reconstruction falls back in measured order; ties are stable.
+  // If the fastest device cannot be rebuilt with the formal region, use the
+  // next measured device and leave no temporary allocation behind.
   calls.clear();
-  auto rebuild_failure = [&](const StartupCandidate& c, bool measure, double* cycles) {
-    Check(!allocated); allocated = true;
-    calls.emplace_back(c.peer, c.local_group, measure);
-    *cycles = 10.0;
-    return !measure && c.peer == 0 ? Status::Internal("rebuild failed") : Status::OK();
-  };
-  Check(SelectStartupCandidate(true, {{0, 0}, {1, 0}}, rebuild_failure, cleanup).ok());
-  Check(calls.size() == 4 && std::get<0>(calls.back()) == 1);
-  cleanup();
-
-  auto invalid = [&](const StartupCandidate&, bool measure, double* cycles) {
-    Check(measure); allocated = true;
-    *cycles = std::numeric_limits<double>::quiet_NaN();
+  releases = 0;
+  const std::vector<std::vector<StartupCandidate>> rebuild_devices{
+      {{0, 0}}, {{1, 0}}};
+  auto rebuild_failure = [&](const StartupCandidate& candidate, bool measure,
+                             double* cycles) {
+    Check(!allocated);
+    allocated = true;
+    calls.emplace_back(candidate.peer, candidate.local_group, measure);
+    *cycles = 10.0 + candidate.peer;
+    if (!measure && candidate.peer == 0) {
+      return Status::Internal("rebuild failed");
+    }
     return Status::OK();
   };
-  Check(!SelectStartupCandidate(true, {{0, 0}}, invalid, cleanup).ok());
-  Check(!allocated);
+  Check(SelectStartupDeviceCandidate(rebuild_devices, rebuild_failure, cleanup).ok());
+  Check(calls.size() == 4 && releases == 3 && allocated);
+  Check(calls.back() == std::make_tuple(1U, std::size_t{0}, false));
+  cleanup();
+
+  allocated = false;
+  auto cleanup_failure = [&]() { return Status::Internal("cleanup failure"); };
   auto failed = [&](const StartupCandidate&, bool, double*) {
     allocated = true;
     return Status::Internal("probe failure");
   };
-  Check(!SelectStartupCandidate(true, {{0, 0}}, failed, cleanup).ok());
-  auto cleanup_failure = [&]() { return Status::Internal("cleanup failure"); };
-  const auto status = SelectStartupCandidate(true, {{0, 0}, {0, 1}}, failed, cleanup_failure);
+  const Status status = SelectStartupDeviceCandidate({{{0, 0}}}, failed,
+                                                      cleanup_failure);
   Check(status.message() == "cleanup failure");
-
-  // EIDs and local EIDs are connectivity fallbacks within a UB device. Once
-  // one pair works, remaining pairs from that device are not benchmarked.
-  calls.clear(); releases = 0; allocated = false;
-  const std::vector<std::vector<StartupCandidate>> devices{
-      {{0, 0}, {0, 1}, {1, 0}}, {{2, 0}, {2, 1}}, {{3, 0}}};
-  auto device_initialize = [&](const StartupCandidate& c, bool measure,
-                               double* cycles) {
-    Check(!allocated); allocated = true;
-    calls.emplace_back(c.peer, c.local_group, measure);
-    *cycles = c.peer == 2 ? 20.0 : 30.0;
-    return (c.peer == 0 && c.local_group == 0)
-               ? Status::Internal("unreachable")
-               : Status::OK();
-  };
-  Check(SelectStartupDeviceCandidate(devices, device_initialize, cleanup).ok());
-  Check(calls.size() == 5);
-  Check(calls[0] == std::make_tuple(0U, std::size_t{0}, true));
-  Check(calls[1] == std::make_tuple(0U, std::size_t{1}, true));
-  Check(calls[2] == std::make_tuple(2U, std::size_t{0}, true));
-  Check(calls[3] == std::make_tuple(3U, std::size_t{0}, true));
-  Check(calls.back() == std::make_tuple(2U, std::size_t{0}, false));
-  cleanup();
   std::cout << "startup selection tests passed\n";
 }
