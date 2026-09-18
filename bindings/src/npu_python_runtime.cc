@@ -363,60 +363,6 @@ class NpuPythonRuntime final {
     ThrowIfError(native_->core().BatchFree(BatchFreeRequest{std::move(copied_keys)}));
   }
 
-  void StartBatchPutKernelProfile() {
-    ThrowIfError(native_->SetBatchPutKernelProfiling(true));
-  }
-
-  py::list BatchPutKernelProfileSnapshot() const {
-    std::vector<kvaf::BatchPutKernelProfile> profiles;
-    ThrowIfError(native_->CopyBatchPutKernelProfiles(&profiles));
-    py::list result;
-    for (std::size_t core = 0; core < profiles.size(); ++core) {
-      const kvaf::BatchPutKernelProfile& profile = profiles[core];
-      py::dict item;
-      item["core"] = core;
-      item["execute_cycles"] = profile.execute_cycles;
-      item["non_execute_cycles"] = profile.non_execute_cycles;
-      result.append(std::move(item));
-    }
-    return result;
-  }
-
-  py::list StopBatchPutKernelProfile() {
-    py::list result = BatchPutKernelProfileSnapshot();
-    ThrowIfError(native_->SetBatchPutKernelProfiling(false));
-    return result;
-  }
-  void StartBatchPutHostProfile() {
-    ThrowIfError(native_->SetBatchPutHostProfiling(true));
-  }
-
-  py::dict BatchPutHostProfileSnapshot() const {
-    kvaf::BatchPutHostProfile profile;
-    ThrowIfError(native_->CopyBatchPutHostProfile(&profile));
-    py::dict result;
-    result["row_count"] = profile.row_count;
-    result["payload_bytes"] = profile.payload_bytes;
-    result["metadata_bytes"] = profile.metadata_bytes;
-    result["request_validation_ns"] = profile.request_validation_ns;
-    result["prepare_put_ns"] = profile.prepare_put_ns;
-    result["metadata_reserve_ns"] = profile.metadata_reserve_ns;
-    result["metadata_pack_ns"] = profile.metadata_pack_ns;
-    result["metadata_h2d_ns"] = profile.metadata_h2d_ns;
-    result["local_buffer_acquire_ns"] = profile.local_buffer_acquire_ns;
-    result["execute_sync_ns"] = profile.execute_sync_ns;
-    result["local_buffer_release_ns"] = profile.local_buffer_release_ns;
-    result["commit_put_ns"] = profile.commit_put_ns;
-    result["runtime_non_execute_ns"] = profile.runtime_non_execute_ns;
-    result["runtime_e2e_ns"] = profile.runtime_e2e_ns;
-    return result;
-  }
-
-  py::dict StopBatchPutHostProfile() {
-    py::dict result = BatchPutHostProfileSnapshot();
-    ThrowIfError(native_->SetBatchPutHostProfiling(false));
-    return result;
-  }
   // Tensor ownership remains with Python. KVAF creates no output Tensor and
   // only retains its internal Direct-HCCP execution state; callers must keep
   // input/output Tensors and either the DeviceAccessTable or the direct
@@ -570,24 +516,6 @@ void BindNpuPythonRuntime(py::module_& module) {
            "Release the supplied keys from the Runtime metadata store. keys "
            "accepts a Python key sequence or a contiguous one-dimensional "
            "CPU torch.int64 Tensor.")
-      .def("start_batch_put_kernel_profile",
-           &NpuPythonRuntime::StartBatchPutKernelProfile,
-           "Enable the per-core BatchPut kernel timing summary.")
-      .def("batch_put_kernel_profile",
-           &NpuPythonRuntime::BatchPutKernelProfileSnapshot,
-           "Return the latest completed per-core BatchPut kernel timing summary.")
-      .def("stop_batch_put_kernel_profile",
-           &NpuPythonRuntime::StopBatchPutKernelProfile,
-           "Return the latest summary and disable BatchPut kernel profiling.")
-      .def("start_batch_put_host_profile",
-           &NpuPythonRuntime::StartBatchPutHostProfile,
-           "Enable BatchPut Runtime and host-side stage timing.")
-      .def("batch_put_host_profile",
-           &NpuPythonRuntime::BatchPutHostProfileSnapshot,
-           "Return the latest synchronous BatchPut host-side timeline.")
-      .def("stop_batch_put_host_profile",
-           &NpuPythonRuntime::StopBatchPutHostProfile,
-           "Return the latest host-side timeline and disable its timing.")
       .def("batch_get", &NpuPythonRuntime::BatchGet,
            py::arg("device_access_table"), py::arg("indices"), py::arg("offsets"),
            py::arg("mask"),

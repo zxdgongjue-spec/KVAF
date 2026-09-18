@@ -1,6 +1,5 @@
 #include "runtime.h"
 
-#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -13,15 +12,6 @@
 namespace kvaf {
 
 namespace {
-
-using HostClock = std::chrono::steady_clock;
-
-std::uint64_t ElapsedNs(HostClock::time_point begin,
-                        HostClock::time_point end) {
-  return static_cast<std::uint64_t>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin)
-          .count());
-}
 
 class HostDdrMemoryAllocator final : public DdrMemoryAllocator {
  public:
@@ -146,8 +136,6 @@ Status RuntimeCore::Shutdown() {
 
   initialized_ = false;
   remote_region_ = RemoteRegionDesc{};
-  batch_put_host_profiling_enabled_ = false;
-  last_batch_put_host_profile_ = BatchPutHostProfile{};
   return first_error;
 }
 
@@ -342,12 +330,6 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
-  const bool host_profiling = batch_put_host_profiling_enabled_;
-  BatchPutHostProfile host_profile{};
-  const HostClock::time_point runtime_begin =
-      host_profiling ? HostClock::now() : HostClock::time_point{};
-  const HostClock::time_point validation_begin =
-      host_profiling ? HostClock::now() : HostClock::time_point{};
   if (request.keys.empty() || request.input.data == nullptr ||
       request.input.bytes == 0 ||
       request.keys.size() != request.input_offsets.size() ||
@@ -365,22 +347,10 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
           "BatchPut input_offsets and lengths must describe bytes inside input");
     }
   }
-  if (host_profiling) {
-    host_profile.row_count = request.keys.size();
-    host_profile.payload_bytes = request.input.bytes;
-    host_profile.request_validation_ns =
-        ElapsedNs(validation_begin, HostClock::now());
-  }
-
   PutContext put_context;
   PutAccessDesc put_desc;
-  const HostClock::time_point prepare_begin =
-      host_profiling ? HostClock::now() : HostClock::time_point{};
   Status status = meta_manager_.PreparePut(request.keys, request.lengths,
                                            &put_context, &put_desc);
-  if (host_profiling) {
-    host_profile.prepare_put_ns = ElapsedNs(prepare_begin, HostClock::now());
-  }
   if (!status.ok()) {
     return status;
   }
@@ -391,65 +361,10 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
     (void)meta_manager_.AbortPut(put_context);
     return status;
   }
-  if (host_profiling) {
-    BatchPutHostProfile data_plane_profile{};
-    if (access_operator_.CopyBatchPutHostProfile(&data_plane_profile).ok()) {
-      host_profile.metadata_bytes = data_plane_profile.metadata_bytes;
-      host_profile.metadata_reserve_ns = data_plane_profile.metadata_reserve_ns;
-      host_profile.metadata_pack_ns = data_plane_profile.metadata_pack_ns;
-      host_profile.metadata_h2d_ns = data_plane_profile.metadata_h2d_ns;
-      host_profile.local_buffer_acquire_ns =
-          data_plane_profile.local_buffer_acquire_ns;
-      host_profile.execute_sync_ns = data_plane_profile.execute_sync_ns;
-      host_profile.local_buffer_release_ns =
-          data_plane_profile.local_buffer_release_ns;
-    }
-  }
-
-  const HostClock::time_point commit_begin =
-      host_profiling ? HostClock::now() : HostClock::time_point{};
   status = meta_manager_.CommitPut(put_context);
-  if (host_profiling) {
-    host_profile.commit_put_ns = ElapsedNs(commit_begin, HostClock::now());
-  }
   if (!status.ok()) {
     return status;
   }
-  if (host_profiling) {
-    host_profile.runtime_e2e_ns = ElapsedNs(runtime_begin, HostClock::now());
-    host_profile.runtime_non_execute_ns =
-        host_profile.runtime_e2e_ns >= host_profile.execute_sync_ns
-            ? host_profile.runtime_e2e_ns - host_profile.execute_sync_ns
-            : 0U;
-    last_batch_put_host_profile_ = host_profile;
-  }
-  return Status::OK();
-}
-
-Status RuntimeCore::SetBatchPutHostProfiling(bool enabled) {
-  if (!initialized_) {
-    return Status::NotInitialized("Runtime has not been initialized");
-  }
-  const Status status = access_operator_.SetBatchPutHostProfiling(enabled);
-  if (!status.ok()) {
-    return status;
-  }
-  batch_put_host_profiling_enabled_ = enabled;
-  last_batch_put_host_profile_ = BatchPutHostProfile{};
-  return Status::OK();
-}
-
-Status RuntimeCore::CopyBatchPutHostProfile(BatchPutHostProfile* profile) const {
-  if (profile == nullptr) {
-    return Status::InvalidArgument("BatchPut host profile output must not be null");
-  }
-  if (!initialized_) {
-    return Status::NotInitialized("Runtime has not been initialized");
-  }
-  if (!batch_put_host_profiling_enabled_) {
-    return Status::InvalidState("BatchPut host profiling is not enabled");
-  }
-  *profile = last_batch_put_host_profile_;
   return Status::OK();
 }
 

@@ -9,8 +9,6 @@
 
 namespace kvaf {
 
-struct BatchPutHostProfile;
-struct BatchPutKernelProfile;
 struct NpuRuntimeOptions {
   NpuRuntimeOptions(std::string kernel_object_path,
                     std::uint32_t token_bytes,
@@ -52,11 +50,6 @@ class NpuRuntime final : public Runtime {
   std::uint32_t batch_get_token_bytes() const;
   std::uint32_t batch_get_tokens_per_block() const;
 
-  Status SetBatchPutKernelProfiling(bool enabled);
-  Status CopyBatchPutKernelProfiles(
-      std::vector<BatchPutKernelProfile>* profiles) const;
-  Status SetBatchPutHostProfiling(bool enabled);
-  Status CopyBatchPutHostProfile(BatchPutHostProfile* profile) const;
   Status LinkTo(const LinkTarget& target) override;
   Status AcceptLink(const LinkTarget& peer) override;
   Status ReleaseLink(LinkId link_id) override;

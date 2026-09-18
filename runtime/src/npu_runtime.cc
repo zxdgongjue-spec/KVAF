@@ -23,7 +23,6 @@
 
 #include "batch_get_abi.h"
 #include "access_operator.h"
-#include "direct_hccp/direct_hccp_session.h"
 #include "peer_link.h"
 #include "meta_manager.h"
 
@@ -31,9 +30,6 @@ namespace kvaf {
 namespace {
 
 Status Internal(std::string message) { return Status::Internal(std::move(message)); }
-
-std::string EidToHex(
-    const std::array<std::uint8_t, peer::kEidBytes>& eid);
 
 class PeerDdrAllocator final : public DdrMemoryAllocator {
  public:
@@ -52,9 +48,6 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
     if (allocated_.base != 0U) return Status::InvalidState("peer DDR is already allocated");
     Status status = link_->AllocateRegion(request.ddr_bytes, request.slot_size, candidate_id_, &allocated_);
     if (!status.ok()) return status;
-    direct_hccp::VerboseLog(
-        "[KVAF_AIV] CPU_PEER_CANDIDATE_ALLOCATED id=%u raw_eid=%s\n",
-        candidate_id_, EidToHex(allocated_.eid).c_str());
     *region = RemoteRegionDesc{allocated_.base, allocated_.length, request.slot_size, DeviceKind::kCpu};
     return Status::OK();
   }
@@ -325,10 +318,10 @@ void AddNpuLocalEidCandidate(
     return;
   }
   candidates->push_back(NpuLocalEidCandidate{eid, std::move(source)});
-  direct_hccp::VerboseLog(
-      "[KVAF_AIV] PEER_LINK_NPU_EID_DISCOVERED physical_device=%u source=%s eid=%s\n",
-      physical_device_id, candidates->back().source.c_str(),
-      EidToHex(candidates->back().eid).c_str());
+  std::fprintf(stderr,
+               "[KVAF_AIV] PEER_LINK_NPU_EID_DISCOVERED physical_device=%u source=%s eid=%s\n",
+               physical_device_id, candidates->back().source.c_str(),
+               EidToHex(candidates->back().eid).c_str());
 }
 
 bool DiscoverNpuLocalEidCandidates(std::uint32_t logical_device_id,
@@ -483,44 +476,8 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   if (candidate_count == 0U) {
     return Status::NotFound("peer Runtime returned no UMDK/EID candidates");
   }
-  std::vector<std::uint32_t> peer_candidates;
-  peer_candidates.reserve(candidate_count);
-  bool candidate_info_supported = true;
-  for (std::uint32_t candidate_id = 0U; candidate_id < candidate_count;
-       ++candidate_id) {
-    peer::PeerCandidateInfo candidate{};
-    const Status candidate_info_status =
-        candidate_info_supported
-            ? impl_->peer_link->GetCandidateInfo(candidate_id, &candidate)
-            : Status::NotFound("candidate information is unavailable");
-    if (!candidate_info_status.ok() && candidate_info_supported) {
-      candidate_info_supported = false;
-      std::fprintf(stderr,
-                   "[KVAF_AIV] CPU_PEER_CANDIDATE_INFO_UNAVAILABLE "
-                   "fallback=candidate_id_only reason=%s\n",
-                   candidate_info_status.message().c_str());
-    }
-    const std::string physical_port =
-        !candidate_info_status.ok() ||
-                candidate.physical_port == peer::kUnknownPhysicalPort
-            ? "unknown"
-            : std::to_string(candidate.physical_port);
-    const std::string ub_device = candidate_info_status.ok()
-                                      ? candidate.ub_device
-                                      : "unknown";
-    const std::string eid_index = candidate_info_status.ok()
-                                      ? std::to_string(candidate.eid_index)
-                                      : "unknown";
-    const std::string raw_eid = candidate_info_status.ok()
-                                    ? EidToHex(candidate.eid)
-                                    : "unknown";
-    direct_hccp::VerboseLog(
-        "[KVAF_AIV] CPU_PEER_CANDIDATE_DISCOVERED id=%u/%u "
-        "ub_device=%s eid_index=%s physical_port=%s raw_eid=%s\n",
-        candidate_id, candidate_count, ub_device.c_str(), eid_index.c_str(),
-        physical_port.c_str(), raw_eid.c_str());
-    peer_candidates.push_back(candidate_id);
-  }
+  std::uint32_t first_peer_candidate = 0U;
+  std::uint32_t peer_candidate_end = candidate_count;
   if (impl_->options.has_cpu_peer_candidate) {
     if (impl_->options.cpu_peer_candidate >= candidate_count) {
       return Status::InvalidArgument(
@@ -529,15 +486,8 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
           " is out of range for " + std::to_string(candidate_count) +
           " discovered candidates");
     }
-    peer_candidates.assign(1U, impl_->options.cpu_peer_candidate);
-    direct_hccp::VerboseLog(
-        "[KVAF_AIV] CPU_PEER_CANDIDATE_SELECTION mode=explicit "
-        "candidate=%u candidate_count=%u\n",
-        impl_->options.cpu_peer_candidate, candidate_count);
-  } else {
-    direct_hccp::VerboseLog(
-        "[KVAF_AIV] CPU_PEER_CANDIDATE_SELECTION mode=auto candidate_count=%u\n",
-        candidate_count);
+    first_peer_candidate = impl_->options.cpu_peer_candidate;
+    peer_candidate_end = first_peer_candidate + 1U;
   }
   std::vector<NpuLocalEidCandidate> npu_candidates;
   std::string discovery_error;
@@ -545,7 +495,8 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                                      &discovery_error)) {
     return Status::NotFound(discovery_error);
   }
-  for (const std::uint32_t peer_candidate : peer_candidates) {
+  for (std::uint32_t peer_candidate = first_peer_candidate;
+       peer_candidate < peer_candidate_end; ++peer_candidate) {
     impl_->peer_allocator->SetCandidate(peer_candidate);
     for (std::size_t npu_index = 0; npu_index < npu_candidates.size(); ++npu_index) {
       const NpuLocalEidCandidate& candidate = npu_candidates[npu_index];
@@ -554,11 +505,11 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       impl_->ReleaseProbe();
       impl_->config.peer_local_eid = candidate.eid;
       impl_->CreateCore();
-      direct_hccp::VerboseLog(
-          "[KVAF_AIV] PEER_LINK_EID_PAIR_ATTEMPT peer_candidate=%u/%u npu_candidate=%zu/%zu "
-          "npu_source=%s npu_eid=%s\n",
-          peer_candidate, candidate_count, npu_index, npu_candidates.size(),
-          candidate.source.c_str(), EidToHex(candidate.eid).c_str());
+      std::fprintf(stderr,
+                   "[KVAF_AIV] PEER_LINK_EID_PAIR_ATTEMPT peer_candidate=%u/%u npu_candidate=%zu/%zu "
+                   "npu_source=%s npu_eid=%s\n",
+                   peer_candidate, candidate_count, npu_index, npu_candidates.size(), candidate.source.c_str(),
+                   EidToHex(candidate.eid).c_str());
       last = impl_->runtime_core->Initialize(request);
       if (last.ok()) {
         const std::uint64_t probe_bytes =
@@ -588,15 +539,6 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
             probe_offsets.push_back(row * probe_bytes);
             probe_lengths.push_back(probe_bytes);
           }
-          direct_hccp::VerboseLog(
-              "[KVAF_AIV] PEER_LINK_EID_PAIR_RMA_PROBE_BEGIN peer_candidate=%u/%u "
-              "npu_candidate=%zu npu_source=%s rows=%llu bytes_per_row=%llu "
-              "source_bytes=%llu cores=%u jettys_per_core=%u\n",
-              peer_candidate, candidate_count, npu_index, candidate.source.c_str(),
-              static_cast<unsigned long long>(probe_rows),
-              static_cast<unsigned long long>(probe_bytes),
-              static_cast<unsigned long long>(probe_total_bytes),
-              impl_->options.npu_core_count, impl_->options.jettys_per_core);
           last = impl_->runtime_core->BatchPut(
               BatchPutRequest{probe_keys,
                               ConstBufferView{impl_->probe_buffer,
@@ -607,25 +549,16 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
           if (last.ok()) {
             last = impl_->runtime_core->BatchFree(BatchFreeRequest{probe_keys});
           }
-          if (last.ok()) {
-            direct_hccp::VerboseLog(
-                "[KVAF_AIV] PEER_LINK_EID_PAIR_RMA_PROBE_READY peer_candidate=%u/%u "
-                "npu_candidate=%zu npu_source=%s rows=%llu source_bytes=%llu\n",
-                peer_candidate, candidate_count, npu_index, candidate.source.c_str(),
-                static_cast<unsigned long long>(probe_rows),
-                static_cast<unsigned long long>(probe_total_bytes));
-          }
         }
         if (stream != nullptr && aclrtDestroyStream(stream) != ACL_SUCCESS && last.ok()) {
           last = Internal("failed to destroy peer candidate probe stream");
         }
       }
       if (last.ok()) {
-        direct_hccp::VerboseLog(
-            "[KVAF_AIV] PEER_LINK_EID_PAIR_SELECTED peer_candidate=%u/%u npu_candidate=%zu/%zu "
-            "npu_source=%s validation=aiv_write_cq_all_lanes\n",
-            peer_candidate, candidate_count, npu_index, npu_candidates.size(),
-            candidate.source.c_str());
+        std::fprintf(stderr,
+                     "[KVAF_AIV] PEER_LINK_EID_PAIR_SELECTED peer_candidate=%u/%u npu_candidate=%zu/%zu "
+                     "npu_source=%s validation=aiv_write_cq\n",
+                     peer_candidate, candidate_count, npu_index, npu_candidates.size(), candidate.source.c_str());
         return Status::OK();
       }
       std::fprintf(stderr,
@@ -667,40 +600,6 @@ std::uint32_t NpuRuntime::batch_get_token_bytes() const {
 }
 std::uint32_t NpuRuntime::batch_get_tokens_per_block() const {
   return impl_->options.batch_get_tokens_per_block;
-}
-
-Status NpuRuntime::SetBatchPutKernelProfiling(bool enabled) {
-  if (impl_->access_operator == nullptr) {
-    return Status::NotInitialized(
-        "NpuRuntime requires LinkTo before configuring BatchPut profiling");
-  }
-  return impl_->access_operator->SetBatchPutKernelProfiling(enabled);
-}
-
-Status NpuRuntime::CopyBatchPutKernelProfiles(
-    std::vector<BatchPutKernelProfile>* profiles) const {
-  if (impl_->access_operator == nullptr) {
-    return Status::NotInitialized(
-        "NpuRuntime requires LinkTo before reading BatchPut profiling");
-  }
-  return impl_->access_operator->CopyBatchPutKernelProfiles(profiles);
-}
-
-Status NpuRuntime::SetBatchPutHostProfiling(bool enabled) {
-  if (impl_->runtime_core == nullptr) {
-    return Status::NotInitialized(
-        "NpuRuntime requires LinkTo before configuring BatchPut host profiling");
-  }
-  return impl_->runtime_core->SetBatchPutHostProfiling(enabled);
-}
-
-Status NpuRuntime::CopyBatchPutHostProfile(
-    BatchPutHostProfile* profile) const {
-  if (impl_->runtime_core == nullptr) {
-    return Status::NotInitialized(
-        "NpuRuntime requires LinkTo before reading BatchPut host profiling");
-  }
-  return impl_->runtime_core->CopyBatchPutHostProfile(profile);
 }
 
 Status NpuRuntime::AcceptLink(const LinkTarget&) {

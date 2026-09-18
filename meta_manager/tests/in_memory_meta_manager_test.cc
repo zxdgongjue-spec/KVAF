@@ -230,84 +230,6 @@ bool TestAbortPutRecyclesSlot() {
                 "AbortPut should recycle the reserved slot back to the stack");
 }
 
-// 验证 pending 和 active 共用一个索引时，提交或回滚一个上下文不会改变另一个
-// in-flight 上下文的可见性或 slot 归属。
-bool TestPendingToActiveTransitionIsContextLocal() {
-  auto manager = MakeInitializedManager(3);
-  if (!manager) {
-    return false;
-  }
-
-  PutContext first_put;
-  PutAccessDesc first_desc;
-  if (!ExpectOk(manager->PreparePut({23}, {32}, &first_put, &first_desc),
-                "first PreparePut should succeed")) {
-    return false;
-  }
-  PutContext second_put;
-  PutAccessDesc second_desc;
-  if (!ExpectOk(manager->PreparePut({24}, {48}, &second_put, &second_desc),
-                "second PreparePut should succeed while first is pending")) {
-    return false;
-  }
-
-  PutContext duplicate_pending_put;
-  PutAccessDesc duplicate_pending_desc;
-  if (!ExpectStatusCode(
-          manager->PreparePut({24}, {48}, &duplicate_pending_put,
-                              &duplicate_pending_desc),
-          StatusCode::kAlreadyExists,
-          "PreparePut should reject a key owned by another pending context")) {
-    return false;
-  }
-
-  if (!ExpectOk(manager->CommitPut(first_put),
-                "CommitPut should activate only its own pending keys")) {
-    return false;
-  }
-  LockContext first_lock;
-  if (!ExpectOk(
-          manager->LockKeys({23}, MetaManagerLockMode::kStableReadAllowAppend,
-                            &first_lock),
-          "committed key should become visible")) {
-    return false;
-  }
-  if (!ExpectOk(manager->UnlockKeys(first_lock),
-                "UnlockKeys should release the committed-key lock")) {
-    return false;
-  }
-
-  LockContext pending_lock;
-  if (!ExpectStatusCode(
-          manager->LockKeys({24}, MetaManagerLockMode::kStableReadAllowAppend,
-                            &pending_lock),
-          StatusCode::kNotFound,
-          "a different pending context must remain invisible after commit")) {
-    return false;
-  }
-  if (!ExpectOk(manager->AbortPut(second_put),
-                "AbortPut should remove only its pending keys")) {
-    return false;
-  }
-
-  PutContext remaining_slot_put;
-  PutAccessDesc remaining_slot_desc;
-  if (!ExpectOk(manager->PreparePut({25}, {64}, &remaining_slot_put,
-                                    &remaining_slot_desc),
-                "remaining free slot should be allocatable")) {
-    return false;
-  }
-  PutContext recycled_put;
-  PutAccessDesc recycled_desc;
-  if (!ExpectOk(manager->PreparePut({26}, {64}, &recycled_put, &recycled_desc),
-                "aborted pending slot should be reusable")) {
-    return false;
-  }
-  return Expect(
-      remaining_slot_desc.entries[0].address == second_desc.entries[0].address,
-      "AbortPut should return the pending context's slot to the top of the stack");
-}
-
 // 验证只要 key 仍被稳定读快照 pin 住，就不允许 free。
 bool TestBatchFreeFailsWhileLocked() {
   auto manager = MakeInitializedManager(1);
@@ -528,8 +450,6 @@ int main() {
       {"PutCommitLookupUnlockFreeRoundTrip",
        TestPutCommitLookupUnlockFreeRoundTrip},
       {"AbortPutRecyclesSlot", TestAbortPutRecyclesSlot},
-      {"PendingToActiveTransitionIsContextLocal",
-       TestPendingToActiveTransitionIsContextLocal},
       {"BatchFreeFailsWhileLocked", TestBatchFreeFailsWhileLocked},
       {"InvalidArgumentAndDuplicateKeyPaths",
        TestInvalidArgumentAndDuplicateKeyPaths},

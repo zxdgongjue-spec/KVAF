@@ -37,7 +37,6 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
   target_link_libraries(kvaf_npu_runtime
     PUBLIC kvaf_runtime
     PRIVATE kvaf_peer_link kvaf_default_access_operator
-            kvaf_direct_hccp_session
             kvaf_execute_batch_get_host ascendcl ${CMAKE_DL_LIBS})
   if(KVAF_ENABLE_AIV_BATCH_PUT)
     target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_execute_batch_put_host)

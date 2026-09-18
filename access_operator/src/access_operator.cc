@@ -1,7 +1,6 @@
 #include "access_operator.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -13,7 +12,6 @@
 
 #include "acl/acl.h"
 #include "batch_get_abi.h"
-#include "direct_hccp/direct_hccp_session.h"
 #include "kvaf_aiv_batch_get.h"
 #include "meta_manager.h"
 
@@ -24,15 +22,6 @@
 
 namespace kvaf {
 namespace {
-
-using HostClock = std::chrono::steady_clock;
-
-std::uint64_t ElapsedNs(HostClock::time_point begin,
-                        HostClock::time_point end) {
-  return static_cast<std::uint64_t>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin)
-          .count());
-}
 
 Status InvalidArgument(std::string message) {
   return Status::InvalidArgument(std::move(message));
@@ -66,9 +55,6 @@ struct BatchPutExecutionState {
   std::size_t host_metadata_capacity{0};
   KvafBatchPutCoreStatus* host_core_status{nullptr};
   std::size_t host_core_status_count{0};
-  bool profiling_enabled{false};
-  bool host_profiling_enabled{false};
-  BatchPutHostProfile last_host_profile{};
 };
 
 void ReleaseBatchPutExecutionState(BatchPutExecutionState* execution) {
@@ -538,27 +524,13 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
     }
     BatchPutExecutionState& execution = impl_->batch_put_execution;
     const std::size_t rows = exec.request->keys.size();
-    const bool host_profiling = execution.host_profiling_enabled;
-    BatchPutHostProfile host_profile{};
-    if (host_profiling) {
-      host_profile.row_count = rows;
-      host_profile.payload_bytes = exec.request->input.bytes;
-    }
     if (!FitsU32(rows)) {
       return InvalidArgument("BatchPut row count exceeds the device ABI");
     }
-    const HostClock::time_point metadata_reserve_begin =
-        host_profiling ? HostClock::now() : HostClock::time_point{};
     Status status = EnsureBatchPutMetadataCapacity(rows, &execution);
-    if (host_profiling) {
-      host_profile.metadata_reserve_ns =
-          ElapsedNs(metadata_reserve_begin, HostClock::now());
-    }
     if (!status.ok()) {
       return status;
     }
-    const HostClock::time_point metadata_pack_begin =
-        host_profiling ? HostClock::now() : HostClock::time_point{};
     std::uint64_t* const host_offsets =
         static_cast<std::uint64_t*>(execution.host_metadata);
     std::uint64_t* const host_lengths = host_offsets + rows;
@@ -570,28 +542,15 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
     for (std::size_t index = 0; index < rows; ++index) {
       host_destinations[index] = exec.put_desc->entries[index].address;
     }
-    if (host_profiling) {
-      host_profile.metadata_pack_ns =
-          ElapsedNs(metadata_pack_begin, HostClock::now());
-    }
 
     const std::size_t metadata_bytes = rows * 3U * sizeof(std::uint64_t);
-    if (host_profiling) {
-      host_profile.metadata_bytes = metadata_bytes;
-    }
 
     KvafBatchPutLocalBuffer* local_buffer = nullptr;
-    const HostClock::time_point local_buffer_acquire_begin =
-        host_profiling ? HostClock::now() : HostClock::time_point{};
     if (KvafBatchPutLocalBufferAcquire(
             impl_->batch_put_transport, const_cast<void*>(exec.request->input.data),
             exec.request->input.bytes, &local_buffer) != KVAF_BATCH_PUT_SUCCESS ||
         local_buffer == nullptr) {
       return Internal("failed to acquire caller input for BatchPut");
-    }
-    if (host_profiling) {
-      host_profile.local_buffer_acquire_ns =
-          ElapsedNs(local_buffer_acquire_begin, HostClock::now());
     }
 
     const aclrtStream stream = static_cast<aclrtStream>(exec.execution.stream);
@@ -612,54 +571,26 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
     std::memset(execution.host_core_status, 0,
                 execution.host_core_status_count *
                     sizeof(KvafBatchPutCoreStatus));
-    for (std::size_t core = 0; core < execution.host_core_status_count;
-         ++core) {
-      KvafBatchPutCoreStatus& core_status = execution.host_core_status[core];
-      if (execution.profiling_enabled) {
-        core_status.profile.magic = KVAF_AIV_BATCH_PUT_PROFILE_MAGIC;
-      }
-    }
-    const HostClock::time_point metadata_h2d_begin =
-        host_profiling ? HostClock::now() : HostClock::time_point{};
     if (aclrtMemcpyAsync(execution.metadata, metadata_bytes,
                          execution.host_metadata, metadata_bytes,
                          ACL_MEMCPY_HOST_TO_DEVICE, stream) != ACL_SUCCESS) {
       KvafBatchPutLocalBufferRelease(local_buffer);
       return Internal("failed to enqueue BatchPut metadata upload to NPU");
     }
-    if (host_profiling) {
-      host_profile.metadata_h2d_ns =
-          ElapsedNs(metadata_h2d_begin, HostClock::now());
-    }
 
-    const HostClock::time_point execute_sync_begin =
-        host_profiling ? HostClock::now() : HostClock::time_point{};
     const int32_t result = KvafExecuteBatchPutSync(
         local_buffer, &arguments, stream, execution.host_core_status,
         static_cast<std::uint32_t>(execution.host_core_status_count));
-    if (host_profiling) {
-      host_profile.execute_sync_ns =
-          ElapsedNs(execute_sync_begin, HostClock::now());
-    }
     if (result != KVAF_BATCH_PUT_SUCCESS) {
       // The metadata upload may have been accepted even when launch or status
       // setup subsequently failed. Do not reuse its pinned source buffer until
       // the stream has stopped reading it.
       (void)aclrtSynchronizeStream(stream);
     }
-    const HostClock::time_point local_buffer_release_begin =
-        host_profiling ? HostClock::now() : HostClock::time_point{};
     KvafBatchPutLocalBufferRelease(local_buffer);
-    if (host_profiling) {
-      host_profile.local_buffer_release_ns =
-          ElapsedNs(local_buffer_release_begin, HostClock::now());
-    }
     if (result != KVAF_BATCH_PUT_SUCCESS) {
       LogBatchPutDeviceStatus(execution, impl_->config.npu_core_count, result);
       return Internal("AIV Direct-HCCP BatchPut execution failed");
-    }
-    if (host_profiling) {
-      execution.last_host_profile = host_profile;
     }
     return Status::OK();
   }
@@ -704,94 +635,6 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
     first = next;
   }
   return Status::OK();
-}
-
-Status DefaultAccessOperator::SetBatchPutKernelProfiling(bool enabled) {
-#if defined(KVAF_ENABLE_AIV_BATCH_PUT)
-  if (!impl_->initialized || impl_->batch_put_transport == nullptr) {
-    return Status::Error(StatusCode::kNotInitialized,
-                         "BatchPut transport has not been initialized");
-  }
-  impl_->batch_put_execution.profiling_enabled = enabled;
-  return Status::OK();
-#else
-  (void)enabled;
-  return InvalidState("BatchPut kernel profiling is not available in this build");
-#endif
-}
-
-Status DefaultAccessOperator::SetBatchPutHostProfiling(bool enabled) {
-#if defined(KVAF_ENABLE_AIV_BATCH_PUT)
-  if (!impl_->initialized || impl_->batch_put_transport == nullptr) {
-    return Status::Error(StatusCode::kNotInitialized,
-                         "BatchPut transport has not been initialized");
-  }
-  impl_->batch_put_execution.host_profiling_enabled = enabled;
-  impl_->batch_put_execution.last_host_profile = BatchPutHostProfile{};
-  return Status::OK();
-#else
-  (void)enabled;
-  return InvalidState("BatchPut host profiling is not available in this build");
-#endif
-}
-
-Status DefaultAccessOperator::CopyBatchPutHostProfile(
-    BatchPutHostProfile* profile) const {
-  if (profile == nullptr) {
-    return InvalidArgument("BatchPut host profile output must not be null");
-  }
-#if defined(KVAF_ENABLE_AIV_BATCH_PUT)
-  if (!impl_->initialized || impl_->batch_put_transport == nullptr) {
-    return Status::Error(StatusCode::kNotInitialized,
-                         "BatchPut transport has not been initialized");
-  }
-  if (!impl_->batch_put_execution.host_profiling_enabled) {
-    return InvalidState("BatchPut host profiling is not enabled");
-  }
-  *profile = impl_->batch_put_execution.last_host_profile;
-  return Status::OK();
-#else
-  return InvalidState("BatchPut host profiling is not available in this build");
-#endif
-}
-
-Status DefaultAccessOperator::CopyBatchPutKernelProfiles(
-    std::vector<BatchPutKernelProfile>* profiles) const {
-  if (profiles == nullptr) {
-    return InvalidArgument("BatchPut kernel profile output must not be null");
-  }
-#if defined(KVAF_ENABLE_AIV_BATCH_PUT)
-  if (!impl_->initialized || impl_->batch_put_transport == nullptr) {
-    return Status::Error(StatusCode::kNotInitialized,
-                         "BatchPut transport has not been initialized");
-  }
-  const BatchPutExecutionState& execution = impl_->batch_put_execution;
-  const KvafBatchPutCoreStatus* statuses = execution.host_core_status;
-  const std::size_t status_count = execution.host_core_status_count;
-  if (statuses == nullptr || status_count == 0U) {
-    return Internal("BatchPut host core status buffer is not initialized");
-  }
-  profiles->clear();
-  profiles->reserve(status_count);
-  for (std::size_t core = 0; core < status_count; ++core) {
-    const KvafBatchPutCoreStatus& status = statuses[core];
-    const KvafBatchPutCoreProfile& source = status.profile;
-    if (status.magic != KVAF_AIV_BATCH_PUT_STATUS_MAGIC ||
-        status.result != KVAF_BATCH_PUT_CORE_SUCCESS ||
-        source.magic != KVAF_AIV_BATCH_PUT_PROFILE_MAGIC) {
-      profiles->clear();
-      return Internal("BatchPut kernel returned an invalid profile summary");
-    }
-    BatchPutKernelProfile destination;
-    destination.execute_cycles = source.execute_cycles;
-    destination.non_execute_cycles = source.non_execute_cycles;
-    profiles->push_back(destination);
-  }
-  return Status::OK();
-#else
-  profiles->clear();
-  return InvalidState("BatchPut kernel profiling is not available in this build");
-#endif
 }
 
 }  // namespace kvaf

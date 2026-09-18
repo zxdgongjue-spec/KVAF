@@ -10,8 +10,6 @@ enum {
 };
 
 static const uint64_t KVAF_AIV_BATCH_PUT_STATUS_MAGIC = 0x4b5641464250444fULL;
-static const uint64_t KVAF_AIV_BATCH_PUT_PROFILE_MAGIC =
-    0x4b56414650524f46ULL;  // "KVAFPROF"
 
 enum KvafBatchPutCoreResult {
   KVAF_BATCH_PUT_CORE_SUCCESS = 0,
@@ -26,19 +24,6 @@ enum KvafBatchPutCoreResult {
   KVAF_BATCH_PUT_CORE_INVALID_LENGTH = 9,
 };
 
-// Optional, per-core kernel timing summary. `execute_cycles` covers the
-// Direct-HCCP data path from post preparation through CQ completion;
-// `non_execute_cycles` covers the remaining kernel setup and finalization.
-// The host enables collection by placing KVAF_AIV_BATCH_PUT_PROFILE_MAGIC in
-// `magic` before launch. GetSystemCycle frequency is platform-specific and
-// supplied by the benchmark at reporting time.
-typedef struct KvafBatchPutCoreProfile {
-  uint64_t magic;
-  uint64_t execute_cycles;
-  uint64_t non_execute_cycles;
-  uint64_t reserved[35];
-} KvafBatchPutCoreProfile;
-
 typedef struct KvafBatchPutCoreStatus {
   uint64_t magic;
   uint64_t processed_request_count;
@@ -50,7 +35,7 @@ typedef struct KvafBatchPutCoreStatus {
   uint64_t last_wqe_protocol;
   uint64_t cq_status;
   uint64_t cq_sub_status;
-  KvafBatchPutCoreProfile profile;
+  uint64_t reserved[38];
 } KvafBatchPutCoreStatus;
 
 // Runtime-facing eager BatchPut V1 ABI. All pointer fields are device
@@ -69,8 +54,6 @@ typedef struct KvafExecuteBatchPutKernelArgs {
 #if defined(__cplusplus)
 static_assert(sizeof(KvafBatchPutCoreStatus) == KVAF_AIV_BATCH_PUT_STATUS_BYTES,
               "KvafBatchPutCoreStatus ABI changed");
-static_assert(sizeof(KvafBatchPutCoreProfile) == 304,
-              "KvafBatchPutCoreProfile ABI changed");
 static_assert(sizeof(KvafExecuteBatchPutKernelArgs) == 56,
               "KvafExecuteBatchPutKernelArgs ABI changed");
 #endif

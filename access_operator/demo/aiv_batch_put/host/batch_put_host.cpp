@@ -58,7 +58,6 @@ struct KvafBatchPutLocalBuffer {
 struct KvafBatchPutTransport {
   DirectHccpApi api{};
   hccp::DirectHccpSession *session = nullptr;
-  hccp::LocalEidIdentity local_identity{};
   uint32_t physical_device_id = 0;
   uint32_t aiv_core_count = 0U;
   uint32_t jettys_per_core = 0U;
@@ -104,14 +103,13 @@ std::array<uint8_t, hccp::kEidBytes> ReverseEidForAivWqe(
 }
 
 bool InitContext(const DirectHccpApi &api, int32_t mode, uint32_t physical_device_id,
-                 uint32_t eid_index,
                  const std::array<uint8_t, hccp::kEidBytes> &eid,
                  const char *role, void **context) {
   hccp::CtxInitCfg cfg{};
   cfg.mode = mode;
   hccp::CtxInitAttr attr{};
   attr.phy_id = physical_device_id;
-  attr.ub.eid_index = eid_index;
+  attr.ub.eid_index = 0U;
   std::memcpy(attr.ub.eid.raw, eid.data(), eid.size());
   const int ret = api.ctx_init(&cfg, &attr, context);
   if (ret != 0 || *context == nullptr) {
@@ -120,9 +118,8 @@ bool InitContext(const DirectHccpApi &api, int32_t mode, uint32_t physical_devic
     return false;
   }
   hccp::VerboseLog(
-      "[KVAF_AIV] DIRECT_HCCP_CONTEXT_READY role=%s mode=%d physical=%u "
-      "context_eid_index=%u context=%p\n",
-      role, mode, physical_device_id, eid_index, *context);
+      "[KVAF_AIV] DIRECT_HCCP_CONTEXT_READY role=%s mode=%d physical=%u context=%p\n",
+      role, mode, physical_device_id, *context);
   return true;
 }
 
@@ -356,46 +353,12 @@ int32_t CreateBatchPutTransport(void *host_ddr, uint64_t host_ddr_bytes,
   }
   state->wqe_remote_eid = ReverseEidForAivWqe(peer_eid);
   if (!hccp::LoadDirectHccp(&state->api)) goto failed;
-  if (!hccp::AcquireDirectHccpSession(physical_device_id, kPidHdcType,
-                                      &state->session)) {
+  if (!hccp::AcquireDirectHccpSession(physical_device_id, kPidHdcType, &state->session) ||
+      !InitContext(state->api, hccp::kOfflineHdc, physical_device_id, device_eid, "device_aiv",
+                   &state->device_context) ||
+      !AllocateToken(state->api, state->device_context, "device_transport",
+                     &state->device_transport_token_handle, &device_transport_token_id)) {
     goto failed;
-  }
-  // Resolve the selected single local EID after RA bootstrap so the Context
-  // uses the provider's matching EID index.
-  (void)hccp::ResolveLocalEidIdentity(
-      state->api, physical_device_id, device_eid, &state->local_identity);
-  {
-    const std::string udma_device = state->local_identity.udma_device.empty()
-                                        ? "unknown"
-                                        : state->local_identity.udma_device;
-    const std::string physical_port =
-        state->local_identity.physical_port == hccp::kUnknownPhysicalPort
-            ? "unknown"
-            : std::to_string(state->local_identity.physical_port);
-    const std::string eid_index_text =
-        state->local_identity.eid_index == hccp::kUnknownEidIndex
-            ? "unknown"
-            : std::to_string(state->local_identity.eid_index);
-    const uint32_t context_eid_index =
-        state->local_identity.eid_index == hccp::kUnknownEidIndex
-            ? 0U
-            : state->local_identity.eid_index;
-    hccp::VerboseLog(
-        "[KVAF_AIV] PEER_LINK_PATH_IDENTITY path=0 eid_index=%s "
-        "udma_device=%s physical_port=%s die_id=%u chip_id=%u func_id=%u "
-        "dev_feature=0x%x raw_eid=%s source=ra_dev_eid_pair_info\n",
-        eid_index_text.c_str(), udma_device.c_str(), physical_port.c_str(),
-        state->local_identity.die_id, state->local_identity.chip_id,
-        state->local_identity.func_id, state->local_identity.dev_feature,
-        EidToHex(device_eid).c_str());
-    if (!InitContext(state->api, hccp::kOfflineHdc, physical_device_id,
-                     context_eid_index, device_eid, "device_aiv",
-                     &state->device_context) ||
-        !AllocateToken(state->api, state->device_context, "device_transport",
-                       &state->device_transport_token_handle,
-                       &device_transport_token_id)) {
-      goto failed;
-    }
   }
   state->device_transport_token_value = state->peer_memory.token_value;
   if (!ImportRemoteMemory(state->api, state->device_context, state->peer_memory,
@@ -604,23 +567,12 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
   KvafBatchPutTransport *transport = local_buffer->transport;
   std::lock_guard<std::mutex> launch_lock(transport->launch_mutex);
   const uint64_t status_bytes = static_cast<uint64_t>(core_status_count) * sizeof(*core_status);
-  bool profiling_enabled = false;
-  for (uint32_t core = 0U; core < core_status_count; ++core) {
-    profiling_enabled =
-        profiling_enabled ||
-        core_status[core].profile.magic == KVAF_AIV_BATCH_PUT_PROFILE_MAGIC;
-  }
   // Status initialization and the kernel are ordered on one stream, so the
   // host need not block before the launch. core_status is a persistent pinned
   // host buffer and remains valid until the final stream synchronization.
-  const aclError seed_result = profiling_enabled
-                                   ? aclrtMemcpyAsync(
-                                         reinterpret_cast<void *>(arguments->core_status),
-                                         status_bytes, core_status, status_bytes,
-                                         ACL_MEMCPY_HOST_TO_DEVICE, stream)
-                                   : aclrtMemsetAsync(
-                                         reinterpret_cast<void *>(arguments->core_status),
-                                         status_bytes, 0, status_bytes, stream);
+  const aclError seed_result = aclrtMemsetAsync(
+      reinterpret_cast<void *>(arguments->core_status), status_bytes, 0,
+      status_bytes, stream);
   if (seed_result != ACL_SUCCESS) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=seed_status acl=%d\n",
                  static_cast<int>(seed_result));
