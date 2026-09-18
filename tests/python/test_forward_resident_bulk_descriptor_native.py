@@ -361,7 +361,10 @@ void dense_preflight() {
   ValidateDenseBatchGetDescriptors(addresses.data(),valid.data(),indices.data(),offsets.data(),
     outputs.data(),n,256,256,656,&entity,&code,&failed);
   assert(code==expected && failed==request && AscendC::event_state==0);
-  for(uint32_t i=8;i<4096;++i) assert(ub[i]==0xa7);
+  for(uint32_t i=8;i<64;++i) assert(ub[i]==0xa7);
+  for(uint32_t i=64+256*4;i<4096;++i) assert(ub[i]==0xa7);
+  if(code==kSuccess) for(uint32_t i=0;i<n;++i)
+    assert(reinterpret_cast<int32_t*>(ub.data()+64)[i]==outputs[i]);
  };
  for(uint32_t n: {0U,1U,31U,32U,33U,64U,255U,256U}) {reset();check(n,kSuccess,UINT64_MAX);}
  for(uint32_t position: {0U,1U,31U,32U,127U,255U}) for(uint32_t fault=0;fault<9;++fault) {
@@ -430,6 +433,7 @@ class ForwardResidentBulkDescriptorNativeTest(unittest.TestCase):
             + '"\n'
             + "using namespace AscendC;\n"
             + "constexpr uint32_t kSuccess=0,kInvalidLookup=4,kInvalidOutput=8;\n"
+            + "constexpr uint32_t kDenseRequestCapacity=256;\n"
             + "constexpr uint32_t kTransferBytes=KVAF_AIV_BATCH_GET_WQE_DATA_BYTES;\n"
             + "constexpr uint32_t kAddressTableEntryBytes=KVAF_AIV_BATCH_GET_ADDRESS_TABLE_ENTRY_BYTES;\n"
             + "\n".join(functions)
