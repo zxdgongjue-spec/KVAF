@@ -5,11 +5,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <random>
 #include <string>
 #include <sys/mman.h>
 #include <unordered_set>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -253,6 +255,19 @@ int main(int argc, char** argv) {
     Usage(argv[0]);
     return argc > 1 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h") ? 0 : 2;
   }
+  // OpenMP may read its policy before main; re-exec so ACTIVE takes effect.
+  const char* wait_policy = std::getenv("OMP_WAIT_POLICY");
+  if (wait_policy == nullptr || std::strcmp(wait_policy, "ACTIVE") != 0) {
+    if (setenv("OMP_WAIT_POLICY", "ACTIVE", 1) == 0) {
+#if defined(__linux__)
+      execv("/proc/self/exe", argv);
+#else
+      execvp(argv[0], argv);
+#endif
+    }
+    std::perror("[HBM_TEST][CPU] FAILED stage=omp_active_startup");
+    return 1;
+  }
   const std::uint64_t total_bytes = static_cast<std::uint64_t>(options.blocks) * options.block_bytes;
   const std::uint64_t host_space_bytes =
       options.host_space_bytes == 0U ? total_bytes : options.host_space_bytes;
@@ -270,7 +285,7 @@ int main(int argc, char** argv) {
                "host_address_space_bytes=%llu "
                "iterations=%zu warmup=%zu "
                "remote_device=%u jettys=%u window_bytes=%llu "
-               "stream_depth=%u cq_mod=%u\n",
+               "stream_depth=%u cq_mod=%u omp_wait_policy=ACTIVE\n",
                options.peer.c_str(), options.blocks, options.block_bytes,
                static_cast<unsigned long long>(total_bytes),
                static_cast<unsigned long long>(host_space_bytes), options.iterations,
