@@ -93,6 +93,7 @@ done
 
 selected_ub_device=""
 adaptive_selection_skipped=false
+selection_log="$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR/ub_device_selection.log"
 sweep_options=()
 if ((${#base_options[@]} > 0)); then
   sweep_options=("${base_options[@]}")
@@ -181,6 +182,11 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
           if [[ "$adaptive_this_shape" == true ]]; then
             selected_ub_device="$active_ub_device"
             sweep_options=("${base_options[@]}" --peer-ub-device "$selected_ub_device")
+            awk '$1 == "[KVAF_AIV]" &&
+                 ($2 == "UB_DEVICE_PROBE_PLAN" ||
+                  $2 == "UB_DEVICE_PROBE_RESULT" ||
+                  $2 == "UB_DEVICE_SELECTED")' "$log_file" >"$selection_log"
+            echo "BATCH_GET_UB_DEVICE_SELECTION_LOG_WRITTEN path=$selection_log"
           fi
         elif [[ "$adaptive_this_shape" == true ]] &&
           awk '$1 == "[KVAF_AIV]" && $2 == "UB_DEVICE_ADAPTIVE_SKIPPED" { found = 1 }
