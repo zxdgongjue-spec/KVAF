@@ -141,6 +141,9 @@ struct Stats {
   std::uint64_t prepare_ns{0};
   std::uint64_t post_ns{0};
   std::uint64_t poll_ns{0};
+  std::uint64_t setup_ns{0};
+  std::uint64_t dispatch_ns{0};
+  std::uint64_t total_ns{0};
   std::uint64_t phase_samples{0};
 };
 
@@ -196,6 +199,9 @@ bool RunBatchPass(kvaf::CpuUrmaTransport* transport, bool write,
     stats->prepare_ns += timing.prepare_ns;
     stats->post_ns += timing.post_ns;
     stats->poll_ns += timing.poll_ns;
+    stats->setup_ns += timing.setup_ns;
+    stats->dispatch_ns += timing.dispatch_ns;
+    stats->total_ns += timing.total_ns;
     ++stats->phase_samples;
   }
   stats->wall_ns = static_cast<std::uint64_t>(
@@ -204,7 +210,7 @@ bool RunBatchPass(kvaf::CpuUrmaTransport* transport, bool write,
   return true;
 }
 
-void PrintStats(const char* name, const Stats& stats) {
+void PrintStats(const char* name, const Stats& stats, bool streaming) {
   const double bandwidth = stats.wall_ns == 0
       ? 0.0 : stats.bytes * 1e9 / stats.wall_ns / (1024.0 * 1024.0);
   const double average = stats.batches == 0 ? 0.0 : stats.sum_ns / static_cast<double>(stats.batches);
@@ -222,6 +228,20 @@ void PrintStats(const char* name, const Stats& stats) {
                 name, stats.prepare_ns / samples / 1000.0,
                 stats.post_ns / samples / 1000.0,
                 stats.poll_ns / samples / 1000.0);
+    // Streaming dispatch already includes CQ polling; do not count it twice.
+    const auto poll_wait_ns = streaming ? 0U : stats.poll_ns;
+    const auto covered_ns = stats.setup_ns + stats.dispatch_ns + poll_wait_ns;
+    const auto other_ns = stats.total_ns > covered_ns
+        ? stats.total_ns - covered_ns : 0U;
+    std::printf("[HBM_TEST][CPU] %-5s_WALL avg_setup=%.3f us "
+                "%s=%.3f us avg_poll_wait=%.3f us avg_other=%.3f us "
+                "avg_total=%.3f us\n",
+                name, stats.setup_ns / samples / 1000.0,
+                streaming ? "avg_stream_wall" : "avg_submit_wall",
+                stats.dispatch_ns / samples / 1000.0,
+                poll_wait_ns / samples / 1000.0,
+                other_ns / samples / 1000.0,
+                stats.total_ns / samples / 1000.0);
   }
 }
 
@@ -374,8 +394,8 @@ int main(int argc, char** argv) {
                                       blocks[i].data + options.block_bytes,
                                       expected[i].begin());
   }
-  PrintStats("WRITE", write_stats);
-  PrintStats("READ", read_stats);
+  PrintStats("WRITE", write_stats, options.stream_depth != 0U);
+  PrintStats("READ", read_stats, options.stream_depth != 0U);
   std::printf("[HBM_TEST][CPU] %s blocks=%zu block_bytes=%zu seed=%llu\n",
               verified ? "PASS" : "FAIL", options.blocks, options.block_bytes,
               static_cast<unsigned long long>(options.seed));

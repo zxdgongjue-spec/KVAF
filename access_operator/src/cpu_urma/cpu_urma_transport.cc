@@ -757,6 +757,7 @@ struct CpuUrmaTransport::Impl {
                                 const cpu_urma_detail::SglGroup* groups = nullptr,
                                 std::size_t group_count = 0U,
                                 std::size_t remote_sgl_size = 1U) {
+    const auto setup_start = std::chrono::steady_clock::now();
     if (!initialized_) return Status::InvalidState("CPU URMA transport is not initialized");
     if (buffers == nullptr || count == 0U || offset > remote_region_.length ||
         remote_sgl_size == 0U || remote_sgl_size > batch_remote_sgl_size_ ||
@@ -840,11 +841,22 @@ struct CpuUrmaTransport::Impl {
     std::uint64_t poll_ns = 0U;
     std::string post_error;
     std::string poll_error;
+    const auto dispatch_start = std::chrono::steady_clock::now();
+    const auto setup_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            dispatch_start - setup_start).count());
+    std::uint64_t dispatch_ns = 0U;
     if (stream_depth_ != 0U) {
       post_error = StreamSglBatch(job, &prepare_ns, &post_ns, &poll_ns);
+      dispatch_ns = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - dispatch_start).count());
     } else {
       post_error = PrepareAndPostSglBatch(job, &prepare_ns, &post_ns);
       const auto poll_start = std::chrono::steady_clock::now();
+      dispatch_ns = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              poll_start - dispatch_start).count());
       poll_error = post_error.empty() ? PollSglBatch(job) : post_error;
       poll_ns = static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -853,6 +865,8 @@ struct CpuUrmaTransport::Impl {
     last_batch_timing_.prepare_ns = prepare_ns;
     last_batch_timing_.post_ns = post_ns;
     last_batch_timing_.poll_ns = poll_ns;
+    last_batch_timing_.setup_ns = setup_ns;
+    last_batch_timing_.dispatch_ns = dispatch_ns;
     last_batch_timing_.wr_count = wr_count;
     if (!post_error.empty()) return Status::Internal(post_error);
     if (!poll_error.empty()) return Status::Internal(poll_error);
@@ -897,6 +911,8 @@ struct CpuUrmaTransport::Impl {
       total_timing.prepare_ns += last_batch_timing_.prepare_ns;
       total_timing.post_ns += last_batch_timing_.post_ns;
       total_timing.poll_ns += last_batch_timing_.poll_ns;
+      total_timing.setup_ns += last_batch_timing_.setup_ns;
+      total_timing.dispatch_ns += last_batch_timing_.dispatch_ns;
       total_timing.wr_count += last_batch_timing_.wr_count;
       contiguous_offset += chunk_bytes;
       begin = end;
@@ -943,6 +959,8 @@ struct CpuUrmaTransport::Impl {
       total_timing.prepare_ns += last_batch_timing_.prepare_ns;
       total_timing.post_ns += last_batch_timing_.post_ns;
       total_timing.poll_ns += last_batch_timing_.poll_ns;
+      total_timing.setup_ns += last_batch_timing_.setup_ns;
+      total_timing.dispatch_ns += last_batch_timing_.dispatch_ns;
       total_timing.wr_count += last_batch_timing_.wr_count;
     }
     total_timing.total_ns = static_cast<std::uint64_t>(

@@ -71,6 +71,11 @@ class CpuUrmaTransport final {
     // Includes validation, workspace/segment lookup and gaps between chunks.
     std::uint64_t total_ns{0};
     std::uint64_t wr_count{0};
+    // Validation, workspace sizing and host segment selection per sub-batch.
+    std::uint64_t setup_ns{0};
+    // Entire prepare/post call, including OpenMP scheduling and joining.
+    // In streaming mode this includes interleaved submission and CQ polling.
+    std::uint64_t dispatch_ns{0};
   };
 
   CpuUrmaTransport();
