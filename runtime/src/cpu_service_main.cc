@@ -11,10 +11,10 @@ namespace {
 
 void PrintUsage(const char* program) {
   std::fprintf(stderr,
-               "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME ...] [--eid-index N] "
+               "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] "
                "[--memory-page-mode default|thp]\n"
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
-               "candidates are discovered automatically. Repeat --ub-device to restrict the device shortlist. "
+               "candidates are discovered automatically. "
                "The default memory page mode is thp. The service requires only liburma and /dev/uburma.\n",
                program);
 }
@@ -69,12 +69,7 @@ int main(int argc, char** argv) {
       }
       service_options.port = static_cast<std::uint16_t>(parsed);
     } else if (argument == "--ub-device") {
-      const std::string name(argv[++index]);
-      if (name.empty()) {
-        std::fprintf(stderr, "invalid empty --ub-device\n");
-        return 2;
-      }
-      cpu_options.ub_devices.push_back(name);
+      cpu_options.ub_device = argv[++index];
     } else if (argument == "--eid-index") {
       if (!ParseUnsigned(argv[++index], std::numeric_limits<std::uint32_t>::max(),
                          &cpu_options.eid_index)) {

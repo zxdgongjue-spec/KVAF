@@ -551,14 +551,17 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
         "npu_eids count exceeds npu_core_count * jettys_per_core workers");
   }
   const bool fixed_peer_device = !impl_->options.peer_ub_device.empty();
-  const bool tune_candidates = detail::ShouldTuneStartupCandidates(
-      impl_->options.adaptive_ub_device, device_filter_applied);
-  if (impl_->options.adaptive_ub_device && !device_filter_applied) {
+  const bool has_n_side_allowlist =
+      !impl_->options.adaptive_peer_ub_devices.empty();
+  const bool tune_candidates = impl_->options.adaptive_ub_device &&
+                               !device_filter_applied && has_n_side_allowlist;
+  if (impl_->options.adaptive_ub_device && !tune_candidates) {
     std::fprintf(stderr,
                  "[KVAF_AIV] UB_DEVICE_ADAPTIVE_SKIPPED device_id=%u "
-                 "peer_devices=%u reason=no_explicit_peer_device_filter "
-                 "selection=first_working_candidate\n",
-                 impl_->options.device_id, device_count);
+                 "reason=%s\n",
+                 impl_->options.device_id,
+                 device_filter_applied ? "k_side_device_filter"
+                                       : "no_n_side_candidates");
   }
   const detail::StartupProbeConfig probe_config{
       impl_->options.batch_get_token_bytes,
@@ -594,12 +597,6 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       return Status::NotFound("peer Runtime did not advertise fixed UB device " +
                               impl_->options.peer_ub_device);
     }
-    std::fprintf(stderr,
-                 "[KVAF_AIV] UB_DEVICE_REUSE_PLAN device_id=%u ub_device=%s "
-                 "peer_candidates=%u measurements=0\n",
-                 impl_->options.device_id,
-                 impl_->options.peer_ub_device.c_str(),
-                 fixed_candidate_count);
   }
   auto initialize_candidate = [&](const detail::StartupCandidate& candidate,
                                   bool measure, double* cycles) -> Status {
@@ -621,37 +618,14 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       impl_->ReleaseProbe();
       impl_->config.peer_local_eids.clear();
       impl_->config.peer_local_eids.reserve(group_size);
-      std::string group_sources;
-      std::string group_eids;
       for (std::size_t offset = 0U; offset < group_size; ++offset) {
         const NpuLocalEidCandidate& candidate = npu_candidates[group_begin + offset];
         impl_->config.peer_local_eids.push_back(candidate.eid);
-        if (offset != 0U) {
-          group_sources += ',';
-          group_eids += ',';
-        }
-        group_sources += candidate.source;
-        group_eids += EidToHex(candidate.eid);
       }
       // BatchPut intentionally remains on the established single-EID path.
       // Multi-EID striping applies only to BatchGet and uses the vector above.
       impl_->config.peer_local_eid = impl_->config.peer_local_eids.front();
       impl_->CreateCore();
-      if (group_size == 1U) {
-        std::fprintf(stderr,
-                     "[KVAF_AIV] PEER_LINK_EID_PAIR_ATTEMPT peer_candidate=%u/%u "
-                     "npu_candidate=%zu/%zu npu_source=%s npu_eid=%s strict=%u\n",
-                     peer_candidate, candidate_count, group_begin,
-                     npu_candidates.size(), group_sources.c_str(), group_eids.c_str(),
-                     explicit_eids ? 1U : 0U);
-      } else {
-        std::fprintf(stderr,
-                     "[KVAF_AIV] PEER_LINK_EID_GROUP_ATTEMPT peer_candidate=%u/%u "
-                     "npu_group=%zu/%zu eid_paths=%zu npu_sources=%s npu_eids=%s "
-                     "distribution=jetty_major_worker_round_robin strict=1\n",
-                     peer_candidate, candidate_count, npu_group, npu_group_count,
-                     group_size, group_sources.c_str(), group_eids.c_str());
-      }
       last = impl_->runtime_core->Initialize(candidate_request);
       if (last.ok()) {
         const std::uint64_t probe_bytes =
@@ -681,33 +655,6 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
             probe_offsets.push_back(row * probe_bytes);
             probe_lengths.push_back(probe_bytes);
           }
-          if (group_size == 1U) {
-            std::fprintf(stderr,
-                         "[KVAF_AIV] PEER_LINK_EID_PAIR_RMA_PROBE_BEGIN "
-                         "peer_candidate=%u/%u npu_candidate=%zu npu_source=%s "
-                         "rows=%llu bytes_per_row=%llu source_bytes=%llu cores=%u "
-                         "jettys_per_core=%u\n",
-                         peer_candidate, candidate_count, group_begin,
-                         group_sources.c_str(),
-                         static_cast<unsigned long long>(probe_rows),
-                         static_cast<unsigned long long>(probe_bytes),
-                         static_cast<unsigned long long>(probe_total_bytes),
-                         impl_->options.npu_core_count,
-                         impl_->config.batch_put_jettys_per_core);
-          } else {
-            std::fprintf(stderr,
-                         "[KVAF_AIV] PEER_LINK_EID_GROUP_RMA_PROBE_BEGIN "
-                         "peer_candidate=%u/%u npu_group=%zu eid_paths=%zu "
-                         "npu_sources=%s rows=%llu bytes_per_row=%llu "
-                         "source_bytes=%llu cores=%u jettys_per_core=%u\n",
-                         peer_candidate, candidate_count, npu_group, group_size,
-                         group_sources.c_str(),
-                         static_cast<unsigned long long>(probe_rows),
-                         static_cast<unsigned long long>(probe_bytes),
-                         static_cast<unsigned long long>(probe_total_bytes),
-                         impl_->options.npu_core_count,
-                         impl_->config.batch_put_jettys_per_core);
-          }
           last = impl_->runtime_core->BatchPut(
               BatchPutRequest{probe_keys,
                               ConstBufferView{impl_->probe_buffer,
@@ -717,27 +664,6 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
               BatchPutExecutionOptions{stream});
           if (last.ok()) {
             last = impl_->runtime_core->BatchFree(BatchFreeRequest{probe_keys});
-          }
-          if (last.ok()) {
-            if (group_size == 1U) {
-              std::fprintf(stderr,
-                           "[KVAF_AIV] PEER_LINK_EID_PAIR_RMA_PROBE_READY "
-                           "peer_candidate=%u/%u npu_candidate=%zu npu_source=%s "
-                           "rows=%llu source_bytes=%llu\n",
-                           peer_candidate, candidate_count, group_begin,
-                           group_sources.c_str(),
-                           static_cast<unsigned long long>(probe_rows),
-                           static_cast<unsigned long long>(probe_total_bytes));
-            } else {
-              std::fprintf(stderr,
-                           "[KVAF_AIV] PEER_LINK_EID_GROUP_RMA_PROBE_READY "
-                           "peer_candidate=%u/%u npu_group=%zu eid_paths=%zu "
-                           "npu_sources=%s rows=%llu source_bytes=%llu\n",
-                           peer_candidate, candidate_count, npu_group, group_size,
-                           group_sources.c_str(),
-                           static_cast<unsigned long long>(probe_rows),
-                           static_cast<unsigned long long>(probe_total_bytes));
-            }
           }
         }
         if (stream != nullptr && aclrtDestroyStream(stream) != ACL_SUCCESS && last.ok()) {
@@ -750,64 +676,29 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
         last = impl_->bandwidth_probe->Run(*impl_->runtime_core, *impl_->access_operator, cycles);
         if (last.ok()) {
           std::fprintf(stderr,
-                       "[KVAF_AIV] UB_DEVICE_PROBE_RESULT device_id=%u peer_candidate=%u "
-                       "npu_group=%zu token_bytes=%u miss_count=%u warmup=%u samples=%u "
-                       "p50_kernel_cycles=%.0f bytes_per_cycle=%.6f\n",
-                       impl_->options.device_id, peer_candidate, npu_group,
-                       probe_config.token_bytes, probe_config.miss_count,
-                       detail::kStartupWarmup, detail::kStartupSamples, *cycles,
-                       static_cast<double>(probe_config.token_bytes) *
-                           probe_config.miss_count / *cycles);
+                       "[KVAF_AIV] UB_DEVICE_PROBE_RESULT device_id=%u "
+                       "ub_device=%s miss_count=%u cycles=%.0f\n",
+                       impl_->options.device_id,
+                       peer_candidate_device_names[peer_candidate].c_str(),
+                       probe_config.miss_count, *cycles);
           return last;
         }
       }
       if (last.ok()) {
-        if (group_size == 1U) {
-          std::fprintf(stderr,
-                       "[KVAF_AIV] PEER_LINK_EID_PAIR_SELECTED peer_candidate=%u/%u "
-                       "npu_candidate=%zu/%zu npu_source=%s npu_eid=%s "
-                       "validation=aiv_write_cq_all_lanes\n",
-                       peer_candidate, candidate_count, group_begin,
-                       npu_candidates.size(), group_sources.c_str(),
-                       group_eids.c_str());
-        } else {
-          std::fprintf(stderr,
-                       "[KVAF_AIV] PEER_LINK_EID_GROUP_SELECTED peer_candidate=%u/%u "
-                       "npu_group=%zu/%zu eid_paths=%zu npu_sources=%s npu_eids=%s "
-                       "distribution=jetty_major_worker_round_robin "
-                       "validation=batch_get_channels_plus_primary_eid_aiv_write_cq\n",
-                       peer_candidate, candidate_count, npu_group, npu_group_count,
-                       group_size, group_sources.c_str(), group_eids.c_str());
-        }
         if (tune_candidates) {
           std::fprintf(stderr,
-                       "[KVAF_AIV] UB_DEVICE_SELECTED device_id=%u peer_candidate=%u "
-                       "ub_device=%s npu_group=%zu p50_kernel_cycles=%.0f\n",
-                       impl_->options.device_id, peer_candidate,
+                       "[KVAF_AIV] UB_DEVICE_SELECTED device_id=%u "
+                       "ub_device=%s cycles=%.0f\n",
+                       impl_->options.device_id,
                        peer_candidate_device_names[peer_candidate].c_str(),
-                       npu_group, *cycles);
+                       *cycles);
         } else if (fixed_peer_device) {
           std::fprintf(stderr,
-                       "[KVAF_AIV] UB_DEVICE_REUSED device_id=%u peer_candidate=%u "
-                       "ub_device=%s npu_group=%zu\n",
-                       impl_->options.device_id, peer_candidate,
-                       impl_->options.peer_ub_device.c_str(), npu_group);
+                       "[KVAF_AIV] UB_DEVICE_REUSED device_id=%u ub_device=%s\n",
+                       impl_->options.device_id,
+                       impl_->options.peer_ub_device.c_str());
         }
         return Status::OK();
-      }
-      if (group_size == 1U) {
-        std::fprintf(stderr,
-                     "[KVAF_AIV] PEER_LINK_EID_PAIR_FAILED peer_candidate=%u "
-                     "npu_candidate=%zu npu_source=%s reason=%s\n",
-                     peer_candidate, group_begin, group_sources.c_str(),
-                     last.message().c_str());
-      } else {
-        std::fprintf(stderr,
-                     "[KVAF_AIV] PEER_LINK_EID_GROUP_FAILED peer_candidate=%u "
-                     "npu_group=%zu eid_paths=%zu npu_sources=%s npu_eids=%s "
-                     "reason=%s\n",
-                     peer_candidate, npu_group, group_size, group_sources.c_str(),
-                     group_eids.c_str(), last.message().c_str());
       }
       return last;
     }
@@ -848,8 +739,9 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   }
 
   peer_candidate_device_names.resize(candidate_count);
-  std::vector<std::vector<detail::StartupCandidate>> device_candidates(device_count);
-  std::vector<std::string> device_names(device_count);
+  std::vector<std::vector<detail::StartupCandidate>> all_device_candidates(
+      device_count);
+  std::vector<std::string> all_device_names(device_count);
   for (std::uint32_t peer_candidate = 0U; peer_candidate < candidate_count;
        ++peer_candidate) {
     peer::PeerCandidateInfo info{};
@@ -859,25 +751,49 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       return Status::Internal("peer Runtime returned invalid candidate metadata");
     }
     peer_candidate_device_names[peer_candidate] = info.device_name;
-    std::string& known_name = device_names[info.device_id];
+    std::string& known_name = all_device_names[info.device_id];
     if (known_name.empty()) {
       known_name = info.device_name;
     } else if (known_name != info.device_name) {
       return Status::Internal("peer Runtime returned inconsistent candidate device grouping");
     }
-    auto& group = device_candidates[info.device_id];
+    auto& group = all_device_candidates[info.device_id];
     for (std::size_t npu_group = 0U; npu_group < npu_group_count; ++npu_group) {
       group.push_back(detail::StartupCandidate{peer_candidate, npu_group});
     }
   }
-  for (std::size_t device = 0U; device < device_candidates.size(); ++device) {
-    if (device_candidates[device].empty() || device_names[device].empty()) {
+  for (std::size_t device = 0U; device < all_device_candidates.size(); ++device) {
+    if (all_device_candidates[device].empty() ||
+        all_device_names[device].empty()) {
       return Status::Internal("peer Runtime returned incomplete candidate device grouping");
     }
+  }
+  std::vector<std::size_t> selected_device_indices;
+  for (std::size_t device = 0U; device < all_device_names.size(); ++device) {
+    if (std::find(impl_->options.adaptive_peer_ub_devices.begin(),
+                  impl_->options.adaptive_peer_ub_devices.end(),
+                  all_device_names[device]) !=
+        impl_->options.adaptive_peer_ub_devices.end()) {
+      selected_device_indices.push_back(device);
+    }
+  }
+  if (selected_device_indices.empty()) {
+    return Status::NotFound(
+        "none of the script-configured adaptive UB devices were advertised by the peer");
+  }
+  std::vector<std::vector<detail::StartupCandidate>> device_candidates;
+  std::vector<std::string> device_names;
+  device_candidates.reserve(selected_device_indices.size());
+  device_names.reserve(selected_device_indices.size());
+  for (const std::size_t device : selected_device_indices) {
+    device_candidates.push_back(std::move(all_device_candidates[device]));
+    device_names.push_back(std::move(all_device_names[device]));
+  }
+  for (std::size_t device = 0U; device < device_candidates.size(); ++device) {
     std::fprintf(stderr,
-                 "[KVAF_AIV] UB_DEVICE_PROBE_PLAN device_id=%u peer_device_id=%zu "
-                 "ub_device=%s connectivity_pairs=%zu measurements=1\n",
-                 impl_->options.device_id, device, device_names[device].c_str(),
+                 "[KVAF_AIV] UB_DEVICE_PROBE_PLAN device_id=%u ub_device=%s "
+                 "pairs=%zu\n",
+                 impl_->options.device_id, device_names[device].c_str(),
                  device_candidates[device].size());
   }
   return detail::SelectStartupDeviceCandidate(

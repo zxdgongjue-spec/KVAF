@@ -160,7 +160,8 @@ class NpuPythonRuntime final {
                    std::vector<std::string> npu_eids,
                    bool adaptive_ub_device,
                    std::uint32_t adaptive_ub_miss_count,
-                   std::string peer_ub_device) {
+                   std::string peer_ub_device,
+                   std::vector<std::string> adaptive_peer_ub_devices) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
                               batch_get_tokens_per_block};
@@ -173,6 +174,7 @@ class NpuPythonRuntime final {
     options.adaptive_ub_device = adaptive_ub_device;
     options.adaptive_ub_miss_count = adaptive_ub_miss_count;
     options.peer_ub_device = std::move(peer_ub_device);
+    options.adaptive_peer_ub_devices = std::move(adaptive_peer_ub_devices);
     native_ = std::make_unique<::kvaf::NpuRuntime>(std::move(options));
   }
 
@@ -461,7 +463,7 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def(py::init<std::string, std::uint32_t, std::uint32_t, std::uint32_t,
                     std::uint32_t, std::string, std::uint32_t,
                     std::vector<std::string>, bool, std::uint32_t,
-                    std::string>(),
+                    std::string, std::vector<std::string>>(),
            py::arg("batch_get_kernel_object_path"),
            py::arg("batch_get_token_bytes"),
            py::arg("batch_get_tokens_per_block"), py::arg("device_id") = 0,
@@ -471,7 +473,9 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("npu_eids") = std::vector<std::string>{},
            py::arg("adaptive_ub_device") = false,
            py::arg("adaptive_ub_miss_count") = 2048,
-           py::arg("peer_ub_device") = "")
+           py::arg("peer_ub_device") = "",
+           py::arg("adaptive_peer_ub_devices") =
+               std::vector<std::string>{})
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
            "Connect this NPU Runtime to a CPU Runtime service before initialize.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),

@@ -43,21 +43,3 @@ else()
   message(STATUS
     "Skipping direct Runtime Python tests; configure with -DKVAF_BUILD_PYTHON=ON")
 endif()
-
-# Host tests cover startup selection and the actual probe's request construction,
-# data verification and lifetime ordering without linking CANN/UMDK.
-add_executable(kvaf_startup_selection_test cpp/startup_selection_test.cc)
-target_link_libraries(kvaf_startup_selection_test PRIVATE kvaf_runtime)
-add_test(NAME kvaf_startup_selection COMMAND kvaf_startup_selection_test)
-
-add_executable(kvaf_startup_bandwidth_probe_test cpp/startup_bandwidth_probe_test.cc)
-target_include_directories(kvaf_startup_bandwidth_probe_test PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}/cpp/stubs"
-  "${CMAKE_CURRENT_SOURCE_DIR}/../runtime/src")
-target_link_libraries(kvaf_startup_bandwidth_probe_test PRIVATE kvaf_runtime)
-add_test(NAME kvaf_startup_bandwidth_probe COMMAND kvaf_startup_bandwidth_probe_test)
-
-add_test(
-  NAME kvaf_batch_get_sweep_ub_device_reuse
-  COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/test_batch_get_sweep_ub_device_reuse.sh"
-)

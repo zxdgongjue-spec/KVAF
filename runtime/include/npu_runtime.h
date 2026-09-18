@@ -32,13 +32,15 @@ struct NpuRuntimeOptions {
   // paths and stripe core/Jetty workers over them in list order. BatchPut
   // remains on the first EID.
   std::vector<std::string> npu_eids{};
-  // Opt-in startup BatchGet tuning over explicitly filtered peer devices.
-  // K/N EIDs are connectivity fallbacks; each working peer device is measured
-  // once. Without a K-side device filter, first-working selection is preserved.
+  // Opt-in startup BatchGet tuning over adaptive_peer_ub_devices. A K-side
+  // explicit device uses the native first-working path without tuning.
   bool adaptive_ub_device{false};
-  // BatchGet request count used by adaptive tuning. Performance tools set this
-  // to the current test shape; other callers retain the historical 2048 default.
+  // BatchGet request count used by adaptive tuning. Performance scripts can
+  // override it independently from the measured shape.
   std::uint32_t adaptive_ub_miss_count{2048U};
+  // Optional N-side peer-device allowlist for adaptive tuning. It is ignored
+  // when the K-side service applies an explicit --ub-device filter.
+  std::vector<std::string> adaptive_peer_ub_devices{};
   // Optional strict K-side UB device selected by an earlier Runtime process.
   // Its EIDs remain connectivity fallbacks, but no bandwidth tuning is run.
   std::string peer_ub_device{};

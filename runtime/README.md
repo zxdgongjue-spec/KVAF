@@ -93,86 +93,24 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 
 ### 可选启动 UB device 选优
 
-每张 N 卡可在 K 端显式限定的 UB device 中独立测速选优。
-K 端重复传入 `--ub-device`，只发布这些设备的全部可用 EID，例如：
+`--adaptive-ub-device` 仅在 K 端未指定 `--ub-device` 时启用启动测速：N 端脚本从
+`KVAF_ADAPTIVE_UB_DEVICES` 配置的候选中选择，默认值为
+`udmac0d1e2,udmac0d1e3,udmac1d1e2,udmac1d1e3`，探测请求数由
+`KVAF_ADAPTIVE_UB_MISS_COUNT` 控制。每个设备只测首个通过连通性校验的 EID 组合，
+探测 region 按 block 大小与 2 MiB 的最小公倍数向上对齐；日志保留精简的
+`UB_DEVICE_PROBE_PLAN/RESULT`、`UB_DEVICE_SELECTED` 和 `UB_DEVICE_REUSED`。K 端指定
+单个 `--ub-device` 时走原生首个可用路径；`peer_ub_device` 可让后续进程复用已选设备
+而不重新测速。miss-count sweep 的第一个正式 shape 完成一次标定，后续 shape 复用
+结果，并在 CSV 的 `selected_ub_device` 列记录设备名。N/K 两端必须同时使用控制协议
+v6。
 
 ```bash
-./build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999 \
-  --ub-device udmac0d1e2 \
-  --ub-device udmac0d1e3 \
-  --ub-device udmac1d1e2 \
-  --ub-device udmac1d1e3
+KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 \
+KVAF_ADAPTIVE_UB_DEVICES=udmac0d1e2,udmac0d1e3,udmac1d1e2,udmac1d1e3 \
+KVAF_ADAPTIVE_UB_MISS_COUNT=2048 \
+  ./tests/run_remote_cpu_batch_get_miss_count_perf.sh /absolute/path/to/build-npu \
+  --adaptive-ub-device
 ```
-
-未指定白名单时仍枚举所有设备；指定名称没有可用 EID 时服务启动报错。
-N 端在原有构造参数上增加 `adaptive_ub_device=True`：
-
-```python
-runtime = kvaf.NpuRuntime(
-    batch_get_kernel,
-    batch_get_token_bytes=656,
-    batch_get_tokens_per_block=128,
-    device_id=0,
-    npu_core_count=24,  # 与业务配置保持一致
-    batch_put_kernel_object_path=batch_put_kernel,
-    adaptive_ub_device=True,
-    adaptive_ub_miss_count=2048,
-)
-runtime.link_to("141.61.92.71:28999")
-runtime.initialize(ddr_bytes, kv_block_bytes)
-```
-
-- 默认 `False` 保持首个连通候选即选中的行为。
-- 开启后，仅当 K 端显式传入至少一个 `--ub-device` 时执行测速，并在所有显式
-  设备中选优，不限制设备数或 EID 数。K 端未指定 `--ub-device` 时，跳过测速并
-  保持原有“首个可用候选”逻辑。
-- 寻优单位是 K 端 `ub-device`，不是 EID 组合。每个设备内部按 K EID、N EID 的
-  顺序尝试建链，首个通过建链和 WRITE/CQ 验证的组合代表该设备参加一次测速，
-  该设备剩余 EID 不再测试。显式 `npu_eids` 仍作为一个严格的完整多 EID 组，
-  不会拆开或回退。K 端指定 `--eid-index 0` 时，每个设备只有一个 K EID，自动
-  发现的 N EID 只作为建链回退，因此 4 个设备最多得到 4 个测速结果。
-- 每个设备的可用组合先完成原有 WRITE/CQ 验证，再在独立临时 region 中执行真实
-  BatchGet。标定沿用 Runtime 的 `batch_get_token_bytes` 和
-  `batch_get_tokens_per_block`，请求数由 `adaptive_ub_miss_count` 指定。单次性能测试
-  会传入当前 shape 的 `miss_count`；miss-count sweep 固定用 `656 × 2048` 校准一次。
-  core/Jetty 配置沿用业务配置，所有候选使用同一组数据与请求。
-- 先写入并校验数据，预热 1 次、采样 5 次，按每次最慢 core 的 kernel 总周期数
-  取中位数，选择耗时最短的组合。相同 N 卡、相同搬运字节数下，这等价于选择最高
-  标定带宽。建链、分配和 Host 同步开销不计入排名；日志输出周期数和 bytes/cycle，
-  不假定硬件时钟频率。
-- 探测 region 根据当前 block 大小和 miss count 计算，并向上对齐到 block 大小与
-  2 MiB 的最小公倍数，使默认 THP 模式具备完整 2 MiB 页的地址和长度条件。各设备串行创建和释放；每个
-  组合完成后先销毁通道和 region，再释放 NPU
-  buffer。全部探测结束后，按排名建立用户请求大小的正式 region，校验连通性，
-  最优组合重建失败时尝试下一名；没有可用组合则初始化失败。
-- `UB_DEVICE_PROBE_PLAN` 记录各设备可能尝试的建链组合数，
-  `UB_DEVICE_PROBE_RESULT` 每个连通设备最多记录一次标定结果，`UB_DEVICE_SELECTED` 记录正式
-  选择；用 `peer_candidate` 对照 K 端 `CANDIDATE_DISCOVERED` 的设备名称/EID。
-  结果属于当前 NpuRuntime session，后续 BatchGet/BatchPut 复用该选择；不做运行中
-  切换。不同 N 卡可以选不同 K 端设备。
-
-现有性能脚本可直接验证：
-
-```bash
-KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 DEVICE_ID=0 \
-  ./tests/run_remote_cpu_batch_get_perf.sh /absolute/path/to/build-npu \
-  --adaptive-ub-device --token-bytes 656 --miss-count 2048
-```
-
-miss-count sweep 传入 `--adaptive-ub-device` 时，会先自动启动一个 `656 × 2048`
-校准进程，保存 `UB_DEVICE_SELECTED` 的设备名，再以 `peer_ub_device` 固定该设备运行
-全部正式 shape；用户只需启动一次脚本。后续进程仍独立建链，同一设备内保留 EID
-回退，但不再执行带宽标定。CSV 为每个 shape 写入 `selected_ub_device`；未执行自适应
-选优或固定设备时该列为空。
-
-EID 组合数只影响找到每个设备首个可用链路前的回退开销；沿用现有
-传输/kernel 超时，当前不新增整个选优过程的硬时间上限。多卡同时启动会相互
-争抢带宽，标定效果需要在目标部署并发下验证。sweep 的固定选择代表 `656 × 2048`
-校准 shape。
-
-**升级要求：**候选查询包含独立设备数和显式过滤标记，并支持在分配前查询候选
-所属设备，控制协议从 v4 升到 v6。
-N 端库和 K 端服务必须一起重新构建/部署，即使未开启自适应也不能混用旧协议。
 
 需要同时使用多个 NPU EID 时，设置 `NpuRuntimeOptions::npu_eids`（Python
 构造参数同名）。列表中每个 EID 必须是 32 位连续十六进制字符；Runtime

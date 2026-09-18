@@ -181,9 +181,8 @@ build-npu/bin/kvaf_execute_batch_put_kernels.o
 ```
 
 服务会自动发现 UB device/EID，并打印 `CANDIDATE_DISCOVERED` 与 `LISTEN`。也可按需要传入 `--ub-device NAME --eid-index N` 来选定对应的端口。
-重复 `--ub-device NAME` 可限定候选设备白名单；N 端可用
-`adaptive_ub_device=True` 会在 K 端通过 `--ub-device` 显式指定的设备中启动测速选优；
-未指定设备时沿用首个可用候选，设备和 EID 数量均不设硬限制。
+N 端性能脚本开启 `--adaptive-ub-device` 后，K 端未指定设备时会从脚本配置的
+`KVAF_ADAPTIVE_UB_DEVICES` 中测速选优；K 端指定单个 `--ub-device` 时走原生路径。
 详见 [Runtime 启动选优](runtime/README.md#可选启动-ub-device-选优)；N/K 两端需同时升级至控制协议 v6。
 
 ### 2. 运行 NPU 端到端测试

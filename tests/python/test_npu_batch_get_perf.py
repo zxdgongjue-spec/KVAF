@@ -22,12 +22,13 @@ environment variables:
     --kernel-profile       KVAF_BATCH_GET_PERF_KERNEL_PROFILE=1
     --kernel-profile-clock-mhz
                            KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ
+    adaptive UB devices    KVAF_ADAPTIVE_UB_DEVICES
+    adaptive miss count    KVAF_ADAPTIVE_UB_MISS_COUNT
 """
 
 from __future__ import annotations
 
 import argparse
-import math
 import os
 from pathlib import Path
 import statistics
@@ -54,6 +55,13 @@ DEFAULT_WARMUP = 3
 DEFAULT_ITERATIONS = 100
 DEFAULT_POPULATE_CHUNK_ENTRIES = 128
 DEFAULT_KERNEL_PROFILE_CLOCK_MHZ = 1000
+DEFAULT_ADAPTIVE_UB_MISS_COUNT = 2048
+DEFAULT_ADAPTIVE_PEER_UB_DEVICES = (
+    "udmac0d1e2",
+    "udmac0d1e3",
+    "udmac1d1e2",
+    "udmac1d1e3",
+)
 MAX_INT32 = (1 << 31) - 1
 MAX_UINT64 = (1 << 64) - 1
 
@@ -72,6 +80,14 @@ def environment_bool(name: str, default: bool = False) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{name} must be one of 1/0, true/false, yes/no, or on/off")
+
+
+def configured_adaptive_ub_devices() -> list[str]:
+    configured = os.environ.get(
+        "KVAF_ADAPTIVE_UB_DEVICES",
+        ",".join(DEFAULT_ADAPTIVE_PEER_UB_DEVICES),
+    )
+    return [device.strip() for device in configured.split(",")]
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -168,17 +184,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--adaptive-ub-device", action="store_true",
-        help="startup tuning over explicitly selected K-side UB devices (all EIDs)",
+        help=(
+            "startup tuning over the N-side peer-device allowlist when K has "
+            "no explicit device filter"
+        ),
     )
     parser.add_argument(
         "--peer-ub-device",
         default="",
         help="strict K-side UB device selected by an earlier process",
-    )
-    parser.add_argument(
-        "--adaptive-calibration-only",
-        action="store_true",
-        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--warmup",
@@ -246,6 +260,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="AIV clock used to convert profile cycles to milliseconds",
     )
     parser.set_defaults(
+        adaptive_peer_ub_devices=configured_adaptive_ub_devices(),
         kernel_profile=environment_bool("KVAF_BATCH_GET_PERF_KERNEL_PROFILE"),
         sort_input_indices=environment_bool(
             "KVAF_BATCH_GET_PERF_SORT_INPUT_INDICES"
@@ -254,6 +269,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.miss_count is None:
         args.miss_count = args.request_length
+    args.adaptive_ub_miss_count = environment_int(
+        "KVAF_ADAPTIVE_UB_MISS_COUNT", DEFAULT_ADAPTIVE_UB_MISS_COUNT
+    )
     return args
 
 
@@ -276,10 +294,18 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "miss-count must be between zero and request-length"
     if args.adaptive_ub_device and args.miss_count == 0:
         return "adaptive UB device tuning requires a positive miss-count"
+    if args.adaptive_ub_device and (
+        args.adaptive_ub_miss_count <= 0 or args.adaptive_ub_miss_count > MAX_INT32
+    ):
+        return "KVAF_ADAPTIVE_UB_MISS_COUNT must be in [1, INT32_MAX]"
     if args.adaptive_ub_device and args.peer_ub_device:
         return "adaptive-ub-device and peer-ub-device are mutually exclusive"
-    if args.adaptive_calibration_only and not args.adaptive_ub_device:
-        return "adaptive-calibration-only requires adaptive-ub-device"
+    if args.adaptive_ub_device and (
+        any(not device for device in args.adaptive_peer_ub_devices)
+        or len(set(args.adaptive_peer_ub_devices))
+        != len(args.adaptive_peer_ub_devices)
+    ):
+        return "KVAF_ADAPTIVE_UB_DEVICES must contain unique non-empty names"
     if args.aiv_cores <= 0 or args.aiv_cores > 48:
         return "aiv-cores must be in [1, 48]"
     if len(args.npu_eids) > args.aiv_cores * args.jettys_per_core:
@@ -610,8 +636,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     miss_count_value = args.miss_count
     block_bytes = token_bytes * tokens_per_block
     table_capacity = args.table_capacity
-    if args.adaptive_calibration_only:
-        table_capacity = math.lcm(block_bytes, 2 * 1024 * 1024) // block_bytes
     ddr_bytes = table_capacity * block_bytes
     total_tokens = table_capacity * tokens_per_block
 
@@ -629,8 +653,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         jettys_per_core=args.jettys_per_core,
         npu_eids=args.npu_eids,
         adaptive_ub_device=args.adaptive_ub_device,
-        adaptive_ub_miss_count=miss_count_value,
+        adaptive_ub_miss_count=args.adaptive_ub_miss_count,
         peer_ub_device=args.peer_ub_device,
+        adaptive_peer_ub_devices=args.adaptive_peer_ub_devices,
     )
     runtime.link_to(remote_cpu_service)
     table = None
@@ -648,6 +673,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"jettys_per_core={args.jettys_per_core} eid_paths={len(args.npu_eids) or 1} "
             f"npu_eids={','.join(args.npu_eids) or 'auto'} warmup={args.warmup} "
             f"adaptive_ub_device={int(args.adaptive_ub_device)} "
+            f"adaptive_ub_miss_count={args.adaptive_ub_miss_count} "
             f"peer_ub_device={args.peer_ub_device or 'auto'} "
             f"iterations={args.iterations} seed={args.seed} "
             f"sort_input_indices={int(args.sort_input_indices)} "
@@ -659,9 +685,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("BATCH_GET_PERF_PHASE_BEGIN phase=initialize")
         runtime.initialize(ddr_bytes, block_bytes)
         print("BATCH_GET_PERF_PHASE_DONE phase=initialize")
-        if args.adaptive_calibration_only:
-            print("BATCH_GET_PERF_ADAPTIVE_CALIBRATION_DONE")
-            return 0
 
         # Every table entry contains the same deterministic token pattern. Reusing
         # a bounded source Tensor keeps setup memory independent of table capacity;

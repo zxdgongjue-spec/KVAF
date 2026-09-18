@@ -83,11 +83,6 @@ struct StartupCandidate {
   double cycles{0.0};
 };
 
-inline constexpr bool ShouldTuneStartupCandidates(bool adaptive_requested,
-                                                  bool device_filter_applied) {
-  return adaptive_requested && device_filter_applied;
-}
-
 // Adaptive selection treats a peer device as the performance candidate. The
 // entries within each device are connectivity fallbacks (K EID x N EID group),
 // so only the first working entry for that device is benchmarked.
