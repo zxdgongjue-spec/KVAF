@@ -15,6 +15,7 @@ namespace {
 using kvaf::CpuUrmaTransport;
 using kvaf::cpu_urma_detail::PlanWriteScatterGroups;
 using kvaf::cpu_urma_detail::SglGroup;
+using kvaf::cpu_urma_detail::ValidateBatchRows;
 
 void Check(bool ok, const char* message) {
   if (!ok) throw std::runtime_error(message);
@@ -101,6 +102,22 @@ void WriteScatterLimits() {
         "zero length WRITE row accepted");
 }
 
+void BatchRowValidation() {
+  std::array<std::uint8_t, 16> source{};
+  CpuUrmaTransport::HostSge buffers[]{{source.data(), 8},
+                                      {source.data() + 8, 8}};
+  std::uint64_t offsets[]{0, 8};
+  Check(ValidateBatchRows(buffers, offsets, 2, 16).ok(),
+        "valid one-to-one batch rejected");
+  offsets[1] = 9;
+  Check(!ValidateBatchRows(buffers, offsets, 2, 16).ok(),
+        "remote overflow accepted");
+  offsets[1] = 8;
+  buffers[1].data = nullptr;
+  Check(!ValidateBatchRows(buffers, offsets, 2, 16).ok(),
+        "null local row accepted");
+}
+
 void JettyChunkSubmission() {
   for (const std::size_t count : {0U, 1U, 97U, 1024U}) {
     for (const std::size_t chunk : {0U, 1U, 32U, 1024U}) {
@@ -158,6 +175,7 @@ int main() {
   try {
     PackedWriteScatter();
     WriteScatterLimits();
+    BatchRowValidation();
     JettyChunkSubmission();
     std::cout << "CPU URMA SGL planning tests passed\n";
     return 0;

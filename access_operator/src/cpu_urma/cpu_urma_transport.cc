@@ -94,9 +94,16 @@ struct CpuUrmaTransport::Impl {
     const cpu_urma_detail::SglGroup* groups{nullptr};
     urma_target_seg_t* single_host_segment{nullptr};
     std::vector<SglBatchQueue> queues;
-    std::vector<std::uint64_t> remote_offsets;
+    const std::uint64_t* remote_offsets{nullptr};
+    std::vector<std::uint64_t> generated_remote_offsets;
     std::vector<urma_target_seg_t*> host_segments;
     std::chrono::steady_clock::time_point deadline{};
+  };
+
+  struct WorkerResult {
+    std::uint64_t prepare_ns{0};
+    std::uint64_t post_ns{0};
+    std::string error;
   };
 
   void PrepareSglBatchEntry(SglBatchJob& job, std::size_t wr_index) {
@@ -130,13 +137,12 @@ struct CpuUrmaTransport::Impl {
     wr = {};
     wr.opcode = job.write ? URMA_OPC_WRITE : URMA_OPC_READ;
     const bool completes_queue = position + 1U == queue.wrs.size();
-    // WRITE matches the comparison benchmark: keep both ordering flags zero.
-    // READ retains its existing ordering contract.
-    if (!job.write) {
-      wr.flag.bs.place_order =
-          completes_queue ? URMA_STRONG_ORDER : URMA_RELAX_ORDER;
-      wr.flag.bs.comp_order = 1U;
-    }
+    // The final CQE is the completion fence for the entire Jetty chain.
+    // Completion ordering is required for both WRITE and READ, especially
+    // when one WRITE scatters a contiguous source into multiple remote SGEs.
+    wr.flag.bs.place_order =
+        completes_queue ? URMA_STRONG_ORDER : URMA_RELAX_ORDER;
+    wr.flag.bs.comp_order = 1U;
     wr.flag.bs.complete_enable = completes_queue ? 1U : 0U;
     wr.tjetty = remote_jettys_[jetty];
     wr.user_ctx = 0x5A1B0000ULL +
@@ -162,12 +168,7 @@ struct CpuUrmaTransport::Impl {
   std::string PrepareAndPostSglBatch(SglBatchJob& job,
                                      std::uint64_t* prepare_ns,
                                      std::uint64_t* post_ns) {
-    struct WorkerResult {
-      std::uint64_t prepare_ns{0};
-      std::uint64_t post_ns{0};
-      std::string error;
-    };
-    std::vector<WorkerResult> results(job.queues.size());
+    std::array<WorkerResult, kMaxJettyCount> results{};
     const std::size_t chunk_size = wqes_per_doorbell_ == 0U
         ? kJettyDepth : wqes_per_doorbell_;
     // A worker owns the entire Jetty chain, SQ and doorbell. No other worker
@@ -206,14 +207,15 @@ struct CpuUrmaTransport::Impl {
     }
     // Keep phase timings additive and comparable to wall time: select one
     // critical worker instead of summing work performed concurrently.
-    const auto critical = std::max_element(results.begin(), results.end(),
+    const auto result_end = results.begin() + job.queues.size();
+    const auto critical = std::max_element(results.begin(), result_end,
         [](const WorkerResult& a, const WorkerResult& b) {
           return a.prepare_ns + a.post_ns < b.prepare_ns + b.post_ns;
         });
     *prepare_ns = critical->prepare_ns;
     *post_ns = critical->post_ns;
-    for (const auto& result : results) {
-      if (!result.error.empty()) return result.error;
+    for (auto result = results.begin(); result != result_end; ++result) {
+      if (!result->error.empty()) return result->error;
     }
     return {};
   }
@@ -636,7 +638,8 @@ struct CpuUrmaTransport::Impl {
                                 std::size_t count,
                                 const cpu_urma_detail::SglGroup* groups = nullptr,
                                 std::size_t group_count = 0U,
-                                std::size_t remote_sgl_size = 1U) {
+                                std::size_t remote_sgl_size = 1U,
+                                bool rows_validated = false) {
     const auto setup_start = std::chrono::steady_clock::now();
     if (!initialized_) return Status::InvalidState("CPU URMA transport is not initialized");
     if (buffers == nullptr || count == 0U || offset > remote_region_.length ||
@@ -656,26 +659,39 @@ struct CpuUrmaTransport::Impl {
     job.groups = groups;
     job.single_host_segment = nullptr;
     job.queues.resize(local_jettys_.size());
-    std::vector<std::size_t> queue_counts(local_jettys_.size(), 0U);
-    for (std::size_t i = 0U; i < wr_count; ++i) ++queue_counts[i % local_jettys_.size()];
     for (std::size_t jetty = 0U; jetty < local_jettys_.size(); ++jetty) {
-      job.queues[jetty].local.resize(queue_counts[jetty]);
-      job.queues[jetty].remote.resize(queue_counts[jetty] * remote_sgl_size);
-      job.queues[jetty].wrs.resize(queue_counts[jetty]);
+      const std::size_t queue_count = wr_count / local_jettys_.size() +
+          (jetty < wr_count % local_jettys_.size() ? 1U : 0U);
+      job.queues[jetty].local.resize(queue_count);
+      job.queues[jetty].remote.resize(queue_count * remote_sgl_size);
+      job.queues[jetty].wrs.resize(queue_count);
     }
-    job.remote_offsets.resize(count);
-    job.host_segments.resize(count);
+    const bool generate_remote_offsets = remote_offsets == nullptr;
+    if (generate_remote_offsets) job.generated_remote_offsets.resize(count);
+    // Explicit offsets remain valid for this synchronous transfer, so avoid
+    // copying the caller's array on every batch.
+    job.remote_offsets = generate_remote_offsets
+        ? job.generated_remote_offsets.data() : remote_offsets;
     std::uint64_t total = 0U;
     bool use_explicit_host_region = explicit_host_region_.segment != nullptr;
     for (std::size_t i = 0U; i < count; ++i) {
       const auto& buffer = buffers[i];
+      if (generate_remote_offsets &&
+          total > std::numeric_limits<std::uint64_t>::max() - offset) {
+        return Status::InvalidArgument("invalid SGL batch entry");
+      }
       const std::uint64_t remote_offset =
-          remote_offsets == nullptr ? offset + total : remote_offsets[i];
-      if (buffer.data == nullptr || buffer.bytes == 0U ||
+          generate_remote_offsets ? offset + total : remote_offsets[i];
+      const bool invalid_entry = !rows_validated &&
+          (buffer.data == nullptr || buffer.bytes == 0U ||
           buffer.bytes > std::numeric_limits<std::uint32_t>::max() ||
-          total > std::numeric_limits<std::uint64_t>::max() - buffer.bytes ||
+          buffer.bytes > std::numeric_limits<std::uintptr_t>::max() -
+              reinterpret_cast<std::uintptr_t>(buffer.data) ||
           remote_offset > remote_region_.length ||
-          buffer.bytes > remote_region_.length - remote_offset) {
+          buffer.bytes > remote_region_.length - remote_offset);
+      const bool total_overflow = generate_remote_offsets &&
+          buffer.bytes > std::numeric_limits<std::uint64_t>::max() - total;
+      if (invalid_entry || total_overflow) {
         return Status::InvalidArgument("invalid SGL batch entry");
       }
       if (use_explicit_host_region) {
@@ -686,12 +702,15 @@ struct CpuUrmaTransport::Impl {
           use_explicit_host_region = false;
         }
       }
-      job.remote_offsets[i] = remote_offset;
-      total += buffer.bytes;
+      if (generate_remote_offsets) {
+        job.generated_remote_offsets[i] = remote_offset;
+        total += buffer.bytes;
+      }
     }
     if (use_explicit_host_region) {
       job.single_host_segment = explicit_host_region_.segment;
     } else if (remote_sgl_size > 1U) {
+      job.host_segments.resize(count);
       // Register each entire contiguous source span: a single SGE must use
       // one segment covering all rows, even across page/registration boundaries.
       for (std::size_t i = 0U; i < group_count; ++i) {
@@ -703,6 +722,7 @@ struct CpuUrmaTransport::Impl {
         job.host_segments[first] = host->segment;
       }
     } else {
+      job.host_segments.resize(count);
       for (std::size_t i = 0U; i < count; ++i) {
         RegisteredHostBuffer* host = FindRegisteredHostBuffer(
             buffers[i].data, buffers[i].bytes);
@@ -773,20 +793,31 @@ struct CpuUrmaTransport::Impl {
     last_batch_timing_ = {};
     const std::size_t batch_capacity = kJettyDepth * local_jettys_.size();
     const bool scatter = write && batch_remote_sgl_size_ > 1U;
-    const Status plan_status = cpu_urma_detail::PlanWriteScatterGroups(
-        buffers, remote_offsets, count, scatter ? batch_remote_sgl_size_ : 1U,
-        remote_region_.length, &batch_groups_);
+    const auto plan_start = std::chrono::steady_clock::now();
+    const Status plan_status = scatter
+        ? cpu_urma_detail::PlanWriteScatterGroups(
+              buffers, remote_offsets, count, batch_remote_sgl_size_,
+              remote_region_.length, &batch_groups_)
+        : cpu_urma_detail::ValidateBatchRows(
+              buffers, remote_offsets, count, remote_region_.length);
     if (!plan_status.ok()) return plan_status;
     CpuUrmaTransport::BatchTiming total_timing{};
-    for (std::size_t begin = 0U; begin < batch_groups_.size(); begin += batch_capacity) {
-      const std::size_t chunk = std::min(batch_capacity, batch_groups_.size() - begin);
-      const std::size_t first_row = batch_groups_[begin].first;
-      const auto& last_group = batch_groups_[begin + chunk - 1U];
-      const std::size_t row_count = last_group.first + last_group.count - first_row;
+    total_timing.setup_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - plan_start).count());
+    const std::size_t wr_count = scatter ? batch_groups_.size() : count;
+    for (std::size_t begin = 0U; begin < wr_count; begin += batch_capacity) {
+      const std::size_t chunk = std::min(batch_capacity, wr_count - begin);
+      const std::size_t first_row = scatter ? batch_groups_[begin].first : begin;
+      const std::size_t row_count = scatter
+          ? batch_groups_[begin + chunk - 1U].first +
+                batch_groups_[begin + chunk - 1U].count - first_row
+          : chunk;
       const Status status = TransferSglBatchLocked(
           write, 0U, buffers + first_row, remote_offsets + first_row,
-          row_count, batch_groups_.data() + begin, chunk,
-          scatter ? batch_remote_sgl_size_ : 1U);
+          row_count, scatter ? batch_groups_.data() + begin : nullptr,
+          scatter ? chunk : 0U, scatter ? batch_remote_sgl_size_ : 1U,
+          true);
       if (!status.ok()) {
         last_batch_timing_ = {};
         return status;

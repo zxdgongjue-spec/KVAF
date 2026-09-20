@@ -233,6 +233,11 @@ tests/run_cpu_batch_put_miss_count_perf.sh "$PWD/build-cpu" \
   --remote-sgl-size 8 --iterations 1000 --warmup 5
 ```
 
+The runner sets `OMP_WAIT_POLICY=ACTIVE` before launching Python so the
+OpenMP submission workers do not sleep between batches. CPU placement remains
+caller-controlled; set `OMP_PROC_BIND=close OMP_PLACES=cores` explicitly when
+dedicated nearby cores have been selected for the benchmark.
+
 脚本默认扫描 `token_bytes={128,256,512,656,1024,2048,4096}` 和
 `miss_count={32,64,128,256,512,1024,2048,4096,8192}`，共 63 种组合；因此
 `request_length` 至少要设为 8192。生成两份 CSV，每份均包含 63 行数据和表头
