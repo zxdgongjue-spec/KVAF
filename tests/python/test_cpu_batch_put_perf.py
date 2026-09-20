@@ -78,7 +78,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--remote-sgl-size",
         type=int,
         default=environment_int("KVAF_CPU_URMA_REMOTE_SGL_SIZE", 1),
-        help="WRITE remote SGEs per WR; >1 combines contiguous CPU rows into one source SGE",
+        help="maximum adjacent CPU/HBM rows coalesced into one WRITE WR",
     )
     parser.add_argument(
         "--device-id", type=int, default=environment_int("DEVICE_ID", 0)

@@ -40,8 +40,8 @@ struct CpuUrmaTransportOptions {
   // urma_post_jetty_send_wr call. Zero prepares and submits one full linked
   // list per Jetty.
   std::uint32_t wqes_per_doorbell{0};
-  // WRITE only: values > 1 enable one contiguous local SGE -> multiple
-  // remote SGEs. Requests above device capacity are split across WRs.
+  // WRITE only: maximum adjacent rows coalesced into one contiguous local and
+  // remote SGE. Local or remote gaps start a new WR.
   std::uint32_t remote_sgl_size{1};
   // Number of independent Jettys and OpenMP submission workers.
   std::uint32_t jetty_count{4};
@@ -86,9 +86,8 @@ class CpuUrmaTransport final {
                        std::size_t count);
   // CPU BatchPut path: transfer packed CPU DRAM rows into independent HBM
   // destinations. This is the CPU-initiated equivalent of AIV BatchGet READs.
-  // With remote_sgl_size > 1, adjacent local rows share one source SGE and
-  // a WR containing up to remote_sgl_size remote destinations. Otherwise,
-  // each row uses one WR.
+  // With remote_sgl_size > 1, adjacent local and remote rows may share one
+  // contiguous WR. Otherwise, each row uses one WR.
   // Queue capacity is applied after grouping, with shared completion fences.
   Status WriteBatch(const std::uint64_t* remote_offsets,
                     const HostSge* sources, std::size_t count);

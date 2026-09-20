@@ -99,14 +99,13 @@ For packed CPU data to multiple remote addresses, use the production
 `kvaf_cpu_urma_eid_perf --remote-sgl-size N` also configure this WRITE grouping.
 
 The CPU HBM client accepts `--remote-sgl-size N` (default 1). Values above 1
-use `WriteBatch` to group contiguous local source blocks into one local SGE
-and up to N remote SGEs per WR. The transport clamps N to device capacity.
-The WRITE request order is sorted by local address once per pass, preserving
-each block's original HBM offset; this changes the posting order, not the
-memory placement or contents. Gaps in sparse host memory still split groups.
-READ remains single-SGE and uses the original shuffled order. The summary
-reports actual `wrs`, which may exceed `ceil(blocks / N)` due to gaps and
-device limits. Default N=1 preserves the random baseline.
+use `WriteBatch` to coalesce up to N rows when both their local and remote
+ranges are contiguous. Each WRITE WR still contains one local and one remote
+SGE because the RC provider does not scatter one WRITE across remote gaps.
+The client sorts blocks by local address and maps that order to contiguous HBM
+offsets; READ uses the same order for validation. Gaps split groups. The
+summary reports actual `wrs`, which may exceed `ceil(blocks / N)`. Default N=1
+preserves the random baseline.
 
 ```bash
 ./build-cpu/tests/kvaf_cpu_hbm_client HOST:PORT \

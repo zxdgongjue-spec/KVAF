@@ -163,29 +163,29 @@ bool RunBatchPass(kvaf::CpuUrmaTransport* transport, bool write,
     return false;
   }
   const auto wall_start = std::chrono::steady_clock::now();
-  const bool scatter_write = write && remote_sgl_size > 1U;
+  const bool coalesced_write = write && remote_sgl_size > 1U;
+  const bool use_coalesced_order = remote_sgl_size > 1U;
   std::vector<std::size_t> positions;
   std::vector<std::uint64_t> remote_offsets;
-  if (scatter_write) {
+  if (use_coalesced_order) {
     positions.resize(order.size());
-    remote_offsets.resize(order.size());
     for (std::size_t i = 0U; i < order.size(); ++i) positions[i] = i;
-    // Keep the original HBM mapping while making contiguous local rows adjacent.
     std::sort(positions.begin(), positions.end(), [&](std::size_t a, std::size_t b) {
       return reinterpret_cast<std::uintptr_t>((*blocks)[order[a]].data) <
              reinterpret_cast<std::uintptr_t>((*blocks)[order[b]].data);
     });
+    if (coalesced_write) remote_offsets.resize(order.size());
   }
   std::vector<kvaf::CpuUrmaTransport::HostSge> requests(order.size());
   for (std::size_t i = 0U; i < order.size(); ++i) {
-    const std::size_t position = scatter_write ? positions[i] : i;
+    const std::size_t position = use_coalesced_order ? positions[i] : i;
     requests[i] = {(*blocks)[order[position]].data, block_bytes};
-    if (scatter_write) remote_offsets[i] = static_cast<std::uint64_t>(position) * block_bytes;
+    if (coalesced_write) remote_offsets[i] = static_cast<std::uint64_t>(i) * block_bytes;
   }
   for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
     const auto start = std::chrono::steady_clock::now();
     const kvaf::Status status = write
-        ? (scatter_write
+        ? (coalesced_write
                ? transport->WriteBatch(remote_offsets.data(), requests.data(), requests.size())
                : transport->WriteSglBatch(0U, requests.data(), requests.size()))
         : transport->ReadSglBatch(0U, requests.data(), requests.size());

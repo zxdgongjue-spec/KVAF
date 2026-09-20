@@ -182,20 +182,19 @@ Jetty 和 CQ；四条通道共享 HBM segment、token 和设备 context。服务
 不需要等待另一个 Jetty 的构造完成。`wqes_per_doorbell > 0` 控制每批 WR 数，
 为 0（默认）时每个 worker 构造完整 Jetty 链表后提交；两种方式都由 worker
 自行下发。每个 Jetty 仅最后一个 WR 请求 CQE，worker 汇合后由调用线程轮询完成。
-WRITE 的 `place_order`、`comp_order` 均为 0，用于与独立测试对照；READ 保留
-末尾 strong-order 和完成顺序设置。CPU JFS/JFR 深度为 8192，JFC 深度为 16384；
+WRITE 和 READ 的 `comp_order` 均为 1，中间 WR 使用 relax-order，最后一个 WR 使用
+strong-order 并请求 CQE。CPU JFS/JFR 深度为 8192，JFC 深度为 16384；
 NPU 每条目标通道的 SQ/RQ 深度为 1024，CQ 深度为 16384。
 
-`CpuRuntime.initialize(..., remote_sgl_size=N)` 控制 WRITE 的远端 SGL 分组。
-默认 1 是单条 WR 对应一条数据的基线。大于 1 时，一个连续本地 DDR SGE 可以
-写入多个指定 HBM 地址，不增加 host memcpy；本地地址不连续、达到有效远端 SGE
-数量或累计长度超过 uint32 上限时拆分 WR。READ 保持每条 WR 一个本地和一个远端
-SGE。已注册的完整 CPU 输入复用原 segment；否则查找或注册覆盖整个源区间的 segment。
+`CpuRuntime.initialize(..., remote_sgl_size=N)` 控制 WRITE 每条 WR 最多合并的相邻行数。
+默认 1 是单条 WR 对应一条数据的基线。大于 1 时，仅当本地 DDR 和远端 HBM 地址
+都连续时，才合并为一个 local SGE 和一个 remote SGE；任一侧有间隔就拆分 WR。
+RC WRITE provider 只消费一个连续 remote SGE，因此不再对多个不连续 HBM 地址构造
+remote scatter。READ 保持每条 WR 一个本地和一个远端 SGE。
 
-不设固定的 31 上限。请求值为正 uint32，实际每条 WR 的远端 SGE 数上限取请求值、
-设备 `max_jfs_rsge` 和 Jetty ABI 字段容量中的较小值。例如请求 128、设备报告 31，
-实际按最多 31 个分组；日志同时打印请求值和生效值。6000 条连续本地行在生效值为 1
-时生成 6000 个 WQE，为 31 时生成 194 个（累计长度未超限）。
+请求值为正 uint32，当前仍按设备 `max_jfs_rsge` 和 Jetty ABI 字段容量限制最大合并
+行数；日志同时打印请求值和生效值。6000 条本地与远端均连续的行在生效值为 1 时
+生成 6000 个 WQE，为 31 时生成 194 个（累计长度未超限）。
 
 基线命令：
 
@@ -212,7 +211,7 @@ worker 的两项时间，不把并行 worker 的时间相加；`poll_ns` 为汇�
 
 Python HBM 集成测试与性能脚本支持 `KVAF_CPU_URMA_REMOTE_SGL_SIZE` 和
 `KVAF_CPU_URMA_DOORBELL_WQES`。设备上的实际 WRITE 提交及回读校验用于确认
-provider 的多远端 SGE 行为。
+合并后的连续 WRITE 行为。
 
 CPU URMA transport/operator 的源码归属 `access_operator/include/cpu_urma` 和
 `access_operator/src/cpu_urma`；Runtime 仅负责 HBM region、MetaManager 和 operator

@@ -13,7 +13,7 @@
 
 namespace {
 using kvaf::CpuUrmaTransport;
-using kvaf::cpu_urma_detail::PlanWriteScatterGroups;
+using kvaf::cpu_urma_detail::PlanWriteCoalescedGroups;
 using kvaf::cpu_urma_detail::SglGroup;
 using kvaf::cpu_urma_detail::ValidateBatchRows;
 
@@ -21,18 +21,17 @@ void Check(bool ok, const char* message) {
   if (!ok) throw std::runtime_error(message);
 }
 
-void PackedWriteScatter() {
-  // More than 13 rows must fit in one WQE: only one local SGE is needed.
+void PackedWriteCoalesce() {
+  // Adjacent local and remote rows can share one contiguous WRITE WQE.
   for (const std::size_t count : {1U, 13U, 31U, 32U, 3000U, 6000U, 32769U}) {
     std::vector<std::uint8_t> source(count * 8);
     std::vector<CpuUrmaTransport::HostSge> buffers(count);
     std::vector<std::uint64_t> offsets(count);
-    std::vector<std::uint8_t> expected(count * 16, 0xEE), actual = expected;
+    std::vector<std::uint8_t> expected(count * 8, 0xEE), actual = expected;
     std::size_t cursor = 0;
     for (std::size_t i = 0; i < count; ++i) {
       const std::size_t bytes = 1 + i % 8;
-      // Reversed destinations with gaps exercise independent remote SGEs.
-      offsets[i] = (count - 1 - i) * 16;
+      offsets[i] = cursor;
       buffers[i] = {source.data() + cursor, bytes};
       std::fill_n(source.data() + cursor, bytes, static_cast<std::uint8_t>(i % 197));
       std::memcpy(expected.data() + offsets[i], buffers[i].data, bytes);
@@ -41,9 +40,9 @@ void PackedWriteScatter() {
     for (const std::size_t limit : {1U, 31U, 64U, 128U}) {
       std::fill(actual.begin(), actual.end(), 0xEE);
       std::vector<SglGroup> groups;
-      Check(PlanWriteScatterGroups(buffers.data(), offsets.data(), count, limit,
-                                    actual.size(), &groups).ok(), "WRITE scatter plan failed");
-      Check(groups.size() == (count + limit - 1) / limit, "WRITE scatter WQE count");
+      Check(PlanWriteCoalescedGroups(buffers.data(), offsets.data(), count, limit,
+                                    actual.size(), &groups).ok(), "WRITE coalesce plan failed");
+      Check(groups.size() == (count + limit - 1) / limit, "WRITE coalesced WQE count");
       std::size_t next = 0;
       // Exercise group rebasing at a 1024-WQE queue boundary as transport does.
       for (std::size_t begin = 0; begin < groups.size(); begin += 1024) {
@@ -53,52 +52,50 @@ void PackedWriteScatter() {
         for (std::size_t g = begin; g < std::min(begin + 1024, groups.size()); ++g) {
           const auto& group = groups[g];
           Check(group.first == next && group.count == std::min<std::size_t>(limit, count - next),
-                "WRITE scatter rows missing or duplicated");
+                "WRITE coalesced rows missing or duplicated");
           const auto first = group.first - base_row;
           const auto* local = static_cast<const std::uint8_t*>(chunk_buffers[first].data);
-          std::size_t consumed = 0;
-          for (std::size_t j = 0; j < group.count; ++j) {
-            const auto bytes = chunk_buffers[first + j].bytes;
-            std::memcpy(actual.data() + chunk_offsets[first + j], local + consumed, bytes);
-            consumed += bytes;
-          }
-          Check(consumed == group.bytes, "WRITE source/destination length mismatch");
+          std::memcpy(actual.data() + chunk_offsets[first], local, group.bytes);
           next += group.count;
         }
       }
-      Check(next == count && actual == expected, "WRITE scatter data or remote gaps corrupted");
+      Check(next == count && actual == expected, "WRITE coalesced data corrupted");
     }
   }
 }
 
-void WriteScatterLimits() {
+void WriteCoalesceLimits() {
   std::array<std::uint8_t, 64> source{};
   CpuUrmaTransport::HostSge buffers[]{{source.data(), 3}, {source.data() + 3, 5},
                                      {source.data() + 20, 2}, {source.data() + 22, 6}};
-  std::uint64_t offsets[]{40, 0, 30, 8};
+  std::uint64_t offsets[]{0, 3, 20, 22};
   std::vector<SglGroup> groups;
-  Check(PlanWriteScatterGroups(buffers, offsets, 4, 31, 64, &groups).ok(), "local gap plan");
+  Check(PlanWriteCoalescedGroups(buffers, offsets, 4, 31, 64, &groups).ok(), "local gap plan");
   Check(groups.size() == 2 && groups[0].count == 2 && groups[1].count == 2,
         "noncontiguous local spans must split WRITE WQEs");
-  Check(PlanWriteScatterGroups(buffers, offsets, 4, 1, 64, &groups).ok() && groups.size() == 4,
-        "remote SGE limit not enforced");
-  Check(!PlanWriteScatterGroups(buffers, offsets, 4, 0, 64, &groups).ok(), "zero remote SGL");
+  offsets[1] = 4;
+  Check(PlanWriteCoalescedGroups(buffers, offsets, 4, 31, 64, &groups).ok() && groups.size() == 3,
+        "noncontiguous remote spans must split WRITE WQEs");
+  offsets[1] = 3;
+  Check(PlanWriteCoalescedGroups(buffers, offsets, 4, 1, 64, &groups).ok() && groups.size() == 4,
+        "row coalescing limit not enforced");
+  Check(!PlanWriteCoalescedGroups(buffers, offsets, 4, 0, 64, &groups).ok(), "zero remote SGL");
   offsets[3] = 60;
-  Check(!PlanWriteScatterGroups(buffers, offsets, 4, 31, 64, &groups).ok() && groups.empty(),
-        "remote overflow left a partial scatter plan");
+  Check(!PlanWriteCoalescedGroups(buffers, offsets, 4, 31, 64, &groups).ok() && groups.empty(),
+        "remote overflow left a partial coalescing plan");
   offsets[3] = 8;
   buffers[3].data = reinterpret_cast<void*>(std::numeric_limits<std::uintptr_t>::max() - 2);
-  Check(!PlanWriteScatterGroups(buffers, offsets, 4, 31, 64, &groups).ok(), "local overflow");
+  Check(!PlanWriteCoalescedGroups(buffers, offsets, 4, 31, 64, &groups).ok(), "local overflow");
 
   // Synthetic addresses are used only for planning, never dereferenced.
   constexpr std::uint64_t max_length = std::numeric_limits<std::uint32_t>::max();
   CpuUrmaTransport::HostSge large[]{{reinterpret_cast<void*>(4096), max_length - 1},
       {reinterpret_cast<void*>(4096 + max_length - 1), 2}};
   std::uint64_t large_offsets[]{0, max_length - 1};
-  Check(PlanWriteScatterGroups(large, large_offsets, 2, 31, max_length + 1, &groups).ok() &&
+  Check(PlanWriteCoalescedGroups(large, large_offsets, 2, 31, max_length + 1, &groups).ok() &&
         groups.size() == 2, "single local SGE length overflow was not split");
   large[0].bytes = 0;
-  Check(!PlanWriteScatterGroups(large, large_offsets, 2, 31, max_length + 1, &groups).ok(),
+  Check(!PlanWriteCoalescedGroups(large, large_offsets, 2, 31, max_length + 1, &groups).ok(),
         "zero length WRITE row accepted");
 }
 
@@ -173,8 +170,8 @@ void JettyChunkSubmission() {
 
 int main() {
   try {
-    PackedWriteScatter();
-    WriteScatterLimits();
+    PackedWriteCoalesce();
+    WriteCoalesceLimits();
     BatchRowValidation();
     JettyChunkSubmission();
     std::cout << "CPU URMA SGL planning tests passed\n";

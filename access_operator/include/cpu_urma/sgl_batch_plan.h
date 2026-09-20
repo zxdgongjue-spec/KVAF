@@ -37,18 +37,19 @@ inline Status ValidateBatchRows(const CpuUrmaTransport::HostSge* buffers,
   return Status::OK();
 }
 
-// WRITE scatter: one contiguous local span feeds up to remote_sgl_size
-// independent remote SGEs. Keep request order and split at local gaps.
-inline Status PlanWriteScatterGroups(const CpuUrmaTransport::HostSge* buffers,
-                                     const std::uint64_t* remote_offsets,
-                                     std::size_t count, std::size_t remote_sgl_size,
-                                     std::uint64_t remote_bytes,
-                                     std::vector<SglGroup>* groups) {
+// Coalesce up to remote_sgl_size rows only when both local and remote ranges
+// are contiguous. RC WRITE consumes one remote SGE, so remote gaps must start
+// a new WR even when the local source remains contiguous.
+inline Status PlanWriteCoalescedGroups(const CpuUrmaTransport::HostSge* buffers,
+                                       const std::uint64_t* remote_offsets,
+                                       std::size_t count, std::size_t remote_sgl_size,
+                                       std::uint64_t remote_bytes,
+                                       std::vector<SglGroup>* groups) {
   if (groups == nullptr) return Status::InvalidArgument("missing SGL plan output");
   groups->clear();
   if (buffers == nullptr || remote_offsets == nullptr || count == 0 ||
       remote_sgl_size == 0)
-    return Status::InvalidArgument("invalid WRITE scatter plan input");
+    return Status::InvalidArgument("invalid WRITE coalescing plan input");
   constexpr auto max_bytes = std::numeric_limits<std::uint32_t>::max();
   for (std::size_t i = 0; i < count; ++i) {
     const auto bytes = buffers[i].bytes;
@@ -58,13 +59,16 @@ inline Status PlanWriteScatterGroups(const CpuUrmaTransport::HostSge* buffers,
         bytes > std::numeric_limits<std::uintptr_t>::max() - address ||
         offset > remote_bytes || bytes > remote_bytes - offset) {
       groups->clear();
-      return Status::InvalidArgument("WRITE scatter row is outside its buffer or remote region");
+      return Status::InvalidArgument("WRITE row is outside its buffer or remote region");
     }
     if (!groups->empty()) {
       auto& previous = groups->back();
       const auto base = reinterpret_cast<std::uintptr_t>(buffers[previous.first].data);
+      const auto remote_base = remote_offsets[previous.first];
       if (previous.count < remote_sgl_size && bytes <= max_bytes - previous.bytes &&
-          address == base + previous.bytes) {
+          address == base + previous.bytes &&
+          previous.bytes <= remote_bytes - remote_base &&
+          offset == remote_base + previous.bytes) {
         ++previous.count;
         previous.bytes += bytes;
         continue;

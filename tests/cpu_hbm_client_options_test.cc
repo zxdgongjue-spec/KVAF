@@ -7,7 +7,7 @@
 #include "cpu_urma/sgl_batch_plan.h"
 
 namespace {
-std::size_t scatter_posts = 0;
+std::size_t coalesced_posts = 0;
 std::size_t single_posts = 0;
 std::size_t read_posts = 0;
 }
@@ -41,9 +41,9 @@ Status CpuUrmaTransport::WriteSglBatch(std::uint64_t offset, const HostSge* buff
 }
 Status CpuUrmaTransport::WriteBatch(const std::uint64_t* offsets, const HostSge* buffers,
                                   std::size_t count) {
-  ++scatter_posts;
+  ++coalesced_posts;
   std::vector<cpu_urma_detail::SglGroup> groups;
-  const auto status = cpu_urma_detail::PlanWriteScatterGroups(
+  const auto status = cpu_urma_detail::PlanWriteCoalescedGroups(
       buffers, offsets, count, impl_->remote_sgl_size, impl_->remote.size(), &groups);
   if (!status.ok()) return status;
   for (std::size_t i = 0; i < count; ++i) {
@@ -134,17 +134,17 @@ int main() {
   const std::vector<std::size_t> order{2, 0, 3, 1};
   Stats write;
   Expect(RunBatchPass(&transport, true, &blocks, order, 16, 2, &write, 2),
-         "scatter WRITE must succeed");
-  Expect(scatter_posts == 2 && single_posts == 0 && write.wrs == 4 && write.bytes == 128,
-         "scatter WRITE must use grouping and actual WR accounting");
+         "coalesced WRITE must succeed");
+  Expect(coalesced_posts == 2 && single_posts == 0 && write.wrs == 4 && write.bytes == 128,
+         "coalesced WRITE must use grouping and actual WR accounting");
   std::fill(storage.begin(), storage.end(), 0);
   Stats read;
   Expect(RunBatchPass(&transport, false, &blocks, order, 16, 1, &read, 2) &&
              storage == expected && read_posts == 1 && read.wrs == 4,
-         "READ must preserve the original shuffled mapping and single-SGE routing");
+         "READ must preserve the coalesced WRITE mapping and single-SGE routing");
   Stats baseline;
   Expect(RunBatchPass(&transport, true, &blocks, order, 16, 1, &baseline) &&
-             single_posts == 1 && scatter_posts == 2 && baseline.wrs == 4,
+             single_posts == 1 && coalesced_posts == 2 && baseline.wrs == 4,
          "default WRITE must preserve the single-SGE baseline");
 
   std::vector<std::uint8_t> sparse_storage(128, 7);
