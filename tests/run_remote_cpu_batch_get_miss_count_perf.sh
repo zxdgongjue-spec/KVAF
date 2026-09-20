@@ -77,6 +77,22 @@ cycles_to_us() {
     'BEGIN { printf "%.3f", cycles / mhz }'
 }
 
+split_initialize_log() {
+  local source_log="$1"
+  local selection_log="$2"
+  local shape_log="${source_log}.without_ub_device_selection"
+  awk -v selection_log="$selection_log" -v shape_log="$shape_log" '
+    $1 == "BATCH_GET_PERF_PHASE_BEGIN" && $2 == "phase=initialize" {
+      in_initialize = 1
+    }
+    { print > (in_initialize ? selection_log : shape_log) }
+    $1 == "BATCH_GET_PERF_PHASE_DONE" && $2 == "phase=initialize" {
+      in_initialize = 0
+    }
+  ' "$source_log"
+  mv "$shape_log" "$source_log"
+}
+
 adaptive_requested=false
 base_options=()
 for option in "$@"; do
@@ -89,7 +105,7 @@ done
 
 selected_ub_device=""
 adaptive_selection_skipped=false
-selection_log="$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR/ub-device-selection.log"
+selection_log="$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR/ub_device_selection.log"
 sweep_options=()
 if ((${#base_options[@]} > 0)); then
   sweep_options=("${base_options[@]}")
@@ -130,6 +146,7 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
           run_options+=(--adaptive-ub-device)
           adaptive_this_shape=true
         fi
+        run_status=0
         if "$KVAF_BATCH_GET_PERF_RUNNER" "$KVAF_BUILD_DIR" \
           ${run_options[@]+"${run_options[@]}"} \
           --token-bytes "$token_bytes" --miss-count "$miss_count" \
@@ -139,9 +156,15 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
           2>&1 | tee "$log_file"; then
           :
         else
-          status=$?
-          echo "BATCH_GET_MISS_SWEEP_FAILED token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core status=$status" >&2
-          exit "$status"
+          run_status=$?
+        fi
+        if [[ "$adaptive_this_shape" == true ]]; then
+          split_initialize_log "$log_file" "$selection_log"
+          echo "BATCH_GET_UB_DEVICE_SELECTION_LOG_WRITTEN path=$selection_log"
+        fi
+        if ((run_status != 0)); then
+          echo "BATCH_GET_MISS_SWEEP_FAILED token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core status=$run_status" >&2
+          exit "$run_status"
         fi
 
     total_profile_result="$(
@@ -159,9 +182,13 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
           exit 1
         fi
 
+        active_log="$log_file"
+        if [[ "$adaptive_this_shape" == true ]]; then
+          active_log="$selection_log"
+        fi
         active_record="$(
           awk '$1 == "[KVAF_AIV]" && ($2 == "UB_DEVICE_SELECTED" || $2 == "UB_DEVICE_REUSED") { result = $0 }
-               END { print result }' "$log_file"
+               END { print result }' "$active_log"
         )"
         shape_ub_device="$selected_ub_device"
         if [[ -n "$active_record" ]]; then
@@ -178,21 +205,10 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
           if [[ "$adaptive_this_shape" == true ]]; then
             selected_ub_device="$active_ub_device"
             sweep_options=("${base_options[@]}" --peer-ub-device "$selected_ub_device")
-            awk '$1 == "[KVAF_AIV]" &&
-                 ($2 == "UB_DEVICE_PROBE_PLAN" ||
-                  $2 == "UB_DEVICE_PROBE_RESULT" ||
-                  $2 == "UB_DEVICE_SELECTED")' "$log_file" >"$selection_log"
-            filtered_shape_log="${log_file}.without_ub_device_selection"
-            awk '!($1 == "[KVAF_AIV]" &&
-                   ($2 == "UB_DEVICE_PROBE_PLAN" ||
-                    $2 == "UB_DEVICE_PROBE_RESULT" ||
-                    $2 == "UB_DEVICE_SELECTED"))' "$log_file" >"$filtered_shape_log"
-            mv "$filtered_shape_log" "$log_file"
-            echo "BATCH_GET_UB_DEVICE_SELECTION_LOG_WRITTEN path=$selection_log"
           fi
         elif [[ "$adaptive_this_shape" == true ]] &&
           awk '$1 == "[KVAF_AIV]" && $2 == "UB_DEVICE_ADAPTIVE_SKIPPED" { found = 1 }
-               END { exit !found }' "$log_file"; then
+               END { exit !found }' "$selection_log"; then
           adaptive_selection_skipped=true
         elif [[ "$adaptive_this_shape" == true ]]; then
           echo "ERROR: adaptive startup did not report a selected UB device" >&2

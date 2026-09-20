@@ -682,9 +682,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "timing=call_to_stream_completion"
         )
 
-        print("BATCH_GET_PERF_PHASE_BEGIN phase=initialize")
+        print("BATCH_GET_PERF_PHASE_BEGIN phase=initialize", flush=True)
         runtime.initialize(ddr_bytes, block_bytes)
-        print("BATCH_GET_PERF_PHASE_DONE phase=initialize")
+        print("BATCH_GET_PERF_PHASE_DONE phase=initialize", flush=True)
 
         # Every table entry contains the same deterministic token pattern. Reusing
         # a bounded source Tensor keeps setup memory independent of table capacity;
