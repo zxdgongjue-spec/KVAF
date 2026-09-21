@@ -162,6 +162,9 @@ token = int(sys.argv[sys.argv.index("--token-bytes") + 1])
 miss = int(sys.argv[sys.argv.index("--miss-count") + 1])
 assert sys.argv[sys.argv.index("--remote-sgl-size") + 1] == "1"
 perf.print_samples("batch_put_transport_total", [1000, 1001], 0, 8192, miss, token)
+perf.print_samples("batch_put_transport_prepare", [100, 101], 0, 8192, miss, token)
+perf.print_samples("batch_put_transport_post", [200, 201], 0, 8192, miss, token)
+perf.print_samples("batch_put_transport_completion_wait", [300, 301], 0, 8192, miss, token)
 perf.print_samples("batch_put", [10000, 10010], 0, 8192, miss, token)
 ''')
             env = {key: value for key, value in os.environ.items()
@@ -181,16 +184,25 @@ perf.print_samples("batch_put", [10000, 10010], 0, 8192, miss, token)
             with summary.open() as stream:
                 call_rows = list(csv.reader(stream))
             self.assertEqual(rows[0], ["token_bytes", "miss_count", "mean_us", "p50_us",
-                                       "p90_us", "p99_us", "p50_GBps"])
+                                       "p90_us", "p99_us", "p50_GBps",
+                                       "prepare_mean_us", "prepare_p50_us",
+                                       "prepare_p90_us", "prepare_p99_us",
+                                       "post_mean_us", "post_p50_us",
+                                       "post_p90_us", "post_p99_us",
+                                       "completion_wait_mean_us", "completion_wait_p50_us",
+                                       "completion_wait_p90_us", "completion_wait_p99_us"])
             pairs = [(token, miss) for token in (128, 256, 512, 656, 1024, 2048, 4096)
                      for miss in (32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)]
             self.assertEqual(len(rows), 64)
             self.assertEqual(len(call_rows), 64)
-            self.assertEqual(call_rows[0], rows[0])
+            self.assertEqual(call_rows[0], rows[0][:7])
             for row, (token, miss) in zip(rows[1:], pairs):
                 self.assertEqual(row, [str(token), str(miss), f"{1.0005:.3f}",
                                        f"{1.0005:.3f}", "1.001", "1.001",
-                                       f"{token * miss / 1000.5:.3f}"])
+                                       f"{token * miss / 1000.5:.3f}",
+                                       "0.101", "0.101", "0.101", "0.101",
+                                       "0.201", "0.201", "0.201", "0.201",
+                                       "0.300", "0.300", "0.301", "0.301"])
             for row, (token, miss) in zip(call_rows[1:], pairs):
                 self.assertEqual(row, [str(token), str(miss), "10.005", "10.005",
                                        "10.009", "10.010", f"{token * miss / 10005:.3f}"])
@@ -206,6 +218,9 @@ perf.print_samples("batch_put", [10000, 10010], 0, 8192, miss, token)
             runner.write_text('''#!/usr/bin/env bash
 echo 'PERF_RESULT operation=batch_put mean_us=10 p50_us=10 p90_us=10 p99_us=10 p50_GBps=1'
 echo 'PERF_RESULT operation=batch_put_transport_total mean_us=1 p50_us=1 p90_us=1 p99_us=1'
+echo 'PERF_RESULT operation=batch_put_transport_prepare mean_us=0.1 p50_us=0.1 p90_us=0.1 p99_us=0.1'
+echo 'PERF_RESULT operation=batch_put_transport_post mean_us=0.2 p50_us=0.2 p90_us=0.2 p99_us=0.2'
+echo 'PERF_RESULT operation=batch_put_transport_completion_wait mean_us=0.3 p50_us=0.3 p90_us=0.3 p99_us=0.3'
 ''')
             run = subprocess.run(["bash", str(sweep), str(root / "build")],
                                  env=env, text=True, capture_output=True)
