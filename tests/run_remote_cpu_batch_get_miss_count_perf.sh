@@ -77,22 +77,6 @@ cycles_to_us() {
     'BEGIN { printf "%.3f", cycles / mhz }'
 }
 
-split_initialize_log() {
-  local source_log="$1"
-  local selection_log="$2"
-  local shape_log="${source_log}.without_ub_device_selection"
-  awk -v selection_log="$selection_log" -v shape_log="$shape_log" '
-    $1 == "BATCH_GET_PERF_PHASE_BEGIN" && $2 == "phase=initialize" {
-      in_initialize = 1
-    }
-    { print > (in_initialize ? selection_log : shape_log) }
-    $1 == "BATCH_GET_PERF_PHASE_DONE" && $2 == "phase=initialize" {
-      in_initialize = 0
-    }
-  ' "$source_log"
-  mv "$shape_log" "$source_log"
-}
-
 adaptive_requested=false
 base_options=()
 for option in "$@"; do
@@ -109,6 +93,58 @@ selection_log="$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR/ub_device_selection.log"
 sweep_options=()
 if ((${#base_options[@]} > 0)); then
   sweep_options=("${base_options[@]}")
+fi
+if [[ "$adaptive_requested" == true ]]; then
+  calibration_token_bytes=656
+  calibration_miss_count="$KVAF_ADAPTIVE_UB_MISS_COUNT"
+  echo "BATCH_GET_UB_DEVICE_CALIBRATION_BEGIN token_bytes=$calibration_token_bytes miss_count=$calibration_miss_count aiv_cores=2 jettys_per_core=1 warmup=1 samples=5" |
+    tee "$selection_log"
+  calibration_status=0
+  if "$KVAF_BATCH_GET_PERF_RUNNER" "$KVAF_BUILD_DIR" \
+    ${base_options[@]+"${base_options[@]}"} \
+    --adaptive-ub-device --adaptive-calibration-only \
+    --request-length "$calibration_miss_count" \
+    --token-bytes "$calibration_token_bytes" \
+    --tokens-per-block 128 \
+    --miss-count "$calibration_miss_count" \
+    --aiv-cores 2 --jettys-per-core 1 \
+    --warmup 1 --iterations 5 --no-kernel-profile \
+    2>&1 | tee -a "$selection_log"; then
+    :
+  else
+    calibration_status=$?
+  fi
+  if ((calibration_status != 0)); then
+    echo "BATCH_GET_UB_DEVICE_CALIBRATION_FAILED status=$calibration_status" >&2
+    exit "$calibration_status"
+  fi
+  selected_record="$(
+    awk '$1 == "[KVAF_AIV]" && $2 == "UB_DEVICE_SELECTED" { result = $0 }
+         END { print result }' "$selection_log"
+  )"
+  if [[ -n "$selected_record" ]]; then
+    selected_ub_device="$(extract_field "$selected_record" ub_device)"
+    if [[ -z "$selected_ub_device" ]]; then
+      echo "ERROR: malformed UB_DEVICE_SELECTED record: $selected_record" >&2
+      exit 1
+    fi
+    sweep_options=()
+    if ((${#base_options[@]} > 0)); then
+      sweep_options=("${base_options[@]}")
+    fi
+    sweep_options+=(--peer-ub-device "$selected_ub_device")
+    echo "BATCH_GET_UB_DEVICE_CALIBRATION_DONE selected_ub_device=$selected_ub_device reuse=all_formal_shapes" |
+      tee -a "$selection_log"
+  elif awk '$1 == "[KVAF_AIV]" && $2 == "UB_DEVICE_ADAPTIVE_SKIPPED" { found = 1 }
+             END { exit !found }' "$selection_log"; then
+    adaptive_selection_skipped=true
+    echo "BATCH_GET_UB_DEVICE_CALIBRATION_SKIPPED reason=k_side_device_filter" |
+      tee -a "$selection_log"
+  else
+    echo "ERROR: adaptive calibration did not report a selected UB device" >&2
+    exit 1
+  fi
+  echo "BATCH_GET_UB_DEVICE_SELECTION_LOG_WRITTEN path=$selection_log"
 fi
 
 token_bytes_values=()
@@ -139,16 +175,9 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
       for jettys_per_core in "${KVAF_BATCH_GET_JETTYS_PER_CORE[@]}"; do
         echo "BATCH_GET_CONFIG_SWEEP_BEGIN token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core"
         log_file="$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR/token_bytes_${token_bytes}_miss_count_${miss_count}_aiv_cores_${aiv_cores}_jettys_per_core_${jettys_per_core}.log"
-        run_options=("${sweep_options[@]}")
-        adaptive_this_shape=false
-        if [[ "$adaptive_requested" == true && -z "$selected_ub_device" &&
-          "$adaptive_selection_skipped" == false ]]; then
-          run_options+=(--adaptive-ub-device)
-          adaptive_this_shape=true
-        fi
         run_status=0
         if "$KVAF_BATCH_GET_PERF_RUNNER" "$KVAF_BUILD_DIR" \
-          ${run_options[@]+"${run_options[@]}"} \
+          ${sweep_options[@]+"${sweep_options[@]}"} \
           --token-bytes "$token_bytes" --miss-count "$miss_count" \
           --aiv-cores "$aiv_cores" --jettys-per-core "$jettys_per_core" \
           --kernel-profile \
@@ -157,10 +186,6 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
           :
         else
           run_status=$?
-        fi
-        if [[ "$adaptive_this_shape" == true ]]; then
-          split_initialize_log "$log_file" "$selection_log"
-          echo "BATCH_GET_UB_DEVICE_SELECTION_LOG_WRITTEN path=$selection_log"
         fi
         if ((run_status != 0)); then
           echo "BATCH_GET_MISS_SWEEP_FAILED token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core status=$run_status" >&2
@@ -182,13 +207,9 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
           exit 1
         fi
 
-        active_log="$log_file"
-        if [[ "$adaptive_this_shape" == true ]]; then
-          active_log="$selection_log"
-        fi
         active_record="$(
           awk '$1 == "[KVAF_AIV]" && ($2 == "UB_DEVICE_SELECTED" || $2 == "UB_DEVICE_REUSED") { result = $0 }
-               END { print result }' "$active_log"
+               END { print result }' "$log_file"
         )"
         shape_ub_device="$selected_ub_device"
         if [[ -n "$active_record" ]]; then
@@ -202,17 +223,6 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
             exit 1
           fi
           shape_ub_device="$active_ub_device"
-          if [[ "$adaptive_this_shape" == true ]]; then
-            selected_ub_device="$active_ub_device"
-            sweep_options=("${base_options[@]}" --peer-ub-device "$selected_ub_device")
-          fi
-        elif [[ "$adaptive_this_shape" == true ]] &&
-          awk '$1 == "[KVAF_AIV]" && $2 == "UB_DEVICE_ADAPTIVE_SKIPPED" { found = 1 }
-               END { exit !found }' "$selection_log"; then
-          adaptive_selection_skipped=true
-        elif [[ "$adaptive_this_shape" == true ]]; then
-          echo "ERROR: adaptive startup did not report a selected UB device" >&2
-          exit 1
         fi
         if [[ "$adaptive_requested" == true && "$adaptive_selection_skipped" == false &&
           -z "$shape_ub_device" ]]; then

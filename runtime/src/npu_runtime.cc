@@ -564,19 +564,13 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                                        : "no_n_side_candidates");
   }
   const detail::StartupProbeConfig probe_config{
-      detail::kStartupTokenBytes,
-      detail::kStartupTokensPerBlock,
+      impl_->options.batch_get_token_bytes,
+      impl_->options.batch_get_tokens_per_block,
       impl_->options.adaptive_ub_miss_count};
   detail::StartupProbeLayout probe_layout{};
   if (tune_candidates) {
     last = detail::BuildStartupProbeLayout(probe_config, &probe_layout);
     if (!last.ok()) return last;
-    if (explicit_eids && npu_candidates.size() >
-                             static_cast<std::size_t>(detail::kStartupAivCores) *
-                                 detail::kStartupJettysPerCore) {
-      return Status::InvalidArgument(
-          "npu_eids count exceeds fixed adaptive probe worker count");
-    }
   }
   // An explicit N-side list remains one strict multi-EID group. Automatically
   // discovered EIDs are connectivity fallbacks.
@@ -631,13 +625,6 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       // BatchPut intentionally remains on the established single-EID path.
       // Multi-EID striping applies only to BatchGet and uses the vector above.
       impl_->config.peer_local_eid = impl_->config.peer_local_eids.front();
-      impl_->config.npu_core_count =
-          measure ? detail::kStartupAivCores : impl_->options.npu_core_count;
-      impl_->config.jettys_per_core =
-          measure ? detail::kStartupJettysPerCore : impl_->options.jettys_per_core;
-      impl_->config.batch_put_jettys_per_core = measure
-          ? detail::kStartupJettysPerCore
-          : std::min(impl_->options.jettys_per_core, std::uint32_t{2U});
       impl_->CreateCore();
       last = impl_->runtime_core->Initialize(candidate_request);
       if (last.ok()) {
@@ -810,7 +797,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                  impl_->options.device_id, device_names[device].c_str(),
                  device_candidates[device].size(), probe_config.token_bytes,
                  probe_config.tokens_per_block, probe_config.miss_count,
-                 detail::kStartupAivCores, detail::kStartupJettysPerCore,
+                 impl_->options.npu_core_count, impl_->options.jettys_per_core,
                  detail::kStartupWarmup, detail::kStartupSamples);
   }
   return detail::SelectStartupDeviceCandidate(

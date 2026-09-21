@@ -96,15 +96,15 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 `--adaptive-ub-device` 仅在 K 端未指定 `--ub-device` 时启用启动测速：N 端脚本从
 `KVAF_ADAPTIVE_UB_DEVICES` 配置的候选中选择，默认值为
 `udmac0d1e2,udmac0d1e3,udmac1d1e2,udmac1d1e3`，探测请求数由
-`KVAF_ADAPTIVE_UB_MISS_COUNT` 控制（默认 2048）。寻优固定使用 656B token、
-128 tokens-per-block、2 个 AIV core 和每 core 1 个 Jetty，不跟随 sweep 的首个
-正式 shape。每个设备只测首个通过连通性校验的 EID 组合，
+`KVAF_ADAPTIVE_UB_MISS_COUNT` 控制（默认 2048）。性能脚本先启动独立的
+initialize-only 校准进程，固定使用 656B token、128 tokens-per-block、2 个 AIV core
+和每 core 1 个 Jetty；每个设备只测首个通过连通性校验的 EID 组合，
 探测 region 按 block 大小与 2 MiB 的最小公倍数向上对齐；日志保留精简的
 `UB_DEVICE_PROBE_PLAN/RESULT`、`UB_DEVICE_SELECTED` 和 `UB_DEVICE_REUSED`。K 端指定
 单个 `--ub-device` 时走原生首个可用路径；`peer_ub_device` 可让后续进程复用已选设备
-而不重新测速。miss-count sweep 的第一个正式 shape 完成一次标定，后续 shape 复用
-结果，并在 CSV 的 `selected_ub_device` 列记录设备名。N/K 两端必须同时使用控制协议
-v6。
+而不重新测速。校准进程退出后，所有正式 shape 均在新进程中复用结果；校准日志写入
+`ub_device_selection.log`，CSV 的 `selected_ub_device` 列记录设备名。N/K 两端必须
+同时使用控制协议 v6。
 
 ```bash
 KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 \
