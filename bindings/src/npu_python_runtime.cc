@@ -161,7 +161,8 @@ class NpuPythonRuntime final {
                    bool adaptive_ub_device,
                    std::uint32_t adaptive_ub_miss_count,
                    std::string peer_ub_device,
-                   std::vector<std::string> adaptive_peer_ub_devices) {
+                   std::vector<std::string> adaptive_peer_ub_devices,
+                   std::uint32_t batch_get_max_inflight_total) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
                               batch_get_tokens_per_block};
@@ -170,6 +171,7 @@ class NpuPythonRuntime final {
     options.device_id = device_id;
     options.npu_core_count = npu_core_count;
     options.jettys_per_core = jettys_per_core;
+    options.batch_get_max_inflight_total = batch_get_max_inflight_total;
     options.npu_eids = std::move(npu_eids);
     options.adaptive_ub_device = adaptive_ub_device;
     options.adaptive_ub_miss_count = adaptive_ub_miss_count;
@@ -337,6 +339,12 @@ class NpuPythonRuntime final {
       item["kernel_finish_cycle"] = profile.kernel_finish_cycle;
       item["active_requests"] = profile.active_requests;
       item["total_posts"] = profile.total_posts;
+      item["submitted_group_count"] = profile.submitted_group_count;
+      item["completed_group_count"] = profile.completed_group_count;
+      item["completion_count"] = profile.completion_count;
+      item["post_active_cycles"] = profile.post_active_cycles;
+      item["drain_wait_cycles"] = profile.drain_wait_cycles;
+      item["peak_submitted_not_drained"] = profile.peak_submitted_not_drained;
       item["jetty_completion_wait_cycles"] =
           profile.jetty_completion_wait_cycles;
       item["jetty_completion_polls"] = profile.jetty_completion_polls;
@@ -463,7 +471,7 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def(py::init<std::string, std::uint32_t, std::uint32_t, std::uint32_t,
                     std::uint32_t, std::string, std::uint32_t,
                     std::vector<std::string>, bool, std::uint32_t,
-                    std::string, std::vector<std::string>>(),
+                    std::string, std::vector<std::string>, std::uint32_t>(),
            py::arg("batch_get_kernel_object_path"),
            py::arg("batch_get_token_bytes"),
            py::arg("batch_get_tokens_per_block"), py::arg("device_id") = 0,
@@ -475,7 +483,8 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("adaptive_ub_miss_count") = 2048,
            py::arg("peer_ub_device") = "",
            py::arg("adaptive_peer_ub_devices") =
-               std::vector<std::string>{})
+               std::vector<std::string>{},
+           py::arg("batch_get_max_inflight_total") = 2048)
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
            "Connect this NPU Runtime to a CPU Runtime service before initialize.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),

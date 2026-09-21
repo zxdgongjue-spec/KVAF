@@ -38,9 +38,12 @@ typedef struct KvafBatchGetCoreProfile {
   uint64_t total_posts;
   uint64_t jetty_completion_wait_cycles[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE];
   uint64_t jetty_completion_polls[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE];
-  // Keep this profile at eighteen cache lines while retaining expansion room
-  // after the sixty-four per-Jetty wait and poll counters.
-  uint64_t reserved[6];
+  uint64_t submitted_group_count;
+  uint64_t completed_group_count;
+  uint64_t completion_count;  // CQEs consumed, not completed READs
+  uint64_t post_active_cycles;  // sum of group submissions, excluding CQ waits
+  uint64_t drain_wait_cycles;   // sum of all group completion waits
+  uint64_t peak_submitted_not_drained;  // conservative per-core software peak
 } KvafBatchGetCoreProfile;
 
 // ExecuteBatchGet uses only the first cache line on the normal path. The
@@ -67,7 +70,8 @@ typedef struct KvafBatchGetQueueState {
   uint64_t cq_consumer_index;
   uint64_t completed_batch_count;
   uint64_t last_error;
-  uint64_t reserved[3];
+  uint64_t poisoned;  // incomplete/failed submission; requires transport rebuild
+  uint64_t reserved[2];
 } KvafBatchGetQueueState;
 
 // Device view of one Direct-HCCP transport plus one acquired local HBM
@@ -124,6 +128,11 @@ typedef struct KvafExecuteBatchGetKernelArgs {
   uint32_t block_count;
   // Zero preserves the phase-one ABI and selects one Jetty per AIV core.
   uint32_t jettys_per_core;
+  // Total READ budget across this launch's cores. Zero selects the original
+  // whole-batch path; otherwise must be >= 2 * block_count. Captured by value.
+  // Consumes former padding. Host and V2 kernel MUST be rebuilt together;
+  // the versioned kernel symbol prevents loading a pre-window kernel.
+  uint32_t batch_get_max_inflight_total;
 } KvafExecuteBatchGetKernelArgs;
 
 #if defined(__cplusplus)

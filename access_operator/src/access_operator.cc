@@ -149,6 +149,7 @@ bool FitsU32(std::uint64_t value) {
 Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
                                std::uint32_t npu_core_count,
                                std::uint32_t jettys_per_core,
+                               std::uint32_t max_inflight_total,
                                const BatchGetExecutionState& execution,
                                KvafExecuteBatchGetKernelArgs* arguments) {
   if (exec.request == nullptr || arguments == nullptr) {
@@ -218,6 +219,7 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
       static_cast<std::uint32_t>(request.tokens_per_block);
   arguments->block_count = npu_core_count;
   arguments->jettys_per_core = jettys_per_core;
+  arguments->batch_get_max_inflight_total = max_inflight_total;
   return Status::OK();
 }
 
@@ -280,7 +282,9 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
       impl_->config.npu_core_count == 0 ||
       impl_->config.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->config.jettys_per_core == 0 ||
-      impl_->config.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE) {
+      impl_->config.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
+      (impl_->config.batch_get_max_inflight_total != 0U &&
+       impl_->config.batch_get_max_inflight_total < 2U * impl_->config.npu_core_count)) {
     return InvalidArgument("invalid AccessOperator initialization config");
   }
   if (impl_->config.peer_link == nullptr) {
@@ -461,7 +465,7 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   KvafExecuteBatchGetKernelArgs arguments{};
   Status status = BuildBatchGetKernelArgs(
       exec, impl_->config.npu_core_count, impl_->config.jettys_per_core,
-      impl_->execution, &arguments);
+      impl_->config.batch_get_max_inflight_total, impl_->execution, &arguments);
   if (!status.ok()) {
     return status;
   }
@@ -569,6 +573,12 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
     destination.kernel_finish_cycle = source.kernel_finish_cycle;
     destination.active_requests = source.active_requests;
     destination.total_posts = source.total_posts;
+    destination.submitted_group_count = source.submitted_group_count;
+    destination.completed_group_count = source.completed_group_count;
+    destination.completion_count = source.completion_count;
+    destination.post_active_cycles = source.post_active_cycles;
+    destination.drain_wait_cycles = source.drain_wait_cycles;
+    destination.peak_submitted_not_drained = source.peak_submitted_not_drained;
     for (std::size_t jetty = 0;
          jetty < destination.jetty_completion_wait_cycles.size(); ++jetty) {
       destination.jetty_completion_wait_cycles[jetty] =

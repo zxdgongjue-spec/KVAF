@@ -135,11 +135,13 @@ def main() -> int:
         os.environ.get("KVAF_NPU_CORE_COUNT", os.environ.get("KVAF_NPU_AIV_CORES", "2"))
     )
     jettys_per_core = int(os.environ.get("KVAF_NPU_JETTYS_PER_CORE", "1"))
+    max_inflight_total = int(os.environ.get("KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL", "2048"))
     npu_eids = parse_npu_eids(os.environ.get("KVAF_NPU_EIDS"))
     active_percent = int(os.environ.get("KVAF_NPU_ACTIVE_PERCENT", "100"))
     warmup = int(os.environ.get("KVAF_NPU_WARMUP", "1"))
     iterations = int(os.environ.get("KVAF_NPU_ITERATIONS", "5"))
     graph_replays = int(os.environ.get("KVAF_NPU_GRAPH_REPLAYS", "0"))
+    inflight_checks = os.environ.get("KVAF_BATCH_GET_INFLIGHT_CHECKS") == "1"
     # Graph and eager measurements always use the same sample plan.
     graph_warmup = warmup
     graph_iterations = iterations
@@ -220,6 +222,7 @@ def main() -> int:
         npu_core_count=npu_core_count,
         batch_put_kernel_object_path=str(batch_put_kernel),
         jettys_per_core=jettys_per_core,
+        batch_get_max_inflight_total=max_inflight_total,
         npu_eids=npu_eids,
     )
     runtime.link_to(remote_cpu_service)
@@ -379,6 +382,52 @@ def main() -> int:
             payload_slots, token_bytes
         )
         print("RUNTIME_NPU_DYNAMIC_OUTPUT_VALIDATION_PASS sequence=A_B_A")
+
+        boundary_counts = sorted({
+            count for count in (0, 1, 127, 128, 129, 1023, 1024, 1025,
+                                2047, 2048, 2049, 3072, 4096, 8193,
+                                max_inflight_total - 1, max_inflight_total,
+                                max_inflight_total + 1, active_requests)
+            if 0 <= count <= active_requests
+        })
+
+        def check_inflight_profile(count: int) -> None:
+            profiles = list(runtime.batch_get_kernel_profile())
+            if sum(int(p["active_requests"]) for p in profiles) != count:
+                raise AssertionError("profile active request count mismatch")
+            for profile in profiles:
+                core = int(profile["core"])
+                active = count * (core + 1) // npu_core_count - count * core // npu_core_count
+                limit = active
+                if max_inflight_total and count > max_inflight_total:
+                    limit = (max_inflight_total // npu_core_count
+                             + int(core < max_inflight_total % npu_core_count))
+                if int(profile["peak_submitted_not_drained"]) > limit:
+                    raise AssertionError("per-core inflight budget exceeded")
+                if int(profile["submitted_group_count"]) != int(profile["completed_group_count"]):
+                    raise AssertionError("BatchGet returned with undrained groups")
+                if active and int(profile["completion_count"]) == 0:
+                    raise AssertionError("non-empty BatchGet did not consume a CQE")
+
+        if inflight_checks:
+            runtime.start_batch_get_kernel_profile()
+            # Alternate large/empty/small calls through the same SQ/CQ state.
+            for count in boundary_counts + list(reversed(boundary_counts)):
+                output_a.zero_()
+                miss_count.fill_(count)
+                torch.npu.synchronize()
+                execute(output_a)
+                torch.npu.synchronize()
+                validate_output(
+                    tensor_to_bytes(output_a),
+                    [int(i < count) for i in range(requests)],
+                    output_indices_values, payload_slots, token_bytes,
+                )
+                check_inflight_profile(count)
+            runtime.stop_batch_get_kernel_profile()
+            miss_count.fill_(active_requests)
+            torch.npu.synchronize()
+            print(f"RUNTIME_NPU_INFLIGHT_EAGER_PASS counts={boundary_counts}")
 
         for _ in range(warmup):
             execute(output_a)
@@ -568,6 +617,26 @@ def main() -> int:
                     token_bytes,
                 )
                 print(f"RUNTIME_NPU_GRAPH_REPLAY_VALIDATION_PASS replay={replay}")
+
+            if inflight_checks:
+                runtime.start_batch_get_kernel_profile()
+                for epoch, count in enumerate(boundary_counts + list(reversed(boundary_counts))):
+                    output_a.zero_()
+                    torch.npu.synchronize()
+                    graph_payload_slots = prepare_graph_inputs(epoch)
+                    graph_miss_count_host[0] = count
+                    enqueue_graph_inputs()
+                    replay_graph_on_capture_stream()
+                    graph.synchronize(capture_stream)
+                    validate_output(
+                        tensor_to_bytes(output_a),
+                        [int(i < count) for i in range(requests)],
+                        output_indices_values, graph_payload_slots, token_bytes,
+                    )
+                    check_inflight_profile(count)
+                runtime.stop_batch_get_kernel_profile()
+                graph_miss_count_host[0] = active_requests
+                print(f"RUNTIME_NPU_INFLIGHT_GRAPH_PASS counts={boundary_counts}")
 
             print(
                 "GRAPH_PERF_CONTRACT "

@@ -9,7 +9,7 @@
 #include "acl/acl.h"
 
 namespace {
-constexpr char kKernelName[] = "KvafExecuteBatchGetAivKernel";
+constexpr char kKernelName[] = "KvafExecuteBatchGetAivKernelV2";
 constexpr uint32_t kKernelTimeoutSeconds = 180U;
 constexpr uint32_t kKernelLocalMemoryBytes =
     KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES;
@@ -50,6 +50,8 @@ extern "C" int32_t KvafExecuteBatchGetLaunch(const KvafExecuteBatchGetKernelArgs
                                                 aclrtStream stream) {
   if (!g_loaded || g_function == nullptr || arguments == nullptr || stream == nullptr ||
       arguments->block_count == 0U || arguments->block_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
+      (arguments->batch_get_max_inflight_total != 0U &&
+       arguments->batch_get_max_inflight_total < 2U * arguments->block_count) ||
       arguments->request_capacity == 0U || arguments->offsets == 0U ||
       arguments->miss_count == 0U ||
       arguments->token_bytes == 0U || arguments->tokens_per_block == 0U ||
