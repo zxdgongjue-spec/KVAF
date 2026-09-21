@@ -128,10 +128,11 @@ build_cpu() {
   fi
   pybind11_dir="$($python_bin -m pybind11 --cmakedir)"
 
-  # The CPU transport has row-planning and WR-building loops on the hot path.
-  # Build them optimized by default so performance tests measure the transport.
+  # Release optimization triggers SIGBUS in the deployed CPU URMA
+  # initialization ABI. Keep the known-good build mode until that provider
+  # boundary is isolated from the performance-sensitive transfer code.
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
-    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_BUILD_TYPE= \
     -DBUILD_TESTING=ON \
     -DKVAF_BUILD_PYTHON=ON \
     -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON \
