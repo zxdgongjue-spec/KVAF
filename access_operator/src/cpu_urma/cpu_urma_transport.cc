@@ -370,7 +370,7 @@ struct CpuUrmaTransport::Impl {
     context_ = urma_create_context(device_, eid_index_);
     if (context_ == nullptr) return Error("urma_create_context");
     urma_device_attr_t device_attr{};
-    max_rsge_ = 1U;
+    max_message_bytes_ = std::numeric_limits<std::uint32_t>::max();
     if (urma_query_device(device_, &device_attr) == URMA_SUCCESS) {
       std::fprintf(stderr,
                    "[KVAF_CPU_URMA] DEVICE_CAP max_jfs=%u max_jfr=%u max_jetty=%u "
@@ -390,12 +390,15 @@ struct CpuUrmaTransport::Impl {
                    static_cast<unsigned long long>(device_attr.dev_cap.page_size_cap),
                    device_attr.dev_cap.max_oor_cnt,
                    device_attr.dev_cap.mn);
-      if (device_attr.dev_cap.max_jfs_rsge != 0U) {
-        max_rsge_ = std::min<std::uint32_t>(
-            std::numeric_limits<std::uint8_t>::max(), device_attr.dev_cap.max_jfs_rsge);
+      if (device_attr.dev_cap.max_msg_size != 0U) {
+        max_message_bytes_ = std::min<std::uint64_t>(
+            std::numeric_limits<std::uint32_t>::max(),
+            device_attr.dev_cap.max_msg_size);
       }
     }
-    batch_remote_sgl_size_ = std::min(options.remote_sgl_size, max_rsge_);
+    // Coalescing still produces one contiguous remote SGE. max_jfs_rsge does
+    // not limit how many adjacent logical rows can be represented by that SGE.
+    batch_remote_sgl_size_ = options.remote_sgl_size;
     get_tp_list_ = reinterpret_cast<GetTpList>(dlsym(RTLD_DEFAULT, "urma_get_tp_list"));
     import_jetty_ex_ = reinterpret_cast<ImportJettyEx>(dlsym(RTLD_DEFAULT, "urma_import_jetty_ex"));
     if (get_tp_list_ == nullptr || import_jetty_ex_ == nullptr) {
@@ -539,10 +542,11 @@ struct CpuUrmaTransport::Impl {
     }
     if (local_jettys_.empty()) return Error("no CPU Jettys created");
     wqes_per_doorbell_ = options.wqes_per_doorbell;
-    std::fprintf(stderr, "[KVAF_CPU_URMA] JETTYS_READY count=%zu omp_threads=%u wqes_per_doorbell=%zu local_sge=1 remote_sge=1 requested_remote_sgl_size=%u remote_sgl_size=%zu depth=%u\n",
+    std::fprintf(stderr, "[KVAF_CPU_URMA] JETTYS_READY count=%zu omp_threads=%u wqes_per_doorbell=%zu local_sge=1 remote_sge=1 requested_remote_sgl_size=%u remote_sgl_size=%zu max_wr_bytes=%llu depth=%u\n",
                  local_jettys_.size(), options.jetty_count,
                  wqes_per_doorbell_,
-                 options.remote_sgl_size, batch_remote_sgl_size_, kJettyDepth);
+                 options.remote_sgl_size, batch_remote_sgl_size_,
+                 static_cast<unsigned long long>(max_message_bytes_), kJettyDepth);
     initialized_ = true;
     return Status::OK();
   }
@@ -670,37 +674,50 @@ struct CpuUrmaTransport::Impl {
         ? job.generated_remote_offsets.data() : remote_offsets;
     std::uint64_t total = 0U;
     bool use_explicit_host_region = explicit_host_region_.segment != nullptr;
-    for (std::size_t i = 0U; i < count; ++i) {
-      const auto& buffer = buffers[i];
-      if (generate_remote_offsets &&
-          total > std::numeric_limits<std::uint64_t>::max() - offset) {
-        return Status::InvalidArgument("invalid SGL batch entry");
+    const auto host_span_is_registered = [&](const void* data, std::uint64_t bytes) {
+      const auto requested = reinterpret_cast<std::uintptr_t>(data);
+      const auto base = reinterpret_cast<std::uintptr_t>(explicit_host_region_.address);
+      return requested >= base && bytes <= explicit_host_region_.bytes &&
+          requested - base <= explicit_host_region_.bytes - bytes;
+    };
+    if (rows_validated && groups != nullptr) {
+      // Planning already checked every row and made each group contiguous.
+      // Check registered-memory coverage once per resulting WR instead of
+      // walking all source rows again.
+      for (std::size_t i = 0U; use_explicit_host_region && i < group_count; ++i) {
+        const std::size_t first = groups[i].first - groups[0].first;
+        use_explicit_host_region = host_span_is_registered(
+            buffers[first].data, groups[i].bytes);
       }
-      const std::uint64_t remote_offset =
-          generate_remote_offsets ? offset + total : remote_offsets[i];
-      const bool invalid_entry = !rows_validated &&
-          (buffer.data == nullptr || buffer.bytes == 0U ||
-          buffer.bytes > std::numeric_limits<std::uint32_t>::max() ||
-          buffer.bytes > std::numeric_limits<std::uintptr_t>::max() -
-              reinterpret_cast<std::uintptr_t>(buffer.data) ||
-          remote_offset > remote_region_.length ||
-          buffer.bytes > remote_region_.length - remote_offset);
-      const bool total_overflow = generate_remote_offsets &&
-          buffer.bytes > std::numeric_limits<std::uint64_t>::max() - total;
-      if (invalid_entry || total_overflow) {
-        return Status::InvalidArgument("invalid SGL batch entry");
-      }
-      if (use_explicit_host_region) {
-        const auto requested = reinterpret_cast<std::uintptr_t>(buffer.data);
-        const auto base = reinterpret_cast<std::uintptr_t>(explicit_host_region_.address);
-        if (requested < base || buffer.bytes > explicit_host_region_.bytes ||
-            requested - base > explicit_host_region_.bytes - buffer.bytes) {
+    } else {
+      for (std::size_t i = 0U; i < count; ++i) {
+        const auto& buffer = buffers[i];
+        if (generate_remote_offsets &&
+            total > std::numeric_limits<std::uint64_t>::max() - offset) {
+          return Status::InvalidArgument("invalid SGL batch entry");
+        }
+        const std::uint64_t remote_offset =
+            generate_remote_offsets ? offset + total : remote_offsets[i];
+        const bool invalid_entry = !rows_validated &&
+            (buffer.data == nullptr || buffer.bytes == 0U ||
+            buffer.bytes > std::numeric_limits<std::uint32_t>::max() ||
+            buffer.bytes > std::numeric_limits<std::uintptr_t>::max() -
+                reinterpret_cast<std::uintptr_t>(buffer.data) ||
+            remote_offset > remote_region_.length ||
+            buffer.bytes > remote_region_.length - remote_offset);
+        const bool total_overflow = generate_remote_offsets &&
+            buffer.bytes > std::numeric_limits<std::uint64_t>::max() - total;
+        if (invalid_entry || total_overflow) {
+          return Status::InvalidArgument("invalid SGL batch entry");
+        }
+        if (use_explicit_host_region &&
+            !host_span_is_registered(buffer.data, buffer.bytes)) {
           use_explicit_host_region = false;
         }
-      }
-      if (generate_remote_offsets) {
-        job.generated_remote_offsets[i] = remote_offset;
-        total += buffer.bytes;
+        if (generate_remote_offsets) {
+          job.generated_remote_offsets[i] = remote_offset;
+          total += buffer.bytes;
+        }
       }
     }
     if (use_explicit_host_region) {
@@ -793,7 +810,7 @@ struct CpuUrmaTransport::Impl {
     const Status plan_status = coalesce
         ? cpu_urma_detail::PlanWriteCoalescedGroups(
               buffers, remote_offsets, count, batch_remote_sgl_size_,
-              remote_region_.length, &batch_groups_)
+              remote_region_.length, &batch_groups_, max_message_bytes_)
         : cpu_urma_detail::ValidateBatchRows(
               buffers, remote_offsets, count, remote_region_.length);
     if (!plan_status.ok()) return plan_status;
@@ -902,7 +919,7 @@ struct CpuUrmaTransport::Impl {
   urma_target_seg_t* remote_seg_handle_{nullptr};
   urma_seg_t remote_seg_{};
   std::uint32_t eid_index_{0};
-  std::uint32_t max_rsge_{1};
+  std::uint64_t max_message_bytes_{std::numeric_limits<std::uint32_t>::max()};
   std::vector<urma_jfc_t*> jfcs_;
   std::vector<urma_jfr_t*> jfrs_;
   std::vector<urma_jetty_t*> local_jettys_;

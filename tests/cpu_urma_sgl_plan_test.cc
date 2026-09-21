@@ -97,6 +97,16 @@ void WriteCoalesceLimits() {
   large[0].bytes = 0;
   Check(!PlanWriteCoalescedGroups(large, large_offsets, 2, 31, max_length + 1, &groups).ok(),
         "zero length WRITE row accepted");
+
+  CpuUrmaTransport::HostSge capped[]{{source.data(), 8}, {source.data() + 8, 8},
+                                     {source.data() + 16, 8}, {source.data() + 24, 8}};
+  std::uint64_t capped_offsets[]{0, 8, 16, 24};
+  Check(PlanWriteCoalescedGroups(capped, capped_offsets, 4, 128, 64, &groups, 16).ok() &&
+            groups.size() == 2 && groups[0].count == 2 && groups[1].count == 2,
+        "device message size did not split WRITE groups");
+  capped[0].bytes = 17;
+  Check(!PlanWriteCoalescedGroups(capped, capped_offsets, 4, 128, 64, &groups, 16).ok(),
+        "row larger than device message size was accepted");
 }
 
 void BatchRowValidation() {

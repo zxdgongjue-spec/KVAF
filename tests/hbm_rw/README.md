@@ -102,6 +102,9 @@ The CPU HBM client accepts `--remote-sgl-size N` (default 1). Values above 1
 use `WriteBatch` to coalesce up to N rows when both their local and remote
 ranges are contiguous. Each WRITE WR still contains one local and one remote
 SGE because the RC provider does not scatter one WRITE across remote gaps.
+N is a logical row limit rather than a remote-SGE count, so it is not capped by
+`max_jfs_rsge`; the transport starts a new WR before the device's
+`max_msg_size` would be exceeded.
 The client sorts blocks by local address and maps that order to contiguous HBM
 offsets; READ uses the same order for validation. Gaps split groups. The
 summary reports actual `wrs`, which may exceed `ceil(blocks / N)`. Default N=1

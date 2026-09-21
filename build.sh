@@ -128,9 +128,10 @@ build_cpu() {
   fi
   pybind11_dir="$($python_bin -m pybind11 --cmakedir)"
 
-  # Restore the pre-951ce25 build mode, including cached Release configurations.
+  # The CPU transport has row-planning and WR-building loops on the hot path.
+  # Build them optimized by default so performance tests measure the transport.
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
-    -DCMAKE_BUILD_TYPE= \
+    -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_TESTING=ON \
     -DKVAF_BUILD_PYTHON=ON \
     -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON \
