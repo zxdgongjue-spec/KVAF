@@ -826,9 +826,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 source_token_ids = contiguous_source_token_ids
                 if args.source_access_pattern == "shuffled-contiguous":
-                    source_token_ids = source_token_ids[
-                        torch.randperm(request_length, device=device)
-                    ]
+                    source_token_ids = contiguous_source_token_ids.clone()
+                    active_permutation = torch.randperm(
+                        miss_count_value, device=device
+                    )
+                    source_token_ids[:miss_count_value].copy_(
+                        contiguous_source_token_ids[:miss_count_value].index_select(
+                            0, active_permutation
+                        )
+                    )
                 indices = (source_token_ids // tokens_per_block).to(torch.int32)
                 token_slots = (source_token_ids % tokens_per_block).to(torch.int32)
             offsets = token_slots * token_bytes
