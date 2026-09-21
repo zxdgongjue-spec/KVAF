@@ -200,8 +200,9 @@ build-npu/bin/kvaf_execute_batch_put_kernels.o
 `--peer-candidate-id N` 选择服务端打印的 candidate id（默认 0）。
 `--doorbell-wqes N` 设置每次提交的 WR 数，0 表示每个 Jetty 一次提交完整链表。
 `--jettys N` 设置 1 到 16 个独立 Jetty；提交使用相同数量的 OpenMP 线程，默认 4。
-`--prepare-threads N` 独立设置最多 1 到 64 个规划/WR 构造线程，默认 4；每个 Jetty
-仍只有一个线程负责 SQ 提交和 CQ 轮询。
+`--prepare-threads N` 设置通用回退路径最多 1 到 64 个规划/WR 构造线程，默认 4。
+预注册且启用 WRITE 合并时，每个 Jetty owner 单遍完成校验、合并和 WR 构造，随后负责
+该 Jetty 的 SQ 提交和 CQ 轮询，因此该快速路径的线程数由 `--jettys` 决定。
 两端需要配置好 UB 网络；TCP 仅用于交换资源描述，不承载测量的数据。
 
 ### 2. 运行 NPU 端到端测试

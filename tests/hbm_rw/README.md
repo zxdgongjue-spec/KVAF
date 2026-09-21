@@ -67,6 +67,8 @@ achieved CPU-initiated URMA payload rate, not raw HBM silicon bandwidth; with
 Per-batch transport logs are disabled so terminal I/O does not distort the
 measurement. The final summary separates non-contiguous batch `plan`,
 per-sub-batch `setup`, WR `prepare`, hardware `post`, and CQ `poll` wall time.
+The registered coalesced WRITE fast path folds validation and grouping into
+`prepare`, so its separate `plan` value is zero.
 The contiguous READ path has no separate plan, so its validation remains in
 `setup`. A separate `_WALL` line
 keeps the aggregate `submit_wall`, `other`, and `total`; `submit_wall` already
@@ -75,11 +77,13 @@ The explicitly registered host address space is cached as one URMA segment,
 so batch transfers reuse its
 `tseg` directly instead of searching the registration list for every block.
 
-Each block is one single-SGE WR. `--jettys N` selects 1 to 16 Jettys; the
-default is 4. `--prepare-threads N` independently selects a maximum of 1 to 64
-CPU planning and WR-construction workers, also defaulting to 4. Small batches
-use fewer workers. Preparation completes before
-submission. One owner then posts each Jetty and polls that Jetty's final CQE;
+Each WR has one local and one remote SGE. With `--remote-sgl-size N > 1`,
+adjacent local and remote blocks may be coalesced into one WR. `--jettys N`
+selects 1 to 16 Jettys; the default is 4. On the registered coalesced WRITE
+fast path, each Jetty owner validates, groups, and constructs its own WRs in
+one pass. `--prepare-threads N` controls only the generic planning/preparation
+path. Preparation completes before submission. One owner then posts each
+Jetty and polls that Jetty's final CQE;
 different Jettys submit and poll concurrently. Each Jetty supports 8192
 outstanding WRs, so a batch accepts
 at most `8192 * jettys` blocks. The CPU HBM client fixes `OMP_WAIT_POLICY=ACTIVE`

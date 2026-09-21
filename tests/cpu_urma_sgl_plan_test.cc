@@ -13,6 +13,8 @@
 
 namespace {
 using kvaf::CpuUrmaTransport;
+using kvaf::cpu_urma_detail::BuildCoalescedWriteRange;
+using kvaf::cpu_urma_detail::CoalescedWriteSpan;
 using kvaf::cpu_urma_detail::GroupsFitRegisteredRegion;
 using kvaf::cpu_urma_detail::MergeSglPlanSlices;
 using kvaf::cpu_urma_detail::PlanWriteCoalescedGroups;
@@ -24,6 +26,145 @@ using kvaf::cpu_urma_detail::ValidateBatchRows;
 
 void Check(bool ok, const char* message) {
   if (!ok) throw std::runtime_error(message);
+}
+
+void CheckFusedWriteTransfer(
+    const std::vector<CpuUrmaTransport::HostSge>& buffers,
+    const std::vector<std::uint64_t>& offsets, std::size_t remote_bytes,
+    std::size_t owners, std::size_t max_rows, std::uint64_t max_bytes) {
+  std::vector<std::uint8_t> expected(remote_bytes, 0xEE), actual = expected;
+  for (std::size_t row = 0U; row < buffers.size(); ++row) {
+    std::memcpy(expected.data() + offsets[row], buffers[row].data, buffers[row].bytes);
+  }
+  std::vector<std::vector<CoalescedWriteSpan>> prepared(owners);
+  for (std::size_t owner = 0U; owner < owners; ++owner) {
+    const std::size_t begin = buffers.size() * owner / owners;
+    const std::size_t end = buffers.size() * (owner + 1U) / owners;
+    prepared[owner].resize(end - begin);
+    std::size_t wr_count = 99U;
+    Check(BuildCoalescedWriteRange(
+              buffers.data(), offsets.data(), buffers.size(), begin, end,
+              max_rows, remote_bytes, max_bytes, prepared[owner].size(),
+              [&](std::size_t slot, const CoalescedWriteSpan& span) {
+                prepared[owner].at(slot) = span;
+              }, &wr_count).ok(), "fused WRITE range failed");
+    prepared[owner].resize(wr_count);
+    std::size_t next = begin;
+    for (const auto& span : prepared[owner]) {
+      Check(span.first == next && span.count > 0U && span.count <= max_rows &&
+                span.count <= end - next && span.bytes <= max_bytes,
+            "fused WRITE range has invalid row coverage");
+      std::uint64_t bytes = 0U;
+      for (std::size_t row = next; row < next + span.count; ++row) {
+        Check(reinterpret_cast<std::uintptr_t>(buffers[row].data) ==
+                  span.local_address + bytes && offsets[row] == span.remote_offset + bytes,
+              "fused WRITE span crossed a local or remote gap");
+        bytes += buffers[row].bytes;
+      }
+      Check(bytes == span.bytes, "fused WRITE span lost variable row bytes");
+      next += span.count;
+    }
+    Check(next == end, "fused WRITE range lost its tail");
+  }
+  // Model the transport barrier: no descriptor is consumed until all owners
+  // have validated and prepared their complete ranges.
+  for (const auto& queue : prepared) {
+    for (const auto& span : queue) {
+      std::memcpy(actual.data() + span.remote_offset,
+                  reinterpret_cast<const void*>(span.local_address), span.bytes);
+    }
+  }
+  Check(actual == expected, "fused WRITE descriptors changed transferred data");
+}
+
+void FusedWriteRanges() {
+  std::array<std::uint8_t, 512> source{};
+  for (std::size_t i = 0U; i < source.size(); ++i) source[i] = i % 197U;
+  for (const bool sparse : {false, true}) {
+    std::vector<CpuUrmaTransport::HostSge> buffers(11);
+    std::vector<std::uint64_t> offsets(11);
+    std::size_t local = 0U, remote = 0U;
+    for (std::size_t row = 0U; row < buffers.size(); ++row) {
+      const std::size_t bytes = 1U + row % 5U;
+      if (sparse && row == 3U) local += 7U;
+      if (sparse && row == 7U) remote += 11U;
+      buffers[row] = {source.data() + local, bytes};
+      offsets[row] = remote;
+      local += bytes;
+      remote += bytes;
+    }
+    for (const std::size_t owners : {1U, 2U, 4U, 16U}) {
+      CheckFusedWriteTransfer(buffers, offsets, remote, owners, 3U, 11U);
+    }
+  }
+
+  // Exact 64 KiB WR limit, with a one-byte tail. Addresses are synthetic and
+  // only descriptors are inspected, never dereferenced.
+  CpuUrmaTransport::HostSge rows[]{{reinterpret_cast<void*>(0x100000), 32768U},
+      {reinterpret_cast<void*>(0x108000), 32768U},
+      {reinterpret_cast<void*>(0x110000), 1U}};
+  std::uint64_t offsets[]{0U, 32768U, 65536U};
+  std::array<CoalescedWriteSpan, 3> scratch{};
+  std::size_t wr_count = 0U, emitted = 0U;
+  bool capacity_exceeded = false;
+  const auto emit = [&](std::size_t slot, const CoalescedWriteSpan& span) {
+    scratch.at(slot) = span;
+    ++emitted;
+  };
+  Check(BuildCoalescedWriteRange(rows, offsets, 3U, 0U, 3U, 128U,
+            65537U, 65536U, 2U, emit, &wr_count, &capacity_exceeded).ok() &&
+            wr_count == 2U && scratch[0].bytes == 65536U && scratch[0].count == 2U &&
+            scratch[1].first == 2U && scratch[1].bytes == 1U && !capacity_exceeded,
+        "fused WRITE did not split at 64 KiB");
+  emitted = 0U;
+  Check(!BuildCoalescedWriteRange(rows, offsets, 3U, 0U, 3U, 128U,
+            65537U, 65536U, 1U, emit, &wr_count, &capacity_exceeded).ok() &&
+            wr_count == 0U && emitted == 1U && capacity_exceeded,
+        "fused WRITE exceeded scratch capacity or exposed a partial count");
+  emitted = 0U;
+  Check(!BuildCoalescedWriteRange(rows, offsets, 3U, 0U, 3U, 128U,
+            65537U, 65536U, 0U, emit, &wr_count, &capacity_exceeded).ok() &&
+            wr_count == 0U && emitted == 0U && capacity_exceeded,
+        "zero WRITE capacity emitted a descriptor");
+  Check(BuildCoalescedWriteRange(nullptr, nullptr, 3U, 3U, 3U, 1U,
+            65537U, 65536U, 0U, emit, &wr_count, &capacity_exceeded).ok() &&
+            wr_count == 0U && !capacity_exceeded,
+        "empty Jetty range must be a successful no-op");
+
+  // An invalid row near the end may follow prepared descriptors. Failure must
+  // invalidate the entire range, and reusing its scratch must recover cleanly.
+  rows[2].data = nullptr;
+  emitted = 0U;
+  Check(!BuildCoalescedWriteRange(rows, offsets, 3U, 0U, 3U, 1U,
+            65537U, 65536U, 3U, emit, &wr_count, &capacity_exceeded).ok() &&
+            wr_count == 0U && emitted == 1U && !capacity_exceeded,
+        "late invalid row left a usable partial WRITE range");
+  std::size_t first_owner_wrs = 0U;
+  Check(BuildCoalescedWriteRange(rows, offsets, 3U, 0U, 1U, 128U,
+            65537U, 65536U, 3U, emit, &first_owner_wrs).ok() &&
+            first_owner_wrs == 1U &&
+            !BuildCoalescedWriteRange(rows, offsets, 3U, 1U, 3U, 128U,
+                65537U, 65536U, 3U, emit, &wr_count).ok() && wr_count == 0U,
+        "invalid row in the later owner range was not reported");
+  rows[2].data = reinterpret_cast<void*>(0x110000);
+  Check(BuildCoalescedWriteRange(rows, offsets, 3U, 1U, 3U, 128U,
+            65537U, 65536U, 3U, emit, &wr_count).ok() && wr_count == 1U &&
+            scratch[0].first == 1U && scratch[0].local_address == 0x108000U &&
+            scratch[0].remote_offset == 32768U && scratch[0].bytes == 32769U,
+        "fused WRITE range reuse or nonzero row base failed");
+  rows[0].bytes = 65537U;
+  Check(!BuildCoalescedWriteRange(rows, offsets, 3U, 0U, 1U, 128U,
+            65537U, 65536U, 3U, emit, &wr_count).ok() && wr_count == 0U,
+        "oversized row passed the device message limit");
+  rows[0] = {reinterpret_cast<void*>(std::numeric_limits<std::uintptr_t>::max() - 1U), 4U};
+  Check(!BuildCoalescedWriteRange(rows, offsets, 3U, 0U, 1U, 128U,
+            65537U, 65536U, 3U, emit, &wr_count).ok(),
+        "overflowing local address passed fused validation");
+  rows[0] = {source.data(), 4U};
+  offsets[0] = 65536U;
+  Check(!BuildCoalescedWriteRange(rows, offsets, 3U, 0U, 1U, 128U,
+            65537U, 65536U, 3U, emit, &wr_count).ok(),
+        "overflowing remote range passed fused validation");
 }
 
 kvaf::Status PlanInSlices(
@@ -359,6 +500,7 @@ void JettyChunkSubmission() {
 
 int main() {
   try {
+    FusedWriteRanges();
     ParallelWritePlanning();
     PackedWriteCoalesce();
     WriteCoalesceLimits();

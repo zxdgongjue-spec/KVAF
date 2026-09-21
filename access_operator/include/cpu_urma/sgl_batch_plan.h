@@ -11,8 +11,8 @@
 namespace kvaf::cpu_urma_detail {
 
 // Global Release optimization triggers SIGBUS in the deployed URMA provider
-// ABI path. These helpers are pure CPU planning code, so optimize only them
-// without changing compilation of initialization or provider calls.
+// ABI path. These helpers perform only CPU planning/preparation, so optimize
+// them without changing compilation of initialization or provider calls.
 #if defined(__GNUC__) && !defined(__clang__)
 #define KVAF_CPU_URMA_PLAN_HOT __attribute__((hot, noinline, optimize("O3")))
 #else
@@ -24,6 +24,80 @@ struct SglGroup {
   std::size_t count{0};
   std::uint64_t bytes{0};
 };
+
+struct CoalescedWriteSpan {
+  std::size_t first{0};
+  std::size_t count{0};
+  std::uintptr_t local_address{0};
+  std::uint64_t remote_offset{0};
+  std::uint64_t bytes{0};
+};
+
+// Validate and coalesce one owner's [begin, end) rows in a single pass. Emit
+// writes only caller-owned scratch: a later row can still fail validation.
+// No owner may post until every range succeeds. Failure leaves wr_count zero;
+// any scratch emitted before the failure must be discarded.
+template <class Emit>
+KVAF_CPU_URMA_PLAN_HOT inline Status BuildCoalescedWriteRange(
+    const CpuUrmaTransport::HostSge* buffers,
+    const std::uint64_t* remote_offsets, std::size_t row_count,
+    std::size_t begin, std::size_t end, std::size_t max_rows,
+    std::uint64_t remote_bytes, std::uint64_t max_group_bytes,
+    std::size_t wr_capacity, Emit emit, std::size_t* wr_count,
+    bool* capacity_exceeded = nullptr) {
+  if (capacity_exceeded != nullptr) *capacity_exceeded = false;
+  if (wr_count == nullptr) {
+    return Status::InvalidArgument("missing WRITE range WR count");
+  }
+  *wr_count = 0U;
+  if (begin > end || end > row_count || max_rows == 0U ||
+      max_group_bytes == 0U) {
+    return Status::InvalidArgument("invalid WRITE range");
+  }
+  if (begin == end) return Status::OK();
+  if (buffers == nullptr || remote_offsets == nullptr) {
+    return Status::InvalidArgument("missing WRITE range rows");
+  }
+  const auto max_bytes = std::min<std::uint64_t>(
+      max_group_bytes, std::numeric_limits<std::uint32_t>::max());
+  std::size_t emitted = 0U;
+  CoalescedWriteSpan span{};
+  const auto flush = [&]() {
+    if (emitted == wr_capacity) {
+      if (capacity_exceeded != nullptr) *capacity_exceeded = true;
+      return false;
+    }
+    emit(emitted++, span);
+    return true;
+  };
+  for (std::size_t row = begin; row < end; ++row) {
+    const auto address = reinterpret_cast<std::uintptr_t>(buffers[row].data);
+    const auto bytes = buffers[row].bytes;
+    const auto offset = remote_offsets[row];
+    if (address == 0U || bytes == 0U || bytes > max_bytes ||
+        bytes > std::numeric_limits<std::uintptr_t>::max() - address ||
+        offset > remote_bytes || bytes > remote_bytes - offset) {
+      return Status::InvalidArgument("WRITE row is outside its buffer or remote region");
+    }
+    if (span.count != 0U && span.count < max_rows &&
+        bytes <= max_bytes - span.bytes &&
+        address == span.local_address + span.bytes &&
+        offset == span.remote_offset + span.bytes) {
+      ++span.count;
+      span.bytes += bytes;
+      continue;
+    }
+    if (span.count != 0U && !flush()) {
+      return Status::InvalidArgument("WRITE range exceeds WR capacity");
+    }
+    span = {row, 1U, address, offset, bytes};
+  }
+  if (!flush()) {
+    return Status::InvalidArgument("WRITE range exceeds WR capacity");
+  }
+  *wr_count = emitted;
+  return Status::OK();
+}
 
 // One independently planned contiguous range. A caller may process different
 // slices concurrently because each worker writes only its own status/groups.

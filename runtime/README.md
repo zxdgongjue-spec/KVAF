@@ -166,14 +166,13 @@ NUMA 节点。该脚本固定 `OMP_THREAD_LIMIT=4`，因此只适合四线程绑
 `taskset -c 8,10,12,14`（按实际拓扑修改），脚本会在该集合内选核。
 绑核仅对本次启动的测试进程生效，未绑核基线可直接运行原测试程序并使用另一份 CSV。
 
-由于 `951ce25` 在设备上出现 SIGBUS 回归，当前保留回退后的原始 WR 构造路径，
-单独扩展为 4 Jetty/worker，以便验证并发提交。`./build.sh cpu` 同时清空 `CMAKE_BUILD_TYPE`，避免旧构建目录
-继续保留该提交设置的 Release 模式。EID 测试保留阶段日志，用于进一步定位崩溃。
+由于 `951ce25` 在设备上出现 SIGBUS 回归，`./build.sh cpu` 清空全局
+`CMAKE_BUILD_TYPE`。CPU-only 的规划/准备 helper 使用函数级优化，URMA 初始化和 provider
+调用仍保持已验证的编译方式。
 
-CPU URMA 默认创建 4 个 Jetty，每条 WR 的本地 SGE 数固定为 1。Jetty owner
-数量和 CPU 侧规划/WR 构造最大线程数相互独立：`jetty_count` 范围是 1 到 16，
-`prepare_thread_count` 范围是 1 到 64，小批量会自适应减少线程；后者可通过性能工具的
-`--prepare-threads` 配置。
+CPU URMA 默认创建 4 个 Jetty，每条 WR 的本地 SGE 数固定为 1。预注册的合并 WRITE
+由每个 Jetty owner 单遍完成校验、连续段识别和 WR 构造；所有 owner 通过 barrier 后才会
+提交。`prepare_thread_count` 仅控制通用回退路径的规划/准备并行度。
 
 每个 CPU Jetty 的 `CreateChannel` 请求都会在 NPU 服务端创建独立的目标
 Jetty 和 CQ；四条通道共享 HBM segment、token 和设备 context。服务端

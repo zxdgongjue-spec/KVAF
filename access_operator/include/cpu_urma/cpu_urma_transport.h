@@ -47,8 +47,8 @@ struct CpuUrmaTransportOptions {
   std::uint32_t jetty_count{4};
   bool has_external_region{false};
   peer::PeerRegion external_region{};
-  // Maximum CPU workers used to plan and prepare a batch. Independent from
-  // the Jetty owners that submit and poll hardware queues.
+  // Maximum CPU workers used by the generic planner/preparer. The registered
+  // coalesced WRITE fast path instead fuses preparation into each Jetty owner.
   std::uint32_t prepare_thread_count{4};
 };
 
