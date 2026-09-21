@@ -14,6 +14,10 @@ namespace kvaf::detail {
 
 constexpr std::uint32_t kStartupWarmup = 3U;
 constexpr std::uint32_t kStartupSamples = 9U;
+constexpr std::uint32_t kStartupTokenBytes = 656U;
+constexpr std::uint32_t kStartupTokensPerBlock = 128U;
+constexpr std::uint32_t kStartupAivCores = 2U;
+constexpr std::uint32_t kStartupJettysPerCore = 1U;
 constexpr std::uint64_t kStartupHugePageBytes = 2ULL * 1024U * 1024U;
 
 struct StartupProbeConfig {
