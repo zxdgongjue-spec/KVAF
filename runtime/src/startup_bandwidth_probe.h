@@ -31,9 +31,7 @@ class StartupBandwidthProbe {
                          config_.miss_count;
     const auto block_bytes = static_cast<std::size_t>(layout.block_bytes);
     const auto source_bytes = static_cast<std::size_t>(layout.source_bytes);
-    const auto blocks = (static_cast<std::size_t>(config_.miss_count) +
-                         config_.tokens_per_block - 1U) /
-                        config_.tokens_per_block;
+    const auto blocks = static_cast<std::size_t>(StartupProbeBlockCount(config_));
     if (aclrtCreateStream(&stream_) != ACL_SUCCESS) {
       return Status::Internal("startup probe stream creation failed");
     }
@@ -69,17 +67,28 @@ class StartupBandwidthProbe {
     std::vector<std::int32_t> offsets(config_.miss_count);
     std::vector<std::int32_t> destinations(config_.miss_count);
     std::vector<std::uint8_t> expected(payload);
-    std::uint32_t stride = std::min<std::uint32_t>(5U, config_.miss_count);
-    while (stride > 1U && std::gcd(stride, config_.miss_count) != 1U) --stride;
+    std::uint32_t block_stride = std::min<std::uint32_t>(
+        5U, static_cast<std::uint32_t>(blocks));
+    while (block_stride > 1U &&
+           std::gcd(block_stride, static_cast<std::uint32_t>(blocks)) != 1U) {
+      --block_stride;
+    }
     for (std::uint32_t row = 0; row < config_.miss_count; ++row) {
-      // Use a shape-dependent coprime stride so every token is read once and
-      // every device sees the same request order for this shape.
-      const auto token = static_cast<std::uint32_t>(
-          (static_cast<std::uint64_t>(row) * stride) % config_.miss_count);
-      indices[row] = token / config_.tokens_per_block;
-      offsets[row] = (token % config_.tokens_per_block) * config_.token_bytes;
+      // With the default shape, visit every block exactly once in a
+      // deterministic shuffled order. Vary the token slot as well so the probe
+      // does not repeatedly read one fixed offset from each remote block.
+      const auto block = static_cast<std::uint32_t>(
+          (static_cast<std::uint64_t>(row) * block_stride) %
+          blocks);
+      const auto token_slot = static_cast<std::uint32_t>(
+          (static_cast<std::uint64_t>(row) * 17U + 3U) %
+          config_.tokens_per_block);
+      const auto token_offset = token_slot * config_.token_bytes;
+      indices[row] = static_cast<std::int32_t>(block);
+      offsets[row] = static_cast<std::int32_t>(token_offset);
       destinations[row] = row;
-      std::copy_n(source.data() + token * config_.token_bytes,
+      std::copy_n(source.data() + static_cast<std::size_t>(block) * block_bytes +
+                      token_offset,
                   config_.token_bytes,
                   expected.data() + row * config_.token_bytes);
     }

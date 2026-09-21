@@ -793,10 +793,14 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
     std::fprintf(stderr,
                  "[KVAF_AIV] UB_DEVICE_PROBE_PLAN device_id=%u ub_device=%s "
                  "pairs=%zu token_bytes=%u tokens_per_block=%u miss_count=%u "
+                 "probe_blocks=%u source_bytes=%llu ddr_bytes=%llu "
                  "aiv_cores=%u jettys_per_core=%u warmup=%u samples=%u\n",
                  impl_->options.device_id, device_names[device].c_str(),
                  device_candidates[device].size(), probe_config.token_bytes,
                  probe_config.tokens_per_block, probe_config.miss_count,
+                 detail::StartupProbeBlockCount(probe_config),
+                 static_cast<unsigned long long>(probe_layout.source_bytes),
+                 static_cast<unsigned long long>(probe_layout.ddr_bytes),
                  impl_->options.npu_core_count, impl_->options.jettys_per_core,
                  detail::kStartupWarmup, detail::kStartupSamples);
   }

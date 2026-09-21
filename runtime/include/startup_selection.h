@@ -14,6 +14,7 @@ namespace kvaf::detail {
 
 constexpr std::uint32_t kStartupWarmup = 1U;
 constexpr std::uint32_t kStartupSamples = 5U;
+constexpr std::uint32_t kStartupMaxProbeBlocks = 2048U;
 constexpr std::uint64_t kStartupHugePageBytes = 2ULL * 1024U * 1024U;
 
 struct StartupProbeConfig {
@@ -27,6 +28,10 @@ struct StartupProbeLayout {
   std::uint64_t source_bytes{0U};
   std::uint64_t ddr_bytes{0U};
 };
+
+inline std::uint32_t StartupProbeBlockCount(const StartupProbeConfig& config) {
+  return std::min(config.miss_count, kStartupMaxProbeBlocks);
+}
 
 inline Status BuildStartupProbeLayout(const StartupProbeConfig& config,
                                       StartupProbeLayout* layout) {
@@ -43,10 +48,11 @@ inline Status BuildStartupProbeLayout(const StartupProbeConfig& config,
       static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
     return Status::InvalidArgument("adaptive UB probe token offset exceeds int32");
   }
-  const std::uint64_t blocks =
-      (static_cast<std::uint64_t>(config.miss_count) +
-       config.tokens_per_block - 1U) /
-      config.tokens_per_block;
+  // Spread the probe across up to one remote block per request. The formal
+  // benchmark samples blocks from a large table, so packing every request into
+  // the minimum number of adjacent blocks gives a misleadingly small working
+  // set. Cap the block count to keep an externally raised miss count bounded.
+  const std::uint64_t blocks = StartupProbeBlockCount(config);
   if (blocks > static_cast<std::uint64_t>(
                    std::numeric_limits<std::int32_t>::max()) + 1U ||
       block_bytes > std::numeric_limits<std::uint64_t>::max() / blocks) {

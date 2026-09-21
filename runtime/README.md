@@ -98,7 +98,8 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 `udmac0d1e2,udmac0d1e3,udmac1d1e2,udmac1d1e3`，探测请求数由
 `KVAF_ADAPTIVE_UB_MISS_COUNT` 控制（默认 2048）。性能脚本先启动独立的
 initialize-only 校准进程，固定使用 656B token、128 tokens-per-block、2 个 AIV core
-和每 core 1 个 Jetty；每个设备只测首个通过连通性校验的 EID 组合，
+和每 core 1 个 Jetty；默认 2048 个请求分别访问 2048 个独立 block，以确定性乱序
+覆盖约 164 MiB 的远端工作集。每个设备只测首个通过连通性校验的 EID 组合，
 探测 region 按 block 大小与 2 MiB 的最小公倍数向上对齐；日志保留精简的
 `UB_DEVICE_PROBE_PLAN/RESULT`、`UB_DEVICE_SELECTED` 和 `UB_DEVICE_REUSED`。K 端指定
 单个 `--ub-device` 时走原生首个可用路径；`peer_ub_device` 可让后续进程复用已选设备
