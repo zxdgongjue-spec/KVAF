@@ -44,33 +44,22 @@ cd /path/to/kvaf
   --listen 0.0.0.0 --port 28999
 ```
 
-CPU DDR region 支持三种页分配模式，通过 CPU 服务启动参数选择：
+CPU DDR region 支持两种页分配模式；未指定时默认使用 `thp`：
 
 ```bash
-# 保留原行为：4 KiB 对齐的普通匿名内存；操作系统仍可能自行使用 THP。
+# 默认模式：2 MiB 对齐，MADV_HUGEPAGE，并在注册前主动触页；
+# 是否全部合并仍由 Linux THP 决定。
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28999
+
+# 保留原始普通内存行为：4 KiB 对齐，操作系统仍可能自行使用 THP。
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28999 --memory-page-mode default
-
-# 2 MiB 对齐，MADV_HUGEPAGE，并在注册前主动触页；是否全部合并仍由 Linux THP 决定。
-./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28999 --memory-page-mode thp
-
-# 显式从预留的 2 MiB hugetlb 池分配；region 字节数必须是 2 MiB 的整数倍。
-./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28999 --memory-page-mode hugetlb-2m
-```
-
-`hugetlb-2m` 不会在失败时静默回退。启动服务前必须在目标 NUMA node
-预留足够的 2 MiB hugepages；例如默认 2 GiB region 至少需要 1024 页：
-
-```bash
-grep -E 'HugePages|Hugepagesize' /proc/meminfo
-sudo sysctl -w vm.nr_hugepages=1100
 ```
 
 需要固定 NUMA 位置时，应在 UB device 所在 node 启动服务，例如
 `numactl --cpunodebind=N --membind=N ...`。`REGION_ALLOCATED` 日志会记录
-`page_mode`。THP 模式还应通过 `/proc/<pid>/smaps` 的 `AnonHugePages` 验证实际
+`page_mode`。默认 THP 模式还应通过 `/proc/<pid>/smaps` 的 `AnonHugePages` 验证实际
 合并量；Linux 使用大页并不保证 UDMA/IOMMU 一定保留相同的页表粒度。
 
 默认自动枚举所有可用 UMDK UB device/EID；`--ub-device NAME` 和
@@ -91,6 +80,9 @@ runtime.link_to("141.61.92.71:28999")
 runtime.initialize(ddr_bytes, kv_block_bytes)
 ```
 
+已知设备名时也可设置 `peer_ub_device="udmac0d1e2"`，只在该设备的 EID 中按
+连通性选择，不执行带宽标定。`peer_ub_device` 与 `adaptive_ub_device=True` 互斥。
+
 `link_to` 必须在 `initialize` 前调用。初始化会从 HCCL root-info 读取当前物理卡的
 CLOS PG EID、追加 `/proc/asdrv_ub/pair_info` fallback，并组合 CPU UMDK 候选。只有
 64B AIV WRITE 与 CQ 完成成功的 EID 对才会被选中；这同时验证 DDR 注册、segment
@@ -98,6 +90,27 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 未建立 CPU 服务 Link 时，`initialize` 会返回 `InvalidState`。
 `batch_get_token_bytes` 和 `batch_get_tokens_per_block` 无默认值，
 构造 `NpuRuntime` 时必须显式传入。
+
+### 可选启动 UB device 选优
+
+`--adaptive-ub-device` 仅在 K 端未指定 `--ub-device` 时启用启动测速：N 端脚本从
+`KVAF_ADAPTIVE_UB_DEVICES` 配置的候选中选择，默认值为
+`udmac0d1e2,udmac0d1e3,udmac1d1e2,udmac1d1e3`，探测请求数由
+`KVAF_ADAPTIVE_UB_MISS_COUNT` 控制。每个设备只测首个通过连通性校验的 EID 组合，
+探测 region 按 block 大小与 2 MiB 的最小公倍数向上对齐；日志保留精简的
+`UB_DEVICE_PROBE_PLAN/RESULT`、`UB_DEVICE_SELECTED` 和 `UB_DEVICE_REUSED`。K 端指定
+单个 `--ub-device` 时走原生首个可用路径；`peer_ub_device` 可让后续进程复用已选设备
+而不重新测速。miss-count sweep 的第一个正式 shape 完成一次标定，后续 shape 复用
+结果，并在 CSV 的 `selected_ub_device` 列记录设备名。N/K 两端必须同时使用控制协议
+v6。
+
+```bash
+KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 \
+KVAF_ADAPTIVE_UB_DEVICES=udmac0d1e2,udmac0d1e3,udmac1d1e2,udmac1d1e3 \
+KVAF_ADAPTIVE_UB_MISS_COUNT=2048 \
+  ./tests/run_remote_cpu_batch_get_miss_count_perf.sh /absolute/path/to/build-npu \
+  --adaptive-ub-device
+```
 
 需要同时使用多个 NPU EID 时，设置 `NpuRuntimeOptions::npu_eids`（Python
 构造参数同名）。列表中每个 EID 必须是 32 位连续十六进制字符；Runtime
@@ -219,7 +232,8 @@ teardown。它以 `KVAF_NPU_ACTIVE_PERCENT` 决定 `miss_count`（例如 `5` 表
 `batch_put` 将 caller-owned NPU source Tensor 写入 Runtime-owned DDR。该小型
 BatchGet 用例不传 BatchPut kernel，因而不启动 Direct-HCCP BatchPut transport。
 默认使用 2 个 AIV core，每个 core 使用 1 个 Jetty；可通过
-`KVAF_NPU_CORE_COUNT` 和 `KVAF_NPU_JETTYS_PER_CORE` 覆盖。
+`KVAF_NPU_CORE_COUNT` 和 `KVAF_NPU_JETTYS_PER_CORE` 覆盖。BatchGet 每个 core
+支持 1 到 64 个 Jetty，BatchPut 仍最多使用 2 个。
 
 设置 `KVAF_NPU_GRAPH_REPLAYS` 可在同一个 Python 用例中额外运行 Python-owned 的
 raw `kvaf.AclGraph` 图模式：

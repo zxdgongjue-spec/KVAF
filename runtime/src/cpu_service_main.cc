@@ -12,9 +12,10 @@ namespace {
 void PrintUsage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] "
-               "[--memory-page-mode default|thp|hugetlb-2m]\n"
+               "[--memory-page-mode default|thp]\n"
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
-               "candidates are discovered automatically. The service requires only liburma and /dev/uburma.\n",
+               "candidates are discovered automatically. "
+               "The default memory page mode is thp. The service requires only liburma and /dev/uburma.\n",
                program);
 }
 
@@ -38,10 +39,6 @@ bool ParseMemoryPageMode(const std::string& text, kvaf::CpuMemoryPageMode* mode)
     *mode = kvaf::CpuMemoryPageMode::kTransparentHugePage;
     return true;
   }
-  if (text == "hugetlb-2m") {
-    *mode = kvaf::CpuMemoryPageMode::kHugeTlb2M;
-    return true;
-  }
   return false;
 }
 
@@ -57,8 +54,7 @@ int main(int argc, char** argv) {
       return 0;
     }
     if ((argument == "--listen" || argument == "--port" || argument == "--ub-device" ||
-         argument == "--eid-index" ||
-         argument == "--memory-page-mode") && index + 1 >= argc) {
+         argument == "--eid-index" || argument == "--memory-page-mode") && index + 1 >= argc) {
       PrintUsage(argv[0]);
       return 2;
     }
@@ -83,8 +79,7 @@ int main(int argc, char** argv) {
       cpu_options.has_eid_index = true;
     } else if (argument == "--memory-page-mode") {
       if (!ParseMemoryPageMode(argv[++index], &cpu_options.memory_page_mode)) {
-        std::fprintf(stderr,
-                     "invalid --memory-page-mode; expected default, thp, or hugetlb-2m\n");
+        std::fprintf(stderr, "invalid --memory-page-mode; expected default or thp\n");
         return 2;
       }
     } else {

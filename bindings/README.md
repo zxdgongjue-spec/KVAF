@@ -35,13 +35,16 @@ output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数�
 `[0, miss_count)` 前缀参与搬运。
 
 `NpuRuntime(batch_get_kernel_object_path, batch_get_token_bytes,
-batch_get_tokens_per_block, device_id=0, npu_core_count=1,
-batch_put_kernel_object_path="", jettys_per_core=2, npu_eids=[])` 要求显式传入单 token KV
+batch_get_tokens_per_block, device_id=0, npu_core_count=2,
+batch_put_kernel_object_path="", jettys_per_core=1, npu_eids=[],
+adaptive_ub_device=False, adaptive_ub_miss_count=2048, peer_ub_device="",
+adaptive_peer_ub_devices=[])`
+要求显式传入单 token KV
 字节数和每个 KV block 中的 token 数，两个参数均无默认值；
 每个 AccessTable entry 大小为两者乘积。
-`jettys_per_core` 配置 BatchGet 每个 AIV core 使用的 Jetty 数量，
-可选 1 到 64 个独立 Jetty。BatchPut 保持原有实现：该值为 1 或 2 时
-使用相同数量，BatchGet 配置为 3 到 64 时 BatchPut 仍使用 2 个。
+`jettys_per_core` 配置 BatchGet 每个 AIV core 使用的 Jetty 数量，可选 1 到 64 个独立
+Jetty。BatchPut 保持原有实现：该值为 1 或 2 时使用相同数量，BatchGet 配置为 3 到
+64 时 BatchPut 仍使用 2 个。
 远程 CPU DDR 只增加 `runtime.link_to("CPU_IP:port")`，必须在 `initialize` 前调用。
 `npu_eids=[]` 时 EID、UMDK device 与候选 RMA 验证由 C++ Runtime 自动完成；
 显式传入多个 32 位十六进制 EID 时，Runtime 为每个 EID 创建独立
@@ -59,3 +62,10 @@ stream 时使用 `torch.npu.current_stream()`。KVAF 不创建、不保存或销
 Binding 不负责 vLLM 适配。后续只在 Runtime、Meta Manager 和 KV Access Operator 的 C++ 接口稳定后，将需要暴露的类和方法注册到 Python。
 
 CacheOS-vLLM Adaptor 属于 vLLM 侧实现，不放在本目录。
+
+`adaptive_ub_device=True` 在启动时进行 BatchGet 标定，token 大小沿用
+`batch_get_token_bytes`，请求数由 `adaptive_ub_miss_count` 指定，并为当前 Runtime
+固定最佳组合。K 端未指定设备时，性能脚本从 `KVAF_ADAPTIVE_UB_DEVICES` 中筛选；
+K 端指定单个 `--ub-device` 时走原生路径。`peer_ub_device="NAME"` 用于跨进程复用
+选择结果且不重新标定。默认关闭；用法与协议升级要求见
+[Runtime 启动选优说明](../runtime/README.md#可选启动-ub-device-选优)。

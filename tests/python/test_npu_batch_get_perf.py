@@ -14,10 +14,16 @@ environment variables:
     --tokens-per-block     KVAF_BATCH_GET_PERF_TOKENS_PER_BLOCK
     --token-bytes          KVAF_BATCH_GET_PERF_TOKEN_BYTES
     --miss-count           KVAF_BATCH_GET_PERF_MISS_COUNT
+    --source-access-pattern
+                           KVAF_BATCH_GET_PERF_SOURCE_ACCESS_PATTERN
+    --output-access-pattern
+                           KVAF_BATCH_GET_PERF_OUTPUT_ACCESS_PATTERN
     --sort-input-indices   KVAF_BATCH_GET_PERF_SORT_INPUT_INDICES=1
     --kernel-profile       KVAF_BATCH_GET_PERF_KERNEL_PROFILE=1
     --kernel-profile-clock-mhz
                            KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ
+    adaptive UB devices    KVAF_ADAPTIVE_UB_DEVICES
+    adaptive miss count    KVAF_ADAPTIVE_UB_MISS_COUNT
 """
 
 from __future__ import annotations
@@ -49,6 +55,13 @@ DEFAULT_WARMUP = 3
 DEFAULT_ITERATIONS = 100
 DEFAULT_POPULATE_CHUNK_ENTRIES = 128
 DEFAULT_KERNEL_PROFILE_CLOCK_MHZ = 1000
+DEFAULT_ADAPTIVE_UB_MISS_COUNT = 2048
+DEFAULT_ADAPTIVE_PEER_UB_DEVICES = (
+    "udmac0d1e2",
+    "udmac0d1e3",
+    "udmac1d1e2",
+    "udmac1d1e3",
+)
 MAX_INT32 = (1 << 31) - 1
 MAX_UINT64 = (1 << 64) - 1
 
@@ -67,6 +80,14 @@ def environment_bool(name: str, default: bool = False) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{name} must be one of 1/0, true/false, yes/no, or on/off")
+
+
+def configured_adaptive_ub_devices() -> list[str]:
+    configured = os.environ.get(
+        "KVAF_ADAPTIVE_UB_DEVICES",
+        ",".join(DEFAULT_ADAPTIVE_PEER_UB_DEVICES),
+    )
+    return [device.strip() for device in configured.split(",")]
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -117,6 +138,29 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="exact valid request-prefix length; defaults to request-length",
     )
     parser.add_argument(
+        "--source-access-pattern",
+        choices=("random", "contiguous", "shuffled-contiguous"),
+        default=os.environ.get(
+            "KVAF_BATCH_GET_PERF_SOURCE_ACCESS_PATTERN", "random"
+        ),
+        help=(
+            "remote CPU DDR read order: random samples the full table, "
+            "contiguous reads an ascending token range, and shuffled-contiguous "
+            "sends the same contiguous range in random order"
+        ),
+    )
+    parser.add_argument(
+        "--output-access-pattern",
+        choices=("random", "contiguous"),
+        default=os.environ.get(
+            "KVAF_BATCH_GET_PERF_OUTPUT_ACCESS_PATTERN", "contiguous"
+        ),
+        help=(
+            "local NPU HBM output order; use contiguous while comparing source "
+            "patterns to isolate remote CPU DDR access behavior"
+        ),
+    )
+    parser.add_argument(
         "--aiv-cores",
         type=int,
         default=environment_int("KVAF_BATCH_GET_PERF_AIV_CORES", DEFAULT_AIV_CORES),
@@ -137,6 +181,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "comma-separated local NPU EIDs; workers are striped over all "
             "listed EIDs (environment: KVAF_NPU_EIDS)"
         ),
+    )
+    parser.add_argument(
+        "--adaptive-ub-device", action="store_true",
+        help=(
+            "startup tuning over the N-side peer-device allowlist when K has "
+            "no explicit device filter"
+        ),
+    )
+    parser.add_argument(
+        "--peer-ub-device",
+        default="",
+        help="strict K-side UB device selected by an earlier process",
     )
     parser.add_argument(
         "--warmup",
@@ -176,7 +232,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--no-sort-input-indices",
         dest="sort_input_indices",
         action="store_false",
-        help="keep the generated request prefix in random order",
+        help="keep the generated request prefix in its configured order",
     )
     kernel_profile = parser.add_mutually_exclusive_group()
     kernel_profile.add_argument(
@@ -204,6 +260,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="AIV clock used to convert profile cycles to milliseconds",
     )
     parser.set_defaults(
+        adaptive_peer_ub_devices=configured_adaptive_ub_devices(),
         kernel_profile=environment_bool("KVAF_BATCH_GET_PERF_KERNEL_PROFILE"),
         sort_input_indices=environment_bool(
             "KVAF_BATCH_GET_PERF_SORT_INPUT_INDICES"
@@ -212,6 +269,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.miss_count is None:
         args.miss_count = args.request_length
+    args.adaptive_ub_miss_count = environment_int(
+        "KVAF_ADAPTIVE_UB_MISS_COUNT", DEFAULT_ADAPTIVE_UB_MISS_COUNT
+    )
     return args
 
 
@@ -232,6 +292,20 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "configured table size must fit uint64"
     if args.miss_count < 0 or args.miss_count > args.request_length:
         return "miss-count must be between zero and request-length"
+    if args.adaptive_ub_device and args.miss_count == 0:
+        return "adaptive UB device tuning requires a positive miss-count"
+    if args.adaptive_ub_device and (
+        args.adaptive_ub_miss_count <= 0 or args.adaptive_ub_miss_count > MAX_INT32
+    ):
+        return "KVAF_ADAPTIVE_UB_MISS_COUNT must be in [1, INT32_MAX]"
+    if args.adaptive_ub_device and args.peer_ub_device:
+        return "adaptive-ub-device and peer-ub-device are mutually exclusive"
+    if args.adaptive_ub_device and (
+        any(not device for device in args.adaptive_peer_ub_devices)
+        or len(set(args.adaptive_peer_ub_devices))
+        != len(args.adaptive_peer_ub_devices)
+    ):
+        return "KVAF_ADAPTIVE_UB_DEVICES must contain unique non-empty names"
     if args.aiv_cores <= 0 or args.aiv_cores > 48:
         return "aiv-cores must be in [1, 48]"
     if len(args.npu_eids) > args.aiv_cores * args.jettys_per_core:
@@ -557,42 +631,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     assert torch is not None
     device_id = int(os.environ.get("DEVICE_ID", "0"))
     request_length = args.request_length
-    table_capacity = args.table_capacity
     token_bytes = args.token_bytes
     tokens_per_block = args.tokens_per_block
     miss_count_value = args.miss_count
     block_bytes = token_bytes * tokens_per_block
+    table_capacity = args.table_capacity
     ddr_bytes = table_capacity * block_bytes
+    total_tokens = table_capacity * tokens_per_block
 
     torch.npu.set_device(device_id)
     torch.manual_seed(args.seed)
     device = f"npu:{device_id}"
-
-    # Every table entry contains the same deterministic token pattern. Reusing
-    # a bounded source Tensor keeps setup memory independent of table capacity;
-    # each BatchPut still allocates a distinct remote entry for every key.
-    token_rows = torch.arange(
-        tokens_per_block, dtype=torch.int64, device=device
-    ).unsqueeze(1)
-    token_byte_indices = torch.arange(
-        token_bytes, dtype=torch.int64, device=device
-    ).unsqueeze(0)
-    entry_pattern = (
-        (
-            (token_rows * 131 + token_byte_indices * 17 + (token_byte_indices >> 3))
-            & 0xFF
-        )
-        .to(torch.uint8)
-        .contiguous()
-    )
-    populate_entries = min(args.populate_chunk_entries, table_capacity)
-    populate_source = entry_pattern.reshape(1, block_bytes).repeat(populate_entries, 1)
-    populate_offsets = [row * block_bytes for row in range(populate_entries)]
-    populate_lengths = [block_bytes] * populate_entries
-    output = torch.empty(
-        (request_length, token_bytes), dtype=torch.uint8, device=device
-    )
-    miss_count = torch.tensor([miss_count_value], dtype=torch.int32, device=device)
 
     runtime = kvaf.NpuRuntime(
         str(kernel),
@@ -603,6 +652,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         batch_put_kernel_object_path=str(batch_put_kernel),
         jettys_per_core=args.jettys_per_core,
         npu_eids=args.npu_eids,
+        adaptive_ub_device=args.adaptive_ub_device,
+        adaptive_ub_miss_count=args.adaptive_ub_miss_count,
+        peer_ub_device=args.peer_ub_device,
+        adaptive_peer_ub_devices=args.adaptive_peer_ub_devices,
     )
     runtime.link_to(remote_cpu_service)
     table = None
@@ -614,9 +667,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"request_length={request_length} table_capacity={table_capacity} "
             f"tokens_per_block={tokens_per_block} token_bytes={token_bytes} "
             f"block_bytes={block_bytes} miss_count={miss_count_value} "
+            f"source_access_pattern={args.source_access_pattern} "
+            f"output_access_pattern={args.output_access_pattern} "
             f"ddr_bytes={ddr_bytes} aiv_cores={args.aiv_cores} "
             f"jettys_per_core={args.jettys_per_core} eid_paths={len(args.npu_eids) or 1} "
             f"npu_eids={','.join(args.npu_eids) or 'auto'} warmup={args.warmup} "
+            f"adaptive_ub_device={int(args.adaptive_ub_device)} "
+            f"adaptive_ub_miss_count={args.adaptive_ub_miss_count} "
+            f"peer_ub_device={args.peer_ub_device or 'auto'} "
             f"iterations={args.iterations} seed={args.seed} "
             f"sort_input_indices={int(args.sort_input_indices)} "
             f"kernel_profile={int(args.kernel_profile)} "
@@ -624,9 +682,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             "timing=call_to_stream_completion"
         )
 
-        print("BATCH_GET_PERF_PHASE_BEGIN phase=initialize")
+        print("BATCH_GET_PERF_PHASE_BEGIN phase=initialize", flush=True)
         runtime.initialize(ddr_bytes, block_bytes)
-        print("BATCH_GET_PERF_PHASE_DONE phase=initialize")
+        print("BATCH_GET_PERF_PHASE_DONE phase=initialize", flush=True)
+
+        # Every table entry contains the same deterministic token pattern. Reusing
+        # a bounded source Tensor keeps setup memory independent of table capacity;
+        # each BatchPut still allocates a distinct remote entry for every key.
+        token_rows = torch.arange(
+            tokens_per_block, dtype=torch.int64, device=device
+        ).unsqueeze(1)
+        token_byte_indices = torch.arange(
+            token_bytes, dtype=torch.int64, device=device
+        ).unsqueeze(0)
+        entry_pattern = (
+            (
+                (token_rows * 131 + token_byte_indices * 17 + (token_byte_indices >> 3))
+                & 0xFF
+            )
+            .to(torch.uint8)
+            .contiguous()
+        )
+        populate_entries = min(args.populate_chunk_entries, table_capacity)
+        populate_source = entry_pattern.reshape(1, block_bytes).repeat(populate_entries, 1)
+        populate_offsets = [row * block_bytes for row in range(populate_entries)]
+        populate_lengths = [block_bytes] * populate_entries
+        output = torch.empty(
+            (request_length, token_bytes), dtype=torch.uint8, device=device
+        )
+        miss_count = torch.tensor([miss_count_value], dtype=torch.int32, device=device)
 
         print("BATCH_GET_PERF_PHASE_BEGIN phase=populate_table")
         populated = 0
@@ -662,8 +746,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         # prefix and the untouched suffix before collecting timing samples.
         print("BATCH_GET_PERF_PHASE_BEGIN phase=correctness_preflight")
         request_ids = torch.arange(request_length, dtype=torch.int64, device=device)
-        preflight_indices = (request_ids % table_capacity).to(torch.int32)
-        preflight_token_slots = request_ids % tokens_per_block
+        preflight_token_ids = request_ids % total_tokens
+        preflight_indices = (preflight_token_ids // tokens_per_block).to(torch.int32)
+        preflight_token_slots = preflight_token_ids % tokens_per_block
         preflight_offsets = (preflight_token_slots * token_bytes).to(torch.int32)
         preflight_output_indices = request_ids.to(torch.int32)
         if args.sort_input_indices:
@@ -704,24 +789,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print("BATCH_GET_PERF_PHASE_DONE phase=correctness_preflight")
 
+        # The table is populated in key order and MetaManager allocates fixed
+        # slots FIFO, so linear token IDs map to adjacent remote CPU addresses.
+        # shuffled-contiguous changes only their submission order and keeps the
+        # exact same remote working set as contiguous.
+        contiguous_source_token_ids = request_ids % total_tokens
+
         def create_request_plan() -> tuple[object, object, object]:
-            indices = torch.randint(
-                0,
-                table_capacity,
-                (request_length,),
-                dtype=torch.int32,
-                device=device,
-            )
-            token_slots = torch.randint(
-                0,
-                tokens_per_block,
-                (request_length,),
-                dtype=torch.int32,
-                device=device,
-            )
+            if args.source_access_pattern == "random":
+                # Preserve the established benchmark's full-table random source
+                # distribution as the default behavior.
+                indices = torch.randint(
+                    0,
+                    table_capacity,
+                    (request_length,),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                token_slots = torch.randint(
+                    0,
+                    tokens_per_block,
+                    (request_length,),
+                    dtype=torch.int32,
+                    device=device,
+                )
+            else:
+                source_token_ids = contiguous_source_token_ids
+                if args.source_access_pattern == "shuffled-contiguous":
+                    source_token_ids = source_token_ids[
+                        torch.randperm(request_length, device=device)
+                    ]
+                indices = (source_token_ids // tokens_per_block).to(torch.int32)
+                token_slots = (source_token_ids % tokens_per_block).to(torch.int32)
             offsets = token_slots * token_bytes
-            output_indices = torch.randperm(request_length, device=device).to(
-                torch.int32
+            output_indices = (
+                request_ids.to(torch.int32)
+                if args.output_access_pattern == "contiguous"
+                else torch.randperm(request_length, device=device).to(torch.int32)
             )
             if args.sort_input_indices:
                 indices, offsets, output_indices = sort_request_plan_prefix(

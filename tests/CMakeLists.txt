@@ -43,6 +43,3 @@ else()
   message(STATUS
     "Skipping direct Runtime Python tests; configure with -DKVAF_BUILD_PYTHON=ON")
 endif()
-
-# Runtime tests are Python-only. Mock and NPU integration coverage call the
-# pybind API directly; no subprocess driver is built or invoked.

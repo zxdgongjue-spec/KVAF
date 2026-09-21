@@ -31,6 +31,8 @@ using kvaf::peer::AllocateRegionRequest;
 using kvaf::peer::AllocateRegionResponse;
 using kvaf::peer::CandidateCountRequest;
 using kvaf::peer::CandidateCountResponse;
+using kvaf::peer::CandidateInfoRequest;
+using kvaf::peer::CandidateInfoResponse;
 using kvaf::peer::Command;
 using kvaf::peer::CreateChannelRequest;
 using kvaf::peer::CreateChannelResponse;
@@ -41,6 +43,7 @@ using kvaf::peer::ReleaseRegionRequest;
 using kvaf::peer::ResponseCommand;
 using kvaf::peer::Result;
 using kvaf::peer::StatusResponse;
+using kvaf::peer::kDeviceNameBytes;
 using kvaf::peer::kEidBytes;
 using kvaf::peer::kQpKeyBytes;
 using kvaf::peer::kSegKeyBytes;
@@ -62,14 +65,6 @@ constexpr uint32_t kNpuJettyKeyBytes = 32U;
 constexpr uint32_t kSegBytes = sizeof(urma_seg_t);
 constexpr std::size_t kBasePageBytes = 4096U;
 constexpr std::size_t kHugePage2MBytes = 2U * 1024U * 1024U;
-
-#ifndef MAP_HUGE_SHIFT
-#define MAP_HUGE_SHIFT 26
-#endif
-
-#ifndef MAP_HUGE_2MB
-#define MAP_HUGE_2MB (21 << MAP_HUGE_SHIFT)
-#endif
 
 static_assert(sizeof(urma_jetty_id_t) == 24U, "UMDK Jetty id ABI changed");
 static_assert(kJettyKeyBytes == 28U, "HCCP UMDK Jetty key ABI changed");
@@ -274,6 +269,7 @@ class UrmaResources {
 
 struct UrmaCandidate {
   uint32_t id = 0U;
+  uint32_t device_id = 0U;
   std::string device_name;
   uint32_t eid_index = 0U;
   std::array<uint8_t, kEidBytes> eid{};
@@ -335,10 +331,16 @@ class UrmaResourcePool {
                            ? left.eid_index < right.eid_index
                            : left.device_name < right.device_name;
               });
+    uint32_t device_id = 0U;
+    std::string previous_device;
     for (uint32_t index = 0U; index < candidates_.size(); ++index) {
       UrmaCandidate& candidate = candidates_[index];
       candidate.id = index;
-      Log("[KVAF_CPU] CANDIDATE_DISCOVERED id=%u ub_device=%s eid_index=%u eid=", candidate.id,
+      if (index != 0U && candidate.device_name != previous_device) ++device_id;
+      candidate.device_id = device_id;
+      previous_device = candidate.device_name;
+      Log("[KVAF_CPU] CANDIDATE_DISCOVERED id=%u device_id=%u ub_device=%s "
+          "eid_index=%u eid=", candidate.id, candidate.device_id,
           candidate.device_name.c_str(), candidate.eid_index);
       for (uint8_t byte : candidate.eid) {
         std::fprintf(stderr, "%02x", byte);
@@ -359,8 +361,29 @@ class UrmaResourcePool {
     return true;
   }
 
+  uint32_t DeviceCount() const {
+    uint32_t count = 0U;
+    std::string previous;
+    for (const auto& candidate : candidates_) {
+      if (candidate.device_name != previous) ++count;
+      previous = candidate.device_name;
+    }
+    return count;
+  }
+
   uint32_t CandidateCount() const {
     return static_cast<uint32_t>(candidates_.size());
+  }
+
+  bool GetInfo(uint32_t candidate_id, UrmaCandidate* info) const {
+    if (info == nullptr || candidate_id >= candidates_.size()) return false;
+    *info = UrmaCandidate{};
+    info->id = candidates_[candidate_id].id;
+    info->device_id = candidates_[candidate_id].device_id;
+    info->device_name = candidates_[candidate_id].device_name;
+    info->eid_index = candidates_[candidate_id].eid_index;
+    info->eid = candidates_[candidate_id].eid;
+    return true;
   }
 
   UrmaResources* Get(uint32_t candidate_id) {
@@ -441,17 +464,11 @@ void ReleaseChannel(Channel* channel) {
 }
 
 struct Region {
-  enum class AllocationKind {
-    kHeap,
-    kMmap,
-  };
-
   uint64_t id = 0U;
   uint32_t candidate_id = 0U;
   UrmaResources* resources = nullptr;
   void* memory = nullptr;
   uint64_t bytes = 0U;
-  AllocationKind allocation_kind = AllocationKind::kHeap;
   urma_token_id_t* token_id = nullptr;
   urma_target_seg_t* segment = nullptr;
   uint32_t token_value = 0U;
@@ -460,13 +477,41 @@ struct Region {
 
 class CpuService {
  public:
-  CpuService(UrmaResourcePool* resource_pool, CpuMemoryPageMode memory_page_mode)
-      : resource_pool_(resource_pool),
-        memory_page_mode_(memory_page_mode) {}
+  CpuService(UrmaResourcePool* resource_pool, CpuMemoryPageMode memory_page_mode,
+             bool device_filter_applied)
+      : resource_pool_(resource_pool), memory_page_mode_(memory_page_mode),
+        device_filter_applied_(device_filter_applied) {}
   ~CpuService() { ReleaseAll(); }
 
   uint32_t CandidateCount() const {
     return resource_pool_ == nullptr ? 0U : resource_pool_->CandidateCount();
+  }
+
+  uint32_t DeviceCount() const {
+    return resource_pool_ == nullptr ? 0U : resource_pool_->DeviceCount();
+  }
+
+  bool DeviceFilterApplied() const { return device_filter_applied_; }
+
+  Result GetCandidateInfo(uint32_t candidate_id,
+                          CandidateInfoResponse* response) const {
+    if (response == nullptr || resource_pool_ == nullptr) {
+      return Result::kInvalidRequest;
+    }
+    UrmaCandidate candidate{};
+    if (!resource_pool_->GetInfo(candidate_id, &candidate)) {
+      return Result::kNotFound;
+    }
+    if (candidate.device_name.empty() ||
+        candidate.device_name.size() >= kDeviceNameBytes) {
+      return Result::kResourceError;
+    }
+    response->candidate_id = candidate.id;
+    response->device_id = candidate.device_id;
+    response->eid_index = candidate.eid_index;
+    std::memcpy(response->device_name, candidate.device_name.c_str(),
+                candidate.device_name.size());
+    return Result::kOk;
   }
 
   Result Allocate(uint64_t bytes, uint64_t slot_size, uint32_t candidate_id,
@@ -539,8 +584,7 @@ class CpuService {
     }
     regions_.emplace(id, std::move(region));
     Log("[KVAF_CPU] REGION_ALLOCATED session=%" PRIu64 " candidate=%u ub_device=%s eid_index=%u "
-        "bytes=%" PRIu64 " base=0x%" PRIx64
-        " token_id=0x%x reg_flags=0x%x page_mode=%s\n",
+        "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x reg_flags=0x%x page_mode=%s\n",
         id, candidate_id, resources->device_name().c_str(), resources->eid_index(), bytes,
         response->peer_base, response->token_id, flag.value, MemoryPageModeName());
     return Result::kOk;
@@ -620,8 +664,6 @@ class CpuService {
         return "default";
       case CpuMemoryPageMode::kTransparentHugePage:
         return "thp";
-      case CpuMemoryPageMode::kHugeTlb2M:
-        return "hugetlb-2m";
     }
     return "unknown";
   }
@@ -632,50 +674,16 @@ class CpuService {
       return false;
     }
     const std::size_t bytes = static_cast<std::size_t>(region->bytes);
-    if (memory_page_mode_ == CpuMemoryPageMode::kHugeTlb2M) {
-      if (bytes % kHugePage2MBytes != 0U) {
-        Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=hugetlb_size bytes=%" PRIu64
-            " hugepage_bytes=%zu reason=not_aligned\n",
-            region->bytes, kHugePage2MBytes);
-        return false;
-      }
-      void* const memory = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB,
-                                -1, 0);
-      if (memory == MAP_FAILED) {
-        Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=hugetlb_mmap bytes=%" PRIu64
-            " hugepage_bytes=%zu errno=%d\n",
-            region->bytes, kHugePage2MBytes, errno);
-        return false;
-      }
-      region->memory = memory;
-      region->allocation_kind = Region::AllocationKind::kMmap;
-      return true;
-    }
-
     const std::size_t alignment =
         memory_page_mode_ == CpuMemoryPageMode::kTransparentHugePage
             ? kHugePage2MBytes
             : kBasePageBytes;
-    const int allocation_status =
-        posix_memalign(&region->memory, alignment, bytes);
+    const int allocation_status = posix_memalign(&region->memory, alignment, bytes);
     if (allocation_status != 0 || region->memory == nullptr) {
       Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=posix_memalign bytes=%" PRIu64
           " alignment=%zu status=%d memory=%p page_mode=%s\n",
           region->bytes, alignment, allocation_status, region->memory,
           MemoryPageModeName());
-      if (region->memory != nullptr) {
-        free(region->memory);
-        region->memory = nullptr;
-      }
-      return false;
-    }
-    if ((reinterpret_cast<uintptr_t>(region->memory) & (alignment - 1U)) != 0U) {
-      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=alignment bytes=%" PRIu64
-          " required_alignment=%zu memory=%p page_mode=%s\n",
-          region->bytes, alignment, region->memory, MemoryPageModeName());
-      free(region->memory);
-      region->memory = nullptr;
       return false;
     }
     if (memory_page_mode_ == CpuMemoryPageMode::kTransparentHugePage) {
@@ -799,11 +807,7 @@ class CpuService {
       region->token_id = nullptr;
     }
     if (region->memory != nullptr) {
-      if (region->allocation_kind == Region::AllocationKind::kMmap) {
-        (void)munmap(region->memory, static_cast<std::size_t>(region->bytes));
-      } else {
-        free(region->memory);
-      }
+      free(region->memory);
       region->memory = nullptr;
     }
   }
@@ -816,7 +820,8 @@ class CpuService {
   }
 
   UrmaResourcePool* resource_pool_ = nullptr;
-  CpuMemoryPageMode memory_page_mode_{CpuMemoryPageMode::kDefault};
+  CpuMemoryPageMode memory_page_mode_{CpuMemoryPageMode::kTransparentHugePage};
+  bool device_filter_applied_{false};
   uint64_t next_region_id_ = 1U;
   uint32_t next_token_ = 1U;
   uint32_t next_psn_ = 1U;
@@ -865,9 +870,31 @@ void HandleClient(int fd, CpuService* service) {
       response.header = MakeHeader(command, sizeof(response));
       response.header.command = ResponseCommand(command);
       response.candidate_count = service == nullptr ? 0U : service->CandidateCount();
+      response.device_count = service == nullptr ? 0U : service->DeviceCount();
+      response.device_filter_applied =
+          service != nullptr && service->DeviceFilterApplied() ? 1U : 0U;
       response.result = static_cast<int32_t>(response.candidate_count == 0U
                                                   ? Result::kResourceError
                                                   : Result::kOk);
+      (void)WriteAll(fd, &response, sizeof(response));
+      return;
+    }
+    case Command::kGetCandidateInfo: {
+      CandidateInfoRequest request{};
+      std::memcpy(&request, &header, sizeof(header));
+      if (!IsValidHeader(header, command, sizeof(request)) ||
+          !ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header),
+                   sizeof(request) - sizeof(header))) {
+        SendStatus(fd, command, Result::kInvalidRequest);
+        return;
+      }
+      CandidateInfoResponse response{};
+      response.header = MakeHeader(command, sizeof(response));
+      response.header.command = ResponseCommand(command);
+      response.result = static_cast<int32_t>(
+          service == nullptr
+              ? Result::kResourceError
+              : service->GetCandidateInfo(request.candidate_id, &response));
       (void)WriteAll(fd, &response, sizeof(response));
       return;
     }
@@ -920,11 +947,12 @@ Status CpuRuntime::Initialize(const CpuRuntimeOptions& options) {
     return Status::InvalidArgument("CpuRuntime eid_index requires ub_device");
   }
   auto impl = std::make_unique<Impl>();
-  if (!impl->resources.Initialize(options.ub_device, options.has_eid_index, options.eid_index)) {
+  if (!impl->resources.Initialize(options.ub_device, options.has_eid_index,
+                                  options.eid_index)) {
     return Status::Internal("CpuRuntime failed to initialize UMDK resources");
   }
   impl->service = std::make_unique<CpuService>(
-      &impl->resources, options.memory_page_mode);
+      &impl->resources, options.memory_page_mode, !options.ub_device.empty());
   impl_ = std::move(impl);
   return Status::OK();
 }

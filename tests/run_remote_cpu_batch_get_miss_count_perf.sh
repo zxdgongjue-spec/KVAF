@@ -11,7 +11,7 @@ fi
 KVAF_BUILD_DIR="$1"
 shift
 KVAF_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-KVAF_BATCH_GET_PERF_RUNNER="$KVAF_ROOT/tests/run_remote_cpu_batch_get_perf.sh"
+: "${KVAF_BATCH_GET_PERF_RUNNER:=$KVAF_ROOT/tests/run_remote_cpu_batch_get_perf.sh}"
 KVAF_BATCH_GET_TOKEN_BYTES=(128 256 512 656 1024 2048 4096)
 KVAF_BATCH_GET_MISS_COUNTS=(32 64 128 256 512 1024 2048 4096 8192)
 KVAF_BATCH_GET_AIV_CORES=(1 2 4 8 16 32)
@@ -29,6 +29,12 @@ if [[ ! "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" =~ ^[1-9][0-9]*$ ]]; then
   echo "ERROR: KVAF_BATCH_GET_KERNEL_CLOCK_MHZ must be a positive integer" >&2
   exit 2
 fi
+: "${KVAF_ADAPTIVE_UB_MISS_COUNT:=2048}"
+if [[ ! "$KVAF_ADAPTIVE_UB_MISS_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: KVAF_ADAPTIVE_UB_MISS_COUNT must be a positive integer" >&2
+  exit 2
+fi
+export KVAF_ADAPTIVE_UB_MISS_COUNT
 
 : "${KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR:=}"
 if [[ -z "$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR" ]]; then
@@ -71,6 +77,40 @@ cycles_to_us() {
     'BEGIN { printf "%.3f", cycles / mhz }'
 }
 
+split_initialize_log() {
+  local source_log="$1"
+  local selection_log="$2"
+  local shape_log="${source_log}.without_ub_device_selection"
+  awk -v selection_log="$selection_log" -v shape_log="$shape_log" '
+    $1 == "BATCH_GET_PERF_PHASE_BEGIN" && $2 == "phase=initialize" {
+      in_initialize = 1
+    }
+    { print > (in_initialize ? selection_log : shape_log) }
+    $1 == "BATCH_GET_PERF_PHASE_DONE" && $2 == "phase=initialize" {
+      in_initialize = 0
+    }
+  ' "$source_log"
+  mv "$shape_log" "$source_log"
+}
+
+adaptive_requested=false
+base_options=()
+for option in "$@"; do
+  if [[ "$option" == "--adaptive-ub-device" ]]; then
+    adaptive_requested=true
+  else
+    base_options+=("$option")
+  fi
+done
+
+selected_ub_device=""
+adaptive_selection_skipped=false
+selection_log="$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR/ub_device_selection.log"
+sweep_options=()
+if ((${#base_options[@]} > 0)); then
+  sweep_options=("${base_options[@]}")
+fi
+
 token_bytes_values=()
 miss_count_values=()
 aiv_core_values=()
@@ -88,6 +128,7 @@ completion_wait_mean_us_values=()
 completion_wait_p50_us_values=()
 completion_wait_p90_us_values=()
 completion_wait_p99_us_values=()
+selected_ub_device_values=()
 
 for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
   echo "BATCH_GET_TOKEN_SWEEP_BEGIN token_bytes=$token_bytes"
@@ -98,7 +139,16 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
       for jettys_per_core in "${KVAF_BATCH_GET_JETTYS_PER_CORE[@]}"; do
         echo "BATCH_GET_CONFIG_SWEEP_BEGIN token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core"
         log_file="$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR/token_bytes_${token_bytes}_miss_count_${miss_count}_aiv_cores_${aiv_cores}_jettys_per_core_${jettys_per_core}.log"
-        if "$KVAF_BATCH_GET_PERF_RUNNER" "$KVAF_BUILD_DIR" "$@" \
+        run_options=("${sweep_options[@]}")
+        adaptive_this_shape=false
+        if [[ "$adaptive_requested" == true && -z "$selected_ub_device" &&
+          "$adaptive_selection_skipped" == false ]]; then
+          run_options+=(--adaptive-ub-device)
+          adaptive_this_shape=true
+        fi
+        run_status=0
+        if "$KVAF_BATCH_GET_PERF_RUNNER" "$KVAF_BUILD_DIR" \
+          ${run_options[@]+"${run_options[@]}"} \
           --token-bytes "$token_bytes" --miss-count "$miss_count" \
           --aiv-cores "$aiv_cores" --jettys-per-core "$jettys_per_core" \
           --kernel-profile \
@@ -106,9 +156,15 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
           2>&1 | tee "$log_file"; then
           :
         else
-          status=$?
-          echo "BATCH_GET_MISS_SWEEP_FAILED token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core status=$status" >&2
-          exit "$status"
+          run_status=$?
+        fi
+        if [[ "$adaptive_this_shape" == true ]]; then
+          split_initialize_log "$log_file" "$selection_log"
+          echo "BATCH_GET_UB_DEVICE_SELECTION_LOG_WRITTEN path=$selection_log"
+        fi
+        if ((run_status != 0)); then
+          echo "BATCH_GET_MISS_SWEEP_FAILED token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core status=$run_status" >&2
+          exit "$run_status"
         fi
 
     total_profile_result="$(
@@ -123,6 +179,44 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
         if [[ -z "$total_profile_result" || -z "$post_profile_result" ||
           -z "$completion_wait_profile_result" ]]; then
           echo "ERROR: incomplete kernel profile results for token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core" >&2
+          exit 1
+        fi
+
+        active_log="$log_file"
+        if [[ "$adaptive_this_shape" == true ]]; then
+          active_log="$selection_log"
+        fi
+        active_record="$(
+          awk '$1 == "[KVAF_AIV]" && ($2 == "UB_DEVICE_SELECTED" || $2 == "UB_DEVICE_REUSED") { result = $0 }
+               END { print result }' "$active_log"
+        )"
+        shape_ub_device="$selected_ub_device"
+        if [[ -n "$active_record" ]]; then
+          active_ub_device="$(extract_field "$active_record" ub_device)"
+          if [[ -z "$active_ub_device" ]]; then
+            echo "ERROR: malformed UB device record: $active_record" >&2
+            exit 1
+          fi
+          if [[ -n "$shape_ub_device" && "$active_ub_device" != "$shape_ub_device" ]]; then
+            echo "ERROR: fixed UB device changed from $shape_ub_device to $active_ub_device" >&2
+            exit 1
+          fi
+          shape_ub_device="$active_ub_device"
+          if [[ "$adaptive_this_shape" == true ]]; then
+            selected_ub_device="$active_ub_device"
+            sweep_options=("${base_options[@]}" --peer-ub-device "$selected_ub_device")
+          fi
+        elif [[ "$adaptive_this_shape" == true ]] &&
+          awk '$1 == "[KVAF_AIV]" && $2 == "UB_DEVICE_ADAPTIVE_SKIPPED" { found = 1 }
+               END { exit !found }' "$selection_log"; then
+          adaptive_selection_skipped=true
+        elif [[ "$adaptive_this_shape" == true ]]; then
+          echo "ERROR: adaptive startup did not report a selected UB device" >&2
+          exit 1
+        fi
+        if [[ "$adaptive_requested" == true && "$adaptive_selection_skipped" == false &&
+          -z "$shape_ub_device" ]]; then
+          echo "ERROR: fixed UB device was not reported for token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core" >&2
           exit 1
         fi
 
@@ -175,6 +269,7 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
     completion_wait_p50_us_values+=("$completion_wait_p50_us")
     completion_wait_p90_us_values+=("$completion_wait_p90_us")
     completion_wait_p99_us_values+=("$completion_wait_p99_us")
+    selected_ub_device_values+=("$shape_ub_device")
 
     result=(
       "BATCH_GET_MISS_SWEEP_RESULT"
@@ -205,6 +300,7 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
       "completion_wait_p99_us=$completion_wait_p99_us"
       "payload_bytes=$payload_bytes"
       "p50_GBps=$p50_gbps"
+      "selected_ub_device=$shape_ub_device"
     )
     printf '%s\n' "${result[*]}"
         echo "BATCH_GET_CONFIG_SWEEP_DONE token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core"
@@ -270,9 +366,9 @@ echo "BATCH_GET_MISS_SWEEP_CLOCK clock_mhz=$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ conv
 mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
 {
   printf '%s\n' \
-    'token_bytes,miss_count,aiv_cores,jettys_per_core,mean_us,p50_us,p90_us,p99_us,p50_GBps,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us'
+    'token_bytes,miss_count,aiv_cores,jettys_per_core,mean_us,p50_us,p90_us,p99_us,p50_GBps,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us,selected_ub_device'
   for index in "${!mean_us_values[@]}"; do
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "${token_bytes_values[$index]}" \
       "${miss_count_values[$index]}" \
       "${aiv_core_values[$index]}" \
@@ -289,7 +385,8 @@ mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
       "${completion_wait_mean_us_values[$index]}" \
       "${completion_wait_p50_us_values[$index]}" \
       "${completion_wait_p90_us_values[$index]}" \
-      "${completion_wait_p99_us_values[$index]}"
+      "${completion_wait_p99_us_values[$index]}" \
+      "${selected_ub_device_values[$index]}"
   done
 } >"$KVAF_BATCH_GET_MISS_SWEEP_CSV"
 echo "BATCH_GET_MISS_SWEEP_CSV_WRITTEN path=$KVAF_BATCH_GET_MISS_SWEEP_CSV rows=${#mean_us_values[@]}"
