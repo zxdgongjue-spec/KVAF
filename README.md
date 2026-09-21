@@ -293,3 +293,12 @@ Jetty，则不会产生足够 post 使用所有配置路径。
 `link_to()` 必须先于 `initialize()` 调用。调用方需要在 BatchGet 所在 stream 完成前保持
 输入/输出 Tensor 和 `DeviceAccessTable` 有效；Runtime 只管理内部 DDR、元数据和内部
 传输资源。
+
+### BatchGet 总在途请求预算
+
+`NpuRuntime(..., batch_get_max_inflight_total=2048)` 默认限制单次 BatchGet 所有
+AIV 核合计的未确认 READ 数。小请求保留整批路径；大请求每核使用两个交叠组，
+完成最老组后补发。设为 0 可对照原实现。性能脚本接受 `--max-inflight-total`，
+或环境变量 `KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL`。修改预算需要重新 capture。
+Host、Python binding 和 Kernel 必须一起重编。详见
+[设计、统计和验证步骤](docs/batch_get_inflight_control.md)。

@@ -38,13 +38,17 @@ output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数�
 batch_get_tokens_per_block, device_id=0, npu_core_count=2,
 batch_put_kernel_object_path="", jettys_per_core=1, npu_eids=[],
 adaptive_ub_device=False, adaptive_ub_miss_count=2048, peer_ub_device="",
-adaptive_peer_ub_devices=[])`
+adaptive_peer_ub_devices=[], batch_get_max_inflight_total=2048)`
 要求显式传入单 token KV
 字节数和每个 KV block 中的 token 数，两个参数均无默认值；
 每个 AccessTable entry 大小为两者乘积。
 `jettys_per_core` 配置 BatchGet 每个 AIV core 使用的 Jetty 数量，可选 1 到 64 个独立
 Jetty。BatchPut 保持原有实现：该值为 1 或 2 时使用相同数量，BatchGet 配置为 3 到
 64 时 BatchPut 仍使用 2 个。
+`batch_get_max_inflight_total` 是单次 BatchGet 所有 AIV 核的总请求预算，默认
+2048；0 使用整批提交基线，非零值须至少为 `2 * npu_core_count`。大请求采用
+双组交叠提交，预算变化需新建 Runtime/graph，详见
+[在途控制](../docs/batch_get_inflight_control.md)。
 远程 CPU DDR 只增加 `runtime.link_to("CPU_IP:port")`，必须在 `initialize` 前调用。
 `npu_eids=[]` 时 EID、UMDK device 与候选 RMA 验证由 C++ Runtime 自动完成；
 显式传入多个 32 位十六进制 EID 时，Runtime 为每个 EID 创建独立

@@ -94,6 +94,7 @@ def main(batch: int = 16) -> int:
             os.environ.get("KVAF_NPU_JETTYS_PER_CORE", str(JETTYS_PER_CORE)),
         )
     )
+    max_inflight_total = int(os.environ.get("KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL", "2048"))
     npu_eids = parse_npu_eids(os.environ.get("KVAF_NPU_EIDS"))
     warmup = int(os.environ.get("KVAF_RUNTIME_PERF_WARMUP", str(WARMUP)))
     iterations = int(os.environ.get("KVAF_RUNTIME_PERF_ITERATIONS", str(ITERATIONS)))
@@ -210,6 +211,7 @@ def main(batch: int = 16) -> int:
         npu_core_count=npu_core_count,
         batch_put_kernel_object_path=str(batch_put_kernel),
         jettys_per_core=jettys_per_core,
+        batch_get_max_inflight_total=max_inflight_total,
         npu_eids=npu_eids,
     )
     remote_cpu_service = os.environ.get("KVAF_CPU_SERVICE_ADDR")

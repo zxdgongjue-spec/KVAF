@@ -14,6 +14,7 @@ environment variables:
     --tokens-per-block     KVAF_BATCH_GET_PERF_TOKENS_PER_BLOCK
     --token-bytes          KVAF_BATCH_GET_PERF_TOKEN_BYTES
     --miss-count           KVAF_BATCH_GET_PERF_MISS_COUNT
+    --max-inflight-total   KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL
     --source-access-pattern
                            KVAF_BATCH_GET_PERF_SOURCE_ACCESS_PATTERN
     --output-access-pattern
@@ -37,8 +38,6 @@ import time
 from typing import Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import kvaf
 
 from backend import detect_torch_backend
 from npu_eids import parse_npu_eids
@@ -266,6 +265,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "KVAF_BATCH_GET_PERF_SORT_INPUT_INDICES"
         ),
     )
+    parser.add_argument(
+        "--max-inflight-total", type=int,
+        default=environment_int("KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL", 2048),
+        help="total unconfirmed READ limit across AIV cores; 0 uses the baseline",
+    )
     args = parser.parse_args(argv)
     if args.miss_count is None:
         args.miss_count = args.request_length
@@ -310,6 +314,10 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "aiv-cores must be in [1, 48]"
     if len(args.npu_eids) > args.aiv_cores * args.jettys_per_core:
         return "npu-eids count must not exceed aiv-cores * jettys-per-core"
+    if not 0 <= args.max_inflight_total <= 0xFFFFFFFF:
+        return "max-inflight-total must fit uint32"
+    if args.max_inflight_total and args.max_inflight_total < 2 * args.aiv_cores:
+        return "max-inflight-total must be zero or at least twice aiv-cores"
     if args.warmup < 0:
         return "warmup must be non-negative"
     if args.iterations <= 0:
@@ -429,6 +437,10 @@ def print_kernel_profile(
             "finalize_ms": 0.0,
             "active_requests": 0.0,
             "total_posts": 0.0,
+            "submitted_group_count": 0.0,
+            "completed_group_count": 0.0,
+            "completion_count": 0.0,
+            "peak_submitted_not_drained": 0.0,
             **{
                 name: 0.0
                 for jetty in range(MAX_JETTYS_PER_CORE)
@@ -460,10 +472,8 @@ def print_kernel_profile(
             total = elapsed_ms(profile, "kernel_start_cycle", "kernel_finish_cycle")
             setup = elapsed_ms(profile, "kernel_start_cycle", "setup_done_cycle")
             compact = elapsed_ms(profile, "setup_done_cycle", "compact_done_cycle")
-            post = elapsed_ms(profile, "compact_done_cycle", "post_done_cycle")
-            completion = elapsed_ms(
-                profile, "post_done_cycle", "completion_done_cycle"
-            )
+            post = int(profile["post_active_cycles"]) / clock_mhz / 1000.0
+            completion = int(profile["drain_wait_cycles"]) / clock_mhz / 1000.0
             finalize = elapsed_ms(
                 profile, "completion_done_cycle", "kernel_finish_cycle"
             )
@@ -499,6 +509,10 @@ def print_kernel_profile(
             accumulator["finalize_ms"] += finalize
             accumulator["active_requests"] += int(profile["active_requests"])
             accumulator["total_posts"] += int(profile["total_posts"])
+            accumulator["submitted_group_count"] += int(profile["submitted_group_count"])
+            accumulator["completed_group_count"] += int(profile["completed_group_count"])
+            accumulator["completion_count"] += int(profile["completion_count"])
+            accumulator["peak_submitted_not_drained"] += int(profile["peak_submitted_not_drained"])
             waits = list(profile["jetty_completion_wait_cycles"])
             polls = list(profile["jetty_completion_polls"])
             for jetty in range(MAX_JETTYS_PER_CORE):
@@ -515,9 +529,10 @@ def print_kernel_profile(
         f"aiv_cores={npu_core_count} jettys_per_core={jettys_per_core} "
         f"request_length={request_length} miss_count={miss_count} "
         "setup=entity_queue_and_miss_count compact=removed_direct_prefix "
-        "post=descriptor_validation_wqe_fill_sq_copy_and_doorbell "
+        "post=sum_group_capacity_check_wqe_fill_sq_copy_and_doorbell "
         "transfer_window=first_doorbell_to_all_cq_complete "
-        "completion_wait=cq_poll_until_udma_complete "
+        "completion_wait=sum_all_group_drains "
+        "peak_submitted_not_drained=per_core_conservative_software_count "
         "profile_overhead_included=1 d2h_outside_host_metric=1"
     )
     total_useful_bytes = len(samples) * miss_count * token_bytes
@@ -572,6 +587,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"detected {backend.name} ({backend.reason})."
         )
         return 0
+    import kvaf
+
     if not hasattr(kvaf, "NpuRuntime"):
         print(
             "SKIP: rebuild KVAF with KVAF_ENABLE_AIV_BATCH_GET=ON "
@@ -651,6 +668,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         npu_core_count=args.aiv_cores,
         batch_put_kernel_object_path=str(batch_put_kernel),
         jettys_per_core=args.jettys_per_core,
+        batch_get_max_inflight_total=args.max_inflight_total,
         npu_eids=args.npu_eids,
         adaptive_ub_device=args.adaptive_ub_device,
         adaptive_ub_miss_count=args.adaptive_ub_miss_count,
@@ -670,6 +688,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"source_access_pattern={args.source_access_pattern} "
             f"output_access_pattern={args.output_access_pattern} "
             f"ddr_bytes={ddr_bytes} aiv_cores={args.aiv_cores} "
+            f"max_inflight_total={args.max_inflight_total} "
             f"jettys_per_core={args.jettys_per_core} eid_paths={len(args.npu_eids) or 1} "
             f"npu_eids={','.join(args.npu_eids) or 'auto'} warmup={args.warmup} "
             f"adaptive_ub_device={int(args.adaptive_ub_device)} "

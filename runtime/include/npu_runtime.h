@@ -27,6 +27,8 @@ struct NpuRuntimeOptions {
   std::uint32_t device_id{0U};
   std::uint32_t npu_core_count{2U};
   std::uint32_t jettys_per_core{1U};
+  // Total submitted, unconfirmed READs per BatchGet launch; 0 disables control.
+  std::uint32_t batch_get_max_inflight_total{2048U};
   // Optional strict local-EID list. Empty preserves automatic discovery and
   // selects one working EID. Multiple entries create simultaneous BatchGet
   // paths and stripe core/Jetty workers over them in list order. BatchPut
