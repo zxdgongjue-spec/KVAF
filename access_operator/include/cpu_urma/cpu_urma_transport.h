@@ -43,17 +43,20 @@ struct CpuUrmaTransportOptions {
   // WRITE only: maximum adjacent rows coalesced into one contiguous local and
   // remote SGE. Local or remote gaps start a new WR.
   std::uint32_t remote_sgl_size{1};
-  // Number of independent Jettys and OpenMP submission workers.
+  // Number of independent Jettys and their submission/CQ owners.
   std::uint32_t jetty_count{4};
   bool has_external_region{false};
   peer::PeerRegion external_region{};
+  // Maximum CPU workers used to plan and prepare a batch. Independent from
+  // the Jetty owners that submit and poll hardware queues.
+  std::uint32_t prepare_thread_count{4};
 };
 
 class CpuUrmaTransport final {
  public:
   struct BatchTiming {
-    // Preparation/submission time of the worker with the longest combined
-    // prepare+post duration; concurrent workers are not summed.
+    // Wall time for WR construction, hardware posting and CQ completion.
+    // Concurrent worker time is not summed.
     std::uint64_t prepare_ns{0};
     std::uint64_t post_ns{0};
     std::uint64_t poll_ns{0};
@@ -61,10 +64,12 @@ class CpuUrmaTransport final {
     // Includes validation, workspace/segment lookup and gaps between chunks.
     std::uint64_t total_ns{0};
     std::uint64_t wr_count{0};
-    // Validation, workspace sizing and host segment selection per sub-batch.
+    // Per-sub-batch validation, workspace sizing and host segment selection.
     std::uint64_t setup_ns{0};
     // Entire prepare/post call, including OpenMP scheduling and joining.
     std::uint64_t dispatch_ns{0};
+    // Pre-validation and WRITE grouping for non-contiguous batch APIs.
+    std::uint64_t plan_ns{0};
   };
 
   CpuUrmaTransport();
@@ -80,8 +85,8 @@ class CpuUrmaTransport final {
     void* data;
     std::size_t bytes;
   };
-  // One local SGE per WR. Each worker owns a Jetty and prepares
-  // and submits its batches independently; completion is polled after joining.
+  // One local SGE per WR. Preparation may span more CPU workers than Jettys;
+  // after a barrier, each Jetty has one submission and CQ owner.
   Status WriteSglBatch(std::uint64_t remote_offset, const HostSge* sources,
                        std::size_t count);
   // CPU BatchPut path: transfer packed CPU DRAM rows into independent HBM

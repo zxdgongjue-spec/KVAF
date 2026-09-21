@@ -50,8 +50,11 @@ class MetricsTest(unittest.TestCase):
         self.assertNotEqual(total["p50_GBps"], f"{rounded_bandwidth:.3f}")
 
     def test_invalid_timings_fail_instead_of_becoming_zero_bandwidth(self):
-        valid = dict(total_scope="transport_call", prepare_ns=100,
-                     post_ns=200, poll_ns=300, total_ns=1000, wr_count=4)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(perf.parse_args([]).prepare_threads, 4)
+        valid = dict(total_scope="transport_call", plan_ns=50, setup_ns=50,
+                     prepare_ns=100, post_ns=200, poll_ns=300,
+                     total_ns=1000, wr_count=4)
         self.assertEqual(perf.validate_timing(valid, 2000)["total_ns"], 1000)
         for changes in ({"total_scope": None}, {"total_ns": 0}, {"total_ns": 500},
                         {"total_ns": 2001}, {"poll_ns": -1}, {"post_ns": None},
@@ -66,6 +69,10 @@ class MetricsTest(unittest.TestCase):
             self.assertIsNotNone(perf.validate_args(perf.parse_args(["--remote-sgl-size", str(size)])))
         for size in (31, 32, 256, 1024, 0xFFFFFFFF):
             self.assertIsNone(perf.validate_args(perf.parse_args(["--remote-sgl-size", str(size)])))
+        for count in (0, -1, 65):
+            self.assertIsNotNone(perf.validate_args(perf.parse_args(["--prepare-threads", str(count)])))
+        for count in (1, 8, 64):
+            self.assertIsNone(perf.validate_args(perf.parse_args(["--prepare-threads", str(count)])))
         for removed in ("--sgl-size", "--jettys", "--omp-threads"):
             with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
                 perf.parse_args([removed, "1"])
@@ -79,13 +86,15 @@ class MetricsTest(unittest.TestCase):
 
             def initialize(self, *args, **kwargs):
                 self.scatter = kwargs["remote_sgl_size"] == 31
+                assert kwargs["prepare_thread_count"] == 8
                 assert not {"sgl_size", "jetty_count", "omp_thread_count"}.intersection(kwargs)
                 self.initialized = True
 
             def batch_put(self, keys, sources, offsets, lengths, miss_count):
                 self.payload = sources[0][:sum(lengths[0][:miss_count])]
                 self.last_batch_timing = dict(total_scope="transport_call", total_ns=next(self.totals),
-                                             prepare_ns=100, post_ns=200, poll_ns=300,
+                                             plan_ns=20, setup_ns=30, prepare_ns=100,
+                                             post_ns=200, poll_ns=300,
                                              wr_count=2 if self.scatter else 32)
 
             def batch_free(self, keys):
@@ -110,7 +119,8 @@ class MetricsTest(unittest.TestCase):
              contextlib.redirect_stdout(out):
             self.assertEqual(perf.main(["--request-length", "64", "--miss-count", "32",
                                         "--token-bytes", "128", "--warmup", "1",
-                                        "--iterations", "4", "--remote-sgl-size", "1"]), 0)
+                                        "--iterations", "4", "--remote-sgl-size", "1",
+                                        "--prepare-threads", "8"]), 0)
         result = records(out.getvalue())
         total = result["batch_put_transport_total"]
         self.assertEqual(total["samples"], "4")
@@ -131,7 +141,8 @@ class MetricsTest(unittest.TestCase):
             self.assertEqual(perf.main(["--request-length", "64", "--miss-count", "32",
                                         "--token-bytes", "128", "--warmup", "1",
                                         "--iterations", "4",
-                                        "--remote-sgl-size", "31"]), 0)
+                                        "--remote-sgl-size", "31",
+                                        "--prepare-threads", "8"]), 0)
         self.assertIn("wr_count_min=2 wr_count_max=2 requested_remote_sgl_size=31",
                       scatter_out.getvalue())
 
@@ -162,6 +173,8 @@ token = int(sys.argv[sys.argv.index("--token-bytes") + 1])
 miss = int(sys.argv[sys.argv.index("--miss-count") + 1])
 assert sys.argv[sys.argv.index("--remote-sgl-size") + 1] == "1"
 perf.print_samples("batch_put_transport_total", [1000, 1001], 0, 8192, miss, token)
+perf.print_samples("batch_put_transport_plan", [40, 41], 0, 8192, miss, token)
+perf.print_samples("batch_put_transport_setup", [60, 61], 0, 8192, miss, token)
 perf.print_samples("batch_put_transport_prepare", [100, 101], 0, 8192, miss, token)
 perf.print_samples("batch_put_transport_post", [200, 201], 0, 8192, miss, token)
 perf.print_samples("batch_put_transport_completion_wait", [300, 301], 0, 8192, miss, token)
@@ -185,6 +198,10 @@ perf.print_samples("batch_put", [10000, 10010], 0, 8192, miss, token)
                 call_rows = list(csv.reader(stream))
             self.assertEqual(rows[0], ["token_bytes", "miss_count", "mean_us", "p50_us",
                                        "p90_us", "p99_us", "p50_GBps",
+                                       "plan_mean_us", "plan_p50_us",
+                                       "plan_p90_us", "plan_p99_us",
+                                       "setup_mean_us", "setup_p50_us",
+                                       "setup_p90_us", "setup_p99_us",
                                        "prepare_mean_us", "prepare_p50_us",
                                        "prepare_p90_us", "prepare_p99_us",
                                        "post_mean_us", "post_p50_us",
@@ -200,6 +217,8 @@ perf.print_samples("batch_put", [10000, 10010], 0, 8192, miss, token)
                 self.assertEqual(row, [str(token), str(miss), f"{1.0005:.3f}",
                                        f"{1.0005:.3f}", "1.001", "1.001",
                                        f"{token * miss / 1000.5:.3f}",
+                                       "0.041", "0.041", "0.041", "0.041",
+                                       "0.060", "0.060", "0.061", "0.061",
                                        "0.101", "0.101", "0.101", "0.101",
                                        "0.201", "0.201", "0.201", "0.201",
                                        "0.300", "0.300", "0.301", "0.301"])
@@ -218,6 +237,8 @@ perf.print_samples("batch_put", [10000, 10010], 0, 8192, miss, token)
             runner.write_text('''#!/usr/bin/env bash
 echo 'PERF_RESULT operation=batch_put mean_us=10 p50_us=10 p90_us=10 p99_us=10 p50_GBps=1'
 echo 'PERF_RESULT operation=batch_put_transport_total mean_us=1 p50_us=1 p90_us=1 p99_us=1'
+echo 'PERF_RESULT operation=batch_put_transport_plan mean_us=0.04 p50_us=0.04 p90_us=0.04 p99_us=0.04'
+echo 'PERF_RESULT operation=batch_put_transport_setup mean_us=0.06 p50_us=0.06 p90_us=0.06 p99_us=0.06'
 echo 'PERF_RESULT operation=batch_put_transport_prepare mean_us=0.1 p50_us=0.1 p90_us=0.1 p99_us=0.1'
 echo 'PERF_RESULT operation=batch_put_transport_post mean_us=0.2 p50_us=0.2 p90_us=0.2 p99_us=0.2'
 echo 'PERF_RESULT operation=batch_put_transport_completion_wait mean_us=0.3 p50_us=0.3 p90_us=0.3 p99_us=0.3'

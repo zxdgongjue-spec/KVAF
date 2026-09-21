@@ -10,6 +10,7 @@ namespace {
 std::size_t coalesced_posts = 0;
 std::size_t single_posts = 0;
 std::size_t read_posts = 0;
+std::uint32_t initialized_prepare_threads = 0;
 }
 
 // Exercise the real client parser and routing without liburma or hardware.
@@ -24,6 +25,7 @@ CpuUrmaTransport::~CpuUrmaTransport() = default;
 Status CpuUrmaTransport::Initialize(const CpuUrmaTransportOptions& options) {
   impl_->remote.resize(options.region_bytes);
   impl_->remote_sgl_size = options.remote_sgl_size;
+  initialized_prepare_threads = options.prepare_thread_count;
   return Status::OK();
 }
 Status CpuUrmaTransport::RegisterDirectHostMemory(void*, std::size_t) {
@@ -90,14 +92,14 @@ int main() {
                     "--device-id", "4", "--jettys", "8", "--doorbell-wqes", "128",
                     "--warmup", "20", "--iterations", "200", "--seed", "1",
                     "--ub-device", "udmac0", "--eid-index", "1",
-                    "--remote-sgl-size", "8"}, &options),
+                    "--remote-sgl-size", "8", "--prepare-threads", "32"}, &options),
          "retained options must parse");
   Expect(options.blocks == 2048 && options.block_bytes == 4096 &&
              options.host_space_bytes == (100ULL << 30U) && options.device_id == 4 &&
              options.jetty_count == 8 && options.wqes_per_doorbell == 128 &&
              options.warmup == 20 && options.iterations == 200 && options.seed == 1 &&
              options.ub_device == "udmac0" && options.has_eid_index && options.eid_index == 1 &&
-             options.remote_sgl_size == 8,
+             options.remote_sgl_size == 8 && options.prepare_thread_count == 32,
          "retained option values must be preserved");
   for (const char* flag : {"--window-bytes", "--stream-depth", "--cq-mod", "--bytes"}) {
     Options removed;
@@ -108,7 +110,7 @@ int main() {
   Expect(ParseArgs({"client", "127.0.0.1", "28111"}, &defaults) &&
              defaults.peer == "127.0.0.1:28111" && defaults.jetty_count == 4 &&
              defaults.host_space_bytes == 0 && defaults.wqes_per_doorbell == 0 &&
-             defaults.remote_sgl_size == 1,
+             defaults.remote_sgl_size == 1 && defaults.prepare_thread_count == 4,
          "peer syntax and defaults must be preserved");
   for (const char* count : {"0", "17"}) {
     Options invalid;
@@ -119,6 +121,11 @@ int main() {
     Options invalid;
     Expect(!ParseArgs({"client", "127.0.0.1:28111", "--remote-sgl-size", size}, &invalid),
            "invalid remote SGL sizes must be rejected");
+  }
+  for (const char* count : {"0", "65", "-1", "4294967296", "invalid"}) {
+    Options invalid;
+    Expect(!ParseArgs({"client", "127.0.0.1:28111", "--prepare-threads", count}, &invalid),
+           "invalid prepare thread counts must be rejected");
   }
 
   kvaf::CpuUrmaTransport transport;
@@ -154,5 +161,17 @@ int main() {
   Expect(RunBatchPass(&transport, true, &sparse, order, 16, 1, &sparse_write, 2) &&
              sparse_write.wrs == 4,
          "sparse host gaps must prevent grouping");
+
+  (void)setenv("OMP_WAIT_POLICY", "ACTIVE", 1);
+  std::vector<std::string> client_storage{
+      "client", "127.0.0.1:28111", "--blocks", "4", "--block-bytes", "16",
+      "--warmup", "0", "--iterations", "1", "--remote-sgl-size", "2",
+      "--prepare-threads", "32"};
+  std::vector<char*> client_argv;
+  for (auto& arg : client_storage) client_argv.push_back(arg.data());
+  Expect(kvaf_cpu_hbm_client_main(
+             static_cast<int>(client_argv.size()), client_argv.data()) == 0 &&
+             initialized_prepare_threads == 32U,
+         "client main must forward prepare threads to the transport");
   return 0;
 }

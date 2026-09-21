@@ -81,6 +81,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="maximum adjacent CPU/HBM rows coalesced into one WRITE WR",
     )
     parser.add_argument(
+        "--prepare-threads",
+        type=int,
+        default=environment_int("KVAF_CPU_URMA_PREPARE_THREADS", 4),
+        help="maximum CPU workers used to plan and prepare each transport batch",
+    )
+    parser.add_argument(
         "--device-id", type=int, default=environment_int("DEVICE_ID", 0)
     )
     parser.add_argument(
@@ -116,6 +122,8 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "doorbell-wqes must be in [0, 1024]"
     if args.remote_sgl_size <= 0 or args.remote_sgl_size > 0xFFFFFFFF:
         return "remote-sgl-size must be a positive uint32; hardware capacity is applied by transport"
+    if args.prepare_threads <= 0 or args.prepare_threads > 64:
+        return "prepare-threads must be in [1, 64]"
     return None
 
 
@@ -174,7 +182,8 @@ def validate_timing(timing: dict, call_ns: int) -> dict[str, int]:
         raise ValueError(
             "transport wall-clock timing is unavailable; rebuild the CPU Python binding"
         )
-    names = ("prepare_ns", "post_ns", "poll_ns", "total_ns", "wr_count")
+    stage_names = ("plan_ns", "setup_ns", "prepare_ns", "post_ns", "poll_ns")
+    names = stage_names + ("total_ns", "wr_count")
     for name in names:
         value = timing.get(name)
         if type(value) is not int or value < 0:
@@ -182,7 +191,7 @@ def validate_timing(timing: dict, call_ns: int) -> dict[str, int]:
     total = timing["total_ns"]
     if total <= 0 or total > call_ns:
         raise ValueError("transport total must be positive and within the Runtime call")
-    if sum(timing[name] for name in names[:3]) > total:
+    if sum(timing[name] for name in stage_names) > total:
         raise ValueError("transport stages exceed the measured transport total")
     return {name: timing[name] for name in names}
 
@@ -227,7 +236,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"peer={args.peer} device_id={args.device_id} "
         f"request_length={args.request_length} miss_count={args.miss_count} "
         f"token_bytes={args.token_bytes} payload_bytes={payload_bytes} "
-        f"remote_sgl_size={args.remote_sgl_size} "
+        f"remote_sgl_size={args.remote_sgl_size} prepare_threads={args.prepare_threads} "
         f"doorbell_wqes={args.doorbell_wqes} warmup={args.warmup} "
         f"iterations={args.iterations}"
     )
@@ -242,6 +251,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             eid_index=args.eid_index,
             wqes_per_doorbell=args.doorbell_wqes,
             remote_sgl_size=args.remote_sgl_size,
+            prepare_thread_count=args.prepare_threads,
         )
 
         def execute() -> None:
@@ -293,6 +303,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
         call_samples: list[int] = []
+        plan_samples: list[int] = []
+        setup_samples: list[int] = []
         prepare_samples: list[int] = []
         post_samples: list[int] = []
         poll_samples: list[int] = []
@@ -311,6 +323,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise ValueError("transport WR count is inconsistent with miss-count/remote-sgl-size")
             wr_counts.append(timing["wr_count"])
             call_samples.append(call_ns)
+            plan_samples.append(timing["plan_ns"])
+            setup_samples.append(timing["setup_ns"])
             prepare_samples.append(timing["prepare_ns"])
             post_samples.append(timing["post_ns"])
             poll_samples.append(timing["poll_ns"])
@@ -325,6 +339,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         for operation, samples in (
             ("batch_put", call_samples),
             ("batch_put_transport_total", total_samples),
+            ("batch_put_transport_plan", plan_samples),
+            ("batch_put_transport_setup", setup_samples),
             ("batch_put_transport_prepare", prepare_samples),
             ("batch_put_transport_post", post_samples),
             ("batch_put_transport_completion_wait", poll_samples),

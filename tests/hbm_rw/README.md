@@ -65,26 +65,30 @@ achieved CPU-initiated URMA payload rate, not raw HBM silicon bandwidth; with
 656-byte messages it includes per-WR protocol and CQ overhead.
 
 Per-batch transport logs are disabled so terminal I/O does not distort the
-measurement. For the single-SGE OpenMP batch path, the final summary also
-reports average worker `prepare`/`post` and caller `poll` time. A separate
-`_WALL` line reports `setup`, `submit_wall`, `poll_wait`, `other`, and `total`.
-Worker timings are contained within `submit_wall`; do not add them to it.
+measurement. The final summary separates non-contiguous batch `plan`,
+per-sub-batch `setup`, WR `prepare`, hardware `post`, and CQ `poll` wall time.
+The contiguous READ path has no separate plan, so its validation remains in
+`setup`. A separate `_WALL` line
+keeps the aggregate `submit_wall`, `other`, and `total`; `submit_wall` already
+contains WR preparation and post, so do not add those fields to it.
 The explicitly registered host address space is cached as one URMA segment,
 so batch transfers reuse its
 `tseg` directly instead of searching the registration list for every block.
 
-Each block is one single-SGE WR. `--jettys N` selects 1 to 16 Jettys, with
-the same number of OpenMP workers; the default is 4. Each worker owns one
-Jetty, prepares its WR/SGE entries and submits each chunk directly. The caller
-polls the final CQE per Jetty after
-the workers join. Each Jetty supports 8192 outstanding WRs, so a batch accepts
+Each block is one single-SGE WR. `--jettys N` selects 1 to 16 Jettys; the
+default is 4. `--prepare-threads N` independently selects a maximum of 1 to 64
+CPU planning and WR-construction workers, also defaulting to 4. Small batches
+use fewer workers. Preparation completes before
+submission. One owner then posts each Jetty and polls that Jetty's final CQE;
+different Jettys submit and poll concurrently. Each Jetty supports 8192
+outstanding WRs, so a batch accepts
 at most `8192 * jettys` blocks. The CPU HBM client fixes `OMP_WAIT_POLICY=ACTIVE`
 before OpenMP initialization, overriding any inherited policy. It does not
 set CPU affinity; `OMP_PROC_BIND` and `OMP_PLACES` remain caller-controlled.
 
-`--doorbell-wqes N` controls the maximum WRs in each worker's submission.
+`--doorbell-wqes N` controls the maximum WRs in each Jetty owner's submission.
 Zero, the default, submits the complete list for that Jetty. With `N=32`,
-each worker independently prepares and posts up to 32 WRs at a time. This
+each owner independently posts up to 32 prepared WRs at a time. This
 is an API-level batch size; the provider implements the actual doorbell.
 
 ```bash

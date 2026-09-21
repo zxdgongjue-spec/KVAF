@@ -31,6 +31,7 @@ struct Options {
   std::uint32_t device_id{0};
   std::uint32_t jetty_count{4};
   std::uint32_t remote_sgl_size{1};
+  std::uint32_t prepare_thread_count{4};
 };
 
 bool ParseU64(const char* text, std::uint64_t* value) {
@@ -57,7 +58,7 @@ void Usage(const char* program) {
                "[--doorbell-wqes N] "
                "[--seed N] [--ub-device NAME] "
                "[--eid-index N] [--device-id N] [--jettys N] "
-               "[--remote-sgl-size N]\n",
+               "[--remote-sgl-size N] [--prepare-threads N]\n",
                program);
 }
 
@@ -110,12 +111,14 @@ bool Parse(int argc, char** argv, Options* options) {
     else if (arg == "--device-id" && ParseU32(value, &options->device_id)) {}
     else if (arg == "--jettys" && ParseU32(value, &options->jetty_count)) {}
     else if (arg == "--remote-sgl-size" && ParseU32(value, &options->remote_sgl_size)) {}
+    else if (arg == "--prepare-threads" && ParseU32(value, &options->prepare_thread_count)) {}
     else return false;
   }
   return options->blocks != 0 && options->block_bytes != 0 && options->iterations != 0 &&
          options->wqes_per_doorbell <= 1024U &&
          options->jetty_count >= 1U && options->jetty_count <= 16U &&
          options->remote_sgl_size != 0U &&
+         options->prepare_thread_count >= 1U && options->prepare_thread_count <= 64U &&
          options->blocks <= std::numeric_limits<std::uint64_t>::max() / options->block_bytes &&
          options->block_bytes <= std::numeric_limits<std::uint32_t>::max();
 }
@@ -129,6 +132,7 @@ struct Stats {
   std::uint64_t min_ns{std::numeric_limits<std::uint64_t>::max()};
   std::uint64_t max_ns{0};
   std::uint64_t wall_ns{0};
+  std::uint64_t plan_ns{0};
   std::uint64_t prepare_ns{0};
   std::uint64_t post_ns{0};
   std::uint64_t poll_ns{0};
@@ -205,6 +209,7 @@ bool RunBatchPass(kvaf::CpuUrmaTransport* transport, bool write,
     stats->sum_ns += elapsed;
     stats->min_ns = std::min(stats->min_ns, elapsed);
     stats->max_ns = std::max(stats->max_ns, elapsed);
+    stats->plan_ns += timing.plan_ns;
     stats->prepare_ns += timing.prepare_ns;
     stats->post_ns += timing.post_ns;
     stats->poll_ns += timing.poll_ns;
@@ -232,18 +237,22 @@ void PrintStats(const char* name, const Stats& stats) {
               stats.min_ns / 1000.0, stats.max_ns / 1000.0);
   if (stats.phase_samples != 0U) {
     const double samples = static_cast<double>(stats.phase_samples);
-    std::printf("[HBM_TEST][CPU] %-5s_PHASE avg_prepare=%.3f us avg_post=%.3f us "
-                "avg_poll=%.3f us\n",
-                name, stats.prepare_ns / samples / 1000.0,
+    std::printf("[HBM_TEST][CPU] %-5s_PHASE avg_plan=%.3f us avg_setup=%.3f us "
+                "avg_prepare=%.3f us avg_post=%.3f us avg_poll=%.3f us\n",
+                name, stats.plan_ns / samples / 1000.0,
+                stats.setup_ns / samples / 1000.0,
+                stats.prepare_ns / samples / 1000.0,
                 stats.post_ns / samples / 1000.0,
                 stats.poll_ns / samples / 1000.0);
-    const auto covered_ns = stats.setup_ns + stats.dispatch_ns + stats.poll_ns;
+    const auto covered_ns = stats.plan_ns + stats.setup_ns +
+        stats.dispatch_ns + stats.poll_ns;
     const auto other_ns = stats.total_ns > covered_ns
         ? stats.total_ns - covered_ns : 0U;
-    std::printf("[HBM_TEST][CPU] %-5s_WALL avg_setup=%.3f us "
+    std::printf("[HBM_TEST][CPU] %-5s_WALL avg_plan=%.3f us avg_setup=%.3f us "
                 "avg_submit_wall=%.3f us avg_poll_wait=%.3f us avg_other=%.3f us "
                 "avg_total=%.3f us\n",
-                name, stats.setup_ns / samples / 1000.0,
+                name, stats.plan_ns / samples / 1000.0,
+                stats.setup_ns / samples / 1000.0,
                 stats.dispatch_ns / samples / 1000.0,
                 stats.poll_ns / samples / 1000.0,
                 other_ns / samples / 1000.0,
@@ -288,13 +297,14 @@ int main(int argc, char** argv) {
                "[HBM_TEST][CPU] START peer=%s blocks=%zu block_bytes=%zu payload_bytes=%llu "
                "host_address_space_bytes=%llu "
                "iterations=%zu warmup=%zu "
-               "remote_device=%u jettys=%u remote_sgl_size=%u "
+               "remote_device=%u jettys=%u prepare_threads=%u remote_sgl_size=%u "
                "write_order=%s omp_wait_policy=ACTIVE\n",
                options.peer.c_str(), options.blocks, options.block_bytes,
                static_cast<unsigned long long>(total_bytes),
                static_cast<unsigned long long>(host_space_bytes), options.iterations,
                options.warmup,
-               options.device_id, options.jetty_count, options.remote_sgl_size,
+               options.device_id, options.jetty_count, options.prepare_thread_count,
+               options.remote_sgl_size,
                options.remote_sgl_size > 1U ? "local-address" : "random");
   std::fprintf(stderr, "[HBM_TEST][CPU] DATA_PATH=direct-registered-host-memory\n");
 
@@ -310,6 +320,7 @@ int main(int argc, char** argv) {
   transport_options.wqes_per_doorbell = options.wqes_per_doorbell;
   transport_options.jetty_count = options.jetty_count;
   transport_options.remote_sgl_size = options.remote_sgl_size;
+  transport_options.prepare_thread_count = options.prepare_thread_count;
   kvaf::CpuUrmaTransport transport;
   kvaf::Status status = transport.Initialize(transport_options);
   if (!status.ok()) {

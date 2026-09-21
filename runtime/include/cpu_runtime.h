@@ -26,6 +26,7 @@ struct CpuRuntimeClientOptions {
   std::uint32_t device_id{0U};
   std::uint32_t wqes_per_doorbell{0U};
   std::uint32_t remote_sgl_size{1U};
+  std::uint32_t prepare_thread_count{4U};
 };
 
 struct CpuRuntimeBatchTiming {
@@ -34,6 +35,8 @@ struct CpuRuntimeBatchTiming {
   std::uint64_t poll_ns{0U};
   std::uint64_t total_ns{0U};
   std::uint64_t wr_count{0U};
+  std::uint64_t plan_ns{0U};
+  std::uint64_t setup_ns{0U};
 };
 
 // CPU endpoint Runtime. It owns only CPU-side UMDK resources and sessions;

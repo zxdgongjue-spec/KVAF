@@ -131,16 +131,19 @@ WRITE 并等待 CQ；第一组成功即选用，失败则释放本次资源后�
 不会自动切换到另一条链路。每组结束先销毁 transport 再释放远端 HBM；若释放失败，
 停止遍历并保留已收集的结果。
 
-默认 `--count 8192 --token-bytes 4096 --remote-sgl-size 1 --warmup 5 --iterations 100`，
+默认 `--count 8192 --token-bytes 4096 --remote-sgl-size 1 --prepare-threads 4`
+和 `--warmup 5 --iterations 100`，
 即每次 WRITE 32 MiB，8192 条 WR；本地和远端行地址均连续。所有组合使用相同负载，
-固定 4 个 Jetty、4 个 OpenMP worker，`wqes_per_doorbell=0`。这些负载选项可按需修改。
+固定 4 个 Jetty，最多使用指定数量的 planning/WR preparation worker，
+`wqes_per_doorbell=0`。这些负载选项可按需修改。
 测量范围为现有 `transport.total_ns`（包含分组、参数检查、segment 查找、WR 构造、
 提交和完成等待），不包含建链、预注册内存、回读校验和 warmup，也不经过 Runtime/Python。
 `mean_GBps = payload_bytes / mean_ns`，使用十进制 GB/s。
 
 CSV 每个 EID 组合一行，写完立即 flush；包括两端设备/EID index/EID、导出的 segment EID、
-状态及错误、负载参数、实际 WR 数、平均/p50/p99 延迟、平均/p50 带宽和 prepare/post/
-completion wait 平均耗时。`remote_sgl_size` 列是请求值，实际分组仍按设备能力限制，
+状态及错误、负载参数、实际 WR 数、平均/p50/p99 延迟、平均/p50 带宽和
+plan/setup/prepare/post/completion wait 平均耗时。`remote_sgl_size` 列是请求值，
+`prepare_threads` 列是配置的最大准备线程数；实际分组仍按设备能力限制，
 可结合 `wr_count_min/max` 和 transport 日志确认。失败行的性能字段留空。
 终端最后输出成功组合按平均带宽降序排列的 `EID_PERF_RANK`，以及包含 CSV 路径的
 `EID_PERF_SUMMARY`。无成功组合或资源清理失败时返回非零退出码。
@@ -155,8 +158,8 @@ tests/run_cpu_urma_eid_perf_pinned.sh "$PWD/build-cpu" \
 ```
 
 脚本在 Linux 上从调用进程允许使用的 CPU 中选四个不同物理核，优先选同一
-NUMA 节点，使用 OpenMP affinity 将四个 worker 分别固定到一个逻辑 CPU。
-每个 worker 仍独占一条 Jetty，负责其 WR 构造和 post；完成轮询仍由调用线程执行。
+NUMA 节点。该脚本固定 `OMP_THREAD_LIMIT=4`，因此只适合四线程绑核基线；测试
+更多 `prepare_threads` 时应直接运行 benchmark，并提供覆盖相应核数的 affinity。
 `EID_PERF_AFFINITY` 输出目标 CPU/NUMA 节点，OpenMP 的 affinity 日志显示实际线程绑定。
 此方式没有在每批传输中增加设置/恢复 affinity 的系统调用。
 脚本不自动判断 UB 设备所在的 NUMA 节点；需要指定核时，在命令前加
@@ -167,10 +170,10 @@ NUMA 节点，使用 OpenMP affinity 将四个 worker 分别固定到一个逻�
 单独扩展为 4 Jetty/worker，以便验证并发提交。`./build.sh cpu` 同时清空 `CMAKE_BUILD_TYPE`，避免旧构建目录
 继续保留该提交设置的 Release 模式。EID 测试保留阶段日志，用于进一步定位崩溃。
 
-CPU URMA 固定创建 4 个 Jetty，并使用 4 个 OpenMP worker，每条 WR 的本地
-SGE 数固定为 1。常量位于 `cpu_urma_transport.cc`：`kJettyCount`、
-`kOmpThreadCount`、`kLocalSgeCount`。不再提供 `jetty_count`、`omp_thread_count`、
-`sgl_size` 初始化参数或对应命令行选项。
+CPU URMA 默认创建 4 个 Jetty，每条 WR 的本地 SGE 数固定为 1。Jetty owner
+数量和 CPU 侧规划/WR 构造最大线程数相互独立：`jetty_count` 范围是 1 到 16，
+`prepare_thread_count` 范围是 1 到 64，小批量会自适应减少线程；后者可通过性能工具的
+`--prepare-threads` 配置。
 
 每个 CPU Jetty 的 `CreateChannel` 请求都会在 NPU 服务端创建独立的目标
 Jetty 和 CQ；四条通道共享 HBM segment、token 和设备 context。服务端
@@ -178,10 +181,10 @@ Jetty 和 CQ；四条通道共享 HBM segment、token 和设备 context。服务
 `target_jfc_id` 可用于确认通道对应关系。释放 HBM session 时先释放各通道，
 再注销并释放 HBM。此行为需要重新构建并重启 `kvaf_npu_service`。
 
-每个 worker 独占一个 Jetty 的 WR 链表、SQ 和提交操作，构造好一批就直接提交，
-不需要等待另一个 Jetty 的构造完成。`wqes_per_doorbell > 0` 控制每批 WR 数，
-为 0（默认）时每个 worker 构造完整 Jetty 链表后提交；两种方式都由 worker
-自行下发。每个 Jetty 仅最后一个 WR 请求 CQE，worker 汇合后由调用线程轮询完成。
+输入校验和分组先按行切片并行执行，WR/SGE 槽位也由 preparation worker 并行
+构造；barrier 之后，每个 Jetty 仅由一个 owner 操作 WR 链、SQ 和 doorbell。
+`wqes_per_doorbell > 0` 控制每次 post 的 WR 数，为 0（默认）时 owner 一次提交
+完整 Jetty 链。每个 Jetty 仅最后一个 WR 请求 CQE，各 owner 并行轮询独立 JFC。
 WRITE 和 READ 的 `comp_order` 均为 1，中间 WR 使用 relax-order，最后一个 WR 使用
 strong-order 并请求 CQE。CPU JFS/JFR 深度为 8192，JFC 深度为 16384；
 NPU 每条目标通道的 SQ/RQ 深度为 1024，CQ 深度为 16384。

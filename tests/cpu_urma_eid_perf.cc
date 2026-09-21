@@ -31,6 +31,7 @@ struct Options {
   std::size_t count{8192};
   std::size_t token_bytes{4096};
   std::uint32_t remote_sgl_size{1};
+  std::uint32_t prepare_thread_count{4};
   std::size_t warmup{5};
   std::size_t iterations{100};
   std::string output{"results/cpu_urma_eid_bandwidth.csv"};
@@ -39,6 +40,7 @@ struct Options {
 void Usage(const char* program) {
   std::cerr << "Usage: " << program << " --peer HOST:PORT [--device-id N] "
       "[--count 8192] [--token-bytes 4096] [--remote-sgl-size 1] "
+      "[--prepare-threads 4] "
       "[--warmup 5] [--iterations 100] [--output results.csv]\n";
 }
 
@@ -64,6 +66,7 @@ Options Parse(int argc, char** argv) {
     if (number > std::numeric_limits<std::size_t>::max()) throw std::invalid_argument("value too large");
     if (flag == "--device-id" && number <= UINT32_MAX) options.device_id = number;
     else if (flag == "--remote-sgl-size" && number <= UINT32_MAX) options.remote_sgl_size = number;
+    else if (flag == "--prepare-threads" && number <= 64U) options.prepare_thread_count = number;
     else if (flag == "--count") options.count = number;
     else if (flag == "--token-bytes") options.token_bytes = number;
     else if (flag == "--warmup") options.warmup = number;
@@ -73,6 +76,7 @@ Options Parse(int argc, char** argv) {
   if (options.peer.empty() || options.output.empty() || options.count == 0U ||
       options.token_bytes == 0U || options.token_bytes > UINT32_MAX ||
       options.remote_sgl_size == 0U || options.iterations == 0U ||
+      options.prepare_thread_count == 0U ||
       options.count > (std::numeric_limits<std::size_t>::max() - kPageBytes) / options.token_bytes) {
     throw std::invalid_argument("invalid peer, output, payload size, SGL size or iterations");
   }
@@ -157,7 +161,7 @@ struct Result {
   std::size_t samples{0};
   std::uint64_t wr_min{UINT64_MAX}, wr_max{0};
   kvaf::eid_perf::Stats stats;
-  double prepare_us{0}, post_us{0}, poll_us{0};
+  double plan_us{0}, setup_us{0}, prepare_us{0}, post_us{0}, poll_us{0};
 };
 
 Result Measure(const Options& options, const CpuCandidate& cpu, std::uint32_t npu_index,
@@ -210,6 +214,7 @@ Result Measure(const Options& options, const CpuCandidate& cpu, std::uint32_t np
     config.has_external_region = true;
     config.external_region = region;
     config.remote_sgl_size = options.remote_sgl_size;
+    config.prepare_thread_count = options.prepare_thread_count;
     // This calls one fixed pair directly; no Runtime candidate fallback.
     phase("initialize");
     status = transport.Initialize(config);
@@ -247,7 +252,7 @@ Result Measure(const Options& options, const CpuCandidate& cpu, std::uint32_t np
     }
     std::vector<std::uint64_t> samples;
     samples.reserve(options.iterations);
-    long double prepare = 0, post = 0, poll = 0;
+    long double plan = 0, setup = 0, prepare = 0, post = 0, poll = 0;
     phase("measure");
     for (std::size_t i = 0; i < options.iterations; ++i) {
       status = write();
@@ -259,6 +264,8 @@ Result Measure(const Options& options, const CpuCandidate& cpu, std::uint32_t np
       result.samples = samples.size();
       result.wr_min = std::min(result.wr_min, timing.wr_count);
       result.wr_max = std::max(result.wr_max, timing.wr_count);
+      plan += timing.plan_ns;
+      setup += timing.setup_ns;
       prepare += timing.prepare_ns;
       post += timing.post_ns;
       poll += timing.poll_ns;
@@ -267,6 +274,8 @@ Result Measure(const Options& options, const CpuCandidate& cpu, std::uint32_t np
     status = verify();
     if (!status.ok()) return finish("verify_failed", status);
     result.stats = kvaf::eid_perf::Summarize(std::move(samples), payload);
+    result.plan_us = static_cast<double>(plan / options.iterations / 1000);
+    result.setup_us = static_cast<double>(setup / options.iterations / 1000);
     result.prepare_us = static_cast<double>(prepare / options.iterations / 1000);
     result.post_us = static_cast<double>(post / options.iterations / 1000);
     result.poll_us = static_cast<double>(poll / options.iterations / 1000);
@@ -288,15 +297,17 @@ void WriteRow(std::ostream& csv, const Options& options, const Result& result) {
       std::to_string(options.device_id), std::to_string(result.npu_index), Hex(result.npu_eid),
       result.segment_eid, result.status, result.error, std::to_string(options.count),
       std::to_string(options.token_bytes), std::to_string(options.count * options.token_bytes),
-      std::to_string(options.remote_sgl_size), std::to_string(options.warmup),
+      std::to_string(options.remote_sgl_size),
+      std::to_string(options.prepare_thread_count), std::to_string(options.warmup),
       std::to_string(options.iterations), std::to_string(result.samples)};
   if (result.status == "ok") {
     fields.insert(fields.end(), {std::to_string(result.wr_min), std::to_string(result.wr_max),
         Fixed(result.stats.mean_ns / 1000), Fixed(result.stats.p50_ns / 1000),
         Fixed(result.stats.p99_ns / 1000), Fixed(result.stats.mean_gbps),
-        Fixed(result.stats.p50_gbps), Fixed(result.prepare_us), Fixed(result.post_us), Fixed(result.poll_us)});
+        Fixed(result.stats.p50_gbps), Fixed(result.plan_us), Fixed(result.setup_us),
+        Fixed(result.prepare_us), Fixed(result.post_us), Fixed(result.poll_us)});
   } else {
-    fields.resize(fields.size() + 10U);  // Failure is not a zero-bandwidth measurement.
+    fields.resize(fields.size() + 12U);  // Failure is not a zero-bandwidth measurement.
   }
   for (std::size_t i = 0; i < fields.size(); ++i) {
     if (i != 0U) csv << ',';
@@ -316,8 +327,8 @@ int Run(const Options& options) {
   std::ofstream csv(path);
   csv.exceptions(std::ios::badbit | std::ios::failbit);
   csv << "cpu_device,cpu_eid_index,cpu_eid,npu_device_id,npu_eid_index,npu_eid,segment_eid,status,error,"
-         "count,token_bytes,payload_bytes,remote_sgl_size,warmup,iterations,samples,wr_count_min,wr_count_max,"
-         "mean_us,p50_us,p99_us,mean_GBps,p50_GBps,prepare_mean_us,post_mean_us,completion_wait_mean_us\n" << std::flush;
+         "count,token_bytes,payload_bytes,remote_sgl_size,prepare_threads,warmup,iterations,samples,wr_count_min,wr_count_max,"
+         "mean_us,p50_us,p99_us,mean_GBps,p50_GBps,plan_mean_us,setup_mean_us,prepare_mean_us,post_mean_us,completion_wait_mean_us\n" << std::flush;
   const std::size_t payload = options.count * options.token_bytes;
   HostBuffer input(payload), output(payload);
   for (std::size_t i = 0; i < payload; ++i) input.data.get()[i] = static_cast<std::uint8_t>(i * 17U + 29U);
@@ -333,6 +344,7 @@ int Run(const Options& options) {
   std::cout << "EID_PERF_CONFIG cpu_eids=" << cpus.size() << " npu_eids=" << npus.size()
             << " payload_bytes=" << payload << " count=" << options.count
             << " token_bytes=" << options.token_bytes << " remote_sgl_size=" << options.remote_sgl_size
+            << " prepare_threads=" << options.prepare_thread_count
             << " scope=transport_total bytes_unit=decimal_GB csv=" << path << std::endl;
   std::vector<Result> results;
   bool aborted = false;

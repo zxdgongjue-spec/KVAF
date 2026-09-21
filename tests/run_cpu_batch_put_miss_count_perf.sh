@@ -95,7 +95,7 @@ printf '%s\n' \
   'token_bytes,miss_count,mean_us,p50_us,p90_us,p99_us,p50_GBps' \
   >"$KVAF_CPU_BATCH_PUT_SWEEP_CSV"
 printf '%s\n' \
-  'token_bytes,miss_count,mean_us,p50_us,p90_us,p99_us,p50_GBps,prepare_mean_us,prepare_p50_us,prepare_p90_us,prepare_p99_us,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us' \
+  'token_bytes,miss_count,mean_us,p50_us,p90_us,p99_us,p50_GBps,plan_mean_us,plan_p50_us,plan_p90_us,plan_p99_us,setup_mean_us,setup_p50_us,setup_p90_us,setup_p99_us,prepare_mean_us,prepare_p50_us,prepare_p90_us,prepare_p99_us,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us' \
   >"$KVAF_CPU_BATCH_PUT_COMPARISON_CSV"
 
 for token_bytes in "${KVAF_TOKEN_BYTES[@]}"; do
@@ -115,10 +115,13 @@ for token_bytes in "${KVAF_TOKEN_BYTES[@]}"; do
 
     call_result="$(extract_result "$log_file" batch_put)"
     total_result="$(extract_result "$log_file" batch_put_transport_total)"
+    plan_result="$(extract_result "$log_file" batch_put_transport_plan)"
+    setup_result="$(extract_result "$log_file" batch_put_transport_setup)"
     prepare_result="$(extract_result "$log_file" batch_put_transport_prepare)"
     post_result="$(extract_result "$log_file" batch_put_transport_post)"
     completion_result="$(extract_result "$log_file" batch_put_transport_completion_wait)"
-    if [[ -z "$call_result" || -z "$total_result" || -z "$prepare_result" ||
+    if [[ -z "$call_result" || -z "$total_result" || -z "$plan_result" ||
+          -z "$setup_result" || -z "$prepare_result" ||
           -z "$post_result" || -z "$completion_result" ]]; then
       echo "ERROR: incomplete CPU BatchPut results for token_bytes=$token_bytes miss_count=$miss_count" >&2
       exit 1
@@ -126,13 +129,15 @@ for token_bytes in "${KVAF_TOKEN_BYTES[@]}"; do
 
     if ! call_row="$(result_to_csv "$token_bytes" "$miss_count" "$call_result")" ||
        ! total_row="$(result_to_csv "$token_bytes" "$miss_count" "$total_result")" ||
+       ! plan_row="$(phase_to_csv "$plan_result")" ||
+       ! setup_row="$(phase_to_csv "$setup_result")" ||
        ! prepare_row="$(phase_to_csv "$prepare_result")" ||
        ! post_row="$(phase_to_csv "$post_result")" ||
        ! completion_row="$(phase_to_csv "$completion_result")"; then
       echo "ERROR: incomplete CPU BatchPut metrics for token_bytes=$token_bytes miss_count=$miss_count" >&2
       exit 1
     fi
-    transport_row="$total_row,$prepare_row,$post_row,$completion_row"
+    transport_row="$total_row,$plan_row,$setup_row,$prepare_row,$post_row,$completion_row"
     printf '%s\n' "$call_row" >>"$KVAF_CPU_BATCH_PUT_SWEEP_CSV"
     printf '%s\n' "$transport_row" >>"$KVAF_CPU_BATCH_PUT_COMPARISON_CSV"
     echo "CPU_BATCH_PUT_MISS_SWEEP_RESULT scope=runtime_call csv=$call_row"

@@ -866,6 +866,9 @@ Status CpuRuntime::InitializeClient(const CpuRuntimeClientOptions& options) {
   if (peer_address.empty() || options.hbm_bytes == 0U || options.slot_size == 0U ||
       options.hbm_bytes % options.slot_size != 0U)
     return Status::InvalidArgument("CPU HBM client requires peer address and valid HBM size");
+  if (options.prepare_thread_count == 0U || options.prepare_thread_count > 64U) {
+    return Status::InvalidArgument("CPU HBM client prepare_thread_count must be in [1,64]");
+  }
   auto impl = std::make_unique<Impl>();
   impl->client_mode = true;
   impl->peer_link = std::make_shared<peer::PeerLink>(peer_address);
@@ -897,6 +900,7 @@ Status CpuRuntime::InitializeClient(const CpuRuntimeClientOptions& options) {
       transport_options.remote_device_id = options.device_id;
       transport_options.wqes_per_doorbell = options.wqes_per_doorbell;
       transport_options.remote_sgl_size = options.remote_sgl_size;
+      transport_options.prepare_thread_count = options.prepare_thread_count;
       impl->access_operator = std::make_unique<CpuUrmaAccessOperator>(transport_options, impl->peer_link);
       impl->meta_manager = CreateInMemoryMetaManager();
       impl->runtime_core = std::make_unique<RuntimeCore>(*impl->meta_manager, *impl->access_operator,
@@ -948,8 +952,15 @@ CpuRuntimeBatchTiming CpuRuntime::last_batch_timing() const {
   }
   const CpuUrmaTransport::BatchTiming timing =
       impl_->access_operator->last_batch_timing();
-  return CpuRuntimeBatchTiming{timing.prepare_ns, timing.post_ns,
-                               timing.poll_ns, timing.total_ns, timing.wr_count};
+  CpuRuntimeBatchTiming result{};
+  result.plan_ns = timing.plan_ns;
+  result.setup_ns = timing.setup_ns;
+  result.prepare_ns = timing.prepare_ns;
+  result.post_ns = timing.post_ns;
+  result.poll_ns = timing.poll_ns;
+  result.total_ns = timing.total_ns;
+  result.wr_count = timing.wr_count;
+  return result;
 }
 
 Status CpuRuntime::LinkTo(const LinkTarget& target) {
