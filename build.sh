@@ -14,7 +14,7 @@ die() {
 
 usage() {
   cat <<'EOF'
-Usage: ./build.sh <cpu|npu|hbm-rw> [--build-dir DIR] [--jobs N]
+Usage: ./build.sh <cpu|npu|hbm-rw|aicpu-cpu|aicpu-npu> [--build-dir DIR] [--jobs N]
 
 cpu  Builds the liburma-only CPU Runtime service. If liburma is not installed,
      it clones and builds the pinned UMDK source beside this repository.
@@ -22,6 +22,9 @@ npu  Builds the CANN AIV BatchGet/BatchPut Runtime and Python binding. It
      installs pybind11 for the selected Python interpreter when necessary.
 hbm-rw Builds the standalone benchmark together with the production CPU URMA
        transport and NPU HBM service.
+aicpu-cpu Builds only the CPU side of the AICPU CPU-push bandwidth test.
+aicpu-npu Builds its NPU executable and AICPU kernel package (no installation).
+          Neither aicpu mode builds Python bindings or AIV kernels.
 
 Environment overrides:
   KVAF_UMDK_ROOT       UMDK source/header root for the CPU build
@@ -31,6 +34,7 @@ Environment overrides:
                         CANN toolkit root for the NPU build
   PYTHON               Python interpreter for the NPU binding (default: python3)
   KVAF_BUILD_JOBS      Parallel build jobs
+  KVAF_AICPU_CXX      CANN AICPU cross compiler override (aicpu-npu)
 EOF
 }
 
@@ -228,9 +232,55 @@ build_hbm_rw() {
   echo "[KVAF_BUILD] HBM test binaries: $build_dir/runtime/kvaf_npu_service and $build_dir/tests/kvaf_cpu_hbm_client"
 }
 
+build_aicpu_test() {
+  local role="$1" build_dir="$2" jobs="$3"
+  local umdk_root="${KVAF_UMDK_ROOT:-$KVAF_ROOT/../third_party/umdk}"
+  local umdk_build_dir="${KVAF_UMDK_BUILD_DIR:-$umdk_root/build-kvaf}"
+  local urma_library cann_root
+  local -a options=(
+    -DCMAKE_BUILD_TYPE=
+    -DBUILD_TESTING=ON
+    -DKVAF_BUILD_PYTHON=OFF
+    -DKVAF_ENABLE_AIV_BATCH_GET=OFF
+    -DKVAF_ENABLE_AIV_BATCH_PUT=OFF
+    -DKVAF_BUILD_NPU_SERVICE=OFF
+    -DKVAF_BUILD_HBM_RW_TEST=OFF
+    -DKVAF_BUILD_CPU_URMA_PROBE=OFF
+  )
+  require_command cmake
+  require_command "${PYTHON:-python3}"
+  ensure_umdk_source "$umdk_root"
+  options+=("-DKVAF_URMA_ROOT=$umdk_root"
+            "-DPython3_EXECUTABLE=$(command -v "${PYTHON:-python3}")")
+  if [[ "$role" == cpu ]]; then
+    urma_library="$(find_urma_library "$umdk_root" "$umdk_build_dir")"
+    if [[ -z "$urma_library" ]]; then
+      cmake -S "$umdk_root" -B "$umdk_build_dir" \
+        -DTPS=disable -DHW=disable -DURMA_INSTALL=disable
+      cmake --build "$umdk_build_dir" --target urma --parallel "$jobs"
+      urma_library="$(find_urma_library "$umdk_root" "$umdk_build_dir")"
+    fi
+    [[ -n "$urma_library" ]] || die "unable to find liburma.so after UMDK setup"
+    options+=(-DKVAF_BUILD_REMOTE_CPU_SERVICE=ON -DKVAF_BUILD_AICPU_GET_TEST=OFF
+              "-DKVAF_URMA_LIBRARY=$urma_library")
+  else
+    cann_root="$(find_cann_root)"
+    [[ -n "$cann_root" ]] || die "CANN toolkit not found; source CANN set_env.sh first"
+    options+=(-DKVAF_BUILD_REMOTE_CPU_SERVICE=OFF -DKVAF_BUILD_AICPU_GET_TEST=ON
+              "-DASCEND_CANN_PACKAGE_PATH=$cann_root")
+    if [[ -n "${KVAF_AICPU_CXX:-}" ]]; then
+      options+=("-DKVAF_AICPU_CXX=$KVAF_AICPU_CXX")
+    fi
+  fi
+  cmake -S "$KVAF_ROOT" -B "$build_dir" "${options[@]}"
+  cmake --build "$build_dir" --target "kvaf_aicpu_get_$role" --parallel "$jobs"
+  echo "[KVAF_BUILD] AICPU test: $build_dir/tests/aicpu_batch_get/kvaf_aicpu_get_$role"
+  echo "[KVAF_BUILD] Run: bash tests/run_aicpu_get_$role.sh --build-dir '$build_dir' --help"
+}
+
 mode="${1:-}"
 case "$mode" in
-  cpu|npu|hbm-rw) shift ;;
+  cpu|npu|hbm-rw|aicpu-cpu|aicpu-npu) shift ;;
   -h|--help|help) usage; exit 0 ;;
   *) usage >&2; exit 2 ;;
 esac
@@ -258,4 +308,6 @@ case "$mode" in
   cpu) build_cpu "$build_dir" "$jobs" ;;
   npu) build_npu "$build_dir" "$jobs" ;;
   hbm-rw) build_hbm_rw "$build_dir" "$jobs" ;;
+  aicpu-cpu) build_aicpu_test cpu "$build_dir" "$jobs" ;;
+  aicpu-npu) build_aicpu_test npu "$build_dir" "$jobs" ;;
 esac

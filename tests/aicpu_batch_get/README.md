@@ -22,7 +22,54 @@ CPU source 每行之间有 64 字节空隙，NPU staging 连续，输出按反�
 同样带 64 字节 guard 的行中。源/目标描述符固定，不包含动态 AccessTable 解析。
 行长必须是 64 的倍数；一次 batch 的数据不超过配置校验允许的内存上限。
 
-## 构建
+## 快速构建和运行（推荐）
+
+在两端的仓库根目录执行。`build.sh` 自动查找 CANN/UMDK；UMDK 未安装时
+沿用已有脚本逻辑获取固定版本。已有 UMDK 可以通过 `KVAF_UMDK_ROOT` 指定，
+已有 liburma 可以通过 `KVAF_URMA_LIBRARY` 指定。两个新模式不构建 Python 或 AIV。
+
+CPU 端构建：
+
+```bash
+bash build.sh aicpu-cpu
+```
+
+NPU 端加载本机 CANN 环境后构建，首次运行或重新构建 kernel 后显式安装：
+
+```bash
+bash build.sh aicpu-npu
+bash tests/run_aicpu_get_npu.sh --install-kernel --device-id 0
+```
+
+安装需要 CANN 目录写权限；不加 `--install-kernel` 不修改安装目录。
+启动脚本自动选择构建目录内的 JSON，默认端口 29991。
+CPU 端先验证小规模正确性（替换机器地址、UB 设备和 EID index）：
+
+```bash
+bash tests/run_aicpu_get_cpu.sh --smoke \
+  --peer NPU_HOST:29991 --ub-device UB_DEVICE --eid-index 0
+```
+
+小规模测试结束后，重新启动 NPU 脚本，再在 CPU 端测量默认 32 MiB/batch：
+
+```bash
+# NPU 端
+bash tests/run_aicpu_get_npu.sh --device-id 0
+
+# CPU 端
+bash tests/run_aicpu_get_cpu.sh \
+  --peer NPU_HOST:29991 --ub-device UB_DEVICE --eid-index 0 \
+  --output results/aicpu_get.csv
+```
+
+两端的构建/启动脚本均支持 `--build-dir DIR`。CPU 启动脚本的 `--smoke` 设置
+16 行×64 字节、预热 1 轮、测量 3 轮；显式 `--rows` 等参数可覆盖这些值。
+其他 benchmark 参数原样传递。`--output` 同时显示和保存 CSV，保留测试失败退出码。
+环境变量 `KVAF_AICPU_CPU_BUILD_DIR` / `KVAF_AICPU_NPU_BUILD_DIR` 可设置启动脚本
+默认构建目录，默认分别为仓库下 `build-aicpu-cpu` / `build-aicpu-npu`。
+自定义交叉编译器使用 `KVAF_AICPU_CXX`；安装根目录可用启动脚本的 `--cann-root` 指定。
+
+## 手动 CMake 构建
 
 CPU 端需要 liburma、UMDK headers 和 OpenMP：
 
