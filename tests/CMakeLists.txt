@@ -2,6 +2,25 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 add_subdirectory(aicpu_batch_get)
 
+add_executable(kvaf_cpu_urma_link_selection_test cpu_urma_link_selection_test.cc)
+target_include_directories(kvaf_cpu_urma_link_selection_test PRIVATE
+  "${CMAKE_SOURCE_DIR}/access_operator/include")
+target_link_libraries(kvaf_cpu_urma_link_selection_test PRIVATE kvaf_peer_link)
+add_test(NAME kvaf_cpu_urma_link_selection COMMAND kvaf_cpu_urma_link_selection_test)
+
+# This provider-double test needs only UMDK headers, not liburma or UB hardware.
+find_path(KVAF_DISCOVERY_TEST_URMA_INCLUDE_DIR urma_api.h
+  HINTS "${KVAF_URMA_INCLUDE_DIR}" "${KVAF_URMA_ROOT}/include"
+        "${CMAKE_SOURCE_DIR}/../third_party/umdk/include")
+if(KVAF_DISCOVERY_TEST_URMA_INCLUDE_DIR)
+  add_executable(kvaf_cpu_urma_discovery_test cpu_urma_discovery_test.cc
+    "${CMAKE_SOURCE_DIR}/access_operator/src/cpu_urma/cpu_urma_discovery.cc")
+  target_include_directories(kvaf_cpu_urma_discovery_test PRIVATE
+    "${CMAKE_SOURCE_DIR}/access_operator/include" "${KVAF_DISCOVERY_TEST_URMA_INCLUDE_DIR}")
+  target_link_libraries(kvaf_cpu_urma_discovery_test PRIVATE kvaf_common)
+  add_test(NAME kvaf_cpu_urma_discovery COMMAND kvaf_cpu_urma_discovery_test)
+endif()
+
 add_executable(kvaf_cpu_hbm_client_options_test cpu_hbm_client_options_test.cc)
 target_include_directories(kvaf_cpu_hbm_client_options_test PRIVATE
   "${CMAKE_SOURCE_DIR}/access_operator/include")

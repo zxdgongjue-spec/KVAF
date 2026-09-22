@@ -217,4 +217,26 @@ inline bool ReadPairInfoDeviceEid(std::uint32_t physical_device_id,
   return success;
 }
 
+// Shared by the Runtime HBM service and standalone NPU transport tests.
+// Preserve CLOS order, then append the active pair_info EID if it is distinct.
+inline bool DiscoverDeviceEids(std::uint32_t physical_device_id,
+                               std::vector<std::array<std::uint8_t, peer::kEidBytes>>* candidates,
+                               std::string* error) {
+  if (candidates == nullptr || error == nullptr) return false;
+  candidates->clear();
+  const char* configured = std::getenv("KVAF_HCCL_ROOTINFO_PATH");
+  const std::string path = configured != nullptr && configured[0] != '\0'
+      ? configured : "/etc/hccl_rootinfo.json";
+  (void)ReadHcclClosEids(path, physical_device_id, candidates, error);
+  std::array<std::uint8_t, peer::kEidBytes> pair{};
+  if (ReadPairInfoDeviceEid(physical_device_id, &pair, error) &&
+      std::find(candidates->begin(), candidates->end(), pair) == candidates->end()) {
+    candidates->push_back(pair);
+  }
+  candidates->erase(std::remove_if(candidates->begin(), candidates->end(), [](const auto& eid) {
+    return std::all_of(eid.begin(), eid.end(), [](std::uint8_t b) { return b == 0; });
+  }), candidates->end());
+  return !candidates->empty();
+}
+
 }  // namespace kvaf::npu_eid_detail

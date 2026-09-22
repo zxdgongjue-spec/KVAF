@@ -15,14 +15,15 @@
 
 namespace kvaf::aicpu_test {
 // Test-only commands; never change the production Runtime protocol.
-// v2 configure carries the requested NPU device ID. An older server must not
-// silently ignore it and allocate on its default device.
-constexpr auto kConfigure = static_cast<peer::Command>(0x7002);
+// v3 configure carries the NPU EID candidate returned by PeerLink discovery.
+constexpr auto kConfigure = static_cast<peer::Command>(0x7004);
 constexpr auto kStart = static_cast<peer::Command>(0x7001);
 constexpr auto kResetSetup = static_cast<peer::Command>(0x7003);
 struct ConfigureRequest {
   peer::MessageHeader header;
   std::uint32_t device_id{};
+  std::uint32_t npu_candidate{};
+  std::uint32_t reserved{};
   Config config;
 };
 struct Ack { std::uint64_t magic{kMagic}; std::uint64_t status{}; };
@@ -32,7 +33,7 @@ struct Report {
   std::uint64_t rounds{};
   double mean_ns{}, p50_ns{}, p99_ns{}, wait_ns{}, scatter_ns{}, gbps{};
 };
-static_assert(sizeof(ConfigureRequest) == 64 && sizeof(Ack) == 16 && sizeof(Report) == 72);
+static_assert(sizeof(ConfigureRequest) == 72 && sizeof(Ack) == 16 && sizeof(Report) == 72);
 
 inline void Require(bool ok, const std::string& message) {
   if (!ok) throw std::runtime_error(message);

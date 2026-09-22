@@ -31,19 +31,15 @@ class NpuTarget {
     if (session_) direct_hccp::ReleaseDirectHccpSession(session_);
     direct_hccp::CloseDirectHccp(&api_);
   }
-  void Initialize(std::uint32_t device, const std::string& eid_text, std::uint64_t bytes) {
+  void Initialize(std::uint32_t device, const std::array<std::uint8_t, peer::kEidBytes>& eid,
+                  std::uint64_t bytes) {
     namespace d = direct_hccp;
     Acl(aclrtSetDevice(device), "aclrtSetDevice");
     Require(d::LoadDirectHccp(&api_), "cannot load Direct HCCP");
     std::uint32_t physical = 0;
     Require(d::GetCurrentNpuPhysicalDeviceId(&physical) &&
             d::AcquireDirectHccpSession(physical, 18, &session_), "cannot acquire HCCP session");
-    if (!eid_text.empty()) Require(npu_eid_detail::ParseEid(eid_text, &eid_), "invalid NPU EID");
-    else {
-      std::string error;
-      Require(npu_eid_detail::ReadPairInfoDeviceEid(physical, &eid_, &error),
-              "cannot select NPU EID: " + error + "; pass --eid HEX");
-    }
+    eid_ = eid;
     d::CtxInitCfg cfg{}; cfg.mode = d::kOfflineHdc;
     d::CtxInitAttr attr{}; attr.phy_id = physical; attr.ub.eid_index = 0;
     std::memcpy(attr.ub.eid.raw, eid_.data(), eid_.size());
@@ -78,8 +74,6 @@ class NpuTarget {
   }
   void* memory() const { return memory_; }
   const peer::AllocateHbmRegionResponse& exported() const { return exported_; }
-  // Called only after a failed Initialize, before any data probe or kernel.
-  void ResetSetup() { while (channels_.size() > 1) channels_.pop_back(); }
   void CreateChannel(int fd, const peer::MessageHeader& header) {
     Require(peer::IsValidHeader(header, peer::Command::kCreateChannel,
                                sizeof(peer::CreateChannelRequest)), "invalid CreateChannel header");

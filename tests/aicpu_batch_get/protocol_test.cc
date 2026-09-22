@@ -1,6 +1,5 @@
 #include "device_loop.h"
 #include "metrics.h"
-#include "cpu_discovery.h"
 
 #include <cstdio>
 #include <cstring>
@@ -106,39 +105,6 @@ void DeviceSelection() {
   try { (void)SelectDevice(UINT32_MAX, false, 0); } catch (...) { rejected = true; }
   Require(rejected, "overflowing device-id accepted");
 
-  struct Transport {
-    std::vector<std::uint32_t> attempted;
-    int stopped{}, validated{};
-    bool fail_validation{};
-    kvaf::Status Initialize(const kvaf::CpuUrmaTransportOptions& options) {
-      Require(options.remote_device_id == 4, "NPU device-id changed during selection");
-      Require(options.has_eid_index && options.has_preferred_eid && options.eid_index != 4,
-              "NPU device-id incorrectly used as CPU EID index");
-      attempted.push_back(options.eid_index);
-      return options.eid_index == 7 ? kvaf::Status::OK() : kvaf::Status::Internal("no route");
-    }
-    kvaf::Status ValidateLink() {
-      ++validated;
-      return fail_validation ? kvaf::Status::Internal("CQ timeout") : kvaf::Status::OK();
-    }
-    kvaf::Status Shutdown() { ++stopped; return kvaf::Status::OK(); }
-  } transport;
-  kvaf::CpuUrmaTransportOptions options; options.remote_device_id = 4;
-  std::vector<CpuCandidate> candidates{{"ub0", 2, {}}, {"ub1", 7, {}}, {"ub2", 9, {}}};
-  int resets = 0;
-  auto reset = [&] {
-    Require(transport.stopped > resets, "target reset before CPU teardown");
-    ++resets; return kvaf::Status::OK();
-  };
-  Require(SelectCpuTransport(options, candidates, transport, reset).ok(), "fallback did not select route");
-  Require(transport.attempted == std::vector<std::uint32_t>({2, 7}) &&
-          transport.validated == 1 && resets == 1, "incorrect route selection order");
-  transport = {}; resets = 0; transport.fail_validation = true;
-  Require(!SelectCpuTransport(options, candidates, transport, reset).ok(), "failed data probe accepted");
-  Require(transport.attempted.size() == 2 && resets == 1, "uncertain DMA target was retried/recycled");
-  transport = {}; resets = 0;
-  Require(!SelectCpuTransport(options, {}, transport, reset).ok() &&
-          transport.attempted.empty(), "empty candidate list accepted");
 }
 }  // namespace
 int main() {

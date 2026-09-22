@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits.h>
+#include <map>
 
 namespace {
 using namespace kvaf::aicpu_test;
@@ -141,42 +142,106 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
   return Summarize(config, device_result, timings);
 }
 
+class CandidateResolver {
+ public:
+  explicit CandidateResolver(const Options& options) : options_(options) {}
+  const std::vector<std::array<std::uint8_t, kvaf::peer::kEidBytes>>& Get(std::uint32_t requested) {
+    const auto device = SelectDevice(requested, options_.has_device, options_.device);
+    auto found = cache_.find(device);
+    if (found != cache_.end()) return found->second;
+    Acl(aclrtSetDevice(device), "select discovery device");
+    std::uint32_t physical = 0;
+    Require(kvaf::direct_hccp::GetCurrentNpuPhysicalDeviceId(&physical), "cannot resolve physical device-id");
+    std::vector<std::array<std::uint8_t, kvaf::peer::kEidBytes>> eids;
+    if (!options_.eid.empty()) {
+      std::array<std::uint8_t, kvaf::peer::kEidBytes> eid{};
+      Require(kvaf::npu_eid_detail::ParseEid(options_.eid, &eid), "invalid --eid");
+      eids.push_back(eid);
+    } else {
+      std::string error;
+      const bool ok = kvaf::npu_eid_detail::DiscoverDeviceEids(physical, &eids, &error);
+      Require(ok, "NPU EID discovery failed: " + error);
+    }
+    return cache_.emplace(device, std::move(eids)).first->second;
+  }
+ private:
+  const Options& options_;
+  std::map<std::uint32_t, std::vector<std::array<std::uint8_t, kvaf::peer::kEidBytes>>> cache_;
+};
+
+void HandleDiscovery(int fd, const kvaf::peer::MessageHeader& header, CandidateResolver& resolver,
+                     bool configured, std::uint32_t active_device) {
+  namespace p = kvaf::peer;
+  p::HbmEidCandidateResponse response{};
+  response.header = p::MakeHeader(p::Command::kGetHbmEidCandidate, sizeof(response));
+  response.header.command = p::ResponseCommand(p::Command::kGetHbmEidCandidate);
+  try {
+    Require(p::IsValidHeader(header, p::Command::kGetHbmEidCandidate, sizeof(p::HbmEidCandidateRequest)),
+            "invalid candidate query");
+    p::HbmEidCandidateRequest request{}; request.header = header;
+    Receive(fd, reinterpret_cast<char*>(&request) + sizeof(header), sizeof(request) - sizeof(header));
+    Require(!configured || request.device_id == active_device, "cannot change device during channel setup");
+    const auto& eids = resolver.Get(request.device_id);
+    Require(request.candidate_index < eids.size(), "NPU EID candidate out of range");
+    response.candidate_count = static_cast<std::uint32_t>(eids.size());
+    response.candidate_index = request.candidate_index;
+    std::copy(eids[request.candidate_index].begin(), eids[request.candidate_index].end(), response.eid);
+  } catch (const std::exception& e) {
+    response.result = static_cast<std::int32_t>(p::Result::kInvalidRequest);
+    std::fprintf(stderr, "AICPU_GET_NPU discovery: %s\n", e.what());
+  }
+  Send(fd, &response, sizeof(response));
+}
+
+void HandleConfigure(int fd, const kvaf::peer::MessageHeader& header, CandidateResolver& resolver,
+                     std::unique_ptr<NpuTarget>& target, Config& config, std::uint32_t& device) {
+  kvaf::peer::AllocateHbmRegionResponse response{};
+  response.header = kvaf::peer::MakeHeader(kConfigure, sizeof(response));
+  response.header.command = kvaf::peer::ResponseCommand(kConfigure);
+  try {
+    Require(!target && kvaf::peer::IsValidHeader(header, kConfigure, sizeof(ConfigureRequest)),
+            "invalid configure request or target already active");
+    ConfigureRequest request{}; request.header = header;
+    Receive(fd, reinterpret_cast<char*>(&request) + sizeof(header), sizeof(request) - sizeof(header));
+    Layout layout{}; Require(MakeLayout(request.config, &layout), "invalid benchmark config");
+    const auto& eids = resolver.Get(request.device_id);
+    Require(request.npu_candidate < eids.size(), "invalid NPU EID candidate");
+    auto candidate = std::make_unique<NpuTarget>();
+    candidate->Initialize(request.device_id, eids[request.npu_candidate], layout.region_bytes);
+    response = candidate->exported();
+    target = std::move(candidate); config = request.config; device = request.device_id;
+    std::fprintf(stderr, "AICPU_GET_NPU device-id=%u npu_candidate=%u\n", device, request.npu_candidate);
+  } catch (const std::exception& e) {
+    response.result = static_cast<std::int32_t>(kvaf::peer::Result::kResourceError);
+    std::fprintf(stderr, "AICPU_GET_NPU configure: %s\n", e.what());
+  }
+  Send(fd, &response, sizeof(response));
+}
+
 void Run(const Options& options) {
   Socket listener(Listen(options.port));
   std::fprintf(stderr, "AICPU_GET_NPU listening port=%u engine=aicpu_memcpy\n", options.port);
-  NpuTarget target;
+  CandidateResolver resolver(options);
+  std::unique_ptr<NpuTarget> target;
   Config config{};
-  {
-    Socket fd(Accept(listener.get())); SocketTimeout(fd.get(), 120000);
-    ConfigureRequest request{}; Receive(fd.get(), &request, sizeof(request));
-    Layout layout{};
-    Require(kvaf::peer::IsValidHeader(request.header, kConfigure, sizeof(request)) &&
-            MakeLayout(request.config, &layout), "invalid configure request");
-    config = request.config;
-    try {
-      const auto device = SelectDevice(request.device_id, options.has_device, options.device);
-      std::fprintf(stderr, "AICPU_GET_NPU device-id=%u selected by CPU request\n", device);
-      target.Initialize(device, options.eid, layout.region_bytes);
-    } catch (...) {
-      kvaf::peer::AllocateHbmRegionResponse failed{};
-      failed.header = kvaf::peer::MakeHeader(kConfigure, sizeof(failed));
-      failed.header.command = kvaf::peer::ResponseCommand(kConfigure);
-      failed.result = static_cast<std::int32_t>(kvaf::peer::Result::kInvalidRequest);
-      Send(fd.get(), &failed, sizeof(failed));
-      throw;
-    }
-    const auto& response = target.exported(); Send(fd.get(), &response, sizeof(response));
-  }
+  std::uint32_t device = 0;
   for (;;) {
     Socket fd(Accept(listener.get())); SocketTimeout(fd.get(), config.timeout_ms + 120000);
     kvaf::peer::MessageHeader header{}; Receive(fd.get(), &header, sizeof(header));
-    if (kvaf::peer::IsValidHeader(header, kResetSetup, sizeof(header))) {
-      target.ResetSetup();
-      Ack ack{}; Send(fd.get(), &ack, sizeof(ack));
-      continue;
+    if (header.command == static_cast<std::uint16_t>(kvaf::peer::Command::kGetHbmEidCandidate)) {
+      HandleDiscovery(fd.get(), header, resolver, target != nullptr, device); continue;
     }
+    if (header.command == static_cast<std::uint16_t>(kConfigure)) {
+      HandleConfigure(fd.get(), header, resolver, target, config, device); continue;
+    }
+    if (kvaf::peer::IsValidHeader(header, kResetSetup, sizeof(header))) {
+      // CPU only requests this after a failed setup, before posting any data.
+      target.reset();
+      Ack ack{}; Send(fd.get(), &ack, sizeof(ack)); continue;
+    }
+    Require(target != nullptr, "target must be configured before channel setup or START");
     if (header.command == static_cast<std::uint16_t>(kvaf::peer::Command::kCreateChannel)) {
-      try { target.CreateChannel(fd.get(), header); }
+      try { target->CreateChannel(fd.get(), header); }
       catch (const std::exception& e) {
         std::fprintf(stderr, "AICPU_GET_NPU channel setup failed: %s\n", e.what());
         kvaf::peer::CreateChannelResponse failed{};
@@ -189,7 +254,7 @@ void Run(const Options& options) {
     }
     Require(kvaf::peer::IsValidHeader(header, kStart, sizeof(header)), "expected START");
     Report report{};
-    try { report = Execute(fd.get(), config, target, options.json); }
+    try { report = Execute(fd.get(), config, *target, options.json); }
     catch (const std::exception& e) { std::fprintf(stderr, "NPU benchmark failed: %s\n", e.what()); }
     Send(fd.get(), &report, sizeof(report));
     Require(report.status == 0, "benchmark failed");
@@ -197,6 +262,7 @@ void Run(const Options& options) {
     break;
   }
 }
+
 }  // namespace
 int main(int argc, char** argv) {
   try {

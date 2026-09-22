@@ -1,5 +1,5 @@
 #include "control.h"
-#include "cpu_discovery.h"
+#include "cpu_urma/cpu_urma_link_selection.h"
 #include "cpu_urma/cpu_urma_transport.h"
 
 #include <chrono>
@@ -52,12 +52,13 @@ Options Parse(int argc, char** argv) {
   return o;
 }
 void Check(const kvaf::Status& status) { Require(status.ok(), status.message()); }
-kvaf::peer::PeerRegion Configure(const Options& options) {
+kvaf::peer::PeerRegion Configure(const Options& options, std::uint32_t npu_candidate) {
   Socket socket(Connect(options.transport.peer_address));
   SocketTimeout(socket.get(), 120000);
   ConfigureRequest request{};
   request.header = kvaf::peer::MakeHeader(kConfigure, sizeof(request));
   request.device_id = options.transport.remote_device_id;
+  request.npu_candidate = npu_candidate;
   request.config = options.config;
   Send(socket.get(), &request, sizeof(request));
   kvaf::peer::AllocateHbmRegionResponse reply{};
@@ -78,8 +79,9 @@ kvaf::peer::PeerRegion Configure(const Options& options) {
   return region;
 }
 void Run(Options options) {
-  UrmaLifetime urma;
-  const auto candidates = DiscoverCpuCandidates(options.transport);
+  kvaf::CpuUrmaDiscovery discovery;
+  Check(discovery.Initialize(options.transport.ub_device, options.transport.has_eid_index,
+                             options.transport.eid_index));
   Layout layout{}; Require(MakeLayout(options.config, &layout), "invalid layout");
   // One page-aligned registered allocation contains source rows and both
   // host-side control buffers. It outlives transport destruction on all paths.
@@ -99,19 +101,44 @@ void Run(Options options) {
     sources[row] = {data, static_cast<std::size_t>(options.config.row_bytes)};
     offsets[row] = kStagingOffset + row * options.config.row_bytes;
   }
-  options.transport.external_region = Configure(options);
-  options.transport.has_external_region = true;
   options.transport.region_bytes = layout.region_bytes;
-  CpuUrmaTransport transport;
-  Check(SelectCpuTransport(options.transport, candidates, transport, [&] {
+  std::unique_ptr<CpuUrmaTransport> selected_transport;
+  kvaf::peer::PeerLink peer(options.transport.peer_address);
+  Check(kvaf::SelectCpuUrmaDeviceLink(peer, options.transport.remote_device_id, discovery.candidates(),
+      [&](const kvaf::CpuUrmaCandidate& cpu, std::uint32_t npu_index) -> kvaf::CpuUrmaLinkAttempt {
+    auto config = kvaf::BindCpuUrmaEndpoint(options.transport, cpu, options.transport.remote_device_id, npu_index);
+    // Match Runtime: each pair gets a fresh transport. Shutdown does not reset
+    // every selection field (e.g. device_), so reinitializing one object could
+    // silently retain the previous CPU EID.
+    auto candidate = std::make_unique<CpuUrmaTransport>();
+    kvaf::Status attempt;
+    try {
+      config.external_region = Configure(options, npu_index);
+      config.has_external_region = true;
+      attempt = candidate->Initialize(config);
+    } catch (const std::exception& e) {
+      attempt = kvaf::Status::Internal(e.what());
+    }
+    // Unlike Runtime's allocator, this test does not recycle a target after a
+    // failed data probe. It retries setup only, before any data WR is posted.
+    if (attempt.ok()) {
+      attempt = candidate->ValidateLink();
+      if (attempt.ok()) selected_transport = std::move(candidate);
+      return {attempt, false};
+    }
+    const auto stopped = candidate->Shutdown();
+    if (!stopped.ok()) return {stopped, false};
+    candidate.reset();
     Socket socket(Connect(options.transport.peer_address));
     SocketTimeout(socket.get(), 120000);
     const auto header = kvaf::peer::MakeHeader(kResetSetup, sizeof(kvaf::peer::MessageHeader));
     Send(socket.get(), &header, sizeof(header));
     Ack ack{}; Receive(socket.get(), &ack, sizeof(ack));
-    return ack.magic == kMagic && ack.status == 0 ? kvaf::Status::OK() :
-        kvaf::Status::Internal("cannot reset failed channel setup");
+    if (ack.magic != kMagic || ack.status != 0)
+      return {kvaf::Status::Internal("cannot reset failed channel setup"), false};
+    return {attempt, true};
   }));
+  CpuUrmaTransport& transport = *selected_transport;
   // ValidateLink writes at offset zero. Restore the request record afterward.
   Check(transport.RegisterDirectHostMemory(memory, bytes));
   CpuUrmaTransport::HostSge request_sge{request, sizeof(*request)}, done_sge{done, sizeof(*done)};

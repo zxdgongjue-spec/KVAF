@@ -172,20 +172,8 @@ struct NpuService::Impl {
     std::uint32_t physical = 0U;
     if (!direct_hccp::GetCurrentNpuPhysicalDeviceId(&physical)) return Result::kResourceError;
     std::vector<std::array<std::uint8_t, kEidBytes>> candidates;
-    const char* configured = std::getenv("KVAF_HCCL_ROOTINFO_PATH");
-    const std::string path = configured != nullptr && configured[0] != '\0'
-        ? configured : "/etc/hccl_rootinfo.json";
     std::string error;
-    (void)npu_eid_detail::ReadHcclClosEids(path, physical, &candidates, &error);
-    std::array<std::uint8_t, kEidBytes> pair{};
-    if (npu_eid_detail::ReadPairInfoDeviceEid(physical, &pair, &error) &&
-        std::find(candidates.begin(), candidates.end(), pair) == candidates.end()) {
-      candidates.push_back(pair);
-    }
-    candidates.erase(std::remove_if(candidates.begin(), candidates.end(), [](const auto& eid) {
-      return std::all_of(eid.begin(), eid.end(), [](std::uint8_t b) { return b == 0U; });
-    }), candidates.end());
-    if (candidates.empty()) {
+    if (!npu_eid_detail::DiscoverDeviceEids(physical, &candidates, &error)) {
       std::fprintf(stderr, "[KVAF_NPU] EID_DISCOVERY_FAILED device=%u reason=%s\n",
                    device_id, error.c_str());
       return Result::kNotFound;

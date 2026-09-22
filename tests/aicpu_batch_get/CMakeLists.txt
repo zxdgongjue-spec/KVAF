@@ -4,9 +4,8 @@ target_link_libraries(kvaf_aicpu_get_protocol_test PRIVATE kvaf_peer_link)
 add_test(NAME kvaf_aicpu_get_protocol COMMAND kvaf_aicpu_get_protocol_test)
 
 if(KVAF_BUILD_REMOTE_CPU_SERVICE)
-  add_executable(kvaf_aicpu_get_cpu cpu_main.cc cpu_discovery.cc)
-  target_include_directories(kvaf_aicpu_get_cpu PRIVATE "${KVAF_URMA_INCLUDE_DIR}")
-  target_link_libraries(kvaf_aicpu_get_cpu PRIVATE kvaf_cpu_urma_transport "${KVAF_URMA_LIBRARY}")
+  add_executable(kvaf_aicpu_get_cpu cpu_main.cc)
+  target_link_libraries(kvaf_aicpu_get_cpu PRIVATE kvaf_cpu_urma_transport)
 endif()
 
 if(KVAF_BUILD_AICPU_GET_TEST)

@@ -8,7 +8,10 @@ SDMA 的性能上限。Ascend/URMA 硬件验证必须在目标机器完成。
 
 ## 执行流程
 
-1. NPU 测试进程分配/注册 HBM，向 CPU 导出 region 并处理 CreateChannel。
+1. CPU 与现有 CpuRuntime 共用 `CpuUrmaDiscovery` 和 `SelectCpuUrmaDeviceLink`，
+   通过 `PeerLink::GetHbmEidCandidates(device_id)` 查询 NPU 候选，逐对尝试建链。
+   NPU 测试进程使用现有 Runtime 共用的 CLOS/pair_info 发现函数，按选定候选
+   分配/注册 HBM，向 CPU 导出 region 并处理 CreateChannel。
 2. CPU 主线程初始化已有 `CpuUrmaTransport`，预注册离散源和控制缓冲区。
 3. NPU 启动一次 AICPU 算子，在算子内部跑 warmup + iterations 轮。
 4. 每轮 AICPU 发布 `request_seq`，CPU 用 `ReadSglBatch` 轮询它。
@@ -24,7 +27,8 @@ CPU source 每行之间有 64 字节空隙，NPU staging 连续，输出按反�
 
 ## 快速构建和运行（推荐）
 
-升级 device-id 版本后，必须重新编译并重启 CPU/NPU 两端程序；旧程序不支持新建链协议。
+升级共享发现逻辑版本后，必须重新编译并重启 CPU/NPU 两端程序；旧程序不支持新的
+候选查询/配置流程。
 AICPU kernel ABI 没变，仅此次更新不需要重新安装 device kernel。
 
 在两端的仓库根目录执行。`build.sh` 自动查找 CANN/UMDK；UMDK 未安装时
@@ -120,7 +124,8 @@ build-aicpu-npu/tests/aicpu_batch_get/kvaf_aicpu_get_npu \
   --kernel-json build-aicpu-npu/tests/aicpu_batch_get/libkvaf_aicpu_test.json
 ```
 
-按选定设备读取 pair_info 的 NPU EID；也可以传 `--eid` 加 32 位十六进制 EID。
+按选定设备读取 CLOS/pair_info 的 NPU EID，与现有 NPU Runtime 共用发现函数；
+也可以传 `--eid` 加 32 位十六进制 EID，将测试 NPU 候选固定为一个。
 然后在 CPU 数据所在机器运行：
 
 ```bash
@@ -132,11 +137,12 @@ build-aicpu-cpu/tests/aicpu_batch_get/kvaf_aicpu_get_cpu \
 ```
 
 先用 `--rows 16 --row-bytes 64 --warmup 1 --iterations 3` 验证，再测大 batch。
-CPU 默认枚举本机非零 UB/EID 候选并尝试建链，不需要手填设备名或 EID index。
+CPU 默认复用 Runtime 的 CPU UB/EID 枚举和 device-id 候选查询流程，
+按 CPU 候选优先、NPU 候选其次的顺序尝试建链，不需要手填设备名或 EID index。
 `--device-id 4` 指 NPU 逻辑设备号，绝不会直接用作 CPU EID index。
 NPU 端未指定 `--device-id` 时按 CPU 请求选择；指定时会拒绝不一致的请求。
-`--ub-device` / `--eid-index` 保留为可选诊断过滤器。建链失败时清理后尝试下一个
-CPU 候选；成功建链后的数据探测若失败则终止，避免回收可能仍有 DMA 的目标。
+`--ub-device` / `--eid-index` 保留为可选诊断过滤器。建链失败时清理后尝试下一对
+候选；成功建链后的数据探测若失败则终止，避免回收可能仍有 DMA 的目标。
 每个 NPU 测试进程仅接受一次配置/测量，下一组参数重新启动。
 
 ## 计时与结果
@@ -181,3 +187,7 @@ ctest --test-dir build-host-aicpu -R kvaf_aicpu_get_protocol --output-on-failure
 模拟器执行生产 kernel 共用的设备状态循环，覆盖预热/轮次、延迟完成、超时、
 过期数据、错误序号、反向 scatter、guard、配置溢出和带宽统计。
 它不验证 AICPU 指令权限、CANN 加载或实际 UB/HBM 缓存一致性。
+
+共享链路选择有独立的 `kvaf_cpu_urma_link_selection` 单测；找到 UMDK headers 时
+还会构建 `kvaf_cpu_urma_discovery`，使用真实 API 声明及模拟 provider 验证枚举、
+排序、过滤和 URMA 初始化所有权，不依赖 liburma 或硬件。
