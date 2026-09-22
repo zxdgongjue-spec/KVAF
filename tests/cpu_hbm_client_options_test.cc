@@ -4,7 +4,7 @@
 #include "cpu_hbm_client.cc"
 #undef main
 
-#include "cpu_urma/sgl_batch_plan.h"
+#include "cpu_urma/sgl_batch_builder.h"
 
 namespace {
 std::size_t gather_posts = 0;
@@ -45,19 +45,24 @@ Status CpuUrmaTransport::WriteSglBatch(std::uint64_t offset, const HostSge* buff
 Status CpuUrmaTransport::WriteBatch(const std::uint64_t* offsets, const HostSge* buffers,
                                   std::size_t count) {
   ++gather_posts;
-  std::vector<cpu_urma_detail::SglGroup> groups;
-  const auto status = cpu_urma_detail::PlanWriteGatherGroups(
-      buffers, offsets, count, impl_->remote_sgl_size, impl_->remote.size(), &groups, 65536U);
+  std::size_t wr_count = 0U;
+  const auto status = cpu_urma_detail::BuildWriteGatherShard(
+      buffers, offsets, count, 0U, count, impl_->remote_sgl_size,
+      impl_->remote.size(), 65536U,
+      [](std::size_t, std::size_t, const HostSge&) {},
+      [&](std::size_t, const cpu_urma_detail::WriteGatherGroup& group) {
+        std::uint64_t destination = offsets[group.first];
+        for (std::size_t row = group.first;
+             row < group.first + group.count; ++row) {
+          const auto* source = buffers[corrupt_gather ? group.first : row].data;
+          std::memcpy(impl_->remote.data() + destination,
+                      source, buffers[row].bytes);
+          destination += buffers[row].bytes;
+        }
+      },
+      &wr_count);
   if (!status.ok()) return status;
-  for (const auto& group : groups) {
-    std::uint64_t destination = offsets[group.first];
-    for (std::size_t row = group.first; row < group.first + group.count; ++row) {
-      const auto* source = buffers[corrupt_gather ? group.first : row].data;
-      std::memcpy(impl_->remote.data() + destination, source, buffers[row].bytes);
-      destination += buffers[row].bytes;
-    }
-  }
-  impl_->timing.wr_count = groups.size();
+  impl_->timing.wr_count = wr_count;
   return Status::OK();
 }
 Status CpuUrmaTransport::ReadSglBatch(std::uint64_t offset, const HostSge* buffers,

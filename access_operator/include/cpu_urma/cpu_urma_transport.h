@@ -48,15 +48,18 @@ struct CpuUrmaTransportOptions {
   std::uint32_t jetty_count{4};
   bool has_external_region{false};
   peer::PeerRegion external_region{};
-  // Maximum CPU workers used by WRITE planning and WR preparation.
+  // Maximum CPU workers used by batch planning and descriptor preparation.
+  // WRITE uses at most one worker per Jetty owner.
   std::uint32_t prepare_thread_count{4};
 };
 
 class CpuUrmaTransport final {
  public:
   struct BatchTiming {
-    // Wall time for WR construction, hardware posting and CQ completion.
-    // Concurrent worker time is not summed.
+    // Wall timeline for WR construction, hardware posting and CQ completion.
+    // WRITE workers poll their assigned Jettys without a global post barrier:
+    // post_ns ends at the last post, and poll_ns is the remaining tail until
+    // the last CQE. Concurrent worker time is not summed, so phases add up.
     std::uint64_t prepare_ns{0};
     std::uint64_t post_ns{0};
     std::uint64_t poll_ns{0};

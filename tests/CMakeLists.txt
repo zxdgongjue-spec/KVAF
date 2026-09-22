@@ -19,12 +19,13 @@ add_test(NAME kvaf_aiv_batch_get_bw
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_aiv_batch_get_bw.py")
 
-add_executable(kvaf_cpu_urma_sgl_plan_test cpu_urma_sgl_plan_test.cc)
-target_include_directories(kvaf_cpu_urma_sgl_plan_test PRIVATE
+add_executable(kvaf_cpu_urma_gather_builder_test cpu_urma_gather_builder_test.cc)
+target_include_directories(kvaf_cpu_urma_gather_builder_test PRIVATE
   "${CMAKE_SOURCE_DIR}/access_operator/include")
-target_link_libraries(kvaf_cpu_urma_sgl_plan_test PRIVATE kvaf_peer_link)
-target_compile_features(kvaf_cpu_urma_sgl_plan_test PRIVATE cxx_std_17)
-add_test(NAME kvaf_cpu_urma_sgl_plan COMMAND kvaf_cpu_urma_sgl_plan_test)
+target_link_libraries(kvaf_cpu_urma_gather_builder_test PRIVATE kvaf_peer_link)
+target_compile_features(kvaf_cpu_urma_gather_builder_test PRIVATE cxx_std_17)
+add_test(NAME kvaf_cpu_urma_gather_builder
+  COMMAND kvaf_cpu_urma_gather_builder_test)
 
 add_executable(kvaf_runtime_batch_put_prefix_test
   runtime_batch_put_prefix_test.cc)
