@@ -792,9 +792,13 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   for (std::size_t device = 0U; device < device_candidates.size(); ++device) {
     std::fprintf(stderr,
                  "[KVAF_AIV] UB_DEVICE_PROBE_PLAN device_id=%u ub_device=%s "
-                 "pairs=%zu\n",
+                 "pairs=%zu token_bytes=%u tokens_per_block=%u miss_count=%u "
+                 "aiv_cores=%u jettys_per_core=%u warmup=%u samples=%u\n",
                  impl_->options.device_id, device_names[device].c_str(),
-                 device_candidates[device].size());
+                 device_candidates[device].size(), probe_config.token_bytes,
+                 probe_config.tokens_per_block, probe_config.miss_count,
+                 impl_->options.npu_core_count, impl_->options.jettys_per_core,
+                 detail::kStartupWarmup, detail::kStartupSamples);
   }
   return detail::SelectStartupDeviceCandidate(
       device_candidates, initialize_candidate, cleanup);

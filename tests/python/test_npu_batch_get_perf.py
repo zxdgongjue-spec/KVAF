@@ -195,6 +195,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="strict K-side UB device selected by an earlier process",
     )
     parser.add_argument(
+        "--adaptive-calibration-only",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--warmup",
         type=int,
         default=environment_int("KVAF_BATCH_GET_PERF_WARMUP", DEFAULT_WARMUP),
@@ -300,6 +305,8 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "KVAF_ADAPTIVE_UB_MISS_COUNT must be in [1, INT32_MAX]"
     if args.adaptive_ub_device and args.peer_ub_device:
         return "adaptive-ub-device and peer-ub-device are mutually exclusive"
+    if args.adaptive_calibration_only and not args.adaptive_ub_device:
+        return "adaptive-calibration-only requires adaptive-ub-device"
     if args.adaptive_ub_device and (
         any(not device for device in args.adaptive_peer_ub_devices)
         or len(set(args.adaptive_peer_ub_devices))
@@ -685,6 +692,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("BATCH_GET_PERF_PHASE_BEGIN phase=initialize", flush=True)
         runtime.initialize(ddr_bytes, block_bytes)
         print("BATCH_GET_PERF_PHASE_DONE phase=initialize", flush=True)
+        if args.adaptive_calibration_only:
+            print("BATCH_GET_PERF_ADAPTIVE_CALIBRATION_DONE")
+            return 0
 
         # Every table entry contains the same deterministic token pattern. Reusing
         # a bounded source Tensor keeps setup memory independent of table capacity;
@@ -816,9 +826,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 source_token_ids = contiguous_source_token_ids
                 if args.source_access_pattern == "shuffled-contiguous":
-                    source_token_ids = source_token_ids[
-                        torch.randperm(request_length, device=device)
-                    ]
+                    source_token_ids = contiguous_source_token_ids.clone()
+                    active_permutation = torch.randperm(
+                        miss_count_value, device=device
+                    )
+                    source_token_ids[:miss_count_value].copy_(
+                        contiguous_source_token_ids[:miss_count_value].index_select(
+                            0, active_permutation
+                        )
+                    )
                 indices = (source_token_ids // tokens_per_block).to(torch.int32)
                 token_slots = (source_token_ids % tokens_per_block).to(torch.int32)
             offsets = token_slots * token_bytes
