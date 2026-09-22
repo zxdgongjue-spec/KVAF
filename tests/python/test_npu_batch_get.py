@@ -3,10 +3,9 @@
 
 The test owns BatchGet input/output Tensors and obtains a directly usable NPU
 DeviceAccessTable from Runtime. Direct-HCCP status and queue buffers stay
-inside the operator. Before the BatchGet flow, it validates the temporary NPU
-BatchPut mock or configured AIV BatchPut path with a packed variable-size input
-Tensor, CPU offset/length metadata, and direct Host DDR byte checks. No native
-runner process is launched.
+inside the operator. It exercises AIV BatchPut with variable-size metadata,
+then validates a fixed-block BatchPut/BatchGet round trip against a CPU DDR
+or NPU HBM service. No native runner process is launched.
 """
 
 from __future__ import annotations
@@ -112,9 +111,12 @@ def main() -> int:
     if not batch_put_kernel.is_file():
         print("FAIL: KVAF_BATCH_PUT_KERNEL must name the built kernel object", file=sys.stderr)
         return 2
-    remote_cpu_service = os.environ.get("KVAF_CPU_SERVICE_ADDR")
-    if not remote_cpu_service:
-        print("FAIL: KVAF_CPU_SERVICE_ADDR must name the separately running CPU service", file=sys.stderr)
+    peer_device = os.environ.get("KVAF_PEER_DEVICE", "cpu")
+    if peer_device not in ("cpu", "npu"):
+        raise ValueError("KVAF_PEER_DEVICE must be cpu or npu")
+    remote_service = os.environ.get("KVAF_PEER_SERVICE_ADDR") or os.environ.get("KVAF_CPU_SERVICE_ADDR")
+    if not remote_service:
+        print("FAIL: KVAF_PEER_SERVICE_ADDR (or KVAF_CPU_SERVICE_ADDR) must name the peer service", file=sys.stderr)
         return 2
 
     device_id = int(os.environ.get("DEVICE_ID", "0"))
@@ -194,7 +196,7 @@ def main() -> int:
     output_indices_values = [output_rows - 1 - request for request in range(requests)]
     # Exercise the public variable-size BatchPut contract independently of
     # BatchGet's fixed-block kernel contract through the same Direct-HCCP
-    # CPU-service Link.
+    # peer service Link.
     variable_payloads = [
         bytes((17 + byte * 3) & 0xFF for byte in range(7)),
         bytes((91 + byte * 5) & 0xFF for byte in range(19)),
@@ -225,7 +227,7 @@ def main() -> int:
         batch_get_max_inflight_total=max_inflight_total,
         npu_eids=npu_eids,
     )
-    runtime.link_to(remote_cpu_service)
+    runtime.link_to(remote_service, peer_device=peer_device)
     table = None
     graph = None
     graph_stream = None
@@ -239,6 +241,7 @@ def main() -> int:
             f"npu_cores={npu_core_count} jettys_per_core={jettys_per_core} "
             f"eid_paths={len(npu_eids) or 1} "
             f"npu_eids={','.join(npu_eids) or 'auto'} "
+            f"peer_device={peer_device} "
             "batch_put_backend=aiv_direct_hccp"
         )
         if graph_replays:
@@ -252,6 +255,8 @@ def main() -> int:
             )
         print("RUNTIME_NPU_PHASE_BEGIN phase=runtime_initialize")
         runtime.initialize(ddr_bytes, source_stride)
+        if runtime.remote_region["device"] != peer_device:
+            raise AssertionError("Runtime selected the wrong remote memory device")
         print(
             "RUNTIME_NPU_PHASE_DONE phase=runtime_initialize "
             f"ddr_bytes={ddr_bytes}"
@@ -274,10 +279,10 @@ def main() -> int:
             variable_view = runtime.access_table_view(variable_table)
             if list(variable_view["lengths"]) != variable_lengths:
                 raise AssertionError("variable BatchPut lengths were not committed")
-            # DDR belongs to the CPU service process and is not mapped into
-            # this NPU process. The fixed-size BatchPut/BatchGet below checks
+            # Memory belongs to the peer service and cannot be dereferenced
+            # in this process. The fixed-size BatchPut/BatchGet below checks
             # the same remote WRITE/READ data plane through AIV UB.
-            print("RUNTIME_NPU_REMOTE_CPU_DIRECT_DEREFERENCE_SKIPPED")
+            print(f"RUNTIME_NPU_REMOTE_DIRECT_DEREFERENCE_SKIPPED peer_device={peer_device}")
             print("RUNTIME_NPU_PHASE_DONE phase=batch_put_variable_validate")
         finally:
             runtime.release_access_table(variable_table)

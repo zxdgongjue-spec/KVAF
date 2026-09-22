@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "runtime.h"
+#include "npu_hbm_service.h"
 
 namespace kvaf {
 
@@ -53,12 +54,14 @@ struct NpuRuntimeOptions {
 class NpuRuntime final : public Runtime {
  public:
   explicit NpuRuntime(NpuRuntimeOptions options);
+  explicit NpuRuntime(NpuHbmServiceOptions options);
   ~NpuRuntime() override;
 
   NpuRuntime(const NpuRuntime&) = delete;
   NpuRuntime& operator=(const NpuRuntime&) = delete;
 
   Status Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size);
+  Status InitializeHbmService();
   RuntimeCore& core();
   const RuntimeCore& core() const;
 

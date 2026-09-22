@@ -43,6 +43,8 @@ class PeerLink {
   Status GetCandidateInfo(uint32_t candidate_id, PeerCandidateInfo* info) const;
   Status AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
                         uint32_t candidate_id, PeerRegion* region);
+  Status AllocateHbmRegion(uint64_t bytes, uint64_t slot_size,
+                           uint32_t candidate_id, PeerRegion* region);
   Status ReleaseRegion(uint64_t base);
   Status LookupRegion(uint64_t base, PeerRegion* region) const;
   Status CreateChannel(

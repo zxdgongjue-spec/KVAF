@@ -15,10 +15,10 @@
 namespace kvaf {
 
 // Runtime roles share Link lifecycle but do not necessarily support the same
-// data-plane operations. A target intentionally carries only host:port for
-// the first CPU--NPU deployment; EID and UB routing stay inside KVAF.
+// data-plane operations. EID and UB routing stay inside KVAF.
 struct LinkTarget {
   std::string address;
+  DeviceKind memory_device{DeviceKind::kCpu};
 };
 
 using LinkId = std::uint64_t;

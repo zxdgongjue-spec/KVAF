@@ -178,20 +178,21 @@ bool GetCandidateInfoAt(const std::string& endpoint, uint32_t candidate_id,
 }
 
 bool AllocateRegionAt(const std::string& endpoint, uint64_t ddr_bytes, uint64_t slot_size,
-                      uint32_t candidate_id, PeerRegion* region, std::string* error) {
+                      uint32_t candidate_id, PeerRegion* region, std::string* error,
+                      Command command = Command::kAllocateRegion) {
   if (region == nullptr || ddr_bytes == 0U || slot_size == 0U ||
       ddr_bytes % slot_size != 0U) {
     SetError(error, "invalid peer region allocation request");
     return false;
   }
   AllocateRegionRequest request{};
-  request.header = MakeHeader(Command::kAllocateRegion, sizeof(request));
+  request.header = MakeHeader(command, sizeof(request));
   request.ddr_bytes = ddr_bytes;
   request.slot_size = slot_size;
   request.candidate_id = candidate_id;
   AllocateRegionResponse response{};
   if (!Exchange(endpoint, request, &response, error) ||
-      !IsValidResponseHeader(response.header, Command::kAllocateRegion, sizeof(response)) ||
+      !IsValidResponseHeader(response.header, command, sizeof(response)) ||
       !ResultOk(static_cast<Result>(response.result), error) || response.session_id == 0U ||
       response.peer_base == 0U || response.peer_length != ddr_bytes ||
       response.token_id == 0U || response.token_value == 0U ||
@@ -262,7 +263,7 @@ bool ReleaseRegionAt(const std::string& endpoint, const PeerRegion& region, std:
   if (!Exchange(endpoint, request, &response, error) ||
       !IsValidResponseHeader(response.header, Command::kReleaseRegion, sizeof(response)) ||
       !ResultOk(static_cast<Result>(response.result), error)) {
-    if (error != nullptr && error->empty()) *error = "CPU service returned an invalid release response";
+    if (error != nullptr && error->empty()) *error = "peer service returned an invalid release response";
     return false;
   }
   return true;
@@ -295,6 +296,19 @@ Status PeerLink::AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
   PeerRegion allocated{};
   if (!AllocateRegionAt(address_, ddr_bytes, slot_size, candidate_id, &allocated, &error)) {
     return ToStatus("peer DDR allocation failed", std::move(error));
+  }
+  regions_[allocated.base] = allocated;
+  if (region != nullptr) *region = allocated;
+  return Status::OK();
+}
+
+Status PeerLink::AllocateHbmRegion(uint64_t bytes, uint64_t slot_size,
+                                  uint32_t candidate_id, PeerRegion* region) {
+  std::string error;
+  PeerRegion allocated{};
+  if (!AllocateRegionAt(address_, bytes, slot_size, candidate_id, &allocated,
+                         &error, Command::kAllocateHbmRegion)) {
+    return ToStatus("peer HBM allocation failed", std::move(error));
   }
   regions_[allocated.base] = allocated;
   if (region != nullptr) *region = allocated;

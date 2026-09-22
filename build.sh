@@ -146,6 +146,10 @@ build_npu() {
   local python_bin="${PYTHON:-python3}"
   local cann_root
   local pybind11_dir
+  local npu_service_args=()
+  if [[ -n "${KVAF_NPU_URMA_INCLUDE_DIR:-}" ]]; then
+    npu_service_args+=("-DKVAF_NPU_URMA_INCLUDE_DIR=$KVAF_NPU_URMA_INCLUDE_DIR")
+  fi
 
   require_command cmake
   require_command "$python_bin"
@@ -162,12 +166,16 @@ build_npu() {
     -DKVAF_BUILD_PYTHON=ON \
     -DKVAF_ENABLE_AIV_BATCH_GET=ON \
     -DKVAF_ENABLE_AIV_BATCH_PUT=ON \
+    -DKVAF_BUILD_NPU_HBM_SERVICE=ON \
+    -DKVAF_URMA_ROOT="${KVAF_URMA_ROOT:-}" \
+    "${npu_service_args[@]}" \
     -DASCEND_CANN_PACKAGE_PATH="$cann_root" \
     -Dpybind11_DIR="$pybind11_dir"
   cmake --build "$build_dir" --parallel "$jobs"
   echo "[KVAF_BUILD] NPU Python package: $build_dir/python/kvaf"
   echo "[KVAF_BUILD] BatchGet kernel: $build_dir/bin/kvaf_execute_batch_get_kernels.o"
   echo "[KVAF_BUILD] BatchPut kernel: $build_dir/bin/kvaf_execute_batch_put_kernels.o"
+  echo "[KVAF_BUILD] NPU HBM service: $build_dir/runtime/kvaf_npu_service"
 }
 
 mode="${1:-}"

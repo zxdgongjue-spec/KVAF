@@ -164,4 +164,9 @@ bool CreateDeviceAivJetty(const DirectHccpApi& api, void* context,
 bool CreatePeerChannel(const PeerChannelRequest& request,
                        PeerChannel* channel);
 
+bool QueryPeerCtp(const DirectHccpApi& api, void* context,
+                  const std::array<std::uint8_t, kEidBytes>& local_eid,
+                  const std::array<std::uint8_t, kEidBytes>& peer_eid,
+                  const char* role, std::uint64_t* tp_handle);
+
 }  // namespace kvaf::direct_hccp

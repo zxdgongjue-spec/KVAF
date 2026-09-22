@@ -50,6 +50,9 @@ Jetty。BatchPut 保持原有实现：该值为 1 或 2 时使用相同数量，
 双组交叠提交，预算变化需新建 Runtime/graph，详见
 [在途控制](../docs/batch_get_inflight_control.md)。
 远程 CPU DDR 只增加 `runtime.link_to("CPU_IP:port")`，必须在 `initialize` 前调用。
+远程 NPU HBM 使用 `runtime.link_to("NPU_IP:port", peer_device="npu")`；
+`initialize`、`batch_put` 和 `batch_get` 的使用方式相同。
+服务启动与完整示例见 [NPU peer 说明](../docs/npu_peer.md)。
 `npu_eids=[]` 时 EID、UMDK device 与候选 RMA 验证由 C++ Runtime 自动完成；
 显式传入多个 32 位十六进制 EID 时，Runtime 为每个 EID 创建独立
 BatchGet 路径，并把 core/Jetty worker 轮转分配到这些路径。BatchPut

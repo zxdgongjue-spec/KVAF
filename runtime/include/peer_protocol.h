@@ -10,9 +10,9 @@
 namespace kvaf::peer {
 
 constexpr uint32_t kProtocolMagic = 0x4b564350U;  // "KVCP"
-// Version 6 exposes candidate metadata before allocation so adaptive startup
-// can group EIDs by K-side UB device and benchmark each device only once.
-constexpr uint16_t kProtocolVersion = 6U;
+// Version 7 adds NPU HBM allocation. Existing command
+// numbers and CPU candidate metadata remain unchanged; upgrade both peers.
+constexpr uint16_t kProtocolVersion = 7U;
 constexpr uint32_t kQpKeyBytes = 64U;
 constexpr uint32_t kSegKeyBytes = 64U;
 constexpr uint32_t kEidBytes = 16U;
@@ -24,6 +24,7 @@ enum class Command : uint16_t {
   kReleaseRegion = 3U,
   kGetCandidateCount = 4U,
   kGetCandidateInfo = 5U,
+  kAllocateHbmRegion = 6U,
 };
 
 enum class Result : int32_t {

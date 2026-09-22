@@ -27,6 +27,7 @@
 #include "meta_manager.h"
 #include "startup_bandwidth_probe.h"
 #include "startup_selection.h"
+#include "npu_peer_eids.h"
 
 namespace kvaf {
 namespace {
@@ -35,22 +36,24 @@ Status Internal(std::string message) { return Status::Internal(std::move(message
 
 class PeerDdrAllocator final : public DdrMemoryAllocator {
  public:
-  explicit PeerDdrAllocator(std::shared_ptr<peer::PeerLink> link)
-      : link_(std::move(link)) {}
+  PeerDdrAllocator(std::shared_ptr<peer::PeerLink> link, DeviceKind device)
+      : link_(std::move(link)), device_(device) {}
 
   void SetCandidate(std::uint32_t candidate_id) { candidate_id_ = candidate_id; }
   bool has_allocation() const { return allocated_.base != 0U; }
 
   Status Allocate(const RuntimeInitRequest& request, RemoteRegionDesc* region) override {
-    if (link_ == nullptr || region == nullptr || request.ddr_device != DeviceKind::kCpu ||
+    if (link_ == nullptr || region == nullptr || request.ddr_device != device_ ||
         request.ddr_bytes == 0U || request.slot_size == 0U ||
         request.ddr_bytes % request.slot_size != 0U) {
       return Status::InvalidArgument("invalid peer DDR allocation request");
     }
     if (allocated_.base != 0U) return Status::InvalidState("peer DDR is already allocated");
-    Status status = link_->AllocateRegion(request.ddr_bytes, request.slot_size, candidate_id_, &allocated_);
+    Status status = device_ == DeviceKind::kNpu
+        ? link_->AllocateHbmRegion(request.ddr_bytes, request.slot_size, candidate_id_, &allocated_)
+        : link_->AllocateRegion(request.ddr_bytes, request.slot_size, candidate_id_, &allocated_);
     if (!status.ok()) return status;
-    *region = RemoteRegionDesc{allocated_.base, allocated_.length, request.slot_size, DeviceKind::kCpu};
+    *region = RemoteRegionDesc{allocated_.base, allocated_.length, request.slot_size, device_};
     return Status::OK();
   }
 
@@ -65,6 +68,7 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
 
  private:
   std::shared_ptr<peer::PeerLink> link_;
+  DeviceKind device_;
   std::uint32_t candidate_id_{0U};
   peer::PeerRegion allocated_{};
 };
@@ -425,6 +429,21 @@ std::uint64_t BatchPutStartupProbeRows(std::uint64_t ddr_bytes,
 
 }  // namespace
 
+Status DiscoverNpuPeerEids(std::uint32_t device_id,
+                           const std::vector<std::string>& configured,
+                           std::vector<std::array<std::uint8_t, 16>>* eids) {
+  if (eids == nullptr) return Status::InvalidArgument("missing EID output");
+  std::vector<NpuLocalEidCandidate> candidates;
+  std::string error;
+  const bool ok = configured.empty()
+      ? DiscoverNpuLocalEidCandidates(device_id, &candidates, &error)
+      : ParseConfiguredNpuLocalEids(device_id, configured, &candidates, &error);
+  if (!ok) return Status::InvalidArgument(error);
+  eids->clear();
+  for (const auto& candidate : candidates) eids->push_back(candidate.eid);
+  return Status::OK();
+}
+
 struct NpuRuntime::Impl {
   explicit Impl(NpuRuntimeOptions init_options) : options(std::move(init_options)) {
     config.batch_get_kernel_object_path = options.batch_get_kernel_object_path;
@@ -453,6 +472,12 @@ struct NpuRuntime::Impl {
   }
 
   NpuRuntimeOptions options;
+  DeviceKind peer_device{DeviceKind::kCpu};
+  bool hbm_provider{false};
+#if defined(KVAF_BUILD_NPU_HBM_SERVICE)
+  NpuHbmServiceOptions service_options;
+  std::unique_ptr<NpuHbmService> service;
+#endif
   AccessOperatorConfig config;
   std::unique_ptr<MetaManager> meta_manager;
   std::unique_ptr<DdrMemoryAllocator> allocator;
@@ -486,6 +511,28 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
   }
 }
 
+NpuRuntime::NpuRuntime(NpuHbmServiceOptions options)
+    : impl_(std::make_unique<Impl>(NpuRuntimeOptions("", 0U, 0U))) {
+#if defined(KVAF_BUILD_NPU_HBM_SERVICE)
+  impl_->hbm_provider = true;
+  impl_->options.device_id = options.device_id;
+  impl_->service_options = std::move(options);
+  impl_->service = std::make_unique<NpuHbmService>();
+#else
+  (void)options;
+  throw std::runtime_error("NPU HBM service was not built");
+#endif
+}
+
+Status NpuRuntime::InitializeHbmService() {
+#if defined(KVAF_BUILD_NPU_HBM_SERVICE)
+  if (!impl_->hbm_provider) return Status::InvalidState("Runtime is not an HBM provider");
+  return impl_->service->Initialize(impl_->service_options);
+#else
+  return Status::NotImplemented("NPU HBM service was not built");
+#endif
+}
+
 NpuRuntime::~NpuRuntime() {
   if (impl_ != nullptr) {
     (void)Shutdown();
@@ -496,6 +543,15 @@ NpuRuntime::~NpuRuntime() {
 }
 
 Status NpuRuntime::LinkTo(const LinkTarget& target) {
+  if (impl_->hbm_provider) return Status::InvalidState("HBM provider cannot initiate a link");
+  if (target.memory_device != DeviceKind::kCpu && target.memory_device != DeviceKind::kNpu) {
+    return Status::InvalidArgument("unsupported peer memory device");
+  }
+  if (target.memory_device == DeviceKind::kNpu &&
+      (impl_->options.adaptive_ub_device || !impl_->options.peer_ub_device.empty() ||
+       !impl_->options.adaptive_peer_ub_devices.empty())) {
+    return Status::InvalidArgument("CPU UB device tuning is not supported for an NPU peer");
+  }
   if (target.address.empty()) return Status::InvalidArgument("NpuRuntime LinkTo requires peer host:port");
   if (initialized()) return Status::InvalidState("NpuRuntime LinkTo must run before initialize");
   if (impl_->peer_link != nullptr) return Status::InvalidState("NpuRuntime already has a PeerLink");
@@ -504,7 +560,8 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
   }
   impl_->peer_link = std::make_shared<peer::PeerLink>(target.address);
   impl_->config.peer_link = impl_->peer_link;
-  auto allocator = std::make_unique<PeerDdrAllocator>(impl_->peer_link);
+  impl_->peer_device = target.memory_device;
+  auto allocator = std::make_unique<PeerDdrAllocator>(impl_->peer_link, impl_->peer_device);
   impl_->peer_allocator = allocator.get();
   impl_->allocator = std::move(allocator);
   impl_->runtime_core.reset();
@@ -514,7 +571,8 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
 }
 
 Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
-  const RuntimeInitRequest request{ddr_bytes, slot_size, DeviceKind::kCpu};
+  if (impl_->hbm_provider) return Status::InvalidState("HBM provider uses InitializeHbmService");
+  const RuntimeInitRequest request{ddr_bytes, slot_size, impl_->peer_device};
   if (initialized()) return Status::InvalidState("NpuRuntime has already been initialized");
   if (impl_->peer_link == nullptr || impl_->peer_allocator == nullptr) {
     return Status::InvalidState("NpuRuntime requires LinkTo before Initialize");
@@ -845,11 +903,19 @@ Status NpuRuntime::CopyBatchGetKernelProfiles(
   return impl_->access_operator->CopyBatchGetKernelProfiles(profiles);
 }
 
-Status NpuRuntime::AcceptLink(const LinkTarget&) {
+Status NpuRuntime::AcceptLink(const LinkTarget& peer) {
+#if defined(KVAF_BUILD_NPU_HBM_SERVICE)
+  if (impl_->hbm_provider) return impl_->service->AcceptLink(peer);
+#else
+  (void)peer;
+#endif
   return Status::NotImplemented("NpuRuntime does not accept links in the CPU--NPU deployment");
 }
 
 Status NpuRuntime::ReleaseLink(LinkId link_id) {
+#if defined(KVAF_BUILD_NPU_HBM_SERVICE)
+  if (impl_->hbm_provider) return impl_->service->ReleaseLink(link_id);
+#endif
   if (link_id != 1U || impl_->peer_link == nullptr) return Status::NotFound("PeerLink was not found");
   const Status shutdown = Shutdown();
   if (!shutdown.ok()) return shutdown;
@@ -864,12 +930,20 @@ Status NpuRuntime::ReleaseLink(LinkId link_id) {
   return Status::OK();
 }
 
-Status NpuRuntime::ServeConnection(int) {
+Status NpuRuntime::ServeConnection(int fd) {
+#if defined(KVAF_BUILD_NPU_HBM_SERVICE)
+  if (impl_->hbm_provider) return impl_->service->ServeConnection(fd);
+#else
+  (void)fd;
+#endif
   return Status::NotImplemented("NpuRuntime has no incoming control service in this deployment");
 }
 
 Status NpuRuntime::Shutdown() {
   if (impl_ == nullptr) return Status::OK();
+#if defined(KVAF_BUILD_NPU_HBM_SERVICE)
+  if (impl_->hbm_provider) return impl_->service->Shutdown();
+#endif
   const Status status = impl_->runtime_core != nullptr && impl_->runtime_core->initialized()
                             ? impl_->runtime_core->Shutdown()
                             : Status::OK();
@@ -878,10 +952,16 @@ Status NpuRuntime::Shutdown() {
 }
 
 bool NpuRuntime::initialized() const {
+#if defined(KVAF_BUILD_NPU_HBM_SERVICE)
+  if (impl_ != nullptr && impl_->hbm_provider) return impl_->service->initialized();
+#endif
   return impl_ != nullptr && impl_->runtime_core != nullptr && impl_->runtime_core->initialized();
 }
 
 RuntimeCapabilities NpuRuntime::capabilities() const {
+#if defined(KVAF_BUILD_NPU_HBM_SERVICE)
+  if (impl_->hbm_provider) return impl_->service->capabilities();
+#endif
   return RuntimeCapabilities{true, !impl_->config.batch_put_kernel_object_path.empty(), false, true};
 }
 

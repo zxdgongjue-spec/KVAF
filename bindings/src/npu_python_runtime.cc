@@ -180,8 +180,12 @@ class NpuPythonRuntime final {
     native_ = std::make_unique<::kvaf::NpuRuntime>(std::move(options));
   }
 
-  void LinkTo(std::string address) {
-    ThrowIfError(native_->LinkTo(LinkTarget{std::move(address)}));
+  void LinkTo(std::string address, const std::string& peer_device) {
+    if (peer_device != "cpu" && peer_device != "npu") {
+      throw py::value_error("peer_device must be 'cpu' or 'npu'");
+    }
+    ThrowIfError(native_->LinkTo(LinkTarget{std::move(address),
+        peer_device == "npu" ? DeviceKind::kNpu : DeviceKind::kCpu}));
   }
 
   void Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
@@ -206,7 +210,7 @@ class NpuPythonRuntime final {
     result["base"] = region.base;
     result["length"] = region.length;
     result["slot_size"] = region.slot_size;
-    result["device"] = "cpu";
+    result["device"] = region.device == DeviceKind::kNpu ? "npu" : "cpu";
     return result;
   }
 
@@ -486,7 +490,8 @@ void BindNpuPythonRuntime(py::module_& module) {
                std::vector<std::string>{},
            py::arg("batch_get_max_inflight_total") = 2048)
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
-           "Connect this NPU Runtime to a CPU Runtime service before initialize.")
+           py::arg("peer_device") = "cpu",
+           "Connect to a CPU DDR or NPU HBM service before initialize.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),
            py::arg("slot_size"))
       .def("shutdown", &NpuPythonRuntime::Shutdown)

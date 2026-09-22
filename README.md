@@ -1,6 +1,6 @@
 # KVAF
 
-KVAF 是面向 KV Cache 的 Runtime。它负责管理 KV block 在存储设备（DDR）中的地址、
+KVAF 是面向 KV Cache 的 Runtime。它负责管理 KV block 在存储设备（DDR 或 HBM）中的地址、
 生命周期和访问一致性，并提供高性能的 BatchPut/BatchGet
 数据搬运能力。
 
@@ -117,7 +117,12 @@ TCP 用于交换控制信息，初始化UB建链；KV 数据 通过 NPU AIV kern
 - `BatchGet`：使用 NPU Tensor 发起 AIV 读取；默认仅入队到调用方 stream；
 - `BatchFree`：释放 Key 对应的 slot。仍被 AccessTable 持有的 Key 会返回 busy。
 
-一个 `NpuRuntime` 当前连接一个 CPU 服务并使用一个远端 DDR region。异常退出后的
+也支持连接 `kvaf_npu_service` 提供的 NPU HBM：调用
+`link_to("NPU_IP:port", peer_device="npu")`，随后仍按
+`initialize → batch_put → prepare_access_table → batch_get` 操作。
+双端构建、运行命令和完整示例见 [NPU0 读写 NPU1 HBM](docs/npu_peer.md)。
+
+一个客户端 `NpuRuntime` 当前连接一个 CPU 或 NPU 服务并使用一个远端 region。异常退出后的
 session 恢复、多个 peer 的选择和 CPU 侧数据面不属于当前范围。
 
 ## 环境要求
@@ -153,6 +158,8 @@ build-cpu/runtime/kvaf_cpu_service
 
 默认使用 `/usr/local/Ascend/ascend-toolkit/latest`；使用其他 CANN 版本时，将两处路径
 替换为实际安装目录。
+构建同时包含 NPU HBM 服务，需要匹配平台的 UMDK 公开头文件 `urma_api.h`；
+若 CANN/系统 include 中未安装，设置 `KVAF_NPU_URMA_INCLUDE_DIR=/path/to/umdk/include`。
 
 ```bash
 source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
@@ -166,6 +173,7 @@ export ASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/ascend-toolkit/latest
 build-npu/python/kvaf/
 build-npu/bin/kvaf_execute_batch_get_kernels.o
 build-npu/bin/kvaf_execute_batch_put_kernels.o
+build-npu/runtime/kvaf_npu_service
 ```
 
 
@@ -183,7 +191,7 @@ build-npu/bin/kvaf_execute_batch_put_kernels.o
 服务会自动发现 UB device/EID，并打印 `CANDIDATE_DISCOVERED` 与 `LISTEN`。也可按需要传入 `--ub-device NAME --eid-index N` 来选定对应的端口。
 N 端性能脚本开启 `--adaptive-ub-device` 后，K 端未指定设备时会从脚本配置的
 `KVAF_ADAPTIVE_UB_DEVICES` 中测速选优；K 端指定单个 `--ub-device` 时走原生路径。
-详见 [Runtime 启动选优](runtime/README.md#可选启动-ub-device-选优)；N/K 两端需同时升级至控制协议 v6。
+详见 [Runtime 启动选优](runtime/README.md#可选启动-ub-device-选优)；两端需同时升级至控制协议 v7。
 
 ### 2. 运行 NPU 端到端测试
 

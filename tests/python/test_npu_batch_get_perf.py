@@ -25,6 +25,8 @@ environment variables:
                            KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ
     adaptive UB devices    KVAF_ADAPTIVE_UB_DEVICES
     adaptive miss count    KVAF_ADAPTIVE_UB_MISS_COUNT
+    --peer-device          KVAF_PEER_DEVICE (cpu or npu; default cpu)
+    --peer-service-addr    KVAF_PEER_SERVICE_ADDR (falls back to KVAF_CPU_SERVICE_ADDR)
 """
 
 from __future__ import annotations
@@ -97,6 +99,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         )
     )
     parser.add_argument(
+        "--peer-device", choices=("cpu", "npu"),
+        default=os.environ.get("KVAF_PEER_DEVICE", "cpu"),
+        help="remote memory kind: CPU DDR or NPU HBM",
+    )
+    parser.add_argument(
+        "--peer-service-addr",
+        default=(os.environ.get("KVAF_PEER_SERVICE_ADDR")
+                 or os.environ.get("KVAF_CPU_SERVICE_ADDR")),
+        help="peer host:port; CLI overrides the peer/legacy CPU address environment",
+    )
+    parser.add_argument(
         "--request-length",
         type=int,
         default=environment_int(
@@ -143,7 +156,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "KVAF_BATCH_GET_PERF_SOURCE_ACCESS_PATTERN", "random"
         ),
         help=(
-            "remote CPU DDR read order: random samples the full table, "
+            "remote memory read order: random samples the full table, "
             "contiguous reads an ascending token range, and shuffled-contiguous "
             "sends the same contiguous range in random order"
         ),
@@ -156,7 +169,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
         help=(
             "local NPU HBM output order; use contiguous while comparing source "
-            "patterns to isolate remote CPU DDR access behavior"
+            "patterns to isolate remote memory access behavior"
         ),
     )
     parser.add_argument(
@@ -259,7 +272,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="AIV clock used to convert profile cycles to milliseconds",
     )
     parser.set_defaults(
-        adaptive_peer_ub_devices=configured_adaptive_ub_devices(),
         kernel_profile=environment_bool("KVAF_BATCH_GET_PERF_KERNEL_PROFILE"),
         sort_input_indices=environment_bool(
             "KVAF_BATCH_GET_PERF_SORT_INPUT_INDICES"
@@ -271,6 +283,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="total unconfirmed READ limit across AIV cores; 0 uses the baseline",
     )
     args = parser.parse_args(argv)
+    # CPU device names are not NPU service candidates. Do not forward the
+    # CPU default allowlist to an NPU peer, even when tuning is disabled.
+    args.adaptive_peer_ub_devices = (
+        configured_adaptive_ub_devices() if args.peer_device == "cpu" else []
+    )
     if args.miss_count is None:
         args.miss_count = args.request_length
     args.adaptive_ub_miss_count = environment_int(
@@ -280,6 +297,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> str | None:
+    if args.peer_device not in ("cpu", "npu"):
+        return "peer-device must be cpu or npu"
+    if args.peer_device == "npu" and (args.adaptive_ub_device or args.peer_ub_device):
+        return "NPU peers do not support --adaptive-ub-device or --peer-ub-device"
     block_bytes = args.token_bytes * args.tokens_per_block
     ddr_bytes = args.table_capacity * block_bytes
     if args.request_length <= 0 or args.request_length > MAX_INT32:
@@ -636,10 +657,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    remote_cpu_service = os.environ.get("KVAF_CPU_SERVICE_ADDR")
-    if not remote_cpu_service:
+    if not args.peer_service_addr:
         print(
-            "FAIL: KVAF_CPU_SERVICE_ADDR must name the separately running CPU service",
+            "FAIL: set --peer-service-addr or KVAF_PEER_SERVICE_ADDR "
+            "(legacy: KVAF_CPU_SERVICE_ADDR) to the peer host:port",
             file=sys.stderr,
         )
         return 2
@@ -675,13 +696,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         peer_ub_device=args.peer_ub_device,
         adaptive_peer_ub_devices=args.adaptive_peer_ub_devices,
     )
-    runtime.link_to(remote_cpu_service)
+    runtime.link_to(args.peer_service_addr, peer_device=args.peer_device)
     table = None
     device_table = None
     kernel_profile_started = False
     try:
         print(
             "BATCH_GET_PERF_CONFIG "
+            f"peer_device={args.peer_device} peer_service_addr={args.peer_service_addr} "
             f"request_length={request_length} table_capacity={table_capacity} "
             f"tokens_per_block={tokens_per_block} token_bytes={token_bytes} "
             f"block_bytes={block_bytes} miss_count={miss_count_value} "
@@ -703,6 +725,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         print("BATCH_GET_PERF_PHASE_BEGIN phase=initialize", flush=True)
         runtime.initialize(ddr_bytes, block_bytes)
+        if runtime.remote_region["device"] != args.peer_device:
+            raise AssertionError("Runtime selected the wrong remote memory device")
         print("BATCH_GET_PERF_PHASE_DONE phase=initialize", flush=True)
 
         # Every table entry contains the same deterministic token pattern. Reusing
@@ -809,7 +833,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("BATCH_GET_PERF_PHASE_DONE phase=correctness_preflight")
 
         # The table is populated in key order and MetaManager allocates fixed
-        # slots FIFO, so linear token IDs map to adjacent remote CPU addresses.
+        # slots FIFO, so linear token IDs map to adjacent remote addresses.
         # shuffled-contiguous changes only their submission order and keeps the
         # exact same remote working set as contiguous.
         contiguous_source_token_ids = request_ids % total_tokens

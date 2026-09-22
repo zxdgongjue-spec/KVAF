@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Sweep BatchGet token sizes, exact miss counts, AIV cores and Jettys per core,
 # then summarize AIV time.
+# The runner supports CPU DDR and NPU HBM; --peer-device/--peer-service-addr
+# and KVAF_PEER_DEVICE/KVAF_PEER_SERVICE_ADDR are passed through to each shape.
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then

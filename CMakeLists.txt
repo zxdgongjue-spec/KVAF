@@ -11,6 +11,9 @@ option(KVAF_ENABLE_AIV_BATCH_PUT
 option(KVAF_BUILD_REMOTE_CPU_SERVICE
        "Build the liburma-only persistent CPU DDR/Jetty service"
        OFF)
+option(KVAF_BUILD_NPU_HBM_SERVICE
+       "Build the Direct-HCCP NPU HBM provider"
+       ${KVAF_ENABLE_AIV_BATCH_GET})
 
 if(KVAF_ENABLE_AIV_BATCH_PUT AND NOT KVAF_ENABLE_AIV_BATCH_GET)
   message(FATAL_ERROR
@@ -37,6 +40,12 @@ include(CTest)
 
 add_subdirectory(common)
 add_subdirectory(meta_manager)
+# Direct-HCCP and Runtime both depend on this target. Define it before the
+# shared Direct-HCCP library so the dependency is a target, not an -l flag.
+add_library(kvaf_peer_link STATIC runtime/src/peer_link.cc)
+target_include_directories(kvaf_peer_link PUBLIC runtime/include)
+target_link_libraries(kvaf_peer_link PUBLIC kvaf_common pthread)
+target_compile_features(kvaf_peer_link PUBLIC cxx_std_17)
 add_subdirectory(access_operator)
 add_subdirectory(runtime)
 

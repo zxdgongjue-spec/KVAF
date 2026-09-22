@@ -1,12 +1,3 @@
-add_library(kvaf_peer_link STATIC src/peer_link.cc)
-
-target_include_directories(kvaf_peer_link
-  PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
-target_link_libraries(kvaf_peer_link PUBLIC kvaf_common pthread)
-target_compile_features(kvaf_peer_link PUBLIC cxx_std_17)
-
 add_library(kvaf_runtime
   src/runtime.cc
   src/runtime_service.cc
@@ -43,6 +34,28 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
   endif()
   target_link_directories(kvaf_npu_runtime PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/lib64)
   target_compile_features(kvaf_npu_runtime PUBLIC cxx_std_17)
+endif()
+
+if(KVAF_BUILD_NPU_HBM_SERVICE)
+  if(NOT KVAF_ENABLE_AIV_BATCH_GET)
+    message(FATAL_ERROR "NPU HBM service requires KVAF_ENABLE_AIV_BATCH_GET=ON")
+  endif()
+  # Only public UMDK types are needed to decode the provider's segment key.
+  # NPU data movement uses Direct-HCCP, not CPU liburma initialization.
+  find_path(KVAF_NPU_URMA_INCLUDE_DIR urma_api.h
+    HINTS "${KVAF_URMA_ROOT}/include" "${ASCEND_CANN_PACKAGE_PATH}/include"
+          "${ASCEND_CANN_PACKAGE_PATH}/include/urma" /usr/include /usr/local/include)
+  if(NOT KVAF_NPU_URMA_INCLUDE_DIR)
+    message(FATAL_ERROR "NPU HBM service requires urma_api.h; set KVAF_NPU_URMA_INCLUDE_DIR or KVAF_URMA_ROOT")
+  endif()
+  target_sources(kvaf_npu_runtime PRIVATE src/npu_hbm_service.cc)
+  target_compile_definitions(kvaf_npu_runtime PRIVATE KVAF_BUILD_NPU_HBM_SERVICE=1)
+  target_include_directories(kvaf_npu_runtime PRIVATE "${KVAF_NPU_URMA_INCLUDE_DIR}")
+  target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_direct_hccp_session)
+  add_executable(kvaf_npu_service src/npu_service_main.cc)
+  target_include_directories(kvaf_npu_service PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/include")
+  target_link_directories(kvaf_npu_service PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/lib64")
+  target_link_libraries(kvaf_npu_service PRIVATE kvaf_npu_runtime ascendcl)
 endif()
 
 if(KVAF_BUILD_REMOTE_CPU_SERVICE)

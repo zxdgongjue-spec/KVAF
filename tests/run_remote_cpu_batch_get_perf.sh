@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run the configurable BatchGet benchmark through the remote CPU DDR service.
+# Run the configurable BatchGet benchmark through a CPU DDR or NPU HBM service.
+# NPU: KVAF_PEER_DEVICE=npu KVAF_PEER_SERVICE_ADDR=host:port (or matching CLI flags).
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
@@ -35,4 +36,4 @@ export DEVICE_ID
 export PYTHONPATH="$KVAF_BUILD_DIR/python${PYTHONPATH:+:$PYTHONPATH}"
 
 exec timeout "${KVAF_REMOTE_CPU_PERF_TIMEOUT}s" \
-  python3 "$KVAF_ROOT/tests/python/test_npu_batch_get_perf.py" "$@"
+  "${PYTHON:-python3}" "$KVAF_ROOT/tests/python/test_npu_batch_get_perf.py" "$@"

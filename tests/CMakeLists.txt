@@ -1,5 +1,19 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+# Compile the production HBM service against a CPU-only ACL/RA provider double.
+# No CANN, liburma or NPU is needed for protocol, rollback and lifetime checks.
+add_executable(kvaf_npu_hbm_service_test
+  npu_hbm_service_test.cc ../runtime/src/npu_hbm_service.cc)
+target_include_directories(kvaf_npu_hbm_service_test PRIVATE
+  fake_npu ../runtime/src)
+target_link_libraries(kvaf_npu_hbm_service_test PRIVATE kvaf_runtime)
+add_test(NAME kvaf_npu_hbm_service COMMAND kvaf_npu_hbm_service_test)
+
+add_executable(kvaf_npu_target_channel_test npu_target_channel_test.cc)
+target_include_directories(kvaf_npu_target_channel_test PRIVATE ../runtime/src)
+target_link_libraries(kvaf_npu_target_channel_test PRIVATE kvaf_runtime)
+add_test(NAME kvaf_npu_target_channel COMMAND kvaf_npu_target_channel_test)
+
 add_executable(kvaf_batch_get_schedule_test batch_get_schedule_test.cc)
 target_include_directories(kvaf_batch_get_schedule_test PRIVATE
   ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include)

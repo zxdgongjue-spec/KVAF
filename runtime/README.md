@@ -32,6 +32,12 @@ AccessOperator，并把调用方已经准备好的输入/输出 buffer 交给数
 segment/token/Jetty 与会话。TCP 监听是无状态的 `RuntimeService`：它只接收连接并
 分发给 Runtime，不拥有硬件资源。
 
+NPU peer 模式由 `NpuRuntime(NpuHbmServiceOptions)` 提供服务端角色，
+`InitializeHbmService()` 后交给相同的 `RuntimeService` 监听。
+内部 `NpuHbmService` 持有 HBM 和 Direct-HCCP target 资源；客户端使用
+`LinkTo(LinkTarget{address, DeviceKind::kNpu})`，沿用池分配、BatchPut 和 BatchGet 流程。
+构建与双端验证见 [NPU peer 说明](../docs/npu_peer.md)。
+
 CPU 服务只需要 UB 驱动、`/dev/uburma`、UMDK 公开头文件和 `liburma.so`；不链接
 或加载 CANN、HCCP、ACL。仓库根目录的统一构建入口会自动拉取固定 UMDK 源码，并在系统
 缺少 `liburma.so` 时只构建所需的 UMDK `urma` target：
@@ -102,7 +108,7 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 单个 `--ub-device` 时走原生首个可用路径；`peer_ub_device` 可让后续进程复用已选设备
 而不重新测速。miss-count sweep 的第一个正式 shape 完成一次标定，后续 shape 复用
 结果，并在 CSV 的 `selected_ub_device` 列记录设备名。N/K 两端必须同时使用控制协议
-v6。
+v7。
 
 ```bash
 KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 \
