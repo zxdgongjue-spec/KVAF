@@ -1,5 +1,7 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+add_subdirectory(aicpu_batch_get)
+
 add_executable(kvaf_cpu_hbm_client_options_test cpu_hbm_client_options_test.cc)
 target_include_directories(kvaf_cpu_hbm_client_options_test PRIVATE
   "${CMAKE_SOURCE_DIR}/access_operator/include")

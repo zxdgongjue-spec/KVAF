@@ -20,6 +20,9 @@ option(KVAF_BUILD_CPU_URMA_PROBE
 option(KVAF_BUILD_NPU_SERVICE
        "Build the NPU HBM control service"
        OFF)
+option(KVAF_BUILD_AICPU_GET_TEST
+       "Build the standalone NPU AICPU CPU-push BatchGet benchmark"
+       OFF)
 
 if(KVAF_ENABLE_AIV_BATCH_PUT AND NOT KVAF_ENABLE_AIV_BATCH_GET)
   message(FATAL_ERROR
