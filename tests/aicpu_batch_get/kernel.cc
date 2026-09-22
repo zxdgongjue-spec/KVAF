@@ -18,7 +18,11 @@ void Clean(const void* data, std::uint64_t bytes) {
 void Invalidate(const void* data, std::uint64_t bytes) {
   auto begin = reinterpret_cast<std::uintptr_t>(data) & ~std::uintptr_t{63};
   const auto end = reinterpret_cast<std::uintptr_t>(data) + bytes;
-  for (; begin < end; begin += 64) asm volatile("dc ivac, %0" :: "r"(begin) : "memory");
+  // DC IVAC is privileged and faults at EL0. AICPU user kernels use CIVAC
+  // (subject to platform cache-maintenance permission), as in the reference kernels.
+  // These DMA-owned lines are only read by AICPU; do not dirty them before
+  // invalidation, or the clean part could overwrite newer DMA data.
+  for (; begin < end; begin += 64) asm volatile("dc civac, %0" :: "r"(begin) : "memory");
   Barrier();
 }
 struct DeviceIO {

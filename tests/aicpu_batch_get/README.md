@@ -29,7 +29,10 @@ CPU source 每行之间有 64 字节空隙，NPU staging 连续，输出按反�
 
 升级共享发现逻辑版本后，必须重新编译并重启 CPU/NPU 两端程序；旧程序不支持新的
 候选查询/配置流程。
-AICPU kernel ABI 没变，仅此次更新不需要重新安装 device kernel。
+**当前缓存指令修复版本需要重新安装 kernel**：若旧版本出现 `stream=507000`，并伴随
+CPU 等待请求超时，应更新、重新编译两端，再用 `--install-kernel` 启动 NPU 端。
+旧 kernel 的 `dc ivac` 在 EL0 不可执行，已改为参考 AICPU 算子使用的 `dc civac`。
+仅更新 host 程序不会替换已安装的 device `.so`。
 
 在两端的仓库根目录执行。`build.sh` 自动查找 CANN/UMDK；UMDK 未安装时
 沿用已有脚本逻辑获取固定版本。已有 UMDK 可以通过 `KVAF_UMDK_ROOT` 指定，
@@ -187,6 +190,22 @@ ctest --test-dir build-host-aicpu -R kvaf_aicpu_get_protocol --output-on-failure
 模拟器执行生产 kernel 共用的设备状态循环，覆盖预热/轮次、延迟完成、超时、
 过期数据、错误序号、反向 scatter、guard、配置溢出和带宽统计。
 它不验证 AICPU 指令权限、CANN 加载或实际 UB/HBM 缓存一致性。
+
+## 故障诊断
+
+`LINK_PROBE ... ok=1` 表示 CPU→HBM 的数据探测已通过，不代表 AICPU kernel 已运行。
+失败时保留两端 stderr：
+
+- CPU 超时打印 `expected`（等待轮次）、`observed`（读到的请求序号）、`last_done`。
+  例如 expected=2 / observed=1 / last_done=1 表示第一轮 CPU WRITE 已完成，
+  AICPU 没有继续发布第二轮请求；expected=1 / observed=0 则尚未观察到首次发布。
+- NPU 在 stream 失败时立即打印 `STREAM_FAILED` 和 `aclGetRecentErrMsg()`。
+- 尝试读取 `KERNEL_STATUS`：0=pending、1=成功、2=参数错误、3=等待超时、
+  4=序号错误、5=数据不匹配。还会打印已完成轮数、失败轮次和计时器频率。
+- 如果设备异常导致状态无法回读，打印 `KERNEL_STATUS_UNAVAILABLE`；这不等于状态为 0。
+
+507000 本身不能唯一定位根因。修复后若仍失败，需要上述新日志以及 CANN device/plog
+异常记录判断加载失败、指令异常、参数/地址访问或算子主动返回错误。
 
 共享链路选择有独立的 `kvaf_cpu_urma_link_selection` 单测；找到 UMDK headers 时
 还会构建 `kvaf_cpu_urma_discovery`，使用真实 API 声明及模拟 provider 验证枚举、

@@ -112,6 +112,12 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
   try { Send(fd, &ack, sizeof(ack)); }
   catch (...) { /* Kernel times out; still perform the drain handshake below. */ }
   const auto sync = kernel.Synchronize();
+  if (sync != ACL_SUCCESS) {
+    // Capture immediately: later ACL calls can replace this thread's error.
+    const char* recent = aclGetRecentErrMsg();
+    std::fprintf(stderr, "AICPU_GET_NPU STREAM_FAILED code=%d acl_error=%s\n",
+                 (int)sync, recent ? recent : "<no recent ACL error>");
+  }
   Ack drained{};
   try {
     Receive(fd, &drained, sizeof(drained));
@@ -121,6 +127,22 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
     for (;;) pause();
   }
   Report report{};
+  KernelResult device_result{};
+  // An explicit kernel error (timeout, bad sequence, mismatch) can also fail
+  // the stream. Try to retrieve its status before discarding this evidence.
+  // A processor exception may prevent readback; report that separately.
+  const auto result_read = aclrtMemcpy(&device_result, sizeof(device_result), result.data,
+                                        sizeof(device_result), ACL_MEMCPY_DEVICE_TO_HOST);
+  if (result_read == ACL_SUCCESS) {
+    std::fprintf(stderr,
+                 "AICPU_GET_NPU KERNEL_STATUS status=%llu completed=%llu failed_sequence=%llu frequency=%llu\n",
+                 (unsigned long long)device_result.status,
+                 (unsigned long long)device_result.completed_rounds,
+                 (unsigned long long)device_result.failed_sequence,
+                 (unsigned long long)device_result.counter_frequency);
+  } else {
+    std::fprintf(stderr, "AICPU_GET_NPU KERNEL_STATUS_UNAVAILABLE readback_code=%d\n", (int)result_read);
+  }
   if (sync != ACL_SUCCESS || drained.status != 0) {
     std::fprintf(stderr, "AICPU execution failed: stream=%d cpu_status=%llu\n",
                  (int)sync, (unsigned long long)drained.status);
@@ -131,9 +153,7 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
     std::fprintf(stderr, "Failed run: target retained. Stop this process after the CPU test has exited.\n");
     for (;;) pause();
   }
-  KernelResult device_result{};
-  Acl(aclrtMemcpy(&device_result, sizeof(device_result), result.data, sizeof(device_result),
-                   ACL_MEMCPY_DEVICE_TO_HOST), "read kernel result");
+  Acl(result_read, "read kernel result");
   Require(device_result.status == Result::kOk, "AICPU returned an error status");
   ValidateOutput(config, layout, output);
   std::vector<Sample> timings(config.iterations);

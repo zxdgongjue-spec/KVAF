@@ -159,8 +159,13 @@ void Run(Options options) {
       do {
         Check(transport.ReadSglBatch(kRequestOffset, &request_sge, 1));
         ++polls;
-        Require(request->sequence <= seq, "unexpected future AICPU request");
-        Require(Clock::now() < deadline, "timed out waiting for AICPU request");
+        if (request->sequence > seq)
+          throw std::runtime_error("unexpected future AICPU request: expected=" + std::to_string(seq) +
+                                   " observed=" + std::to_string(request->sequence));
+        if (Clock::now() >= deadline)
+          throw std::runtime_error("timed out waiting for AICPU request: expected=" + std::to_string(seq) +
+                                   " observed=" + std::to_string(request->sequence) +
+                                   " last_done=" + std::to_string(done->sequence));
       } while (request->sequence != seq);
       for (std::uint64_t row = 0; row < options.config.rows; ++row) {
         const auto tag = RowTag(seq, row);
