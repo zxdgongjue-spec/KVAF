@@ -10,7 +10,8 @@
 namespace kvaf::cpu_urma_detail {
 
 #if defined(__GNUC__) && !defined(__clang__)
-#define KVAF_CPU_URMA_BUILD_HOT __attribute__((hot, noinline, optimize("O3")))
+#define KVAF_CPU_URMA_BUILD_HOT \
+  __attribute__((hot, noinline, flatten, optimize("O3")))
 #else
 #define KVAF_CPU_URMA_BUILD_HOT
 #endif
