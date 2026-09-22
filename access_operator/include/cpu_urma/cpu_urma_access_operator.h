@@ -22,6 +22,7 @@ class CpuUrmaAccessOperator final : public AccessOperator {
 
   Status Initialize(const RemoteRegionDesc& remote_region) override;
   Status Shutdown() override;
+  Status ValidateLink();
   Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
   Status ExecuteBatchPut(const BatchPutExecRequest& request) override;
 

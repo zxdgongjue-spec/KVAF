@@ -69,6 +69,7 @@ def initialize_runtime(hbm_bytes: int, slot_size: int) -> object:
             os.environ.get("KVAF_CPU_URMA_DOORBELL_WQES", "0")
         ),
         remote_sgl_size=int(os.environ.get("KVAF_CPU_URMA_REMOTE_SGL_SIZE", "1")),
+        prepare_thread_count=int(os.environ.get("KVAF_CPU_URMA_PREPARE_THREADS", "4")),
     )
     return runtime
 

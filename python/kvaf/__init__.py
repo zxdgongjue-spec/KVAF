@@ -27,6 +27,7 @@ if hasattr(_native, "NpuRuntime"):
     NpuRuntime = _native.NpuRuntime
     AclGraph = _native.AclGraph
     DeviceAccessTable = _native.DeviceAccessTable
+    NormalHbmBuffer = _native.NormalHbmBuffer
 
 if hasattr(_native, "CpuRuntime"):
     CpuRuntime = _native.CpuRuntime
@@ -46,6 +47,7 @@ if hasattr(_native, "NpuRuntime"):
         "NpuRuntime",
         "AclGraph",
         "DeviceAccessTable",
+        "NormalHbmBuffer",
     ]
 
 if hasattr(_native, "CpuRuntime"):

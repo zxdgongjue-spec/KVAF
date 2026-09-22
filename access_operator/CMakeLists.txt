@@ -13,7 +13,7 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   add_subdirectory(src/cpu_urma)
 endif()
 
-if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_BUILD_HBM_RW_TEST)
+if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_BUILD_HBM_RW_TEST OR KVAF_BUILD_AICPU_GET_TEST)
   add_subdirectory(src/direct_hccp)
 endif()
 

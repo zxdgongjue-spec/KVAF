@@ -385,7 +385,8 @@ class CpuPythonRuntime final {
                   std::uint64_t slot_size, std::uint32_t device_id,
                   const std::string& ub_device, py::object eid_index,
                   std::uint32_t wqes_per_doorbell,
-                  std::uint32_t remote_sgl_size) {
+                  std::uint32_t remote_sgl_size,
+                  std::uint32_t prepare_thread_count) {
     CpuRuntimeClientOptions options;
     options.peer_address = peer;
     options.hbm_bytes = hbm_bytes;
@@ -394,6 +395,7 @@ class CpuPythonRuntime final {
     options.ub_device = ub_device;
     options.wqes_per_doorbell = wqes_per_doorbell;
     options.remote_sgl_size = remote_sgl_size;
+    options.prepare_thread_count = prepare_thread_count;
     if (!eid_index.is_none()) {
       options.eid_index = eid_index.cast<std::uint32_t>();
       options.has_eid_index = true;
@@ -417,6 +419,8 @@ class CpuPythonRuntime final {
   py::dict LastBatchTiming() const {
     const CpuRuntimeBatchTiming timing = native_.last_batch_timing();
     py::dict result;
+    result["plan_ns"] = timing.plan_ns;
+    result["setup_ns"] = timing.setup_ns;
     result["prepare_ns"] = timing.prepare_ns;
     result["post_ns"] = timing.post_ns;
     result["poll_ns"] = timing.poll_ns;
@@ -590,7 +594,7 @@ PYBIND11_MODULE(_kvaf, m) {
            py::arg("peer"), py::arg("hbm_bytes"), py::arg("slot_size"),
            py::arg("device_id") = 0, py::arg("ub_device") = "",
            py::arg("eid_index") = py::none(), py::arg("wqes_per_doorbell") = 0,
-           py::arg("remote_sgl_size") = 1)
+           py::arg("remote_sgl_size") = 1, py::arg("prepare_thread_count") = 4)
       .def("shutdown", &kvaf::CpuPythonRuntime::Shutdown)
       .def_property_readonly("initialized", &kvaf::CpuPythonRuntime::Initialized)
       .def_property_readonly("remote_region", &kvaf::CpuPythonRuntime::RemoteRegion)

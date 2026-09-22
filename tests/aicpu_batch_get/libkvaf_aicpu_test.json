@@ -1,0 +1,9 @@
+{
+  "KvafAicpuBatchGetV2": {
+    "opInfo": {
+      "functionName": "KvafAicpuBatchGetV2",
+      "kernelSo": "libkvaf_aicpu_test.so",
+      "opKernelLib": "AICPUKernel"
+    }
+  }
+}

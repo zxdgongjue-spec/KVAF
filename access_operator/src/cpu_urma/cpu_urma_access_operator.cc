@@ -25,7 +25,10 @@ Status CpuUrmaAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     options_.external_region = descriptor;
   }
   const Status status = transport_.Initialize(options_);
-  if (!status.ok()) return status;
+  if (!status.ok()) {
+    (void)transport_.Shutdown();
+    return status;
+  }
   region_ = remote_region;
   initialized_ = true;
   return Status::OK();
@@ -36,6 +39,11 @@ Status CpuUrmaAccessOperator::Shutdown() {
   initialized_ = false;
   region_ = {};
   return transport_.Shutdown();
+}
+
+Status CpuUrmaAccessOperator::ValidateLink() {
+  std::unique_lock<std::mutex> lock(batch_mutex_);
+  return transport_.ValidateLink();
 }
 
 Status CpuUrmaAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& request) {
@@ -74,9 +82,9 @@ Status CpuUrmaAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& request
     batch_used_sources_[source_index] = 1U;
   }
   // AIV BatchGet binds its complete HBM output before posting READs. For the
-  // corresponding CPU DRAM -> HBM flow, bind each complete packed CPU input
-  // once so all row SGEs reuse the same registered host segment. Providers
-  // that reject the larger range fall back to per-row registration below.
+  // corresponding CPU DRAM -> HBM flow, bind each complete CPU source buffer
+  // once so its distinct row SGEs reuse the same registered host segment.
+  // Providers that reject the larger range fall back to per-row registration.
   for (std::size_t index = 0; index < request.plan->sources.size(); ++index) {
     if (batch_used_sources_[index] == 0U) continue;
     const ConstBufferView& source = request.plan->sources[index];

@@ -19,7 +19,7 @@ if(NOT KVAF_URMA_INCLUDE_DIR OR NOT KVAF_URMA_LIBRARY)
     "KVAF_BUILD_REMOTE_CPU_SERVICE requires urma_api.h and liburma; set KVAF_URMA_ROOT")
 endif()
 
-add_library(kvaf_cpu_urma_transport STATIC cpu_urma_transport.cc)
+add_library(kvaf_cpu_urma_transport STATIC cpu_urma_transport.cc cpu_urma_discovery.cc)
 target_include_directories(kvaf_cpu_urma_transport
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../../include
   PRIVATE "${KVAF_URMA_INCLUDE_DIR}")

@@ -179,6 +179,32 @@ build-npu/bin/kvaf_execute_batch_put_kernels.o
 
 服务会自动发现 UB device/EID，并打印 `CANDIDATE_DISCOVERED` 与 `LISTEN`。也可按需要传入 `--ub-device NAME --eid-index N` 来选定对应的端口。
 
+### CPU 到 CPU URMA 带宽测试
+
+两台 CPU 主机均执行 `./build.sh cpu`，服务端按上面的方式启动
+`kvaf_cpu_service`，客户端执行：
+
+```bash
+./build-cpu/tests/kvaf_cpu_urma_cpu_bw --peer <server-ip>:28999 \
+  --blocks 8192 --block-bytes 4096 --warmup 5 --iterations 100
+```
+
+测试直接复用 `CpuUrmaTransport`，使用一块预注册的 CPU 内存，分别测试 CPU DDR
+到 CPU DDR 的单向 WRITE 和 READ；不是双向同时打流。输出十进制 `GB/s`、
+`Gbit/s` 和每批平均耗时。计时包含批量请求准备、提交和等待完成，不包含初始化、
+内存注册、预热及回读校验；结果是现有传输接口的实际吞吐，不是纯链路峰值。
+校验失败时程序返回非零值，成功时打印 `VERIFY ok`。
+
+`--blocks` 范围为 1 到 32768，`--block-bytes` 单位为字节。
+客户端可通过 `--ub-device NAME --eid-index N` 指定本地端口，
+`--peer-candidate-id N` 选择服务端打印的 candidate id（默认 0）。
+`--doorbell-wqes N` 设置每次提交的 WR 数，0 表示每个 Jetty 一次提交完整链表。
+`--jettys N` 设置 1 到 16 个独立 Jetty；提交使用相同数量的 OpenMP 线程，默认 4。
+`--prepare-threads N` 设置通用回退路径最多 1 到 64 个规划/WR 构造线程，默认 4。
+预注册且启用 WRITE 合并时，每个 Jetty owner 单遍完成校验、合并和 WR 构造，随后负责
+该 Jetty 的 SQ 提交和 CQ 轮询，因此该快速路径的线程数由 `--jettys` 决定。
+两端需要配置好 UB 网络；TCP 仅用于交换资源描述，不承载测量的数据。
+
 ### 2. 运行 NPU 端到端测试
 
 在 NPU 主机上执行：

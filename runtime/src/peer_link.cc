@@ -300,6 +300,43 @@ Status PeerLink::GetCandidateCount(uint32_t* candidate_count) const {
              : ToStatus("peer candidate discovery failed", std::move(error));
 }
 
+Status PeerLink::GetHbmEidCandidates(
+    uint32_t device_id, std::vector<std::array<uint8_t, kEidBytes>>* candidates) const {
+  if (candidates == nullptr) return Status::InvalidArgument("missing HBM EID candidates output");
+  candidates->clear();
+  uint32_t count = 1U;
+  for (uint32_t index = 0U; index < count; ++index) {
+    HbmEidCandidateRequest request{};
+    request.header = MakeHeader(Command::kGetHbmEidCandidate, sizeof(request));
+    request.device_id = device_id;
+    request.candidate_index = index;
+    HbmEidCandidateResponse response{};
+    std::string error;
+    if (!Exchange(address_, request, &response, &error) ||
+        !IsValidResponseHeader(response.header, Command::kGetHbmEidCandidate, sizeof(response)) ||
+        !ResultOk(static_cast<Result>(response.result), &error)) {
+      candidates->clear();
+      return ToStatus("NPU EID discovery failed (requires an updated NPU service)", std::move(error));
+    }
+    if (response.candidate_count == 0U || response.candidate_index != index ||
+        (index != 0U && response.candidate_count != count) ||
+        std::all_of(response.eid, response.eid + kEidBytes, [](uint8_t b) { return b == 0U; })) {
+      candidates->clear();
+      return Status::Internal("invalid or changed NPU EID candidate list");
+    }
+    count = response.candidate_count;
+    std::array<uint8_t, kEidBytes> eid{};
+    std::copy_n(response.eid, kEidBytes, eid.begin());
+    if (std::find(candidates->begin(), candidates->end(), eid) != candidates->end()) {
+      candidates->clear();
+      return Status::Internal("duplicate NPU EID candidate");
+    }
+    candidates->push_back(eid);
+  }
+  return Status::OK();
+}
+
+
 Status PeerLink::AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
                                 uint32_t candidate_id, PeerRegion* region) {
   std::string error;

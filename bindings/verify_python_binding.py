@@ -19,11 +19,12 @@ def main() -> int:
             not hasattr(kvaf, "NpuRuntime")
             or not hasattr(kvaf, "DeviceAccessTable")
             or not hasattr(kvaf, "AclGraph")
+            or not hasattr(kvaf, "NormalHbmBuffer")
             or not hasattr(kvaf.NpuRuntime, "batch_free")
         ):
             raise RuntimeError(
                 "KVAF AIV binding does not export NpuRuntime, DeviceAccessTable, "
-                "AclGraph, and NpuRuntime.batch_free"
+                "AclGraph, NormalHbmBuffer, and NpuRuntime.batch_free"
             )
     if options.require_cpu_urma:
         if (

@@ -5,11 +5,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <random>
 #include <string>
 #include <sys/mman.h>
 #include <unordered_set>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -27,6 +29,9 @@ struct Options {
   bool has_eid_index{false};
   std::uint32_t eid_index{0};
   std::uint32_t device_id{0};
+  std::uint32_t jetty_count{4};
+  std::uint32_t remote_sgl_size{1};
+  std::uint32_t prepare_thread_count{4};
 };
 
 bool ParseU64(const char* text, std::uint64_t* value) {
@@ -52,7 +57,8 @@ void Usage(const char* program) {
                "[--host-space-bytes N[K|M|G|T]] [--iterations N] [--warmup N] "
                "[--doorbell-wqes N] "
                "[--seed N] [--ub-device NAME] "
-               "[--eid-index N] [--device-id N]\n",
+               "[--eid-index N] [--device-id N] [--jettys N] "
+               "[--remote-sgl-size N] [--prepare-threads N]\n",
                program);
 }
 
@@ -95,10 +101,6 @@ bool Parse(int argc, char** argv, Options* options) {
     std::uint64_t number = 0;
     if (arg == "--blocks" && ParseU64(value, &number)) options->blocks = number;
     else if (arg == "--block-bytes" && ParseU64(value, &number)) options->block_bytes = number;
-    else if (arg == "--bytes" && ParseU64(value, &number)) {
-      options->blocks = 1;
-      options->block_bytes = number;
-    }
     else if (arg == "--host-space-bytes" && ParseBytes(value, &options->host_space_bytes)) {}
     else if (arg == "--doorbell-wqes" && ParseU32(value, &options->wqes_per_doorbell)) {}
     else if (arg == "--iterations" && ParseU64(value, &number)) options->iterations = number;
@@ -107,10 +109,16 @@ bool Parse(int argc, char** argv, Options* options) {
     else if (arg == "--ub-device") options->ub_device = value;
     else if (arg == "--eid-index" && ParseU32(value, &options->eid_index)) options->has_eid_index = true;
     else if (arg == "--device-id" && ParseU32(value, &options->device_id)) {}
+    else if (arg == "--jettys" && ParseU32(value, &options->jetty_count)) {}
+    else if (arg == "--remote-sgl-size" && ParseU32(value, &options->remote_sgl_size)) {}
+    else if (arg == "--prepare-threads" && ParseU32(value, &options->prepare_thread_count)) {}
     else return false;
   }
   return options->blocks != 0 && options->block_bytes != 0 && options->iterations != 0 &&
          options->wqes_per_doorbell <= 1024U &&
+         options->jetty_count >= 1U && options->jetty_count <= 16U &&
+         options->remote_sgl_size != 0U &&
+         options->prepare_thread_count >= 1U && options->prepare_thread_count <= 64U &&
          options->blocks <= std::numeric_limits<std::uint64_t>::max() / options->block_bytes &&
          options->block_bytes <= std::numeric_limits<std::uint32_t>::max();
 }
@@ -124,9 +132,13 @@ struct Stats {
   std::uint64_t min_ns{std::numeric_limits<std::uint64_t>::max()};
   std::uint64_t max_ns{0};
   std::uint64_t wall_ns{0};
+  std::uint64_t plan_ns{0};
   std::uint64_t prepare_ns{0};
   std::uint64_t post_ns{0};
   std::uint64_t poll_ns{0};
+  std::uint64_t setup_ns{0};
+  std::uint64_t dispatch_ns{0};
+  std::uint64_t total_ns{0};
   std::uint64_t phase_samples{0};
 };
 
@@ -154,14 +166,18 @@ bool RunBatchPass(kvaf::CpuUrmaTransport* transport, bool write,
     return false;
   }
   const auto wall_start = std::chrono::steady_clock::now();
+  std::vector<std::uint64_t> remote_offsets;
+  if (write) remote_offsets.resize(order.size());
   std::vector<kvaf::CpuUrmaTransport::HostSge> requests(order.size());
   for (std::size_t i = 0U; i < order.size(); ++i) {
     requests[i] = {(*blocks)[order[i]].data, block_bytes};
+    if (write) remote_offsets[i] = static_cast<std::uint64_t>(i) * block_bytes;
   }
   for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
     const auto start = std::chrono::steady_clock::now();
     const kvaf::Status status = write
-        ? transport->WriteSglBatch(0U, requests.data(), requests.size())
+        ? transport->WriteBatch(
+              remote_offsets.data(), requests.data(), requests.size())
         : transport->ReadSglBatch(0U, requests.data(), requests.size());
     if (!status.ok()) {
       std::fprintf(stderr, "[HBM_TEST][CPU] %s failed: %s\n",
@@ -179,9 +195,13 @@ bool RunBatchPass(kvaf::CpuUrmaTransport* transport, bool write,
     stats->sum_ns += elapsed;
     stats->min_ns = std::min(stats->min_ns, elapsed);
     stats->max_ns = std::max(stats->max_ns, elapsed);
+    stats->plan_ns += timing.plan_ns;
     stats->prepare_ns += timing.prepare_ns;
     stats->post_ns += timing.post_ns;
     stats->poll_ns += timing.poll_ns;
+    stats->setup_ns += timing.setup_ns;
+    stats->dispatch_ns += timing.dispatch_ns;
+    stats->total_ns += timing.total_ns;
     ++stats->phase_samples;
   }
   stats->wall_ns = static_cast<std::uint64_t>(
@@ -203,11 +223,26 @@ void PrintStats(const char* name, const Stats& stats) {
               stats.min_ns / 1000.0, stats.max_ns / 1000.0);
   if (stats.phase_samples != 0U) {
     const double samples = static_cast<double>(stats.phase_samples);
-    std::printf("[HBM_TEST][CPU] %-5s_PHASE avg_prepare=%.3f us avg_post=%.3f us "
-                "avg_poll=%.3f us\n",
-                name, stats.prepare_ns / samples / 1000.0,
+    std::printf("[HBM_TEST][CPU] %-5s_PHASE avg_plan=%.3f us avg_setup=%.3f us "
+                "avg_prepare=%.3f us avg_post=%.3f us avg_poll=%.3f us\n",
+                name, stats.plan_ns / samples / 1000.0,
+                stats.setup_ns / samples / 1000.0,
+                stats.prepare_ns / samples / 1000.0,
                 stats.post_ns / samples / 1000.0,
                 stats.poll_ns / samples / 1000.0);
+    const auto covered_ns = stats.plan_ns + stats.setup_ns +
+        stats.dispatch_ns + stats.poll_ns;
+    const auto other_ns = stats.total_ns > covered_ns
+        ? stats.total_ns - covered_ns : 0U;
+    std::printf("[HBM_TEST][CPU] %-5s_WALL avg_plan=%.3f us avg_setup=%.3f us "
+                "avg_submit_wall=%.3f us avg_poll_wait=%.3f us avg_other=%.3f us "
+                "avg_total=%.3f us\n",
+                name, stats.plan_ns / samples / 1000.0,
+                stats.setup_ns / samples / 1000.0,
+                stats.dispatch_ns / samples / 1000.0,
+                stats.poll_ns / samples / 1000.0,
+                other_ns / samples / 1000.0,
+                stats.total_ns / samples / 1000.0);
   }
 }
 
@@ -219,14 +254,31 @@ int main(int argc, char** argv) {
     Usage(argv[0]);
     return argc > 1 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h") ? 0 : 2;
   }
+  // OpenMP may read its policy before main; re-exec so ACTIVE takes effect.
+  const char* wait_policy = std::getenv("OMP_WAIT_POLICY");
+  if (wait_policy == nullptr || std::strcmp(wait_policy, "ACTIVE") != 0) {
+    if (setenv("OMP_WAIT_POLICY", "ACTIVE", 1) == 0) {
+#if defined(__linux__)
+      execv("/proc/self/exe", argv);
+#else
+      execvp(argv[0], argv);
+#endif
+    }
+    std::perror("[HBM_TEST][CPU] FAILED stage=omp_active_startup");
+    return 1;
+  }
   const std::uint64_t total_bytes = static_cast<std::uint64_t>(options.blocks) * options.block_bytes;
+  if (total_bytes > std::numeric_limits<std::size_t>::max() / 2U) {
+    std::fprintf(stderr, "[HBM_TEST][CPU] scattered host address space size overflows\n");
+    return 2;
+  }
+  const std::uint64_t source_stride_bytes = 2U * options.block_bytes;
   const std::uint64_t host_space_bytes =
-      options.host_space_bytes == 0U ? total_bytes : options.host_space_bytes;
-  if (host_space_bytes < total_bytes ||
-      host_space_bytes / options.block_bytes < options.blocks ||
+      options.host_space_bytes == 0U ? 2U * total_bytes : options.host_space_bytes;
+  if (host_space_bytes / source_stride_bytes < options.blocks ||
       host_space_bytes > std::numeric_limits<std::size_t>::max()) {
     std::fprintf(stderr,
-                 "[HBM_TEST][CPU] invalid host address space bytes=%llu for blocks=%zu block_bytes=%zu\n",
+                 "[HBM_TEST][CPU] invalid scattered host address space bytes=%llu for blocks=%zu block_bytes=%zu (requires at least twice payload_bytes)\n",
                  static_cast<unsigned long long>(host_space_bytes), options.blocks,
                  options.block_bytes);
     return 2;
@@ -235,12 +287,16 @@ int main(int argc, char** argv) {
                "[HBM_TEST][CPU] START peer=%s blocks=%zu block_bytes=%zu payload_bytes=%llu "
                "host_address_space_bytes=%llu "
                "iterations=%zu warmup=%zu "
-               "remote_device=%u\n",
+               "remote_device=%u jettys=%u prepare_threads=%u remote_sgl_size=%u "
+               "source_layout=scattered remote_layout=contiguous source_stride_bytes=%llu "
+               "write_order=random read_layout=packed omp_wait_policy=ACTIVE\n",
                options.peer.c_str(), options.blocks, options.block_bytes,
                static_cast<unsigned long long>(total_bytes),
                static_cast<unsigned long long>(host_space_bytes), options.iterations,
                options.warmup,
-               options.device_id);
+               options.device_id, options.jetty_count, options.prepare_thread_count,
+               options.remote_sgl_size,
+               static_cast<unsigned long long>(source_stride_bytes));
   std::fprintf(stderr, "[HBM_TEST][CPU] DATA_PATH=direct-registered-host-memory\n");
 
   kvaf::CpuUrmaTransportOptions transport_options;
@@ -253,6 +309,9 @@ int main(int argc, char** argv) {
   transport_options.remote_device_id = options.device_id;
   transport_options.remote_eid_index = options.has_eid_index ? options.eid_index : UINT32_MAX;
   transport_options.wqes_per_doorbell = options.wqes_per_doorbell;
+  transport_options.jetty_count = options.jetty_count;
+  transport_options.remote_sgl_size = options.remote_sgl_size;
+  transport_options.prepare_thread_count = options.prepare_thread_count;
   kvaf::CpuUrmaTransport transport;
   kvaf::Status status = transport.Initialize(transport_options);
   if (!status.ok()) {
@@ -293,9 +352,7 @@ int main(int argc, char** argv) {
   storage.data = static_cast<std::uint8_t*>(storage_address);
   storage.bytes = allocation_bytes;
   std::vector<HostBlock> blocks(options.blocks);
-  std::vector<std::vector<std::uint8_t>> expected(
-      options.blocks, std::vector<std::uint8_t>(options.block_bytes));
-  const std::uint64_t slot_count = host_space_bytes / options.block_bytes;
+  const std::uint64_t slot_count = host_space_bytes / source_stride_bytes;
   std::uniform_int_distribution<std::uint64_t> slot_distribution(0U, slot_count - 1U);
   std::unordered_set<std::uint64_t> used_slots;
   used_slots.reserve(options.blocks * 2U);
@@ -305,10 +362,9 @@ int main(int argc, char** argv) {
       slot = slot_distribution(rng);
     } while (!used_slots.insert(slot).second);
     blocks[i].data = storage.data +
-                     static_cast<std::size_t>(slot * options.block_bytes);
+                     static_cast<std::size_t>(slot * source_stride_bytes);
     for (std::size_t j = 0; j < options.block_bytes; ++j) {
       blocks[i].data[j] = static_cast<std::uint8_t>(rng());
-      expected[i][j] = blocks[i].data[j];
     }
   }
   // Fault in the selected pages before registering the encompassing segment.
@@ -326,11 +382,16 @@ int main(int argc, char** argv) {
   std::vector<std::size_t> order(options.blocks);
   for (std::size_t i = 0; i < options.blocks; ++i) order[i] = i;
   std::shuffle(order.begin(), order.end(), rng);
+  std::vector<std::uint8_t> expected(static_cast<std::size_t>(total_bytes));
+  for (std::size_t row = 0U; row < options.blocks; ++row) {
+    std::memcpy(expected.data() + row * options.block_bytes,
+                blocks[order[row]].data, options.block_bytes);
+  }
 
   Stats warmup_stats;
   const auto run_pass = [&](bool write, std::size_t iterations, Stats* stats) {
     return RunBatchPass(&transport, write, &blocks, order, options.block_bytes,
-                      iterations, stats);
+                        iterations, stats);
   };
   if (options.warmup != 0 && !run_pass(true, options.warmup, &warmup_stats)) {
     (void)transport.Shutdown();
@@ -341,18 +402,40 @@ int main(int argc, char** argv) {
     (void)transport.Shutdown();
     return 1;
   }
-  for (auto& block : blocks) std::fill_n(block.data, options.block_bytes, 0);
-  Stats read_stats;
-  if (!run_pass(false, options.iterations, &read_stats)) {
+  // Verify the packed remote bytes through independent, single-SGE READs.
+  // Reusing the scattered WRITE layout could hide an incorrect gather mapping.
+  MappedRegion readback;
+  readback.bytes = (static_cast<std::size_t>(total_bytes) + page_bytes - 1U) /
+      page_bytes * page_bytes;
+  void* readback_address = mmap(nullptr, readback.bytes, PROT_READ | PROT_WRITE,
+                                mmap_flags, -1, 0);
+  if (readback_address == MAP_FAILED) {
+    std::fprintf(stderr, "[HBM_TEST][CPU] packed READ buffer allocation failed\n");
     (void)transport.Shutdown();
     return 1;
   }
-  bool verified = true;
-  for (std::size_t i = 0; i < blocks.size(); ++i) {
-    verified = verified && std::equal(blocks[i].data,
-                                      blocks[i].data + options.block_bytes,
-                                      expected[i].begin());
+  readback.data = static_cast<std::uint8_t*>(readback_address);
+  std::fill_n(readback.data, static_cast<std::size_t>(total_bytes), 0U);
+  status = transport.RegisterDirectHostMemory(readback.data, readback.bytes);
+  if (!status.ok()) {
+    std::fprintf(stderr, "[HBM_TEST][CPU] packed READ buffer registration failed: %s\n",
+                 status.message().c_str());
+    (void)transport.Shutdown();
+    return 1;
   }
+  std::vector<HostBlock> read_blocks(options.blocks);
+  std::vector<std::size_t> read_order(options.blocks);
+  for (std::size_t row = 0U; row < options.blocks; ++row) {
+    read_blocks[row].data = readback.data + row * options.block_bytes;
+    read_order[row] = row;
+  }
+  Stats read_stats;
+  if (!RunBatchPass(&transport, false, &read_blocks, read_order,
+                    options.block_bytes, options.iterations, &read_stats)) {
+    (void)transport.Shutdown();
+    return 1;
+  }
+  const bool verified = std::equal(expected.begin(), expected.end(), readback.data);
   PrintStats("WRITE", write_stats);
   PrintStats("READ", read_stats);
   std::printf("[HBM_TEST][CPU] %s blocks=%zu block_bytes=%zu seed=%llu\n",

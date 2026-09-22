@@ -1,6 +1,7 @@
 #include "cpu_runtime.h"
 #include "peer_protocol.h"
 #include "cpu_urma/cpu_urma_access_operator.h"
+#include "cpu_urma/cpu_urma_link_selection.h"
 #include "peer_link.h"
 
 #include <dlfcn.h>
@@ -58,6 +59,7 @@ class PeerHbmAllocator final : public DdrMemoryAllocator {
     eid_index_ = has_eid_index ? eid : UINT32_MAX;
   }
   const peer::PeerRegion& region() const { return allocated_; }
+  bool has_allocation() const { return allocated_.base != 0U; }
  private:
   std::shared_ptr<peer::PeerLink> link_;
   peer::PeerRegion allocated_{};
@@ -307,11 +309,8 @@ class UrmaResources {
   UrmaImportJettyExFn import_jetty_ex_ = nullptr;
 };
 
-struct UrmaCandidate {
+struct UrmaCandidate : CpuUrmaCandidate {
   uint32_t id = 0U;
-  std::string device_name;
-  uint32_t eid_index = 0U;
-  std::array<uint8_t, kEidBytes> eid{};
   bool unavailable = false;
   std::unique_ptr<UrmaResources> resources;
 };
@@ -322,54 +321,16 @@ class UrmaResourcePool {
 
   bool Initialize(const std::string& requested_device, bool eid_index_requested,
                   uint32_t requested_eid_index) {
-    urma_init_attr_t init{};
-    if (urma_init(&init) != URMA_SUCCESS) {
-      Log("[KVAF_CPU] urma_init failed\n");
+    const Status status = discovery_.Initialize(requested_device, eid_index_requested, requested_eid_index);
+    if (!status.ok()) {
+      Log("[KVAF_CPU] candidate discovery failed: %s\n", status.message().c_str());
       return false;
     }
-    initialized_ = true;
-
-    int device_count = 0;
-    urma_device_t** devices = urma_get_device_list(&device_count);
-    if (devices == nullptr) {
-      Log("[KVAF_CPU] urma_get_device_list returned no devices\n");
-      return false;
+    for (const auto& discovered : discovery_.candidates()) {
+      UrmaCandidate candidate;
+      static_cast<CpuUrmaCandidate&>(candidate) = discovered;
+      candidates_.push_back(std::move(candidate));
     }
-    for (int device_index = 0; device_index < device_count; ++device_index) {
-      urma_device_t* device = devices[device_index];
-      if (device == nullptr || device->type != URMA_TRANSPORT_UB ||
-          (!requested_device.empty() && requested_device != device->name)) {
-        continue;
-      }
-      uint32_t eid_count = 0U;
-      urma_eid_info_t* eids = urma_get_eid_list(device, &eid_count);
-      if (eids == nullptr) {
-        Log("[KVAF_CPU] CANDIDATE_ENUM_FAILED ub_device=%s errno=%d\n", device->name, errno);
-        continue;
-      }
-      for (uint32_t eid_position = 0U; eid_position < eid_count; ++eid_position) {
-        const urma_eid_info_t& info = eids[eid_position];
-        if ((eid_index_requested && info.eid_index != requested_eid_index) ||
-            std::all_of(info.eid.raw, info.eid.raw + kEidBytes,
-                        [](uint8_t byte) { return byte == 0U; })) {
-          continue;
-        }
-        UrmaCandidate candidate{};
-        candidate.device_name = device->name;
-        candidate.eid_index = info.eid_index;
-        std::memcpy(candidate.eid.data(), info.eid.raw, candidate.eid.size());
-        candidates_.push_back(std::move(candidate));
-      }
-      urma_free_eid_list(eids);
-    }
-    urma_free_device_list(devices);
-
-    std::sort(candidates_.begin(), candidates_.end(),
-              [](const UrmaCandidate& left, const UrmaCandidate& right) {
-                return left.device_name == right.device_name
-                           ? left.eid_index < right.eid_index
-                           : left.device_name < right.device_name;
-              });
     for (uint32_t index = 0U; index < candidates_.size(); ++index) {
       UrmaCandidate& candidate = candidates_[index];
       candidate.id = index;
@@ -380,23 +341,14 @@ class UrmaResourcePool {
       }
       std::fprintf(stderr, "\n");
     }
-    if (candidates_.empty()) {
-      Log("[KVAF_CPU] no usable UB EID candidates");
-      if (!requested_device.empty()) {
-        Log(" for ub_device=%s", requested_device.c_str());
-      }
-      if (eid_index_requested) {
-        Log(" eid_index=%u", requested_eid_index);
-      }
-      Log("\n");
-      return false;
-    }
     return true;
   }
 
   uint32_t CandidateCount() const {
     return static_cast<uint32_t>(candidates_.size());
   }
+
+  const std::vector<UrmaCandidate>& candidates() const { return candidates_; }
 
   UrmaResources* Get(uint32_t candidate_id) {
     if (candidate_id >= candidates_.size()) {
@@ -432,13 +384,10 @@ class UrmaResourcePool {
  private:
   void Shutdown() {
     candidates_.clear();
-    if (initialized_) {
-      (void)urma_uninit();
-      initialized_ = false;
-    }
+    discovery_.Shutdown();
   }
 
-  bool initialized_ = false;
+  CpuUrmaDiscovery discovery_;
   std::vector<UrmaCandidate> candidates_;
 };
 
@@ -550,13 +499,15 @@ class CpuService {
   }
 
   Result CreateChannel(const CreateChannelRequest& request, CreateChannelResponse* response) {
-    if (response == nullptr || request.local_qp_key_bytes != kNpuJettyKeyBytes ||
+    if (response == nullptr ||
+        (request.local_qp_key_bytes != kJettyKeyBytes &&
+         request.local_qp_key_bytes != kNpuJettyKeyBytes) ||
         std::all_of(request.local_eid, request.local_eid + kEidBytes,
                     [](uint8_t byte) { return byte == 0U; }) ||
         request.peer_token_value == 0U || request.local_tp_handle == 0U || request.local_psn == 0U) {
-      Log("[KVAF_CPU] CHANNEL_REJECTED key_bytes=%u expected_npu_key_bytes=%u token=0x%x npu_tp=0x%llx "
-          "npu_psn=0x%x\n",
-          request.local_qp_key_bytes, kNpuJettyKeyBytes, request.peer_token_value,
+      Log("[KVAF_CPU] CHANNEL_REJECTED key_bytes=%u expected_key_bytes=%u/%u token=0x%x peer_tp=0x%llx "
+          "peer_psn=0x%x\n",
+          request.local_qp_key_bytes, kJettyKeyBytes, kNpuJettyKeyBytes, request.peer_token_value,
           static_cast<unsigned long long>(request.local_tp_handle), request.local_psn);
       return Result::kInvalidRequest;
     }
@@ -811,6 +762,7 @@ void HandleClient(int fd, CpuService* service) {
     }
     case Command::kAllocateHbmRegion:
     case Command::kReleaseHbmRegion:
+    case Command::kGetHbmEidCandidate:
       // HBM ownership belongs to NpuService; a CPU service never accepts
       // these commands.
       SendStatus(fd, command, Result::kInvalidRequest);
@@ -856,30 +808,50 @@ Status CpuRuntime::InitializeClient(const CpuRuntimeClientOptions& options) {
   if (peer_address.empty() || options.hbm_bytes == 0U || options.slot_size == 0U ||
       options.hbm_bytes % options.slot_size != 0U)
     return Status::InvalidArgument("CPU HBM client requires peer address and valid HBM size");
+  if (options.prepare_thread_count == 0U || options.prepare_thread_count > 64U) {
+    return Status::InvalidArgument("CPU HBM client prepare_thread_count must be in [1,64]");
+  }
   auto impl = std::make_unique<Impl>();
   impl->client_mode = true;
   impl->peer_link = std::make_shared<peer::PeerLink>(peer_address);
-  impl->hbm_allocator = std::make_unique<PeerHbmAllocator>(impl->peer_link);
-  impl->hbm_allocator->SetDevice(options.device_id, options.eid_index, options.has_eid_index);
-  CpuUrmaTransportOptions transport_options;
-  transport_options.peer_address = peer_address;
-  transport_options.ub_device = options.ub_device;
-  transport_options.has_eid_index = options.has_eid_index;
-  transport_options.eid_index = options.eid_index;
-  transport_options.remote_hbm = true;
-  transport_options.remote_device_id = options.device_id;
-  transport_options.remote_eid_index = options.has_eid_index ? options.eid_index : UINT32_MAX;
-  transport_options.wqes_per_doorbell = options.wqes_per_doorbell;
-  transport_options.remote_sgl_size = options.remote_sgl_size;
-  impl->access_operator = std::make_unique<CpuUrmaAccessOperator>(transport_options, impl->peer_link);
-  impl->meta_manager = CreateInMemoryMetaManager();
-  impl->runtime_core = std::make_unique<RuntimeCore>(*impl->meta_manager, *impl->access_operator,
+  // Keep URMA alive while failed candidate transports are destroyed and retried.
+  if (!impl->resources.Initialize(options.ub_device, options.has_eid_index, options.eid_index)) {
+    return Status::Internal("CPU link candidate discovery failed");
+  }
+  const Status status = SelectCpuUrmaDeviceLink(*impl->peer_link, options.device_id,
+      impl->resources.candidates(), [&](const CpuUrmaCandidate& cpu, std::uint32_t npu_index) -> CpuUrmaLinkAttempt {
+    impl->hbm_allocator = std::make_unique<PeerHbmAllocator>(impl->peer_link);
+    impl->hbm_allocator->SetDevice(options.device_id, npu_index, true);
+    CpuUrmaTransportOptions transport_options;
+    transport_options.peer_address = peer_address;
+    transport_options.wqes_per_doorbell = options.wqes_per_doorbell;
+    transport_options.remote_sgl_size = options.remote_sgl_size;
+    transport_options.prepare_thread_count = options.prepare_thread_count;
+    transport_options = BindCpuUrmaEndpoint(transport_options, cpu, options.device_id, npu_index);
+    impl->access_operator = std::make_unique<CpuUrmaAccessOperator>(transport_options, impl->peer_link);
+    impl->meta_manager = CreateInMemoryMetaManager();
+    impl->runtime_core = std::make_unique<RuntimeCore>(*impl->meta_manager, *impl->access_operator,
                                                      *impl->hbm_allocator);
-  const Status status = impl->runtime_core->Initialize(
-      RuntimeInitRequest{options.hbm_bytes, options.slot_size, DeviceKind::kNpu});
-  if (!status.ok()) return status;
-  impl_ = std::move(impl);
-  return Status::OK();
+    Status attempt = impl->runtime_core->Initialize(
+        RuntimeInitRequest{options.hbm_bytes, options.slot_size, DeviceKind::kNpu});
+    if (attempt.ok()) attempt = impl->access_operator->ValidateLink();
+    if (attempt.ok()) return {attempt, false};
+    if (impl->runtime_core->initialized()) {
+      const Status cleanup = impl->runtime_core->Shutdown();
+      if (!cleanup.ok()) return {cleanup, false};
+    }
+    if (impl->hbm_allocator->has_allocation()) {
+      const Status cleanup = impl->hbm_allocator->Release(RemoteRegionDesc{});
+      if (!cleanup.ok()) return {cleanup, false};
+    }
+    impl->runtime_core.reset();
+    impl->access_operator.reset();
+    impl->meta_manager.reset();
+    impl->hbm_allocator.reset();
+    return {attempt, true};
+  });
+  if (status.ok()) impl_ = std::move(impl);
+  return status;
 }
 
 RuntimeCore& CpuRuntime::core() {
@@ -901,8 +873,15 @@ CpuRuntimeBatchTiming CpuRuntime::last_batch_timing() const {
   }
   const CpuUrmaTransport::BatchTiming timing =
       impl_->access_operator->last_batch_timing();
-  return CpuRuntimeBatchTiming{timing.prepare_ns, timing.post_ns,
-                               timing.poll_ns, timing.total_ns, timing.wr_count};
+  CpuRuntimeBatchTiming result{};
+  result.plan_ns = timing.plan_ns;
+  result.setup_ns = timing.setup_ns;
+  result.prepare_ns = timing.prepare_ns;
+  result.post_ns = timing.post_ns;
+  result.poll_ns = timing.poll_ns;
+  result.total_ns = timing.total_ns;
+  result.wr_count = timing.wr_count;
+  return result;
 }
 
 Status CpuRuntime::LinkTo(const LinkTarget& target) {

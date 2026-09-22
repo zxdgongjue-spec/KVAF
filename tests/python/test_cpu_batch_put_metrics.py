@@ -50,8 +50,11 @@ class MetricsTest(unittest.TestCase):
         self.assertNotEqual(total["p50_GBps"], f"{rounded_bandwidth:.3f}")
 
     def test_invalid_timings_fail_instead_of_becoming_zero_bandwidth(self):
-        valid = dict(total_scope="transport_call", prepare_ns=100,
-                     post_ns=200, poll_ns=300, total_ns=1000, wr_count=4)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(perf.parse_args([]).prepare_threads, 4)
+        valid = dict(total_scope="transport_call", plan_ns=50, setup_ns=50,
+                     prepare_ns=100, post_ns=200, poll_ns=300,
+                     total_ns=1000, wr_count=4)
         self.assertEqual(perf.validate_timing(valid, 2000)["total_ns"], 1000)
         for changes in ({"total_scope": None}, {"total_ns": 0}, {"total_ns": 500},
                         {"total_ns": 2001}, {"poll_ns": -1}, {"post_ns": None},
@@ -66,6 +69,10 @@ class MetricsTest(unittest.TestCase):
             self.assertIsNotNone(perf.validate_args(perf.parse_args(["--remote-sgl-size", str(size)])))
         for size in (31, 32, 256, 1024, 0xFFFFFFFF):
             self.assertIsNone(perf.validate_args(perf.parse_args(["--remote-sgl-size", str(size)])))
+        for count in (0, -1, 65):
+            self.assertIsNotNone(perf.validate_args(perf.parse_args(["--prepare-threads", str(count)])))
+        for count in (1, 8, 64):
+            self.assertIsNone(perf.validate_args(perf.parse_args(["--prepare-threads", str(count)])))
         for removed in ("--sgl-size", "--jettys", "--omp-threads"):
             with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
                 perf.parse_args([removed, "1"])
@@ -78,15 +85,32 @@ class MetricsTest(unittest.TestCase):
                 self.totals = iter([99999999, 88888888, 6001, 10000, 20000, 8000])
 
             def initialize(self, *args, **kwargs):
-                self.scatter = kwargs["remote_sgl_size"] == 31
+                self.gather_limit = min(kwargs["remote_sgl_size"], 13)
+                assert kwargs["prepare_thread_count"] == 8
                 assert not {"sgl_size", "jetty_count", "omp_thread_count"}.intersection(kwargs)
                 self.initialized = True
 
             def batch_put(self, keys, sources, offsets, lengths, miss_count):
-                self.payload = sources[0][:sum(lengths[0][:miss_count])]
+                self.payload = b"".join(
+                    sources[0][offset : offset + length]
+                    for offset, length in zip(
+                        offsets[0][:miss_count], lengths[0][:miss_count]
+                    )
+                )
+                token_bytes = lengths[0][0]
+                assert offsets[0] == [
+                    row * 2 * token_bytes for row in range(len(keys[0]))
+                ]
+                assert all(
+                    sources[0][offset + length : offset + 2 * length]
+                    == b"\xCD" * length
+                    for offset, length in zip(offsets[0], lengths[0])
+                )
+                assert self.payload != sources[0][:len(self.payload)]
                 self.last_batch_timing = dict(total_scope="transport_call", total_ns=next(self.totals),
-                                             prepare_ns=100, post_ns=200, poll_ns=300,
-                                             wr_count=2 if self.scatter else 32)
+                                             plan_ns=20, setup_ns=30, prepare_ns=100,
+                                             post_ns=200, poll_ns=300,
+                                             wr_count=(miss_count + self.gather_limit - 1) // self.gather_limit)
 
             def batch_free(self, keys):
                 self.last_batch_timing = None
@@ -95,6 +119,10 @@ class MetricsTest(unittest.TestCase):
                 return keys
 
             def batch_get(self, table, rows, offsets, output_rows, output, token_bytes):
+                assert rows == list(range(len(table)))
+                assert offsets == [0] * len(table)
+                assert output_rows == rows
+                assert len(output) == len(table) * token_bytes
                 output[:] = self.payload
 
             def release_access_table(self, table):
@@ -110,7 +138,8 @@ class MetricsTest(unittest.TestCase):
              contextlib.redirect_stdout(out):
             self.assertEqual(perf.main(["--request-length", "64", "--miss-count", "32",
                                         "--token-bytes", "128", "--warmup", "1",
-                                        "--iterations", "4", "--remote-sgl-size", "1"]), 0)
+                                        "--iterations", "4", "--remote-sgl-size", "1",
+                                        "--prepare-threads", "8"]), 0)
         result = records(out.getvalue())
         total = result["batch_put_transport_total"]
         self.assertEqual(total["samples"], "4")
@@ -121,8 +150,11 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(total["p50_GBps"], "0.455")
         self.assertEqual(result["batch_put"]["p50_GBps"], "0.046")
         self.assertIn("wr_count_min=32 wr_count_max=32 requested_remote_sgl_size=1", out.getvalue())
-        # With 32 packed rows, remote SGL=31 permits two WQEs despite local
-        # SGL=1. The benchmark must validate against the remote grouping limit.
+        self.assertIn("source_layout=scattered remote_layout=contiguous", out.getvalue())
+        self.assertIn("source_stride_bytes=256 source_bytes=16384", out.getvalue())
+        self.assertIn("sgl_mode=local_gather", out.getvalue())
+        # The legacy remote SGL argument requests local gather. A device with
+        # max_jfs_sge=13 needs three WRs for 32 rows even when 31 is requested.
         scatter_out = io.StringIO()
         with patch.dict(sys.modules, {"kvaf": types.SimpleNamespace(CpuRuntime=FakeRuntime)}), \
              patch.object(perf.time, "perf_counter_ns", side_effect=[
@@ -131,8 +163,9 @@ class MetricsTest(unittest.TestCase):
             self.assertEqual(perf.main(["--request-length", "64", "--miss-count", "32",
                                         "--token-bytes", "128", "--warmup", "1",
                                         "--iterations", "4",
-                                        "--remote-sgl-size", "31"]), 0)
-        self.assertIn("wr_count_min=2 wr_count_max=2 requested_remote_sgl_size=31",
+                                        "--remote-sgl-size", "31",
+                                        "--prepare-threads", "8"]), 0)
+        self.assertIn("wr_count_min=3 wr_count_max=3 requested_remote_sgl_size=31",
                       scatter_out.getvalue())
 
     def test_preflight_payload_distinguishes_rows(self):
@@ -162,6 +195,11 @@ token = int(sys.argv[sys.argv.index("--token-bytes") + 1])
 miss = int(sys.argv[sys.argv.index("--miss-count") + 1])
 assert sys.argv[sys.argv.index("--remote-sgl-size") + 1] == "1"
 perf.print_samples("batch_put_transport_total", [1000, 1001], 0, 8192, miss, token)
+perf.print_samples("batch_put_transport_plan", [40, 41], 0, 8192, miss, token)
+perf.print_samples("batch_put_transport_setup", [60, 61], 0, 8192, miss, token)
+perf.print_samples("batch_put_transport_prepare", [100, 101], 0, 8192, miss, token)
+perf.print_samples("batch_put_transport_post", [200, 201], 0, 8192, miss, token)
+perf.print_samples("batch_put_transport_completion_wait", [300, 301], 0, 8192, miss, token)
 perf.print_samples("batch_put", [10000, 10010], 0, 8192, miss, token)
 ''')
             env = {key: value for key, value in os.environ.items()
@@ -181,16 +219,31 @@ perf.print_samples("batch_put", [10000, 10010], 0, 8192, miss, token)
             with summary.open() as stream:
                 call_rows = list(csv.reader(stream))
             self.assertEqual(rows[0], ["token_bytes", "miss_count", "mean_us", "p50_us",
-                                       "p90_us", "p99_us", "p50_GBps"])
+                                       "p90_us", "p99_us", "p50_GBps",
+                                       "plan_mean_us", "plan_p50_us",
+                                       "plan_p90_us", "plan_p99_us",
+                                       "setup_mean_us", "setup_p50_us",
+                                       "setup_p90_us", "setup_p99_us",
+                                       "prepare_mean_us", "prepare_p50_us",
+                                       "prepare_p90_us", "prepare_p99_us",
+                                       "post_mean_us", "post_p50_us",
+                                       "post_p90_us", "post_p99_us",
+                                       "completion_wait_mean_us", "completion_wait_p50_us",
+                                       "completion_wait_p90_us", "completion_wait_p99_us"])
             pairs = [(token, miss) for token in (128, 256, 512, 656, 1024, 2048, 4096)
                      for miss in (32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)]
             self.assertEqual(len(rows), 64)
             self.assertEqual(len(call_rows), 64)
-            self.assertEqual(call_rows[0], rows[0])
+            self.assertEqual(call_rows[0], rows[0][:7])
             for row, (token, miss) in zip(rows[1:], pairs):
                 self.assertEqual(row, [str(token), str(miss), f"{1.0005:.3f}",
                                        f"{1.0005:.3f}", "1.001", "1.001",
-                                       f"{token * miss / 1000.5:.3f}"])
+                                       f"{token * miss / 1000.5:.3f}",
+                                       "0.041", "0.041", "0.041", "0.041",
+                                       "0.060", "0.060", "0.061", "0.061",
+                                       "0.101", "0.101", "0.101", "0.101",
+                                       "0.201", "0.201", "0.201", "0.201",
+                                       "0.300", "0.300", "0.301", "0.301"])
             for row, (token, miss) in zip(call_rows[1:], pairs):
                 self.assertEqual(row, [str(token), str(miss), "10.005", "10.005",
                                        "10.009", "10.010", f"{token * miss / 10005:.3f}"])
@@ -206,6 +259,11 @@ perf.print_samples("batch_put", [10000, 10010], 0, 8192, miss, token)
             runner.write_text('''#!/usr/bin/env bash
 echo 'PERF_RESULT operation=batch_put mean_us=10 p50_us=10 p90_us=10 p99_us=10 p50_GBps=1'
 echo 'PERF_RESULT operation=batch_put_transport_total mean_us=1 p50_us=1 p90_us=1 p99_us=1'
+echo 'PERF_RESULT operation=batch_put_transport_plan mean_us=0.04 p50_us=0.04 p90_us=0.04 p99_us=0.04'
+echo 'PERF_RESULT operation=batch_put_transport_setup mean_us=0.06 p50_us=0.06 p90_us=0.06 p99_us=0.06'
+echo 'PERF_RESULT operation=batch_put_transport_prepare mean_us=0.1 p50_us=0.1 p90_us=0.1 p99_us=0.1'
+echo 'PERF_RESULT operation=batch_put_transport_post mean_us=0.2 p50_us=0.2 p90_us=0.2 p99_us=0.2'
+echo 'PERF_RESULT operation=batch_put_transport_completion_wait mean_us=0.3 p50_us=0.3 p90_us=0.3 p99_us=0.3'
 ''')
             run = subprocess.run(["bash", str(sweep), str(root / "build")],
                                  env=env, text=True, capture_output=True)

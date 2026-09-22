@@ -35,8 +35,8 @@ tests/run_hbm_rw_client.sh <npu-host> 29888 \
 The client calls `CpuUrmaTransport::Initialize`, which sends the allocation
 request, imports the segment, and creates the CTP/Jetty pair through
 `PeerLink`. Each benchmark operation uses the direct registered host-memory
-path (`Write`/`Read`), so the block address itself is the URMA SGE and no
-bounce-buffer memcpy is performed.
+path (`WriteSglBatch`/`ReadSglBatch`), so the block address itself is the URMA
+SGE and no bounce-buffer memcpy is performed.
 
 ## Random 656-byte block benchmark
 
@@ -58,30 +58,37 @@ HBM. `--host-space-bytes` controls only the CPU-side virtual address range;
 it does not increase the remote HBM allocation.
 
 Bandwidth is calculated from the wall-clock interval covering all WR
-submissions and matching CQ completions. Per-operation latency is measured from
-immediately before `urma_post_jetty_send_wr` until its CQ completion. Allocation,
+submissions and matching CQ completions. Per-batch latency covers the entire
+`WriteSglBatch`/`ReadSglBatch` call and timing retrieval. Allocation,
 registration, import, connection setup, and warmup are excluded. This is the
 achieved CPU-initiated URMA payload rate, not raw HBM silicon bandwidth; with
 656-byte messages it includes per-WR protocol and CQ overhead.
 
 Per-batch transport logs are disabled so terminal I/O does not distort the
-measurement. For the single-SGE OpenMP batch path, the final summary also
-reports average `prepare`, `post`, and `poll` time. The explicitly registered
-host address space is cached as one URMA segment, so batch transfers reuse its
+measurement. The final summary separates non-contiguous batch `plan`,
+per-sub-batch `setup`, WR `prepare`, hardware `post`, and CQ `poll` wall time.
+The contiguous READ path has no separate plan, so its validation remains in
+`setup`. A separate `_WALL` line
+keeps the aggregate `submit_wall`, `other`, and `total`; `submit_wall` already
+contains WR preparation and post, so do not add those fields to it.
+The explicitly registered host address space is cached as one URMA segment,
+so batch transfers reuse its
 `tseg` directly instead of searching the registration list for every block.
 
-The test accepts explicit EIDs for diagnostics, but the default path follows
-the pair-info local/remote EID rule used by the H2D script.
+Each WRITE WR has one contiguous remote SGE and up to the effective local
+source-SGE limit; READ keeps one local and one remote SGE per WR. `--jettys N`
+selects 1 to 16 Jettys; the default is 4. `--prepare-threads N` controls
+parallel grouping and WR preparation. Preparation completes before submission.
+One owner then posts each
+Jetty and polls that Jetty's final CQE; different Jettys submit and poll
+concurrently. Each Jetty queue holds at most 8192 WRs; gathered source blocks
+do not each consume a WR. The CPU HBM client fixes `OMP_WAIT_POLICY=ACTIVE`
+before OpenMP initialization, overriding any inherited policy. It does not
+set CPU affinity; `OMP_PROC_BIND` and `OMP_PLACES` remain caller-controlled.
 
-Each block is one single-SGE WR. The transport uses two fixed Jettys and two
-OpenMP workers. Each worker owns one Jetty, prepares its WR/SGE entries and
-submits each chunk directly. The caller polls the final CQE per Jetty after
-the workers join. Each Jetty supports 1024 outstanding WRs; this standalone
-single-SGE probe accepts at most 2048 blocks per batch.
-
-`--doorbell-wqes N` controls the maximum WRs in each worker's submission.
+`--doorbell-wqes N` controls the maximum WRs in each Jetty owner's submission.
 Zero, the default, submits the complete list for that Jetty. With `N=32`,
-each worker independently prepares and posts up to 32 WRs at a time. This
+each owner independently posts up to 32 prepared WRs at a time. This
 is an API-level batch size; the provider implements the actual doorbell.
 
 ```bash
@@ -90,5 +97,27 @@ tests/run_hbm_rw_client.sh <npu-host> 29888 \
   --iterations 10 --warmup 1
 ```
 
-For packed CPU data to multiple remote addresses, use the production
-`run_cpu_batch_put_perf.sh` script with `--remote-sgl-size N`.
+For the production CPU BatchPut path, use `run_cpu_batch_put_perf.sh` with the
+legacy `--remote-sgl-size N` option.
+`CpuRuntime.initialize(..., remote_sgl_size=N)` and
+`kvaf_cpu_urma_eid_perf --remote-sgl-size N` configure the same WRITE gather.
+
+The CPU HBM client accepts `--remote-sgl-size N` (default 1). Despite its legacy
+name, N requests the maximum number of local source SGEs in one WRITE WR; the
+effective value is clamped by the device's `max_jfs_sge`. The benchmark source
+blocks remain scattered in the registered CPU address space, while their
+destination offsets are contiguous in HBM. A WR may therefore gather unrelated
+CPU SGEs into one contiguous remote SGE. Every source row is kept as a separate
+local SGE even if two CPU addresses happen to be adjacent. A remote gap, the effective local-SGE
+cap, or `max_msg_size` starts a new WR; this path does not construct remote
+scatter. Validation reads the contiguous HBM range into an independent packed
+CPU buffer with one local and one remote SGE per WR, so a WRITE mapping error
+cannot be hidden by reusing the same scattered layout. The summary reports
+actual `wrs`, which may exceed `ceil(blocks / N)`.
+Default N=1 preserves the one-source-SGE-per-WR baseline.
+
+```bash
+./build-cpu/tests/kvaf_cpu_hbm_client HOST:PORT \
+  --device-id 4 --jettys 4 --blocks 2048 --block-bytes 4096 \
+  --remote-sgl-size 8 --warmup 20 --iterations 200
+```

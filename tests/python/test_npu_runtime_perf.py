@@ -33,6 +33,18 @@ DEFAULT_TOKENS_PER_BLOCK = 128
 REQUESTS_PER_BATCH = 2048
 
 
+def make_output(torch, rows: int, row_bytes: int, device_id: int, allocator: str):
+    if allocator == "torch":
+        return torch.empty(
+            (rows, row_bytes), dtype=torch.uint8, device=f"npu:{device_id}"
+        )
+    if allocator == "acl-normal":
+        if not hasattr(kvaf, "NormalHbmBuffer"):
+            raise RuntimeError("rebuild the NPU Python binding for acl-normal output")
+        return kvaf.NormalHbmBuffer(rows, row_bytes, device_id)
+    raise ValueError("HBM allocator must be torch or acl-normal")
+
+
 def percentile(values: list[float], fraction: float) -> float:
     ordered = sorted(values)
     position = fraction * (len(ordered) - 1)
@@ -85,6 +97,11 @@ def main(batch: int = 16) -> int:
     torch = backend.torch
     assert torch is not None
     device_id = int(os.environ.get("DEVICE_ID", "0"))
+    hbm_allocator = os.environ.get("KVAF_RUNTIME_PERF_HBM_ALLOCATOR", "torch")
+    if hbm_allocator not in ("torch", "acl-normal"):
+        print("FAIL: KVAF_RUNTIME_PERF_HBM_ALLOCATOR must be torch or acl-normal", file=sys.stderr)
+        return 2
+    seed = int(os.environ.get("KVAF_RUNTIME_PERF_SEED", "1"))
     batch = int(os.environ.get("KVAF_RUNTIME_PERF_BATCH", str(batch)))
     npu_core_count = int(os.environ.get("KVAF_RUNTIME_PERF_AIV_CORES", str(AIV_CORES)))
     jettys_per_core = int(
@@ -182,6 +199,7 @@ def main(batch: int = 16) -> int:
     lengths = [block_bytes] * PUT_BATCH_SIZE
 
     torch.npu.set_device(device_id)
+    torch.manual_seed(seed)
     device = f"npu:{device_id}"
     token_rows = torch.arange(
         tokens_per_block, dtype=torch.int64, device=device
@@ -198,7 +216,7 @@ def main(batch: int = 16) -> int:
         & 0xFF
     ).to(torch.uint8).contiguous()
     kv_data = entry_pattern.reshape(1, block_bytes).repeat(PUT_BATCH_SIZE, 1)
-    output = torch.empty((requests, token_bytes), dtype=torch.uint8, device=device)
+    output = make_output(torch, requests, token_bytes, device_id, hbm_allocator)
     runtime = kvaf.NpuRuntime(
         str(kernel),
         batch_get_token_bytes=token_bytes,
@@ -228,6 +246,9 @@ def main(batch: int = 16) -> int:
             f"source_stride={source_stride} "
             f"aiv_cores={npu_core_count} jettys_per_core={jettys_per_core} "
             f"warmup={warmup} iterations={iterations} "
+            f"hbm_allocator={hbm_allocator} seed={seed} "
+            f"output_bytes={requests * token_bytes} "
+            f"output_address=0x{output.data_ptr():x} "
             "batch_put_backend=aiv_direct_hccp timing=call_to_stream_completion"
         )
 
@@ -252,8 +273,8 @@ def main(batch: int = 16) -> int:
         preflight_indices = torch.arange(PUT_BATCH_SIZE, dtype=torch.int32, device=device)
         preflight_offsets = torch.zeros(PUT_BATCH_SIZE, dtype=torch.int32, device=device)
         preflight_mask = torch.ones(PUT_BATCH_SIZE, dtype=torch.uint8, device=device)
-        preflight_output = torch.empty(
-            (PUT_BATCH_SIZE, token_bytes), dtype=torch.uint8, device=device
+        preflight_output = make_output(
+            torch, PUT_BATCH_SIZE, token_bytes, device_id, hbm_allocator
         )
         runtime.batch_get(
             preflight_device_table,
@@ -265,8 +286,8 @@ def main(batch: int = 16) -> int:
         )
         torch.npu.synchronize()
         if not torch.equal(
-            preflight_output,
-            entry_pattern[0].expand(PUT_BATCH_SIZE, -1),
+            preflight_output.cpu(),
+            entry_pattern[0].cpu().expand(PUT_BATCH_SIZE, -1),
         ):
             raise AssertionError("Runtime performance preflight BatchPut/BatchGet validation failed")
         runtime.release_access_table(preflight_table)
@@ -435,6 +456,15 @@ def main(batch: int = 16) -> int:
         )
         print("RUNTIME_PERF_PHASE_DONE phase=batch_get")
 
+        # Validate the final active destinations outside the measured interval.
+        active = mask.bool()
+        output_host = output.cpu()
+        expected = entry_pattern.cpu()[(source_token_ids % tokens_per_block)[active].cpu().long()]
+        actual = output_host[output_indices[active].cpu().long()]
+        if not torch.equal(actual, expected):
+            raise AssertionError("BatchGet output allocator validation failed")
+        print(f"RUNTIME_PERF_CORRECTNESS_PASS phase=batch_get hbm_allocator={hbm_allocator}")
+
         # The full-table lock must be released before BatchFree can reclaim its
         # entries. DeviceAccessTable is no longer used after BatchGet.
         print("RUNTIME_PERF_PHASE_BEGIN phase=release_access_table")
@@ -479,6 +509,10 @@ def main(batch: int = 16) -> int:
             shutdown_ms = (time.perf_counter() - begin) * 1000.0
             print(f"PERF_RESULT operation=shutdown samples=1 elapsed_ms={shutdown_ms:.3f} kind=lifecycle")
         print("RUNTIME_PERF_PHASE_DONE phase=shutdown")
+        # Runtime caches the HBM registration, so raw allocations outlive shutdown.
+        output = None
+        if "preflight_output" in locals():
+            preflight_output = None
 
 
 if __name__ == "__main__":

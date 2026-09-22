@@ -36,22 +36,30 @@ struct CpuUrmaTransportOptions {
   bool remote_hbm{false};
   std::uint32_t remote_device_id{0};
   std::uint32_t remote_eid_index{0};
-  // Streaming wave size and number of WRs submitted per
+  // Number of WRs submitted per
   // urma_post_jetty_send_wr call. Zero prepares and submits one full linked
   // list per Jetty.
   std::uint32_t wqes_per_doorbell{0};
-  // WRITE only: values > 1 enable one contiguous local SGE -> multiple
-  // remote SGEs. Requests above device capacity are split across WRs.
+  // Legacy public name. WRITE gathers up to this many local source SGEs into
+  // one contiguous remote HBM SGE. Every input row remains a distinct SGE.
+  // Device max_jfs_sge, max_msg_size, or a remote gap may split the WR earlier.
   std::uint32_t remote_sgl_size{1};
+  // Number of independent Jettys and their submission/CQ owners.
+  std::uint32_t jetty_count{4};
   bool has_external_region{false};
   peer::PeerRegion external_region{};
+  // Maximum CPU workers used by batch planning and descriptor preparation.
+  // WRITE uses at most one worker per Jetty owner.
+  std::uint32_t prepare_thread_count{4};
 };
 
 class CpuUrmaTransport final {
  public:
   struct BatchTiming {
-    // Preparation/submission time of the worker with the longest combined
-    // prepare+post duration; concurrent workers are not summed.
+    // Wall timeline for WR construction, hardware posting and CQ completion.
+    // WRITE workers poll their assigned Jettys without a global post barrier:
+    // post_ns ends at the last post, and poll_ns is the remaining tail until
+    // the last CQE. Concurrent worker time is not summed, so phases add up.
     std::uint64_t prepare_ns{0};
     std::uint64_t post_ns{0};
     std::uint64_t poll_ns{0};
@@ -59,6 +67,12 @@ class CpuUrmaTransport final {
     // Includes validation, workspace/segment lookup and gaps between chunks.
     std::uint64_t total_ns{0};
     std::uint64_t wr_count{0};
+    // Per-sub-batch validation, workspace sizing and host segment selection.
+    std::uint64_t setup_ns{0};
+    // Entire prepare/post call, including OpenMP scheduling and joining.
+    std::uint64_t dispatch_ns{0};
+    // Pre-validation and WRITE grouping for non-contiguous batch APIs.
+    std::uint64_t plan_ns{0};
   };
 
   CpuUrmaTransport();
@@ -68,19 +82,22 @@ class CpuUrmaTransport final {
   CpuUrmaTransport& operator=(const CpuUrmaTransport&) = delete;
 
   Status Initialize(const CpuUrmaTransportOptions& options);
+  // Verify all Jettys with small WRITEs and completion before selecting a link.
+  Status ValidateLink();
   struct HostSge {
     void* data;
     std::size_t bytes;
   };
-  // One local SGE per WR. Two fixed workers each own a Jetty and prepare
-  // and submit its batches independently; completion is polled after joining.
+  // Legacy one-local-SGE API for a packed remote range. Preparation may span
+  // more CPU workers than Jettys; after a barrier, each Jetty has one
+  // submission and CQ owner.
   Status WriteSglBatch(std::uint64_t remote_offset, const HostSge* sources,
                        std::size_t count);
-  // CPU BatchPut path: transfer packed CPU DRAM rows into independent HBM
-  // destinations. This is the CPU-initiated equivalent of AIV BatchGet READs.
-  // With remote_sgl_size > 1, adjacent local rows share one source SGE and
-  // a WR containing up to remote_sgl_size remote destinations. Otherwise,
-  // each row uses one WR.
+  // CPU BatchPut path: gather CPU DRAM rows into HBM destinations. This is the
+  // CPU-initiated equivalent of AIV BatchGet READs.
+  // With remote_sgl_size > 1, rows targeting adjacent HBM ranges may share one
+  // WR even when their local CPU addresses are unrelated. The WR gathers one
+  // or more local source SGEs into one contiguous remote destination SGE.
   // Queue capacity is applied after grouping, with shared completion fences.
   Status WriteBatch(const std::uint64_t* remote_offsets,
                     const HostSge* sources, std::size_t count);

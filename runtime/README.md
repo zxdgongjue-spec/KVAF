@@ -79,6 +79,12 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 负责 UMDK 本地 buffer、CTP/Jetty 导入，并通过 URMA 发起 READ/WRITE。HBM 的
 `urma_seg_t` descriptor 在 TCP 上原样传输，不依赖 `urma_admin`。
 
+HBM 分配策略由 `--hbm-allocator normal|huge` 配置，默认 `huge`：
+`normal` 使用 `ACL_MEM_MALLOC_NORMAL_ONLY`，`huge` 使用
+`ACL_MEM_MALLOC_HUGE_FIRST` 优先分配大页，大页不足时可能回退到普通页。
+启动日志 `HBM_ALLOCATOR` 打印所选策略（不代表实际页大小）。两种模式的
+Direct-HCCP 注册都使用 non-pin device-memory 路径。切换模式需要重启服务。
+
 构建：
 
 ```bash
@@ -87,7 +93,7 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 ```
 
 启动 NPU HBM service（默认监听 `127.0.0.1:28999`）。不指定 `--device-id` 时，服务会在 CPU
-第一次申请时按请求选择 NPU device，并缓存该 device 的 HBM context：
+第一次申请时按请求选择 NPU device，并按 device 和 EID 候选缓存 HBM context：
 
 ```bash
 build-npu/runtime/kvaf_npu_service --listen 0.0.0.0 --port 28999
@@ -102,27 +108,94 @@ build-cpu/runtime/kvaf_cpu_runtime_npu_hbm_e2e \
   --doorbell-wqes 32
 ```
 
-CPU URMA 固定创建 2 个 Jetty，并使用 2 个 OpenMP worker，每条 WR 的本地
-SGE 数固定为 1。常量位于 `cpu_urma_transport.cc`：`kJettyCount`、
-`kOmpThreadCount`、`kLocalSgeCount`。不再提供 `jetty_count`、`omp_thread_count`、
-`sgl_size` 初始化参数或对应命令行选项。
+CPU 初始化按 UB 设备名、EID index 顺序遍历本地候选，逐个尝试 NPU 的 EID
+候选。NPU 候选与 AIV 共用发现逻辑：先取指定物理设备的 HCCL CLOS EID，再追加
+去重后的 `pair_info` EID。每组建链后在四个 CPU Jetty 上各做一次最多 64B 的
+WRITE 并等待 CQ；第一组成功即选用，失败则释放本次资源后继续尝试。日志
+`LINK_ATTEMPT`、`LINK_FAILED`、`LINK_SELECTED` 记录所选路径，不进行带宽排名。
+客户端的 `--ub-device`、`--eid-index` 只筛选 CPU 本地候选。
+候选查询使用控制协议 v5，CPU 客户端与 NPU 服务端需要一起重新构建、重启。
 
-每个 worker 独占一个 Jetty 的 WR 链表、SQ 和提交操作，构造好一批就直接提交，
-不需要等待另一个 Jetty 的构造完成。`wqes_per_doorbell > 0` 控制每批 WR 数，
-为 0（默认）时每个 worker 构造完整 Jetty 链表后提交；两种方式都由 worker
-自行下发。每个 Jetty 最后一个 WR 使用 strong-order 并请求 CQE，worker 汇合后
-由调用线程轮询完成。队列深度为每个 Jetty 1024 个 WR。
+逐条比较 EID 链路带宽，可在 CPU 侧运行独立测试（`./build.sh cpu` 会构建该程序）：
 
-`CpuRuntime.initialize(..., remote_sgl_size=N)` 控制 WRITE 的远端 SGL 分组。
-默认 1 是单条 WR 对应一条数据的基线。大于 1 时，一个连续本地 DDR SGE 可以
-写入多个指定 HBM 地址，不增加 host memcpy；本地地址不连续、达到有效远端 SGE
-数量或累计长度超过 uint32 上限时拆分 WR。READ 保持每条 WR 一个本地和一个远端
-SGE。已注册的完整 CPU 输入复用原 segment；否则查找或注册覆盖整个源区间的 segment。
+```bash
+./build-cpu/tests/kvaf_cpu_urma_eid_perf \
+  --peer 127.0.0.1:29888 --device-id 3 \
+  --output results/cpu_urma_eid_bandwidth.csv
+```
 
-不设固定的 31 上限。请求值为正 uint32，实际每条 WR 的远端 SGE 数上限取请求值、
-设备 `max_jfs_rsge` 和 Jetty ABI 字段容量中的较小值。例如请求 128、设备报告 31，
-实际按最多 31 个分组；日志同时打印请求值和生效值。6000 条连续本地行在生效值为 1
-时生成 6000 个 WQE，为 31 时生成 194 个（累计长度未超限）。
+`--peer` 指向已启动的 NPU HBM service；按部署修改地址、端口和 NPU device ID。
+测试遍历所有本地 UB 设备的非零 EID × 指定 NPU device 的全部候选 EID。
+每次固定一个组合，建立四条独立 Jetty 通道，探测成功后执行完整 WRITE/READ
+回读校验，再 warmup 和采样，最后再次回读校验。失败组合记录原因后继续下一组，
+不会自动切换到另一条链路。每组结束先销毁 transport 再释放远端 HBM；若释放失败，
+停止遍历并保留已收集的结果。
+
+默认 `--count 8192 --token-bytes 4096 --remote-sgl-size 1 --prepare-threads 4`
+和 `--warmup 5 --iterations 100`，
+即每次 WRITE 32 MiB，8192 条 WR；本地和远端行地址均连续。所有组合使用相同负载，
+固定 4 个 Jetty，最多使用指定数量的 planning/WR preparation worker，
+`wqes_per_doorbell=0`。这些负载选项可按需修改。
+测量范围为现有 `transport.total_ns`（包含分组、参数检查、segment 查找、WR 构造、
+提交和完成等待），不包含建链、预注册内存、回读校验和 warmup，也不经过 Runtime/Python。
+`mean_GBps = payload_bytes / mean_ns`，使用十进制 GB/s。
+
+CSV 每个 EID 组合一行，写完立即 flush；包括两端设备/EID index/EID、导出的 segment EID、
+状态及错误、负载参数、实际 WR 数、平均/p50/p99 延迟、平均/p50 带宽和
+plan/setup/prepare/post/completion wait 平均耗时。`remote_sgl_size` 列是请求值，
+`prepare_threads` 列是配置的最大准备线程数；实际分组仍按设备能力限制，
+可结合 `wr_count_min/max` 和 transport 日志确认。失败行的性能字段留空。
+终端最后输出成功组合按平均带宽降序排列的 `EID_PERF_RANK`，以及包含 CSV 路径的
+`EID_PERF_SUMMARY`。无成功组合或资源清理失败时返回非零退出码。
+
+绑核对比可使用下面的测试入口，负载和 CSV 格式与上述程序一致：
+
+```bash
+tests/run_cpu_urma_eid_perf_pinned.sh "$PWD/build-cpu" \
+  --peer 127.0.0.1:29888 --device-id 3 \
+  --count 8192 --token-bytes 4096 --remote-sgl-size 1 \
+  --output results/cpu_urma_eid_bandwidth_pinned.csv
+```
+
+脚本在 Linux 上从调用进程允许使用的 CPU 中选四个不同物理核，优先选同一
+NUMA 节点。该脚本固定 `OMP_THREAD_LIMIT=4`，因此只适合四线程绑核基线；测试
+更多 `prepare_threads` 时应直接运行 benchmark，并提供覆盖相应核数的 affinity。
+`EID_PERF_AFFINITY` 输出目标 CPU/NUMA 节点，OpenMP 的 affinity 日志显示实际线程绑定。
+此方式没有在每批传输中增加设置/恢复 affinity 的系统调用。
+脚本不自动判断 UB 设备所在的 NUMA 节点；需要指定核时，在命令前加
+`taskset -c 8,10,12,14`（按实际拓扑修改），脚本会在该集合内选核。
+绑核仅对本次启动的测试进程生效，未绑核基线可直接运行原测试程序并使用另一份 CSV。
+
+由于 `951ce25` 在设备上出现 SIGBUS 回归，`./build.sh cpu` 清空全局
+`CMAKE_BUILD_TYPE`。CPU-only 的规划/准备 helper 使用函数级优化，URMA 初始化和 provider
+调用仍保持已验证的编译方式。
+
+CPU URMA 默认创建 4 个 Jetty。WRITE 每条 WR 可包含多个本地 source SGE，READ
+仍固定为一个本地和一个远端 SGE。WRITE 统一先完成校验和分组，再并行构造 WR；
+`prepare_thread_count` 控制规划和准备的并行度。
+
+每个 CPU Jetty 的 `CreateChannel` 请求都会在 NPU 服务端创建独立的目标
+Jetty 和 CQ；四条通道共享 HBM segment、token 和设备 context。服务端
+`CHANNEL_READY` 日志中的 `channel_index`、`target_jetty_id` 和
+`target_jfc_id` 可用于确认通道对应关系。释放 HBM session 时先释放各通道，
+再注销并释放 HBM。此行为需要重新构建并重启 `kvaf_npu_service`。
+
+输入校验和分组先按行切片并行执行，WR/SGE 槽位也由 preparation worker 并行
+构造；barrier 之后，每个 Jetty 仅由一个 owner 操作 WR 链、SQ 和 doorbell。
+`wqes_per_doorbell > 0` 控制每次 post 的 WR 数，为 0（默认）时 owner 一次提交
+完整 Jetty 链。每个 Jetty 仅最后一个 WR 请求 CQE，各 owner 并行轮询独立 JFC。
+WRITE 和 READ 的 `comp_order` 均为 1，中间 WR 使用 relax-order，最后一个 WR 使用
+strong-order 并请求 CQE。CPU JFS/JFR 深度为 8192，JFC 深度为 16384；
+NPU 每条目标通道的 SQ/RQ 深度为 1024，CQ 深度为 16384。
+
+`CpuRuntime.initialize(..., remote_sgl_size=N)` 保留了旧参数名；对 WRITE，它请求每条
+WR 最多包含 N 个本地 CPU source SGE，生效值按设备 `max_jfs_sge` 截断。默认 1 是
+每条 WR 一个 source SGE 的基线。N 大于 1 时，本地地址可以离散；只要对应的远端 HBM
+地址连续且累计长度不超过 `max_msg_size`，这些本地 SGE 就 gather 到同一个连续 remote
+SGE。每一行始终占用一个 local SGE，即使相邻行的 CPU 地址连续也不会合并。远端地址
+出现 gap、达到本地 SGE 上限或达到 `max_msg_size` 都会拆分 WR。这是
+local gather，不是 remote scatter；READ 保持每条 WR 一个本地和一个远端 SGE。日志
+同时打印请求值和生效值。
 
 基线命令：
 
@@ -139,7 +212,7 @@ worker 的两项时间，不把并行 worker 的时间相加；`poll_ns` 为汇�
 
 Python HBM 集成测试与性能脚本支持 `KVAF_CPU_URMA_REMOTE_SGL_SIZE` 和
 `KVAF_CPU_URMA_DOORBELL_WQES`。设备上的实际 WRITE 提交及回读校验用于确认
-provider 的多远端 SGE 行为。
+合并后的连续 WRITE 行为。
 
 CPU URMA transport/operator 的源码归属 `access_operator/include/cpu_urma` 和
 `access_operator/src/cpu_urma`；Runtime 仅负责 HBM region、MetaManager 和 operator
@@ -159,6 +232,11 @@ tests/run_cpu_batch_put_miss_count_perf.sh "$PWD/build-cpu" \
   --request-length 8192 --doorbell-wqes 32 \
   --remote-sgl-size 8 --iterations 1000 --warmup 5
 ```
+
+The runner sets `OMP_WAIT_POLICY=ACTIVE` before launching Python so the
+OpenMP submission workers do not sleep between batches. CPU placement remains
+caller-controlled; set `OMP_PROC_BIND=close OMP_PLACES=cores` explicitly when
+dedicated nearby cores have been selected for the benchmark.
 
 脚本默认扫描 `token_bytes={128,256,512,656,1024,2048,4096}` 和
 `miss_count={32,64,128,256,512,1024,2048,4096,8192}`，共 63 种组合；因此
@@ -420,3 +498,71 @@ Jetty 数量可通过
 填充。
 脚本以 CPU `torch.int64` Tensor 传入全量 Prepare key，避免 Python `list[int]` 转换污染
 这项控制面性能数据。
+
+### AIV BatchGet HBM Allocation Comparison
+
+For a focused benchmark with three terminal summary lines, use the independent
+test below. It populates only the requested CPU region once and measures only
+BatchGet through device completion. Every request is active (no miss-count
+grouping). Preparation, preflight, warmup, verification and teardown are outside
+the measured samples. The complete native output and failure traceback are
+saved to the temporary log named in the PASS/FAIL line.
+
+```bash
+# CPU host: keep this service running.
+./build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999
+
+# NPU host: use the same build for all output allocators.
+for allocator in torch acl-normal acl-huge; do
+  python3 tests/python/aiv_batch_get_bw.py \
+    --peer CPU_HOST:28999 --build-dir build-npu \
+    --allocator "$allocator" --blocks 2048 --block-bytes 4096 \
+    --cores 32 --jettys-per-core 2 --warmup 20 --iterations 200
+done
+```
+
+`--blocks 1024 --block-bytes 4096` transfers exactly 4 MiB;
+`--blocks 2048 --block-bytes 4096` transfers exactly 8 MiB. For the same 8 MiB
+with fewer WRs, use `--blocks 128 --block-bytes 65536`. The default address
+pattern is sequential; `--pattern random` uses fixed-seed permutations of
+both source and destination rows. Each iteration reuses that request plan.
+
+`KVAF_RUNTIME_PERF_HBM_ALLOCATOR=torch` (default) uses the caller's
+`torch.empty` output. `acl-normal` uses an owned `NormalHbmBuffer` allocated
+with `aclrtMalloc(ACL_MEM_MALLOC_NORMAL_ONLY)`, matching the previous NpuService policy and
+bypassing the Torch allocator. The raw buffer is accepted only as BatchGet
+output; it is not a Torch Tensor. Allocation and CPU readback validation are
+outside the timed loop. The benchmark releases the buffer after Runtime
+shutdown, because Runtime caches its Direct-HCCP registration.
+
+The focused `aiv_batch_get_bw.py` test also accepts `--allocator acl-huge`.
+It uses the same raw buffer and `aclrtMalloc` call as `acl-normal`, changing
+only the policy to `ACL_MEM_MALLOC_HUGE_FIRST`. Allocation size, registration
+and timing are unchanged; it does not use the Torch memory pool. HUGE_FIRST
+prefers huge pages but may fall back to normal pages, so the mode name does
+not prove the actual page size. Rebuild the NPU binding before using it.
+
+After rebuilding `build-npu`, set the same settings for both runs:
+
+```bash
+export KVAF_CPU_SERVICE_ADDR=CPU_HOST:28999
+export DEVICE_ID=0
+export KVAF_RUNTIME_PERF_REQUESTS=2048
+export KVAF_RUNTIME_PERF_TOKEN_BYTES=4096
+export KVAF_RUNTIME_PERF_TOKENS_PER_BLOCK=1
+export KVAF_RUNTIME_PERF_TABLE_CAPACITY=32768
+export KVAF_RUNTIME_PERF_ACTIVE_PERCENT=100
+export KVAF_RUNTIME_PERF_WARMUP=20
+export KVAF_RUNTIME_PERF_ITERATIONS=200
+
+KVAF_RUNTIME_PERF_HBM_ALLOCATOR=torch \
+  tests/run_remote_cpu_runtime_perf.sh "$PWD/build-npu"
+KVAF_RUNTIME_PERF_HBM_ALLOCATOR=acl-normal \
+  tests/run_remote_cpu_runtime_perf.sh "$PWD/build-npu"
+```
+
+Both modes allocate an 8 MiB output and populate 128 MiB of remote CPU memory.
+The existing miss-count contract allows at most 2047 active requests per
+2048-request group, so the actual payload is 8 MiB minus 4 KiB. Compare the
+`operation=batch_get` result, whose timing includes stream completion, and
+check `RUNTIME_PERF_CORRECTNESS_PASS phase=batch_get`.
