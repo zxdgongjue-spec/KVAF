@@ -15,11 +15,14 @@
 
 namespace kvaf::aicpu_test {
 // Test-only commands; never change the production Runtime protocol.
-constexpr auto kConfigure = static_cast<peer::Command>(0x7000);
+// v2 configure carries the requested NPU device ID. An older server must not
+// silently ignore it and allocate on its default device.
+constexpr auto kConfigure = static_cast<peer::Command>(0x7002);
 constexpr auto kStart = static_cast<peer::Command>(0x7001);
+constexpr auto kResetSetup = static_cast<peer::Command>(0x7003);
 struct ConfigureRequest {
   peer::MessageHeader header;
-  std::uint32_t reserved{};
+  std::uint32_t device_id{};
   Config config;
 };
 struct Ack { std::uint64_t magic{kMagic}; std::uint64_t status{}; };
@@ -33,6 +36,13 @@ static_assert(sizeof(ConfigureRequest) == 64 && sizeof(Ack) == 16 && sizeof(Repo
 
 inline void Require(bool ok, const std::string& message) {
   if (!ok) throw std::runtime_error(message);
+}
+inline std::uint32_t SelectDevice(std::uint32_t requested, bool pinned, std::uint32_t device) {
+  Require(requested <= INT32_MAX, "invalid NPU device-id");
+  Require(!pinned || requested == device,
+          "CPU requested NPU device-id=" + std::to_string(requested) +
+          " but server is pinned to device-id=" + std::to_string(device));
+  return requested;
 }
 class Socket {
  public:

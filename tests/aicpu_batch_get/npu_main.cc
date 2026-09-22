@@ -9,6 +9,7 @@ namespace {
 using namespace kvaf::aicpu_test;
 struct Options {
   std::uint32_t device{};
+  bool has_device{};
   std::uint16_t port{29991};
   std::string eid, json;
 };
@@ -21,7 +22,8 @@ Options Parse(int argc, char** argv) {
     if (flag == "--kernel-json") o.json = value;
     else if (flag == "--eid") o.eid = value;
     else if (flag == "--device-id") {
-      const auto n = Number(value); Require(n <= INT32_MAX, "invalid device ID"); o.device = n;
+      const auto n = Number(value); Require(n <= INT32_MAX, "invalid device ID");
+      o.device = n; o.has_device = true;
     } else if (flag == "--port") {
       const auto n = Number(value); Require(n > 0 && n <= UINT16_MAX, "invalid port"); o.port = n;
     } else throw std::runtime_error("unknown option " + flag);
@@ -151,14 +153,39 @@ void Run(const Options& options) {
     Require(kvaf::peer::IsValidHeader(request.header, kConfigure, sizeof(request)) &&
             MakeLayout(request.config, &layout), "invalid configure request");
     config = request.config;
-    target.Initialize(options.device, options.eid, layout.region_bytes);
+    try {
+      const auto device = SelectDevice(request.device_id, options.has_device, options.device);
+      std::fprintf(stderr, "AICPU_GET_NPU device-id=%u selected by CPU request\n", device);
+      target.Initialize(device, options.eid, layout.region_bytes);
+    } catch (...) {
+      kvaf::peer::AllocateHbmRegionResponse failed{};
+      failed.header = kvaf::peer::MakeHeader(kConfigure, sizeof(failed));
+      failed.header.command = kvaf::peer::ResponseCommand(kConfigure);
+      failed.result = static_cast<std::int32_t>(kvaf::peer::Result::kInvalidRequest);
+      Send(fd.get(), &failed, sizeof(failed));
+      throw;
+    }
     const auto& response = target.exported(); Send(fd.get(), &response, sizeof(response));
   }
   for (;;) {
     Socket fd(Accept(listener.get())); SocketTimeout(fd.get(), config.timeout_ms + 120000);
     kvaf::peer::MessageHeader header{}; Receive(fd.get(), &header, sizeof(header));
+    if (kvaf::peer::IsValidHeader(header, kResetSetup, sizeof(header))) {
+      target.ResetSetup();
+      Ack ack{}; Send(fd.get(), &ack, sizeof(ack));
+      continue;
+    }
     if (header.command == static_cast<std::uint16_t>(kvaf::peer::Command::kCreateChannel)) {
-      target.CreateChannel(fd.get(), header); continue;
+      try { target.CreateChannel(fd.get(), header); }
+      catch (const std::exception& e) {
+        std::fprintf(stderr, "AICPU_GET_NPU channel setup failed: %s\n", e.what());
+        kvaf::peer::CreateChannelResponse failed{};
+        failed.header = kvaf::peer::MakeHeader(kvaf::peer::Command::kCreateChannel, sizeof(failed));
+        failed.header.command = kvaf::peer::ResponseCommand(kvaf::peer::Command::kCreateChannel);
+        failed.result = static_cast<std::int32_t>(kvaf::peer::Result::kResourceError);
+        Send(fd.get(), &failed, sizeof(failed));
+      }
+      continue;
     }
     Require(kvaf::peer::IsValidHeader(header, kStart, sizeof(header)), "expected START");
     Report report{};

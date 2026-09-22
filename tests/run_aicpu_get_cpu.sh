@@ -9,7 +9,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help)
       cat <<'EOF'
-Usage: tests/run_aicpu_get_cpu.sh --peer NPU_HOST:29991 [options]
+Usage: tests/run_aicpu_get_cpu.sh --peer NPU_HOST:29991 --device-id N [options]
 
 Wrapper options:
   --build-dir DIR    Default: build-aicpu-cpu (or KVAF_AICPU_CPU_BUILD_DIR)
@@ -17,11 +17,13 @@ Wrapper options:
   --output FILE      Save CSV and also print it to stdout
 
 All other options go to kvaf_aicpu_get_cpu, for example:
-  --ub-device NAME --eid-index N --rows 8192 --row-bytes 4096
+  --device-id 4 --rows 8192 --row-bytes 4096
   --warmup 5 --iterations 100 --remote-sgl-size 16 --jettys 4
   --prepare-threads 4 --wqes-per-doorbell 0 --timeout-ms 30000
 
 Start the NPU script first. Restart it for every test invocation.
+device-id selects the remote NPU (default 0); CPU UB/EID selection is automatic.
+Optional diagnostic overrides: --ub-device NAME --eid-index N.
 Build: bash build.sh aicpu-cpu
 EOF
       exit 0 ;;

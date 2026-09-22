@@ -78,6 +78,8 @@ class NpuTarget {
   }
   void* memory() const { return memory_; }
   const peer::AllocateHbmRegionResponse& exported() const { return exported_; }
+  // Called only after a failed Initialize, before any data probe or kernel.
+  void ResetSetup() { while (channels_.size() > 1) channels_.pop_back(); }
   void CreateChannel(int fd, const peer::MessageHeader& header) {
     Require(peer::IsValidHeader(header, peer::Command::kCreateChannel,
                                sizeof(peer::CreateChannelRequest)), "invalid CreateChannel header");

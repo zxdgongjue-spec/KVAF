@@ -1,4 +1,5 @@
 #include "control.h"
+#include "cpu_discovery.h"
 #include "cpu_urma/cpu_urma_transport.h"
 
 #include <chrono>
@@ -33,6 +34,9 @@ Options Parse(int argc, char** argv) {
     else {
       Require(n <= UINT32_MAX, "option exceeds uint32");
       if (flag == "--eid-index") { o.transport.has_eid_index = true; o.transport.eid_index = n; }
+      else if (flag == "--device-id") {
+        Require(n <= INT32_MAX, "invalid NPU device-id"); o.transport.remote_device_id = n;
+      }
       else if (flag == "--remote-sgl-size") o.transport.remote_sgl_size = n;
       else if (flag == "--jettys") o.transport.jetty_count = n;
       else if (flag == "--prepare-threads") o.transport.prepare_thread_count = n;
@@ -53,13 +57,15 @@ kvaf::peer::PeerRegion Configure(const Options& options) {
   SocketTimeout(socket.get(), 120000);
   ConfigureRequest request{};
   request.header = kvaf::peer::MakeHeader(kConfigure, sizeof(request));
+  request.device_id = options.transport.remote_device_id;
   request.config = options.config;
   Send(socket.get(), &request, sizeof(request));
   kvaf::peer::AllocateHbmRegionResponse reply{};
   Receive(socket.get(), &reply, sizeof(reply));
   Require(kvaf::peer::IsValidResponseHeader(reply.header, kConfigure, sizeof(reply)) &&
           reply.result == 0 && reply.segment_key_bytes <= kvaf::peer::kSegKeyBytes &&
-          reply.jetty_key_bytes <= kvaf::peer::kQpKeyBytes, "NPU configure/export failed");
+          reply.jetty_key_bytes <= kvaf::peer::kQpKeyBytes,
+          "NPU configure/export failed; check device-id and update both test binaries");
   kvaf::peer::PeerRegion region{};
   region.session_id = reply.session_id; region.base = reply.hbm_base;
   region.length = reply.hbm_bytes; region.device_memory = true;
@@ -72,6 +78,8 @@ kvaf::peer::PeerRegion Configure(const Options& options) {
   return region;
 }
 void Run(Options options) {
+  UrmaLifetime urma;
+  const auto candidates = DiscoverCpuCandidates(options.transport);
   Layout layout{}; Require(MakeLayout(options.config, &layout), "invalid layout");
   // One page-aligned registered allocation contains source rows and both
   // host-side control buffers. It outlives transport destruction on all paths.
@@ -95,9 +103,16 @@ void Run(Options options) {
   options.transport.has_external_region = true;
   options.transport.region_bytes = layout.region_bytes;
   CpuUrmaTransport transport;
-  Check(transport.Initialize(options.transport));
+  Check(SelectCpuTransport(options.transport, candidates, transport, [&] {
+    Socket socket(Connect(options.transport.peer_address));
+    SocketTimeout(socket.get(), 120000);
+    const auto header = kvaf::peer::MakeHeader(kResetSetup, sizeof(kvaf::peer::MessageHeader));
+    Send(socket.get(), &header, sizeof(header));
+    Ack ack{}; Receive(socket.get(), &ack, sizeof(ack));
+    return ack.magic == kMagic && ack.status == 0 ? kvaf::Status::OK() :
+        kvaf::Status::Internal("cannot reset failed channel setup");
+  }));
   // ValidateLink writes at offset zero. Restore the request record afterward.
-  Check(transport.ValidateLink());
   Check(transport.RegisterDirectHostMemory(memory, bytes));
   CpuUrmaTransport::HostSge request_sge{request, sizeof(*request)}, done_sge{done, sizeof(*done)};
   Check(transport.WriteSglBatch(kRequestOffset, &request_sge, 1));

@@ -24,6 +24,9 @@ CPU source 每行之间有 64 字节空隙，NPU staging 连续，输出按反�
 
 ## 快速构建和运行（推荐）
 
+升级 device-id 版本后，必须重新编译并重启 CPU/NPU 两端程序；旧程序不支持新建链协议。
+AICPU kernel ABI 没变，仅此次更新不需要重新安装 device kernel。
+
 在两端的仓库根目录执行。`build.sh` 自动查找 CANN/UMDK；UMDK 未安装时
 沿用已有脚本逻辑获取固定版本。已有 UMDK 可以通过 `KVAF_UMDK_ROOT` 指定，
 已有 liburma 可以通过 `KVAF_URMA_LIBRARY` 指定。两个新模式不构建 Python 或 AIV。
@@ -38,27 +41,27 @@ NPU 端加载本机 CANN 环境后构建，首次运行或重新构建 kernel �
 
 ```bash
 bash build.sh aicpu-npu
-bash tests/run_aicpu_get_npu.sh --install-kernel --device-id 0
+bash tests/run_aicpu_get_npu.sh --install-kernel --device-id 4
 ```
 
 安装需要 CANN 目录写权限；不加 `--install-kernel` 不修改安装目录。
 启动脚本自动选择构建目录内的 JSON，默认端口 29991。
-CPU 端先验证小规模正确性（替换机器地址、UB 设备和 EID index）：
+CPU 端先验证小规模正确性（替换机器地址，device-id 为 NPU 逻辑设备号）：
 
 ```bash
 bash tests/run_aicpu_get_cpu.sh --smoke \
-  --peer NPU_HOST:29991 --ub-device UB_DEVICE --eid-index 0
+  --peer NPU_HOST:29991 --device-id 4
 ```
 
 小规模测试结束后，重新启动 NPU 脚本，再在 CPU 端测量默认 32 MiB/batch：
 
 ```bash
 # NPU 端
-bash tests/run_aicpu_get_npu.sh --device-id 0
+bash tests/run_aicpu_get_npu.sh --device-id 4
 
 # CPU 端
 bash tests/run_aicpu_get_cpu.sh \
-  --peer NPU_HOST:29991 --ub-device UB_DEVICE --eid-index 0 \
+  --peer NPU_HOST:29991 --device-id 4 \
   --output results/aicpu_get.csv
 ```
 
@@ -113,23 +116,27 @@ bash tests/aicpu_batch_get/install_kernel.sh \
 
 ```bash
 build-aicpu-npu/tests/aicpu_batch_get/kvaf_aicpu_get_npu \
-  --port 29991 --device-id 0 \
+  --port 29991 --device-id 4 \
   --kernel-json build-aicpu-npu/tests/aicpu_batch_get/libkvaf_aicpu_test.json
 ```
 
-默认读取 pair_info 的 NPU EID；也可以传 `--eid` 加 32 位十六进制 EID。
+按选定设备读取 pair_info 的 NPU EID；也可以传 `--eid` 加 32 位十六进制 EID。
 然后在 CPU 数据所在机器运行：
 
 ```bash
 build-aicpu-cpu/tests/aicpu_batch_get/kvaf_aicpu_get_cpu \
-  --peer NPU_HOST:29991 --ub-device UB_DEVICE --eid-index 0 \
+  --peer NPU_HOST:29991 --device-id 4 \
   --rows 8192 --row-bytes 4096 --warmup 5 --iterations 100 \
   --remote-sgl-size 16 --jettys 4 --prepare-threads 4 \
   --wqes-per-doorbell 0 --timeout-ms 30000
 ```
 
 先用 `--rows 16 --row-bytes 64 --warmup 1 --iterations 3` 验证，再测大 batch。
-EID 需要选择当前硬件上可达的 CPU/NPU 配对；测试不自动遍历候选。
+CPU 默认枚举本机非零 UB/EID 候选并尝试建链，不需要手填设备名或 EID index。
+`--device-id 4` 指 NPU 逻辑设备号，绝不会直接用作 CPU EID index。
+NPU 端未指定 `--device-id` 时按 CPU 请求选择；指定时会拒绝不一致的请求。
+`--ub-device` / `--eid-index` 保留为可选诊断过滤器。建链失败时清理后尝试下一个
+CPU 候选；成功建链后的数据探测若失败则终止，避免回收可能仍有 DMA 的目标。
 每个 NPU 测试进程仅接受一次配置/测量，下一组参数重新启动。
 
 ## 计时与结果
