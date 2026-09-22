@@ -52,7 +52,7 @@ class Kernel {
     option.type = ACL_RT_BINARY_LOAD_OPT_CPU_KERNEL_MODE; option.value.cpuKernelMode = 0;
     aclrtBinaryLoadOptions options{}; options.numOpt = 1; options.options = &option;
     Acl(aclrtBinaryLoadFromFile(path, &options, &binary_), "load AICPU JSON");
-    Acl(aclrtBinaryGetFunction(binary_, "KvafAicpuBatchGet", &function_), "resolve AICPU function");
+    Acl(aclrtBinaryGetFunction(binary_, kKernelName, &function_), "resolve AICPU function");
     Acl(aclrtCreateStream(&stream_), "create AICPU stream");
   }
   void Launch(const KernelArgs& args) {
@@ -135,11 +135,15 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
                                         sizeof(device_result), ACL_MEMCPY_DEVICE_TO_HOST);
   if (result_read == ACL_SUCCESS) {
     std::fprintf(stderr,
-                 "AICPU_GET_NPU KERNEL_STATUS status=%llu completed=%llu failed_sequence=%llu frequency=%llu\n",
+                 "AICPU_GET_NPU KERNEL_STATUS status=%llu completed=%llu failed_sequence=%llu frequency=%llu requested_threads=%llu active_threads=%llu pthread_error=%llu revision=%llu\n",
                  (unsigned long long)device_result.status,
                  (unsigned long long)device_result.completed_rounds,
                  (unsigned long long)device_result.failed_sequence,
-                 (unsigned long long)device_result.counter_frequency);
+                 (unsigned long long)device_result.counter_frequency,
+                 (unsigned long long)device_result.requested_threads,
+                 (unsigned long long)device_result.active_threads,
+                 (unsigned long long)device_result.pthread_error,
+                 (unsigned long long)device_result.kernel_revision);
   } else {
     std::fprintf(stderr, "AICPU_GET_NPU KERNEL_STATUS_UNAVAILABLE readback_code=%d\n", (int)result_read);
   }

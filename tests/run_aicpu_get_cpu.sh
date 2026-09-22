@@ -17,9 +17,13 @@ Wrapper options:
   --output FILE      Save CSV and also print it to stdout
 
 All other options go to kvaf_aicpu_get_cpu, for example:
-  --device-id 4 --rows 8192 --row-bytes 4096
+  --device-id 4 --rows 4096 --row-bytes 656 --scatter-threads 4
   --warmup 5 --iterations 100 --remote-sgl-size 16 --jettys 4
   --prepare-threads 4 --wqes-per-doorbell 0 --timeout-ms 30000
+
+  --rows N             Number of rows
+  --row-bytes N        Payload bytes per row (minimum 8)
+  --scatter-threads N  AICPU workers including caller (1..32; default 1)
 
 Start the NPU script first. Restart it for every test invocation.
 device-id selects the remote NPU (default 0); CPU UB/EID selection is automatic.

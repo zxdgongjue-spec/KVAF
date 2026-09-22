@@ -1,5 +1,6 @@
 #include "device_loop.h"
 #include "metrics.h"
+#include "scatter_pool.h"
 
 #include <cstdio>
 #include <cstring>
@@ -89,11 +90,53 @@ void Bounds() {
   Config c; Layout l{};
   Require(MakeLayout(c, &l), "default layout invalid");
   c.rows = UINT64_MAX; Require(!MakeLayout(c, &l), "overflow accepted");
-  c = {}; c.row_bytes = 65; Require(!MakeLayout(c, &l), "partial cache line accepted");
+  c = {}; c.row_bytes = 7; Require(!MakeLayout(c, &l), "undersized tag accepted");
   c = {}; c.warmup = UINT64_MAX; Require(!MakeLayout(c, &l), "round overflow accepted");
   c = {}; c.iterations = 0; Require(!MakeLayout(c, &l), "zero samples accepted");
   c = {}; c.timeout_ms = 0; Require(!MakeLayout(c, &l), "unbounded wait accepted");
   c = {}; c.magic = 0; Require(!MakeLayout(c, &l), "invalid ABI accepted");
+}
+void ParallelScatter() {
+  for (auto bytes : {8, 65, 656, 4096}) for (auto rows : {3, 67, 4096})
+    for (auto threads : {1, 2, 4, 8}) {
+      Config c; c.rows = rows; c.row_bytes = bytes; c.scatter_threads = threads;
+      Simulator io(c);
+      struct Context { Simulator* io; } context{&io};
+      ScatterPool pool;
+      Require(pool.Initialize(ActiveThreads(c), [](void* opaque, std::uint32_t worker) {
+        auto& io = *static_cast<Context*>(opaque)->io;
+        auto range = ScatterRange(io.config, worker, ActiveThreads(io.config));
+        for (auto row = range.begin; row < range.end; ++row)
+          std::memcpy(io.output.data() + OutputOffset(io.config, io.layout, row),
+                      io.staging.data() + row * io.config.row_bytes, io.config.row_bytes);
+      }, &context) == 0, "pthread initialization failed");
+      std::uint64_t previous = 0;
+      for (std::uint32_t worker = 0; worker < ActiveThreads(c); ++worker) {
+        auto range = ScatterRange(c, worker, ActiveThreads(c));
+        Require(range.begin == previous && range.end > range.begin &&
+                (range.begin * c.row_bytes) % 64 == 0, "overlapping/unaligned partition");
+        previous = range.end;
+      }
+      Require(previous == c.rows, "missing rows");
+      for (unsigned round = 0; round < 4; ++round) {
+        for (std::size_t b = 0; b < io.staging.size(); ++b)
+          io.staging[b] = static_cast<std::uint8_t>(b * 17 + round);
+        pool.Run();
+        for (std::uint64_t row = 0; row < c.rows; ++row) {
+          const auto* dst = io.output.data() + OutputOffset(c, io.layout, row);
+          Require(std::memcmp(dst, io.staging.data() + row * c.row_bytes, c.row_bytes) == 0,
+                  "parallel scatter data mismatch");
+          for (auto b = c.row_bytes; b < io.layout.stride; ++b)
+            Require(dst[b] == 0xA5, "parallel scatter guard overwritten");
+        }
+      }
+    }
+  Config c; Layout l{};
+  c.rows = 4096; c.row_bytes = 656;
+  Require(MakeLayout(c, &l) && l.payload_bytes == 2686976 && l.stride == 768,
+          "4096x656 layout mismatch");
+  c.scatter_threads = 0; Require(!MakeLayout(c, &l), "zero threads accepted");
+  c.scatter_threads = 33; Require(!MakeLayout(c, &l), "too many threads accepted");
 }
 void DeviceSelection() {
   Require(SelectDevice(4, false, 0) == 4, "CPU device-id was ignored");
@@ -108,7 +151,7 @@ void DeviceSelection() {
 }
 }  // namespace
 int main() {
-  try { Bounds(); DeviceSelection(); SuccessAndMetrics(); Failures();
+  try { ParallelScatter(); Bounds(); DeviceSelection(); SuccessAndMetrics(); Failures();
         std::puts("aicpu get protocol: PASS"); return 0; }
   catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
 }

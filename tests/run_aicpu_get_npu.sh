@@ -20,6 +20,7 @@ Wrapper options:
 Pass-through options: --port 29991 --device-id 0 --eid HEX --kernel-json PATH
 Without --device-id, use the CPU request's NPU device ID. With it, reject a mismatch.
 The built kernel JSON is selected automatically. No installation by default.
+Set --rows, --row-bytes and --scatter-threads on the CPU script.
 This server handles one test run; restart it for the next run.
 Build: bash build.sh aicpu-npu
 EOF

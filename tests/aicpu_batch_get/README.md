@@ -2,9 +2,33 @@
 
 这是独立 C++ 测试，不调用 Runtime BatchPut，不改 Python 或 MetaManager。
 
-**当前 scatter 引擎是单 AICPU 核 `memcpy`，不是 SDMA。** CSV 固定标注
-`aicpu_memcpy`。该版本用于验证完整链路并测量这个实现的带宽，不能据此报告
-SDMA 的性能上限。Ascend/URMA 硬件验证必须在目标机器完成。
+scatter 使用 AICPU `memcpy`，支持 `--scatter-threads 1..32`（默认 1）。
+调用线程也参与复制，其余 pthread 在进入测试循环前创建，跨预热和计时轮复用。
+CSV 标注 `aicpu_memcpy` / `aicpu_memcpy_mt`，并输出请求与实际线程数。
+线程创建失败报告 `pthread_error`，不会静默回退。设备 pthread 支持及带宽需在目标机器验证。
+
+### 4096 × 656 B、多线程测试
+
+更新后需重新构建两端、安装 V2 kernel，并重启测试进程：
+
+```bash
+bash build.sh aicpu-cpu
+bash build.sh aicpu-npu
+bash tests/run_aicpu_get_npu.sh --install-kernel --device-id 4
+```
+
+另一个终端：
+
+```bash
+bash tests/run_aicpu_get_cpu.sh --peer 127.0.0.1:29991 --device-id 4 \
+  --rows 4096 --row-bytes 656 --scatter-threads 4 \
+  --warmup 5 --iterations 100
+```
+
+每轮有效载荷 2,686,976 B（2.5625 MiB），带宽不计 padding/guard。
+分别测试线程数 1、2、4、8；每次先重启 NPU 脚本，后续无需重复安装。
+本版本按线程批量 clean 输出，单线程基线也应使用本版本重新测量。
+线程调度、完成等待及缓存操作计入 scatter；创建/销毁线程、数据校验不计入。
 
 ## 执行流程
 
@@ -21,9 +45,10 @@ SDMA 的性能上限。Ascend/URMA 硬件验证必须在目标机器完成。
    检查各行本轮序号后才请求下一轮，不存在两轮同时使用 staging。
 7. CPU 停止/销毁 transport 并确认 drained；NPU 检查输出后才释放 target。
 
-CPU source 每行之间有 64 字节空隙，NPU staging 连续，输出按反向行序分散到
-同样带 64 字节 guard 的行中。源/目标描述符固定，不包含动态 AccessTable 解析。
-行长必须是 64 的倍数；一次 batch 的数据不超过配置校验允许的内存上限。
+CPU source 和输出的行步长为 round_up(row_bytes, 64) + 64，NPU staging 保持连续，
+输出按反向行序 scatter。行长至少 8 B（序号头），支持 656 B；此时行步长为 768 B。
+线程按 64 / gcd(row_bytes, 64) 行分组，656 B 时每组 4 行，避免线程间共享输入缓存行。
+实际线程数不超过分组数。源/目标描述符固定，不包含动态 AccessTable 解析。
 
 ## 快速构建和运行（推荐）
 

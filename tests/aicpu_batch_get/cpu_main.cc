@@ -27,6 +27,7 @@ Options Parse(int argc, char** argv) {
     if (flag == "--ub-device") { o.transport.ub_device = value; continue; }
     const auto n = Number(value);
     if (flag == "--rows") o.config.rows = n;
+    else if (flag == "--scatter-threads") o.config.scatter_threads = n;
     else if (flag == "--row-bytes") o.config.row_bytes = n;
     else if (flag == "--warmup") o.config.warmup = n;
     else if (flag == "--iterations") o.config.iterations = n;
@@ -192,11 +193,14 @@ void Run(Options options) {
   Report report{}; Receive(control.get(), &report, sizeof(report));
   Require(ok && report.magic == kMagic && report.status == 0, "benchmark or NPU validation failed");
   const double n = static_cast<double>(options.config.iterations);
-  std::printf("engine,rows,row_bytes,iterations,e2e_GBps,mean_ns,p50_ns,p99_ns,wait_ns,scatter_ns,"
+  std::printf("engine,rows,row_bytes,iterations,scatter_threads,active_threads,e2e_GBps,mean_ns,p50_ns,p99_ns,wait_ns,scatter_ns,"
               "cpu_write_ns,cpu_prepare_ns,cpu_post_ns,cpu_poll_ns,mean_wrs,control_reads\n");
-  std::printf("aicpu_memcpy,%llu,%llu,%llu,%.6f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%llu\n",
+  std::printf("%s,%llu,%llu,%llu,%llu,%llu,%.6f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%llu\n",
+              report.active_threads > 1 ? "aicpu_memcpy_mt" : "aicpu_memcpy",
               (unsigned long long)options.config.rows, (unsigned long long)options.config.row_bytes,
-              (unsigned long long)options.config.iterations, report.gbps, report.mean_ns,
+              (unsigned long long)options.config.iterations,
+              (unsigned long long)options.config.scatter_threads,
+              (unsigned long long)report.active_threads, report.gbps, report.mean_ns,
               report.p50_ns, report.p99_ns, report.wait_ns, report.scatter_ns,
               (double)write_ns / n, (double)prepare_ns / n, (double)post_ns / n,
               (double)poll_ns / n, (double)wr_count / n, (unsigned long long)polls);

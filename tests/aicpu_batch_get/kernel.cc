@@ -1,4 +1,5 @@
 #include "device_loop.h"
+#include "scatter_pool.h"
 
 #include <cstring>
 
@@ -28,6 +29,20 @@ void Invalidate(const void* data, std::uint64_t bytes) {
 struct DeviceIO {
   std::uint8_t* region;
   std::uint8_t* output;
+  Config config;
+  Layout layout;
+  ScatterPool pool;
+  static void ScatterWorker(void* context, std::uint32_t worker) {
+    auto& io = *static_cast<DeviceIO*>(context);
+    const auto range = ScatterRange(io.config, worker, ActiveThreads(io.config));
+    Invalidate(io.region + kStagingOffset + range.begin * io.config.row_bytes,
+               (range.end - range.begin) * io.config.row_bytes);
+    for (auto row = range.begin; row < range.end; ++row)
+      std::memcpy(io.output + OutputOffset(io.config, io.layout, row),
+                  io.region + kStagingOffset + row * io.config.row_bytes, io.config.row_bytes);
+    Clean(io.output + (io.config.rows - range.end) * io.layout.stride,
+          (range.end - range.begin) * io.layout.stride);
+  }
   std::uint64_t Frequency() {
     std::uint64_t value;
     asm volatile("mrs %0, cntfrq_el0" : "=r"(value));
@@ -47,16 +62,9 @@ struct DeviceIO {
     Invalidate(region + kDoneOffset, sizeof(Control));
     return reinterpret_cast<volatile Control*>(region + kDoneOffset)->sequence;
   }
-  void Scatter(const Config& c, const Layout& l) {
-    // This baseline intentionally measures AICPU memcpy, NOT SDMA bandwidth.
-    Invalidate(region + kStagingOffset, l.payload_bytes);
-    for (std::uint64_t row = 0; row < c.rows; ++row) {
-      auto* dst = output + OutputOffset(c, l, row);
-      std::memcpy(dst, region + kStagingOffset + row * c.row_bytes, c.row_bytes);
-      Clean(dst, c.row_bytes);
-    }
-  }
+  void Scatter(const Config&, const Layout&) { pool.Run(); }
   bool VerifyTags(std::uint64_t seq, const Config& c, const Layout& l) {
+    Invalidate(output, l.output_bytes);
     for (std::uint64_t row = 0; row < c.rows; ++row) {
       std::uint64_t value;
       std::memcpy(&value, output + OutputOffset(c, l, row), sizeof(value));
@@ -68,13 +76,25 @@ struct DeviceIO {
 }  // namespace
 
 extern "C" __attribute__((visibility("default")))
-std::uint32_t KvafAicpuBatchGet(KernelArgs* args) {
+std::uint32_t KvafAicpuBatchGetV2(KernelArgs* args) {
   if (!args || !args->region || !args->output || !args->samples || !args->result)
     return 1;
   auto* result = reinterpret_cast<KernelResult*>(args->result);
   auto* samples = reinterpret_cast<Sample*>(args->samples);
+  Layout layout{};
+  if (!MakeLayout(args->config, &layout)) {
+    *result = {}; result->status = Result::kInvalidArgs;
+    Clean(result, sizeof(*result)); return 1;
+  }
   DeviceIO io{reinterpret_cast<std::uint8_t*>(args->region),
-              reinterpret_cast<std::uint8_t*>(args->output)};
+              reinterpret_cast<std::uint8_t*>(args->output), args->config, layout, {}};
+  const auto error = io.pool.Initialize(ActiveThreads(args->config), &DeviceIO::ScatterWorker, &io);
+  if (error) {
+    *result = {}; result->status = Result::kThreadError;
+    result->requested_threads = args->config.scatter_threads;
+    result->pthread_error = error; result->kernel_revision = kKernelRevision;
+    Clean(result, sizeof(*result)); return 1;
+  }
   const auto status = RunDevice(args->config, io, samples, result);
   result->status = status;
   if (status == Result::kOk) Clean(samples, args->config.iterations * sizeof(Sample));

@@ -15,8 +15,8 @@
 
 namespace kvaf::aicpu_test {
 // Test-only commands; never change the production Runtime protocol.
-// v3 configure carries the NPU EID candidate returned by PeerLink discovery.
-constexpr auto kConfigure = static_cast<peer::Command>(0x7004);
+// v4 config includes device-side scatter thread count and unaligned row sizes.
+constexpr auto kConfigure = static_cast<peer::Command>(0x7005);
 constexpr auto kStart = static_cast<peer::Command>(0x7001);
 constexpr auto kResetSetup = static_cast<peer::Command>(0x7003);
 struct ConfigureRequest {
@@ -31,9 +31,10 @@ struct Report {
   std::uint64_t magic{kMagic};
   std::uint64_t status{1};
   std::uint64_t rounds{};
+  std::uint64_t active_threads{};
   double mean_ns{}, p50_ns{}, p99_ns{}, wait_ns{}, scatter_ns{}, gbps{};
 };
-static_assert(sizeof(ConfigureRequest) == 72 && sizeof(Ack) == 16 && sizeof(Report) == 72);
+static_assert(sizeof(ConfigureRequest) == 80 && sizeof(Ack) == 16 && sizeof(Report) == 80);
 
 inline void Require(bool ok, const std::string& message) {
   if (!ok) throw std::runtime_error(message);

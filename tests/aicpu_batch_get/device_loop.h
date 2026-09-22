@@ -10,6 +10,9 @@ Result RunDevice(const Config& config, IO& io, Sample* samples, KernelResult* re
   Layout layout{};
   if (!MakeLayout(config, &layout) || !samples || !result) return Result::kInvalidArgs;
   *result = {};
+  result->requested_threads = config.scatter_threads;
+  result->active_threads = ActiveThreads(config);
+  result->kernel_revision = kKernelRevision;
   result->counter_frequency = io.Frequency();
   if (result->counter_frequency == 0 || result->counter_frequency > UINT64_MAX / config.timeout_ms)
     return result->status = Result::kInvalidArgs;
