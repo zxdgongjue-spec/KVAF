@@ -13,12 +13,10 @@
 
 namespace {
 using kvaf::CpuUrmaTransport;
-using kvaf::cpu_urma_detail::BuildCoalescedWriteRange;
-using kvaf::cpu_urma_detail::CoalescedWriteSpan;
-using kvaf::cpu_urma_detail::GroupsFitRegisteredRegion;
+using kvaf::cpu_urma_detail::RowsFitRegisteredRegion;
 using kvaf::cpu_urma_detail::MergeSglPlanSlices;
-using kvaf::cpu_urma_detail::PlanWriteCoalescedGroups;
-using kvaf::cpu_urma_detail::PlanWriteCoalescedSlice;
+using kvaf::cpu_urma_detail::PlanWriteGatherGroups;
+using kvaf::cpu_urma_detail::PlanWriteGatherSlice;
 using kvaf::cpu_urma_detail::PrepareSglPlanSlices;
 using kvaf::cpu_urma_detail::SglGroup;
 using kvaf::cpu_urma_detail::SglPlanSlice;
@@ -26,145 +24,6 @@ using kvaf::cpu_urma_detail::ValidateBatchRows;
 
 void Check(bool ok, const char* message) {
   if (!ok) throw std::runtime_error(message);
-}
-
-void CheckFusedWriteTransfer(
-    const std::vector<CpuUrmaTransport::HostSge>& buffers,
-    const std::vector<std::uint64_t>& offsets, std::size_t remote_bytes,
-    std::size_t owners, std::size_t max_rows, std::uint64_t max_bytes) {
-  std::vector<std::uint8_t> expected(remote_bytes, 0xEE), actual = expected;
-  for (std::size_t row = 0U; row < buffers.size(); ++row) {
-    std::memcpy(expected.data() + offsets[row], buffers[row].data, buffers[row].bytes);
-  }
-  std::vector<std::vector<CoalescedWriteSpan>> prepared(owners);
-  for (std::size_t owner = 0U; owner < owners; ++owner) {
-    const std::size_t begin = buffers.size() * owner / owners;
-    const std::size_t end = buffers.size() * (owner + 1U) / owners;
-    prepared[owner].resize(end - begin);
-    std::size_t wr_count = 99U;
-    Check(BuildCoalescedWriteRange(
-              buffers.data(), offsets.data(), buffers.size(), begin, end,
-              max_rows, remote_bytes, max_bytes, prepared[owner].size(),
-              [&](std::size_t slot, const CoalescedWriteSpan& span) {
-                prepared[owner].at(slot) = span;
-              }, &wr_count).ok(), "fused WRITE range failed");
-    prepared[owner].resize(wr_count);
-    std::size_t next = begin;
-    for (const auto& span : prepared[owner]) {
-      Check(span.first == next && span.count > 0U && span.count <= max_rows &&
-                span.count <= end - next && span.bytes <= max_bytes,
-            "fused WRITE range has invalid row coverage");
-      std::uint64_t bytes = 0U;
-      for (std::size_t row = next; row < next + span.count; ++row) {
-        Check(reinterpret_cast<std::uintptr_t>(buffers[row].data) ==
-                  span.local_address + bytes && offsets[row] == span.remote_offset + bytes,
-              "fused WRITE span crossed a local or remote gap");
-        bytes += buffers[row].bytes;
-      }
-      Check(bytes == span.bytes, "fused WRITE span lost variable row bytes");
-      next += span.count;
-    }
-    Check(next == end, "fused WRITE range lost its tail");
-  }
-  // Model the transport barrier: no descriptor is consumed until all owners
-  // have validated and prepared their complete ranges.
-  for (const auto& queue : prepared) {
-    for (const auto& span : queue) {
-      std::memcpy(actual.data() + span.remote_offset,
-                  reinterpret_cast<const void*>(span.local_address), span.bytes);
-    }
-  }
-  Check(actual == expected, "fused WRITE descriptors changed transferred data");
-}
-
-void FusedWriteRanges() {
-  std::array<std::uint8_t, 512> source{};
-  for (std::size_t i = 0U; i < source.size(); ++i) source[i] = i % 197U;
-  for (const bool sparse : {false, true}) {
-    std::vector<CpuUrmaTransport::HostSge> buffers(11);
-    std::vector<std::uint64_t> offsets(11);
-    std::size_t local = 0U, remote = 0U;
-    for (std::size_t row = 0U; row < buffers.size(); ++row) {
-      const std::size_t bytes = 1U + row % 5U;
-      if (sparse && row == 3U) local += 7U;
-      if (sparse && row == 7U) remote += 11U;
-      buffers[row] = {source.data() + local, bytes};
-      offsets[row] = remote;
-      local += bytes;
-      remote += bytes;
-    }
-    for (const std::size_t owners : {1U, 2U, 4U, 16U}) {
-      CheckFusedWriteTransfer(buffers, offsets, remote, owners, 3U, 11U);
-    }
-  }
-
-  // Exact 64 KiB WR limit, with a one-byte tail. Addresses are synthetic and
-  // only descriptors are inspected, never dereferenced.
-  CpuUrmaTransport::HostSge rows[]{{reinterpret_cast<void*>(0x100000), 32768U},
-      {reinterpret_cast<void*>(0x108000), 32768U},
-      {reinterpret_cast<void*>(0x110000), 1U}};
-  std::uint64_t offsets[]{0U, 32768U, 65536U};
-  std::array<CoalescedWriteSpan, 3> scratch{};
-  std::size_t wr_count = 0U, emitted = 0U;
-  bool capacity_exceeded = false;
-  const auto emit = [&](std::size_t slot, const CoalescedWriteSpan& span) {
-    scratch.at(slot) = span;
-    ++emitted;
-  };
-  Check(BuildCoalescedWriteRange(rows, offsets, 3U, 0U, 3U, 128U,
-            65537U, 65536U, 2U, emit, &wr_count, &capacity_exceeded).ok() &&
-            wr_count == 2U && scratch[0].bytes == 65536U && scratch[0].count == 2U &&
-            scratch[1].first == 2U && scratch[1].bytes == 1U && !capacity_exceeded,
-        "fused WRITE did not split at 64 KiB");
-  emitted = 0U;
-  Check(!BuildCoalescedWriteRange(rows, offsets, 3U, 0U, 3U, 128U,
-            65537U, 65536U, 1U, emit, &wr_count, &capacity_exceeded).ok() &&
-            wr_count == 0U && emitted == 1U && capacity_exceeded,
-        "fused WRITE exceeded scratch capacity or exposed a partial count");
-  emitted = 0U;
-  Check(!BuildCoalescedWriteRange(rows, offsets, 3U, 0U, 3U, 128U,
-            65537U, 65536U, 0U, emit, &wr_count, &capacity_exceeded).ok() &&
-            wr_count == 0U && emitted == 0U && capacity_exceeded,
-        "zero WRITE capacity emitted a descriptor");
-  Check(BuildCoalescedWriteRange(nullptr, nullptr, 3U, 3U, 3U, 1U,
-            65537U, 65536U, 0U, emit, &wr_count, &capacity_exceeded).ok() &&
-            wr_count == 0U && !capacity_exceeded,
-        "empty Jetty range must be a successful no-op");
-
-  // An invalid row near the end may follow prepared descriptors. Failure must
-  // invalidate the entire range, and reusing its scratch must recover cleanly.
-  rows[2].data = nullptr;
-  emitted = 0U;
-  Check(!BuildCoalescedWriteRange(rows, offsets, 3U, 0U, 3U, 1U,
-            65537U, 65536U, 3U, emit, &wr_count, &capacity_exceeded).ok() &&
-            wr_count == 0U && emitted == 1U && !capacity_exceeded,
-        "late invalid row left a usable partial WRITE range");
-  std::size_t first_owner_wrs = 0U;
-  Check(BuildCoalescedWriteRange(rows, offsets, 3U, 0U, 1U, 128U,
-            65537U, 65536U, 3U, emit, &first_owner_wrs).ok() &&
-            first_owner_wrs == 1U &&
-            !BuildCoalescedWriteRange(rows, offsets, 3U, 1U, 3U, 128U,
-                65537U, 65536U, 3U, emit, &wr_count).ok() && wr_count == 0U,
-        "invalid row in the later owner range was not reported");
-  rows[2].data = reinterpret_cast<void*>(0x110000);
-  Check(BuildCoalescedWriteRange(rows, offsets, 3U, 1U, 3U, 128U,
-            65537U, 65536U, 3U, emit, &wr_count).ok() && wr_count == 1U &&
-            scratch[0].first == 1U && scratch[0].local_address == 0x108000U &&
-            scratch[0].remote_offset == 32768U && scratch[0].bytes == 32769U,
-        "fused WRITE range reuse or nonzero row base failed");
-  rows[0].bytes = 65537U;
-  Check(!BuildCoalescedWriteRange(rows, offsets, 3U, 0U, 1U, 128U,
-            65537U, 65536U, 3U, emit, &wr_count).ok() && wr_count == 0U,
-        "oversized row passed the device message limit");
-  rows[0] = {reinterpret_cast<void*>(std::numeric_limits<std::uintptr_t>::max() - 1U), 4U};
-  Check(!BuildCoalescedWriteRange(rows, offsets, 3U, 0U, 1U, 128U,
-            65537U, 65536U, 3U, emit, &wr_count).ok(),
-        "overflowing local address passed fused validation");
-  rows[0] = {source.data(), 4U};
-  offsets[0] = 65536U;
-  Check(!BuildCoalescedWriteRange(rows, offsets, 3U, 0U, 1U, 128U,
-            65537U, 65536U, 3U, emit, &wr_count).ok(),
-        "overflowing remote range passed fused validation");
 }
 
 kvaf::Status PlanInSlices(
@@ -183,7 +42,7 @@ kvaf::Status PlanInSlices(
   workers.reserve(slices->size());
   for (std::size_t i = 0U; i < slices->size(); ++i) {
     workers.push_back(std::async(std::launch::async, [&, i] {
-      return PlanWriteCoalescedSlice(
+      return PlanWriteGatherSlice(
           buffers, offsets, count, remote_sgl_size, remote_bytes,
           &(*slices)[i], max_group_bytes);
     }));
@@ -203,16 +62,12 @@ void CheckPlanShape(const std::vector<SglGroup>& groups,
           "SGL plan does not cover rows in order");
     Check(group.count <= remote_sgl_size,
           "SGL plan exceeds its row limit");
-    const auto local_base =
-        reinterpret_cast<std::uintptr_t>(buffers[group.first].data);
     const auto remote_base = offsets[group.first];
     std::uint64_t bytes = 0U;
     for (std::size_t row = group.first;
          row < group.first + group.count; ++row) {
-      Check(reinterpret_cast<std::uintptr_t>(buffers[row].data) ==
-                local_base + bytes &&
-                offsets[row] == remote_base + bytes,
-            "SGL group contains a non-contiguous row");
+      Check(offsets[row] == remote_base + bytes,
+            "gather group contains a non-contiguous remote row");
       bytes += buffers[row].bytes;
     }
     Check(bytes == group.bytes && bytes <= max_group_bytes,
@@ -228,7 +83,7 @@ void CheckSerialAndSlicedPlans(
     std::size_t remote_sgl_size, std::uint64_t remote_bytes,
     std::uint64_t max_group_bytes, std::size_t requested_slices) {
   std::vector<SglGroup> serial;
-  Check(PlanWriteCoalescedGroups(
+  Check(PlanWriteGatherGroups(
             buffers.data(), offsets.data(), buffers.size(), remote_sgl_size,
             remote_bytes, &serial, max_group_bytes).ok(),
         "serial SGL plan failed");
@@ -261,7 +116,7 @@ void ParallelWritePlanning() {
   }
   CheckSerialAndSlicedPlans(buffers, offsets, 8U, cursor, 64U, 6U);
 
-  // Independent local and remote gaps must split both serial and sliced plans.
+  // Local gaps are gathered; remote gaps split both serial and sliced plans.
   std::array<std::uint8_t, 1024> sparse{};
   cursor = 0U;
   std::uint64_t remote_cursor = 0U;
@@ -296,7 +151,7 @@ void ParallelWritePlanning() {
           "small batch slices are not balanced");
   }
 
-  // A slice boundary may split one otherwise coalesced group, but no rows.
+  // A slice boundary may split one gather group, but no rows.
   std::array<std::uint8_t, 64> boundary_source{};
   std::vector<CpuUrmaTransport::HostSge> boundary_buffers(8);
   std::vector<std::uint64_t> boundary_offsets(8);
@@ -305,10 +160,10 @@ void ParallelWritePlanning() {
     boundary_offsets[i] = i * 8U;
   }
   std::vector<SglGroup> serial, sliced;
-  Check(PlanWriteCoalescedGroups(
+  Check(PlanWriteGatherGroups(
             boundary_buffers.data(), boundary_offsets.data(), 8U, 8U, 64U,
             &serial, 64U).ok() && serial.size() == 1U,
-        "serial boundary plan did not coalesce");
+        "serial boundary plan did not gather");
   Check(PlanInSlices(boundary_buffers.data(), boundary_offsets.data(), 8U, 8U,
                      64U, 64U, 2U, &sliced).ok() && sliced.size() == 2U &&
             sliced[0].first == 0U && sliced[0].count == 4U &&
@@ -333,10 +188,10 @@ void ParallelWritePlanning() {
         "reused slice workspace retained a previous planning error");
 }
 
-void PackedWriteCoalesce() {
-  // Adjacent local and remote rows can share one contiguous WRITE WQE.
+void ScatteredWriteGather() {
+  // Reversed, separated CPU rows gather into a contiguous remote WRITE.
   for (const std::size_t count : {1U, 13U, 31U, 32U, 3000U, 6000U, 32769U}) {
-    std::vector<std::uint8_t> source(count * 8);
+    std::vector<std::uint8_t> source(count * 16, 0xCD);
     std::vector<CpuUrmaTransport::HostSge> buffers(count);
     std::vector<std::uint64_t> offsets(count);
     std::vector<std::uint8_t> expected(count * 8, 0xEE), actual = expected;
@@ -344,17 +199,18 @@ void PackedWriteCoalesce() {
     for (std::size_t i = 0; i < count; ++i) {
       const std::size_t bytes = 1 + i % 8;
       offsets[i] = cursor;
-      buffers[i] = {source.data() + cursor, bytes};
-      std::fill_n(source.data() + cursor, bytes, static_cast<std::uint8_t>(i % 197));
+      buffers[i] = {source.data() + (count - 1U - i) * 16U, bytes};
+      std::fill_n(static_cast<std::uint8_t*>(buffers[i].data), bytes,
+                  static_cast<std::uint8_t>(i % 197));
       std::memcpy(expected.data() + offsets[i], buffers[i].data, bytes);
       cursor += bytes;
     }
     for (const std::size_t limit : {1U, 31U, 64U, 128U}) {
       std::fill(actual.begin(), actual.end(), 0xEE);
       std::vector<SglGroup> groups;
-      Check(PlanWriteCoalescedGroups(buffers.data(), offsets.data(), count, limit,
-                                    actual.size(), &groups).ok(), "WRITE coalesce plan failed");
-      Check(groups.size() == (count + limit - 1) / limit, "WRITE coalesced WQE count");
+      Check(PlanWriteGatherGroups(buffers.data(), offsets.data(), count, limit,
+                                    actual.size(), &groups).ok(), "WRITE gather plan failed");
+      Check(groups.size() == (count + limit - 1) / limit, "WRITE gather WQE count");
       std::size_t next = 0;
       // Exercise group rebasing at a 1024-WQE queue boundary as transport does.
       for (std::size_t begin = 0; begin < groups.size(); begin += 1024) {
@@ -364,69 +220,84 @@ void PackedWriteCoalesce() {
         for (std::size_t g = begin; g < std::min(begin + 1024, groups.size()); ++g) {
           const auto& group = groups[g];
           Check(group.first == next && group.count == std::min<std::size_t>(limit, count - next),
-                "WRITE coalesced rows missing or duplicated");
+                "WRITE gather rows missing or duplicated");
           const auto first = group.first - base_row;
-          const auto* local = static_cast<const std::uint8_t*>(chunk_buffers[first].data);
-          std::memcpy(actual.data() + chunk_offsets[first], local, group.bytes);
+          std::uint64_t destination = chunk_offsets[first];
+          for (std::size_t sge = 0U; sge < group.count; ++sge) {
+            const auto& local = chunk_buffers[first + sge];
+            std::memcpy(actual.data() + destination, local.data, local.bytes);
+            destination += local.bytes;
+          }
+          Check(destination == chunk_offsets[first] + group.bytes,
+                "gather local SGE bytes do not match remote SGE");
           next += group.count;
         }
       }
-      Check(next == count && actual == expected, "WRITE coalesced data corrupted");
+      Check(next == count && actual == expected, "WRITE gather data corrupted");
     }
   }
 }
 
-void WriteCoalesceLimits() {
+void WriteGatherLimits() {
   std::array<std::uint8_t, 64> source{};
+  CpuUrmaTransport::HostSge adjacent[]{{source.data(), 8},
+      {source.data() + 8, 8}, {source.data() + 16, 8},
+      {source.data() + 24, 8}};
+  std::uint64_t adjacent_offsets[]{0, 8, 16, 24};
+  std::vector<SglGroup> groups;
+  Check(PlanWriteGatherGroups(
+            adjacent, adjacent_offsets, 4, 4, 64, &groups).ok() &&
+            groups.size() == 1U && groups[0].count == 4U,
+        "adjacent CPU rows must remain four local SGEs in one WRITE WQE");
+
   CpuUrmaTransport::HostSge buffers[]{{source.data(), 3}, {source.data() + 3, 5},
                                      {source.data() + 20, 2}, {source.data() + 22, 6}};
-  std::uint64_t offsets[]{0, 3, 20, 22};
-  std::vector<SglGroup> groups;
-  Check(PlanWriteCoalescedGroups(buffers, offsets, 4, 31, 64, &groups).ok(), "local gap plan");
-  Check(groups.size() == 2 && groups[0].count == 2 && groups[1].count == 2,
-        "noncontiguous local spans must split WRITE WQEs");
+  std::uint64_t offsets[]{0, 3, 8, 10};
+  Check(PlanWriteGatherGroups(buffers, offsets, 4, 31, 64, &groups).ok(), "local gap plan");
+  Check(groups.size() == 1 && groups[0].count == 4,
+        "noncontiguous local rows must gather into one WRITE WQE");
   offsets[1] = 4;
-  Check(PlanWriteCoalescedGroups(buffers, offsets, 4, 31, 64, &groups).ok() && groups.size() == 3,
+  Check(PlanWriteGatherGroups(buffers, offsets, 4, 31, 64, &groups).ok() && groups.size() == 3,
         "noncontiguous remote spans must split WRITE WQEs");
   offsets[1] = 3;
-  Check(PlanWriteCoalescedGroups(buffers, offsets, 4, 1, 64, &groups).ok() && groups.size() == 4,
-        "row coalescing limit not enforced");
-  Check(!PlanWriteCoalescedGroups(buffers, offsets, 4, 0, 64, &groups).ok(), "zero remote SGL");
+  Check(PlanWriteGatherGroups(buffers, offsets, 4, 1, 64, &groups).ok() && groups.size() == 4,
+        "local SGE count limit not enforced");
+  Check(!PlanWriteGatherGroups(buffers, offsets, 4, 0, 64, &groups).ok(), "zero remote SGL");
   offsets[3] = 60;
-  Check(!PlanWriteCoalescedGroups(buffers, offsets, 4, 31, 64, &groups).ok() && groups.empty(),
-        "remote overflow left a partial coalescing plan");
+  Check(!PlanWriteGatherGroups(buffers, offsets, 4, 31, 64, &groups).ok() && groups.empty(),
+        "remote overflow left a partial gather plan");
   offsets[3] = 8;
   buffers[3].data = reinterpret_cast<void*>(std::numeric_limits<std::uintptr_t>::max() - 2);
-  Check(!PlanWriteCoalescedGroups(buffers, offsets, 4, 31, 64, &groups).ok(), "local overflow");
+  Check(!PlanWriteGatherGroups(buffers, offsets, 4, 31, 64, &groups).ok(), "local overflow");
 
   // Synthetic addresses are used only for planning, never dereferenced.
   constexpr std::uint64_t max_length = std::numeric_limits<std::uint32_t>::max();
   CpuUrmaTransport::HostSge large[]{{reinterpret_cast<void*>(4096), max_length - 1},
       {reinterpret_cast<void*>(4096 + max_length - 1), 2}};
   std::uint64_t large_offsets[]{0, max_length - 1};
-  Check(PlanWriteCoalescedGroups(large, large_offsets, 2, 31, max_length + 1, &groups).ok() &&
-        groups.size() == 2, "single local SGE length overflow was not split");
+  Check(PlanWriteGatherGroups(large, large_offsets, 2, 31, max_length + 1, &groups).ok() &&
+        groups.size() == 2, "gather total length overflow was not split");
   large[0].bytes = 0;
-  Check(!PlanWriteCoalescedGroups(large, large_offsets, 2, 31, max_length + 1, &groups).ok(),
+  Check(!PlanWriteGatherGroups(large, large_offsets, 2, 31, max_length + 1, &groups).ok(),
         "zero length WRITE row accepted");
 
   CpuUrmaTransport::HostSge capped[]{{source.data(), 8}, {source.data() + 8, 8},
                                      {source.data() + 16, 8}, {source.data() + 24, 8}};
   std::uint64_t capped_offsets[]{0, 8, 16, 24};
-  Check(PlanWriteCoalescedGroups(capped, capped_offsets, 4, 128, 64, &groups, 16).ok() &&
+  Check(PlanWriteGatherGroups(capped, capped_offsets, 4, 128, 64, &groups, 16).ok() &&
             groups.size() == 2 && groups[0].count == 2 && groups[1].count == 2,
         "device message size did not split WRITE groups");
   capped[0].bytes = 17;
-  Check(!PlanWriteCoalescedGroups(capped, capped_offsets, 4, 128, 64, &groups, 16).ok(),
+  Check(!PlanWriteGatherGroups(capped, capped_offsets, 4, 128, 64, &groups, 16).ok(),
         "row larger than device message size was accepted");
 
   capped[0].bytes = 8;
-  Check(PlanWriteCoalescedGroups(capped, capped_offsets, 4, 128, 64, &groups, 16).ok(),
+  Check(PlanWriteGatherGroups(capped, capped_offsets, 4, 128, 64, &groups, 16).ok(),
         "registered-region plan failed");
-  Check(GroupsFitRegisteredRegion(capped, groups.data(), groups.size(), source.data(), 32),
-        "valid grouped host region rejected");
-  Check(!GroupsFitRegisteredRegion(capped, groups.data(), groups.size(), source.data(), 31),
-        "group outside registered host region accepted");
+  Check(RowsFitRegisteredRegion(capped, 4U, source.data(), 32),
+        "valid local SGE registered region rejected");
+  Check(!RowsFitRegisteredRegion(capped, 4U, source.data(), 31),
+        "local SGE outside registered host region accepted");
 }
 
 void BatchRowValidation() {
@@ -500,10 +371,9 @@ void JettyChunkSubmission() {
 
 int main() {
   try {
-    FusedWriteRanges();
     ParallelWritePlanning();
-    PackedWriteCoalesce();
-    WriteCoalesceLimits();
+    ScatteredWriteGather();
+    WriteGatherLimits();
     BatchRowValidation();
     JettyChunkSubmission();
     std::cout << "CPU URMA SGL planning tests passed\n";

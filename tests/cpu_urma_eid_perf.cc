@@ -222,7 +222,7 @@ Result Measure(const Options& options, const CpuCandidate& cpu, std::uint32_t np
     phase("probe");
     status = transport.ValidateLink();
     if (!status.ok()) return finish("probe_failed", status);
-    // Keep the input as the explicit region for the measured WRITE fast path.
+    // Register both buffers once so measured transfers reuse their segments.
     phase("register_output");
     status = transport.RegisterDirectHostMemory(output.data.get(), output.bytes);
     if (status.ok()) {

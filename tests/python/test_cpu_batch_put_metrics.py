@@ -85,17 +85,32 @@ class MetricsTest(unittest.TestCase):
                 self.totals = iter([99999999, 88888888, 6001, 10000, 20000, 8000])
 
             def initialize(self, *args, **kwargs):
-                self.scatter = kwargs["remote_sgl_size"] == 31
+                self.gather_limit = min(kwargs["remote_sgl_size"], 13)
                 assert kwargs["prepare_thread_count"] == 8
                 assert not {"sgl_size", "jetty_count", "omp_thread_count"}.intersection(kwargs)
                 self.initialized = True
 
             def batch_put(self, keys, sources, offsets, lengths, miss_count):
-                self.payload = sources[0][:sum(lengths[0][:miss_count])]
+                self.payload = b"".join(
+                    sources[0][offset : offset + length]
+                    for offset, length in zip(
+                        offsets[0][:miss_count], lengths[0][:miss_count]
+                    )
+                )
+                token_bytes = lengths[0][0]
+                assert offsets[0] == [
+                    row * 2 * token_bytes for row in range(len(keys[0]))
+                ]
+                assert all(
+                    sources[0][offset + length : offset + 2 * length]
+                    == b"\xCD" * length
+                    for offset, length in zip(offsets[0], lengths[0])
+                )
+                assert self.payload != sources[0][:len(self.payload)]
                 self.last_batch_timing = dict(total_scope="transport_call", total_ns=next(self.totals),
                                              plan_ns=20, setup_ns=30, prepare_ns=100,
                                              post_ns=200, poll_ns=300,
-                                             wr_count=2 if self.scatter else 32)
+                                             wr_count=(miss_count + self.gather_limit - 1) // self.gather_limit)
 
             def batch_free(self, keys):
                 self.last_batch_timing = None
@@ -104,6 +119,10 @@ class MetricsTest(unittest.TestCase):
                 return keys
 
             def batch_get(self, table, rows, offsets, output_rows, output, token_bytes):
+                assert rows == list(range(len(table)))
+                assert offsets == [0] * len(table)
+                assert output_rows == rows
+                assert len(output) == len(table) * token_bytes
                 output[:] = self.payload
 
             def release_access_table(self, table):
@@ -131,8 +150,11 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(total["p50_GBps"], "0.455")
         self.assertEqual(result["batch_put"]["p50_GBps"], "0.046")
         self.assertIn("wr_count_min=32 wr_count_max=32 requested_remote_sgl_size=1", out.getvalue())
-        # With 32 packed rows, remote SGL=31 permits two WQEs despite local
-        # SGL=1. The benchmark must validate against the remote grouping limit.
+        self.assertIn("source_layout=scattered remote_layout=contiguous", out.getvalue())
+        self.assertIn("source_stride_bytes=256 source_bytes=16384", out.getvalue())
+        self.assertIn("sgl_mode=local_gather", out.getvalue())
+        # The legacy remote SGL argument requests local gather. A device with
+        # max_jfs_sge=13 needs three WRs for 32 rows even when 31 is requested.
         scatter_out = io.StringIO()
         with patch.dict(sys.modules, {"kvaf": types.SimpleNamespace(CpuRuntime=FakeRuntime)}), \
              patch.object(perf.time, "perf_counter_ns", side_effect=[
@@ -143,7 +165,7 @@ class MetricsTest(unittest.TestCase):
                                         "--iterations", "4",
                                         "--remote-sgl-size", "31",
                                         "--prepare-threads", "8"]), 0)
-        self.assertIn("wr_count_min=2 wr_count_max=2 requested_remote_sgl_size=31",
+        self.assertIn("wr_count_min=3 wr_count_max=3 requested_remote_sgl_size=31",
                       scatter_out.getvalue())
 
     def test_preflight_payload_distinguishes_rows(self):

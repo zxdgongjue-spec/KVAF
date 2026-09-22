@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Measure CPU Runtime BatchPut from packed CPU DRAM into remote NPU HBM.
+"""Measure CPU Runtime BatchPut from scattered CPU DRAM into contiguous NPU HBM.
 
 The benchmark uses the same compact-prefix shape as the latest AIV BatchGet
 benchmark: ``request_length`` is the fixed descriptor/buffer capacity and
 ``miss_count`` is the number of active rows. Full-capacity inputs are passed to
 BatchPut, which consumes only the active prefix.
+CPU source rows have a fixed stride with one unused row between payloads;
+remote slots and the independent readback expectation remain packed.
 """
 
 from __future__ import annotations
@@ -78,7 +80,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--remote-sgl-size",
         type=int,
         default=environment_int("KVAF_CPU_URMA_REMOTE_SGL_SIZE", 1),
-        help="maximum adjacent CPU/HBM rows coalesced into one WRITE WR",
+        help=(
+            "legacy parameter name: maximum local source SGEs gathered into one "
+            "contiguous remote WRITE; transport applies max_jfs_sge/max_msg_size"
+        ),
     )
     parser.add_argument(
         "--prepare-threads",
@@ -225,9 +230,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     hbm_bytes = args.request_length * slot_size
     payload_bytes = args.miss_count * args.token_bytes
     keys = list(range(1, args.request_length + 1))
-    offsets = [row * args.token_bytes for row in range(args.request_length)]
+    source_stride_bytes = 2 * args.token_bytes
+    offsets = [row * source_stride_bytes for row in range(args.request_length)]
     lengths = [args.token_bytes] * args.request_length
-    source = make_source(args.request_length * args.token_bytes, args.token_bytes)
+    packed_source = make_source(hbm_bytes, args.token_bytes)
+    expected_payload = packed_source[:payload_bytes]
+    scattered_source = bytearray(b"\xCD") * (args.request_length * source_stride_bytes)
+    for row, offset in enumerate(offsets):
+        packed_offset = row * args.token_bytes
+        scattered_source[offset : offset + args.token_bytes] = packed_source[
+            packed_offset : packed_offset + args.token_bytes
+        ]
+    source = bytes(scattered_source)
     active_keys = keys[: args.miss_count]
 
     runtime = kvaf.CpuRuntime()
@@ -236,6 +250,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"peer={args.peer} device_id={args.device_id} "
         f"request_length={args.request_length} miss_count={args.miss_count} "
         f"token_bytes={args.token_bytes} payload_bytes={payload_bytes} "
+        f"source_layout=scattered remote_layout=contiguous "
+        f"source_stride_bytes={source_stride_bytes} source_bytes={len(source)} "
         f"remote_sgl_size={args.remote_sgl_size} prepare_threads={args.prepare_threads} "
         f"doorbell_wqes={args.doorbell_wqes} warmup={args.warmup} "
         f"iterations={args.iterations}"
@@ -282,7 +298,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     output,
                     args.token_bytes,
                 )
-                if bytes(output) != source[:payload_bytes]:
+                if bytes(output) != expected_payload:
                     raise AssertionError("CPU BatchPut payload validation failed")
             finally:
                 runtime.release_access_table(table)
@@ -317,10 +333,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             completed_ns = time.perf_counter_ns()
             call_ns = completed_ns - begin_ns
             timing = validate_timing(dict(runtime.last_batch_timing), call_ns)
-            rows_per_wr = args.remote_sgl_size
-            minimum_wrs = (args.miss_count + rows_per_wr - 1) // rows_per_wr
+            # remote_sgl_size is the requested local gather limit. Actual WRs
+            # may increase because max_jfs_sge/max_msg_size or Jetty boundaries
+            # reduce a group, so this is a conservative bound, not an exact count.
+            minimum_wrs = (
+                args.miss_count + args.remote_sgl_size - 1
+            ) // args.remote_sgl_size
             if not minimum_wrs <= timing["wr_count"] <= args.miss_count:
-                raise ValueError("transport WR count is inconsistent with miss-count/remote-sgl-size")
+                raise ValueError("transport WR count is inconsistent with miss-count/requested local gather limit")
             wr_counts.append(timing["wr_count"])
             call_samples.append(call_ns)
             plan_samples.append(timing["plan_ns"])
@@ -334,7 +354,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             "CPU_BATCH_PUT_SGL_RESULT "
             f"wr_count_min={min(wr_counts)} wr_count_max={max(wr_counts)} "
-            f"requested_remote_sgl_size={args.remote_sgl_size}"
+            f"requested_remote_sgl_size={args.remote_sgl_size} "
+            "sgl_mode=local_gather"
         )
         for operation, samples in (
             ("batch_put", call_samples),

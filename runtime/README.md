@@ -170,9 +170,9 @@ NUMA 节点。该脚本固定 `OMP_THREAD_LIMIT=4`，因此只适合四线程绑
 `CMAKE_BUILD_TYPE`。CPU-only 的规划/准备 helper 使用函数级优化，URMA 初始化和 provider
 调用仍保持已验证的编译方式。
 
-CPU URMA 默认创建 4 个 Jetty，每条 WR 的本地 SGE 数固定为 1。预注册的合并 WRITE
-由每个 Jetty owner 单遍完成校验、连续段识别和 WR 构造；所有 owner 通过 barrier 后才会
-提交。`prepare_thread_count` 仅控制通用回退路径的规划/准备并行度。
+CPU URMA 默认创建 4 个 Jetty。WRITE 每条 WR 可包含多个本地 source SGE，READ
+仍固定为一个本地和一个远端 SGE。WRITE 统一先完成校验和分组，再并行构造 WR；
+`prepare_thread_count` 控制规划和准备的并行度。
 
 每个 CPU Jetty 的 `CreateChannel` 请求都会在 NPU 服务端创建独立的目标
 Jetty 和 CQ；四条通道共享 HBM segment、token 和设备 context。服务端
@@ -188,15 +188,14 @@ WRITE 和 READ 的 `comp_order` 均为 1，中间 WR 使用 relax-order，最后
 strong-order 并请求 CQE。CPU JFS/JFR 深度为 8192，JFC 深度为 16384；
 NPU 每条目标通道的 SQ/RQ 深度为 1024，CQ 深度为 16384。
 
-`CpuRuntime.initialize(..., remote_sgl_size=N)` 控制 WRITE 每条 WR 最多合并的相邻行数。
-默认 1 是单条 WR 对应一条数据的基线。大于 1 时，仅当本地 DDR 和远端 HBM 地址
-都连续时，才合并为一个 local SGE 和一个 remote SGE；任一侧有间隔就拆分 WR。
-RC WRITE provider 只消费一个连续 remote SGE，因此不再对多个不连续 HBM 地址构造
-remote scatter。READ 保持每条 WR 一个本地和一个远端 SGE。
-
-请求值为正 uint32，当前仍按设备 `max_jfs_rsge` 和 Jetty ABI 字段容量限制最大合并
-行数；日志同时打印请求值和生效值。6000 条本地与远端均连续的行在生效值为 1 时
-生成 6000 个 WQE，为 31 时生成 194 个（累计长度未超限）。
+`CpuRuntime.initialize(..., remote_sgl_size=N)` 保留了旧参数名；对 WRITE，它请求每条
+WR 最多包含 N 个本地 CPU source SGE，生效值按设备 `max_jfs_sge` 截断。默认 1 是
+每条 WR 一个 source SGE 的基线。N 大于 1 时，本地地址可以离散；只要对应的远端 HBM
+地址连续且累计长度不超过 `max_msg_size`，这些本地 SGE 就 gather 到同一个连续 remote
+SGE。每一行始终占用一个 local SGE，即使相邻行的 CPU 地址连续也不会合并。远端地址
+出现 gap、达到本地 SGE 上限或达到 `max_msg_size` 都会拆分 WR。这是
+local gather，不是 remote scatter；READ 保持每条 WR 一个本地和一个远端 SGE。日志
+同时打印请求值和生效值。
 
 基线命令：
 

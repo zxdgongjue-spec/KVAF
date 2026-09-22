@@ -161,37 +161,23 @@ struct MappedRegion {
 bool RunBatchPass(kvaf::CpuUrmaTransport* transport, bool write,
                 std::vector<HostBlock>* blocks,
                 const std::vector<std::size_t>& order, std::size_t block_bytes,
-                std::size_t iterations, Stats* stats,
-                std::uint32_t remote_sgl_size = 1U) {
+                std::size_t iterations, Stats* stats) {
   if (transport == nullptr || blocks == nullptr || stats == nullptr) {
     return false;
   }
   const auto wall_start = std::chrono::steady_clock::now();
-  const bool coalesced_write = write && remote_sgl_size > 1U;
-  const bool use_coalesced_order = remote_sgl_size > 1U;
-  std::vector<std::size_t> positions;
   std::vector<std::uint64_t> remote_offsets;
-  if (use_coalesced_order) {
-    positions.resize(order.size());
-    for (std::size_t i = 0U; i < order.size(); ++i) positions[i] = i;
-    std::sort(positions.begin(), positions.end(), [&](std::size_t a, std::size_t b) {
-      return reinterpret_cast<std::uintptr_t>((*blocks)[order[a]].data) <
-             reinterpret_cast<std::uintptr_t>((*blocks)[order[b]].data);
-    });
-    if (coalesced_write) remote_offsets.resize(order.size());
-  }
+  if (write) remote_offsets.resize(order.size());
   std::vector<kvaf::CpuUrmaTransport::HostSge> requests(order.size());
   for (std::size_t i = 0U; i < order.size(); ++i) {
-    const std::size_t position = use_coalesced_order ? positions[i] : i;
-    requests[i] = {(*blocks)[order[position]].data, block_bytes};
-    if (coalesced_write) remote_offsets[i] = static_cast<std::uint64_t>(i) * block_bytes;
+    requests[i] = {(*blocks)[order[i]].data, block_bytes};
+    if (write) remote_offsets[i] = static_cast<std::uint64_t>(i) * block_bytes;
   }
   for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
     const auto start = std::chrono::steady_clock::now();
     const kvaf::Status status = write
-        ? (coalesced_write
-               ? transport->WriteBatch(remote_offsets.data(), requests.data(), requests.size())
-               : transport->WriteSglBatch(0U, requests.data(), requests.size()))
+        ? transport->WriteBatch(
+              remote_offsets.data(), requests.data(), requests.size())
         : transport->ReadSglBatch(0U, requests.data(), requests.size());
     if (!status.ok()) {
       std::fprintf(stderr, "[HBM_TEST][CPU] %s failed: %s\n",
@@ -282,13 +268,17 @@ int main(int argc, char** argv) {
     return 1;
   }
   const std::uint64_t total_bytes = static_cast<std::uint64_t>(options.blocks) * options.block_bytes;
+  if (total_bytes > std::numeric_limits<std::size_t>::max() / 2U) {
+    std::fprintf(stderr, "[HBM_TEST][CPU] scattered host address space size overflows\n");
+    return 2;
+  }
+  const std::uint64_t source_stride_bytes = 2U * options.block_bytes;
   const std::uint64_t host_space_bytes =
-      options.host_space_bytes == 0U ? total_bytes : options.host_space_bytes;
-  if (host_space_bytes < total_bytes ||
-      host_space_bytes / options.block_bytes < options.blocks ||
+      options.host_space_bytes == 0U ? 2U * total_bytes : options.host_space_bytes;
+  if (host_space_bytes / source_stride_bytes < options.blocks ||
       host_space_bytes > std::numeric_limits<std::size_t>::max()) {
     std::fprintf(stderr,
-                 "[HBM_TEST][CPU] invalid host address space bytes=%llu for blocks=%zu block_bytes=%zu\n",
+                 "[HBM_TEST][CPU] invalid scattered host address space bytes=%llu for blocks=%zu block_bytes=%zu (requires at least twice payload_bytes)\n",
                  static_cast<unsigned long long>(host_space_bytes), options.blocks,
                  options.block_bytes);
     return 2;
@@ -298,14 +288,15 @@ int main(int argc, char** argv) {
                "host_address_space_bytes=%llu "
                "iterations=%zu warmup=%zu "
                "remote_device=%u jettys=%u prepare_threads=%u remote_sgl_size=%u "
-               "write_order=%s omp_wait_policy=ACTIVE\n",
+               "source_layout=scattered remote_layout=contiguous source_stride_bytes=%llu "
+               "write_order=random read_layout=packed omp_wait_policy=ACTIVE\n",
                options.peer.c_str(), options.blocks, options.block_bytes,
                static_cast<unsigned long long>(total_bytes),
                static_cast<unsigned long long>(host_space_bytes), options.iterations,
                options.warmup,
                options.device_id, options.jetty_count, options.prepare_thread_count,
                options.remote_sgl_size,
-               options.remote_sgl_size > 1U ? "local-address" : "random");
+               static_cast<unsigned long long>(source_stride_bytes));
   std::fprintf(stderr, "[HBM_TEST][CPU] DATA_PATH=direct-registered-host-memory\n");
 
   kvaf::CpuUrmaTransportOptions transport_options;
@@ -361,9 +352,7 @@ int main(int argc, char** argv) {
   storage.data = static_cast<std::uint8_t*>(storage_address);
   storage.bytes = allocation_bytes;
   std::vector<HostBlock> blocks(options.blocks);
-  std::vector<std::vector<std::uint8_t>> expected(
-      options.blocks, std::vector<std::uint8_t>(options.block_bytes));
-  const std::uint64_t slot_count = host_space_bytes / options.block_bytes;
+  const std::uint64_t slot_count = host_space_bytes / source_stride_bytes;
   std::uniform_int_distribution<std::uint64_t> slot_distribution(0U, slot_count - 1U);
   std::unordered_set<std::uint64_t> used_slots;
   used_slots.reserve(options.blocks * 2U);
@@ -373,10 +362,9 @@ int main(int argc, char** argv) {
       slot = slot_distribution(rng);
     } while (!used_slots.insert(slot).second);
     blocks[i].data = storage.data +
-                     static_cast<std::size_t>(slot * options.block_bytes);
+                     static_cast<std::size_t>(slot * source_stride_bytes);
     for (std::size_t j = 0; j < options.block_bytes; ++j) {
       blocks[i].data[j] = static_cast<std::uint8_t>(rng());
-      expected[i][j] = blocks[i].data[j];
     }
   }
   // Fault in the selected pages before registering the encompassing segment.
@@ -394,11 +382,16 @@ int main(int argc, char** argv) {
   std::vector<std::size_t> order(options.blocks);
   for (std::size_t i = 0; i < options.blocks; ++i) order[i] = i;
   std::shuffle(order.begin(), order.end(), rng);
+  std::vector<std::uint8_t> expected(static_cast<std::size_t>(total_bytes));
+  for (std::size_t row = 0U; row < options.blocks; ++row) {
+    std::memcpy(expected.data() + row * options.block_bytes,
+                blocks[order[row]].data, options.block_bytes);
+  }
 
   Stats warmup_stats;
   const auto run_pass = [&](bool write, std::size_t iterations, Stats* stats) {
     return RunBatchPass(&transport, write, &blocks, order, options.block_bytes,
-                      iterations, stats, options.remote_sgl_size);
+                        iterations, stats);
   };
   if (options.warmup != 0 && !run_pass(true, options.warmup, &warmup_stats)) {
     (void)transport.Shutdown();
@@ -409,18 +402,40 @@ int main(int argc, char** argv) {
     (void)transport.Shutdown();
     return 1;
   }
-  for (auto& block : blocks) std::fill_n(block.data, options.block_bytes, 0);
-  Stats read_stats;
-  if (!run_pass(false, options.iterations, &read_stats)) {
+  // Verify the packed remote bytes through independent, single-SGE READs.
+  // Reusing the scattered WRITE layout could hide an incorrect gather mapping.
+  MappedRegion readback;
+  readback.bytes = (static_cast<std::size_t>(total_bytes) + page_bytes - 1U) /
+      page_bytes * page_bytes;
+  void* readback_address = mmap(nullptr, readback.bytes, PROT_READ | PROT_WRITE,
+                                mmap_flags, -1, 0);
+  if (readback_address == MAP_FAILED) {
+    std::fprintf(stderr, "[HBM_TEST][CPU] packed READ buffer allocation failed\n");
     (void)transport.Shutdown();
     return 1;
   }
-  bool verified = true;
-  for (std::size_t i = 0; i < blocks.size(); ++i) {
-    verified = verified && std::equal(blocks[i].data,
-                                      blocks[i].data + options.block_bytes,
-                                      expected[i].begin());
+  readback.data = static_cast<std::uint8_t*>(readback_address);
+  std::fill_n(readback.data, static_cast<std::size_t>(total_bytes), 0U);
+  status = transport.RegisterDirectHostMemory(readback.data, readback.bytes);
+  if (!status.ok()) {
+    std::fprintf(stderr, "[HBM_TEST][CPU] packed READ buffer registration failed: %s\n",
+                 status.message().c_str());
+    (void)transport.Shutdown();
+    return 1;
   }
+  std::vector<HostBlock> read_blocks(options.blocks);
+  std::vector<std::size_t> read_order(options.blocks);
+  for (std::size_t row = 0U; row < options.blocks; ++row) {
+    read_blocks[row].data = readback.data + row * options.block_bytes;
+    read_order[row] = row;
+  }
+  Stats read_stats;
+  if (!RunBatchPass(&transport, false, &read_blocks, read_order,
+                    options.block_bytes, options.iterations, &read_stats)) {
+    (void)transport.Shutdown();
+    return 1;
+  }
+  const bool verified = std::equal(expected.begin(), expected.end(), readback.data);
   PrintStats("WRITE", write_stats);
   PrintStats("READ", read_stats);
   std::printf("[HBM_TEST][CPU] %s blocks=%zu block_bytes=%zu seed=%llu\n",

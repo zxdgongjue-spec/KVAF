@@ -67,8 +67,6 @@ achieved CPU-initiated URMA payload rate, not raw HBM silicon bandwidth; with
 Per-batch transport logs are disabled so terminal I/O does not distort the
 measurement. The final summary separates non-contiguous batch `plan`,
 per-sub-batch `setup`, WR `prepare`, hardware `post`, and CQ `poll` wall time.
-The registered coalesced WRITE fast path folds validation and grouping into
-`prepare`, so its separate `plan` value is zero.
 The contiguous READ path has no separate plan, so its validation remains in
 `setup`. A separate `_WALL` line
 keeps the aggregate `submit_wall`, `other`, and `total`; `submit_wall` already
@@ -77,16 +75,14 @@ The explicitly registered host address space is cached as one URMA segment,
 so batch transfers reuse its
 `tseg` directly instead of searching the registration list for every block.
 
-Each WR has one local and one remote SGE. With `--remote-sgl-size N > 1`,
-adjacent local and remote blocks may be coalesced into one WR. `--jettys N`
-selects 1 to 16 Jettys; the default is 4. On the registered coalesced WRITE
-fast path, each Jetty owner validates, groups, and constructs its own WRs in
-one pass. `--prepare-threads N` controls only the generic planning/preparation
-path. Preparation completes before submission. One owner then posts each
-Jetty and polls that Jetty's final CQE;
-different Jettys submit and poll concurrently. Each Jetty supports 8192
-outstanding WRs, so a batch accepts
-at most `8192 * jettys` blocks. The CPU HBM client fixes `OMP_WAIT_POLICY=ACTIVE`
+Each WRITE WR has one contiguous remote SGE and up to the effective local
+source-SGE limit; READ keeps one local and one remote SGE per WR. `--jettys N`
+selects 1 to 16 Jettys; the default is 4. `--prepare-threads N` controls
+parallel grouping and WR preparation. Preparation completes before submission.
+One owner then posts each
+Jetty and polls that Jetty's final CQE; different Jettys submit and poll
+concurrently. Each Jetty queue holds at most 8192 WRs; gathered source blocks
+do not each consume a WR. The CPU HBM client fixes `OMP_WAIT_POLICY=ACTIVE`
 before OpenMP initialization, overriding any inherited policy. It does not
 set CPU affinity; `OMP_PROC_BIND` and `OMP_PLACES` remain caller-controlled.
 
@@ -101,22 +97,24 @@ tests/run_hbm_rw_client.sh <npu-host> 29888 \
   --iterations 10 --warmup 1
 ```
 
-For packed CPU data to multiple remote addresses, use the production
-`run_cpu_batch_put_perf.sh` script with `--remote-sgl-size N`.
+For the production CPU BatchPut path, use `run_cpu_batch_put_perf.sh` with the
+legacy `--remote-sgl-size N` option.
 `CpuRuntime.initialize(..., remote_sgl_size=N)` and
-`kvaf_cpu_urma_eid_perf --remote-sgl-size N` also configure this WRITE grouping.
+`kvaf_cpu_urma_eid_perf --remote-sgl-size N` configure the same WRITE gather.
 
-The CPU HBM client accepts `--remote-sgl-size N` (default 1). Values above 1
-use `WriteBatch` to coalesce up to N rows when both their local and remote
-ranges are contiguous. Each WRITE WR still contains one local and one remote
-SGE because the RC provider does not scatter one WRITE across remote gaps.
-N is a logical row limit rather than a remote-SGE count, so it is not capped by
-`max_jfs_rsge`; the transport starts a new WR before the device's
-`max_msg_size` would be exceeded.
-The client sorts blocks by local address and maps that order to contiguous HBM
-offsets; READ uses the same order for validation. Gaps split groups. The
-summary reports actual `wrs`, which may exceed `ceil(blocks / N)`. Default N=1
-preserves the random baseline.
+The CPU HBM client accepts `--remote-sgl-size N` (default 1). Despite its legacy
+name, N requests the maximum number of local source SGEs in one WRITE WR; the
+effective value is clamped by the device's `max_jfs_sge`. The benchmark source
+blocks remain scattered in the registered CPU address space, while their
+destination offsets are contiguous in HBM. A WR may therefore gather unrelated
+CPU SGEs into one contiguous remote SGE. Every source row is kept as a separate
+local SGE even if two CPU addresses happen to be adjacent. A remote gap, the effective local-SGE
+cap, or `max_msg_size` starts a new WR; this path does not construct remote
+scatter. Validation reads the contiguous HBM range into an independent packed
+CPU buffer with one local and one remote SGE per WR, so a WRITE mapping error
+cannot be hidden by reusing the same scattered layout. The summary reports
+actual `wrs`, which may exceed `ceil(blocks / N)`.
+Default N=1 preserves the one-source-SGE-per-WR baseline.
 
 ```bash
 ./build-cpu/tests/kvaf_cpu_hbm_client HOST:PORT \

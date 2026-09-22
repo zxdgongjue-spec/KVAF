@@ -25,80 +25,6 @@ struct SglGroup {
   std::uint64_t bytes{0};
 };
 
-struct CoalescedWriteSpan {
-  std::size_t first{0};
-  std::size_t count{0};
-  std::uintptr_t local_address{0};
-  std::uint64_t remote_offset{0};
-  std::uint64_t bytes{0};
-};
-
-// Validate and coalesce one owner's [begin, end) rows in a single pass. Emit
-// writes only caller-owned scratch: a later row can still fail validation.
-// No owner may post until every range succeeds. Failure leaves wr_count zero;
-// any scratch emitted before the failure must be discarded.
-template <class Emit>
-KVAF_CPU_URMA_PLAN_HOT inline Status BuildCoalescedWriteRange(
-    const CpuUrmaTransport::HostSge* buffers,
-    const std::uint64_t* remote_offsets, std::size_t row_count,
-    std::size_t begin, std::size_t end, std::size_t max_rows,
-    std::uint64_t remote_bytes, std::uint64_t max_group_bytes,
-    std::size_t wr_capacity, Emit emit, std::size_t* wr_count,
-    bool* capacity_exceeded = nullptr) {
-  if (capacity_exceeded != nullptr) *capacity_exceeded = false;
-  if (wr_count == nullptr) {
-    return Status::InvalidArgument("missing WRITE range WR count");
-  }
-  *wr_count = 0U;
-  if (begin > end || end > row_count || max_rows == 0U ||
-      max_group_bytes == 0U) {
-    return Status::InvalidArgument("invalid WRITE range");
-  }
-  if (begin == end) return Status::OK();
-  if (buffers == nullptr || remote_offsets == nullptr) {
-    return Status::InvalidArgument("missing WRITE range rows");
-  }
-  const auto max_bytes = std::min<std::uint64_t>(
-      max_group_bytes, std::numeric_limits<std::uint32_t>::max());
-  std::size_t emitted = 0U;
-  CoalescedWriteSpan span{};
-  const auto flush = [&]() {
-    if (emitted == wr_capacity) {
-      if (capacity_exceeded != nullptr) *capacity_exceeded = true;
-      return false;
-    }
-    emit(emitted++, span);
-    return true;
-  };
-  for (std::size_t row = begin; row < end; ++row) {
-    const auto address = reinterpret_cast<std::uintptr_t>(buffers[row].data);
-    const auto bytes = buffers[row].bytes;
-    const auto offset = remote_offsets[row];
-    if (address == 0U || bytes == 0U || bytes > max_bytes ||
-        bytes > std::numeric_limits<std::uintptr_t>::max() - address ||
-        offset > remote_bytes || bytes > remote_bytes - offset) {
-      return Status::InvalidArgument("WRITE row is outside its buffer or remote region");
-    }
-    if (span.count != 0U && span.count < max_rows &&
-        bytes <= max_bytes - span.bytes &&
-        address == span.local_address + span.bytes &&
-        offset == span.remote_offset + span.bytes) {
-      ++span.count;
-      span.bytes += bytes;
-      continue;
-    }
-    if (span.count != 0U && !flush()) {
-      return Status::InvalidArgument("WRITE range exceeds WR capacity");
-    }
-    span = {row, 1U, address, offset, bytes};
-  }
-  if (!flush()) {
-    return Status::InvalidArgument("WRITE range exceeds WR capacity");
-  }
-  *wr_count = emitted;
-  return Status::OK();
-}
-
 // One independently planned contiguous range. A caller may process different
 // slices concurrently because each worker writes only its own status/groups.
 // Group indices remain relative to the slice until MergeSglPlanSlices().
@@ -136,22 +62,20 @@ inline Status PrepareSglPlanSlices(std::size_t row_count,
   return Status::OK();
 }
 
-KVAF_CPU_URMA_PLAN_HOT inline bool GroupsFitRegisteredRegion(
+KVAF_CPU_URMA_PLAN_HOT inline bool RowsFitRegisteredRegion(
     const CpuUrmaTransport::HostSge* buffers,
-    const SglGroup* groups,
-    std::size_t group_count,
+    std::size_t count,
     const void* region_address,
     std::size_t region_bytes) {
-  if (buffers == nullptr || groups == nullptr || group_count == 0U ||
+  if (buffers == nullptr || count == 0U ||
       region_address == nullptr || region_bytes == 0U) {
     return false;
   }
   const auto base = reinterpret_cast<std::uintptr_t>(region_address);
-  for (std::size_t i = 0U; i < group_count; ++i) {
-    const std::size_t first = groups[i].first - groups[0].first;
-    const auto requested = reinterpret_cast<std::uintptr_t>(buffers[first].data);
-    if (requested < base || groups[i].bytes > region_bytes ||
-        requested - base > region_bytes - groups[i].bytes) {
+  for (std::size_t i = 0U; i < count; ++i) {
+    const auto requested = reinterpret_cast<std::uintptr_t>(buffers[i].data);
+    if (requested < base || buffers[i].bytes > region_bytes ||
+        requested - base > region_bytes - buffers[i].bytes) {
       return false;
     }
   }
@@ -163,15 +87,18 @@ KVAF_CPU_URMA_PLAN_HOT inline Status ValidateBatchRows(
     const CpuUrmaTransport::HostSge* buffers,
     const std::uint64_t* offsets,
     std::size_t count,
-    std::uint64_t remote_bytes) {
+    std::uint64_t remote_bytes,
+    std::uint64_t max_row_bytes =
+        std::numeric_limits<std::uint32_t>::max()) {
   if (buffers == nullptr || offsets == nullptr || count == 0U) {
     return Status::InvalidArgument("invalid batch rows");
   }
+  const auto max_bytes = std::min<std::uint64_t>(
+      max_row_bytes, std::numeric_limits<std::uint32_t>::max());
   for (std::size_t i = 0U; i < count; ++i) {
     const auto address = reinterpret_cast<std::uintptr_t>(buffers[i].data);
     const auto bytes = buffers[i].bytes;
-    if (address == 0U || bytes == 0U ||
-        bytes > std::numeric_limits<std::uint32_t>::max() ||
+    if (address == 0U || bytes == 0U || bytes > max_bytes ||
         bytes > std::numeric_limits<std::uintptr_t>::max() - address ||
         offsets[i] > remote_bytes || bytes > remote_bytes - offsets[i]) {
       return Status::InvalidArgument(
@@ -181,13 +108,14 @@ KVAF_CPU_URMA_PLAN_HOT inline Status ValidateBatchRows(
   return Status::OK();
 }
 
-// Coalesce up to remote_sgl_size rows only when both local and remote ranges
-// are contiguous. RC WRITE consumes one remote SGE, so remote gaps must start
-// a new WR even when the local source remains contiguous.
-KVAF_CPU_URMA_PLAN_HOT inline Status PlanWriteCoalescedGroups(
+// Gather up to local_sgl_size CPU rows into one WR when their remote HBM
+// destinations form a contiguous range. Every row remains a distinct local
+// SGE, even when two local addresses are adjacent. RC WRITE uses one remote
+// SGE, so a remote gap always starts a new WR.
+KVAF_CPU_URMA_PLAN_HOT inline Status PlanWriteGatherGroups(
     const CpuUrmaTransport::HostSge* buffers,
     const std::uint64_t* remote_offsets,
-    std::size_t count, std::size_t remote_sgl_size,
+    std::size_t count, std::size_t local_sgl_size,
     std::uint64_t remote_bytes,
     std::vector<SglGroup>* groups,
     std::uint64_t max_group_bytes =
@@ -195,53 +123,40 @@ KVAF_CPU_URMA_PLAN_HOT inline Status PlanWriteCoalescedGroups(
   if (groups == nullptr) return Status::InvalidArgument("missing SGL plan output");
   groups->clear();
   if (buffers == nullptr || remote_offsets == nullptr || count == 0 ||
-      remote_sgl_size == 0 || max_group_bytes == 0)
-    return Status::InvalidArgument("invalid WRITE coalescing plan input");
+      local_sgl_size == 0 || max_group_bytes == 0)
+    return Status::InvalidArgument("invalid WRITE gather plan input");
   const auto max_bytes = std::min<std::uint64_t>(
       max_group_bytes, std::numeric_limits<std::uint32_t>::max());
-  const auto group_is_valid = [&](const SglGroup& group) {
-    const auto address = reinterpret_cast<std::uintptr_t>(buffers[group.first].data);
-    const auto offset = remote_offsets[group.first];
-    return group.bytes <= std::numeric_limits<std::uintptr_t>::max() - address &&
-        offset <= remote_bytes && group.bytes <= remote_bytes - offset;
-  };
   for (std::size_t i = 0; i < count; ++i) {
     const auto bytes = buffers[i].bytes;
     const auto address = reinterpret_cast<std::uintptr_t>(buffers[i].data);
     const auto offset = remote_offsets[i];
-    if (address == 0 || bytes == 0 || bytes > max_bytes) {
+    if (address == 0 || bytes == 0 || bytes > max_bytes ||
+        bytes > std::numeric_limits<std::uintptr_t>::max() - address ||
+        offset > remote_bytes || bytes > remote_bytes - offset) {
       groups->clear();
       return Status::InvalidArgument("invalid WRITE row");
     }
     if (!groups->empty()) {
       auto& previous = groups->back();
-      const auto base = reinterpret_cast<std::uintptr_t>(buffers[previous.first].data);
       const auto remote_base = remote_offsets[previous.first];
-      if (previous.count < remote_sgl_size && bytes <= max_bytes - previous.bytes &&
-          address == base + previous.bytes &&
+      if (previous.count < local_sgl_size &&
+          bytes <= max_bytes - previous.bytes &&
           offset == remote_base + previous.bytes) {
         ++previous.count;
         previous.bytes += bytes;
         continue;
       }
-      if (!group_is_valid(previous)) {
-        groups->clear();
-        return Status::InvalidArgument("WRITE group is outside its buffer or remote region");
-      }
     }
     groups->push_back(SglGroup{i, 1, bytes});
-  }
-  if (!group_is_valid(groups->back())) {
-    groups->clear();
-    return Status::InvalidArgument("WRITE group is outside its buffer or remote region");
   }
   return Status::OK();
 }
 
-inline Status PlanWriteCoalescedSlice(
+inline Status PlanWriteGatherSlice(
     const CpuUrmaTransport::HostSge* buffers,
     const std::uint64_t* remote_offsets,
-    std::size_t row_count, std::size_t remote_sgl_size,
+    std::size_t row_count, std::size_t local_sgl_size,
     std::uint64_t remote_bytes, SglPlanSlice* slice,
     std::uint64_t max_group_bytes =
         std::numeric_limits<std::uint32_t>::max()) {
@@ -254,9 +169,9 @@ inline Status PlanWriteCoalescedSlice(
     slice->status = Status::InvalidArgument("invalid SGL plan slice");
     return slice->status;
   }
-  slice->status = PlanWriteCoalescedGroups(
+  slice->status = PlanWriteGatherGroups(
       buffers + slice->first, remote_offsets + slice->first, slice->count,
-      remote_sgl_size, remote_bytes, &slice->groups, max_group_bytes);
+      local_sgl_size, remote_bytes, &slice->groups, max_group_bytes);
   return slice->status;
 }
 

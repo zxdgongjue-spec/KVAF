@@ -40,15 +40,15 @@ struct CpuUrmaTransportOptions {
   // urma_post_jetty_send_wr call. Zero prepares and submits one full linked
   // list per Jetty.
   std::uint32_t wqes_per_doorbell{0};
-  // WRITE only: maximum adjacent rows coalesced into one contiguous local and
-  // remote SGE. Local or remote gaps start a new WR.
+  // Legacy public name. WRITE gathers up to this many local source SGEs into
+  // one contiguous remote HBM SGE. Every input row remains a distinct SGE.
+  // Device max_jfs_sge, max_msg_size, or a remote gap may split the WR earlier.
   std::uint32_t remote_sgl_size{1};
   // Number of independent Jettys and their submission/CQ owners.
   std::uint32_t jetty_count{4};
   bool has_external_region{false};
   peer::PeerRegion external_region{};
-  // Maximum CPU workers used by the generic planner/preparer. The registered
-  // coalesced WRITE fast path instead fuses preparation into each Jetty owner.
+  // Maximum CPU workers used by WRITE planning and WR preparation.
   std::uint32_t prepare_thread_count{4};
 };
 
@@ -85,14 +85,16 @@ class CpuUrmaTransport final {
     void* data;
     std::size_t bytes;
   };
-  // One local SGE per WR. Preparation may span more CPU workers than Jettys;
-  // after a barrier, each Jetty has one submission and CQ owner.
+  // Legacy one-local-SGE API for a packed remote range. Preparation may span
+  // more CPU workers than Jettys; after a barrier, each Jetty has one
+  // submission and CQ owner.
   Status WriteSglBatch(std::uint64_t remote_offset, const HostSge* sources,
                        std::size_t count);
-  // CPU BatchPut path: transfer packed CPU DRAM rows into independent HBM
-  // destinations. This is the CPU-initiated equivalent of AIV BatchGet READs.
-  // With remote_sgl_size > 1, adjacent local and remote rows may share one
-  // contiguous WR. Otherwise, each row uses one WR.
+  // CPU BatchPut path: gather CPU DRAM rows into HBM destinations. This is the
+  // CPU-initiated equivalent of AIV BatchGet READs.
+  // With remote_sgl_size > 1, rows targeting adjacent HBM ranges may share one
+  // WR even when their local CPU addresses are unrelated. The WR gathers one
+  // or more local source SGEs into one contiguous remote destination SGE.
   // Queue capacity is applied after grouping, with shared completion fences.
   Status WriteBatch(const std::uint64_t* remote_offsets,
                     const HostSge* sources, std::size_t count);

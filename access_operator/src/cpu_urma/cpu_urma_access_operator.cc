@@ -82,9 +82,9 @@ Status CpuUrmaAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& request
     batch_used_sources_[source_index] = 1U;
   }
   // AIV BatchGet binds its complete HBM output before posting READs. For the
-  // corresponding CPU DRAM -> HBM flow, bind each complete packed CPU input
-  // once so all row SGEs reuse the same registered host segment. Providers
-  // that reject the larger range fall back to per-row registration below.
+  // corresponding CPU DRAM -> HBM flow, bind each complete CPU source buffer
+  // once so its distinct row SGEs reuse the same registered host segment.
+  // Providers that reject the larger range fall back to per-row registration.
   for (std::size_t index = 0; index < request.plan->sources.size(); ++index) {
     if (batch_used_sources_[index] == 0U) continue;
     const ConstBufferView& source = request.plan->sources[index];
