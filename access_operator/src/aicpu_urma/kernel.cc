@@ -44,15 +44,24 @@ void Flush(const void* address, std::uint64_t bytes) {
 #endif
 }
 
-template <typename Entity, typename Queue>
-bool Valid(const Entity& entity, const Queue& queue) {
+template <typename Entity>
+bool ValidEntity(const Entity& entity) {
   return entity.magic == kEntityMagic && entity.version == 1U &&
          entity.remote_host_ddr_address != 0U && entity.remote_host_ddr_size != 0U &&
          entity.remote_token_id != 0U && entity.remote_token_value != 0U &&
          entity.sq_va != 0U && entity.sq_db_va != 0U && entity.sq_depth >= 2U &&
          entity.wqe_size == 64U && entity.cq_va != 0U && entity.cq_db_va != 0U &&
-         entity.cq_depth != 0U && entity.cqe_size >= 32U &&
-         (queue.initialized == 0U || queue.magic == kQueueMagic);
+         entity.cq_depth != 0U && entity.cqe_size >= 32U;
+}
+
+template <typename Queue>
+bool ValidQueue(const Queue& queue) {
+  return queue.initialized == 0U || queue.magic == kQueueMagic;
+}
+
+template <typename Entity, typename Queue>
+bool Valid(const Entity& entity, const Queue& queue) {
+  return ValidEntity(entity) && ValidQueue(queue);
 }
 
 template <typename Queue>
@@ -147,25 +156,36 @@ bool MakeGetTransfer(const KvafExecuteBatchGetKernelArgs& args,
 
 extern "C" __attribute__((visibility("default")))
 std::uint32_t KvafAicpuUrmaBatchPut(KvafExecuteBatchPutLaunchArgs* args) {
-  if (args == nullptr || args->request.row_count == 0U || args->request.aiv_core_count != 1U ||
-      args->reserved0 == 0U || args->reserved0 > args->request.row_count ||
-      args->jettys_per_core != 1U || args->channel_entity == 0U || args->queue_state == 0U)
-    return 1U;
+  if (args == nullptr || args->request.core_status == 0U) return 1U;
   const auto& request = args->request;
-  auto& entity = *reinterpret_cast<KvafBatchPutDirectUrmaEntity*>(args->channel_entity);
-  auto& queue = *reinterpret_cast<KvafBatchPutQueueState*>(args->queue_state);
   auto& status = *reinterpret_cast<KvafBatchPutCoreStatus*>(request.core_status);
   status = {};
   status.magic = KVAF_AIV_BATCH_PUT_STATUS_MAGIC;
-  status.result = 2U;
+  status.result = KVAF_BATCH_PUT_CORE_INVALID_ARGUMENT;
   status.failed_request_index = UINT64_MAX;
-  if (!Valid(entity, queue) || request.source_descriptors == 0U ||
-      request.source_indices == 0U || request.input_offsets == 0U ||
-      request.lengths == 0U || request.destination_addresses == 0U) {
+  if (request.row_count == 0U || request.aiv_core_count != 1U ||
+      args->reserved0 == 0U || args->reserved0 > request.row_count ||
+      args->jettys_per_core != 1U || args->channel_entity == 0U || args->queue_state == 0U ||
+      request.source_descriptors == 0U || request.source_indices == 0U ||
+      request.input_offsets == 0U || request.lengths == 0U ||
+      request.destination_addresses == 0U) {
     Flush(&status, sizeof(status));
-    return 1U;
+    return 0U;
+  }
+  auto& entity = *reinterpret_cast<KvafBatchPutDirectUrmaEntity*>(args->channel_entity);
+  auto& queue = *reinterpret_cast<KvafBatchPutQueueState*>(args->queue_state);
+  if (!ValidEntity(entity)) {
+    status.result = KVAF_BATCH_PUT_CORE_INVALID_ENTITY;
+    Flush(&status, sizeof(status));
+    return 0U;
+  }
+  if (!ValidQueue(queue)) {
+    status.result = KVAF_BATCH_PUT_CORE_INVALID_QUEUE;
+    Flush(&status, sizeof(status));
+    return 0U;
   }
   Initialize(queue);
+  status.result = KVAF_BATCH_PUT_CORE_SUCCESS;
   const auto* sources = reinterpret_cast<const KvafBatchPutSourceDescriptor*>(request.source_descriptors);
   const auto* source_indices = reinterpret_cast<const std::uint32_t*>(request.source_indices);
   const auto* offsets = reinterpret_cast<const std::uint64_t*>(request.input_offsets);
@@ -180,20 +200,31 @@ std::uint32_t KvafAicpuUrmaBatchPut(KvafExecuteBatchPutLaunchArgs* args) {
   std::uint32_t count = 0U;
   for (std::uint32_t index = 0U; index < request.row_count; ++index) {
     if (source_indices[index] >= args->reserved0) {
-      status.result = 5U;
+      status.result = KVAF_BATCH_PUT_CORE_INVALID_SOURCE_RANGE;
       status.failed_request_index = index;
       Flush(&status, sizeof(status));
-      return 1U;
+      return 0U;
     }
     const auto& source = sources[source_indices[index]];
     const auto length = lengths[index];
-    if (length == 0U || length > UINT32_MAX || source.base_address > UINT64_MAX - offsets[index] ||
-        !InRange(entity.remote_host_ddr_address, entity.remote_host_ddr_size,
-                 destinations[index], length) || source.local_token_id == 0U) {
-      status.result = 5U;
+    if (length == 0U || length > UINT32_MAX) {
+      status.result = KVAF_BATCH_PUT_CORE_INVALID_LENGTH;
       status.failed_request_index = index;
       Flush(&status, sizeof(status));
-      return 1U;
+      return 0U;
+    }
+    if (source.base_address > UINT64_MAX - offsets[index] || source.local_token_id == 0U) {
+      status.result = KVAF_BATCH_PUT_CORE_INVALID_SOURCE_RANGE;
+      status.failed_request_index = index;
+      Flush(&status, sizeof(status));
+      return 0U;
+    }
+    if (!InRange(entity.remote_host_ddr_address, entity.remote_host_ddr_size,
+                 destinations[index], length)) {
+      status.result = KVAF_BATCH_PUT_CORE_INVALID_DESTINATION_RANGE;
+      status.failed_request_index = index;
+      Flush(&status, sizeof(status));
+      return 0U;
     }
     const auto local = source.base_address + offsets[index];
     Flush(reinterpret_cast<void*>(local), length);
@@ -210,7 +241,7 @@ std::uint32_t KvafAicpuUrmaBatchPut(KvafExecuteBatchPutLaunchArgs* args) {
   if (status.result == 0U) status.completed_batch_count = 1U;
   Flush(&queue, sizeof(queue));
   Flush(&status, sizeof(status));
-  return status.result == 0U ? 0U : 1U;
+  return 0U;
 }
 
 extern "C" __attribute__((visibility("default")))

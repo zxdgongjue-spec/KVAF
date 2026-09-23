@@ -21,7 +21,9 @@ kernel 并发使用；异步 BatchGet 需要调用方在释放输出/transport �
 `build.sh` 自动检测 CANN 根目录；`--install-kernel` 显式安装到同一目录，
 需要写入权限。不传该选项时只构建，不修改 CANN。原生客户端默认使用构建时的
 CANN 路径查找 AICPU JSON，并使用单 worker、单 Jetty；无需配置 `CANN_ROOT`
-或提供 AIV kernel object 路径。服务端仍是 KVAF 原有 CPU Runtime 服务。
+或提供 AIV kernel object 路径。若 `ASCEND_HOME_PATH` 未设置，客户端在 ACL 初始化前
+将其设为构建时的 CANN 根目录，以便设备包加载器找到安装包；显式设置的值不覆盖。
+服务端仍是 KVAF 原有 CPU Runtime 服务。
 
 Host 单测：`ctest --test-dir build-aicpu-urma -R kvaf_aicpu_urma_ --output-on-failure`。
 无需 CANN 的机器也可运行：`cmake -S . -B build-host -DBUILD_TESTING=ON && cmake --build build-host --target kvaf_aicpu_urma_wqe_test kvaf_aicpu_urma_kernel_test kvaf_aicpu_urma_client_options_test && ctest --test-dir build-host -R kvaf_aicpu_urma_ --output-on-failure`。
@@ -73,3 +75,9 @@ grep -R -nE '507018|PrintAicpuErrorInfo|HandleTaskTimeout|KvafAicpuUrma' \
 
 使用同一 CPU peer 的纯 AIV WRITE 探针可作为对照，但不能跳过 AICPU 探针直接
 选定 EID：这会把 AICPU 执行失败延后到正式 BatchPut。
+
+如果设置 CANN 根目录后变成 `execute kernel param invalid`，说明 `.so` 已加载，
+但旧版 AICPU 内核把所有失败都返回为任务错误。新版同步 BatchPut 在状态缓冲区
+可用时通过 `BATCH_PUT_DEVICE_ERROR` 输出具体 `result`：1=入参形状，
+2=entity，3=队列，4=源地址，5=目标地址，6=SQ 已满，7=CQ 超时，
+8=CQ 错误，9=长度；`failed_request` 给出失败的请求索引。

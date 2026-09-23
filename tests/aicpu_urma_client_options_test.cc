@@ -24,6 +24,18 @@ int main() {
 #if defined(KVAF_AICPU_URMA_CANN_ROOT)
   assert(default_options.kernel_json.rfind(KVAF_AICPU_URMA_CANN_ROOT, 0) == 0);
 #endif
+  const char* saved_home = std::getenv("ASCEND_HOME_PATH");
+  const bool had_home = saved_home != nullptr;
+  const std::string previous_home = saved_home == nullptr ? "" : saved_home;
+  assert(unsetenv("ASCEND_HOME_PATH") == 0);
+  const std::string default_root = kvaf::aicpu_urma_client::DefaultCannRoot();
+  assert(kvaf::aicpu_urma_client::ConfigureCannEnvironment());
+  assert(std::string(std::getenv("ASCEND_HOME_PATH")) == default_root);
+  assert(setenv("ASCEND_HOME_PATH", "/custom/cann", 1) == 0);
+  assert(kvaf::aicpu_urma_client::ConfigureCannEnvironment());
+  assert(std::string(std::getenv("ASCEND_HOME_PATH")) == "/custom/cann");
+  if (!had_home) assert(unsetenv("ASCEND_HOME_PATH") == 0);
+  else assert(setenv("ASCEND_HOME_PATH", previous_home.c_str(), 1) == 0);
   constexpr const char* valid[] = {"client", "--peer", "127.0.0.1:28999", "--kernel-json", "/tmp/kernel.json",
                                    "--blocks", "16", "--block-bytes", "4096", "--token-bytes", "256",
                                    "--warmup", "0", "--iterations", "5", "--seed", "123",

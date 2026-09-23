@@ -15,6 +15,7 @@ namespace {
 using kvaf::aicpu_urma_client::Options;
 using kvaf::aicpu_urma_client::Parse;
 using kvaf::aicpu_urma_client::DefaultKernelJson;
+using kvaf::aicpu_urma_client::ConfigureCannEnvironment;
 
 void Usage(const char* program) {
   std::fprintf(stderr,
@@ -265,6 +266,8 @@ int main(int argc, char** argv) {
     return 2;
   }
   try {
+    if (!ConfigureCannEnvironment())
+      throw std::runtime_error("failed to set ASCEND_HOME_PATH for the CANN package loader");
     return Run(options);
   } catch (const std::exception& error) {
     std::fprintf(stderr, "[KVAF_AICPU_URMA] FAIL: %s\n", error.what());

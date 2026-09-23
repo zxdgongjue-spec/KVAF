@@ -9,7 +9,7 @@
 
 namespace kvaf::aicpu_urma_client {
 
-inline std::string DefaultKernelJson() {
+inline std::string DefaultCannRoot() {
 #if defined(KVAF_AICPU_URMA_CANN_ROOT)
   const char* root = KVAF_AICPU_URMA_CANN_ROOT;
 #else
@@ -17,7 +17,17 @@ inline std::string DefaultKernelJson() {
   if (root == nullptr || root[0] == '\0') root = std::getenv("ASCEND_HOME_PATH");
   if (root == nullptr || root[0] == '\0') root = "/usr/local/Ascend/ascend-toolkit/latest";
 #endif
-  return std::string(root) + "/opp/vendors/cust/op_impl/aicpu/config/kvaf_aicpu_urma.json";
+  return root;
+}
+
+inline std::string DefaultKernelJson() {
+  return DefaultCannRoot() + "/opp/vendors/cust/op_impl/aicpu/config/kvaf_aicpu_urma.json";
+}
+
+inline bool ConfigureCannEnvironment() {
+  const char* current = std::getenv("ASCEND_HOME_PATH");
+  if (current != nullptr && current[0] != '\0') return true;
+  return setenv("ASCEND_HOME_PATH", DefaultCannRoot().c_str(), 1) == 0;
 }
 
 struct Options {

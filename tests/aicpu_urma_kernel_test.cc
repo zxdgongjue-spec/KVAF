@@ -67,7 +67,23 @@ void Put() {
   assert(sq[1] == kvaf::aicpu_urma::kWriteOpcode << 8U);
   assert(sq[32 * 16 + 1] == kvaf::aicpu_urma::kWriteOpcode << 8U);
   source_indices[0] = 2U;
-  assert(KvafAicpuUrmaBatchPut(&args) != 0U && status.failed_request_index == 0U);
+  assert(KvafAicpuUrmaBatchPut(&args) == 0U &&
+         status.result == KVAF_BATCH_PUT_CORE_INVALID_SOURCE_RANGE &&
+         status.failed_request_index == 0U);
+  assert(sq_doorbell == 33U);
+  args.reserved0 = 0U;
+  assert(KvafAicpuUrmaBatchPut(&args) == 0U &&
+         status.result == KVAF_BATCH_PUT_CORE_INVALID_ARGUMENT);
+  assert(sq_doorbell == 33U);
+  args.reserved0 = 1U;
+  source_indices[0] = 0U;
+  entity.magic = 0U;
+  assert(KvafAicpuUrmaBatchPut(&args) == 0U &&
+         status.result == KVAF_BATCH_PUT_CORE_INVALID_ENTITY);
+  entity.magic = 0x4b564155U;
+  queue.magic = 0U;
+  assert(KvafAicpuUrmaBatchPut(&args) == 0U &&
+         status.result == KVAF_BATCH_PUT_CORE_INVALID_QUEUE);
   assert(sq_doorbell == 33U);
 }
 
