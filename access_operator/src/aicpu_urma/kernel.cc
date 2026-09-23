@@ -90,7 +90,7 @@ std::uint32_t Submit(const Entity& entity, Queue& queue,
     const auto slot = producer % entity.sq_depth;
     std::uint32_t words[16];
     EncodeWqe(words, endpoint, transfers[index], opcode,
-              1U - static_cast<std::uint32_t>((producer / entity.sq_depth) & 1U),
+              static_cast<std::uint32_t>((producer / entity.sq_depth) & 1U),
               index + 1U == count);
     auto* destination = reinterpret_cast<void*>(entity.sq_va + slot * 64U);
     std::memcpy(destination, words, sizeof(words));

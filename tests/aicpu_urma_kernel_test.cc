@@ -65,6 +65,7 @@ void Put() {
   assert(status.processed_request_count == 33U && status.failed_request_index == UINT64_MAX);
   assert(status.cq_status == 0U && status.cq_sub_status == 0U && status.reserved[0] == 0U);
   assert(sq_doorbell == 33U && cq_doorbell == 2U);
+  assert(sq[0] == 0x30150000U && sq[32 * 16] == 0x303e0000U);
   assert(sq[1] == kvaf::aicpu_urma::kWriteOpcode << 8U);
   assert(sq[32 * 16 + 1] == kvaf::aicpu_urma::kWriteOpcode << 8U);
   source_indices[0] = 2U;
@@ -100,6 +101,13 @@ void Put() {
          status.processed_request_count == 32U &&
          status.cq_status == 7U && status.cq_sub_status == 9U &&
          status.reserved[0] == cq[8]);
+  queue = {};
+  queue.magic = 0x4b564151U;
+  queue.initialized = 1U;
+  queue.sq_producer_index = entity.sq_depth;
+  cq[8] = 4U;
+  assert(KvafAicpuUrmaBatchPut(&args) == 0U && status.result == 0U);
+  assert(sq[0] == 0xb0150000U && sq[32 * 16] == 0xb03e0000U);
 }
 
 void Get() {

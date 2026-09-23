@@ -28,7 +28,8 @@ inline void EncodeWqe(std::uint32_t (&words)[16], const Endpoint& endpoint,
                       std::uint32_t owner, bool completion) {
   std::memset(words, 0, sizeof(words));
   const std::uint32_t place_order = completion ? 2U : 1U;
-  words[0] = (place_order << 16U) | (1U << 18U) | (1U << 20U) |
+  words[0] = (place_order << 16U) | (1U << 18U) |
+             (static_cast<std::uint32_t>(completion) << 19U) | (1U << 20U) |
              (static_cast<std::uint32_t>(completion) << 21U) | (1U << 28U) |
              (1U << 29U) | ((owner & 1U) << 31U);
   words[1] = opcode << 8U;

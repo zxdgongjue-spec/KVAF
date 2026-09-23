@@ -118,3 +118,21 @@ build-aicpu-urma/tests/kvaf_aicpu_urma_client \
 缓存可见性和门铃顺序；若两者在同一候选均返回 `2/2`，先检查共享的 WQE 字段、
 token、地址与 PeerLink 资源。两种后端的批量 WQE 目前都是单 SGE/WQE，
 `--blocks` 不会将一个 WQE 变为多 SGL。
+
+后续 AIV 对照在 `peer_candidate=9` 的两个 NPU EID 上也得到 `status=2`、
+`sub_status=2`。AIV 的 `processed=1` 只表示请求已发出，不能视为 WRITE 成功；
+其 `cqe_word=0` 是因为 AIV 未保存原始 CQE。由此可以排除 AICPU 独有的提交路径
+是唯一原因，但仍不能从该片段确定 26 个 CPU 候选的最终结果。
+
+共享 WQE 控制字与本地 HCOMM AICPU 实现对照后，发现 KVAF 首轮 SQE 使用
+`owner=1` 且末条未设置 `fence`，而 HCOMM 使用首轮 `owner=0`、末条 `fence=1`。
+现已统一修正 AICPU 和 AIV BatchPut/BatchGet 编码；这是有依据的故障假设，
+尚未经过真机验证。重新构建后先用同一 peer 跑两种后端的单 block 探针：
+
+```bash
+./build.sh aicpu-urma --install-kernel --compare-aiv
+build-aicpu-urma/tests/kvaf_aicpu_urma_client \
+  --backend aiv --peer 127.0.0.1:28991 --blocks 1 --warmup 0 --iterations 1
+build-aicpu-urma/tests/kvaf_aicpu_urma_client \
+  --backend aicpu --peer 127.0.0.1:28991 --blocks 1 --warmup 0 --iterations 1
+```

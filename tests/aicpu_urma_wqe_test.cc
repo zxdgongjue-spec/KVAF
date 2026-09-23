@@ -16,8 +16,8 @@ int main() {
   for (const auto opcode : {kvaf::aicpu_urma::kReadOpcode,
                             kvaf::aicpu_urma::kWriteOpcode}) {
     std::uint32_t words[16];
-    kvaf::aicpu_urma::EncodeWqe(words, endpoint, transfer, opcode, 1, true);
-    assert(words[0] == 0xb0360000U);
+    kvaf::aicpu_urma::EncodeWqe(words, endpoint, transfer, opcode, 0, true);
+    assert(words[0] == 0x303e0000U);
     assert(words[1] == opcode << 8U);
     assert(words[2] == 0x01345678U && words[3] == 0x00034567U);
     assert(std::memcmp(&words[4], endpoint.remote_eid, 16) == 0);
@@ -25,6 +25,10 @@ int main() {
     assert(words[10] == 0x55667788U && words[11] == 0x11223344U);
     assert(words[12] == 4096U && words[13] == 27U);
     assert(words[14] == 0xddeeff00U && words[15] == 0x99aabbccU);
+    kvaf::aicpu_urma::EncodeWqe(words, endpoint, transfer, opcode, 0, false);
+    assert(words[0] == 0x30150000U);
+    kvaf::aicpu_urma::EncodeWqe(words, endpoint, transfer, opcode, 1, true);
+    assert(words[0] == 0xb03e0000U);
   }
   assert(kvaf::aicpu_urma::InRange(0x1000, 0x100, 0x1080, 0x80));
   assert(!kvaf::aicpu_urma::InRange(0x1000, 0x100, 0x1080, 0x81));
