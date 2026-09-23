@@ -18,6 +18,26 @@ add_test(NAME kvaf_aicpu_urma_kernel COMMAND kvaf_aicpu_urma_kernel_test)
 add_executable(kvaf_aicpu_urma_client_options_test aicpu_urma_client_options_test.cc)
 add_test(NAME kvaf_aicpu_urma_client_options COMMAND kvaf_aicpu_urma_client_options_test)
 
+add_executable(kvaf_aiv_batch_roundtrip_options_test aiv_batch_roundtrip_options_test.cc)
+add_test(NAME kvaf_aiv_batch_roundtrip_options COMMAND kvaf_aiv_batch_roundtrip_options_test)
+
+if(KVAF_ENABLE_AIV_BATCH_PUT)
+  add_executable(kvaf_aiv_batch_roundtrip aiv_batch_roundtrip.cc)
+  target_compile_definitions(kvaf_aiv_batch_roundtrip PRIVATE
+    "KVAF_AIV_NATIVE_CANN_ROOT=\"${ASCEND_CANN_PACKAGE_PATH}\""
+    "KVAF_AIV_NATIVE_BUILD_DIR=\"${CMAKE_BINARY_DIR}\"")
+  target_include_directories(kvaf_aiv_batch_roundtrip PRIVATE
+    "${CMAKE_SOURCE_DIR}/runtime/src"
+    "${ASCEND_CANN_PACKAGE_PATH}/include")
+  target_link_directories(kvaf_aiv_batch_roundtrip PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/lib64")
+  target_link_libraries(kvaf_aiv_batch_roundtrip PRIVATE
+    kvaf_peer_link kvaf_direct_hccp_session
+    kvaf_execute_batch_put_host kvaf_execute_batch_get_host ascendcl ${CMAKE_DL_LIBS})
+  target_compile_features(kvaf_aiv_batch_roundtrip PRIVATE cxx_std_17)
+  set_property(TARGET kvaf_aiv_batch_roundtrip APPEND PROPERTY BUILD_RPATH
+    "${ASCEND_CANN_PACKAGE_PATH}/lib64")
+endif()
+
 if(KVAF_ENABLE_AICPU_URMA)
   add_executable(kvaf_aicpu_urma_client aicpu_urma_client.cc)
   target_compile_definitions(kvaf_aicpu_urma_client PRIVATE

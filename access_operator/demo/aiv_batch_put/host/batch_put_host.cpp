@@ -177,30 +177,15 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
                  static_cast<unsigned long long>(aligned_bytes));
     return false;
   }
-  const uint32_t registered_token_id = info.out.ub.token_id >> kTokenIdShift;
-  if (registered_token_id == 0U) {
-    std::fprintf(stderr,
-                 "[KVAF_AIV] DIRECT_MEMORY_REGISTER_FAILED role=%s reason=invalid_registered_token "
-                 "allocated_token_id=0x%x registered_raw_token_id=0x%x\n",
-                 role, token_id, info.out.ub.token_id);
-    return false;
-  }
-  if (registered_token_id != token_id) {
-    std::fprintf(stderr,
-                 "[KVAF_AIV] DIRECT_MEMORY_TOKEN_MISMATCH role=%s allocated_token_id=0x%x "
-                 "registered_token_id=0x%x\n",
-                 role, token_id, registered_token_id);
-  }
   memory->registered_address = aligned_address;
   memory->registered_bytes = aligned_bytes;
-  memory->token_id = registered_token_id;
+  memory->token_id = token_id;
   memory->token_value = token_value;
   memory->key_bytes = info.out.key.size;
   std::memcpy(memory->key, info.out.key.value, memory->key_bytes);
   hccp::VerboseLog(
-      "[KVAF_AIV] DIRECT_MEMORY_REGISTERED role=%s token_id=0x%x raw_token_id=0x%x "
-      "host_or_hbm_va=0x%llx bytes=%llu\n",
-      role, memory->token_id, info.out.ub.token_id, static_cast<unsigned long long>(aligned_address),
+      "[KVAF_AIV] DIRECT_MEMORY_REGISTERED role=%s token_id=0x%x host_or_hbm_va=0x%llx bytes=%llu\n",
+      role, memory->token_id, static_cast<unsigned long long>(aligned_address),
       static_cast<unsigned long long>(aligned_bytes));
   return true;
 }
@@ -560,17 +545,26 @@ static int32_t ExecuteBatchPutSync(KvafBatchPutTransport *transport,
     result = KvafExecuteBatchPutLaunchInternal(&launch_args, stream);
   }
   if (result != KVAF_BATCH_PUT_SUCCESS) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR backend=%s phase=launch result=%d\n",
-                 aicpu ? "aicpu" : "aiv", result);
+    if (aicpu) {
+      std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR backend=aicpu phase=launch result=%d\n",
+                   result);
+    } else {
+      std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=launch result=%d\n", result);
+    }
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
   const aclError synchronize_result = aclrtSynchronizeStream(stream);
   if (synchronize_result != ACL_SUCCESS) {
-    const char* recent_error = aclGetRecentErrMsg();
-    std::fprintf(stderr,
-                 "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR backend=%s phase=synchronize acl=%d recent=%s\n",
-                 aicpu ? "aicpu" : "aiv", static_cast<int>(synchronize_result),
-                 recent_error != nullptr ? recent_error : "(unavailable)");
+    if (aicpu) {
+      const char* recent_error = aclGetRecentErrMsg();
+      std::fprintf(stderr,
+                   "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR backend=aicpu phase=synchronize acl=%d recent=%s\n",
+                   static_cast<int>(synchronize_result),
+                   recent_error != nullptr ? recent_error : "(unavailable)");
+    } else {
+      std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=synchronize acl=%d\n",
+                   static_cast<int>(synchronize_result));
+    }
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
   const aclError status_copy_result =

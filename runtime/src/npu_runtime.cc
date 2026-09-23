@@ -300,6 +300,8 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                                      &discovery_error)) {
     return Status::NotFound(discovery_error);
   }
+  const char* probe_prefix = impl_->config.aicpu_urma_kernel_json_path.empty()
+                                 ? "[KVAF_AIV]" : "[KVAF]";
   for (std::uint32_t peer_candidate = 0U; peer_candidate < candidate_count; ++peer_candidate) {
     impl_->peer_allocator->SetCandidate(peer_candidate);
     for (std::size_t npu_index = 0; npu_index < npu_candidates.size(); ++npu_index) {
@@ -310,9 +312,9 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       impl_->config.peer_local_eid = candidate.eid;
       impl_->CreateCore();
       std::fprintf(stderr,
-                   "[KVAF] PEER_LINK_EID_PAIR_ATTEMPT peer_candidate=%u/%u npu_candidate=%zu/%zu "
+                   "%s PEER_LINK_EID_PAIR_ATTEMPT peer_candidate=%u/%u npu_candidate=%zu/%zu "
                    "npu_source=%s npu_eid=%s\n",
-                   peer_candidate, candidate_count, npu_index, npu_candidates.size(), candidate.source.c_str(),
+                   probe_prefix, peer_candidate, candidate_count, npu_index, npu_candidates.size(), candidate.source.c_str(),
                    EidToHex(candidate.eid).c_str());
       last = impl_->runtime_core->Initialize(request);
       if (last.ok()) {
@@ -328,9 +330,9 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
           last = Internal("failed to prepare peer candidate RMA probe");
         } else {
           std::fprintf(stderr,
-                       "[KVAF] PEER_LINK_EID_PAIR_RMA_PROBE_BEGIN peer_candidate=%u/%u "
+                       "%s PEER_LINK_EID_PAIR_RMA_PROBE_BEGIN peer_candidate=%u/%u "
                        "npu_candidate=%zu npu_source=%s bytes=%llu\n",
-                       peer_candidate, candidate_count, npu_index, candidate.source.c_str(),
+                       probe_prefix, peer_candidate, candidate_count, npu_index, candidate.source.c_str(),
                        static_cast<unsigned long long>(probe_bytes));
           last = impl_->runtime_core->BatchPut(
               BatchPutRequest{{BatchPutGroup{
@@ -342,9 +344,9 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
           if (last.ok()) last = impl_->runtime_core->BatchFree(BatchFreeRequest{{std::numeric_limits<KeyId>::max()}});
           if (last.ok()) {
             std::fprintf(stderr,
-                         "[KVAF] PEER_LINK_EID_PAIR_RMA_PROBE_READY peer_candidate=%u/%u "
+                         "%s PEER_LINK_EID_PAIR_RMA_PROBE_READY peer_candidate=%u/%u "
                          "npu_candidate=%zu npu_source=%s bytes=%llu\n",
-                         peer_candidate, candidate_count, npu_index, candidate.source.c_str(),
+                         probe_prefix, peer_candidate, candidate_count, npu_index, candidate.source.c_str(),
                          static_cast<unsigned long long>(probe_bytes));
           }
         }
@@ -354,9 +356,9 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       }
       if (last.ok()) {
         std::fprintf(stderr,
-                     "[KVAF] PEER_LINK_EID_PAIR_SELECTED peer_candidate=%u/%u npu_candidate=%zu/%zu "
+                     "%s PEER_LINK_EID_PAIR_SELECTED peer_candidate=%u/%u npu_candidate=%zu/%zu "
                      "npu_source=%s validation=%s\n",
-                     peer_candidate, candidate_count, npu_index, npu_candidates.size(), candidate.source.c_str(),
+                     probe_prefix, peer_candidate, candidate_count, npu_index, npu_candidates.size(), candidate.source.c_str(),
                      impl_->config.aicpu_urma_kernel_json_path.empty() ? "aiv_write_cq" : "aicpu_write_cq");
         return Status::OK();
       }

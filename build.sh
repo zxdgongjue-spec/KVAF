@@ -14,12 +14,14 @@ die() {
 
 usage() {
   cat <<'EOF'
-Usage: ./build.sh <cpu|npu|aicpu-urma|hbm-rw|aicpu-cpu|aicpu-npu> [--build-dir DIR] [--jobs N] [--install-kernel] [--compare-aiv]
+Usage: ./build.sh <cpu|npu|aiv-native|aicpu-urma|hbm-rw|aicpu-cpu|aicpu-npu> [--build-dir DIR] [--jobs N] [--install-kernel] [--compare-aiv]
 
 cpu  Builds the liburma-only CPU Runtime service. If liburma is not installed,
      it clones and builds the pinned UMDK source beside this repository.
 npu  Builds the CANN AIV BatchGet/BatchPut Runtime and Python binding. It
      installs pybind11 for the selected Python interpreter when necessary.
+aiv-native Builds the standalone native ACL BatchPut/BatchGet roundtrip test;
+           no PyTorch NPU, Python binding, or AICPU kernel installation.
 aicpu-urma Builds the native NPU Runtime client and the AICPU URMA BatchPut/
            BatchGet kernel package; no Python binding. --install-kernel installs
            the package into the detected CANN root (write access required).
@@ -245,6 +247,26 @@ build_aicpu_urma() {
   fi
 }
 
+build_aiv_native() {
+  local build_dir="$1"
+  local jobs="$2"
+  local cann_root
+  require_command cmake
+  cann_root="$(find_cann_root)"
+  [[ -n "$cann_root" ]] || die "CANN toolkit not found; source CANN set_env.sh first"
+  cmake -S "$KVAF_ROOT" -B "$build_dir" \
+    -DBUILD_TESTING=ON \
+    -DKVAF_BUILD_PYTHON=OFF \
+    -DKVAF_BUILD_NPU_SERVICE=OFF \
+    -DKVAF_ENABLE_AIV_BATCH_GET=ON \
+    -DKVAF_ENABLE_AIV_BATCH_PUT=ON \
+    -DKVAF_ENABLE_AICPU_URMA=OFF \
+    -DASCEND_CANN_PACKAGE_PATH="$cann_root"
+  cmake --build "$build_dir" --target kvaf_aiv_batch_roundtrip --parallel "$jobs"
+  echo "[KVAF_BUILD] Native AIV test: $build_dir/tests/kvaf_aiv_batch_roundtrip"
+  echo "[KVAF_BUILD] Run: '$build_dir/tests/kvaf_aiv_batch_roundtrip' --device-id 0"
+}
+
 build_hbm_rw() {
   local build_dir="$1"
   local jobs="$2"
@@ -326,7 +348,7 @@ build_aicpu_test() {
 
 mode="${1:-}"
 case "$mode" in
-  cpu|npu|aicpu-urma|hbm-rw|aicpu-cpu|aicpu-npu) shift ;;
+  cpu|npu|aiv-native|aicpu-urma|hbm-rw|aicpu-cpu|aicpu-npu) shift ;;
   -h|--help|help) usage; exit 0 ;;
   *) usage >&2; exit 2 ;;
 esac
@@ -365,6 +387,7 @@ done
 case "$mode" in
   cpu) build_cpu "$build_dir" "$jobs" ;;
   npu) build_npu "$build_dir" "$jobs" ;;
+  aiv-native) build_aiv_native "$build_dir" "$jobs" ;;
   aicpu-urma) build_aicpu_urma "$build_dir" "$jobs" "$install_kernel" "$compare_aiv" ;;
   hbm-rw) build_hbm_rw "$build_dir" "$jobs" ;;
   aicpu-cpu) build_aicpu_test cpu "$build_dir" "$jobs" ;;

@@ -124,10 +124,11 @@ token、地址与 PeerLink 资源。两种后端的批量 WQE 目前都是单 SG
 旧版 AIV 的 `cqe_word=0` 是因为未保存原始 CQE。由此可以排除 AICPU 独有的提交路径
 是唯一原因，但仍不能从该片段确定 26 个 CPU 候选的最终结果。
 
-共享 WQE 控制字与本地 HCOMM AICPU 实现对照后，发现 KVAF 首轮 SQE 使用
-`owner=1` 且末条未设置 `fence`，而 HCOMM 使用首轮 `owner=0`、末条 `fence=1`。
-现已统一修正 AICPU 和 AIV BatchPut/BatchGet 编码；这是有依据的故障假设，
-尚未经过真机验证。重新构建后先用同一 peer 跑两种后端的单 block 探针：
+共享 WQE 控制字与本地 HCOMM AICPU 实现对照后，曾尝试把 AICPU 和 AIV 的
+首轮 owner 改为 0、末条 fence 改为 1；真机 AIV 探针仍返回 `2/2`。
+现已将 AIV BatchPut/BatchGet kernel 和 Put Host 注册行为回退到本分支起点的
+实现；AICPU WQE 编码仍保留该假设，尚需单独验证。对照时要注意两者目前
+不再使用相同的 WQE 控制字。两种后端的单 block 命令：
 
 ```bash
 ./build.sh aicpu-urma --install-kernel --compare-aiv
@@ -137,12 +138,10 @@ build-aicpu-urma/tests/kvaf_aicpu_urma_client \
   --backend aicpu --peer 127.0.0.1:28991 --blocks 1 --warmup 0 --iterations 1
 ```
 
-修正后首个 CPU 候选的两个 NPU EID 仍返回 `2/2`，因此 owner/fence 不是该错误的
+上述实验中首个 CPU 候选的两个 NPU EID 仍返回 `2/2`，因此 owner/fence 不是该错误的
 充分解释。本地 HCOMM A5 状态表将 `status=2, sub_status=2` 标为
 `Local Operation Error / Local Access Error`；该表不是当前驱动的实时诊断，
-不能仅凭它认定具体的 HBM 地址或 token 有误。新版 AIV 状态会保存原始 CQE，
-两端失败日志均打印 `cqe_word`、`sq_pi`、`cq_ci`、`last_wqe`；HBM 注册日志打印
-注册接口返回的原始 token ID，若与分配的 token ID 不一致则单独告警，并使用
-注册结果填写 WQE 的本地 token ID。下一轮先对比两端同一候选的这些字段，
-以及 CPU 服务 `REGION_ALLOCATED` 的 `token_id` / `seg_token_id`，再检查设备日志
-中的本地内存访问错误；不要把候选扫描中途的片段当作最终结果。
+不能仅凭它认定具体的 HBM 地址或 token 有误。AIV 状态不保存原始 CQE，
+因此其 `cqe_word=0` 不代表硬件返回 0；AICPU 状态仍保存原始 CQE。
+CPU 服务 `REGION_ALLOCATED` 会打印 `token_id` / `seg_token_id` 供对照。
+不要把候选扫描中途的片段当作最终结果。
