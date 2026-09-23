@@ -14,7 +14,7 @@ if(NOT EXISTS "${KVAF_AICPU_CXX}")
 endif()
 
 add_library(kvaf_aicpu_urma_host STATIC host.cc)
-target_include_directories(kvaf_aicpu_urma_host PRIVATE
+target_include_directories(kvaf_aicpu_urma_host PUBLIC
   "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include"
   "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_put/include"
   "${ASCEND_CANN_PACKAGE_PATH}/include")
