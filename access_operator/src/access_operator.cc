@@ -153,6 +153,10 @@ void LogBatchPutDeviceStatus(const BatchPutExecutionState& execution,
                              int32_t result) {
   std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_EXECUTION_ERROR result=%d\n",
                static_cast<int>(result));
+  if (result == KVAF_BATCH_PUT_RUNTIME_ERROR) {
+    std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_DEVICE_STATUS_UNAVAILABLE reason=runtime_error\n");
+    return;
+  }
   for (std::uint32_t core = 0; core < npu_core_count; ++core) {
     const KvafBatchPutCoreStatus& status = execution.host_core_status[core];
     std::fprintf(stderr,

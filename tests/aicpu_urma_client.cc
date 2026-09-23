@@ -14,13 +14,15 @@
 namespace {
 using kvaf::aicpu_urma_client::Options;
 using kvaf::aicpu_urma_client::Parse;
+using kvaf::aicpu_urma_client::DefaultKernelJson;
 
 void Usage(const char* program) {
   std::fprintf(stderr,
-               "Usage: %s --peer HOST:PORT --kernel-json PATH [--device-id N] "
+               "Usage: %s [--peer HOST:PORT] [--kernel-json PATH] [--device-id N] "
                "[--blocks N] [--block-bytes N] [--token-bytes N] "
-               "[--ddr-bytes N] [--warmup N] [--iterations N] [--seed N]\n",
-               program);
+               "[--ddr-bytes N] [--warmup N] [--iterations N] [--seed N]\n"
+               "Defaults: peer=127.0.0.1:28999, kernel-json=%s\n",
+               program, DefaultKernelJson().c_str());
 }
 
 void Acl(aclError result, const char* operation) {

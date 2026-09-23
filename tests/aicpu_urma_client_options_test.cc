@@ -15,6 +15,15 @@ bool Accepts(const char* const (&arguments)[Size]) {
 }  // namespace
 
 int main() {
+  constexpr const char* defaults[] = {"client"};
+  kvaf::aicpu_urma_client::Options default_options;
+  assert(kvaf::aicpu_urma_client::Parse(1, defaults, &default_options));
+  assert(default_options.peer == "127.0.0.1:28999");
+  assert(default_options.kernel_json.find("/opp/vendors/cust/op_impl/aicpu/config/kvaf_aicpu_urma.json") !=
+         std::string::npos);
+#if defined(KVAF_AICPU_URMA_CANN_ROOT)
+  assert(default_options.kernel_json.rfind(KVAF_AICPU_URMA_CANN_ROOT, 0) == 0);
+#endif
   constexpr const char* valid[] = {"client", "--peer", "127.0.0.1:28999", "--kernel-json", "/tmp/kernel.json",
                                    "--blocks", "16", "--block-bytes", "4096", "--token-bytes", "256",
                                    "--warmup", "0", "--iterations", "5", "--seed", "123",

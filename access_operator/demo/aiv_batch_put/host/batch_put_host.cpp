@@ -545,13 +545,17 @@ static int32_t ExecuteBatchPutSync(KvafBatchPutTransport *transport,
     result = KvafExecuteBatchPutLaunchInternal(&launch_args, stream);
   }
   if (result != KVAF_BATCH_PUT_SUCCESS) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=launch result=%d\n", result);
+    std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR backend=%s phase=launch result=%d\n",
+                 aicpu ? "aicpu" : "aiv", result);
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
   const aclError synchronize_result = aclrtSynchronizeStream(stream);
   if (synchronize_result != ACL_SUCCESS) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=synchronize acl=%d\n",
-                 static_cast<int>(synchronize_result));
+    const char* recent_error = aclGetRecentErrMsg();
+    std::fprintf(stderr,
+                 "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR backend=%s phase=synchronize acl=%d recent=%s\n",
+                 aicpu ? "aicpu" : "aiv", static_cast<int>(synchronize_result),
+                 recent_error != nullptr ? recent_error : "(unavailable)");
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
   const aclError status_copy_result =

@@ -9,9 +9,20 @@
 
 namespace kvaf::aicpu_urma_client {
 
+inline std::string DefaultKernelJson() {
+#if defined(KVAF_AICPU_URMA_CANN_ROOT)
+  const char* root = KVAF_AICPU_URMA_CANN_ROOT;
+#else
+  const char* root = std::getenv("ASCEND_CANN_PACKAGE_PATH");
+  if (root == nullptr || root[0] == '\0') root = std::getenv("ASCEND_HOME_PATH");
+  if (root == nullptr || root[0] == '\0') root = "/usr/local/Ascend/ascend-toolkit/latest";
+#endif
+  return std::string(root) + "/opp/vendors/cust/op_impl/aicpu/config/kvaf_aicpu_urma.json";
+}
+
 struct Options {
-  std::string peer;
-  std::string kernel_json;
+  std::string peer{"127.0.0.1:28999"};
+  std::string kernel_json{DefaultKernelJson()};
   std::uint32_t device_id{0};
   std::uint32_t blocks{8};
   std::uint32_t block_bytes{4096};
@@ -33,7 +44,7 @@ inline bool Number(const char* text, std::uint64_t* value) {
 }
 
 inline bool Parse(int argc, const char* const* argv, Options* options) {
-  if (argc < 2 || options == nullptr) return false;
+  if (argc < 1 || argv == nullptr || options == nullptr) return false;
   for (int index = 1; index < argc; index += 2) {
     if (index + 1 >= argc) return false;
     const std::string flag = argv[index];

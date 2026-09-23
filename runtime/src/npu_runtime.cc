@@ -17,6 +17,7 @@
 #include <string>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -277,6 +278,14 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   if (impl_->peer_link == nullptr || impl_->peer_allocator == nullptr ||
       impl_->runtime_core == nullptr) {
     return Status::InvalidState("NpuRuntime requires LinkTo before Initialize");
+  }
+  if (!impl_->config.aicpu_urma_kernel_json_path.empty()) {
+    const std::string& path = impl_->config.aicpu_urma_kernel_json_path;
+    struct stat kernel_file {};
+    if (stat(path.c_str(), &kernel_file) != 0 || !S_ISREG(kernel_file.st_mode) ||
+        access(path.c_str(), R_OK) != 0) {
+      return Status::InvalidArgument("AICPU URMA kernel JSON is missing or unreadable: " + path);
+    }
   }
 
   std::uint32_t candidate_count = 0U;
