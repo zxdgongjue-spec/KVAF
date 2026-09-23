@@ -14,17 +14,19 @@ die() {
 
 usage() {
   cat <<'EOF'
-Usage: ./build.sh <cpu|npu|hbm-rw|aicpu-cpu|aicpu-npu> [--build-dir DIR] [--jobs N]
+Usage: ./build.sh <cpu|npu|aicpu-urma|hbm-rw|aicpu-cpu|aicpu-npu> [--build-dir DIR] [--jobs N]
 
 cpu  Builds the liburma-only CPU Runtime service. If liburma is not installed,
      it clones and builds the pinned UMDK source beside this repository.
 npu  Builds the CANN AIV BatchGet/BatchPut Runtime and Python binding. It
      installs pybind11 for the selected Python interpreter when necessary.
+aicpu-urma Builds the native NPU Runtime client and the AICPU URMA BatchPut/
+           BatchGet kernel package; no Python binding or kernel installation.
 hbm-rw Builds the standalone benchmark together with the production CPU URMA
        transport and NPU HBM service.
 aicpu-cpu Builds only the CPU side of the AICPU CPU-push bandwidth test.
 aicpu-npu Builds its NPU executable and AICPU kernel package (no installation).
-          Neither aicpu mode builds Python bindings or AIV kernels.
+          These two benchmark modes do not build Python bindings or AIV kernels.
 
 Environment overrides:
   KVAF_UMDK_ROOT       UMDK source/header root for the CPU build
@@ -34,7 +36,7 @@ Environment overrides:
                         CANN toolkit root for the NPU build
   PYTHON               Python interpreter for the NPU binding (default: python3)
   KVAF_BUILD_JOBS      Parallel build jobs
-  KVAF_AICPU_CXX      CANN AICPU cross compiler override (aicpu-npu)
+  KVAF_AICPU_CXX      CANN AICPU cross compiler override (aicpu-npu, aicpu-urma)
 EOF
 }
 
@@ -183,12 +185,12 @@ build_npu() {
     "$python_bin" -m pip install --user pybind11
   fi
   pybind11_dir="$($python_bin -m pybind11 --cmakedir)"
-
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
     -DBUILD_TESTING=ON \
     -DKVAF_BUILD_PYTHON=ON \
     -DKVAF_ENABLE_AIV_BATCH_GET=ON \
     -DKVAF_ENABLE_AIV_BATCH_PUT=ON \
+    -DKVAF_ENABLE_AICPU_URMA=OFF \
     -DASCEND_CANN_PACKAGE_PATH="$cann_root" \
     -Dpybind11_DIR="$pybind11_dir" \
     -DKVAF_BUILD_NPU_SERVICE=ON \
@@ -197,6 +199,35 @@ build_npu() {
   echo "[KVAF_BUILD] NPU Python package: $build_dir/python/kvaf"
   echo "[KVAF_BUILD] BatchGet kernel: $build_dir/bin/kvaf_execute_batch_get_kernels.o"
   echo "[KVAF_BUILD] BatchPut kernel: $build_dir/bin/kvaf_execute_batch_put_kernels.o"
+}
+
+build_aicpu_urma() {
+  local build_dir="$1"
+  local jobs="$2"
+  local cann_root
+  local -a compiler_option=()
+  require_command cmake
+  cann_root="$(find_cann_root)"
+  [[ -n "$cann_root" ]] || die "CANN toolkit not found; source CANN set_env.sh first"
+  if [[ -n "${KVAF_AICPU_CXX:-}" ]]; then
+    compiler_option+=("-DKVAF_AICPU_CXX=$KVAF_AICPU_CXX")
+  fi
+  cmake -S "$KVAF_ROOT" -B "$build_dir" \
+    -DBUILD_TESTING=ON \
+    -DKVAF_BUILD_PYTHON=OFF \
+    -DKVAF_BUILD_NPU_SERVICE=OFF \
+    -DKVAF_ENABLE_AIV_BATCH_GET=ON \
+    -DKVAF_ENABLE_AIV_BATCH_PUT=ON \
+    -DKVAF_ENABLE_AICPU_URMA=ON \
+    -DASCEND_CANN_PACKAGE_PATH="$cann_root" \
+    "${compiler_option[@]}"
+  cmake --build "$build_dir" --target kvaf_aicpu_urma_client kvaf_aicpu_urma_kernel \
+    kvaf_aicpu_urma_wqe_test kvaf_aicpu_urma_kernel_test \
+    kvaf_aicpu_urma_client_options_test --parallel "$jobs"
+  echo "[KVAF_BUILD] Native test: $build_dir/tests/kvaf_aicpu_urma_client"
+  echo "[KVAF_BUILD] AICPU kernel package: $build_dir/access_operator/src/aicpu_urma/kvaf-aicpu-urma.tar.gz"
+  echo "[KVAF_BUILD] Host tests: ctest --test-dir '$build_dir' -R kvaf_aicpu_urma_ --output-on-failure"
+  echo "[KVAF_BUILD] Run: '$build_dir/tests/kvaf_aicpu_urma_client' --help"
 }
 
 build_hbm_rw() {
@@ -280,7 +311,7 @@ build_aicpu_test() {
 
 mode="${1:-}"
 case "$mode" in
-  cpu|npu|hbm-rw|aicpu-cpu|aicpu-npu) shift ;;
+  cpu|npu|aicpu-urma|hbm-rw|aicpu-cpu|aicpu-npu) shift ;;
   -h|--help|help) usage; exit 0 ;;
   *) usage >&2; exit 2 ;;
 esac
@@ -307,6 +338,7 @@ done
 case "$mode" in
   cpu) build_cpu "$build_dir" "$jobs" ;;
   npu) build_npu "$build_dir" "$jobs" ;;
+  aicpu-urma) build_aicpu_urma "$build_dir" "$jobs" ;;
   hbm-rw) build_hbm_rw "$build_dir" "$jobs" ;;
   aicpu-cpu) build_aicpu_test cpu "$build_dir" "$jobs" ;;
   aicpu-npu) build_aicpu_test npu "$build_dir" "$jobs" ;;

@@ -22,6 +22,7 @@ struct NpuRuntimeOptions {
   std::uint32_t batch_get_token_bytes;
   std::uint32_t batch_get_tokens_per_block;
   std::string batch_put_kernel_object_path;
+  std::string aicpu_urma_kernel_json_path;
   std::uint32_t device_id{0U};
   std::uint32_t npu_core_count{1U};
   std::uint32_t jettys_per_core{2U};

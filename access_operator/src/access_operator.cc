@@ -14,6 +14,9 @@
 #include "batch_get_abi.h"
 #include "kvaf_aiv_batch_get.h"
 #include "meta_manager.h"
+#if defined(KVAF_ENABLE_AICPU_URMA)
+#include "host.h"
+#endif
 
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
 #include "batch_put_abi.h"
@@ -303,7 +306,8 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     return InvalidState("AccessOperator has already been initialized");
   }
   if (remote_region.base == 0 || remote_region.length == 0 ||
-      impl_->config.batch_get_kernel_object_path.empty() ||
+      (impl_->config.batch_get_kernel_object_path.empty() &&
+       impl_->config.aicpu_urma_kernel_json_path.empty()) ||
       impl_->config.npu_core_count == 0 ||
       impl_->config.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->config.jettys_per_core == 0 ||
@@ -313,6 +317,17 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
   if (impl_->config.peer_link == nullptr) {
     return InvalidState("AccessOperator requires an established Runtime Link");
   }
+#if defined(KVAF_ENABLE_AICPU_URMA)
+  if (!impl_->config.aicpu_urma_kernel_json_path.empty() &&
+      (impl_->config.npu_core_count != 1U || impl_->config.jettys_per_core != 1U ||
+       !aicpu_urma::Load(impl_->config.aicpu_urma_kernel_json_path.c_str()))) {
+    return Internal("AICPU URMA requires one worker and a loadable kernel JSON");
+  }
+#else
+  if (!impl_->config.aicpu_urma_kernel_json_path.empty()) {
+    return InvalidArgument("AICPU URMA was not enabled at build time");
+  }
+#endif
   if (std::all_of(impl_->config.peer_local_eid.begin(),
                   impl_->config.peer_local_eid.end(),
                   [](std::uint8_t value) { return value == 0U; })) {
@@ -326,9 +341,10 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     return InvalidArgument("invalid BatchPut transport configuration");
   }
 #endif
-  if (KvafExecuteBatchGetLoadKernel(
+  if (impl_->config.aicpu_urma_kernel_json_path.empty() &&
+      KvafExecuteBatchGetLoadKernel(
           impl_->config.batch_get_kernel_object_path.c_str()) !=
-      KVAF_BATCH_GET_SUCCESS) {
+          KVAF_BATCH_GET_SUCCESS) {
     return Internal("failed to load BatchGet kernel");
   }
 
@@ -365,11 +381,13 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
   impl_->transport = transport;
   impl_->execution = execution;
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
-  if (!impl_->config.batch_put_kernel_object_path.empty()) {
+  if (!impl_->config.batch_put_kernel_object_path.empty() ||
+      !impl_->config.aicpu_urma_kernel_json_path.empty()) {
     if (impl_->config.npu_core_count > KVAF_AIV_BATCH_PUT_MAX_AIV_CORES ||
-        KvafExecuteBatchPutLoadKernel(
+        (impl_->config.aicpu_urma_kernel_json_path.empty() &&
+         KvafExecuteBatchPutLoadKernel(
             impl_->config.batch_put_kernel_object_path.c_str()) !=
-            KVAF_BATCH_PUT_SUCCESS) {
+            KVAF_BATCH_PUT_SUCCESS)) {
       (void)aclrtFree(impl_->execution.queue_state);
       (void)aclrtFree(impl_->execution.status);
       KvafBatchGetTransportDestroy(impl_->transport);
@@ -477,7 +495,16 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   arguments.channel_entity = channel_entity;
 
   const aclrtStream stream = static_cast<aclrtStream>(exec.execution.stream);
-  const int32_t launch_result = KvafExecuteBatchGetLaunch(&arguments, stream);
+  int32_t launch_result = KVAF_BATCH_GET_RUNTIME_ERROR;
+#if defined(KVAF_ENABLE_AICPU_URMA)
+  if (!impl_->config.aicpu_urma_kernel_json_path.empty()) {
+    launch_result = aicpu_urma::LaunchGet(&arguments, stream) == 0
+                        ? KVAF_BATCH_GET_SUCCESS : KVAF_BATCH_GET_RUNTIME_ERROR;
+  } else
+#endif
+  {
+    launch_result = KvafExecuteBatchGetLaunch(&arguments, stream);
+  }
   if (launch_result != KVAF_BATCH_GET_SUCCESS) {
     KvafBatchGetLocalBufferRelease(local_buffer);
     return Internal("failed to launch BatchGet");
@@ -489,6 +516,16 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
       return Internal("BatchGet stream synchronization failed");
     }
     LogBatchGetDeviceStatus(impl_->execution, impl_->config.npu_core_count);
+#if defined(KVAF_ENABLE_AICPU_URMA)
+    if (!impl_->config.aicpu_urma_kernel_json_path.empty()) {
+      KvafBatchGetCoreStatus device_status{};
+      if (aclrtMemcpy(&device_status, sizeof(device_status), impl_->execution.status,
+                      sizeof(device_status), ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS ||
+          device_status.magic != KVAF_AIV_BATCH_GET_STATUS_MAGIC || device_status.result != 0U) {
+        return Internal("AICPU URMA BatchGet device completion failed");
+      }
+    }
+#endif
   } else {
     // The demo transport caches zero-reference registrations until shutdown.
     // Releasing after an externally captured launch keeps KVAF graph-agnostic;
@@ -618,18 +655,31 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
     for (KvafBatchPutCoreStatus& core_status : execution.host_core_status) {
       core_status = KvafBatchPutCoreStatus{};
     }
-    const int32_t result = KvafExecuteBatchPutSync(
+    int32_t result = KVAF_BATCH_PUT_RUNTIME_ERROR;
+#if defined(KVAF_ENABLE_AICPU_URMA)
+    if (!impl_->config.aicpu_urma_kernel_json_path.empty()) {
+      result = KvafExecuteBatchPutAicpuSync(
+          impl_->batch_put_transport, &arguments,
+          static_cast<aclrtStream>(exec.execution.stream),
+          execution.host_core_status.data(),
+          static_cast<std::uint32_t>(execution.host_core_status.size()),
+          static_cast<std::uint32_t>(sources));
+    } else
+#endif
+    {
+      result = KvafExecuteBatchPutSync(
         impl_->batch_put_transport, &arguments,
         static_cast<aclrtStream>(exec.execution.stream),
         execution.host_core_status.data(),
         static_cast<std::uint32_t>(execution.host_core_status.size()));
+    }
     for (KvafBatchPutLocalBuffer* local_buffer : local_buffers) {
       KvafBatchPutLocalBufferRelease(local_buffer);
     }
     local_buffers.clear();
     if (result != KVAF_BATCH_PUT_SUCCESS) {
       LogBatchPutDeviceStatus(execution, impl_->config.npu_core_count, result);
-      return Internal("AIV Direct-HCCP BatchPut execution failed");
+      return Internal("Direct-HCCP BatchPut execution failed");
     }
     return Status::OK();
   }

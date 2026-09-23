@@ -165,6 +165,16 @@ build-npu/bin/kvaf_execute_batch_get_kernels.o
 build-npu/bin/kvaf_execute_batch_put_kernels.o
 ```
 
+### 构建 AICPU URMA BatchPut/BatchGet
+
+在 NPU 主机上使用相同的 CANN 环境，运行 `./build.sh aicpu-urma`。它构建原生
+`kvaf_aicpu_urma_client` 和 AICPU kernel 包，不使用 Python；不会自动安装设备内核。安装与测试命令见
+`access_operator/src/aicpu_urma/README.md`。Host 测试入口为：
+
+```bash
+ctest --test-dir build-aicpu-urma -R kvaf_aicpu_urma_ --output-on-failure
+```
+
 
 ## 启动与端到端验证
 

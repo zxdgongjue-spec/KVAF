@@ -236,12 +236,14 @@ class NpuPythonRuntime final {
                    std::uint32_t batch_get_tokens_per_block,
                    std::uint32_t device_id, std::uint32_t npu_core_count,
                    std::string batch_put_kernel_object_path,
-                   std::uint32_t jettys_per_core) {
+                   std::uint32_t jettys_per_core,
+                   std::string aicpu_urma_kernel_json_path) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
                               batch_get_tokens_per_block};
     options.batch_put_kernel_object_path =
         std::move(batch_put_kernel_object_path);
+    options.aicpu_urma_kernel_json_path = std::move(aicpu_urma_kernel_json_path);
     options.device_id = device_id;
     options.npu_core_count = npu_core_count;
     options.jettys_per_core = jettys_per_core;
@@ -524,13 +526,14 @@ void BindNpuPythonRuntime(py::module_& module) {
 
   py::class_<NpuPythonRuntime>(module, "NpuRuntime")
       .def(py::init<std::string, std::uint32_t, std::uint32_t, std::uint32_t,
-                    std::uint32_t, std::string, std::uint32_t>(),
+                    std::uint32_t, std::string, std::uint32_t, std::string>(),
            py::arg("batch_get_kernel_object_path"),
            py::arg("batch_get_token_bytes"),
            py::arg("batch_get_tokens_per_block"), py::arg("device_id") = 0,
            py::arg("npu_core_count") = 1,
            py::arg("batch_put_kernel_object_path") = "",
-           py::arg("jettys_per_core") = 2)
+           py::arg("jettys_per_core") = 2,
+           py::arg("aicpu_urma_kernel_json_path") = "")
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
            "Connect this NPU Runtime to a CPU Runtime service before initialize.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),

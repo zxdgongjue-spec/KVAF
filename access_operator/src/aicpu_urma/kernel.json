@@ -1,0 +1,16 @@
+{
+  "KvafAicpuUrmaBatchPut": {
+    "opInfo": {
+      "functionName": "KvafAicpuUrmaBatchPut",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
+  },
+  "KvafAicpuUrmaBatchGet": {
+    "opInfo": {
+      "functionName": "KvafAicpuUrmaBatchGet",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
+  }
+}

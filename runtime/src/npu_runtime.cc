@@ -176,6 +176,7 @@ struct NpuRuntime::Impl {
   explicit Impl(NpuRuntimeOptions init_options) : options(std::move(init_options)) {
     config.batch_get_kernel_object_path = options.batch_get_kernel_object_path;
     config.batch_put_kernel_object_path = options.batch_put_kernel_object_path;
+    config.aicpu_urma_kernel_json_path = options.aicpu_urma_kernel_json_path;
     config.npu_core_count = options.npu_core_count;
     config.jettys_per_core = options.jettys_per_core;
   }
@@ -215,7 +216,8 @@ struct NpuRuntime::Impl {
 };
 
 NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {
-  if (impl_->config.batch_get_kernel_object_path.empty() || impl_->options.npu_core_count == 0U ||
+  if ((impl_->config.batch_get_kernel_object_path.empty() &&
+       impl_->config.aicpu_urma_kernel_json_path.empty()) || impl_->options.npu_core_count == 0U ||
       impl_->options.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->options.jettys_per_core == 0U ||
       impl_->options.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
@@ -253,7 +255,8 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
   if (target.address.empty()) return Status::InvalidArgument("NpuRuntime LinkTo requires peer host:port");
   if (initialized()) return Status::InvalidState("NpuRuntime LinkTo must run before initialize");
   if (impl_->peer_link != nullptr) return Status::InvalidState("NpuRuntime already has a PeerLink");
-  if (impl_->config.batch_put_kernel_object_path.empty()) {
+  if (impl_->config.batch_put_kernel_object_path.empty() &&
+      impl_->config.aicpu_urma_kernel_json_path.empty()) {
     return Status::InvalidArgument("PeerLink requires the AIV BatchPut kernel for RMA validation");
   }
   impl_->peer_link = std::make_shared<peer::PeerLink>(target.address);
@@ -298,7 +301,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       impl_->config.peer_local_eid = candidate.eid;
       impl_->CreateCore();
       std::fprintf(stderr,
-                   "[KVAF_AIV] PEER_LINK_EID_PAIR_ATTEMPT peer_candidate=%u/%u npu_candidate=%zu/%zu "
+                   "[KVAF] PEER_LINK_EID_PAIR_ATTEMPT peer_candidate=%u/%u npu_candidate=%zu/%zu "
                    "npu_source=%s npu_eid=%s\n",
                    peer_candidate, candidate_count, npu_index, npu_candidates.size(), candidate.source.c_str(),
                    EidToHex(candidate.eid).c_str());
@@ -316,7 +319,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
           last = Internal("failed to prepare peer candidate RMA probe");
         } else {
           std::fprintf(stderr,
-                       "[KVAF_AIV] PEER_LINK_EID_PAIR_RMA_PROBE_BEGIN peer_candidate=%u/%u "
+                       "[KVAF] PEER_LINK_EID_PAIR_RMA_PROBE_BEGIN peer_candidate=%u/%u "
                        "npu_candidate=%zu npu_source=%s bytes=%llu\n",
                        peer_candidate, candidate_count, npu_index, candidate.source.c_str(),
                        static_cast<unsigned long long>(probe_bytes));
@@ -330,7 +333,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
           if (last.ok()) last = impl_->runtime_core->BatchFree(BatchFreeRequest{{std::numeric_limits<KeyId>::max()}});
           if (last.ok()) {
             std::fprintf(stderr,
-                         "[KVAF_AIV] PEER_LINK_EID_PAIR_RMA_PROBE_READY peer_candidate=%u/%u "
+                         "[KVAF] PEER_LINK_EID_PAIR_RMA_PROBE_READY peer_candidate=%u/%u "
                          "npu_candidate=%zu npu_source=%s bytes=%llu\n",
                          peer_candidate, candidate_count, npu_index, candidate.source.c_str(),
                          static_cast<unsigned long long>(probe_bytes));
@@ -342,9 +345,10 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       }
       if (last.ok()) {
         std::fprintf(stderr,
-                     "[KVAF_AIV] PEER_LINK_EID_PAIR_SELECTED peer_candidate=%u/%u npu_candidate=%zu/%zu "
-                     "npu_source=%s validation=aiv_write_cq\n",
-                     peer_candidate, candidate_count, npu_index, npu_candidates.size(), candidate.source.c_str());
+                     "[KVAF] PEER_LINK_EID_PAIR_SELECTED peer_candidate=%u/%u npu_candidate=%zu/%zu "
+                     "npu_source=%s validation=%s\n",
+                     peer_candidate, candidate_count, npu_index, npu_candidates.size(), candidate.source.c_str(),
+                     impl_->config.aicpu_urma_kernel_json_path.empty() ? "aiv_write_cq" : "aicpu_write_cq");
         return Status::OK();
       }
       std::fprintf(stderr,
@@ -466,7 +470,8 @@ RuntimeCapabilities NpuRuntime::capabilities() const {
                                          : RuntimeCapabilities{};
   }
 #endif
-  return RuntimeCapabilities{true, !impl_->config.batch_put_kernel_object_path.empty(), false, true};
+  return RuntimeCapabilities{true, !impl_->config.batch_put_kernel_object_path.empty() ||
+      !impl_->config.aicpu_urma_kernel_json_path.empty(), false, true};
 }
 
 }  // namespace kvaf

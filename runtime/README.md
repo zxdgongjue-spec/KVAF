@@ -70,6 +70,10 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 `batch_get_token_bytes` 和 `batch_get_tokens_per_block` 无默认值，
 构造 `NpuRuntime` 时必须显式传入。
 
+可选 AICPU URMA BatchPut/BatchGet 后端复用同一条 KVAF PeerLink、EID 候选选择、
+Direct-HCCP 资源和上述 RMA WRITE 探针，不使用 MemFabric 建链。部署、单 worker
+限制和构建参数见 `access_operator/src/aicpu_urma/README.md`。
+
 ## CPU Runtime 访问 NPU HBM
 
 当 CPU 需要直接读写 NPU HBM 时，NPU 侧运行 `kvaf_npu_service`，CPU 侧使用

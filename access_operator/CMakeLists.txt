@@ -22,6 +22,9 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
   if(KVAF_ENABLE_AIV_BATCH_PUT)
     add_subdirectory(demo/aiv_batch_put)
   endif()
+  if(KVAF_ENABLE_AICPU_URMA)
+    add_subdirectory(src/aicpu_urma)
+  endif()
 
   add_library(kvaf_default_access_operator
     src/access_operator.cc
@@ -38,6 +41,15 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
   if(KVAF_ENABLE_AIV_BATCH_PUT)
     target_include_directories(kvaf_default_access_operator
       PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/demo/aiv_batch_put/include)
+  endif()
+
+  if(KVAF_ENABLE_AICPU_URMA)
+    target_link_libraries(kvaf_default_access_operator PRIVATE kvaf_aicpu_urma_host)
+    target_compile_definitions(kvaf_default_access_operator PRIVATE KVAF_ENABLE_AICPU_URMA=1)
+    target_include_directories(kvaf_default_access_operator PRIVATE src/aicpu_urma)
+    target_include_directories(kvaf_execute_batch_put_host PRIVATE src/aicpu_urma)
+    target_link_libraries(kvaf_execute_batch_put_host PRIVATE kvaf_aicpu_urma_host)
+    target_compile_definitions(kvaf_execute_batch_put_host PRIVATE KVAF_ENABLE_AICPU_URMA=1)
   endif()
 
   target_compile_definitions(kvaf_default_access_operator

@@ -45,6 +45,9 @@ struct AccessOperatorConfig {
   // not establish a shared Direct-HCCP ABI.
   std::string batch_get_kernel_object_path;
   std::string batch_put_kernel_object_path;
+  // Optional AICPUKernel JSON. Uses the same Runtime PeerLink/Direct-HCCP
+  // resources instead of establishing another connection.
+  std::string aicpu_urma_kernel_json_path;
   std::uint32_t npu_core_count{0};
   // Direct-HCCP Jettys assigned to each AIV core.
   std::uint32_t jettys_per_core{2};
