@@ -24,6 +24,14 @@ inline std::string DefaultKernelJson() {
   return DefaultCannRoot() + "/opp/vendors/cust/op_impl/aicpu/config/kvaf_aicpu_urma.json";
 }
 
+inline std::string DefaultAivKernelObject(const char* name) {
+#if defined(KVAF_AICPU_URMA_BUILD_DIR)
+  return std::string(KVAF_AICPU_URMA_BUILD_DIR) + "/bin/" + name;
+#else
+  return std::string("build-aicpu-urma/bin/") + name;
+#endif
+}
+
 inline bool ConfigureCannEnvironment() {
   const char* current = std::getenv("ASCEND_HOME_PATH");
   if (current != nullptr && current[0] != '\0') return true;
@@ -31,8 +39,12 @@ inline bool ConfigureCannEnvironment() {
 }
 
 struct Options {
+  enum class Backend { kAicpu, kAiv };
+  Backend backend{Backend::kAicpu};
   std::string peer{"127.0.0.1:28999"};
   std::string kernel_json{DefaultKernelJson()};
+  std::string aiv_get_object{DefaultAivKernelObject("kvaf_execute_batch_get_kernels.o")};
+  std::string aiv_put_object{DefaultAivKernelObject("kvaf_execute_batch_put_kernels.o")};
   std::uint32_t device_id{0};
   std::uint32_t blocks{8};
   std::uint32_t block_bytes{4096};
@@ -61,6 +73,11 @@ inline bool Parse(int argc, const char* const* argv, Options* options) {
     const char* value = argv[index + 1];
     if (flag == "--peer") options->peer = value;
     else if (flag == "--kernel-json") options->kernel_json = value;
+    else if (flag == "--backend") {
+      if (std::string(value) == "aicpu") options->backend = Options::Backend::kAicpu;
+      else if (std::string(value) == "aiv") options->backend = Options::Backend::kAiv;
+      else return false;
+    }
     else {
       std::uint64_t number = 0;
       if (!Number(value, &number)) return false;

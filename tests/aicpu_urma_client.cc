@@ -19,10 +19,12 @@ using kvaf::aicpu_urma_client::ConfigureCannEnvironment;
 
 void Usage(const char* program) {
   std::fprintf(stderr,
-               "Usage: %s [--peer HOST:PORT] [--kernel-json PATH] [--device-id N] "
+               "Usage: %s [--peer HOST:PORT] [--backend aicpu|aiv] "
+               "[--kernel-json PATH] [--device-id N] "
                "[--blocks N] [--block-bytes N] [--token-bytes N] "
                "[--ddr-bytes N] [--warmup N] [--iterations N] [--seed N]\n"
-               "Defaults: peer=127.0.0.1:28999, kernel-json=%s\n",
+               "Defaults: backend=aicpu, peer=127.0.0.1:28999, kernel-json=%s\n"
+               "AIV comparison: build with --compare-aiv, then use --backend aiv.\n",
                program, DefaultKernelJson().c_str());
 }
 
@@ -214,9 +216,14 @@ Timing RunRound(kvaf::NpuRuntime& runtime, aclrtStream stream, Buffers* buffers,
 int Run(const Options& options) {
   AclContext acl(options.device_id);
   Buffers buffers(options);
-  kvaf::NpuRuntimeOptions runtime_options("", options.token_bytes,
+  const bool use_aiv = options.backend == Options::Backend::kAiv;
+  kvaf::NpuRuntimeOptions runtime_options(use_aiv ? options.aiv_get_object : "", options.token_bytes,
                                           options.block_bytes / options.token_bytes);
-  runtime_options.aicpu_urma_kernel_json_path = options.kernel_json;
+  if (use_aiv) {
+    runtime_options.batch_put_kernel_object_path = options.aiv_put_object;
+  } else {
+    runtime_options.aicpu_urma_kernel_json_path = options.kernel_json;
+  }
   runtime_options.device_id = options.device_id;
   runtime_options.npu_core_count = 1;
   runtime_options.jettys_per_core = 1;
@@ -227,9 +234,9 @@ int Run(const Options& options) {
   double put_ms = 0.0;
   double get_ms = 0.0;
   const std::uint64_t total = static_cast<std::uint64_t>(options.warmup) + options.iterations;
-  std::fprintf(stdout, "[KVAF_AICPU_URMA] linked peer=%s device=%u blocks=%u block_bytes=%u "
+  std::fprintf(stdout, "[KVAF_AICPU_URMA] linked backend=%s peer=%s device=%u blocks=%u block_bytes=%u "
                        "token_bytes=%u rounds=%llu\n",
-               options.peer.c_str(), options.device_id, options.blocks, options.block_bytes,
+               use_aiv ? "aiv" : "aicpu", options.peer.c_str(), options.device_id, options.blocks, options.block_bytes,
                options.token_bytes, static_cast<unsigned long long>(total));
   for (std::uint64_t round = 0; round < total; ++round) {
     const Timing sample = RunRound(runtime, acl.stream, &buffers, options, round);
@@ -244,9 +251,9 @@ int Run(const Options& options) {
   Check(runtime.Shutdown(), "Shutdown");
   const double put_mean = put_ms / options.iterations;
   const double get_mean = get_ms / options.iterations;
-  std::fprintf(stdout, "AICPU_URMA_PASS iterations=%u put_mean_ms=%.3f get_mean_ms=%.3f "
+  std::fprintf(stdout, "%s iterations=%u put_mean_ms=%.3f get_mean_ms=%.3f "
                        "put_GBps=%.3f get_GBps=%.3f\n",
-               options.iterations, put_mean, get_mean,
+               use_aiv ? "AIV_URMA_PASS" : "AICPU_URMA_PASS", options.iterations, put_mean, get_mean,
                buffers.payload_bytes / (put_mean * 1.0e6),
                buffers.payload_bytes / (get_mean * 1.0e6));
   return 0;

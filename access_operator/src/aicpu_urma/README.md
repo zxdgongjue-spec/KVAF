@@ -97,3 +97,24 @@ build-aicpu-urma/tests/kvaf_aicpu_urma_client \
 
 对照纯 AIV 使用同一 CPU peer 的探针结果和新 CQE 状态，再区分 token、地址、
 WQE 协议或互联故障；不能仅凭当前 `result=8` 归因到其中一种。
+
+最新单 block 日志的 `cqe_word=0x02020006`，即 `cq_status=2`、
+`cq_sub_status=2`。这表明硬件返回了错误完成，不是 CQ 超时；两个 NPU EID
+候选在同一个 CPU 候选上返回相同的 CQE，但测试在继续扫描 CPU 候选时被中断，
+不能据此断言所有 26 个候选都失败。当前没有经过确认的该设备子状态码映射，
+不要把 `2/2` 直接解释为某一种 token、地址或 EID 错误。
+
+需要区分共享的 Host-HCCP/WQE 问题与 AICPU 提交路径问题时，用同一个原生客户端
+运行 AIV 对照，无需 Python。`--compare-aiv` 只额外编译 AIV kernel object，
+不改变默认 AICPU 后端：
+
+```bash
+./build.sh aicpu-urma --install-kernel --compare-aiv
+build-aicpu-urma/tests/kvaf_aicpu_urma_client \
+  --backend aiv --peer 127.0.0.1:28991 --blocks 1 --warmup 0 --iterations 1
+```
+
+若 AIV 在同一候选的 WRITE 探针成功而 AICPU 返回 `2/2`，重点检查 AICPU 写 SQ、
+缓存可见性和门铃顺序；若两者在同一候选均返回 `2/2`，先检查共享的 WQE 字段、
+token、地址与 PeerLink 资源。两种后端的批量 WQE 目前都是单 SGE/WQE，
+`--blocks` 不会将一个 WQE 变为多 SGL。

@@ -19,6 +19,9 @@ int main() {
   kvaf::aicpu_urma_client::Options default_options;
   assert(kvaf::aicpu_urma_client::Parse(1, defaults, &default_options));
   assert(default_options.peer == "127.0.0.1:28999");
+  assert(default_options.backend == kvaf::aicpu_urma_client::Options::Backend::kAicpu);
+  assert(default_options.aiv_get_object.find("/bin/kvaf_execute_batch_get_kernels.o") != std::string::npos);
+  assert(default_options.aiv_put_object.find("/bin/kvaf_execute_batch_put_kernels.o") != std::string::npos);
   assert(default_options.kernel_json.find("/opp/vendors/cust/op_impl/aicpu/config/kvaf_aicpu_urma.json") !=
          std::string::npos);
 #if defined(KVAF_AICPU_URMA_CANN_ROOT)
@@ -44,6 +47,11 @@ int main() {
   assert(kvaf::aicpu_urma_client::Parse(sizeof(valid) / sizeof(valid[0]), valid, &options));
   assert(options.blocks == 16 && options.token_bytes == 256 && options.warmup == 0);
   assert(options.ddr_bytes == 1048576 && options.seed == 123);
+  constexpr const char* aiv[] = {"client", "--backend", "aiv", "--peer", "127.0.0.1:28991"};
+  assert(kvaf::aicpu_urma_client::Parse(sizeof(aiv) / sizeof(aiv[0]), aiv, &options));
+  assert(options.backend == kvaf::aicpu_urma_client::Options::Backend::kAiv);
+  constexpr const char* invalid_backend[] = {"client", "--backend", "other"};
+  assert(!Accepts(invalid_backend));
   constexpr const char* invalid_ratio[] = {"client", "--peer", "host:1", "--kernel-json", "file",
                                            "--block-bytes", "257", "--token-bytes", "256"};
   constexpr const char* invalid_count[] = {"client", "--peer", "host:1", "--kernel-json", "file",

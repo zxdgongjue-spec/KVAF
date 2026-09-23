@@ -14,7 +14,7 @@ die() {
 
 usage() {
   cat <<'EOF'
-Usage: ./build.sh <cpu|npu|aicpu-urma|hbm-rw|aicpu-cpu|aicpu-npu> [--build-dir DIR] [--jobs N] [--install-kernel]
+Usage: ./build.sh <cpu|npu|aicpu-urma|hbm-rw|aicpu-cpu|aicpu-npu> [--build-dir DIR] [--jobs N] [--install-kernel] [--compare-aiv]
 
 cpu  Builds the liburma-only CPU Runtime service. If liburma is not installed,
      it clones and builds the pinned UMDK source beside this repository.
@@ -23,6 +23,7 @@ npu  Builds the CANN AIV BatchGet/BatchPut Runtime and Python binding. It
 aicpu-urma Builds the native NPU Runtime client and the AICPU URMA BatchPut/
            BatchGet kernel package; no Python binding. --install-kernel installs
            the package into the detected CANN root (write access required).
+           --compare-aiv also builds AIV kernels for a same-peer diagnostic run.
 hbm-rw Builds the standalone benchmark together with the production CPU URMA
        transport and NPU HBM service.
 aicpu-cpu Builds only the CPU side of the AICPU CPU-push bandwidth test.
@@ -206,8 +207,12 @@ build_aicpu_urma() {
   local build_dir="$1"
   local jobs="$2"
   local install_kernel="$3"
+  local compare_aiv="$4"
   local cann_root
   local -a compiler_option=()
+  local -a targets=(kvaf_aicpu_urma_client kvaf_aicpu_urma_kernel
+    kvaf_aicpu_urma_wqe_test kvaf_aicpu_urma_kernel_test
+    kvaf_aicpu_urma_client_options_test)
   require_command cmake
   cann_root="$(find_cann_root)"
   [[ -n "$cann_root" ]] || die "CANN toolkit not found; source CANN set_env.sh first"
@@ -223,9 +228,10 @@ build_aicpu_urma() {
     -DKVAF_ENABLE_AICPU_URMA=ON \
     -DASCEND_CANN_PACKAGE_PATH="$cann_root" \
     "${compiler_option[@]}"
-  cmake --build "$build_dir" --target kvaf_aicpu_urma_client kvaf_aicpu_urma_kernel \
-    kvaf_aicpu_urma_wqe_test kvaf_aicpu_urma_kernel_test \
-    kvaf_aicpu_urma_client_options_test --parallel "$jobs"
+  if [[ "$compare_aiv" == true ]]; then
+    targets+=(kvaf_execute_batch_get_kernel kvaf_execute_batch_put_kernel)
+  fi
+  cmake --build "$build_dir" --target "${targets[@]}" --parallel "$jobs"
   if [[ "$install_kernel" == true ]]; then
     bash "$KVAF_ROOT/access_operator/src/aicpu_urma/install_kernel.sh" \
       "$build_dir/access_operator/src/aicpu_urma" "$cann_root"
@@ -234,6 +240,9 @@ build_aicpu_urma() {
   echo "[KVAF_BUILD] AICPU kernel package: $build_dir/access_operator/src/aicpu_urma/kvaf-aicpu-urma.tar.gz"
   echo "[KVAF_BUILD] Host tests: ctest --test-dir '$build_dir' -R kvaf_aicpu_urma_ --output-on-failure"
   echo "[KVAF_BUILD] Run: '$build_dir/tests/kvaf_aicpu_urma_client' --help"
+  if [[ "$compare_aiv" == true ]]; then
+    echo "[KVAF_BUILD] AIV comparison: '$build_dir/tests/kvaf_aicpu_urma_client' --backend aiv --peer HOST:PORT"
+  fi
 }
 
 build_hbm_rw() {
@@ -325,6 +334,7 @@ esac
 build_dir="$KVAF_ROOT/build-$mode"
 jobs="$(default_jobs)"
 install_kernel=false
+compare_aiv=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --build-dir)
@@ -342,6 +352,11 @@ while [[ $# -gt 0 ]]; do
       install_kernel=true
       shift
       ;;
+    --compare-aiv)
+      [[ "$mode" == aicpu-urma ]] || die "--compare-aiv is only valid for aicpu-urma"
+      compare_aiv=true
+      shift
+      ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -350,7 +365,7 @@ done
 case "$mode" in
   cpu) build_cpu "$build_dir" "$jobs" ;;
   npu) build_npu "$build_dir" "$jobs" ;;
-  aicpu-urma) build_aicpu_urma "$build_dir" "$jobs" "$install_kernel" ;;
+  aicpu-urma) build_aicpu_urma "$build_dir" "$jobs" "$install_kernel" "$compare_aiv" ;;
   hbm-rw) build_hbm_rw "$build_dir" "$jobs" ;;
   aicpu-cpu) build_aicpu_test cpu "$build_dir" "$jobs" ;;
   aicpu-npu) build_aicpu_test npu "$build_dir" "$jobs" ;;
