@@ -13,7 +13,7 @@ def test_dense_descriptor_validation_keeps_one_warp_for_small_waves():
     source = KERNEL.read_text()
     wrapper = source.split("__aicore__ inline void ValidateDenseBatchGetDescriptors(", 1)[1]
     wrapper = wrapper.split("__aicore__ inline uint32_t ActiveRequestsForJetty(", 1)[0]
-    assert "if (active_request_count <= 32U)" in wrapper
+    assert "if (active_request_count <= 48U)" in wrapper
     assert "VF_CALL<ValidateDenseBatchGetDescriptorsSmall>" in wrapper
     assert "*result = failure[1];" in wrapper
     assert "return;" in wrapper
