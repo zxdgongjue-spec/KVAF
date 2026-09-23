@@ -177,15 +177,30 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
                  static_cast<unsigned long long>(aligned_bytes));
     return false;
   }
+  const uint32_t registered_token_id = info.out.ub.token_id >> kTokenIdShift;
+  if (registered_token_id == 0U) {
+    std::fprintf(stderr,
+                 "[KVAF_AIV] DIRECT_MEMORY_REGISTER_FAILED role=%s reason=invalid_registered_token "
+                 "allocated_token_id=0x%x registered_raw_token_id=0x%x\n",
+                 role, token_id, info.out.ub.token_id);
+    return false;
+  }
+  if (registered_token_id != token_id) {
+    std::fprintf(stderr,
+                 "[KVAF_AIV] DIRECT_MEMORY_TOKEN_MISMATCH role=%s allocated_token_id=0x%x "
+                 "registered_token_id=0x%x\n",
+                 role, token_id, registered_token_id);
+  }
   memory->registered_address = aligned_address;
   memory->registered_bytes = aligned_bytes;
-  memory->token_id = token_id;
+  memory->token_id = registered_token_id;
   memory->token_value = token_value;
   memory->key_bytes = info.out.key.size;
   std::memcpy(memory->key, info.out.key.value, memory->key_bytes);
   hccp::VerboseLog(
-      "[KVAF_AIV] DIRECT_MEMORY_REGISTERED role=%s token_id=0x%x host_or_hbm_va=0x%llx bytes=%llu\n",
-      role, memory->token_id, static_cast<unsigned long long>(aligned_address),
+      "[KVAF_AIV] DIRECT_MEMORY_REGISTERED role=%s token_id=0x%x raw_token_id=0x%x "
+      "host_or_hbm_va=0x%llx bytes=%llu\n",
+      role, memory->token_id, info.out.ub.token_id, static_cast<unsigned long long>(aligned_address),
       static_cast<unsigned long long>(aligned_bytes));
   return true;
 }

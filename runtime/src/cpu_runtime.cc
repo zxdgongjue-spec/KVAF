@@ -490,11 +490,13 @@ class CpuService {
       ReleaseRegion(region.get());
       return Result::kResourceError;
     }
+    const uint32_t segment_token_id = region->segment->seg.token_id;
     regions_.emplace(id, std::move(region));
     Log("[KVAF_CPU] REGION_ALLOCATED session=%" PRIu64 " candidate=%u ub_device=%s eid_index=%u "
-        "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x reg_flags=0x%x\n",
+        "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x seg_token_id=0x%x "
+        "reg_flags=0x%x\n",
         id, candidate_id, resources->device_name().c_str(), resources->eid_index(), bytes,
-        response->peer_base, response->token_id, flag.value);
+        response->peer_base, response->token_id, segment_token_id, flag.value);
     return Result::kOk;
   }
 

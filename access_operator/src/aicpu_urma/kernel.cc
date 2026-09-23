@@ -78,7 +78,8 @@ void Initialize(Queue& queue) {
 template <typename Entity, typename Queue>
 std::uint32_t Submit(const Entity& entity, Queue& queue,
                      const Transfer* transfers, std::uint32_t count,
-                     std::uint32_t opcode, std::uint32_t* cqe_word = nullptr) {
+                     std::uint32_t opcode, std::uint32_t* cqe_word = nullptr,
+                     std::uint64_t* last_wqe_protocol = nullptr) {
   if (cqe_word != nullptr) *cqe_word = 0U;
   if (count == 0U) return 0U;
   if (count >= entity.sq_depth) return 6U;
@@ -92,6 +93,8 @@ std::uint32_t Submit(const Entity& entity, Queue& queue,
     EncodeWqe(words, endpoint, transfers[index], opcode,
               static_cast<std::uint32_t>((producer / entity.sq_depth) & 1U),
               index + 1U == count);
+    if (last_wqe_protocol != nullptr && index + 1U == count)
+      *last_wqe_protocol = words[0];
     auto* destination = reinterpret_cast<void*>(entity.sq_va + slot * 64U);
     std::memcpy(destination, words, sizeof(words));
     Flush(destination, sizeof(words));
@@ -122,8 +125,10 @@ std::uint32_t Submit(const Entity& entity, Queue& queue,
 template <typename Entity, typename Queue>
 std::uint32_t Post(const Entity& entity, Queue& queue, Transfer* transfers,
                    std::uint32_t& count, std::uint32_t opcode,
-                   std::uint32_t* cqe_word = nullptr) {
-  const auto result = Submit(entity, queue, transfers, count, opcode, cqe_word);
+                   std::uint32_t* cqe_word = nullptr,
+                   std::uint64_t* last_wqe_protocol = nullptr) {
+  const auto result = Submit(entity, queue, transfers, count, opcode, cqe_word,
+                             last_wqe_protocol);
   if (result == 0U) count = 0U;
   return result;
 }
@@ -236,7 +241,7 @@ std::uint32_t KvafAicpuUrmaBatchPut(KvafExecuteBatchPutLaunchArgs* args) {
                           static_cast<std::uint32_t>(length), source.local_token_id};
     if (count == 32U || index + 1U == request.row_count) {
       status.result = Post(entity, queue, transfers, count, kvaf::aicpu_urma::kWriteOpcode,
-                           &cqe_word);
+                           &cqe_word, &status.last_wqe_protocol);
       if (status.result == KVAF_BATCH_PUT_CORE_CQ_ERROR) {
         status.cq_status = (cqe_word >> 24U) & 0xffU;
         status.cq_sub_status = (cqe_word >> 16U) & 0xffU;
