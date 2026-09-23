@@ -63,6 +63,7 @@ void Put() {
   assert(KvafAicpuUrmaBatchPut(&args) == 0U);
   assert(status.magic == KVAF_AIV_BATCH_PUT_STATUS_MAGIC && status.result == 0U);
   assert(status.processed_request_count == 33U && status.failed_request_index == UINT64_MAX);
+  assert(status.cq_status == 0U && status.cq_sub_status == 0U && status.reserved[0] == 0U);
   assert(sq_doorbell == 33U && cq_doorbell == 2U);
   assert(sq[1] == kvaf::aicpu_urma::kWriteOpcode << 8U);
   assert(sq[32 * 16 + 1] == kvaf::aicpu_urma::kWriteOpcode << 8U);
@@ -85,6 +86,20 @@ void Put() {
   assert(KvafAicpuUrmaBatchPut(&args) == 0U &&
          status.result == KVAF_BATCH_PUT_CORE_INVALID_QUEUE);
   assert(sq_doorbell == 33U);
+  queue = {};
+  cq[0] = (3U << 24U) | (5U << 16U) | 4U;
+  assert(KvafAicpuUrmaBatchPut(&args) == 0U &&
+         status.result == KVAF_BATCH_PUT_CORE_CQ_ERROR &&
+         status.cq_status == 3U && status.cq_sub_status == 5U &&
+         status.reserved[0] == cq[0]);
+  queue = {};
+  cq[0] = 4U;
+  cq[8] = (7U << 24U) | (9U << 16U) | 4U;
+  assert(KvafAicpuUrmaBatchPut(&args) == 0U &&
+         status.result == KVAF_BATCH_PUT_CORE_CQ_ERROR &&
+         status.processed_request_count == 32U &&
+         status.cq_status == 7U && status.cq_sub_status == 9U &&
+         status.reserved[0] == cq[8]);
 }
 
 void Get() {

@@ -80,4 +80,20 @@ grep -R -nE '507018|PrintAicpuErrorInfo|HandleTaskTimeout|KvafAicpuUrma' \
 但旧版 AICPU 内核把所有失败都返回为任务错误。新版同步 BatchPut 在状态缓冲区
 可用时通过 `BATCH_PUT_DEVICE_ERROR` 输出具体 `result`：1=入参形状，
 2=entity，3=队列，4=源地址，5=目标地址，6=SQ 已满，7=CQ 超时，
-8=CQ 错误，9=长度；`failed_request` 给出失败的请求索引。
+8=CQ 错误，9=长度；`failed_request` 仅在逐请求参数校验失败时给出索引。
+
+`result=8` 表示 USER_CTL CQ 已返回错误完成，并不等于 EID 建链失败。
+AICPU BatchPut 会额外打印 `cq_status`、`cq_sub_status` 和原始
+`cqe_word`（保存在状态 ABI 的 `reserved[0]`）。只有收到错误 CQE 时这些字段
+才有效；`result=7` 是 CQ 超时，没有错误 CQE。当前日志中的 `result=8` 但
+`cq_status=0 cq_sub_status=0` 来自旧版 AICPU 内核未写回 CQE 字段，无法据此
+判定具体硬件错误。重新构建、安装内核并重新运行客户端，用单 block 探针采集新值：
+
+```bash
+./build.sh aicpu-urma --install-kernel
+build-aicpu-urma/tests/kvaf_aicpu_urma_client \
+  --peer CPU_HOST:28999 --blocks 1 --warmup 0 --iterations 1
+```
+
+对照纯 AIV 使用同一 CPU peer 的探针结果和新 CQE 状态，再区分 token、地址、
+WQE 协议或互联故障；不能仅凭当前 `result=8` 归因到其中一种。

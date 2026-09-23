@@ -78,7 +78,8 @@ void Initialize(Queue& queue) {
 template <typename Entity, typename Queue>
 std::uint32_t Submit(const Entity& entity, Queue& queue,
                      const Transfer* transfers, std::uint32_t count,
-                     std::uint32_t opcode) {
+                     std::uint32_t opcode, std::uint32_t* cqe_word = nullptr) {
+  if (cqe_word != nullptr) *cqe_word = 0U;
   if (count == 0U) return 0U;
   if (count >= entity.sq_depth) return 6U;
   Endpoint endpoint{entity.tp_id, entity.remote_token_id,
@@ -108,6 +109,7 @@ std::uint32_t Submit(const Entity& entity, Queue& queue,
     Flush(const_cast<const std::uint32_t*>(completion), 32U);
     const std::uint32_t word = *completion;
     if (((word >> 2U) & 1U) == expected) continue;
+    if (cqe_word != nullptr) *cqe_word = word;
     ++queue.cq_consumer_index;
     *reinterpret_cast<volatile std::uint32_t*>(entity.cq_db_va) =
         static_cast<std::uint32_t>(queue.cq_consumer_index) & 0x003fffffU;
@@ -119,8 +121,9 @@ std::uint32_t Submit(const Entity& entity, Queue& queue,
 
 template <typename Entity, typename Queue>
 std::uint32_t Post(const Entity& entity, Queue& queue, Transfer* transfers,
-                   std::uint32_t& count, std::uint32_t opcode) {
-  const auto result = Submit(entity, queue, transfers, count, opcode);
+                   std::uint32_t& count, std::uint32_t opcode,
+                   std::uint32_t* cqe_word = nullptr) {
+  const auto result = Submit(entity, queue, transfers, count, opcode, cqe_word);
   if (result == 0U) count = 0U;
   return result;
 }
@@ -198,6 +201,7 @@ std::uint32_t KvafAicpuUrmaBatchPut(KvafExecuteBatchPutLaunchArgs* args) {
   Flush(destinations, static_cast<std::uint64_t>(request.row_count) * sizeof(*destinations));
   Transfer transfers[32];
   std::uint32_t count = 0U;
+  std::uint32_t cqe_word = 0U;
   for (std::uint32_t index = 0U; index < request.row_count; ++index) {
     if (source_indices[index] >= args->reserved0) {
       status.result = KVAF_BATCH_PUT_CORE_INVALID_SOURCE_RANGE;
@@ -231,7 +235,13 @@ std::uint32_t KvafAicpuUrmaBatchPut(KvafExecuteBatchPutLaunchArgs* args) {
     transfers[count++] = {destinations[index], local,
                           static_cast<std::uint32_t>(length), source.local_token_id};
     if (count == 32U || index + 1U == request.row_count) {
-      status.result = Post(entity, queue, transfers, count, kvaf::aicpu_urma::kWriteOpcode);
+      status.result = Post(entity, queue, transfers, count, kvaf::aicpu_urma::kWriteOpcode,
+                           &cqe_word);
+      if (status.result == KVAF_BATCH_PUT_CORE_CQ_ERROR) {
+        status.cq_status = (cqe_word >> 24U) & 0xffU;
+        status.cq_sub_status = (cqe_word >> 16U) & 0xffU;
+        status.reserved[0] = cqe_word;
+      }
       if (status.result != 0U) break;
     }
     status.processed_request_count = index + 1U;
