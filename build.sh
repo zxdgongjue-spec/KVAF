@@ -14,7 +14,7 @@ die() {
 
 usage() {
   cat <<'EOF'
-Usage: ./build.sh <cpu|npu|aiv-native|aicpu-urma|hbm-rw|aicpu-cpu|aicpu-npu> [--build-dir DIR] [--jobs N] [--install-kernel] [--compare-aiv]
+Usage: ./build.sh <cpu|npu|aiv-native|aicpu-urma|aicpu-sgl-sim|hbm-rw|aicpu-cpu|aicpu-npu> [--build-dir DIR] [--jobs N] [--install-kernel|--check-kernel|--uninstall-kernel] [--compare-aiv]
 
 cpu  Builds the liburma-only CPU Runtime service. If liburma is not installed,
      it clones and builds the pinned UMDK source beside this repository.
@@ -24,8 +24,11 @@ aiv-native Builds the standalone native ACL BatchPut/BatchGet roundtrip test;
            no PyTorch NPU, Python binding, or AICPU kernel installation.
 aicpu-urma Builds the native NPU Runtime client and the AICPU URMA BatchPut/
            BatchGet kernel package; no Python binding. --install-kernel installs
-           the package into the detected CANN root (write access required).
+           and verifies the package in the detected CANN root (write access
+           required). --check-kernel and --uninstall-kernel do not build.
            --compare-aiv also builds AIV kernels for a same-peer diagnostic run.
+aicpu-sgl-sim Builds the CPU-only gather + AICPU SGL transfer simulator.
+              It needs no CANN, URMA device, or NPU.
 hbm-rw Builds the standalone benchmark together with the production CPU URMA
        transport and NPU HBM service.
 aicpu-cpu Builds only the CPU side of the AICPU CPU-push bandwidth test.
@@ -171,6 +174,17 @@ find_cann_root() {
   done
 }
 
+check_aicpu_cann_root() {
+  local selected_root="$1"
+  local runtime_root
+  [[ -n "${ASCEND_HOME_PATH:-}" ]] || return 0
+  [[ -d "$ASCEND_HOME_PATH" ]] || die "ASCEND_HOME_PATH does not exist: $ASCEND_HOME_PATH"
+  runtime_root="$(cd "$ASCEND_HOME_PATH" && pwd -P)"
+  selected_root="$(cd "$selected_root" && pwd -P)"
+  [[ "$runtime_root" == "$selected_root" ]] ||
+    die "AICPU build CANN root ($selected_root) differs from runtime ASCEND_HOME_PATH ($runtime_root)"
+}
+
 build_npu() {
   local build_dir="$1"
   local jobs="$2"
@@ -208,7 +222,7 @@ build_npu() {
 build_aicpu_urma() {
   local build_dir="$1"
   local jobs="$2"
-  local install_kernel="$3"
+  local kernel_action="$3"
   local compare_aiv="$4"
   local cann_root
   local -a compiler_option=()
@@ -218,6 +232,7 @@ build_aicpu_urma() {
   require_command cmake
   cann_root="$(find_cann_root)"
   [[ -n "$cann_root" ]] || die "CANN toolkit not found; source CANN set_env.sh first"
+  check_aicpu_cann_root "$cann_root"
   if [[ -n "${KVAF_AICPU_CXX:-}" ]]; then
     compiler_option+=("-DKVAF_AICPU_CXX=$KVAF_AICPU_CXX")
   fi
@@ -234,8 +249,8 @@ build_aicpu_urma() {
     targets+=(kvaf_execute_batch_get_kernel kvaf_execute_batch_put_kernel)
   fi
   cmake --build "$build_dir" --target "${targets[@]}" --parallel "$jobs"
-  if [[ "$install_kernel" == true ]]; then
-    bash "$KVAF_ROOT/access_operator/src/aicpu_urma/install_kernel.sh" \
+  if [[ "$kernel_action" == install ]]; then
+    bash "$KVAF_ROOT/access_operator/src/aicpu_urma/install_kernel.sh" --install \
       "$build_dir/access_operator/src/aicpu_urma" "$cann_root"
   fi
   echo "[KVAF_BUILD] Native test: $build_dir/tests/kvaf_aicpu_urma_client"
@@ -265,6 +280,27 @@ build_aiv_native() {
   cmake --build "$build_dir" --target kvaf_aiv_batch_roundtrip --parallel "$jobs"
   echo "[KVAF_BUILD] Native AIV test: $build_dir/tests/kvaf_aiv_batch_roundtrip"
   echo "[KVAF_BUILD] Run: '$build_dir/tests/kvaf_aiv_batch_roundtrip' --device-id 0"
+}
+
+build_aicpu_sgl_sim() {
+  local build_dir="$1"
+  local jobs="$2"
+  require_command cmake
+  cmake -S "$KVAF_ROOT" -B "$build_dir" \
+    -DBUILD_TESTING=ON \
+    -DKVAF_BUILD_PYTHON=OFF \
+    -DKVAF_ENABLE_AIV_BATCH_GET=OFF \
+    -DKVAF_ENABLE_AIV_BATCH_PUT=OFF \
+    -DKVAF_ENABLE_AICPU_URMA=OFF \
+    -DKVAF_BUILD_REMOTE_CPU_SERVICE=OFF \
+    -DKVAF_BUILD_HBM_RW_TEST=OFF \
+    -DKVAF_BUILD_CPU_URMA_PROBE=OFF \
+    -DKVAF_BUILD_NPU_SERVICE=OFF \
+    -DKVAF_BUILD_AICPU_GET_TEST=OFF
+  cmake --build "$build_dir" --target kvaf_aicpu_sgl_simulator --parallel "$jobs"
+  echo "[KVAF_BUILD] Simulator: $build_dir/tests/kvaf_aicpu_sgl_simulator"
+  echo "[KVAF_BUILD] Run: '$build_dir/tests/kvaf_aicpu_sgl_simulator' --sgl-size 8"
+  echo "[KVAF_BUILD] Tests: ctest --test-dir '$build_dir' -R '^kvaf_aicpu_sgl_sim_' --output-on-failure"
 }
 
 build_hbm_rw() {
@@ -348,14 +384,14 @@ build_aicpu_test() {
 
 mode="${1:-}"
 case "$mode" in
-  cpu|npu|aiv-native|aicpu-urma|hbm-rw|aicpu-cpu|aicpu-npu) shift ;;
+  cpu|npu|aiv-native|aicpu-urma|aicpu-sgl-sim|hbm-rw|aicpu-cpu|aicpu-npu) shift ;;
   -h|--help|help) usage; exit 0 ;;
   *) usage >&2; exit 2 ;;
 esac
 
 build_dir="$KVAF_ROOT/build-$mode"
 jobs="$(default_jobs)"
-install_kernel=false
+kernel_action=build
 compare_aiv=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -371,7 +407,20 @@ while [[ $# -gt 0 ]]; do
       ;;
     --install-kernel)
       [[ "$mode" == aicpu-urma ]] || die "--install-kernel is only valid for aicpu-urma"
-      install_kernel=true
+      [[ "$kernel_action" == build ]] || die "choose only one AICPU kernel action"
+      kernel_action=install
+      shift
+      ;;
+    --check-kernel)
+      [[ "$mode" == aicpu-urma ]] || die "--check-kernel is only valid for aicpu-urma"
+      [[ "$kernel_action" == build ]] || die "choose only one AICPU kernel action"
+      kernel_action=check
+      shift
+      ;;
+    --uninstall-kernel)
+      [[ "$mode" == aicpu-urma ]] || die "--uninstall-kernel is only valid for aicpu-urma"
+      [[ "$kernel_action" == build ]] || die "choose only one AICPU kernel action"
+      kernel_action=uninstall
       shift
       ;;
     --compare-aiv)
@@ -384,11 +433,20 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || die "KVAF_BUILD_JOBS must be a positive integer"
+if [[ "$mode" == aicpu-urma && "$kernel_action" != build && "$kernel_action" != install ]]; then
+  [[ "$compare_aiv" == false ]] || die "--compare-aiv requires an AICPU build"
+  cann_root="$(find_cann_root)"
+  [[ -n "$cann_root" ]] || die "CANN toolkit not found; source CANN set_env.sh first"
+  check_aicpu_cann_root "$cann_root"
+  bash "$KVAF_ROOT/access_operator/src/aicpu_urma/install_kernel.sh" "--$kernel_action" "$cann_root"
+  exit
+fi
 case "$mode" in
   cpu) build_cpu "$build_dir" "$jobs" ;;
   npu) build_npu "$build_dir" "$jobs" ;;
   aiv-native) build_aiv_native "$build_dir" "$jobs" ;;
-  aicpu-urma) build_aicpu_urma "$build_dir" "$jobs" "$install_kernel" "$compare_aiv" ;;
+  aicpu-urma) build_aicpu_urma "$build_dir" "$jobs" "$kernel_action" "$compare_aiv" ;;
+  aicpu-sgl-sim) build_aicpu_sgl_sim "$build_dir" "$jobs" ;;
   hbm-rw) build_hbm_rw "$build_dir" "$jobs" ;;
   aicpu-cpu) build_aicpu_test cpu "$build_dir" "$jobs" ;;
   aicpu-npu) build_aicpu_test npu "$build_dir" "$jobs" ;;

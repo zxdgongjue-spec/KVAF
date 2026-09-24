@@ -19,13 +19,29 @@ kernel 并发使用；异步 BatchGet 需要调用方在释放输出/transport �
 ```
 
 `build.sh` 自动检测 CANN 根目录；`--install-kernel` 显式安装到同一目录，
-需要写入权限。不传该选项时只构建，不修改 CANN。原生客户端默认使用构建时的
+需要写入权限。安装后会检查压缩包内容、JSON、加载配置中唯一且完整的条目，
+并对比安装文件与构建产物；检查失败则命令以非零状态退出。不传该选项时只构建，
+不修改 CANN。检查与卸载不重新编译：
+
+```bash
+./build.sh aicpu-urma --check-kernel
+./build.sh aicpu-urma --uninstall-kernel
+```
+
+这两个命令只作用于**当前主机**的 CANN 根目录。构建主机与运行主机不同时，
+必须在运行主机安装相同的包；`ascend_package_load.ini.kvaf-aicpu-urma.bak`
+只是安装前备份，不代表当前加载配置仍含 KVAF 条目。卸载仅移除 KVAF 的条目和
+两个安装文件，不用备份覆盖其他包的配置。若 `ASCEND_CANN_PACKAGE_PATH`
+和 `ASCEND_HOME_PATH` 指向不同 CANN 根目录，构建/检查会直接报错。
+
+原生客户端默认使用构建时的
 CANN 路径查找 AICPU JSON，并使用单 worker、单 Jetty；无需配置 `CANN_ROOT`
 或提供 AIV kernel object 路径。若 `ASCEND_HOME_PATH` 未设置，客户端在 ACL 初始化前
 将其设为构建时的 CANN 根目录，以便设备包加载器找到安装包；显式设置的值不覆盖。
 服务端仍是 KVAF 原有 CPU Runtime 服务。
 
-Host 单测：`ctest --test-dir build-aicpu-urma -R kvaf_aicpu_urma_ --output-on-failure`。
+Host 单测（含部署脚本的本地模拟测试）：
+`ctest --test-dir build-aicpu-urma -R kvaf_aicpu_urma_ --output-on-failure`。
 无需 CANN 的机器也可运行：`cmake -S . -B build-host -DBUILD_TESTING=ON && cmake --build build-host --target kvaf_aicpu_urma_wqe_test kvaf_aicpu_urma_kernel_test kvaf_aicpu_urma_client_options_test && ctest --test-dir build-host -R kvaf_aicpu_urma_ --output-on-failure`。
 
 真实 CPU/NPU 回读测试：CPU 端先运行 `./build.sh cpu` 和
@@ -118,6 +134,10 @@ build-aicpu-urma/tests/kvaf_aicpu_urma_client \
 缓存可见性和门铃顺序；若两者在同一候选均返回 `2/2`，先检查共享的 WQE 字段、
 token、地址与 PeerLink 资源。两种后端的批量 WQE 目前都是单 SGE/WQE，
 `--blocks` 不会将一个 WQE 变为多 SGL。
+
+无设备环境下评估 CPU gather 后使用可配置 SGL 发送的映射和理论时间，可运行
+[`aicpu_sgl_simulator.md`](../../../tests/aicpu_sgl_simulator.md) 中的 CPU-only
+仿真。它假设 AICPU 发送带宽为 25 GB/s，不改变现有 kernel 的单 SGE/WQE 实现。
 
 后续 AIV 对照在 `peer_candidate=9` 的两个 NPU EID 上也得到 `status=2`、
 `sub_status=2`。AIV 的 `processed=1` 只表示请求已发出，不能视为 WRITE 成功；

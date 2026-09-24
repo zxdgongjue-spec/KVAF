@@ -18,6 +18,35 @@ add_test(NAME kvaf_aicpu_urma_kernel COMMAND kvaf_aicpu_urma_kernel_test)
 add_executable(kvaf_aicpu_urma_client_options_test aicpu_urma_client_options_test.cc)
 add_test(NAME kvaf_aicpu_urma_client_options COMMAND kvaf_aicpu_urma_client_options_test)
 
+add_test(NAME kvaf_aicpu_urma_install
+  COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/aicpu_urma_install_test.sh")
+
+add_executable(kvaf_aicpu_sgl_simulator aicpu_sgl_simulator.cc)
+target_include_directories(kvaf_aicpu_sgl_simulator PRIVATE
+  "${CMAKE_SOURCE_DIR}/access_operator/include"
+  "${CMAKE_SOURCE_DIR}/runtime/include")
+target_link_libraries(kvaf_aicpu_sgl_simulator PRIVATE kvaf_common)
+target_compile_features(kvaf_aicpu_sgl_simulator PRIVATE cxx_std_17)
+
+add_test(NAME kvaf_aicpu_sgl_sim_single
+  COMMAND kvaf_aicpu_sgl_simulator --rows 7 --row-bytes 128
+          --sgl-size 1 --iterations 2 --wr-overhead-ns 100)
+set_tests_properties(kvaf_aicpu_sgl_sim_single PROPERTIES
+  PASS_REGULAR_EXPRESSION "AICPU_SGL_SIM_PASS.*wr_count_per_iteration=7")
+add_test(NAME kvaf_aicpu_sgl_sim_partial
+  COMMAND kvaf_aicpu_sgl_simulator --rows 7 --row-bytes 128
+          --sgl-size 3 --iterations 2 --wr-overhead-ns 100)
+set_tests_properties(kvaf_aicpu_sgl_sim_partial PROPERTIES
+  PASS_REGULAR_EXPRESSION "AICPU_SEND_MODEL.*send_ns=671.68")
+add_test(NAME kvaf_aicpu_sgl_sim_oversized
+  COMMAND kvaf_aicpu_sgl_simulator --rows 7 --row-bytes 128
+          --sgl-size 32 --iterations 1)
+set_tests_properties(kvaf_aicpu_sgl_sim_oversized PROPERTIES
+  PASS_REGULAR_EXPRESSION "AICPU_SGL_SIM_PASS.*wr_count_per_iteration=1")
+add_test(NAME kvaf_aicpu_sgl_sim_invalid
+  COMMAND kvaf_aicpu_sgl_simulator --sgl-size 0)
+set_tests_properties(kvaf_aicpu_sgl_sim_invalid PROPERTIES WILL_FAIL TRUE)
+
 add_executable(kvaf_aiv_batch_roundtrip_options_test aiv_batch_roundtrip_options_test.cc)
 add_test(NAME kvaf_aiv_batch_roundtrip_options COMMAND kvaf_aiv_batch_roundtrip_options_test)
 
