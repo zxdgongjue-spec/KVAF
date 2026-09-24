@@ -522,13 +522,34 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
             ddr_bytes, slot_size, impl_->options.npu_core_count,
             impl_->options.jettys_per_core);
         const std::uint64_t probe_total_bytes = probe_rows * probe_bytes;
+        // Diagnostic A/B only: test whether this platform needs a page-sized
+        // local HBM registration even when the WRITE payload is just 64 B.
+        // The default path, including the production benchmark, is unchanged.
+        const char* page_probe_setting = std::getenv("KVAF_PROBE_PAD_HBM_PAGE");
+        const bool pad_probe_page = page_probe_setting != nullptr &&
+                                    std::strcmp(page_probe_setting, "1") == 0;
+        constexpr std::uint64_t kProbePageBytes = 4096U;
+        const std::uint64_t probe_alloc_bytes = pad_probe_page &&
+            probe_total_bytes <= std::numeric_limits<std::uint64_t>::max() -
+                                     (kProbePageBytes - 1U)
+            ? std::max(kProbePageBytes,
+                       (probe_total_bytes + kProbePageBytes - 1U) &
+                           ~(kProbePageBytes - 1U))
+            : probe_total_bytes;
+        if (pad_probe_page) {
+          std::fprintf(stderr,
+                       "[KVAF_AIV] PEER_LINK_PROBE_HBM_REGISTRATION "
+                       "payload_bytes=%llu registered_bytes=%llu page_padded=1\n",
+                       static_cast<unsigned long long>(probe_total_bytes),
+                       static_cast<unsigned long long>(probe_alloc_bytes));
+        }
         aclrtStream stream = nullptr;
         if (probe_bytes == 0U || probe_rows == 0U ||
-            aclrtMalloc(&impl_->probe_buffer, probe_total_bytes,
+            aclrtMalloc(&impl_->probe_buffer, probe_alloc_bytes,
                         ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
             impl_->probe_buffer == nullptr ||
-            aclrtMemset(impl_->probe_buffer, probe_total_bytes, 0xA5U,
-                        probe_total_bytes) != ACL_SUCCESS ||
+            aclrtMemset(impl_->probe_buffer, probe_alloc_bytes, 0xA5U,
+                        probe_alloc_bytes) != ACL_SUCCESS ||
             aclrtCreateStream(&stream) != ACL_SUCCESS || stream == nullptr) {
           last = Internal("failed to prepare peer candidate RMA probe");
         } else {
@@ -557,7 +578,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
             Status result = impl_->runtime_core->BatchPut(
                 BatchPutRequest{probe_keys,
                                 ConstBufferView{impl_->probe_buffer,
-                                                static_cast<std::size_t>(probe_total_bytes),
+                                                static_cast<std::size_t>(probe_alloc_bytes),
                                                 DeviceKind::kNpu},
                                 probe_offsets, probe_lengths},
                 BatchPutExecutionOptions{stream});
