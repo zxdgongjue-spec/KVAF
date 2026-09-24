@@ -10,12 +10,18 @@ CPU 数据行复制到连续 staging buffer，再沿用 KVAF 的
 ./build.sh aicpu-sgl-sim
 build-aicpu-sgl-sim/tests/kvaf_aicpu_sgl_simulator \
   --rows 1024 --row-bytes 4096 --source-gap-bytes 64 \
-  --sgl-size 8 --remote-offset 4096 --iterations 3
+  --sgl-size 8 --gather-threads 8 --remote-offset 4096 --iterations 3
 ctest --test-dir build-aicpu-sgl-sim -R '^kvaf_aicpu_sgl_sim_' --output-on-failure
 ```
 
 `--sgl-size 1` 是单 SGE 基线；例如 1024 行使用 SGL=8 时，每轮由
 1024 条模拟 WR 降为 128 条。`--help` 列出全部参数。
+
+`--gather-threads N` 控制 CPU gather 线程数，默认取本机逻辑核数，上限 64；
+每个线程复制互不重叠的行分片，worker 在所有迭代间复用。数据不足时按行数和
+每线程至少 256 KiB 自动减少线程数，输出同时报告请求值与实际值。
+`--gather-threads 1` 是串行基线；计时包含每轮唤醒和等待 worker 的成本，
+不包含初次创建线程的成本。
 
 发送阶段不调用硬件，而是按十进制 25 GB/s 计算
 `wire_ns = payload_bytes / 25`；默认每 WR 附加开销为 0，因此仅增大

@@ -3,14 +3,17 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -20,9 +23,16 @@ using HostSge = kvaf::CpuUrmaTransport::HostSge;
 using WriteGroup = kvaf::cpu_urma_detail::WriteGatherGroup;
 
 constexpr std::size_t kMaxPayloadBytes = 256U * 1024U * 1024U;
+constexpr std::size_t kMinGatherBytesPerWorker = 256U * 1024U;
+constexpr std::size_t kMaxGatherThreads = 64U;
 constexpr std::size_t kRemoteGuardBytes = 64U;
 constexpr double kAssumedAicpuBytesPerNs = 25.0;
 constexpr std::uint8_t kGuardValue = 0xcdU;
+
+std::size_t DefaultGatherThreads() {
+  const auto detected = std::thread::hardware_concurrency();
+  return detected == 0U ? 1U : std::min<std::size_t>(detected, kMaxGatherThreads);
+}
 
 struct Options {
   std::size_t rows{1024U};
@@ -31,6 +41,7 @@ struct Options {
   std::size_t sgl_size{8U};
   std::size_t remote_offset{4096U};
   std::size_t iterations{3U};
+  std::size_t gather_threads{DefaultGatherThreads()};
   std::uint64_t wr_overhead_ns{0U};
 };
 
@@ -40,10 +51,106 @@ struct SimulatedSge {
   std::size_t bytes{0U};
 };
 
+class GatherTeam {
+ public:
+  GatherTeam(const std::vector<std::uint8_t>& source,
+             std::vector<std::uint8_t>* staging, const Options& options,
+             std::size_t worker_count)
+      : source_(source.data()), staging_(staging->data()), rows_(options.rows),
+        row_bytes_(options.row_bytes),
+        stride_(options.row_bytes + options.source_gap_bytes),
+        worker_count_(worker_count) {
+    try {
+      for (std::size_t worker = 1U; worker < worker_count_; ++worker) {
+        workers_.emplace_back([this, worker] { Worker(worker); });
+      }
+    } catch (...) {
+      Stop();
+      throw;
+    }
+  }
+
+  ~GatherTeam() { Stop(); }
+
+  GatherTeam(const GatherTeam&) = delete;
+  GatherTeam& operator=(const GatherTeam&) = delete;
+
+  void Run() {
+    if (worker_count_ == 1U) {
+      CopyShard(0U);
+      return;
+    }
+    std::unique_lock<std::mutex> lock(mutex_);
+    completed_ = 0U;
+    ++generation_;
+    lock.unlock();
+    ready_.notify_all();
+    CopyShard(0U);
+    lock.lock();
+    ++completed_;
+    done_.wait(lock, [this] { return completed_ == worker_count_; });
+  }
+
+ private:
+  void CopyShard(std::size_t worker) const {
+    const std::size_t base = rows_ / worker_count_;
+    const std::size_t extra = rows_ % worker_count_;
+    const std::size_t first = worker * base + std::min(worker, extra);
+    const std::size_t end = first + base + (worker < extra ? 1U : 0U);
+    for (std::size_t row = first; row < end; ++row) {
+      std::memcpy(staging_ + row * row_bytes_,
+                  source_ + (rows_ - 1U - row) * stride_, row_bytes_);
+    }
+  }
+
+  void Worker(std::size_t worker) {
+    std::size_t observed_generation = 0U;
+    for (;;) {
+      std::unique_lock<std::mutex> lock(mutex_);
+      ready_.wait(lock, [this, &observed_generation] {
+        return stopping_ || generation_ != observed_generation;
+      });
+      if (stopping_) return;
+      observed_generation = generation_;
+      lock.unlock();
+      CopyShard(worker);
+      lock.lock();
+      ++completed_;
+      if (completed_ == worker_count_) done_.notify_one();
+    }
+  }
+
+  void Stop() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+    }
+    ready_.notify_all();
+    for (std::thread& worker : workers_) {
+      if (worker.joinable()) worker.join();
+    }
+  }
+
+  const std::uint8_t* source_;
+  std::uint8_t* staging_;
+  std::size_t rows_;
+  std::size_t row_bytes_;
+  std::size_t stride_;
+  std::size_t worker_count_;
+  std::vector<std::thread> workers_;
+  std::mutex mutex_;
+  std::condition_variable ready_;
+  std::condition_variable done_;
+  std::size_t generation_{0U};
+  std::size_t completed_{0U};
+  bool stopping_{false};
+};
+
 void Usage(const char* program) {
   std::cout << "Usage: " << program
             << " [--rows N] [--row-bytes N] [--source-gap-bytes N]"
                " [--sgl-size N] [--remote-offset N] [--iterations N]"
+               " [--gather-threads N]"
                " [--wr-overhead-ns N]\n";
 }
 
@@ -76,10 +183,12 @@ Options ParseOptions(int argc, char** argv) {
     else if (flag == "--sgl-size") options.sgl_size = size;
     else if (flag == "--remote-offset") options.remote_offset = size;
     else if (flag == "--iterations") options.iterations = size;
+    else if (flag == "--gather-threads") options.gather_threads = size;
     else throw std::invalid_argument("unknown option: " + std::string(flag));
   }
   if (options.rows == 0U || options.row_bytes == 0U || options.sgl_size == 0U ||
       options.iterations == 0U || options.iterations > 1000U ||
+      options.gather_threads == 0U || options.gather_threads > kMaxGatherThreads ||
       options.row_bytes > kMaxPayloadBytes / options.rows ||
       options.source_gap_bytes > std::numeric_limits<std::size_t>::max() - options.row_bytes) {
     throw std::invalid_argument("invalid dimensions or payload exceeds 256 MiB");
@@ -92,6 +201,13 @@ Options ParseOptions(int argc, char** argv) {
     throw std::invalid_argument("source or remote buffer is too large");
   }
   return options;
+}
+
+std::size_t EffectiveGatherThreads(const Options& options) {
+  const std::size_t payload_bytes = options.rows * options.row_bytes;
+  const std::size_t useful_workers = std::max<std::size_t>(
+      1U, payload_bytes / kMinGatherBytesPerWorker);
+  return std::min({options.gather_threads, options.rows, useful_workers});
 }
 
 void FillScatteredSource(std::vector<std::uint8_t>* source, const Options& options,
@@ -160,6 +276,9 @@ void Run(const Options& options) {
     local_rows[row] = {staging.data() + row * options.row_bytes, options.row_bytes};
     remote_offsets[row] = options.remote_offset + row * options.row_bytes;
   }
+  const std::size_t gather_threads = EffectiveGatherThreads(options);
+  GatherTeam gather_team(source, &staging, options, gather_threads);
+  gather_team.Run();
 
   std::uint64_t gather_ns = 0U;
   std::uint64_t plan_ns = 0U;
@@ -167,11 +286,7 @@ void Run(const Options& options) {
   for (std::size_t iteration = 0U; iteration < options.iterations; ++iteration) {
     FillScatteredSource(&source, options, iteration);
     const auto gather_start = Clock::now();
-    for (std::size_t row = 0U; row < options.rows; ++row) {
-      std::memcpy(staging.data() + row * options.row_bytes,
-                  source.data() + (options.rows - 1U - row) * stride,
-                  options.row_bytes);
-    }
+    gather_team.Run();
     const auto gather_end = Clock::now();
 
     std::vector<SimulatedSge> sges;
@@ -213,7 +328,9 @@ void Run(const Options& options) {
             << " wr_count_per_iteration=" << wr_count
             << " iterations=" << options.iterations
             << " bytes_per_iteration=" << payload_bytes
-            << " remote_offset=" << options.remote_offset << '\n';
+            << " remote_offset=" << options.remote_offset
+            << " gather_threads_requested=" << options.gather_threads
+            << " gather_threads_effective=" << gather_threads << '\n';
   std::cout << std::fixed << std::setprecision(2)
             << "CPU_PREP_MEASURED gather_ns=" << gather_ns
             << " plan_ns=" << plan_ns << '\n'

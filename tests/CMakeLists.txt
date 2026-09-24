@@ -22,10 +22,11 @@ add_test(NAME kvaf_aicpu_urma_install
   COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/aicpu_urma_install_test.sh")
 
 add_executable(kvaf_aicpu_sgl_simulator aicpu_sgl_simulator.cc)
+find_package(Threads REQUIRED)
 target_include_directories(kvaf_aicpu_sgl_simulator PRIVATE
   "${CMAKE_SOURCE_DIR}/access_operator/include"
   "${CMAKE_SOURCE_DIR}/runtime/include")
-target_link_libraries(kvaf_aicpu_sgl_simulator PRIVATE kvaf_common)
+target_link_libraries(kvaf_aicpu_sgl_simulator PRIVATE kvaf_common Threads::Threads)
 target_compile_features(kvaf_aicpu_sgl_simulator PRIVATE cxx_std_17)
 
 add_test(NAME kvaf_aicpu_sgl_sim_single
@@ -46,6 +47,19 @@ set_tests_properties(kvaf_aicpu_sgl_sim_oversized PROPERTIES
 add_test(NAME kvaf_aicpu_sgl_sim_invalid
   COMMAND kvaf_aicpu_sgl_simulator --sgl-size 0)
 set_tests_properties(kvaf_aicpu_sgl_sim_invalid PROPERTIES WILL_FAIL TRUE)
+add_test(NAME kvaf_aicpu_sgl_sim_parallel
+  COMMAND kvaf_aicpu_sgl_simulator --rows 257 --row-bytes 4096
+          --sgl-size 7 --iterations 3 --gather-threads 4)
+set_tests_properties(kvaf_aicpu_sgl_sim_parallel PROPERTIES
+  PASS_REGULAR_EXPRESSION "AICPU_SGL_SIM_PASS.*gather_threads_effective=4")
+add_test(NAME kvaf_aicpu_sgl_sim_small_fallback
+  COMMAND kvaf_aicpu_sgl_simulator --rows 7 --row-bytes 128
+          --sgl-size 3 --iterations 2 --gather-threads 8)
+set_tests_properties(kvaf_aicpu_sgl_sim_small_fallback PROPERTIES
+  PASS_REGULAR_EXPRESSION "AICPU_SGL_SIM_PASS.*gather_threads_effective=1")
+add_test(NAME kvaf_aicpu_sgl_sim_invalid_threads
+  COMMAND kvaf_aicpu_sgl_simulator --gather-threads 0)
+set_tests_properties(kvaf_aicpu_sgl_sim_invalid_threads PROPERTIES WILL_FAIL TRUE)
 
 add_executable(kvaf_aiv_batch_roundtrip_options_test aiv_batch_roundtrip_options_test.cc)
 add_test(NAME kvaf_aiv_batch_roundtrip_options COMMAND kvaf_aiv_batch_roundtrip_options_test)
