@@ -522,10 +522,21 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
             ddr_bytes, slot_size, impl_->options.npu_core_count,
             impl_->options.jettys_per_core);
         const std::uint64_t probe_total_bytes = probe_rows * probe_bytes;
+        // Isolated single-variable A/B only. The reference V9 path remains
+        // NORMAL_ONLY unless the one-pair diagnostic explicitly opts in.
+        const char* huge_probe_setting = std::getenv("KVAF_PROBE_HUGE_FIRST");
+        const bool huge_probe = first_pair_only && huge_probe_setting != nullptr &&
+                                std::strcmp(huge_probe_setting, "1") == 0;
+        const auto probe_alloc_policy = huge_probe ? ACL_MEM_MALLOC_HUGE_FIRST
+                                                   : ACL_MEM_MALLOC_NORMAL_ONLY;
+        std::fprintf(stderr,
+                     "[KVAF_AIV] PEER_LINK_PROBE_SOURCE_ALLOCATION mode=%s bytes=%llu\n",
+                     huge_probe ? "huge_first" : "normal_only",
+                     static_cast<unsigned long long>(probe_total_bytes));
         aclrtStream stream = nullptr;
         if (probe_bytes == 0U || probe_rows == 0U ||
             aclrtMalloc(&impl_->probe_buffer, probe_total_bytes,
-                        ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
+                        probe_alloc_policy) != ACL_SUCCESS ||
             impl_->probe_buffer == nullptr ||
             aclrtMemset(impl_->probe_buffer, probe_total_bytes, 0xA5U,
                         probe_total_bytes) != ACL_SUCCESS ||
