@@ -1,6 +1,6 @@
 # CPU gather + AICPU SGL 仿真
 
-这是不依赖 CANN、URMA 或 NPU 的原生 C++ 测试。它把物理上逆序、相互间有间隔的
+这是不依赖 CANN、URMA 或 NPU 的原生 C++ 测试。它把虚拟地址上逆序、相互间有间隔的
 CPU 数据行复制到连续 staging buffer，再沿用 KVAF 的
 `BuildWriteGatherShard` 分组规则，把每行作为一个本地 SGE，按
 `--sgl-size` 指定的**每条 WRITE 最多本地 SGE 数**组成模拟 WR。每条 WR
@@ -16,6 +16,32 @@ ctest --test-dir build-aicpu-sgl-sim -R '^kvaf_aicpu_sgl_sim_' --output-on-failu
 
 `--sgl-size 1` 是单 SGE 基线；例如 1024 行使用 SGL=8 时，每轮由
 1024 条模拟 WR 降为 128 条。`--help` 列出全部参数。
+
+默认源数据位于一块 4.0625 MiB 的连续 CPU 虚拟地址区，每轮重写内容但复用
+地址。要比较分散在 4 GiB 与 100 GiB 虚拟地址跨度中的 gather，使用稀疏
+`mmap` 源区：
+
+```bash
+for space in 4 100; do
+  build-aicpu-sgl-sim/tests/kvaf_aicpu_sgl_simulator \
+    --rows 1024 --row-bytes 4096 --source-space-gib "$space" \
+    --source-variants 16 --sgl-size 8 --iterations 1000 \
+    --gather-threads 16 --gather-mode active
+done
+```
+
+稀疏模式把每个输出行的候选源地址分布在整个虚拟地址区；候选数据在计时前
+预填，每轮选另一组源地址，仍然复制到 staging buffer 并重新生成 SGL 分组。
+`--source-variants 16` 表示每行有 16 个候选地址，每 16 轮循环；上述命令
+仅预填 64 MiB 有效数据（4 KiB 行），**不是**实际驻留 4/100 GiB 数据。
+`SOURCE_LAYOUT` 分别报告保留的虚拟地址字节数、实际访问跨度、预填有效
+数据字节数和触达的数据页字节数；页表及实际 RSS 可能不同。想让 1000 轮
+都使用未重复的地址，可设 `--source-variants 1000`，此时预填约 4 GiB，
+必须有足够内存。按 1024 行、每行 4 KiB 计算，完整预填 4 GiB 数据池需要
+`--source-variants 1024`，完整预填 100 GiB 需要 `25600`，后者要求
+超过 100 GiB 可用内存，不应仅为比较虚拟地址跨度而使用。稀疏模式不使用
+`--source-gap-bytes`；候选选址及预填不计入
+`gather_ns`。
 
 `--gather-threads N` 控制 CPU gather 线程数，默认取本机逻辑核数，上限 64；
 每个线程复制互不重叠的行分片，worker 在所有迭代间复用。数据不足时按行数和

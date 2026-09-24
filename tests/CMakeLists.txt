@@ -97,6 +97,23 @@ set_tests_properties(kvaf_aicpu_sgl_sim_ns_summary PROPERTIES
 add_test(NAME kvaf_aicpu_sgl_sim_invalid_ns_log
   COMMAND kvaf_aicpu_sgl_simulator --log-iterations 2)
 set_tests_properties(kvaf_aicpu_sgl_sim_invalid_ns_log PROPERTIES WILL_FAIL TRUE)
+add_test(NAME kvaf_aicpu_sgl_sim_sparse_source
+  COMMAND kvaf_aicpu_sgl_simulator --rows 257 --row-bytes 4096
+          --source-space-gib 4 --source-variants 3 --sgl-size 7
+          --iterations 4 --gather-threads 4 --gather-mode active)
+set_tests_properties(kvaf_aicpu_sgl_sim_sparse_source PROPERTIES
+  PASS_REGULAR_EXPRESSION "SOURCE_LAYOUT mode=sparse virtual_bytes=4294967296.*variants=3")
+add_test(NAME kvaf_aicpu_sgl_sim_invalid_source_variants
+  COMMAND kvaf_aicpu_sgl_simulator --rows 1024 --row-bytes 4096
+          --source-space-gib 4 --source-variants 1025)
+set_tests_properties(kvaf_aicpu_sgl_sim_invalid_source_variants PROPERTIES
+  WILL_FAIL TRUE)
+add_test(NAME kvaf_aicpu_sgl_sim_many_source_variants
+  COMMAND kvaf_aicpu_sgl_simulator --rows 7 --row-bytes 128
+          --source-space-gib 4 --source-variants 1000 --sgl-size 3
+          --iterations 3 --gather-threads 1)
+set_tests_properties(kvaf_aicpu_sgl_sim_many_source_variants PROPERTIES
+  PASS_REGULAR_EXPRESSION "SOURCE_LAYOUT mode=sparse virtual_bytes=4294967296.*variants=1000")
 
 add_executable(kvaf_aiv_batch_roundtrip_options_test aiv_batch_roundtrip_options_test.cc)
 add_test(NAME kvaf_aiv_batch_roundtrip_options COMMAND kvaf_aiv_batch_roundtrip_options_test)

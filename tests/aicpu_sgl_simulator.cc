@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
@@ -13,9 +14,13 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#include <sys/mman.h>
+#include <unistd.h>
 
 #if defined(_OPENMP)
 #include <omp.h>
@@ -31,6 +36,9 @@ constexpr std::size_t kMaxPayloadBytes = 256U * 1024U * 1024U;
 constexpr std::size_t kMinGatherBytesPerWorker = 256U * 1024U;
 constexpr std::size_t kMaxGatherThreads = 64U;
 constexpr std::size_t kRemoteGuardBytes = 64U;
+constexpr std::size_t kGiB = 1024U * 1024U * 1024U;
+constexpr std::size_t kSourceSlotAlignment = 64U;
+constexpr std::size_t kDefaultSourceVariants = 16U;
 constexpr double kAssumedAicpuBytesPerNs = 25.0;
 constexpr std::uint8_t kGuardValue = 0xcdU;
 
@@ -45,6 +53,8 @@ struct Options {
   std::size_t rows{1024U};
   std::size_t row_bytes{4096U};
   std::size_t source_gap_bytes{64U};
+  std::size_t source_space_gib{0U};
+  std::size_t source_variants{kDefaultSourceVariants};
   std::size_t sgl_size{8U};
   std::size_t remote_offset{4096U};
   std::size_t iterations{3U};
@@ -57,6 +67,8 @@ struct Options {
 struct IterationTiming {
   std::uint64_t gather_ns{0U};
   std::uint64_t plan_ns{0U};
+  std::size_t source_first_offset{0U};
+  std::size_t source_last_offset{0U};
 };
 
 struct SimulatedSge {
@@ -65,14 +77,129 @@ struct SimulatedSge {
   std::size_t bytes{0U};
 };
 
+void FillSourceRow(std::uint8_t* data, std::size_t row, std::size_t variant,
+                   std::size_t row_bytes) {
+  for (std::size_t byte = 0U; byte < row_bytes; ++byte) {
+    data[byte] = static_cast<std::uint8_t>(
+        (row * 131U + byte * 17U + variant * 29U) & 0xffU);
+  }
+  const std::uint64_t marker =
+      (static_cast<std::uint64_t>(row) << 32U) | variant;
+  std::memcpy(data, &marker, std::min(row_bytes, sizeof(marker)));
+}
+
+class SourceSpace {
+ public:
+  explicit SourceSpace(const Options& options)
+      : rows_(options.rows), row_bytes_(options.row_bytes),
+        variants_(options.source_variants) {
+    if (options.source_space_gib == 0U) {
+      band_stride_bytes_ = options.row_bytes + options.source_gap_bytes;
+      compact_.resize(rows_ * band_stride_bytes_);
+      virtual_bytes_ = compact_.size();
+      return;
+    }
+
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) throw std::runtime_error("cannot determine page size");
+    page_bytes_ = static_cast<std::size_t>(page_size);
+    slot_bytes_ = ((row_bytes_ + kSourceSlotAlignment - 1U) /
+                   kSourceSlotAlignment) * kSourceSlotAlignment;
+    virtual_bytes_ = options.source_space_gib * kGiB;
+    band_stride_bytes_ = (virtual_bytes_ / rows_ / page_bytes_) * page_bytes_;
+    if (band_stride_bytes_ < slot_bytes_ ||
+        variants_ > band_stride_bytes_ / slot_bytes_) {
+      throw std::invalid_argument("source variants do not fit in the address space");
+    }
+
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#if defined(MAP_NORESERVE)
+    flags |= MAP_NORESERVE;
+#endif
+    void* region = mmap(nullptr, virtual_bytes_, PROT_READ | PROT_WRITE,
+                        flags, -1, 0);
+    if (region == MAP_FAILED) {
+      throw std::runtime_error("cannot map source address space: " +
+                               std::string(std::strerror(errno)));
+    }
+    mapped_ = static_cast<std::uint8_t*>(region);
+    for (std::size_t row = 0U; row < rows_; ++row) {
+      for (std::size_t variant = 0U; variant < variants_; ++variant) {
+        FillSourceRow(WideRow(row, variant), row, variant, row_bytes_);
+      }
+    }
+  }
+
+  ~SourceSpace() {
+    if (mapped_ != nullptr) munmap(mapped_, virtual_bytes_);
+  }
+
+  SourceSpace(const SourceSpace&) = delete;
+  SourceSpace& operator=(const SourceSpace&) = delete;
+
+  void Select(std::size_t iteration,
+              std::vector<const std::uint8_t*>* source_rows) {
+    for (std::size_t row = 0U; row < rows_; ++row) {
+      if (mapped_ != nullptr) {
+        const std::size_t variant =
+            (iteration + row * 7U) % variants_;
+        (*source_rows)[row] = WideRow(row, variant);
+      } else {
+        auto* data = compact_.data() + (rows_ - 1U - row) * band_stride_bytes_;
+        FillSourceRow(data, row, iteration, row_bytes_);
+        (*source_rows)[row] = data;
+      }
+    }
+  }
+
+  bool sparse() const { return mapped_ != nullptr; }
+  std::size_t virtual_bytes() const { return virtual_bytes_; }
+  std::size_t variants() const { return sparse() ? variants_ : 1U; }
+  std::size_t band_stride_bytes() const { return band_stride_bytes_; }
+  std::size_t slot_stride_bytes() const { return slot_bytes_; }
+  std::size_t pool_payload_bytes() const {
+    return rows_ * variants() * row_bytes_;
+  }
+  std::size_t pool_touched_page_bytes() const {
+    if (!sparse()) return compact_.size();
+    const std::size_t bytes_per_band = variants_ * slot_bytes_;
+    return rows_ * ((bytes_per_band + page_bytes_ - 1U) / page_bytes_) *
+           page_bytes_;
+  }
+  std::size_t access_span_bytes() const {
+    return (rows_ - 1U) * band_stride_bytes_ +
+           (variants() - 1U) * (sparse() ? slot_bytes_ : 0U) + row_bytes_;
+  }
+  std::size_t Offset(const std::uint8_t* address) const {
+    const auto* base = sparse() ? mapped_ : compact_.data();
+    return reinterpret_cast<std::uintptr_t>(address) -
+           reinterpret_cast<std::uintptr_t>(base);
+  }
+
+ private:
+  std::uint8_t* WideRow(std::size_t row, std::size_t variant) const {
+    return mapped_ + (rows_ - 1U - row) * band_stride_bytes_ +
+           variant * slot_bytes_;
+  }
+
+  std::size_t rows_;
+  std::size_t row_bytes_;
+  std::size_t variants_;
+  std::size_t virtual_bytes_{0U};
+  std::size_t band_stride_bytes_{0U};
+  std::size_t slot_bytes_{0U};
+  std::size_t page_bytes_{0U};
+  std::vector<std::uint8_t> compact_;
+  std::uint8_t* mapped_{nullptr};
+};
+
 class GatherTeam {
  public:
-  GatherTeam(const std::vector<std::uint8_t>& source,
+  GatherTeam(const std::vector<const std::uint8_t*>& source_rows,
              std::vector<std::uint8_t>* staging, const Options& options,
              std::size_t worker_count)
-      : source_(source.data()), staging_(staging->data()), rows_(options.rows),
-        row_bytes_(options.row_bytes),
-        stride_(options.row_bytes + options.source_gap_bytes),
+      : source_rows_(source_rows.data()), staging_(staging->data()),
+        rows_(options.rows), row_bytes_(options.row_bytes),
         worker_count_(worker_count), actual_count_(worker_count),
         mode_(options.gather_mode) {
 #if defined(_OPENMP)
@@ -148,7 +275,7 @@ class GatherTeam {
     const std::size_t end = first + base + (worker < extra ? 1U : 0U);
     for (std::size_t row = first; row < end; ++row) {
       std::memcpy(staging_ + row * row_bytes_,
-                  source_ + (rows_ - 1U - row) * stride_, row_bytes_);
+                  source_rows_[row], row_bytes_);
     }
   }
 
@@ -203,11 +330,10 @@ class GatherTeam {
     }
   }
 
-  const std::uint8_t* source_;
+  const std::uint8_t* const* source_rows_;
   std::uint8_t* staging_;
   std::size_t rows_;
   std::size_t row_bytes_;
-  std::size_t stride_;
   std::size_t worker_count_;
   std::size_t actual_count_;
   GatherMode mode_;
@@ -226,6 +352,7 @@ class GatherTeam {
 void Usage(const char* program) {
   std::cout << "Usage: " << program
             << " [--rows N] [--row-bytes N] [--source-gap-bytes N]"
+               " [--source-space-gib N] [--source-variants N]"
                " [--sgl-size N] [--remote-offset N] [--iterations N]"
                " [--gather-threads N]"
                " [--gather-mode active|passive|omp]"
@@ -277,6 +404,8 @@ Options ParseOptions(int argc, char** argv) {
     if (flag == "--rows") options.rows = size;
     else if (flag == "--row-bytes") options.row_bytes = size;
     else if (flag == "--source-gap-bytes") options.source_gap_bytes = size;
+    else if (flag == "--source-space-gib") options.source_space_gib = size;
+    else if (flag == "--source-variants") options.source_variants = size;
     else if (flag == "--sgl-size") options.sgl_size = size;
     else if (flag == "--remote-offset") options.remote_offset = size;
     else if (flag == "--iterations") options.iterations = size;
@@ -285,6 +414,7 @@ Options ParseOptions(int argc, char** argv) {
   }
   if (options.rows == 0U || options.row_bytes == 0U || options.sgl_size == 0U ||
       options.iterations == 0U || options.iterations > 1000U ||
+      options.source_variants == 0U ||
       options.gather_threads == 0U || options.gather_threads > kMaxGatherThreads ||
       options.row_bytes > kMaxPayloadBytes / options.rows ||
       options.source_gap_bytes > std::numeric_limits<std::size_t>::max() - options.row_bytes) {
@@ -292,10 +422,19 @@ Options ParseOptions(int argc, char** argv) {
   }
   const auto payload_bytes = options.rows * options.row_bytes;
   const auto stride = options.row_bytes + options.source_gap_bytes;
-  if (options.rows > (2U * kMaxPayloadBytes) / stride ||
-      options.remote_offset > std::numeric_limits<std::size_t>::max() -
+  if (options.remote_offset > std::numeric_limits<std::size_t>::max() -
           payload_bytes - kRemoteGuardBytes) {
     throw std::invalid_argument("source or remote buffer is too large");
+  }
+  if (options.source_space_gib == 0U) {
+    if (options.rows > (2U * kMaxPayloadBytes) / stride ||
+        options.source_variants != kDefaultSourceVariants) {
+      throw std::invalid_argument("invalid compact source layout");
+    }
+  } else if (options.source_space_gib >
+                 std::numeric_limits<std::size_t>::max() / kGiB ||
+             options.source_gap_bytes != 64U) {
+    throw std::invalid_argument("invalid sparse source layout");
   }
   return options;
 }
@@ -305,18 +444,6 @@ std::size_t EffectiveGatherThreads(const Options& options) {
   const std::size_t useful_workers = std::max<std::size_t>(
       1U, payload_bytes / kMinGatherBytesPerWorker);
   return std::min({options.gather_threads, options.rows, useful_workers});
-}
-
-void FillScatteredSource(std::vector<std::uint8_t>* source, const Options& options,
-                         std::size_t iteration) {
-  const std::size_t stride = options.row_bytes + options.source_gap_bytes;
-  for (std::size_t row = 0U; row < options.rows; ++row) {
-    auto* data = source->data() + (options.rows - 1U - row) * stride;
-    for (std::size_t byte = 0U; byte < options.row_bytes; ++byte) {
-      data[byte] = static_cast<std::uint8_t>(
-          (row * 131U + byte * 17U + iteration * 29U) & 0xffU);
-    }
-  }
 }
 
 void SimulateSend(const Options& options, const std::vector<SimulatedSge>& sges,
@@ -340,12 +467,12 @@ void SimulateSend(const Options& options, const std::vector<SimulatedSge>& sges,
   }
 }
 
-void VerifyRemote(const Options& options, const std::vector<std::uint8_t>& source,
+void VerifyRemote(const Options& options,
+                  const std::vector<const std::uint8_t*>& source_rows,
                   const std::vector<std::uint8_t>& remote) {
-  const std::size_t stride = options.row_bytes + options.source_gap_bytes;
   const std::size_t payload_bytes = options.rows * options.row_bytes;
   for (std::size_t row = 0U; row < options.rows; ++row) {
-    const auto* expected = source.data() + (options.rows - 1U - row) * stride;
+    const auto* expected = source_rows[row];
     const auto* actual = remote.data() + options.remote_offset + row * options.row_bytes;
     if (std::memcmp(expected, actual, options.row_bytes) != 0) {
       throw std::runtime_error("remote bytes do not match the scattered CPU source");
@@ -362,8 +489,9 @@ void VerifyRemote(const Options& options, const std::vector<std::uint8_t>& sourc
 
 void Run(const Options& options) {
   const std::size_t payload_bytes = options.rows * options.row_bytes;
-  const std::size_t stride = options.row_bytes + options.source_gap_bytes;
-  std::vector<std::uint8_t> source(options.rows * stride);
+  SourceSpace source(options);
+  std::vector<const std::uint8_t*> source_rows(options.rows);
+  source.Select(0U, &source_rows);
   std::vector<std::uint8_t> staging(payload_bytes);
   std::vector<std::uint8_t> remote(options.remote_offset + payload_bytes +
                                    kRemoteGuardBytes);
@@ -374,7 +502,7 @@ void Run(const Options& options) {
     remote_offsets[row] = options.remote_offset + row * options.row_bytes;
   }
   const std::size_t gather_threads = EffectiveGatherThreads(options);
-  GatherTeam gather_team(source, &staging, options, gather_threads);
+  GatherTeam gather_team(source_rows, &staging, options, gather_threads);
   gather_team.Run();
 
   std::uint64_t gather_ns = 0U;
@@ -387,7 +515,7 @@ void Run(const Options& options) {
   if (options.log_iterations) iteration_timings.reserve(options.iterations);
   std::size_t wr_count = 0U;
   for (std::size_t iteration = 0U; iteration < options.iterations; ++iteration) {
-    FillScatteredSource(&source, options, iteration);
+    source.Select(iteration, &source_rows);
     const auto gather_start = Clock::now();
     gather_team.Run();
     const auto gather_end = Clock::now();
@@ -412,7 +540,7 @@ void Run(const Options& options) {
       throw std::runtime_error("SGL plan is invalid: " + status.message());
     }
     SimulateSend(options, sges, writes, &remote);
-    VerifyRemote(options, source, remote);
+    VerifyRemote(options, source_rows, remote);
     const auto iteration_gather_ns = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             gather_end - gather_start).count());
@@ -426,7 +554,9 @@ void Run(const Options& options) {
     plan_min_ns = std::min(plan_min_ns, iteration_plan_ns);
     plan_max_ns = std::max(plan_max_ns, iteration_plan_ns);
     if (options.log_iterations) {
-      iteration_timings.push_back({iteration_gather_ns, iteration_plan_ns});
+      iteration_timings.push_back({iteration_gather_ns, iteration_plan_ns,
+                                   source.Offset(source_rows.front()),
+                                   source.Offset(source_rows.back())});
     }
   }
 
@@ -450,6 +580,14 @@ void Run(const Options& options) {
             << (options.gather_mode == GatherMode::kActive ? "active" :
                 options.gather_mode == GatherMode::kOpenMp ? "omp" : "passive")
             << '\n';
+  std::cout << "SOURCE_LAYOUT mode=" << (source.sparse() ? "sparse" : "compact")
+            << " virtual_bytes=" << source.virtual_bytes()
+            << " access_span_bytes=" << source.access_span_bytes()
+            << " pool_payload_bytes=" << source.pool_payload_bytes()
+            << " pool_touched_page_bytes=" << source.pool_touched_page_bytes()
+            << " variants=" << source.variants()
+            << " band_stride_bytes=" << source.band_stride_bytes()
+            << " slot_stride_bytes=" << source.slot_stride_bytes() << '\n';
   std::cout << std::fixed << std::setprecision(2)
             << "CPU_PREP_MEASURED gather_ns=" << gather_ns
             << " plan_ns=" << plan_ns << '\n'
@@ -475,6 +613,8 @@ void Run(const Options& options) {
     std::cout << "ITERATION_NS index=" << iteration + 1U
               << " gather_ns=" << timing.gather_ns
               << " plan_ns=" << timing.plan_ns
+              << " source_first_offset=" << timing.source_first_offset
+              << " source_last_offset=" << timing.source_last_offset
               << " send_model_ns=" << send_ns_per_iteration
               << " total_model_ns="
               << timing.gather_ns + timing.plan_ns + send_ns_per_iteration << '\n';

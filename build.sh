@@ -300,6 +300,7 @@ build_aicpu_sgl_sim() {
   cmake --build "$build_dir" --target kvaf_aicpu_sgl_simulator --parallel "$jobs"
   echo "[KVAF_BUILD] Simulator: $build_dir/tests/kvaf_aicpu_sgl_simulator"
   echo "[KVAF_BUILD] Run: '$build_dir/tests/kvaf_aicpu_sgl_simulator' --sgl-size 8 --gather-threads 8 --gather-mode active --log-iterations 1"
+  echo "[KVAF_BUILD] Wide source: add --source-space-gib 4 (or 100) --source-variants 16"
   echo "[KVAF_BUILD] Tests: ctest --test-dir '$build_dir' -R '^kvaf_aicpu_sgl_sim_' --output-on-failure"
 }
 
