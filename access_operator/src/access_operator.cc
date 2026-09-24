@@ -17,6 +17,7 @@
 
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
 #include "batch_put_abi.h"
+#include "direct_hccp/direct_hccp_session.h"
 #include "kvaf_aiv_batch_put.h"
 #endif
 
