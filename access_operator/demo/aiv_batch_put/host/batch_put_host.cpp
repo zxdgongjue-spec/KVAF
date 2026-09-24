@@ -652,6 +652,31 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
                    static_cast<unsigned long long>(local_buffer->memory.registered_address),
                    static_cast<unsigned long long>(local_buffer->memory.registered_bytes),
                    local_buffer->memory.token_id);
+      if (arguments->row_count == 1U && core_status_count == 1U &&
+          transport->jettys_per_core == 1U) {
+        const uint64_t local_address = core_status[core].reserved[0];
+        const uint64_t length = core_status[core].reserved[1];
+        const auto &mr = local_buffer->memory;
+        const bool address_in_mr = local_address >= mr.registered_address &&
+            local_address - mr.registered_address <= mr.registered_bytes &&
+            length <= mr.registered_bytes -
+                          (local_address - mr.registered_address);
+        std::fprintf(stderr,
+                     "[KVAF_AIV] BATCH_PUT_AIV_SGE_INPUT local_addr=0x%llx "
+                     "length=%llu local_token_id=0x%llx local_in_mr=%u "
+                     "remote_addr=0x%llx remote_token_id=0x%llx "
+                     "remote_token_value=0x%llx tp_id=0x%llx "
+                     "entity_local_size=%llu\n",
+                     static_cast<unsigned long long>(local_address),
+                     static_cast<unsigned long long>(length),
+                     static_cast<unsigned long long>(core_status[core].reserved[2]),
+                     static_cast<unsigned int>(address_in_mr),
+                     static_cast<unsigned long long>(core_status[core].reserved[3]),
+                     static_cast<unsigned long long>(core_status[core].reserved[4]),
+                     static_cast<unsigned long long>(core_status[core].reserved[5]),
+                     static_cast<unsigned long long>(core_status[core].reserved[6]),
+                     static_cast<unsigned long long>(core_status[core].reserved[7]));
+      }
       return KVAF_BATCH_PUT_KERNEL_ERROR;
     }
   }
