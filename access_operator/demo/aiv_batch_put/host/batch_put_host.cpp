@@ -629,45 +629,29 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
         core_status[core].result != KVAF_BATCH_PUT_CORE_SUCCESS ||
         core_status[core].processed_request_count != end - begin ||
         core_status[core].failed_request_index != UINT64_MAX) {
-      // Only on failure: inspect the exact SQE fetched by hardware. This
-      // distinguishes a bad local SGE from a correct SQE with a bad MR.
-      if (core_status[core].sq_producer_index != 0U) {
-        const uint32_t worker_index = core * transport->jettys_per_core;
-        const auto &entity = transport->entity_templates[worker_index];
-        const uint64_t slot = (core_status[core].sq_producer_index - 1U) %
-                              entity.sq_depth;
-        std::array<uint32_t, kWqeBytes / sizeof(uint32_t)> wqe{};
-        const aclError read_result = aclrtMemcpy(
-            wqe.data(), sizeof(wqe),
-            reinterpret_cast<void *>(entity.sq_va + slot * kWqeBytes),
-            sizeof(wqe), ACL_MEMCPY_DEVICE_TO_HOST);
-        if (read_result == ACL_SUCCESS) {
-          const uint64_t source = static_cast<uint64_t>(wqe[14]) |
-                                  (static_cast<uint64_t>(wqe[15]) << 32U);
-          const uint64_t destination = static_cast<uint64_t>(wqe[10]) |
-                                       (static_cast<uint64_t>(wqe[11]) << 32U);
-          const auto &mr = local_buffer->memory;
-          const bool source_in_mr = source >= mr.registered_address &&
-              source - mr.registered_address <= mr.registered_bytes &&
-              wqe[12] <= mr.registered_bytes -
-                             (source - mr.registered_address);
-          std::fprintf(stderr,
-                       "[KVAF_AIV] BATCH_PUT_FAILED_WQE core=%u jetty=0 "
-                       "opcode=0x%x byte_count=%u local_addr=0x%llx "
-                       "local_token_id=0x%x mr_addr=0x%llx mr_bytes=%llu "
-                       "mr_token_id=0x%x local_in_mr=%u remote_addr=0x%llx\n",
-                       core, (wqe[1] >> 8U) & 0xffU, wqe[12],
-                       static_cast<unsigned long long>(source), wqe[13],
-                       static_cast<unsigned long long>(mr.registered_address),
-                       static_cast<unsigned long long>(mr.registered_bytes),
-                       mr.token_id, static_cast<unsigned int>(source_in_mr),
-                       static_cast<unsigned long long>(destination));
-        } else {
-          std::fprintf(stderr,
-                       "[KVAF_AIV] BATCH_PUT_FAILED_WQE_READ core=%u acl=%d\n",
-                       core, static_cast<int>(read_result));
-        }
-      }
+      // The SQ address comes from HCCP QP creation, not aclrtMalloc. This
+      // path has no verified ACL copy contract for that address. Keep the
+      // already-copied status instead of risking a second fault while trying
+      // to inspect an SQE on the failure path.
+      std::fprintf(stderr,
+                   "[KVAF_AIV] BATCH_PUT_VALIDATION_ERROR core=%u magic=0x%llx result=%llu "
+                   "processed=%llu expected=%llu failed_request=%llu "
+                   "sq_pi=%llu cq_ci=%llu cq_status=%llu cq_sub_status=%llu "
+                   "last_wqe=0x%llx mr_addr=0x%llx mr_bytes=%llu "
+                   "mr_token_id=0x%x\n",
+                   core, static_cast<unsigned long long>(core_status[core].magic),
+                   static_cast<unsigned long long>(core_status[core].result),
+                   static_cast<unsigned long long>(core_status[core].processed_request_count),
+                   static_cast<unsigned long long>(end - begin),
+                   static_cast<unsigned long long>(core_status[core].failed_request_index),
+                   static_cast<unsigned long long>(core_status[core].sq_producer_index),
+                   static_cast<unsigned long long>(core_status[core].cq_consumer_index),
+                   static_cast<unsigned long long>(core_status[core].cq_status),
+                   static_cast<unsigned long long>(core_status[core].cq_sub_status),
+                   static_cast<unsigned long long>(core_status[core].last_wqe_protocol),
+                   static_cast<unsigned long long>(local_buffer->memory.registered_address),
+                   static_cast<unsigned long long>(local_buffer->memory.registered_bytes),
+                   local_buffer->memory.token_id);
       return KVAF_BATCH_PUT_KERNEL_ERROR;
     }
   }
