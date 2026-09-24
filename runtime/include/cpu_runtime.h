@@ -11,7 +11,8 @@ namespace kvaf {
 enum class CpuMemoryPageMode { kDefault, kBasePage, kTransparentHugePage };
 
 struct CpuRuntimeOptions {
-  CpuMemoryPageMode memory_page_mode{CpuMemoryPageMode::kDefault};
+  // THP is the production default; explicit modes are retained for diagnostics.
+  CpuMemoryPageMode memory_page_mode{CpuMemoryPageMode::kTransparentHugePage};
   std::string ub_device;
   bool has_eid_index{false};
   std::uint32_t eid_index{0};
