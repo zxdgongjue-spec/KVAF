@@ -487,9 +487,22 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                                      &discovery_error)) {
     return Status::NotFound(discovery_error);
   }
-  for (std::uint32_t peer_candidate = 0U; peer_candidate < candidate_count; ++peer_candidate) {
+  // Diagnostic-only: reproduce the first EID pair without constructing and
+  // tearing down every candidate. The normal benchmark leaves this unset.
+  const char* first_pair_setting = std::getenv("KVAF_PROBE_FIRST_PAIR_ONLY");
+  const bool first_pair_only = first_pair_setting != nullptr &&
+                               std::strcmp(first_pair_setting, "1") == 0;
+  const std::uint32_t peer_limit = first_pair_only ? 1U : candidate_count;
+  const std::size_t npu_limit = first_pair_only ? 1U : npu_candidates.size();
+  if (first_pair_only) {
+    std::fprintf(stderr,
+                 "[KVAF_AIV] PEER_LINK_DIAGNOSTIC first_pair_only=1 "
+                 "peer_candidates=%u npu_candidates=%zu\n",
+                 candidate_count, npu_candidates.size());
+  }
+  for (std::uint32_t peer_candidate = 0U; peer_candidate < peer_limit; ++peer_candidate) {
     impl_->peer_allocator->SetCandidate(peer_candidate);
-    for (std::size_t npu_index = 0; npu_index < npu_candidates.size(); ++npu_index) {
+    for (std::size_t npu_index = 0; npu_index < npu_limit; ++npu_index) {
       const NpuLocalEidCandidate& candidate = npu_candidates[npu_index];
       impl_->runtime_core.reset();
       impl_->access_operator.reset();
