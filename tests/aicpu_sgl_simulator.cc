@@ -50,7 +50,13 @@ struct Options {
   std::size_t iterations{3U};
   std::size_t gather_threads{DefaultGatherThreads()};
   GatherMode gather_mode{GatherMode::kPassive};
+  bool log_iterations{false};
   std::uint64_t wr_overhead_ns{0U};
+};
+
+struct IterationTiming {
+  std::uint64_t gather_ns{0U};
+  std::uint64_t plan_ns{0U};
 };
 
 struct SimulatedSge {
@@ -223,6 +229,7 @@ void Usage(const char* program) {
                " [--sgl-size N] [--remote-offset N] [--iterations N]"
                " [--gather-threads N]"
                " [--gather-mode active|passive|omp]"
+               " [--log-iterations 0|1]"
                " [--wr-overhead-ns N]\n";
 }
 
@@ -256,6 +263,11 @@ Options ParseOptions(int argc, char** argv) {
     const std::uint64_t value = ParseUnsigned(argv[index + 1]);
     if (flag == "--wr-overhead-ns") {
       options.wr_overhead_ns = value;
+      continue;
+    }
+    if (flag == "--log-iterations") {
+      if (value > 1U) throw std::invalid_argument("invalid log-iterations value");
+      options.log_iterations = value == 1U;
       continue;
     }
     if (value > std::numeric_limits<std::size_t>::max()) {
@@ -367,6 +379,12 @@ void Run(const Options& options) {
 
   std::uint64_t gather_ns = 0U;
   std::uint64_t plan_ns = 0U;
+  std::uint64_t gather_min_ns = std::numeric_limits<std::uint64_t>::max();
+  std::uint64_t gather_max_ns = 0U;
+  std::uint64_t plan_min_ns = std::numeric_limits<std::uint64_t>::max();
+  std::uint64_t plan_max_ns = 0U;
+  std::vector<IterationTiming> iteration_timings;
+  if (options.log_iterations) iteration_timings.reserve(options.iterations);
   std::size_t wr_count = 0U;
   for (std::size_t iteration = 0U; iteration < options.iterations; ++iteration) {
     FillScatteredSource(&source, options, iteration);
@@ -395,10 +413,21 @@ void Run(const Options& options) {
     }
     SimulateSend(options, sges, writes, &remote);
     VerifyRemote(options, source, remote);
-    gather_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-        gather_end - gather_start).count();
-    plan_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-        plan_end - gather_end).count();
+    const auto iteration_gather_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            gather_end - gather_start).count());
+    const auto iteration_plan_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            plan_end - gather_end).count());
+    gather_ns += iteration_gather_ns;
+    plan_ns += iteration_plan_ns;
+    gather_min_ns = std::min(gather_min_ns, iteration_gather_ns);
+    gather_max_ns = std::max(gather_max_ns, iteration_gather_ns);
+    plan_min_ns = std::min(plan_min_ns, iteration_plan_ns);
+    plan_max_ns = std::max(plan_max_ns, iteration_plan_ns);
+    if (options.log_iterations) {
+      iteration_timings.push_back({iteration_gather_ns, iteration_plan_ns});
+    }
   }
 
   const double total_bytes = static_cast<double>(payload_bytes) * options.iterations;
@@ -407,6 +436,7 @@ void Run(const Options& options) {
   const double wr_ns = total_wrs * static_cast<double>(options.wr_overhead_ns);
   const double send_ns = wire_ns + wr_ns;
   const double pipeline_ns = static_cast<double>(gather_ns + plan_ns) + send_ns;
+  const double send_ns_per_iteration = send_ns / options.iterations;
   std::cout << "AICPU_SGL_SIM_PASS rows=" << options.rows
             << " row_bytes=" << options.row_bytes
             << " sgl_size=" << options.sgl_size
@@ -423,12 +453,32 @@ void Run(const Options& options) {
   std::cout << std::fixed << std::setprecision(2)
             << "CPU_PREP_MEASURED gather_ns=" << gather_ns
             << " plan_ns=" << plan_ns << '\n'
+            << "CPU_PREP_PER_ITERATION gather_avg_ns="
+            << static_cast<double>(gather_ns) / options.iterations
+            << " gather_min_ns=" << gather_min_ns
+            << " gather_max_ns=" << gather_max_ns
+            << " plan_avg_ns=" << static_cast<double>(plan_ns) / options.iterations
+            << " plan_min_ns=" << plan_min_ns
+            << " plan_max_ns=" << plan_max_ns << '\n'
             << "AICPU_SEND_MODEL assumed_GBps=25.00 wire_ns=" << wire_ns
             << " wr_overhead_ns=" << options.wr_overhead_ns
             << " total_wr_overhead_ns=" << wr_ns
             << " send_ns=" << send_ns << '\n'
+            << "AICPU_SEND_PER_ITERATION wire_ns=" << wire_ns / options.iterations
+            << " wr_overhead_ns=" << wr_ns / options.iterations
+            << " send_ns=" << send_ns_per_iteration << '\n'
             << "PIPELINE_ESTIMATE total_ns=" << pipeline_ns
+            << " avg_ns=" << pipeline_ns / options.iterations
             << " effective_GBps=" << total_bytes / pipeline_ns << '\n';
+  for (std::size_t iteration = 0U; iteration < iteration_timings.size(); ++iteration) {
+    const auto& timing = iteration_timings[iteration];
+    std::cout << "ITERATION_NS index=" << iteration + 1U
+              << " gather_ns=" << timing.gather_ns
+              << " plan_ns=" << timing.plan_ns
+              << " send_model_ns=" << send_ns_per_iteration
+              << " total_model_ns="
+              << timing.gather_ns + timing.plan_ns + send_ns_per_iteration << '\n';
+  }
 }
 
 }  // namespace

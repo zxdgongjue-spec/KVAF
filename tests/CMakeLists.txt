@@ -84,6 +84,19 @@ set_tests_properties(kvaf_aicpu_sgl_sim_invalid_threads PROPERTIES WILL_FAIL TRU
 add_test(NAME kvaf_aicpu_sgl_sim_invalid_mode
   COMMAND kvaf_aicpu_sgl_simulator --gather-mode unknown)
 set_tests_properties(kvaf_aicpu_sgl_sim_invalid_mode PROPERTIES WILL_FAIL TRUE)
+add_test(NAME kvaf_aicpu_sgl_sim_ns_log
+  COMMAND kvaf_aicpu_sgl_simulator --rows 7 --row-bytes 128
+          --sgl-size 3 --iterations 2 --gather-threads 1 --log-iterations 1)
+set_tests_properties(kvaf_aicpu_sgl_sim_ns_log PROPERTIES
+  PASS_REGULAR_EXPRESSION "ITERATION_NS index=2 gather_ns=[0-9]+ plan_ns=[0-9]+")
+add_test(NAME kvaf_aicpu_sgl_sim_ns_summary
+  COMMAND kvaf_aicpu_sgl_simulator --rows 7 --row-bytes 128
+          --sgl-size 3 --iterations 2 --gather-threads 1)
+set_tests_properties(kvaf_aicpu_sgl_sim_ns_summary PROPERTIES
+  PASS_REGULAR_EXPRESSION "CPU_PREP_PER_ITERATION gather_avg_ns=[0-9]+\\.[0-9]+ gather_min_ns=[0-9]+ gather_max_ns=[0-9]+")
+add_test(NAME kvaf_aicpu_sgl_sim_invalid_ns_log
+  COMMAND kvaf_aicpu_sgl_simulator --log-iterations 2)
+set_tests_properties(kvaf_aicpu_sgl_sim_invalid_ns_log PROPERTIES WILL_FAIL TRUE)
 
 add_executable(kvaf_aiv_batch_roundtrip_options_test aiv_batch_roundtrip_options_test.cc)
 add_test(NAME kvaf_aiv_batch_roundtrip_options COMMAND kvaf_aiv_batch_roundtrip_options_test)

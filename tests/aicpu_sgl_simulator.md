@@ -42,8 +42,14 @@ OMP_WAIT_POLICY=ACTIVE build-aicpu-sgl-sim/tests/kvaf_aicpu_sgl_simulator \
   --gather-threads 8 --gather-mode omp
 ```
 
-最后一条仅在构建检测到 OpenMP 时可用。比较 `gather_ns / iterations`，并重复
+最后一条仅在构建检测到 OpenMP 时可用。比较 `gather_avg_ns`，并重复
 整组测试；active 的空转会影响其余阶段，不应只凭模拟 `effective_GBps` 选策略。
+
+默认日志保留累计耗时，并增加 `CPU_PREP_PER_ITERATION` 的平均、最小、最大耗时
+（单位 ns）、`AICPU_SEND_PER_ITERATION` 的模型耗时及每轮的流水线平均估算。
+需要逐轮采样时加 `--log-iterations 1`；`ITERATION_NS` 在计时结束后统一打印，
+避免日志输出影响 gather 和分组计时。`send_model_ns` 和 `total_model_ns`
+仍是模型估算，不是设备实测。
 
 发送阶段不调用硬件，而是按十进制 25 GB/s 计算
 `wire_ns = payload_bytes / 25`；默认每 WR 附加开销为 0，因此仅增大
