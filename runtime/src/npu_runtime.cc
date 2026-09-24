@@ -24,6 +24,7 @@
 #include "batch_get_abi.h"
 #include "access_operator.h"
 #include "peer_link.h"
+#include "peer_candidate_selection.h"
 #include "meta_manager.h"
 
 namespace kvaf {
@@ -248,7 +249,8 @@ bool ReadHcclClosEids(const std::string& path, std::uint32_t physical_device_id,
 
 bool ReadPairInfoDeviceEid(std::uint32_t physical_device_id,
                            std::array<std::uint8_t, peer::kEidBytes>* eid,
-                           std::string* error) {
+                           std::string* error,
+                           std::array<std::uint8_t, peer::kEidBytes>* host_eid = nullptr) {
   if (eid == nullptr || error == nullptr) return false;
   const int lock_fd = open(kUbSelectorLockPath, O_CREAT | O_RDWR, 0600);
   if (lock_fd < 0 || flock(lock_fd, LOCK_EX) != 0) {
@@ -273,6 +275,7 @@ bool ReadPairInfoDeviceEid(std::uint32_t physical_device_id,
         bool active_channel = false;
         std::uint32_t active_channels = 0U;
         std::uint32_t device_eids = 0U;
+        std::uint32_t host_eids = 0U;
         std::string line;
         while (std::getline(pair_info, line)) {
           if (line.find("Dev id info.") != std::string::npos) {
@@ -287,17 +290,25 @@ bool ReadPairInfoDeviceEid(std::uint32_t physical_device_id,
             continue;
           }
           constexpr char kRemotePrefix[] = "remote_eid:";
+          constexpr char kLocalPrefix[] = "local_eid:";
+          const std::size_t local_pos = line.find(kLocalPrefix);
+          if (active_channel && host_eid != nullptr && local_pos != std::string::npos &&
+              ParsePairInfoEid(Trim(line.substr(local_pos + sizeof(kLocalPrefix) - 1U)), host_eid)) {
+            ++host_eids;
+          }
           const std::size_t remote_pos = line.find(kRemotePrefix);
           if (active_channel && remote_pos != std::string::npos &&
               ParsePairInfoEid(Trim(line.substr(remote_pos + sizeof(kRemotePrefix) - 1U)), eid)) {
             ++device_eids;
           }
         }
-        success = selected_device && active_channels == 1U && device_eids == 1U;
+        success = selected_device && active_channels == 1U && device_eids == 1U &&
+                  (host_eid == nullptr || host_eids == 1U);
         if (!success) {
           *error = "expected one active pair_info device EID for physical device_id=" +
                    std::to_string(physical_device_id) + "; active=" +
-                   std::to_string(active_channels) + " device_eids=" + std::to_string(device_eids);
+                   std::to_string(active_channels) + " device_eids=" + std::to_string(device_eids) +
+                   " host_eids=" + std::to_string(host_eids);
         }
       }
     }
@@ -487,12 +498,42 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                                      &discovery_error)) {
     return Status::NotFound(discovery_error);
   }
+  // B12 local-host reproduction: use the same driver-reported Host/NPU pair
+  // as the working direct-HCCP path. A CLOS EID is a distinct candidate, not
+  // evidence that its context can access this device's local HBM.
+  const char* pair_setting = std::getenv("KVAF_B12_USE_DRIVER_PAIR");
+  const bool driver_pair = pair_setting != nullptr && std::strcmp(pair_setting, "1") == 0;
+  if (pair_setting != nullptr && !driver_pair && std::strcmp(pair_setting, "0") != 0) {
+    return Status::InvalidArgument("KVAF_B12_USE_DRIVER_PAIR must be 0 or 1");
+  }
+  std::uint32_t peer_begin = 0U;
+  if (driver_pair) {
+    std::uint32_t physical_device = 0U;
+    std::array<std::uint8_t, peer::kEidBytes> device_eid{}, host_eid{};
+    if (!ResolvePhysicalDeviceId(impl_->options.device_id, &physical_device) ||
+        !ReadPairInfoDeviceEid(physical_device, &device_eid, &discovery_error, &host_eid)) {
+      return Status::NotFound("driver Host/NPU pair unavailable: " + discovery_error);
+    }
+    std::fprintf(stderr,
+                 "[KVAF_AIV] B12_DRIVER_PAIR physical=%u host_eid=%s npu_eid=%s\n",
+                 physical_device, EidToHex(host_eid).c_str(), EidToHex(device_eid).c_str());
+    // The peer protocol exposes the EID in the allocation response. Read it
+    // using a tiny CPU-only region and release it before creating NPU queues.
+    // This avoids posting on wrong EIDs or allocating full benchmark DDR for
+    // every candidate; all of this discovery is outside timed execution.
+    const Status selected = detail::FindPeerCandidateByEid(
+        *impl_->peer_link, host_eid, candidate_count, &peer_begin);
+    if (!selected.ok()) return selected;
+    npu_candidates.assign(1U, NpuLocalEidCandidate{device_eid, "asdrv_pair_info_exact_host_match"});
+    std::fprintf(stderr, "[KVAF_AIV] B12_DRIVER_PAIR_SELECTED peer_candidate=%u\n", peer_begin);
+  }
   // Diagnostic-only: reproduce the first EID pair without constructing and
   // tearing down every candidate. The normal benchmark leaves this unset.
   const char* first_pair_setting = std::getenv("KVAF_PROBE_FIRST_PAIR_ONLY");
   const bool first_pair_only = first_pair_setting != nullptr &&
                                std::strcmp(first_pair_setting, "1") == 0;
-  const std::uint32_t peer_limit = first_pair_only ? 1U : candidate_count;
+  const std::uint32_t peer_limit = driver_pair ? peer_begin + 1U :
+                                  first_pair_only ? 1U : candidate_count;
   const std::size_t npu_limit = first_pair_only ? 1U : npu_candidates.size();
   if (first_pair_only) {
     std::fprintf(stderr,
@@ -500,7 +541,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                  "peer_candidates=%u npu_candidates=%zu\n",
                  candidate_count, npu_candidates.size());
   }
-  for (std::uint32_t peer_candidate = 0U; peer_candidate < peer_limit; ++peer_candidate) {
+  for (std::uint32_t peer_candidate = peer_begin; peer_candidate < peer_limit; ++peer_candidate) {
     impl_->peer_allocator->SetCandidate(peer_candidate);
     for (std::size_t npu_index = 0; npu_index < npu_limit; ++npu_index) {
       const NpuLocalEidCandidate& candidate = npu_candidates[npu_index];

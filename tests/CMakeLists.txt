@@ -1,5 +1,9 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+add_executable(kvaf_peer_candidate_selection_test peer_candidate_selection_test.cc)
+target_link_libraries(kvaf_peer_candidate_selection_test PRIVATE kvaf_runtime)
+add_test(NAME kvaf_peer_candidate_selection_host COMMAND kvaf_peer_candidate_selection_test)
+
 if(KVAF_BUILD_PYTHON)
   add_test(
     NAME kvaf_runtime_mock_python
