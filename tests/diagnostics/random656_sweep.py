@@ -29,6 +29,22 @@ def source_ids(np, rng, working, count, pattern):
     return np.sort(ids) if pattern == 'sorted' else ids
 
 
+def aligned_pool(np, bases, block_bytes):
+    blocks, offsets = [], []
+    for b, base in enumerate(bases):
+        first = (-int(base)) % 4096
+        # Reserve room for ALL offsets (including crossing) with identical pages.
+        local = np.arange(first, block_bytes-4096-656+1, 4096, dtype=np.int64)
+        blocks.extend([b]*len(local)); offsets.extend(local.tolist())
+    return np.array(blocks), np.array(offsets)
+
+
+def byte_payload(np, byte_starts, length=656):
+    positions = byte_starts[:, None] + np.arange(length)
+    tokens, columns = positions//656, positions%656
+    return ((tokens >> ((columns%4)*8)) ^ (columns*17)).astype(np.uint8)
+
+
 def summarize(root):
     rows = [json.loads(p.read_text()) for p in sorted(root.glob('case-*.json'))]
     groups = {}
@@ -87,6 +103,10 @@ def case(args):
     view = runtime.access_table_view(table, device='npu', capacity=args.blocks)
     host_view = runtime.access_table_view(table, device='cpu')
     remote_bases = np.frombuffer(bytes(host_view['addresses']), dtype='<u8')
+    if args.page_offset >= 0:
+        if token_bytes != 656: raise ValueError('alignment probe requires 656B')
+        pool_blocks, pool_offsets = aligned_pool(np, remote_bases[:args.blocks], 128*656)
+        if args.requests > len(pool_blocks): raise ValueError('not enough distinct source pages')
     stream = torch.npu.Stream(device=args.device)
     n = args.requests
     indices = torch.zeros(n, dtype=torch.int32, device=device)
@@ -98,11 +118,14 @@ def case(args):
     rng = np.random.default_rng(args.seed)
 
     def prepare():
-        ids = source_ids(np, rng, working, n, args.pattern)
+        ids = (rng.choice(len(pool_blocks), n, replace=False) if args.page_offset >= 0
+               else source_ids(np, rng, working, n, args.pattern))
+        source_blocks = pool_blocks[ids] if args.page_offset >= 0 else ids//128
+        source_offsets = pool_offsets[ids]+args.page_offset if args.page_offset >= 0 else (ids%128)*token_bytes
         slots = rng.permutation(n).astype(np.int32)
         with torch.npu.stream(stream):
-            indices.copy_(torch.from_numpy((ids//128).astype(np.int32)))
-            offsets.copy_(torch.from_numpy(((ids%128)*token_bytes).astype(np.int32)))
+            indices.copy_(torch.from_numpy(source_blocks.astype(np.int32)))
+            offsets.copy_(torch.from_numpy(source_offsets.astype(np.int32)))
             destinations.copy_(torch.from_numpy(slots))
             output.fill_(0xA5)
         stream.synchronize()
@@ -115,7 +138,9 @@ def case(args):
 
     def verify(ids, slots):
         actual = output.cpu().numpy()
-        if not np.array_equal(actual[slots], payload(np, ids, token_bytes)):
+        expected = (byte_payload(np, pool_blocks[ids]*128*656+pool_offsets[ids]+args.page_offset)
+                    if args.page_offset >= 0 else payload(np, ids, token_bytes))
+        if not np.array_equal(actual[slots], expected):
             raise AssertionError('Random source/destination payload mismatch')
 
     ids, slots = prepare()
@@ -143,8 +168,11 @@ def case(args):
     ids, slots = prepare()
     execute(); stream.synchronize(); verify(ids, slots)
     timeline = runtime.stop_batch_get_kernel_profile()
-    addresses = remote_bases[ids//128] + (ids%128).astype(np.uint64)*token_bytes
-    address_stats = dict(unique_4k_pages=len(np.unique(addresses//4096)),
+    addresses = (remote_bases[pool_blocks[ids]]+(pool_offsets[ids]+args.page_offset).astype(np.uint64)
+                 if args.page_offset >= 0 else remote_bases[ids//128]+(ids%128).astype(np.uint64)*token_bytes)
+    address_stats = dict(page_offset=args.page_offset,
+        crosses_4k_fraction=float(np.mean(addresses//4096 != (addresses+token_bytes-1)//4096)),
+        unique_4k_pages=len(np.unique(addresses//4096)),
         unique_2m_regions=len(np.unique(addresses//2097152)),
         consecutive_fraction=float(np.mean(addresses[1:]==addresses[:-1]+token_bytes)),
         note='Start-address virtual regions, not physical pages or measured translation misses.')
@@ -165,6 +193,7 @@ def main():
     p.add_argument('--server', default=os.environ.get('KVAF_CPU_SERVICE_ADDR'))
     p.add_argument('--device', type=int, default=int(os.environ.get('DEVICE_ID', '0')))
     p.add_argument('--output', type=Path, default=Path('random656-results'))
+    p.add_argument('--page-offset', type=int, choices=(-1,0,16,64,3392,3456,3840), default=-1)
     p.add_argument('--token-bytes', type=int, default=656)
     p.add_argument('--working-tokens', type=int, default=0)
     p.add_argument('--pattern', choices=('random', 'sorted', 'contiguous'), default='random')
@@ -187,7 +216,7 @@ def main():
     args.build = args.build.resolve()
     if args.result:
         case(args); return
-    if args.token_bytes != 656 or args.pattern != 'random' or args.working_tokens:
+    if args.token_bytes != 656 or args.pattern != 'random' or args.working_tokens or args.page_offset >= 0:
         p.error('use locality_sweep.py for size/pattern/working-set experiments')
     jobs = [(repeat, *config) for repeat in range(args.repeats) for config in plan()]
     random.Random(args.seed).shuffle(jobs)

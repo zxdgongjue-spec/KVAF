@@ -13,6 +13,10 @@ import sys
 
 def plan(suite):
     cases = []
+    if suite in ('alignment', 'all'):
+        for offset in (0,16,64,3392,3456,3840):
+            cases.append(dict(label=f'align-{offset}', token_bytes=656, requests=7740,
+                blocks=1024, working_tokens=1024*128, pattern='random', page_offset=offset))
     if suite in ('locality', 'all'):
         # Fixed registration size and request count. Only the sampled range changes.
         for blocks in (192, 1024, 8192):
@@ -61,7 +65,7 @@ def main():
     p.add_argument('--build',type=Path,default=Path('build-npu'))
     p.add_argument('--server',default=os.environ.get('KVAF_CPU_SERVICE_ADDR'))
     p.add_argument('--device',type=int,default=int(os.environ.get('DEVICE_ID','0')))
-    p.add_argument('--suite',choices=('locality','size','all'),default='locality')
+    p.add_argument('--suite',choices=('locality','size','alignment','all'),default='locality')
     p.add_argument('--output',type=Path,default=Path('locality-results'))
     p.add_argument('--repeats',type=int,default=2)
     p.add_argument('--iterations',type=int,default=20)
@@ -89,6 +93,7 @@ def main():
             '--seed',str(20260924+repeat),'--result',str(stem.with_suffix('.json'))]
         for key in ('token_bytes','requests','blocks','working_tokens','pattern'):
             command += ['--'+key.replace('_','-'),str(c[key])]
+        if 'page_offset' in c: command += ['--page-offset',str(c['page_offset'])]
         print(f'[{i+1}/{len(jobs)}] {c["label"]}',flush=True)
         with stem.with_suffix('.log').open('w') as log:
             status=subprocess.call(command,env=env,stdout=log,stderr=subprocess.STDOUT)

@@ -53,12 +53,19 @@ def main():
     if a.seconds<1 or not (Path('/proc')/str(a.pid)).exists():p.error('invalid duration or service PID')
     start=counters(a.interface)
     report=dict(pid=a.pid,started_unix=time.time(),memory_samples=[],counter_start=start,
-        rdma_start=command(['rdma','-j','statistic','show']),numa_hardware=command(['numactl','--hardware']),
+        rdma_start=command(['rdma','-j','statistic','show']),
+        hardware={'kernel':command(['uname','-a']), 'pci':command(['lspci','-nn']),
+                  'rdma_devices':command(['rdma','-j','dev','show']),
+                  'rdma_links':command(['rdma','-j','link','show']),
+                  'urma_devices':command(['urma_admin','show']),
+                  'perf_event_catalog':command(['perf','list','--raw-dump'])},numa_hardware=command(['numactl','--hardware']),
         iommu_groups=len(list(Path('/sys/kernel/iommu_groups').glob('*'))),
         limitations=['Counter deltas are system-wide over the entire collection, not per case.',
           'CPU process counters do not measure device DMA memory traffic or NIC translation misses.',
           'Unavailable vendor PMU counters are not zero; this collector cannot prove an ordering bottleneck.'])
-    if a.interface:report['ethtool_start']=command(['ethtool','-S',a.interface])
+    if a.interface:
+        report['ethtool_start']=command(['ethtool','-S',a.interface])
+        report['driver']=command(['ethtool','-i',a.interface])
     def save():a.output.write_text(json.dumps(report,indent=2)+'\n')
     stop=time.monotonic()+a.seconds
     try:
