@@ -1,4 +1,5 @@
 #include "npu_runtime.h"
+#include "aicpu_urma_client_metrics.h"
 #include "aicpu_urma_client_options.h"
 
 #include "acl/acl.h"
@@ -16,6 +17,7 @@ using kvaf::aicpu_urma_client::Options;
 using kvaf::aicpu_urma_client::Parse;
 using kvaf::aicpu_urma_client::DefaultKernelJson;
 using kvaf::aicpu_urma_client::ConfigureCannEnvironment;
+using kvaf::aicpu_urma_client::SummarizeTiming;
 
 void Usage(const char* program) {
   std::fprintf(stderr,
@@ -226,31 +228,40 @@ int Run(const Options& options) {
   kvaf::NpuRuntime runtime(std::move(runtime_options));
   Check(runtime.LinkTo({options.peer}), "LinkTo");
   Check(runtime.Initialize(buffers.payload_bytes, options.block_bytes), "Initialize");
-  double put_ms = 0.0;
-  double get_ms = 0.0;
+  std::vector<double> put_samples;
+  std::vector<double> get_samples;
+  put_samples.reserve(options.iterations);
+  get_samples.reserve(options.iterations);
   const std::uint64_t total = static_cast<std::uint64_t>(options.warmup) + options.iterations;
   std::fprintf(stdout, "[KVAF_AICPU_URMA] linked peer=%s device=%u blocks=%u block_bytes=%u "
-                       "token_bytes=%u rounds=%llu\n",
+                       "token_bytes=%u warmup=%u iterations=%u\n",
                options.peer.c_str(), options.device_id, options.blocks, options.block_bytes,
-               options.token_bytes, static_cast<unsigned long long>(total));
+               options.token_bytes, options.warmup, options.iterations);
   for (std::uint64_t round = 0; round < total; ++round) {
-    const Timing sample = RunRound(runtime, acl.stream, &buffers, options, round);
-    std::fprintf(stdout, "[KVAF_AICPU_URMA] round=%llu phase=%s put_ms=%.3f get_ms=%.3f verified=1\n",
-                 static_cast<unsigned long long>(round), round < options.warmup ? "warmup" : "measure",
-                 sample.put_ms, sample.get_ms);
+    Timing sample;
+    try {
+      sample = RunRound(runtime, acl.stream, &buffers, options, round);
+    } catch (const std::exception& error) {
+      throw std::runtime_error("round=" + std::to_string(round) + ": " + error.what());
+    }
     if (round >= options.warmup) {
-      put_ms += sample.put_ms;
-      get_ms += sample.get_ms;
+      put_samples.push_back(sample.put_ms);
+      get_samples.push_back(sample.get_ms);
     }
   }
   Check(runtime.Shutdown(), "Shutdown");
-  const double put_mean = put_ms / options.iterations;
-  const double get_mean = get_ms / options.iterations;
-  std::fprintf(stdout, "%s iterations=%u put_mean_ms=%.3f get_mean_ms=%.3f "
-                       "put_GBps=%.3f get_GBps=%.3f\n",
-               "AICPU_URMA_PASS", options.iterations, put_mean, get_mean,
-               buffers.payload_bytes / (put_mean * 1.0e6),
-               buffers.payload_bytes / (get_mean * 1.0e6));
+  const auto put_stats = SummarizeTiming(std::move(put_samples), buffers.payload_bytes);
+  const auto get_stats = SummarizeTiming(std::move(get_samples), buffers.payload_bytes);
+  std::fprintf(stdout, "PUT_STATS min_ms=%.3f p50_ms=%.3f p95_ms=%.3f p99_ms=%.3f max_ms=%.3f\n",
+               put_stats.min_ms, put_stats.p50_ms, put_stats.p95_ms, put_stats.p99_ms,
+               put_stats.max_ms);
+  std::fprintf(stdout, "GET_STATS min_ms=%.3f p50_ms=%.3f p95_ms=%.3f p99_ms=%.3f max_ms=%.3f\n",
+               get_stats.min_ms, get_stats.p50_ms, get_stats.p95_ms, get_stats.p99_ms,
+               get_stats.max_ms);
+  std::fprintf(stdout, "AICPU_URMA_PASS iterations=%u warmup=%u bytes_per_iteration=%zu "
+                       "put_mean_ms=%.3f get_mean_ms=%.3f put_GBps=%.3f get_GBps=%.3f\n",
+               options.iterations, options.warmup, buffers.payload_bytes,
+               put_stats.mean_ms, get_stats.mean_ms, put_stats.mean_gbps, get_stats.mean_gbps);
   return 0;
 }
 

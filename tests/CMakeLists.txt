@@ -18,6 +18,9 @@ add_test(NAME kvaf_aicpu_urma_kernel COMMAND kvaf_aicpu_urma_kernel_test)
 add_executable(kvaf_aicpu_urma_client_options_test aicpu_urma_client_options_test.cc)
 add_test(NAME kvaf_aicpu_urma_client_options COMMAND kvaf_aicpu_urma_client_options_test)
 
+add_executable(kvaf_aicpu_urma_client_metrics_test aicpu_urma_client_metrics_test.cc)
+add_test(NAME kvaf_aicpu_urma_client_metrics COMMAND kvaf_aicpu_urma_client_metrics_test)
+
 add_test(NAME kvaf_aicpu_urma_install
   COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/aicpu_urma_install_test.sh")
 

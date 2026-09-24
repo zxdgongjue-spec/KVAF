@@ -45,7 +45,7 @@ CANN 路径查找 AICPU JSON，并使用单 worker、单 Jetty；无需配置 `C
 
 Host 单测（含部署脚本的本地模拟测试）：
 `ctest --test-dir build-aicpu-urma -R kvaf_aicpu_urma_ --output-on-failure`。
-无需 CANN 的机器也可运行：`cmake -S . -B build-host -DBUILD_TESTING=ON && cmake --build build-host --target kvaf_aicpu_urma_wqe_test kvaf_aicpu_urma_kernel_test kvaf_aicpu_urma_client_options_test && ctest --test-dir build-host -R kvaf_aicpu_urma_ --output-on-failure`。
+无需 CANN 的机器也可运行：`cmake -S . -B build-host -DBUILD_TESTING=ON && cmake --build build-host --target kvaf_aicpu_urma_wqe_test kvaf_aicpu_urma_kernel_test kvaf_aicpu_urma_client_options_test kvaf_aicpu_urma_client_metrics_test && ctest --test-dir build-host -R kvaf_aicpu_urma_ --output-on-failure`。
 
 真实 CPU/NPU 回读测试：CPU 端先运行 `./build.sh cpu` 和
 `build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999`；
@@ -69,10 +69,11 @@ BatchGet token 时才指定，且 `--block-bytes` 必须能被它整除。客户
 block 的所有 token 执行 BatchGet，反向排列输出并逐字节比对，因此覆盖完整
 BatchPut payload 和 BatchGet READ。
 CPU DDR 分配大小固定为 `blocks * block-bytes`。
-每轮先写入新 payload，再读取并验证；warmup 不计入统计，输出每轮耗时和平均
+每轮先写入新 payload，再读取并验证；warmup 不计入统计，也不输出每轮成功日志。
+完成后汇总 Put/Get 的平均、最小、p50、p95、p99、最大耗时和平均
 `put_GBps/get_GBps`。Put 计时包含 MetaManager 的预留和提交；Get 计时包含
 Runtime 提交与 stream 同步，不包含 AccessTable 准备、HBM 上传/回读和逐字节校验，
-因此不是纯 SQ 带宽。
+因此不是纯 SQ 带宽。底层 Direct-HCCP 的诊断日志仍可能出现。
 失败时退出码非零且不会输出 `AICPU_URMA_PASS`；`--help` 查看完整参数。
 
 **硬件验证状态**：本分支的 Host WQE ABI/模拟队列测试和内核语法检查不等价于 NPU
