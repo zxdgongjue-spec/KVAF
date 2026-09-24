@@ -601,6 +601,23 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                    "[KVAF_AIV] PEER_LINK_EID_PAIR_FAILED peer_candidate=%u npu_candidate=%zu npu_source=%s "
                    "reason=%s\n",
                    peer_candidate, npu_index, candidate.source.c_str(), last.message().c_str());
+      // Diagnostic process only: a failed single-WQE CQ has already been
+      // consumed, but this host's qp_unimport may block indefinitely while
+      // tearing down the failed Jetty. Exit the isolated probe process after
+      // its failure-only WQE/MR evidence is flushed; never use this path for
+      // the benchmark or for a multi-WQE probe with outstanding SQ entries.
+      const char* exit_on_failure = std::getenv("KVAF_PROBE_EXIT_ON_FAILURE");
+      if (first_pair_only && impl_->options.npu_core_count == 1U &&
+          impl_->options.jettys_per_core == 1U && exit_on_failure != nullptr &&
+          std::strcmp(exit_on_failure, "1") == 0 &&
+          BatchPutStartupProbeRows(ddr_bytes, slot_size, 1U, 1U) == 1U &&
+          last.message() == "AIV Direct-HCCP BatchPut execution failed") {
+        std::fprintf(stderr,
+                     "[KVAF_AIV] PEER_LINK_DIAGNOSTIC_EXIT reason=failed_single_wqe_cq "
+                     "status=86 teardown=skipped_process_exit\n");
+        std::fflush(stderr);
+        std::_Exit(86);
+      }
       if (impl_->runtime_core->initialized()) {
         std::fprintf(stderr,
                      "[KVAF_AIV] PEER_LINK_EID_PAIR_CLEANUP_BEGIN peer_candidate=%u "
