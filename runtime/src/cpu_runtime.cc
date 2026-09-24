@@ -3,6 +3,7 @@
 
 #include <dlfcn.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -437,7 +438,8 @@ struct Region {
 
 class CpuService {
  public:
-  explicit CpuService(UrmaResourcePool* resource_pool) : resource_pool_(resource_pool) {}
+  explicit CpuService(UrmaResourcePool* resource_pool, CpuMemoryPageMode mode)
+      : resource_pool_(resource_pool), memory_page_mode_(mode) {}
   ~CpuService() { ReleaseAll(); }
 
   uint32_t CandidateCount() const {
@@ -457,12 +459,26 @@ class CpuService {
     auto region = std::make_unique<Region>();
     region->candidate_id = candidate_id;
     region->resources = resources;
-    const int allocation_status = posix_memalign(&region->memory, kPageBytes, static_cast<size_t>(bytes));
+    const size_t alignment = memory_page_mode_ == CpuMemoryPageMode::kTransparentHugePage
+        ? 2U * 1024U * 1024U : kPageBytes;
+    const int allocation_status = posix_memalign(&region->memory, alignment, static_cast<size_t>(bytes));
     if (allocation_status != 0 || region->memory == nullptr) {
       Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=posix_memalign bytes=%" PRIu64
           " alignment=%" PRIu64 " status=%d memory=%p\n",
-          bytes, kPageBytes, allocation_status, region->memory);
+          bytes, static_cast<uint64_t>(alignment), allocation_status, region->memory);
       return Result::kResourceError;
+    }
+    if (memory_page_mode_ != CpuMemoryPageMode::kDefault) {
+      const int advice = memory_page_mode_ == CpuMemoryPageMode::kTransparentHugePage
+          ? MADV_HUGEPAGE : MADV_NOHUGEPAGE;
+      if (madvise(region->memory, static_cast<size_t>(bytes), advice) != 0) {
+        Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=madvise errno=%d\n", errno);
+        free(region->memory);
+        region->memory = nullptr;
+        return Result::kResourceError;
+      }
+      // Populate under the service NUMA policy BEFORE registering the region.
+      std::memset(region->memory, 0, static_cast<size_t>(bytes));
     }
     region->bytes = bytes;
     region->token_value = NextToken();
@@ -518,9 +534,11 @@ class CpuService {
     }
     regions_.emplace(id, std::move(region));
     Log("[KVAF_CPU] REGION_ALLOCATED session=%" PRIu64 " candidate=%u ub_device=%s eid_index=%u "
-        "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x reg_flags=0x%x\n",
+        "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x reg_flags=0x%x page_mode=%s\n",
         id, candidate_id, resources->device_name().c_str(), resources->eid_index(), bytes,
-        response->peer_base, response->token_id, flag.value);
+        response->peer_base, response->token_id, flag.value,
+        memory_page_mode_ == CpuMemoryPageMode::kTransparentHugePage ? "thp" :
+        (memory_page_mode_ == CpuMemoryPageMode::kBasePage ? "base" : "default"));
     return Result::kOk;
   }
 
@@ -702,6 +720,7 @@ class CpuService {
   }
 
   UrmaResourcePool* resource_pool_ = nullptr;
+  CpuMemoryPageMode memory_page_mode_;
   uint64_t next_region_id_ = 1U;
   uint32_t next_token_ = 1U;
   uint32_t next_psn_ = 1U;
@@ -808,7 +827,7 @@ Status CpuRuntime::Initialize(const CpuRuntimeOptions& options) {
   if (!impl->resources.Initialize(options.ub_device, options.has_eid_index, options.eid_index)) {
     return Status::Internal("CpuRuntime failed to initialize UMDK resources");
   }
-  impl->service = std::make_unique<CpuService>(&impl->resources);
+  impl->service = std::make_unique<CpuService>(&impl->resources, options.memory_page_mode);
   impl_ = std::move(impl);
   return Status::OK();
 }
