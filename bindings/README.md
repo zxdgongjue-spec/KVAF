@@ -51,6 +51,18 @@ batch_put_kernel_object_path="", jettys_per_core=2)` 的 `jettys_per_core` 参�
 NPU packed input 和每条 block 的 CPU 整数 metadata；同步写入完成后才返回。未传
 BatchPut kernel 时，该方法保留 ACL D2H mock，便于只验证 BatchGet 的构建。
 
+`KVAF_DDR_PAGE_MODE` 仅选择 `NpuRuntime.initialize` 的 CPU DDR 分配方式：
+`acl`（默认）沿用 `aclrtMallocHost`；`base` 和 `thp` 均使用独立的、2 MiB 对齐的
+匿名映射并预触页，前者设置 `MADV_NOHUGEPAGE`，后者设置 `MADV_HUGEPAGE`。
+三种方式均由原有 Direct-HCCP 路径注册，再由 AIV/URMA 执行 Get；切换页模式
+不会修改 Jetty、SQ、WQE 或 Get ABI。`thp` 初始化时及 HCCP 注册后均要求
+`/proc/self/smaps` 的 `AnonHugePages` 非零；`base` 要求为零。若注册不支持
+该内存或大页实际未生效，初始化失败，不自动退回 `acl`。
+`remote_region()` 额外返回 `ddr_page_mode` 与 `ddr_anon_huge_bytes`，用于区分
+“请求大页”和“实际得到大页”。同机比较 `thp` 对 `base` 可单独考察页大小影响；
+`thp` 对 `acl` 是实际可部署路径的净差异。两组对照仍须各自通过 HCCP 注册、
+数据正确性和无 profiling 的性能测试。
+
 `AclGraph` 与 `NpuRuntime.batch_get` 可接收调用方持有的 `torch.npu.Stream`；后者省略
 stream 时使用 `torch.npu.current_stream()`。KVAF 不创建、不保存或销毁调用方的 stream；
 图 capture、replay 和生命周期仍由上层框架负责。同一 stream 上的后续 Torch/ACL 操作

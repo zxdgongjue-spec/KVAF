@@ -2,12 +2,18 @@
 
 #include <pybind11/stl.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <dlfcn.h>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -15,6 +21,10 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 
 #include "access_table_python.h"
 #include "acl/acl.h"
@@ -61,22 +71,166 @@ void ThrowIfAclError(aclError error, const char* operation) {
                            std::to_string(static_cast<int>(error)));
 }
 
-class AclHostDdrAllocator final : public DdrMemoryAllocator {
+constexpr std::size_t kDdrHugePageBytes = 2U * 1024U * 1024U;
+
+enum class DdrPageMode { kAcl, kBase, kThp };
+
+DdrPageMode GetDdrPageMode() {
+  const char* value = std::getenv("KVAF_DDR_PAGE_MODE");
+  if (value == nullptr || std::strcmp(value, "acl") == 0) {
+    return DdrPageMode::kAcl;
+  }
+  if (std::strcmp(value, "thp") == 0) {
+    return DdrPageMode::kThp;
+  }
+  if (std::strcmp(value, "base") == 0) {
+    return DdrPageMode::kBase;
+  }
+  throw py::value_error(
+      "KVAF_DDR_PAGE_MODE must be 'acl' (default), 'base', or 'thp'");
+}
+
+struct DdrPageStats {
+  std::uint64_t anon_huge_bytes{0};
+  std::uint64_t smaps_covered_bytes{0};
+};
+
+// Sum every VMA intersecting the DDR range: HCCP registration is permitted
+// to split it into several VMAs. The mmap allocator applies madvise to the
+// exact aligned DDR range, so its VMA accounting excludes untouched padding.
+DdrPageStats PageStatsInRange(const void* address, std::size_t bytes) {
+  DdrPageStats result;
+#if defined(__linux__)
+  std::ifstream smaps("/proc/self/smaps");
+  if (!smaps || address == nullptr || bytes == 0) return result;
+  std::string line;
+  bool selected = false;
+  const auto target = reinterpret_cast<std::uintptr_t>(address);
+  const auto limit = target + bytes;
+  while (std::getline(smaps, line)) {
+    unsigned long long start = 0;
+    unsigned long long end = 0;
+    if (std::sscanf(line.c_str(), "%llx-%llx", &start, &end) == 2) {
+      selected = start < limit && end > target;
+      if (selected) {
+        const auto intersection_begin = std::max<std::uint64_t>(start, target);
+        const auto intersection_end = std::min<std::uint64_t>(end, limit);
+        result.smaps_covered_bytes += intersection_end - intersection_begin;
+      }
+    } else if (selected && line.rfind("AnonHugePages:", 0) == 0) {
+      unsigned long long kib = 0;
+      if (std::sscanf(line.c_str(), "AnonHugePages: %llu kB", &kib) == 1) {
+        result.anon_huge_bytes += static_cast<std::uint64_t>(kib) * 1024U;
+      }
+    }
+  }
+#else
+  (void)address;
+  (void)bytes;
+#endif
+  return result;
+}
+
+class RuntimeHostDdrAllocator final : public DdrMemoryAllocator {
  public:
+  explicit RuntimeHostDdrAllocator(DdrPageMode mode) : mode_(mode) {}
+
+  const char* PageMode() const {
+    if (mode_ == DdrPageMode::kThp) return "thp";
+    return mode_ == DdrPageMode::kBase ? "base" : "acl";
+  }
+  DdrPageStats PageStats() const {
+    return address_ == nullptr ? DdrPageStats{}
+                               : PageStatsInRange(address_, advised_bytes_);
+  }
+
   Status Allocate(const RuntimeInitRequest& request,
                   RemoteRegionDesc* region) override {
     if (region == nullptr || request.ddr_device != DeviceKind::kCpu ||
         request.ddr_bytes == 0 || request.slot_size == 0 ||
-        request.ddr_bytes % request.slot_size != 0) {
+        request.ddr_bytes % request.slot_size != 0 ||
+        request.ddr_bytes > std::numeric_limits<std::size_t>::max()) {
       return InvalidArgument("invalid ACL Host DDR allocation request");
     }
     if (address_ != nullptr) {
       return Status::Error(StatusCode::kInvalidState,
                            "ACL Host DDR is already allocated");
     }
-    if (aclrtMallocHost(&address_, request.ddr_bytes) != ACL_SUCCESS) {
-      return Status::Error(StatusCode::kOutOfMemory,
-                           "aclrtMallocHost failed for Runtime DDR");
+    if (mode_ == DdrPageMode::kAcl) {
+      if (aclrtMallocHost(&address_, request.ddr_bytes) != ACL_SUCCESS) {
+        return Status::Error(StatusCode::kOutOfMemory,
+                             "aclrtMallocHost failed for Runtime DDR");
+      }
+      advised_bytes_ = static_cast<std::size_t>(request.ddr_bytes);
+    } else {
+#if defined(__linux__)
+      if (request.ddr_bytes >
+          std::numeric_limits<std::size_t>::max() - 2U * kDdrHugePageBytes) {
+        return InvalidArgument("THP Runtime DDR size overflows size_t");
+      }
+      const std::size_t rounded =
+          (static_cast<std::size_t>(request.ddr_bytes) +
+           kDdrHugePageBytes - 1U) & ~(kDdrHugePageBytes - 1U);
+      mapped_bytes_ = rounded + kDdrHugePageBytes;
+      mapping_ = mmap(nullptr, mapped_bytes_, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      if (mapping_ == MAP_FAILED) {
+        mapping_ = nullptr;
+        mapped_bytes_ = 0;
+        return Status::Error(StatusCode::kOutOfMemory,
+                             std::string("mmap failed for THP Runtime DDR: ") +
+                                 std::strerror(errno));
+      }
+      const auto base = reinterpret_cast<std::uintptr_t>(mapping_);
+      const auto aligned = (base + kDdrHugePageBytes - 1U) &
+                           ~(static_cast<std::uintptr_t>(kDdrHugePageBytes) - 1U);
+      address_ = reinterpret_cast<void*>(aligned);
+      advised_bytes_ = rounded;
+      const int advice =
+          mode_ == DdrPageMode::kThp ? MADV_HUGEPAGE : MADV_NOHUGEPAGE;
+      if (madvise(address_, rounded, advice) != 0) {
+        const std::string error = std::strerror(errno);
+        (void)munmap(mapping_, mapped_bytes_);
+        address_ = nullptr;
+        mapping_ = nullptr;
+        mapped_bytes_ = 0;
+        advised_bytes_ = 0;
+        return Internal(std::string("madvise failed for ") + PageMode() +
+                        " Runtime DDR: " + error);
+      }
+      // Touch the entire 2 MiB-aligned range before HCCP registration, so
+      // the measurement never silently benchmarks an untouched VMA.
+      std::memset(address_, 0, rounded);
+      const DdrPageStats page_stats = PageStats();
+      std::fprintf(stderr,
+                   "[KVAF_AIV] DDR_PAGE_MODE mode=%s requested_bytes=%llu "
+                   "rounded_bytes=%zu anon_huge_bytes=%llu "
+                   "smaps_covered_bytes=%llu\n",
+                   PageMode(), static_cast<unsigned long long>(request.ddr_bytes), rounded,
+                   static_cast<unsigned long long>(page_stats.anon_huge_bytes),
+                   static_cast<unsigned long long>(page_stats.smaps_covered_bytes));
+      if (page_stats.smaps_covered_bytes != rounded ||
+          (mode_ == DdrPageMode::kThp && page_stats.anon_huge_bytes == 0) ||
+          (mode_ == DdrPageMode::kBase && page_stats.anon_huge_bytes != 0)) {
+        (void)munmap(mapping_, mapped_bytes_);
+        address_ = nullptr;
+        mapping_ = nullptr;
+        mapped_bytes_ = 0;
+        advised_bytes_ = 0;
+        return Internal(std::string(PageMode()) +
+                        " Runtime DDR has unexpected smaps page coverage after first touch");
+      }
+#else
+      return InvalidArgument("THP Runtime DDR requires Linux");
+#endif
+    }
+    if (mode_ == DdrPageMode::kAcl) {
+      std::fprintf(stderr,
+                   "[KVAF_AIV] DDR_PAGE_MODE mode=acl requested_bytes=%llu "
+                   "anon_huge_bytes=%llu\n",
+                   static_cast<unsigned long long>(request.ddr_bytes),
+                   static_cast<unsigned long long>(
+                       PageStatsInRange(address_, request.ddr_bytes).anon_huge_bytes));
     }
     *region = RemoteRegionDesc{reinterpret_cast<Address>(address_),
                                request.ddr_bytes, request.slot_size,
@@ -89,15 +243,32 @@ class AclHostDdrAllocator final : public DdrMemoryAllocator {
       return Status::Error(StatusCode::kNotFound,
                            "Runtime DDR allocation was not found");
     }
-    const aclError error = aclrtFreeHost(address_);
+    Status status = Status::OK();
+    if (mode_ == DdrPageMode::kAcl) {
+      if (aclrtFreeHost(address_) != ACL_SUCCESS) {
+        status = Internal("aclrtFreeHost failed for Runtime DDR");
+      }
+    } else {
+#if defined(__linux__)
+      if (munmap(mapping_, mapped_bytes_) != 0) {
+        status = Internal(std::string("munmap failed for THP Runtime DDR: ") +
+                          std::strerror(errno));
+      }
+#endif
+      mapping_ = nullptr;
+      mapped_bytes_ = 0;
+    }
     address_ = nullptr;
-    return error == ACL_SUCCESS
-               ? Status::OK()
-               : Internal("aclrtFreeHost failed for Runtime DDR");
+    advised_bytes_ = 0;
+    return status;
   }
 
  private:
+  DdrPageMode mode_;
   void* address_{nullptr};
+  void* mapping_{nullptr};
+  std::size_t mapped_bytes_{0};
+  std::size_t advised_bytes_{0};
 };
 
 void* PointerFromValue(std::uint64_t pointer) {
@@ -887,7 +1058,7 @@ class NpuRuntime final {
     // each BatchGet, so external framework graph capture stays outside KVAF.
     ThrowIfAclError(aclrtSetDevice(device_id_), "aclrtSetDevice");
 
-    allocator_ = std::make_unique<AclHostDdrAllocator>();
+    allocator_ = std::make_unique<RuntimeHostDdrAllocator>(GetDdrPageMode());
     access_operator_ = std::make_unique<DefaultAccessOperator>(
         AccessOperatorConfig{std::move(batch_get_kernel_object_path),
                              std::move(batch_put_kernel_object_path),
@@ -906,6 +1077,26 @@ class NpuRuntime final {
     EnsureNoFusedBatchGetControl("initialize");
     ThrowIfError(runtime_->Initialize(
         RuntimeInitRequest{ddr_bytes, slot_size, DeviceKind::kCpu}));
+    if (allocator_->PageMode() != std::string("acl")) {
+      const DdrPageStats page_stats = allocator_->PageStats();
+      const bool thp = allocator_->PageMode() == std::string("thp");
+      std::fprintf(stderr,
+                   "[KVAF_AIV] DDR_PAGE_MODE stage=after_hccp_register mode=%s "
+                   "anon_huge_bytes=%llu smaps_covered_bytes=%llu\n",
+                   allocator_->PageMode(),
+                   static_cast<unsigned long long>(page_stats.anon_huge_bytes),
+                   static_cast<unsigned long long>(page_stats.smaps_covered_bytes));
+      if (page_stats.smaps_covered_bytes < ddr_bytes ||
+          (thp && page_stats.anon_huge_bytes == 0) ||
+          (!thp && page_stats.anon_huge_bytes != 0)) {
+        const Status shutdown_status = runtime_->Shutdown();
+        throw std::runtime_error(
+            std::string("Runtime DDR page mode ") + allocator_->PageMode() +
+            " not retained after HCCP registration" +
+            (shutdown_status.ok() ? "" :
+             "; cleanup also failed: " + shutdown_status.message()));
+      }
+    }
   }
 
   bool Initialized() const {
@@ -923,6 +1114,10 @@ class NpuRuntime final {
     result["length"] = region.length;
     result["slot_size"] = region.slot_size;
     result["device"] = "cpu";
+    result["ddr_page_mode"] = allocator_->PageMode();
+    const DdrPageStats page_stats = allocator_->PageStats();
+    result["ddr_anon_huge_bytes"] = page_stats.anon_huge_bytes;
+    result["ddr_smaps_covered_bytes"] = page_stats.smaps_covered_bytes;
     return result;
   }
 
@@ -1995,7 +2190,7 @@ class NpuRuntime final {
   std::uint32_t npu_core_count_{0};
   std::uint32_t jettys_per_core_{2};
   std::unique_ptr<MetaManager> meta_manager_;
-  std::unique_ptr<AclHostDdrAllocator> allocator_;
+  std::unique_ptr<RuntimeHostDdrAllocator> allocator_;
   std::unique_ptr<DefaultAccessOperator> access_operator_;
   std::unique_ptr<Runtime> runtime_;
   std::unique_ptr<NativeGetSubmitLane> native_get_lane_;
