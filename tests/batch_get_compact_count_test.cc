@@ -82,6 +82,16 @@ void TestRuntimeOpaqueForwardingAndValidation() {
             !access.last_execution.synchronize,
         "caller stream or asynchronous ownership changed");
 
+  auto direct = request;
+  direct.selection_mode = kvaf::BatchGetSelectionMode::kCompactCountDirect;
+  Check(runtime.BatchGet(direct, {stream, false}).ok(),
+        "direct compact count rejected");
+  Check(access.last_request.selection_mode ==
+            kvaf::BatchGetSelectionMode::kCompactCountDirect &&
+            access.last_request.mask.data == request.mask.data &&
+            access.last_request.indices.data == request.indices.data,
+        "direct compact selection copied descriptors or count");
+
   auto invalid = request;
   invalid.mask.bytes = 8;
   Check(!runtime.BatchGet(invalid).ok(), "non-scalar count accepted");
@@ -91,13 +101,17 @@ void TestRuntimeOpaqueForwardingAndValidation() {
   invalid = request;
   invalid.mask.data = nullptr;
   Check(!runtime.BatchGet(invalid).ok(), "null count accepted");
+  invalid = direct;
+  invalid.mask.bytes = 8;
+  Check(!runtime.BatchGet(invalid).ok(),
+        "direct compact mode accepted a non-scalar count");
   invalid = request;
   invalid.selection_mode = static_cast<kvaf::BatchGetSelectionMode>(99);
   Check(!runtime.BatchGet(invalid).ok(), "unknown mode accepted");
   invalid = request;
   invalid.selection_mode = kvaf::BatchGetSelectionMode::kDenseMask;
   Check(!runtime.BatchGet(invalid).ok(), "short dense mask accepted as count");
-  Check(access.calls == 1, "invalid metadata reached the data plane");
+  Check(access.calls == 2, "invalid metadata reached the data plane");
 
   // Existing dense mode, including the ambiguous N=4 byte size, is explicitly
   // distinguished by the mode rather than inferring semantics from bytes.
@@ -110,7 +124,7 @@ void TestRuntimeOpaqueForwardingAndValidation() {
   Check(runtime.BatchGet(four).ok(), "four-byte dense mask rejected");
   four.selection_mode = kvaf::BatchGetSelectionMode::kCompactCount;
   Check(runtime.BatchGet(four).ok(), "four-byte compact count rejected");
-  Check(access.calls == 4, "dense/compact dispatch count differs");
+  Check(access.calls == 5, "dense/compact dispatch count differs");
   Check(runtime.Shutdown().ok(), "runtime shutdown failed");
 }
 
@@ -175,6 +189,7 @@ void TestPrefixRetainsNativeScatterIdentities() {
     output_indices[index] = count - index - 1;
   }
   std::vector<int32_t> observed(count, -1);
+  std::vector<int32_t> observed_direct(count, -1);
   for (uint32_t core = 0; core < 16; ++core) {
     uint32_t begin = 0, end = 0;
     Check(KvafBatchGetCompactPrefixRange(count, capacity, core, 16, &begin, &end),
@@ -182,10 +197,21 @@ void TestPrefixRetainsNativeScatterIdentities() {
     for (uint32_t request = begin; request < end; ++request) {
       observed.at(static_cast<std::size_t>(output_indices[request])) = source[request];
     }
+    for (uint32_t active_offset = 0; active_offset < end - begin;
+         active_offset += 32) {
+      for (uint32_t slot = 0; slot < 32 &&
+           active_offset + slot < end - begin; ++slot) {
+        const uint32_t request = begin + active_offset + slot;
+        observed_direct.at(static_cast<std::size_t>(output_indices[request])) =
+            source[request];
+      }
+    }
   }
   for (int32_t index = 0; index < count; ++index) {
     Check(observed[count - index - 1] == source[index],
           "native compact request/scatter identity changed");
+    Check(observed_direct[count - index - 1] == observed[count - index - 1],
+          "direct compact request/scatter identity differs from staged mode");
   }
 }
 
@@ -195,6 +221,8 @@ int main() {
   try {
     static_assert(KVAF_AIV_BATCH_GET_COMPACT_COUNT_ABI == 1,
                   "compact-count capability changed");
+    static_assert(KVAF_BATCH_GET_SELECTION_COMPACT_COUNT_DIRECT == 2,
+                  "direct compact selection value changed");
     static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 112,
                   "host/device launch ABI drifted");
     TestRuntimeOpaqueForwardingAndValidation();

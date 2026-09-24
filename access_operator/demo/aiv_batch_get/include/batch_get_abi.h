@@ -75,6 +75,10 @@ enum {
   KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES = 160 * 1024,
   KVAF_BATCH_GET_SELECTION_DENSE_MASK = 0,
   KVAF_BATCH_GET_SELECTION_COMPACT_COUNT = 1,
+  // Opt-in native-only A/B: consume the same compact int32[1] count, but
+  // read each descriptor directly while constructing its WQE.  The default
+  // compact mode continues to stage table indices/request IDs in UB.
+  KVAF_BATCH_GET_SELECTION_COMPACT_COUNT_DIRECT = 2,
   KVAF_AIV_BATCH_GET_COMPACT_COUNT_ABI = 1,
 };
 

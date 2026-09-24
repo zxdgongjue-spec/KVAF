@@ -260,7 +260,8 @@ Status Runtime::BatchGet(const BatchGetRequest& request,
   }
   const std::size_t request_count =
       request.indices.bytes / sizeof(std::int32_t);
-  if (request.selection_mode == BatchGetSelectionMode::kCompactCount) {
+  if (request.selection_mode == BatchGetSelectionMode::kCompactCount ||
+      request.selection_mode == BatchGetSelectionMode::kCompactCountDirect) {
     if (request.indices.device != DeviceKind::kNpu ||
         !request.mask.valid() ||
         request.mask.bytes != sizeof(std::int32_t) ||

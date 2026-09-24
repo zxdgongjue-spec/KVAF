@@ -1298,12 +1298,13 @@ class NpuRuntime final {
                 const py::object& indices, const py::object& offsets,
                 const py::object& mask,
                 const py::object& output_indices, const py::object& output,
-                const py::object& stream, bool synchronize) {
+                const py::object& stream, bool synchronize,
+                bool direct_compact) {
     EnsureNoNativeGetLane("batch_get");
     EnsureNoFusedBatchGetControl("batch_get");
     BatchGetImpl(access_table.source(), access_table.addresses(),
                  access_table.valid(), indices, offsets, mask, output_indices,
-                 output, stream, synchronize);
+                 output, stream, synchronize, direct_compact);
   }
 
   // This overload accepts a caller-owned device table directly. Since bare
@@ -1316,11 +1317,12 @@ class NpuRuntime final {
                            const py::object& mask,
                            const py::object& output_indices,
                            const py::object& output,
-                           const py::object& stream, bool synchronize) {
+                           const py::object& stream, bool synchronize,
+                           bool direct_compact) {
     EnsureNoNativeGetLane("batch_get");
     EnsureNoFusedBatchGetControl("batch_get");
     BatchGetImpl(AccessTableHandle{}, addresses, valid, indices, offsets, mask,
-                 output_indices, output, stream, synchronize);
+                 output_indices, output, stream, synchronize, direct_compact);
   }
 
   // Eager-only host-submission escape hatch for the LI/Get overlap probe.
@@ -1991,7 +1993,8 @@ class NpuRuntime final {
       const AccessTableHandle& access_table, const py::object& addresses,
       const py::object& valid, const py::object& indices,
       const py::object& offsets, const py::object& mask,
-      const py::object& output_indices, const py::object& output) const {
+      const py::object& output_indices, const py::object& output,
+      bool direct_compact = false) const {
     const NpuTensorView index_view = GetNpuTensorView(indices, "indices");
     const NpuTensorView offset_view = GetNpuTensorView(offsets, "offsets");
     const NpuTensorView mask_view = GetNpuTensorView(mask, "mask");
@@ -2010,6 +2013,10 @@ class NpuRuntime final {
         selection_dtype == "torch.uint8" &&
         mask_view.element_bytes == sizeof(std::uint8_t) &&
         mask_view.bytes == index_view.bytes / sizeof(std::int32_t);
+    if (direct_compact && !compact_count) {
+      throw py::value_error(
+          "direct_compact requires native compact-count mask int32[1]");
+    }
     if (index_view.shape.size() != 1 || offset_view.shape.size() != 1 ||
         mask_view.shape.size() != 1 ||
         output_index_view.shape.size() != 1 || output_view.shape.size() < 2 ||
@@ -2044,8 +2051,9 @@ class NpuRuntime final {
         AccessTableDeviceView{
             ConstBufferView{address_view.data, address_view.bytes, DeviceKind::kNpu},
             ConstBufferView{valid_view.data, valid_view.bytes, DeviceKind::kNpu}},
-        compact_count ? BatchGetSelectionMode::kCompactCount
-                      : BatchGetSelectionMode::kDenseMask};
+        direct_compact ? BatchGetSelectionMode::kCompactCountDirect
+                       : compact_count ? BatchGetSelectionMode::kCompactCount
+                                       : BatchGetSelectionMode::kDenseMask};
   }
 
   void BatchGetImpl(const AccessTableHandle& access_table,
@@ -2054,10 +2062,10 @@ class NpuRuntime final {
                     const py::object& mask,
                     const py::object& output_indices,
                     const py::object& output, const py::object& stream,
-                    bool synchronize) {
+                    bool synchronize, bool direct_compact) {
     const BatchGetRequest request = BuildBatchGetRequest(
         access_table, addresses, valid, indices, offsets, mask, output_indices,
-        output);
+        output, direct_compact);
     const aclrtStream acl_stream = ResolveStream(stream);
     ThrowIfError(runtime_->BatchGet(
         request, BatchGetExecutionOptions{acl_stream,
@@ -2403,16 +2411,20 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("mask"),
            py::arg("output_indices"), py::arg("output"),
            py::arg("stream") = py::none(), py::arg("synchronize") = false,
+           py::arg("direct_compact") = false,
            "Submit BatchGet from NPU Tensors. stream=None uses torch.npu.current_stream(); "
            "mask is uint8[N] or native MTP compact-count int32[1]; "
+           "direct_compact=True opts into direct compact descriptor loads; "
            "the default returns after enqueueing work on that stream.")
       .def("batch_get", &NpuRuntime::BatchGetFromTensors,
            py::arg("addresses"), py::arg("valid"), py::arg("indices"),
            py::arg("offsets"), py::arg("mask"), py::arg("output_indices"),
            py::arg("output"), py::arg("stream") = py::none(),
            py::arg("synchronize") = false,
+           py::arg("direct_compact") = false,
            "Submit BatchGet from caller-owned NPU addresses and valid Tensors. "
            "mask is uint8[N] or native MTP compact-count int32[1], consumed on device. "
+           "direct_compact=True requires compact-count int32[1]. "
            "stream=None uses torch.npu.current_stream(); the default returns "
            "after enqueueing work on that stream.");
 }

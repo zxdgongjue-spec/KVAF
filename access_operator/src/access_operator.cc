@@ -412,7 +412,8 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
   }
   const BatchGetRequest& request = *exec.request;
   const bool compact_count =
-      request.selection_mode == BatchGetSelectionMode::kCompactCount;
+      request.selection_mode == BatchGetSelectionMode::kCompactCount ||
+      request.selection_mode == BatchGetSelectionMode::kCompactCountDirect;
   if (request.selection_mode != BatchGetSelectionMode::kDenseMask &&
       !compact_count) {
     return InvalidArgument("unknown BatchGet selection mode");
@@ -478,9 +479,11 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
   arguments->block_bytes = KVAF_AIV_BATCH_GET_WQE_DATA_BYTES;
   arguments->block_count = npu_core_count;
   arguments->jettys_per_core = jettys_per_core;
-  arguments->selection_mode = compact_count
-      ? KVAF_BATCH_GET_SELECTION_COMPACT_COUNT
-      : KVAF_BATCH_GET_SELECTION_DENSE_MASK;
+  arguments->selection_mode =
+      request.selection_mode == BatchGetSelectionMode::kCompactCountDirect
+          ? KVAF_BATCH_GET_SELECTION_COMPACT_COUNT_DIRECT
+          : compact_count ? KVAF_BATCH_GET_SELECTION_COMPACT_COUNT
+                          : KVAF_BATCH_GET_SELECTION_DENSE_MASK;
   return Status::OK();
 }
 

@@ -58,6 +58,7 @@ struct AccessTableDeviceView {
 enum class BatchGetSelectionMode : std::uint32_t {
   kDenseMask = 0,
   kCompactCount = 1,
+  kCompactCountDirect = 2,
 };
 
 struct BatchGetRequest {

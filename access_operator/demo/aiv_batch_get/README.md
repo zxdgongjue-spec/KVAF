@@ -39,6 +39,16 @@ to this ordinary BatchGet call. The existing 16384-active-requests/AIV and
 SQ-capacity bounds still apply. `KvafExecuteBatchGetKernelArgs` is now 112
 bytes: rebuild the host library, kernel object and fused consumers together.
 
+For a same-source, same-descriptor performance A/B, Python callers may pass
+`direct_compact=True` to `NpuRuntime.batch_get(...)` with an `int32[1]` mask.
+That opt-in sets `selection_mode=KVAF_BATCH_GET_SELECTION_COMPACT_COUNT_DIRECT`:
+the 32 WQE lanes read the original compact descriptor prefix directly,
+without a separate 2048-thread VF staging table indices and request IDs in
+UB. The default remains the staged mode. Both variants use the same 32-WQE
+Post, MTE3, doorbell, Jetty and CQ protocol. Direct mode rejects a dense
+`uint8[N]` mask. Compare only after validating identical rows, output bytes
+and descriptor digest; neither mode by itself establishes a bandwidth gain.
+
 The local-memory lifetime is intentionally separate from the shared
 transport:
 
