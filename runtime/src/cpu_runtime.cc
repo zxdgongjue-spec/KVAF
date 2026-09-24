@@ -660,6 +660,8 @@ class CpuService {
  private:
   const char* MemoryPageModeName() const {
     switch (memory_page_mode_) {
+      case CpuMemoryPageMode::kBasePage:
+        return "base";
       case CpuMemoryPageMode::kDefault:
         return "default";
       case CpuMemoryPageMode::kTransparentHugePage:
@@ -685,6 +687,15 @@ class CpuService {
           region->bytes, alignment, allocation_status, region->memory,
           MemoryPageModeName());
       return false;
+    }
+    if (memory_page_mode_ == CpuMemoryPageMode::kBasePage) {
+      if (madvise(region->memory, bytes, MADV_NOHUGEPAGE) != 0) {
+        Log("[KVAF_CPU] MADV_NOHUGEPAGE failed errno=%d\n", errno);
+        free(region->memory);
+        region->memory = nullptr;
+        return false;
+      }
+      std::memset(region->memory, 0, bytes);
     }
     if (memory_page_mode_ == CpuMemoryPageMode::kTransparentHugePage) {
       if (madvise(region->memory, bytes, MADV_HUGEPAGE) != 0) {

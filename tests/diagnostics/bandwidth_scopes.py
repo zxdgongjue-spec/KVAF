@@ -54,6 +54,7 @@ def main():
     parser.add_argument('--build', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--clock-mhz', type=int, required=True, help='Explicit assumed GetSystemCycle frequency; verify on hardware')
+    parser.add_argument("--record-stride", type=int, choices=(656,704,768,1024), default=656)
     args, extra = parser.parse_known_args()
     if args.clock_mhz <= 0:
         parser.error('clock-mhz must be positive')
@@ -61,7 +62,8 @@ def main():
     build = args.build.resolve()
     source_path = root/'tests/python/test_npu_batch_get_perf.py'
     source = source_path.read_text()
-    patched = instrument(source)
+    from record_stride import apply
+    patched = instrument(apply(source, args.record_stride))
     for name, value in [('KVAF_RUN_NPU_TESTS', '1'), ('KVAF_BATCH_GET_KERNEL', str(build/'bin/kvaf_execute_batch_get_kernels.o')),
                         ('KVAF_BATCH_PUT_KERNEL', str(build/'bin/kvaf_execute_batch_put_kernels.o'))]:
         os.environ[name] = value
@@ -72,7 +74,7 @@ def main():
         if not (len(host) == len(submit) == len(events) == len(profiles)):
             raise RuntimeError('Paired sample count mismatch')
         payload = config.miss_count * config.token_bytes
-        result = dict(payload_bytes=payload, assumed_clock_mhz=args.clock_mhz,
+        result = dict(record_stride=args.record_stride, payload_bytes=payload, assumed_clock_mhz=args.clock_mhz,
                       config=vars(config), benchmark_sha256=hashlib.sha256(source.encode()).hexdigest(),
                       notes=['Events bracket host submission and may contain dispatch gaps.',
                              'Host timing includes event instrumentation overhead.',

@@ -12,7 +12,7 @@ namespace {
 void PrintUsage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] "
-               "[--memory-page-mode default|thp]\n"
+               "[--memory-page-mode default|base|thp]\n"
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
                "candidates are discovered automatically. "
                "The default memory page mode is thp. The service requires only liburma and /dev/uburma.\n",
@@ -31,6 +31,10 @@ bool ParseUnsigned(const char* text, std::uint32_t maximum, std::uint32_t* value
 
 bool ParseMemoryPageMode(const std::string& text, kvaf::CpuMemoryPageMode* mode) {
   if (mode == nullptr) return false;
+  if (text == "base") {
+    *mode = kvaf::CpuMemoryPageMode::kBasePage;
+    return true;
+  }
   if (text == "default") {
     *mode = kvaf::CpuMemoryPageMode::kDefault;
     return true;
@@ -79,7 +83,7 @@ int main(int argc, char** argv) {
       cpu_options.has_eid_index = true;
     } else if (argument == "--memory-page-mode") {
       if (!ParseMemoryPageMode(argv[++index], &cpu_options.memory_page_mode)) {
-        std::fprintf(stderr, "invalid --memory-page-mode; expected default or thp\n");
+        std::fprintf(stderr, "invalid --memory-page-mode; expected default, base or thp\n");
         return 2;
       }
     } else {
