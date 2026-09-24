@@ -23,10 +23,14 @@ add_test(NAME kvaf_aicpu_urma_install
 
 add_executable(kvaf_aicpu_sgl_simulator aicpu_sgl_simulator.cc)
 find_package(Threads REQUIRED)
+find_package(OpenMP COMPONENTS CXX QUIET)
 target_include_directories(kvaf_aicpu_sgl_simulator PRIVATE
   "${CMAKE_SOURCE_DIR}/access_operator/include"
   "${CMAKE_SOURCE_DIR}/runtime/include")
 target_link_libraries(kvaf_aicpu_sgl_simulator PRIVATE kvaf_common Threads::Threads)
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(kvaf_aicpu_sgl_simulator PRIVATE OpenMP::OpenMP_CXX)
+endif()
 target_compile_features(kvaf_aicpu_sgl_simulator PRIVATE cxx_std_17)
 
 add_test(NAME kvaf_aicpu_sgl_sim_single
@@ -49,9 +53,26 @@ add_test(NAME kvaf_aicpu_sgl_sim_invalid
 set_tests_properties(kvaf_aicpu_sgl_sim_invalid PROPERTIES WILL_FAIL TRUE)
 add_test(NAME kvaf_aicpu_sgl_sim_parallel
   COMMAND kvaf_aicpu_sgl_simulator --rows 257 --row-bytes 4096
-          --sgl-size 7 --iterations 3 --gather-threads 4)
+          --sgl-size 7 --iterations 3 --gather-threads 4 --gather-mode active)
 set_tests_properties(kvaf_aicpu_sgl_sim_parallel PROPERTIES
-  PASS_REGULAR_EXPRESSION "AICPU_SGL_SIM_PASS.*gather_threads_effective=4")
+  PASS_REGULAR_EXPRESSION "AICPU_SGL_SIM_PASS.*gather_threads_effective=4 gather_mode=active")
+add_test(NAME kvaf_aicpu_sgl_sim_passive
+  COMMAND kvaf_aicpu_sgl_simulator --rows 257 --row-bytes 4096
+          --sgl-size 7 --iterations 3 --gather-threads 4 --gather-mode passive)
+set_tests_properties(kvaf_aicpu_sgl_sim_passive PROPERTIES
+  PASS_REGULAR_EXPRESSION "AICPU_SGL_SIM_PASS.*gather_threads_effective=4 gather_mode=passive")
+if(OpenMP_CXX_FOUND)
+  add_test(NAME kvaf_aicpu_sgl_sim_omp
+    COMMAND kvaf_aicpu_sgl_simulator --rows 257 --row-bytes 4096
+            --sgl-size 7 --iterations 3 --gather-threads 4 --gather-mode omp)
+  set_tests_properties(kvaf_aicpu_sgl_sim_omp PROPERTIES
+    PASS_REGULAR_EXPRESSION "AICPU_SGL_SIM_PASS.*gather_threads_effective=4 gather_mode=omp")
+else()
+  add_test(NAME kvaf_aicpu_sgl_sim_omp_unavailable
+    COMMAND kvaf_aicpu_sgl_simulator --gather-mode omp)
+  set_tests_properties(kvaf_aicpu_sgl_sim_omp_unavailable PROPERTIES
+    WILL_FAIL TRUE)
+endif()
 add_test(NAME kvaf_aicpu_sgl_sim_small_fallback
   COMMAND kvaf_aicpu_sgl_simulator --rows 7 --row-bytes 128
           --sgl-size 3 --iterations 2 --gather-threads 8)
@@ -60,6 +81,9 @@ set_tests_properties(kvaf_aicpu_sgl_sim_small_fallback PROPERTIES
 add_test(NAME kvaf_aicpu_sgl_sim_invalid_threads
   COMMAND kvaf_aicpu_sgl_simulator --gather-threads 0)
 set_tests_properties(kvaf_aicpu_sgl_sim_invalid_threads PROPERTIES WILL_FAIL TRUE)
+add_test(NAME kvaf_aicpu_sgl_sim_invalid_mode
+  COMMAND kvaf_aicpu_sgl_simulator --gather-mode unknown)
+set_tests_properties(kvaf_aicpu_sgl_sim_invalid_mode PROPERTIES WILL_FAIL TRUE)
 
 add_executable(kvaf_aiv_batch_roundtrip_options_test aiv_batch_roundtrip_options_test.cc)
 add_test(NAME kvaf_aiv_batch_roundtrip_options COMMAND kvaf_aiv_batch_roundtrip_options_test)

@@ -20,8 +20,30 @@ ctest --test-dir build-aicpu-sgl-sim -R '^kvaf_aicpu_sgl_sim_' --output-on-failu
 `--gather-threads N` 控制 CPU gather 线程数，默认取本机逻辑核数，上限 64；
 每个线程复制互不重叠的行分片，worker 在所有迭代间复用。数据不足时按行数和
 每线程至少 256 KiB 自动减少线程数，输出同时报告请求值与实际值。
-`--gather-threads 1` 是串行基线；计时包含每轮唤醒和等待 worker 的成本，
-不包含初次创建线程的成本。
+`--gather-threads 1` 是串行基线。`--gather-mode active` 让 worker 在迭代间
+保持活跃，通过原子计数同步；默认的 `--gather-mode passive` 使用条件变量唤醒。
+`--gather-mode omp` 在编译器支持 OpenMP 时使用与 CPU transport 相同的
+`parallel num_threads` 静态分片方式；`OMP_WAIT_POLICY=ACTIVE` 可请求运行时
+积极等待，但 OpenMP 不保证线程永久驻留。active 会持续占用 CPU，可能拖慢其它
+工作，不保证比 passive 快；三种模式的计时均包含每轮同步，不包含初次创建线程。
+
+同一负载下比较等待策略与线程数：
+
+```bash
+for mode in passive active; do
+  for threads in 1 2 4 8 16; do
+    build-aicpu-sgl-sim/tests/kvaf_aicpu_sgl_simulator \
+      --rows 1024 --row-bytes 4096 --sgl-size 8 --iterations 100 \
+      --gather-threads "$threads" --gather-mode "$mode"
+  done
+done
+OMP_WAIT_POLICY=ACTIVE build-aicpu-sgl-sim/tests/kvaf_aicpu_sgl_simulator \
+  --rows 1024 --row-bytes 4096 --sgl-size 8 --iterations 100 \
+  --gather-threads 8 --gather-mode omp
+```
+
+最后一条仅在构建检测到 OpenMP 时可用。比较 `gather_ns / iterations`，并重复
+整组测试；active 的空转会影响其余阶段，不应只凭模拟 `effective_GBps` 选策略。
 
 发送阶段不调用硬件，而是按十进制 25 GB/s 计算
 `wire_ns = payload_bytes / 25`；默认每 WR 附加开销为 0，因此仅增大

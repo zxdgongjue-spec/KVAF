@@ -1,6 +1,7 @@
 #include "cpu_urma/sgl_batch_builder.h"
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
@@ -16,6 +17,10 @@
 #include <thread>
 #include <vector>
 
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -28,6 +33,8 @@ constexpr std::size_t kMaxGatherThreads = 64U;
 constexpr std::size_t kRemoteGuardBytes = 64U;
 constexpr double kAssumedAicpuBytesPerNs = 25.0;
 constexpr std::uint8_t kGuardValue = 0xcdU;
+
+enum class GatherMode { kActive, kPassive, kOpenMp };
 
 std::size_t DefaultGatherThreads() {
   const auto detected = std::thread::hardware_concurrency();
@@ -42,6 +49,7 @@ struct Options {
   std::size_t remote_offset{4096U};
   std::size_t iterations{3U};
   std::size_t gather_threads{DefaultGatherThreads()};
+  GatherMode gather_mode{GatherMode::kPassive};
   std::uint64_t wr_overhead_ns{0U};
 };
 
@@ -59,10 +67,21 @@ class GatherTeam {
       : source_(source.data()), staging_(staging->data()), rows_(options.rows),
         row_bytes_(options.row_bytes),
         stride_(options.row_bytes + options.source_gap_bytes),
-        worker_count_(worker_count) {
+        worker_count_(worker_count), actual_count_(worker_count),
+        mode_(options.gather_mode) {
+#if defined(_OPENMP)
+    if (mode_ == GatherMode::kOpenMp) omp_set_dynamic(0);
+#endif
+    if (mode_ == GatherMode::kOpenMp) return;
     try {
       for (std::size_t worker = 1U; worker < worker_count_; ++worker) {
-        workers_.emplace_back([this, worker] { Worker(worker); });
+        workers_.emplace_back([this, worker] {
+          if (mode_ == GatherMode::kActive) {
+            ActiveWorker(worker);
+          } else {
+            PassiveWorker(worker);
+          }
+        });
       }
     } catch (...) {
       Stop();
@@ -75,9 +94,33 @@ class GatherTeam {
   GatherTeam(const GatherTeam&) = delete;
   GatherTeam& operator=(const GatherTeam&) = delete;
 
+  std::size_t actual_count() const { return actual_count_; }
+
   void Run() {
     if (worker_count_ == 1U) {
-      CopyShard(0U);
+      CopyShard(0U, 1U);
+      return;
+    }
+    if (mode_ == GatherMode::kOpenMp) {
+#if defined(_OPENMP)
+#pragma omp parallel num_threads(static_cast<int>(worker_count_))
+      {
+        const auto team_size = static_cast<std::size_t>(omp_get_num_threads());
+#pragma omp master
+        { actual_count_ = team_size; }
+        CopyShard(static_cast<std::size_t>(omp_get_thread_num()), team_size);
+      }
+#endif
+      return;
+    }
+    if (mode_ == GatherMode::kActive) {
+      active_completed_.store(0U, std::memory_order_relaxed);
+      active_generation_.fetch_add(1U, std::memory_order_release);
+      CopyShard(0U, worker_count_);
+      while (active_completed_.load(std::memory_order_acquire) !=
+             worker_count_ - 1U) {
+        std::this_thread::yield();
+      }
       return;
     }
     std::unique_lock<std::mutex> lock(mutex_);
@@ -85,16 +128,16 @@ class GatherTeam {
     ++generation_;
     lock.unlock();
     ready_.notify_all();
-    CopyShard(0U);
+    CopyShard(0U, worker_count_);
     lock.lock();
     ++completed_;
     done_.wait(lock, [this] { return completed_ == worker_count_; });
   }
 
  private:
-  void CopyShard(std::size_t worker) const {
-    const std::size_t base = rows_ / worker_count_;
-    const std::size_t extra = rows_ % worker_count_;
+  void CopyShard(std::size_t worker, std::size_t team_size) const {
+    const std::size_t base = rows_ / team_size;
+    const std::size_t extra = rows_ % team_size;
     const std::size_t first = worker * base + std::min(worker, extra);
     const std::size_t end = first + base + (worker < extra ? 1U : 0U);
     for (std::size_t row = first; row < end; ++row) {
@@ -103,7 +146,22 @@ class GatherTeam {
     }
   }
 
-  void Worker(std::size_t worker) {
+  void ActiveWorker(std::size_t worker) {
+    std::size_t observed_generation = 0U;
+    while (!active_stopping_.load(std::memory_order_acquire)) {
+      const auto generation =
+          active_generation_.load(std::memory_order_acquire);
+      if (generation == observed_generation) {
+        std::this_thread::yield();
+        continue;
+      }
+      observed_generation = generation;
+      CopyShard(worker, worker_count_);
+      active_completed_.fetch_add(1U, std::memory_order_release);
+    }
+  }
+
+  void PassiveWorker(std::size_t worker) {
     std::size_t observed_generation = 0U;
     for (;;) {
       std::unique_lock<std::mutex> lock(mutex_);
@@ -113,7 +171,7 @@ class GatherTeam {
       if (stopping_) return;
       observed_generation = generation_;
       lock.unlock();
-      CopyShard(worker);
+      CopyShard(worker, worker_count_);
       lock.lock();
       ++completed_;
       if (completed_ == worker_count_) done_.notify_one();
@@ -121,6 +179,14 @@ class GatherTeam {
   }
 
   void Stop() {
+    if (mode_ == GatherMode::kOpenMp) return;
+    if (mode_ == GatherMode::kActive) {
+      active_stopping_.store(true, std::memory_order_release);
+      for (std::thread& worker : workers_) {
+        if (worker.joinable()) worker.join();
+      }
+      return;
+    }
     {
       std::lock_guard<std::mutex> lock(mutex_);
       stopping_ = true;
@@ -137,7 +203,12 @@ class GatherTeam {
   std::size_t row_bytes_;
   std::size_t stride_;
   std::size_t worker_count_;
+  std::size_t actual_count_;
+  GatherMode mode_;
   std::vector<std::thread> workers_;
+  std::atomic<std::size_t> active_generation_{0U};
+  std::atomic<std::size_t> active_completed_{0U};
+  std::atomic<bool> active_stopping_{false};
   std::mutex mutex_;
   std::condition_variable ready_;
   std::condition_variable done_;
@@ -151,6 +222,7 @@ void Usage(const char* program) {
             << " [--rows N] [--row-bytes N] [--source-gap-bytes N]"
                " [--sgl-size N] [--remote-offset N] [--iterations N]"
                " [--gather-threads N]"
+               " [--gather-mode active|passive|omp]"
                " [--wr-overhead-ns N]\n";
 }
 
@@ -168,6 +240,19 @@ Options ParseOptions(int argc, char** argv) {
   if (argc % 2 == 0) throw std::invalid_argument("every option requires a value");
   for (int index = 1; index < argc; index += 2) {
     const std::string_view flag(argv[index]);
+    if (flag == "--gather-mode") {
+      const std::string_view value(argv[index + 1]);
+      if (value == "active") options.gather_mode = GatherMode::kActive;
+      else if (value == "passive") options.gather_mode = GatherMode::kPassive;
+      else if (value == "omp") {
+#if defined(_OPENMP)
+        options.gather_mode = GatherMode::kOpenMp;
+#else
+        throw std::invalid_argument("OpenMP gather mode is not available in this build");
+#endif
+      } else throw std::invalid_argument("invalid gather mode");
+      continue;
+    }
     const std::uint64_t value = ParseUnsigned(argv[index + 1]);
     if (flag == "--wr-overhead-ns") {
       options.wr_overhead_ns = value;
@@ -330,7 +415,11 @@ void Run(const Options& options) {
             << " bytes_per_iteration=" << payload_bytes
             << " remote_offset=" << options.remote_offset
             << " gather_threads_requested=" << options.gather_threads
-            << " gather_threads_effective=" << gather_threads << '\n';
+            << " gather_threads_effective=" << gather_team.actual_count()
+            << " gather_mode="
+            << (options.gather_mode == GatherMode::kActive ? "active" :
+                options.gather_mode == GatherMode::kOpenMp ? "omp" : "passive")
+            << '\n';
   std::cout << std::fixed << std::setprecision(2)
             << "CPU_PREP_MEASURED gather_ns=" << gather_ns
             << " plan_ns=" << plan_ns << '\n'
