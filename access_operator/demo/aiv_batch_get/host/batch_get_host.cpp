@@ -87,7 +87,7 @@ struct KvafBatchGetTransport {
   hccp::PeerLink *peer_link{nullptr};
 };
 
-std::string EidToHex(const std::array<uint8_t, hccp::kEidBytes> &eid) {
+static std::string EidToHex(const std::array<uint8_t, hccp::kEidBytes> &eid) {
   static constexpr char kHex[] = "0123456789abcdef";
   std::string result;
   result.reserve(hccp::kEidBytes * 2U);
@@ -98,7 +98,7 @@ std::string EidToHex(const std::array<uint8_t, hccp::kEidBytes> &eid) {
   return result;
 }
 
-std::array<uint8_t, hccp::kEidBytes> ReverseEidForAivWqe(
+static std::array<uint8_t, hccp::kEidBytes> ReverseEidForAivWqe(
     const std::array<uint8_t, hccp::kEidBytes> &ra_host_eid) {
   std::array<uint8_t, hccp::kEidBytes> wqe_remote_eid{};
   for (uint32_t index = 0U; index < hccp::kEidBytes; ++index) {
@@ -110,7 +110,7 @@ std::array<uint8_t, hccp::kEidBytes> ReverseEidForAivWqe(
   return wqe_remote_eid;
 }
 
-bool InitContext(const DirectHccpApi &api, int32_t mode, uint32_t physical_device_id,
+static bool InitContext(const DirectHccpApi &api, int32_t mode, uint32_t physical_device_id,
                  const std::array<uint8_t, hccp::kEidBytes> &eid, const char *role, void **context) {
   hccp::CtxInitCfg cfg{};
   cfg.mode = mode;
@@ -129,7 +129,7 @@ bool InitContext(const DirectHccpApi &api, int32_t mode, uint32_t physical_devic
   return true;
 }
 
-bool AllocateToken(const DirectHccpApi &api, void *context, const char *role, void **token_handle,
+static bool AllocateToken(const DirectHccpApi &api, void *context, const char *role, void **token_handle,
                    uint32_t *token_id) {
   hccp::TokenId raw{};
   const int ret = api.token_alloc(context, &raw, token_handle);
@@ -143,7 +143,7 @@ bool AllocateToken(const DirectHccpApi &api, void *context, const char *role, vo
   return true;
 }
 
-bool AlignRange(uint64_t address, uint64_t bytes, uint64_t *aligned_address, uint64_t *aligned_bytes) {
+static bool AlignRange(uint64_t address, uint64_t bytes, uint64_t *aligned_address, uint64_t *aligned_bytes) {
   if (bytes == 0U || aligned_address == nullptr || aligned_bytes == nullptr) {
     return false;
   }
@@ -157,7 +157,7 @@ bool AlignRange(uint64_t address, uint64_t bytes, uint64_t *aligned_address, uin
   return true;
 }
 
-bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle, uint32_t token_id,
+static bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle, uint32_t token_id,
                     uint32_t token_value, void *address, uint64_t bytes, const char *role, DirectMemory *memory) {
   uint64_t aligned_address = 0U;
   uint64_t aligned_bytes = 0U;
@@ -285,7 +285,7 @@ bool AcquireLocalBuffer(KvafBatchGetTransport *transport, void *output_hbm, uint
   return true;
 }
 
-bool ImportRemoteMemory(const DirectHccpApi &api, void *context, const DirectMemory &remote, void **import_handle) {
+static bool ImportRemoteMemory(const DirectHccpApi &api, void *context, const DirectMemory &remote, void **import_handle) {
   hccp::MrImportInfo info{};
   std::memcpy(info.in.key.value, remote.key, remote.key_bytes);
   info.in.key.size = static_cast<uint8_t>(remote.key_bytes);
@@ -302,7 +302,7 @@ bool ImportRemoteMemory(const DirectHccpApi &api, void *context, const DirectMem
   return true;
 }
 
-bool CreateCq(const DirectHccpApi &api, void *context, uint32_t mode, uint32_t depth, const char *role,
+static bool CreateCq(const DirectHccpApi &api, void *context, uint32_t mode, uint32_t depth, const char *role,
               hccp::CqInfo *info, void **handle) {
   *info = {};
   info->in.channel_handle = nullptr;

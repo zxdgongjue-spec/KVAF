@@ -80,7 +80,7 @@ struct KvafBatchPutTransport {
   hccp::PeerLink *peer_link{nullptr};
 };
 
-std::string EidToHex(const std::array<uint8_t, hccp::kEidBytes> &eid) {
+static std::string EidToHex(const std::array<uint8_t, hccp::kEidBytes> &eid) {
   static constexpr char kHex[] = "0123456789abcdef";
   std::string result;
   result.reserve(hccp::kEidBytes * 2U);
@@ -91,7 +91,7 @@ std::string EidToHex(const std::array<uint8_t, hccp::kEidBytes> &eid) {
   return result;
 }
 
-std::array<uint8_t, hccp::kEidBytes> ReverseEidForAivWqe(
+static std::array<uint8_t, hccp::kEidBytes> ReverseEidForAivWqe(
     const std::array<uint8_t, hccp::kEidBytes> &ra_host_eid) {
   std::array<uint8_t, hccp::kEidBytes> wqe_remote_eid{};
   for (uint32_t index = 0U; index < hccp::kEidBytes; ++index) {
@@ -103,7 +103,7 @@ std::array<uint8_t, hccp::kEidBytes> ReverseEidForAivWqe(
   return wqe_remote_eid;
 }
 
-bool InitContext(const DirectHccpApi &api, int32_t mode, uint32_t physical_device_id,
+static bool InitContext(const DirectHccpApi &api, int32_t mode, uint32_t physical_device_id,
                  const std::array<uint8_t, hccp::kEidBytes> &eid, const char *role, void **context) {
   hccp::CtxInitCfg cfg{};
   cfg.mode = mode;
@@ -123,7 +123,7 @@ bool InitContext(const DirectHccpApi &api, int32_t mode, uint32_t physical_devic
   return true;
 }
 
-bool AllocateToken(const DirectHccpApi &api, void *context, const char *role, void **token_handle,
+static bool AllocateToken(const DirectHccpApi &api, void *context, const char *role, void **token_handle,
                    uint32_t *token_id) {
   hccp::TokenId raw{};
   const int ret = api.token_alloc(context, &raw, token_handle);
@@ -138,7 +138,7 @@ bool AllocateToken(const DirectHccpApi &api, void *context, const char *role, vo
   return true;
 }
 
-bool AlignRange(uint64_t address, uint64_t bytes, uint64_t *aligned_address, uint64_t *aligned_bytes) {
+static bool AlignRange(uint64_t address, uint64_t bytes, uint64_t *aligned_address, uint64_t *aligned_bytes) {
   if (bytes == 0U || aligned_address == nullptr || aligned_bytes == nullptr) {
     return false;
   }
@@ -152,7 +152,7 @@ bool AlignRange(uint64_t address, uint64_t bytes, uint64_t *aligned_address, uin
   return true;
 }
 
-bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle, uint32_t token_id,
+static bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle, uint32_t token_id,
                     uint32_t token_value, void *address, uint64_t bytes, const char *role, DirectMemory *memory) {
   uint64_t aligned_address = 0U;
   uint64_t aligned_bytes = 0U;
@@ -195,7 +195,7 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
   return true;
 }
 
-bool ImportRemoteMemory(const DirectHccpApi &api, void *context, const DirectMemory &remote, void **import_handle) {
+static bool ImportRemoteMemory(const DirectHccpApi &api, void *context, const DirectMemory &remote, void **import_handle) {
   hccp::MrImportInfo info{};
   std::memcpy(info.in.key.value, remote.key, remote.key_bytes);
   info.in.key.size = static_cast<uint8_t>(remote.key_bytes);
@@ -212,7 +212,7 @@ bool ImportRemoteMemory(const DirectHccpApi &api, void *context, const DirectMem
   return true;
 }
 
-bool CreateCq(const DirectHccpApi &api, void *context, uint32_t mode, uint32_t depth, const char *role,
+static bool CreateCq(const DirectHccpApi &api, void *context, uint32_t mode, uint32_t depth, const char *role,
               hccp::CqInfo *info, void **handle) {
   *info = {};
   info->in.channel_handle = nullptr;
@@ -568,6 +568,9 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
                                             aclrtStream stream,
                                             KvafBatchPutCoreStatus *core_status,
                                             uint32_t core_status_count) {
+  hccp::VerboseLog("[KVAF_AIV] BATCH_PUT_PHASE phase=sync_enter local=%p args=%p stream=%p\n",
+                   static_cast<void *>(local_buffer), static_cast<const void *>(arguments),
+                   static_cast<void *>(stream));
   if (local_buffer == nullptr || local_buffer->reference_count == 0U ||
       local_buffer->transport == nullptr || arguments == nullptr || stream == nullptr || core_status == nullptr ||
       arguments->input == 0U || arguments->input_offsets == 0U || arguments->lengths == 0U ||
@@ -582,6 +585,7 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
 
   KvafBatchPutTransport *transport = local_buffer->transport;
   std::lock_guard<std::mutex> launch_lock(transport->launch_mutex);
+  hccp::VerboseLog("[KVAF_AIV] BATCH_PUT_PHASE phase=clear_status_begin\n");
   const uint64_t status_bytes = static_cast<uint64_t>(core_status_count) * sizeof(*core_status);
   const aclError clear_result =
       aclrtMemset(reinterpret_cast<void *>(arguments->core_status), status_bytes, 0, status_bytes);
@@ -590,6 +594,7 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
                  static_cast<int>(clear_result));
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
+  hccp::VerboseLog("[KVAF_AIV] BATCH_PUT_PHASE phase=launch_begin\n");
   KvafExecuteBatchPutLaunchArgs launch_args{};
   launch_args.request = *arguments;
   launch_args.channel_entity = local_buffer->device_channel_entity;
@@ -600,12 +605,14 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=launch result=%d\n", result);
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
+  hccp::VerboseLog("[KVAF_AIV] BATCH_PUT_PHASE phase=synchronize_begin\n");
   const aclError synchronize_result = aclrtSynchronizeStream(stream);
   if (synchronize_result != ACL_SUCCESS) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=synchronize acl=%d\n",
                  static_cast<int>(synchronize_result));
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
+  hccp::VerboseLog("[KVAF_AIV] BATCH_PUT_PHASE phase=copy_status_begin\n");
   const aclError status_copy_result =
       aclrtMemcpy(core_status, status_bytes, reinterpret_cast<void *>(arguments->core_status), status_bytes,
                   ACL_MEMCPY_DEVICE_TO_HOST);
@@ -614,6 +621,7 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
                  static_cast<int>(status_copy_result));
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
+  hccp::VerboseLog("[KVAF_AIV] BATCH_PUT_PHASE phase=status_validate_begin\n");
   for (uint32_t core = 0U; core < core_status_count; ++core) {
     const uint64_t begin = static_cast<uint64_t>(arguments->row_count) * core / core_status_count;
     const uint64_t end = static_cast<uint64_t>(arguments->row_count) * (core + 1U) / core_status_count;
