@@ -163,9 +163,29 @@ static bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_
   hccp::MrRegInfo info{};
   info.in.mem.addr = aligned_address;
   info.in.mem.size = aligned_bytes;
-  // Keep the local HBM registration identical to the V9 BatchPut/Get path.
-  // non_pin is a transport registration flag, not a new HBM allocation.
-  info.in.ub.flags = hccp::MemRegFlags(true);
+  // V9 uses non_pin=1. Only this isolated B12 reproduction accepts an
+  // explicit local-HBM registration A/B; neither the source allocation nor
+  // the remote DDR registration is changed.
+  bool non_pin = true;
+  if (std::strcmp(role, "device_hbm") == 0) {
+    const char *setting = std::getenv("KVAF_B12_LOCAL_HBM_NON_PIN");
+    if (setting != nullptr) {
+      if (std::strcmp(setting, "0") == 0) {
+        non_pin = false;
+      } else if (std::strcmp(setting, "1") != 0) {
+        std::fprintf(stderr,
+                     "[KVAF_AIV] BATCH_PUT_LOCAL_HBM_REG_POLICY_INVALID value=%s\n",
+                     setting);
+        return false;
+      }
+    }
+    std::fprintf(stderr,
+                 "[KVAF_AIV] BATCH_PUT_LOCAL_HBM_REG_POLICY non_pin=%u "
+                 "source=%s\n",
+                 static_cast<unsigned int>(non_pin),
+                 setting == nullptr ? "v9_default" : "explicit_b12_ab");
+  }
+  info.in.ub.flags = hccp::MemRegFlags(non_pin);
   info.in.ub.token_value = token_value;
   info.in.ub.token_id_handle = token_handle;
   const int ret = api.lmem_register(context, &info, &memory->handle);
@@ -189,9 +209,10 @@ static bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_
       role, token_id, info.out.ub.token_id, memory->token_id);
   hccp::VerboseLog(
       "[KVAF_AIV] DIRECT_MEMORY_REGISTERED role=%s token_id=0x%x host_or_hbm_va=0x%llx bytes=%llu "
-      "reg_flags=0x%x non_pin=1\n",
+      "reg_flags=0x%x non_pin=%u\n",
       role, memory->token_id, static_cast<unsigned long long>(aligned_address),
-      static_cast<unsigned long long>(aligned_bytes), info.in.ub.flags);
+      static_cast<unsigned long long>(aligned_bytes), info.in.ub.flags,
+      static_cast<unsigned int>(non_pin));
   return true;
 }
 
