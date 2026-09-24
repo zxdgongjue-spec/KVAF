@@ -439,9 +439,13 @@ Status DefaultAccessOperator::Shutdown() {
   // Callers must complete all submitted streams before Runtime::Shutdown,
   // including the default enqueue-only Python BatchGet path.
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
+  std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_SHUTDOWN_BEGIN step=execution_state\n");
   ReleaseBatchPutExecutionState(&impl_->batch_put_execution);
+  std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_SHUTDOWN_DONE step=execution_state\n");
   if (impl_->batch_put_transport != nullptr) {
+    std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_SHUTDOWN_BEGIN step=transport\n");
     KvafBatchPutTransportDestroy(impl_->batch_put_transport);
+    std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_SHUTDOWN_DONE step=transport\n");
   }
   impl_->batch_put_transport = nullptr;
 #endif

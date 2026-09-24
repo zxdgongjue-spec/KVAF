@@ -519,43 +519,58 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
             aclrtCreateStream(&stream) != ACL_SUCCESS || stream == nullptr) {
           last = Internal("failed to prepare peer candidate RMA probe");
         } else {
-          std::vector<KeyId> probe_keys;
-          std::vector<std::uint64_t> probe_offsets;
-          std::vector<std::uint64_t> probe_lengths;
-          probe_keys.reserve(static_cast<std::size_t>(probe_rows));
-          probe_offsets.reserve(static_cast<std::size_t>(probe_rows));
-          probe_lengths.reserve(static_cast<std::size_t>(probe_rows));
-          for (std::uint64_t row = 0U; row < probe_rows; ++row) {
-            probe_keys.push_back(std::numeric_limits<KeyId>::max() - row);
-            probe_offsets.push_back(row * probe_bytes);
-            probe_lengths.push_back(probe_bytes);
-          }
-          std::fprintf(stderr,
-                       "[KVAF_AIV] PEER_LINK_EID_PAIR_RMA_PROBE_BEGIN peer_candidate=%u/%u "
-                       "npu_candidate=%zu npu_source=%s rows=%llu bytes_per_row=%llu "
-                       "source_bytes=%llu cores=%u jettys_per_core=%u\n",
-                       peer_candidate, candidate_count, npu_index, candidate.source.c_str(),
-                       static_cast<unsigned long long>(probe_rows),
-                       static_cast<unsigned long long>(probe_bytes),
-                       static_cast<unsigned long long>(probe_total_bytes),
-                       impl_->options.npu_core_count, impl_->options.jettys_per_core);
-          last = impl_->runtime_core->BatchPut(
-              BatchPutRequest{probe_keys,
-                              ConstBufferView{impl_->probe_buffer,
-                                              static_cast<std::size_t>(probe_total_bytes),
-                                              DeviceKind::kNpu},
-                              probe_offsets, probe_lengths},
-              BatchPutExecutionOptions{stream});
-          if (last.ok()) {
-            last = impl_->runtime_core->BatchFree(BatchFreeRequest{probe_keys});
-          }
-          if (last.ok()) {
+          const auto run_probe = [&](std::uint64_t rows, const char* stage) -> Status {
+            std::vector<KeyId> probe_keys;
+            std::vector<std::uint64_t> probe_offsets;
+            std::vector<std::uint64_t> probe_lengths;
+            probe_keys.reserve(static_cast<std::size_t>(rows));
+            probe_offsets.reserve(static_cast<std::size_t>(rows));
+            probe_lengths.reserve(static_cast<std::size_t>(rows));
+            for (std::uint64_t row = 0U; row < rows; ++row) {
+              probe_keys.push_back(std::numeric_limits<KeyId>::max() - row);
+              probe_offsets.push_back(row * probe_bytes);
+              probe_lengths.push_back(probe_bytes);
+            }
             std::fprintf(stderr,
-                         "[KVAF_AIV] PEER_LINK_EID_PAIR_RMA_PROBE_READY peer_candidate=%u/%u "
-                         "npu_candidate=%zu npu_source=%s rows=%llu source_bytes=%llu\n",
-                         peer_candidate, candidate_count, npu_index, candidate.source.c_str(),
-                         static_cast<unsigned long long>(probe_rows),
-                         static_cast<unsigned long long>(probe_total_bytes));
+                         "[KVAF_AIV] PEER_LINK_EID_PAIR_RMA_PROBE_BEGIN stage=%s "
+                         "peer_candidate=%u/%u npu_candidate=%zu npu_source=%s "
+                         "rows=%llu bytes_per_row=%llu source_bytes=%llu "
+                         "cores=%u jettys_per_core=%u\n",
+                         stage, peer_candidate, candidate_count, npu_index,
+                         candidate.source.c_str(), static_cast<unsigned long long>(rows),
+                         static_cast<unsigned long long>(probe_bytes),
+                         static_cast<unsigned long long>(probe_total_bytes),
+                         impl_->options.npu_core_count, impl_->options.jettys_per_core);
+            Status result = impl_->runtime_core->BatchPut(
+                BatchPutRequest{probe_keys,
+                                ConstBufferView{impl_->probe_buffer,
+                                                static_cast<std::size_t>(probe_total_bytes),
+                                                DeviceKind::kNpu},
+                                probe_offsets, probe_lengths},
+                BatchPutExecutionOptions{stream});
+            if (result.ok()) {
+              result = impl_->runtime_core->BatchFree(BatchFreeRequest{probe_keys});
+            }
+            if (result.ok()) {
+              std::fprintf(stderr,
+                           "[KVAF_AIV] PEER_LINK_EID_PAIR_RMA_PROBE_READY stage=%s "
+                           "peer_candidate=%u/%u npu_candidate=%zu npu_source=%s "
+                           "rows=%llu source_bytes=%llu\n",
+                           stage, peer_candidate, candidate_count, npu_index,
+                           candidate.source.c_str(), static_cast<unsigned long long>(rows),
+                           static_cast<unsigned long long>(probe_total_bytes));
+            }
+            return result;
+          };
+
+          // Reject an unusable EID with one write on every core before the
+          // 32-WQE-per-core, two-Jetty stress probe. A successful candidate
+          // still must pass the original complete all-lane validation.
+          const std::uint64_t connectivity_rows =
+              std::min<std::uint64_t>(probe_rows, impl_->options.npu_core_count);
+          last = run_probe(connectivity_rows, "connectivity");
+          if (last.ok() && probe_rows > connectivity_rows) {
+            last = run_probe(probe_rows, "all_lanes");
           }
         }
         if (stream != nullptr && aclrtDestroyStream(stream) != ACL_SUCCESS && last.ok()) {
@@ -574,7 +589,14 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                    "reason=%s\n",
                    peer_candidate, npu_index, candidate.source.c_str(), last.message().c_str());
       if (impl_->runtime_core->initialized()) {
+        std::fprintf(stderr,
+                     "[KVAF_AIV] PEER_LINK_EID_PAIR_CLEANUP_BEGIN peer_candidate=%u "
+                     "npu_candidate=%zu\n", peer_candidate, npu_index);
         const Status cleanup = impl_->runtime_core->Shutdown();
+        std::fprintf(stderr,
+                     "[KVAF_AIV] PEER_LINK_EID_PAIR_CLEANUP_DONE peer_candidate=%u "
+                     "npu_candidate=%zu status=%s\n", peer_candidate, npu_index,
+                     cleanup.message().c_str());
         if (!cleanup.ok()) return cleanup;
       }
       if (impl_->peer_allocator->has_allocation()) {

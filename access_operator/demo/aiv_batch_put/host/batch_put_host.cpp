@@ -242,12 +242,15 @@ void ReleaseTransport(KvafBatchPutTransport *transport) {
     for (uint32_t index = 0U; index < transport->worker_count; ++index) {
       DirectAivWorker &worker = transport->workers[index];
       if (transport->device_context != nullptr && worker.device_peer_target_jetty != nullptr) {
+        std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_TEARDOWN_BEGIN step=qp_unimport index=%u\n", index);
         if (transport->api.qp_unimport(transport->device_context,
                                        worker.device_peer_target_jetty) != 0) {
           queues_retired = false;
         } else {
           worker.device_peer_target_jetty = nullptr;
         }
+        std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_TEARDOWN_DONE step=qp_unimport index=%u ok=%u\n",
+                     index, static_cast<unsigned int>(worker.device_peer_target_jetty == nullptr));
       }
     }
   }
@@ -255,11 +258,14 @@ void ReleaseTransport(KvafBatchPutTransport *transport) {
     for (uint32_t index = 0U; index < transport->worker_count; ++index) {
       DirectAivWorker &worker = transport->workers[index];
       if (worker.device_user_ctl_jetty.handle != nullptr) {
+        std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_TEARDOWN_BEGIN step=qp_destroy index=%u\n", index);
         if (transport->api.qp_destroy(worker.device_user_ctl_jetty.handle) != 0) {
           queues_retired = false;
         } else {
           worker.device_user_ctl_jetty.handle = nullptr;
         }
+        std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_TEARDOWN_DONE step=qp_destroy index=%u ok=%u\n",
+                     index, static_cast<unsigned int>(worker.device_user_ctl_jetty.handle == nullptr));
       }
     }
   }
@@ -267,12 +273,15 @@ void ReleaseTransport(KvafBatchPutTransport *transport) {
     for (uint32_t index = 0U; index < transport->worker_count; ++index) {
       DirectAivWorker &worker = transport->workers[index];
       if (transport->device_context != nullptr && worker.device_user_ctl_cq != nullptr) {
+        std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_TEARDOWN_BEGIN step=cq_destroy index=%u\n", index);
         if (transport->api.cq_destroy(transport->device_context,
                                       worker.device_user_ctl_cq) != 0) {
           queues_retired = false;
         } else {
           worker.device_user_ctl_cq = nullptr;
         }
+        std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_TEARDOWN_DONE step=cq_destroy index=%u ok=%u\n",
+                     index, static_cast<unsigned int>(worker.device_user_ctl_cq == nullptr));
       }
     }
   }
