@@ -19,9 +19,7 @@ int main() {
   kvaf::aicpu_urma_client::Options default_options;
   assert(kvaf::aicpu_urma_client::Parse(1, defaults, &default_options));
   assert(default_options.peer == "127.0.0.1:28999");
-  assert(default_options.backend == kvaf::aicpu_urma_client::Options::Backend::kAicpu);
-  assert(default_options.aiv_get_object.find("/bin/kvaf_execute_batch_get_kernels.o") != std::string::npos);
-  assert(default_options.aiv_put_object.find("/bin/kvaf_execute_batch_put_kernels.o") != std::string::npos);
+  assert(default_options.token_bytes == default_options.block_bytes);
   assert(default_options.kernel_json.find("/opp/vendors/cust/op_impl/aicpu/config/kvaf_aicpu_urma.json") !=
          std::string::npos);
 #if defined(KVAF_AICPU_URMA_CANN_ROOT)
@@ -41,32 +39,40 @@ int main() {
   else assert(setenv("ASCEND_HOME_PATH", previous_home.c_str(), 1) == 0);
   constexpr const char* valid[] = {"client", "--peer", "127.0.0.1:28999", "--kernel-json", "/tmp/kernel.json",
                                    "--blocks", "16", "--block-bytes", "4096", "--token-bytes", "256",
-                                   "--warmup", "0", "--iterations", "5", "--seed", "123",
-                                   "--ddr-bytes", "1048576"};
+                                   "--warmup", "0", "--iterations", "5"};
   kvaf::aicpu_urma_client::Options options;
   assert(kvaf::aicpu_urma_client::Parse(sizeof(valid) / sizeof(valid[0]), valid, &options));
   assert(options.blocks == 16 && options.token_bytes == 256 && options.warmup == 0);
-  assert(options.ddr_bytes == 1048576 && options.seed == 123);
-  constexpr const char* aiv[] = {"client", "--backend", "aiv", "--peer", "127.0.0.1:28991"};
-  assert(kvaf::aicpu_urma_client::Parse(sizeof(aiv) / sizeof(aiv[0]), aiv, &options));
-  assert(options.backend == kvaf::aicpu_urma_client::Options::Backend::kAiv);
-  constexpr const char* invalid_backend[] = {"client", "--backend", "other"};
-  assert(!Accepts(invalid_backend));
+  constexpr const char* block_first[] = {"client", "--block-bytes", "656"};
+  assert(kvaf::aicpu_urma_client::Parse(sizeof(block_first) / sizeof(block_first[0]), block_first, &options));
+  assert(options.block_bytes == 656 && options.token_bytes == 656);
+  constexpr const char* token_first[] = {"client", "--token-bytes", "328", "--block-bytes", "656"};
+  assert(kvaf::aicpu_urma_client::Parse(sizeof(token_first) / sizeof(token_first[0]), token_first, &options));
+  assert(options.block_bytes == 656 && options.token_bytes == 328);
+  constexpr const char* block_then_token[] = {"client", "--block-bytes", "656", "--token-bytes", "328"};
+  assert(kvaf::aicpu_urma_client::Parse(sizeof(block_then_token) / sizeof(block_then_token[0]),
+                                        block_then_token, &options));
+  assert(options.block_bytes == 656 && options.token_bytes == 328);
+  constexpr const char* invalid_backend[] = {"client", "--backend", "aiv"};
+  constexpr const char* invalid_seed[] = {"client", "--seed", "123"};
+  constexpr const char* invalid_ddr_option[] = {"client", "--ddr-bytes", "1048576"};
   constexpr const char* invalid_ratio[] = {"client", "--peer", "host:1", "--kernel-json", "file",
-                                           "--block-bytes", "257", "--token-bytes", "256"};
+                                           "--block-bytes", "656", "--token-bytes", "256"};
+  constexpr const char* invalid_token[] = {"client", "--token-bytes", "0"};
   constexpr const char* invalid_count[] = {"client", "--peer", "host:1", "--kernel-json", "file",
                                            "--blocks", "2147483648"};
   constexpr const char* invalid_device[] = {"client", "--peer", "host:1", "--kernel-json", "file",
                                             "--device-id", "4294967295"};
-  constexpr const char* invalid_ddr[] = {"client", "--peer", "host:1", "--kernel-json", "file",
-                                         "--ddr-bytes", "4095"};
   constexpr const char* missing_value[] = {"client", "--peer"};
   constexpr const char* negative[] = {"client", "--peer", "host:1", "--kernel-json", "file",
                                       "--iterations", "-1"};
+  assert(!Accepts(invalid_backend));
+  assert(!Accepts(invalid_seed));
+  assert(!Accepts(invalid_ddr_option));
   assert(!Accepts(invalid_ratio));
+  assert(!Accepts(invalid_token));
   assert(!Accepts(invalid_count));
   assert(!Accepts(invalid_device));
-  assert(!Accepts(invalid_ddr));
   assert(!Accepts(missing_value));
   assert(!Accepts(negative));
   std::cout << "AICPU URMA native client options: PASS\n";

@@ -34,6 +34,9 @@ kernel 并发使用；异步 BatchGet 需要调用方在释放输出/transport �
 两个安装文件，不用备份覆盖其他包的配置。若 `ASCEND_CANN_PACKAGE_PATH`
 和 `ASCEND_HOME_PATH` 指向不同 CANN 根目录，构建/检查会直接报错。
 
+当前 `NpuRuntime` 仍复用 AIV BatchGet/BatchPut 的 Direct-HCCP Host 目标，
+所以构建 AICPU 客户端会连带编译其 AIV kernel 依赖；客户端本身只执行 AICPU 路径。
+
 原生客户端默认使用构建时的
 CANN 路径查找 AICPU JSON，并使用单 worker、单 Jetty；无需配置 `CANN_ROOT`
 或提供 AIV kernel object 路径。若 `ASCEND_HOME_PATH` 未设置，客户端在 ACL 初始化前
@@ -51,8 +54,8 @@ NPU 端安装内核并重启测试进程后执行：
 ```bash
 build-aicpu-urma/tests/kvaf_aicpu_urma_client \
   --peer CPU_HOST:28999 \
-  --device-id 0 --blocks 16 --block-bytes 4096 --token-bytes 256 \
-  --warmup 1 --iterations 5 --seed 123
+  --device-id 0 --blocks 16 --block-bytes 4096 \
+  --warmup 1 --iterations 5
 ```
 
 同机 CPU service 使用默认监听地址和端口时，客户端不带参数也可运行：
@@ -60,10 +63,12 @@ build-aicpu-urma/tests/kvaf_aicpu_urma_client \
 内核安装在其他目录时可用 `--kernel-json` 覆盖。默认 JSON 缺失或不可读时，
 Runtime 在枚举 EID 前直接报错。
 
-`--blocks` 为每批 KV block 数；`--block-bytes` 为每个 block 的写入字节数，
-必须能被 `--token-bytes` 整除。客户端会对每个 block 的所有 token 执行 BatchGet，
-反向排列输出并逐字节比对，因此覆盖完整 BatchPut payload 和 BatchGet READ。
-`--ddr-bytes` 可选，至少为 `blocks * block-bytes` 且是 block 的整数倍。
+`--blocks` 为每批 KV block 数；`--block-bytes` 为每个 block 的写入字节数。
+`--token-bytes` 默认等于最终的 `--block-bytes`；只有需要将 block 拆为多个
+BatchGet token 时才指定，且 `--block-bytes` 必须能被它整除。客户端会对每个
+block 的所有 token 执行 BatchGet，反向排列输出并逐字节比对，因此覆盖完整
+BatchPut payload 和 BatchGet READ。
+CPU DDR 分配大小固定为 `blocks * block-bytes`。
 每轮先写入新 payload，再读取并验证；warmup 不计入统计，输出每轮耗时和平均
 `put_GBps/get_GBps`。Put 计时包含 MetaManager 的预留和提交；Get 计时包含
 Runtime 提交与 stream 同步，不包含 AccessTable 准备、HBM 上传/回读和逐字节校验，
@@ -120,15 +125,17 @@ WQE 协议或互联故障；不能仅凭当前 `result=8` 归因到其中一种�
 不能据此断言所有 26 个候选都失败。当前没有经过确认的该设备子状态码映射，
 不要把 `2/2` 直接解释为某一种 token、地址或 EID 错误。
 
-需要区分共享的 Host-HCCP/WQE 问题与 AICPU 提交路径问题时，用同一个原生客户端
-运行 AIV 对照，无需 Python。`--compare-aiv` 只额外编译 AIV kernel object，
-不改变默认 AICPU 后端：
+需要区分共享的 Host-HCCP/WQE 问题与 AICPU 提交路径问题时，单独构建原生
+AIV 客户端作对照，无需 Python 或修改 AICPU 客户端：
 
 ```bash
-./build.sh aicpu-urma --install-kernel --compare-aiv
-build-aicpu-urma/tests/kvaf_aicpu_urma_client \
-  --backend aiv --peer 127.0.0.1:28991 --blocks 1 --warmup 0 --iterations 1
+./build.sh aiv-native
+build-aiv-native/tests/kvaf_aiv_batch_roundtrip \
+  --peer 127.0.0.1:28991 --device-id 0 --blocks 1 --iterations 1
 ```
+
+AIV 原生客户端不调用 `NpuRuntime::Initialize` 的 WRITE 预探针；比较结果前应从
+日志确认双方实际选择的 CPU/NPU EID 候选一致。
 
 若 AIV 在同一候选的 WRITE 探针成功而 AICPU 返回 `2/2`，重点检查 AICPU 写 SQ、
 缓存可见性和门铃顺序；若两者在同一候选均返回 `2/2`，先检查共享的 WQE 字段、
@@ -148,14 +155,15 @@ token、地址与 PeerLink 资源。两种后端的批量 WQE 目前都是单 SG
 首轮 owner 改为 0、末条 fence 改为 1；真机 AIV 探针仍返回 `2/2`。
 现已将 AIV BatchPut/BatchGet kernel 和 Put Host 注册行为回退到本分支起点的
 实现；AICPU WQE 编码仍保留该假设，尚需单独验证。对照时要注意两者目前
-不再使用相同的 WQE 控制字。两种后端的单 block 命令：
+不再使用相同的 WQE 控制字。分别运行两个独立客户端的单 block 命令：
 
 ```bash
-./build.sh aicpu-urma --install-kernel --compare-aiv
+./build.sh aiv-native
+build-aiv-native/tests/kvaf_aiv_batch_roundtrip \
+  --peer 127.0.0.1:28991 --device-id 0 --blocks 1 --iterations 1
+./build.sh aicpu-urma --install-kernel
 build-aicpu-urma/tests/kvaf_aicpu_urma_client \
-  --backend aiv --peer 127.0.0.1:28991 --blocks 1 --warmup 0 --iterations 1
-build-aicpu-urma/tests/kvaf_aicpu_urma_client \
-  --backend aicpu --peer 127.0.0.1:28991 --blocks 1 --warmup 0 --iterations 1
+  --peer 127.0.0.1:28991 --device-id 0 --blocks 1 --warmup 0 --iterations 1
 ```
 
 上述实验中首个 CPU 候选的两个 NPU EID 仍返回 `2/2`，因此 owner/fence 不是该错误的

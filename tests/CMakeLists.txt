@@ -138,8 +138,7 @@ endif()
 if(KVAF_ENABLE_AICPU_URMA)
   add_executable(kvaf_aicpu_urma_client aicpu_urma_client.cc)
   target_compile_definitions(kvaf_aicpu_urma_client PRIVATE
-    "KVAF_AICPU_URMA_CANN_ROOT=\"${ASCEND_CANN_PACKAGE_PATH}\""
-    "KVAF_AICPU_URMA_BUILD_DIR=\"${CMAKE_BINARY_DIR}\"")
+    "KVAF_AICPU_URMA_CANN_ROOT=\"${ASCEND_CANN_PACKAGE_PATH}\"")
   target_include_directories(kvaf_aicpu_urma_client PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/include")
   target_link_directories(kvaf_aicpu_urma_client PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/lib64")
   target_link_libraries(kvaf_aicpu_urma_client PRIVATE kvaf_npu_runtime ascendcl)
