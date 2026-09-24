@@ -163,7 +163,9 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
   hccp::MrRegInfo info{};
   info.in.mem.addr = aligned_address;
   info.in.mem.size = aligned_bytes;
-  info.in.ub.flags = hccp::MemRegFlags(true);
+  // The source is aclrtMalloc HBM, not a device register. RMA WRITE reads
+  // this local memory, so its pages must be pinned for the transport.
+  info.in.ub.flags = hccp::MemRegFlags(false);
   info.in.ub.token_value = token_value;
   info.in.ub.token_id_handle = token_handle;
   const int ret = api.lmem_register(context, &info, &memory->handle);
@@ -182,9 +184,10 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
   memory->key_bytes = info.out.key.size;
   std::memcpy(memory->key, info.out.key.value, memory->key_bytes);
   hccp::VerboseLog(
-      "[KVAF_AIV] DIRECT_MEMORY_REGISTERED role=%s token_id=0x%x host_or_hbm_va=0x%llx bytes=%llu\n",
+      "[KVAF_AIV] DIRECT_MEMORY_REGISTERED role=%s token_id=0x%x host_or_hbm_va=0x%llx bytes=%llu "
+      "reg_flags=0x%x non_pin=0\n",
       role, memory->token_id, static_cast<unsigned long long>(aligned_address),
-      static_cast<unsigned long long>(aligned_bytes));
+      static_cast<unsigned long long>(aligned_bytes), info.in.ub.flags);
   return true;
 }
 
