@@ -163,9 +163,9 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
   hccp::MrRegInfo info{};
   info.in.mem.addr = aligned_address;
   info.in.mem.size = aligned_bytes;
-  // The source is aclrtMalloc HBM, not a device register. RMA WRITE reads
-  // this local memory, so its pages must be pinned for the transport.
-  info.in.ub.flags = hccp::MemRegFlags(false);
+  // Keep the local HBM registration identical to the V9 BatchPut/Get path.
+  // non_pin is a transport registration flag, not a new HBM allocation.
+  info.in.ub.flags = hccp::MemRegFlags(true);
   info.in.ub.token_value = token_value;
   info.in.ub.token_id_handle = token_handle;
   const int ret = api.lmem_register(context, &info, &memory->handle);
@@ -189,7 +189,7 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
       role, token_id, info.out.ub.token_id, memory->token_id);
   hccp::VerboseLog(
       "[KVAF_AIV] DIRECT_MEMORY_REGISTERED role=%s token_id=0x%x host_or_hbm_va=0x%llx bytes=%llu "
-      "reg_flags=0x%x non_pin=0\n",
+      "reg_flags=0x%x non_pin=1\n",
       role, memory->token_id, static_cast<unsigned long long>(aligned_address),
       static_cast<unsigned long long>(aligned_bytes), info.in.ub.flags);
   return true;
