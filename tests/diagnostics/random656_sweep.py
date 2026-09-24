@@ -15,10 +15,18 @@ def plan():
         (16384, 30, 2), (32768, 30, 2)]
 
 
-def payload(np, ids):
-    columns = np.arange(656, dtype=np.uint32)
+def payload(np, ids, token_bytes=656):
+    columns = np.arange(token_bytes, dtype=np.uint32)
     return ((ids.astype(np.uint32)[:, None] >> ((columns % 4)*8)) ^
             (columns*17)).astype(np.uint8)
+
+
+def source_ids(np, rng, working, count, pattern):
+    if pattern == 'contiguous':
+        begin = int(rng.integers(0, working-count+1))
+        return np.arange(begin, begin+count)
+    ids = rng.choice(working, count, replace=False)
+    return np.sort(ids) if pattern == 'sorted' else ids
 
 
 def summarize(root):
@@ -55,42 +63,46 @@ def case(args):
     import kvaf
     torch.npu.set_device(args.device)
     device = f'npu:{args.device}'
+    token_bytes = args.token_bytes
     total = args.blocks*128
-    if args.requests > total:
+    working = args.working_tokens or total
+    if not args.requests <= working <= total:
         raise ValueError('requests exceed source tokens')
     runtime = kvaf.NpuRuntime(str(args.build/'bin/kvaf_execute_batch_get_kernels.o'),
-        batch_get_token_bytes=656, batch_get_tokens_per_block=128,
+        batch_get_token_bytes=token_bytes, batch_get_tokens_per_block=128,
         device_id=args.device, npu_core_count=args.cores, jettys_per_core=args.jettys,
         batch_put_kernel_object_path=str(args.build/'bin/kvaf_execute_batch_put_kernels.o'))
     runtime.link_to(args.server)
-    runtime.initialize(total*656, 128*656)
+    runtime.initialize(total*token_bytes, 128*token_bytes)
     keys = list(range(1, args.blocks+1))
     # Each token has a source-identity-specific payload, so wrong remote addresses
     # cannot pass merely because all blocks contain the same pattern.
     for begin in range(0, args.blocks, 64):
         end = min(args.blocks, begin+64)
-        data = torch.from_numpy(payload(np, np.arange(begin*128, end*128))).to(device)
-        runtime.batch_put(keys[begin:end], data.reshape(end-begin, 128*656),
-                          [i*128*656 for i in range(end-begin)], [128*656]*(end-begin))
+        data = torch.from_numpy(payload(np, np.arange(begin*128, end*128), token_bytes)).to(device)
+        runtime.batch_put(keys[begin:end], data.reshape(end-begin, 128*token_bytes),
+                          [i*128*token_bytes for i in range(end-begin)], [128*token_bytes]*(end-begin))
         torch.npu.synchronize()
     table = runtime.prepare_access_table(keys)
     view = runtime.access_table_view(table, device='npu', capacity=args.blocks)
+    host_view = runtime.access_table_view(table, device='cpu')
+    remote_bases = np.frombuffer(bytes(host_view['addresses']), dtype='<u8')
     stream = torch.npu.Stream(device=args.device)
     n = args.requests
     indices = torch.zeros(n, dtype=torch.int32, device=device)
     offsets = torch.zeros_like(indices)
     destinations = torch.arange(n, dtype=torch.int32, device=device)
     count = torch.tensor([n], dtype=torch.int32, device=device)
-    output = torch.empty((n, 656), dtype=torch.uint8, device=device)
+    output = torch.empty((n, token_bytes), dtype=torch.uint8, device=device)
     torch.npu.synchronize()
     rng = np.random.default_rng(args.seed)
 
     def prepare():
-        ids = rng.choice(total, n, replace=False)
+        ids = source_ids(np, rng, working, n, args.pattern)
         slots = rng.permutation(n).astype(np.int32)
         with torch.npu.stream(stream):
             indices.copy_(torch.from_numpy((ids//128).astype(np.int32)))
-            offsets.copy_(torch.from_numpy(((ids%128)*656).astype(np.int32)))
+            offsets.copy_(torch.from_numpy(((ids%128)*token_bytes).astype(np.int32)))
             destinations.copy_(torch.from_numpy(slots))
             output.fill_(0xA5)
         stream.synchronize()
@@ -103,7 +115,7 @@ def case(args):
 
     def verify(ids, slots):
         actual = output.cpu().numpy()
-        if not np.array_equal(actual[slots], payload(np, ids)):
+        if not np.array_equal(actual[slots], payload(np, ids, token_bytes)):
             raise AssertionError('Random source/destination payload mismatch')
 
     ids, slots = prepare()
@@ -131,13 +143,19 @@ def case(args):
     ids, slots = prepare()
     execute(); stream.synchronize(); verify(ids, slots)
     timeline = runtime.stop_batch_get_kernel_profile()
+    addresses = remote_bases[ids//128] + (ids%128).astype(np.uint64)*token_bytes
+    address_stats = dict(unique_4k_pages=len(np.unique(addresses//4096)),
+        unique_2m_regions=len(np.unique(addresses//2097152)),
+        consecutive_fraction=float(np.mean(addresses[1:]==addresses[:-1]+token_bytes)),
+        note='Start-address virtual regions, not physical pages or measured translation misses.')
     runtime.release_access_table(table)
     runtime.batch_free(keys)
     result = dict(requests=n, cores=args.cores, jettys=args.jettys, blocks=args.blocks,
-                  source_bytes=total*656, payload_bytes=n*656, seed=args.seed,
+                  source_bytes=total*token_bytes, working_bytes=working*token_bytes,
+                  pattern=args.pattern, token_bytes=token_bytes, payload_bytes=n*token_bytes, seed=args.seed,
                   device_p50_us=float(np.percentile(samples, 50)),
                   device_p95_us=float(np.percentile(samples, 95)), samples_us=samples,
-                  profile=timeline, correctness=True, timing='device_event_graph_replay_including_completion')
+                  address_stats=address_stats, profile=timeline, correctness=True, timing='device_event_graph_replay_including_completion')
     args.result.write_text(json.dumps(result, indent=2)+'\n')
 
 
@@ -147,6 +165,9 @@ def main():
     p.add_argument('--server', default=os.environ.get('KVAF_CPU_SERVICE_ADDR'))
     p.add_argument('--device', type=int, default=int(os.environ.get('DEVICE_ID', '0')))
     p.add_argument('--output', type=Path, default=Path('random656-results'))
+    p.add_argument('--token-bytes', type=int, default=656)
+    p.add_argument('--working-tokens', type=int, default=0)
+    p.add_argument('--pattern', choices=('random', 'sorted', 'contiguous'), default='random')
     p.add_argument('--blocks', type=int, default=1024)
     p.add_argument('--warmup', type=int, default=3)
     p.add_argument('--iterations', type=int, default=20)
@@ -161,11 +182,13 @@ def main():
     args = p.parse_args()
     if args.summarize_only:
         summarize(args.output); return
-    if args.blocks < 256 or args.iterations < 1 or args.warmup < 0 or args.repeats < 1:
-        p.error('requires blocks>=256, iterations/repeats>=1, warmup>=0')
+    if args.blocks < 1 or args.token_bytes < 1 or args.iterations < 1 or args.warmup < 0 or args.repeats < 1:
+        p.error('requires blocks/token-bytes>=1, iterations/repeats>=1, warmup>=0')
     args.build = args.build.resolve()
     if args.result:
         case(args); return
+    if args.token_bytes != 656 or args.pattern != 'random' or args.working_tokens:
+        p.error('use locality_sweep.py for size/pattern/working-set experiments')
     jobs = [(repeat, *config) for repeat in range(args.repeats) for config in plan()]
     random.Random(args.seed).shuffle(jobs)
     if args.dry_run:
