@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+#include <dlfcn.h>
+
 #include "acl/acl.h"
 #include "batch_put_internal.h"
 #include "direct_hccp/direct_hccp_abi.h"
@@ -37,6 +39,48 @@ constexpr uint32_t kMaxDirectAivWorkers =
 
 using DirectHccpApi = hccp::DirectHccpApi;
 using DirectMemory = hccp::DirectMemory;
+
+struct ProcessTokenQueryInfo {
+  uint64_t address;
+  uint64_t bytes;
+  uint32_t token_id;
+  uint32_t token_value;
+};
+static_assert(sizeof(ProcessTokenQueryInfo) == 24U);
+
+// HCCL queries the runtime process token for ACL-owned HBM. This is an
+// opt-in comparison with the existing RA-registered token, not a replacement
+// for the V9 path. CANN's QUERY_PROCESS_TOKEN command is zero.
+static bool QueryAclProcessToken(void *address, uint64_t bytes,
+                                 uint32_t *token_id) {
+  if (token_id == nullptr || address == nullptr || bytes == 0U) return false;
+  void *library = dlopen("libruntime.so", RTLD_NOW | RTLD_LOCAL);
+  if (library == nullptr) {
+    std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_PROCESS_TOKEN_QUERY_FAILED phase=dlopen\n");
+    return false;
+  }
+  using QueryFn = int (*)(int, void *);
+  const auto query = reinterpret_cast<QueryFn>(dlsym(library, "rtUbDevQueryInfo"));
+  if (query == nullptr) {
+    std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_PROCESS_TOKEN_QUERY_FAILED phase=dlsym\n");
+    dlclose(library);
+    return false;
+  }
+  ProcessTokenQueryInfo info{reinterpret_cast<uint64_t>(address), bytes, 0U, 0U};
+  const int result = query(0, &info);
+  dlclose(library);
+  if (result != 0 || info.token_id < (1U << kTokenIdShift)) {
+    std::fprintf(stderr,
+                 "[KVAF_AIV] BATCH_PUT_PROCESS_TOKEN_QUERY_FAILED phase=query result=%d raw_token=0x%x\n",
+                 result, info.token_id);
+    return false;
+  }
+  *token_id = info.token_id >> kTokenIdShift;
+  std::fprintf(stderr,
+               "[KVAF_AIV] BATCH_PUT_PROCESS_TOKEN_READY raw_token_id=0x%x wqe_token_id=0x%x\n",
+               info.token_id, *token_id);
+  return true;
+}
 
 // A USER_CTL SQ/CQ is strictly single-producer/single-consumer from the AIV
 // kernel's point of view. Each core/Jetty slot therefore owns one complete
@@ -522,6 +566,21 @@ extern "C" int32_t KvafBatchPutLocalBufferAcquire(KvafBatchPutTransport *transpo
   candidate->transport = transport;
   candidate->input_hbm_address = input_address;
   candidate->input_hbm_bytes = input_device_bytes;
+  const char *token_source = std::getenv("KVAF_B12_LOCAL_HBM_TOKEN_SOURCE");
+  const bool use_process_token = token_source != nullptr &&
+      std::strcmp(token_source, "process") == 0;
+  if (token_source != nullptr && !use_process_token &&
+      std::strcmp(token_source, "ra") != 0) {
+    std::fprintf(stderr,
+                 "[KVAF_AIV] BATCH_PUT_LOCAL_TOKEN_SOURCE_INVALID value=%s\n",
+                 token_source);
+    return KVAF_BATCH_PUT_DIRECT_HCCP_ERROR;
+  }
+  uint32_t process_token_id = 0U;
+  if (use_process_token &&
+      !QueryAclProcessToken(input_device, input_device_bytes, &process_token_id)) {
+    return KVAF_BATCH_PUT_DIRECT_HCCP_ERROR;
+  }
   uint32_t token_id = 0U;
   if (!AllocateToken(transport->api, transport->device_context, "device_local_hbm",
                      &candidate->token_handle, &token_id) ||
@@ -541,9 +600,16 @@ extern "C" int32_t KvafBatchPutLocalBufferAcquire(KvafBatchPutTransport *transpo
   for (uint32_t entity_index = 0U; entity_index < transport->worker_count; ++entity_index) {
     entities[entity_index].local_hbm_address = input_address;
     entities[entity_index].local_hbm_size = input_device_bytes;
-    entities[entity_index].local_token_id = candidate->memory.token_id;
+    entities[entity_index].local_token_id =
+        use_process_token ? process_token_id : candidate->memory.token_id;
     entities[entity_index].local_token_value = candidate->memory.token_value;
   }
+  std::fprintf(stderr,
+               "[KVAF_AIV] BATCH_PUT_LOCAL_TOKEN_SOURCE source=%s "
+               "wqe_token_id=0x%x ra_token_id=0x%x\n",
+               use_process_token ? "process" : "ra_v9_default",
+               use_process_token ? process_token_id : candidate->memory.token_id,
+               candidate->memory.token_id);
   const uint64_t entity_bytes =
       static_cast<uint64_t>(transport->worker_count) * sizeof(entities.front());
   if (aclrtMalloc(&candidate->device_entities, entity_bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
