@@ -35,8 +35,8 @@ void Usage(const char* program) {
                "Usage: %s [--peer HOST:PORT] [--device-id N] [--kernel-json PATH] "
                "[--blocks N] [--block-bytes N] [--output-stride N] [--sgl-size N] "
                "[--warmup N] [--iterations N]\n"
-               "Defaults: output-stride=2*block-bytes, sgl-size=8 (range 1..8)\n",
-               program);
+               "Defaults: output-stride=2*block-bytes, sgl-size=%u (range 1..%u)\n",
+               program, kvaf::kGatherMaxSglSize, kvaf::kGatherMaxSglSize);
 }
 
 bool Parse(int argc, char** argv, Options* options) {

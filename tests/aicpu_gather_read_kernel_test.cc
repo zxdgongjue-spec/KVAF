@@ -67,7 +67,7 @@ int main() {
   args.output_spans = reinterpret_cast<std::uint64_t>(output_spans.data());
   args.output_extent = 133U;
   args.output_span_count = output_spans.size();
-  args.sgl_size = 8U;
+  args.sgl_size = kvaf::kGatherMaxSglSize;
   args.sequence = 1U;
   args.bytes = 48U;
 
@@ -75,7 +75,7 @@ int main() {
   std::thread hardware([&] {
     std::uint32_t producer = 60U;
     std::uint32_t completion = 0U;
-    while (producer < 67U && !stopped.load(std::memory_order_acquire)) {
+    while (producer < 68U && !stopped.load(std::memory_order_acquire)) {
       if (__atomic_load_n(&sq_doorbell, __ATOMIC_ACQUIRE) == producer) {
         std::this_thread::yield();
         continue;
@@ -128,8 +128,8 @@ int main() {
   assert(status.magic == kvaf::aicpu_urma::kGatherStatusMagic);
   assert(status.result == 0U && status.phase == 3U && status.ack_seen == 1U);
   assert(status.sequence == 1U && status.cqe_word == 4U);
-  assert(status.sq_producer_index == 67U && status.cq_consumer_index == 3U);
-  assert(sq_doorbell == 67U && cq_doorbell == 3U);
+  assert(status.sq_producer_index == 68U && status.cq_consumer_index == 3U);
+  assert(sq_doorbell == 68U && cq_doorbell == 3U);
   std::array<std::uint8_t, 256> expected{};
   expected.fill(0xa5U);
   std::size_t staging_offset = 0U;
@@ -141,9 +141,14 @@ int main() {
   assert(staging_offset == 48U);
   for (std::uint32_t index = 0U; index < args.output_extent; ++index)
     assert(output[index] == expected[index]);
+  args.sgl_size = kvaf::kGatherMaxSglSize + 1U;
+  const auto oversized_sgl_result = KvafAicpuUrmaGatherRead(&args);
+  assert(oversized_sgl_result != 0U);
+  assert(status.result == 2U && sq_doorbell == 68U);
+  args.sgl_size = kvaf::kGatherMaxSglSize;
   args.bytes = 100U;
   const auto invalid_result = KvafAicpuUrmaGatherRead(&args);
   assert(invalid_result != 0U);
-  assert(status.result == 2U && sq_doorbell == 67U);
+  assert(status.result == 2U && sq_doorbell == 68U);
   std::cout << "AICPU gather/read kernel simulation: PASS\n";
 }

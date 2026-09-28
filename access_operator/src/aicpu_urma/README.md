@@ -103,13 +103,14 @@ build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999
 ./build.sh aicpu-urma --install-kernel
 build-aicpu-urma/tests/kvaf_aicpu_gather_read_client \
   --peer CPU_HOST:28999 --device-id 0 \
-  --blocks 16 --block-bytes 4096 --output-stride 8192 --sgl-size 8 \
+  --blocks 16 --block-bytes 4096 --output-stride 8192 --sgl-size 6 \
   --warmup 1 --iterations 5
 ```
 
 客户端每轮 BatchPut 不同 payload 到 DDR，按 block 逆序生成 gather 清单，再用
 多 SGL READ 将数据写入原 block 顺序的稀疏 HBM 槽位；逐字节校验槽位及空隙，
-仅汇总 GatherRead 计时。`--sgl-size` 可设为 1 到 8，`--output-stride` 不得小于
+仅汇总 GatherRead 计时。UDMA READ 每个 WR 最多支持 6 个目标 SGE，
+`--sgl-size` 可设为 1 到 6，`--output-stride` 不得小于
 `--block-bytes`，默认是两倍 block 大小。客户端从保留 key 的 AccessTable 中选择连续
 staging，避免 LinkTo 探针轮转 slot 后与源块重叠；另保留控制区并占住其 slot，避免 MetaManager
 后续复用。调用 `NpuRuntime::GatherRead` 时，源地址与 staging 必须在注册 DDR

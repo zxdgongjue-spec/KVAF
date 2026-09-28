@@ -4,7 +4,7 @@
 
 namespace kvaf {
 
-constexpr std::uint32_t kGatherMaxSglSize = 8U;
+constexpr std::uint32_t kGatherMaxSglSize = 6U;
 
 struct GatherOutputSpan {
   std::uint64_t offset;

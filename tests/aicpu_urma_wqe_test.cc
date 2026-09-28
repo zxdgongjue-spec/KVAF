@@ -56,10 +56,10 @@ int main() {
   assert(kvaf::aicpu_urma::ScatterWqebbs(1U) == 1U);
   assert(kvaf::aicpu_urma::ScatterWqebbs(2U) == 2U);
   assert(kvaf::aicpu_urma::ScatterWqebbs(5U) == 2U);
-  assert(kvaf::aicpu_urma::ScatterWqebbs(8U) == 3U);
+  assert(kvaf::aicpu_urma::ScatterWqebbs(kvaf::kGatherMaxSglSize) == 3U);
   kvaf::aicpu_urma::ScatterTransfer scatter{};
   scatter.remote_address = 0x1122334455667788ULL;
-  scatter.sge_count = 8U;
+  scatter.sge_count = kvaf::kGatherMaxSglSize;
   for (std::uint32_t index = 0U; index < scatter.sge_count; ++index) {
     scatter.sges[index] = {0x200000000ULL + index * 4096U, 656U, 27U};
     scatter.bytes += 656U;
@@ -68,7 +68,7 @@ int main() {
   kvaf::aicpu_urma::EncodeScatterReadWqe(scatter_words, endpoint, scatter, 1U, true);
   assert(scatter_words[0] == 0xb03e0000U);
   assert(scatter_words[1] == kvaf::aicpu_urma::kReadOpcode << 8U);
-  assert(scatter_words[2] == 0x08345678U);
+  assert(scatter_words[2] == 0x06345678U);
   assert(scatter_words[10] == 0x55667788U && scatter_words[11] == 0x11223344U);
   for (std::uint32_t index = 0U; index < scatter.sge_count; ++index) {
     const auto base = 12U + index * 4U;
@@ -76,7 +76,7 @@ int main() {
     assert(scatter_words[base + 2U] == index * 4096U);
     assert(scatter_words[base + 3U] == 2U);
   }
-  for (std::uint32_t index = 44U; index < 48U; ++index)
+  for (std::uint32_t index = 36U; index < 48U; ++index)
     assert(scatter_words[index] == 0U);
   scatter.sge_count = 1U;
   kvaf::aicpu_urma::EncodeScatterReadWqe(scatter_words, endpoint, scatter, 0U, true);
