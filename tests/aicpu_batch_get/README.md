@@ -10,7 +10,7 @@ CSV 标注 `aicpu_memcpy` / `aicpu_memcpy_mt`，并输出请求与参与分片�
 
 ### 4096 × 656 B、多线程测试
 
-更新后需重新构建两端、安装 V3 kernel，并重启测试进程：
+更新后需重新构建两端、安装 V4 kernel，并重启测试进程：
 
 ```bash
 bash build.sh aicpu-cpu
@@ -33,8 +33,8 @@ bash tests/run_aicpu_get_cpu.sh --peer 127.0.0.1:29991 --device-id 4 \
 
 ### 实际运行核与 scatter 三段计时
 
-在 **NPU 端**增加 `--profile-scatter`，默认关闭。升级需重新编译并安装 V3 kernel，
-本次新增了 kernel 参数，独立的 V3 入口可避免旧 device `.so` 静默忽略诊断参数。
+在 **NPU 端**增加 `--profile-scatter`，默认关闭。升级需重新编译并安装 V4 kernel，
+本次新增了 kernel 参数，独立的 V4 入口可避免旧 device `.so` 静默忽略诊断参数。
 CPU 控制协议和原有 CSV 列保持不变。先启动 NPU 端：
 
 ```bash
@@ -89,11 +89,56 @@ affinity、核采样、线程 CPU 时钟分别报告 `affinity_errno`、`cpu_sam
 `avg_dispatch_us/avg_join_us` 不能视为纯锁开销，CSV 的 scatter 也会包含插桩开销。
 诊断后去掉 `--profile-scatter` 重跑性能基线。默认模式不执行这些额外采样或阶段计时。
 
+### blockDim 核探测与 multi-block scatter
+
+`--scatter-threads` 只是在**一个** AICPU block 内创建 pthread，不保证 pthread 会被
+AICPU 调度器放到不同物理核。先用独立 probe 验证 Runtime 对 `blockDim` 的实际调度；
+probe 不建立 CPU/NPU 通道，也不会触发远端 WRITE：
+
+```bash
+bash build.sh aicpu-npu
+bash tests/run_aicpu_get_npu.sh --install-kernel --device-id 7 \
+  --probe-aicpu-blocks 4 --probe-hold-ms 20
+```
+
+只有日志中的 `[AICPU_CORE_PROBE] SUMMARY` 同时满足
+`claimed=4 completed=4 distinct_cpus=4 max_overlap=4 multicore_ready=1`，才说明这台
+设备的 4 个 block 确实并发占用了 4 个不同的 AICPU CPU。每个 `BLOCK` 行还会给出
+开始/结束 tick、两个 `sched_getcpu()` 样本和允许的 affinity 集合。若
+`multicore_ready=0`，不要开启 multi-block；应先检查 AICPU 资源配额、CPU affinity
+和同设备上的其他 AICPU/HCOMM 负载。
+
+probe 通过后，将 NPU 服务切到 multi-block。`--aicpu-blocks N` 必须等于本轮
+`active_threads`，也就是 `min(--scatter-threads, 可用 64 B 行组数)`；这样每个 block
+恰好拥有一个不重叠的 scatter 区间。4096×656 B、4 路的例子：
+
+```bash
+# NPU 端：每一组测试重新启动一次
+bash tests/run_aicpu_get_npu.sh --device-id 7 --aicpu-blocks 4 \
+  --profile-scatter 2>&1 | tee aicpu-block4.log
+
+# CPU 端
+bash tests/run_aicpu_get_cpu.sh --peer 127.0.0.1:29991 --device-id 7 \
+  --rows 4096 --row-bytes 656 --scatter-threads 4 \
+  --remote-sgl-size 16 --jettys 4 --prepare-threads 4 \
+  --warmup 5 --iterations 1000 --output aicpu-block4.csv
+```
+
+multi-block 下 block 0 仍独占 request/done、tag 校验和每轮计时；其余 block 只执行
+自己的 invalidate、memcpy、clean。所有 block clean 完输出后 block 0 才发布下一轮，
+因此 staging 和输出正确性检查与单 block 模式相同。启动栅栏只有 1 秒：若 Runtime
+没有同时调度请求的 block，测试会返回 timeout，而不会在 CPU 通道上等待完整的每轮超时。
+`--aicpu-blocks 1` 保持原有 pthread 模式，适合做基线对比。
+
+在 multi-block 的 `--profile-scatter` 输出中，`WORKER id` 指 AICPU block/range，
+不再指 pthread。`cpu_parallelism`、三段计时和 `cpu_hits` 的定义保持不变；成功的
+multi-block 运行应与 probe 的核分布相互印证。
+
 统计逻辑的无设备测试：
 
 ```bash
-cmake --build build-aicpu-cpu --target kvaf_aicpu_scatter_profile_test
-ctest --test-dir build-aicpu-cpu -R '^kvaf_aicpu_scatter_profile$' --output-on-failure
+cmake --build build-aicpu-cpu --target kvaf_aicpu_scatter_profile_test kvaf_aicpu_core_probe_test
+ctest --test-dir build-aicpu-cpu -R '^kvaf_aicpu_(scatter_profile|core_probe)$' --output-on-failure
 ```
 
 ## 执行流程

@@ -1,4 +1,5 @@
 #include "npu_target.h"
+#include "core_probe_report.h"
 #include "metrics.h"
 #include "scatter_profile_report.h"
 
@@ -13,6 +14,9 @@ struct Options {
   std::uint32_t device{};
   bool has_device{};
   bool profile_scatter{};
+  std::uint32_t aicpu_blocks{1};
+  std::uint32_t probe_aicpu_blocks{};
+  std::uint32_t probe_hold_ms{20};
   std::uint16_t port{29991};
   std::string eid, json;
 };
@@ -30,9 +34,19 @@ Options Parse(int argc, char** argv) {
       o.device = n; o.has_device = true;
     } else if (flag == "--port") {
       const auto n = Number(value); Require(n > 0 && n <= UINT16_MAX, "invalid port"); o.port = n;
+    } else if (flag == "--aicpu-blocks") {
+      const auto n = Number(value); Require(n > 0 && n <= kMaxScatterThreads, "invalid AICPU block count");
+      o.aicpu_blocks = static_cast<std::uint32_t>(n);
+    } else if (flag == "--probe-aicpu-blocks") {
+      const auto n = Number(value); Require(n > 0 && n <= kMaxScatterThreads, "invalid probe block count");
+      o.probe_aicpu_blocks = static_cast<std::uint32_t>(n);
+    } else if (flag == "--probe-hold-ms") {
+      const auto n = Number(value); Require(n > 0 && n <= 5000, "invalid probe hold time");
+      o.probe_hold_ms = static_cast<std::uint32_t>(n);
     } else throw std::runtime_error("unknown option " + flag);
   }
   Require(!o.json.empty(), "--kernel-json PATH is required");
+  if (o.probe_aicpu_blocks) Require(o.has_device, "--probe-aicpu-blocks requires --device-id");
   return o;
 }
 struct DeviceBuffer {
@@ -49,25 +63,35 @@ class Kernel {
     if (stream_) aclrtDestroyStream(stream_);
     if (binary_) aclrtBinaryUnLoad(binary_);
   }
-  void Load(const std::string& json) {
+  void Load(const std::string& json, const char* name) {
     char path[PATH_MAX]; Require(realpath(json.c_str(), path), "kernel JSON not found");
     aclrtBinaryLoadOption option{};
     option.type = ACL_RT_BINARY_LOAD_OPT_CPU_KERNEL_MODE; option.value.cpuKernelMode = 0;
     aclrtBinaryLoadOptions options{}; options.numOpt = 1; options.options = &option;
     Acl(aclrtBinaryLoadFromFile(path, &options, &binary_), "load AICPU JSON");
-    Acl(aclrtBinaryGetFunction(binary_, kKernelName, &function_), "resolve AICPU function");
+    Acl(aclrtBinaryGetFunction(binary_, name, &function_), "resolve AICPU function");
     Acl(aclrtCreateStream(&stream_), "create AICPU stream");
   }
-  void Launch(const KernelArgs& args) {
+  void Launch(const KernelArgs& args, std::uint32_t block_dim) {
     Layout layout{}; Require(MakeLayout(args.config, &layout), "invalid launch shape");
+    Require(block_dim > 0 && block_dim <= kMaxScatterThreads, "invalid AICPU block count");
     aclrtLaunchKernelAttr attr{};
     attr.id = ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT;
     attr.value.timeout = static_cast<std::uint32_t>(
         std::min<std::uint64_t>(UINT32_MAX, layout.rounds * (args.config.timeout_ms / 1000 + 2) + 60));
     aclrtLaunchKernelCfg cfg{}; cfg.numAttrs = 1; cfg.attrs = &attr;
-    Acl(aclrtLaunchKernelWithHostArgs(function_, 1, stream_, &cfg,
+    Acl(aclrtLaunchKernelWithHostArgs(function_, block_dim, stream_, &cfg,
                                      const_cast<KernelArgs*>(&args), sizeof(args), nullptr, 0),
         "launch AICPU kernel");
+  }
+  void LaunchProbe(const CoreProbeArgs& args, std::uint32_t block_dim) {
+    Require(block_dim > 0 && block_dim <= kMaxScatterThreads, "invalid AICPU probe block count");
+    aclrtLaunchKernelAttr attr{};
+    attr.id = ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT;
+    attr.value.timeout = 60;
+    aclrtLaunchKernelCfg cfg{}; cfg.numAttrs = 1; cfg.attrs = &attr;
+    Acl(aclrtLaunchKernelWithHostArgs(function_, block_dim, stream_, &cfg,
+        const_cast<CoreProbeArgs*>(&args), sizeof(args), nullptr, 0), "launch AICPU core probe");
   }
   aclError Synchronize() { return aclrtSynchronizeStream(stream_); }
  private:
@@ -97,20 +121,32 @@ void ValidateOutput(const Config& c, const Layout& l, const DeviceBuffer& output
 }
 
 Report Execute(int fd, const Config& config, NpuTarget& target, const std::string& json,
-               bool profile_scatter) {
+               bool profile_scatter, std::uint32_t aicpu_blocks) {
   Layout layout{}; Require(MakeLayout(config, &layout), "invalid config");
-  DeviceBuffer output, samples, result, profile;
+  const auto active_threads = ActiveThreads(config);
+  Require(aicpu_blocks == 1 || aicpu_blocks == active_threads,
+          "--aicpu-blocks must equal active scatter ranges; use --aicpu-blocks 1 for pthread mode");
+  DeviceBuffer output, samples, result, profile, coordination;
   output.Allocate(layout.output_bytes, 0xA5);
   samples.Allocate(config.iterations * sizeof(Sample));
   result.Allocate(sizeof(KernelResult));
   if (profile_scatter) profile.Allocate(sizeof(ScatterProfile));
-  Kernel kernel; kernel.Load(json);
+  if (aicpu_blocks > 1) {
+    const auto host_coordination = MakeMultiBlockCoordination(active_threads);
+    coordination.Allocate(sizeof(host_coordination));
+    Acl(aclrtMemcpy(coordination.data, sizeof(host_coordination), &host_coordination,
+                    sizeof(host_coordination), ACL_MEMCPY_HOST_TO_DEVICE), "initialize multi-block coordination");
+  }
+  Kernel kernel; kernel.Load(json, kKernelName);
   KernelArgs args{reinterpret_cast<std::uint64_t>(target.memory()),
                   reinterpret_cast<std::uint64_t>(output.data),
                   reinterpret_cast<std::uint64_t>(samples.data),
                   reinterpret_cast<std::uint64_t>(result.data), config,
-                  reinterpret_cast<std::uint64_t>(profile.data)};
-  kernel.Launch(args);
+                  reinterpret_cast<std::uint64_t>(profile.data),
+                  reinterpret_cast<std::uint64_t>(coordination.data)};
+  std::fprintf(stderr, "AICPU_GET_NPU LAUNCH mode=%s block_dim=%u active_scatter_ranges=%u\n",
+               aicpu_blocks == 1 ? "pthread" : "multi-block", aicpu_blocks, active_threads);
+  kernel.Launch(args, aicpu_blocks);
   // Once launched, do not unwind allocations until both device execution and
   // CPU transport have stopped. A lost control connection requires retaining
   // the process/resources for operator intervention, not eager buffer free.
@@ -254,9 +290,38 @@ void HandleConfigure(int fd, const kvaf::peer::MessageHeader& header, CandidateR
   Send(fd, &response, sizeof(response));
 }
 
+void RunCoreProbe(const Options& options) {
+  Acl(aclrtSetDevice(options.device), "select AICPU probe device");
+  CoreProbeResult host_result{};
+  host_result.requested_blocks = options.probe_aicpu_blocks;
+  DeviceBuffer device_result;
+  device_result.Allocate(sizeof(host_result));
+  Acl(aclrtMemcpy(device_result.data, sizeof(host_result), &host_result, sizeof(host_result),
+                  ACL_MEMCPY_HOST_TO_DEVICE), "initialize AICPU core probe");
+  Kernel kernel;
+  kernel.Load(options.json, kCoreProbeKernelName);
+  const CoreProbeArgs args{reinterpret_cast<std::uint64_t>(device_result.data),
+                           options.probe_hold_ms, options.probe_aicpu_blocks};
+  std::fprintf(stderr, "AICPU_GET_NPU CORE_PROBE device-id=%u block_dim=%u hold_ms=%u\n",
+               options.device, options.probe_aicpu_blocks, options.probe_hold_ms);
+  kernel.LaunchProbe(args, options.probe_aicpu_blocks);
+  Acl(kernel.Synchronize(), "synchronize AICPU core probe");
+  Acl(aclrtMemcpy(&host_result, sizeof(host_result), device_result.data, sizeof(host_result),
+                  ACL_MEMCPY_DEVICE_TO_HOST), "read AICPU core probe");
+  PrintCoreProbe(stderr, host_result, options.probe_aicpu_blocks);
+  Require(host_result.status == Result::kOk &&
+          host_result.claimed == options.probe_aicpu_blocks &&
+          host_result.completed == options.probe_aicpu_blocks,
+          "AICPU core probe did not run every requested block");
+  if (CoreProbeDistinctCpus(host_result) < options.probe_aicpu_blocks ||
+      CoreProbeMaxOverlap(host_result) < options.probe_aicpu_blocks)
+    std::fprintf(stderr, "[AICPU_CORE_PROBE] MULTICORE_NOT_READY: blockDim completed but blocks did not overlap on distinct CPUs\n");
+}
+
 void Run(const Options& options) {
   Socket listener(Listen(options.port));
-  std::fprintf(stderr, "AICPU_GET_NPU listening port=%u engine=aicpu_memcpy\n", options.port);
+  std::fprintf(stderr, "AICPU_GET_NPU listening port=%u engine=aicpu_memcpy aicpu_blocks=%u\n",
+               options.port, options.aicpu_blocks);
   CandidateResolver resolver(options);
   std::unique_ptr<NpuTarget> target;
   Config config{};
@@ -290,8 +355,12 @@ void Run(const Options& options) {
     }
     Require(kvaf::peer::IsValidHeader(header, kStart, sizeof(header)), "expected START");
     Report report{};
-    try { report = Execute(fd.get(), config, *target, options.json, options.profile_scatter); }
-    catch (const std::exception& e) { std::fprintf(stderr, "NPU benchmark failed: %s\n", e.what()); }
+    try { report = Execute(fd.get(), config, *target, options.json, options.profile_scatter,
+                           options.aicpu_blocks); }
+    catch (const std::exception& e) {
+      report.status = 1;
+      std::fprintf(stderr, "NPU benchmark failed: %s\n", e.what());
+    }
     Send(fd.get(), &report, sizeof(report));
     Require(report.status == 0, "benchmark failed");
     std::fprintf(stderr, "AICPU_GET_NPU PASS mean_ns=%.1f e2e_GBps=%.6f\n", report.mean_ns, report.gbps);
@@ -304,7 +373,7 @@ int main(int argc, char** argv) {
   try {
     const auto options = Parse(argc, argv);
     Acl(aclInit(nullptr), "aclInit");
-    Run(options);
+    if (options.probe_aicpu_blocks) RunCoreProbe(options); else Run(options);
     Acl(aclFinalize(), "aclFinalize");
     return 0;
   }

@@ -5,8 +5,11 @@
 
 namespace kvaf::aicpu_test {
 constexpr std::uint64_t kMagic = 0x4b56414641424732ULL;
-constexpr char kKernelName[] = "KvafAicpuBatchGetV3";
-constexpr std::uint64_t kKernelRevision = 3;
+constexpr char kKernelName[] = "KvafAicpuBatchGetV4";
+constexpr std::uint64_t kKernelRevision = 4;
+constexpr char kCoreProbeKernelName[] = "KvafAicpuCoreProbeV1";
+constexpr std::uint64_t kCoreProbeMagic = 0x4b564146434f5231ULL;
+constexpr std::uint64_t kCoreProbeRevision = 1;
 constexpr std::uint64_t kMaxScatterThreads = 32;
 constexpr std::uint64_t kRequestOffset = 0;
 constexpr std::uint64_t kDoneOffset = 256;
@@ -85,7 +88,80 @@ struct KernelArgs {
   Config config;
   // Optional device-side profiling buffer; zero keeps the normal timing path.
   std::uint64_t profile;
+  // Zero selects the legacy single-block pthread scatter implementation.
+  // A nonzero pointer selects one AICPU block per scatter range.
+  std::uint64_t coordination;
 };
+
+// Each coordination value occupies a separate cache line. Multi-block scatter
+// has several independent producers/consumers on every round, so sharing a
+// cache line here would itself serialize the blocks being measured.
+struct alignas(64) CoordinationWord {
+  std::uint64_t value{};
+  std::uint64_t reserved[7]{};
+};
+struct alignas(64) MultiBlockCoordination {
+  std::uint64_t magic{kMagic};
+  std::uint64_t revision{kKernelRevision};
+  std::uint64_t workers{};
+  std::uint64_t reserved[5]{};
+  CoordinationWord claimed, ready, initialized, profile_ready;
+  CoordinationWord request_sequence, request_start, ready_tick, scatter_done, arrivals;
+  CoordinationWord round_complete, profile_flushed, exited;
+  CoordinationWord status, failure_sequence;
+};
+
+inline bool IsValidMultiBlockCoordination(const MultiBlockCoordination& c,
+                                          std::uint32_t expected_workers) {
+  return c.magic == kMagic && c.revision == kKernelRevision &&
+      expected_workers != 0 && expected_workers <= kMaxScatterThreads &&
+      c.workers == expected_workers;
+}
+inline MultiBlockCoordination MakeMultiBlockCoordination(std::uint32_t workers) {
+  MultiBlockCoordination c{};
+  c.workers = workers;
+  return c;
+}
+
+// The probe launches N blocks of a second, self-contained AICPU entry. Each
+// block records its actual scheduler CPU before and after a fixed hold period.
+// It never opens the CPU/NPU transport, so it is safe to run before a test.
+struct alignas(64) CoreProbeSlot {
+  std::uint64_t slot{};
+  std::uint64_t start_tick{};
+  std::uint64_t finish_tick{};
+  std::uint64_t affinity_errno{};
+  std::uint64_t cpu_sample_errors{};
+  std::uint64_t cpu_sample_errno{};
+  std::uint64_t cpu_out_of_range{};
+  std::int64_t first_cpu{-1};
+  std::int64_t last_cpu{-1};
+  std::uint64_t allowed_cpus[16]{};
+  std::uint64_t reserved[7]{};
+};
+struct alignas(64) CoreProbeResult {
+  std::uint64_t magic{kCoreProbeMagic};
+  std::uint64_t revision{kCoreProbeRevision};
+  std::uint64_t requested_blocks{};
+  std::uint64_t hold_ticks{};
+  std::uint64_t counter_frequency{};
+  Result status{Result::kPending};
+  std::uint64_t claimed{};
+  std::uint64_t completed{};
+  CoreProbeSlot slot[kMaxScatterThreads];
+};
+struct CoreProbeArgs {
+  std::uint64_t result{};
+  std::uint64_t hold_ms{};
+  std::uint64_t requested_blocks{};
+};
+
+inline bool IsValidCoreProbeResult(const CoreProbeResult& r,
+                                   std::uint32_t requested_blocks) {
+  return r.magic == kCoreProbeMagic && r.revision == kCoreProbeRevision &&
+      requested_blocks != 0 && requested_blocks <= kMaxScatterThreads &&
+      r.requested_blocks == requested_blocks;
+}
 
 // Nontrivial row/byte pattern plus a changing per-round header detects stale
 // data. CPU updates only the 8-byte header of each source row per round.
@@ -120,5 +196,6 @@ inline RowRange ScatterRange(const Config& c, std::uint32_t worker, std::uint32_
 }
 static_assert(sizeof(Config) == 56 && sizeof(Control) == 64);
 static_assert(sizeof(Sample) == 24 && sizeof(KernelResult) == 64);
-static_assert(sizeof(KernelArgs) == 96);
+static_assert(sizeof(KernelArgs) == 104 && sizeof(CoordinationWord) == 64);
+static_assert(sizeof(CoreProbeSlot) == 256 && sizeof(CoreProbeArgs) == 24);
 }  // namespace kvaf::aicpu_test

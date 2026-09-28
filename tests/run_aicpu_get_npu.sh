@@ -19,6 +19,9 @@ Wrapper options:
 
 Pass-through options: --port 29991 --device-id 0 --eid HEX --kernel-json PATH
   --profile-scatter   Report AICPU CPU placement and scatter phase timing after the run
+  --probe-aicpu-blocks N [--probe-hold-ms 20]
+                      Standalone blockDim-to-core probe; requires --device-id and exits
+  --aicpu-blocks N    Use N AICPU blocks for scatter; N must equal active scatter ranges
 Without --device-id, use the CPU request's NPU device ID. With it, reject a mismatch.
 The built kernel JSON is selected automatically. No installation by default.
 Set --rows, --row-bytes and --scatter-threads on the CPU script.

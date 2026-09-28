@@ -5,6 +5,8 @@ target_link_libraries(kvaf_aicpu_get_protocol_test PRIVATE kvaf_peer_link Thread
 add_test(NAME kvaf_aicpu_get_protocol COMMAND kvaf_aicpu_get_protocol_test)
 add_executable(kvaf_aicpu_scatter_profile_test scatter_profile_test.cc)
 add_test(NAME kvaf_aicpu_scatter_profile COMMAND kvaf_aicpu_scatter_profile_test)
+add_executable(kvaf_aicpu_core_probe_test core_probe_test.cc)
+add_test(NAME kvaf_aicpu_core_probe COMMAND kvaf_aicpu_core_probe_test)
 
 if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   add_executable(kvaf_aicpu_get_cpu cpu_main.cc)
