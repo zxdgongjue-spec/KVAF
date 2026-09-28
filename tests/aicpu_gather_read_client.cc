@@ -2,13 +2,13 @@
 #include "peer_protocol.h"
 #include "aicpu_urma_client_metrics.h"
 #include "aicpu_urma_client_options.h"
+#include "aicpu_gather_read_layout.h"
 
 #include "acl/acl.h"
 
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
-#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -109,19 +109,12 @@ struct DeviceBuffer {
   std::size_t bytes;
 };
 
-std::size_t ReservedSlots(const Options& options) {
-  const std::size_t page_slots = 4096U / std::gcd<std::size_t>(options.block_bytes, 4096U);
-  const std::size_t minimum =
-      (std::size_t{128U} + options.block_bytes - 1U) / options.block_bytes;
-  const std::size_t used = 2U * options.blocks + minimum;
-  return minimum + (page_slots - used % page_slots) % page_slots;
-}
-
 double RunRound(kvaf::NpuRuntime* runtime, aclrtStream stream, const Options& options,
                 DeviceBuffer* input, DeviceBuffer* output,
                 std::vector<std::uint8_t>* host_input,
                 std::vector<std::uint8_t>* host_output,
-                std::vector<kvaf::KeyId>* reserved_keys, std::uint64_t round) {
+                std::vector<kvaf::KeyId>* reserved_keys,
+                std::uint64_t* staging_address, std::uint64_t round) {
   const std::size_t payload = host_input->size();
   for (std::size_t byte = 0U; byte < payload; ++byte)
     (*host_input)[byte] = static_cast<std::uint8_t>((byte * 131U + round * 29U) & 0xffU);
@@ -137,7 +130,8 @@ double RunRound(kvaf::NpuRuntime* runtime, aclrtStream stream, const Options& op
   put.groups.push_back(std::move(group));
   Check(runtime->core().BatchPut(put, kvaf::BatchPutExecutionOptions{stream}), "BatchPut");
   if (round == 0U) {
-    const std::size_t reserve_slots = ReservedSlots(options);
+    const std::size_t reserve_slots = kvaf::aicpu_gather_read_client::ReservedSlots(
+        options.blocks, options.block_bytes);
     kvaf::BatchPutGroup reserved;
     reserved.input = {input->data, input->bytes, kvaf::DeviceKind::kNpu};
     for (std::size_t index = 0U; index < options.blocks + reserve_slots; ++index) {
@@ -151,6 +145,29 @@ double RunRound(kvaf::NpuRuntime* runtime, aclrtStream stream, const Options& op
     reservation.groups.push_back(std::move(reserved));
     Check(runtime->core().BatchPut(reservation, kvaf::BatchPutExecutionOptions{stream}),
           "ReserveGatherStaging");
+    kvaf::AccessTableHandle reserved_handle{};
+    Check(runtime->core().PrepareAccessTable({*reserved_keys}, &reserved_handle),
+          "PrepareReservedAccessTable");
+    kvaf::AccessTableView reserved_view{};
+    Check(runtime->core().GetAccessTableView(reserved_handle, &reserved_view),
+          "GetReservedAccessTableView");
+    if (reserved_view.size != reserved_keys->size())
+      throw std::runtime_error("reserved AccessTable size mismatch");
+    std::vector<std::uint64_t> reserved_addresses;
+    reserved_addresses.reserve(reserved_view.size);
+    for (std::size_t index = 0U; index < reserved_view.size; ++index) {
+      if (reserved_view.valid[index] != 1U ||
+          reserved_view.lengths[index] != options.block_bytes)
+        throw std::runtime_error("reserved AccessTable entry is invalid");
+      reserved_addresses.push_back(reserved_view.addresses[index]);
+    }
+    const auto region = runtime->core().remote_region();
+    if (!kvaf::aicpu_gather_read_client::SelectStagingAddress(
+            region.base, region.length, options.block_bytes, options.blocks,
+            std::move(reserved_addresses), staging_address))
+      throw std::runtime_error("no contiguous staging span outside the DDR control area");
+    Check(runtime->core().ReleaseAccessTable(reserved_handle),
+          "ReleaseReservedAccessTable");
   }
   kvaf::AccessTableHandle handle{};
   Check(runtime->core().PrepareAccessTable({put.groups.front().keys}, &handle),
@@ -158,17 +175,22 @@ double RunRound(kvaf::NpuRuntime* runtime, aclrtStream stream, const Options& op
   kvaf::AccessTableView view{};
   Check(runtime->core().GetAccessTableView(handle, &view), "GetAccessTableView");
   const auto region = runtime->core().remote_region();
+  if (view.size != options.blocks || *staging_address == 0U)
+    throw std::runtime_error("source AccessTable or staging address is invalid");
   kvaf::CpuGatherReadRequest gather;
-  gather.staging_address = region.base + payload;
+  gather.staging_address = *staging_address;
   gather.output = {output->data, output->bytes, kvaf::DeviceKind::kNpu};
   gather.stream = stream;
   for (std::size_t block = options.blocks; block != 0U; --block) {
     const auto address = view.addresses[block - 1U];
-    if (view.valid[block - 1U] != 1U || view.lengths[block - 1U] != options.block_bytes ||
-        !kvaf::peer::GatherRange(region.base, payload, address, options.block_bytes))
-      throw std::runtime_error("source block is outside the reserved DDR source half");
+    if (view.valid[block - 1U] != 1U || view.lengths[block - 1U] != options.block_bytes)
+      throw std::runtime_error("source AccessTable entry is invalid");
     gather.spans.push_back({address, options.block_bytes, 0U});
   }
+  std::uint32_t gathered_bytes = 0U;
+  if (!kvaf::peer::ValidateGather(region.base, region.length, gather.staging_address,
+                                  gather.spans, &gathered_bytes) || gathered_bytes != payload)
+    throw std::runtime_error("source blocks overlap staging or DDR control area");
   const auto begin = std::chrono::steady_clock::now();
   Check(runtime->GatherRead(gather), "GatherRead");
   const auto end = std::chrono::steady_clock::now();
@@ -196,7 +218,9 @@ int Run(const Options& options) {
   DeviceBuffer output(((payload + 63U) & ~std::size_t{63U}) + 64U);
   std::vector<std::uint8_t> host_input(payload), host_output(payload);
   std::vector<kvaf::KeyId> reserved_keys;
-  const std::size_t reserve_slots = ReservedSlots(options);
+  std::uint64_t staging_address = 0U;
+  const std::size_t reserve_slots = kvaf::aicpu_gather_read_client::ReservedSlots(
+      options.blocks, options.block_bytes);
   kvaf::NpuRuntimeOptions runtime_options("", options.block_bytes, 1U);
   runtime_options.aicpu_urma_kernel_json_path = options.kernel_json;
   runtime_options.device_id = options.device_id;
@@ -211,7 +235,8 @@ int Run(const Options& options) {
   for (std::uint64_t round = 0U;
        round < static_cast<std::uint64_t>(options.warmup) + options.iterations; ++round) {
     const double elapsed = RunRound(&runtime, acl.stream, options, &input, &output,
-                                    &host_input, &host_output, &reserved_keys, round);
+                                    &host_input, &host_output, &reserved_keys,
+                                    &staging_address, round);
     if (round >= options.warmup) samples.push_back(elapsed);
   }
   Check(runtime.core().BatchFree({reserved_keys}), "ReleaseGatherStaging");

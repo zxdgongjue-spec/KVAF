@@ -11,6 +11,11 @@ add_executable(kvaf_cpu_gather_test cpu_gather_test.cc)
 target_include_directories(kvaf_cpu_gather_test PRIVATE "${CMAKE_SOURCE_DIR}/runtime/include")
 add_test(NAME kvaf_cpu_gather COMMAND kvaf_cpu_gather_test)
 
+add_executable(kvaf_aicpu_gather_read_layout_test aicpu_gather_read_layout_test.cc)
+target_include_directories(kvaf_aicpu_gather_read_layout_test PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/runtime/include")
+add_test(NAME kvaf_aicpu_gather_read_layout COMMAND kvaf_aicpu_gather_read_layout_test)
+
 add_executable(kvaf_aicpu_urma_kernel_test aicpu_urma_kernel_test.cc
   "${CMAKE_SOURCE_DIR}/access_operator/src/aicpu_urma/kernel.cc")
 target_compile_definitions(kvaf_aicpu_urma_kernel_test PRIVATE KVAF_AICPU_URMA_HOST_TEST=1)

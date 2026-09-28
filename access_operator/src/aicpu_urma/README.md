@@ -44,7 +44,7 @@ CANN 路径查找 AICPU JSON，并使用单 worker、单 Jetty；无需配置 `C
 服务端仍是 KVAF 原有 CPU Runtime 服务。
 
 Host 单测（含部署脚本的本地模拟测试）：
-`ctest --test-dir build-aicpu-urma -R 'kvaf_aicpu_urma_|kvaf_aicpu_gather_read_kernel|kvaf_cpu_gather' --output-on-failure`。
+`ctest --test-dir build-aicpu-urma -R 'kvaf_aicpu_urma_|kvaf_aicpu_gather_read_|kvaf_cpu_gather' --output-on-failure`。
 无需 CANN 的机器也可编译并运行 WQE、gather 和内核握手单测。
 
 真实 CPU/NPU 回读测试：CPU 端先运行 `./build.sh cpu` 和
@@ -101,8 +101,8 @@ build-aicpu-urma/tests/kvaf_aicpu_gather_read_client \
 ```
 
 客户端每轮 BatchPut 不同 payload 到 DDR，按 block 逆序生成 gather 清单，校验连续
-HBM 输出；仅汇总 GatherRead 计时。分配布局为源数据、等长 staging、至少
-128 字节的控制预留，并用保留 key 占住 staging/控制 slot，避免 MetaManager
+HBM 输出；仅汇总 GatherRead 计时。客户端从保留 key 的 AccessTable 中选择连续
+staging，避免 LinkTo 探针轮转 slot 后与源块重叠；另保留控制区并占住其 slot，避免 MetaManager
 后续复用。调用 `NpuRuntime::GatherRead` 时，源地址与 staging 必须在注册 DDR
 范围内且不重叠，末尾 64 字节控制区不可用于 KV slot。输出 HBM 需要额外的
 64 字节对齐 scratch 空间；数据本身从输出基址开始。一个 region 同时只允许
