@@ -67,7 +67,7 @@ int main() {
   args.output_spans = reinterpret_cast<std::uint64_t>(output_spans.data());
   args.output_extent = 133U;
   args.output_span_count = output_spans.size();
-  args.sgl_size = kvaf::kGatherMaxSglSize;
+  args.sgl_size = kvaf::kGatherMaxSglSize + 2U;
   args.sequence = 1U;
   args.bytes = 48U;
 
@@ -108,6 +108,7 @@ int main() {
         assert(opcode == kvaf::aicpu_urma::kReadOpcode);
         std::uint64_t remote_address = address(words[10], words[11]);
         const auto sge_count = words[2] >> 24U;
+        assert(sge_count <= kvaf::kGatherMaxSglSize);
         for (std::uint32_t index = 0U; index < sge_count; ++index) {
           const auto offset = 12U + index * 4U;
           assert(words[offset + 1U] == entity.local_token_id);
@@ -151,9 +152,9 @@ int main() {
   assert(staging_offset == 48U);
   for (std::uint32_t index = 0U; index < args.output_extent; ++index)
     assert(output[index] == expected[index]);
-  args.sgl_size = kvaf::kGatherMaxSglSize + 1U;
-  const auto oversized_sgl_result = KvafAicpuUrmaGatherRead(&args);
-  assert(oversized_sgl_result != 0U);
+  args.sgl_size = 0U;
+  const auto invalid_sgl_result = KvafAicpuUrmaGatherRead(&args);
+  assert(invalid_sgl_result != 0U);
   assert(status.result == 2U && sq_doorbell == 68U);
   args.sgl_size = kvaf::kGatherMaxSglSize;
   args.bytes = 100U;

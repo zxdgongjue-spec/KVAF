@@ -11,9 +11,10 @@ namespace {
 
 void PrintUsage(const char* program) {
   std::fprintf(stderr,
-               "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] [--gather-threads N]\n"
+               "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] [--gather-threads N] [--gather-mode active|passive] [--gather-affinity on|off]\n"
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
-               "candidates are discovered automatically. Gather threads default to auto (up to 32). "
+               "candidates are discovered automatically. Gather threads default to auto (up to 32), "
+               "mode to active, affinity to on. "
                "The service requires only liburma and /dev/uburma.\n",
                program);
 }
@@ -40,7 +41,8 @@ int main(int argc, char** argv) {
       return 0;
     }
     if ((argument == "--listen" || argument == "--port" || argument == "--ub-device" ||
-         argument == "--eid-index" || argument == "--gather-threads") &&
+         argument == "--eid-index" || argument == "--gather-threads" ||
+         argument == "--gather-mode" || argument == "--gather-affinity") &&
         index + 1 >= argc) {
       PrintUsage(argv[0]);
       return 2;
@@ -70,6 +72,20 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "invalid --gather-threads (expected 1..64)\n");
         return 2;
       }
+    } else if (argument == "--gather-affinity") {
+      const std::string value(argv[++index]);
+      if (value != "on" && value != "off") {
+        std::fprintf(stderr, "invalid --gather-affinity (expected on|off)\n");
+        return 2;
+      }
+      cpu_options.gather_affinity = value == "on";
+    } else if (argument == "--gather-mode") {
+      const std::string value(argv[++index]);
+      if (value != "active" && value != "passive") {
+        std::fprintf(stderr, "invalid --gather-mode (expected active|passive)\n");
+        return 2;
+      }
+      cpu_options.gather_active = value == "active";
     } else {
       PrintUsage(argv[0]);
       return 2;

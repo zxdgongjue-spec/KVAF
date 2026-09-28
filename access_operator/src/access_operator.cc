@@ -580,7 +580,7 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
   if (request.output.device != DeviceKind::kNpu || !request.output.valid() ||
       request.stream == nullptr || request.bytes == 0U ||
       request.output_spans == nullptr || request.output_span_count == 0U ||
-      request.sgl_size == 0U || request.sgl_size > kGatherMaxSglSize ||
+      request.sgl_size == 0U ||
       request.output_extent > UINT64_MAX - 63U)
     return InvalidArgument("GatherRead output requires a valid SGL and 64-byte HBM scratch");
   const std::uint64_t scratch_offset =

@@ -12,6 +12,14 @@
 #include <thread>
 #include <vector>
 
+#if defined(__linux__)
+#include <cerrno>
+#include <cstdio>
+#include <sched.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 namespace kvaf::peer {
 
 inline void GatherCacheLine(const void* address, bool invalidate) {
@@ -42,13 +50,21 @@ inline void GatherSpinPause() {
 #endif
 }
 
+enum class GatherWaitMode { kActive, kPassive };
+
 class CpuGatherTeam {
  public:
   CpuGatherTeam(void* memory, std::uint64_t base, std::size_t max_threads,
-                std::size_t min_bytes_per_thread = 256U * 1024U)
+                std::size_t min_bytes_per_thread = 256U * 1024U,
+                GatherWaitMode wait_mode = GatherWaitMode::kPassive,
+                bool bind_cores = false)
       : memory_(static_cast<std::uint8_t*>(memory)), base_(base),
-        max_threads_(std::max<std::size_t>(1U, max_threads)),
-        min_bytes_per_thread_(std::max<std::size_t>(1U, min_bytes_per_thread)) {}
+        cpu_ids_(bind_cores ? AllowedCpus() : std::vector<int>{}),
+        max_threads_(std::min(std::max<std::size_t>(1U, max_threads),
+                              cpu_ids_.empty() ? std::max<std::size_t>(1U, max_threads)
+                                               : cpu_ids_.size())),
+        min_bytes_per_thread_(std::max<std::size_t>(1U, min_bytes_per_thread)),
+        wait_mode_(wait_mode) {}
 
   ~CpuGatherTeam() {
     stopping_.store(true, std::memory_order_release);
@@ -58,6 +74,28 @@ class CpuGatherTeam {
 
   CpuGatherTeam(const CpuGatherTeam&) = delete;
   CpuGatherTeam& operator=(const CpuGatherTeam&) = delete;
+
+  std::size_t max_threads() const { return max_threads_; }
+
+  void BindWorker(std::size_t worker) const {
+#if defined(__linux__)
+    const long tid = syscall(SYS_gettid);
+    if (worker >= cpu_ids_.size()) {
+      std::fprintf(stderr, "[KVAF_CPU] GATHER_THREAD worker=%zu tid=%ld cpu=%d pinned=0\n",
+                   worker, tid, sched_getcpu());
+      return;
+    }
+    cpu_set_t mask{};
+    CPU_ZERO(&mask);
+    CPU_SET(cpu_ids_[worker], &mask);
+    const int result = sched_setaffinity(0, sizeof(mask), &mask);
+    std::fprintf(stderr,
+                 "[KVAF_CPU] GATHER_THREAD worker=%zu tid=%ld cpu=%d pinned=%d error=%d\n",
+                 worker, tid, cpu_ids_[worker], result == 0, result == 0 ? 0 : errno);
+#else
+    (void)worker;
+#endif
+  }
 
   std::size_t Prepare(std::uint64_t staging, const std::vector<GatherSpan>& spans,
                       std::uint32_t total_bytes) {
@@ -77,7 +115,7 @@ class CpuGatherTeam {
     offsets_.push_back(0U);
     for (const auto& span : spans) offsets_.push_back(offsets_.back() + span.length);
     phase_.store(0U, std::memory_order_release);
-    ++generation_;
+    generation_.fetch_add(1U, std::memory_order_release);
     lock.unlock();
     ready_.notify_all();
     return threads;
@@ -91,6 +129,17 @@ class CpuGatherTeam {
   static constexpr std::uint32_t kInvalidatePhase = 1U;
   static constexpr std::uint32_t kCopyPhase = 2U;
   static constexpr std::uint32_t kFlushPhase = 3U;
+
+  static std::vector<int> AllowedCpus() {
+    std::vector<int> cpus;
+#if defined(__linux__)
+    cpu_set_t mask{};
+    if (sched_getaffinity(0, sizeof(mask), &mask) == 0)
+      for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+        if (CPU_ISSET(cpu, &mask)) cpus.push_back(cpu);
+#endif
+    return cpus;
+  }
 
   std::uint64_t Boundary(std::size_t index) const {
     if (index == 0U) return 0U;
@@ -149,17 +198,32 @@ class CpuGatherTeam {
   }
 
   void RunHelper(std::size_t worker) {
+    BindWorker(worker);
     std::uint64_t observed_generation = 0U;
+    bool was_active = false;
     for (;;) {
-      std::unique_lock<std::mutex> lock(mutex_);
-      ready_.wait(lock, [this, &observed_generation] {
-        return stopping_.load(std::memory_order_acquire) ||
-               generation_ != observed_generation;
-      });
-      if (stopping_.load(std::memory_order_acquire)) return;
-      observed_generation = generation_;
-      const bool active = worker < active_threads_;
-      lock.unlock();
+      bool active = false;
+      if (wait_mode_ == GatherWaitMode::kActive && was_active) {
+        std::uint64_t generation = generation_.load(std::memory_order_acquire);
+        while (generation == observed_generation) {
+          if (stopping_.load(std::memory_order_acquire)) return;
+          GatherSpinPause();
+          generation = generation_.load(std::memory_order_acquire);
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        observed_generation = generation_.load(std::memory_order_acquire);
+        active = worker < active_threads_;
+      } else {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ready_.wait(lock, [this, &observed_generation] {
+          return stopping_.load(std::memory_order_acquire) ||
+                 generation_.load(std::memory_order_acquire) != observed_generation;
+        });
+        if (stopping_.load(std::memory_order_acquire)) return;
+        observed_generation = generation_.load(std::memory_order_acquire);
+        active = worker < active_threads_;
+      }
+      was_active = active;
       if (!active) continue;
       for (std::uint32_t expected = kInvalidatePhase;
            expected <= kFlushPhase; ++expected) {
@@ -175,12 +239,14 @@ class CpuGatherTeam {
 
   std::uint8_t* memory_;
   std::uint64_t base_;
+  std::vector<int> cpu_ids_;
   std::size_t max_threads_;
   std::size_t min_bytes_per_thread_;
+  GatherWaitMode wait_mode_;
   std::vector<std::thread> helpers_;
   std::mutex mutex_;
   std::condition_variable ready_;
-  std::uint64_t generation_{0U};
+  std::atomic<std::uint64_t> generation_{0U};
   const std::vector<GatherSpan>* spans_{nullptr};
   std::uint8_t* staging_{nullptr};
   std::uint64_t total_bytes_{0U};

@@ -35,7 +35,8 @@ void Usage(const char* program) {
                "Usage: %s [--peer HOST:PORT] [--device-id N] [--kernel-json PATH] "
                "[--blocks N] [--block-bytes N] [--output-stride N] [--sgl-size N] "
                "[--warmup N] [--iterations N]\n"
-               "Defaults: output-stride=2*block-bytes, sgl-size=%u (range 1..%u)\n",
+               "Defaults: output-stride=2*block-bytes, sgl-size=%u "
+               "(positive; each READ WQE uses at most %u SGE)\n",
                program, kvaf::kGatherMaxSglSize, kvaf::kGatherMaxSglSize);
 }
 
@@ -64,7 +65,7 @@ bool Parse(int argc, char** argv, Options* options) {
   if (parsed.peer.empty() || parsed.kernel_json.empty() || parsed.device_id > INT32_MAX ||
       parsed.blocks == 0U || parsed.blocks > kvaf::peer::kMaxGatherSpans ||
       parsed.block_bytes == 0U || parsed.iterations == 0U ||
-      parsed.sgl_size == 0U || parsed.sgl_size > kvaf::kGatherMaxSglSize ||
+      parsed.sgl_size == 0U ||
       static_cast<std::uint64_t>(parsed.blocks) * parsed.block_bytes > UINT32_MAX - 64U)
     return false;
   if (parsed.output_stride == 0U) {
@@ -334,9 +335,10 @@ int Run(const Options& options) {
                average(&kvaf::GatherReadTiming::read_wqes));
   std::fprintf(stdout,
                "AICPU_GATHER_READ_PASS blocks=%u block_bytes=%u bytes=%zu "
-               "output_stride=%u sgl_size=%u warmup=%u iterations=%u\n",
+               "output_stride=%u sgl_size=%u wqe_sgl_size=%u warmup=%u iterations=%u\n",
                options.blocks, options.block_bytes, payload, options.output_stride,
-               options.sgl_size, options.warmup, options.iterations);
+               options.sgl_size, std::min(options.sgl_size, kvaf::kGatherMaxSglSize),
+               options.warmup, options.iterations);
   return 0;
 }
 

@@ -476,7 +476,6 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
       args->bytes > UINT32_MAX - kvaf::aicpu_urma::kGatherScratchBytes ||
       args->output_spans == 0U || args->output_span_count == 0U ||
       args->output_span_count > 65536U || args->sgl_size == 0U ||
-      args->sgl_size > kvaf::kGatherMaxSglSize ||
       args->output_extent == 0U || args->output > UINT64_MAX - scratch_offset ||
       scratch_offset > UINT64_MAX - kvaf::aicpu_urma::kGatherScratchBytes ||
       args->output != entity.local_hbm_address ||
@@ -562,6 +561,8 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
   }
   if (status.result == 0U) {
     status.phase = 3U;
+    const std::uint32_t wqe_sgl_size = args->sgl_size < kvaf::kGatherMaxSglSize
+        ? args->sgl_size : kvaf::kGatherMaxSglSize;
     const auto preflush_start_ns = NowNs();
     for (std::uint32_t index = 0U; index < args->output_span_count; ++index)
       FlushLines(reinterpret_cast<void*>(args->output + output_spans[index].offset),
@@ -579,7 +580,7 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
       transfer = {};
       transfer.remote_address = args->remote_staging + remote_offset;
       while (span_index < args->output_span_count &&
-             transfer.sge_count < args->sgl_size &&
+             transfer.sge_count < wqe_sgl_size &&
              transfer.bytes < kvaf::aicpu_urma::kMaxReadBytes) {
         const auto& span = output_spans[span_index];
         const auto available = span.length - span_offset;

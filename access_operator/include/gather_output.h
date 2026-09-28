@@ -4,6 +4,7 @@
 
 namespace kvaf {
 
+// Physical SGE limit per READ WQE, not a limit on the requested gather size.
 constexpr std::uint32_t kGatherMaxSglSize = 6U;
 
 struct GatherOutputSpan {

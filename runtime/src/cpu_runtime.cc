@@ -413,12 +413,16 @@ class CpuGatherWorker {
  public:
   CpuGatherWorker(void* memory, uint64_t base, uint64_t bytes,
                   std::size_t gather_threads,
-                  std::size_t min_bytes_per_thread)
+                  std::size_t min_bytes_per_thread, bool gather_affinity,
+                  bool gather_active)
       : base_(base), bytes_(bytes),
         control_(reinterpret_cast<peer::GatherControl*>(
             static_cast<uint8_t*>(memory) + peer::GatherControlOffset(bytes))),
-        team_(memory, base, gather_threads, min_bytes_per_thread),
-        max_threads_(gather_threads) {
+        team_(memory, base, gather_threads, min_bytes_per_thread,
+              gather_active ? peer::GatherWaitMode::kActive
+                            : peer::GatherWaitMode::kPassive,
+              gather_affinity),
+        max_threads_(team_.max_threads()), gather_active_(gather_active) {
     std::memset(control_, 0, sizeof(*control_));
     peer::GatherCacheLine(control_, false);
     peer::GatherBarrier();
@@ -439,8 +443,9 @@ class CpuGatherWorker {
     spans_ = spans;
     const std::size_t gather_threads = team_.Prepare(staging, spans_, total_bytes);
     if (gather_threads != reported_threads_) {
-      Log("[KVAF_CPU] GATHER_THREADS active=%zu max=%zu bytes=%u\n",
-          gather_threads, max_threads_, total_bytes);
+      Log("[KVAF_CPU] GATHER_THREADS active=%zu max=%zu bytes=%u mode=%s\n",
+          gather_threads, max_threads_, total_bytes,
+          gather_active_ ? "active" : "passive");
       reported_threads_ = gather_threads;
     }
     scheduled_at_ns_ = NowNs();
@@ -460,6 +465,7 @@ class CpuGatherWorker {
   }
 
   void Run() {
+    team_.BindWorker(0U);
     auto* notify = &control_->notify;
     auto* ack = &control_->ack;
     auto* command = &control_->command;
@@ -511,6 +517,7 @@ class CpuGatherWorker {
   std::vector<GatherSpan> spans_;
   peer::CpuGatherTeam team_;
   std::size_t max_threads_{0U};
+  bool gather_active_{true};
   std::size_t reported_threads_{0U};
   std::uint64_t scheduled_at_ns_{0U};
   uint64_t scheduled_{0U};
@@ -535,9 +542,11 @@ struct Region {
 class CpuService {
  public:
   CpuService(UrmaResourcePool* resource_pool, std::size_t gather_threads,
-             std::size_t min_bytes_per_thread)
+             std::size_t min_bytes_per_thread, bool gather_affinity,
+             bool gather_active)
       : resource_pool_(resource_pool), gather_threads_(gather_threads),
-        min_bytes_per_thread_(min_bytes_per_thread) {}
+        min_bytes_per_thread_(min_bytes_per_thread),
+        gather_affinity_(gather_affinity), gather_active_(gather_active) {}
   ~CpuService() { ReleaseAll(); }
 
   uint32_t CandidateCount() const {
@@ -712,7 +721,7 @@ class CpuService {
       if (region.gather == nullptr)
         region.gather = std::make_unique<CpuGatherWorker>(
             region.memory, region.base, region.bytes, gather_threads_,
-            min_bytes_per_thread_);
+            min_bytes_per_thread_, gather_affinity_, gather_active_);
       if (!region.gather->Configure(staging, spans, total_bytes, response))
         return Result::kResourceError;
     } catch (const std::exception& error) {
@@ -836,6 +845,8 @@ class CpuService {
   UrmaResourcePool* resource_pool_ = nullptr;
   std::size_t gather_threads_{1U};
   std::size_t min_bytes_per_thread_{256U * 1024U};
+  bool gather_affinity_{true};
+  bool gather_active_{true};
   uint64_t next_region_id_ = 1U;
   uint32_t next_token_ = 1U;
   uint32_t next_psn_ = 1U;
@@ -988,7 +999,8 @@ Status CpuRuntime::Initialize(const CpuRuntimeOptions& options) {
   const std::size_t min_bytes_per_thread = options.gather_threads == 0U
       ? 256U * 1024U : 64U * 1024U;
   impl->service = std::make_unique<CpuService>(
-      &impl->resources, gather_threads, min_bytes_per_thread);
+      &impl->resources, gather_threads, min_bytes_per_thread,
+      options.gather_affinity, options.gather_active);
   impl_ = std::move(impl);
   return Status::OK();
 }

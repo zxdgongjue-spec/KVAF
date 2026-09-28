@@ -83,7 +83,7 @@ CPU 服务端先收到离散源地址清单及 staging 地址；AICPU 发一条 
 WRITE_WITH_NOTIFY（96 字节，占两个 64 字节 SQ WQEBB），将序号写入 DDR 控制区并
 通知 CPU worker。worker 按清单将 DRAM 数据复制到连续 staging，刷出 CPU 缓存并
 写回完成序号。AICPU 用 READ 轮询完成序号，匹配后将连续 staging 读入连续
-HBM 的离散目标 span。每条 READ WQE 最多带 8 个本地 SGE，占 1 到 3 个 64 字节
+HBM 的离散目标 span。每条 READ WQE 最多带 6 个本地 SGE，占 1 到 3 个 64 字节
 WQEBB；每 32 条 WQE 在末条请求 CQE。单条 WQE 的总数据量不超过 256 MiB，
 更长的 span 会拆分。所有目标 span 当前必须落在同一块已注册的 HBM 分配内；
 不支持跨独立 HBM 分配的 SGL。
@@ -92,21 +92,27 @@ CPU worker 在用户态用 `dc civac` 重新读取 DMA 写入的控制字和源�
 在 EL0 不可用，会令服务端进程收到 `SIGILL`。这些行在 DMA 写入前已 clean，
 worker 对控制区写入 ack 后也立即 clean，避免 clean-and-invalidate 回写旧数据。
 源缓存处理、staging 拷贝和 staging flush 现在各自并行执行；每一阶段完成后
-所有线程同步，再进入下一阶段，保证 DMA 可见性。辅助线程随 CPU region 的
-首次需要该并行度时创建并复用，配置请求唤醒，等待 AICPU 通知期间保持 active，
-完成后休眠。默认按 CPU 核数自动选择上限 32，并按每线程至少 256 KiB 的
+所有线程同步，再进入下一阶段，保证 DMA 可见性。这里没有使用 OpenMP：
+CPU worker 使用常驻 `std::thread`，默认 `--gather-mode active`：辅助线程在
+各轮之间保持自旋，不需要每轮重建 OpenMP parallel region；这会持续占用
+所选逻辑 CPU。也可设为 `--gather-mode passive`，让辅助线程在两轮之间休眠。Linux 上
+默认将 coordinator 和 helper 绑到进程允许的不同逻辑 CPU；可用
+`--gather-affinity off` 关闭以作对比。`GATHER_THREAD` 日志记录 TID、CPU 和绑核结果。
+默认按 CPU 核数自动选择上限 32，并按每线程至少 256 KiB 的
 payload 限制实际并行度；服务端可用 `--gather-threads N` 指定上限（1 到 64，
 显式指定时阈值降为每线程 64 KiB，设为 1 可作为单线程基线）。
 `[KVAF_CPU] GATHER_THREADS` 日志显示实际线程数。
 CPU profiling 的三个阶段耗时均包含线程分发与同步，需在目标机器上用同一
-batch 比较 `--gather-threads 1/4/8/16` 后再选线程数。
+batch 比较 `--gather-threads 1/4/8/16` 后再选线程数。可用 `taskset`
+限制服务进程的候选 CPU 集合，绑核只在该集合内选核。
 
 两端分别运行：
 
 ```bash
 # CPU 终端
 ./build.sh cpu
-build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999 --gather-threads 16
+build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999 \
+  --gather-threads 8 --gather-mode active --gather-affinity on
 
 # NPU 终端
 ./build.sh aicpu-urma --install-kernel
@@ -118,8 +124,9 @@ build-aicpu-urma/tests/kvaf_aicpu_gather_read_client \
 
 客户端每轮 BatchPut 不同 payload 到 DDR，按 block 逆序生成 gather 清单，再用
 多 SGL READ 将数据写入原 block 顺序的稀疏 HBM 槽位；逐字节校验槽位及空隙，
-仅汇总 GatherRead 计时。UDMA READ 每个 WR 最多支持 6 个目标 SGE，
-`--sgl-size` 可设为 1 到 6，`--output-stride` 不得小于
+仅汇总 GatherRead 计时。`--sgl-size` 接受 1 到 2^32-1；大于 6 时，
+内核自动将请求拆成每条最多 6 个目标 SGE 的 READ WQE，不会发出未经验证的
+8-SGE WQE；因此设置大于 6 不会减少 WQE 数量。`--output-stride` 不得小于
 `--block-bytes`，默认是两倍 block 大小。客户端从保留 key 的 AccessTable 中选择连续
 staging，避免 LinkTo 探针轮转 slot 后与源块重叠；另保留控制区并占住其 slot，避免 MetaManager
 后续复用。调用 `NpuRuntime::GatherRead` 时，源地址与 staging 必须在注册 DDR

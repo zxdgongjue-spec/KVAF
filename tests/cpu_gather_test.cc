@@ -73,16 +73,28 @@ void TestParallelGather() {
   for (std::size_t block = block_count; block != 0U; --block)
     spans.push_back({base + source_offset + (block - 1U) * block_bytes,
                      block_bytes, 0U});
-  kvaf::peer::CpuGatherTeam tuned_team(memory.data(), base, 16U, 64U * 1024U);
-  Require(tuned_team.Prepare(staging, spans, total_bytes) == 16U);
-  tuned_team.InvalidateSources();
-  tuned_team.Copy();
-  tuned_team.FlushStaging();
-  for (std::size_t block = 0U; block < block_count; ++block)
-    Require(std::memcmp(memory.data() + staging_offset + block * block_bytes,
-                        memory.data() + source_offset +
-                            (block_count - 1U - block) * block_bytes,
-                        block_bytes) == 0);
+  kvaf::peer::CpuGatherTeam tuned_team(memory.data(), base, 16U, 64U * 1024U,
+                                      kvaf::peer::GatherWaitMode::kActive);
+  const std::vector<kvaf::peer::GatherSpan> small_spans{{base + source_offset, 64U, 0U}};
+  for (std::size_t round = 0U; round < 16U; ++round) {
+    const bool small = round == 8U;
+    const auto& selected = small ? small_spans : spans;
+    Require(tuned_team.Prepare(staging, selected,
+                               small ? 64U : total_bytes) == (small ? 1U : 16U));
+    tuned_team.InvalidateSources();
+    tuned_team.Copy();
+    tuned_team.FlushStaging();
+    if (small) {
+      Require(std::memcmp(memory.data() + staging_offset,
+                          memory.data() + source_offset, 64U) == 0);
+    } else {
+      for (std::size_t block = 0U; block < block_count; ++block)
+        Require(std::memcmp(memory.data() + staging_offset + block * block_bytes,
+                            memory.data() + source_offset +
+                                (block_count - 1U - block) * block_bytes,
+                            block_bytes) == 0);
+    }
+  }
 }
 
 void TestIrregularGather() {
