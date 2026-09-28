@@ -310,6 +310,10 @@ struct DefaultAccessOperator::Impl {
   RemoteRegionDesc remote_region;
   KvafBatchGetTransport* transport{nullptr};
   BatchGetExecutionState execution;
+#if defined(KVAF_ENABLE_AICPU_URMA)
+  void* gather_output_spans{nullptr};
+  std::size_t gather_output_spans_capacity{0U};
+#endif
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   KvafBatchPutTransport* batch_put_transport{nullptr};
   BatchPutExecutionState batch_put_execution;
@@ -472,6 +476,13 @@ Status DefaultAccessOperator::Shutdown() {
   }
   impl_->batch_put_transport = nullptr;
 #endif
+#if defined(KVAF_ENABLE_AICPU_URMA)
+  if (impl_->gather_output_spans != nullptr) {
+    (void)aclrtFree(impl_->gather_output_spans);
+    impl_->gather_output_spans = nullptr;
+    impl_->gather_output_spans_capacity = 0U;
+  }
+#endif
   if (impl_->transport != nullptr) {
     KvafBatchGetTransportDestroy(impl_->transport);
   }
@@ -561,12 +572,31 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
   if (!impl_->initialized || impl_->transport == nullptr ||
       impl_->config.aicpu_urma_kernel_json_path.empty())
     return InvalidState("AICPU URMA GatherRead transport is unavailable");
-  const std::uint64_t scratch_offset =
-      (static_cast<std::uint64_t>(request.bytes) + 63U) & ~std::uint64_t{63U};
   if (request.output.device != DeviceKind::kNpu || !request.output.valid() ||
       request.stream == nullptr || request.bytes == 0U ||
-      request.output.bytes < scratch_offset + aicpu_urma::kGatherScratchBytes)
-    return InvalidArgument("GatherRead output requires payload plus 64-byte HBM scratch");
+      request.output_spans == nullptr || request.output_span_count == 0U ||
+      request.sgl_size == 0U || request.sgl_size > kGatherMaxSglSize ||
+      request.output_extent > UINT64_MAX - 63U)
+    return InvalidArgument("GatherRead output requires a valid SGL and 64-byte HBM scratch");
+  const std::uint64_t scratch_offset =
+      (request.output_extent + 63U) & ~std::uint64_t{63U};
+  if (scratch_offset > request.output.bytes ||
+      request.output.bytes - scratch_offset < aicpu_urma::kGatherScratchBytes)
+    return InvalidArgument("GatherRead output requires 64-byte HBM scratch");
+  const std::size_t descriptor_bytes =
+      static_cast<std::size_t>(request.output_span_count) * sizeof(GatherOutputSpan);
+  if (descriptor_bytes > impl_->gather_output_spans_capacity) {
+    void* descriptors = nullptr;
+    if (aclrtMalloc(&descriptors, descriptor_bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS)
+      return Internal("failed to allocate GatherRead HBM SGL descriptors");
+    if (impl_->gather_output_spans != nullptr) (void)aclrtFree(impl_->gather_output_spans);
+    impl_->gather_output_spans = descriptors;
+    impl_->gather_output_spans_capacity = descriptor_bytes;
+  }
+  if (aclrtMemcpy(impl_->gather_output_spans, impl_->gather_output_spans_capacity,
+                  request.output_spans, descriptor_bytes,
+                  ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS)
+    return Internal("failed to upload GatherRead HBM SGL descriptors");
   KvafBatchGetLocalBuffer* local_buffer = nullptr;
   std::uint64_t channel_entity = 0U;
   if (KvafBatchGetLocalBufferAcquire(impl_->transport, request.output.data,
@@ -579,6 +609,10 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
   arguments.queue_state = reinterpret_cast<std::uint64_t>(impl_->execution.queue_state);
   arguments.core_status = reinterpret_cast<std::uint64_t>(impl_->execution.status);
   arguments.output = reinterpret_cast<std::uint64_t>(request.output.data);
+  arguments.output_spans = reinterpret_cast<std::uint64_t>(impl_->gather_output_spans);
+  arguments.output_span_count = request.output_span_count;
+  arguments.sgl_size = request.sgl_size;
+  arguments.output_extent = request.output_extent;
   arguments.remote_staging = request.remote_staging;
   arguments.remote_command = request.remote_command;
   arguments.remote_notify = request.remote_notify;
@@ -602,7 +636,7 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
       device_status.sequence == request.sequence &&
       (sync != ACL_SUCCESS || device_status.result != 0U)) {
     std::fprintf(stderr, "[KVAF_AICPU_URMA] GATHER_READ_ERROR acl=%d result=%llu phase=%llu ack=%llu "
-                         "sq=%llu cq=%llu cqe_word=0x%llx sequence=%llu\n",
+                         "sq=%llu cq=%llu cqe_word=0x%llx sequence=%llu spans=%u sgl_size=%u\n",
                  static_cast<int>(sync),
                  static_cast<unsigned long long>(device_status.result),
                  static_cast<unsigned long long>(device_status.phase),
@@ -610,7 +644,8 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
                  static_cast<unsigned long long>(device_status.sq_producer_index),
                  static_cast<unsigned long long>(device_status.cq_consumer_index),
                  static_cast<unsigned long long>(device_status.cqe_word),
-                 static_cast<unsigned long long>(device_status.sequence));
+                 static_cast<unsigned long long>(device_status.sequence),
+                 request.output_span_count, request.sgl_size);
   }
   if (sync != ACL_SUCCESS) return Internal("AICPU URMA GatherRead stream synchronization failed");
   if (copy != ACL_SUCCESS || device_status.magic != aicpu_urma::kGatherStatusMagic ||

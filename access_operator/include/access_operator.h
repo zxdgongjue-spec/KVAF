@@ -6,6 +6,7 @@
 #include <string>
 
 #include "requests.h"
+#include "gather_output.h"
 #include "status.h"
 #include "types.h"
 
@@ -26,6 +27,10 @@ struct BatchPutExecRequest {
 
 struct CpuGatherReadExecRequest {
   MutableBufferView output;
+  const GatherOutputSpan* output_spans{nullptr};
+  std::uint32_t output_span_count{0U};
+  std::uint32_t sgl_size{0U};
+  std::uint64_t output_extent{0U};
   std::uint64_t remote_staging{0U};
   std::uint64_t remote_command{0U};
   std::uint64_t remote_notify{0U};

@@ -6,9 +6,11 @@
 
 #include "acl/acl.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -22,6 +24,8 @@ struct Options {
   std::uint32_t device_id{0U};
   std::uint32_t blocks{8U};
   std::uint32_t block_bytes{4096U};
+  std::uint32_t output_stride{0U};
+  std::uint32_t sgl_size{kvaf::kGatherMaxSglSize};
   std::uint32_t warmup{1U};
   std::uint32_t iterations{3U};
 };
@@ -29,7 +33,9 @@ struct Options {
 void Usage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s [--peer HOST:PORT] [--device-id N] [--kernel-json PATH] "
-               "[--blocks N] [--block-bytes N] [--warmup N] [--iterations N]\n",
+               "[--blocks N] [--block-bytes N] [--output-stride N] [--sgl-size N] "
+               "[--warmup N] [--iterations N]\n"
+               "Defaults: output-stride=2*block-bytes, sgl-size=8 (range 1..8)\n",
                program);
 }
 
@@ -48,6 +54,8 @@ bool Parse(int argc, char** argv, Options* options) {
       if (flag == "--device-id") parsed.device_id = static_cast<std::uint32_t>(number);
       else if (flag == "--blocks") parsed.blocks = static_cast<std::uint32_t>(number);
       else if (flag == "--block-bytes") parsed.block_bytes = static_cast<std::uint32_t>(number);
+      else if (flag == "--output-stride") parsed.output_stride = static_cast<std::uint32_t>(number);
+      else if (flag == "--sgl-size") parsed.sgl_size = static_cast<std::uint32_t>(number);
       else if (flag == "--warmup") parsed.warmup = static_cast<std::uint32_t>(number);
       else if (flag == "--iterations") parsed.iterations = static_cast<std::uint32_t>(number);
       else return false;
@@ -56,8 +64,16 @@ bool Parse(int argc, char** argv, Options* options) {
   if (parsed.peer.empty() || parsed.kernel_json.empty() || parsed.device_id > INT32_MAX ||
       parsed.blocks == 0U || parsed.blocks > kvaf::peer::kMaxGatherSpans ||
       parsed.block_bytes == 0U || parsed.iterations == 0U ||
+      parsed.sgl_size == 0U || parsed.sgl_size > kvaf::kGatherMaxSglSize ||
       static_cast<std::uint64_t>(parsed.blocks) * parsed.block_bytes > UINT32_MAX - 64U)
     return false;
+  if (parsed.output_stride == 0U) {
+    if (parsed.block_bytes > UINT32_MAX / 2U) return false;
+    parsed.output_stride = 2U * parsed.block_bytes;
+  }
+  if (parsed.output_stride < parsed.block_bytes ||
+      static_cast<std::uint64_t>(parsed.blocks - 1U) * parsed.output_stride +
+          parsed.block_bytes > UINT32_MAX - 64U) return false;
   *options = parsed;
   return true;
 }
@@ -113,6 +129,7 @@ double RunRound(kvaf::NpuRuntime* runtime, aclrtStream stream, const Options& op
                 DeviceBuffer* input, DeviceBuffer* output,
                 std::vector<std::uint8_t>* host_input,
                 std::vector<std::uint8_t>* host_output,
+                std::vector<std::uint8_t>* expected_output,
                 std::vector<kvaf::KeyId>* reserved_keys,
                 std::uint64_t* staging_address, std::uint64_t round) {
   const std::size_t payload = host_input->size();
@@ -191,18 +208,27 @@ double RunRound(kvaf::NpuRuntime* runtime, aclrtStream stream, const Options& op
   if (!kvaf::peer::ValidateGather(region.base, region.length, gather.staging_address,
                                   gather.spans, &gathered_bytes) || gathered_bytes != payload)
     throw std::runtime_error("source blocks overlap staging or DDR control area");
+  gather.sgl_size = options.sgl_size;
+  std::fill(host_output->begin(), host_output->end(), std::uint8_t{0xa5U});
+  std::fill(expected_output->begin(), expected_output->end(), std::uint8_t{0xa5U});
+  for (std::uint32_t block = options.blocks; block != 0U; --block) {
+    const std::size_t source = static_cast<std::size_t>(block - 1U) * options.block_bytes;
+    const std::size_t destination = static_cast<std::size_t>(block - 1U) * options.output_stride;
+    gather.output_spans.push_back({destination, options.block_bytes, 0U});
+    std::memcpy(expected_output->data() + destination,
+                host_input->data() + source, options.block_bytes);
+  }
+  output->Upload(host_output->data());
   const auto begin = std::chrono::steady_clock::now();
   Check(runtime->GatherRead(gather), "GatherRead");
   const auto end = std::chrono::steady_clock::now();
-  output->Download(host_output->data(), payload);
-  for (std::size_t block = 0U; block < options.blocks; ++block) {
-    const std::size_t source = (options.blocks - 1U - block) * options.block_bytes;
-    const std::size_t destination = block * options.block_bytes;
-    for (std::uint32_t byte = 0U; byte < options.block_bytes; ++byte) {
-      if ((*host_output)[destination + byte] != (*host_input)[source + byte])
-        throw std::runtime_error("GatherRead payload mismatch at block=" +
-                                 std::to_string(block) + " byte=" + std::to_string(byte));
-    }
+  output->Download(host_output->data(), expected_output->size());
+  if (std::memcmp(host_output->data(), expected_output->data(),
+                  expected_output->size()) != 0) {
+    for (std::size_t byte = 0U; byte < expected_output->size(); ++byte)
+      if ((*host_output)[byte] != (*expected_output)[byte])
+        throw std::runtime_error("GatherRead HBM scatter mismatch at offset=" +
+                                 std::to_string(byte));
   }
   Check(runtime->core().ReleaseAccessTable(handle), "ReleaseAccessTable");
   Check(runtime->core().BatchFree({put.groups.front().keys}), "BatchFree");
@@ -214,9 +240,12 @@ int Run(const Options& options) {
     throw std::runtime_error("failed to configure ASCEND_HOME_PATH");
   AclContext acl(options.device_id);
   const std::size_t payload = static_cast<std::size_t>(options.blocks) * options.block_bytes;
+  const std::size_t output_extent =
+      static_cast<std::size_t>(options.blocks - 1U) * options.output_stride + options.block_bytes;
   DeviceBuffer input(payload);
-  DeviceBuffer output(((payload + 63U) & ~std::size_t{63U}) + 64U);
-  std::vector<std::uint8_t> host_input(payload), host_output(payload);
+  DeviceBuffer output(((output_extent + 63U) & ~std::size_t{63U}) + 64U);
+  std::vector<std::uint8_t> host_input(payload), host_output(output.bytes);
+  std::vector<std::uint8_t> expected_output(output_extent);
   std::vector<kvaf::KeyId> reserved_keys;
   std::uint64_t staging_address = 0U;
   const std::size_t reserve_slots = kvaf::aicpu_gather_read_client::ReservedSlots(
@@ -235,7 +264,7 @@ int Run(const Options& options) {
   for (std::uint64_t round = 0U;
        round < static_cast<std::uint64_t>(options.warmup) + options.iterations; ++round) {
     const double elapsed = RunRound(&runtime, acl.stream, options, &input, &output,
-                                    &host_input, &host_output, &reserved_keys,
+                                    &host_input, &host_output, &expected_output, &reserved_keys,
                                     &staging_address, round);
     if (round >= options.warmup) samples.push_back(elapsed);
   }
@@ -248,8 +277,10 @@ int Run(const Options& options) {
                stats.min_ms, stats.p50_ms, stats.p95_ms, stats.p99_ms,
                stats.max_ms, stats.mean_ms, stats.mean_gbps);
   std::fprintf(stdout,
-               "AICPU_GATHER_READ_PASS blocks=%u block_bytes=%u bytes=%zu warmup=%u iterations=%u\n",
-               options.blocks, options.block_bytes, payload, options.warmup, options.iterations);
+               "AICPU_GATHER_READ_PASS blocks=%u block_bytes=%u bytes=%zu "
+               "output_stride=%u sgl_size=%u warmup=%u iterations=%u\n",
+               options.blocks, options.block_bytes, payload, options.output_stride,
+               options.sgl_size, options.warmup, options.iterations);
   return 0;
 }
 

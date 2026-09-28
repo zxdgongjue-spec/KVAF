@@ -4,7 +4,9 @@ find_package(Threads REQUIRED)
 add_subdirectory(aicpu_batch_get)
 
 add_executable(kvaf_aicpu_urma_wqe_test aicpu_urma_wqe_test.cc)
-target_include_directories(kvaf_aicpu_urma_wqe_test PRIVATE "${CMAKE_SOURCE_DIR}/access_operator/src")
+target_include_directories(kvaf_aicpu_urma_wqe_test PRIVATE
+  "${CMAKE_SOURCE_DIR}/access_operator/src"
+  "${CMAKE_SOURCE_DIR}/access_operator/include")
 add_test(NAME kvaf_aicpu_urma_wqe COMMAND kvaf_aicpu_urma_wqe_test)
 
 add_executable(kvaf_cpu_gather_test cpu_gather_test.cc)
@@ -13,7 +15,8 @@ add_test(NAME kvaf_cpu_gather COMMAND kvaf_cpu_gather_test)
 
 add_executable(kvaf_aicpu_gather_read_layout_test aicpu_gather_read_layout_test.cc)
 target_include_directories(kvaf_aicpu_gather_read_layout_test PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/runtime/include")
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/runtime/include"
+  "${CMAKE_SOURCE_DIR}/access_operator/include")
 add_test(NAME kvaf_aicpu_gather_read_layout COMMAND kvaf_aicpu_gather_read_layout_test)
 
 add_executable(kvaf_aicpu_urma_kernel_test aicpu_urma_kernel_test.cc
@@ -21,6 +24,7 @@ add_executable(kvaf_aicpu_urma_kernel_test aicpu_urma_kernel_test.cc
 target_compile_definitions(kvaf_aicpu_urma_kernel_test PRIVATE KVAF_AICPU_URMA_HOST_TEST=1)
 target_include_directories(kvaf_aicpu_urma_kernel_test PRIVATE
   "${CMAKE_SOURCE_DIR}/access_operator/src"
+  "${CMAKE_SOURCE_DIR}/access_operator/include"
   "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include"
   "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_put/include")
 add_test(NAME kvaf_aicpu_urma_kernel COMMAND kvaf_aicpu_urma_kernel_test)
@@ -30,6 +34,7 @@ add_executable(kvaf_aicpu_gather_read_kernel_test aicpu_gather_read_kernel_test.
 target_compile_definitions(kvaf_aicpu_gather_read_kernel_test PRIVATE KVAF_AICPU_URMA_HOST_TEST=1)
 target_include_directories(kvaf_aicpu_gather_read_kernel_test PRIVATE
   "${CMAKE_SOURCE_DIR}/access_operator/src"
+  "${CMAKE_SOURCE_DIR}/access_operator/include"
   "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include"
   "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_put/include"
   "${CMAKE_SOURCE_DIR}/runtime/include")

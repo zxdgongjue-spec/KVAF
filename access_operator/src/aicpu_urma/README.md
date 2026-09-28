@@ -76,15 +76,17 @@ Runtime 提交与 stream 同步，不包含 AccessTable 准备、HBM 上传/回�
 因此不是纯 SQ 带宽。底层 Direct-HCCP 的诊断日志仍可能出现。
 失败时退出码非零且不会输出 `AICPU_URMA_PASS`；`--help` 查看完整参数。
 
-## CPU Gather + AICPU 连续 READ
+## CPU Gather + AICPU 多 SGL READ
 
 此路径使用同一个 `NpuRuntime::LinkTo` / Direct-HCCP Jetty，不改变 AIV 算子。
 CPU 服务端先收到离散源地址清单及 staging 地址；AICPU 发一条 opcode 5 的
 WRITE_WITH_NOTIFY（96 字节，占两个 64 字节 SQ WQEBB），将序号写入 DDR 控制区并
 通知 CPU worker。worker 按清单将 DRAM 数据复制到连续 staging，刷出 CPU 缓存并
 写回完成序号。AICPU 用 READ 轮询完成序号，匹配后将连续 staging 读入连续
-HBM 输出；超过 256 MiB 时按 hcomm 的单 WQE 上限分段提交。当前不执行 HBM
-离散地址 scatter，也不是多 SGL WQE。
+HBM 的离散目标 span。每条 READ WQE 最多带 8 个本地 SGE，占 1 到 3 个 64 字节
+WQEBB；每 32 条 WQE 在末条请求 CQE。单条 WQE 的总数据量不超过 256 MiB，
+更长的 span 会拆分。所有目标 span 当前必须落在同一块已注册的 HBM 分配内；
+不支持跨独立 HBM 分配的 SGL。
 
 CPU worker 在用户态用 `dc civac` 重新读取 DMA 写入的控制字和源块；`dc ivac`
 在 EL0 不可用，会令服务端进程收到 `SIGILL`。这些行在 DMA 写入前已 clean，
@@ -101,16 +103,21 @@ build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999
 ./build.sh aicpu-urma --install-kernel
 build-aicpu-urma/tests/kvaf_aicpu_gather_read_client \
   --peer CPU_HOST:28999 --device-id 0 \
-  --blocks 16 --block-bytes 4096 --warmup 1 --iterations 5
+  --blocks 16 --block-bytes 4096 --output-stride 8192 --sgl-size 8 \
+  --warmup 1 --iterations 5
 ```
 
-客户端每轮 BatchPut 不同 payload 到 DDR，按 block 逆序生成 gather 清单，校验连续
-HBM 输出；仅汇总 GatherRead 计时。客户端从保留 key 的 AccessTable 中选择连续
+客户端每轮 BatchPut 不同 payload 到 DDR，按 block 逆序生成 gather 清单，再用
+多 SGL READ 将数据写入原 block 顺序的稀疏 HBM 槽位；逐字节校验槽位及空隙，
+仅汇总 GatherRead 计时。`--sgl-size` 可设为 1 到 8，`--output-stride` 不得小于
+`--block-bytes`，默认是两倍 block 大小。客户端从保留 key 的 AccessTable 中选择连续
 staging，避免 LinkTo 探针轮转 slot 后与源块重叠；另保留控制区并占住其 slot，避免 MetaManager
 后续复用。调用 `NpuRuntime::GatherRead` 时，源地址与 staging 必须在注册 DDR
-范围内且不重叠，末尾 64 字节控制区不可用于 KV slot。输出 HBM 需要额外的
-64 字节对齐 scratch 空间；数据本身从输出基址开始。一个 region 同时只允许
-一个未完成的 gather。真实设备的 WRITE_WITH_NOTIFY 支持和性能仍需在目标机器验证。
+范围内且不重叠，末尾 64 字节控制区不可用于 KV slot。输出 HBM 的最后一个
+span 之后需要额外的 64 字节对齐 scratch 空间；span 不得重叠。一个 region 同时
+只允许一个未完成的 gather。GatherRead 计时包含输出布局校验、SGL 描述符上传、
+CPU gather 握手和 CQ 等待，不含输入上传、输出回读及逐字节校验。多 SGL READ 的
+真实设备兼容性和性能仍需目标机器验证。
 
 **硬件验证状态**：本分支的 Host WQE ABI/模拟队列测试和内核语法检查不等价于 NPU
 收发验证。部署后应先用 Runtime 自带的 LinkTo WRITE 探针确认链路，再在真实

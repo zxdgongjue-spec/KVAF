@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "gather_output.h"
+
 namespace kvaf::aicpu_urma {
 
 constexpr std::uint32_t kWqeBytes = 64;
@@ -10,6 +12,7 @@ constexpr std::uint32_t kReadOpcode = 6;
 constexpr std::uint32_t kWriteOpcode = 3;
 constexpr std::uint32_t kWriteWithNotifyOpcode = 5;
 constexpr std::uint32_t kMaxReadBytes = 256U * 1024U * 1024U;
+constexpr std::uint32_t kMaxScatterWqebbs = 3U;
 
 struct Transfer {
   std::uint64_t remote_address;
@@ -17,6 +20,26 @@ struct Transfer {
   std::uint32_t length;
   std::uint32_t local_token_id;
 };
+
+struct LocalSge {
+  std::uint64_t address;
+  std::uint32_t length;
+  std::uint32_t token_id;
+};
+
+struct ScatterTransfer {
+  std::uint64_t remote_address;
+  std::uint32_t bytes;
+  std::uint32_t sge_count;
+  LocalSge sges[kGatherMaxSglSize];
+};
+
+constexpr std::uint32_t ScatterWqebbs(std::uint32_t sge_count) {
+  return (48U + sge_count * 16U + kWqeBytes - 1U) / kWqeBytes;
+}
+
+static_assert(ScatterWqebbs(kGatherMaxSglSize) == kMaxScatterWqebbs,
+              "scatter WQE buffer is too small");
 
 struct Endpoint {
   std::uint32_t tp_id;
@@ -60,6 +83,32 @@ inline void EncodeWqe(std::uint32_t (&words)[16], const Endpoint& endpoint,
   words[13] = transfer.local_token_id;
   words[14] = static_cast<std::uint32_t>(transfer.local_address);
   words[15] = static_cast<std::uint32_t>(transfer.local_address >> 32U);
+}
+
+inline void EncodeScatterReadWqe(std::uint32_t (&words)[kMaxScatterWqebbs * 16U],
+                                 const Endpoint& endpoint,
+                                 const ScatterTransfer& transfer,
+                                 std::uint32_t owner, bool completion) {
+  std::memset(words, 0, sizeof(words));
+  const std::uint32_t place_order = completion ? 2U : 1U;
+  words[0] = (place_order << 16U) | (1U << 18U) |
+             (static_cast<std::uint32_t>(completion) << 19U) | (1U << 20U) |
+             (static_cast<std::uint32_t>(completion) << 21U) | (1U << 28U) |
+             (1U << 29U) | ((owner & 1U) << 31U);
+  words[1] = kReadOpcode << 8U;
+  words[2] = (endpoint.tp_id & 0x00ffffffU) | (transfer.sge_count << 24U);
+  words[3] = endpoint.remote_token_id & 0x000fffffU;
+  std::memcpy(&words[4], endpoint.remote_eid, sizeof(endpoint.remote_eid));
+  words[8] = endpoint.remote_token_value;
+  words[10] = static_cast<std::uint32_t>(transfer.remote_address);
+  words[11] = static_cast<std::uint32_t>(transfer.remote_address >> 32U);
+  for (std::uint32_t index = 0U; index < transfer.sge_count; ++index) {
+    const std::uint32_t base = 12U + index * 4U;
+    words[base] = transfer.sges[index].length;
+    words[base + 1U] = transfer.sges[index].token_id;
+    words[base + 2U] = static_cast<std::uint32_t>(transfer.sges[index].address);
+    words[base + 3U] = static_cast<std::uint32_t>(transfer.sges[index].address >> 32U);
+  }
 }
 
 inline void EncodeNotifyWqe(std::uint32_t (&words)[32], const Endpoint& endpoint,

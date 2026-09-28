@@ -8,6 +8,7 @@
 #include "npu_service.h"
 #include "runtime.h"
 #include "cpu_gather.h"
+#include "gather_output.h"
 
 namespace kvaf {
 
@@ -15,6 +16,8 @@ struct CpuGatherReadRequest {
   std::vector<peer::GatherSpan> spans;
   std::uint64_t staging_address{0U};
   MutableBufferView output;
+  std::vector<GatherOutputSpan> output_spans;
+  std::uint32_t sgl_size{kGatherMaxSglSize};
   void* stream{nullptr};
 };
 

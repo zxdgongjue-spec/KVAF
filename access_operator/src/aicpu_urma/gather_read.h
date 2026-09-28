@@ -2,6 +2,8 @@
 
 #include <cstdint>
 
+#include "gather_output.h"
+
 namespace kvaf::aicpu_urma {
 
 constexpr std::uint64_t kGatherStatusMagic = 0x4b56414647415448ULL;
@@ -27,12 +29,16 @@ struct GatherReadArgs {
   std::uint64_t remote_command;
   std::uint64_t remote_notify;
   std::uint64_t remote_ack;
+  std::uint64_t output_spans;
+  std::uint64_t output_extent;
   std::uint64_t sequence;
   std::uint32_t bytes;
+  std::uint32_t output_span_count;
+  std::uint32_t sgl_size;
   std::uint32_t reserved;
 };
 
 static_assert(sizeof(GatherReadStatus) == 64U, "GatherRead status ABI changed");
-static_assert(sizeof(GatherReadArgs) == 80U, "GatherRead argument ABI changed");
+static_assert(sizeof(GatherReadArgs) == 104U, "GatherRead argument ABI changed");
 
 }  // namespace kvaf::aicpu_urma

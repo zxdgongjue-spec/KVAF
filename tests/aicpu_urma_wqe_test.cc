@@ -53,6 +53,41 @@ int main() {
   assert(reads[1].remote_address == 0x100000000ULL + kvaf::aicpu_urma::kMaxReadBytes);
   assert(reads[2].local_address == 0x200000000ULL + 2U * kvaf::aicpu_urma::kMaxReadBytes);
   assert(reads[2].length == 64U && reads[2].local_token_id == 27U);
+  assert(kvaf::aicpu_urma::ScatterWqebbs(1U) == 1U);
+  assert(kvaf::aicpu_urma::ScatterWqebbs(2U) == 2U);
+  assert(kvaf::aicpu_urma::ScatterWqebbs(5U) == 2U);
+  assert(kvaf::aicpu_urma::ScatterWqebbs(8U) == 3U);
+  kvaf::aicpu_urma::ScatterTransfer scatter{};
+  scatter.remote_address = 0x1122334455667788ULL;
+  scatter.sge_count = 8U;
+  for (std::uint32_t index = 0U; index < scatter.sge_count; ++index) {
+    scatter.sges[index] = {0x200000000ULL + index * 4096U, 656U, 27U};
+    scatter.bytes += 656U;
+  }
+  std::uint32_t scatter_words[kvaf::aicpu_urma::kMaxScatterWqebbs * 16U];
+  kvaf::aicpu_urma::EncodeScatterReadWqe(scatter_words, endpoint, scatter, 1U, true);
+  assert(scatter_words[0] == 0xb03e0000U);
+  assert(scatter_words[1] == kvaf::aicpu_urma::kReadOpcode << 8U);
+  assert(scatter_words[2] == 0x08345678U);
+  assert(scatter_words[10] == 0x55667788U && scatter_words[11] == 0x11223344U);
+  for (std::uint32_t index = 0U; index < scatter.sge_count; ++index) {
+    const auto base = 12U + index * 4U;
+    assert(scatter_words[base] == 656U && scatter_words[base + 1U] == 27U);
+    assert(scatter_words[base + 2U] == index * 4096U);
+    assert(scatter_words[base + 3U] == 2U);
+  }
+  for (std::uint32_t index = 44U; index < 48U; ++index)
+    assert(scatter_words[index] == 0U);
+  scatter.sge_count = 1U;
+  kvaf::aicpu_urma::EncodeScatterReadWqe(scatter_words, endpoint, scatter, 0U, true);
+  assert(scatter_words[2] == 0x01345678U);
+  assert(scatter_words[12] == 656U && scatter_words[13] == 27U);
+  std::uint32_t single_read[16];
+  kvaf::aicpu_urma::EncodeWqe(single_read, endpoint,
+      {scatter.remote_address, scatter.sges[0].address,
+       scatter.sges[0].length, scatter.sges[0].token_id},
+      kvaf::aicpu_urma::kReadOpcode, 0U, true);
+  assert(std::memcmp(scatter_words, single_read, sizeof(single_read)) == 0);
   assert(kvaf::aicpu_urma::InRange(0x1000, 0x100, 0x1080, 0x80));
   assert(!kvaf::aicpu_urma::InRange(0x1000, 0x100, 0x1080, 0x81));
   assert(!kvaf::aicpu_urma::InRange(0x1000, 0x100, 0xfff, 1));

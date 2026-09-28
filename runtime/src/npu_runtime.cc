@@ -24,6 +24,7 @@
 
 #include "batch_get_abi.h"
 #include "access_operator.h"
+#include "gather_output_layout.h"
 #include "peer_link.h"
 #include "meta_manager.h"
 #include "npu_eid_discovery.h"
@@ -404,18 +405,27 @@ Status NpuRuntime::GatherRead(const CpuGatherReadRequest& request) {
   if (!peer::ValidateGather(region.base, region.length, request.staging_address,
                             request.spans, &total_bytes))
     return Status::InvalidArgument("invalid GatherRead source or staging layout");
-  const std::uint64_t scratch_offset =
-      (static_cast<std::uint64_t>(total_bytes) + 63U) & ~std::uint64_t{63U};
-  if (request.output.bytes < scratch_offset + 64U)
-    return Status::InvalidArgument("GatherRead output needs 64-byte aligned scratch after the payload");
+  std::vector<GatherOutputSpan> contiguous_output;
+  if (request.output_spans.empty())
+    contiguous_output.push_back({0U, total_bytes, 0U});
+  const auto& output_spans = request.output_spans.empty()
+                                 ? contiguous_output : request.output_spans;
+  std::uint64_t output_extent = 0U;
+  if (request.sgl_size == 0U || request.sgl_size > kGatherMaxSglSize ||
+      output_spans.size() > peer::kMaxGatherSpans ||
+      !ValidateGatherOutput(request.output.bytes, output_spans, total_bytes,
+                            &output_extent))
+    return Status::InvalidArgument("invalid GatherRead HBM scatter layout or SGL size");
   peer::GatherReady ready{};
   Status status = impl_->peer_link->ConfigureGather(region.base, request.staging_address,
                                                     request.spans, &ready);
   if (!status.ok()) return status;
   return impl_->access_operator->ExecuteCpuGatherRead(CpuGatherReadExecRequest{
-      request.output, request.staging_address, ready.command_address,
-      ready.notify_address, ready.ack_address, ready.sequence, ready.total_bytes,
-      request.stream});
+      request.output, output_spans.data(),
+      static_cast<std::uint32_t>(output_spans.size()), request.sgl_size,
+      output_extent, request.staging_address, ready.command_address,
+      ready.notify_address, ready.ack_address, ready.sequence,
+      ready.total_bytes, request.stream});
 }
 
 RuntimeCore& NpuRuntime::core() {
