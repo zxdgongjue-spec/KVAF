@@ -3,6 +3,8 @@ add_executable(kvaf_aicpu_get_protocol_test protocol_test.cc)
 target_include_directories(kvaf_aicpu_get_protocol_test PRIVATE "${CMAKE_SOURCE_DIR}/access_operator/include")
 target_link_libraries(kvaf_aicpu_get_protocol_test PRIVATE kvaf_peer_link Threads::Threads)
 add_test(NAME kvaf_aicpu_get_protocol COMMAND kvaf_aicpu_get_protocol_test)
+add_executable(kvaf_aicpu_scatter_profile_test scatter_profile_test.cc)
+add_test(NAME kvaf_aicpu_scatter_profile COMMAND kvaf_aicpu_scatter_profile_test)
 
 if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   add_executable(kvaf_aicpu_get_cpu cpu_main.cc)
@@ -40,7 +42,7 @@ if(KVAF_BUILD_AICPU_GET_TEST)
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/aicpu_kernels_device"
     COMMAND "${KVAF_AICPU_CXX}" -std=c++17 -O3 -shared -fPIC -pthread
             -I "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/kernel.cc" -o "${kernel_so}"
-    DEPENDS kernel.cc device_loop.h scatter_pool.h abi.h VERBATIM)
+    DEPENDS kernel.cc device_loop.h scatter_pool.h scatter_profile.h abi.h VERBATIM)
   add_custom_command(OUTPUT "${kernel_tar}"
     COMMAND ${CMAKE_COMMAND} -E tar czf "${kernel_tar}" aicpu_kernels_device
     WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"

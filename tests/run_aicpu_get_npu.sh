@@ -18,6 +18,7 @@ Wrapper options:
   --cann-root DIR     Installation root; defaults to CANN environment/cache
 
 Pass-through options: --port 29991 --device-id 0 --eid HEX --kernel-json PATH
+  --profile-scatter   Report AICPU CPU placement and scatter phase timing after the run
 Without --device-id, use the CPU request's NPU device ID. With it, reject a mismatch.
 The built kernel JSON is selected automatically. No installation by default.
 Set --rows, --row-bytes and --scatter-threads on the CPU script.

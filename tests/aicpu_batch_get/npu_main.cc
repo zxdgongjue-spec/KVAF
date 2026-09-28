@@ -1,5 +1,6 @@
 #include "npu_target.h"
 #include "metrics.h"
+#include "scatter_profile_report.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -11,6 +12,7 @@ using namespace kvaf::aicpu_test;
 struct Options {
   std::uint32_t device{};
   bool has_device{};
+  bool profile_scatter{};
   std::uint16_t port{29991};
   std::string eid, json;
 };
@@ -18,6 +20,7 @@ Options Parse(int argc, char** argv) {
   Options o;
   for (int i = 1; i < argc; ++i) {
     const std::string flag = argv[i];
+    if (flag == "--profile-scatter") { o.profile_scatter = true; continue; }
     Require(i + 1 < argc, "missing option value");
     const char* value = argv[++i];
     if (flag == "--kernel-json") o.json = value;
@@ -93,17 +96,20 @@ void ValidateOutput(const Config& c, const Layout& l, const DeviceBuffer& output
   }
 }
 
-Report Execute(int fd, const Config& config, NpuTarget& target, const std::string& json) {
+Report Execute(int fd, const Config& config, NpuTarget& target, const std::string& json,
+               bool profile_scatter) {
   Layout layout{}; Require(MakeLayout(config, &layout), "invalid config");
-  DeviceBuffer output, samples, result;
+  DeviceBuffer output, samples, result, profile;
   output.Allocate(layout.output_bytes, 0xA5);
   samples.Allocate(config.iterations * sizeof(Sample));
   result.Allocate(sizeof(KernelResult));
+  if (profile_scatter) profile.Allocate(sizeof(ScatterProfile));
   Kernel kernel; kernel.Load(json);
   KernelArgs args{reinterpret_cast<std::uint64_t>(target.memory()),
                   reinterpret_cast<std::uint64_t>(output.data),
                   reinterpret_cast<std::uint64_t>(samples.data),
-                  reinterpret_cast<std::uint64_t>(result.data), config};
+                  reinterpret_cast<std::uint64_t>(result.data), config,
+                  reinterpret_cast<std::uint64_t>(profile.data)};
   kernel.Launch(args);
   // Once launched, do not unwind allocations until both device execution and
   // CPU transport have stopped. A lost control connection requires retaining
@@ -163,6 +169,12 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
   std::vector<Sample> timings(config.iterations);
   Acl(aclrtMemcpy(timings.data(), timings.size() * sizeof(Sample), samples.data,
                    timings.size() * sizeof(Sample), ACL_MEMCPY_DEVICE_TO_HOST), "read timings");
+  if (profile_scatter) {
+    auto device_profile = std::make_unique<ScatterProfile>();
+    Acl(aclrtMemcpy(device_profile.get(), sizeof(ScatterProfile), profile.data,
+                     sizeof(ScatterProfile), ACL_MEMCPY_DEVICE_TO_HOST), "read scatter profile");
+    PrintScatterProfile(stderr, config, device_result.counter_frequency, *device_profile);
+  }
   return Summarize(config, device_result, timings);
 }
 
@@ -278,7 +290,7 @@ void Run(const Options& options) {
     }
     Require(kvaf::peer::IsValidHeader(header, kStart, sizeof(header)), "expected START");
     Report report{};
-    try { report = Execute(fd.get(), config, *target, options.json); }
+    try { report = Execute(fd.get(), config, *target, options.json, options.profile_scatter); }
     catch (const std::exception& e) { std::fprintf(stderr, "NPU benchmark failed: %s\n", e.what()); }
     Send(fd.get(), &report, sizeof(report));
     Require(report.status == 0, "benchmark failed");

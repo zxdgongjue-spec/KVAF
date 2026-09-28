@@ -5,8 +5,8 @@
 
 namespace kvaf::aicpu_test {
 constexpr std::uint64_t kMagic = 0x4b56414641424732ULL;
-constexpr char kKernelName[] = "KvafAicpuBatchGetV2";
-constexpr std::uint64_t kKernelRevision = 2;
+constexpr char kKernelName[] = "KvafAicpuBatchGetV3";
+constexpr std::uint64_t kKernelRevision = 3;
 constexpr std::uint64_t kMaxScatterThreads = 32;
 constexpr std::uint64_t kRequestOffset = 0;
 constexpr std::uint64_t kDoneOffset = 256;
@@ -83,6 +83,8 @@ struct KernelArgs {
   std::uint64_t samples;
   std::uint64_t result;
   Config config;
+  // Optional device-side profiling buffer; zero keeps the normal timing path.
+  std::uint64_t profile;
 };
 
 // Nontrivial row/byte pattern plus a changing per-round header detects stale
@@ -118,5 +120,5 @@ inline RowRange ScatterRange(const Config& c, std::uint32_t worker, std::uint32_
 }
 static_assert(sizeof(Config) == 56 && sizeof(Control) == 64);
 static_assert(sizeof(Sample) == 24 && sizeof(KernelResult) == 64);
-static_assert(sizeof(KernelArgs) == 88);
+static_assert(sizeof(KernelArgs) == 96);
 }  // namespace kvaf::aicpu_test

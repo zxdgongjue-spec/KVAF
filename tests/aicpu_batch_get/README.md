@@ -4,12 +4,13 @@
 
 scatter 使用 AICPU `memcpy`，支持 `--scatter-threads 1..32`（默认 1）。
 调用线程也参与复制，其余 pthread 在进入测试循环前创建，跨预热和计时轮复用。
-CSV 标注 `aicpu_memcpy` / `aicpu_memcpy_mt`，并输出请求与实际线程数。
+CSV 标注 `aicpu_memcpy` / `aicpu_memcpy_mt`，并输出请求与参与分片的线程数。
+`active_threads` 不是实际占用的核数；实际核采样需启用下面的诊断开关。
 线程创建失败报告 `pthread_error`，不会静默回退。设备 pthread 支持及带宽需在目标机器验证。
 
 ### 4096 × 656 B、多线程测试
 
-更新后需重新构建两端、安装 V2 kernel，并重启测试进程：
+更新后需重新构建两端、安装 V3 kernel，并重启测试进程：
 
 ```bash
 bash build.sh aicpu-cpu
@@ -29,6 +30,71 @@ bash tests/run_aicpu_get_cpu.sh --peer 127.0.0.1:29991 --device-id 4 \
 分别测试线程数 1、2、4、8；每次先重启 NPU 脚本，后续无需重复安装。
 本版本按线程批量 clean 输出，单线程基线也应使用本版本重新测量。
 线程调度、完成等待及缓存操作计入 scatter；创建/销毁线程、数据校验不计入。
+
+### 实际运行核与 scatter 三段计时
+
+在 **NPU 端**增加 `--profile-scatter`，默认关闭。升级需重新编译并安装 V3 kernel，
+本次新增了 kernel 参数，独立的 V3 入口可避免旧 device `.so` 静默忽略诊断参数。
+CPU 控制协议和原有 CSV 列保持不变。先启动 NPU 端：
+
+```bash
+bash build.sh aicpu-npu
+bash tests/run_aicpu_get_npu.sh --install-kernel --device-id 7 \
+  --profile-scatter 2>&1 | tee aicpu-profile-t4.log
+```
+
+另一个终端启动 CPU 端：
+
+```bash
+bash build.sh aicpu-cpu
+bash tests/run_aicpu_get_cpu.sh --peer 127.0.0.1:29991 --device-id 7 \
+  --rows 4096 --row-bytes 656 --scatter-threads 4 \
+  --remote-sgl-size 16 --jettys 4 --prepare-threads 4 \
+  --warmup 5 --iterations 1000 --output aicpu-t4.csv
+```
+
+分别测 1、2、4、8 线程时，每次重启 NPU 脚本并修改日志文件名，后续不必重复安装。
+保持 CPU 端 OpenMP/绑核环境一致。测试结束后，NPU 日志输出 `[AICPU_PROFILE] SUMMARY`
+及每个 worker 的 `[AICPU_PROFILE] WORKER`，所有均值只覆盖正式测量轮次，不含预热。
+worker 0 是 kernel 调用线程，其余是持久 pthread。
+
+| 字段 | 含义 |
+| --- | --- |
+| `allowed_cpus` | 测试循环前在该 worker 上读取的 affinity；这是允许集合，不是实际运行核 |
+| `cpu_hits=CPU:次数,...` | 每个正式轮次的工作前后各采样一次 `sched_getcpu()`；不是各核驻留时间/利用率 |
+| `first_cpu` / `last_cpu` | 首个/最后一个有效核采样；`-1` 表示无有效采样 |
+| `boundary_cpu_changes` | 同一轮开始与结束采样核不同的次数；不能捕获两次采样间迁出又迁回 |
+| `avg_invalidate_us` | 该 worker 输入区的 `dc civac` 循环和末尾 `dsb sy` |
+| `avg_memcpy_us` | 该 worker 逐行 memcpy 循环 |
+| `avg_clean_us` | 该 worker 输出区的 `dc cvac` 循环和末尾 `dsb sy` |
+| `avg_start_us` / `avg_finish_us` | 相对本轮 pool dispatch 的三段工作起止时间均值，可看线程启动延迟/错峰 |
+| `avg_thread_cpu_us` | 工作区间的线程 CPU 时间，有效轮次均值；包括包围三段工作的少量计时开销 |
+| `avg_pool_us` | 从调用线程派发到全部 worker 返回的墙钟时间 |
+| `avg_dispatch_us` | 派发至最早 worker 开始三段工作 |
+| `avg_envelope_us` | 最早 worker 开始至最后 worker 完成三段工作的时间，包含区间内调度等待 |
+| `avg_join_us` | 最后 worker 完成三段工作至 pool 返回，含收尾统计/同步 |
+| `cpu_parallelism` | 所有 worker 线程 CPU 时间之和 / pool 墙钟时间，近似平均同时运行线程数；不是配置线程数 |
+
+`avg_pool_us = avg_dispatch_us + avg_envelope_us + avg_join_us`。
+多线程阶段可能重叠，不能把各 worker 三段耗时相加后与 scatter 墙钟直接比较。
+三段是墙钟耗时，线程被抢占也会计入；通过线程 CPU 时间辅助区分执行与调度等待。
+`cpu_parallelism` 接近 1 只说明平均并行度低，需要结合允许核集合判断是否限制在单核。
+
+affinity、核采样、线程 CPU 时钟分别报告 `affinity_errno`、`cpu_sample_errors/errno`、
+`cpu_time_rounds/errors/errno`。查询失败显示 `unavailable`，不冒充 CPU 0 或零耗时。
+核分布支持 CPU ID 0..1023，超出范围计入 `cpu_out_of_range`；affinity 缓冲不足等查询错误显式报告。
+若任一 worker 缺少正式轮次的线程 CPU 时间，汇总 `cpu_parallelism=unavailable`。
+
+所有打印和 affinity 查询都在正式计时循环之外；轮内核采样、CPU 时钟和统计本身仍有开销，
+`avg_dispatch_us/avg_join_us` 不能视为纯锁开销，CSV 的 scatter 也会包含插桩开销。
+诊断后去掉 `--profile-scatter` 重跑性能基线。默认模式不执行这些额外采样或阶段计时。
+
+统计逻辑的无设备测试：
+
+```bash
+cmake --build build-aicpu-cpu --target kvaf_aicpu_scatter_profile_test
+ctest --test-dir build-aicpu-cpu -R '^kvaf_aicpu_scatter_profile$' --output-on-failure
+```
 
 ## 执行流程
 
