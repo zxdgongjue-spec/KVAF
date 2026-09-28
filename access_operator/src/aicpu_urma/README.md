@@ -91,13 +91,22 @@ WQEBB；每 32 条 WQE 在末条请求 CQE。单条 WQE 的总数据量不超过
 CPU worker 在用户态用 `dc civac` 重新读取 DMA 写入的控制字和源块；`dc ivac`
 在 EL0 不可用，会令服务端进程收到 `SIGILL`。这些行在 DMA 写入前已 clean，
 worker 对控制区写入 ack 后也立即 clean，避免 clean-and-invalidate 回写旧数据。
+源缓存处理、staging 拷贝和 staging flush 现在各自并行执行；每一阶段完成后
+所有线程同步，再进入下一阶段，保证 DMA 可见性。辅助线程随 CPU region 的
+首次需要该并行度时创建并复用，配置请求唤醒，等待 AICPU 通知期间保持 active，
+完成后休眠。默认按 CPU 核数自动选择上限 32，并按每线程至少 256 KiB 的
+payload 限制实际并行度；服务端可用 `--gather-threads N` 指定上限（1 到 64，
+显式指定时阈值降为每线程 64 KiB，设为 1 可作为单线程基线）。
+`[KVAF_CPU] GATHER_THREADS` 日志显示实际线程数。
+CPU profiling 的三个阶段耗时均包含线程分发与同步，需在目标机器上用同一
+batch 比较 `--gather-threads 1/4/8/16` 后再选线程数。
 
 两端分别运行：
 
 ```bash
 # CPU 终端
 ./build.sh cpu
-build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999
+build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999 --gather-threads 16
 
 # NPU 终端
 ./build.sh aicpu-urma --install-kernel

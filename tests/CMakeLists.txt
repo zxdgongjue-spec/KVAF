@@ -11,6 +11,7 @@ add_test(NAME kvaf_aicpu_urma_wqe COMMAND kvaf_aicpu_urma_wqe_test)
 
 add_executable(kvaf_cpu_gather_test cpu_gather_test.cc)
 target_include_directories(kvaf_cpu_gather_test PRIVATE "${CMAKE_SOURCE_DIR}/runtime/include")
+target_link_libraries(kvaf_cpu_gather_test PRIVATE Threads::Threads)
 add_test(NAME kvaf_cpu_gather COMMAND kvaf_cpu_gather_test)
 
 add_executable(kvaf_aicpu_gather_read_layout_test aicpu_gather_read_layout_test.cc)

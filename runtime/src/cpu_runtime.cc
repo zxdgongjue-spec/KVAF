@@ -4,6 +4,7 @@
 #include "cpu_urma/cpu_urma_link_selection.h"
 #include "peer_link.h"
 #include "cpu_gather.h"
+#include "cpu_gather_team.h"
 #include "gather_read_profile.h"
 
 #include <dlfcn.h>
@@ -410,14 +411,18 @@ struct Channel {
 
 class CpuGatherWorker {
  public:
-  CpuGatherWorker(void* memory, uint64_t base, uint64_t bytes)
-      : memory_(memory), base_(base), bytes_(bytes),
+  CpuGatherWorker(void* memory, uint64_t base, uint64_t bytes,
+                  std::size_t gather_threads,
+                  std::size_t min_bytes_per_thread)
+      : base_(base), bytes_(bytes),
         control_(reinterpret_cast<peer::GatherControl*>(
             static_cast<uint8_t*>(memory) + peer::GatherControlOffset(bytes))),
-        worker_(&CpuGatherWorker::Run, this) {
+        team_(memory, base, gather_threads, min_bytes_per_thread),
+        max_threads_(gather_threads) {
     std::memset(control_, 0, sizeof(*control_));
-    CacheLine(control_, false);
-    Barrier();
+    peer::GatherCacheLine(control_, false);
+    peer::GatherBarrier();
+    worker_ = std::thread(&CpuGatherWorker::Run, this);
   }
 
   ~CpuGatherWorker() {
@@ -427,11 +432,17 @@ class CpuGatherWorker {
   }
 
   bool Configure(uint64_t staging, const std::vector<GatherSpan>& spans,
+                 std::uint32_t total_bytes,
                  ConfigureGatherResponse* response) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (scheduled_ != completed_ || scheduled_ == UINT64_MAX) return false;
-    staging_ = staging;
     spans_ = spans;
+    const std::size_t gather_threads = team_.Prepare(staging, spans_, total_bytes);
+    if (gather_threads != reported_threads_) {
+      Log("[KVAF_CPU] GATHER_THREADS active=%zu max=%zu bytes=%u\n",
+          gather_threads, max_threads_, total_bytes);
+      reported_threads_ = gather_threads;
+    }
     scheduled_at_ns_ = NowNs();
     ++scheduled_;
     response->sequence = scheduled_;
@@ -448,37 +459,6 @@ class CpuGatherWorker {
         std::chrono::steady_clock::now().time_since_epoch()).count());
   }
 
-  static void CacheLine(void* address, bool invalidate) {
-#if defined(__aarch64__)
-    if (invalidate) asm volatile("dc civac, %0" :: "r"(address) : "memory");
-    else asm volatile("dc cvac, %0" :: "r"(address) : "memory");
-#else
-    (void)address;
-    (void)invalidate;
-#endif
-  }
-
-  static void Barrier() {
-#if defined(__aarch64__)
-    asm volatile("dsb sy" ::: "memory");
-#else
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-#endif
-  }
-
-  static void CacheRange(void* address, uint64_t bytes, bool invalidate) {
-#if defined(__aarch64__)
-    const auto first = reinterpret_cast<uintptr_t>(address) & ~uintptr_t{63U};
-    const auto end = reinterpret_cast<uintptr_t>(address) + bytes;
-    for (auto line = first; line < end; line += 64U)
-      CacheLine(reinterpret_cast<void*>(line), invalidate);
-#else
-    (void)address;
-    (void)bytes;
-    (void)invalidate;
-#endif
-  }
-
   void Run() {
     auto* notify = &control_->notify;
     auto* ack = &control_->ack;
@@ -490,48 +470,38 @@ class CpuGatherWorker {
       });
       if (stop_.load(std::memory_order_acquire)) return;
       const auto sequence = scheduled_;
-      const auto staging = staging_;
-      const auto spans = spans_;
       const auto scheduled_at_ns = scheduled_at_ns_;
       lock.unlock();
       peer::GatherCpuProfile profile{};
       const auto poll_start_ns = NowNs();
       profile.dispatch_ns = poll_start_ns - scheduled_at_ns;
       while (!stop_.load(std::memory_order_acquire)) {
-        CacheLine(control_, true);
-        Barrier();
+        peer::GatherCacheLine(control_, true);
+        peer::GatherBarrier();
         if (__atomic_load_n(notify, __ATOMIC_ACQUIRE) == sequence &&
             __atomic_load_n(command, __ATOMIC_ACQUIRE) == sequence) break;
-        std::this_thread::yield();
+        peer::GatherSpinPause();
       }
       if (stop_.load(std::memory_order_acquire)) return;
       const auto notified_ns = NowNs();
       profile.notify_spin_ns = notified_ns - poll_start_ns;
-      for (const auto& span : spans)
-        CacheRange(static_cast<uint8_t*>(memory_) + (span.address - base_),
-                   span.length, true);
-      Barrier();
+      team_.InvalidateSources();
       const auto source_ready_ns = NowNs();
       profile.source_cache_ns = source_ready_ns - notified_ns;
-      peer::GatherIntoStaging(memory_, base_, staging, spans);
+      team_.Copy();
       const auto copied_ns = NowNs();
       profile.copy_ns = copied_ns - source_ready_ns;
-      uint8_t* gathered = static_cast<uint8_t*>(memory_) + (staging - base_);
-      uint64_t gathered_bytes = 0U;
-      for (const auto& span : spans) gathered_bytes += span.length;
-      CacheRange(gathered, gathered_bytes, false);
-      Barrier();
+      team_.FlushStaging();
       profile.staging_flush_ns = NowNs() - copied_ns;
       control_->profile = profile;
       __atomic_store_n(ack, sequence, __ATOMIC_RELEASE);
-      CacheLine(control_, false);
-      Barrier();
+      peer::GatherCacheLine(control_, false);
+      peer::GatherBarrier();
       lock.lock();
       completed_ = sequence;
     }
   }
 
-  void* memory_;
   uint64_t base_;
   uint64_t bytes_;
   peer::GatherControl* control_;
@@ -539,7 +509,9 @@ class CpuGatherWorker {
   std::mutex mutex_;
   std::condition_variable changed_;
   std::vector<GatherSpan> spans_;
-  uint64_t staging_{0U};
+  peer::CpuGatherTeam team_;
+  std::size_t max_threads_{0U};
+  std::size_t reported_threads_{0U};
   std::uint64_t scheduled_at_ns_{0U};
   uint64_t scheduled_{0U};
   uint64_t completed_{0U};
@@ -562,7 +534,10 @@ struct Region {
 
 class CpuService {
  public:
-  explicit CpuService(UrmaResourcePool* resource_pool) : resource_pool_(resource_pool) {}
+  CpuService(UrmaResourcePool* resource_pool, std::size_t gather_threads,
+             std::size_t min_bytes_per_thread)
+      : resource_pool_(resource_pool), gather_threads_(gather_threads),
+        min_bytes_per_thread_(min_bytes_per_thread) {}
   ~CpuService() { ReleaseAll(); }
 
   uint32_t CandidateCount() const {
@@ -733,9 +708,17 @@ class CpuService {
     uint32_t total_bytes = 0U;
     if (!peer::ValidateGather(region.base, region.bytes, staging, spans, &total_bytes))
       return Result::kInvalidRequest;
-    if (region.gather == nullptr)
-      region.gather = std::make_unique<CpuGatherWorker>(region.memory, region.base, region.bytes);
-    if (!region.gather->Configure(staging, spans, response)) return Result::kResourceError;
+    try {
+      if (region.gather == nullptr)
+        region.gather = std::make_unique<CpuGatherWorker>(
+            region.memory, region.base, region.bytes, gather_threads_,
+            min_bytes_per_thread_);
+      if (!region.gather->Configure(staging, spans, total_bytes, response))
+        return Result::kResourceError;
+    } catch (const std::exception& error) {
+      Log("[KVAF_CPU] GATHER_CONFIG_FAILED reason=%s\n", error.what());
+      return Result::kResourceError;
+    }
     response->total_bytes = total_bytes;
     return Result::kOk;
   }
@@ -851,6 +834,8 @@ class CpuService {
   }
 
   UrmaResourcePool* resource_pool_ = nullptr;
+  std::size_t gather_threads_{1U};
+  std::size_t min_bytes_per_thread_{256U * 1024U};
   uint64_t next_region_id_ = 1U;
   uint32_t next_token_ = 1U;
   uint32_t next_psn_ = 1U;
@@ -990,11 +975,20 @@ Status CpuRuntime::Initialize(const CpuRuntimeOptions& options) {
   if (options.has_eid_index && options.ub_device.empty()) {
     return Status::InvalidArgument("CpuRuntime eid_index requires ub_device");
   }
+  if (options.gather_threads > 64U)
+    return Status::InvalidArgument("CpuRuntime gather_threads must be in [1,64] or auto");
+  const auto detected = std::thread::hardware_concurrency();
+  const std::size_t gather_threads = options.gather_threads == 0U
+      ? std::min<std::size_t>(detected == 0U ? 1U : detected, 32U)
+      : options.gather_threads;
   auto impl = std::make_unique<Impl>();
   if (!impl->resources.Initialize(options.ub_device, options.has_eid_index, options.eid_index)) {
     return Status::Internal("CpuRuntime failed to initialize UMDK resources");
   }
-  impl->service = std::make_unique<CpuService>(&impl->resources);
+  const std::size_t min_bytes_per_thread = options.gather_threads == 0U
+      ? 256U * 1024U : 64U * 1024U;
+  impl->service = std::make_unique<CpuService>(
+      &impl->resources, gather_threads, min_bytes_per_thread);
   impl_ = std::move(impl);
   return Status::OK();
 }

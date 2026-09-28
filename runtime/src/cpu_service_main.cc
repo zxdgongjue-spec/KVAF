@@ -11,9 +11,10 @@ namespace {
 
 void PrintUsage(const char* program) {
   std::fprintf(stderr,
-               "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N]\n"
+               "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] [--gather-threads N]\n"
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
-               "candidates are discovered automatically. The service requires only liburma and /dev/uburma.\n",
+               "candidates are discovered automatically. Gather threads default to auto (up to 32). "
+               "The service requires only liburma and /dev/uburma.\n",
                program);
 }
 
@@ -39,7 +40,8 @@ int main(int argc, char** argv) {
       return 0;
     }
     if ((argument == "--listen" || argument == "--port" || argument == "--ub-device" ||
-         argument == "--eid-index") && index + 1 >= argc) {
+         argument == "--eid-index" || argument == "--gather-threads") &&
+        index + 1 >= argc) {
       PrintUsage(argv[0]);
       return 2;
     }
@@ -62,6 +64,12 @@ int main(int argc, char** argv) {
         return 2;
       }
       cpu_options.has_eid_index = true;
+    } else if (argument == "--gather-threads") {
+      if (!ParseUnsigned(argv[++index], 64U, &cpu_options.gather_threads) ||
+          cpu_options.gather_threads == 0U) {
+        std::fprintf(stderr, "invalid --gather-threads (expected 1..64)\n");
+        return 2;
+      }
     } else {
       PrintUsage(argv[0]);
       return 2;

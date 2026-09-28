@@ -14,6 +14,7 @@ struct CpuRuntimeOptions {
   std::string ub_device;
   bool has_eid_index{false};
   std::uint32_t eid_index{0};
+  std::uint32_t gather_threads{0U};
 };
 
 struct CpuRuntimeClientOptions {
