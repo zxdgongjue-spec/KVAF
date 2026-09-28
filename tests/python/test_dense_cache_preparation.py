@@ -13,7 +13,9 @@ def test_exact_cache_line_coverage(tmp_path):
     source = (Path(__file__).resolve().parents[2] /
               "access_operator/demo/aiv_batch_get/kernel/execute_batch_get_aiv.asc").read_text()
     start = source.index("__aicore__ inline void PrepareDenseBatchGetOutputForInboundDma(")
-    end = source.index("__aicore__ inline uint32_t WqeControl", start)
+    # Extract only the row-wise function under test, not the newer adjacent
+    # entire-cache device helper (which requires actual Ascend C types).
+    end = source.index("__aicore__ inline void PrepareDenseBatchGetOutputForInboundDmaEntire(", start)
     body = source[start:end]
     assert "ReadGmByPassDCache" not in body
     cpp = tmp_path / "cache.cpp"
