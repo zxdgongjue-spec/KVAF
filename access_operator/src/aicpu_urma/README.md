@@ -124,7 +124,9 @@ build-aicpu-urma/tests/kvaf_aicpu_gather_read_client \
 
 客户端每轮 BatchPut 不同 payload 到 DDR，按 block 逆序生成 gather 清单，再用
 多 SGL READ 将数据写入原 block 顺序的稀疏 HBM 槽位；逐字节校验槽位及空隙，
-仅汇总 GatherRead 计时。`--sgl-size` 接受 1 到 2^32-1；大于 6 时，
+仅汇总 GatherRead 计时。客户端的输入和输出 HBM 使用
+`ACL_MEM_MALLOC_HUGE_FIRST` 优先分配大页；是否实际获得大页由 CANN 决定。
+`--sgl-size` 接受 1 到 2^32-1；大于 6 时，
 内核自动将请求拆成每条最多 6 个目标 SGE 的 READ WQE，不会发出未经验证的
 8-SGE WQE；因此设置大于 6 不会减少 WQE 数量。`--output-stride` 不得小于
 `--block-bytes`，默认是两倍 block 大小。客户端从保留 key 的 AccessTable 中选择连续

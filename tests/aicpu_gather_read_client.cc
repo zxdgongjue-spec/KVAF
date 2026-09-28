@@ -113,7 +113,7 @@ struct AclContext {
 
 struct DeviceBuffer {
   explicit DeviceBuffer(std::size_t length) : bytes(length) {
-    Acl(aclrtMalloc(&data, bytes, ACL_MEM_MALLOC_NORMAL_ONLY), "aclrtMalloc");
+    Acl(aclrtMalloc(&data, bytes, ACL_MEM_MALLOC_HUGE_FIRST), "aclrtMalloc");
   }
   ~DeviceBuffer() { if (data != nullptr) (void)aclrtFree(data); }
   void Upload(const void* source) {
