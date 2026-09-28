@@ -38,7 +38,7 @@ void Barrier() {
 #endif
 }
 
-void Flush(const void* address, std::uint64_t bytes) {
+void FlushLines(const void* address, std::uint64_t bytes) {
 #if defined(KVAF_AICPU_URMA_HOST_TEST)
   (void)address;
   (void)bytes;
@@ -47,8 +47,12 @@ void Flush(const void* address, std::uint64_t bytes) {
   const auto end = reinterpret_cast<std::uintptr_t>(address) + bytes;
   for (auto line = first; line < end; line += 64U)
     asm volatile("dc civac, %0" :: "r"(line) : "memory");
-  Barrier();
 #endif
+}
+
+void Flush(const void* address, std::uint64_t bytes) {
+  FlushLines(address, bytes);
+  Barrier();
 }
 
 void Ring(volatile std::uint32_t* doorbell, std::uint32_t value) {
@@ -226,10 +230,11 @@ std::uint32_t SubmitScatter(const Entity& entity, Queue& queue,
       const auto slot = (producer + block) % entity.sq_depth;
       auto* destination = reinterpret_cast<void*>(entity.sq_va + slot * 64U);
       std::memcpy(destination, &words[block * 16U], 64U);
-      Flush(destination, 64U);
+      FlushLines(destination, 64U);
     }
     producer += wqebbs;
   }
+  Barrier();
   queue.sq_producer_index = producer;
   Ring(reinterpret_cast<volatile std::uint32_t*>(entity.sq_db_va),
        static_cast<std::uint32_t>(producer));
@@ -559,8 +564,9 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
     status.phase = 3U;
     const auto preflush_start_ns = NowNs();
     for (std::uint32_t index = 0U; index < args->output_span_count; ++index)
-      Flush(reinterpret_cast<void*>(args->output + output_spans[index].offset),
-            output_spans[index].length);
+      FlushLines(reinterpret_cast<void*>(args->output + output_spans[index].offset),
+                 output_spans[index].length);
+    Barrier();
     status.scatter_cache_ns = NowNs() - preflush_start_ns;
     kvaf::aicpu_urma::ScatterTransfer data[32]{};
     std::uint32_t batch_count = 0U;
@@ -608,8 +614,9 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
     if (status.result == 0U) {
       const auto postflush_start_ns = NowNs();
       for (std::uint32_t index = 0U; index < args->output_span_count; ++index)
-        Flush(reinterpret_cast<void*>(args->output + output_spans[index].offset),
-              output_spans[index].length);
+        FlushLines(reinterpret_cast<void*>(args->output + output_spans[index].offset),
+                   output_spans[index].length);
+      Barrier();
       status.scatter_cache_ns += NowNs() - postflush_start_ns;
     }
   }

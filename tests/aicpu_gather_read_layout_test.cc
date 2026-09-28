@@ -43,10 +43,16 @@ int main() {
       {64U, 16U, 0U}, {0U, 16U, 0U}, {32U, 16U, 0U}};
   assert(kvaf::ValidateGatherOutput(192U, scattered, 48U, &extent));
   assert(extent == 80U);
+  assert(kvaf::ValidateGatherOutput(192U,
+      {{0U, 16U, 0U}, {32U, 16U, 0U}, {64U, 16U, 0U}}, 48U, &extent));
+  assert(kvaf::ValidateGatherOutput(192U,
+      {{64U, 16U, 0U}, {32U, 16U, 0U}, {0U, 16U, 0U}}, 48U, &extent));
   assert(!kvaf::ValidateGatherOutput(127U, scattered, 48U, &extent));
   assert(!kvaf::ValidateGatherOutput(192U, scattered, 47U, &extent));
   assert(!kvaf::ValidateGatherOutput(192U,
       {{0U, 16U, 0U}, {8U, 16U, 0U}}, 32U, &extent));
+  assert(!kvaf::ValidateGatherOutput(192U,
+      {{16U, 16U, 0U}, {8U, 16U, 0U}}, 32U, &extent));
   assert(!kvaf::ValidateGatherOutput(192U,
       {{0U, 16U, 1U}, {64U, 16U, 0U}}, 32U, &extent));
   std::cout << "AICPU GatherRead layout: PASS\n";

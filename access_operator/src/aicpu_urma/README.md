@@ -131,6 +131,11 @@ CPU gather 握手和 CQ 等待，不含输入上传、输出回读及逐字节�
 56 字节，因此小 batch 的总耗时不应直接与旧版无 profiling 结果比较。更新后需
 同时重新部署 CPU service 和 AICPU kernel。
 
+升序或降序且不重叠的 HBM 输出 span 使用线性布局校验；其他顺序仍通过排序
+检查重叠。AICPU 逐条处理输出 span 和 READ WQE 的 cache line，但输出缓存
+在 READ 前后各统一同步一次，SQ WQE 在敲 doorbell 前统一同步一次。该优化
+不改变 WQE、CQ 或链路协议。
+
 **硬件验证状态**：本分支的 Host WQE ABI/模拟队列测试和内核语法检查不等价于 NPU
 收发验证。部署后应先用 Runtime 自带的 LinkTo WRITE 探针确认链路，再在真实
 CPU DDR/HBM 之间做小 batch 的 put/get 数据回读验证，最后再进行性能测试。
