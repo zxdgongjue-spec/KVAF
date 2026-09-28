@@ -441,7 +441,7 @@ class CpuGatherWorker {
  private:
   static void CacheLine(void* address, bool invalidate) {
 #if defined(__aarch64__)
-    if (invalidate) asm volatile("dc ivac, %0" :: "r"(address) : "memory");
+    if (invalidate) asm volatile("dc civac, %0" :: "r"(address) : "memory");
     else asm volatile("dc cvac, %0" :: "r"(address) : "memory");
 #else
     (void)address;

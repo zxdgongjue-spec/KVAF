@@ -86,6 +86,10 @@ WRITE_WITH_NOTIFY（96 字节，占两个 64 字节 SQ WQEBB），将序号写�
 HBM 输出；超过 256 MiB 时按 hcomm 的单 WQE 上限分段提交。当前不执行 HBM
 离散地址 scatter，也不是多 SGL WQE。
 
+CPU worker 在用户态用 `dc civac` 重新读取 DMA 写入的控制字和源块；`dc ivac`
+在 EL0 不可用，会令服务端进程收到 `SIGILL`。这些行在 DMA 写入前已 clean，
+worker 对控制区写入 ack 后也立即 clean，避免 clean-and-invalidate 回写旧数据。
+
 两端分别运行：
 
 ```bash
