@@ -7,6 +7,7 @@
 
 #include "requests.h"
 #include "gather_output.h"
+#include "gather_read_profile.h"
 #include "status.h"
 #include "types.h"
 
@@ -38,6 +39,7 @@ struct CpuGatherReadExecRequest {
   std::uint64_t sequence{0U};
   std::uint32_t bytes{0U};
   void* stream{nullptr};
+  GatherReadTiming* timing{nullptr};
 };
 
 // KV Access Operator 是 Runtime 的数据面依赖。Runtime 管理远端 DDR

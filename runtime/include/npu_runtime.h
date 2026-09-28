@@ -9,6 +9,7 @@
 #include "runtime.h"
 #include "cpu_gather.h"
 #include "gather_output.h"
+#include "gather_read_profile.h"
 
 namespace kvaf {
 
@@ -19,6 +20,7 @@ struct CpuGatherReadRequest {
   std::vector<GatherOutputSpan> output_spans;
   std::uint32_t sgl_size{kGatherMaxSglSize};
   void* stream{nullptr};
+  GatherReadTiming* timing{nullptr};
 };
 
 struct NpuRuntimeOptions {

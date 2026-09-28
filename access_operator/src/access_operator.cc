@@ -1,6 +1,7 @@
 #include "access_operator.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -569,6 +570,10 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
 
 Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecRequest& request) {
 #if defined(KVAF_ENABLE_AICPU_URMA)
+  const auto elapsed_ns = [](std::chrono::steady_clock::time_point start) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count());
+  };
   if (!impl_->initialized || impl_->transport == nullptr ||
       impl_->config.aicpu_urma_kernel_json_path.empty())
     return InvalidState("AICPU URMA GatherRead transport is unavailable");
@@ -583,6 +588,7 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
   if (scratch_offset > request.output.bytes ||
       request.output.bytes - scratch_offset < aicpu_urma::kGatherScratchBytes)
     return InvalidArgument("GatherRead output requires 64-byte HBM scratch");
+  const auto descriptor_start = std::chrono::steady_clock::now();
   const std::size_t descriptor_bytes =
       static_cast<std::size_t>(request.output_span_count) * sizeof(GatherOutputSpan);
   if (descriptor_bytes > impl_->gather_output_spans_capacity) {
@@ -597,13 +603,17 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
                   request.output_spans, descriptor_bytes,
                   ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS)
     return Internal("failed to upload GatherRead HBM SGL descriptors");
+  if (request.timing != nullptr)
+    request.timing->descriptor_upload_ns = elapsed_ns(descriptor_start);
   KvafBatchGetLocalBuffer* local_buffer = nullptr;
   std::uint64_t channel_entity = 0U;
+  const auto register_start = std::chrono::steady_clock::now();
   if (KvafBatchGetLocalBufferAcquire(impl_->transport, request.output.data,
                                      request.output.bytes, &local_buffer,
                                      &channel_entity) != KVAF_BATCH_GET_SUCCESS ||
       local_buffer == nullptr || channel_entity == 0U)
     return Internal("failed to register GatherRead HBM output");
+  if (request.timing != nullptr) request.timing->register_ns = elapsed_ns(register_start);
   aicpu_urma::GatherReadArgs arguments{};
   arguments.channel_entity = channel_entity;
   arguments.queue_state = reinterpret_cast<std::uint64_t>(impl_->execution.queue_state);
@@ -620,18 +630,48 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
   arguments.sequence = request.sequence;
   arguments.bytes = request.bytes;
   const aclrtStream stream = static_cast<aclrtStream>(request.stream);
+  const auto launch_start = std::chrono::steady_clock::now();
   const int32_t launch = aicpu_urma::LaunchGatherRead(&arguments, stream);
+  if (request.timing != nullptr) request.timing->launch_ns = elapsed_ns(launch_start);
   if (launch != 0) {
     KvafBatchGetLocalBufferRelease(local_buffer);
     return Internal("AICPU URMA GatherRead launch failed");
   }
   aclError sync = ACL_SUCCESS;
+  const auto sync_start = std::chrono::steady_clock::now();
   sync = aclrtSynchronizeStream(stream);
+  if (request.timing != nullptr) request.timing->sync_ns = elapsed_ns(sync_start);
+  const auto release_start = std::chrono::steady_clock::now();
   KvafBatchGetLocalBufferRelease(local_buffer);
+  if (request.timing != nullptr) request.timing->release_ns = elapsed_ns(release_start);
   aicpu_urma::GatherReadStatus device_status{};
+  const auto copy_start = std::chrono::steady_clock::now();
   const aclError copy = aclrtMemcpy(&device_status, sizeof(device_status),
                                    impl_->execution.status, sizeof(device_status),
                                    ACL_MEMCPY_DEVICE_TO_HOST);
+  if (request.timing != nullptr) request.timing->status_copy_ns = elapsed_ns(copy_start);
+  if (request.timing != nullptr && copy == ACL_SUCCESS &&
+      device_status.magic == aicpu_urma::kGatherStatusMagic &&
+      device_status.sequence == request.sequence) {
+    request.timing->notify_ns = device_status.notify_ns;
+    request.timing->notify_post_ns = device_status.notify_post_ns;
+    request.timing->notify_cq_ns = device_status.notify_cq_ns;
+    request.timing->ack_poll_ns = device_status.ack_poll_ns;
+    request.timing->ack_post_ns = device_status.ack_post_ns;
+    request.timing->ack_cq_ns = device_status.ack_cq_ns;
+    request.timing->ack_cache_ns = device_status.ack_cache_ns;
+    request.timing->scatter_cache_ns = device_status.scatter_cache_ns;
+    request.timing->scatter_plan_ns = device_status.scatter_plan_ns;
+    request.timing->scatter_post_ns = device_status.scatter_post_ns;
+    request.timing->scatter_cq_ns = device_status.scatter_cq_ns;
+    request.timing->cpu_dispatch_ns = device_status.cpu.dispatch_ns;
+    request.timing->cpu_notify_spin_ns = device_status.cpu.notify_spin_ns;
+    request.timing->cpu_source_cache_ns = device_status.cpu.source_cache_ns;
+    request.timing->cpu_copy_ns = device_status.cpu.copy_ns;
+    request.timing->cpu_staging_flush_ns = device_status.cpu.staging_flush_ns;
+    request.timing->ack_polls = device_status.ack_polls;
+    request.timing->read_wqes = device_status.read_wqes;
+  }
   if (copy == ACL_SUCCESS && device_status.magic == aicpu_urma::kGatherStatusMagic &&
       device_status.sequence == request.sequence &&
       (sync != ACL_SUCCESS || device_status.result != 0U)) {

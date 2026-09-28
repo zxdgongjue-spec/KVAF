@@ -4,6 +4,7 @@
 #include "cpu_urma/cpu_urma_link_selection.h"
 #include "peer_link.h"
 #include "cpu_gather.h"
+#include "gather_read_profile.h"
 
 #include <dlfcn.h>
 #include <sys/socket.h>
@@ -13,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdarg>
@@ -410,9 +412,10 @@ class CpuGatherWorker {
  public:
   CpuGatherWorker(void* memory, uint64_t base, uint64_t bytes)
       : memory_(memory), base_(base), bytes_(bytes),
-        control_(static_cast<uint8_t*>(memory) + peer::GatherControlOffset(bytes)),
+        control_(reinterpret_cast<peer::GatherControl*>(
+            static_cast<uint8_t*>(memory) + peer::GatherControlOffset(bytes))),
         worker_(&CpuGatherWorker::Run, this) {
-    std::memset(control_, 0, 64U);
+    std::memset(control_, 0, sizeof(*control_));
     CacheLine(control_, false);
     Barrier();
   }
@@ -429,6 +432,7 @@ class CpuGatherWorker {
     if (scheduled_ != completed_ || scheduled_ == UINT64_MAX) return false;
     staging_ = staging;
     spans_ = spans;
+    scheduled_at_ns_ = NowNs();
     ++scheduled_;
     response->sequence = scheduled_;
     response->command_address = base_ + peer::GatherControlOffset(bytes_) + 16U;
@@ -439,6 +443,11 @@ class CpuGatherWorker {
   }
 
  private:
+  static std::uint64_t NowNs() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+  }
+
   static void CacheLine(void* address, bool invalidate) {
 #if defined(__aarch64__)
     if (invalidate) asm volatile("dc civac, %0" :: "r"(address) : "memory");
@@ -471,9 +480,9 @@ class CpuGatherWorker {
   }
 
   void Run() {
-    auto* notify = reinterpret_cast<uint64_t*>(control_);
-    auto* ack = reinterpret_cast<uint64_t*>(control_ + 8U);
-    auto* command = reinterpret_cast<uint64_t*>(control_ + 16U);
+    auto* notify = &control_->notify;
+    auto* ack = &control_->ack;
+    auto* command = &control_->command;
     for (;;) {
       std::unique_lock<std::mutex> lock(mutex_);
       changed_.wait(lock, [this] {
@@ -483,7 +492,11 @@ class CpuGatherWorker {
       const auto sequence = scheduled_;
       const auto staging = staging_;
       const auto spans = spans_;
+      const auto scheduled_at_ns = scheduled_at_ns_;
       lock.unlock();
+      peer::GatherCpuProfile profile{};
+      const auto poll_start_ns = NowNs();
+      profile.dispatch_ns = poll_start_ns - scheduled_at_ns;
       while (!stop_.load(std::memory_order_acquire)) {
         CacheLine(control_, true);
         Barrier();
@@ -492,16 +505,24 @@ class CpuGatherWorker {
         std::this_thread::yield();
       }
       if (stop_.load(std::memory_order_acquire)) return;
+      const auto notified_ns = NowNs();
+      profile.notify_spin_ns = notified_ns - poll_start_ns;
       for (const auto& span : spans)
         CacheRange(static_cast<uint8_t*>(memory_) + (span.address - base_),
                    span.length, true);
       Barrier();
+      const auto source_ready_ns = NowNs();
+      profile.source_cache_ns = source_ready_ns - notified_ns;
       peer::GatherIntoStaging(memory_, base_, staging, spans);
+      const auto copied_ns = NowNs();
+      profile.copy_ns = copied_ns - source_ready_ns;
       uint8_t* gathered = static_cast<uint8_t*>(memory_) + (staging - base_);
       uint64_t gathered_bytes = 0U;
       for (const auto& span : spans) gathered_bytes += span.length;
       CacheRange(gathered, gathered_bytes, false);
       Barrier();
+      profile.staging_flush_ns = NowNs() - copied_ns;
+      control_->profile = profile;
       __atomic_store_n(ack, sequence, __ATOMIC_RELEASE);
       CacheLine(control_, false);
       Barrier();
@@ -513,12 +534,13 @@ class CpuGatherWorker {
   void* memory_;
   uint64_t base_;
   uint64_t bytes_;
-  uint8_t* control_;
+  peer::GatherControl* control_;
   std::atomic<bool> stop_{false};
   std::mutex mutex_;
   std::condition_variable changed_;
   std::vector<GatherSpan> spans_;
   uint64_t staging_{0U};
+  std::uint64_t scheduled_at_ns_{0U};
   uint64_t scheduled_{0U};
   uint64_t completed_{0U};
   std::thread worker_;

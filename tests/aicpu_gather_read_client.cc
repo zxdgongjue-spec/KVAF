@@ -131,7 +131,8 @@ double RunRound(kvaf::NpuRuntime* runtime, aclrtStream stream, const Options& op
                 std::vector<std::uint8_t>* host_output,
                 std::vector<std::uint8_t>* expected_output,
                 std::vector<kvaf::KeyId>* reserved_keys,
-                std::uint64_t* staging_address, std::uint64_t round) {
+                std::uint64_t* staging_address, std::uint64_t round,
+                kvaf::GatherReadTiming* timing) {
   const std::size_t payload = host_input->size();
   for (std::size_t byte = 0U; byte < payload; ++byte)
     (*host_input)[byte] = static_cast<std::uint8_t>((byte * 131U + round * 29U) & 0xffU);
@@ -198,6 +199,7 @@ double RunRound(kvaf::NpuRuntime* runtime, aclrtStream stream, const Options& op
   gather.staging_address = *staging_address;
   gather.output = {output->data, output->bytes, kvaf::DeviceKind::kNpu};
   gather.stream = stream;
+  gather.timing = timing;
   for (std::size_t block = options.blocks; block != 0U; --block) {
     const auto address = view.addresses[block - 1U];
     if (view.valid[block - 1U] != 1U || view.lengths[block - 1U] != options.block_bytes)
@@ -261,21 +263,75 @@ int Run(const Options& options) {
                            options.block_bytes), "Initialize");
   std::vector<double> samples;
   samples.reserve(options.iterations);
+  std::vector<kvaf::GatherReadTiming> profiles;
+  profiles.reserve(options.iterations);
   for (std::uint64_t round = 0U;
        round < static_cast<std::uint64_t>(options.warmup) + options.iterations; ++round) {
+    kvaf::GatherReadTiming timing{};
     const double elapsed = RunRound(&runtime, acl.stream, options, &input, &output,
                                     &host_input, &host_output, &expected_output, &reserved_keys,
-                                    &staging_address, round);
-    if (round >= options.warmup) samples.push_back(elapsed);
+                                    &staging_address, round, &timing);
+    if (round >= options.warmup) {
+      samples.push_back(elapsed);
+      profiles.push_back(timing);
+    }
   }
   Check(runtime.core().BatchFree({reserved_keys}), "ReleaseGatherStaging");
   Check(runtime.Shutdown(), "Shutdown");
+  double total_ns = 0.0;
+  for (const double elapsed_ms : samples) total_ns += elapsed_ms * 1000000.0;
   const auto stats = kvaf::aicpu_urma_client::SummarizeTiming(std::move(samples), payload);
   std::fprintf(stdout,
                "GATHER_READ_STATS min_ms=%.3f p50_ms=%.3f p95_ms=%.3f p99_ms=%.3f "
                "max_ms=%.3f mean_ms=%.3f GBps=%.3f\n",
                stats.min_ms, stats.p50_ms, stats.p95_ms, stats.p99_ms,
                stats.max_ms, stats.mean_ms, stats.mean_gbps);
+  const auto average = [&](std::uint64_t kvaf::GatherReadTiming::*field) {
+    std::uint64_t sum = 0U;
+    for (const auto& profile : profiles) sum += profile.*field;
+    return static_cast<double>(sum) / profiles.size();
+  };
+  std::fprintf(stdout,
+               "GATHER_READ_HOST_PROFILE avg_ns total=%.0f validate=%.0f configure_rpc=%.0f "
+               "descriptor_upload=%.0f hbm_register=%.0f launch=%.0f "
+               "stream_sync=%.0f hbm_release=%.0f status_copy=%.0f\n",
+               total_ns / profiles.size(),
+               average(&kvaf::GatherReadTiming::validate_ns),
+               average(&kvaf::GatherReadTiming::configure_ns),
+               average(&kvaf::GatherReadTiming::descriptor_upload_ns),
+               average(&kvaf::GatherReadTiming::register_ns),
+               average(&kvaf::GatherReadTiming::launch_ns),
+               average(&kvaf::GatherReadTiming::sync_ns),
+               average(&kvaf::GatherReadTiming::release_ns),
+               average(&kvaf::GatherReadTiming::status_copy_ns));
+  std::fprintf(stdout,
+               "GATHER_READ_AICPU_CONTROL_PROFILE avg_ns notify=%.0f notify_post=%.0f "
+               "notify_cq=%.0f ack_poll=%.0f ack_post=%.0f ack_cq=%.0f "
+               "ack_cache=%.0f ack_polls=%.2f\n",
+               average(&kvaf::GatherReadTiming::notify_ns),
+               average(&kvaf::GatherReadTiming::notify_post_ns),
+               average(&kvaf::GatherReadTiming::notify_cq_ns),
+               average(&kvaf::GatherReadTiming::ack_poll_ns),
+               average(&kvaf::GatherReadTiming::ack_post_ns),
+               average(&kvaf::GatherReadTiming::ack_cq_ns),
+               average(&kvaf::GatherReadTiming::ack_cache_ns),
+               average(&kvaf::GatherReadTiming::ack_polls));
+  std::fprintf(stdout,
+               "GATHER_READ_CPU_PROFILE avg_ns dispatch=%.0f notify_spin=%.0f "
+               "source_cache=%.0f copy=%.0f staging_flush=%.0f\n",
+               average(&kvaf::GatherReadTiming::cpu_dispatch_ns),
+               average(&kvaf::GatherReadTiming::cpu_notify_spin_ns),
+               average(&kvaf::GatherReadTiming::cpu_source_cache_ns),
+               average(&kvaf::GatherReadTiming::cpu_copy_ns),
+               average(&kvaf::GatherReadTiming::cpu_staging_flush_ns));
+  std::fprintf(stdout,
+               "GATHER_READ_AICPU_DATA_PROFILE avg_ns scatter_cache=%.0f "
+               "scatter_plan=%.0f scatter_post=%.0f scatter_cq=%.0f read_wqes=%.2f\n",
+               average(&kvaf::GatherReadTiming::scatter_cache_ns),
+               average(&kvaf::GatherReadTiming::scatter_plan_ns),
+               average(&kvaf::GatherReadTiming::scatter_post_ns),
+               average(&kvaf::GatherReadTiming::scatter_cq_ns),
+               average(&kvaf::GatherReadTiming::read_wqes));
   std::fprintf(stdout,
                "AICPU_GATHER_READ_PASS blocks=%u block_bytes=%u bytes=%zu "
                "output_stride=%u sgl_size=%u warmup=%u iterations=%u\n",

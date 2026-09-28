@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "gather_output.h"
+#include "gather_read_profile.h"
 
 namespace kvaf::aicpu_urma {
 
@@ -18,6 +19,20 @@ struct GatherReadStatus {
   std::uint64_t cq_consumer_index;
   std::uint64_t cqe_word;
   std::uint64_t sequence;
+  std::uint64_t notify_ns;
+  std::uint64_t notify_post_ns;
+  std::uint64_t notify_cq_ns;
+  std::uint64_t ack_poll_ns;
+  std::uint64_t ack_post_ns;
+  std::uint64_t ack_cq_ns;
+  std::uint64_t ack_cache_ns;
+  std::uint64_t scatter_cache_ns;
+  std::uint64_t scatter_plan_ns;
+  std::uint64_t scatter_post_ns;
+  std::uint64_t scatter_cq_ns;
+  std::uint64_t ack_polls;
+  std::uint64_t read_wqes;
+  kvaf::peer::GatherCpuProfile cpu;
 };
 
 struct GatherReadArgs {
@@ -38,7 +53,7 @@ struct GatherReadArgs {
   std::uint32_t reserved;
 };
 
-static_assert(sizeof(GatherReadStatus) == 64U, "GatherRead status ABI changed");
+static_assert(sizeof(GatherReadStatus) <= 384U, "GatherRead exceeds shared status buffer");
 static_assert(sizeof(GatherReadArgs) == 104U, "GatherRead argument ABI changed");
 
 }  // namespace kvaf::aicpu_urma

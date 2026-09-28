@@ -6,6 +6,7 @@
 #include <array>
 #include <cerrno>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -394,6 +395,8 @@ Status NpuRuntime::InitializeHbmService() {
 }
 
 Status NpuRuntime::GatherRead(const CpuGatherReadRequest& request) {
+  if (request.timing != nullptr) *request.timing = {};
+  const auto validate_start = std::chrono::steady_clock::now();
   if (!initialized() || impl_->hbm_mode || impl_->peer_link == nullptr ||
       impl_->config.aicpu_urma_kernel_json_path.empty())
     return Status::NotInitialized("GatherRead requires an initialized AICPU URMA NPU Runtime");
@@ -416,16 +419,23 @@ Status NpuRuntime::GatherRead(const CpuGatherReadRequest& request) {
       !ValidateGatherOutput(request.output.bytes, output_spans, total_bytes,
                             &output_extent))
     return Status::InvalidArgument("invalid GatherRead HBM scatter layout or SGL size");
+  if (request.timing != nullptr)
+    request.timing->validate_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - validate_start).count();
   peer::GatherReady ready{};
+  const auto configure_start = std::chrono::steady_clock::now();
   Status status = impl_->peer_link->ConfigureGather(region.base, request.staging_address,
                                                     request.spans, &ready);
+  if (request.timing != nullptr)
+    request.timing->configure_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - configure_start).count();
   if (!status.ok()) return status;
   return impl_->access_operator->ExecuteCpuGatherRead(CpuGatherReadExecRequest{
       request.output, output_spans.data(),
       static_cast<std::uint32_t>(output_spans.size()), request.sgl_size,
       output_extent, request.staging_address, ready.command_address,
       ready.notify_address, ready.ack_address, ready.sequence,
-      ready.total_bytes, request.stream});
+      ready.total_bytes, request.stream, request.timing});
 }
 
 RuntimeCore& NpuRuntime::core() {

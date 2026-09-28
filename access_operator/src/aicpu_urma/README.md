@@ -120,6 +120,17 @@ span 之后需要额外的 64 字节对齐 scratch 空间；span 不得重叠。
 CPU gather 握手和 CQ 等待，不含输入上传、输出回读及逐字节校验。多 SGL READ 的
 真实设备兼容性和性能仍需目标机器验证。
 
+客户端在测量结束后汇总四行 `avg_ns` profiling：`HOST` 拆分布局校验、配置 RPC、
+描述符上传、HBM 注册、AICPU 启动、stream 同步、资源释放及状态回读；
+`AICPU_CONTROL` 拆分 WRITE_WITH_NOTIFY 的提交/CQ、ack 轮询的提交/CQ/缓存处理；
+`CPU` 拆分 worker 调度、等待通知、源缓存处理、staging 拷贝和缓存 flush；
+`AICPU_DATA` 拆分 scatter 缓存处理、规划、READ WQE 提交及 CQ 等待。四行是
+不同处理器的局部耗时：Host 的
+`stream_sync` 包含 AICPU/CPU 工作，AICPU 的 `ack_poll` 包含 CPU gather，不能把
+所有字段直接相加。profiling 增加时钟采样，并将 ack READ 从 8 字节扩展到
+56 字节，因此小 batch 的总耗时不应直接与旧版无 profiling 结果比较。更新后需
+同时重新部署 CPU service 和 AICPU kernel。
+
 **硬件验证状态**：本分支的 Host WQE ABI/模拟队列测试和内核语法检查不等价于 NPU
 收发验证。部署后应先用 Runtime 自带的 LinkTo WRITE 探针确认链路，再在真实
 CPU DDR/HBM 之间做小 batch 的 put/get 数据回读验证，最后再进行性能测试。

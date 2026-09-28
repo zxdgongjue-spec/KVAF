@@ -35,7 +35,8 @@ add_custom_command(OUTPUT "${kernel_so}"
           -I "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_put/include"
           "${CMAKE_CURRENT_SOURCE_DIR}/kernel.cc" -o "${kernel_so}"
   DEPENDS kernel.cc wqe.h gather_read.h
-          "${CMAKE_SOURCE_DIR}/access_operator/include/gather_output.h" VERBATIM)
+          "${CMAKE_SOURCE_DIR}/access_operator/include/gather_output.h"
+          "${CMAKE_SOURCE_DIR}/access_operator/include/gather_read_profile.h" VERBATIM)
 add_custom_command(OUTPUT "${kernel_tar}"
   COMMAND "${CMAKE_COMMAND}" -E tar czf "${kernel_tar}" aicpu_kernels_device
   WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"

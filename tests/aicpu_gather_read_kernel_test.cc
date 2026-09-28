@@ -101,6 +101,8 @@ int main() {
         std::memcpy(reinterpret_cast<void*>(address(words[14], words[15])),
                     &sequence, 8U);
         kvaf::peer::GatherIntoStaging(remote.data(), base, args.remote_staging, spans);
+        const kvaf::peer::GatherCpuProfile cpu{11U, 22U, 33U, 44U, 55U};
+        std::memcpy(remote.data() + 216U, &cpu, sizeof(cpu));
         std::memcpy(reinterpret_cast<void*>(args.remote_ack), &sequence, 8U);
       } else {
         assert(opcode == kvaf::aicpu_urma::kReadOpcode);
@@ -129,6 +131,14 @@ int main() {
   assert(status.result == 0U && status.phase == 3U && status.ack_seen == 1U);
   assert(status.sequence == 1U && status.cqe_word == 4U);
   assert(status.sq_producer_index == 68U && status.cq_consumer_index == 3U);
+  assert(status.ack_polls == 1U && status.read_wqes == 2U);
+  assert(status.cpu.dispatch_ns == 11U && status.cpu.notify_spin_ns == 22U);
+  assert(status.cpu.source_cache_ns == 33U && status.cpu.copy_ns == 44U);
+  assert(status.cpu.staging_flush_ns == 55U);
+  assert(status.notify_ns > 0U && status.ack_poll_ns > 0U);
+  assert(status.notify_post_ns > 0U && status.notify_cq_ns > 0U);
+  assert(status.ack_post_ns > 0U && status.ack_cq_ns > 0U);
+  assert(status.scatter_post_ns > 0U && status.scatter_cq_ns > 0U);
   assert(sq_doorbell == 68U && cq_doorbell == 3U);
   std::array<std::uint8_t, 256> expected{};
   expected.fill(0xa5U);

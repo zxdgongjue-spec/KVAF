@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <chrono>
 #if defined(KVAF_AICPU_URMA_HOST_TEST)
 #include <atomic>
 #endif
@@ -23,6 +24,11 @@ using kvaf::aicpu_urma::Transfer;
 constexpr std::uint32_t kEntityMagic = 0x4b564155U;
 constexpr std::uint32_t kQueueMagic = 0x4b564151U;
 constexpr std::uint32_t kPollLimit = 10000000U;
+
+std::uint64_t NowNs() {
+  return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 
 void Barrier() {
 #if defined(KVAF_AICPU_URMA_HOST_TEST)
@@ -118,10 +124,16 @@ template <typename Entity, typename Queue>
 std::uint32_t Submit(const Entity& entity, Queue& queue,
                      const Transfer* transfers, std::uint32_t count,
                      std::uint32_t opcode, std::uint32_t* cqe_word = nullptr,
-                     std::uint64_t* last_wqe_protocol = nullptr) {
+                     std::uint64_t* last_wqe_protocol = nullptr,
+                     std::uint64_t* post_ns = nullptr,
+                     std::uint64_t* cq_ns = nullptr) {
   if (cqe_word != nullptr) *cqe_word = 0U;
+  if (post_ns != nullptr) *post_ns = 0U;
+  if (cq_ns != nullptr) *cq_ns = 0U;
   if (count == 0U) return 0U;
   if (count >= entity.sq_depth) return 6U;
+  const bool timed = post_ns != nullptr || cq_ns != nullptr;
+  const auto post_start_ns = timed ? NowNs() : 0U;
   Endpoint endpoint{entity.tp_id, entity.remote_token_id,
                     entity.remote_token_value, {}};
   std::memcpy(endpoint.remote_eid, entity.remote_eid, sizeof(endpoint.remote_eid));
@@ -142,15 +154,22 @@ std::uint32_t Submit(const Entity& entity, Queue& queue,
   Ring(reinterpret_cast<volatile std::uint32_t*>(entity.sq_db_va),
        static_cast<std::uint32_t>(queue.sq_producer_index));
   Barrier();
-  return WaitCompletion(entity, queue, cqe_word);
+  const auto cq_start_ns = timed ? NowNs() : 0U;
+  if (post_ns != nullptr) *post_ns = cq_start_ns - post_start_ns;
+  const auto result = WaitCompletion(entity, queue, cqe_word);
+  if (cq_ns != nullptr) *cq_ns = NowNs() - cq_start_ns;
+  return result;
 }
 
 template <typename Entity, typename Queue>
 std::uint32_t SubmitNotify(const Entity& entity, Queue& queue,
                             std::uint64_t command, std::uint64_t notify,
                             std::uint64_t local, std::uint64_t sequence,
-                            std::uint32_t* cqe_word) {
+                            std::uint32_t* cqe_word,
+                            std::uint64_t* post_ns,
+                            std::uint64_t* cq_ns) {
   if (entity.sq_depth < 4U) return 6U;
+  const auto post_start_ns = NowNs();
   Endpoint endpoint{entity.tp_id, entity.remote_token_id,
                     entity.remote_token_value, {}};
   std::memcpy(endpoint.remote_eid, entity.remote_eid, sizeof(endpoint.remote_eid));
@@ -168,14 +187,21 @@ std::uint32_t SubmitNotify(const Entity& entity, Queue& queue,
   Ring(reinterpret_cast<volatile std::uint32_t*>(entity.sq_db_va),
        static_cast<std::uint32_t>(queue.sq_producer_index));
   Barrier();
-  return WaitCompletion(entity, queue, cqe_word);
+  const auto cq_start_ns = NowNs();
+  *post_ns = cq_start_ns - post_start_ns;
+  const auto result = WaitCompletion(entity, queue, cqe_word);
+  *cq_ns = NowNs() - cq_start_ns;
+  return result;
 }
 
 template <typename Entity, typename Queue>
 std::uint32_t SubmitScatter(const Entity& entity, Queue& queue,
                             const kvaf::aicpu_urma::ScatterTransfer* transfers,
-                            std::uint32_t count, std::uint32_t* cqe_word) {
+                            std::uint32_t count, std::uint32_t* cqe_word,
+                            std::uint64_t* post_ns, std::uint64_t* cq_ns) {
   if (cqe_word != nullptr) *cqe_word = 0U;
+  if (post_ns != nullptr) *post_ns = 0U;
+  if (cq_ns != nullptr) *cq_ns = 0U;
   if (count == 0U) return 0U;
   std::uint32_t blocks = 0U;
   for (std::uint32_t index = 0U; index < count; ++index) {
@@ -187,6 +213,7 @@ std::uint32_t SubmitScatter(const Entity& entity, Queue& queue,
   Endpoint endpoint{entity.tp_id, entity.remote_token_id,
                     entity.remote_token_value, {}};
   std::memcpy(endpoint.remote_eid, entity.remote_eid, sizeof(endpoint.remote_eid));
+  const auto post_start_ns = NowNs();
   std::uint64_t producer = queue.sq_producer_index;
   for (std::uint32_t index = 0U; index < count; ++index) {
     std::uint32_t words[kvaf::aicpu_urma::kMaxScatterWqebbs * 16U];
@@ -207,7 +234,11 @@ std::uint32_t SubmitScatter(const Entity& entity, Queue& queue,
   Ring(reinterpret_cast<volatile std::uint32_t*>(entity.sq_db_va),
        static_cast<std::uint32_t>(producer));
   Barrier();
-  return WaitCompletion(entity, queue, cqe_word);
+  const auto cq_start_ns = NowNs();
+  if (post_ns != nullptr) *post_ns = cq_start_ns - post_start_ns;
+  const auto result = WaitCompletion(entity, queue, cqe_word);
+  if (cq_ns != nullptr) *cq_ns = NowNs() - cq_start_ns;
+  return result;
 }
 
 template <typename Entity, typename Queue>
@@ -453,7 +484,7 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
       !InRange(entity.remote_host_ddr_address, entity.remote_host_ddr_size,
                args->remote_notify, 8U) ||
       !InRange(entity.remote_host_ddr_address, entity.remote_host_ddr_size,
-               args->remote_ack, 8U)) {
+               args->remote_ack, sizeof(kvaf::peer::GatherControl) - 8U)) {
     Flush(&status, sizeof(status));
     return 1U;
   }
@@ -485,36 +516,58 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
   Flush(reinterpret_cast<void*>(scratch), kvaf::aicpu_urma::kGatherScratchBytes);
   status.phase = 1U;
   std::uint32_t cqe_word = 0U;
+  const auto notify_start_ns = NowNs();
   status.result = SubmitNotify(entity, queue, args->remote_command,
                                args->remote_notify, scratch + 16U, args->sequence,
-                               &cqe_word);
+                               &cqe_word, &status.notify_post_ns,
+                               &status.notify_cq_ns);
+  status.notify_ns = NowNs() - notify_start_ns;
   status.cqe_word = cqe_word;
   if (status.result == 0U) {
     status.phase = 2U;
-    const Transfer check{args->remote_ack, scratch + 8U, 8U, entity.local_token_id};
+    const Transfer check{args->remote_ack, scratch + 8U,
+                         sizeof(kvaf::peer::GatherControl) - 8U,
+                         entity.local_token_id};
+    const auto ack_start_ns = NowNs();
     for (std::uint32_t poll = 0U; poll < 10000U; ++poll) {
-      Flush(ack, 8U);
+      const auto preflush_start_ns = NowNs();
+      Flush(ack, check.length);
+      status.ack_cache_ns += NowNs() - preflush_start_ns;
+      std::uint64_t post_ns = 0U;
+      std::uint64_t cq_ns = 0U;
       status.result = Submit(entity, queue, &check, 1U, kvaf::aicpu_urma::kReadOpcode,
-                             &cqe_word);
+                             &cqe_word, nullptr, &post_ns, &cq_ns);
+      status.ack_post_ns += post_ns;
+      status.ack_cq_ns += cq_ns;
+      ++status.ack_polls;
       status.cqe_word = cqe_word;
       if (status.result != 0U) break;
-      Flush(ack, 8U);
+      const auto postflush_start_ns = NowNs();
+      Flush(ack, check.length);
+      status.ack_cache_ns += NowNs() - postflush_start_ns;
       status.ack_seen = *ack;
       if (status.ack_seen == args->sequence) break;
     }
+    status.ack_poll_ns = NowNs() - ack_start_ns;
+    if (status.result == 0U && status.ack_seen == args->sequence)
+      std::memcpy(&status.cpu, reinterpret_cast<const void*>(scratch + 24U),
+                  sizeof(status.cpu));
     if (status.result == 0U && status.ack_seen != args->sequence)
       status.result = 9U;
   }
   if (status.result == 0U) {
     status.phase = 3U;
+    const auto preflush_start_ns = NowNs();
     for (std::uint32_t index = 0U; index < args->output_span_count; ++index)
       Flush(reinterpret_cast<void*>(args->output + output_spans[index].offset),
             output_spans[index].length);
+    status.scatter_cache_ns = NowNs() - preflush_start_ns;
     kvaf::aicpu_urma::ScatterTransfer data[32]{};
     std::uint32_t batch_count = 0U;
     std::uint32_t span_index = 0U;
     std::uint32_t span_offset = 0U;
     std::uint64_t remote_offset = 0U;
+    auto plan_start_ns = NowNs();
     while (span_index < args->output_span_count && status.result == 0U) {
       auto& transfer = data[batch_count];
       transfer = {};
@@ -538,16 +591,27 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
       }
       ++batch_count;
       if (batch_count == 32U || span_index == args->output_span_count) {
-        status.result = SubmitScatter(entity, queue, data, batch_count, &cqe_word);
+        status.scatter_plan_ns += NowNs() - plan_start_ns;
+        status.read_wqes += batch_count;
+        std::uint64_t post_ns = 0U;
+        std::uint64_t cq_ns = 0U;
+        status.result = SubmitScatter(entity, queue, data, batch_count, &cqe_word,
+                                      &post_ns, &cq_ns);
+        status.scatter_post_ns += post_ns;
+        status.scatter_cq_ns += cq_ns;
         status.cqe_word = cqe_word;
         batch_count = 0U;
+        plan_start_ns = NowNs();
       }
     }
     status.cqe_word = cqe_word;
-    if (status.result == 0U)
+    if (status.result == 0U) {
+      const auto postflush_start_ns = NowNs();
       for (std::uint32_t index = 0U; index < args->output_span_count; ++index)
         Flush(reinterpret_cast<void*>(args->output + output_spans[index].offset),
               output_spans[index].length);
+      status.scatter_cache_ns += NowNs() - postflush_start_ns;
+    }
   }
   status.sq_producer_index = queue.sq_producer_index;
   status.cq_consumer_index = queue.cq_consumer_index;
