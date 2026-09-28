@@ -30,6 +30,29 @@ int main() {
     kvaf::aicpu_urma::EncodeWqe(words, endpoint, transfer, opcode, 1, true);
     assert(words[0] == 0xb03e0000U);
   }
+  std::uint32_t notify[32];
+  kvaf::aicpu_urma::EncodeNotifyWqe(notify, endpoint,
+                                    0x1111222233334444ULL, 0x5555666677778888ULL,
+                                    0x9999aaaabbbbccccULL, 29U,
+                                    0xddddeeeeffff0001ULL, 1U);
+  assert(notify[0] == 0xb03e0000U);
+  assert(notify[1] == kvaf::aicpu_urma::kWriteWithNotifyOpcode << 8U);
+  assert(notify[12] == (endpoint.remote_token_id & 0x000fffffU));
+  assert(notify[13] == endpoint.remote_token_value);
+  assert(notify[14] == 0x77778888U && notify[15] == 0x55556666U);
+  assert(notify[16] == 0xffff0001U && notify[17] == 0xddddeeeeU);
+  assert(notify[20] == 8U && notify[21] == 29U);
+  assert(notify[22] == 0xbbbbccccU && notify[23] == 0x9999aaaaU);
+  assert(notify[24] == 0U && notify[31] == 0U);
+  kvaf::aicpu_urma::Transfer reads[16]{};
+  const auto count = kvaf::aicpu_urma::PlanContiguousRead(
+      reads, 0x100000000ULL, 0x200000000ULL,
+      2U * kvaf::aicpu_urma::kMaxReadBytes + 64U, 27U);
+  assert(count == 3U);
+  assert(reads[0].length == kvaf::aicpu_urma::kMaxReadBytes);
+  assert(reads[1].remote_address == 0x100000000ULL + kvaf::aicpu_urma::kMaxReadBytes);
+  assert(reads[2].local_address == 0x200000000ULL + 2U * kvaf::aicpu_urma::kMaxReadBytes);
+  assert(reads[2].length == 64U && reads[2].local_token_id == 27U);
   assert(kvaf::aicpu_urma::InRange(0x1000, 0x100, 0x1080, 0x80));
   assert(!kvaf::aicpu_urma::InRange(0x1000, 0x100, 0x1080, 0x81));
   assert(!kvaf::aicpu_urma::InRange(0x1000, 0x100, 0xfff, 1));

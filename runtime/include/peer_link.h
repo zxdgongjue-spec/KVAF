@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "peer_protocol.h"
+#include "cpu_gather.h"
 #include "status.h"
 
 namespace kvaf::peer {
@@ -24,6 +25,14 @@ struct PeerRegion {
   uint32_t jetty_key_bytes = 0U;
   std::array<uint8_t, kQpKeyBytes> jetty_key{};
   bool device_memory = false;
+};
+
+struct GatherReady {
+  std::uint64_t sequence{0U};
+  std::uint64_t command_address{0U};
+  std::uint64_t notify_address{0U};
+  std::uint64_t ack_address{0U};
+  std::uint32_t total_bytes{0U};
 };
 
 // Per-Runtime peer control-plane client. Its endpoint is explicit: Runtime
@@ -46,6 +55,8 @@ class PeerLink {
   Status ReleaseRegion(uint64_t base);
   Status ReleaseHbmRegion(uint64_t session_id);
   Status LookupRegion(uint64_t base, PeerRegion* region) const;
+  Status ConfigureGather(uint64_t region_base, uint64_t staging_address,
+                         const std::vector<GatherSpan>& spans, GatherReady* ready) const;
   // Register a descriptor obtained by an out-of-band allocator (for example
   // RuntimeCore's NPU HBM allocator) so channel setup can use the same API.
   Status RememberRegion(const PeerRegion& region);

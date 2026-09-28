@@ -556,6 +556,73 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   return Status::OK();
 }
 
+Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecRequest& request) {
+#if defined(KVAF_ENABLE_AICPU_URMA)
+  if (!impl_->initialized || impl_->transport == nullptr ||
+      impl_->config.aicpu_urma_kernel_json_path.empty())
+    return InvalidState("AICPU URMA GatherRead transport is unavailable");
+  const std::uint64_t scratch_offset =
+      (static_cast<std::uint64_t>(request.bytes) + 63U) & ~std::uint64_t{63U};
+  if (request.output.device != DeviceKind::kNpu || !request.output.valid() ||
+      request.stream == nullptr || request.bytes == 0U ||
+      request.output.bytes < scratch_offset + aicpu_urma::kGatherScratchBytes)
+    return InvalidArgument("GatherRead output requires payload plus 64-byte HBM scratch");
+  KvafBatchGetLocalBuffer* local_buffer = nullptr;
+  std::uint64_t channel_entity = 0U;
+  if (KvafBatchGetLocalBufferAcquire(impl_->transport, request.output.data,
+                                     request.output.bytes, &local_buffer,
+                                     &channel_entity) != KVAF_BATCH_GET_SUCCESS ||
+      local_buffer == nullptr || channel_entity == 0U)
+    return Internal("failed to register GatherRead HBM output");
+  aicpu_urma::GatherReadArgs arguments{};
+  arguments.channel_entity = channel_entity;
+  arguments.queue_state = reinterpret_cast<std::uint64_t>(impl_->execution.queue_state);
+  arguments.core_status = reinterpret_cast<std::uint64_t>(impl_->execution.status);
+  arguments.output = reinterpret_cast<std::uint64_t>(request.output.data);
+  arguments.remote_staging = request.remote_staging;
+  arguments.remote_command = request.remote_command;
+  arguments.remote_notify = request.remote_notify;
+  arguments.remote_ack = request.remote_ack;
+  arguments.sequence = request.sequence;
+  arguments.bytes = request.bytes;
+  const aclrtStream stream = static_cast<aclrtStream>(request.stream);
+  const int32_t launch = aicpu_urma::LaunchGatherRead(&arguments, stream);
+  if (launch != 0) {
+    KvafBatchGetLocalBufferRelease(local_buffer);
+    return Internal("AICPU URMA GatherRead launch failed");
+  }
+  aclError sync = ACL_SUCCESS;
+  sync = aclrtSynchronizeStream(stream);
+  KvafBatchGetLocalBufferRelease(local_buffer);
+  aicpu_urma::GatherReadStatus device_status{};
+  const aclError copy = aclrtMemcpy(&device_status, sizeof(device_status),
+                                   impl_->execution.status, sizeof(device_status),
+                                   ACL_MEMCPY_DEVICE_TO_HOST);
+  if (copy == ACL_SUCCESS && device_status.magic == aicpu_urma::kGatherStatusMagic &&
+      device_status.sequence == request.sequence &&
+      (sync != ACL_SUCCESS || device_status.result != 0U)) {
+    std::fprintf(stderr, "[KVAF_AICPU_URMA] GATHER_READ_ERROR acl=%d result=%llu phase=%llu ack=%llu "
+                         "sq=%llu cq=%llu cqe_word=0x%llx sequence=%llu\n",
+                 static_cast<int>(sync),
+                 static_cast<unsigned long long>(device_status.result),
+                 static_cast<unsigned long long>(device_status.phase),
+                 static_cast<unsigned long long>(device_status.ack_seen),
+                 static_cast<unsigned long long>(device_status.sq_producer_index),
+                 static_cast<unsigned long long>(device_status.cq_consumer_index),
+                 static_cast<unsigned long long>(device_status.cqe_word),
+                 static_cast<unsigned long long>(device_status.sequence));
+  }
+  if (sync != ACL_SUCCESS) return Internal("AICPU URMA GatherRead stream synchronization failed");
+  if (copy != ACL_SUCCESS || device_status.magic != aicpu_urma::kGatherStatusMagic ||
+      device_status.sequence != request.sequence || device_status.result != 0U)
+    return Internal("AICPU URMA GatherRead device completion failed");
+  return Status::OK();
+#else
+  (void)request;
+  return Status::NotImplemented("AICPU URMA is disabled");
+#endif
+}
+
 Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
   if (!impl_->initialized) {
     return Status::NotInitialized("AccessOperator has not been initialized");

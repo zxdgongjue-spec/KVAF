@@ -1,4 +1,5 @@
 #include "wqe.h"
+#include "gather_read.h"
 
 #include "batch_get_abi.h"
 #include "batch_put_internal.h"
@@ -44,6 +45,22 @@ void Flush(const void* address, std::uint64_t bytes) {
 #endif
 }
 
+void Ring(volatile std::uint32_t* doorbell, std::uint32_t value) {
+#if defined(KVAF_AICPU_URMA_HOST_TEST)
+  __atomic_store_n(const_cast<std::uint32_t*>(doorbell), value, __ATOMIC_RELEASE);
+#else
+  *doorbell = value;
+#endif
+}
+
+std::uint32_t LoadCompletion(volatile std::uint32_t* completion) {
+#if defined(KVAF_AICPU_URMA_HOST_TEST)
+  return __atomic_load_n(const_cast<std::uint32_t*>(completion), __ATOMIC_ACQUIRE);
+#else
+  return *completion;
+#endif
+}
+
 template <typename Entity>
 bool ValidEntity(const Entity& entity) {
   return entity.magic == kEntityMagic && entity.version == 1U &&
@@ -76,6 +93,28 @@ void Initialize(Queue& queue) {
 }
 
 template <typename Entity, typename Queue>
+std::uint32_t WaitCompletion(const Entity& entity, Queue& queue,
+                             std::uint32_t* cqe_word) {
+  const auto slot = queue.cq_consumer_index % entity.cq_depth;
+  auto* completion = reinterpret_cast<volatile std::uint32_t*>(
+      entity.cq_va + slot * entity.cqe_size);
+  const auto expected = static_cast<std::uint32_t>(
+      (queue.cq_consumer_index / entity.cq_depth) & 1U);
+  for (std::uint32_t poll = 0U; poll < kPollLimit; ++poll) {
+    Flush(const_cast<const std::uint32_t*>(completion), 32U);
+    const std::uint32_t word = LoadCompletion(completion);
+    if (((word >> 2U) & 1U) == expected) continue;
+    if (cqe_word != nullptr) *cqe_word = word;
+    ++queue.cq_consumer_index;
+    Ring(reinterpret_cast<volatile std::uint32_t*>(entity.cq_db_va),
+         static_cast<std::uint32_t>(queue.cq_consumer_index) & 0x003fffffU);
+    Barrier();
+    return ((word >> 16U) & 0xffffU) == 0U ? 0U : 8U;
+  }
+  return 7U;
+}
+
+template <typename Entity, typename Queue>
 std::uint32_t Submit(const Entity& entity, Queue& queue,
                      const Transfer* transfers, std::uint32_t count,
                      std::uint32_t opcode, std::uint32_t* cqe_word = nullptr,
@@ -100,26 +139,36 @@ std::uint32_t Submit(const Entity& entity, Queue& queue,
     Flush(destination, sizeof(words));
   }
   queue.sq_producer_index += count;
-  *reinterpret_cast<volatile std::uint32_t*>(entity.sq_db_va) =
-      static_cast<std::uint32_t>(queue.sq_producer_index);
+  Ring(reinterpret_cast<volatile std::uint32_t*>(entity.sq_db_va),
+       static_cast<std::uint32_t>(queue.sq_producer_index));
   Barrier();
-  const auto slot = queue.cq_consumer_index % entity.cq_depth;
-  auto* completion = reinterpret_cast<volatile std::uint32_t*>(
-      entity.cq_va + slot * entity.cqe_size);
-  const auto expected = static_cast<std::uint32_t>(
-      (queue.cq_consumer_index / entity.cq_depth) & 1U);
-  for (std::uint32_t poll = 0U; poll < kPollLimit; ++poll) {
-    Flush(const_cast<const std::uint32_t*>(completion), 32U);
-    const std::uint32_t word = *completion;
-    if (((word >> 2U) & 1U) == expected) continue;
-    if (cqe_word != nullptr) *cqe_word = word;
-    ++queue.cq_consumer_index;
-    *reinterpret_cast<volatile std::uint32_t*>(entity.cq_db_va) =
-        static_cast<std::uint32_t>(queue.cq_consumer_index) & 0x003fffffU;
-    Barrier();
-    return ((word >> 16U) & 0xffffU) == 0U ? 0U : 8U;
+  return WaitCompletion(entity, queue, cqe_word);
+}
+
+template <typename Entity, typename Queue>
+std::uint32_t SubmitNotify(const Entity& entity, Queue& queue,
+                            std::uint64_t command, std::uint64_t notify,
+                            std::uint64_t local, std::uint64_t sequence,
+                            std::uint32_t* cqe_word) {
+  if (entity.sq_depth < 4U) return 6U;
+  Endpoint endpoint{entity.tp_id, entity.remote_token_id,
+                    entity.remote_token_value, {}};
+  std::memcpy(endpoint.remote_eid, entity.remote_eid, sizeof(endpoint.remote_eid));
+  std::uint32_t words[32];
+  EncodeNotifyWqe(words, endpoint, command, notify, local, entity.local_token_id,
+                  sequence, static_cast<std::uint32_t>(
+                      (queue.sq_producer_index / entity.sq_depth) & 1U));
+  for (std::uint32_t block = 0U; block < 2U; ++block) {
+    const auto slot = (queue.sq_producer_index + block) % entity.sq_depth;
+    auto* destination = reinterpret_cast<void*>(entity.sq_va + slot * 64U);
+    std::memcpy(destination, &words[block * 16U], 64U);
+    Flush(destination, 64U);
   }
-  return 7U;
+  queue.sq_producer_index += 2U;
+  Ring(reinterpret_cast<volatile std::uint32_t*>(entity.sq_db_va),
+       static_cast<std::uint32_t>(queue.sq_producer_index));
+  Barrier();
+  return WaitCompletion(entity, queue, cqe_word);
 }
 
 template <typename Entity, typename Queue>
@@ -321,6 +370,83 @@ std::uint32_t KvafAicpuUrmaBatchGet(KvafExecuteBatchGetKernelArgs* args) {
     Flush(reinterpret_cast<void*>(args->output),
           static_cast<std::uint64_t>(args->output_rows) * args->token_bytes);
     status.completed_batch_count = 1U;
+  }
+  status.sq_producer_index = queue.sq_producer_index;
+  status.cq_consumer_index = queue.cq_consumer_index;
+  Flush(&queue, sizeof(queue));
+  Flush(&status, sizeof(status));
+  return status.result == 0U ? 0U : 1U;
+}
+
+extern "C" __attribute__((visibility("default")))
+std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
+  using kvaf::aicpu_urma::GatherReadStatus;
+  if (args == nullptr || args->channel_entity == 0U || args->queue_state == 0U ||
+      args->core_status == 0U) return 1U;
+  auto& entity = *reinterpret_cast<KvafBatchGetDirectUrmaEntity*>(args->channel_entity);
+  auto& queue = *reinterpret_cast<KvafBatchGetQueueState*>(args->queue_state);
+  auto& status = *reinterpret_cast<GatherReadStatus*>(args->core_status);
+  status = {};
+  status.magic = kvaf::aicpu_urma::kGatherStatusMagic;
+  status.sequence = args->sequence;
+  status.result = 2U;
+  if (!Valid(entity, queue) || entity.local_token_id == 0U ||
+      args->sequence == 0U || args->bytes == 0U ||
+      args->bytes > UINT32_MAX - kvaf::aicpu_urma::kGatherScratchBytes ||
+      args->output != entity.local_hbm_address ||
+      !InRange(entity.local_hbm_address, entity.local_hbm_size, args->output,
+               ((static_cast<std::uint64_t>(args->bytes) + 63U) & ~std::uint64_t{63U}) +
+                   kvaf::aicpu_urma::kGatherScratchBytes) ||
+      !InRange(entity.remote_host_ddr_address, entity.remote_host_ddr_size,
+               args->remote_staging, args->bytes) ||
+      !InRange(entity.remote_host_ddr_address, entity.remote_host_ddr_size,
+               args->remote_command, 8U) ||
+      !InRange(entity.remote_host_ddr_address, entity.remote_host_ddr_size,
+               args->remote_notify, 8U) ||
+      !InRange(entity.remote_host_ddr_address, entity.remote_host_ddr_size,
+               args->remote_ack, 8U)) {
+    Flush(&status, sizeof(status));
+    return 1U;
+  }
+  Initialize(queue);
+  const auto scratch = args->output +
+      ((static_cast<std::uint64_t>(args->bytes) + 63U) & ~std::uint64_t{63U});
+  auto* ack = reinterpret_cast<std::uint64_t*>(scratch + 8U);
+  *ack = 0U;
+  *reinterpret_cast<std::uint64_t*>(scratch + 16U) = args->sequence;
+  Flush(reinterpret_cast<void*>(scratch), kvaf::aicpu_urma::kGatherScratchBytes);
+  status.phase = 1U;
+  std::uint32_t cqe_word = 0U;
+  status.result = SubmitNotify(entity, queue, args->remote_command,
+                               args->remote_notify, scratch + 16U, args->sequence,
+                               &cqe_word);
+  status.cqe_word = cqe_word;
+  if (status.result == 0U) {
+    status.phase = 2U;
+    const Transfer check{args->remote_ack, scratch + 8U, 8U, entity.local_token_id};
+    for (std::uint32_t poll = 0U; poll < 10000U; ++poll) {
+      Flush(ack, 8U);
+      status.result = Submit(entity, queue, &check, 1U, kvaf::aicpu_urma::kReadOpcode,
+                             &cqe_word);
+      status.cqe_word = cqe_word;
+      if (status.result != 0U) break;
+      Flush(ack, 8U);
+      status.ack_seen = *ack;
+      if (status.ack_seen == args->sequence) break;
+    }
+    if (status.result == 0U && status.ack_seen != args->sequence)
+      status.result = 9U;
+  }
+  if (status.result == 0U) {
+    status.phase = 3U;
+    Flush(reinterpret_cast<void*>(args->output), args->bytes);
+    Transfer data[16];
+    const auto count = kvaf::aicpu_urma::PlanContiguousRead(
+        data, args->remote_staging, args->output, args->bytes, entity.local_token_id);
+    status.result = Submit(entity, queue, data, count, kvaf::aicpu_urma::kReadOpcode,
+                           &cqe_word);
+    status.cqe_word = cqe_word;
+    if (status.result == 0U) Flush(reinterpret_cast<void*>(args->output), args->bytes);
   }
   status.sq_producer_index = queue.sq_producer_index;
   status.cq_consumer_index = queue.cq_consumer_index;

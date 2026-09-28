@@ -7,8 +7,16 @@
 
 #include "npu_service.h"
 #include "runtime.h"
+#include "cpu_gather.h"
 
 namespace kvaf {
+
+struct CpuGatherReadRequest {
+  std::vector<peer::GatherSpan> spans;
+  std::uint64_t staging_address{0U};
+  MutableBufferView output;
+  void* stream{nullptr};
+};
 
 struct NpuRuntimeOptions {
   NpuRuntimeOptions(std::string kernel_object_path,
@@ -43,6 +51,7 @@ class NpuRuntime final : public Runtime {
 
   Status Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size);
   Status InitializeHbmService();
+  Status GatherRead(const CpuGatherReadRequest& request);
   RuntimeCore& core();
   const RuntimeCore& core() const;
 

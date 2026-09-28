@@ -12,5 +12,12 @@
       "kernelSo": "libkvaf_aicpu_urma.so",
       "opKernelLib": "AICPUKernel"
     }
+  },
+  "KvafAicpuUrmaGatherRead": {
+    "opInfo": {
+      "functionName": "KvafAicpuUrmaGatherRead",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
   }
 }

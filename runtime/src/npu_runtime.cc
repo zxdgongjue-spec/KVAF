@@ -392,6 +392,32 @@ Status NpuRuntime::InitializeHbmService() {
 #endif
 }
 
+Status NpuRuntime::GatherRead(const CpuGatherReadRequest& request) {
+  if (!initialized() || impl_->hbm_mode || impl_->peer_link == nullptr ||
+      impl_->config.aicpu_urma_kernel_json_path.empty())
+    return Status::NotInitialized("GatherRead requires an initialized AICPU URMA NPU Runtime");
+  if (request.output.device != DeviceKind::kNpu || !request.output.valid() ||
+      request.stream == nullptr)
+    return Status::InvalidArgument("GatherRead requires a caller-owned HBM output and ACL stream");
+  const auto& region = impl_->runtime_core->remote_region();
+  std::uint32_t total_bytes = 0U;
+  if (!peer::ValidateGather(region.base, region.length, request.staging_address,
+                            request.spans, &total_bytes))
+    return Status::InvalidArgument("invalid GatherRead source or staging layout");
+  const std::uint64_t scratch_offset =
+      (static_cast<std::uint64_t>(total_bytes) + 63U) & ~std::uint64_t{63U};
+  if (request.output.bytes < scratch_offset + 64U)
+    return Status::InvalidArgument("GatherRead output needs 64-byte aligned scratch after the payload");
+  peer::GatherReady ready{};
+  Status status = impl_->peer_link->ConfigureGather(region.base, request.staging_address,
+                                                    request.spans, &ready);
+  if (!status.ok()) return status;
+  return impl_->access_operator->ExecuteCpuGatherRead(CpuGatherReadExecRequest{
+      request.output, request.staging_address, ready.command_address,
+      ready.notify_address, ready.ack_address, ready.sequence, ready.total_bytes,
+      request.stream});
+}
+
 RuntimeCore& NpuRuntime::core() {
   if (impl_->hbm_mode || impl_->runtime_core == nullptr) {
     throw std::logic_error("NpuRuntime requires LinkTo before core access");

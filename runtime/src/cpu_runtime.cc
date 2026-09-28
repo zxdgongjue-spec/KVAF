@@ -3,6 +3,7 @@
 #include "cpu_urma/cpu_urma_access_operator.h"
 #include "cpu_urma/cpu_urma_link_selection.h"
 #include "peer_link.h"
+#include "cpu_gather.h"
 
 #include <dlfcn.h>
 #include <sys/socket.h>
@@ -10,7 +11,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdarg>
 #include <cinttypes>
@@ -19,8 +22,10 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -74,6 +79,10 @@ using kvaf::peer::CandidateCountResponse;
 using kvaf::peer::Command;
 using kvaf::peer::CreateChannelRequest;
 using kvaf::peer::CreateChannelResponse;
+using kvaf::peer::ConfigureGatherRequest;
+using kvaf::peer::ConfigureGatherResponse;
+using kvaf::peer::GatherSpan;
+using kvaf::peer::GatherSpanWire;
 using kvaf::peer::IsValidHeader;
 using kvaf::peer::MakeHeader;
 using kvaf::peer::MessageHeader;
@@ -397,16 +406,136 @@ struct Channel {
   urma_target_jetty_t* remote_jetty = nullptr;
 };
 
+class CpuGatherWorker {
+ public:
+  CpuGatherWorker(void* memory, uint64_t base, uint64_t bytes)
+      : memory_(memory), base_(base), bytes_(bytes),
+        control_(static_cast<uint8_t*>(memory) + peer::GatherControlOffset(bytes)),
+        worker_(&CpuGatherWorker::Run, this) {
+    std::memset(control_, 0, 64U);
+    CacheLine(control_, false);
+    Barrier();
+  }
+
+  ~CpuGatherWorker() {
+    stop_.store(true, std::memory_order_release);
+    changed_.notify_all();
+    worker_.join();
+  }
+
+  bool Configure(uint64_t staging, const std::vector<GatherSpan>& spans,
+                 ConfigureGatherResponse* response) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (scheduled_ != completed_ || scheduled_ == UINT64_MAX) return false;
+    staging_ = staging;
+    spans_ = spans;
+    ++scheduled_;
+    response->sequence = scheduled_;
+    response->command_address = base_ + peer::GatherControlOffset(bytes_) + 16U;
+    response->notify_address = base_ + peer::GatherControlOffset(bytes_);
+    response->ack_address = response->notify_address + 8U;
+    changed_.notify_one();
+    return true;
+  }
+
+ private:
+  static void CacheLine(void* address, bool invalidate) {
+#if defined(__aarch64__)
+    if (invalidate) asm volatile("dc ivac, %0" :: "r"(address) : "memory");
+    else asm volatile("dc cvac, %0" :: "r"(address) : "memory");
+#else
+    (void)address;
+    (void)invalidate;
+#endif
+  }
+
+  static void Barrier() {
+#if defined(__aarch64__)
+    asm volatile("dsb sy" ::: "memory");
+#else
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
+  }
+
+  static void CacheRange(void* address, uint64_t bytes, bool invalidate) {
+#if defined(__aarch64__)
+    const auto first = reinterpret_cast<uintptr_t>(address) & ~uintptr_t{63U};
+    const auto end = reinterpret_cast<uintptr_t>(address) + bytes;
+    for (auto line = first; line < end; line += 64U)
+      CacheLine(reinterpret_cast<void*>(line), invalidate);
+#else
+    (void)address;
+    (void)bytes;
+    (void)invalidate;
+#endif
+  }
+
+  void Run() {
+    auto* notify = reinterpret_cast<uint64_t*>(control_);
+    auto* ack = reinterpret_cast<uint64_t*>(control_ + 8U);
+    auto* command = reinterpret_cast<uint64_t*>(control_ + 16U);
+    for (;;) {
+      std::unique_lock<std::mutex> lock(mutex_);
+      changed_.wait(lock, [this] {
+        return stop_.load(std::memory_order_acquire) || scheduled_ != completed_;
+      });
+      if (stop_.load(std::memory_order_acquire)) return;
+      const auto sequence = scheduled_;
+      const auto staging = staging_;
+      const auto spans = spans_;
+      lock.unlock();
+      while (!stop_.load(std::memory_order_acquire)) {
+        CacheLine(control_, true);
+        Barrier();
+        if (__atomic_load_n(notify, __ATOMIC_ACQUIRE) == sequence &&
+            __atomic_load_n(command, __ATOMIC_ACQUIRE) == sequence) break;
+        std::this_thread::yield();
+      }
+      if (stop_.load(std::memory_order_acquire)) return;
+      for (const auto& span : spans)
+        CacheRange(static_cast<uint8_t*>(memory_) + (span.address - base_),
+                   span.length, true);
+      Barrier();
+      peer::GatherIntoStaging(memory_, base_, staging, spans);
+      uint8_t* gathered = static_cast<uint8_t*>(memory_) + (staging - base_);
+      uint64_t gathered_bytes = 0U;
+      for (const auto& span : spans) gathered_bytes += span.length;
+      CacheRange(gathered, gathered_bytes, false);
+      Barrier();
+      __atomic_store_n(ack, sequence, __ATOMIC_RELEASE);
+      CacheLine(control_, false);
+      Barrier();
+      lock.lock();
+      completed_ = sequence;
+    }
+  }
+
+  void* memory_;
+  uint64_t base_;
+  uint64_t bytes_;
+  uint8_t* control_;
+  std::atomic<bool> stop_{false};
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  std::vector<GatherSpan> spans_;
+  uint64_t staging_{0U};
+  uint64_t scheduled_{0U};
+  uint64_t completed_{0U};
+  std::thread worker_;
+};
+
 struct Region {
   uint64_t id = 0U;
   uint32_t candidate_id = 0U;
   UrmaResources* resources = nullptr;
   void* memory = nullptr;
   uint64_t bytes = 0U;
+  uint64_t base = 0U;
   urma_token_id_t* token_id = nullptr;
   urma_target_seg_t* segment = nullptr;
   uint32_t token_value = 0U;
   std::vector<Channel> channels;
+  std::unique_ptr<CpuGatherWorker> gather;
 };
 
 class CpuService {
@@ -439,6 +568,8 @@ class CpuService {
       return Result::kResourceError;
     }
     region->bytes = bytes;
+    if (bytes >= 64U)
+      std::memset(static_cast<uint8_t*>(region->memory) + peer::GatherControlOffset(bytes), 0, 64U);
     region->token_value = NextToken();
     region->token_id = urma_alloc_token_id(resources->context());
     if (region->token_id == nullptr) {
@@ -473,6 +604,7 @@ class CpuService {
     }
     const uint64_t id = next_region_id_++;
     region->id = id;
+    region->base = region->segment->seg.ubva.va;
     response->session_id = id;
     response->peer_base = region->segment->seg.ubva.va;
     response->peer_length = bytes;
@@ -570,6 +702,22 @@ class CpuService {
     return Result::kOk;
   }
 
+  Result ConfigureGather(uint64_t session_id, uint64_t staging,
+                         const std::vector<GatherSpan>& spans,
+                         ConfigureGatherResponse* response) {
+    const auto found = regions_.find(session_id);
+    if (found == regions_.end()) return Result::kNotFound;
+    Region& region = *found->second;
+    uint32_t total_bytes = 0U;
+    if (!peer::ValidateGather(region.base, region.bytes, staging, spans, &total_bytes))
+      return Result::kInvalidRequest;
+    if (region.gather == nullptr)
+      region.gather = std::make_unique<CpuGatherWorker>(region.memory, region.base, region.bytes);
+    if (!region.gather->Configure(staging, spans, response)) return Result::kResourceError;
+    response->total_bytes = total_bytes;
+    return Result::kOk;
+  }
+
  private:
   uint32_t NextToken() {
     ++next_token_;
@@ -646,6 +794,7 @@ class CpuService {
     if (region == nullptr) {
       return;
     }
+    region->gather.reset();
     for (auto iterator = region->channels.rbegin(); iterator != region->channels.rend(); ++iterator) {
       if (iterator->remote_jetty != nullptr) {
         (void)urma_unimport_jetty(iterator->remote_jetty);
@@ -760,6 +909,30 @@ void HandleClient(int fd, CpuService* service) {
         return;
       }
       SendStatus(fd, command, service->Release(request.session_id));
+      return;
+    }
+    case Command::kConfigureGather: {
+      ConfigureGatherRequest request{};
+      request.header = header;
+      if (!ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header),
+                   sizeof(request) - sizeof(header)) ||
+          request.reserved != 0U || request.span_count == 0U ||
+          request.span_count > peer::kMaxGatherSpans ||
+          header.bytes != sizeof(request) + request.span_count * sizeof(GatherSpanWire)) {
+        SendStatus(fd, command, Result::kInvalidRequest);
+        return;
+      }
+      std::vector<GatherSpanWire> wire(request.span_count);
+      if (!ReadAll(fd, wire.data(), wire.size() * sizeof(wire.front()))) return;
+      std::vector<GatherSpan> spans;
+      spans.reserve(wire.size());
+      for (const auto& span : wire) spans.push_back({span.address, span.length, span.reserved});
+      ConfigureGatherResponse response{};
+      response.header = MakeHeader(command, sizeof(response));
+      response.header.command = ResponseCommand(command);
+      response.result = static_cast<int32_t>(service->ConfigureGather(
+          request.session_id, request.staging_address, spans, &response));
+      (void)WriteAll(fd, &response, sizeof(response));
       return;
     }
     case Command::kAllocateHbmRegion:

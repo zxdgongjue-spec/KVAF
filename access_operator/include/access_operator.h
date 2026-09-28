@@ -24,6 +24,17 @@ struct BatchPutExecRequest {
   BatchPutExecutionOptions execution;
 };
 
+struct CpuGatherReadExecRequest {
+  MutableBufferView output;
+  std::uint64_t remote_staging{0U};
+  std::uint64_t remote_command{0U};
+  std::uint64_t remote_notify{0U};
+  std::uint64_t remote_ack{0U};
+  std::uint64_t sequence{0U};
+  std::uint32_t bytes{0U};
+  void* stream{nullptr};
+};
+
 // KV Access Operator 是 Runtime 的数据面依赖。Runtime 管理远端 DDR
 // 生命周期和 Meta 可见性；Operator 只负责初始化链路并执行同步搬运。
 class AccessOperator {
@@ -81,6 +92,7 @@ class DefaultAccessOperator final : public AccessOperator {
   Status Shutdown() override;
   Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
   Status ExecuteBatchPut(const BatchPutExecRequest& request) override;
+  Status ExecuteCpuGatherRead(const CpuGatherReadExecRequest& request);
 
  private:
   struct Impl;

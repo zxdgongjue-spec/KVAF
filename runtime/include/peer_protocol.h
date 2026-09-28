@@ -16,6 +16,7 @@ constexpr uint16_t kProtocolVersion = 5U;
 constexpr uint32_t kQpKeyBytes = 64U;
 constexpr uint32_t kSegKeyBytes = 64U;
 constexpr uint32_t kEidBytes = 16U;
+constexpr uint32_t kMaxGatherSpans = 65536U;
 
 enum class Command : uint16_t {
   kAllocateRegion = 1U,
@@ -27,6 +28,7 @@ enum class Command : uint16_t {
   kAllocateHbmRegion = 5U,
   kReleaseHbmRegion = 6U,
   kGetHbmEidCandidate = 7U,
+  kConfigureGather = 8U,
 };
 
 enum class Result : int32_t {
@@ -155,6 +157,30 @@ struct StatusResponse {
   int32_t result;
   uint32_t reserved;
 };
+
+struct ConfigureGatherRequest {
+  MessageHeader header;
+  uint64_t session_id;
+  uint64_t staging_address;
+  uint32_t span_count;
+  uint32_t reserved;
+};
+
+struct GatherSpanWire {
+  uint64_t address;
+  uint32_t length;
+  uint32_t reserved;
+};
+
+struct ConfigureGatherResponse {
+  MessageHeader header;
+  int32_t result;
+  uint32_t total_bytes;
+  uint64_t sequence;
+  uint64_t command_address;
+  uint64_t notify_address;
+  uint64_t ack_address;
+};
 #pragma pack(pop)
 
 static_assert(sizeof(MessageHeader) == 12U, "wire header ABI changed");
@@ -168,6 +194,9 @@ static_assert(sizeof(AllocateHbmRegionResponse) == 204U, "HBM allocate response 
 static_assert(sizeof(ReleaseHbmRegionRequest) == 20U, "HBM release request ABI changed");
 static_assert(sizeof(HbmEidCandidateRequest) == 20U, "HBM candidate request ABI changed");
 static_assert(sizeof(HbmEidCandidateResponse) == 40U, "HBM candidate response ABI changed");
+static_assert(sizeof(ConfigureGatherRequest) == 36U, "gather request ABI changed");
+static_assert(sizeof(GatherSpanWire) == 16U, "gather span ABI changed");
+static_assert(sizeof(ConfigureGatherResponse) == 52U, "gather response ABI changed");
 
 inline constexpr uint16_t ResponseCommand(Command command) {
   return static_cast<uint16_t>(command) | 0x8000U;

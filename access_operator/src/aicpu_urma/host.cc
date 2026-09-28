@@ -13,6 +13,7 @@ std::mutex kernel_mutex;
 aclrtBinHandle binary = nullptr;
 aclrtFuncHandle put_function = nullptr;
 aclrtFuncHandle get_function = nullptr;
+aclrtFuncHandle gather_function = nullptr;
 
 int32_t Launch(aclrtFuncHandle function, void* arguments, std::size_t bytes,
                aclrtStream stream) {
@@ -52,11 +53,13 @@ bool Load(const char* json_path) {
   aclrtBinHandle loaded = nullptr;
   if (aclrtBinaryLoadFromFile(resolved, &options, &loaded) != ACL_SUCCESS ||
       aclrtBinaryGetFunction(loaded, "KvafAicpuUrmaBatchPut", &put_function) != ACL_SUCCESS ||
-      aclrtBinaryGetFunction(loaded, "KvafAicpuUrmaBatchGet", &get_function) != ACL_SUCCESS) {
+      aclrtBinaryGetFunction(loaded, "KvafAicpuUrmaBatchGet", &get_function) != ACL_SUCCESS ||
+      aclrtBinaryGetFunction(loaded, "KvafAicpuUrmaGatherRead", &gather_function) != ACL_SUCCESS) {
     std::fprintf(stderr, "[KVAF_AICPU_URMA] failed to load AICPU kernel path=%s\n", resolved);
     if (loaded != nullptr) (void)aclrtBinaryUnLoad(loaded);
     put_function = nullptr;
     get_function = nullptr;
+    gather_function = nullptr;
     return false;
   }
   binary = loaded;
@@ -70,6 +73,11 @@ int32_t LaunchPut(const KvafExecuteBatchPutLaunchArgs* arguments, aclrtStream st
 
 int32_t LaunchGet(const KvafExecuteBatchGetKernelArgs* arguments, aclrtStream stream) {
   return Launch(get_function, const_cast<KvafExecuteBatchGetKernelArgs*>(arguments),
+                sizeof(*arguments), stream);
+}
+
+int32_t LaunchGatherRead(const GatherReadArgs* arguments, aclrtStream stream) {
+  return Launch(gather_function, const_cast<GatherReadArgs*>(arguments),
                 sizeof(*arguments), stream);
 }
 

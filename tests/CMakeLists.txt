@@ -1,10 +1,15 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+find_package(Threads REQUIRED)
 
 add_subdirectory(aicpu_batch_get)
 
 add_executable(kvaf_aicpu_urma_wqe_test aicpu_urma_wqe_test.cc)
 target_include_directories(kvaf_aicpu_urma_wqe_test PRIVATE "${CMAKE_SOURCE_DIR}/access_operator/src")
 add_test(NAME kvaf_aicpu_urma_wqe COMMAND kvaf_aicpu_urma_wqe_test)
+
+add_executable(kvaf_cpu_gather_test cpu_gather_test.cc)
+target_include_directories(kvaf_cpu_gather_test PRIVATE "${CMAKE_SOURCE_DIR}/runtime/include")
+add_test(NAME kvaf_cpu_gather COMMAND kvaf_cpu_gather_test)
 
 add_executable(kvaf_aicpu_urma_kernel_test aicpu_urma_kernel_test.cc
   "${CMAKE_SOURCE_DIR}/access_operator/src/aicpu_urma/kernel.cc")
@@ -14,6 +19,17 @@ target_include_directories(kvaf_aicpu_urma_kernel_test PRIVATE
   "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include"
   "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_put/include")
 add_test(NAME kvaf_aicpu_urma_kernel COMMAND kvaf_aicpu_urma_kernel_test)
+
+add_executable(kvaf_aicpu_gather_read_kernel_test aicpu_gather_read_kernel_test.cc
+  "${CMAKE_SOURCE_DIR}/access_operator/src/aicpu_urma/kernel.cc")
+target_compile_definitions(kvaf_aicpu_gather_read_kernel_test PRIVATE KVAF_AICPU_URMA_HOST_TEST=1)
+target_include_directories(kvaf_aicpu_gather_read_kernel_test PRIVATE
+  "${CMAKE_SOURCE_DIR}/access_operator/src"
+  "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include"
+  "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_put/include"
+  "${CMAKE_SOURCE_DIR}/runtime/include")
+target_link_libraries(kvaf_aicpu_gather_read_kernel_test PRIVATE Threads::Threads)
+add_test(NAME kvaf_aicpu_gather_read_kernel COMMAND kvaf_aicpu_gather_read_kernel_test)
 
 add_executable(kvaf_aicpu_urma_client_options_test aicpu_urma_client_options_test.cc)
 add_test(NAME kvaf_aicpu_urma_client_options COMMAND kvaf_aicpu_urma_client_options_test)
@@ -25,7 +41,6 @@ add_test(NAME kvaf_aicpu_urma_install
   COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/aicpu_urma_install_test.sh")
 
 add_executable(kvaf_aicpu_sgl_simulator aicpu_sgl_simulator.cc)
-find_package(Threads REQUIRED)
 find_package(OpenMP COMPONENTS CXX QUIET)
 target_include_directories(kvaf_aicpu_sgl_simulator PRIVATE
   "${CMAKE_SOURCE_DIR}/access_operator/include"
@@ -139,6 +154,15 @@ if(KVAF_ENABLE_AIV_BATCH_PUT)
 endif()
 
 if(KVAF_ENABLE_AICPU_URMA)
+  add_executable(kvaf_aicpu_gather_read_client aicpu_gather_read_client.cc)
+  target_compile_definitions(kvaf_aicpu_gather_read_client PRIVATE
+    "KVAF_AICPU_URMA_CANN_ROOT=\"${ASCEND_CANN_PACKAGE_PATH}\"")
+  target_include_directories(kvaf_aicpu_gather_read_client PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/include")
+  target_link_directories(kvaf_aicpu_gather_read_client PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/lib64")
+  target_link_libraries(kvaf_aicpu_gather_read_client PRIVATE kvaf_npu_runtime ascendcl)
+  target_compile_features(kvaf_aicpu_gather_read_client PRIVATE cxx_std_17)
+  set_property(TARGET kvaf_aicpu_gather_read_client APPEND PROPERTY BUILD_RPATH
+    "${ASCEND_CANN_PACKAGE_PATH}/lib64")
   add_executable(kvaf_aicpu_urma_client aicpu_urma_client.cc)
   target_compile_definitions(kvaf_aicpu_urma_client PRIVATE
     "KVAF_AICPU_URMA_CANN_ROOT=\"${ASCEND_CANN_PACKAGE_PATH}\"")

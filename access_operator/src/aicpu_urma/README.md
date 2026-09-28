@@ -1,4 +1,4 @@
-# AICPU URMA BatchPut / BatchGet
+# AICPU URMA BatchPut / BatchGet / GatherRead
 
 这个可选后端不创建第二条链路：沿用 KVAF `NpuRuntime::LinkTo` 的候选 EID/PeerLink
 选择，以及现有 Direct-HCCP Host 侧的 HBM/Host DDR 注册、远端导入、USER_CTL
@@ -44,8 +44,8 @@ CANN 路径查找 AICPU JSON，并使用单 worker、单 Jetty；无需配置 `C
 服务端仍是 KVAF 原有 CPU Runtime 服务。
 
 Host 单测（含部署脚本的本地模拟测试）：
-`ctest --test-dir build-aicpu-urma -R kvaf_aicpu_urma_ --output-on-failure`。
-无需 CANN 的机器也可运行：`cmake -S . -B build-host -DBUILD_TESTING=ON && cmake --build build-host --target kvaf_aicpu_urma_wqe_test kvaf_aicpu_urma_kernel_test kvaf_aicpu_urma_client_options_test kvaf_aicpu_urma_client_metrics_test && ctest --test-dir build-host -R kvaf_aicpu_urma_ --output-on-failure`。
+`ctest --test-dir build-aicpu-urma -R 'kvaf_aicpu_urma_|kvaf_aicpu_gather_read_kernel|kvaf_cpu_gather' --output-on-failure`。
+无需 CANN 的机器也可编译并运行 WQE、gather 和内核握手单测。
 
 真实 CPU/NPU 回读测试：CPU 端先运行 `./build.sh cpu` 和
 `build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999`；
@@ -75,6 +75,38 @@ CPU DDR 分配大小固定为 `blocks * block-bytes`。
 Runtime 提交与 stream 同步，不包含 AccessTable 准备、HBM 上传/回读和逐字节校验，
 因此不是纯 SQ 带宽。底层 Direct-HCCP 的诊断日志仍可能出现。
 失败时退出码非零且不会输出 `AICPU_URMA_PASS`；`--help` 查看完整参数。
+
+## CPU Gather + AICPU 连续 READ
+
+此路径使用同一个 `NpuRuntime::LinkTo` / Direct-HCCP Jetty，不改变 AIV 算子。
+CPU 服务端先收到离散源地址清单及 staging 地址；AICPU 发一条 opcode 5 的
+WRITE_WITH_NOTIFY（96 字节，占两个 64 字节 SQ WQEBB），将序号写入 DDR 控制区并
+通知 CPU worker。worker 按清单将 DRAM 数据复制到连续 staging，刷出 CPU 缓存并
+写回完成序号。AICPU 用 READ 轮询完成序号，匹配后将连续 staging 读入连续
+HBM 输出；超过 256 MiB 时按 hcomm 的单 WQE 上限分段提交。当前不执行 HBM
+离散地址 scatter，也不是多 SGL WQE。
+
+两端分别运行：
+
+```bash
+# CPU 终端
+./build.sh cpu
+build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999
+
+# NPU 终端
+./build.sh aicpu-urma --install-kernel
+build-aicpu-urma/tests/kvaf_aicpu_gather_read_client \
+  --peer CPU_HOST:28999 --device-id 0 \
+  --blocks 16 --block-bytes 4096 --warmup 1 --iterations 5
+```
+
+客户端每轮 BatchPut 不同 payload 到 DDR，按 block 逆序生成 gather 清单，校验连续
+HBM 输出；仅汇总 GatherRead 计时。分配布局为源数据、等长 staging、至少
+128 字节的控制预留，并用保留 key 占住 staging/控制 slot，避免 MetaManager
+后续复用。调用 `NpuRuntime::GatherRead` 时，源地址与 staging 必须在注册 DDR
+范围内且不重叠，末尾 64 字节控制区不可用于 KV slot。输出 HBM 需要额外的
+64 字节对齐 scratch 空间；数据本身从输出基址开始。一个 region 同时只允许
+一个未完成的 gather。真实设备的 WRITE_WITH_NOTIFY 支持和性能仍需在目标机器验证。
 
 **硬件验证状态**：本分支的 Host WQE ABI/模拟队列测试和内核语法检查不等价于 NPU
 收发验证。部署后应先用 Runtime 自带的 LinkTo WRITE 探针确认链路，再在真实

@@ -396,6 +396,49 @@ Status PeerLink::LookupRegion(uint64_t base, PeerRegion* region) const {
   return Status::OK();
 }
 
+Status PeerLink::ConfigureGather(uint64_t region_base, uint64_t staging_address,
+                                 const std::vector<GatherSpan>& spans, GatherReady* ready) const {
+  const auto found = regions_.find(region_base);
+  if (found == regions_.end() || found->second.device_memory)
+    return Status::NotFound("peer DDR region was not found");
+  if (ready == nullptr || spans.size() > kMaxGatherSpans)
+    return Status::InvalidArgument("invalid gather output or span count");
+  std::uint32_t total_bytes = 0U;
+  if (!ValidateGather(found->second.base, found->second.length,
+                      staging_address, spans, &total_bytes))
+    return Status::InvalidArgument("gather addresses overlap or exceed peer DDR");
+  ConfigureGatherRequest request{};
+  request.header = MakeHeader(Command::kConfigureGather,
+                              static_cast<uint32_t>(sizeof(request) +
+                                                    spans.size() * sizeof(GatherSpanWire)));
+  request.session_id = found->second.session_id;
+  request.staging_address = staging_address;
+  request.span_count = static_cast<uint32_t>(spans.size());
+  std::vector<GatherSpanWire> wire;
+  wire.reserve(spans.size());
+  for (const auto& span : spans) wire.push_back({span.address, span.length, 0U});
+  std::string error;
+  const int fd = Connect(address_, &error);
+  if (fd < 0) return ToStatus("peer gather configuration failed", std::move(error));
+  ConfigureGatherResponse response{};
+  const bool exchanged = WriteAll(fd, &request, sizeof(request), &error) &&
+                         WriteAll(fd, wire.data(), wire.size() * sizeof(wire.front()), &error) &&
+                         ReadAll(fd, &response, sizeof(response), &error);
+  close(fd);
+  if (!exchanged ||
+      !IsValidResponseHeader(response.header, Command::kConfigureGather, sizeof(response)) ||
+      !ResultOk(static_cast<Result>(response.result), &error) ||
+      response.sequence == 0U || response.total_bytes != total_bytes ||
+      response.notify_address != found->second.base +
+          GatherControlOffset(found->second.length) ||
+      response.command_address != response.notify_address + 16U ||
+      response.ack_address != response.notify_address + 8U)
+    return ToStatus("peer gather configuration failed", std::move(error));
+  *ready = {response.sequence, response.command_address, response.notify_address,
+            response.ack_address, total_bytes};
+  return Status::OK();
+}
+
 Status PeerLink::RememberRegion(const PeerRegion& region) {
   if (region.base == 0U || region.length == 0U || region.session_id == 0U)
     return Status::InvalidArgument("invalid peer region descriptor");

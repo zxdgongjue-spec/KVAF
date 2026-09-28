@@ -22,8 +22,8 @@ npu  Builds the CANN AIV BatchGet/BatchPut Runtime and Python binding. It
      installs pybind11 for the selected Python interpreter when necessary.
 aiv-native Builds the standalone native ACL BatchPut/BatchGet roundtrip test;
            no PyTorch NPU, Python binding, or AICPU kernel installation.
-aicpu-urma Builds the native NPU Runtime client and the AICPU URMA BatchPut/
-           BatchGet kernel package; no Python binding. --install-kernel installs
+aicpu-urma Builds the native NPU Runtime clients and the AICPU URMA BatchPut/
+           BatchGet/GatherRead kernel package; no Python binding. --install-kernel installs
            and verifies the package in the detected CANN root (write access
            required). --check-kernel and --uninstall-kernel do not build.
 aicpu-sgl-sim Builds the CPU-only gather + AICPU SGL transfer simulator.
@@ -224,8 +224,9 @@ build_aicpu_urma() {
   local kernel_action="$3"
   local cann_root
   local -a compiler_option=()
-  local -a targets=(kvaf_aicpu_urma_client kvaf_aicpu_urma_kernel
-    kvaf_aicpu_urma_wqe_test kvaf_aicpu_urma_kernel_test
+  local -a targets=(kvaf_aicpu_urma_client kvaf_aicpu_gather_read_client kvaf_aicpu_urma_kernel
+    kvaf_aicpu_urma_wqe_test kvaf_aicpu_urma_kernel_test kvaf_aicpu_gather_read_kernel_test
+    kvaf_cpu_gather_test
     kvaf_aicpu_urma_client_options_test kvaf_aicpu_urma_client_metrics_test)
   require_command cmake
   cann_root="$(find_cann_root)"
@@ -249,8 +250,9 @@ build_aicpu_urma() {
       "$build_dir/access_operator/src/aicpu_urma" "$cann_root"
   fi
   echo "[KVAF_BUILD] Native test: $build_dir/tests/kvaf_aicpu_urma_client"
+  echo "[KVAF_BUILD] Gather test: $build_dir/tests/kvaf_aicpu_gather_read_client --help"
   echo "[KVAF_BUILD] AICPU kernel package: $build_dir/access_operator/src/aicpu_urma/kvaf-aicpu-urma.tar.gz"
-  echo "[KVAF_BUILD] Host tests: ctest --test-dir '$build_dir' -R kvaf_aicpu_urma_ --output-on-failure"
+  echo "[KVAF_BUILD] Host tests: ctest --test-dir '$build_dir' -R 'kvaf_aicpu_urma_|kvaf_aicpu_gather_read_kernel|kvaf_cpu_gather' --output-on-failure"
   echo "[KVAF_BUILD] Run: '$build_dir/tests/kvaf_aicpu_urma_client' --help"
 }
 
