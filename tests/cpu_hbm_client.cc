@@ -1,4 +1,6 @@
 #include "cpu_urma/cpu_urma_transport.h"
+#include "cpu_urma/cpu_urma_discovery.h"
+#include "cpu_urma/cpu_urma_link_selection.h"
 
 #include <algorithm>
 #include <chrono>
@@ -7,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <random>
 #include <string>
 #include <sys/mman.h>
@@ -28,6 +31,7 @@ struct Options {
   std::string ub_device;
   bool has_eid_index{false};
   std::uint32_t eid_index{0};
+  std::uint32_t remote_eid_index{UINT32_MAX};
   std::uint32_t device_id{0};
   std::uint32_t jetty_count{4};
   std::uint32_t remote_sgl_size{1};
@@ -57,7 +61,7 @@ void Usage(const char* program) {
                "[--host-space-bytes N[K|M|G|T]] [--iterations N] [--warmup N] "
                "[--doorbell-wqes N] "
                "[--seed N] [--ub-device NAME] "
-               "[--eid-index N] [--device-id N] [--jettys N] "
+               "[--eid-index N] [--remote-eid-index N] [--device-id N] [--jettys N] "
                "[--remote-sgl-size N] [--prepare-threads N]\n",
                program);
 }
@@ -108,6 +112,8 @@ bool Parse(int argc, char** argv, Options* options) {
     else if (arg == "--seed" && ParseU64(value, &options->seed)) {}
     else if (arg == "--ub-device") options->ub_device = value;
     else if (arg == "--eid-index" && ParseU32(value, &options->eid_index)) options->has_eid_index = true;
+    else if (arg == "--remote-eid-index" && ParseU32(value, &options->remote_eid_index) &&
+             options->remote_eid_index != UINT32_MAX) {}
     else if (arg == "--device-id" && ParseU32(value, &options->device_id)) {}
     else if (arg == "--jettys" && ParseU32(value, &options->jetty_count)) {}
     else if (arg == "--remote-sgl-size" && ParseU32(value, &options->remote_sgl_size)) {}
@@ -122,6 +128,72 @@ bool Parse(int argc, char** argv, Options* options) {
          options->blocks <= std::numeric_limits<std::uint64_t>::max() / options->block_bytes &&
          options->block_bytes <= std::numeric_limits<std::uint32_t>::max();
 }
+
+// Own each HBM allocation outside the transport so a failed attempt's remote
+// resources must be released successfully before another endpoint is tried.
+class HbmConnection {
+ public:
+  explicit HbmConnection(const std::string& peer) : peer_(peer) {}
+  ~HbmConnection() { (void)Shutdown(); }
+
+  kvaf::Status Initialize(const Options& options, std::uint64_t total_bytes) {
+    auto status = discovery_.Initialize(
+        options.ub_device, options.has_eid_index, options.eid_index);
+    if (!status.ok()) return status;
+    kvaf::CpuUrmaTransportOptions base;
+    base.peer_address = options.peer;
+    base.region_bytes = total_bytes;
+    base.wqes_per_doorbell = options.wqes_per_doorbell;
+    base.jetty_count = options.jetty_count;
+    base.remote_sgl_size = options.remote_sgl_size;
+    base.prepare_thread_count = options.prepare_thread_count;
+    return kvaf::SelectCpuUrmaDeviceLink(
+        peer_, options.device_id, discovery_.candidates(),
+        [&](const kvaf::CpuUrmaCandidate& cpu, std::uint32_t npu_index)
+            -> kvaf::CpuUrmaLinkAttempt {
+          auto attempt = peer_.AllocateHbmRegion(
+              total_bytes, total_bytes, options.device_id, npu_index, &region_);
+          if (attempt.ok()) {
+            auto config = kvaf::BindCpuUrmaEndpoint(
+                base, cpu, options.device_id, npu_index);
+            config.has_external_region = true;
+            config.external_region = region_;
+            // A failed/poisoned transport retains endpoint state after Shutdown.
+            // Each candidate pair therefore needs a fresh transport instance.
+            transport_ = std::make_unique<kvaf::CpuUrmaTransport>();
+            attempt = transport_->Initialize(config);
+            if (attempt.ok()) attempt = transport_->ValidateLink();
+          }
+          if (attempt.ok()) return {attempt, false};
+          const auto cleanup = Shutdown();
+          if (!cleanup.ok()) return {cleanup, false};
+          return {attempt, true};
+        }, options.remote_eid_index);
+  }
+
+  kvaf::CpuUrmaTransport& transport() { return *transport_; }
+
+  kvaf::Status Shutdown() {
+    if (transport_) {
+      const auto status = transport_->Shutdown();
+      if (!status.ok()) return status;
+      transport_.reset();
+    }
+    if (region_.session_id != 0U) {
+      const auto status = peer_.ReleaseHbmRegion(region_.session_id);
+      if (!status.ok()) return status;
+      region_ = {};
+    }
+    return kvaf::Status::OK();
+  }
+
+ private:
+  // Discovery keeps process-wide URMA alive throughout retries and transfers.
+  kvaf::CpuUrmaDiscovery discovery_;
+  kvaf::peer::PeerLink peer_;
+  kvaf::peer::PeerRegion region_{};
+  std::unique_ptr<kvaf::CpuUrmaTransport> transport_;
+};
 
 struct Stats {
   std::uint64_t batches{0};
@@ -299,26 +371,14 @@ int main(int argc, char** argv) {
                static_cast<unsigned long long>(source_stride_bytes));
   std::fprintf(stderr, "[HBM_TEST][CPU] DATA_PATH=direct-registered-host-memory\n");
 
-  kvaf::CpuUrmaTransportOptions transport_options;
-  transport_options.peer_address = options.peer;
-  transport_options.ub_device = options.ub_device;
-  transport_options.has_eid_index = options.has_eid_index;
-  transport_options.eid_index = options.eid_index;
-  transport_options.region_bytes = total_bytes;
-  transport_options.remote_hbm = true;
-  transport_options.remote_device_id = options.device_id;
-  transport_options.remote_eid_index = options.has_eid_index ? options.eid_index : UINT32_MAX;
-  transport_options.wqes_per_doorbell = options.wqes_per_doorbell;
-  transport_options.jetty_count = options.jetty_count;
-  transport_options.remote_sgl_size = options.remote_sgl_size;
-  transport_options.prepare_thread_count = options.prepare_thread_count;
-  kvaf::CpuUrmaTransport transport;
-  kvaf::Status status = transport.Initialize(transport_options);
+  HbmConnection connection(options.peer);
+  kvaf::Status status = connection.Initialize(options, total_bytes);
   if (!status.ok()) {
     std::fprintf(stderr, "[HBM_TEST][CPU] FAILED stage=transport_initialize: %s\n",
                  status.message().c_str());
     return 1;
   }
+  auto& transport = connection.transport();
   std::fprintf(stderr, "[HBM_TEST][CPU] CHANNEL_READY remote_bytes=%llu\n",
                static_cast<unsigned long long>(transport.region_bytes()));
 
@@ -330,7 +390,7 @@ int main(int argc, char** argv) {
   if (static_cast<std::size_t>(host_space_bytes) >
       std::numeric_limits<std::size_t>::max() - (page_bytes - 1U)) {
     std::fprintf(stderr, "[HBM_TEST][CPU] host address space size overflows page rounding\n");
-    (void)transport.Shutdown();
+    (void)connection.Shutdown();
     return 1;
   }
   const std::size_t allocation_bytes =
@@ -346,7 +406,7 @@ int main(int argc, char** argv) {
   if (storage_address == MAP_FAILED) {
     std::fprintf(stderr, "[HBM_TEST][CPU] host address-space reservation failed bytes=%zu\n",
                  allocation_bytes);
-    (void)transport.Shutdown();
+    (void)connection.Shutdown();
     return 1;
   }
   storage.data = static_cast<std::uint8_t*>(storage_address);
@@ -376,7 +436,7 @@ int main(int argc, char** argv) {
   if (!status.ok()) {
     std::fprintf(stderr, "[HBM_TEST][CPU] FAILED stage=host_region_register: %s\n",
                  status.message().c_str());
-    (void)transport.Shutdown();
+    (void)connection.Shutdown();
     return 1;
   }
   std::vector<std::size_t> order(options.blocks);
@@ -394,12 +454,12 @@ int main(int argc, char** argv) {
                         iterations, stats);
   };
   if (options.warmup != 0 && !run_pass(true, options.warmup, &warmup_stats)) {
-    (void)transport.Shutdown();
+    (void)connection.Shutdown();
     return 1;
   }
   Stats write_stats;
   if (!run_pass(true, options.iterations, &write_stats)) {
-    (void)transport.Shutdown();
+    (void)connection.Shutdown();
     return 1;
   }
   // Verify the packed remote bytes through independent, single-SGE READs.
@@ -411,7 +471,7 @@ int main(int argc, char** argv) {
                                 mmap_flags, -1, 0);
   if (readback_address == MAP_FAILED) {
     std::fprintf(stderr, "[HBM_TEST][CPU] packed READ buffer allocation failed\n");
-    (void)transport.Shutdown();
+    (void)connection.Shutdown();
     return 1;
   }
   readback.data = static_cast<std::uint8_t*>(readback_address);
@@ -420,7 +480,7 @@ int main(int argc, char** argv) {
   if (!status.ok()) {
     std::fprintf(stderr, "[HBM_TEST][CPU] packed READ buffer registration failed: %s\n",
                  status.message().c_str());
-    (void)transport.Shutdown();
+    (void)connection.Shutdown();
     return 1;
   }
   std::vector<HostBlock> read_blocks(options.blocks);
@@ -432,15 +492,20 @@ int main(int argc, char** argv) {
   Stats read_stats;
   if (!RunBatchPass(&transport, false, &read_blocks, read_order,
                     options.block_bytes, options.iterations, &read_stats)) {
-    (void)transport.Shutdown();
+    (void)connection.Shutdown();
     return 1;
   }
   const bool verified = std::equal(expected.begin(), expected.end(), readback.data);
   PrintStats("WRITE", write_stats);
   PrintStats("READ", read_stats);
+  status = connection.Shutdown();
+  if (!status.ok()) {
+    std::fprintf(stderr, "[HBM_TEST][CPU] FAILED stage=shutdown: %s\n",
+                 status.message().c_str());
+    return 1;
+  }
   std::printf("[HBM_TEST][CPU] %s blocks=%zu block_bytes=%zu seed=%llu\n",
               verified ? "PASS" : "FAIL", options.blocks, options.block_bytes,
               static_cast<unsigned long long>(options.seed));
-  (void)transport.Shutdown();
   return verified ? 0 : 1;
 }

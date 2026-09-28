@@ -23,20 +23,38 @@ size, remote `device_id`, and EID list index. The NPU service then calls
 tests/run_hbm_rw_server.sh --port 29888
 ```
 
-`--eid-index` is the NPU EID list index. The CPU-side URMA device/EID is
-discovered by `CpuUrmaTransport`; use `--ub-device` or `--eid-index` only to
-constrain that local discovery.
+The client discovers CPU and NPU EID candidates and probes each pair with an
+actual WRITE, using the same selection logic as `CpuRuntime`. It releases a
+failed attempt before retrying, and prints `LINK_SELECTED` and `CHANNEL_READY`
+only after a probe succeeds. Discovery and probing are outside benchmark timing.
+
+`--ub-device` and `--eid-index` constrain the local CPU endpoint only.
+`--device-id` selects the remote NPU device; `--remote-eid-index` optionally pins
+that device's EID candidate list index. Local EID indices and remote candidate
+indices are independent. Omitting `--remote-eid-index` tries all remote
+candidates; supplying it never falls back to a different remote candidate.
 
 ```bash
 tests/run_hbm_rw_client.sh <npu-host> 29888 \
   --blocks 1024 --block-bytes 656 --device-id 0 --eid-index 0
 ```
 
-The client calls `CpuUrmaTransport::Initialize`, which sends the allocation
-request, imports the segment, and creates the CTP/Jetty pair through
+For each candidate pair, the client allocates HBM through `PeerLink`, passes
+the region to a fresh `CpuUrmaTransport::Initialize`, and calls `ValidateLink`.
+The transport imports the segment and creates the CTP/Jetty pair through
 `PeerLink`. Each benchmark operation uses the direct registered host-memory
-path (`WriteSglBatch`/`ReadSglBatch`), so the block address itself is the URMA
+path (`WriteBatch`/`ReadSglBatch`), so the block address itself is the URMA
 SGE and no bounce-buffer memcpy is performed.
+
+For example, to pin CPU EID 0 and NPU device 6's EID candidate 1:
+
+```bash
+./build-cpu/tests/kvaf_cpu_hbm_client 127.0.0.1:28111 \
+  --ub-device udmac0d1e2 --eid-index 0 \
+  --device-id 6 --remote-eid-index 1 \
+  --jettys 4 --prepare-threads 4 --remote-sgl-size 12 \
+  --blocks 4096 --block-bytes 656 --warmup 50 --iterations 1000
+```
 
 ## Random 656-byte block benchmark
 

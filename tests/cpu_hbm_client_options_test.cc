@@ -12,22 +12,86 @@ std::size_t single_posts = 0;
 std::size_t read_posts = 0;
 std::uint32_t initialized_prepare_threads = 0;
 bool corrupt_gather = false;
+bool fail_first_probe = false;
+bool fail_release = false;
+std::uint64_t active_session = 0;
+std::uint64_t next_session = 1;
+std::size_t live_link_transports = 0;
+std::vector<std::uint32_t> allocated_candidates;
+std::vector<kvaf::CpuUrmaTransportOptions> initialized_endpoints;
 }
 
 // Exercise the real client parser and routing without liburma or hardware.
 namespace kvaf {
+CpuUrmaDiscovery::~CpuUrmaDiscovery() { Shutdown(); }
+Status CpuUrmaDiscovery::Initialize(const std::string& device, bool has_index,
+                                    std::uint32_t index) {
+  candidates_ = {{"udmac0d1e2", 0U, {}}};
+  candidates_[0].eid[15] = 23U;
+  if ((!device.empty() && device != candidates_[0].device_name) ||
+      (has_index && index != candidates_[0].eid_index)) {
+    candidates_.clear();
+    return Status::NotFound("mock CPU endpoint not found");
+  }
+  return Status::OK();
+}
+void CpuUrmaDiscovery::Shutdown() { candidates_.clear(); }
+
+namespace peer {
+PeerLink::PeerLink(std::string address) : address_(std::move(address)) {}
+Status PeerLink::GetHbmEidCandidates(
+    std::uint32_t, std::vector<std::array<std::uint8_t, kEidBytes>>* candidates) const {
+  candidates->resize(2);
+  return Status::OK();
+}
+Status PeerLink::AllocateHbmRegion(std::uint64_t bytes, std::uint64_t,
+                                  std::uint32_t, std::uint32_t eid_index,
+                                  PeerRegion* region) {
+  if (active_session != 0U || live_link_transports != 0U) {
+    return Status::Internal("previous attempt was not cleaned before retry");
+  }
+  allocated_candidates.push_back(eid_index);
+  *region = {};
+  region->session_id = active_session = next_session++;
+  region->base = 0x1000U;
+  region->length = bytes;
+  region->device_memory = true;
+  return Status::OK();
+}
+Status PeerLink::ReleaseHbmRegion(std::uint64_t session) {
+  if (live_link_transports != 0U || session != active_session) {
+    return Status::Internal("HBM released before transport shutdown or with wrong session");
+  }
+  if (fail_release) return Status::Internal("mock HBM release failed");
+  active_session = 0U;
+  return Status::OK();
+}
+}  // namespace peer
+
 struct CpuUrmaTransport::Impl {
   std::vector<std::uint8_t> remote;
   std::uint32_t remote_sgl_size{1};
+  bool external{false};
+  std::uint32_t remote_eid_index{0};
   BatchTiming timing;
 };
 CpuUrmaTransport::CpuUrmaTransport() : impl_(std::make_unique<Impl>()) {}
-CpuUrmaTransport::~CpuUrmaTransport() = default;
+CpuUrmaTransport::~CpuUrmaTransport() { (void)Shutdown(); }
 Status CpuUrmaTransport::Initialize(const CpuUrmaTransportOptions& options) {
   impl_->remote.resize(options.region_bytes);
   impl_->remote_sgl_size = std::min(options.remote_sgl_size, 13U);
   initialized_prepare_threads = options.prepare_thread_count;
+  impl_->external = options.has_external_region;
+  impl_->remote_eid_index = options.remote_eid_index;
+  if (impl_->external) {
+    ++live_link_transports;
+    initialized_endpoints.push_back(options);
+  }
   return Status::OK();
+}
+Status CpuUrmaTransport::ValidateLink() {
+  return fail_first_probe && impl_->remote_eid_index == 0U
+      ? Status::Internal("mock status=4") : Status::OK();
 }
 Status CpuUrmaTransport::RegisterDirectHostMemory(void*, std::size_t) {
   return Status::OK();
@@ -75,8 +139,11 @@ Status CpuUrmaTransport::ReadSglBatch(std::uint64_t offset, const HostSge* buffe
   impl_->timing.wr_count = count;
   return Status::OK();
 }
-Status CpuUrmaTransport::Shutdown() { return Status::OK(); }
-std::uint64_t CpuUrmaTransport::region_bytes() const { return 0; }
+Status CpuUrmaTransport::Shutdown() {
+  if (impl_->external) { --live_link_transports; impl_->external = false; }
+  return Status::OK();
+}
+std::uint64_t CpuUrmaTransport::region_bytes() const { return impl_->remote.size(); }
 CpuUrmaTransport::BatchTiming CpuUrmaTransport::last_batch_timing() const { return impl_->timing; }
 }  // namespace kvaf
 
@@ -93,6 +160,73 @@ void Expect(bool condition, const char* message) {
     std::fprintf(stderr, "%s\n", message);
     std::exit(1);
   }
+}
+
+void EndpointSelection() {
+  Options options;
+  options.peer = "127.0.0.1:28111";
+  options.device_id = 6;
+  options.remote_sgl_size = 12;
+  options.wqes_per_doorbell = 32;
+  options.prepare_thread_count = 8;
+  fail_first_probe = true;
+  {
+    HbmConnection connection(options.peer);
+    Expect(connection.Initialize(options, 4096).ok(),
+           "client must retry NPU candidate 1 after candidate 0 fails its data probe");
+    Expect(allocated_candidates == std::vector<std::uint32_t>{0, 1} &&
+               initialized_endpoints.size() == 2 && live_link_transports == 1,
+           "failed probe must release HBM and destroy its transport before retry");
+    const auto& selected = initialized_endpoints.back();
+    Expect(selected.ub_device == "udmac0d1e2" && selected.eid_index == 0 &&
+               selected.has_eid_index && selected.has_preferred_eid &&
+               selected.preferred_eid[15] == 23U && selected.remote_device_id == 6 &&
+               selected.remote_eid_index == 1 && selected.remote_hbm &&
+               selected.jetty_count == 4 && selected.prepare_thread_count == 8 &&
+               selected.remote_sgl_size == 12 && selected.wqes_per_doorbell == 32 &&
+               selected.external_region.session_id == active_session,
+           "selected endpoints and benchmark options must reach the new transport");
+  }
+  Expect(active_session == 0 && live_link_transports == 0,
+         "successful connection must release transport and HBM on destruction");
+
+  allocated_candidates.clear();
+  initialized_endpoints.clear();
+  Options pinned;
+  Expect(ParseArgs({"client", "127.0.0.1:28111", "--device-id", "6",
+                    "--ub-device", "udmac0d1e2", "--eid-index", "0",
+                    "--remote-eid-index", "1"}, &pinned),
+         "independent local and remote EID options must parse");
+  {
+    HbmConnection connection(pinned.peer);
+    Expect(connection.Initialize(pinned, 4096).ok() &&
+               allocated_candidates == std::vector<std::uint32_t>{1} &&
+               initialized_endpoints.back().eid_index == 0 &&
+               initialized_endpoints.back().remote_eid_index == 1,
+           "pinning remote candidate 1 must preserve CPU EID 0 and skip remote 0");
+  }
+
+  allocated_candidates.clear();
+  pinned.remote_eid_index = 0;
+  {
+    HbmConnection connection(pinned.peer);
+    Expect(!connection.Initialize(pinned, 4096).ok() &&
+               allocated_candidates == std::vector<std::uint32_t>{0} && active_session == 0,
+           "explicit failed remote candidate must not silently fall back");
+  }
+
+  allocated_candidates.clear();
+  fail_release = true;
+  {
+    HbmConnection connection(options.peer);
+    const auto status = connection.Initialize(options, 4096);
+    Expect(!status.ok() && status.message() == "mock HBM release failed" &&
+               allocated_candidates == std::vector<std::uint32_t>{0},
+           "cleanup failure must stop candidate retries");
+    fail_release = false;
+  }
+  fail_first_probe = false;
+  Expect(active_session == 0 && live_link_transports == 0, "connection cleanup leaked resources");
 }
 }  // namespace
 
@@ -121,7 +255,8 @@ int main() {
   Expect(ParseArgs({"client", "127.0.0.1", "28111"}, &defaults) &&
              defaults.peer == "127.0.0.1:28111" && defaults.jetty_count == 4 &&
              defaults.host_space_bytes == 0 && defaults.wqes_per_doorbell == 0 &&
-             defaults.remote_sgl_size == 1 && defaults.prepare_thread_count == 4,
+             defaults.remote_sgl_size == 1 && defaults.prepare_thread_count == 4 &&
+             defaults.remote_eid_index == UINT32_MAX,
          "peer syntax and defaults must be preserved");
   for (const char* count : {"0", "17"}) {
     Options invalid;
@@ -138,6 +273,13 @@ int main() {
     Expect(!ParseArgs({"client", "127.0.0.1:28111", "--prepare-threads", count}, &invalid),
            "invalid prepare thread counts must be rejected");
   }
+
+  for (const char* index : {"-1", "4294967295", "4294967296", "invalid"}) {
+    Options invalid;
+    Expect(!ParseArgs({"client", "127.0.0.1:28111", "--remote-eid-index", index}, &invalid),
+           "invalid remote EID candidate indices must be rejected");
+  }
+  EndpointSelection();
 
   kvaf::CpuUrmaTransport transport;
   kvaf::CpuUrmaTransportOptions config;
