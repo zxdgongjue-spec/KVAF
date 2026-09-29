@@ -83,7 +83,9 @@ Runtime 提交与 stream 同步，不包含 AccessTable 准备、HBM 上传/回�
 通过 RPC 启用直连 worker。每轮源地址清单和 staging 地址先上传到输出 HBM 的附加空间，
 AICPU 用 opcode 3 WRITE 将其写入 DDR mailbox，等 WRITE CQE 后再发 opcode 5
 WRITE_WITH_NOTIFY（两个 64 字节 SQ WQEBB），将 mailbox 地址写入控制区并通知 CPU。
-CPU worker 校验清单，按清单将 DRAM 数据复制到连续 staging，并写回完成序号。
+CPU worker 检测通知后先写入临时 ACK 标记 `~sequence`，再校验清单、按清单将
+DRAM 数据复制到连续 staging，最后写回完成序号。AICPU 在同一条 ACK READ 轮询中
+记录首次看到临时标记的时间，用于区分通知响应延迟与后续 gather/ACK 可见性延迟。
 AICPU 用 READ 轮询完成序号，匹配后将连续 staging 读入连续
 HBM 的离散目标 span。每条 READ WQE 最多带 6 个本地 SGE，占 1 到 3 个 64 字节
 WQEBB；队列深度允许时每 64 条 WQE 在末条请求 CQE。单条 WQE 的总数据量不超过 256 MiB，
@@ -97,9 +99,11 @@ CPU worker 仅对通知、ack 和 descriptor mailbox 的缓存行做 `dc civac`/
 执行内存屏障。数据区正确性依赖目标平台的 CPU DDR 与 URMA DMA 一致性，
 目前不能从注册参数推断这一点；更新后须在真实设备上以每轮变化的数据验证。
 这里没有使用 OpenMP：
-CPU worker 使用常驻 `std::thread`，默认 `--gather-mode active`：辅助线程在
-各轮之间保持自旋，不需要每轮重建 OpenMP parallel region；这会持续占用
-所选逻辑 CPU。也可设为 `--gather-mode passive`，让辅助线程在两轮之间休眠。Linux 上
+CPU worker 使用常驻 `std::thread`。默认 `--gather-mode adaptive`：主线程在
+完成一轮后主动轮询约 100 us，随后定时休眠；辅助线程也先自旋约 100 us，之后
+等待下一次准备通知。这样避免两轮之间一直占用绑核。`--gather-mode active` 保留
+无限自旋，`--gather-mode passive` 让主线程定时休眠、辅助线程等待通知，可用于
+设备上的 A/B 对比。Linux 上
 默认将 coordinator 和 helper 绑到进程允许的不同逻辑 CPU；可用
 `--gather-affinity off` 关闭以作对比。`GATHER_THREAD` 日志记录 TID、CPU 和绑核结果。
 默认按 CPU 核数自动选择上限 32，并按每线程至少 256 KiB 的
@@ -116,7 +120,7 @@ batch 比较 `--gather-threads 1/4/8/16` 后再选线程数。可用 `taskset`
 # CPU 终端
 ./build.sh cpu
 build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999 \
-  --gather-threads 8 --gather-mode active --gather-affinity on
+  --gather-threads 8 --gather-mode adaptive --gather-affinity on
 
 # NPU 终端
 ./build.sh aicpu-urma --install-kernel
@@ -155,7 +159,12 @@ CPU gather 握手和 CQ 等待，不含输入上传、输出回读及逐字节�
 完成等待，不等于纯传输时间。profiling 增加时钟采样，并将 ack READ 从 8 字节扩展到
 56 字节，因此小 batch 的总耗时不应直接与旧版无 profiling 结果比较。
 需要原始纳秒计数器时使用 `--profile-detail 1`；默认只显示分层时间线。更新后需
-同时重新部署 CPU service、NPU Runtime 和 AICPU kernel。直连路径及 `dc cvac`
+同时重新部署 CPU service、NPU Runtime 和 AICPU kernel。直连模式 profiling 中的
+`idle_since_previous_ack` 从上一轮 ack 到本轮收到通知，包含两轮之间的空闲，
+不是通知传递耗时。`CPU start observed after ACK polling began` 是 AICPU 首次读到
+临时 ACK 标记的时间；若 CPU 在第一次轮询前就完成，标记可能不会被观察到。
+`direct_setup` 包含每轮 mailbox 布局检查，只有首次调用才会
+启用 CPU worker。直连路径及 `dc cvac`
 批量清理 SQ 的性能和缓存一致性尚需目标机器验证，不能从 Host 模拟推断实际带宽。
 
 升序或降序且不重叠的 HBM 输出 span 使用线性布局校验；其他顺序仍通过排序

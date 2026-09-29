@@ -692,6 +692,7 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
     request.timing->notify_post_ns = device_status.notify_post_ns;
     request.timing->notify_cq_ns = device_status.notify_cq_ns;
     request.timing->ack_poll_ns = device_status.ack_poll_ns;
+    request.timing->ack_started_ns = device_status.ack_started_ns;
     request.timing->ack_post_ns = device_status.ack_post_ns;
     request.timing->ack_cq_ns = device_status.ack_cq_ns;
     request.timing->ack_cache_ns = device_status.ack_cache_ns;

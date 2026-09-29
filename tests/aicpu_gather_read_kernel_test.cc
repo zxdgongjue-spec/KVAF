@@ -226,7 +226,7 @@ void TestUrmaDescriptorGather() {
   std::thread hardware([&] {
     std::uint32_t producer = 0U;
     std::uint32_t completion = 0U;
-    while (producer < 6U && !stopped.load(std::memory_order_acquire)) {
+    while (producer < 7U && !stopped.load(std::memory_order_acquire)) {
       if (__atomic_load_n(&sq_doorbell, __ATOMIC_ACQUIRE) == producer) {
         std::this_thread::yield();
         continue;
@@ -265,7 +265,8 @@ void TestUrmaDescriptorGather() {
         assert(kvaf::peer::ValidateDirectGather(
             base, remote.size(), args.remote_descriptor, received, gathered));
         kvaf::peer::GatherIntoStaging(remote.data(), base, received.staging_address, gathered);
-        std::memcpy(reinterpret_cast<void*>(args.remote_ack), &sequence, 8U);
+        const auto started = kvaf::peer::GatherStartedAck(sequence);
+        std::memcpy(reinterpret_cast<void*>(args.remote_ack), &started, 8U);
       } else {
         assert(opcode == kvaf::aicpu_urma::kReadOpcode);
         auto source = address(words[10], words[11]);
@@ -275,6 +276,8 @@ void TestUrmaDescriptorGather() {
                       reinterpret_cast<const void*>(source), words[offset]);
           source += words[offset];
         }
+        if (address(words[10], words[11]) == args.remote_ack)
+          std::memcpy(reinterpret_cast<void*>(args.remote_ack), &args.sequence, 8U);
       }
       producer += blocks;
       if ((words[0] & (1U << 19U)) != 0U)
@@ -286,14 +289,15 @@ void TestUrmaDescriptorGather() {
   hardware.join();
   assert(result == 0U && status.result == 0U && status.phase == 4U);
   assert(status.source_write_ns > 0U && status.source_write_cq_ns > 0U);
-  assert(status.sq_producer_index == 6U && status.cq_consumer_index == 4U);
+  assert(status.ack_started_ns > 0U && status.ack_polls == 2U);
+  assert(status.sq_producer_index == 7U && status.cq_consumer_index == 5U);
   for (std::size_t index = 0U; index < 16U; ++index) {
     assert(output[32U + index] == remote[32U + index]);
     assert(output[index] == remote[index]);
   }
   args.remote_descriptor = base + 500U;
   assert(KvafAicpuUrmaGatherRead(&args) != 0U);
-  assert(status.result == 2U && sq_doorbell == 6U);
+  assert(status.result == 2U && sq_doorbell == 7U);
 }
 
 int main() {

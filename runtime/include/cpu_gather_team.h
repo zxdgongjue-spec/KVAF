@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -40,7 +41,7 @@ inline void GatherSpinPause() {
 #endif
 }
 
-enum class GatherWaitMode { kActive, kPassive };
+enum class GatherWaitMode { kActive, kAdaptive, kPassive };
 
 class CpuGatherTeam {
  public:
@@ -164,14 +165,26 @@ class CpuGatherTeam {
     bool was_active = false;
     for (;;) {
       bool active = false;
-      if (wait_mode_ == GatherWaitMode::kActive && was_active) {
+      if (wait_mode_ != GatherWaitMode::kPassive && was_active) {
+        const auto spin_start = std::chrono::steady_clock::now();
+        std::uint32_t spin_count = 0U;
         std::uint64_t generation = generation_.load(std::memory_order_acquire);
         while (generation == observed_generation) {
           if (stopping_.load(std::memory_order_acquire)) return;
+          if (wait_mode_ == GatherWaitMode::kAdaptive &&
+              (++spin_count & 255U) == 0U &&
+              std::chrono::steady_clock::now() - spin_start >=
+                  std::chrono::microseconds(100)) break;
           GatherSpinPause();
           generation = generation_.load(std::memory_order_acquire);
         }
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (generation_.load(std::memory_order_acquire) == observed_generation)
+          ready_.wait(lock, [this, &observed_generation] {
+            return stopping_.load(std::memory_order_acquire) ||
+                   generation_.load(std::memory_order_acquire) != observed_generation;
+          });
+        if (stopping_.load(std::memory_order_acquire)) return;
         observed_generation = generation_.load(std::memory_order_acquire);
         active = worker < active_threads_;
       } else {

@@ -4,11 +4,13 @@
 
 #include <array>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 void Require(bool condition) {
@@ -86,6 +88,20 @@ void TestParallelGather() {
                                 (block_count - 1U - block) * block_bytes,
                             block_bytes) == 0);
     }
+  }
+
+  kvaf::peer::CpuGatherTeam adaptive_team(memory.data(), base, 4U, 64U * 1024U,
+                                         kvaf::peer::GatherWaitMode::kAdaptive);
+  for (std::size_t round = 0U; round < 4U; ++round) {
+    if (round != 0U) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    memory[source_offset + round] = static_cast<std::uint8_t>(round + 1U);
+    Require(adaptive_team.Prepare(staging, spans, total_bytes) == 4U);
+    adaptive_team.Copy();
+    for (std::size_t block = 0U; block < block_count; ++block)
+      Require(std::memcmp(memory.data() + staging_offset + block * block_bytes,
+                          memory.data() + source_offset +
+                              (block_count - 1U - block) * block_bytes,
+                          block_bytes) == 0);
   }
 }
 
@@ -170,6 +186,8 @@ int main() {
   const std::vector<kvaf::peer::GatherSpan> bad{{base + 200U, 8U, 0U}};
   assert(!kvaf::peer::ValidateGather(base, memory.size(), base + 128U, bad, &total));
   assert(kvaf::peer::GatherControlOffset(256U) == 192U);
+  assert(kvaf::peer::GatherStartedAck(1U) != 1U);
+  assert(kvaf::peer::GatherStartedAck(1U) != (1U | kvaf::peer::kGatherErrorBit));
   assert(sizeof(kvaf::peer::GatherSpan) == sizeof(kvaf::peer::GatherSpanWire));
   TestParallelGather();
   TestIrregularGather();

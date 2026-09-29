@@ -11,10 +11,10 @@ namespace {
 
 void PrintUsage(const char* program) {
   std::fprintf(stderr,
-               "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] [--gather-threads N] [--gather-mode active|passive] [--gather-affinity on|off]\n"
+               "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] [--gather-threads N] [--gather-mode adaptive|active|passive] [--gather-affinity on|off]\n"
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
                "candidates are discovered automatically. Gather threads default to auto (up to 32), "
-               "mode to active, affinity to on. "
+               "mode to adaptive, affinity to on. "
                "The service requires only liburma and /dev/uburma.\n",
                program);
 }
@@ -81,11 +81,13 @@ int main(int argc, char** argv) {
       cpu_options.gather_affinity = value == "on";
     } else if (argument == "--gather-mode") {
       const std::string value(argv[++index]);
-      if (value != "active" && value != "passive") {
-        std::fprintf(stderr, "invalid --gather-mode (expected active|passive)\n");
+      if (value != "adaptive" && value != "active" && value != "passive") {
+        std::fprintf(stderr, "invalid --gather-mode (expected adaptive|active|passive)\n");
         return 2;
       }
-      cpu_options.gather_active = value == "active";
+      cpu_options.gather_mode = value == "adaptive" ? kvaf::CpuGatherMode::kAdaptive
+          : value == "active" ? kvaf::CpuGatherMode::kActive
+                              : kvaf::CpuGatherMode::kPassive;
     } else {
       PrintUsage(argv[0]);
       return 2;

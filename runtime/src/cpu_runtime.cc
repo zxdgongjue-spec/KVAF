@@ -420,20 +420,36 @@ void CacheGatherControlLine(const void* address, bool invalidate) {
 #endif
 }
 
+const char* GatherModeName(CpuGatherMode mode) {
+  switch (mode) {
+    case CpuGatherMode::kAdaptive: return "adaptive";
+    case CpuGatherMode::kActive: return "active";
+    case CpuGatherMode::kPassive: return "passive";
+  }
+  return "unknown";
+}
+
+peer::GatherWaitMode TeamWaitMode(CpuGatherMode mode) {
+  switch (mode) {
+    case CpuGatherMode::kAdaptive: return peer::GatherWaitMode::kAdaptive;
+    case CpuGatherMode::kActive: return peer::GatherWaitMode::kActive;
+    case CpuGatherMode::kPassive: return peer::GatherWaitMode::kPassive;
+  }
+  return peer::GatherWaitMode::kPassive;
+}
+
 class CpuGatherWorker {
  public:
   CpuGatherWorker(void* memory, uint64_t base, uint64_t bytes,
                   std::size_t gather_threads,
                   std::size_t min_bytes_per_thread, bool gather_affinity,
-                  bool gather_active, bool direct = false)
+                  CpuGatherMode gather_mode, bool direct = false)
       : memory_(static_cast<uint8_t*>(memory)), base_(base), bytes_(bytes),
         control_(reinterpret_cast<peer::GatherControl*>(
             static_cast<uint8_t*>(memory) + peer::GatherControlOffset(bytes))),
         team_(memory, base, gather_threads, min_bytes_per_thread,
-              gather_active ? peer::GatherWaitMode::kActive
-                            : peer::GatherWaitMode::kPassive,
-              gather_affinity),
-        max_threads_(team_.max_threads()), gather_active_(gather_active), direct_(direct) {
+              TeamWaitMode(gather_mode), gather_affinity),
+        max_threads_(team_.max_threads()), gather_mode_(gather_mode), direct_(direct) {
     std::memset(control_, 0, sizeof(*control_));
     CacheGatherControlLine(control_, false);
     peer::GatherBarrier();
@@ -458,7 +474,7 @@ class CpuGatherWorker {
     if (gather_threads != reported_threads_) {
       Log("[KVAF_CPU] GATHER_THREADS active=%zu max=%zu bytes=%u mode=%s\n",
           gather_threads, max_threads_, total_bytes,
-          gather_active_ ? "active" : "passive");
+          GatherModeName(gather_mode_));
       reported_threads_ = gather_threads;
     }
     scheduled_at_ns_ = NowNs();
@@ -519,18 +535,32 @@ class CpuGatherWorker {
     team_.BindWorker(0U);
     std::uint64_t last_sequence = 0U;
     std::uint64_t wait_start_ns = NowNs();
+    std::uint32_t idle_polls = 0U;
+    bool idle = false;
     while (!stop_.load(std::memory_order_acquire)) {
       CacheGatherControlLine(control_, true);
       peer::GatherBarrier();
       const auto sequence = __atomic_load_n(&control_->notify, __ATOMIC_ACQUIRE);
       if (sequence == 0U || sequence == last_sequence ||
           (sequence & peer::kGatherErrorBit) != 0U) {
-        peer::GatherSpinPause();
+        if (gather_mode_ == CpuGatherMode::kAdaptive) {
+          if (!idle && (++idle_polls & 63U) == 0U)
+            idle = NowNs() - wait_start_ns >= 100000U;
+          if (idle) std::this_thread::sleep_for(std::chrono::microseconds(20));
+          else peer::GatherSpinPause();
+        } else if (gather_mode_ == CpuGatherMode::kPassive) {
+          std::this_thread::sleep_for(std::chrono::microseconds(20));
+        } else {
+          peer::GatherSpinPause();
+        }
         continue;
       }
       last_sequence = sequence;
       peer::GatherCpuProfile profile{};
       profile.notify_spin_ns = NowNs() - wait_start_ns;
+      __atomic_store_n(&control_->ack, peer::GatherStartedAck(sequence), __ATOMIC_RELEASE);
+      CacheGatherControlLine(control_, false);
+      peer::GatherBarrier();
       const auto descriptor_start_ns = NowNs();
       const auto address = __atomic_load_n(&control_->command, __ATOMIC_ACQUIRE);
       bool valid = address % 64U == 0U &&
@@ -564,7 +594,7 @@ class CpuGatherWorker {
               if (threads != reported_threads_) {
                 Log("[KVAF_CPU] GATHER_THREADS active=%zu max=%zu bytes=%u mode=%s transport=urma\n",
                     threads, max_threads_, header.total_bytes,
-                    gather_active_ ? "active" : "passive");
+                    GatherModeName(gather_mode_));
                 reported_threads_ = threads;
               }
             }
@@ -589,6 +619,8 @@ class CpuGatherWorker {
       CacheGatherControlLine(control_, false);
       peer::GatherBarrier();
       wait_start_ns = NowNs();
+      idle_polls = 0U;
+      idle = false;
     }
   }
 
@@ -602,7 +634,7 @@ class CpuGatherWorker {
   std::vector<GatherSpan> spans_;
   peer::CpuGatherTeam team_;
   std::size_t max_threads_{0U};
-  bool gather_active_{true};
+  CpuGatherMode gather_mode_{CpuGatherMode::kAdaptive};
   bool direct_{false};
   std::size_t reported_threads_{0U};
   std::uint64_t scheduled_at_ns_{0U};
@@ -629,10 +661,10 @@ class CpuService {
  public:
   CpuService(UrmaResourcePool* resource_pool, std::size_t gather_threads,
              std::size_t min_bytes_per_thread, bool gather_affinity,
-             bool gather_active)
+             CpuGatherMode gather_mode)
       : resource_pool_(resource_pool), gather_threads_(gather_threads),
         min_bytes_per_thread_(min_bytes_per_thread),
-        gather_affinity_(gather_affinity), gather_active_(gather_active) {}
+        gather_affinity_(gather_affinity), gather_mode_(gather_mode) {}
   ~CpuService() { ReleaseAll(); }
 
   uint32_t CandidateCount() const {
@@ -807,7 +839,7 @@ class CpuService {
       if (region.gather == nullptr)
         region.gather = std::make_unique<CpuGatherWorker>(
             region.memory, region.base, region.bytes, gather_threads_,
-            min_bytes_per_thread_, gather_affinity_, gather_active_);
+            min_bytes_per_thread_, gather_affinity_, gather_mode_);
       if (!region.gather->Configure(staging, spans, total_bytes, response))
         return Result::kResourceError;
     } catch (const std::exception& error) {
@@ -826,7 +858,7 @@ class CpuService {
     try {
       region.gather = std::make_unique<CpuGatherWorker>(
           region.memory, region.base, region.bytes, gather_threads_,
-          min_bytes_per_thread_, gather_affinity_, gather_active_, true);
+          min_bytes_per_thread_, gather_affinity_, gather_mode_, true);
     } catch (const std::exception& error) {
       Log("[KVAF_CPU] GATHER_DIRECT_ENABLE_FAILED reason=%s\n", error.what());
       return Result::kResourceError;
@@ -948,7 +980,7 @@ class CpuService {
   std::size_t gather_threads_{1U};
   std::size_t min_bytes_per_thread_{256U * 1024U};
   bool gather_affinity_{true};
-  bool gather_active_{true};
+  CpuGatherMode gather_mode_{CpuGatherMode::kAdaptive};
   uint64_t next_region_id_ = 1U;
   uint32_t next_token_ = 1U;
   uint32_t next_psn_ = 1U;
@@ -1114,7 +1146,7 @@ Status CpuRuntime::Initialize(const CpuRuntimeOptions& options) {
       ? 256U * 1024U : 64U * 1024U;
   impl->service = std::make_unique<CpuService>(
       &impl->resources, gather_threads, min_bytes_per_thread,
-      options.gather_affinity, options.gather_active);
+      options.gather_affinity, options.gather_mode);
   impl_ = std::move(impl);
   return Status::OK();
 }

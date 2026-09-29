@@ -17,6 +17,10 @@ static_assert(sizeof(GatherSpan) == 16U, "gather span ABI changed");
 constexpr std::uint64_t kGatherDescriptorMagic = 0x4b56414647445231ULL;
 constexpr std::uint64_t kGatherErrorBit = std::uint64_t{1U} << 63U;
 
+inline std::uint64_t GatherStartedAck(std::uint64_t sequence) {
+  return ~sequence;
+}
+
 struct GatherDescriptorHeader {
   std::uint64_t magic;
   std::uint64_t sequence;

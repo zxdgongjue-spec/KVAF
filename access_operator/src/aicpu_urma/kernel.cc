@@ -605,6 +605,9 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
       Flush(ack, check.length);
       status.ack_cache_ns += NowNs() - postflush_start_ns;
       status.ack_seen = *ack;
+      if (direct && status.ack_started_ns == 0U &&
+          status.ack_seen == kvaf::peer::GatherStartedAck(args->sequence))
+        status.ack_started_ns = NowNs() - ack_start_ns;
       if (status.ack_seen == args->sequence ||
           status.ack_seen == (args->sequence | kvaf::peer::kGatherErrorBit)) break;
     }
