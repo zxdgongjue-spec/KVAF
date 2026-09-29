@@ -409,6 +409,16 @@ struct Channel {
   urma_target_jetty_t* remote_jetty = nullptr;
 };
 
+void CacheGatherControlLine(const void* address, bool invalidate) {
+#if defined(__aarch64__)
+  if (invalidate) asm volatile("dc civac, %0" :: "r"(address) : "memory");
+  else asm volatile("dc cvac, %0" :: "r"(address) : "memory");
+#else
+  (void)address;
+  (void)invalidate;
+#endif
+}
+
 class CpuGatherWorker {
  public:
   CpuGatherWorker(void* memory, uint64_t base, uint64_t bytes,
@@ -424,7 +434,7 @@ class CpuGatherWorker {
               gather_affinity),
         max_threads_(team_.max_threads()), gather_active_(gather_active) {
     std::memset(control_, 0, sizeof(*control_));
-    peer::GatherCacheLine(control_, false);
+    CacheGatherControlLine(control_, false);
     peer::GatherBarrier();
     worker_ = std::thread(&CpuGatherWorker::Run, this);
   }
@@ -482,7 +492,7 @@ class CpuGatherWorker {
       const auto poll_start_ns = NowNs();
       profile.dispatch_ns = poll_start_ns - scheduled_at_ns;
       while (!stop_.load(std::memory_order_acquire)) {
-        peer::GatherCacheLine(control_, true);
+        CacheGatherControlLine(control_, true);
         peer::GatherBarrier();
         if (__atomic_load_n(notify, __ATOMIC_ACQUIRE) == sequence &&
             __atomic_load_n(command, __ATOMIC_ACQUIRE) == sequence) break;
@@ -491,17 +501,11 @@ class CpuGatherWorker {
       if (stop_.load(std::memory_order_acquire)) return;
       const auto notified_ns = NowNs();
       profile.notify_spin_ns = notified_ns - poll_start_ns;
-      team_.InvalidateSources();
-      const auto source_ready_ns = NowNs();
-      profile.source_cache_ns = source_ready_ns - notified_ns;
       team_.Copy();
-      const auto copied_ns = NowNs();
-      profile.copy_ns = copied_ns - source_ready_ns;
-      team_.FlushStaging();
-      profile.staging_flush_ns = NowNs() - copied_ns;
+      profile.copy_ns = NowNs() - notified_ns;
       control_->profile = profile;
       __atomic_store_n(ack, sequence, __ATOMIC_RELEASE);
-      peer::GatherCacheLine(control_, false);
+      CacheGatherControlLine(control_, false);
       peer::GatherBarrier();
       lock.lock();
       completed_ = sequence;

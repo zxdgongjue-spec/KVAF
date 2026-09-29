@@ -22,16 +22,6 @@
 
 namespace kvaf::peer {
 
-inline void GatherCacheLine(const void* address, bool invalidate) {
-#if defined(__aarch64__)
-  if (invalidate) asm volatile("dc civac, %0" :: "r"(address) : "memory");
-  else asm volatile("dc cvac, %0" :: "r"(address) : "memory");
-#else
-  (void)address;
-  (void)invalidate;
-#endif
-}
-
 inline void GatherBarrier() {
 #if defined(__aarch64__)
   asm volatile("dsb sy" ::: "memory");
@@ -121,15 +111,16 @@ class CpuGatherTeam {
     return threads;
   }
 
-  void InvalidateSources() { RunPhase(kInvalidatePhase); }
-  void Copy() { RunPhase(kCopyPhase); }
-  void FlushStaging() { RunPhase(kFlushPhase); }
+  void Copy() {
+    completed_.store(0U, std::memory_order_relaxed);
+    phase_.store(1U, std::memory_order_release);
+    ProcessSource(0U);
+    GatherBarrier();
+    while (completed_.load(std::memory_order_acquire) != active_threads_ - 1U)
+      GatherSpinPause();
+  }
 
  private:
-  static constexpr std::uint32_t kInvalidatePhase = 1U;
-  static constexpr std::uint32_t kCopyPhase = 2U;
-  static constexpr std::uint32_t kFlushPhase = 3U;
-
   static std::vector<int> AllowedCpus() {
     std::vector<int> cpus;
 #if defined(__linux__)
@@ -150,7 +141,7 @@ class CpuGatherTeam {
            reinterpret_cast<std::uintptr_t>(staging_);
   }
 
-  void ProcessSource(std::size_t worker, bool invalidate) const {
+  void ProcessSource(std::size_t worker) const {
     std::uint64_t offset = Boundary(worker);
     const std::uint64_t end = Boundary(worker + 1U);
     auto found = std::upper_bound(offsets_.begin(), offsets_.end(), offset);
@@ -161,40 +152,10 @@ class CpuGatherTeam {
       const std::uint64_t bytes = std::min<std::uint64_t>(
           end - offset, span.length - in_span);
       auto* source = memory_ + (span.address - base_) + in_span;
-      if (invalidate) {
-        const auto first = reinterpret_cast<std::uintptr_t>(source) & ~std::uintptr_t{63U};
-        const auto last = reinterpret_cast<std::uintptr_t>(source) + bytes;
-        for (auto line = first; line < last; line += 64U)
-          GatherCacheLine(reinterpret_cast<const void*>(line), true);
-      } else {
-        std::memcpy(staging_ + offset, source, bytes);
-      }
+      std::memcpy(staging_ + offset, source, bytes);
       offset += bytes;
       ++index;
     }
-  }
-
-  void FlushShard(std::size_t worker) const {
-    const auto begin = reinterpret_cast<std::uintptr_t>(staging_) + Boundary(worker);
-    const auto end = reinterpret_cast<std::uintptr_t>(staging_) + Boundary(worker + 1U);
-    for (auto line = begin & ~std::uintptr_t{63U}; line < end; line += 64U)
-      GatherCacheLine(reinterpret_cast<const void*>(line), false);
-  }
-
-  void ProcessShard(std::size_t worker, std::uint32_t phase) const {
-    if (phase == kInvalidatePhase) ProcessSource(worker, true);
-    else if (phase == kCopyPhase) ProcessSource(worker, false);
-    else FlushShard(worker);
-    if (phase != kCopyPhase) GatherBarrier();
-  }
-
-  void RunPhase(std::uint32_t phase) {
-    // A phase completes on every core before the next one can touch staging.
-    completed_.store(0U, std::memory_order_relaxed);
-    phase_.store(phase, std::memory_order_release);
-    ProcessShard(0U, phase);
-    while (completed_.load(std::memory_order_acquire) != active_threads_ - 1U)
-      GatherSpinPause();
   }
 
   void RunHelper(std::size_t worker) {
@@ -225,15 +186,13 @@ class CpuGatherTeam {
       }
       was_active = active;
       if (!active) continue;
-      for (std::uint32_t expected = kInvalidatePhase;
-           expected <= kFlushPhase; ++expected) {
-        while (phase_.load(std::memory_order_acquire) < expected) {
-          if (stopping_.load(std::memory_order_acquire)) return;
-          GatherSpinPause();
-        }
-        ProcessShard(worker, expected);
-        completed_.fetch_add(1U, std::memory_order_release);
+      while (phase_.load(std::memory_order_acquire) == 0U) {
+        if (stopping_.load(std::memory_order_acquire)) return;
+        GatherSpinPause();
       }
+      ProcessSource(worker);
+      GatherBarrier();
+      completed_.fetch_add(1U, std::memory_order_release);
     }
   }
 

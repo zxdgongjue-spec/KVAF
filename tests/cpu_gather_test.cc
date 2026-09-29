@@ -40,9 +40,7 @@ void TestParallelGather() {
     memory[staging_offset - 1U] = 0xa5U;
     memory[staging_offset + payload_bytes] = 0x5aU;
     Require(team.Prepare(staging, spans, total_bytes) > 1U);
-    team.InvalidateSources();
     team.Copy();
-    team.FlushStaging();
     for (std::size_t block = 0U; block < block_count; ++block) {
       Require(std::memcmp(memory.data() + staging_offset + block * block_bytes,
                           memory.data() + source_offset +
@@ -55,17 +53,13 @@ void TestParallelGather() {
 
   spans = {{base + source_offset, payload_bytes, 0U}};
   Require(team.Prepare(staging, spans, total_bytes) > 1U);
-  team.InvalidateSources();
   team.Copy();
-  team.FlushStaging();
   Require(std::memcmp(memory.data() + staging_offset,
                       memory.data() + source_offset, payload_bytes) == 0);
 
   spans = {{base + source_offset, 64U, 0U}};
   Require(team.Prepare(staging, spans, 64U) == 1U);
-  team.InvalidateSources();
   team.Copy();
-  team.FlushStaging();
   Require(std::memcmp(memory.data() + staging_offset,
                       memory.data() + source_offset, 64U) == 0);
 
@@ -81,9 +75,7 @@ void TestParallelGather() {
     const auto& selected = small ? small_spans : spans;
     Require(tuned_team.Prepare(staging, selected,
                                small ? 64U : total_bytes) == (small ? 1U : 16U));
-    tuned_team.InvalidateSources();
     tuned_team.Copy();
-    tuned_team.FlushStaging();
     if (small) {
       Require(std::memcmp(memory.data() + staging_offset,
                           memory.data() + source_offset, 64U) == 0);
@@ -123,9 +115,7 @@ void TestIrregularGather() {
   Require(total_bytes == payload_bytes);
   kvaf::peer::CpuGatherTeam team(memory.data(), base, 8U);
   Require(team.Prepare(staging, spans, total_bytes) > 1U);
-  team.InvalidateSources();
   team.Copy();
-  team.FlushStaging();
   std::size_t destination_offset = staging_offset;
   for (const auto& span : spans) {
     Require(std::memcmp(memory.data() + destination_offset,

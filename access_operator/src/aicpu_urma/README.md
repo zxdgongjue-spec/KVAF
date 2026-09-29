@@ -81,18 +81,19 @@ Runtime 提交与 stream 同步，不包含 AccessTable 准备、HBM 上传/回�
 此路径使用同一个 `NpuRuntime::LinkTo` / Direct-HCCP Jetty，不改变 AIV 算子。
 CPU 服务端先收到离散源地址清单及 staging 地址；AICPU 发一条 opcode 5 的
 WRITE_WITH_NOTIFY（96 字节，占两个 64 字节 SQ WQEBB），将序号写入 DDR 控制区并
-通知 CPU worker。worker 按清单将 DRAM 数据复制到连续 staging，刷出 CPU 缓存并
-写回完成序号。AICPU 用 READ 轮询完成序号，匹配后将连续 staging 读入连续
+通知 CPU worker。worker 按清单将 DRAM 数据复制到连续 staging，并写回完成序号。
+AICPU 用 READ 轮询完成序号，匹配后将连续 staging 读入连续
 HBM 的离散目标 span。每条 READ WQE 最多带 6 个本地 SGE，占 1 到 3 个 64 字节
 WQEBB；每 32 条 WQE 在末条请求 CQE。单条 WQE 的总数据量不超过 256 MiB，
 更长的 span 会拆分。所有目标 span 当前必须落在同一块已注册的 HBM 分配内；
 不支持跨独立 HBM 分配的 SGL。
 
-CPU worker 在用户态用 `dc civac` 重新读取 DMA 写入的控制字和源块；`dc ivac`
-在 EL0 不可用，会令服务端进程收到 `SIGILL`。这些行在 DMA 写入前已 clean，
-worker 对控制区写入 ack 后也立即 clean，避免 clean-and-invalidate 回写旧数据。
-源缓存处理、staging 拷贝和 staging flush 现在各自并行执行；每一阶段完成后
-所有线程同步，再进入下一阶段，保证 DMA 可见性。这里没有使用 OpenMP：
+CPU worker 仅对通知和 ack 的控制区缓存行做 `dc civac`/`dc cvac`；`dc ivac`
+在 EL0 不可用，会令服务端进程收到 `SIGILL`。源 DDR 与 staging 数据区不再
+逐行做缓存维护，只有一次并行拷贝阶段；所有工作线程在发布 ack 前完成拷贝并
+执行内存屏障。数据区正确性依赖目标平台的 CPU DDR 与 URMA DMA 一致性，
+目前不能从注册参数推断这一点；更新后须在真实设备上以每轮变化的数据验证。
+这里没有使用 OpenMP：
 CPU worker 使用常驻 `std::thread`，默认 `--gather-mode active`：辅助线程在
 各轮之间保持自旋，不需要每轮重建 OpenMP parallel region；这会持续占用
 所选逻辑 CPU。也可设为 `--gather-mode passive`，让辅助线程在两轮之间休眠。Linux 上
@@ -102,7 +103,7 @@ CPU worker 使用常驻 `std::thread`，默认 `--gather-mode active`：辅助�
 payload 限制实际并行度；服务端可用 `--gather-threads N` 指定上限（1 到 64，
 显式指定时阈值降为每线程 64 KiB，设为 1 可作为单线程基线）。
 `[KVAF_CPU] GATHER_THREADS` 日志显示实际线程数。
-CPU profiling 的三个阶段耗时均包含线程分发与同步，需在目标机器上用同一
+CPU profiling 的拷贝耗时包含线程分发与同步，需在目标机器上用同一
 batch 比较 `--gather-threads 1/4/8/16` 后再选线程数。可用 `taskset`
 限制服务进程的候选 CPU 集合，绑核只在该集合内选核。
 
@@ -138,15 +139,13 @@ span 之后需要额外的 64 字节对齐 scratch 空间；span 不得重叠。
 CPU gather 握手和 CQ 等待，不含输入上传、输出回读及逐字节校验。多 SGL READ 的
 真实设备兼容性和性能仍需目标机器验证。
 
-客户端在测量结束后汇总四行 `avg_ns` profiling：`HOST` 拆分布局校验、配置 RPC、
-描述符上传、HBM 注册、AICPU 启动、stream 同步、资源释放及状态回读；
-`AICPU_CONTROL` 拆分 WRITE_WITH_NOTIFY 的提交/CQ、ack 轮询的提交/CQ/缓存处理；
-`CPU` 拆分 worker 调度、等待通知、源缓存处理、staging 拷贝和缓存 flush；
-`AICPU_DATA` 拆分 scatter 缓存处理、规划、READ WQE 提交及 CQ 等待。四行是
-不同处理器的局部耗时：Host 的
-`stream_sync` 包含 AICPU/CPU 工作，AICPU 的 `ack_poll` 包含 CPU gather，不能把
-所有字段直接相加。profiling 增加时钟采样，并将 ack READ 从 8 字节扩展到
-56 字节，因此小 batch 的总耗时不应直接与旧版无 profiling 结果比较。更新后需
+客户端先打印端到端统计，再按执行顺序打印 `GATHER_READ_TIMELINE`：Host 准备、
+等待与收尾；等待期间的 AICPU 通知、CPU gather、AICPU READ 到 HBM。各值是测量轮次
+平均微秒，保留三位小数即纳秒精度。Host 等待包含 CPU/AICPU 工作，AICPU 等 CPU ack
+与 CPU gather 重叠，不能相加；AICPU READ 阶段包含目标缓存处理、WQE 规划与提交、
+完成等待，不等于纯传输时间。profiling 增加时钟采样，并将 ack READ 从 8 字节扩展到
+56 字节，因此小 batch 的总耗时不应直接与旧版无 profiling 结果比较。
+需要原始纳秒计数器时使用 `--profile-detail 1`；默认只显示分层时间线。更新后需
 同时重新部署 CPU service 和 AICPU kernel。
 
 升序或降序且不重叠的 HBM 输出 span 使用线性布局校验；其他顺序仍通过排序

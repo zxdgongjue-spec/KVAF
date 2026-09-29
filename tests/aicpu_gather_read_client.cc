@@ -3,6 +3,7 @@
 #include "aicpu_urma_client_metrics.h"
 #include "aicpu_urma_client_options.h"
 #include "aicpu_gather_read_layout.h"
+#include "aicpu_gather_read_report.h"
 
 #include "acl/acl.h"
 
@@ -28,13 +29,14 @@ struct Options {
   std::uint32_t sgl_size{kvaf::kGatherMaxSglSize};
   std::uint32_t warmup{1U};
   std::uint32_t iterations{3U};
+  bool profile_detail{false};
 };
 
 void Usage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s [--peer HOST:PORT] [--device-id N] [--kernel-json PATH] "
                "[--blocks N] [--block-bytes N] [--output-stride N] [--sgl-size N] "
-               "[--warmup N] [--iterations N]\n"
+               "[--warmup N] [--iterations N] [--profile-detail 0|1]\n"
                "Defaults: output-stride=2*block-bytes, sgl-size=%u "
                "(positive; each READ WQE uses at most %u SGE)\n",
                program, kvaf::kGatherMaxSglSize, kvaf::kGatherMaxSglSize);
@@ -59,6 +61,8 @@ bool Parse(int argc, char** argv, Options* options) {
       else if (flag == "--sgl-size") parsed.sgl_size = static_cast<std::uint32_t>(number);
       else if (flag == "--warmup") parsed.warmup = static_cast<std::uint32_t>(number);
       else if (flag == "--iterations") parsed.iterations = static_cast<std::uint32_t>(number);
+      else if (flag == "--profile-detail" && number <= 1U)
+        parsed.profile_detail = number != 0U;
       else return false;
     }
   }
@@ -279,60 +283,15 @@ int Run(const Options& options) {
   }
   Check(runtime.core().BatchFree({reserved_keys}), "ReleaseGatherStaging");
   Check(runtime.Shutdown(), "Shutdown");
-  double total_ns = 0.0;
-  for (const double elapsed_ms : samples) total_ns += elapsed_ms * 1000000.0;
   const auto stats = kvaf::aicpu_urma_client::SummarizeTiming(std::move(samples), payload);
   std::fprintf(stdout,
                "GATHER_READ_STATS min_ms=%.3f p50_ms=%.3f p95_ms=%.3f p99_ms=%.3f "
                "max_ms=%.3f mean_ms=%.3f GBps=%.3f\n",
                stats.min_ms, stats.p50_ms, stats.p95_ms, stats.p99_ms,
                stats.max_ms, stats.mean_ms, stats.mean_gbps);
-  const auto average = [&](std::uint64_t kvaf::GatherReadTiming::*field) {
-    std::uint64_t sum = 0U;
-    for (const auto& profile : profiles) sum += profile.*field;
-    return static_cast<double>(sum) / profiles.size();
-  };
-  std::fprintf(stdout,
-               "GATHER_READ_HOST_PROFILE avg_ns total=%.0f validate=%.0f configure_rpc=%.0f "
-               "descriptor_upload=%.0f hbm_register=%.0f launch=%.0f "
-               "stream_sync=%.0f hbm_release=%.0f status_copy=%.0f\n",
-               total_ns / profiles.size(),
-               average(&kvaf::GatherReadTiming::validate_ns),
-               average(&kvaf::GatherReadTiming::configure_ns),
-               average(&kvaf::GatherReadTiming::descriptor_upload_ns),
-               average(&kvaf::GatherReadTiming::register_ns),
-               average(&kvaf::GatherReadTiming::launch_ns),
-               average(&kvaf::GatherReadTiming::sync_ns),
-               average(&kvaf::GatherReadTiming::release_ns),
-               average(&kvaf::GatherReadTiming::status_copy_ns));
-  std::fprintf(stdout,
-               "GATHER_READ_AICPU_CONTROL_PROFILE avg_ns notify=%.0f notify_post=%.0f "
-               "notify_cq=%.0f ack_poll=%.0f ack_post=%.0f ack_cq=%.0f "
-               "ack_cache=%.0f ack_polls=%.2f\n",
-               average(&kvaf::GatherReadTiming::notify_ns),
-               average(&kvaf::GatherReadTiming::notify_post_ns),
-               average(&kvaf::GatherReadTiming::notify_cq_ns),
-               average(&kvaf::GatherReadTiming::ack_poll_ns),
-               average(&kvaf::GatherReadTiming::ack_post_ns),
-               average(&kvaf::GatherReadTiming::ack_cq_ns),
-               average(&kvaf::GatherReadTiming::ack_cache_ns),
-               average(&kvaf::GatherReadTiming::ack_polls));
-  std::fprintf(stdout,
-               "GATHER_READ_CPU_PROFILE avg_ns dispatch=%.0f notify_spin=%.0f "
-               "source_cache=%.0f copy=%.0f staging_flush=%.0f\n",
-               average(&kvaf::GatherReadTiming::cpu_dispatch_ns),
-               average(&kvaf::GatherReadTiming::cpu_notify_spin_ns),
-               average(&kvaf::GatherReadTiming::cpu_source_cache_ns),
-               average(&kvaf::GatherReadTiming::cpu_copy_ns),
-               average(&kvaf::GatherReadTiming::cpu_staging_flush_ns));
-  std::fprintf(stdout,
-               "GATHER_READ_AICPU_DATA_PROFILE avg_ns scatter_cache=%.0f "
-               "scatter_plan=%.0f scatter_post=%.0f scatter_cq=%.0f read_wqes=%.2f\n",
-               average(&kvaf::GatherReadTiming::scatter_cache_ns),
-               average(&kvaf::GatherReadTiming::scatter_plan_ns),
-               average(&kvaf::GatherReadTiming::scatter_post_ns),
-               average(&kvaf::GatherReadTiming::scatter_cq_ns),
-               average(&kvaf::GatherReadTiming::read_wqes));
+  kvaf::aicpu_gather_read_client::PrintGatherReadTimeline(stdout, stats.mean_ms, profiles);
+  if (options.profile_detail)
+    kvaf::aicpu_gather_read_client::PrintGatherReadTechnicalProfile(stdout, profiles);
   std::fprintf(stdout,
                "AICPU_GATHER_READ_PASS blocks=%u block_bytes=%u bytes=%zu "
                "output_stride=%u sgl_size=%u wqe_sgl_size=%u warmup=%u iterations=%u\n",
