@@ -106,14 +106,14 @@ void Initialize(Queue& queue) {
 
 template <typename Entity, typename Queue>
 std::uint32_t WaitCompletion(const Entity& entity, Queue& queue,
-                             std::uint32_t* cqe_word, bool maintain_cache) {
+                             std::uint32_t* cqe_word) {
   const auto slot = queue.cq_consumer_index % entity.cq_depth;
   auto* completion = reinterpret_cast<volatile std::uint32_t*>(
       entity.cq_va + slot * entity.cqe_size);
   const auto expected = static_cast<std::uint32_t>(
       (queue.cq_consumer_index / entity.cq_depth) & 1U);
   for (std::uint32_t poll = 0U; poll < kPollLimit; ++poll) {
-    if (maintain_cache) Flush(const_cast<const std::uint32_t*>(completion), 32U);
+    Flush(const_cast<const std::uint32_t*>(completion), 32U);
     const std::uint32_t word = LoadCompletion(completion);
     if (((word >> 2U) & 1U) == expected) continue;
     if (cqe_word != nullptr) *cqe_word = word;
@@ -133,7 +133,7 @@ std::uint32_t Submit(const Entity& entity, Queue& queue,
                      std::uint64_t* last_wqe_protocol = nullptr,
                      std::uint64_t* post_ns = nullptr,
                      std::uint64_t* cq_ns = nullptr,
-                     bool maintain_cache = true) {
+                     bool maintain_sq_cache = true) {
   if (cqe_word != nullptr) *cqe_word = 0U;
   if (post_ns != nullptr) *post_ns = 0U;
   if (cq_ns != nullptr) *cq_ns = 0U;
@@ -155,16 +155,16 @@ std::uint32_t Submit(const Entity& entity, Queue& queue,
       *last_wqe_protocol = words[0];
     auto* destination = reinterpret_cast<void*>(entity.sq_va + slot * 64U);
     std::memcpy(destination, words, sizeof(words));
-    if (maintain_cache) Flush(destination, sizeof(words));
+    if (maintain_sq_cache) Flush(destination, sizeof(words));
   }
   queue.sq_producer_index += count;
-  if (!maintain_cache) Barrier();
+  if (!maintain_sq_cache) Barrier();
   Ring(reinterpret_cast<volatile std::uint32_t*>(entity.sq_db_va),
        static_cast<std::uint32_t>(queue.sq_producer_index));
   Barrier();
   const auto cq_start_ns = timed ? NowNs() : 0U;
   if (post_ns != nullptr) *post_ns = cq_start_ns - post_start_ns;
-  const auto result = WaitCompletion(entity, queue, cqe_word, maintain_cache);
+  const auto result = WaitCompletion(entity, queue, cqe_word);
   if (cq_ns != nullptr) *cq_ns = NowNs() - cq_start_ns;
   return result;
 }
@@ -197,7 +197,7 @@ std::uint32_t SubmitNotify(const Entity& entity, Queue& queue,
   Barrier();
   const auto cq_start_ns = NowNs();
   *post_ns = cq_start_ns - post_start_ns;
-  const auto result = WaitCompletion(entity, queue, cqe_word, false);
+  const auto result = WaitCompletion(entity, queue, cqe_word);
   *cq_ns = NowNs() - cq_start_ns;
   return result;
 }
@@ -244,7 +244,7 @@ std::uint32_t SubmitScatter(const Entity& entity, Queue& queue,
   Barrier();
   const auto cq_start_ns = NowNs();
   if (post_ns != nullptr) *post_ns = cq_start_ns - post_start_ns;
-  const auto result = WaitCompletion(entity, queue, cqe_word, false);
+  const auto result = WaitCompletion(entity, queue, cqe_word);
   if (cq_ns != nullptr) *cq_ns = NowNs() - cq_start_ns;
   return result;
 }

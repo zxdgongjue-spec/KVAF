@@ -93,11 +93,12 @@ WQEBB；队列深度允许时每 64 条 WQE 在末条请求 CQE。单条 WQE 的
 不支持跨独立 HBM 分配的 SGL。未指定 `source_descriptor_address` 的旧调用仍使用
 每轮配置 RPC；一个 DDR region 不得混用两种模式。
 
-GatherRead 的 CPU 通知、ack、descriptor、源 DDR、staging 和 AICPU 的描述符、
-SQ、CQ、HBM 输出、状态缓冲均不执行显式缓存行清理或失效；仍保留内存屏障以保证
-提交与完成的顺序。这样做依赖目标平台的 CPU DDR、HBM 与 URMA DMA 一致性，
-不能从注册参数推断该条件已经满足。Host 模拟无法验证这一点，更新后必须在
-真实设备上逐轮改变数据并完整回读校验；若通知、CQ 或状态不可见，需恢复维护。
+GatherRead 仅在每次轮询 AICPU CQE 前清理并失效对应缓存行；CPU 通知、ack、
+descriptor、源 DDR、staging 和 AICPU 的描述符、SQ、HBM 输出、状态缓冲
+均不执行显式缓存行维护。仍保留内存屏障以保证提交与完成的顺序。其余缓冲区
+依赖目标平台的 CPU DDR、HBM 与 URMA DMA 一致性，不能从注册参数推断该条件
+已经满足。Host 模拟无法验证这一点，更新后必须在真实设备上逐轮改变数据并
+完整回读校验；若通知、SQ 或状态不可见，需恢复相应维护。
 这里没有使用 OpenMP：
 CPU worker 使用常驻 `std::thread`。默认 `--gather-mode adaptive`：协调线程
 持续轮询远端控制行；辅助线程在完成一轮后先自旋约 100 us，再等待协调线程
@@ -165,7 +166,19 @@ CPU gather 握手和 CQ 等待，不含输入上传、输出回读及逐字节�
 不是通知传递耗时。`CPU start observed after ACK polling began` 是 AICPU 首次读到
 临时 ACK 标记的时间；若 CPU 在第一次轮询前就完成，标记可能不会被观察到。
 `direct_setup` 包含每轮 mailbox 布局检查，只有首次调用才会启用 CPU worker。
-禁用显式缓存维护后的数据正确性和性能尚需目标机器验证，不能从 Host 模拟推断。
+CQ 缓存行维护计入 `ack_cq_ns` / `scatter_cq_ns` 等完成等待时间，不计入
+`ack_cache_ns`；其余缓存维护禁用后的正确性和性能尚需目标机器验证，
+不能从 Host 模拟推断。
+
+服务端加 `--gather-notify-profile` 后，直连 CPU worker 退出时输出一行
+`GATHER_NOTIFY_POLL`。此采样有开销，正式测带宽时不要启用。
+`detect_gap_*`
+是读到新通知前最后一个采样窗口的墙钟时间，`detect_offcpu_*` 是该窗口墙钟
+减去线程 CPU 时间，`sampled_offcpu_max_ns` 覆盖整个轮询期间的采样窗口。
+active/adaptive 每 4096 次轮询采样，passive 每次休眠后采样。active/adaptive
+模式的较大 off-CPU 间隔表明协调线程未运行；passive 模式的 off-CPU 时间还包含
+主动休眠。off-CPU 字段只在 Linux 上有效。这些值不是 NPU 写入通知到 CPU
+看到通知的端到端耗时。
 
 升序或降序且不重叠的 HBM 输出 span 使用线性布局校验；其他顺序仍通过排序
 检查重叠。GatherRead 不再刷新输出 span 或 SQ WQE 的 cache line；此变更不改变

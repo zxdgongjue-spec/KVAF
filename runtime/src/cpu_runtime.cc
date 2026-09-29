@@ -10,6 +10,9 @@
 #include <dlfcn.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <time.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -433,13 +436,15 @@ class CpuGatherWorker {
   CpuGatherWorker(void* memory, uint64_t base, uint64_t bytes,
                   std::size_t gather_threads,
                   std::size_t min_bytes_per_thread, bool gather_affinity,
-                  CpuGatherMode gather_mode, bool direct = false)
+                  CpuGatherMode gather_mode, bool direct = false,
+                  bool notify_profile = false)
       : memory_(static_cast<uint8_t*>(memory)), base_(base), bytes_(bytes),
         control_(reinterpret_cast<peer::GatherControl*>(
             static_cast<uint8_t*>(memory) + peer::GatherControlOffset(bytes))),
         team_(memory, base, gather_threads, min_bytes_per_thread,
               TeamWaitMode(gather_mode), gather_affinity),
-        max_threads_(team_.max_threads()), gather_mode_(gather_mode), direct_(direct) {
+        max_threads_(team_.max_threads()), gather_mode_(gather_mode), direct_(direct),
+        notify_profile_(notify_profile) {
     std::memset(control_, 0, sizeof(*control_));
     peer::GatherBarrier();
     worker_ = std::thread(direct ? &CpuGatherWorker::RunDirect
@@ -450,6 +455,16 @@ class CpuGatherWorker {
     stop_.store(true, std::memory_order_release);
     changed_.notify_all();
     worker_.join();
+    if (notify_profile_ && direct_rounds_ != 0U) {
+      Log("[KVAF_CPU] GATHER_NOTIFY_POLL mode=%s rounds=%" PRIu64
+          " detect_gap_avg_ns=%" PRIu64 " detect_gap_max_ns=%" PRIu64
+          " detect_offcpu_avg_ns=%" PRIu64 " detect_offcpu_max_ns=%" PRIu64
+          " detect_offcpu_ge_1ms=%" PRIu64 " sampled_offcpu_max_ns=%" PRIu64 "\n",
+          GatherModeName(gather_mode_), direct_rounds_,
+          detect_gap_sum_ns_ / direct_rounds_, detect_gap_max_ns_,
+          detect_offcpu_sum_ns_ / direct_rounds_, detect_offcpu_max_ns_,
+          detect_offcpu_ge_1ms_, sampled_offcpu_max_ns_);
+    }
   }
 
   bool Configure(uint64_t staging, const std::vector<GatherSpan>& spans,
@@ -480,6 +495,16 @@ class CpuGatherWorker {
   static std::uint64_t NowNs() {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
+  }
+
+  static std::uint64_t ThreadCpuNs() {
+#if defined(__linux__)
+    timespec value{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) return 0U;
+    return static_cast<std::uint64_t>(value.tv_sec) * 1000000000U + value.tv_nsec;
+#else
+    return 0U;
+#endif
   }
 
   void Run() {
@@ -521,16 +546,43 @@ class CpuGatherWorker {
     team_.BindWorker(0U);
     std::uint64_t last_sequence = 0U;
     std::uint64_t wait_start_ns = NowNs();
+    std::uint64_t last_sample_ns = wait_start_ns;
+    std::uint64_t last_cpu_ns = notify_profile_ ? ThreadCpuNs() : 0U;
+    std::uint64_t poll_count = 0U;
+    auto sample_gap = [&]() {
+      const auto now_ns = NowNs();
+      const auto cpu_ns = ThreadCpuNs();
+      const auto gap_ns = now_ns - last_sample_ns;
+      const auto cpu_elapsed_ns = cpu_ns >= last_cpu_ns ? cpu_ns - last_cpu_ns : 0U;
+      const auto offcpu_ns = cpu_ns != 0U && last_cpu_ns != 0U &&
+                                     gap_ns > cpu_elapsed_ns ? gap_ns - cpu_elapsed_ns : 0U;
+      sampled_offcpu_max_ns_ = std::max(sampled_offcpu_max_ns_, offcpu_ns);
+      last_sample_ns = now_ns;
+      last_cpu_ns = cpu_ns;
+      return std::pair{gap_ns, offcpu_ns};
+    };
     while (!stop_.load(std::memory_order_acquire)) {
       const auto sequence = __atomic_load_n(&control_->notify, __ATOMIC_ACQUIRE);
       if (sequence == 0U || sequence == last_sequence ||
           (sequence & peer::kGatherErrorBit) != 0U) {
+        if (notify_profile_ &&
+            ((++poll_count & 4095U) == 0U || gather_mode_ == CpuGatherMode::kPassive))
+          sample_gap();
         if (gather_mode_ == CpuGatherMode::kPassive) {
           std::this_thread::sleep_for(std::chrono::microseconds(20));
         } else {
           peer::GatherSpinPause();
         }
         continue;
+      }
+      if (notify_profile_) {
+        const auto [gap_ns, offcpu_ns] = sample_gap();
+        ++direct_rounds_;
+        detect_gap_sum_ns_ += gap_ns;
+        detect_gap_max_ns_ = std::max(detect_gap_max_ns_, gap_ns);
+        detect_offcpu_sum_ns_ += offcpu_ns;
+        detect_offcpu_max_ns_ = std::max(detect_offcpu_max_ns_, offcpu_ns);
+        if (offcpu_ns >= 1000000U) ++detect_offcpu_ge_1ms_;
       }
       last_sequence = sequence;
       peer::GatherCpuProfile profile{};
@@ -588,6 +640,11 @@ class CpuGatherWorker {
                        sequence | (valid ? 0U : peer::kGatherErrorBit), __ATOMIC_RELEASE);
       peer::GatherBarrier();
       wait_start_ns = NowNs();
+      if (notify_profile_) {
+        last_sample_ns = wait_start_ns;
+        last_cpu_ns = ThreadCpuNs();
+        poll_count = 0U;
+      }
     }
   }
 
@@ -603,10 +660,18 @@ class CpuGatherWorker {
   std::size_t max_threads_{0U};
   CpuGatherMode gather_mode_{CpuGatherMode::kAdaptive};
   bool direct_{false};
+  bool notify_profile_{false};
   std::size_t reported_threads_{0U};
   std::uint64_t scheduled_at_ns_{0U};
   uint64_t scheduled_{0U};
   uint64_t completed_{0U};
+  std::uint64_t direct_rounds_{0U};
+  std::uint64_t detect_gap_sum_ns_{0U};
+  std::uint64_t detect_gap_max_ns_{0U};
+  std::uint64_t detect_offcpu_sum_ns_{0U};
+  std::uint64_t detect_offcpu_max_ns_{0U};
+  std::uint64_t detect_offcpu_ge_1ms_{0U};
+  std::uint64_t sampled_offcpu_max_ns_{0U};
   std::thread worker_;
 };
 
@@ -628,10 +693,11 @@ class CpuService {
  public:
   CpuService(UrmaResourcePool* resource_pool, std::size_t gather_threads,
              std::size_t min_bytes_per_thread, bool gather_affinity,
-             CpuGatherMode gather_mode)
+             CpuGatherMode gather_mode, bool gather_notify_profile)
       : resource_pool_(resource_pool), gather_threads_(gather_threads),
         min_bytes_per_thread_(min_bytes_per_thread),
-        gather_affinity_(gather_affinity), gather_mode_(gather_mode) {}
+        gather_affinity_(gather_affinity), gather_mode_(gather_mode),
+        gather_notify_profile_(gather_notify_profile) {}
   ~CpuService() { ReleaseAll(); }
 
   uint32_t CandidateCount() const {
@@ -825,7 +891,8 @@ class CpuService {
     try {
       region.gather = std::make_unique<CpuGatherWorker>(
           region.memory, region.base, region.bytes, gather_threads_,
-          min_bytes_per_thread_, gather_affinity_, gather_mode_, true);
+          min_bytes_per_thread_, gather_affinity_, gather_mode_, true,
+          gather_notify_profile_);
     } catch (const std::exception& error) {
       Log("[KVAF_CPU] GATHER_DIRECT_ENABLE_FAILED reason=%s\n", error.what());
       return Result::kResourceError;
@@ -948,6 +1015,7 @@ class CpuService {
   std::size_t min_bytes_per_thread_{256U * 1024U};
   bool gather_affinity_{true};
   CpuGatherMode gather_mode_{CpuGatherMode::kAdaptive};
+  bool gather_notify_profile_{false};
   uint64_t next_region_id_ = 1U;
   uint32_t next_token_ = 1U;
   uint32_t next_psn_ = 1U;
@@ -1113,7 +1181,7 @@ Status CpuRuntime::Initialize(const CpuRuntimeOptions& options) {
       ? 256U * 1024U : 64U * 1024U;
   impl->service = std::make_unique<CpuService>(
       &impl->resources, gather_threads, min_bytes_per_thread,
-      options.gather_affinity, options.gather_mode);
+      options.gather_affinity, options.gather_mode, options.gather_notify_profile);
   impl_ = std::move(impl);
   return Status::OK();
 }
