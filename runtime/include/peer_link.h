@@ -57,6 +57,7 @@ class PeerLink {
   Status LookupRegion(uint64_t base, PeerRegion* region) const;
   Status ConfigureGather(uint64_t region_base, uint64_t staging_address,
                          const std::vector<GatherSpan>& spans, GatherReady* ready) const;
+  Status EnableDirectGather(uint64_t region_base) const;
   // Register a descriptor obtained by an out-of-band allocator (for example
   // RuntimeCore's NPU HBM allocator) so channel setup can use the same API.
   Status RememberRegion(const PeerRegion& region);

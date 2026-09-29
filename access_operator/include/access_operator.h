@@ -13,6 +13,7 @@
 
 namespace kvaf::peer {
 class PeerLink;
+struct GatherSpan;
 }
 
 namespace kvaf {
@@ -36,6 +37,9 @@ struct CpuGatherReadExecRequest {
   std::uint64_t remote_command{0U};
   std::uint64_t remote_notify{0U};
   std::uint64_t remote_ack{0U};
+  std::uint64_t remote_descriptor{0U};
+  const peer::GatherSpan* source_spans{nullptr};
+  std::uint32_t source_span_count{0U};
   std::uint64_t sequence{0U};
   std::uint32_t bytes{0U};
   void* stream{nullptr};

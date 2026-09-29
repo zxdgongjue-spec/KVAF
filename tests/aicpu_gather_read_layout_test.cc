@@ -20,9 +20,14 @@ void ProbeRotatesFirstSlot(std::uint32_t blocks, std::uint32_t block_bytes) {
   reserved.push_back(base);
   assert(reserved.size() == blocks + extra);
   std::uint64_t staging = 0U;
+  std::uint64_t descriptor = 0U;
   assert(kvaf::aicpu_gather_read_client::SelectStagingAddress(
-      base, bytes, block_bytes, blocks, reserved, &staging));
+      base, bytes, block_bytes, blocks, reserved, &staging, &descriptor));
   assert(staging == base + static_cast<std::uint64_t>(blocks + 1U) * block_bytes);
+  assert(descriptor >= staging + static_cast<std::uint64_t>(blocks) * block_bytes);
+  assert(descriptor % 64U == 0U);
+  assert(descriptor + kvaf::peer::GatherDescriptorBytes(blocks) <=
+         base + bytes - 64U);
   std::vector<kvaf::peer::GatherSpan> sources;
   for (std::uint64_t slot = 1U; slot <= blocks; ++slot)
     sources.push_back({base + slot * block_bytes, block_bytes, 0U});

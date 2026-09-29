@@ -20,6 +20,9 @@ struct GatherReadStatus {
   std::uint64_t cqe_word;
   std::uint64_t sequence;
   std::uint64_t notify_ns;
+  std::uint64_t source_write_ns;
+  std::uint64_t source_write_post_ns;
+  std::uint64_t source_write_cq_ns;
   std::uint64_t notify_post_ns;
   std::uint64_t notify_cq_ns;
   std::uint64_t ack_poll_ns;
@@ -45,15 +48,17 @@ struct GatherReadArgs {
   std::uint64_t remote_notify;
   std::uint64_t remote_ack;
   std::uint64_t output_spans;
+  std::uint64_t source_descriptor;
+  std::uint64_t remote_descriptor;
   std::uint64_t output_extent;
   std::uint64_t sequence;
   std::uint32_t bytes;
   std::uint32_t output_span_count;
   std::uint32_t sgl_size;
-  std::uint32_t reserved;
+  std::uint32_t source_span_count;
 };
 
 static_assert(sizeof(GatherReadStatus) <= 384U, "GatherRead exceeds shared status buffer");
-static_assert(sizeof(GatherReadArgs) == 104U, "GatherRead argument ABI changed");
+static_assert(sizeof(GatherReadArgs) == 120U, "GatherRead argument ABI changed");
 
 }  // namespace kvaf::aicpu_urma

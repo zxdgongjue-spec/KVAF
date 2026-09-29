@@ -439,6 +439,23 @@ Status PeerLink::ConfigureGather(uint64_t region_base, uint64_t staging_address,
   return Status::OK();
 }
 
+Status PeerLink::EnableDirectGather(uint64_t region_base) const {
+  const auto found = regions_.find(region_base);
+  if (found == regions_.end() || found->second.device_memory)
+    return Status::NotFound("peer DDR region was not found");
+  EnableDirectGatherRequest request{};
+  request.header = MakeHeader(Command::kEnableDirectGather, sizeof(request));
+  request.session_id = found->second.session_id;
+  StatusResponse response{};
+  std::string error;
+  if (!Exchange(address_, request, &response, &error) ||
+      !IsValidResponseHeader(response.header, Command::kEnableDirectGather,
+                             sizeof(response)) ||
+      !ResultOk(static_cast<Result>(response.result), &error))
+    return ToStatus("peer direct gather enable failed", std::move(error));
+  return Status::OK();
+}
+
 Status PeerLink::RememberRegion(const PeerRegion& region) {
   if (region.base == 0U || region.length == 0U || region.session_id == 0U)
     return Status::InvalidArgument("invalid peer region descriptor");

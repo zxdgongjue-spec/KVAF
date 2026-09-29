@@ -32,7 +32,8 @@ target_include_directories(kvaf_aicpu_urma_kernel_test PRIVATE
   "${CMAKE_SOURCE_DIR}/access_operator/src"
   "${CMAKE_SOURCE_DIR}/access_operator/include"
   "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include"
-  "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_put/include")
+  "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_put/include"
+  "${CMAKE_SOURCE_DIR}/runtime/include")
 add_test(NAME kvaf_aicpu_urma_kernel COMMAND kvaf_aicpu_urma_kernel_test)
 
 add_executable(kvaf_aicpu_gather_read_kernel_test aicpu_gather_read_kernel_test.cc

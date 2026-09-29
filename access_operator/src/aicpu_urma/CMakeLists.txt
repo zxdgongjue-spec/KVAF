@@ -33,8 +33,10 @@ add_custom_command(OUTPUT "${kernel_so}"
           -I "${CMAKE_SOURCE_DIR}/access_operator/include"
           -I "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include"
           -I "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_put/include"
+          -I "${CMAKE_SOURCE_DIR}/runtime/include"
           "${CMAKE_CURRENT_SOURCE_DIR}/kernel.cc" -o "${kernel_so}"
   DEPENDS kernel.cc wqe.h gather_read.h
+          "${CMAKE_SOURCE_DIR}/runtime/include/cpu_gather.h"
           "${CMAKE_SOURCE_DIR}/access_operator/include/gather_output.h"
           "${CMAKE_SOURCE_DIR}/access_operator/include/gather_read_profile.h" VERBATIM)
 add_custom_command(OUTPUT "${kernel_tar}"

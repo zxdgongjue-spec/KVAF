@@ -29,6 +29,7 @@ struct Options {
   std::uint32_t sgl_size{kvaf::kGatherMaxSglSize};
   std::uint32_t warmup{1U};
   std::uint32_t iterations{3U};
+  bool urma_descriptors{true};
   bool profile_detail{false};
 };
 
@@ -36,8 +37,9 @@ void Usage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s [--peer HOST:PORT] [--device-id N] [--kernel-json PATH] "
                "[--blocks N] [--block-bytes N] [--output-stride N] [--sgl-size N] "
-               "[--warmup N] [--iterations N] [--profile-detail 0|1]\n"
-               "Defaults: output-stride=2*block-bytes, sgl-size=%u "
+               "[--warmup N] [--iterations N] [--descriptor-transport urma|rpc] "
+               "[--profile-detail 0|1]\n"
+               "Defaults: descriptor-transport=urma, output-stride=2*block-bytes, sgl-size=%u "
                "(positive; each READ WQE uses at most %u SGE)\n",
                program, kvaf::kGatherMaxSglSize, kvaf::kGatherMaxSglSize);
 }
@@ -50,6 +52,11 @@ bool Parse(int argc, char** argv, Options* options) {
     const char* value = argv[index + 1];
     if (flag == "--peer") parsed.peer = value;
     else if (flag == "--kernel-json") parsed.kernel_json = value;
+    else if (flag == "--descriptor-transport") {
+      if (std::strcmp(value, "urma") == 0) parsed.urma_descriptors = true;
+      else if (std::strcmp(value, "rpc") == 0) parsed.urma_descriptors = false;
+      else return false;
+    }
     else {
       std::uint64_t number = 0U;
       if (!kvaf::aicpu_urma_client::Number(value, &number) || number > UINT32_MAX)
@@ -136,7 +143,8 @@ double RunRound(kvaf::NpuRuntime* runtime, aclrtStream stream, const Options& op
                 std::vector<std::uint8_t>* host_output,
                 std::vector<std::uint8_t>* expected_output,
                 std::vector<kvaf::KeyId>* reserved_keys,
-                std::uint64_t* staging_address, std::uint64_t round,
+                std::uint64_t* staging_address,
+                std::uint64_t* descriptor_address, std::uint64_t round,
                 kvaf::GatherReadTiming* timing) {
   const std::size_t payload = host_input->size();
   for (std::size_t byte = 0U; byte < payload; ++byte)
@@ -187,8 +195,8 @@ double RunRound(kvaf::NpuRuntime* runtime, aclrtStream stream, const Options& op
     const auto region = runtime->core().remote_region();
     if (!kvaf::aicpu_gather_read_client::SelectStagingAddress(
             region.base, region.length, options.block_bytes, options.blocks,
-            std::move(reserved_addresses), staging_address))
-      throw std::runtime_error("no contiguous staging span outside the DDR control area");
+            std::move(reserved_addresses), staging_address, descriptor_address))
+      throw std::runtime_error("no contiguous staging and descriptor spans in DDR");
     Check(runtime->core().ReleaseAccessTable(reserved_handle),
           "ReleaseReservedAccessTable");
   }
@@ -198,10 +206,12 @@ double RunRound(kvaf::NpuRuntime* runtime, aclrtStream stream, const Options& op
   kvaf::AccessTableView view{};
   Check(runtime->core().GetAccessTableView(handle, &view), "GetAccessTableView");
   const auto region = runtime->core().remote_region();
-  if (view.size != options.blocks || *staging_address == 0U)
+  if (view.size != options.blocks || *staging_address == 0U ||
+      *descriptor_address == 0U)
     throw std::runtime_error("source AccessTable or staging address is invalid");
   kvaf::CpuGatherReadRequest gather;
   gather.staging_address = *staging_address;
+  gather.source_descriptor_address = options.urma_descriptors ? *descriptor_address : 0U;
   gather.output = {output->data, output->bytes, kvaf::DeviceKind::kNpu};
   gather.stream = stream;
   gather.timing = timing;
@@ -250,11 +260,13 @@ int Run(const Options& options) {
   const std::size_t output_extent =
       static_cast<std::size_t>(options.blocks - 1U) * options.output_stride + options.block_bytes;
   DeviceBuffer input(payload);
-  DeviceBuffer output(((output_extent + 63U) & ~std::size_t{63U}) + 64U);
+  DeviceBuffer output(((output_extent + 63U) & ~std::size_t{63U}) + 64U +
+                      kvaf::peer::GatherDescriptorBytes(options.blocks));
   std::vector<std::uint8_t> host_input(payload), host_output(output.bytes);
   std::vector<std::uint8_t> expected_output(output_extent);
   std::vector<kvaf::KeyId> reserved_keys;
   std::uint64_t staging_address = 0U;
+  std::uint64_t descriptor_address = 0U;
   const std::size_t reserve_slots = kvaf::aicpu_gather_read_client::ReservedSlots(
       options.blocks, options.block_bytes);
   kvaf::NpuRuntimeOptions runtime_options("", options.block_bytes, 1U);
@@ -275,7 +287,7 @@ int Run(const Options& options) {
     kvaf::GatherReadTiming timing{};
     const double elapsed = RunRound(&runtime, acl.stream, options, &input, &output,
                                     &host_input, &host_output, &expected_output, &reserved_keys,
-                                    &staging_address, round, &timing);
+                                    &staging_address, &descriptor_address, round, &timing);
     if (round >= options.warmup) {
       samples.push_back(elapsed);
       profiles.push_back(timing);
@@ -294,9 +306,11 @@ int Run(const Options& options) {
     kvaf::aicpu_gather_read_client::PrintGatherReadTechnicalProfile(stdout, profiles);
   std::fprintf(stdout,
                "AICPU_GATHER_READ_PASS blocks=%u block_bytes=%u bytes=%zu "
-               "output_stride=%u sgl_size=%u wqe_sgl_size=%u warmup=%u iterations=%u\n",
+               "output_stride=%u sgl_size=%u wqe_sgl_size=%u descriptor_transport=%s "
+               "warmup=%u iterations=%u\n",
                options.blocks, options.block_bytes, payload, options.output_stride,
                options.sgl_size, std::min(options.sgl_size, kvaf::kGatherMaxSglSize),
+               options.urma_descriptors ? "urma" : "rpc",
                options.warmup, options.iterations);
   return 0;
 }

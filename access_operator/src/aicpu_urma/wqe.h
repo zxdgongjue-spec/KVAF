@@ -38,6 +38,11 @@ constexpr std::uint32_t ScatterWqebbs(std::uint32_t sge_count) {
   return (48U + sge_count * 16U + kWqeBytes - 1U) / kWqeBytes;
 }
 
+constexpr std::uint32_t MaxScatterBatch(std::uint32_t sq_depth) {
+  const auto safe_batch = sq_depth > 1U ? (sq_depth - 1U) / kMaxScatterWqebbs : 0U;
+  return safe_batch < 64U ? safe_batch : 64U;
+}
+
 static_assert(ScatterWqebbs(kGatherMaxSglSize) == kMaxScatterWqebbs,
               "scatter WQE buffer is too small");
 

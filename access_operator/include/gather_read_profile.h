@@ -8,6 +8,7 @@ namespace kvaf {
 struct GatherReadTiming {
   std::uint64_t validate_ns{0U};
   std::uint64_t configure_ns{0U};
+  std::uint64_t source_upload_ns{0U};
   std::uint64_t descriptor_upload_ns{0U};
   std::uint64_t register_ns{0U};
   std::uint64_t launch_ns{0U};
@@ -15,6 +16,9 @@ struct GatherReadTiming {
   std::uint64_t release_ns{0U};
   std::uint64_t status_copy_ns{0U};
   std::uint64_t notify_ns{0U};
+  std::uint64_t source_write_ns{0U};
+  std::uint64_t source_write_post_ns{0U};
+  std::uint64_t source_write_cq_ns{0U};
   std::uint64_t notify_post_ns{0U};
   std::uint64_t notify_cq_ns{0U};
   std::uint64_t ack_poll_ns{0U};

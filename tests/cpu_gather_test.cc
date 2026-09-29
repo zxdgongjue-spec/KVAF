@@ -124,6 +124,31 @@ void TestIrregularGather() {
   }
 }
 
+void TestDirectDescriptorLayout() {
+  std::array<std::uint8_t, 512> memory{};
+  const auto base = reinterpret_cast<std::uint64_t>(memory.data());
+  std::vector<kvaf::peer::GatherSpan> spans{
+      {base + 32U, 16U, 0U}, {base, 16U, 0U}};
+  kvaf::peer::GatherDescriptorHeader header{
+      kvaf::peer::kGatherDescriptorMagic, 1U, base + 128U, 2U, 32U};
+  assert(kvaf::peer::ValidateDirectGather(base, memory.size(), base + 256U,
+                                          header, spans));
+  header.total_bytes = 31U;
+  assert(!kvaf::peer::ValidateDirectGather(base, memory.size(), base + 256U,
+                                           header, spans));
+  header.total_bytes = 32U;
+  header.staging_address = base + 256U;
+  assert(!kvaf::peer::ValidateDirectGather(base, memory.size(), base + 256U,
+                                           header, spans));
+  header.staging_address = base + 128U;
+  spans[0].address = base + 256U;
+  assert(!kvaf::peer::ValidateDirectGather(base, memory.size(), base + 256U,
+                                           header, spans));
+  spans[0].address = base + 32U;
+  assert(!kvaf::peer::ValidateDirectGather(base, memory.size(), base + 400U,
+                                           header, spans));
+}
+
 int main() {
   std::array<std::uint8_t, 256> memory{};
   const auto base = reinterpret_cast<std::uint64_t>(memory.data());
@@ -148,5 +173,6 @@ int main() {
   assert(sizeof(kvaf::peer::GatherSpan) == sizeof(kvaf::peer::GatherSpanWire));
   TestParallelGather();
   TestIrregularGather();
+  TestDirectDescriptorLayout();
   std::cout << "CPU gather: PASS\n";
 }

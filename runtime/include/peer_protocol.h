@@ -29,6 +29,7 @@ enum class Command : uint16_t {
   kReleaseHbmRegion = 6U,
   kGetHbmEidCandidate = 7U,
   kConfigureGather = 8U,
+  kEnableDirectGather = 9U,
 };
 
 enum class Result : int32_t {
@@ -181,6 +182,11 @@ struct ConfigureGatherResponse {
   uint64_t notify_address;
   uint64_t ack_address;
 };
+
+struct EnableDirectGatherRequest {
+  MessageHeader header;
+  uint64_t session_id;
+};
 #pragma pack(pop)
 
 static_assert(sizeof(MessageHeader) == 12U, "wire header ABI changed");
@@ -197,6 +203,7 @@ static_assert(sizeof(HbmEidCandidateResponse) == 40U, "HBM candidate response AB
 static_assert(sizeof(ConfigureGatherRequest) == 36U, "gather request ABI changed");
 static_assert(sizeof(GatherSpanWire) == 16U, "gather span ABI changed");
 static_assert(sizeof(ConfigureGatherResponse) == 52U, "gather response ABI changed");
+static_assert(sizeof(EnableDirectGatherRequest) == 20U, "direct gather request ABI changed");
 
 inline constexpr uint16_t ResponseCommand(Command command) {
   return static_cast<uint16_t>(command) | 0x8000U;

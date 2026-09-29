@@ -1,5 +1,6 @@
 #include "wqe.h"
 #include "gather_read.h"
+#include "cpu_gather.h"
 
 #include "batch_get_abi.h"
 #include "batch_put_internal.h"
@@ -7,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <chrono>
+#include <algorithm>
 #if defined(KVAF_AICPU_URMA_HOST_TEST)
 #include <atomic>
 #endif
@@ -47,6 +49,18 @@ void FlushLines(const void* address, std::uint64_t bytes) {
   const auto end = reinterpret_cast<std::uintptr_t>(address) + bytes;
   for (auto line = first; line < end; line += 64U)
     asm volatile("dc civac, %0" :: "r"(line) : "memory");
+#endif
+}
+
+void CleanLines(const void* address, std::uint64_t bytes) {
+#if defined(KVAF_AICPU_URMA_HOST_TEST)
+  (void)address;
+  (void)bytes;
+#else
+  const auto first = reinterpret_cast<std::uintptr_t>(address) & ~std::uintptr_t{63};
+  const auto end = reinterpret_cast<std::uintptr_t>(address) + bytes;
+  for (auto line = first; line < end; line += 64U)
+    asm volatile("dc cvac, %0" :: "r"(line) : "memory");
 #endif
 }
 
@@ -230,9 +244,14 @@ std::uint32_t SubmitScatter(const Entity& entity, Queue& queue,
       const auto slot = (producer + block) % entity.sq_depth;
       auto* destination = reinterpret_cast<void*>(entity.sq_va + slot * 64U);
       std::memcpy(destination, &words[block * 16U], 64U);
-      FlushLines(destination, 64U);
     }
     producer += wqebbs;
+  }
+  for (std::uint64_t block = queue.sq_producer_index; block < producer;) {
+    const auto slot = block % entity.sq_depth;
+    const auto count = std::min<std::uint64_t>(producer - block, entity.sq_depth - slot);
+    CleanLines(reinterpret_cast<void*>(entity.sq_va + slot * 64U), count * 64U);
+    block += count;
   }
   Barrier();
   queue.sq_producer_index = producer;
@@ -471,6 +490,10 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
   }
   const std::uint64_t scratch_offset =
       (args->output_extent + 63U) & ~std::uint64_t{63U};
+  const bool direct = args->source_span_count != 0U ||
+                      args->remote_descriptor != 0U;
+  const std::uint64_t source_bytes =
+      kvaf::peer::GatherDescriptorBytes(args->source_span_count);
   if (!Valid(entity, queue) || entity.local_token_id == 0U ||
       args->sequence == 0U || args->bytes == 0U ||
       args->bytes > UINT32_MAX - kvaf::aicpu_urma::kGatherScratchBytes ||
@@ -488,7 +511,18 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
       !InRange(entity.remote_host_ddr_address, entity.remote_host_ddr_size,
                args->remote_notify, 8U) ||
       !InRange(entity.remote_host_ddr_address, entity.remote_host_ddr_size,
-               args->remote_ack, sizeof(kvaf::peer::GatherControl) - 8U)) {
+               args->remote_ack, sizeof(kvaf::peer::GatherControl) - 8U) ||
+      (direct && (args->sequence >= kvaf::peer::kGatherErrorBit ||
+                  args->source_span_count == 0U ||
+                  args->source_span_count > 65536U ||
+                  args->remote_descriptor == 0U ||
+                  args->source_descriptor < args->output ||
+                  args->source_descriptor - args->output != scratch_offset +
+                      kvaf::aicpu_urma::kGatherScratchBytes ||
+                  !InRange(entity.local_hbm_address, entity.local_hbm_size,
+                           args->source_descriptor, source_bytes) ||
+                  !InRange(entity.remote_host_ddr_address, entity.remote_host_ddr_size,
+                           args->remote_descriptor, source_bytes)))) {
     Flush(&status, sizeof(status));
     return 1U;
   }
@@ -513,13 +547,34 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
     return 1U;
   }
   Initialize(queue);
+  status.result = 0U;
   const auto scratch = args->output + scratch_offset;
   auto* ack = reinterpret_cast<std::uint64_t*>(scratch + 8U);
   *ack = 0U;
-  *reinterpret_cast<std::uint64_t*>(scratch + 16U) = args->sequence;
+  *reinterpret_cast<std::uint64_t*>(scratch + 16U) =
+      direct ? args->remote_descriptor : args->sequence;
   Flush(reinterpret_cast<void*>(scratch), kvaf::aicpu_urma::kGatherScratchBytes);
-  status.phase = 1U;
   std::uint32_t cqe_word = 0U;
+  if (direct) {
+    status.phase = 1U;
+    const auto source_start_ns = NowNs();
+    Flush(reinterpret_cast<void*>(args->source_descriptor), source_bytes);
+    const Transfer descriptor{args->remote_descriptor, args->source_descriptor,
+                              static_cast<std::uint32_t>(source_bytes), entity.local_token_id};
+    status.result = Submit(entity, queue, &descriptor, 1U,
+                           kvaf::aicpu_urma::kWriteOpcode, &cqe_word, nullptr,
+                           &status.source_write_post_ns, &status.source_write_cq_ns);
+    status.source_write_ns = NowNs() - source_start_ns;
+    status.cqe_word = cqe_word;
+  }
+  if (status.result != 0U) {
+    status.sq_producer_index = queue.sq_producer_index;
+    status.cq_consumer_index = queue.cq_consumer_index;
+    Flush(&queue, sizeof(queue));
+    Flush(&status, sizeof(status));
+    return 1U;
+  }
+  status.phase = direct ? 2U : 1U;
   const auto notify_start_ns = NowNs();
   status.result = SubmitNotify(entity, queue, args->remote_command,
                                args->remote_notify, scratch + 16U, args->sequence,
@@ -528,7 +583,7 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
   status.notify_ns = NowNs() - notify_start_ns;
   status.cqe_word = cqe_word;
   if (status.result == 0U) {
-    status.phase = 2U;
+    status.phase = direct ? 3U : 2U;
     const Transfer check{args->remote_ack, scratch + 8U,
                          sizeof(kvaf::peer::GatherControl) - 8U,
                          entity.local_token_id};
@@ -550,9 +605,13 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
       Flush(ack, check.length);
       status.ack_cache_ns += NowNs() - postflush_start_ns;
       status.ack_seen = *ack;
-      if (status.ack_seen == args->sequence) break;
+      if (status.ack_seen == args->sequence ||
+          status.ack_seen == (args->sequence | kvaf::peer::kGatherErrorBit)) break;
     }
     status.ack_poll_ns = NowNs() - ack_start_ns;
+    if (status.result == 0U &&
+        status.ack_seen == (args->sequence | kvaf::peer::kGatherErrorBit))
+      status.result = 10U;
     if (status.result == 0U && status.ack_seen == args->sequence)
       std::memcpy(&status.cpu, reinterpret_cast<const void*>(scratch + 24U),
                   sizeof(status.cpu));
@@ -560,7 +619,7 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
       status.result = 9U;
   }
   if (status.result == 0U) {
-    status.phase = 3U;
+    status.phase = direct ? 4U : 3U;
     const std::uint32_t wqe_sgl_size = args->sgl_size < kvaf::kGatherMaxSglSize
         ? args->sgl_size : kvaf::kGatherMaxSglSize;
     const auto preflush_start_ns = NowNs();
@@ -569,7 +628,9 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
                  output_spans[index].length);
     Barrier();
     status.scatter_cache_ns = NowNs() - preflush_start_ns;
-    kvaf::aicpu_urma::ScatterTransfer data[32]{};
+    kvaf::aicpu_urma::ScatterTransfer data[64]{};
+    const std::uint32_t max_batch = kvaf::aicpu_urma::MaxScatterBatch(entity.sq_depth);
+    if (max_batch == 0U) status.result = 6U;
     std::uint32_t batch_count = 0U;
     std::uint32_t span_index = 0U;
     std::uint32_t span_offset = 0U;
@@ -597,7 +658,7 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
         }
       }
       ++batch_count;
-      if (batch_count == 32U || span_index == args->output_span_count) {
+      if (batch_count == max_batch || span_index == args->output_span_count) {
         status.scatter_plan_ns += NowNs() - plan_start_ns;
         status.read_wqes += batch_count;
         std::uint64_t post_ns = 0U;

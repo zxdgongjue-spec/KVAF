@@ -14,6 +14,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <fcntl.h>
@@ -216,6 +217,9 @@ struct NpuRuntime::Impl {
 #endif
   bool hbm_mode{false};
   void* probe_buffer{nullptr};
+  std::mutex gather_mutex;
+  std::uint64_t gather_sequence{0U};
+  bool direct_gather_enabled{false};
 };
 
 NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {
@@ -395,6 +399,7 @@ Status NpuRuntime::InitializeHbmService() {
 }
 
 Status NpuRuntime::GatherRead(const CpuGatherReadRequest& request) {
+  std::lock_guard<std::mutex> lock(impl_->gather_mutex);
   if (request.timing != nullptr) *request.timing = {};
   const auto validate_start = std::chrono::steady_clock::now();
   if (!initialized() || impl_->hbm_mode || impl_->peer_link == nullptr ||
@@ -405,7 +410,8 @@ Status NpuRuntime::GatherRead(const CpuGatherReadRequest& request) {
     return Status::InvalidArgument("GatherRead requires a caller-owned HBM output and ACL stream");
   const auto& region = impl_->runtime_core->remote_region();
   std::uint32_t total_bytes = 0U;
-  if (!peer::ValidateGather(region.base, region.length, request.staging_address,
+  if (request.spans.size() > peer::kMaxGatherSpans ||
+      !peer::ValidateGather(region.base, region.length, request.staging_address,
                             request.spans, &total_bytes))
     return Status::InvalidArgument("invalid GatherRead source or staging layout");
   std::vector<GatherOutputSpan> contiguous_output;
@@ -423,8 +429,37 @@ Status NpuRuntime::GatherRead(const CpuGatherReadRequest& request) {
         std::chrono::steady_clock::now() - validate_start).count();
   peer::GatherReady ready{};
   const auto configure_start = std::chrono::steady_clock::now();
-  Status status = impl_->peer_link->ConfigureGather(region.base, request.staging_address,
-                                                    request.spans, &ready);
+  const bool direct = request.source_descriptor_address != 0U;
+  Status status = Status::OK();
+  if (direct) {
+    const auto descriptor_bytes = peer::GatherDescriptorBytes(request.spans.size());
+    const auto descriptor = request.source_descriptor_address;
+    if (descriptor % 64U != 0U ||
+        !peer::GatherRange(region.base, peer::GatherControlOffset(region.length),
+                           descriptor, descriptor_bytes) ||
+        (descriptor < request.staging_address + total_bytes &&
+         request.staging_address < descriptor + descriptor_bytes))
+      return Status::InvalidArgument("invalid GatherRead source descriptor mailbox");
+    for (const auto& span : request.spans)
+      if (descriptor < span.address + span.length &&
+          span.address < descriptor + descriptor_bytes)
+        return Status::InvalidArgument("GatherRead descriptor mailbox overlaps a source");
+    if (!impl_->direct_gather_enabled) {
+      status = impl_->peer_link->EnableDirectGather(region.base);
+      if (status.ok()) impl_->direct_gather_enabled = true;
+    }
+    if (status.ok()) {
+      if (impl_->gather_sequence == peer::kGatherErrorBit - 1U)
+        return Status::InvalidState("GatherRead direct sequence exhausted");
+      const auto control = region.base + peer::GatherControlOffset(region.length);
+      ready = {++impl_->gather_sequence, control + 16U, control, control + 8U, total_bytes};
+    }
+  } else if (impl_->direct_gather_enabled) {
+    return Status::InvalidState("direct GatherRead requires a source descriptor mailbox");
+  } else {
+    status = impl_->peer_link->ConfigureGather(region.base, request.staging_address,
+                                                request.spans, &ready);
+  }
   if (request.timing != nullptr)
     request.timing->configure_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - configure_start).count();
@@ -433,7 +468,9 @@ Status NpuRuntime::GatherRead(const CpuGatherReadRequest& request) {
       request.output, output_spans.data(),
       static_cast<std::uint32_t>(output_spans.size()), request.sgl_size,
       output_extent, request.staging_address, ready.command_address,
-      ready.notify_address, ready.ack_address, ready.sequence,
+      ready.notify_address, ready.ack_address, request.source_descriptor_address,
+      direct ? request.spans.data() : nullptr,
+      direct ? static_cast<std::uint32_t>(request.spans.size()) : 0U, ready.sequence,
       ready.total_bytes, request.stream, request.timing});
 }
 
@@ -501,9 +538,14 @@ Status NpuRuntime::Shutdown() {
     return impl_->hbm_service != nullptr ? impl_->hbm_service->Shutdown() : Status::OK();
   }
 #endif
+  std::lock_guard<std::mutex> lock(impl_->gather_mutex);
   const Status status = impl_->runtime_core != nullptr && impl_->runtime_core->initialized()
                             ? impl_->runtime_core->Shutdown()
                             : Status::OK();
+  if (status.ok()) {
+    impl_->direct_gather_enabled = false;
+    impl_->gather_sequence = 0U;
+  }
   impl_->ReleaseProbe();
   return status;
 }

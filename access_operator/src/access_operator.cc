@@ -16,6 +16,7 @@
 #include "kvaf_aiv_batch_get.h"
 #include "meta_manager.h"
 #if defined(KVAF_ENABLE_AICPU_URMA)
+#include "cpu_gather.h"
 #include "host.h"
 #endif
 
@@ -314,6 +315,7 @@ struct DefaultAccessOperator::Impl {
 #if defined(KVAF_ENABLE_AICPU_URMA)
   void* gather_output_spans{nullptr};
   std::size_t gather_output_spans_capacity{0U};
+  std::vector<std::uint8_t> gather_source_metadata;
 #endif
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   KvafBatchPutTransport* batch_put_transport{nullptr};
@@ -588,6 +590,15 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
   if (scratch_offset > request.output.bytes ||
       request.output.bytes - scratch_offset < aicpu_urma::kGatherScratchBytes)
     return InvalidArgument("GatherRead output requires 64-byte HBM scratch");
+  const bool direct = request.remote_descriptor != 0U;
+  const auto source_bytes = peer::GatherDescriptorBytes(request.source_span_count);
+  const std::uint64_t source_offset =
+      scratch_offset + aicpu_urma::kGatherScratchBytes;
+  if (direct && (request.source_spans == nullptr || request.source_span_count == 0U ||
+                 request.sequence == 0U ||
+                 source_offset > request.output.bytes ||
+                 source_bytes > request.output.bytes - source_offset))
+    return InvalidArgument("GatherRead direct mode requires HBM descriptor storage");
   const auto descriptor_start = std::chrono::steady_clock::now();
   const std::size_t descriptor_bytes =
       static_cast<std::size_t>(request.output_span_count) * sizeof(GatherOutputSpan);
@@ -605,6 +616,23 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
     return Internal("failed to upload GatherRead HBM SGL descriptors");
   if (request.timing != nullptr)
     request.timing->descriptor_upload_ns = elapsed_ns(descriptor_start);
+  if (direct) {
+    const auto source_start = std::chrono::steady_clock::now();
+    impl_->gather_source_metadata.resize(source_bytes);
+    const peer::GatherDescriptorHeader header{
+        peer::kGatherDescriptorMagic, request.sequence, request.remote_staging,
+        request.source_span_count, request.bytes};
+    std::memcpy(impl_->gather_source_metadata.data(), &header, sizeof(header));
+    std::memcpy(impl_->gather_source_metadata.data() + sizeof(header),
+                request.source_spans,
+                request.source_span_count * sizeof(peer::GatherSpan));
+    auto* destination = static_cast<std::uint8_t*>(request.output.data) + source_offset;
+    if (aclrtMemcpy(destination, source_bytes, impl_->gather_source_metadata.data(),
+                    source_bytes, ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS)
+      return Internal("failed to upload GatherRead source descriptors");
+    if (request.timing != nullptr)
+      request.timing->source_upload_ns = elapsed_ns(source_start);
+  }
   KvafBatchGetLocalBuffer* local_buffer = nullptr;
   std::uint64_t channel_entity = 0U;
   const auto register_start = std::chrono::steady_clock::now();
@@ -620,6 +648,10 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
   arguments.core_status = reinterpret_cast<std::uint64_t>(impl_->execution.status);
   arguments.output = reinterpret_cast<std::uint64_t>(request.output.data);
   arguments.output_spans = reinterpret_cast<std::uint64_t>(impl_->gather_output_spans);
+  arguments.source_descriptor = direct
+      ? reinterpret_cast<std::uint64_t>(request.output.data) + source_offset : 0U;
+  arguments.remote_descriptor = request.remote_descriptor;
+  arguments.source_span_count = direct ? request.source_span_count : 0U;
   arguments.output_span_count = request.output_span_count;
   arguments.sgl_size = request.sgl_size;
   arguments.output_extent = request.output_extent;
@@ -654,6 +686,9 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
       device_status.magic == aicpu_urma::kGatherStatusMagic &&
       device_status.sequence == request.sequence) {
     request.timing->notify_ns = device_status.notify_ns;
+    request.timing->source_write_ns = device_status.source_write_ns;
+    request.timing->source_write_post_ns = device_status.source_write_post_ns;
+    request.timing->source_write_cq_ns = device_status.source_write_cq_ns;
     request.timing->notify_post_ns = device_status.notify_post_ns;
     request.timing->notify_cq_ns = device_status.notify_cq_ns;
     request.timing->ack_poll_ns = device_status.ack_poll_ns;

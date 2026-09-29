@@ -84,6 +84,7 @@ using kvaf::peer::CreateChannelRequest;
 using kvaf::peer::CreateChannelResponse;
 using kvaf::peer::ConfigureGatherRequest;
 using kvaf::peer::ConfigureGatherResponse;
+using kvaf::peer::EnableDirectGatherRequest;
 using kvaf::peer::GatherSpan;
 using kvaf::peer::GatherSpanWire;
 using kvaf::peer::IsValidHeader;
@@ -424,19 +425,20 @@ class CpuGatherWorker {
   CpuGatherWorker(void* memory, uint64_t base, uint64_t bytes,
                   std::size_t gather_threads,
                   std::size_t min_bytes_per_thread, bool gather_affinity,
-                  bool gather_active)
-      : base_(base), bytes_(bytes),
+                  bool gather_active, bool direct = false)
+      : memory_(static_cast<uint8_t*>(memory)), base_(base), bytes_(bytes),
         control_(reinterpret_cast<peer::GatherControl*>(
             static_cast<uint8_t*>(memory) + peer::GatherControlOffset(bytes))),
         team_(memory, base, gather_threads, min_bytes_per_thread,
               gather_active ? peer::GatherWaitMode::kActive
                             : peer::GatherWaitMode::kPassive,
               gather_affinity),
-        max_threads_(team_.max_threads()), gather_active_(gather_active) {
+        max_threads_(team_.max_threads()), gather_active_(gather_active), direct_(direct) {
     std::memset(control_, 0, sizeof(*control_));
     CacheGatherControlLine(control_, false);
     peer::GatherBarrier();
-    worker_ = std::thread(&CpuGatherWorker::Run, this);
+    worker_ = std::thread(direct ? &CpuGatherWorker::RunDirect
+                                 : &CpuGatherWorker::Run, this);
   }
 
   ~CpuGatherWorker() {
@@ -448,6 +450,7 @@ class CpuGatherWorker {
   bool Configure(uint64_t staging, const std::vector<GatherSpan>& spans,
                  std::uint32_t total_bytes,
                  ConfigureGatherResponse* response) {
+    if (direct_) return false;
     std::lock_guard<std::mutex> lock(mutex_);
     if (scheduled_ != completed_ || scheduled_ == UINT64_MAX) return false;
     spans_ = spans;
@@ -512,6 +515,84 @@ class CpuGatherWorker {
     }
   }
 
+  void RunDirect() {
+    team_.BindWorker(0U);
+    std::uint64_t last_sequence = 0U;
+    std::uint64_t wait_start_ns = NowNs();
+    while (!stop_.load(std::memory_order_acquire)) {
+      CacheGatherControlLine(control_, true);
+      peer::GatherBarrier();
+      const auto sequence = __atomic_load_n(&control_->notify, __ATOMIC_ACQUIRE);
+      if (sequence == 0U || sequence == last_sequence ||
+          (sequence & peer::kGatherErrorBit) != 0U) {
+        peer::GatherSpinPause();
+        continue;
+      }
+      last_sequence = sequence;
+      peer::GatherCpuProfile profile{};
+      profile.notify_spin_ns = NowNs() - wait_start_ns;
+      const auto descriptor_start_ns = NowNs();
+      const auto address = __atomic_load_n(&control_->command, __ATOMIC_ACQUIRE);
+      bool valid = address % 64U == 0U &&
+          peer::GatherRange(base_, peer::GatherControlOffset(bytes_), address,
+                            sizeof(peer::GatherDescriptorHeader));
+      peer::GatherDescriptorHeader header{};
+      if (valid) {
+        auto* descriptor = memory_ + (address - base_);
+        CacheGatherControlLine(descriptor, true);
+        peer::GatherBarrier();
+        std::memcpy(&header, descriptor, sizeof(header));
+        valid = header.magic == peer::kGatherDescriptorMagic &&
+            header.sequence == sequence && header.span_count != 0U &&
+            header.span_count <= peer::kMaxGatherSpans &&
+            header.total_bytes != 0U &&
+            peer::GatherRange(base_, peer::GatherControlOffset(bytes_), address,
+                              peer::GatherDescriptorBytes(header.span_count));
+        if (valid) {
+          const auto descriptor_bytes = peer::GatherDescriptorBytes(header.span_count);
+          for (std::uint64_t offset = 64U; offset < descriptor_bytes; offset += 64U)
+            CacheGatherControlLine(descriptor + offset, true);
+          peer::GatherBarrier();
+          try {
+            spans_.resize(header.span_count);
+            std::memcpy(spans_.data(), descriptor + sizeof(header),
+                        header.span_count * sizeof(GatherSpan));
+            valid = peer::ValidateDirectGather(base_, bytes_, address, header, spans_);
+            if (valid) {
+              const auto threads = team_.Prepare(header.staging_address, spans_,
+                                                 header.total_bytes);
+              if (threads != reported_threads_) {
+                Log("[KVAF_CPU] GATHER_THREADS active=%zu max=%zu bytes=%u mode=%s transport=urma\n",
+                    threads, max_threads_, header.total_bytes,
+                    gather_active_ ? "active" : "passive");
+                reported_threads_ = threads;
+              }
+            }
+          } catch (const std::exception& error) {
+            Log("[KVAF_CPU] GATHER_DIRECT_PREPARE_FAILED reason=%s\n", error.what());
+            valid = false;
+          }
+        }
+      }
+      profile.source_cache_ns = NowNs() - descriptor_start_ns;
+      if (valid) {
+        const auto copy_start_ns = NowNs();
+        team_.Copy();
+        profile.copy_ns = NowNs() - copy_start_ns;
+      } else {
+        Log("[KVAF_CPU] GATHER_DIRECT_DESCRIPTOR_INVALID sequence=%" PRIu64
+            " address=0x%" PRIx64 "\n", sequence, address);
+      }
+      control_->profile = profile;
+      __atomic_store_n(&control_->ack,
+                       sequence | (valid ? 0U : peer::kGatherErrorBit), __ATOMIC_RELEASE);
+      CacheGatherControlLine(control_, false);
+      peer::GatherBarrier();
+      wait_start_ns = NowNs();
+    }
+  }
+
+  uint8_t* memory_;
   uint64_t base_;
   uint64_t bytes_;
   peer::GatherControl* control_;
@@ -522,6 +603,7 @@ class CpuGatherWorker {
   peer::CpuGatherTeam team_;
   std::size_t max_threads_{0U};
   bool gather_active_{true};
+  bool direct_{false};
   std::size_t reported_threads_{0U};
   std::uint64_t scheduled_at_ns_{0U};
   uint64_t scheduled_{0U};
@@ -733,6 +815,22 @@ class CpuService {
       return Result::kResourceError;
     }
     response->total_bytes = total_bytes;
+    return Result::kOk;
+  }
+
+  Result EnableDirectGather(uint64_t session_id) {
+    const auto found = regions_.find(session_id);
+    if (found == regions_.end()) return Result::kNotFound;
+    Region& region = *found->second;
+    if (region.gather != nullptr) return Result::kResourceError;
+    try {
+      region.gather = std::make_unique<CpuGatherWorker>(
+          region.memory, region.base, region.bytes, gather_threads_,
+          min_bytes_per_thread_, gather_affinity_, gather_active_, true);
+    } catch (const std::exception& error) {
+      Log("[KVAF_CPU] GATHER_DIRECT_ENABLE_FAILED reason=%s\n", error.what());
+      return Result::kResourceError;
+    }
     return Result::kOk;
   }
 
@@ -955,6 +1053,18 @@ void HandleClient(int fd, CpuService* service) {
       response.result = static_cast<int32_t>(service->ConfigureGather(
           request.session_id, request.staging_address, spans, &response));
       (void)WriteAll(fd, &response, sizeof(response));
+      return;
+    }
+    case Command::kEnableDirectGather: {
+      EnableDirectGatherRequest request{};
+      request.header = header;
+      if (!IsValidHeader(header, command, sizeof(request)) ||
+          !ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header),
+                   sizeof(request) - sizeof(header))) {
+        SendStatus(fd, command, Result::kInvalidRequest);
+        return;
+      }
+      SendStatus(fd, command, service->EnableDirectGather(request.session_id));
       return;
     }
     case Command::kAllocateHbmRegion:

@@ -49,4 +49,20 @@ int main() {
   assert(report.find("GATHER_READ_TECHNICAL avg_ns") != std::string::npos);
   assert(report.find("configure_rpc=2000") != std::string::npos);
   assert(report.find("read_wqes=7.00") != std::string::npos);
+
+  std::FILE* direct_output = std::tmpfile();
+  assert(direct_output != nullptr);
+  first.source_write_ns = 8000U;
+  first.source_upload_ns = 5000U;
+  first.cpu_source_cache_ns = 3000U;
+  kvaf::aicpu_gather_read_client::PrintGatherReadTimeline(direct_output, 1.5, {first});
+  std::rewind(direct_output);
+  std::string direct_report;
+  while ((bytes = std::fread(buffer, 1U, sizeof(buffer), direct_output)) != 0U)
+    direct_report.append(buffer, bytes);
+  std::fclose(direct_output);
+  assert(direct_report.find("Upload DDR source list to HBM: 5.000 us") != std::string::npos);
+  assert(direct_report.find("AICPU WRITE source list to CPU DDR: 8.000 us") != std::string::npos);
+  assert(direct_report.find("CPU read and prepare source list: 3.000 us") != std::string::npos);
+  assert(direct_report.find("Send DDR source list to CPU:") == std::string::npos);
 }

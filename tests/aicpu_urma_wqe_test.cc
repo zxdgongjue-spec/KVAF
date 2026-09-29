@@ -57,6 +57,9 @@ int main() {
   assert(kvaf::aicpu_urma::ScatterWqebbs(2U) == 2U);
   assert(kvaf::aicpu_urma::ScatterWqebbs(5U) == 2U);
   assert(kvaf::aicpu_urma::ScatterWqebbs(kvaf::kGatherMaxSglSize) == 3U);
+  assert(kvaf::aicpu_urma::MaxScatterBatch(2U) == 0U);
+  assert(kvaf::aicpu_urma::MaxScatterBatch(64U) == 21U);
+  assert(kvaf::aicpu_urma::MaxScatterBatch(8192U) == 64U);
   kvaf::aicpu_urma::ScatterTransfer scatter{};
   scatter.remote_address = 0x1122334455667788ULL;
   scatter.sge_count = kvaf::kGatherMaxSglSize;
