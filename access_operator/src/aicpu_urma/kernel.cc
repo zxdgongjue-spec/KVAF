@@ -202,6 +202,18 @@ std::uint32_t SubmitNotify(const Entity& entity, Queue& queue,
   return result;
 }
 
+template <typename Entity>
+void WriteSqBlocks(const Entity& entity, std::uint64_t producer,
+                   const std::uint32_t* words, std::uint32_t blocks) {
+  const auto slot = static_cast<std::uint32_t>(producer % entity.sq_depth);
+  const auto first = std::min(blocks, entity.sq_depth - slot);
+  std::memcpy(reinterpret_cast<void*>(entity.sq_va + slot * 64U),
+              words, first * 64U);
+  if (first < blocks)
+    std::memcpy(reinterpret_cast<void*>(entity.sq_va), words + first * 16U,
+                (blocks - first) * 64U);
+}
+
 template <typename Entity, typename Queue>
 std::uint32_t SubmitScatter(const Entity& entity, Queue& queue,
                             const kvaf::aicpu_urma::ScatterTransfer* transfers,
@@ -223,20 +235,25 @@ std::uint32_t SubmitScatter(const Entity& entity, Queue& queue,
   std::memcpy(endpoint.remote_eid, entity.remote_eid, sizeof(endpoint.remote_eid));
   const auto post_start_ns = NowNs();
   std::uint64_t producer = queue.sq_producer_index;
+  constexpr std::uint32_t kStagingBlocks = 8U * kvaf::aicpu_urma::kMaxScatterWqebbs;
+  std::uint32_t words[kStagingBlocks * 16U];
+  std::uint32_t staged_blocks = 0U;
+  std::uint64_t staged_producer = producer;
   for (std::uint32_t index = 0U; index < count; ++index) {
-    std::uint32_t words[kvaf::aicpu_urma::kMaxScatterWqebbs * 16U];
+    const auto wqebbs = kvaf::aicpu_urma::ScatterWqebbs(transfers[index].sge_count);
+    if (staged_blocks + wqebbs > kStagingBlocks) {
+      WriteSqBlocks(entity, staged_producer, words, staged_blocks);
+      staged_producer = producer;
+      staged_blocks = 0U;
+    }
     kvaf::aicpu_urma::EncodeScatterReadWqe(
-        words, endpoint, transfers[index],
+        words + staged_blocks * 16U, endpoint, transfers[index],
         static_cast<std::uint32_t>((producer / entity.sq_depth) & 1U),
         index + 1U == count);
-    const auto wqebbs = kvaf::aicpu_urma::ScatterWqebbs(transfers[index].sge_count);
-    for (std::uint32_t block = 0U; block < wqebbs; ++block) {
-      const auto slot = (producer + block) % entity.sq_depth;
-      auto* destination = reinterpret_cast<void*>(entity.sq_va + slot * 64U);
-      std::memcpy(destination, &words[block * 16U], 64U);
-    }
+    staged_blocks += wqebbs;
     producer += wqebbs;
   }
+  if (staged_blocks != 0U) WriteSqBlocks(entity, staged_producer, words, staged_blocks);
   Barrier();
   queue.sq_producer_index = producer;
   Ring(reinterpret_cast<volatile std::uint32_t*>(entity.sq_db_va),

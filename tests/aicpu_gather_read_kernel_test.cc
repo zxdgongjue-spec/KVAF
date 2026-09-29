@@ -302,8 +302,108 @@ void TestUrmaDescriptorGather() {
   assert(status.result == 2U && sq_doorbell == 7U);
 }
 
+void TestScatterStagingBoundary() {
+  alignas(64) std::array<std::uint8_t, 512> remote{};
+  std::array<std::uint8_t, 256> output{};
+  output.fill(0xa5U);
+  std::array<std::uint32_t, 128U * 16U> sq{};
+  std::array<std::uint32_t, 512> cq{};
+  std::array<kvaf::GatherOutputSpan, 25> targets{};
+  for (std::uint32_t index = 0U; index < targets.size(); ++index) {
+    remote[256U + index] = static_cast<std::uint8_t>(index + 1U);
+    targets[index] = {index * 2U, 1U, 0U};
+  }
+  std::uint32_t sq_doorbell = 124U;
+  std::uint32_t cq_doorbell = 0U;
+  const auto base = reinterpret_cast<std::uint64_t>(remote.data());
+  KvafBatchGetDirectUrmaEntity entity{};
+  entity.magic = 0x4b564155U;
+  entity.version = 1U;
+  entity.remote_host_ddr_address = base;
+  entity.remote_host_ddr_size = remote.size();
+  entity.remote_token_id = 3U;
+  entity.remote_token_value = 4U;
+  entity.local_hbm_address = reinterpret_cast<std::uint64_t>(output.data());
+  entity.local_hbm_size = output.size();
+  entity.local_token_id = 7U;
+  entity.sq_va = reinterpret_cast<std::uint64_t>(sq.data());
+  entity.sq_db_va = reinterpret_cast<std::uint64_t>(&sq_doorbell);
+  entity.sq_depth = 128U;
+  entity.wqe_size = 64U;
+  entity.cq_va = reinterpret_cast<std::uint64_t>(cq.data());
+  entity.cq_db_va = reinterpret_cast<std::uint64_t>(&cq_doorbell);
+  entity.cq_depth = 64U;
+  entity.cqe_size = 32U;
+  entity.tp_id = 5U;
+  KvafBatchGetQueueState queue{};
+  queue.magic = 0x4b564151U;
+  queue.initialized = 1U;
+  queue.sq_producer_index = 124U;
+  kvaf::aicpu_urma::GatherReadStatus status{};
+  kvaf::aicpu_urma::GatherReadArgs args{};
+  args.channel_entity = reinterpret_cast<std::uint64_t>(&entity);
+  args.queue_state = reinterpret_cast<std::uint64_t>(&queue);
+  args.core_status = reinterpret_cast<std::uint64_t>(&status);
+  args.output = entity.local_hbm_address;
+  args.output_spans = reinterpret_cast<std::uint64_t>(targets.data());
+  args.output_extent = 49U;
+  args.output_span_count = targets.size();
+  args.sgl_size = 1U;
+  args.bytes = targets.size();
+  args.sequence = 1U;
+  args.remote_staging = base + 256U;
+  args.remote_notify = base + 448U;
+  args.remote_ack = base + 456U;
+  args.remote_command = base + 464U;
+
+  std::atomic<bool> stopped{false};
+  std::thread hardware([&] {
+    std::uint32_t producer = 124U;
+    std::uint32_t completion = 0U;
+    while (producer < 152U && !stopped.load(std::memory_order_acquire)) {
+      if (__atomic_load_n(&sq_doorbell, __ATOMIC_ACQUIRE) == producer) {
+        std::this_thread::yield();
+        continue;
+      }
+      std::uint32_t words[32]{};
+      const auto* first = sq.data() + (producer % entity.sq_depth) * 16U;
+      const auto opcode = (first[1] >> 8U) & 0xffU;
+      const auto blocks = opcode == kvaf::aicpu_urma::kWriteWithNotifyOpcode ? 2U : 1U;
+      for (std::uint32_t block = 0U; block < blocks; ++block)
+        std::memcpy(words + block * 16U,
+                    sq.data() + ((producer + block) % entity.sq_depth) * 16U, 64U);
+      const auto address = [](std::uint32_t low, std::uint32_t high) {
+        return static_cast<std::uint64_t>(low) | (static_cast<std::uint64_t>(high) << 32U);
+      };
+      if (opcode == kvaf::aicpu_urma::kWriteWithNotifyOpcode) {
+        const auto sequence = address(words[16], words[17]);
+        std::memcpy(reinterpret_cast<void*>(args.remote_notify), &sequence, 8U);
+        std::memcpy(reinterpret_cast<void*>(args.remote_ack), &sequence, 8U);
+      } else {
+        assert(opcode == kvaf::aicpu_urma::kReadOpcode);
+        std::memcpy(reinterpret_cast<void*>(address(words[14], words[15])),
+                    reinterpret_cast<const void*>(address(words[10], words[11])), words[12]);
+      }
+      producer += blocks;
+      if ((words[0] & (1U << 19U)) != 0U)
+        __atomic_store_n(&cq[completion++ * 8U], 4U, __ATOMIC_RELEASE);
+    }
+  });
+  const auto result = KvafAicpuUrmaGatherRead(&args);
+  stopped.store(true, std::memory_order_release);
+  hardware.join();
+  assert(result == 0U && status.result == 0U);
+  assert(status.read_wqes == targets.size() && status.sq_producer_index == 152U);
+  assert(status.cq_consumer_index == 3U && cq_doorbell == 3U);
+  for (std::uint32_t index = 0U; index < targets.size(); ++index) {
+    assert(output[index * 2U] == index + 1U);
+    assert(output[index * 2U + 1U] == 0xa5U);
+  }
+}
+
 int main() {
   TestRpcGather();
   TestUrmaDescriptorGather();
+  TestScatterStagingBoundary();
   std::cout << "AICPU gather/read kernel simulation: PASS\n";
 }

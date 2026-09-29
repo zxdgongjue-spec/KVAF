@@ -90,11 +90,11 @@ inline void EncodeWqe(std::uint32_t (&words)[16], const Endpoint& endpoint,
   words[15] = static_cast<std::uint32_t>(transfer.local_address >> 32U);
 }
 
-inline void EncodeScatterReadWqe(std::uint32_t (&words)[kMaxScatterWqebbs * 16U],
+inline void EncodeScatterReadWqe(std::uint32_t* words,
                                  const Endpoint& endpoint,
                                  const ScatterTransfer& transfer,
                                  std::uint32_t owner, bool completion) {
-  std::memset(words, 0, sizeof(words));
+  std::memset(words, 0, ScatterWqebbs(transfer.sge_count) * kWqeBytes);
   const std::uint32_t place_order = completion ? 2U : 1U;
   words[0] = (place_order << 16U) | (1U << 18U) |
              (static_cast<std::uint32_t>(completion) << 19U) | (1U << 20U) |

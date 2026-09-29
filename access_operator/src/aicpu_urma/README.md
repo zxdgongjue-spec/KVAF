@@ -93,6 +93,11 @@ WQEBB；队列深度允许时每 64 条 WQE 在末条请求 CQE。单条 WQE 的
 不支持跨独立 HBM 分配的 SGL。未指定 `source_descriptor_address` 的旧调用仍使用
 每轮配置 RPC；一个 DDR region 不得混用两种模式。
 
+GatherRead 的 READ WQE 先在 AICPU 本地以最多 24 个 WQEBB 为一组编码，
+再按 SQ 环绕位置批量写入；原有的每个提交批次仍只敲一次 doorbell、等待一次 CQE。
+当前 GatherRead 使用一个 AICPU core 和一套 SQ/CQ。多核并行需要按 core
+分配独立队列和 jetty，不能让多个 core 共用 SQ producer index。
+
 GatherRead 仅在每次轮询 AICPU CQE 前清理并失效对应缓存行；CPU 通知、ack、
 descriptor、源 DDR、staging 和 AICPU 的描述符、SQ、HBM 输出、状态缓冲
 均不执行显式缓存行维护。仍保留内存屏障以保证提交与完成的顺序。其余缓冲区

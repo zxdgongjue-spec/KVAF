@@ -91,6 +91,11 @@ int main() {
        scatter.sges[0].length, scatter.sges[0].token_id},
       kvaf::aicpu_urma::kReadOpcode, 0U, true);
   assert(std::memcmp(scatter_words, single_read, sizeof(single_read)) == 0);
+  std::uint32_t compact_words[17];
+  for (auto& word : compact_words) word = 0xfeedfaceU;
+  kvaf::aicpu_urma::EncodeScatterReadWqe(compact_words, endpoint, scatter, 0U, true);
+  assert(std::memcmp(compact_words, single_read, sizeof(single_read)) == 0);
+  assert(compact_words[16] == 0xfeedfaceU);
   assert(kvaf::aicpu_urma::InRange(0x1000, 0x100, 0x1080, 0x80));
   assert(!kvaf::aicpu_urma::InRange(0x1000, 0x100, 0x1080, 0x81));
   assert(!kvaf::aicpu_urma::InRange(0x1000, 0x100, 0xfff, 1));
