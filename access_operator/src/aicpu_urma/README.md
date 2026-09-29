@@ -99,11 +99,12 @@ CPU worker 仅对通知、ack 和 descriptor mailbox 的缓存行做 `dc civac`/
 执行内存屏障。数据区正确性依赖目标平台的 CPU DDR 与 URMA DMA 一致性，
 目前不能从注册参数推断这一点；更新后须在真实设备上以每轮变化的数据验证。
 这里没有使用 OpenMP：
-CPU worker 使用常驻 `std::thread`。默认 `--gather-mode adaptive`：主线程在
-完成一轮后主动轮询约 100 us，随后定时休眠；辅助线程也先自旋约 100 us，之后
-等待下一次准备通知。这样避免两轮之间一直占用绑核。`--gather-mode active` 保留
-无限自旋，`--gather-mode passive` 让主线程定时休眠、辅助线程等待通知，可用于
-设备上的 A/B 对比。Linux 上
+CPU worker 使用常驻 `std::thread`。默认 `--gather-mode adaptive`：协调线程
+持续轮询远端控制行；辅助线程在完成一轮后先自旋约 100 us，再等待协调线程
+下一次准备通知。远端 WRITE_WITH_NOTIFY 不会唤醒本地的 C++ 条件变量，因此
+协调线程不能靠定时休眠保证低延迟。`--gather-mode active` 会让协调线程和
+辅助线程都无限自旋，`--gather-mode passive` 则让协调线程定时休眠、辅助线程
+等待通知，仅用于对照。Linux 上
 默认将 coordinator 和 helper 绑到进程允许的不同逻辑 CPU；可用
 `--gather-affinity off` 关闭以作对比。`GATHER_THREAD` 日志记录 TID、CPU 和绑核结果。
 默认按 CPU 核数自动选择上限 32，并按每线程至少 256 KiB 的

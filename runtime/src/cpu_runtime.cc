@@ -535,20 +535,13 @@ class CpuGatherWorker {
     team_.BindWorker(0U);
     std::uint64_t last_sequence = 0U;
     std::uint64_t wait_start_ns = NowNs();
-    std::uint32_t idle_polls = 0U;
-    bool idle = false;
     while (!stop_.load(std::memory_order_acquire)) {
       CacheGatherControlLine(control_, true);
       peer::GatherBarrier();
       const auto sequence = __atomic_load_n(&control_->notify, __ATOMIC_ACQUIRE);
       if (sequence == 0U || sequence == last_sequence ||
           (sequence & peer::kGatherErrorBit) != 0U) {
-        if (gather_mode_ == CpuGatherMode::kAdaptive) {
-          if (!idle && (++idle_polls & 63U) == 0U)
-            idle = NowNs() - wait_start_ns >= 100000U;
-          if (idle) std::this_thread::sleep_for(std::chrono::microseconds(20));
-          else peer::GatherSpinPause();
-        } else if (gather_mode_ == CpuGatherMode::kPassive) {
+        if (gather_mode_ == CpuGatherMode::kPassive) {
           std::this_thread::sleep_for(std::chrono::microseconds(20));
         } else {
           peer::GatherSpinPause();
@@ -619,8 +612,6 @@ class CpuGatherWorker {
       CacheGatherControlLine(control_, false);
       peer::GatherBarrier();
       wait_start_ns = NowNs();
-      idle_polls = 0U;
-      idle = false;
     }
   }
 
