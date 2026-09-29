@@ -52,18 +52,6 @@ void FlushLines(const void* address, std::uint64_t bytes) {
 #endif
 }
 
-void CleanLines(const void* address, std::uint64_t bytes) {
-#if defined(KVAF_AICPU_URMA_HOST_TEST)
-  (void)address;
-  (void)bytes;
-#else
-  const auto first = reinterpret_cast<std::uintptr_t>(address) & ~std::uintptr_t{63};
-  const auto end = reinterpret_cast<std::uintptr_t>(address) + bytes;
-  for (auto line = first; line < end; line += 64U)
-    asm volatile("dc cvac, %0" :: "r"(line) : "memory");
-#endif
-}
-
 void Flush(const void* address, std::uint64_t bytes) {
   FlushLines(address, bytes);
   Barrier();
@@ -118,14 +106,14 @@ void Initialize(Queue& queue) {
 
 template <typename Entity, typename Queue>
 std::uint32_t WaitCompletion(const Entity& entity, Queue& queue,
-                             std::uint32_t* cqe_word) {
+                             std::uint32_t* cqe_word, bool maintain_cache) {
   const auto slot = queue.cq_consumer_index % entity.cq_depth;
   auto* completion = reinterpret_cast<volatile std::uint32_t*>(
       entity.cq_va + slot * entity.cqe_size);
   const auto expected = static_cast<std::uint32_t>(
       (queue.cq_consumer_index / entity.cq_depth) & 1U);
   for (std::uint32_t poll = 0U; poll < kPollLimit; ++poll) {
-    Flush(const_cast<const std::uint32_t*>(completion), 32U);
+    if (maintain_cache) Flush(const_cast<const std::uint32_t*>(completion), 32U);
     const std::uint32_t word = LoadCompletion(completion);
     if (((word >> 2U) & 1U) == expected) continue;
     if (cqe_word != nullptr) *cqe_word = word;
@@ -144,7 +132,8 @@ std::uint32_t Submit(const Entity& entity, Queue& queue,
                      std::uint32_t opcode, std::uint32_t* cqe_word = nullptr,
                      std::uint64_t* last_wqe_protocol = nullptr,
                      std::uint64_t* post_ns = nullptr,
-                     std::uint64_t* cq_ns = nullptr) {
+                     std::uint64_t* cq_ns = nullptr,
+                     bool maintain_cache = true) {
   if (cqe_word != nullptr) *cqe_word = 0U;
   if (post_ns != nullptr) *post_ns = 0U;
   if (cq_ns != nullptr) *cq_ns = 0U;
@@ -166,15 +155,16 @@ std::uint32_t Submit(const Entity& entity, Queue& queue,
       *last_wqe_protocol = words[0];
     auto* destination = reinterpret_cast<void*>(entity.sq_va + slot * 64U);
     std::memcpy(destination, words, sizeof(words));
-    Flush(destination, sizeof(words));
+    if (maintain_cache) Flush(destination, sizeof(words));
   }
   queue.sq_producer_index += count;
+  if (!maintain_cache) Barrier();
   Ring(reinterpret_cast<volatile std::uint32_t*>(entity.sq_db_va),
        static_cast<std::uint32_t>(queue.sq_producer_index));
   Barrier();
   const auto cq_start_ns = timed ? NowNs() : 0U;
   if (post_ns != nullptr) *post_ns = cq_start_ns - post_start_ns;
-  const auto result = WaitCompletion(entity, queue, cqe_word);
+  const auto result = WaitCompletion(entity, queue, cqe_word, maintain_cache);
   if (cq_ns != nullptr) *cq_ns = NowNs() - cq_start_ns;
   return result;
 }
@@ -199,15 +189,15 @@ std::uint32_t SubmitNotify(const Entity& entity, Queue& queue,
     const auto slot = (queue.sq_producer_index + block) % entity.sq_depth;
     auto* destination = reinterpret_cast<void*>(entity.sq_va + slot * 64U);
     std::memcpy(destination, &words[block * 16U], 64U);
-    Flush(destination, 64U);
   }
   queue.sq_producer_index += 2U;
+  Barrier();
   Ring(reinterpret_cast<volatile std::uint32_t*>(entity.sq_db_va),
        static_cast<std::uint32_t>(queue.sq_producer_index));
   Barrier();
   const auto cq_start_ns = NowNs();
   *post_ns = cq_start_ns - post_start_ns;
-  const auto result = WaitCompletion(entity, queue, cqe_word);
+  const auto result = WaitCompletion(entity, queue, cqe_word, false);
   *cq_ns = NowNs() - cq_start_ns;
   return result;
 }
@@ -247,12 +237,6 @@ std::uint32_t SubmitScatter(const Entity& entity, Queue& queue,
     }
     producer += wqebbs;
   }
-  for (std::uint64_t block = queue.sq_producer_index; block < producer;) {
-    const auto slot = block % entity.sq_depth;
-    const auto count = std::min<std::uint64_t>(producer - block, entity.sq_depth - slot);
-    CleanLines(reinterpret_cast<void*>(entity.sq_va + slot * 64U), count * 64U);
-    block += count;
-  }
   Barrier();
   queue.sq_producer_index = producer;
   Ring(reinterpret_cast<volatile std::uint32_t*>(entity.sq_db_va),
@@ -260,7 +244,7 @@ std::uint32_t SubmitScatter(const Entity& entity, Queue& queue,
   Barrier();
   const auto cq_start_ns = NowNs();
   if (post_ns != nullptr) *post_ns = cq_start_ns - post_start_ns;
-  const auto result = WaitCompletion(entity, queue, cqe_word);
+  const auto result = WaitCompletion(entity, queue, cqe_word, false);
   if (cq_ns != nullptr) *cq_ns = NowNs() - cq_start_ns;
   return result;
 }
@@ -485,7 +469,7 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
   status.sequence = args->sequence;
   status.result = 2U;
   if (args->output_extent > UINT64_MAX - 63U) {
-    Flush(&status, sizeof(status));
+    Barrier();
     return 1U;
   }
   const std::uint64_t scratch_offset =
@@ -523,13 +507,11 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
                            args->source_descriptor, source_bytes) ||
                   !InRange(entity.remote_host_ddr_address, entity.remote_host_ddr_size,
                            args->remote_descriptor, source_bytes)))) {
-    Flush(&status, sizeof(status));
+    Barrier();
     return 1U;
   }
   const auto* output_spans =
       reinterpret_cast<const kvaf::GatherOutputSpan*>(args->output_spans);
-  Flush(output_spans, static_cast<std::uint64_t>(args->output_span_count) *
-                          sizeof(*output_spans));
   std::uint64_t output_bytes = 0U;
   for (std::uint32_t index = 0U; index < args->output_span_count; ++index) {
     const auto& span = output_spans[index];
@@ -537,13 +519,13 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
         span.offset > args->output_extent ||
         span.length > args->output_extent - span.offset ||
         span.length > args->bytes - output_bytes) {
-      Flush(&status, sizeof(status));
+      Barrier();
       return 1U;
     }
     output_bytes += span.length;
   }
   if (output_bytes != args->bytes) {
-    Flush(&status, sizeof(status));
+    Barrier();
     return 1U;
   }
   Initialize(queue);
@@ -553,25 +535,24 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
   *ack = 0U;
   *reinterpret_cast<std::uint64_t*>(scratch + 16U) =
       direct ? args->remote_descriptor : args->sequence;
-  Flush(reinterpret_cast<void*>(scratch), kvaf::aicpu_urma::kGatherScratchBytes);
+  Barrier();
   std::uint32_t cqe_word = 0U;
   if (direct) {
     status.phase = 1U;
     const auto source_start_ns = NowNs();
-    Flush(reinterpret_cast<void*>(args->source_descriptor), source_bytes);
     const Transfer descriptor{args->remote_descriptor, args->source_descriptor,
                               static_cast<std::uint32_t>(source_bytes), entity.local_token_id};
     status.result = Submit(entity, queue, &descriptor, 1U,
                            kvaf::aicpu_urma::kWriteOpcode, &cqe_word, nullptr,
-                           &status.source_write_post_ns, &status.source_write_cq_ns);
+                           &status.source_write_post_ns, &status.source_write_cq_ns,
+                           false);
     status.source_write_ns = NowNs() - source_start_ns;
     status.cqe_word = cqe_word;
   }
   if (status.result != 0U) {
     status.sq_producer_index = queue.sq_producer_index;
     status.cq_consumer_index = queue.cq_consumer_index;
-    Flush(&queue, sizeof(queue));
-    Flush(&status, sizeof(status));
+    Barrier();
     return 1U;
   }
   status.phase = direct ? 2U : 1U;
@@ -589,21 +570,15 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
                          entity.local_token_id};
     const auto ack_start_ns = NowNs();
     for (std::uint32_t poll = 0U; poll < 10000U; ++poll) {
-      const auto preflush_start_ns = NowNs();
-      Flush(ack, check.length);
-      status.ack_cache_ns += NowNs() - preflush_start_ns;
       std::uint64_t post_ns = 0U;
       std::uint64_t cq_ns = 0U;
       status.result = Submit(entity, queue, &check, 1U, kvaf::aicpu_urma::kReadOpcode,
-                             &cqe_word, nullptr, &post_ns, &cq_ns);
+                             &cqe_word, nullptr, &post_ns, &cq_ns, false);
       status.ack_post_ns += post_ns;
       status.ack_cq_ns += cq_ns;
       ++status.ack_polls;
       status.cqe_word = cqe_word;
       if (status.result != 0U) break;
-      const auto postflush_start_ns = NowNs();
-      Flush(ack, check.length);
-      status.ack_cache_ns += NowNs() - postflush_start_ns;
       status.ack_seen = *ack;
       if (direct && status.ack_started_ns == 0U &&
           status.ack_seen == kvaf::peer::GatherStartedAck(args->sequence))
@@ -625,12 +600,6 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
     status.phase = direct ? 4U : 3U;
     const std::uint32_t wqe_sgl_size = args->sgl_size < kvaf::kGatherMaxSglSize
         ? args->sgl_size : kvaf::kGatherMaxSglSize;
-    const auto preflush_start_ns = NowNs();
-    for (std::uint32_t index = 0U; index < args->output_span_count; ++index)
-      FlushLines(reinterpret_cast<void*>(args->output + output_spans[index].offset),
-                 output_spans[index].length);
-    Barrier();
-    status.scatter_cache_ns = NowNs() - preflush_start_ns;
     kvaf::aicpu_urma::ScatterTransfer data[64]{};
     const std::uint32_t max_batch = kvaf::aicpu_urma::MaxScatterBatch(entity.sq_depth);
     if (max_batch == 0U) status.result = 6U;
@@ -676,18 +645,9 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
       }
     }
     status.cqe_word = cqe_word;
-    if (status.result == 0U) {
-      const auto postflush_start_ns = NowNs();
-      for (std::uint32_t index = 0U; index < args->output_span_count; ++index)
-        FlushLines(reinterpret_cast<void*>(args->output + output_spans[index].offset),
-                   output_spans[index].length);
-      Barrier();
-      status.scatter_cache_ns += NowNs() - postflush_start_ns;
-    }
   }
   status.sq_producer_index = queue.sq_producer_index;
   status.cq_consumer_index = queue.cq_consumer_index;
-  Flush(&queue, sizeof(queue));
-  Flush(&status, sizeof(status));
+  Barrier();
   return status.result == 0U ? 0U : 1U;
 }

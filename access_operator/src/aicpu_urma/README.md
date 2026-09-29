@@ -93,11 +93,11 @@ WQEBB；队列深度允许时每 64 条 WQE 在末条请求 CQE。单条 WQE 的
 不支持跨独立 HBM 分配的 SGL。未指定 `source_descriptor_address` 的旧调用仍使用
 每轮配置 RPC；一个 DDR region 不得混用两种模式。
 
-CPU worker 仅对通知、ack 和 descriptor mailbox 的缓存行做 `dc civac`/`dc cvac`；`dc ivac`
-在 EL0 不可用，会令服务端进程收到 `SIGILL`。源 DDR 与 staging 数据区不再
-逐行做缓存维护，只有一次并行拷贝阶段；所有工作线程在发布 ack 前完成拷贝并
-执行内存屏障。数据区正确性依赖目标平台的 CPU DDR 与 URMA DMA 一致性，
-目前不能从注册参数推断这一点；更新后须在真实设备上以每轮变化的数据验证。
+GatherRead 的 CPU 通知、ack、descriptor、源 DDR、staging 和 AICPU 的描述符、
+SQ、CQ、HBM 输出、状态缓冲均不执行显式缓存行清理或失效；仍保留内存屏障以保证
+提交与完成的顺序。这样做依赖目标平台的 CPU DDR、HBM 与 URMA DMA 一致性，
+不能从注册参数推断该条件已经满足。Host 模拟无法验证这一点，更新后必须在
+真实设备上逐轮改变数据并完整回读校验；若通知、CQ 或状态不可见，需恢复维护。
 这里没有使用 OpenMP：
 CPU worker 使用常驻 `std::thread`。默认 `--gather-mode adaptive`：协调线程
 持续轮询远端控制行；辅助线程在完成一轮后先自旋约 100 us，再等待协调线程
@@ -156,7 +156,7 @@ CPU gather 握手和 CQ 等待，不含输入上传、输出回读及逐字节�
 客户端先打印端到端统计，再按执行顺序打印 `GATHER_READ_TIMELINE`：Host 上传清单与目标、
 等待与收尾；等待期间的 AICPU WRITE 清单、通知、CPU gather、AICPU READ 到 HBM。各值是测量轮次
 平均微秒，保留三位小数即纳秒精度。Host 等待包含 CPU/AICPU 工作，AICPU 等 CPU ack
-与 CPU gather 重叠，不能相加；AICPU READ 阶段包含目标缓存处理、WQE 规划与提交、
+与 CPU gather 重叠，不能相加；AICPU READ 阶段包含 WQE 规划与提交、
 完成等待，不等于纯传输时间。profiling 增加时钟采样，并将 ack READ 从 8 字节扩展到
 56 字节，因此小 batch 的总耗时不应直接与旧版无 profiling 结果比较。
 需要原始纳秒计数器时使用 `--profile-detail 1`；默认只显示分层时间线。更新后需
@@ -164,14 +164,12 @@ CPU gather 握手和 CQ 等待，不含输入上传、输出回读及逐字节�
 `idle_since_previous_ack` 从上一轮 ack 到本轮收到通知，包含两轮之间的空闲，
 不是通知传递耗时。`CPU start observed after ACK polling began` 是 AICPU 首次读到
 临时 ACK 标记的时间；若 CPU 在第一次轮询前就完成，标记可能不会被观察到。
-`direct_setup` 包含每轮 mailbox 布局检查，只有首次调用才会
-启用 CPU worker。直连路径及 `dc cvac`
-批量清理 SQ 的性能和缓存一致性尚需目标机器验证，不能从 Host 模拟推断实际带宽。
+`direct_setup` 包含每轮 mailbox 布局检查，只有首次调用才会启用 CPU worker。
+禁用显式缓存维护后的数据正确性和性能尚需目标机器验证，不能从 Host 模拟推断。
 
 升序或降序且不重叠的 HBM 输出 span 使用线性布局校验；其他顺序仍通过排序
-检查重叠。AICPU 逐条处理输出 span 和 READ WQE 的 cache line，但输出缓存
-在 READ 前后各统一同步一次，SQ WQE 在敲 doorbell 前统一同步一次。该优化
-不改变 WQE、CQ 或链路协议。
+检查重叠。GatherRead 不再刷新输出 span 或 SQ WQE 的 cache line；此变更不改变
+WQE、CQ 或链路协议，但要求设备对这些缓冲区的 DMA 访问可见。
 
 **硬件验证状态**：本分支的 Host WQE ABI/模拟队列测试和内核语法检查不等价于 NPU
 收发验证。部署后应先用 Runtime 自带的 LinkTo WRITE 探针确认链路，再在真实

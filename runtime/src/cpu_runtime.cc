@@ -410,16 +410,6 @@ struct Channel {
   urma_target_jetty_t* remote_jetty = nullptr;
 };
 
-void CacheGatherControlLine(const void* address, bool invalidate) {
-#if defined(__aarch64__)
-  if (invalidate) asm volatile("dc civac, %0" :: "r"(address) : "memory");
-  else asm volatile("dc cvac, %0" :: "r"(address) : "memory");
-#else
-  (void)address;
-  (void)invalidate;
-#endif
-}
-
 const char* GatherModeName(CpuGatherMode mode) {
   switch (mode) {
     case CpuGatherMode::kAdaptive: return "adaptive";
@@ -451,7 +441,6 @@ class CpuGatherWorker {
               TeamWaitMode(gather_mode), gather_affinity),
         max_threads_(team_.max_threads()), gather_mode_(gather_mode), direct_(direct) {
     std::memset(control_, 0, sizeof(*control_));
-    CacheGatherControlLine(control_, false);
     peer::GatherBarrier();
     worker_ = std::thread(direct ? &CpuGatherWorker::RunDirect
                                  : &CpuGatherWorker::Run, this);
@@ -511,8 +500,6 @@ class CpuGatherWorker {
       const auto poll_start_ns = NowNs();
       profile.dispatch_ns = poll_start_ns - scheduled_at_ns;
       while (!stop_.load(std::memory_order_acquire)) {
-        CacheGatherControlLine(control_, true);
-        peer::GatherBarrier();
         if (__atomic_load_n(notify, __ATOMIC_ACQUIRE) == sequence &&
             __atomic_load_n(command, __ATOMIC_ACQUIRE) == sequence) break;
         peer::GatherSpinPause();
@@ -524,7 +511,6 @@ class CpuGatherWorker {
       profile.copy_ns = NowNs() - notified_ns;
       control_->profile = profile;
       __atomic_store_n(ack, sequence, __ATOMIC_RELEASE);
-      CacheGatherControlLine(control_, false);
       peer::GatherBarrier();
       lock.lock();
       completed_ = sequence;
@@ -536,8 +522,6 @@ class CpuGatherWorker {
     std::uint64_t last_sequence = 0U;
     std::uint64_t wait_start_ns = NowNs();
     while (!stop_.load(std::memory_order_acquire)) {
-      CacheGatherControlLine(control_, true);
-      peer::GatherBarrier();
       const auto sequence = __atomic_load_n(&control_->notify, __ATOMIC_ACQUIRE);
       if (sequence == 0U || sequence == last_sequence ||
           (sequence & peer::kGatherErrorBit) != 0U) {
@@ -552,7 +536,6 @@ class CpuGatherWorker {
       peer::GatherCpuProfile profile{};
       profile.notify_spin_ns = NowNs() - wait_start_ns;
       __atomic_store_n(&control_->ack, peer::GatherStartedAck(sequence), __ATOMIC_RELEASE);
-      CacheGatherControlLine(control_, false);
       peer::GatherBarrier();
       const auto descriptor_start_ns = NowNs();
       const auto address = __atomic_load_n(&control_->command, __ATOMIC_ACQUIRE);
@@ -562,8 +545,6 @@ class CpuGatherWorker {
       peer::GatherDescriptorHeader header{};
       if (valid) {
         auto* descriptor = memory_ + (address - base_);
-        CacheGatherControlLine(descriptor, true);
-        peer::GatherBarrier();
         std::memcpy(&header, descriptor, sizeof(header));
         valid = header.magic == peer::kGatherDescriptorMagic &&
             header.sequence == sequence && header.span_count != 0U &&
@@ -572,10 +553,6 @@ class CpuGatherWorker {
             peer::GatherRange(base_, peer::GatherControlOffset(bytes_), address,
                               peer::GatherDescriptorBytes(header.span_count));
         if (valid) {
-          const auto descriptor_bytes = peer::GatherDescriptorBytes(header.span_count);
-          for (std::uint64_t offset = 64U; offset < descriptor_bytes; offset += 64U)
-            CacheGatherControlLine(descriptor + offset, true);
-          peer::GatherBarrier();
           try {
             spans_.resize(header.span_count);
             std::memcpy(spans_.data(), descriptor + sizeof(header),
@@ -609,7 +586,6 @@ class CpuGatherWorker {
       control_->profile = profile;
       __atomic_store_n(&control_->ack,
                        sequence | (valid ? 0U : peer::kGatherErrorBit), __ATOMIC_RELEASE);
-      CacheGatherControlLine(control_, false);
       peer::GatherBarrier();
       wait_start_ns = NowNs();
     }

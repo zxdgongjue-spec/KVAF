@@ -137,6 +137,7 @@ void TestRpcGather() {
   assert(status.cpu.source_cache_ns == 33U && status.cpu.copy_ns == 44U);
   assert(status.cpu.staging_flush_ns == 55U);
   assert(status.notify_ns > 0U && status.ack_poll_ns > 0U);
+  assert(status.ack_cache_ns == 0U && status.scatter_cache_ns == 0U);
   assert(status.notify_post_ns > 0U && status.notify_cq_ns > 0U);
   assert(status.ack_post_ns > 0U && status.ack_cq_ns > 0U);
   assert(status.scatter_post_ns > 0U && status.scatter_cq_ns > 0U);
@@ -290,6 +291,7 @@ void TestUrmaDescriptorGather() {
   assert(result == 0U && status.result == 0U && status.phase == 4U);
   assert(status.source_write_ns > 0U && status.source_write_cq_ns > 0U);
   assert(status.ack_started_ns > 0U && status.ack_polls == 2U);
+  assert(status.ack_cache_ns == 0U && status.scatter_cache_ns == 0U);
   assert(status.sq_producer_index == 7U && status.cq_consumer_index == 5U);
   for (std::size_t index = 0U; index < 16U; ++index) {
     assert(output[32U + index] == remote[32U + index]);

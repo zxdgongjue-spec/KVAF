@@ -38,8 +38,8 @@ int main() {
   assert(report.find("GatherRead call: 1500.000 us") != std::string::npos);
   assert(report.find("Send DDR source list to CPU: 2.000 us") != std::string::npos);
   assert(report.find("CPU gather DDR -> staging: 3.000 us") != std::string::npos);
-  assert(report.find("no data cache maintenance") != std::string::npos);
-  assert(report.find("AICPU READ staging -> HBM: 14.000 us (7.00 READ WQEs on average)") !=
+  assert(report.find("HBM cache maintenance:") == std::string::npos);
+  assert(report.find("AICPU READ staging -> HBM: 12.000 us (7.00 READ WQEs on average)") !=
          std::string::npos);
   assert(report.find("AICPU wait for CPU gather ack:") != std::string::npos);
   assert(report.find("overlaps CPU gather") != std::string::npos);

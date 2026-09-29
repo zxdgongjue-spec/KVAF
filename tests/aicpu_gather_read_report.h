@@ -23,7 +23,6 @@ inline void PrintGatherReadTimeline(std::FILE* output, double mean_ms,
     return average(field) / 1000.0;
   };
   const double copy_us = average_us(&GatherReadTiming::cpu_copy_ns);
-  const double target_cache_us = average_us(&GatherReadTiming::scatter_cache_ns);
   const double plan_us = average_us(&GatherReadTiming::scatter_plan_ns);
   const double post_us = average_us(&GatherReadTiming::scatter_post_ns);
   const double cq_us = average_us(&GatherReadTiming::scatter_cq_ns);
@@ -86,14 +85,13 @@ inline void PrintGatherReadTimeline(std::FILE* output, double mean_ms,
   }
   std::fprintf(output,
                "      CPU gather DDR -> staging: %.3f us\n"
-               "        Parallel copy and worker synchronization; no data cache maintenance\n"
                "    AICPU READ staging -> HBM: %.3f us (%.2f READ WQEs on average)\n"
-               "      HBM cache maintenance: %.3f us | Build READ WQEs: %.3f us\n"
-               "      Submit WQEs (encode, flush SQ, doorbell): %.3f us | Wait for READ completions: %.3f us\n",
+               "      Build READ WQEs: %.3f us\n"
+               "      Submit WQEs (encode, write SQ, doorbell): %.3f us | Wait for READ completions: %.3f us\n",
                copy_us,
-               target_cache_us + plan_us + post_us + cq_us,
+               plan_us + post_us + cq_us,
                average(&GatherReadTiming::read_wqes),
-               target_cache_us, plan_us, post_us, cq_us);
+               plan_us, post_us, cq_us);
   std::fprintf(output,
                "  3 Host finishes: Release HBM reference: %.3f us | Read status: %.3f us\n"
                "  Overlap: Host wait includes CPU/AICPU; AICPU ack wait overlaps CPU gather.\n",
