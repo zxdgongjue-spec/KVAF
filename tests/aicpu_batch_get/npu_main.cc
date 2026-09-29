@@ -144,7 +144,9 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
                   reinterpret_cast<std::uint64_t>(result.data), config,
                   reinterpret_cast<std::uint64_t>(profile.data),
                   reinterpret_cast<std::uint64_t>(coordination.data)};
-  std::fprintf(stderr, "AICPU_GET_NPU LAUNCH mode=%s block_dim=%u active_scatter_ranges=%u\n",
+  std::fprintf(stderr,
+               "AICPU_GET_NPU LAUNCH mode=%s block_dim=%u active_scatter_ranges=%u "
+               "sgl_layout=source_by_output_slot scatter_layout=forward\n",
                aicpu_blocks == 1 ? "pthread" : "multi-block", aicpu_blocks, active_threads);
   kernel.Launch(args, aicpu_blocks);
   // Once launched, do not unwind allocations until both device execution and

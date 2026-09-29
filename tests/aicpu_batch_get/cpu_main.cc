@@ -99,9 +99,17 @@ void Run(Options options) {
   for (std::uint64_t row = 0; row < options.config.rows; ++row) {
     auto* data = input + row * layout.stride;
     for (std::uint64_t b = 8; b < options.config.row_bytes; ++b) data[b] = Pattern(row, b);
-    sources[row] = {data, static_cast<std::size_t>(options.config.row_bytes)};
-    offsets[row] = kStagingOffset + row * options.config.row_bytes;
   }
+  // Keep remote staging consecutive, but order its SGL entries by physical
+  // output slot. AICPU can then copy staging slot q directly to output slot q
+  // with both source and destination addresses increasing.
+  for (std::uint64_t slot = 0; slot < options.config.rows; ++slot) {
+    const auto row = LogicalRowForOutputSlot(options.config, slot);
+    sources[slot] = {input + row * layout.stride,
+                     static_cast<std::size_t>(options.config.row_bytes)};
+    offsets[slot] = kStagingOffset + slot * options.config.row_bytes;
+  }
+  std::fprintf(stderr, "AICPU_GET_CPU SGL_LAYOUT=source_by_output_slot staging=contiguous scatter=forward\n");
   options.transport.region_bytes = layout.region_bytes;
   std::unique_ptr<CpuUrmaTransport> selected_transport;
   kvaf::peer::PeerLink peer(options.transport.peer_address);
@@ -170,7 +178,7 @@ void Run(Options options) {
       } while (request->sequence != seq);
       for (std::uint64_t row = 0; row < options.config.rows; ++row) {
         const auto tag = RowTag(seq, row);
-        std::memcpy(sources[row].data, &tag, sizeof(tag));
+        std::memcpy(input + row * layout.stride, &tag, sizeof(tag));
       }
       Check(transport.WriteBatch(offsets.data(), sources.data(), sources.size()));
       const auto timing = transport.last_batch_timing();
@@ -196,7 +204,8 @@ void Run(Options options) {
   std::printf("engine,rows,row_bytes,iterations,scatter_threads,active_threads,e2e_GBps,mean_ns,p50_ns,p99_ns,wait_ns,scatter_ns,"
               "cpu_write_ns,cpu_prepare_ns,cpu_post_ns,cpu_poll_ns,mean_wrs,control_reads\n");
   std::printf("%s,%llu,%llu,%llu,%llu,%llu,%.6f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%llu\n",
-              report.active_threads > 1 ? "aicpu_memcpy_mt" : "aicpu_memcpy",
+              report.active_threads > 1 ? "aicpu_memcpy_sgl_reordered_mt" :
+                                          "aicpu_memcpy_sgl_reordered",
               (unsigned long long)options.config.rows, (unsigned long long)options.config.row_bytes,
               (unsigned long long)options.config.iterations,
               (unsigned long long)options.config.scatter_threads,

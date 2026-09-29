@@ -5,8 +5,8 @@
 
 namespace kvaf::aicpu_test {
 constexpr std::uint64_t kMagic = 0x4b56414641424732ULL;
-constexpr char kKernelName[] = "KvafAicpuBatchGetV4";
-constexpr std::uint64_t kKernelRevision = 4;
+constexpr char kKernelName[] = "KvafAicpuBatchGetV5";
+constexpr std::uint64_t kKernelRevision = 5;
 constexpr char kCoreProbeKernelName[] = "KvafAicpuCoreProbeV1";
 constexpr std::uint64_t kCoreProbeMagic = 0x4b564146434f5231ULL;
 constexpr std::uint64_t kCoreProbeRevision = 1;
@@ -173,6 +173,15 @@ inline std::uint64_t RowTag(std::uint64_t sequence, std::uint64_t row) {
 }
 inline std::uint64_t OutputOffset(const Config& c, const Layout& l, std::uint64_t row) {
   return (c.rows - 1 - row) * l.stride;
+}
+// The CPU builds its local SGL in physical output-slot order. Thus staging
+// slot q contains the logical row that ultimately belongs in output slot q.
+// AICPU can copy slot q to slot q with increasing source and destination VAs.
+inline std::uint64_t LogicalRowForOutputSlot(const Config& c, std::uint64_t slot) {
+  return c.rows - 1 - slot;
+}
+inline std::uint64_t OutputSlotOffset(const Layout& l, std::uint64_t slot) {
+  return slot * l.stride;
 }
 // A packed source row can cross cache lines. Assign whole groups whose byte
 // length is a multiple of 64, so worker invalidations never share a line.

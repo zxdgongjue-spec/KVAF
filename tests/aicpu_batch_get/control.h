@@ -15,7 +15,7 @@
 
 namespace kvaf::aicpu_test {
 // Test-only commands; never change the production Runtime protocol.
-// v4 config includes device-side scatter thread count and unaligned row sizes.
+// v5 keeps the control ABI and changes the device scatter layout.
 constexpr auto kConfigure = static_cast<peer::Command>(0x7005);
 constexpr auto kStart = static_cast<peer::Command>(0x7001);
 constexpr auto kResetSetup = static_cast<peer::Command>(0x7003);

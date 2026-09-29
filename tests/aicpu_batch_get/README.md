@@ -3,14 +3,17 @@
 这是独立 C++ 测试，不调用 Runtime BatchPut，不改 Python 或 MetaManager。
 
 scatter 使用 AICPU `memcpy`，支持 `--scatter-threads 1..32`（默认 1）。
+CPU 将 SGL 描述符按 output 物理 slot 排列，仍 WRITE 到连续 HBM staging；
+AICPU 将同一个 slot 顺序复制到 output。
 调用线程也参与复制，其余 pthread 在进入测试循环前创建，跨预热和计时轮复用。
-CSV 标注 `aicpu_memcpy` / `aicpu_memcpy_mt`，并输出请求与参与分片的线程数。
+CSV 标注 `aicpu_memcpy_sgl_reordered` /
+`aicpu_memcpy_sgl_reordered_mt`，并输出请求与参与分片的线程数。
 `active_threads` 不是实际占用的核数；实际核采样需启用下面的诊断开关。
 线程创建失败报告 `pthread_error`，不会静默回退。设备 pthread 支持及带宽需在目标机器验证。
 
 ### 4096 × 656 B、多线程测试
 
-更新后需重新构建两端、安装 V4 kernel，并重启测试进程：
+更新后需重新构建两端、安装 V5 kernel，并重启测试进程：
 
 ```bash
 bash build.sh aicpu-cpu
@@ -33,8 +36,8 @@ bash tests/run_aicpu_get_cpu.sh --peer 127.0.0.1:29991 --device-id 4 \
 
 ### 实际运行核与 scatter 三段计时
 
-在 **NPU 端**增加 `--profile-scatter`，默认关闭。升级需重新编译并安装 V4 kernel，
-本次新增了 kernel 参数，独立的 V4 入口可避免旧 device `.so` 静默忽略诊断参数。
+在 **NPU 端**增加 `--profile-scatter`，默认关闭。升级需重新编译并安装 V5 kernel，
+独立的 V5 入口可避免旧 device `.so` 静默使用旧 scatter 布局。
 CPU 控制协议和原有 CSV 列保持不变。先启动 NPU 端：
 
 ```bash
@@ -134,6 +137,18 @@ multi-block 下 block 0 仍独占 request/done、tag 校验和每轮计时；其
 不再指 pthread。`cpu_parallelism`、三段计时和 `cpu_hits` 的定义保持不变；成功的
 multi-block 运行应与 probe 的核分布相互印证。
 
+### SGL 按 output slot 重排
+
+逻辑行 `r` 的最终位置仍是 `output slot = rows - 1 - r`。CPU 不再将
+`host row r` 写到 `staging slot r`，而是构造 `SGL[slot]` 指向
+`host row (rows - 1 - slot)`，同时保持远端偏移连续：
+`staging + slot * row_bytes`。AICPU 随后执行 `staging slot → output slot`
+的正向 copy。这个变换不增加 WR、不会写入 host stride 中的 guard 字节，最终 tag、
+payload 与 guard 语义不变。
+
+运行日志会显示 `SGL_LAYOUT=source_by_output_slot` 和
+`scatter_layout=forward`，可与旧布局的基线区分。
+
 统计逻辑的无设备测试：
 
 ```bash
@@ -156,8 +171,10 @@ ctest --test-dir build-aicpu-cpu -R '^kvaf_aicpu_(scatter_profile|core_probe)$' 
    检查各行本轮序号后才请求下一轮，不存在两轮同时使用 staging。
 7. CPU 停止/销毁 transport 并确认 drained；NPU 检查输出后才释放 target。
 
-CPU source 和输出的行步长为 round_up(row_bytes, 64) + 64，NPU staging 保持连续，
-输出按反向行序 scatter。行长至少 8 B（序号头），支持 656 B；此时行步长为 768 B。
+CPU source 和输出的行步长为 round_up(row_bytes, 64) + 64，NPU staging 保持连续。
+逻辑输出仍按反向行序排列，但 CPU 已将 SGL 重排为 output 物理 slot 顺序，因此
+AICPU 的 staging 与 output 访问均为正向。行长至少 8 B（序号头），支持 656 B；
+此时行步长为 768 B。
 线程按 64 / gcd(row_bytes, 64) 行分组，656 B 时每组 4 行，避免线程间共享输入缓存行。
 实际线程数不超过分组数。源/目标描述符固定，不包含动态 AccessTable 解析。
 

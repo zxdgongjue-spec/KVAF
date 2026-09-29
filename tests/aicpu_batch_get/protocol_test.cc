@@ -29,8 +29,9 @@ struct Simulator {
     if (future) return sequence + 1;
     if (timeout || ++reads < 3) return done;
     // Model the CPU WRITE and delayed completion, with a new tag every round.
-    for (std::uint64_t row = 0; row < config.rows; ++row) {
-      auto* dst = staging.data() + row * config.row_bytes;
+    for (std::uint64_t slot = 0; slot < config.rows; ++slot) {
+      const auto row = LogicalRowForOutputSlot(config, slot);
+      auto* dst = staging.data() + slot * config.row_bytes;
       auto tag = RowTag(sequence, row);
       if (corrupt && row == 1) --tag;
       std::memcpy(dst, &tag, 8);
@@ -40,8 +41,9 @@ struct Simulator {
   }
   void Scatter(const Config& c, const Layout& l) {
     Require(done == sequence, "scatter ran before completion");
-    for (std::uint64_t row = 0; row < c.rows; ++row)
-      std::memcpy(output.data() + OutputOffset(c, l, row), staging.data() + row * c.row_bytes, c.row_bytes);
+    for (std::uint64_t slot = 0; slot < c.rows; ++slot)
+      std::memcpy(output.data() + OutputSlotOffset(l, slot),
+                  staging.data() + slot * c.row_bytes, c.row_bytes);
     clock += 5;
   }
   bool VerifyTags(std::uint64_t seq, const Config& c, const Layout& l) {
@@ -63,7 +65,7 @@ void SuccessAndMetrics() {
     const auto row = c.rows - 1 - slot;
     const auto* bytes = io.output.data() + slot * io.layout.stride;
     for (std::uint64_t b = 8; b < c.row_bytes; ++b)
-      Require(bytes[b] == Pattern(row, b), "incorrect reversed scatter payload");
+      Require(bytes[b] == Pattern(row, b), "incorrect output-slot scatter payload");
     for (std::uint64_t b = c.row_bytes; b < io.layout.stride; ++b)
       Require(bytes[b] == 0xA5, "scatter overwrote guard");
   }
@@ -106,9 +108,9 @@ void ParallelScatter() {
       Require(pool.Initialize(ActiveThreads(c), [](void* opaque, std::uint32_t worker) {
         auto& io = *static_cast<Context*>(opaque)->io;
         auto range = ScatterRange(io.config, worker, ActiveThreads(io.config));
-        for (auto row = range.begin; row < range.end; ++row)
-          std::memcpy(io.output.data() + OutputOffset(io.config, io.layout, row),
-                      io.staging.data() + row * io.config.row_bytes, io.config.row_bytes);
+        for (auto slot = range.begin; slot < range.end; ++slot)
+          std::memcpy(io.output.data() + OutputSlotOffset(io.layout, slot),
+                      io.staging.data() + slot * io.config.row_bytes, io.config.row_bytes);
       }, &context) == 0, "pthread initialization failed");
       std::uint64_t previous = 0;
       for (std::uint32_t worker = 0; worker < ActiveThreads(c); ++worker) {
@@ -122,9 +124,9 @@ void ParallelScatter() {
         for (std::size_t b = 0; b < io.staging.size(); ++b)
           io.staging[b] = static_cast<std::uint8_t>(b * 17 + round);
         pool.Run();
-        for (std::uint64_t row = 0; row < c.rows; ++row) {
-          const auto* dst = io.output.data() + OutputOffset(c, io.layout, row);
-          Require(std::memcmp(dst, io.staging.data() + row * c.row_bytes, c.row_bytes) == 0,
+        for (std::uint64_t slot = 0; slot < c.rows; ++slot) {
+          const auto* dst = io.output.data() + OutputSlotOffset(io.layout, slot);
+          Require(std::memcmp(dst, io.staging.data() + slot * c.row_bytes, c.row_bytes) == 0,
                   "parallel scatter data mismatch");
           for (auto b = c.row_bytes; b < io.layout.stride; ++b)
             Require(dst[b] == 0xA5, "parallel scatter guard overwritten");

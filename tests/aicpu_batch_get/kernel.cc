@@ -83,11 +83,11 @@ struct DeviceIO {
     Invalidate(region + kStagingOffset + range.begin * config.row_bytes,
                (range.end - range.begin) * config.row_bytes);
     const auto invalidated = measure ? Now() : 0;
-    for (auto row = range.begin; row < range.end; ++row)
-      std::memcpy(output + OutputOffset(config, layout, row),
-                  region + kStagingOffset + row * config.row_bytes, config.row_bytes);
+    for (auto slot = range.begin; slot < range.end; ++slot)
+      std::memcpy(output + OutputSlotOffset(layout, slot),
+                  region + kStagingOffset + slot * config.row_bytes, config.row_bytes);
     const auto copied = measure ? Now() : 0;
-    Clean(output + (config.rows - range.end) * layout.stride,
+    Clean(output + OutputSlotOffset(layout, range.begin),
           (range.end - range.begin) * layout.stride);
     if (!measure) return;
     const auto cleaned = Now();
@@ -373,7 +373,7 @@ std::uint32_t KvafAicpuCoreProbeV1(CoreProbeArgs* args) {
 }
 
 extern "C" __attribute__((visibility("default")))
-std::uint32_t KvafAicpuBatchGetV4(KernelArgs* args) {
+std::uint32_t KvafAicpuBatchGetV5(KernelArgs* args) {
   if (!args || !args->region || !args->output || !args->samples || !args->result) return 1;
   auto* result = reinterpret_cast<KernelResult*>(args->result);
   auto* samples = reinterpret_cast<Sample*>(args->samples);
