@@ -64,6 +64,8 @@ inline void PrintGatherReadTimeline(std::FILE* output, double mean_ms,
   std::fprintf(output,
                "  2 Host waits for completion: %.3f us (includes CPU/AICPU work below)\n",
                average_us(&GatherReadTiming::sync_ns));
+  std::fprintf(output, "    AICPU validate HBM targets and prepare worker starts: %.3f us\n",
+               average_us(&GatherReadTiming::output_layout_ns));
   if (direct)
     std::fprintf(output, "    AICPU WRITE source list to CPU DDR: %.3f us\n",
                  average_us(&GatherReadTiming::source_write_ns));
@@ -100,9 +102,19 @@ inline void PrintGatherReadTimeline(std::FILE* output, double mean_ms,
                  "      Details below are per-round maxima across cores; they overlap and must not be added.\n",
                  average(&GatherReadTiming::aicpu_cores));
   std::fprintf(output,
-               "      Build READ WQEs: %.3f us\n"
+               "      Worker initialization: %.3f us | Build local SGL: %.3f us\n"
                "      Submit WQEs (encode, write SQ, doorbell): %.3f us | Wait for READ completions: %.3f us\n",
-               plan_us, post_us, cq_us);
+               average_us(&GatherReadTiming::scatter_init_ns), plan_us, post_us, cq_us);
+  std::fprintf(output,
+               "        Within submit: Encode WQEs: %.3f us | Write SQ: %.3f us | Doorbell and barriers: %.3f us\n",
+               average_us(&GatherReadTiming::scatter_encode_ns),
+               average_us(&GatherReadTiming::scatter_sq_write_ns),
+               average_us(&GatherReadTiming::scatter_doorbell_ns));
+  if (parallel)
+    std::fprintf(output,
+                 "      Worker start spread: %.3f us | Longest worker duration: %.3f us (both within READ wall time)\n",
+                 average_us(&GatherReadTiming::scatter_start_skew_ns),
+                 average_us(&GatherReadTiming::scatter_worker_ns));
   std::fprintf(output,
                "  3 Host finishes: Release HBM reference: %.3f us | Read status: %.3f us\n"
                "  Overlap: Host wait includes CPU/AICPU; AICPU ack wait overlaps CPU gather.\n",
@@ -160,7 +172,7 @@ inline void PrintGatherReadTechnicalProfile(std::FILE* output,
   std::fprintf(output,
                "  AICPU data: scatter_cache=%.0f scatter_plan=%.0f "
                "scatter_post=%.0f scatter_cq=%.0f read_wqes=%.2f scatter_wall=%.0f cores=%.0f "
-               "(plan/post/cq: max per core, overlapping)\n",
+               "(worker phases: max per core, overlapping)\n",
                average(&GatherReadTiming::scatter_cache_ns),
                average(&GatherReadTiming::scatter_plan_ns),
                average(&GatherReadTiming::scatter_post_ns),
@@ -168,6 +180,16 @@ inline void PrintGatherReadTechnicalProfile(std::FILE* output,
                average(&GatherReadTiming::read_wqes),
                average(&GatherReadTiming::scatter_total_ns),
                average(&GatherReadTiming::aicpu_cores));
+  std::fprintf(output,
+               "  READ preparation: output_layout=%.0f worker_init=%.0f start_spread=%.0f longest_worker=%.0f\n"
+               "  Within submit (max per core): encode=%.0f sq_write=%.0f doorbell_barriers=%.0f\n",
+               average(&GatherReadTiming::output_layout_ns),
+               average(&GatherReadTiming::scatter_init_ns),
+               average(&GatherReadTiming::scatter_start_skew_ns),
+               average(&GatherReadTiming::scatter_worker_ns),
+               average(&GatherReadTiming::scatter_encode_ns),
+               average(&GatherReadTiming::scatter_sq_write_ns),
+               average(&GatherReadTiming::scatter_doorbell_ns));
 }
 
 }

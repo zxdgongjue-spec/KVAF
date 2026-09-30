@@ -707,6 +707,7 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
     request.timing->ack_post_ns = device_status.ack_post_ns;
     request.timing->ack_cq_ns = device_status.ack_cq_ns;
     request.timing->ack_cache_ns = device_status.ack_cache_ns;
+    request.timing->output_layout_ns = device_status.output_layout_ns;
     request.timing->scatter_cache_ns = device_status.scatter_cache_ns;
     request.timing->scatter_plan_ns = device_status.scatter_plan_ns;
     request.timing->scatter_post_ns = device_status.scatter_post_ns;
@@ -721,6 +722,7 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
   }
   bool complete = copy == ACL_SUCCESS;
   std::uint64_t scatter_begin = UINT64_MAX;
+  std::uint64_t latest_begin = 0U;
   std::uint64_t scatter_end = 0U;
   if (request.timing != nullptr) {
     request.timing->aicpu_cores = arguments.worker_count;
@@ -729,6 +731,12 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
     request.timing->scatter_cq_ns = 0U;
     request.timing->read_wqes = 0U;
     request.timing->scatter_total_ns = 0U;
+    request.timing->scatter_init_ns = 0U;
+    request.timing->scatter_encode_ns = 0U;
+    request.timing->scatter_sq_write_ns = 0U;
+    request.timing->scatter_doorbell_ns = 0U;
+    request.timing->scatter_start_skew_ns = 0U;
+    request.timing->scatter_worker_ns = 0U;
   }
   for (std::uint32_t worker = 0U; copy == ACL_SUCCESS && worker < arguments.worker_count;
        ++worker) {
@@ -743,6 +751,7 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
     complete = complete && valid_status;
     if (valid_status) {
       scatter_begin = std::min(scatter_begin, worker_status.scatter_begin_ns);
+      latest_begin = std::max(latest_begin, worker_status.scatter_begin_ns);
       scatter_end = std::max(scatter_end, worker_status.scatter_end_ns);
       if (request.timing != nullptr) {
         request.timing->scatter_plan_ns = std::max(request.timing->scatter_plan_ns,
@@ -751,6 +760,16 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
                                                    worker_status.scatter_post_ns);
         request.timing->scatter_cq_ns = std::max(request.timing->scatter_cq_ns,
                                                  worker_status.scatter_cq_ns);
+        request.timing->scatter_init_ns = std::max(request.timing->scatter_init_ns,
+                                                   worker_status.scatter_init_ns);
+        request.timing->scatter_encode_ns = std::max(request.timing->scatter_encode_ns,
+                                                     worker_status.scatter_encode_ns);
+        request.timing->scatter_sq_write_ns = std::max(request.timing->scatter_sq_write_ns,
+                                                       worker_status.scatter_sq_write_ns);
+        request.timing->scatter_doorbell_ns = std::max(request.timing->scatter_doorbell_ns,
+                                                       worker_status.scatter_doorbell_ns);
+        request.timing->scatter_worker_ns = std::max(request.timing->scatter_worker_ns,
+            worker_status.scatter_end_ns - worker_status.scatter_begin_ns);
         request.timing->read_wqes += worker_status.read_wqes;
       }
     }
@@ -768,8 +787,10 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
                  static_cast<unsigned long long>(worker_status.sequence),
                  request.output_span_count, request.sgl_size);
   }
-  if (complete && request.timing != nullptr)
+  if (complete && request.timing != nullptr) {
     request.timing->scatter_total_ns = scatter_end - scatter_begin;
+    request.timing->scatter_start_skew_ns = latest_begin - scatter_begin;
+  }
   if (sync != ACL_SUCCESS) return Internal("AICPU URMA GatherRead stream synchronization failed");
   if (!complete)
     return Internal("AICPU URMA GatherRead device completion failed");

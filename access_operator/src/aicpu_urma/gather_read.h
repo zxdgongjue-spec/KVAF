@@ -9,6 +9,8 @@ namespace kvaf::aicpu_urma {
 
 constexpr std::uint64_t kGatherStatusMagic = 0x4b56414647415448ULL;
 constexpr std::uint32_t kGatherScratchBytes = 64U;
+constexpr std::uint32_t kGatherWorkerCounterSlot = 0U;
+constexpr std::uint32_t kGatherStagingOffsetSlot = 1U;
 
 struct GatherReadStatus {
   std::uint64_t magic;
@@ -39,6 +41,11 @@ struct GatherReadStatus {
   kvaf::peer::GatherCpuProfile cpu;
   std::uint64_t scatter_begin_ns;
   std::uint64_t scatter_end_ns;
+  std::uint64_t output_layout_ns;
+  std::uint64_t scatter_init_ns;
+  std::uint64_t scatter_encode_ns;
+  std::uint64_t scatter_sq_write_ns;
+  std::uint64_t scatter_doorbell_ns;
 };
 
 struct GatherReadArgs {

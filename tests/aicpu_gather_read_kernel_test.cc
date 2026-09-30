@@ -549,11 +549,25 @@ void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count) {
   };
   for (std::uint32_t round = 1U; round <= 3U; ++round) {
     args.sequence = round;
+    total_bytes = 0U;
+    for (std::uint32_t index = 0U; index < span_count; ++index) {
+      targets[index].length = (index + round) % 7U + 1U;
+      sources[index].length = targets[index].length;
+      total_bytes += targets[index].length;
+    }
+    args.bytes = total_bytes;
     output.fill(0xa5U);
     for (std::uint32_t index = 0U; index < args.output_extent; ++index)
       remote[index] = static_cast<std::uint8_t>(index + round);
     prepare_sources();
     assert(KvafAicpuUrmaGatherRead(&args) == 0U);
+    for (std::uint32_t worker = 0U; worker < workers; ++worker) {
+      std::uint64_t expected_offset = 0U;
+      const auto first = span_count * worker / workers;
+      for (std::uint32_t index = 0U; index < first; ++index)
+        expected_offset += targets[index].length;
+      assert(queues[worker].reserved[kvaf::aicpu_urma::kGatherStagingOffsetSlot] == expected_offset);
+    }
     for (std::uint32_t index = 0U; index < args.output_extent; ++index)
       assert(output[index] == 0xa5U);
     const auto results = run_scatter();
@@ -566,6 +580,11 @@ void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count) {
       assert(status.magic == kvaf::aicpu_urma::kGatherStatusMagic && status.sequence == round);
       assert(status.result == 0U && status.scatter_begin_ns > 0U);
       assert(status.scatter_end_ns >= status.scatter_begin_ns);
+      assert(status.scatter_post_ns == status.scatter_encode_ns + status.scatter_sq_write_ns +
+                                          status.scatter_doorbell_ns);
+      assert(status.scatter_init_ns + status.scatter_plan_ns + status.scatter_post_ns +
+                 status.scatter_cq_ns <= status.scatter_end_ns - status.scatter_begin_ns);
+      if (status.read_wqes != 0U) assert(status.scatter_post_ns > 0U);
       assert(status.sq_producer_index == queues[worker].sq_producer_index);
       assert(status.cq_consumer_index == queues[worker].cq_consumer_index);
       assert(status.scatter_cache_ns == 0U);

@@ -100,7 +100,9 @@ GatherRead 默认使用一个 AICPU core；`--aicpu-cores 2/4/8` 开启多核 RE
 Host 在同一 ACL stream 上顺序排入两个 kernel：单 block 的 GatherRead 负责
 WRITE 源清单、通知一次 CPU、轮询 gather ACK；随后 N block 的 GatherScatter
 将目标 span 按索引分为 N 个连续区间。各 block 用原子计数获取唯一 worker ID，
-累加前置 span 长度得到自己的 staging 起始地址，然后独立组 WQE、写 SQ、
+控制核在已有的目标 span 校验遍历中同时计算每核 staging 起点，存入该核
+queue state 的保留槽位；READ block 直接读取起点，不再逐核扫描前置 span。
+每轮重新计算，源和目标布局变化时不会复用旧偏移。然后各核独立组 WQE、写 SQ、
 敲 doorbell、等待自己的 READ CQE。没有跨 block 自旋屏障，也没有设备端
 OpenMP 或新建 std::thread；并行 block 由 ACL/AICPU Runtime 调度。
 CPU gather 算法和线程数不受此参数影响；用于准备源数据的 BatchPut/Get 仍为单核。
@@ -196,11 +198,22 @@ CQ 缓存行维护计入 `ack_cq_ns` / `scatter_cq_ns` 等完成等待时间，�
 不能从 Host 模拟推断。
 
 `AICPU READ staging -> HBM` 取所有 worker 最早开始到最后完成的墙钟区间，
-包含各 worker 的 staging 偏移计算、WQE 规划、编码提交和 CQ 等待，不是各核耗时之和。
+包含各 worker 的领号、初始化、WQE 规划、编码提交和 CQ 等待，不是各核耗时之和。
 多核日志中的 plan/post/cq 分别取每轮各核最大值；它们可能来自不同核，
 互相重叠，不能相加还原 READ 总时间。`read_wqes` 是所有核之和；分片边界
 可能产生额外的尾部 WQE。额外 kernel 调度开销仍包含在 Host stream 等待和
 GatherRead 总耗时中，不包含在首个 READ worker 开始之前的设备 READ 区间。
+
+`AICPU validate HBM targets and prepare worker starts` 是控制核在通知 CPU 前
+执行的一次布局校验与起点计算，包含在 Host 等待中，不在 READ worker 区间内。
+`Worker initialization` 覆盖 READ block 进入后的原子领号、状态/队列准备和起点读取。
+`Build local SGL` 是按该核目标 span 生成本地 SGE 列表；`Within submit` 的
+编码（含批次参数检查）、SQ 批量拷贝、doorbell 与内存屏障均包含在 `Submit WQEs` 中。
+细分采样每组最多 24 个 WQEBB 执行两次额外时钟读取，不逐 WQE 打点；
+采样本身有开销。各阶段多核最大值可能来自不同核，不能相加。
+`Worker start spread` 是最晚与最早 READ block 进入时间之差；`Longest worker duration`
+是单核进入到完成的最长区间。两者用于识别调度错开与单核耗时，均在 READ 墙钟内，
+不是额外阶段，也不能相加。READ 分组数组只在填充实际 WQE 时清零，避免整数组重复清零。
 
 服务端加 `--gather-notify-profile` 后，直连 CPU worker 退出时输出一行
 `GATHER_NOTIFY_POLL`。此采样有开销，正式测带宽时不要启用。

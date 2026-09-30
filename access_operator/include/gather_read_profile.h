@@ -31,6 +31,13 @@ struct GatherReadTiming {
   std::uint64_t scatter_post_ns{0U};
   std::uint64_t scatter_cq_ns{0U};
   std::uint64_t scatter_total_ns{0U};
+  std::uint64_t output_layout_ns{0U};
+  std::uint64_t scatter_init_ns{0U};
+  std::uint64_t scatter_encode_ns{0U};
+  std::uint64_t scatter_sq_write_ns{0U};
+  std::uint64_t scatter_doorbell_ns{0U};
+  std::uint64_t scatter_start_skew_ns{0U};
+  std::uint64_t scatter_worker_ns{0U};
   std::uint64_t aicpu_cores{1U};
   std::uint64_t cpu_dispatch_ns{0U};
   std::uint64_t cpu_notify_spin_ns{0U};

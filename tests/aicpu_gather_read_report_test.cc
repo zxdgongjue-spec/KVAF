@@ -84,9 +84,17 @@ int main() {
 
   first.aicpu_cores = 4U;
   first.scatter_total_ns = 6500U;
+  first.output_layout_ns = 2300U;
+  first.scatter_init_ns = 700U;
+  first.scatter_encode_ns = 1000U;
+  first.scatter_sq_write_ns = 1500U;
+  first.scatter_doorbell_ns = 500U;
+  first.scatter_start_skew_ns = 1500U;
+  first.scatter_worker_ns = 5000U;
   std::FILE* parallel_output = std::tmpfile();
   assert(parallel_output != nullptr);
   kvaf::aicpu_gather_read_client::PrintGatherReadTimeline(parallel_output, 1.5, {first});
+  kvaf::aicpu_gather_read_client::PrintGatherReadTechnicalProfile(parallel_output, {first});
   std::rewind(parallel_output);
   std::string parallel_report;
   while ((bytes = std::fread(buffer, 1U, sizeof(buffer), parallel_output)) != 0U)
@@ -95,4 +103,12 @@ int main() {
   assert(parallel_report.find("AICPU READ staging -> HBM: 6.500 us") != std::string::npos);
   assert(parallel_report.find("4 AICPU cores, independent SQ/CQ") != std::string::npos);
   assert(parallel_report.find("must not be added") != std::string::npos);
+  assert(parallel_report.find("prepare worker starts: 2.300 us") != std::string::npos);
+  assert(parallel_report.find("Worker initialization: 0.700 us") != std::string::npos);
+  assert(parallel_report.find("Within submit: Encode WQEs: 1.000 us | Write SQ: 1.500 us") !=
+         std::string::npos);
+  assert(parallel_report.find("Doorbell and barriers: 0.500 us") != std::string::npos);
+  assert(parallel_report.find("Worker start spread: 1.500 us | Longest worker duration: 5.000 us") !=
+         std::string::npos);
+  assert(parallel_report.find("encode=1000 sq_write=1500 doorbell_barriers=500") != std::string::npos);
 }
