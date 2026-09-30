@@ -27,6 +27,7 @@ struct Options {
   std::uint32_t block_bytes{4096U};
   std::uint32_t output_stride{0U};
   std::uint32_t sgl_size{kvaf::kGatherMaxSglSize};
+  std::uint32_t aicpu_cores{1U};
   std::uint32_t warmup{1U};
   std::uint32_t iterations{3U};
   bool urma_descriptors{true};
@@ -37,7 +38,7 @@ void Usage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s [--peer HOST:PORT] [--device-id N] [--kernel-json PATH] "
                "[--blocks N] [--block-bytes N] [--output-stride N] [--sgl-size N] "
-               "[--warmup N] [--iterations N] [--descriptor-transport urma|rpc] "
+               "[--warmup N] [--iterations N] [--aicpu-cores 1|2|4|8] [--descriptor-transport urma|rpc] "
                "[--profile-detail 0|1]\n"
                "Defaults: descriptor-transport=urma, output-stride=2*block-bytes, sgl-size=%u "
                "(positive; each READ WQE uses at most %u SGE)\n",
@@ -66,6 +67,7 @@ bool Parse(int argc, char** argv, Options* options) {
       else if (flag == "--block-bytes") parsed.block_bytes = static_cast<std::uint32_t>(number);
       else if (flag == "--output-stride") parsed.output_stride = static_cast<std::uint32_t>(number);
       else if (flag == "--sgl-size") parsed.sgl_size = static_cast<std::uint32_t>(number);
+      else if (flag == "--aicpu-cores") parsed.aicpu_cores = static_cast<std::uint32_t>(number);
       else if (flag == "--warmup") parsed.warmup = static_cast<std::uint32_t>(number);
       else if (flag == "--iterations") parsed.iterations = static_cast<std::uint32_t>(number);
       else if (flag == "--profile-detail" && number <= 1U)
@@ -76,6 +78,8 @@ bool Parse(int argc, char** argv, Options* options) {
   if (parsed.peer.empty() || parsed.kernel_json.empty() || parsed.device_id > INT32_MAX ||
       parsed.blocks == 0U || parsed.blocks > kvaf::peer::kMaxGatherSpans ||
       parsed.block_bytes == 0U || parsed.iterations == 0U ||
+      (parsed.aicpu_cores != 1U && parsed.aicpu_cores != 2U &&
+       parsed.aicpu_cores != 4U && parsed.aicpu_cores != 8U) ||
       parsed.sgl_size == 0U ||
       static_cast<std::uint64_t>(parsed.blocks) * parsed.block_bytes > UINT32_MAX - 64U)
     return false;
@@ -272,7 +276,7 @@ int Run(const Options& options) {
   kvaf::NpuRuntimeOptions runtime_options("", options.block_bytes, 1U);
   runtime_options.aicpu_urma_kernel_json_path = options.kernel_json;
   runtime_options.device_id = options.device_id;
-  runtime_options.npu_core_count = 1U;
+  runtime_options.npu_core_count = options.aicpu_cores;
   runtime_options.jettys_per_core = 1U;
   kvaf::NpuRuntime runtime(std::move(runtime_options));
   Check(runtime.LinkTo({options.peer}), "LinkTo");
@@ -306,10 +310,11 @@ int Run(const Options& options) {
     kvaf::aicpu_gather_read_client::PrintGatherReadTechnicalProfile(stdout, profiles);
   std::fprintf(stdout,
                "AICPU_GATHER_READ_PASS blocks=%u block_bytes=%u bytes=%zu "
-               "output_stride=%u sgl_size=%u wqe_sgl_size=%u descriptor_transport=%s "
+               "output_stride=%u sgl_size=%u wqe_sgl_size=%u aicpu_cores=%u descriptor_transport=%s "
                "warmup=%u iterations=%u\n",
                options.blocks, options.block_bytes, payload, options.output_stride,
                options.sgl_size, std::min(options.sgl_size, kvaf::kGatherMaxSglSize),
+               options.aicpu_cores,
                options.urma_descriptors ? "urma" : "rpc",
                options.warmup, options.iterations);
   return 0;

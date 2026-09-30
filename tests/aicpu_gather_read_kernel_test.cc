@@ -13,6 +13,7 @@
 #include <vector>
 
 extern "C" std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args);
+extern "C" std::uint32_t KvafAicpuUrmaGatherScatter(kvaf::aicpu_urma::GatherReadArgs* args);
 
 void TestRpcGather() {
   std::array<std::uint8_t, 256> remote{};
@@ -401,9 +402,229 @@ void TestScatterStagingBoundary() {
   }
 }
 
+void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count) {
+  using kvaf::aicpu_urma::GatherReadStatus;
+  constexpr std::uint32_t depth = 128U;
+  alignas(64) std::array<std::uint8_t, 4096> remote{};
+  std::array<std::uint8_t, 2048> output{};
+  std::vector<kvaf::GatherOutputSpan> targets(span_count);
+  std::vector<kvaf::peer::GatherSpan> sources(span_count);
+  std::array<KvafBatchGetDirectUrmaEntity, 8> entities{};
+  std::array<KvafBatchGetQueueState, 8> queues{};
+  alignas(64) std::array<std::uint8_t, 8U * KVAF_AIV_BATCH_GET_STATUS_BYTES> statuses{};
+  std::array<std::array<std::uint32_t, depth * 16U>, 8> sq{};
+  std::array<std::array<std::uint32_t, 64U * 8U>, 8> cq{};
+  std::array<std::uint32_t, 8> sq_doorbells{};
+  std::array<std::uint32_t, 8> cq_doorbells{};
+  const auto base = reinterpret_cast<std::uint64_t>(remote.data());
+  std::uint32_t total_bytes = 0U;
+  for (std::uint32_t index = 0U; index < span_count; ++index) {
+    targets[index] = {(span_count - 1U - index) * 16U, index % 7U + 1U, 0U};
+    sources[index] = {base + targets[index].offset, targets[index].length, 0U};
+    total_bytes += targets[index].length;
+  }
+  for (std::uint32_t worker = 0U; worker < workers; ++worker) {
+    auto& entity = entities[worker];
+    entity.magic = 0x4b564155U;
+    entity.version = 1U;
+    entity.remote_host_ddr_address = base;
+    entity.remote_host_ddr_size = remote.size();
+    entity.remote_token_id = 3U;
+    entity.remote_token_value = 4U;
+    entity.local_hbm_address = reinterpret_cast<std::uint64_t>(output.data());
+    entity.local_hbm_size = output.size();
+    entity.local_token_id = worker + 7U;
+    entity.sq_va = reinterpret_cast<std::uint64_t>(sq[worker].data());
+    entity.sq_db_va = reinterpret_cast<std::uint64_t>(&sq_doorbells[worker]);
+    entity.sq_depth = depth;
+    entity.wqe_size = 64U;
+    entity.cq_va = reinterpret_cast<std::uint64_t>(cq[worker].data());
+    entity.cq_db_va = reinterpret_cast<std::uint64_t>(&cq_doorbells[worker]);
+    entity.cq_depth = 64U;
+    entity.cqe_size = 32U;
+    entity.tp_id = worker + 5U;
+    queues[worker].magic = 0x4b564151U;
+    queues[worker].initialized = 1U;
+    queues[worker].sq_producer_index = depth - 4U;
+    sq_doorbells[worker] = depth - 4U;
+  }
+  kvaf::aicpu_urma::GatherReadArgs args{};
+  args.channel_entity = reinterpret_cast<std::uint64_t>(entities.data());
+  args.queue_state = reinterpret_cast<std::uint64_t>(queues.data());
+  args.core_status = reinterpret_cast<std::uint64_t>(statuses.data());
+  args.output = entities[0].local_hbm_address;
+  args.output_spans = reinterpret_cast<std::uint64_t>(targets.data());
+  args.output_extent = span_count * 16U;
+  args.output_span_count = span_count;
+  args.sgl_size = 6U;
+  args.bytes = total_bytes;
+  args.worker_count = workers;
+  args.remote_staging = base + 1024U;
+  args.remote_notify = base + 3008U;
+  args.remote_ack = base + 3016U;
+  args.remote_command = base + 3024U;
+  args.remote_descriptor = base + 2048U;
+  args.source_descriptor = args.output + ((args.output_extent + 63U) & ~std::uint64_t{63U}) +
+      kvaf::aicpu_urma::kGatherScratchBytes;
+  args.source_span_count = span_count;
+  std::atomic<bool> stopped{false};
+  std::atomic<std::uint32_t> notifications{0U};
+  std::atomic<int> error_worker{-1};
+  std::vector<std::thread> hardware;
+  for (std::uint32_t worker = 0U; worker < workers; ++worker) {
+    hardware.emplace_back([&, worker] {
+      std::uint32_t producer = depth - 4U;
+      std::uint32_t completion = 0U;
+      const auto address = [](std::uint32_t low, std::uint32_t high) {
+        return static_cast<std::uint64_t>(low) | (static_cast<std::uint64_t>(high) << 32U);
+      };
+      while (!stopped.load(std::memory_order_acquire)) {
+        if (__atomic_load_n(&sq_doorbells[worker], __ATOMIC_ACQUIRE) == producer) {
+          std::this_thread::yield();
+          continue;
+        }
+        const auto* first = sq[worker].data() + (producer % depth) * 16U;
+        const auto opcode = (first[1] >> 8U) & 0xffU;
+        const auto blocks = opcode == kvaf::aicpu_urma::kWriteWithNotifyOpcode
+            ? 2U : opcode == kvaf::aicpu_urma::kWriteOpcode
+                ? 1U : kvaf::aicpu_urma::ScatterWqebbs(first[2] >> 24U);
+        std::array<std::uint32_t, kvaf::aicpu_urma::kMaxScatterWqebbs * 16U> words{};
+        for (std::uint32_t block = 0U; block < blocks; ++block)
+          std::memcpy(words.data() + block * 16U,
+                      sq[worker].data() + ((producer + block) % depth) * 16U, 64U);
+        if (opcode == kvaf::aicpu_urma::kWriteOpcode) {
+          assert(worker == 0U && address(words[10], words[11]) == args.remote_descriptor);
+          std::memcpy(reinterpret_cast<void*>(args.remote_descriptor),
+                      reinterpret_cast<const void*>(address(words[14], words[15])), words[12]);
+        } else if (opcode == kvaf::aicpu_urma::kWriteWithNotifyOpcode) {
+          assert(worker == 0U);
+          const auto sequence = address(words[16], words[17]);
+          kvaf::peer::GatherDescriptorHeader header{};
+          std::memcpy(&header, reinterpret_cast<const void*>(args.remote_descriptor), sizeof(header));
+          assert(header.sequence == sequence && header.span_count == span_count);
+          std::vector<kvaf::peer::GatherSpan> received(span_count);
+          std::memcpy(received.data(), reinterpret_cast<const std::uint8_t*>(args.remote_descriptor) +
+                          sizeof(header), received.size() * sizeof(received.front()));
+          assert(kvaf::peer::ValidateDirectGather(base, remote.size(), args.remote_descriptor,
+                                                 header, received));
+          kvaf::peer::GatherIntoStaging(remote.data(), base, args.remote_staging, received);
+          std::memcpy(reinterpret_cast<void*>(args.remote_notify), &sequence, 8U);
+          std::memcpy(reinterpret_cast<void*>(args.remote_ack), &sequence, 8U);
+          ++notifications;
+        } else {
+          assert(opcode == kvaf::aicpu_urma::kReadOpcode);
+          auto source = address(words[10], words[11]);
+          for (std::uint32_t index = 0U; index < words[2] >> 24U; ++index) {
+            const auto offset = 12U + index * 4U;
+            assert(words[offset + 1U] == entities[worker].local_token_id);
+            std::memcpy(reinterpret_cast<void*>(address(words[offset + 2U], words[offset + 3U])),
+                        reinterpret_cast<const void*>(source), words[offset]);
+            source += words[offset];
+          }
+        }
+        producer += blocks;
+        if ((words[0] & (1U << 19U)) != 0U) {
+          const auto error = error_worker.load() == static_cast<int>(worker) ? 1U << 16U : 0U;
+          const auto owner = ((completion / 64U) & 1U) == 0U ? 4U : 0U;
+          __atomic_store_n(&cq[worker][(completion++ % 64U) * 8U], owner | error, __ATOMIC_RELEASE);
+        }
+      }
+    });
+  }
+  const auto run_scatter = [&] {
+    std::vector<std::thread> cores;
+    std::array<std::uint32_t, 8> results{};
+    for (std::uint32_t core = 0U; core < workers; ++core)
+      cores.emplace_back([&, core] { results[core] = KvafAicpuUrmaGatherScatter(&args); });
+    for (auto& core : cores) core.join();
+    return results;
+  };
+  const auto prepare_sources = [&] {
+    const kvaf::peer::GatherDescriptorHeader header{
+        kvaf::peer::kGatherDescriptorMagic, args.sequence, args.remote_staging,
+        span_count, total_bytes};
+    std::memcpy(reinterpret_cast<void*>(args.source_descriptor), &header, sizeof(header));
+    std::memcpy(reinterpret_cast<std::uint8_t*>(args.source_descriptor) + sizeof(header),
+                sources.data(), sources.size() * sizeof(sources.front()));
+  };
+  for (std::uint32_t round = 1U; round <= 3U; ++round) {
+    args.sequence = round;
+    output.fill(0xa5U);
+    for (std::uint32_t index = 0U; index < args.output_extent; ++index)
+      remote[index] = static_cast<std::uint8_t>(index + round);
+    prepare_sources();
+    assert(KvafAicpuUrmaGatherRead(&args) == 0U);
+    for (std::uint32_t index = 0U; index < args.output_extent; ++index)
+      assert(output[index] == 0xa5U);
+    const auto results = run_scatter();
+    assert(queues[0].reserved[0] == workers);
+    std::uint64_t wqes = 0U;
+    for (std::uint32_t worker = 0U; worker < workers; ++worker) {
+      assert(results[worker] == 0U);
+      GatherReadStatus status{};
+      std::memcpy(&status, statuses.data() + worker * KVAF_AIV_BATCH_GET_STATUS_BYTES, sizeof(status));
+      assert(status.magic == kvaf::aicpu_urma::kGatherStatusMagic && status.sequence == round);
+      assert(status.result == 0U && status.scatter_begin_ns > 0U);
+      assert(status.scatter_end_ns >= status.scatter_begin_ns);
+      assert(status.sq_producer_index == queues[worker].sq_producer_index);
+      assert(status.cq_consumer_index == queues[worker].cq_consumer_index);
+      assert(status.scatter_cache_ns == 0U);
+      wqes += status.read_wqes;
+    }
+    std::uint32_t expected_wqes = 0U;
+    for (std::uint32_t worker = 0U; worker < workers; ++worker) {
+      const auto first = span_count * worker / workers;
+      const auto last = span_count * (worker + 1U) / workers;
+      expected_wqes += (last - first + 5U) / 6U;
+    }
+    assert(wqes == expected_wqes && notifications.load() == round);
+    std::array<std::uint8_t, 2048> expected{};
+    expected.fill(0xa5U);
+    std::size_t prefix = 0U;
+    for (const auto& span : targets) {
+      std::memcpy(expected.data() + span.offset, remote.data() + 1024U + prefix, span.length);
+      prefix += span.length;
+    }
+    assert(std::memcmp(output.data(), expected.data(), args.output_extent) == 0);
+    assert(KvafAicpuUrmaGatherScatter(&args) != 0U);
+  }
+  args.sequence = 4U;
+  prepare_sources();
+  assert(KvafAicpuUrmaGatherRead(&args) == 0U);
+  error_worker.store(static_cast<int>(workers - 1U));
+  run_scatter();
+  GatherReadStatus failed{};
+  std::memcpy(&failed, statuses.data() + (workers - 1U) * KVAF_AIV_BATCH_GET_STATUS_BYTES, sizeof(failed));
+  assert(failed.result == 8U && (failed.cqe_word & (1U << 16U)) != 0U);
+  error_worker.store(-1);
+  args.sequence = 5U;
+  prepare_sources();
+  assert(KvafAicpuUrmaGatherRead(&args) == 0U);
+  entities[workers - 1U].local_token_id = 0U;
+  run_scatter();
+  std::memcpy(&failed, statuses.data() + (workers - 1U) * KVAF_AIV_BATCH_GET_STATUS_BYTES, sizeof(failed));
+  assert(failed.result == 2U && failed.sequence == args.sequence);
+  entities[workers - 1U].local_token_id = workers + 6U;
+  args.sequence = 6U;
+  ++args.bytes;
+  assert(KvafAicpuUrmaGatherRead(&args) != 0U);
+  const auto before = queues;
+  run_scatter();
+  for (std::uint32_t worker = 0U; worker < workers; ++worker)
+    assert(queues[worker].sq_producer_index == before[worker].sq_producer_index);
+  assert(notifications.load() == 5U);
+  stopped.store(true, std::memory_order_release);
+  for (auto& device : hardware) device.join();
+}
+
 int main() {
   TestRpcGather();
   TestUrmaDescriptorGather();
   TestScatterStagingBoundary();
+  TestParallelScatter(2U, 41U);
+  TestParallelScatter(4U, 41U);
+  TestParallelScatter(8U, 41U);
+  TestParallelScatter(8U, 9U);
+  TestParallelScatter(8U, 3U);
   std::cout << "AICPU gather/read kernel simulation: PASS\n";
 }

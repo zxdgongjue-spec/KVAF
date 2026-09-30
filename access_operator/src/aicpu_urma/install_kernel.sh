@@ -30,6 +30,7 @@ check_artifacts() {
   grep -Fq '"KvafAicpuUrmaBatchPut"' "$dir/kernel.json" || die "BatchPut missing from $dir/kernel.json"
   grep -Fq '"KvafAicpuUrmaBatchGet"' "$dir/kernel.json" || die "BatchGet missing from $dir/kernel.json"
   grep -Fq '"KvafAicpuUrmaGatherRead"' "$dir/kernel.json" || die "GatherRead missing from $dir/kernel.json"
+  grep -Fq '"KvafAicpuUrmaGatherScatter"' "$dir/kernel.json" || die "GatherScatter missing from $dir/kernel.json"
 }
 
 check_installed() {
@@ -40,6 +41,7 @@ check_installed() {
   grep -Fq '"KvafAicpuUrmaBatchPut"' "$config_dir/$json" || die "installed JSON lacks BatchPut"
   grep -Fq '"KvafAicpuUrmaBatchGet"' "$config_dir/$json" || die "installed JSON lacks BatchGet"
   grep -Fq '"KvafAicpuUrmaGatherRead"' "$config_dir/$json" || die "installed JSON lacks GatherRead"
+  grep -Fq '"KvafAicpuUrmaGatherScatter"' "$config_dir/$json" || die "installed JSON lacks GatherScatter"
   count="$(grep -Fxc "$header" "$load_config" || true)"
   [[ "$count" == 1 ]] || die "expected one $header entry in $load_config, found $count"
   block="$(grep -A4 -Fx "$header" "$load_config")"

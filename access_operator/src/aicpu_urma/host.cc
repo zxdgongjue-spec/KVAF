@@ -14,9 +14,10 @@ aclrtBinHandle binary = nullptr;
 aclrtFuncHandle put_function = nullptr;
 aclrtFuncHandle get_function = nullptr;
 aclrtFuncHandle gather_function = nullptr;
+aclrtFuncHandle scatter_function = nullptr;
 
 int32_t Launch(aclrtFuncHandle function, void* arguments, std::size_t bytes,
-               aclrtStream stream) {
+               aclrtStream stream, std::uint32_t blocks = 1U) {
   if (function == nullptr || arguments == nullptr || stream == nullptr) return -1;
   aclrtLaunchKernelAttr attribute{};
   attribute.id = ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT;
@@ -24,7 +25,7 @@ int32_t Launch(aclrtFuncHandle function, void* arguments, std::size_t bytes,
   aclrtLaunchKernelCfg config{};
   config.numAttrs = 1U;
   config.attrs = &attribute;
-  const aclError result = aclrtLaunchKernelWithHostArgs(function, 1U, stream,
+  const aclError result = aclrtLaunchKernelWithHostArgs(function, blocks, stream,
                                                        &config, arguments, bytes, nullptr, 0U);
   if (result != ACL_SUCCESS) {
     std::fprintf(stderr, "[KVAF_AICPU_URMA] kernel launch failed acl=%d\n", static_cast<int>(result));
@@ -54,12 +55,14 @@ bool Load(const char* json_path) {
   if (aclrtBinaryLoadFromFile(resolved, &options, &loaded) != ACL_SUCCESS ||
       aclrtBinaryGetFunction(loaded, "KvafAicpuUrmaBatchPut", &put_function) != ACL_SUCCESS ||
       aclrtBinaryGetFunction(loaded, "KvafAicpuUrmaBatchGet", &get_function) != ACL_SUCCESS ||
-      aclrtBinaryGetFunction(loaded, "KvafAicpuUrmaGatherRead", &gather_function) != ACL_SUCCESS) {
+      aclrtBinaryGetFunction(loaded, "KvafAicpuUrmaGatherRead", &gather_function) != ACL_SUCCESS ||
+      aclrtBinaryGetFunction(loaded, "KvafAicpuUrmaGatherScatter", &scatter_function) != ACL_SUCCESS) {
     std::fprintf(stderr, "[KVAF_AICPU_URMA] failed to load AICPU kernel path=%s\n", resolved);
     if (loaded != nullptr) (void)aclrtBinaryUnLoad(loaded);
     put_function = nullptr;
     get_function = nullptr;
     gather_function = nullptr;
+    scatter_function = nullptr;
     return false;
   }
   binary = loaded;
@@ -77,8 +80,11 @@ int32_t LaunchGet(const KvafExecuteBatchGetKernelArgs* arguments, aclrtStream st
 }
 
 int32_t LaunchGatherRead(const GatherReadArgs* arguments, aclrtStream stream) {
-  return Launch(gather_function, const_cast<GatherReadArgs*>(arguments),
-                sizeof(*arguments), stream);
+  if (Launch(gather_function, const_cast<GatherReadArgs*>(arguments),
+             sizeof(*arguments), stream) != 0) return -1;
+  if (arguments->worker_count <= 1U) return 0;
+  return Launch(scatter_function, const_cast<GatherReadArgs*>(arguments),
+                sizeof(*arguments), stream, arguments->worker_count);
 }
 
 }  // namespace kvaf::aicpu_urma

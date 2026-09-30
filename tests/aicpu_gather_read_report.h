@@ -26,6 +26,13 @@ inline void PrintGatherReadTimeline(std::FILE* output, double mean_ms,
   const double plan_us = average_us(&GatherReadTiming::scatter_plan_ns);
   const double post_us = average_us(&GatherReadTiming::scatter_post_ns);
   const double cq_us = average_us(&GatherReadTiming::scatter_cq_ns);
+  double read_us = 0.0;
+  for (const auto& profile : profiles)
+    read_us += static_cast<double>(profile.scatter_total_ns != 0U
+        ? profile.scatter_total_ns
+        : profile.scatter_plan_ns + profile.scatter_post_ns + profile.scatter_cq_ns);
+  read_us /= profiles.size() * 1000.0;
+  const bool parallel = average(&GatherReadTiming::aicpu_cores) > 1.0;
   const bool direct = average(&GatherReadTiming::source_write_ns) > 0.0;
 
   std::fprintf(output,
@@ -85,12 +92,16 @@ inline void PrintGatherReadTimeline(std::FILE* output, double mean_ms,
   }
   std::fprintf(output,
                "      CPU gather DDR -> staging: %.3f us\n"
-               "    AICPU READ staging -> HBM: %.3f us (%.2f READ WQEs on average)\n"
+               "    AICPU READ staging -> HBM: %.3f us (%.2f READ WQEs on average)\n",
+               copy_us, read_us, average(&GatherReadTiming::read_wqes));
+  if (parallel)
+    std::fprintf(output,
+                 "      %.0f AICPU cores, independent SQ/CQ; READ time is wall-clock, not a sum.\n"
+                 "      Details below are per-round maxima across cores; they overlap and must not be added.\n",
+                 average(&GatherReadTiming::aicpu_cores));
+  std::fprintf(output,
                "      Build READ WQEs: %.3f us\n"
                "      Submit WQEs (encode, write SQ, doorbell): %.3f us | Wait for READ completions: %.3f us\n",
-               copy_us,
-               plan_us + post_us + cq_us,
-               average(&GatherReadTiming::read_wqes),
                plan_us, post_us, cq_us);
   std::fprintf(output,
                "  3 Host finishes: Release HBM reference: %.3f us | Read status: %.3f us\n"
@@ -148,12 +159,15 @@ inline void PrintGatherReadTechnicalProfile(std::FILE* output,
                average(&GatherReadTiming::cpu_copy_ns));
   std::fprintf(output,
                "  AICPU data: scatter_cache=%.0f scatter_plan=%.0f "
-               "scatter_post=%.0f scatter_cq=%.0f read_wqes=%.2f\n",
+               "scatter_post=%.0f scatter_cq=%.0f read_wqes=%.2f scatter_wall=%.0f cores=%.0f "
+               "(plan/post/cq: max per core, overlapping)\n",
                average(&GatherReadTiming::scatter_cache_ns),
                average(&GatherReadTiming::scatter_plan_ns),
                average(&GatherReadTiming::scatter_post_ns),
                average(&GatherReadTiming::scatter_cq_ns),
-               average(&GatherReadTiming::read_wqes));
+               average(&GatherReadTiming::read_wqes),
+               average(&GatherReadTiming::scatter_total_ns),
+               average(&GatherReadTiming::aicpu_cores));
 }
 
 }

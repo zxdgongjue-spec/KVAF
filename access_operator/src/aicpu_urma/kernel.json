@@ -19,5 +19,12 @@
       "kernelSo": "libkvaf_aicpu_urma.so",
       "opKernelLib": "AICPUKernel"
     }
+  },
+  "KvafAicpuUrmaGatherScatter": {
+    "opInfo": {
+      "functionName": "KvafAicpuUrmaGatherScatter",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
   }
 }

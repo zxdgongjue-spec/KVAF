@@ -81,4 +81,18 @@ int main() {
   assert(technical_report.find("direct_setup=1000") != std::string::npos);
   assert(technical_report.find("ack_started=4000") != std::string::npos);
   assert(technical_report.find("idle_since_previous_ack=") != std::string::npos);
+
+  first.aicpu_cores = 4U;
+  first.scatter_total_ns = 6500U;
+  std::FILE* parallel_output = std::tmpfile();
+  assert(parallel_output != nullptr);
+  kvaf::aicpu_gather_read_client::PrintGatherReadTimeline(parallel_output, 1.5, {first});
+  std::rewind(parallel_output);
+  std::string parallel_report;
+  while ((bytes = std::fread(buffer, 1U, sizeof(buffer), parallel_output)) != 0U)
+    parallel_report.append(buffer, bytes);
+  std::fclose(parallel_output);
+  assert(parallel_report.find("AICPU READ staging -> HBM: 6.500 us") != std::string::npos);
+  assert(parallel_report.find("4 AICPU cores, independent SQ/CQ") != std::string::npos);
+  assert(parallel_report.find("must not be added") != std::string::npos);
 }

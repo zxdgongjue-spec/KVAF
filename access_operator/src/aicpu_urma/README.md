@@ -5,7 +5,7 @@
 Jetty、SQ/CQ 和 token。AICPU 只从现有 transport 的 entity/queue 表生成并提交
 WRITE（BatchPut）或 READ（BatchGet）WQE，等待 CQ，写回结果。
 
-目前采用**单 AICPU worker、单 Jetty**，每 32 个请求提交一次带 completion 的
+BatchPut/BatchGet 目前采用**单 AICPU worker、单 Jetty**，每 32 个请求提交一次带 completion 的
 批次；AIV 模式保持默认不变。BatchPut 同步等待并验证状态；BatchGet 保留调用方
 `synchronize` 语义，开启同步时检查 AICPU 状态。不支持与同一 Jetty 上 AIV
 kernel 并发使用；异步 BatchGet 需要调用方在释放输出/transport 前同步 stream。
@@ -95,8 +95,17 @@ WQEBB；队列深度允许时每 64 条 WQE 在末条请求 CQE。单条 WQE 的
 
 GatherRead 的 READ WQE 先在 AICPU 本地以最多 24 个 WQEBB 为一组编码，
 再按 SQ 环绕位置批量写入；原有的每个提交批次仍只敲一次 doorbell、等待一次 CQE。
-当前 GatherRead 使用一个 AICPU core 和一套 SQ/CQ。多核并行需要按 core
-分配独立队列和 jetty，不能让多个 core 共用 SQ producer index。
+GatherRead 默认使用一个 AICPU core；`--aicpu-cores 2/4/8` 开启多核 READ。
+建链时为每个 worker 分配独立 Jetty、SQ/CQ，后续轮次复用，不共享 producer index。
+Host 在同一 ACL stream 上顺序排入两个 kernel：单 block 的 GatherRead 负责
+WRITE 源清单、通知一次 CPU、轮询 gather ACK；随后 N block 的 GatherScatter
+将目标 span 按索引分为 N 个连续区间。各 block 用原子计数获取唯一 worker ID，
+累加前置 span 长度得到自己的 staging 起始地址，然后独立组 WQE、写 SQ、
+敲 doorbell、等待自己的 READ CQE。没有跨 block 自旋屏障，也没有设备端
+OpenMP 或新建 std::thread；并行 block 由 ACL/AICPU Runtime 调度。
+CPU gather 算法和线程数不受此参数影响；用于准备源数据的 BatchPut/Get 仍为单核。
+单核保留原先一次 kernel launch，多核多一次 launch，因此小 batch 可能更慢。
+多核性能尚未在真实设备验证；先做小 batch 正确性测试，再对比相同 workload。
 
 GatherRead 仅在每次轮询 AICPU CQE 前清理并失效对应缓存行；CPU 通知、ack、
 descriptor、源 DDR、staging 和 AICPU 的描述符、SQ、HBM 输出、状态缓冲
@@ -127,14 +136,25 @@ batch 比较 `--gather-threads 1/4/8/16` 后再选线程数。可用 `taskset`
 # CPU 终端
 ./build.sh cpu
 build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999 \
-  --gather-threads 8 --gather-mode adaptive --gather-affinity on
+  --gather-threads 8 --gather-mode adaptive --gather-affinity off
 
 # NPU 终端
 ./build.sh aicpu-urma --install-kernel
 build-aicpu-urma/tests/kvaf_aicpu_gather_read_client \
   --peer CPU_HOST:28999 --device-id 0 \
   --blocks 16 --block-bytes 4096 --output-stride 8192 --sgl-size 6 \
-  --warmup 1 --iterations 5
+  --aicpu-cores 4 --warmup 1 --iterations 5
+```
+
+相同输入对比单核和多核（同机使用以下 peer；跨机器替换 CPU 地址）：
+
+```bash
+for cores in 1 2 4 8; do
+  build-aicpu-urma/tests/kvaf_aicpu_gather_read_client \
+    --peer 127.0.0.1:28999 --device-id 6 \
+    --blocks 4096 --block-bytes 656 --output-stride 1312 --sgl-size 6 \
+    --aicpu-cores "$cores" --warmup 10 --iterations 1000 --profile-detail 1
+done
 ```
 
 默认 `--descriptor-transport urma`。同一参数另起一次客户端进程，指定
@@ -174,6 +194,13 @@ CPU gather 握手和 CQ 等待，不含输入上传、输出回读及逐字节�
 CQ 缓存行维护计入 `ack_cq_ns` / `scatter_cq_ns` 等完成等待时间，不计入
 `ack_cache_ns`；其余缓存维护禁用后的正确性和性能尚需目标机器验证，
 不能从 Host 模拟推断。
+
+`AICPU READ staging -> HBM` 取所有 worker 最早开始到最后完成的墙钟区间，
+包含各 worker 的 staging 偏移计算、WQE 规划、编码提交和 CQ 等待，不是各核耗时之和。
+多核日志中的 plan/post/cq 分别取每轮各核最大值；它们可能来自不同核，
+互相重叠，不能相加还原 READ 总时间。`read_wqes` 是所有核之和；分片边界
+可能产生额外的尾部 WQE。额外 kernel 调度开销仍包含在 Host stream 等待和
+GatherRead 总耗时中，不包含在首个 READ worker 开始之前的设备 READ 区间。
 
 服务端加 `--gather-notify-profile` 后，直连 CPU worker 退出时输出一行
 `GATHER_NOTIFY_POLL`。此采样有开销，正式测带宽时不要启用。

@@ -1,6 +1,7 @@
 #include "access_operator.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -279,7 +280,7 @@ void LogBatchGetDeviceStatus(const BatchGetExecutionState& execution,
   std::vector<KvafBatchGetCoreStatus> statuses(npu_core_count);
   const aclError copy_result = aclrtMemcpy(
       statuses.data(), statuses.size() * sizeof(statuses.front()),
-      execution.status, execution.status_bytes, ACL_MEMCPY_DEVICE_TO_HOST);
+      execution.status, statuses.size() * sizeof(statuses.front()), ACL_MEMCPY_DEVICE_TO_HOST);
   if (copy_result != ACL_SUCCESS) {
     std::fprintf(stderr,
                  "[KVAF_AIV] BATCH_GET_STATUS_LOG_ERROR aclrtMemcpy=%d\n",
@@ -347,9 +348,9 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
   }
 #if defined(KVAF_ENABLE_AICPU_URMA)
   if (!impl_->config.aicpu_urma_kernel_json_path.empty() &&
-      (impl_->config.npu_core_count != 1U || impl_->config.jettys_per_core != 1U ||
+      (impl_->config.npu_core_count > 8U || impl_->config.jettys_per_core != 1U ||
        !aicpu_urma::Load(impl_->config.aicpu_urma_kernel_json_path.c_str()))) {
-    return Internal("AICPU URMA requires one worker and a loadable kernel JSON");
+    return Internal("AICPU URMA requires 1..8 workers, one Jetty per worker, and a loadable kernel JSON");
   }
 #else
   if (!impl_->config.aicpu_urma_kernel_json_path.empty()) {
@@ -425,9 +426,11 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     }
 
     KvafBatchPutTransport* batch_put_transport = nullptr;
+    const std::uint32_t put_cores = impl_->config.aicpu_urma_kernel_json_path.empty()
+        ? impl_->config.npu_core_count : 1U;
     const int32_t batch_put_result = KvafBatchPutTransportCreateWithPeerLink(
         reinterpret_cast<void*>(remote_region.base), remote_region.length,
-        impl_->config.npu_core_count, impl_->config.jettys_per_core,
+        put_cores, impl_->config.jettys_per_core,
         impl_->config.peer_link.get(), impl_->config.peer_local_eid.data(),
         &batch_put_transport);
     if (batch_put_result != KVAF_BATCH_PUT_SUCCESS ||
@@ -441,7 +444,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     }
     BatchPutExecutionState batch_put_execution;
     Status batch_put_status = InitializeBatchPutExecutionState(
-        impl_->config.npu_core_count, &batch_put_execution);
+        put_cores, &batch_put_execution);
     if (!batch_put_status.ok()) {
       KvafBatchPutTransportDestroy(batch_put_transport);
       (void)aclrtFree(impl_->execution.queue_state);
@@ -511,8 +514,10 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
     return InvalidArgument("NPU BatchGet requires a caller-owned ACL stream");
   }
   KvafExecuteBatchGetKernelArgs arguments{};
+  const std::uint32_t get_cores = impl_->config.aicpu_urma_kernel_json_path.empty()
+      ? impl_->config.npu_core_count : 1U;
   Status status = BuildBatchGetKernelArgs(
-      exec, impl_->config.npu_core_count, impl_->config.jettys_per_core,
+      exec, get_cores, impl_->config.jettys_per_core,
       impl_->execution, &arguments);
   if (!status.ok()) {
     return status;
@@ -550,7 +555,7 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
     if (sync_result != ACL_SUCCESS) {
       return Internal("BatchGet stream synchronization failed");
     }
-    LogBatchGetDeviceStatus(impl_->execution, impl_->config.npu_core_count);
+    LogBatchGetDeviceStatus(impl_->execution, get_cores);
 #if defined(KVAF_ENABLE_AICPU_URMA)
     if (!impl_->config.aicpu_urma_kernel_json_path.empty()) {
       KvafBatchGetCoreStatus device_status{};
@@ -661,11 +666,13 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
   arguments.remote_ack = request.remote_ack;
   arguments.sequence = request.sequence;
   arguments.bytes = request.bytes;
+  arguments.worker_count = impl_->config.npu_core_count;
   const aclrtStream stream = static_cast<aclrtStream>(request.stream);
   const auto launch_start = std::chrono::steady_clock::now();
   const int32_t launch = aicpu_urma::LaunchGatherRead(&arguments, stream);
   if (request.timing != nullptr) request.timing->launch_ns = elapsed_ns(launch_start);
   if (launch != 0) {
+    (void)aclrtSynchronizeStream(stream);
     KvafBatchGetLocalBufferRelease(local_buffer);
     return Internal("AICPU URMA GatherRead launch failed");
   }
@@ -677,10 +684,14 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
   KvafBatchGetLocalBufferRelease(local_buffer);
   if (request.timing != nullptr) request.timing->release_ns = elapsed_ns(release_start);
   aicpu_urma::GatherReadStatus device_status{};
+  std::array<std::uint8_t, 8U * KVAF_AIV_BATCH_GET_STATUS_BYTES> status_storage{};
+  const auto status_bytes = impl_->execution.status_bytes;
   const auto copy_start = std::chrono::steady_clock::now();
-  const aclError copy = aclrtMemcpy(&device_status, sizeof(device_status),
-                                   impl_->execution.status, sizeof(device_status),
+  const aclError copy = aclrtMemcpy(status_storage.data(), status_storage.size(),
+                                   impl_->execution.status, status_bytes,
                                    ACL_MEMCPY_DEVICE_TO_HOST);
+  if (copy == ACL_SUCCESS)
+    std::memcpy(&device_status, status_storage.data(), sizeof(device_status));
   if (request.timing != nullptr) request.timing->status_copy_ns = elapsed_ns(copy_start);
   if (request.timing != nullptr && copy == ACL_SUCCESS &&
       device_status.magic == aicpu_urma::kGatherStatusMagic &&
@@ -708,24 +719,59 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
     request.timing->ack_polls = device_status.ack_polls;
     request.timing->read_wqes = device_status.read_wqes;
   }
-  if (copy == ACL_SUCCESS && device_status.magic == aicpu_urma::kGatherStatusMagic &&
-      device_status.sequence == request.sequence &&
-      (sync != ACL_SUCCESS || device_status.result != 0U)) {
-    std::fprintf(stderr, "[KVAF_AICPU_URMA] GATHER_READ_ERROR acl=%d result=%llu phase=%llu ack=%llu "
+  bool complete = copy == ACL_SUCCESS;
+  std::uint64_t scatter_begin = UINT64_MAX;
+  std::uint64_t scatter_end = 0U;
+  if (request.timing != nullptr) {
+    request.timing->aicpu_cores = arguments.worker_count;
+    request.timing->scatter_plan_ns = 0U;
+    request.timing->scatter_post_ns = 0U;
+    request.timing->scatter_cq_ns = 0U;
+    request.timing->read_wqes = 0U;
+    request.timing->scatter_total_ns = 0U;
+  }
+  for (std::uint32_t worker = 0U; copy == ACL_SUCCESS && worker < arguments.worker_count;
+       ++worker) {
+    aicpu_urma::GatherReadStatus worker_status{};
+    std::memcpy(&worker_status,
+                status_storage.data() + worker * KVAF_AIV_BATCH_GET_STATUS_BYTES,
+                sizeof(worker_status));
+    const bool valid_status = worker_status.magic == aicpu_urma::kGatherStatusMagic &&
+        worker_status.sequence == request.sequence && worker_status.result == 0U &&
+        worker_status.scatter_begin_ns != 0U &&
+        worker_status.scatter_end_ns >= worker_status.scatter_begin_ns;
+    complete = complete && valid_status;
+    if (valid_status) {
+      scatter_begin = std::min(scatter_begin, worker_status.scatter_begin_ns);
+      scatter_end = std::max(scatter_end, worker_status.scatter_end_ns);
+      if (request.timing != nullptr) {
+        request.timing->scatter_plan_ns = std::max(request.timing->scatter_plan_ns,
+                                                   worker_status.scatter_plan_ns);
+        request.timing->scatter_post_ns = std::max(request.timing->scatter_post_ns,
+                                                   worker_status.scatter_post_ns);
+        request.timing->scatter_cq_ns = std::max(request.timing->scatter_cq_ns,
+                                                 worker_status.scatter_cq_ns);
+        request.timing->read_wqes += worker_status.read_wqes;
+      }
+    }
+    if (valid_status && sync == ACL_SUCCESS) continue;
+    std::fprintf(stderr, "[KVAF_AICPU_URMA] GATHER_READ_ERROR worker=%u acl=%d result=%llu phase=%llu ack=%llu "
                          "sq=%llu cq=%llu cqe_word=0x%llx sequence=%llu spans=%u sgl_size=%u\n",
+                 worker,
                  static_cast<int>(sync),
-                 static_cast<unsigned long long>(device_status.result),
-                 static_cast<unsigned long long>(device_status.phase),
-                 static_cast<unsigned long long>(device_status.ack_seen),
-                 static_cast<unsigned long long>(device_status.sq_producer_index),
-                 static_cast<unsigned long long>(device_status.cq_consumer_index),
-                 static_cast<unsigned long long>(device_status.cqe_word),
-                 static_cast<unsigned long long>(device_status.sequence),
+                 static_cast<unsigned long long>(worker_status.result),
+                 static_cast<unsigned long long>(worker_status.phase),
+                 static_cast<unsigned long long>(worker_status.ack_seen),
+                 static_cast<unsigned long long>(worker_status.sq_producer_index),
+                 static_cast<unsigned long long>(worker_status.cq_consumer_index),
+                 static_cast<unsigned long long>(worker_status.cqe_word),
+                 static_cast<unsigned long long>(worker_status.sequence),
                  request.output_span_count, request.sgl_size);
   }
+  if (complete && request.timing != nullptr)
+    request.timing->scatter_total_ns = scatter_end - scatter_begin;
   if (sync != ACL_SUCCESS) return Internal("AICPU URMA GatherRead stream synchronization failed");
-  if (copy != ACL_SUCCESS || device_status.magic != aicpu_urma::kGatherStatusMagic ||
-      device_status.sequence != request.sequence || device_status.result != 0U)
+  if (!complete)
     return Internal("AICPU URMA GatherRead device completion failed");
   return Status::OK();
 #else
@@ -849,7 +895,7 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
         device_metadata + layout.destinations);
     arguments.core_status = PointerValue(execution.core_status);
     arguments.row_count = static_cast<std::uint32_t>(rows);
-    arguments.aiv_core_count = impl_->config.npu_core_count;
+    arguments.aiv_core_count = static_cast<std::uint32_t>(execution.host_core_status.size());
 
     for (KvafBatchPutCoreStatus& core_status : execution.host_core_status) {
       core_status = KvafBatchPutCoreStatus{};
@@ -878,7 +924,7 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
     local_buffers.clear();
     if (result != KVAF_BATCH_PUT_SUCCESS) {
       const bool aicpu = !impl_->config.aicpu_urma_kernel_json_path.empty();
-      LogBatchPutDeviceStatus(execution, impl_->config.npu_core_count, result, aicpu);
+      LogBatchPutDeviceStatus(execution, arguments.aiv_core_count, result, aicpu);
       return Internal(aicpu ? "Direct-HCCP BatchPut execution failed"
                             : "AIV Direct-HCCP BatchPut execution failed");
     }
