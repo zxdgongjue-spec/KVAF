@@ -1,9 +1,19 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
 namespace kvaf {
+
+struct GatherReadWorkerTiming {
+  std::uint64_t start_offset_ns{0U};
+  std::uint64_t end_offset_ns{0U};
+  std::uint64_t duration_ns{0U};
+  std::uint64_t read_wqes{0U};
+  std::uint64_t sq_write_calls{0U};
+  std::uint64_t sq_wqebbs{0U};
+};
 
 struct GatherReadTiming {
   std::uint64_t validate_ns{0U};
@@ -39,6 +49,8 @@ struct GatherReadTiming {
   std::uint64_t scatter_start_skew_ns{0U};
   std::uint64_t scatter_worker_ns{0U};
   std::uint64_t aicpu_cores{1U};
+  bool profile_detail{false};
+  std::array<GatherReadWorkerTiming, 8> workers{};
   std::uint64_t cpu_dispatch_ns{0U};
   std::uint64_t cpu_notify_spin_ns{0U};
   std::uint64_t cpu_source_cache_ns{0U};
@@ -46,6 +58,8 @@ struct GatherReadTiming {
   std::uint64_t cpu_staging_flush_ns{0U};
   std::uint64_t ack_polls{0U};
   std::uint64_t read_wqes{0U};
+  std::uint64_t sq_write_calls{0U};
+  std::uint64_t sq_wqebbs{0U};
 };
 
 namespace peer {

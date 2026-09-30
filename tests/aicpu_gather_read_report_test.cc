@@ -49,6 +49,8 @@ int main() {
   assert(report.find("GATHER_READ_TECHNICAL avg_ns") != std::string::npos);
   assert(report.find("configure_rpc=2000") != std::string::npos);
   assert(report.find("read_wqes=7.00") != std::string::npos);
+  assert(report.find("Per-SQ-group timing: disabled") != std::string::npos);
+  assert(report.find("Within submit: Encode WQEs:") == std::string::npos);
 
   std::FILE* direct_output = std::tmpfile();
   assert(direct_output != nullptr);
@@ -83,6 +85,7 @@ int main() {
   assert(technical_report.find("idle_since_previous_ack=") != std::string::npos);
 
   first.aicpu_cores = 4U;
+  first.profile_detail = true;
   first.scatter_total_ns = 6500U;
   first.output_layout_ns = 2300U;
   first.scatter_init_ns = 700U;
@@ -111,4 +114,29 @@ int main() {
   assert(parallel_report.find("Worker start spread: 1.500 us | Longest worker duration: 5.000 us") !=
          std::string::npos);
   assert(parallel_report.find("encode=1000 sq_write=1500 doorbell_barriers=500") != std::string::npos);
+
+  first.workers[1] = {1000U, 5000U, 4000U, 2U, 1U, 6U};
+  second = first;
+  second.workers[1] = {3000U, 7000U, 4000U, 2U, 1U, 6U};
+  std::FILE* worker_output = std::tmpfile();
+  assert(worker_output != nullptr);
+  kvaf::aicpu_gather_read_client::PrintGatherReadWorkers(worker_output, {first, second});
+  std::rewind(worker_output);
+  std::string worker_report;
+  while ((bytes = std::fread(buffer, 1U, sizeof(buffer), worker_output)) != 0U)
+    worker_report.append(buffer, bytes);
+  std::fclose(worker_output);
+  assert(worker_report.find("worker=1 start_avg=2.000 start_p50=2.000 start_p95=2.900 end_avg=6.000") !=
+         std::string::npos);
+  assert(worker_report.find("duration_avg=4.000 read_wqes=2.00 sq_copies=1.00 sq_wqebbs=6.00") !=
+         std::string::npos);
+  assert(worker_report.find("not physical CPU IDs") != std::string::npos);
+  bool rejected = false;
+  second.aicpu_cores = 2U;
+  try {
+    kvaf::aicpu_gather_read_client::PrintGatherReadWorkers(stdout, {first, second});
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  assert(rejected);
 }

@@ -95,6 +95,12 @@ WQEBB；队列深度允许时每 64 条 WQE 在末条请求 CQE。单条 WQE 的
 
 GatherRead 的 READ WQE 先在 AICPU 本地以最多 24 个 WQEBB 为一组编码，
 再按 SQ 环绕位置批量写入；原有的每个提交批次仍只敲一次 doorbell、等待一次 CQE。
+`--sq-batch-wqes 8/16/32/64` 控制一次 SQ 批量拷贝最多合并的 READ WQE 数，
+默认 8；6-SGE workload 对应最多 24/48/96/192 个 WQEBB。
+这是 memcpy 合并粒度，不改变每个至多 64-WQE 提交批次的 CQE 和 doorbell 边界，
+也不改变 SGL 上限或建链。遇到 SQ 环尾仍拆成两次 memcpy，不填充空洞。
+本地 WQE 编码空间最大 12 KiB，另有原来的 SGL 规划数组，不使用设备堆分配。
+较大粒度可能减少 SQ 拷贝调用次数，实际收益须在设备验证；默认不自动切换。
 GatherRead 默认使用一个 AICPU core；`--aicpu-cores 2/4/8` 开启多核 READ。
 建链时为每个 worker 分配独立 Jetty、SQ/CQ，后续轮次复用，不共享 producer index。
 Host 在同一 ACL stream 上顺序排入两个 kernel：单 block 的 GatherRead 负责
@@ -187,7 +193,7 @@ CPU gather 握手和 CQ 等待，不含输入上传、输出回读及逐字节�
 与 CPU gather 重叠，不能相加；AICPU READ 阶段包含 WQE 规划与提交、
 完成等待，不等于纯传输时间。profiling 增加时钟采样，并将 ack READ 从 8 字节扩展到
 56 字节，因此小 batch 的总耗时不应直接与旧版无 profiling 结果比较。
-需要原始纳秒计数器时使用 `--profile-detail 1`；默认只显示分层时间线。更新后需
+需要原始纳秒计数器与逐核时序时使用 `--profile-detail 1`；默认只显示分层时间线。更新后需
 同时重新部署 CPU service、NPU Runtime 和 AICPU kernel。直连模式 profiling 中的
 `idle_since_previous_ack` 从上一轮 ack 到本轮收到通知，包含两轮之间的空闲，
 不是通知传递耗时。`CPU start observed after ACK polling began` 是 AICPU 首次读到
@@ -209,11 +215,39 @@ GatherRead 总耗时中，不包含在首个 READ worker 开始之前的设备 R
 `Worker initialization` 覆盖 READ block 进入后的原子领号、状态/队列准备和起点读取。
 `Build local SGL` 是按该核目标 span 生成本地 SGE 列表；`Within submit` 的
 编码（含批次参数检查）、SQ 批量拷贝、doorbell 与内存屏障均包含在 `Submit WQEs` 中。
-细分采样每组最多 24 个 WQEBB 执行两次额外时钟读取，不逐 WQE 打点；
-采样本身有开销。各阶段多核最大值可能来自不同核，不能相加。
+`--profile-detail 0` 现在真正关闭每次 SQ 拷贝组的两次额外时钟采样，
+编码/SQ/doorbell 子计数器保持 0，日志明确标记禁用，不再打印伪零耗时。
+仍保留每核进入/结束、READ 批次 plan/post/CQ、握手和 Host 阶段计时，
+因此不是完全无 profiling。`--profile-detail 1` 启用组内采样；采样本身有开销。
+各阶段多核最大值可能来自不同核，不能相加。
 `Worker start spread` 是最晚与最早 READ block 进入时间之差；`Longest worker duration`
 是单核进入到完成的最长区间。两者用于识别调度错开与单核耗时，均在 READ 墙钟内，
 不是额外阶段，也不能相加。READ 分组数组只在填充实际 WQE 时清零，避免整数组重复清零。
+
+`GATHER_READ_WORKERS` 每行对应一套 SQ/CQ worker，不代表固定物理 AICPU ID。
+start/end 是每轮相对最早 READ worker 进入时刻的纳秒差，输出为微秒；
+每行显示平均 start/end/duration、start p50/p95，以及该 worker 的 WQE、SQ memcpy
+调用和 WQEBB 数。各核区间重叠，不能相加；晚进入 worker 的起点集中在早进入
+worker 的完成附近，只能作为分波执行的证据，不能单凭均值推断可用物理核数。
+`SQ writes` 统计全部 worker 的 memcpy 调用和实际写入的 64-byte WQEBB，不计控制握手。
+
+沿用现有 CPU 服务，对比采样开关和 SQ 拷贝粒度：
+
+```bash
+./build.sh aicpu-urma --install-kernel
+for detail in 0 1; do
+  for batch in 8 16 32 64; do
+    build-aicpu-urma/tests/kvaf_aicpu_gather_read_client \
+      --peer 127.0.0.1:28990 --device-id 6 \
+      --blocks 4096 --block-bytes 656 --output-stride 1312 --sgl-size 6 \
+      --aicpu-cores 8 --sq-batch-wqes "$batch" --profile-detail "$detail" \
+      --warmup 10 --iterations 1000
+  done
+done
+```
+
+保持输入、CPU gather 配置及 AICPU 核数一致，先用 detail=0 比较总耗时和 READ
+墙钟，再用 detail=1 定位写 SQ/编码及逐核启动分布，避免把采样开销当作传输退化。
 
 服务端加 `--gather-notify-profile` 后，直连 CPU worker 退出时输出一行
 `GATHER_NOTIFY_POLL`。此采样有开销，正式测带宽时不要启用。

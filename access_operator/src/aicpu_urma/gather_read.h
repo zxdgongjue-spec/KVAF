@@ -46,6 +46,9 @@ struct GatherReadStatus {
   std::uint64_t scatter_encode_ns;
   std::uint64_t scatter_sq_write_ns;
   std::uint64_t scatter_doorbell_ns;
+  std::uint64_t profile_detail;
+  std::uint64_t sq_write_calls;
+  std::uint64_t sq_wqebbs;
 };
 
 struct GatherReadArgs {
@@ -68,9 +71,11 @@ struct GatherReadArgs {
   std::uint32_t source_span_count;
   std::uint32_t worker_count;
   std::uint32_t reserved;
+  std::uint32_t profile_detail;
+  std::uint32_t sq_batch_wqes{8U};
 };
 
 static_assert(sizeof(GatherReadStatus) <= 384U, "GatherRead exceeds shared status buffer");
-static_assert(sizeof(GatherReadArgs) == 128U, "GatherRead argument ABI changed");
+static_assert(sizeof(GatherReadArgs) == 136U, "GatherRead argument ABI changed");
 
 }  // namespace kvaf::aicpu_urma

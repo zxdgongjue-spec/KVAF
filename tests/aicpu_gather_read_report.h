@@ -2,6 +2,7 @@
 
 #include "gather_read_profile.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -105,11 +106,16 @@ inline void PrintGatherReadTimeline(std::FILE* output, double mean_ms,
                "      Worker initialization: %.3f us | Build local SGL: %.3f us\n"
                "      Submit WQEs (encode, write SQ, doorbell): %.3f us | Wait for READ completions: %.3f us\n",
                average_us(&GatherReadTiming::scatter_init_ns), plan_us, post_us, cq_us);
-  std::fprintf(output,
-               "        Within submit: Encode WQEs: %.3f us | Write SQ: %.3f us | Doorbell and barriers: %.3f us\n",
-               average_us(&GatherReadTiming::scatter_encode_ns),
-               average_us(&GatherReadTiming::scatter_sq_write_ns),
-               average_us(&GatherReadTiming::scatter_doorbell_ns));
+  if (profiles.front().profile_detail)
+    std::fprintf(output,
+                 "        Within submit: Encode WQEs: %.3f us | Write SQ: %.3f us | Doorbell and barriers: %.3f us\n",
+                 average_us(&GatherReadTiming::scatter_encode_ns),
+                 average_us(&GatherReadTiming::scatter_sq_write_ns),
+                 average_us(&GatherReadTiming::scatter_doorbell_ns));
+  else
+    std::fprintf(output, "        Per-SQ-group timing: disabled (READ wall and batch timing remain enabled)\n");
+  std::fprintf(output, "      SQ writes: %.2f memcpy calls, %.2f WQEBBs (64 bytes each), all workers combined\n",
+               average(&GatherReadTiming::sq_write_calls), average(&GatherReadTiming::sq_wqebbs));
   if (parallel)
     std::fprintf(output,
                  "      Worker start spread: %.3f us | Longest worker duration: %.3f us (both within READ wall time)\n",
@@ -190,6 +196,51 @@ inline void PrintGatherReadTechnicalProfile(std::FILE* output,
                average(&GatherReadTiming::scatter_encode_ns),
                average(&GatherReadTiming::scatter_sq_write_ns),
                average(&GatherReadTiming::scatter_doorbell_ns));
+}
+
+inline void PrintGatherReadWorkers(std::FILE* output,
+                                   const std::vector<GatherReadTiming>& profiles) {
+  if (output == nullptr || profiles.empty() || profiles.front().aicpu_cores == 0U ||
+      profiles.front().aicpu_cores > 8U)
+    throw std::invalid_argument("GatherRead workers need measured profiles and 1..8 workers");
+  const auto workers = profiles.front().aicpu_cores;
+  for (const auto& profile : profiles)
+    if (profile.aicpu_cores != workers)
+      throw std::invalid_argument("GatherRead worker count changed within measured profiles");
+  std::fprintf(output,
+               "GATHER_READ_WORKERS relative to first READ worker entry in each round (us)\n"
+               "  Worker IDs identify SQ/CQ slots, not physical CPU IDs. Worker intervals overlap.\n");
+  for (std::size_t worker = 0U; worker < workers; ++worker) {
+    double start_ns = 0.0, end_ns = 0.0, duration_ns = 0.0;
+    double wqes = 0.0, copies = 0.0, blocks = 0.0;
+    std::vector<std::uint64_t> starts;
+    starts.reserve(profiles.size());
+    for (const auto& profile : profiles) {
+      const auto& timing = profile.workers[worker];
+      starts.push_back(timing.start_offset_ns);
+      start_ns += timing.start_offset_ns;
+      end_ns += timing.end_offset_ns;
+      duration_ns += timing.duration_ns;
+      wqes += timing.read_wqes;
+      copies += timing.sq_write_calls;
+      blocks += timing.sq_wqebbs;
+    }
+    std::sort(starts.begin(), starts.end());
+    const auto percentile_us = [&](double fraction) {
+      const double position = fraction * (starts.size() - 1U);
+      const auto lower = static_cast<std::size_t>(position);
+      const auto upper = std::min(lower + 1U, starts.size() - 1U);
+      return (starts[lower] + (static_cast<double>(starts[upper]) - starts[lower]) *
+                                 (position - lower)) / 1000.0;
+    };
+    const double rounds = profiles.size();
+    std::fprintf(output,
+                 "  worker=%zu start_avg=%.3f start_p50=%.3f start_p95=%.3f end_avg=%.3f "
+                 "duration_avg=%.3f read_wqes=%.2f sq_copies=%.2f sq_wqebbs=%.2f\n",
+                 worker, start_ns / rounds / 1000.0, percentile_us(0.5), percentile_us(0.95),
+                 end_ns / rounds / 1000.0, duration_ns / rounds / 1000.0,
+                 wqes / rounds, copies / rounds, blocks / rounds);
+  }
 }
 
 }

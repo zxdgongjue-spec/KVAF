@@ -28,6 +28,7 @@ struct Options {
   std::uint32_t output_stride{0U};
   std::uint32_t sgl_size{kvaf::kGatherMaxSglSize};
   std::uint32_t aicpu_cores{1U};
+  std::uint32_t sq_batch_wqes{8U};
   std::uint32_t warmup{1U};
   std::uint32_t iterations{3U};
   bool urma_descriptors{true};
@@ -39,9 +40,10 @@ void Usage(const char* program) {
                "Usage: %s [--peer HOST:PORT] [--device-id N] [--kernel-json PATH] "
                "[--blocks N] [--block-bytes N] [--output-stride N] [--sgl-size N] "
                "[--warmup N] [--iterations N] [--aicpu-cores 1|2|4|8] [--descriptor-transport urma|rpc] "
-               "[--profile-detail 0|1]\n"
+               "[--sq-batch-wqes 8|16|32|64] [--profile-detail 0|1]\n"
                "Defaults: descriptor-transport=urma, output-stride=2*block-bytes, sgl-size=%u "
-               "(positive; each READ WQE uses at most %u SGE)\n",
+               "(positive; each READ WQE uses at most %u SGE), sq-batch-wqes=8\n"
+               "profile-detail=0 disables per-SQ-group timing; READ wall timing stays enabled.\n",
                program, kvaf::kGatherMaxSglSize, kvaf::kGatherMaxSglSize);
 }
 
@@ -68,6 +70,7 @@ bool Parse(int argc, char** argv, Options* options) {
       else if (flag == "--output-stride") parsed.output_stride = static_cast<std::uint32_t>(number);
       else if (flag == "--sgl-size") parsed.sgl_size = static_cast<std::uint32_t>(number);
       else if (flag == "--aicpu-cores") parsed.aicpu_cores = static_cast<std::uint32_t>(number);
+      else if (flag == "--sq-batch-wqes") parsed.sq_batch_wqes = static_cast<std::uint32_t>(number);
       else if (flag == "--warmup") parsed.warmup = static_cast<std::uint32_t>(number);
       else if (flag == "--iterations") parsed.iterations = static_cast<std::uint32_t>(number);
       else if (flag == "--profile-detail" && number <= 1U)
@@ -80,6 +83,8 @@ bool Parse(int argc, char** argv, Options* options) {
       parsed.block_bytes == 0U || parsed.iterations == 0U ||
       (parsed.aicpu_cores != 1U && parsed.aicpu_cores != 2U &&
        parsed.aicpu_cores != 4U && parsed.aicpu_cores != 8U) ||
+      (parsed.sq_batch_wqes != 8U && parsed.sq_batch_wqes != 16U &&
+       parsed.sq_batch_wqes != 32U && parsed.sq_batch_wqes != 64U) ||
       parsed.sgl_size == 0U ||
       static_cast<std::uint64_t>(parsed.blocks) * parsed.block_bytes > UINT32_MAX - 64U)
     return false;
@@ -219,6 +224,8 @@ double RunRound(kvaf::NpuRuntime* runtime, aclrtStream stream, const Options& op
   gather.output = {output->data, output->bytes, kvaf::DeviceKind::kNpu};
   gather.stream = stream;
   gather.timing = timing;
+  gather.profile_detail = options.profile_detail;
+  gather.sq_batch_wqes = options.sq_batch_wqes;
   for (std::size_t block = options.blocks; block != 0U; --block) {
     const auto address = view.addresses[block - 1U];
     if (view.valid[block - 1U] != 1U || view.lengths[block - 1U] != options.block_bytes)
@@ -306,16 +313,19 @@ int Run(const Options& options) {
                stats.min_ms, stats.p50_ms, stats.p95_ms, stats.p99_ms,
                stats.max_ms, stats.mean_ms, stats.mean_gbps);
   kvaf::aicpu_gather_read_client::PrintGatherReadTimeline(stdout, stats.mean_ms, profiles);
-  if (options.profile_detail)
+  if (options.profile_detail) {
     kvaf::aicpu_gather_read_client::PrintGatherReadTechnicalProfile(stdout, profiles);
+    kvaf::aicpu_gather_read_client::PrintGatherReadWorkers(stdout, profiles);
+  }
   std::fprintf(stdout,
                "AICPU_GATHER_READ_PASS blocks=%u block_bytes=%u bytes=%zu "
                "output_stride=%u sgl_size=%u wqe_sgl_size=%u aicpu_cores=%u descriptor_transport=%s "
-               "warmup=%u iterations=%u\n",
+               "sq_batch_wqes=%u profile_detail=%u warmup=%u iterations=%u\n",
                options.blocks, options.block_bytes, payload, options.output_stride,
                options.sgl_size, std::min(options.sgl_size, kvaf::kGatherMaxSglSize),
                options.aicpu_cores,
                options.urma_descriptors ? "urma" : "rpc",
+               options.sq_batch_wqes, options.profile_detail ? 1U : 0U,
                options.warmup, options.iterations);
   return 0;
 }

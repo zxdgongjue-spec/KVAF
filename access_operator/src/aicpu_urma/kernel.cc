@@ -203,23 +203,27 @@ std::uint32_t SubmitNotify(const Entity& entity, Queue& queue,
 }
 
 template <typename Entity>
-void WriteSqBlocks(const Entity& entity, std::uint64_t producer,
+std::uint32_t WriteSqBlocks(const Entity& entity, std::uint64_t producer,
                    const std::uint32_t* words, std::uint32_t blocks) {
   const auto slot = static_cast<std::uint32_t>(producer % entity.sq_depth);
   const auto first = std::min(blocks, entity.sq_depth - slot);
   std::memcpy(reinterpret_cast<void*>(entity.sq_va + slot * 64U),
               words, first * 64U);
-  if (first < blocks)
+  if (first < blocks) {
     std::memcpy(reinterpret_cast<void*>(entity.sq_va), words + first * 16U,
                 (blocks - first) * 64U);
+    return 2U;
+  }
+  return 1U;
 }
 
-template <typename Entity, typename Queue>
+template <bool Detailed, typename Entity, typename Queue>
 std::uint32_t SubmitScatter(const Entity& entity, Queue& queue,
                             const kvaf::aicpu_urma::ScatterTransfer* transfers,
                             std::uint32_t count, std::uint32_t* cqe_word,
                             std::uint64_t* post_ns, std::uint64_t* cq_ns,
-                            kvaf::aicpu_urma::GatherReadStatus& status) {
+                            kvaf::aicpu_urma::GatherReadStatus& status,
+                            std::uint32_t sq_batch_wqes) {
   const auto post_start_ns = NowNs();
   if (cqe_word != nullptr) *cqe_word = 0U;
   if (post_ns != nullptr) *post_ns = 0U;
@@ -236,16 +240,18 @@ std::uint32_t SubmitScatter(const Entity& entity, Queue& queue,
                     entity.remote_token_value, {}};
   std::memcpy(endpoint.remote_eid, entity.remote_eid, sizeof(endpoint.remote_eid));
   std::uint64_t producer = queue.sq_producer_index;
-  constexpr std::uint32_t kStagingBlocks = 8U * kvaf::aicpu_urma::kMaxScatterWqebbs;
+  constexpr std::uint32_t kStagingBlocks = 64U * kvaf::aicpu_urma::kMaxScatterWqebbs;
   std::uint32_t words[kStagingBlocks * 16U];
   std::uint32_t index = 0U;
   std::uint64_t encode_ns = 0U;
   std::uint64_t sq_write_ns = 0U;
+  std::uint64_t sq_write_calls = 0U;
   auto encode_start_ns = post_start_ns;
   while (index < count) {
     std::uint32_t staged_blocks = 0U;
+    const auto first_index = index;
     const auto staged_producer = producer;
-    while (index < count) {
+    while (index < count && index - first_index < sq_batch_wqes) {
       const auto wqebbs = kvaf::aicpu_urma::ScatterWqebbs(transfers[index].sge_count);
       if (staged_blocks + wqebbs > kStagingBlocks) break;
       kvaf::aicpu_urma::EncodeScatterReadWqe(
@@ -256,11 +262,13 @@ std::uint32_t SubmitScatter(const Entity& entity, Queue& queue,
       producer += wqebbs;
       ++index;
     }
-    const auto sq_start_ns = NowNs();
-    encode_ns += sq_start_ns - encode_start_ns;
-    WriteSqBlocks(entity, staged_producer, words, staged_blocks);
-    encode_start_ns = NowNs();
-    sq_write_ns += encode_start_ns - sq_start_ns;
+    const auto sq_start_ns = Detailed ? NowNs() : 0U;
+    if constexpr (Detailed) encode_ns += sq_start_ns - encode_start_ns;
+    sq_write_calls += WriteSqBlocks(entity, staged_producer, words, staged_blocks);
+    if constexpr (Detailed) {
+      encode_start_ns = NowNs();
+      sq_write_ns += encode_start_ns - sq_start_ns;
+    }
   }
   Barrier();
   queue.sq_producer_index = producer;
@@ -268,13 +276,16 @@ std::uint32_t SubmitScatter(const Entity& entity, Queue& queue,
        static_cast<std::uint32_t>(producer));
   Barrier();
   const auto cq_start_ns = NowNs();
-  const auto doorbell_ns = cq_start_ns - encode_start_ns;
   if (post_ns != nullptr) *post_ns = cq_start_ns - post_start_ns;
   const auto result = WaitCompletion(entity, queue, cqe_word);
   if (cq_ns != nullptr) *cq_ns = NowNs() - cq_start_ns;
-  status.scatter_encode_ns += encode_ns;
-  status.scatter_sq_write_ns += sq_write_ns;
-  status.scatter_doorbell_ns += doorbell_ns;
+  if constexpr (Detailed) {
+    status.scatter_encode_ns += encode_ns;
+    status.scatter_sq_write_ns += sq_write_ns;
+    status.scatter_doorbell_ns += cq_start_ns - encode_start_ns;
+  }
+  status.sq_write_calls += sq_write_calls;
+  status.sq_wqebbs += blocks;
   return result;
 }
 
@@ -322,8 +333,11 @@ void ScatterOutputRange(const kvaf::aicpu_urma::GatherReadArgs& args,
       status.read_wqes += batch_count;
       std::uint64_t post_ns = 0U;
       std::uint64_t cq_ns = 0U;
-      status.result = SubmitScatter(entity, queue, data, batch_count, &cqe_word,
-                                    &post_ns, &cq_ns, status);
+      status.result = args.profile_detail != 0U
+          ? SubmitScatter<true>(entity, queue, data, batch_count, &cqe_word,
+                                 &post_ns, &cq_ns, status, args.sq_batch_wqes)
+          : SubmitScatter<false>(entity, queue, data, batch_count, &cqe_word,
+                                  &post_ns, &cq_ns, status, args.sq_batch_wqes);
       status.scatter_post_ns += post_ns;
       status.scatter_cq_ns += cq_ns;
       status.cqe_word = cqe_word;
@@ -552,6 +566,7 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
   status = {};
   status.magic = kvaf::aicpu_urma::kGatherStatusMagic;
   status.sequence = args->sequence;
+  status.profile_detail = args->profile_detail;
   status.result = 2U;
   if (args->worker_count > 1U)
     queue.reserved[kvaf::aicpu_urma::kGatherWorkerCounterSlot] = 0U;
@@ -566,7 +581,9 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
   const std::uint64_t source_bytes =
       kvaf::peer::GatherDescriptorBytes(args->source_span_count);
   if (!Valid(entity, queue) || entity.local_token_id == 0U || args->worker_count > 8U ||
-      args->reserved != 0U ||
+      args->reserved != 0U || args->profile_detail > 1U ||
+      (args->sq_batch_wqes != 8U && args->sq_batch_wqes != 16U &&
+       args->sq_batch_wqes != 32U && args->sq_batch_wqes != 64U) ||
       args->sequence == 0U || args->bytes == 0U ||
       args->bytes > UINT32_MAX - kvaf::aicpu_urma::kGatherScratchBytes ||
       args->output_spans == 0U || args->output_span_count == 0U ||
@@ -711,7 +728,10 @@ extern "C" __attribute__((visibility("default")))
 std::uint32_t KvafAicpuUrmaGatherScatter(kvaf::aicpu_urma::GatherReadArgs* args) {
   using kvaf::aicpu_urma::GatherReadStatus;
   if (args == nullptr || args->channel_entity == 0U || args->queue_state == 0U ||
-      args->core_status == 0U || args->worker_count < 2U || args->worker_count > 8U)
+      args->core_status == 0U || args->worker_count < 2U || args->worker_count > 8U ||
+      args->profile_detail > 1U ||
+      (args->sq_batch_wqes != 8U && args->sq_batch_wqes != 16U &&
+       args->sq_batch_wqes != 32U && args->sq_batch_wqes != 64U))
     return 1U;
   const auto worker_begin_ns = NowNs();
   auto* queues = reinterpret_cast<KvafBatchGetQueueState*>(args->queue_state);
@@ -728,6 +748,7 @@ std::uint32_t KvafAicpuUrmaGatherScatter(kvaf::aicpu_urma::GatherReadArgs* args)
     status = {};
     status.magic = kvaf::aicpu_urma::kGatherStatusMagic;
     status.sequence = args->sequence;
+    status.profile_detail = args->profile_detail;
     status.result = ready ? 0U : 11U;
   }
   if (!ready) return 1U;

@@ -587,9 +587,11 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
   if (request.output.device != DeviceKind::kNpu || !request.output.valid() ||
       request.stream == nullptr || request.bytes == 0U ||
       request.output_spans == nullptr || request.output_span_count == 0U ||
+      (request.sq_batch_wqes != 8U && request.sq_batch_wqes != 16U &&
+       request.sq_batch_wqes != 32U && request.sq_batch_wqes != 64U) ||
       request.sgl_size == 0U ||
       request.output_extent > UINT64_MAX - 63U)
-    return InvalidArgument("GatherRead output requires a valid SGL and 64-byte HBM scratch");
+    return InvalidArgument("GatherRead output requires a valid SGL, SQ batch size, and 64-byte HBM scratch");
   const std::uint64_t scratch_offset =
       (request.output_extent + 63U) & ~std::uint64_t{63U};
   if (scratch_offset > request.output.bytes ||
@@ -667,6 +669,8 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
   arguments.sequence = request.sequence;
   arguments.bytes = request.bytes;
   arguments.worker_count = impl_->config.npu_core_count;
+  arguments.profile_detail = request.profile_detail ? 1U : 0U;
+  arguments.sq_batch_wqes = request.sq_batch_wqes;
   const aclrtStream stream = static_cast<aclrtStream>(request.stream);
   const auto launch_start = std::chrono::steady_clock::now();
   const int32_t launch = aicpu_urma::LaunchGatherRead(&arguments, stream);
@@ -708,6 +712,7 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
     request.timing->ack_cq_ns = device_status.ack_cq_ns;
     request.timing->ack_cache_ns = device_status.ack_cache_ns;
     request.timing->output_layout_ns = device_status.output_layout_ns;
+    request.timing->profile_detail = device_status.profile_detail != 0U;
     request.timing->scatter_cache_ns = device_status.scatter_cache_ns;
     request.timing->scatter_plan_ns = device_status.scatter_plan_ns;
     request.timing->scatter_post_ns = device_status.scatter_post_ns;
@@ -737,6 +742,9 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
     request.timing->scatter_doorbell_ns = 0U;
     request.timing->scatter_start_skew_ns = 0U;
     request.timing->scatter_worker_ns = 0U;
+    request.timing->sq_write_calls = 0U;
+    request.timing->sq_wqebbs = 0U;
+    request.timing->workers = {};
   }
   for (std::uint32_t worker = 0U; copy == ACL_SUCCESS && worker < arguments.worker_count;
        ++worker) {
@@ -771,6 +779,12 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
         request.timing->scatter_worker_ns = std::max(request.timing->scatter_worker_ns,
             worker_status.scatter_end_ns - worker_status.scatter_begin_ns);
         request.timing->read_wqes += worker_status.read_wqes;
+        request.timing->sq_write_calls += worker_status.sq_write_calls;
+        request.timing->sq_wqebbs += worker_status.sq_wqebbs;
+        request.timing->workers[worker] = {
+            worker_status.scatter_begin_ns, worker_status.scatter_end_ns,
+            worker_status.scatter_end_ns - worker_status.scatter_begin_ns,
+            worker_status.read_wqes, worker_status.sq_write_calls, worker_status.sq_wqebbs};
       }
     }
     if (valid_status && sync == ACL_SUCCESS) continue;
@@ -790,6 +804,10 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
   if (complete && request.timing != nullptr) {
     request.timing->scatter_total_ns = scatter_end - scatter_begin;
     request.timing->scatter_start_skew_ns = latest_begin - scatter_begin;
+    for (std::uint32_t worker = 0U; worker < arguments.worker_count; ++worker) {
+      request.timing->workers[worker].start_offset_ns -= scatter_begin;
+      request.timing->workers[worker].end_offset_ns -= scatter_begin;
+    }
   }
   if (sync != ACL_SUCCESS) return Internal("AICPU URMA GatherRead stream synchronization failed");
   if (!complete)

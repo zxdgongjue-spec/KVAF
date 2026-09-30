@@ -420,10 +420,12 @@ Status NpuRuntime::GatherRead(const CpuGatherReadRequest& request) {
   const auto& output_spans = request.output_spans.empty()
                                  ? contiguous_output : request.output_spans;
   std::uint64_t output_extent = 0U;
-  if (request.sgl_size == 0U || output_spans.size() > peer::kMaxGatherSpans ||
+  if ((request.sq_batch_wqes != 8U && request.sq_batch_wqes != 16U &&
+       request.sq_batch_wqes != 32U && request.sq_batch_wqes != 64U) ||
+      request.sgl_size == 0U || output_spans.size() > peer::kMaxGatherSpans ||
       !ValidateGatherOutput(request.output.bytes, output_spans, total_bytes,
                             &output_extent))
-    return Status::InvalidArgument("invalid GatherRead HBM scatter layout or SGL size");
+    return Status::InvalidArgument("invalid GatherRead HBM scatter layout, SGL size, or SQ batch size");
   if (request.timing != nullptr)
     request.timing->validate_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - validate_start).count();
@@ -471,7 +473,8 @@ Status NpuRuntime::GatherRead(const CpuGatherReadRequest& request) {
       ready.notify_address, ready.ack_address, request.source_descriptor_address,
       direct ? request.spans.data() : nullptr,
       direct ? static_cast<std::uint32_t>(request.spans.size()) : 0U, ready.sequence,
-      ready.total_bytes, request.stream, request.timing});
+      ready.total_bytes, request.stream, request.timing, request.profile_detail,
+      request.sq_batch_wqes});
 }
 
 RuntimeCore& NpuRuntime::core() {

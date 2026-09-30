@@ -22,6 +22,8 @@ struct CpuGatherReadRequest {
   std::uint32_t sgl_size{kGatherMaxSglSize};
   void* stream{nullptr};
   GatherReadTiming* timing{nullptr};
+  bool profile_detail{false};
+  std::uint32_t sq_batch_wqes{8U};
 };
 
 struct NpuRuntimeOptions {
