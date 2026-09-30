@@ -13,7 +13,7 @@ CSV 标注 `aicpu_memcpy_sgl_reordered` /
 
 ### 4096 × 656 B、多线程测试
 
-更新后需重新构建两端、安装 V5 kernel，并重启测试进程：
+更新后需重新构建两端、安装 V6 kernel，并重启测试进程：
 
 ```bash
 bash build.sh aicpu-cpu
@@ -31,13 +31,19 @@ bash tests/run_aicpu_get_cpu.sh --peer 127.0.0.1:29991 --device-id 4 \
 
 每轮有效载荷 2,686,976 B（2.5625 MiB），带宽不计 padding/guard。
 分别测试线程数 1、2、4、8；每次先重启 NPU 脚本，后续无需重复安装。
-本版本按线程批量 clean 输出，单线程基线也应使用本版本重新测量。
+V6 实现 B 版优化：输出只 clean 每行有效 payload 覆盖的 cache line，
+包含非对齐尾部所在的整条 line，跳过完全未写入的 guard line。
+4096×656 B、stride=768 B 时，输出 `dc cvac` 从 49,152 次降为 45,056 次（减少 8.3%）；
+每个 worker 仍只在全部输出 clean 指令之后执行一次 `dsb sy`。
+逐行 `memcpy`、输入 invalidate、调度和每轮校验保持原样；pthread 和 multi-block 共用此路径。
+启动日志增加 `scatter_clean=payload_cache_lines`，`KERNEL_STATUS` 应显示 `revision=6`。
+单线程基线也应使用本版本重新测量，CSV 列和 engine 名称保持不变。
 线程调度、完成等待及缓存操作计入 scatter；创建/销毁线程、数据校验不计入。
 
 ### 实际运行核与 scatter 三段计时
 
-在 **NPU 端**增加 `--profile-scatter`，默认关闭。升级需重新编译并安装 V5 kernel，
-独立的 V5 入口可避免旧 device `.so` 静默使用旧 scatter 布局。
+在 **NPU 端**增加 `--profile-scatter`，默认关闭。升级需重新编译并安装 V6 kernel，
+独立的 V6 入口可避免旧 device `.so` 静默使用旧 clean 实现。
 CPU 控制协议和原有 CSV 列保持不变。先启动 NPU 端：
 
 ```bash
@@ -149,11 +155,11 @@ payload 与 guard 语义不变。
 运行日志会显示 `SGL_LAYOUT=source_by_output_slot` 和
 `scatter_layout=forward`，可与旧布局的基线区分。
 
-统计逻辑的无设备测试：
+统计逻辑和输出 clean 覆盖范围的无设备测试：
 
 ```bash
-cmake --build build-aicpu-cpu --target kvaf_aicpu_scatter_profile_test kvaf_aicpu_core_probe_test
-ctest --test-dir build-aicpu-cpu -R '^kvaf_aicpu_(scatter_profile|core_probe)$' --output-on-failure
+cmake --build build-aicpu-cpu --target kvaf_aicpu_scatter_profile_test kvaf_aicpu_core_probe_test kvaf_aicpu_scatter_cache_test
+ctest --test-dir build-aicpu-cpu -R '^kvaf_aicpu_(scatter_profile|core_probe|scatter_cache)$' --output-on-failure
 ```
 
 ## 执行流程
@@ -331,6 +337,35 @@ NPU 端未指定 `--device-id` 时按 CPU 请求选择；指定时会拒绝不�
   再结束 NPU 测试进程，防止在途 WRITE 访问已释放内存。
 - 异常终止/断连不是自动恢复场景；修复环境后重启两端。未实现 SDMA、双缓冲、
   graph capture、动态地址列表或 Runtime 接入。
+
+### AICPU local-copy / SDMA capability probe
+
+当前测试的远端路径固定为 CPU URMA SGL gather WRITE 到本地 HBM staging。SDMA 若可用，
+只能替换 staging 到 output 的**本地 HBM→HBM** scatter，不能替代 CPU DDR 经 RoCE 的
+URMA WRITE。
+
+CANN 9.1.0 已发现 PTO `TPUT_ASYNC`/`TGET_ASYNC` 的 SDMA 头文件，但它不能直接作为
+AICPU backend：接口使用 `__gm__` 指针和 AI Core SDMA 指令；现有 kernel 是由
+`aarch64-target-linux-gnu-g++` 构建的 AICPU Linux ELF。并且 PTO async SDMA 路径拒绝
+多维或非连续 tensor，而当前 `656 B` staging 连续、output 行距 `768 B`，其 scatter
+不是单个连续 DMA。拆为 4096 个 SDMA 提交通常会比当前四核 `memcpy` 更差。
+
+下面脚本除扫描安装目录外，还用**同一个 AICPU 交叉编译器**验证 PTO 头能否被 AICPU
+内核编译，并打印 PTO 的架构选择宏和连续布局限制：
+
+```bash
+bash tests/aicpu_batch_get/probe_aicpu_sdma_api.sh
+```
+
+若输出 `aicpu_toolchain_defines___CCE_AICORE__=0` 或
+`direct_pto_a2a3_header_compile=fail`，PTO SDMA 只能用于独立的 AI Core kernel，不能
+链接或内联到本测试的 AICPU `.so`。不要添加 host `aclrtMemcpyAsync` 作为替代：它不能
+从 AICPU 的完成路径提交，也不能保证和 AICPU 请求序号同步。
+
+只有 AICPU 可调用的 submit、completion 和 error-query API 均通过同一 toolchain 验证，
+并且存在支持本地 HBM 非连续目的地址的批量/2D SDMA 语义后，才能接入实际 backend。随后
+必须验证：URMA WRITE completion 后 staging 对 SDMA 可见；SDMA 支持本地 HBM 地址；完成
+事件可由 AICPU 等待；以及异常时 slot 不会被提前复用。
 
 ## 本机测试（无需 CANN/URMA）
 

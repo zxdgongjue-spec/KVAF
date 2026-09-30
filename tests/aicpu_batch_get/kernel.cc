@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 #include "device_loop.h"
+#include "scatter_cache.h"
 #include "scatter_pool.h"
 #include "scatter_profile.h"
 
@@ -87,8 +88,12 @@ struct DeviceIO {
       std::memcpy(output + OutputSlotOffset(layout, slot),
                   region + kStagingOffset + slot * config.row_bytes, config.row_bytes);
     const auto copied = measure ? Now() : 0;
-    Clean(output + OutputSlotOffset(layout, range.begin),
-          (range.end - range.begin) * layout.stride);
+    CleanScatterPayload(
+        reinterpret_cast<std::uintptr_t>(output + OutputSlotOffset(layout, range.begin)),
+        range.end - range.begin, config.row_bytes, layout.stride,
+        [](std::uintptr_t line) {
+          asm volatile("dc cvac, %0" :: "r"(line) : "memory");
+        }, [] { Barrier(); });
     if (!measure) return;
     const auto cleaned = Now();
     timespec cpu_time_end{};
@@ -373,7 +378,7 @@ std::uint32_t KvafAicpuCoreProbeV1(CoreProbeArgs* args) {
 }
 
 extern "C" __attribute__((visibility("default")))
-std::uint32_t KvafAicpuBatchGetV5(KernelArgs* args) {
+std::uint32_t KvafAicpuBatchGetV6(KernelArgs* args) {
   if (!args || !args->region || !args->output || !args->samples || !args->result) return 1;
   auto* result = reinterpret_cast<KernelResult*>(args->result);
   auto* samples = reinterpret_cast<Sample*>(args->samples);
