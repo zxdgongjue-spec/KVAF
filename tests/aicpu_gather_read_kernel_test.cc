@@ -688,9 +688,10 @@ int main() {
   TestScatterStagingBoundary(16U, 384U, 6U);
   TestScatterStagingBoundary(32U, 384U, 6U);
   TestScatterStagingBoundary(64U, 384U, 6U, true);
-  TestParallelScatter(2U, 41U);
-  TestParallelScatter(4U, 41U);
-  TestParallelScatter(8U, 41U);
+  for (std::uint32_t workers = 2U; workers <= 8U; ++workers)
+    TestParallelScatter(workers, 41U);
+  TestParallelScatter(5U, 3U);
+  TestParallelScatter(6U, 3U);
   TestParallelScatter(8U, 9U);
   TestParallelScatter(8U, 3U);
   TestParallelScatter(8U, 41U, false);

@@ -39,7 +39,7 @@ void Usage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s [--peer HOST:PORT] [--device-id N] [--kernel-json PATH] "
                "[--blocks N] [--block-bytes N] [--output-stride N] [--sgl-size N] "
-               "[--warmup N] [--iterations N] [--aicpu-cores 1|2|4|8] [--descriptor-transport urma|rpc] "
+               "[--warmup N] [--iterations N] [--aicpu-cores N(1..8)] [--descriptor-transport urma|rpc] "
                "[--sq-batch-wqes 8|16|32|64] [--profile-detail 0|1]\n"
                "Defaults: descriptor-transport=urma, output-stride=2*block-bytes, sgl-size=%u "
                "(positive; each READ WQE uses at most %u SGE), sq-batch-wqes=8\n"
@@ -81,8 +81,7 @@ bool Parse(int argc, char** argv, Options* options) {
   if (parsed.peer.empty() || parsed.kernel_json.empty() || parsed.device_id > INT32_MAX ||
       parsed.blocks == 0U || parsed.blocks > kvaf::peer::kMaxGatherSpans ||
       parsed.block_bytes == 0U || parsed.iterations == 0U ||
-      (parsed.aicpu_cores != 1U && parsed.aicpu_cores != 2U &&
-       parsed.aicpu_cores != 4U && parsed.aicpu_cores != 8U) ||
+      parsed.aicpu_cores == 0U || parsed.aicpu_cores > 8U ||
       (parsed.sq_batch_wqes != 8U && parsed.sq_batch_wqes != 16U &&
        parsed.sq_batch_wqes != 32U && parsed.sq_batch_wqes != 64U) ||
       parsed.sgl_size == 0U ||

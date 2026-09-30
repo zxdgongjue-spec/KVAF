@@ -101,7 +101,9 @@ GatherRead 的 READ WQE 先在 AICPU 本地以最多 24 个 WQEBB 为一组编�
 也不改变 SGL 上限或建链。遇到 SQ 环尾仍拆成两次 memcpy，不填充空洞。
 本地 WQE 编码空间最大 12 KiB，另有原来的 SGL 规划数组，不使用设备堆分配。
 较大粒度可能减少 SQ 拷贝调用次数，实际收益须在设备验证；默认不自动切换。
-GatherRead 默认使用一个 AICPU core；`--aicpu-cores 2/4/8` 开启多核 READ。
+GatherRead 默认使用一个 worker；`--aicpu-cores` 接受 1 到 8 的任意整数，
+可使用 4、5、6、8 对比 READ 并行度。此参数设置 kernel block 数，
+不代表固定的物理核心数，也不保证所有 worker 同时开始执行。
 建链时为每个 worker 分配独立 Jetty、SQ/CQ，后续轮次复用，不共享 producer index。
 Host 在同一 ACL stream 上顺序排入两个 kernel：单 block 的 GatherRead 负责
 WRITE 源清单、通知一次 CPU、轮询 gather ACK；随后 N block 的 GatherScatter
@@ -165,7 +167,7 @@ build-aicpu-urma/tests/kvaf_aicpu_gather_read_client \
 相同输入对比单核和多核（同机使用以下 peer；跨机器替换 CPU 地址）：
 
 ```bash
-for cores in 1 2 4 8; do
+for cores in 1 2 4 5 6 8; do
   build-aicpu-urma/tests/kvaf_aicpu_gather_read_client \
     --peer 127.0.0.1:28999 --device-id 6 \
     --blocks 4096 --block-bytes 656 --output-stride 1312 --sgl-size 6 \
