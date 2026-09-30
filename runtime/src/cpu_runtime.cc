@@ -438,7 +438,7 @@ class CpuGatherWorker {
                   std::size_t min_bytes_per_thread, bool gather_affinity,
                   CpuGatherMode gather_mode, bool direct = false,
                   bool notify_profile = false)
-      : memory_(static_cast<uint8_t*>(memory)), base_(base), bytes_(bytes),
+      : base_(base), bytes_(bytes),
         control_(reinterpret_cast<peer::GatherControl*>(
             static_cast<uint8_t*>(memory) + peer::GatherControlOffset(bytes))),
         team_(memory, base, gather_threads, min_bytes_per_thread,
@@ -591,40 +591,18 @@ class CpuGatherWorker {
       peer::GatherBarrier();
       const auto descriptor_start_ns = NowNs();
       const auto address = __atomic_load_n(&control_->command, __ATOMIC_ACQUIRE);
-      bool valid = address % 64U == 0U &&
-          peer::GatherRange(base_, peer::GatherControlOffset(bytes_), address,
-                            sizeof(peer::GatherDescriptorHeader));
-      peer::GatherDescriptorHeader header{};
-      if (valid) {
-        auto* descriptor = memory_ + (address - base_);
-        std::memcpy(&header, descriptor, sizeof(header));
-        valid = header.magic == peer::kGatherDescriptorMagic &&
-            header.sequence == sequence && header.span_count != 0U &&
-            header.span_count <= peer::kMaxGatherSpans &&
-            header.total_bytes != 0U &&
-            peer::GatherRange(base_, peer::GatherControlOffset(bytes_), address,
-                              peer::GatherDescriptorBytes(header.span_count));
-        if (valid) {
-          try {
-            spans_.resize(header.span_count);
-            std::memcpy(spans_.data(), descriptor + sizeof(header),
-                        header.span_count * sizeof(GatherSpan));
-            valid = peer::ValidateDirectGather(base_, bytes_, address, header, spans_);
-            if (valid) {
-              const auto threads = team_.Prepare(header.staging_address, spans_,
-                                                 header.total_bytes);
-              if (threads != reported_threads_) {
-                Log("[KVAF_CPU] GATHER_THREADS active=%zu max=%zu bytes=%u mode=%s transport=urma\n",
-                    threads, max_threads_, header.total_bytes,
-                    GatherModeName(gather_mode_));
-                reported_threads_ = threads;
-              }
-            }
-          } catch (const std::exception& error) {
-            Log("[KVAF_CPU] GATHER_DIRECT_PREPARE_FAILED reason=%s\n", error.what());
-            valid = false;
-          }
+      bool valid = false;
+      try {
+        const auto threads = team_.PrepareDirect(bytes_, address, sequence, peer::kMaxGatherSpans);
+        valid = threads != 0U;
+        if (valid && threads != reported_threads_) {
+          Log("[KVAF_CPU] GATHER_THREADS active=%zu max=%zu bytes=%" PRIu64
+              " mode=%s transport=urma\n", threads, max_threads_, team_.total_bytes(),
+              GatherModeName(gather_mode_));
+          reported_threads_ = threads;
         }
+      } catch (const std::exception& error) {
+        Log("[KVAF_CPU] GATHER_DIRECT_PREPARE_FAILED reason=%s\n", error.what());
       }
       profile.source_cache_ns = NowNs() - descriptor_start_ns;
       if (valid) {
@@ -648,7 +626,6 @@ class CpuGatherWorker {
     }
   }
 
-  uint8_t* memory_;
   uint64_t base_;
   uint64_t bytes_;
   peer::GatherControl* control_;

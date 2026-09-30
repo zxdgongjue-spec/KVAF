@@ -173,6 +173,9 @@ NUMA 节点。该脚本固定 `OMP_THREAD_LIMIT=4`，因此只适合四线程绑
 由于 `951ce25` 在设备上出现 SIGBUS 回归，`./build.sh cpu` 清空全局
 `CMAKE_BUILD_TYPE`。CPU-only 的规划/准备 helper 使用函数级优化，URMA 初始化和 provider
 调用仍保持已验证的编译方式。
+CPU GatherRead 的 URMA 清单准备单独编译为 `kvaf_cpu_gather_plan`（`-O2`），
+将必要的源范围、重叠和长度检查与 staging 偏移表构建合并为一次遍历。
+每轮处理当前清单，复用缓冲区容量和工作线程，不缓存旧布局。
 
 CPU URMA 默认创建 4 个 Jetty。WRITE 每条 WR 可包含多个本地 source SGE，READ
 仍固定为一个本地和一个远端 SGE。WRITE 统一先完成校验和分组，再并行构造 WR；

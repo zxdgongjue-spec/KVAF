@@ -165,6 +165,122 @@ void TestDirectDescriptorLayout() {
                                            header, spans));
 }
 
+void TestDirectPreparation() {
+  constexpr std::size_t span_count = 4096U;
+  constexpr std::size_t source_stride = 128U;
+  constexpr std::size_t source_bytes = span_count * source_stride;
+  constexpr std::size_t staging_offset = source_bytes + 64U;
+  constexpr std::size_t descriptor_offset = staging_offset + source_bytes + 64U;
+  std::vector<std::uint8_t> memory(descriptor_offset +
+                                  kvaf::peer::GatherDescriptorBytes(span_count) + 256U);
+  const auto base = reinterpret_cast<std::uint64_t>(memory.data());
+  const auto address = (base + descriptor_offset + 63U) & ~std::uint64_t{63U};
+  for (const auto mode : {kvaf::peer::GatherWaitMode::kPassive,
+                          kvaf::peer::GatherWaitMode::kActive,
+                          kvaf::peer::GatherWaitMode::kAdaptive}) {
+    kvaf::peer::CpuGatherTeam team(memory.data(), base, 4U, 256U, mode);
+    for (std::uint64_t sequence = 1U; sequence <= 24U; ++sequence) {
+      const std::size_t count = sequence % 3U == 0U ? 1U : span_count - sequence;
+      std::vector<kvaf::peer::GatherSpan> spans(count);
+      std::uint32_t total = 0U;
+      for (std::size_t index = 0U; index < count; ++index) {
+        const auto offset = ((index * 37U + sequence) % span_count) * source_stride;
+        const auto length = static_cast<std::uint32_t>(17U + (index + sequence) % 97U);
+        spans[index] = {base + offset, length, 1U};
+        for (std::size_t byte = 0U; byte < length; ++byte)
+          memory[offset + byte] = static_cast<std::uint8_t>(index + byte + sequence);
+        total += length;
+      }
+      kvaf::peer::GatherDescriptorHeader header{
+          kvaf::peer::kGatherDescriptorMagic, sequence, base + staging_offset,
+          static_cast<std::uint32_t>(count), total};
+      auto* descriptor = memory.data() + (address - base);
+      std::memcpy(descriptor, &header, sizeof(header));
+      std::memcpy(descriptor + sizeof(header), spans.data(), spans.size() * sizeof(spans[0U]));
+      Require(team.PrepareDirect(memory.size(), address, sequence + 1U, span_count) == 0U);
+      Require(team.PrepareDirect(memory.size(), address, sequence, count - 1U) == 0U);
+      if (sequence == 8U) {
+        auto invalid = spans.front();
+        invalid.address = base + staging_offset;
+        std::memcpy(descriptor + sizeof(header), &invalid, sizeof(invalid));
+        Require(team.PrepareDirect(memory.size(), address, sequence, span_count) == 0U);
+        std::memcpy(descriptor + sizeof(header), spans.data(), sizeof(spans[0U]));
+      }
+      memory[staging_offset - 1U] = 0xa5U;
+      memory[staging_offset + total] = 0x5aU;
+      Require(team.PrepareDirect(memory.size(), address, sequence, span_count) ==
+              (count == 1U ? 1U : 4U));
+      Require(team.total_bytes() == total);
+      team.Copy();
+      std::size_t output = staging_offset;
+      for (const auto& span : spans) {
+        Require(std::memcmp(memory.data() + output,
+                            memory.data() + (span.address - base), span.length) == 0);
+        output += span.length;
+      }
+      Require(memory[staging_offset - 1U] == 0xa5U);
+      Require(memory[staging_offset + total] == 0x5aU);
+      if (mode == kvaf::peer::GatherWaitMode::kAdaptive)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+}
+
+void TestDirectPreparationBounds() {
+  alignas(64) std::array<std::uint8_t, 1024> memory{};
+  const auto base = reinterpret_cast<std::uint64_t>(memory.data());
+  const auto address = base + 512U;
+  kvaf::peer::CpuGatherTeam team(memory.data(), base, 2U);
+  const kvaf::peer::GatherDescriptorHeader valid_header{
+      kvaf::peer::kGatherDescriptorMagic, 1U, base + 256U, 2U, 32U};
+  const std::vector<kvaf::peer::GatherSpan> valid_spans{{base, 16U, 0U}, {base + 64U, 16U, 0U}};
+  auto prepare = [&](const kvaf::peer::GatherDescriptorHeader& header,
+                     const std::vector<kvaf::peer::GatherSpan>& spans) {
+    std::memcpy(memory.data() + 512U, &header, sizeof(header));
+    std::memcpy(memory.data() + 512U + sizeof(header), spans.data(),
+                spans.size() * sizeof(spans[0U]));
+    return team.PrepareDirect(memory.size(), address, 1U, 4096U);
+  };
+  for (const auto staging : {base + 8U, address, base + 960U, UINT64_MAX - 16U}) {
+    auto header = valid_header;
+    header.staging_address = staging;
+    Require(prepare(header, valid_spans) == 0U);
+  }
+  for (const auto length : {0U, UINT32_MAX}) {
+    auto spans = valid_spans;
+    spans[0U].length = length;
+    Require(prepare(valid_header, spans) == 0U);
+  }
+  for (const auto source : {base - 1U, address, base + 952U, UINT64_MAX - 8U}) {
+    auto spans = valid_spans;
+    spans[0U].address = source;
+    Require(prepare(valid_header, spans) == 0U);
+  }
+  for (const auto count : {0U, 29U, UINT32_MAX}) {
+    auto header = valid_header;
+    header.span_count = count;
+    Require(prepare(header, valid_spans) == 0U);
+  }
+  auto header = valid_header;
+  header.total_bytes = 31U;
+  Require(prepare(header, valid_spans) == 0U);
+  header.total_bytes = 33U;
+  Require(prepare(header, valid_spans) == 0U);
+  header = valid_header;
+  header.magic = 0U;
+  Require(prepare(header, valid_spans) == 0U);
+  Require(team.PrepareDirect(32U, address, 1U, 4096U) == 0U);
+  Require(team.PrepareDirect(memory.size(), address + 1U, 1U, 4096U) == 0U);
+  Require(team.PrepareDirect(memory.size(), base + 960U, 1U, 4096U) == 0U);
+  Require(team.PrepareDirect(UINT64_MAX, address, 1U, 4096U) == 0U);
+  Require(prepare(valid_header, valid_spans) == 1U);
+  team.Copy();
+  Require(kvaf::peer::ValidateDirectGather(base, memory.size(), address,
+                                          valid_header, valid_spans));
+  Require(!kvaf::peer::ValidateDirectGather(UINT64_MAX - 8U, 1024U, address,
+                                           valid_header, valid_spans));
+}
+
 int main() {
   std::array<std::uint8_t, 256> memory{};
   const auto base = reinterpret_cast<std::uint64_t>(memory.data());
@@ -192,5 +308,7 @@ int main() {
   TestParallelGather();
   TestIrregularGather();
   TestDirectDescriptorLayout();
+  TestDirectPreparation();
+  TestDirectPreparationBounds();
   std::cout << "CPU gather: PASS\n";
 }

@@ -66,25 +66,10 @@ inline bool ValidateGather(std::uint64_t base, std::uint64_t bytes,
   return true;
 }
 
-inline bool ValidateDirectGather(std::uint64_t base, std::uint64_t bytes,
-                                std::uint64_t descriptor_address,
-                                const GatherDescriptorHeader& header,
-                                const std::vector<GatherSpan>& spans) {
-  if (header.magic != kGatherDescriptorMagic ||
-      header.span_count != spans.size() || bytes < 64U ||
-      !GatherRange(base, GatherControlOffset(bytes), descriptor_address,
-                   GatherDescriptorBytes(spans.size()))) return false;
-  std::uint32_t total_bytes = 0U;
-  if (!ValidateGather(base, bytes, header.staging_address, spans, &total_bytes) ||
-      total_bytes != header.total_bytes) return false;
-  const auto descriptor_end = descriptor_address + GatherDescriptorBytes(spans.size());
-  if (descriptor_address < header.staging_address + total_bytes &&
-      header.staging_address < descriptor_end) return false;
-  for (const auto& span : spans)
-    if (descriptor_address < span.address + span.length &&
-        span.address < descriptor_end) return false;
-  return true;
-}
+bool ValidateDirectGather(std::uint64_t base, std::uint64_t bytes,
+                          std::uint64_t descriptor_address,
+                          const GatherDescriptorHeader& header,
+                          const std::vector<GatherSpan>& spans);
 
 inline void GatherIntoStaging(void* memory, std::uint64_t base,
                               std::uint64_t staging, const std::vector<GatherSpan>& spans) {

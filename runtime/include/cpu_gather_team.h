@@ -58,7 +58,10 @@ class CpuGatherTeam {
         wait_mode_(wait_mode) {}
 
   ~CpuGatherTeam() {
-    stopping_.store(true, std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_.store(true, std::memory_order_release);
+    }
     ready_.notify_all();
     for (std::thread& helper : helpers_) helper.join();
   }
@@ -67,6 +70,10 @@ class CpuGatherTeam {
   CpuGatherTeam& operator=(const CpuGatherTeam&) = delete;
 
   std::size_t max_threads() const { return max_threads_; }
+  std::uint64_t total_bytes() const { return total_bytes_; }
+
+  std::size_t PrepareDirect(std::uint64_t region_bytes, std::uint64_t descriptor_address,
+                            std::uint64_t sequence, std::size_t max_spans);
 
   void BindWorker(std::size_t worker) const {
 #if defined(__linux__)
@@ -90,26 +97,11 @@ class CpuGatherTeam {
 
   std::size_t Prepare(std::uint64_t staging, const std::vector<GatherSpan>& spans,
                       std::uint32_t total_bytes) {
-    const std::size_t threads = std::min(max_threads_, std::max<std::size_t>(
-        1U, total_bytes / min_bytes_per_thread_));
-    std::unique_lock<std::mutex> lock(mutex_);
-    while (helpers_.size() + 1U < threads) {
-      const std::size_t index = helpers_.size() + 1U;
-      helpers_.emplace_back(&CpuGatherTeam::RunHelper, this, index);
-    }
-    spans_ = &spans;
-    staging_ = memory_ + (staging - base_);
-    total_bytes_ = total_bytes;
-    active_threads_ = threads;
-    offsets_.clear();
-    offsets_.reserve(spans.size() + 1U);
-    offsets_.push_back(0U);
-    for (const auto& span : spans) offsets_.push_back(offsets_.back() + span.length);
-    phase_.store(0U, std::memory_order_release);
-    generation_.fetch_add(1U, std::memory_order_release);
-    lock.unlock();
-    ready_.notify_all();
-    return threads;
+    offsets_.resize(spans.size() + 1U);
+    offsets_[0U] = 0U;
+    for (std::size_t index = 0U; index < spans.size(); ++index)
+      offsets_[index + 1U] = offsets_[index] + spans[index].length;
+    return Publish(staging, spans, total_bytes);
   }
 
   void Copy() {
@@ -122,6 +114,26 @@ class CpuGatherTeam {
   }
 
  private:
+  std::size_t Publish(std::uint64_t staging, const std::vector<GatherSpan>& spans,
+                      std::uint32_t total_bytes) {
+    const std::size_t threads = std::min(max_threads_, std::max<std::size_t>(
+        1U, total_bytes / min_bytes_per_thread_));
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (helpers_.size() + 1U < threads) {
+      const std::size_t index = helpers_.size() + 1U;
+      helpers_.emplace_back(&CpuGatherTeam::RunHelper, this, index);
+    }
+    spans_ = &spans;
+    staging_ = memory_ + (staging - base_);
+    total_bytes_ = total_bytes;
+    active_threads_ = threads;
+    phase_.store(0U, std::memory_order_release);
+    generation_.fetch_add(1U, std::memory_order_release);
+    lock.unlock();
+    ready_.notify_all();
+    return threads;
+  }
+
   static std::vector<int> AllowedCpus() {
     std::vector<int> cpus;
 #if defined(__linux__)
@@ -220,6 +232,7 @@ class CpuGatherTeam {
   std::condition_variable ready_;
   std::atomic<std::uint64_t> generation_{0U};
   const std::vector<GatherSpan>* spans_{nullptr};
+  std::vector<GatherSpan> direct_spans_;
   std::uint8_t* staging_{nullptr};
   std::uint64_t total_bytes_{0U};
   std::size_t active_threads_{1U};

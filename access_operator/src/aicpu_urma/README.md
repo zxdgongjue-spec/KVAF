@@ -134,6 +134,14 @@ CPU worker 使用常驻 `std::thread`。默认 `--gather-mode adaptive`：协调
 payload 限制实际并行度；服务端可用 `--gather-threads N` 指定上限（1 到 64，
 显式指定时阈值降为每线程 64 KiB，设为 1 可作为单线程基线）。
 `[KVAF_CPU] GATHER_THREADS` 日志显示实际线程数。
+URMA 清单准备将源地址范围、缓冲区重叠和总长度检查与 staging 偏移表构建
+合并为一次遍历；不再调用 RPC 路径的两遍校验，也不再单独重建偏移表。
+不检查未使用的 span `reserved` 字段。清单仍先复制到 CPU 持有的缓冲区，
+每轮重新生成偏移，支持源地址、顺序、数量和长度变化。缓冲区容量与 worker 复用。
+这段纯 CPU 准备代码独立编译为 `kvaf_cpu_gather_plan`，使用 `-O2`；
+URMA 初始化仍保留原编译方式。更新后执行 `./build.sh cpu` 并重启 CPU 服务，
+NPU 客户端和 AICPU kernel 无需重装。对比时间线中的
+`CPU read and prepare source list` 与整个通知到 ACK 完成区间。
 CPU profiling 的拷贝耗时包含线程分发与同步，需在目标机器上用同一
 batch 比较 `--gather-threads 1/4/8/16` 后再选线程数。可用 `taskset`
 限制服务进程的候选 CPU 集合，绑核只在该集合内选核。
