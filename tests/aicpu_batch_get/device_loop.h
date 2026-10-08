@@ -31,14 +31,17 @@ Result RunDevice(const Config& config, IO& io, Sample* samples, KernelResult* re
       if (io.Now() - start >= timeout_ticks) return result->status = Result::kTimeout;
     }
     const auto ready = io.Now();
-    io.Scatter(config, layout);
+    if (IsDirectOutput(config)) io.CompleteDirectOutput();
+    else io.Scatter(config, layout);
     const auto end = io.Now();
     // Verification is outside the reported per-round timing, but before the
-    // next request; the producer cannot overwrite staging during checking.
+    // next request; the producer cannot overwrite payload during checking.
     // PrepareRound removes its cache effects before the next sample starts.
     if (!io.VerifyTags(seq, config, layout)) return result->status = Result::kDataMismatch;
     if (seq > config.warmup)
-      samples[seq - config.warmup - 1] = {end - start, ready - start, end - ready};
+      samples[seq - config.warmup - 1] = IsDirectOutput(config)
+          ? Sample{end - start, end - start, 0}
+          : Sample{end - start, ready - start, end - ready};
     result->completed_rounds = seq;
   }
   result->failed_sequence = 0;

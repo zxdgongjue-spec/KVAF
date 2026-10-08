@@ -4,9 +4,9 @@
 #include <limits>
 
 namespace kvaf::aicpu_test {
-constexpr std::uint64_t kMagic = 0x4b56414641424732ULL;
-constexpr char kKernelName[] = "KvafAicpuBatchGetV8";
-constexpr std::uint64_t kKernelRevision = 8;
+constexpr std::uint64_t kMagic = 0x4b56414641424733ULL;
+constexpr char kKernelName[] = "KvafAicpuBatchGetV10";
+constexpr std::uint64_t kKernelRevision = 10;
 constexpr char kCoreProbeKernelName[] = "KvafAicpuCoreProbeV1";
 constexpr std::uint64_t kCoreProbeMagic = 0x4b564146434f5231ULL;
 constexpr std::uint64_t kCoreProbeRevision = 1;
@@ -18,6 +18,8 @@ constexpr std::uint64_t kGuardBytes = 64;
 constexpr std::uint64_t kMaxAllocation = 8ULL << 30;
 constexpr std::uint64_t kMaxRounds = 100000;
 
+enum class TransferMode : std::uint64_t { kScatter = 0, kDirectOutput = 1 };
+
 struct Config {
   std::uint64_t magic{kMagic};
   std::uint64_t rows{8192};
@@ -26,7 +28,18 @@ struct Config {
   std::uint64_t iterations{100};
   std::uint64_t timeout_ms{30000};
   std::uint64_t scatter_threads{1};
+  TransferMode transfer_mode{TransferMode::kScatter};
+  // Direct output defaults to tightly packed rows. A larger stride exercises
+  // remote gaps without transmitting or overwriting the intervening bytes.
+  std::uint64_t direct_output_stride{};
 };
+
+inline bool IsDirectOutput(const Config& c) {
+  return c.transfer_mode == TransferMode::kDirectOutput;
+}
+inline const char* TransferModeName(const Config& c) {
+  return IsDirectOutput(c) ? "direct_output" : "scatter";
+}
 
 struct Layout {
   std::uint64_t payload_bytes;
@@ -34,21 +47,32 @@ struct Layout {
   std::uint64_t output_bytes;
   std::uint64_t region_bytes;
   std::uint64_t rounds;
+  // Keep the CPU source layout identical when comparing transfer modes.
+  std::uint64_t source_stride;
 };
 
-// Keep every row on separate complete cache lines. The two control records
-// have different producers and never share a line with data or each other.
+// Scatter output and CPU sources keep separate complete cache lines per row.
+// Direct output may be packed; only the coordinator touches it after DMA.
+// Control records never share a cache line with data or each other.
 inline bool MakeLayout(const Config& c, Layout* out) {
   if (!out || c.magic != kMagic || c.rows == 0 || c.rows > UINT32_MAX ||
       c.row_bytes < sizeof(std::uint64_t) || c.row_bytes > UINT32_MAX ||
       c.scatter_threads == 0 || c.scatter_threads > kMaxScatterThreads ||
       c.iterations == 0 || c.iterations > kMaxRounds ||
       c.warmup > kMaxRounds - c.iterations ||
-      c.timeout_ms == 0 || c.timeout_ms > 600000) return false;
-  const std::uint64_t stride = ((c.row_bytes + 63) & ~std::uint64_t{63}) + kGuardBytes;
-  if (c.rows > (kMaxAllocation - kStagingOffset) / stride) return false;
+      c.timeout_ms == 0 || c.timeout_ms > 600000 ||
+      (c.transfer_mode != TransferMode::kScatter && !IsDirectOutput(c)) ||
+      (!IsDirectOutput(c) && c.direct_output_stride != 0)) return false;
+  const std::uint64_t source_stride = ((c.row_bytes + 63) & ~std::uint64_t{63}) + kGuardBytes;
+  const std::uint64_t stride = IsDirectOutput(c)
+      ? (c.direct_output_stride ? c.direct_output_stride : c.row_bytes) : source_stride;
+  const auto tail_guard = IsDirectOutput(c) ? kGuardBytes : 0;
+  const auto limit = kMaxAllocation - kStagingOffset - tail_guard;
+  if (stride < c.row_bytes || c.rows > limit / stride ||
+      c.rows > limit / source_stride) return false;
   *out = {c.rows * c.row_bytes, stride, c.rows * stride,
-          kStagingOffset + c.rows * c.row_bytes, c.warmup + c.iterations};
+          kStagingOffset + c.rows * (IsDirectOutput(c) ? stride : c.row_bytes) + tail_guard,
+          c.warmup + c.iterations, source_stride};
   return true;
 }
 
@@ -191,6 +215,7 @@ inline std::uint64_t RowsPerCacheGroup(std::uint64_t row_bytes) {
   return 64 / a;
 }
 inline std::uint32_t ActiveThreads(const Config& c) {
+  if (IsDirectOutput(c)) return 1;  // Coordinator only; no scatter team.
   const auto quantum = RowsPerCacheGroup(c.row_bytes);
   const auto groups = (c.rows + quantum - 1) / quantum;
   return static_cast<std::uint32_t>(groups < c.scatter_threads ? groups : c.scatter_threads);
@@ -203,8 +228,8 @@ inline RowRange ScatterRange(const Config& c, std::uint32_t worker, std::uint32_
   const auto end = (groups * (worker + 1) / workers) * quantum;
   return {begin, end < c.rows ? end : c.rows};
 }
-static_assert(sizeof(Config) == 56 && sizeof(Control) == 64);
+static_assert(sizeof(Config) == 72 && sizeof(Control) == 64);
 static_assert(sizeof(Sample) == 24 && sizeof(KernelResult) == 64);
-static_assert(sizeof(KernelArgs) == 104 && sizeof(CoordinationWord) == 64);
+static_assert(sizeof(KernelArgs) == 120 && sizeof(CoordinationWord) == 64);
 static_assert(sizeof(CoreProbeSlot) == 256 && sizeof(CoreProbeArgs) == 24);
 }  // namespace kvaf::aicpu_test

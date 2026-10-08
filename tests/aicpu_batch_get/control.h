@@ -15,8 +15,8 @@
 
 namespace kvaf::aicpu_test {
 // Test-only commands; never change the production Runtime protocol.
-// v5 keeps the control ABI and changes the device scatter layout.
-constexpr auto kConfigure = static_cast<peer::Command>(0x7005);
+// V10 adds transfer mode/stride to Config; reject older configuration frames.
+constexpr auto kConfigure = static_cast<peer::Command>(0x700a);
 constexpr auto kStart = static_cast<peer::Command>(0x7001);
 constexpr auto kResetSetup = static_cast<peer::Command>(0x7003);
 struct ConfigureRequest {
@@ -34,7 +34,7 @@ struct Report {
   std::uint64_t active_threads{};
   double mean_ns{}, p50_ns{}, p99_ns{}, wait_ns{}, scatter_ns{}, gbps{};
 };
-static_assert(sizeof(ConfigureRequest) == 80 && sizeof(Ack) == 16 && sizeof(Report) == 80);
+static_assert(sizeof(ConfigureRequest) == 96 && sizeof(Ack) == 16 && sizeof(Report) == 80);
 
 inline void Require(bool ok, const std::string& message) {
   if (!ok) throw std::runtime_error(message);

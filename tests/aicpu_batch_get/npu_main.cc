@@ -76,6 +76,8 @@ class Kernel {
   void Launch(const KernelArgs& args, std::uint32_t block_dim) {
     Layout layout{}; Require(MakeLayout(args.config, &layout), "invalid launch shape");
     Require(block_dim > 0 && block_dim <= kMaxScatterThreads, "invalid AICPU block count");
+    Require(!IsDirectOutput(args.config) || (block_dim == 1 && args.coordination == 0 && args.profile == 0),
+            "direct output requires one coordinator and no scatter profile/team");
     aclrtLaunchKernelAttr attr{};
     attr.id = ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT;
     attr.value.timeout = static_cast<std::uint32_t>(
@@ -101,13 +103,13 @@ class Kernel {
   aclrtStream stream_{};
 };
 
-void ValidateOutput(const Config& c, const Layout& l, const DeviceBuffer& output) {
+void ValidateOutput(const Config& c, const Layout& l, const void* output) {
   // Chunked readback avoids a second whole-output host allocation.
   constexpr std::uint64_t kChunkBytes = 1U << 20;
   std::vector<std::uint8_t> copy(std::min(kChunkBytes, l.output_bytes));
   for (std::uint64_t offset = 0; offset < l.output_bytes; offset += copy.size()) {
     const auto bytes = std::min<std::uint64_t>(copy.size(), l.output_bytes - offset);
-    Acl(aclrtMemcpy(copy.data(), copy.size(), static_cast<std::uint8_t*>(output.data) + offset,
+    Acl(aclrtMemcpy(copy.data(), copy.size(), static_cast<const std::uint8_t*>(output) + offset,
                      bytes, ACL_MEMCPY_DEVICE_TO_HOST), "read output");
     for (std::uint64_t i = 0; i < bytes; ++i) {
       const auto slot = (offset + i) / l.stride;
@@ -116,23 +118,37 @@ void ValidateOutput(const Config& c, const Layout& l, const DeviceBuffer& output
       const auto tag = RowTag(l.rounds, row);
       const std::uint8_t expected = b >= c.row_bytes ? 0xA5 :
           b < 8 ? static_cast<std::uint8_t>(tag >> (8 * b)) : Pattern(row, b);
-      Require(copy[i] == expected, "scatter output/guard mismatch at byte " + std::to_string(offset + i));
+      Require(copy[i] == expected, "output/guard mismatch at byte " + std::to_string(offset + i));
     }
+  }
+}
+
+void ValidateDirectOutputGuards(const Layout& layout, const NpuTarget& target) {
+  const auto* output = static_cast<const std::uint8_t*>(target.payload());
+  std::uint8_t copy[kGuardBytes];
+  for (const auto* guard : {output - kGuardBytes, output + layout.output_bytes}) {
+    Acl(aclrtMemcpy(copy, sizeof(copy), guard, sizeof(copy), ACL_MEMCPY_DEVICE_TO_HOST),
+        "read direct output boundary guard");
+    for (auto byte : copy) Require(byte == 0xA5, "direct output boundary guard overwritten");
   }
 }
 
 Report Execute(int fd, const Config& config, NpuTarget& target, const std::string& json,
                bool profile_scatter, std::uint32_t aicpu_blocks) {
   Layout layout{}; Require(MakeLayout(config, &layout), "invalid config");
+  const bool direct_output = IsDirectOutput(config);
   const auto active_threads = ActiveThreads(config);
-  Require(aicpu_blocks == 1 || aicpu_blocks == active_threads,
+  const auto block_dim = direct_output ? 1U : aicpu_blocks;
+  const bool collect_profile = profile_scatter && !direct_output;
+  Require(block_dim == 1 || block_dim == active_threads,
           "--aicpu-blocks must equal active scatter ranges; use --aicpu-blocks 1 for pthread mode");
   DeviceBuffer output, samples, result, profile, coordination;
-  output.Allocate(layout.output_bytes, 0xA5);
+  if (!direct_output) output.Allocate(layout.output_bytes, 0xA5);
+  void* output_data = direct_output ? target.payload() : output.data;
   samples.Allocate(config.iterations * sizeof(Sample));
   result.Allocate(sizeof(KernelResult));
-  if (profile_scatter) profile.Allocate(sizeof(ScatterProfile));
-  if (aicpu_blocks > 1) {
+  if (collect_profile) profile.Allocate(sizeof(ScatterProfile));
+  if (block_dim > 1) {
     const auto host_coordination = MakeMultiBlockCoordination(active_threads);
     coordination.Allocate(sizeof(host_coordination));
     Acl(aclrtMemcpy(coordination.data, sizeof(host_coordination), &host_coordination,
@@ -140,19 +156,32 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
   }
   Kernel kernel; kernel.Load(json, kKernelName);
   KernelArgs args{reinterpret_cast<std::uint64_t>(target.memory()),
-                  reinterpret_cast<std::uint64_t>(output.data),
+                  reinterpret_cast<std::uint64_t>(output_data),
                   reinterpret_cast<std::uint64_t>(samples.data),
                   reinterpret_cast<std::uint64_t>(result.data), config,
                   reinterpret_cast<std::uint64_t>(profile.data),
                   reinterpret_cast<std::uint64_t>(coordination.data)};
-  std::fprintf(stderr,
+  if (direct_output) {
+    std::fprintf(stderr,
+                 "AICPU_GET_NPU LAUNCH mode=direct_output transfer_mode=direct_output "
+                 "block_dim=1 requested_block_dim=%u active_scatter_ranges=0 "
+                 "sgl_layout=source_by_output_slot output_memory=registered_target_payload "
+                 "source_stride=%llu output_stride=%llu scatter_clean=none scatter_copy=none "
+                 "output_cache=cold_before_request cache_prepare=outside_timing\n",
+                 aicpu_blocks, (unsigned long long)layout.source_stride,
+                 (unsigned long long)layout.stride);
+    if (profile_scatter)
+      std::fprintf(stderr, "[AICPU_PROFILE] SKIPPED reason=direct_output_has_no_scatter\n");
+  } else {
+    std::fprintf(stderr,
                "AICPU_GET_NPU LAUNCH mode=%s block_dim=%u active_scatter_ranges=%u "
-               "sgl_layout=source_by_output_slot scatter_layout=forward "
+               "transfer_mode=scatter sgl_layout=source_by_output_slot scatter_layout=forward "
                "scatter_clean=payload_cache_lines scatter_copy=%s "
                "output_cache=cold_before_request cache_prepare=outside_timing\n",
-               aicpu_blocks == 1 ? "pthread" : "multi-block", aicpu_blocks, active_threads,
+               block_dim == 1 ? "pthread" : "multi-block", block_dim, active_threads,
                ScatterCopyBackendName(config.row_bytes));
-  kernel.Launch(args, aicpu_blocks);
+  }
+  kernel.Launch(args, block_dim);
   // Once launched, do not unwind allocations until both device execution and
   // CPU transport have stopped. A lost control connection requires retaining
   // the process/resources for operator intervention, not eager buffer free.
@@ -207,11 +236,12 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
   }
   Acl(result_read, "read kernel result");
   Require(device_result.status == Result::kOk, "AICPU returned an error status");
-  ValidateOutput(config, layout, output);
+  ValidateOutput(config, layout, output_data);
+  if (direct_output) ValidateDirectOutputGuards(layout, target);
   std::vector<Sample> timings(config.iterations);
   Acl(aclrtMemcpy(timings.data(), timings.size() * sizeof(Sample), samples.data,
                    timings.size() * sizeof(Sample), ACL_MEMCPY_DEVICE_TO_HOST), "read timings");
-  if (profile_scatter) {
+  if (collect_profile) {
     auto device_profile = std::make_unique<ScatterProfile>();
     Acl(aclrtMemcpy(device_profile.get(), sizeof(ScatterProfile), profile.data,
                      sizeof(ScatterProfile), ACL_MEMCPY_DEVICE_TO_HOST), "read scatter profile");
@@ -286,6 +316,7 @@ void HandleConfigure(int fd, const kvaf::peer::MessageHeader& header, CandidateR
     Require(request.npu_candidate < eids.size(), "invalid NPU EID candidate");
     auto candidate = std::make_unique<NpuTarget>();
     candidate->Initialize(request.device_id, eids[request.npu_candidate], layout.region_bytes);
+    if (IsDirectOutput(request.config)) candidate->PrepareDirectOutput(layout);
     response = candidate->exported();
     target = std::move(candidate); config = request.config; device = request.device_id;
     std::fprintf(stderr, "AICPU_GET_NPU device-id=%u npu_candidate=%u\n", device, request.npu_candidate);

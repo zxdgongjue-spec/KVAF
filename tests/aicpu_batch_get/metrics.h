@@ -21,7 +21,8 @@ inline Report Summarize(const Config& config, const KernelResult& result,
   const double ns_per_tick = 1e9 / static_cast<double>(result.counter_frequency);
   for (const auto& sample : samples) {
     Require(sample.total_ticks > 0 && sample.wait_ticks <= sample.total_ticks &&
-            sample.scatter_ticks == sample.total_ticks - sample.wait_ticks,
+            sample.scatter_ticks == sample.total_ticks - sample.wait_ticks &&
+            (!IsDirectOutput(config) || sample.scatter_ticks == 0),
             "invalid timing sample");
     const auto ns = sample.total_ticks * ns_per_tick;
     times.push_back(ns);

@@ -2,6 +2,7 @@
 #include "metrics.h"
 #include "scatter_pool.h"
 #include "scatter_copy.h"
+#include "cpu_urma/sgl_batch_builder.h"
 
 #include <cstdio>
 #include <cstring>
@@ -16,6 +17,7 @@ struct Simulator {
   std::uint64_t clock{}, sequence{}, done{}, publications{};
   std::uint64_t prepared_rounds{}, verified_sequence{};
   std::uint64_t preparation_ticks{}, verification_ticks{};
+  std::uint64_t scatter_calls{}, direct_completions{};
   bool output_cached{true};  // Initial fill, then scatter/verification refills it.
   int reads{};
   bool timeout{}, future{}, corrupt{};
@@ -44,7 +46,8 @@ struct Simulator {
     // Model the CPU WRITE and delayed completion, with a new tag every round.
     for (std::uint64_t slot = 0; slot < config.rows; ++slot) {
       const auto row = LogicalRowForOutputSlot(config, slot);
-      auto* dst = staging.data() + slot * config.row_bytes;
+      auto* dst = IsDirectOutput(config) ? output.data() + slot * layout.stride
+                                        : staging.data() + slot * config.row_bytes;
       auto tag = RowTag(sequence, row);
       if (corrupt && row == 1) --tag;
       std::memcpy(dst, &tag, 8);
@@ -53,11 +56,19 @@ struct Simulator {
     return done = sequence;
   }
   void Scatter(const Config& c, const Layout& l) {
+    Require(!IsDirectOutput(c), "direct output entered scatter");
+    ++scatter_calls;
     Require(done == sequence, "scatter ran before completion");
     Require(!output_cached, "scatter inherited initialization/verification cache state");
     CopyScatterRows(output.data(), staging.data(), c.rows, c.row_bytes, l.stride);
     output_cached = true;
     clock += 5;
+  }
+  void CompleteDirectOutput() {
+    Require(IsDirectOutput(config) && done == sequence && !output_cached,
+            "direct output consumed payload before completion/cache preparation");
+    ++direct_completions;
+    clock += 2;  // Completion barrier belongs to the measured wait, not scatter.
   }
   bool VerifyTags(std::uint64_t seq, const Config& c, const Layout& l) {
     output_cached = true;
@@ -94,19 +105,23 @@ void SuccessAndMetrics() {
   Require(rejected, "invalid timing accepted");
 }
 void Failures() {
-  Config c; c.rows = 3; c.row_bytes = 64; c.iterations = 1; c.warmup = 0; c.timeout_ms = 5;
-  Sample sample{}; KernelResult result{};
-  Simulator missing(c); missing.timeout = true;
-  Require(RunDevice(c, missing, &sample, &result) == Result::kTimeout &&
-          result.completed_rounds == 0 && result.failed_sequence == 1, "missing completion must timeout");
-  Simulator future(c); future.future = true;
-  Require(RunDevice(c, future, &sample, &result) == Result::kSequenceError, "future sequence accepted");
-  Simulator corrupt(c); corrupt.corrupt = true;
-  Require(RunDevice(c, corrupt, &sample, &result) == Result::kDataMismatch, "stale row accepted");
+  for (auto mode : {TransferMode::kScatter, TransferMode::kDirectOutput}) {
+    Config c; c.rows = 3; c.row_bytes = 64; c.iterations = 1; c.warmup = 0; c.timeout_ms = 5;
+    c.transfer_mode = mode;
+    Sample sample{}; KernelResult result{};
+    Simulator missing(c); missing.timeout = true;
+    Require(RunDevice(c, missing, &sample, &result) == Result::kTimeout &&
+            result.completed_rounds == 0 && result.failed_sequence == 1, "missing completion must timeout");
+    Simulator future(c); future.future = true;
+    Require(RunDevice(c, future, &sample, &result) == Result::kSequenceError, "future sequence accepted");
+    Simulator corrupt(c); corrupt.corrupt = true;
+    Require(RunDevice(c, corrupt, &sample, &result) == Result::kDataMismatch, "stale row accepted");
+  }
 }
 void CachePreparationAndTiming() {
-  for (auto warmup : {0, 2}) {
+  for (auto mode : {TransferMode::kScatter, TransferMode::kDirectOutput}) for (auto warmup : {0, 2}) {
     Config c; c.rows = 67; c.row_bytes = 656; c.warmup = warmup; c.iterations = 4;
+    c.transfer_mode = mode;
     c.timeout_ms = 10;
     Simulator baseline(c), delayed(c);
     // Both costs exceed the per-round timeout; neither belongs to a sample.
@@ -140,6 +155,88 @@ void Bounds() {
   c = {}; c.iterations = 0; Require(!MakeLayout(c, &l), "zero samples accepted");
   c = {}; c.timeout_ms = 0; Require(!MakeLayout(c, &l), "unbounded wait accepted");
   c = {}; c.magic = 0; Require(!MakeLayout(c, &l), "invalid ABI accepted");
+  c = {}; c.transfer_mode = static_cast<TransferMode>(2);
+  Require(!MakeLayout(c, &l), "unknown transfer mode accepted");
+  c = {}; c.direct_output_stride = 4096;
+  Require(!MakeLayout(c, &l), "direct stride accepted in scatter mode");
+  c = {}; c.transfer_mode = TransferMode::kDirectOutput; c.direct_output_stride = c.row_bytes - 1;
+  Require(!MakeLayout(c, &l), "overlapping direct output rows accepted");
+  c.direct_output_stride = UINT64_MAX;
+  Require(!MakeLayout(c, &l), "overflowing direct output stride accepted");
+}
+void DirectOutput() {
+  for (auto bytes : {8, 65, 656, 4096}) for (auto rows : {1, 3, 67})
+    for (auto requested_threads : {1, 4}) for (auto extra_stride : {0, 17, 112}) {
+      Config c; c.rows = rows; c.row_bytes = bytes; c.scatter_threads = requested_threads;
+      c.transfer_mode = TransferMode::kDirectOutput;
+      if (extra_stride) c.direct_output_stride = c.row_bytes + extra_stride;
+      c.warmup = 2; c.iterations = 4;
+      Simulator io(c);
+      std::vector<Sample> samples(c.iterations); KernelResult result{};
+      Require(RunDevice(c, io, samples.data(), &result) == Result::kOk,
+              "direct output loop failed");
+      Require(result.active_threads == 1 && result.requested_threads == c.scatter_threads &&
+              io.scatter_calls == 0 && io.direct_completions == c.warmup + c.iterations,
+              "direct output created/used scatter workers or skipped completion");
+      for (std::uint64_t slot = 0; slot < c.rows; ++slot) {
+        const auto row = LogicalRowForOutputSlot(c, slot);
+        const auto* dst = io.output.data() + OutputSlotOffset(io.layout, slot);
+        for (std::uint64_t b = 8; b < c.row_bytes; ++b)
+          Require(dst[b] == Pattern(row, b), "direct output payload mismatch");
+        for (auto b = c.row_bytes; b < io.layout.stride; ++b)
+          Require(dst[b] == 0xA5, "direct WRITE overwrote output gap");
+      }
+      const auto report = Summarize(c, result, samples);
+      Require(report.scatter_ns == 0 && report.mean_ns == report.wait_ns && report.gbps > 0,
+              "direct output completion/timing mismatch");
+      // An internally consistent nonzero scatter sample is still invalid for this mode.
+      --samples[0].wait_ticks; ++samples[0].scatter_ticks;
+      bool rejected = false;
+      try { (void)Summarize(c, result, samples); } catch (...) { rejected = true; }
+      Require(rejected, "direct output accepted scatter timings");
+    }
+  Config c; c.rows = 4096; c.row_bytes = 656; c.transfer_mode = TransferMode::kDirectOutput;
+  Layout l{};
+  Require(MakeLayout(c, &l) && l.stride == 656 && l.source_stride == 768 &&
+          l.output_bytes == l.payload_bytes &&
+          l.region_bytes == kStagingOffset + l.output_bytes + kGuardBytes,
+          "registered packed direct output layout mismatch");
+}
+void DirectWriteGrouping() {
+  // Exercise the actual transport planner: source addresses are reversed,
+  // while packed destinations gather and strided destinations split WRs.
+  for (auto stride : {0, 768}) {
+    Config c; c.rows = 67; c.row_bytes = 656; c.transfer_mode = TransferMode::kDirectOutput;
+    c.direct_output_stride = stride;
+    Layout l{}; Require(MakeLayout(c, &l), "WRITE grouping layout");
+    std::vector<std::uint8_t> source(c.rows * l.source_stride);
+    std::vector<kvaf::CpuUrmaTransport::HostSge> buffers(c.rows);
+    std::vector<std::uint64_t> offsets(c.rows);
+    for (std::uint64_t slot = 0; slot < c.rows; ++slot) {
+      buffers[slot] = {source.data() + LogicalRowForOutputSlot(c, slot) * l.source_stride,
+                       static_cast<std::size_t>(c.row_bytes)};
+      offsets[slot] = kStagingOffset + OutputSlotOffset(l, slot);
+    }
+    std::size_t wrs = 0, emitted = 0;
+    std::uint64_t transferred = 0;
+    const auto status = kvaf::cpu_urma_detail::BuildWriteGatherShard(
+        buffers.data(), offsets.data(), buffers.size(), 0, buffers.size(), 16,
+        l.region_bytes, UINT32_MAX,
+        [&](std::size_t, std::size_t row, const auto& buffer) {
+          Require(buffer.data == buffers[row].data && buffer.bytes == c.row_bytes,
+                  "WRITE grouping changed source mapping");
+          ++emitted;
+        },
+        [&](std::size_t, const auto& group) { transferred += group.bytes; }, &wrs);
+    Require(status.ok() && emitted == c.rows && transferred == l.payload_bytes &&
+            wrs == (stride ? c.rows : (c.rows + 15) / 16),
+            "packed/strided direct WRITE grouping mismatch");
+    offsets.back() = l.region_bytes - c.row_bytes + 1;
+    Require(!kvaf::cpu_urma_detail::BuildWriteGatherShard(
+                buffers.data(), offsets.data(), buffers.size(), 0, buffers.size(), 16,
+                l.region_bytes, UINT32_MAX, [](auto...) {}, [](auto...) {}, &wrs).ok(),
+            "direct WRITE accepted an out-of-range destination");
+  }
 }
 void ParallelScatter() {
   for (auto bytes : {8, 65, 656, 4096}) for (auto rows : {3, 67, 4096})
@@ -197,7 +294,7 @@ void DeviceSelection() {
 }  // namespace
 int main() {
   try { ParallelScatter(); Bounds(); DeviceSelection(); SuccessAndMetrics(); Failures();
-        CachePreparationAndTiming();
+        CachePreparationAndTiming(); DirectOutput(); DirectWriteGrouping();
         std::puts("aicpu get protocol: PASS"); return 0; }
   catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
 }

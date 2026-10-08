@@ -1,7 +1,7 @@
 {
-  "KvafAicpuBatchGetV8": {
+  "KvafAicpuBatchGetV10": {
     "opInfo": {
-      "functionName": "KvafAicpuBatchGetV8",
+      "functionName": "KvafAicpuBatchGetV10",
       "kernelSo": "libkvaf_aicpu_test.so",
       "opKernelLib": "AICPUKernel"
     }

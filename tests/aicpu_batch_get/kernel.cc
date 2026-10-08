@@ -161,6 +161,13 @@ struct DeviceIO {
     dispatch_tick = Now(); pool.Run();
     RecordPoolTiming(*profile, dispatch_tick, Now());
   }
+  void CompleteDirectOutput() {
+    // Output was evicted before publishing the request and has not been
+    // touched since. Do not copy, clean or refill the DMA-owned payload here.
+    // CPU publishes done only after WriteBatch has waited for every Jetty.
+    // Provider-to-HBM visibility still needs hardware validation.
+    Barrier();
+  }
   bool VerifyTags(std::uint64_t seq, const Config& c, const Layout& l) {
     Invalidate(output, l.output_bytes);
     for (std::uint64_t row = 0; row < c.rows; ++row) {
@@ -389,18 +396,28 @@ std::uint32_t KvafAicpuCoreProbeV1(CoreProbeArgs* args) {
 }
 
 extern "C" __attribute__((visibility("default")))
-std::uint32_t KvafAicpuBatchGetV8(KernelArgs* args) {
+std::uint32_t KvafAicpuBatchGetV10(KernelArgs* args) {
   if (!args || !args->region || !args->output || !args->samples || !args->result) return 1;
   auto* result = reinterpret_cast<KernelResult*>(args->result);
   auto* samples = reinterpret_cast<Sample*>(args->samples);
   Layout layout{};
-  if (!MakeLayout(args->config, &layout)) {
-    *result = {}; result->status = Result::kInvalidArgs;
+  if (!MakeLayout(args->config, &layout) ||
+      (IsDirectOutput(args->config) &&
+       (args->coordination || args->profile || args->region > UINT64_MAX - layout.region_bytes ||
+        args->output != args->region + kStagingOffset))) {
+    *result = {}; result->status = Result::kInvalidArgs; result->kernel_revision = kKernelRevision;
     Clean(result, sizeof(*result)); return 1;
   }
   DeviceIO io{reinterpret_cast<std::uint8_t*>(args->region),
               reinterpret_cast<std::uint8_t*>(args->output), args->config, layout,
               reinterpret_cast<ScatterProfile*>(args->profile), {}};
+  if (IsDirectOutput(args->config)) {
+    // No pthread initialization, worker dispatch or multi-block barriers.
+    const auto status = RunDevice(args->config, io, samples, result);
+    if (status == Result::kOk) Clean(samples, args->config.iterations * sizeof(Sample));
+    Clean(result, sizeof(*result));
+    return status == Result::kOk ? 0 : 1;
+  }
   if (args->coordination) {
     const auto status = RunMultiBlock(io, samples, result,
         *reinterpret_cast<MultiBlockCoordination*>(args->coordination));

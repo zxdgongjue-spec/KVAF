@@ -1,4 +1,4 @@
-# AICPU 发起、CPU URMA 回推、AICPU scatter 带宽测试
+# AICPU 发起、CPU URMA 回推：scatter / direct output 带宽测试
 
 这是独立 C++ 测试，不调用 Runtime BatchPut，不改 Python 或 MetaManager。
 
@@ -12,9 +12,62 @@ CSV 标注 `aicpu_memcpy_sgl_reordered` /
 `active_threads` 不是实际占用的核数；实际核采样需启用下面的诊断开关。
 线程创建失败报告 `pthread_error`，不会静默回退。设备 pthread 支持及带宽需在目标机器验证。
 
+### 可切换的直接输出（V10）
+
+CPU 端新增 `--transfer-mode scatter|direct_output`，默认 `scatter`，沿用 V8 的复制和
+缓存准备路径。选择 `direct_output` 时，URMA WRITE 的落点就是最终 output；
+AICPU 只发布请求、等待完成、执行完成屏障，不启动 scatter 线程池或多 block 团队。
+这仍是独立带宽测试，不接入生产 Runtime，也不接收调用方 Tensor。
+
+两种模式使用相同的 CPU 源行 stride（656 B 时为 768 B），相同的反序逻辑映射和
+按 output slot 排列的 SGL，以及相同的 CPU `WriteBatch`、全部 Jetty CQ 等待、done 发布
+和退出握手。直接模式将测试 target 的已注册 HBM payload 用作最终 output，复用同一
+RA context、导出 UB segment 和远端 WRITE 通道；不另分配 staging 或复制到其他输出。
+远端传输继续使用 `--peer NPU_HOST:29991`；远端 CPU/NPU 的 URMA 数据连接需可达。
+
+默认直接输出 stride 为 `row_bytes`，656 B 行紧密排列，便于合并相邻目标。
+可加 `--direct-output-stride 768` 保留行间空洞；只 WRITE 有效字节，空洞保持 `0xA5`，
+该配置下每行成为一个数据 WR。此开关用于观察目标空洞的代价，不等同于实现动态 mask。
+scatter 模式不接受非零 `--direct-output-stride`。源布局、有效字节数及源顺序均不随该开关改变。
+
+直接 output 前后各有 64 B 边界 guard；最终 readback 验证所有 payload 字节、行间空洞及
+边界 guard。首轮/预热/正式轮都保留计时外的 `PrepareRound`，发布 request 后直到完成前
+不访问或写脏 payload；逐轮行头校验仍在计时外。CPU 仅在数据 `WriteBatch` 全部完成后
+写入 done。该测试的完成屏障不能代替 provider 的远端可见性保证，实际机器仍需验证。
+测试通过也不代表已验证后续 AIV 算子的消费可见性或生产 Tensor 的注册生命周期。
+
+V10 扩展 Config 和测试 Configure 帧，更新 magic、命令及 kernel 入口，避免加载旧版本。
+重新构建两端并安装 V10 kernel；安装后重启 NPU 测试进程。V9 tile 融合未包含在此版本中。
+
+```bash
+bash build.sh aicpu-cpu
+bash build.sh aicpu-npu
+bash tests/run_aicpu_get_npu.sh --install-kernel --device-id 7 \
+  --aicpu-blocks 4 --profile-scatter
+```
+
+另一个终端运行直接输出：
+
+```bash
+bash tests/run_aicpu_get_cpu.sh --peer 127.0.0.1:29991 --device-id 7 \
+  --transfer-mode direct_output --rows 4096 --row-bytes 656 --scatter-threads 4 \
+  --remote-sgl-size 16 --jettys 4 --prepare-threads 4 \
+  --warmup 5 --iterations 1000 --output aicpu-direct.csv
+```
+
+重启 NPU 脚本（无需再次安装），用相同参数把 `--transfer-mode` 改为 `scatter` 做对照；
+再重启可测试 `direct_output --direct-output-stride 768`。直接模式自动将实际 blockDim
+设为 1，日志保留 `requested_block_dim`；`--scatter-threads 4` 仍记录为请求值，
+`active_threads=1` 表示唯一协调核。`--profile-scatter` 明确输出 SKIPPED，不生成虚假的 profile。
+
+CSV 列不变，直接模式 engine 为 `aicpu_urma_direct_output`，`scatter_ns=0`，
+`wait_ns=mean_ns`，完成屏障和控制开销都计入 wait。缓存准备及校验仍不计入这些数字。
+对比 `mean_ns`、`cpu_prepare_ns`、`cpu_post_ns`、`cpu_poll_ns` 和 `mean_wrs`；
+紧密目标的 WR 数受 SGE/消息长度限制，是否与原 staging 相近以实测为准。
+
 ### 4096 × 656 B、多线程测试
 
-更新后需重新构建两端、安装 V8 kernel，并重启测试进程：
+更新后需重新构建两端、安装 V10 kernel，并重启测试进程：
 
 ```bash
 bash build.sh aicpu-cpu
@@ -41,7 +94,7 @@ V7 在 B 版基础上实现 C 版优化：656 B 行通过十组完全展开的 6
 其他行长保留通用 `memcpy`，输入 invalidate、B 版输出 clean、调度和每轮校验保持原样。
 pthread 和 multi-block 共用此路径；未加入 tile 融合或预取。
 启动日志显示 `scatter_clean=payload_cache_lines`，656 B 时显示 `scatter_copy=neon_656`，
-其他行长显示 `scatter_copy=libc`；`KERNEL_STATUS` 应显示 `revision=8`。
+其他行长显示 `scatter_copy=libc`；`KERNEL_STATUS` 应显示 `revision=10`。
 单线程基线也应使用本版本重新测量，CSV 列和 engine 名称保持不变。
 线程调度、完成等待、staging invalidate 和输出 clean 计入 scatter；
 创建/销毁线程、数据校验和下面的输出缓存准备不计入。
@@ -65,9 +118,9 @@ V8 在每轮计时开始及发布 request 之前，对整个 output 执行 `dc c
 
 ### 实际运行核与 scatter 三段计时
 
-在 **NPU 端**增加 `--profile-scatter`，默认关闭。升级需重新编译并安装 V8 kernel，
-独立的 V8 入口可避免旧 device `.so` 静默使用旧测试口径。
-CPU 控制协议和原有 CSV 列保持不变。先启动 NPU 端：
+在 **NPU 端**增加 `--profile-scatter`，默认关闭。升级需重新编译并安装 V10 kernel，
+独立的 V10 入口可避免旧 device `.so` 静默使用旧测试口径。
+两端需一起升级测试控制协议；原有 CSV 列保持不变。先启动 NPU 端：
 
 ```bash
 bash build.sh aicpu-npu
@@ -192,6 +245,8 @@ AArch64 主机运行真实 NEON；其他架构以同一展开复制逻辑模拟 
 不能代替目标 AICPU 的指令执行验证。protocol 测试也使用实际的分片复制函数。
 protocol 测试另外检查首轮/预热/正式轮均先准备缓存再发布 request、先校验再准备
 下一轮，并通过增加准备/校验模拟耗时，验证它们不进入计时样本和轮内等待超时。
+直接模式测试检查不调用 scatter、只报告一个协调核、完成屏障计入 wait、无 scatter 计时，
+并覆盖超时/未来序号/陈旧数据、紧密和带空洞目标及实际 WRITE planner 的合并和越界检查。
 
 ## 执行流程
 
@@ -203,13 +258,14 @@ protocol 测试另外检查首轮/预热/正式轮均先准备缓存再发布 re
 3. NPU 启动一次 AICPU 算子，在算子内部跑 warmup + iterations 轮。
 4. 每轮 AICPU 先在计时区间外清空 output 缓存驻留，再开始计时并发布
    `request_seq`，CPU 用 `ReadSglBatch` 轮询它。
-5. CPU 更新每行 8 字节序号，调用 `WriteBatch`，等待返回，再用
+5. CPU 更新每行 8 字节序号，调用 `WriteBatch` 写入 staging 或直接 output，等待返回，再用
    `WriteSglBatch` 写 `done_seq`。
-6. AICPU 等待序号，invalidate staging，memcpy scatter，clean 输出。
-   检查各行本轮序号后才请求下一轮，不存在两轮同时使用 staging。
+6. AICPU 等待序号。scatter 模式 invalidate staging、memcpy scatter、clean 输出；
+   direct_output 模式仅执行完成屏障。检查各行本轮序号后才请求下一轮，不存在两轮覆盖 payload。
 7. CPU 停止/销毁 transport 并确认 drained；NPU 检查输出后才释放 target。
 
-CPU source 和输出的行步长为 round_up(row_bytes, 64) + 64，NPU staging 保持连续。
+CPU source 的行步长始终为 round_up(row_bytes, 64) + 64。scatter 输出采用相同步长，
+NPU staging 保持连续；direct_output 默认紧密排列，可指定目标 stride。
 逻辑输出仍按反向行序排列，但 CPU 已将 SGL 重排为 output 物理 slot 顺序，因此
 AICPU 的 staging 与 output 访问均为正向。行长至少 8 B（序号头），支持 656 B；
 此时行步长为 768 B。
@@ -344,9 +400,10 @@ NPU 端未指定 `--device-id` 时按 CPU 请求选择；指定时会拒绝不�
 成功且最终数据验证通过才输出一行 CSV：
 
 - `e2e_GBps`：有效 payload 字节数 / 平均端到端 ns，十进制 GB/s。
-- `mean_ns/p50_ns/p99_ns`：AICPU 发布请求前到 scatter 完成并 clean 输出。
+- `mean_ns/p50_ns/p99_ns`：AICPU 发布请求前到模式对应的传输完成边界。
 - `wait_ns`：请求发布、CPU 控制轮询、行序号更新、WRITE 和 done 通知。
-- `scatter_ns`：staging invalidate、AICPU memcpy 和输出 cache clean。
+- `scatter_ns`：scatter 模式的 staging invalidate、AICPU memcpy 和输出 cache clean；
+  direct_output 为 0，完成屏障和控制开销计入 wait，`wait_ns=mean_ns`。
 - `cpu_write_ns/cpu_prepare_ns/cpu_post_ns/cpu_poll_ns`：现有 WriteBatch 统计。
 - `mean_wrs`：仅数据 WriteBatch 的平均 WR 数；`control_reads` 包含预热的控制轮询次数。
 
@@ -372,14 +429,14 @@ NPU 端未指定 `--device-id` 时按 CPU 请求选择；指定时会拒绝不�
 
 ### AICPU local-copy / SDMA capability probe
 
-当前测试的远端路径固定为 CPU URMA SGL gather WRITE 到本地 HBM staging。SDMA 若可用，
+scatter 模式的远端路径为 CPU URMA SGL gather WRITE 到本地 HBM staging。SDMA 若可用，
 只能替换 staging 到 output 的**本地 HBM→HBM** scatter，不能替代 CPU DDR 经 RoCE 的
 URMA WRITE。
 
 CANN 9.1.0 已发现 PTO `TPUT_ASYNC`/`TGET_ASYNC` 的 SDMA 头文件，但它不能直接作为
 AICPU backend：接口使用 `__gm__` 指针和 AI Core SDMA 指令；现有 kernel 是由
 `aarch64-target-linux-gnu-g++` 构建的 AICPU Linux ELF。并且 PTO async SDMA 路径拒绝
-多维或非连续 tensor，而当前 `656 B` staging 连续、output 行距 `768 B`，其 scatter
+多维或非连续 tensor，而 scatter 模式的 `656 B` staging 连续、output 行距 `768 B`，其 scatter
 不是单个连续 DMA。拆为 4096 个 SDMA 提交通常会比当前四核 `memcpy` 更差。
 
 下面脚本除扫描安装目录外，还用**同一个 AICPU 交叉编译器**验证 PTO 头能否被 AICPU

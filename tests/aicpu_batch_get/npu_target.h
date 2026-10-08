@@ -19,6 +19,8 @@ inline void Acl(aclError status, const char* operation) {
 }
 
 // A test-owned target, using KVAF's RA ABI/session and TargetChannel helpers.
+// Its registered payload is staging in scatter mode and the final output in
+// direct mode; both use the same exported UB segment and CPU WRITE channels.
 // No production NpuService or Runtime state is modified.
 class NpuTarget {
  public:
@@ -73,6 +75,17 @@ class NpuTarget {
     channels_.push_back(std::move(allocation_channel));
   }
   void* memory() const { return memory_; }
+  void* payload() const { return static_cast<std::uint8_t*>(memory_) + kStagingOffset; }
+  void PrepareDirectOutput(const Layout& layout) {
+    Require(memory_ && exported_.hbm_bytes == layout.region_bytes &&
+            layout.region_bytes == kStagingOffset + layout.output_bytes + kGuardBytes,
+            "invalid registered direct output range");
+    // Outer guards catch an incorrect WR start/length even with packed rows.
+    // Initialize before exporting to the CPU; never dirty output after DMA.
+    const auto bytes = layout.output_bytes + 2 * kGuardBytes;
+    auto* begin = static_cast<std::uint8_t*>(payload()) - kGuardBytes;
+    Acl(aclrtMemset(begin, bytes, 0xA5, bytes), "initialize registered direct output and guards");
+  }
   const peer::AllocateHbmRegionResponse& exported() const { return exported_; }
   void CreateChannel(int fd, const peer::MessageHeader& header) {
     Require(peer::IsValidHeader(header, peer::Command::kCreateChannel,

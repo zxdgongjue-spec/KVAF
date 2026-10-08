@@ -25,6 +25,14 @@ Options Parse(int argc, char** argv) {
     const char* value = argv[++i];
     if (flag == "--peer") { o.transport.peer_address = value; continue; }
     if (flag == "--ub-device") { o.transport.ub_device = value; continue; }
+    if (flag == "--transfer-mode") {
+      const std::string mode = value;
+      Require(mode == "scatter" || mode == "direct_output",
+              "--transfer-mode must be scatter or direct_output");
+      o.config.transfer_mode = mode == "direct_output"
+          ? TransferMode::kDirectOutput : TransferMode::kScatter;
+      continue;
+    }
     const auto n = Number(value);
     if (flag == "--rows") o.config.rows = n;
     else if (flag == "--scatter-threads") o.config.scatter_threads = n;
@@ -32,6 +40,7 @@ Options Parse(int argc, char** argv) {
     else if (flag == "--warmup") o.config.warmup = n;
     else if (flag == "--iterations") o.config.iterations = n;
     else if (flag == "--timeout-ms") o.config.timeout_ms = n;
+    else if (flag == "--direct-output-stride") o.config.direct_output_stride = n;
     else {
       Require(n <= UINT32_MAX, "option exceeds uint32");
       if (flag == "--eid-index") { o.transport.has_eid_index = true; o.transport.eid_index = n; }
@@ -87,7 +96,7 @@ void Run(Options options) {
   // One page-aligned registered allocation contains source rows and both
   // host-side control buffers. It outlives transport destruction on all paths.
   void* memory = nullptr;
-  const auto bytes = (layout.output_bytes + 4096 + 4095) & ~std::uint64_t{4095};
+  const auto bytes = (options.config.rows * layout.source_stride + 4096 + 4095) & ~std::uint64_t{4095};
   Require(posix_memalign(&memory, 4096, bytes) == 0, "source allocation failed");
   std::unique_ptr<void, decltype(&std::free)> allocation(memory, std::free);
   std::memset(memory, 0, bytes);
@@ -97,19 +106,23 @@ void Run(Options options) {
   std::vector<CpuUrmaTransport::HostSge> sources(options.config.rows);
   std::vector<std::uint64_t> offsets(options.config.rows);
   for (std::uint64_t row = 0; row < options.config.rows; ++row) {
-    auto* data = input + row * layout.stride;
+    auto* data = input + row * layout.source_stride;
     for (std::uint64_t b = 8; b < options.config.row_bytes; ++b) data[b] = Pattern(row, b);
   }
-  // Keep remote staging consecutive, but order its SGL entries by physical
-  // output slot. AICPU can then copy staging slot q directly to output slot q
-  // with both source and destination addresses increasing.
+  // Order local sources by physical output slot in both modes. Scatter writes
+  // packed staging; direct output uses the final output's remote stride.
   for (std::uint64_t slot = 0; slot < options.config.rows; ++slot) {
     const auto row = LogicalRowForOutputSlot(options.config, slot);
-    sources[slot] = {input + row * layout.stride,
+    sources[slot] = {input + row * layout.source_stride,
                      static_cast<std::size_t>(options.config.row_bytes)};
-    offsets[slot] = kStagingOffset + slot * options.config.row_bytes;
+    offsets[slot] = kStagingOffset + slot *
+        (IsDirectOutput(options.config) ? layout.stride : options.config.row_bytes);
   }
-  std::fprintf(stderr, "AICPU_GET_CPU SGL_LAYOUT=source_by_output_slot staging=contiguous scatter=forward\n");
+  std::fprintf(stderr,
+               "AICPU_GET_CPU SGL_LAYOUT=source_by_output_slot transfer_mode=%s "
+               "write_target=%s source_stride=%llu output_stride=%llu\n",
+               TransferModeName(options.config), IsDirectOutput(options.config) ? "output" : "staging",
+               (unsigned long long)layout.source_stride, (unsigned long long)layout.stride);
   options.transport.region_bytes = layout.region_bytes;
   std::unique_ptr<CpuUrmaTransport> selected_transport;
   kvaf::peer::PeerLink peer(options.transport.peer_address);
@@ -178,7 +191,7 @@ void Run(Options options) {
       } while (request->sequence != seq);
       for (std::uint64_t row = 0; row < options.config.rows; ++row) {
         const auto tag = RowTag(seq, row);
-        std::memcpy(input + row * layout.stride, &tag, sizeof(tag));
+        std::memcpy(input + row * layout.source_stride, &tag, sizeof(tag));
       }
       Check(transport.WriteBatch(offsets.data(), sources.data(), sources.size()));
       const auto timing = transport.last_batch_timing();
@@ -204,8 +217,9 @@ void Run(Options options) {
   std::printf("engine,rows,row_bytes,iterations,scatter_threads,active_threads,e2e_GBps,mean_ns,p50_ns,p99_ns,wait_ns,scatter_ns,"
               "cpu_write_ns,cpu_prepare_ns,cpu_post_ns,cpu_poll_ns,mean_wrs,control_reads\n");
   std::printf("%s,%llu,%llu,%llu,%llu,%llu,%.6f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%llu\n",
-              report.active_threads > 1 ? "aicpu_memcpy_sgl_reordered_mt" :
-                                          "aicpu_memcpy_sgl_reordered",
+              IsDirectOutput(options.config) ? "aicpu_urma_direct_output" :
+              (report.active_threads > 1 ? "aicpu_memcpy_sgl_reordered_mt" :
+                                           "aicpu_memcpy_sgl_reordered"),
               (unsigned long long)options.config.rows, (unsigned long long)options.config.row_bytes,
               (unsigned long long)options.config.iterations,
               (unsigned long long)options.config.scatter_threads,
