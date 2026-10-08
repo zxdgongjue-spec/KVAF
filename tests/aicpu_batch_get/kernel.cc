@@ -126,6 +126,13 @@ struct DeviceIO {
     asm volatile("isb; mrs %0, cntvct_el0" : "=r"(value) :: "memory");
     return value;
   }
+  void PrepareRound(const Config&, const Layout& l) {
+    // VerifyTags invalidates output then refills row headers on worker 0.
+    // Evict those lines, as well as any previous scatter/initialization lines,
+    // before the next request. Invalidate includes a completion DSB; workers
+    // must not access output again until their timed scatter begins.
+    Invalidate(output, l.output_bytes);
+  }
   void PublishRequest(std::uint64_t sequence) {
     auto* control = reinterpret_cast<volatile Control*>(region + kRequestOffset);
     control->sequence = sequence;
@@ -277,6 +284,9 @@ Result RunMultiBlock(DeviceIO& io, Sample* samples, KernelResult* result,
   for (std::uint64_t sequence = 1; sequence <= io.layout.rounds; ++sequence) {
     if (worker == 0) {
       result->failed_sequence = sequence;
+      // Other blocks wait for request_sequence and do not touch output here.
+      // Match the single-block cache preparation and timing boundary.
+      io.PrepareRound(io.config, io.layout);
       const auto start = io.Now();
       io.PublishRequest(sequence);
       for (;;) {
@@ -379,7 +389,7 @@ std::uint32_t KvafAicpuCoreProbeV1(CoreProbeArgs* args) {
 }
 
 extern "C" __attribute__((visibility("default")))
-std::uint32_t KvafAicpuBatchGetV7(KernelArgs* args) {
+std::uint32_t KvafAicpuBatchGetV8(KernelArgs* args) {
   if (!args || !args->region || !args->output || !args->samples || !args->result) return 1;
   auto* result = reinterpret_cast<KernelResult*>(args->result);
   auto* samples = reinterpret_cast<Sample*>(args->samples);

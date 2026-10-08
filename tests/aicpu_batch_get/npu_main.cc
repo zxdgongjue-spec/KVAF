@@ -148,7 +148,8 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
   std::fprintf(stderr,
                "AICPU_GET_NPU LAUNCH mode=%s block_dim=%u active_scatter_ranges=%u "
                "sgl_layout=source_by_output_slot scatter_layout=forward "
-               "scatter_clean=payload_cache_lines scatter_copy=%s\n",
+               "scatter_clean=payload_cache_lines scatter_copy=%s "
+               "output_cache=cold_before_request cache_prepare=outside_timing\n",
                aicpu_blocks == 1 ? "pthread" : "multi-block", aicpu_blocks, active_threads,
                ScatterCopyBackendName(config.row_bytes));
   kernel.Launch(args, aicpu_blocks);

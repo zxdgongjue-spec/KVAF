@@ -19,6 +19,9 @@ Result RunDevice(const Config& config, IO& io, Sample* samples, KernelResult* re
   const std::uint64_t timeout_ticks = result->counter_frequency * config.timeout_ms / 1000;
   for (std::uint64_t seq = 1; seq <= layout.rounds; ++seq) {
     result->failed_sequence = seq;
+    // Reset output cache residency left by allocation/previous verification.
+    // Complete before timing or notifying the producer, including warmup.
+    io.PrepareRound(config, layout);
     const auto start = io.Now();
     io.PublishRequest(seq);
     for (;;) {
@@ -32,6 +35,7 @@ Result RunDevice(const Config& config, IO& io, Sample* samples, KernelResult* re
     const auto end = io.Now();
     // Verification is outside the reported per-round timing, but before the
     // next request; the producer cannot overwrite staging during checking.
+    // PrepareRound removes its cache effects before the next sample starts.
     if (!io.VerifyTags(seq, config, layout)) return result->status = Result::kDataMismatch;
     if (seq > config.warmup)
       samples[seq - config.warmup - 1] = {end - start, ready - start, end - ready};

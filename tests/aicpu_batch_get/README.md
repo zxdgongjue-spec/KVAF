@@ -14,7 +14,7 @@ CSV 标注 `aicpu_memcpy_sgl_reordered` /
 
 ### 4096 × 656 B、多线程测试
 
-更新后需重新构建两端、安装 V7 kernel，并重启测试进程：
+更新后需重新构建两端、安装 V8 kernel，并重启测试进程：
 
 ```bash
 bash build.sh aicpu-cpu
@@ -41,14 +41,32 @@ V7 在 B 版基础上实现 C 版优化：656 B 行通过十组完全展开的 6
 其他行长保留通用 `memcpy`，输入 invalidate、B 版输出 clean、调度和每轮校验保持原样。
 pthread 和 multi-block 共用此路径；未加入 tile 融合或预取。
 启动日志显示 `scatter_clean=payload_cache_lines`，656 B 时显示 `scatter_copy=neon_656`，
-其他行长显示 `scatter_copy=libc`；`KERNEL_STATUS` 应显示 `revision=7`。
+其他行长显示 `scatter_copy=libc`；`KERNEL_STATUS` 应显示 `revision=8`。
 单线程基线也应使用本版本重新测量，CSV 列和 engine 名称保持不变。
-线程调度、完成等待及缓存操作计入 scatter；创建/销毁线程、数据校验不计入。
+线程调度、完成等待、staging invalidate 和输出 clean 计入 scatter；
+创建/销毁线程、数据校验和下面的输出缓存准备不计入。
+
+### 每轮输出缓存起点（V8）
+
+旧版 scatter 结束后，block 0 会 invalidate 整个 output 并读取所有行头校验序号。
+这虽然在计时区间外，却会将行头重新加载到校验核的缓存，改变下一轮写入的缓存状态。
+V8 在每轮计时开始及发布 request 之前，对整个 output 执行 `dc civac` 和末尾的
+`dsb sy`，消除初始化、上一轮 scatter 和校验留下的输出缓存驻留。
+首轮、预热轮和正式轮都执行；准备后直到 scatter 前不再访问 output。
+单 block 的调用线程和 multi-block 的 block 0 都使用同一个 `PrepareRound`。
+其他 worker 等待派发，不在准备过程中访问 output；输入 staging 的 invalidate 仍在
+计时区间内，逐轮 tag 校验和最终逐字节 payload/guard 校验继续保留。
+
+启动日志增加 `output_cache=cold_before_request cache_prepare=outside_timing`。
+这定义了固定的输出冷缓存测试口径；缓存准备和校验的时间均不计入 `mean_ns`、
+`wait_ns`、`scatter_ns` 或 profile 的三段时间，因此不是包含准备/校验的整轮吞吐。
+重新测量相同 V8 口径下的单核/多核数据；V7 及更早数据的输出缓存状态不同，
+不宜将两者的 scatter 差异直接归因于复制优化。
 
 ### 实际运行核与 scatter 三段计时
 
-在 **NPU 端**增加 `--profile-scatter`，默认关闭。升级需重新编译并安装 V7 kernel，
-独立的 V7 入口可避免旧 device `.so` 静默使用旧复制实现。
+在 **NPU 端**增加 `--profile-scatter`，默认关闭。升级需重新编译并安装 V8 kernel，
+独立的 V8 入口可避免旧 device `.so` 静默使用旧测试口径。
 CPU 控制协议和原有 CSV 列保持不变。先启动 NPU 端：
 
 ```bash
@@ -140,6 +158,7 @@ bash tests/run_aicpu_get_cpu.sh --peer 127.0.0.1:29991 --device-id 7 \
 
 multi-block 下 block 0 仍独占 request/done、tag 校验和每轮计时；其余 block 只执行
 自己的 invalidate、memcpy、clean。所有 block clean 完输出后 block 0 才发布下一轮，
+并在发布前完成计时区间外的输出缓存准备，
 因此 staging 和输出正确性检查与单 block 模式相同。启动栅栏只有 1 秒：若 Runtime
 没有同时调度请求的 block，测试会返回 timeout，而不会在 CPU 通道上等待完整的每轮超时。
 `--aicpu-blocks 1` 保持原有 pthread 模式，适合做基线对比。
@@ -171,6 +190,8 @@ ctest --test-dir build-aicpu-cpu -R '^kvaf_aicpu_(get_protocol|scatter_profile|c
 其他行长回退和空分片；Linux/macOS 上另用保护页检测最后一行越界读写。
 AArch64 主机运行真实 NEON；其他架构以同一展开复制逻辑模拟 16 B load/store，
 不能代替目标 AICPU 的指令执行验证。protocol 测试也使用实际的分片复制函数。
+protocol 测试另外检查首轮/预热/正式轮均先准备缓存再发布 request、先校验再准备
+下一轮，并通过增加准备/校验模拟耗时，验证它们不进入计时样本和轮内等待超时。
 
 ## 执行流程
 
@@ -180,7 +201,8 @@ AArch64 主机运行真实 NEON；其他架构以同一展开复制逻辑模拟 
    分配/注册 HBM，向 CPU 导出 region 并处理 CreateChannel。
 2. CPU 主线程初始化已有 `CpuUrmaTransport`，预注册离散源和控制缓冲区。
 3. NPU 启动一次 AICPU 算子，在算子内部跑 warmup + iterations 轮。
-4. 每轮 AICPU 发布 `request_seq`，CPU 用 `ReadSglBatch` 轮询它。
+4. 每轮 AICPU 先在计时区间外清空 output 缓存驻留，再开始计时并发布
+   `request_seq`，CPU 用 `ReadSglBatch` 轮询它。
 5. CPU 更新每行 8 字节序号，调用 `WriteBatch`，等待返回，再用
    `WriteSglBatch` 写 `done_seq`。
 6. AICPU 等待序号，invalidate staging，memcpy scatter，clean 输出。
@@ -328,7 +350,7 @@ NPU 端未指定 `--device-id` 时按 CPU 请求选择；指定时会拒绝不�
 - `cpu_write_ns/cpu_prepare_ns/cpu_post_ns/cpu_poll_ns`：现有 WriteBatch 统计。
 - `mean_wrs`：仅数据 WriteBatch 的平均 WR 数；`control_reads` 包含预热的控制轮询次数。
 
-初始化、注册、launch、warmup、每轮 tag 校验和最终逐字节 readback 不在报告的
+初始化、注册、launch、warmup、每轮输出缓存准备、tag 校验和最终逐字节 readback 不在报告的
 端到端样本内。每轮 O(rows) 的 CPU tag 更新在端到端内，不在 cpu_write_ns 内。
 因此该结果是完整串行握手模式的有效带宽，不是只测 post 的带宽，也不是
 多批次重叠时的稳态吞吐。纯 CPU gather WRITE 基线继续使用
