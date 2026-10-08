@@ -275,24 +275,14 @@ struct UrmaCandidate {
   uint32_t id = 0U;
   std::string device_name;
   uint32_t eid_index = 0U;
+  // Diagnostic only: public EID entries do not identify a physical port.
+  // Avoid querying full device attributes during discovery; their ABI may
+  // differ between the bootstrap headers and the platform liburma.
   uint32_t physical_port = kUnknownPhysicalPort;
   std::array<uint8_t, kEidBytes> eid{};
   bool unavailable = false;
   std::unique_ptr<UrmaResources> resources;
 };
-
-uint32_t ResolvePhysicalPort(urma_device_t* device) {
-  if (device == nullptr) return kUnknownPhysicalPort;
-  urma_device_attr_t attributes{};
-  if (urma_query_device(device, &attributes) != URMA_SUCCESS) {
-    Log("[KVAF_CPU] CANDIDATE_PORT_QUERY_FAILED ub_device=%s errno=%d\n",
-        device->name, errno);
-    return kUnknownPhysicalPort;
-  }
-  // The public URMA EID record has no port id. A single-port device is the
-  // only case where the mapping is unambiguous without provider-private APIs.
-  return attributes.port_cnt == 1U ? 0U : kUnknownPhysicalPort;
-}
 
 const char* PhysicalPortText(uint32_t physical_port, char* buffer,
                              size_t buffer_bytes) {
@@ -332,7 +322,6 @@ class UrmaResourcePool {
         Log("[KVAF_CPU] CANDIDATE_ENUM_FAILED ub_device=%s errno=%d\n", device->name, errno);
         continue;
       }
-      const uint32_t physical_port = ResolvePhysicalPort(device);
       for (uint32_t eid_position = 0U; eid_position < eid_count; ++eid_position) {
         const urma_eid_info_t& info = eids[eid_position];
         if ((eid_index_requested && info.eid_index != requested_eid_index) ||
@@ -343,7 +332,6 @@ class UrmaResourcePool {
         UrmaCandidate candidate{};
         candidate.device_name = device->name;
         candidate.eid_index = info.eid_index;
-        candidate.physical_port = physical_port;
         std::memcpy(candidate.eid.data(), info.eid.raw, candidate.eid.size());
         candidates_.push_back(std::move(candidate));
       }
