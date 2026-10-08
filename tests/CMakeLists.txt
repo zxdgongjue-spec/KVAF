@@ -20,6 +20,10 @@ target_include_directories(kvaf_aicpu_gather_read_layout_test PRIVATE
   "${CMAKE_SOURCE_DIR}/access_operator/include")
 add_test(NAME kvaf_aicpu_gather_read_layout COMMAND kvaf_aicpu_gather_read_layout_test)
 
+add_executable(kvaf_gather_host_plan_test gather_host_plan_test.cc)
+target_link_libraries(kvaf_gather_host_plan_test PRIVATE kvaf_gather_host_plan)
+add_test(NAME kvaf_gather_host_plan COMMAND kvaf_gather_host_plan_test)
+
 add_executable(kvaf_aicpu_gather_read_report_test aicpu_gather_read_report_test.cc)
 target_include_directories(kvaf_aicpu_gather_read_report_test PRIVATE
   "${CMAKE_SOURCE_DIR}/access_operator/include")

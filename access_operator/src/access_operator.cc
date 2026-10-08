@@ -316,7 +316,7 @@ struct DefaultAccessOperator::Impl {
 #if defined(KVAF_ENABLE_AICPU_URMA)
   void* gather_output_spans{nullptr};
   std::size_t gather_output_spans_capacity{0U};
-  std::vector<std::uint8_t> gather_source_metadata;
+  std::vector<std::uint8_t> gather_metadata;
 #endif
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   KvafBatchPutTransport* batch_put_transport{nullptr};
@@ -604,6 +604,7 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
   const std::uint64_t source_offset =
       scratch_offset + aicpu_urma::kGatherScratchBytes;
   if (direct && (request.source_spans == nullptr || request.source_span_count == 0U ||
+                 request.source_span_count > aicpu_urma::kGatherMaxSpans ||
                  request.sequence == 0U ||
                  source_offset > request.output.bytes ||
                  source_bytes > request.output.bytes - source_offset))
@@ -613,7 +614,15 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
       static_cast<std::size_t>(request.output_span_count) * sizeof(GatherOutputSpan);
   const auto storage_bytes = aicpu_urma::GatherOutputStorageBytes(
       request.output_span_count, request.read_task_spans);
-  if (storage_bytes > impl_->gather_output_spans_capacity) {
+  const auto packed_output_bytes = aicpu_urma::GatherReadPackedOutputBytes(
+      request.output_extent, source_bytes, request.output_span_count, request.read_task_spans);
+  const bool packed = direct && packed_output_bytes != 0U &&
+      packed_output_bytes <= request.output.bytes &&
+      reinterpret_cast<std::uintptr_t>(request.output.data) %
+          alignof(aicpu_urma::GatherTaskState) == 0U;
+  const auto target_offset = aicpu_urma::GatherPackedTargetOffset(source_bytes);
+  auto* source_destination = static_cast<std::uint8_t*>(request.output.data) + source_offset;
+  if (!packed && storage_bytes > impl_->gather_output_spans_capacity) {
     void* descriptors = nullptr;
     if (aclrtMalloc(&descriptors, storage_bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS)
       return Internal("failed to allocate GatherRead HBM SGL descriptors");
@@ -621,28 +630,35 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
     impl_->gather_output_spans = descriptors;
     impl_->gather_output_spans_capacity = storage_bytes;
   }
-  if (aclrtMemcpy(impl_->gather_output_spans, impl_->gather_output_spans_capacity,
+  if (!packed && aclrtMemcpy(impl_->gather_output_spans, impl_->gather_output_spans_capacity,
                   request.output_spans, descriptor_bytes,
                   ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS)
     return Internal("failed to upload GatherRead HBM SGL descriptors");
-  if (request.timing != nullptr)
+  if (!packed && request.timing != nullptr)
     request.timing->descriptor_upload_ns = elapsed_ns(descriptor_start);
+  void* const target_destination =
+      packed ? source_destination + target_offset : impl_->gather_output_spans;
   if (direct) {
     const auto source_start = std::chrono::steady_clock::now();
-    impl_->gather_source_metadata.resize(source_bytes);
+    const auto upload_bytes = packed ? target_offset + descriptor_bytes : source_bytes;
+    impl_->gather_metadata.resize(upload_bytes);
     const peer::GatherDescriptorHeader header{
         peer::kGatherDescriptorMagic, request.sequence, request.remote_staging,
         request.source_span_count, request.bytes};
-    std::memcpy(impl_->gather_source_metadata.data(), &header, sizeof(header));
-    std::memcpy(impl_->gather_source_metadata.data() + sizeof(header),
+    std::memcpy(impl_->gather_metadata.data(), &header, sizeof(header));
+    std::memcpy(impl_->gather_metadata.data() + sizeof(header),
                 request.source_spans,
                 request.source_span_count * sizeof(peer::GatherSpan));
-    auto* destination = static_cast<std::uint8_t*>(request.output.data) + source_offset;
-    if (aclrtMemcpy(destination, source_bytes, impl_->gather_source_metadata.data(),
-                    source_bytes, ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS)
+    if (packed)
+      std::memcpy(impl_->gather_metadata.data() + target_offset,
+                  request.output_spans, descriptor_bytes);
+    if (aclrtMemcpy(source_destination, upload_bytes, impl_->gather_metadata.data(),
+                    upload_bytes, ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS)
       return Internal("failed to upload GatherRead source descriptors");
-    if (request.timing != nullptr)
-      request.timing->source_upload_ns = elapsed_ns(source_start);
+    if (request.timing != nullptr) {
+      if (packed) request.timing->metadata_upload_ns = elapsed_ns(descriptor_start);
+      else request.timing->source_upload_ns = elapsed_ns(source_start);
+    }
   }
   KvafBatchGetLocalBuffer* local_buffer = nullptr;
   std::uint64_t channel_entity = 0U;
@@ -658,7 +674,7 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
   arguments.queue_state = reinterpret_cast<std::uint64_t>(impl_->execution.queue_state);
   arguments.core_status = reinterpret_cast<std::uint64_t>(impl_->execution.status);
   arguments.output = reinterpret_cast<std::uint64_t>(request.output.data);
-  arguments.output_spans = reinterpret_cast<std::uint64_t>(impl_->gather_output_spans);
+  arguments.output_spans = reinterpret_cast<std::uint64_t>(target_destination);
   arguments.source_descriptor = direct
       ? reinterpret_cast<std::uint64_t>(request.output.data) + source_offset : 0U;
   arguments.remote_descriptor = request.remote_descriptor;

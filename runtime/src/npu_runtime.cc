@@ -26,7 +26,7 @@
 
 #include "batch_get_abi.h"
 #include "access_operator.h"
-#include "gather_output_layout.h"
+#include "gather_host_plan.h"
 #include "peer_link.h"
 #include "meta_manager.h"
 #include "npu_eid_discovery.h"
@@ -218,6 +218,7 @@ struct NpuRuntime::Impl {
   bool hbm_mode{false};
   void* probe_buffer{nullptr};
   std::mutex gather_mutex;
+  GatherHostPlan gather_host_plan;
   std::uint64_t gather_sequence{0U};
   bool direct_gather_enabled{false};
 };
@@ -409,24 +410,19 @@ Status NpuRuntime::GatherRead(const CpuGatherReadRequest& request) {
       request.stream == nullptr)
     return Status::InvalidArgument("GatherRead requires a caller-owned HBM output and ACL stream");
   const auto& region = impl_->runtime_core->remote_region();
-  std::uint32_t total_bytes = 0U;
-  if (request.spans.size() > peer::kMaxGatherSpans ||
-      !peer::ValidateGather(region.base, region.length, request.staging_address,
-                            request.spans, &total_bytes))
-    return Status::InvalidArgument("invalid GatherRead source or staging layout");
-  std::vector<GatherOutputSpan> contiguous_output;
-  if (request.output_spans.empty())
-    contiguous_output.push_back({0U, total_bytes, 0U});
-  const auto& output_spans = request.output_spans.empty()
-                                 ? contiguous_output : request.output_spans;
-  std::uint64_t output_extent = 0U;
   if ((request.sq_batch_wqes != 8U && request.sq_batch_wqes != 16U &&
        request.sq_batch_wqes != 32U && request.sq_batch_wqes != 64U) ||
       request.read_task_spans > peer::kMaxGatherSpans ||
-      request.sgl_size == 0U || output_spans.size() > peer::kMaxGatherSpans ||
-      !ValidateGatherOutput(request.output.bytes, output_spans, total_bytes,
-                            &output_extent))
-    return Status::InvalidArgument("invalid GatherRead HBM scatter layout, SGL size, or SQ batch size");
+      request.sgl_size == 0U)
+    return Status::InvalidArgument("invalid GatherRead SGL size, task size, or SQ batch size");
+  if (!PrepareGatherHostLayout(region.base, region.length, request.staging_address,
+                                request.source_descriptor_address, request.spans,
+                                request.output.bytes, request.output_spans,
+                                &impl_->gather_host_plan))
+    return Status::InvalidArgument("invalid GatherRead source, staging, mailbox, or HBM layout");
+  const auto total_bytes = impl_->gather_host_plan.total_bytes;
+  const auto output_extent = impl_->gather_host_plan.output_extent;
+  const GatherOutputSpan contiguous_output{0U, total_bytes, 0U};
   if (request.timing != nullptr)
     request.timing->validate_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - validate_start).count();
@@ -435,18 +431,6 @@ Status NpuRuntime::GatherRead(const CpuGatherReadRequest& request) {
   const bool direct = request.source_descriptor_address != 0U;
   Status status = Status::OK();
   if (direct) {
-    const auto descriptor_bytes = peer::GatherDescriptorBytes(request.spans.size());
-    const auto descriptor = request.source_descriptor_address;
-    if (descriptor % 64U != 0U ||
-        !peer::GatherRange(region.base, peer::GatherControlOffset(region.length),
-                           descriptor, descriptor_bytes) ||
-        (descriptor < request.staging_address + total_bytes &&
-         request.staging_address < descriptor + descriptor_bytes))
-      return Status::InvalidArgument("invalid GatherRead source descriptor mailbox");
-    for (const auto& span : request.spans)
-      if (descriptor < span.address + span.length &&
-          span.address < descriptor + descriptor_bytes)
-        return Status::InvalidArgument("GatherRead descriptor mailbox overlaps a source");
     if (!impl_->direct_gather_enabled) {
       status = impl_->peer_link->EnableDirectGather(region.base);
       if (status.ok()) impl_->direct_gather_enabled = true;
@@ -468,8 +452,9 @@ Status NpuRuntime::GatherRead(const CpuGatherReadRequest& request) {
         std::chrono::steady_clock::now() - configure_start).count();
   if (!status.ok()) return status;
   return impl_->access_operator->ExecuteCpuGatherRead(CpuGatherReadExecRequest{
-      request.output, output_spans.data(),
-      static_cast<std::uint32_t>(output_spans.size()), request.sgl_size,
+      request.output, request.output_spans.empty() ? &contiguous_output : request.output_spans.data(),
+      static_cast<std::uint32_t>(request.output_spans.empty() ? 1U : request.output_spans.size()),
+      request.sgl_size,
       output_extent, request.staging_address, ready.command_address,
       ready.notify_address, ready.ack_address, request.source_descriptor_address,
       direct ? request.spans.data() : nullptr,

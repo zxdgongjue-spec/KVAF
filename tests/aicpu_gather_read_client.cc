@@ -4,6 +4,7 @@
 #include "aicpu_urma_client_options.h"
 #include "aicpu_gather_read_layout.h"
 #include "aicpu_gather_read_report.h"
+#include "gather_read_storage.h"
 
 #include "acl/acl.h"
 
@@ -282,8 +283,9 @@ int Run(const Options& options) {
   const std::size_t output_extent =
       static_cast<std::size_t>(options.blocks - 1U) * options.output_stride + options.block_bytes;
   DeviceBuffer input(payload);
-  DeviceBuffer output(((output_extent + 63U) & ~std::size_t{63U}) + 64U +
-                      kvaf::peer::GatherDescriptorBytes(options.blocks));
+  DeviceBuffer output(kvaf::aicpu_urma::GatherReadPackedOutputBytes(
+      output_extent, kvaf::peer::GatherDescriptorBytes(options.blocks), options.blocks,
+      options.dynamic_read ? options.read_task_spans : 0U));
   std::vector<std::uint8_t> host_input(payload), host_output(output.bytes);
   std::vector<std::uint8_t> expected_output(output_extent);
   std::vector<kvaf::KeyId> reserved_keys;

@@ -21,6 +21,7 @@ struct GatherReadTiming {
   std::uint64_t configure_ns{0U};
   std::uint64_t source_upload_ns{0U};
   std::uint64_t descriptor_upload_ns{0U};
+  std::uint64_t metadata_upload_ns{0U};
   std::uint64_t register_ns{0U};
   std::uint64_t launch_ns{0U};
   std::uint64_t sync_ns{0U};

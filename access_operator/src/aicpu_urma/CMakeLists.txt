@@ -38,6 +38,7 @@ add_custom_command(OUTPUT "${kernel_so}"
   DEPENDS kernel.cc wqe.h gather_read.h
           "${CMAKE_SOURCE_DIR}/runtime/include/cpu_gather.h"
           "${CMAKE_SOURCE_DIR}/access_operator/include/gather_output.h"
+          "${CMAKE_SOURCE_DIR}/access_operator/include/gather_read_storage.h"
           "${CMAKE_SOURCE_DIR}/access_operator/include/gather_read_profile.h" VERBATIM)
 add_custom_command(OUTPUT "${kernel_tar}"
   COMMAND "${CMAKE_COMMAND}" -E tar czf "${kernel_tar}" aicpu_kernels_device

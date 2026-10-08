@@ -35,6 +35,7 @@ inline void PrintGatherReadTimeline(std::FILE* output, double mean_ms,
   read_us /= profiles.size() * 1000.0;
   const bool parallel = average(&GatherReadTiming::aicpu_cores) > 1.0;
   const bool direct = average(&GatherReadTiming::source_write_ns) > 0.0;
+  const double metadata_us = average_us(&GatherReadTiming::metadata_upload_ns);
 
   std::fprintf(output,
                "GATHER_READ_TIMELINE average per measured round (us; 3 decimals = 1 ns)\n"
@@ -44,16 +45,22 @@ inline void PrintGatherReadTimeline(std::FILE* output, double mean_ms,
                mean_ms * 1000.0, average_us(&GatherReadTiming::validate_ns));
   if (direct) {
     if (average(&GatherReadTiming::configure_ns) > 0.0)
-      std::fprintf(output, "    Check DDR mailbox (enable worker on first call): %.3f us\n",
+      std::fprintf(output, "    Assign sequence / enable CPU worker on first call: %.3f us\n",
                    average_us(&GatherReadTiming::configure_ns));
-    std::fprintf(output, "    Upload DDR source list to HBM: %.3f us\n",
-                 average_us(&GatherReadTiming::source_upload_ns));
+    if (metadata_us > 0.0)
+      std::fprintf(output, "    Pack source list + HBM targets and upload once: %.3f us\n",
+                   metadata_us);
+    if (metadata_us == 0.0 || average(&GatherReadTiming::source_upload_ns) > 0.0)
+      std::fprintf(output, "    Upload DDR source list to HBM: %.3f us\n",
+                   average_us(&GatherReadTiming::source_upload_ns));
   } else
     std::fprintf(output, "    Send DDR source list to CPU: %.3f us\n",
                  average_us(&GatherReadTiming::configure_ns));
+  if (metadata_us == 0.0 || average(&GatherReadTiming::descriptor_upload_ns) > 0.0)
+    std::fprintf(output, "    Upload HBM targets: %.3f us\n",
+                 average_us(&GatherReadTiming::descriptor_upload_ns));
   std::fprintf(output,
-               "    Upload HBM targets: %.3f us | Look up HBM registration: %.3f us | Launch AICPU: %.3f us\n",
-               average_us(&GatherReadTiming::descriptor_upload_ns),
+               "    Look up HBM registration: %.3f us | Launch AICPU: %.3f us\n",
                average_us(&GatherReadTiming::register_ns),
                average_us(&GatherReadTiming::launch_ns));
   if (!direct)
@@ -146,13 +153,14 @@ inline void PrintGatherReadTechnicalProfile(std::FILE* output,
   const bool direct = average(&GatherReadTiming::source_write_ns) > 0.0;
   std::fprintf(output,
                "GATHER_READ_TECHNICAL avg_ns (only with --profile-detail 1; nested times overlap)\n"
-               "  Host: validate=%.0f %s=%.0f source_upload=%.0f descriptor_upload=%.0f "
+               "  Host: validate=%.0f %s=%.0f source_upload=%.0f descriptor_upload=%.0f metadata_upload=%.0f "
                "hbm_register=%.0f launch=%.0f stream_sync=%.0f hbm_release=%.0f status_copy=%.0f\n",
                average(&GatherReadTiming::validate_ns),
                direct ? "direct_setup" : "configure_rpc",
                average(&GatherReadTiming::configure_ns),
                average(&GatherReadTiming::source_upload_ns),
                average(&GatherReadTiming::descriptor_upload_ns),
+               average(&GatherReadTiming::metadata_upload_ns),
                average(&GatherReadTiming::register_ns),
                average(&GatherReadTiming::launch_ns),
                average(&GatherReadTiming::sync_ns),

@@ -431,11 +431,12 @@ void TestScatterStagingBoundary(std::uint32_t sq_batch_wqes,
 
 void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count,
                          bool detailed = true, std::uint32_t sq_batch_wqes = 8U,
-                         std::uint32_t task_spans = 0U, bool delay_followers = false) {
+                         std::uint32_t task_spans = 0U, bool delay_followers = false,
+                         bool packed_metadata = false) {
   using kvaf::aicpu_urma::GatherReadStatus;
   constexpr std::uint32_t depth = 128U;
   alignas(64) std::array<std::uint8_t, 4096> remote{};
-  std::array<std::uint8_t, 2048> output{};
+  alignas(64) std::array<std::uint8_t, 4096> output{};
   std::vector<kvaf::GatherOutputSpan> targets(span_count);
   std::vector<std::uint64_t> target_storage(
       (kvaf::aicpu_urma::GatherOutputStorageBytes(span_count, task_spans) + 63U) / 8U + 1U);
@@ -504,6 +505,12 @@ void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count,
   args.source_descriptor = args.output + ((args.output_extent + 63U) & ~std::uint64_t{63U}) +
       kvaf::aicpu_urma::kGatherScratchBytes;
   args.source_span_count = span_count;
+  if (packed_metadata) {
+    assert(kvaf::aicpu_urma::GatherReadPackedOutputBytes(args.output_extent,
+        kvaf::peer::GatherDescriptorBytes(span_count), span_count, task_spans) <= output.size());
+    args.output_spans = args.source_descriptor + kvaf::aicpu_urma::GatherPackedTargetOffset(
+        kvaf::peer::GatherDescriptorBytes(span_count));
+  }
   std::atomic<bool> stopped{false};
   std::atomic<std::uint32_t> notifications{0U};
   std::atomic<int> error_worker{-1};
@@ -586,19 +593,31 @@ void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count,
     return results;
   };
   const auto prepare_sources = [&] {
-    std::memcpy(reinterpret_cast<void*>(args.output_spans), targets.data(),
-                targets.size() * sizeof(targets.front()));
     const kvaf::peer::GatherDescriptorHeader header{
         kvaf::peer::kGatherDescriptorMagic, args.sequence, args.remote_staging,
         span_count, total_bytes};
-    std::memcpy(reinterpret_cast<void*>(args.source_descriptor), &header, sizeof(header));
-    std::memcpy(reinterpret_cast<std::uint8_t*>(args.source_descriptor) + sizeof(header),
+    const auto target_offset = kvaf::aicpu_urma::GatherPackedTargetOffset(
+        kvaf::peer::GatherDescriptorBytes(span_count));
+    std::vector<std::uint8_t> metadata(target_offset + targets.size() * sizeof(targets.front()));
+    auto* source_destination = packed_metadata ? metadata.data()
+        : reinterpret_cast<std::uint8_t*>(args.source_descriptor);
+    auto* target_destination = packed_metadata ? metadata.data() + target_offset
+        : reinterpret_cast<std::uint8_t*>(args.output_spans);
+    std::memcpy(target_destination, targets.data(), targets.size() * sizeof(targets.front()));
+    std::memcpy(source_destination, &header, sizeof(header));
+    std::memcpy(source_destination + sizeof(header),
                 sources.data(), sources.size() * sizeof(sources.front()));
+    if (packed_metadata)
+      std::memcpy(reinterpret_cast<void*>(args.source_descriptor), metadata.data(), metadata.size());
   };
   for (std::uint32_t round = 1U; round <= 3U; ++round) {
     args.sequence = round;
     total_bytes = 0U;
     for (std::uint32_t index = 0U; index < span_count; ++index) {
+      if (packed_metadata) {
+        targets[index].offset = ((index + round) % span_count) * 16U;
+        sources[index].address = base + targets[index].offset;
+      }
       targets[index].length = (index + round) % 7U + 1U;
       sources[index].length = targets[index].length;
       total_bytes += targets[index].length;
@@ -760,5 +779,8 @@ int main() {
   TestParallelScatter(6U, 41U, false, 16U, 12U);
   TestParallelScatter(8U, 41U, true, 32U, 1U);
   TestParallelScatter(5U, 3U, true, 64U, 192U);
+  TestParallelScatter(5U, 41U, true, 8U, 0U, false, true);
+  TestParallelScatter(5U, 41U, true, 8U, 10U, false, true);
+  TestParallelScatter(8U, 41U, true, 8U, 1U, false, true);
   std::cout << "AICPU gather/read kernel simulation: PASS\n";
 }

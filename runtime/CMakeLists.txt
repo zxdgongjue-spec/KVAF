@@ -18,6 +18,14 @@ target_link_libraries(kvaf_runtime
 target_compile_features(kvaf_runtime PUBLIC cxx_std_17)
 
 find_package(Threads REQUIRED)
+add_library(kvaf_gather_host_plan STATIC src/gather_host_plan.cc)
+target_include_directories(kvaf_gather_host_plan PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../access_operator/include)
+target_compile_features(kvaf_gather_host_plan PUBLIC cxx_std_17)
+target_compile_options(kvaf_gather_host_plan PRIVATE
+  "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2>")
+
 add_library(kvaf_cpu_gather_plan STATIC src/cpu_gather_plan.cc)
 target_include_directories(kvaf_cpu_gather_plan PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(kvaf_cpu_gather_plan PUBLIC Threads::Threads)
@@ -35,7 +43,7 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
       ${ASCEND_CANN_PACKAGE_PATH}/include)
   target_link_libraries(kvaf_npu_runtime
     PUBLIC kvaf_runtime
-    PRIVATE kvaf_peer_link kvaf_default_access_operator
+    PRIVATE kvaf_peer_link kvaf_default_access_operator kvaf_gather_host_plan
             kvaf_execute_batch_get_host ascendcl ${CMAKE_DL_LIBS})
   if(KVAF_ENABLE_AIV_BATCH_PUT)
     target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_execute_batch_put_host)

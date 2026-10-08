@@ -4,6 +4,7 @@
 
 #include "gather_output.h"
 #include "gather_read_profile.h"
+#include "gather_read_storage.h"
 
 namespace kvaf::aicpu_urma {
 
@@ -12,25 +13,6 @@ constexpr std::uint32_t kGatherScratchBytes = 64U;
 constexpr std::uint32_t kGatherMaxSpans = 65536U;
 constexpr std::uint32_t kGatherWorkerCounterSlot = 0U;
 constexpr std::uint32_t kGatherStagingOffsetSlot = 1U;
-
-struct alignas(64) GatherTaskState {
-  std::uint64_t next_task;
-};
-
-inline std::uint32_t GatherTaskCount(std::uint32_t spans, std::uint32_t task_spans) {
-  return task_spans == 0U ? 0U : (spans + task_spans - 1U) / task_spans;
-}
-
-inline std::uint64_t GatherTaskStateOffset(std::uint32_t spans) {
-  return (static_cast<std::uint64_t>(spans) * sizeof(GatherOutputSpan) + 63U) &
-         ~std::uint64_t{63U};
-}
-
-inline std::uint64_t GatherOutputStorageBytes(std::uint32_t spans, std::uint32_t task_spans) {
-  return task_spans == 0U ? static_cast<std::uint64_t>(spans) * sizeof(GatherOutputSpan)
-      : GatherTaskStateOffset(spans) + sizeof(GatherTaskState) +
-          static_cast<std::uint64_t>(GatherTaskCount(spans, task_spans)) * sizeof(std::uint64_t);
-}
 
 struct GatherReadStatus {
   std::uint64_t magic;

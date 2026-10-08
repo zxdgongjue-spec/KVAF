@@ -69,7 +69,7 @@ int main() {
   assert(direct_report.find("CPU read and prepare source list: 3.000 us") != std::string::npos);
   assert(direct_report.find("CPU start observed after ACK polling began: 4.000 us (1/1 rounds)") !=
          std::string::npos);
-  assert(direct_report.find("Check DDR mailbox (enable worker on first call): 1.000 us") !=
+  assert(direct_report.find("Assign sequence / enable CPU worker on first call: 1.000 us") !=
          std::string::npos);
   assert(direct_report.find("Send DDR source list to CPU:") == std::string::npos);
   std::FILE* technical_output = std::tmpfile();
@@ -83,6 +83,24 @@ int main() {
   assert(technical_report.find("direct_setup=1000") != std::string::npos);
   assert(technical_report.find("ack_started=4000") != std::string::npos);
   assert(technical_report.find("idle_since_previous_ack=") != std::string::npos);
+
+  first.source_upload_ns = 0U;
+  first.descriptor_upload_ns = 0U;
+  first.metadata_upload_ns = 6500U;
+  std::FILE* packed_output = std::tmpfile();
+  assert(packed_output != nullptr);
+  kvaf::aicpu_gather_read_client::PrintGatherReadTimeline(packed_output, 1.5, {first});
+  kvaf::aicpu_gather_read_client::PrintGatherReadTechnicalProfile(packed_output, {first});
+  std::rewind(packed_output);
+  std::string packed_report;
+  while ((bytes = std::fread(buffer, 1U, sizeof(buffer), packed_output)) != 0U)
+    packed_report.append(buffer, bytes);
+  std::fclose(packed_output);
+  assert(packed_report.find("Pack source list + HBM targets and upload once: 6.500 us") !=
+         std::string::npos);
+  assert(packed_report.find("Upload DDR source list to HBM:") == std::string::npos);
+  assert(packed_report.find("Upload HBM targets:") == std::string::npos);
+  assert(packed_report.find("metadata_upload=6500") != std::string::npos);
 
   first.aicpu_cores = 4U;
   first.profile_detail = true;
