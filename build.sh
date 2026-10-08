@@ -228,7 +228,8 @@ build_aicpu_urma() {
     kvaf_aicpu_urma_wqe_test kvaf_aicpu_urma_kernel_test kvaf_aicpu_gather_read_kernel_test
     kvaf_aicpu_gather_read_layout_test
     kvaf_cpu_gather_test
-    kvaf_aicpu_urma_client_options_test kvaf_aicpu_urma_client_metrics_test)
+    kvaf_aicpu_urma_client_options_test kvaf_aicpu_urma_client_metrics_test
+    kvaf_peer_memory_allocator_test)
   require_command cmake
   cann_root="$(find_cann_root)"
   [[ -n "$cann_root" ]] || die "CANN toolkit not found; source CANN set_env.sh first"

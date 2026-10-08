@@ -23,9 +23,11 @@ void Usage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s [--peer HOST:PORT] "
                "[--kernel-json PATH] [--device-id N] "
+               "[--peer-device cpu|npu] [--peer-device-id N] "
                "[--blocks N] [--block-bytes N] [--token-bytes N] "
                "[--warmup N] [--iterations N]\n"
-               "Defaults: peer=127.0.0.1:28999, device-id=0, blocks=8, "
+               "Defaults: peer=127.0.0.1:28999, device-id=0, peer-device=cpu, "
+               "peer-device-id=0 (NPU peer only), blocks=8, "
                "block-bytes=4096, token-bytes=block-bytes, warmup=1, iterations=3, "
                "kernel-json=%s\n",
                program, DefaultKernelJson().c_str());
@@ -223,6 +225,9 @@ int Run(const Options& options) {
                                           options.block_bytes / options.token_bytes);
   runtime_options.aicpu_urma_kernel_json_path = options.kernel_json;
   runtime_options.device_id = options.device_id;
+  runtime_options.peer_device = options.peer_device == "npu"
+                                    ? kvaf::DeviceKind::kNpu : kvaf::DeviceKind::kCpu;
+  runtime_options.peer_device_id = options.peer_device_id;
   runtime_options.npu_core_count = 1;
   runtime_options.jettys_per_core = 1;
   kvaf::NpuRuntime runtime(std::move(runtime_options));
@@ -233,9 +238,11 @@ int Run(const Options& options) {
   put_samples.reserve(options.iterations);
   get_samples.reserve(options.iterations);
   const std::uint64_t total = static_cast<std::uint64_t>(options.warmup) + options.iterations;
-  std::fprintf(stdout, "[KVAF_AICPU_URMA] linked peer=%s device=%u blocks=%u block_bytes=%u "
+  std::fprintf(stdout, "[KVAF_AICPU_URMA] linked peer=%s device=%u peer_device=%s "
+                       "peer_device_id=%u blocks=%u block_bytes=%u "
                        "token_bytes=%u warmup=%u iterations=%u\n",
-               options.peer.c_str(), options.device_id, options.blocks, options.block_bytes,
+               options.peer.c_str(), options.device_id, options.peer_device.c_str(),
+               options.peer_device_id, options.blocks, options.block_bytes,
                options.token_bytes, options.warmup, options.iterations);
   for (std::uint64_t round = 0; round < total; ++round) {
     Timing sample;
@@ -259,9 +266,11 @@ int Run(const Options& options) {
                get_stats.min_ms, get_stats.p50_ms, get_stats.p95_ms, get_stats.p99_ms,
                get_stats.max_ms);
   std::fprintf(stdout, "AICPU_URMA_PASS iterations=%u warmup=%u bytes_per_iteration=%zu "
-                       "put_mean_ms=%.3f get_mean_ms=%.3f put_GBps=%.3f get_GBps=%.3f\n",
+                       "put_mean_ms=%.3f get_mean_ms=%.3f put_GBps=%.3f get_GBps=%.3f "
+                       "peer_device=%s peer_device_id=%u\n",
                options.iterations, options.warmup, buffers.payload_bytes,
-               put_stats.mean_ms, get_stats.mean_ms, put_stats.mean_gbps, get_stats.mean_gbps);
+               put_stats.mean_ms, get_stats.mean_ms, put_stats.mean_gbps, get_stats.mean_gbps,
+               options.peer_device.c_str(), options.peer_device_id);
   return 0;
 }
 

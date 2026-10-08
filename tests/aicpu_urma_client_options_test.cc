@@ -19,6 +19,7 @@ int main() {
   kvaf::aicpu_urma_client::Options default_options;
   assert(kvaf::aicpu_urma_client::Parse(1, defaults, &default_options));
   assert(default_options.peer == "127.0.0.1:28999");
+  assert(default_options.peer_device == "cpu" && default_options.peer_device_id == 0U);
   assert(default_options.token_bytes == default_options.block_bytes);
   assert(default_options.kernel_json.find("/opp/vendors/cust/op_impl/aicpu/config/kvaf_aicpu_urma.json") !=
          std::string::npos);
@@ -49,6 +50,20 @@ int main() {
   constexpr const char* token_first[] = {"client", "--token-bytes", "328", "--block-bytes", "656"};
   assert(kvaf::aicpu_urma_client::Parse(sizeof(token_first) / sizeof(token_first[0]), token_first, &options));
   assert(options.block_bytes == 656 && options.token_bytes == 328);
+  constexpr const char* npu_peer[] = {"client", "--device-id", "0", "--peer-device-id", "3",
+                                     "--peer-device", "npu", "--block-bytes", "656"};
+  assert(kvaf::aicpu_urma_client::Parse(sizeof(npu_peer) / sizeof(npu_peer[0]), npu_peer, &options));
+  assert(options.device_id == 0U && options.peer_device == "npu" && options.peer_device_id == 3U);
+  constexpr const char* npu_zero[] = {"client", "--peer-device", "npu"};
+  assert(kvaf::aicpu_urma_client::Parse(sizeof(npu_zero) / sizeof(npu_zero[0]), npu_zero, &options));
+  assert(options.peer_device_id == 0U);
+  constexpr const char* invalid_peer[] = {"client", "--peer-device", "gpu"};
+  constexpr const char* cpu_peer_id[] = {"client", "--peer-device-id", "1"};
+  constexpr const char* invalid_peer_id[] = {"client", "--peer-device", "npu",
+                                            "--peer-device-id", "2147483648"};
+  assert(!Accepts(invalid_peer));
+  assert(!Accepts(cpu_peer_id));
+  assert(!Accepts(invalid_peer_id));
   constexpr const char* block_then_token[] = {"client", "--block-bytes", "656", "--token-bytes", "328"};
   assert(kvaf::aicpu_urma_client::Parse(sizeof(block_then_token) / sizeof(block_then_token[0]),
                                         block_then_token, &options));

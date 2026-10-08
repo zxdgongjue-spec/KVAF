@@ -43,14 +43,17 @@ struct NpuRuntimeOptions {
   std::uint32_t device_id{0U};
   std::uint32_t npu_core_count{1U};
   std::uint32_t jettys_per_core{2U};
+  // Remote memory owner; device_id above always selects the local NPU.
+  DeviceKind peer_device{DeviceKind::kCpu};
+  std::uint32_t peer_device_id{0U};
 };
 
 // NPU role Runtime. It owns the current MetaManager, NPU AccessOperator and
-// DDR allocator, while Python remains responsible only for Tensor adaptation.
+// remote memory allocator, while Python remains responsible only for Tensor adaptation.
 class NpuRuntime final : public Runtime {
  public:
   explicit NpuRuntime(NpuRuntimeOptions options);
-  // HBM provider mode. The service owns HBM and accepts CPU Runtime links;
+  // HBM provider mode. The service owns HBM and accepts CPU or NPU Runtime links;
   // the AIV kernel configuration is not required in this mode.
   explicit NpuRuntime(NpuServiceOptions options);
   ~NpuRuntime() override;
@@ -58,7 +61,8 @@ class NpuRuntime final : public Runtime {
   NpuRuntime(const NpuRuntime&) = delete;
   NpuRuntime& operator=(const NpuRuntime&) = delete;
 
-  Status Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size);
+  // Allocates CPU DRAM or NPU HBM according to options.peer_device.
+  Status Initialize(std::uint64_t remote_bytes, std::uint64_t slot_size);
   Status InitializeHbmService();
   Status GatherRead(const CpuGatherReadRequest& request);
   RuntimeCore& core();

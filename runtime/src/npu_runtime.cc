@@ -28,6 +28,7 @@
 #include "access_operator.h"
 #include "gather_host_plan.h"
 #include "peer_link.h"
+#include "peer_memory_allocator.h"
 #include "meta_manager.h"
 #include "npu_eid_discovery.h"
 
@@ -38,42 +39,6 @@ using npu_eid_detail::ReadHcclClosEids;
 using npu_eid_detail::ReadPairInfoDeviceEid;
 
 Status Internal(std::string message) { return Status::Internal(std::move(message)); }
-
-class PeerDdrAllocator final : public DdrMemoryAllocator {
- public:
-  explicit PeerDdrAllocator(std::shared_ptr<peer::PeerLink> link)
-      : link_(std::move(link)) {}
-
-  void SetCandidate(std::uint32_t candidate_id) { candidate_id_ = candidate_id; }
-  bool has_allocation() const { return allocated_.base != 0U; }
-
-  Status Allocate(const RuntimeInitRequest& request, RemoteRegionDesc* region) override {
-    if (link_ == nullptr || region == nullptr || request.ddr_device != DeviceKind::kCpu ||
-        request.ddr_bytes == 0U || request.slot_size == 0U ||
-        request.ddr_bytes % request.slot_size != 0U) {
-      return Status::InvalidArgument("invalid peer DDR allocation request");
-    }
-    if (allocated_.base != 0U) return Status::InvalidState("peer DDR is already allocated");
-    Status status = link_->AllocateRegion(request.ddr_bytes, request.slot_size, candidate_id_, &allocated_);
-    if (!status.ok()) return status;
-    *region = RemoteRegionDesc{allocated_.base, allocated_.length, request.slot_size, DeviceKind::kCpu};
-    return Status::OK();
-  }
-
-  Status Release(const RemoteRegionDesc& region) override {
-    if (allocated_.base == 0U || allocated_.base != region.base) {
-      return Status::NotFound("peer DDR allocation was not found");
-    }
-    const Status status = link_->ReleaseRegion(allocated_.base);
-    if (status.ok()) allocated_ = {};
-    return status;
-  }
-
- private:
-  std::shared_ptr<peer::PeerLink> link_;
-  std::uint32_t candidate_id_{0U};
-  peer::PeerRegion allocated_{};
-};
 
 using AclrtGetPhyDevIdByLogicDevId = int (*)(int32_t, int32_t*);
 
@@ -207,7 +172,7 @@ struct NpuRuntime::Impl {
   AccessOperatorConfig config;
   std::unique_ptr<MetaManager> meta_manager;
   std::unique_ptr<DdrMemoryAllocator> allocator;
-  PeerDdrAllocator* peer_allocator{nullptr};
+  PeerMemoryAllocator* peer_allocator{nullptr};
   std::shared_ptr<peer::PeerLink> peer_link;
   std::unique_ptr<DefaultAccessOperator> access_operator;
   std::unique_ptr<RuntimeCore> runtime_core;
@@ -230,7 +195,10 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
       impl_->options.jettys_per_core == 0U ||
       impl_->options.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
       impl_->options.batch_get_token_bytes == 0U ||
-      impl_->options.batch_get_tokens_per_block == 0U) {
+      impl_->options.batch_get_tokens_per_block == 0U ||
+      (impl_->options.peer_device != DeviceKind::kCpu &&
+       impl_->options.peer_device != DeviceKind::kNpu) ||
+      impl_->options.peer_device_id > static_cast<std::uint32_t>(INT32_MAX)) {
     throw std::invalid_argument("invalid NPU Runtime configuration");
   }
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS) {
@@ -269,7 +237,8 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
   }
   impl_->peer_link = std::make_shared<peer::PeerLink>(target.address);
   impl_->config.peer_link = impl_->peer_link;
-  auto allocator = std::make_unique<PeerDdrAllocator>(impl_->peer_link);
+  auto allocator = std::make_unique<PeerMemoryAllocator>(
+      impl_->peer_link, impl_->options.peer_device, impl_->options.peer_device_id);
   impl_->peer_allocator = allocator.get();
   impl_->allocator = std::move(allocator);
   impl_->runtime_core.reset();
@@ -278,9 +247,9 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
   return Status::OK();
 }
 
-Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
+Status NpuRuntime::Initialize(std::uint64_t remote_bytes, std::uint64_t slot_size) {
   if (impl_->hbm_mode) return Status::InvalidState("HBM provider NpuRuntime uses InitializeHbmService");
-  const RuntimeInitRequest request{ddr_bytes, slot_size, DeviceKind::kCpu};
+  const RuntimeInitRequest request{remote_bytes, slot_size, impl_->options.peer_device};
   if (initialized()) return Status::InvalidState("NpuRuntime has already been initialized");
   if (impl_->peer_link == nullptr || impl_->peer_allocator == nullptr ||
       impl_->runtime_core == nullptr) {
@@ -296,7 +265,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   }
 
   std::uint32_t candidate_count = 0U;
-  Status last = impl_->peer_link->GetCandidateCount(&candidate_count);
+  Status last = impl_->peer_allocator->GetCandidateCount(&candidate_count);
   if (!last.ok()) return last;
   if (candidate_count == 0U) {
     return Status::NotFound("peer Runtime returned no UMDK/EID candidates");
@@ -378,7 +347,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
         if (!cleanup.ok()) return cleanup;
       }
       if (impl_->peer_allocator->has_allocation()) {
-        return Status::Internal("failed peer candidate left DDR allocated");
+        return Status::Internal("failed peer candidate left remote memory allocated");
       }
     }
   }

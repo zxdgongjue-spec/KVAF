@@ -41,7 +41,7 @@ kernel 并发使用；异步 BatchGet 需要调用方在释放输出/transport �
 CANN 路径查找 AICPU JSON，并使用单 worker、单 Jetty；无需配置 `CANN_ROOT`
 或提供 AIV kernel object 路径。若 `ASCEND_HOME_PATH` 未设置，客户端在 ACL 初始化前
 将其设为构建时的 CANN 根目录，以便设备包加载器找到安装包；显式设置的值不覆盖。
-服务端仍是 KVAF 原有 CPU Runtime 服务。
+默认服务端是 KVAF 原有 CPU Runtime 服务；跨 NPU 模式使用 `kvaf_npu_service`。
 
 Host 单测（含部署脚本的本地模拟测试）：
 `ctest --test-dir build-aicpu-urma -R 'kvaf_aicpu_urma_|kvaf_aicpu_gather_read_|kvaf_cpu_gather' --output-on-failure`。
@@ -75,6 +75,78 @@ CPU DDR 分配大小固定为 `blocks * block-bytes`。
 Runtime 提交与 stream 同步，不包含 AccessTable 准备、HBM 上传/回读和逐字节校验，
 因此不是纯 SQ 带宽。底层 Direct-HCCP 的诊断日志仍可能出现。
 失败时退出码非零且不会输出 `AICPU_URMA_PASS`；`--help` 查看完整参数。
+
+## NPU → NPU HBM BatchPut / BatchGet
+
+原生客户端支持 A 卡的 AICPU 通过 URMA 读写 B 卡的 HBM。B 端复用现有
+`kvaf_npu_service`：Host 负责分配、注册 HBM 和交换连接描述符；数据由 UB
+传输硬件在两张卡的 HBM 之间搬运。此模式使用普通 BatchPut/BatchGet。
+
+在 B 所在主机启动 HBM 服务（已有服务产物可直接使用；构建命令为
+`./build.sh npu --build-dir build-npu`）：
+
+```bash
+build-npu/runtime/kvaf_npu_service \
+  --listen 0.0.0.0 --port 29888 --device-id 1
+```
+
+在 A 所在主机构建、安装内核并运行：
+
+```bash
+./build.sh aicpu-urma --install-kernel
+build-aicpu-urma/tests/kvaf_aicpu_urma_client \
+  --peer NPU_B_HOST:29888 \
+  --device-id 0 --peer-device npu --peer-device-id 1 \
+  --blocks 16 --block-bytes 4096 --token-bytes 256 \
+  --warmup 1 --iterations 5
+```
+
+同机双卡时把 `NPU_B_HOST` 换为 `127.0.0.1`，两个进程分别选择卡 0 和卡 1。
+跨主机时两端逻辑卡号可以相同；卡号按各进程的设备可见性解释。
+`--device-id` 始终选择发起端 A，`--peer-device-id` 选择 B 服务进程中的目标卡。
+`--peer-device` 默认 `cpu`；选择 `npu` 后远端卡号默认 0。
+
+Runtime 查询 B 的 HBM EID 候选，与 A 的本地 EID 组合逐对尝试。每次尝试申请
+B 的 HBM region，复用 Direct-HCCP 远端 segment 导入和双方 Jetty/CTP 握手，
+再以 AICPU WRITE/CQ 探测链路。失败会先销毁传输资源并释放 region，再尝试下一对。
+连接成功后，客户端每轮更换源数据，BatchPut 写 B 的 HBM，再用 BatchGet 将全部
+数据读回 A 的不同输出 buffer，反序排列 token 并逐字节校验。
+成功行包含 `AICPU_URMA_PASS ... peer_device=npu peer_device_id=1`。
+这验证传输往返，不验证 B 侧计算核并发消费；后者还需要双方通知和 stream 同步协议。
+
+C++ 使用同一 Runtime API，在 `LinkTo` 前配置：
+
+```cpp
+kvaf::NpuRuntimeOptions options("", 256, 16);
+options.aicpu_urma_kernel_json_path = kernel_json;
+options.device_id = 0;
+options.peer_device = kvaf::DeviceKind::kNpu;
+options.peer_device_id = 1;
+options.npu_core_count = 1;
+options.jettys_per_core = 1;
+kvaf::NpuRuntime runtime(std::move(options));
+// 检查每个返回的 Status。
+runtime.LinkTo({"NPU_B_HOST:29888"});
+runtime.Initialize(16 * 4096, 4096);  // B 端 HBM 大小和 slot 大小
+// runtime.core().BatchPut(...) / BatchGet(...)
+runtime.Shutdown();
+```
+
+当前模式访问由 B 服务新分配的 HBM；不导出已有 Tensor，也不要求 B 执行 AICPU
+数据处理内核。READ/WRITE 内核及 WQE 格式沿用原实现。调用方需在源数据生产完成后
+提交操作，并在异步 BatchGet 完成后才读取输出或销毁资源。双卡 EID 的 UB/CTP
+可达性及 HBM 可见性需要目标硬件验证；Host 单测不能替代双卡回读测试。
+
+无需 CANN 的控制面回归测试：
+
+```bash
+cmake -S . -B build-host -DBUILD_TESTING=ON
+cmake --build build-host --target kvaf_peer_memory_allocator_test \
+  kvaf_peer_hbm_eid_test kvaf_aicpu_urma_client_options_test
+ctest --test-dir build-host \
+  -R '^(kvaf_peer_memory_allocator|kvaf_peer_hbm_eid|kvaf_aicpu_urma_client_options)$' \
+  --output-on-failure
+```
 
 ## CPU Gather + AICPU 多 SGL READ
 

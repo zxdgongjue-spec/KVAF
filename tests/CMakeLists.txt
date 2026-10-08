@@ -261,6 +261,11 @@ target_include_directories(kvaf_peer_hbm_eid_test PRIVATE "${CMAKE_SOURCE_DIR}/r
 target_link_libraries(kvaf_peer_hbm_eid_test PRIVATE kvaf_peer_link)
 add_test(NAME kvaf_peer_hbm_eid COMMAND kvaf_peer_hbm_eid_test)
 
+add_executable(kvaf_peer_memory_allocator_test peer_memory_allocator_test.cc)
+target_include_directories(kvaf_peer_memory_allocator_test PRIVATE "${CMAKE_SOURCE_DIR}/runtime/src")
+target_link_libraries(kvaf_peer_memory_allocator_test PRIVATE kvaf_runtime kvaf_peer_link Threads::Threads)
+add_test(NAME kvaf_peer_memory_allocator COMMAND kvaf_peer_memory_allocator_test)
+
 add_executable(kvaf_cpu_urma_eid_perf_metrics_test cpu_urma_eid_perf_metrics_test.cc)
 target_compile_features(kvaf_cpu_urma_eid_perf_metrics_test PRIVATE cxx_std_17)
 add_test(NAME kvaf_cpu_urma_eid_perf_metrics COMMAND kvaf_cpu_urma_eid_perf_metrics_test)

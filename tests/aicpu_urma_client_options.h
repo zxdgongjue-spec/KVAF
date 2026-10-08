@@ -34,6 +34,8 @@ struct Options {
   std::string peer{"127.0.0.1:28999"};
   std::string kernel_json{DefaultKernelJson()};
   std::uint32_t device_id{0};
+  std::string peer_device{"cpu"};
+  std::uint32_t peer_device_id{0};
   std::uint32_t blocks{8};
   std::uint32_t block_bytes{4096};
   std::uint32_t token_bytes{block_bytes};
@@ -55,18 +57,23 @@ inline bool Parse(int argc, const char* const* argv, Options* options) {
   if (argc < 1 || argv == nullptr || options == nullptr) return false;
   Options parsed;
   bool token_bytes_set = false;
+  bool peer_device_id_set = false;
   for (int index = 1; index < argc; index += 2) {
     if (index + 1 >= argc) return false;
     const std::string flag = argv[index];
     const char* value = argv[index + 1];
     if (flag == "--peer") parsed.peer = value;
     else if (flag == "--kernel-json") parsed.kernel_json = value;
+    else if (flag == "--peer-device") parsed.peer_device = value;
     else {
       std::uint64_t number = 0;
       if (!Number(value, &number)) return false;
       if (number > UINT32_MAX) return false;
       if (flag == "--device-id") parsed.device_id = static_cast<std::uint32_t>(number);
-      else if (flag == "--blocks") parsed.blocks = static_cast<std::uint32_t>(number);
+      else if (flag == "--peer-device-id") {
+        parsed.peer_device_id = static_cast<std::uint32_t>(number);
+        peer_device_id_set = true;
+      } else if (flag == "--blocks") parsed.blocks = static_cast<std::uint32_t>(number);
       else if (flag == "--block-bytes") parsed.block_bytes = static_cast<std::uint32_t>(number);
       else if (flag == "--token-bytes") {
         parsed.token_bytes = static_cast<std::uint32_t>(number);
@@ -78,6 +85,9 @@ inline bool Parse(int argc, const char* const* argv, Options* options) {
   }
   if (!token_bytes_set) parsed.token_bytes = parsed.block_bytes;
   if (parsed.peer.empty() || parsed.kernel_json.empty() || parsed.blocks == 0 ||
+      (parsed.peer_device != "cpu" && parsed.peer_device != "npu") ||
+      (peer_device_id_set && parsed.peer_device != "npu") ||
+      parsed.peer_device_id > INT32_MAX ||
       parsed.device_id > INT32_MAX || parsed.token_bytes == 0 ||
       parsed.block_bytes == 0 || parsed.iterations == 0 ||
       parsed.block_bytes % parsed.token_bytes != 0 ||

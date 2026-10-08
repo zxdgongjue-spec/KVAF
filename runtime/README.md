@@ -76,6 +76,12 @@ Direct-HCCP 资源和上述 RMA WRITE 探针，不使用 MemFabric 建链。部�
 
 ## CPU Runtime 访问 NPU HBM
 
+NPU 发起端也可通过 AICPU URMA 访问另一张 NPU 的 HBM：设置
+`NpuRuntimeOptions::peer_device = DeviceKind::kNpu` 和 `peer_device_id`，再调用
+`LinkTo` / `Initialize` / `core().BatchPut` / `core().BatchGet`。目标端复用
+`kvaf_npu_service`。双卡构建、运行与验证步骤见
+[AICPU NPU → NPU HBM](../access_operator/src/aicpu_urma/README.md#npu--npu-hbm-batchput--batchget)。
+
 当 CPU 需要直接读写 NPU HBM 时，NPU 侧运行 `kvaf_npu_service`，CPU 侧使用
 `CpuRuntime::InitializeClient`。NPU 侧的命令行服务由 `NpuRuntime` 的 HBM provider
 模式承载（`NpuRuntime(NpuServiceOptions)` + `InitializeHbmService()`）；两者复用同一套 `PeerLink` 控制协议：NPU service
