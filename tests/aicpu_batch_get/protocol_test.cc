@@ -1,6 +1,7 @@
 #include "device_loop.h"
 #include "metrics.h"
 #include "scatter_pool.h"
+#include "scatter_copy.h"
 
 #include <cstdio>
 #include <cstring>
@@ -41,9 +42,7 @@ struct Simulator {
   }
   void Scatter(const Config& c, const Layout& l) {
     Require(done == sequence, "scatter ran before completion");
-    for (std::uint64_t slot = 0; slot < c.rows; ++slot)
-      std::memcpy(output.data() + OutputSlotOffset(l, slot),
-                  staging.data() + slot * c.row_bytes, c.row_bytes);
+    CopyScatterRows(output.data(), staging.data(), c.rows, c.row_bytes, l.stride);
     clock += 5;
   }
   bool VerifyTags(std::uint64_t seq, const Config& c, const Layout& l) {
@@ -108,9 +107,9 @@ void ParallelScatter() {
       Require(pool.Initialize(ActiveThreads(c), [](void* opaque, std::uint32_t worker) {
         auto& io = *static_cast<Context*>(opaque)->io;
         auto range = ScatterRange(io.config, worker, ActiveThreads(io.config));
-        for (auto slot = range.begin; slot < range.end; ++slot)
-          std::memcpy(io.output.data() + OutputSlotOffset(io.layout, slot),
-                      io.staging.data() + slot * io.config.row_bytes, io.config.row_bytes);
+        CopyScatterRows(io.output.data() + OutputSlotOffset(io.layout, range.begin),
+                        io.staging.data() + range.begin * io.config.row_bytes,
+                        range.end - range.begin, io.config.row_bytes, io.layout.stride);
       }, &context) == 0, "pthread initialization failed");
       std::uint64_t previous = 0;
       for (std::uint32_t worker = 0; worker < ActiveThreads(c); ++worker) {

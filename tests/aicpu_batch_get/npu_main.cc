@@ -2,6 +2,7 @@
 #include "core_probe_report.h"
 #include "metrics.h"
 #include "scatter_profile_report.h"
+#include "scatter_copy.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -147,8 +148,9 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
   std::fprintf(stderr,
                "AICPU_GET_NPU LAUNCH mode=%s block_dim=%u active_scatter_ranges=%u "
                "sgl_layout=source_by_output_slot scatter_layout=forward "
-               "scatter_clean=payload_cache_lines\n",
-               aicpu_blocks == 1 ? "pthread" : "multi-block", aicpu_blocks, active_threads);
+               "scatter_clean=payload_cache_lines scatter_copy=%s\n",
+               aicpu_blocks == 1 ? "pthread" : "multi-block", aicpu_blocks, active_threads,
+               ScatterCopyBackendName(config.row_bytes));
   kernel.Launch(args, aicpu_blocks);
   // Once launched, do not unwind allocations until both device execution and
   // CPU transport have stopped. A lost control connection requires retaining

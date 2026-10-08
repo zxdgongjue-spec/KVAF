@@ -5,8 +5,8 @@
 
 namespace kvaf::aicpu_test {
 constexpr std::uint64_t kMagic = 0x4b56414641424732ULL;
-constexpr char kKernelName[] = "KvafAicpuBatchGetV6";
-constexpr std::uint64_t kKernelRevision = 6;
+constexpr char kKernelName[] = "KvafAicpuBatchGetV7";
+constexpr std::uint64_t kKernelRevision = 7;
 constexpr char kCoreProbeKernelName[] = "KvafAicpuCoreProbeV1";
 constexpr std::uint64_t kCoreProbeMagic = 0x4b564146434f5231ULL;
 constexpr std::uint64_t kCoreProbeRevision = 1;

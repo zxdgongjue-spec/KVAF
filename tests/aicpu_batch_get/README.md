@@ -2,7 +2,8 @@
 
 这是独立 C++ 测试，不调用 Runtime BatchPut，不改 Python 或 MetaManager。
 
-scatter 使用 AICPU `memcpy`，支持 `--scatter-threads 1..32`（默认 1）。
+scatter 在 656 B 行上使用 AICPU NEON 向量复制，其他行长使用 `memcpy`，
+支持 `--scatter-threads 1..32`（默认 1）。
 CPU 将 SGL 描述符按 output 物理 slot 排列，仍 WRITE 到连续 HBM staging；
 AICPU 将同一个 slot 顺序复制到 output。
 调用线程也参与复制，其余 pthread 在进入测试循环前创建，跨预热和计时轮复用。
@@ -13,7 +14,7 @@ CSV 标注 `aicpu_memcpy_sgl_reordered` /
 
 ### 4096 × 656 B、多线程测试
 
-更新后需重新构建两端、安装 V6 kernel，并重启测试进程：
+更新后需重新构建两端、安装 V7 kernel，并重启测试进程：
 
 ```bash
 bash build.sh aicpu-cpu
@@ -35,15 +36,19 @@ V6 实现 B 版优化：输出只 clean 每行有效 payload 覆盖的 cache lin
 包含非对齐尾部所在的整条 line，跳过完全未写入的 guard line。
 4096×656 B、stride=768 B 时，输出 `dc cvac` 从 49,152 次降为 45,056 次（减少 8.3%）；
 每个 worker 仍只在全部输出 clean 指令之后执行一次 `dsb sy`。
-逐行 `memcpy`、输入 invalidate、调度和每轮校验保持原样；pthread 和 multi-block 共用此路径。
-启动日志增加 `scatter_clean=payload_cache_lines`，`KERNEL_STATUS` 应显示 `revision=6`。
+V7 在 B 版基础上实现 C 版优化：656 B 行通过十组完全展开的 64 B NEON load/store
+加一个 16 B 尾部复制，恰好读写 656 B；行长判断在每个 worker 的行循环外完成。
+其他行长保留通用 `memcpy`，输入 invalidate、B 版输出 clean、调度和每轮校验保持原样。
+pthread 和 multi-block 共用此路径；未加入 tile 融合或预取。
+启动日志显示 `scatter_clean=payload_cache_lines`，656 B 时显示 `scatter_copy=neon_656`，
+其他行长显示 `scatter_copy=libc`；`KERNEL_STATUS` 应显示 `revision=7`。
 单线程基线也应使用本版本重新测量，CSV 列和 engine 名称保持不变。
 线程调度、完成等待及缓存操作计入 scatter；创建/销毁线程、数据校验不计入。
 
 ### 实际运行核与 scatter 三段计时
 
-在 **NPU 端**增加 `--profile-scatter`，默认关闭。升级需重新编译并安装 V6 kernel，
-独立的 V6 入口可避免旧 device `.so` 静默使用旧 clean 实现。
+在 **NPU 端**增加 `--profile-scatter`，默认关闭。升级需重新编译并安装 V7 kernel，
+独立的 V7 入口可避免旧 device `.so` 静默使用旧复制实现。
 CPU 控制协议和原有 CSV 列保持不变。先启动 NPU 端：
 
 ```bash
@@ -74,7 +79,7 @@ worker 0 是 kernel 调用线程，其余是持久 pthread。
 | `first_cpu` / `last_cpu` | 首个/最后一个有效核采样；`-1` 表示无有效采样 |
 | `boundary_cpu_changes` | 同一轮开始与结束采样核不同的次数；不能捕获两次采样间迁出又迁回 |
 | `avg_invalidate_us` | 该 worker 输入区的 `dc civac` 循环和末尾 `dsb sy` |
-| `avg_memcpy_us` | 该 worker 逐行 memcpy 循环 |
+| `avg_memcpy_us` | 该 worker 逐行复制循环；656 B 为 NEON，其他行长为 memcpy |
 | `avg_clean_us` | 该 worker 输出区的 `dc cvac` 循环和末尾 `dsb sy` |
 | `avg_start_us` / `avg_finish_us` | 相对本轮 pool dispatch 的三段工作起止时间均值，可看线程启动延迟/错峰 |
 | `avg_thread_cpu_us` | 工作区间的线程 CPU 时间，有效轮次均值；包括包围三段工作的少量计时开销 |
@@ -155,12 +160,17 @@ payload 与 guard 语义不变。
 运行日志会显示 `SGL_LAYOUT=source_by_output_slot` 和
 `scatter_layout=forward`，可与旧布局的基线区分。
 
-统计逻辑和输出 clean 覆盖范围的无设备测试：
+统计逻辑、输出 clean 覆盖范围和复制正确性的无设备测试：
 
 ```bash
-cmake --build build-aicpu-cpu --target kvaf_aicpu_scatter_profile_test kvaf_aicpu_core_probe_test kvaf_aicpu_scatter_cache_test
-ctest --test-dir build-aicpu-cpu -R '^kvaf_aicpu_(scatter_profile|core_probe|scatter_cache)$' --output-on-failure
+cmake --build build-aicpu-cpu --target kvaf_aicpu_get_protocol_test kvaf_aicpu_scatter_profile_test kvaf_aicpu_core_probe_test kvaf_aicpu_scatter_cache_test kvaf_aicpu_scatter_copy_test
+ctest --test-dir build-aicpu-cpu -R '^kvaf_aicpu_(get_protocol|scatter_profile|core_probe|scatter_cache|scatter_copy)$' --output-on-failure
 ```
+
+复制测试覆盖源/目的地址全部 64 种 line 内偏移、16 B 尾部、输出 guard、重复更新、
+其他行长回退和空分片；Linux/macOS 上另用保护页检测最后一行越界读写。
+AArch64 主机运行真实 NEON；其他架构以同一展开复制逻辑模拟 16 B load/store，
+不能代替目标 AICPU 的指令执行验证。protocol 测试也使用实际的分片复制函数。
 
 ## 执行流程
 
