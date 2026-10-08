@@ -66,6 +66,7 @@ class NpuTarget {
     exported_.token_value = kTokenValue; exported_.segment_key_bytes = sizeof(segment);
     std::memcpy(exported_.segment_key, &segment, sizeof(segment));
     std::memcpy(exported_.peer_eid, segment.ubva.eid.raw, peer::kEidBytes);
+    std::memcpy(exported_.route_eid, eid_.data(), peer::kEidBytes);
     auto allocation_channel = NewChannel();
     const auto& key = allocation_channel->jetty_info().key;
     exported_.jetty_key_bytes = key.size;

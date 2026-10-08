@@ -114,6 +114,18 @@ B 的 HBM region，复用 Direct-HCCP 远端 segment 导入和双方 Jetty/CTP �
 成功行包含 `AICPU_URMA_PASS ... peer_device=npu peer_device_id=1`。
 这验证传输往返，不验证 B 侧计算核并发消费；后者还需要双方通知和 stream 同步协议。
 
+控制协议 v6 将 HBM segment 的内存 EID 与 B 端 context 的路由 EID 分开传递。
+CTP 必须使用双方选定的 context EID；WQE 和 segment 导入继续使用 provider
+导出的内存描述符。两个 EID 可能不同，不能相互覆盖。升级时需要同时重建并重启
+客户端和 HBM 服务；CPU 客户端也需要与服务端使用同一协议版本。
+
+服务端 `HBM_EXPORTED` 打印 `memory_eid` 和 `route_eid`；客户端
+`DIRECT_CTP_READY` 的 `peer_route_eid` 应与服务端的 `route_eid` 相同。
+客户端 WQE 日志仍应显示 memory EID 的反序编码。
+若首条 WRITE 返回 `cq_status=2 cq_sub_status=2`，它表示错误 CQE，不是超时；
+该子状态的硬件含义尚未确认，路由修正后仍需回读验证。若日志停在资源销毁阶段，
+`DIRECT_JETTY_DESTROY_BEGIN/END` 可用于判断哪条 Jetty 的 provider 销毁调用未返回。
+
 C++ 使用同一 Runtime API，在 `LinkTo` 前配置：
 
 ```cpp

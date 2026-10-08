@@ -295,7 +295,8 @@ int main(int argc, char** argv) {
     out.token_value = state.token_value;
     out.segment_key_bytes = state.segment_key_bytes;
     out.jetty_key_bytes = state.jetty_info.key.size;
-    std::memcpy(out.peer_eid, state.eid.data(), state.eid.size());
+    std::memcpy(out.peer_eid, exported_segment.ubva.eid.raw, kEidBytes);
+    std::memcpy(out.route_eid, state.eid.data(), state.eid.size());
     std::memcpy(out.segment_key, state.segment_key.data(), state.segment_key_bytes);
     std::memcpy(out.jetty_key, state.jetty_info.key.value, state.jetty_info.key.size);
   } else {

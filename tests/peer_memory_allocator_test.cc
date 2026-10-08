@@ -1,4 +1,6 @@
 #include "peer_memory_allocator.h"
+#include "direct_hccp/direct_hccp_session.h"
+#include "direct_hccp/direct_hccp_remote_transport.h"
 
 #include <arpa/inet.h>
 #include <poll.h>
@@ -6,18 +8,58 @@
 #include <unistd.h>
 
 #include <exception>
+#include <cstring>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
 
+// Device bootstrap/teardown are outside this Host test. The real channel
+// implementation below only uses the injected RA callbacks and PeerLink.
+extern "C" int aclrtGetDevice(std::int32_t*) { return -1; }
+namespace kvaf::direct_hccp {
+void ReleaseDirectHccpSession(DirectHccpSession*) {}
+}
+
 namespace {
 using namespace kvaf;
 using namespace kvaf::peer;
+namespace d = kvaf::direct_hccp;
 
 void Check(bool value, const char* message) {
   if (!value) throw std::runtime_error(message);
 }
+
+struct FakeRa {
+  std::uint8_t expected_route;
+  bool queried{false};
+  bool imported{false};
+
+  static int Query(void* context, d::GetTpCfg* cfg, d::TpInfo* info,
+                   std::uint32_t* count, void** request) {
+    auto& fake = *static_cast<FakeRa*>(context);
+    Check(cfg->local_eid.raw[15] == 5U && cfg->peer_eid.raw[15] == fake.expected_route,
+          "CTP query used the memory EID instead of the peer context EID");
+    fake.queried = true;
+    info->tp_handle = 11U;
+    *count = 1U;
+    *request = context;
+    return 0;
+  }
+  static int Complete(void*, int* result) { *result = 0; return 0; }
+  static int Random(d::RaInfo*, std::uint32_t* psn) { *psn = 7U; return 0; }
+  static int Import(void* context, d::QpImportInfoT* info, void** target) {
+    auto& fake = *static_cast<FakeRa*>(context);
+    const auto& cfg = info->in.ub.exp_import_cfg;
+    Check(fake.queried && cfg.tp_handle == 11U && cfg.peer_tp_handle == 12U &&
+          cfg.tx_psn == 7U && cfg.rx_psn == 6U && info->in.key.size == 1U &&
+          info->in.key.value[0] == 8U, "wrong CTP pair imported");
+    fake.imported = true;
+    info->out.ub.tpn = 42U;
+    *target = context;
+    return 0;
+  }
+};
 
 template <typename T>
 T Receive(int fd, Command command) {
@@ -126,6 +168,7 @@ void Lifecycle(DeviceKind kind) {
         response.segment_key[0] = 0xA5U;
         response.jetty_key[0] = 0xB5U;
         response.peer_eid[15] = 2U;
+        response.route_eid[15] = 0xCBU;
         Reply(fd, Command::kAllocateHbmRegion, response);
       } else {
         const auto request = Receive<AllocateRegionRequest>(fd, Command::kAllocateRegion);
@@ -192,15 +235,27 @@ void Lifecycle(DeviceKind kind) {
         descriptor.token_id == 0x12300U && descriptor.token_value == 0xABCFU &&
         descriptor.segment_key[0] == 0xA5U && descriptor.eid[15] == 2U,
         "exported descriptor lost");
-  std::array<std::uint8_t, kQpKeyBytes> local_key{}, remote_key{};
-  std::array<std::uint8_t, kEidBytes> local_eid{};
-  local_key[0] = 9U;
+  Check(descriptor.RoutingEid()[15] == (hbm ? 0xCBU : 2U) && descriptor.eid[15] == 2U,
+        "CTP routing EID must not replace the exported memory EID");
+  d::DirectMemory memory{};
+  std::array<std::uint8_t, kEidBytes> local_eid{}, memory_eid{};
+  Check(d::LoadPeerMemory(link.get(), region.base, &memory, &memory_eid) &&
+        memory_eid[15] == 2U && memory.token_id == 0x123U && memory.key[0] == 0xA5U,
+        "WQE memory descriptor changed while selecting route EID");
   local_eid[15] = 5U;
-  std::uint32_t key_bytes = 0U, psn = 0U;
-  std::uint64_t tp = 0U;
-  Check(link->CreateChannel(region.base, local_key.data(), 1U, local_eid.data(),
-                           descriptor.token_value, 11U, 7U, &remote_key, &key_bytes, &tp, &psn).ok() &&
-        key_bytes == 1U && remote_key[0] == 8U && tp == 12U && psn == 6U, "channel failed");
+  d::QpCreateInfo local_jetty{};
+  local_jetty.key.size = 1U;
+  local_jetty.key.value[0] = 9U;
+  FakeRa fake{static_cast<std::uint8_t>(hbm ? 0xCBU : 2U)};
+  d::DirectHccpApi api{};
+  api.get_tp_info_async = FakeRa::Query;
+  api.get_async_req_result = FakeRa::Complete;
+  api.get_random = FakeRa::Random;
+  api.qp_import = FakeRa::Import;
+  d::PeerChannel channel{};
+  Check(d::CreatePeerChannel({link.get(), &api, &fake, 7U, region.base, &memory,
+                             &local_eid, &memory_eid, &local_jetty, "host_test"}, &channel) &&
+        fake.imported && channel.local_import_info.out.ub.tpn == 42U, "channel failed");
   Check(!allocator.Release({region.base + 1U, region.length, region.slot_size, kind}).ok(),
         "wrong allocation released");
   Check(!allocator.Release(region).ok() && allocator.has_allocation() && link->has_region(),

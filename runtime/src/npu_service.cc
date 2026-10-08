@@ -282,6 +282,15 @@ struct NpuService::Impl {
     std::memcpy(response->segment_key, region->segment_key.data(), kSegKeyBytes);
     std::memcpy(response->jetty_key, region->jetty_key.data(), kQpKeyBytes);
     std::memcpy(response->peer_eid, exported_segment.ubva.eid.raw, kEidBytes);
+    std::memcpy(response->route_eid, device->local_eid.data(), kEidBytes);
+    std::fprintf(stderr, "[KVAF_NPU] HBM_EXPORTED session=%llu base=0x%llx bytes=%llu memory_eid=",
+                 static_cast<unsigned long long>(region->session_id),
+                 static_cast<unsigned long long>(response->hbm_base),
+                 static_cast<unsigned long long>(region->bytes));
+    for (std::uint8_t byte : region->eid) std::fprintf(stderr, "%02x", byte);
+    std::fprintf(stderr, " route_eid=");
+    for (std::uint8_t byte : device->local_eid) std::fprintf(stderr, "%02x", byte);
+    std::fprintf(stderr, "\n");
     regions.emplace(region->session_id, std::move(region));
     return Result::kOk;
   }

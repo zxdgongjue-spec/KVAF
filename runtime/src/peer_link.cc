@@ -245,7 +245,9 @@ bool AllocateHbmRegionAt(const std::string& endpoint, uint64_t hbm_bytes,
       response.hbm_bytes != hbm_bytes || response.token_id == 0U ||
       response.token_value == 0U || response.segment_key_bytes == 0U ||
       response.segment_key_bytes > kSegKeyBytes ||
-      response.jetty_key_bytes == 0U || response.jetty_key_bytes > kQpKeyBytes) {
+      response.jetty_key_bytes == 0U || response.jetty_key_bytes > kQpKeyBytes ||
+      std::all_of(response.route_eid, response.route_eid + kEidBytes,
+                  [](uint8_t byte) { return byte == 0U; })) {
     if (error != nullptr && error->empty())
       *error = "NPU service returned an invalid HBM descriptor";
     return false;
@@ -259,6 +261,7 @@ bool AllocateHbmRegionAt(const std::string& endpoint, uint64_t hbm_bytes,
   allocated.segment_key_bytes = response.segment_key_bytes;
   allocated.jetty_key_bytes = response.jetty_key_bytes;
   allocated.device_memory = true;
+  std::memcpy(allocated.route_eid.data(), response.route_eid, allocated.route_eid.size());
   std::memcpy(allocated.eid.data(), response.peer_eid, allocated.eid.size());
   std::memcpy(allocated.segment_key.data(), response.segment_key,
               allocated.segment_key.size());

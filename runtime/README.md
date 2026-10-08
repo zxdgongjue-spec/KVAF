@@ -124,7 +124,9 @@ CPU 初始化按 UB 设备名、EID index 顺序遍历本地候选，逐个尝�
 WRITE 并等待 CQ；第一组成功即选用，失败则释放本次资源后继续尝试。日志
 `LINK_ATTEMPT`、`LINK_FAILED`、`LINK_SELECTED` 记录所选路径，不进行带宽排名。
 客户端的 `--ub-device`、`--eid-index` 只筛选 CPU 本地候选。
-候选查询使用控制协议 v5，CPU 客户端与 NPU 服务端需要一起重新构建、重启。
+控制协议 v6 在 HBM 描述符中分别携带 segment 内存 EID 和 context 路由 EID；
+CTP 查询使用路由 EID，segment 导入和 WQE 保留原始内存 EID。
+CPU/NPU 客户端与服务端需要一起重新构建、重启，不能混用 v5 二进制。
 
 逐条比较 EID 链路带宽，可在 CPU 侧运行独立测试（`./build.sh cpu` 会构建该程序）：
 

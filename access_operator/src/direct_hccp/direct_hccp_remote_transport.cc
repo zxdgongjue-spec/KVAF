@@ -115,8 +115,12 @@ bool GetPeerCtp(const DirectHccpApi& api, void* context,
   }
   *tp_handle = info.tp_handle;
   std::fprintf(stderr,
-               "[KVAF_AIV] DIRECT_CTP_READY role=%s mode=hdc_async tp_handle=0x%llx\n",
+               "[KVAF_AIV] DIRECT_CTP_READY role=%s mode=hdc_async tp_handle=0x%llx local_eid=",
                role, static_cast<unsigned long long>(*tp_handle));
+  for (std::uint8_t byte : local_eid) std::fprintf(stderr, "%02x", byte);
+  std::fprintf(stderr, " peer_route_eid=");
+  for (std::uint8_t byte : peer_eid) std::fprintf(stderr, "%02x", byte);
+  std::fprintf(stderr, "\n");
   return true;
 }
 
@@ -212,7 +216,13 @@ void ReleaseDeviceAivTransport(const DeviceAivTransportResources& resources) {
     for (std::uint32_t index = 0U; index < resources.worker_count; ++index) {
       DeviceAivWorkerResources& worker = resources.workers[index];
       if (worker.device_user_ctl_jetty.handle != nullptr) {
-        (void)api.qp_destroy(worker.device_user_ctl_jetty.handle);
+        std::fprintf(stderr,
+                     "[KVAF_AIV] DIRECT_JETTY_DESTROY_BEGIN worker=%u jetty_id=%u\n",
+                     index, worker.device_user_ctl_jetty.info.ub.id);
+        const int rc = api.qp_destroy(worker.device_user_ctl_jetty.handle);
+        std::fprintf(stderr,
+                     "[KVAF_AIV] DIRECT_JETTY_DESTROY_END worker=%u jetty_id=%u rc=%d\n",
+                     index, worker.device_user_ctl_jetty.info.ub.id, rc);
       }
     }
   }
@@ -410,9 +420,13 @@ bool CreatePeerChannel(const PeerChannelRequest& request,
     return false;
   }
   *channel = {};
+  PeerRegion region{};
+  if (!request.link->LookupRegion(request.peer_base, &region).ok()) return false;
   std::uint64_t local_tp_handle = 0U;
+  // CTP addresses the peer context, while WQE/RmemImport address its exported
+  // memory segment. NPU HBM can have a different EID from its context.
   if (!GetPeerCtp(*request.api, request.device_context, *request.local_eid,
-                  *request.peer_eid, request.role, &local_tp_handle)) {
+                  region.RoutingEid(), request.role, &local_tp_handle)) {
     return false;
   }
   const std::uint32_t local_psn =

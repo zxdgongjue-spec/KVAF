@@ -75,6 +75,7 @@ kvaf::peer::PeerRegion Configure(const Options& options, std::uint32_t npu_candi
   region.segment_key_bytes = reply.segment_key_bytes;
   region.jetty_key_bytes = reply.jetty_key_bytes;
   std::memcpy(region.eid.data(), reply.peer_eid, sizeof(reply.peer_eid));
+  std::memcpy(region.route_eid.data(), reply.route_eid, sizeof(reply.route_eid));
   std::memcpy(region.segment_key.data(), reply.segment_key, sizeof(reply.segment_key));
   std::memcpy(region.jetty_key.data(), reply.jetty_key, sizeof(reply.jetty_key));
   return region;

@@ -25,6 +25,11 @@ struct PeerRegion {
   uint32_t jetty_key_bytes = 0U;
   std::array<uint8_t, kQpKeyBytes> jetty_key{};
   bool device_memory = false;
+  std::array<uint8_t, kEidBytes> route_eid{};
+
+  const std::array<uint8_t, kEidBytes>& RoutingEid() const {
+    return device_memory ? route_eid : eid;
+  }
 };
 
 struct GatherReady {
