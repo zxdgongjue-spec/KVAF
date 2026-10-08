@@ -36,6 +36,8 @@ struct Options {
   std::string put_kernel{KernelObject("kvaf_execute_batch_put_kernels.o")};
   std::string get_kernel{KernelObject("kvaf_execute_batch_get_kernels.o")};
   std::uint32_t device_id{0U};
+  std::string peer_device{"cpu"};
+  std::uint32_t peer_device_id{0U};
   std::uint32_t blocks{1U};
   std::uint32_t block_bytes{4096U};
   std::uint32_t token_bytes{256U};
@@ -55,18 +57,23 @@ inline bool ParseNumber(const char* text, std::uint32_t* value) {
 inline bool Parse(int argc, const char* const* argv, Options* options) {
   if (argc < 1 || argv == nullptr || options == nullptr) return false;
   Options parsed = *options;
+  bool peer_device_id_set = false;
   for (int index = 1; index < argc; index += 2) {
     if (index + 1 >= argc) return false;
     const std::string flag = argv[index];
     const char* value = argv[index + 1];
     if (flag == "--peer") parsed.peer = value;
+    else if (flag == "--peer-device") parsed.peer_device = value;
     else if (flag == "--put-kernel") parsed.put_kernel = value;
     else if (flag == "--get-kernel") parsed.get_kernel = value;
     else {
       std::uint32_t number = 0U;
       if (!ParseNumber(value, &number)) return false;
       if (flag == "--device-id") parsed.device_id = number;
-      else if (flag == "--blocks") parsed.blocks = number;
+      else if (flag == "--peer-device-id") {
+        parsed.peer_device_id = number;
+        peer_device_id_set = true;
+      } else if (flag == "--blocks") parsed.blocks = number;
       else if (flag == "--block-bytes") parsed.block_bytes = number;
       else if (flag == "--token-bytes") parsed.token_bytes = number;
       else if (flag == "--iterations") parsed.iterations = number;
@@ -74,6 +81,9 @@ inline bool Parse(int argc, const char* const* argv, Options* options) {
     }
   }
   if (parsed.peer.empty() || parsed.put_kernel.empty() || parsed.get_kernel.empty() ||
+      (parsed.peer_device != "cpu" && parsed.peer_device != "npu") ||
+      (peer_device_id_set && parsed.peer_device != "npu") ||
+      parsed.peer_device_id > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
       parsed.device_id > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
       parsed.blocks == 0U || parsed.block_bytes == 0U || parsed.token_bytes == 0U ||
       parsed.iterations == 0U || parsed.block_bytes % parsed.token_bytes != 0U ||

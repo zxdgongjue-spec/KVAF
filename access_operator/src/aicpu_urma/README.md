@@ -144,6 +144,35 @@ HBM 服务现在与独立 HBM 测试端一致，导出 `RaCtxLmemRegister` 返�
 客户端日志若暂时停在 Jetty 销毁，而同一次运行的服务端随后出现旧 session 释放和
 下一 session 建链，说明候选扫描已有后续进展，应收集到客户端最终退出的完整日志。
 
+若三处远端 token 一致，实际 WQE 的地址、长度、token、TP ID 与 Host 描述符也一致，
+但仍返回 `2/2`，这些日志只能排除相应字段传递不一致，不能证明硬件认可 WQE，
+也不能排除 SQ/门铃缓存可见性问题。使用原生 AIV 客户端做同一 NPU peer 的对照：
+
+```bash
+./build.sh aiv-native --build-dir build-aiv-native
+KVAF_AIV_VERBOSE_DIRECT_HCCP=1 \\
+  build-aiv-native/tests/kvaf_aiv_batch_roundtrip \\
+  --peer 127.0.0.1:29888 --device-id 7 \\
+  --peer-device npu --peer-device-id 6 \\
+  --blocks 1 --block-bytes 64 --token-bytes 64 --iterations 1
+
+KVAF_AIV_VERBOSE_DIRECT_HCCP=1 \\
+  build-aicpu-urma/tests/kvaf_aicpu_urma_client \\
+  --peer 127.0.0.1:29888 --device-id 7 \\
+  --peer-device npu --peer-device-id 6 \\
+  --blocks 1 --block-bytes 64 --token-bytes 64 --warmup 0 --iterations 1
+```
+
+目标端继续运行 NPU 6 的 `kvaf_npu_service`。两种客户端分别分配 HBM session、
+遍历 EID 候选，比较时以日志中的同一对本地/远端 EID 为准，不能只比较最终退出码。
+AIV 不经过 AICPU 初始化 WRITE 探针；上述 64 字节配置使其正式 WRITE 大小与
+AICPU 探针一致。AIV 成功而 AICPU 失败时优先检查提交和缓存路径；两者均失败时
+检查共享传输配置及平台错误信息。成功标志分别是 `AIV_BATCH_ROUNDTRIP_PASS` 和
+`AICPU_URMA_PASS`。
+
+Get/Put Host 共享库的内部 helper 已使用内部链接，避免 ELF 同名符号互相覆盖。
+更新后需要重新构建 Host 客户端；仅安装设备内核不会更新这些共享库。
+
 C++ 使用同一 Runtime API，在 `LinkTo` 前配置：
 
 ```cpp

@@ -82,6 +82,9 @@ struct KvafBatchPutTransport {
   hccp::PeerLink *peer_link{nullptr};
 };
 
+// Keep helper symbols private: Get and Put are loaded into the same process.
+namespace {
+
 std::string EidToHex(const std::array<uint8_t, hccp::kEidBytes> &eid) {
   static constexpr char kHex[] = "0123456789abcdef";
   std::string result;
@@ -413,6 +416,8 @@ failed:
   ReleaseTransport(state);
   return result;
 }
+
+}  // namespace
 
 extern "C" int32_t KvafBatchPutTransportCreateWithPeerLink(
     void *host_ddr, uint64_t host_ddr_bytes, uint32_t aiv_core_count,

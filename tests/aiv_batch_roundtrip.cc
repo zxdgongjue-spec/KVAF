@@ -165,7 +165,8 @@ struct Region {
   explicit Region(kvaf::peer::PeerLink& link) : link(link) {}
   ~Region() {
     if (value.base != 0U) {
-      const kvaf::Status status = link.ReleaseRegion(value.base);
+      const kvaf::Status status = value.device_memory
+          ? link.ReleaseHbmRegion(value.session_id) : link.ReleaseRegion(value.base);
       if (!status.ok()) std::fprintf(stderr, "[KVAF_AIV_TEST] RELEASE_FAILED reason=%s\n", status.message().c_str());
     }
   }
@@ -208,8 +209,10 @@ bool Attempt(kvaf::peer::PeerLink& link, std::uint32_t peer_candidate,
              const std::array<std::uint8_t, kvaf::peer::kEidBytes>& local_eid,
              const Options& options, Buffers& buffers, aclrtStream stream) {
   Region region(link);
-  const kvaf::Status allocated = link.AllocateRegion(buffers.payload_bytes, options.block_bytes,
-                                                      peer_candidate, &region.value);
+  const kvaf::Status allocated = options.peer_device == "npu"
+      ? link.AllocateHbmRegion(buffers.payload_bytes, options.block_bytes,
+                               options.peer_device_id, peer_candidate, &region.value)
+      : link.AllocateRegion(buffers.payload_bytes, options.block_bytes, peer_candidate, &region.value);
   if (!allocated.ok()) {
     std::fprintf(stderr, "[KVAF_AIV_TEST] ALLOCATE_FAILED reason=%s\n", allocated.message().c_str());
     return false;
@@ -340,7 +343,13 @@ int Run(const Options& options) {
   RequireResult(KvafExecuteBatchGetLoadKernel(options.get_kernel.c_str()), "load AIV BatchGet kernel");
   kvaf::peer::PeerLink link(options.peer);
   std::uint32_t peer_count = 0U;
-  RequireStatus(link.GetCandidateCount(&peer_count), "CPU candidate discovery");
+  if (options.peer_device == "npu") {
+    std::vector<std::array<std::uint8_t, kvaf::peer::kEidBytes>> candidates;
+    RequireStatus(link.GetHbmEidCandidates(options.peer_device_id, &candidates), "NPU candidate discovery");
+    peer_count = static_cast<std::uint32_t>(candidates.size());
+  } else {
+    RequireStatus(link.GetCandidateCount(&peer_count), "CPU candidate discovery");
+  }
   Buffers buffers(options);
   for (std::uint32_t peer_candidate = 0U; peer_candidate < peer_count; ++peer_candidate) {
     for (std::size_t npu_candidate = 0U; npu_candidate < local_eids.size(); ++npu_candidate) {
@@ -350,24 +359,27 @@ int Run(const Options& options) {
                    EidHex(local_eids[npu_candidate]).c_str());
       if (Attempt(link, peer_candidate, local_eids[npu_candidate], options, buffers, acl.stream)) {
         std::printf("AIV_BATCH_ROUNDTRIP_PASS device=%u peer_candidate=%u npu_candidate=%zu "
-                    "blocks=%u block_bytes=%u token_bytes=%u iterations=%u\n",
+                    "blocks=%u block_bytes=%u token_bytes=%u iterations=%u peer_device=%s peer_device_id=%u\n",
                     options.device_id, peer_candidate, npu_candidate, options.blocks,
-                    options.block_bytes, options.token_bytes, options.iterations);
+                    options.block_bytes, options.token_bytes, options.iterations,
+                    options.peer_device.c_str(), options.peer_device_id);
         return 0;
       }
     }
   }
-  std::fprintf(stderr, "[KVAF_AIV_TEST] FAIL no CPU/NPU EID pair passed Put and Get\n");
+  std::fprintf(stderr, "[KVAF_AIV_TEST] FAIL no peer/local NPU EID pair passed Put and Get\n");
   return 1;
 }
 
 void Usage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s [--device-id N] [--peer HOST:PORT] [--blocks N] "
+               "[--peer-device cpu|npu] [--peer-device-id N] "
                "[--block-bytes N] [--token-bytes N] [--iterations N] "
                "[--put-kernel PATH] [--get-kernel PATH]\n"
                "Defaults: device=0 peer=127.0.0.1:28999 blocks=1 block-bytes=4096 "
-               "token-bytes=256 iterations=1. CPU and NPU EIDs are discovered automatically.\n",
+               "token-bytes=256 iterations=1 peer-device=cpu peer-device-id=0. "
+               "Local and peer EIDs are discovered automatically.\n",
                program);
 }
 

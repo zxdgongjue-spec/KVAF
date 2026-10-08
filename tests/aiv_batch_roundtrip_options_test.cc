@@ -27,6 +27,16 @@ int main() {
   assert(kvaf::aiv_batch_roundtrip::Parse(sizeof(valid) / sizeof(valid[0]), valid, &options));
   assert(options.device_id == 1U && options.blocks == 4U && options.token_bytes == 512U);
   assert(options.iterations == 3U && options.peer == "host:28999");
+  constexpr const char* npu[] = {"client", "--device-id", "7", "--peer-device", "npu",
+                                "--peer-device-id", "6", "--blocks", "1",
+                                "--block-bytes", "64", "--token-bytes", "64"};
+  assert(kvaf::aiv_batch_roundtrip::Parse(sizeof(npu) / sizeof(npu[0]), npu, &options));
+  assert(options.device_id == 7U && options.peer_device == "npu" && options.peer_device_id == 6U);
+  assert(options.block_bytes == 64U && options.token_bytes == 64U);
+  constexpr const char* wrong_peer[] = {"client", "--peer-device", "gpu"};
+  constexpr const char* unused_id[] = {"client", "--peer-device-id", "6"};
+  constexpr const char* bad_id[] = {"client", "--peer-device", "npu", "--peer-device-id", "2147483648"};
+  assert(!Accepts(wrong_peer) && !Accepts(unused_id) && !Accepts(bad_id));
 
   constexpr const char* missing[] = {"client", "--device-id"};
   constexpr const char* negative[] = {"client", "--device-id", "-1"};
