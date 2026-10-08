@@ -177,6 +177,20 @@ void LogBatchPutDeviceStatus(const BatchPutExecutionState& execution,
                    static_cast<unsigned long long>(status.sq_producer_index),
                    static_cast<unsigned long long>(status.cq_consumer_index),
                    static_cast<unsigned long long>(status.last_wqe_protocol));
+      if (status.reserved[KVAF_PUT_DIAG_MAGIC] == KVAF_AICPU_BATCH_PUT_DIAGNOSTIC_MAGIC) {
+        std::fprintf(stderr, "[KVAF_AICPU_URMA] PUT_ERROR_SNAPSHOT core=%u batch_wqes=%llu\n",
+                     core, static_cast<unsigned long long>(status.reserved[KVAF_PUT_DIAG_BATCH_COUNT]));
+        for (const auto& item : {std::pair<const char*, int>{"FIRST_WQE", KVAF_PUT_DIAG_FIRST_WQE},
+                                 {"LAST_WQE", KVAF_PUT_DIAG_LAST_WQE},
+                                 {"CQE", KVAF_PUT_DIAG_CQE}}) {
+          std::uint32_t words[16]{};
+          const std::size_t count = item.second == KVAF_PUT_DIAG_CQE ? 8U : 16U;
+          std::memcpy(words, &status.reserved[item.second], count * sizeof(words[0]));
+          std::fprintf(stderr, "[KVAF_AICPU_URMA] PUT_ERROR_%s core=%u words=", item.first, core);
+          for (std::size_t i = 0; i < count; ++i) std::fprintf(stderr, "%s%08x", i == 0 ? "" : ",", words[i]);
+          std::fprintf(stderr, "\n");
+        }
+      }
     } else {
       std::fprintf(stderr,
                    "[KVAF_AIV] BATCH_PUT_DEVICE_ERROR core=%u magic=0x%llx "

@@ -126,6 +126,24 @@ CTP 必须使用双方选定的 context EID；WQE 和 segment 导入继续使用
 该子状态的硬件含义尚未确认，路由修正后仍需回读验证。若日志停在资源销毁阶段，
 `DIRECT_JETTY_DESTROY_BEGIN/END` 可用于判断哪条 Jetty 的 provider 销毁调用未返回。
 
+若路由 EID 已对齐，第一条 WRITE 仍返回 `2/2`，继续检查内存注册和 WQE。
+HBM 服务现在与独立 HBM 测试端一致，导出 `RaCtxLmemRegister` 返回的 token ID，
+而不是注册前 `RaCtxTokenIdAlloc` 的返回值。`HBM_TOKEN` 同时打印
+`allocated_raw`、`registered_raw`、`segment_raw`、`exported_raw` 和右移 8 位后的
+`wqe_token`。三个 raw token 是否一致需要实机日志确认；若一致，单独修正导出来源
+不会改变本次 WQE 的 token 值，也不能据此宣称已解决 CQ 错误。
+
+设置 `KVAF_AIV_VERBOSE_DIRECT_HCCP=1` 后，发起端的 `DIRECT_MEMORY_TOKEN` 打印本地
+源 HBM 的分配、注册及实际使用的 token。AICPU WRITE 收到错误 CQE 时还会保存
+并输出 `PUT_ERROR_FIRST_WQE` / `PUT_ERROR_LAST_WQE` 的 16 个原始 32 位字，
+以及 `PUT_ERROR_CQE` 的前 8 个字。它们是实际 SQ/CQ 内容，不是 Host 重建值。
+多 WQE 批次的首尾记录不一定就是具体出错的 WQE；初始化探针只提交一条 WQE，
+此时两份记录应完全相同。诊断使用状态结构的保留空间，不改变其大小。
+更新该诊断必须执行 `./build.sh aicpu-urma --install-kernel` 并重启客户端。
+
+客户端日志若暂时停在 Jetty 销毁，而同一次运行的服务端随后出现旧 session 释放和
+下一 session 建链，说明候选扫描已有后续进展，应收集到客户端最终退出的完整日志。
+
 C++ 使用同一 Runtime API，在 `LinkTo` 前配置：
 
 ```cpp

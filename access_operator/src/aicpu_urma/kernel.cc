@@ -503,6 +503,20 @@ std::uint32_t KvafAicpuUrmaBatchPut(KvafExecuteBatchPutLaunchArgs* args) {
         status.cq_status = (cqe_word >> 24U) & 0xffU;
         status.cq_sub_status = (cqe_word >> 16U) & 0xffU;
         status.reserved[0] = cqe_word;
+        // Retain the actual SQ entries and the CQE that ended this batch.
+        // For a multi-WQE batch these are its endpoints, not necessarily the
+        // individual WQE that failed. The initialization probe posts one WQE.
+        status.reserved[KVAF_PUT_DIAG_MAGIC] = KVAF_AICPU_BATCH_PUT_DIAGNOSTIC_MAGIC;
+        status.reserved[KVAF_PUT_DIAG_BATCH_COUNT] = count;
+        const auto first = (queue.sq_producer_index - count) % entity.sq_depth;
+        const auto last = (queue.sq_producer_index - 1U) % entity.sq_depth;
+        const auto cq_slot = (queue.cq_consumer_index - 1U) % entity.cq_depth;
+        std::memcpy(&status.reserved[KVAF_PUT_DIAG_FIRST_WQE],
+                    reinterpret_cast<const void*>(entity.sq_va + first * 64U), 64U);
+        std::memcpy(&status.reserved[KVAF_PUT_DIAG_LAST_WQE],
+                    reinterpret_cast<const void*>(entity.sq_va + last * 64U), 64U);
+        std::memcpy(&status.reserved[KVAF_PUT_DIAG_CQE],
+                    reinterpret_cast<const void*>(entity.cq_va + cq_slot * entity.cqe_size), 32U);
       }
       if (status.result != 0U) break;
     }

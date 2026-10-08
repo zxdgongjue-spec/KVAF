@@ -184,6 +184,11 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
   memory->key_bytes = info.out.key.size;
   std::memcpy(memory->key, info.out.key.value, memory->key_bytes);
   hccp::VerboseLog(
+      "[KVAF_AIV] DIRECT_MEMORY_TOKEN role=%s allocated_wqe=0x%x registered_raw=0x%x "
+      "registered_wqe=0x%x used_wqe=0x%x key_bytes=%u\n",
+      role, token_id, info.out.ub.token_id, info.out.ub.token_id >> kTokenIdShift,
+      memory->token_id, info.out.key.size);
+  hccp::VerboseLog(
       "[KVAF_AIV] DIRECT_MEMORY_REGISTERED role=%s token_id=0x%x host_or_hbm_va=0x%llx bytes=%llu\n",
       role, memory->token_id, static_cast<unsigned long long>(aligned_address),
       static_cast<unsigned long long>(aligned_bytes));

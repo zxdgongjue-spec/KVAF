@@ -5,6 +5,7 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 
 extern "C" std::uint32_t KvafAicpuUrmaBatchPut(KvafExecuteBatchPutLaunchArgs* args);
@@ -94,6 +95,11 @@ void Put() {
          status.result == KVAF_BATCH_PUT_CORE_CQ_ERROR &&
          status.cq_status == 3U && status.cq_sub_status == 5U &&
          status.reserved[0] == cq[0] && status.last_wqe_protocol == 0x303e0000U);
+  assert(status.reserved[KVAF_PUT_DIAG_MAGIC] == KVAF_AICPU_BATCH_PUT_DIAGNOSTIC_MAGIC);
+  assert(status.reserved[KVAF_PUT_DIAG_BATCH_COUNT] == 32U);
+  assert(std::memcmp(&status.reserved[KVAF_PUT_DIAG_FIRST_WQE], sq.data(), 64U) == 0);
+  assert(std::memcmp(&status.reserved[KVAF_PUT_DIAG_LAST_WQE], sq.data() + 31U * 16U, 64U) == 0);
+  assert(std::memcmp(&status.reserved[KVAF_PUT_DIAG_CQE], cq.data(), 32U) == 0);
   queue = {};
   cq[0] = 4U;
   cq[8] = (7U << 24U) | (9U << 16U) | 4U;
@@ -102,6 +108,11 @@ void Put() {
          status.processed_request_count == 32U &&
          status.cq_status == 7U && status.cq_sub_status == 9U &&
          status.reserved[0] == cq[8]);
+  assert(status.reserved[KVAF_PUT_DIAG_BATCH_COUNT] == 1U);
+  assert(std::memcmp(&status.reserved[KVAF_PUT_DIAG_FIRST_WQE], sq.data() + 32U * 16U, 64U) == 0);
+  assert(std::memcmp(&status.reserved[KVAF_PUT_DIAG_FIRST_WQE],
+                     &status.reserved[KVAF_PUT_DIAG_LAST_WQE], 64U) == 0);
+  assert(std::memcmp(&status.reserved[KVAF_PUT_DIAG_CQE], cq.data() + 8U, 32U) == 0);
   queue = {};
   queue.magic = 0x4b564151U;
   queue.initialized = 1U;
@@ -109,6 +120,7 @@ void Put() {
   cq[8] = 4U;
   assert(KvafAicpuUrmaBatchPut(&args) == 0U && status.result == 0U);
   assert(status.last_wqe_protocol == 0xb03e0000U);
+  assert(status.reserved[KVAF_PUT_DIAG_MAGIC] == 0U);
   assert(sq[0] == 0xb0150000U && sq[32 * 16] == 0xb03e0000U);
 }
 

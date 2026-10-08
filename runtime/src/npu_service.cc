@@ -229,7 +229,6 @@ struct NpuService::Impl {
       Release(region.get());
       return Result::kResourceError;
     }
-    region->token_id = token_id.token_id;
     direct_hccp::MrRegInfo reg{};
     reg.in.mem.addr = reinterpret_cast<std::uint64_t>(region->memory);
     reg.in.mem.size = request.hbm_bytes;
@@ -242,11 +241,27 @@ struct NpuService::Impl {
       Release(region.get());
       return Result::kResourceError;
     }
+    // Export the registered memory token, as in the standalone HBM targets.
+    // The token allocated before registration is a resource handle input;
+    // hand-written remote WQEs must use the registration result.
+    if (reg.out.ub.token_id == 0U || reg.out.key.size < sizeof(urma_seg_t) ||
+        reg.out.key.size > kSegKeyBytes) {
+      std::fprintf(stderr, "[KVAF_NPU] HBM_REGISTER_INVALID token=0x%x key_bytes=%u\n",
+                   reg.out.ub.token_id, reg.out.key.size);
+      Release(region.get());
+      return Result::kResourceError;
+    }
+    region->token_id = reg.out.ub.token_id;
     region->token_value = reg.in.ub.token_value;
     region->segment_key_bytes = sizeof(urma_seg_t);
     std::memcpy(region->segment_key.data(), reg.out.key.value, region->segment_key_bytes);
     urma_seg_t exported_segment{};
     std::memcpy(&exported_segment, reg.out.key.value, sizeof(exported_segment));
+    std::fprintf(stderr,
+                 "[KVAF_NPU] HBM_TOKEN allocated_raw=0x%x registered_raw=0x%x "
+                 "segment_raw=0x%x exported_raw=0x%x wqe_token=0x%x key_bytes=%u\n",
+                 token_id.token_id, reg.out.ub.token_id, exported_segment.token_id,
+                 region->token_id, region->token_id >> 8U, reg.out.key.size);
     std::memcpy(region->eid.data(), exported_segment.ubva.eid.raw, region->eid.size());
 
     // AllocateHbmRegion's protocol includes a live Jetty key. Actual channel

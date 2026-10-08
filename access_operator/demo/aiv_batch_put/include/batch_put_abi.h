@@ -10,6 +10,15 @@ enum {
 };
 
 static const uint64_t KVAF_AIV_BATCH_PUT_STATUS_MAGIC = 0x4b5641464250444fULL;
+// AICPU-only error snapshot in reserved[]. Existing status size is unchanged.
+static const uint64_t KVAF_AICPU_BATCH_PUT_DIAGNOSTIC_MAGIC = 0x4b56414644494147ULL;
+enum {
+  KVAF_PUT_DIAG_MAGIC = 1,
+  KVAF_PUT_DIAG_BATCH_COUNT = 2,
+  KVAF_PUT_DIAG_FIRST_WQE = 4,  // 64 bytes
+  KVAF_PUT_DIAG_LAST_WQE = 12,  // 64 bytes
+  KVAF_PUT_DIAG_CQE = 20,      // first 32 bytes
+};
 
 enum KvafBatchPutCoreResult {
   KVAF_BATCH_PUT_CORE_SUCCESS = 0,
