@@ -135,7 +135,7 @@ int main() {
   std::fclose(worker_output);
   assert(worker_report.find("worker=1 start_avg=2.000 start_p50=2.000 start_p95=2.900 end_avg=6.000") !=
          std::string::npos);
-  assert(worker_report.find("duration_avg=4.000 read_wqes=2.00 sq_copies=1.00 sq_wqebbs=6.00 read_tasks=2.00") !=
+  assert(worker_report.find("duration_avg=4.000 read_wqes=2.00 sq_write_ranges=1.00 sq_wqebbs=6.00 read_tasks=2.00") !=
          std::string::npos);
   assert(worker_report.find("not physical CPU IDs") != std::string::npos);
   bool rejected = false;

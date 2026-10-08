@@ -1,11 +1,71 @@
 #include "aicpu_urma/wqe.h"
 
 #include <cassert>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 
+void TestWqebbCopy() {
+  constexpr std::uint32_t max_blocks = 192U;
+  alignas(64) std::array<std::uint8_t, (max_blocks + 2U) * 64U> source{};
+  alignas(64) std::array<std::uint8_t, (max_blocks + 2U) * 64U> destination{};
+  for (std::size_t index = 0U; index < source.size(); ++index)
+    source[index] = static_cast<std::uint8_t>((index * 37U + index / 64U) & 0xffU);
+  const auto original = source;
+  for (std::uint32_t blocks = 0U; blocks <= max_blocks; ++blocks) {
+    destination.fill(0xa5U);
+    kvaf::aicpu_urma::CopyWqebbs(destination.data() + 64U, source.data() + 64U, blocks);
+    assert(std::memcmp(destination.data() + 64U, source.data() + 64U, blocks * 64U) == 0);
+    for (std::size_t index = 0U; index < 64U; ++index) assert(destination[index] == 0xa5U);
+    for (std::size_t index = (blocks + 1U) * 64U; index < destination.size(); ++index)
+      assert(destination[index] == 0xa5U);
+    assert(source == original);
+  }
+}
+
+void TestScatterHeaderReuse() {
+  kvaf::aicpu_urma::Endpoint endpoint{0xff123456U, 0xff012345U, 0xdeadbeefU, {}};
+  for (std::uint8_t index = 0U; index < 16U; ++index) endpoint.remote_eid[index] = index + 17U;
+  const auto header = kvaf::aicpu_urma::PrepareScatterReadHeader(endpoint);
+  constexpr std::uint32_t word_counts[]{0U, 16U, 32U, 32U, 32U, 32U, 48U};
+  kvaf::aicpu_urma::ScatterTransfer transfer;
+  std::memset(&transfer, 0xa5, sizeof(transfer));
+  for (std::uint32_t sges = 6U; sges != 0U; --sges) {
+    transfer.sge_count = sges;
+    transfer.remote_address = 0x1122334455660000ULL + sges;
+    for (std::uint32_t index = 0U; index < sges; ++index)
+      transfer.sges[index] = {0x9988776655440000ULL + index * 16U, index + 13U, index + 23U};
+    for (std::uint32_t owner = 0U; owner < 2U; ++owner) {
+      for (const bool completion : {false, true}) {
+        std::array<std::uint32_t, 50> encoded;
+        encoded.fill(0xfeedfaceU);
+        auto* words = encoded.data() + 1U;
+        kvaf::aicpu_urma::EncodeScatterReadWqe(words, header, transfer, owner, completion);
+        assert(words[0] == ((completion ? 0x303e0000U : 0x30150000U) | (owner << 31U)));
+        assert(words[1] == 0x600U && words[2] == (0x00123456U | sges << 24U));
+        assert(words[3] == 0x00012345U && words[8] == 0xdeadbeefU && words[9] == 0U);
+        assert(std::memcmp(words + 4U, endpoint.remote_eid, 16U) == 0);
+        assert(words[10] == 0x55660000U + sges && words[11] == 0x11223344U);
+        for (std::uint32_t index = 0U; index < sges; ++index) {
+          assert(words[12U + index * 4U] == index + 13U);
+          assert(words[13U + index * 4U] == index + 23U);
+          assert(words[14U + index * 4U] == 0x55440000U + index * 16U);
+          assert(words[15U + index * 4U] == 0x99887766U);
+        }
+        for (std::uint32_t index = 12U + sges * 4U; index < word_counts[sges]; ++index)
+          assert(words[index] == 0U);
+        assert(encoded.front() == 0xfeedfaceU);
+        for (std::uint32_t index = word_counts[sges] + 1U; index < encoded.size(); ++index)
+          assert(encoded[index] == 0xfeedfaceU);
+      }
+    }
+  }
+}
+
 int main() {
+  TestWqebbCopy();
+  TestScatterHeaderReuse();
   kvaf::aicpu_urma::Endpoint endpoint{};
   endpoint.tp_id = 0x12345678U;
   endpoint.remote_token_id = 0xf1234567U;

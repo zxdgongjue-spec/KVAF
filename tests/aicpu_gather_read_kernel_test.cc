@@ -310,7 +310,8 @@ void TestUrmaDescriptorGather() {
 
 void TestScatterStagingBoundary(std::uint32_t sq_batch_wqes,
                                 std::uint32_t span_count = 25U,
-                                std::uint32_t sgl_size = 1U, bool detailed = false) {
+                                std::uint32_t sgl_size = 1U, bool detailed = false,
+                                std::uint32_t sq_depth = 256U) {
   alignas(64) std::array<std::uint8_t, 1024> remote{};
   std::array<std::uint8_t, 1024> output{};
   output.fill(0xa5U);
@@ -321,7 +322,7 @@ void TestScatterStagingBoundary(std::uint32_t sq_batch_wqes,
     remote[128U + index] = static_cast<std::uint8_t>(index + 1U);
     targets[index] = {index * 2U, 1U, 0U};
   }
-  std::uint32_t sq_doorbell = 252U;
+  std::uint32_t sq_doorbell = sq_depth - 4U;
   std::uint32_t cq_doorbell = 0U;
   const auto base = reinterpret_cast<std::uint64_t>(remote.data());
   KvafBatchGetDirectUrmaEntity entity{};
@@ -336,7 +337,7 @@ void TestScatterStagingBoundary(std::uint32_t sq_batch_wqes,
   entity.local_token_id = 7U;
   entity.sq_va = reinterpret_cast<std::uint64_t>(sq.data());
   entity.sq_db_va = reinterpret_cast<std::uint64_t>(&sq_doorbell);
-  entity.sq_depth = 256U;
+  entity.sq_depth = sq_depth;
   entity.wqe_size = 64U;
   entity.cq_va = reinterpret_cast<std::uint64_t>(cq.data());
   entity.cq_db_va = reinterpret_cast<std::uint64_t>(&cq_doorbell);
@@ -346,7 +347,7 @@ void TestScatterStagingBoundary(std::uint32_t sq_batch_wqes,
   KvafBatchGetQueueState queue{};
   queue.magic = 0x4b564151U;
   queue.initialized = 1U;
-  queue.sq_producer_index = 252U;
+  queue.sq_producer_index = sq_depth - 4U;
   kvaf::aicpu_urma::GatherReadStatus status{};
   kvaf::aicpu_urma::GatherReadArgs args{};
   args.channel_entity = reinterpret_cast<std::uint64_t>(&entity);
@@ -369,11 +370,11 @@ void TestScatterStagingBoundary(std::uint32_t sq_batch_wqes,
   std::uint32_t expected_blocks = 0U;
   for (std::uint32_t index = 0U; index < span_count; index += sgl_size)
     expected_blocks += kvaf::aicpu_urma::ScatterWqebbs(std::min(sgl_size, span_count - index));
-  const auto expected_producer = 255U + expected_blocks;
+  const auto expected_producer = sq_depth - 1U + expected_blocks;
 
   std::atomic<bool> stopped{false};
   std::thread hardware([&] {
-    std::uint32_t producer = 252U;
+    std::uint32_t producer = sq_depth - 4U;
     std::uint32_t completion = 0U;
     while (producer < expected_producer && !stopped.load(std::memory_order_acquire)) {
       if (__atomic_load_n(&sq_doorbell, __ATOMIC_ACQUIRE) == producer) {
@@ -528,6 +529,8 @@ void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count,
         for (std::uint32_t block = 0U; block < blocks; ++block)
           std::memcpy(words.data() + block * 16U,
                       sq[worker].data() + ((producer + block) % depth) * 16U, 64U);
+        assert((words[0] >> 31U) == ((producer / depth) & 1U));
+        assert(words[9] == 0U);
         if (opcode == kvaf::aicpu_urma::kWriteOpcode) {
           assert(worker == 0U && address(words[10], words[11]) == args.remote_descriptor);
           std::memcpy(reinterpret_cast<void*>(args.remote_descriptor),
@@ -741,6 +744,7 @@ int main() {
   TestScatterStagingBoundary(16U, 384U, 6U);
   TestScatterStagingBoundary(32U, 384U, 6U);
   TestScatterStagingBoundary(64U, 384U, 6U, true);
+  TestScatterStagingBoundary(8U, 384U, 6U, true, 193U);
   for (std::uint32_t workers = 2U; workers <= 8U; ++workers)
     TestParallelScatter(workers, 41U);
   TestParallelScatter(5U, 3U);

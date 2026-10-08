@@ -53,6 +53,44 @@ struct Endpoint {
   std::uint8_t remote_eid[16];
 };
 
+struct ScatterReadHeader {
+  std::uint32_t words[10];
+};
+
+inline ScatterReadHeader PrepareScatterReadHeader(const Endpoint& endpoint) {
+  ScatterReadHeader header{};
+  header.words[1] = kReadOpcode << 8U;
+  header.words[2] = endpoint.tp_id & 0x00ffffffU;
+  header.words[3] = endpoint.remote_token_id & 0x000fffffU;
+  std::memcpy(&header.words[4], endpoint.remote_eid, sizeof(endpoint.remote_eid));
+  header.words[8] = endpoint.remote_token_value;
+  return header;
+}
+
+inline void CopyWqebbs(void* destination, const void* source, std::uint32_t blocks) {
+  auto* output = static_cast<std::uint8_t*>(destination);
+  const auto* input = static_cast<const std::uint8_t*>(source);
+  for (std::uint32_t block = 0U; block < blocks; ++block) {
+#if defined(__aarch64__)
+    asm volatile(
+        "ldp x9, x10, [%[src]]\n"
+        "ldp x11, x12, [%[src], #16]\n"
+        "stp x9, x10, [%[dst]]\n"
+        "stp x11, x12, [%[dst], #16]\n"
+        "ldp x9, x10, [%[src], #32]\n"
+        "ldp x11, x12, [%[src], #48]\n"
+        "stp x9, x10, [%[dst], #32]\n"
+        "stp x11, x12, [%[dst], #48]\n"
+        : : [src] "r"(input), [dst] "r"(output)
+        : "x9", "x10", "x11", "x12", "memory");
+#else
+    std::memcpy(output, input, kWqeBytes);
+#endif
+    input += kWqeBytes;
+    output += kWqeBytes;
+  }
+}
+
 inline std::uint32_t PlanContiguousRead(Transfer (&transfers)[16],
                                         std::uint64_t remote, std::uint64_t local,
                                         std::uint32_t bytes, std::uint32_t local_token_id) {
@@ -91,20 +129,16 @@ inline void EncodeWqe(std::uint32_t (&words)[16], const Endpoint& endpoint,
 }
 
 inline void EncodeScatterReadWqe(std::uint32_t* words,
-                                 const Endpoint& endpoint,
+                                 const ScatterReadHeader& header,
                                  const ScatterTransfer& transfer,
                                  std::uint32_t owner, bool completion) {
-  std::memset(words, 0, ScatterWqebbs(transfer.sge_count) * kWqeBytes);
+  std::memcpy(words, header.words, sizeof(header.words));
   const std::uint32_t place_order = completion ? 2U : 1U;
   words[0] = (place_order << 16U) | (1U << 18U) |
              (static_cast<std::uint32_t>(completion) << 19U) | (1U << 20U) |
              (static_cast<std::uint32_t>(completion) << 21U) | (1U << 28U) |
              (1U << 29U) | ((owner & 1U) << 31U);
-  words[1] = kReadOpcode << 8U;
-  words[2] = (endpoint.tp_id & 0x00ffffffU) | (transfer.sge_count << 24U);
-  words[3] = endpoint.remote_token_id & 0x000fffffU;
-  std::memcpy(&words[4], endpoint.remote_eid, sizeof(endpoint.remote_eid));
-  words[8] = endpoint.remote_token_value;
+  words[2] |= transfer.sge_count << 24U;
   words[10] = static_cast<std::uint32_t>(transfer.remote_address);
   words[11] = static_cast<std::uint32_t>(transfer.remote_address >> 32U);
   for (std::uint32_t index = 0U; index < transfer.sge_count; ++index) {
@@ -114,6 +148,16 @@ inline void EncodeScatterReadWqe(std::uint32_t* words,
     words[base + 2U] = static_cast<std::uint32_t>(transfer.sges[index].address);
     words[base + 3U] = static_cast<std::uint32_t>(transfer.sges[index].address >> 32U);
   }
+  const auto used_words = 12U + transfer.sge_count * 4U;
+  const auto total_words = ScatterWqebbs(transfer.sge_count) * 16U;
+  std::memset(words + used_words, 0, (total_words - used_words) * sizeof(*words));
+}
+
+inline void EncodeScatterReadWqe(std::uint32_t* words,
+                                 const Endpoint& endpoint,
+                                 const ScatterTransfer& transfer,
+                                 std::uint32_t owner, bool completion) {
+  EncodeScatterReadWqe(words, PrepareScatterReadHeader(endpoint), transfer, owner, completion);
 }
 
 inline void EncodeNotifyWqe(std::uint32_t (&words)[32], const Endpoint& endpoint,

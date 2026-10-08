@@ -93,14 +93,22 @@ WQEBB；队列深度允许时每 64 条 WQE 在末条请求 CQE。单条 WQE 的
 不支持跨独立 HBM 分配的 SGL。未指定 `source_descriptor_address` 的旧调用仍使用
 每轮配置 RPC；一个 DDR region 不得混用两种模式。
 
-GatherRead 的 READ WQE 先在 AICPU 本地以最多 24 个 WQEBB 为一组编码，
+GatherRead 的 READ WQE 默认先在 AICPU 本地以最多 24 个 WQEBB 为一组编码，
 再按 SQ 环绕位置批量写入；原有的每个提交批次仍只敲一次 doorbell、等待一次 CQE。
-`--sq-batch-wqes 8/16/32/64` 控制一次 SQ 批量拷贝最多合并的 READ WQE 数，
+`--sq-batch-wqes 8/16/32/64` 控制一次 SQ 连续写入最多合并的 READ WQE 数，
 默认 8；6-SGE workload 对应最多 24/48/96/192 个 WQEBB。
-这是 memcpy 合并粒度，不改变每个至多 64-WQE 提交批次的 CQE 和 doorbell 边界，
-也不改变 SGL 上限或建链。遇到 SQ 环尾仍拆成两次 memcpy，不填充空洞。
+这是连续 SQ 写入的合并粒度，不改变每个至多 64-WQE 提交批次的 CQE 和 doorbell 边界，
+也不改变 SGL 上限或建链。遇到 SQ 环尾仍拆成两段写入，不填充空洞。
+每个 READ 任务只准备一次固定 WQE 头，复用 EID、TP 和 token 字段。
+编码时覆盖有效字段，仅清零尾部 padding，不再先把整个 WQE 清零。
+SGL 规划直接覆盖有效条目，顺便累计 WQEBB 数量；提交时不再重复扫描 SGL。
+SQ slot 和 owner 在批次内递增，到环尾时翻转 owner，避免逐 WQE 的除法。
+AArch64 SQ 写入按 64 B 使用通用寄存器 LDP/STP，不调用通用 memcpy；
+本地编码缓冲区按 64 B 对齐。每个 WQEBB 仍完整写入，包括保留字段和 padding，
+仍在门铃之前执行屏障。仅 CQ 保持缓存行维护。
+固定头准备计入任务初始化，整体效果以 READ 墙钟耗时评估。
 本地 WQE 编码空间最大 12 KiB，另有原来的 SGL 规划数组，不使用设备堆分配。
-较大粒度可能减少 SQ 拷贝调用次数，实际收益须在设备验证；默认不自动切换。
+较大粒度可能减少连续写入段数，实际收益须在设备验证；默认不自动切换。
 GatherRead 默认使用一个 worker；`--aicpu-cores` 接受 1 到 8 的任意整数，
 可使用 4、5、6、8 对比 READ 并行度。此参数设置 kernel block 数，
 不代表固定的物理核心数，也不保证所有 worker 同时开始执行。
@@ -262,14 +270,15 @@ GatherRead 总耗时中，不包含在首个 READ worker 开始之前的设备 R
 各阶段多核最大值可能来自不同核，不能相加。
 `Worker start spread` 是最晚与最早 READ block 进入时间之差；`Longest worker duration`
 是单核进入到完成的最长区间。两者用于识别调度错开与单核耗时，均在 READ 墙钟内，
-不是额外阶段，也不能相加。READ 分组数组只在填充实际 WQE 时清零，避免整数组重复清零。
+不是额外阶段，也不能相加。READ 分组数组仅覆盖实际使用的 SGE，不清零未使用条目。
 
 `GATHER_READ_WORKERS` 每行对应一套 SQ/CQ worker，不代表固定物理 AICPU ID。
 start/end 是每轮相对最早 READ worker 进入时刻的纳秒差，输出为微秒；
-每行显示平均 start/end/duration、start p50/p95，以及该 worker 的 WQE、SQ memcpy
-调用和 WQEBB 数。各核区间重叠，不能相加；晚进入 worker 的起点集中在早进入
+每行显示平均 start/end/duration、start p50/p95，以及该 worker 的 WQE、SQ 连续写入
+段数和 WQEBB 数。各核区间重叠，不能相加；晚进入 worker 的起点集中在早进入
 worker 的完成附近，只能作为分波执行的证据，不能单凭均值推断可用物理核数。
-`SQ writes` 统计全部 worker 的 memcpy 调用和实际写入的 64-byte WQEBB，不计控制握手。
+`SQ writes` 统计全部 worker 的连续写入段数和实际写入的 64-byte WQEBB，不计控制握手。
+逐 worker 的 `sq_write_ranges` 同样表示连续写入段数；一个段可能包含多个 WQEBB。
 
 沿用现有 CPU 服务，对比采样开关和 SQ 拷贝粒度：
 

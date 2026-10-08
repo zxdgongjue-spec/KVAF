@@ -120,7 +120,7 @@ inline void PrintGatherReadTimeline(std::FILE* output, double mean_ms,
                  average_us(&GatherReadTiming::scatter_doorbell_ns));
   else
     std::fprintf(output, "        Per-SQ-group timing: disabled (READ wall and batch timing remain enabled)\n");
-  std::fprintf(output, "      SQ writes: %.2f memcpy calls, %.2f WQEBBs (64 bytes each), all workers combined\n",
+  std::fprintf(output, "      SQ writes: %.2f contiguous ranges, %.2f WQEBBs (64 bytes each), all workers combined\n",
                average(&GatherReadTiming::sq_write_calls), average(&GatherReadTiming::sq_wqebbs));
   if (parallel)
     std::fprintf(output,
@@ -248,7 +248,7 @@ inline void PrintGatherReadWorkers(std::FILE* output,
     const double rounds = profiles.size();
     std::fprintf(output,
                  "  worker=%zu start_avg=%.3f start_p50=%.3f start_p95=%.3f end_avg=%.3f "
-                 "duration_avg=%.3f read_wqes=%.2f sq_copies=%.2f sq_wqebbs=%.2f read_tasks=%.2f\n",
+                 "duration_avg=%.3f read_wqes=%.2f sq_write_ranges=%.2f sq_wqebbs=%.2f read_tasks=%.2f\n",
                  worker, start_ns / rounds / 1000.0, percentile_us(0.5), percentile_us(0.95),
                  end_ns / rounds / 1000.0, duration_ns / rounds / 1000.0,
                  wqes / rounds, copies / rounds, blocks / rounds, tasks / rounds);

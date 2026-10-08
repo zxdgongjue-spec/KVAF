@@ -203,15 +203,14 @@ std::uint32_t SubmitNotify(const Entity& entity, Queue& queue,
 }
 
 template <typename Entity>
-std::uint32_t WriteSqBlocks(const Entity& entity, std::uint64_t producer,
+std::uint32_t WriteSqBlocks(const Entity& entity, std::uint32_t slot,
                    const std::uint32_t* words, std::uint32_t blocks) {
-  const auto slot = static_cast<std::uint32_t>(producer % entity.sq_depth);
   const auto first = std::min(blocks, entity.sq_depth - slot);
-  std::memcpy(reinterpret_cast<void*>(entity.sq_va + slot * 64U),
-              words, first * 64U);
+  kvaf::aicpu_urma::CopyWqebbs(reinterpret_cast<void*>(entity.sq_va + slot * 64U),
+                              words, first);
   if (first < blocks) {
-    std::memcpy(reinterpret_cast<void*>(entity.sq_va), words + first * 16U,
-                (blocks - first) * 64U);
+    kvaf::aicpu_urma::CopyWqebbs(reinterpret_cast<void*>(entity.sq_va), words + first * 16U,
+                                blocks - first);
     return 2U;
   }
   return 1U;
@@ -219,8 +218,9 @@ std::uint32_t WriteSqBlocks(const Entity& entity, std::uint64_t producer,
 
 template <bool Detailed, typename Entity, typename Queue>
 std::uint32_t SubmitScatter(const Entity& entity, Queue& queue,
+                            const kvaf::aicpu_urma::ScatterReadHeader& header,
                             const kvaf::aicpu_urma::ScatterTransfer* transfers,
-                            std::uint32_t count, std::uint32_t* cqe_word,
+                            std::uint32_t count, std::uint32_t blocks, std::uint32_t* cqe_word,
                             std::uint64_t* post_ns, std::uint64_t* cq_ns,
                             kvaf::aicpu_urma::GatherReadStatus& status,
                             std::uint32_t sq_batch_wqes) {
@@ -229,19 +229,12 @@ std::uint32_t SubmitScatter(const Entity& entity, Queue& queue,
   if (post_ns != nullptr) *post_ns = 0U;
   if (cq_ns != nullptr) *cq_ns = 0U;
   if (count == 0U) return 0U;
-  std::uint32_t blocks = 0U;
-  for (std::uint32_t index = 0U; index < count; ++index) {
-    if (transfers[index].sge_count == 0U ||
-        transfers[index].sge_count > kvaf::kGatherMaxSglSize) return 6U;
-    blocks += kvaf::aicpu_urma::ScatterWqebbs(transfers[index].sge_count);
-  }
   if (blocks >= entity.sq_depth) return 6U;
-  Endpoint endpoint{entity.tp_id, entity.remote_token_id,
-                    entity.remote_token_value, {}};
-  std::memcpy(endpoint.remote_eid, entity.remote_eid, sizeof(endpoint.remote_eid));
   std::uint64_t producer = queue.sq_producer_index;
+  auto slot = static_cast<std::uint32_t>(producer % entity.sq_depth);
+  auto owner = static_cast<std::uint32_t>((producer / entity.sq_depth) & 1U);
   constexpr std::uint32_t kStagingBlocks = 64U * kvaf::aicpu_urma::kMaxScatterWqebbs;
-  std::uint32_t words[kStagingBlocks * 16U];
+  alignas(64) std::uint32_t words[kStagingBlocks * 16U];
   std::uint32_t index = 0U;
   std::uint64_t encode_ns = 0U;
   std::uint64_t sq_write_ns = 0U;
@@ -250,21 +243,24 @@ std::uint32_t SubmitScatter(const Entity& entity, Queue& queue,
   while (index < count) {
     std::uint32_t staged_blocks = 0U;
     const auto first_index = index;
-    const auto staged_producer = producer;
+    const auto staged_slot = slot;
     while (index < count && index - first_index < sq_batch_wqes) {
       const auto wqebbs = kvaf::aicpu_urma::ScatterWqebbs(transfers[index].sge_count);
       if (staged_blocks + wqebbs > kStagingBlocks) break;
       kvaf::aicpu_urma::EncodeScatterReadWqe(
-          words + staged_blocks * 16U, endpoint, transfers[index],
-          static_cast<std::uint32_t>((producer / entity.sq_depth) & 1U),
-          index + 1U == count);
+          words + staged_blocks * 16U, header, transfers[index], owner, index + 1U == count);
       staged_blocks += wqebbs;
       producer += wqebbs;
+      slot += wqebbs;
+      if (slot >= entity.sq_depth) {
+        slot -= entity.sq_depth;
+        owner ^= 1U;
+      }
       ++index;
     }
     const auto sq_start_ns = Detailed ? NowNs() : 0U;
     if constexpr (Detailed) encode_ns += sq_start_ns - encode_start_ns;
-    sq_write_calls += WriteSqBlocks(entity, staged_producer, words, staged_blocks);
+    sq_write_calls += WriteSqBlocks(entity, staged_slot, words, staged_blocks);
     if constexpr (Detailed) {
       encode_start_ns = NowNs();
       sq_write_ns += encode_start_ns - sq_start_ns;
@@ -299,10 +295,14 @@ void ScatterOutputRange(const kvaf::aicpu_urma::GatherReadArgs& args,
   if (status.scatter_begin_ns == 0U) status.scatter_begin_ns = range_start_ns;
   const auto* spans = reinterpret_cast<const kvaf::GatherOutputSpan*>(args.output_spans);
   const auto sgl_size = std::min(args.sgl_size, kvaf::kGatherMaxSglSize);
+  Endpoint endpoint{entity.tp_id, entity.remote_token_id, entity.remote_token_value, {}};
+  std::memcpy(endpoint.remote_eid, entity.remote_eid, sizeof(endpoint.remote_eid));
+  const auto header = kvaf::aicpu_urma::PrepareScatterReadHeader(endpoint);
   kvaf::aicpu_urma::ScatterTransfer data[64];
   const auto max_batch = kvaf::aicpu_urma::MaxScatterBatch(entity.sq_depth);
   if (max_batch == 0U) status.result = 6U;
   std::uint32_t batch_count = 0U;
+  std::uint32_t batch_blocks = 0U;
   std::uint32_t span_index = first;
   std::uint32_t span_offset = 0U;
   std::uint32_t cqe_word = 0U;
@@ -310,7 +310,8 @@ void ScatterOutputRange(const kvaf::aicpu_urma::GatherReadArgs& args,
   status.scatter_init_ns += plan_start_ns - range_start_ns;
   while (span_index < last && status.result == 0U) {
     auto& transfer = data[batch_count];
-    transfer = {};
+    transfer.bytes = 0U;
+    transfer.sge_count = 0U;
     transfer.remote_address = args.remote_staging + remote_offset;
     while (span_index < last && transfer.sge_count < sgl_size &&
            transfer.bytes < kvaf::aicpu_urma::kMaxReadBytes) {
@@ -329,20 +330,22 @@ void ScatterOutputRange(const kvaf::aicpu_urma::GatherReadArgs& args,
       }
     }
     ++batch_count;
+    batch_blocks += kvaf::aicpu_urma::ScatterWqebbs(transfer.sge_count);
     if (batch_count == max_batch || span_index == last) {
       status.scatter_plan_ns += NowNs() - plan_start_ns;
       status.read_wqes += batch_count;
       std::uint64_t post_ns = 0U;
       std::uint64_t cq_ns = 0U;
       status.result = args.profile_detail != 0U
-          ? SubmitScatter<true>(entity, queue, data, batch_count, &cqe_word,
+          ? SubmitScatter<true>(entity, queue, header, data, batch_count, batch_blocks, &cqe_word,
                                  &post_ns, &cq_ns, status, args.sq_batch_wqes)
-          : SubmitScatter<false>(entity, queue, data, batch_count, &cqe_word,
+          : SubmitScatter<false>(entity, queue, header, data, batch_count, batch_blocks, &cqe_word,
                                   &post_ns, &cq_ns, status, args.sq_batch_wqes);
       status.scatter_post_ns += post_ns;
       status.scatter_cq_ns += cq_ns;
       status.cqe_word = cqe_word;
       batch_count = 0U;
+      batch_blocks = 0U;
       plan_start_ns = NowNs();
     }
   }
