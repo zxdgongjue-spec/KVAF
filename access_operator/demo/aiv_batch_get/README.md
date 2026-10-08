@@ -29,6 +29,52 @@ block. This is the
 fixed-block, single-output-scatter scope; duplicate output rows are not
 rejected and have last-completion-wins semantics.
 
+### Raw addresses (V3)
+
+Set `remote_addresses` and `local_addresses` to device-resident
+`uint64[request_capacity]` arrays containing final remote UBAs and local HBM
+addresses. Set `address_table`, `valid_table`, `indices`, `offsets`,
+`output_indices`, `table_capacity`, `output_rows`, and `tokens_per_block` to
+zero. `miss_count` still selects the active prefix, and each READ transfers
+exactly `token_bytes`. `output` and `channel_entity` identify the acquired
+local registration containing the destinations; destinations can have arbitrary
+byte offsets and the registration size need not be a multiple of `token_bytes`.
+
+The raw WQE fill only loads `remote_addresses[i]` and `local_addresses[i]`.
+It performs no AccessTable lookup, offset addition, or output-row multiplication.
+Raw and lookup modes use separate compile-time posting specializations and
+share the existing multi-Jetty, inflight, completion and profiling behavior.
+
+Descriptor contents are trusted, as in the existing lookup path with request
+validation disabled. Callers must ensure every active source range is inside
+the linked remote MR and every destination range is inside the acquired local
+MR. All entries in a launch use that peer and local registration. Overlapping
+destinations have no guaranteed completion order. No metadata lock is acquired
+by raw BatchGet; retain any needed AccessTable lock or otherwise guarantee the
+remote allocations remain valid through stream/graph completion.
+
+Python exposes `runtime.batch_get_raw(remote_addresses, local_addresses,
+miss_count, output, stream=None, synchronize=False)`. Address tensors are
+contiguous one-dimensional `torch.int64`; `miss_count` is `torch.int32[1]`.
+All tensors must reside on the Runtime NPU. `output` is a contiguous backing
+buffer for registration, and the transfer size is `batch_get_token_bytes`.
+The C++ `BatchGetRequest` accepts the same two address buffer fields; leave its
+lookup fields empty and `tokens_per_block=0`.
+
+```python
+# Caller-side preparation, outside the BatchGet kernel/timed region.
+remote_addresses = (device_table.addresses[indices.long()] + offsets.long()).contiguous()
+local_addresses = (output_indices.long() * token_bytes + output.data_ptr()).contiguous()
+runtime.batch_get_raw(remote_addresses, local_addresses, miss_count, output)
+torch.npu.synchronize()  # keep all tensors and remote allocations alive until here
+```
+
+For graph use, warm up the output registration before capture. Keep the address
+arrays, output allocation and their addresses fixed, and update array contents
+and `miss_count` on the capture stream before replay. Raw mode needs no device
+AccessTable. Host, binding and kernel must be rebuilt together: the argument
+record is now 128 bytes and the launcher requires `KvafExecuteBatchGetAivKernelV3`.
+
 The local-memory lifetime is intentionally separate from the shared
 transport:
 
@@ -107,7 +153,7 @@ temporarily disabled in this branch.
 
 The ACL launcher reserves 160 KiB of AIV local memory for the two WQE banks and
 SIMT validation scratch. Rebuild Host, Python binding and Kernel together: the
-launcher now requires the `KvafExecuteBatchGetAivKernelV2` symbol.
+launcher now requires the `KvafExecuteBatchGetAivKernelV3` symbol.
 
 ## Build and validate on A5
 
@@ -122,6 +168,12 @@ KVAF_NPU_ACTIVE_PERCENT=5 \
 tests/run_remote_cpu_e2e.sh "$PWD/build-npu"
 ```
 
+Set `KVAF_BATCH_GET_RAW_ADDRESSES=1` to run the same eager, A/B/A output,
+inflight and graph integration checks through raw addresses. This also works
+with `tests/run_remote_npu_e2e.sh` for an NPU HBM peer. The performance script
+`tests/python/test_npu_batch_get_perf.py` accepts `--raw-addresses`; address
+preparation is excluded from its timing and it reports `address_mode=raw`.
+
 The kernel uses the Ascend C SIMT API. The build automatically checks the
 toolkit's top-level `include/simt_api` directory and the older tikcpp layouts.
 If asc-devkit is installed separately, point the build at the directory that
@@ -135,6 +187,54 @@ If that header is absent from both the CANN toolkit and asc-devkit, install the
 asc-devkit package matching the target CANN version before building; mixing
 headers from a different CANN release is not supported. The example above uses
 656 bytes per token, 128 tokens per block, and a 5% active probability.
+
+## Raw-address miss-count performance sweep
+
+The existing `tests/run_remote_cpu_batch_get_miss_count_perf.sh` accepts
+`--raw-addresses` (or `KVAF_BATCH_GET_RAW_ADDRESSES=1`). It enables kernel
+profiling automatically and keeps the same statistics as lookup BatchGet.
+Rebuild the V3 host, Python binding and kernel first (`./build.sh npu`), start
+the CPU peer service as usual, then run on the NPU client:
+
+```bash
+KVAF_CPU_SERVICE_ADDR=CPU_HOST_IP:28999 \
+DEVICE_ID=0 \
+KVAF_BATCH_GET_SWEEP_TOKEN_BYTES="656" \
+KVAF_BATCH_GET_SWEEP_MISS_COUNTS="32 128 512 2048 8192" \
+KVAF_BATCH_GET_SWEEP_AIV_CORES="2" \
+KVAF_BATCH_GET_SWEEP_JETTYS_PER_CORE="1" \
+KVAF_BATCH_GET_KERNEL_CLOCK_MHZ=1000 \
+bash tests/run_remote_cpu_batch_get_miss_count_perf.sh "$PWD/build-npu" \
+  --raw-addresses --request-length 8192 --table-capacity 8192 \
+  --tokens-per-block 128 --warmup 3 --iterations 100
+```
+
+The four `KVAF_BATCH_GET_SWEEP_*` variables accept space-separated values.
+Omit them to retain the original 2646-shape sweep. Set
+`KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR` to choose a persistent output directory;
+otherwise its temporary path is printed at startup. Results also go to
+`batch_get_miss_sweep_summary.csv` in that directory. Configuration, kernel
+profile records, sweep results and CSV identify `address_mode=raw` or `lookup`.
+
+For each sample, `kernel_total` uses the maximum elapsed kernel time across
+AIV cores. The summary reports `mean_us`, `p50_us`, `p90_us`, `p99_us` and
+`p50_GBps = miss_count * token_bytes / p50_us / 1000` (decimal GB/s).
+The `batch_get_kernel_total` profile record also reports `useful_GiBps`, based
+on the mean kernel time (binary GiB/s). `kernel_post` and
+`kernel_completion_wait` separately report submission and accumulated CQ wait
+times; their independently aggregated maxima need not add up to total time.
+Address preparation, remote-data population and profile copies to Host are
+outside the timed region. Kernel profiling overhead is included.
+
+`KVAF_BATCH_GET_KERNEL_CLOCK_MHZ` is the **GetSystemCycle counter frequency**,
+which must match the target platform. The existing default is 1000 MHz;
+an incorrect value scales both reported time and bandwidth. Raw cycle counts
+are retained in per-shape logs.
+
+The host-only regression `python3 tests/python/test_batch_get_miss_sweep.py`
+checks both shell wrappers with synthetic profiles, including raw CLI/env
+selection, cycle conversion, bandwidth and CSV output. It does not measure
+hardware performance.
 
 ## Graph boundary
 

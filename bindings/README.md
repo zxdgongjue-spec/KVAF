@@ -76,3 +76,14 @@ CacheOS-vLLM Adaptor 属于 vLLM 侧实现，不放在本目录。
 K 端指定单个 `--ub-device` 时走原生路径。`peer_ub_device="NAME"` 用于跨进程复用
 选择结果且不重新标定。默认关闭；用法与协议升级要求见
 [Runtime 启动选优说明](../runtime/README.md#可选启动-ub-device-选优)。
+
+## Raw-address BatchGet
+
+`NpuRuntime.batch_get_raw(remote_addresses, local_addresses, miss_count, output,
+stream=None, synchronize=False)` accepts final remote/local addresses in
+contiguous NPU `torch.int64` vectors and an NPU `torch.int32[1]` active count.
+Each entry transfers the Runtime's `batch_get_token_bytes`. `output` supplies
+the containing contiguous local registration; no row shape or AccessTable is
+required. All active ranges must belong to the linked remote registration and
+this local registration. The caller owns address validity and buffer/allocation
+lifetime through completion. See the [operator contract and graph example](../access_operator/demo/aiv_batch_get/README.md#raw-addresses-v3).

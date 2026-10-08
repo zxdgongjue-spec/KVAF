@@ -144,6 +144,7 @@ def main() -> int:
     iterations = int(os.environ.get("KVAF_NPU_ITERATIONS", "5"))
     graph_replays = int(os.environ.get("KVAF_NPU_GRAPH_REPLAYS", "0"))
     inflight_checks = os.environ.get("KVAF_BATCH_GET_INFLIGHT_CHECKS") == "1"
+    raw_addresses_mode = os.environ.get("KVAF_BATCH_GET_RAW_ADDRESSES") == "1"
     # Graph and eager measurements always use the same sample plan.
     graph_warmup = warmup
     graph_iterations = iterations
@@ -350,7 +351,25 @@ def main() -> int:
         torch.npu.synchronize()
         print("RUNTIME_NPU_PHASE_DONE phase=caller_buffer_setup")
 
+        raw_remote = (
+            address_table[indices.to(torch.int64)] + offsets.to(torch.int64)
+        ).contiguous() if raw_addresses_mode else None
+        raw_locals = {
+            int(buffer.data_ptr()): (
+                output_indices.to(torch.int64) * token_bytes + int(buffer.data_ptr())
+            ).contiguous()
+            for buffer in (output_a, output_b)
+        } if raw_addresses_mode else {}
+        torch.npu.synchronize()
+        print(f"RUNTIME_NPU_ADDRESS_MODE mode={'raw' if raw_addresses_mode else 'lookup'}")
+
         def execute(output: object, stream: object | None = None) -> None:
+            if raw_addresses_mode:
+                runtime.batch_get_raw(
+                    raw_remote, raw_locals[int(output.data_ptr())], miss_count,
+                    output, stream,
+                )
+                return
             runtime.batch_get(
                 address_table,
                 valid_table,
@@ -502,6 +521,8 @@ def main() -> int:
             graph_offsets_host = array("i", offsets_values)
             graph_miss_count_host = array("i", [active_requests])
             graph_output_indices_host = array("i", output_indices_values)
+            graph_raw_remote_host = array("Q", [0] * requests)
+            graph_raw_local_host = array("Q", [0] * requests)
             if (
                 graph_indices_host.itemsize != 4
                 or graph_offsets_host.itemsize != 4
@@ -529,30 +550,48 @@ def main() -> int:
                         source_entry * tokens_per_block
                         + offsets_values[request] // token_bytes
                     )
+                if raw_addresses_mode:
+                    for request in range(requests):
+                        base = struct.unpack_from(
+                            "<Q", graph_address_table_host, indices_values[request] * 8
+                        )[0]
+                        graph_raw_remote_host[request] = base + offsets_values[request]
+                        # Permute destinations only within the active row set,
+                        # leaving inactive rows untouched across graph replays.
+                        row_request = ((request + epoch // 2) % active_requests
+                                       if request < active_requests else request)
+                        graph_output_indices_host[request] = output_indices_values[row_request]
+                        graph_raw_local_host[request] = (
+                            int(output_a.data_ptr()) + graph_output_indices_host[request] * token_bytes
+                        )
                 return expected_payload_slots
 
             def enqueue_graph_inputs(trace: str | None = None) -> None:
                 if trace is not None:
                     print(f"RUNTIME_NPU_GRAPH_INPUT_UPDATE_BEGIN replay={trace}")
-                graph.copy_host_to_device_async(
-                    int(address_table.data_ptr()), tensor_bytes(address_table),
-                    graph_address_table_host, capture_stream
-                )
-                graph.copy_host_to_device_async(
-                    int(indices.data_ptr()), tensor_bytes(indices),
-                    graph_indices_host, capture_stream
-                )
-                graph.copy_host_to_device_async(
-                    int(offsets.data_ptr()), tensor_bytes(offsets),
-                    graph_offsets_host, capture_stream
-                )
+                if raw_addresses_mode:
+                    graph.copy_host_to_device_async(
+                        int(raw_remote.data_ptr()), tensor_bytes(raw_remote),
+                        graph_raw_remote_host, capture_stream
+                    )
+                    local = raw_locals[int(output_a.data_ptr())]
+                    graph.copy_host_to_device_async(
+                        int(local.data_ptr()), tensor_bytes(local),
+                        graph_raw_local_host, capture_stream
+                    )
+                else:
+                    for tensor, staging in (
+                        (address_table, graph_address_table_host),
+                        (indices, graph_indices_host),
+                        (offsets, graph_offsets_host),
+                        (output_indices, graph_output_indices_host),
+                    ):
+                        graph.copy_host_to_device_async(
+                            int(tensor.data_ptr()), tensor_bytes(tensor), staging, capture_stream
+                        )
                 graph.copy_host_to_device_async(
                     int(miss_count.data_ptr()), tensor_bytes(miss_count),
                     graph_miss_count_host, capture_stream
-                )
-                graph.copy_host_to_device_async(
-                    int(output_indices.data_ptr()), tensor_bytes(output_indices),
-                    graph_output_indices_host, capture_stream
                 )
                 if trace is not None:
                     print(f"RUNTIME_NPU_GRAPH_INPUT_UPDATE_ENQUEUED replay={trace}")
@@ -617,7 +656,7 @@ def main() -> int:
                 validate_output(
                     tensor_to_bytes(output_a),
                     mask_values,
-                    output_indices_values,
+                    graph_output_indices_host,
                     graph_payload_slots,
                     token_bytes,
                 )
@@ -636,7 +675,7 @@ def main() -> int:
                     validate_output(
                         tensor_to_bytes(output_a),
                         [int(i < count) for i in range(requests)],
-                        output_indices_values, graph_payload_slots, token_bytes,
+                        graph_output_indices_host, graph_payload_slots, token_bytes,
                     )
                     check_inflight_profile(count)
                 runtime.stop_batch_get_kernel_profile()
@@ -683,7 +722,7 @@ def main() -> int:
             validate_output(
                 tensor_to_bytes(output_a),
                 mask_values,
-                output_indices_values,
+                graph_output_indices_host,
                 graph_payload_slots,
                 token_bytes,
             )

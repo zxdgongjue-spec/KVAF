@@ -11,6 +11,7 @@
 
 #include "acl/acl.h"
 #include "batch_get_abi.h"
+#include "batch_get_validation.h"
 #include "kvaf_aiv_batch_get.h"
 #include "meta_manager.h"
 
@@ -156,6 +157,33 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
     return InvalidArgument("BatchGet request and arguments must not be null");
   }
   const BatchGetRequest& request = *exec.request;
+  if (request.uses_raw_addresses()) {
+    const Status status = ValidateRawBatchGetRequest(request);
+    if (!status.ok()) return status;
+    if (execution.status == nullptr ||
+        execution.status_bytes < static_cast<std::size_t>(npu_core_count) *
+                                     sizeof(KvafBatchGetCoreStatus) ||
+        execution.queue_state == nullptr ||
+        execution.queue_state_bytes <
+            static_cast<std::size_t>(npu_core_count) * jettys_per_core *
+                sizeof(KvafBatchGetQueueState)) {
+      return InvalidArgument("raw BatchGet execution state is incomplete");
+    }
+    *arguments = KvafExecuteBatchGetKernelArgs{};
+    arguments->remote_addresses = PointerValue(request.remote_addresses.data);
+    arguments->local_addresses = PointerValue(request.local_addresses.data);
+    arguments->miss_count = PointerValue(request.miss_count.data);
+    arguments->output = PointerValue(request.output.data);
+    arguments->core_status = PointerValue(execution.status);
+    arguments->queue_state = PointerValue(execution.queue_state);
+    arguments->request_capacity = static_cast<std::uint32_t>(
+        request.remote_addresses.bytes / sizeof(Address));
+    arguments->token_bytes = static_cast<std::uint32_t>(request.output_block_bytes);
+    arguments->block_count = npu_core_count;
+    arguments->jettys_per_core = jettys_per_core;
+    arguments->batch_get_max_inflight_total = max_inflight_total;
+    return Status::OK();
+  }
   if (!request.indices.has_elements<std::int32_t>() ||
       !request.offsets.has_elements<std::int32_t>() ||
       !request.output_indices.has_elements<std::int32_t>() ||

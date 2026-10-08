@@ -108,7 +108,7 @@ typedef struct KvafBatchGetDirectUrmaEntity {
 // Fixed-shape graph ABI. `output` and `channel_entity` must identify the same
 // LocalBufferAcquire result. During capture/replay both addresses stay fixed;
 // address/valid/index/offset/miss-count/output-index contents may change between
-// replays.
+// replays. Raw mode instead updates remote_addresses/local_addresses contents.
 typedef struct KvafExecuteBatchGetKernelArgs {
   uint64_t address_table;       // uint64[table_capacity], absolute Host DDR UBA
   uint64_t valid_table;         // uint8[table_capacity]
@@ -130,9 +130,16 @@ typedef struct KvafExecuteBatchGetKernelArgs {
   uint32_t jettys_per_core;
   // Total READ budget across this launch's cores. Zero selects the original
   // whole-batch path; otherwise must be >= 2 * block_count. Captured by value.
-  // Consumes former padding. Host and V2 kernel MUST be rebuilt together;
-  // the versioned kernel symbol prevents loading a pre-window kernel.
+  // Consumes former padding. Host and kernel MUST be rebuilt together;
+  // the versioned kernel symbol prevents loading an incompatible kernel.
   uint32_t batch_get_max_inflight_total;
+  // V3 raw-address mode. Both are uint64[request_capacity] device arrays of
+  // final addresses, copied directly into WQEs. All lookup pointers/capacities
+  // and tokens_per_block must be zero. output remains the local MR base.
+  // Active ranges must be valid within the remote MR and local output MR;
+  // descriptor contents are trusted, like the legacy path's disabled validation.
+  uint64_t remote_addresses;
+  uint64_t local_addresses;
 } KvafExecuteBatchGetKernelArgs;
 
 #if defined(__cplusplus)
@@ -144,7 +151,7 @@ static_assert(sizeof(KvafBatchGetQueueState) == KVAF_AIV_BATCH_GET_QUEUE_STATE_B
               "KvafBatchGetQueueState ABI changed");
 static_assert(sizeof(KvafBatchGetDirectUrmaEntity) == 192,
               "KvafBatchGetDirectUrmaEntity ABI changed");
-static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 112,
+static_assert(sizeof(KvafExecuteBatchGetKernelArgs) == 128,
               "KvafExecuteBatchGetKernelArgs ABI changed");
 #endif
 

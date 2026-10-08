@@ -15,6 +15,7 @@ environment variables:
     --token-bytes          KVAF_BATCH_GET_PERF_TOKEN_BYTES
     --miss-count           KVAF_BATCH_GET_PERF_MISS_COUNT
     --max-inflight-total   KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL
+    --raw-addresses        KVAF_BATCH_GET_RAW_ADDRESSES=1
     --source-access-pattern
                            KVAF_BATCH_GET_PERF_SOURCE_ACCESS_PATTERN
     --output-access-pattern
@@ -97,6 +98,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "Measure NPU BatchGet performance with an independently configurable "
             "request length, table capacity, block layout and exact miss count."
         )
+    )
+    parser.add_argument(
+        "--raw-addresses", action="store_true",
+        default=os.environ.get("KVAF_BATCH_GET_RAW_ADDRESSES") == "1",
+        help="pass final remote/local addresses; prepare addresses outside timed BatchGet",
     )
     parser.add_argument(
         "--peer-device", choices=("cpu", "npu"),
@@ -431,6 +437,7 @@ def print_kernel_profile(
     request_length: int,
     miss_count: int,
     token_bytes: int,
+    address_mode: str = "lookup",
 ) -> None:
     if not samples or any(len(sample) != npu_core_count for sample in samples):
         raise AssertionError("BatchGet kernel profile sample/core count mismatch")
@@ -547,6 +554,7 @@ def print_kernel_profile(
     print(
         "KERNEL_PROFILE_CONTRACT "
         f"clock_mhz={clock_mhz} unit=ms samples={len(samples)} "
+        f"address_mode={address_mode} "
         f"aiv_cores={npu_core_count} jettys_per_core={jettys_per_core} "
         f"request_length={request_length} miss_count={miss_count} "
         "setup=entity_queue_and_miss_count compact=removed_direct_prefix "
@@ -573,11 +581,16 @@ def print_kernel_profile(
             f"p50_ms={percentile(values, 0.50):.3f} "
             f"p90_ms={percentile(values, 0.90):.3f} "
             f"p99_ms={percentile(values, 0.99):.3f} "
+            f"mean_us={statistics.mean(values) * 1000.0:.3f} "
+            f"p50_us={percentile(values, 0.50) * 1000.0:.3f} "
+            f"p90_us={percentile(values, 0.90) * 1000.0:.3f} "
+            f"p99_us={percentile(values, 0.99) * 1000.0:.3f} "
             f"mean_cycles={statistics.mean(cycle_values):.3f} "
             f"p50_cycles={percentile(cycle_values, 0.50):.3f} "
             f"p90_cycles={percentile(cycle_values, 0.90):.3f} "
             f"p99_cycles={percentile(cycle_values, 0.99):.3f} "
-            f"units={request_length}_requests_per_call{useful_gibps}"
+            f"units={request_length}_requests_per_call{useful_gibps} "
+            f"address_mode={address_mode}"
         )
     divisor = float(len(samples))
     for core, accumulator in enumerate(per_core):
@@ -703,6 +716,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         print(
             "BATCH_GET_PERF_CONFIG "
+            f"address_mode={'raw' if args.raw_addresses else 'lookup'} "
             f"peer_device={args.peer_device} peer_service_addr={args.peer_service_addr} "
             f"request_length={request_length} table_capacity={table_capacity} "
             f"tokens_per_block={tokens_per_block} token_bytes={token_bytes} "
@@ -785,6 +799,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"entries={table_capacity}"
         )
 
+        def prepare_submission(indices: object, offsets: object, rows: object) -> tuple:
+            if args.raw_addresses:
+                # These allocations/gathers run BEFORE synchronization and timing.
+                remote = device_table.addresses[indices.to(torch.int64)] + offsets.to(torch.int64)
+                local = rows.to(torch.int64) * token_bytes + int(output.data_ptr())
+                return remote.contiguous(), local.contiguous(), miss_count, output
+            return device_table, indices, offsets, miss_count, rows, output
+
+        submit_batch_get = runtime.batch_get_raw if args.raw_addresses else runtime.batch_get
+
         # Execute one deterministic request plan and validate both the copied
         # prefix and the untouched suffix before collecting timing samples.
         print("BATCH_GET_PERF_PHASE_BEGIN phase=correctness_preflight")
@@ -808,14 +832,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 miss_count_value,
             )
         output.zero_()
-        runtime.batch_get(
-            device_table,
-            preflight_indices,
-            preflight_offsets,
-            miss_count,
-            preflight_output_indices,
-            output,
+        preflight_submission = prepare_submission(
+            preflight_indices, preflight_offsets, preflight_output_indices
         )
+        submit_batch_get(*preflight_submission)
         torch.npu.synchronize()
         if miss_count_value > 0 and not torch.equal(
             output[:miss_count_value],
@@ -889,15 +909,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("BATCH_GET_PERF_PHASE_BEGIN phase=warmup")
         for _ in range(args.warmup):
             indices, offsets, output_indices = create_request_plan()
+            submission = prepare_submission(indices, offsets, output_indices)
             torch.npu.synchronize()
-            runtime.batch_get(
-                device_table,
-                indices,
-                offsets,
-                miss_count,
-                output_indices,
-                output,
-            )
+            submit_batch_get(*submission)
             # Keep caller-owned request Tensors alive through completion.
             torch.npu.synchronize()
         print("BATCH_GET_PERF_PHASE_DONE phase=warmup " f"iterations={args.warmup}")
@@ -909,18 +923,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         kernel_profile_samples: list[list[dict[str, object]]] = []
         for _ in range(args.iterations):
             indices, offsets, output_indices = create_request_plan()
+            submission = prepare_submission(indices, offsets, output_indices)
             # Request generation and Tensor work are deliberately excluded.
             torch.npu.synchronize()
 
             begin = time.perf_counter()
-            runtime.batch_get(
-                device_table,
-                indices,
-                offsets,
-                miss_count,
-                output_indices,
-                output,
-            )
+            submit_batch_get(*submission)
             submitted = time.perf_counter()
             torch.npu.synchronize()
             completed = time.perf_counter()
@@ -966,6 +974,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 request_length,
                 miss_count_value,
                 token_bytes,
+                address_mode="raw" if args.raw_addresses else "lookup",
             )
             runtime.stop_batch_get_kernel_profile()
             kernel_profile_started = False

@@ -9,7 +9,7 @@
 #include "acl/acl.h"
 
 namespace {
-constexpr char kKernelName[] = "KvafExecuteBatchGetAivKernelV2";
+constexpr char kKernelName[] = "KvafExecuteBatchGetAivKernelV3";
 constexpr uint32_t kKernelTimeoutSeconds = 180U;
 constexpr uint32_t kKernelLocalMemoryBytes =
     KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES;
@@ -52,10 +52,30 @@ extern "C" int32_t KvafExecuteBatchGetLaunch(const KvafExecuteBatchGetKernelArgs
       arguments->block_count == 0U || arguments->block_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       (arguments->batch_get_max_inflight_total != 0U &&
        arguments->batch_get_max_inflight_total < 2U * arguments->block_count) ||
-      arguments->request_capacity == 0U || arguments->offsets == 0U ||
+      arguments->request_capacity == 0U ||
       arguments->miss_count == 0U ||
-      arguments->token_bytes == 0U || arguments->tokens_per_block == 0U ||
+      arguments->token_bytes == 0U ||
       arguments->jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE) {
+    return KVAF_BATCH_GET_INVALID_ARGUMENT;
+  }
+  const bool raw = arguments->remote_addresses != 0U ||
+                   arguments->local_addresses != 0U;
+  if (arguments->output == 0U || arguments->core_status == 0U ||
+      arguments->channel_entity == 0U || arguments->queue_state == 0U) {
+    return KVAF_BATCH_GET_INVALID_ARGUMENT;
+  }
+  if (raw) {
+    if (arguments->remote_addresses == 0U || arguments->local_addresses == 0U ||
+        arguments->address_table != 0U || arguments->valid_table != 0U ||
+        arguments->indices != 0U || arguments->offsets != 0U ||
+        arguments->output_indices != 0U || arguments->table_capacity != 0U ||
+        arguments->output_rows != 0U || arguments->tokens_per_block != 0U) {
+      return KVAF_BATCH_GET_INVALID_ARGUMENT;
+    }
+  } else if (arguments->address_table == 0U || arguments->valid_table == 0U ||
+             arguments->indices == 0U || arguments->offsets == 0U ||
+             arguments->output_indices == 0U || arguments->table_capacity == 0U ||
+             arguments->output_rows == 0U || arguments->tokens_per_block == 0U) {
     return KVAF_BATCH_GET_INVALID_ARGUMENT;
   }
   aclrtLaunchKernelAttr attrs[4]{};

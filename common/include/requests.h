@@ -64,8 +64,23 @@ struct BatchGetRequest {
   std::uint64_t output_block_bytes{0};
   std::uint64_t tokens_per_block{0};
 
-  // CPU path 留空。NPU path 必须提供调用方持有的稳定 Device 表。
+  // CPU/raw-address path 留空。NPU lookup path 提供调用方持有的稳定 Device 表。
   AccessTableDeviceView device_access_table;
+
+  // Optional raw-address NPU mode: uint64[request_capacity] arrays containing
+  // final remote UBAs and local HBM addresses. Set both and leave all lookup
+  // fields (including access_table and tokens_per_block) empty/zero. output
+  // identifies the contiguous local registration containing every destination;
+  // output_block_bytes is the fixed transfer size, not an output row stride.
+  // The caller guarantees each active range belongs to the linked remote MR
+  // and this local registration, and keeps buffers/remote allocations alive
+  // until stream completion (including graph replays).
+  ConstBufferView remote_addresses;
+  ConstBufferView local_addresses;
+
+  bool uses_raw_addresses() const {
+    return !remote_addresses.empty() || !local_addresses.empty();
+  }
 };
 
 struct BatchPutRequest {

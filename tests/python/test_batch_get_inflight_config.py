@@ -29,6 +29,12 @@ class InflightConfigTests(unittest.TestCase):
             self.assertEqual(perf.parse_args([]).max_inflight_total, 512)
             self.assertEqual(perf.parse_args(["--max-inflight-total", "0"]).max_inflight_total, 0)
 
+    def test_raw_address_mode(self):
+        self.assertFalse(self.parse().raw_addresses)
+        self.assertTrue(self.parse("--raw-addresses").raw_addresses)
+        with patch.dict(os.environ, {"KVAF_BATCH_GET_RAW_ADDRESSES": "1"}, clear=True):
+            self.assertTrue(perf.parse_args([]).raw_addresses)
+
     def test_profile_excludes_intermediate_waits_from_post(self):
         profile = {
             "core": 0, "kernel_start_cycle": 10, "setup_done_cycle": 20,

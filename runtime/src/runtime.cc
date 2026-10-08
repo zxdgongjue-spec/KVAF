@@ -1,4 +1,5 @@
 #include "runtime.h"
+#include "batch_get_validation.h"
 
 #include <cstdint>
 #include <limits>
@@ -243,6 +244,12 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
                              const BatchGetExecutionOptions& execution) {
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
+  }
+  if (request.uses_raw_addresses()) {
+    const Status status = ValidateRawBatchGetRequest(request);
+    if (!status.ok()) return status;
+    return access_operator_.ExecuteBatchGet(
+        BatchGetExecRequest{AccessTableView{}, &request, execution});
   }
   const AccessTableState* table = nullptr;
   if (request.access_table.opaque != 0) {

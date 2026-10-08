@@ -96,13 +96,15 @@ struct Fixture {
   std::vector<KvafBatchGetQueueState> queues;
   std::vector<KvafBatchGetDirectUrmaEntity> entities;
   std::vector<KvafBatchGetCoreStatus> statuses;
+  std::vector<uint64_t> raw_remote, raw_local;
+  bool raw;
   int32_t misses = 0;
   KvafExecuteBatchGetKernelArgs args{};
 
-  Fixture(uint32_t count, uint32_t c, uint32_t j, uint32_t budget)
+  Fixture(uint32_t count, uint32_t c, uint32_t j, uint32_t budget, bool raw_mode = false)
       : capacity(count), cores(c), jettys(j), output(count * 16),
         indices(count), offsets(count), rows(count), queues(c * j),
-        entities(c * j), statuses(c) {
+        entities(c * j), statuses(c), raw_remote(count), raw_local(count), raw(raw_mode) {
     aiv_model::hardware.clear();
     aiv_model::hardware.resize(c * j);
     for (uint32_t i = 0; i < remote.size(); ++i) remote[i] = (i * 7 + 1) % 251;
@@ -151,6 +153,19 @@ struct Fixture {
     args.block_count = c;
     args.jettys_per_core = j;
     args.batch_get_max_inflight_total = budget;
+    if (raw) {
+      // Neither transfer endpoint is a token row/block boundary. The kernel
+      // must preserve the supplied addresses byte-for-byte.
+      args.token_bytes = 7;
+      for (uint32_t i = 0; i < count; ++i) {
+        raw_remote[i] = addresses[indices[i]] + 3;
+        raw_local[i] = args.output + rows[i] * 16 + 1;
+      }
+      args.remote_addresses = reinterpret_cast<uint64_t>(raw_remote.data());
+      args.local_addresses = reinterpret_cast<uint64_t>(raw_local.data());
+      args.address_table = args.valid_table = args.indices = args.offsets = 0;
+      args.output_indices = args.table_capacity = args.output_rows = args.tokens_per_block = 0;
+    }
   }
 
   void Run(uint32_t count, uint64_t expected = 0) {
@@ -162,7 +177,7 @@ struct Fixture {
     for (const auto& queue : queues) cq_before += queue.cq_consumer_index;
     for (uint32_t c = 0; c < cores; ++c) {
       aiv_model::core = c;
-      KvafExecuteBatchGetAivKernelV2(args);
+      KvafExecuteBatchGetAivKernelV3(args);
       CHECK(statuses[c].result == expected);
       if (expected || !profiling) continue;
       const auto& profile = statuses[c].profile;
@@ -178,11 +193,14 @@ struct Fixture {
       }
     }
     if (expected) return;
-    for (uint32_t i = 0; i < capacity; ++i) {
-      for (uint32_t byte = 0; byte < 16; ++byte) {
-        CHECK(output[rows[i] * 16 + byte] == (i < count ? remote[indices[i] * 16 + byte] : 0));
-      }
+    std::vector<uint8_t> expected_output(output.size(), 0);
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint64_t remote_address = raw ? raw_remote[i] : addresses[indices[i]] + offsets[i];
+      const uint64_t local_address = raw ? raw_local[i] : args.output + rows[i] * args.token_bytes;
+      std::memcpy(expected_output.data() + (local_address - args.output),
+                  reinterpret_cast<const void*>(remote_address), args.token_bytes);
     }
+    CHECK(output == expected_output);
     for (uint32_t i = 0; i < cores * jettys; ++i) {
       const auto& hardware = aiv_model::hardware[i];
       CHECK(hardware.checkpoints.empty());
@@ -203,34 +221,34 @@ struct Fixture {
   }
 };
 
-int main() {
+void RunMode(bool raw) {
   for (const auto& shape : {std::array<uint32_t, 3>{1, 1, 2048}, {1, 16, 2048},
                            {1, 64, 2048}, {4, 4, 2048}, {3, 3, 2049}, {1, 1, 2},
                            {1, 16, 0}}) {
-    Fixture f(8193, shape[0], shape[1], shape[2]);
+    Fixture f(8193, shape[0], shape[1], shape[2], raw);
     for (int repeat = 0; repeat < 2; ++repeat) {
       for (uint32_t count : {0U, 1U, 127U, 128U, 129U, 1024U, 2047U,
                              2048U, 2049U, 3072U, 4096U, 8193U}) f.Run(count);
     }
   }
-  { Fixture f(65537, 1, 1, 2048); f.Run(65537); f.Run(1); f.Run(0); }
-  { Fixture f(65537, 1, 1, 0); f.Run(65537, kQueueFull); CHECK(aiv_model::hardware[0].producer == 0); }
-  { Fixture f(2049, 1, 1, 1); f.Run(2049, kInvalidArgs); }
+  { Fixture f(65537, 1, 1, 2048, raw); f.Run(65537); f.Run(1); f.Run(0); }
+  { Fixture f(65537, 1, 1, 0, raw); f.Run(65537, kQueueFull); CHECK(aiv_model::hardware[0].producer == 0); }
+  { Fixture f(2049, 1, 1, 1, raw); f.Run(2049, kInvalidArgs); }
   {
-    Fixture f(65535, 1, 1, 65534);
+    Fixture f(65535, 1, 1, 65534, raw);
     f.Run(65535, kQueueFull);  // first group fits, second would overwrite SQ
     CHECK(aiv_model::hardware[0].producer == 32767);
     CHECK(f.queues[0].poisoned);
     f.Run(1, kInvalidQueue);
   }
   {
-    Fixture f(8193, 1, 1, 2048);
+    Fixture f(8193, 1, 1, 2048, raw);
     f.statuses[0].profile.magic = 0;
     f.Run(2049);
     CHECK(f.statuses[0].profile.magic == 0);
   }
   {
-    Fixture f(8193, 1, 1, 2048);
+    Fixture f(8193, 1, 1, 2048, raw);
     auto& q = f.queues[0];
     auto& h = aiv_model::hardware[0];
     q.magic = 0x4b564151U;
@@ -241,7 +259,7 @@ int main() {
     f.Run(8193);  // hardware doorbell counters wrap; software indices do not
   }
   for (bool timeout : {false, true}) {
-    Fixture f(8193, 1, 2, 2048);
+    Fixture f(8193, 1, 2, 2048, raw);
     aiv_model::hardware[1].timeout = timeout;
     aiv_model::hardware[1].error = !timeout;
     f.Run(8193, timeout ? kCqTimeout : kCqError);
@@ -252,5 +270,31 @@ int main() {
     f.Run(8193, kInvalidQueue);
     CHECK(aiv_model::doorbells == before);
   }
+  if (raw) {
+    Fixture f(257, 1, 2, 256, true);
+    f.Run(257);
+    // Replay with changed source/destination contents at fixed array addresses.
+    std::reverse(f.raw_remote.begin(), f.raw_remote.end());
+    f.Run(257);
+    std::reverse(f.raw_local.begin(), f.raw_local.end());
+    f.Run(257);
+    f.raw_remote.back() = f.raw_local.back() = UINT64_MAX;
+    f.Run(256);  // ignored suffix must not be dereferenced
+    f.Run(0);
+    f.Run(258, kInvalidArgs);
+    f.Run(UINT32_MAX, kInvalidArgs);
+    const uint64_t before = aiv_model::doorbells;
+    f.args.local_addresses = 0;
+    f.Run(1, kInvalidArgs);
+    f.args.local_addresses = reinterpret_cast<uint64_t>(f.raw_local.data());
+    f.args.indices = reinterpret_cast<uint64_t>(f.indices.data());
+    f.Run(1, kInvalidArgs);  // reject mixed addressing modes
+    CHECK(aiv_model::doorbells == before);
+  }
+}
+
+int main() {
+  RunMode(false);
+  RunMode(true);
   std::cout << "BatchGet kernel CPU model: payload, CQ/SQ wrap, tail, replay and faults passed\n";
 }

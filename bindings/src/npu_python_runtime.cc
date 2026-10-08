@@ -392,6 +392,43 @@ class NpuPythonRuntime final {
                  miss_count, output_indices, output, stream, synchronize);
   }
 
+  void BatchGetRaw(const py::object& remote_addresses,
+                   const py::object& local_addresses,
+                   const py::object& miss_count, const py::object& output,
+                   const py::object& stream, bool synchronize) {
+    const NpuTensorView remote = GetNpuTensorView(remote_addresses, "remote_addresses");
+    const NpuTensorView local = GetNpuTensorView(local_addresses, "local_addresses");
+    const NpuTensorView count = GetNpuTensorView(miss_count, "miss_count");
+    const NpuTensorView buffer = GetNpuTensorView(output, "output");
+    // Check actual dtypes: float64/int64 have the same width but very different
+    // address bits. No tensor contents are copied to Host or resolved here.
+    const py::module_ torch = py::module_::import("torch");
+    if (!remote_addresses.attr("dtype").equal(torch.attr("int64")) ||
+        !local_addresses.attr("dtype").equal(torch.attr("int64")) ||
+        !miss_count.attr("dtype").equal(torch.attr("int32")) ||
+        remote.shape.size() != 1 || local.shape.size() != 1 ||
+        count.shape.size() != 1 || count.bytes != sizeof(std::int32_t) ||
+        remote.bytes != local.bytes) {
+      throw py::value_error(
+          "raw BatchGet requires 1D torch.int64 address arrays of equal size "
+          "and a torch.int32[1] miss_count");
+    }
+    const std::string expected_device = "npu:" + std::to_string(native_->device_id());
+    for (const py::object& tensor : {remote_addresses, local_addresses, miss_count, output}) {
+      if (py::str(tensor.attr("device")).cast<std::string>() != expected_device) {
+        throw py::value_error("raw BatchGet Tensors must reside on the Runtime NPU");
+      }
+    }
+    BatchGetRequest request{};
+    request.remote_addresses = ConstBufferView{remote.data, remote.bytes, DeviceKind::kNpu};
+    request.local_addresses = ConstBufferView{local.data, local.bytes, DeviceKind::kNpu};
+    request.miss_count = ConstBufferView{count.data, count.bytes, DeviceKind::kNpu};
+    request.output = MutableBufferView{buffer.data, buffer.bytes, DeviceKind::kNpu};
+    request.output_block_bytes = native_->batch_get_token_bytes();
+    ThrowIfError(native_->core().BatchGet(
+        request, BatchGetExecutionOptions{ResolveStream(stream), synchronize}));
+  }
+
  private:
   void BatchGetImpl(const AccessTableHandle& access_table,
                     const py::object& addresses, const py::object& valid,
@@ -531,6 +568,14 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("stop_batch_get_kernel_profile",
            &NpuPythonRuntime::StopBatchGetKernelProfile,
            "Copy the latest timeline and disable BatchGet kernel profiling.")
+      .def("batch_get_raw", &NpuPythonRuntime::BatchGetRaw,
+           py::arg("remote_addresses"), py::arg("local_addresses"),
+           py::arg("miss_count"), py::arg("output"),
+           py::arg("stream") = py::none(), py::arg("synchronize") = false,
+           "Read token_bytes from each final remote address into its final local address. "
+           "Addresses are caller-owned NPU int64 arrays; output is the containing local "
+           "registration. Active addresses must belong to the registered regions. "
+           "Keep buffers and remote allocations alive until stream/graph completion.")
       .def("batch_get", &NpuPythonRuntime::BatchGet,
            py::arg("device_access_table"), py::arg("indices"), py::arg("offsets"),
            py::arg("miss_count"),

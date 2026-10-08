@@ -1,5 +1,15 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+add_executable(kvaf_batch_get_raw_request_test batch_get_raw_request_test.cc)
+target_link_libraries(kvaf_batch_get_raw_request_test PRIVATE kvaf_runtime)
+add_test(NAME kvaf_batch_get_raw_request COMMAND kvaf_batch_get_raw_request_test)
+
+add_executable(kvaf_batch_get_loader_test batch_get_loader_test.cc
+  ../access_operator/demo/aiv_batch_get/host/execute_batch_get_loader.cpp)
+target_include_directories(kvaf_batch_get_loader_test PRIVATE fake_npu
+  ../access_operator/demo/aiv_batch_get/include)
+add_test(NAME kvaf_batch_get_loader COMMAND kvaf_batch_get_loader_test)
+
 # Compile the production HBM service against a CPU-only ACL/RA provider double.
 # No CANN, liburma or NPU is needed for protocol, rollback and lifetime checks.
 add_executable(kvaf_npu_hbm_service_test
@@ -26,6 +36,9 @@ add_test(NAME kvaf_batch_get_kernel_model_test COMMAND kvaf_batch_get_kernel_mod
 add_test(NAME kvaf_batch_get_inflight_config_python
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_inflight_config.py")
+add_test(NAME kvaf_batch_get_miss_sweep_python
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_miss_sweep.py")
 
 add_test(
   NAME kvaf_npu_eid_parser_python
