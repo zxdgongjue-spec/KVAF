@@ -29,6 +29,8 @@ struct Options {
   std::uint32_t sgl_size{kvaf::kGatherMaxSglSize};
   std::uint32_t aicpu_cores{1U};
   std::uint32_t sq_batch_wqes{8U};
+  std::uint32_t read_task_spans{192U};
+  bool dynamic_read{true};
   std::uint32_t warmup{1U};
   std::uint32_t iterations{3U};
   bool urma_descriptors{true};
@@ -41,8 +43,10 @@ void Usage(const char* program) {
                "[--blocks N] [--block-bytes N] [--output-stride N] [--sgl-size N] "
                "[--warmup N] [--iterations N] [--aicpu-cores N(1..8)] [--descriptor-transport urma|rpc] "
                "[--sq-batch-wqes 8|16|32|64] [--profile-detail 0|1]\n"
+               "[--read-schedule static|dynamic] [--read-task-spans N(1..65536)]\n"
                "Defaults: descriptor-transport=urma, output-stride=2*block-bytes, sgl-size=%u "
-               "(positive; each READ WQE uses at most %u SGE), sq-batch-wqes=8\n"
+               "(positive; each READ WQE uses at most %u SGE), sq-batch-wqes=8, "
+               "read-schedule=dynamic, read-task-spans=192\n"
                "profile-detail=0 disables per-SQ-group timing; READ wall timing stays enabled.\n",
                program, kvaf::kGatherMaxSglSize, kvaf::kGatherMaxSglSize);
 }
@@ -55,6 +59,11 @@ bool Parse(int argc, char** argv, Options* options) {
     const char* value = argv[index + 1];
     if (flag == "--peer") parsed.peer = value;
     else if (flag == "--kernel-json") parsed.kernel_json = value;
+    else if (flag == "--read-schedule") {
+      if (std::strcmp(value, "dynamic") == 0) parsed.dynamic_read = true;
+      else if (std::strcmp(value, "static") == 0) parsed.dynamic_read = false;
+      else return false;
+    }
     else if (flag == "--descriptor-transport") {
       if (std::strcmp(value, "urma") == 0) parsed.urma_descriptors = true;
       else if (std::strcmp(value, "rpc") == 0) parsed.urma_descriptors = false;
@@ -71,6 +80,7 @@ bool Parse(int argc, char** argv, Options* options) {
       else if (flag == "--sgl-size") parsed.sgl_size = static_cast<std::uint32_t>(number);
       else if (flag == "--aicpu-cores") parsed.aicpu_cores = static_cast<std::uint32_t>(number);
       else if (flag == "--sq-batch-wqes") parsed.sq_batch_wqes = static_cast<std::uint32_t>(number);
+      else if (flag == "--read-task-spans") parsed.read_task_spans = static_cast<std::uint32_t>(number);
       else if (flag == "--warmup") parsed.warmup = static_cast<std::uint32_t>(number);
       else if (flag == "--iterations") parsed.iterations = static_cast<std::uint32_t>(number);
       else if (flag == "--profile-detail" && number <= 1U)
@@ -82,6 +92,7 @@ bool Parse(int argc, char** argv, Options* options) {
       parsed.blocks == 0U || parsed.blocks > kvaf::peer::kMaxGatherSpans ||
       parsed.block_bytes == 0U || parsed.iterations == 0U ||
       parsed.aicpu_cores == 0U || parsed.aicpu_cores > 8U ||
+      parsed.read_task_spans == 0U || parsed.read_task_spans > kvaf::peer::kMaxGatherSpans ||
       (parsed.sq_batch_wqes != 8U && parsed.sq_batch_wqes != 16U &&
        parsed.sq_batch_wqes != 32U && parsed.sq_batch_wqes != 64U) ||
       parsed.sgl_size == 0U ||
@@ -225,6 +236,7 @@ double RunRound(kvaf::NpuRuntime* runtime, aclrtStream stream, const Options& op
   gather.timing = timing;
   gather.profile_detail = options.profile_detail;
   gather.sq_batch_wqes = options.sq_batch_wqes;
+  gather.read_task_spans = options.dynamic_read ? options.read_task_spans : 0U;
   for (std::size_t block = options.blocks; block != 0U; --block) {
     const auto address = view.addresses[block - 1U];
     if (view.valid[block - 1U] != 1U || view.lengths[block - 1U] != options.block_bytes)
@@ -319,12 +331,15 @@ int Run(const Options& options) {
   std::fprintf(stdout,
                "AICPU_GATHER_READ_PASS blocks=%u block_bytes=%u bytes=%zu "
                "output_stride=%u sgl_size=%u wqe_sgl_size=%u aicpu_cores=%u descriptor_transport=%s "
-               "sq_batch_wqes=%u profile_detail=%u warmup=%u iterations=%u\n",
+               "sq_batch_wqes=%u profile_detail=%u read_schedule=%s read_task_spans=%u "
+               "warmup=%u iterations=%u\n",
                options.blocks, options.block_bytes, payload, options.output_stride,
                options.sgl_size, std::min(options.sgl_size, kvaf::kGatherMaxSglSize),
                options.aicpu_cores,
                options.urma_descriptors ? "urma" : "rpc",
                options.sq_batch_wqes, options.profile_detail ? 1U : 0U,
+               options.dynamic_read ? "dynamic" : "static",
+               options.dynamic_read ? options.read_task_spans : 0U,
                options.warmup, options.iterations);
   return 0;
 }

@@ -422,6 +422,7 @@ Status NpuRuntime::GatherRead(const CpuGatherReadRequest& request) {
   std::uint64_t output_extent = 0U;
   if ((request.sq_batch_wqes != 8U && request.sq_batch_wqes != 16U &&
        request.sq_batch_wqes != 32U && request.sq_batch_wqes != 64U) ||
+      request.read_task_spans > peer::kMaxGatherSpans ||
       request.sgl_size == 0U || output_spans.size() > peer::kMaxGatherSpans ||
       !ValidateGatherOutput(request.output.bytes, output_spans, total_bytes,
                             &output_extent))
@@ -474,7 +475,7 @@ Status NpuRuntime::GatherRead(const CpuGatherReadRequest& request) {
       direct ? request.spans.data() : nullptr,
       direct ? static_cast<std::uint32_t>(request.spans.size()) : 0U, ready.sequence,
       ready.total_bytes, request.stream, request.timing, request.profile_detail,
-      request.sq_batch_wqes});
+      request.sq_batch_wqes, request.read_task_spans});
 }
 
 RuntimeCore& NpuRuntime::core() {

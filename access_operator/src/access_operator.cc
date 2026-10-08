@@ -587,6 +587,8 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
   if (request.output.device != DeviceKind::kNpu || !request.output.valid() ||
       request.stream == nullptr || request.bytes == 0U ||
       request.output_spans == nullptr || request.output_span_count == 0U ||
+      request.output_span_count > aicpu_urma::kGatherMaxSpans ||
+      request.read_task_spans > aicpu_urma::kGatherMaxSpans ||
       (request.sq_batch_wqes != 8U && request.sq_batch_wqes != 16U &&
        request.sq_batch_wqes != 32U && request.sq_batch_wqes != 64U) ||
       request.sgl_size == 0U ||
@@ -609,13 +611,15 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
   const auto descriptor_start = std::chrono::steady_clock::now();
   const std::size_t descriptor_bytes =
       static_cast<std::size_t>(request.output_span_count) * sizeof(GatherOutputSpan);
-  if (descriptor_bytes > impl_->gather_output_spans_capacity) {
+  const auto storage_bytes = aicpu_urma::GatherOutputStorageBytes(
+      request.output_span_count, request.read_task_spans);
+  if (storage_bytes > impl_->gather_output_spans_capacity) {
     void* descriptors = nullptr;
-    if (aclrtMalloc(&descriptors, descriptor_bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS)
+    if (aclrtMalloc(&descriptors, storage_bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS)
       return Internal("failed to allocate GatherRead HBM SGL descriptors");
     if (impl_->gather_output_spans != nullptr) (void)aclrtFree(impl_->gather_output_spans);
     impl_->gather_output_spans = descriptors;
-    impl_->gather_output_spans_capacity = descriptor_bytes;
+    impl_->gather_output_spans_capacity = storage_bytes;
   }
   if (aclrtMemcpy(impl_->gather_output_spans, impl_->gather_output_spans_capacity,
                   request.output_spans, descriptor_bytes,
@@ -671,6 +675,7 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
   arguments.worker_count = impl_->config.npu_core_count;
   arguments.profile_detail = request.profile_detail ? 1U : 0U;
   arguments.sq_batch_wqes = request.sq_batch_wqes;
+  arguments.read_task_spans = request.read_task_spans;
   const aclrtStream stream = static_cast<aclrtStream>(request.stream);
   const auto launch_start = std::chrono::steady_clock::now();
   const int32_t launch = aicpu_urma::LaunchGatherRead(&arguments, stream);
@@ -744,6 +749,9 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
     request.timing->scatter_worker_ns = 0U;
     request.timing->sq_write_calls = 0U;
     request.timing->sq_wqebbs = 0U;
+    request.timing->read_tasks = 0U;
+    request.timing->scatter_schedule_ns = 0U;
+    request.timing->read_task_spans = request.read_task_spans;
     request.timing->workers = {};
   }
   for (std::uint32_t worker = 0U; copy == ACL_SUCCESS && worker < arguments.worker_count;
@@ -781,10 +789,14 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
         request.timing->read_wqes += worker_status.read_wqes;
         request.timing->sq_write_calls += worker_status.sq_write_calls;
         request.timing->sq_wqebbs += worker_status.sq_wqebbs;
+        request.timing->read_tasks += worker_status.read_tasks;
+        request.timing->scatter_schedule_ns = std::max(request.timing->scatter_schedule_ns,
+                                                       worker_status.scatter_schedule_ns);
         request.timing->workers[worker] = {
             worker_status.scatter_begin_ns, worker_status.scatter_end_ns,
             worker_status.scatter_end_ns - worker_status.scatter_begin_ns,
-            worker_status.read_wqes, worker_status.sq_write_calls, worker_status.sq_wqebbs};
+            worker_status.read_wqes, worker_status.sq_write_calls, worker_status.sq_wqebbs,
+            worker_status.read_tasks};
       }
     }
     if (valid_status && sync == ACL_SUCCESS) continue;

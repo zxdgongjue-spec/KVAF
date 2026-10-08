@@ -15,7 +15,7 @@
 extern "C" std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args);
 extern "C" std::uint32_t KvafAicpuUrmaGatherScatter(kvaf::aicpu_urma::GatherReadArgs* args);
 
-void TestRpcGather() {
+void TestRpcGather(std::uint32_t task_spans = 0U) {
   std::array<std::uint8_t, 256> remote{};
   std::array<std::uint8_t, 256> output{};
   output.fill(0xa5U);
@@ -29,6 +29,8 @@ void TestRpcGather() {
       {128U, 5U, 0U}, {0U, 5U, 0U}, {112U, 5U, 0U},
       {16U, 5U, 0U}, {96U, 5U, 0U}, {32U, 5U, 0U},
       {80U, 5U, 0U}, {48U, 5U, 0U}, {64U, 8U, 0U}}};
+  alignas(64) std::array<std::uint8_t, 512> descriptor_storage{};
+  std::memcpy(descriptor_storage.data(), output_spans.data(), sizeof(output_spans));
   for (std::uint32_t index = 0U; index < 128U; ++index)
     remote[index] = static_cast<std::uint8_t>(index);
   KvafBatchGetDirectUrmaEntity entity{};
@@ -65,7 +67,8 @@ void TestRpcGather() {
   args.remote_command = base + 208U;
   args.remote_notify = base + 192U;
   args.remote_ack = base + 200U;
-  args.output_spans = reinterpret_cast<std::uint64_t>(output_spans.data());
+  args.output_spans = reinterpret_cast<std::uint64_t>(descriptor_storage.data());
+  args.read_task_spans = task_spans;
   args.output_extent = 133U;
   args.output_span_count = output_spans.size();
   args.sgl_size = kvaf::kGatherMaxSglSize + 2U;
@@ -132,7 +135,9 @@ void TestRpcGather() {
   assert(status.magic == kvaf::aicpu_urma::kGatherStatusMagic);
   assert(status.result == 0U && status.phase == 3U && status.ack_seen == 1U);
   assert(status.sequence == 1U && status.cqe_word == 4U);
-  assert(status.sq_producer_index == 68U && status.cq_consumer_index == 3U);
+  const auto completions = task_spans != 0U ? 4U : 3U;
+  assert(status.sq_producer_index == 68U && status.cq_consumer_index == completions);
+  assert(status.read_tasks == (task_spans != 0U ? 2U : 1U));
   assert(status.ack_polls == 1U && status.read_wqes == 2U);
   assert(status.cpu.dispatch_ns == 11U && status.cpu.notify_spin_ns == 22U);
   assert(status.cpu.source_cache_ns == 33U && status.cpu.copy_ns == 44U);
@@ -142,7 +147,7 @@ void TestRpcGather() {
   assert(status.notify_post_ns > 0U && status.notify_cq_ns > 0U);
   assert(status.ack_post_ns > 0U && status.ack_cq_ns > 0U);
   assert(status.scatter_post_ns > 0U && status.scatter_cq_ns > 0U);
-  assert(sq_doorbell == 68U && cq_doorbell == 3U);
+  assert(sq_doorbell == 68U && cq_doorbell == completions);
   std::array<std::uint8_t, 256> expected{};
   expected.fill(0xa5U);
   std::size_t staging_offset = 0U;
@@ -424,12 +429,18 @@ void TestScatterStagingBoundary(std::uint32_t sq_batch_wqes,
 }
 
 void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count,
-                         bool detailed = true, std::uint32_t sq_batch_wqes = 8U) {
+                         bool detailed = true, std::uint32_t sq_batch_wqes = 8U,
+                         std::uint32_t task_spans = 0U, bool delay_followers = false) {
   using kvaf::aicpu_urma::GatherReadStatus;
   constexpr std::uint32_t depth = 128U;
   alignas(64) std::array<std::uint8_t, 4096> remote{};
   std::array<std::uint8_t, 2048> output{};
   std::vector<kvaf::GatherOutputSpan> targets(span_count);
+  std::vector<std::uint64_t> target_storage(
+      (kvaf::aicpu_urma::GatherOutputStorageBytes(span_count, task_spans) + 63U) / 8U + 1U);
+  const auto target_address = (reinterpret_cast<std::uint64_t>(target_storage.data()) + 63U) &
+                              ~std::uint64_t{63U};
+  std::array<std::atomic<std::uint32_t>, 2048> output_writes{};
   std::vector<kvaf::peer::GatherSpan> sources(span_count);
   std::array<KvafBatchGetDirectUrmaEntity, 8> entities{};
   std::array<KvafBatchGetQueueState, 8> queues{};
@@ -475,7 +486,7 @@ void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count,
   args.queue_state = reinterpret_cast<std::uint64_t>(queues.data());
   args.core_status = reinterpret_cast<std::uint64_t>(statuses.data());
   args.output = entities[0].local_hbm_address;
-  args.output_spans = reinterpret_cast<std::uint64_t>(targets.data());
+  args.output_spans = target_address;
   args.output_extent = span_count * 16U;
   args.output_span_count = span_count;
   args.sgl_size = 6U;
@@ -483,6 +494,7 @@ void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count,
   args.worker_count = workers;
   args.profile_detail = detailed ? 1U : 0U;
   args.sq_batch_wqes = sq_batch_wqes;
+  args.read_task_spans = task_spans;
   args.remote_staging = base + 1024U;
   args.remote_notify = base + 3008U;
   args.remote_ack = base + 3016U;
@@ -543,6 +555,12 @@ void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count,
             assert(words[offset + 1U] == entities[worker].local_token_id);
             std::memcpy(reinterpret_cast<void*>(address(words[offset + 2U], words[offset + 3U])),
                         reinterpret_cast<const void*>(source), words[offset]);
+            const auto destination = address(words[offset + 2U], words[offset + 3U]);
+            if (destination >= args.output && destination - args.output < args.output_extent) {
+              assert(words[offset] <= args.output_extent - (destination - args.output));
+              for (std::uint32_t byte = 0U; byte < words[offset]; ++byte)
+                ++output_writes[destination - args.output + byte];
+            }
             source += words[offset];
           }
         }
@@ -555,15 +573,18 @@ void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count,
       }
     });
   }
-  const auto run_scatter = [&] {
+  const auto run_scatter = [&](bool first_synchronously = false) {
     std::vector<std::thread> cores;
     std::array<std::uint32_t, 8> results{};
-    for (std::uint32_t core = 0U; core < workers; ++core)
+    if (first_synchronously) results[0U] = KvafAicpuUrmaGatherScatter(&args);
+    for (std::uint32_t core = first_synchronously ? 1U : 0U; core < workers; ++core)
       cores.emplace_back([&, core] { results[core] = KvafAicpuUrmaGatherScatter(&args); });
     for (auto& core : cores) core.join();
     return results;
   };
   const auto prepare_sources = [&] {
+    std::memcpy(reinterpret_cast<void*>(args.output_spans), targets.data(),
+                targets.size() * sizeof(targets.front()));
     const kvaf::peer::GatherDescriptorHeader header{
         kvaf::peer::kGatherDescriptorMagic, args.sequence, args.remote_staging,
         span_count, total_bytes};
@@ -581,6 +602,7 @@ void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count,
     }
     args.bytes = total_bytes;
     output.fill(0xa5U);
+    for (auto& writes : output_writes) writes.store(0U);
     for (std::uint32_t index = 0U; index < args.output_extent; ++index)
       remote[index] = static_cast<std::uint8_t>(index + round);
     prepare_sources();
@@ -590,13 +612,27 @@ void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count,
       const auto first = span_count * worker / workers;
       for (std::uint32_t index = 0U; index < first; ++index)
         expected_offset += targets[index].length;
-      assert(queues[worker].reserved[kvaf::aicpu_urma::kGatherStagingOffsetSlot] == expected_offset);
+      if (task_spans == 0U)
+        assert(queues[worker].reserved[kvaf::aicpu_urma::kGatherStagingOffsetSlot] == expected_offset);
+    }
+    const auto task_count = kvaf::aicpu_urma::GatherTaskCount(span_count, task_spans);
+    if (task_spans != 0U) {
+      const auto* tasks = reinterpret_cast<const kvaf::aicpu_urma::GatherTaskState*>(
+          args.output_spans + kvaf::aicpu_urma::GatherTaskStateOffset(span_count));
+      assert(tasks->next_task == 0U);
+      const auto* offsets = reinterpret_cast<const std::uint64_t*>(tasks + 1U);
+      std::uint64_t expected_offset = 0U;
+      for (std::uint32_t index = 0U; index < span_count; ++index) {
+        if (index % task_spans == 0U) assert(offsets[index / task_spans] == expected_offset);
+        expected_offset += targets[index].length;
+      }
     }
     for (std::uint32_t index = 0U; index < args.output_extent; ++index)
       assert(output[index] == 0xa5U);
-    const auto results = run_scatter();
+    const auto results = run_scatter(delay_followers);
     assert(queues[0].reserved[0] == workers);
     std::uint64_t wqes = 0U;
+    std::uint64_t completed_tasks = 0U;
     for (std::uint32_t worker = 0U; worker < workers; ++worker) {
       assert(results[worker] == 0U);
       GatherReadStatus status{};
@@ -611,7 +647,8 @@ void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count,
       else
         assert(status.scatter_encode_ns == 0U && status.scatter_sq_write_ns == 0U &&
                status.scatter_doorbell_ns == 0U);
-      assert(status.scatter_init_ns + status.scatter_plan_ns + status.scatter_post_ns +
+      assert(status.scatter_init_ns + status.scatter_schedule_ns +
+                 status.scatter_plan_ns + status.scatter_post_ns +
                  status.scatter_cq_ns <= status.scatter_end_ns - status.scatter_begin_ns);
       if (status.read_wqes != 0U) {
         assert(status.scatter_post_ns > 0U);
@@ -623,31 +660,42 @@ void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count,
       assert(status.cq_consumer_index == queues[worker].cq_consumer_index);
       assert(status.scatter_cache_ns == 0U);
       wqes += status.read_wqes;
+      completed_tasks += status.read_tasks;
+      if (task_spans != 0U && delay_followers)
+        assert(status.read_tasks == (worker == 0U ? task_count : 0U));
     }
     std::uint32_t expected_wqes = 0U;
-    for (std::uint32_t worker = 0U; worker < workers; ++worker) {
-      const auto first = span_count * worker / workers;
-      const auto last = span_count * (worker + 1U) / workers;
+    for (std::uint32_t part = 0U; part < (task_spans != 0U ? task_count : workers); ++part) {
+      const auto first = task_spans != 0U ? part * task_spans : span_count * part / workers;
+      const auto last = task_spans != 0U ? std::min(first + task_spans, span_count)
+                                        : span_count * (part + 1U) / workers;
       expected_wqes += (last - first + 5U) / 6U;
     }
+    assert(completed_tasks == (task_spans != 0U ? task_count : std::min(workers, span_count)));
     assert(wqes == expected_wqes && notifications.load() == round);
     std::array<std::uint8_t, 2048> expected{};
+    std::array<std::uint32_t, 2048> expected_writes{};
     expected.fill(0xa5U);
     std::size_t prefix = 0U;
     for (const auto& span : targets) {
       std::memcpy(expected.data() + span.offset, remote.data() + 1024U + prefix, span.length);
       prefix += span.length;
+      for (std::uint32_t byte = 0U; byte < span.length; ++byte)
+        ++expected_writes[span.offset + byte];
     }
     assert(std::memcmp(output.data(), expected.data(), args.output_extent) == 0);
+    for (std::uint32_t byte = 0U; byte < args.output_extent; ++byte)
+      assert(output_writes[byte].load() == expected_writes[byte]);
     assert(KvafAicpuUrmaGatherScatter(&args) != 0U);
   }
   args.sequence = 4U;
   prepare_sources();
   assert(KvafAicpuUrmaGatherRead(&args) == 0U);
-  error_worker.store(static_cast<int>(workers - 1U));
-  run_scatter();
+  const auto failing_worker = task_spans != 0U ? 0U : workers - 1U;
+  error_worker.store(static_cast<int>(failing_worker));
+  run_scatter(task_spans != 0U);
   GatherReadStatus failed{};
-  std::memcpy(&failed, statuses.data() + (workers - 1U) * KVAF_AIV_BATCH_GET_STATUS_BYTES, sizeof(failed));
+  std::memcpy(&failed, statuses.data() + failing_worker * KVAF_AIV_BATCH_GET_STATUS_BYTES, sizeof(failed));
   assert(failed.result == 8U && (failed.cqe_word & (1U << 16U)) != 0U);
   error_worker.store(-1);
   args.sequence = 5U;
@@ -673,12 +721,17 @@ void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count,
   args.sq_batch_wqes = 7U;
   assert(KvafAicpuUrmaGatherRead(&args) != 0U);
   assert(notifications.load() == 5U);
+  args.sq_batch_wqes = 8U;
+  args.read_task_spans = 65537U;
+  assert(KvafAicpuUrmaGatherRead(&args) != 0U);
+  assert(KvafAicpuUrmaGatherScatter(&args) != 0U);
   stopped.store(true, std::memory_order_release);
   for (auto& device : hardware) device.join();
 }
 
 int main() {
   TestRpcGather();
+  TestRpcGather(6U);
   TestUrmaDescriptorGather();
   TestScatterStagingBoundary(8U);
   TestScatterStagingBoundary(16U);
@@ -698,5 +751,10 @@ int main() {
   TestParallelScatter(8U, 41U, true, 16U);
   TestParallelScatter(8U, 41U, false, 32U);
   TestParallelScatter(8U, 41U, true, 64U);
+  TestParallelScatter(5U, 41U, true, 8U, 6U, true);
+  TestParallelScatter(5U, 41U, true, 8U, 10U);
+  TestParallelScatter(6U, 41U, false, 16U, 12U);
+  TestParallelScatter(8U, 41U, true, 32U, 1U);
+  TestParallelScatter(5U, 3U, true, 64U, 192U);
   std::cout << "AICPU gather/read kernel simulation: PASS\n";
 }

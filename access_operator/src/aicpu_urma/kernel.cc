@@ -295,7 +295,8 @@ void ScatterOutputRange(const kvaf::aicpu_urma::GatherReadArgs& args,
                         kvaf::aicpu_urma::GatherReadStatus& status,
                         std::uint32_t first, std::uint32_t last,
                         std::uint64_t remote_offset) {
-  if (status.scatter_begin_ns == 0U) status.scatter_begin_ns = NowNs();
+  const auto range_start_ns = NowNs();
+  if (status.scatter_begin_ns == 0U) status.scatter_begin_ns = range_start_ns;
   const auto* spans = reinterpret_cast<const kvaf::GatherOutputSpan*>(args.output_spans);
   const auto sgl_size = std::min(args.sgl_size, kvaf::kGatherMaxSglSize);
   kvaf::aicpu_urma::ScatterTransfer data[64];
@@ -306,7 +307,7 @@ void ScatterOutputRange(const kvaf::aicpu_urma::GatherReadArgs& args,
   std::uint32_t span_offset = 0U;
   std::uint32_t cqe_word = 0U;
   auto plan_start_ns = NowNs();
-  status.scatter_init_ns = plan_start_ns - status.scatter_begin_ns;
+  status.scatter_init_ns += plan_start_ns - range_start_ns;
   while (span_index < last && status.result == 0U) {
     auto& transfer = data[batch_count];
     transfer = {};
@@ -344,6 +345,33 @@ void ScatterOutputRange(const kvaf::aicpu_urma::GatherReadArgs& args,
       batch_count = 0U;
       plan_start_ns = NowNs();
     }
+  }
+  status.scatter_end_ns = NowNs();
+}
+
+template <typename Entity, typename Queue>
+void ScatterOutputTasks(const kvaf::aicpu_urma::GatherReadArgs& args,
+                        const Entity& entity, Queue& queue,
+                        kvaf::aicpu_urma::GatherReadStatus& status) {
+  using namespace kvaf::aicpu_urma;
+  if (status.scatter_begin_ns == 0U) status.scatter_begin_ns = NowNs();
+  auto* tasks = reinterpret_cast<GatherTaskState*>(
+      args.output_spans + GatherTaskStateOffset(args.output_span_count));
+  const auto* offsets = reinterpret_cast<const std::uint64_t*>(tasks + 1U);
+  const auto count = GatherTaskCount(args.output_span_count, args.read_task_spans);
+  while (status.result == 0U) {
+    const auto schedule_start_ns = NowNs();
+    const auto task = __atomic_fetch_add(&tasks->next_task, 1U, __ATOMIC_RELAXED);
+    if (task >= count) {
+      status.scatter_schedule_ns += NowNs() - schedule_start_ns;
+      break;
+    }
+    const auto first = static_cast<std::uint32_t>(task * args.read_task_spans);
+    const auto last = std::min(first + args.read_task_spans, args.output_span_count);
+    const auto remote_offset = offsets[task];
+    status.scatter_schedule_ns += NowNs() - schedule_start_ns;
+    ++status.read_tasks;
+    ScatterOutputRange(args, entity, queue, status, first, last, remote_offset);
   }
   status.scatter_end_ns = NowNs();
 }
@@ -581,7 +609,7 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
   const std::uint64_t source_bytes =
       kvaf::peer::GatherDescriptorBytes(args->source_span_count);
   if (!Valid(entity, queue) || entity.local_token_id == 0U || args->worker_count > 8U ||
-      args->reserved != 0U || args->profile_detail > 1U ||
+      args->read_task_spans > 65536U || args->profile_detail > 1U ||
       (args->sq_batch_wqes != 8U && args->sq_batch_wqes != 16U &&
        args->sq_batch_wqes != 32U && args->sq_batch_wqes != 64U) ||
       args->sequence == 0U || args->bytes == 0U ||
@@ -620,16 +648,32 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
       reinterpret_cast<const kvaf::GatherOutputSpan*>(args->output_spans);
   auto* queues = reinterpret_cast<KvafBatchGetQueueState*>(args->queue_state);
   const auto workers = std::max(args->worker_count, 1U);
+  std::uint64_t* task_offsets = nullptr;
+  if (args->read_task_spans != 0U) {
+    auto* tasks = reinterpret_cast<kvaf::aicpu_urma::GatherTaskState*>(
+        args->output_spans + kvaf::aicpu_urma::GatherTaskStateOffset(args->output_span_count));
+    tasks->next_task = 0U;
+    task_offsets = reinterpret_cast<std::uint64_t*>(tasks + 1U);
+  }
   std::uint32_t next_worker = 0U;
   std::uint32_t next_first = 0U;
+  std::uint32_t next_task_first = 0U;
+  std::uint32_t task_index = 0U;
   std::uint64_t output_bytes = 0U;
   for (std::uint32_t index = 0U; index < args->output_span_count; ++index) {
-    while (next_worker < workers && index == next_first) {
-      queues[next_worker].reserved[kvaf::aicpu_urma::kGatherStagingOffsetSlot] = output_bytes;
-      ++next_worker;
-      if (next_worker < workers)
-        next_first = static_cast<std::uint32_t>(
-            static_cast<std::uint64_t>(args->output_span_count) * next_worker / workers);
+    if (task_offsets != nullptr) {
+      if (index == next_task_first) {
+        task_offsets[task_index++] = output_bytes;
+        next_task_first += args->read_task_spans;
+      }
+    } else {
+      while (next_worker < workers && index == next_first) {
+        queues[next_worker].reserved[kvaf::aicpu_urma::kGatherStagingOffsetSlot] = output_bytes;
+        ++next_worker;
+        if (next_worker < workers)
+          next_first = static_cast<std::uint32_t>(
+              static_cast<std::uint64_t>(args->output_span_count) * next_worker / workers);
+      }
     }
     const auto& span = output_spans[index];
     if (span.reserved != 0U || span.length == 0U ||
@@ -716,7 +760,12 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
   }
   if (status.result == 0U && args->worker_count <= 1U) {
     status.phase = direct ? 4U : 3U;
-    ScatterOutputRange(*args, entity, queue, status, 0U, args->output_span_count, 0U);
+    if (args->read_task_spans != 0U)
+      ScatterOutputTasks(*args, entity, queue, status);
+    else {
+      status.read_tasks = 1U;
+      ScatterOutputRange(*args, entity, queue, status, 0U, args->output_span_count, 0U);
+    }
   }
   status.sq_producer_index = queue.sq_producer_index;
   status.cq_consumer_index = queue.cq_consumer_index;
@@ -729,7 +778,7 @@ std::uint32_t KvafAicpuUrmaGatherScatter(kvaf::aicpu_urma::GatherReadArgs* args)
   using kvaf::aicpu_urma::GatherReadStatus;
   if (args == nullptr || args->channel_entity == 0U || args->queue_state == 0U ||
       args->core_status == 0U || args->worker_count < 2U || args->worker_count > 8U ||
-      args->profile_detail > 1U ||
+      args->profile_detail > 1U || args->read_task_spans > 65536U ||
       (args->sq_batch_wqes != 8U && args->sq_batch_wqes != 16U &&
        args->sq_batch_wqes != 32U && args->sq_batch_wqes != 64U))
     return 1U;
@@ -764,12 +813,17 @@ std::uint32_t KvafAicpuUrmaGatherScatter(kvaf::aicpu_urma::GatherReadArgs* args)
   }
   Initialize(queue);
   status.scatter_begin_ns = worker_begin_ns;
-  const auto first = static_cast<std::uint32_t>(
-      static_cast<std::uint64_t>(args->output_span_count) * worker / args->worker_count);
-  const auto last = static_cast<std::uint32_t>(
-      static_cast<std::uint64_t>(args->output_span_count) * (worker + 1U) / args->worker_count);
-  const auto remote_offset = queue.reserved[kvaf::aicpu_urma::kGatherStagingOffsetSlot];
-  ScatterOutputRange(*args, entity, queue, status, first, last, remote_offset);
+  if (args->read_task_spans != 0U) {
+    ScatterOutputTasks(*args, entity, queue, status);
+  } else {
+    const auto first = static_cast<std::uint32_t>(
+        static_cast<std::uint64_t>(args->output_span_count) * worker / args->worker_count);
+    const auto last = static_cast<std::uint32_t>(
+        static_cast<std::uint64_t>(args->output_span_count) * (worker + 1U) / args->worker_count);
+    const auto remote_offset = queue.reserved[kvaf::aicpu_urma::kGatherStagingOffsetSlot];
+    status.read_tasks = first != last ? 1U : 0U;
+    ScatterOutputRange(*args, entity, queue, status, first, last, remote_offset);
+  }
   status.sq_producer_index = queue.sq_producer_index;
   status.cq_consumer_index = queue.cq_consumer_index;
   Barrier();

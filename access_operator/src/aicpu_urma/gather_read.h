@@ -9,8 +9,28 @@ namespace kvaf::aicpu_urma {
 
 constexpr std::uint64_t kGatherStatusMagic = 0x4b56414647415448ULL;
 constexpr std::uint32_t kGatherScratchBytes = 64U;
+constexpr std::uint32_t kGatherMaxSpans = 65536U;
 constexpr std::uint32_t kGatherWorkerCounterSlot = 0U;
 constexpr std::uint32_t kGatherStagingOffsetSlot = 1U;
+
+struct alignas(64) GatherTaskState {
+  std::uint64_t next_task;
+};
+
+inline std::uint32_t GatherTaskCount(std::uint32_t spans, std::uint32_t task_spans) {
+  return task_spans == 0U ? 0U : (spans + task_spans - 1U) / task_spans;
+}
+
+inline std::uint64_t GatherTaskStateOffset(std::uint32_t spans) {
+  return (static_cast<std::uint64_t>(spans) * sizeof(GatherOutputSpan) + 63U) &
+         ~std::uint64_t{63U};
+}
+
+inline std::uint64_t GatherOutputStorageBytes(std::uint32_t spans, std::uint32_t task_spans) {
+  return task_spans == 0U ? static_cast<std::uint64_t>(spans) * sizeof(GatherOutputSpan)
+      : GatherTaskStateOffset(spans) + sizeof(GatherTaskState) +
+          static_cast<std::uint64_t>(GatherTaskCount(spans, task_spans)) * sizeof(std::uint64_t);
+}
 
 struct GatherReadStatus {
   std::uint64_t magic;
@@ -49,6 +69,8 @@ struct GatherReadStatus {
   std::uint64_t profile_detail;
   std::uint64_t sq_write_calls;
   std::uint64_t sq_wqebbs;
+  std::uint64_t read_tasks;
+  std::uint64_t scatter_schedule_ns;
 };
 
 struct GatherReadArgs {
@@ -70,7 +92,7 @@ struct GatherReadArgs {
   std::uint32_t sgl_size;
   std::uint32_t source_span_count;
   std::uint32_t worker_count;
-  std::uint32_t reserved;
+  std::uint32_t read_task_spans;
   std::uint32_t profile_detail;
   std::uint32_t sq_batch_wqes{8U};
 };

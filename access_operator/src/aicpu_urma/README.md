@@ -107,15 +107,45 @@ GatherRead 默认使用一个 worker；`--aicpu-cores` 接受 1 到 8 的任意�
 建链时为每个 worker 分配独立 Jetty、SQ/CQ，后续轮次复用，不共享 producer index。
 Host 在同一 ACL stream 上顺序排入两个 kernel：单 block 的 GatherRead 负责
 WRITE 源清单、通知一次 CPU、轮询 gather ACK；随后 N block 的 GatherScatter
-将目标 span 按索引分为 N 个连续区间。各 block 用原子计数获取唯一 worker ID，
-控制核在已有的目标 span 校验遍历中同时计算每核 staging 起点，存入该核
-queue state 的保留槽位；READ block 直接读取起点，不再逐核扫描前置 span。
-每轮重新计算，源和目标布局变化时不会复用旧偏移。然后各核独立组 WQE、写 SQ、
+执行 READ。各 block 用原子计数获取唯一 worker ID，独立组 WQE、写 SQ、
 敲 doorbell、等待自己的 READ CQE。没有跨 block 自旋屏障，也没有设备端
 OpenMP 或新建 std::thread；并行 block 由 ACL/AICPU Runtime 调度。
+原生客户端默认 `--read-schedule dynamic --read-task-spans 192`：
+将目标清单切成每批最多 192 个 span，worker 用原子计数领取一批，READ 完成后
+继续领取，直到任务耗尽。4096 个 span 会形成 22 批；SGL=6 且没有超大 span 时，
+一个完整批次包含 32 条 READ WQE。可用 `--read-task-spans 96/192/384` 对比粒度，
+此参数接受 1..65536。小批次增加领取和 CQ 等待次数，实际收益需设备对比。
+控制核在已有的布局校验遍历中生成每批 staging 起点；起点表和独占缓存行的
+任务计数器位于输出描述符分配的尾部，容量随描述符缓冲区复用。
+每轮重置计数并重建起点，支持变长 span、地址乱序和布局变化。
+未领到任务的 worker 直接结束，不等待其他 worker，也不共用 SQ/CQ。
+`--read-schedule static` 使用原固定分工：每个 worker 一个连续索引区间，
+起点保存在各自 queue state 中。Runtime API 的 `read_task_spans=0` 表示固定分工，
+正数表示动态批次最多包含的 span 数。
 CPU gather 算法和线程数不受此参数影响；用于准备源数据的 BatchPut/Get 仍为单核。
 单核保留原先一次 kernel launch，多核多一次 launch，因此小 batch 可能更慢。
-多核性能尚未在真实设备验证；先做小 batch 正确性测试，再对比相同 workload。
+动态调度已覆盖 Host 内核模拟中的变长 span、尾批、SQ 回绕、空任务 worker、
+晚启动 worker 和 CQ 错误；真实设备上的性能需实测。
+
+更新动态调度时，需要在 NPU 侧执行 `./build.sh aicpu-urma --install-kernel`，
+同时更新 Host 和 kernel；CPU 服务无需因这项调度修改而重编译。
+沿用已启动的 CPU 服务，在 NPU 终端对比：
+
+```bash
+./build.sh aicpu-urma --install-kernel
+for schedule in static dynamic; do
+  build-aicpu-urma/tests/kvaf_aicpu_gather_read_client \
+    --peer 127.0.0.1:28990 --device-id 6 \
+    --blocks 4096 --block-bytes 656 --output-stride 1312 --sgl-size 6 \
+    --aicpu-cores 5 --sq-batch-wqes 8 \
+    --read-schedule "$schedule" --read-task-spans 192 \
+    --warmup 10 --iterations 1000 --profile-detail 1
+done
+```
+
+比较 READ 整体墙钟耗时、各 worker 的 `read_tasks` / `read_wqes` 和结束时刻。
+`claim tasks` 是每轮各 worker 领取任务耗时的最大值再求平均，包含在 READ 总耗时中；
+task initialization 是各 worker 累计的批次初始化耗时，再按每轮最大值汇总。
 
 GatherRead 仅在每次轮询 AICPU CQE 前清理并失效对应缓存行；CPU 通知、ack、
 descriptor、源 DDR、staging 和 AICPU 的描述符、SQ、HBM 输出、状态缓冲

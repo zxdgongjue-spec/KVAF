@@ -24,6 +24,7 @@ struct CpuGatherReadRequest {
   GatherReadTiming* timing{nullptr};
   bool profile_detail{false};
   std::uint32_t sq_batch_wqes{8U};
+  std::uint32_t read_task_spans{0U};
 };
 
 struct NpuRuntimeOptions {

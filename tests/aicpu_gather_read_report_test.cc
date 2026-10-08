@@ -94,6 +94,9 @@ int main() {
   first.scatter_doorbell_ns = 500U;
   first.scatter_start_skew_ns = 1500U;
   first.scatter_worker_ns = 5000U;
+  first.read_task_spans = 192U;
+  first.read_tasks = 22U;
+  first.scatter_schedule_ns = 500U;
   std::FILE* parallel_output = std::tmpfile();
   assert(parallel_output != nullptr);
   kvaf::aicpu_gather_read_client::PrintGatherReadTimeline(parallel_output, 1.5, {first});
@@ -104,20 +107,24 @@ int main() {
     parallel_report.append(buffer, bytes);
   std::fclose(parallel_output);
   assert(parallel_report.find("AICPU READ staging -> HBM: 6.500 us") != std::string::npos);
-  assert(parallel_report.find("4 AICPU cores, independent SQ/CQ") != std::string::npos);
+  assert(parallel_report.find("4 AICPU workers, independent SQ/CQ") != std::string::npos);
   assert(parallel_report.find("must not be added") != std::string::npos);
   assert(parallel_report.find("prepare worker starts: 2.300 us") != std::string::npos);
-  assert(parallel_report.find("Worker initialization: 0.700 us") != std::string::npos);
+  assert(parallel_report.find("Task initialization: 0.700 us") != std::string::npos);
+  assert(parallel_report.find("Dynamic READ: up to 192 spans/task, 22.00 tasks/round; claim tasks: 0.500 us") !=
+         std::string::npos);
   assert(parallel_report.find("Within submit: Encode WQEs: 1.000 us | Write SQ: 1.500 us") !=
          std::string::npos);
   assert(parallel_report.find("Doorbell and barriers: 0.500 us") != std::string::npos);
   assert(parallel_report.find("Worker start spread: 1.500 us | Longest worker duration: 5.000 us") !=
          std::string::npos);
   assert(parallel_report.find("encode=1000 sq_write=1500 doorbell_barriers=500") != std::string::npos);
+  assert(parallel_report.find("READ schedule: task_spans=192 tasks=22.00 claim_ns=500") !=
+         std::string::npos);
 
-  first.workers[1] = {1000U, 5000U, 4000U, 2U, 1U, 6U};
+  first.workers[1] = {1000U, 5000U, 4000U, 2U, 1U, 6U, 1U};
   second = first;
-  second.workers[1] = {3000U, 7000U, 4000U, 2U, 1U, 6U};
+  second.workers[1] = {3000U, 7000U, 4000U, 2U, 1U, 6U, 3U};
   std::FILE* worker_output = std::tmpfile();
   assert(worker_output != nullptr);
   kvaf::aicpu_gather_read_client::PrintGatherReadWorkers(worker_output, {first, second});
@@ -128,7 +135,7 @@ int main() {
   std::fclose(worker_output);
   assert(worker_report.find("worker=1 start_avg=2.000 start_p50=2.000 start_p95=2.900 end_avg=6.000") !=
          std::string::npos);
-  assert(worker_report.find("duration_avg=4.000 read_wqes=2.00 sq_copies=1.00 sq_wqebbs=6.00") !=
+  assert(worker_report.find("duration_avg=4.000 read_wqes=2.00 sq_copies=1.00 sq_wqebbs=6.00 read_tasks=2.00") !=
          std::string::npos);
   assert(worker_report.find("not physical CPU IDs") != std::string::npos);
   bool rejected = false;

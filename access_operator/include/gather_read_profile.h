@@ -13,6 +13,7 @@ struct GatherReadWorkerTiming {
   std::uint64_t read_wqes{0U};
   std::uint64_t sq_write_calls{0U};
   std::uint64_t sq_wqebbs{0U};
+  std::uint64_t read_tasks{0U};
 };
 
 struct GatherReadTiming {
@@ -60,6 +61,9 @@ struct GatherReadTiming {
   std::uint64_t read_wqes{0U};
   std::uint64_t sq_write_calls{0U};
   std::uint64_t sq_wqebbs{0U};
+  std::uint64_t read_tasks{0U};
+  std::uint64_t scatter_schedule_ns{0U};
+  std::uint32_t read_task_spans{0U};
 };
 
 namespace peer {
