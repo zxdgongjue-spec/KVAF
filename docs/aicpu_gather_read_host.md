@@ -20,8 +20,8 @@
 HBM output
   [离散输出数据及间隙]
   [对齐到 64 B]
-  [64 B 控制 scratch]
-  [32 B 源清单 header + source spans]
+  [64 B 控制 scratch；分块流水模式预留 8 × 64 B 独立轮询空间]
+  [48 B 源清单 header + source spans]
   [对齐到 64 B]
   [target spans]
   [动态任务计数器及 staging offsets（由 AICPU 初始化）]

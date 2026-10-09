@@ -97,6 +97,7 @@ class CpuGatherTeam {
 
   std::size_t Prepare(std::uint64_t staging, const std::vector<GatherSpan>& spans,
                       std::uint32_t total_bytes) {
+    pipeline_ready_ = nullptr;
     offsets_.resize(spans.size() + 1U);
     offsets_[0U] = 0U;
     for (std::size_t index = 0U; index < spans.size(); ++index)
@@ -154,9 +155,7 @@ class CpuGatherTeam {
            reinterpret_cast<std::uintptr_t>(staging_);
   }
 
-  void ProcessSource(std::size_t worker) const {
-    std::uint64_t offset = Boundary(worker);
-    const std::uint64_t end = Boundary(worker + 1U);
+  void CopyRange(std::uint64_t offset, std::uint64_t end) const {
     auto found = std::upper_bound(offsets_.begin(), offsets_.end(), offset);
     std::size_t index = static_cast<std::size_t>(found - offsets_.begin() - 1U);
     while (offset < end) {
@@ -168,6 +167,34 @@ class CpuGatherTeam {
       std::memcpy(staging_ + offset, source, bytes);
       offset += bytes;
       ++index;
+    }
+  }
+
+  void ProcessSource(std::size_t worker) {
+    if (pipeline_ready_ == nullptr) {
+      CopyRange(Boundary(worker), Boundary(worker + 1U));
+      return;
+    }
+    for (;;) {
+      const auto chunk = next_chunk_.fetch_add(1U, std::memory_order_relaxed);
+      if (chunk >= chunk_done_.size()) return;
+      const auto begin = static_cast<std::uint64_t>(chunk) * pipeline_chunk_bytes_;
+      CopyRange(begin, std::min(begin + pipeline_chunk_bytes_, total_bytes_));
+      GatherBarrier();
+      __atomic_store_n(&chunk_done_[chunk], 1U, __ATOMIC_RELEASE);
+      auto observed = __atomic_load_n(pipeline_ready_, __ATOMIC_ACQUIRE);
+      auto prefix = static_cast<std::size_t>(observed / pipeline_chunk_bytes_);
+      while (prefix < chunk_done_.size() &&
+             __atomic_load_n(&chunk_done_[prefix], __ATOMIC_ACQUIRE) != 0U)
+        ++prefix;
+      const auto ready_bytes = std::min(total_bytes_,
+          static_cast<std::uint64_t>(prefix) * pipeline_chunk_bytes_);
+      while (observed < ready_bytes) {
+        if (!__atomic_compare_exchange_n(pipeline_ready_, &observed, ready_bytes, false,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
+        GatherBarrier();
+        break;
+      }
     }
   }
 
@@ -237,6 +264,10 @@ class CpuGatherTeam {
   std::uint64_t total_bytes_{0U};
   std::size_t active_threads_{1U};
   std::vector<std::uint64_t> offsets_;
+  std::uint64_t* pipeline_ready_{nullptr};
+  std::uint32_t pipeline_chunk_bytes_{0U};
+  std::vector<std::uint32_t> chunk_done_;
+  std::atomic<std::size_t> next_chunk_{0U};
   alignas(64) std::atomic<std::uint32_t> phase_{0U};
   alignas(64) std::atomic<std::size_t> completed_{0U};
   std::atomic<bool> stopping_{false};

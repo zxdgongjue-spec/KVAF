@@ -121,6 +121,8 @@ void PackedStorage() {
       assert(required == 704U + 64U + target_offset + GatherOutputStorageBytes(count, task_spans));
       const auto upload_end = 704U + 64U + target_offset + count * sizeof(kvaf::GatherOutputSpan);
       assert(upload_end <= required);
+      assert(GatherReadPackedOutputBytes(656U, source_bytes, count, task_spans, 131072U) ==
+             required + 7U * 64U);
       if (task_spans != 0U)
         assert(required >= upload_end + sizeof(GatherTaskState));
     }

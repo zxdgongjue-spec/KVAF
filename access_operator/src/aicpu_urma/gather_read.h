@@ -13,6 +13,7 @@ constexpr std::uint32_t kGatherScratchBytes = 64U;
 constexpr std::uint32_t kGatherMaxSpans = 65536U;
 constexpr std::uint32_t kGatherWorkerCounterSlot = 0U;
 constexpr std::uint32_t kGatherStagingOffsetSlot = 1U;
+constexpr std::uint32_t kGatherPipelineSequenceSlot = 2U;
 
 struct GatherReadStatus {
   std::uint64_t magic;
@@ -53,6 +54,7 @@ struct GatherReadStatus {
   std::uint64_t sq_wqebbs;
   std::uint64_t read_tasks;
   std::uint64_t scatter_schedule_ns;
+  std::uint64_t ready_wait_ns;
 };
 
 struct GatherReadArgs {
@@ -78,6 +80,7 @@ struct GatherReadArgs {
   std::uint32_t profile_detail;
   std::uint32_t sq_batch_wqes{8U};
   GatherSqCopyMode sq_copy_mode{GatherSqCopyMode::kMemcpy};
+  std::uint32_t pipeline_chunk_bytes{0U};
 };
 
 static_assert(sizeof(GatherReadStatus) <= 384U, "GatherRead exceeds shared status buffer");

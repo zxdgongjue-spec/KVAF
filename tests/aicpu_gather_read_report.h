@@ -34,6 +34,7 @@ inline void PrintGatherReadTimeline(std::FILE* output, double mean_ms,
         : profile.scatter_plan_ns + profile.scatter_post_ns + profile.scatter_cq_ns);
   read_us /= profiles.size() * 1000.0;
   const bool parallel = average(&GatherReadTiming::aicpu_cores) > 1.0;
+  const bool pipeline = profiles.front().pipeline_chunk_bytes != 0U;
   const bool direct = average(&GatherReadTiming::source_write_ns) > 0.0;
   const double metadata_us = average_us(&GatherReadTiming::metadata_upload_ns);
 
@@ -77,11 +78,15 @@ inline void PrintGatherReadTimeline(std::FILE* output, double mean_ms,
   if (direct)
     std::fprintf(output, "    AICPU WRITE source list to CPU DDR: %.3f us\n",
                  average_us(&GatherReadTiming::source_write_ns));
-  std::fprintf(output,
-               "    AICPU notify CPU: %.3f us\n"
-               "    AICPU wait for CPU gather ack: %.3f us (overlaps CPU gather)\n",
-               average_us(&GatherReadTiming::notify_ns),
-               average_us(&GatherReadTiming::ack_poll_ns));
+  std::fprintf(output, "    AICPU notify CPU: %.3f us\n",
+               average_us(&GatherReadTiming::notify_ns));
+  if (!pipeline)
+    std::fprintf(output, "    AICPU wait for CPU gather ack: %.3f us (overlaps CPU gather)\n",
+                 average_us(&GatherReadTiming::ack_poll_ns));
+  else
+    std::fprintf(output,
+                 "    CPU gather and AICPU READ overlap; CPU publishes ready prefixes in %u-byte chunks.\n",
+                 profiles.front().pipeline_chunk_bytes);
   if (direct) {
     double started_ns = 0.0;
     std::size_t started_rounds = 0U;
@@ -90,20 +95,25 @@ inline void PrintGatherReadTimeline(std::FILE* output, double mean_ms,
       started_ns += profile.ack_started_ns;
       ++started_rounds;
     }
-    if (started_rounds != 0U)
+    if (!pipeline && started_rounds != 0U)
       std::fprintf(output,
                    "      CPU start observed after ACK polling began: %.3f us (%zu/%zu rounds)\n",
                    started_ns / started_rounds / 1000.0, started_rounds,
                    profiles.size());
-    else
+    else if (!pipeline)
       std::fprintf(output, "      CPU start marker not observed before final ACK\n");
     std::fprintf(output, "      CPU read and prepare source list: %.3f us\n",
                  average_us(&GatherReadTiming::cpu_source_cache_ns));
   }
   std::fprintf(output,
                "      CPU gather DDR -> staging: %.3f us\n"
-               "    AICPU READ staging -> HBM: %.3f us (%.2f READ WQEs on average)\n",
-               copy_us, read_us, average(&GatherReadTiming::read_wqes));
+               "    AICPU READ staging -> HBM%s: %.3f us (%.2f READ WQEs on average)\n",
+               copy_us, pipeline ? " (includes waiting for ready prefixes)" : "",
+               read_us, average(&GatherReadTiming::read_wqes));
+  if (pipeline)
+    std::fprintf(output,
+                 "      Wait for ready prefixes: %.3f us (max accumulated per worker; included in READ wall time)\n",
+                 average_us(&GatherReadTiming::ready_wait_ns));
   if (parallel)
     std::fprintf(output,
                  "      %.0f AICPU workers, independent SQ/CQ; READ time is wall-clock, not a sum.\n"
@@ -134,11 +144,16 @@ inline void PrintGatherReadTimeline(std::FILE* output, double mean_ms,
                  "      Worker start spread: %.3f us | Longest worker duration: %.3f us (both within READ wall time)\n",
                  average_us(&GatherReadTiming::scatter_start_skew_ns),
                  average_us(&GatherReadTiming::scatter_worker_ns));
+  if (pipeline)
+    std::fprintf(output, "    Final CPU ACK confirmation after worker 0 READs: %.3f us (overlaps other workers)\n",
+                 average_us(&GatherReadTiming::ack_poll_ns));
   std::fprintf(output,
                "  3 Host finishes: Release HBM reference: %.3f us | Read status: %.3f us\n"
-               "  Overlap: Host wait includes CPU/AICPU; AICPU ack wait overlaps CPU gather.\n",
+               "  Overlap: Host wait includes CPU/AICPU; %s\n",
                average_us(&GatherReadTiming::release_ns),
-               average_us(&GatherReadTiming::status_copy_ns));
+               average_us(&GatherReadTiming::status_copy_ns),
+               pipeline ? "CPU gather overlaps READ; ready waits are included in READ wall time."
+                        : "AICPU ack wait overlaps CPU gather.");
 }
 
 inline void PrintGatherReadTechnicalProfile(std::FILE* output,
@@ -215,6 +230,9 @@ inline void PrintGatherReadTechnicalProfile(std::FILE* output,
                "(claim_ns: max per worker, included in scatter_wall)\n",
                profiles.front().read_task_spans, average(&GatherReadTiming::read_tasks),
                average(&GatherReadTiming::scatter_schedule_ns));
+  if (profiles.front().pipeline_chunk_bytes != 0U)
+    std::fprintf(output, "  Pipeline: chunk_bytes=%u ready_wait_ns=%.0f (max per worker; included in scatter_wall)\n",
+                 profiles.front().pipeline_chunk_bytes, average(&GatherReadTiming::ready_wait_ns));
 }
 
 inline void PrintGatherReadWorkers(std::FILE* output,

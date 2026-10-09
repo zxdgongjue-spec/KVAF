@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -14,7 +15,7 @@ struct GatherSpan {
 
 static_assert(sizeof(GatherSpan) == 16U, "gather span ABI changed");
 
-constexpr std::uint64_t kGatherDescriptorMagic = 0x4b56414647445231ULL;
+constexpr std::uint64_t kGatherDescriptorMagic = 0x4b56414647445232ULL;
 constexpr std::uint64_t kGatherErrorBit = std::uint64_t{1U} << 63U;
 
 inline std::uint64_t GatherStartedAck(std::uint64_t sequence) {
@@ -27,9 +28,14 @@ struct GatherDescriptorHeader {
   std::uint64_t staging_address;
   std::uint32_t span_count;
   std::uint32_t total_bytes;
+  std::uint32_t pipeline_chunk_bytes{0U};
+  std::uint32_t reserved{0U};
+  std::uint64_t ready_bytes{0U};
 };
 
-static_assert(sizeof(GatherDescriptorHeader) == 32U, "gather descriptor ABI changed");
+static_assert(sizeof(GatherDescriptorHeader) == 48U, "gather descriptor ABI changed");
+static_assert(offsetof(GatherDescriptorHeader, ready_bytes) == 40U,
+              "gather progress offset changed");
 
 inline std::uint64_t GatherDescriptorBytes(std::size_t span_count) {
   return sizeof(GatherDescriptorHeader) + span_count * sizeof(GatherSpan);

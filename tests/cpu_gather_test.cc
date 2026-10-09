@@ -269,6 +269,14 @@ void TestDirectPreparationBounds() {
   header = valid_header;
   header.magic = 0U;
   Require(prepare(header, valid_spans) == 0U);
+  for (const auto chunk_bytes : {1U, 63U, 65U}) {
+    header = valid_header;
+    header.pipeline_chunk_bytes = chunk_bytes;
+    Require(prepare(header, valid_spans) == 0U);
+  }
+  header = valid_header;
+  header.ready_bytes = 16U;
+  Require(prepare(header, valid_spans) == 0U);
   Require(team.PrepareDirect(32U, address, 1U, 4096U) == 0U);
   Require(team.PrepareDirect(memory.size(), address + 1U, 1U, 4096U) == 0U);
   Require(team.PrepareDirect(memory.size(), base + 960U, 1U, 4096U) == 0U);
@@ -279,6 +287,62 @@ void TestDirectPreparationBounds() {
                                           valid_header, valid_spans));
   Require(!kvaf::peer::ValidateDirectGather(UINT64_MAX - 8U, 1024U, address,
                                            valid_header, valid_spans));
+}
+
+void TestPipelinedGather() {
+  constexpr std::size_t span_count = 257U;
+  constexpr std::size_t stride = 1024U;
+  constexpr std::size_t staging_offset = span_count * stride + 128U;
+  constexpr std::size_t descriptor_offset = 2U * staging_offset;
+  std::vector<std::uint8_t> memory(descriptor_offset +
+      kvaf::peer::GatherDescriptorBytes(span_count) + 256U);
+  const auto base = reinterpret_cast<std::uint64_t>(memory.data());
+  const auto descriptor = (base + descriptor_offset + 63U) & ~std::uint64_t{63U};
+  auto* descriptor_memory = reinterpret_cast<std::uint8_t*>(descriptor);
+  auto* progress = reinterpret_cast<std::uint64_t*>(descriptor_memory +
+      offsetof(kvaf::peer::GatherDescriptorHeader, ready_bytes));
+  std::vector<kvaf::peer::GatherSpan> spans(span_count);
+  std::vector<std::uint8_t> expected;
+  kvaf::peer::CpuGatherTeam team(memory.data(), base, 8U, 4096U,
+                                kvaf::peer::GatherWaitMode::kActive);
+  for (std::uint64_t sequence = 1U; sequence <= 9U; ++sequence) {
+    expected.clear();
+    for (std::size_t index = 0U; index < span_count; ++index) {
+      const auto source_offset = ((index + sequence) % span_count) * stride;
+      const auto length = static_cast<std::uint32_t>((index + sequence) % 2U == 0U ? 257U : 513U);
+      spans[index] = {base + source_offset, length, 0U};
+      for (std::uint32_t byte = 0U; byte < length; ++byte)
+        memory[source_offset + byte] = static_cast<std::uint8_t>(index + byte + sequence);
+      expected.insert(expected.end(), memory.data() + source_offset,
+                      memory.data() + source_offset + length);
+    }
+    const auto chunk_bytes = sequence == 9U ? 0U : sequence % 2U == 0U ? 4096U : 8192U;
+    const kvaf::peer::GatherDescriptorHeader header{
+        kvaf::peer::kGatherDescriptorMagic, sequence, base + staging_offset,
+        span_count, static_cast<std::uint32_t>(expected.size()), chunk_bytes};
+    std::memcpy(descriptor_memory, &header, sizeof(header));
+    std::memcpy(descriptor_memory + sizeof(header), spans.data(), spans.size() * sizeof(spans.front()));
+    Require(team.PrepareDirect(memory.size(), descriptor, sequence, span_count) == 8U);
+    std::atomic<bool> done{false};
+    std::thread copier([&] {
+      team.Copy();
+      done.store(true, std::memory_order_release);
+    });
+    std::uint64_t observed = 0U;
+    while (!done.load(std::memory_order_acquire)) {
+      const auto ready = __atomic_load_n(progress, __ATOMIC_ACQUIRE);
+      Require(ready >= observed && ready <= expected.size());
+      Require(ready == expected.size() || ready % (chunk_bytes == 0U ? 1U : chunk_bytes) == 0U);
+      Require(std::memcmp(memory.data() + staging_offset + observed,
+                          expected.data() + observed, ready - observed) == 0);
+      observed = ready;
+      std::this_thread::yield();
+    }
+    copier.join();
+    Require(__atomic_load_n(progress, __ATOMIC_ACQUIRE) ==
+            (chunk_bytes == 0U ? 0U : expected.size()));
+    Require(std::memcmp(memory.data() + staging_offset, expected.data(), expected.size()) == 0);
+  }
 }
 
 int main() {
@@ -310,5 +374,6 @@ int main() {
   TestDirectDescriptorLayout();
   TestDirectPreparation();
   TestDirectPreparationBounds();
+  TestPipelinedGather();
   std::cout << "CPU gather: PASS\n";
 }

@@ -598,6 +598,10 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
   if (!impl_->initialized || impl_->transport == nullptr ||
       impl_->config.aicpu_urma_kernel_json_path.empty())
     return InvalidState("AICPU URMA GatherRead transport is unavailable");
+  if (request.pipeline_chunk_bytes != 0U &&
+      (request.remote_descriptor == 0U || request.read_task_spans == 0U ||
+       request.pipeline_chunk_bytes < 64U || request.pipeline_chunk_bytes % 64U != 0U))
+    return InvalidArgument("GatherRead pipeline requires URMA descriptors, dynamic READ, and aligned chunks");
   if (request.output.device != DeviceKind::kNpu || !request.output.valid() ||
       request.stream == nullptr || request.bytes == 0U ||
       request.output_spans == nullptr || request.output_span_count == 0U ||
@@ -608,16 +612,17 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
        request.sq_batch_wqes != 32U && request.sq_batch_wqes != 64U) ||
       request.sgl_size == 0U ||
       request.output_extent > UINT64_MAX - 63U)
-    return InvalidArgument("GatherRead output requires a valid SGL, SQ batch size, and 64-byte HBM scratch");
+    return InvalidArgument("GatherRead output requires a valid SGL, SQ batch size, and HBM scratch");
   const std::uint64_t scratch_offset =
       (request.output_extent + 63U) & ~std::uint64_t{63U};
+  const auto scratch_bytes = aicpu_urma::GatherScratchBytes(request.pipeline_chunk_bytes);
   if (scratch_offset > request.output.bytes ||
-      request.output.bytes - scratch_offset < aicpu_urma::kGatherScratchBytes)
-    return InvalidArgument("GatherRead output requires 64-byte HBM scratch");
+      request.output.bytes - scratch_offset < scratch_bytes)
+    return InvalidArgument("GatherRead output has insufficient HBM scratch");
   const bool direct = request.remote_descriptor != 0U;
   const auto source_bytes = peer::GatherDescriptorBytes(request.source_span_count);
   const std::uint64_t source_offset =
-      scratch_offset + aicpu_urma::kGatherScratchBytes;
+      scratch_offset + scratch_bytes;
   if (direct && (request.source_spans == nullptr || request.source_span_count == 0U ||
                  request.source_span_count > aicpu_urma::kGatherMaxSpans ||
                  request.sequence == 0U ||
@@ -630,7 +635,8 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
   const auto storage_bytes = aicpu_urma::GatherOutputStorageBytes(
       request.output_span_count, request.read_task_spans);
   const auto packed_output_bytes = aicpu_urma::GatherReadPackedOutputBytes(
-      request.output_extent, source_bytes, request.output_span_count, request.read_task_spans);
+      request.output_extent, source_bytes, request.output_span_count, request.read_task_spans,
+      request.pipeline_chunk_bytes);
   const bool packed = direct && packed_output_bytes != 0U &&
       packed_output_bytes <= request.output.bytes &&
       reinterpret_cast<std::uintptr_t>(request.output.data) %
@@ -659,7 +665,7 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
     impl_->gather_metadata.resize(upload_bytes);
     const peer::GatherDescriptorHeader header{
         peer::kGatherDescriptorMagic, request.sequence, request.remote_staging,
-        request.source_span_count, request.bytes};
+        request.source_span_count, request.bytes, request.pipeline_chunk_bytes};
     std::memcpy(impl_->gather_metadata.data(), &header, sizeof(header));
     std::memcpy(impl_->gather_metadata.data() + sizeof(header),
                 request.source_spans,
@@ -708,6 +714,7 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
   arguments.sq_batch_wqes = request.sq_batch_wqes;
   arguments.read_task_spans = request.read_task_spans;
   arguments.sq_copy_mode = request.sq_copy_mode;
+  arguments.pipeline_chunk_bytes = request.pipeline_chunk_bytes;
   const aclrtStream stream = static_cast<aclrtStream>(request.stream);
   const auto launch_start = std::chrono::steady_clock::now();
   const int32_t launch = aicpu_urma::LaunchGatherRead(&arguments, stream);
@@ -784,6 +791,8 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
     request.timing->read_tasks = 0U;
     request.timing->scatter_schedule_ns = 0U;
     request.timing->read_task_spans = request.read_task_spans;
+    request.timing->pipeline_chunk_bytes = request.pipeline_chunk_bytes;
+    request.timing->ready_wait_ns = 0U;
     request.timing->workers = {};
   }
   for (std::uint32_t worker = 0U; copy == ACL_SUCCESS && worker < arguments.worker_count;
@@ -808,6 +817,8 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
                                                    worker_status.scatter_post_ns);
         request.timing->scatter_cq_ns = std::max(request.timing->scatter_cq_ns,
                                                  worker_status.scatter_cq_ns);
+        request.timing->ready_wait_ns = std::max(request.timing->ready_wait_ns,
+                                                 worker_status.ready_wait_ns);
         request.timing->scatter_init_ns = std::max(request.timing->scatter_init_ns,
                                                    worker_status.scatter_init_ns);
         request.timing->scatter_encode_ns = std::max(request.timing->scatter_encode_ns,

@@ -379,6 +379,10 @@ Status NpuRuntime::GatherRead(const CpuGatherReadRequest& request) {
       request.stream == nullptr)
     return Status::InvalidArgument("GatherRead requires a caller-owned HBM output and ACL stream");
   const auto& region = impl_->runtime_core->remote_region();
+  if (request.pipeline_chunk_bytes != 0U &&
+      (request.pipeline_chunk_bytes < 64U || request.pipeline_chunk_bytes % 64U != 0U ||
+       request.read_task_spans == 0U || request.source_descriptor_address == 0U))
+    return Status::InvalidArgument("GatherRead pipeline requires URMA descriptors, dynamic READ, and a chunk size aligned to 64 bytes");
   if ((request.sq_batch_wqes != 8U && request.sq_batch_wqes != 16U &&
        request.sq_batch_wqes != 32U && request.sq_batch_wqes != 64U) ||
       request.read_task_spans > peer::kMaxGatherSpans ||
@@ -429,7 +433,8 @@ Status NpuRuntime::GatherRead(const CpuGatherReadRequest& request) {
       direct ? request.spans.data() : nullptr,
       direct ? static_cast<std::uint32_t>(request.spans.size()) : 0U, ready.sequence,
       ready.total_bytes, request.stream, request.timing, request.profile_detail,
-      request.sq_batch_wqes, request.read_task_spans, request.sq_copy_mode});
+      request.sq_batch_wqes, request.read_task_spans, request.sq_copy_mode,
+      request.pipeline_chunk_bytes});
 }
 
 RuntimeCore& NpuRuntime::core() {

@@ -353,16 +353,81 @@ void ScatterOutputRange(const kvaf::aicpu_urma::GatherReadArgs& args,
 }
 
 template <typename Entity, typename Queue>
+void WaitGatherAck(const kvaf::aicpu_urma::GatherReadArgs& args,
+                   const Entity& entity, Queue& queue,
+                   kvaf::aicpu_urma::GatherReadStatus& status) {
+  const auto scratch = args.output + ((args.output_extent + 63U) & ~std::uint64_t{63U});
+  const Transfer check{args.remote_ack, scratch + 8U,
+                       sizeof(kvaf::peer::GatherControl) - 8U, entity.local_token_id};
+  const auto start_ns = NowNs();
+  for (std::uint32_t poll = 0U; poll < 10000U; ++poll) {
+    std::uint64_t post_ns = 0U;
+    std::uint64_t cq_ns = 0U;
+    std::uint32_t cqe_word = 0U;
+    status.result = Submit(entity, queue, &check, 1U, kvaf::aicpu_urma::kReadOpcode,
+                           &cqe_word, nullptr, &post_ns, &cq_ns, false);
+    status.ack_post_ns += post_ns;
+    status.ack_cq_ns += cq_ns;
+    ++status.ack_polls;
+    status.cqe_word = cqe_word;
+    if (status.result != 0U) break;
+    status.ack_seen = *reinterpret_cast<const std::uint64_t*>(scratch + 8U);
+    if (args.source_span_count != 0U && status.ack_started_ns == 0U &&
+        status.ack_seen == kvaf::peer::GatherStartedAck(args.sequence))
+      status.ack_started_ns = NowNs() - start_ns;
+    if (status.ack_seen == args.sequence ||
+        status.ack_seen == (args.sequence | kvaf::peer::kGatherErrorBit)) break;
+  }
+  status.ack_poll_ns = NowNs() - start_ns;
+  if (status.result == 0U && status.ack_seen == (args.sequence | kvaf::peer::kGatherErrorBit))
+    status.result = 10U;
+  if (status.result == 0U && status.ack_seen == args.sequence)
+    std::memcpy(&status.cpu, reinterpret_cast<const void*>(scratch + 24U), sizeof(status.cpu));
+  if (status.result == 0U && status.ack_seen != args.sequence) status.result = 9U;
+}
+
+template <typename Entity, typename Queue>
+bool WaitGatherPrefix(const kvaf::aicpu_urma::GatherReadArgs& args,
+                      const Entity& entity, Queue& queue,
+                      kvaf::aicpu_urma::GatherReadStatus& status, std::uint32_t worker,
+                      std::uint64_t required_bytes, std::uint64_t& ready_bytes) {
+  if (required_bytes <= ready_bytes) return true;
+  const auto start_ns = NowNs();
+  const auto scratch = args.output + ((args.output_extent + 63U) & ~std::uint64_t{63U}) +
+                       worker * 64U;
+  const Transfer check{args.remote_descriptor + offsetof(kvaf::peer::GatherDescriptorHeader, ready_bytes),
+                       scratch, 8U, entity.local_token_id};
+  for (std::uint32_t poll = 0U; poll < 10000U; ++poll) {
+    std::uint32_t cqe_word = 0U;
+    status.result = Submit(entity, queue, &check, 1U, kvaf::aicpu_urma::kReadOpcode,
+                           &cqe_word, nullptr, nullptr, nullptr, false);
+    status.cqe_word = cqe_word;
+    if (status.result != 0U) break;
+    ready_bytes = *reinterpret_cast<const std::uint64_t*>(scratch);
+    if ((ready_bytes & kvaf::peer::kGatherErrorBit) != 0U || ready_bytes > args.bytes) {
+      status.result = 10U;
+      break;
+    }
+    if (ready_bytes >= required_bytes) break;
+  }
+  status.ready_wait_ns += NowNs() - start_ns;
+  if (status.result == 0U && ready_bytes < required_bytes) status.result = 9U;
+  return status.result == 0U;
+}
+
+template <typename Entity, typename Queue>
 void ScatterOutputTasks(const kvaf::aicpu_urma::GatherReadArgs& args,
                         const Entity& entity, Queue& queue,
                         kvaf::aicpu_urma::GatherReadStatus& status,
-                        kvaf::aicpu_urma::ScatterReadBatch& batch) {
+                        kvaf::aicpu_urma::ScatterReadBatch& batch,
+                        std::uint32_t worker = 0U) {
   using namespace kvaf::aicpu_urma;
   if (status.scatter_begin_ns == 0U) status.scatter_begin_ns = NowNs();
   auto* tasks = reinterpret_cast<GatherTaskState*>(
       args.output_spans + GatherTaskStateOffset(args.output_span_count));
   const auto* offsets = reinterpret_cast<const std::uint64_t*>(tasks + 1U);
   const auto count = GatherTaskCount(args.output_span_count, args.read_task_spans);
+  std::uint64_t ready_bytes = 0U;
   while (status.result == 0U) {
     const auto schedule_start_ns = NowNs();
     const auto task = __atomic_fetch_add(&tasks->next_task, 1U, __ATOMIC_RELAXED);
@@ -374,6 +439,10 @@ void ScatterOutputTasks(const kvaf::aicpu_urma::GatherReadArgs& args,
     const auto last = std::min(first + args.read_task_spans, args.output_span_count);
     const auto remote_offset = offsets[task];
     status.scatter_schedule_ns += NowNs() - schedule_start_ns;
+    if (args.pipeline_chunk_bytes != 0U &&
+        !WaitGatherPrefix(args, entity, queue, status, worker,
+                          task + 1U < count ? offsets[task + 1U] : args.bytes, ready_bytes))
+      break;
     ++status.read_tasks;
     ScatterOutputRange(args, entity, queue, status, batch, first, last, remote_offset);
   }
@@ -627,6 +696,8 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
   status.result = 2U;
   if (args->worker_count > 1U)
     queue.reserved[kvaf::aicpu_urma::kGatherWorkerCounterSlot] = 0U;
+  __atomic_store_n(&queue.reserved[kvaf::aicpu_urma::kGatherPipelineSequenceSlot],
+                   0U, __ATOMIC_RELEASE);
   if (args->output_extent > UINT64_MAX - 63U) {
     Barrier();
     return 1U;
@@ -637,8 +708,12 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
                       args->remote_descriptor != 0U;
   const std::uint64_t source_bytes =
       kvaf::peer::GatherDescriptorBytes(args->source_span_count);
+  const auto scratch_bytes = kvaf::aicpu_urma::GatherScratchBytes(args->pipeline_chunk_bytes);
   if (!Valid(entity, queue) || entity.local_token_id == 0U || args->worker_count > 8U ||
       args->read_task_spans > 65536U || args->profile_detail > 1U ||
+      (args->pipeline_chunk_bytes != 0U &&
+       (!direct || args->read_task_spans == 0U || args->pipeline_chunk_bytes < 64U ||
+        args->pipeline_chunk_bytes % 64U != 0U)) ||
       !kvaf::ValidGatherSqCopyMode(args->sq_copy_mode) ||
       (args->sq_batch_wqes != 8U && args->sq_batch_wqes != 16U &&
        args->sq_batch_wqes != 32U && args->sq_batch_wqes != 64U) ||
@@ -647,10 +722,10 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
       args->output_spans == 0U || args->output_span_count == 0U ||
       args->output_span_count > 65536U || args->sgl_size == 0U ||
       args->output_extent == 0U || args->output > UINT64_MAX - scratch_offset ||
-      scratch_offset > UINT64_MAX - kvaf::aicpu_urma::kGatherScratchBytes ||
+      scratch_offset > UINT64_MAX - scratch_bytes ||
       args->output != entity.local_hbm_address ||
       !InRange(entity.local_hbm_address, entity.local_hbm_size, args->output,
-               scratch_offset + kvaf::aicpu_urma::kGatherScratchBytes) ||
+               scratch_offset + scratch_bytes) ||
       !InRange(entity.remote_host_ddr_address, entity.remote_host_ddr_size,
                args->remote_staging, args->bytes) ||
       !InRange(entity.remote_host_ddr_address, entity.remote_host_ddr_size,
@@ -665,7 +740,7 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
                   args->remote_descriptor == 0U ||
                   args->source_descriptor < args->output ||
                   args->source_descriptor - args->output != scratch_offset +
-                      kvaf::aicpu_urma::kGatherScratchBytes ||
+                      scratch_bytes ||
                   !InRange(entity.local_hbm_address, entity.local_hbm_size,
                            args->source_descriptor, source_bytes) ||
                   !InRange(entity.remote_host_ddr_address, entity.remote_host_ddr_size,
@@ -755,38 +830,12 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
                                &status.notify_cq_ns);
   status.notify_ns = NowNs() - notify_start_ns;
   status.cqe_word = cqe_word;
-  if (status.result == 0U) {
+  if (status.result == 0U && args->pipeline_chunk_bytes != 0U)
+    __atomic_store_n(&queue.reserved[kvaf::aicpu_urma::kGatherPipelineSequenceSlot],
+                     args->sequence, __ATOMIC_RELEASE);
+  if (status.result == 0U && args->pipeline_chunk_bytes == 0U) {
     status.phase = direct ? 3U : 2U;
-    const Transfer check{args->remote_ack, scratch + 8U,
-                         sizeof(kvaf::peer::GatherControl) - 8U,
-                         entity.local_token_id};
-    const auto ack_start_ns = NowNs();
-    for (std::uint32_t poll = 0U; poll < 10000U; ++poll) {
-      std::uint64_t post_ns = 0U;
-      std::uint64_t cq_ns = 0U;
-      status.result = Submit(entity, queue, &check, 1U, kvaf::aicpu_urma::kReadOpcode,
-                             &cqe_word, nullptr, &post_ns, &cq_ns, false);
-      status.ack_post_ns += post_ns;
-      status.ack_cq_ns += cq_ns;
-      ++status.ack_polls;
-      status.cqe_word = cqe_word;
-      if (status.result != 0U) break;
-      status.ack_seen = *ack;
-      if (direct && status.ack_started_ns == 0U &&
-          status.ack_seen == kvaf::peer::GatherStartedAck(args->sequence))
-        status.ack_started_ns = NowNs() - ack_start_ns;
-      if (status.ack_seen == args->sequence ||
-          status.ack_seen == (args->sequence | kvaf::peer::kGatherErrorBit)) break;
-    }
-    status.ack_poll_ns = NowNs() - ack_start_ns;
-    if (status.result == 0U &&
-        status.ack_seen == (args->sequence | kvaf::peer::kGatherErrorBit))
-      status.result = 10U;
-    if (status.result == 0U && status.ack_seen == args->sequence)
-      std::memcpy(&status.cpu, reinterpret_cast<const void*>(scratch + 24U),
-                  sizeof(status.cpu));
-    if (status.result == 0U && status.ack_seen != args->sequence)
-      status.result = 9U;
+    WaitGatherAck(*args, entity, queue, status);
   }
   if (status.result == 0U && args->worker_count <= 1U) {
     status.phase = direct ? 4U : 3U;
@@ -799,6 +848,8 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
       ScatterOutputRange(*args, entity, queue, status, batch, 0U, args->output_span_count, 0U);
     }
   }
+  if (status.result == 0U && args->pipeline_chunk_bytes != 0U && args->worker_count <= 1U)
+    WaitGatherAck(*args, entity, queue, status);
   status.sq_producer_index = queue.sq_producer_index;
   status.cq_consumer_index = queue.cq_consumer_index;
   Barrier();
@@ -811,6 +862,9 @@ std::uint32_t KvafAicpuUrmaGatherScatter(kvaf::aicpu_urma::GatherReadArgs* args)
   if (args == nullptr || args->channel_entity == 0U || args->queue_state == 0U ||
       args->core_status == 0U || args->worker_count < 2U || args->worker_count > 8U ||
       args->profile_detail > 1U || args->read_task_spans > 65536U ||
+      (args->pipeline_chunk_bytes != 0U &&
+       (args->source_span_count == 0U || args->read_task_spans == 0U ||
+        args->pipeline_chunk_bytes < 64U || args->pipeline_chunk_bytes % 64U != 0U)) ||
       !kvaf::ValidGatherSqCopyMode(args->sq_copy_mode) ||
       (args->sq_batch_wqes != 8U && args->sq_batch_wqes != 16U &&
        args->sq_batch_wqes != 32U && args->sq_batch_wqes != 64U))
@@ -823,7 +877,11 @@ std::uint32_t KvafAicpuUrmaGatherScatter(kvaf::aicpu_urma::GatherReadArgs* args)
   auto* status_base = reinterpret_cast<std::uint8_t*>(args->core_status);
   const auto& control = *reinterpret_cast<const GatherReadStatus*>(status_base);
   const bool ready = control.magic == kvaf::aicpu_urma::kGatherStatusMagic &&
-                     control.sequence == args->sequence && control.ack_seen == args->sequence;
+                     control.sequence == args->sequence &&
+      (args->pipeline_chunk_bytes != 0U
+          ? __atomic_load_n(&queues[0].reserved[kvaf::aicpu_urma::kGatherPipelineSequenceSlot],
+                            __ATOMIC_ACQUIRE) == args->sequence
+          : control.ack_seen == args->sequence);
   auto& status = *reinterpret_cast<GatherReadStatus*>(
       status_base + worker * KVAF_AIV_BATCH_GET_STATUS_BYTES);
   if (worker != 0U) {
@@ -849,7 +907,7 @@ std::uint32_t KvafAicpuUrmaGatherScatter(kvaf::aicpu_urma::GatherReadArgs* args)
   kvaf::aicpu_urma::ScatterReadBatch batch;
   InitializeScatterBatch(entity, batch, status);
   if (args->read_task_spans != 0U) {
-    ScatterOutputTasks(*args, entity, queue, status, batch);
+    ScatterOutputTasks(*args, entity, queue, status, batch, static_cast<std::uint32_t>(worker));
   } else {
     const auto first = static_cast<std::uint32_t>(
         static_cast<std::uint64_t>(args->output_span_count) * worker / args->worker_count);
@@ -859,6 +917,8 @@ std::uint32_t KvafAicpuUrmaGatherScatter(kvaf::aicpu_urma::GatherReadArgs* args)
     status.read_tasks = first != last ? 1U : 0U;
     ScatterOutputRange(*args, entity, queue, status, batch, first, last, remote_offset);
   }
+  if (worker == 0U && status.result == 0U && args->pipeline_chunk_bytes != 0U)
+    WaitGatherAck(*args, entity, queue, status);
   status.sq_producer_index = queue.sq_producer_index;
   status.cq_consumer_index = queue.cq_consumer_index;
   Barrier();

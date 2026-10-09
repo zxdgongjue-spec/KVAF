@@ -32,6 +32,7 @@ struct Options {
   std::uint32_t sq_batch_wqes{8U};
   kvaf::GatherSqCopyMode sq_copy_mode{kvaf::GatherSqCopyMode::kMemcpy};
   std::uint32_t read_task_spans{192U};
+  std::uint32_t pipeline_chunk_bytes{0U};
   bool dynamic_read{true};
   std::uint32_t warmup{1U};
   std::uint32_t iterations{3U};
@@ -45,10 +46,11 @@ void Usage(const char* program) {
                "[--blocks N] [--block-bytes N] [--output-stride N] [--sgl-size N] "
                "[--warmup N] [--iterations N] [--aicpu-cores N(1..8)] [--descriptor-transport urma|rpc] "
                "[--sq-batch-wqes 8|16|32|64] [--sq-copy memcpy|paired] [--profile-detail 0|1]\n"
-               "[--read-schedule static|dynamic] [--read-task-spans N(1..65536)]\n"
+               "[--read-schedule static|dynamic] [--read-task-spans N(1..65536)] "
+               "[--pipeline-chunk-bytes N(0=off; multiple of 64)]\n"
                "Defaults: descriptor-transport=urma, output-stride=2*block-bytes, sgl-size=%u "
                "(positive; each READ WQE uses at most %u SGE), sq-batch-wqes=8, "
-               "read-schedule=dynamic, read-task-spans=192, sq-copy=memcpy\n"
+               "read-schedule=dynamic, read-task-spans=192, sq-copy=memcpy, pipeline-chunk-bytes=0\n"
                "profile-detail=0 disables per-SQ-group timing; READ wall timing stays enabled.\n",
                program, kvaf::kGatherMaxSglSize, kvaf::kGatherMaxSglSize);
 }
@@ -88,6 +90,7 @@ bool Parse(int argc, char** argv, Options* options) {
       else if (flag == "--aicpu-cores") parsed.aicpu_cores = static_cast<std::uint32_t>(number);
       else if (flag == "--sq-batch-wqes") parsed.sq_batch_wqes = static_cast<std::uint32_t>(number);
       else if (flag == "--read-task-spans") parsed.read_task_spans = static_cast<std::uint32_t>(number);
+      else if (flag == "--pipeline-chunk-bytes") parsed.pipeline_chunk_bytes = static_cast<std::uint32_t>(number);
       else if (flag == "--warmup") parsed.warmup = static_cast<std::uint32_t>(number);
       else if (flag == "--iterations") parsed.iterations = static_cast<std::uint32_t>(number);
       else if (flag == "--profile-detail" && number <= 1U)
@@ -95,6 +98,9 @@ bool Parse(int argc, char** argv, Options* options) {
       else return false;
     }
   }
+  if (parsed.pipeline_chunk_bytes != 0U &&
+      (!parsed.dynamic_read || !parsed.urma_descriptors || parsed.pipeline_chunk_bytes < 64U ||
+       parsed.pipeline_chunk_bytes % 64U != 0U)) return false;
   if (parsed.peer.empty() || parsed.kernel_json.empty() || parsed.device_id > INT32_MAX ||
       parsed.blocks == 0U || parsed.blocks > kvaf::peer::kMaxGatherSpans ||
       parsed.block_bytes == 0U || parsed.iterations == 0U ||
@@ -245,6 +251,7 @@ double RunRound(kvaf::NpuRuntime* runtime, aclrtStream stream, const Options& op
   gather.sq_batch_wqes = options.sq_batch_wqes;
   gather.sq_copy_mode = options.sq_copy_mode;
   gather.read_task_spans = options.dynamic_read ? options.read_task_spans : 0U;
+  gather.pipeline_chunk_bytes = options.pipeline_chunk_bytes;
   for (std::size_t block = options.blocks; block != 0U; --block) {
     const auto address = view.addresses[block - 1U];
     if (view.valid[block - 1U] != 1U || view.lengths[block - 1U] != options.block_bytes)
@@ -292,7 +299,7 @@ int Run(const Options& options) {
   DeviceBuffer input(payload);
   DeviceBuffer output(kvaf::aicpu_urma::GatherReadPackedOutputBytes(
       output_extent, kvaf::peer::GatherDescriptorBytes(options.blocks), options.blocks,
-      options.dynamic_read ? options.read_task_spans : 0U));
+      options.dynamic_read ? options.read_task_spans : 0U, options.pipeline_chunk_bytes));
   std::vector<std::uint8_t> host_input(payload), host_output(output.bytes);
   std::vector<std::uint8_t> expected_output(output_extent);
   std::vector<kvaf::KeyId> reserved_keys;
@@ -341,6 +348,7 @@ int Run(const Options& options) {
                "AICPU_GATHER_READ_PASS blocks=%u block_bytes=%u bytes=%zu "
                "output_stride=%u sgl_size=%u wqe_sgl_size=%u aicpu_cores=%u descriptor_transport=%s "
                "sq_batch_wqes=%u sq_copy=%s profile_detail=%u read_schedule=%s read_task_spans=%u "
+               "pipeline_chunk_bytes=%u "
                "warmup=%u iterations=%u\n",
                options.blocks, options.block_bytes, payload, options.output_stride,
                options.sgl_size, std::min(options.sgl_size, kvaf::kGatherMaxSglSize),
@@ -351,6 +359,7 @@ int Run(const Options& options) {
                options.profile_detail ? 1U : 0U,
                options.dynamic_read ? "dynamic" : "static",
                options.dynamic_read ? options.read_task_spans : 0U,
+               options.pipeline_chunk_bytes,
                options.warmup, options.iterations);
   return 0;
 }

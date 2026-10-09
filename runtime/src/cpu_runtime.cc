@@ -438,7 +438,7 @@ class CpuGatherWorker {
                   std::size_t min_bytes_per_thread, bool gather_affinity,
                   CpuGatherMode gather_mode, bool direct = false,
                   bool notify_profile = false)
-      : base_(base), bytes_(bytes),
+      : memory_(static_cast<std::uint8_t*>(memory)), base_(base), bytes_(bytes),
         control_(reinterpret_cast<peer::GatherControl*>(
             static_cast<uint8_t*>(memory) + peer::GatherControlOffset(bytes))),
         team_(memory, base, gather_threads, min_bytes_per_thread,
@@ -612,6 +612,12 @@ class CpuGatherWorker {
       } else {
         Log("[KVAF_CPU] GATHER_DIRECT_DESCRIPTOR_INVALID sequence=%" PRIu64
             " address=0x%" PRIx64 "\n", sequence, address);
+        if (address % 64U == 0U && peer::GatherRange(base_, peer::GatherControlOffset(bytes_),
+                                                  address, sizeof(peer::GatherDescriptorHeader))) {
+          auto* progress = reinterpret_cast<std::uint64_t*>(
+              memory_ + (address - base_) + offsetof(peer::GatherDescriptorHeader, ready_bytes));
+          __atomic_store_n(progress, peer::kGatherErrorBit, __ATOMIC_RELEASE);
+        }
       }
       control_->profile = profile;
       __atomic_store_n(&control_->ack,
@@ -626,6 +632,7 @@ class CpuGatherWorker {
     }
   }
 
+  std::uint8_t* memory_;
   uint64_t base_;
   uint64_t bytes_;
   peer::GatherControl* control_;

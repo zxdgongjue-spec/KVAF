@@ -141,6 +141,27 @@ int main() {
   assert(parallel_report.find("READ schedule: task_spans=192 tasks=22.00 claim_ns=500") !=
          std::string::npos);
 
+  first.pipeline_chunk_bytes = 131072U;
+  first.ready_wait_ns = 1200U;
+  first.ack_poll_ns = 4500U;
+  std::FILE* pipeline_output = std::tmpfile();
+  assert(pipeline_output != nullptr);
+  kvaf::aicpu_gather_read_client::PrintGatherReadTimeline(pipeline_output, 1.5, {first});
+  kvaf::aicpu_gather_read_client::PrintGatherReadTechnicalProfile(pipeline_output, {first});
+  std::rewind(pipeline_output);
+  std::string pipeline_report;
+  while ((bytes = std::fread(buffer, 1U, sizeof(buffer), pipeline_output)) != 0U)
+    pipeline_report.append(buffer, bytes);
+  std::fclose(pipeline_output);
+  assert(pipeline_report.find("CPU publishes ready prefixes in 131072-byte chunks") != std::string::npos);
+  assert(pipeline_report.find("AICPU READ staging -> HBM (includes waiting for ready prefixes): 6.500 us") !=
+         std::string::npos);
+  assert(pipeline_report.find("Wait for ready prefixes: 1.200 us") != std::string::npos);
+  assert(pipeline_report.find("Final CPU ACK confirmation after worker 0 READs: 4.500 us") != std::string::npos);
+  assert(pipeline_report.find("AICPU wait for CPU gather ack:") == std::string::npos);
+  assert(pipeline_report.find("CPU start observed after ACK polling began:") == std::string::npos);
+  assert(pipeline_report.find("Pipeline: chunk_bytes=131072 ready_wait_ns=1200") != std::string::npos);
+
   first.workers[1] = {1000U, 5000U, 4000U, 2U, 1U, 6U, 1U};
   second = first;
   second.workers[1] = {3000U, 7000U, 4000U, 2U, 1U, 6U, 3U};

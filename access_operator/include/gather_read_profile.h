@@ -65,6 +65,8 @@ struct GatherReadTiming {
   std::uint64_t read_tasks{0U};
   std::uint64_t scatter_schedule_ns{0U};
   std::uint32_t read_task_spans{0U};
+  std::uint32_t pipeline_chunk_bytes{0U};
+  std::uint64_t ready_wait_ns{0U};
 };
 
 namespace peer {

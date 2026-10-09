@@ -26,6 +26,7 @@ struct CpuGatherReadRequest {
   std::uint32_t sq_batch_wqes{8U};
   std::uint32_t read_task_spans{0U};
   GatherSqCopyMode sq_copy_mode{GatherSqCopyMode::kMemcpy};
+  std::uint32_t pipeline_chunk_bytes{0U};
 };
 
 struct NpuRuntimeOptions {
