@@ -116,6 +116,128 @@ V8 在每轮计时开始及发布 request 之前，对整个 output 执行 `dc c
 重新测量相同 V8 口径下的单核/多核数据；V7 及更早数据的输出缓存状态不同，
 不宜将两者的 scatter 差异直接归因于复制优化。
 
+### 定位四核复制降速：独立 scatter probe
+
+新增独立入口 `KvafAicpuScatterProbeV1`。它使用与正常 scatter 相同的
+缓存行操作/DSB 序列、`CopyScatterRows` 和 payload clean，直接分配本地设备源/目标内存，
+不建立 URMA、不启动 CPU peer、不执行逐轮 payload 校验。原有 V10 的传输 ABI
+及 scatter/direct_output 执行路径不变。源由 Host 初始化，目标按冷缓存口径准备；
+源的 invalidate 在每轮被测阶段内，保证复制开始前输入失效。
+
+每个 block 固定负责 `rows_per_worker` 行。套件内的源/目标地址与分配大小保持不变，
+packed 只改变目标行距。每轮先等待所有 block 完成计时外的输出缓存准备，
+然后执行测试。除了 pipeline，操作前后有阶段屏障；serial 系列再按 worker
+顺序逐个执行操作。阶段等待不计入 `avg_op_us`，原始时间戳保留等待形成的间隔。
+
+先构建并安装更新后的 `.so` 和 JSON，独立 probe 不需要重建 CPU 程序：
+
+```bash
+bash build.sh aicpu-npu
+bash tests/run_aicpu_get_npu.sh --install-kernel --device-id 7 \
+  --probe-scatter-blocks 4 --probe-rows-per-worker 1024 \
+  --probe-row-bytes 656 --probe-iterations 200 --probe-warmup 5 \
+  --probe-scatter-case all --probe-trace-rounds 3 2>&1 | tee scatter-probe-4.log
+```
+
+保持每核 1024 行，改变并发数：
+
+```bash
+for n in 1 2 4; do
+  bash tests/run_aicpu_get_npu.sh --device-id 7 \
+    --probe-scatter-blocks "$n" --probe-rows-per-worker 1024 \
+    --probe-row-bytes 656 --probe-iterations 200 --probe-scatter-case all \
+    --probe-trace-rounds 3 2>&1 | tee "scatter-probe-${n}.log"
+done
+```
+
+| case | 操作与用途 |
+| --- | --- |
+| `pipeline` | 各核独立 invalidate→copy→clean，复现当前三段交错 |
+| `phased` | 全部 invalidate 完成→并行 copy→全部 copy 完成→并行 clean，排除阶段交错 |
+| `serial_copy` | 同一批 block、相同分片逐个 copy，其余核等待；每个 turn 追加计时外 DSB，再释放下一核 |
+| `copy_fenced` | phased copy 后逐核追加一次 `dsb sy`，单独记录 store drain，检查复制返回与提交完成的区别 |
+| `packed` / `packed_serial` | 仍使用同一逐行复制实现，目标行距由 768 改为 656；比较连续输出的扩展性 |
+| `read` / `read_serial` | 只读 packed 输入，计算 16 个字节 lane 的 XOR 校验；比较读路径并发与串行 |
+| `write` / `write_serial` | 只写 output 的有效字节，padding 不变；比较写路径并发与串行 |
+| `compute` / `compute_serial` | 相同次数的寄存器整数运算；检查是否连计算控制也出现并发降速 |
+
+`avg_op_us` 对 copy case 相当于原来的 memcpy 阶段。`avg_op_cpu_us` 是包围操作的
+线程 CPU 时间，包含边界时钟调用的少量开销，不包含 drain 和阶段屏障。
+serial 系列与 copy_fenced 的 `avg_drain_us` 单独计量 DSB；DSB 不能代替 output clean，
+也不表示此时所有脏缓存行已写回 HBM。
+线程 CPU 时间接近墙钟时间只能说明线程持续占用 CPU，不能排除硬件访存停顿。
+CPU 时钟或核号查询失败明确报告 errors/unavailable；`frequency` 是计时器频率，
+不能当作 AICPU 实际执行频率。
+
+invalidate/clean 额外拆成 `avg_*_issue_us`（缓存行指令循环）和 `avg_*_dsb_us`
+（末尾 DSB），用于区分循环执行成本与完成等待。issue 段本身也可能因缓存维护
+队列反压而停顿，不能理解为纯指令发射时间；额外时间戳会给诊断带来少量开销。
+
+SUMMARY 的 `avg_op_envelope_us` 每轮取操作最早开始到最晚结束再平均，
+`avg_sum_worker_op_us` 则是各 worker 操作耗时之和；两者不等价。
+`avg_max_overlap`/`max_overlap` 由逐轮真实区间计算。串行系列若出现操作重叠直接失败。
+`avg_round_envelope_us` 包含阶段间等待和 clean，未包含最前面的缓存准备和最终统计。
+`payload_GBps` 只按有效字节/操作区间估算，不包含缓存分配额外流量；在写入缓冲尚未
+排空的 case 中也不能解释为完整 HBM 写回带宽。compute case 不报告有意义的带宽。
+
+`TRACE` 默认输出前 3 个正式轮次，各 worker 的 invalidate/op/drain/clean 起止时间
+都相对该轮最早 invalidate 起点。日志、输出逐字节/guard 校验、read/compute 的
+逐轮 checksum 校验和 device readback 均在 kernel 同步完成后进行。
+核号在每轮操作前后采样，affinity 在循环外查询；边界采样不能检测迁出再迁回。
+
+判断顺序：
+
+1. 查看核采样和 overlap，确认并行 case 实际同时运行在不同 CPU；比较 serial 与
+   parallel 时核分配应相同或可对应，不只看请求 block 数。
+2. `serial_copy` 每核明显快于 `phased`：支持并发访存导致减速；仅凭这一项不能区分
+   共享缓存、互联、内存端口、访存延迟或功耗/频率影响。
+3. `phased` 明显快于 `pipeline`：invalidate/clean 与其他核 copy 交错是重要因素。
+4. read 或 write 的并行/串行比更差：分别指向读路径或写入/分配路径；这些控制的
+   指令混合与 copy 不同，因此用于定位扩展性，不能直接相减得到 copy 各部分耗时。
+5. packed 明显改善并发/串行比：目标布局和缓存行访问是重要因素，但不能据此认定
+   写分配是唯一原因；compute 也同比降速则需继续检查执行频率/核资源。
+
+再用 16、64、256、1024 行/核重复 `all`（656 B 时必须是 4 行的整数倍），观察小
+工作集与大工作集的扩展性；如果仅大工作集降速，进一步支持缓存之外的访存限制。
+可用 `--probe-timeout-ms 1000` 调整屏障超时，上限 10000；不能同时调度全部 block
+时会报错，不把串行调度结果当作并行。iterations+warmup 最多 2000，默认 205 轮。
+
+先跑未启用 PMU 的套件，再在同样命令中添加 `--probe-pmu`。probe 尝试通过设备
+Linux `perf_event_open` 为当前线程建立 cycles、instructions、cache_references、
+cache_misses、backend_stalls 的硬件事件组。打开、启停和读取均在操作墙钟计时之外；
+事件区间包围操作及少量用户态边界采样。PMU 不是默认性能口径，小工作集尤其容易
+受到这些额外系统调用及核间启动错峰影响。
+
+每个事件输出有效轮数、原始均值、按 enabled/running 比例估算的 scaled 均值和
+`avg_running_fraction`。比例明显低于 1 时，复用缩放不能作为精确硬件结论；为 0
+表示事件组没有实际运行，也会显示 unavailable。不支持的事件或权限不足报告
+`open_errno`，启停/读取错误报告 `read_errno`，不会将缺失计数冒充 0。缺少 perf
+头文件或 syscall 能力也保留完整普通 probe，PMU 显示 unavailable。
+
+事件组必须整体能被 PMU 调度；若 running_fraction 为 0，可用 `--probe-pmu-mask 3`
+只采集 cycles/instructions，再用 11 添加 cache_misses 或用 19 添加 backend_stalls。
+mask 的 bit 0..4 对应上述五个事件；`--probe-pmu` 默认选择全部事件（31）。
+enabled/running 按逐轮差值计算，因为 RESET 不重置这些累计时间。
+计数格式和组语义参考 [Linux perf_event_open](https://man7.org/linux/man-pages/man2/perf_event_open.2.html)。
+
+相同复制代码下 instructions/row 应接近；如果四核 cycles/row、cycles/instruction
+和 backend_stalls/row 同时明显升高，而 compute 控制稳定，更支持访存停顿。
+若 instructions/row 本身大幅改变，先检查迁移、插桩或执行路径。泛化的 cache
+事件含义依赖平台 PMU，不能把 cache_misses 直接换算成 HBM 读流量。确定具体
+共享端口仍需芯片对应的互联/内存控制器计数器。
+
+这个 probe 隔离了本地复制，不复现 DMA 新写入后的完整缓存/一致性状态。如果
+pipeline 与真实 URMA 测试明显不同，需返回真实传输链路继续排查。确定具体硬件
+端口或 cache 层级还需要目标平台可用的 PMU/互联计数器；这些控制测试不会把推断
+冒充硬件计数器结论。
+
+无 NPU 的检查目标：
+
+```bash
+cmake --build build-aicpu-cpu --target kvaf_aicpu_scatter_probe_test
+ctest --test-dir build-aicpu-cpu -R '^kvaf_aicpu_scatter_probe$' --output-on-failure
+```
+
 ### 实际运行核与 scatter 三段计时
 
 在 **NPU 端**增加 `--profile-scatter`，默认关闭。升级需重新编译并安装 V10 kernel，

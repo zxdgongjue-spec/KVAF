@@ -6,6 +6,7 @@
 #include "scatter_copy.h"
 #include "scatter_pool.h"
 #include "scatter_profile.h"
+#include "scatter_probe.h"
 
 #include <cerrno>
 #include <cstring>
@@ -362,7 +363,172 @@ std::uint64_t ProbeFrequency() {
   asm volatile("mrs %0, cntfrq_el0" : "=r"(value));
   return value;
 }
+
+// Standalone diagnostics share the normal cache/copy primitives, but do not
+// open URMA. Each block always owns the same fixed-sized, disjoint range.
+void ProbeCacheLines(const void* data, std::uint64_t bytes, bool invalidate) {
+  auto line = reinterpret_cast<std::uintptr_t>(data) & ~std::uintptr_t{63};
+  const auto end = reinterpret_cast<std::uintptr_t>(data) + bytes;
+  if (invalidate) {
+    for (; line < end; line += 64) asm volatile("dc civac, %0" :: "r"(line) : "memory");
+  } else {
+    for (; line < end; line += 64) asm volatile("dc cvac, %0" :: "r"(line) : "memory");
+  }
+}
+struct ScatterProbeIO {
+  const ScatterProbeArgs& args;
+  ScatterProbeLayout layout;
+  ScatterProbeCoordination& coordination;
+  std::uint32_t worker;
+  std::uint64_t generation{}, timeout_ticks;
+  ScatterProbePmu pmu;
+
+  bool Pending() { return Load(coordination.status) == static_cast<std::uint64_t>(Result::kPending); }
+  bool Sync() {
+    Store(coordination.arrived[worker], ++generation);
+    const auto start = ProbeNow();
+    for (;;) {
+      if (!Pending()) return false;
+      bool complete = true;
+      for (std::uint64_t w = 0; w < args.config.workers; ++w)
+        if (Load(coordination.arrived[w]) < generation) { complete = false; break; }
+      if (complete) return true;
+      if (ProbeNow() - start >= timeout_ticks) {
+        std::uint64_t expected = static_cast<std::uint64_t>(Result::kPending);
+        __atomic_compare_exchange_n(&coordination.status.value, &expected,
+            static_cast<std::uint64_t>(Result::kTimeout), false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+        return false;
+      }
+      asm volatile("yield" ::: "memory");
+    }
+  }
+  std::uint8_t* Source() {
+    return reinterpret_cast<std::uint8_t*>(args.source) +
+        worker * args.config.rows_per_worker * args.config.row_bytes;
+  }
+  std::uint8_t* Output() {
+    return reinterpret_cast<std::uint8_t*>(args.output) +
+        worker * args.config.rows_per_worker * layout.stride;
+  }
+  void Operation(ScatterProbeSample& s) {
+    const auto& c = args.config;
+    alignas(16) std::uint8_t checksum[16]{};
+    s.first_cpu = sched_getcpu();
+    if (s.first_cpu < 0) s.cpu_sample_errno = errno;
+    timespec cpu_start{}, cpu_end{};
+    pmu.Begin(s.pmu);
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_start) != 0) s.cpu_time_errno = errno;
+    s.op_begin = ProbeNow();
+    if (ProbeReadsOnly(c.mode)) {
+      ProbeReadVectors(Source(), c.rows_per_worker * c.row_bytes, checksum);
+    } else if (ProbeWritesOnly(c.mode)) {
+      ProbeWriteRows(Output(), c.rows_per_worker, c.row_bytes, layout.stride);
+    } else if (ProbeComputesOnly(c.mode)) {
+      s.checksum = ProbeCompute(c.rows_per_worker * c.row_bytes / 16, worker + 1);
+    } else {
+      CopyScatterRows(Output(), Source(), c.rows_per_worker, c.row_bytes, layout.stride);
+    }
+    s.op_end = ProbeNow();
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_end) != 0 && !s.cpu_time_errno)
+      s.cpu_time_errno = errno;
+    if (!s.cpu_time_errno)
+      s.op_cpu_ns = (cpu_end.tv_sec - cpu_start.tv_sec) * 1000000000LL +
+          cpu_end.tv_nsec - cpu_start.tv_nsec;
+    s.last_cpu = sched_getcpu();
+    if (s.last_cpu < 0 && !s.cpu_sample_errno) s.cpu_sample_errno = errno;
+    pmu.End(s.pmu);
+    // Keep the CPU-clock sampling outside drain timing. Serialized turns wait
+    // for explicit accesses before releasing the next worker; this does not
+    // imply that dirty cache lines have already been cleaned to HBM.
+    const bool drain = c.mode == ScatterProbeMode::kCopyFenced || ProbeSerial(c.mode);
+    s.drain_begin = drain ? ProbeNow() : s.op_end;
+    if (drain) Barrier();
+    s.drain_end = drain ? ProbeNow() : s.op_end;
+    if (ProbeReadsOnly(c.mode)) for (auto byte : checksum) s.checksum = s.checksum * 131 + byte;
+  }
+  bool Round(ScatterProbeSample& s) {
+    const auto& c = args.config;
+    // Evict only this block's output, then ensure preparation has stopped on
+    // every block before any timed phase begins. No verification in the loop.
+    Invalidate(Output(), c.rows_per_worker * layout.stride);
+    if (!Sync()) return false;
+    s.invalidate_begin = ProbeNow();
+    ProbeCacheLines(Source(), c.rows_per_worker * c.row_bytes, true);
+    s.invalidate_issued = ProbeNow();
+    Barrier();
+    s.invalidate_end = ProbeNow();
+    if (c.mode != ScatterProbeMode::kPipeline && !Sync()) return false;
+    if (ProbeSerial(c.mode)) {
+      for (std::uint64_t turn = 0; turn < c.workers; ++turn) {
+        if (turn == worker) Operation(s);
+        if (!Sync()) return false;
+      }
+    } else {
+      Operation(s);
+      if (c.mode != ScatterProbeMode::kPipeline && !Sync()) return false;
+    }
+    s.clean_begin = ProbeNow();
+    if (ProbeComputesOnly(c.mode) || ProbeReadsOnly(c.mode)) {
+      s.clean_issued = s.clean_begin;
+      Barrier();
+    } else if (ProbePacked(c.mode)) {
+      ProbeCacheLines(Output(), c.rows_per_worker * c.row_bytes, false);
+      s.clean_issued = ProbeNow();
+      Barrier();
+    } else {
+      CleanScatterPayload(reinterpret_cast<std::uintptr_t>(Output()), c.rows_per_worker,
+          c.row_bytes, layout.stride,
+          [](std::uintptr_t line) { asm volatile("dc cvac, %0" :: "r"(line) : "memory"); },
+          [&s] { s.clean_issued = ProbeNow(); Barrier(); });
+    }
+    s.clean_end = ProbeNow();
+    return Sync();
+  }
+};
 }  // namespace
+
+extern "C" __attribute__((visibility("default")))
+std::uint32_t KvafAicpuScatterProbeV1(ScatterProbeArgs* args) {
+  ScatterProbeLayout layout{};
+  if (!args || !args->source || !args->output || !args->samples || !args->result ||
+      !args->coordination || !MakeScatterProbeLayout(args->config, &layout)) return 1;
+  auto& c = *reinterpret_cast<ScatterProbeCoordination*>(args->coordination);
+  auto& result = *reinterpret_cast<ScatterProbeResult*>(args->result);
+  if (result.magic != kScatterProbeMagic || result.revision != kScatterProbeRevision) return 1;
+  const auto id = Add(c.claimed);
+  if (id >= args->config.workers) return 1;
+  const auto worker = static_cast<std::uint32_t>(id);
+  auto& placement = result.placement[worker];
+  placement = {}; placement.slot = worker;
+  ProbeAffinity(placement); ProbeCpu(placement);
+  const auto frequency = ProbeFrequency();
+  if (worker == 0) result.counter_frequency = frequency;
+  ScatterProbeIO io{*args, layout, c, worker, 0, frequency * args->config.timeout_ms / 1000};
+  io.pmu.Open(args->config.pmu);
+  bool ok = io.timeout_ticks != 0 && io.Sync();
+  auto* samples = reinterpret_cast<ScatterProbeSample*>(args->samples);
+  for (std::uint64_t round = 0; ok && round < args->config.warmup + args->config.iterations; ++round) {
+    ScatterProbeSample sample{};
+    ok = io.Round(sample);
+    if (ok && round >= args->config.warmup)
+      samples[(round - args->config.warmup) * args->config.workers + worker] = sample;
+  }
+  // Ensure raw sample stores are complete before flushing them for host readback.
+  if (ok) ok = io.Sync();
+  ProbeCpu(placement);
+  Clean(&placement, sizeof(placement));
+  for (std::uint64_t round = 0; round < args->config.iterations; ++round)
+    Clean(&samples[round * args->config.workers + worker], sizeof(ScatterProbeSample));
+  if (ok) __atomic_fetch_add(&result.completed_workers, std::uint64_t{1}, __ATOMIC_ACQ_REL);
+  const auto exited = Add(c.exited) + 1;
+  if (exited == args->config.workers) {
+    if (result.completed_workers == args->config.workers && io.Pending())
+      Store(c.status, static_cast<std::uint64_t>(Result::kOk));
+    Clean(&result, offsetof(ScatterProbeResult, placement));
+    Clean(&c, sizeof(c));
+  }
+  return ok ? 0 : 1;
+}
 
 extern "C" __attribute__((visibility("default")))
 std::uint32_t KvafAicpuCoreProbeV1(CoreProbeArgs* args) {

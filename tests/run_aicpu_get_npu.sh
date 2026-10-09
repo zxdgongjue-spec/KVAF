@@ -21,6 +21,15 @@ Pass-through options: --port 29991 --device-id 0 --eid HEX --kernel-json PATH
   --profile-scatter   Report AICPU CPU placement and scatter phase timing after the run
   --probe-aicpu-blocks N [--probe-hold-ms 20]
                       Standalone blockDim-to-core probe; requires --device-id and exits
+  --probe-scatter-blocks N
+                      Standalone local-copy diagnostics; requires --device-id; no CPU peer
+    --probe-rows-per-worker 1024 --probe-row-bytes 656
+    --probe-iterations 200 --probe-warmup 5 --probe-trace-rounds 3
+    --probe-scatter-case all|pipeline|phased|serial_copy|copy_fenced|packed|packed_serial|
+                         read|read_serial|write|write_serial|compute|compute_serial
+    --probe-timeout-ms 1000   Per-barrier timeout, fails if blocks cannot run together
+    --probe-pmu             Optional per-thread Linux hardware counters; reports unsupported events
+    --probe-pmu-mask N      Select a smaller event group: 3=cycles/instructions, 11=+misses, 19=+stalls
   --aicpu-blocks N    Use N AICPU blocks for scatter; N must equal active scatter ranges
                      direct_output always launches one coordinator, even if N > 1
 Without --device-id, use the CPU request's NPU device ID. With it, reject a mismatch.

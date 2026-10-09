@@ -3,6 +3,7 @@
 #include "metrics.h"
 #include "scatter_profile_report.h"
 #include "scatter_copy.h"
+#include "scatter_probe_report.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -18,14 +19,20 @@ struct Options {
   std::uint32_t aicpu_blocks{1};
   std::uint32_t probe_aicpu_blocks{};
   std::uint32_t probe_hold_ms{20};
+  std::uint32_t probe_scatter_blocks{};
+  ScatterProbeConfig scatter_probe;
+  std::string scatter_probe_case{"all"};
+  std::uint64_t probe_trace_rounds{3};
   std::uint16_t port{29991};
   std::string eid, json;
 };
 Options Parse(int argc, char** argv) {
   Options o;
+  bool scatter_probe_option = false;
   for (int i = 1; i < argc; ++i) {
     const std::string flag = argv[i];
     if (flag == "--profile-scatter") { o.profile_scatter = true; continue; }
+    if (flag == "--probe-pmu") { o.scatter_probe.pmu = kScatterProbePmuMask; scatter_probe_option = true; continue; }
     Require(i + 1 < argc, "missing option value");
     const char* value = argv[++i];
     if (flag == "--kernel-json") o.json = value;
@@ -44,10 +51,40 @@ Options Parse(int argc, char** argv) {
     } else if (flag == "--probe-hold-ms") {
       const auto n = Number(value); Require(n > 0 && n <= 5000, "invalid probe hold time");
       o.probe_hold_ms = static_cast<std::uint32_t>(n);
+    } else if (flag == "--probe-scatter-blocks") {
+      const auto n = Number(value); Require(n > 0 && n <= kMaxScatterThreads, "invalid scatter probe block count");
+      o.probe_scatter_blocks = static_cast<std::uint32_t>(n); o.scatter_probe.workers = n;
+    } else if (flag == "--probe-rows-per-worker") {
+      o.scatter_probe.rows_per_worker = Number(value); scatter_probe_option = true;
+    } else if (flag == "--probe-row-bytes") {
+      o.scatter_probe.row_bytes = Number(value); scatter_probe_option = true;
+    } else if (flag == "--probe-iterations") {
+      o.scatter_probe.iterations = Number(value); scatter_probe_option = true;
+    } else if (flag == "--probe-warmup") {
+      o.scatter_probe.warmup = Number(value); scatter_probe_option = true;
+    } else if (flag == "--probe-timeout-ms") {
+      o.scatter_probe.timeout_ms = Number(value); scatter_probe_option = true;
+    } else if (flag == "--probe-pmu-mask") {
+      o.scatter_probe.pmu = Number(value); scatter_probe_option = true;
+      Require(o.scatter_probe.pmu > 0 && o.scatter_probe.pmu <= kScatterProbePmuMask, "invalid PMU event mask");
+    } else if (flag == "--probe-scatter-case") {
+      o.scatter_probe_case = value; scatter_probe_option = true;
+    } else if (flag == "--probe-trace-rounds") {
+      o.probe_trace_rounds = Number(value); scatter_probe_option = true;
+      Require(o.probe_trace_rounds <= 50, "scatter probe trace is limited to 50 rounds");
     } else throw std::runtime_error("unknown option " + flag);
   }
   Require(!o.json.empty(), "--kernel-json PATH is required");
   if (o.probe_aicpu_blocks) Require(o.has_device, "--probe-aicpu-blocks requires --device-id");
+  Require(!scatter_probe_option || o.probe_scatter_blocks, "scatter probe options require --probe-scatter-blocks");
+  if (o.probe_scatter_blocks) {
+    Require(o.has_device && !o.probe_aicpu_blocks, "scatter probe requires --device-id and cannot run with core probe");
+    ScatterProbeLayout l{}; Require(MakeScatterProbeLayout(o.scatter_probe, &l), "invalid scatter probe shape/rounds");
+    bool known = o.scatter_probe_case == "all";
+    for (std::uint64_t i = 0; i < static_cast<std::uint64_t>(ScatterProbeMode::kCount); ++i)
+      known |= o.scatter_probe_case == ScatterProbeModeName(static_cast<ScatterProbeMode>(i));
+    Require(known, "unknown --probe-scatter-case");
+  }
   return o;
 }
 struct DeviceBuffer {
@@ -95,6 +132,18 @@ class Kernel {
     aclrtLaunchKernelCfg cfg{}; cfg.numAttrs = 1; cfg.attrs = &attr;
     Acl(aclrtLaunchKernelWithHostArgs(function_, block_dim, stream_, &cfg,
         const_cast<CoreProbeArgs*>(&args), sizeof(args), nullptr, 0), "launch AICPU core probe");
+  }
+  void LaunchScatterProbe(const ScatterProbeArgs& args) {
+    ScatterProbeLayout l{}; Require(MakeScatterProbeLayout(args.config, &l), "invalid scatter probe launch");
+    aclrtLaunchKernelAttr attr{};
+    attr.id = ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT;
+    attr.value.timeout = static_cast<std::uint32_t>(60 +
+        (args.config.warmup + args.config.iterations) * (args.config.workers + 4) *
+        ((args.config.timeout_ms + 999) / 1000));
+    aclrtLaunchKernelCfg cfg{}; cfg.numAttrs = 1; cfg.attrs = &attr;
+    Acl(aclrtLaunchKernelWithHostArgs(function_, static_cast<std::uint32_t>(args.config.workers),
+        stream_, &cfg, const_cast<ScatterProbeArgs*>(&args), sizeof(args), nullptr, 0),
+        "launch AICPU scatter probe");
   }
   aclError Synchronize() { return aclrtSynchronizeStream(stream_); }
  private:
@@ -355,6 +404,122 @@ void RunCoreProbe(const Options& options) {
     std::fprintf(stderr, "[AICPU_CORE_PROBE] MULTICORE_NOT_READY: blockDim completed but blocks did not overlap on distinct CPUs\n");
 }
 
+void InitializeProbeSource(void* allocation, std::uint64_t bytes, std::uint64_t row_bytes) {
+  constexpr std::uint64_t chunk_size = 1U << 20;
+  std::vector<std::uint8_t> chunk(std::min(bytes, chunk_size));
+  for (std::uint64_t offset = 0; offset < bytes; offset += chunk.size()) {
+    const auto count = std::min<std::uint64_t>(chunk.size(), bytes - offset);
+    for (std::uint64_t i = 0; i < count; ++i)
+      chunk[i] = Pattern((offset + i) / row_bytes, (offset + i) % row_bytes);
+    Acl(aclrtMemcpy(static_cast<std::uint8_t*>(allocation) + kGuardBytes + offset,
+        count, chunk.data(), count, ACL_MEMCPY_HOST_TO_DEVICE), "initialize scatter probe source");
+  }
+}
+
+void ValidateProbeOutput(const ScatterProbeConfig& c, const ScatterProbeLayout& l,
+                         const void* allocation, std::uint64_t allocation_bytes) {
+  constexpr std::uint64_t chunk_size = 1U << 20;
+  std::vector<std::uint8_t> chunk(std::min(allocation_bytes, chunk_size));
+  for (std::uint64_t offset = 0; offset < allocation_bytes; offset += chunk.size()) {
+    const auto count = std::min<std::uint64_t>(chunk.size(), allocation_bytes - offset);
+    Acl(aclrtMemcpy(chunk.data(), count, static_cast<const std::uint8_t*>(allocation) + offset,
+        count, ACL_MEMCPY_DEVICE_TO_HOST), "read scatter probe output/guards");
+    for (std::uint64_t i = 0; i < count; ++i) {
+      const auto position = offset + i;
+      std::uint8_t expected = 0xA5;
+      if (position >= kGuardBytes && position - kGuardBytes < l.output_bytes) {
+        const auto row = (position - kGuardBytes) / l.stride;
+        const auto b = (position - kGuardBytes) % l.stride;
+        if (b < c.row_bytes) {
+          if (ProbeWritesOnly(c.mode)) expected = 0x3C;
+          else if (ProbeCopies(c.mode)) expected = Pattern(row, b);
+        }
+      }
+      Require(chunk[i] == expected, "scatter probe payload/guard mismatch at byte " + std::to_string(position));
+    }
+  }
+}
+
+void ValidateProbeChecksums(const ScatterProbeConfig& c, const std::vector<ScatterProbeSample>& samples) {
+  if (!ProbeReadsOnly(c.mode) && !ProbeComputesOnly(c.mode)) return;
+  for (std::uint64_t worker = 0; worker < c.workers; ++worker) {
+    std::uint64_t expected = 0;
+    if (ProbeComputesOnly(c.mode)) expected = ProbeCompute(c.rows_per_worker * c.row_bytes / 16, worker + 1);
+    else {
+      std::uint8_t lanes[16]{};
+      for (std::uint64_t row = worker * c.rows_per_worker; row < (worker + 1) * c.rows_per_worker; ++row)
+        for (std::uint64_t b = 0; b < c.row_bytes; ++b) lanes[b % 16] ^= Pattern(row, b);
+      for (auto byte : lanes) expected = expected * 131 + byte;
+    }
+    for (std::uint64_t round = 0; round < c.iterations; ++round)
+      Require(samples[round * c.workers + worker].checksum == expected, "scatter probe checksum mismatch");
+  }
+}
+
+void RunScatterProbe(const Options& options) {
+  Acl(aclrtSetDevice(options.device), "select scatter probe device");
+  const auto& config = options.scatter_probe;
+  ScatterProbeLayout maximum{}; Require(MakeScatterProbeLayout(config, &maximum), "invalid scatter probe config");
+  // Keep source/output addresses and total allocation size fixed across cases.
+  DeviceBuffer source, output, samples, result, coordination;
+  source.Allocate(maximum.source_bytes + 2 * kGuardBytes, 0xA5);
+  output.Allocate(maximum.output_bytes + 2 * kGuardBytes, 0xA5);
+  samples.Allocate(config.iterations * config.workers * sizeof(ScatterProbeSample));
+  result.Allocate(sizeof(ScatterProbeResult)); coordination.Allocate(sizeof(ScatterProbeCoordination));
+  InitializeProbeSource(source.data, maximum.source_bytes, config.row_bytes);
+  Kernel kernel; kernel.Load(options.json, kScatterProbeKernelName);
+  for (std::uint64_t mode = 0; mode < static_cast<std::uint64_t>(ScatterProbeMode::kCount); ++mode) {
+    auto c = config; c.mode = static_cast<ScatterProbeMode>(mode);
+    if (options.scatter_probe_case != "all" && options.scatter_probe_case != ScatterProbeModeName(c.mode)) continue;
+    ScatterProbeLayout l{}; Require(MakeScatterProbeLayout(c, &l), "invalid scatter probe case");
+    const ScatterProbeResult initial{};
+    const ScatterProbeCoordination initial_coordination{};
+    Acl(aclrtMemset(output.data, maximum.output_bytes + 2 * kGuardBytes, 0xA5,
+        maximum.output_bytes + 2 * kGuardBytes), "reset scatter probe output");
+    Acl(aclrtMemcpy(result.data, sizeof(initial), &initial, sizeof(initial), ACL_MEMCPY_HOST_TO_DEVICE),
+        "reset scatter probe result");
+    Acl(aclrtMemcpy(coordination.data, sizeof(initial_coordination), &initial_coordination,
+        sizeof(initial_coordination), ACL_MEMCPY_HOST_TO_DEVICE), "reset scatter probe coordination");
+    ScatterProbeArgs args{reinterpret_cast<std::uint64_t>(source.data) + kGuardBytes,
+        reinterpret_cast<std::uint64_t>(output.data) + kGuardBytes,
+        reinterpret_cast<std::uint64_t>(samples.data), reinterpret_cast<std::uint64_t>(result.data),
+        reinterpret_cast<std::uint64_t>(coordination.data), c};
+    std::fprintf(stderr, "[AICPU_SCATTER_PROBE] LAUNCH device-id=%u case=%s block_dim=%llu "
+        "source_va=0x%llx output_va=0x%llx source_allocation_bytes=%llu output_allocation_bytes=%llu\n",
+        options.device, ScatterProbeModeName(c.mode), (unsigned long long)c.workers,
+        (unsigned long long)args.source, (unsigned long long)args.output,
+        (unsigned long long)(maximum.source_bytes + 2 * kGuardBytes),
+        (unsigned long long)(maximum.output_bytes + 2 * kGuardBytes));
+    kernel.LaunchScatterProbe(args);
+    const auto sync = kernel.Synchronize();
+    auto device_result = std::make_unique<ScatterProbeResult>();
+    auto device_coordination = std::make_unique<ScatterProbeCoordination>();
+    Acl(aclrtMemcpy(device_result.get(), sizeof(*device_result), result.data,
+        sizeof(*device_result), ACL_MEMCPY_DEVICE_TO_HOST), "read scatter probe result");
+    Acl(aclrtMemcpy(device_coordination.get(), sizeof(*device_coordination), coordination.data,
+        sizeof(*device_coordination), ACL_MEMCPY_DEVICE_TO_HOST), "read scatter probe status");
+    std::fprintf(stderr, "[AICPU_SCATTER_PROBE] STATUS case=%s stream=%d status=%llu claimed=%llu exited=%llu completed=%llu\n",
+        ScatterProbeModeName(c.mode), (int)sync, (unsigned long long)device_coordination->status.value,
+        (unsigned long long)device_coordination->claimed.value, (unsigned long long)device_coordination->exited.value,
+        (unsigned long long)device_result->completed_workers);
+    Acl(sync, "synchronize scatter probe");
+    Require(device_coordination->status.value == static_cast<std::uint64_t>(Result::kOk), "scatter probe failed/timed out");
+    std::vector<ScatterProbeSample> timings(c.iterations * c.workers);
+    Acl(aclrtMemcpy(timings.data(), timings.size() * sizeof(ScatterProbeSample), samples.data,
+        timings.size() * sizeof(ScatterProbeSample), ACL_MEMCPY_DEVICE_TO_HOST), "read scatter probe samples");
+    ValidateProbeOutput(c, l, output.data, maximum.output_bytes + 2 * kGuardBytes);
+    ValidateProbeChecksums(c, timings);
+    PrintScatterProbe(stderr, c, *device_result, timings, options.probe_trace_rounds);
+    std::uint8_t guard[kGuardBytes];
+    for (const auto offset : {std::uint64_t{0}, kGuardBytes + maximum.source_bytes}) {
+      Acl(aclrtMemcpy(guard, sizeof(guard), static_cast<const std::uint8_t*>(source.data) + offset,
+          sizeof(guard), ACL_MEMCPY_DEVICE_TO_HOST), "read scatter probe source guard");
+      for (auto byte : guard) Require(byte == 0xA5, "scatter probe source guard mismatch");
+    }
+    std::fprintf(stderr, "[AICPU_SCATTER_PROBE] PASS case=%s\n", ScatterProbeModeName(c.mode));
+  }
+}
+
 void Run(const Options& options) {
   Socket listener(Listen(options.port));
   std::fprintf(stderr, "AICPU_GET_NPU listening port=%u engine=aicpu_memcpy aicpu_blocks=%u\n",
@@ -410,7 +575,9 @@ int main(int argc, char** argv) {
   try {
     const auto options = Parse(argc, argv);
     Acl(aclInit(nullptr), "aclInit");
-    if (options.probe_aicpu_blocks) RunCoreProbe(options); else Run(options);
+    if (options.probe_scatter_blocks) RunScatterProbe(options);
+    else if (options.probe_aicpu_blocks) RunCoreProbe(options);
+    else Run(options);
     Acl(aclFinalize(), "aclFinalize");
     return 0;
   }

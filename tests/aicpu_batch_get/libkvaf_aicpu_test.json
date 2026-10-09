@@ -6,6 +6,13 @@
       "opKernelLib": "AICPUKernel"
     }
   },
+  "KvafAicpuScatterProbeV1": {
+    "opInfo": {
+      "functionName": "KvafAicpuScatterProbeV1",
+      "kernelSo": "libkvaf_aicpu_test.so",
+      "opKernelLib": "AICPUKernel"
+    }
+  },
   "KvafAicpuCoreProbeV1": {
     "opInfo": {
       "functionName": "KvafAicpuCoreProbeV1",
