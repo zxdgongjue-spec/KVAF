@@ -4,21 +4,24 @@
 #include <limits>
 
 namespace kvaf::aicpu_test {
-constexpr std::uint64_t kMagic = 0x4b56414641424733ULL;
-constexpr char kKernelName[] = "KvafAicpuBatchGetV10";
-constexpr std::uint64_t kKernelRevision = 10;
+constexpr std::uint64_t kMagic = 0x4b56414641424734ULL;
+constexpr char kKernelName[] = "KvafAicpuBatchGetV11";
+constexpr std::uint64_t kKernelRevision = 11;
 constexpr char kCoreProbeKernelName[] = "KvafAicpuCoreProbeV1";
 constexpr std::uint64_t kCoreProbeMagic = 0x4b564146434f5231ULL;
 constexpr std::uint64_t kCoreProbeRevision = 1;
 constexpr std::uint64_t kMaxScatterThreads = 32;
 constexpr std::uint64_t kRequestOffset = 0;
 constexpr std::uint64_t kDoneOffset = 256;
+constexpr std::uint64_t kPipelineReadyOffset = 512;
 constexpr std::uint64_t kStagingOffset = 4096;
 constexpr std::uint64_t kGuardBytes = 64;
 constexpr std::uint64_t kMaxAllocation = 8ULL << 30;
 constexpr std::uint64_t kMaxRounds = 100000;
 
-enum class TransferMode : std::uint64_t { kScatter = 0, kDirectOutput = 1 };
+enum class TransferMode : std::uint64_t {
+  kScatter = 0, kDirectOutput = 1, kScatterPipeline = 2,
+};
 
 struct Config {
   std::uint64_t magic{kMagic};
@@ -32,13 +35,20 @@ struct Config {
   // Direct output defaults to tightly packed rows. A larger stride exercises
   // remote gaps without transmitting or overwriting the intervening bytes.
   std::uint64_t direct_output_stride{};
+  // Validation only: refresh/check the entire payload on every sequence.
+  // Source generation is inside request wait, so this is not a bandwidth run.
+  std::uint64_t verify_payload{};
 };
 
 inline bool IsDirectOutput(const Config& c) {
   return c.transfer_mode == TransferMode::kDirectOutput;
 }
+inline bool IsScatterPipeline(const Config& c) {
+  return c.transfer_mode == TransferMode::kScatterPipeline;
+}
 inline const char* TransferModeName(const Config& c) {
-  return IsDirectOutput(c) ? "direct_output" : "scatter";
+  return IsDirectOutput(c) ? "direct_output" :
+      IsScatterPipeline(c) ? "scatter_pipeline" : "scatter";
 }
 
 struct Layout {
@@ -61,7 +71,8 @@ inline bool MakeLayout(const Config& c, Layout* out) {
       c.iterations == 0 || c.iterations > kMaxRounds ||
       c.warmup > kMaxRounds - c.iterations ||
       c.timeout_ms == 0 || c.timeout_ms > 600000 ||
-      (c.transfer_mode != TransferMode::kScatter && !IsDirectOutput(c)) ||
+      (c.transfer_mode != TransferMode::kScatter && !IsDirectOutput(c) && !IsScatterPipeline(c)) ||
+      c.verify_payload > 1 ||
       (!IsDirectOutput(c) && c.direct_output_stride != 0)) return false;
   const std::uint64_t source_stride = ((c.row_bytes + 63) & ~std::uint64_t{63}) + kGuardBytes;
   const std::uint64_t stride = IsDirectOutput(c)
@@ -80,6 +91,10 @@ struct alignas(64) Control {
   std::uint64_t sequence;
   std::uint64_t reserved[7];
 };
+inline std::uint64_t PipelineReadyOffset(std::uint32_t worker) {
+  return kPipelineReadyOffset + worker * sizeof(Control);
+}
+static_assert(kPipelineReadyOffset + kMaxScatterThreads * sizeof(Control) <= kStagingOffset);
 
 enum class Result : std::uint64_t {
   kPending = 0, kOk = 1, kInvalidArgs = 2, kTimeout = 3,
@@ -89,6 +104,8 @@ enum class Result : std::uint64_t {
 
 struct Sample {
   std::uint64_t total_ticks;
+  // Pipeline: request -> earliest observed range ready, then ready -> all
+  // scatter ranges and final producer done. The latter includes overlap.
   std::uint64_t wait_ticks;
   std::uint64_t scatter_ticks;
 };
@@ -192,6 +209,12 @@ inline bool IsValidCoreProbeResult(const CoreProbeResult& r,
 inline std::uint8_t Pattern(std::uint64_t row, std::uint64_t byte) {
   return static_cast<std::uint8_t>((row * 131 + byte * 17 + (byte >> 8)) % 251);
 }
+inline std::uint8_t PayloadPattern(const Config& c, std::uint64_t sequence,
+                                   std::uint64_t row, std::uint64_t byte) {
+  const auto mask = c.verify_payload ?
+      static_cast<std::uint8_t>(sequence * 37 + (sequence >> 8) * 29) : 0;
+  return Pattern(row, byte) ^ mask;
+}
 inline std::uint64_t RowTag(std::uint64_t sequence, std::uint64_t row) {
   return (sequence << 32) | row;
 }
@@ -228,8 +251,8 @@ inline RowRange ScatterRange(const Config& c, std::uint32_t worker, std::uint32_
   const auto end = (groups * (worker + 1) / workers) * quantum;
   return {begin, end < c.rows ? end : c.rows};
 }
-static_assert(sizeof(Config) == 72 && sizeof(Control) == 64);
+static_assert(sizeof(Config) == 80 && sizeof(Control) == 64);
 static_assert(sizeof(Sample) == 24 && sizeof(KernelResult) == 64);
-static_assert(sizeof(KernelArgs) == 120 && sizeof(CoordinationWord) == 64);
+static_assert(sizeof(KernelArgs) == 128 && sizeof(CoordinationWord) == 64);
 static_assert(sizeof(CoreProbeSlot) == 256 && sizeof(CoreProbeArgs) == 24);
 }  // namespace kvaf::aicpu_test

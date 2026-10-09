@@ -45,6 +45,10 @@ inline void PrintScatterProfile(std::FILE* out, const Config& config,
                                 std::uint64_t frequency, const ScatterProfile& p) {
   ValidateScatterProfile(config, p);
   if (!frequency) throw std::runtime_error("missing scatter profile counter frequency");
+  if (IsScatterPipeline(config))
+    std::fprintf(out, "[AICPU_PROFILE] SEMANTICS mode=scatter_pipeline "
+        "start_origin=request pool_includes=range_ready_wait "
+        "envelope=scatter_span thread_cpu=scatter_only\n");
   const double us_per_tick_per_round = 1e6 / static_cast<double>(frequency) / p.rounds;
   std::uint64_t cpu_ns = 0;
   bool cpu_time_valid = true;

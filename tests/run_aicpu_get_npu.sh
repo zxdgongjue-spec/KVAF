@@ -32,9 +32,10 @@ Pass-through options: --port 29991 --device-id 0 --eid HEX --kernel-json PATH
     --probe-pmu-mask N      Select a smaller event group: 3=cycles/instructions, 11=+misses, 19=+stalls
   --aicpu-blocks N    Use N AICPU blocks for scatter; N must equal active scatter ranges
                      direct_output always launches one coordinator, even if N > 1
+                     scatter_pipeline requires N equal to active ranges (also N=1)
 Without --device-id, use the CPU request's NPU device ID. With it, reject a mismatch.
 The built kernel JSON is selected automatically. No installation by default.
-Set --rows, --row-bytes, --scatter-threads and --transfer-mode on the CPU script.
+Set --rows, --row-bytes, --scatter-threads, --transfer-mode and --verify-payload on the CPU script.
 direct_output skips --profile-scatter because there is no scatter phase.
 This server handles one test run; restart it for the next run.
 Build: bash build.sh aicpu-npu

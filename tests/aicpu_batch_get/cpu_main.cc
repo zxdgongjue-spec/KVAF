@@ -21,16 +21,17 @@ Options Parse(int argc, char** argv) {
   o.transport.remote_sgl_size = 16;
   for (int i = 1; i < argc; ++i) {
     const std::string flag = argv[i];
+    if (flag == "--verify-payload") { o.config.verify_payload = 1; continue; }
     Require(i + 1 < argc, "missing value for " + flag);
     const char* value = argv[++i];
     if (flag == "--peer") { o.transport.peer_address = value; continue; }
     if (flag == "--ub-device") { o.transport.ub_device = value; continue; }
     if (flag == "--transfer-mode") {
       const std::string mode = value;
-      Require(mode == "scatter" || mode == "direct_output",
-              "--transfer-mode must be scatter or direct_output");
-      o.config.transfer_mode = mode == "direct_output"
-          ? TransferMode::kDirectOutput : TransferMode::kScatter;
+      Require(mode == "scatter" || mode == "direct_output" || mode == "scatter_pipeline",
+              "--transfer-mode must be scatter, direct_output or scatter_pipeline");
+      o.config.transfer_mode = mode == "direct_output" ? TransferMode::kDirectOutput :
+          mode == "scatter_pipeline" ? TransferMode::kScatterPipeline : TransferMode::kScatter;
       continue;
     }
     const auto n = Number(value);
@@ -93,7 +94,7 @@ void Run(Options options) {
   Check(discovery.Initialize(options.transport.ub_device, options.transport.has_eid_index,
                              options.transport.eid_index));
   Layout layout{}; Require(MakeLayout(options.config, &layout), "invalid layout");
-  // One page-aligned registered allocation contains source rows and both
+  // One page-aligned registered allocation contains source rows and all
   // host-side control buffers. It outlives transport destruction on all paths.
   void* memory = nullptr;
   const auto bytes = (options.config.rows * layout.source_stride + 4096 + 4095) & ~std::uint64_t{4095};
@@ -109,7 +110,7 @@ void Run(Options options) {
     auto* data = input + row * layout.source_stride;
     for (std::uint64_t b = 8; b < options.config.row_bytes; ++b) data[b] = Pattern(row, b);
   }
-  // Order local sources by physical output slot in both modes. Scatter writes
+  // Order local sources by physical output slot in all modes. Scatter writes
   // packed staging; direct output uses the final output's remote stride.
   for (std::uint64_t slot = 0; slot < options.config.rows; ++slot) {
     const auto row = LogicalRowForOutputSlot(options.config, slot);
@@ -166,6 +167,21 @@ void Run(Options options) {
   CpuUrmaTransport::HostSge request_sge{request, sizeof(*request)}, done_sge{done, sizeof(*done)};
   Check(transport.WriteSglBatch(kRequestOffset, &request_sge, 1));
   Check(transport.WriteSglBatch(kDoneOffset, &done_sge, 1));
+  const bool pipeline = IsScatterPipeline(options.config);
+  const auto workers = ActiveThreads(options.config);
+  std::vector<CpuUrmaTransport::HostSge> ready_sges;
+  if (pipeline) {
+    ready_sges.resize(workers);
+    for (std::uint32_t worker = 0; worker < workers; ++worker) {
+      ready_sges[worker] = {static_cast<std::uint8_t*>(memory) + PipelineReadyOffset(worker), sizeof(Control)};
+      Check(transport.WriteSglBatch(PipelineReadyOffset(worker), &ready_sges[worker], 1));
+    }
+    std::fprintf(stderr, "[AICPU_PIPELINE] CPU ranges=%u scheduling=range_order "
+        "ready=after_range_write_batch staging=disjoint_full_batch\n", workers);
+  }
+  if (options.config.verify_payload)
+    std::fprintf(stderr, "AICPU_GET_CPU VALIDATION payload=sequence_pattern "
+        "source_generation=inside_request_wait performance=validation_only\n");
   Socket control(Connect(options.transport.peer_address));
   SocketTimeout(control.get(), options.config.timeout_ms + 120000);
   auto start = kvaf::peer::MakeHeader(kStart, sizeof(kvaf::peer::MessageHeader));
@@ -173,6 +189,7 @@ void Run(Options options) {
   Ack ack{}; Receive(control.get(), &ack, sizeof(ack));
   Require(ack.magic == kMagic && ack.status == 0, "NPU kernel launch failed");
   long double write_ns = 0, prepare_ns = 0, post_ns = 0, poll_ns = 0;
+  long double notify_ns = 0;
   std::uint64_t polls = 0, wr_count = 0;
   bool ok = true;
   try {
@@ -192,15 +209,40 @@ void Run(Options options) {
       for (std::uint64_t row = 0; row < options.config.rows; ++row) {
         const auto tag = RowTag(seq, row);
         std::memcpy(input + row * layout.source_stride, &tag, sizeof(tag));
+        if (options.config.verify_payload)
+          for (std::uint64_t b = 8; b < options.config.row_bytes; ++b)
+            input[row * layout.source_stride + b] = PayloadPattern(options.config, seq, row, b);
       }
-      Check(transport.WriteBatch(offsets.data(), sources.data(), sources.size()));
-      const auto timing = transport.last_batch_timing();
-      if (seq > options.config.warmup) {
-        write_ns += timing.total_ns; prepare_ns += timing.prepare_ns;
-        post_ns += timing.post_ns; poll_ns += timing.poll_ns; wr_count += timing.wr_count;
+      const auto write_range = [&](RowRange range) {
+        Check(transport.WriteBatch(offsets.data() + range.begin, sources.data() + range.begin,
+                                   range.end - range.begin));
+        const auto timing = transport.last_batch_timing();
+        if (seq > options.config.warmup) {
+          write_ns += timing.total_ns; prepare_ns += timing.prepare_ns;
+          post_ns += timing.post_ns; poll_ns += timing.poll_ns; wr_count += timing.wr_count;
+        }
+      };
+      const auto publish = [&](std::uint64_t offset, CpuUrmaTransport::HostSge& sge) {
+        static_cast<Control*>(sge.data)->sequence = seq;
+        Clock::time_point before{};
+        if (pipeline && seq > options.config.warmup) before = Clock::now();
+        // A ready WRITE is submitted only after this range's WriteBatch has
+        // waited for every participating Jetty. Never infer cross-Jetty
+        // completion from a single queue's tail. Provider HBM visibility
+        // uses the same completion/cache contract as the serial path.
+        Check(transport.WriteSglBatch(offset, &sge, 1));
+        if (pipeline && seq > options.config.warmup)
+          notify_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - before).count();
+      };
+      if (pipeline) {
+        for (std::uint32_t worker = 0; worker < workers; ++worker) {
+          write_range(ScatterRange(options.config, worker, workers));
+          publish(PipelineReadyOffset(worker), ready_sges[worker]);
+        }
+      } else {
+        write_range({0, options.config.rows});
       }
-      done->sequence = seq;
-      Check(transport.WriteSglBatch(kDoneOffset, &done_sge, 1));
+      publish(kDoneOffset, done_sge);
     }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "CPU transfer failed: %s\n", e.what()); ok = false;
@@ -214,10 +256,14 @@ void Run(Options options) {
   Report report{}; Receive(control.get(), &report, sizeof(report));
   Require(ok && report.magic == kMagic && report.status == 0, "benchmark or NPU validation failed");
   const double n = static_cast<double>(options.config.iterations);
-  std::printf("engine,rows,row_bytes,iterations,scatter_threads,active_threads,e2e_GBps,mean_ns,p50_ns,p99_ns,wait_ns,scatter_ns,"
-              "cpu_write_ns,cpu_prepare_ns,cpu_post_ns,cpu_poll_ns,mean_wrs,control_reads\n");
-  std::printf("%s,%llu,%llu,%llu,%llu,%llu,%.6f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%llu\n",
+  std::printf("engine,rows,row_bytes,iterations,scatter_threads,active_threads,e2e_GBps,mean_ns,p50_ns,p99_ns,%s,%s,"
+              "cpu_write_ns,cpu_prepare_ns,cpu_post_ns,cpu_poll_ns,mean_wrs,control_reads",
+              pipeline ? "first_ready_ns" : "wait_ns", pipeline ? "pipeline_ns" : "scatter_ns");
+  if (pipeline) std::printf(",cpu_notify_ns,mean_data_batches,mean_notify_wrs");
+  std::printf("\n");
+  std::printf("%s,%llu,%llu,%llu,%llu,%llu,%.6f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%llu",
               IsDirectOutput(options.config) ? "aicpu_urma_direct_output" :
+              pipeline ? "aicpu_memcpy_sgl_reordered_pipeline" :
               (report.active_threads > 1 ? "aicpu_memcpy_sgl_reordered_mt" :
                                            "aicpu_memcpy_sgl_reordered"),
               (unsigned long long)options.config.rows, (unsigned long long)options.config.row_bytes,
@@ -227,6 +273,8 @@ void Run(Options options) {
               report.p50_ns, report.p99_ns, report.wait_ns, report.scatter_ns,
               (double)write_ns / n, (double)prepare_ns / n, (double)post_ns / n,
               (double)poll_ns / n, (double)wr_count / n, (unsigned long long)polls);
+  if (pipeline) std::printf(",%.1f,%u,%u", (double)notify_ns / n, workers, workers + 1);
+  std::printf("\n");
 }
 }  // namespace
 int main(int argc, char** argv) {

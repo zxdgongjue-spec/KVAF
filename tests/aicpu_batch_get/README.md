@@ -1,4 +1,4 @@
-# AICPU 发起、CPU URMA 回推：scatter / direct output 带宽测试
+# AICPU 发起、CPU URMA 回推：scatter / pipeline / direct output 带宽测试
 
 这是独立 C++ 测试，不调用 Runtime BatchPut，不改 Python 或 MetaManager。
 
@@ -11,6 +11,75 @@ CSV 标注 `aicpu_memcpy_sgl_reordered` /
 `aicpu_memcpy_sgl_reordered_mt`，并输出请求与参与分片的线程数。
 `active_threads` 不是实际占用的核数；实际核采样需启用下面的诊断开关。
 线程创建失败报告 `pthread_error`，不会静默回退。设备 pthread 支持及带宽需在目标机器验证。
+
+### 可切换的批内流水线（V11）
+
+CPU 端选择 `--transfer-mode scatter_pipeline`；默认仍为 `scatter`，
+`direct_output` 继续保留。流水线沿用现有 `ScatterRange`：4096×656 B、4 个 worker
+时，每核仍负责 1024 行，使用现有 NEON copy 和 payload clean。
+CPU 依次对每个完整分片调用同步 `WriteBatch`，等待该分片所有 Jetty 完成后，
+向独立的 64 B ready 控制记录 WRITE 当前 sequence，然后立即发送下一分片。
+设备在 request 发布后释放全部 block，每核只等待自己的 ready，随后
+invalidate 自己的 staging、copy、clean。block 0 同时负责分片 0 的 scatter。
+无需第五个核、双缓冲或生产 transport 的异步 API；整批 staging 的各分片不重叠，
+下一轮仅在全部分片完成、全局 producer done 及计时外校验完成后请求。
+
+控制区的 per-range ready 从 offset 512 开始，每核独占一个 cache line，与 request、
+global done、staging 分离。旧 sequence 继续等待，未来 sequence、缺失 ready、
+超时或其他 block 的错误会使本轮失败。沿用现有 CPU drain/设备资源保留握手。
+ready 的正确性仍依赖 provider WRITE completion 到远端 HBM 可见性的契约；
+单个 Jetty 的 tail 不用于推断其他 Jetty 完成。
+
+流水线要求 NPU `--aicpu-blocks` 等于实际分片数；也支持一个 worker 的流水线对照。
+不支持多 worker 配置下的单 block pthread 回退；configure 阶段即拒绝该组合。
+V11 增加 `verify_payload` 字段，更新 magic、Configure 命令和 kernel 入口，
+必须重新构建 **CPU 程序、NPU 程序、device .so 和 JSON**，安装后重启 NPU 测试进程。
+
+```bash
+bash build.sh aicpu-cpu
+bash build.sh aicpu-npu
+bash tests/run_aicpu_get_npu.sh --install-kernel --device-id 7 \
+  --aicpu-blocks 4 --profile-scatter
+```
+
+CPU 端（跨机器时将 peer 改为 NPU 主机地址）：
+
+```bash
+bash tests/run_aicpu_get_cpu.sh --peer 127.0.0.1:29991 --device-id 7 \
+  --transfer-mode scatter_pipeline --rows 4096 --row-bytes 656 --scatter-threads 4 \
+  --remote-sgl-size 16 --jettys 4 --prepare-threads 4 \
+  --warmup 5 --iterations 1000 --output aicpu-pipeline.csv
+```
+
+重启 NPU 进程，用相同参数改成 `--transfer-mode scatter` 做基线。
+流水线 engine 为 `aicpu_memcpy_sgl_reordered_pipeline`。CSV 将两列改为
+`first_ready_ns`（request 到最早观察到任意分片 ready）和 `pipeline_ns`
+（首片 ready 到全部 scatter 和最终 producer done），二者之和仍为 `mean_ns`。
+`pipeline_ns` 包含后续分片等待和重叠执行，**不是纯 scatter**。
+额外输出 `cpu_notify_ns`（每轮分片 ready 加最终 done 的提交/等待耗时）、
+`mean_data_batches` 和 `mean_notify_wrs`。`cpu_write_ns`/prepare/post/poll/mean_wrs
+累加本轮所有分片的 **数据** WriteBatch，通知 WR 单独计量。
+这些 CPU 时间不能与设备流水线时间直接相加，跨机器的时钟也不能直接相减。
+
+启用 profile 时，每核 `avg_start_us`/`avg_finish_us` 均相对 request 起点；
+invalidate/memcpy/clean 和 thread CPU time 仅覆盖实际 scatter。
+SUMMARY 的 pool 包含 ready 等待，envelope 表示最早 scatter 开始到最后 scatter 结束，
+cpu_parallelism 表示该 pool 区间内的有效 scatter CPU 时间比。
+输出冷缓存准备、逐轮校验和打印仍在端到端计时外。
+
+正确性检查可加 `--verify-payload --warmup 1 --iterations 10`：CPU 每轮改变所有
+payload 字节，设备在计时外逐字节检查并验证 padding，最终 host readback 也使用对应
+sequence 的期望值。它能发现仅行头更新而其余字节过旧的结果。
+该开关对三种模式都可用；源数据生成在 request 等待内，**仅用于验证，性能对照应关闭**。
+分片发送会增加控制及提交开销，同时通信与 scatter 可能竞争访存资源，收益以
+`mean_ns`/p99 和各阶段实测为准。本版是每核一个完整分片，尚未实现分片内的 256/512 行细分。
+
+无 NPU 的协议测试：
+
+```bash
+cmake --build build-aicpu-cpu --target kvaf_aicpu_pipeline_test kvaf_aicpu_get_protocol_test
+ctest --test-dir build-aicpu-cpu -R 'kvaf_aicpu_(pipeline|get_protocol)' --output-on-failure
+```
 
 ### 可切换的直接输出（V10）
 
@@ -37,7 +106,7 @@ scatter 模式不接受非零 `--direct-output-stride`。源布局、有效字�
 测试通过也不代表已验证后续 AIV 算子的消费可见性或生产 Tensor 的注册生命周期。
 
 V10 扩展 Config 和测试 Configure 帧，更新 magic、命令及 kernel 入口，避免加载旧版本。
-重新构建两端并安装 V10 kernel；安装后重启 NPU 测试进程。V9 tile 融合未包含在此版本中。
+当前版本需重新构建两端并安装 V11 kernel；安装后重启 NPU 测试进程。V9 tile 融合未包含在此版本中。
 
 ```bash
 bash build.sh aicpu-cpu
@@ -67,7 +136,7 @@ CSV 列不变，直接模式 engine 为 `aicpu_urma_direct_output`，`scatter_ns
 
 ### 4096 × 656 B、多线程测试
 
-更新后需重新构建两端、安装 V10 kernel，并重启测试进程：
+更新后需重新构建两端、安装 V11 kernel，并重启测试进程：
 
 ```bash
 bash build.sh aicpu-cpu
@@ -94,7 +163,7 @@ V7 在 B 版基础上实现 C 版优化：656 B 行通过十组完全展开的 6
 其他行长保留通用 `memcpy`，输入 invalidate、B 版输出 clean、调度和每轮校验保持原样。
 pthread 和 multi-block 共用此路径；未加入 tile 融合或预取。
 启动日志显示 `scatter_clean=payload_cache_lines`，656 B 时显示 `scatter_copy=neon_656`，
-其他行长显示 `scatter_copy=libc`；`KERNEL_STATUS` 应显示 `revision=10`。
+其他行长显示 `scatter_copy=libc`；`KERNEL_STATUS` 应显示 `revision=11`。
 单线程基线也应使用本版本重新测量，CSV 列和 engine 名称保持不变。
 线程调度、完成等待、staging invalidate 和输出 clean 计入 scatter；
 创建/销毁线程、数据校验和下面的输出缓存准备不计入。
@@ -120,8 +189,8 @@ V8 在每轮计时开始及发布 request 之前，对整个 output 执行 `dc c
 
 新增独立入口 `KvafAicpuScatterProbeV1`。它使用与正常 scatter 相同的
 缓存行操作/DSB 序列、`CopyScatterRows` 和 payload clean，直接分配本地设备源/目标内存，
-不建立 URMA、不启动 CPU peer、不执行逐轮 payload 校验。原有 V10 的传输 ABI
-及 scatter/direct_output 执行路径不变。源由 Host 初始化，目标按冷缓存口径准备；
+不建立 URMA、不启动 CPU peer、不执行逐轮 payload 校验。probe 使用独立 ABI，
+正常传输入口当前为 V11。源由 Host 初始化，目标按冷缓存口径准备；
 源的 invalidate 在每轮被测阶段内，保证复制开始前输入失效。
 
 每个 block 固定负责 `rows_per_worker` 行。套件内的源/目标地址与分配大小保持不变，
@@ -240,8 +309,8 @@ ctest --test-dir build-aicpu-cpu -R '^kvaf_aicpu_scatter_probe$' --output-on-fai
 
 ### 实际运行核与 scatter 三段计时
 
-在 **NPU 端**增加 `--profile-scatter`，默认关闭。升级需重新编译并安装 V10 kernel，
-独立的 V10 入口可避免旧 device `.so` 静默使用旧测试口径。
+在 **NPU 端**增加 `--profile-scatter`，默认关闭。升级需重新编译并安装 V11 kernel，
+独立的 V11 入口可避免旧 device `.so` 静默使用旧测试口径。
 两端需一起升级测试控制协议；原有 CSV 列保持不变。先启动 NPU 端：
 
 ```bash

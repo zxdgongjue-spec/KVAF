@@ -24,12 +24,16 @@ All other options go to kvaf_aicpu_get_cpu, for example:
   --rows N             Number of rows
   --row-bytes N        Payload bytes per row (minimum 8)
   --scatter-threads N  AICPU workers including caller (1..32; default 1)
-  --transfer-mode MODE scatter (default) or direct_output
+  --transfer-mode MODE scatter (default), scatter_pipeline or direct_output
+                       Pipeline sends each worker range then publishes its ready
+  --verify-payload      Validation only: refresh/check whole payload each round
+                       Source generation adds request wait; omit for bandwidth
   --direct-output-stride N
                        Direct mode only: 0 packs rows (default); N >= row-bytes
                        leaves destination gaps, which are preserved
 
 direct_output uses one AICPU coordinator; scatter-threads does not create copy workers.
+scatter_pipeline requires NPU --aicpu-blocks equal to active scatter ranges.
 
 Start the NPU script first. Restart it for every test invocation.
 device-id selects the remote NPU (default 0); CPU UB/EID selection is automatic.

@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 #include "device_loop.h"
+#include "pipeline.h"
 #include "scatter_cache.h"
 #include "scatter_copy.h"
 #include "scatter_pool.h"
@@ -143,6 +144,11 @@ struct DeviceIO {
     Invalidate(region + kDoneOffset, sizeof(Control));
     return reinterpret_cast<volatile Control*>(region + kDoneOffset)->sequence;
   }
+  std::uint64_t ReadRangeDone(std::uint32_t worker) {
+    const auto offset = PipelineReadyOffset(worker);
+    Invalidate(region + offset, sizeof(Control));
+    return reinterpret_cast<volatile Control*>(region + offset)->sequence;
+  }
   void InitializeProfile() {
     if (!profile) return;
     profile->revision = kKernelRevision;
@@ -175,6 +181,13 @@ struct DeviceIO {
       std::uint64_t value;
       std::memcpy(&value, output + OutputOffset(c, l, row), sizeof(value));
       if (value != RowTag(seq, row)) return false;
+      if (c.verify_payload) {
+        const auto* data = output + OutputOffset(c, l, row);
+        for (std::uint64_t b = 8; b < c.row_bytes; ++b)
+          if (data[b] != PayloadPattern(c, seq, row, b)) return false;
+        for (auto b = c.row_bytes; b < l.stride; ++b)
+          if (data[b] != 0xA5) return false;
+      }
     }
     return true;
   }
@@ -198,6 +211,26 @@ void Fail(MultiBlockCoordination& c, Result status, std::uint64_t sequence) {
                                   false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
     Store(c.failure_sequence, sequence);
 }
+void Minimum(CoordinationWord& word, std::uint64_t value) {
+  auto previous = Load(word);
+  while (value < previous && !__atomic_compare_exchange_n(&word.value, &previous, value,
+      false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {}
+}
+struct PipelineRangeIO {
+  DeviceIO& device;
+  MultiBlockCoordination& coordination;
+  bool measure;
+  Result Status() { return ::Status(coordination); }
+  std::uint64_t ReadRangeDone(std::uint32_t worker) { return device.ReadRangeDone(worker); }
+  std::uint64_t Now() { return device.Now(); }
+  void RangeReady(std::uint32_t, std::uint64_t observed) {
+    Minimum(coordination.ready_tick, observed);
+  }
+  void Scatter(std::uint32_t worker, std::uint64_t start) {
+    device.ScatterRows(worker, start, measure);
+  }
+  void Relax() { asm volatile("yield" ::: "memory"); }
+};
 bool WaitFor(DeviceIO& io, MultiBlockCoordination& c, const CoordinationWord& word,
              std::uint64_t target, std::uint64_t start, std::uint64_t timeout_ticks,
              std::uint64_t sequence) {
@@ -289,6 +322,7 @@ Result RunMultiBlock(DeviceIO& io, Sample* samples, KernelResult* result,
 
   const auto frequency = result->counter_frequency;
   const auto timeout_ticks = frequency * io.config.timeout_ms / 1000;
+  const bool pipeline = IsScatterPipeline(io.config);
   for (std::uint64_t sequence = 1; sequence <= io.layout.rounds; ++sequence) {
     if (worker == 0) {
       result->failed_sequence = sequence;
@@ -296,35 +330,63 @@ Result RunMultiBlock(DeviceIO& io, Sample* samples, KernelResult* result,
       // Match the single-block cache preparation and timing boundary.
       io.PrepareRound(io.config, io.layout);
       const auto start = io.Now();
+      Store(c.request_start, start);
+      if (pipeline) Store(c.ready_tick, UINT64_MAX);
       io.PublishRequest(sequence);
-      for (;;) {
-        const auto done = io.ReadDone();
-        if (done == sequence) break;
-        if (done > sequence) { Fail(c, Result::kSequenceError, sequence); break; }
-        if (io.Now() - start >= timeout_ticks) { Fail(c, Result::kTimeout, sequence); break; }
+      if (!pipeline) {
+        for (;;) {
+          const auto done = io.ReadDone();
+          if (done == sequence) break;
+          if (done > sequence) { Fail(c, Result::kSequenceError, sequence); break; }
+          if (io.Now() - start >= timeout_ticks) { Fail(c, Result::kTimeout, sequence); break; }
+        }
       }
       if (Status(c) == Result::kPending) {
-        Store(c.request_start, start);
-        Store(c.ready_tick, io.Now());
+        if (!pipeline) Store(c.ready_tick, io.Now());
+        // Pipeline releases the blocks after request publication, before any
+        // global data completion. Each then waits only for its own range.
         Store(c.request_sequence, sequence);
       }
     } else if (!WaitFor(io, c, c.request_sequence, sequence, io.Now(), timeout_ticks, sequence)) {
       break;
     }
     if (Status(c) != Result::kPending) break;
-    const auto ready = Load(c.ready_tick);
     const bool profile_round = io.profile && sequence > io.config.warmup;
-    io.ScatterRows(worker, ready, profile_round);
+    if (pipeline) {
+      PipelineRangeIO range_io{io, c, profile_round};
+      const auto status = RunPipelineRange(worker, sequence, Load(c.request_start),
+                                          timeout_ticks, range_io);
+      if (status != Result::kOk) { Fail(c, status, sequence); break; }
+    } else {
+      io.ScatterRows(worker, Load(c.ready_tick), profile_round);
+    }
     const auto arrivals = Add(c.arrivals) + 1;
     if (arrivals == sequence * workers) Store(c.scatter_done, sequence);
     if (worker == 0) {
-      if (!WaitFor(io, c, c.scatter_done, sequence, io.Now(), timeout_ticks, sequence)) break;
+      if (!WaitFor(io, c, c.scatter_done, sequence,
+                   pipeline ? Load(c.request_start) : io.Now(), timeout_ticks, sequence)) break;
+      if (pipeline) {
+        // The final producer done closes the round, including all ready WRs.
+        // Do not verify/reuse buffers while producer control is still in flight.
+        for (;;) {
+          if (Status(c) != Result::kPending) break;
+          const auto done = io.ReadDone();
+          if (done > sequence) { Fail(c, Result::kSequenceError, sequence); break; }
+          if (io.Now() - Load(c.request_start) >= timeout_ticks) {
+            Fail(c, Result::kTimeout, sequence); break;
+          }
+          if (done == sequence) break;
+          asm volatile("yield" ::: "memory");
+        }
+        if (Status(c) != Result::kPending) break;
+      }
       const auto end = io.Now();
       if (!io.VerifyTags(sequence, io.config, io.layout)) { Fail(c, Result::kDataMismatch, sequence); break; }
       if (sequence > io.config.warmup) {
         const auto start = Load(c.request_start);
+        const auto ready = Load(c.ready_tick);
         samples[sequence - io.config.warmup - 1] = {end - start, ready - start, end - ready};
-        if (io.profile) RecordPoolTiming(*io.profile, ready, end);
+        if (io.profile) RecordPoolTiming(*io.profile, pipeline ? start : ready, end);
       }
       result->completed_rounds = sequence;
       Store(c.round_complete, sequence);
@@ -562,12 +624,13 @@ std::uint32_t KvafAicpuCoreProbeV1(CoreProbeArgs* args) {
 }
 
 extern "C" __attribute__((visibility("default")))
-std::uint32_t KvafAicpuBatchGetV10(KernelArgs* args) {
+std::uint32_t KvafAicpuBatchGetV11(KernelArgs* args) {
   if (!args || !args->region || !args->output || !args->samples || !args->result) return 1;
   auto* result = reinterpret_cast<KernelResult*>(args->result);
   auto* samples = reinterpret_cast<Sample*>(args->samples);
   Layout layout{};
   if (!MakeLayout(args->config, &layout) ||
+      (IsScatterPipeline(args->config) && !args->coordination) ||
       (IsDirectOutput(args->config) &&
        (args->coordination || args->profile || args->region > UINT64_MAX - layout.region_bytes ||
         args->output != args->region + kStagingOffset))) {

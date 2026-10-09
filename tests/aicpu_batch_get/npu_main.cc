@@ -115,6 +115,9 @@ class Kernel {
     Require(block_dim > 0 && block_dim <= kMaxScatterThreads, "invalid AICPU block count");
     Require(!IsDirectOutput(args.config) || (block_dim == 1 && args.coordination == 0 && args.profile == 0),
             "direct output requires one coordinator and no scatter profile/team");
+    Require(!IsScatterPipeline(args.config) ||
+            (block_dim == ActiveThreads(args.config) && args.coordination != 0),
+            "scatter_pipeline requires a block per range and a coordination buffer");
     aclrtLaunchKernelAttr attr{};
     attr.id = ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT;
     attr.value.timeout = static_cast<std::uint32_t>(
@@ -166,7 +169,7 @@ void ValidateOutput(const Config& c, const Layout& l, const void* output) {
       const auto row = c.rows - 1 - slot;
       const auto tag = RowTag(l.rounds, row);
       const std::uint8_t expected = b >= c.row_bytes ? 0xA5 :
-          b < 8 ? static_cast<std::uint8_t>(tag >> (8 * b)) : Pattern(row, b);
+          b < 8 ? static_cast<std::uint8_t>(tag >> (8 * b)) : PayloadPattern(c, l.rounds, row, b);
       Require(copy[i] == expected, "output/guard mismatch at byte " + std::to_string(offset + i));
     }
   }
@@ -186,18 +189,21 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
                bool profile_scatter, std::uint32_t aicpu_blocks) {
   Layout layout{}; Require(MakeLayout(config, &layout), "invalid config");
   const bool direct_output = IsDirectOutput(config);
+  const bool pipeline = IsScatterPipeline(config);
   const auto active_threads = ActiveThreads(config);
   const auto block_dim = direct_output ? 1U : aicpu_blocks;
   const bool collect_profile = profile_scatter && !direct_output;
   Require(block_dim == 1 || block_dim == active_threads,
           "--aicpu-blocks must equal active scatter ranges; use --aicpu-blocks 1 for pthread mode");
+  Require(!pipeline || block_dim == active_threads,
+          "scatter_pipeline requires --aicpu-blocks equal to active scatter ranges");
   DeviceBuffer output, samples, result, profile, coordination;
   if (!direct_output) output.Allocate(layout.output_bytes, 0xA5);
   void* output_data = direct_output ? target.payload() : output.data;
   samples.Allocate(config.iterations * sizeof(Sample));
   result.Allocate(sizeof(KernelResult));
   if (collect_profile) profile.Allocate(sizeof(ScatterProfile));
-  if (block_dim > 1) {
+  if (block_dim > 1 || pipeline) {
     const auto host_coordination = MakeMultiBlockCoordination(active_threads);
     coordination.Allocate(sizeof(host_coordination));
     Acl(aclrtMemcpy(coordination.data, sizeof(host_coordination), &host_coordination,
@@ -221,6 +227,15 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
                  (unsigned long long)layout.stride);
     if (profile_scatter)
       std::fprintf(stderr, "[AICPU_PROFILE] SKIPPED reason=direct_output_has_no_scatter\n");
+  } else if (pipeline) {
+    std::fprintf(stderr, "AICPU_GET_NPU LAUNCH mode=multi-block-pipeline block_dim=%u "
+        "active_scatter_ranges=%u transfer_mode=scatter_pipeline "
+        "sgl_layout=source_by_output_slot scatter_layout=forward "
+        "ready=per_range staging=disjoint_full_batch scatter_clean=payload_cache_lines "
+        "scatter_copy=%s output_cache=cold_before_request cache_prepare=outside_timing "
+        "timing=first_ready_plus_pipeline verify_payload=%llu\n",
+        block_dim, active_threads, ScatterCopyBackendName(config.row_bytes),
+        (unsigned long long)config.verify_payload);
   } else {
     std::fprintf(stderr,
                "AICPU_GET_NPU LAUNCH mode=%s block_dim=%u active_scatter_ranges=%u "
@@ -296,7 +311,14 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
                      sizeof(ScatterProfile), ACL_MEMCPY_DEVICE_TO_HOST), "read scatter profile");
     PrintScatterProfile(stderr, config, device_result.counter_frequency, *device_profile);
   }
-  return Summarize(config, device_result, timings);
+  const auto report_result = Summarize(config, device_result, timings);
+  if (pipeline)
+    std::fprintf(stderr, "[AICPU_PIPELINE] SUMMARY workers=%u rounds=%llu "
+        "avg_first_ready_us=%.3f avg_pipeline_us=%.3f avg_total_us=%.3f "
+        "ready_time=observed pipeline_includes=later_range_wait_and_scatter\n",
+        active_threads, (unsigned long long)config.iterations,
+        report_result.wait_ns / 1000, report_result.scatter_ns / 1000, report_result.mean_ns / 1000);
+  return report_result;
 }
 
 class CandidateResolver {
@@ -351,7 +373,8 @@ void HandleDiscovery(int fd, const kvaf::peer::MessageHeader& header, CandidateR
 }
 
 void HandleConfigure(int fd, const kvaf::peer::MessageHeader& header, CandidateResolver& resolver,
-                     std::unique_ptr<NpuTarget>& target, Config& config, std::uint32_t& device) {
+                     std::unique_ptr<NpuTarget>& target, Config& config, std::uint32_t& device,
+                     std::uint32_t aicpu_blocks) {
   kvaf::peer::AllocateHbmRegionResponse response{};
   response.header = kvaf::peer::MakeHeader(kConfigure, sizeof(response));
   response.header.command = kvaf::peer::ResponseCommand(kConfigure);
@@ -361,6 +384,8 @@ void HandleConfigure(int fd, const kvaf::peer::MessageHeader& header, CandidateR
     ConfigureRequest request{}; request.header = header;
     Receive(fd, reinterpret_cast<char*>(&request) + sizeof(header), sizeof(request) - sizeof(header));
     Layout layout{}; Require(MakeLayout(request.config, &layout), "invalid benchmark config");
+    Require(!IsScatterPipeline(request.config) || aicpu_blocks == ActiveThreads(request.config),
+            "scatter_pipeline requires --aicpu-blocks equal to active scatter ranges");
     const auto& eids = resolver.Get(request.device_id);
     Require(request.npu_candidate < eids.size(), "invalid NPU EID candidate");
     auto candidate = std::make_unique<NpuTarget>();
@@ -535,7 +560,7 @@ void Run(const Options& options) {
       HandleDiscovery(fd.get(), header, resolver, target != nullptr, device); continue;
     }
     if (header.command == static_cast<std::uint16_t>(kConfigure)) {
-      HandleConfigure(fd.get(), header, resolver, target, config, device); continue;
+      HandleConfigure(fd.get(), header, resolver, target, config, device, options.aicpu_blocks); continue;
     }
     if (kvaf::peer::IsValidHeader(header, kResetSetup, sizeof(header))) {
       // CPU only requests this after a failed setup, before posting any data.

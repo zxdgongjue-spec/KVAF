@@ -155,7 +155,7 @@ void Bounds() {
   c = {}; c.iterations = 0; Require(!MakeLayout(c, &l), "zero samples accepted");
   c = {}; c.timeout_ms = 0; Require(!MakeLayout(c, &l), "unbounded wait accepted");
   c = {}; c.magic = 0; Require(!MakeLayout(c, &l), "invalid ABI accepted");
-  c = {}; c.transfer_mode = static_cast<TransferMode>(2);
+  c = {}; c.transfer_mode = static_cast<TransferMode>(3);
   Require(!MakeLayout(c, &l), "unknown transfer mode accepted");
   c = {}; c.direct_output_stride = 4096;
   Require(!MakeLayout(c, &l), "direct stride accepted in scatter mode");
@@ -163,6 +163,14 @@ void Bounds() {
   Require(!MakeLayout(c, &l), "overlapping direct output rows accepted");
   c.direct_output_stride = UINT64_MAX;
   Require(!MakeLayout(c, &l), "overflowing direct output stride accepted");
+  c = {}; c.verify_payload = 2;
+  Require(!MakeLayout(c, &l), "invalid payload validation switch accepted");
+  c = {}; c.rows = 3; c.row_bytes = 64; c.iterations = 1; c.warmup = 0;
+  c.transfer_mode = TransferMode::kScatterPipeline;
+  Require(MakeLayout(c, &l), "pipeline layout rejected");
+  Simulator io(c); Sample sample{}; KernelResult result{};
+  Require(RunDevice(c, io, &sample, &result) == Result::kInvalidArgs && io.publications == 0,
+          "pipeline silently fell back to the whole-batch serial loop");
 }
 void DirectOutput() {
   for (auto bytes : {8, 65, 656, 4096}) for (auto rows : {1, 3, 67})
@@ -280,6 +288,38 @@ void ParallelScatter() {
   c.scatter_threads = 0; Require(!MakeLayout(c, &l), "zero threads accepted");
   c.scatter_threads = 33; Require(!MakeLayout(c, &l), "too many threads accepted");
 }
+void PipelineWriteGrouping() {
+  for (auto rows : {3, 67, 4096}) for (auto bytes : {8, 65, 656}) for (auto requested : {1, 4, 8}) {
+    Config c; c.rows = rows; c.row_bytes = bytes; c.scatter_threads = requested;
+    c.transfer_mode = TransferMode::kScatterPipeline;
+    Layout l{}; Require(MakeLayout(c, &l), "pipeline WRITE layout");
+    std::vector<std::uint8_t> source(c.rows * l.source_stride);
+    std::vector<kvaf::CpuUrmaTransport::HostSge> buffers(c.rows);
+    std::vector<std::uint64_t> offsets(c.rows);
+    for (std::uint64_t slot = 0; slot < c.rows; ++slot) {
+      buffers[slot] = {source.data() + LogicalRowForOutputSlot(c, slot) * l.source_stride,
+                       static_cast<std::size_t>(c.row_bytes)};
+      offsets[slot] = kStagingOffset + slot * c.row_bytes;
+    }
+    std::uint64_t transferred = 0, emitted = 0;
+    for (std::uint32_t w = 0; w < ActiveThreads(c); ++w) {
+      const auto range = ScatterRange(c, w, ActiveThreads(c));
+      const auto count = range.end - range.begin;
+      std::size_t wrs = 0;
+      Require(kvaf::cpu_urma_detail::BuildWriteGatherShard(
+          buffers.data() + range.begin, offsets.data() + range.begin, count, 0, count, 16,
+          l.region_bytes, UINT32_MAX,
+          [&](std::size_t, std::size_t row, const auto& buffer) {
+            Require(buffer.data == buffers[range.begin + row].data, "pipeline source mapping changed");
+            ++emitted;
+          }, [&](std::size_t, const auto& group) {
+            Require(group.first + group.count <= count, "WR crossed a ready boundary");
+            transferred += group.bytes;
+          }, &wrs).ok(), "pipeline gather planner rejected a range");
+    }
+    Require(emitted == c.rows && transferred == l.payload_bytes, "pipeline WRITE lost/duplicated rows");
+  }
+}
 void DeviceSelection() {
   Require(SelectDevice(4, false, 0) == 4, "CPU device-id was ignored");
   Require(SelectDevice(4, true, 4) == 4, "matching pinned device rejected");
@@ -294,7 +334,7 @@ void DeviceSelection() {
 }  // namespace
 int main() {
   try { ParallelScatter(); Bounds(); DeviceSelection(); SuccessAndMetrics(); Failures();
-        CachePreparationAndTiming(); DirectOutput(); DirectWriteGrouping();
+        CachePreparationAndTiming(); DirectOutput(); DirectWriteGrouping(); PipelineWriteGrouping();
         std::puts("aicpu get protocol: PASS"); return 0; }
   catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
 }

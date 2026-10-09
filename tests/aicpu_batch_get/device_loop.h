@@ -8,7 +8,10 @@ namespace kvaf::aicpu_test {
 template <class IO>
 Result RunDevice(const Config& config, IO& io, Sample* samples, KernelResult* result) {
   Layout layout{};
-  if (!MakeLayout(config, &layout) || !samples || !result) return Result::kInvalidArgs;
+  // Pipeline needs independently running blocks; never silently use the
+  // whole-batch wait/pthread path for a pipeline configuration.
+  if (!MakeLayout(config, &layout) || IsScatterPipeline(config) || !samples || !result)
+    return Result::kInvalidArgs;
   *result = {};
   result->requested_threads = config.scatter_threads;
   result->active_threads = ActiveThreads(config);
