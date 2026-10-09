@@ -492,7 +492,7 @@ void LogBatchGetDeviceStatus(const BatchGetExecutionState& execution,
   std::vector<KvafBatchGetCoreStatus> statuses(npu_core_count);
   const aclError copy_result = aclrtMemcpy(
       statuses.data(), statuses.size() * sizeof(statuses.front()),
-      execution.status, execution.status_bytes, ACL_MEMCPY_DEVICE_TO_HOST);
+      execution.status, statuses.size() * sizeof(statuses.front()), ACL_MEMCPY_DEVICE_TO_HOST);
   if (copy_result != ACL_SUCCESS) {
     std::fprintf(stderr,
                  "[KVAF_AIV] BATCH_GET_STATUS_LOG_ERROR aclrtMemcpy=%d\n",
@@ -2062,7 +2062,7 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
   std::vector<KvafBatchGetCoreStatus> statuses(
       impl_->config.npu_core_count);
   if (aclrtMemcpy(statuses.data(), statuses.size() * sizeof(statuses.front()),
-                  impl_->execution.status, impl_->execution.status_bytes,
+                  impl_->execution.status, statuses.size() * sizeof(statuses.front()),
                   ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
     return Internal("failed to copy BatchGet kernel profiles");
   }

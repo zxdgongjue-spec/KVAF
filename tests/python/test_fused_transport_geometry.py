@@ -39,6 +39,11 @@ int main() {
     # not the larger cold pool. Extra queues never add timed native workers.
     assert "exec, impl_->config.npu_core_count, impl_->config.jettys_per_core," in text
     assert "arguments.aiv_core_count = impl_->config.npu_core_count;" in text
+    # The transport allocation can contain 2R status records. Ordinary
+    # diagnostics still copy R records into an R-sized host vector.
+    assert "execution.status, execution.status_bytes, ACL_MEMCPY_DEVICE_TO_HOST" not in text
+    assert "impl_->execution.status, impl_->execution.status_bytes,\n                  ACL_MEMCPY_DEVICE_TO_HOST" not in text
+    assert "execution.status, statuses.size() * sizeof(statuses.front()), ACL_MEMCPY_DEVICE_TO_HOST" in text
     print("KVAF_FUSED_TRANSPORT_GEOMETRY pass=1 native=12 fused_pool=24 put=12")
 
 
