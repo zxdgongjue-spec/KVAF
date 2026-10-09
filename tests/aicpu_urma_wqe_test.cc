@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <random>
 
 void TestWqebbCopy() {
   constexpr std::uint32_t max_blocks = 192U;
@@ -63,9 +64,53 @@ void TestScatterHeaderReuse() {
   }
 }
 
+void TestScatterBatchTemplates() {
+  using namespace kvaf::aicpu_urma;
+  ScatterReadBatch batch;
+  for (auto& word : batch.words) word = 0xfeedfaceU;
+  std::mt19937 random(47U);
+  for (std::uint32_t generation = 0U; generation < 3U; ++generation) {
+    Endpoint endpoint{0xab123456U + generation, 0xff023456U + generation,
+                       0x12345678U + generation, {}};
+    for (std::uint32_t index = 0U; index < 16U; ++index)
+      endpoint.remote_eid[index] = static_cast<std::uint8_t>(index + generation);
+    const auto local_token = 123U + generation;
+    PrepareScatterReadBatch(batch, endpoint, local_token);
+    assert(batch.initialized_wqes == 0U);
+    const auto original_templates = batch.templates;
+    for (std::uint32_t round = 0U; round < 400U; ++round) {
+      const auto count = round < 8U ? 8U : 1U + random() % kScatterBatchWqes;
+      std::uint32_t blocks = 0U;
+      for (std::uint32_t index = 0U; index < count; ++index) {
+        ScatterTransfer transfer{};
+        transfer.sge_count = round < 8U ? 6U : 1U + random() % kvaf::kGatherMaxSglSize;
+        transfer.remote_address = 0x1234567800000000ULL + random();
+        for (std::uint32_t sge = 0U; sge < transfer.sge_count; ++sge)
+          transfer.sges[sge] = {0xabcd987600000000ULL + random(),
+                                1U + random() % 4096U, local_token};
+        const auto owner = random() & 1U;
+        const bool completion = index + 1U == count;
+        std::array<std::uint32_t, kScatterWqeWords> reference{};
+        EncodeScatterReadWqe(reference.data(), endpoint, transfer, owner, completion);
+        for (auto& sge : transfer.sges) sge.token_id = 0xdeadbeefU;
+        const auto words = ScatterWqebbs(transfer.sge_count) * 16U;
+        const auto end = blocks * 16U + words;
+        const bool has_guard = end < kScatterBatchWqes * kScatterWqeWords;
+        const auto guard = has_guard ? batch.words[end] : 0U;
+        PatchScatterReadWqe(batch, index, blocks, transfer, owner, completion);
+        assert(std::memcmp(batch.words + blocks * 16U, reference.data(), words * 4U) == 0);
+        if (has_guard) assert(batch.words[end] == guard);
+        blocks += ScatterWqebbs(transfer.sge_count);
+      }
+    }
+    assert(std::memcmp(&batch.templates, &original_templates, sizeof(batch.templates)) == 0);
+  }
+}
+
 int main() {
   TestWqebbCopy();
   TestScatterHeaderReuse();
+  TestScatterBatchTemplates();
   kvaf::aicpu_urma::Endpoint endpoint{};
   endpoint.tp_id = 0x12345678U;
   endpoint.remote_token_id = 0xf1234567U;

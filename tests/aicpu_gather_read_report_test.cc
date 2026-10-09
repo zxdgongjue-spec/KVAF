@@ -128,7 +128,8 @@ int main() {
   assert(parallel_report.find("4 AICPU workers, independent SQ/CQ") != std::string::npos);
   assert(parallel_report.find("must not be added") != std::string::npos);
   assert(parallel_report.find("prepare worker starts: 2.300 us") != std::string::npos);
-  assert(parallel_report.find("Task initialization: 0.700 us") != std::string::npos);
+  assert(parallel_report.find("Worker/task initialization (includes WQE templates): 0.700 us") !=
+         std::string::npos);
   assert(parallel_report.find("Dynamic READ: up to 192 spans/task, 22.00 tasks/round; claim tasks: 0.500 us") !=
          std::string::npos);
   assert(parallel_report.find("Within submit: Encode WQEs: 1.000 us | Write SQ: 1.500 us") !=

@@ -110,7 +110,7 @@ inline void PrintGatherReadTimeline(std::FILE* output, double mean_ms,
                  "      Details below are per-round maxima across cores; they overlap and must not be added.\n",
                  average(&GatherReadTiming::aicpu_cores));
   std::fprintf(output,
-               "      Task initialization: %.3f us | Build local SGL: %.3f us\n"
+               "      Worker/task initialization (includes WQE templates): %.3f us | Build local SGL: %.3f us\n"
                "      Submit WQEs (encode, write SQ, doorbell): %.3f us | Wait for READ completions: %.3f us\n",
                average_us(&GatherReadTiming::scatter_init_ns), plan_us, post_us, cq_us);
   if (profiles.front().read_task_spans != 0U)

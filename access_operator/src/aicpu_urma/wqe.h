@@ -67,6 +67,60 @@ inline ScatterReadHeader PrepareScatterReadHeader(const Endpoint& endpoint) {
   return header;
 }
 
+constexpr std::uint32_t kScatterBatchWqes = 64U;
+constexpr std::uint32_t kScatterWqeWords = kMaxScatterWqebbs * 16U;
+
+struct ScatterReadTemplates {
+  std::uint32_t words[kGatherMaxSglSize][kScatterWqeWords];
+  std::uint32_t control[2];
+};
+
+struct ScatterReadBatch {
+  ScatterReadTemplates templates;
+  alignas(64) std::uint32_t words[kScatterBatchWqes * kScatterWqeWords];
+  std::uint32_t sge_counts[kScatterBatchWqes];
+  std::uint32_t initialized_wqes;
+};
+
+inline void PrepareScatterReadBatch(ScatterReadBatch& batch, const Endpoint& endpoint,
+                                    std::uint32_t local_token_id) {
+  batch.initialized_wqes = 0U;
+  std::memset(&batch.templates, 0, sizeof(batch.templates));
+  const auto header = PrepareScatterReadHeader(endpoint);
+  for (std::uint32_t count = 1U; count <= kGatherMaxSglSize; ++count) {
+    auto* words = batch.templates.words[count - 1U];
+    std::memcpy(words, header.words, sizeof(header.words));
+    words[2] |= count << 24U;
+    for (std::uint32_t index = 0U; index < count; ++index)
+      words[13U + index * 4U] = local_token_id;
+  }
+  const auto fixed = (1U << 18U) | (1U << 20U) | (1U << 28U) | (1U << 29U);
+  batch.templates.control[0] = fixed | (1U << 16U);
+  batch.templates.control[1] = fixed | (2U << 16U) | (1U << 19U) | (1U << 21U);
+}
+
+inline void PatchScatterReadWqe(ScatterReadBatch& batch, std::uint32_t batch_index,
+                                std::uint32_t block_offset, const ScatterTransfer& transfer,
+                                std::uint32_t owner, bool completion) {
+  auto* words = batch.words + block_offset * 16U;
+  if (batch_index >= batch.initialized_wqes ||
+      batch.sge_counts[batch_index] != transfer.sge_count) {
+    std::memcpy(words, batch.templates.words[transfer.sge_count - 1U],
+                ScatterWqebbs(transfer.sge_count) * kWqeBytes);
+    batch.sge_counts[batch_index] = transfer.sge_count;
+    batch.initialized_wqes = batch_index + 1U;
+  }
+  words[0] = batch.templates.control[completion ? 1U : 0U] | ((owner & 1U) << 31U);
+  words[10] = static_cast<std::uint32_t>(transfer.remote_address);
+  words[11] = static_cast<std::uint32_t>(transfer.remote_address >> 32U);
+  for (std::uint32_t index = 0U; index < transfer.sge_count; ++index) {
+    const auto offset = 12U + index * 4U;
+    words[offset] = transfer.sges[index].length;
+    words[offset + 2U] = static_cast<std::uint32_t>(transfer.sges[index].address);
+    words[offset + 3U] = static_cast<std::uint32_t>(transfer.sges[index].address >> 32U);
+  }
+}
+
 inline void CopyWqebbs(void* destination, const void* source, std::uint32_t blocks) {
   auto* output = static_cast<std::uint8_t*>(destination);
   const auto* input = static_cast<const std::uint8_t*>(source);
