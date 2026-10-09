@@ -3,6 +3,7 @@
 #include "batch_get_abi.h"
 #include "cpu_gather.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cassert>
