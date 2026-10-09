@@ -47,6 +47,7 @@ struct CpuGatherReadExecRequest {
   bool profile_detail{false};
   std::uint32_t sq_batch_wqes{8U};
   std::uint32_t read_task_spans{0U};
+  GatherSqCopyMode sq_copy_mode{GatherSqCopyMode::kMemcpy};
 };
 
 // KV Access Operator 是 Runtime 的数据面依赖。Runtime 管理远端 DDR

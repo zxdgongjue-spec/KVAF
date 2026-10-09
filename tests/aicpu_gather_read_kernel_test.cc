@@ -311,7 +311,8 @@ void TestUrmaDescriptorGather() {
 void TestScatterStagingBoundary(std::uint32_t sq_batch_wqes,
                                 std::uint32_t span_count = 25U,
                                 std::uint32_t sgl_size = 1U, bool detailed = false,
-                                std::uint32_t sq_depth = 256U) {
+                                std::uint32_t sq_depth = 256U,
+                                kvaf::GatherSqCopyMode copy_mode = kvaf::GatherSqCopyMode::kMemcpy) {
   alignas(64) std::array<std::uint8_t, 1024> remote{};
   std::array<std::uint8_t, 1024> output{};
   output.fill(0xa5U);
@@ -360,6 +361,7 @@ void TestScatterStagingBoundary(std::uint32_t sq_batch_wqes,
   args.sgl_size = sgl_size;
   args.profile_detail = detailed ? 1U : 0U;
   args.sq_batch_wqes = sq_batch_wqes;
+  args.sq_copy_mode = copy_mode;
   args.bytes = targets.size();
   args.sequence = 1U;
   args.remote_staging = base + 128U;
@@ -432,7 +434,8 @@ void TestScatterStagingBoundary(std::uint32_t sq_batch_wqes,
 void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count,
                          bool detailed = true, std::uint32_t sq_batch_wqes = 8U,
                          std::uint32_t task_spans = 0U, bool delay_followers = false,
-                         bool packed_metadata = false) {
+                         bool packed_metadata = false,
+                         kvaf::GatherSqCopyMode copy_mode = kvaf::GatherSqCopyMode::kMemcpy) {
   using kvaf::aicpu_urma::GatherReadStatus;
   constexpr std::uint32_t depth = 128U;
   alignas(64) std::array<std::uint8_t, 4096> remote{};
@@ -496,6 +499,7 @@ void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count,
   args.worker_count = workers;
   args.profile_detail = detailed ? 1U : 0U;
   args.sq_batch_wqes = sq_batch_wqes;
+  args.sq_copy_mode = copy_mode;
   args.read_task_spans = task_spans;
   args.remote_staging = base + 1024U;
   args.remote_notify = base + 3008U;
@@ -747,6 +751,10 @@ void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count,
   args.read_task_spans = 65537U;
   assert(KvafAicpuUrmaGatherRead(&args) != 0U);
   assert(KvafAicpuUrmaGatherScatter(&args) != 0U);
+  args.read_task_spans = task_spans;
+  args.sq_copy_mode = static_cast<kvaf::GatherSqCopyMode>(2U);
+  assert(KvafAicpuUrmaGatherRead(&args) != 0U);
+  assert(KvafAicpuUrmaGatherScatter(&args) != 0U);
   stopped.store(true, std::memory_order_release);
   for (auto& device : hardware) device.join();
 }
@@ -782,5 +790,9 @@ int main() {
   TestParallelScatter(5U, 41U, true, 8U, 0U, false, true);
   TestParallelScatter(5U, 41U, true, 8U, 10U, false, true);
   TestParallelScatter(8U, 41U, true, 8U, 1U, false, true);
+  TestScatterStagingBoundary(8U, 384U, 6U, true, 193U, kvaf::GatherSqCopyMode::kPaired);
+  TestScatterStagingBoundary(64U, 384U, 6U, true, 256U, kvaf::GatherSqCopyMode::kPaired);
+  TestParallelScatter(5U, 41U, true, 8U, 0U, false, true, kvaf::GatherSqCopyMode::kPaired);
+  TestParallelScatter(5U, 41U, true, 8U, 10U, false, true, kvaf::GatherSqCopyMode::kPaired);
   std::cout << "AICPU gather/read kernel simulation: PASS\n";
 }

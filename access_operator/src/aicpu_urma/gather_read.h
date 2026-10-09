@@ -77,9 +77,10 @@ struct GatherReadArgs {
   std::uint32_t read_task_spans;
   std::uint32_t profile_detail;
   std::uint32_t sq_batch_wqes{8U};
+  GatherSqCopyMode sq_copy_mode{GatherSqCopyMode::kMemcpy};
 };
 
 static_assert(sizeof(GatherReadStatus) <= 384U, "GatherRead exceeds shared status buffer");
-static_assert(sizeof(GatherReadArgs) == 136U, "GatherRead argument ABI changed");
+static_assert(sizeof(GatherReadArgs) == 144U, "GatherRead argument ABI changed");
 
 }  // namespace kvaf::aicpu_urma

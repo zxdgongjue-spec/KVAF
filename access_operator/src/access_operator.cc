@@ -603,6 +603,7 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
       request.output_spans == nullptr || request.output_span_count == 0U ||
       request.output_span_count > aicpu_urma::kGatherMaxSpans ||
       request.read_task_spans > aicpu_urma::kGatherMaxSpans ||
+      !ValidGatherSqCopyMode(request.sq_copy_mode) ||
       (request.sq_batch_wqes != 8U && request.sq_batch_wqes != 16U &&
        request.sq_batch_wqes != 32U && request.sq_batch_wqes != 64U) ||
       request.sgl_size == 0U ||
@@ -706,6 +707,7 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
   arguments.profile_detail = request.profile_detail ? 1U : 0U;
   arguments.sq_batch_wqes = request.sq_batch_wqes;
   arguments.read_task_spans = request.read_task_spans;
+  arguments.sq_copy_mode = request.sq_copy_mode;
   const aclrtStream stream = static_cast<aclrtStream>(request.stream);
   const auto launch_start = std::chrono::steady_clock::now();
   const int32_t launch = aicpu_urma::LaunchGatherRead(&arguments, stream);

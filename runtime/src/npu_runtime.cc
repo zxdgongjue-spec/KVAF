@@ -382,8 +382,8 @@ Status NpuRuntime::GatherRead(const CpuGatherReadRequest& request) {
   if ((request.sq_batch_wqes != 8U && request.sq_batch_wqes != 16U &&
        request.sq_batch_wqes != 32U && request.sq_batch_wqes != 64U) ||
       request.read_task_spans > peer::kMaxGatherSpans ||
-      request.sgl_size == 0U)
-    return Status::InvalidArgument("invalid GatherRead SGL size, task size, or SQ batch size");
+      request.sgl_size == 0U || !ValidGatherSqCopyMode(request.sq_copy_mode))
+    return Status::InvalidArgument("invalid GatherRead SGL size, task size, SQ batch size, or copy mode");
   if (!PrepareGatherHostLayout(region.base, region.length, request.staging_address,
                                 request.source_descriptor_address, request.spans,
                                 request.output.bytes, request.output_spans,
@@ -429,7 +429,7 @@ Status NpuRuntime::GatherRead(const CpuGatherReadRequest& request) {
       direct ? request.spans.data() : nullptr,
       direct ? static_cast<std::uint32_t>(request.spans.size()) : 0U, ready.sequence,
       ready.total_bytes, request.stream, request.timing, request.profile_detail,
-      request.sq_batch_wqes, request.read_task_spans});
+      request.sq_batch_wqes, request.read_task_spans, request.sq_copy_mode});
 }
 
 RuntimeCore& NpuRuntime::core() {

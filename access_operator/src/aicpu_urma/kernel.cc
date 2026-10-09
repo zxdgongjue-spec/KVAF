@@ -204,13 +204,14 @@ std::uint32_t SubmitNotify(const Entity& entity, Queue& queue,
 
 template <typename Entity>
 std::uint32_t WriteSqBlocks(const Entity& entity, std::uint32_t slot,
-                   const std::uint32_t* words, std::uint32_t blocks) {
+                   const std::uint32_t* words, std::uint32_t blocks,
+                   kvaf::GatherSqCopyMode copy_mode) {
   const auto first = std::min(blocks, entity.sq_depth - slot);
-  kvaf::aicpu_urma::CopyWqebbs(reinterpret_cast<void*>(entity.sq_va + slot * 64U),
-                              words, first);
+  kvaf::aicpu_urma::CopySqWqebbs(reinterpret_cast<void*>(entity.sq_va + slot * 64U),
+                                words, first, copy_mode);
   if (first < blocks) {
-    kvaf::aicpu_urma::CopyWqebbs(reinterpret_cast<void*>(entity.sq_va), words + first * 16U,
-                                blocks - first);
+    kvaf::aicpu_urma::CopySqWqebbs(reinterpret_cast<void*>(entity.sq_va), words + first * 16U,
+                                  blocks - first, copy_mode);
     return 2U;
   }
   return 1U;
@@ -223,7 +224,7 @@ std::uint32_t SubmitScatter(const Entity& entity, Queue& queue,
                             std::uint32_t count, std::uint32_t blocks, std::uint32_t* cqe_word,
                             std::uint64_t* post_ns, std::uint64_t* cq_ns,
                             kvaf::aicpu_urma::GatherReadStatus& status,
-                            std::uint32_t sq_batch_wqes) {
+                            std::uint32_t sq_batch_wqes, kvaf::GatherSqCopyMode copy_mode) {
   const auto post_start_ns = NowNs();
   if (cqe_word != nullptr) *cqe_word = 0U;
   if (post_ns != nullptr) *post_ns = 0U;
@@ -260,7 +261,7 @@ std::uint32_t SubmitScatter(const Entity& entity, Queue& queue,
     }
     const auto sq_start_ns = Detailed ? NowNs() : 0U;
     if constexpr (Detailed) encode_ns += sq_start_ns - encode_start_ns;
-    sq_write_calls += WriteSqBlocks(entity, staged_slot, batch.words, staged_blocks);
+    sq_write_calls += WriteSqBlocks(entity, staged_slot, batch.words, staged_blocks, copy_mode);
     if constexpr (Detailed) {
       encode_start_ns = NowNs();
       sq_write_ns += encode_start_ns - sq_start_ns;
@@ -337,9 +338,9 @@ void ScatterOutputRange(const kvaf::aicpu_urma::GatherReadArgs& args,
       std::uint64_t cq_ns = 0U;
       status.result = args.profile_detail != 0U
           ? SubmitScatter<true>(entity, queue, batch, data, batch_count, batch_blocks, &cqe_word,
-                                 &post_ns, &cq_ns, status, args.sq_batch_wqes)
+                                 &post_ns, &cq_ns, status, args.sq_batch_wqes, args.sq_copy_mode)
           : SubmitScatter<false>(entity, queue, batch, data, batch_count, batch_blocks, &cqe_word,
-                                  &post_ns, &cq_ns, status, args.sq_batch_wqes);
+                                  &post_ns, &cq_ns, status, args.sq_batch_wqes, args.sq_copy_mode);
       status.scatter_post_ns += post_ns;
       status.scatter_cq_ns += cq_ns;
       status.cqe_word = cqe_word;
@@ -638,6 +639,7 @@ std::uint32_t KvafAicpuUrmaGatherRead(kvaf::aicpu_urma::GatherReadArgs* args) {
       kvaf::peer::GatherDescriptorBytes(args->source_span_count);
   if (!Valid(entity, queue) || entity.local_token_id == 0U || args->worker_count > 8U ||
       args->read_task_spans > 65536U || args->profile_detail > 1U ||
+      !kvaf::ValidGatherSqCopyMode(args->sq_copy_mode) ||
       (args->sq_batch_wqes != 8U && args->sq_batch_wqes != 16U &&
        args->sq_batch_wqes != 32U && args->sq_batch_wqes != 64U) ||
       args->sequence == 0U || args->bytes == 0U ||
@@ -809,6 +811,7 @@ std::uint32_t KvafAicpuUrmaGatherScatter(kvaf::aicpu_urma::GatherReadArgs* args)
   if (args == nullptr || args->channel_entity == 0U || args->queue_state == 0U ||
       args->core_status == 0U || args->worker_count < 2U || args->worker_count > 8U ||
       args->profile_detail > 1U || args->read_task_spans > 65536U ||
+      !kvaf::ValidGatherSqCopyMode(args->sq_copy_mode) ||
       (args->sq_batch_wqes != 8U && args->sq_batch_wqes != 16U &&
        args->sq_batch_wqes != 32U && args->sq_batch_wqes != 64U))
     return 1U;

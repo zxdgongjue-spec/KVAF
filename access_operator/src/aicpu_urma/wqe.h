@@ -145,6 +145,15 @@ inline void CopyWqebbs(void* destination, const void* source, std::uint32_t bloc
   }
 }
 
+inline void CopySqWqebbs(void* destination, const void* source, std::uint32_t blocks,
+                         GatherSqCopyMode mode) {
+  if (blocks == 0U) return;
+  if (mode == GatherSqCopyMode::kMemcpy)
+    std::memcpy(destination, source, static_cast<std::size_t>(blocks) * kWqeBytes);
+  else
+    CopyWqebbs(destination, source, blocks);
+}
+
 inline std::uint32_t PlanContiguousRead(Transfer (&transfers)[16],
                                         std::uint64_t remote, std::uint64_t local,
                                         std::uint32_t bytes, std::uint32_t local_token_id) {

@@ -7,7 +7,7 @@
 #include <iostream>
 #include <random>
 
-void TestWqebbCopy() {
+void TestWqebbCopy(kvaf::GatherSqCopyMode mode) {
   constexpr std::uint32_t max_blocks = 192U;
   alignas(64) std::array<std::uint8_t, (max_blocks + 2U) * 64U> source{};
   alignas(64) std::array<std::uint8_t, (max_blocks + 2U) * 64U> destination{};
@@ -16,7 +16,7 @@ void TestWqebbCopy() {
   const auto original = source;
   for (std::uint32_t blocks = 0U; blocks <= max_blocks; ++blocks) {
     destination.fill(0xa5U);
-    kvaf::aicpu_urma::CopyWqebbs(destination.data() + 64U, source.data() + 64U, blocks);
+    kvaf::aicpu_urma::CopySqWqebbs(destination.data() + 64U, source.data() + 64U, blocks, mode);
     assert(std::memcmp(destination.data() + 64U, source.data() + 64U, blocks * 64U) == 0);
     for (std::size_t index = 0U; index < 64U; ++index) assert(destination[index] == 0xa5U);
     for (std::size_t index = (blocks + 1U) * 64U; index < destination.size(); ++index)
@@ -108,7 +108,8 @@ void TestScatterBatchTemplates() {
 }
 
 int main() {
-  TestWqebbCopy();
+  TestWqebbCopy(kvaf::GatherSqCopyMode::kMemcpy);
+  TestWqebbCopy(kvaf::GatherSqCopyMode::kPaired);
   TestScatterHeaderReuse();
   TestScatterBatchTemplates();
   kvaf::aicpu_urma::Endpoint endpoint{};

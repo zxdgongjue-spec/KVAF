@@ -30,6 +30,7 @@ struct Options {
   std::uint32_t sgl_size{kvaf::kGatherMaxSglSize};
   std::uint32_t aicpu_cores{1U};
   std::uint32_t sq_batch_wqes{8U};
+  kvaf::GatherSqCopyMode sq_copy_mode{kvaf::GatherSqCopyMode::kMemcpy};
   std::uint32_t read_task_spans{192U};
   bool dynamic_read{true};
   std::uint32_t warmup{1U};
@@ -43,11 +44,11 @@ void Usage(const char* program) {
                "Usage: %s [--peer HOST:PORT] [--device-id N] [--kernel-json PATH] "
                "[--blocks N] [--block-bytes N] [--output-stride N] [--sgl-size N] "
                "[--warmup N] [--iterations N] [--aicpu-cores N(1..8)] [--descriptor-transport urma|rpc] "
-               "[--sq-batch-wqes 8|16|32|64] [--profile-detail 0|1]\n"
+               "[--sq-batch-wqes 8|16|32|64] [--sq-copy memcpy|paired] [--profile-detail 0|1]\n"
                "[--read-schedule static|dynamic] [--read-task-spans N(1..65536)]\n"
                "Defaults: descriptor-transport=urma, output-stride=2*block-bytes, sgl-size=%u "
                "(positive; each READ WQE uses at most %u SGE), sq-batch-wqes=8, "
-               "read-schedule=dynamic, read-task-spans=192\n"
+               "read-schedule=dynamic, read-task-spans=192, sq-copy=memcpy\n"
                "profile-detail=0 disables per-SQ-group timing; READ wall timing stays enabled.\n",
                program, kvaf::kGatherMaxSglSize, kvaf::kGatherMaxSglSize);
 }
@@ -60,6 +61,11 @@ bool Parse(int argc, char** argv, Options* options) {
     const char* value = argv[index + 1];
     if (flag == "--peer") parsed.peer = value;
     else if (flag == "--kernel-json") parsed.kernel_json = value;
+    else if (flag == "--sq-copy") {
+      if (std::strcmp(value, "memcpy") == 0) parsed.sq_copy_mode = kvaf::GatherSqCopyMode::kMemcpy;
+      else if (std::strcmp(value, "paired") == 0) parsed.sq_copy_mode = kvaf::GatherSqCopyMode::kPaired;
+      else return false;
+    }
     else if (flag == "--read-schedule") {
       if (std::strcmp(value, "dynamic") == 0) parsed.dynamic_read = true;
       else if (std::strcmp(value, "static") == 0) parsed.dynamic_read = false;
@@ -237,6 +243,7 @@ double RunRound(kvaf::NpuRuntime* runtime, aclrtStream stream, const Options& op
   gather.timing = timing;
   gather.profile_detail = options.profile_detail;
   gather.sq_batch_wqes = options.sq_batch_wqes;
+  gather.sq_copy_mode = options.sq_copy_mode;
   gather.read_task_spans = options.dynamic_read ? options.read_task_spans : 0U;
   for (std::size_t block = options.blocks; block != 0U; --block) {
     const auto address = view.addresses[block - 1U];
@@ -333,13 +340,15 @@ int Run(const Options& options) {
   std::fprintf(stdout,
                "AICPU_GATHER_READ_PASS blocks=%u block_bytes=%u bytes=%zu "
                "output_stride=%u sgl_size=%u wqe_sgl_size=%u aicpu_cores=%u descriptor_transport=%s "
-               "sq_batch_wqes=%u profile_detail=%u read_schedule=%s read_task_spans=%u "
+               "sq_batch_wqes=%u sq_copy=%s profile_detail=%u read_schedule=%s read_task_spans=%u "
                "warmup=%u iterations=%u\n",
                options.blocks, options.block_bytes, payload, options.output_stride,
                options.sgl_size, std::min(options.sgl_size, kvaf::kGatherMaxSglSize),
                options.aicpu_cores,
                options.urma_descriptors ? "urma" : "rpc",
-               options.sq_batch_wqes, options.profile_detail ? 1U : 0U,
+               options.sq_batch_wqes,
+               options.sq_copy_mode == kvaf::GatherSqCopyMode::kMemcpy ? "memcpy" : "paired",
+               options.profile_detail ? 1U : 0U,
                options.dynamic_read ? "dynamic" : "static",
                options.dynamic_read ? options.read_task_spans : 0U,
                options.warmup, options.iterations);
