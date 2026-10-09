@@ -44,6 +44,15 @@ struct AccessOperatorConfig {
   std::uint32_t npu_core_count{0};
   // Direct-HCCP Jettys assigned to each AIV core.
   std::uint32_t jettys_per_core{2};
+  // Optional cold transport pool for exclusive fused readers. Ordinary
+  // BatchGet still launches npu_core_count workers, and BatchPut is unchanged.
+  // Zero preserves the existing pool; nonzero must be >= npu_core_count and
+  // requires one Jetty per worker (one independent SQ/CQ per queue).
+  std::uint32_t fused_transport_core_count{0};
+
+  std::uint32_t GetTransportCoreCount() const {
+    return fused_transport_core_count ? fused_transport_core_count : npu_core_count;
+  }
 };
 
 struct BatchGetKernelProfile {
@@ -211,7 +220,7 @@ class DefaultAccessOperator final : public AccessOperator {
   // The legacy two-argument overload preserves the original two-queue
   // contract. New users must pass queue_count explicitly. queue_count selects
   // the first queue_count transport queues and must be in
-  // [1, npu_core_count]; the current device helper still requires exactly one
+  // [1, GetTransportCoreCount()]; the current device helper requires one
   // Jetty per selected queue.
   // The binding is intentionally exclusive with ordinary and native-lane
   // BatchGet because all paths would otherwise mutate the same SQ/CQ state.

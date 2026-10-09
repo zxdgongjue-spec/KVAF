@@ -150,11 +150,11 @@ Status ValidateFusedBatchGetQueueCount(const AccessOperatorConfig& config,
         "fused BatchGet queue_count must be in [1, "
         + std::to_string(KVAF_AIV_BATCH_GET_MAX_AIV_CORES) + "]");
   }
-  if (queue_count > config.npu_core_count) {
+  if (queue_count > config.GetTransportCoreCount()) {
     return InvalidArgument(
         "fused BatchGet queue_count=" + std::to_string(queue_count) +
-        " exceeds Runtime npu_core_count=" +
-        std::to_string(config.npu_core_count));
+        " exceeds Runtime transport_core_count=" +
+        std::to_string(config.GetTransportCoreCount()));
   }
   // The device-side Begin/TryRetire/Finish primitive treats one selected
   // worker as one AIV-owned USER_CTL SQ/CQ pair.  It does not yet carry a
@@ -636,6 +636,9 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
       impl_->config.batch_get_kernel_object_path.empty() ||
       impl_->config.npu_core_count == 0 ||
       impl_->config.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
+      impl_->config.GetTransportCoreCount() < impl_->config.npu_core_count ||
+      impl_->config.GetTransportCoreCount() > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
+      (impl_->config.fused_transport_core_count != 0U && impl_->config.jettys_per_core != 1U) ||
       impl_->config.jettys_per_core == 0 ||
       impl_->config.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE) {
     return InvalidArgument("invalid AccessOperator initialization config");
@@ -657,16 +660,16 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
   KvafBatchGetTransport* transport = nullptr;
   const int32_t result = KvafBatchGetTransportCreate(
       reinterpret_cast<void*>(remote_region.base), remote_region.length,
-      impl_->config.npu_core_count, impl_->config.jettys_per_core, &transport);
+      impl_->config.GetTransportCoreCount(), impl_->config.jettys_per_core, &transport);
   if (result != KVAF_BATCH_GET_SUCCESS || transport == nullptr) {
     return Internal("failed to create reusable BatchGet transport");
   }
 
   BatchGetExecutionState execution;
-  execution.status_bytes = static_cast<std::size_t>(impl_->config.npu_core_count) *
+  execution.status_bytes = static_cast<std::size_t>(impl_->config.GetTransportCoreCount()) *
                            sizeof(KvafBatchGetCoreStatus);
   execution.queue_state_bytes =
-      static_cast<std::size_t>(impl_->config.npu_core_count) *
+      static_cast<std::size_t>(impl_->config.GetTransportCoreCount()) *
       impl_->config.jettys_per_core *
       sizeof(KvafBatchGetQueueState);
   if (aclrtMalloc(&execution.status, execution.status_bytes,
