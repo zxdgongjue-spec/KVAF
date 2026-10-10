@@ -4,7 +4,6 @@ set(aiv_copy_includes
   "-I${CMAKE_SOURCE_DIR}/access_operator/src"
   "-I${CMAKE_SOURCE_DIR}/access_operator/include"
   "-I${KVAF_KERNEL_OPERATOR_DIR}"
-  "-I${KVAF_SIMT_API_DIR}"
   "-I${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw/lib"
   "-I${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw"
   "-I${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw/interface"

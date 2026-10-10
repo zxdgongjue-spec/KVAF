@@ -43,15 +43,23 @@ void TestCopy(std::uint32_t workers, std::uint32_t batch) {
         threads.emplace_back([&, worker] {
           kvaf::aiv_sq_copy_stub::worker = worker;
           kvaf::aiv_sq_copy_stub::mte3_waits = 0U;
+          kvaf::aiv_sq_copy_stub::mte2_reads = 0U;
+          kvaf::aiv_sq_copy_stub::clock_reads = 0U;
           KvafAivSqCopyBenchmark(args);
           assert(kvaf::aiv_sq_copy_stub::pending.empty());
+          assert(kvaf::aiv_sq_copy_stub::pending_reads.empty());
           assert(kvaf::aiv_sq_copy_stub::mte3_waits >= 1U);
+          assert(kvaf::aiv_sq_copy_stub::reads_at_copy_begin == (target < 2U ? 1U : 0U));
+          assert(kvaf::aiv_sq_copy_stub::mte2_reads == (target < 2U ? 1U
+              : (queues[worker].bytes + batch * 192U - 1U) / (batch * 192U)));
         });
       for (auto& thread : threads) thread.join();
       for (std::uint32_t worker = 0U; worker < workers; ++worker) {
         assert(KvafAicpuUrmaSqCopyVerify(&args) == 0U);
         assert(statuses[worker].copy_end_ns > statuses[worker].copy_begin_ns);
         assert(statuses[worker].thread_cpu_available == 0U);
+        assert(statuses[worker].copy_calls ==
+            (queues[worker].bytes + batch * 192U - 1U) / (batch * 192U));
         const auto& untouched = (target & 1U) != 0U ? buffers[worker].hbm : buffers[worker].sq;
         const auto& destination = (target & 1U) != 0U ? buffers[worker].sq : buffers[worker].hbm;
         for (std::uint64_t index = 0U; index < destination.size(); ++index) {
@@ -91,6 +99,14 @@ void TestInvalid() {
   queue.offset = 4032U;
   KvafAivSqCopyBenchmark(args);
   assert(status.result == 0U);
+  const auto source_hbm = queue.source_hbm;
+  for (const auto target : {0U, 1U, 2U, 3U}) {
+    args.target_sq = target;
+    queue.source_hbm = 0U;
+    KvafAivSqCopyBenchmark(args);
+    assert(status.result == 1U && kvaf::aiv_sq_copy_stub::pending_reads.empty());
+  }
+  queue.source_hbm = source_hbm;
   args.target_sq = 2U;
   queue.source_hbm = queue.hbm + queue.offset;
   KvafAivSqCopyBenchmark(args);

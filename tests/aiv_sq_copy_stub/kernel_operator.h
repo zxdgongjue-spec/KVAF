@@ -28,6 +28,10 @@ inline thread_local std::uint32_t worker = 0U;
 inline thread_local std::uint32_t thread = 0U;
 alignas(64) inline thread_local std::array<std::uint8_t, 16384> local_memory{};
 inline thread_local std::vector<PendingCopy> pending;
+inline thread_local std::vector<PendingCopy> pending_reads;
+inline thread_local std::uint64_t mte2_reads = 0U;
+inline thread_local std::uint64_t clock_reads = 0U;
+inline thread_local std::uint64_t reads_at_copy_begin = 0U;
 inline thread_local std::uint64_t mte3_waits = 0U;
 inline thread_local bool require_completed_copy = true;
 inline std::atomic<std::uint64_t> clock{0U};
@@ -56,6 +60,11 @@ inline void wait_flag(int source, int, int) {
     kvaf::aiv_sq_copy_stub::CompleteCopies();
     ++kvaf::aiv_sq_copy_stub::mte3_waits;
   }
+  if (source == PIPE_MTE2) {
+    for (const auto& copy : kvaf::aiv_sq_copy_stub::pending_reads)
+      std::memcpy(copy.destination, copy.source, copy.bytes);
+    kvaf::aiv_sq_copy_stub::pending_reads.clear();
+  }
 }
 
 inline void* get_imm(std::uint32_t offset) {
@@ -65,6 +74,7 @@ inline void* get_imm(std::uint32_t offset) {
 
 inline void copy_ubuf_to_gm_align_v2(float* destination, float* source,
                                     std::uint64_t configuration, std::uint64_t) {
+  assert(kvaf::aiv_sq_copy_stub::pending_reads.empty());
   kvaf::aiv_sq_copy_stub::pending.push_back({destination, source,
       static_cast<std::size_t>(configuration >> 25U)});
 }
@@ -74,13 +84,17 @@ inline void copy_gm_to_ubuf_align_v2(std::uint8_t* destination, std::uint8_t* so
     unsigned, unsigned, std::uint32_t bytes, Arguments...) {
   assert(kvaf::aiv_sq_copy_stub::pending.empty());
   assert(bytes <= kvaf::aiv_sq_copy_stub::local_memory.size());
-  std::memcpy(destination, source, bytes);
+  kvaf::aiv_sq_copy_stub::pending_reads.push_back({destination, source, bytes});
+  ++kvaf::aiv_sq_copy_stub::mte2_reads;
 }
 
 namespace AscendC {
 
 inline std::uint32_t GetBlockIdx() { return kvaf::aiv_sq_copy_stub::worker; }
 inline std::uint64_t GetSystemCycle() {
+  assert(kvaf::aiv_sq_copy_stub::pending_reads.empty());
+  if (kvaf::aiv_sq_copy_stub::clock_reads++ == 1U)
+    kvaf::aiv_sq_copy_stub::reads_at_copy_begin = kvaf::aiv_sq_copy_stub::mte2_reads;
   if (kvaf::aiv_sq_copy_stub::require_completed_copy)
     assert(kvaf::aiv_sq_copy_stub::pending.empty());
   return kvaf::aiv_sq_copy_stub::clock.fetch_add(1U, std::memory_order_relaxed);
