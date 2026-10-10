@@ -17,6 +17,35 @@ spec.loader.exec_module(runner)
 
 
 class DiagnosticsRunnerTests(unittest.TestCase):
+    def test_fault_only_preserves_original_mode(self):
+        result = subprocess.run([sys.executable, str(RUNNER), '/missing-build', '--dry-run', '--fault-only'],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['cases'], [[1, 1, 1]])
+
+    def test_raw_fault_evidence_survives_verbose_output(self):
+        content = ('[KVAF_DIAG] unrelated repeated\n' * 5000
+                   + '[KVAF_AIV] DIRECT_AIV_WQE_EID_ENCODING ra_host_eid=abcd\n'
+                   + '[KVAF_DIAG] DEVICE_CQE words=02020006,00000000\n'
+                   + '[KVAF_DIAG] DEVICE_WQE words=b0360000\n'
+                   + '[KVAF_DIAG] REQUEST_CHECK metadata_valid=1\n'
+                   + '[KVAF_DIAG] CQ_AUX_VALUES type:value=39:0x00000001\n'
+                   + '[KVAF_DIAG] unrelated repeated\n' * 5000)
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            runner.print_case_report(runner.TerminalReport(), 'fault', content)
+        for marker in ('DEVICE_CQE', 'DEVICE_WQE', 'REQUEST_CHECK', 'CQ_AUX_VALUES', 'ra_host_eid=abcd'):
+            self.assertIn(marker, stream.getvalue())
+        self.assertLess(len(stream.getvalue().splitlines()), 200)
+
+    def test_old_kernel_stops_after_completion_without_capture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, summary = self.run_matrix(directory, [(1, False,
+                '[KVAF_DIAG] FIXED_PAIR\n[KVAF_DIAG] PUT_COMPLETION result=8\nDIAG_CLEANUP_OK\n')])
+            self.assertEqual(result, 1)
+            self.assertEqual(len(summary), 1)
+            self.assertFalse(summary[0]['device_capture_v3'])
+
     def test_comparisons_hold_layout_constant(self):
         self.assertEqual(runner.matrix(), [(1, 1, 1), (1, 1, 0), (32, 2, 1), (32, 2, 0)])
         self.assertEqual(runner.matrix(True), [(1, 1, 1), (1, 1, 0)])

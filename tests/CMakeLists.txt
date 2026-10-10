@@ -44,3 +44,9 @@ endif()
 # The diagnostic harness itself runs without CANN; hardware cases are explicit.
 add_test(NAME kvaf_diagnostics_runner_python
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_diagnostics_runner.py")
+
+add_executable(kvaf_put_diagnostics_test batch_put_diagnostics_test.cc)
+target_include_directories(kvaf_put_diagnostics_test PRIVATE
+  "${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_put/include")
+target_compile_features(kvaf_put_diagnostics_test PRIVATE cxx_std_17)
+add_test(NAME kvaf_put_diagnostics COMMAND kvaf_put_diagnostics_test)

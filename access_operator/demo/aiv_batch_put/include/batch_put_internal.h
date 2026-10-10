@@ -6,7 +6,8 @@
 #include "batch_put_abi.h"
 
 enum {
-  KVAF_AIV_BATCH_PUT_QUEUE_STATE_BYTES = 64,
+  KVAF_AIV_BATCH_PUT_QUEUE_STATE_BYTES = 256,
+  KVAF_AIV_BATCH_PUT_DIAG_MAGIC = 0x44494133,
 };
 
 typedef struct KvafBatchPutQueueState {
@@ -17,6 +18,14 @@ typedef struct KvafBatchPutQueueState {
   uint64_t completed_batch_count;
   uint64_t last_error;
   uint64_t reserved[3];
+  // Private host/kernel ABI: rebuild both libraries after changing this state.
+  uint32_t diag_magic;
+  uint32_t diag_flags;  // bit 0: CQE captured; bit 1: matching outstanding SQE captured
+  uint32_t diag_cqe_bytes;
+  uint32_t diag_sq_slot;
+  uint32_t diag_cqe[16];
+  uint32_t diag_wqe[16];
+  uint64_t diag_reserved[6];
 } KvafBatchPutQueueState;
 
 typedef struct KvafBatchPutDirectUrmaEntity {

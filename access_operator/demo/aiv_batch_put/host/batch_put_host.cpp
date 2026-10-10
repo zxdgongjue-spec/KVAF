@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <dlfcn.h>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -14,6 +15,7 @@
 
 #include "acl/acl.h"
 #include "batch_put_internal.h"
+#include "batch_put_diagnostics.h"
 #include "diagnostics.h"
 #include "direct_hccp/direct_hccp_abi.h"
 #include "direct_hccp/direct_hccp_remote_transport.h"
@@ -442,6 +444,9 @@ int32_t CreateBatchPutTransport(void *host_ddr, uint64_t host_ddr_bytes,
     entity.jfc_id = worker.device_cq_info.out.id;
     entity.cq_depth = kDeviceUserCtlCqDepth;
     entity.cqe_size = worker.device_cq_info.out.cqe_size;
+    // Capture only core 0's lanes; all cores still retain their completion status.
+    if (kvaf::diagnostics::Enabled() && entity_index < state->jettys_per_core)
+      entity.reserved0 = KVAF_AIV_BATCH_PUT_DIAG_MAGIC;
     if (entity.sq_va == 0U || entity.sq_db_va == 0U || entity.cq_va == 0U ||
         entity.cq_db_va == 0U || entity.cqe_size < 32U || entity.tp_id == 0U) {
       goto failed;
@@ -576,6 +581,42 @@ extern "C" void KvafBatchPutLocalBufferRelease(KvafBatchPutLocalBuffer *local_bu
 }
 
 namespace {
+void PrintWords(const char* tag, uint32_t lane, const uint32_t* words, uint32_t count) {
+  std::fprintf(stderr, "[KVAF_DIAG] %s lane=%u words=", tag, lane);
+  for (uint32_t i = 0; i < count; ++i) std::fprintf(stderr, "%s%08x", i ? "," : "", words[i]);
+  std::fprintf(stderr, "\n");
+}
+
+void DumpAuxInfo(KvafBatchPutTransport* transport, const KvafBatchPutQueueState& queue) {
+  const uint32_t raw = queue.diag_cqe[0];
+  if ((raw >> 24) != 2U || ((raw >> 16) & 255U) != 2U) {
+    std::fprintf(stderr, "[KVAF_DIAG] CQ_AUX skipped=unmapped_raw_status\n");
+    return;
+  }
+  auto query = reinterpret_cast<kvaf::put_diag::GetAuxInfo>(
+      dlsym(transport->api.library, "RaCtxGetAuxInfo"));
+  if (!query) {
+    std::fprintf(stderr, "[KVAF_DIAG] CQ_AUX unavailable=RaCtxGetAuxInfo_symbol_missing\n");
+    return;
+  }
+  kvaf::put_diag::AuxInfoIn in{};
+  in.status = 4U;  // URMA_CR_LOC_ACCESS_ERR: udma_u_get_cr_status maps raw (2,2) -> 4.
+  in.s_r = static_cast<uint8_t>(raw & 1U);
+  kvaf::put_diag::AuxInfoOut out{};
+  std::fprintf(stderr, "[KVAF_DIAG] CQ_AUX_BEGIN raw_status=2 raw_substatus=2 urma_status=4 s_r=%u\n", in.s_r);
+  std::fflush(stderr);
+  const int ret = query(transport->device_context, &in, &out);
+  std::fprintf(stderr, "[KVAF_DIAG] CQ_AUX ret=%d count=%u capacity=256\n", ret, out.count);
+  if (ret != 0) return;
+  const uint32_t count = out.count < 256U ? out.count : 256U;
+  for (uint32_t i = 0; i < count; i += 8U) {
+    std::fprintf(stderr, "[KVAF_DIAG] CQ_AUX_VALUES type:value=");
+    for (uint32_t j = i; j < count && j < i + 8U; ++j)
+      std::fprintf(stderr, "%s%u:0x%08x", j == i ? "" : ",", out.types[j], out.values[j]);
+    std::fprintf(stderr, "\n");
+  }
+}
+
 void DumpDeviceWords(const char* label, uint32_t lane, uint64_t address, size_t bytes) {
   uint32_t words[16]{};
   const aclError result = aclrtMemcpy(words, sizeof(words), reinterpret_cast<void*>(address),
@@ -589,8 +630,9 @@ void DumpDeviceWords(const char* label, uint32_t lane, uint64_t address, size_t 
   std::fprintf(stderr, "\n");
 }
 
-void DumpBatchPut(KvafBatchPutLocalBuffer* buffer) {
+void DumpBatchPut(KvafBatchPutLocalBuffer* buffer, const KvafExecuteBatchPutKernelArgs* args) {
   auto* transport = buffer->transport;
+  bool aux_queried = false;
   // Bounded evidence from core 0, all its lanes; read only KVAF-owned HBM.
   for (uint32_t lane = 0; lane < transport->jettys_per_core; ++lane) {
     KvafBatchPutDirectUrmaEntity entity{};
@@ -604,6 +646,48 @@ void DumpBatchPut(KvafBatchPutLocalBuffer* buffer) {
     std::fprintf(stderr, "[KVAF_DIAG] SNAPSHOT lane=%u entity_acl=%d queue_acl=%d\n",
                  lane, static_cast<int>(entity_result), static_cast<int>(queue_result));
     if (entity_result != ACL_SUCCESS || queue_result != ACL_SUCCESS) continue;
+    std::fprintf(stderr, "[KVAF_DIAG] DEVICE_CAPTURE_V3 lane=%u kernel_marker=0x%x flags=%u cqe_bytes=%u sq_slot=%u\n",
+                 lane, queue.diag_magic, queue.diag_flags, queue.diag_cqe_bytes, queue.diag_sq_slot);
+    if (queue.diag_magic == KVAF_AIV_BATCH_PUT_DIAG_MAGIC && (queue.diag_flags & 1U)) {
+      PrintWords("DEVICE_CQE", lane, queue.diag_cqe, queue.diag_cqe_bytes == 64U ? 16U : 8U);
+      const uint32_t* c = queue.diag_cqe;
+      std::fprintf(stderr, "[KVAF_DIAG] CQ_DECODE lane=%u s_r=%u is_jetty=%u opcode=%u entry=%u local_id=%u expected_jetty=%u tpn=%u expected_tpn=%u bytes=%u\n",
+                   lane, c[0] & 1U, (c[0] >> 1) & 1U, (c[0] >> 4) & 7U,
+                   c[1] & 0xffffU, (c[1] >> 16) | ((c[2] & 15U) << 16), entity.jetty_id,
+                   c[3] & 0xffffffU, entity.tp_id, c[4]);
+      if (queue.diag_flags & 2U) {
+        PrintWords("DEVICE_WQE", lane, queue.diag_wqe, 16U);
+        const auto checks = kvaf::put_diag::CheckWqe(queue.diag_wqe, entity);
+        std::fprintf(stderr, "[KVAF_DIAG] WQE_CHECK lane=%u local_range=%d remote_range=%d local_token=%d remote_token=%d remote_eid=%d tpn=%d scope=descriptor_consistency_only\n",
+                     lane, checks.local_range, checks.remote_range, checks.local_token,
+                     checks.remote_token, checks.remote_eid, checks.tpn);
+        const uint64_t absolute = queue.diag_reserved[0], start = queue.diag_reserved[1];
+        const uint64_t offset = absolute >= start ? kvaf::put_diag::RequestOffset(
+            absolute - start, lane, transport->jettys_per_core) : UINT64_MAX;
+        const uint64_t begin = queue.diag_reserved[2];
+        if (offset < queue.diag_reserved[3] && begin < args->row_count && offset < args->row_count - begin) {
+          const uint64_t row = begin + offset;
+          uint64_t input_offset = 0, length = 0, destination = 0;
+          const auto a = aclrtMemcpy(&input_offset, 8, reinterpret_cast<void*>(args->input_offsets + row * 8), 8, ACL_MEMCPY_DEVICE_TO_HOST);
+          const auto b = aclrtMemcpy(&length, 8, reinterpret_cast<void*>(args->lengths + row * 8), 8, ACL_MEMCPY_DEVICE_TO_HOST);
+          const auto c = aclrtMemcpy(&destination, 8, reinterpret_cast<void*>(args->destination_addresses + row * 8), 8, ACL_MEMCPY_DEVICE_TO_HOST);
+          const auto* w = queue.diag_wqe;
+          const uint64_t local = uint64_t(w[14]) | (uint64_t(w[15]) << 32);
+          const uint64_t remote = uint64_t(w[10]) | (uint64_t(w[11]) << 32);
+          const bool valid = a == ACL_SUCCESS && b == ACL_SUCCESS && c == ACL_SUCCESS;
+          std::fprintf(stderr, "[KVAF_DIAG] REQUEST_CHECK lane=%u row=%llu metadata_valid=%d acl=%d,%d,%d input_offset=%llu length=%llu destination=0x%llx source_match=%d length_match=%d destination_match=%d\n",
+                       lane, static_cast<unsigned long long>(row), valid, int(a), int(b), int(c),
+                       static_cast<unsigned long long>(input_offset), static_cast<unsigned long long>(length),
+                       static_cast<unsigned long long>(destination),
+                       valid && input_offset <= UINT64_MAX - entity.local_hbm_address && local == entity.local_hbm_address + input_offset,
+                       valid && w[12] == length, valid && remote == destination);
+        } else {
+          std::fprintf(stderr, "[KVAF_DIAG] REQUEST_CHECK lane=%u metadata_valid=0 reason=cqe_outside_current_submission\n", lane);
+        }
+      }
+      // Error state is context-wide; query once, before context destruction.
+      if (!aux_queried) { DumpAuxInfo(transport, queue); aux_queried = true; }
+    }
     std::fprintf(stderr,
         "[KVAF_DIAG] ENTITY lane=%u jetty=%u jfc=%u tpn=%u local=0x%llx bytes=%llu "
         "local_token=0x%x remote=0x%llx remote_bytes=%llu remote_token=0x%x "
@@ -621,7 +705,7 @@ void DumpBatchPut(KvafBatchPutLocalBuffer* buffer) {
     // them through aclrtMemcpy can segfault inside the runtime (observed on A5).
     // Only read our own aclrtMalloc-backed entity/state/metadata buffers.
     std::fprintf(stderr,
-        "[KVAF_DIAG] QUEUE_ADDRESSES lane=%u sq=0x%llx cq=0x%llx raw_read=disabled\n",
+        "[KVAF_DIAG] QUEUE_ADDRESSES lane=%u sq=0x%llx cq=0x%llx host_raw_read=disabled\n",
         lane, static_cast<unsigned long long>(entity.sq_va),
         static_cast<unsigned long long>(entity.cq_va));
   }
@@ -698,7 +782,7 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
     DumpDeviceWords("INPUT_OFFSETS_HEAD", 0U, arguments->input_offsets, metadata_bytes);
     DumpDeviceWords("LENGTHS_HEAD", 0U, arguments->lengths, metadata_bytes);
     DumpDeviceWords("DESTINATIONS_HEAD", 0U, arguments->destination_addresses, metadata_bytes);
-    DumpBatchPut(local_buffer);
+    DumpBatchPut(local_buffer, arguments);
   }
   for (uint32_t core = 0U; core < core_status_count; ++core) {
     const uint64_t begin = static_cast<uint64_t>(arguments->row_count) * core / core_status_count;

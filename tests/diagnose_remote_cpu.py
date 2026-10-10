@@ -48,13 +48,18 @@ class TerminalReport:
 
 def print_case_report(terminal, name, content):
     lines = content.splitlines()
+    priority_markers = ('DEVICE_CAPTURE_V3', 'DEVICE_CQE', 'DEVICE_WQE', 'CQ_DECODE',
+                        'WQE_CHECK', 'REQUEST_CHECK', 'CQ_AUX', 'DIRECT_AIV_WQE_EID_ENCODING', 'PEER_LINK_LOCAL_EID_READY')
+    priority = [line for line in lines if any(marker in line for marker in priority_markers)]
     evidence = [line for line in lines if ('[KVAF_DIAG]' in line or line.startswith('DIAG_'))
-                and not line.startswith('DIAG_LOADED_LIBRARY')]
+                and not line.startswith('DIAG_LOADED_LIBRARY')
+                and not any(marker in line for marker in priority_markers)]
     libraries = list(dict.fromkeys(line for line in lines if line.startswith('DIAG_LOADED_LIBRARY')))
     faults = [line for line in lines if any(marker in line for marker in
         ('ERROR', 'FAILED', 'FAILURE', 'PROBE_', 'EID_PAIR_', 'Traceback', 'Error:', 'Exception:'))]
     terminal.section(name + ' libraries', libraries, 12)
-    terminal.section(name + ' evidence', evidence, 110)
+    terminal.section(name + ' device fault and driver auxiliary evidence', priority, 64)
+    terminal.section(name + ' evidence', evidence, 46)
     terminal.section(name + ' errors and probe', faults, 45)
     # Preserve final Python exception and teardown even when a message is unrecognized.
     terminal.section(name + ' tail', lines[-18:], 18)
@@ -127,12 +132,14 @@ def main(terminal=None):
     parser.add_argument('--peer-candidate', type=unsigned, default=0)
     parser.add_argument('--npu-candidate', type=unsigned, default=0)
     parser.add_argument('--timeout', type=unsigned, default=120, help='seconds per fresh process')
-    parser.add_argument('--single-only', action='store_true')
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument('--single-only', action='store_true')
+    selection.add_argument('--fault-only', action='store_true', help='one core, one jetty, original non_pin=1 only')
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
     if args.timeout == 0:
         parser.error('--timeout must be positive')
-    cases = matrix(args.single_only)
+    cases = [(1, 1, 1)] if args.fault_only else matrix(args.single_only)
     if args.dry_run:
         terminal.emit(json.dumps({'cases': cases, 'peer_candidate': args.peer_candidate,
                           'npu_candidate': args.npu_candidate, 'timeout': args.timeout}))
@@ -185,13 +192,18 @@ def main(terminal=None):
         instrumentation = '[KVAF_DIAG] FIXED_PAIR' in content
         cleanup = 'DIAG_CLEANUP_OK' in content
         registration = 'HBM_REGISTER implementation=batch_put_private_v2' in content
+        device_capture = bool(re.search(r'DEVICE_CAPTURE_V3 .*kernel_marker=0x44494133', content))
         results.append({'case': name, 'exit': code, 'timeout': timed_out,
-                        'instrumentation': instrumentation, 'cleanup': cleanup, 'private_put_registration': registration})
+                        'instrumentation': instrumentation, 'cleanup': cleanup, 'private_put_registration': registration,
+                        'device_capture_v3': device_capture})
         (output / 'summary.json').write_text(json.dumps(results, indent=2))
         terminal.emit(f'DIAG_RESULT {results[-1]}')
         print_case_report(terminal, name, content)
         if ('PEER_LINK_EID_PAIR_RMA_PROBE_BEGIN' in content and not registration):
             terminal.emit('DIAG_REGISTRATION_MISSING: rebuild NPU libraries; Put registration evidence is absent.')
+            break
+        if 'PUT_COMPLETION' in content and not device_capture:
+            terminal.emit('DIAG_DEVICE_CAPTURE_MISSING: rebuild BOTH Put host library and AIV kernel; stop mixed-version run.')
             break
         if timed_out or not cleanup or not instrumentation:
             terminal.emit('DIAG_STOP: incomplete cleanup or missing rebuilt instrumentation; inspect evidence before rerunning.')
