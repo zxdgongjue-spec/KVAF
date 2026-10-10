@@ -37,7 +37,7 @@ void Usage(const char* program) {
       "[--sq-batch-wqes 8|16|32|64] [--sq-copy memcpy|paired] "
       "[--eid-list-index N] [--kernel-json PATH] [--warmup N] [--iterations N]\n"
       "Defaults: aicpu-cores=5 bytes=131072 sq-batch-wqes=8 sq-copy=memcpy warmup=10 iterations=1000.\n"
-      "Compares stack -> HBM, stack -> driver SQ, and HBM -> HBM; no peer or doorbell.\n", program);
+      "Compares stack/HBM -> HBM/driver SQ; no peer or doorbell.\n", program);
 }
 
 bool Parse(int argc, char** argv, Options* options) {
@@ -248,7 +248,7 @@ int Run(const Options& options) {
         static_cast<unsigned long long>(queues[worker].capacity),
         static_cast<unsigned long long>(queues[worker].bytes));
   }
-  std::array<Samples, 3> samples;
+  std::array<Samples, 4> samples;
   std::vector<std::uint8_t> source_data(static_cast<std::size_t>(queues.front().bytes));
   std::vector<benchmark::SqCopyBenchmarkStatus> statuses(options.workers);
   benchmark::SqCopyBenchmarkArgs args{reinterpret_cast<std::uint64_t>(queue_buffer.data),
@@ -268,8 +268,8 @@ int Run(const Options& options) {
     for (auto& queue : queues) queue.offset = (round % (queue.capacity / queue.bytes)) * queue.bytes;
     queue_buffer.Upload(queues.data(), queues.size() * sizeof(queues.front()));
     args.round = round;
-    for (std::uint32_t phase = 0U; phase < 3U; ++phase) {
-      const auto target = static_cast<std::uint32_t>((round + phase) % 3U);
+    for (std::uint32_t phase = 0U; phase < 4U; ++phase) {
+      const auto target = static_cast<std::uint32_t>((round + phase) % 4U);
       args.target_sq = target;
       Acl(aclrtMemset(counter_buffer.data, counter_buffer.bytes, 0, counter_buffer.bytes), "reset counter");
       Acl(aclrtMemset(status_buffer.data, status_buffer.bytes, 0, status_buffer.bytes), "reset status");
@@ -288,7 +288,7 @@ int Run(const Options& options) {
             status.copy_end_ns <= status.copy_begin_ns) {
           std::fprintf(stderr, "SQ_COPY_FAIL source=%s target=%s worker=%u round=%llu result=%llu "
               "mismatch_offset=%llu expected=0x%llx actual=0x%llx\n",
-              target == 2U ? "hbm" : "stack", target == 1U ? "sq" : "hbm", worker,
+              target >= 2U ? "hbm" : "stack", (target & 1U) != 0U ? "sq" : "hbm", worker,
               static_cast<unsigned long long>(round), static_cast<unsigned long long>(status.result),
               static_cast<unsigned long long>(status.mismatch_offset),
               static_cast<unsigned long long>(status.expected), static_cast<unsigned long long>(status.actual));
@@ -317,6 +317,7 @@ int Run(const Options& options) {
   Print(options, samples[0], "stack", "hbm", queues);
   Print(options, samples[1], "stack", "sq", queues);
   Print(options, samples[2], "hbm", "hbm", queues);
+  Print(options, samples[3], "hbm", "sq", queues);
   std::fprintf(stdout, "SQ_COPY_BENCHMARK_PASS workers=%u total_bytes=%llu sq_copy=%s "
       "warmup=%u iterations=%u no_doorbell=1\n", options.workers,
       static_cast<unsigned long long>(options.bytes),

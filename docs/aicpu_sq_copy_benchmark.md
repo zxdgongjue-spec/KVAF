@@ -2,11 +2,11 @@
 
 本基准从 worker 栈上与 GatherRead 同样大小的 WQE 编码缓冲区，使用同一个 `CopySqWqebbs` 函数，比较写普通 HBM 和写 HCCP/驱动 SQ 的耗时。它创建独占的 USER_CTL SQ/CQ，使用与 GatherRead 相同的深度和创建方式，不连接远端、不写 doorbell、不产生网络 READ 或 CQE。
 
-同一次运行还测试 **HBM → HBM**：源和目标来自两个独立的 `aclrtMalloc` 分配，均使用 `ACL_MEM_MALLOC_HUGE_FIRST`。AICPU 从源 HBM 顺序读取，每个源字节只拷贝一次，仍使用相同拷贝函数、总字节数和批次大小。Host 每轮提前上传源数据，不计入拷贝耗时；不在计时前由 AICPU 初始化或预读源 HBM。这是 AICPU 执行内存拷贝，不是 `aclrtMemcpy` 或 SDMA 执行的 HBM 拷贝。
+同一次运行还测试 **HBM → HBM** 和 **HBM → SQ**：HBM 源和 HBM 目标来自两个独立的 `aclrtMalloc` 分配，均使用 `ACL_MEM_MALLOC_HUGE_FIRST`；SQ 仍由驱动分配。AICPU 从源 HBM 顺序读取，每条路径内每个源字节只拷贝一次，使用相同拷贝函数、总字节数和批次大小。Host 每轮提前上传源数据，不计入拷贝耗时；AICPU 不额外初始化或预热源 HBM。两条 HBM 源路径共用源缓冲，前一次读取可能影响后一次读取的缓存状态，因此结果不是严格冷缓存测量。这是 AICPU 执行内存拷贝，不是 `aclrtMemcpy` 或 SDMA 执行的拷贝。
 
 HBM 目标使用 `ACL_MEM_MALLOC_HUGE_FIRST`。每轮总拷贝量固定为 128 KiB，在 workers 间按 64 B 分配；1 worker 和 5 workers 的总字节数相同。默认每次拷贝 1536 B，相当于 8 个 6-SGE WQE，尾块按实际字节数拷贝。目标地址逐轮推进，在队列容量内循环，避免一直写同一个小槽位。
 
-每轮轮换三个测试的执行顺序，减少顺序偏差。栈源缓冲区在每次 kernel 内生成，HBM 源数据由 Host 提前上传，数据随轮次和 worker 改变。拷贝结束使用 `dsb sy`；不增加缓存行刷新。所有 worker 拷贝结束后，再由同一 stream 上的独立校验 kernel 逐 32-bit 字检查目标全部数据，避免校验读取干扰仍在计时的 worker。失败时打印首个不匹配位置，包含 warmup 在内全部正确才打印 PASS。验证 SQ 内存不代表验证网络传输，因为本基准不提交网络操作。
+每轮轮换四个测试的执行顺序，减少顺序偏差。栈源缓冲区在每次 kernel 内生成，HBM 源数据由 Host 提前上传，数据随轮次和 worker 改变。拷贝结束使用 `dsb sy`；不增加缓存行刷新。所有 worker 拷贝结束后，再由同一 stream 上的独立校验 kernel 逐 32-bit 字检查目标全部数据，避免校验读取干扰仍在计时的 worker。失败时打印首个不匹配位置，包含 warmup 在内全部正确才打印 PASS。验证 SQ 内存不代表验证网络传输，因为本基准不提交网络操作。
 
 ## 执行
 
@@ -31,7 +31,7 @@ done
 
 ## 计时含义
 
-每种路径分别输出一行 `SQ_COPY_STATS`，分位数和平均值均以 **us** 表示：`source=stack target=hbm`、`source=stack target=sq` 和 `source=hbm target=hbm`。比较三行的 `mean_us`；只比较相同 worker 数、总字节数、批次大小和拷贝方式的运行。
+每种路径分别输出一行 `SQ_COPY_STATS`，分位数和平均值均以 **us** 表示：`source=stack target=hbm`、`source=stack target=sq`、`source=hbm target=hbm` 和 `source=hbm target=sq`。比较四行的 `mean_us`；只比较相同 worker 数、总字节数、批次大小和拷贝方式的运行。
 
 | 数据 | 区间 |
 | --- | --- |

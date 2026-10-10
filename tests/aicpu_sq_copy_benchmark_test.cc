@@ -32,7 +32,7 @@ void TestCopy(std::uint32_t workers, std::uint32_t batch, kvaf::GatherSqCopyMode
       0U, workers, batch, 0U, mode, reinterpret_cast<std::uint64_t>(&verify_counter)};
   for (std::uint64_t round = 0U; round < 3U; ++round) {
     args.round = round;
-    for (std::uint32_t target = 0U; target < 3U; ++target) {
+    for (std::uint32_t target = 0U; target < 4U; ++target) {
       args.target_sq = target;
       counter = 0U;
       verify_counter = 0U;
@@ -63,11 +63,11 @@ void TestCopy(std::uint32_t workers, std::uint32_t batch, kvaf::GatherSqCopyMode
         assert(status.round == round && status.result == 0U && status.bytes == queue.bytes);
         assert(status.entry_ns <= status.copy_begin_ns && status.copy_begin_ns <= status.copy_end_ns);
         assert(status.copy_calls == (queue.bytes + batch * 192U - 1U) / (batch * 192U));
-        const auto& destination = target == 1U ? buffers[worker].sq : buffers[worker].hbm;
-        const auto& untouched = target == 1U ? buffers[worker].hbm : buffers[worker].sq;
+        const auto& destination = (target & 1U) != 0U ? buffers[worker].sq : buffers[worker].hbm;
+        const auto& untouched = (target & 1U) != 0U ? buffers[worker].hbm : buffers[worker].sq;
         for (std::uint64_t index = 0U; index < destination.size(); ++index) {
           const auto expected = index >= queue.offset && index - queue.offset < queue.bytes
-              ? SqCopyBenchmarkPattern(target == 2U ? index - queue.offset
+              ? SqCopyBenchmarkPattern(target >= 2U ? index - queue.offset
                   : (index - queue.offset) % (batch * 192U), worker, round)
               : 0xa5U;
           assert(destination[index] == expected);
@@ -113,7 +113,7 @@ void TestInvalid() {
   invalid.workers = 9U;
   assert(KvafAicpuUrmaSqCopyBenchmark(&invalid) == 1U);
   invalid = valid;
-  invalid.target_sq = 3U;
+  invalid.target_sq = 4U;
   assert(KvafAicpuUrmaSqCopyBenchmark(&invalid) == 1U);
   invalid = valid;
   invalid.batch_wqes = 7U;
@@ -121,14 +121,29 @@ void TestInvalid() {
   invalid = valid;
   invalid.copy_mode = static_cast<kvaf::GatherSqCopyMode>(2U);
   assert(KvafAicpuUrmaSqCopyBenchmark(&invalid) == 1U);
-  valid.target_sq = 2U;
   queue.offset = 0U;
-  for (const auto source : {0ULL, static_cast<unsigned long long>(
-       reinterpret_cast<std::uint64_t>(buffers.source_hbm.data()) + 1U),
-       static_cast<unsigned long long>(queue.hbm), UINT64_MAX - 63ULL}) {
+  for (const auto target : {2U, 3U}) {
+    valid.target_sq = target;
+    for (const auto source : {0ULL, static_cast<unsigned long long>(
+         reinterpret_cast<std::uint64_t>(buffers.source_hbm.data()) + 1U),
+         static_cast<unsigned long long>(target == 3U ? queue.sq : queue.hbm),
+         UINT64_MAX - 63ULL}) {
+      counter = 0U;
+      queue.source_hbm = source;
+      assert(KvafAicpuUrmaSqCopyBenchmark(&valid) == 1U);
+    }
+    queue.source_hbm = reinterpret_cast<std::uint64_t>(buffers.source_hbm.data());
+    for (std::uint64_t index = 0U; index < queue.bytes; ++index)
+      buffers.source_hbm[index] = SqCopyBenchmarkPattern(index, 0U, valid.round);
     counter = 0U;
-    queue.source_hbm = source;
-    assert(KvafAicpuUrmaSqCopyBenchmark(&valid) == 1U);
+    verify_counter = 0U;
+    assert(KvafAicpuUrmaSqCopyBenchmark(&valid) == 0U);
+    assert(KvafAicpuUrmaSqCopyVerify(&valid) == 0U);
+    auto& destination = target == 3U ? buffers.sq : buffers.hbm;
+    destination[8U] ^= 1U;
+    verify_counter = 0U;
+    assert(KvafAicpuUrmaSqCopyVerify(&valid) == 1U && status.result == 2U);
+    assert(status.mismatch_offset == 8U && status.actual != status.expected);
   }
 }
 

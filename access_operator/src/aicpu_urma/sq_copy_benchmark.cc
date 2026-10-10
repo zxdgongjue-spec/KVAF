@@ -41,7 +41,7 @@ std::uint32_t KvafAicpuUrmaSqCopyBenchmark(kvaf::aicpu_urma::SqCopyBenchmarkArgs
   const auto entry_ns = NowNs();
   if (args == nullptr || args->queues == 0U || args->statuses == 0U ||
       args->next_worker == 0U || args->workers == 0U ||
-      args->workers > kSqCopyBenchmarkMaxWorkers || args->target_sq > 2U ||
+      args->workers > kSqCopyBenchmarkMaxWorkers || args->target_sq > 3U ||
       (args->batch_wqes != 8U && args->batch_wqes != 16U &&
        args->batch_wqes != 32U && args->batch_wqes != 64U) ||
       !kvaf::ValidGatherSqCopyMode(args->copy_mode)) return 1U;
@@ -56,13 +56,13 @@ std::uint32_t KvafAicpuUrmaSqCopyBenchmark(kvaf::aicpu_urma::SqCopyBenchmarkArgs
   status.round = args->round;
   status.entry_ns = entry_ns;
   const auto& queue = reinterpret_cast<const SqCopyBenchmarkQueue*>(args->queues)[worker];
-  const auto destination = args->target_sq == 1U ? queue.sq : queue.hbm;
+  const auto destination = (args->target_sq & 1U) != 0U ? queue.sq : queue.hbm;
   if (destination == 0U || destination % 64U != 0U || queue.bytes == 0U ||
       queue.bytes % 64U != 0U || queue.offset % 64U != 0U ||
       queue.capacity > kSqCopyBenchmarkQueueBytes || queue.offset > queue.capacity ||
       queue.bytes > queue.capacity - queue.offset ||
       destination > UINT64_MAX - queue.capacity ||
-      (args->target_sq == 2U && (queue.source_hbm == 0U ||
+      (args->target_sq >= 2U && (queue.source_hbm == 0U ||
        queue.source_hbm % 64U != 0U || queue.source_hbm > UINT64_MAX - queue.bytes ||
        (queue.source_hbm < destination + queue.offset + queue.bytes &&
         destination + queue.offset < queue.source_hbm + queue.bytes)))) {
@@ -73,7 +73,7 @@ std::uint32_t KvafAicpuUrmaSqCopyBenchmark(kvaf::aicpu_urma::SqCopyBenchmarkArgs
   const auto chunk_blocks = args->batch_wqes * kMaxScatterWqebbs;
   const auto chunk_bytes = chunk_blocks * kWqeBytes;
   auto* source_bytes = reinterpret_cast<std::uint8_t*>(source);
-  if (args->target_sq != 2U) {
+  if (args->target_sq < 2U) {
     for (std::uint32_t index = 0U; index < chunk_bytes; ++index)
       source_bytes[index] = SqCopyBenchmarkPattern(index, static_cast<std::uint32_t>(worker), args->round);
   }
@@ -86,7 +86,7 @@ std::uint32_t KvafAicpuUrmaSqCopyBenchmark(kvaf::aicpu_urma::SqCopyBenchmarkArgs
   for (std::uint64_t offset = 0U; offset < queue.bytes; offset += chunk_bytes) {
     const auto blocks = static_cast<std::uint32_t>(
         std::min<std::uint64_t>(chunk_bytes, queue.bytes - offset) / kWqeBytes);
-    const auto* input = args->target_sq == 2U
+    const auto* input = args->target_sq >= 2U
         ? reinterpret_cast<const std::uint8_t*>(queue.source_hbm) + offset : source_bytes;
     CopySqWqebbs(output + offset, input, blocks, args->copy_mode);
 #if defined(__GNUC__) || defined(__clang__)
@@ -111,7 +111,7 @@ std::uint32_t KvafAicpuUrmaSqCopyVerify(kvaf::aicpu_urma::SqCopyBenchmarkArgs* a
   using namespace kvaf::aicpu_urma;
   if (args == nullptr || args->queues == 0U || args->statuses == 0U ||
       args->next_verify_worker == 0U || args->workers == 0U ||
-      args->workers > kSqCopyBenchmarkMaxWorkers || args->target_sq > 2U ||
+      args->workers > kSqCopyBenchmarkMaxWorkers || args->target_sq > 3U ||
       (args->batch_wqes != 8U && args->batch_wqes != 16U &&
        args->batch_wqes != 32U && args->batch_wqes != 64U)) return 1U;
   const auto worker = __atomic_fetch_add(reinterpret_cast<std::uint64_t*>(args->next_verify_worker),
@@ -119,7 +119,7 @@ std::uint32_t KvafAicpuUrmaSqCopyVerify(kvaf::aicpu_urma::SqCopyBenchmarkArgs* a
   if (worker >= args->workers) return 1U;
   auto& status = reinterpret_cast<SqCopyBenchmarkStatus*>(args->statuses)[worker];
   const auto& queue = reinterpret_cast<const SqCopyBenchmarkQueue*>(args->queues)[worker];
-  const auto destination = args->target_sq == 1U ? queue.sq : queue.hbm;
+  const auto destination = (args->target_sq & 1U) != 0U ? queue.sq : queue.hbm;
   if (status.magic != kSqCopyBenchmarkMagic || status.worker != worker ||
       status.round != args->round || status.result != 0U || status.bytes != queue.bytes ||
       destination == 0U || destination % 64U != 0U || queue.bytes == 0U ||
@@ -137,7 +137,7 @@ std::uint32_t KvafAicpuUrmaSqCopyVerify(kvaf::aicpu_urma::SqCopyBenchmarkArgs* a
     std::uint32_t expected = 0U;
     for (std::uint32_t byte = 0U; byte < sizeof(expected); ++byte)
       expected |= static_cast<std::uint32_t>(SqCopyBenchmarkPattern(
-          args->target_sq == 2U ? offset + byte : (offset + byte) % chunk_bytes,
+          args->target_sq >= 2U ? offset + byte : (offset + byte) % chunk_bytes,
           static_cast<std::uint32_t>(worker), args->round)) << (byte * 8U);
     const auto actual = words[offset / sizeof(std::uint32_t)];
     if (actual != expected) {
