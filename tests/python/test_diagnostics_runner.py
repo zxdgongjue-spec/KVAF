@@ -116,6 +116,19 @@ class DiagnosticsRunnerTests(unittest.TestCase):
         self.assertEqual(runner.kernel_delta('UMMU fault\n', 'UMMU fault\nUMMU fault\nunrelated\n'),
                          ['UMMU fault'])
 
+    def test_iommu_registration_noise_does_not_hide_fault(self):
+        after = ('platform ummu_vdev.15.auto: Adding to iommu group 16\n' * 1000
+                 + 'UMMU local access fault token=0x1100\n')
+        self.assertEqual(runner.kernel_delta('', after), ['UMMU local access fault token=0x1100'])
+
+    def test_missing_private_registration_stops_invalid_comparison(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, summary = self.run_matrix(directory, [(1, False,
+                '[KVAF_DIAG] FIXED_PAIR\nPEER_LINK_EID_PAIR_RMA_PROBE_BEGIN\nDIAG_CLEANUP_OK\n')])
+            self.assertEqual(result, 1)
+            self.assertEqual(len(summary), 1)
+            self.assertFalse(summary[0]['private_put_registration'])
+
     def test_hung_child_is_bounded_and_marked(self):
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / 'case.log'

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """One fresh-process diagnostic case; invoked by diagnose_remote_cpu.py."""
 import os
+import faulthandler
 from pathlib import Path
 import traceback
 
@@ -17,6 +18,7 @@ def loaded_libraries():
 
 
 def main():
+    faulthandler.enable(all_threads=True)
     import torch
     import torch_npu  # noqa: F401: registers the NPU backend
     import kvaf
@@ -37,6 +39,7 @@ def main():
     cleanup_ok = False
     try:
         runtime.link_to(os.environ['KVAF_CPU_SERVICE_ADDR'])
+        loaded_libraries()
         phase = 'initialize_probe'
         print(f'DIAG_PHASE_BEGIN phase={phase} ddr_bytes=262144 slot_size=64', flush=True)
         runtime.initialize(4096 * 64, 64)

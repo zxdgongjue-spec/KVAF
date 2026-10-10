@@ -81,6 +81,8 @@ struct KvafBatchPutTransport {
   hccp::PeerLink *peer_link{nullptr};
 };
 
+namespace {
+
 std::string EidToHex(const std::array<uint8_t, hccp::kEidBytes> &eid) {
   static constexpr char kHex[] = "0123456789abcdef";
   std::string result;
@@ -180,7 +182,7 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
   const int ret = api.lmem_register(context, &info, &memory->handle);
   if (kvaf::diagnostics::Enabled()) {
     std::fprintf(stderr,
-        "[KVAF_DIAG] HBM_REGISTER role=%s ret=%d non_pin=%u flags=0x%x context=%p "
+        "[KVAF_DIAG] HBM_REGISTER implementation=batch_put_private_v2 role=%s ret=%d non_pin=%u flags=0x%x context=%p "
         "input=0x%llx input_bytes=%llu registered=0x%llx registered_bytes=%llu "
         "allocated_wqe_token=0x%x returned_raw_token=0x%x returned_shifted_token=0x%x "
         "handle=%p target_seg=0x%llx key_bytes=%u\n",
@@ -470,6 +472,8 @@ failed:
   return result;
 }
 
+}  // namespace: private helpers must not interpose with BatchGet DSO symbols.
+
 extern "C" int32_t KvafBatchPutTransportCreateWithPeerLink(
     void *host_ddr, uint64_t host_ddr_bytes, uint32_t aiv_core_count,
     uint32_t jettys_per_core, void *peer_link, const uint8_t *peer_local_eid,
@@ -587,8 +591,7 @@ void DumpDeviceWords(const char* label, uint32_t lane, uint64_t address, size_t 
 
 void DumpBatchPut(KvafBatchPutLocalBuffer* buffer) {
   auto* transport = buffer->transport;
-  // Bounded evidence from core 0, all its lanes. Queue contents are diagnostic,
-  // not a second completion check; ACL cannot copy every platform's queue VA.
+  // Bounded evidence from core 0, all its lanes; read only KVAF-owned HBM.
   for (uint32_t lane = 0; lane < transport->jettys_per_core; ++lane) {
     KvafBatchPutDirectUrmaEntity entity{};
     KvafBatchPutQueueState queue{};
@@ -614,15 +617,13 @@ void DumpBatchPut(KvafBatchPutLocalBuffer* buffer) {
         static_cast<unsigned long long>(queue.cq_consumer_index),
         static_cast<unsigned long long>(queue.completed_batch_count),
         static_cast<unsigned long long>(queue.last_error));
-    DumpDeviceWords("SQ_SLOT0", lane, entity.sq_va, 64U);
-    if (queue.sq_producer_index != 0U && entity.sq_depth != 0U)
-      DumpDeviceWords("SQ_LAST_POSTED", lane,
-          entity.sq_va + ((queue.sq_producer_index - 1U) % entity.sq_depth) * 64U, 64U);
-    if (entity.cq_depth != 0U) {
-      const uint64_t ci = queue.cq_consumer_index == 0U ? 0U : queue.cq_consumer_index - 1U;
-      DumpDeviceWords("CQ_LAST_OR_FIRST", lane,
-          entity.cq_va + (ci % entity.cq_depth) * entity.cqe_size, 64U);
-    }
+    // Queue VAs returned by RA are not general ACL HBM allocations. Reading
+    // them through aclrtMemcpy can segfault inside the runtime (observed on A5).
+    // Only read our own aclrtMalloc-backed entity/state/metadata buffers.
+    std::fprintf(stderr,
+        "[KVAF_DIAG] QUEUE_ADDRESSES lane=%u sq=0x%llx cq=0x%llx raw_read=disabled\n",
+        lane, static_cast<unsigned long long>(entity.sq_va),
+        static_cast<unsigned long long>(entity.cq_va));
   }
 }
 }  // namespace
@@ -679,6 +680,20 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
   if (kvaf::diagnostics::Enabled()) {
+    // Emit original completion evidence before any optional diagnostics.
+    for (uint32_t core = 0U; core < core_status_count; ++core) {
+      const auto& status = core_status[core];
+      std::fprintf(stderr,
+          "[KVAF_DIAG] PUT_COMPLETION core=%u magic=0x%llx result=%llu "
+          "cq_status=%llu cq_sub_status=%llu sq_pi=%llu cq_ci=%llu completed=%llu\n",
+          core, static_cast<unsigned long long>(status.magic),
+          static_cast<unsigned long long>(status.result),
+          static_cast<unsigned long long>(status.cq_status),
+          static_cast<unsigned long long>(status.cq_sub_status),
+          static_cast<unsigned long long>(status.sq_producer_index),
+          static_cast<unsigned long long>(status.cq_consumer_index),
+          static_cast<unsigned long long>(status.completed_batch_count));
+    }
     const size_t metadata_bytes = (arguments->row_count < 8U ? arguments->row_count : 8U) * sizeof(uint64_t);
     DumpDeviceWords("INPUT_OFFSETS_HEAD", 0U, arguments->input_offsets, metadata_bytes);
     DumpDeviceWords("LENGTHS_HEAD", 0U, arguments->lengths, metadata_bytes);

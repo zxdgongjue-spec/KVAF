@@ -48,9 +48,12 @@ class TerminalReport:
 
 def print_case_report(terminal, name, content):
     lines = content.splitlines()
-    evidence = [line for line in lines if '[KVAF_DIAG]' in line or line.startswith('DIAG_')]
+    evidence = [line for line in lines if ('[KVAF_DIAG]' in line or line.startswith('DIAG_'))
+                and not line.startswith('DIAG_LOADED_LIBRARY')]
+    libraries = list(dict.fromkeys(line for line in lines if line.startswith('DIAG_LOADED_LIBRARY')))
     faults = [line for line in lines if any(marker in line for marker in
         ('ERROR', 'FAILED', 'FAILURE', 'PROBE_', 'EID_PAIR_', 'Traceback', 'Error:', 'Exception:'))]
+    terminal.section(name + ' libraries', libraries, 12)
     terminal.section(name + ' evidence', evidence, 110)
     terminal.section(name + ' errors and probe', faults, 45)
     # Preserve final Python exception and teardown even when a message is unrecognized.
@@ -65,7 +68,8 @@ def kernel_delta(before, after):
     for line in after.splitlines():
         if previous[line]:
             previous[line] -= 1
-        elif re.search(r'ummu|udma|urma|asdrv|smmu|iommu|fault|error|fail|token|\bub\b', line, re.I):
+        elif ('Adding to iommu group' not in line and
+              re.search(r'ummu|udma|urma|asdrv|smmu|iommu|fault|error|fail|token|\bub\b', line, re.I)):
             delta.append(line)
     return delta
 
@@ -180,11 +184,15 @@ def main(terminal=None):
         content = (output / (name + '.log')).read_text(errors='replace')
         instrumentation = '[KVAF_DIAG] FIXED_PAIR' in content
         cleanup = 'DIAG_CLEANUP_OK' in content
+        registration = 'HBM_REGISTER implementation=batch_put_private_v2' in content
         results.append({'case': name, 'exit': code, 'timeout': timed_out,
-                        'instrumentation': instrumentation, 'cleanup': cleanup})
+                        'instrumentation': instrumentation, 'cleanup': cleanup, 'private_put_registration': registration})
         (output / 'summary.json').write_text(json.dumps(results, indent=2))
         terminal.emit(f'DIAG_RESULT {results[-1]}')
         print_case_report(terminal, name, content)
+        if ('PEER_LINK_EID_PAIR_RMA_PROBE_BEGIN' in content and not registration):
+            terminal.emit('DIAG_REGISTRATION_MISSING: rebuild NPU libraries; Put registration evidence is absent.')
+            break
         if timed_out or not cleanup or not instrumentation:
             terminal.emit('DIAG_STOP: incomplete cleanup or missing rebuilt instrumentation; inspect evidence before rerunning.')
             break
@@ -196,7 +204,8 @@ def main(terminal=None):
     terminal.emit('DIAG_SUMMARY ' + json.dumps(results))
     terminal.emit(f'DIAG_LOCAL_ARCHIVE {output} (optional; terminal evidence above is ready to paste)')
     terminal.emit('DIAG_REPORT_END')
-    return 0 if len(results) == len(cases) and all(r['exit'] == 0 and r['instrumentation'] and r['cleanup'] for r in results) else 1
+    return 0 if len(results) == len(cases) and all(r['exit'] == 0 and r['instrumentation'] and r['cleanup']
+                                                    and r['private_put_registration'] for r in results) else 1
 
 
 if __name__ == '__main__':

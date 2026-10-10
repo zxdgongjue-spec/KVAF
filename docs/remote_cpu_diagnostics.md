@@ -3,7 +3,7 @@
 用于 `cq_status=2 cq_sub_status=2` 等首次写入错误的对照采集，不需要旧环境版本。
 这一状态按仓内参考 UDMA provider 映射为本地访问错误，仍应核对实机驱动版本。
 测试不预设配置错误：`non_pin` 对照仅用于检验环境变化后的注册/映射兼容性，
-重点是实际错误 CQE、WQE 与内存注册证据。默认运行行为不变；诊断选项只有
+重点是 kernel 返回的 CQ 错误、请求 metadata 与内存注册证据。默认运行行为不变；诊断选项只有
 `KVAF_DIAGNOSTICS=1` 时生效。仅在没有其他 KVAF 工作负载的测试时段运行。
 
 ## 运行
@@ -62,15 +62,20 @@ KVAF_CPU_SERVICE_ADDR=141.61.80.71:29876 DEVICE_ID=0 \
   `allocated_wqe_token` 已右移 8 位；`returned_raw_token` 原样记录，并另列移位结果，不能直接比较未统一编码的数据。
 - `RA_LIBRARY` / `DIAG_LOADED_LIBRARY`：实际加载库；`HOST_ABI`：本地手写接口结构大小。
 - `ENTITY`：从 device 回读的 core 0 每条 lane 的地址、token、TPN、队列进度。
-- `SQ_SLOT0` / `SQ_LAST_POSTED`：执行完成后读取实际 SQ 的 64 字节。首次调用时槽 0 是首条 WQE；
-  后续调用时槽 0 可能仍为历史条目，应结合 LAST_POSTED/PI 使用。
-- `CQ_LAST_OR_FIRST`：最后消费的 CQE；CI 为零时是首槽，并不意味着它已经有效。
-- `acl!=0`：当前平台不支持该地址的 ACL 回读或回读失败，不能把打印的空 words 当硬件内容。
+- `PUT_COMPLETION`：直接打印 kernel 已写入自有 HBM status 的 CQ status/substatus，先于附加回读输出。
+- `QUEUE_ADDRESSES`：只记录队列地址，不用主机 ACL 读取 SQ/CQ。旧诊断在该操作前后出现 SIGSEGV，
+  不能把 RA 返回的队列 VA 当作普通 HBM 地址。当前仅回读 KVAF 自己申请的 HBM 描述符、metadata 和状态。
+- `HBM_REGISTER implementation=batch_put_private_v2`：确认执行了 Put 独立的注册实现。
+  原 Get/Put 动态库有同名全局辅助函数，可能使 Put 注册调用绑定到 Get 实现；本版本将 Put 辅助函数私有化。
+- `acl!=0`：自有 HBM 回读失败，不能把空 words 当有效内容。
 - `DIAG_CLEANUP_OK`：客户端 teardown 返回成功，不证明所有底层 destroy 已成功或 CPU 服务无残留；
   应结合 CPU `REGION_RELEASE`。超时、清理异常或缺少诊断编译标记时停止剩余矩阵。
   超时强制结束进程可能留下 CPU session，确认 CPU 服务资源恢复后再重跑。
 
 若 non_pin=0 通过而 1 失败，优先定位注册/映射模式；两者都在同一 `(2,2)` 失败，则结合
-WQE 本地 token/VA、注册返回值及 UMMU fault 继续定位。单队列通过而 32×2 失败，才优先查规模和隔离。
+device entity 的本地 token/VA、请求 metadata、注册返回值及 UMMU fault 继续定位。单队列通过而 32×2 失败，才优先查规模和隔离。
 
 此分支不改 kernel WQE 编码或 token 使用方式。诊断会增加同步完成后的回读开销，不用于性能测量。
+
+诊断 v2 必须重新运行 `./build.sh npu`。上一版若以 exit=-11 退出且没有 REGION_RELEASE，
+应先确认 CPU 服务残留 session 已清理；不能把该段错误当原始 CQ 故障的根因。
