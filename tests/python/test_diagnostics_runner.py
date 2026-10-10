@@ -17,6 +17,33 @@ spec.loader.exec_module(runner)
 
 
 class DiagnosticsRunnerTests(unittest.TestCase):
+    def test_ctrl_c_kills_separate_child_session_and_keeps_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / 'case.log'
+            process = mock.Mock(pid=12345)
+            process.wait.side_effect = [KeyboardInterrupt, -runner.signal.SIGKILL]
+
+            def spawn(*args, **kwargs):
+                self.assertTrue(kwargs['start_new_session'])
+                kwargs['stdout'].write('last child evidence\n')
+                return process
+
+            with mock.patch.object(runner.subprocess, 'Popen', side_effect=spawn), \
+                 mock.patch.object(runner.os, 'killpg') as kill:
+                result = runner.run_case(['fake-child'], {}, log, 120)
+            self.assertEqual(result, (130, False))
+            kill.assert_called_once_with(12345, runner.signal.SIGKILL)
+            self.assertIn('last child evidence', log.read_text())
+            self.assertIn('DIAG_PROCESS_INTERRUPTED cleanup_unconfirmed=1', log.read_text())
+
+    def test_interrupted_case_reports_and_stops_even_after_cleanup_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, summary = self.run_matrix(directory, [(130, False,
+                '[KVAF_DIAG] FIXED_PAIR\nDIAG_CLEANUP_OK\nDIAG_PROCESS_INTERRUPTED\n')])
+            self.assertEqual(result, 130)
+            self.assertEqual(len(summary), 1)
+            self.assertFalse(summary[0]['cleanup'])
+
     def test_fault_only_preserves_original_mode(self):
         result = subprocess.run([sys.executable, str(RUNNER), '/missing-build', '--dry-run', '--fault-only'],
                                 capture_output=True, text=True)

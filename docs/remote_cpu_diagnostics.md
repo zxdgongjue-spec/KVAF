@@ -39,6 +39,10 @@ KVAF_CPU_SERVICE_ADDR=141.61.80.71:29876 DEVICE_ID=0 \
 目录包括 summary.json、manifest.json（构建文件 SHA256）、environment.txt、每组独立日志、
 运行前后的 dmesg。case 内记录实际加载的相关动态库路径，不输出完整进程环境。
 
+子进程输出在 case 结束或达到超时后汇总打印。Ctrl+C 会结束该 case 的独立进程组、
+打印中断前已有的证据并以 130 退出；强制结束不等于底层资源已清理，脚本不再启动后续 case。
+旧版（含 8c7b256e）Ctrl+C 只中断父脚本，子进程可能继续运行；分析旧版中断实验时需读取其原始 case 日志。
+
 默认四组，均为独立进程，同一个 CPU/NPU EID 候选组合：
 
 | case | core | Jetty/core | Put HBM non_pin |

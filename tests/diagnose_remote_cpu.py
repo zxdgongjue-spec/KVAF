@@ -113,15 +113,21 @@ def run_case(command, env, log, timeout):
                                    start_new_session=True)
         try:
             return process.wait(timeout=timeout), False
-        except subprocess.TimeoutExpired:
-            # Bound even a stuck ACL/RA teardown. Do not start more cases afterwards.
+        except (subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
+            # The child has its own session and does not receive terminal SIGINT.
+            # Always stop that process group and return its evidence to main.
+            interrupted = isinstance(exc, KeyboardInterrupt)
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            process.wait()
-            stream.write('\nDIAG_PROCESS_TIMEOUT cleanup_unconfirmed=1\n')
-            return 124, True
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                stream.write('\nDIAG_PROCESS_REAP_TIMEOUT cleanup_unconfirmed=1\n')
+            marker = 'INTERRUPTED' if interrupted else 'TIMEOUT'
+            stream.write(f'\nDIAG_PROCESS_{marker} cleanup_unconfirmed=1\n')
+            return (130, False) if interrupted else (124, True)
 
 
 def main(terminal=None):
@@ -185,12 +191,12 @@ def main(terminal=None):
         name = f'c{cores}-j{jettys}-nonpin{non_pin}'
         case_env = env | {'KVAF_DIAG_CORES': str(cores), 'KVAF_DIAG_JETTYS': str(jettys),
                           'KVAF_DIAG_PUT_NON_PIN': str(non_pin)}
-        terminal.emit(f'DIAG_RUN case={name}')
+        terminal.emit(f'DIAG_RUN case={name} timeout_seconds={args.timeout}; output appears at completion; Ctrl+C stops the child and prints captured evidence.')
         code, timed_out = run_case([sys.executable, str(ROOT / 'tests/python/diagnose_remote_cpu_case.py')],
                                   case_env, output / (name + '.log'), args.timeout)
         content = (output / (name + '.log')).read_text(errors='replace')
         instrumentation = '[KVAF_DIAG] FIXED_PAIR' in content
-        cleanup = 'DIAG_CLEANUP_OK' in content
+        cleanup = 'DIAG_CLEANUP_OK' in content and code != 130 and not timed_out
         registration = 'HBM_REGISTER implementation=batch_put_private_v2' in content
         device_capture = bool(re.search(r'DEVICE_CAPTURE_V3 .*kernel_marker=0x44494133', content))
         results.append({'case': name, 'exit': code, 'timeout': timed_out,
@@ -216,6 +222,8 @@ def main(terminal=None):
     terminal.emit('DIAG_SUMMARY ' + json.dumps(results))
     terminal.emit(f'DIAG_LOCAL_ARCHIVE {output} (optional; terminal evidence above is ready to paste)')
     terminal.emit('DIAG_REPORT_END')
+    if any(r['exit'] == 130 for r in results):
+        return 130
     return 0 if len(results) == len(cases) and all(r['exit'] == 0 and r['instrumentation'] and r['cleanup']
                                                     and r['private_put_registration'] for r in results) else 1
 
