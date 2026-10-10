@@ -1,4 +1,6 @@
 import importlib.util
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -78,6 +80,41 @@ class DiagnosticsRunnerTests(unittest.TestCase):
             self.assertEqual(result, 1)
             self.assertEqual(len(summary), 1)
             self.assertFalse(summary[0]['cleanup'])
+
+    def test_terminal_hard_limit_including_multiline_messages(self):
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            terminal = runner.TerminalReport()
+            terminal.emit('line\n' * 1500)
+            terminal.emit('must not leak beyond limit')
+        lines = stream.getvalue().splitlines()
+        self.assertEqual(len(lines), 1000)
+        self.assertIn('DIAG_TERMINAL_LIMIT', lines[-1])
+
+    def test_four_large_cases_fit_report_and_keep_faults(self):
+        content = ('[KVAF_AIV] DIRECT_JETTY_READY repeated\n' * 5000
+                   + '[KVAF_DIAG] HBM_REGISTER token=0x1100\n'
+                   + '[KVAF_DIAG] SQ_SLOT0 words=1234\n'
+                   + '[KVAF_AIV] BATCH_PUT_DEVICE_ERROR cq_status=2 cq_sub_status=2\n'
+                   + 'Traceback (most recent call last):\nRuntimeError: probe failed\nDIAG_CLEANUP_OK\n')
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            terminal = runner.TerminalReport()
+            terminal.section('manifest', ['manifest'] * 500, 45)
+            terminal.section('environment', ['env'] * 5000, 55)
+            for case in range(4):
+                runner.print_case_report(terminal, str(case), content)
+            terminal.section('kernel faults', ['fault'] * 5000, 60)
+            terminal.emit('DIAG_REPORT_END')
+        output = stream.getvalue()
+        self.assertLessEqual(len(output.splitlines()), 1000)
+        self.assertEqual(output.count('HBM_REGISTER'), 8)  # evidence + tail per case
+        self.assertIn('cq_status=2 cq_sub_status=2', output)
+        self.assertTrue(output.rstrip().endswith('DIAG_REPORT_END'))
+
+    def test_kernel_delta_retains_repeated_new_faults(self):
+        self.assertEqual(runner.kernel_delta('UMMU fault\n', 'UMMU fault\nUMMU fault\nunrelated\n'),
+                         ['UMMU fault'])
 
     def test_hung_child_is_bounded_and_marked(self):
         with tempfile.TemporaryDirectory() as directory:

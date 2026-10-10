@@ -2,12 +2,13 @@
 
 用于 `cq_status=2 cq_sub_status=2` 等首次写入错误的对照采集，不需要旧环境版本。
 这一状态按仓内参考 UDMA provider 映射为本地访问错误，仍应核对实机驱动版本。
-测试不把 `non_pin` 或链路直接判为根因。默认运行行为不变；诊断选项只有
+测试不预设配置错误：`non_pin` 对照仅用于检验环境变化后的注册/映射兼容性，
+重点是实际错误 CQE、WQE 与内存注册证据。默认运行行为不变；诊断选项只有
 `KVAF_DIAGNOSTICS=1` 时生效。仅在没有其他 KVAF 工作负载的测试时段运行。
 
 ## 运行
 
-CPU 端继续使用已有服务和参数，保存这次运行对应的 CPU 服务标准输出/错误日志。
+CPU 端继续使用已有服务和参数，本轮先回传 NPU 端终端报告即可。
 本分支没有修改 CPU 协议，不要求升级 CPU 服务。
 
 NPU 端先按正常方法加载 CANN 环境，再重新构建；不能使用旧 binding/host library：
@@ -18,7 +19,10 @@ KVAF_CPU_SERVICE_ADDR=141.61.80.71:29876 DEVICE_ID=0 \
   bash tests/run_remote_cpu_diagnostics.sh "$PWD/build-npu"
 ```
 
-脚本打印 `DIAG_OUTPUT` 目录，将该目录和对应 CPU 服务日志一起回传。任何 case 失败时
+脚本直接在终端打印 `DIAG_REPORT_BEGIN` 到 `DIAG_REPORT_END` 的诊断报告，
+**本次诊断脚本的总终端输出最多 1000 行**（构建命令输出不包含在内）。直接复制粘贴终端输出即可，
+不需要上传文件夹，也不需要先收集 CPU 服务日志。报告包含每组关键原始证据、异常尾部、
+实际加载库、构建指纹和新出现的内核错误。原始完整日志仍在本地保留作备查。任何 case 失败时
 脚本最终退出码为 1，这是诊断结果，不表示日志采集一定失败。`dmesg` 不可读时会记录原因。
 目录包括 summary.json、manifest.json（构建文件 SHA256）、environment.txt、每组独立日志、
 运行前后的 dmesg。case 内记录实际加载的相关动态库路径，不输出完整进程环境。

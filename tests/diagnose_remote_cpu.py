@@ -7,11 +7,67 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
+import traceback
 import signal
 import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class TerminalReport:
+    """One budget for all parent output; children never inherit the terminal."""
+    def __init__(self, limit=1000):
+        self.limit = limit
+        self.lines = 0
+
+    def emit(self, text):
+        for line in str(text).splitlines():
+            if self.lines >= self.limit:
+                return
+            if self.lines == self.limit - 1:
+                print('DIAG_TERMINAL_LIMIT reached; remaining details retained locally.', flush=True)
+                self.lines += 1
+                return
+            # Strip terminal controls; bound unusually long loader/driver messages.
+            line = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', line)
+            line = ''.join(c if c.isprintable() or c == '\t' else '?' for c in line)
+            print(line[:1600] + (' ...[line truncated]' if len(line) > 1600 else ''), flush=True)
+            self.lines += 1
+
+    def section(self, name, lines, budget):
+        self.emit(f'--- {name} ---')
+        lines = list(lines)
+        if len(lines) > budget:
+            front = budget // 2
+            lines = lines[:front] + [f'... {len(lines) - budget + 1} lines omitted ...'] + lines[-(budget - front - 1):]
+        for line in lines:
+            self.emit(line)
+
+
+def print_case_report(terminal, name, content):
+    lines = content.splitlines()
+    evidence = [line for line in lines if '[KVAF_DIAG]' in line or line.startswith('DIAG_')]
+    faults = [line for line in lines if any(marker in line for marker in
+        ('ERROR', 'FAILED', 'FAILURE', 'PROBE_', 'EID_PAIR_', 'Traceback', 'Error:', 'Exception:'))]
+    terminal.section(name + ' evidence', evidence, 110)
+    terminal.section(name + ' errors and probe', faults, 45)
+    # Preserve final Python exception and teardown even when a message is unrecognized.
+    terminal.section(name + ' tail', lines[-18:], 18)
+
+
+def kernel_delta(before, after):
+    # Preserve duplicate events by subtracting counts, not by converting to a set.
+    from collections import Counter
+    previous = Counter(before.splitlines())
+    delta = []
+    for line in after.splitlines():
+        if previous[line]:
+            previous[line] -= 1
+        elif re.search(r'ummu|udma|urma|asdrv|smmu|iommu|fault|error|fail|token|\bub\b', line, re.I):
+            delta.append(line)
+    return delta
 
 
 def unsigned(value):
@@ -59,7 +115,8 @@ def run_case(command, env, log, timeout):
             return 124, True
 
 
-def main():
+def main(terminal=None):
+    terminal = terminal or TerminalReport()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('build_dir', type=Path)
     parser.add_argument('--output', type=Path)
@@ -73,7 +130,7 @@ def main():
         parser.error('--timeout must be positive')
     cases = matrix(args.single_only)
     if args.dry_run:
-        print(json.dumps({'cases': cases, 'peer_candidate': args.peer_candidate,
+        terminal.emit(json.dumps({'cases': cases, 'peer_candidate': args.peer_candidate,
                           'npu_candidate': args.npu_candidate, 'timeout': args.timeout}))
         return 0
     if not os.environ.get('KVAF_CPU_SERVICE_ADDR'):
@@ -107,13 +164,17 @@ def main():
         except OSError as exc:
             inventory += f'\nFILE {path} unavailable: {exc}\n'
     (output / 'environment.txt').write_text(inventory)
-    (output / 'dmesg-before.txt').write_text(capture(['dmesg', '--ctime']))
+    before = capture(['dmesg', '--ctime'])
+    (output / 'dmesg-before.txt').write_text(before)
+    terminal.emit('DIAG_REPORT_BEGIN max_terminal_lines=1000; paste this run output, no directory upload needed')
+    terminal.section('manifest', json.dumps(metadata, default=str, indent=2).splitlines(), 45)
+    terminal.section('environment', inventory.splitlines(), 55)
     results = []
     for cores, jettys, non_pin in cases:
         name = f'c{cores}-j{jettys}-nonpin{non_pin}'
         case_env = env | {'KVAF_DIAG_CORES': str(cores), 'KVAF_DIAG_JETTYS': str(jettys),
                           'KVAF_DIAG_PUT_NON_PIN': str(non_pin)}
-        print(f'DIAG_RUN case={name} log={output / (name + ".log")}', flush=True)
+        terminal.emit(f'DIAG_RUN case={name}')
         code, timed_out = run_case([sys.executable, str(ROOT / 'tests/python/diagnose_remote_cpu_case.py')],
                                   case_env, output / (name + '.log'), args.timeout)
         content = (output / (name + '.log')).read_text(errors='replace')
@@ -122,14 +183,26 @@ def main():
         results.append({'case': name, 'exit': code, 'timeout': timed_out,
                         'instrumentation': instrumentation, 'cleanup': cleanup})
         (output / 'summary.json').write_text(json.dumps(results, indent=2))
-        print(f'DIAG_RESULT {results[-1]}', flush=True)
+        terminal.emit(f'DIAG_RESULT {results[-1]}')
+        print_case_report(terminal, name, content)
         if timed_out or not cleanup or not instrumentation:
-            print('DIAG_STOP: incomplete cleanup or missing rebuilt instrumentation; inspect logs before rerunning.', flush=True)
+            terminal.emit('DIAG_STOP: incomplete cleanup or missing rebuilt instrumentation; inspect evidence before rerunning.')
             break
-    (output / 'dmesg-after.txt').write_text(capture(['dmesg', '--ctime']))
-    print(f'DIAG_OUTPUT {output}', flush=True)
+    after = capture(['dmesg', '--ctime'])
+    (output / 'dmesg-after.txt').write_text(after)
+    delta = kernel_delta(before, after)
+    terminal.section('new kernel fault messages', delta or ['No new matching messages; check dmesg access below.'], 60)
+    terminal.section('dmesg access', after.splitlines()[:4], 4)
+    terminal.emit('DIAG_SUMMARY ' + json.dumps(results))
+    terminal.emit(f'DIAG_LOCAL_ARCHIVE {output} (optional; terminal evidence above is ready to paste)')
+    terminal.emit('DIAG_REPORT_END')
     return 0 if len(results) == len(cases) and all(r['exit'] == 0 and r['instrumentation'] and r['cleanup'] for r in results) else 1
 
 
 if __name__ == '__main__':
-    raise SystemExit(main())
+    terminal = TerminalReport()
+    try:
+        raise SystemExit(main(terminal))
+    except Exception:
+        terminal.emit(traceback.format_exc())
+        raise SystemExit(1)
