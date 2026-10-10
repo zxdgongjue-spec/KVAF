@@ -107,8 +107,11 @@ void TestInvalid() {
   assert(KvafAicpuUrmaSqCopyVerify(&valid) == 0U);
   buffers.sq[queue.offset + 8U] ^= 1U;
   verify_counter = 0U;
-  assert(KvafAicpuUrmaSqCopyVerify(&valid) == 1U && status.result == 2U);
+  assert(KvafAicpuUrmaSqCopyVerify(&valid) == 0U && status.result == 2U);
   assert(status.mismatch_offset == queue.offset + 8U && status.actual != status.expected);
+  status.worker = 1U;
+  verify_counter = 0U;
+  assert(KvafAicpuUrmaSqCopyVerify(&valid) == 0U && status.result == 3U);
   auto invalid = valid;
   invalid.workers = 9U;
   assert(KvafAicpuUrmaSqCopyBenchmark(&invalid) == 1U);
@@ -142,7 +145,7 @@ void TestInvalid() {
     auto& destination = target == 3U ? buffers.sq : buffers.hbm;
     destination[8U] ^= 1U;
     verify_counter = 0U;
-    assert(KvafAicpuUrmaSqCopyVerify(&valid) == 1U && status.result == 2U);
+    assert(KvafAicpuUrmaSqCopyVerify(&valid) == 0U && status.result == 2U);
     assert(status.mismatch_offset == 8U && status.actual != status.expected);
   }
 }

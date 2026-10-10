@@ -89,7 +89,7 @@ int32_t LaunchGatherRead(const GatherReadArgs* arguments, aclrtStream stream) {
                 sizeof(*arguments), stream, arguments->worker_count);
 }
 
-int32_t LaunchSqCopyBenchmark(const SqCopyBenchmarkArgs* arguments, aclrtStream stream) {
+int32_t LaunchSqCopy(const SqCopyBenchmarkArgs* arguments, aclrtStream stream) {
   if (arguments == nullptr) return -1;
   {
     std::lock_guard<std::mutex> lock(kernel_mutex);
@@ -100,8 +100,12 @@ int32_t LaunchSqCopyBenchmark(const SqCopyBenchmarkArgs* arguments, aclrtStream 
       return -1;
     }
   }
-  if (Launch(sq_copy_function, const_cast<SqCopyBenchmarkArgs*>(arguments),
-             sizeof(*arguments), stream, arguments->workers) != 0) return -1;
+  return Launch(sq_copy_function, const_cast<SqCopyBenchmarkArgs*>(arguments),
+                sizeof(*arguments), stream, arguments->workers);
+}
+
+int32_t LaunchSqCopyBenchmark(const SqCopyBenchmarkArgs* arguments, aclrtStream stream) {
+  if (LaunchSqCopy(arguments, stream) != 0) return -1;
   const auto result = LaunchSqCopyVerify(arguments, stream);
   if (result != 0) (void)aclrtSynchronizeStream(stream);
   return result;

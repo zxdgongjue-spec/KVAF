@@ -113,7 +113,7 @@ std::uint32_t KvafAicpuUrmaSqCopyVerify(kvaf::aicpu_urma::SqCopyBenchmarkArgs* a
       queue.capacity > kSqCopyBenchmarkQueueBytes || queue.offset > queue.capacity ||
       queue.bytes > queue.capacity - queue.offset || destination > UINT64_MAX - queue.capacity) {
     status.result = 3U;
-    return 1U;
+    return 0U;
   }
   const auto chunk_bytes = args->batch_wqes * kMaxScatterWqebbs * kWqeBytes;
   const auto* output = reinterpret_cast<const std::uint8_t*>(destination + queue.offset);
@@ -130,7 +130,7 @@ std::uint32_t KvafAicpuUrmaSqCopyVerify(kvaf::aicpu_urma::SqCopyBenchmarkArgs* a
       status.mismatch_offset = queue.offset + offset;
       status.expected = expected;
       status.actual = actual;
-      return 1U;
+      return 0U;
     }
   }
   status.result = 0U;

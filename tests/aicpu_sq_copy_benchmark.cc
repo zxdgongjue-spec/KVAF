@@ -126,6 +126,41 @@ struct DeviceBuffer {
   std::size_t bytes;
 };
 
+void SynchronizeCase(aclrtStream stream, const DeviceBuffer& status_buffer,
+                     const benchmark::SqCopyBenchmarkArgs& args, bool aiv,
+                     const char* stage) {
+  const auto result = aclrtSynchronizeStream(stream);
+  if (result == ACL_SUCCESS) return;
+  const char* recent = aclGetRecentErrMsg();
+  std::fprintf(stderr,
+      "SQ_COPY_STREAM_FAIL engine=%s source=%s target=%s stage=%s round=%llu acl=%d acl_error=%s\n",
+      aiv ? "aiv" : "aicpu", args.target_sq >= 2U ? "hbm" : (aiv ? "ub" : "stack"),
+      (args.target_sq & 1U) != 0U ? "sq" : "hbm", stage,
+      static_cast<unsigned long long>(args.round), static_cast<int>(result),
+      recent == nullptr ? "<no recent ACL error>" : recent);
+  std::vector<benchmark::SqCopyBenchmarkStatus> statuses(args.workers);
+  const auto readback = aclrtMemcpy(statuses.data(), statuses.size() * sizeof(statuses.front()),
+      status_buffer.data, statuses.size() * sizeof(statuses.front()), ACL_MEMCPY_DEVICE_TO_HOST);
+  if (readback == ACL_SUCCESS) {
+    for (std::uint32_t worker = 0U; worker < args.workers; ++worker) {
+      const auto& status = statuses[worker];
+      std::fprintf(stderr,
+          "SQ_COPY_ERROR_STATUS slot=%u magic=0x%llx result=%llu worker=%llu round=%llu bytes=%llu "
+          "copy_begin=%llu copy_end=%llu mismatch_offset=%llu expected=0x%llx actual=0x%llx\n",
+          worker, static_cast<unsigned long long>(status.magic),
+          static_cast<unsigned long long>(status.result), static_cast<unsigned long long>(status.worker),
+          static_cast<unsigned long long>(status.round), static_cast<unsigned long long>(status.bytes),
+          static_cast<unsigned long long>(status.copy_begin_ns),
+          static_cast<unsigned long long>(status.copy_end_ns),
+          static_cast<unsigned long long>(status.mismatch_offset),
+          static_cast<unsigned long long>(status.expected), static_cast<unsigned long long>(status.actual));
+    }
+  } else {
+    std::fprintf(stderr, "SQ_COPY_ERROR_STATUS readback_acl=%d\n", static_cast<int>(readback));
+  }
+  throw std::runtime_error(std::string("SQ copy ") + stage + " failed acl=" + std::to_string(result));
+}
+
 struct DedicatedQueues {
   ~DedicatedQueues() {
     hccp::ReleaseDeviceAivTransport({&api, session, context, token, nullptr,
@@ -303,7 +338,7 @@ int Run(const Options& options) {
       0U, options.workers, options.batch_wqes, 0U, options.copy_mode,
       reinterpret_cast<std::uint64_t>(counter_buffer.data) + sizeof(std::uint64_t)};
   const auto aiv_ns_per_tick = CalibrateAivClock(args, status_buffer, acl.stream);
-  const auto rounds = static_cast<std::uint64_t>(options.warmup) + options.iterations;
+  const auto rounds = 1U + static_cast<std::uint64_t>(options.warmup) + options.iterations;
   for (std::uint64_t round = 0U; round < rounds; ++round) {
     for (std::uint32_t worker = 0U; worker < options.workers; ++worker) {
       const auto& queue = queues[worker];
@@ -325,16 +360,26 @@ int Run(const Options& options) {
       Acl(aclrtMemset(counter_buffer.data, counter_buffer.bytes, 0, counter_buffer.bytes), "reset counter");
       Acl(aclrtMemset(status_buffer.data, status_buffer.bytes, 0, status_buffer.bytes), "reset status");
       const auto host_begin = std::chrono::steady_clock::now();
-      if (aiv) {
-        Require(kvaf::aiv_sq_copy::LaunchCopy(&args, acl.stream) == 0, "launch AIV SQ copy benchmark");
-        if (benchmark::LaunchSqCopyVerify(&args, acl.stream) != 0) {
-          (void)aclrtSynchronizeStream(acl.stream);
-          throw std::runtime_error("launch AIV copy data verification");
-        }
-      } else {
-        Require(benchmark::LaunchSqCopyBenchmark(&args, acl.stream) == 0, "launch AICPU SQ copy benchmark");
+      if (round == 0U) {
+        std::fprintf(stdout, "SQ_COPY_PREFLIGHT engine=%s source=%s target=%s stage=copy\n",
+            aiv ? "aiv" : "aicpu", target >= 2U ? "hbm" : (aiv ? "ub" : "stack"),
+            (target & 1U) != 0U ? "sq" : "hbm");
+        std::fflush(stdout);
       }
-      Acl(aclrtSynchronizeStream(acl.stream), "synchronize SQ copy benchmark");
+      Require((aiv ? kvaf::aiv_sq_copy::LaunchCopy(&args, acl.stream)
+                   : benchmark::LaunchSqCopy(&args, acl.stream)) == 0, "launch SQ copy benchmark");
+      if (round == 0U) {
+        SynchronizeCase(acl.stream, status_buffer, args, aiv, "copy");
+        std::fprintf(stdout, "SQ_COPY_PREFLIGHT engine=%s source=%s target=%s stage=verify\n",
+            aiv ? "aiv" : "aicpu", target >= 2U ? "hbm" : (aiv ? "ub" : "stack"),
+            (target & 1U) != 0U ? "sq" : "hbm");
+        std::fflush(stdout);
+      }
+      if (benchmark::LaunchSqCopyVerify(&args, acl.stream) != 0) {
+        SynchronizeCase(acl.stream, status_buffer, args, aiv, "copy/verify-launch");
+        throw std::runtime_error("launch copy data verification");
+      }
+      SynchronizeCase(acl.stream, status_buffer, args, aiv, round == 0U ? "verify" : "copy+verify");
       const auto host_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now() - host_begin).count();
       status_buffer.Download(statuses.data(), statuses.size() * sizeof(statuses.front()));
@@ -357,7 +402,13 @@ int Run(const Options& options) {
         first = std::min(first, status.copy_begin_ns);
         last = std::max(last, status.copy_end_ns);
       }
-      if (round < options.warmup) continue;
+      if (round == 0U) {
+        std::fprintf(stdout, "SQ_COPY_PREFLIGHT engine=%s source=%s target=%s PASS\n",
+            aiv ? "aiv" : "aicpu", target >= 2U ? "hbm" : (aiv ? "ub" : "stack"),
+            (target & 1U) != 0U ? "sq" : "hbm");
+        std::fflush(stdout);
+      }
+      if (round <= options.warmup) continue;
       auto& sample = samples[case_index];
       sample.wall_ms.push_back(static_cast<double>(last - first) * time_scale / 1000000.0);
       sample.host_ns += host_ns;

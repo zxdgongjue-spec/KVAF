@@ -64,7 +64,7 @@ void TestCopy(std::uint32_t workers, std::uint32_t batch) {
       auto& destination = (target & 1U) != 0U ? buffers[0].sq : buffers[0].hbm;
       destination[queues[0].offset + 8U] ^= 1U;
       verify_counter = 0U;
-      assert(KvafAicpuUrmaSqCopyVerify(&args) == 1U && statuses[0].result == 2U);
+      assert(KvafAicpuUrmaSqCopyVerify(&args) == 0U && statuses[0].result == 2U);
     }
   }
 }

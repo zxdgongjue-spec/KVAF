@@ -14,6 +14,7 @@ bool Load(const char* json_path);
 int32_t LaunchPut(const KvafExecuteBatchPutLaunchArgs* arguments, aclrtStream stream);
 int32_t LaunchGet(const KvafExecuteBatchGetKernelArgs* arguments, aclrtStream stream);
 int32_t LaunchGatherRead(const GatherReadArgs* arguments, aclrtStream stream);
+int32_t LaunchSqCopy(const SqCopyBenchmarkArgs* arguments, aclrtStream stream);
 int32_t LaunchSqCopyBenchmark(const SqCopyBenchmarkArgs* arguments, aclrtStream stream);
 int32_t LaunchSqCopyVerify(const SqCopyBenchmarkArgs* arguments, aclrtStream stream);
 

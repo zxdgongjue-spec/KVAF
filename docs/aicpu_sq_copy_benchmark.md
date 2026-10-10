@@ -10,6 +10,10 @@ HBM 目标使用 `ACL_MEM_MALLOC_HUGE_FIRST`。每轮总拷贝量固定为 128 K
 
 每轮轮换八个测试的执行顺序，减少顺序偏差。栈/UB 源缓冲区在每次 kernel 内生成，HBM 源数据由 Host 提前上传，数据随轮次和 worker 改变。AICPU 显式 `dsb sy` 已删除，不增加缓存行刷新，其计时截至拷贝函数返回；AIV 计时包含 MTE3 完成等待。所有 worker 拷贝结束后，再由同一 stream 上的独立 AICPU 校验 kernel 逐 32-bit 字检查目标全部数据，避免校验读取干扰仍在计时的 worker。失败时打印首个不匹配位置，包含 warmup 在内全部正确才打印 PASS。验证 SQ 内存不代表验证网络传输，因为本基准不提交网络操作。
 
+warmup 前额外执行一轮检查，不计入性能统计。每条路径打印 `SQ_COPY_PREFLIGHT`，分别同步拷贝 kernel 和校验 kernel，确认二者都成功后打印该路径的 PASS。正式 warmup 和测量轮次保持一次同步，不增加计时区间内的等待。校验 kernel 将数据不匹配和状态错误写入 `result=2/3` 后正常返回，由 Host 报失败；不再因这类可报告的错误提前中断 stream 并遮住不匹配信息。
+
+若同步失败，`SQ_COPY_STREAM_FAIL` 打印引擎、源、目标、阶段、轮次、ACL 错误码和立即获取的 `aclGetRecentErrMsg()`，随后尝试读回每个 worker 的状态。`507018` 对应 AICPU 执行异常，单独这个错误码不能证明 AIV 搬运失败，也不能区分校验失败、共享库加载失败或处理器异常。特别是 AIV 写入后仍由 AICPU 校验，两者的缓存可见性需要设备结果确认；本测试不通过新增缓存刷新掩盖这个问题。
+
 ## 执行
 
 不需要 CPU service。在 NPU 机器的仓库根目录执行：
