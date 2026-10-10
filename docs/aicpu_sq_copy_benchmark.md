@@ -1,12 +1,12 @@
 # AICPU SQ 拷贝独立基准
 
-本基准从 worker 栈上与 GatherRead 同样大小的 WQE 编码缓冲区，使用同一个 `CopySqWqebbs` 函数，比较写普通 HBM 和写 HCCP/驱动 SQ 的耗时。它创建独占的 USER_CTL SQ/CQ，使用与 GatherRead 相同的深度和创建方式，不连接远端、不写 doorbell、不产生网络 READ 或 CQE。
+本基准从 worker 栈上与 GatherRead 同样大小的 WQE 编码缓冲区，使用同一个 `CopySqWqebbs` 函数，比较写普通 HBM 和写 HCCP/驱动 SQ 的耗时。设备端统一调用 securec 的 `memcpy_sp`，手写 ARM 拷贝路径已删除。它创建独占的 USER_CTL SQ/CQ，使用与 GatherRead 相同的深度和创建方式，不连接远端、不写 doorbell、不产生网络 READ 或 CQE。
 
 同一次运行还测试 **HBM → HBM** 和 **HBM → SQ**：HBM 源和 HBM 目标来自两个独立的 `aclrtMalloc` 分配，均使用 `ACL_MEM_MALLOC_HUGE_FIRST`；SQ 仍由驱动分配。AICPU 从源 HBM 顺序读取，每条路径内每个源字节只拷贝一次，使用相同拷贝函数、总字节数和批次大小。Host 每轮提前上传源数据，不计入拷贝耗时；AICPU 不额外初始化或预热源 HBM。两条 HBM 源路径共用源缓冲，前一次读取可能影响后一次读取的缓存状态，因此结果不是严格冷缓存测量。这是 AICPU 执行内存拷贝，不是 `aclrtMemcpy` 或 SDMA 执行的拷贝。
 
 HBM 目标使用 `ACL_MEM_MALLOC_HUGE_FIRST`。每轮总拷贝量固定为 128 KiB，在 workers 间按 64 B 分配；1 worker 和 5 workers 的总字节数相同。默认每次拷贝 1536 B，相当于 8 个 6-SGE WQE，尾块按实际字节数拷贝。目标地址逐轮推进，在队列容量内循环，避免一直写同一个小槽位。
 
-每轮轮换四个测试的执行顺序，减少顺序偏差。栈源缓冲区在每次 kernel 内生成，HBM 源数据由 Host 提前上传，数据随轮次和 worker 改变。拷贝结束使用 `dsb sy`；不增加缓存行刷新。所有 worker 拷贝结束后，再由同一 stream 上的独立校验 kernel 逐 32-bit 字检查目标全部数据，避免校验读取干扰仍在计时的 worker。失败时打印首个不匹配位置，包含 warmup 在内全部正确才打印 PASS。验证 SQ 内存不代表验证网络传输，因为本基准不提交网络操作。
+每轮轮换四个测试的执行顺序，减少顺序偏差。栈源缓冲区在每次 kernel 内生成，HBM 源数据由 Host 提前上传，数据随轮次和 worker 改变。显式 `dsb sy` 已删除，不增加缓存行刷新。计时截至拷贝函数返回，不等价于硬件完成全部写入的时间。所有 worker 拷贝结束后，再由同一 stream 上的独立校验 kernel 逐 32-bit 字检查目标全部数据，避免校验读取干扰仍在计时的 worker。失败时打印首个不匹配位置，包含 warmup 在内全部正确才打印 PASS。验证 SQ 内存不代表验证网络传输，因为本基准不提交网络操作。
 
 ## 执行
 
@@ -21,7 +21,7 @@ for cores in 1 5; do
     --aicpu-cores "$cores" \
     --bytes 131072 \
     --sq-batch-wqes 8 \
-    --sq-copy memcpy \
+    --sq-copy memcpy_sp \
     --warmup 10 \
     --iterations 1000
 done
@@ -35,8 +35,8 @@ done
 
 | 数据 | 区间 |
 | --- | --- |
-| Copy wall / mean_us | 首个 worker 开始拷贝至最后一个 worker 结束拷贝，包含启动时间差和结尾 DSB；晚开始 worker 的准备时间可能体现在启动差中。不含第二个 kernel 的数据校验或 Host 操作 |
-| worker copy_us | 单 worker 全部 memcpy 加结尾 DSB 的平均耗时，不含自身源初始化和数据校验 |
+| Copy wall / mean_us | 首个 worker 开始拷贝至最后一个 worker 的拷贝函数返回，包含启动时间差；晚开始 worker 的准备时间可能体现在启动差中。不含硬件屏障、第二个 kernel 的数据校验或 Host 操作 |
+| worker copy_us | 单 worker 全部 memcpy_sp 调用的平均耗时，不含自身源初始化、硬件屏障和数据校验 |
 | worker start_us | 相对本轮最早开始拷贝的 worker 的平均时间差 |
 | thread_cpu_us | 包围拷贝区间的线程 CPU 时间；内存访问停顿仍计入 CPU 时间 |
 | offcpu_estimate_us | `max(0, copy wall - thread CPU)`，只用于估计调度暂停，不能理解为内存访问延迟 |
@@ -58,4 +58,4 @@ CANN_OBJDUMP="${CANN_CXX%g++}objdump"
   > /tmp/kvaf_sq_copy_benchmark.asm
 ```
 
-默认 memcpy 分支可能调用外部 libc 的 memcpy；此时 `.so` 中只能看到调用指令，还需要确认运行时 libc 的实际实现。不能仅凭这个 `.so` 的反汇编断言 memcpy 使用了某种 SIMD 指令，也不能仅凭 SQ 的虚拟地址判断物理内存位置或缓存属性。
+`memcpy_sp` 是 securec 宏，实际展开可能调用 securec 优化函数或其他拷贝实现，需要结合设备头文件和链接的 securec 库确认，不能假定它等同于标准 `memcpy`。不能仅凭 kernel `.so` 的反汇编断言使用了某种 SIMD 指令，也不能仅凭 SQ 的虚拟地址判断物理内存位置或缓存属性。旧参数 `--sq-copy memcpy` 仍可用，日志统一显示 `sq_copy=memcpy_sp`。

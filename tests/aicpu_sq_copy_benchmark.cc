@@ -34,9 +34,9 @@ struct Options {
 void Usage(const char* program) {
   std::fprintf(stderr,
       "Usage: %s [--device-id N] [--aicpu-cores N(1..8)] [--bytes N(multiple of 64)] "
-      "[--sq-batch-wqes 8|16|32|64] [--sq-copy memcpy|paired] "
+      "[--sq-batch-wqes 8|16|32|64] [--sq-copy memcpy_sp] "
       "[--eid-list-index N] [--kernel-json PATH] [--warmup N] [--iterations N]\n"
-      "Defaults: aicpu-cores=5 bytes=131072 sq-batch-wqes=8 sq-copy=memcpy warmup=10 iterations=1000.\n"
+      "Defaults: aicpu-cores=5 bytes=131072 sq-batch-wqes=8 sq-copy=memcpy_sp warmup=10 iterations=1000.\n"
       "Compares stack/HBM -> HBM/driver SQ; no peer or doorbell.\n", program);
 }
 
@@ -47,8 +47,8 @@ bool Parse(int argc, char** argv, Options* options) {
     const char* value = argv[index + 1];
     if (flag == "--kernel-json") options->kernel_json = value;
     else if (flag == "--sq-copy") {
-      if (std::strcmp(value, "memcpy") == 0) options->copy_mode = kvaf::GatherSqCopyMode::kMemcpy;
-      else if (std::strcmp(value, "paired") == 0) options->copy_mode = kvaf::GatherSqCopyMode::kPaired;
+      if (std::strcmp(value, "memcpy_sp") == 0 || std::strcmp(value, "memcpy") == 0)
+        options->copy_mode = kvaf::GatherSqCopyMode::kMemcpySp;
       else return false;
     } else {
       std::uint64_t number = 0U;
@@ -204,9 +204,9 @@ void Print(const Options& options, const Samples& samples, const char* source, c
       stats.min_ms * 1000.0, stats.p50_ms * 1000.0, stats.p95_ms * 1000.0,
       stats.p99_ms * 1000.0, stats.max_ms * 1000.0, stats.mean_ms * 1000.0, stats.mean_gbps);
   std::fprintf(stdout,
-      "  Copy wall: first worker copy start to last worker copy end; includes final DSB and start spread.\n"
+      "  Copy wall: first worker copy start to last worker copy return; includes start spread; no DSB.\n"
       "  Host launch + sync mean: %.3f us (includes untimed source preparation and data verification).\n"
-      "  Per-worker averages (us): start offset | copy including DSB | thread CPU | estimated off-CPU.\n",
+      "  Per-worker averages (us): start offset | memcpy_sp calls | thread CPU | estimated off-CPU.\n",
       samples.host_ns / options.iterations / 1000.0);
   for (std::uint32_t worker = 0U; worker < options.workers; ++worker) {
     std::fprintf(stdout, "  worker=%u bytes=%llu start_us=%.3f copy_us=%.3f ", worker,
@@ -321,7 +321,7 @@ int Run(const Options& options) {
   std::fprintf(stdout, "SQ_COPY_BENCHMARK_PASS workers=%u total_bytes=%llu sq_copy=%s "
       "warmup=%u iterations=%u no_doorbell=1\n", options.workers,
       static_cast<unsigned long long>(options.bytes),
-      options.copy_mode == kvaf::GatherSqCopyMode::kMemcpy ? "memcpy" : "paired",
+      "memcpy_sp",
       options.warmup, options.iterations);
   return 0;
 }

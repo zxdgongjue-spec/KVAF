@@ -880,14 +880,12 @@ int main() {
   TestParallelScatter(5U, 41U, true, 8U, 0U, false, true);
   TestParallelScatter(5U, 41U, true, 8U, 10U, false, true);
   TestParallelScatter(8U, 41U, true, 8U, 1U, false, true);
-  TestScatterStagingBoundary(8U, 384U, 6U, true, 193U, kvaf::GatherSqCopyMode::kPaired);
-  TestScatterStagingBoundary(64U, 384U, 6U, true, 256U, kvaf::GatherSqCopyMode::kPaired);
-  TestParallelScatter(5U, 41U, true, 8U, 0U, false, true, kvaf::GatherSqCopyMode::kPaired);
-  TestParallelScatter(5U, 41U, true, 8U, 10U, false, true, kvaf::GatherSqCopyMode::kPaired);
+  TestScatterStagingBoundary(8U, 384U, 6U, true, 193U, kvaf::GatherSqCopyMode::kMemcpySp);
+  TestScatterStagingBoundary(64U, 384U, 6U, true, 256U, kvaf::GatherSqCopyMode::kMemcpySp);
   TestParallelScatter(5U, 41U, true, 8U, 6U, false, true,
                       kvaf::GatherSqCopyMode::kMemcpy, 64U);
   TestParallelScatter(8U, 41U, false, 16U, 1U, false, false,
-                      kvaf::GatherSqCopyMode::kPaired, 64U);
+                      kvaf::GatherSqCopyMode::kMemcpySp, 64U);
   TestParallelScatter(5U, 3U, true, 8U, 1U, false, true,
                       kvaf::GatherSqCopyMode::kMemcpy, 128U);
   std::cout << "AICPU gather/read kernel simulation: PASS\n";

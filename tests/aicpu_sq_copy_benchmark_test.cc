@@ -151,9 +151,8 @@ void TestInvalid() {
 
 int main() {
   TestInvalid();
-  for (const auto mode : {kvaf::GatherSqCopyMode::kMemcpy, kvaf::GatherSqCopyMode::kPaired}) {
-    for (const auto workers : {1U, 5U, 8U}) {
-      for (const auto batch : {8U, 16U, 32U, 64U}) TestCopy(workers, batch, mode);
-    }
+  for (const auto workers : {1U, 5U, 8U}) {
+    for (const auto batch : {8U, 16U, 32U, 64U})
+      TestCopy(workers, batch, kvaf::GatherSqCopyMode::kMemcpySp);
   }
 }

@@ -8,12 +8,12 @@ namespace kvaf {
 constexpr std::uint32_t kGatherMaxSglSize = 6U;
 
 enum class GatherSqCopyMode : std::uint32_t {
-  kMemcpy = 0U,
-  kPaired = 1U,
+  kMemcpySp = 0U,
+  kMemcpy = kMemcpySp,
 };
 
 inline bool ValidGatherSqCopyMode(GatherSqCopyMode mode) {
-  return mode == GatherSqCopyMode::kMemcpy || mode == GatherSqCopyMode::kPaired;
+  return mode == GatherSqCopyMode::kMemcpySp;
 }
 
 struct GatherOutputSpan {

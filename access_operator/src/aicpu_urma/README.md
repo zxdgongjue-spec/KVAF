@@ -234,9 +234,9 @@ GatherRead 的 READ WQE 默认先在 AICPU 本地以最多 24 个 WQEBB 为一�
 编码时覆盖有效字段，仅清零尾部 padding，不再先把整个 WQE 清零。
 SGL 规划直接覆盖有效条目，顺便累计 WQEBB 数量；提交时不再重复扫描 SGL。
 SQ slot 和 owner 在批次内递增，到环尾时翻转 owner，避免逐 WQE 的除法。
-AArch64 SQ 写入按 64 B 使用通用寄存器 LDP/STP，不调用通用 memcpy；
+设备端 SQ 写入统一使用 CANN securec 的 `memcpy_sp`，不再使用手写 ARM 拷贝；
 本地编码缓冲区按 64 B 对齐。每个 WQEBB 仍完整写入，包括保留字段和 padding，
-仍在门铃之前执行屏障。仅 CQ 保持缓存行维护。
+设备端显式 `dsb sy` 已删除，仅保留编译器屏障。仅 CQ 保持缓存行维护。
 固定头准备计入任务初始化，整体效果以 READ 墙钟耗时评估。
 本地 WQE 编码空间最大 12 KiB，另有原来的 SGL 规划数组，不使用设备堆分配。
 较大粒度可能减少连续写入段数，实际收益须在设备验证；默认不自动切换。

@@ -1,30 +1,28 @@
-# GatherRead SQ 写入对照
+# GatherRead SQ 写入
 
-客户端增加 `--sq-copy memcpy|paired`，默认 `memcpy`。该参数仅控制 AICPU READ WQE 从 worker 编码缓冲区写入 SQ 的方式。
+设备端 SQ 写入统一调用 CANN securec 的 `memcpy_sp`，不再使用手写 ARM `LDP/STP` 拷贝。默认参数为 `--sq-copy memcpy_sp`。旧的 `--sq-copy memcpy` 和值为 0 的 API 字段继续兼容，实际调用 `memcpy_sp`；`paired` 已删除。
 
-- `memcpy`：每个连续 SQ 区间调用一次 `std::memcpy`，例如 8 条完整的 6-SGE WQE，一次复制 1536 B。
-- `paired`：保留原有手写 ARM `LDP/STP`，每次循环复制 64 B；非 AArch64 本地仿真使用原来的逐 64 B `memcpy`。
+每个连续 SQ 区间调用一次 `memcpy_sp`，例如 8 条完整的 6-SGE WQE，一次复制 1536 B。拷贝失败会返回错误，不继续敲门铃。
 
-跨 SQ 环尾仍分成两个连续区间。两种方式沿用相同的模板、任务分配、WQE 编码、producer/owner 维护、doorbell、屏障和 CQ 轮询；不会清理 SQ 缓存行。模式选择发生在连续区间复制处，不在逐 WQEBB 循环内。
+跨 SQ 环尾仍分成两个连续区间。模板、任务分配、WQE 编码、producer/owner 维护、doorbell 和 CQ 轮询沿用原实现。设备 kernel 中的显式 `dsb sy` 已移除，只保留不生成硬件屏障指令的编译器屏障；CQ 缓存行刷新仍保留。
 
-HCOMM 普通 AICPU 路径调用 `memcpy_sp` 写入 SQ，本次对照使用标准 `memcpy`，未引入 HCOMM/securec 链接依赖；不能假设这两个复制函数底层实现完全相同。
+设备构建使用 CANN 的 `securec.h` 和 AArch64 securec 共享库。构建系统检查共享库为 AArch64 ELF，链接时检查未解析符号，并把依赖库随 kernel 一起打包，通过 `$ORIGIN` 查找。若 CANN 的目录布局不同，可用 CMake 的 `KVAF_AICPU_SECUREC_INCLUDE_DIR` 和 `KVAF_AICPU_SECUREC_LIBRARY` 指定设备头文件和共享库位置。本地仿真使用标准内存拷贝，只检查功能，不测量设备 securec 性能。
 
-`GatherReadArgs` 扩展为 144 B。测试前需要同时重编客户端并安装新版 AICPU kernel，使用 `./build.sh aicpu-urma --install-kernel` 完成。
+需要同时重编客户端并安装新版 AICPU kernel，使用 `./build.sh aicpu-urma --install-kernel` 完成。
 
 CPU service 保持原配置运行于 `127.0.0.1:28990` 时，在 KVAF 目录执行：
 
 ```bash
 ./build.sh aicpu-urma --install-kernel
 
-for mode in paired memcpy; do
-  ./build-aicpu-urma/tests/kvaf_aicpu_gather_read_client \
+./build-aicpu-urma/tests/kvaf_aicpu_gather_read_client \
     --peer 127.0.0.1:28990 --device-id 6 \
     --blocks 4096 --block-bytes 656 --output-stride 1312 \
     --sgl-size 6 --aicpu-cores 5 --sq-batch-wqes 8 \
     --read-schedule dynamic --read-task-spans 192 \
     --descriptor-transport urma --profile-detail 1 \
-    --sq-copy "$mode" --warmup 10 --iterations 1000
-done
+    --sq-copy memcpy_sp --pipeline-chunk-bytes 131072 \
+    --warmup 10 --iterations 1000
 ```
 
-末尾 `AICPU_GATHER_READ_PASS` 打印 `sq_copy` 标识结果。对比 `Write SQ`、完整 `AICPU READ staging -> HBM` 和总调用耗时；`Write SQ` 的计时边界沿用原来区间，包含全部连续区间复制，不包含门铃和 CQ 等待。两种方式都必须通过数据正确性验证。默认选择只是对照实验入口，实际性能仍需设备实测后确定。
+末尾 `AICPU_GATHER_READ_PASS` 打印 `sq_copy=memcpy_sp`。比较 `Write SQ`、完整 `AICPU READ staging -> HBM` 和总调用耗时。`Write SQ` 包含全部连续区间复制，不包含门铃和 CQ 等待。设备性能和去掉屏障后的数据正确性需在 NPU 上实测确认。

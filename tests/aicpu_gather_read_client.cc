@@ -45,12 +45,12 @@ void Usage(const char* program) {
                "Usage: %s [--peer HOST:PORT] [--device-id N] [--kernel-json PATH] "
                "[--blocks N] [--block-bytes N] [--output-stride N] [--sgl-size N] "
                "[--warmup N] [--iterations N] [--aicpu-cores N(1..8)] [--descriptor-transport urma|rpc] "
-               "[--sq-batch-wqes 8|16|32|64] [--sq-copy memcpy|paired] [--profile-detail 0|1]\n"
+               "[--sq-batch-wqes 8|16|32|64] [--sq-copy memcpy_sp] [--profile-detail 0|1]\n"
                "[--read-schedule static|dynamic] [--read-task-spans N(1..65536)] "
                "[--pipeline-chunk-bytes N(0=off; multiple of 64)]\n"
                "Defaults: descriptor-transport=urma, output-stride=2*block-bytes, sgl-size=%u "
                "(positive; each READ WQE uses at most %u SGE), sq-batch-wqes=8, "
-               "read-schedule=dynamic, read-task-spans=192, sq-copy=memcpy, pipeline-chunk-bytes=0\n"
+               "read-schedule=dynamic, read-task-spans=192, sq-copy=memcpy_sp, pipeline-chunk-bytes=0\n"
                "profile-detail=0 disables per-SQ-group timing; READ wall timing stays enabled.\n",
                program, kvaf::kGatherMaxSglSize, kvaf::kGatherMaxSglSize);
 }
@@ -64,8 +64,8 @@ bool Parse(int argc, char** argv, Options* options) {
     if (flag == "--peer") parsed.peer = value;
     else if (flag == "--kernel-json") parsed.kernel_json = value;
     else if (flag == "--sq-copy") {
-      if (std::strcmp(value, "memcpy") == 0) parsed.sq_copy_mode = kvaf::GatherSqCopyMode::kMemcpy;
-      else if (std::strcmp(value, "paired") == 0) parsed.sq_copy_mode = kvaf::GatherSqCopyMode::kPaired;
+      if (std::strcmp(value, "memcpy_sp") == 0 || std::strcmp(value, "memcpy") == 0)
+        parsed.sq_copy_mode = kvaf::GatherSqCopyMode::kMemcpySp;
       else return false;
     }
     else if (flag == "--read-schedule") {
@@ -355,7 +355,7 @@ int Run(const Options& options) {
                options.aicpu_cores,
                options.urma_descriptors ? "urma" : "rpc",
                options.sq_batch_wqes,
-               options.sq_copy_mode == kvaf::GatherSqCopyMode::kMemcpy ? "memcpy" : "paired",
+               "memcpy_sp",
                options.profile_detail ? 1U : 0U,
                options.dynamic_read ? "dynamic" : "static",
                options.dynamic_read ? options.read_task_spans : 0U,

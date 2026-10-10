@@ -9,9 +9,7 @@
 #include <cstring>
 #include <chrono>
 #include <algorithm>
-#if defined(KVAF_AICPU_URMA_HOST_TEST)
 #include <atomic>
-#endif
 
 #if !defined(__aarch64__) && !defined(KVAF_AICPU_URMA_HOST_TEST)
 #error "The AICPU URMA kernel must be compiled for aarch64"
@@ -33,11 +31,7 @@ std::uint64_t NowNs() {
 }
 
 void Barrier() {
-#if defined(KVAF_AICPU_URMA_HOST_TEST)
-  std::atomic_thread_fence(std::memory_order_seq_cst);
-#else
-  asm volatile("dsb sy" ::: "memory");
-#endif
+  std::atomic_signal_fence(std::memory_order_seq_cst);
 }
 
 void FlushLines(const void* address, std::uint64_t bytes) {
@@ -154,7 +148,7 @@ std::uint32_t Submit(const Entity& entity, Queue& queue,
     if (last_wqe_protocol != nullptr && index + 1U == count)
       *last_wqe_protocol = words[0];
     auto* destination = reinterpret_cast<void*>(entity.sq_va + slot * 64U);
-    std::memcpy(destination, words, sizeof(words));
+    if (!kvaf::aicpu_urma::CopySqBytes(destination, words, sizeof(words))) return 2U;
     if (maintain_sq_cache) Flush(destination, sizeof(words));
   }
   queue.sq_producer_index += count;
@@ -188,7 +182,7 @@ std::uint32_t SubmitNotify(const Entity& entity, Queue& queue,
   for (std::uint32_t block = 0U; block < 2U; ++block) {
     const auto slot = (queue.sq_producer_index + block) % entity.sq_depth;
     auto* destination = reinterpret_cast<void*>(entity.sq_va + slot * 64U);
-    std::memcpy(destination, &words[block * 16U], 64U);
+    if (!kvaf::aicpu_urma::CopySqBytes(destination, &words[block * 16U], 64U)) return 2U;
   }
   queue.sq_producer_index += 2U;
   Barrier();
@@ -207,11 +201,11 @@ std::uint32_t WriteSqBlocks(const Entity& entity, std::uint32_t slot,
                    const std::uint32_t* words, std::uint32_t blocks,
                    kvaf::GatherSqCopyMode copy_mode) {
   const auto first = std::min(blocks, entity.sq_depth - slot);
-  kvaf::aicpu_urma::CopySqWqebbs(reinterpret_cast<void*>(entity.sq_va + slot * 64U),
-                                words, first, copy_mode);
+  if (!kvaf::aicpu_urma::CopySqWqebbs(reinterpret_cast<void*>(entity.sq_va + slot * 64U),
+                                     words, first, copy_mode)) return 0U;
   if (first < blocks) {
-    kvaf::aicpu_urma::CopySqWqebbs(reinterpret_cast<void*>(entity.sq_va), words + first * 16U,
-                                  blocks - first, copy_mode);
+    if (!kvaf::aicpu_urma::CopySqWqebbs(reinterpret_cast<void*>(entity.sq_va), words + first * 16U,
+                                       blocks - first, copy_mode)) return 0U;
     return 2U;
   }
   return 1U;
@@ -261,7 +255,9 @@ std::uint32_t SubmitScatter(const Entity& entity, Queue& queue,
     }
     const auto sq_start_ns = Detailed ? NowNs() : 0U;
     if constexpr (Detailed) encode_ns += sq_start_ns - encode_start_ns;
-    sq_write_calls += WriteSqBlocks(entity, staged_slot, batch.words, staged_blocks, copy_mode);
+    const auto write_calls = WriteSqBlocks(entity, staged_slot, batch.words, staged_blocks, copy_mode);
+    if (write_calls == 0U) return 2U;
+    sq_write_calls += write_calls;
     if constexpr (Detailed) {
       encode_start_ns = NowNs();
       sq_write_ns += encode_start_ns - sq_start_ns;

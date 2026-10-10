@@ -25,14 +25,6 @@ bool ThreadCpuNs(std::uint64_t* nanoseconds) {
   return true;
 }
 
-void Barrier() {
-#if defined(KVAF_AICPU_URMA_HOST_TEST)
-  std::atomic_thread_fence(std::memory_order_seq_cst);
-#else
-  asm volatile("dsb sy" ::: "memory");
-#endif
-}
-
 }
 
 extern "C" __attribute__((visibility("default")))
@@ -66,7 +58,6 @@ std::uint32_t KvafAicpuUrmaSqCopyBenchmark(kvaf::aicpu_urma::SqCopyBenchmarkArgs
        queue.source_hbm % 64U != 0U || queue.source_hbm > UINT64_MAX - queue.bytes ||
        (queue.source_hbm < destination + queue.offset + queue.bytes &&
         destination + queue.offset < queue.source_hbm + queue.bytes)))) {
-    Barrier();
     return 1U;
   }
   alignas(64) std::uint32_t source[kScatterBatchWqes * kScatterWqeWords];
@@ -80,7 +71,6 @@ std::uint32_t KvafAicpuUrmaSqCopyBenchmark(kvaf::aicpu_urma::SqCopyBenchmarkArgs
   auto* output = reinterpret_cast<std::uint8_t*>(destination + queue.offset);
   std::uint64_t cpu_begin_ns = 0U;
   std::uint64_t cpu_end_ns = 0U;
-  Barrier();
   const bool cpu_available = ThreadCpuNs(&cpu_begin_ns);
   status.copy_begin_ns = NowNs();
   for (std::uint64_t offset = 0U; offset < queue.bytes; offset += chunk_bytes) {
@@ -88,12 +78,9 @@ std::uint32_t KvafAicpuUrmaSqCopyBenchmark(kvaf::aicpu_urma::SqCopyBenchmarkArgs
         std::min<std::uint64_t>(chunk_bytes, queue.bytes - offset) / kWqeBytes);
     const auto* input = args->target_sq >= 2U
         ? reinterpret_cast<const std::uint8_t*>(queue.source_hbm) + offset : source_bytes;
-    CopySqWqebbs(output + offset, input, blocks, args->copy_mode);
-#if defined(__GNUC__) || defined(__clang__)
-    asm volatile("" : : "r"(output + offset), "r"(input) : "memory");
-#endif
+    if (!CopySqWqebbs(output + offset, input, blocks, args->copy_mode)) return 1U;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
   }
-  Barrier();
   status.copy_end_ns = NowNs();
   if (cpu_available && ThreadCpuNs(&cpu_end_ns) && cpu_end_ns >= cpu_begin_ns) {
     status.thread_cpu_available = 1U;
@@ -102,7 +89,6 @@ std::uint32_t KvafAicpuUrmaSqCopyBenchmark(kvaf::aicpu_urma::SqCopyBenchmarkArgs
   status.bytes = queue.bytes;
   status.copy_calls = (queue.bytes + chunk_bytes - 1U) / chunk_bytes;
   status.result = 0U;
-  Barrier();
   return 0U;
 }
 
@@ -127,7 +113,6 @@ std::uint32_t KvafAicpuUrmaSqCopyVerify(kvaf::aicpu_urma::SqCopyBenchmarkArgs* a
       queue.capacity > kSqCopyBenchmarkQueueBytes || queue.offset > queue.capacity ||
       queue.bytes > queue.capacity - queue.offset || destination > UINT64_MAX - queue.capacity) {
     status.result = 3U;
-    Barrier();
     return 1U;
   }
   const auto chunk_bytes = args->batch_wqes * kMaxScatterWqebbs * kWqeBytes;
@@ -145,11 +130,9 @@ std::uint32_t KvafAicpuUrmaSqCopyVerify(kvaf::aicpu_urma::SqCopyBenchmarkArgs* a
       status.mismatch_offset = queue.offset + offset;
       status.expected = expected;
       status.actual = actual;
-      Barrier();
       return 1U;
     }
   }
   status.result = 0U;
-  Barrier();
   return 0U;
 }

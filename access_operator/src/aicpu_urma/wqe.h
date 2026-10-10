@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "gather_output.h"
+#include "sq_copy.h"
 
 namespace kvaf::aicpu_urma {
 
@@ -121,37 +122,10 @@ inline void PatchScatterReadWqe(ScatterReadBatch& batch, std::uint32_t batch_ind
   }
 }
 
-inline void CopyWqebbs(void* destination, const void* source, std::uint32_t blocks) {
-  auto* output = static_cast<std::uint8_t*>(destination);
-  const auto* input = static_cast<const std::uint8_t*>(source);
-  for (std::uint32_t block = 0U; block < blocks; ++block) {
-#if defined(__aarch64__)
-    asm volatile(
-        "ldp x9, x10, [%[src]]\n"
-        "ldp x11, x12, [%[src], #16]\n"
-        "stp x9, x10, [%[dst]]\n"
-        "stp x11, x12, [%[dst], #16]\n"
-        "ldp x9, x10, [%[src], #32]\n"
-        "ldp x11, x12, [%[src], #48]\n"
-        "stp x9, x10, [%[dst], #32]\n"
-        "stp x11, x12, [%[dst], #48]\n"
-        : : [src] "r"(input), [dst] "r"(output)
-        : "x9", "x10", "x11", "x12", "memory");
-#else
-    std::memcpy(output, input, kWqeBytes);
-#endif
-    input += kWqeBytes;
-    output += kWqeBytes;
-  }
-}
-
-inline void CopySqWqebbs(void* destination, const void* source, std::uint32_t blocks,
+inline bool CopySqWqebbs(void* destination, const void* source, std::uint32_t blocks,
                          GatherSqCopyMode mode) {
-  if (blocks == 0U) return;
-  if (mode == GatherSqCopyMode::kMemcpy)
-    std::memcpy(destination, source, static_cast<std::size_t>(blocks) * kWqeBytes);
-  else
-    CopyWqebbs(destination, source, blocks);
+  return kvaf::ValidGatherSqCopyMode(mode) &&
+      CopySqBytes(destination, source, static_cast<std::size_t>(blocks) * kWqeBytes);
 }
 
 inline std::uint32_t PlanContiguousRead(Transfer (&transfers)[16],

@@ -131,7 +131,7 @@ inline void PrintGatherReadTimeline(std::FILE* output, double mean_ms,
                  average_us(&GatherReadTiming::scatter_schedule_ns));
   if (profiles.front().profile_detail)
     std::fprintf(output,
-                 "        Within submit: Encode WQEs: %.3f us | Write SQ: %.3f us | Doorbell and barriers: %.3f us\n",
+                 "        Within submit: Encode WQEs: %.3f us | Write SQ: %.3f us | Doorbell and queue update: %.3f us\n",
                  average_us(&GatherReadTiming::scatter_encode_ns),
                  average_us(&GatherReadTiming::scatter_sq_write_ns),
                  average_us(&GatherReadTiming::scatter_doorbell_ns));
@@ -217,7 +217,7 @@ inline void PrintGatherReadTechnicalProfile(std::FILE* output,
                average(&GatherReadTiming::aicpu_cores));
   std::fprintf(output,
                "  READ preparation: output_layout=%.0f worker_init=%.0f start_spread=%.0f longest_worker=%.0f\n"
-               "  Within submit (max per core): encode=%.0f sq_write=%.0f doorbell_barriers=%.0f\n",
+               "  Within submit (max per core): encode=%.0f sq_write=%.0f doorbell_queue_update=%.0f\n",
                average(&GatherReadTiming::output_layout_ns),
                average(&GatherReadTiming::scatter_init_ns),
                average(&GatherReadTiming::scatter_start_skew_ns),

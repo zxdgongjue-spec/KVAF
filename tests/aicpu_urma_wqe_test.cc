@@ -16,7 +16,7 @@ void TestWqebbCopy(kvaf::GatherSqCopyMode mode) {
   const auto original = source;
   for (std::uint32_t blocks = 0U; blocks <= max_blocks; ++blocks) {
     destination.fill(0xa5U);
-    kvaf::aicpu_urma::CopySqWqebbs(destination.data() + 64U, source.data() + 64U, blocks, mode);
+    assert(kvaf::aicpu_urma::CopySqWqebbs(destination.data() + 64U, source.data() + 64U, blocks, mode));
     assert(std::memcmp(destination.data() + 64U, source.data() + 64U, blocks * 64U) == 0);
     for (std::size_t index = 0U; index < 64U; ++index) assert(destination[index] == 0xa5U);
     for (std::size_t index = (blocks + 1U) * 64U; index < destination.size(); ++index)
@@ -108,8 +108,10 @@ void TestScatterBatchTemplates() {
 }
 
 int main() {
-  TestWqebbCopy(kvaf::GatherSqCopyMode::kMemcpy);
-  TestWqebbCopy(kvaf::GatherSqCopyMode::kPaired);
+  TestWqebbCopy(kvaf::GatherSqCopyMode::kMemcpySp);
+  assert(kvaf::aicpu_urma::CopySqWqebbs(nullptr, nullptr, 0U, kvaf::GatherSqCopyMode::kMemcpySp));
+  assert(!kvaf::aicpu_urma::CopySqWqebbs(nullptr, nullptr, 1U, kvaf::GatherSqCopyMode::kMemcpySp));
+  assert(!kvaf::ValidGatherSqCopyMode(static_cast<kvaf::GatherSqCopyMode>(1U)));
   TestScatterHeaderReuse();
   TestScatterBatchTemplates();
   kvaf::aicpu_urma::Endpoint endpoint{};

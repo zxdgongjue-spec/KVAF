@@ -4,6 +4,7 @@ find_package(Threads REQUIRED)
 add_subdirectory(aicpu_batch_get)
 
 add_executable(kvaf_aicpu_urma_wqe_test aicpu_urma_wqe_test.cc)
+target_compile_definitions(kvaf_aicpu_urma_wqe_test PRIVATE KVAF_AICPU_URMA_HOST_TEST=1)
 target_include_directories(kvaf_aicpu_urma_wqe_test PRIVATE
   "${CMAKE_SOURCE_DIR}/access_operator/src"
   "${CMAKE_SOURCE_DIR}/access_operator/include")

@@ -134,10 +134,10 @@ int main() {
          std::string::npos);
   assert(parallel_report.find("Within submit: Encode WQEs: 1.000 us | Write SQ: 1.500 us") !=
          std::string::npos);
-  assert(parallel_report.find("Doorbell and barriers: 0.500 us") != std::string::npos);
+  assert(parallel_report.find("Doorbell and queue update: 0.500 us") != std::string::npos);
   assert(parallel_report.find("Worker start spread: 1.500 us | Longest worker duration: 5.000 us") !=
          std::string::npos);
-  assert(parallel_report.find("encode=1000 sq_write=1500 doorbell_barriers=500") != std::string::npos);
+  assert(parallel_report.find("encode=1000 sq_write=1500 doorbell_queue_update=500") != std::string::npos);
   assert(parallel_report.find("READ schedule: task_spans=192 tasks=22.00 claim_ns=500") !=
          std::string::npos);
 
