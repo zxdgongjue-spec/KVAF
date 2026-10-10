@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "batch_get_abi.h"
+#include "diagnostics.h"
 #include "access_operator.h"
 #include "peer_link.h"
 #include "meta_manager.h"
@@ -482,9 +483,21 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                                      &discovery_error)) {
     return Status::NotFound(discovery_error);
   }
+  std::uint32_t diag_peer = 0U, diag_npu = 0U;
+  if (diagnostics::Enabled()) {
+    if (!diagnostics::ReadUnsigned("KVAF_DIAG_PEER_CANDIDATE", 0U, &diag_peer) ||
+        !diagnostics::ReadUnsigned("KVAF_DIAG_NPU_CANDIDATE", 0U, &diag_npu) ||
+        diag_peer >= candidate_count || diag_npu >= npu_candidates.size()) {
+      return Status::InvalidArgument("invalid diagnostic EID candidate indices");
+    }
+    std::fprintf(stderr, "[KVAF_DIAG] FIXED_PAIR peer=%u npu=%u fallback=disabled\n",
+                 diag_peer, diag_npu);
+  }
   for (std::uint32_t peer_candidate = 0U; peer_candidate < candidate_count; ++peer_candidate) {
+    if (diagnostics::Enabled() && peer_candidate != diag_peer) continue;
     impl_->peer_allocator->SetCandidate(peer_candidate);
     for (std::size_t npu_index = 0; npu_index < npu_candidates.size(); ++npu_index) {
+      if (diagnostics::Enabled() && npu_index != diag_npu) continue;
       const NpuLocalEidCandidate& candidate = npu_candidates[npu_index];
       impl_->runtime_core.reset();
       impl_->access_operator.reset();

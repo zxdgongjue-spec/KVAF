@@ -14,6 +14,7 @@
 
 #include "acl/acl.h"
 #include "batch_put_internal.h"
+#include "diagnostics.h"
 #include "direct_hccp/direct_hccp_abi.h"
 #include "direct_hccp/direct_hccp_remote_transport.h"
 #include "direct_hccp/direct_hccp_session.h"
@@ -133,6 +134,10 @@ bool AllocateToken(const DirectHccpApi &api, void *context, const char *role, vo
     return false;
   }
   *token_id = raw.token_id >> kTokenIdShift;
+  if (kvaf::diagnostics::Enabled()) {
+    std::fprintf(stderr, "[KVAF_DIAG] TOKEN role=%s raw=0x%x wqe=0x%x context=%p handle=%p\n",
+                 role, raw.token_id, *token_id, context, *token_handle);
+  }
   hccp::VerboseLog("[KVAF_AIV] DIRECT_TOKEN_READY role=%s token_id=0x%x\n", role,
                    *token_id);
   return true;
@@ -163,10 +168,29 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
   hccp::MrRegInfo info{};
   info.in.mem.addr = aligned_address;
   info.in.mem.size = aligned_bytes;
-  info.in.ub.flags = hccp::MemRegFlags(true);
+  uint32_t non_pin = 1U;
+  if (kvaf::diagnostics::Enabled() &&
+      (!kvaf::diagnostics::ReadUnsigned("KVAF_DIAG_PUT_NON_PIN", 1U, &non_pin) || non_pin > 1U)) {
+    std::fprintf(stderr, "[KVAF_DIAG] INVALID_OPTION name=KVAF_DIAG_PUT_NON_PIN\n");
+    return false;
+  }
+  info.in.ub.flags = hccp::MemRegFlags(non_pin != 0U);
   info.in.ub.token_value = token_value;
   info.in.ub.token_id_handle = token_handle;
   const int ret = api.lmem_register(context, &info, &memory->handle);
+  if (kvaf::diagnostics::Enabled()) {
+    std::fprintf(stderr,
+        "[KVAF_DIAG] HBM_REGISTER role=%s ret=%d non_pin=%u flags=0x%x context=%p "
+        "input=0x%llx input_bytes=%llu registered=0x%llx registered_bytes=%llu "
+        "allocated_wqe_token=0x%x returned_raw_token=0x%x returned_shifted_token=0x%x "
+        "handle=%p target_seg=0x%llx key_bytes=%u\n",
+        role, ret, non_pin, info.in.ub.flags, context,
+        static_cast<unsigned long long>(reinterpret_cast<uint64_t>(address)),
+        static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(aligned_address),
+        static_cast<unsigned long long>(aligned_bytes), token_id, info.out.ub.token_id,
+        info.out.ub.token_id >> kTokenIdShift, memory->handle,
+        static_cast<unsigned long long>(info.out.ub.target_seg_handle), info.out.key.size);
+  }
   if (ret != 0 || memory->handle == nullptr || info.out.key.size == 0U || info.out.key.size > hccp::kMemKeyBytes) {
     std::fprintf(stderr,
                  "[KVAF_AIV] DIRECT_MEMORY_REGISTER_FAILED role=%s ret=%d handle=%p key_bytes=%u addr=0x%llx "
@@ -547,6 +571,62 @@ extern "C" void KvafBatchPutLocalBufferRelease(KvafBatchPutLocalBuffer *local_bu
   --local_buffer->reference_count;
 }
 
+namespace {
+void DumpDeviceWords(const char* label, uint32_t lane, uint64_t address, size_t bytes) {
+  uint32_t words[16]{};
+  const aclError result = aclrtMemcpy(words, sizeof(words), reinterpret_cast<void*>(address),
+                                     bytes, ACL_MEMCPY_DEVICE_TO_HOST);
+  std::fprintf(stderr, "[KVAF_DIAG] %s lane=%u address=0x%llx acl=%d words=",
+               label, lane, static_cast<unsigned long long>(address), static_cast<int>(result));
+  if (result == ACL_SUCCESS) {
+    for (size_t index = 0; index < bytes / sizeof(uint32_t); ++index)
+      std::fprintf(stderr, "%s%08x", index == 0 ? "" : ",", words[index]);
+  }
+  std::fprintf(stderr, "\n");
+}
+
+void DumpBatchPut(KvafBatchPutLocalBuffer* buffer) {
+  auto* transport = buffer->transport;
+  // Bounded evidence from core 0, all its lanes. Queue contents are diagnostic,
+  // not a second completion check; ACL cannot copy every platform's queue VA.
+  for (uint32_t lane = 0; lane < transport->jettys_per_core; ++lane) {
+    KvafBatchPutDirectUrmaEntity entity{};
+    KvafBatchPutQueueState queue{};
+    const auto entity_result = aclrtMemcpy(&entity, sizeof(entity),
+        static_cast<const uint8_t*>(buffer->device_entities) + lane * sizeof(entity),
+        sizeof(entity), ACL_MEMCPY_DEVICE_TO_HOST);
+    const auto queue_result = aclrtMemcpy(&queue, sizeof(queue),
+        static_cast<const uint8_t*>(transport->device_queue_state) + lane * sizeof(queue),
+        sizeof(queue), ACL_MEMCPY_DEVICE_TO_HOST);
+    std::fprintf(stderr, "[KVAF_DIAG] SNAPSHOT lane=%u entity_acl=%d queue_acl=%d\n",
+                 lane, static_cast<int>(entity_result), static_cast<int>(queue_result));
+    if (entity_result != ACL_SUCCESS || queue_result != ACL_SUCCESS) continue;
+    std::fprintf(stderr,
+        "[KVAF_DIAG] ENTITY lane=%u jetty=%u jfc=%u tpn=%u local=0x%llx bytes=%llu "
+        "local_token=0x%x remote=0x%llx remote_bytes=%llu remote_token=0x%x "
+        "sq_pi=%llu cq_ci=%llu completed=%llu error=%llu\n",
+        lane, entity.jetty_id, entity.jfc_id, entity.tp_id,
+        static_cast<unsigned long long>(entity.local_hbm_address),
+        static_cast<unsigned long long>(entity.local_hbm_size), entity.local_token_id,
+        static_cast<unsigned long long>(entity.remote_host_ddr_address),
+        static_cast<unsigned long long>(entity.remote_host_ddr_size), entity.remote_token_id,
+        static_cast<unsigned long long>(queue.sq_producer_index),
+        static_cast<unsigned long long>(queue.cq_consumer_index),
+        static_cast<unsigned long long>(queue.completed_batch_count),
+        static_cast<unsigned long long>(queue.last_error));
+    DumpDeviceWords("SQ_SLOT0", lane, entity.sq_va, 64U);
+    if (queue.sq_producer_index != 0U && entity.sq_depth != 0U)
+      DumpDeviceWords("SQ_LAST_POSTED", lane,
+          entity.sq_va + ((queue.sq_producer_index - 1U) % entity.sq_depth) * 64U, 64U);
+    if (entity.cq_depth != 0U) {
+      const uint64_t ci = queue.cq_consumer_index == 0U ? 0U : queue.cq_consumer_index - 1U;
+      DumpDeviceWords("CQ_LAST_OR_FIRST", lane,
+          entity.cq_va + (ci % entity.cq_depth) * entity.cqe_size, 64U);
+    }
+  }
+}
+}  // namespace
+
 extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer,
                                             const KvafExecuteBatchPutKernelArgs *arguments,
                                             aclrtStream stream,
@@ -597,6 +677,13 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=copy_status acl=%d\n",
                  static_cast<int>(status_copy_result));
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
+  }
+  if (kvaf::diagnostics::Enabled()) {
+    const size_t metadata_bytes = (arguments->row_count < 8U ? arguments->row_count : 8U) * sizeof(uint64_t);
+    DumpDeviceWords("INPUT_OFFSETS_HEAD", 0U, arguments->input_offsets, metadata_bytes);
+    DumpDeviceWords("LENGTHS_HEAD", 0U, arguments->lengths, metadata_bytes);
+    DumpDeviceWords("DESTINATIONS_HEAD", 0U, arguments->destination_addresses, metadata_bytes);
+    DumpBatchPut(local_buffer);
   }
   for (uint32_t core = 0U; core < core_status_count; ++core) {
     const uint64_t begin = static_cast<uint64_t>(arguments->row_count) * core / core_status_count;

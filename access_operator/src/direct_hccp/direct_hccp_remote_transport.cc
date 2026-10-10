@@ -10,6 +10,7 @@
 
 #include "acl/acl.h"
 #include "peer_link.h"
+#include "diagnostics.h"
 #include "direct_hccp/direct_hccp_session.h"
 
 namespace kvaf::direct_hccp {
@@ -145,6 +146,16 @@ bool LoadDirectHccp(DirectHccpApi* api) {
       LoadSymbol(api->library, "RaCtxGetTpInfoList", &api->get_tp_info) &&
       LoadSymbol(api->library, "RaGetTpInfoListAsync", &api->get_tp_info_async) &&
       LoadSymbol(api->library, "RaGetAsyncReqResult", &api->get_async_req_result);
+  if (loaded && diagnostics::Enabled()) {
+    Dl_info library_info{};
+    if (dladdr(reinterpret_cast<void*>(api->lmem_register), &library_info) != 0) {
+      std::fprintf(stderr, "[KVAF_DIAG] RA_LIBRARY path=%s symbol=RaCtxLmemRegister\n",
+                   library_info.dli_fname == nullptr ? "unknown" : library_info.dli_fname);
+    }
+    std::fprintf(stderr,
+                 "[KVAF_DIAG] HOST_ABI MrRegInfo=%zu MemRegAttr=%zu MemRegInfo=%zu QpCreateAttr=%zu\n",
+                 sizeof(MrRegInfo), sizeof(MemRegAttr), sizeof(MemRegInfo), sizeof(QpCreateAttr));
+  }
   api->get_random = reinterpret_cast<GetRandomFn>(dlsym(api->library, "RaGetSecRandom"));
   if (!loaded) {
     dlclose(api->library);

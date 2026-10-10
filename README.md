@@ -257,3 +257,8 @@ runtime.shutdown()
 `link_to()` 必须先于 `initialize()` 调用。调用方需要在 BatchGet 所在 stream 完成前保持
 输入/输出 Tensor 和 `DeviceAccessTable` 有效；Runtime 只管理内部 DDR、元数据和内部
 传输资源。
+
+## 首次 BatchPut / A+K 访问失败诊断
+
+可运行独立的四组对照测试，采集内存注册、token、实际 SQ/CQ 和加载库信息。
+运行命令及结果判读见 [远端 CPU 诊断说明](docs/remote_cpu_diagnostics.md)。

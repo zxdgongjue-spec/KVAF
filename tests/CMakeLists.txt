@@ -40,3 +40,7 @@ endif()
 
 # Runtime tests are Python-only. Mock and NPU integration coverage call the
 # pybind API directly; no subprocess driver is built or invoked.
+
+# The diagnostic harness itself runs without CANN; hardware cases are explicit.
+add_test(NAME kvaf_diagnostics_runner_python
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_diagnostics_runner.py")
