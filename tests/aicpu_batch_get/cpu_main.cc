@@ -22,6 +22,11 @@ struct Options {
   kvaf::CpuUrmaTransportOptions transport;
   std::string transfer_csv;
 };
+struct FileCloser {
+  void operator()(FILE* file) const noexcept {
+    if (file) std::fclose(file);
+  }
+};
 Options Parse(int argc, char** argv) {
   Options o;
   o.transport.remote_sgl_size = 16;
@@ -103,7 +108,7 @@ kvaf::peer::PeerRegion Configure(const Options& options, std::uint32_t npu_candi
   return region;
 }
 void Run(Options options) {
-  std::unique_ptr<FILE, decltype(&std::fclose)> transfer_csv(nullptr, &std::fclose);
+  std::unique_ptr<FILE, FileCloser> transfer_csv;
   if (!options.transfer_csv.empty()) {
     transfer_csv.reset(std::fopen(options.transfer_csv.c_str(), "w"));
     Require(transfer_csv != nullptr, "cannot open --profile-transfer-csv: " + options.transfer_csv);
