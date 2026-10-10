@@ -9,6 +9,14 @@ target_include_directories(kvaf_aicpu_urma_wqe_test PRIVATE
   "${CMAKE_SOURCE_DIR}/access_operator/include")
 add_test(NAME kvaf_aicpu_urma_wqe COMMAND kvaf_aicpu_urma_wqe_test)
 
+add_executable(kvaf_aicpu_sq_copy_benchmark_test aicpu_sq_copy_benchmark_test.cc
+  "${CMAKE_SOURCE_DIR}/access_operator/src/aicpu_urma/sq_copy_benchmark.cc")
+target_compile_definitions(kvaf_aicpu_sq_copy_benchmark_test PRIVATE KVAF_AICPU_URMA_HOST_TEST=1)
+target_include_directories(kvaf_aicpu_sq_copy_benchmark_test PRIVATE
+  "${CMAKE_SOURCE_DIR}/access_operator/src" "${CMAKE_SOURCE_DIR}/access_operator/include")
+target_link_libraries(kvaf_aicpu_sq_copy_benchmark_test PRIVATE Threads::Threads)
+add_test(NAME kvaf_aicpu_sq_copy_benchmark COMMAND kvaf_aicpu_sq_copy_benchmark_test)
+
 add_executable(kvaf_cpu_gather_test cpu_gather_test.cc)
 target_include_directories(kvaf_cpu_gather_test PRIVATE "${CMAKE_SOURCE_DIR}/runtime/include")
 target_link_libraries(kvaf_cpu_gather_test PRIVATE kvaf_cpu_gather_plan)
@@ -175,6 +183,16 @@ if(KVAF_ENABLE_AIV_BATCH_PUT)
 endif()
 
 if(KVAF_ENABLE_AICPU_URMA)
+  add_executable(kvaf_aicpu_sq_copy_benchmark aicpu_sq_copy_benchmark.cc)
+  target_compile_definitions(kvaf_aicpu_sq_copy_benchmark PRIVATE
+    "KVAF_AICPU_URMA_CANN_ROOT=\"${ASCEND_CANN_PACKAGE_PATH}\"")
+  target_include_directories(kvaf_aicpu_sq_copy_benchmark PRIVATE
+    "${CMAKE_SOURCE_DIR}/access_operator/src" "${ASCEND_CANN_PACKAGE_PATH}/include")
+  target_link_directories(kvaf_aicpu_sq_copy_benchmark PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/lib64")
+  target_link_libraries(kvaf_aicpu_sq_copy_benchmark PRIVATE
+    kvaf_aicpu_urma_host kvaf_direct_hccp_session ascendcl)
+  set_property(TARGET kvaf_aicpu_sq_copy_benchmark APPEND PROPERTY BUILD_RPATH
+    "${ASCEND_CANN_PACKAGE_PATH}/lib64")
   add_executable(kvaf_aicpu_gather_read_client aicpu_gather_read_client.cc)
   target_compile_definitions(kvaf_aicpu_gather_read_client PRIVATE
     "KVAF_AICPU_URMA_CANN_ROOT=\"${ASCEND_CANN_PACKAGE_PATH}\"")

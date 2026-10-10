@@ -15,6 +15,8 @@ aclrtFuncHandle put_function = nullptr;
 aclrtFuncHandle get_function = nullptr;
 aclrtFuncHandle gather_function = nullptr;
 aclrtFuncHandle scatter_function = nullptr;
+aclrtFuncHandle sq_copy_function = nullptr;
+aclrtFuncHandle sq_verify_function = nullptr;
 
 int32_t Launch(aclrtFuncHandle function, void* arguments, std::size_t bytes,
                aclrtStream stream, std::uint32_t blocks = 1U) {
@@ -85,6 +87,30 @@ int32_t LaunchGatherRead(const GatherReadArgs* arguments, aclrtStream stream) {
   if (arguments->worker_count <= 1U) return 0;
   return Launch(scatter_function, const_cast<GatherReadArgs*>(arguments),
                 sizeof(*arguments), stream, arguments->worker_count);
+}
+
+int32_t LaunchSqCopyBenchmark(const SqCopyBenchmarkArgs* arguments, aclrtStream stream) {
+  if (arguments == nullptr) return -1;
+  {
+    std::lock_guard<std::mutex> lock(kernel_mutex);
+    if (binary == nullptr) return -1;
+    if (sq_copy_function == nullptr &&
+        aclrtBinaryGetFunction(binary, "KvafAicpuUrmaSqCopyBenchmark", &sq_copy_function) != ACL_SUCCESS) {
+      std::fprintf(stderr, "[KVAF_AICPU_URMA] SQ copy kernel missing; rebuild and install kernel\n");
+      return -1;
+    }
+    if (sq_verify_function == nullptr &&
+        aclrtBinaryGetFunction(binary, "KvafAicpuUrmaSqCopyVerify", &sq_verify_function) != ACL_SUCCESS) {
+      std::fprintf(stderr, "[KVAF_AICPU_URMA] SQ verify kernel missing; rebuild and install kernel\n");
+      return -1;
+    }
+  }
+  if (Launch(sq_copy_function, const_cast<SqCopyBenchmarkArgs*>(arguments),
+             sizeof(*arguments), stream, arguments->workers) != 0) return -1;
+  const auto result = Launch(sq_verify_function, const_cast<SqCopyBenchmarkArgs*>(arguments),
+                             sizeof(*arguments), stream, arguments->workers);
+  if (result != 0) (void)aclrtSynchronizeStream(stream);
+  return result;
 }
 
 }  // namespace kvaf::aicpu_urma

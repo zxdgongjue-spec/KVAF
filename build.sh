@@ -224,8 +224,10 @@ build_aicpu_urma() {
   local kernel_action="$3"
   local cann_root
   local -a compiler_option=()
-  local -a targets=(kvaf_aicpu_urma_client kvaf_aicpu_gather_read_client kvaf_aicpu_urma_kernel
+  local -a targets=(kvaf_aicpu_urma_client kvaf_aicpu_gather_read_client
+    kvaf_aicpu_sq_copy_benchmark kvaf_aicpu_urma_kernel
     kvaf_aicpu_urma_wqe_test kvaf_aicpu_urma_kernel_test kvaf_aicpu_gather_read_kernel_test
+    kvaf_aicpu_sq_copy_benchmark_test
     kvaf_aicpu_gather_read_layout_test
     kvaf_cpu_gather_test
     kvaf_aicpu_urma_client_options_test kvaf_aicpu_urma_client_metrics_test
@@ -253,6 +255,7 @@ build_aicpu_urma() {
   fi
   echo "[KVAF_BUILD] Native test: $build_dir/tests/kvaf_aicpu_urma_client"
   echo "[KVAF_BUILD] Gather test: $build_dir/tests/kvaf_aicpu_gather_read_client --help"
+  echo "[KVAF_BUILD] SQ copy test: $build_dir/tests/kvaf_aicpu_sq_copy_benchmark --help"
   echo "[KVAF_BUILD] AICPU kernel package: $build_dir/access_operator/src/aicpu_urma/kvaf-aicpu-urma.tar.gz"
   echo "[KVAF_BUILD] Host tests: ctest --test-dir '$build_dir' -R 'kvaf_aicpu_urma_|kvaf_aicpu_gather_read_|kvaf_cpu_gather' --output-on-failure"
   echo "[KVAF_BUILD] Run: '$build_dir/tests/kvaf_aicpu_urma_client' --help"

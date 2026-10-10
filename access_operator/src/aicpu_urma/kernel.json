@@ -20,6 +20,20 @@
       "opKernelLib": "AICPUKernel"
     }
   },
+  "KvafAicpuUrmaSqCopyBenchmark": {
+    "opInfo": {
+      "functionName": "KvafAicpuUrmaSqCopyBenchmark",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
+  },
+  "KvafAicpuUrmaSqCopyVerify": {
+    "opInfo": {
+      "functionName": "KvafAicpuUrmaSqCopyVerify",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
+  },
   "KvafAicpuUrmaGatherScatter": {
     "opInfo": {
       "functionName": "KvafAicpuUrmaGatherScatter",
