@@ -16,6 +16,7 @@ struct SqCopyBenchmarkQueue {
   std::uint64_t capacity;
   std::uint64_t offset;
   std::uint64_t bytes;
+  std::uint64_t source_hbm;
 };
 
 struct alignas(64) SqCopyBenchmarkStatus {
@@ -53,7 +54,7 @@ inline std::uint8_t SqCopyBenchmarkPattern(std::uint64_t index,
   return static_cast<std::uint8_t>(index * 131U + index / 64U * 17U + worker * 29U + round * 7U);
 }
 
-static_assert(sizeof(SqCopyBenchmarkQueue) == 40U, "SQ copy queue ABI changed");
+static_assert(sizeof(SqCopyBenchmarkQueue) == 48U, "SQ copy queue ABI changed");
 static_assert(sizeof(SqCopyBenchmarkStatus) == 128U, "SQ copy status ABI changed");
 static_assert(sizeof(SqCopyBenchmarkArgs) == 56U, "SQ copy arguments ABI changed");
 

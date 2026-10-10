@@ -18,6 +18,7 @@ using namespace kvaf::aicpu_urma;
 struct alignas(64) Buffers {
   std::array<std::uint8_t, 4096> sq;
   std::array<std::uint8_t, 4096> hbm;
+  std::array<std::uint8_t, 4096> source_hbm;
 };
 
 void TestCopy(std::uint32_t workers, std::uint32_t batch, kvaf::GatherSqCopyMode mode) {
@@ -31,7 +32,7 @@ void TestCopy(std::uint32_t workers, std::uint32_t batch, kvaf::GatherSqCopyMode
       0U, workers, batch, 0U, mode, reinterpret_cast<std::uint64_t>(&verify_counter)};
   for (std::uint64_t round = 0U; round < 3U; ++round) {
     args.round = round;
-    for (std::uint32_t target = 0U; target < 2U; ++target) {
+    for (std::uint32_t target = 0U; target < 3U; ++target) {
       args.target_sq = target;
       counter = 0U;
       verify_counter = 0U;
@@ -40,7 +41,10 @@ void TestCopy(std::uint32_t workers, std::uint32_t batch, kvaf::GatherSqCopyMode
         buffers[worker].hbm.fill(0xa5U);
         queues[worker] = {reinterpret_cast<std::uint64_t>(buffers[worker].sq.data()),
             reinterpret_cast<std::uint64_t>(buffers[worker].hbm.data()), 4096U,
-            (round + 1U) * 64U, 1664U + worker * 64U};
+            (round + 1U) * 64U, 1664U + worker * 64U,
+            reinterpret_cast<std::uint64_t>(buffers[worker].source_hbm.data())};
+        for (std::uint64_t index = 0U; index < buffers[worker].source_hbm.size(); ++index)
+          buffers[worker].source_hbm[index] = SqCopyBenchmarkPattern(index, worker, round);
       }
       std::vector<std::thread> threads;
       for (std::uint32_t thread = 0U; thread < workers; ++thread)
@@ -59,14 +63,16 @@ void TestCopy(std::uint32_t workers, std::uint32_t batch, kvaf::GatherSqCopyMode
         assert(status.round == round && status.result == 0U && status.bytes == queue.bytes);
         assert(status.entry_ns <= status.copy_begin_ns && status.copy_begin_ns <= status.copy_end_ns);
         assert(status.copy_calls == (queue.bytes + batch * 192U - 1U) / (batch * 192U));
-        const auto& destination = target != 0U ? buffers[worker].sq : buffers[worker].hbm;
-        const auto& untouched = target != 0U ? buffers[worker].hbm : buffers[worker].sq;
+        const auto& destination = target == 1U ? buffers[worker].sq : buffers[worker].hbm;
+        const auto& untouched = target == 1U ? buffers[worker].hbm : buffers[worker].sq;
         for (std::uint64_t index = 0U; index < destination.size(); ++index) {
           const auto expected = index >= queue.offset && index - queue.offset < queue.bytes
-              ? SqCopyBenchmarkPattern((index - queue.offset) % (batch * 192U), worker, round)
+              ? SqCopyBenchmarkPattern(target == 2U ? index - queue.offset
+                  : (index - queue.offset) % (batch * 192U), worker, round)
               : 0xa5U;
           assert(destination[index] == expected);
           assert(untouched[index] == 0xa5U);
+          assert(buffers[worker].source_hbm[index] == SqCopyBenchmarkPattern(index, worker, round));
         }
       }
       assert(KvafAicpuUrmaSqCopyBenchmark(&args) == 1U);
@@ -78,7 +84,7 @@ void TestInvalid() {
   assert(KvafAicpuUrmaSqCopyBenchmark(nullptr) == 1U);
   Buffers buffers{};
   SqCopyBenchmarkQueue queue{reinterpret_cast<std::uint64_t>(buffers.sq.data()),
-      reinterpret_cast<std::uint64_t>(buffers.hbm.data()), 4096U, 0U, 64U};
+      reinterpret_cast<std::uint64_t>(buffers.hbm.data()), 4096U, 0U, 64U, 0U};
   SqCopyBenchmarkStatus status{};
   std::uint64_t counter = 0U;
   std::uint64_t verify_counter = 0U;
@@ -107,7 +113,7 @@ void TestInvalid() {
   invalid.workers = 9U;
   assert(KvafAicpuUrmaSqCopyBenchmark(&invalid) == 1U);
   invalid = valid;
-  invalid.target_sq = 2U;
+  invalid.target_sq = 3U;
   assert(KvafAicpuUrmaSqCopyBenchmark(&invalid) == 1U);
   invalid = valid;
   invalid.batch_wqes = 7U;
@@ -115,6 +121,15 @@ void TestInvalid() {
   invalid = valid;
   invalid.copy_mode = static_cast<kvaf::GatherSqCopyMode>(2U);
   assert(KvafAicpuUrmaSqCopyBenchmark(&invalid) == 1U);
+  valid.target_sq = 2U;
+  queue.offset = 0U;
+  for (const auto source : {0ULL, static_cast<unsigned long long>(
+       reinterpret_cast<std::uint64_t>(buffers.source_hbm.data()) + 1U),
+       static_cast<unsigned long long>(queue.hbm), UINT64_MAX - 63ULL}) {
+    counter = 0U;
+    queue.source_hbm = source;
+    assert(KvafAicpuUrmaSqCopyBenchmark(&valid) == 1U);
+  }
 }
 
 }
