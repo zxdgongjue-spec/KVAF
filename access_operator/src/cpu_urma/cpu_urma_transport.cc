@@ -491,6 +491,7 @@ struct CpuUrmaTransport::Impl {
     batch_local_sgl_size_ = std::min<std::size_t>(
         options.remote_sgl_size, max_local_sge_);
     prepare_thread_count_ = options.prepare_thread_count;
+    profile_write_queues_ = options.profile_write_queues;
     get_tp_list_ = reinterpret_cast<GetTpList>(dlsym(RTLD_DEFAULT, "urma_get_tp_list"));
     import_jetty_ex_ = reinterpret_cast<ImportJettyEx>(dlsym(RTLD_DEFAULT, "urma_import_jetty_ex"));
     if (get_tp_list_ == nullptr || import_jetty_ex_ == nullptr) {
@@ -990,6 +991,35 @@ struct CpuUrmaTransport::Impl {
     timing->dispatch_ns = timing->prepare_ns + timing->post_ns;
     for (const auto& queue : job.queues) timing->wr_count += queue.count;
 
+    if (profile_write_queues_ && shared_status.ok()) {
+      auto& profile = last_write_queue_profile_;
+      ++profile.waves;
+      auto last_cq = prepare_start;
+      for (std::size_t jetty = 0; jetty < job.queues.size(); ++jetty)
+        if (job.queues[jetty].count != 0)
+          last_cq = std::max(last_cq, poll_finished[jetty]);
+      auto first_cq = last_cq;
+      for (std::size_t jetty = 0; jetty < job.queues.size(); ++jetty) {
+        if (job.queues[jetty].count == 0) continue;
+        first_cq = std::min(first_cq, poll_finished[jetty]);
+        auto& q = profile.queue[jetty];
+        ++q.waves;
+        q.rows += base + (jetty < remainder ? 1U : 0U);
+        q.wr_count += job.queues[jetty].count;
+        const auto ns = [](auto duration) {
+          return static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count());
+        };
+        q.post_ns += ns(post_finished[jetty] - post_started[jetty]);
+        q.post_to_cq_ns += ns(poll_finished[jetty] - post_finished[jetty]);
+        if (poll_finished[jetty] > post_end)
+          q.cq_tail_ns += ns(poll_finished[jetty] - post_end);
+        if (poll_finished[jetty] == last_cq) ++q.tail_waves;
+      }
+      profile.cq_spread_ns += static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(last_cq - first_cq).count());
+    }
+
     if (!shared_status.ok()) return shared_status;
     for (std::size_t jetty = 0U; jetty < job.queues.size(); ++jetty) {
       if (!results[jetty].post_error.empty()) {
@@ -1022,6 +1052,10 @@ struct CpuUrmaTransport::Impl {
 
     const auto start = std::chrono::steady_clock::now();
     CpuUrmaTransport::BatchTiming total_timing{};
+    if (profile_write_queues_) {
+      last_write_queue_profile_ = {};
+      last_write_queue_profile_.jettys = local_jettys_.size();
+    }
     const std::size_t wave_rows = kJettyDepth * local_jettys_.size();
     if (count > wave_rows) {
       const auto validate_start = std::chrono::steady_clock::now();
@@ -1358,6 +1392,8 @@ struct CpuUrmaTransport::Impl {
   std::vector<cpu_urma_detail::BatchValidationSlice>
       batch_validation_slices_;
   CpuUrmaTransport::BatchTiming last_batch_timing_{};
+  CpuUrmaTransport::WriteQueueProfile last_write_queue_profile_{};
+  bool profile_write_queues_{false};
   std::uint64_t batch_generation_{0U};
   bool batch_poisoned_{false};
   bool urma_initialized_{false};
@@ -1402,6 +1438,9 @@ bool CpuUrmaTransport::initialized() const { return impl_->initialized_; }
 std::uint64_t CpuUrmaTransport::region_bytes() const { return impl_->remote_region_.length; }
 CpuUrmaTransport::BatchTiming CpuUrmaTransport::last_batch_timing() const {
   return impl_->last_batch_timing_;
+}
+CpuUrmaTransport::WriteQueueProfile CpuUrmaTransport::last_write_queue_profile() const {
+  return impl_->profile_write_queues_ ? impl_->last_write_queue_profile_ : WriteQueueProfile{};
 }
 
 }  // namespace kvaf

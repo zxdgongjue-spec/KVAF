@@ -28,6 +28,10 @@ All other options go to kvaf_aicpu_get_cpu, for example:
                        Pipeline sends each worker range then publishes its ready
   --verify-payload      Validation only: refresh/check whole payload each round
                        Source generation adds request wait; omit for bandwidth
+  --profile-transfer    Scatter only: print transfer-stage mean/p50/p99 after drain
+  --profile-transfer-csv FILE
+                       Enables profiling and saves matched CPU/NPU per-round timings
+                       Does not change the normal --output CSV schema
   --direct-output-stride N
                        Direct mode only: 0 packs rows (default); N >= row-bytes
                        leaves destination gaps, which are preserved

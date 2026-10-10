@@ -51,6 +51,9 @@ struct CpuUrmaTransportOptions {
   // Maximum CPU workers used by batch planning and descriptor preparation.
   // WRITE uses at most one worker per Jetty owner.
   std::uint32_t prepare_thread_count{4};
+  // Diagnostic only: capture WRITE queue ownership/completion skew using
+  // existing per-queue timestamps. Disabled for normal transports.
+  bool profile_write_queues{false};
 };
 
 class CpuUrmaTransport final {
@@ -71,8 +74,20 @@ class CpuUrmaTransport final {
     std::uint64_t setup_ns{0};
     // Entire prepare/post call, including OpenMP scheduling and joining.
     std::uint64_t dispatch_ns{0};
-    // Pre-validation and WRITE grouping for non-contiguous batch APIs.
+    // Pre-validation for non-contiguous batch APIs. WRITE grouping/descriptor
+    // construction is included in prepare_ns; plan may be zero for one wave.
     std::uint64_t plan_ns{0};
+  };
+  struct WriteQueueProfile {
+    struct Queue {
+      std::uint64_t waves{}, rows{}, wr_count{};
+      std::uint64_t post_ns{}, post_to_cq_ns{}, cq_tail_ns{}, tail_waves{};
+    };
+    std::uint64_t jettys{}, waves{}, cq_spread_ns{};
+    // Sums over serial waves, never sums parallel owners into wall time.
+    // post_to_cq includes any delay entering polling; CQ timestamps are
+    // software observations, not the instant DMA reaches remote memory.
+    std::array<Queue, 16> queue{};
   };
 
   CpuUrmaTransport();
@@ -115,6 +130,10 @@ class CpuUrmaTransport final {
   bool initialized() const;
   std::uint64_t region_bytes() const;
   BatchTiming last_batch_timing() const;
+  // Last WriteBatch only; control ReadSglBatch/WriteSglBatch do not overwrite
+  // this record. Read after the synchronous call with no concurrent caller.
+  // Returns zeroes when profile_write_queues is disabled.
+  WriteQueueProfile last_write_queue_profile() const;
 
  private:
   struct Impl;

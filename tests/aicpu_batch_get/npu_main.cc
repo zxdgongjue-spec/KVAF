@@ -2,6 +2,7 @@
 #include "core_probe_report.h"
 #include "metrics.h"
 #include "scatter_profile_report.h"
+#include "transfer_profile.h"
 #include "scatter_copy.h"
 #include "scatter_probe_report.h"
 
@@ -186,7 +187,8 @@ void ValidateDirectOutputGuards(const Layout& layout, const NpuTarget& target) {
 }
 
 Report Execute(int fd, const Config& config, NpuTarget& target, const std::string& json,
-               bool profile_scatter, std::uint32_t aicpu_blocks) {
+               bool profile_scatter, std::uint32_t aicpu_blocks,
+               TransferProfileHeader* transfer_header, std::vector<Sample>* transfer_samples) {
   Layout layout{}; Require(MakeLayout(config, &layout), "invalid config");
   const bool direct_output = IsDirectOutput(config);
   const bool pipeline = IsScatterPipeline(config);
@@ -245,6 +247,10 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
                block_dim == 1 ? "pthread" : "multi-block", block_dim, active_threads,
                ScatterCopyBackendName(config.row_bytes));
   }
+  if (config.profile_transfer)
+    std::fprintf(stderr, "[AICPU_TRANSFER] DEVICE enabled=1 mode=scatter "
+        "request_publish=store_clean_dsb samples=after_run clock=cntvct_el0 revision=%llu\n",
+        (unsigned long long)kKernelRevision);
   kernel.Launch(args, block_dim);
   // Once launched, do not unwind allocations until both device execution and
   // CPU transport have stopped. A lost control connection requires retaining
@@ -312,6 +318,12 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
     PrintScatterProfile(stderr, config, device_result.counter_frequency, *device_profile);
   }
   const auto report_result = Summarize(config, device_result, timings);
+  if (config.profile_transfer) {
+    Require(transfer_header && transfer_samples, "missing transfer profile output");
+    transfer_header->rounds = config.iterations;
+    transfer_header->frequency = device_result.counter_frequency;
+    *transfer_samples = std::move(timings);
+  }
   if (pipeline)
     std::fprintf(stderr, "[AICPU_PIPELINE] SUMMARY workers=%u rounds=%llu "
         "avg_first_ready_us=%.3f avg_pipeline_us=%.3f avg_total_us=%.3f "
@@ -582,14 +594,20 @@ void Run(const Options& options) {
     }
     Require(kvaf::peer::IsValidHeader(header, kStart, sizeof(header)), "expected START");
     Report report{};
+    TransferProfileHeader transfer_header{};
+    std::vector<Sample> transfer_samples;
     try { report = Execute(fd.get(), config, *target, options.json, options.profile_scatter,
-                           options.aicpu_blocks); }
+                           options.aicpu_blocks, &transfer_header, &transfer_samples); }
     catch (const std::exception& e) {
       report.status = 1;
       std::fprintf(stderr, "NPU benchmark failed: %s\n", e.what());
     }
     Send(fd.get(), &report, sizeof(report));
     Require(report.status == 0, "benchmark failed");
+    if (config.profile_transfer) {
+      Send(fd.get(), &transfer_header, sizeof(transfer_header));
+      Send(fd.get(), transfer_samples.data(), transfer_samples.size() * sizeof(Sample));
+    }
     std::fprintf(stderr, "AICPU_GET_NPU PASS mean_ns=%.1f e2e_GBps=%.6f\n", report.mean_ns, report.gbps);
     break;
   }

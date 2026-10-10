@@ -324,18 +324,25 @@ Result RunMultiBlock(DeviceIO& io, Sample* samples, KernelResult* result,
   const auto timeout_ticks = frequency * io.config.timeout_ms / 1000;
   const bool pipeline = IsScatterPipeline(io.config);
   for (std::uint64_t sequence = 1; sequence <= io.layout.rounds; ++sequence) {
+    const bool measure_transfer = worker == 0 && io.config.profile_transfer &&
+        sequence > io.config.warmup;
+    std::uint64_t cache_prepare_ticks = 0, published = 0, done_reads = 0;
     if (worker == 0) {
       result->failed_sequence = sequence;
       // Other blocks wait for request_sequence and do not touch output here.
       // Match the single-block cache preparation and timing boundary.
+      const auto prepare_start = measure_transfer ? io.Now() : 0;
       io.PrepareRound(io.config, io.layout);
       const auto start = io.Now();
+      if (measure_transfer) cache_prepare_ticks = start - prepare_start;
       Store(c.request_start, start);
       if (pipeline) Store(c.ready_tick, UINT64_MAX);
       io.PublishRequest(sequence);
+      if (measure_transfer) published = io.Now();
       if (!pipeline) {
         for (;;) {
           const auto done = io.ReadDone();
+          if (measure_transfer) ++done_reads;
           if (done == sequence) break;
           if (done > sequence) { Fail(c, Result::kSequenceError, sequence); break; }
           if (io.Now() - start >= timeout_ticks) { Fail(c, Result::kTimeout, sequence); break; }
@@ -382,10 +389,18 @@ Result RunMultiBlock(DeviceIO& io, Sample* samples, KernelResult* result,
       }
       const auto end = io.Now();
       if (!io.VerifyTags(sequence, io.config, io.layout)) { Fail(c, Result::kDataMismatch, sequence); break; }
+      const auto verified = measure_transfer ? io.Now() : 0;
       if (sequence > io.config.warmup) {
         const auto start = Load(c.request_start);
         const auto ready = Load(c.ready_tick);
         samples[sequence - io.config.warmup - 1] = {end - start, ready - start, end - ready};
+        if (measure_transfer) {
+          auto& sample = samples[sequence - io.config.warmup - 1];
+          sample.request_publish_ticks = published - start;
+          sample.done_poll_count = done_reads;
+          sample.cache_prepare_ticks = cache_prepare_ticks;
+          sample.verify_ticks = verified - end;
+        }
         if (io.profile) RecordPoolTiming(*io.profile, pipeline ? start : ready, end);
       }
       result->completed_rounds = sequence;
@@ -624,7 +639,7 @@ std::uint32_t KvafAicpuCoreProbeV1(CoreProbeArgs* args) {
 }
 
 extern "C" __attribute__((visibility("default")))
-std::uint32_t KvafAicpuBatchGetV11(KernelArgs* args) {
+std::uint32_t KvafAicpuBatchGetV14(KernelArgs* args) {
   if (!args || !args->region || !args->output || !args->samples || !args->result) return 1;
   auto* result = reinterpret_cast<KernelResult*>(args->result);
   auto* samples = reinterpret_cast<Sample*>(args->samples);

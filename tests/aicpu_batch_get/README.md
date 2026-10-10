@@ -2,6 +2,12 @@
 
 这是独立 C++ 测试，不调用 Runtime BatchPut，不改 Python 或 MetaManager。
 
+当前普通传输入口为 **V14**（从 V11 基线增加传输打点，未引入 chunk/prefetch 优化）。
+CPU 增加 `--profile-transfer`，可选 `--profile-transfer-csv FILE` 输出逐轮记录；
+只接受 `--transfer-mode scatter`。两端程序、device .so、JSON 必须一起更新，安装后重启 NPU 进程。
+完整实际流程、各计时边界、运行命令和结果解读见
+[AICPU + SGL 分阶段计时](../../docs/aicpu_sgl_transfer_profile.md)。
+
 scatter 在 656 B 行上使用 AICPU NEON 向量复制，其他行长使用 `memcpy`，
 支持 `--scatter-threads 1..32`（默认 1）。
 CPU 将 SGL 描述符按 output 物理 slot 排列，仍 WRITE 到连续 HBM staging；
@@ -106,7 +112,7 @@ scatter 模式不接受非零 `--direct-output-stride`。源布局、有效字�
 测试通过也不代表已验证后续 AIV 算子的消费可见性或生产 Tensor 的注册生命周期。
 
 V10 扩展 Config 和测试 Configure 帧，更新 magic、命令及 kernel 入口，避免加载旧版本。
-当前版本需重新构建两端并安装 V11 kernel；安装后重启 NPU 测试进程。V9 tile 融合未包含在此版本中。
+当前版本需重新构建两端并安装 V14 kernel；安装后重启 NPU 测试进程。V9 tile 融合未包含在此版本中。
 
 ```bash
 bash build.sh aicpu-cpu
@@ -136,7 +142,7 @@ CSV 列不变，直接模式 engine 为 `aicpu_urma_direct_output`，`scatter_ns
 
 ### 4096 × 656 B、多线程测试
 
-更新后需重新构建两端、安装 V11 kernel，并重启测试进程：
+更新后需重新构建两端、安装 V14 kernel，并重启测试进程：
 
 ```bash
 bash build.sh aicpu-cpu
@@ -190,7 +196,7 @@ V8 在每轮计时开始及发布 request 之前，对整个 output 执行 `dc c
 新增独立入口 `KvafAicpuScatterProbeV1`。它使用与正常 scatter 相同的
 缓存行操作/DSB 序列、`CopyScatterRows` 和 payload clean，直接分配本地设备源/目标内存，
 不建立 URMA、不启动 CPU peer、不执行逐轮 payload 校验。probe 使用独立 ABI，
-正常传输入口当前为 V11。源由 Host 初始化，目标按冷缓存口径准备；
+正常传输入口当前为 V14。源由 Host 初始化，目标按冷缓存口径准备；
 源的 invalidate 在每轮被测阶段内，保证复制开始前输入失效。
 
 每个 block 固定负责 `rows_per_worker` 行。套件内的源/目标地址与分配大小保持不变，
@@ -309,8 +315,8 @@ ctest --test-dir build-aicpu-cpu -R '^kvaf_aicpu_scatter_probe$' --output-on-fai
 
 ### 实际运行核与 scatter 三段计时
 
-在 **NPU 端**增加 `--profile-scatter`，默认关闭。升级需重新编译并安装 V11 kernel，
-独立的 V11 入口可避免旧 device `.so` 静默使用旧测试口径。
+在 **NPU 端**增加 `--profile-scatter`，默认关闭。升级需重新编译并安装 V14 kernel，
+独立的 V14 入口可避免旧 device `.so` 静默使用旧测试口径。
 两端需一起升级测试控制协议；原有 CSV 列保持不变。先启动 NPU 端：
 
 ```bash

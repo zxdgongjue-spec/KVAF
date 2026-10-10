@@ -24,6 +24,9 @@ inline Report Summarize(const Config& config, const KernelResult& result,
             sample.scatter_ticks == sample.total_ticks - sample.wait_ticks &&
             (!IsDirectOutput(config) || sample.scatter_ticks == 0),
             "invalid timing sample");
+    Require(!config.profile_transfer ||
+            (sample.request_publish_ticks <= sample.wait_ticks && sample.done_poll_count > 0),
+            "invalid transfer timing sample");
     const auto ns = sample.total_ticks * ns_per_tick;
     times.push_back(ns);
     report.mean_ns += ns;

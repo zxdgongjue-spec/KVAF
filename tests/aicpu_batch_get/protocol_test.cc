@@ -1,5 +1,6 @@
 #include "device_loop.h"
 #include "metrics.h"
+#include "transfer_profile.h"
 #include "scatter_pool.h"
 #include "scatter_copy.h"
 #include "cpu_urma/sgl_batch_builder.h"
@@ -96,6 +97,9 @@ void SuccessAndMetrics() {
     for (std::uint64_t b = c.row_bytes; b < io.layout.stride; ++b)
       Require(bytes[b] == 0xA5, "scatter overwrote guard");
   }
+  for (const auto& s : samples)
+    Require(!s.request_publish_ticks && !s.done_poll_count && !s.cache_prepare_ticks && !s.verify_ticks,
+            "disabled transfer profiling collected samples");
   const auto report = Summarize(c, result, samples);
   Require(report.status == 0 && report.mean_ns == report.wait_ns + report.scatter_ns &&
           report.p50_ns > 0 && report.p99_ns >= report.p50_ns && report.gbps > 0, "metrics mismatch");
@@ -331,10 +335,77 @@ void DeviceSelection() {
   Require(rejected, "overflowing device-id accepted");
 
 }
+void TransferProfiling() {
+  Config c; c.rows = 3; c.row_bytes = 128; c.warmup = 2; c.iterations = 2;
+  c.profile_transfer = 1;
+  Simulator io(c); io.preparation_ticks = 1000; io.verification_ticks = 2000;
+  std::vector<Sample> device(c.iterations); KernelResult result{};
+  Require(RunDevice(c, io, device.data(), &result) == Result::kOk, "profiled device loop failed");
+  (void)Summarize(c, result, device);
+  for (const auto& s : device)
+    Require(s.request_publish_ticks == 1 && s.done_poll_count == 3 &&
+            s.cache_prepare_ticks == 1001 && s.verify_ticks == 2001 && s.total_ticks < 1000,
+            "incorrect transfer boundaries/polls or preparation leaked into total");
+  Require(result.completed_rounds == c.warmup + c.iterations, "profile changed warmup/rounds");
+
+  std::vector<CpuTransferSample> cpu(c.iterations);
+  for (std::size_t i = 0; i < cpu.size(); ++i) {
+    auto& s = cpu[i]; s.sequence = c.warmup + i + 1;
+    s.request_poll_ns = 50; s.request_reads = 2;
+    s.request.total_ns = 20; s.request.setup_ns = 2; s.request.prepare_ns = 4;
+    s.request.post_ns = 2; s.request.poll_ns = 10;
+    s.data.total_ns = 70; s.data.plan_ns = 2; s.data.setup_ns = 5;
+    s.data.prepare_ns = 10; s.data.post_ns = 5; s.data.poll_ns = 40; s.data.wr_count = 3;
+    s.notify.total_ns = 15; s.notify.setup_ns = 1; s.notify.prepare_ns = 2;
+    s.notify.post_ns = 1; s.notify.poll_ns = 9;
+    s.queues.jettys = 1; s.queues.waves = 1;
+    s.queues.queue[0].rows = 3; s.queues.queue[0].wr_count = 3;
+    FinishCpuTransferSample(s, 100, 130, 140, 220, 250, 270);
+    Require(s.response_ns == 170 && s.source_update_ns == 30 && s.write_call_ns == 80 &&
+            s.notify_call_ns == 20 && s.gap_ns == 40 && TransferOtherNs(s.data) == 8,
+            "CPU phase partition is not additive");
+  }
+  ValidateTransferSamples(c, io.Frequency(), cpu, device);
+  const auto values = TransferValues(cpu[0], device[0], 1e9 / io.Frequency());
+  Require(values[31] == device[0].wait_ticks * 1e6 &&
+          values[33] == (device[0].wait_ticks - device[0].request_publish_ticks) * 1e6,
+          "device ticks were treated as CPU ns");
+  FILE* file = std::tmpfile(); Require(file != nullptr, "cannot create profile test file");
+  PrintTransferCsv(file, c, io.Frequency(), cpu, device);
+  std::rewind(file);
+  char line[8192]; std::size_t lines = 0;
+  while (std::fgets(line, sizeof(line), file)) {
+    std::size_t columns = 1;
+    for (const char* p = line; *p; ++p) if (*p == ',') ++columns;
+    Require(columns == 1 + kTransferColumnCount + 6, "profile CSV columns shifted");
+    if (lines == 1) Require(std::strncmp(line, "3,", 2) == 0, "warmup included in trace");
+    if (lines == 2) Require(std::strncmp(line, "4,", 2) == 0, "trace sequence not matched");
+    ++lines;
+  }
+  std::fclose(file);
+  Require(lines == c.iterations + 1, "profile trace missing rounds");
+  const auto rejected = [&](const std::function<void()>& fn) {
+    bool failed = false; try { fn(); } catch (...) { failed = true; }
+    Require(failed, "invalid transfer profile accepted");
+  };
+  rejected([&] { FinishCpuTransferSample(cpu[0], 100, 90, 140, 220, 250, 270); });
+  auto bad = cpu; --bad[0].sequence;
+  rejected([&] { ValidateTransferSamples(c, io.Frequency(), bad, device); });
+  bad = cpu; bad[0].data.poll_ns = 1000;
+  rejected([&] { ValidateTransferSamples(c, io.Frequency(), bad, device); });
+  auto bad_device = device; bad_device[0].request_publish_ticks = bad_device[0].wait_ticks + 1;
+  rejected([&] { ValidateTransferSamples(c, io.Frequency(), cpu, bad_device); });
+  Layout layout{};
+  c.transfer_mode = TransferMode::kScatterPipeline;
+  Require(!MakeLayout(c, &layout), "pipeline accepted additive transfer profiling");
+  c.transfer_mode = TransferMode::kDirectOutput;
+  Require(!MakeLayout(c, &layout), "direct output accepted staging profiling");
+}
 }  // namespace
 int main() {
   try { ParallelScatter(); Bounds(); DeviceSelection(); SuccessAndMetrics(); Failures();
         CachePreparationAndTiming(); DirectOutput(); DirectWriteGrouping(); PipelineWriteGrouping();
+        TransferProfiling();
         std::puts("aicpu get protocol: PASS"); return 0; }
   catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
 }

@@ -36,6 +36,7 @@ Pass-through options: --port 29991 --device-id 0 --eid HEX --kernel-json PATH
 Without --device-id, use the CPU request's NPU device ID. With it, reject a mismatch.
 The built kernel JSON is selected automatically. No installation by default.
 Set --rows, --row-bytes, --scatter-threads, --transfer-mode and --verify-payload on the CPU script.
+Set --profile-transfer / --profile-transfer-csv FILE on CPU; only scatter is accepted.
 direct_output skips --profile-scatter because there is no scatter phase.
 This server handles one test run; restart it for the next run.
 Build: bash build.sh aicpu-npu

@@ -4,9 +4,11 @@
 #include <limits>
 
 namespace kvaf::aicpu_test {
-constexpr std::uint64_t kMagic = 0x4b56414641424734ULL;
-constexpr char kKernelName[] = "KvafAicpuBatchGetV11";
-constexpr std::uint64_t kKernelRevision = 11;
+// V12/V13 were used by subsequent optimization experiments. Keep this
+// profiling ABI distinct even when built from the V11 baseline.
+constexpr std::uint64_t kMagic = 0x4b56414641424737ULL;
+constexpr char kKernelName[] = "KvafAicpuBatchGetV14";
+constexpr std::uint64_t kKernelRevision = 14;
 constexpr char kCoreProbeKernelName[] = "KvafAicpuCoreProbeV1";
 constexpr std::uint64_t kCoreProbeMagic = 0x4b564146434f5231ULL;
 constexpr std::uint64_t kCoreProbeRevision = 1;
@@ -38,6 +40,9 @@ struct Config {
   // Validation only: refresh/check the entire payload on every sequence.
   // Source generation is inside request wait, so this is not a bandwidth run.
   std::uint64_t verify_payload{};
+  // Extra transfer timestamps/counters, ordinary scatter only. No hot-path
+  // printing; warmup rounds are not collected.
+  std::uint64_t profile_transfer{};
 };
 
 inline bool IsDirectOutput(const Config& c) {
@@ -72,7 +77,8 @@ inline bool MakeLayout(const Config& c, Layout* out) {
       c.warmup > kMaxRounds - c.iterations ||
       c.timeout_ms == 0 || c.timeout_ms > 600000 ||
       (c.transfer_mode != TransferMode::kScatter && !IsDirectOutput(c) && !IsScatterPipeline(c)) ||
-      c.verify_payload > 1 ||
+      c.verify_payload > 1 || c.profile_transfer > 1 ||
+      (c.profile_transfer && c.transfer_mode != TransferMode::kScatter) ||
       (!IsDirectOutput(c) && c.direct_output_stride != 0)) return false;
   const std::uint64_t source_stride = ((c.row_bytes + 63) & ~std::uint64_t{63}) + kGuardBytes;
   const std::uint64_t stride = IsDirectOutput(c)
@@ -108,6 +114,13 @@ struct Sample {
   // scatter ranges and final producer done. The latter includes overlap.
   std::uint64_t wait_ticks;
   std::uint64_t scatter_ticks;
+  // Zero when profile_transfer is disabled. These use the device clock only.
+  // publish is a subset of wait; cache preparation/verification are outside
+  // total, preserving the original measured timing boundary.
+  std::uint64_t request_publish_ticks;
+  std::uint64_t done_poll_count;
+  std::uint64_t cache_prepare_ticks;
+  std::uint64_t verify_ticks;
 };
 
 struct alignas(64) KernelResult {
@@ -251,8 +264,8 @@ inline RowRange ScatterRange(const Config& c, std::uint32_t worker, std::uint32_
   const auto end = (groups * (worker + 1) / workers) * quantum;
   return {begin, end < c.rows ? end : c.rows};
 }
-static_assert(sizeof(Config) == 80 && sizeof(Control) == 64);
-static_assert(sizeof(Sample) == 24 && sizeof(KernelResult) == 64);
-static_assert(sizeof(KernelArgs) == 128 && sizeof(CoordinationWord) == 64);
+static_assert(sizeof(Config) == 88 && sizeof(Control) == 64);
+static_assert(sizeof(Sample) == 56 && sizeof(KernelResult) == 64);
+static_assert(sizeof(KernelArgs) == 136 && sizeof(CoordinationWord) == 64);
 static_assert(sizeof(CoreProbeSlot) == 256 && sizeof(CoreProbeArgs) == 24);
 }  // namespace kvaf::aicpu_test

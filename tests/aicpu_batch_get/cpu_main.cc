@@ -1,4 +1,5 @@
 #include "control.h"
+#include "transfer_profile.h"
 #include "cpu_urma/cpu_urma_link_selection.h"
 #include "cpu_urma/cpu_urma_transport.h"
 
@@ -12,9 +13,14 @@ namespace {
 using namespace kvaf::aicpu_test;
 using kvaf::CpuUrmaTransport;
 using Clock = std::chrono::steady_clock;
+std::uint64_t ClockNs() {
+  return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      Clock::now().time_since_epoch()).count());
+}
 struct Options {
   Config config;
   kvaf::CpuUrmaTransportOptions transport;
+  std::string transfer_csv;
 };
 Options Parse(int argc, char** argv) {
   Options o;
@@ -22,10 +28,14 @@ Options Parse(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     const std::string flag = argv[i];
     if (flag == "--verify-payload") { o.config.verify_payload = 1; continue; }
+    if (flag == "--profile-transfer") { o.config.profile_transfer = 1; continue; }
     Require(i + 1 < argc, "missing value for " + flag);
     const char* value = argv[++i];
     if (flag == "--peer") { o.transport.peer_address = value; continue; }
     if (flag == "--ub-device") { o.transport.ub_device = value; continue; }
+    if (flag == "--profile-transfer-csv") {
+      o.transfer_csv = value; o.config.profile_transfer = 1; continue;
+    }
     if (flag == "--transfer-mode") {
       const std::string mode = value;
       Require(mode == "scatter" || mode == "direct_output" || mode == "scatter_pipeline",
@@ -56,10 +66,13 @@ Options Parse(int argc, char** argv) {
     }
   }
   Layout layout{};
+  Require(!o.config.profile_transfer || o.config.transfer_mode == TransferMode::kScatter,
+          "--profile-transfer requires --transfer-mode scatter (no overlapping pipeline timings)");
   Require(MakeLayout(o.config, &layout) && !o.transport.peer_address.empty() &&
           o.transport.remote_sgl_size > 0 && o.transport.jetty_count > 0 &&
           o.transport.jetty_count <= 16 && o.transport.prepare_thread_count > 0 &&
           o.transport.prepare_thread_count <= 64, "invalid benchmark configuration");
+  o.transport.profile_write_queues = o.config.profile_transfer != 0;
   return o;
 }
 void Check(const kvaf::Status& status) { Require(status.ok(), status.message()); }
@@ -90,6 +103,11 @@ kvaf::peer::PeerRegion Configure(const Options& options, std::uint32_t npu_candi
   return region;
 }
 void Run(Options options) {
+  std::unique_ptr<FILE, decltype(&std::fclose)> transfer_csv(nullptr, &std::fclose);
+  if (!options.transfer_csv.empty()) {
+    transfer_csv.reset(std::fopen(options.transfer_csv.c_str(), "w"));
+    Require(transfer_csv != nullptr, "cannot open --profile-transfer-csv: " + options.transfer_csv);
+  }
   kvaf::CpuUrmaDiscovery discovery;
   Check(discovery.Initialize(options.transport.ub_device, options.transport.has_eid_index,
                              options.transport.eid_index));
@@ -168,6 +186,9 @@ void Run(Options options) {
   Check(transport.WriteSglBatch(kRequestOffset, &request_sge, 1));
   Check(transport.WriteSglBatch(kDoneOffset, &done_sge, 1));
   const bool pipeline = IsScatterPipeline(options.config);
+  const bool profile_transfer = options.config.profile_transfer != 0;
+  // Allocate once before launch; never allocate/log detailed rows in the loop.
+  std::vector<CpuTransferSample> transfer_samples(profile_transfer ? options.config.iterations : 0);
   const auto workers = ActiveThreads(options.config);
   std::vector<CpuUrmaTransport::HostSge> ready_sges;
   if (pipeline) {
@@ -182,6 +203,10 @@ void Run(Options options) {
   if (options.config.verify_payload)
     std::fprintf(stderr, "AICPU_GET_CPU VALIDATION payload=sequence_pattern "
         "source_generation=inside_request_wait performance=validation_only\n");
+  if (profile_transfer)
+    std::fprintf(stderr, "[AICPU_TRANSFER] ENABLED mode=scatter warmup_excluded=1 "
+        "trace=after_drain detailed_csv=%s\n",
+        options.transfer_csv.empty() ? "disabled" : options.transfer_csv.c_str());
   Socket control(Connect(options.transport.peer_address));
   SocketTimeout(control.get(), options.config.timeout_ms + 120000);
   auto start = kvaf::peer::MakeHeader(kStart, sizeof(kvaf::peer::MessageHeader));
@@ -194,6 +219,13 @@ void Run(Options options) {
   bool ok = true;
   try {
     for (std::uint64_t seq = 1; seq <= layout.rounds; ++seq) {
+      const bool measure_transfer = profile_transfer && seq > options.config.warmup;
+      CpuTransferSample* transfer = measure_transfer
+          ? &transfer_samples[seq - options.config.warmup - 1] : nullptr;
+      const auto request_poll_begin = measure_transfer ? ClockNs() : 0;
+      const auto polls_before = polls;
+      std::uint64_t observed = 0, source_end = 0, write_begin = 0, write_end = 0;
+      std::uint64_t notify_begin = 0, notify_end = 0;
       const auto deadline = Clock::now() + std::chrono::milliseconds(options.config.timeout_ms);
       do {
         Check(transport.ReadSglBatch(kRequestOffset, &request_sge, 1));
@@ -206,6 +238,7 @@ void Run(Options options) {
                                    " observed=" + std::to_string(request->sequence) +
                                    " last_done=" + std::to_string(done->sequence));
       } while (request->sequence != seq);
+      if (measure_transfer) observed = ClockNs();
       for (std::uint64_t row = 0; row < options.config.rows; ++row) {
         const auto tag = RowTag(seq, row);
         std::memcpy(input + row * layout.source_stride, &tag, sizeof(tag));
@@ -213,10 +246,22 @@ void Run(Options options) {
           for (std::uint64_t b = 8; b < options.config.row_bytes; ++b)
             input[row * layout.source_stride + b] = PayloadPattern(options.config, seq, row, b);
       }
+      if (measure_transfer) {
+        source_end = ClockNs();
+        transfer->sequence = seq;
+        transfer->request_poll_ns = observed - request_poll_begin;
+        transfer->request_reads = polls - polls_before;
+        transfer->request = transport.last_batch_timing(); // Matching READ only.
+      }
       const auto write_range = [&](RowRange range) {
+        if (measure_transfer) write_begin = ClockNs();
         Check(transport.WriteBatch(offsets.data() + range.begin, sources.data() + range.begin,
                                    range.end - range.begin));
+        if (measure_transfer) write_end = ClockNs();
         const auto timing = transport.last_batch_timing();
+        if (measure_transfer) {
+          transfer->data = timing;
+        }
         if (seq > options.config.warmup) {
           write_ns += timing.total_ns; prepare_ns += timing.prepare_ns;
           post_ns += timing.post_ns; poll_ns += timing.poll_ns; wr_count += timing.wr_count;
@@ -226,11 +271,16 @@ void Run(Options options) {
         static_cast<Control*>(sge.data)->sequence = seq;
         Clock::time_point before{};
         if (pipeline && seq > options.config.warmup) before = Clock::now();
+        if (measure_transfer) notify_begin = ClockNs();
         // A ready WRITE is submitted only after this range's WriteBatch has
         // waited for every participating Jetty. Never infer cross-Jetty
         // completion from a single queue's tail. Provider HBM visibility
         // uses the same completion/cache contract as the serial path.
         Check(transport.WriteSglBatch(offset, &sge, 1));
+        if (measure_transfer) {
+          notify_end = ClockNs();
+          transfer->notify = transport.last_batch_timing();
+        }
         if (pipeline && seq > options.config.warmup)
           notify_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - before).count();
       };
@@ -243,6 +293,13 @@ void Run(Options options) {
         write_range({0, options.config.rows});
       }
       publish(kDoneOffset, done_sge);
+      if (measure_transfer) {
+        FinishCpuTransferSample(*transfer, observed, source_end, write_begin, write_end,
+                                notify_begin, notify_end);
+        // This snapshot survives control WRs; copy it after publishing done
+        // so the larger diagnostic record does not delay staging consumption.
+        transfer->queues = transport.last_write_queue_profile();
+      }
     }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "CPU transfer failed: %s\n", e.what()); ok = false;
@@ -255,6 +312,18 @@ void Run(Options options) {
   Send(control.get(), &drained, sizeof(drained));
   Report report{}; Receive(control.get(), &report, sizeof(report));
   Require(ok && report.magic == kMagic && report.status == 0, "benchmark or NPU validation failed");
+  if (profile_transfer) {
+    TransferProfileHeader header{};
+    Receive(control.get(), &header, sizeof(header));
+    Require(header.magic == kMagic && header.revision == kKernelRevision &&
+            header.rounds == options.config.iterations && header.frequency > 0 &&
+            header.sample_bytes == sizeof(Sample), "incompatible device transfer profile");
+    std::vector<Sample> device_samples(header.rounds);
+    Receive(control.get(), device_samples.data(), device_samples.size() * sizeof(Sample));
+    PrintTransferProfile(stderr, options.config, header.frequency, transfer_samples, device_samples);
+    if (transfer_csv)
+      PrintTransferCsv(transfer_csv.get(), options.config, header.frequency, transfer_samples, device_samples);
+  }
   const double n = static_cast<double>(options.config.iterations);
   std::printf("engine,rows,row_bytes,iterations,scatter_threads,active_threads,e2e_GBps,mean_ns,p50_ns,p99_ns,%s,%s,"
               "cpu_write_ns,cpu_prepare_ns,cpu_post_ns,cpu_poll_ns,mean_wrs,control_reads",
