@@ -650,6 +650,69 @@ extern "C" void KvafBatchPutLocalBufferRelease(KvafBatchPutLocalBuffer *local_bu
   --local_buffer->reference_count;
 }
 
+static void LogBatchPutCompletionDiagnostics(const KvafBatchPutCoreStatus *statuses,
+                                            uint32_t core_count,
+                                            uint32_t jettys_per_core) {
+  for (uint32_t core = 0U; core < core_count; ++core) {
+    const auto &status = statuses[core];
+    if (status.reserved[KVAF_BATCH_PUT_CQ_DIAGNOSTIC_MAGIC_WORD] !=
+        KVAF_BATCH_PUT_CQ_DIAGNOSTIC_MAGIC) {
+      continue;
+    }
+    bool report = false;
+    for (uint32_t jetty = 0U; jetty < jettys_per_core; ++jetty) {
+      const uint64_t *const record = status.reserved +
+          KVAF_BATCH_PUT_CQ_DIAGNOSTIC_BASE_WORD +
+          jetty * KVAF_BATCH_PUT_CQ_DIAGNOSTIC_WORDS_PER_JETTY;
+      report = report || record[KVAF_BATCH_PUT_CQ_DIAG_FAST_BUDGET_EXCEEDED] != 0U ||
+               record[KVAF_BATCH_PUT_CQ_DIAG_RESULT] != KVAF_BATCH_PUT_CORE_SUCCESS;
+    }
+    if (!report) continue;
+    // Print both queues of the affected core: the old aggregate SQ/CQ
+    // fields refer only to jetty0 even when jetty1 is the one that failed.
+    for (uint32_t jetty = 0U; jetty < jettys_per_core; ++jetty) {
+      const uint64_t *const record = status.reserved +
+          KVAF_BATCH_PUT_CQ_DIAGNOSTIC_BASE_WORD +
+          jetty * KVAF_BATCH_PUT_CQ_DIAGNOSTIC_WORDS_PER_JETTY;
+      if (record[KVAF_BATCH_PUT_CQ_DIAG_ASSIGNED_ROWS] == 0U) continue;
+      const uint64_t reason = record[KVAF_BATCH_PUT_CQ_DIAG_TIMEOUT_REASON];
+      const char *const reason_name =
+          reason == KVAF_BATCH_PUT_CQ_TIMEOUT_DEVICE_DEADLINE ? "device_deadline" :
+          reason == KVAF_BATCH_PUT_CQ_TIMEOUT_POLL_FALLBACK ? "poll_fallback" : "none";
+      const uint64_t result = record[KVAF_BATCH_PUT_CQ_DIAG_RESULT];
+      const bool late_success = result == KVAF_BATCH_PUT_CORE_SUCCESS &&
+          record[KVAF_BATCH_PUT_CQ_DIAG_FAST_BUDGET_EXCEEDED] != 0U;
+      std::fprintf(stderr,
+          "[KVAF_AIV] BATCH_PUT_CQ_WAIT_DETAILS core=%u jetty=%u result=%llu "
+          "rows=%llu polls=%llu elapsed_ticks=%llu slow_elapsed_ticks=%llu "
+          "fast_budget_exceeded=%llu late_success=%u timeout_reason=%s "
+          "raw_cq_word=0x%llx observed_owner=%llu expected_owner=%llu cqe_valid=%u "
+          "cq_status=%llu cq_sub_status=%llu sq_before=%llu cq_before=%llu "
+          "sq_after=%llu cq_after=%llu fast_poll_budget=20000 "
+          "slow_deadline_ticks=100000000 slow_poll_limit=1000000 clock_hz=1000000000 "
+          "timing_scope=eager_put_cq_not_Get_performance\n",
+          core, jetty, static_cast<unsigned long long>(result),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_ASSIGNED_ROWS]),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_POLLS]),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_ELAPSED_TICKS]),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_SLOW_ELAPSED_TICKS]),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_FAST_BUDGET_EXCEEDED]),
+          static_cast<unsigned int>(late_success), reason_name,
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_RAW_WORD]),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_OBSERVED_OWNER]),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_EXPECTED_OWNER]),
+          static_cast<unsigned int>(record[KVAF_BATCH_PUT_CQ_DIAG_OBSERVED_OWNER] !=
+                                    record[KVAF_BATCH_PUT_CQ_DIAG_EXPECTED_OWNER]),
+          static_cast<unsigned long long>((record[KVAF_BATCH_PUT_CQ_DIAG_RAW_WORD] >> 24U) & 0xffU),
+          static_cast<unsigned long long>((record[KVAF_BATCH_PUT_CQ_DIAG_RAW_WORD] >> 16U) & 0xffU),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_SQ_BEFORE]),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_CQ_BEFORE]),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_SQ_AFTER]),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_CQ_AFTER]));
+    }
+  }
+}
+
 extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer,
                                             const KvafExecuteBatchPutKernelArgs *arguments,
                                             aclrtStream stream,
@@ -708,6 +771,8 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
                  static_cast<int>(status_copy_result));
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
+  LogBatchPutCompletionDiagnostics(core_status, core_status_count,
+                                    transport->jettys_per_core);
   hccp::VerboseLog("[KVAF_AIV] BATCH_PUT_PHASE phase=status_validate_begin\n");
   for (uint32_t core = 0U; core < core_status_count; ++core) {
     const uint64_t begin = static_cast<uint64_t>(arguments->row_count) * core / core_status_count;
