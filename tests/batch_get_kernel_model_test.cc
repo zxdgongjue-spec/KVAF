@@ -40,6 +40,7 @@ void Doorbell(uint32_t value, uint32_t* address) {
       return;
     }
     if (address != &queue.sq_db) continue;
+    post_trace.push_back(PostStage::Doorbell);
     ++doorbells;
     const uint32_t added = value - queue.sq_db;
     CHECK(added > 0 && added <= 128);
@@ -177,7 +178,20 @@ struct Fixture {
     for (const auto& queue : queues) cq_before += queue.cq_consumer_index;
     for (uint32_t c = 0; c < cores; ++c) {
       aiv_model::core = c;
+      aiv_model::post_trace.clear();
       KvafExecuteBatchGetAivKernelV3(args);
+      if (!KVAF_BATCH_GET_PIPELINED) {
+        // Every post must finish fill -> one/two SQ copies -> doorbell before
+        // another fill, including SQ wrap and queue-full/error launches.
+        using Stage = aiv_model::PostStage;
+        const auto& trace = aiv_model::post_trace;
+        for (size_t i = 0; i < trace.size();) {
+          CHECK(trace[i++] == Stage::Fill);
+          CHECK(i < trace.size() && trace[i++] == Stage::Copy);
+          if (i < trace.size() && trace[i] == Stage::Copy) ++i;
+          CHECK(i < trace.size() && trace[i++] == Stage::Doorbell);
+        }
+      }
       CHECK(statuses[c].result == expected);
       if (expected || !profiling) continue;
       const auto& profile = statuses[c].profile;
@@ -296,5 +310,6 @@ void RunMode(bool raw) {
 int main() {
   RunMode(false);
   RunMode(true);
-  std::cout << "BatchGet kernel CPU model: payload, CQ/SQ wrap, tail, replay and faults passed\n";
+  std::cout << "BatchGet kernel CPU model (pipelined=" << KVAF_BATCH_GET_PIPELINED
+            << "): payload, CQ/SQ wrap, tail, replay and faults passed\n";
 }

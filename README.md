@@ -298,6 +298,14 @@ Jetty，则不会产生足够 post 使用所有配置路径。
 远端地址和 slot 内 offset 排序，并同步重排 `indices`、`offsets` 和
 `output_indices`；请求构造和排序不计入 BatchGet 计时。
 
+`tests/run_remote_cpu_batch_get_miss_count_perf.sh` 和单配置性能脚本均支持
+`--batch-get-mode lookup|no-pipeline|raw`（默认 `lookup`），分别测试查表流水版、
+查表无流水版、裸地址流水版。无流水版每批填完 WQE 后进行 MTE3 拷贝，等拷贝
+完成再敲 doorbell，然后处理下一批；在途请求预算和 CQ 处理保持一致。
+重新执行 `./build.sh npu` 会同时生成无流水 kernel。日志和 CSV 的
+`batch_get_mode` 字段标明所测版本，也可用 `KVAF_BATCH_GET_MODE` 设置默认值。
+完整命令见 [BatchGet 性能测试说明](access_operator/demo/aiv_batch_get/README.md#batchget-variant-miss-count-performance-sweep)。
+
 `link_to()` 必须先于 `initialize()` 调用。调用方需要在 BatchGet 所在 stream 完成前保持
 输入/输出 Tensor 和 `DeviceAccessTable` 有效；Runtime 只管理内部 DDR、元数据和内部
 传输资源。

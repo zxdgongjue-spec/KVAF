@@ -155,6 +155,22 @@ The ACL launcher reserves 160 KiB of AIV local memory for the two WQE banks and
 SIMT validation scratch. Rebuild Host, Python binding and Kernel together: the
 launcher now requires the `KvafExecuteBatchGetAivKernelV3` symbol.
 
+### No-pipeline lookup variant
+
+The build also produces `bin/kvaf_execute_batch_get_no_pipeline_kernels.o`.
+It compiles the same source with `KVAF_BATCH_GET_PIPELINED=0`, preserving the
+128-byte V3 ABI. Each post uses one UB bank: fill up to 128 WQEs, wait for vector
+completion, copy the bank into SQ with MTE3, wait for copy completion, then
+update PI and ring the doorbell. The next post's vector fill waits for that
+scalar commit. SQ wrap still uses two copies before the doorbell.
+
+The performance mode `no-pipeline` uses the same table lookup, post size, Jetty
+rotation, inflight budget, CQ signaling and profiling as `lookup`. It removes
+overlap among WQE fill, SQ copy and doorbell submission; it does not wait for a
+remote READ completion after every post or disable the two-group inflight
+scheduler. The launcher loads one object per process, so compare variants in
+separate benchmark runs. No Runtime or Python binding ABI change is needed.
+
 ## Build and validate on A5
 
 ```bash
@@ -188,12 +204,25 @@ asc-devkit package matching the target CANN version before building; mixing
 headers from a different CANN release is not supported. The example above uses
 656 bytes per token, 128 tokens per block, and a 5% active probability.
 
-## Raw-address miss-count performance sweep
+## BatchGet variant miss-count performance sweep
 
-The existing `tests/run_remote_cpu_batch_get_miss_count_perf.sh` accepts
-`--raw-addresses` (or `KVAF_BATCH_GET_RAW_ADDRESSES=1`). It enables kernel
-profiling automatically and keeps the same statistics as lookup BatchGet.
-Rebuild the V3 host, Python binding and kernel first (`./build.sh npu`), start
+Both `tests/run_remote_cpu_batch_get_miss_count_perf.sh` and the single-shape
+`tests/run_remote_cpu_batch_get_perf.sh` accept `--batch-get-mode`:
+
+| Mode | Addressing | WQE submission | Kernel object |
+| --- | --- | --- | --- |
+| `lookup` (default) | Table lookup | Three-stage pipeline | `kvaf_execute_batch_get_kernels.o` |
+| `no-pipeline` | Table lookup | Fill, MTE3 copy, doorbell in sequence | `kvaf_execute_batch_get_no_pipeline_kernels.o` |
+| `raw` | Caller-prepared final addresses | Three-stage pipeline | `kvaf_execute_batch_get_kernels.o` |
+
+`KVAF_BATCH_GET_MODE` supplies the default mode. Explicit CLI selection takes
+precedence. The legacy `--raw-addresses` flag remains an alias for
+`--batch-get-mode raw`; do not combine the two flags. If `KVAF_BATCH_GET_MODE`
+is unset/empty, `KVAF_BATCH_GET_RAW_ADDRESSES=1` still selects raw mode.
+Missing kernel objects fail with a rebuild message; there is no fallback.
+
+The sweep enables kernel profiling automatically and keeps identical
+statistics for all three modes. Rebuild first (`./build.sh npu`), start
 the CPU peer service as usual, then run on the NPU client:
 
 ```bash
@@ -205,7 +234,7 @@ KVAF_BATCH_GET_SWEEP_AIV_CORES="2" \
 KVAF_BATCH_GET_SWEEP_JETTYS_PER_CORE="1" \
 KVAF_BATCH_GET_KERNEL_CLOCK_MHZ=1000 \
 bash tests/run_remote_cpu_batch_get_miss_count_perf.sh "$PWD/build-npu" \
-  --raw-addresses --request-length 8192 --table-capacity 8192 \
+  --batch-get-mode no-pipeline --request-length 8192 --table-capacity 8192 \
   --tokens-per-block 128 --warmup 3 --iterations 100
 ```
 
@@ -215,6 +244,10 @@ Omit them to retain the original 2646-shape sweep. Set
 otherwise its temporary path is printed at startup. Results also go to
 `batch_get_miss_sweep_summary.csv` in that directory. Configuration, kernel
 profile records, sweep results and CSV identify `address_mode=raw` or `lookup`.
+They also include `batch_get_mode=lookup|no-pipeline|raw` to distinguish the two
+lookup implementations. Change only `--batch-get-mode` to compare variants.
+When invoking the Python benchmark directly, `no-pipeline` selects the sibling
+`kvaf_execute_batch_get_no_pipeline_kernels.o` beside `KVAF_BATCH_GET_KERNEL`.
 
 For each sample, `kernel_total` uses the maximum elapsed kernel time across
 AIV cores. The summary reports `mean_us`, `p50_us`, `p90_us`, `p99_us` and
@@ -232,9 +265,12 @@ an incorrect value scales both reported time and bandwidth. Raw cycle counts
 are retained in per-shape logs.
 
 The host-only regression `python3 tests/python/test_batch_get_miss_sweep.py`
-checks both shell wrappers with synthetic profiles, including raw CLI/env
-selection, cycle conversion, bandwidth and CSV output. It does not measure
-hardware performance.
+checks both shell wrappers with synthetic profiles, including all three
+CLI/env modes, kernel selection, cycle conversion, bandwidth and CSV output.
+The `kvaf_batch_get_no_pipeline_model_test` CTest target executes the production
+kernel's serial specialization in the CPU shim, checking post ordering,
+payloads, tails, replay, SQ/CQ wrap and faults. These checks do not measure
+hardware performance or validate AIV DMA/cache visibility.
 
 ## Graph boundary
 

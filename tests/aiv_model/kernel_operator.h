@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #define __aicore__
 #define __global__
@@ -17,6 +18,8 @@ namespace aiv_model {
 alignas(64) inline uint8_t ub[160 * 1024];
 inline uint32_t core = 0;
 inline uint64_t cycle = 0;
+enum class PostStage { Fill, Copy, Doorbell };
+inline std::vector<PostStage> post_trace;
 void Poll(void* address);
 void Doorbell(uint32_t value, uint32_t* address);
 }  // namespace aiv_model
@@ -41,6 +44,7 @@ inline uintptr_t get_imm(uint32_t offset) {
   return reinterpret_cast<uintptr_t>(aiv_model::ub + offset);
 }
 inline void copy_ubuf_to_gm_align_v2(float* dst, float* src, uint64_t config, uint64_t) {
+  aiv_model::post_trace.push_back(aiv_model::PostStage::Copy);
   std::memcpy(dst, src, config >> 25U);
 }
 inline void st_dev(uint32_t value, uint32_t* address, int) {
@@ -65,6 +69,7 @@ namespace Simt {
 struct Dim3 { uint32_t x, y, z; };
 template <auto Function, typename... Args>
 void VF_CALL(Dim3 dim, Args... args) {
+  aiv_model::post_trace.push_back(aiv_model::PostStage::Fill);
   for (threadIdx.x = 0; threadIdx.x < dim.x; ++threadIdx.x) Function(args...);
 }
 }  // namespace Simt

@@ -174,6 +174,7 @@ build_npu() {
   cmake --build "$build_dir" --parallel "$jobs"
   echo "[KVAF_BUILD] NPU Python package: $build_dir/python/kvaf"
   echo "[KVAF_BUILD] BatchGet kernel: $build_dir/bin/kvaf_execute_batch_get_kernels.o"
+  echo "[KVAF_BUILD] BatchGet no-pipeline kernel: $build_dir/bin/kvaf_execute_batch_get_no_pipeline_kernels.o"
   echo "[KVAF_BUILD] BatchPut kernel: $build_dir/bin/kvaf_execute_batch_put_kernels.o"
   echo "[KVAF_BUILD] NPU HBM service: $build_dir/runtime/kvaf_npu_service"
 }

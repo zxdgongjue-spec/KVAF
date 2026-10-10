@@ -35,6 +35,40 @@ class InflightConfigTests(unittest.TestCase):
         with patch.dict(os.environ, {"KVAF_BATCH_GET_RAW_ADDRESSES": "1"}, clear=True):
             self.assertTrue(perf.parse_args([]).raw_addresses)
 
+    def test_operator_modes_and_environment_precedence(self):
+        self.assertEqual(self.parse().batch_get_mode, "lookup")
+        for mode in ("lookup", "no-pipeline", "raw"):
+            with patch.dict(os.environ, {
+                "KVAF_BATCH_GET_MODE": mode, "KVAF_BATCH_GET_RAW_ADDRESSES": "1",
+            }, clear=True):
+                args = perf.parse_args([])
+                self.assertEqual(args.batch_get_mode, mode)
+                self.assertEqual(args.raw_addresses, mode == "raw")
+                self.assertEqual(perf.parse_args(["--batch-get-mode", "lookup"]).batch_get_mode,
+                                 "lookup")
+                self.assertEqual(perf.parse_args(["--raw-addresses"]).batch_get_mode, "raw")
+        with contextlib.redirect_stderr(io.StringIO()):
+            for options in (("--batch-get-mode", "bad"), ("--batch-get-mode",),
+                            ("--batch-get-mode", "lookup", "--raw-addresses"),
+                            ("--batch-get-mode", "no-pipeline", "--raw-addresses")):
+                with self.assertRaises(SystemExit) as caught:
+                    self.parse(*options)
+                self.assertEqual(caught.exception.code, 2)
+            with patch.dict(os.environ, {"KVAF_BATCH_GET_MODE": "bad"}, clear=True):
+                with self.assertRaises(SystemExit) as caught:
+                    perf.parse_args([])
+                self.assertEqual(caught.exception.code, 2)
+
+    def test_no_pipeline_kernel_selection(self):
+        with patch.dict(os.environ, {
+            "KVAF_BATCH_GET_KERNEL": "/build/bin/kvaf_execute_batch_get_kernels.o",
+        }, clear=True):
+            self.assertEqual(str(perf.batch_get_kernel_path("no-pipeline")),
+                             "/build/bin/kvaf_execute_batch_get_no_pipeline_kernels.o")
+            for mode in ("lookup", "raw"):
+                self.assertEqual(str(perf.batch_get_kernel_path(mode)),
+                                 os.environ["KVAF_BATCH_GET_KERNEL"])
+
     def test_profile_excludes_intermediate_waits_from_post(self):
         profile = {
             "core": 0, "kernel_start_cycle": 10, "setup_done_cycle": 20,

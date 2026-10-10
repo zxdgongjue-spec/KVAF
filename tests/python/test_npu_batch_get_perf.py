@@ -15,6 +15,7 @@ environment variables:
     --token-bytes          KVAF_BATCH_GET_PERF_TOKEN_BYTES
     --miss-count           KVAF_BATCH_GET_PERF_MISS_COUNT
     --max-inflight-total   KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL
+    --batch-get-mode       KVAF_BATCH_GET_MODE (lookup, no-pipeline, raw)
     --raw-addresses        KVAF_BATCH_GET_RAW_ADDRESSES=1
     --source-access-pattern
                            KVAF_BATCH_GET_PERF_SOURCE_ACCESS_PATTERN
@@ -94,15 +95,20 @@ def configured_adaptive_ub_devices() -> list[str]:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
+        allow_abbrev=False,
         description=(
             "Measure NPU BatchGet performance with an independently configurable "
             "request length, table capacity, block layout and exact miss count."
         )
     )
-    parser.add_argument(
-        "--raw-addresses", action="store_true",
-        default=os.environ.get("KVAF_BATCH_GET_RAW_ADDRESSES") == "1",
-        help="pass final remote/local addresses; prepare addresses outside timed BatchGet",
+    mode_options = parser.add_mutually_exclusive_group()
+    mode_options.add_argument(
+        "--batch-get-mode", choices=("lookup", "no-pipeline", "raw"),
+        help="lookup: pipelined table lookup; no-pipeline: serial table lookup; raw: pipelined final addresses",
+    )
+    mode_options.add_argument(
+        "--raw-addresses", action="store_const", const="raw", dest="batch_get_mode",
+        help="alias for --batch-get-mode raw; address preparation is outside timed BatchGet",
     )
     parser.add_argument(
         "--peer-device", choices=("cpu", "npu"),
@@ -289,6 +295,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="total unconfirmed READ limit across AIV cores; 0 uses the baseline",
     )
     args = parser.parse_args(argv)
+    if args.batch_get_mode is None:
+        args.batch_get_mode = (
+            os.environ.get("KVAF_BATCH_GET_MODE") or
+            ("raw" if os.environ.get("KVAF_BATCH_GET_RAW_ADDRESSES") == "1" else "lookup")
+        )
+    if args.batch_get_mode not in ("lookup", "no-pipeline", "raw"):
+        parser.error("KVAF_BATCH_GET_MODE must be lookup, no-pipeline, or raw")
+    args.raw_addresses = args.batch_get_mode == "raw"
     # CPU device names are not NPU service candidates. Do not forward the
     # CPU default allowlist to an NPU peer, even when tuning is disabled.
     args.adaptive_peer_ub_devices = (
@@ -438,6 +452,7 @@ def print_kernel_profile(
     miss_count: int,
     token_bytes: int,
     address_mode: str = "lookup",
+    batch_get_mode: str | None = None,
 ) -> None:
     if not samples or any(len(sample) != npu_core_count for sample in samples):
         raise AssertionError("BatchGet kernel profile sample/core count mismatch")
@@ -590,7 +605,8 @@ def print_kernel_profile(
             f"p90_cycles={percentile(cycle_values, 0.90):.3f} "
             f"p99_cycles={percentile(cycle_values, 0.99):.3f} "
             f"units={request_length}_requests_per_call{useful_gibps} "
-            f"address_mode={address_mode}"
+            f"address_mode={address_mode} "
+            f"batch_get_mode={batch_get_mode or address_mode}"
         )
     divisor = float(len(samples))
     for core, accumulator in enumerate(per_core):
@@ -602,6 +618,15 @@ def print_kernel_profile(
                 for name, value in accumulator.items()
             )
         )
+
+
+def batch_get_kernel_path(batch_get_mode: str) -> Path:
+    kernel = Path(os.environ.get(
+        "KVAF_BATCH_GET_KERNEL", os.environ.get("KVAF_AIV_BATCH_GET_KERNEL", "")
+    ))
+    if batch_get_mode == "no-pipeline":
+        kernel = kernel.parent / "kvaf_execute_batch_get_no_pipeline_kernels.o"
+    return kernel
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -646,15 +671,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("SKIP: set KVAF_RUN_NPU_TESTS=1 on the A5/CANN target")
         return 0
 
-    kernel = Path(
-        os.environ.get(
-            "KVAF_BATCH_GET_KERNEL",
-            os.environ.get("KVAF_AIV_BATCH_GET_KERNEL", ""),
-        )
-    )
+    kernel = batch_get_kernel_path(args.batch_get_mode)
     if not kernel.is_file():
         print(
-            "FAIL: KVAF_BATCH_GET_KERNEL must name the built kernel object",
+            f"FAIL: missing BatchGet kernel for {args.batch_get_mode}: {kernel}; rebuild with ./build.sh npu",
             file=sys.stderr,
         )
         return 2
@@ -717,6 +737,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             "BATCH_GET_PERF_CONFIG "
             f"address_mode={'raw' if args.raw_addresses else 'lookup'} "
+            f"batch_get_mode={args.batch_get_mode} kernel={kernel} "
             f"peer_device={args.peer_device} peer_service_addr={args.peer_service_addr} "
             f"request_length={request_length} table_capacity={table_capacity} "
             f"tokens_per_block={tokens_per_block} token_bytes={token_bytes} "
@@ -975,6 +996,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 miss_count_value,
                 token_bytes,
                 address_mode="raw" if args.raw_addresses else "lookup",
+                batch_get_mode=args.batch_get_mode,
             )
             runtime.stop_batch_get_kernel_profile()
             kernel_profile_started = False

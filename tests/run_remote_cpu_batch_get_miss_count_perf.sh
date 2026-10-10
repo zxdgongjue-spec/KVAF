@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
 # Sweep BatchGet token sizes, exact miss counts, AIV cores and Jettys per core,
-# then summarize AIV time and bandwidth. Add --raw-addresses for raw BatchGet.
+# then summarize AIV time and bandwidth. Select lookup/no-pipeline/raw with
+# --batch-get-mode (default lookup); --raw-addresses remains an alias for raw.
 # The runner supports CPU DDR and NPU HBM; --peer-device/--peer-service-addr
 # and KVAF_PEER_DEVICE/KVAF_PEER_SERVICE_ADDR are passed through to each shape.
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 /absolute/path/to/kvaf/build-npu [batch-get-perf-options...]" >&2
+  echo "Usage: $0 /absolute/path/to/kvaf/build-npu [--batch-get-mode lookup|no-pipeline|raw] [batch-get-perf-options...]" >&2
   exit 2
 fi
 
 KVAF_BUILD_DIR="$1"
 shift
 KVAF_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$KVAF_ROOT/tests/batch_get_perf_mode.sh"
+kvaf_batch_get_parse_mode "$@"
 : "${KVAF_BATCH_GET_PERF_RUNNER:=$KVAF_ROOT/tests/run_remote_cpu_batch_get_perf.sh}"
 # Space-separated overrides allow a short smoke sweep without changing the
-# original full matrix. These options affect both lookup and raw-address modes.
+# original full matrix. These options affect all three operator modes.
 read -r -a KVAF_BATCH_GET_TOKEN_BYTES <<< "${KVAF_BATCH_GET_SWEEP_TOKEN_BYTES:-128 256 512 656 1024 2048 4096}"
 read -r -a KVAF_BATCH_GET_MISS_COUNTS <<< "${KVAF_BATCH_GET_SWEEP_MISS_COUNTS:-32 64 128 256 512 1024 2048 4096 8192}"
 read -r -a KVAF_BATCH_GET_AIV_CORES <<< "${KVAF_BATCH_GET_SWEEP_AIV_CORES:-1 2 4 8 16 32}"
@@ -40,16 +43,6 @@ validate_values KVAF_BATCH_GET_SWEEP_TOKEN_BYTES 1 2147483647 ${KVAF_BATCH_GET_T
 validate_values KVAF_BATCH_GET_SWEEP_MISS_COUNTS 0 2147483647 ${KVAF_BATCH_GET_MISS_COUNTS[@]+"${KVAF_BATCH_GET_MISS_COUNTS[@]}"}
 validate_values KVAF_BATCH_GET_SWEEP_AIV_CORES 1 48 ${KVAF_BATCH_GET_AIV_CORES[@]+"${KVAF_BATCH_GET_AIV_CORES[@]}"}
 validate_values KVAF_BATCH_GET_SWEEP_JETTYS_PER_CORE 1 64 ${KVAF_BATCH_GET_JETTYS_PER_CORE[@]+"${KVAF_BATCH_GET_JETTYS_PER_CORE[@]}"}
-
-address_mode=lookup
-if [[ "${KVAF_BATCH_GET_RAW_ADDRESSES:-0}" == 1 ]]; then
-  address_mode=raw
-fi
-for option in "$@"; do
-  if [[ "$option" == --raw-addresses ]]; then
-    address_mode=raw
-  fi
-done
 
 [[ -x "$KVAF_BATCH_GET_PERF_RUNNER" ]] || {
   echo "ERROR: BatchGet performance runner is not executable: $KVAF_BATCH_GET_PERF_RUNNER" >&2
@@ -82,7 +75,7 @@ echo "BATCH_GET_MISS_SWEEP_LOG_DIR path=$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR"
 KVAF_BATCH_GET_SWEEP_COMBINATIONS=$((${#KVAF_BATCH_GET_TOKEN_BYTES[@]} *
   ${#KVAF_BATCH_GET_MISS_COUNTS[@]} * ${#KVAF_BATCH_GET_AIV_CORES[@]} *
   ${#KVAF_BATCH_GET_JETTYS_PER_CORE[@]}))
-echo "BATCH_GET_MISS_SWEEP_PLAN address_mode=$address_mode token_sizes=${#KVAF_BATCH_GET_TOKEN_BYTES[@]} miss_counts=${#KVAF_BATCH_GET_MISS_COUNTS[@]} aiv_core_counts=${#KVAF_BATCH_GET_AIV_CORES[@]} jetty_counts=${#KVAF_BATCH_GET_JETTYS_PER_CORE[@]} combinations=$KVAF_BATCH_GET_SWEEP_COMBINATIONS"
+echo "BATCH_GET_MISS_SWEEP_PLAN address_mode=$address_mode batch_get_mode=$batch_get_mode token_sizes=${#KVAF_BATCH_GET_TOKEN_BYTES[@]} miss_counts=${#KVAF_BATCH_GET_MISS_COUNTS[@]} aiv_core_counts=${#KVAF_BATCH_GET_AIV_CORES[@]} jetty_counts=${#KVAF_BATCH_GET_JETTYS_PER_CORE[@]} combinations=$KVAF_BATCH_GET_SWEEP_COMBINATIONS"
 
 extract_field() {
   local record="$1"
@@ -336,6 +329,7 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
       "p50_GBps=$p50_gbps"
       "selected_ub_device=$shape_ub_device"
       "address_mode=$address_mode"
+      "batch_get_mode=$batch_get_mode"
     )
     printf '%s\n' "${result[*]}"
         echo "BATCH_GET_CONFIG_SWEEP_DONE token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core"
@@ -347,8 +341,8 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
   echo "BATCH_GET_TOKEN_SWEEP_DONE token_bytes=$token_bytes"
 done
 
-printf '\nBATCH_GET_MISS_SWEEP_SUMMARY combinations=%s units=us clock_mhz=%s aggregation=max_elapsed_across_cores address_mode=%s\n' \
-  "${#mean_us_values[@]}" "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" "$address_mode"
+printf '\nBATCH_GET_MISS_SWEEP_SUMMARY combinations=%s units=us clock_mhz=%s aggregation=max_elapsed_across_cores address_mode=%s batch_get_mode=%s\n' \
+  "${#mean_us_values[@]}" "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" "$address_mode" "$batch_get_mode"
 printf 'BATCH_GET_MISS_SWEEP_STAGE_SUMMARY stage=kernel_total\n'
 printf '%-12s %-12s %-12s %-18s %15s %15s %15s %15s %15s\n' \
   token_bytes miss_count aiv_cores jettys_per_core mean_us p50_us p90_us p99_us p50_GB/s
@@ -401,9 +395,9 @@ echo "BATCH_GET_MISS_SWEEP_CLOCK clock_mhz=$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ conv
 mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
 {
   printf '%s\n' \
-    'token_bytes,miss_count,aiv_cores,jettys_per_core,mean_us,p50_us,p90_us,p99_us,p50_GBps,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us,selected_ub_device,address_mode'
+    'token_bytes,miss_count,aiv_cores,jettys_per_core,mean_us,p50_us,p90_us,p99_us,p50_GBps,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us,selected_ub_device,address_mode,batch_get_mode'
   for index in "${!mean_us_values[@]}"; do
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "${token_bytes_values[$index]}" \
       "${miss_count_values[$index]}" \
       "${aiv_core_values[$index]}" \
@@ -422,7 +416,8 @@ mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
       "${completion_wait_p90_us_values[$index]}" \
       "${completion_wait_p99_us_values[$index]}" \
       "${selected_ub_device_values[$index]}" \
-      "$address_mode"
+      "$address_mode" \
+      "$batch_get_mode"
   done
 } >"$KVAF_BATCH_GET_MISS_SWEEP_CSV"
 echo "BATCH_GET_MISS_SWEEP_CSV_WRITTEN path=$KVAF_BATCH_GET_MISS_SWEEP_CSV rows=${#mean_us_values[@]}"

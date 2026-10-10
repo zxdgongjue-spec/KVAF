@@ -4,18 +4,23 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 /absolute/path/to/kvaf/build-npu [batch-get-perf-options...]" >&2
+  echo "Usage: $0 /absolute/path/to/kvaf/build-npu [--batch-get-mode lookup|no-pipeline|raw] [batch-get-perf-options...]" >&2
   exit 2
 fi
 
 KVAF_BUILD_DIR="$1"
 shift
 KVAF_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$KVAF_ROOT/tests/batch_get_perf_mode.sh"
+kvaf_batch_get_parse_mode "$@"
 KVAF_GET_KERNEL="$KVAF_BUILD_DIR/bin/kvaf_execute_batch_get_kernels.o"
+if [[ "$batch_get_mode" == no-pipeline ]]; then
+  KVAF_GET_KERNEL="$KVAF_BUILD_DIR/bin/kvaf_execute_batch_get_no_pipeline_kernels.o"
+fi
 KVAF_PUT_KERNEL="$KVAF_BUILD_DIR/bin/kvaf_execute_batch_put_kernels.o"
 
 [[ -s "$KVAF_GET_KERNEL" && -s "$KVAF_PUT_KERNEL" && -d "$KVAF_BUILD_DIR/python/kvaf" ]] || {
-  echo "ERROR: expected AIV kernels and Python binding under $KVAF_BUILD_DIR" >&2
+  echo "ERROR: expected $KVAF_GET_KERNEL, $KVAF_PUT_KERNEL and Python binding under $KVAF_BUILD_DIR; rebuild with ./build.sh npu" >&2
   exit 1
 }
 

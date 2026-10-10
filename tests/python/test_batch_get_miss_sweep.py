@@ -27,7 +27,7 @@ class MissSweepTests(unittest.TestCase):
         build = self.directory / "build"
         (build / "bin").mkdir(parents=True)
         (build / "python" / "kvaf").mkdir(parents=True)
-        for name in ("get", "put"):
+        for name in ("get", "get_no_pipeline", "put"):
             (build / "bin" / f"kvaf_execute_batch_{name}_kernels.o").write_bytes(b"stub")
         self.build = build
         # macOS need not have GNU timeout. This stub only forwards its argv;
@@ -48,9 +48,15 @@ class MissSweepTests(unittest.TestCase):
             assert args.kernel_profile
             mode = "raw" if args.raw_addresses else "lookup"
             assert mode == os.environ["EXPECTED_ADDRESS_MODE"]
+            assert args.batch_get_mode == os.environ["EXPECTED_BATCH_GET_MODE"]
+            filename = ("kvaf_execute_batch_get_no_pipeline_kernels.o"
+                        if args.batch_get_mode == "no-pipeline"
+                        else "kvaf_execute_batch_get_kernels.o")
+            assert os.path.basename(os.environ["KVAF_BATCH_GET_KERNEL"]) == filename
+            assert perf.batch_get_kernel_path(args.batch_get_mode).name == filename
             assert args.peer_service_addr == "test-peer:28999"
             assert args.max_inflight_total == 8
-            print(f"BATCH_GET_PERF_CONFIG address_mode={{mode}}")
+            print(f"BATCH_GET_PERF_CONFIG address_mode={{mode}} batch_get_mode={{args.batch_get_mode}}")
             # An unrelated host timing must never be used by the sweep.
             print("PERF_RESULT operation=batch_get mean_ms=200 p50_ms=200")
             sample = []
@@ -77,7 +83,7 @@ class MissSweepTests(unittest.TestCase):
             perf.print_kernel_profile([sample], args.warmup,
                 args.kernel_profile_clock_mhz, args.aiv_cores, args.jettys_per_core,
                 args.request_length, args.miss_count, args.token_bytes,
-                address_mode=mode)
+                address_mode=mode, batch_get_mode=args.batch_get_mode)
             """))
         runner.chmod(0o755)
         self.environment = {
@@ -94,6 +100,7 @@ class MissSweepTests(unittest.TestCase):
             "KVAF_BATCH_GET_SWEEP_JETTYS_PER_CORE": "2",
             "KVAF_BATCH_GET_KERNEL_CLOCK_MHZ": "500",
             "EXPECTED_ADDRESS_MODE": "lookup",
+            "EXPECTED_BATCH_GET_MODE": "lookup",
         })
 
     def run_sweep(self, *options):
@@ -106,17 +113,28 @@ class MissSweepTests(unittest.TestCase):
         )
 
     def test_modes_timing_bandwidth_and_csv(self):
-        for mode, options, raw_env in (
-            ("lookup", (), "0"),
-            ("raw", ("--raw-addresses",), "0"),
-            ("raw", (), "1"),
+        for batch_get_mode, options, raw_env, mode_env in (
+            ("lookup", (), "0", ""),
+            ("raw", ("--raw-addresses",), "0", ""),
+            ("raw", (), "1", ""),
+            ("lookup", ("--batch-get-mode", "lookup"), "1", ""),
+            ("no-pipeline", ("--batch-get-mode", "no-pipeline"), "0", ""),
+            ("no-pipeline", ("--batch-get-mode=no-pipeline",), "1", "raw"),
+            ("raw", ("--batch-get-mode", "raw"), "0", "no-pipeline"),
+            ("no-pipeline", (), "1", "no-pipeline"),
+            ("lookup", (), "1", "lookup"),
+            ("raw", ("--raw-addresses",), "0", "no-pipeline"),
         ):
-            with self.subTest(mode=mode, options=options):
+            mode = "raw" if batch_get_mode == "raw" else "lookup"
+            with self.subTest(mode=batch_get_mode, options=options):
                 self.environment["EXPECTED_ADDRESS_MODE"] = mode
+                self.environment["EXPECTED_BATCH_GET_MODE"] = batch_get_mode
+                self.environment["KVAF_BATCH_GET_MODE"] = mode_env
                 self.environment["KVAF_BATCH_GET_RAW_ADDRESSES"] = raw_env
                 result = self.run_sweep(*options)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(f"address_mode={mode}", result.stdout)
+                self.assertIn(f"batch_get_mode={batch_get_mode}", result.stdout)
                 self.assertIn("combinations=2", result.stdout)
                 self.assertIn("stage=kernel_post", result.stdout)
                 self.assertIn("stage=kernel_completion_wait", result.stdout)
@@ -126,6 +144,7 @@ class MissSweepTests(unittest.TestCase):
                 self.assertEqual(len(rows), 2)
                 for row, count in zip(rows, (0, 64)):
                     self.assertEqual(row["address_mode"], mode)
+                    self.assertEqual(row["batch_get_mode"], batch_get_mode)
                     self.assertEqual(int(row["miss_count"]), count)
                     self.assertEqual(float(row["mean_us"]), 16)
                     self.assertEqual(float(row["p50_us"]), 16)
@@ -139,8 +158,31 @@ class MissSweepTests(unittest.TestCase):
                     fields = dict(field.split("=", 1) for field in total.split()[1:])
                     self.assertEqual(fields["mean_us"], "16.000")
                     self.assertEqual(fields["address_mode"], mode)
+                    self.assertEqual(fields["batch_get_mode"], batch_get_mode)
                     expected_gibps = count * 128 / (16 / 1_000_000) / (1024 ** 3)
                     self.assertAlmostEqual(float(fields["useful_GiBps"]), expected_gibps, places=3)
+
+    def test_invalid_modes_fail_before_launch(self):
+        for options in (
+            ("--batch-get-mode", "unknown"), ("--batch-get-mode",),
+            ("--batch-get-mode=",),
+            ("--batch-get-mode", "lookup", "--raw-addresses"),
+            ("--raw-addresses", "--batch-get-mode", "no-pipeline"),
+        ):
+            with self.subTest(options=options):
+                result = self.run_sweep(*options)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("ERROR:", result.stderr)
+                self.assertNotIn("BATCH_GET_PERF_CONFIG", result.stdout)
+        self.environment["KVAF_BATCH_GET_MODE"] = "unknown"
+        self.assertEqual(self.run_sweep().returncode, 2)
+
+    def test_missing_no_pipeline_kernel_fails_without_fallback(self):
+        (self.build / "bin/kvaf_execute_batch_get_no_pipeline_kernels.o").unlink()
+        result = self.run_sweep("--batch-get-mode", "no-pipeline")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("kvaf_execute_batch_get_no_pipeline_kernels.o", result.stdout)
+        self.assertNotIn("BATCH_GET_PERF_CONFIG", result.stdout)
 
     def test_invalid_sweep_lists_fail_before_launch(self):
         for name, value in (
