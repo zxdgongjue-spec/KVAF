@@ -1,4 +1,5 @@
 #include "aicpu_urma/host.h"
+#include "aiv_sq_copy_benchmark/host.h"
 #include "aicpu_urma_client_metrics.h"
 #include "aicpu_urma_client_options.h"
 #include "direct_hccp/direct_hccp_remote_transport.h"
@@ -37,7 +38,7 @@ void Usage(const char* program) {
       "[--sq-batch-wqes 8|16|32|64] [--sq-copy memcpy_sp] "
       "[--eid-list-index N] [--kernel-json PATH] [--warmup N] [--iterations N]\n"
       "Defaults: aicpu-cores=5 bytes=131072 sq-batch-wqes=8 sq-copy=memcpy_sp warmup=10 iterations=1000.\n"
-      "Compares stack/HBM -> HBM/driver SQ; no peer or doorbell.\n", program);
+      "Compares AICPU stack/HBM and AIV UB/HBM -> the same HBM/driver SQ; no peer or doorbell.\n", program);
 }
 
 bool Parse(int argc, char** argv, Options* options) {
@@ -194,26 +195,71 @@ struct Samples {
   std::array<std::uint64_t, benchmark::kSqCopyBenchmarkMaxWorkers> cpu_samples{};
 };
 
-void Print(const Options& options, const Samples& samples, const char* source, const char* target,
+double CalibrateAivClock(benchmark::SqCopyBenchmarkArgs args, const DeviceBuffer& status_buffer,
+                          aclrtStream stream) {
+  struct ClockSample {
+    std::uint64_t ticks{0U};
+    std::uint64_t host_ns{UINT64_MAX};
+  };
+  std::array<ClockSample, 2> fastest;
+  const std::array<std::uint64_t, 2> durations{2000000U, 20000000U};
+  args.workers = 1U;
+  args.round = durations[0];
+  Require(kvaf::aiv_sq_copy::LaunchClock(&args, stream) == 0, "warm up AIV clock");
+  Acl(aclrtSynchronizeStream(stream), "synchronize AIV clock warmup");
+  for (std::uint32_t sample = 0U; sample < 3U; ++sample) {
+    for (std::uint32_t phase = 0U; phase < 2U; ++phase) {
+      const auto index = (sample + phase) % 2U;
+      args.round = durations[index];
+      const auto begin = std::chrono::steady_clock::now();
+      Require(kvaf::aiv_sq_copy::LaunchClock(&args, stream) == 0, "launch AIV clock calibration");
+      Acl(aclrtSynchronizeStream(stream), "synchronize AIV clock calibration");
+      const auto host_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - begin).count());
+      benchmark::SqCopyBenchmarkStatus status{};
+      status_buffer.Download(&status, sizeof(status));
+      Require(status.magic == benchmark::kSqCopyBenchmarkMagic && status.result == 0U &&
+          status.copy_end_ns > status.copy_begin_ns &&
+          status.copy_end_ns - status.copy_begin_ns >= durations[index], "invalid AIV clock sample");
+      if (host_ns < fastest[index].host_ns)
+        fastest[index] = {status.copy_end_ns - status.copy_begin_ns, host_ns};
+    }
+  }
+  Require(fastest[1].host_ns > fastest[0].host_ns && fastest[1].ticks > fastest[0].ticks,
+          "AIV clock calibration failed");
+  const auto ns_per_tick = static_cast<double>(fastest[1].host_ns - fastest[0].host_ns) /
+      static_cast<double>(fastest[1].ticks - fastest[0].ticks);
+  std::fprintf(stdout, "AIV_COPY_CLOCK estimated_ns_per_tick=%.6f estimated_MHz=%.3f "
+      "short_host_us=%.3f long_host_us=%.3f method=two_duration_min_of_3\n",
+      ns_per_tick, 1000.0 / ns_per_tick, fastest[0].host_ns / 1000.0, fastest[1].host_ns / 1000.0);
+  return ns_per_tick;
+}
+
+void Print(const Options& options, const Samples& samples, const char* engine,
+           const char* source, const char* target,
            const std::vector<benchmark::SqCopyBenchmarkQueue>& queues) {
+  const bool aiv = std::strcmp(engine, "aiv") == 0;
   const auto stats = kvaf::aicpu_urma_client::SummarizeTiming(samples.wall_ms, options.bytes);
   std::fprintf(stdout,
-      "SQ_COPY_STATS source=%s target=%s workers=%u total_bytes=%llu chunk_bytes=%u "
+      "SQ_COPY_STATS engine=%s source=%s target=%s workers=%u total_bytes=%llu chunk_bytes=%u "
       "min_us=%.3f p50_us=%.3f p95_us=%.3f p99_us=%.3f max_us=%.3f mean_us=%.3f GBps=%.3f\n",
-      source, target, options.workers, static_cast<unsigned long long>(options.bytes), options.batch_wqes * 192U,
+      engine, source, target, options.workers, static_cast<unsigned long long>(options.bytes), options.batch_wqes * 192U,
       stats.min_ms * 1000.0, stats.p50_ms * 1000.0, stats.p95_ms * 1000.0,
       stats.p99_ms * 1000.0, stats.max_ms * 1000.0, stats.mean_ms * 1000.0, stats.mean_gbps);
+  std::fprintf(stdout, "  Copy wall: %s\n",
+      aiv ? "first worker copy start to last MTE3 completion; us estimated from AIV clock calibration."
+          : "first worker copy start to last memcpy_sp return; includes start spread; no DSB.");
   std::fprintf(stdout,
-      "  Copy wall: first worker copy start to last worker copy return; includes start spread; no DSB.\n"
       "  Host launch + sync mean: %.3f us (includes untimed source preparation and data verification).\n"
-      "  Per-worker averages (us): start offset | memcpy_sp calls | thread CPU | estimated off-CPU.\n",
+      "  Per-worker averages (us): start offset | copy duration.\n",
       samples.host_ns / options.iterations / 1000.0);
   for (std::uint32_t worker = 0U; worker < options.workers; ++worker) {
     std::fprintf(stdout, "  worker=%u bytes=%llu start_us=%.3f copy_us=%.3f ", worker,
         static_cast<unsigned long long>(queues[worker].bytes),
         samples.start_ns[worker] / options.iterations / 1000.0,
         samples.copy_ns[worker] / options.iterations / 1000.0);
-    if (samples.cpu_samples[worker] != 0U)
+    if (aiv) std::fprintf(stdout, "completion=MTE3\n");
+    else if (samples.cpu_samples[worker] != 0U)
       std::fprintf(stdout, "thread_cpu_us=%.3f offcpu_estimate_us=%.3f cpu_samples=%llu/%u\n",
           samples.cpu_ns[worker] / samples.cpu_samples[worker] / 1000.0,
           samples.offcpu_ns[worker] / samples.cpu_samples[worker] / 1000.0,
@@ -226,6 +272,7 @@ int Run(const Options& options) {
   Require(kvaf::aicpu_urma_client::ConfigureCannEnvironment(), "configure CANN environment");
   AclContext acl(options.device_id);
   Require(benchmark::Load(options.kernel_json.c_str()), "load AICPU kernel");
+  Require(kvaf::aiv_sq_copy::Load(KVAF_AIV_SQ_COPY_KERNEL_OBJECT), "load AIV SQ copy kernel");
   DedicatedQueues dedicated;
   dedicated.Initialize(options);
   DeviceBuffer hbm(benchmark::kSqCopyBenchmarkQueueBytes * options.workers);
@@ -248,13 +295,14 @@ int Run(const Options& options) {
         static_cast<unsigned long long>(queues[worker].capacity),
         static_cast<unsigned long long>(queues[worker].bytes));
   }
-  std::array<Samples, 4> samples;
+  std::array<Samples, 8> samples;
   std::vector<std::uint8_t> source_data(static_cast<std::size_t>(queues.front().bytes));
   std::vector<benchmark::SqCopyBenchmarkStatus> statuses(options.workers);
   benchmark::SqCopyBenchmarkArgs args{reinterpret_cast<std::uint64_t>(queue_buffer.data),
       reinterpret_cast<std::uint64_t>(status_buffer.data), reinterpret_cast<std::uint64_t>(counter_buffer.data),
       0U, options.workers, options.batch_wqes, 0U, options.copy_mode,
       reinterpret_cast<std::uint64_t>(counter_buffer.data) + sizeof(std::uint64_t)};
+  const auto aiv_ns_per_tick = CalibrateAivClock(args, status_buffer, acl.stream);
   const auto rounds = static_cast<std::uint64_t>(options.warmup) + options.iterations;
   for (std::uint64_t round = 0U; round < rounds; ++round) {
     for (std::uint32_t worker = 0U; worker < options.workers; ++worker) {
@@ -268,13 +316,24 @@ int Run(const Options& options) {
     for (auto& queue : queues) queue.offset = (round % (queue.capacity / queue.bytes)) * queue.bytes;
     queue_buffer.Upload(queues.data(), queues.size() * sizeof(queues.front()));
     args.round = round;
-    for (std::uint32_t phase = 0U; phase < 4U; ++phase) {
-      const auto target = static_cast<std::uint32_t>((round + phase) % 4U);
+    for (std::uint32_t phase = 0U; phase < 8U; ++phase) {
+      const auto case_index = static_cast<std::uint32_t>((round + phase) % 8U);
+      const auto target = case_index % 4U;
+      const bool aiv = case_index >= 4U;
+      const auto time_scale = aiv ? aiv_ns_per_tick : 1.0;
       args.target_sq = target;
       Acl(aclrtMemset(counter_buffer.data, counter_buffer.bytes, 0, counter_buffer.bytes), "reset counter");
       Acl(aclrtMemset(status_buffer.data, status_buffer.bytes, 0, status_buffer.bytes), "reset status");
       const auto host_begin = std::chrono::steady_clock::now();
-      Require(benchmark::LaunchSqCopyBenchmark(&args, acl.stream) == 0, "launch SQ copy benchmark");
+      if (aiv) {
+        Require(kvaf::aiv_sq_copy::LaunchCopy(&args, acl.stream) == 0, "launch AIV SQ copy benchmark");
+        if (benchmark::LaunchSqCopyVerify(&args, acl.stream) != 0) {
+          (void)aclrtSynchronizeStream(acl.stream);
+          throw std::runtime_error("launch AIV copy data verification");
+        }
+      } else {
+        Require(benchmark::LaunchSqCopyBenchmark(&args, acl.stream) == 0, "launch AICPU SQ copy benchmark");
+      }
       Acl(aclrtSynchronizeStream(acl.stream), "synchronize SQ copy benchmark");
       const auto host_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now() - host_begin).count();
@@ -286,9 +345,10 @@ int Run(const Options& options) {
         if (status.magic != benchmark::kSqCopyBenchmarkMagic || status.result != 0U ||
             status.worker != worker || status.round != round || status.bytes != queues[worker].bytes ||
             status.copy_end_ns <= status.copy_begin_ns) {
-          std::fprintf(stderr, "SQ_COPY_FAIL source=%s target=%s worker=%u round=%llu result=%llu "
+          std::fprintf(stderr, "SQ_COPY_FAIL engine=%s source=%s target=%s worker=%u round=%llu result=%llu "
               "mismatch_offset=%llu expected=0x%llx actual=0x%llx\n",
-              target >= 2U ? "hbm" : "stack", (target & 1U) != 0U ? "sq" : "hbm", worker,
+              aiv ? "aiv" : "aicpu", target >= 2U ? "hbm" : (aiv ? "ub" : "stack"),
+              (target & 1U) != 0U ? "sq" : "hbm", worker,
               static_cast<unsigned long long>(round), static_cast<unsigned long long>(status.result),
               static_cast<unsigned long long>(status.mismatch_offset),
               static_cast<unsigned long long>(status.expected), static_cast<unsigned long long>(status.actual));
@@ -298,14 +358,14 @@ int Run(const Options& options) {
         last = std::max(last, status.copy_end_ns);
       }
       if (round < options.warmup) continue;
-      auto& sample = samples[target];
-      sample.wall_ms.push_back(static_cast<double>(last - first) / 1000000.0);
+      auto& sample = samples[case_index];
+      sample.wall_ms.push_back(static_cast<double>(last - first) * time_scale / 1000000.0);
       sample.host_ns += host_ns;
       for (std::uint32_t worker = 0U; worker < options.workers; ++worker) {
         const auto& status = statuses[worker];
         const auto elapsed = status.copy_end_ns - status.copy_begin_ns;
-        sample.start_ns[worker] += status.copy_begin_ns - first;
-        sample.copy_ns[worker] += elapsed;
+        sample.start_ns[worker] += (status.copy_begin_ns - first) * time_scale;
+        sample.copy_ns[worker] += elapsed * time_scale;
         if (status.thread_cpu_available != 0U) {
           ++sample.cpu_samples[worker];
           sample.cpu_ns[worker] += status.thread_cpu_ns;
@@ -314,12 +374,16 @@ int Run(const Options& options) {
       }
     }
   }
-  Print(options, samples[0], "stack", "hbm", queues);
-  Print(options, samples[1], "stack", "sq", queues);
-  Print(options, samples[2], "hbm", "hbm", queues);
-  Print(options, samples[3], "hbm", "sq", queues);
+  Print(options, samples[0], "aicpu", "stack", "hbm", queues);
+  Print(options, samples[1], "aicpu", "stack", "sq", queues);
+  Print(options, samples[2], "aicpu", "hbm", "hbm", queues);
+  Print(options, samples[3], "aicpu", "hbm", "sq", queues);
+  Print(options, samples[4], "aiv", "ub", "hbm", queues);
+  Print(options, samples[5], "aiv", "ub", "sq", queues);
+  Print(options, samples[6], "aiv", "hbm", "hbm", queues);
+  Print(options, samples[7], "aiv", "hbm", "sq", queues);
   std::fprintf(stdout, "SQ_COPY_BENCHMARK_PASS workers=%u total_bytes=%llu sq_copy=%s "
-      "warmup=%u iterations=%u no_doorbell=1\n", options.workers,
+      "warmup=%u iterations=%u no_doorbell=1 engines=aicpu,aiv\n", options.workers,
       static_cast<unsigned long long>(options.bytes),
       "memcpy_sp",
       options.warmup, options.iterations);

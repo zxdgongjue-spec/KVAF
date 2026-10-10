@@ -24,6 +24,7 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
   endif()
   if(KVAF_ENABLE_AICPU_URMA)
     add_subdirectory(src/aicpu_urma)
+    add_subdirectory(src/aiv_sq_copy_benchmark)
   endif()
 
   add_library(kvaf_default_access_operator

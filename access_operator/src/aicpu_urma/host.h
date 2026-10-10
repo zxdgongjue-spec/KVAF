@@ -15,5 +15,6 @@ int32_t LaunchPut(const KvafExecuteBatchPutLaunchArgs* arguments, aclrtStream st
 int32_t LaunchGet(const KvafExecuteBatchGetKernelArgs* arguments, aclrtStream stream);
 int32_t LaunchGatherRead(const GatherReadArgs* arguments, aclrtStream stream);
 int32_t LaunchSqCopyBenchmark(const SqCopyBenchmarkArgs* arguments, aclrtStream stream);
+int32_t LaunchSqCopyVerify(const SqCopyBenchmarkArgs* arguments, aclrtStream stream);
 
 }  // namespace kvaf::aicpu_urma
