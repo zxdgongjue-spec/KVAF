@@ -537,7 +537,7 @@ void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count,
   std::atomic<int> error_worker{-1};
   std::atomic<bool> first_read{false};
   std::atomic<bool> read_before_gather_done{false};
-  std::atomic<bool> progress_error{false};
+  std::atomic<std::uint64_t> progress_error{0U};
   std::thread cpu;
   std::vector<std::thread> hardware;
   for (std::uint32_t worker = 0U; worker < workers; ++worker) {
@@ -593,8 +593,9 @@ void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count,
               }
               auto* progress = reinterpret_cast<std::uint64_t*>(args.remote_descriptor +
                   offsetof(kvaf::peer::GatherDescriptorHeader, ready_bytes));
-              if (progress_error.load(std::memory_order_acquire)) {
-                __atomic_store_n(progress, kvaf::peer::kGatherErrorBit, __ATOMIC_RELEASE);
+              const auto injected_progress = progress_error.load(std::memory_order_acquire);
+              if (injected_progress != 0U) {
+                __atomic_store_n(progress, injected_progress, __ATOMIC_RELEASE);
                 __atomic_store_n(reinterpret_cast<std::uint64_t*>(args.remote_ack),
                                  sequence | kvaf::peer::kGatherErrorBit, __ATOMIC_RELEASE);
                 return;
@@ -828,23 +829,29 @@ void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count,
   assert(KvafAicpuUrmaGatherScatter(&args) != 0U);
   if (pipeline_chunk_bytes != 0U) {
     args.sq_copy_mode = copy_mode;
-    prepare_sources();
-    progress_error.store(true, std::memory_order_release);
-    assert(KvafAicpuUrmaGatherRead(&args) == 0U);
-    const auto results = run_scatter();
-    if (cpu.joinable()) cpu.join();
-    bool failed = false;
-    for (std::uint32_t worker = 0U; worker < workers; ++worker) {
-      GatherReadStatus status{};
-      std::memcpy(&status, statuses.data() + worker * KVAF_AIV_BATCH_GET_STATUS_BYTES, sizeof(status));
-      assert(status.read_wqes == 0U);
-      if (status.result != 0U) {
-        assert(status.result == 10U);
-        failed = true;
+    const std::array<std::uint64_t, 3U> invalid_progress{
+        kvaf::peer::kGatherErrorBit, static_cast<std::uint64_t>(args.bytes) + 1U,
+        0xa5a5a5a5a5a5a5a5ULL};
+    for (const auto injected_progress : invalid_progress) {
+      prepare_sources();
+      progress_error.store(injected_progress, std::memory_order_release);
+      assert(KvafAicpuUrmaGatherRead(&args) == 0U);
+      const auto results = run_scatter();
+      if (cpu.joinable()) cpu.join();
+      bool failed = false;
+      for (std::uint32_t worker = 0U; worker < workers; ++worker) {
+        GatherReadStatus status{};
+        std::memcpy(&status, statuses.data() + worker * KVAF_AIV_BATCH_GET_STATUS_BYTES, sizeof(status));
+        assert(status.read_wqes == 0U);
+        if (status.result != 0U) {
+          assert(status.result == 10U && status.phase == 5U);
+          assert(status.ack_seen == injected_progress);
+          failed = true;
+        }
       }
+      assert(failed && std::any_of(results.begin(), results.begin() + workers,
+                                   [](std::uint32_t result) { return result != 0U; }));
     }
-    assert(failed && std::any_of(results.begin(), results.begin() + workers,
-                                 [](std::uint32_t result) { return result != 0U; }));
   }
   stopped.store(true, std::memory_order_release);
   for (auto& device : hardware) device.join();

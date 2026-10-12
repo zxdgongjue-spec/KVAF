@@ -855,6 +855,23 @@ Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecReques
                  static_cast<unsigned long long>(worker_status.cqe_word),
                  static_cast<unsigned long long>(worker_status.sequence),
                  request.output_span_count, request.sgl_size);
+    if (worker_status.result != 0U && worker_status.phase == 5U) {
+      const auto observed = worker_status.ack_seen;
+      const char* reason = worker_status.result == 10U
+          ? (observed == peer::kGatherErrorBit ? "cpu_descriptor_error" : "invalid_progress_value")
+          : "prefix_read_failed";
+      std::fprintf(stderr,
+                   "[KVAF_AICPU_URMA] GATHER_PREFIX_ERROR worker=%u reason=%s "
+                   "ready_bytes=0x%llx ready_bytes_decimal=%llu total_bytes=%u "
+                   "scratch=0x%llx remote_progress=0x%llx sequence=%llu\n",
+                   worker, reason, static_cast<unsigned long long>(observed),
+                   static_cast<unsigned long long>(observed), request.bytes,
+                   static_cast<unsigned long long>(arguments.output +
+                       ((arguments.output_extent + 63U) & ~std::uint64_t{63U}) + worker * 64U),
+                   static_cast<unsigned long long>(arguments.remote_descriptor +
+                       offsetof(peer::GatherDescriptorHeader, ready_bytes)),
+                   static_cast<unsigned long long>(request.sequence));
+    }
   }
   if (complete && request.timing != nullptr) {
     request.timing->scatter_total_ns = scatter_end - scatter_begin;

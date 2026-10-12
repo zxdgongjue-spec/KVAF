@@ -259,6 +259,15 @@ git pull --ff-only
 `Build WQEs directly in SQ` 和 `Wait for READ CQEs`。直写构建耗时包含字段编码及 SQ
 store，应与旧版编码加写 SQ 的同一 worker 累计耗时比较，不能将两个跨 worker 最大值相加。
 
+流水模式 `result=10` 可能是 CPU 发布了错误标记，也可能是 AICPU 读到大于总长度
+或含异常高位的进度值。进度等待失败使用 `phase=5`，此时状态的 `ack_seen` 保存
+原始进度值，Host 额外打印 `GATHER_PREFIX_ERROR` 的原始值、总长度和读写地址。
+`cpu_descriptor_error` 对应 CPU 定义的精确错误标记 `0x8000000000000000`，
+其他非法值报告 `invalid_progress_value`，不能直接归因于 CPU 清单校验失败。
+ACK 和进度回读使用 volatile load 防止编译器复用旧值；这不等价于缓存失效或 DMA
+可见性保证。此诊断不增加缓存行维护或内存屏障，尚不能证明设备失败根因已修复。
+对比命令中 `--pipeline-chunk-bytes 0` 与 `131072`，区分非流水 READ 和进度回读路径。
+
 GatherRead 默认使用一个 worker；`--aicpu-cores` 接受 1 到 8 的任意整数，
 可使用 4、5、6、8 对比 READ 并行度。此参数设置 kernel block 数，
 不代表固定的物理核心数，也不保证所有 worker 同时开始执行。

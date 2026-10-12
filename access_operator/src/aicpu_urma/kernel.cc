@@ -342,7 +342,7 @@ void WaitGatherAck(const kvaf::aicpu_urma::GatherReadArgs& args,
     ++status.ack_polls;
     status.cqe_word = cqe_word;
     if (status.result != 0U) break;
-    status.ack_seen = *reinterpret_cast<const std::uint64_t*>(scratch + 8U);
+    status.ack_seen = *reinterpret_cast<const volatile std::uint64_t*>(scratch + 8U);
     if (args.source_span_count != 0U && status.ack_started_ns == 0U &&
         status.ack_seen == kvaf::peer::GatherStartedAck(args.sequence))
       status.ack_started_ns = NowNs() - start_ns;
@@ -363,6 +363,7 @@ bool WaitGatherPrefix(const kvaf::aicpu_urma::GatherReadArgs& args,
                       kvaf::aicpu_urma::GatherReadStatus& status, std::uint32_t worker,
                       std::uint64_t required_bytes, std::uint64_t& ready_bytes) {
   if (required_bytes <= ready_bytes) return true;
+  status.phase = 5U;
   const auto start_ns = NowNs();
   const auto scratch = args.output + ((args.output_extent + 63U) & ~std::uint64_t{63U}) +
                        worker * 64U;
@@ -374,7 +375,7 @@ bool WaitGatherPrefix(const kvaf::aicpu_urma::GatherReadArgs& args,
                            &cqe_word, nullptr, nullptr, nullptr, false);
     status.cqe_word = cqe_word;
     if (status.result != 0U) break;
-    ready_bytes = *reinterpret_cast<const std::uint64_t*>(scratch);
+    ready_bytes = *reinterpret_cast<const volatile std::uint64_t*>(scratch);
     if ((ready_bytes & kvaf::peer::kGatherErrorBit) != 0U || ready_bytes > args.bytes) {
       status.result = 10U;
       break;
@@ -383,6 +384,8 @@ bool WaitGatherPrefix(const kvaf::aicpu_urma::GatherReadArgs& args,
   }
   status.ready_wait_ns += NowNs() - start_ns;
   if (status.result == 0U && ready_bytes < required_bytes) status.result = 9U;
+  if (status.result != 0U) status.ack_seen = ready_bytes;
+  else status.phase = 4U;
   return status.result == 0U;
 }
 
