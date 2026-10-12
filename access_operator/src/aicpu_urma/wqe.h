@@ -83,21 +83,67 @@ struct ScatterReadBatch {
   std::uint32_t initialized_wqes;
 };
 
-inline void PrepareScatterReadBatch(ScatterReadBatch& batch, const Endpoint& endpoint,
-                                    std::uint32_t local_token_id) {
-  batch.initialized_wqes = 0U;
-  std::memset(&batch.templates, 0, sizeof(batch.templates));
+inline void PrepareScatterReadTemplates(ScatterReadTemplates& templates, const Endpoint& endpoint,
+                                        std::uint32_t local_token_id) {
+  std::memset(&templates, 0, sizeof(templates));
   const auto header = PrepareScatterReadHeader(endpoint);
   for (std::uint32_t count = 1U; count <= kGatherMaxSglSize; ++count) {
-    auto* words = batch.templates.words[count - 1U];
+    auto* words = templates.words[count - 1U];
     std::memcpy(words, header.words, sizeof(header.words));
     words[2] |= count << 24U;
     for (std::uint32_t index = 0U; index < count; ++index)
       words[13U + index * 4U] = local_token_id;
   }
   const auto fixed = (1U << 18U) | (1U << 20U) | (1U << 28U) | (1U << 29U);
-  batch.templates.control[0] = fixed | (1U << 16U);
-  batch.templates.control[1] = fixed | (2U << 16U) | (1U << 19U) | (1U << 21U);
+  templates.control[0] = fixed | (1U << 16U);
+  templates.control[1] = fixed | (2U << 16U) | (1U << 19U) | (1U << 21U);
+}
+
+inline void PrepareScatterReadBatch(ScatterReadBatch& batch, const Endpoint& endpoint,
+                                    std::uint32_t local_token_id) {
+  batch.initialized_wqes = 0U;
+  PrepareScatterReadTemplates(batch.templates, endpoint, local_token_id);
+}
+
+template <typename StoreWord>
+inline void StoreScatterReadWqe(const ScatterReadTemplates& templates,
+                                const ScatterTransfer& transfer, std::uint32_t owner,
+                                bool completion, StoreWord store) {
+  const auto* fixed = templates.words[transfer.sge_count - 1U];
+  for (std::uint32_t index = 1U; index < 10U; ++index) store(index, fixed[index]);
+  store(10U, static_cast<std::uint32_t>(transfer.remote_address));
+  store(11U, static_cast<std::uint32_t>(transfer.remote_address >> 32U));
+  for (std::uint32_t index = 0U; index < transfer.sge_count; ++index) {
+    const auto offset = 12U + index * 4U;
+    store(offset, transfer.sges[index].length);
+    store(offset + 1U, fixed[offset + 1U]);
+    store(offset + 2U, static_cast<std::uint32_t>(transfer.sges[index].address));
+    store(offset + 3U, static_cast<std::uint32_t>(transfer.sges[index].address >> 32U));
+  }
+  const auto used_words = 12U + transfer.sge_count * 4U;
+  const auto total_words = ScatterWqebbs(transfer.sge_count) * 16U;
+  for (auto index = used_words; index < total_words; ++index) store(index, 0U);
+  store(0U, templates.control[completion ? 1U : 0U] | ((owner & 1U) << 31U));
+}
+
+inline std::uint32_t WriteScatterReadSq(volatile std::uint32_t* sq, std::uint32_t depth,
+                                       std::uint32_t slot, const ScatterReadTemplates& templates,
+                                       const ScatterTransfer& transfer, std::uint32_t owner,
+                                       bool completion) {
+  auto* destination = sq + slot * 16U;
+  const auto blocks = ScatterWqebbs(transfer.sge_count);
+  if (blocks <= depth - slot) {
+    StoreScatterReadWqe(templates, transfer, owner, completion,
+        [destination](std::uint32_t index, std::uint32_t value) { destination[index] = value; });
+    return 1U;
+  }
+  const auto first_words = (depth - slot) * 16U;
+  StoreScatterReadWqe(templates, transfer, owner, completion,
+      [destination, sq, first_words](std::uint32_t index, std::uint32_t value) {
+        if (index < first_words) destination[index] = value;
+        else sq[index - first_words] = value;
+      });
+  return 2U;
 }
 
 inline void PatchScatterReadWqe(ScatterReadBatch& batch, std::uint32_t batch_index,

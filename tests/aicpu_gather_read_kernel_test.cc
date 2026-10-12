@@ -434,7 +434,8 @@ void TestScatterStagingBoundary(std::uint32_t sq_batch_wqes,
   assert(status.read_wqes == expected_wqes && status.sq_producer_index == expected_producer);
   assert(status.cq_consumer_index == 3U && cq_doorbell == 3U);
   assert(status.sq_wqebbs == expected_blocks);
-  assert(status.sq_write_calls == (expected_wqes + sq_batch_wqes - 1U) / sq_batch_wqes + 1U);
+  assert(status.sq_write_calls == expected_wqes + (sgl_size == 1U ? 0U : 1U));
+  assert(status.scatter_encode_ns == 0U);
   if (detailed)
     assert(status.scatter_post_ns == status.scatter_encode_ns + status.scatter_sq_write_ns +
                                         status.scatter_doorbell_ns);
@@ -733,6 +734,7 @@ void TestParallelScatter(std::uint32_t workers, std::uint32_t span_count,
       assert(status.result == 0U && status.scatter_begin_ns > 0U);
       assert(status.scatter_end_ns >= status.scatter_begin_ns);
       assert(status.profile_detail == args.profile_detail);
+      assert(status.scatter_encode_ns == 0U);
       if (detailed)
         assert(status.scatter_post_ns == status.scatter_encode_ns + status.scatter_sq_write_ns +
                                             status.scatter_doorbell_ns);

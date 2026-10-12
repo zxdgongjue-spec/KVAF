@@ -107,6 +107,49 @@ void TestScatterBatchTemplates() {
   }
 }
 
+void TestDirectScatterSq() {
+  using namespace kvaf::aicpu_urma;
+  std::mt19937 random(91U);
+  for (const auto depth : {4U, 7U, 64U, 193U}) {
+    std::array<std::uint32_t, 193U * 16U + 2U> actual{};
+    actual.fill(0xfeedfaceU);
+    auto expected = actual;
+    for (std::uint32_t generation = 0U; generation < 2U; ++generation) {
+      Endpoint endpoint{static_cast<std::uint32_t>(random()), static_cast<std::uint32_t>(random()),
+                         static_cast<std::uint32_t>(random()), {}};
+      for (auto& byte : endpoint.remote_eid) byte = static_cast<std::uint8_t>(random());
+      const auto local_token = static_cast<std::uint32_t>(random());
+      ScatterReadTemplates templates;
+      PrepareScatterReadTemplates(templates, endpoint, local_token);
+      const auto original_templates = templates;
+      for (std::uint32_t slot = 0U; slot < depth; ++slot) {
+        for (std::uint32_t sges = 1U; sges <= kvaf::kGatherMaxSglSize; ++sges) {
+          ScatterTransfer transfer{};
+          transfer.remote_address = 0x1234567800000000ULL | random();
+          transfer.sge_count = sges;
+          for (std::uint32_t index = 0U; index < sges; ++index)
+            transfer.sges[index] = {0xabcdef1200000000ULL | random(),
+                                    static_cast<std::uint32_t>(1U + random() % 4096U), local_token};
+          for (std::uint32_t owner = 0U; owner < 2U; ++owner) {
+            for (const bool completion : {false, true}) {
+              std::array<std::uint32_t, kScatterWqeWords> reference{};
+              EncodeScatterReadWqe(reference.data(), endpoint, transfer, owner, completion);
+              const auto blocks = ScatterWqebbs(sges);
+              for (std::uint32_t index = 0U; index < blocks * 16U; ++index)
+                expected[1U + (slot * 16U + index) % (depth * 16U)] = reference[index];
+              const auto ranges = WriteScatterReadSq(actual.data() + 1U, depth, slot,
+                                                     templates, transfer, owner, completion);
+              assert(ranges == (blocks <= depth - slot ? 1U : 2U));
+              assert(actual == expected);
+            }
+          }
+        }
+      }
+      assert(std::memcmp(&templates, &original_templates, sizeof(templates)) == 0);
+    }
+  }
+}
+
 int main() {
   TestWqebbCopy(kvaf::GatherSqCopyMode::kMemcpySp);
   assert(kvaf::aicpu_urma::CopySqWqebbs(nullptr, nullptr, 0U, kvaf::GatherSqCopyMode::kMemcpySp));
@@ -114,6 +157,7 @@ int main() {
   assert(!kvaf::ValidGatherSqCopyMode(static_cast<kvaf::GatherSqCopyMode>(1U)));
   TestScatterHeaderReuse();
   TestScatterBatchTemplates();
+  TestDirectScatterSq();
   kvaf::aicpu_urma::Endpoint endpoint{};
   endpoint.tp_id = 0x12345678U;
   endpoint.remote_token_id = 0xf1234567U;

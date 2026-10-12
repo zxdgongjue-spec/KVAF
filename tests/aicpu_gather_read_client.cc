@@ -51,7 +51,8 @@ void Usage(const char* program) {
                "Defaults: descriptor-transport=urma, output-stride=2*block-bytes, sgl-size=%u "
                "(positive; each READ WQE uses at most %u SGE), sq-batch-wqes=8, "
                "read-schedule=dynamic, read-task-spans=192, sq-copy=memcpy_sp, pipeline-chunk-bytes=0\n"
-               "profile-detail=0 disables per-SQ-group timing; READ wall timing stays enabled.\n",
+               "READ WQEs are built directly in SQ; sq-batch-wqes sets the timing group size.\n"
+               "sq-copy applies to control WQEs; profile-detail=0 disables per-SQ-group timing.\n",
                program, kvaf::kGatherMaxSglSize, kvaf::kGatherMaxSglSize);
 }
 
@@ -347,7 +348,7 @@ int Run(const Options& options) {
   std::fprintf(stdout,
                "AICPU_GATHER_READ_PASS blocks=%u block_bytes=%u bytes=%zu "
                "output_stride=%u sgl_size=%u wqe_sgl_size=%u aicpu_cores=%u descriptor_transport=%s "
-               "sq_batch_wqes=%u sq_copy=%s profile_detail=%u read_schedule=%s read_task_spans=%u "
+               "sq_write=direct sq_batch_wqes=%u sq_copy=%s profile_detail=%u read_schedule=%s read_task_spans=%u "
                "pipeline_chunk_bytes=%u "
                "warmup=%u iterations=%u\n",
                options.blocks, options.block_bytes, payload, options.output_stride,

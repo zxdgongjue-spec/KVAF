@@ -50,7 +50,9 @@ int main() {
   assert(report.find("configure_rpc=2000") != std::string::npos);
   assert(report.find("read_wqes=7.00") != std::string::npos);
   assert(report.find("Per-SQ-group timing: disabled") != std::string::npos);
-  assert(report.find("Within submit: Encode WQEs:") == std::string::npos);
+  assert(report.find("Within submit: Build WQEs directly in SQ:") == std::string::npos);
+  assert(report.find("Wait for READ CQEs:") != std::string::npos);
+  assert(report.find("no WQE memcpy") != std::string::npos);
 
   std::FILE* direct_output = std::tmpfile();
   assert(direct_output != nullptr);
@@ -107,7 +109,7 @@ int main() {
   first.scatter_total_ns = 6500U;
   first.output_layout_ns = 2300U;
   first.scatter_init_ns = 700U;
-  first.scatter_encode_ns = 1000U;
+  first.scatter_encode_ns = 0U;
   first.scatter_sq_write_ns = 1500U;
   first.scatter_doorbell_ns = 500U;
   first.scatter_start_skew_ns = 1500U;
@@ -132,12 +134,12 @@ int main() {
          std::string::npos);
   assert(parallel_report.find("Dynamic READ: up to 192 spans/task, 22.00 tasks/round; claim tasks: 0.500 us") !=
          std::string::npos);
-  assert(parallel_report.find("Within submit: Encode WQEs: 1.000 us | Write SQ: 1.500 us") !=
+  assert(parallel_report.find("Within submit: Build WQEs directly in SQ: 1.500 us") !=
          std::string::npos);
   assert(parallel_report.find("Doorbell and queue update: 0.500 us") != std::string::npos);
   assert(parallel_report.find("Worker start spread: 1.500 us | Longest worker duration: 5.000 us") !=
          std::string::npos);
-  assert(parallel_report.find("encode=1000 sq_write=1500 doorbell_queue_update=500") != std::string::npos);
+  assert(parallel_report.find("sq_build=1500 doorbell_queue_update=500") != std::string::npos);
   assert(parallel_report.find("READ schedule: task_spans=192 tasks=22.00 claim_ns=500") !=
          std::string::npos);
 
@@ -175,7 +177,7 @@ int main() {
   std::fclose(worker_output);
   assert(worker_report.find("worker=1 start_avg=2.000 start_p50=2.000 start_p95=2.900 end_avg=6.000") !=
          std::string::npos);
-  assert(worker_report.find("duration_avg=4.000 read_wqes=2.00 sq_write_ranges=1.00 sq_wqebbs=6.00 read_tasks=2.00") !=
+  assert(worker_report.find("duration_avg=4.000 read_wqes=2.00 sq_wqe_segments=1.00 sq_wqebbs=6.00 read_tasks=2.00") !=
          std::string::npos);
   assert(worker_report.find("not physical CPU IDs") != std::string::npos);
   bool rejected = false;

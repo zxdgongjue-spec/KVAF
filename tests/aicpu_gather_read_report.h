@@ -121,7 +121,7 @@ inline void PrintGatherReadTimeline(std::FILE* output, double mean_ms,
                  average(&GatherReadTiming::aicpu_cores));
   std::fprintf(output,
                "      Worker/task initialization (includes WQE templates): %.3f us | Build local SGL: %.3f us\n"
-               "      Submit WQEs (encode, write SQ, doorbell): %.3f us | Wait for READ completions: %.3f us\n",
+               "      Submit WQEs (build directly in SQ, doorbell): %.3f us | Wait for READ CQEs: %.3f us\n",
                average_us(&GatherReadTiming::scatter_init_ns), plan_us, post_us, cq_us);
   if (profiles.front().read_task_spans != 0U)
     std::fprintf(output,
@@ -131,13 +131,12 @@ inline void PrintGatherReadTimeline(std::FILE* output, double mean_ms,
                  average_us(&GatherReadTiming::scatter_schedule_ns));
   if (profiles.front().profile_detail)
     std::fprintf(output,
-                 "        Within submit: Encode WQEs: %.3f us | Write SQ: %.3f us | Doorbell and queue update: %.3f us\n",
-                 average_us(&GatherReadTiming::scatter_encode_ns),
+                 "        Within submit: Build WQEs directly in SQ: %.3f us | Doorbell and queue update: %.3f us\n",
                  average_us(&GatherReadTiming::scatter_sq_write_ns),
                  average_us(&GatherReadTiming::scatter_doorbell_ns));
   else
     std::fprintf(output, "        Per-SQ-group timing: disabled (READ wall and batch timing remain enabled)\n");
-  std::fprintf(output, "      SQ writes: %.2f contiguous ranges, %.2f WQEBBs (64 bytes each), all workers combined\n",
+  std::fprintf(output, "      Direct SQ writes: %.2f WQE segments, %.2f WQEBBs (64 bytes each), all workers combined; no WQE memcpy\n",
                average(&GatherReadTiming::sq_write_calls), average(&GatherReadTiming::sq_wqebbs));
   if (parallel)
     std::fprintf(output,
@@ -217,12 +216,11 @@ inline void PrintGatherReadTechnicalProfile(std::FILE* output,
                average(&GatherReadTiming::aicpu_cores));
   std::fprintf(output,
                "  READ preparation: output_layout=%.0f worker_init=%.0f start_spread=%.0f longest_worker=%.0f\n"
-               "  Within submit (max per core): encode=%.0f sq_write=%.0f doorbell_queue_update=%.0f\n",
+               "  Within submit (max per core): sq_build=%.0f doorbell_queue_update=%.0f\n",
                average(&GatherReadTiming::output_layout_ns),
                average(&GatherReadTiming::scatter_init_ns),
                average(&GatherReadTiming::scatter_start_skew_ns),
                average(&GatherReadTiming::scatter_worker_ns),
-               average(&GatherReadTiming::scatter_encode_ns),
                average(&GatherReadTiming::scatter_sq_write_ns),
                average(&GatherReadTiming::scatter_doorbell_ns));
   std::fprintf(output,
@@ -274,7 +272,7 @@ inline void PrintGatherReadWorkers(std::FILE* output,
     const double rounds = profiles.size();
     std::fprintf(output,
                  "  worker=%zu start_avg=%.3f start_p50=%.3f start_p95=%.3f end_avg=%.3f "
-                 "duration_avg=%.3f read_wqes=%.2f sq_write_ranges=%.2f sq_wqebbs=%.2f read_tasks=%.2f\n",
+                 "duration_avg=%.3f read_wqes=%.2f sq_wqe_segments=%.2f sq_wqebbs=%.2f read_tasks=%.2f\n",
                  worker, start_ns / rounds / 1000.0, percentile_us(0.5), percentile_us(0.95),
                  end_ns / rounds / 1000.0, duration_ns / rounds / 1000.0,
                  wqes / rounds, copies / rounds, blocks / rounds, tasks / rounds);

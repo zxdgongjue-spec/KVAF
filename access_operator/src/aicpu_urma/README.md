@@ -224,22 +224,41 @@ WQEBB；队列深度允许时每 64 条 WQE 在末条请求 CQE。单条 WQE 的
 不支持跨独立 HBM 分配的 SGL。未指定 `source_descriptor_address` 的旧调用仍使用
 每轮配置 RPC；一个 DDR region 不得混用两种模式。
 
-GatherRead 的 READ WQE 默认先在 AICPU 本地以最多 24 个 WQEBB 为一组编码，
-再按 SQ 环绕位置批量写入；原有的每个提交批次仍只敲一次 doorbell、等待一次 CQE。
-`--sq-batch-wqes 8/16/32/64` 控制一次 SQ 连续写入最多合并的 READ WQE 数，
-默认 8；6-SGE workload 对应最多 24/48/96/192 个 WQEBB。
-这是连续 SQ 写入的合并粒度，不改变每个至多 64-WQE 提交批次的 CQE 和 doorbell 边界，
-也不改变 SGL 上限或建链。遇到 SQ 环尾仍拆成两段写入，不填充空洞。
-每个 READ 任务只准备一次固定 WQE 头，复用 EID、TP 和 token 字段。
-编码时覆盖有效字段，仅清零尾部 padding，不再先把整个 WQE 清零。
+GatherRead 的 READ WQE 直接在当前 SQ 槽位中构建，不再先编码到本地缓冲，
+也不再调用 `memcpy_sp` 把 READ WQE 拷到 SQ。每个任务在本地准备固定字段模板，
+编码时直接向 SQ 写入头、源地址、本地 SGE 和 padding，最后写控制字。
+SQ 写入使用 volatile 32-bit store，不读取或修改旧槽位内容，不依赖上轮模板仍驻留。
+完整覆盖每个 WQEBB；跨环尾的 WQE 按物理地址拆成两段，不填充空洞。
+`--sq-batch-wqes 8/16/32/64` 保留作为详细计时的分组粒度，默认 8；
+不再代表 memcpy 批量大小。原有每个至多 64-WQE 提交批次仍只敲一次 doorbell，
+等待末条 WQE 的 CQE 后才复用该队列空间，SQ slot 和 owner 继续按原规则推进。
 SGL 规划直接覆盖有效条目，顺便累计 WQEBB 数量；提交时不再重复扫描 SGL。
 SQ slot 和 owner 在批次内递增，到环尾时翻转 owner，避免逐 WQE 的除法。
-设备端 SQ 写入统一使用 CANN securec 的 `memcpy_sp`，不再使用手写 ARM 拷贝；
-本地编码缓冲区按 64 B 对齐。每个 WQEBB 仍完整写入，包括保留字段和 padding，
-设备端显式 `dsb sy` 已删除，仅保留编译器屏障。仅 CQ 保持缓存行维护。
+控制握手 WQE 和独立 SQ 拷贝 benchmark 仍使用 CANN securec 的 `memcpy_sp`。
+READ 直写不新增参数、设备内存分配、显式 DSB 或缓存行维护。仅 CQ 保持缓存行维护。
 固定头准备计入任务初始化，整体效果以 READ 墙钟耗时评估。
-本地 WQE 编码空间最大 12 KiB，另有原来的 SGL 规划数组，不使用设备堆分配。
-较大粒度可能减少连续写入段数，实际收益须在设备验证；默认不自动切换。
+READ worker 不再分配 12 KiB 的本地 WQE 编码数组，仅保留固定字段模板和 SGL 规划数组。
+是否更快需要设备实测：直接 store 仍访问同一 SQ 映射，不能保证消除该映射的写入瓶颈。
+测试客户端继续在每轮计时外逐字节比较 HBM 结果及未写入区域；PASS 才表示验证通过。
+
+沿用已启动的 CPU gather 服务，运行直写端到端测试：
+
+```bash
+git pull --ff-only
+./build.sh aicpu-urma --install-kernel
+./build-aicpu-urma/tests/kvaf_aicpu_gather_read_client \
+  --peer 127.0.0.1:28990 --device-id 7 \
+  --blocks 4096 --block-bytes 656 --output-stride 1312 --sgl-size 6 \
+  --aicpu-cores 5 --descriptor-transport urma \
+  --read-schedule dynamic --read-task-spans 192 \
+  --pipeline-chunk-bytes 131072 --sq-batch-wqes 8 \
+  --profile-detail 1 --warmup 10 --iterations 1000
+```
+
+日志 `sq_write=direct` 标识此实验。重点比较总调用、READ 墙钟、
+`Build WQEs directly in SQ` 和 `Wait for READ CQEs`。直写构建耗时包含字段编码及 SQ
+store，应与旧版编码加写 SQ 的同一 worker 累计耗时比较，不能将两个跨 worker 最大值相加。
+
 GatherRead 默认使用一个 worker；`--aicpu-cores` 接受 1 到 8 的任意整数，
 可使用 4、5、6、8 对比 READ 并行度。此参数设置 kernel block 数，
 不代表固定的物理核心数，也不保证所有 worker 同时开始执行。
@@ -393,9 +412,9 @@ GatherRead 总耗时中，不包含在首个 READ worker 开始之前的设备 R
 执行的一次布局校验与起点计算，包含在 Host 等待中，不在 READ worker 区间内。
 `Worker initialization` 覆盖 READ block 进入后的原子领号、状态/队列准备和起点读取。
 `Build local SGL` 是按该核目标 span 生成本地 SGE 列表；`Within submit` 的
-编码（含批次参数检查）、SQ 批量拷贝、doorbell 与内存屏障均包含在 `Submit WQEs` 中。
-`--profile-detail 0` 现在真正关闭每次 SQ 拷贝组的两次额外时钟采样，
-编码/SQ/doorbell 子计数器保持 0，日志明确标记禁用，不再打印伪零耗时。
+SQ 内直接构建 WQE（含批次参数检查）、doorbell 与队列更新均包含在 `Submit WQEs` 中。
+`--profile-detail 0` 关闭每个 SQ 构建组的额外时钟采样，
+SQ 构建/doorbell 子计数器保持 0，日志明确标记禁用，不再打印伪零耗时。
 仍保留每核进入/结束、READ 批次 plan/post/CQ、握手和 Host 阶段计时，
 因此不是完全无 profiling。`--profile-detail 1` 启用组内采样；采样本身有开销。
 各阶段多核最大值可能来自不同核，不能相加。
@@ -408,10 +427,12 @@ start/end 是每轮相对最早 READ worker 进入时刻的纳秒差，输出为
 每行显示平均 start/end/duration、start p50/p95，以及该 worker 的 WQE、SQ 连续写入
 段数和 WQEBB 数。各核区间重叠，不能相加；晚进入 worker 的起点集中在早进入
 worker 的完成附近，只能作为分波执行的证据，不能单凭均值推断可用物理核数。
-`SQ writes` 统计全部 worker 的连续写入段数和实际写入的 64-byte WQEBB，不计控制握手。
-逐 worker 的 `sq_write_ranges` 同样表示连续写入段数；一个段可能包含多个 WQEBB。
+`Direct SQ writes` 统计全部 worker 直接构建 WQE 的连续段数和实际写入的 64-byte WQEBB，
+不计控制握手；一个 WQE 通常计一段，跨环尾计两段，并非 memcpy 调用次数。
+逐 worker 的 `sq_wqe_segments` 含义相同。状态 ABI 的 `scatter_sq_write_ns` 现在承载
+SQ 内直接构建耗时，`scatter_encode_ns` 保留为 0，避免把编码和写入重复计时。
 
-沿用现有 CPU 服务，对比采样开关和 SQ 拷贝粒度：
+沿用现有 CPU 服务，对比采样开关和 SQ 构建计时粒度：
 
 ```bash
 ./build.sh aicpu-urma --install-kernel
