@@ -9,6 +9,8 @@ namespace kvaf::aicpu_urma {
 constexpr std::uint64_t kSqCopyBenchmarkMagic = 0x4b56414653514350ULL;
 constexpr std::uint32_t kSqCopyBenchmarkMaxWorkers = 8U;
 constexpr std::uint64_t kSqCopyBenchmarkQueueBytes = 8192ULL * 4U * 64U;
+constexpr std::uint32_t kSqCopyWholeHbm = 4U;
+constexpr std::uint32_t kSqCopyWholeSq = 5U;
 
 struct SqCopyBenchmarkQueue {
   std::uint64_t sq;

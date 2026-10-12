@@ -33,7 +33,7 @@ std::uint32_t KvafAicpuUrmaSqCopyBenchmark(kvaf::aicpu_urma::SqCopyBenchmarkArgs
   const auto entry_ns = NowNs();
   if (args == nullptr || args->queues == 0U || args->statuses == 0U ||
       args->next_worker == 0U || args->workers == 0U ||
-      args->workers > kSqCopyBenchmarkMaxWorkers || args->target_sq > 3U ||
+      args->workers > kSqCopyBenchmarkMaxWorkers || args->target_sq > kSqCopyWholeSq ||
       (args->batch_wqes != 8U && args->batch_wqes != 16U &&
        args->batch_wqes != 32U && args->batch_wqes != 64U) ||
       !kvaf::ValidGatherSqCopyMode(args->copy_mode)) return 1U;
@@ -61,7 +61,9 @@ std::uint32_t KvafAicpuUrmaSqCopyBenchmark(kvaf::aicpu_urma::SqCopyBenchmarkArgs
     return 1U;
   }
   alignas(64) std::uint32_t source[kScatterBatchWqes * kScatterWqeWords];
-  const auto chunk_blocks = args->batch_wqes * kMaxScatterWqebbs;
+  const auto chunk_blocks = args->target_sq >= kSqCopyWholeHbm
+      ? static_cast<std::uint32_t>(queue.bytes / kWqeBytes)
+      : args->batch_wqes * kMaxScatterWqebbs;
   const auto chunk_bytes = chunk_blocks * kWqeBytes;
   auto* source_bytes = reinterpret_cast<std::uint8_t*>(source);
   if (args->target_sq < 2U) {
@@ -97,7 +99,7 @@ std::uint32_t KvafAicpuUrmaSqCopyVerify(kvaf::aicpu_urma::SqCopyBenchmarkArgs* a
   using namespace kvaf::aicpu_urma;
   if (args == nullptr || args->queues == 0U || args->statuses == 0U ||
       args->next_verify_worker == 0U || args->workers == 0U ||
-      args->workers > kSqCopyBenchmarkMaxWorkers || args->target_sq > 3U ||
+      args->workers > kSqCopyBenchmarkMaxWorkers || args->target_sq > kSqCopyWholeSq ||
       (args->batch_wqes != 8U && args->batch_wqes != 16U &&
        args->batch_wqes != 32U && args->batch_wqes != 64U)) return 1U;
   const auto worker = __atomic_fetch_add(reinterpret_cast<std::uint64_t*>(args->next_verify_worker),

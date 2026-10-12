@@ -8,7 +8,7 @@
 
 HBM 目标使用 `ACL_MEM_MALLOC_HUGE_FIRST`。每轮总拷贝量固定为 128 KiB，在 workers 间按 64 B 分配；1 worker 和 5 workers 的总字节数相同。默认每次拷贝 1536 B，相当于 8 个 6-SGE WQE，尾块按实际字节数拷贝。目标地址逐轮推进，在队列容量内循环，避免一直写同一个小槽位。
 
-每轮轮换八个测试的执行顺序，减少顺序偏差。AICPU 栈源缓冲区在每次 kernel 内生成；HBM 源数据由 Host 提前上传，AIV 的 UB 源在计时前由 MTE2 从这份 HBM 源加载一个批次并等待完成，随后重复写出该 UB 批次。数据随轮次和 worker 改变。AICPU 显式 `dsb sy` 已删除，不增加缓存行刷新，其计时截至拷贝函数返回；AIV 计时包含 MTE3 完成等待。所有 worker 拷贝结束后，再由同一 stream 上的独立 AICPU 校验 kernel 逐 32-bit 字检查目标全部数据，避免校验读取干扰仍在计时的 worker。失败时打印首个不匹配位置，包含 warmup 在内全部正确才打印 PASS。验证 SQ 内存不代表验证网络传输，因为本基准不提交网络操作。
+每轮轮换十个测试的执行顺序，减少顺序偏差：原有八条分批路径，加上两条 AICPU HBM 源整段拷贝路径。AICPU 栈源缓冲区在每次 kernel 内生成；HBM 源数据由 Host 提前上传，AIV 的 UB 源在计时前由 MTE2 从这份 HBM 源加载一个批次并等待完成，随后重复写出该 UB 批次。数据随轮次和 worker 改变。AICPU 显式 `dsb sy` 已删除，不增加缓存行刷新，其计时截至拷贝函数返回；AIV 计时包含 MTE3 完成等待。所有 worker 拷贝结束后，再由同一 stream 上的独立 AICPU 校验 kernel 逐 32-bit 字检查目标全部数据，避免校验读取干扰仍在计时的 worker。失败时打印首个不匹配位置，包含 warmup 在内全部正确才打印 PASS。验证 SQ 内存不代表验证网络传输，因为本基准不提交网络操作。
 
 warmup 前额外执行一轮检查，不计入性能统计。每条路径打印 `SQ_COPY_PREFLIGHT`，分别同步拷贝 kernel 和校验 kernel，确认二者都成功后打印该路径的 PASS。正式 warmup 和测量轮次保持一次同步，不增加计时区间内的等待。校验 kernel 将数据不匹配和状态错误写入 `result=2/3` 后正常返回，由 Host 报失败；不再因这类可报告的错误提前中断 stream 并遮住不匹配信息。
 
@@ -18,6 +18,17 @@ warmup 前额外执行一轮检查，不计入性能统计。每条路径打印 
 
 ## 执行
 
+程序自动追加 `copy_layout=whole_per_worker` 的 AICPU HBM → HBM 和 HBM → SQ，
+不新增命令行参数。每个 worker 只调用一次 `memcpy_sp`，直接使用 Host 提前分配并
+上传的 HBM 源，不申请 128 KiB 本地临时缓冲，也不在计时内生成源数据。
+日志 `copy_calls=1.00` 用于确认整段拷贝；`chunk_bytes` 是最大单 worker 拷贝长度。
+
+`--bytes 131072 --aicpu-cores 1` 才是一次完整 128 KiB 拷贝。
+`--aicpu-cores 5` 仍分摊总计 128 KiB，各 worker 一次拷贝约 25.6 KiB，
+不代表各自都拷贝 128 KiB。原有 `copy_layout=batched` 默认每次 1536 B，
+可在同一次运行中比较分批和整段写入的耗时。两条整段路径仍完整校验数据，
+不敲 doorbell、不测实际网络 WQE 提交；这次不改变正式 GatherRead 的提交实现。
+
 不需要 CPU service。在 NPU 机器的仓库根目录执行：
 
 ```bash
@@ -25,7 +36,7 @@ warmup 前额外执行一轮检查，不计入性能统计。每条路径打印 
 
 for cores in 1 5; do
   ./build-aicpu-urma/tests/kvaf_aicpu_sq_copy_benchmark \
-    --device-id 6 \
+    --device-id 7 \
     --aicpu-cores "$cores" \
     --bytes 131072 \
     --sq-batch-wqes 8 \
@@ -39,7 +50,7 @@ done
 
 ## 计时含义
 
-每种路径分别输出一行 `SQ_COPY_STATS`，分位数和平均值均以 **us** 表示。`engine=aicpu` 有四条路径：`source=stack target=hbm`、`source=stack target=sq`、`source=hbm target=hbm` 和 `source=hbm target=sq`；`engine=aiv` 对应使用 `source=ub` 或 `source=hbm`。比较相同 worker 数、总字节数和批次大小下两种引擎写入同一目标的 `mean_us`。
+每种路径分别输出一行 `SQ_COPY_STATS`，分位数和平均值均以 **us** 表示。`engine=aicpu` 的 `copy_layout=batched` 有四条路径：`source=stack target=hbm`、`source=stack target=sq`、`source=hbm target=hbm` 和 `source=hbm target=sq`；另有两条 `source=hbm copy_layout=whole_per_worker` 路径。`engine=aiv` 仍为原有四条分批路径，对应使用 `source=ub` 或 `source=hbm`。比较相同 worker 数和总字节数下 AICPU 分批和整段写入同一目标的 `mean_us`，以及同样分批大小下两个引擎的耗时。
 
 AIV 记录 `GetSystemCycle()` 原始 tick。程序先用单 AIV worker 执行 200 万和 2000 万 tick 的空等待，各测三次取 Host 最短时间，再用长短时间差除以 tick 差估计 ns/tick，以消除近似固定的启动开销。转换频率和两种等待的 Host 时间打印在 `AIV_COPY_CLOCK` 中。AIV 的 us 和 GB/s 是基于这次校准的估计值，Host 延迟变化仍可能影响精度；不硬编码计数器频率。计时字段在 AIV 返回状态中暂存 tick，由 Host 按差值转换后统计。首次校准不计入 warmup 或测量轮次。
 
