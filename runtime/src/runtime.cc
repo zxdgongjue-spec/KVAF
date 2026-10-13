@@ -95,13 +95,28 @@ Status RuntimeCore::Initialize(const RuntimeInitRequest& request) {
 
   status = access_operator_.Initialize(remote_region);
   if (!status.ok()) {
+    const Status cleanup = access_operator_.Shutdown();
+    if (!cleanup.ok()) {
+      // The operator still owns registered host memory or a live queue.
+      // Retain the region so Shutdown can retry before freeing its DDR.
+      remote_region_ = remote_region;
+      initialized_ = true;
+      return Status::Internal(status.message() + "; initialization teardown retained: " +
+                              cleanup.message());
+    }
     (void)ddr_allocator_.Release(remote_region);
     return status;
   }
 
   status = meta_manager_.RegisterRemoteRegion(remote_region);
   if (!status.ok()) {
-    (void)access_operator_.Shutdown();
+    const Status cleanup = access_operator_.Shutdown();
+    if (!cleanup.ok()) {
+      remote_region_ = remote_region;
+      initialized_ = true;
+      return Status::Internal(status.message() + "; registration teardown retained: " +
+                              cleanup.message());
+    }
     (void)ddr_allocator_.Release(remote_region);
     return status;
   }

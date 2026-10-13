@@ -12,10 +12,13 @@
 #include <string>
 #include <vector>
 
+#include <dlfcn.h>
+
 #include "acl/acl.h"
 #include "batch_put_internal.h"
 #include "direct_hccp/direct_hccp_abi.h"
 #include "direct_hccp/direct_hccp_remote_transport.h"
+#include "direct_hccp/direct_hccp_local_host.h"
 #include "direct_hccp/direct_hccp_session.h"
 
 extern "C" int32_t KvafExecuteBatchPutLaunchInternal(
@@ -37,6 +40,48 @@ constexpr uint32_t kMaxDirectAivWorkers =
 
 using DirectHccpApi = hccp::DirectHccpApi;
 using DirectMemory = hccp::DirectMemory;
+
+struct ProcessTokenQueryInfo {
+  uint64_t address;
+  uint64_t bytes;
+  uint32_t token_id;
+  uint32_t token_value;
+};
+static_assert(sizeof(ProcessTokenQueryInfo) == 24U);
+
+// HCCL queries the runtime process token for ACL-owned HBM. This is an
+// opt-in comparison with the existing RA-registered token, not a replacement
+// for the V9 path. CANN's QUERY_PROCESS_TOKEN command is zero.
+static bool QueryAclProcessToken(void *address, uint64_t bytes,
+                                 uint32_t *token_id) {
+  if (token_id == nullptr || address == nullptr || bytes == 0U) return false;
+  void *library = dlopen("libruntime.so", RTLD_NOW | RTLD_LOCAL);
+  if (library == nullptr) {
+    std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_PROCESS_TOKEN_QUERY_FAILED phase=dlopen\n");
+    return false;
+  }
+  using QueryFn = int (*)(int, void *);
+  const auto query = reinterpret_cast<QueryFn>(dlsym(library, "rtUbDevQueryInfo"));
+  if (query == nullptr) {
+    std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_PROCESS_TOKEN_QUERY_FAILED phase=dlsym\n");
+    dlclose(library);
+    return false;
+  }
+  ProcessTokenQueryInfo info{reinterpret_cast<uint64_t>(address), bytes, 0U, 0U};
+  const int result = query(0, &info);
+  dlclose(library);
+  if (result != 0 || info.token_id < (1U << kTokenIdShift)) {
+    std::fprintf(stderr,
+                 "[KVAF_AIV] BATCH_PUT_PROCESS_TOKEN_QUERY_FAILED phase=query result=%d raw_token=0x%x\n",
+                 result, info.token_id);
+    return false;
+  }
+  *token_id = info.token_id >> kTokenIdShift;
+  std::fprintf(stderr,
+               "[KVAF_AIV] BATCH_PUT_PROCESS_TOKEN_READY raw_token_id=0x%x wqe_token_id=0x%x\n",
+               info.token_id, *token_id);
+  return true;
+}
 
 // A USER_CTL SQ/CQ is strictly single-producer/single-consumer from the AIV
 // kernel's point of view. Each core/Jetty slot therefore owns one complete
@@ -78,9 +123,10 @@ struct KvafBatchPutTransport {
   std::mutex mutex{};
   std::mutex launch_mutex{};
   hccp::PeerLink *peer_link{nullptr};
+  std::unique_ptr<hccp::LocalHostEndpoint> local_host;
 };
 
-std::string EidToHex(const std::array<uint8_t, hccp::kEidBytes> &eid) {
+static std::string EidToHex(const std::array<uint8_t, hccp::kEidBytes> &eid) {
   static constexpr char kHex[] = "0123456789abcdef";
   std::string result;
   result.reserve(hccp::kEidBytes * 2U);
@@ -91,7 +137,7 @@ std::string EidToHex(const std::array<uint8_t, hccp::kEidBytes> &eid) {
   return result;
 }
 
-std::array<uint8_t, hccp::kEidBytes> ReverseEidForAivWqe(
+static std::array<uint8_t, hccp::kEidBytes> ReverseEidForAivWqe(
     const std::array<uint8_t, hccp::kEidBytes> &ra_host_eid) {
   std::array<uint8_t, hccp::kEidBytes> wqe_remote_eid{};
   for (uint32_t index = 0U; index < hccp::kEidBytes; ++index) {
@@ -103,7 +149,7 @@ std::array<uint8_t, hccp::kEidBytes> ReverseEidForAivWqe(
   return wqe_remote_eid;
 }
 
-bool InitContext(const DirectHccpApi &api, int32_t mode, uint32_t physical_device_id,
+static bool InitContext(const DirectHccpApi &api, int32_t mode, uint32_t physical_device_id,
                  const std::array<uint8_t, hccp::kEidBytes> &eid, const char *role, void **context) {
   hccp::CtxInitCfg cfg{};
   cfg.mode = mode;
@@ -123,7 +169,7 @@ bool InitContext(const DirectHccpApi &api, int32_t mode, uint32_t physical_devic
   return true;
 }
 
-bool AllocateToken(const DirectHccpApi &api, void *context, const char *role, void **token_handle,
+static bool AllocateToken(const DirectHccpApi &api, void *context, const char *role, void **token_handle,
                    uint32_t *token_id) {
   hccp::TokenId raw{};
   const int ret = api.token_alloc(context, &raw, token_handle);
@@ -138,7 +184,7 @@ bool AllocateToken(const DirectHccpApi &api, void *context, const char *role, vo
   return true;
 }
 
-bool AlignRange(uint64_t address, uint64_t bytes, uint64_t *aligned_address, uint64_t *aligned_bytes) {
+static bool AlignRange(uint64_t address, uint64_t bytes, uint64_t *aligned_address, uint64_t *aligned_bytes) {
   if (bytes == 0U || aligned_address == nullptr || aligned_bytes == nullptr) {
     return false;
   }
@@ -152,7 +198,7 @@ bool AlignRange(uint64_t address, uint64_t bytes, uint64_t *aligned_address, uin
   return true;
 }
 
-bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle, uint32_t token_id,
+static bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle, uint32_t token_id,
                     uint32_t token_value, void *address, uint64_t bytes, const char *role, DirectMemory *memory) {
   uint64_t aligned_address = 0U;
   uint64_t aligned_bytes = 0U;
@@ -163,7 +209,29 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
   hccp::MrRegInfo info{};
   info.in.mem.addr = aligned_address;
   info.in.mem.size = aligned_bytes;
-  info.in.ub.flags = hccp::MemRegFlags(true);
+  // V9 uses non_pin=1. Only this isolated B12 reproduction accepts an
+  // explicit local-HBM registration A/B; neither the source allocation nor
+  // the remote DDR registration is changed.
+  bool non_pin = true;
+  if (std::strcmp(role, "device_hbm") == 0) {
+    const char *setting = std::getenv("KVAF_B12_LOCAL_HBM_NON_PIN");
+    if (setting != nullptr) {
+      if (std::strcmp(setting, "0") == 0) {
+        non_pin = false;
+      } else if (std::strcmp(setting, "1") != 0) {
+        std::fprintf(stderr,
+                     "[KVAF_AIV] BATCH_PUT_LOCAL_HBM_REG_POLICY_INVALID value=%s\n",
+                     setting);
+        return false;
+      }
+    }
+    std::fprintf(stderr,
+                 "[KVAF_AIV] BATCH_PUT_LOCAL_HBM_REG_POLICY non_pin=%u "
+                 "source=%s\n",
+                 static_cast<unsigned int>(non_pin),
+                 setting == nullptr ? "v9_default" : "explicit_b12_ab");
+  }
+  info.in.ub.flags = hccp::MemRegFlags(non_pin);
   info.in.ub.token_value = token_value;
   info.in.ub.token_id_handle = token_handle;
   const int ret = api.lmem_register(context, &info, &memory->handle);
@@ -182,13 +250,19 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
   memory->key_bytes = info.out.key.size;
   std::memcpy(memory->key, info.out.key.value, memory->key_bytes);
   hccp::VerboseLog(
-      "[KVAF_AIV] DIRECT_MEMORY_REGISTERED role=%s token_id=0x%x host_or_hbm_va=0x%llx bytes=%llu\n",
+      "[KVAF_AIV] DIRECT_LOCAL_MR_TOKEN_CHECK role=%s allocated_token_id=0x%x "
+      "registered_token_id=0x%x wqe_token_id=0x%x\n",
+      role, token_id, info.out.ub.token_id, memory->token_id);
+  hccp::VerboseLog(
+      "[KVAF_AIV] DIRECT_MEMORY_REGISTERED role=%s token_id=0x%x host_or_hbm_va=0x%llx bytes=%llu "
+      "reg_flags=0x%x non_pin=%u\n",
       role, memory->token_id, static_cast<unsigned long long>(aligned_address),
-      static_cast<unsigned long long>(aligned_bytes));
+      static_cast<unsigned long long>(aligned_bytes), info.in.ub.flags,
+      static_cast<unsigned int>(non_pin));
   return true;
 }
 
-bool ImportRemoteMemory(const DirectHccpApi &api, void *context, const DirectMemory &remote, void **import_handle) {
+static bool ImportRemoteMemory(const DirectHccpApi &api, void *context, const DirectMemory &remote, void **import_handle) {
   hccp::MrImportInfo info{};
   std::memcpy(info.in.key.value, remote.key, remote.key_bytes);
   info.in.key.size = static_cast<uint8_t>(remote.key_bytes);
@@ -205,7 +279,7 @@ bool ImportRemoteMemory(const DirectHccpApi &api, void *context, const DirectMem
   return true;
 }
 
-bool CreateCq(const DirectHccpApi &api, void *context, uint32_t mode, uint32_t depth, const char *role,
+static bool CreateCq(const DirectHccpApi &api, void *context, uint32_t mode, uint32_t depth, const char *role,
               hccp::CqInfo *info, void **handle) {
   *info = {};
   info->in.channel_handle = nullptr;
@@ -227,59 +301,15 @@ bool CreateCq(const DirectHccpApi &api, void *context, uint32_t mode, uint32_t d
   return true;
 }
 
-void ReleaseTransport(KvafBatchPutTransport *transport) {
-  if (transport == nullptr) {
-    return;
+bool ReleaseTransport(KvafBatchPutTransport *transport) {
+  if (transport == nullptr) return true;
+  // Retire both reciprocal imports and all SQ/CQ objects before their MRs.
+  // A failed retirement retains the transport and its caller-owned DDR.
+  if (!hccp::RetireLocalAndDeviceQueues(transport->api, transport->device_context,
+        transport->workers.data(), transport->worker_count, transport->local_host.get())) {
+    std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_TEARDOWN_RETAINED phase=queues\n");
+    return false;
   }
-
-  // Queue objects can retain references to the local entity table and HBM MR.
-  // Retire every imported Jetty, SQ and CQ before releasing any of those
-  // dependent allocations.  If a queue cannot be retired, retain the complete
-  // transport for process exit rather than freeing memory the driver may still
-  // dereference.
-  bool queues_retired = true;
-  if (transport->api.qp_unimport != nullptr) {
-    for (uint32_t index = 0U; index < transport->worker_count; ++index) {
-      DirectAivWorker &worker = transport->workers[index];
-      if (transport->device_context != nullptr && worker.device_peer_target_jetty != nullptr) {
-        if (transport->api.qp_unimport(transport->device_context,
-                                       worker.device_peer_target_jetty) != 0) {
-          queues_retired = false;
-        } else {
-          worker.device_peer_target_jetty = nullptr;
-        }
-      }
-    }
-  }
-  if (queues_retired && transport->api.qp_destroy != nullptr) {
-    for (uint32_t index = 0U; index < transport->worker_count; ++index) {
-      DirectAivWorker &worker = transport->workers[index];
-      if (worker.device_user_ctl_jetty.handle != nullptr) {
-        if (transport->api.qp_destroy(worker.device_user_ctl_jetty.handle) != 0) {
-          queues_retired = false;
-        } else {
-          worker.device_user_ctl_jetty.handle = nullptr;
-        }
-      }
-    }
-  }
-  if (queues_retired && transport->api.cq_destroy != nullptr) {
-    for (uint32_t index = 0U; index < transport->worker_count; ++index) {
-      DirectAivWorker &worker = transport->workers[index];
-      if (transport->device_context != nullptr && worker.device_user_ctl_cq != nullptr) {
-        if (transport->api.cq_destroy(transport->device_context,
-                                      worker.device_user_ctl_cq) != 0) {
-          queues_retired = false;
-        } else {
-          worker.device_user_ctl_cq = nullptr;
-        }
-      }
-    }
-  }
-  if (!queues_retired) {
-    return;
-  }
-
   for (const auto &local : transport->local_buffers) {
     if (local->device_entities != nullptr) {
       (void)aclrtFree(local->device_entities);
@@ -298,19 +328,27 @@ void ReleaseTransport(KvafBatchPutTransport *transport) {
     (void)aclrtFree(transport->device_queue_state);
     transport->device_queue_state = nullptr;
   }
+
+  if (transport->device_peer_memory_import) {
+    if (!transport->api.rmem_unimport || transport->api.rmem_unimport(
+          transport->device_context, transport->device_peer_memory_import) != 0) return false;
+    transport->device_peer_memory_import = nullptr;
+  }
+  if (!hccp::ReleaseLocalHostEndpoint(transport->api, transport->local_host.get())) return false;
   hccp::ReleaseDeviceAivTransport({&transport->api, transport->session, transport->device_context,
                                    transport->device_transport_token_handle,
-                                   transport->device_peer_memory_import, transport->workers.data(),
-                                   transport->worker_count});
+                                   nullptr, transport->workers.data(), transport->worker_count});
   delete transport;
+  return true;
 }
 
 int32_t CreateBatchPutTransport(void *host_ddr, uint64_t host_ddr_bytes,
                                 uint32_t aiv_core_count, uint32_t jettys_per_core,
-                                void *peer_link,
+                                bool local_host_ddr, void *peer_link,
                                 const uint8_t *peer_local_eid,
                                 KvafBatchPutTransport **transport) {
-  if (host_ddr == nullptr || host_ddr_bytes == 0U || peer_link == nullptr || peer_local_eid == nullptr ||
+  if (host_ddr == nullptr || host_ddr_bytes == 0U ||
+      (!local_host_ddr && (peer_link == nullptr || peer_local_eid == nullptr)) ||
       aiv_core_count == 0U || aiv_core_count > KVAF_AIV_BATCH_PUT_MAX_AIV_CORES || jettys_per_core == 0U ||
       jettys_per_core > KVAF_AIV_BATCH_PUT_MAX_JETTYS_PER_CORE || transport == nullptr ||
       static_cast<uint64_t>(aiv_core_count) * jettys_per_core >
@@ -343,17 +381,22 @@ int32_t CreateBatchPutTransport(void *host_ddr, uint64_t host_ddr_bytes,
     goto failed;
   }
   state->physical_device_id = physical_device_id;
-  std::memcpy(device_eid.data(), peer_local_eid, device_eid.size());
-  hccp::VerboseLog(
-      "[KVAF_AIV] PEER_LINK_LOCAL_EID_READY physical_device=%u eid=%s\n",
-      physical_device_id, EidToHex(device_eid).c_str());
-  if (!hccp::LoadPeerMemory(state->peer_link, state->peer_memory_address,
-                            &state->peer_memory, &peer_eid)) {
-    goto failed;
+  if (!hccp::LoadDirectHccp(&state->api) ||
+      !hccp::AcquireDirectHccpSession(physical_device_id, kPidHdcType, &state->session)) goto failed;
+  if (local_host_ddr) {
+    state->local_host = std::make_unique<hccp::LocalHostEndpoint>();
+    if (!hccp::CreateLocalHostEndpoint(state->api, physical_device_id,
+                                      host_ddr, host_ddr_bytes, state->local_host.get())) goto failed;
+    device_eid = state->local_host->device_eid;
+    peer_eid = state->local_host->host_eid;
+    state->peer_memory = state->local_host->memory;
+  } else {
+    std::memcpy(device_eid.data(), peer_local_eid, device_eid.size());
+    if (!hccp::LoadPeerMemory(state->peer_link, state->peer_memory_address,
+                              &state->peer_memory, &peer_eid)) goto failed;
   }
   state->wqe_remote_eid = ReverseEidForAivWqe(peer_eid);
-  if (!hccp::LoadDirectHccp(&state->api)) goto failed;
-  if (!hccp::AcquireDirectHccpSession(physical_device_id, kPidHdcType, &state->session) ||
+  if (
       !InitContext(state->api, hccp::kOfflineHdc, physical_device_id, device_eid, "device_aiv",
                    &state->device_context) ||
       !AllocateToken(state->api, state->device_context, "device_transport",
@@ -384,16 +427,19 @@ int32_t CreateBatchPutTransport(void *host_ddr, uint64_t host_ddr_bytes,
 
     const std::string device_ctp_role = "device_aiv_peer_link_" + suffix;
     hccp::PeerChannel channel{};
-    if (!hccp::CreatePeerChannel(
+    const bool channel_ready = local_host_ddr
+        ? hccp::CreateLocalHostChannel(state->api, physical_device_id, state->device_context,
+              state->device_transport_token_value, worker.device_user_ctl_jetty.info,
+              entity_index, state->local_host.get(), &channel)
+        : hccp::CreatePeerChannel(
             {state->peer_link, &state->api, state->device_context,
              physical_device_id, state->peer_memory_address, &state->peer_memory,
              &device_eid, &peer_eid, &worker.device_user_ctl_jetty.info,
              device_ctp_role.c_str()},
-            &channel)) {
-      goto failed;
-    }
+            &channel);
     worker.device_peer_import_info = channel.local_import_info;
     worker.device_peer_target_jetty = channel.local_target_jetty;
+    if (!channel_ready) goto failed;
   }
   for (uint32_t entity_index = 0U; entity_index < state->worker_count; ++entity_index) {
     const DirectAivWorker &worker = state->workers[entity_index];
@@ -442,8 +488,21 @@ int32_t CreateBatchPutTransport(void *host_ddr, uint64_t host_ddr_bytes,
   return KVAF_BATCH_PUT_SUCCESS;
 
 failed:
-  ReleaseTransport(state);
+  // A partially registered endpoint may fail to retire. Return its ownership
+  // on error so AccessOperator/Runtime keep DDR alive until shutdown succeeds.
+  if (!ReleaseTransport(state)) *transport = state;
   return result;
+}
+
+extern "C" int32_t KvafBatchPutTransportCreateLocalHost(
+    void *host_ddr, uint64_t host_ddr_bytes, uint32_t aiv_core_count,
+    uint32_t jettys_per_core, KvafBatchPutTransport **transport) {
+  return CreateBatchPutTransport(host_ddr, host_ddr_bytes, aiv_core_count,
+                                   jettys_per_core, true, nullptr, nullptr, transport);
+}
+
+extern "C" int32_t KvafBatchPutTransportDestroyChecked(KvafBatchPutTransport *transport) {
+  return ReleaseTransport(transport) ? KVAF_BATCH_PUT_SUCCESS : KVAF_BATCH_PUT_RUNTIME_ERROR;
 }
 
 extern "C" int32_t KvafBatchPutTransportCreateWithPeerLink(
@@ -452,7 +511,7 @@ extern "C" int32_t KvafBatchPutTransportCreateWithPeerLink(
     KvafBatchPutTransport **transport) {
   if (peer_link == nullptr || peer_local_eid == nullptr) return KVAF_BATCH_PUT_INVALID_ARGUMENT;
   return CreateBatchPutTransport(host_ddr, host_ddr_bytes, aiv_core_count,
-                                 jettys_per_core, peer_link, peer_local_eid, transport);
+                                 jettys_per_core, false, peer_link, peer_local_eid, transport);
 }
 
 extern "C" void KvafBatchPutTransportDestroy(KvafBatchPutTransport *transport) {
@@ -485,6 +544,21 @@ extern "C" int32_t KvafBatchPutLocalBufferAcquire(KvafBatchPutTransport *transpo
   candidate->transport = transport;
   candidate->input_hbm_address = input_address;
   candidate->input_hbm_bytes = input_device_bytes;
+  const char *token_source = std::getenv("KVAF_B12_LOCAL_HBM_TOKEN_SOURCE");
+  const bool use_process_token = token_source != nullptr &&
+      std::strcmp(token_source, "process") == 0;
+  if (token_source != nullptr && !use_process_token &&
+      std::strcmp(token_source, "ra") != 0) {
+    std::fprintf(stderr,
+                 "[KVAF_AIV] BATCH_PUT_LOCAL_TOKEN_SOURCE_INVALID value=%s\n",
+                 token_source);
+    return KVAF_BATCH_PUT_DIRECT_HCCP_ERROR;
+  }
+  uint32_t process_token_id = 0U;
+  if (use_process_token &&
+      !QueryAclProcessToken(input_device, input_device_bytes, &process_token_id)) {
+    return KVAF_BATCH_PUT_DIRECT_HCCP_ERROR;
+  }
   uint32_t token_id = 0U;
   if (!AllocateToken(transport->api, transport->device_context, "device_local_hbm",
                      &candidate->token_handle, &token_id) ||
@@ -504,9 +578,16 @@ extern "C" int32_t KvafBatchPutLocalBufferAcquire(KvafBatchPutTransport *transpo
   for (uint32_t entity_index = 0U; entity_index < transport->worker_count; ++entity_index) {
     entities[entity_index].local_hbm_address = input_address;
     entities[entity_index].local_hbm_size = input_device_bytes;
-    entities[entity_index].local_token_id = candidate->memory.token_id;
+    entities[entity_index].local_token_id =
+        use_process_token ? process_token_id : candidate->memory.token_id;
     entities[entity_index].local_token_value = candidate->memory.token_value;
   }
+  std::fprintf(stderr,
+               "[KVAF_AIV] BATCH_PUT_LOCAL_TOKEN_SOURCE source=%s "
+               "wqe_token_id=0x%x ra_token_id=0x%x\n",
+               use_process_token ? "process" : "ra_v9_default",
+               use_process_token ? process_token_id : candidate->memory.token_id,
+               candidate->memory.token_id);
   const uint64_t entity_bytes =
       static_cast<uint64_t>(transport->worker_count) * sizeof(entities.front());
   if (aclrtMalloc(&candidate->device_entities, entity_bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
@@ -547,11 +628,77 @@ extern "C" void KvafBatchPutLocalBufferRelease(KvafBatchPutLocalBuffer *local_bu
   --local_buffer->reference_count;
 }
 
+static void LogBatchPutCompletionDiagnostics(const KvafBatchPutCoreStatus *statuses,
+                                            uint32_t core_count,
+                                            uint32_t jettys_per_core) {
+  for (uint32_t core = 0U; core < core_count; ++core) {
+    const auto &status = statuses[core];
+    if (status.reserved[KVAF_BATCH_PUT_CQ_DIAGNOSTIC_MAGIC_WORD] !=
+        KVAF_BATCH_PUT_CQ_DIAGNOSTIC_MAGIC) {
+      continue;
+    }
+    bool report = false;
+    for (uint32_t jetty = 0U; jetty < jettys_per_core; ++jetty) {
+      const uint64_t *const record = status.reserved +
+          KVAF_BATCH_PUT_CQ_DIAGNOSTIC_BASE_WORD +
+          jetty * KVAF_BATCH_PUT_CQ_DIAGNOSTIC_WORDS_PER_JETTY;
+      report = report || record[KVAF_BATCH_PUT_CQ_DIAG_FAST_BUDGET_EXCEEDED] != 0U ||
+               record[KVAF_BATCH_PUT_CQ_DIAG_RESULT] != KVAF_BATCH_PUT_CORE_SUCCESS;
+    }
+    if (!report) continue;
+    // Print both queues of the affected core: the old aggregate SQ/CQ
+    // fields refer only to jetty0 even when jetty1 is the one that failed.
+    for (uint32_t jetty = 0U; jetty < jettys_per_core; ++jetty) {
+      const uint64_t *const record = status.reserved +
+          KVAF_BATCH_PUT_CQ_DIAGNOSTIC_BASE_WORD +
+          jetty * KVAF_BATCH_PUT_CQ_DIAGNOSTIC_WORDS_PER_JETTY;
+      if (record[KVAF_BATCH_PUT_CQ_DIAG_ASSIGNED_ROWS] == 0U) continue;
+      const uint64_t reason = record[KVAF_BATCH_PUT_CQ_DIAG_TIMEOUT_REASON];
+      const char *const reason_name =
+          reason == KVAF_BATCH_PUT_CQ_TIMEOUT_DEVICE_DEADLINE ? "device_deadline" :
+          reason == KVAF_BATCH_PUT_CQ_TIMEOUT_POLL_FALLBACK ? "poll_fallback" : "none";
+      const uint64_t result = record[KVAF_BATCH_PUT_CQ_DIAG_RESULT];
+      const bool late_success = result == KVAF_BATCH_PUT_CORE_SUCCESS &&
+          record[KVAF_BATCH_PUT_CQ_DIAG_FAST_BUDGET_EXCEEDED] != 0U;
+      std::fprintf(stderr,
+          "[KVAF_AIV] BATCH_PUT_CQ_WAIT_DETAILS core=%u jetty=%u result=%llu "
+          "rows=%llu polls=%llu elapsed_ticks=%llu slow_elapsed_ticks=%llu "
+          "fast_budget_exceeded=%llu late_success=%u timeout_reason=%s "
+          "raw_cq_word=0x%llx observed_owner=%llu expected_owner=%llu cqe_valid=%u "
+          "cq_status=%llu cq_sub_status=%llu sq_before=%llu cq_before=%llu "
+          "sq_after=%llu cq_after=%llu fast_poll_budget=20000 "
+          "slow_deadline_ticks=100000000 slow_poll_limit=1000000 clock_hz=1000000000 "
+          "timing_scope=eager_put_cq_not_Get_performance\n",
+          core, jetty, static_cast<unsigned long long>(result),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_ASSIGNED_ROWS]),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_POLLS]),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_ELAPSED_TICKS]),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_SLOW_ELAPSED_TICKS]),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_FAST_BUDGET_EXCEEDED]),
+          static_cast<unsigned int>(late_success), reason_name,
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_RAW_WORD]),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_OBSERVED_OWNER]),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_EXPECTED_OWNER]),
+          static_cast<unsigned int>(record[KVAF_BATCH_PUT_CQ_DIAG_OBSERVED_OWNER] !=
+                                    record[KVAF_BATCH_PUT_CQ_DIAG_EXPECTED_OWNER]),
+          static_cast<unsigned long long>((record[KVAF_BATCH_PUT_CQ_DIAG_RAW_WORD] >> 24U) & 0xffU),
+          static_cast<unsigned long long>((record[KVAF_BATCH_PUT_CQ_DIAG_RAW_WORD] >> 16U) & 0xffU),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_SQ_BEFORE]),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_CQ_BEFORE]),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_SQ_AFTER]),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_CQ_DIAG_CQ_AFTER]));
+    }
+  }
+}
+
 extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer,
                                             const KvafExecuteBatchPutKernelArgs *arguments,
                                             aclrtStream stream,
                                             KvafBatchPutCoreStatus *core_status,
                                             uint32_t core_status_count) {
+  hccp::VerboseLog("[KVAF_AIV] BATCH_PUT_PHASE phase=sync_enter local=%p args=%p stream=%p\n",
+                   static_cast<void *>(local_buffer), static_cast<const void *>(arguments),
+                   static_cast<void *>(stream));
   if (local_buffer == nullptr || local_buffer->reference_count == 0U ||
       local_buffer->transport == nullptr || arguments == nullptr || stream == nullptr || core_status == nullptr ||
       arguments->input == 0U || arguments->input_offsets == 0U || arguments->lengths == 0U ||
@@ -566,6 +713,7 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
 
   KvafBatchPutTransport *transport = local_buffer->transport;
   std::lock_guard<std::mutex> launch_lock(transport->launch_mutex);
+  hccp::VerboseLog("[KVAF_AIV] BATCH_PUT_PHASE phase=clear_status_begin\n");
   const uint64_t status_bytes = static_cast<uint64_t>(core_status_count) * sizeof(*core_status);
   const aclError clear_result =
       aclrtMemset(reinterpret_cast<void *>(arguments->core_status), status_bytes, 0, status_bytes);
@@ -574,6 +722,7 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
                  static_cast<int>(clear_result));
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
+  hccp::VerboseLog("[KVAF_AIV] BATCH_PUT_PHASE phase=launch_begin\n");
   KvafExecuteBatchPutLaunchArgs launch_args{};
   launch_args.request = *arguments;
   launch_args.channel_entity = local_buffer->device_channel_entity;
@@ -584,12 +733,14 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=launch result=%d\n", result);
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
+  hccp::VerboseLog("[KVAF_AIV] BATCH_PUT_PHASE phase=synchronize_begin\n");
   const aclError synchronize_result = aclrtSynchronizeStream(stream);
   if (synchronize_result != ACL_SUCCESS) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=synchronize acl=%d\n",
                  static_cast<int>(synchronize_result));
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
+  hccp::VerboseLog("[KVAF_AIV] BATCH_PUT_PHASE phase=copy_status_begin\n");
   const aclError status_copy_result =
       aclrtMemcpy(core_status, status_bytes, reinterpret_cast<void *>(arguments->core_status), status_bytes,
                   ACL_MEMCPY_DEVICE_TO_HOST);
@@ -598,6 +749,9 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
                  static_cast<int>(status_copy_result));
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
+  LogBatchPutCompletionDiagnostics(core_status, core_status_count,
+                                    transport->jettys_per_core);
+  hccp::VerboseLog("[KVAF_AIV] BATCH_PUT_PHASE phase=status_validate_begin\n");
   for (uint32_t core = 0U; core < core_status_count; ++core) {
     const uint64_t begin = static_cast<uint64_t>(arguments->row_count) * core / core_status_count;
     const uint64_t end = static_cast<uint64_t>(arguments->row_count) * (core + 1U) / core_status_count;
@@ -605,6 +759,54 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
         core_status[core].result != KVAF_BATCH_PUT_CORE_SUCCESS ||
         core_status[core].processed_request_count != end - begin ||
         core_status[core].failed_request_index != UINT64_MAX) {
+      // The SQ address comes from HCCP QP creation, not aclrtMalloc. This
+      // path has no verified ACL copy contract for that address. Keep the
+      // already-copied status instead of risking a second fault while trying
+      // to inspect an SQE on the failure path.
+      std::fprintf(stderr,
+                   "[KVAF_AIV] BATCH_PUT_VALIDATION_ERROR core=%u magic=0x%llx result=%llu "
+                   "processed=%llu expected=%llu failed_request=%llu "
+                   "sq_pi=%llu cq_ci=%llu cq_status=%llu cq_sub_status=%llu "
+                   "last_wqe=0x%llx mr_addr=0x%llx mr_bytes=%llu "
+                   "mr_token_id=0x%x\n",
+                   core, static_cast<unsigned long long>(core_status[core].magic),
+                   static_cast<unsigned long long>(core_status[core].result),
+                   static_cast<unsigned long long>(core_status[core].processed_request_count),
+                   static_cast<unsigned long long>(end - begin),
+                   static_cast<unsigned long long>(core_status[core].failed_request_index),
+                   static_cast<unsigned long long>(core_status[core].sq_producer_index),
+                   static_cast<unsigned long long>(core_status[core].cq_consumer_index),
+                   static_cast<unsigned long long>(core_status[core].cq_status),
+                   static_cast<unsigned long long>(core_status[core].cq_sub_status),
+                   static_cast<unsigned long long>(core_status[core].last_wqe_protocol),
+                   static_cast<unsigned long long>(local_buffer->memory.registered_address),
+                   static_cast<unsigned long long>(local_buffer->memory.registered_bytes),
+                   local_buffer->memory.token_id);
+      if (arguments->row_count == 1U && core_status_count == 1U &&
+          transport->jettys_per_core == 1U) {
+        const uint64_t local_address = core_status[core].reserved[0];
+        const uint64_t length = core_status[core].reserved[1];
+        const auto &mr = local_buffer->memory;
+        const bool address_in_mr = local_address >= mr.registered_address &&
+            local_address - mr.registered_address <= mr.registered_bytes &&
+            length <= mr.registered_bytes -
+                          (local_address - mr.registered_address);
+        std::fprintf(stderr,
+                     "[KVAF_AIV] BATCH_PUT_AIV_SGE_INPUT local_addr=0x%llx "
+                     "length=%llu local_token_id=0x%llx local_in_mr=%u "
+                     "remote_addr=0x%llx remote_token_id=0x%llx "
+                     "remote_token_value=0x%llx tp_id=0x%llx "
+                     "entity_local_size=%llu\n",
+                     static_cast<unsigned long long>(local_address),
+                     static_cast<unsigned long long>(length),
+                     static_cast<unsigned long long>(core_status[core].reserved[2]),
+                     static_cast<unsigned int>(address_in_mr),
+                     static_cast<unsigned long long>(core_status[core].reserved[3]),
+                     static_cast<unsigned long long>(core_status[core].reserved[4]),
+                     static_cast<unsigned long long>(core_status[core].reserved[5]),
+                     static_cast<unsigned long long>(core_status[core].reserved[6]),
+                     static_cast<unsigned long long>(core_status[core].reserved[7]));
+      }
       return KVAF_BATCH_PUT_KERNEL_ERROR;
     }
   }

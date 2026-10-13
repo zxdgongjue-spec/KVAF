@@ -43,6 +43,17 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
   # _kvaf directly links the AIV host shared object. Keep its build-tree
   # location in the extension RPATH so PYTHONPATH=build/python is sufficient
   # for the direct Python integration test.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # DT_RPATH takes precedence over LD_LIBRARY_PATH for these direct
+    # dependencies, preventing an older KVAF host DSO from replacing the
+    # transport implementation paired with this extension. The host DSOs
+    # need the same rule for their direct_hccp_session dependency.
+    target_link_options(_kvaf PRIVATE "-Wl,--disable-new-dtags")
+    target_link_options(kvaf_execute_batch_get_host PRIVATE "-Wl,--disable-new-dtags")
+    if(KVAF_ENABLE_AIV_BATCH_PUT)
+      target_link_options(kvaf_execute_batch_put_host PRIVATE "-Wl,--disable-new-dtags")
+    endif()
+  endif()
   set_property(TARGET _kvaf APPEND PROPERTY BUILD_RPATH
     "$<TARGET_FILE_DIR:kvaf_execute_batch_get_host>"
   )

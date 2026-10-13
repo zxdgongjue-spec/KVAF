@@ -22,6 +22,13 @@ enum KvafBatchPutResult {
 typedef struct KvafBatchPutTransport KvafBatchPutTransport;
 typedef struct KvafBatchPutLocalBuffer KvafBatchPutLocalBuffer;
 
+// In-process registered Host DDR; no PeerLink or CPU service is required.
+int32_t KvafBatchPutTransportCreateLocalHost(
+    void *host_ddr, uint64_t host_ddr_bytes, uint32_t aiv_core_count,
+    uint32_t jettys_per_core, KvafBatchPutTransport **transport);
+// Failure retains the transport; the caller must retain its DDR allocation.
+int32_t KvafBatchPutTransportDestroyChecked(KvafBatchPutTransport *transport);
+
 int32_t KvafBatchPutTransportCreateWithPeerLink(
     void *host_ddr, uint64_t host_ddr_bytes, uint32_t aiv_core_count,
     uint32_t jettys_per_core, void *peer_link,

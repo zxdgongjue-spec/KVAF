@@ -1,5 +1,23 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+# Build only the allocator and a private ACL stub. In particular, this target
+# does not link Runtime, PeerLink, the CPU service or any device transport.
+add_executable(kvaf_local_host_ddr_allocator_test
+  local_host_ddr_allocator_test.cc
+  ../runtime/src/local_host_ddr.cc)
+target_include_directories(kvaf_local_host_ddr_allocator_test PRIVATE
+  local_host_ddr_stubs
+  ../runtime/include
+  ../access_operator/include
+  ../meta_manager/include)
+target_link_libraries(kvaf_local_host_ddr_allocator_test PRIVATE kvaf_common)
+add_test(NAME kvaf_local_host_ddr_allocator_host
+  COMMAND kvaf_local_host_ddr_allocator_test)
+add_test(NAME kvaf_local_host_ddr_allocator_thp
+  COMMAND kvaf_local_host_ddr_allocator_test --thp)
+set_tests_properties(kvaf_local_host_ddr_allocator_thp PROPERTIES
+  SKIP_RETURN_CODE 77)
+
 if(KVAF_BUILD_PYTHON)
   add_test(
     NAME kvaf_runtime_mock_python
@@ -67,3 +85,18 @@ target_include_directories(kvaf_batch_get_device_control_test PRIVATE
   ../access_operator/demo/aiv_batch_get/include)
 add_test(NAME kvaf_batch_get_device_control_host
   COMMAND kvaf_batch_get_device_control_test)
+
+# Real local endpoint teardown with injected RA callbacks; no NPU is required.
+add_executable(kvaf_local_host_transport_lifecycle_test
+  local_host_transport_lifecycle_test.cc
+  ../access_operator/src/direct_hccp/direct_hccp_local_host.cc)
+target_include_directories(kvaf_local_host_transport_lifecycle_test PRIVATE
+  ../access_operator/include)
+add_test(NAME kvaf_local_host_transport_lifecycle
+  COMMAND kvaf_local_host_transport_lifecycle_test)
+
+# Runtime ownership and teardown with injected CPU-only dependencies.
+add_executable(kvaf_runtime_core_test runtime_core_test.cc)
+target_link_libraries(kvaf_runtime_core_test PRIVATE kvaf_runtime)
+add_test(NAME kvaf_runtime_core_initialize_cleanup
+  COMMAND kvaf_runtime_core_test)

@@ -395,6 +395,7 @@ struct NpuRuntime::Impl {
     config.batch_put_kernel_object_path = options.batch_put_kernel_object_path;
     config.npu_core_count = options.npu_core_count;
     config.jettys_per_core = options.jettys_per_core;
+    config.local_host_ddr = options.local_host_ddr;
   }
 
   void CreateCore() {
@@ -433,6 +434,10 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS) {
     throw std::runtime_error("aclrtSetDevice failed for NpuRuntime");
   }
+  if (impl_->options.local_host_ddr) {
+    impl_->allocator = CreateLocalHostDdrAllocator(impl_->options.local_ddr_page_mode);
+    impl_->CreateCore();
+  }
 }
 
 NpuRuntime::~NpuRuntime() {
@@ -450,6 +455,9 @@ NpuRuntime::~NpuRuntime() {
 }
 
 Status NpuRuntime::LinkTo(const LinkTarget& target) {
+  if (impl_->options.local_host_ddr) {
+    return Status::InvalidState("local host DDR Runtime does not use a peer service");
+  }
   if (target.address.empty()) return Status::InvalidArgument("NpuRuntime LinkTo requires peer host:port");
   if (initialized()) return Status::InvalidState("NpuRuntime LinkTo must run before initialize");
   if (impl_->peer_link != nullptr) return Status::InvalidState("NpuRuntime already has a PeerLink");
@@ -470,6 +478,24 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
 Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
   const RuntimeInitRequest request{ddr_bytes, slot_size, DeviceKind::kCpu};
   if (initialized()) return Status::InvalidState("NpuRuntime has already been initialized");
+  if (impl_->options.local_host_ddr) {
+    const Status initialized = impl_->runtime_core->Initialize(request);
+    if (!initialized.ok()) return initialized;
+    const LocalHostDdrStats stats = local_ddr_page_stats();
+    const std::string mode = local_ddr_page_mode();
+    if (mode != "acl" && (stats.smaps_covered_bytes < ddr_bytes ||
+        (mode == "thp" && stats.anon_huge_bytes == 0U) ||
+        (mode == "base" && stats.anon_huge_bytes != 0U))) {
+      const Status shutdown = impl_->runtime_core->Shutdown();
+      return Status::Internal("local host DDR page mode changed after HCCP registration: " + mode +
+                              (shutdown.ok() ? "" : "; teardown retained: " + shutdown.message()));
+    }
+    std::fprintf(stderr, "[KVAF_AIV] LOCAL_HOST_DDR_READY pid=%d bytes=%llu mode=%s "
+                         "anon_huge_bytes=%llu remote_service=0\n",
+                 static_cast<int>(getpid()), static_cast<unsigned long long>(ddr_bytes), mode.c_str(),
+                 static_cast<unsigned long long>(stats.anon_huge_bytes));
+    return Status::OK();
+  }
   if (impl_->peer_link == nullptr || impl_->peer_allocator == nullptr ||
       impl_->runtime_core == nullptr) {
     return Status::InvalidState("NpuRuntime requires LinkTo before Initialize");
@@ -682,7 +708,14 @@ bool NpuRuntime::initialized() const {
 }
 
 RuntimeCapabilities NpuRuntime::capabilities() const {
-  return RuntimeCapabilities{true, !impl_->config.batch_put_kernel_object_path.empty(), false, true};
+  return RuntimeCapabilities{true, !impl_->config.batch_put_kernel_object_path.empty(), false,
+                             !impl_->options.local_host_ddr};
+}
+
+bool NpuRuntime::local_host_ddr() const { return impl_->options.local_host_ddr; }
+std::string NpuRuntime::local_ddr_page_mode() const { return impl_->options.local_ddr_page_mode; }
+LocalHostDdrStats NpuRuntime::local_ddr_page_stats() const {
+  return impl_->allocator == nullptr ? LocalHostDdrStats{} : LocalHostDdrPageStats(*impl_->allocator);
 }
 
 }  // namespace kvaf

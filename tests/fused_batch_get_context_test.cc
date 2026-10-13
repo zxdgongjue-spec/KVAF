@@ -19,6 +19,10 @@ struct FakeDriver {
   int destroys{0};
   int launches{0};
   int device_syncs{0};
+  int local_creates{0};
+  int peer_creates{0};
+  bool fail_destroy{false};
+  bool fail_local_create{false};
   bool fail_acquire{false};
   bool fail_stream_sync{false};
 } driver;
@@ -54,6 +58,45 @@ class Allocator final : public kvaf::DdrMemoryAllocator {
   int releases{0};
   std::vector<std::uint8_t> data;
 };
+
+void TestLocalHostOwnership() {
+  driver = {};
+  auto config = Config();
+  config.local_host_ddr = true;
+  config.peer_link.reset();
+  config.peer_local_eid.fill(0);
+  kvaf::DefaultAccessOperator op(config);
+  auto metadata = kvaf::CreateInMemoryMetaManager();
+  Allocator allocator;
+  kvaf::RuntimeCore runtime(*metadata, op, allocator);
+  Require(runtime.Initialize({4096, 256, kvaf::DeviceKind::kCpu}).ok(), "local initialize without Link");
+  Require(driver.local_creates == 1 && driver.peer_creates == 0, "local transport selected");
+  driver.fail_destroy = true;
+  Require(!runtime.Shutdown().ok(), "failed queue retirement reaches Runtime");
+  Require(allocator.releases == 0 && !allocator.data.empty(), "failed retirement retains DDR");
+  driver.fail_destroy = false;
+  Require(runtime.Shutdown().ok(), "retry retired transport");
+  Require(allocator.releases == 1 && driver.destroys == 1, "successful retirement releases once");
+}
+
+void TestPartialLocalInitialization() {
+  driver = {};
+  auto config = Config();
+  config.local_host_ddr = true;
+  config.peer_link.reset();
+  kvaf::DefaultAccessOperator op(config);
+  auto metadata = kvaf::CreateInMemoryMetaManager();
+  Allocator allocator;
+  kvaf::RuntimeCore runtime(*metadata, op, allocator);
+  driver.fail_local_create = true;
+  driver.fail_destroy = true;
+  Require(!runtime.Initialize({4096, 256, kvaf::DeviceKind::kCpu}).ok(), "partial initialization fails");
+  Require(runtime.initialized() && allocator.releases == 0, "failed rollback retains DDR ownership");
+  Require(!op.ExecuteBatchGet({}).ok(), "partial transport cannot execute");
+  driver.fail_destroy = false;
+  Require(runtime.Shutdown().ok(), "retire partial transport before DDR release");
+  Require(allocator.releases == 1 && driver.destroys == 1, "partial resources released once");
+}
 
 void TestLeaseAndRuntimeTeardown() {
   driver = {};
@@ -173,7 +216,20 @@ aclError aclrtSynchronizeStream(aclrtStream) { return driver.fail_stream_sync ? 
 int32_t KvafBatchGetTransportCreateWithPeerLink(void*, uint64_t, uint32_t,
                                                 uint32_t, void*, const uint8_t*,
                                                 KvafBatchGetTransport** transport) {
+  ++driver.peer_creates;
   *transport = new KvafBatchGetTransport;
+  return KVAF_BATCH_GET_SUCCESS;
+}
+int32_t KvafBatchGetTransportCreateLocalHost(void*, uint64_t, uint32_t,
+                                              uint32_t, KvafBatchGetTransport** transport) {
+  ++driver.local_creates;
+  *transport = new KvafBatchGetTransport;
+  return driver.fail_local_create ? KVAF_BATCH_GET_RUNTIME_ERROR : KVAF_BATCH_GET_SUCCESS;
+}
+int32_t KvafBatchGetTransportDestroyChecked(KvafBatchGetTransport* transport) {
+  if (driver.fail_destroy) return KVAF_BATCH_GET_RUNTIME_ERROR;
+  ++driver.destroys;
+  delete transport;
   return KVAF_BATCH_GET_SUCCESS;
 }
 void KvafBatchGetTransportDestroy(KvafBatchGetTransport* transport) {
@@ -199,6 +255,8 @@ int32_t KvafExecuteBatchGetLaunch(const KvafExecuteBatchGetKernelArgs*, aclrtStr
 
 int main() {
   try {
+    TestLocalHostOwnership();
+    TestPartialLocalInitialization();
     TestLeaseAndRuntimeTeardown();
     TestFailedCompletionRetainsRegistration(false);
     TestFailedCompletionRetainsRegistration(true);

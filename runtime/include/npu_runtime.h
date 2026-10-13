@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "access_operator.h"
+#include "local_host_ddr.h"
 #include "runtime.h"
 
 namespace kvaf {
@@ -28,6 +29,8 @@ struct NpuRuntimeOptions {
   std::uint32_t device_id{0U};
   std::uint32_t npu_core_count{1U};
   std::uint32_t jettys_per_core{2U};
+  bool local_host_ddr{false};
+  std::string local_ddr_page_mode{"thp"};
 };
 
 // NPU role Runtime. It owns the current MetaManager, NPU AccessOperator and
@@ -49,6 +52,9 @@ class NpuRuntime final : public Runtime {
   std::uint32_t jettys_per_core() const;
   std::uint32_t batch_get_token_bytes() const;
   std::uint32_t batch_get_tokens_per_block() const;
+  bool local_host_ddr() const;
+  std::string local_ddr_page_mode() const;
+  LocalHostDdrStats local_ddr_page_stats() const;
 
   Status SetBatchGetKernelProfiling(bool enabled);
   Status CopyBatchGetKernelProfiles(

@@ -1,6 +1,7 @@
 add_library(kvaf_direct_hccp_session SHARED
   direct_hccp_session.cc
   direct_hccp_remote_transport.cc
+  direct_hccp_local_host.cc
 )
 
 target_include_directories(kvaf_direct_hccp_session

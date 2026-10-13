@@ -23,6 +23,13 @@ typedef struct KvafBatchGetLocalBuffer KvafBatchGetLocalBuffer;
 
 // Transport owns only the reusable peer-EID path and remote DDR registration.
 // It deliberately accepts no caller-owned HBM buffer.
+// In-process registered Host DDR; no PeerLink or CPU service is required.
+int32_t KvafBatchGetTransportCreateLocalHost(
+    void *host_ddr, uint64_t host_ddr_bytes, uint32_t aiv_core_count,
+    uint32_t jettys_per_core, KvafBatchGetTransport **transport);
+// Failure retains the transport; the caller must retain its DDR allocation.
+int32_t KvafBatchGetTransportDestroyChecked(KvafBatchGetTransport *transport);
+
 int32_t KvafBatchGetTransportCreateWithPeerLink(
     void *host_ddr, uint64_t host_ddr_bytes, uint32_t aiv_core_count,
     uint32_t jettys_per_core, void *peer_link,

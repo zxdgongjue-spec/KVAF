@@ -289,6 +289,7 @@ struct DefaultAccessOperator::Impl {
   BatchPutExecutionState batch_put_execution;
 #endif
   bool initialized{false};
+  bool initialization_failed{false};
 };
 
 DefaultAccessOperator::DefaultAccessOperator(AccessOperatorConfig config)
@@ -317,10 +318,10 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
       impl_->config.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE) {
     return InvalidArgument("invalid AccessOperator initialization config");
   }
-  if (impl_->config.peer_link == nullptr) {
+  if (!impl_->config.local_host_ddr && impl_->config.peer_link == nullptr) {
     return InvalidState("AccessOperator requires an established Runtime Link");
   }
-  if (std::all_of(impl_->config.peer_local_eid.begin(),
+  if (!impl_->config.local_host_ddr && std::all_of(impl_->config.peer_local_eid.begin(),
                   impl_->config.peer_local_eid.end(),
                   [](std::uint8_t value) { return value == 0U; })) {
     return InvalidArgument("Runtime Link requires a Runtime-selected local EID");
@@ -340,15 +341,27 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
   }
 
   KvafBatchGetTransport* transport = nullptr;
-  const int32_t result = KvafBatchGetTransportCreateWithPeerLink(
-      reinterpret_cast<void*>(remote_region.base), remote_region.length,
-      impl_->config.npu_core_count, impl_->config.jettys_per_core,
-      impl_->config.peer_link.get(), impl_->config.peer_local_eid.data(), &transport);
+  const int32_t result = impl_->config.local_host_ddr
+      ? KvafBatchGetTransportCreateLocalHost(
+            reinterpret_cast<void*>(remote_region.base), remote_region.length,
+            impl_->config.npu_core_count, impl_->config.jettys_per_core, &transport)
+      : KvafBatchGetTransportCreateWithPeerLink(
+            reinterpret_cast<void*>(remote_region.base), remote_region.length,
+            impl_->config.npu_core_count, impl_->config.jettys_per_core,
+            impl_->config.peer_link.get(), impl_->config.peer_local_eid.data(), &transport);
+  if (transport != nullptr) {
+    impl_->transport = transport;
+    impl_->remote_region = remote_region;
+    // Publish ownership before a later setup step can fail. Runtime rolls
+    // back through checked Shutdown and retains DDR if retirement fails.
+    impl_->initialized = true;
+    impl_->initialization_failed = true;
+  }
   if (result != KVAF_BATCH_GET_SUCCESS || transport == nullptr) {
     return Internal("failed to create reusable BatchGet transport");
   }
 
-  BatchGetExecutionState execution;
+  BatchGetExecutionState& execution = impl_->execution;
   execution.status_bytes = static_cast<std::size_t>(impl_->config.npu_core_count) *
                            sizeof(KvafBatchGetCoreStatus);
   execution.queue_state_bytes =
@@ -363,53 +376,35 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
                   execution.status_bytes) != ACL_SUCCESS ||
       aclrtMemset(execution.queue_state, execution.queue_state_bytes, 0,
                   execution.queue_state_bytes) != ACL_SUCCESS) {
-    if (execution.queue_state != nullptr) (void)aclrtFree(execution.queue_state);
-    if (execution.status != nullptr) (void)aclrtFree(execution.status);
-    KvafBatchGetTransportDestroy(transport);
     return Internal("failed to allocate internal BatchGet execution state");
   }
-  impl_->remote_region = remote_region;
-  impl_->transport = transport;
-  impl_->execution = execution;
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   if (!impl_->config.batch_put_kernel_object_path.empty()) {
     if (impl_->config.npu_core_count > KVAF_AIV_BATCH_PUT_MAX_AIV_CORES ||
         KvafExecuteBatchPutLoadKernel(
             impl_->config.batch_put_kernel_object_path.c_str()) !=
             KVAF_BATCH_PUT_SUCCESS) {
-      (void)aclrtFree(impl_->execution.queue_state);
-      (void)aclrtFree(impl_->execution.status);
-      KvafBatchGetTransportDestroy(impl_->transport);
-      impl_->transport = nullptr;
-      impl_->execution = BatchGetExecutionState{};
       return Internal("failed to load BatchPut kernel");
     }
 
     KvafBatchPutTransport* batch_put_transport = nullptr;
-    const int32_t batch_put_result = KvafBatchPutTransportCreateWithPeerLink(
-        reinterpret_cast<void*>(remote_region.base), remote_region.length,
-        impl_->config.npu_core_count, impl_->config.jettys_per_core,
-        impl_->config.peer_link.get(), impl_->config.peer_local_eid.data(),
-        &batch_put_transport);
+    const int32_t batch_put_result = impl_->config.local_host_ddr
+        ? KvafBatchPutTransportCreateLocalHost(
+              reinterpret_cast<void*>(remote_region.base), remote_region.length,
+              impl_->config.npu_core_count, impl_->config.jettys_per_core, &batch_put_transport)
+        : KvafBatchPutTransportCreateWithPeerLink(
+              reinterpret_cast<void*>(remote_region.base), remote_region.length,
+              impl_->config.npu_core_count, impl_->config.jettys_per_core,
+              impl_->config.peer_link.get(), impl_->config.peer_local_eid.data(), &batch_put_transport);
+    impl_->batch_put_transport = batch_put_transport;
     if (batch_put_result != KVAF_BATCH_PUT_SUCCESS ||
         batch_put_transport == nullptr) {
-      (void)aclrtFree(impl_->execution.queue_state);
-      (void)aclrtFree(impl_->execution.status);
-      KvafBatchGetTransportDestroy(impl_->transport);
-      impl_->transport = nullptr;
-      impl_->execution = BatchGetExecutionState{};
       return Internal("failed to create reusable BatchPut transport");
     }
     BatchPutExecutionState batch_put_execution;
     Status batch_put_status = InitializeBatchPutExecutionState(
         impl_->config.npu_core_count, &batch_put_execution);
     if (!batch_put_status.ok()) {
-      KvafBatchPutTransportDestroy(batch_put_transport);
-      (void)aclrtFree(impl_->execution.queue_state);
-      (void)aclrtFree(impl_->execution.status);
-      KvafBatchGetTransportDestroy(impl_->transport);
-      impl_->transport = nullptr;
-      impl_->execution = BatchGetExecutionState{};
       return batch_put_status;
     }
     impl_->batch_put_transport = batch_put_transport;
@@ -423,6 +418,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
   }
 #endif
   impl_->initialized = true;
+  impl_->initialization_failed = false;
   return Status::OK();
 }
 
@@ -438,15 +434,20 @@ Status DefaultAccessOperator::Shutdown() {
 
   // Callers must complete all submitted streams before Runtime::Shutdown,
   // including the default enqueue-only Python BatchGet path.
+  // A failed retirement can leave only part of the transport graph alive.
+  // Reject new launches until checked Shutdown has released it completely.
+  impl_->initialization_failed = true;
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
-  ReleaseBatchPutExecutionState(&impl_->batch_put_execution);
-  if (impl_->batch_put_transport != nullptr) {
-    KvafBatchPutTransportDestroy(impl_->batch_put_transport);
+  if (impl_->batch_put_transport != nullptr &&
+      KvafBatchPutTransportDestroyChecked(impl_->batch_put_transport) != KVAF_BATCH_PUT_SUCCESS) {
+    return Internal("BatchPut transport retirement failed; retain Runtime and DDR");
   }
+  ReleaseBatchPutExecutionState(&impl_->batch_put_execution);
   impl_->batch_put_transport = nullptr;
 #endif
-  if (impl_->transport != nullptr) {
-    KvafBatchGetTransportDestroy(impl_->transport);
+  if (impl_->transport != nullptr &&
+      KvafBatchGetTransportDestroyChecked(impl_->transport) != KVAF_BATCH_GET_SUCCESS) {
+    return Internal("BatchGet transport retirement failed; retain Runtime and DDR");
   }
   if (impl_->execution.queue_state != nullptr) {
     (void)aclrtFree(impl_->execution.queue_state);
@@ -458,12 +459,13 @@ Status DefaultAccessOperator::Shutdown() {
   impl_->execution = BatchGetExecutionState{};
   impl_->remote_region = RemoteRegionDesc{};
   impl_->initialized = false;
+  impl_->initialization_failed = false;
   return Status::OK();
 }
 
 Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   std::lock_guard<std::mutex> lock(impl_->batch_get_mutex);
-  if (!impl_->initialized || impl_->transport == nullptr) {
+  if (!impl_->initialized || impl_->initialization_failed || impl_->transport == nullptr) {
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
   }
@@ -518,7 +520,7 @@ Status DefaultAccessOperator::AcquireFusedBatchGetContext(
     void* output, std::uint64_t output_bytes, std::uint32_t token_bytes,
     std::uint32_t tokens_per_block, FusedBatchGetContext* context) {
   std::lock_guard<std::mutex> lock(impl_->batch_get_mutex);
-  if (!impl_->initialized || impl_->transport == nullptr) {
+  if (!impl_->initialized || impl_->initialization_failed || impl_->transport == nullptr) {
     return Status::NotInitialized("AccessOperator has not been initialized");
   }
   if (impl_->fused_context.lease_id != 0U) {
@@ -594,7 +596,7 @@ Status DefaultAccessOperator::ReleaseFusedBatchGetContext(
 
 Status DefaultAccessOperator::SetBatchGetKernelProfiling(bool enabled) {
   std::lock_guard<std::mutex> lock(impl_->batch_get_mutex);
-  if (!impl_->initialized || impl_->execution.status == nullptr) {
+  if (!impl_->initialized || impl_->initialization_failed || impl_->execution.status == nullptr) {
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
   }
@@ -621,7 +623,7 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
   if (profiles == nullptr) {
     return InvalidArgument("BatchGet kernel profile output must not be null");
   }
-  if (!impl_->initialized || impl_->execution.status == nullptr) {
+  if (!impl_->initialized || impl_->initialization_failed || impl_->execution.status == nullptr) {
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
   }
@@ -679,7 +681,7 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
 }
 
 Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
-  if (!impl_->initialized) {
+  if (!impl_->initialized || impl_->initialization_failed) {
     return Status::NotInitialized("AccessOperator has not been initialized");
   }
   if (exec.request == nullptr || exec.put_desc == nullptr ||

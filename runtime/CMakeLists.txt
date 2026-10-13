@@ -27,7 +27,7 @@ target_link_libraries(kvaf_runtime
 target_compile_features(kvaf_runtime PUBLIC cxx_std_17)
 
 if(KVAF_ENABLE_AIV_BATCH_GET)
-  add_library(kvaf_npu_runtime STATIC src/npu_runtime.cc)
+  add_library(kvaf_npu_runtime STATIC src/npu_runtime.cc src/local_host_ddr.cc)
   target_include_directories(kvaf_npu_runtime
     PUBLIC
       ${CMAKE_CURRENT_SOURCE_DIR}/include

@@ -15,6 +15,7 @@
 #include "acl/acl.h"
 #include "direct_hccp/direct_hccp_abi.h"
 #include "direct_hccp/direct_hccp_remote_transport.h"
+#include "direct_hccp/direct_hccp_local_host.h"
 #include "direct_hccp/direct_hccp_session.h"
 
 namespace hccp = kvaf::direct_hccp;
@@ -85,9 +86,10 @@ struct KvafBatchGetTransport {
   std::array<KvafBatchGetDirectUrmaEntity, kMaxDirectAivWorkers> entity_templates{};
   uint32_t worker_count{0};
   hccp::PeerLink *peer_link{nullptr};
+  std::unique_ptr<hccp::LocalHostEndpoint> local_host;
 };
 
-std::string EidToHex(const std::array<uint8_t, hccp::kEidBytes> &eid) {
+static std::string EidToHex(const std::array<uint8_t, hccp::kEidBytes> &eid) {
   static constexpr char kHex[] = "0123456789abcdef";
   std::string result;
   result.reserve(hccp::kEidBytes * 2U);
@@ -98,7 +100,7 @@ std::string EidToHex(const std::array<uint8_t, hccp::kEidBytes> &eid) {
   return result;
 }
 
-std::array<uint8_t, hccp::kEidBytes> ReverseEidForAivWqe(
+static std::array<uint8_t, hccp::kEidBytes> ReverseEidForAivWqe(
     const std::array<uint8_t, hccp::kEidBytes> &ra_host_eid) {
   std::array<uint8_t, hccp::kEidBytes> wqe_remote_eid{};
   for (uint32_t index = 0U; index < hccp::kEidBytes; ++index) {
@@ -110,7 +112,7 @@ std::array<uint8_t, hccp::kEidBytes> ReverseEidForAivWqe(
   return wqe_remote_eid;
 }
 
-bool InitContext(const DirectHccpApi &api, int32_t mode, uint32_t physical_device_id,
+static bool InitContext(const DirectHccpApi &api, int32_t mode, uint32_t physical_device_id,
                  const std::array<uint8_t, hccp::kEidBytes> &eid, const char *role, void **context) {
   hccp::CtxInitCfg cfg{};
   cfg.mode = mode;
@@ -129,7 +131,7 @@ bool InitContext(const DirectHccpApi &api, int32_t mode, uint32_t physical_devic
   return true;
 }
 
-bool AllocateToken(const DirectHccpApi &api, void *context, const char *role, void **token_handle,
+static bool AllocateToken(const DirectHccpApi &api, void *context, const char *role, void **token_handle,
                    uint32_t *token_id) {
   hccp::TokenId raw{};
   const int ret = api.token_alloc(context, &raw, token_handle);
@@ -143,7 +145,7 @@ bool AllocateToken(const DirectHccpApi &api, void *context, const char *role, vo
   return true;
 }
 
-bool AlignRange(uint64_t address, uint64_t bytes, uint64_t *aligned_address, uint64_t *aligned_bytes) {
+static bool AlignRange(uint64_t address, uint64_t bytes, uint64_t *aligned_address, uint64_t *aligned_bytes) {
   if (bytes == 0U || aligned_address == nullptr || aligned_bytes == nullptr) {
     return false;
   }
@@ -157,7 +159,7 @@ bool AlignRange(uint64_t address, uint64_t bytes, uint64_t *aligned_address, uin
   return true;
 }
 
-bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle, uint32_t token_id,
+static bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle, uint32_t token_id,
                     uint32_t token_value, void *address, uint64_t bytes, const char *role, DirectMemory *memory) {
   uint64_t aligned_address = 0U;
   uint64_t aligned_bytes = 0U;
@@ -285,7 +287,7 @@ bool AcquireLocalBuffer(KvafBatchGetTransport *transport, void *output_hbm, uint
   return true;
 }
 
-bool ImportRemoteMemory(const DirectHccpApi &api, void *context, const DirectMemory &remote, void **import_handle) {
+static bool ImportRemoteMemory(const DirectHccpApi &api, void *context, const DirectMemory &remote, void **import_handle) {
   hccp::MrImportInfo info{};
   std::memcpy(info.in.key.value, remote.key, remote.key_bytes);
   info.in.key.size = static_cast<uint8_t>(remote.key_bytes);
@@ -302,7 +304,7 @@ bool ImportRemoteMemory(const DirectHccpApi &api, void *context, const DirectMem
   return true;
 }
 
-bool CreateCq(const DirectHccpApi &api, void *context, uint32_t mode, uint32_t depth, const char *role,
+static bool CreateCq(const DirectHccpApi &api, void *context, uint32_t mode, uint32_t depth, const char *role,
               hccp::CqInfo *info, void **handle) {
   *info = {};
   info->in.channel_handle = nullptr;
@@ -324,34 +326,39 @@ bool CreateCq(const DirectHccpApi &api, void *context, uint32_t mode, uint32_t d
   return true;
 }
 
-void ReleaseTransport(KvafBatchGetTransport *transport) {
-  if (transport == nullptr) {
-    return;
+bool ReleaseTransport(KvafBatchGetTransport *transport) {
+  if (transport == nullptr) return true;
+  // Retire both reciprocal imports and all SQ/CQ objects before their MRs.
+  // A failed retirement retains the transport and its caller-owned DDR.
+  if (!hccp::RetireLocalAndDeviceQueues(transport->api, transport->device_context,
+        transport->workers.data(), transport->worker_count, transport->local_host.get())) {
+    std::fprintf(stderr, "[KVAF_AIV] BATCH_GET_TEARDOWN_RETAINED phase=queues\n");
+    return false;
   }
-  if (!transport->local_buffers.empty()) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=release_local_buffers count=%zu\n",
-                 transport->local_buffers.size());
-    for (const auto &local : transport->local_buffers) {
-      if (local != nullptr) ReleaseLocalBufferResources(transport, local.get());
-    }
+  for (const auto &local : transport->local_buffers) {
+    if (local != nullptr) ReleaseLocalBufferResources(transport, local.get());
   }
+  transport->local_buffers.clear();
+  if (transport->device_peer_memory_import) {
+    if (!transport->api.rmem_unimport || transport->api.rmem_unimport(
+          transport->device_context, transport->device_peer_memory_import) != 0) return false;
+    transport->device_peer_memory_import = nullptr;
+  }
+  if (!hccp::ReleaseLocalHostEndpoint(transport->api, transport->local_host.get())) return false;
   hccp::ReleaseDeviceAivTransport({&transport->api, transport->session, transport->device_context,
                                    transport->device_transport_token_handle,
-                                   transport->device_peer_memory_import, transport->workers.data(),
-                                   transport->worker_count});
-  std::fprintf(stderr,
-               "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=delete_transport "
-               "worker_storage=inline workers=%u\n",
-               transport->worker_count);
+                                   nullptr, transport->workers.data(), transport->worker_count});
   delete transport;
+  return true;
 }
 
 int32_t CreateBatchGetTransport(void *host_ddr, uint64_t host_ddr_bytes,
                                 uint32_t aiv_core_count, uint32_t jettys_per_core,
-                                void *peer_link,
+                                bool local_host_ddr, void *peer_link,
                                 const uint8_t *peer_local_eid,
                                 KvafBatchGetTransport **transport) {
-  if (host_ddr == nullptr || host_ddr_bytes == 0U || peer_link == nullptr || peer_local_eid == nullptr ||
+  if (host_ddr == nullptr || host_ddr_bytes == 0U ||
+      (!local_host_ddr && (peer_link == nullptr || peer_local_eid == nullptr)) ||
       aiv_core_count == 0U || aiv_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES || jettys_per_core == 0U ||
       jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
       static_cast<uint64_t>(aiv_core_count) * jettys_per_core >
@@ -382,17 +389,22 @@ int32_t CreateBatchGetTransport(void *host_ddr, uint64_t host_ddr_bytes,
     goto failed;
   }
   state->physical_device_id = physical_device_id;
-  std::memcpy(device_eid.data(), peer_local_eid, device_eid.size());
-  std::fprintf(stderr,
-               "[KVAF_AIV] PEER_LINK_LOCAL_EID_READY physical_device=%u eid=%s\n",
-               physical_device_id, EidToHex(device_eid).c_str());
-  if (!hccp::LoadPeerMemory(state->peer_link, reinterpret_cast<uint64_t>(host_ddr),
-                            &state->peer_memory, &peer_eid)) {
-    goto failed;
+  if (!hccp::LoadDirectHccp(&state->api) ||
+      !hccp::AcquireDirectHccpSession(physical_device_id, kPidHdcType, &state->session)) goto failed;
+  if (local_host_ddr) {
+    state->local_host = std::make_unique<hccp::LocalHostEndpoint>();
+    if (!hccp::CreateLocalHostEndpoint(state->api, physical_device_id,
+                                      host_ddr, host_ddr_bytes, state->local_host.get())) goto failed;
+    device_eid = state->local_host->device_eid;
+    peer_eid = state->local_host->host_eid;
+    state->peer_memory = state->local_host->memory;
+  } else {
+    std::memcpy(device_eid.data(), peer_local_eid, device_eid.size());
+    if (!hccp::LoadPeerMemory(state->peer_link, reinterpret_cast<uint64_t>(host_ddr),
+                              &state->peer_memory, &peer_eid)) goto failed;
   }
   wqe_remote_eid = ReverseEidForAivWqe(peer_eid);
-  if (!hccp::LoadDirectHccp(&state->api)) goto failed;
-  if (!hccp::AcquireDirectHccpSession(physical_device_id, kPidHdcType, &state->session) ||
+  if (
       !InitContext(state->api, hccp::kOfflineHdc, physical_device_id, device_eid, "device_aiv",
                    &state->device_context) ||
       !AllocateToken(state->api, state->device_context, "device_transport", &state->device_transport_token_handle,
@@ -423,16 +435,19 @@ int32_t CreateBatchGetTransport(void *host_ddr, uint64_t host_ddr_bytes,
     }
     const std::string device_ctp_role = "device_aiv_peer_link_" + suffix;
     hccp::PeerChannel channel{};
-    if (!hccp::CreatePeerChannel(
+    const bool channel_ready = local_host_ddr
+        ? hccp::CreateLocalHostChannel(state->api, physical_device_id, state->device_context,
+              state->device_transport_token_value, worker.device_user_ctl_jetty.info,
+              entity_index, state->local_host.get(), &channel)
+        : hccp::CreatePeerChannel(
             {state->peer_link, &state->api, state->device_context,
              physical_device_id, reinterpret_cast<uint64_t>(host_ddr),
              &state->peer_memory, &device_eid, &peer_eid,
              &worker.device_user_ctl_jetty.info, device_ctp_role.c_str()},
-            &channel)) {
-      goto failed;
-    }
+            &channel);
     worker.device_peer_import_info = channel.local_import_info;
     worker.device_peer_target_jetty = channel.local_target_jetty;
+    if (!channel_ready) goto failed;
   }
 
   {
@@ -508,8 +523,21 @@ int32_t CreateBatchGetTransport(void *host_ddr, uint64_t host_ddr_bytes,
   return KVAF_BATCH_GET_SUCCESS;
 
 failed:
-  ReleaseTransport(state);
+  // A partially registered endpoint may fail to retire. Return its ownership
+  // on error so AccessOperator/Runtime keep DDR alive until shutdown succeeds.
+  if (!ReleaseTransport(state)) *transport = state;
   return result;
+}
+
+extern "C" int32_t KvafBatchGetTransportCreateLocalHost(
+    void *host_ddr, uint64_t host_ddr_bytes, uint32_t aiv_core_count,
+    uint32_t jettys_per_core, KvafBatchGetTransport **transport) {
+  return CreateBatchGetTransport(host_ddr, host_ddr_bytes, aiv_core_count,
+                                   jettys_per_core, true, nullptr, nullptr, transport);
+}
+
+extern "C" int32_t KvafBatchGetTransportDestroyChecked(KvafBatchGetTransport *transport) {
+  return ReleaseTransport(transport) ? KVAF_BATCH_GET_SUCCESS : KVAF_BATCH_GET_RUNTIME_ERROR;
 }
 
 extern "C" int32_t KvafBatchGetTransportCreateWithPeerLink(
@@ -518,7 +546,7 @@ extern "C" int32_t KvafBatchGetTransportCreateWithPeerLink(
     KvafBatchGetTransport **transport) {
   if (peer_link == nullptr || peer_local_eid == nullptr) return KVAF_BATCH_GET_INVALID_ARGUMENT;
   return CreateBatchGetTransport(host_ddr, host_ddr_bytes, aiv_core_count,
-                                 jettys_per_core, peer_link, peer_local_eid, transport);
+                                 jettys_per_core, false, peer_link, peer_local_eid, transport);
 }
 
 extern "C" int32_t KvafBatchGetLocalBufferAcquire(KvafBatchGetTransport *transport, void *output_hbm,

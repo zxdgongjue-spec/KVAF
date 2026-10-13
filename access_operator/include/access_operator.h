@@ -53,6 +53,8 @@ struct AccessOperatorConfig {
   // they do not discover EIDs or make topology decisions.
   std::array<std::uint8_t, 16> peer_local_eid{};
   std::shared_ptr<PeerLink> peer_link;
+  // Register Runtime-owned DDR through the in-process RA host endpoint.
+  bool local_host_ddr{false};
 };
 
 struct BatchGetKernelProfile {

@@ -24,6 +24,32 @@ enum KvafBatchPutCoreResult {
   KVAF_BATCH_PUT_CORE_INVALID_LENGTH = 9,
 };
 
+// CQ wait diagnostics use only existing reserved words: one version marker
+// followed by two 14-word queue records. The one-row SGE snapshot keeps 0..7.
+static const uint64_t KVAF_BATCH_PUT_CQ_DIAGNOSTIC_MAGIC = 0x4351444941473031ULL;
+enum {
+  KVAF_BATCH_PUT_CQ_DIAGNOSTIC_MAGIC_WORD = 8,
+  KVAF_BATCH_PUT_CQ_DIAGNOSTIC_BASE_WORD = 9,
+  KVAF_BATCH_PUT_CQ_DIAGNOSTIC_WORDS_PER_JETTY = 14,
+  KVAF_BATCH_PUT_CQ_DIAG_RESULT = 0,
+  KVAF_BATCH_PUT_CQ_DIAG_POLLS = 1,
+  KVAF_BATCH_PUT_CQ_DIAG_ELAPSED_TICKS = 2,
+  KVAF_BATCH_PUT_CQ_DIAG_RAW_WORD = 3,
+  KVAF_BATCH_PUT_CQ_DIAG_EXPECTED_OWNER = 4,
+  KVAF_BATCH_PUT_CQ_DIAG_TIMEOUT_REASON = 5,
+  KVAF_BATCH_PUT_CQ_DIAG_SQ_BEFORE = 6,
+  KVAF_BATCH_PUT_CQ_DIAG_CQ_BEFORE = 7,
+  KVAF_BATCH_PUT_CQ_DIAG_SQ_AFTER = 8,
+  KVAF_BATCH_PUT_CQ_DIAG_CQ_AFTER = 9,
+  KVAF_BATCH_PUT_CQ_DIAG_ASSIGNED_ROWS = 10,
+  KVAF_BATCH_PUT_CQ_DIAG_FAST_BUDGET_EXCEEDED = 11,
+  KVAF_BATCH_PUT_CQ_DIAG_OBSERVED_OWNER = 12,
+  KVAF_BATCH_PUT_CQ_DIAG_SLOW_ELAPSED_TICKS = 13,
+  KVAF_BATCH_PUT_CQ_TIMEOUT_NONE = 0,
+  KVAF_BATCH_PUT_CQ_TIMEOUT_DEVICE_DEADLINE = 1,
+  KVAF_BATCH_PUT_CQ_TIMEOUT_POLL_FALLBACK = 2,
+};
+
 typedef struct KvafBatchPutCoreStatus {
   uint64_t magic;
   uint64_t processed_request_count;
@@ -56,6 +82,10 @@ static_assert(sizeof(KvafBatchPutCoreStatus) == KVAF_AIV_BATCH_PUT_STATUS_BYTES,
               "KvafBatchPutCoreStatus ABI changed");
 static_assert(sizeof(KvafExecuteBatchPutKernelArgs) == 56,
               "KvafExecuteBatchPutKernelArgs ABI changed");
+static_assert(KVAF_BATCH_PUT_CQ_DIAGNOSTIC_BASE_WORD +
+                  KVAF_AIV_BATCH_PUT_MAX_JETTYS_PER_CORE *
+                      KVAF_BATCH_PUT_CQ_DIAGNOSTIC_WORDS_PER_JETTY <= 38,
+              "BatchPut CQ diagnostics overflow reserved status storage");
 #endif
 
 #endif  // KVAF_AIV_BATCH_PUT_ABI_H_
