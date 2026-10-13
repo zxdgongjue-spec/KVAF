@@ -1,6 +1,227 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+find_package(Threads REQUIRED)
 
 add_subdirectory(aicpu_batch_get)
+
+add_executable(kvaf_aicpu_urma_wqe_test aicpu_urma_wqe_test.cc)
+target_compile_definitions(kvaf_aicpu_urma_wqe_test PRIVATE KVAF_AICPU_URMA_HOST_TEST=1)
+target_include_directories(kvaf_aicpu_urma_wqe_test PRIVATE
+  "${CMAKE_SOURCE_DIR}/access_operator/src"
+  "${CMAKE_SOURCE_DIR}/access_operator/include")
+add_test(NAME kvaf_aicpu_urma_wqe COMMAND kvaf_aicpu_urma_wqe_test)
+
+add_executable(kvaf_aicpu_sq_copy_benchmark_test aicpu_sq_copy_benchmark_test.cc
+  "${CMAKE_SOURCE_DIR}/access_operator/src/aicpu_urma/sq_copy_benchmark.cc")
+target_compile_definitions(kvaf_aicpu_sq_copy_benchmark_test PRIVATE KVAF_AICPU_URMA_HOST_TEST=1)
+target_include_directories(kvaf_aicpu_sq_copy_benchmark_test PRIVATE
+  "${CMAKE_SOURCE_DIR}/access_operator/src" "${CMAKE_SOURCE_DIR}/access_operator/include")
+target_link_libraries(kvaf_aicpu_sq_copy_benchmark_test PRIVATE Threads::Threads)
+add_test(NAME kvaf_aicpu_sq_copy_benchmark COMMAND kvaf_aicpu_sq_copy_benchmark_test)
+
+add_executable(kvaf_aiv_sq_copy_benchmark_test aiv_sq_copy_benchmark_test.cc
+  "${CMAKE_SOURCE_DIR}/access_operator/src/aicpu_urma/sq_copy_benchmark.cc")
+target_compile_definitions(kvaf_aiv_sq_copy_benchmark_test PRIVATE KVAF_AICPU_URMA_HOST_TEST=1)
+target_include_directories(kvaf_aiv_sq_copy_benchmark_test PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/aiv_sq_copy_stub"
+  "${CMAKE_SOURCE_DIR}/access_operator/src" "${CMAKE_SOURCE_DIR}/access_operator/include")
+target_link_libraries(kvaf_aiv_sq_copy_benchmark_test PRIVATE Threads::Threads)
+add_test(NAME kvaf_aiv_sq_copy_benchmark COMMAND kvaf_aiv_sq_copy_benchmark_test)
+
+add_executable(kvaf_cpu_gather_test cpu_gather_test.cc)
+target_include_directories(kvaf_cpu_gather_test PRIVATE "${CMAKE_SOURCE_DIR}/runtime/include")
+target_link_libraries(kvaf_cpu_gather_test PRIVATE kvaf_cpu_gather_plan)
+add_test(NAME kvaf_cpu_gather COMMAND kvaf_cpu_gather_test)
+
+add_executable(kvaf_aicpu_gather_read_layout_test aicpu_gather_read_layout_test.cc)
+target_include_directories(kvaf_aicpu_gather_read_layout_test PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/runtime/include"
+  "${CMAKE_SOURCE_DIR}/access_operator/include")
+add_test(NAME kvaf_aicpu_gather_read_layout COMMAND kvaf_aicpu_gather_read_layout_test)
+
+add_executable(kvaf_gather_host_plan_test gather_host_plan_test.cc)
+target_link_libraries(kvaf_gather_host_plan_test PRIVATE kvaf_gather_host_plan)
+add_test(NAME kvaf_gather_host_plan COMMAND kvaf_gather_host_plan_test)
+
+add_executable(kvaf_aicpu_gather_read_report_test aicpu_gather_read_report_test.cc)
+target_include_directories(kvaf_aicpu_gather_read_report_test PRIVATE
+  "${CMAKE_SOURCE_DIR}/access_operator/include")
+add_test(NAME kvaf_aicpu_gather_read_report COMMAND kvaf_aicpu_gather_read_report_test)
+
+add_executable(kvaf_aicpu_urma_kernel_test aicpu_urma_kernel_test.cc
+  "${CMAKE_SOURCE_DIR}/access_operator/src/aicpu_urma/kernel.cc")
+target_compile_definitions(kvaf_aicpu_urma_kernel_test PRIVATE KVAF_AICPU_URMA_HOST_TEST=1)
+target_include_directories(kvaf_aicpu_urma_kernel_test PRIVATE
+  "${CMAKE_SOURCE_DIR}/access_operator/src"
+  "${CMAKE_SOURCE_DIR}/access_operator/include"
+  "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include"
+  "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_put/include"
+  "${CMAKE_SOURCE_DIR}/runtime/include")
+add_test(NAME kvaf_aicpu_urma_kernel COMMAND kvaf_aicpu_urma_kernel_test)
+
+add_executable(kvaf_aicpu_gather_read_kernel_test aicpu_gather_read_kernel_test.cc
+  "${CMAKE_SOURCE_DIR}/access_operator/src/aicpu_urma/kernel.cc")
+target_compile_definitions(kvaf_aicpu_gather_read_kernel_test PRIVATE KVAF_AICPU_URMA_HOST_TEST=1)
+target_include_directories(kvaf_aicpu_gather_read_kernel_test PRIVATE
+  "${CMAKE_SOURCE_DIR}/access_operator/src"
+  "${CMAKE_SOURCE_DIR}/access_operator/include"
+  "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include"
+  "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_put/include"
+  "${CMAKE_SOURCE_DIR}/runtime/include")
+target_link_libraries(kvaf_aicpu_gather_read_kernel_test PRIVATE kvaf_cpu_gather_plan)
+add_test(NAME kvaf_aicpu_gather_read_kernel COMMAND kvaf_aicpu_gather_read_kernel_test)
+
+add_executable(kvaf_aicpu_urma_client_options_test aicpu_urma_client_options_test.cc)
+add_test(NAME kvaf_aicpu_urma_client_options COMMAND kvaf_aicpu_urma_client_options_test)
+
+add_executable(kvaf_aicpu_urma_client_metrics_test aicpu_urma_client_metrics_test.cc)
+add_test(NAME kvaf_aicpu_urma_client_metrics COMMAND kvaf_aicpu_urma_client_metrics_test)
+
+add_test(NAME kvaf_aicpu_urma_install
+  COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/aicpu_urma_install_test.sh")
+
+add_executable(kvaf_aicpu_sgl_simulator aicpu_sgl_simulator.cc)
+find_package(OpenMP COMPONENTS CXX QUIET)
+target_include_directories(kvaf_aicpu_sgl_simulator PRIVATE
+  "${CMAKE_SOURCE_DIR}/access_operator/include"
+  "${CMAKE_SOURCE_DIR}/runtime/include")
+target_link_libraries(kvaf_aicpu_sgl_simulator PRIVATE kvaf_common Threads::Threads)
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(kvaf_aicpu_sgl_simulator PRIVATE OpenMP::OpenMP_CXX)
+endif()
+target_compile_features(kvaf_aicpu_sgl_simulator PRIVATE cxx_std_17)
+
+add_test(NAME kvaf_aicpu_sgl_sim_single
+  COMMAND kvaf_aicpu_sgl_simulator --rows 7 --row-bytes 128
+          --sgl-size 1 --iterations 2 --wr-overhead-ns 100)
+set_tests_properties(kvaf_aicpu_sgl_sim_single PROPERTIES
+  PASS_REGULAR_EXPRESSION "AICPU_SGL_SIM_PASS.*wr_count_per_iteration=7")
+add_test(NAME kvaf_aicpu_sgl_sim_partial
+  COMMAND kvaf_aicpu_sgl_simulator --rows 7 --row-bytes 128
+          --sgl-size 3 --iterations 2 --wr-overhead-ns 100)
+set_tests_properties(kvaf_aicpu_sgl_sim_partial PROPERTIES
+  PASS_REGULAR_EXPRESSION "AICPU_SEND_MODEL.*send_ns=671.68")
+add_test(NAME kvaf_aicpu_sgl_sim_oversized
+  COMMAND kvaf_aicpu_sgl_simulator --rows 7 --row-bytes 128
+          --sgl-size 32 --iterations 1)
+set_tests_properties(kvaf_aicpu_sgl_sim_oversized PROPERTIES
+  PASS_REGULAR_EXPRESSION "AICPU_SGL_SIM_PASS.*wr_count_per_iteration=1")
+add_test(NAME kvaf_aicpu_sgl_sim_invalid
+  COMMAND kvaf_aicpu_sgl_simulator --sgl-size 0)
+set_tests_properties(kvaf_aicpu_sgl_sim_invalid PROPERTIES WILL_FAIL TRUE)
+add_test(NAME kvaf_aicpu_sgl_sim_parallel
+  COMMAND kvaf_aicpu_sgl_simulator --rows 257 --row-bytes 4096
+          --sgl-size 7 --iterations 3 --gather-threads 4 --gather-mode active)
+set_tests_properties(kvaf_aicpu_sgl_sim_parallel PROPERTIES
+  PASS_REGULAR_EXPRESSION "AICPU_SGL_SIM_PASS.*gather_threads_effective=4 gather_mode=active")
+add_test(NAME kvaf_aicpu_sgl_sim_passive
+  COMMAND kvaf_aicpu_sgl_simulator --rows 257 --row-bytes 4096
+          --sgl-size 7 --iterations 3 --gather-threads 4 --gather-mode passive)
+set_tests_properties(kvaf_aicpu_sgl_sim_passive PROPERTIES
+  PASS_REGULAR_EXPRESSION "AICPU_SGL_SIM_PASS.*gather_threads_effective=4 gather_mode=passive")
+if(OpenMP_CXX_FOUND)
+  add_test(NAME kvaf_aicpu_sgl_sim_omp
+    COMMAND kvaf_aicpu_sgl_simulator --rows 257 --row-bytes 4096
+            --sgl-size 7 --iterations 3 --gather-threads 4 --gather-mode omp)
+  set_tests_properties(kvaf_aicpu_sgl_sim_omp PROPERTIES
+    PASS_REGULAR_EXPRESSION "AICPU_SGL_SIM_PASS.*gather_threads_effective=4 gather_mode=omp")
+else()
+  add_test(NAME kvaf_aicpu_sgl_sim_omp_unavailable
+    COMMAND kvaf_aicpu_sgl_simulator --gather-mode omp)
+  set_tests_properties(kvaf_aicpu_sgl_sim_omp_unavailable PROPERTIES
+    WILL_FAIL TRUE)
+endif()
+add_test(NAME kvaf_aicpu_sgl_sim_small_fallback
+  COMMAND kvaf_aicpu_sgl_simulator --rows 7 --row-bytes 128
+          --sgl-size 3 --iterations 2 --gather-threads 8)
+set_tests_properties(kvaf_aicpu_sgl_sim_small_fallback PROPERTIES
+  PASS_REGULAR_EXPRESSION "AICPU_SGL_SIM_PASS.*gather_threads_effective=1")
+add_test(NAME kvaf_aicpu_sgl_sim_invalid_threads
+  COMMAND kvaf_aicpu_sgl_simulator --gather-threads 0)
+set_tests_properties(kvaf_aicpu_sgl_sim_invalid_threads PROPERTIES WILL_FAIL TRUE)
+add_test(NAME kvaf_aicpu_sgl_sim_invalid_mode
+  COMMAND kvaf_aicpu_sgl_simulator --gather-mode unknown)
+set_tests_properties(kvaf_aicpu_sgl_sim_invalid_mode PROPERTIES WILL_FAIL TRUE)
+add_test(NAME kvaf_aicpu_sgl_sim_ns_log
+  COMMAND kvaf_aicpu_sgl_simulator --rows 7 --row-bytes 128
+          --sgl-size 3 --iterations 2 --gather-threads 1 --log-iterations 1)
+set_tests_properties(kvaf_aicpu_sgl_sim_ns_log PROPERTIES
+  PASS_REGULAR_EXPRESSION "ITERATION_NS index=2 gather_ns=[0-9]+ plan_ns=[0-9]+")
+add_test(NAME kvaf_aicpu_sgl_sim_ns_summary
+  COMMAND kvaf_aicpu_sgl_simulator --rows 7 --row-bytes 128
+          --sgl-size 3 --iterations 2 --gather-threads 1)
+set_tests_properties(kvaf_aicpu_sgl_sim_ns_summary PROPERTIES
+  PASS_REGULAR_EXPRESSION "CPU_PREP_PER_ITERATION gather_avg_ns=[0-9]+\\.[0-9]+ gather_min_ns=[0-9]+ gather_max_ns=[0-9]+")
+add_test(NAME kvaf_aicpu_sgl_sim_invalid_ns_log
+  COMMAND kvaf_aicpu_sgl_simulator --log-iterations 2)
+set_tests_properties(kvaf_aicpu_sgl_sim_invalid_ns_log PROPERTIES WILL_FAIL TRUE)
+add_test(NAME kvaf_aicpu_sgl_sim_sparse_source
+  COMMAND kvaf_aicpu_sgl_simulator --rows 257 --row-bytes 4096
+          --source-space-gib 4 --source-variants 3 --sgl-size 7
+          --iterations 4 --gather-threads 4 --gather-mode active)
+set_tests_properties(kvaf_aicpu_sgl_sim_sparse_source PROPERTIES
+  PASS_REGULAR_EXPRESSION "SOURCE_LAYOUT mode=sparse virtual_bytes=4294967296.*variants=3")
+add_test(NAME kvaf_aicpu_sgl_sim_invalid_source_variants
+  COMMAND kvaf_aicpu_sgl_simulator --rows 1024 --row-bytes 4096
+          --source-space-gib 4 --source-variants 1025)
+set_tests_properties(kvaf_aicpu_sgl_sim_invalid_source_variants PROPERTIES
+  WILL_FAIL TRUE)
+add_test(NAME kvaf_aicpu_sgl_sim_many_source_variants
+  COMMAND kvaf_aicpu_sgl_simulator --rows 7 --row-bytes 128
+          --source-space-gib 4 --source-variants 1000 --sgl-size 3
+          --iterations 3 --gather-threads 1)
+set_tests_properties(kvaf_aicpu_sgl_sim_many_source_variants PROPERTIES
+  PASS_REGULAR_EXPRESSION "SOURCE_LAYOUT mode=sparse virtual_bytes=4294967296.*variants=1000")
+
+add_executable(kvaf_aiv_batch_roundtrip_options_test aiv_batch_roundtrip_options_test.cc)
+add_test(NAME kvaf_aiv_batch_roundtrip_options COMMAND kvaf_aiv_batch_roundtrip_options_test)
+
+if(KVAF_ENABLE_AIV_BATCH_PUT)
+  add_executable(kvaf_aiv_batch_roundtrip aiv_batch_roundtrip.cc)
+  target_compile_definitions(kvaf_aiv_batch_roundtrip PRIVATE
+    "KVAF_AIV_NATIVE_CANN_ROOT=\"${ASCEND_CANN_PACKAGE_PATH}\""
+    "KVAF_AIV_NATIVE_BUILD_DIR=\"${CMAKE_BINARY_DIR}\"")
+  target_include_directories(kvaf_aiv_batch_roundtrip PRIVATE
+    "${CMAKE_SOURCE_DIR}/runtime/src"
+    "${ASCEND_CANN_PACKAGE_PATH}/include")
+  target_link_directories(kvaf_aiv_batch_roundtrip PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/lib64")
+  target_link_libraries(kvaf_aiv_batch_roundtrip PRIVATE
+    kvaf_peer_link kvaf_direct_hccp_session
+    kvaf_execute_batch_put_host kvaf_execute_batch_get_host ascendcl ${CMAKE_DL_LIBS})
+  target_compile_features(kvaf_aiv_batch_roundtrip PRIVATE cxx_std_17)
+  set_property(TARGET kvaf_aiv_batch_roundtrip APPEND PROPERTY BUILD_RPATH
+    "${ASCEND_CANN_PACKAGE_PATH}/lib64")
+endif()
+
+if(KVAF_ENABLE_AICPU_URMA)
+  add_executable(kvaf_aicpu_sq_copy_benchmark aicpu_sq_copy_benchmark.cc)
+  target_compile_definitions(kvaf_aicpu_sq_copy_benchmark PRIVATE
+    "KVAF_AICPU_URMA_CANN_ROOT=\"${ASCEND_CANN_PACKAGE_PATH}\"")
+  target_include_directories(kvaf_aicpu_sq_copy_benchmark PRIVATE
+    "${CMAKE_SOURCE_DIR}/access_operator/src" "${ASCEND_CANN_PACKAGE_PATH}/include")
+  target_link_directories(kvaf_aicpu_sq_copy_benchmark PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/lib64")
+  target_link_libraries(kvaf_aicpu_sq_copy_benchmark PRIVATE
+    kvaf_aicpu_urma_host kvaf_aiv_sq_copy_host kvaf_direct_hccp_session ascendcl)
+  set_property(TARGET kvaf_aicpu_sq_copy_benchmark APPEND PROPERTY BUILD_RPATH
+    "${ASCEND_CANN_PACKAGE_PATH}/lib64")
+  add_executable(kvaf_aicpu_gather_read_client aicpu_gather_read_client.cc)
+  target_compile_definitions(kvaf_aicpu_gather_read_client PRIVATE
+    "KVAF_AICPU_URMA_CANN_ROOT=\"${ASCEND_CANN_PACKAGE_PATH}\"")
+  target_include_directories(kvaf_aicpu_gather_read_client PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/include")
+  target_link_directories(kvaf_aicpu_gather_read_client PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/lib64")
+  target_link_libraries(kvaf_aicpu_gather_read_client PRIVATE kvaf_npu_runtime ascendcl)
+  target_compile_features(kvaf_aicpu_gather_read_client PRIVATE cxx_std_17)
+  set_property(TARGET kvaf_aicpu_gather_read_client APPEND PROPERTY BUILD_RPATH
+    "${ASCEND_CANN_PACKAGE_PATH}/lib64")
+  add_executable(kvaf_aicpu_urma_client aicpu_urma_client.cc)
+  target_compile_definitions(kvaf_aicpu_urma_client PRIVATE
+    "KVAF_AICPU_URMA_CANN_ROOT=\"${ASCEND_CANN_PACKAGE_PATH}\"")
+  target_include_directories(kvaf_aicpu_urma_client PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/include")
+  target_link_directories(kvaf_aicpu_urma_client PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/lib64")
+  target_link_libraries(kvaf_aicpu_urma_client PRIVATE kvaf_npu_runtime ascendcl)
+  target_compile_features(kvaf_aicpu_urma_client PRIVATE cxx_std_17)
+  set_property(TARGET kvaf_aicpu_urma_client APPEND PROPERTY BUILD_RPATH
+    "${ASCEND_CANN_PACKAGE_PATH}/lib64")
+endif()
 
 add_executable(kvaf_cpu_urma_link_selection_test cpu_urma_link_selection_test.cc)
 target_include_directories(kvaf_cpu_urma_link_selection_test PRIVATE
@@ -67,6 +288,14 @@ add_executable(kvaf_peer_hbm_eid_test peer_hbm_eid_test.cc)
 target_include_directories(kvaf_peer_hbm_eid_test PRIVATE "${CMAKE_SOURCE_DIR}/runtime/src")
 target_link_libraries(kvaf_peer_hbm_eid_test PRIVATE kvaf_peer_link)
 add_test(NAME kvaf_peer_hbm_eid COMMAND kvaf_peer_hbm_eid_test)
+
+add_executable(kvaf_peer_memory_allocator_test peer_memory_allocator_test.cc
+  "${CMAKE_SOURCE_DIR}/access_operator/src/direct_hccp/direct_hccp_remote_transport.cc")
+target_include_directories(kvaf_peer_memory_allocator_test PRIVATE
+  "${CMAKE_SOURCE_DIR}/runtime/src" "${CMAKE_CURRENT_SOURCE_DIR}/direct_hccp_test_stubs")
+target_link_libraries(kvaf_peer_memory_allocator_test PRIVATE
+  kvaf_runtime kvaf_peer_link Threads::Threads ${CMAKE_DL_LIBS})
+add_test(NAME kvaf_peer_memory_allocator COMMAND kvaf_peer_memory_allocator_test)
 
 add_executable(kvaf_cpu_urma_eid_perf_metrics_test cpu_urma_eid_perf_metrics_test.cc)
 target_compile_features(kvaf_cpu_urma_eid_perf_metrics_test PRIVATE cxx_std_17)

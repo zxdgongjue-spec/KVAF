@@ -10,10 +10,16 @@ namespace kvaf { class RuntimeCore; }
 
 namespace kvaf {
 
+enum class CpuGatherMode { kAdaptive, kActive, kPassive };
+
 struct CpuRuntimeOptions {
   std::string ub_device;
   bool has_eid_index{false};
   std::uint32_t eid_index{0};
+  std::uint32_t gather_threads{0U};
+  bool gather_affinity{true};
+  bool gather_notify_profile{false};
+  CpuGatherMode gather_mode{CpuGatherMode::kAdaptive};
 };
 
 struct CpuRuntimeClientOptions {

@@ -35,7 +35,8 @@ output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数�
 
 `NpuRuntime(batch_get_kernel_object_path, batch_get_token_bytes,
 batch_get_tokens_per_block, device_id=0, npu_core_count=1,
-batch_put_kernel_object_path="", jettys_per_core=2)` 要求显式传入单 token KV
+batch_put_kernel_object_path="", jettys_per_core=2,
+aicpu_urma_kernel_json_path="")` 要求显式传入单 token KV
 字节数和每个 KV block 中的 token 数，两个参数均无默认值；
 每个 AccessTable entry 大小为两者乘积。
 `jettys_per_core` 参数同时
@@ -45,6 +46,10 @@ EID、UMDK device 与候选 RMA 验证由 C++ Runtime 自动完成，Python 不�
 `batch_put(keys, packed_input, input_offsets, lengths, stream=None)` 接收 caller-owned
 NPU packed input 和每条 block 的 CPU 整数 metadata；同步写入完成后才返回。未传
 BatchPut kernel 时，该方法保留 ACL D2H mock，便于只验证 BatchGet 的构建。
+可选 AICPU URMA 后端需在构建时启用 `KVAF_ENABLE_AICPU_URMA`，传入安装后的
+`aicpu_urma_kernel_json_path` 并设置 `npu_core_count=1, jettys_per_core=1`；
+它复用 KVAF 的 Link/Direct-HCCP Host 建链，不要求 AIV kernel 路径。
+部署步骤见 `access_operator/src/aicpu_urma/README.md`。
 
 `AclGraph` 与 `NpuRuntime.batch_get` 可接收调用方持有的 `torch.npu.Stream`；后者省略
 stream 时使用 `torch.npu.current_stream()`。KVAF 不创建、不保存或销毁调用方的 stream；

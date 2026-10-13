@@ -590,7 +590,7 @@ struct CpuUrmaTransport::Impl {
       query.flag = 1;
       query.trans_mode = static_cast<std::uint32_t>(URMA_TM_RM);
       std::memcpy(query.local_eid, context_->eid.raw, 16);
-      std::memcpy(query.peer_eid, region.eid.data(), 16);
+      std::memcpy(query.peer_eid, region.RoutingEid().data(), 16);
       TpInfo info{};
       std::uint32_t tp_count = 1;
       if (get_tp_list_(context_, &query, &tp_count, &info) != 0 ||

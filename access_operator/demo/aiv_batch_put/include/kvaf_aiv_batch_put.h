@@ -46,6 +46,11 @@ int32_t KvafExecuteBatchPutSync(KvafBatchPutTransport *transport,
                                KvafBatchPutCoreStatus *core_status,
                                uint32_t core_status_count);
 
+int32_t KvafExecuteBatchPutAicpuSync(KvafBatchPutTransport *transport,
+                                    const KvafExecuteBatchPutKernelArgs *arguments,
+                                    aclrtStream stream, KvafBatchPutCoreStatus *core_status,
+                                    uint32_t core_status_count, uint32_t source_count);
+
 #ifdef __cplusplus
 }
 #endif

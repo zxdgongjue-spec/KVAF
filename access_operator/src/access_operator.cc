@@ -1,6 +1,8 @@
 #include "access_operator.h"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -14,6 +16,10 @@
 #include "batch_get_abi.h"
 #include "kvaf_aiv_batch_get.h"
 #include "meta_manager.h"
+#if defined(KVAF_ENABLE_AICPU_URMA)
+#include "cpu_gather.h"
+#include "host.h"
+#endif
 
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
 #include "batch_put_abi.h"
@@ -147,21 +153,56 @@ Status EnsureBatchPutMetadataCapacity(std::size_t sources, std::size_t rows,
 
 void LogBatchPutDeviceStatus(const BatchPutExecutionState& execution,
                              std::uint32_t npu_core_count,
-                             int32_t result) {
+                             int32_t result, bool aicpu) {
   std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_EXECUTION_ERROR result=%d\n",
                static_cast<int>(result));
+  if (aicpu && result == KVAF_BATCH_PUT_RUNTIME_ERROR) {
+    std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_DEVICE_STATUS_UNAVAILABLE reason=runtime_error\n");
+    return;
+  }
   for (std::uint32_t core = 0; core < npu_core_count; ++core) {
     const KvafBatchPutCoreStatus& status = execution.host_core_status[core];
-    std::fprintf(stderr,
-                 "[KVAF_AIV] BATCH_PUT_DEVICE_ERROR core=%u magic=0x%llx "
-                 "result=%llu processed=%llu failed_request=%llu cq_status=%llu "
-                 "cq_sub_status=%llu\n",
-                 core, static_cast<unsigned long long>(status.magic),
-                 static_cast<unsigned long long>(status.result),
-                 static_cast<unsigned long long>(status.processed_request_count),
-                 static_cast<unsigned long long>(status.failed_request_index),
-                 static_cast<unsigned long long>(status.cq_status),
-                 static_cast<unsigned long long>(status.cq_sub_status));
+    if (aicpu) {
+      std::fprintf(stderr,
+                   "[KVAF_AIV] BATCH_PUT_DEVICE_ERROR core=%u magic=0x%llx "
+                   "result=%llu processed=%llu failed_request=%llu cq_status=%llu "
+                   "cq_sub_status=%llu cqe_word=0x%llx sq_pi=%llu cq_ci=%llu last_wqe=0x%llx\n",
+                   core, static_cast<unsigned long long>(status.magic),
+                   static_cast<unsigned long long>(status.result),
+                   static_cast<unsigned long long>(status.processed_request_count),
+                   static_cast<unsigned long long>(status.failed_request_index),
+                   static_cast<unsigned long long>(status.cq_status),
+                   static_cast<unsigned long long>(status.cq_sub_status),
+                   static_cast<unsigned long long>(status.reserved[0]),
+                   static_cast<unsigned long long>(status.sq_producer_index),
+                   static_cast<unsigned long long>(status.cq_consumer_index),
+                   static_cast<unsigned long long>(status.last_wqe_protocol));
+      if (status.reserved[KVAF_PUT_DIAG_MAGIC] == KVAF_AICPU_BATCH_PUT_DIAGNOSTIC_MAGIC) {
+        std::fprintf(stderr, "[KVAF_AICPU_URMA] PUT_ERROR_SNAPSHOT core=%u batch_wqes=%llu\n",
+                     core, static_cast<unsigned long long>(status.reserved[KVAF_PUT_DIAG_BATCH_COUNT]));
+        for (const auto& item : {std::pair<const char*, int>{"FIRST_WQE", KVAF_PUT_DIAG_FIRST_WQE},
+                                 {"LAST_WQE", KVAF_PUT_DIAG_LAST_WQE},
+                                 {"CQE", KVAF_PUT_DIAG_CQE}}) {
+          std::uint32_t words[16]{};
+          const std::size_t count = item.second == KVAF_PUT_DIAG_CQE ? 8U : 16U;
+          std::memcpy(words, &status.reserved[item.second], count * sizeof(words[0]));
+          std::fprintf(stderr, "[KVAF_AICPU_URMA] PUT_ERROR_%s core=%u words=", item.first, core);
+          for (std::size_t i = 0; i < count; ++i) std::fprintf(stderr, "%s%08x", i == 0 ? "" : ",", words[i]);
+          std::fprintf(stderr, "\n");
+        }
+      }
+    } else {
+      std::fprintf(stderr,
+                   "[KVAF_AIV] BATCH_PUT_DEVICE_ERROR core=%u magic=0x%llx "
+                   "result=%llu processed=%llu failed_request=%llu cq_status=%llu "
+                   "cq_sub_status=%llu\n",
+                   core, static_cast<unsigned long long>(status.magic),
+                   static_cast<unsigned long long>(status.result),
+                   static_cast<unsigned long long>(status.processed_request_count),
+                   static_cast<unsigned long long>(status.failed_request_index),
+                   static_cast<unsigned long long>(status.cq_status),
+                   static_cast<unsigned long long>(status.cq_sub_status));
+    }
   }
 }
 #endif
@@ -253,7 +294,7 @@ void LogBatchGetDeviceStatus(const BatchGetExecutionState& execution,
   std::vector<KvafBatchGetCoreStatus> statuses(npu_core_count);
   const aclError copy_result = aclrtMemcpy(
       statuses.data(), statuses.size() * sizeof(statuses.front()),
-      execution.status, execution.status_bytes, ACL_MEMCPY_DEVICE_TO_HOST);
+      execution.status, statuses.size() * sizeof(statuses.front()), ACL_MEMCPY_DEVICE_TO_HOST);
   if (copy_result != ACL_SUCCESS) {
     std::fprintf(stderr,
                  "[KVAF_AIV] BATCH_GET_STATUS_LOG_ERROR aclrtMemcpy=%d\n",
@@ -286,6 +327,11 @@ struct DefaultAccessOperator::Impl {
   RemoteRegionDesc remote_region;
   KvafBatchGetTransport* transport{nullptr};
   BatchGetExecutionState execution;
+#if defined(KVAF_ENABLE_AICPU_URMA)
+  void* gather_output_spans{nullptr};
+  std::size_t gather_output_spans_capacity{0U};
+  std::vector<std::uint8_t> gather_metadata;
+#endif
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   KvafBatchPutTransport* batch_put_transport{nullptr};
   BatchPutExecutionState batch_put_execution;
@@ -303,7 +349,8 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     return InvalidState("AccessOperator has already been initialized");
   }
   if (remote_region.base == 0 || remote_region.length == 0 ||
-      impl_->config.batch_get_kernel_object_path.empty() ||
+      (impl_->config.batch_get_kernel_object_path.empty() &&
+       impl_->config.aicpu_urma_kernel_json_path.empty()) ||
       impl_->config.npu_core_count == 0 ||
       impl_->config.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->config.jettys_per_core == 0 ||
@@ -313,6 +360,17 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
   if (impl_->config.peer_link == nullptr) {
     return InvalidState("AccessOperator requires an established Runtime Link");
   }
+#if defined(KVAF_ENABLE_AICPU_URMA)
+  if (!impl_->config.aicpu_urma_kernel_json_path.empty() &&
+      (impl_->config.npu_core_count > 8U || impl_->config.jettys_per_core != 1U ||
+       !aicpu_urma::Load(impl_->config.aicpu_urma_kernel_json_path.c_str()))) {
+    return Internal("AICPU URMA requires 1..8 workers, one Jetty per worker, and a loadable kernel JSON");
+  }
+#else
+  if (!impl_->config.aicpu_urma_kernel_json_path.empty()) {
+    return InvalidArgument("AICPU URMA was not enabled at build time");
+  }
+#endif
   if (std::all_of(impl_->config.peer_local_eid.begin(),
                   impl_->config.peer_local_eid.end(),
                   [](std::uint8_t value) { return value == 0U; })) {
@@ -326,9 +384,10 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     return InvalidArgument("invalid BatchPut transport configuration");
   }
 #endif
-  if (KvafExecuteBatchGetLoadKernel(
+  if (impl_->config.aicpu_urma_kernel_json_path.empty() &&
+      KvafExecuteBatchGetLoadKernel(
           impl_->config.batch_get_kernel_object_path.c_str()) !=
-      KVAF_BATCH_GET_SUCCESS) {
+          KVAF_BATCH_GET_SUCCESS) {
     return Internal("failed to load BatchGet kernel");
   }
 
@@ -365,11 +424,13 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
   impl_->transport = transport;
   impl_->execution = execution;
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
-  if (!impl_->config.batch_put_kernel_object_path.empty()) {
+  if (!impl_->config.batch_put_kernel_object_path.empty() ||
+      !impl_->config.aicpu_urma_kernel_json_path.empty()) {
     if (impl_->config.npu_core_count > KVAF_AIV_BATCH_PUT_MAX_AIV_CORES ||
-        KvafExecuteBatchPutLoadKernel(
+        (impl_->config.aicpu_urma_kernel_json_path.empty() &&
+         KvafExecuteBatchPutLoadKernel(
             impl_->config.batch_put_kernel_object_path.c_str()) !=
-            KVAF_BATCH_PUT_SUCCESS) {
+            KVAF_BATCH_PUT_SUCCESS)) {
       (void)aclrtFree(impl_->execution.queue_state);
       (void)aclrtFree(impl_->execution.status);
       KvafBatchGetTransportDestroy(impl_->transport);
@@ -379,9 +440,11 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     }
 
     KvafBatchPutTransport* batch_put_transport = nullptr;
+    const std::uint32_t put_cores = impl_->config.aicpu_urma_kernel_json_path.empty()
+        ? impl_->config.npu_core_count : 1U;
     const int32_t batch_put_result = KvafBatchPutTransportCreateWithPeerLink(
         reinterpret_cast<void*>(remote_region.base), remote_region.length,
-        impl_->config.npu_core_count, impl_->config.jettys_per_core,
+        put_cores, impl_->config.jettys_per_core,
         impl_->config.peer_link.get(), impl_->config.peer_local_eid.data(),
         &batch_put_transport);
     if (batch_put_result != KVAF_BATCH_PUT_SUCCESS ||
@@ -395,7 +458,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     }
     BatchPutExecutionState batch_put_execution;
     Status batch_put_status = InitializeBatchPutExecutionState(
-        impl_->config.npu_core_count, &batch_put_execution);
+        put_cores, &batch_put_execution);
     if (!batch_put_status.ok()) {
       KvafBatchPutTransportDestroy(batch_put_transport);
       (void)aclrtFree(impl_->execution.queue_state);
@@ -433,6 +496,13 @@ Status DefaultAccessOperator::Shutdown() {
   }
   impl_->batch_put_transport = nullptr;
 #endif
+#if defined(KVAF_ENABLE_AICPU_URMA)
+  if (impl_->gather_output_spans != nullptr) {
+    (void)aclrtFree(impl_->gather_output_spans);
+    impl_->gather_output_spans = nullptr;
+    impl_->gather_output_spans_capacity = 0U;
+  }
+#endif
   if (impl_->transport != nullptr) {
     KvafBatchGetTransportDestroy(impl_->transport);
   }
@@ -458,8 +528,10 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
     return InvalidArgument("NPU BatchGet requires a caller-owned ACL stream");
   }
   KvafExecuteBatchGetKernelArgs arguments{};
+  const std::uint32_t get_cores = impl_->config.aicpu_urma_kernel_json_path.empty()
+      ? impl_->config.npu_core_count : 1U;
   Status status = BuildBatchGetKernelArgs(
-      exec, impl_->config.npu_core_count, impl_->config.jettys_per_core,
+      exec, get_cores, impl_->config.jettys_per_core,
       impl_->execution, &arguments);
   if (!status.ok()) {
     return status;
@@ -477,7 +549,16 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   arguments.channel_entity = channel_entity;
 
   const aclrtStream stream = static_cast<aclrtStream>(exec.execution.stream);
-  const int32_t launch_result = KvafExecuteBatchGetLaunch(&arguments, stream);
+  int32_t launch_result = KVAF_BATCH_GET_RUNTIME_ERROR;
+#if defined(KVAF_ENABLE_AICPU_URMA)
+  if (!impl_->config.aicpu_urma_kernel_json_path.empty()) {
+    launch_result = aicpu_urma::LaunchGet(&arguments, stream) == 0
+                        ? KVAF_BATCH_GET_SUCCESS : KVAF_BATCH_GET_RUNTIME_ERROR;
+  } else
+#endif
+  {
+    launch_result = KvafExecuteBatchGetLaunch(&arguments, stream);
+  }
   if (launch_result != KVAF_BATCH_GET_SUCCESS) {
     KvafBatchGetLocalBufferRelease(local_buffer);
     return Internal("failed to launch BatchGet");
@@ -488,7 +569,17 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
     if (sync_result != ACL_SUCCESS) {
       return Internal("BatchGet stream synchronization failed");
     }
-    LogBatchGetDeviceStatus(impl_->execution, impl_->config.npu_core_count);
+    LogBatchGetDeviceStatus(impl_->execution, get_cores);
+#if defined(KVAF_ENABLE_AICPU_URMA)
+    if (!impl_->config.aicpu_urma_kernel_json_path.empty()) {
+      KvafBatchGetCoreStatus device_status{};
+      if (aclrtMemcpy(&device_status, sizeof(device_status), impl_->execution.status,
+                      sizeof(device_status), ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS ||
+          device_status.magic != KVAF_AIV_BATCH_GET_STATUS_MAGIC || device_status.result != 0U) {
+        return Internal("AICPU URMA BatchGet device completion failed");
+      }
+    }
+#endif
   } else {
     // The demo transport caches zero-reference registrations until shutdown.
     // Releasing after an externally captured launch keeps KVAF graph-agnostic;
@@ -496,6 +587,308 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
     KvafBatchGetLocalBufferRelease(local_buffer);
   }
   return Status::OK();
+}
+
+Status DefaultAccessOperator::ExecuteCpuGatherRead(const CpuGatherReadExecRequest& request) {
+#if defined(KVAF_ENABLE_AICPU_URMA)
+  const auto elapsed_ns = [](std::chrono::steady_clock::time_point start) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count());
+  };
+  if (!impl_->initialized || impl_->transport == nullptr ||
+      impl_->config.aicpu_urma_kernel_json_path.empty())
+    return InvalidState("AICPU URMA GatherRead transport is unavailable");
+  if (request.pipeline_chunk_bytes != 0U &&
+      (request.remote_descriptor == 0U || request.read_task_spans == 0U ||
+       request.pipeline_chunk_bytes < 64U || request.pipeline_chunk_bytes % 64U != 0U))
+    return InvalidArgument("GatherRead pipeline requires URMA descriptors, dynamic READ, and aligned chunks");
+  if (request.output.device != DeviceKind::kNpu || !request.output.valid() ||
+      request.stream == nullptr || request.bytes == 0U ||
+      request.output_spans == nullptr || request.output_span_count == 0U ||
+      request.output_span_count > aicpu_urma::kGatherMaxSpans ||
+      request.read_task_spans > aicpu_urma::kGatherMaxSpans ||
+      !ValidGatherSqCopyMode(request.sq_copy_mode) ||
+      (request.sq_batch_wqes != 8U && request.sq_batch_wqes != 16U &&
+       request.sq_batch_wqes != 32U && request.sq_batch_wqes != 64U) ||
+      request.sgl_size == 0U ||
+      request.output_extent > UINT64_MAX - 63U)
+    return InvalidArgument("GatherRead output requires a valid SGL, SQ batch size, and HBM scratch");
+  const std::uint64_t scratch_offset =
+      (request.output_extent + 63U) & ~std::uint64_t{63U};
+  const auto scratch_bytes = aicpu_urma::GatherScratchBytes(request.pipeline_chunk_bytes);
+  if (scratch_offset > request.output.bytes ||
+      request.output.bytes - scratch_offset < scratch_bytes)
+    return InvalidArgument("GatherRead output has insufficient HBM scratch");
+  const bool direct = request.remote_descriptor != 0U;
+  const auto source_bytes = peer::GatherDescriptorBytes(request.source_span_count);
+  const std::uint64_t source_offset =
+      scratch_offset + scratch_bytes;
+  if (direct && (request.source_spans == nullptr || request.source_span_count == 0U ||
+                 request.source_span_count > aicpu_urma::kGatherMaxSpans ||
+                 request.sequence == 0U ||
+                 source_offset > request.output.bytes ||
+                 source_bytes > request.output.bytes - source_offset))
+    return InvalidArgument("GatherRead direct mode requires HBM descriptor storage");
+  const auto descriptor_start = std::chrono::steady_clock::now();
+  const std::size_t descriptor_bytes =
+      static_cast<std::size_t>(request.output_span_count) * sizeof(GatherOutputSpan);
+  const auto storage_bytes = aicpu_urma::GatherOutputStorageBytes(
+      request.output_span_count, request.read_task_spans);
+  const auto packed_output_bytes = aicpu_urma::GatherReadPackedOutputBytes(
+      request.output_extent, source_bytes, request.output_span_count, request.read_task_spans,
+      request.pipeline_chunk_bytes);
+  const bool packed = direct && packed_output_bytes != 0U &&
+      packed_output_bytes <= request.output.bytes &&
+      reinterpret_cast<std::uintptr_t>(request.output.data) %
+          alignof(aicpu_urma::GatherTaskState) == 0U;
+  const auto target_offset = aicpu_urma::GatherPackedTargetOffset(source_bytes);
+  auto* source_destination = static_cast<std::uint8_t*>(request.output.data) + source_offset;
+  if (!packed && storage_bytes > impl_->gather_output_spans_capacity) {
+    void* descriptors = nullptr;
+    if (aclrtMalloc(&descriptors, storage_bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS)
+      return Internal("failed to allocate GatherRead HBM SGL descriptors");
+    if (impl_->gather_output_spans != nullptr) (void)aclrtFree(impl_->gather_output_spans);
+    impl_->gather_output_spans = descriptors;
+    impl_->gather_output_spans_capacity = storage_bytes;
+  }
+  if (!packed && aclrtMemcpy(impl_->gather_output_spans, impl_->gather_output_spans_capacity,
+                  request.output_spans, descriptor_bytes,
+                  ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS)
+    return Internal("failed to upload GatherRead HBM SGL descriptors");
+  if (!packed && request.timing != nullptr)
+    request.timing->descriptor_upload_ns = elapsed_ns(descriptor_start);
+  void* const target_destination =
+      packed ? source_destination + target_offset : impl_->gather_output_spans;
+  if (direct) {
+    const auto source_start = std::chrono::steady_clock::now();
+    const auto upload_bytes = packed ? target_offset + descriptor_bytes : source_bytes;
+    impl_->gather_metadata.resize(upload_bytes);
+    const peer::GatherDescriptorHeader header{
+        peer::kGatherDescriptorMagic, request.sequence, request.remote_staging,
+        request.source_span_count, request.bytes, request.pipeline_chunk_bytes};
+    std::memcpy(impl_->gather_metadata.data(), &header, sizeof(header));
+    std::memcpy(impl_->gather_metadata.data() + sizeof(header),
+                request.source_spans,
+                request.source_span_count * sizeof(peer::GatherSpan));
+    if (packed)
+      std::memcpy(impl_->gather_metadata.data() + target_offset,
+                  request.output_spans, descriptor_bytes);
+    if (aclrtMemcpy(source_destination, upload_bytes, impl_->gather_metadata.data(),
+                    upload_bytes, ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS)
+      return Internal("failed to upload GatherRead source descriptors");
+    if (request.timing != nullptr) {
+      if (packed) request.timing->metadata_upload_ns = elapsed_ns(descriptor_start);
+      else request.timing->source_upload_ns = elapsed_ns(source_start);
+    }
+  }
+  KvafBatchGetLocalBuffer* local_buffer = nullptr;
+  std::uint64_t channel_entity = 0U;
+  const auto register_start = std::chrono::steady_clock::now();
+  if (KvafBatchGetLocalBufferAcquire(impl_->transport, request.output.data,
+                                     request.output.bytes, &local_buffer,
+                                     &channel_entity) != KVAF_BATCH_GET_SUCCESS ||
+      local_buffer == nullptr || channel_entity == 0U)
+    return Internal("failed to register GatherRead HBM output");
+  if (request.timing != nullptr) request.timing->register_ns = elapsed_ns(register_start);
+  aicpu_urma::GatherReadArgs arguments{};
+  arguments.channel_entity = channel_entity;
+  arguments.queue_state = reinterpret_cast<std::uint64_t>(impl_->execution.queue_state);
+  arguments.core_status = reinterpret_cast<std::uint64_t>(impl_->execution.status);
+  arguments.output = reinterpret_cast<std::uint64_t>(request.output.data);
+  arguments.output_spans = reinterpret_cast<std::uint64_t>(target_destination);
+  arguments.source_descriptor = direct
+      ? reinterpret_cast<std::uint64_t>(request.output.data) + source_offset : 0U;
+  arguments.remote_descriptor = request.remote_descriptor;
+  arguments.source_span_count = direct ? request.source_span_count : 0U;
+  arguments.output_span_count = request.output_span_count;
+  arguments.sgl_size = request.sgl_size;
+  arguments.output_extent = request.output_extent;
+  arguments.remote_staging = request.remote_staging;
+  arguments.remote_command = request.remote_command;
+  arguments.remote_notify = request.remote_notify;
+  arguments.remote_ack = request.remote_ack;
+  arguments.sequence = request.sequence;
+  arguments.bytes = request.bytes;
+  arguments.worker_count = impl_->config.npu_core_count;
+  arguments.profile_detail = request.profile_detail ? 1U : 0U;
+  arguments.sq_batch_wqes = request.sq_batch_wqes;
+  arguments.read_task_spans = request.read_task_spans;
+  arguments.sq_copy_mode = request.sq_copy_mode;
+  arguments.pipeline_chunk_bytes = request.pipeline_chunk_bytes;
+  const aclrtStream stream = static_cast<aclrtStream>(request.stream);
+  const auto launch_start = std::chrono::steady_clock::now();
+  const int32_t launch = aicpu_urma::LaunchGatherRead(&arguments, stream);
+  if (request.timing != nullptr) request.timing->launch_ns = elapsed_ns(launch_start);
+  if (launch != 0) {
+    (void)aclrtSynchronizeStream(stream);
+    KvafBatchGetLocalBufferRelease(local_buffer);
+    return Internal("AICPU URMA GatherRead launch failed");
+  }
+  aclError sync = ACL_SUCCESS;
+  const auto sync_start = std::chrono::steady_clock::now();
+  sync = aclrtSynchronizeStream(stream);
+  if (request.timing != nullptr) request.timing->sync_ns = elapsed_ns(sync_start);
+  const auto release_start = std::chrono::steady_clock::now();
+  KvafBatchGetLocalBufferRelease(local_buffer);
+  if (request.timing != nullptr) request.timing->release_ns = elapsed_ns(release_start);
+  aicpu_urma::GatherReadStatus device_status{};
+  std::array<std::uint8_t, 8U * KVAF_AIV_BATCH_GET_STATUS_BYTES> status_storage{};
+  const auto status_bytes = impl_->execution.status_bytes;
+  const auto copy_start = std::chrono::steady_clock::now();
+  const aclError copy = aclrtMemcpy(status_storage.data(), status_storage.size(),
+                                   impl_->execution.status, status_bytes,
+                                   ACL_MEMCPY_DEVICE_TO_HOST);
+  if (copy == ACL_SUCCESS)
+    std::memcpy(&device_status, status_storage.data(), sizeof(device_status));
+  if (request.timing != nullptr) request.timing->status_copy_ns = elapsed_ns(copy_start);
+  if (request.timing != nullptr && copy == ACL_SUCCESS &&
+      device_status.magic == aicpu_urma::kGatherStatusMagic &&
+      device_status.sequence == request.sequence) {
+    request.timing->notify_ns = device_status.notify_ns;
+    request.timing->source_write_ns = device_status.source_write_ns;
+    request.timing->source_write_post_ns = device_status.source_write_post_ns;
+    request.timing->source_write_cq_ns = device_status.source_write_cq_ns;
+    request.timing->notify_post_ns = device_status.notify_post_ns;
+    request.timing->notify_cq_ns = device_status.notify_cq_ns;
+    request.timing->ack_poll_ns = device_status.ack_poll_ns;
+    request.timing->ack_started_ns = device_status.ack_started_ns;
+    request.timing->ack_post_ns = device_status.ack_post_ns;
+    request.timing->ack_cq_ns = device_status.ack_cq_ns;
+    request.timing->ack_cache_ns = device_status.ack_cache_ns;
+    request.timing->output_layout_ns = device_status.output_layout_ns;
+    request.timing->profile_detail = device_status.profile_detail != 0U;
+    request.timing->scatter_cache_ns = device_status.scatter_cache_ns;
+    request.timing->scatter_plan_ns = device_status.scatter_plan_ns;
+    request.timing->scatter_post_ns = device_status.scatter_post_ns;
+    request.timing->scatter_cq_ns = device_status.scatter_cq_ns;
+    request.timing->cpu_dispatch_ns = device_status.cpu.dispatch_ns;
+    request.timing->cpu_notify_spin_ns = device_status.cpu.notify_spin_ns;
+    request.timing->cpu_source_cache_ns = device_status.cpu.source_cache_ns;
+    request.timing->cpu_copy_ns = device_status.cpu.copy_ns;
+    request.timing->cpu_staging_flush_ns = device_status.cpu.staging_flush_ns;
+    request.timing->ack_polls = device_status.ack_polls;
+    request.timing->read_wqes = device_status.read_wqes;
+  }
+  bool complete = copy == ACL_SUCCESS;
+  std::uint64_t scatter_begin = UINT64_MAX;
+  std::uint64_t latest_begin = 0U;
+  std::uint64_t scatter_end = 0U;
+  if (request.timing != nullptr) {
+    request.timing->aicpu_cores = arguments.worker_count;
+    request.timing->scatter_plan_ns = 0U;
+    request.timing->scatter_post_ns = 0U;
+    request.timing->scatter_cq_ns = 0U;
+    request.timing->read_wqes = 0U;
+    request.timing->scatter_total_ns = 0U;
+    request.timing->scatter_init_ns = 0U;
+    request.timing->scatter_encode_ns = 0U;
+    request.timing->scatter_sq_write_ns = 0U;
+    request.timing->scatter_doorbell_ns = 0U;
+    request.timing->scatter_start_skew_ns = 0U;
+    request.timing->scatter_worker_ns = 0U;
+    request.timing->sq_write_calls = 0U;
+    request.timing->sq_wqebbs = 0U;
+    request.timing->read_tasks = 0U;
+    request.timing->scatter_schedule_ns = 0U;
+    request.timing->read_task_spans = request.read_task_spans;
+    request.timing->pipeline_chunk_bytes = request.pipeline_chunk_bytes;
+    request.timing->ready_wait_ns = 0U;
+    request.timing->workers = {};
+  }
+  for (std::uint32_t worker = 0U; copy == ACL_SUCCESS && worker < arguments.worker_count;
+       ++worker) {
+    aicpu_urma::GatherReadStatus worker_status{};
+    std::memcpy(&worker_status,
+                status_storage.data() + worker * KVAF_AIV_BATCH_GET_STATUS_BYTES,
+                sizeof(worker_status));
+    const bool valid_status = worker_status.magic == aicpu_urma::kGatherStatusMagic &&
+        worker_status.sequence == request.sequence && worker_status.result == 0U &&
+        worker_status.scatter_begin_ns != 0U &&
+        worker_status.scatter_end_ns >= worker_status.scatter_begin_ns;
+    complete = complete && valid_status;
+    if (valid_status) {
+      scatter_begin = std::min(scatter_begin, worker_status.scatter_begin_ns);
+      latest_begin = std::max(latest_begin, worker_status.scatter_begin_ns);
+      scatter_end = std::max(scatter_end, worker_status.scatter_end_ns);
+      if (request.timing != nullptr) {
+        request.timing->scatter_plan_ns = std::max(request.timing->scatter_plan_ns,
+                                                   worker_status.scatter_plan_ns);
+        request.timing->scatter_post_ns = std::max(request.timing->scatter_post_ns,
+                                                   worker_status.scatter_post_ns);
+        request.timing->scatter_cq_ns = std::max(request.timing->scatter_cq_ns,
+                                                 worker_status.scatter_cq_ns);
+        request.timing->ready_wait_ns = std::max(request.timing->ready_wait_ns,
+                                                 worker_status.ready_wait_ns);
+        request.timing->scatter_init_ns = std::max(request.timing->scatter_init_ns,
+                                                   worker_status.scatter_init_ns);
+        request.timing->scatter_encode_ns = std::max(request.timing->scatter_encode_ns,
+                                                     worker_status.scatter_encode_ns);
+        request.timing->scatter_sq_write_ns = std::max(request.timing->scatter_sq_write_ns,
+                                                       worker_status.scatter_sq_write_ns);
+        request.timing->scatter_doorbell_ns = std::max(request.timing->scatter_doorbell_ns,
+                                                       worker_status.scatter_doorbell_ns);
+        request.timing->scatter_worker_ns = std::max(request.timing->scatter_worker_ns,
+            worker_status.scatter_end_ns - worker_status.scatter_begin_ns);
+        request.timing->read_wqes += worker_status.read_wqes;
+        request.timing->sq_write_calls += worker_status.sq_write_calls;
+        request.timing->sq_wqebbs += worker_status.sq_wqebbs;
+        request.timing->read_tasks += worker_status.read_tasks;
+        request.timing->scatter_schedule_ns = std::max(request.timing->scatter_schedule_ns,
+                                                       worker_status.scatter_schedule_ns);
+        request.timing->workers[worker] = {
+            worker_status.scatter_begin_ns, worker_status.scatter_end_ns,
+            worker_status.scatter_end_ns - worker_status.scatter_begin_ns,
+            worker_status.read_wqes, worker_status.sq_write_calls, worker_status.sq_wqebbs,
+            worker_status.read_tasks};
+      }
+    }
+    if (valid_status && sync == ACL_SUCCESS) continue;
+    std::fprintf(stderr, "[KVAF_AICPU_URMA] GATHER_READ_ERROR worker=%u acl=%d result=%llu phase=%llu ack=%llu "
+                         "sq=%llu cq=%llu cqe_word=0x%llx sequence=%llu spans=%u sgl_size=%u\n",
+                 worker,
+                 static_cast<int>(sync),
+                 static_cast<unsigned long long>(worker_status.result),
+                 static_cast<unsigned long long>(worker_status.phase),
+                 static_cast<unsigned long long>(worker_status.ack_seen),
+                 static_cast<unsigned long long>(worker_status.sq_producer_index),
+                 static_cast<unsigned long long>(worker_status.cq_consumer_index),
+                 static_cast<unsigned long long>(worker_status.cqe_word),
+                 static_cast<unsigned long long>(worker_status.sequence),
+                 request.output_span_count, request.sgl_size);
+    if (worker_status.result != 0U && worker_status.phase == 5U) {
+      const auto observed = worker_status.ack_seen;
+      const char* reason = worker_status.result == 10U
+          ? (observed == peer::kGatherErrorBit ? "cpu_descriptor_error" : "invalid_progress_value")
+          : "prefix_read_failed";
+      std::fprintf(stderr,
+                   "[KVAF_AICPU_URMA] GATHER_PREFIX_ERROR worker=%u reason=%s "
+                   "ready_bytes=0x%llx ready_bytes_decimal=%llu total_bytes=%u "
+                   "scratch=0x%llx remote_progress=0x%llx sequence=%llu\n",
+                   worker, reason, static_cast<unsigned long long>(observed),
+                   static_cast<unsigned long long>(observed), request.bytes,
+                   static_cast<unsigned long long>(arguments.output +
+                       ((arguments.output_extent + 63U) & ~std::uint64_t{63U}) + worker * 64U),
+                   static_cast<unsigned long long>(arguments.remote_descriptor +
+                       offsetof(peer::GatherDescriptorHeader, ready_bytes)),
+                   static_cast<unsigned long long>(request.sequence));
+    }
+  }
+  if (complete && request.timing != nullptr) {
+    request.timing->scatter_total_ns = scatter_end - scatter_begin;
+    request.timing->scatter_start_skew_ns = latest_begin - scatter_begin;
+    for (std::uint32_t worker = 0U; worker < arguments.worker_count; ++worker) {
+      request.timing->workers[worker].start_offset_ns -= scatter_begin;
+      request.timing->workers[worker].end_offset_ns -= scatter_begin;
+    }
+  }
+  if (sync != ACL_SUCCESS) return Internal("AICPU URMA GatherRead stream synchronization failed");
+  if (!complete)
+    return Internal("AICPU URMA GatherRead device completion failed");
+  return Status::OK();
+#else
+  (void)request;
+  return Status::NotImplemented("AICPU URMA is disabled");
+#endif
 }
 
 Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
@@ -613,23 +1006,38 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
         device_metadata + layout.destinations);
     arguments.core_status = PointerValue(execution.core_status);
     arguments.row_count = static_cast<std::uint32_t>(rows);
-    arguments.aiv_core_count = impl_->config.npu_core_count;
+    arguments.aiv_core_count = static_cast<std::uint32_t>(execution.host_core_status.size());
 
     for (KvafBatchPutCoreStatus& core_status : execution.host_core_status) {
       core_status = KvafBatchPutCoreStatus{};
     }
-    const int32_t result = KvafExecuteBatchPutSync(
+    int32_t result = KVAF_BATCH_PUT_RUNTIME_ERROR;
+#if defined(KVAF_ENABLE_AICPU_URMA)
+    if (!impl_->config.aicpu_urma_kernel_json_path.empty()) {
+      result = KvafExecuteBatchPutAicpuSync(
+          impl_->batch_put_transport, &arguments,
+          static_cast<aclrtStream>(exec.execution.stream),
+          execution.host_core_status.data(),
+          static_cast<std::uint32_t>(execution.host_core_status.size()),
+          static_cast<std::uint32_t>(sources));
+    } else
+#endif
+    {
+      result = KvafExecuteBatchPutSync(
         impl_->batch_put_transport, &arguments,
         static_cast<aclrtStream>(exec.execution.stream),
         execution.host_core_status.data(),
         static_cast<std::uint32_t>(execution.host_core_status.size()));
+    }
     for (KvafBatchPutLocalBuffer* local_buffer : local_buffers) {
       KvafBatchPutLocalBufferRelease(local_buffer);
     }
     local_buffers.clear();
     if (result != KVAF_BATCH_PUT_SUCCESS) {
-      LogBatchPutDeviceStatus(execution, impl_->config.npu_core_count, result);
-      return Internal("AIV Direct-HCCP BatchPut execution failed");
+      const bool aicpu = !impl_->config.aicpu_urma_kernel_json_path.empty();
+      LogBatchPutDeviceStatus(execution, arguments.aiv_core_count, result, aicpu);
+      return Internal(aicpu ? "Direct-HCCP BatchPut execution failed"
+                            : "AIV Direct-HCCP BatchPut execution failed");
     }
     return Status::OK();
   }

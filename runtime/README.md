@@ -70,7 +70,17 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 `batch_get_token_bytes` 和 `batch_get_tokens_per_block` 无默认值，
 构造 `NpuRuntime` 时必须显式传入。
 
+可选 AICPU URMA BatchPut/BatchGet 后端复用同一条 KVAF PeerLink、EID 候选选择、
+Direct-HCCP 资源和上述 RMA WRITE 探针，不使用 MemFabric 建链。部署、单 worker
+限制和构建参数见 `access_operator/src/aicpu_urma/README.md`。
+
 ## CPU Runtime 访问 NPU HBM
+
+NPU 发起端也可通过 AICPU URMA 访问另一张 NPU 的 HBM：设置
+`NpuRuntimeOptions::peer_device = DeviceKind::kNpu` 和 `peer_device_id`，再调用
+`LinkTo` / `Initialize` / `core().BatchPut` / `core().BatchGet`。目标端复用
+`kvaf_npu_service`。双卡构建、运行与验证步骤见
+[AICPU NPU → NPU HBM](../access_operator/src/aicpu_urma/README.md#npu--npu-hbm-batchput--batchget)。
 
 当 CPU 需要直接读写 NPU HBM 时，NPU 侧运行 `kvaf_npu_service`，CPU 侧使用
 `CpuRuntime::InitializeClient`。NPU 侧的命令行服务由 `NpuRuntime` 的 HBM provider
@@ -114,7 +124,9 @@ CPU 初始化按 UB 设备名、EID index 顺序遍历本地候选，逐个尝�
 WRITE 并等待 CQ；第一组成功即选用，失败则释放本次资源后继续尝试。日志
 `LINK_ATTEMPT`、`LINK_FAILED`、`LINK_SELECTED` 记录所选路径，不进行带宽排名。
 客户端的 `--ub-device`、`--eid-index` 只筛选 CPU 本地候选。
-候选查询使用控制协议 v5，CPU 客户端与 NPU 服务端需要一起重新构建、重启。
+控制协议 v6 在 HBM 描述符中分别携带 segment 内存 EID 和 context 路由 EID；
+CTP 查询使用路由 EID，segment 导入和 WQE 保留原始内存 EID。
+CPU/NPU 客户端与服务端需要一起重新构建、重启，不能混用 v5 二进制。
 
 逐条比较 EID 链路带宽，可在 CPU 侧运行独立测试（`./build.sh cpu` 会构建该程序）：
 
@@ -169,6 +181,9 @@ NUMA 节点。该脚本固定 `OMP_THREAD_LIMIT=4`，因此只适合四线程绑
 由于 `951ce25` 在设备上出现 SIGBUS 回归，`./build.sh cpu` 清空全局
 `CMAKE_BUILD_TYPE`。CPU-only 的规划/准备 helper 使用函数级优化，URMA 初始化和 provider
 调用仍保持已验证的编译方式。
+CPU GatherRead 的 URMA 清单准备单独编译为 `kvaf_cpu_gather_plan`（`-O2`），
+将必要的源范围、重叠和长度检查与 staging 偏移表构建合并为一次遍历。
+每轮处理当前清单，复用缓冲区容量和工作线程，不缓存旧布局。
 
 CPU URMA 默认创建 4 个 Jetty。WRITE 每条 WR 可包含多个本地 source SGE，READ
 仍固定为一个本地和一个远端 SGE。WRITE 统一先完成校验和分组，再并行构造 WR；

@@ -245,7 +245,9 @@ bool AllocateHbmRegionAt(const std::string& endpoint, uint64_t hbm_bytes,
       response.hbm_bytes != hbm_bytes || response.token_id == 0U ||
       response.token_value == 0U || response.segment_key_bytes == 0U ||
       response.segment_key_bytes > kSegKeyBytes ||
-      response.jetty_key_bytes == 0U || response.jetty_key_bytes > kQpKeyBytes) {
+      response.jetty_key_bytes == 0U || response.jetty_key_bytes > kQpKeyBytes ||
+      std::all_of(response.route_eid, response.route_eid + kEidBytes,
+                  [](uint8_t byte) { return byte == 0U; })) {
     if (error != nullptr && error->empty())
       *error = "NPU service returned an invalid HBM descriptor";
     return false;
@@ -259,6 +261,7 @@ bool AllocateHbmRegionAt(const std::string& endpoint, uint64_t hbm_bytes,
   allocated.segment_key_bytes = response.segment_key_bytes;
   allocated.jetty_key_bytes = response.jetty_key_bytes;
   allocated.device_memory = true;
+  std::memcpy(allocated.route_eid.data(), response.route_eid, allocated.route_eid.size());
   std::memcpy(allocated.eid.data(), response.peer_eid, allocated.eid.size());
   std::memcpy(allocated.segment_key.data(), response.segment_key,
               allocated.segment_key.size());
@@ -393,6 +396,66 @@ Status PeerLink::LookupRegion(uint64_t base, PeerRegion* region) const {
   const auto found = regions_.find(base);
   if (found == regions_.end()) return Status::NotFound("peer region was not found");
   *region = found->second;
+  return Status::OK();
+}
+
+Status PeerLink::ConfigureGather(uint64_t region_base, uint64_t staging_address,
+                                 const std::vector<GatherSpan>& spans, GatherReady* ready) const {
+  const auto found = regions_.find(region_base);
+  if (found == regions_.end() || found->second.device_memory)
+    return Status::NotFound("peer DDR region was not found");
+  if (ready == nullptr || spans.size() > kMaxGatherSpans)
+    return Status::InvalidArgument("invalid gather output or span count");
+  std::uint32_t total_bytes = 0U;
+  if (!ValidateGather(found->second.base, found->second.length,
+                      staging_address, spans, &total_bytes))
+    return Status::InvalidArgument("gather addresses overlap or exceed peer DDR");
+  ConfigureGatherRequest request{};
+  request.header = MakeHeader(Command::kConfigureGather,
+                              static_cast<uint32_t>(sizeof(request) +
+                                                    spans.size() * sizeof(GatherSpanWire)));
+  request.session_id = found->second.session_id;
+  request.staging_address = staging_address;
+  request.span_count = static_cast<uint32_t>(spans.size());
+  std::vector<GatherSpanWire> wire;
+  wire.reserve(spans.size());
+  for (const auto& span : spans) wire.push_back({span.address, span.length, 0U});
+  std::string error;
+  const int fd = Connect(address_, &error);
+  if (fd < 0) return ToStatus("peer gather configuration failed", std::move(error));
+  ConfigureGatherResponse response{};
+  const bool exchanged = WriteAll(fd, &request, sizeof(request), &error) &&
+                         WriteAll(fd, wire.data(), wire.size() * sizeof(wire.front()), &error) &&
+                         ReadAll(fd, &response, sizeof(response), &error);
+  close(fd);
+  if (!exchanged ||
+      !IsValidResponseHeader(response.header, Command::kConfigureGather, sizeof(response)) ||
+      !ResultOk(static_cast<Result>(response.result), &error) ||
+      response.sequence == 0U || response.total_bytes != total_bytes ||
+      response.notify_address != found->second.base +
+          GatherControlOffset(found->second.length) ||
+      response.command_address != response.notify_address + 16U ||
+      response.ack_address != response.notify_address + 8U)
+    return ToStatus("peer gather configuration failed", std::move(error));
+  *ready = {response.sequence, response.command_address, response.notify_address,
+            response.ack_address, total_bytes};
+  return Status::OK();
+}
+
+Status PeerLink::EnableDirectGather(uint64_t region_base) const {
+  const auto found = regions_.find(region_base);
+  if (found == regions_.end() || found->second.device_memory)
+    return Status::NotFound("peer DDR region was not found");
+  EnableDirectGatherRequest request{};
+  request.header = MakeHeader(Command::kEnableDirectGather, sizeof(request));
+  request.session_id = found->second.session_id;
+  StatusResponse response{};
+  std::string error;
+  if (!Exchange(address_, request, &response, &error) ||
+      !IsValidResponseHeader(response.header, Command::kEnableDirectGather,
+                             sizeof(response)) ||
+      !ResultOk(static_cast<Result>(response.result), &error))
+    return ToStatus("peer direct gather enable failed", std::move(error));
   return Status::OK();
 }
 

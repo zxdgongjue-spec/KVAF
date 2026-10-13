@@ -7,8 +7,27 @@
 
 #include "npu_service.h"
 #include "runtime.h"
+#include "cpu_gather.h"
+#include "gather_output.h"
+#include "gather_read_profile.h"
 
 namespace kvaf {
+
+struct CpuGatherReadRequest {
+  std::vector<peer::GatherSpan> spans;
+  std::uint64_t staging_address{0U};
+  std::uint64_t source_descriptor_address{0U};
+  MutableBufferView output;
+  std::vector<GatherOutputSpan> output_spans;
+  std::uint32_t sgl_size{kGatherMaxSglSize};
+  void* stream{nullptr};
+  GatherReadTiming* timing{nullptr};
+  bool profile_detail{false};
+  std::uint32_t sq_batch_wqes{8U};
+  std::uint32_t read_task_spans{0U};
+  GatherSqCopyMode sq_copy_mode{GatherSqCopyMode::kMemcpy};
+  std::uint32_t pipeline_chunk_bytes{0U};
+};
 
 struct NpuRuntimeOptions {
   NpuRuntimeOptions(std::string kernel_object_path,
@@ -22,17 +41,21 @@ struct NpuRuntimeOptions {
   std::uint32_t batch_get_token_bytes;
   std::uint32_t batch_get_tokens_per_block;
   std::string batch_put_kernel_object_path;
+  std::string aicpu_urma_kernel_json_path;
   std::uint32_t device_id{0U};
   std::uint32_t npu_core_count{1U};
   std::uint32_t jettys_per_core{2U};
+  // Remote memory owner; device_id above always selects the local NPU.
+  DeviceKind peer_device{DeviceKind::kCpu};
+  std::uint32_t peer_device_id{0U};
 };
 
 // NPU role Runtime. It owns the current MetaManager, NPU AccessOperator and
-// DDR allocator, while Python remains responsible only for Tensor adaptation.
+// remote memory allocator, while Python remains responsible only for Tensor adaptation.
 class NpuRuntime final : public Runtime {
  public:
   explicit NpuRuntime(NpuRuntimeOptions options);
-  // HBM provider mode. The service owns HBM and accepts CPU Runtime links;
+  // HBM provider mode. The service owns HBM and accepts CPU or NPU Runtime links;
   // the AIV kernel configuration is not required in this mode.
   explicit NpuRuntime(NpuServiceOptions options);
   ~NpuRuntime() override;
@@ -40,8 +63,10 @@ class NpuRuntime final : public Runtime {
   NpuRuntime(const NpuRuntime&) = delete;
   NpuRuntime& operator=(const NpuRuntime&) = delete;
 
-  Status Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size);
+  // Allocates CPU DRAM or NPU HBM according to options.peer_device.
+  Status Initialize(std::uint64_t remote_bytes, std::uint64_t slot_size);
   Status InitializeHbmService();
+  Status GatherRead(const CpuGatherReadRequest& request);
   RuntimeCore& core();
   const RuntimeCore& core() const;
 

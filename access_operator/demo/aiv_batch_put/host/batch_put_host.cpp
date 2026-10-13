@@ -17,6 +17,9 @@
 #include "direct_hccp/direct_hccp_abi.h"
 #include "direct_hccp/direct_hccp_remote_transport.h"
 #include "direct_hccp/direct_hccp_session.h"
+#if defined(KVAF_ENABLE_AICPU_URMA)
+#include "host.h"
+#endif
 
 extern "C" int32_t KvafExecuteBatchPutLaunchInternal(
     const KvafExecuteBatchPutLaunchArgs *arguments, aclrtStream stream);
@@ -78,6 +81,9 @@ struct KvafBatchPutTransport {
   std::mutex launch_mutex{};
   hccp::PeerLink *peer_link{nullptr};
 };
+
+// Keep helper symbols private: Get and Put are loaded into the same process.
+namespace {
 
 std::string EidToHex(const std::array<uint8_t, hccp::kEidBytes> &eid) {
   static constexpr char kHex[] = "0123456789abcdef";
@@ -180,6 +186,11 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
   memory->token_value = token_value;
   memory->key_bytes = info.out.key.size;
   std::memcpy(memory->key, info.out.key.value, memory->key_bytes);
+  hccp::VerboseLog(
+      "[KVAF_AIV] DIRECT_MEMORY_TOKEN role=%s allocated_wqe=0x%x registered_raw=0x%x "
+      "registered_wqe=0x%x used_wqe=0x%x key_bytes=%u\n",
+      role, token_id, info.out.ub.token_id, info.out.ub.token_id >> kTokenIdShift,
+      memory->token_id, info.out.key.size);
   hccp::VerboseLog(
       "[KVAF_AIV] DIRECT_MEMORY_REGISTERED role=%s token_id=0x%x host_or_hbm_va=0x%llx bytes=%llu\n",
       role, memory->token_id, static_cast<unsigned long long>(aligned_address),
@@ -406,6 +417,8 @@ failed:
   return result;
 }
 
+}  // namespace
+
 extern "C" int32_t KvafBatchPutTransportCreateWithPeerLink(
     void *host_ddr, uint64_t host_ddr_bytes, uint32_t aiv_core_count,
     uint32_t jettys_per_core, void *peer_link, const uint8_t *peer_local_eid,
@@ -499,11 +512,12 @@ extern "C" int32_t KvafBatchPutLocalBufferDescribe(
   return KVAF_BATCH_PUT_SUCCESS;
 }
 
-extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutTransport *transport,
+static int32_t ExecuteBatchPutSync(KvafBatchPutTransport *transport,
                                             const KvafExecuteBatchPutKernelArgs *arguments,
                                             aclrtStream stream,
                                             KvafBatchPutCoreStatus *core_status,
-                                            uint32_t core_status_count) {
+                                            uint32_t core_status_count, bool aicpu,
+                                            uint32_t source_count) {
   if (transport == nullptr || arguments == nullptr || stream == nullptr || core_status == nullptr ||
       arguments->source_descriptors == 0U || arguments->source_indices == 0U ||
       arguments->input_offsets == 0U || arguments->lengths == 0U ||
@@ -529,15 +543,38 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutTransport *transport,
   launch_args.channel_entity = reinterpret_cast<uint64_t>(transport->device_entities);
   launch_args.queue_state = reinterpret_cast<uint64_t>(transport->device_queue_state);
   launch_args.jettys_per_core = transport->jettys_per_core;
-  int32_t result = KvafExecuteBatchPutLaunchInternal(&launch_args, stream);
+  launch_args.reserved0 = source_count;
+  int32_t result = KVAF_BATCH_PUT_RUNTIME_ERROR;
+#if defined(KVAF_ENABLE_AICPU_URMA)
+  if (aicpu) {
+    result = kvaf::aicpu_urma::LaunchPut(&launch_args, stream) == 0
+                 ? KVAF_BATCH_PUT_SUCCESS : KVAF_BATCH_PUT_RUNTIME_ERROR;
+  } else
+#endif
+  {
+    result = KvafExecuteBatchPutLaunchInternal(&launch_args, stream);
+  }
   if (result != KVAF_BATCH_PUT_SUCCESS) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=launch result=%d\n", result);
+    if (aicpu) {
+      std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR backend=aicpu phase=launch result=%d\n",
+                   result);
+    } else {
+      std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=launch result=%d\n", result);
+    }
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
   const aclError synchronize_result = aclrtSynchronizeStream(stream);
   if (synchronize_result != ACL_SUCCESS) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=synchronize acl=%d\n",
-                 static_cast<int>(synchronize_result));
+    if (aicpu) {
+      const char* recent_error = aclGetRecentErrMsg();
+      std::fprintf(stderr,
+                   "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR backend=aicpu phase=synchronize acl=%d recent=%s\n",
+                   static_cast<int>(synchronize_result),
+                   recent_error != nullptr ? recent_error : "(unavailable)");
+    } else {
+      std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=synchronize acl=%d\n",
+                   static_cast<int>(synchronize_result));
+    }
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
   const aclError status_copy_result =
@@ -559,4 +596,30 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutTransport *transport,
     }
   }
   return KVAF_BATCH_PUT_SUCCESS;
+}
+
+extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutTransport *transport,
+                                             const KvafExecuteBatchPutKernelArgs *arguments,
+                                             aclrtStream stream,
+                                             KvafBatchPutCoreStatus *core_status,
+                                             uint32_t core_status_count) {
+  return ExecuteBatchPutSync(transport, arguments, stream, core_status, core_status_count, false, 0U);
+}
+
+extern "C" int32_t KvafExecuteBatchPutAicpuSync(KvafBatchPutTransport *transport,
+                                                  const KvafExecuteBatchPutKernelArgs *arguments,
+                                                  aclrtStream stream,
+                                                  KvafBatchPutCoreStatus *core_status,
+                                                  uint32_t core_status_count,
+                                                  uint32_t source_count) {
+#if defined(KVAF_ENABLE_AICPU_URMA)
+  if (arguments == nullptr || source_count == 0U || source_count > arguments->row_count)
+    return KVAF_BATCH_PUT_INVALID_ARGUMENT;
+  return ExecuteBatchPutSync(transport, arguments, stream, core_status, core_status_count, true,
+                             source_count);
+#else
+  (void)transport; (void)arguments; (void)stream; (void)core_status;
+  (void)core_status_count; (void)source_count;
+  return KVAF_BATCH_PUT_RUNTIME_ERROR;
+#endif
 }

@@ -10,12 +10,13 @@
 namespace kvaf::peer {
 
 constexpr uint32_t kProtocolMagic = 0x4b564350U;  // "KVCP"
-// Version 5 adds NPU EID discovery. HBM allocation's eid_index now indexes
-// the same CLOS/pair-info candidate list, rather than a provider-specific list.
-constexpr uint16_t kProtocolVersion = 5U;
+// Version 6 separates the NPU's CTP routing EID from its exported memory EID.
+// HBM allocation's eid_index indexes the discovered CLOS/pair-info candidates.
+constexpr uint16_t kProtocolVersion = 6U;
 constexpr uint32_t kQpKeyBytes = 64U;
 constexpr uint32_t kSegKeyBytes = 64U;
 constexpr uint32_t kEidBytes = 16U;
+constexpr uint32_t kMaxGatherSpans = 65536U;
 
 enum class Command : uint16_t {
   kAllocateRegion = 1U,
@@ -27,6 +28,8 @@ enum class Command : uint16_t {
   kAllocateHbmRegion = 5U,
   kReleaseHbmRegion = 6U,
   kGetHbmEidCandidate = 7U,
+  kConfigureGather = 8U,
+  kEnableDirectGather = 9U,
 };
 
 enum class Result : int32_t {
@@ -101,6 +104,9 @@ struct AllocateHbmRegionResponse {
   uint8_t peer_eid[kEidBytes];
   uint8_t segment_key[kSegKeyBytes];
   uint8_t jetty_key[kQpKeyBytes];
+  // Selected context EID used for CTP lookup. peer_eid above belongs to the
+  // exported segment and must remain unchanged for remote memory access.
+  uint8_t route_eid[kEidBytes];
 };
 
 // Candidate indices are used by AllocateHbmRegionRequest.eid_index.
@@ -155,6 +161,35 @@ struct StatusResponse {
   int32_t result;
   uint32_t reserved;
 };
+
+struct ConfigureGatherRequest {
+  MessageHeader header;
+  uint64_t session_id;
+  uint64_t staging_address;
+  uint32_t span_count;
+  uint32_t reserved;
+};
+
+struct GatherSpanWire {
+  uint64_t address;
+  uint32_t length;
+  uint32_t reserved;
+};
+
+struct ConfigureGatherResponse {
+  MessageHeader header;
+  int32_t result;
+  uint32_t total_bytes;
+  uint64_t sequence;
+  uint64_t command_address;
+  uint64_t notify_address;
+  uint64_t ack_address;
+};
+
+struct EnableDirectGatherRequest {
+  MessageHeader header;
+  uint64_t session_id;
+};
 #pragma pack(pop)
 
 static_assert(sizeof(MessageHeader) == 12U, "wire header ABI changed");
@@ -164,10 +199,14 @@ static_assert(sizeof(CandidateCountResponse) == 20U, "candidate count response A
 static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed");
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");
 static_assert(sizeof(AllocateHbmRegionRequest) == 36U, "HBM allocate request ABI changed");
-static_assert(sizeof(AllocateHbmRegionResponse) == 204U, "HBM allocate response ABI changed");
+static_assert(sizeof(AllocateHbmRegionResponse) == 220U, "HBM allocate response ABI changed");
 static_assert(sizeof(ReleaseHbmRegionRequest) == 20U, "HBM release request ABI changed");
 static_assert(sizeof(HbmEidCandidateRequest) == 20U, "HBM candidate request ABI changed");
 static_assert(sizeof(HbmEidCandidateResponse) == 40U, "HBM candidate response ABI changed");
+static_assert(sizeof(ConfigureGatherRequest) == 36U, "gather request ABI changed");
+static_assert(sizeof(GatherSpanWire) == 16U, "gather span ABI changed");
+static_assert(sizeof(ConfigureGatherResponse) == 52U, "gather response ABI changed");
+static_assert(sizeof(EnableDirectGatherRequest) == 20U, "direct gather request ABI changed");
 
 inline constexpr uint16_t ResponseCommand(Command command) {
   return static_cast<uint16_t>(command) | 0x8000U;

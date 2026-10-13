@@ -1,0 +1,44 @@
+{
+  "KvafAicpuUrmaBatchPut": {
+    "opInfo": {
+      "functionName": "KvafAicpuUrmaBatchPut",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
+  },
+  "KvafAicpuUrmaBatchGet": {
+    "opInfo": {
+      "functionName": "KvafAicpuUrmaBatchGet",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
+  },
+  "KvafAicpuUrmaGatherRead": {
+    "opInfo": {
+      "functionName": "KvafAicpuUrmaGatherRead",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
+  },
+  "KvafAicpuUrmaSqCopyBenchmark": {
+    "opInfo": {
+      "functionName": "KvafAicpuUrmaSqCopyBenchmark",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
+  },
+  "KvafAicpuUrmaSqCopyVerify": {
+    "opInfo": {
+      "functionName": "KvafAicpuUrmaSqCopyVerify",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
+  },
+  "KvafAicpuUrmaGatherScatter": {
+    "opInfo": {
+      "functionName": "KvafAicpuUrmaGatherScatter",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
+  }
+}

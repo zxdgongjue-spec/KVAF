@@ -6,11 +6,14 @@
 #include <string>
 
 #include "requests.h"
+#include "gather_output.h"
+#include "gather_read_profile.h"
 #include "status.h"
 #include "types.h"
 
 namespace kvaf::peer {
 class PeerLink;
+struct GatherSpan;
 }
 
 namespace kvaf {
@@ -22,6 +25,30 @@ struct BatchPutExecRequest {
   const BatchPutExecutionPlan* plan{nullptr};
   const PutAccessDesc* put_desc{nullptr};
   BatchPutExecutionOptions execution;
+};
+
+struct CpuGatherReadExecRequest {
+  MutableBufferView output;
+  const GatherOutputSpan* output_spans{nullptr};
+  std::uint32_t output_span_count{0U};
+  std::uint32_t sgl_size{0U};
+  std::uint64_t output_extent{0U};
+  std::uint64_t remote_staging{0U};
+  std::uint64_t remote_command{0U};
+  std::uint64_t remote_notify{0U};
+  std::uint64_t remote_ack{0U};
+  std::uint64_t remote_descriptor{0U};
+  const peer::GatherSpan* source_spans{nullptr};
+  std::uint32_t source_span_count{0U};
+  std::uint64_t sequence{0U};
+  std::uint32_t bytes{0U};
+  void* stream{nullptr};
+  GatherReadTiming* timing{nullptr};
+  bool profile_detail{false};
+  std::uint32_t sq_batch_wqes{8U};
+  std::uint32_t read_task_spans{0U};
+  GatherSqCopyMode sq_copy_mode{GatherSqCopyMode::kMemcpy};
+  std::uint32_t pipeline_chunk_bytes{0U};
 };
 
 // KV Access Operator 是 Runtime 的数据面依赖。Runtime 管理远端 DDR
@@ -45,6 +72,9 @@ struct AccessOperatorConfig {
   // not establish a shared Direct-HCCP ABI.
   std::string batch_get_kernel_object_path;
   std::string batch_put_kernel_object_path;
+  // Optional AICPUKernel JSON. Uses the same Runtime PeerLink/Direct-HCCP
+  // resources instead of establishing another connection.
+  std::string aicpu_urma_kernel_json_path;
   std::uint32_t npu_core_count{0};
   // Direct-HCCP Jettys assigned to each AIV core.
   std::uint32_t jettys_per_core{2};
@@ -78,6 +108,7 @@ class DefaultAccessOperator final : public AccessOperator {
   Status Shutdown() override;
   Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
   Status ExecuteBatchPut(const BatchPutExecRequest& request) override;
+  Status ExecuteCpuGatherRead(const CpuGatherReadExecRequest& request);
 
  private:
   struct Impl;

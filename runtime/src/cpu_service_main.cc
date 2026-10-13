@@ -11,9 +11,11 @@ namespace {
 
 void PrintUsage(const char* program) {
   std::fprintf(stderr,
-               "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N]\n"
+               "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] [--gather-threads N] [--gather-mode adaptive|active|passive] [--gather-affinity on|off] [--gather-notify-profile]\n"
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
-               "candidates are discovered automatically. The service requires only liburma and /dev/uburma.\n",
+               "candidates are discovered automatically. Gather threads default to auto (up to 32), "
+               "mode to adaptive (one polling coordinator, parked helpers), affinity to on. "
+               "The service requires only liburma and /dev/uburma.\n",
                program);
 }
 
@@ -39,7 +41,9 @@ int main(int argc, char** argv) {
       return 0;
     }
     if ((argument == "--listen" || argument == "--port" || argument == "--ub-device" ||
-         argument == "--eid-index") && index + 1 >= argc) {
+         argument == "--eid-index" || argument == "--gather-threads" ||
+         argument == "--gather-mode" || argument == "--gather-affinity") &&
+        index + 1 >= argc) {
       PrintUsage(argv[0]);
       return 2;
     }
@@ -62,6 +66,30 @@ int main(int argc, char** argv) {
         return 2;
       }
       cpu_options.has_eid_index = true;
+    } else if (argument == "--gather-threads") {
+      if (!ParseUnsigned(argv[++index], 64U, &cpu_options.gather_threads) ||
+          cpu_options.gather_threads == 0U) {
+        std::fprintf(stderr, "invalid --gather-threads (expected 1..64)\n");
+        return 2;
+      }
+    } else if (argument == "--gather-affinity") {
+      const std::string value(argv[++index]);
+      if (value != "on" && value != "off") {
+        std::fprintf(stderr, "invalid --gather-affinity (expected on|off)\n");
+        return 2;
+      }
+      cpu_options.gather_affinity = value == "on";
+    } else if (argument == "--gather-mode") {
+      const std::string value(argv[++index]);
+      if (value != "adaptive" && value != "active" && value != "passive") {
+        std::fprintf(stderr, "invalid --gather-mode (expected adaptive|active|passive)\n");
+        return 2;
+      }
+      cpu_options.gather_mode = value == "adaptive" ? kvaf::CpuGatherMode::kAdaptive
+          : value == "active" ? kvaf::CpuGatherMode::kActive
+                              : kvaf::CpuGatherMode::kPassive;
+    } else if (argument == "--gather-notify-profile") {
+      cpu_options.gather_notify_profile = true;
     } else {
       PrintUsage(argv[0]);
       return 2;

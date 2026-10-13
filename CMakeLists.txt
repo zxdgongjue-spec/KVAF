@@ -8,6 +8,9 @@ option(KVAF_ENABLE_AIV_BATCH_GET
 option(KVAF_ENABLE_AIV_BATCH_PUT
        "Build the CANN-backed Direct-HCCP BatchPut data plane"
        ${KVAF_ENABLE_AIV_BATCH_GET})
+option(KVAF_ENABLE_AICPU_URMA
+       "Build AICPU URMA BatchPut/BatchGet on the KVAF Direct-HCCP PeerLink"
+       OFF)
 option(KVAF_BUILD_REMOTE_CPU_SERVICE
        "Build the liburma-only persistent CPU DDR/Jetty service"
        OFF)
@@ -28,6 +31,9 @@ if(KVAF_ENABLE_AIV_BATCH_PUT AND NOT KVAF_ENABLE_AIV_BATCH_GET)
   message(FATAL_ERROR
     "KVAF_ENABLE_AIV_BATCH_PUT requires KVAF_ENABLE_AIV_BATCH_GET because "
     "DefaultAccessOperator is built by the CANN BatchGet integration")
+endif()
+if(KVAF_ENABLE_AICPU_URMA AND NOT KVAF_ENABLE_AIV_BATCH_PUT)
+  message(FATAL_ERROR "KVAF_ENABLE_AICPU_URMA requires AIV BatchGet and BatchPut transport hosts")
 endif()
 
 # CANN/PyTorch NPU libraries use the legacy libstdc++ ABI. Keep this setting
