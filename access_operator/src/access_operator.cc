@@ -295,6 +295,24 @@ void LogBatchGetDeviceStatus(const BatchGetExecutionState& execution,
                    static_cast<unsigned long long>(status.cq_consumer_index),
                    static_cast<unsigned long long>(status.failed_request_index),
                    static_cast<unsigned long long>(status.last_wqe_protocol));
+      if (status.profile.magic == KVAF_AIV_BATCH_GET_PROFILE_MAGIC) {
+        // Keep failed timelines without passing them through the success-only
+        // profile API. These timings belong to each Jetty, while core_result
+        // is the aggregate result of the owner group. The host cannot infer
+        // the device clock frequency or an independent Jetty result here.
+        for (std::uint32_t jetty = 0;
+             jetty < KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE; ++jetty) {
+          std::fprintf(stderr,
+                       "[KVAF_AIV] BATCH_GET_CQ_PROFILE core=%u jetty=%u "
+                       "core_result=%llu polls=%llu wait_ticks=%llu "
+                       "active_requests=%llu total_posts=%llu clock_hz=unconfirmed\n",
+                       core, jetty, static_cast<unsigned long long>(status.result),
+                       static_cast<unsigned long long>(status.profile.jetty_completion_polls[jetty]),
+                       static_cast<unsigned long long>(status.profile.jetty_completion_wait_cycles[jetty]),
+                       static_cast<unsigned long long>(status.profile.active_requests),
+                       static_cast<unsigned long long>(status.profile.total_posts));
+        }
+      }
     }
   }
 }

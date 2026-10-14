@@ -321,6 +321,81 @@ void TestQueueHealthDiagnostics(bool release_boundary) {
   op.reset();
 }
 
+void TestQueueHealthCqProfileDiagnostics(bool profile_enabled) {
+  driver = {};
+  auto op = std::make_unique<kvaf::DefaultAccessOperator>(Config());
+  std::vector<std::uint8_t> ddr(4096), output(656 * 4);
+  Require(op->Initialize({reinterpret_cast<std::uint64_t>(ddr.data()), ddr.size(),
+                         256, kvaf::DeviceKind::kCpu}).ok(), "CQ profile diagnostic fixture init");
+  kvaf::FusedBatchGetContext context;
+  Require(op->AcquireFusedBatchGetContext(output.data(), output.size(), 656, 128,
+                                         &context).ok(), "CQ profile fixture obtains ABI pointers");
+  auto* queues = reinterpret_cast<KvafBatchGetQueueState*>(context.device_queue_state);
+  auto* statuses = reinterpret_cast<KvafBatchGetCoreStatus*>(context.device_core_status);
+  int stream_marker = 0;
+  Require(op->ReleaseFusedBatchGetContext(context, &stream_marker).ok(), "CQ profile fixture releases lease");
+  Require(op->SetBatchGetKernelProfiling(profile_enabled).ok(), "configure real profile magic");
+  // Populate real, host-backed ABI snapshots, without simulating device CQ
+  // execution or DMA. Timing on a failed core remains useful even though the
+  // public successful-profile API correctly rejects its aggregate error.
+  statuses[0].magic = statuses[1].magic = KVAF_AIV_BATCH_GET_STATUS_MAGIC;
+  statuses[0].result = 6;
+  statuses[0].profile.active_requests = 307;
+  statuses[0].profile.total_posts = 10;
+  statuses[0].profile.jetty_completion_polls[0] = 20000;
+  statuses[0].profile.jetty_completion_polls[1] = 1;
+  statuses[0].profile.jetty_completion_wait_cycles[0] = 11000123;
+  statuses[0].profile.jetty_completion_wait_cycles[1] = 321;
+  statuses[1].profile.active_requests = 307;
+  statuses[1].profile.total_posts = 10;
+  statuses[1].profile.jetty_completion_polls[0] = 8;
+  statuses[1].profile.jetty_completion_polls[1] = 2;
+  statuses[1].profile.jetty_completion_wait_cycles[0] = 1000;
+  statuses[1].profile.jetty_completion_wait_cycles[1] = 400;
+  queues[0].last_error = queues[1].last_error = 6;
+  queues[0].sq_producer_index = 160;
+  queues[1].sq_producer_index = 147;
+  queues[1].cq_consumer_index = 1;
+  queues[1].completed_batch_count = 1;
+  const int previous_acquires = driver.acquires;
+  const int previous_releases = driver.releases;
+  std::string diagnostics;
+  {
+    StderrCapture capture;
+    kvaf::FusedBatchGetContext next;
+    Require(!op->AcquireFusedBatchGetContext(output.data(), output.size(), 656, 128,
+                                            &next).ok(), "poisoned profile fixture fails health check");
+    Require(next.lease_id == 0, "CQ profile logging does not publish a lease");
+    diagnostics = capture.Read();
+  }
+  Require(diagnostics.find("BATCH_GET_QUEUE_ERROR core=0 jetty=0 last_error=6") != std::string::npos &&
+              diagnostics.find("BATCH_GET_DEVICE_ERROR core=0") != std::string::npos,
+          "queue and core fault remain visible alongside timings");
+  if (profile_enabled) {
+    Require(diagnostics.find("BATCH_GET_CQ_PROFILE core=0 jetty=0 core_result=6 polls=20000 wait_ticks=11000123 "
+                             "active_requests=307 total_posts=10 clock_hz=unconfirmed") != std::string::npos,
+            "retain failed Jetty timing with an explicit aggregate result and unknown clock");
+    Require(diagnostics.find("BATCH_GET_CQ_PROFILE core=0 jetty=1 core_result=6 polls=1 wait_ticks=321")
+                != std::string::npos,
+            "second Jetty keeps its independent polls and ticks without claiming its own result");
+    Require(diagnostics.find("BATCH_GET_CQ_PROFILE core=1 jetty=0 core_result=0 polls=8 wait_ticks=1000")
+                != std::string::npos &&
+                diagnostics.find("BATCH_GET_CQ_PROFILE core=1 jetty=1 core_result=0 polls=2 wait_ticks=400")
+                != std::string::npos,
+            "successful cores in a failed owner snapshot retain both Jetty timings");
+  } else {
+    Require(diagnostics.find("BATCH_GET_CQ_PROFILE") == std::string::npos,
+            "without profile magic no unverified timing is emitted");
+  }
+  Require(driver.acquires == previous_acquires && driver.releases == previous_releases &&
+              driver.launches == 0 && driver.destroys == 0,
+          "CQ profile logging launches no work and leaves registrations retained");
+  Require(queues[0].last_error == 6 && queues[1].cq_consumer_index == 1 &&
+              statuses[0].result == 6 && statuses[0].profile.jetty_completion_polls[0] == 20000,
+          "CQ profile logging does not clear errors or mutate device snapshots");
+  Require(op->Shutdown().ok(), "unleased CPU fixture retires outside the diagnostic check");
+}
+
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
 void TestIndependentPutPool(std::uint32_t requested_put_workers,
                             std::uint32_t expected_put_workers, bool local_host) {
@@ -512,6 +587,8 @@ int main() {
     TestFailedCompletionRetainsRegistration(true);
     TestQueueHealthDiagnostics(false);
     TestQueueHealthDiagnostics(true);
+    TestQueueHealthCqProfileDiagnostics(false);
+    TestQueueHealthCqProfileDiagnostics(true);
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
     TestIndependentPutPool(1, 1, true);
     TestIndependentPutPool(0, 30, true);
