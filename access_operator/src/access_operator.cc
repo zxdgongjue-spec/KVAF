@@ -42,6 +42,10 @@ struct BatchGetExecutionState {
   std::size_t queue_state_bytes{0};
 };
 
+void LogBatchGetDeviceStatus(const BatchGetExecutionState& execution,
+                             std::uint32_t npu_core_count,
+                             bool include_successful = false);
+
 Status CheckBatchGetQueueHealth(const BatchGetExecutionState& execution,
                                std::uint32_t workers,
                                std::uint32_t jettys_per_core) {
@@ -52,11 +56,28 @@ Status CheckBatchGetQueueHealth(const BatchGetExecutionState& execution,
                   ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
     return Internal("failed to inspect BatchGet queue completion state");
   }
-  for (const auto& queue : queues) {
+  bool failed = false;
+  for (std::size_t index = 0; index < queues.size(); ++index) {
+    const auto& queue = queues[index];
     if (queue.last_error != 0U) {
-      return Internal("BatchGet queue has a transport error; keep its output "
-                      "and registrations alive until device/process teardown");
+      failed = true;
+      std::fprintf(stderr,
+                   "[KVAF_AIV] BATCH_GET_QUEUE_ERROR core=%u jetty=%u "
+                   "last_error=%llu sq_pi=%llu cq_ci=%llu completed_batches=%llu\n",
+                   static_cast<unsigned>(index / jettys_per_core),
+                   static_cast<unsigned>(index % jettys_per_core),
+                   static_cast<unsigned long long>(queue.last_error),
+                   static_cast<unsigned long long>(queue.sq_producer_index),
+                   static_cast<unsigned long long>(queue.cq_consumer_index),
+                   static_cast<unsigned long long>(queue.completed_batch_count));
     }
+  }
+  if (failed) {
+    // A failed queue may have a partial or stale core status. Keep both views
+    // for diagnosis without clearing poison or releasing uncertain DMA state.
+    LogBatchGetDeviceStatus(execution, workers, true);
+    return Internal("BatchGet queue has a transport error; keep its output "
+                    "and registrations alive until device/process teardown");
   }
   return Status::OK();
 }
@@ -242,7 +263,8 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
 }
 
 void LogBatchGetDeviceStatus(const BatchGetExecutionState& execution,
-                             std::uint32_t npu_core_count) {
+                             std::uint32_t npu_core_count,
+                             bool include_successful) {
   std::vector<KvafBatchGetCoreStatus> statuses(npu_core_count);
   const aclError copy_result = aclrtMemcpy(
       statuses.data(), statuses.size() * sizeof(statuses.front()),
@@ -255,17 +277,24 @@ void LogBatchGetDeviceStatus(const BatchGetExecutionState& execution,
   }
   for (std::uint32_t core = 0; core < npu_core_count; ++core) {
     const KvafBatchGetCoreStatus& status = statuses[core];
-    if (status.magic != KVAF_AIV_BATCH_GET_STATUS_MAGIC || status.result != 0U) {
+    const bool failed = status.magic != KVAF_AIV_BATCH_GET_STATUS_MAGIC || status.result != 0U;
+    if (include_successful || failed) {
       // Keep device execution faults in the operator diagnostic channel rather
       // than turning the kernel status buffer into a Python BatchGet result.
       // Deployments can route this marker through their CANN/plog collection.
       std::fprintf(stderr,
-                   "[KVAF_AIV] BATCH_GET_DEVICE_ERROR core=%u magic=0x%llx "
-                   "result=%llu processed=%llu failed_request=%llu\n",
+                   "[KVAF_AIV] %s core=%u magic=0x%llx "
+                   "result=%llu processed=%llu completed_batches=%llu "
+                   "sq_pi=%llu cq_ci=%llu failed_request=%llu last_wqe=0x%llx\n",
+                   failed ? "BATCH_GET_DEVICE_ERROR" : "BATCH_GET_DEVICE_SNAPSHOT",
                    core, static_cast<unsigned long long>(status.magic),
                    static_cast<unsigned long long>(status.result),
                    static_cast<unsigned long long>(status.processed_request_count),
-                   static_cast<unsigned long long>(status.failed_request_index));
+                   static_cast<unsigned long long>(status.completed_batch_count),
+                   static_cast<unsigned long long>(status.sq_producer_index),
+                   static_cast<unsigned long long>(status.cq_consumer_index),
+                   static_cast<unsigned long long>(status.failed_request_index),
+                   static_cast<unsigned long long>(status.last_wqe_protocol));
     }
   }
 }

@@ -1,9 +1,12 @@
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
+#include <unistd.h>
 
 #include "access_operator.h"
 #include "batch_get_abi.h"
@@ -41,6 +44,45 @@ struct FakeDriver {
 void Require(bool value, const char* message) {
   if (!value) throw std::runtime_error(message);
 }
+
+class StderrCapture {
+ public:
+  StderrCapture() {
+    std::fflush(stderr);
+    saved_ = dup(fileno(stderr));
+    file_ = std::tmpfile();
+    if (saved_ < 0 || file_ == nullptr || dup2(fileno(file_), fileno(stderr)) < 0) {
+      if (saved_ >= 0) close(saved_);
+      if (file_ != nullptr) std::fclose(file_);
+      throw std::runtime_error("cannot capture diagnostic stderr");
+    }
+  }
+  ~StderrCapture() {
+    Restore();
+    if (file_ != nullptr) std::fclose(file_);
+  }
+  std::string Read() {
+    Restore();
+    std::rewind(file_);
+    std::string result;
+    char buffer[1024];
+    while (const auto size = std::fread(buffer, 1, sizeof(buffer), file_)) {
+      result.append(buffer, size);
+    }
+    return result;
+  }
+ private:
+  void Restore() {
+    if (saved_ >= 0) {
+      std::fflush(stderr);
+      dup2(saved_, fileno(stderr));
+      close(saved_);
+      saved_ = -1;
+    }
+  }
+  int saved_{-1};
+  std::FILE* file_{nullptr};
+};
 
 kvaf::AccessOperatorConfig Config() {
   kvaf::AccessOperatorConfig config;
@@ -197,6 +239,86 @@ void TestFailedCompletionRetainsRegistration(bool stream_failure) {
   op.reset();
   Require(driver.releases == 0 && driver.destroys == 0,
           "destructor never deregisters potentially live DMA resources");
+}
+
+void TestQueueHealthDiagnostics(bool release_boundary) {
+  driver = {};
+  auto op = std::make_unique<kvaf::DefaultAccessOperator>(Config());
+  std::vector<std::uint8_t> ddr(4096), output(656 * 4);
+  Require(op->Initialize({reinterpret_cast<std::uint64_t>(ddr.data()), ddr.size(),
+                         256, kvaf::DeviceKind::kCpu}).ok(), "queue diagnostic fixture init");
+  kvaf::FusedBatchGetContext context;
+  {
+    StderrCapture capture;
+    Require(op->AcquireFusedBatchGetContext(output.data(), output.size(), 656, 128,
+                                           &context).ok(), "healthy queue acquire");
+    Require(capture.Read().empty(), "healthy setup adds no status diagnostics");
+  }
+  auto* queues = reinterpret_cast<KvafBatchGetQueueState*>(context.device_queue_state);
+  auto* statuses = reinterpret_cast<KvafBatchGetCoreStatus*>(context.device_core_status);
+  int stream_marker = 0;
+  if (!release_boundary) {
+    StderrCapture capture;
+    Require(op->ReleaseFusedBatchGetContext(context, &stream_marker).ok(), "healthy queue release");
+    Require(capture.Read().empty(), "healthy release adds no status diagnostics");
+  }
+  // Populate host-backed ABI records only; this does not simulate any CQ or
+  // device execution. Two poisoned Jettys must both remain visible in stderr.
+  queues[1].last_error = 7;
+  queues[1].sq_producer_index = 51;
+  queues[1].cq_consumer_index = 4;
+  queues[1].completed_batch_count = 3;
+  queues[3].last_error = 9;
+  queues[3].sq_producer_index = 83;
+  queues[3].cq_consumer_index = 6;
+  queues[3].completed_batch_count = 5;
+  statuses[0].magic = statuses[1].magic = KVAF_AIV_BATCH_GET_STATUS_MAGIC;
+  statuses[1].result = 7;
+  statuses[1].processed_request_count = 12;
+  statuses[1].completed_batch_count = 5;
+  statuses[1].sq_producer_index = 81;
+  statuses[1].cq_consumer_index = 6;
+  statuses[1].failed_request_index = 11;
+  statuses[1].last_wqe_protocol = 0x1234;
+  const int previous_acquires = driver.acquires;
+  const int previous_releases = driver.releases;
+  std::string diagnostics;
+  {
+    StderrCapture capture;
+    kvaf::Status result;
+    if (release_boundary) {
+      result = op->ReleaseFusedBatchGetContext(context, &stream_marker);
+    } else {
+      kvaf::FusedBatchGetContext next;
+      result = op->AcquireFusedBatchGetContext(output.data(), output.size(), 656, 128, &next);
+      Require(next.lease_id == 0, "poisoned queue does not publish a lease");
+    }
+    Require(!result.ok(), "poisoned queue fails health check");
+    diagnostics = capture.Read();
+  }
+  Require(diagnostics.find("BATCH_GET_QUEUE_ERROR core=0 jetty=1 last_error=7 sq_pi=51 cq_ci=4 completed_batches=3")
+              != std::string::npos, "log first poisoned core and Jetty with persistent indices");
+  Require(diagnostics.find("BATCH_GET_QUEUE_ERROR core=1 jetty=1 last_error=9 sq_pi=83 cq_ci=6 completed_batches=5")
+              != std::string::npos, "log every poisoned queue rather than just the first");
+  Require(diagnostics.find("BATCH_GET_DEVICE_ERROR core=1") != std::string::npos &&
+              diagnostics.find("result=7 processed=12 completed_batches=5 sq_pi=81 cq_ci=6 failed_request=11 last_wqe=0x1234")
+              != std::string::npos, "log existing device ABI fields alongside queue poison");
+  Require(diagnostics.find("BATCH_GET_DEVICE_SNAPSHOT core=0") != std::string::npos &&
+              diagnostics.find("BATCH_GET_DEVICE_ERROR core=0") == std::string::npos,
+          "failed queue retains a snapshot even when its core status is partial or stale");
+  Require(driver.acquires == previous_acquires && driver.releases == previous_releases &&
+              driver.launches == 0 && driver.destroys == 0,
+          "failure diagnostics post no work and do not deregister or retire transport");
+  Require(queues[1].last_error == 7 && queues[3].last_error == 9 &&
+              queues[1].sq_producer_index == 51 && queues[3].cq_consumer_index == 6,
+          "logging never clears poison or modifies queue state");
+  if (release_boundary) {
+    Require(op->Shutdown().code() == kvaf::StatusCode::kBusy,
+            "failed release still quarantines its registration");
+  } else {
+    Require(op->Shutdown().ok(), "unleased mock queue retires outside diagnostic check");
+  }
+  op.reset();
 }
 
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
@@ -388,6 +510,8 @@ int main() {
     TestLeaseAndRuntimeTeardown();
     TestFailedCompletionRetainsRegistration(false);
     TestFailedCompletionRetainsRegistration(true);
+    TestQueueHealthDiagnostics(false);
+    TestQueueHealthDiagnostics(true);
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
     TestIndependentPutPool(1, 1, true);
     TestIndependentPutPool(0, 30, true);
