@@ -570,10 +570,13 @@ __aicore__ inline uint64_t WaitForCompletion(
       static_cast<uint64_t>(slot) * entity->cqe_size;
   for (uint32_t poll = 0U; poll < kMaxCqPolls; ++poll) {
     CleanCacheLines(cqe_address, kCqeProbeBytes);
-    __asm__ __volatile__("");
+    // CQ is written by the transport, outside the C++ memory model. DCCI
+    // invalidates the hardware cache; volatile and the compiler barrier also
+    // require a fresh GM load after that invalidation on every poll.
+    __asm__ __volatile__("" ::: "memory");
     const uint32_t cqe_word =
-        *reinterpret_cast<__gm__ uint32_t *>(cqe_address);
-    __asm__ __volatile__("");
+        *reinterpret_cast<__gm__ const volatile uint32_t *>(cqe_address);
+    __asm__ __volatile__("" ::: "memory");
     const uint8_t owner = static_cast<uint8_t>((cqe_word >> 2U) & 1U);
     const uint8_t expected = static_cast<uint8_t>(
         (queue->cq_consumer_index / entity->cq_depth) & 1U);
