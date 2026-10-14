@@ -116,6 +116,25 @@ class FusedBindingHostTest(unittest.TestCase):
         runtime.initialize(4096, 256)
         return runtime
 
+    def test_put_workers_are_optional_and_do_not_change_get_lease(self):
+        # The trailing argument preserves the previous nine positional args.
+        legacy = self.module.NpuRuntime("fixture.o", 656, 128, 0, 30,
+                                         "put.o", 2, True, "thp")
+        self.assertEqual(legacy.npu_core_count, 30)
+        self.assertEqual(legacy.batch_put_npu_core_count, 30)
+        legacy.shutdown()
+        independent = self.module.NpuRuntime("fixture.o", 656, 128,
+                                              npu_core_count=30,
+                                              batch_put_npu_core_count=1)
+        independent.initialize(4096, 256)
+        self.assertEqual(independent.batch_put_npu_core_count, 1)
+        context = independent.acquire_fused_batch_get_context(Tensor(), Stream())
+        self.assertEqual(context["worker_count"], 30)
+        with self.assertRaises(AttributeError):
+            independent.batch_put_npu_core_count = 2
+        independent.release_fused_batch_get_context(context)
+        independent.shutdown()
+
     def test_exports_unsigned_context_and_releases_only_after_fence(self):
         runtime = self.runtime()
         output, stream = Tensor(), Stream()

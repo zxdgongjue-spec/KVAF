@@ -8,6 +8,9 @@
 #include "access_operator.h"
 #include "batch_get_abi.h"
 #include "kvaf_aiv_batch_get.h"
+#if defined(KVAF_ENABLE_AIV_BATCH_PUT)
+#include "kvaf_aiv_batch_put.h"
+#endif
 #include "meta_manager.h"
 #include "peer_link.h"
 #include "runtime.h"
@@ -21,6 +24,14 @@ struct FakeDriver {
   int device_syncs{0};
   int local_creates{0};
   int peer_creates{0};
+  std::uint32_t get_workers{0};
+  std::uint32_t put_workers{0};
+  std::uint32_t put_launch_workers{0};
+  std::uint32_t put_status_workers{0};
+  int put_creates{0};
+  int put_destroys{0};
+  int put_launches{0};
+  bool fail_put_destroy{false};
   bool fail_destroy{false};
   bool fail_local_create{false};
   bool fail_acquire{false};
@@ -187,12 +198,81 @@ void TestFailedCompletionRetainsRegistration(bool stream_failure) {
   Require(driver.releases == 0 && driver.destroys == 0,
           "destructor never deregisters potentially live DMA resources");
 }
+
+#if defined(KVAF_ENABLE_AIV_BATCH_PUT)
+void TestIndependentPutPool(std::uint32_t requested_put_workers,
+                            std::uint32_t expected_put_workers, bool local_host) {
+  driver = {};
+  auto config = Config();
+  config.npu_core_count = 30;
+  config.batch_put_kernel_object_path = "mock-put-kernel";
+  config.batch_put_npu_core_count = requested_put_workers;
+  config.local_host_ddr = local_host;
+  if (local_host) {
+    config.peer_link.reset();
+    config.peer_local_eid.fill(0);
+  }
+  kvaf::DefaultAccessOperator op(config);
+  auto metadata = kvaf::CreateInMemoryMetaManager();
+  Allocator allocator;
+  kvaf::RuntimeCore runtime(*metadata, op, allocator);
+  Require(runtime.Initialize({4096, 256, kvaf::DeviceKind::kCpu}).ok(), "independent Put init");
+  Require(driver.get_workers == 30 && driver.put_workers == expected_put_workers &&
+              driver.put_creates == 1,
+          "Put transport uses separate workers; Get pool remains 30");
+  std::vector<std::uint8_t> source(512), output(656 * 4);
+  int stream_marker = 0;
+  Require(runtime.BatchPut({{1, 2},
+                            {source.data(), source.size(), kvaf::DeviceKind::kNpu},
+                            {0, 256}, {256, 256}}, {&stream_marker}).ok(),
+          "eager Put runs with independent status and transport geometry");
+  Require(driver.put_launches == 1 && driver.put_launch_workers == expected_put_workers &&
+              driver.put_status_workers == expected_put_workers,
+          "Put launch and status storage use the Put pool");
+  kvaf::FusedBatchGetContext context;
+  Require(op.AcquireFusedBatchGetContext(output.data(), output.size(), 656, 128,
+                                        &context).ok(), "lease large Get pool");
+  Require(context.worker_count == 30 && context.jettys_per_core == 2,
+          "Put workers do not shrink the fused Get lease");
+  Require(op.ReleaseFusedBatchGetContext(context, &stream_marker).ok(), "release Get lease");
+  driver.fail_put_destroy = true;
+  Require(!runtime.Shutdown().ok() && allocator.releases == 0 && !allocator.data.empty(),
+          "failed independent Put retirement retains DDR");
+  driver.fail_put_destroy = false;
+  Require(runtime.Shutdown().ok() && allocator.releases == 1 &&
+              driver.put_destroys == 1 && driver.destroys == 1,
+          "successful retry retires both pools before DDR release");
+}
+
+void TestInvalidPutPoolRejectedBeforeTransportCreation() {
+  driver = {};
+  auto config = Config();
+  config.local_host_ddr = true;
+  config.peer_link.reset();
+  config.batch_put_kernel_object_path = "mock-put-kernel";
+  config.batch_put_npu_core_count = 49;
+  kvaf::DefaultAccessOperator op(config);
+  std::vector<std::uint8_t> ddr(4096);
+  Require(op.Initialize({reinterpret_cast<std::uint64_t>(ddr.data()), ddr.size(),
+                         256, kvaf::DeviceKind::kCpu}).code() == kvaf::StatusCode::kInvalidArgument,
+          "reject Put workers above ABI limit");
+  Require(driver.local_creates == 0 && driver.put_creates == 0,
+          "invalid Put count creates no transport");
+}
+#endif
 }  // namespace
 
 struct KvafBatchGetLocalBuffer { std::uint64_t entity{0xabc}; };
 struct KvafBatchGetTransport {
   std::vector<std::unique_ptr<KvafBatchGetLocalBuffer>> registrations;
 };
+#if defined(KVAF_ENABLE_AIV_BATCH_PUT)
+struct KvafBatchPutLocalBuffer {};
+struct KvafBatchPutTransport {
+  std::uint32_t workers{0};
+  KvafBatchPutLocalBuffer registration;
+};
+#endif
 
 extern "C" {
 aclError aclrtMalloc(void** ptr, std::size_t bytes, aclrtMemMallocPolicy) {
@@ -213,16 +293,18 @@ aclError aclrtMemcpy(void* dst, std::size_t capacity, const void* src,
 }
 aclError aclrtSynchronizeDevice() { ++driver.device_syncs; return ACL_SUCCESS; }
 aclError aclrtSynchronizeStream(aclrtStream) { return driver.fail_stream_sync ? 1 : ACL_SUCCESS; }
-int32_t KvafBatchGetTransportCreateWithPeerLink(void*, uint64_t, uint32_t,
+int32_t KvafBatchGetTransportCreateWithPeerLink(void*, uint64_t, uint32_t workers,
                                                 uint32_t, void*, const uint8_t*,
                                                 KvafBatchGetTransport** transport) {
   ++driver.peer_creates;
+  driver.get_workers = workers;
   *transport = new KvafBatchGetTransport;
   return KVAF_BATCH_GET_SUCCESS;
 }
-int32_t KvafBatchGetTransportCreateLocalHost(void*, uint64_t, uint32_t,
+int32_t KvafBatchGetTransportCreateLocalHost(void*, uint64_t, uint32_t workers,
                                               uint32_t, KvafBatchGetTransport** transport) {
   ++driver.local_creates;
+  driver.get_workers = workers;
   *transport = new KvafBatchGetTransport;
   return driver.fail_local_create ? KVAF_BATCH_GET_RUNTIME_ERROR : KVAF_BATCH_GET_SUCCESS;
 }
@@ -251,6 +333,52 @@ int32_t KvafExecuteBatchGetLaunch(const KvafExecuteBatchGetKernelArgs*, aclrtStr
   ++driver.launches;
   return KVAF_BATCH_GET_SUCCESS;
 }
+
+#if defined(KVAF_ENABLE_AIV_BATCH_PUT)
+int32_t KvafBatchPutTransportCreateLocalHost(void*, uint64_t, uint32_t workers,
+                                              uint32_t, KvafBatchPutTransport** transport) {
+  ++driver.put_creates;
+  driver.put_workers = workers;
+  *transport = new KvafBatchPutTransport{workers, {}};
+  return KVAF_BATCH_PUT_SUCCESS;
+}
+int32_t KvafBatchPutTransportCreateWithPeerLink(void* ddr, uint64_t bytes, uint32_t workers,
+                                                uint32_t jettys, void*, const uint8_t*,
+                                                KvafBatchPutTransport** transport) {
+  return KvafBatchPutTransportCreateLocalHost(ddr, bytes, workers, jettys, transport);
+}
+int32_t KvafBatchPutTransportDestroyChecked(KvafBatchPutTransport* transport) {
+  if (driver.fail_put_destroy) return KVAF_BATCH_PUT_RUNTIME_ERROR;
+  ++driver.put_destroys;
+  delete transport;
+  return KVAF_BATCH_PUT_SUCCESS;
+}
+int32_t KvafBatchPutLocalBufferAcquire(KvafBatchPutTransport* transport, void*, uint64_t,
+                                       KvafBatchPutLocalBuffer** buffer) {
+  *buffer = &transport->registration;
+  return KVAF_BATCH_PUT_SUCCESS;
+}
+void KvafBatchPutLocalBufferRelease(KvafBatchPutLocalBuffer*) {}
+int32_t KvafExecuteBatchPutLoadKernel(const char*) { return KVAF_BATCH_PUT_SUCCESS; }
+int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer*,
+                                const KvafExecuteBatchPutKernelArgs* arguments,
+                                aclrtStream, KvafBatchPutCoreStatus* statuses,
+                                uint32_t status_workers) {
+  ++driver.put_launches;
+  driver.put_launch_workers = arguments->aiv_core_count;
+  driver.put_status_workers = status_workers;
+  if (arguments->aiv_core_count != driver.put_workers || status_workers != driver.put_workers) {
+    return KVAF_BATCH_PUT_INVALID_ARGUMENT;
+  }
+  auto* device_statuses = reinterpret_cast<KvafBatchPutCoreStatus*>(arguments->core_status);
+  for (std::uint32_t core = 0; core < status_workers; ++core) {
+    device_statuses[core] = {};
+    device_statuses[core].magic = KVAF_AIV_BATCH_PUT_STATUS_MAGIC;
+    statuses[core] = device_statuses[core];
+  }
+  return KVAF_BATCH_PUT_SUCCESS;
+}
+#endif
 }
 
 int main() {
@@ -260,6 +388,13 @@ int main() {
     TestLeaseAndRuntimeTeardown();
     TestFailedCompletionRetainsRegistration(false);
     TestFailedCompletionRetainsRegistration(true);
+#if defined(KVAF_ENABLE_AIV_BATCH_PUT)
+    TestIndependentPutPool(1, 1, true);
+    TestIndependentPutPool(0, 30, true);
+    TestIndependentPutPool(48, 48, true);
+    TestIndependentPutPool(2, 2, false);
+    TestInvalidPutPoolRejectedBeforeTransportCreation();
+#endif
     std::cout << "fused BatchGet host lifecycle tests passed (mock transport only)\n";
     return 0;
   } catch (const std::exception& error) {

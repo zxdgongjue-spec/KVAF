@@ -273,7 +273,11 @@ void LogBatchGetDeviceStatus(const BatchGetExecutionState& execution,
 }  // namespace
 
 struct DefaultAccessOperator::Impl {
-  explicit Impl(AccessOperatorConfig init_config) : config(std::move(init_config)) {}
+  explicit Impl(AccessOperatorConfig init_config) : config(std::move(init_config)) {
+    if (config.batch_put_npu_core_count == 0U) {
+      config.batch_put_npu_core_count = config.npu_core_count;
+    }
+  }
 
   AccessOperatorConfig config;
   RemoteRegionDesc remote_region;
@@ -328,7 +332,8 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
   }
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   if (!impl_->config.batch_put_kernel_object_path.empty() &&
-      (impl_->config.npu_core_count > KVAF_AIV_BATCH_PUT_MAX_AIV_CORES ||
+      (impl_->config.batch_put_npu_core_count == 0U ||
+       impl_->config.batch_put_npu_core_count > KVAF_AIV_BATCH_PUT_MAX_AIV_CORES ||
        impl_->config.jettys_per_core >
            KVAF_AIV_BATCH_PUT_MAX_JETTYS_PER_CORE)) {
     return InvalidArgument("invalid BatchPut transport configuration");
@@ -380,8 +385,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
   }
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   if (!impl_->config.batch_put_kernel_object_path.empty()) {
-    if (impl_->config.npu_core_count > KVAF_AIV_BATCH_PUT_MAX_AIV_CORES ||
-        KvafExecuteBatchPutLoadKernel(
+    if (KvafExecuteBatchPutLoadKernel(
             impl_->config.batch_put_kernel_object_path.c_str()) !=
             KVAF_BATCH_PUT_SUCCESS) {
       return Internal("failed to load BatchPut kernel");
@@ -391,10 +395,10 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     const int32_t batch_put_result = impl_->config.local_host_ddr
         ? KvafBatchPutTransportCreateLocalHost(
               reinterpret_cast<void*>(remote_region.base), remote_region.length,
-              impl_->config.npu_core_count, impl_->config.jettys_per_core, &batch_put_transport)
+              impl_->config.batch_put_npu_core_count, impl_->config.jettys_per_core, &batch_put_transport)
         : KvafBatchPutTransportCreateWithPeerLink(
               reinterpret_cast<void*>(remote_region.base), remote_region.length,
-              impl_->config.npu_core_count, impl_->config.jettys_per_core,
+              impl_->config.batch_put_npu_core_count, impl_->config.jettys_per_core,
               impl_->config.peer_link.get(), impl_->config.peer_local_eid.data(), &batch_put_transport);
     impl_->batch_put_transport = batch_put_transport;
     if (batch_put_result != KVAF_BATCH_PUT_SUCCESS ||
@@ -403,7 +407,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     }
     BatchPutExecutionState batch_put_execution;
     Status batch_put_status = InitializeBatchPutExecutionState(
-        impl_->config.npu_core_count, &batch_put_execution);
+        impl_->config.batch_put_npu_core_count, &batch_put_execution);
     if (!batch_put_status.ok()) {
       return batch_put_status;
     }
@@ -413,7 +417,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
                  "[KVAF_AIV] RUNTIME_BATCH_PUT_TRANSPORT_READY cores=%u "
                  "jettys_per_core=%u "
                  "metadata_staging=reusable\n",
-                 impl_->config.npu_core_count,
+                 impl_->config.batch_put_npu_core_count,
                  impl_->config.jettys_per_core);
   }
 #endif
@@ -758,7 +762,7 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
     arguments.core_status = PointerValue(execution.core_status);
     arguments.input_bytes = exec.request->input.bytes;
     arguments.row_count = static_cast<std::uint32_t>(rows);
-    arguments.aiv_core_count = impl_->config.npu_core_count;
+    arguments.aiv_core_count = impl_->config.batch_put_npu_core_count;
 
     for (KvafBatchPutCoreStatus& core_status : execution.host_core_status) {
       core_status = KvafBatchPutCoreStatus{};
@@ -770,7 +774,7 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
         static_cast<std::uint32_t>(execution.host_core_status.size()));
     KvafBatchPutLocalBufferRelease(local_buffer);
     if (result != KVAF_BATCH_PUT_SUCCESS) {
-      LogBatchPutDeviceStatus(execution, impl_->config.npu_core_count, result);
+      LogBatchPutDeviceStatus(execution, impl_->config.batch_put_npu_core_count, result);
       return Internal("AIV Direct-HCCP BatchPut execution failed");
     }
     return Status::OK();

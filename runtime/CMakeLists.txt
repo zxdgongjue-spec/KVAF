@@ -33,6 +33,7 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
       ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/../access_operator/demo/aiv_batch_get/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/../access_operator/demo/aiv_batch_put/include
       ${ASCEND_CANN_PACKAGE_PATH}/include)
   target_link_libraries(kvaf_npu_runtime
     PUBLIC kvaf_runtime

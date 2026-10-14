@@ -55,6 +55,9 @@ struct AccessOperatorConfig {
   std::shared_ptr<PeerLink> peer_link;
   // Register Runtime-owned DDR through the in-process RA host endpoint.
   bool local_host_ddr{false};
+  // Zero inherits npu_core_count for compatibility with existing callers.
+  // Eager Put setup/seed can use a smaller pool than performance Get launches.
+  std::uint32_t batch_put_npu_core_count{0};
 };
 
 struct BatchGetKernelProfile {

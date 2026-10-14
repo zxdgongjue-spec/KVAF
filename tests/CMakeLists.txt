@@ -64,18 +64,36 @@ add_executable(kvaf_fused_batch_get_context_test
   ../access_operator/src/access_operator.cc)
 target_include_directories(kvaf_fused_batch_get_context_test PRIVATE
   fused_context_stubs
-  ../access_operator/demo/aiv_batch_get/include)
+  ../access_operator/demo/aiv_batch_get/include
+  ../access_operator/demo/aiv_batch_put/include)
 target_link_libraries(kvaf_fused_batch_get_context_test PRIVATE
   kvaf_runtime kvaf_meta_manager kvaf_peer_link)
 add_test(NAME kvaf_fused_batch_get_context_host
   COMMAND kvaf_fused_batch_get_context_test)
+
+# Exercise the same real operator with both Get and Put fake transports. The
+# small Put pool must not change leased Get geometry or DDR teardown ownership.
+add_executable(kvaf_independent_batch_put_context_test
+  fused_batch_get_context_test.cc
+  ../access_operator/src/access_operator.cc)
+target_include_directories(kvaf_independent_batch_put_context_test PRIVATE
+  fused_context_stubs
+  ../access_operator/demo/aiv_batch_get/include
+  ../access_operator/demo/aiv_batch_put/include)
+target_compile_definitions(kvaf_independent_batch_put_context_test PRIVATE
+  KVAF_ENABLE_AIV_BATCH_PUT=1)
+target_link_libraries(kvaf_independent_batch_put_context_test PRIVATE
+  kvaf_runtime kvaf_meta_manager kvaf_peer_link)
+add_test(NAME kvaf_independent_batch_put_context_host
+  COMMAND kvaf_independent_batch_put_context_test)
 
 # Also compile the NpuRuntime forwarding API against the same declarations;
 # this is a host syntax check and deliberately has no runtime/device backend.
 add_library(kvaf_fused_npu_runtime_syntax OBJECT ../runtime/src/npu_runtime.cc)
 target_include_directories(kvaf_fused_npu_runtime_syntax PRIVATE
   fused_context_stubs
-  ../access_operator/demo/aiv_batch_get/include)
+  ../access_operator/demo/aiv_batch_get/include
+  ../access_operator/demo/aiv_batch_put/include)
 target_link_libraries(kvaf_fused_npu_runtime_syntax PRIVATE kvaf_runtime)
 
 add_executable(kvaf_batch_get_device_control_test

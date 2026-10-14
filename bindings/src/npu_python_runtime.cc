@@ -174,7 +174,8 @@ class NpuPythonRuntime final {
                    std::uint32_t device_id, std::uint32_t npu_core_count,
                    std::string batch_put_kernel_object_path,
                    std::uint32_t jettys_per_core, bool local_host_ddr,
-                   std::string local_ddr_page_mode) {
+                   std::string local_ddr_page_mode,
+                   std::uint32_t batch_put_npu_core_count) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
                               batch_get_tokens_per_block};
@@ -185,6 +186,7 @@ class NpuPythonRuntime final {
     options.jettys_per_core = jettys_per_core;
     options.local_host_ddr = local_host_ddr;
     options.local_ddr_page_mode = std::move(local_ddr_page_mode);
+    options.batch_put_npu_core_count = batch_put_npu_core_count;
     native_ = std::make_unique<::kvaf::NpuRuntime>(std::move(options));
   }
 
@@ -215,6 +217,7 @@ class NpuPythonRuntime final {
   bool Initialized() const { return native_->initialized(); }
   std::uint32_t DeviceId() const { return native_->device_id(); }
   std::uint32_t NpuCoreCount() const { return native_->npu_core_count(); }
+  std::uint32_t BatchPutNpuCoreCount() const { return native_->batch_put_npu_core_count(); }
   std::uint32_t JettysPerCore() const { return native_->jettys_per_core(); }
   bool LocalHostDdr() const { return native_->local_host_ddr(); }
   std::uint32_t BatchGetTokenBytes() const {
@@ -581,14 +584,16 @@ void BindNpuPythonRuntime(py::module_& module) {
 
   py::class_<NpuPythonRuntime>(module, "NpuRuntime")
       .def(py::init<std::string, std::uint32_t, std::uint32_t, std::uint32_t,
-                    std::uint32_t, std::string, std::uint32_t, bool, std::string>(),
+                    std::uint32_t, std::string, std::uint32_t, bool, std::string,
+                    std::uint32_t>(),
            py::arg("batch_get_kernel_object_path"),
            py::arg("batch_get_token_bytes"),
            py::arg("batch_get_tokens_per_block"), py::arg("device_id") = 0,
            py::arg("npu_core_count") = 1,
            py::arg("batch_put_kernel_object_path") = "",
            py::arg("jettys_per_core") = 2, py::arg("local_host_ddr") = false,
-           py::arg("local_ddr_page_mode") = "thp")
+           py::arg("local_ddr_page_mode") = "thp",
+           py::arg("batch_put_npu_core_count") = 0)
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
            "Connect this NPU Runtime to a CPU Runtime service before initialize.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),
@@ -613,6 +618,7 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def_property_readonly("initialized", &NpuPythonRuntime::Initialized)
       .def_property_readonly("device_id", &NpuPythonRuntime::DeviceId)
       .def_property_readonly("npu_core_count", &NpuPythonRuntime::NpuCoreCount)
+      .def_property_readonly("batch_put_npu_core_count", &NpuPythonRuntime::BatchPutNpuCoreCount)
       .def_property_readonly("jettys_per_core", &NpuPythonRuntime::JettysPerCore)
       .def_property_readonly("local_host_ddr", &NpuPythonRuntime::LocalHostDdr)
       .def_property_readonly("batch_get_token_bytes",

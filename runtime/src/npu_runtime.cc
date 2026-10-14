@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "batch_get_abi.h"
+#include "batch_put_abi.h"
 #include "access_operator.h"
 #include "peer_link.h"
 #include "meta_manager.h"
@@ -394,6 +395,8 @@ struct NpuRuntime::Impl {
     config.batch_get_kernel_object_path = options.batch_get_kernel_object_path;
     config.batch_put_kernel_object_path = options.batch_put_kernel_object_path;
     config.npu_core_count = options.npu_core_count;
+    config.batch_put_npu_core_count = options.batch_put_npu_core_count == 0U
+        ? options.npu_core_count : options.batch_put_npu_core_count;
     config.jettys_per_core = options.jettys_per_core;
     config.local_host_ddr = options.local_host_ddr;
   }
@@ -425,6 +428,8 @@ struct NpuRuntime::Impl {
 NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {
   if (impl_->config.batch_get_kernel_object_path.empty() || impl_->options.npu_core_count == 0U ||
       impl_->options.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
+      impl_->config.batch_put_npu_core_count == 0U ||
+      impl_->config.batch_put_npu_core_count > KVAF_AIV_BATCH_PUT_MAX_AIV_CORES ||
       impl_->options.jettys_per_core == 0U ||
       impl_->options.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
       impl_->options.batch_get_token_bytes == 0U ||
@@ -532,7 +537,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
         const std::uint64_t probe_bytes =
             std::min<std::uint64_t>(slot_size, kBatchPutProbeBytesPerRow);
         const std::uint64_t probe_rows = BatchPutStartupProbeRows(
-            ddr_bytes, slot_size, impl_->options.npu_core_count,
+            ddr_bytes, slot_size, impl_->config.batch_put_npu_core_count,
             impl_->options.jettys_per_core);
         const std::uint64_t probe_total_bytes = probe_rows * probe_bytes;
         aclrtStream stream = nullptr;
@@ -564,7 +569,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                        static_cast<unsigned long long>(probe_rows),
                        static_cast<unsigned long long>(probe_bytes),
                        static_cast<unsigned long long>(probe_total_bytes),
-                       impl_->options.npu_core_count, impl_->options.jettys_per_core);
+                       impl_->config.batch_put_npu_core_count, impl_->options.jettys_per_core);
           last = impl_->runtime_core->BatchPut(
               BatchPutRequest{probe_keys,
                               ConstBufferView{impl_->probe_buffer,
@@ -628,6 +633,9 @@ const RuntimeCore& NpuRuntime::core() const {
 }
 std::uint32_t NpuRuntime::device_id() const { return impl_->options.device_id; }
 std::uint32_t NpuRuntime::npu_core_count() const { return impl_->options.npu_core_count; }
+std::uint32_t NpuRuntime::batch_put_npu_core_count() const {
+  return impl_->config.batch_put_npu_core_count;
+}
 std::uint32_t NpuRuntime::jettys_per_core() const { return impl_->options.jettys_per_core; }
 std::uint32_t NpuRuntime::batch_get_token_bytes() const {
   return impl_->options.batch_get_token_bytes;

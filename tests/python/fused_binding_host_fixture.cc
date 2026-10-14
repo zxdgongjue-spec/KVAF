@@ -59,7 +59,14 @@ bool NpuRuntime::initialized() const { return impl_->initialized; }
 RuntimeCapabilities NpuRuntime::capabilities() const { return {}; }
 std::uint32_t NpuRuntime::device_id() const { return impl_->options.device_id; }
 std::uint32_t NpuRuntime::npu_core_count() const { return impl_->options.npu_core_count; }
+std::uint32_t NpuRuntime::batch_put_npu_core_count() const {
+  return impl_->options.batch_put_npu_core_count == 0U
+      ? npu_core_count() : impl_->options.batch_put_npu_core_count;
+}
 std::uint32_t NpuRuntime::jettys_per_core() const { return impl_->options.jettys_per_core; }
+bool NpuRuntime::local_host_ddr() const { return impl_->options.local_host_ddr; }
+std::string NpuRuntime::local_ddr_page_mode() const { return impl_->options.local_ddr_page_mode; }
+LocalHostDdrStats NpuRuntime::local_ddr_page_stats() const { return {}; }
 std::uint32_t NpuRuntime::batch_get_token_bytes() const {
   return impl_->options.batch_get_token_bytes;
 }

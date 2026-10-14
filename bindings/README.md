@@ -36,11 +36,17 @@ output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数�
 
 `NpuRuntime(batch_get_kernel_object_path, batch_get_token_bytes,
 batch_get_tokens_per_block, device_id=0, npu_core_count=1,
-batch_put_kernel_object_path="", jettys_per_core=2)` 要求显式传入单 token KV
+batch_put_kernel_object_path="", jettys_per_core=2, local_host_ddr=False,
+local_ddr_page_mode="thp", batch_put_npu_core_count=0)` 要求显式传入单 token KV
 字节数和每个 KV block 中的 token 数，两个参数均无默认值；
 每个 AccessTable entry 大小为两者乘积。
 `jettys_per_core` 参数同时
 配置 BatchGet 和 BatchPut 每个 AIV core 使用的 Jetty 数量，可选 1 或 2 个独立 Jetty。
+`npu_core_count` 配置 BatchGet 与 fused Get lease 的 worker 数；
+`batch_put_npu_core_count` 可独立配置 eager BatchPut 的 worker 数，范围为 1..48。
+默认值 0 沿用 `npu_core_count`，保持旧调用行为。只读属性
+`runtime.batch_put_npu_core_count` 返回实际 Put worker 数。扩大性能 Get worker 池时，
+可显式保持 seed Put 的既有 worker 数，例如 Get 为 30、Put 为 batch size。
 远程 CPU DDR 只增加 `runtime.link_to("CPU_IP:port")`，必须在 `initialize` 前调用；
 EID、UMDK device 与候选 RMA 验证由 C++ Runtime 自动完成，Python 不传递这些硬件细节。
 `batch_put(keys, packed_input, input_offsets, lengths, stream=None)` 接收 caller-owned
