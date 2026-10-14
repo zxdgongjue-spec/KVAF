@@ -349,6 +349,10 @@ class NpuPythonRuntime final {
       item["post_active_cycles"] = profile.post_active_cycles;
       item["drain_wait_cycles"] = profile.drain_wait_cycles;
       item["peak_submitted_not_drained"] = profile.peak_submitted_not_drained;
+      item["post_stage_profile_enabled"] = profile.post_stage_profile_enabled;
+      item["wqe_fill_cycles"] = profile.wqe_fill_cycles;
+      item["mte_copy_cycles"] = profile.mte_copy_cycles;
+      item["doorbell_cycles"] = profile.doorbell_cycles;
       item["jetty_completion_wait_cycles"] =
           profile.jetty_completion_wait_cycles;
       item["jetty_completion_polls"] = profile.jetty_completion_polls;

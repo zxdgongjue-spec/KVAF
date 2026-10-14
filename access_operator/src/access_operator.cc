@@ -607,6 +607,10 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
     destination.post_active_cycles = source.post_active_cycles;
     destination.drain_wait_cycles = source.drain_wait_cycles;
     destination.peak_submitted_not_drained = source.peak_submitted_not_drained;
+    destination.post_stage_profile_enabled = source.post_stage_profile_enabled;
+    destination.wqe_fill_cycles = source.wqe_fill_cycles;
+    destination.mte_copy_cycles = source.mte_copy_cycles;
+    destination.doorbell_cycles = source.doorbell_cycles;
     for (std::size_t jetty = 0;
          jetty < destination.jetty_completion_wait_cycles.size(); ++jetty) {
       destination.jetty_completion_wait_cycles[jetty] =

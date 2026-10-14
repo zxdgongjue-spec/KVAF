@@ -306,6 +306,12 @@ Jetty，则不会产生足够 post 使用所有配置路径。
 `batch_get_mode` 字段标明所测版本，也可用 `KVAF_BATCH_GET_MODE` 设置默认值。
 完整命令见 [BatchGet 性能测试说明](access_operator/demo/aiv_batch_get/README.md#batchget-variant-miss-count-performance-sweep)。
 
+`no-pipeline` 开启 `--kernel-profile` 后还会输出 WQE 填充、MTE3 拷贝和
+doorbell 三阶段耗时。miss-count sweep 默认开启 profiling，汇总表和 CSV 会
+自动包含三阶段的 mean/p50/p90/p99（微秒）。耗时按每核单次调用内所有 post
+累计，再取核间最大值，包含同步和计时开销；CQ 等待单独统计。此扩展使用 V4
+状态布局，需通过 `./build.sh npu` 一起重编 host、Python binding 和 kernel。
+
 `link_to()` 必须先于 `initialize()` 调用。调用方需要在 BatchGet 所在 stream 完成前保持
 输入/输出 Tensor 和 `DeviceAccessTable` 有效；Runtime 只管理内部 DDR、元数据和内部
 传输资源。

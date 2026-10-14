@@ -18,6 +18,9 @@ namespace aiv_model {
 alignas(64) inline uint8_t ub[160 * 1024];
 inline uint32_t core = 0;
 inline uint64_t cycle = 0;
+inline uint64_t timestamp_reads = 0;
+// Synthetic costs only: expose misplaced stage boundaries in the CPU model.
+inline constexpr uint64_t fill_cycles = 11, copy_cycles = 17, doorbell_cycles = 5;
 enum class PostStage { Fill, Copy, Doorbell };
 inline std::vector<PostStage> post_trace;
 void Poll(void* address);
@@ -45,6 +48,7 @@ inline uintptr_t get_imm(uint32_t offset) {
 }
 inline void copy_ubuf_to_gm_align_v2(float* dst, float* src, uint64_t config, uint64_t) {
   aiv_model::post_trace.push_back(aiv_model::PostStage::Copy);
+  aiv_model::cycle += aiv_model::copy_cycles;
   std::memcpy(dst, src, config >> 25U);
 }
 inline void st_dev(uint32_t value, uint32_t* address, int) {
@@ -53,7 +57,10 @@ inline void st_dev(uint32_t value, uint32_t* address, int) {
 
 namespace AscendC {
 inline uint32_t GetBlockIdx() { return aiv_model::core; }
-inline uint64_t GetSystemCycle() { return ++aiv_model::cycle; }
+inline uint64_t GetSystemCycle() {
+  ++aiv_model::timestamp_reads;
+  return ++aiv_model::cycle;
+}
 enum class CacheLine { SINGLE_CACHE_LINE };
 enum class DcciDst { CACHELINE_OUT };
 template <typename T> struct GlobalTensor {
@@ -70,6 +77,7 @@ struct Dim3 { uint32_t x, y, z; };
 template <auto Function, typename... Args>
 void VF_CALL(Dim3 dim, Args... args) {
   aiv_model::post_trace.push_back(aiv_model::PostStage::Fill);
+  aiv_model::cycle += aiv_model::fill_cycles;
   for (threadIdx.x = 0; threadIdx.x < dim.x; ++threadIdx.x) Function(args...);
 }
 }  // namespace Simt

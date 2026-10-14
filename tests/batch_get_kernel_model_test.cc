@@ -41,6 +41,7 @@ void Doorbell(uint32_t value, uint32_t* address) {
     }
     if (address != &queue.sq_db) continue;
     post_trace.push_back(PostStage::Doorbell);
+    cycle += doorbell_cycles;
     ++doorbells;
     const uint32_t added = value - queue.sq_db;
     CHECK(added > 0 && added <= 128);
@@ -179,7 +180,9 @@ struct Fixture {
     for (uint32_t c = 0; c < cores; ++c) {
       aiv_model::core = c;
       aiv_model::post_trace.clear();
-      KvafExecuteBatchGetAivKernelV3(args);
+      const auto reads_before = aiv_model::timestamp_reads;
+      KvafExecuteBatchGetAivKernelV4(args);
+      if (!profiling) CHECK(aiv_model::timestamp_reads == reads_before);
       if (!KVAF_BATCH_GET_PIPELINED) {
         // Every post must finish fill -> one/two SQ copies -> doorbell before
         // another fill, including SQ wrap and queue-full/error launches.
@@ -195,6 +198,22 @@ struct Fixture {
       CHECK(statuses[c].result == expected);
       if (expected || !profiling) continue;
       const auto& profile = statuses[c].profile;
+      CHECK(profile.post_stage_profile_enabled == !KVAF_BATCH_GET_PIPELINED);
+      if (!KVAF_BATCH_GET_PIPELINED) {
+        using Stage = aiv_model::PostStage;
+        const auto& trace = aiv_model::post_trace;
+        const auto fills = std::count(trace.begin(), trace.end(), Stage::Fill);
+        const auto copies = std::count(trace.begin(), trace.end(), Stage::Copy);
+        CHECK(profile.total_posts == static_cast<uint64_t>(fills));
+        CHECK(profile.wqe_fill_cycles == fills * (aiv_model::fill_cycles + 1));
+        CHECK(profile.mte_copy_cycles == copies * aiv_model::copy_cycles + fills);
+        CHECK(profile.doorbell_cycles == fills * (aiv_model::doorbell_cycles + 1));
+        CHECK(profile.wqe_fill_cycles + profile.mte_copy_cycles + profile.doorbell_cycles
+              <= profile.post_active_cycles);
+      } else {
+        CHECK(profile.wqe_fill_cycles == 0 && profile.mte_copy_cycles == 0 &&
+              profile.doorbell_cycles == 0);
+      }
       CHECK(profile.submitted_group_count == profile.completed_group_count);
       CHECK(profile.kernel_start_cycle <= profile.setup_done_cycle);
       CHECK(profile.setup_done_cycle <= profile.post_done_cycle);

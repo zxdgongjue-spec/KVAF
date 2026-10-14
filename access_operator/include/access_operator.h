@@ -82,6 +82,10 @@ struct BatchGetKernelProfile {
   std::uint64_t post_active_cycles{0};
   std::uint64_t drain_wait_cycles{0};
   std::uint64_t peak_submitted_not_drained{0};
+  std::uint64_t post_stage_profile_enabled{0};
+  std::uint64_t wqe_fill_cycles{0};
+  std::uint64_t mte_copy_cycles{0};
+  std::uint64_t doorbell_cycles{0};
 };
 
 // Default synchronous NPU data-plane implementation.

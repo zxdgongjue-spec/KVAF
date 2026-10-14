@@ -54,7 +54,7 @@ set(KVAF_KERNEL_INCLUDES
   "-I${ASCEND_CANN_PACKAGE_PATH}/tikcpp/tikcfw/impl"
   "-I${KVAF_AIV_DEMO_INCLUDE_DIR}")
 
-# Keep the 128-byte V3 ABI in both objects. The benchmark selects the object
+# Keep the 128-byte launch arguments and V4 status ABI in both objects. The benchmark selects the object
 # before Runtime initialization, so the timed path has no mode-switch overhead.
 function(kvaf_add_batch_get_kernel target object_name pipelined)
   set(KVAF_EXECUTE_KERNEL_TMP "${CMAKE_CURRENT_BINARY_DIR}/${target}.tmp.o")

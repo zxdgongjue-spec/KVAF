@@ -6,7 +6,7 @@
 // Shared host/AIV ABI for the graph-safe ExecuteBatchGet kernel.  These
 // records are copied verbatim between host code, HBM and the AIV kernel.
 enum {
-  KVAF_AIV_BATCH_GET_STATUS_BYTES = 1216,
+  KVAF_AIV_BATCH_GET_STATUS_BYTES = 1280,
   KVAF_AIV_BATCH_GET_QUEUE_STATE_BYTES = 64,
   KVAF_AIV_BATCH_GET_MAX_AIV_CORES = 48,
   KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE = 64,
@@ -44,6 +44,13 @@ typedef struct KvafBatchGetCoreProfile {
   uint64_t post_active_cycles;  // sum of group submissions, excluding CQ waits
   uint64_t drain_wait_cycles;   // sum of all group completion waits
   uint64_t peak_submitted_not_drained;  // conservative per-core software peak
+  // V4: no-pipeline stage totals, accumulated across all posts in this launch.
+  // Zero enabled means unavailable (pipelined kernel), not zero stage cost.
+  uint64_t post_stage_profile_enabled;
+  uint64_t wqe_fill_cycles;  // includes vector completion synchronization
+  uint64_t mte_copy_cycles; // includes all SQ copies and MTE3 completion wait
+  uint64_t doorbell_cycles; // scalar PI update + st_dev, excludes CQ waits
+  uint64_t reserved[4];     // retain a cache-line-aligned per-core stride
 } KvafBatchGetCoreProfile;
 
 // ExecuteBatchGet uses only the first cache line on the normal path. The
@@ -145,7 +152,7 @@ typedef struct KvafExecuteBatchGetKernelArgs {
 #if defined(__cplusplus)
 static_assert(sizeof(KvafBatchGetCoreStatus) == KVAF_AIV_BATCH_GET_STATUS_BYTES,
               "KvafBatchGetCoreStatus ABI changed");
-static_assert(sizeof(KvafBatchGetCoreProfile) == 1152,
+static_assert(sizeof(KvafBatchGetCoreProfile) == 1216,
               "KvafBatchGetCoreProfile ABI changed");
 static_assert(sizeof(KvafBatchGetQueueState) == KVAF_AIV_BATCH_GET_QUEUE_STATE_BYTES,
               "KvafBatchGetQueueState ABI changed");

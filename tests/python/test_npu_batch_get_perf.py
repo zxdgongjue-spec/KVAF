@@ -456,6 +456,16 @@ def print_kernel_profile(
 ) -> None:
     if not samples or any(len(sample) != npu_core_count for sample in samples):
         raise AssertionError("BatchGet kernel profile sample/core count mismatch")
+    post_stages = ("wqe_fill", "mte_copy", "doorbell") if batch_get_mode == "no-pipeline" else ()
+    if post_stages and any(
+        profile.get("post_stage_profile_enabled") != 1 or
+        any(f"{stage}_cycles" not in profile for stage in post_stages)
+        for sample in samples for profile in sample
+    ):
+        raise AssertionError(
+            "No-pipeline stage profiling is unavailable; rebuild the host, Python binding "
+            "and V4 kernels together, and select --batch-get-mode no-pipeline"
+        )
 
     def elapsed_ms(profile: dict[str, object], begin: str, end: str) -> float:
         return (int(profile[end]) - int(profile[begin])) / clock_mhz / 1000.0
@@ -469,6 +479,7 @@ def print_kernel_profile(
         "kernel_transfer_window": [],
         "kernel_completion_wait": [],
         "kernel_finalize": [],
+        **{f"kernel_{stage}": [] for stage in post_stages},
     }
     per_core: list[dict[str, float]] = [
         {
@@ -484,6 +495,7 @@ def print_kernel_profile(
             "completed_group_count": 0.0,
             "completion_count": 0.0,
             "peak_submitted_not_drained": 0.0,
+            **{f"{stage}_ms": 0.0 for stage in post_stages},
             **{
                 name: 0.0
                 for jetty in range(MAX_JETTYS_PER_CORE)
@@ -509,6 +521,7 @@ def print_kernel_profile(
             "kernel_transfer_window": 0.0,
             "kernel_completion_wait": 0.0,
             "kernel_finalize": 0.0,
+            **{f"kernel_{stage}": 0.0 for stage in post_stages},
         }
         for profile in sample:
             core = int(profile["core"])
@@ -544,6 +557,10 @@ def print_kernel_profile(
                 critical["kernel_finalize"], finalize
             )
             accumulator = per_core[core]
+            for stage in post_stages:
+                value = int(profile[f"{stage}_cycles"]) / clock_mhz / 1000.0
+                critical[f"kernel_{stage}"] = max(critical[f"kernel_{stage}"], value)
+                accumulator[f"{stage}_ms"] += value
             accumulator["total_ms"] += total
             accumulator["setup_ms"] += setup
             accumulator["compact_ms"] += compact
@@ -579,6 +596,16 @@ def print_kernel_profile(
         "peak_submitted_not_drained=per_core_conservative_software_count "
         "profile_overhead_included=1 d2h_outside_host_metric=1"
     )
+    if post_stages:
+        print(
+            "KERNEL_POST_STAGE_CONTRACT mode=no-pipeline "
+            "aggregation=max_per_core_sum_over_posts "
+            "wqe_fill=fill_and_vector_completion_wait "
+            "mte_copy=sq_copy_and_mte3_completion_wait "
+            "doorbell=scalar_pi_update_and_st_dev "
+            "cq_wait_excluded=1 synchronization_and_timer_overhead_included=1 "
+            "independent_stage_maxima_not_additive=1"
+        )
     total_useful_bytes = len(samples) * miss_count * token_bytes
     for stage, values in stage_samples.items():
         cycle_values = [value * clock_mhz * 1000.0 for value in values]

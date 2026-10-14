@@ -77,9 +77,16 @@ class MissSweepTests(unittest.TestCase):
                     "post_active_cycles": 1000 + core * 500,
                     "drain_wait_cycles": 2000 + core * 500,
                     "peak_submitted_not_drained": 4,
+                    "post_stage_profile_enabled": int(args.batch_get_mode == "no-pipeline"),
+                    "wqe_fill_cycles": (200 + core * 100) if args.miss_count else 0,
+                    "mte_copy_cycles": (400 - core * 100) if args.miss_count else 0,
+                    "doorbell_cycles": 50 if args.miss_count else 0,
                     "jetty_completion_wait_cycles": [0] * 64,
                     "jetty_completion_polls": [0] * 64,
                 }})
+            if os.environ.get("OMIT_POST_STAGE_PROFILE") == "1":
+                for profile in sample:
+                    profile.pop("post_stage_profile_enabled")
             perf.print_kernel_profile([sample], args.warmup,
                 args.kernel_profile_clock_mhz, args.aiv_cores, args.jettys_per_core,
                 args.request_length, args.miss_count, args.token_bytes,
@@ -145,6 +152,15 @@ class MissSweepTests(unittest.TestCase):
                 for row, count in zip(rows, (0, 64)):
                     self.assertEqual(row["address_mode"], mode)
                     self.assertEqual(row["batch_get_mode"], batch_get_mode)
+                    for stage, expected in (("wqe_fill", 0.6), ("mte_copy", 0.8), ("doorbell", 0.1)):
+                        for statistic in ("mean", "p50", "p90", "p99"):
+                            value = row[f"{stage}_{statistic}_us"]
+                            if batch_get_mode == "no-pipeline":
+                                self.assertEqual(float(value), expected if count else 0)
+                            else:
+                                self.assertEqual(value, "")
+                        self.assertEqual(f"stage=kernel_{stage}" in result.stdout,
+                                         batch_get_mode == "no-pipeline")
                     self.assertEqual(int(row["miss_count"]), count)
                     self.assertEqual(float(row["mean_us"]), 16)
                     self.assertEqual(float(row["p50_us"]), 16)
@@ -161,6 +177,14 @@ class MissSweepTests(unittest.TestCase):
                     self.assertEqual(fields["batch_get_mode"], batch_get_mode)
                     expected_gibps = count * 128 / (16 / 1_000_000) / (1024 ** 3)
                     self.assertAlmostEqual(float(fields["useful_GiBps"]), expected_gibps, places=3)
+
+    def test_old_profile_fails_without_zero_stage_fallback(self):
+        self.environment["EXPECTED_BATCH_GET_MODE"] = "no-pipeline"
+        self.environment["OMIT_POST_STAGE_PROFILE"] = "1"
+        result = self.run_sweep("--batch-get-mode", "no-pipeline")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("No-pipeline stage profiling is unavailable", result.stdout)
+        self.assertFalse((self.directory / "logs/batch_get_miss_sweep_summary.csv").exists())
 
     def test_invalid_modes_fail_before_launch(self):
         for options in (

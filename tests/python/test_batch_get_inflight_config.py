@@ -69,8 +69,8 @@ class InflightConfigTests(unittest.TestCase):
                 self.assertEqual(str(perf.batch_get_kernel_path(mode)),
                                  os.environ["KVAF_BATCH_GET_KERNEL"])
 
-    def test_profile_excludes_intermediate_waits_from_post(self):
-        profile = {
+    def profile(self):
+        return {
             "core": 0, "kernel_start_cycle": 10, "setup_done_cycle": 20,
             "compact_done_cycle": 20, "first_doorbell_cycle": 30,
             "post_done_cycle": 200, "completion_done_cycle": 220,
@@ -82,6 +82,9 @@ class InflightConfigTests(unittest.TestCase):
             "jetty_completion_wait_cycles": [100] + [0] * 63,
             "jetty_completion_polls": [3] + [0] * 63,
         }
+
+    def test_profile_excludes_intermediate_waits_from_post(self):
+        profile = self.profile()
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             perf.print_kernel_profile([[profile]], 0, 1000, 1, 1, 2049, 2049, 656)
@@ -93,6 +96,43 @@ class InflightConfigTests(unittest.TestCase):
         self.assertEqual(records["batch_get_kernel_post"]["mean_cycles"], "80.000")
         self.assertEqual(records["batch_get_kernel_completion_wait"]["mean_cycles"], "100.000")
         self.assertIn("peak_submitted_not_drained_mean=2048", output.getvalue())
+
+    def test_serial_stages_max_per_core_then_percentiles(self):
+        samples = []
+        for factor in (1, 3):
+            sample = []
+            for core, values in enumerate(((30, 5, 2), (10, 20, 4))):
+                profile = self.profile()
+                profile.update(core=core, post_stage_profile_enabled=1)
+                profile.update({f"{stage}_cycles": value * factor
+                                for stage, value in zip(("wqe_fill", "mte_copy", "doorbell"), values)})
+                sample.append(profile)
+            samples.append(sample)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            perf.print_kernel_profile(samples, 3, 500, 2, 1, 2049, 2049, 656,
+                                      batch_get_mode="no-pipeline")
+        records = {}
+        for line in output.getvalue().splitlines():
+            if line.startswith("PERF_RESULT "):
+                fields = dict(field.split("=", 1) for field in line.split()[1:])
+                records[fields["operation"]] = fields
+        for stage, maximum in (("wqe_fill", 30), ("mte_copy", 20), ("doorbell", 4)):
+            record = records[f"batch_get_kernel_{stage}"]
+            self.assertEqual(float(record["mean_cycles"]), 2 * maximum)
+            self.assertAlmostEqual(float(record["mean_us"]), 2 * maximum / 500)
+            self.assertAlmostEqual(float(record["p90_cycles"]), 2.8 * maximum)
+        self.assertIn("wqe_fill_ms_mean=0.000120", output.getvalue())
+        self.assertIn("independent_stage_maxima_not_additive=1", output.getvalue())
+
+    def test_serial_stages_require_new_kernel_and_binding(self):
+        for enabled in (None, 0, 1):
+            profile = self.profile()
+            if enabled is not None:
+                profile["post_stage_profile_enabled"] = enabled
+            with self.assertRaisesRegex(AssertionError, "rebuild"):
+                perf.print_kernel_profile([[profile]], 0, 1000, 1, 1, 2049, 2049, 656,
+                                          batch_get_mode="no-pipeline")
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ aclrtBinary aclrtCreateBinary(const void*, size_t) { return reinterpret_cast<voi
 int aclrtBinaryLoad(aclrtBinary binary, aclrtBinHandle* result) { *result = binary; return 0; }
 int aclrtDestroyBinary(aclrtBinary) { return 0; }
 int aclrtBinaryGetFunction(aclrtBinHandle binary, const char* name, aclrtFuncHandle* result) {
-  CHECK(std::strcmp(name, "KvafExecuteBatchGetAivKernelV3") == 0);
+  CHECK(std::strcmp(name, "KvafExecuteBatchGetAivKernelV4") == 0);
   *result = binary;
   return 0;
 }
@@ -72,5 +72,5 @@ int main() {
   lookup.table_capacity = lookup.output_rows = lookup.tokens_per_block = 1;
   CHECK(KvafExecuteBatchGetLaunch(&lookup, stream) == KVAF_BATCH_GET_SUCCESS);
   CHECK(launches == 2 && captured.remote_addresses == 0);
-  std::cout << "BatchGet V3 launcher raw/lookup ABI and rejection checks passed\n";
+  std::cout << "BatchGet V4 launcher raw/lookup ABI and rejection checks passed\n";
 }

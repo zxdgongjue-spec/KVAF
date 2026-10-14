@@ -156,6 +156,11 @@ completion_wait_p50_us_values=()
 completion_wait_p90_us_values=()
 completion_wait_p99_us_values=()
 selected_ub_device_values=()
+post_stage_names=(wqe_fill mte_copy doorbell)
+post_stage_statistics=(mean p50 p90 p99)
+# Flat shape-major, stage-major, statistic-major storage works with Bash 3.2.
+post_stage_us_values=()
+post_stage_width=$((${#post_stage_names[@]} * ${#post_stage_statistics[@]}))
 
 for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
   echo "BATCH_GET_TOKEN_SWEEP_BEGIN token_bytes=$token_bytes"
@@ -208,6 +213,27 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
           echo "ERROR: incomplete kernel profile results for token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core" >&2
           exit 1
         fi
+
+        post_stage_result_fields=()
+        for stage in "${post_stage_names[@]}"; do
+          stage_profile_result=""
+          if [[ "$batch_get_mode" == no-pipeline ]]; then
+            stage_profile_result="$(extract_profile_result "$log_file" "batch_get_kernel_$stage")"
+            if [[ -z "$stage_profile_result" ]]; then
+              echo "ERROR: missing no-pipeline $stage profile in $log_file; rebuild host, binding and kernels" >&2
+              exit 1
+            fi
+          fi
+          for statistic in "${post_stage_statistics[@]}"; do
+            stage_us=""
+            if [[ "$batch_get_mode" == no-pipeline ]]; then
+              stage_cycles="$(extract_field "$stage_profile_result" "${statistic}_cycles")"
+              stage_us="$(cycles_to_us "$stage_cycles")"
+              post_stage_result_fields+=("${stage}_${statistic}_us=$stage_us")
+            fi
+            post_stage_us_values+=("$stage_us")
+          done
+        done
 
         active_log="$log_file"
         if [[ "$adaptive_this_shape" == true ]]; then
@@ -331,6 +357,9 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
       "address_mode=$address_mode"
       "batch_get_mode=$batch_get_mode"
     )
+    if [[ "$batch_get_mode" == no-pipeline ]]; then
+      result+=("${post_stage_result_fields[@]}")
+    fi
     printf '%s\n' "${result[*]}"
         echo "BATCH_GET_CONFIG_SWEEP_DONE token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core"
       done
@@ -389,15 +418,39 @@ for index in "${!completion_wait_mean_us_values[@]}"; do
     "${completion_wait_p99_us_values[$index]}"
 done
 
+if [[ "$batch_get_mode" == no-pipeline ]]; then
+  for stage_index in "${!post_stage_names[@]}"; do
+    printf '\nBATCH_GET_MISS_SWEEP_STAGE_SUMMARY stage=kernel_%s\n' "${post_stage_names[$stage_index]}"
+    printf '%-12s %-12s %-12s %-18s %15s %15s %15s %15s\n' \
+      token_bytes miss_count aiv_cores jettys_per_core mean_us p50_us p90_us p99_us
+    for index in "${!mean_us_values[@]}"; do
+      stage_offset=$((index * post_stage_width + stage_index * ${#post_stage_statistics[@]}))
+      printf '%-12s %-12s %-12s %-18s %15s %15s %15s %15s\n' \
+        "${token_bytes_values[$index]}" "${miss_count_values[$index]}" \
+        "${aiv_core_values[$index]}" "${jettys_per_core_values[$index]}" \
+        "${post_stage_us_values[$stage_offset]}" \
+        "${post_stage_us_values[$((stage_offset + 1))]}" \
+        "${post_stage_us_values[$((stage_offset + 2))]}" \
+        "${post_stage_us_values[$((stage_offset + 3))]}"
+    done
+  done
+fi
+
 echo "BATCH_GET_MISS_SWEEP_CLOCK clock_mhz=$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ conversion=cycles_per_mhz_to_us"
 
 : "${KVAF_BATCH_GET_MISS_SWEEP_CSV:=$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR/batch_get_miss_sweep_summary.csv}"
 mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
 {
-  printf '%s\n' \
+  printf '%s' \
     'token_bytes,miss_count,aiv_cores,jettys_per_core,mean_us,p50_us,p90_us,p99_us,p50_GBps,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us,selected_ub_device,address_mode,batch_get_mode'
+  for stage in "${post_stage_names[@]}"; do
+    for statistic in "${post_stage_statistics[@]}"; do
+      printf ',%s_%s_us' "$stage" "$statistic"
+    done
+  done
+  printf '\n'
   for index in "${!mean_us_values[@]}"; do
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s' \
       "${token_bytes_values[$index]}" \
       "${miss_count_values[$index]}" \
       "${aiv_core_values[$index]}" \
@@ -418,6 +471,10 @@ mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
       "${selected_ub_device_values[$index]}" \
       "$address_mode" \
       "$batch_get_mode"
+    for ((stage_field = 0; stage_field < post_stage_width; ++stage_field)); do
+      printf ',%s' "${post_stage_us_values[$((index * post_stage_width + stage_field))]}"
+    done
+    printf '\n'
   done
 } >"$KVAF_BATCH_GET_MISS_SWEEP_CSV"
 echo "BATCH_GET_MISS_SWEEP_CSV_WRITTEN path=$KVAF_BATCH_GET_MISS_SWEEP_CSV rows=${#mean_us_values[@]}"

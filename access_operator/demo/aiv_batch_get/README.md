@@ -73,7 +73,7 @@ For graph use, warm up the output registration before capture. Keep the address
 arrays, output allocation and their addresses fixed, and update array contents
 and `miss_count` on the capture stream before replay. Raw mode needs no device
 AccessTable. Host, binding and kernel must be rebuilt together: the argument
-record is now 128 bytes and the launcher requires `KvafExecuteBatchGetAivKernelV3`.
+record is now 128 bytes and the launcher requires `KvafExecuteBatchGetAivKernelV4`.
 
 The local-memory lifetime is intentionally separate from the shared
 transport:
@@ -153,13 +153,13 @@ temporarily disabled in this branch.
 
 The ACL launcher reserves 160 KiB of AIV local memory for the two WQE banks and
 SIMT validation scratch. Rebuild Host, Python binding and Kernel together: the
-launcher now requires the `KvafExecuteBatchGetAivKernelV3` symbol.
+launcher now requires the `KvafExecuteBatchGetAivKernelV4` symbol.
 
 ### No-pipeline lookup variant
 
 The build also produces `bin/kvaf_execute_batch_get_no_pipeline_kernels.o`.
-It compiles the same source with `KVAF_BATCH_GET_PIPELINED=0`, preserving the
-128-byte V3 ABI. Each post uses one UB bank: fill up to 128 WQEs, wait for vector
+It compiles the same source with `KVAF_BATCH_GET_PIPELINED=0`, using the same
+128-byte launch arguments and V4 status ABI. Each post uses one UB bank: fill up to 128 WQEs, wait for vector
 completion, copy the bank into SQ with MTE3, wait for copy completion, then
 update PI and ring the doorbell. The next post's vector fill waits for that
 scalar commit. SQ wrap still uses two copies before the doorbell.
@@ -169,7 +169,46 @@ rotation, inflight budget, CQ signaling and profiling as `lookup`. It removes
 overlap among WQE fill, SQ copy and doorbell submission; it does not wait for a
 remote READ completion after every post or disable the two-group inflight
 scheduler. The launcher loads one object per process, so compare variants in
-separate benchmark runs. No Runtime or Python binding ABI change is needed.
+separate benchmark runs.
+
+### No-pipeline stage timing (V4)
+
+With `--batch-get-mode no-pipeline --kernel-profile`, the benchmark reports
+three additional `PERF_RESULT` operations:
+
+| Operation | Measured interval |
+| --- | --- |
+| `batch_get_kernel_wqe_fill` | WQE fill setup, table lookup and vector fill, through the V-to-S completion wait |
+| `batch_get_kernel_mte_copy` | MTE3 submission and UB-to-SQ copy, through the MTE3-to-S completion wait; includes both fragments on SQ wrap |
+| `batch_get_kernel_doorbell` | Scalar SQ PI update and `st_dev` doorbell submission, after the copy has finished |
+
+These are **per-call totals over all posts on each core**. Each sample takes
+the maximum core total for each stage, then reports mean/p50/p90/p99 in cycles,
+microseconds and milliseconds across the measured calls (warmup excluded).
+They are not per-WQE averages. Doorbell timing does not include remote READ
+completion or CQ polling; those remain in `kernel_completion_wait`.
+
+The miss-count sweep already enables `--kernel-profile`, so its existing
+`--batch-get-mode no-pipeline` command now prints three more stage summary
+tables automatically. Its result records and CSV add
+`wqe_fill_{mean,p50,p90,p99}_us`, `mte_copy_{mean,p50,p90,p99}_us` and
+`doorbell_{mean,p50,p90,p99}_us`. The pipeline modes leave these CSV fields empty
+because overlapping stages are not measured independently. Per-core counters
+are also available from `runtime.batch_get_kernel_profile()` as
+`wqe_fill_cycles`, `mte_copy_cycles` and `doorbell_cycles`, with
+`post_stage_profile_enabled=1` in the serial kernel's profile.
+
+Stage profiling adds scalar completion barriers and four clock reads per post.
+Reported timings include this synchronization and clock overhead. The ordinary
+non-profiled serial path does not add those barriers or clock reads. Stage sums
+need not equal `kernel_post`: that metric also covers scheduling and accounting,
+and independent stage maxima can come from different cores.
+
+Run `./build.sh npu` to rebuild the **host, Python binding and both kernels**.
+V4 extends the status stride from 1216 to 1280 bytes while retaining 128-byte
+launch arguments. The new `KvafExecuteBatchGetAivKernelV4` symbol prevents
+mixing incompatible host/kernel status layouts. The benchmark rejects missing
+stage counters instead of reporting unavailable measurements as zero.
 
 ## Build and validate on A5
 
