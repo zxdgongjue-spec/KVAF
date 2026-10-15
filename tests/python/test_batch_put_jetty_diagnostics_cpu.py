@@ -37,8 +37,12 @@ int main(int argc, char** argv) {
   kvaf::direct_hccp::LogBatchPutJettyState(
       mode == 7U ? nullptr : library,
       mode == 6U ? nullptr : reinterpret_cast<void*>(static_cast<std::uintptr_t>(mode)),
-      "device", 3U, 1U);
+      mode == 10U ? "host" : "device", 3U, 1U, mode == 10U);
   assert(errno == EDOM);
+  if (mode == 10U) {
+    const auto call_count = reinterpret_cast<unsigned int (*)()>(dlsym(library, "QueryCallCount"));
+    assert(call_count != nullptr && call_count() == 0U);
+  }
   dlclose(library);
 }
 ''')
@@ -54,7 +58,10 @@ struct JettyAttr {
   std::uint32_t reserved[2];
 };
 #ifndef NO_QUERY
+unsigned int query_calls = 0U;
+extern "C" unsigned int QueryCallCount() { return query_calls; }
 extern "C" int RaCtxQpQueryBatch(void* handles[], JettyAttr attributes[], unsigned int* count) {
+  ++query_calls;
   assert(handles != nullptr && attributes != nullptr && count != nullptr && *count == 1U);
   assert(attributes[0].mask == 0U && attributes[0].state == 0);
   const auto mode = reinterpret_cast<std::uintptr_t>(handles[0]);
@@ -114,3 +121,17 @@ def test_missing_optional_symbol_is_nonfatal(query_program):
                             check=True, capture_output=True, text=True)
     assert "availability=symbol_unavailable api_ret=not_called" in result.stderr
     assert "state_name=ready" not in result.stderr
+
+
+def test_peer_online_skips_unsupported_query_and_keeps_link_state_unknown(query_program):
+    executable, libraries = query_program
+    result = subprocess.run([str(executable), str(libraries["present"]), "10"],
+                            check=True, capture_output=True, text=True)
+    assert result.stdout == ""
+    assert result.stderr.count("BATCH_PUT_JETTY_STATE") == 1
+    assert "core=3 jetty=1 role=host api=RaCtxQpQueryBatch" in result.stderr
+    assert "query_status=unsupported_context context=peer_online link_state=unknown" in result.stderr
+    assert "api_ret=not_called" in result.stderr
+    assert "state_name=unavailable" not in result.stderr
+    assert "failed" not in result.stderr
+    assert "error" not in result.stderr

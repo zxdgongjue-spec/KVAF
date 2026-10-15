@@ -22,23 +22,10 @@ enum KvafBatchPutCoreResult {
   KVAF_BATCH_PUT_CORE_CQ_TIMEOUT = 7,
   KVAF_BATCH_PUT_CORE_CQ_ERROR = 8,
   KVAF_BATCH_PUT_CORE_INVALID_LENGTH = 9,
-  KVAF_BATCH_PUT_CORE_SQ_PUBLICATION_ERROR = 10,
-};
-
-// Scalar SQ publication uses 0..7 with its own marker in word 37. Legacy
-// one-row SGE snapshots have no SQ marker and remain distinguishable.
-static const uint64_t KVAF_BATCH_PUT_SQ_DIAGNOSTIC_MAGIC = 0x5351505542303031ULL;
-enum {
-  KVAF_BATCH_PUT_SQ_DIAGNOSTIC_MAGIC_WORD = 37,
-  KVAF_BATCH_PUT_SQ_DIAGNOSTIC_WORDS = 4,
-  KVAF_BATCH_PUT_SQ_DIAG_PUBLISHED_PI = 0,
-  KVAF_BATCH_PUT_SQ_DIAG_FIRST_CONTROL = 1,
-  KVAF_BATCH_PUT_SQ_DIAG_LAST_CONTROL = 2,
-  KVAF_BATCH_PUT_SQ_DIAG_MISMATCH_WORD = 3,
 };
 
 // CQ wait diagnostics use only existing reserved words: one version marker
-// followed by two 14-word queue records. SQ publication occupies 0..7 and 37.
+// followed by two 14-word queue records. The one-row SGE snapshot keeps 0..7.
 static const uint64_t KVAF_BATCH_PUT_CQ_DIAGNOSTIC_MAGIC = 0x4351444941473031ULL;
 enum {
   KVAF_BATCH_PUT_CQ_DIAGNOSTIC_MAGIC_WORD = 8,

@@ -39,9 +39,23 @@ inline const char* JettyDiagnosticStateName(std::int32_t state) {
 // contexts. The already-loaded production RA library remains caller-owned.
 inline void LogBatchPutJettyState(void* ra_library, void* jetty_handle,
                                  const char* role, std::uint32_t core,
-                                 std::uint32_t jetty_slot) {
+                                 std::uint32_t jetty_slot,
+                                 bool peer_online = false) {
   const int original_errno = errno;
   const char* role_name = role == nullptr ? "unknown" : role;
+  if (peer_online) {
+    // Public RA implementation: gRaPeerCtxOps.raCtxQueryQpBatch is NULL;
+    // QpQueryBatchParamCheck returns -EINVAL, converted to RDMA error 128103.
+    // This is query support for the peer-online context, not a link failure.
+    // The offline-HDC device context has its own supported query callback.
+    std::fprintf(stderr,
+                 "[KVAF_AIV] BATCH_PUT_JETTY_STATE core=%u jetty=%u role=%s "
+                 "api=RaCtxQpQueryBatch query_status=unsupported_context "
+                 "context=peer_online link_state=unknown api_ret=not_called\n",
+                 core, jetty_slot, role_name);
+    errno = original_errno;
+    return;
+  }
   const auto query = ra_library == nullptr ? nullptr :
       reinterpret_cast<QueryJettyDiagnosticFn>(dlsym(ra_library, "RaCtxQpQueryBatch"));
   if (jetty_handle == nullptr || query == nullptr) {
