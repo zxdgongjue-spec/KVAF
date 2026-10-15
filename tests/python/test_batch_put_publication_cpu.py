@@ -1,7 +1,8 @@
-"""Exercise actual Put publication helpers against a delayed DMA CPU model.
+"""Execute scalar Put publication against durable-memory and corruption models.
 
-The model checks queue/head/doorbell ordering and ring copies. It cannot prove
-that the publication change resolves a fabric or NPU failure.
+This checks the actual device helpers, including every WQE word, doorbell
+suppression on bad SQ contents, and owner publication across ring wrap.
+It does not assert that an NPU fabric failure is resolved.
 """
 from pathlib import Path
 import shutil
@@ -24,23 +25,22 @@ def test_actual_put_sq_and_producer_publication(tmp_path):
     if compiler is None:
         pytest.skip("C++ compiler unavailable")
     kernel = (DEMO / "kernel/execute_batch_put_aiv.asc").read_text()
-    structs = _between(kernel, "struct PreparedPost {", "__aicore__ inline void CleanCacheLines(")
-    clean = _between(kernel, "__aicore__ inline void CleanCacheLines(", "__aicore__ inline uint32_t WqeControl(")
-    copy = _between(kernel, "__aicore__ inline void CopyUbToGm(", "__simt_vf__")
-    publish = _between(kernel, "__aicore__ inline void CopyPreparedPostToSq(", "__aicore__ inline void PostBatchPutRequests(")
+    helpers = _between(kernel, "__aicore__ inline void CleanCacheLines(",
+                       "__aicore__ inline uint32_t BatchPutRequestsForJetty(")
+    assert "VF_CALL" not in kernel
+    assert "PIPE_MTE3" not in kernel
     source = r'''
 #include <array>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <vector>
 #include "batch_put_internal.h"
 #define __aicore__
 #define __gm__
-#define __ubuf__
-enum pipe_t { PIPE_V, PIPE_MTE3, PIPE_S, PIPE_ALL };
-using event_t = unsigned;
+enum pipe_t { PIPE_ALL };
 enum class CacheLine { SINGLE_CACHE_LINE };
 enum class DcciDst { CACHELINE_OUT };
 enum class MemDsbT { DDR };
@@ -49,105 +49,132 @@ template<typename T> struct GlobalTensor {
   void SetGlobalBuffer(T *p) { base=p; }
   T &operator[](uint64_t offset) { return base[offset]; }
 };
-constexpr uint32_t kWqeBytes = 64U;
-constexpr uint32_t kWqeBankBytes = 2048U;
-constexpr uint64_t kCacheLineBytes = 64U;
-alignas(64) uint8_t ub[4096];
-struct DmaCopy { uint8_t *destination; std::vector<uint8_t> data; };
-std::vector<DmaCopy> pending_dma;
-KvafBatchPutQueueState *current_queue;
-uint32_t *current_doorbell;
-uint64_t durable_head, clean_sequence, sync_sequence;
-uint32_t doorbells;
-std::array<std::array<std::array<unsigned,2>,4>,4> events;
-void *get_imm(uint32_t offset) { return ub+offset; }
-void wait_flag(pipe_t from, pipe_t to, event_t id) {
-  assert(events[from][to][id] != 0);
-  --events[from][to][id];
+constexpr uint32_t kWqeBytes=64, kWqesPerPost=32, kWriteOpcode=3;
+constexpr uint64_t kCacheLineBytes=64, kSuccess=0;
+constexpr uint32_t depth=64;
+alignas(64) uint32_t sq[2][depth][16];
+alignas(64) KvafBatchPutQueueState queues[2];
+uint32_t durable[2][depth][16], doorbell[2];
+uint64_t old_heads[2], expected_heads[2];
+uint64_t offsets[96], lengths[96], addresses[96];
+KvafBatchPutDirectUrmaEntity entities[2];
+unsigned calls, barriers, flushes, synced_flushes;
+int inject_word, inject_pass;
+bool injected;
+std::map<uintptr_t,unsigned> line_passes;
+std::array<uint32_t,16> expected[2][depth];
+void check_payload(uint32_t jetty,uint32_t ring,bool owner_valid) {
+  for(uint32_t word=0;word<16;++word)
+    assert(durable[jetty][ring][word]==
+        (expected[jetty][ring][word]^((word==0 && !owner_valid)?0x80000000U:0U)));
 }
-void set_flag(pipe_t from, pipe_t to, event_t id) {
-  ++events[from][to][id];
-}
-template<pipe_t pipe> void PipeBarrier() {
-  static_assert(pipe == PIPE_ALL);
-  for (auto &copy : pending_dma)
-    std::memcpy(copy.destination, copy.data.data(), copy.data.size());
-  pending_dma.clear();
-}
-void copy_ubuf_to_gm_align_v2(float *dst, float *src,
-                             uint64_t config0, uint64_t) {
-  const auto *bytes = reinterpret_cast<uint8_t *>(src);
-  pending_dma.push_back({reinterpret_cast<uint8_t *>(dst),
-                        std::vector<uint8_t>(bytes,bytes+(config0>>25U))});
-}
+template<pipe_t> void PipeBarrier() { ++barriers; }
 template<typename T, CacheLine, DcciDst>
 void DataCacheCleanAndInvalid(T &line) {
-  // Each AIV owns a complete 64-byte queue line. Model its writeback,
-  // including neighbors, so a PI-only overwrite cannot silently pass.
-  assert(reinterpret_cast<uint8_t *>(&line) ==
-         reinterpret_cast<uint8_t *>(current_queue));
-  durable_head=current_queue->sq_producer_index;
-  ++clean_sequence;
+  auto ptr=reinterpret_cast<uintptr_t>(&line);
+  for(uint32_t jetty=0;jetty<2;++jetty) {
+    auto lo=reinterpret_cast<uintptr_t>(sq[jetty]);
+    auto hi=lo+sizeof(sq[jetty]);
+    if(ptr>=lo && ptr<hi) {
+      const uint32_t ring=(ptr-lo)/64;
+      auto pass=++line_passes[ptr];
+      // A valid owner can be written only after every payload in this
+      // doorbell batch has reached the durable memory image.
+      if(pass==2 && !injected) {
+        uint64_t stop=expected_heads[jetty];
+        if(stop>old_heads[jetty]+32) stop=old_heads[jetty]+32;
+        for(uint64_t head=old_heads[jetty];head<stop;++head) {
+          const uint32_t slot=head%depth;
+          for(uint32_t word=1;word<16;++word)
+            assert(durable[jetty][slot][word]==expected[jetty][slot][word]);
+        }
+      }
+      if(!injected && inject_word>=0 && pass==static_cast<unsigned>(inject_pass)) {
+        sq[jetty][ring][inject_word]^=0x100U;
+        injected=true;
+      }
+      std::memcpy(durable[jetty][ring],sq[jetty][ring],64);
+      ++flushes;
+      return;
+    }
+    if(ptr==reinterpret_cast<uintptr_t>(&queues[jetty])) {
+      ++flushes;
+      return;
+    }
+  }
+  assert(false && "DCCI outside SQ or owned queue");
 }
-template<MemDsbT> void DataSyncBarrier() {
-  assert(pending_dma.empty());
-  sync_sequence=clean_sequence;
-}
-void st_dev(uint32_t value, uint32_t *address, int) {
-  assert(address==current_doorbell);
-  assert(pending_dma.empty());
-  assert(clean_sequence==doorbells+1);
-  assert(sync_sequence==clean_sequence);
-  assert(value==static_cast<uint32_t>(durable_head));
+template<MemDsbT> void DataSyncBarrier() { synced_flushes=flushes; }
+void st_dev(uint32_t value,uint32_t *address,int) {
+  uint32_t jetty=address==&doorbell[0]?0:1;
+  assert(address==&doorbell[jetty] && value<=expected_heads[jetty]);
+  assert(flushes==synced_flushes && barriers!=0);
+  for(uint64_t head=old_heads[jetty];head<value;++head)
+    check_payload(jetty,head%depth,true);
+  assert(queues[jetty].sq_producer_index==value);
   *address=value;
-  ++doorbells;
+  old_heads[jetty]=value;
+  ++calls;
 }
-''' + structs + clean + copy + publish + r'''
-void run(uint32_t bank, uint32_t head, uint32_t count, bool release_bank) {
-  constexpr uint32_t depth=64;
-  alignas(64) uint8_t sq[depth*kWqeBytes]={};
-  alignas(64) KvafBatchPutQueueState queue{};
-  uint32_t db=0;
-  current_queue=&queue; current_doorbell=&db;
-  queue.magic=0x4b564151U; queue.initialized=1;
-  queue.sq_producer_index=head; queue.cq_consumer_index=17;
-  queue.completed_batch_count=8; queue.last_error=0;
-  for(uint32_t i=0;i<3;++i) queue.reserved[i]=0xfeed0000U+i;
-  durable_head=head; clean_sequence=0; sync_sequence=0; doorbells=0;
-  pending_dma.clear(); events={};
-  for(uint32_t i=0;i<kWqeBankBytes;++i)
-    ub[bank*kWqeBankBytes+i]=static_cast<uint8_t>((i*13U+bank+1U)&255U);
-  set_flag(PIPE_V,PIPE_MTE3,bank);
-  PreparedPost prepared{
-    reinterpret_cast<uint64_t>(sq),reinterpret_cast<uint64_t>(&db),
-    reinterpret_cast<uint64_t>(&queue),head,head+count,depth,count,bank};
-  PendingPost pending{};
-  PreparePostMte3Stage(&prepared,release_bank,&pending);
-  // SQ data must be published before its producer is committed.
-  assert(pending_dma.empty());
-  for(uint32_t i=0;i<count*kWqeBytes;++i)
-    assert(sq[((head%depth)*kWqeBytes+i)%(depth*kWqeBytes)]==
-           ub[bank*kWqeBankBytes+i]);
-  assert(queue.sq_producer_index==head && doorbells==0);
-  CommitPostScalarStage(&pending);
-  assert(db==head+count && queue.sq_producer_index==head+count);
-  assert(doorbells==1 && durable_head==head+count);
-  assert(queue.magic==0x4b564151U && queue.initialized==1);
-  assert(queue.cq_consumer_index==17 && queue.completed_batch_count==8);
-  assert(queue.last_error==0);
-  for(uint32_t i=0;i<3;++i) assert(queue.reserved[i]==0xfeed0000U+i);
-  if(release_bank) wait_flag(PIPE_MTE3,PIPE_V,bank);
-  for(auto &from:events) for(auto &to:from) for(auto count:to) assert(count==0);
+''' + helpers + r'''
+void run(uint32_t head,uint32_t count,uint32_t jettys,int bad_word=-1,int bad_pass=1) {
+  std::memset(sq,0,sizeof(sq)); std::memset(durable,0,sizeof(durable));
+  std::memset(queues,0,sizeof(queues)); std::memset(entities,0,sizeof(entities));
+  calls=barriers=flushes=synced_flushes=0; inject_word=bad_word;
+  inject_pass=bad_pass; injected=false; line_passes.clear();
+  for(uint32_t j=0;j<2;++j) {
+    old_heads[j]=expected_heads[j]=head; queues[j].sq_producer_index=head;
+    queues[j].cq_consumer_index=17; queues[j].completed_batch_count=8;
+    entities[j].local_hbm_address=0x100000000ULL;
+    entities[j].sq_va=reinterpret_cast<uint64_t>(sq[j]);
+    entities[j].sq_db_va=reinterpret_cast<uint64_t>(&doorbell[j]);
+    entities[j].sq_depth=depth; entities[j].tp_id=0x123456;
+    entities[j].remote_token_id=0x1357; entities[j].remote_token_value=0xabcd;
+    entities[j].local_token_id=0x2468;
+    for(uint32_t k=0;k<16;++k) entities[j].remote_eid[k]=k;
+    doorbell[j]=head;
+  }
+  for(uint32_t i=0;i<count;++i) {
+    offsets[i]=i*83968ULL; lengths[i]=83968; addresses[i]=0x200000000ULL+i*83968ULL;
+    const uint32_t j=(i/32)%jettys;
+    const uint64_t pi=expected_heads[j]++;
+    const uint32_t post=i/32,total=(count+31)/32;
+    const bool completion=post+jettys>=total && ((i+1)%32==0 || i+1==count);
+    BuildBatchPutWqeWords(&entities[j],offsets[i],lengths[i],addresses[i],pi,
+                         completion,expected[j][pi%depth].data());
+    const auto &w=expected[j][pi%depth];
+    assert((w[0]&0xffffU)==pi%depth);
+    assert(((w[0]>>31)&1U)==(1U-((pi/depth)&1U)));
+    assert(w[1]==0x300 && w[2]==0x1123456 && w[3]==0x1357);
+    assert(w[8]==0xabcd && w[9]==0 && w[12]==83968 && w[13]==0x2468);
+    assert((uint64_t(w[15])<<32|w[14])==entities[j].local_hbm_address+offsets[i]);
+    assert((uint64_t(w[11])<<32|w[10])==addresses[i]);
+  }
+  KvafBatchPutCoreStatus status{}; uint64_t last=0, failed=UINT64_MAX;
+  const uint64_t result=PostBatchPutRequests(offsets,lengths,addresses,0,count,
+                                             jettys,entities,queues,&status,&last,&failed);
+  if(bad_word>=0) {
+    assert(failed!=UINT64_MAX);
+    assert(injected && result==KVAF_BATCH_PUT_CORE_SQ_PUBLICATION_ERROR);
+    assert(calls==0 && doorbell[0]==head && queues[0].sq_producer_index==head);
+    assert(status.reserved[KVAF_BATCH_PUT_SQ_DIAG_MISMATCH_WORD]!=0);
+  } else {
+    assert(result==0 && calls==(count+31)/32);
+    for(uint32_t j=0;j<jettys;++j) {
+      assert(old_heads[j]==expected_heads[j] && queues[j].sq_producer_index==expected_heads[j]);
+      assert(queues[j].cq_consumer_index==17 && queues[j].completed_batch_count==8);
+      if(expected_heads[j]!=head)
+        assert(status.reserved[j*4+KVAF_BATCH_PUT_SQ_DIAG_PUBLISHED_PI]==expected_heads[j]);
+    }
+  }
+  assert(status.reserved[KVAF_BATCH_PUT_SQ_DIAGNOSTIC_MAGIC_WORD]==KVAF_BATCH_PUT_SQ_DIAGNOSTIC_MAGIC);
 }
 int main() {
-  for(uint32_t bank=0;bank<2;++bank)
-    for(uint32_t count : {1U,5U,6U,8U,31U,32U}) {
-      run(bank,0,count,false);
-      run(bank,57,count,true);
-      run(bank,128,count,true);
-    }
-  assert(sizeof(KvafBatchPutQueueState)==64);
-  std::puts("BATCH_PUT_PUBLICATION_CPU_PASS cases=36 ring_wrap=1 ABI=64");
+  for(uint32_t j:{1U,2U}) for(uint32_t head:{0U,57U,128U})
+    for(uint32_t count:{1U,5U,8U,31U,32U,33U,63U}) run(head,count,j);
+  for(int word=0;word<16;++word) for(int pass=1;pass<=2;++pass) run(57,8,2,word,pass);
+  assert(sizeof(KvafBatchPutQueueState)==64 && sizeof(KvafBatchPutCoreStatus)==384);
+  std::puts("BATCH_PUT_SCALAR_PUBLICATION_CPU_PASS valid=42 corrupted=32 ring_wrap=1");
 }
 '''
     cpp = tmp_path / "put_publication.cpp"
@@ -158,4 +185,4 @@ int main() {
                    check=True, capture_output=True, text=True)
     result = subprocess.run([str(executable)], check=True, capture_output=True,
                             text=True)
-    assert "BATCH_PUT_PUBLICATION_CPU_PASS cases=36" in result.stdout
+    assert "BATCH_PUT_SCALAR_PUBLICATION_CPU_PASS valid=42 corrupted=32" in result.stdout

@@ -81,6 +81,23 @@ in round-robin order. Only the last WQE assigned to each used Jetty requests a
 CQE, and the kernel waits for one CQE from every used Jetty before reporting
 success. A core with at most one post uses only Jetty 0.
 
+## SQ publication
+
+The eager Put path uses scalar GM WQE stores, matching the CANN 9.1 PTO
+`urma_async_intrin.hpp::UrmaPostSend` publication mechanism. Each 64-byte WQE
+includes `sqeBbIdx = head % sq_depth` in DW0 bits 0..15. The kernel first
+writes its payload with an invalid owner, cleans the SQ cache line, and reads
+back all 16 words. It then publishes owners in reverse order, cleans the
+lines again, and verifies all 16 words before writing the SQ doorbell.
+A readback mismatch returns core result `10` and suppresses that post's
+doorbell. It never retries WQEs or increases the CQ deadline.
+
+This replaces the Put setup path's former SIMT/UB/MTE3 publication pipeline.
+Get kernels, worker counts and timed Get/fused paths are unchanged. Source
+contract checks, CPU corruption tests and successful CANN compilation do not
+prove the observed A5 timeout is resolved; the target-server Put and Get gates
+must pass before collecting performance results.
+
 ## Completion and errors
 
 `KvafExecuteBatchPutSync` performs kernel launch, stream synchronization,
@@ -112,19 +129,26 @@ Core `result` values:
 | `7` | CQ completion timeout. |
 | `8` | CQ status or sub-status reports an error. |
 | `9` | Reserved compatibility value; this kernel does not validate request lengths. |
+| `10` | Actual SQ WQE or persistent producer readback differs from its expected value; the current post doorbell was suppressed. |
 
-The kernel does not produce a request-level error index; for a normally written
-status, `failed_request_index` is `UINT64_MAX`. `sq_producer_index`,
+For a WQE readback mismatch, `failed_request_index` identifies the absolute
+request row. Other errors retain `UINT64_MAX`. `sq_producer_index`,
 `cq_consumer_index`,
 `cq_status`, `cq_sub_status`, `last_wqe_protocol` and `completed_batch_count`
 preserve queue diagnostics. The per-core status reports Jetty 0
 producer/consumer indices; each Jetty still maintains its own persistent queue
-state internally.
+state internally. Reserved words 0..7 contain two four-word SQ publication
+records (published PI, actual first/last control words, and 1-based mismatching
+WQE word; `UINT64_MAX` means producer readback mismatch). Reserved word 37
+contains the `SQPUB001` marker; legacy one-row SGE snapshots have no such
+marker. The status ABI remains 384 bytes.
 
 ## Logging
 
-Normal BatchPut execution prints only errors and the Runtime-level transport
-ready marker. The successful Direct-HCCP setup details (EID selection,
+Normal BatchPut execution prints the publication policy
+`publication=scalar_sq_dcci_verified_v1`, the Runtime transport-ready marker,
+and early SQ publication records for each used Jetty. Later records print
+on errors or when verbose lifecycle logging is enabled. The successful Direct-HCCP setup details (EID selection,
 contexts, tokens, MR registration, CQ/Jetty, CTP, imports, and local-buffer
 cache activity) are disabled by default.
 

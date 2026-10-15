@@ -19,6 +19,7 @@
 #include "direct_hccp/direct_hccp_abi.h"
 #include "direct_hccp/direct_hccp_remote_transport.h"
 #include "direct_hccp/direct_hccp_local_host.h"
+#include "direct_hccp/direct_hccp_jetty_diagnostics.h"
 #include "direct_hccp/direct_hccp_session.h"
 
 extern "C" int32_t KvafExecuteBatchPutLaunchInternal(
@@ -528,6 +529,8 @@ int32_t CreateBatchPutTransport(void *host_ddr, uint64_t host_ddr_bytes,
     goto failed;
   }
 
+  std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_PUBLICATION_POLICY publication=scalar_sq_dcci_verified_v1 "
+                       "sq_word_readback=all16 owner_last=1 get_path_unchanged=1\n");
   *transport = state;
   return KVAF_BATCH_PUT_SUCCESS;
 
@@ -668,6 +671,36 @@ extern "C" void KvafBatchPutLocalBufferRelease(KvafBatchPutLocalBuffer *local_bu
   --local_buffer->reference_count;
 }
 
+static void LogBatchPutPublicationDiagnostics(const KvafBatchPutCoreStatus *statuses,
+                                             uint32_t core_count,
+                                             uint32_t jettys_per_core) {
+  for (uint32_t core = 0U; core < core_count; ++core) {
+    const auto &status = statuses[core];
+    if (status.reserved[KVAF_BATCH_PUT_SQ_DIAGNOSTIC_MAGIC_WORD] !=
+        KVAF_BATCH_PUT_SQ_DIAGNOSTIC_MAGIC) continue;
+    for (uint32_t jetty = 0U; jetty < jettys_per_core; ++jetty) {
+      const uint64_t *record = status.reserved + jetty * KVAF_BATCH_PUT_SQ_DIAGNOSTIC_WORDS;
+      if (record[KVAF_BATCH_PUT_SQ_DIAG_PUBLISHED_PI] == 0U &&
+          record[KVAF_BATCH_PUT_SQ_DIAG_MISMATCH_WORD] == 0U) continue;
+      if (status.result == KVAF_BATCH_PUT_CORE_SUCCESS &&
+          record[KVAF_BATCH_PUT_SQ_DIAG_PUBLISHED_PI] > 32U &&
+          !hccp::VerboseLoggingEnabled()) continue;
+      std::fprintf(stderr,
+          "[KVAF_AIV] BATCH_PUT_SQ_PUBLICATION core=%u jetty=%u result=%llu "
+          "published_pi=%llu first_control=0x%llx last_control=0x%llx "
+          "mismatch_word_1based=%llu implementation=scalar_GM_DCCI_readback "
+          "all_16_words_verified=%u owner_published_last=1 "
+          "timing_scope=eager_put_setup_not_Get_performance\n",
+          core, jetty, static_cast<unsigned long long>(status.result),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_SQ_DIAG_PUBLISHED_PI]),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_SQ_DIAG_FIRST_CONTROL]),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_SQ_DIAG_LAST_CONTROL]),
+          static_cast<unsigned long long>(record[KVAF_BATCH_PUT_SQ_DIAG_MISMATCH_WORD]),
+          static_cast<unsigned int>(record[KVAF_BATCH_PUT_SQ_DIAG_MISMATCH_WORD] == 0U));
+    }
+  }
+}
+
 static void LogBatchPutCompletionDiagnostics(const KvafBatchPutCoreStatus *statuses,
                                             uint32_t core_count,
                                             uint32_t jettys_per_core) {
@@ -736,7 +769,7 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
                                             aclrtStream stream,
                                             KvafBatchPutCoreStatus *core_status,
                                             uint32_t core_status_count) {
-  hccp::VerboseLog("[KVAF_AIV] BATCH_PUT_PHASE phase=sync_enter local=%p args=%p stream=%p\n",
+  hccp::VerboseLog("[KVAF_AIV] BATCH_PUT_PHASE phase=sync_enter local=%p args=%p stream=%p publication=scalar_sq_dcci_verified_v1\n",
                    static_cast<void *>(local_buffer), static_cast<const void *>(arguments),
                    static_cast<void *>(stream));
   if (local_buffer == nullptr || local_buffer->reference_count == 0U ||
@@ -789,8 +822,28 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
                  static_cast<int>(status_copy_result));
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
+  LogBatchPutPublicationDiagnostics(core_status, core_status_count, transport->jettys_per_core);
   LogBatchPutCompletionDiagnostics(core_status, core_status_count,
                                     transport->jettys_per_core);
+  // Observe the hardware queue state before ownership is quarantined. These
+  // optional, read-only queries never replace the original Put result.
+  for (uint32_t core = 0U; core < core_status_count; ++core) {
+    if (core_status[core].result != KVAF_BATCH_PUT_CORE_CQ_TIMEOUT) continue;
+    for (uint32_t jetty = 0U; jetty < transport->jettys_per_core; ++jetty) {
+      const uint64_t *diagnostic = core_status[core].reserved +
+          KVAF_BATCH_PUT_CQ_DIAGNOSTIC_BASE_WORD +
+          jetty * KVAF_BATCH_PUT_CQ_DIAGNOSTIC_WORDS_PER_JETTY;
+      if (diagnostic[KVAF_BATCH_PUT_CQ_DIAG_ASSIGNED_ROWS] == 0U ||
+          diagnostic[KVAF_BATCH_PUT_CQ_DIAG_RESULT] != KVAF_BATCH_PUT_CORE_CQ_TIMEOUT) continue;
+      const uint32_t index = core * transport->jettys_per_core + jetty;
+      hccp::LogBatchPutJettyState(transport->api.library,
+          transport->workers[index].device_user_ctl_jetty.handle, "device", core, jetty);
+      if (transport->local_host) {
+        hccp::LogBatchPutJettyState(transport->api.library,
+            transport->local_host->workers[index].jetty.handle, "host", core, jetty);
+      }
+    }
+  }
   hccp::VerboseLog("[KVAF_AIV] BATCH_PUT_PHASE phase=status_validate_begin\n");
   for (uint32_t core = 0U; core < core_status_count; ++core) {
     const uint64_t begin = static_cast<uint64_t>(arguments->row_count) * core / core_status_count;
@@ -823,7 +876,9 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
                    static_cast<unsigned long long>(local_buffer->memory.registered_bytes),
                    local_buffer->memory.token_id);
       if (arguments->row_count == 1U && core_status_count == 1U &&
-          transport->jettys_per_core == 1U) {
+          transport->jettys_per_core == 1U &&
+          core_status[core].reserved[KVAF_BATCH_PUT_SQ_DIAGNOSTIC_MAGIC_WORD] !=
+              KVAF_BATCH_PUT_SQ_DIAGNOSTIC_MAGIC) {
         const uint64_t local_address = core_status[core].reserved[0];
         const uint64_t length = core_status[core].reserved[1];
         const auto &mr = local_buffer->memory;
