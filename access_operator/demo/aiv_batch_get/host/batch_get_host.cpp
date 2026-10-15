@@ -87,6 +87,7 @@ struct KvafBatchGetTransport {
   uint32_t worker_count{0};
   hccp::PeerLink *peer_link{nullptr};
   std::unique_ptr<hccp::LocalHostEndpoint> local_host;
+  bool retirement_started{false};
 };
 
 static std::string EidToHex(const std::array<uint8_t, hccp::kEidBytes> &eid) {
@@ -195,29 +196,46 @@ static bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_
   return true;
 }
 
-void ReleaseLocalBufferResources(KvafBatchGetTransport *transport, KvafBatchGetLocalBuffer *local) {
-  if (transport == nullptr || local == nullptr) return;
+bool ReleaseLocalBufferResources(KvafBatchGetTransport *transport, KvafBatchGetLocalBuffer *local) {
+  if (transport == nullptr || local == nullptr) return false;
+  if (local->memory.handle != nullptr) {
+    const int ret = transport->api.lmem_unregister && transport->device_context
+        ? transport->api.lmem_unregister(transport->device_context, local->memory.handle) : -1;
+    if (ret != 0) {
+      std::fprintf(stderr, "[KVAF_AIV] BATCH_GET_TEARDOWN_RETAINED phase=unregister_local_hbm "
+                           "core=all handle=%p ret=%d\n", local->memory.handle, ret);
+      return false;
+    }
+    local->memory.handle = nullptr;
+  }
+  if (local->token_handle != nullptr) {
+    const int ret = transport->api.token_free && transport->device_context
+        ? transport->api.token_free(transport->device_context, local->token_handle) : -1;
+    if (ret != 0) {
+      std::fprintf(stderr, "[KVAF_AIV] BATCH_GET_TEARDOWN_RETAINED phase=free_local_token "
+                           "core=all handle=%p ret=%d\n", local->token_handle, ret);
+      return false;
+    }
+    local->token_handle = nullptr;
+  }
   if (local->device_entities != nullptr) {
-    (void)aclrtFree(local->device_entities);
+    const aclError ret = aclrtFree(local->device_entities);
+    if (ret != ACL_SUCCESS) {
+      std::fprintf(stderr, "[KVAF_AIV] BATCH_GET_TEARDOWN_RETAINED phase=free_entity_table "
+                           "core=all handle=%p ret=%d\n", local->device_entities, static_cast<int>(ret));
+      return false;
+    }
     local->device_entities = nullptr;
     local->device_channel_entity = 0U;
   }
-  if (local->memory.handle != nullptr && transport->api.lmem_unregister != nullptr &&
-      transport->device_context != nullptr) {
-    (void)transport->api.lmem_unregister(transport->device_context, local->memory.handle);
-    local->memory.handle = nullptr;
-  }
-  if (local->token_handle != nullptr && transport->api.token_free != nullptr && transport->device_context != nullptr) {
-    (void)transport->api.token_free(transport->device_context, local->token_handle);
-    local->token_handle = nullptr;
-  }
+  return true;
 }
 
 bool AcquireLocalBuffer(KvafBatchGetTransport *transport, void *output_hbm, uint64_t output_hbm_bytes,
                         KvafBatchGetLocalBuffer **local_buffer, uint64_t *device_channel_entity) {
   if (transport == nullptr || output_hbm == nullptr || output_hbm_bytes == 0U || local_buffer == nullptr ||
       device_channel_entity == nullptr || transport->device_context == nullptr || transport->worker_count == 0U ||
-      transport->device_transport_token_value == 0U) {
+      transport->device_transport_token_value == 0U || transport->retirement_started) {
     return false;
   }
   const uint64_t output_address = reinterpret_cast<uint64_t>(output_hbm);
@@ -250,7 +268,10 @@ bool AcquireLocalBuffer(KvafBatchGetTransport *transport, void *output_hbm, uint
       !RegisterMemory(transport->api, transport->device_context, candidate->token_handle, token_id,
                       transport->device_transport_token_value, output_hbm, output_hbm_bytes, "device_hbm",
                       &candidate->memory)) {
-    ReleaseLocalBufferResources(transport, candidate.get());
+    if (!ReleaseLocalBufferResources(transport, candidate.get())) {
+      transport->retirement_started = true;
+      transport->local_buffers.push_back(std::move(candidate));
+    }
     return false;
   }
 
@@ -271,7 +292,10 @@ bool AcquireLocalBuffer(KvafBatchGetTransport *transport, void *output_hbm, uint
                  "[KVAF_AIV] DIRECT_LOCAL_BUFFER_ENTITY_COPY_FAILED output_hbm=0x%llx bytes=%llu workers=%u\n",
                  static_cast<unsigned long long>(output_address), static_cast<unsigned long long>(output_hbm_bytes),
                  transport->worker_count);
-    ReleaseLocalBufferResources(transport, candidate.get());
+    if (!ReleaseLocalBufferResources(transport, candidate.get())) {
+      transport->retirement_started = true;
+      transport->local_buffers.push_back(std::move(candidate));
+    }
     return false;
   }
   candidate->device_channel_entity = reinterpret_cast<uint64_t>(candidate->device_entities);
@@ -328,6 +352,7 @@ static bool CreateCq(const DirectHccpApi &api, void *context, uint32_t mode, uin
 
 bool ReleaseTransport(KvafBatchGetTransport *transport) {
   if (transport == nullptr) return true;
+  transport->retirement_started = true;
   // Retire both reciprocal imports and all SQ/CQ objects before their MRs.
   // A failed retirement retains the transport and its caller-owned DDR.
   if (!hccp::RetireLocalAndDeviceQueues(transport->api, transport->device_context,
@@ -336,18 +361,30 @@ bool ReleaseTransport(KvafBatchGetTransport *transport) {
     return false;
   }
   for (const auto &local : transport->local_buffers) {
-    if (local != nullptr) ReleaseLocalBufferResources(transport, local.get());
+    if (local != nullptr && !ReleaseLocalBufferResources(transport, local.get())) return false;
   }
   transport->local_buffers.clear();
   if (transport->device_peer_memory_import) {
-    if (!transport->api.rmem_unimport || transport->api.rmem_unimport(
-          transport->device_context, transport->device_peer_memory_import) != 0) return false;
+    const int ret = transport->api.rmem_unimport && transport->device_context
+        ? transport->api.rmem_unimport(transport->device_context, transport->device_peer_memory_import) : -1;
+    if (ret != 0) {
+      std::fprintf(stderr, "[KVAF_AIV] BATCH_GET_TEARDOWN_RETAINED phase=unimport_peer_memory "
+                           "core=all handle=%p ret=%d\n", transport->device_peer_memory_import, ret);
+      return false;
+    }
     transport->device_peer_memory_import = nullptr;
   }
   if (!hccp::ReleaseLocalHostEndpoint(transport->api, transport->local_host.get())) return false;
-  hccp::ReleaseDeviceAivTransport({&transport->api, transport->session, transport->device_context,
-                                   transport->device_transport_token_handle,
-                                   nullptr, transport->workers.data(), transport->worker_count});
+  hccp::DeviceAivTransportResources resources{
+      &transport->api, transport->session, transport->device_context,
+      transport->device_transport_token_handle, transport->device_peer_memory_import,
+      transport->workers.data(), transport->worker_count};
+  const bool retired = hccp::ReleaseDeviceAivTransport(resources);
+  transport->session = resources.session;
+  transport->device_context = resources.device_context;
+  transport->device_transport_token_handle = resources.device_transport_token_handle;
+  transport->device_peer_memory_import = resources.device_peer_memory_import;
+  if (!retired) return false;
   delete transport;
   return true;
 }

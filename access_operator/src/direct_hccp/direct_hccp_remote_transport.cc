@@ -188,57 +188,103 @@ bool GetCurrentNpuPhysicalDeviceId(std::uint32_t* physical_device_id) {
   return true;
 }
 
-void ReleaseDeviceAivTransport(const DeviceAivTransportResources& resources) {
-  if (resources.api == nullptr) return;
+bool ReleaseDeviceAivTransport(DeviceAivTransportResources& resources) {
+  if (resources.api == nullptr || (resources.worker_count != 0U && resources.workers == nullptr)) return false;
   DirectHccpApi& api = *resources.api;
+  const auto failed = [](const char* phase, void* handle, int ret, std::uint32_t worker) {
+    std::fprintf(stderr,
+                 "[KVAF_AIV] DIRECT_HCCP_TEARDOWN_RETAINED phase=%s core=all "
+                 "worker_index=%u handle=%p ret=%d\n", phase, worker, handle, ret);
+  };
+  bool ok = true;
   std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=begin\n");
-  if (api.qp_unimport != nullptr) {
+  {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=unimport_jettys\n");
     for (std::uint32_t index = 0U; index < resources.worker_count; ++index) {
       DeviceAivWorkerResources& worker = resources.workers[index];
-      if (resources.device_context != nullptr && worker.device_peer_target_jetty != nullptr) {
-        (void)api.qp_unimport(resources.device_context, worker.device_peer_target_jetty);
+      if (worker.device_peer_target_jetty != nullptr) {
+        const int ret = api.qp_unimport && resources.device_context
+            ? api.qp_unimport(resources.device_context, worker.device_peer_target_jetty) : -1;
+        if (ret != 0) {
+          failed("unimport_jetty", worker.device_peer_target_jetty, ret, index);
+          ok = false;
+        } else {
+          worker.device_peer_target_jetty = nullptr;
+        }
       }
     }
   }
-  if (api.qp_destroy != nullptr) {
+  if (!ok) return false;
+  {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=destroy_jettys\n");
     for (std::uint32_t index = 0U; index < resources.worker_count; ++index) {
       DeviceAivWorkerResources& worker = resources.workers[index];
       if (worker.device_user_ctl_jetty.handle != nullptr) {
-        (void)api.qp_destroy(worker.device_user_ctl_jetty.handle);
+        const int ret = api.qp_destroy ? api.qp_destroy(worker.device_user_ctl_jetty.handle) : -1;
+        if (ret != 0) {
+          failed("destroy_jetty", worker.device_user_ctl_jetty.handle, ret, index);
+          ok = false;
+        } else {
+          worker.device_user_ctl_jetty.handle = nullptr;
+        }
       }
     }
   }
-  if (api.cq_destroy != nullptr) {
+  if (!ok) return false;
+  {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=destroy_completion_queues\n");
     for (std::uint32_t index = 0U; index < resources.worker_count; ++index) {
       DeviceAivWorkerResources& worker = resources.workers[index];
-      if (resources.device_context != nullptr && worker.device_user_ctl_cq != nullptr) {
-        (void)api.cq_destroy(resources.device_context, worker.device_user_ctl_cq);
+      if (worker.device_user_ctl_cq != nullptr) {
+        const int ret = api.cq_destroy && resources.device_context
+            ? api.cq_destroy(resources.device_context, worker.device_user_ctl_cq) : -1;
+        if (ret != 0) {
+          failed("destroy_cq", worker.device_user_ctl_cq, ret, index);
+          ok = false;
+        } else {
+          worker.device_user_ctl_cq = nullptr;
+        }
       }
     }
   }
-  if (api.rmem_unimport != nullptr && resources.device_context != nullptr &&
-      resources.device_peer_memory_import != nullptr) {
+  if (!ok) return false;
+  if (resources.device_peer_memory_import != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=unimport_peer_memory\n");
-    (void)api.rmem_unimport(resources.device_context, resources.device_peer_memory_import);
+    const int ret = api.rmem_unimport && resources.device_context
+        ? api.rmem_unimport(resources.device_context, resources.device_peer_memory_import) : -1;
+    if (ret != 0) {
+      failed("unimport_peer_memory", resources.device_peer_memory_import, ret, UINT32_MAX);
+      return false;
+    }
+    resources.device_peer_memory_import = nullptr;
   }
-  if (api.token_free != nullptr && resources.device_context != nullptr &&
-      resources.device_transport_token_handle != nullptr) {
+  if (resources.device_transport_token_handle != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=free_tokens\n");
-    (void)api.token_free(resources.device_context, resources.device_transport_token_handle);
+    const int ret = api.token_free && resources.device_context
+        ? api.token_free(resources.device_context, resources.device_transport_token_handle) : -1;
+    if (ret != 0) {
+      failed("free_device_token", resources.device_transport_token_handle, ret, UINT32_MAX);
+      return false;
+    }
+    resources.device_transport_token_handle = nullptr;
   }
-  if (api.ctx_deinit != nullptr && resources.device_context != nullptr) {
+  if (resources.device_context != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=deinit_contexts\n");
-    (void)api.ctx_deinit(resources.device_context);
+    const int ret = api.ctx_deinit ? api.ctx_deinit(resources.device_context) : -1;
+    if (ret != 0) {
+      failed("deinit_device_context", resources.device_context, ret, UINT32_MAX);
+      return false;
+    }
+    resources.device_context = nullptr;
   }
   if (resources.session != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=release_session\n");
     ReleaseDirectHccpSession(resources.session);
+    resources.session = nullptr;
   }
   std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=close_dynamic_libraries\n");
   CloseDirectHccp(&api);
+  return true;
 }
 
 bool LoadPeerMemory(PeerLink* link, std::uint64_t peer_base,

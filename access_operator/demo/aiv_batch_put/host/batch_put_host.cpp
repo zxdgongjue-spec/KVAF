@@ -124,6 +124,7 @@ struct KvafBatchPutTransport {
   std::mutex launch_mutex{};
   hccp::PeerLink *peer_link{nullptr};
   std::unique_ptr<hccp::LocalHostEndpoint> local_host;
+  bool retirement_started{false};
 };
 
 static std::string EidToHex(const std::array<uint8_t, hccp::kEidBytes> &eid) {
@@ -301,8 +302,44 @@ static bool CreateCq(const DirectHccpApi &api, void *context, uint32_t mode, uin
   return true;
 }
 
+bool ReleaseLocalBufferResources(KvafBatchPutTransport *transport, KvafBatchPutLocalBuffer *local) {
+  if (transport == nullptr || local == nullptr) return false;
+  if (local->memory.handle != nullptr) {
+    const int ret = transport->api.lmem_unregister && transport->device_context
+        ? transport->api.lmem_unregister(transport->device_context, local->memory.handle) : -1;
+    if (ret != 0) {
+      std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_TEARDOWN_RETAINED phase=unregister_local_hbm "
+                           "core=all handle=%p ret=%d\n", local->memory.handle, ret);
+      return false;
+    }
+    local->memory.handle = nullptr;
+  }
+  if (local->token_handle != nullptr) {
+    const int ret = transport->api.token_free && transport->device_context
+        ? transport->api.token_free(transport->device_context, local->token_handle) : -1;
+    if (ret != 0) {
+      std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_TEARDOWN_RETAINED phase=free_local_token "
+                           "core=all handle=%p ret=%d\n", local->token_handle, ret);
+      return false;
+    }
+    local->token_handle = nullptr;
+  }
+  if (local->device_entities != nullptr) {
+    const aclError ret = aclrtFree(local->device_entities);
+    if (ret != ACL_SUCCESS) {
+      std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_TEARDOWN_RETAINED phase=free_entity_table "
+                           "core=all handle=%p ret=%d\n", local->device_entities, static_cast<int>(ret));
+      return false;
+    }
+    local->device_entities = nullptr;
+    local->device_channel_entity = 0U;
+  }
+  return true;
+}
+
 bool ReleaseTransport(KvafBatchPutTransport *transport) {
   if (transport == nullptr) return true;
+  transport->retirement_started = true;
   // Retire both reciprocal imports and all SQ/CQ objects before their MRs.
   // A failed retirement retains the transport and its caller-owned DDR.
   if (!hccp::RetireLocalAndDeviceQueues(transport->api, transport->device_context,
@@ -311,33 +348,40 @@ bool ReleaseTransport(KvafBatchPutTransport *transport) {
     return false;
   }
   for (const auto &local : transport->local_buffers) {
-    if (local->device_entities != nullptr) {
-      (void)aclrtFree(local->device_entities);
-    }
-    if (transport->api.lmem_unregister != nullptr && transport->device_context != nullptr &&
-        local->memory.handle != nullptr) {
-      (void)transport->api.lmem_unregister(transport->device_context, local->memory.handle);
-    }
-    if (transport->api.token_free != nullptr && transport->device_context != nullptr &&
-        local->token_handle != nullptr) {
-      (void)transport->api.token_free(transport->device_context, local->token_handle);
-    }
+    if (local != nullptr && !ReleaseLocalBufferResources(transport, local.get())) return false;
   }
   transport->local_buffers.clear();
   if (transport->device_queue_state != nullptr) {
-    (void)aclrtFree(transport->device_queue_state);
+    const aclError ret = aclrtFree(transport->device_queue_state);
+    if (ret != ACL_SUCCESS) {
+      std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_TEARDOWN_RETAINED phase=free_queue_state "
+                           "core=all handle=%p ret=%d\n", transport->device_queue_state, static_cast<int>(ret));
+      return false;
+    }
     transport->device_queue_state = nullptr;
   }
 
   if (transport->device_peer_memory_import) {
-    if (!transport->api.rmem_unimport || transport->api.rmem_unimport(
-          transport->device_context, transport->device_peer_memory_import) != 0) return false;
+    const int ret = transport->api.rmem_unimport && transport->device_context
+        ? transport->api.rmem_unimport(transport->device_context, transport->device_peer_memory_import) : -1;
+    if (ret != 0) {
+      std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_TEARDOWN_RETAINED phase=unimport_peer_memory "
+                           "core=all handle=%p ret=%d\n", transport->device_peer_memory_import, ret);
+      return false;
+    }
     transport->device_peer_memory_import = nullptr;
   }
   if (!hccp::ReleaseLocalHostEndpoint(transport->api, transport->local_host.get())) return false;
-  hccp::ReleaseDeviceAivTransport({&transport->api, transport->session, transport->device_context,
-                                   transport->device_transport_token_handle,
-                                   nullptr, transport->workers.data(), transport->worker_count});
+  hccp::DeviceAivTransportResources resources{
+      &transport->api, transport->session, transport->device_context,
+      transport->device_transport_token_handle, transport->device_peer_memory_import,
+      transport->workers.data(), transport->worker_count};
+  const bool retired = hccp::ReleaseDeviceAivTransport(resources);
+  transport->session = resources.session;
+  transport->device_context = resources.device_context;
+  transport->device_transport_token_handle = resources.device_transport_token_handle;
+  transport->device_peer_memory_import = resources.device_peer_memory_import;
+  if (!retired) return false;
   delete transport;
   return true;
 }
@@ -521,7 +565,8 @@ extern "C" void KvafBatchPutTransportDestroy(KvafBatchPutTransport *transport) {
 extern "C" int32_t KvafBatchPutLocalBufferAcquire(KvafBatchPutTransport *transport,
                                                     void *input_device, uint64_t input_device_bytes,
                                                     KvafBatchPutLocalBuffer **local_buffer) {
-  if (transport == nullptr || input_device == nullptr || input_device_bytes == 0U || local_buffer == nullptr) {
+  if (transport == nullptr || input_device == nullptr || input_device_bytes == 0U || local_buffer == nullptr ||
+      transport->retirement_started) {
     return KVAF_BATCH_PUT_INVALID_ARGUMENT;
   }
   *local_buffer = nullptr;
@@ -565,11 +610,9 @@ extern "C" int32_t KvafBatchPutLocalBufferAcquire(KvafBatchPutTransport *transpo
       !RegisterMemory(transport->api, transport->device_context, candidate->token_handle,
                       token_id, transport->device_transport_token_value, input_device,
                       input_device_bytes, "device_hbm", &candidate->memory)) {
-    if (candidate->memory.handle != nullptr && transport->api.lmem_unregister != nullptr) {
-      (void)transport->api.lmem_unregister(transport->device_context, candidate->memory.handle);
-    }
-    if (candidate->token_handle != nullptr && transport->api.token_free != nullptr) {
-      (void)transport->api.token_free(transport->device_context, candidate->token_handle);
+    if (!ReleaseLocalBufferResources(transport, candidate.get())) {
+      transport->retirement_started = true;
+      transport->local_buffers.push_back(std::move(candidate));
     }
     return KVAF_BATCH_PUT_DIRECT_HCCP_ERROR;
   }
@@ -594,12 +637,9 @@ extern "C" int32_t KvafBatchPutLocalBufferAcquire(KvafBatchPutTransport *transpo
       candidate->device_entities == nullptr ||
       aclrtMemcpy(candidate->device_entities, entity_bytes, entities.data(), entity_bytes,
                   ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
-    if (candidate->device_entities != nullptr) (void)aclrtFree(candidate->device_entities);
-    if (candidate->memory.handle != nullptr && transport->api.lmem_unregister != nullptr) {
-      (void)transport->api.lmem_unregister(transport->device_context, candidate->memory.handle);
-    }
-    if (candidate->token_handle != nullptr && transport->api.token_free != nullptr) {
-      (void)transport->api.token_free(transport->device_context, candidate->token_handle);
+    if (!ReleaseLocalBufferResources(transport, candidate.get())) {
+      transport->retirement_started = true;
+      transport->local_buffers.push_back(std::move(candidate));
     }
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }

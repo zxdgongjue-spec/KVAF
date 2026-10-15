@@ -98,7 +98,9 @@ bool LoadDirectHccp(DirectHccpApi* api);
 void CloseDirectHccp(DirectHccpApi* api);
 
 bool GetCurrentNpuPhysicalDeviceId(std::uint32_t* physical_device_id);
-void ReleaseDeviceAivTransport(const DeviceAivTransportResources& resources);
+// Clear each handle only after its release succeeds. On failure the caller
+// must preserve the updated view, its session/API and dependent allocations.
+bool ReleaseDeviceAivTransport(DeviceAivTransportResources& resources);
 
 // Converts the Link descriptor's raw UMDK token to the AIV WQE token format.
 bool LoadPeerMemory(PeerLink* link, std::uint64_t peer_base,

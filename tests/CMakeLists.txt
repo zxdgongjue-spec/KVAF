@@ -113,6 +113,24 @@ target_include_directories(kvaf_local_host_transport_lifecycle_test PRIVATE
 add_test(NAME kvaf_local_host_transport_lifecycle
   COMMAND kvaf_local_host_transport_lifecycle_test)
 
+foreach(mode IN ITEMS get put)
+  add_executable(kvaf_${mode}_transport_teardown_test
+    transport_teardown_failure_test.cc
+    ../access_operator/src/direct_hccp/direct_hccp_remote_transport.cc
+    ../access_operator/src/direct_hccp/direct_hccp_local_host.cc)
+  target_include_directories(kvaf_${mode}_transport_teardown_test PRIVATE
+    transport_teardown_stubs
+    ../access_operator/include
+    ../access_operator/demo/aiv_batch_get/include
+    ../access_operator/demo/aiv_batch_put/include)
+  if(mode STREQUAL "put")
+    target_compile_definitions(kvaf_${mode}_transport_teardown_test PRIVATE KVAF_TEST_PUT_TEARDOWN=1)
+  endif()
+  target_link_libraries(kvaf_${mode}_transport_teardown_test PRIVATE kvaf_peer_link dl pthread)
+  add_test(NAME kvaf_${mode}_transport_checked_teardown
+    COMMAND kvaf_${mode}_transport_teardown_test)
+endforeach()
+
 # Runtime ownership and teardown with injected CPU-only dependencies.
 add_executable(kvaf_runtime_core_test runtime_core_test.cc)
 target_link_libraries(kvaf_runtime_core_test PRIVATE kvaf_runtime)
