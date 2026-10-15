@@ -16,14 +16,31 @@ Wrapper options:
   --smoke            16 rows x 64 bytes, 1 warmup, 3 measured iterations
   --output FILE      Save CSV and also print it to stdout
 
-All other options go to kvaf_aicpu_get_cpu, for example:
-  --device-id 4 --rows 4096 --row-bytes 656 --scatter-threads 4
-  --warmup 5 --iterations 100 --remote-sgl-size 16 --jettys 4
-  --prepare-threads 4 --wqes-per-doorbell 0 --timeout-ms 30000
+Defaults (V21): ordered WRITE chain, 4096 x 656 B, 4 workers/Jettys,
+chunk 1024, doorbell 32, securec copy, indexed CQ batch 8/deadline 32,
+NUMA auto, payload maintenance off, final output readback, warmup 50/iterations 1000.
+No transfer/backend/poll/window experiment flags are required.
 
-  --rows N             Number of rows
-  --row-bytes N        Payload bytes per row (minimum 8)
-  --scatter-threads N  AICPU workers including caller (1..32; default 1)
+  --rows N --row-bytes N --scatter-threads N --pipeline-chunk-rows N
+  --jettys N --remote-sgl-size N --prepare-threads N --wqes-per-doorbell N
+  --warmup N --iterations N --timeout-ms N
+  --host-numa-node auto|none|N --host-cpu N
+  --payload-cache-maintenance off|on
+                     Off is the verified fast platform policy; on performs
+                     staging invalidate and output clean. Control maintenance
+                     and cold-output preparation are always retained.
+  --output-verify final|urma
+                     Final checks the last round; urma checks every round.
+  --verify-payload   Change/check every payload byte each round (validation only).
+                     Automatically enables per-round readback; omit for bandwidth.
+  --npu-candidate N  Pin the remote EID candidate; default automatic selection.
+
+CSV includes all three bandwidth scopes:
+  e2e_GBps       Request -> all scatter and producer done, excluding preparation/checks.
+  cpu_data_GBps  First data Submit -> last observed chain tail, including markers.
+  cpu_cycle_GBps Full CPU round, including request wait, source update and scheduled checks.
+Times are in ns; effective GB/s = rows * row_bytes / corresponding mean_ns.
+Communication time is cpu_data_span_ns, not first_ready_ns or CQ poll time.
 
 Start the NPU script first. Restart it for every test invocation.
 device-id selects the remote NPU (default 0); CPU UB/EID selection is automatic.

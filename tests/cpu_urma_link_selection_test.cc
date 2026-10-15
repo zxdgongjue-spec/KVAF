@@ -80,8 +80,22 @@ void StopAndFailure() {
   const auto status = SelectCpuUrmaDeviceLink(peer, 4, Candidates(), all_fail);
   Check(!status.ok() && attempts == 4 && status.message() == "attempt 4", "last error was lost");
 }
+void FixedRemoteCandidate() {
+  Peer peer;
+  std::vector<std::pair<std::uint32_t, std::uint32_t>> attempted;
+  const auto attempt = [&](const CpuUrmaCandidate& cpu, std::uint32_t npu) -> CpuUrmaLinkAttempt {
+    attempted.emplace_back(cpu.eid_index, npu);
+    return {cpu.eid_index == 7 ? Status::OK() : Status::Internal("no route"), true};
+  };
+  Check(SelectCpuUrmaDeviceLink(peer, 6, Candidates(), attempt, 1).ok() &&
+        attempted == std::vector<std::pair<std::uint32_t, std::uint32_t>>{{2, 1}, {7, 1}},
+        "fixed remote candidate changed local selection or tried another remote EID");
+  attempted.clear();
+  Check(!SelectCpuUrmaDeviceLink(peer, 6, Candidates(), attempt, 2).ok() && attempted.empty(),
+        "out-of-range remote candidate must fail before allocation");
+}
 }  // namespace
 int main() {
-  try { PairOrderAndReuse(); StopAndFailure(); std::cout << "CPU URMA link selection: PASS\n"; return 0; }
+  try { PairOrderAndReuse(); StopAndFailure(); FixedRemoteCandidate(); std::cout << "CPU URMA link selection: PASS\n"; return 0; }
   catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

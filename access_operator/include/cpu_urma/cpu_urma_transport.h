@@ -14,7 +14,8 @@ namespace kvaf {
 
 // CPU-side URMA data plane shared by the production AccessOperator and its
 // hardware benchmarks. PeerLink supplies the control-plane channel; this
-// class owns only the local URMA resources and synchronous byte transfers.
+// class owns the local URMA resources, synchronous transfers and optional
+// prepared asynchronous WRITEs with a single CQ owner.
 struct CpuUrmaTransportOptions {
   std::string peer_address;  // host:port of kvaf_cpu_service
   std::string ub_device;     // empty: first usable UB device
@@ -41,7 +42,7 @@ struct CpuUrmaTransportOptions {
   // list per Jetty.
   std::uint32_t wqes_per_doorbell{0};
   // Legacy public name. WRITE gathers up to this many local source SGEs into
-  // one contiguous remote HBM SGE. Every input row remains a distinct SGE.
+  // one contiguous remote HBM SGE. By default every input row is a distinct SGE.
   // Device max_jfs_sge, max_msg_size, or a remote gap may split the WR earlier.
   std::uint32_t remote_sgl_size{1};
   // Number of independent Jettys and their submission/CQ owners.
@@ -51,6 +52,10 @@ struct CpuUrmaTransportOptions {
   // Maximum CPU workers used by batch planning and descriptor preparation.
   // WRITE uses at most one worker per Jetty owner.
   std::uint32_t prepare_thread_count{4};
+  // Prepared WRITEs use indexed completions, active queues and a single CQ
+  // owner. Synchronous APIs retain their existing path.
+  std::uint32_t async_cq_batch{8};
+  std::uint32_t async_deadline_polls{32};
 };
 
 class CpuUrmaTransport final {
@@ -101,6 +106,68 @@ class CpuUrmaTransport final {
   // Queue capacity is applied after grouping, with shared completion fences.
   Status WriteBatch(const std::uint64_t* remote_offsets,
                     const HostSge* sources, std::size_t count);
+  using PreparedWriteId = std::uint64_t;
+  struct PreparedWriteCompletion { PreparedWriteId id{}; BatchTiming timing{}; };
+  // Build/register immutable address/SGL descriptors once, outside the hot
+  // loop. Source PAYLOAD may change only while this plan is idle; source memory
+  // must remain allocated until completion, or successful Shutdown on error.
+  // One plan must fit one Jetty wave; no synchronous transfer is permitted
+  // while prepared WRITEs are in flight. Calls share one submission/CQ owner.
+  Status PrepareWriteBatch(const std::uint64_t* remote_offsets,
+                           const HostSge* sources, std::size_t count,
+                           PreparedWriteId* id);
+  struct WriteChainChunk {
+    const std::uint64_t* remote_offsets{};
+    const HostSge* sources{};
+    std::size_t count{};
+    // One aligned remote 8-byte progress word per Jetty; all queues publish.
+    const std::uint64_t* marker_offsets{};
+    // Registered, immutable while live; may change between completions.
+    const std::uint64_t* marker_value{};
+  };
+  // One credit-reserved chain per Jetty, data -> marker for each chunk. Post
+  // the first chunk on ALL queues before posting their remaining suffixes.
+  // No intermediate CQEs/CPU ready submission; only final queue tails fence it.
+  Status PrepareWriteChain(const WriteChainChunk* chunks, std::size_t count,
+                           PreparedWriteId* id);
+  struct PreparedWriteInfo {
+    std::uint64_t wr_count{}, tail_cqes{}, post_calls{};
+    std::uint64_t input_sges{}, effective_sges{};
+    std::uint64_t marker_wrs{}, logical_chunks{};
+  };
+  // Descriptor counts after device SGE/message limits have been applied.
+  Status DescribePreparedWrite(PreparedWriteId id, PreparedWriteInfo* info) const;
+  // OK + submitted=false means queue credits are temporarily exhausted.
+  Status SubmitPreparedWrite(PreparedWriteId id, bool* submitted);
+  // Bounded nonblocking CQ polling; completions are returned once per batch after all
+  // participating Jetty tails. Completion latencies overlap between plans.
+  Status PollPreparedWrites(PreparedWriteCompletion* completed,
+                           std::size_t capacity, std::size_t* count);
+  struct PreparedAsyncStats {
+    std::uint64_t sweeps{}, cq_reads{}, empty_cq_reads{}, tail_cqes{}, deadline_checks{};
+    std::uint64_t poll_calls{};
+  };
+  // Snapshot/reset outside the producer session, for measurement boundaries.
+  Status ReadPreparedAsyncStats(PreparedAsyncStats* stats, bool reset = false) const;
+  // Hold submission/CQ ownership once across an asynchronous producer loop.
+  // Use on the acquiring thread only. Destroy the session before any other
+  // transport API (including synchronous ready/done writes and Shutdown).
+  // Releasing a session does not cancel or free outstanding plans on error.
+  class PreparedWriteSession final {
+   public:
+    ~PreparedWriteSession();
+    PreparedWriteSession(const PreparedWriteSession&) = delete;
+    PreparedWriteSession& operator=(const PreparedWriteSession&) = delete;
+    Status Submit(PreparedWriteId id, bool* submitted);
+    Status Poll(PreparedWriteCompletion* completed, std::size_t capacity, std::size_t* count);
+   private:
+    friend class CpuUrmaTransport;
+    struct State;
+    explicit PreparedWriteSession(std::unique_ptr<State> state);
+    std::unique_ptr<State> state_;
+  };
+  Status BeginPreparedWriteSession(std::unique_ptr<PreparedWriteSession>* session);
+  Status ClearPreparedWrites();  // Requires all plans to be idle.
   // Register one page-aligned host region once. SGL transfers from any
   // sub-range of this region then reuse the same URMA segment.
   Status RegisterDirectHostMemory(void* base, std::size_t bytes);
@@ -114,6 +181,7 @@ class CpuUrmaTransport final {
 
   bool initialized() const;
   std::uint64_t region_bytes() const;
+  std::uint64_t max_write_bytes() const;  // Queried device message limit, <= uint32.
   BatchTiming last_batch_timing() const;
 
  private:
