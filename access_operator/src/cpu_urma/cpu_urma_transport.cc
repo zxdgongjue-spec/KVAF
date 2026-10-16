@@ -3,8 +3,6 @@
 #include "cpu_urma/sgl_batch_builder.h"
 #include "cpu_urma/jetty_batch_dispatch.h"
 #include "cpu_urma/indexed_async_write_tracker.h"
-#include "cpu_urma/prepared_write_routing.h"
-#include "cpu_urma/write_chain_schedule.h"
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -37,6 +35,14 @@ constexpr std::uint32_t kMaxJettyCount = 16;
 constexpr std::uint32_t kMaxPrepareThreadCount = 64;
 constexpr std::uint32_t kPageBytes = 4096;
 constexpr std::size_t kMinRowsPerPrepareWorker = 64;
+
+struct PreparedQueueRows { std::size_t first{}, count{}; };
+inline PreparedQueueRows PreparedRowsForQueue(std::size_t rows, std::size_t queues,
+    std::size_t queue) {
+  if (!queues || queue >= queues) return {};
+  const auto base = rows / queues, remainder = rows % queues;
+  return {queue * base + std::min(queue, remainder), base + (queue < remainder ? 1U : 0U)};
+}
 constexpr std::size_t kParallelPrepareMinItems = 256;
 constexpr std::uint32_t kKeyBytes = sizeof(urma_jetty_id_t) + sizeof(urma_transport_mode_t);
 // AIV/Direct-HCCP and liburma expose the same routing EID prefix but may
@@ -271,8 +277,7 @@ struct CpuUrmaTransport::Impl {
     std::array<WorkerResult, kMaxJettyCount> results{};
     std::size_t wr_count = 0U;
     for (const auto& queue : job.queues) wr_count += queue.count;
-    // A 64 B request/ready message has one active queue. Avoid waking a full
-    // OpenMP team and its phase barriers for that queue, even with 4 Jettys.
+    // Single-queue control messages bypass the OpenMP team.
     std::size_t active = 0, sole = 0;
     for (std::size_t q = 0; q < job.queues.size(); ++q)
       if (job.queues[q].count) { ++active; sole = q; }
@@ -1361,13 +1366,12 @@ struct CpuUrmaTransport::Impl {
     job.write = true;
     job.queues.resize(local_jettys_.size());
     for (std::size_t q = 0; q < job.queues.size(); ++q) {
-      const auto range = cpu_urma_detail::PreparedRowsForQueue(count, job.queues.size(), q);
+      const auto range = PreparedRowsForQueue(count, job.queues.size(), q);
       const auto rows = range.count;
       EnsureSglQueueStorage(job.queues[q], rows, rows);
       if (!rows) continue;
       status = BuildWriteGatherQueue(job, q, sources, offsets, count, range.first, rows);
       if (!status.ok()) return status;
-      // All host spans were registered before building; no deferred lookup.
       if (!job.queues[q].missing_host_segments.empty())
         return Status::Internal("prepared WRITE has an unresolved host segment");
       plan->fences[plan->fence_count++] = {q, job.queues[q].count, 0};
@@ -1401,11 +1405,11 @@ struct CpuUrmaTransport::Impl {
         const auto offset = chunk.marker_offsets[q];
         if (offset % 8 || offset > remote_region_.length || remote_region_.length - offset < 8)
           return Status::InvalidArgument("chain marker is outside remote region or unaligned");
-        capacity[q] += cpu_urma_detail::PreparedRowsForQueue(chunk.count, job.queues.size(), q).count + 1;
+        capacity[q] += PreparedRowsForQueue(chunk.count, job.queues.size(), q).count + 1;
         if (capacity[q] > kJettyDepth)
           return Status::InvalidArgument("WRITE chain source/marker budget exceeds one SQ wave; reduce rows/chunks");
       }
-      // All queues use the same local marker; register its source once.
+      // Each chunk shares one local marker across Jettys.
       const CpuUrmaTransport::HostSge marker{const_cast<std::uint64_t*>(chunk.marker_value), 8};
       status = ValidateAndRegisterHostBuffers(&marker, chunk.marker_offsets, 1);
       if (!status.ok()) return status;
@@ -1426,7 +1430,7 @@ struct CpuUrmaTransport::Impl {
       }
       if (!marker_segment) return Status::Internal("unresolved chain marker segment");
       for (std::size_t q = 0; q < job.queues.size(); ++q) {
-        const auto range = cpu_urma_detail::PreparedRowsForQueue(chunk.count, job.queues.size(), q);
+        const auto range = PreparedRowsForQueue(chunk.count, job.queues.size(), q);
         auto& dst = job.queues[q]; auto& src = temp.queues[q];
         EnsureSglQueueStorage(src, range.count, range.count);
         const auto status = BuildWriteGatherQueue(temp, q, chunk.sources, chunk.remote_offsets,
@@ -1502,7 +1506,7 @@ struct CpuUrmaTransport::Impl {
     if (!id || id > prepared_writes_.size()) return Status::InvalidArgument("unknown prepared WRITE");
     auto& plan = *prepared_writes_[id - 1];
     auto& job = plan.job;
-    // Check duplicate submissions BEFORE changing any live tail/context.
+    // Reject duplicate submissions before modifying live WRs.
     if (plan.handle.token) return Status::InvalidState("prepared WRITE is already in flight");
     const auto start = std::chrono::steady_clock::now();
     auto status = indexed_tracker_.TryBegin(id, plan.handle, plan.fences.data(), plan.fence_count, submitted);
@@ -1513,8 +1517,7 @@ struct CpuUrmaTransport::Impl {
       job.queues[f.queue].wrs[f.wrs - 1].user_ctx = f.context;
       const auto error = plan.ordered_chain ? std::string{} : PostSglQueue(job, f.queue);
       if (!error.empty()) {
-        // A failed post may have partially submitted a chain. Keep every
-        // descriptor and source registration alive until Jetty teardown.
+        // A failed post may leave live WRs; retain sources and descriptors until teardown.
         batch_poisoned_ = true;
         return Status::Internal(error);
       }
@@ -1580,9 +1583,7 @@ struct CpuUrmaTransport::Impl {
 
   Status CheckPreparedDeadlines() {
     bool expired = false;
-    // Empty sweeps avoid a clock read and a deadline walk in optimized mode.
-    // CQ errors are still checked immediately, and every Nth sweep checks
-    // every outstanding deadline (including plans only partially completed).
+    // Check all outstanding deadlines once per configured poll interval.
     if (async_polls_since_deadline_ >= async_deadline_polls_) {
       async_polls_since_deadline_ = 0;
       const auto now = std::chrono::steady_clock::now();
@@ -1606,8 +1607,7 @@ struct CpuUrmaTransport::Impl {
   Status Shutdown() {
     std::unique_lock<std::mutex> submit_lock(batch_submit_mutex_);
     initialized_ = false;
-    // Queued WRs retain their imported target and SGL/source registrations.
-    // Stop local send queues before releasing any of those objects.
+    // Stop local queues before releasing imported targets or registered sources.
     bool delete_failed = false;
     for (auto*& local_jetty : local_jettys_) {
       if (local_jetty == nullptr) continue;

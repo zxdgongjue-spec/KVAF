@@ -25,7 +25,6 @@ struct Config {
   std::uint64_t timeout_ms{30000};
   std::uint64_t scatter_threads{4};
   std::uint64_t pipeline_chunk_rows{1024}, pipeline_jettys{4};
-  // Off is the measured fast path; on maintains both staging and output.
   std::uint64_t payload_cache_maintenance{};
   std::uint64_t verify_payload{}, verify_each_round{};
 };
@@ -125,8 +124,7 @@ inline MultiBlockCoordination MakeMultiBlockCoordination(std::uint32_t workers) 
   MultiBlockCoordination c{}; c.workers = workers; return c;
 }
 
-// Nontrivial row/byte pattern plus a changing per-round header detects stale
-// data. CPU updates only the 8-byte header of each source row per round.
+// Per-row byte pattern; changing round tags detect stale transfers.
 inline std::uint8_t Pattern(std::uint64_t row, std::uint64_t byte) {
   return static_cast<std::uint8_t>((row * 131 + byte * 17 + (byte >> 8)) % 251);
 }
@@ -139,8 +137,7 @@ inline std::uint64_t RowTag(std::uint64_t sequence, std::uint64_t row) {
   return (sequence << 32) | row;
 }
 inline std::uint64_t LogicalRowForOutputSlot(const Config& c, std::uint64_t slot) { return c.rows - 1 - slot; }
-// A packed source row can cross cache lines. Assign whole groups whose byte
-// length is a multiple of 64, so worker invalidations never share a line.
+// Align worker boundaries to complete staging cache lines.
 inline std::uint64_t RowsPerCacheGroup(std::uint64_t row_bytes) {
   std::uint64_t a = row_bytes, b = 64;
   while (b) { const auto remainder = a % b; a = b; b = remainder; }

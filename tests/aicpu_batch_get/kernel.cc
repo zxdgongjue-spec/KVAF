@@ -1,8 +1,6 @@
 #define KVAF_AICPU_TEST_DEVICE_KERNEL 1
 #include "abi.h"
 #include "pipeline.h"
-#include "scatter_copy.h"
-#include "output_verify.h"
 #include <cstdint>
 
 #if !defined(__aarch64__)

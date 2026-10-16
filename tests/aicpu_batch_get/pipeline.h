@@ -1,6 +1,12 @@
 #pragma once
 
 #include "abi.h"
+#if defined(KVAF_AICPU_TEST_DEVICE_KERNEL)
+#include <securec.h>
+#else
+#include <cstddef>
+#include <cstring>
+#endif
 
 namespace kvaf::aicpu_test {
 inline std::uint64_t PipelineChunkCount(const Config& c, std::uint32_t worker) {
@@ -16,8 +22,7 @@ inline RowRange PipelineChunkRange(const Config& c, std::uint32_t worker, std::u
 inline std::uint64_t PipelineProgressToken(std::uint64_t sequence, std::uint64_t chunks) {
   return (sequence << 32) | chunks;
 }
-// A queue marker fences only THAT queue. Never release a range from queue 0
-// alone. A later marker subsumes earlier chunks on the same ordered queue.
+// Release only the progress reached by every Jetty.
 template <class Read>
 std::uint64_t ChainReadyProgress(const Config& c, std::uint32_t worker,
                                  std::uint64_t sequence, Read read) {
@@ -43,8 +48,7 @@ template <class Emit> void ForEachPipelineChunk(const Config& c, Emit emit) {
     for (std::uint32_t w = 0; w < workers; ++w)
       if (chunk < PipelineChunkCount(c, w)) emit(w, chunk, PipelineChunkRange(c, w, chunk));
 }
-// Consume the entire contiguous ready prefix in one invalidate+copy span.
-// A progress jump skips notifications, NEVER data. Clean once per worker.
+// A progress jump releases all intervening chunks; finalize once per worker.
 template <class IO>
 Result RunPipelineChunks(const Config& c, std::uint32_t worker, std::uint64_t sequence,
                          std::uint64_t start, std::uint64_t timeout, IO& io) {
@@ -78,5 +82,32 @@ Result RunPipelineChunks(const Config& c, std::uint32_t worker, std::uint64_t se
   io.CleanRange(worker);
   if (const auto cleaned = io.Status(); cleaned != Result::kPending) return cleaned;
   return io.Now() - start >= timeout ? Result::kTimeout : Result::kOk;
+}
+// Copy packed staging rows into strided output slots.
+inline bool CopyScatterRows(std::uint8_t* output, const std::uint8_t* source,
+                             std::uint64_t rows, std::uint64_t bytes, std::uint64_t stride) {
+  for (std::uint64_t row = 0; row < rows; ++row) {
+#if defined(KVAF_AICPU_TEST_DEVICE_KERNEL)
+    if (memcpy_sp(output + row * stride, bytes, source + row * bytes, bytes) != EOK) return false;
+#else
+    std::memcpy(output + row * stride, source + row * bytes, static_cast<std::size_t>(bytes));
+#endif
+  }
+  return true;
+}
+
+// Leave output untouched until the external reader acknowledges it.
+template <class IO>
+Result VerifyOutputViaUrma(std::uint64_t sequence, std::uint64_t timeout, IO& io) {
+  const auto begin = io.Now();
+  io.PublishOutputReady(sequence);
+  for (;;) {
+    const auto ack = io.ReadOutputVerified();
+    const auto ack_sequence = ack >> 1;
+    if (ack_sequence > sequence) return Result::kSequenceError;
+    if (ack_sequence == sequence) return (ack & 1) ? Result::kDataMismatch : Result::kOk;
+    if (io.Now() - begin >= timeout) return Result::kTimeout;
+    io.Relax();
+  }
 }
 }  // namespace kvaf::aicpu_test

@@ -126,9 +126,7 @@ void Run(Options options) {
   Check(kvaf::SelectCpuUrmaDeviceLink(peer, options.transport.remote_device_id, discovery.candidates(),
       [&](const kvaf::CpuUrmaCandidate& cpu, std::uint32_t npu_index) -> kvaf::CpuUrmaLinkAttempt {
     auto config = kvaf::BindCpuUrmaEndpoint(options.transport, cpu, options.transport.remote_device_id, npu_index);
-    // Match Runtime: each pair gets a fresh transport. Shutdown does not reset
-    // every selection field (e.g. device_), so reinitializing one object could
-    // silently retain the previous CPU EID.
+    // Use a fresh transport per EID pair to avoid stale selection state.
     auto candidate = std::make_unique<CpuUrmaTransport>();
     kvaf::Status attempt;
     try {
@@ -138,8 +136,7 @@ void Run(Options options) {
     } catch (const std::exception& e) {
       attempt = kvaf::Status::Internal(e.what());
     }
-    // Unlike Runtime's allocator, this test does not recycle a target after a
-    // failed data probe. It retries setup only, before any data WR is posted.
+    // Retry setup only; a failed data probe may have live WRs.
     if (attempt.ok()) {
       attempt = candidate->ValidateLink();
       if (attempt.ok()) selected_transport = std::move(candidate);

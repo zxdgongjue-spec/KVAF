@@ -37,8 +37,7 @@ if(KVAF_BUILD_AICPU_GET_TEST)
   if(NOT EXISTS "${KVAF_AICPU_CXX}")
     message(FATAL_ERROR "Set KVAF_AICPU_CXX to the CANN AICPU cross compiler")
   endif()
-  # Match hbm-sgl-probe: use the CANN device securec performance addon, not a
-  # host securec library or an implementation silently replaced by std::memcpy.
+  # Link and package the device AArch64 securec library providing memcpy_sp.
   find_path(KVAF_AICPU_SECUREC_INCLUDE_DIR securec.h
     PATHS "${ASCEND_CANN_PACKAGE_PATH}/include"
           "${ASCEND_CANN_PACKAGE_PATH}/include/experiment"
@@ -71,7 +70,7 @@ if(KVAF_BUILD_AICPU_GET_TEST)
             "-Wl,-rpath,$ORIGIN" -Wl,-z,defs -o "${kernel_so}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KVAF_AICPU_SECUREC_LIBRARY}"
             "${CMAKE_CURRENT_BINARY_DIR}/aicpu_kernels_device/${securec_library_name}"
-    DEPENDS kernel.cc pipeline.h scatter_copy.h output_verify.h abi.h
+    DEPENDS kernel.cc pipeline.h abi.h
             "${KVAF_AICPU_SECUREC_LIBRARY}" "${KVAF_AICPU_SECUREC_INCLUDE_DIR}/securec.h" VERBATIM)
 
   add_custom_command(OUTPUT "${kernel_tar}"

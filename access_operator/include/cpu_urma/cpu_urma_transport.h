@@ -52,8 +52,7 @@ struct CpuUrmaTransportOptions {
   // Maximum CPU workers used by batch planning and descriptor preparation.
   // WRITE uses at most one worker per Jetty owner.
   std::uint32_t prepare_thread_count{4};
-  // Prepared WRITEs use indexed completions, active queues and a single CQ
-  // owner. Synchronous APIs retain their existing path.
+  // Prepared WRITE CQ batch size and deadline-check interval.
   std::uint32_t async_cq_batch{8};
   std::uint32_t async_deadline_polls{32};
 };
@@ -108,13 +107,9 @@ class CpuUrmaTransport final {
                     const HostSge* sources, std::size_t count);
   using PreparedWriteId = std::uint64_t;
   struct PreparedWriteCompletion { PreparedWriteId id{}; };
-  // Build/register immutable address/SGL descriptors once, outside the hot
-  // loop. Preserve each source row as one local SGE; gather rows into WRs
-  // according to remote adjacency and device limits, without packing payload.
-  // Source PAYLOAD may change only while this plan is idle; source memory
-  // must remain allocated until completion, or successful Shutdown on error.
-  // One plan must fit one Jetty wave; no synchronous transfer is permitted
-  // while prepared WRITEs are in flight. Calls share one submission/CQ owner.
+  // Prepare reusable one-wave descriptors, preserving one local SGE per source row.
+  // Modify payload only while idle; retain sources until completion or successful
+  // Shutdown after failure. Do not mix live prepared and synchronous transfers.
   Status PrepareWriteBatch(const std::uint64_t* remote_offsets,
                            const HostSge* sources, std::size_t count,
                            PreparedWriteId* id);
@@ -122,14 +117,13 @@ class CpuUrmaTransport final {
     const std::uint64_t* remote_offsets{};
     const HostSge* sources{};
     std::size_t count{};
-    // One aligned remote 8-byte progress word per Jetty; all queues publish.
+    // One aligned 8-byte progress word per Jetty.
     const std::uint64_t* marker_offsets{};
-    // Registered, immutable while live; may change between completions.
+    // Immutable until completion.
     const std::uint64_t* marker_value{};
   };
-  // One credit-reserved chain per Jetty, data -> marker for each chunk. Post
-  // the first chunk on ALL queues before posting their remaining suffixes.
-  // No intermediate CQEs/CPU ready submission; only final queue tails fence it.
+  // Chain data and ordered progress WRITEs on each Jetty; only tails produce CQEs.
+  // Post all first prefixes before their suffixes.
   Status PrepareWriteChain(const WriteChainChunk* chunks, std::size_t count,
                            PreparedWriteId* id);
   struct PreparedWriteInfo {
@@ -138,12 +132,10 @@ class CpuUrmaTransport final {
   // Descriptor counts after device SGE/message limits have been applied.
   Status DescribePreparedWrite(PreparedWriteId id, PreparedWriteInfo* info) const;
   struct PreparedAsyncStats { std::uint64_t tail_cqes{}; };
-  // Snapshot/reset outside the producer session, for measurement boundaries.
+  // Read/reset counters outside the producer session.
   Status ReadPreparedAsyncStats(PreparedAsyncStats* stats, bool reset = false) const;
-  // Hold submission/CQ ownership once across an asynchronous producer loop.
-  // Use on the acquiring thread only. Destroy the session before any other
-  // transport API (including synchronous ready/done writes and Shutdown).
-  // Releasing a session does not cancel or free outstanding plans on error.
+  // One thread owns submission/CQ access for the session lifetime.
+  // Release before other transport calls; outstanding plans survive session exit.
   class PreparedWriteSession final {
    public:
     ~PreparedWriteSession();

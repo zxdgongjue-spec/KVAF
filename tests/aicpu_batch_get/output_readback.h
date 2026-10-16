@@ -5,8 +5,7 @@
 #include <vector>
 
 namespace kvaf::aicpu_test {
-// CPU-only expected image. Pattern generation happens once before launch;
-// successful checks use libc memcmp rather than per-byte pattern arithmetic.
+// Precompute expected payload; update round tags before checking output.
 class OutputReadbackVerifier {
  public:
   OutputReadbackVerifier(const Config& c, const Layout& l) : config_(c), layout_(l), expected_(l.output_bytes, 0xA5) {
@@ -26,7 +25,6 @@ class OutputReadbackVerifier {
     }
     mask_ = mask;
     if (std::memcmp(data, expected_.data(), expected_.size()) == 0) return true;
-    // Detailed location is needed only on failure, never on the fast path.
     for (std::uint64_t i = 0; i < layout_.output_bytes; ++i)
       if (data[i] != expected_[i]) {
         if (mismatch_offset) *mismatch_offset = i;

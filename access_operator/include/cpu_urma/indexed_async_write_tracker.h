@@ -7,8 +7,7 @@
 #include <algorithm>
 
 namespace kvaf::cpu_urma_detail {
-// CQ context encodes slot, generation and queue. Handles belong to stable
-// prepared plans; no allocation, task scan or hash lookup is needed on a CQE.
+// Track queue credits and CQE identity with slot/generation/queue contexts.
 class IndexedAsyncWriteTracker {
  public:
   struct Fence { std::size_t queue{}, wrs{}; std::uint64_t context{}; };
@@ -95,10 +94,8 @@ class IndexedAsyncWriteTracker {
   std::array<Batch, kMaxBatches> batches_{};
 };
 
-// One bounded read per active queue, rotating the first queue each sweep.
-// A CQE can finish at most one plan. Limit reads by output space so even an
-// out-of-order burst cannot consume completions that the caller cannot hold.
-// read(queue,limit,&polled); complete(queue,index,&finished) own CR storage.
+// Rotate across active CQs; bound reads by free result slots to avoid
+// overflowing the caller buffer when completions arrive out of order.
 template <class Pending, class Read, class Complete>
 Status SweepAsyncCqs(std::size_t queues, std::size_t first, std::size_t batch_size,
                     std::size_t capacity, std::size_t* count,

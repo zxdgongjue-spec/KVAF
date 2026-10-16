@@ -14,9 +14,7 @@
 #include <unistd.h>
 
 namespace kvaf::aicpu_test {
-// Test-only commands; never change the production Runtime protocol.
-// V21 retains only the optimized ordered-WRITE pipeline.
-// A new command prevents older executables from interpreting a different ABI.
+// Test-only V21 commands; the configure opcode rejects older executables.
 constexpr auto kConfigure = static_cast<peer::Command>(0x7015);
 constexpr auto kStart = static_cast<peer::Command>(0x7001);
 constexpr auto kResetSetup = static_cast<peer::Command>(0x7003);

@@ -1,10 +1,8 @@
 #include "metrics.h"
 #include "pipeline.h"
-#include "scatter_copy.h"
 #include "output_readback.h"
-#include "output_verify.h"
 #include "cpu_urma/indexed_async_write_tracker.h"
-#include "cpu_urma/write_chain_schedule.h"
+#include "cpu_urma/jetty_batch_dispatch.h"
 #include <array>
 #include <cstdio>
 #include <deque>

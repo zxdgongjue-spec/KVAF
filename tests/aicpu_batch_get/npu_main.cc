@@ -87,8 +87,7 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
   Acl(aclrtMemset(output, layout.output_bytes + kGuardBytes, 0xA5, layout.output_bytes + kGuardBytes),
       "initialize registered output");
   samples.Allocate(config.iterations * sizeof(Sample)); result.Allocate(sizeof(KernelResult));
-  // Successful rounds fill samples; the host copy initializes coordination.
-  // Zero only the result so a pre-write kernel failure leaves a pending status.
+  // Preserve pending status if the kernel fails before writing its result.
   Acl(aclrtMemset(result.data, sizeof(KernelResult), 0, sizeof(KernelResult)), "initialize kernel result");
   const auto host_coordination = MakeMultiBlockCoordination(ActiveThreads(config));
   coordination.Allocate(sizeof(host_coordination));
@@ -102,12 +101,10 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
       "payload_cache=%s output_cache=cold_before_request cache_prepare=outside_timing revision=%llu\n",
       ActiveThreads(config), config.payload_cache_maintenance ? "on" : "off", (unsigned long long)kKernelRevision);
   kernel.Launch(args, ActiveThreads(config));
-  // Once launched, do not unwind allocations until both device execution and
-  // CPU transport have stopped. A lost control connection requires retaining
-  // the process/resources for operator intervention, not eager buffer free.
+  // Retain buffers until both kernel execution and CPU transport have stopped.
   Ack ack{};
   try { Send(fd, &ack, sizeof(ack)); }
-  catch (...) { /* Kernel times out; still perform the drain handshake below. */ }
+  catch (...) { /* Drain even if the launch ACK fails. */ }
   const auto sync = kernel.Synchronize();
   if (sync != ACL_SUCCESS) {
     // Capture immediately: later ACL calls can replace this thread's error.
@@ -125,9 +122,7 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
   }
   Report report{};
   KernelResult device_result{};
-  // An explicit kernel error (timeout, bad sequence, mismatch) can also fail
-  // the stream. Try to retrieve its status before discarding this evidence.
-  // A processor exception may prevent readback; report that separately.
+  // Read kernel status after stream failure to preserve the failure reason.
   const auto result_read = aclrtMemcpy(&device_result, sizeof(device_result), result.data,
                                         sizeof(device_result), ACL_MEMCPY_DEVICE_TO_HOST);
   if (result_read == ACL_SUCCESS) {
@@ -146,9 +141,7 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
   if (sync != ACL_SUCCESS || drained.status != 0) {
     std::fprintf(stderr, "AICPU execution failed: stream=%d cpu_status=%llu\n",
                  (int)sync, (unsigned long long)drained.status);
-    // Existing transport Shutdown ignores some provider teardown errors.
-    // Do not interpret its OK as proof that a failed/partial WRITE is drained.
-    // Let the CPU exit, but retain device resources on this abnormal path.
+    // Retain the target after failed transfers until the CPU has exited.
     try { Send(fd, &report, sizeof(report)); } catch (...) {}
     std::fprintf(stderr, "Failed run: target retained. Stop this process after the CPU test has exited.\n");
     for (;;) pause();
