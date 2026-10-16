@@ -3,19 +3,19 @@
 This validates control flow and bounded waiting, not fabric or NPU performance.
 The function and host diagnostic formatter are extracted from current sources.
 """
-from pathlib import Path
+
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
-
 
 ROOT = Path(__file__).resolve().parents[2]
 DEMO = ROOT / "access_operator/demo/aiv_batch_put"
 
 
 def _body(text, begin, end):
-    return text[text.index(begin):text.index(end, text.index(begin))]
+    return text[text.index(begin) : text.index(end, text.index(begin))]
 
 
 def test_actual_cq_wait_and_host_diagnostics(tmp_path):
@@ -24,13 +24,21 @@ def test_actual_cq_wait_and_host_diagnostics(tmp_path):
         pytest.skip("C++ compiler unavailable")
     kernel = (DEMO / "kernel/execute_batch_put_aiv.asc").read_text()
     host = (DEMO / "host/batch_put_host.cpp").read_text()
-    wait = _body(kernel, "__aicore__ inline uint64_t WaitForCompletion(", "\n}  // namespace")
-    formatter = _body(host, "static void LogBatchPutCompletionDiagnostics(", '\nextern "C" int32_t KvafExecuteBatchPutSync(')
-    source = r'''
+    wait = _body(
+        kernel, "__aicore__ inline uint64_t WaitForCompletion(", "\n}  // namespace"
+    )
+    formatter = _body(
+        host,
+        "static void LogBatchPutCompletionDiagnostics(",
+        '\nextern "C" int32_t KvafExecuteBatchPutSync(',
+    )
+    source = (
+        r"""
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <type_traits>
 #include "batch_put_internal.h"
 #define __aicore__
 #define __gm__
@@ -45,17 +53,26 @@ constexpr uint64_t kCqTimeout = KVAF_BATCH_PUT_CORE_CQ_TIMEOUT;
 uint64_t ticks, tick_step, arrival;
 uint32_t reads, arrival_word, doorbells;
 namespace AscendC { uint64_t GetSystemCycle() { return ticks; } }
-void CleanCacheLines(uint8_t *address, uint64_t) {
-  ++reads;
-  ticks += tick_step;
-  if (arrival != 0U && reads >= arrival)
-    *reinterpret_cast<uint32_t *>(address) = arrival_word;
+// Direct device reads see transport DDR without touching an older L1 line.
+template<class T> T ReadGmByPassDCache(T *address) {
+  if constexpr (std::is_same<T, uint32_t>::value) {
+    ++reads; ticks += tick_step;
+    if (arrival != 0U && reads >= arrival) *address = arrival_word;
+  }
+  return *address;
 }
+template<class T> void WriteGmByPassDCache(T *address, T value) { *address = value; }
+enum class MemDsbT { DDR };
+template<MemDsbT> void DataSyncBarrier() {}
+void CleanCacheLines(uint8_t *, uint64_t) { assert(false && "CQ probe must not write back stale L1"); }
 void st_dev(uint32_t value, uint32_t *address, int) {
   *address = value;
   ++doorbells;
 }
-''' + wait + formatter + r'''
+"""
+        + wait
+        + formatter
+        + r"""
 void configure(uint64_t at, uint32_t word, uint64_t step = 1U) {
   ticks = 0; tick_step = step; arrival = at; reads = 0;
   arrival_word = word; doorbells = 0;
@@ -143,14 +160,33 @@ int main() {
   assert(sizeof(s)==384 && sizeof(KvafExecuteBatchPutKernelArgs)==56);
   std::puts("BATCH_PUT_CQ_CPU_PASS cases=7 ABI=384 SGE_0_7_preserved=1");
 }
-'''
+"""
+    )
     cpp = tmp_path / "cq_wait.cpp"
     cpp.write_text(source)
     executable = tmp_path / "cq_wait"
-    subprocess.run([compiler, "-std=c++17", "-O2", "-fsanitize=address,undefined",
-                    "-fno-omit-frame-pointer", "-I", str(DEMO / "include"),
-                    str(cpp), "-o", str(executable)], check=True, capture_output=True, text=True)
-    result = subprocess.run([str(executable)], check=True, capture_output=True, text=True, timeout=20)
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-O2",
+            "-fsanitize=address,undefined",
+            "-fno-omit-frame-pointer",
+            "-I",
+            str(DEMO / "include"),
+            str(cpp),
+            "-o",
+            str(executable),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    result = subprocess.run(
+        [str(executable)], check=True, capture_output=True, text=True, timeout=20
+    )
+    (tmp_path / "cq.stdout.log").write_text(result.stdout)
+    (tmp_path / "cq.stderr.log").write_text(result.stderr)
     assert "BATCH_PUT_CQ_CPU_PASS cases=7" in result.stdout
     assert "late_success=1 timeout_reason=none" in result.stderr
     assert "timeout_reason=device_deadline" in result.stderr
@@ -158,10 +194,53 @@ int main() {
     assert "core=0 jetty=1 result=8" in result.stderr
     assert "core=0 jetty=0 result=0 rows=32" in result.stderr
     assert "core=0 jetty=1 result=7 rows=1" in result.stderr
-    assert result.stderr.startswith("[KVAF_AIV] BATCH_PUT_CQ_WAIT_DETAILS core=0 jetty=1 result=0")
+    assert result.stderr.startswith(
+        "[KVAF_AIV] BATCH_PUT_CQ_WAIT_DETAILS core=0 jetty=1 result=0"
+    )
     assert "cqe_valid=0" in result.stderr
     assert "cqe_valid=1" in result.stderr
     assert "eager_put_cq_not_Get_performance" in result.stderr
+    # A dirty scalar-L1 line left from an earlier allocation is independent
+    # of a fresh NIC DDR write. Reconstruct the previous clean/cached probe:
+    # its writeback destroys the injected completion; bypass preserves it.
+    cached_probe = "ReadCachedCq(reinterpret_cast<__gm__ uint32_t *>(cqe_address))"
+    cached_wait = wait.replace(
+        "ReadGmByPassDCache<uint32_t>(reinterpret_cast<__gm__ uint32_t *>(cqe_address))",
+        cached_probe,
+    )
+    assert cached_wait.count(cached_probe) == 2
+    stale_l1 = r"""
+uint32_t ReadCachedCq(uint32_t *address) {
+  ++reads; ticks += tick_step;
+  if (arrival != 0U && reads >= arrival) *address = arrival_word; // NIC DDR write.
+  *address = 0U; // DCCI writes the older dirty L1 line back before its GM read.
+  return *address;
+}
+"""
+    cached_source = source.replace(wait, stale_l1 + cached_wait)
+    cached_cpp = tmp_path / "cq_cached_probe.cpp"
+    cached_cpp.write_text(cached_source)
+    cached_executable = tmp_path / "cq_cached_probe"
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-O2",
+            "-I",
+            str(DEMO / "include"),
+            str(cached_cpp),
+            "-o",
+            str(cached_executable),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    cached = subprocess.run(
+        [str(cached_executable)], capture_output=True, text=True, timeout=20
+    )
+    (tmp_path / "old_dcci_probe.failure.log").write_text(cached.stderr)
+    assert cached.returncode != 0 and "WaitForCompletion" in cached.stderr
 
 
 def test_does_not_change_registration_or_get_contract():

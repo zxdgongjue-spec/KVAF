@@ -1,16 +1,16 @@
-"""Exercise the tagged UB/MTE3 Put helpers against delayed DMA and event models.
+"""Exercise production Put SQ publication against delayed DMA and durable DDR.
 
-The model checks tagged event/doorbell ordering and ring copies. Source parity
-checks reject any data-path change beyond the two fresh CQ polling reads.
-Neither test establishes that a target NPU transport failure is resolved.
+Only the bypass store followed by a DDR barrier publishes the producer index.
+A cached C++ assignment cannot satisfy the independently modelled device DB.
+This verifies ordering and ring copies, not target transport recovery.
 """
-from pathlib import Path
+
 import hashlib
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
-
 
 ROOT = Path(__file__).resolve().parents[2]
 DEMO = ROOT / "access_operator/demo/aiv_batch_put"
@@ -18,7 +18,7 @@ DEMO = ROOT / "access_operator/demo/aiv_batch_put"
 
 def _between(text, begin, end):
     first = text.index(begin)
-    return text[first:text.index(end, first)]
+    return text[first : text.index(end, first)]
 
 
 def test_actual_put_sq_and_producer_publication(tmp_path):
@@ -26,11 +26,22 @@ def test_actual_put_sq_and_producer_publication(tmp_path):
     if compiler is None:
         pytest.skip("C++ compiler unavailable")
     kernel = (DEMO / "kernel/execute_batch_put_aiv.asc").read_text()
-    structs = _between(kernel, "struct PreparedPost {", "__aicore__ inline void CleanCacheLines(")
-    clean = _between(kernel, "__aicore__ inline void CleanCacheLines(", "__aicore__ inline uint32_t WqeControl(")
+    structs = _between(
+        kernel, "struct PreparedPost {", "__aicore__ inline void CleanCacheLines("
+    )
+    clean = _between(
+        kernel,
+        "__aicore__ inline void CleanCacheLines(",
+        "__aicore__ inline uint32_t WqeControl(",
+    )
     copy = _between(kernel, "__aicore__ inline void CopyUbToGm(", "__simt_vf__")
-    publish = _between(kernel, "__aicore__ inline void CopyPreparedPostToSq(", "__aicore__ inline void PostBatchPutRequests(")
-    source = r'''
+    publish = _between(
+        kernel,
+        "__aicore__ inline void CopyPreparedPostToSq(",
+        "__aicore__ inline void PostBatchPutRequests(",
+    )
+    source = (
+        r"""
 #include <array>
 #include <cassert>
 #include <cstdint>
@@ -59,7 +70,7 @@ struct DmaCopy { uint8_t *destination; std::vector<uint8_t> data; };
 std::vector<DmaCopy> pending_dma;
 KvafBatchPutQueueState *current_queue;
 uint32_t *current_doorbell;
-uint64_t durable_head, clean_sequence, sync_sequence;
+uint64_t durable_head, pending_head, publish_sequence, sync_sequence;
 uint32_t doorbells;
 std::array<std::array<std::array<unsigned,2>,4>,4> events;
 void *get_imm(uint32_t offset) { return ub+offset; }
@@ -95,21 +106,31 @@ void DataCacheCleanAndInvalid(T &line) {
   // including neighbors, so a PI-only overwrite cannot silently pass.
   assert(reinterpret_cast<uint8_t *>(&line) ==
          reinterpret_cast<uint8_t *>(current_queue));
-  assert(false && "tag publication must not add producer DCCI");
+  assert(false && "bypass publication must not dirty the software queue line");
+}
+template<class T> void WriteGmByPassDCache(T *address, T value) {
+  assert(address == &current_queue->sq_producer_index && pending_dma.empty());
+  *address = value; pending_head = value; ++publish_sequence;
 }
 template<MemDsbT> void DataSyncBarrier() {
   assert(pending_dma.empty());
-  sync_sequence=clean_sequence;
+  durable_head = pending_head; sync_sequence = publish_sequence;
 }
 void st_dev(uint32_t value, uint32_t *address, int) {
   assert(address==current_doorbell);
   assert(pending_dma.empty());
-  assert(clean_sequence==0 && sync_sequence==0);
+  assert(publish_sequence == 1 && sync_sequence == publish_sequence);
+  assert(durable_head == value);
   assert(value==static_cast<uint32_t>(current_queue->sq_producer_index));
   *address=value;
   ++doorbells;
 }
-''' + structs + clean + copy + publish + r'''
+"""
+        + structs
+        + clean
+        + copy
+        + publish
+        + r"""
 void run(uint32_t bank, uint32_t head, uint32_t count, bool release_bank) {
   constexpr uint32_t depth=64;
   alignas(64) uint8_t sq[depth*kWqeBytes]={};
@@ -120,7 +141,7 @@ void run(uint32_t bank, uint32_t head, uint32_t count, bool release_bank) {
   queue.sq_producer_index=head; queue.cq_consumer_index=17;
   queue.completed_batch_count=8; queue.last_error=0;
   for(uint32_t i=0;i<3;++i) queue.reserved[i]=0xfeed0000U+i;
-  durable_head=head; clean_sequence=0; sync_sequence=0; doorbells=0;
+  durable_head=pending_head=head; publish_sequence=0; sync_sequence=0; doorbells=0;
   pending_dma.clear(); events={};
   for(uint32_t i=0;i<kWqeBankBytes;++i)
     ub[bank*kWqeBankBytes+i]=static_cast<uint8_t>((i*13U+bank+1U)&255U);
@@ -139,7 +160,7 @@ void run(uint32_t bank, uint32_t head, uint32_t count, bool release_bank) {
     assert(sq[((head%depth)*kWqeBytes+i)%(depth*kWqeBytes)]==
            ub[bank*kWqeBankBytes+i]);
   assert(db==head+count && queue.sq_producer_index==head+count);
-  assert(doorbells==1 && durable_head==head && clean_sequence==0);
+  assert(doorbells==1 && durable_head==head+count && publish_sequence==1);
   assert(queue.magic==0x4b564151U && queue.initialized==1);
   assert(queue.cq_consumer_index==17 && queue.completed_batch_count==8);
   assert(queue.last_error==0);
@@ -155,29 +176,86 @@ int main() {
       run(bank,128,count,true);
     }
   assert(sizeof(KvafBatchPutQueueState)==64);
-  std::puts("BATCH_PUT_TAG_PUBLICATION_CPU_PASS cases=36 ring_wrap=1 ABI=64");
+  std::puts("BATCH_PUT_BYPASS_PUBLICATION_CPU_PASS cases=36 ring_wrap=1 ABI=64");
 }
-'''
+"""
+    )
     cpp = tmp_path / "put_publication.cpp"
     cpp.write_text(source)
     executable = tmp_path / "put_publication"
-    subprocess.run([compiler, "-std=c++17", "-O2", "-fsanitize=address,undefined",
-                    "-I", str(DEMO / "include"), str(cpp), "-o", str(executable)],
-                   check=True, capture_output=True, text=True)
-    result = subprocess.run([str(executable)], check=True, capture_output=True,
-                            text=True)
-    assert "BATCH_PUT_TAG_PUBLICATION_CPU_PASS cases=36" in result.stdout
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-O2",
+            "-fsanitize=address,undefined",
+            "-I",
+            str(DEMO / "include"),
+            str(cpp),
+            "-o",
+            str(executable),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    result = subprocess.run(
+        [str(executable)], check=True, capture_output=True, text=True
+    )
+    (tmp_path / "publication.stdout.log").write_text(result.stdout)
+    assert "BATCH_PUT_BYPASS_PUBLICATION_CPU_PASS cases=36" in result.stdout
+    # Reconstruct the old publication edge: the C++ assignment changes the
+    # scalar cache image while the doorbell still observes the old DDR PI.
+    old_publish = publish.replace(
+        "WriteGmByPassDCache<uint64_t>(&queue->sq_producer_index, pending->next_head);\n  DataSyncBarrier<MemDsbT::DDR>();",
+        "queue->sq_producer_index = pending->next_head;",
+    )
+    assert old_publish != publish
+    cached_cpp = tmp_path / "put_cached_publication.cpp"
+    cached_cpp.write_text(source.replace(publish, old_publish))
+    cached_executable = tmp_path / "put_cached_publication"
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-O2",
+            "-I",
+            str(DEMO / "include"),
+            str(cached_cpp),
+            "-o",
+            str(cached_executable),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    cached = subprocess.run([str(cached_executable)], capture_output=True, text=True)
+    (tmp_path / "old_cached_publication.failure.log").write_text(cached.stderr)
+    assert cached.returncode != 0 and "publish_sequence" in cached.stderr
 
 
-def test_put_data_path_matches_saved_tag_except_fresh_cq_reads():
-    """Pin the full tagged kernel and CMake, allowing only two CQ read fixes."""
+def test_put_wqe_bytes_and_copy_geometry_match_saved_tag():
+    """Keep protocol materialization and SQ copy geometry byte-for-byte fixed."""
     kernel = (DEMO / "kernel/execute_batch_put_aiv.asc").read_text()
-    assert kernel.count('const volatile uint32_t *>(cqe_address)') == 2
-    assert kernel.count('__asm__ __volatile__("" ::: "memory");') == 4
-    tagged = kernel.replace('__asm__ __volatile__("" ::: "memory");',
-                            '__asm__ __volatile__("");')
-    tagged = tagged.replace('reinterpret_cast<__gm__ const volatile uint32_t *>(cqe_address)',
-                            'reinterpret_cast<__gm__ uint32_t *>(cqe_address)')
-    # q1-nomtp-hostddr-matrix-v1-20261013, commit 8ef4f1d8c3f4b324bea9125b699d180e42dfae2f.
-    assert hashlib.sha256(tagged.encode()).hexdigest() == "d19c7b448515e493101bfd8a753a7fc0e9deb00eff0afdaf435142c3fbb5b2e2"
-    assert hashlib.sha256((DEMO / "kernel/CMakeLists.txt").read_bytes()).hexdigest() == "e03386984a49ef04eaa6ce8babef35dceff251874c22409f7468619a06e86df0"
+    wqe = _between(
+        kernel,
+        "__simt_vf__ __aicore__ LAUNCH_BOUND(32)",
+        "__aicore__ inline void PreparePostVectorStage(",
+    )
+    copy = _between(
+        kernel,
+        "__aicore__ inline void CopyPreparedPostToSq(",
+        "__aicore__ inline void PreparePostMte3Stage(",
+    )
+    assert (
+        hashlib.sha256(wqe.encode()).hexdigest()
+        == "84ea53c6d1dfe5af2ea2527240ae9cfb7c53778d7f6f8b359bedfa524e78ee09"
+    )
+    assert (
+        hashlib.sha256(copy.encode()).hexdigest()
+        == "bd5679c70a7a1ab88e2a4b179a0425392ead4ffc30614cf2206e49a3077e1c73"
+    )
+    assert (
+        hashlib.sha256((DEMO / "kernel/CMakeLists.txt").read_bytes()).hexdigest()
+        == "e03386984a49ef04eaa6ce8babef35dceff251874c22409f7468619a06e86df0"
+    )
