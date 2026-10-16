@@ -42,7 +42,7 @@ struct CpuUrmaTransportOptions {
   // list per Jetty.
   std::uint32_t wqes_per_doorbell{0};
   // Legacy public name. WRITE gathers up to this many local source SGEs into
-  // one contiguous remote HBM SGE. By default every input row is a distinct SGE.
+  // one contiguous remote HBM SGE. Every input row remains a distinct SGE.
   // Device max_jfs_sge, max_msg_size, or a remote gap may split the WR earlier.
   std::uint32_t remote_sgl_size{1};
   // Number of independent Jettys and their submission/CQ owners.
@@ -109,7 +109,9 @@ class CpuUrmaTransport final {
   using PreparedWriteId = std::uint64_t;
   struct PreparedWriteCompletion { PreparedWriteId id{}; };
   // Build/register immutable address/SGL descriptors once, outside the hot
-  // loop. Source PAYLOAD may change only while this plan is idle; source memory
+  // loop. Preserve each source row as one local SGE; gather rows into WRs
+  // according to remote adjacency and device limits, without packing payload.
+  // Source PAYLOAD may change only while this plan is idle; source memory
   // must remain allocated until completion, or successful Shutdown on error.
   // One plan must fit one Jetty wave; no synchronous transfer is permitted
   // while prepared WRITEs are in flight. Calls share one submission/CQ owner.

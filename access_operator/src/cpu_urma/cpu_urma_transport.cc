@@ -3,7 +3,6 @@
 #include "cpu_urma/sgl_batch_builder.h"
 #include "cpu_urma/jetty_batch_dispatch.h"
 #include "cpu_urma/indexed_async_write_tracker.h"
-#include "cpu_urma/contiguous_write_spans.h"
 #include "cpu_urma/prepared_write_routing.h"
 #include "cpu_urma/write_chain_schedule.h"
 
@@ -1361,27 +1360,12 @@ struct CpuUrmaTransport::Impl {
     auto& job = plan->job;
     job.write = true;
     job.queues.resize(local_jettys_.size());
-    std::vector<CpuUrmaTransport::HostSge> merged;
-    std::vector<std::uint64_t> merged_offsets;
     for (std::size_t q = 0; q < job.queues.size(); ++q) {
       const auto range = cpu_urma_detail::PreparedRowsForQueue(count, job.queues.size(), q);
       const auto rows = range.count;
       EnsureSglQueueStorage(job.queues[q], rows, rows);
       if (!rows) continue;
-      const auto first = range.first;
-      {
-        status = cpu_urma_detail::CoalesceWriteSpans(sources + first, offsets + first, rows,
-            remote_region_.length, max_message_bytes_,
-            [&](const void* data, std::size_t bytes) -> urma_target_seg_t* {
-              if (HostSpanFitsRegisteredBuffer(explicit_host_region_, data, bytes))
-                return explicit_host_region_.segment;
-              auto* host = FindRegisteredHostBuffer(data, bytes);
-              return host ? host->segment : nullptr;
-            }, &merged, &merged_offsets);
-        if (!status.ok()) return status;
-        status = BuildWriteGatherQueue(job, q, merged.data(), merged_offsets.data(),
-                                      merged.size(), 0, merged.size());
-      }
+      status = BuildWriteGatherQueue(job, q, sources, offsets, count, range.first, rows);
       if (!status.ok()) return status;
       // All host spans were registered before building; no deferred lookup.
       if (!job.queues[q].missing_host_segments.empty())
@@ -1431,8 +1415,6 @@ struct CpuUrmaTransport::Impl {
       queue.wrs.resize(capacity[q]);
     }
     SglBatchJob temp; temp.write = true; temp.queues.resize(job.queues.size());
-    std::vector<CpuUrmaTransport::HostSge> merged;
-    std::vector<std::uint64_t> merged_offsets;
     std::array<std::size_t, kMaxJettyCount> locals{};
     for (std::size_t c = 0; c < count; ++c) {
       const auto& chunk = chunks[c];
@@ -1440,26 +1422,14 @@ struct CpuUrmaTransport::Impl {
         const auto range = cpu_urma_detail::PreparedRowsForQueue(chunk.count, job.queues.size(), q);
         auto& dst = job.queues[q]; auto& src = temp.queues[q];
         EnsureSglQueueStorage(src, range.count, range.count);
-        Status status;
-        if (range.count) {
-          status = cpu_urma_detail::CoalesceWriteSpans(chunk.sources + range.first,
-              chunk.remote_offsets + range.first, range.count, remote_region_.length, max_message_bytes_,
-              [&](const void* p, std::size_t n) -> urma_target_seg_t* {
-                if (HostSpanFitsRegisteredBuffer(explicit_host_region_, p, n)) return explicit_host_region_.segment;
-                auto* host = FindRegisteredHostBuffer(p, n); return host ? host->segment : nullptr;
-              }, &merged, &merged_offsets);
-          if (!status.ok()) return status;
-          status = BuildWriteGatherQueue(temp, q, merged.data(), merged_offsets.data(), merged.size(), 0, merged.size());
-        } else status = BuildWriteGatherQueue(temp, q, chunk.sources, chunk.remote_offsets,
-                                               chunk.count, range.first, range.count);
+        const auto status = BuildWriteGatherQueue(temp, q, chunk.sources, chunk.remote_offsets,
+                                                chunk.count, range.first, range.count);
         if (!status.ok()) return status;
         if (!src.missing_host_segments.empty()) return Status::Internal("unresolved chain host segment");
         const auto local_base = locals[q];
-        const auto local_count = src.count ? static_cast<std::size_t>(
-            reinterpret_cast<SglSgeAbi*>(src.wrs[src.count - 1].rw.src.sge) - src.local.data()) +
-            src.wrs[src.count - 1].rw.src.num_sge : 0;
-        std::copy_n(src.local.data(), local_count, dst.local.data() + local_base);
-        locals[q] += local_count;
+        // The gather builder emits exactly one local SGE per source row.
+        std::copy_n(src.local.data(), range.count, dst.local.data() + local_base);
+        locals[q] += range.count;
         for (std::size_t w = 0; w < src.count; ++w) {
           const auto index = dst.count++;
           dst.wrs[index] = src.wrs[w];

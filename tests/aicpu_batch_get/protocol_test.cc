@@ -4,7 +4,6 @@
 #include "output_readback.h"
 #include "output_verify.h"
 #include "cpu_urma/indexed_async_write_tracker.h"
-#include "cpu_urma/contiguous_write_spans.h"
 #include "cpu_urma/write_chain_schedule.h"
 #include <array>
 #include <cstdio>
@@ -140,18 +139,7 @@ void Completions() {
   }
   Require(burst.Empty() && hits[1] == 1 && hits[2] == 1, "lost/duplicated completion");
 }
-void SourcesAndOutput() {
-  std::vector<std::uint8_t> memory(4096); std::vector<kvaf::CpuUrmaTransport::HostSge> merged;
-  kvaf::CpuUrmaTransport::HostSge input[]{{memory.data(), 656}, {memory.data() + 656, 656}};
-  std::uint64_t offsets[]{0, 656}; std::vector<std::uint64_t> merged_offsets;
-  auto merge = [&](std::uint64_t limit) {
-    return CoalesceWriteSpans(input, offsets, 2, memory.size(), limit,
-        [](auto, auto) { return 1; }, &merged, &merged_offsets);
-  };
-  Require(merge(65536).ok() && merged.size() == 1 && merged[0].bytes == 1312, "contiguous spans not merged");
-  Require(merge(656).ok() && merged.size() == 2, "message boundary crossed");
-  input[1].data = memory.data() + 672;
-  Require(merge(65536).ok() && merged.size() == 2, "source gap discarded");
+void ScatterOutput() {
   Config c; c.rows = 4; c.verify_payload = c.verify_each_round = 1;
   Layout l{}; Require(MakeLayout(c, &l), "output layout rejected");
   OutputReadbackVerifier verifier(c, l); std::uint64_t mismatch_offset{};
@@ -190,7 +178,7 @@ void Acknowledgements() {
 int main() {
   try {
     Bounds(); DeviceSelection(); RangesAndMetrics(); ReadyAndPosting();
-    Completions(); SourcesAndOutput(); Acknowledgements();
+    Completions(); ScatterOutput(); Acknowledgements();
     std::puts("aicpu ordered pipeline protocol: PASS"); return 0;
   } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
 }

@@ -4,6 +4,8 @@
 
 CPU 预构建 SGL/WR，有序 WRITE 发布各 Jetty 的 chunk 进度，AICPU 按范围并行
 调用 securec `memcpy_sp`，通信与 scatter 重叠。支持 `--scatter-threads 1..32`。
+传输路径固定为离散 CPU 源地址 → 连续 HBM staging → 离散 output slot。
+每行保留一个本地 SGE，仅按目标连续性和设备上限聚合为 WR；不做源段合并或 CPU 打包。
 默认 4096×656 B、4 核/4 Jetty、chunk 1024、doorbell 32、CQ batch 8/deadline 32，
 payload 缓存维护关闭、仅末轮回读校验；CPU caller 局部 -O2，URMA 初始化编译方式不变。
 CSV engine 为 `aicpu_sgl_ordered_write`。旧 `--profile-scatter` 及实验模式参数已移除。
