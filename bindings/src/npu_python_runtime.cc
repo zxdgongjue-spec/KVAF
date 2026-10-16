@@ -356,6 +356,42 @@ class NpuPythonRuntime final {
         lengths}, BatchPutExecutionOptions{acl_stream}));
   }
 
+  // Untimed initialization of owned Host DDR. The CPU buffer stays borrowed
+  // and alive through synchronous metadata allocation, copy and commit.
+  void BatchPutHost(const std::vector<KeyId>& keys, const py::buffer& source,
+                    const std::vector<std::uint64_t>& input_offsets,
+                    const std::vector<std::uint64_t>& lengths) {
+    if (!Initialized()) throw std::runtime_error("Runtime has not been initialized");
+    if (!native_->local_host_ddr()) throw py::value_error("batch_put_host requires local_host_ddr=True");
+    if (fused_context_.lease_id != 0U) throw py::value_error("cannot seed Host DDR during a fused lease");
+    if (keys.empty() || keys.size() != input_offsets.size() || keys.size() != lengths.size()) {
+      throw py::value_error("batch_put_host requires equally sized nonempty keys, offsets and lengths");
+    }
+    const py::buffer_info view = source.request();
+    if (view.itemsize != 1 || view.format != py::format_descriptor<std::uint8_t>::format() ||
+        view.ndim < 1 || view.size <= 0 || view.ptr == nullptr) {
+      throw py::value_error("batch_put_host source must be a nonempty unsigned uint8 CPU buffer");
+    }
+    py::ssize_t stride = 1;
+    for (py::ssize_t dimension = view.ndim; dimension-- > 0;) {
+      if (view.shape[dimension] <= 0 ||
+          (view.shape[dimension] > 1 && view.strides[dimension] != stride) ||
+          view.shape[dimension] > std::numeric_limits<py::ssize_t>::max() / stride) {
+        throw py::value_error("batch_put_host source must be C-contiguous");
+      }
+      stride *= view.shape[dimension];
+    }
+    const auto bytes = static_cast<std::size_t>(view.size);
+    for (std::size_t index = 0; index < keys.size(); ++index) {
+      if (lengths[index] == 0U || input_offsets[index] > bytes || lengths[index] > bytes - input_offsets[index]) {
+        throw py::value_error("batch_put_host source offsets/lengths escape the CPU buffer");
+      }
+    }
+    ThrowIfError(native_->core().BatchPut(
+        BatchPutRequest{keys, ConstBufferView{view.ptr, bytes, DeviceKind::kCpu}, input_offsets, lengths},
+        BatchPutExecutionOptions{}));
+  }
+
   AccessTableHandle PrepareAccessTable(const py::object& keys) {
     std::vector<KeyId> copied_keys = CopyPrepareKeys(keys);
     AccessTableHandle handle;
@@ -668,6 +704,10 @@ void BindNpuPythonRuntime(py::module_& module) {
            "Synchronously write variable-size packed NPU blocks. input_offsets and "
            "lengths are CPU integer sequences with one entry per key; "
            "stream=None uses torch.npu.current_stream().")
+      .def("batch_put_host", &NpuPythonRuntime::BatchPutHost, py::arg("keys"),
+           py::arg("source"), py::arg("input_offsets"), py::arg("lengths"),
+           "Synchronously seed owned local Host DDR from a C-contiguous unsigned uint8 CPU buffer. "
+           "Uses Runtime metadata allocation/commit and no NPU Put kernel; call outside performance measurement.")
       .def("prepare_access_table", &NpuPythonRuntime::PrepareAccessTable,
            py::arg("keys"))
       .def("access_table_view", &NpuPythonRuntime::AccessTableView,

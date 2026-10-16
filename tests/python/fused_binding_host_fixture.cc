@@ -3,6 +3,7 @@
 #include <pybind11/pybind11.h>
 
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <utility>
@@ -10,6 +11,7 @@
 #include "acl/acl.h"
 #include "npu_python_runtime.h"
 #include "npu_runtime.h"
+#include "meta_manager.h"
 
 namespace py = pybind11;
 namespace {
@@ -25,17 +27,56 @@ struct Driver {
   bool fail_acquire{false};
   bool fail_release{false};
   bool fail_set_device{false};
+  int host_puts{0};
+  std::vector<std::uint8_t> host_seed_bytes;
 } driver;
 std::uint64_t next_lease = 1;
+
+class CpuSeedAllocator : public kvaf::DdrMemoryAllocator {
+ public:
+  kvaf::Status Allocate(const kvaf::RuntimeInitRequest& request, kvaf::RemoteRegionDesc* region) override {
+    bytes.resize(request.ddr_bytes);
+    *region = {reinterpret_cast<std::uint64_t>(bytes.data()), request.ddr_bytes, request.slot_size, kvaf::DeviceKind::kCpu};
+    return kvaf::Status::OK();
+  }
+  kvaf::Status Release(const kvaf::RemoteRegionDesc&) override { bytes.clear(); return kvaf::Status::OK(); }
+  std::vector<std::uint8_t> bytes;
+};
+
+class CpuSeedOperator : public kvaf::AccessOperator {
+ public:
+  kvaf::Status Initialize(const kvaf::RemoteRegionDesc&) override { return kvaf::Status::OK(); }
+  kvaf::Status Shutdown() override { return kvaf::Status::OK(); }
+  kvaf::Status ExecuteBatchGet(const kvaf::BatchGetExecRequest&) override { return kvaf::Status::NotImplemented("fixture"); }
+  kvaf::Status ExecuteBatchPut(const kvaf::BatchPutExecRequest& exec) override {
+    if (exec.request->input.device != kvaf::DeviceKind::kCpu || exec.execution.stream != nullptr) {
+      return kvaf::Status::InvalidArgument("fixture expected streamless CPU seed");
+    }
+    ++driver.host_puts;
+    driver.host_seed_bytes.clear();
+    const auto* source = static_cast<const std::uint8_t*>(exec.request->input.data);
+    for (std::size_t row = 0; row < exec.request->keys.size(); ++row) {
+      const auto* begin = source + exec.request->input_offsets[row];
+      driver.host_seed_bytes.insert(driver.host_seed_bytes.end(), begin, begin + exec.request->lengths[row]);
+      std::memcpy(reinterpret_cast<void*>(exec.put_desc->entries[row].address), begin, exec.request->lengths[row]);
+    }
+    return kvaf::Status::OK();
+  }
+};
 }
 
 namespace kvaf {
 struct NpuRuntime::Impl {
-  explicit Impl(NpuRuntimeOptions value) : options(std::move(value)) {}
+  explicit Impl(NpuRuntimeOptions value) : options(std::move(value)), metadata(CreateInMemoryMetaManager()),
+      runtime_core(*metadata, cpu_operator, allocator) {}
   NpuRuntimeOptions options;
   bool initialized{false};
   bool quarantined{false};
   FusedBatchGetContext context;
+  std::unique_ptr<MetaManager> metadata;
+  CpuSeedOperator cpu_operator;
+  CpuSeedAllocator allocator;
+  RuntimeCore runtime_core;
 };
 
 NpuRuntime::NpuRuntime(NpuRuntimeOptions options)
@@ -45,13 +86,19 @@ Status NpuRuntime::LinkTo(const LinkTarget&) { return Status::OK(); }
 Status NpuRuntime::AcceptLink(const LinkTarget&) { return Status::NotImplemented("fixture"); }
 Status NpuRuntime::ReleaseLink(LinkId) { return Status::NotImplemented("fixture"); }
 Status NpuRuntime::ServeConnection(int) { return Status::NotImplemented("fixture"); }
-Status NpuRuntime::Initialize(std::uint64_t, std::uint64_t) {
+Status NpuRuntime::Initialize(std::uint64_t bytes, std::uint64_t slot) {
+  const auto result = impl_->runtime_core.Initialize({bytes, slot, DeviceKind::kCpu});
+  if (!result.ok()) return result;
   impl_->initialized = true;
   return Status::OK();
 }
 Status NpuRuntime::Shutdown() {
   ++driver.shutdowns;
   if (impl_->context.lease_id) return Status::Busy("fixture active lease");
+  if (impl_->initialized) {
+    const auto result = impl_->runtime_core.Shutdown();
+    if (!result.ok()) return result;
+  }
   impl_->initialized = false;
   return Status::OK();
 }
@@ -129,22 +176,8 @@ Status NpuRuntime::ReleaseFusedBatchGetContext(const FusedBatchGetContext& conte
 
 // Unrelated entry points must link for the actual binding TU, but are never
 // exercised by the lease tests. Fail loudly if the fixture scope expands.
-RuntimeCore& NpuRuntime::core() { throw std::runtime_error("fixture has no RuntimeCore"); }
-const RuntimeCore& NpuRuntime::core() const { throw std::runtime_error("fixture has no RuntimeCore"); }
-Status RuntimeCore::PrepareAccessTable(const AccessTablePrepareRequest&, AccessTableHandle*) {
-  return Status::NotImplemented("fixture");
-}
-Status RuntimeCore::GetAccessTableView(const AccessTableHandle&, AccessTableView*) const {
-  return Status::NotImplemented("fixture");
-}
-Status RuntimeCore::ReleaseAccessTable(const AccessTableHandle&) { return Status::NotImplemented("fixture"); }
-Status RuntimeCore::BatchPut(const BatchPutRequest&, BatchPutExecutionOptions) {
-  return Status::NotImplemented("fixture");
-}
-Status RuntimeCore::BatchGet(const BatchGetRequest&, const BatchGetExecutionOptions&) {
-  return Status::NotImplemented("fixture");
-}
-Status RuntimeCore::BatchFree(const BatchFreeRequest&) { return Status::NotImplemented("fixture"); }
+RuntimeCore& NpuRuntime::core() { return impl_->runtime_core; }
+const RuntimeCore& NpuRuntime::core() const { return impl_->runtime_core; }
 }
 
 extern "C" {
@@ -173,6 +206,10 @@ PYBIND11_MODULE(_kvaf_fused_binding_host, module) {
     result["destructions"] = driver.destructions;
     result["selected_device"] = driver.selected_device;
     result["last_stream"] = driver.last_stream;
+    result["host_puts"] = driver.host_puts;
     return result;
+  });
+  module.def("host_seed_bytes", [] {
+    return py::bytes(reinterpret_cast<const char*>(driver.host_seed_bytes.data()), driver.host_seed_bytes.size());
   });
 }

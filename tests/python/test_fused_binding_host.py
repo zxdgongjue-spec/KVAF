@@ -8,6 +8,7 @@ torch is not imported or executed by these tests.
 """
 from __future__ import annotations
 
+import array
 import gc
 import importlib
 import importlib.util
@@ -58,7 +59,8 @@ def compile_fixture(destination: Path) -> Path:
     command += [f"-I{path}" for path in includes]
     command += [str(ROOT / path) for path in (
         "bindings/src/npu_python_runtime.cc", "bindings/src/acl_python_utils.cc",
-        "tests/python/fused_binding_host_fixture.cc")]
+        "tests/python/fused_binding_host_fixture.cc", "runtime/src/runtime.cc", "runtime/src/runtime_service.cc",
+        "meta_manager/src/in_memory_meta_manager.cc")]
     command += ["-o", str(output)]
     subprocess.run(command, check=True, capture_output=True, text=True)
     return output
@@ -153,6 +155,47 @@ class FusedBindingHostTest(unittest.TestCase):
         self.assertEqual(self.module.stats(), before)
         runtime.release_fused_batch_get_context(context)
         runtime.shutdown()
+
+    def test_host_seed_put_copies_real_cpu_uint8_without_resolving_npu_stream(self):
+        runtime = self.module.NpuRuntime("fixture.o", 656, 128, npu_core_count=30, local_host_ddr=True)
+        runtime.initialize(4096, 256)
+        payload = bytearray(range(32))
+        sources = (payload, bytes(payload), memoryview(payload).cast("B", (4, 8)))
+        before = self.module.stats()
+        for index, source in enumerate(sources):
+            runtime.batch_put_host([2 * index + 1, 2 * index + 2], source, [16, 2], [7, 5])
+            self.assertEqual(self.module.host_seed_bytes(), bytes(payload[16:23] + payload[2:7]))
+        after = self.module.stats()
+        self.assertEqual(after["host_puts"], 3)
+        self.assertEqual((after["acquires"], after["fences"], after["last_stream"]),
+                         (before["acquires"], before["fences"], before["last_stream"]))
+        self.assertEqual(runtime.npu_core_count, 30)
+        runtime.shutdown()
+
+    def test_host_seed_put_rejects_bad_buffer_bounds_peer_and_active_lease(self):
+        runtime = self.module.NpuRuntime("fixture.o", 656, 128, local_host_ddr=True)
+        runtime.initialize(4096, 256)
+        payload = bytearray(range(32))
+        for source in (memoryview(payload)[::2], memoryview(payload)[::-1],
+                       array.array("H", range(16)), array.array("b", range(16)), b""):
+            with self.assertRaises(ValueError):
+                runtime.batch_put_host([1], source, [0], [4])
+        with self.assertRaises(TypeError):
+            runtime.batch_put_host([1], Tensor(), [0], [4])
+        for keys, offsets, lengths in (([], [], []), ([1], [], [4]), ([1], [29], [4]), ([1], [0], [0]),
+                                       ([1, 2], [0, 30], [4, 4])):
+            with self.assertRaises(ValueError):
+                runtime.batch_put_host(keys, payload, offsets, lengths)
+        self.assertEqual(self.module.stats()["host_puts"], 0)
+        lease = runtime.acquire_fused_batch_get_context(Tensor(), Stream())
+        with self.assertRaisesRegex(ValueError, "fused lease"):
+            runtime.batch_put_host([1], payload, [0], [4])
+        runtime.release_fused_batch_get_context(lease)
+        runtime.shutdown()
+        peer = self.runtime()
+        with self.assertRaisesRegex(ValueError, "local_host_ddr"):
+            peer.batch_put_host([1], payload, [0], [4])
+        peer.shutdown()
 
     def test_exports_unsigned_context_and_releases_only_after_fence(self):
         runtime = self.runtime()

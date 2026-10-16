@@ -42,6 +42,32 @@ constexpr uint32_t kMaxDirectAivWorkers =
 using DirectHccpApi = hccp::DirectHccpApi;
 using DirectMemory = hccp::DirectMemory;
 
+static void LogBatchPutAclFailure(const char *phase, aclError result) {
+  // Capture the thread-local SDK message before another ACL call can replace
+  // it. This getter reads host diagnostic state and never touches the device.
+  const char *recent = aclGetRecentErrMsg();
+  const char *name = "ACL_ERROR_OTHER";
+  // CANN 9.1 acl/error_codes/rt_error_codes.h: 507034 is a vector timeout;
+  // 507035 is the distinct vector-core exception code.
+  if (result == 507034) name = "ACL_ERROR_RT_VECTOR_CORE_TIMEOUT";
+  else if (result == 507035) name = "ACL_ERROR_RT_VECTOR_CORE_EXCEPTION";
+  char detail[4097]{};
+  size_t bytes = 0U;
+  if (recent != nullptr) {
+    for (; bytes < sizeof(detail) - 1U && recent[bytes] != '\0'; ++bytes) {
+      const char value = recent[bytes];
+      detail[bytes] = value == '\n' || value == '\r' || value == '\t' ? ' ' : value;
+    }
+  }
+  std::fprintf(stderr,
+               "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=%s acl=%d acl_name=%s "
+               "status_snapshot=unavailable device_status_read=0 "
+               "recent_error_bytes=%zu recent_error_truncated=%u recent_error=%s\n",
+               phase, static_cast<int>(result), name, bytes,
+               static_cast<unsigned>(recent != nullptr && recent[bytes] != '\0'),
+               recent == nullptr ? "(unavailable)" : detail);
+}
+
 struct ProcessTokenQueryInfo {
   uint64_t address;
   uint64_t bytes;
@@ -762,8 +788,7 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
   const aclError clear_result =
       aclrtMemset(reinterpret_cast<void *>(arguments->core_status), status_bytes, 0, status_bytes);
   if (clear_result != ACL_SUCCESS) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=clear_status acl=%d\n",
-                 static_cast<int>(clear_result));
+    LogBatchPutAclFailure("clear_status", clear_result);
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
   hccp::VerboseLog("[KVAF_AIV] BATCH_PUT_PHASE phase=launch_begin\n");
@@ -780,8 +805,7 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
   hccp::VerboseLog("[KVAF_AIV] BATCH_PUT_PHASE phase=synchronize_begin\n");
   const aclError synchronize_result = aclrtSynchronizeStream(stream);
   if (synchronize_result != ACL_SUCCESS) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=synchronize acl=%d\n",
-                 static_cast<int>(synchronize_result));
+    LogBatchPutAclFailure("synchronize", synchronize_result);
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
   hccp::VerboseLog("[KVAF_AIV] BATCH_PUT_PHASE phase=copy_status_begin\n");
@@ -789,8 +813,7 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
       aclrtMemcpy(core_status, status_bytes, reinterpret_cast<void *>(arguments->core_status), status_bytes,
                   ACL_MEMCPY_DEVICE_TO_HOST);
   if (status_copy_result != ACL_SUCCESS) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=copy_status acl=%d\n",
-                 static_cast<int>(status_copy_result));
+    LogBatchPutAclFailure("copy_status", status_copy_result);
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
   LogBatchPutCompletionDiagnostics(core_status, core_status_count,

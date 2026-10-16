@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -469,6 +470,62 @@ void TestPersistentCqDiagnosticReadback() {
   Require(op->Shutdown().ok(), "unleased diagnostic CPU fixture shutdown");
 }
 
+void TestCpuHostSeedPut() {
+  driver = {};
+  auto config = Config();
+  config.local_host_ddr = true;
+  config.peer_link.reset();
+  config.npu_core_count = 30;
+  kvaf::DefaultAccessOperator op(config);
+  auto metadata = kvaf::CreateInMemoryMetaManager();
+  Allocator allocator;
+  kvaf::RuntimeCore runtime(*metadata, op, allocator);
+  Require(runtime.Initialize({128, 16, kvaf::DeviceKind::kCpu}).ok(), "CPU seed Runtime initialize");
+  const std::vector<std::uint8_t> source{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+  Require(runtime.BatchPut({{7, 11}, {source.data(), source.size(), kvaf::DeviceKind::kCpu},
+                            {9, 1}, {5, 7}}).ok(), "CPU seed preserves Runtime PreparePut/CommitPut");
+  kvaf::AccessTableHandle table;
+  kvaf::AccessTableView view;
+  Require(runtime.PrepareAccessTable({{7, 11}}, &table).ok() && runtime.GetAccessTableView(table, &view).ok(),
+          "CPU seeded keys become visible through normal metadata");
+  Require(view.size == 2 && view.valid[0] && view.valid[1] && view.lengths[0] == 5 && view.lengths[1] == 7,
+          "CPU seed commits actual variable block lengths");
+  Require(std::memcmp(reinterpret_cast<void*>(view.addresses[0]), source.data() + 9, 5) == 0 &&
+              std::memcmp(reinterpret_cast<void*>(view.addresses[1]), source.data() + 1, 7) == 0,
+          "CPU seed copies every requested real payload byte");
+  Require(runtime.ReleaseAccessTable(table).ok(), "release CPU seed metadata view");
+  const auto saved = allocator.data;
+  kvaf::BatchPutRequest request{{23, 29}, {source.data(), source.size(), kvaf::DeviceKind::kCpu}, {0, 4}, {4, 4}};
+  const auto base = reinterpret_cast<std::uint64_t>(allocator.data.data());
+  for (const std::uint64_t invalid : {base - 1U, base + allocator.data.size() - 3U,
+                                     std::numeric_limits<std::uint64_t>::max()}) {
+    kvaf::PutAccessDesc desc{{{23, base, 4}, {29, invalid, 4}}};
+    Require(!op.ExecuteBatchPut({&request, &desc, {}}).ok() && allocator.data == saved,
+            "all destination bounds are checked before any CPU seed write");
+  }
+  auto invalid_source = request;
+  invalid_source.input_offsets[1] = source.size() - 3;
+  kvaf::PutAccessDesc valid{{{23, base, 4}, {29, base + 16, 4}}};
+  Require(!op.ExecuteBatchPut({&invalid_source, &valid, {}}).ok() && allocator.data == saved,
+          "later invalid source cannot partially change DDR");
+  std::vector<std::uint8_t> output(656 * 4);
+  kvaf::FusedBatchGetContext lease;
+  Require(op.AcquireFusedBatchGetContext(output.data(), output.size(), 656, 128, &lease).ok(), "CPU seed Get30 lease");
+  Require(lease.worker_count == 30 && lease.jettys_per_core == 2 && driver.put_creates == 0 && driver.put_launches == 0,
+          "CPU seed adds no Put resources and leaves measured Get pool unchanged");
+  Require(op.ExecuteBatchPut({&request, &valid, {}}).code() == kvaf::StatusCode::kBusy,
+          "CPU seed rejects active DMA lease");
+  int stream = 0;
+  Require(op.ReleaseFusedBatchGetContext(lease, &stream).ok() && runtime.Shutdown().ok(), "CPU seed resources retire");
+  auto peer_config = Config();
+  kvaf::DefaultAccessOperator peer(peer_config);
+  std::vector<std::uint8_t> peer_ddr(128);
+  Require(peer.Initialize({reinterpret_cast<std::uint64_t>(peer_ddr.data()), peer_ddr.size(),
+                           16, kvaf::DeviceKind::kCpu}).ok(), "peer rejection fixture initialize");
+  Require(!peer.ExecuteBatchPut({&request, &valid, {}}).ok(), "CPU host-copy cannot target peer-service DDR");
+  Require(peer.Shutdown().ok(), "peer fixture retire");
+}
+
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
 void TestIndependentPutPool(std::uint32_t requested_put_workers,
                             std::uint32_t expected_put_workers, bool local_host) {
@@ -663,6 +720,7 @@ int main() {
     TestQueueHealthCqProfileDiagnostics(false);
     TestQueueHealthCqProfileDiagnostics(true);
     TestPersistentCqDiagnosticReadback();
+    TestCpuHostSeedPut();
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
     TestIndependentPutPool(1, 1, true);
     TestIndependentPutPool(0, 30, true);

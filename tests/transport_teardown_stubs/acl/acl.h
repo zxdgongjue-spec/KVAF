@@ -15,4 +15,5 @@ aclError aclrtMemset(void*, std::size_t, int32_t, std::size_t);
 aclError aclrtMemcpy(void*, std::size_t, const void*, std::size_t, aclrtMemcpyKind);
 aclError aclrtSynchronizeStream(aclrtStream);
 aclError aclrtGetDevice(int32_t*);
+const char* aclGetRecentErrMsg();
 }

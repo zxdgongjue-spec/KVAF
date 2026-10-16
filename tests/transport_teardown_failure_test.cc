@@ -223,6 +223,7 @@ aclError aclrtMemcpy(void* destination, std::size_t capacity, const void* source
   std::memcpy(destination, source, bytes); return ACL_SUCCESS;
 }
 aclError aclrtSynchronizeStream(aclrtStream) { return ACL_SUCCESS; }
+const char* aclGetRecentErrMsg() { return nullptr; }
 aclError aclrtGetDevice(int32_t* device) { *device = 0; return ACL_SUCCESS; }
 #if defined(KVAF_TEST_PUT_TEARDOWN)
 int32_t KvafExecuteBatchPutLaunchInternal(const KvafExecuteBatchPutLaunchArgs*, aclrtStream) { return 0; }

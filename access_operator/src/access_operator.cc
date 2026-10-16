@@ -1,9 +1,11 @@
 #include "access_operator.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -227,6 +229,15 @@ void LogBatchPutDeviceStatus(const BatchPutExecutionState& execution,
                              int32_t result) {
   std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_EXECUTION_ERROR result=%d\n",
                static_cast<int>(result));
+  if (result != KVAF_BATCH_PUT_KERNEL_ERROR) {
+    // Sync/launch/copy failure returned before a valid D2H snapshot. The
+    // caller's zeroed host buffer is not evidence about any device core.
+    std::fprintf(stderr,
+                 "[KVAF_AIV] BATCH_PUT_DEVICE_STATUS_UNAVAILABLE result=%d "
+                 "status_snapshot=unavailable device_status_read=0 "
+                 "host_buffer_is_not_device_snapshot=1\n", static_cast<int>(result));
+    return;
+  }
   for (std::uint32_t core = 0; core < npu_core_count; ++core) {
     const KvafBatchPutCoreStatus& status = execution.host_core_status[core];
     std::fprintf(stderr,
@@ -826,6 +837,43 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
       exec.request->keys.size() != exec.request->lengths.size() ||
       exec.request->keys.size() != exec.put_desc->entries.size()) {
     return InvalidArgument("BatchPut request does not satisfy the NPU mock contract");
+  }
+
+  if (exec.request->input.device == DeviceKind::kCpu) {
+    std::lock_guard<std::mutex> lock(impl_->batch_get_mutex);
+    if (!impl_->config.local_host_ddr || impl_->remote_region.device != DeviceKind::kCpu) {
+      return InvalidArgument("CPU seed Put requires this Runtime's local Host DDR");
+    }
+    if (impl_->fused_context.lease_id != 0U) {
+      return Status::Busy("cannot seed Host DDR while BatchGet queues have a fused lease");
+    }
+    const auto& region = impl_->remote_region;
+    const auto& request = *exec.request;
+    if (region.base == 0U || region.length == 0U ||
+        region.base > std::numeric_limits<std::uint64_t>::max() - region.length ||
+        PointerValue(request.input.data) > std::numeric_limits<std::uint64_t>::max() - request.input.bytes) {
+      return InvalidArgument("CPU seed Put source or owned DDR range is invalid");
+    }
+    // Validate every row before touching any destination. Runtime commits
+    // metadata only after this synchronous copy and its release fence.
+    for (std::size_t index = 0; index < request.keys.size(); ++index) {
+      const auto offset = request.input_offsets[index];
+      const auto length = request.lengths[index];
+      const auto& destination = exec.put_desc->entries[index];
+      if (length == 0U || offset > request.input.bytes || length > request.input.bytes - offset ||
+          destination.key != request.keys[index] || destination.reserved_length != length ||
+          destination.address < region.base || destination.address - region.base > region.length ||
+          length > region.length - (destination.address - region.base)) {
+        return InvalidArgument("CPU seed Put source/destination escapes its validated blocks or owned DDR");
+      }
+    }
+    const auto* source = static_cast<const std::uint8_t*>(request.input.data);
+    for (std::size_t index = 0; index < request.keys.size(); ++index) {
+      std::memmove(reinterpret_cast<void*>(exec.put_desc->entries[index].address),
+                   source + request.input_offsets[index], request.lengths[index]);
+    }
+    std::atomic_thread_fence(std::memory_order_release);
+    return Status::OK();
   }
 
   const auto* input = static_cast<const std::uint8_t*>(exec.request->input.data);
