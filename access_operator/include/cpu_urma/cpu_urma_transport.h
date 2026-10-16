@@ -107,7 +107,7 @@ class CpuUrmaTransport final {
   Status WriteBatch(const std::uint64_t* remote_offsets,
                     const HostSge* sources, std::size_t count);
   using PreparedWriteId = std::uint64_t;
-  struct PreparedWriteCompletion { PreparedWriteId id{}; BatchTiming timing{}; };
+  struct PreparedWriteCompletion { PreparedWriteId id{}; };
   // Build/register immutable address/SGL descriptors once, outside the hot
   // loop. Source PAYLOAD may change only while this plan is idle; source memory
   // must remain allocated until completion, or successful Shutdown on error.
@@ -131,22 +131,11 @@ class CpuUrmaTransport final {
   Status PrepareWriteChain(const WriteChainChunk* chunks, std::size_t count,
                            PreparedWriteId* id);
   struct PreparedWriteInfo {
-    std::uint64_t wr_count{}, tail_cqes{}, post_calls{};
-    std::uint64_t input_sges{}, effective_sges{};
-    std::uint64_t marker_wrs{}, logical_chunks{};
+    std::uint64_t wr_count{}, marker_wrs{}, tail_cqes{};
   };
   // Descriptor counts after device SGE/message limits have been applied.
   Status DescribePreparedWrite(PreparedWriteId id, PreparedWriteInfo* info) const;
-  // OK + submitted=false means queue credits are temporarily exhausted.
-  Status SubmitPreparedWrite(PreparedWriteId id, bool* submitted);
-  // Bounded nonblocking CQ polling; completions are returned once per batch after all
-  // participating Jetty tails. Completion latencies overlap between plans.
-  Status PollPreparedWrites(PreparedWriteCompletion* completed,
-                           std::size_t capacity, std::size_t* count);
-  struct PreparedAsyncStats {
-    std::uint64_t sweeps{}, cq_reads{}, empty_cq_reads{}, tail_cqes{}, deadline_checks{};
-    std::uint64_t poll_calls{};
-  };
+  struct PreparedAsyncStats { std::uint64_t tail_cqes{}; };
   // Snapshot/reset outside the producer session, for measurement boundaries.
   Status ReadPreparedAsyncStats(PreparedAsyncStats* stats, bool reset = false) const;
   // Hold submission/CQ ownership once across an asynchronous producer loop.
@@ -158,6 +147,7 @@ class CpuUrmaTransport final {
     ~PreparedWriteSession();
     PreparedWriteSession(const PreparedWriteSession&) = delete;
     PreparedWriteSession& operator=(const PreparedWriteSession&) = delete;
+    // OK + submitted=false means queue credits are temporarily exhausted.
     Status Submit(PreparedWriteId id, bool* submitted);
     Status Poll(PreparedWriteCompletion* completed, std::size_t capacity, std::size_t* count);
    private:
@@ -167,7 +157,6 @@ class CpuUrmaTransport final {
     std::unique_ptr<State> state_;
   };
   Status BeginPreparedWriteSession(std::unique_ptr<PreparedWriteSession>* session);
-  Status ClearPreparedWrites();  // Requires all plans to be idle.
   // Register one page-aligned host region once. SGL transfers from any
   // sub-range of this region then reuse the same URMA segment.
   Status RegisterDirectHostMemory(void* base, std::size_t bytes);

@@ -18,13 +18,13 @@ Wrapper options:
 
 Defaults (V21): ordered WRITE chain, 4096 x 656 B, 4 workers/Jettys,
 chunk 1024, doorbell 32, securec copy, indexed CQ batch 8/deadline 32,
-NUMA auto, payload maintenance off, final output readback, warmup 50/iterations 1000.
+payload maintenance off, final output readback, warmup 50/iterations 1000.
 No transfer/backend/poll/window experiment flags are required.
+Use numactl for NUMA/CPU binding; the executable inherits the process policy.
 
   --rows N --row-bytes N --scatter-threads N --pipeline-chunk-rows N
   --jettys N --remote-sgl-size N --prepare-threads N --wqes-per-doorbell N
   --warmup N --iterations N --timeout-ms N
-  --host-numa-node auto|none|N --host-cpu N
   --payload-cache-maintenance off|on
                      Off is the verified fast platform policy; on performs
                      staging invalidate and output clean. Control maintenance

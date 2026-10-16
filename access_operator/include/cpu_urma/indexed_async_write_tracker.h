@@ -46,7 +46,7 @@ class IndexedAsyncWriteTracker {
       batch.wrs[f.queue] = f.wrs; used_[f.queue] += f.wrs;
       ++pending_[f.queue];
     }
-    active_ |= UINT64_C(1) << slot; queues_mask_ |= mask;
+    active_ |= UINT64_C(1) << slot;
     *submitted = true;
     return Status::OK();
   }
@@ -62,7 +62,7 @@ class IndexedAsyncWriteTracker {
         (context & ~UINT64_C(15)) != batch.handle->token)
       return Status::Internal("unexpected/stale indexed async completion context");
     used_[queue] -= batch.wrs[queue]; batch.mask &= ~bit;
-    if (!--pending_[queue]) queues_mask_ &= ~bit;
+    --pending_[queue];
     if (!batch.mask) {
       *completed = batch.id; batch.handle->token = 0;
       active_ &= ~(UINT64_C(1) << slot);
@@ -70,7 +70,6 @@ class IndexedAsyncWriteTracker {
     return Status::OK();
   }
   bool Empty() const { return active_ == 0; }
-  std::uint32_t QueueMask() const { return queues_mask_; }
   std::size_t Pending(std::size_t queue) const { return pending_[queue]; }
   template <class Visit> void ForEachActive(Visit visit) const {
     for (auto bits = active_; bits; bits &= bits - 1) visit(batches_[FirstBit(bits)].id);
@@ -92,7 +91,6 @@ class IndexedAsyncWriteTracker {
   };
   std::size_t queues_, depth_;
   std::uint64_t active_{}, generation_{};
-  std::uint32_t queues_mask_{};
   std::array<std::size_t, kMaxQueues> used_{}, pending_{};
   std::array<Batch, kMaxBatches> batches_{};
 };
