@@ -1,6 +1,7 @@
 #pragma once
 
-#include "output_verify.h"
+#include "abi.h"
+#include <cstring>
 #include <vector>
 
 namespace kvaf::aicpu_test {
@@ -13,7 +14,7 @@ class OutputReadbackVerifier {
       for (std::uint64_t b = 8; b < c.row_bytes; ++b)
         expected_[slot * l.stride + b] = Pattern(LogicalRowForOutputSlot(c, slot), b);
   }
-  bool Check(std::uint64_t sequence, const std::uint8_t* data, OutputMismatch* mismatch) {
+  bool Check(std::uint64_t sequence, const std::uint8_t* data, std::uint64_t* mismatch_offset) {
     const auto mask = config_.verify_payload ?
         static_cast<std::uint8_t>(sequence * 37 + (sequence >> 8) * 29) : std::uint8_t{0};
     for (std::uint64_t slot = 0; slot < config_.rows; ++slot) {
@@ -28,7 +29,7 @@ class OutputReadbackVerifier {
     // Detailed location is needed only on failure, never on the fast path.
     for (std::uint64_t i = 0; i < layout_.output_bytes; ++i)
       if (data[i] != expected_[i]) {
-        if (mismatch) *mismatch = {i, expected_[i], data[i]};
+        if (mismatch_offset) *mismatch_offset = i;
         return false;
       }
     return false;

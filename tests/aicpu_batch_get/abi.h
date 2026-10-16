@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <limits>
 
 namespace kvaf::aicpu_test {
 constexpr std::uint64_t kMagic = 0x4b56414641424735ULL;
@@ -37,13 +36,12 @@ struct Layout {
   std::uint64_t output_bytes;
   std::uint64_t region_bytes;
   std::uint64_t rounds;
-  std::uint64_t source_stride;
 };
 
 // Packed staging, guarded output and per-worker/Jetty progress words are disjoint.
 inline std::uint64_t Align64(std::uint64_t n) { return (n + 63) & ~std::uint64_t{63}; }
 inline std::uint64_t RowsPerCacheGroup(std::uint64_t row_bytes);
-inline std::uint64_t RegisteredOutputOffset(const Config&, const Layout& l) {
+inline std::uint64_t RegisteredOutputOffset(const Layout& l) {
   return Align64(kStagingOffset + l.payload_bytes);
 }
 inline bool MakeLayout(const Config& c, Layout* out) {
@@ -59,8 +57,8 @@ inline bool MakeLayout(const Config& c, Layout* out) {
   const auto limit = kMaxAllocation - kStagingOffset - kGuardBytes - 63 -
       c.scatter_threads * kChainReadyWorkerBytes;
   if (c.rows > limit / (stride + c.row_bytes) || c.rows > limit / (2 * stride)) return false;
-  *out = {c.rows * c.row_bytes, stride, c.rows * stride, 0, c.warmup + c.iterations, stride};
-  out->region_bytes = Align64(RegisteredOutputOffset(c, *out) + out->output_bytes + kGuardBytes) +
+  *out = {c.rows * c.row_bytes, stride, c.rows * stride, 0, c.warmup + c.iterations};
+  out->region_bytes = Align64(RegisteredOutputOffset(*out) + out->output_bytes + kGuardBytes) +
       c.scatter_threads * kChainReadyWorkerBytes;
   return true;
 }
@@ -141,7 +139,6 @@ inline std::uint64_t RowTag(std::uint64_t sequence, std::uint64_t row) {
   return (sequence << 32) | row;
 }
 inline std::uint64_t LogicalRowForOutputSlot(const Config& c, std::uint64_t slot) { return c.rows - 1 - slot; }
-inline std::uint64_t OutputSlotOffset(const Layout& l, std::uint64_t slot) { return slot * l.stride; }
 // A packed source row can cross cache lines. Assign whole groups whose byte
 // length is a multiple of 64, so worker invalidations never share a line.
 inline std::uint64_t RowsPerCacheGroup(std::uint64_t row_bytes) {

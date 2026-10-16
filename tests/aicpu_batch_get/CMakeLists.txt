@@ -1,7 +1,8 @@
-find_package(Threads REQUIRED)
 add_executable(kvaf_aicpu_get_protocol_test protocol_test.cc)
-target_include_directories(kvaf_aicpu_get_protocol_test PRIVATE "${CMAKE_SOURCE_DIR}/access_operator/include")
-target_link_libraries(kvaf_aicpu_get_protocol_test PRIVATE kvaf_peer_link Threads::Threads)
+target_include_directories(kvaf_aicpu_get_protocol_test PRIVATE
+  "${CMAKE_SOURCE_DIR}/access_operator/include"
+  "${CMAKE_SOURCE_DIR}/runtime/include"
+  "${CMAKE_SOURCE_DIR}/common/include")
 add_test(NAME kvaf_aicpu_get_protocol COMMAND kvaf_aicpu_get_protocol_test)
 if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   add_executable(kvaf_aicpu_get_cpu cpu_main.cc)

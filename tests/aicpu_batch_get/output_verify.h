@@ -2,8 +2,6 @@
 
 #include "abi.h"
 
-#include <cstring>
-
 namespace kvaf::aicpu_test {
 // Control-only handshake. The device must not touch output between publishing
 // ready and receiving the external consumer's ACK; buffer reuse follows ACK.
@@ -20,10 +18,5 @@ Result VerifyOutputViaUrma(std::uint64_t sequence, std::uint64_t timeout, IO& io
     io.Relax();
   }
 }
-
-struct OutputMismatch {
-  std::uint64_t offset{};
-  std::uint8_t expected{}, actual{};
-};
 
 }  // namespace kvaf::aicpu_test

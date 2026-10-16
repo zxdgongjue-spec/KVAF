@@ -3,7 +3,6 @@
 #include "pipeline.h"
 #include "scatter_copy.h"
 #include "output_verify.h"
-#include <algorithm>
 #include <cstdint>
 
 #if !defined(__aarch64__)
@@ -44,7 +43,7 @@ struct DeviceIO {
   Config config;
   Layout layout;
   std::uint64_t sequence{};
-  std::uint8_t* Output() { return region + RegisteredOutputOffset(config, layout); }
+  std::uint8_t* Output() { return region + RegisteredOutputOffset(layout); }
   std::uint64_t Now() { std::uint64_t v; asm volatile("isb; mrs %0, cntvct_el0" : "=r"(v) :: "memory"); return v; }
   std::uint64_t Frequency() { std::uint64_t v; asm volatile("mrs %0, cntfrq_el0" : "=r"(v)); return v; }
   void PublishRequest(std::uint64_t seq) {
@@ -88,9 +87,9 @@ struct RangeIO {
   Result Status() { return ::Status(coordination); }
   std::uint64_t Now() { return device.Now(); }
   std::uint64_t ReadRangeDone(std::uint32_t worker) { return device.ReadRangeDone(worker); }
-  void RangeReady(std::uint32_t, std::uint64_t now) { Minimum(coordination.ready_tick, now); }
+  void RangeReady(std::uint64_t now) { Minimum(coordination.ready_tick, now); }
   void Relax() { device.Relax(); }
-  void CopySpan(std::uint32_t, RowRange r, std::uint64_t) {
+  void CopySpan(RowRange r) {
     if (device.config.payload_cache_maintenance)
       InvalidateLines(device.region + kStagingOffset + r.begin * device.config.row_bytes,
                       (r.end - r.begin) * device.config.row_bytes);
@@ -100,7 +99,7 @@ struct RangeIO {
         r.end - r.begin, device.config.row_bytes, device.layout.stride))
       Fail(coordination, Result::kCopyError, device.sequence);
   }
-  void CleanRange(std::uint32_t worker, std::uint64_t) {
+  void CleanRange(std::uint32_t worker) {
     if (device.config.payload_cache_maintenance) {
       const auto r = ScatterRange(device.config, worker, ActiveThreads(device.config));
       // Issue all row payload cache lines, then one completion barrier.

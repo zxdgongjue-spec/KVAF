@@ -43,9 +43,9 @@ Options Parse(int argc, char** argv) {
 struct DeviceBuffer {
   void* data{};
   ~DeviceBuffer() { if (data) aclrtFree(data); }
-  void Allocate(std::uint64_t bytes, int fill = 0) {
+  void Allocate(std::uint64_t bytes) {
     Acl(aclrtMalloc(&data, bytes, ACL_MEM_MALLOC_NORMAL_ONLY), "allocate device buffer");
-    Acl(aclrtMemset(data, bytes, fill, bytes), "initialize device buffer");
+    Acl(aclrtMemset(data, bytes, 0, bytes), "initialize device buffer");
   }
 };
 class Kernel {
@@ -84,7 +84,7 @@ class Kernel {
 Report Execute(int fd, const Config& config, NpuTarget& target, const std::string& json) {
   Layout layout{}; Require(MakeLayout(config, &layout), "invalid layout");
   DeviceBuffer samples, result, coordination;
-  auto* output = static_cast<std::uint8_t*>(target.memory()) + RegisteredOutputOffset(config, layout);
+  auto* output = static_cast<std::uint8_t*>(target.memory()) + RegisteredOutputOffset(layout);
   Acl(aclrtMemset(output, layout.output_bytes + kGuardBytes, 0xA5, layout.output_bytes + kGuardBytes),
       "initialize registered output");
   samples.Allocate(config.iterations * sizeof(Sample)); result.Allocate(sizeof(KernelResult));

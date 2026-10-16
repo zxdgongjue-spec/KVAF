@@ -129,7 +129,8 @@ struct CpuUrmaTransport::Impl {
     std::size_t fence_count{};
     cpu_urma_detail::IndexedAsyncWriteTracker::Handle handle;
     std::array<std::size_t, kMaxJettyCount> first_prefix{};
-    std::uint64_t marker_wrs{}, logical_chunks{};
+    std::uint64_t marker_wrs{};
+    bool ordered_chain{};
   };
 
   static std::uint64_t MakeUserContext(std::uint64_t generation,
@@ -1401,7 +1402,7 @@ struct CpuUrmaTransport::Impl {
       return Status::InvalidArgument("invalid ordered WRITE chain");
     auto plan = std::make_unique<PreparedWrite>();
     auto& job = plan->job; job.write = true; job.queues.resize(local_jettys_.size());
-    plan->logical_chunks = count;
+    plan->ordered_chain = true;
     // Allocate worst-case storage before binding any descriptor pointers.
     std::array<std::size_t, kMaxJettyCount> capacity{};
     for (std::size_t c = 0; c < count; ++c) {
@@ -1537,7 +1538,7 @@ struct CpuUrmaTransport::Impl {
     for (std::size_t i = 0; i < plan.fence_count; ++i) {
       const auto& f = plan.fences[i];
       job.queues[f.queue].wrs[f.wrs - 1].user_ctx = f.context;
-      const auto error = plan.logical_chunks ? std::string{} : PostSglQueue(job, f.queue);
+      const auto error = plan.ordered_chain ? std::string{} : PostSglQueue(job, f.queue);
       if (!error.empty()) {
         // A failed post may have partially submitted a chain. Keep every
         // descriptor and source registration alive until Jetty teardown.
@@ -1545,7 +1546,7 @@ struct CpuUrmaTransport::Impl {
         return Status::Internal(error);
       }
     }
-    if (plan.logical_chunks) {
+    if (plan.ordered_chain) {
       std::string error;
       const bool ok = cpu_urma_detail::DispatchWriteChain(job.queues.size(),
           [&](std::size_t q) { return plan.first_prefix[q]; },

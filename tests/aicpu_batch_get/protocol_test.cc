@@ -2,6 +2,7 @@
 #include "pipeline.h"
 #include "scatter_copy.h"
 #include "output_readback.h"
+#include "output_verify.h"
 #include "cpu_urma/indexed_async_write_tracker.h"
 #include "cpu_urma/contiguous_write_spans.h"
 #include "cpu_urma/write_chain_schedule.h"
@@ -42,7 +43,7 @@ void RangesAndMetrics() {
   for (auto rows : {1, 67, 4096}) for (auto bytes : {8, 65, 656, 4096}) for (auto workers : {1, 4, 32}) {
     Config c; c.rows = rows; c.row_bytes = bytes; c.scatter_threads = workers;
     Layout l{}; Require(MakeLayout(c, &l), "valid layout rejected");
-    Require(ChainReadyOffset(c, l, 0) >= RegisteredOutputOffset(c, l) + l.output_bytes + kGuardBytes &&
+    Require(ChainReadyOffset(c, l, 0) >= RegisteredOutputOffset(l) + l.output_bytes + kGuardBytes &&
             l.region_bytes <= kMaxAllocation, "registered ranges overlap/overflow");
     std::vector<unsigned> covered(rows);
     ForEachPipelineChunk(c, [&](auto, auto, RowRange r) {
@@ -68,9 +69,9 @@ struct ChunkIO {
   Result Status() { return Result::kPending; }
   std::uint64_t Now() { return ++ticks; }
   std::uint64_t ReadRangeDone(std::uint32_t) { return token; }
-  void RangeReady(std::uint32_t, std::uint64_t) {}
-  void CopySpan(std::uint32_t, RowRange r, std::uint64_t) { copied.push_back(r); }
-  void CleanRange(std::uint32_t, std::uint64_t) { ++cleans; }
+  void RangeReady(std::uint64_t) {}
+  void CopySpan(RowRange r) { copied.push_back(r); }
+  void CleanRange(std::uint32_t) { ++cleans; }
   void Relax() {}
 };
 void ReadyAndPosting() {
@@ -153,7 +154,7 @@ void SourcesAndOutput() {
   Require(merge(65536).ok() && merged.size() == 2, "source gap discarded");
   Config c; c.rows = 4; c.verify_payload = c.verify_each_round = 1;
   Layout l{}; Require(MakeLayout(c, &l), "output layout rejected");
-  OutputReadbackVerifier verifier(c, l); OutputMismatch mismatch{};
+  OutputReadbackVerifier verifier(c, l); std::uint64_t mismatch_offset{};
   std::vector<std::uint8_t> source(l.payload_bytes), output(l.output_bytes, 0xA5);
   for (std::uint64_t seq : {1, 2, 257}) {
     for (std::uint64_t slot = 0; slot < c.rows; ++slot) {
@@ -162,9 +163,9 @@ void SourcesAndOutput() {
       for (std::uint64_t b = 8; b < c.row_bytes; ++b) source[slot * c.row_bytes + b] = PayloadPattern(c, seq, row, b);
     }
     Require(CopyScatterRows(output.data(), source.data(), c.rows, c.row_bytes, l.stride) &&
-            verifier.Check(seq, output.data(), &mismatch), "payload/guard copy mismatch");
+            verifier.Check(seq, output.data(), &mismatch_offset), "payload/guard copy mismatch");
     output[c.row_bytes] ^= 1;
-    Require(!verifier.Check(seq, output.data(), &mismatch) && mismatch.offset == c.row_bytes, "guard overwrite accepted");
+    Require(!verifier.Check(seq, output.data(), &mismatch_offset) && mismatch_offset == c.row_bytes, "guard overwrite accepted");
     output[c.row_bytes] ^= 1;
   }
 }

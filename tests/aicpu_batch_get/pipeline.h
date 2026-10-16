@@ -65,10 +65,10 @@ Result RunPipelineChunks(const Config& c, std::uint32_t worker, std::uint64_t se
       }
       if (observed - start >= timeout) return Result::kTimeout;
       if (seq == sequence && progress > consumed) {
-        if (!consumed) io.RangeReady(worker, observed);
+        if (!consumed) io.RangeReady(observed);
         const auto first = PipelineChunkRange(c, worker, consumed);
         const auto last = PipelineChunkRange(c, worker, progress - 1);
-        io.CopySpan(worker, {first.begin, last.end}, progress - consumed);
+        io.CopySpan({first.begin, last.end});
         consumed = progress;
         if (io.Status() != Result::kPending) return io.Status();
         if (io.Now() - start >= timeout) return Result::kTimeout;
@@ -77,7 +77,7 @@ Result RunPipelineChunks(const Config& c, std::uint32_t worker, std::uint64_t se
       io.Relax();
     }
   }
-  io.CleanRange(worker, start);
+  io.CleanRange(worker);
   if (io.Status() != Result::kPending) return io.Status();
   return io.Now() - start >= timeout ? Result::kTimeout : Result::kOk;
 }

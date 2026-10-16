@@ -66,7 +66,6 @@ Options Parse(int argc, char** argv) {
   Require(MakeLayout(o.config, &layout) && !o.transport.peer_address.empty() &&
       o.transport.remote_sgl_size && o.transport.prepare_thread_count && o.transport.prepare_thread_count <= 64 &&
       o.transport.wqes_per_doorbell <= 8192, "invalid benchmark configuration");
-  Require(!o.config.verify_payload || o.config.verify_each_round, "payload validation requires --output-verify urma");
   return o;
 }
 struct Work { std::uint32_t worker; std::uint64_t chunk; RowRange rows; };
@@ -115,7 +114,7 @@ void Run(Options options) {
   Layout layout{}; Require(MakeLayout(options.config, &layout), "invalid layout");
   std::vector<Work> work;
   ForEachPipelineChunk(options.config, [&](auto worker, auto chunk, auto rows) { work.push_back({worker, chunk, rows}); });
-  const auto ready_base = Align64(kStagingOffset + options.config.rows * layout.source_stride);
+  const auto ready_base = Align64(kStagingOffset + options.config.rows * layout.stride);
   Require(work.size() <= (kMaxAllocation - ready_base) / sizeof(Control), "too many ready buffers");
   const auto verify_base = ready_base + work.size() * sizeof(Control);
   Require(layout.output_bytes + kGuardBytes <= kMaxAllocation - verify_base, "host buffers exceed allocation limit");
@@ -177,9 +176,9 @@ void Run(Options options) {
   std::vector<std::uint64_t> offsets(options.config.rows);
   for (std::uint64_t row = 0; row < options.config.rows; ++row)
     for (std::uint64_t b = 8; b < options.config.row_bytes; ++b)
-      input[row * layout.source_stride + b] = Pattern(row, b);
+      input[row * layout.stride + b] = Pattern(row, b);
   for (std::uint64_t slot = 0; slot < options.config.rows; ++slot) {
-    sources[slot] = {input + LogicalRowForOutputSlot(options.config, slot) * layout.source_stride,
+    sources[slot] = {input + LogicalRowForOutputSlot(options.config, slot) * layout.stride,
                     static_cast<std::size_t>(options.config.row_bytes)};
     offsets[slot] = kStagingOffset + slot * options.config.row_bytes;
   }
@@ -238,22 +237,21 @@ void Run(Options options) {
         Require(Clock::now() < deadline, "request timeout");
       } while (request->sequence != seq);
       for (std::uint64_t row = 0; row < options.config.rows; ++row) {
-        const auto tag = RowTag(seq, row); std::memcpy(input + row * layout.source_stride, &tag, 8);
+        const auto tag = RowTag(seq, row); std::memcpy(input + row * layout.stride, &tag, 8);
         if (options.config.verify_payload)
           for (std::uint64_t b = 8; b < options.config.row_bytes; ++b)
-            input[row * layout.source_stride + b] = PayloadPattern(options.config, seq, row, b);
+            input[row * layout.stride + b] = PayloadPattern(options.config, seq, row, b);
       }
       for (std::size_t i = 0; i < work.size(); ++i)
         tokens[i].sequence = PipelineProgressToken(seq, work[i].chunk + 1);
       Check(transport.BeginPreparedWriteSession(&session));
       const auto producer_begin = Clock::now();
-      const auto data_begin = producer_begin;
       SubmitAndWait(*session, data_id, deadline);
       const auto data_end = Clock::now();
       done->sequence = seq; SubmitAndWait(*session, done_id, deadline);
       session.reset();
       if (measured) {
-        data_ns += Ns(data_begin, data_end);
+        data_ns += Ns(producer_begin, data_end);
         producer_ns += Ns(producer_begin, Clock::now());
       }
       if (ShouldVerifyOutput(options.config, seq)) {
@@ -263,17 +261,17 @@ void Run(Options options) {
           Require(output_ready->sequence <= seq, "future output-ready sequence");
           Require(Clock::now() < verify_deadline, "output-ready timeout");
         } while (output_ready->sequence != seq);
-        Check(transport.ReadSglBatch(RegisteredOutputOffset(options.config, layout), read_sges.data(), read_sges.size()));
-        OutputMismatch mismatch{}; bool matches = verifier.Check(seq, readback, &mismatch);
+        Check(transport.ReadSglBatch(RegisteredOutputOffset(layout), read_sges.data(), read_sges.size()));
+        std::uint64_t mismatch_offset{}; bool matches = verifier.Check(seq, readback, &mismatch_offset);
         for (std::uint64_t i = 0; i < kGuardBytes; ++i)
           if (readback[layout.output_bytes + i] != 0xA5) {
-            if (matches) mismatch = {layout.output_bytes + i, 0xA5, readback[layout.output_bytes + i]};
+            if (matches) mismatch_offset = layout.output_bytes + i;
             matches = false; break;
           }
         output_verified->sequence = OutputVerificationToken(seq, matches);
         Check(transport.WriteSglBatch(kOutputVerifiedOffset, &ack_sge, 1));
         if (!matches) std::fprintf(stderr, "AICPU_OUTPUT_VERIFY FAIL sequence=%llu offset=%llu\n",
-            (unsigned long long)seq, (unsigned long long)mismatch.offset);
+            (unsigned long long)seq, (unsigned long long)mismatch_offset);
         Require(matches, "output payload or guard mismatch");
       }
       if (measured) round_ns += Ns(round_begin, Clock::now());
