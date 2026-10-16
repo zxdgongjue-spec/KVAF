@@ -19,7 +19,12 @@ Options Parse(int argc, char** argv) {
   Options o;
   for (int i = 1; i < argc; ++i) {
     const std::string flag = argv[i];
-    Require(i + 1 < argc, "missing option value");
+    Require(flag != "--profile-scatter",
+            "--profile-scatter was removed in V21; remove it and use the CPU CSV timing fields");
+    Require(flag == "--kernel-json" || flag == "--eid" || flag == "--device-id" ||
+            flag == "--port" || flag == "--aicpu-blocks", "unknown option " + flag);
+    Require(i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0,
+            "missing option value for " + flag);
     const char* value = argv[++i];
     if (flag == "--kernel-json") o.json = value;
     else if (flag == "--eid") o.eid = value;

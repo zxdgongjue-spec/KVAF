@@ -22,6 +22,7 @@ Without --device-id, use the CPU request's NPU device ID. With it, reject a mism
 The built kernel JSON is selected automatically. No installation by default.
 Set shape/workers on the CPU script; blockDim automatically matches active workers.
   --aicpu-blocks N  Optional override; must match the requested active worker count.
+V21 removed --profile-scatter; use the CPU CSV timing fields instead.
 Install the V21 kernel after rebuilding both ends; restart NPU after installation.
 This server handles one test run; restart it for the next run.
 Build: bash build.sh aicpu-npu
@@ -32,7 +33,13 @@ EOF
       if [[ "$1" == --build-dir ]]; then build_dir="$2"; else cann_root="$2"; fi
       shift 2 ;;
     --install-kernel) install_kernel=true; shift ;;
-    *) args+=("$1"); shift ;;
+    --profile-scatter)
+      echo "--profile-scatter was removed in V21; remove it and use the CPU CSV timing fields" >&2
+      exit 2 ;;
+    --port|--device-id|--eid|--kernel-json|--aicpu-blocks)
+      [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "$1 requires a value" >&2; exit 2; }
+      args+=("$1" "$2"); shift 2 ;;
+    *) echo "Unknown option: $1; run with --help" >&2; exit 2 ;;
   esac
 done
 artifact_dir="$build_dir/tests/aicpu_batch_get"

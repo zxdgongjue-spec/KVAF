@@ -24,6 +24,7 @@ CQ batch 8 / deadline 32、NUMA auto、payload maintenance off、末轮 output �
 
 V21 入口 `KvafAicpuBatchGetV21`，Configure `0x7015`，Config 96 B。
 CPU、NPU executable 与 device kernel 必须同时更新，安装后重启 NPU 进程。
+旧的 `--profile-scatter` 已移除，启动 NPU 时不要再传；当前耗时指标直接由 CPU CSV 输出。
 
 ```bash
 bash build.sh aicpu-cpu
