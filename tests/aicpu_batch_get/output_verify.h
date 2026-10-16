@@ -11,9 +11,9 @@ Result VerifyOutputViaUrma(std::uint64_t sequence, std::uint64_t timeout, IO& io
   io.PublishOutputReady(sequence);
   for (;;) {
     const auto ack = io.ReadOutputVerified();
-    const auto ack_sequence = ack.sequence >> 1;
+    const auto ack_sequence = ack >> 1;
     if (ack_sequence > sequence) return Result::kSequenceError;
-    if (ack_sequence == sequence) return (ack.sequence & 1) ? Result::kDataMismatch : Result::kOk;
+    if (ack_sequence == sequence) return (ack & 1) ? Result::kDataMismatch : Result::kOk;
     if (io.Now() - begin >= timeout) return Result::kTimeout;
     io.Relax();
   }

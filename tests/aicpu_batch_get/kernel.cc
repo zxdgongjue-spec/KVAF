@@ -64,11 +64,9 @@ struct DeviceIO {
     reinterpret_cast<volatile Control*>(region + kOutputReadyOffset)->sequence = seq;
     Clean(region + kOutputReadyOffset, sizeof(Control));
   }
-  Control ReadOutputVerified() {
+  std::uint64_t ReadOutputVerified() {
     Invalidate(region + kOutputVerifiedOffset, sizeof(Control));
-    Control value{};
-    value.sequence = reinterpret_cast<volatile Control*>(region + kOutputVerifiedOffset)->sequence;
-    return value;
+    return reinterpret_cast<volatile Control*>(region + kOutputVerifiedOffset)->sequence;
   }
   void Relax() { asm volatile("yield" ::: "memory"); }
 };

@@ -786,7 +786,7 @@ struct CpuUrmaTransport::Impl {
       return Status::InvalidState(
           "CPU URMA transport requires reinitialization after a submission failure");
     }
-    if (!AsyncEmpty())
+    if (!indexed_tracker_.Empty())
       return Status::InvalidState("host registration while prepared WRITEs are in flight");
     RegisteredHostBuffer* host = nullptr;
     Status status = RegisterHostBuffer(base, bytes, &host);
@@ -1058,7 +1058,7 @@ struct CpuUrmaTransport::Impl {
       return Status::InvalidState(
           "CPU URMA transport requires reinitialization after a submission failure");
     }
-    if (!AsyncEmpty())
+    if (!indexed_tracker_.Empty())
       return Status::InvalidState("synchronous transfer while prepared WRITEs are in flight");
     if (remote_offsets == nullptr || buffers == nullptr || count == 0U) {
       return Status::InvalidArgument("invalid non-contiguous batch transfer");
@@ -1109,7 +1109,7 @@ struct CpuUrmaTransport::Impl {
       return Status::InvalidState(
           "CPU URMA transport requires reinitialization after a submission failure");
     }
-    if (!AsyncEmpty())
+    if (!indexed_tracker_.Empty())
       return Status::InvalidState("synchronous transfer while prepared WRITEs are in flight");
     if (buffers == nullptr || count == 0U ||
         offset > remote_region_.length) {
@@ -1236,7 +1236,7 @@ struct CpuUrmaTransport::Impl {
     if (!initialized_) {
       return Status::InvalidState("CPU URMA transport is not initialized");
     }
-    if (!AsyncEmpty())
+    if (!indexed_tracker_.Empty())
       return Status::InvalidState("synchronous transfer while prepared WRITEs are in flight");
     if (remote_offsets == nullptr || buffers == nullptr || count == 0U) {
       return Status::InvalidArgument("invalid non-contiguous batch transfer");
@@ -1312,7 +1312,7 @@ struct CpuUrmaTransport::Impl {
   Status ValidateLink() {
     std::unique_lock<std::mutex> submit_lock(batch_submit_mutex_);
     if (!initialized_) return Status::NotInitialized("CPU transport is not initialized");
-    if (!AsyncEmpty())
+    if (!indexed_tracker_.Empty())
       return Status::InvalidState("link validation while prepared WRITEs are in flight");
     if (batch_poisoned_) {
       return Status::InvalidState(
@@ -1349,7 +1349,7 @@ struct CpuUrmaTransport::Impl {
                            const CpuUrmaTransport::HostSge* sources,
                            std::size_t count, CpuUrmaTransport::PreparedWriteId* id) {
     std::unique_lock<std::mutex> lock(batch_submit_mutex_);
-    if (!initialized_ || batch_poisoned_ || !AsyncEmpty())
+    if (!initialized_ || batch_poisoned_ || !indexed_tracker_.Empty())
       return Status::InvalidState("prepare WRITE requires an initialized, idle transport");
     if (!id || !offsets || !sources || !count ||
         count > kJettyDepth * local_jettys_.size())
@@ -1380,7 +1380,7 @@ struct CpuUrmaTransport::Impl {
   Status PrepareWriteChain(const CpuUrmaTransport::WriteChainChunk* chunks, std::size_t count,
       CpuUrmaTransport::PreparedWriteId* id) {
     std::unique_lock<std::mutex> lock(batch_submit_mutex_);
-    if (!initialized_ || batch_poisoned_ || !AsyncEmpty())
+    if (!initialized_ || batch_poisoned_ || !indexed_tracker_.Empty())
       return Status::InvalidState("prepare chain requires an initialized, idle transport");
     if (!chunks || !count || !id || count > kJettyDepth)
       return Status::InvalidArgument("invalid ordered WRITE chain");
@@ -1401,13 +1401,14 @@ struct CpuUrmaTransport::Impl {
         const auto offset = chunk.marker_offsets[q];
         if (offset % 8 || offset > remote_region_.length || remote_region_.length - offset < 8)
           return Status::InvalidArgument("chain marker is outside remote region or unaligned");
-        const CpuUrmaTransport::HostSge marker{const_cast<std::uint64_t*>(chunk.marker_value), 8};
-        status = ValidateAndRegisterHostBuffers(&marker, &offset, 1);
-        if (!status.ok()) return status;
         capacity[q] += cpu_urma_detail::PreparedRowsForQueue(chunk.count, job.queues.size(), q).count + 1;
         if (capacity[q] > kJettyDepth)
           return Status::InvalidArgument("WRITE chain source/marker budget exceeds one SQ wave; reduce rows/chunks");
       }
+      // All queues use the same local marker; register its source once.
+      const CpuUrmaTransport::HostSge marker{const_cast<std::uint64_t*>(chunk.marker_value), 8};
+      status = ValidateAndRegisterHostBuffers(&marker, chunk.marker_offsets, 1);
+      if (!status.ok()) return status;
     }
     for (std::size_t q = 0; q < job.queues.size(); ++q) {
       auto& queue = job.queues[q];
@@ -1418,6 +1419,12 @@ struct CpuUrmaTransport::Impl {
     std::array<std::size_t, kMaxJettyCount> locals{};
     for (std::size_t c = 0; c < count; ++c) {
       const auto& chunk = chunks[c];
+      auto* marker_segment = explicit_host_region_.segment;
+      if (!HostSpanFitsRegisteredBuffer(explicit_host_region_, chunk.marker_value, 8)) {
+        const auto* host = FindRegisteredHostBuffer(chunk.marker_value, 8);
+        marker_segment = host ? host->segment : nullptr;
+      }
+      if (!marker_segment) return Status::Internal("unresolved chain marker segment");
       for (std::size_t q = 0; q < job.queues.size(); ++q) {
         const auto range = cpu_urma_detail::PreparedRowsForQueue(chunk.count, job.queues.size(), q);
         auto& dst = job.queues[q]; auto& src = temp.queues[q];
@@ -1443,11 +1450,7 @@ struct CpuUrmaTransport::Impl {
         }
         // Every queue publishes its own progress, including empty shards.
         const auto index = dst.count++, local = locals[q]++;
-        auto* host = FindRegisteredHostBuffer(chunk.marker_value, 8);
-        auto* segment = HostSpanFitsRegisteredBuffer(explicit_host_region_, chunk.marker_value, 8)
-            ? explicit_host_region_.segment : host ? host->segment : nullptr;
-        if (!segment) return Status::Internal("unresolved chain marker segment");
-        dst.local[local] = {reinterpret_cast<std::uint64_t>(chunk.marker_value), 8, segment, nullptr};
+        dst.local[local] = {reinterpret_cast<std::uint64_t>(chunk.marker_value), 8, marker_segment, nullptr};
         dst.remote[index] = {remote_region_.base + chunk.marker_offsets[q], 8, remote_seg_handle_, nullptr};
         auto& wr = dst.wrs[index]; wr = {}; wr.opcode = URMA_OPC_WRITE;
         wr.flag.bs.place_order = URMA_STRONG_ORDER; wr.flag.bs.comp_order = 1;
@@ -1583,7 +1586,7 @@ struct CpuUrmaTransport::Impl {
     if (async_polls_since_deadline_ >= async_deadline_polls_) {
       async_polls_since_deadline_ = 0;
       const auto now = std::chrono::steady_clock::now();
-      ForEachAsync([&](std::uint64_t id) { expired |= now >= prepared_writes_[id - 1]->job.deadline; });
+      indexed_tracker_.ForEachActive([&](std::uint64_t id) { expired |= now >= prepared_writes_[id - 1]->job.deadline; });
     }
     if (expired) {
       batch_poisoned_ = true;
@@ -1665,8 +1668,6 @@ struct CpuUrmaTransport::Impl {
   std::vector<urma_jetty_t*> local_jettys_;
   std::vector<urma_target_jetty_t*> remote_jettys_;
   std::mutex batch_submit_mutex_;
-  bool AsyncEmpty() const { return indexed_tracker_.Empty(); }
-  template <class Visit> void ForEachAsync(Visit visit) const { indexed_tracker_.ForEachActive(visit); }
   SglBatchJob sgl_batch_workspace_;
   std::vector<std::unique_ptr<PreparedWrite>> prepared_writes_;
   cpu_urma_detail::IndexedAsyncWriteTracker indexed_tracker_;
@@ -1711,7 +1712,7 @@ Status CpuUrmaTransport::PreparedWriteSession::Poll(PreparedWriteCompletion* com
 Status CpuUrmaTransport::BeginPreparedWriteSession(std::unique_ptr<PreparedWriteSession>* session) {
   if (!session || *session) return Status::InvalidArgument("missing/nonempty prepared WRITE session");
   auto state = std::make_unique<PreparedWriteSession::State>(impl_.get());
-  if (!impl_->initialized_ || impl_->batch_poisoned_ || !impl_->AsyncEmpty())
+  if (!impl_->initialized_ || impl_->batch_poisoned_ || !impl_->indexed_tracker_.Empty())
     return Status::InvalidState("prepared WRITE session requires an initialized, idle transport");
   session->reset(new PreparedWriteSession(std::move(state)));
   return Status::OK();

@@ -161,7 +161,7 @@ struct AckIO {
   std::uint64_t clock{}, token{};
   std::uint64_t Now() { return ++clock; }
   void PublishOutputReady(std::uint64_t) {}
-  Control ReadOutputVerified() { Control c{}; c.sequence = token; return c; }
+  std::uint64_t ReadOutputVerified() { return token; }
   void Relax() {}
 };
 void Acknowledgements() {

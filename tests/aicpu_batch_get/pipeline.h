@@ -51,7 +51,7 @@ Result RunPipelineChunks(const Config& c, std::uint32_t worker, std::uint64_t se
   if (!c.pipeline_chunk_rows || worker >= ActiveThreads(c) || !sequence ||
       sequence > UINT32_MAX || !timeout) return Result::kInvalidArgs;
   const auto chunks = PipelineChunkCount(c, worker);
-  std::uint64_t consumed = 0, previous = 0;
+  std::uint64_t consumed = 0;
   while (consumed < chunks) {
     for (;;) {
       const auto status = io.Status();
@@ -59,10 +59,8 @@ Result RunPipelineChunks(const Config& c, std::uint32_t worker, std::uint64_t se
       const auto token = io.ReadRangeDone(worker), observed = io.Now();
       const auto seq = token >> 32, progress = token & UINT32_MAX;
       if (seq > sequence) return Result::kSequenceError;
-      if (seq == sequence) {
-        if (!progress || progress > chunks || progress < previous) return Result::kSequenceError;
-        previous = progress;
-      }
+      if (seq == sequence && (!progress || progress > chunks || progress < consumed))
+        return Result::kSequenceError;
       if (observed - start >= timeout) return Result::kTimeout;
       if (seq == sequence && progress > consumed) {
         if (!consumed) io.RangeReady(observed);
@@ -70,7 +68,7 @@ Result RunPipelineChunks(const Config& c, std::uint32_t worker, std::uint64_t se
         const auto last = PipelineChunkRange(c, worker, progress - 1);
         io.CopySpan({first.begin, last.end});
         consumed = progress;
-        if (io.Status() != Result::kPending) return io.Status();
+        if (const auto copied = io.Status(); copied != Result::kPending) return copied;
         if (io.Now() - start >= timeout) return Result::kTimeout;
         break;
       }
@@ -78,7 +76,7 @@ Result RunPipelineChunks(const Config& c, std::uint32_t worker, std::uint64_t se
     }
   }
   io.CleanRange(worker);
-  if (io.Status() != Result::kPending) return io.Status();
+  if (const auto cleaned = io.Status(); cleaned != Result::kPending) return cleaned;
   return io.Now() - start >= timeout ? Result::kTimeout : Result::kOk;
 }
 }  // namespace kvaf::aicpu_test

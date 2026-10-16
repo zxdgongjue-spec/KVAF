@@ -45,7 +45,6 @@ struct DeviceBuffer {
   ~DeviceBuffer() { if (data) aclrtFree(data); }
   void Allocate(std::uint64_t bytes) {
     Acl(aclrtMalloc(&data, bytes, ACL_MEM_MALLOC_NORMAL_ONLY), "allocate device buffer");
-    Acl(aclrtMemset(data, bytes, 0, bytes), "initialize device buffer");
   }
 };
 class Kernel {
@@ -88,6 +87,9 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
   Acl(aclrtMemset(output, layout.output_bytes + kGuardBytes, 0xA5, layout.output_bytes + kGuardBytes),
       "initialize registered output");
   samples.Allocate(config.iterations * sizeof(Sample)); result.Allocate(sizeof(KernelResult));
+  // Successful rounds fill samples; the host copy initializes coordination.
+  // Zero only the result so a pre-write kernel failure leaves a pending status.
+  Acl(aclrtMemset(result.data, sizeof(KernelResult), 0, sizeof(KernelResult)), "initialize kernel result");
   const auto host_coordination = MakeMultiBlockCoordination(ActiveThreads(config));
   coordination.Allocate(sizeof(host_coordination));
   Acl(aclrtMemcpy(coordination.data, sizeof(host_coordination), &host_coordination,
