@@ -6,6 +6,7 @@
 #include "simt_api/asc_simt.h"
 #endif
 #include "batch_get_abi.h"
+#include "kvaf_batch_get_cq_wait.h"
 #include "kvaf_batch_get_device_policy.h"
 
 // Graph-safe ExecuteBatchGet data path.  The Direct-HCCP transport and WQE
@@ -33,8 +34,10 @@ constexpr uint32_t kWqeBankCount = 2U;
 constexpr uint32_t kValidationThreads = 1024U;
 constexpr uint32_t kScratchEventId = 2U;
 constexpr uint32_t kCqeProbeBytes = 32U;
-constexpr uint32_t kCqConsumerMask = 0x003fffffU;
-constexpr uint32_t kMaxCqPolls = 20000U;
+// Compatibility for the separate V7 SharedTransport lock/probe loops. The
+// shared WaitForCompletion uses its own bounded device-time slow phase.
+constexpr uint32_t kMaxCqPolls = kvaf_get_cq::kFastPolls;
+constexpr uint32_t kCqConsumerMask = kvaf_get_cq::kConsumerMask;
 constexpr uint64_t kCacheLineBytes = 64U;
 constexpr uint32_t kLocalMemoryBytes =
     KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES;
@@ -446,7 +449,8 @@ __aicore__ inline void CommitPostScalarStage(const PendingPost *pending) {
   __gm__ KvafBatchGetQueueState *const queue =
       reinterpret_cast<__gm__ KvafBatchGetQueueState *>(
           pending->queue_state_address);
-  queue->sq_producer_index = pending->next_head;
+  WriteGmByPassDCache<uint64_t>(&queue->sq_producer_index, pending->next_head);
+  DataSyncBarrier<MemDsbT::DDR>();
   st_dev(static_cast<uint32_t>(pending->next_head),
          reinterpret_cast<__gm__ uint32_t *>(pending->sq_db_address), 0);
 }
@@ -465,7 +469,7 @@ __aicore__ inline void PostDirectRequests(
   PendingPost pending_posts[kWqeBankCount];
   uint64_t current_heads[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE];
   for (uint32_t jetty = 0U; jetty < jettys_per_core; ++jetty) {
-    current_heads[jetty] = queues[jetty].sq_producer_index;
+    current_heads[jetty] = ReadGmByPassDCache<uint64_t>(&queues[jetty].sq_producer_index);
   }
   const uint32_t total_posts =
       (static_cast<uint64_t>(request_count) + kWqesPerPost - 1U) / kWqesPerPost;
@@ -563,39 +567,7 @@ __aicore__ inline uint32_t ActiveRequestsForJetty(
 __aicore__ inline uint64_t WaitForCompletion(
     __gm__ const KvafBatchGetDirectUrmaEntity *entity,
     __gm__ KvafBatchGetQueueState *queue, uint32_t *poll_count) {
-  const uint32_t slot =
-      static_cast<uint32_t>(queue->cq_consumer_index % entity->cq_depth);
-  __gm__ uint8_t *const cqe_address =
-      reinterpret_cast<__gm__ uint8_t *>(entity->cq_va) +
-      static_cast<uint64_t>(slot) * entity->cqe_size;
-  for (uint32_t poll = 0U; poll < kMaxCqPolls; ++poll) {
-    CleanCacheLines(cqe_address, kCqeProbeBytes);
-    // CQ is written by the transport, outside the C++ memory model. DCCI
-    // invalidates the hardware cache; volatile and the compiler barrier also
-    // require a fresh GM load after that invalidation on every poll.
-    __asm__ __volatile__("" ::: "memory");
-    const uint32_t cqe_word =
-        *reinterpret_cast<__gm__ const volatile uint32_t *>(cqe_address);
-    __asm__ __volatile__("" ::: "memory");
-    const uint8_t owner = static_cast<uint8_t>((cqe_word >> 2U) & 1U);
-    const uint8_t expected = static_cast<uint8_t>(
-        (queue->cq_consumer_index / entity->cq_depth) & 1U);
-    if ((owner ^ expected) == 0U) {
-      continue;
-    }
-    const uint8_t sub_status =
-        static_cast<uint8_t>((cqe_word >> 16U) & 0xffU);
-    const uint8_t status =
-        static_cast<uint8_t>((cqe_word >> 24U) & 0xffU);
-    ++queue->cq_consumer_index;
-    st_dev(static_cast<uint32_t>(queue->cq_consumer_index) &
-               kCqConsumerMask,
-           reinterpret_cast<__gm__ uint32_t *>(entity->cq_db_va), 0);
-    *poll_count = poll + 1U;
-    return status == 0U && sub_status == 0U ? kSuccess : kCqError;
-  }
-  *poll_count = kMaxCqPolls;
-  return kCqTimeout;
+  return kvaf_get_cq::WaitForCompletion(entity, queue, poll_count);
 }
 
 // One ordinary device call on an exclusively owned queue group. Call only after
@@ -630,19 +602,22 @@ __aicore__ inline uint64_t KvafBatchGetWait(AsyncBatchGet &pending) {
   for (uint32_t jetty = 0U; jetty < pending.used_jettys; ++jetty) {
     uint32_t polls = 0U;
     const uint64_t completed = WaitForCompletion(entities + jetty, queues + jetty, &polls);
-    if (completed == kSuccess) { ++queues[jetty].completed_batch_count; }
+    if (completed == kSuccess) {
+      const uint64_t batches = ReadGmByPassDCache<uint64_t>(&queues[jetty].completed_batch_count);
+      WriteGmByPassDCache<uint64_t>(&queues[jetty].completed_batch_count, batches + 1U);
+    }
     else if (result == kSuccess) { result = completed; }
   }
   if (result != kSuccess) {
     pending.error = result;
     for (uint32_t jetty = 0U; jetty < pending.jettys_per_core; ++jetty) {
-      if (queues[jetty].last_error == 0U) { queues[jetty].last_error = result; }
+      if (ReadGmByPassDCache<uint64_t>(&queues[jetty].last_error) == 0U)
+        WriteGmByPassDCache<uint64_t>(&queues[jetty].last_error, result);
     }
   } else {
     pending.used_jettys = 0U;
   }
-  CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(queues),
-      pending.jettys_per_core * sizeof(KvafBatchGetQueueState));
+  DataSyncBarrier<MemDsbT::DDR>();
   return result;
 }
 
@@ -761,18 +736,20 @@ __aicore__ inline uint64_t KvafBatchGetDevice(
     __gm__ KvafBatchGetQueueState *const queue = queues + jetty;
     // A previous timed-out READ can still write HBM. Never reset it on a
     // later row, launch or graph replay.
-    if (queue->last_error != 0U) {
+    if (ReadGmByPassDCache<uint64_t>(&queue->last_error) != 0U) {
       result = kQueuePoisoned;
-    } else if (queue->initialized != 0U && queue->magic != kQueueMagic) {
+    } else if (ReadGmByPassDCache<uint32_t>(&queue->initialized) != 0U &&
+               ReadGmByPassDCache<uint32_t>(&queue->magic) != kQueueMagic) {
       result = kInvalidQueue;
     }
-    if (result == kSuccess && queue->initialized == 0U) {
-      queue->magic = kQueueMagic;
-      queue->initialized = 1U;
-      queue->sq_producer_index = 0U;
-      queue->cq_consumer_index = 0U;
-      queue->completed_batch_count = 0U;
-      queue->last_error = 0U;
+    if (result == kSuccess && ReadGmByPassDCache<uint32_t>(&queue->initialized) == 0U) {
+      WriteGmByPassDCache<uint32_t>(&queue->magic, kQueueMagic);
+      WriteGmByPassDCache<uint32_t>(&queue->initialized, 1U);
+      WriteGmByPassDCache<uint64_t>(&queue->sq_producer_index, 0U);
+      WriteGmByPassDCache<uint64_t>(&queue->cq_consumer_index, 0U);
+      WriteGmByPassDCache<uint64_t>(&queue->completed_batch_count, 0U);
+      WriteGmByPassDCache<uint64_t>(&queue->last_error, 0U);
+      DataSyncBarrier<MemDsbT::DDR>();
     }
   }
 
@@ -857,7 +834,8 @@ __aicore__ inline uint64_t KvafBatchGetDevice(
             static_cast<uint64_t>(AscendC::GetSystemCycle()) - wait_start_cycle;
       }
       if (completion_result == kSuccess) {
-        ++queues[jetty].completed_batch_count;
+        const uint64_t batches = ReadGmByPassDCache<uint64_t>(&queues[jetty].completed_batch_count);
+        WriteGmByPassDCache<uint64_t>(&queues[jetty].completed_batch_count, batches + 1U);
       } else if (result == kSuccess) {
         result = completion_result;
       }
@@ -871,13 +849,15 @@ __aicore__ inline uint64_t KvafBatchGetDevice(
   // Preserve the original error when rejecting an already poisoned queue.
   if (result != kSuccess && active_count != 0U) {
     for (uint32_t jetty = 0U; jetty < jettys_per_core; ++jetty) {
-      if (queues[jetty].last_error == 0U) {
-        queues[jetty].last_error = result;
+      if (ReadGmByPassDCache<uint64_t>(&queues[jetty].last_error) == 0U) {
+        WriteGmByPassDCache<uint64_t>(&queues[jetty].last_error, result);
       }
     }
   }
-  WriteStatus(status, result, active_count, queues[0].completed_batch_count,
-              queues[0].sq_producer_index, queues[0].cq_consumer_index,
+  WriteStatus(status, result, active_count,
+              ReadGmByPassDCache<uint64_t>(&queues[0].completed_batch_count),
+              ReadGmByPassDCache<uint64_t>(&queues[0].sq_producer_index),
+              ReadGmByPassDCache<uint64_t>(&queues[0].cq_consumer_index),
               failed_request, last_wqe);
   if (profile_enabled) {
     const uint64_t profile_finish_cycle =
@@ -888,9 +868,7 @@ __aicore__ inline uint64_t KvafBatchGetDevice(
                  profile_finish_cycle, active_count, total_posts,
                  completion_wait_cycles, completion_polls);
   }
-  CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(queues),
-                  static_cast<uint64_t>(jettys_per_core) *
-                      sizeof(KvafBatchGetQueueState));
+  DataSyncBarrier<MemDsbT::DDR>();
   CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(status),
                   sizeof(KvafBatchGetCoreStatus));
   return result;

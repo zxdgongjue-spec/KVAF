@@ -79,6 +79,22 @@ Status NpuRuntime::SetBatchGetKernelProfiling(bool) {
 Status NpuRuntime::CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>*) const {
   return Status::OK();
 }
+Status NpuRuntime::CopyBatchGetCqDiagnostics(std::vector<BatchGetCqDiagnostic>* diagnostics) const {
+  if (!impl_->initialized) return Status::NotInitialized("fixture uninitialized runtime");
+  BatchGetCqDiagnostic item;
+  item.core = 29;
+  item.jetty = 1;
+  item.trace_valid = true;
+  item.raw_cq_word = 4;
+  item.expected_owner = 1;
+  item.slow_elapsed_ticks = 1234;
+  item.polls = 20003;
+  item.flags = 35;
+  item.fast_budget_exceeded = item.late_success = item.bypass_probe = true;
+  item.reason = "late_success";
+  diagnostics->assign(1, item);
+  return Status::OK();
+}
 Status NpuRuntime::AcquireFusedBatchGetContext(void* output, std::uint64_t bytes,
                                              FusedBatchGetContext* context) {
   ++driver.acquires;

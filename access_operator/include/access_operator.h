@@ -74,6 +74,28 @@ struct BatchGetKernelProfile {
   std::array<std::uint64_t, 2> jetty_completion_polls{};
 };
 
+// Read-only snapshot of an interesting persistent queue. Trace words record
+// its most recent slow/error CQ wait; later fast completions retain that
+// evidence. They are not a measurement of the latest normal replay.
+struct BatchGetCqDiagnostic {
+  std::uint32_t core{0};
+  std::uint32_t jetty{0};
+  std::uint64_t last_error{0};
+  std::uint64_t sq_producer_index{0};
+  std::uint64_t cq_consumer_index{0};
+  std::uint64_t completed_batch_count{0};
+  bool trace_valid{false};
+  std::uint32_t raw_cq_word{0};
+  std::uint32_t expected_owner{0};
+  std::uint64_t slow_elapsed_ticks{0};
+  std::uint32_t polls{0};
+  std::uint32_t flags{0};
+  bool fast_budget_exceeded{false};
+  bool late_success{false};
+  bool bypass_probe{false};
+  std::string reason;
+};
+
 // Borrowed device resources for a caller-launched fused kernel. KVAF retains
 // the registrations and queue storage until ReleaseFusedBatchGetContext.
 // Queue cursors are persistent: never clear them between kernel invocations.
@@ -133,6 +155,11 @@ class DefaultAccessOperator final : public AccessOperator {
   Status SetBatchGetKernelProfiling(bool enabled);
   Status CopyBatchGetKernelProfiles(
       std::vector<BatchGetKernelProfile>* profiles) const;
+  // Call only after the caller's launch stream has completed. This method
+  // copies queue storage without launching work, clearing poison or changing
+  // a fused lease. Healthy queues without slow/error traces are omitted.
+  Status CopyBatchGetCqDiagnostics(
+      std::vector<BatchGetCqDiagnostic>* diagnostics) const;
 
  private:
   struct Impl;

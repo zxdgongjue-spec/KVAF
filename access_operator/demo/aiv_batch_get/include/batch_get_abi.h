@@ -18,6 +18,23 @@ static const uint64_t KVAF_AIV_BATCH_GET_STATUS_MAGIC = 0x4b5641464247444fULL;
 static const uint64_t KVAF_AIV_BATCH_GET_PROFILE_MAGIC =
     0x4b56414650524f46ULL;  // "KVAFPROF"
 
+// Optional CQ wait trace in QueueState.reserved[], without changing its ABI.
+// reserved[0]: raw CQ word in bits 0..31, expected owner in bit 32.
+// reserved[1]: slow-phase elapsed GetSystemCycle ticks (fast phase is untimed).
+// reserved[2]: poll count in bits 0..31, version tag | flags in bits 32..63.
+// This records the most recent slow/error wait and survives later fast waits.
+enum {
+  KVAF_BATCH_GET_CQ_TRACE_TAG = 0x43510000U,
+  KVAF_BATCH_GET_CQ_TRACE_TAG_MASK = 0xffff0000U,
+  KVAF_BATCH_GET_CQ_TRACE_SLOW_ENTERED = 1U,
+  KVAF_BATCH_GET_CQ_TRACE_LATE_SUCCESS = 2U,
+  KVAF_BATCH_GET_CQ_TRACE_DEADLINE = 4U,
+  KVAF_BATCH_GET_CQ_TRACE_POLL_LIMIT = 8U,
+  KVAF_BATCH_GET_CQ_TRACE_ERROR_CQE = 16U,
+  KVAF_BATCH_GET_CQ_TRACE_BYPASS_PROBE = 32U,
+  KVAF_BATCH_GET_CQ_TRACE_TIMEOUT = 64U,
+};
+
 // Optional, per-core kernel timeline. The host enables collection by placing
 // KVAF_AIV_BATCH_GET_PROFILE_MAGIC in `magic` before launch. The kernel keeps
 // the magic in its output, so repeated launches can reuse the same status

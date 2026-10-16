@@ -68,6 +68,7 @@ add_custom_command(
   DEPENDS "${KVAF_EXECUTE_KERNEL_SOURCE}"
           "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_abi.h"
           "${KVAF_AIV_DEMO_INCLUDE_DIR}/kvaf_batch_get_device.h"
+          "${KVAF_AIV_DEMO_INCLUDE_DIR}/kvaf_batch_get_cq_wait.h"
           "${KVAF_AIV_DEMO_INCLUDE_DIR}/kvaf_batch_get_device_policy.h"
           "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"
           "${KVAF_SIMT_API_DIR}/simt_api/asc_simt.h"

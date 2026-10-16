@@ -63,6 +63,8 @@ class NpuRuntime final : public Runtime {
   Status SetBatchGetKernelProfiling(bool enabled);
   Status CopyBatchGetKernelProfiles(
       std::vector<BatchGetKernelProfile>* profiles) const;
+  Status CopyBatchGetCqDiagnostics(
+      std::vector<BatchGetCqDiagnostic>* diagnostics) const;
 
   // Acquire once before fused launches. KVAF registers this caller-owned HBM
   // output and exclusively leases its BatchGet queues; ordinary BatchGet and

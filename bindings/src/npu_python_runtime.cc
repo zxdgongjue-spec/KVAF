@@ -434,6 +434,42 @@ class NpuPythonRuntime final {
     ThrowIfError(native_->SetBatchGetKernelProfiling(true));
   }
 
+  py::list BatchGetCqDiagnostics() const {
+    std::vector<kvaf::BatchGetCqDiagnostic> diagnostics;
+    ThrowIfError(native_->CopyBatchGetCqDiagnostics(&diagnostics));
+    py::list result;
+    for (const auto& source : diagnostics) {
+      py::dict item;
+      item["core"] = source.core;
+      item["jetty"] = source.jetty;
+      item["last_error"] = source.last_error;
+      item["sq_producer_index"] = source.sq_producer_index;
+      item["cq_consumer_index"] = source.cq_consumer_index;
+      item["completed_batch_count"] = source.completed_batch_count;
+      item["trace_valid"] = source.trace_valid;
+      if (source.trace_valid) {
+        item["raw_cq_word"] = source.raw_cq_word;
+        item["observed_owner"] = (source.raw_cq_word >> 2U) & 1U;
+        item["expected_owner"] = source.expected_owner;
+        item["cq_status"] = (source.raw_cq_word >> 24U) & 0xffU;
+        item["cq_sub_status"] = (source.raw_cq_word >> 16U) & 0xffU;
+        item["slow_elapsed_ticks"] = source.slow_elapsed_ticks;
+        item["polls"] = source.polls;
+        item["flags"] = source.flags;
+        item["fast_budget_exceeded"] = source.fast_budget_exceeded;
+        item["late_success"] = source.late_success;
+        item["bypass_probe"] = source.bypass_probe;
+        item["reason"] = source.reason;
+        item["fast_poll_budget"] = 20000;
+        item["slow_deadline_ticks"] = 100000000;
+        item["clock_hz"] = 1000000000;
+        item["trace_scope"] = "most_recent_slow_or_error_wait";
+      }
+      result.append(std::move(item));
+    }
+    return result;
+  }
+
   py::list BatchGetKernelProfileSnapshot() const {
     std::vector<kvaf::BatchGetKernelProfile> profiles;
     ThrowIfError(native_->CopyBatchGetKernelProfiles(&profiles));
@@ -646,6 +682,9 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("start_batch_get_kernel_profile",
            &NpuPythonRuntime::StartBatchGetKernelProfile,
            "Enable the per-core BatchGet kernel cycle timeline.")
+      .def("batch_get_cq_diagnostics", &NpuPythonRuntime::BatchGetCqDiagnostics,
+           "After caller stream completion, copy persistent slow/error CQ traces. "
+           "Healthy queues without a trace are omitted; this never clears queue poison.")
       .def("batch_get_kernel_profile",
            &NpuPythonRuntime::BatchGetKernelProfileSnapshot,
            "Copy the latest completed per-core BatchGet kernel timeline.")

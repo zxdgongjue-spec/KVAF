@@ -396,6 +396,79 @@ void TestQueueHealthCqProfileDiagnostics(bool profile_enabled) {
   Require(op->Shutdown().ok(), "unleased CPU fixture retires outside the diagnostic check");
 }
 
+void TestPersistentCqDiagnosticReadback() {
+  driver = {};
+  auto op = std::make_unique<kvaf::DefaultAccessOperator>(Config());
+  std::vector<kvaf::BatchGetCqDiagnostic> snapshots;
+  Require(!op->CopyBatchGetCqDiagnostics(&snapshots).ok(), "uninitialized diagnostic read rejected");
+  std::vector<std::uint8_t> ddr(4096), output(656 * 4);
+  Require(op->Initialize({reinterpret_cast<std::uint64_t>(ddr.data()), ddr.size(),
+                         256, kvaf::DeviceKind::kCpu}).ok(), "CQ diagnostic readback init");
+  Require(!op->CopyBatchGetCqDiagnostics(nullptr).ok(), "null diagnostic output rejected");
+  Require(op->CopyBatchGetCqDiagnostics(&snapshots).ok() && snapshots.empty(),
+          "healthy untraced queues are omitted");
+  kvaf::FusedBatchGetContext context;
+  Require(op->AcquireFusedBatchGetContext(output.data(), output.size(), 656, 128, &context).ok(),
+          "CQ diagnostic fixture obtains ABI pointers");
+  auto* queues = reinterpret_cast<KvafBatchGetQueueState*>(context.device_queue_state);
+  auto& slow = queues[3];
+  slow.sq_producer_index = 68;
+  slow.cq_consumer_index = 1;
+  slow.completed_batch_count = 1;
+  const std::uint32_t late_flags = KVAF_BATCH_GET_CQ_TRACE_SLOW_ENTERED |
+      KVAF_BATCH_GET_CQ_TRACE_LATE_SUCCESS | KVAF_BATCH_GET_CQ_TRACE_BYPASS_PROBE;
+  slow.reserved[0] = (1ULL << 32U) | 4U;
+  slow.reserved[1] = 123456;
+  slow.reserved[2] = (static_cast<std::uint64_t>(KVAF_BATCH_GET_CQ_TRACE_TAG | late_flags) << 32U) | 20003U;
+  const auto saved = slow;
+  const auto original_driver = driver;
+  Require(op->CopyBatchGetCqDiagnostics(&snapshots).ok() && snapshots.size() == 1,
+          "late success observable while lease remains owned");
+  const auto& trace = snapshots.front();
+  Require(trace.core == 1 && trace.jetty == 1 && trace.last_error == 0 && trace.trace_valid &&
+              trace.raw_cq_word == 4 && trace.expected_owner == 1 && trace.polls == 20003 &&
+              trace.slow_elapsed_ticks == 123456 && trace.reason == "late_success" &&
+              trace.late_success && trace.fast_budget_exceeded && trace.bypass_probe,
+          "host readback decodes the real reserved-word contract");
+  Require(std::memcmp(&slow, &saved, sizeof(slow)) == 0 &&
+              driver.acquires == original_driver.acquires && driver.releases == original_driver.releases &&
+              driver.launches == original_driver.launches && driver.device_syncs == original_driver.device_syncs,
+          "readback changes no queues, launches, fences or ownership");
+  const std::uint32_t fault_flags[] = {KVAF_BATCH_GET_CQ_TRACE_ERROR_CQE,
+      KVAF_BATCH_GET_CQ_TRACE_TIMEOUT | KVAF_BATCH_GET_CQ_TRACE_DEADLINE,
+      KVAF_BATCH_GET_CQ_TRACE_TIMEOUT | KVAF_BATCH_GET_CQ_TRACE_POLL_LIMIT};
+  const char* reasons[] = {"error_cqe", "device_deadline", "slow_poll_limit"};
+  for (std::size_t index = 0; index < 3; ++index) {
+    slow.last_error = index == 0 ? 7U : 6U;
+    slow.reserved[0] = (1ULL << 32U) | 4U | (2U << 24U) | (3U << 16U);
+    slow.reserved[2] = (static_cast<std::uint64_t>(KVAF_BATCH_GET_CQ_TRACE_TAG |
+        KVAF_BATCH_GET_CQ_TRACE_BYPASS_PROBE | fault_flags[index]) << 32U) | 20003U;
+    Require(op->CopyBatchGetCqDiagnostics(&snapshots).ok() && snapshots.size() == 1 &&
+                snapshots.front().last_error == slow.last_error && snapshots.front().reason == reasons[index] &&
+                snapshots.front().raw_cq_word == (4U | (2U << 24U) | (3U << 16U)) &&
+                !snapshots.front().late_success,
+            "error CQE, device deadline and poll guard remain distinct");
+  }
+  slow = saved;
+  int stream_marker = 0;
+  std::string log;
+  {
+    StderrCapture capture;
+    Require(op->ReleaseFusedBatchGetContext(context, &stream_marker).ok(), "late success permits checked release");
+    log = capture.Read();
+  }
+  Require(log.find("BATCH_GET_CQ_WAIT_DETAILS core=1 jetty=1 last_error=0 polls=20003") != std::string::npos &&
+              log.find("reason=late_success raw_cq_word=0x4 observed_owner=1 expected_owner=1") != std::string::npos &&
+              log.find("trace_scope=most_recent_slow_or_error_wait") != std::string::npos &&
+              log.find("core=0") == std::string::npos,
+          "automatic health boundary logs slow queues without healthy queue spam");
+  queues[0].last_error = 6;
+  Require(op->CopyBatchGetCqDiagnostics(&snapshots).ok() && snapshots.size() == 2 &&
+              snapshots[0].last_error == 6 && !snapshots[0].trace_valid,
+          "legacy poison remains observable without inventing CQ trace values");
+  Require(op->Shutdown().ok(), "unleased diagnostic CPU fixture shutdown");
+}
+
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
 void TestIndependentPutPool(std::uint32_t requested_put_workers,
                             std::uint32_t expected_put_workers, bool local_host) {
@@ -589,6 +662,7 @@ int main() {
     TestQueueHealthDiagnostics(true);
     TestQueueHealthCqProfileDiagnostics(false);
     TestQueueHealthCqProfileDiagnostics(true);
+    TestPersistentCqDiagnosticReadback();
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
     TestIndependentPutPool(1, 1, true);
     TestIndependentPutPool(0, 30, true);

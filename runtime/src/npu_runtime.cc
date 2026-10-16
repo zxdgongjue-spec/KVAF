@@ -661,6 +661,15 @@ Status NpuRuntime::CopyBatchGetKernelProfiles(
   return impl_->access_operator->CopyBatchGetKernelProfiles(profiles);
 }
 
+Status NpuRuntime::CopyBatchGetCqDiagnostics(
+    std::vector<BatchGetCqDiagnostic>* diagnostics) const {
+  if (impl_->access_operator == nullptr) {
+    return Status::NotInitialized(
+        "initialize NpuRuntime before reading BatchGet CQ diagnostics");
+  }
+  return impl_->access_operator->CopyBatchGetCqDiagnostics(diagnostics);
+}
+
 Status NpuRuntime::AcceptLink(const LinkTarget&) {
   return Status::NotImplemented("NpuRuntime does not accept links in the CPU--NPU deployment");
 }

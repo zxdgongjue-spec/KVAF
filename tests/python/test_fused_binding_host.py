@@ -123,6 +123,7 @@ class FusedBindingHostTest(unittest.TestCase):
         self.assertEqual(legacy.npu_core_count, 30)
         self.assertEqual(legacy.batch_put_npu_core_count, 30)
         legacy.shutdown()
+
         independent = self.module.NpuRuntime("fixture.o", 656, 128,
                                               npu_core_count=30,
                                               batch_put_npu_core_count=1)
@@ -134,6 +135,24 @@ class FusedBindingHostTest(unittest.TestCase):
             independent.batch_put_npu_core_count = 2
         independent.release_fused_batch_get_context(context)
         independent.shutdown()
+
+    def test_cq_diagnostic_snapshot_exports_late_success_without_releasing_lease(self):
+        runtime = self.runtime()
+        context = runtime.acquire_fused_batch_get_context(Tensor(), Stream())
+        before = self.module.stats()
+        records = runtime.batch_get_cq_diagnostics()
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual((record["core"], record["jetty"], record["last_error"]), (29, 1, 0))
+        self.assertEqual(record["reason"], "late_success")
+        self.assertEqual(record["raw_cq_word"], 4)
+        self.assertEqual((record["observed_owner"], record["expected_owner"]), (1, 1))
+        self.assertEqual((record["polls"], record["slow_elapsed_ticks"]), (20003, 1234))
+        self.assertTrue(record["late_success"] and record["fast_budget_exceeded"] and record["bypass_probe"])
+        self.assertEqual(record["trace_scope"], "most_recent_slow_or_error_wait")
+        self.assertEqual(self.module.stats(), before)
+        runtime.release_fused_batch_get_context(context)
+        runtime.shutdown()
 
     def test_exports_unsigned_context_and_releases_only_after_fence(self):
         runtime = self.runtime()

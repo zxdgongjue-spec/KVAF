@@ -46,9 +46,12 @@ void LogBatchGetDeviceStatus(const BatchGetExecutionState& execution,
                              std::uint32_t npu_core_count,
                              bool include_successful = false);
 
-Status CheckBatchGetQueueHealth(const BatchGetExecutionState& execution,
-                               std::uint32_t workers,
-                               std::uint32_t jettys_per_core) {
+const char* BatchGetCqWaitReason(std::uint32_t flags);
+
+Status CollectBatchGetCqDiagnostics(const BatchGetExecutionState& execution,
+                                   std::uint32_t workers,
+                                   std::uint32_t jettys_per_core,
+                                   std::vector<BatchGetCqDiagnostic>* diagnostics) {
   std::vector<KvafBatchGetQueueState> queues(
       static_cast<std::size_t>(workers) * jettys_per_core);
   if (aclrtMemcpy(queues.data(), queues.size() * sizeof(queues.front()),
@@ -56,16 +59,82 @@ Status CheckBatchGetQueueHealth(const BatchGetExecutionState& execution,
                   ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
     return Internal("failed to inspect BatchGet queue completion state");
   }
-  bool failed = false;
+  diagnostics->clear();
   for (std::size_t index = 0; index < queues.size(); ++index) {
     const auto& queue = queues[index];
+    const auto trace_header = static_cast<std::uint32_t>(queue.reserved[2] >> 32U);
+    const bool trace_valid =
+        (trace_header & KVAF_BATCH_GET_CQ_TRACE_TAG_MASK) == KVAF_BATCH_GET_CQ_TRACE_TAG;
+    if (queue.last_error == 0U && !trace_valid) continue;
+    BatchGetCqDiagnostic item;
+    item.core = static_cast<std::uint32_t>(index / jettys_per_core);
+    item.jetty = static_cast<std::uint32_t>(index % jettys_per_core);
+    item.last_error = queue.last_error;
+    item.sq_producer_index = queue.sq_producer_index;
+    item.cq_consumer_index = queue.cq_consumer_index;
+    item.completed_batch_count = queue.completed_batch_count;
+    item.trace_valid = trace_valid;
+    if (trace_valid) {
+      item.raw_cq_word = static_cast<std::uint32_t>(queue.reserved[0]);
+      item.expected_owner = static_cast<std::uint32_t>((queue.reserved[0] >> 32U) & 1U);
+      item.slow_elapsed_ticks = queue.reserved[1];
+      item.polls = static_cast<std::uint32_t>(queue.reserved[2]);
+      item.flags = trace_header & ~KVAF_BATCH_GET_CQ_TRACE_TAG_MASK;
+      item.fast_budget_exceeded = (item.flags & KVAF_BATCH_GET_CQ_TRACE_SLOW_ENTERED) != 0U;
+      item.late_success = (item.flags & KVAF_BATCH_GET_CQ_TRACE_LATE_SUCCESS) != 0U;
+      item.bypass_probe = (item.flags & KVAF_BATCH_GET_CQ_TRACE_BYPASS_PROBE) != 0U;
+      item.reason = BatchGetCqWaitReason(item.flags);
+    }
+    diagnostics->push_back(item);
+  }
+  return Status::OK();
+}
+
+const char* BatchGetCqWaitReason(std::uint32_t flags) {
+  if ((flags & KVAF_BATCH_GET_CQ_TRACE_ERROR_CQE) != 0U) return "error_cqe";
+  if ((flags & KVAF_BATCH_GET_CQ_TRACE_DEADLINE) != 0U) return "device_deadline";
+  if ((flags & KVAF_BATCH_GET_CQ_TRACE_POLL_LIMIT) != 0U) return "slow_poll_limit";
+  if ((flags & KVAF_BATCH_GET_CQ_TRACE_LATE_SUCCESS) != 0U) return "late_success";
+  return "unclassified";
+}
+
+void LogBatchGetCqDiagnostic(const BatchGetCqDiagnostic& item) {
+  if (!item.trace_valid) return;
+  std::fprintf(stderr,
+               "[KVAF_AIV] BATCH_GET_CQ_WAIT_DETAILS core=%u jetty=%u "
+               "last_error=%llu polls=%u slow_elapsed_ticks=%llu "
+               "reason=%s raw_cq_word=0x%x observed_owner=%u expected_owner=%u "
+               "cq_status=%u cq_sub_status=%u fast_budget_exceeded=%u late_success=%u "
+               "bypass_probe=%u sq_after=%llu cq_after=%llu "
+               "fast_poll_budget=20000 slow_deadline_ticks=100000000 clock_hz=1000000000 "
+               "trace_scope=most_recent_slow_or_error_wait timing_scope=Get_CQ\n",
+               item.core, item.jetty, static_cast<unsigned long long>(item.last_error),
+               item.polls, static_cast<unsigned long long>(item.slow_elapsed_ticks),
+               BatchGetCqWaitReason(item.flags), item.raw_cq_word,
+               (item.raw_cq_word >> 2U) & 1U, item.expected_owner,
+               (item.raw_cq_word >> 24U) & 0xffU, (item.raw_cq_word >> 16U) & 0xffU,
+               static_cast<unsigned>((item.flags & KVAF_BATCH_GET_CQ_TRACE_SLOW_ENTERED) != 0U),
+               static_cast<unsigned>((item.flags & KVAF_BATCH_GET_CQ_TRACE_LATE_SUCCESS) != 0U),
+               static_cast<unsigned>((item.flags & KVAF_BATCH_GET_CQ_TRACE_BYPASS_PROBE) != 0U),
+               static_cast<unsigned long long>(item.sq_producer_index),
+               static_cast<unsigned long long>(item.cq_consumer_index));
+}
+
+Status CheckBatchGetQueueHealth(const BatchGetExecutionState& execution,
+                               std::uint32_t workers,
+                               std::uint32_t jettys_per_core) {
+  std::vector<BatchGetCqDiagnostic> diagnostics;
+  const Status read = CollectBatchGetCqDiagnostics(execution, workers, jettys_per_core, &diagnostics);
+  if (!read.ok()) return read;
+  bool failed = false;
+  for (const auto& queue : diagnostics) {
+    LogBatchGetCqDiagnostic(queue);
     if (queue.last_error != 0U) {
       failed = true;
       std::fprintf(stderr,
                    "[KVAF_AIV] BATCH_GET_QUEUE_ERROR core=%u jetty=%u "
                    "last_error=%llu sq_pi=%llu cq_ci=%llu completed_batches=%llu\n",
-                   static_cast<unsigned>(index / jettys_per_core),
-                   static_cast<unsigned>(index % jettys_per_core),
+                   queue.core, queue.jetty,
                    static_cast<unsigned long long>(queue.last_error),
                    static_cast<unsigned long long>(queue.sq_producer_index),
                    static_cast<unsigned long long>(queue.cq_consumer_index),
@@ -667,6 +736,21 @@ Status DefaultAccessOperator::SetBatchGetKernelProfiling(bool enabled) {
     return Internal("failed to configure BatchGet kernel profiling");
   }
   return Status::OK();
+}
+
+Status DefaultAccessOperator::CopyBatchGetCqDiagnostics(
+    std::vector<BatchGetCqDiagnostic>* diagnostics) const {
+  std::lock_guard<std::mutex> lock(impl_->batch_get_mutex);
+  if (diagnostics == nullptr) {
+    return InvalidArgument("BatchGet CQ diagnostic output must not be null");
+  }
+  if (!impl_->initialized || impl_->initialization_failed || impl_->execution.queue_state == nullptr) {
+    return Status::NotInitialized("AccessOperator has not been initialized");
+  }
+  // The caller owns stream synchronization. In particular this read does not
+  // release or reacquire a fused lease and does not run inside a timed graph.
+  return CollectBatchGetCqDiagnostics(impl_->execution, impl_->config.npu_core_count,
+                                     impl_->config.jettys_per_core, diagnostics);
 }
 
 Status DefaultAccessOperator::CopyBatchGetKernelProfiles(

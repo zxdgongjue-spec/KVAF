@@ -55,6 +55,10 @@ inline uint64_t GetSystemCycle() {
   static uint64_t cycle = 0U;
   return ++cycle;
 }
+template<typename T> inline T ReadGmByPassDCache(T *address) { return *address; }
+template<typename T> inline void WriteGmByPassDCache(T *address, T value) { *address = value; }
+enum class MemDsbT { DDR };
+template<MemDsbT> inline void DataSyncBarrier() {}
 enum class CacheLine { SINGLE_CACHE_LINE };
 enum class DcciDst { CACHELINE_OUT };
 template <typename T> struct GlobalTensor {
