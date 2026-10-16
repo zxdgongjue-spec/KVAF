@@ -142,9 +142,6 @@ inline std::uint64_t RowTag(std::uint64_t sequence, std::uint64_t row) {
 }
 inline std::uint64_t LogicalRowForOutputSlot(const Config& c, std::uint64_t slot) { return c.rows - 1 - slot; }
 inline std::uint64_t OutputSlotOffset(const Layout& l, std::uint64_t slot) { return slot * l.stride; }
-inline std::uint64_t OutputOffset(const Config& c, const Layout& l, std::uint64_t row) {
-  return (c.rows - 1 - row) * l.stride;
-}
 // A packed source row can cross cache lines. Assign whole groups whose byte
 // length is a multiple of 64, so worker invalidations never share a line.
 inline std::uint64_t RowsPerCacheGroup(std::uint64_t row_bytes) {

@@ -166,13 +166,14 @@ Result Run(DeviceIO& io, Sample* samples, KernelResult* result, MultiBlockCoordi
       }
       if (Status(c) != Result::kPending) break;
       const auto end = io.Now(), ready = Load(c.ready_tick);
-      const auto verify_start = io.Now();
+      std::uint64_t verification = 0;
       if (ShouldVerifyOutput(io.config, sequence)) {
+        const auto verify_start = io.Now();
         // No output flush/read before the independent URMA consumer's ACK.
         const auto verified = VerifyOutputViaUrma(sequence, timeout, io);
         if (verified != Result::kOk) { Fail(c, verified, sequence); break; }
+        verification = io.Now() - verify_start;
       }
-      const auto verification = io.Now() - verify_start;
       if (sequence > io.config.warmup)
         samples[sequence - io.config.warmup - 1] = {end - start, ready - start, end - ready, prepared, verification};
       result->completed_rounds = sequence; Store(c.round_complete, sequence);
