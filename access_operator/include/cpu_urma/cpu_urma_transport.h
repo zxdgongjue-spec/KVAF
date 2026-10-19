@@ -107,24 +107,20 @@ class CpuUrmaTransport final {
                     const HostSge* sources, std::size_t count);
   using PreparedWriteId = std::uint64_t;
   struct PreparedWriteCompletion { PreparedWriteId id{}; };
-  // Prepare reusable one-wave descriptors, preserving one local SGE per source row.
-  // Modify payload only while idle; retain sources until completion or successful
-  // Shutdown after failure. Do not mix live prepared and synchronous transfers.
-  Status PrepareWriteBatch(const std::uint64_t* remote_offsets,
-                           const HostSge* sources, std::size_t count,
-                           PreparedWriteId* id);
-  struct WriteChainChunk {
+  struct WriteChunk {
     const std::uint64_t* remote_offsets{};
     const HostSge* sources{};
     std::size_t count{};
-    // One aligned 8-byte progress word per Jetty.
+    // Optional: one aligned 8-byte progress word per Jetty; omit both marker fields.
     const std::uint64_t* marker_offsets{};
     // Immutable until completion.
     const std::uint64_t* marker_value{};
   };
-  // Chain data and ordered progress WRITEs on each Jetty; only tails produce CQEs.
-  Status PrepareWriteChain(const WriteChainChunk* chunks, std::size_t count,
-                           PreparedWriteId* id);
+  // Prepare reusable one-wave descriptors; optional ordered markers follow each
+  // chunk and only queue tails produce CQEs. Modify payload only while idle;
+  // retain sources until completion or successful Shutdown after failure.
+  // Do not mix live prepared and synchronous transfers.
+  Status PrepareWrite(const WriteChunk* chunks, std::size_t count, PreparedWriteId* id);
   struct PreparedWriteInfo {
     std::uint64_t wr_count{}, marker_wrs{}, tail_cqes{};
   };

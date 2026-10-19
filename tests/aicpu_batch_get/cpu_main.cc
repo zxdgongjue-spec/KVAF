@@ -184,7 +184,7 @@ void Run(Options options) {
   CpuUrmaTransport::HostSge ready_sge{output_ready, sizeof(Control)}, ack_sge{output_verified, sizeof(Control)};
   Check(transport.WriteSglBatch(kRequestOffset, &request_sge, 1));
   Check(transport.WriteSglBatch(kDoneOffset, &done_sge, 1));
-  std::vector<CpuUrmaTransport::WriteChainChunk> chunks(work.size());
+  std::vector<CpuUrmaTransport::WriteChunk> chunks(work.size());
   std::vector<std::array<std::uint64_t, 16>> markers(work.size());
   for (std::size_t i = 0; i < work.size(); ++i) {
     const auto& w = work[i];
@@ -194,9 +194,10 @@ void Run(Options options) {
         static_cast<std::size_t>(w.rows.end - w.rows.begin), markers[i].data(), &tokens[i].sequence};
   }
   CpuUrmaTransport::PreparedWriteId data_id{}, done_id{};
-  Check(transport.PrepareWriteChain(chunks.data(), chunks.size(), &data_id));
+  Check(transport.PrepareWrite(chunks.data(), chunks.size(), &data_id));
   const std::uint64_t done_offset = kDoneOffset;
-  Check(transport.PrepareWriteBatch(&done_offset, &done_sge, 1, &done_id));
+  const CpuUrmaTransport::WriteChunk done_chunk{&done_offset, &done_sge, 1};
+  Check(transport.PrepareWrite(&done_chunk, 1, &done_id));
   CpuUrmaTransport::PreparedWriteInfo info{}; Check(transport.DescribePreparedWrite(data_id, &info));
   for (std::uint64_t offset = 0; offset < layout.output_bytes + kGuardBytes;) {
     const auto length = std::min(transport.max_write_bytes(), layout.output_bytes + kGuardBytes - offset);

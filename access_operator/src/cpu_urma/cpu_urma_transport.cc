@@ -1336,68 +1336,42 @@ struct CpuUrmaTransport::Impl {
     return status;
   }
 
-  Status PrepareWriteBatch(const std::uint64_t* offsets,
-                           const CpuUrmaTransport::HostSge* sources,
-                           std::size_t count, CpuUrmaTransport::PreparedWriteId* id) {
-    std::unique_lock<std::mutex> lock(batch_submit_mutex_);
-    if (!initialized_ || batch_poisoned_ || !indexed_tracker_.Empty())
-      return Status::InvalidState("prepare WRITE requires an initialized, idle transport");
-    if (!id || !offsets || !sources || !count ||
-        count > kJettyDepth * local_jettys_.size())
-      return Status::InvalidArgument("prepared WRITE must fit one Jetty wave");
-    auto status = ValidateAndRegisterHostBuffers(sources, offsets, count);
-    if (!status.ok()) return status;
-    auto plan = std::make_unique<PreparedWrite>();
-    auto& job = plan->job;
-    job.write = true;
-    job.queues.resize(local_jettys_.size());
-    for (std::size_t q = 0; q < job.queues.size(); ++q) {
-      const auto range = RowsForQueue(count, job.queues.size(), q);
-      const auto rows = range.count;
-      EnsureSglQueueStorage(job.queues[q], rows, rows);
-      if (!rows) continue;
-      status = BuildWriteGatherQueue(job, q, sources, offsets, count, range.first, rows);
-      if (!status.ok()) return status;
-      if (!job.queues[q].missing_host_segments.empty())
-        return Status::Internal("prepared WRITE has an unresolved host segment");
-      plan->fences[plan->fence_count++] = {q, job.queues[q].count, 0};
-    }
-    prepared_writes_.push_back(std::move(plan));
-    *id = prepared_writes_.size();
-    return Status::OK();
-  }
-
-  Status PrepareWriteChain(const CpuUrmaTransport::WriteChainChunk* chunks, std::size_t count,
+  Status PrepareWrite(const CpuUrmaTransport::WriteChunk* chunks, std::size_t count,
       CpuUrmaTransport::PreparedWriteId* id) {
     std::unique_lock<std::mutex> lock(batch_submit_mutex_);
     if (!initialized_ || batch_poisoned_ || !indexed_tracker_.Empty())
-      return Status::InvalidState("prepare chain requires an initialized, idle transport");
+      return Status::InvalidState("prepare WRITE requires an initialized, idle transport");
     if (!chunks || !count || !id || count > kJettyDepth)
-      return Status::InvalidArgument("invalid ordered WRITE chain");
+      return Status::InvalidArgument("invalid prepared WRITE chunks");
     auto plan = std::make_unique<PreparedWrite>();
     auto& job = plan->job; job.write = true; job.queues.resize(local_jettys_.size());
     // Allocate worst-case storage before binding any descriptor pointers.
     std::array<std::size_t, kMaxJettyCount> capacity{};
     for (std::size_t c = 0; c < count; ++c) {
       const auto& chunk = chunks[c];
-      if (!chunk.count || !chunk.sources || !chunk.remote_offsets || !chunk.marker_offsets ||
-          !chunk.marker_value || reinterpret_cast<std::uintptr_t>(chunk.marker_value) % 8 ||
+      if (!chunk.count || !chunk.sources || !chunk.remote_offsets ||
+          (chunk.marker_offsets != nullptr) != (chunk.marker_value != nullptr) ||
+          reinterpret_cast<std::uintptr_t>(chunk.marker_value) % 8 ||
           chunk.count > kJettyDepth * local_jettys_.size())
         return Status::InvalidArgument("invalid chain chunk/source/marker alignment");
       auto status = ValidateAndRegisterHostBuffers(chunk.sources, chunk.remote_offsets, chunk.count);
       if (!status.ok()) return status;
       for (std::size_t q = 0; q < job.queues.size(); ++q) {
-        const auto offset = chunk.marker_offsets[q];
-        if (offset % 8 || offset > remote_region_.length || remote_region_.length - offset < 8)
-          return Status::InvalidArgument("chain marker is outside remote region or unaligned");
-        capacity[q] += RowsForQueue(chunk.count, job.queues.size(), q).count + 1;
+        if (chunk.marker_value) {
+          const auto offset = chunk.marker_offsets[q];
+          if (offset % 8 || offset > remote_region_.length || remote_region_.length - offset < 8)
+            return Status::InvalidArgument("chain marker is outside remote region or unaligned");
+        }
+        capacity[q] += RowsForQueue(chunk.count, job.queues.size(), q).count +
+                       (chunk.marker_value ? 1 : 0);
         if (capacity[q] > kJettyDepth)
           return Status::InvalidArgument("WRITE chain source/marker budget exceeds one SQ wave; reduce rows/chunks");
       }
-      // Each chunk shares one local marker across Jettys.
-      const CpuUrmaTransport::HostSge marker{const_cast<std::uint64_t*>(chunk.marker_value), 8};
-      status = ValidateAndRegisterHostBuffers(&marker, chunk.marker_offsets, 1);
-      if (!status.ok()) return status;
+      if (chunk.marker_value) {
+        const CpuUrmaTransport::HostSge marker{const_cast<std::uint64_t*>(chunk.marker_value), 8};
+        status = ValidateAndRegisterHostBuffers(&marker, chunk.marker_offsets, 1);
+        if (!status.ok()) return status;
+      }
     }
     for (std::size_t q = 0; q < job.queues.size(); ++q) {
       auto& queue = job.queues[q];
@@ -1409,13 +1383,16 @@ struct CpuUrmaTransport::Impl {
     for (std::size_t c = 0; c < count; ++c) {
       const auto& chunk = chunks[c];
       auto* marker_segment = explicit_host_region_.segment;
-      if (!HostSpanFitsRegisteredBuffer(explicit_host_region_, chunk.marker_value, 8)) {
-        const auto* host = FindRegisteredHostBuffer(chunk.marker_value, 8);
-        marker_segment = host ? host->segment : nullptr;
+      if (chunk.marker_value) {
+        if (!HostSpanFitsRegisteredBuffer(explicit_host_region_, chunk.marker_value, 8)) {
+          const auto* host = FindRegisteredHostBuffer(chunk.marker_value, 8);
+          marker_segment = host ? host->segment : nullptr;
+        }
+        if (!marker_segment) return Status::Internal("unresolved chain marker segment");
       }
-      if (!marker_segment) return Status::Internal("unresolved chain marker segment");
       for (std::size_t q = 0; q < job.queues.size(); ++q) {
         const auto range = RowsForQueue(chunk.count, job.queues.size(), q);
+        if (!range.count && !chunk.marker_value) continue;
         auto& dst = job.queues[q]; auto& src = temp.queues[q];
         EnsureSglQueueStorage(src, range.count, range.count);
         const auto status = BuildWriteGatherQueue(temp, q, chunk.sources, chunk.remote_offsets,
@@ -1424,7 +1401,7 @@ struct CpuUrmaTransport::Impl {
         if (!src.missing_host_segments.empty()) return Status::Internal("unresolved chain host segment");
         const auto local_base = locals[q];
         // The gather builder emits exactly one local SGE per source row.
-        std::copy_n(src.local.data(), range.count, dst.local.data() + local_base);
+        if (range.count) std::copy_n(src.local.data(), range.count, dst.local.data() + local_base);
         locals[q] += range.count;
         for (std::size_t w = 0; w < src.count; ++w) {
           const auto index = dst.count++;
@@ -1437,6 +1414,7 @@ struct CpuUrmaTransport::Impl {
           wr.flag.bs.complete_enable = 0;
           wr.flag.bs.place_order = URMA_RELAX_ORDER;
         }
+        if (!chunk.marker_value) continue;
         // Every queue publishes its own progress, including empty shards.
         const auto index = dst.count++, local = locals[q]++;
         dst.local[local] = {reinterpret_cast<std::uint64_t>(chunk.marker_value), 8, marker_segment, nullptr};
@@ -1451,6 +1429,7 @@ struct CpuUrmaTransport::Impl {
     }
     for (std::size_t q = 0; q < job.queues.size(); ++q) {
       auto& queue = job.queues[q];
+      if (!queue.count) continue;
       if (queue.count > kJettyDepth) return Status::InvalidArgument("WRITE chain exceeds one SQ wave; reduce rows/chunks");
       for (std::size_t w = 0; w < queue.count; ++w)
         queue.wrs[w].next = w + 1 < queue.count ? &queue.wrs[w + 1] : nullptr;
@@ -1685,13 +1664,9 @@ Status CpuUrmaTransport::WriteBatch(const std::uint64_t* remote_offsets,
                                     std::size_t count) {
   return impl_->TransferBatch(true, remote_offsets, sources, count);
 }
-Status CpuUrmaTransport::PrepareWriteBatch(const std::uint64_t* offsets,
-    const HostSge* sources, std::size_t count, PreparedWriteId* id) {
-  return impl_->PrepareWriteBatch(offsets, sources, count, id);
-}
-Status CpuUrmaTransport::PrepareWriteChain(const WriteChainChunk* chunks, std::size_t count,
+Status CpuUrmaTransport::PrepareWrite(const WriteChunk* chunks, std::size_t count,
     PreparedWriteId* id) {
-  return impl_->PrepareWriteChain(chunks, count, id);
+  return impl_->PrepareWrite(chunks, count, id);
 }
 Status CpuUrmaTransport::DescribePreparedWrite(PreparedWriteId id, PreparedWriteInfo* info) const {
   return impl_->DescribePreparedWrite(id, info);
