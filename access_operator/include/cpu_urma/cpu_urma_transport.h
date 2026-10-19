@@ -123,7 +123,6 @@ class CpuUrmaTransport final {
     const std::uint64_t* marker_value{};
   };
   // Chain data and ordered progress WRITEs on each Jetty; only tails produce CQEs.
-  // Post all first prefixes before their suffixes.
   Status PrepareWriteChain(const WriteChainChunk* chunks, std::size_t count,
                            PreparedWriteId* id);
   struct PreparedWriteInfo {

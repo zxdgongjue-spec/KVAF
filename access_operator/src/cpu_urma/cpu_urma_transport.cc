@@ -133,9 +133,7 @@ struct CpuUrmaTransport::Impl {
     std::array<cpu_urma_detail::IndexedAsyncWriteTracker::Fence, kMaxJettyCount> fences{};
     std::size_t fence_count{};
     cpu_urma_detail::IndexedAsyncWriteTracker::Handle handle;
-    std::array<std::size_t, kMaxJettyCount> first_prefix{};
     std::uint64_t marker_wrs{};
-    bool ordered_chain{};
   };
 
   static std::uint64_t MakeUserContext(std::uint64_t generation,
@@ -1390,7 +1388,6 @@ struct CpuUrmaTransport::Impl {
       return Status::InvalidArgument("invalid ordered WRITE chain");
     auto plan = std::make_unique<PreparedWrite>();
     auto& job = plan->job; job.write = true; job.queues.resize(local_jettys_.size());
-    plan->ordered_chain = true;
     // Allocate worst-case storage before binding any descriptor pointers.
     std::array<std::size_t, kMaxJettyCount> capacity{};
     for (std::size_t c = 0; c < count; ++c) {
@@ -1462,7 +1459,6 @@ struct CpuUrmaTransport::Impl {
         wr.rw.src.sge = reinterpret_cast<urma_sge_t*>(&dst.local[local]); wr.rw.src.num_sge = 1;
         wr.rw.dst.sge = reinterpret_cast<urma_sge_t*>(&dst.remote[index]); wr.rw.dst.num_sge = 1;
         ++plan->marker_wrs;
-        if (!c) plan->first_prefix[q] = dst.count;
       }
     }
     for (std::size_t q = 0; q < job.queues.size(); ++q) {
@@ -1470,11 +1466,6 @@ struct CpuUrmaTransport::Impl {
       if (queue.count > kJettyDepth) return Status::InvalidArgument("WRITE chain exceeds one SQ wave; reduce rows/chunks");
       for (std::size_t w = 0; w < queue.count; ++w)
         queue.wrs[w].next = w + 1 < queue.count ? &queue.wrs[w + 1] : nullptr;
-      // Permanent cuts agree with first-prefix/suffix submission and doorbells.
-      for (unsigned phase = 0; phase < 2; ++phase)
-        cpu_urma_detail::ForEachChainPost(phase ? plan->first_prefix[q] : 0,
-            phase ? queue.count : plan->first_prefix[q], wqes_per_doorbell_,
-            [&](std::size_t, std::size_t end) { queue.wrs[end - 1].next = nullptr; });
       auto& tail = queue.wrs[queue.count - 1]; tail.flag.bs.complete_enable = 1;
       tail.flag.bs.place_order = URMA_STRONG_ORDER; tail.flag.bs.comp_order = 1;
       plan->fences[plan->fence_count++] = {q, queue.count, 0};
@@ -1515,34 +1506,12 @@ struct CpuUrmaTransport::Impl {
     for (std::size_t i = 0; i < plan.fence_count; ++i) {
       const auto& f = plan.fences[i];
       job.queues[f.queue].wrs[f.wrs - 1].user_ctx = f.context;
-      const auto error = plan.ordered_chain ? std::string{} : PostSglQueue(job, f.queue);
+      const auto error = PostSglQueue(job, f.queue);
       if (!error.empty()) {
         // A failed post may leave live WRs; retain sources and descriptors until teardown.
         batch_poisoned_ = true;
         return Status::Internal(error);
       }
-    }
-    if (plan.ordered_chain) {
-      std::string error;
-      const bool ok = cpu_urma_detail::DispatchWriteChain(job.queues.size(),
-          [&](std::size_t q) { return plan.first_prefix[q]; },
-          [&](std::size_t q) { return job.queues[q].count; },
-          [&](std::size_t q, std::size_t begin, std::size_t end) {
-            bool success = true;
-            cpu_urma_detail::ForEachChainPost(begin, end, wqes_per_doorbell_,
-                [&](std::size_t first, std::size_t) {
-                  if (!success) return;
-                  urma_jfs_wr_t* bad = nullptr;
-                  const auto rc = urma_post_jetty_send_wr(local_jettys_[q], &job.queues[q].wrs[first], &bad);
-                  if (rc != URMA_SUCCESS) {
-                    success = false;
-                    error = "WRITE chain post failed (jetty=" + std::to_string(q) +
-                        ", status=" + std::to_string(static_cast<int>(rc)) + ")";
-                  }
-                });
-            return success;
-          });
-      if (!ok) { batch_poisoned_ = true; return Status::Internal(error); }
     }
     return Status::OK();
   }

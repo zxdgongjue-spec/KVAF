@@ -2,7 +2,6 @@
 #include "pipeline.h"
 #include "output_readback.h"
 #include "cpu_urma/indexed_async_write_tracker.h"
-#include "cpu_urma/jetty_batch_dispatch.h"
 #include <array>
 #include <cstdio>
 #include <deque>
@@ -71,7 +70,7 @@ struct ChunkIO {
   void CleanRange(std::uint32_t) { ++cleans; }
   void Relax() {}
 };
-void ReadyAndPosting() {
+void ReadyProgress() {
   Config c; c.pipeline_chunk_rows = 256;
   std::array<std::uint64_t, 4> tokens{};
   auto read = [&](auto q) { return tokens[q]; };
@@ -86,19 +85,6 @@ void ReadyAndPosting() {
           io.copied[0].begin == 0 && io.copied[0].end == 1024 && io.cleans == 1, "prefix merge lost data");
   io = {}; io.token = PipelineProgressToken(2, 4);
   Require(RunPipelineChunks(c, 0, 3, 0, 3, io) == Result::kTimeout && io.copied.empty(), "stale marker released data");
-  std::array<std::size_t, 4> next{}; unsigned posts = 0;
-  Require(DispatchWriteChain(4, [](auto) { return 21U; }, [](auto) { return 84U; },
-      [&](auto q, auto begin, auto end) {
-        if (posts < 4) Require(q == posts && begin == 0 && end == 21, "suffix preceded first prefixes");
-        ForEachChainPost(begin, end, 32, [&](auto a, auto b) {
-          Require(a == next[q] && b > a && b - a <= 32, "post skipped/duplicated WR"); next[q] = b;
-        });
-        ++posts; return true;
-      }), "chain dispatch failed");
-  for (auto n : next) Require(n == 84, "unposted tail");
-  unsigned attempted = 0;
-  Require(!DispatchWriteChain(4, [](auto) { return 1U; }, [](auto) { return 2U; },
-      [&](auto q, auto, auto) { ++attempted; return q != 1; }) && attempted == 2, "post continued after failure");
 }
 void Completions() {
   Tracker t(2, 4); Tracker::Handle a{}, b{};
@@ -175,7 +161,7 @@ void Acknowledgements() {
 }  // namespace
 int main() {
   try {
-    Bounds(); DeviceSelection(); RangesAndMetrics(); ReadyAndPosting();
+    Bounds(); DeviceSelection(); RangesAndMetrics(); ReadyProgress();
     Completions(); ScatterOutput(); Acknowledgements();
     std::puts("aicpu ordered pipeline protocol: PASS"); return 0;
   } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }

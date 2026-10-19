@@ -44,7 +44,7 @@ CPU、NPU executable 与 device kernel 必须一起更新；blockDim 自动匹�
 3. NPU 启动一次 AICPU 算子，在算子内部跑 warmup + iterations 轮。
 4. 每轮 AICPU 发布 `request_seq`，CPU 用 `ReadSglBatch` 轮询它。
 5. CPU 更新每行序号，复用 prepared WRITE 链：每个 Jetty 的 data 后接强序 ready WRITE。
-   先提交所有队列的首范围，再提交后续链；只等待各队列最终尾 CQE，随后发送 done。
+   按 Jetty 依次提交整条链，沿用 doorbell 分批；只等待各队列最终尾 CQE，随后发送 done。
 6. AICPU 每个 worker 等待所有 Jetty 的本轮最小 ready 进度，合并已就绪的连续 chunk
    向前复制；各核完成且 global done 到达后才允许下一轮复用 staging。
 7. 默认末轮 CPU 通过 URMA READ 检查 output/guard 并 ACK，AICPU 在 ACK 前不触碰 output；
