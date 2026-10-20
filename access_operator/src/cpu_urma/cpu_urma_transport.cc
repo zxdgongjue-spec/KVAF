@@ -1345,7 +1345,7 @@ struct CpuUrmaTransport::Impl {
       return Status::InvalidArgument("invalid prepared WRITE chunks");
     auto plan = std::make_unique<PreparedWrite>();
     auto& job = plan->job; job.write = true; job.queues.resize(local_jettys_.size());
-    // Allocate worst-case storage before binding any descriptor pointers.
+    // Validate the layout and reserve storage before binding descriptor pointers.
     std::array<std::size_t, kMaxJettyCount> capacity{};
     for (std::size_t c = 0; c < count; ++c) {
       const auto& chunk = chunks[c];
@@ -1354,8 +1354,6 @@ struct CpuUrmaTransport::Impl {
           reinterpret_cast<std::uintptr_t>(chunk.marker_value) % 8 ||
           chunk.count > kJettyDepth * local_jettys_.size())
         return Status::InvalidArgument("invalid chain chunk/source/marker alignment");
-      auto status = ValidateAndRegisterHostBuffers(chunk.sources, chunk.remote_offsets, chunk.count);
-      if (!status.ok()) return status;
       for (std::size_t q = 0; q < job.queues.size(); ++q) {
         if (chunk.marker_value) {
           const auto offset = chunk.marker_offsets[q];
@@ -1364,17 +1362,12 @@ struct CpuUrmaTransport::Impl {
         }
         capacity[q] += RowsForQueue(chunk.count, job.queues.size(), q).count +
                        (chunk.marker_value ? 1 : 0);
-        if (capacity[q] > kJettyDepth)
-          return Status::InvalidArgument("WRITE chain source/marker budget exceeds one SQ wave; reduce rows/chunks");
-      }
-      if (chunk.marker_value) {
-        const CpuUrmaTransport::HostSge marker{const_cast<std::uint64_t*>(chunk.marker_value), 8};
-        status = ValidateAndRegisterHostBuffers(&marker, chunk.marker_offsets, 1);
-        if (!status.ok()) return status;
       }
     }
     for (std::size_t q = 0; q < job.queues.size(); ++q) {
       auto& queue = job.queues[q];
+      if (capacity[q] > kJettyDepth)
+        return Status::InvalidArgument("WRITE source/marker budget exceeds one SQ wave; reduce rows/chunks");
       queue.local.resize(capacity[q]); queue.remote.resize(capacity[q]);
       queue.wrs.resize(capacity[q]);
     }
@@ -1382,23 +1375,22 @@ struct CpuUrmaTransport::Impl {
     std::array<std::size_t, kMaxJettyCount> locals{};
     for (std::size_t c = 0; c < count; ++c) {
       const auto& chunk = chunks[c];
-      auto* marker_segment = explicit_host_region_.segment;
+      auto status = ValidateAndRegisterHostBuffers(chunk.sources, chunk.remote_offsets, chunk.count);
+      if (!status.ok()) return status;
+      urma_target_seg_t* marker_segment = nullptr;
       if (chunk.marker_value) {
-        if (!HostSpanFitsRegisteredBuffer(explicit_host_region_, chunk.marker_value, 8)) {
-          const auto* host = FindRegisteredHostBuffer(chunk.marker_value, 8);
-          marker_segment = host ? host->segment : nullptr;
-        }
-        if (!marker_segment) return Status::Internal("unresolved chain marker segment");
+        const CpuUrmaTransport::HostSge marker{const_cast<std::uint64_t*>(chunk.marker_value), 8};
+        status = ValidateAndRegisterHostBuffers(&marker, chunk.marker_offsets, 1);
+        if (!status.ok()) return status;
+        marker_segment = FindRegisteredHostBuffer(chunk.marker_value, 8)->segment;
       }
       for (std::size_t q = 0; q < job.queues.size(); ++q) {
         const auto range = RowsForQueue(chunk.count, job.queues.size(), q);
-        if (!range.count && !chunk.marker_value) continue;
         auto& dst = job.queues[q]; auto& src = temp.queues[q];
         EnsureSglQueueStorage(src, range.count, range.count);
-        const auto status = BuildWriteGatherQueue(temp, q, chunk.sources, chunk.remote_offsets,
-                                                chunk.count, range.first, range.count);
+        status = BuildWriteGatherQueue(temp, q, chunk.sources, chunk.remote_offsets,
+                                      chunk.count, range.first, range.count);
         if (!status.ok()) return status;
-        if (!src.missing_host_segments.empty()) return Status::Internal("unresolved chain host segment");
         const auto local_base = locals[q];
         // The gather builder emits exactly one local SGE per source row.
         if (range.count) std::copy_n(src.local.data(), range.count, dst.local.data() + local_base);
@@ -1430,7 +1422,6 @@ struct CpuUrmaTransport::Impl {
     for (std::size_t q = 0; q < job.queues.size(); ++q) {
       auto& queue = job.queues[q];
       if (!queue.count) continue;
-      if (queue.count > kJettyDepth) return Status::InvalidArgument("WRITE chain exceeds one SQ wave; reduce rows/chunks");
       for (std::size_t w = 0; w < queue.count; ++w)
         queue.wrs[w].next = w + 1 < queue.count ? &queue.wrs[w + 1] : nullptr;
       auto& tail = queue.wrs[queue.count - 1]; tail.flag.bs.complete_enable = 1;
