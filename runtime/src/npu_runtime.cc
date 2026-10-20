@@ -25,6 +25,9 @@
 #include "access_operator.h"
 #include "peer_link.h"
 #include "meta_manager.h"
+#if defined(KVAF_ENABLE_AICPU_URMA)
+#include "aicpu_gather_access_operator.h"
+#endif
 
 namespace kvaf {
 namespace {
@@ -376,7 +379,18 @@ struct NpuRuntime::Impl {
 
   void CreateCore() {
     meta_manager = CreateInMemoryMetaManager();
-    access_operator = std::make_unique<DefaultAccessOperator>(config);
+#if defined(KVAF_ENABLE_AICPU_URMA)
+    if (!options.aicpu_urma_kernel_json_path.empty())
+      access_operator = std::make_unique<UmdkAccessOperator>(UmdkAccessOperatorConfig{
+          options.aicpu_urma_kernel_json_path, options.urma_device, options.urma_eid_index,
+          options.npu_core_count, peer_link});
+    else
+#endif
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+      access_operator = std::make_unique<DefaultAccessOperator>(config);
+#else
+      throw std::invalid_argument("AIV data plane is not built; configure an AICPU UMDK kernel");
+#endif
     runtime_core = std::make_unique<RuntimeCore>(*meta_manager, *access_operator, *allocator);
   }
 
@@ -393,13 +407,13 @@ struct NpuRuntime::Impl {
   std::unique_ptr<DdrMemoryAllocator> allocator;
   PeerDdrAllocator* peer_allocator{nullptr};
   std::shared_ptr<peer::PeerLink> peer_link;
-  std::unique_ptr<DefaultAccessOperator> access_operator;
+  std::unique_ptr<AccessOperator> access_operator;
   std::unique_ptr<RuntimeCore> runtime_core;
   void* probe_buffer{nullptr};
 };
 
 NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {
-  if (impl_->config.batch_get_kernel_object_path.empty() || impl_->options.npu_core_count == 0U ||
+  if ((impl_->config.batch_get_kernel_object_path.empty() && impl_->options.aicpu_urma_kernel_json_path.empty()) || impl_->options.npu_core_count == 0U ||
       impl_->options.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->options.jettys_per_core == 0U ||
       impl_->options.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
@@ -407,6 +421,10 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
       impl_->options.batch_get_tokens_per_block == 0U) {
     throw std::invalid_argument("invalid NPU Runtime configuration");
   }
+#if !defined(KVAF_ENABLE_AICPU_URMA)
+  if (!impl_->options.aicpu_urma_kernel_json_path.empty())
+    throw std::invalid_argument("AICPU UMDK support was not built");
+#endif
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS) {
     throw std::runtime_error("aclrtSetDevice failed for NpuRuntime");
   }
@@ -414,10 +432,10 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
 
 NpuRuntime::~NpuRuntime() {
   if (impl_ != nullptr) {
-    (void)Shutdown();
+    const auto status = Shutdown();
     impl_->runtime_core.reset();
     impl_->access_operator.reset();
-    impl_->ReleaseProbe();
+    if (status.ok()) impl_->ReleaseProbe();
   }
 }
 
@@ -425,7 +443,7 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
   if (target.address.empty()) return Status::InvalidArgument("NpuRuntime LinkTo requires peer host:port");
   if (initialized()) return Status::InvalidState("NpuRuntime LinkTo must run before initialize");
   if (impl_->peer_link != nullptr) return Status::InvalidState("NpuRuntime already has a PeerLink");
-  if (impl_->config.batch_put_kernel_object_path.empty()) {
+  if (impl_->config.batch_put_kernel_object_path.empty() && impl_->options.aicpu_urma_kernel_json_path.empty()) {
     return Status::InvalidArgument("PeerLink requires the AIV BatchPut kernel for RMA validation");
   }
   impl_->peer_link = std::make_shared<peer::PeerLink>(target.address);
@@ -455,7 +473,9 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   }
   std::vector<NpuLocalEidCandidate> npu_candidates;
   std::string discovery_error;
-  if (!DiscoverNpuLocalEidCandidates(impl_->options.device_id, &npu_candidates,
+  if (!impl_->options.aicpu_urma_kernel_json_path.empty()) {
+    npu_candidates.push_back({{}, "umdk_device_discovery"});
+  } else if (!DiscoverNpuLocalEidCandidates(impl_->options.device_id, &npu_candidates,
                                      &discovery_error)) {
     return Status::NotFound(discovery_error);
   }
@@ -512,7 +532,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       if (last.ok()) {
         std::fprintf(stderr,
                      "[KVAF_AIV] PEER_LINK_EID_PAIR_SELECTED peer_candidate=%u/%u npu_candidate=%zu/%zu "
-                     "npu_source=%s validation=aiv_write_cq\n",
+                     "npu_source=%s validation=write_cq\n",
                      peer_candidate, candidate_count, npu_index, npu_candidates.size(), candidate.source.c_str());
         return Status::OK();
       }
@@ -533,6 +553,10 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   // transport teardown above. Keep it only for a successfully selected Link.
   impl_->ReleaseProbe();
   return last;
+}
+
+Status NpuRuntime::GatherRead(const CpuGatherReadRequest& request) {
+  return impl_->access_operator->ExecuteGatherRead(request);
 }
 
 RuntimeCore& NpuRuntime::core() {
@@ -584,7 +608,7 @@ Status NpuRuntime::Shutdown() {
   const Status status = impl_->runtime_core != nullptr && impl_->runtime_core->initialized()
                             ? impl_->runtime_core->Shutdown()
                             : Status::OK();
-  impl_->ReleaseProbe();
+  if (status.ok()) impl_->ReleaseProbe();
   return status;
 }
 
@@ -593,7 +617,8 @@ bool NpuRuntime::initialized() const {
 }
 
 RuntimeCapabilities NpuRuntime::capabilities() const {
-  return RuntimeCapabilities{true, !impl_->config.batch_put_kernel_object_path.empty(), false, true};
+  return RuntimeCapabilities{true, !impl_->config.batch_put_kernel_object_path.empty() ||
+      !impl_->options.aicpu_urma_kernel_json_path.empty(), false, true};
 }
 
 }  // namespace kvaf

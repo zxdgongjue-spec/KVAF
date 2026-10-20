@@ -6,6 +6,7 @@
 #include <string>
 
 #include "requests.h"
+#include "gather_read_request.h"
 #include "status.h"
 #include "types.h"
 
@@ -35,6 +36,9 @@ class AccessOperator {
 
   virtual Status ExecuteBatchGet(const BatchGetExecRequest& request) = 0;
   virtual Status ExecuteBatchPut(const BatchPutExecRequest& request) = 0;
+  virtual Status ExecuteGatherRead(const CpuGatherReadRequest&) {
+    return Status::NotImplemented("GatherRead is not supported by this AccessOperator");
+  }
 };
 
 // Configuration for the current NPU-backed default implementation. Transport

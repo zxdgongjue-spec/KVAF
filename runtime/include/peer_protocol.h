@@ -17,12 +17,15 @@ constexpr uint16_t kProtocolVersion = 4U;
 constexpr uint32_t kQpKeyBytes = 64U;
 constexpr uint32_t kSegKeyBytes = 64U;
 constexpr uint32_t kEidBytes = 16U;
+constexpr uint32_t kMaxGatherSpans = 65536U;
+constexpr uint32_t kChannelSharedTp = 1U;
 
 enum class Command : uint16_t {
   kAllocateRegion = 1U,
   kCreateChannel = 2U,
   kReleaseRegion = 3U,
   kGetCandidateCount = 4U,
+  kEnableDirectGather = 9U,
 };
 
 enum class Result : int32_t {
@@ -103,6 +106,10 @@ struct StatusResponse {
   MessageHeader header;
   int32_t result;
   uint32_t reserved;
+};
+struct EnableDirectGatherRequest {
+  MessageHeader header;
+  uint64_t session_id;
 };
 #pragma pack(pop)
 

@@ -255,3 +255,7 @@ runtime.shutdown()
 `link_to()` 必须先于 `initialize()` 调用。调用方需要在 BatchGet 所在 stream 完成前保持
 输入/输出 Tensor 和 `DeviceAccessTable` 有效；Runtime 只管理内部 DDR、元数据和内部
 传输资源。
+
+## AICPU 流水 GatherRead
+
+可选的 CPU gather + UMDK READ 流水路径及独立构建命令见 [AICPU GatherRead](docs/aicpu_gather_read.md)。现有 AIV/Python 默认路径保持原样。

@@ -1,13 +1,26 @@
 #include "cpu_runtime.h"
+#include "cpu_urma_channel.h"
 #include "peer_protocol.h"
+#include "cpu_urma_discovery.h"
+#include "peer_link.h"
+#include "cpu_gather.h"
+#include "cpu_gather_profile.h"
+#include "cpu_gather_team.h"
+#include "gather_read_profile.h"
 
 #include <dlfcn.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <time.h>
+#endif
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdarg>
 #include <cinttypes>
@@ -16,7 +29,10 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -33,6 +49,8 @@ using kvaf::peer::CandidateCountResponse;
 using kvaf::peer::Command;
 using kvaf::peer::CreateChannelRequest;
 using kvaf::peer::CreateChannelResponse;
+using kvaf::peer::EnableDirectGatherRequest;
+using kvaf::peer::GatherSpan;
 using kvaf::peer::IsValidHeader;
 using kvaf::peer::MakeHeader;
 using kvaf::peer::MessageHeader;
@@ -44,8 +62,6 @@ using kvaf::peer::kEidBytes;
 using kvaf::peer::kQpKeyBytes;
 using kvaf::peer::kSegKeyBytes;
 
-constexpr uint32_t kJettyDepth = 8192U;
-constexpr uint32_t kJfcDepth = 16384U;
 constexpr uint32_t kJettyKeyBytes = sizeof(urma_jetty_id_t) + sizeof(urma_transport_mode_t);
 // HCCP reports the NPU's USER_CTL Jetty key as a 32-byte record on the
 // deployed CANN release.  Its first 28 bytes are the public UMDK Jetty id
@@ -164,13 +180,6 @@ class UrmaResources {
           selected_device_name_.c_str(), eid_index, errno);
       return false;
     }
-    urma_jfc_cfg_t jfc_cfg{};
-    jfc_cfg.depth = kJfcDepth;
-    completion_queue_ = urma_create_jfc(context_, &jfc_cfg);
-    if (completion_queue_ == nullptr) {
-      Log("[KVAF_CPU] urma_create_jfc failed depth=%u errno=%d\n", kJfcDepth, errno);
-      return false;
-    }
     get_tp_list_ = reinterpret_cast<UrmaGetTpListFn>(dlsym(RTLD_DEFAULT, "urma_get_tp_list"));
     import_jetty_ex_ = reinterpret_cast<UrmaImportJettyExFn>(dlsym(RTLD_DEFAULT, "urma_import_jetty_ex"));
     if (get_tp_list_ == nullptr || import_jetty_ex_ == nullptr) {
@@ -188,10 +197,6 @@ class UrmaResources {
   }
 
   void Shutdown() {
-    if (completion_queue_ != nullptr) {
-      (void)urma_delete_jfc(completion_queue_);
-      completion_queue_ = nullptr;
-    }
     if (context_ != nullptr) {
       (void)urma_delete_context(context_);
       context_ = nullptr;
@@ -199,7 +204,6 @@ class UrmaResources {
   }
 
   urma_context_t* context() const { return context_; }
-  urma_jfc_t* completion_queue() const { return completion_queue_; }
   const std::string& device_name() const { return selected_device_name_; }
   uint32_t eid_index() const { return eid_index_; }
 
@@ -263,16 +267,12 @@ class UrmaResources {
   uint32_t eid_index_ = 0U;
   urma_device_t* device_ = nullptr;
   urma_context_t* context_ = nullptr;
-  urma_jfc_t* completion_queue_ = nullptr;
   UrmaGetTpListFn get_tp_list_ = nullptr;
   UrmaImportJettyExFn import_jetty_ex_ = nullptr;
 };
 
-struct UrmaCandidate {
+struct UrmaCandidate : CpuUrmaCandidate {
   uint32_t id = 0U;
-  std::string device_name;
-  uint32_t eid_index = 0U;
-  std::array<uint8_t, kEidBytes> eid{};
   bool unavailable = false;
   std::unique_ptr<UrmaResources> resources;
 };
@@ -283,54 +283,16 @@ class UrmaResourcePool {
 
   bool Initialize(const std::string& requested_device, bool eid_index_requested,
                   uint32_t requested_eid_index) {
-    urma_init_attr_t init{};
-    if (urma_init(&init) != URMA_SUCCESS) {
-      Log("[KVAF_CPU] urma_init failed\n");
+    const Status status = discovery_.Initialize(requested_device, eid_index_requested, requested_eid_index);
+    if (!status.ok()) {
+      Log("[KVAF_CPU] candidate discovery failed: %s\n", status.message().c_str());
       return false;
     }
-    initialized_ = true;
-
-    int device_count = 0;
-    urma_device_t** devices = urma_get_device_list(&device_count);
-    if (devices == nullptr) {
-      Log("[KVAF_CPU] urma_get_device_list returned no devices\n");
-      return false;
+    for (const auto& discovered : discovery_.candidates()) {
+      UrmaCandidate candidate;
+      static_cast<CpuUrmaCandidate&>(candidate) = discovered;
+      candidates_.push_back(std::move(candidate));
     }
-    for (int device_index = 0; device_index < device_count; ++device_index) {
-      urma_device_t* device = devices[device_index];
-      if (device == nullptr || device->type != URMA_TRANSPORT_UB ||
-          (!requested_device.empty() && requested_device != device->name)) {
-        continue;
-      }
-      uint32_t eid_count = 0U;
-      urma_eid_info_t* eids = urma_get_eid_list(device, &eid_count);
-      if (eids == nullptr) {
-        Log("[KVAF_CPU] CANDIDATE_ENUM_FAILED ub_device=%s errno=%d\n", device->name, errno);
-        continue;
-      }
-      for (uint32_t eid_position = 0U; eid_position < eid_count; ++eid_position) {
-        const urma_eid_info_t& info = eids[eid_position];
-        if ((eid_index_requested && info.eid_index != requested_eid_index) ||
-            std::all_of(info.eid.raw, info.eid.raw + kEidBytes,
-                        [](uint8_t byte) { return byte == 0U; })) {
-          continue;
-        }
-        UrmaCandidate candidate{};
-        candidate.device_name = device->name;
-        candidate.eid_index = info.eid_index;
-        std::memcpy(candidate.eid.data(), info.eid.raw, candidate.eid.size());
-        candidates_.push_back(std::move(candidate));
-      }
-      urma_free_eid_list(eids);
-    }
-    urma_free_device_list(devices);
-
-    std::sort(candidates_.begin(), candidates_.end(),
-              [](const UrmaCandidate& left, const UrmaCandidate& right) {
-                return left.device_name == right.device_name
-                           ? left.eid_index < right.eid_index
-                           : left.device_name < right.device_name;
-              });
     for (uint32_t index = 0U; index < candidates_.size(); ++index) {
       UrmaCandidate& candidate = candidates_[index];
       candidate.id = index;
@@ -341,23 +303,14 @@ class UrmaResourcePool {
       }
       std::fprintf(stderr, "\n");
     }
-    if (candidates_.empty()) {
-      Log("[KVAF_CPU] no usable UB EID candidates");
-      if (!requested_device.empty()) {
-        Log(" for ub_device=%s", requested_device.c_str());
-      }
-      if (eid_index_requested) {
-        Log(" eid_index=%u", requested_eid_index);
-      }
-      Log("\n");
-      return false;
-    }
     return true;
   }
 
   uint32_t CandidateCount() const {
     return static_cast<uint32_t>(candidates_.size());
   }
+
+  const std::vector<UrmaCandidate>& candidates() const { return candidates_; }
 
   UrmaResources* Get(uint32_t candidate_id) {
     if (candidate_id >= candidates_.size()) {
@@ -393,20 +346,204 @@ class UrmaResourcePool {
  private:
   void Shutdown() {
     candidates_.clear();
-    if (initialized_) {
-      (void)urma_uninit();
-      initialized_ = false;
-    }
+    discovery_.Shutdown();
   }
 
-  bool initialized_ = false;
+  CpuUrmaDiscovery discovery_;
   std::vector<UrmaCandidate> candidates_;
 };
 
-struct Channel {
-  urma_jfr_t* local_jfr = nullptr;
-  urma_jetty_t* local_jetty = nullptr;
-  urma_target_jetty_t* remote_jetty = nullptr;
+using Channel = cpu_runtime_detail::UrmaChannel;
+
+const char* GatherModeName(CpuGatherMode mode) {
+  switch (mode) {
+    case CpuGatherMode::kAdaptive: return "adaptive";
+    case CpuGatherMode::kActive: return "active";
+    case CpuGatherMode::kPassive: return "passive";
+  }
+  return "unknown";
+}
+
+peer::GatherWaitMode TeamWaitMode(CpuGatherMode mode) {
+  switch (mode) {
+    case CpuGatherMode::kAdaptive: return peer::GatherWaitMode::kAdaptive;
+    case CpuGatherMode::kActive: return peer::GatherWaitMode::kActive;
+    case CpuGatherMode::kPassive: return peer::GatherWaitMode::kPassive;
+  }
+  return peer::GatherWaitMode::kPassive;
+}
+
+class CpuGatherWorker {
+ public:
+  CpuGatherWorker(void* memory, uint64_t base, uint64_t bytes,
+                  std::size_t gather_threads,
+                  std::size_t min_bytes_per_thread, bool gather_affinity,
+                  CpuGatherMode gather_mode,
+                  bool notify_profile = false, std::uint64_t session_id = 0U,
+                  std::uint64_t control_address = 0U, std::uint32_t lane = 0U,
+                  std::size_t cpu_offset = 0U)
+      : memory_(static_cast<std::uint8_t*>(memory)), base_(base), bytes_(bytes),
+        control_(reinterpret_cast<peer::GatherControl*>(
+            static_cast<uint8_t*>(memory) + (control_address == 0U
+                ? peer::GatherControlOffset(bytes) : control_address - base))),
+        team_(memory, base, gather_threads, min_bytes_per_thread,
+              TeamWaitMode(gather_mode), gather_affinity, notify_profile, cpu_offset),
+        max_threads_(team_.max_threads()), gather_mode_(gather_mode),
+        notify_profile_(notify_profile), session_id_(session_id), lane_(lane),
+        copy_stats_(notify_profile ? new peer::CpuGatherCopyStats(team_.max_threads()) : nullptr) {
+    std::memset(control_, 0, sizeof(*control_));
+    peer::GatherBarrier();
+    worker_ = std::thread(&CpuGatherWorker::RunDirect, this);
+  }
+
+  ~CpuGatherWorker() {
+    stop_.store(true, std::memory_order_release);
+    worker_.join();
+    if (copy_stats_) copy_stats_->Print(stderr, session_id_, base_, lane_);
+    if (notify_profile_ && direct_rounds_ != 0U) {
+      Log("[KVAF_CPU] GATHER_NOTIFY_POLL mode=%s rounds=%" PRIu64
+          " detect_gap_avg_ns=%" PRIu64 " detect_gap_max_ns=%" PRIu64
+          " detect_offcpu_avg_ns=%" PRIu64 " detect_offcpu_max_ns=%" PRIu64
+          " detect_offcpu_ge_1ms=%" PRIu64 " sampled_offcpu_max_ns=%" PRIu64 "\n",
+          GatherModeName(gather_mode_), direct_rounds_,
+          detect_gap_sum_ns_ / direct_rounds_, detect_gap_max_ns_,
+          detect_offcpu_sum_ns_ / direct_rounds_, detect_offcpu_max_ns_,
+          detect_offcpu_ge_1ms_, sampled_offcpu_max_ns_);
+    }
+  }
+
+
+
+ private:
+  static std::uint64_t NowNs() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+  }
+
+  static std::uint64_t ThreadCpuNs() {
+#if defined(__linux__)
+    timespec value{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) return 0U;
+    return static_cast<std::uint64_t>(value.tv_sec) * 1000000000U + value.tv_nsec;
+#else
+    return 0U;
+#endif
+  }
+
+
+
+  void RunDirect() {
+    team_.BindWorker(0U);
+    std::uint64_t last_sequence = 0U;
+    std::uint64_t wait_start_ns = NowNs();
+    std::uint64_t last_sample_ns = wait_start_ns;
+    std::uint64_t last_cpu_ns = notify_profile_ ? ThreadCpuNs() : 0U;
+    std::uint64_t poll_count = 0U;
+    auto sample_gap = [&]() {
+      const auto now_ns = NowNs();
+      const auto cpu_ns = ThreadCpuNs();
+      const auto gap_ns = now_ns - last_sample_ns;
+      const auto cpu_elapsed_ns = cpu_ns >= last_cpu_ns ? cpu_ns - last_cpu_ns : 0U;
+      const auto offcpu_ns = cpu_ns != 0U && last_cpu_ns != 0U &&
+                                     gap_ns > cpu_elapsed_ns ? gap_ns - cpu_elapsed_ns : 0U;
+      sampled_offcpu_max_ns_ = std::max(sampled_offcpu_max_ns_, offcpu_ns);
+      last_sample_ns = now_ns;
+      last_cpu_ns = cpu_ns;
+      return std::pair{gap_ns, offcpu_ns};
+    };
+    while (!stop_.load(std::memory_order_acquire)) {
+      const auto sequence = __atomic_load_n(&control_->notify, __ATOMIC_ACQUIRE);
+      if (sequence == 0U || sequence == last_sequence ||
+          (sequence & peer::kGatherErrorBit) != 0U) {
+        if (notify_profile_ &&
+            ((++poll_count & 4095U) == 0U || gather_mode_ == CpuGatherMode::kPassive))
+          sample_gap();
+        if (gather_mode_ == CpuGatherMode::kPassive) {
+          std::this_thread::sleep_for(std::chrono::microseconds(20));
+        } else {
+          peer::GatherSpinPause();
+        }
+        continue;
+      }
+      if (notify_profile_) {
+        const auto [gap_ns, offcpu_ns] = sample_gap();
+        ++direct_rounds_;
+        detect_gap_sum_ns_ += gap_ns;
+        detect_gap_max_ns_ = std::max(detect_gap_max_ns_, gap_ns);
+        detect_offcpu_sum_ns_ += offcpu_ns;
+        detect_offcpu_max_ns_ = std::max(detect_offcpu_max_ns_, offcpu_ns);
+        if (offcpu_ns >= 1000000U) ++detect_offcpu_ge_1ms_;
+      }
+      last_sequence = sequence;
+      peer::GatherCpuProfile profile{};
+      profile.notify_spin_ns = NowNs() - wait_start_ns;
+      __atomic_store_n(&control_->ack, peer::GatherStartedAck(sequence), __ATOMIC_RELEASE);
+      peer::GatherBarrier();
+      const auto descriptor_start_ns = NowNs();
+      const auto address = __atomic_load_n(&control_->command, __ATOMIC_ACQUIRE);
+      bool valid = false;
+      try {
+        const auto threads = team_.PrepareDirect(bytes_, address, sequence, peer::kMaxGatherSpans);
+        valid = threads != 0U;
+        if (valid && threads != reported_threads_) {
+          Log("[KVAF_CPU] GATHER_THREADS active=%zu max=%zu bytes=%" PRIu64
+              " mode=%s transport=urma\n", threads, max_threads_, team_.total_bytes(),
+              GatherModeName(gather_mode_));
+          reported_threads_ = threads;
+        }
+      } catch (const std::exception& error) {
+        Log("[KVAF_CPU] GATHER_DIRECT_PREPARE_FAILED reason=%s\n", error.what());
+      }
+      profile.source_cache_ns = NowNs() - descriptor_start_ns;
+      if (valid) {
+        const auto copy_start_ns = NowNs();
+        team_.Copy();
+        profile.copy_ns = NowNs() - copy_start_ns;
+      } else {
+        Log("[KVAF_CPU] GATHER_DIRECT_DESCRIPTOR_INVALID sequence=%" PRIu64
+            " address=0x%" PRIx64 "\n", sequence, address);
+        if (address % 64U == 0U && peer::GatherRange(base_, peer::GatherControlOffset(bytes_),
+                                                  address, sizeof(peer::GatherDescriptorHeader))) {
+          auto* progress = reinterpret_cast<std::uint64_t*>(
+              memory_ + (address - base_) + offsetof(peer::GatherDescriptorHeader, ready_bytes));
+          __atomic_store_n(progress, peer::kGatherErrorBit, __ATOMIC_RELEASE);
+        }
+      }
+      control_->profile = profile;
+      __atomic_store_n(&control_->ack,
+                       sequence | (valid ? 0U : peer::kGatherErrorBit), __ATOMIC_RELEASE);
+      peer::GatherBarrier();
+      if (valid && copy_stats_) copy_stats_->Accumulate(team_);
+      wait_start_ns = NowNs();
+      if (notify_profile_) {
+        last_sample_ns = wait_start_ns;
+        last_cpu_ns = ThreadCpuNs();
+        poll_count = 0U;
+      }
+    }
+  }
+
+  std::uint8_t* memory_;
+  uint64_t base_;
+  uint64_t bytes_;
+  peer::GatherControl* control_;
+  std::atomic<bool> stop_{false};
+  peer::CpuGatherTeam team_;
+  std::size_t max_threads_{0U};
+  CpuGatherMode gather_mode_{CpuGatherMode::kAdaptive};
+  bool notify_profile_{false};
+  std::uint64_t session_id_{0U};
+  std::uint32_t lane_{0U};
+  std::unique_ptr<peer::CpuGatherCopyStats> copy_stats_;
+  std::size_t reported_threads_{0U};
+  std::uint64_t direct_rounds_{0U};
+  std::uint64_t detect_gap_sum_ns_{0U};
+  std::uint64_t detect_gap_max_ns_{0U};
+  std::uint64_t detect_offcpu_sum_ns_{0U};
+  std::uint64_t detect_offcpu_max_ns_{0U};
+  std::uint64_t detect_offcpu_ge_1ms_{0U};
+  std::uint64_t sampled_offcpu_max_ns_{0U};
+  std::thread worker_;
 };
 
 struct Region {
@@ -415,15 +552,23 @@ struct Region {
   UrmaResources* resources = nullptr;
   void* memory = nullptr;
   uint64_t bytes = 0U;
+  uint64_t base = 0U;
   urma_token_id_t* token_id = nullptr;
   urma_target_seg_t* segment = nullptr;
   uint32_t token_value = 0U;
   std::vector<Channel> channels;
+  std::unique_ptr<CpuGatherWorker> gather;
 };
 
 class CpuService {
  public:
-  explicit CpuService(UrmaResourcePool* resource_pool) : resource_pool_(resource_pool) {}
+  CpuService(UrmaResourcePool* resource_pool, std::size_t gather_threads,
+             std::size_t min_bytes_per_thread, bool gather_affinity,
+             CpuGatherMode gather_mode, bool gather_notify_profile)
+      : resource_pool_(resource_pool), gather_threads_(gather_threads),
+        min_bytes_per_thread_(min_bytes_per_thread),
+        gather_affinity_(gather_affinity), gather_mode_(gather_mode),
+        gather_notify_profile_(gather_notify_profile) {}
   ~CpuService() { ReleaseAll(); }
 
   uint32_t CandidateCount() const {
@@ -451,6 +596,8 @@ class CpuService {
       return Result::kResourceError;
     }
     region->bytes = bytes;
+    if (bytes >= 64U)
+      std::memset(static_cast<uint8_t*>(region->memory) + peer::GatherControlOffset(bytes), 0, 64U);
     region->token_value = NextToken();
     region->token_id = urma_alloc_token_id(resources->context());
     if (region->token_id == nullptr) {
@@ -485,6 +632,7 @@ class CpuService {
     }
     const uint64_t id = next_region_id_++;
     region->id = id;
+    region->base = region->segment->seg.ubva.va;
     response->session_id = id;
     response->peer_base = region->segment->seg.ubva.va;
     response->peer_length = bytes;
@@ -502,22 +650,27 @@ class CpuService {
       ReleaseRegion(region.get());
       return Result::kResourceError;
     }
+    const uint32_t segment_token_id = region->segment->seg.token_id;
     regions_.emplace(id, std::move(region));
     Log("[KVAF_CPU] REGION_ALLOCATED session=%" PRIu64 " candidate=%u ub_device=%s eid_index=%u "
-        "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x reg_flags=0x%x\n",
+        "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x seg_token_id=0x%x "
+        "reg_flags=0x%x\n",
         id, candidate_id, resources->device_name().c_str(), resources->eid_index(), bytes,
-        response->peer_base, response->token_id, flag.value);
+        response->peer_base, response->token_id, segment_token_id, flag.value);
     return Result::kOk;
   }
 
   Result CreateChannel(const CreateChannelRequest& request, CreateChannelResponse* response) {
-    if (response == nullptr || request.local_qp_key_bytes != kNpuJettyKeyBytes ||
+    if (response == nullptr ||
+        (request.local_qp_key_bytes != kJettyKeyBytes &&
+         request.local_qp_key_bytes != kNpuJettyKeyBytes) ||
         std::all_of(request.local_eid, request.local_eid + kEidBytes,
                     [](uint8_t byte) { return byte == 0U; }) ||
-        request.peer_token_value == 0U || request.local_tp_handle == 0U || request.local_psn == 0U) {
-      Log("[KVAF_CPU] CHANNEL_REJECTED key_bytes=%u expected_npu_key_bytes=%u token=0x%x npu_tp=0x%llx "
-          "npu_psn=0x%x\n",
-          request.local_qp_key_bytes, kNpuJettyKeyBytes, request.peer_token_value,
+        request.peer_token_value == 0U || request.local_tp_handle == 0U || request.local_psn == 0U ||
+        (request.reserved & ~peer::kChannelSharedTp) != 0U) {
+      Log("[KVAF_CPU] CHANNEL_REJECTED key_bytes=%u expected_key_bytes=%u/%u token=0x%x peer_tp=0x%llx "
+          "peer_psn=0x%x\n",
+          request.local_qp_key_bytes, kJettyKeyBytes, kNpuJettyKeyBytes, request.peer_token_value,
           static_cast<unsigned long long>(request.local_tp_handle), request.local_psn);
       return Result::kInvalidRequest;
     }
@@ -534,35 +687,44 @@ class CpuService {
     }
     std::fprintf(stderr, "\n");
     Channel channel{};
-    uint64_t cpu_tp_handle = 0U;
-    const uint32_t cpu_psn = NextPsn();
-    if (!CreateLocalJetty(region.resources, region.token_value, &channel.local_jfr, &channel.local_jetty) ||
-        !region.resources->GetCtpForPeer(request.local_eid, &cpu_tp_handle) ||
-        !ImportRemoteJetty(region.resources, request.local_qp_key, request.peer_token_value, cpu_tp_handle,
-                           request.local_tp_handle, cpu_psn, request.local_psn, &channel.remote_jetty)) {
-      if (channel.remote_jetty != nullptr) {
-        (void)urma_unimport_jetty(channel.remote_jetty);
-      }
-      if (channel.local_jetty != nullptr) {
-        (void)urma_delete_jetty(channel.local_jetty);
-      }
-      if (channel.local_jfr != nullptr) {
-        (void)urma_delete_jfr(channel.local_jfr);
-      }
+    if (!channel.CreateLocal(region.resources->context(), region.token_value))
       return Result::kResourceError;
+    const bool share_tp = (request.reserved & peer::kChannelSharedTp) != 0U;
+    const auto* shared = share_tp ? cpu_runtime_detail::FindSharedChannelTp(
+        region.channels, request.local_eid, request.local_tp_handle) : nullptr;
+    if (shared != nullptr) {
+      if (shared->peer_psn != request.local_psn) return Result::kInvalidRequest;
+      channel.tp = *shared;
+    } else {
+      channel.tp.shared = share_tp;
+      std::copy_n(request.local_eid, kEidBytes, channel.tp.peer_eid.begin());
+      channel.tp.peer = request.local_tp_handle;
+      channel.tp.peer_psn = request.local_psn;
+      channel.tp.local_psn = NextPsn();
+      if (!region.resources->GetCtpForPeer(request.local_eid, &channel.tp.local))
+        return Result::kResourceError;
     }
+    if (!ImportRemoteJetty(region.resources, request.local_qp_key, request.peer_token_value,
+                           channel.tp.local, channel.tp.peer, channel.tp.local_psn,
+                           channel.tp.peer_psn, &channel.remote_jetty))
+      return Result::kResourceError;
     std::memcpy(response->peer_qp_key, &channel.local_jetty->jetty_id,
                 sizeof(channel.local_jetty->jetty_id));
     const urma_transport_mode_t mode = channel.local_jetty->jetty_cfg.jfs_cfg.trans_mode;
     std::memcpy(response->peer_qp_key + sizeof(channel.local_jetty->jetty_id), &mode, sizeof(mode));
     response->peer_qp_key_bytes = kJettyKeyBytes;
-    response->peer_tp_handle = cpu_tp_handle;
-    response->peer_psn = cpu_psn;
-    region.channels.push_back(channel);
+    response->peer_tp_handle = channel.tp.local;
+    response->peer_psn = channel.tp.local_psn;
+    response->reserved = share_tp ? peer::kChannelSharedTp : 0U;
+    const bool tp_reused = shared != nullptr;
+    region.channels.push_back(std::move(channel));
+    const auto& connected = region.channels.back();
     Log("[KVAF_CPU] CHANNEL_CREATED session=%" PRIu64 " local_jetty=%u remote_jetty=%u cpu_tp=0x%llx "
-        "cpu_psn=0x%x\n",
-        region.id, channel.local_jetty->jetty_id.id, channel.remote_jetty->id.id,
-        static_cast<unsigned long long>(cpu_tp_handle), cpu_psn);
+        "cpu_psn=0x%x cpu_cq_id=%u cpu_jfr_id=%u peer_tp=0x%llx tp_shared=%u tp_reused=%u\n",
+        region.id, connected.local_jetty->jetty_id.id, connected.remote_jetty->id.id,
+        static_cast<unsigned long long>(connected.tp.local), connected.tp.local_psn,
+        connected.local_jfc->jfc_id.id, connected.local_jfr->jfr_id.id,
+        static_cast<unsigned long long>(connected.tp.peer), share_tp, tp_reused);
     return Result::kOk;
   }
 
@@ -575,6 +737,27 @@ class CpuService {
         found->second->channels.size());
     ReleaseRegion(found->second.get());
     regions_.erase(found);
+    return Result::kOk;
+  }
+
+
+
+
+
+  Result EnableDirectGather(uint64_t session_id) {
+    const auto found = regions_.find(session_id);
+    if (found == regions_.end()) return Result::kNotFound;
+    Region& region = *found->second;
+    if (region.gather != nullptr) return Result::kResourceError;
+    try {
+      region.gather = std::make_unique<CpuGatherWorker>(
+          region.memory, region.base, region.bytes, gather_threads_,
+          min_bytes_per_thread_, gather_affinity_, gather_mode_,
+          gather_notify_profile_, region.id);
+    } catch (const std::exception& error) {
+      Log("[KVAF_CPU] GATHER_DIRECT_ENABLE_FAILED reason=%s\n", error.what());
+      return Result::kResourceError;
+    }
     return Result::kOk;
   }
 
@@ -595,47 +778,6 @@ class CpuService {
     return next_psn_;
   }
 
-  bool CreateLocalJetty(UrmaResources* resources, uint32_t token_value, urma_jfr_t** jfr,
-                        urma_jetty_t** jetty) {
-    if (resources == nullptr || jfr == nullptr || jetty == nullptr) {
-      return false;
-    }
-    *jfr = nullptr;
-    *jetty = nullptr;
-    urma_jfs_cfg_t jfs{};
-    jfs.depth = kJettyDepth;
-    jfs.trans_mode = URMA_TM_RM;
-    jfs.max_sge = 1U;
-    jfs.jfc = resources->completion_queue();
-    urma_jfr_cfg_t jfr_config{};
-    jfr_config.depth = kJettyDepth;
-    jfr_config.trans_mode = URMA_TM_RM;
-    jfr_config.max_sge = 1U;
-    jfr_config.jfc = resources->completion_queue();
-    jfr_config.token_value.token = token_value;
-    jfr_config.flag.bs.tag_matching = URMA_NO_TAG_MATCHING;
-    *jfr = urma_create_jfr(resources->context(), &jfr_config);
-    if (*jfr == nullptr) {
-      Log("[KVAF_CPU] urma_create_jfr failed depth=%u token=0x%x errno=%d\n", kJettyDepth,
-          token_value, errno);
-      return false;
-    }
-    urma_jetty_cfg_t config{};
-    config.flag.bs.share_jfr = URMA_SHARE_JFR;
-    config.jfs_cfg = jfs;
-    config.shared.jfr = *jfr;
-    config.shared.jfc = resources->completion_queue();
-    *jetty = urma_create_jetty(resources->context(), &config);
-    if (*jetty == nullptr) {
-      Log("[KVAF_CPU] urma_create_jetty failed depth=%u token=0x%x errno=%d\n", kJettyDepth,
-          token_value, errno);
-      (void)urma_delete_jfr(*jfr);
-      *jfr = nullptr;
-      return false;
-    }
-    return true;
-  }
-
   bool ImportRemoteJetty(UrmaResources* resources, const uint8_t key[kQpKeyBytes], uint32_t token_value,
                          uint64_t cpu_tp_handle,
                          uint64_t npu_tp_handle, uint32_t cpu_psn, uint32_t npu_psn,
@@ -654,18 +796,8 @@ class CpuService {
     if (region == nullptr) {
       return;
     }
-    for (auto iterator = region->channels.rbegin(); iterator != region->channels.rend(); ++iterator) {
-      if (iterator->remote_jetty != nullptr) {
-        (void)urma_unimport_jetty(iterator->remote_jetty);
-      }
-      if (iterator->local_jetty != nullptr) {
-        (void)urma_delete_jetty(iterator->local_jetty);
-      }
-      if (iterator->local_jfr != nullptr) {
-        (void)urma_delete_jfr(iterator->local_jfr);
-      }
-    }
-    region->channels.clear();
+    region->gather.reset();
+    while (!region->channels.empty()) region->channels.pop_back();
     if (region->segment != nullptr) {
       (void)urma_unregister_seg(region->segment);
       region->segment = nullptr;
@@ -688,6 +820,11 @@ class CpuService {
   }
 
   UrmaResourcePool* resource_pool_ = nullptr;
+  std::size_t gather_threads_{1U};
+  std::size_t min_bytes_per_thread_{256U * 1024U};
+  bool gather_affinity_{true};
+  CpuGatherMode gather_mode_{CpuGatherMode::kAdaptive};
+  bool gather_notify_profile_{false};
   uint64_t next_region_id_ = 1U;
   uint32_t next_token_ = 1U;
   uint32_t next_psn_ = 1U;
@@ -770,6 +907,19 @@ void HandleClient(int fd, CpuService* service) {
       SendStatus(fd, command, service->Release(request.session_id));
       return;
     }
+    case Command::kEnableDirectGather: {
+      EnableDirectGatherRequest request{};
+      request.header = header;
+      if (!IsValidHeader(header, command, sizeof(request)) ||
+          !ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header),
+                   sizeof(request) - sizeof(header))) {
+        SendStatus(fd, command, Result::kInvalidRequest);
+        return;
+      }
+      SendStatus(fd, command, service->EnableDirectGather(request.session_id));
+      return;
+    }
+
   }
   SendStatus(fd, command, Result::kInvalidRequest);
 }
@@ -790,21 +940,38 @@ Status CpuRuntime::Initialize(const CpuRuntimeOptions& options) {
   if (options.has_eid_index && options.ub_device.empty()) {
     return Status::InvalidArgument("CpuRuntime eid_index requires ub_device");
   }
+  if (options.gather_threads > 64U)
+    return Status::InvalidArgument("CpuRuntime gather_threads must be in [1,64] or auto");
+  const auto detected = std::thread::hardware_concurrency();
+  const std::size_t gather_threads = options.gather_threads == 0U
+      ? std::min<std::size_t>(detected == 0U ? 1U : detected, 32U)
+      : options.gather_threads;
   auto impl = std::make_unique<Impl>();
   if (!impl->resources.Initialize(options.ub_device, options.has_eid_index, options.eid_index)) {
     return Status::Internal("CpuRuntime failed to initialize UMDK resources");
   }
-  impl->service = std::make_unique<CpuService>(&impl->resources);
+  const std::size_t min_bytes_per_thread = options.gather_threads == 0U
+      ? 256U * 1024U : 64U * 1024U;
+  impl->service = std::make_unique<CpuService>(
+      &impl->resources, gather_threads, min_bytes_per_thread,
+      options.gather_affinity, options.gather_mode, options.gather_notify_profile);
   impl_ = std::move(impl);
+  return Status::OK();
+}
+
+Status CpuRuntime::AcceptLink(const LinkTarget&) {
+  return initialized() ? Status::OK() : Status::NotInitialized("CpuRuntime has not been initialized");
+}
+
+Status CpuRuntime::ServeConnection(int connection_fd) {
+  if (!initialized()) return Status::NotInitialized("CpuRuntime has not been initialized");
+  if (connection_fd < 0) return Status::InvalidArgument("CpuRuntime connection fd is invalid");
+  HandleClient(connection_fd, impl_->service.get());
   return Status::OK();
 }
 
 Status CpuRuntime::LinkTo(const LinkTarget&) {
   return Status::NotImplemented("CpuRuntime does not initiate links in the CPU--NPU deployment");
-}
-
-Status CpuRuntime::AcceptLink(const LinkTarget&) {
-  return initialized() ? Status::OK() : Status::NotInitialized("CpuRuntime has not been initialized");
 }
 
 Status CpuRuntime::ReleaseLink(LinkId link_id) {
@@ -813,13 +980,6 @@ Status CpuRuntime::ReleaseLink(LinkId link_id) {
   if (result == Result::kOk) return Status::OK();
   if (result == Result::kNotFound) return Status::NotFound("CpuRuntime Link was not found");
   return Status::Internal("CpuRuntime failed to release Link");
-}
-
-Status CpuRuntime::ServeConnection(int connection_fd) {
-  if (!initialized()) return Status::NotInitialized("CpuRuntime has not been initialized");
-  if (connection_fd < 0) return Status::InvalidArgument("CpuRuntime connection fd is invalid");
-  HandleClient(connection_fd, impl_->service.get());
-  return Status::OK();
 }
 
 Status CpuRuntime::Shutdown() {

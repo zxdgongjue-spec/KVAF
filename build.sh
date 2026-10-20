@@ -14,10 +14,12 @@ die() {
 
 usage() {
   cat <<'EOF'
-Usage: ./build.sh <cpu|npu> [--build-dir DIR] [--jobs N]
+Usage: ./build.sh <cpu|npu|aicpu-urma> [--build-dir DIR] [--jobs N]
 
 cpu  Builds the liburma-only CPU Runtime service. If liburma is not installed,
      it clones and builds the pinned UMDK source beside this repository.
+aicpu-urma Builds the native UMDK GatherRead client and AICPU kernel.
+     --install-kernel installs it; --check-kernel and --uninstall-kernel manage the package.
 npu  Builds the CANN AIV BatchGet/BatchPut Runtime and Python binding. It
      installs pybind11 for the selected Python interpreter when necessary.
 
@@ -28,6 +30,7 @@ Environment overrides:
   ASCEND_CANN_PACKAGE_PATH
                         CANN toolkit root for the NPU build
   PYTHON               Python interpreter for the NPU binding (default: python3)
+  KVAF_AICPU_CXX       AICPU cross compiler override
   KVAF_BUILD_JOBS      Parallel build jobs
 EOF
 }
@@ -120,6 +123,7 @@ build_cpu() {
 
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
     -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON \
+    -DKVAF_ENABLE_AICPU_URMA=OFF \
     -DKVAF_URMA_ROOT="$umdk_root" \
     -DKVAF_URMA_LIBRARY="$urma_library"
   cmake --build "$build_dir" --target kvaf_cpu_service --parallel "$jobs"
@@ -170,15 +174,57 @@ build_npu() {
   echo "[KVAF_BUILD] BatchPut kernel: $build_dir/bin/kvaf_execute_batch_put_kernels.o"
 }
 
+check_aicpu_cann_root() {
+  local selected_root="$1"
+  local runtime_root
+  [[ -n "${ASCEND_HOME_PATH:-}" ]] || return 0
+  [[ -d "$ASCEND_HOME_PATH" ]] || die "ASCEND_HOME_PATH does not exist: $ASCEND_HOME_PATH"
+  runtime_root="$(cd "$ASCEND_HOME_PATH" && pwd -P)"
+  selected_root="$(cd "$selected_root" && pwd -P)"
+  [[ "$runtime_root" == "$selected_root" ]] ||
+    die "AICPU build CANN root ($selected_root) differs from runtime ASCEND_HOME_PATH ($runtime_root)"
+}
+
+build_aicpu_urma() {
+  local build_dir="$1" jobs="$2" kernel_action="$3"
+  local cann_root umdk_root="${KVAF_UMDK_ROOT:-$KVAF_ROOT/../third_party/umdk}"
+  local -a compiler_option=()
+  cann_root="$(find_cann_root)"
+  [[ -n "$cann_root" ]] || die "CANN toolkit not found; source CANN set_env.sh first"
+  check_aicpu_cann_root "$cann_root"
+  if [[ "$kernel_action" == check || "$kernel_action" == uninstall ]]; then
+    bash "$KVAF_ROOT/access_operator/src/aicpu_urma/install_kernel.sh" "--$kernel_action" "$cann_root"
+    return
+  fi
+  require_command cmake
+  ensure_umdk_source "$umdk_root"
+  if [[ -n "${KVAF_AICPU_CXX:-}" ]]; then
+    compiler_option+=("-DKVAF_AICPU_CXX=$KVAF_AICPU_CXX")
+  fi
+  cmake -S "$KVAF_ROOT" -B "$build_dir" \
+    -DBUILD_TESTING=ON -DKVAF_BUILD_PYTHON=OFF \
+    -DKVAF_ENABLE_AIV_BATCH_GET=OFF -DKVAF_ENABLE_AIV_BATCH_PUT=OFF \
+    -DKVAF_BUILD_REMOTE_CPU_SERVICE=OFF -DKVAF_ENABLE_AICPU_URMA=ON \
+    -DKVAF_URMA_ROOT="$umdk_root" -DASCEND_CANN_PACKAGE_PATH="$cann_root" \
+    "${compiler_option[@]}"
+  cmake --build "$build_dir" --target kvaf_aicpu_gather_read_client kvaf_aicpu_urma_kernel --parallel "$jobs"
+  if [[ "$kernel_action" == install ]]; then
+    bash "$KVAF_ROOT/access_operator/src/aicpu_urma/install_kernel.sh" --install \
+      "$build_dir/access_operator/src/aicpu_urma" "$cann_root"
+  fi
+  echo "[KVAF_BUILD] GatherRead client: $build_dir/tests/kvaf_aicpu_gather_read_client"
+}
+
 mode="${1:-}"
 case "$mode" in
-  cpu|npu) shift ;;
+  cpu|npu|aicpu-urma) shift ;;
   -h|--help|help) usage; exit 0 ;;
   *) usage >&2; exit 2 ;;
 esac
 
 build_dir="$KVAF_ROOT/build-$mode"
 jobs="$(default_jobs)"
+kernel_action=build
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --build-dir)
@@ -191,12 +237,23 @@ while [[ $# -gt 0 ]]; do
       jobs="$2"
       shift 2
       ;;
+    --install-kernel|--check-kernel|--uninstall-kernel)
+      [[ "$mode" == aicpu-urma ]] || die "$1 is only valid for aicpu-urma"
+      case "$1" in
+        --install-kernel) kernel_action=install ;;
+        --check-kernel) kernel_action=check ;;
+        --uninstall-kernel) kernel_action=uninstall ;;
+      esac
+      shift
+      ;;
     *) die "unknown argument: $1" ;;
   esac
 done
 
 [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || die "KVAF_BUILD_JOBS must be a positive integer"
-if [[ "$mode" == cpu ]]; then
+if [[ "$mode" == aicpu-urma ]]; then
+  build_aicpu_urma "$build_dir" "$jobs" "$kernel_action"
+elif [[ "$mode" == cpu ]]; then
   build_cpu "$build_dir" "$jobs"
 else
   build_npu "$build_dir" "$jobs"

@@ -24,6 +24,10 @@ struct NpuRuntimeOptions {
   std::uint32_t device_id{0U};
   std::uint32_t npu_core_count{1U};
   std::uint32_t jettys_per_core{2U};
+  // Nonempty selects the optional AICPU UMDK data plane; AIV defaults stay unchanged.
+  std::string aicpu_urma_kernel_json_path;
+  std::string urma_device;
+  std::uint32_t urma_eid_index{UINT32_MAX};
 };
 
 // NPU role Runtime. It owns the current MetaManager, NPU AccessOperator and
@@ -37,6 +41,8 @@ class NpuRuntime final : public Runtime {
   NpuRuntime& operator=(const NpuRuntime&) = delete;
 
   Status Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size);
+  // Trusted current-request metadata; the selected UMDK operator owns execution.
+  Status GatherRead(const CpuGatherReadRequest& request);
   RuntimeCore& core();
   const RuntimeCore& core() const;
 
