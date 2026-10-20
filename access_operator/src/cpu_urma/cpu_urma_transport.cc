@@ -828,23 +828,23 @@ struct CpuUrmaTransport::Impl {
     return Status::OK();
   }
 
-  Status BuildWriteGatherQueue(
+  // Append into preallocated storage; the caller sets the final completion fence.
+  Status AppendWriteGatherQueue(
       SglBatchJob& job, std::size_t jetty,
       const CpuUrmaTransport::HostSge* buffers,
       const std::uint64_t* remote_offsets, std::size_t row_count,
-      std::size_t first, std::size_t count) {
+      std::size_t first, std::size_t count, std::size_t local_base = 0) {
     SglBatchQueue& queue = job.queues[jetty];
-    queue.count = 0U;
-    queue.missing_host_segments.clear();
     if (count == 0U) return Status::OK();
 
+    const auto wr_base = queue.count;
     std::size_t wr_count = 0U;
     const Status status = cpu_urma_detail::BuildWriteGatherShard(
         buffers, remote_offsets, row_count, first, count,
         batch_local_sgl_size_, remote_region_.length, max_message_bytes_,
         [&](std::size_t local_index, std::size_t row,
             const CpuUrmaTransport::HostSge& buffer) {
-          SglSgeAbi& local = queue.local[local_index];
+          SglSgeAbi& local = queue.local[local_base + local_index];
           local = {};
           local.addr = reinterpret_cast<std::uint64_t>(buffer.data);
           local.len = static_cast<std::uint32_t>(buffer.bytes);
@@ -857,18 +857,19 @@ struct CpuUrmaTransport::Impl {
                      host != nullptr) {
             local.tseg = host->segment;
           } else {
-            queue.missing_host_segments.push_back({row, local_index});
+            queue.missing_host_segments.push_back({row, local_base + local_index});
           }
         },
         [&](std::size_t wr_index,
             const cpu_urma_detail::WriteGatherGroup& group) {
-          SglSgeAbi& remote = queue.remote[wr_index];
+          const auto index = wr_base + wr_index;
+          SglSgeAbi& remote = queue.remote[index];
           remote = {};
           remote.addr = remote_region_.base + remote_offsets[group.first];
           remote.len = static_cast<std::uint32_t>(group.bytes);
           remote.tseg = remote_seg_handle_;
 
-          urma_jfs_wr_t& wr = queue.wrs[wr_index];
+          urma_jfs_wr_t& wr = queue.wrs[index];
           wr = {};
           wr.opcode = URMA_OPC_WRITE;
           wr.flag.bs.place_order = URMA_RELAX_ORDER;
@@ -878,7 +879,7 @@ struct CpuUrmaTransport::Impl {
           wr.user_ctx = MakeUserContext(
               job.generation, jetty, wr_index);
 
-          const std::size_t local_first = group.first - first;
+          const std::size_t local_first = local_base + group.first - first;
           urma_sg_t local_sg{};
           local_sg.sge = reinterpret_cast<urma_sge_t*>(
               queue.local.data() + local_first);
@@ -889,8 +890,8 @@ struct CpuUrmaTransport::Impl {
           wr.rw.src = local_sg;
           wr.rw.dst = remote_sg;
           wr.next = nullptr;
-          if (wr_index != 0U) {
-            queue.wrs[wr_index - 1U].next = &wr;
+          if (index != 0U) {
+            queue.wrs[index - 1U].next = &wr;
           }
         },
         &wr_count);
@@ -899,10 +900,7 @@ struct CpuUrmaTransport::Impl {
       return status;
     }
 
-    queue.count = wr_count;
-    urma_jfs_wr_t& tail = queue.wrs[wr_count - 1U];
-    tail.flag.bs.place_order = URMA_STRONG_ORDER;
-    tail.flag.bs.complete_enable = 1U;
+    queue.count += wr_count;
     return Status::OK();
   }
 
@@ -953,8 +951,13 @@ struct CpuUrmaTransport::Impl {
         const auto shard = RowsForQueue(count, job.queues.size(), jetty);
         build_status[jetty] = shard.count == 0U
             ? Status::OK()
-            : BuildWriteGatherQueue(job, jetty, buffers, remote_offsets,
-                                    row_count, first + shard.first, shard.count);
+            : AppendWriteGatherQueue(job, jetty, buffers, remote_offsets,
+                                     row_count, first + shard.first, shard.count);
+        if (build_status[jetty].ok() && shard.count) {
+          auto& tail = job.queues[jetty].wrs[job.queues[jetty].count - 1];
+          tail.flag.bs.place_order = URMA_STRONG_ORDER;
+          tail.flag.bs.complete_enable = 1U;
+        }
       }
 
 #pragma omp master
@@ -1345,8 +1348,6 @@ struct CpuUrmaTransport::Impl {
       return Status::InvalidArgument("invalid prepared WRITE chunks");
     auto plan = std::make_unique<PreparedWrite>();
     auto& job = plan->job; job.write = true; job.queues.resize(local_jettys_.size());
-    // Validate the layout and reserve storage before binding descriptor pointers.
-    std::array<std::size_t, kMaxJettyCount> capacity{};
     for (std::size_t c = 0; c < count; ++c) {
       const auto& chunk = chunks[c];
       if (!chunk.count || !chunk.sources || !chunk.remote_offsets ||
@@ -1354,76 +1355,50 @@ struct CpuUrmaTransport::Impl {
           reinterpret_cast<std::uintptr_t>(chunk.marker_value) % 8 ||
           chunk.count > kJettyDepth * local_jettys_.size())
         return Status::InvalidArgument("invalid chain chunk/source/marker alignment");
-      for (std::size_t q = 0; q < job.queues.size(); ++q) {
-        if (chunk.marker_value) {
-          const auto offset = chunk.marker_offsets[q];
-          if (offset % 8 || offset > remote_region_.length || remote_region_.length - offset < 8)
-            return Status::InvalidArgument("chain marker is outside remote region or unaligned");
-        }
-        capacity[q] += RowsForQueue(chunk.count, job.queues.size(), q).count +
-                       (chunk.marker_value ? 1 : 0);
-      }
-    }
-    for (std::size_t q = 0; q < job.queues.size(); ++q) {
-      auto& queue = job.queues[q];
-      if (capacity[q] > kJettyDepth)
-        return Status::InvalidArgument("WRITE source/marker budget exceeds one SQ wave; reduce rows/chunks");
-      queue.local.resize(capacity[q]); queue.remote.resize(capacity[q]);
-      queue.wrs.resize(capacity[q]);
-    }
-    SglBatchJob temp; temp.write = true; temp.queues.resize(job.queues.size());
-    std::array<std::size_t, kMaxJettyCount> locals{};
-    for (std::size_t c = 0; c < count; ++c) {
-      const auto& chunk = chunks[c];
       auto status = ValidateAndRegisterHostBuffers(chunk.sources, chunk.remote_offsets, chunk.count);
       if (!status.ok()) return status;
-      urma_target_seg_t* marker_segment = nullptr;
       if (chunk.marker_value) {
         const CpuUrmaTransport::HostSge marker{const_cast<std::uint64_t*>(chunk.marker_value), 8};
         status = ValidateAndRegisterHostBuffers(&marker, chunk.marker_offsets, 1);
         if (!status.ok()) return status;
-        marker_segment = FindRegisteredHostBuffer(chunk.marker_value, 8)->segment;
-      }
-      for (std::size_t q = 0; q < job.queues.size(); ++q) {
-        const auto range = RowsForQueue(chunk.count, job.queues.size(), q);
-        auto& dst = job.queues[q]; auto& src = temp.queues[q];
-        EnsureSglQueueStorage(src, range.count, range.count);
-        status = BuildWriteGatherQueue(temp, q, chunk.sources, chunk.remote_offsets,
-                                      chunk.count, range.first, range.count);
-        if (!status.ok()) return status;
-        const auto local_base = locals[q];
-        // The gather builder emits exactly one local SGE per source row.
-        if (range.count) std::copy_n(src.local.data(), range.count, dst.local.data() + local_base);
-        locals[q] += range.count;
-        for (std::size_t w = 0; w < src.count; ++w) {
-          const auto index = dst.count++;
-          dst.wrs[index] = src.wrs[w];
-          auto& wr = dst.wrs[index];
-          wr.rw.src.sge = reinterpret_cast<urma_sge_t*>(dst.local.data() + local_base +
-              (reinterpret_cast<SglSgeAbi*>(src.wrs[w].rw.src.sge) - src.local.data()));
-          dst.remote[index] = src.remote[w];
-          wr.rw.dst.sge = reinterpret_cast<urma_sge_t*>(&dst.remote[index]);
-          wr.flag.bs.complete_enable = 0;
-          wr.flag.bs.place_order = URMA_RELAX_ORDER;
-        }
-        if (!chunk.marker_value) continue;
-        // Every queue publishes its own progress, including empty shards.
-        const auto index = dst.count++, local = locals[q]++;
-        dst.local[local] = {reinterpret_cast<std::uint64_t>(chunk.marker_value), 8, marker_segment, nullptr};
-        dst.remote[index] = {remote_region_.base + chunk.marker_offsets[q], 8, remote_seg_handle_, nullptr};
-        auto& wr = dst.wrs[index]; wr = {}; wr.opcode = URMA_OPC_WRITE;
-        wr.flag.bs.place_order = URMA_STRONG_ORDER; wr.flag.bs.comp_order = 1;
-        wr.tjetty = remote_jettys_[q];
-        wr.rw.src.sge = reinterpret_cast<urma_sge_t*>(&dst.local[local]); wr.rw.src.num_sge = 1;
-        wr.rw.dst.sge = reinterpret_cast<urma_sge_t*>(&dst.remote[index]); wr.rw.dst.num_sge = 1;
-        ++plan->marker_wrs;
       }
     }
     for (std::size_t q = 0; q < job.queues.size(); ++q) {
       auto& queue = job.queues[q];
+      std::size_t capacity = 0;
+      for (std::size_t c = 0; c < count; ++c)
+        capacity += RowsForQueue(chunks[c].count, job.queues.size(), q).count +
+                    (chunks[c].marker_value ? 1 : 0);
+      if (capacity > kJettyDepth)
+        return Status::InvalidArgument("WRITE source/marker budget exceeds one SQ wave; reduce rows/chunks");
+      // Keep descriptor addresses stable while appending this queue's chunks.
+      queue.local.resize(capacity); queue.remote.resize(capacity); queue.wrs.resize(capacity);
+      std::size_t local_count = 0;
+      for (std::size_t c = 0; c < count; ++c) {
+        const auto& chunk = chunks[c];
+        const auto range = RowsForQueue(chunk.count, job.queues.size(), q);
+        const auto status = AppendWriteGatherQueue(job, q, chunk.sources, chunk.remote_offsets,
+                                                  chunk.count, range.first, range.count, local_count);
+        if (!status.ok()) return status;
+        local_count += range.count;
+        if (!chunk.marker_value) continue;
+        const auto offset = chunk.marker_offsets[q];
+        if (offset % 8 || offset > remote_region_.length || remote_region_.length - offset < 8)
+          return Status::InvalidArgument("chain marker is outside remote region or unaligned");
+        auto* marker_segment = FindRegisteredHostBuffer(chunk.marker_value, 8)->segment;
+        // Every queue publishes its own progress, including empty shards.
+        const auto index = queue.count++, local = local_count++;
+        queue.local[local] = {reinterpret_cast<std::uint64_t>(chunk.marker_value), 8, marker_segment, nullptr};
+        queue.remote[index] = {remote_region_.base + offset, 8, remote_seg_handle_, nullptr};
+        auto& wr = queue.wrs[index]; wr = {}; wr.opcode = URMA_OPC_WRITE;
+        wr.flag.bs.place_order = URMA_STRONG_ORDER; wr.flag.bs.comp_order = 1;
+        wr.tjetty = remote_jettys_[q];
+        wr.rw.src.sge = reinterpret_cast<urma_sge_t*>(&queue.local[local]); wr.rw.src.num_sge = 1;
+        wr.rw.dst.sge = reinterpret_cast<urma_sge_t*>(&queue.remote[index]); wr.rw.dst.num_sge = 1;
+        if (index) queue.wrs[index - 1].next = &wr;
+        ++plan->marker_wrs;
+      }
       if (!queue.count) continue;
-      for (std::size_t w = 0; w < queue.count; ++w)
-        queue.wrs[w].next = w + 1 < queue.count ? &queue.wrs[w + 1] : nullptr;
       auto& tail = queue.wrs[queue.count - 1]; tail.flag.bs.complete_enable = 1;
       tail.flag.bs.place_order = URMA_STRONG_ORDER; tail.flag.bs.comp_order = 1;
       plan->fences[plan->fence_count++] = {q, queue.count, 0};
