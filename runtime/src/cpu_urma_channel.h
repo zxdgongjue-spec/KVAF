@@ -1,7 +1,5 @@
 #pragma once
 
-#include <urma_api.h>
-
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -9,6 +7,8 @@
 #include <cstdio>
 #include <utility>
 #include <vector>
+
+#include "urma_transport.h"
 
 namespace kvaf::cpu_runtime_detail {
 
@@ -46,34 +46,10 @@ struct UrmaChannel {
   }
 
   bool CreateLocal(urma_context_t* context, std::uint32_t token) {
-    constexpr std::uint32_t jetty_depth = 8192U;
-    constexpr std::uint32_t cq_depth = 16384U;
-    urma_jfc_cfg_t cq_config{};
-    cq_config.depth = cq_depth;
-    local_jfc = urma_create_jfc(context, &cq_config);
-    if (local_jfc == nullptr) return Fail("urma_create_jfc", cq_depth, token);
-
-    urma_jfr_cfg_t jfr_config{};
-    jfr_config.depth = jetty_depth;
-    jfr_config.trans_mode = URMA_TM_RM;
-    jfr_config.max_sge = 1U;
-    jfr_config.jfc = local_jfc;
-    jfr_config.token_value.token = token;
-    jfr_config.flag.bs.tag_matching = URMA_NO_TAG_MATCHING;
-    local_jfr = urma_create_jfr(context, &jfr_config);
-    if (local_jfr == nullptr) return Fail("urma_create_jfr", jetty_depth, token);
-
-    urma_jetty_cfg_t config{};
-    config.flag.bs.share_jfr = URMA_SHARE_JFR;
-    config.jfs_cfg.depth = jetty_depth;
-    config.jfs_cfg.trans_mode = URMA_TM_RM;
-    config.jfs_cfg.max_sge = 1U;
-    config.jfs_cfg.jfc = local_jfc;
-    config.shared.jfr = local_jfr;
-    config.shared.jfc = local_jfc;
-    local_jetty = urma_create_jetty(context, &config);
-    if (local_jetty == nullptr) return Fail("urma_create_jetty", jetty_depth, token);
-    return true;
+    const auto* error =
+        urma::CreateQueues(urma::NativeApi{}, context, token, {16384U, 8192U, 1U, false}, local_jfc,
+                           local_jfr, local_jetty);
+    return error ? Fail(error, 8192U, token) : true;
   }
 
   void Reset() {

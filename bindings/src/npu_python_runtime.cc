@@ -23,7 +23,7 @@ namespace {
 void ThrowIfError(const Status& status) {
   if (status.ok()) return;
   const std::string message = status.message().empty()
-                                  ? "KVAF AIV operation failed"
+                                  ? "KVAF NPU operation failed"
                                   : status.message();
   if (status.code() == StatusCode::kInvalidArgument ||
       status.code() == StatusCode::kInvalidState ||
@@ -155,7 +155,9 @@ class NpuPythonRuntime final {
                    std::uint32_t batch_get_tokens_per_block,
                    std::uint32_t device_id, std::uint32_t npu_core_count,
                    std::string batch_put_kernel_object_path,
-                   std::uint32_t jettys_per_core) {
+                   std::uint32_t jettys_per_core,
+                   std::string aicpu_urma_kernel_json_path,
+                   std::string urma_device, std::uint32_t urma_eid_index) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
                               batch_get_tokens_per_block};
@@ -164,6 +166,9 @@ class NpuPythonRuntime final {
     options.device_id = device_id;
     options.npu_core_count = npu_core_count;
     options.jettys_per_core = jettys_per_core;
+    options.aicpu_urma_kernel_json_path = std::move(aicpu_urma_kernel_json_path);
+    options.urma_device = std::move(urma_device);
+    options.urma_eid_index = urma_eid_index;
     native_ = std::make_unique<::kvaf::NpuRuntime>(std::move(options));
   }
 
@@ -413,13 +418,17 @@ void BindNpuPythonRuntime(py::module_& module) {
 
   py::class_<NpuPythonRuntime>(module, "NpuRuntime")
       .def(py::init<std::string, std::uint32_t, std::uint32_t, std::uint32_t,
-                    std::uint32_t, std::string, std::uint32_t>(),
+                    std::uint32_t, std::string, std::uint32_t, std::string,
+                    std::string, std::uint32_t>(),
            py::arg("batch_get_kernel_object_path"),
            py::arg("batch_get_token_bytes"),
            py::arg("batch_get_tokens_per_block"), py::arg("device_id") = 0,
            py::arg("npu_core_count") = 1,
            py::arg("batch_put_kernel_object_path") = "",
-           py::arg("jettys_per_core") = 2)
+           py::arg("jettys_per_core") = 2,
+           py::arg("aicpu_urma_kernel_json_path") = "",
+           py::arg("urma_device") = "",
+           py::arg("urma_eid_index") = UINT32_MAX)
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
            "Connect this NPU Runtime to a CPU Runtime service before initialize.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),

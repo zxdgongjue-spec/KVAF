@@ -65,7 +65,3 @@ endif()
 if(KVAF_ENABLE_AICPU_URMA)
   add_subdirectory(src/aicpu_urma)
 endif()
-
-add_library(kvaf_gather_host_plan STATIC src/aicpu_urma/host_plan.cc)
-target_link_libraries(kvaf_gather_host_plan PUBLIC kvaf_access_operator)
-target_compile_options(kvaf_gather_host_plan PRIVATE "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2>")

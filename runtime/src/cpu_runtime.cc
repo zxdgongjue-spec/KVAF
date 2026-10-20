@@ -1,12 +1,11 @@
 #include "cpu_runtime.h"
 #include "cpu_urma_channel.h"
+#include "urma_transport.h"
 #include "peer_protocol.h"
 #include "cpu_urma_discovery.h"
 #include "peer_link.h"
 #include "cpu_gather.h"
-#include "cpu_gather_profile.h"
 #include "cpu_gather_team.h"
-#include "gather_read_profile.h"
 
 #include <dlfcn.h>
 #include <sys/socket.h>
@@ -76,60 +75,6 @@ static_assert(kSegBytes == 48U, "HCCP UMDK segment ABI changed");
 static_assert(kJettyKeyBytes <= kQpKeyBytes, "QpKey protocol buffer is too small");
 static_assert(kSegBytes <= kSegKeyBytes, "segment protocol buffer is too small");
 
-// These two calls are exported by the deployed liburma but are not declared
-// by the public UMDK header used to build this standalone CPU service.  The
-// layouts below come from the matching HCCP/UMDK source ABI.  Keeping them
-// private here avoids importing any CANN or HCCP header/library into CPU.
-struct UrmaExtImportJettyFlag {
-  uint64_t value;
-  uint64_t stag;
-  uint64_t dtag;
-};
-
-struct UrmaExtRjetty {
-  urma_jetty_id_t jetty_id;
-  uint32_t trans_mode;
-  uint32_t policy;
-  uint32_t type;
-  uint32_t reserved_before_flag;
-  UrmaExtImportJettyFlag flag;
-  uint32_t tp_type;
-  uint32_t reserved_after_tp_type;
-};
-
-struct UrmaExtGetTpCfg {
-  uint32_t flag;
-  uint32_t trans_mode;
-  uint8_t local_eid[kEidBytes];
-  uint8_t peer_eid[kEidBytes];
-};
-
-struct UrmaExtTpInfo {
-  uint64_t tp_handle;
-};
-
-struct UrmaExtActiveTpCfg {
-  uint64_t tp_handle;
-  uint64_t peer_tp_handle;
-  uint64_t tag;
-  uint32_t tx_psn;
-  uint32_t rx_psn;
-  uint64_t reserved;
-};
-
-static_assert(sizeof(UrmaExtImportJettyFlag) == 24U, "UMDK expanded Jetty flag ABI changed");
-static_assert(sizeof(UrmaExtRjetty) == 72U, "UMDK expanded remote Jetty ABI changed");
-static_assert(offsetof(UrmaExtRjetty, trans_mode) == 24U, "UMDK remote Jetty mode offset changed");
-static_assert(offsetof(UrmaExtRjetty, flag) == 40U, "UMDK remote Jetty flag offset changed");
-static_assert(offsetof(UrmaExtRjetty, tp_type) == 64U, "UMDK remote Jetty TP type offset changed");
-static_assert(sizeof(UrmaExtGetTpCfg) == 40U, "UMDK CTP query ABI changed");
-static_assert(sizeof(UrmaExtTpInfo) == 8U, "UMDK TP info ABI changed");
-static_assert(sizeof(UrmaExtActiveTpCfg) == 40U, "UMDK expanded Jetty config ABI changed");
-
-using UrmaGetTpListFn = int (*)(urma_context_t*, UrmaExtGetTpCfg*, uint32_t*, UrmaExtTpInfo*);
-using UrmaImportJettyExFn = urma_target_jetty_t* (*)(urma_context_t*, UrmaExtRjetty*, urma_token_t*,
-                                                      UrmaExtActiveTpCfg*);
-
 void Log(const char* format, ...) {
   va_list arguments;
   va_start(arguments, format);
@@ -180,8 +125,8 @@ class UrmaResources {
           selected_device_name_.c_str(), eid_index, errno);
       return false;
     }
-    get_tp_list_ = reinterpret_cast<UrmaGetTpListFn>(dlsym(RTLD_DEFAULT, "urma_get_tp_list"));
-    import_jetty_ex_ = reinterpret_cast<UrmaImportJettyExFn>(dlsym(RTLD_DEFAULT, "urma_import_jetty_ex"));
+    get_tp_list_ = reinterpret_cast<urma::GetTpList>(dlsym(RTLD_DEFAULT, "urma_get_tp_list"));
+    import_jetty_ex_ = reinterpret_cast<urma::ImportJettyEx>(dlsym(RTLD_DEFAULT, "urma_import_jetty_ex"));
     if (get_tp_list_ == nullptr || import_jetty_ex_ == nullptr) {
       Log("[KVAF_CPU] liburma lacks required expanded CTP APIs get_tp_list=%p import_jetty_ex=%p\n",
           reinterpret_cast<void*>(get_tp_list_), reinterpret_cast<void*>(import_jetty_ex_));
@@ -211,21 +156,7 @@ class UrmaResources {
     if (peer_eid == nullptr || tp_handle == nullptr || get_tp_list_ == nullptr || context_ == nullptr) {
       return false;
     }
-    UrmaExtGetTpCfg config{};
-    config.flag = 1U;  // CTP flag bit.
-    config.trans_mode = static_cast<uint32_t>(URMA_TM_RM);
-    std::memcpy(config.local_eid, context_->eid.raw, kEidBytes);
-    std::memcpy(config.peer_eid, peer_eid, kEidBytes);
-    UrmaExtTpInfo info{};
-    uint32_t count = 1U;
-    const int status = get_tp_list_(context_, &config, &count, &info);
-    if (status != 0 || count == 0U || info.tp_handle == 0U) {
-      Log("[KVAF_CPU] urma_get_tp_list failed status=%d count=%u tp=0x%llx errno=%d\n", status, count,
-          static_cast<unsigned long long>(info.tp_handle), errno);
-      return false;
-    }
-    *tp_handle = info.tp_handle;
-    return true;
+    return urma::QueryTp(get_tp_list_, context_, peer_eid, tp_handle);
   }
 
   urma_target_jetty_t* ImportJettyEx(const uint8_t key[kQpKeyBytes], uint32_t token_value,
@@ -235,30 +166,9 @@ class UrmaResources {
         peer_psn == 0U || import_jetty_ex_ == nullptr || context_ == nullptr) {
       return nullptr;
     }
-    UrmaExtRjetty remote{};
-    std::memcpy(&remote.jetty_id, key, sizeof(remote.jetty_id));
-    std::memcpy(&remote.trans_mode, key + sizeof(remote.jetty_id), sizeof(remote.trans_mode));
-    remote.policy = static_cast<uint32_t>(URMA_JETTY_GRP_POLICY_RR);
-    remote.type = static_cast<uint32_t>(URMA_JETTY);
-    urma_import_jetty_flag_t flag{};
-    flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
-    remote.flag.value = flag.value;
-    remote.tp_type = 1U;  // URMA_CTP in the expanded UMDK ABI.
-    UrmaExtActiveTpCfg config{};
-    config.tp_handle = local_tp;
-    config.peer_tp_handle = peer_tp;
-    config.tx_psn = local_psn;
-    config.rx_psn = peer_psn;
-    urma_token_t token{};
-    token.token = token_value;
-    urma_target_jetty_t* target = import_jetty_ex_(context_, &remote, &token, &config);
-    if (target == nullptr) {
-      Log("[KVAF_CPU] urma_import_jetty_ex failed remote_jetty=%u remote_uasid=%u token=0x%x mode=%u "
-          "local_tp=0x%llx peer_tp=0x%llx tx_psn=0x%x rx_psn=0x%x errno=%d\n",
-          remote.jetty_id.id, remote.jetty_id.uasid, token_value, remote.trans_mode,
-          static_cast<unsigned long long>(local_tp), static_cast<unsigned long long>(peer_tp), local_psn,
-          peer_psn, errno);
-    }
+    auto* target = urma::ImportJetty(import_jetty_ex_, context_, key, token_value,
+                                     local_tp, peer_tp, local_psn, peer_psn);
+    if (!target) Log("[KVAF_CPU] urma_import_jetty_ex failed errno=%d\n", errno);
     return target;
   }
 
@@ -267,8 +177,8 @@ class UrmaResources {
   uint32_t eid_index_ = 0U;
   urma_device_t* device_ = nullptr;
   urma_context_t* context_ = nullptr;
-  UrmaGetTpListFn get_tp_list_ = nullptr;
-  UrmaImportJettyExFn import_jetty_ex_ = nullptr;
+  urma::GetTpList get_tp_list_ = nullptr;
+  urma::ImportJettyEx import_jetty_ex_ = nullptr;
 };
 
 struct UrmaCandidate : CpuUrmaCandidate {
@@ -355,15 +265,6 @@ class UrmaResourcePool {
 
 using Channel = cpu_runtime_detail::UrmaChannel;
 
-const char* GatherModeName(CpuGatherMode mode) {
-  switch (mode) {
-    case CpuGatherMode::kAdaptive: return "adaptive";
-    case CpuGatherMode::kActive: return "active";
-    case CpuGatherMode::kPassive: return "passive";
-  }
-  return "unknown";
-}
-
 peer::GatherWaitMode TeamWaitMode(CpuGatherMode mode) {
   switch (mode) {
     case CpuGatherMode::kAdaptive: return peer::GatherWaitMode::kAdaptive;
@@ -376,173 +277,62 @@ peer::GatherWaitMode TeamWaitMode(CpuGatherMode mode) {
 class CpuGatherWorker {
  public:
   CpuGatherWorker(void* memory, uint64_t base, uint64_t bytes,
-                  std::size_t gather_threads,
-                  std::size_t min_bytes_per_thread, bool gather_affinity,
-                  CpuGatherMode gather_mode,
-                  bool notify_profile = false, std::uint64_t session_id = 0U,
-                  std::uint64_t control_address = 0U, std::uint32_t lane = 0U,
-                  std::size_t cpu_offset = 0U)
+                  std::size_t threads, std::size_t min_bytes, bool affinity,
+                  CpuGatherMode mode)
       : memory_(static_cast<std::uint8_t*>(memory)), base_(base), bytes_(bytes),
-        control_(reinterpret_cast<peer::GatherControl*>(
-            static_cast<uint8_t*>(memory) + (control_address == 0U
-                ? peer::GatherControlOffset(bytes) : control_address - base))),
-        team_(memory, base, gather_threads, min_bytes_per_thread,
-              TeamWaitMode(gather_mode), gather_affinity, notify_profile, cpu_offset),
-        max_threads_(team_.max_threads()), gather_mode_(gather_mode),
-        notify_profile_(notify_profile), session_id_(session_id), lane_(lane),
-        copy_stats_(notify_profile ? new peer::CpuGatherCopyStats(team_.max_threads()) : nullptr) {
+        control_(reinterpret_cast<peer::GatherControl*>(memory_ + peer::GatherControlOffset(bytes))),
+        team_(memory, base, threads, min_bytes, TeamWaitMode(mode), affinity), mode_(mode) {
     std::memset(control_, 0, sizeof(*control_));
     peer::GatherBarrier();
-    worker_ = std::thread(&CpuGatherWorker::RunDirect, this);
+    worker_ = std::thread(&CpuGatherWorker::Run, this);
   }
-
   ~CpuGatherWorker() {
     stop_.store(true, std::memory_order_release);
     worker_.join();
-    if (copy_stats_) copy_stats_->Print(stderr, session_id_, base_, lane_);
-    if (notify_profile_ && direct_rounds_ != 0U) {
-      Log("[KVAF_CPU] GATHER_NOTIFY_POLL mode=%s rounds=%" PRIu64
-          " detect_gap_avg_ns=%" PRIu64 " detect_gap_max_ns=%" PRIu64
-          " detect_offcpu_avg_ns=%" PRIu64 " detect_offcpu_max_ns=%" PRIu64
-          " detect_offcpu_ge_1ms=%" PRIu64 " sampled_offcpu_max_ns=%" PRIu64 "\n",
-          GatherModeName(gather_mode_), direct_rounds_,
-          detect_gap_sum_ns_ / direct_rounds_, detect_gap_max_ns_,
-          detect_offcpu_sum_ns_ / direct_rounds_, detect_offcpu_max_ns_,
-          detect_offcpu_ge_1ms_, sampled_offcpu_max_ns_);
-    }
   }
-
-
-
  private:
-  static std::uint64_t NowNs() {
-    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count());
-  }
-
-  static std::uint64_t ThreadCpuNs() {
-#if defined(__linux__)
-    timespec value{};
-    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) return 0U;
-    return static_cast<std::uint64_t>(value.tv_sec) * 1000000000U + value.tv_nsec;
-#else
-    return 0U;
-#endif
-  }
-
-
-
-  void RunDirect() {
+  void Run() {
     team_.BindWorker(0U);
-    std::uint64_t last_sequence = 0U;
-    std::uint64_t wait_start_ns = NowNs();
-    std::uint64_t last_sample_ns = wait_start_ns;
-    std::uint64_t last_cpu_ns = notify_profile_ ? ThreadCpuNs() : 0U;
-    std::uint64_t poll_count = 0U;
-    auto sample_gap = [&]() {
-      const auto now_ns = NowNs();
-      const auto cpu_ns = ThreadCpuNs();
-      const auto gap_ns = now_ns - last_sample_ns;
-      const auto cpu_elapsed_ns = cpu_ns >= last_cpu_ns ? cpu_ns - last_cpu_ns : 0U;
-      const auto offcpu_ns = cpu_ns != 0U && last_cpu_ns != 0U &&
-                                     gap_ns > cpu_elapsed_ns ? gap_ns - cpu_elapsed_ns : 0U;
-      sampled_offcpu_max_ns_ = std::max(sampled_offcpu_max_ns_, offcpu_ns);
-      last_sample_ns = now_ns;
-      last_cpu_ns = cpu_ns;
-      return std::pair{gap_ns, offcpu_ns};
-    };
+    std::uint64_t last = 0U;
     while (!stop_.load(std::memory_order_acquire)) {
       const auto sequence = __atomic_load_n(&control_->notify, __ATOMIC_ACQUIRE);
-      if (sequence == 0U || sequence == last_sequence ||
-          (sequence & peer::kGatherErrorBit) != 0U) {
-        if (notify_profile_ &&
-            ((++poll_count & 4095U) == 0U || gather_mode_ == CpuGatherMode::kPassive))
-          sample_gap();
-        if (gather_mode_ == CpuGatherMode::kPassive) {
+      if (!sequence || sequence == last || (sequence & peer::kGatherErrorBit)) {
+        if (mode_ == CpuGatherMode::kPassive)
           std::this_thread::sleep_for(std::chrono::microseconds(20));
-        } else {
+        else
           peer::GatherSpinPause();
-        }
         continue;
       }
-      if (notify_profile_) {
-        const auto [gap_ns, offcpu_ns] = sample_gap();
-        ++direct_rounds_;
-        detect_gap_sum_ns_ += gap_ns;
-        detect_gap_max_ns_ = std::max(detect_gap_max_ns_, gap_ns);
-        detect_offcpu_sum_ns_ += offcpu_ns;
-        detect_offcpu_max_ns_ = std::max(detect_offcpu_max_ns_, offcpu_ns);
-        if (offcpu_ns >= 1000000U) ++detect_offcpu_ge_1ms_;
-      }
-      last_sequence = sequence;
-      peer::GatherCpuProfile profile{};
-      profile.notify_spin_ns = NowNs() - wait_start_ns;
+      last = sequence;
       __atomic_store_n(&control_->ack, peer::GatherStartedAck(sequence), __ATOMIC_RELEASE);
       peer::GatherBarrier();
-      const auto descriptor_start_ns = NowNs();
       const auto address = __atomic_load_n(&control_->command, __ATOMIC_ACQUIRE);
       bool valid = false;
       try {
-        const auto threads = team_.PrepareDirect(bytes_, address, sequence, peer::kMaxGatherSpans);
-        valid = threads != 0U;
-        if (valid && threads != reported_threads_) {
-          Log("[KVAF_CPU] GATHER_THREADS active=%zu max=%zu bytes=%" PRIu64
-              " mode=%s transport=urma\n", threads, max_threads_, team_.total_bytes(),
-              GatherModeName(gather_mode_));
-          reported_threads_ = threads;
-        }
+        valid = team_.PrepareDirect(bytes_, address, sequence, peer::kMaxGatherSpans) != 0U;
+        if (valid) team_.Copy();
       } catch (const std::exception& error) {
-        Log("[KVAF_CPU] GATHER_DIRECT_PREPARE_FAILED reason=%s\n", error.what());
+        Log("[KVAF_CPU] GatherRead failed: %s\n", error.what());
+        valid = false;
       }
-      profile.source_cache_ns = NowNs() - descriptor_start_ns;
-      if (valid) {
-        const auto copy_start_ns = NowNs();
-        team_.Copy();
-        profile.copy_ns = NowNs() - copy_start_ns;
-      } else {
-        Log("[KVAF_CPU] GATHER_DIRECT_DESCRIPTOR_INVALID sequence=%" PRIu64
-            " address=0x%" PRIx64 "\n", sequence, address);
-        if (address % 64U == 0U && peer::GatherRange(base_, peer::GatherControlOffset(bytes_),
-                                                  address, sizeof(peer::GatherDescriptorHeader))) {
-          auto* progress = reinterpret_cast<std::uint64_t*>(
-              memory_ + (address - base_) + offsetof(peer::GatherDescriptorHeader, ready_bytes));
-          __atomic_store_n(progress, peer::kGatherErrorBit, __ATOMIC_RELEASE);
-        }
+      if (!valid && address % 64U == 0U &&
+          peer::GatherRange(base_, peer::GatherControlOffset(bytes_), address,
+                            sizeof(peer::GatherDescriptorHeader))) {
+        auto* progress = reinterpret_cast<std::uint64_t*>(
+            memory_ + address - base_ + offsetof(peer::GatherDescriptorHeader, ready_bytes));
+        __atomic_store_n(progress, peer::kGatherErrorBit, __ATOMIC_RELEASE);
       }
-      control_->profile = profile;
       __atomic_store_n(&control_->ack,
-                       sequence | (valid ? 0U : peer::kGatherErrorBit), __ATOMIC_RELEASE);
+                      sequence | (valid ? 0U : peer::kGatherErrorBit), __ATOMIC_RELEASE);
       peer::GatherBarrier();
-      if (valid && copy_stats_) copy_stats_->Accumulate(team_);
-      wait_start_ns = NowNs();
-      if (notify_profile_) {
-        last_sample_ns = wait_start_ns;
-        last_cpu_ns = ThreadCpuNs();
-        poll_count = 0U;
-      }
     }
   }
-
   std::uint8_t* memory_;
-  uint64_t base_;
-  uint64_t bytes_;
+  std::uint64_t base_, bytes_;
   peer::GatherControl* control_;
-  std::atomic<bool> stop_{false};
   peer::CpuGatherTeam team_;
-  std::size_t max_threads_{0U};
-  CpuGatherMode gather_mode_{CpuGatherMode::kAdaptive};
-  bool notify_profile_{false};
-  std::uint64_t session_id_{0U};
-  std::uint32_t lane_{0U};
-  std::unique_ptr<peer::CpuGatherCopyStats> copy_stats_;
-  std::size_t reported_threads_{0U};
-  std::uint64_t direct_rounds_{0U};
-  std::uint64_t detect_gap_sum_ns_{0U};
-  std::uint64_t detect_gap_max_ns_{0U};
-  std::uint64_t detect_offcpu_sum_ns_{0U};
-  std::uint64_t detect_offcpu_max_ns_{0U};
-  std::uint64_t detect_offcpu_ge_1ms_{0U};
-  std::uint64_t sampled_offcpu_max_ns_{0U};
+  CpuGatherMode mode_;
+  std::atomic<bool> stop_{false};
   std::thread worker_;
 };
 
@@ -564,11 +354,10 @@ class CpuService {
  public:
   CpuService(UrmaResourcePool* resource_pool, std::size_t gather_threads,
              std::size_t min_bytes_per_thread, bool gather_affinity,
-             CpuGatherMode gather_mode, bool gather_notify_profile)
+             CpuGatherMode gather_mode)
       : resource_pool_(resource_pool), gather_threads_(gather_threads),
         min_bytes_per_thread_(min_bytes_per_thread),
-        gather_affinity_(gather_affinity), gather_mode_(gather_mode),
-        gather_notify_profile_(gather_notify_profile) {}
+        gather_affinity_(gather_affinity), gather_mode_(gather_mode) {}
   ~CpuService() { ReleaseAll(); }
 
   uint32_t CandidateCount() const {
@@ -752,8 +541,7 @@ class CpuService {
     try {
       region.gather = std::make_unique<CpuGatherWorker>(
           region.memory, region.base, region.bytes, gather_threads_,
-          min_bytes_per_thread_, gather_affinity_, gather_mode_,
-          gather_notify_profile_, region.id);
+          min_bytes_per_thread_, gather_affinity_, gather_mode_);
     } catch (const std::exception& error) {
       Log("[KVAF_CPU] GATHER_DIRECT_ENABLE_FAILED reason=%s\n", error.what());
       return Result::kResourceError;
@@ -824,7 +612,6 @@ class CpuService {
   std::size_t min_bytes_per_thread_{256U * 1024U};
   bool gather_affinity_{true};
   CpuGatherMode gather_mode_{CpuGatherMode::kAdaptive};
-  bool gather_notify_profile_{false};
   uint64_t next_region_id_ = 1U;
   uint32_t next_token_ = 1U;
   uint32_t next_psn_ = 1U;
@@ -954,7 +741,7 @@ Status CpuRuntime::Initialize(const CpuRuntimeOptions& options) {
       ? 256U * 1024U : 64U * 1024U;
   impl->service = std::make_unique<CpuService>(
       &impl->resources, gather_threads, min_bytes_per_thread,
-      options.gather_affinity, options.gather_mode, options.gather_notify_profile);
+      options.gather_affinity, options.gather_mode);
   impl_ = std::move(impl);
   return Status::OK();
 }

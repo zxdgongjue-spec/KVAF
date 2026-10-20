@@ -19,12 +19,5 @@
       "kernelSo": "libkvaf_aicpu_urma.so",
       "opKernelLib": "AICPUKernel"
     }
-  },
-  "KvafAicpuUmdkBatchGet": {
-    "opInfo": {
-      "functionName": "KvafAicpuUmdkBatchGet",
-      "kernelSo": "libkvaf_aicpu_urma.so",
-      "opKernelLib": "AICPUKernel"
-    }
   }
 }

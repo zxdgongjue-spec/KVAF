@@ -27,7 +27,6 @@ check_artifacts() {
   local dir="$1"
   [[ -s "$dir/$package" && -s "$dir/kernel.json" ]] || die "missing build artifacts in $dir"
   check_archive "$dir/$package"
-  grep -Fq '"KvafAicpuUmdkBatchGet"' "$dir/kernel.json" || die "UMDK BatchGet missing"
   grep -Fq '"KvafAicpuGatherRead"' "$dir/kernel.json" || die "GatherRead missing from $dir/kernel.json"
   grep -Fq '"KvafAicpuGatherScatter"' "$dir/kernel.json" || die "GatherScatter missing from $dir/kernel.json"
   grep -Fq '"KvafAicpuUmdkControl"' "$dir/kernel.json" || die "UMDK control missing from $dir/kernel.json"

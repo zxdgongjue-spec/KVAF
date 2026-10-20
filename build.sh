@@ -18,7 +18,7 @@ Usage: ./build.sh <cpu|npu|aicpu-urma> [--build-dir DIR] [--jobs N]
 
 cpu  Builds the liburma-only CPU Runtime service. If liburma is not installed,
      it clones and builds the pinned UMDK source beside this repository.
-aicpu-urma Builds the native UMDK GatherRead client and AICPU kernel.
+aicpu-urma Builds the UMDK pipeline BatchGet Python binding and AICPU kernel.
      --install-kernel installs it; --check-kernel and --uninstall-kernel manage the package.
 npu  Builds the CANN AIV BatchGet/BatchPut Runtime and Python binding. It
      installs pybind11 for the selected Python interpreter when necessary.
@@ -197,22 +197,27 @@ build_aicpu_urma() {
     return
   fi
   require_command cmake
+  local python_bin="${PYTHON:-python3}"
+  require_command "$python_bin"
+  if ! "$python_bin" -m pybind11 --cmakedir >/dev/null 2>&1; then
+    "$python_bin" -m pip install --user pybind11
+  fi
   ensure_umdk_source "$umdk_root"
   if [[ -n "${KVAF_AICPU_CXX:-}" ]]; then
     compiler_option+=("-DKVAF_AICPU_CXX=$KVAF_AICPU_CXX")
   fi
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
-    -DBUILD_TESTING=ON -DKVAF_BUILD_PYTHON=OFF \
+    -DBUILD_TESTING=OFF -DKVAF_BUILD_PYTHON=ON -DPython_EXECUTABLE="$python_bin" \
     -DKVAF_ENABLE_AIV_BATCH_GET=OFF -DKVAF_ENABLE_AIV_BATCH_PUT=OFF \
     -DKVAF_BUILD_REMOTE_CPU_SERVICE=OFF -DKVAF_ENABLE_AICPU_URMA=ON \
     -DKVAF_URMA_ROOT="$umdk_root" -DASCEND_CANN_PACKAGE_PATH="$cann_root" \
     "${compiler_option[@]}"
-  cmake --build "$build_dir" --target kvaf_aicpu_gather_read_client kvaf_aicpu_urma_kernel --parallel "$jobs"
+  cmake --build "$build_dir" --target _kvaf kvaf_aicpu_urma_kernel --parallel "$jobs"
   if [[ "$kernel_action" == install ]]; then
     bash "$KVAF_ROOT/access_operator/src/aicpu_urma/install_kernel.sh" --install \
       "$build_dir/access_operator/src/aicpu_urma" "$cann_root"
   fi
-  echo "[KVAF_BUILD] GatherRead client: $build_dir/tests/kvaf_aicpu_gather_read_client"
+  echo "[KVAF_BUILD] NPU Python package: $build_dir/python/kvaf"
 }
 
 mode="${1:-}"

@@ -1,83 +1,86 @@
-# AICPU UMDK 流水 GatherRead
+# Python BatchGet 使用 AICPU UMDK 流水
 
-CPU 把当前源清单 gather 到连续 DDR staging，完成一段连续前缀后发布 `ready_bytes`。
-AICPU 每批重新构造 READ WR/SGL，确认整批源数据就绪后立即提交，边提交边继续构造下一批。
-每个 worker 的一波最多 4096 条 WR，只在最后一条请求数据 CQE；完成前保留所有 WR/SGL 槽位。
+已有的 `NpuRuntime.batch_get` 可以选择 UMDK 后端。AICPU 从本轮 NPU Tensor 生成源清单，
+CPU gather 到连续 DDR staging；每完成 128 KiB 连续前缀，AICPU 就提交对应 READ。
+indices、offsets、mask、output_indices 和数据可以每轮变化，不缓存上一轮内容。
 
-## 编译与运行
+## 构建和启动
 
-在仓库根目录编译 CPU 服务和 NPU 客户端：
+在仓库根目录执行：
 
 ```bash
 ./build.sh cpu
 ./build.sh aicpu-urma --install-kernel
+export PYTHONPATH="$PWD/build-aicpu-urma/python:$PYTHONPATH"
 ```
 
-CPU 终端：
+CPU 服务使用新二进制重启：
 
 ```bash
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28990 \
-  --gather-threads 8 --gather-mode active --gather-affinity on --gather-notify-profile
+  --gather-threads 8 --gather-mode active --gather-affinity on
 ```
 
-NPU 终端：
+NPU 进程先加载 CANN 环境，再使用现有 Tensor 接口：
 
-```bash
-./build-aicpu-urma/tests/kvaf_aicpu_gather_read_client \
-  --device-id 7 --peer 127.0.0.1:28990 \
-  --urma-device udmac0d1e5 --eid-index 0 --aicpu-cores 1 \
-  --blocks 4096 --block-bytes 656 --output-stride 1312 \
-  --sgl-size 6 --sq-batch-wqes 32 --pipeline-chunk-bytes 131072 \
-  --profile-detail 1 --warmup 10 --iterations 1000
+```python
+import os
+import torch
+import torch_npu
+import kvaf
+
+torch.npu.set_device(7)
+runtime = kvaf.NpuRuntime(
+    batch_get_kernel_object_path="",
+    batch_get_token_bytes=656,
+    batch_get_tokens_per_block=1,
+    device_id=7,
+    npu_core_count=1,
+    aicpu_urma_kernel_json_path=os.path.join(
+        os.environ["ASCEND_HOME_PATH"],
+        "opp/vendors/cust/op_impl/aicpu/config/kvaf_aicpu_urma.json",
+    ),
+    urma_device="udmac0d1e5",
+    urma_eid_index=0,
+)
+runtime.link_to("127.0.0.1:28990")
+runtime.initialize(ddr_bytes=656 * 8192, slot_size=656)
+
+keys = list(range(4096))
+source = torch.randint(0, 256, (4096, 656), dtype=torch.uint8, device="npu:7")
+runtime.batch_put(keys, source, [i * 656 for i in keys], [656] * 4096)
+table = runtime.prepare_access_table(keys)
+device_table = runtime.access_table_view(table, device="npu")
+indices = torch.arange(4096, dtype=torch.int32, device="npu:7")
+offsets = torch.zeros_like(indices)  # 表项内的字节偏移。
+mask = torch.ones(4096, dtype=torch.uint8, device="npu:7")
+output_indices = indices.clone()
+output = torch.empty_like(source)
+runtime.batch_get(device_table, indices, offsets, mask, output_indices, output,
+                  synchronize=True)
+assert torch.equal(output, source)
+runtime.release_access_table(table)
+runtime.shutdown()
 ```
 
-设备和 EID 按部署环境调整。`pipeline-chunk-bytes=0` 等完整 CPU ACK 后再 READ。
-1..8 个 worker 使用同一对 TP，各有独立数据 Jetty/CQ，并共享一条专用控制 Jetty/CQ。
-控制队列负责清单 WRITE、通知、ACK 和前缀查询；CPU 服务为每个通道分别创建 Jetty、RQ 和 CQ。
-总 CPU 线程预算由 `gather-threads` 设置，与 AICPU worker 数分别配置。
+设备、URMA device、EID 和服务地址按部署环境调整。原来的 addresses/valid Tensor 重载也可直接使用。
+未设置 `aicpu_urma_kernel_json_path` 时仍走原 AIV 后端。
 
-只构建现有 AIV/Python 路径仍使用 `./build.sh npu`；它的默认选择和原有公共请求结构保持不变。
+## 执行和资源约定
 
-## C++ 调用
+1..8 个 AICPU worker 共用一对 TP，每个 worker 有独立数据 Jetty/CQ；另有一条专用控制 Jetty/CQ。
+CPU 侧每条通道也各有独立 Jetty/RQ/CQ。CPU 与 AICPU 共用端点枚举、队列创建和 TP/Jetty 扩展代码；
+AICPU 进程内的 liburma 动态加载与会话由 AICPU 自己维护。
 
-给 `NpuRuntimeOptions::aicpu_urma_kernel_json_path` 设置安装后的 JSON 路径，即选择 UMDK 后端。
-`urma_device`、`urma_eid_index` 和 `npu_core_count` 配置该会话；BatchPut、BatchGet、初始化探测和
-GatherRead 复用同一会话，不再为 UMDK 创建 Direct-HCCP 连接。
-未设置 JSON 的现有调用继续使用原 AIV 后端。
+每次最多 65536 项；token 大小由构造参数指定，最大总载荷须能用 uint32 表示。
+Runtime 在用户指定 DDR 数据容量之外预留 `65536 * token_bytes` 的 staging、源描述符和控制区，
+这些空间不进入 KV slot 分配。HBM 描述符和 scratch 使用独立内部缓冲，输出 Tensor 无需额外尾部空间。
+READ 使用 SGL 6、每次提交 32 条 WR；每波最多 4096 条 WR，只请求最后一条的有序 CQE，完成后复用 WR/SGL 空间。
 
-调用 `NpuRuntime::GatherRead(CpuGatherReadRequest)`，提供本轮源 span、DDR staging、
-DDR descriptor 邮箱、HBM 输出 span 和调用方 stream。源/目标清单、地址和长度可逐轮改变；
-只复用缓冲区容量，每轮覆盖全部有效描述符和 WR/SGL。不会保存上一轮清单结果。
+BatchPut 同步完成；BatchGet 默认只 enqueue，`synchronize=True` 等待完成并读取错误状态。
+内部 workspace 在下一次操作或 Shutdown 前排空；跨 stream 依赖由调用方负责。
+调用方须保留元数据 Tensor 至执行结束，已注册的源/输出 Tensor 至 Shutdown 前保持有效。
+同一 AICPU 进程只支持一个活动 UMDK 会话。目前该后端使用 eager 调用，不支持 ACL Graph capture/replay。
 
-Host 信任调用方的有效布局，不执行逐轮全量校验。源总量与目标总量必须一致，地址及容量必须有效，
-DDR 源、staging、descriptor、区域末尾 64 B control 不得重叠。descriptor 地址按 64 B 对齐，
-至少保留 `peer::GatherDescriptorBytes(source_count)` 字节。
-staging、descriptor 和末尾 control 所在 KV slot 必须由调用方保留，不参与普通数据分配；测试客户端会实际占住这些 slot。
-HBM 输出末端额外空间用 `GatherReadPackedOutputBytes(output_extent, source_bytes, target_count, chunk_bytes)`
-计算，包含 scratch、源清单与目标清单；辅助函数位于 `gather_read_storage.h`。
-CPU/AICPU 边界检查、CQ 错误和超时仍返回失败。
-
-同一 AICPU 进程目前只支持一个活动 UMDK 会话，第二次创建会明确失败。
-已注册的调用方 HBM 缓冲在 Runtime Shutdown 前须保持有效；不支持释放后复用地址。
-GatherRead 同步返回；BatchPut 同步返回；BatchGet 保留默认只 enqueue、可选 synchronize 的原契约。
-调用方负责跨 stream 依赖，并在 Shutdown 前完成异步 BatchGet。
-GatherRead 上传或同步失败时保留 pinned metadata，后续调用或 Shutdown 先排空 stream，避免提前复用。
-客户端、CPU 服务和 AICPU kernel 一起更新。
-
-## 性能与正确性
-
-抽取前已测基线：device 7，CPU 8 线程 active/绑核，单 AICPU worker，4096 × 656 B，
-输出 stride 1312，SGL 6，batch 32，128 KiB 前缀流水，warmup 10、测量 1000 轮。
-端到端均值 **258.4 µs / 10.40 GB/s**，P50 **257.0 µs**，P95 **280.0 µs**。
-这份整理后的代码还需在相同设备和条件下复测。
-
-客户端每轮更新 payload、改变源清单顺序、毒化输出，并逐字节验证载荷及输出间隙。
-输入上传、造数和结果验证不计入 GatherRead 时间。
-日志中的 Host wait 包含传输、kernel 与 CPU/AICPU 工作；流水 READ 包含 ready-prefix 等待，
-CPU gather 与 READ 重叠；多 worker 阶段取每轮最大值，不能相加。
-Provider submit 包含 provider 编码、SQ 写入与 doorbell，不能当作单独的 SQ 拷贝计时。
-
-无 NPU 的 native 回归在存在 UMDK headers 时使用 provider 与 ACL 替身，覆盖平铺 BatchPut、
-异步 BatchGet、1/2/4 worker、变化布局、前缀就绪约束及 stream 失败恢复。它们验证行为和生命周期；
-上面的 NPU 命令用于确认硬件兼容性和性能。
+本地验证使用 ACL/provider 替身；本分支的 NPU 兼容性与性能需要服务器验证。

@@ -1,5 +1,8 @@
 #include <dlfcn.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <link.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -15,14 +18,13 @@
 
 #include "cpu_gather.h"
 #include "gather_cache.h"
-#include "umdk_abi.h"
 #include "umdk_control.h"
-#include "umdk_diagnostics.h"
 #include "umdk_gather.h"
+#include "urma_transport.h"
 
 namespace {
 using namespace kvaf::aicpu_urma;
-using namespace kvaf::aicpu_urma::umdk;
+using namespace kvaf::urma;
 
 std::uint64_t NowNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -30,28 +32,28 @@ std::uint64_t NowNs() {
       .count();
 }
 
-#define KVAF_UMDK_APIS(APPLY) \
-  APPLY(urma_init) \
-  APPLY(urma_uninit) \
-  APPLY(urma_get_device_list) \
-  APPLY(urma_free_device_list) \
-  APPLY(urma_get_eid_list) \
-  APPLY(urma_free_eid_list) \
-  APPLY(urma_create_context) \
-  APPLY(urma_delete_context) \
-  APPLY(urma_create_jfc) \
-  APPLY(urma_delete_jfc) \
-  APPLY(urma_create_jfr) \
-  APPLY(urma_delete_jfr) \
-  APPLY(urma_create_jetty) \
-  APPLY(urma_delete_jetty) \
-  APPLY(urma_alloc_token_id) \
-  APPLY(urma_free_token_id) \
-  APPLY(urma_register_seg) \
-  APPLY(urma_unregister_seg) \
-  APPLY(urma_import_seg) \
-  APPLY(urma_unimport_seg) \
-  APPLY(urma_unimport_jetty) \
+#define KVAF_UMDK_APIS(APPLY)    \
+  APPLY(urma_init)               \
+  APPLY(urma_uninit)             \
+  APPLY(urma_get_device_list)    \
+  APPLY(urma_free_device_list)   \
+  APPLY(urma_get_eid_list)       \
+  APPLY(urma_free_eid_list)      \
+  APPLY(urma_create_context)     \
+  APPLY(urma_delete_context)     \
+  APPLY(urma_create_jfc)         \
+  APPLY(urma_delete_jfc)         \
+  APPLY(urma_create_jfr)         \
+  APPLY(urma_delete_jfr)         \
+  APPLY(urma_create_jetty)       \
+  APPLY(urma_delete_jetty)       \
+  APPLY(urma_alloc_token_id)     \
+  APPLY(urma_free_token_id)      \
+  APPLY(urma_register_seg)       \
+  APPLY(urma_unregister_seg)     \
+  APPLY(urma_import_seg)         \
+  APPLY(urma_unimport_seg)       \
+  APPLY(urma_unimport_jetty)     \
   APPLY(urma_post_jetty_send_wr) \
   APPLY(urma_poll_jfc)
 
@@ -61,10 +63,6 @@ struct Api {
 #undef KVAF_DECLARE_API
   GetTpList get_tp_list = nullptr;
   ImportJettyEx import_jetty_ex = nullptr;
-  decltype(&::urma_register_log_func) register_log = nullptr;
-  decltype(&::urma_unregister_log_func) unregister_log = nullptr;
-  decltype(&::urma_log_get_level) get_log_level = nullptr;
-  decltype(&::urma_log_set_level) set_log_level = nullptr;
 };
 
 struct WrQueue {
@@ -77,7 +75,6 @@ struct GatherQueue : WrQueue {
   // Vectors own constructed workspace slots; wr_count is the active chain size.
   std::vector<kvaf::GatherOutputSpan> targets;
   std::uint32_t wr_count = 0;
-  std::uint64_t builds = 0;
 };
 
 template <typename T>
@@ -116,8 +113,6 @@ struct State : Worker {
   void* library = nullptr;
   void* common_library = nullptr;
   bool owns_init = false;
-  bool log_registered = false;
-  urma_vlog_level_t old_log_level = URMA_VLOG_LEVEL_INFO;
   urma_context_t* context = nullptr;
   urma_token_id_t* token = nullptr;
   urma_target_seg_t* local = nullptr;
@@ -127,10 +122,7 @@ struct State : Worker {
   std::uint32_t shared_peer_psn = 0;
   std::array<std::uint8_t, 16> peer_eid{};
   std::uint64_t buffer = 0, buffer_bytes = 0, remote_address = 0;
-  std::uint32_t bytes = 0;
-  char library_path[256]{};
-  char device[64]{};
-  std::uint32_t eid_index = 0, worker_count = 1;
+  std::uint32_t worker_count = 1;
   std::array<std::unique_ptr<Worker>, 7> extra_workers;
   std::unique_ptr<Worker> control;
   std::vector<RegisteredBuffer> buffers;
@@ -139,9 +131,8 @@ struct State : Worker {
 State state;
 std::shared_mutex state_mutex;
 std::array<std::mutex, 8> worker_mutexes;
-std::array<std::mutex, 8> control_mutexes;
+std::mutex control_mutex;
 std::uint64_t generation = 0;
-DiagnosticLog diagnostic_log;
 
 Worker& GetWorker(std::uint32_t index) {
   return index == 0 ? static_cast<Worker&>(state) : *state.extra_workers[index - 1];
@@ -151,22 +142,6 @@ Worker* SetupQueue(std::uint32_t index) {
   if (index < state.worker_count) return &GetWorker(index);
   if (index == kUmdkControlQueueIndex) return state.control.get();
   return nullptr;
-}
-
-void CaptureUrmaLog(int level, char* message) { diagnostic_log.NativeLog(level, message); }
-
-void EnableLogging() {
-  const auto& api = state.api;
-  if (api.register_log == nullptr || api.unregister_log == nullptr ||
-      api.get_log_level == nullptr || api.set_log_level == nullptr) {
-    diagnostic_log.Append("native_log_capture=unavailable (optional APIs missing)\n");
-    return;
-  }
-  state.old_log_level = api.get_log_level();
-  const int result = api.register_log(CaptureUrmaLog);
-  state.log_registered = result == 0;
-  diagnostic_log.Append("native_log_capture_register=%d\n", result);
-  if (state.log_registered) api.set_log_level(URMA_VLOG_LEVEL_DEBUG);
 }
 
 void Stage(UmdkControlStatus& status, const char* name) {
@@ -231,12 +206,6 @@ bool Cleanup(UmdkControlStatus& status) {
     if (result != 0) return Fail(status, "urma_uninit", result);
     state.owns_init = false;
   }
-  if (state.log_registered) {
-    state.api.set_log_level(state.old_log_level);
-    const int result = state.api.unregister_log();
-    if (result != 0) return Fail(status, "urma_unregister_log_func", result);
-    state.log_registered = false;
-  }
   if (state.library != nullptr) dlclose(state.library);
   if (state.common_library != nullptr) dlclose(state.common_library);
   state = {};
@@ -272,10 +241,8 @@ bool LoadApi(const UmdkControlArgs& args, UmdkControlStatus& status) {
   Stage(status, "dlopen liburma (inside AICPU)");
   const auto resident = args.library[0] == '\0' ? ResidentUrmaPath() : std::string{};
   if (args.library[0] != '\0') {
-    diagnostic_log.Append("core_selection=explicit requested=%s\n", args.library);
     state.library = dlopen(args.library, RTLD_NOW | RTLD_GLOBAL);
   } else if (!resident.empty()) {
-    diagnostic_log.Append("core_selection=reuse_loaded path=%s\n", resident.c_str());
     state.library = dlopen(resident.c_str(), RTLD_NOW | RTLD_GLOBAL | RTLD_NOLOAD);
   } else {
     Dl_info info{};
@@ -289,7 +256,6 @@ bool LoadApi(const UmdkControlArgs& args, UmdkControlStatus& status) {
     auto core = bundled + "liburma.so.0";
     if (access(core.c_str(), R_OK) != 0) core = bundled + "liburma.so";
     if (!bundled.empty() && access(core.c_str(), R_OK) == 0) {
-      diagnostic_log.Append("core_selection=bundled no_resident_core=1 path=%s\n", core.c_str());
       auto common = bundled + "liburma_common.so.0";
       if (access(common.c_str(), R_OK) != 0) common = bundled + "liburma_common.so";
       if (access(common.c_str(), R_OK) == 0) {
@@ -299,7 +265,6 @@ bool LoadApi(const UmdkControlArgs& args, UmdkControlStatus& status) {
       }
       state.library = dlopen(core.c_str(), RTLD_NOW | RTLD_GLOBAL);
     } else {
-      diagnostic_log.Append("core_selection=loader_search no_resident_core=1\n");
       state.library = dlopen("liburma.so.0", RTLD_NOW | RTLD_GLOBAL);
       if (state.library == nullptr) state.library = dlopen("liburma.so", RTLD_NOW | RTLD_GLOBAL);
     }
@@ -318,102 +283,32 @@ bool LoadApi(const UmdkControlArgs& args, UmdkControlStatus& status) {
   state.api.import_jetty_ex =
       reinterpret_cast<ImportJettyEx>(dlsym(state.library, "urma_import_jetty_ex"));
   if (state.api.import_jetty_ex == nullptr) return Fail(status, "dlsym urma_import_jetty_ex");
-  Dl_info library_info{};
-  if (dladdr(reinterpret_cast<void*>(state.api.urma_init), &library_info) != 0 &&
-      library_info.dli_fname != nullptr) {
-    std::snprintf(status.detail, sizeof(status.detail), "%s", library_info.dli_fname);
-    std::snprintf(status.library, sizeof(status.library), "%s", library_info.dli_fname);
-    std::snprintf(state.library_path, sizeof(state.library_path), "%s", library_info.dli_fname);
-    diagnostic_log.Append("core_library=%s\n", library_info.dli_fname);
-    const std::string path = library_info.dli_fname;
-    const auto slash = path.find_last_of('/');
-  }
-  state.api.register_log = reinterpret_cast<decltype(state.api.register_log)>(
-      dlsym(state.library, "urma_register_log_func"));
-  state.api.unregister_log = reinterpret_cast<decltype(state.api.unregister_log)>(
-      dlsym(state.library, "urma_unregister_log_func"));
-  state.api.get_log_level = reinterpret_cast<decltype(state.api.get_log_level)>(
-      dlsym(state.library, "urma_log_get_level"));
-  state.api.set_log_level = reinterpret_cast<decltype(state.api.set_log_level)>(
-      dlsym(state.library, "urma_log_set_level"));
-  EnableLogging();
+
   return true;
 }
 
 bool CreateWorker(const UmdkControlArgs& args, UmdkControlStatus& status, Worker& worker) {
-  urma_jfc_cfg_t jfc_cfg{};
-  jfc_cfg.depth = 64;
-  // Data/control paths hold their queue's outer mutex across post + CQ wait;
-  // setup/teardown holds state_mutex exclusively. No provider lock is needed.
-  jfc_cfg.flag.bs.lock_free = 1;
-  Stage(status, "urma_create_jfc");
-  worker.jfc = state.api.urma_create_jfc(state.context, &jfc_cfg);
-  if (worker.jfc == nullptr) return Fail(status, "urma_create_jfc");
-  urma_jfr_cfg_t jfr_cfg{};
-  jfr_cfg.depth = 64;
-  jfr_cfg.trans_mode = URMA_TM_RM;
-  jfr_cfg.max_sge = 1;
-  jfr_cfg.jfc = worker.jfc;
-  jfr_cfg.token_value.token = args.token;
-  Stage(status, "urma_create_jfr");
-  worker.jfr = state.api.urma_create_jfr(state.context, &jfr_cfg);
-  if (worker.jfr == nullptr) return Fail(status, "urma_create_jfr");
-  urma_jetty_cfg_t jetty_cfg{};
-  jetty_cfg.flag.bs.share_jfr = URMA_SHARE_JFR;
-  jetty_cfg.jfs_cfg.depth = 8192;
-  jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
-  jetty_cfg.jfs_cfg.flag.bs.lock_free = 1;
-  jetty_cfg.jfs_cfg.priority = URMA_MAX_PRIORITY;
-  jetty_cfg.jfs_cfg.max_sge = 6U;
-  jetty_cfg.jfs_cfg.max_rsge = 1;
-  jetty_cfg.jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
-  jetty_cfg.jfs_cfg.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
-  jetty_cfg.jfs_cfg.jfc = worker.jfc;
-  jetty_cfg.shared.jfr = worker.jfr;
-  jetty_cfg.shared.jfc = worker.jfc;
-  Stage(status, "urma_create_jetty (normal UMDK)");
-  worker.jetty = state.api.urma_create_jetty(state.context, &jetty_cfg);
-  if (worker.jetty == nullptr) return Fail(status, "urma_create_jetty (normal UMDK)");
-  diagnostic_log.Append("normal_jetty_created id=%u depth=%u\n", worker.jetty->jetty_id.id,
-                        jetty_cfg.jfs_cfg.depth);
-  return true;
+  const auto* error =
+      kvaf::urma::CreateQueues(state.api, state.context, args.token, {64U, 64U, 6U, true},
+                               worker.jfc, worker.jfr, worker.jetty);
+  return error ? Fail(status, error) : true;
 }
 
 bool DescribeWorker(const UmdkControlArgs& args, std::uint32_t index, UmdkControlStatus& status) {
   auto* selected = SetupQueue(index);
   if (selected == nullptr) return Fail(status, "invalid worker index");
   auto& worker = *selected;
-  if (worker.jetty == nullptr)
-    return Fail(status, "builder has no Jetty; worker 0 owns submission");
+  if (worker.jetty == nullptr) return Fail(status, "worker Jetty is unavailable");
   if (worker.tp == 0 && state.shared_tp != 0) worker.tp = state.shared_tp;
   if (worker.tp == 0) {
-    TpQuery query{};
-    query.flag = 1;
-    query.trans_mode = URMA_TM_RM;
-    std::memcpy(query.local_eid, state.context->eid.raw, 16);
-    std::memcpy(query.peer_eid, state.peer_eid.data(), 16);
-    TpInfo info{};
-    std::uint32_t count = 1;
     Stage(status, "urma_get_tp_list");
-    const int result = state.api.get_tp_list(state.context, &query, &count, &info);
-    if (result != 0 || count == 0 || info.tp_handle == 0)
-      return Fail(status, "urma_get_tp_list", result);
-    worker.tp = info.tp_handle;
+    if (!kvaf::urma::QueryTp(state.api.get_tp_list, state.context, state.peer_eid.data(),
+                             &worker.tp))
+      return Fail(status, "urma_get_tp_list");
     state.shared_tp = worker.tp;
   }
   status.tp = worker.tp;
-  status.wr_builds = worker.read_queue.builds;
-  status.local_jetty_id = worker.jetty->jetty_id.id;
-  status.local_cq_id = worker.jfc->jfc_id.id;
-  status.local_jetty_address = reinterpret_cast<std::uint64_t>(worker.jetty);
-  status.local_cq_address = reinterpret_cast<std::uint64_t>(worker.jfc);
-  if (worker.target != nullptr) {
-    status.peer_jetty_id = worker.target->id.id;
-    status.target_address = reinterpret_cast<std::uint64_t>(worker.target);
-  }
-  status.eid_index = state.eid_index;
   std::memcpy(status.eid, state.context->eid.raw, 16);
-  std::snprintf(status.device, sizeof(status.device), "%s", state.device);
   status.key_bytes = sizeof(urma_jetty_id_t) + sizeof(urma_transport_mode_t);
   std::memcpy(status.key, &worker.jetty->jetty_id, sizeof(urma_jetty_id_t));
   const urma_transport_mode_t mode = URMA_TM_RM;
@@ -425,100 +320,28 @@ bool Prepare(const UmdkControlArgs& args, UmdkControlStatus& status) {
   if (state.session != 0) return Fail(status, "UMDK session already active");
   state.session = ++generation;
   status.session = state.session;
-  diagnostic_log.Append(
-      "selection requested_device='%s' name_bytes=%zu eid_index=%u workers=%u "
-      "expected_ub_type=%u\n",
-      args.device, std::strlen(args.device), args.eid_index, std::max(1U, args.worker_count),
-      static_cast<unsigned>(URMA_TRANSPORT_UB));
+
   if (!LoadApi(args, status)) return false;
   Stage(status, "urma_init");
   const int init_result = state.api.urma_init(nullptr);
   const int init_errno = errno;
-  status.init_result = init_result;
-  status.init_errno = init_errno;
-  diagnostic_log.Append("urma_init result=%d errno=%d\n", init_result, init_errno);
+
   errno = init_errno;
   if (init_result != 0 && init_result != EEXIST && init_result != -EEXIST)
     return Fail(status, "urma_init", init_result);
   state.owns_init = init_result == 0;
-  int device_count = 0;
-  Stage(status, "urma_get_device_list");
-  auto** devices = state.api.urma_get_device_list(&device_count);
-  const int device_errno = errno;
-  status.device_count = device_count;
-  diagnostic_log.Append("urma_get_device_list null=%d count=%d errno=%d\n", devices == nullptr,
-                        device_count, device_errno);
-  if (devices == nullptr) {
-    errno = device_errno;
-    Fail(status, "urma_get_device_list", -1,
-         "See AICPU diagnostics: sysfs visibility, provider logs and loaded modules");
-    diagnostic_log.LastError(status.detail, sizeof(status.detail));
-    return false;
-  }
-  std::uint32_t matching_names = 0, matching_ub_devices = 0;
-  int eid_error = 0;
-  for (int device_index = 0; device_index < device_count && state.context == nullptr;
-       ++device_index) {
-    auto* device = devices[device_index];
-    const bool name_match = args.device[0] == '\0' || std::strcmp(args.device, device->name) == 0;
-    const bool ub_match = device->type == URMA_TRANSPORT_UB;
-    diagnostic_log.Append("urma_device name=%s type=%u path=%s name_match=%u ub_match=%u\n",
-                          device->name, static_cast<unsigned>(device->type), device->path,
-                          name_match, ub_match);
-    if (name_match) ++matching_names;
-    if (!ub_match || !name_match) continue;
-    ++matching_ub_devices;
-    std::uint32_t eid_count = 0;
-    Stage(status, "urma_get_eid_list");
-    auto* eids = state.api.urma_get_eid_list(device, &eid_count);
-    if (eids == nullptr) eid_error = errno;
-    diagnostic_log.Append("urma_get_eid_list device=%s null=%d count=%u errno=%d\n", device->name,
-                          eids == nullptr, eid_count, errno);
-    if (eids == nullptr) continue;
-    for (std::uint32_t index = 0; index < eid_count; ++index) {
-      diagnostic_log.Append("urma_eid device=%s index=%u eid=", device->name,
-                            eids[index].eid_index);
-      for (auto byte : eids[index].eid.raw) diagnostic_log.Append("%02x", byte);
-      diagnostic_log.Append("\n");
-      if (args.eid_index != UINT32_MAX && eids[index].eid_index != args.eid_index) continue;
-      const std::uint8_t zero[16]{};
-      if (std::memcmp(eids[index].eid.raw, zero, 16) == 0) continue;
-      Stage(status, "urma_create_context");
-      state.context = state.api.urma_create_context(device, eids[index].eid_index);
-      if (state.context == nullptr) {
-        Fail(status, "urma_create_context");
-        break;
-      }
-      status.eid_index = eids[index].eid_index;
-      state.eid_index = status.eid_index;
-      std::snprintf(state.device, sizeof(state.device), "%s", device->name);
-      std::memcpy(status.eid, state.context->eid.raw, 16);
-      std::snprintf(status.device, sizeof(status.device), "%s", device->name);
-      break;
-    }
-    state.api.urma_free_eid_list(eids);
-    if (status.result != 0) break;
-  }
-  state.api.urma_free_device_list(devices);
-  if (state.context == nullptr) {
-    if (status.result != 0) return false;
-    char detail[256]{};
-    std::snprintf(detail, sizeof(detail),
-                  "requested_device='%s' name_bytes=%zu eid_index=%u expected_ub_type=%u "
-                  "name_matches=%u ub_matches=%u",
-                  args.device, std::strlen(args.device), args.eid_index,
-                  static_cast<unsigned>(URMA_TRANSPORT_UB), matching_names, matching_ub_devices);
-    if (matching_names == 0) {
-      errno = ENODEV;
-      return Fail(status, "requested UMDK device not found", -1, detail);
-    }
-    if (matching_ub_devices == 0) {
-      errno = EPROTONOSUPPORT;
-      return Fail(status, "selected device is not UB transport", -1, detail);
-    }
-    errno = eid_error != 0 ? eid_error : ENOENT;
-    return Fail(status, "no usable EID on selected UB device", -1, detail);
-  }
+  const bool enumerated = kvaf::urma::EnumerateEndpoints(
+      state.api, args.device, args.eid_index, [&](auto* device, const auto& eid) {
+        state.context = state.api.urma_create_context(device, eid.eid_index);
+        if (!state.context) {
+          Fail(status, "urma_create_context");
+          return true;
+        }
+        std::memcpy(status.eid, state.context->eid.raw, 16);
+        return true;
+      });
+  if (!enumerated) return Fail(status, "urma_get_device_list");
+  if (!state.context) return status.result ? false : Fail(status, "no usable UB EID inside AICPU");
   std::copy_n(args.route_eid, 16, state.peer_eid.begin());
   state.worker_count = args.worker_count;
   // Keep the control queue's creation order independent of the data workers.
@@ -539,23 +362,18 @@ bool Prepare(const UmdkControlArgs& args, UmdkControlStatus& status) {
   cfg.token_id = state.token;
   cfg.token_value.token = args.token;
   cfg.flag.value = MemRegFlags(true);
-  diagnostic_log.Append(
-      "local_hbm_register va=0x%llx bytes=%llu flags=0x%x non_pin=%u access=0x%x\n",
-      static_cast<unsigned long long>(cfg.va), static_cast<unsigned long long>(cfg.len),
-      cfg.flag.value, cfg.flag.bs.non_pin, cfg.flag.bs.access);
+
   Stage(status, "urma_register_seg (local HBM)");
   state.local = state.api.urma_register_seg(state.context, &cfg);
   if (state.local == nullptr) {
     Fail(status, "urma_register_seg (local HBM)");
-    diagnostic_log.LastError(status.detail, sizeof(status.detail));
+
     return false;
   }
   state.buffer = args.local_buffer;
   state.buffer_bytes = args.buffer_bytes;
-  state.bytes = args.bytes;
   if (state.control && !DescribeWorker(args, kUmdkControlQueueIndex, status)) return false;
   if (!DescribeWorker(args, 0, status)) return false;
-  if (state.log_registered) state.api.set_log_level(URMA_VLOG_LEVEL_ERR);
   return true;
 }
 
@@ -573,8 +391,8 @@ bool Connect(const UmdkControlArgs& args, UmdkControlStatus& status) {
                 "all Jettys must use the same peer TP and PSN");
   urma_seg_t segment{};
   std::memcpy(&segment, args.segment, sizeof(segment));
-  if (args.remote_address < segment.ubva.va || state.bytes > segment.len ||
-      args.remote_address - segment.ubva.va > segment.len - state.bytes)
+  if (args.remote_address < segment.ubva.va ||
+      args.remote_address - segment.ubva.va >= segment.len)
     return Fail(status, "remote range outside segment");
   urma_token_t token{};
   token.token = args.token;
@@ -586,23 +404,9 @@ bool Connect(const UmdkControlArgs& args, UmdkControlStatus& status) {
   if (state.remote == nullptr)
     state.remote = state.api.urma_import_seg(state.context, &segment, &token, 0, flag);
   if (state.remote == nullptr) return Fail(status, "urma_import_seg");
-  RemoteJettyEx remote{};
-  std::memcpy(&remote.jetty_id, args.peer_key, sizeof(remote.jetty_id));
-  std::memcpy(&remote.trans_mode, args.peer_key + sizeof(remote.jetty_id),
-              sizeof(remote.trans_mode));
-  remote.policy = URMA_JETTY_GRP_POLICY_RR;
-  remote.type = URMA_JETTY;
-  urma_import_jetty_flag_t jetty_flag{};
-  jetty_flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
-  remote.flag.value = jetty_flag.value;
-  remote.tp_type = 1;
-  ActiveTp active{};
-  active.tp_handle = worker.tp;
-  active.peer_tp_handle = args.peer_tp;
-  active.tx_psn = 1;
-  active.rx_psn = args.peer_psn;
   Stage(status, "urma_import_jetty_ex");
-  worker.target = state.api.import_jetty_ex(state.context, &remote, &token, &active);
+  worker.target = kvaf::urma::ImportJetty(state.api.import_jetty_ex, state.context, args.peer_key,
+                                          args.token, worker.tp, args.peer_tp, 1U, args.peer_psn);
   if (worker.target == nullptr) return Fail(status, "urma_import_jetty_ex");
   state.shared_peer_tp = args.peer_tp;
   state.shared_peer_psn = args.peer_psn;
@@ -616,72 +420,54 @@ bool PostBatch(Worker& worker, urma_jfs_wr_t* first, urma_jfs_wr_t* tail, std::u
   tail->next = nullptr;
   urma_jfs_wr_t* bad = nullptr;
   errno = 0;
-  ++status.post_calls;
   const int result = state.api.urma_post_jetty_send_wr(worker.jetty, first, &bad);
   tail->next = saved_next;
   if (result == 0) return true;
   worker.poisoned = true;
-  diagnostic_log.Append("post_failed first_wr=%u batch_wqes=%u result=%d errno=%d bad_wr=%p\n",
-                        first_index, count, result, errno, static_cast<void*>(bad));
+
   return Fail(status, "urma_post_jetty_send_wr", result);
 }
 
-bool WaitCompletion(Worker& worker, std::uint64_t expected_context, std::uint64_t start,
+bool WaitCompletion(Worker& worker, std::uint64_t context, std::uint64_t start,
                     std::uint32_t timeout_ms, UmdkControlStatus& status) {
-  const auto posted = status.last_post_ns;
   const auto deadline = start + static_cast<std::uint64_t>(timeout_ms) * 1000000;
-  bool success = false;
-  auto poll_time = posted;
-  while (poll_time < deadline) {
+  std::uint32_t polls = 0;
+  auto now = start;
+  while (now < deadline) {
     urma_cr_t completion{};
-    const int polled = state.api.urma_poll_jfc(worker.jfc, 1, &completion);
-    ++status.cq_poll_calls;
-    if (polled < 0) {
-      Fail(status, "urma_poll_jfc", polled);
+    const int count = state.api.urma_poll_jfc(worker.jfc, 1, &completion);
+    if (count < 0) {
+      Fail(status, "urma_poll_jfc", count);
       break;
     }
-    if (polled == 0) {
-      if (status.cq_poll_calls % 64U == 0U) poll_time = NowNs();
-      continue;
-    }
-    status.cq_status = completion.status;
-    status.cq_context = completion.user_ctx;
-    if (completion.status != URMA_CR_SUCCESS || completion.user_ctx != expected_context) {
+    if (count) {
+      status.cq_status = completion.status;
+      status.cq_context = completion.user_ctx;
+      if (completion.status == URMA_CR_SUCCESS && completion.user_ctx == context) return true;
       Fail(status, "READ/WRITE CQE status or user_ctx mismatch");
       break;
     }
-    success = true;
-    break;
+    if (++polls % 64U == 0U) now = NowNs();
   }
-  status.completion_ns = NowNs();
-  status.total_ns = status.completion_ns - status.first_post_ns;
-  status.cq_ns = status.completion_ns - posted;
-  if (!success) {
-    worker.poisoned = true;
-    if (status.result == 0) {
-      errno = ETIMEDOUT;
-      Fail(status, "waiting for CQE timed out", ETIMEDOUT);
-    }
+  worker.poisoned = true;
+  if (!status.result) {
+    errno = ETIMEDOUT;
+    Fail(status, "waiting for CQE timed out", ETIMEDOUT);
   }
-  return success;
+  return false;
 }
 
 template <typename RequestAt>
 bool SubmitRequests(Worker& worker, std::uint32_t count, std::uint32_t batch,
                     std::uint32_t timeout_ms, UmdkControlStatus& status, RequestAt request_at) {
-  status.read_wqes = count;
   Stage(status, "provider post and CQ wait");
   const auto start = NowNs();
-  status.first_post_ns = start;
   for (std::uint32_t first = 0; first < count; first += batch) {
     const auto end = std::min(first + batch, count);
     if (!PostBatch(worker, request_at(first), request_at(end - 1U), first, end - first, status)) {
-      status.post_ns = NowNs() - start;
       return false;
     }
   }
-  status.last_post_ns = NowNs();
-  status.post_ns = status.last_post_ns - start;
   return WaitCompletion(worker, request_at(count - 1U)->user_ctx, start, timeout_ms, status);
 }
 
@@ -786,11 +572,6 @@ bool TransferGather(Worker& worker, bool write, const UmdkTransfer* transfers, s
     if (!BuildTransfers(worker, write, transfers, count, index, offset, status)) return false;
     UmdkControlStatus submitted{};
     const bool success = SubmitQueue(worker, worker.wrs, 8, 1000, submitted);
-    status.post_ns += submitted.post_ns;
-    status.cq_ns += submitted.cq_ns;
-    status.read_wqes += submitted.read_wqes;
-    status.post_calls += submitted.post_calls;
-    status.cq_poll_calls += submitted.cq_poll_calls;
     if (!success) {
       status.cq_status = submitted.cq_status;
       status.cq_context = submitted.cq_context;
@@ -801,14 +582,12 @@ bool TransferGather(Worker& worker, bool write, const UmdkTransfer* transfers, s
   return true;
 }
 
-// The caller holds its data-worker lock when using the original shared queue.
-// A dedicated control queue has its own lock and never polls a data CQ.
-bool TransferControl(Worker& shared_worker, bool write, const UmdkTransfer* transfers,
-                     std::uint32_t count, UmdkControlStatus& status, std::uint32_t lane = 0U) {
-  if (!state.control) return TransferGather(shared_worker, write, transfers, count, status);
+// The control Jetty has its own lock and never polls a data CQ.
+bool TransferControl(bool write, const UmdkTransfer* transfers, std::uint32_t count,
+                     UmdkControlStatus& status) {
   auto* control = SetupQueue(kUmdkControlQueueIndex);
   if (!control) return Fail(status, "control queue is unavailable");
-  std::lock_guard<std::mutex> control_lock(control_mutexes[0]);
+  std::lock_guard<std::mutex> control_lock(control_mutex);
   return TransferGather(*control, write, transfers, count, status);
 }
 
@@ -819,7 +598,6 @@ void BeginGatherWave(GatherQueue& queue, std::uint32_t sgl_size) {
   EnsureSlots(queue.remote_sges, kGatherWaveWrs);
   EnsureSlots(queue.wrs, kGatherWaveWrs);
   queue.wr_count = 0U;
-  ++queue.builds;
 }
 
 // Resolve this request's fixed addresses and registration once, before batches.
@@ -905,24 +683,21 @@ void AppendGatherBatch(Worker& worker, const GatherBuildLayout& layout, std::uin
 }
 
 struct GatherPrefix {
-  Worker& worker;
   const GatherReadArgs& args;
   GatherReadStatus& gather;
   std::uint32_t worker_index;
   std::uint64_t ready_bytes = 0;
 };
 
-bool WaitBatchPrefix(GatherPrefix& prefix, const urma_jfs_wr_t& tail, UmdkControlStatus& submitted,
-                     std::uint64_t& ready_wait_ns) {
+bool WaitBatchPrefix(GatherPrefix& prefix, const urma_jfs_wr_t& tail,
+                     UmdkControlStatus& submitted) {
   const auto& args = prefix.args;
   const auto& source = *reinterpret_cast<const Sge*>(tail.rw.src.sge);
   const auto required = source.addr + source.len - args.remote_staging;
   if (required <= prefix.ready_bytes) return true;
   auto& gather = prefix.gather;
   gather.phase = 5;
-  const auto start = NowNs();
-  const auto scratch =
-      args.output + ((args.output_extent + 63U) & ~std::uint64_t{63U}) + prefix.worker_index * 64U;
+  const auto scratch = args.scratch + prefix.worker_index * 64U;
   const UmdkTransfer transfer{
       args.remote_descriptor + offsetof(kvaf::peer::GatherDescriptorHeader, ready_bytes), scratch,
       8};
@@ -932,7 +707,7 @@ bool WaitBatchPrefix(GatherPrefix& prefix, const urma_jfs_wr_t& tail, UmdkContro
     UmdkControlStatus query{};
     // The dedicated control Jetty can complete this query while data READs
     // remain outstanding; controls use their own WR storage.
-    if (!TransferControl(prefix.worker, false, &transfer, 1, query)) {
+    if (!TransferControl(false, &transfer, 1, query)) {
       errno = query.error_number;
       Fail(submitted, query.stage, query.result);
       gather.result = 16;
@@ -951,9 +726,6 @@ bool WaitBatchPrefix(GatherPrefix& prefix, const urma_jfs_wr_t& tail, UmdkContro
       break;
     }
   }
-  const auto elapsed = NowNs() - start;
-  gather.ready_wait_ns += elapsed;
-  ready_wait_ns += elapsed;
   if (!success) {
     gather.ack_seen = prefix.ready_bytes;
     if (gather.result == 0) {
@@ -968,80 +740,34 @@ bool WaitBatchPrefix(GatherPrefix& prefix, const urma_jfs_wr_t& tail, UmdkContro
 
 bool ScatterQueue(Worker& worker, const GatherReadArgs& args, GatherReadStatus& status,
                   std::uint32_t first, std::uint32_t last, std::uint64_t remote_offset,
-                  UmdkControlStatus& timeline, std::uint32_t timeout_ms,
+                  UmdkControlStatus& error, std::uint32_t timeout_ms,
                   std::uint32_t worker_index = 0) {
   if (first == last) return true;
-  const auto snapshot_start = NowNs();
   const auto snapshot_first = first;
   SnapshotGatherTargets(worker.read_queue, args, first, last);
   const GatherBuildLayout layout(worker, args);
-  const auto batch_wrs = args.sq_batch_wqes;
-  bool first_wave = true;
-  GatherPrefix prefix{worker, args, status, worker_index};
-  const bool pipeline = args.pipeline_chunk_bytes != 0;
+  GatherPrefix prefix{args, status, worker_index};
   std::uint32_t span_offset = 0;
   while (first < last) {
-    const auto source_begin = remote_offset;
-    auto plan_start = first_wave ? snapshot_start : NowNs();
-    first_wave = false;
-    if (timeline.build_begin_ns == 0) timeline.build_begin_ns = plan_start;
     auto& queue = worker.read_queue;
     BeginGatherWave(queue, layout.sgl_size);
-    ++timeline.wr_builds;
-    std::uint32_t local_index = 0U;
-    UmdkControlStatus submitted{};
-    Stage(submitted, "provider post and CQ wait");
-    std::uint64_t submit_start = 0U, build_ns = 0U, last_build_ns = 0U;
-    bool success = true;
+    std::uint32_t local_index = 0;
+    const auto start = NowNs();  // Deadline only; no per-stage profiling.
     do {
       const auto batch_first = queue.wr_count;
       AppendGatherBatch(worker, layout, first, last, span_offset, remote_offset, snapshot_first,
-                        batch_wrs, local_index);
-      const auto build_end = NowNs();
-      last_build_ns = build_end;
-      build_ns += build_end - plan_start;
-      submitted.read_wqes = queue.wr_count;
-      if (submit_start == 0U) submit_start = build_end;
+                        args.sq_batch_wqes, local_index);
       auto* tail = &queue.wrs[queue.wr_count - 1U];
-      std::uint64_t ready_wait_ns = 0U;
-      if (pipeline && !WaitBatchPrefix(prefix, *tail, submitted, ready_wait_ns)) {
+      if ((args.pipeline_chunk_bytes && !WaitBatchPrefix(prefix, *tail, error)) ||
+          !PostBatch(worker, &queue.wrs[batch_first], tail, batch_first,
+                     queue.wr_count - batch_first, error)) {
         worker.poisoned = true;
-        submitted.post_ns += NowNs() - build_end - ready_wait_ns;
-        success = false;
-        break;
+        return false;
       }
-      if (submitted.first_post_ns == 0U) submitted.first_post_ns = NowNs();
-      success = PostBatch(worker, &queue.wrs[batch_first], tail, batch_first,
-                          queue.wr_count - batch_first, submitted);
-      const auto post_end = NowNs();
-      submitted.post_ns += post_end - build_end - ready_wait_ns;
-      submitted.last_post_ns = post_end;
-      if (!success) break;
-      plan_start = post_end;
     } while (first < last && queue.wr_count < kGatherWaveWrs);
-    // Only the last WR of this wave requests completion. Retain all workspace
-    // slots until that CQE arrives; a later batch never overwrites an earlier one.
-    if (success)
-      success = WaitCompletion(worker, queue.wrs[queue.wr_count - 1U].user_ctx, submit_start,
-                               timeout_ms, submitted);
-    timeline.build_end_ns = last_build_ns;
-    status.scatter_plan_ns += build_ns;
-    status.read_wqes += submitted.read_wqes;
-    status.scatter_post_ns += submitted.post_ns;
-    status.scatter_cq_ns += submitted.cq_ns;
-    status.provider_post_calls += submitted.post_calls;
-    status.cq_poll_calls += submitted.cq_poll_calls;
-    if (timeline.first_post_ns == 0) timeline.first_post_ns = submitted.first_post_ns;
-    timeline.last_post_ns = submitted.last_post_ns;
-    timeline.completion_ns = submitted.completion_ns;
-    timeline.cq_status = submitted.cq_status;
-    timeline.cq_context = submitted.cq_context;
-    if (success)
-      status.read_bytes += remote_offset - source_begin;
-    else {
-      errno = submitted.error_number;
-      return Fail(timeline, submitted.stage, submitted.result);
-    }
+    // Retain every WR/SGL slot until the final ordered CQE for this wave.
+    if (!WaitCompletion(worker, queue.wrs[queue.wr_count - 1U].user_ctx, start, timeout_ms, error))
+      return false;
   }
   return true;
 }
@@ -1064,21 +790,14 @@ extern "C" std::uint32_t KvafAicpuUmdkGatherMemory(const GatherReadArgs* args,
 extern "C" std::uint32_t KvafAicpuUmdkGatherTransfer(const GatherReadArgs* args, bool write,
                                                      const UmdkTransfer* transfers,
                                                      std::uint32_t count,
-                                                     std::uint32_t worker_index,
-                                                     std::uint64_t* post_ns, std::uint64_t* cq_ns) {
+                                                     std::uint32_t worker_index) {
   std::shared_lock<std::shared_mutex> lock(state_mutex);
   if (args == nullptr || args->umdk_session != state.session ||
       args->umdk_owner_pid != static_cast<std::uint64_t>(getpid()) ||
       worker_index >= state.worker_count)
     return 16;
-  if (worker_index >= state.worker_count) return 16;
-  std::unique_lock<std::mutex> worker_lock(worker_mutexes[worker_index], std::defer_lock);
-  if (!state.control) worker_lock.lock();
   UmdkControlStatus status{};
-  const bool success =
-      TransferControl(GetWorker(worker_index), write, transfers, count, status, 0U);
-  if (post_ns != nullptr) *post_ns = status.post_ns;
-  if (cq_ns != nullptr) *cq_ns = status.cq_ns;
+  const bool success = TransferControl(write, transfers, count, status);
   if (!success)
     std::fprintf(
         stderr,
@@ -1126,11 +845,10 @@ extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkCon
   status.magic = kUmdkControlMagic;
   status.owner_pid = getpid();
   status.session = state.session;
-  diagnostic_log.Clear();
+
   errno = 0;
   if (args->op == UmdkControlOp::kPrepareGather) {
-    if (!args->worker_count || args->worker_count > 8 || !args->blocks ||
-        args->blocks > kGatherMaxSpans || !args->bytes || !args->local_buffer ||
+    if (!args->worker_count || args->worker_count > 8 || !args->local_buffer ||
         !args->buffer_bytes || args->local_buffer > UINT64_MAX - args->buffer_bytes ||
         args->device[63] || args->library[255])
       Fail(status, "invalid UMDK session arguments");
@@ -1156,8 +874,7 @@ extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkCon
         RegisterGatherBuffer(*args, status);
         break;
       case UmdkControlOp::kWriteGather:
-        TransferControl(GetWorker(0), true,
-                        reinterpret_cast<const UmdkTransfer*>(args->transfer_spans),
+        TransferControl(true, reinterpret_cast<const UmdkTransfer*>(args->transfer_spans),
                         args->transfer_count, status);
         break;
       case UmdkControlOp::kDestroy:
@@ -1167,7 +884,7 @@ extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkCon
         Fail(status, "unknown UMDK operation");
         break;
     }
-  diagnostic_log.Publish(*args, status);
+
   if (!status.result) std::snprintf(status.stage, sizeof(status.stage), "OK");
   return 0;
 }

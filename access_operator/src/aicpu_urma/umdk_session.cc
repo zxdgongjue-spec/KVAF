@@ -25,13 +25,6 @@ Status UmdkSession::Run(UmdkControlOp op, UmdkControlStatus& status, aclrtStream
   if (launch != 0 || sync != ACL_SUCCESS || copy != ACL_SUCCESS ||
       status.magic != kUmdkControlMagic || status.result != 0) {
     if (copy == ACL_SUCCESS && status.magic == kUmdkControlMagic) {
-      const auto bytes = std::min(status.diagnostic_bytes, args_.diagnostic_capacity);
-      if (bytes != 0) {
-        std::vector<char> diagnostics(bytes);
-        if (aclrtMemcpy(diagnostics.data(), bytes, reinterpret_cast<void*>(args_.diagnostics),
-                        bytes, ACL_MEMCPY_DEVICE_TO_HOST) == ACL_SUCCESS)
-          std::fwrite(diagnostics.data(), 1, bytes, stderr);
-      }
       std::fprintf(stderr,
                    "GATHER_UMDK_SETUP_ERROR op=%u workers=%u host_device='%s' "
                    "result=%d errno=%d stage=%s detail=%s\n",
@@ -51,7 +44,6 @@ Status UmdkSession::Shutdown() {
     auto result = Run(UmdkControlOp::kDestroy, status);
     if (!result.ok()) return result;
   }
-  if (args_.diagnostics != 0) (void)aclrtFree(reinterpret_cast<void*>(args_.diagnostics));
   if (args_.status != 0) (void)aclrtFree(reinterpret_cast<void*>(args_.status));
   if (transfers_ != nullptr) (void)aclrtFree(transfers_);
   if (stream_ != nullptr) (void)aclrtDestroyStream(stream_);
@@ -66,8 +58,7 @@ Status UmdkSession::Shutdown() {
 
 Status UmdkSession::Ensure(peer::PeerLink& link, std::uint64_t region_base,
                            const std::string& device, std::uint32_t eid_index, void* output,
-                           std::size_t output_bytes, std::uint32_t payload_bytes,
-                           std::uint32_t spans, std::uint32_t workers) {
+                           std::size_t output_bytes, std::uint32_t workers) {
   if (connected_ && args_.remote_address == region_base && args_.worker_count == workers &&
       device == args_.device && eid_index == args_.eid_index) {
     const auto address = reinterpret_cast<std::uint64_t>(output);
@@ -92,24 +83,14 @@ Status UmdkSession::Ensure(peer::PeerLink& link, std::uint64_t region_base,
   if (aclrtCreateStream(&stream_) != ACL_SUCCESS)
     return Status::Internal("failed to create GatherRead UMDK setup stream");
   void* status_buffer = nullptr;
-  void* diagnostic_buffer = nullptr;
   if (aclrtMalloc(&status_buffer, sizeof(UmdkControlStatus), ACL_MEM_MALLOC_HUGE_FIRST) !=
       ACL_SUCCESS) {
     (void)Shutdown();
     return Status::Internal("failed to allocate GatherRead UMDK status");
   }
   args_.status = reinterpret_cast<std::uint64_t>(status_buffer);
-  if (aclrtMalloc(&diagnostic_buffer, kUmdkControlDiagnosticBytes, ACL_MEM_MALLOC_HUGE_FIRST) !=
-      ACL_SUCCESS) {
-    (void)Shutdown();
-    return Status::Internal("failed to allocate GatherRead UMDK diagnostics");
-  }
-  args_.diagnostics = reinterpret_cast<std::uint64_t>(diagnostic_buffer);
-  args_.diagnostic_capacity = kUmdkControlDiagnosticBytes;
   args_.local_buffer = reinterpret_cast<std::uint64_t>(output);
   args_.buffer_bytes = output_bytes;
-  args_.bytes = payload_bytes;
-  args_.blocks = spans;
   args_.worker_count = workers;
   args_.eid_index = eid_index;
   std::snprintf(args_.device, sizeof(args_.device), "%s", device.c_str());
@@ -144,26 +125,10 @@ Status UmdkSession::Ensure(peer::PeerLink& link, std::uint64_t region_base,
     UmdkControlStatus connected{};
     result = Run(UmdkControlOp::kConnect, connected);
     if (!result.ok()) return result;
-    std::fprintf(stderr,
-                 "GATHER_UMDK_CHANNEL %s=%u local_jetty_id=%u peer_jetty_id=%u cq_id=%u "
-                 "jetty=0x%llx cq=0x%llx target=0x%llx local_tp=0x%llx peer_tp=0x%llx\n",
-                 control ? "control_slot" : "worker", index, connected.local_jetty_id,
-                 connected.peer_jetty_id, connected.local_cq_id,
-                 static_cast<unsigned long long>(connected.local_jetty_address),
-                 static_cast<unsigned long long>(connected.local_cq_address),
-                 static_cast<unsigned long long>(connected.target_address),
-                 static_cast<unsigned long long>(descriptor.tp),
-                 static_cast<unsigned long long>(args_.peer_tp));
   }
   args_.worker_index = 0;
   connected_ = true;
   registered_buffers_.push_back({reinterpret_cast<std::uint64_t>(output), output_bytes});
-  std::fprintf(stderr,
-               "GATHER_UMDK_READY workers=%u control_jettys=%u independent_sq_cq=1 "
-               "control_backend=umdk data_backend=umdk "
-               "device=%s eid_index=%u library=%s pid=%llu tp_mode=shared\n",
-               workers, 1U, prepared.device, prepared.eid_index, prepared.library,
-               static_cast<unsigned long long>(prepared.owner_pid));
   return Status::OK();
 }
 

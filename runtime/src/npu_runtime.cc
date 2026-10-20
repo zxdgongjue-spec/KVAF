@@ -25,6 +25,7 @@
 #include "access_operator.h"
 #include "peer_link.h"
 #include "meta_manager.h"
+#include "gather_workspace.h"
 #if defined(KVAF_ENABLE_AICPU_URMA)
 #include "aicpu_gather_access_operator.h"
 #endif
@@ -36,8 +37,8 @@ Status Internal(std::string message) { return Status::Internal(std::move(message
 
 class PeerDdrAllocator final : public DdrMemoryAllocator {
  public:
-  explicit PeerDdrAllocator(std::shared_ptr<peer::PeerLink> link)
-      : link_(std::move(link)) {}
+  explicit PeerDdrAllocator(std::shared_ptr<peer::PeerLink> link, std::uint64_t workspace = 0U)
+      : link_(std::move(link)), workspace_(workspace) {}
 
   void SetCandidate(std::uint32_t candidate_id) { candidate_id_ = candidate_id; }
   bool has_allocation() const { return allocated_.base != 0U; }
@@ -49,9 +50,14 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
       return Status::InvalidArgument("invalid peer DDR allocation request");
     }
     if (allocated_.base != 0U) return Status::InvalidState("peer DDR is already allocated");
-    Status status = link_->AllocateRegion(request.ddr_bytes, request.slot_size, candidate_id_, &allocated_);
+    if (workspace_ > UINT64_MAX - (request.slot_size - 1U))
+      return Status::InvalidArgument("gather workspace size overflow");
+    const auto reserved = (workspace_ + request.slot_size - 1U) / request.slot_size * request.slot_size;
+    if (request.ddr_bytes > UINT64_MAX - reserved)
+      return Status::InvalidArgument("DDR allocation size overflow");
+    Status status = link_->AllocateRegion(request.ddr_bytes + reserved, request.slot_size, candidate_id_, &allocated_);
     if (!status.ok()) return status;
-    *region = RemoteRegionDesc{allocated_.base, allocated_.length, request.slot_size, DeviceKind::kCpu};
+    *region = RemoteRegionDesc{allocated_.base, request.ddr_bytes, request.slot_size, DeviceKind::kCpu};
     return Status::OK();
   }
 
@@ -66,6 +72,7 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
 
  private:
   std::shared_ptr<peer::PeerLink> link_;
+  std::uint64_t workspace_{0U};
   std::uint32_t candidate_id_{0U};
   peer::PeerRegion allocated_{};
 };
@@ -383,7 +390,7 @@ struct NpuRuntime::Impl {
     if (!options.aicpu_urma_kernel_json_path.empty())
       access_operator = std::make_unique<UmdkAccessOperator>(UmdkAccessOperatorConfig{
           options.aicpu_urma_kernel_json_path, options.urma_device, options.urma_eid_index,
-          options.npu_core_count, peer_link});
+          options.npu_core_count, peer_link, options.batch_get_token_bytes});
     else
 #endif
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
@@ -425,6 +432,10 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
   if (!impl_->options.aicpu_urma_kernel_json_path.empty())
     throw std::invalid_argument("AICPU UMDK support was not built");
 #endif
+  if (!impl_->options.aicpu_urma_kernel_json_path.empty() &&
+      (impl_->options.npu_core_count > 8U ||
+       GatherStagingBytes(impl_->options.batch_get_token_bytes) > UINT32_MAX))
+    throw std::invalid_argument("UMDK supports 1..8 workers and a gather payload fitting uint32");
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS) {
     throw std::runtime_error("aclrtSetDevice failed for NpuRuntime");
   }
@@ -448,7 +459,9 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
   }
   impl_->peer_link = std::make_shared<peer::PeerLink>(target.address);
   impl_->config.peer_link = impl_->peer_link;
-  auto allocator = std::make_unique<PeerDdrAllocator>(impl_->peer_link);
+  auto allocator = std::make_unique<PeerDdrAllocator>(impl_->peer_link,
+      impl_->options.aicpu_urma_kernel_json_path.empty() ? 0U :
+          GatherRemoteWorkspaceBytes(impl_->options.batch_get_token_bytes));
   impl_->peer_allocator = allocator.get();
   impl_->allocator = std::move(allocator);
   impl_->runtime_core.reset();
@@ -555,9 +568,6 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   return last;
 }
 
-Status NpuRuntime::GatherRead(const CpuGatherReadRequest& request) {
-  return impl_->access_operator->ExecuteGatherRead(request);
-}
 
 RuntimeCore& NpuRuntime::core() {
   if (impl_->runtime_core == nullptr) {

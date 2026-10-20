@@ -5,7 +5,6 @@
 namespace kvaf::aicpu_urma {
 
 constexpr std::uint64_t kUmdkControlMagic = 0x4b564146554d444bULL;
-constexpr std::uint32_t kUmdkControlDiagnosticBytes = 32768;
 // Setup slot for the control queue; data worker indices remain 0..7.
 constexpr std::uint32_t kUmdkControlQueueIndex = 8;
 enum class UmdkControlOp : std::uint32_t {
@@ -19,8 +18,6 @@ enum class UmdkControlOp : std::uint32_t {
 
 struct UmdkControlArgs {
   std::uint64_t status;
-  std::uint64_t diagnostics;
-  std::uint32_t diagnostic_capacity;
   std::uint32_t worker_count;
   std::uint64_t session;
   std::uint64_t owner_pid;
@@ -30,8 +27,6 @@ struct UmdkControlArgs {
   std::uint64_t peer_tp;
   std::uint32_t peer_psn;
   std::uint32_t token;
-  std::uint32_t bytes;
-  std::uint32_t blocks;
   std::uint32_t eid_index;
   std::uint32_t segment_bytes;
   std::uint32_t key_bytes;
@@ -47,45 +42,11 @@ struct UmdkControlArgs {
 };
 
 struct alignas(64) UmdkControlStatus {
-  std::uint64_t magic;
-  std::uint64_t session;
-  std::uint64_t owner_pid;
-  std::uint64_t tp;
-  std::uint64_t post_ns;
-  std::uint64_t cq_ns;
-  std::uint64_t total_ns;
-  std::uint64_t cq_context;
-  std::uint32_t read_wqes;
-  std::uint32_t post_calls;
-  std::int32_t result;
-  std::int32_t error_number;
-  std::int32_t cq_status;
+  std::uint64_t magic, session, owner_pid, tp, cq_context;
+  std::int32_t result, error_number, cq_status;
   std::uint32_t key_bytes;
-  std::uint32_t eid_index;
-  std::int32_t init_result;
-  std::int32_t init_errno;
-  std::int32_t device_count;
-  std::uint32_t diagnostic_bytes;
-  std::uint32_t diagnostic_truncated;
-  char library[256];
-  std::uint8_t eid[16];
-  std::uint8_t key[32];
-  char device[64];
-  char stage[64];
-  char detail[256];
-  std::uint64_t cq_poll_calls;
-  std::uint64_t local_jetty_address;
-  std::uint64_t local_cq_address;
-  std::uint64_t target_address;
-  std::uint32_t local_jetty_id;
-  std::uint32_t local_cq_id;
-  std::uint32_t peer_jetty_id;
-  std::uint64_t build_begin_ns;
-  std::uint64_t first_post_ns;
-  std::uint64_t last_post_ns;
-  std::uint64_t completion_ns;
-  std::uint64_t wr_builds;  // Fresh WR chain builds, retaining ABI layout.
-  std::uint64_t build_end_ns;
+  std::uint8_t eid[16], key[32];
+  char stage[64], detail[256];
 };
 
 }  // namespace kvaf::aicpu_urma

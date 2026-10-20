@@ -1,7 +1,5 @@
 #pragma once
 
-#include <time.h>
-
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -47,25 +45,12 @@ inline void GatherSpinPause() {
 
 enum class GatherWaitMode { kActive, kAdaptive, kPassive };
 
-struct alignas(64) GatherCopyWorkerProfile {
-  std::uint64_t bytes{0U};
-  std::uint64_t begin_ns{0U}, end_ns{0U};
-  std::uint64_t thread_cpu_ns{0U};
-  bool thread_cpu_available{false};
-  int start_cpu{-1}, end_cpu{-1};
-};
-
-struct GatherCopyProfile {
-  std::uint64_t begin_ns{0U}, end_ns{0U}, join_wait_ns{0U};
-  std::size_t workers{0U};
-};
-
 class CpuGatherTeam {
  public:
   CpuGatherTeam(void* memory, std::uint64_t base, std::size_t max_threads,
                 std::size_t min_bytes_per_thread = 256U * 1024U,
                 GatherWaitMode wait_mode = GatherWaitMode::kPassive, bool bind_cores = false,
-                bool profile_copy = false, std::size_t cpu_offset = 0U)
+                std::size_t cpu_offset = 0U)
       : memory_(static_cast<std::uint8_t*>(memory)),
         base_(base),
         cpu_ids_(bind_cores ? AllowedCpus(cpu_offset) : std::vector<int>{}),
@@ -73,8 +58,7 @@ class CpuGatherTeam {
             std::min(std::max<std::size_t>(1U, max_threads),
                      cpu_ids_.empty() ? std::max<std::size_t>(1U, max_threads) : cpu_ids_.size())),
         min_bytes_per_thread_(std::max<std::size_t>(1U, min_bytes_per_thread)),
-        wait_mode_(wait_mode),
-        copy_profiles_(profile_copy ? new GatherCopyWorkerProfile[max_threads_] : nullptr) {}
+        wait_mode_(wait_mode) {}
 
   ~CpuGatherTeam() {
     {
@@ -88,13 +72,6 @@ class CpuGatherTeam {
   CpuGatherTeam(const CpuGatherTeam&) = delete;
   CpuGatherTeam& operator=(const CpuGatherTeam&) = delete;
 
-  std::size_t max_threads() const { return max_threads_; }
-  std::uint64_t total_bytes() const { return total_bytes_; }
-  const GatherCopyProfile& copy_profile() const { return copy_profile_; }
-  const GatherCopyWorkerProfile& copy_worker_profile(std::size_t worker) const {
-    return copy_profiles_[worker];
-  }
-
   std::size_t PrepareDirect(std::uint64_t region_bytes, std::uint64_t descriptor_address,
                             std::uint64_t sequence, std::size_t max_spans);
 
@@ -102,29 +79,18 @@ class CpuGatherTeam {
 #if defined(__linux__)
     const long tid = syscall(SYS_gettid);
     if (worker >= cpu_ids_.size()) {
-      std::fprintf(stderr, "[KVAF_CPU] GATHER_THREAD worker=%zu tid=%ld cpu=%d pinned=0\n", worker,
-                   tid, sched_getcpu());
       return;
     }
     cpu_set_t mask{};
     CPU_ZERO(&mask);
     CPU_SET(cpu_ids_[worker], &mask);
     const int result = sched_setaffinity(0, sizeof(mask), &mask);
-    std::fprintf(stderr, "[KVAF_CPU] GATHER_THREAD worker=%zu tid=%ld cpu=%d pinned=%d error=%d\n",
-                 worker, tid, cpu_ids_[worker], result == 0, result == 0 ? 0 : errno);
+    if (result)
+      std::fprintf(stderr, "[KVAF_CPU] gather affinity failed tid=%ld cpu=%d errno=%d\n", tid,
+                   cpu_ids_[worker], errno);
 #else
     (void)worker;
 #endif
-  }
-
-  std::size_t Prepare(std::uint64_t staging, const std::vector<GatherSpan>& spans,
-                      std::uint32_t total_bytes) {
-    pipeline_ready_ = nullptr;
-    offsets_.resize(spans.size() + 1U);
-    offsets_[0U] = 0U;
-    for (std::size_t index = 0U; index < spans.size(); ++index)
-      offsets_[index + 1U] = offsets_[index] + spans[index].length;
-    return Publish(staging, spans, total_bytes);
   }
 
   void Copy();
@@ -176,7 +142,6 @@ class CpuGatherTeam {
   std::uint64_t CopyRange(std::uint64_t offset, std::uint64_t end) const;
 
   std::uint64_t ProcessSource(std::size_t worker);
-  void RunSource(std::size_t worker);
 
   void RunHelper(std::size_t worker);
 
@@ -186,8 +151,6 @@ class CpuGatherTeam {
   std::size_t max_threads_;
   std::size_t min_bytes_per_thread_;
   GatherWaitMode wait_mode_;
-  std::unique_ptr<GatherCopyWorkerProfile[]> copy_profiles_;
-  GatherCopyProfile copy_profile_{};
   std::vector<std::thread> helpers_;
   std::mutex mutex_;
   std::condition_variable ready_;

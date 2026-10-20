@@ -17,7 +17,7 @@ add_library(kvaf_aicpu_gather_host STATIC host.cc umdk_session.cc access_operato
 target_include_directories(kvaf_aicpu_gather_host PRIVATE
   "${CMAKE_SOURCE_DIR}/access_operator/src" "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include"
   "${CMAKE_SOURCE_DIR}/runtime/include" "${ASCEND_CANN_PACKAGE_PATH}/include")
-target_link_libraries(kvaf_aicpu_gather_host PUBLIC kvaf_access_operator PRIVATE kvaf_meta_manager kvaf_peer_link kvaf_gather_host_plan ascendcl)
+target_link_libraries(kvaf_aicpu_gather_host PUBLIC kvaf_access_operator PRIVATE kvaf_meta_manager kvaf_peer_link ascendcl)
 target_link_directories(kvaf_aicpu_gather_host PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/lib64")
 set(kernel_dir "${CMAKE_CURRENT_BINARY_DIR}/aicpu_kernels_device")
 set(kernel_so "${kernel_dir}/libkvaf_aicpu_urma.so")
@@ -40,13 +40,12 @@ add_custom_command(OUTPUT "${kernel_so}"
     -ldl -pthread "-Wl,-rpath,$ORIGIN" -Wl,-z,defs -o "${kernel_so}"
   COMMAND "${CMAKE_COMMAND}" "-DUMDK_RUNTIME_DIR=${KVAF_AICPU_UMDK_RUNTIME_DIR}" "-DOUTPUT_DIR=${kernel_dir}/umdk_runtime"
     -P "${CMAKE_CURRENT_SOURCE_DIR}/bundle_umdk.cmake"
-  DEPENDS kernel.cc umdk_transport.cc gather_read.h umdk_gather.h umdk_control.h umdk_abi.h umdk_diagnostics.h gather_cache.h
+  DEPENDS kernel.cc umdk_transport.cc gather_read.h umdk_gather.h umdk_control.h "${CMAKE_SOURCE_DIR}/common/include/urma_transport.h" gather_cache.h
     bundle_umdk.cmake ${umdk_runtime_files}
     "${CMAKE_SOURCE_DIR}/runtime/include/cpu_gather.h"
     "${CMAKE_SOURCE_DIR}/common/include/gather_span.h"
     "${CMAKE_SOURCE_DIR}/access_operator/include/gather_output.h"
-    "${CMAKE_SOURCE_DIR}/access_operator/include/gather_read_profile.h"
-    "${CMAKE_SOURCE_DIR}/access_operator/include/gather_read_storage.h"
+    "${CMAKE_SOURCE_DIR}/common/include/gather_workspace.h"
     "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include/batch_get_abi.h"
   VERBATIM)
 add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/kvaf-aicpu-urma.tar.gz"

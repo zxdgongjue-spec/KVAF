@@ -10,7 +10,7 @@ namespace {
 std::mutex kernel_mutex;
 aclrtBinHandle binary = nullptr;
 aclrtFuncHandle gather_function = nullptr, scatter_function = nullptr;
-aclrtFuncHandle control_function = nullptr, umdk_get_function = nullptr;
+aclrtFuncHandle control_function = nullptr;
 int32_t Launch(aclrtFuncHandle function, void* arguments, std::size_t bytes, aclrtStream stream,
                std::uint32_t blocks = 1U) {
   if (function == nullptr || arguments == nullptr || stream == nullptr) return -1;
@@ -73,22 +73,13 @@ int32_t LaunchUmdkControl(const UmdkControlArgs* arguments, aclrtStream stream) 
   return Launch(control_function, const_cast<UmdkControlArgs*>(arguments), sizeof(*arguments),
                 stream);
 }
-int32_t LaunchUmdkGet(const UmdkBatchGetArgs* arguments, aclrtStream stream) {
-  if (arguments == nullptr) return -1;
-  {
-    std::lock_guard<std::mutex> lock(kernel_mutex);
-    if (binary == nullptr) return -1;
-    if (umdk_get_function == nullptr &&
-        aclrtBinaryGetFunction(binary, "KvafAicpuUmdkBatchGet", &umdk_get_function) != ACL_SUCCESS)
-      return -1;
-  }
-  return Launch(umdk_get_function, const_cast<UmdkBatchGetArgs*>(arguments), sizeof(*arguments),
-                stream);
-}
-int32_t LaunchGatherRead(const GatherReadArgs* args, aclrtStream stream) {
-  if (Launch(gather_function, const_cast<GatherReadArgs*>(args), sizeof(*args), stream)) return -1;
-  return args->worker_count <= 1U ? 0
-                                  : Launch(scatter_function, const_cast<GatherReadArgs*>(args),
-                                           sizeof(*args), stream, args->worker_count);
+int32_t LaunchUmdkGet(const UmdkBatchGetArgs* args, aclrtStream stream) {
+  if (!args) return -1;
+  if (Launch(gather_function, const_cast<UmdkBatchGetArgs*>(args), sizeof(*args), stream))
+    return -1;
+  return args->gather.worker_count <= 1U
+             ? 0
+             : Launch(scatter_function, const_cast<UmdkBatchGetArgs*>(args), sizeof(*args), stream,
+                      args->gather.worker_count);
 }
 }  // namespace kvaf::aicpu_urma

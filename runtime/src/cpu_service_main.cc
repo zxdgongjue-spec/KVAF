@@ -11,11 +11,10 @@ namespace {
 
 void PrintUsage(const char* program) {
   std::fprintf(stderr,
-               "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] [--gather-threads N] [--gather-mode adaptive|active|passive] [--gather-affinity on|off] [--gather-notify-profile]\n"
+               "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] [--gather-threads N] [--gather-mode adaptive|active|passive] [--gather-affinity on|off]\n"
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
                "candidates are discovered automatically. Gather threads default to auto (up to 32), "
                "mode to adaptive (one polling coordinator, parked helpers), affinity to on. "
-               "With --gather-notify-profile, notify and per-thread copy summaries print when a client closes. "
                "The service requires only liburma and /dev/uburma.\n",
                program);
 }
@@ -89,8 +88,7 @@ int main(int argc, char** argv) {
       cpu_options.gather_mode = value == "adaptive" ? kvaf::CpuGatherMode::kAdaptive
           : value == "active" ? kvaf::CpuGatherMode::kActive
                               : kvaf::CpuGatherMode::kPassive;
-    } else if (argument == "--gather-notify-profile") {
-      cpu_options.gather_notify_profile = true;
+
     } else {
       PrintUsage(argv[0]);
       return 2;

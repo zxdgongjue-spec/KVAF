@@ -90,7 +90,7 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   target_compile_features(kvaf_cpu_service PRIVATE cxx_std_17)
 endif()
 
-if(KVAF_BUILD_REMOTE_CPU_SERVICE OR BUILD_TESTING)
+if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   find_package(Threads REQUIRED)
   add_library(kvaf_cpu_gather_plan STATIC src/cpu_gather_plan.cc)
   target_include_directories(kvaf_cpu_gather_plan PUBLIC include)

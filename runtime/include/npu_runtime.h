@@ -41,8 +41,6 @@ class NpuRuntime final : public Runtime {
   NpuRuntime& operator=(const NpuRuntime&) = delete;
 
   Status Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size);
-  // Trusted current-request metadata; the selected UMDK operator owns execution.
-  Status GatherRead(const CpuGatherReadRequest& request);
   RuntimeCore& core();
   const RuntimeCore& core() const;
 

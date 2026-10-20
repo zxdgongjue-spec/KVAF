@@ -7,9 +7,10 @@ struct UmdkAccessOperatorConfig {
   std::uint32_t eid_index{UINT32_MAX};
   std::uint32_t workers{1U};
   std::shared_ptr<PeerLink> peer_link;
+  std::uint32_t token_bytes{0U};
 };
 // Opt-in AICPU data plane. Existing AIV operators and public BatchPut inputs
-// are unchanged; setup WRITE, BatchPut/Get and GatherRead share this session.
+// are unchanged; setup WRITE and BatchPut/Get share this session.
 class UmdkAccessOperator final : public AccessOperator {
  public:
   explicit UmdkAccessOperator(UmdkAccessOperatorConfig config);
@@ -18,7 +19,6 @@ class UmdkAccessOperator final : public AccessOperator {
   Status Shutdown() override;
   Status ExecuteBatchPut(const BatchPutExecRequest&) override;
   Status ExecuteBatchGet(const BatchGetExecRequest&) override;
-  Status ExecuteGatherRead(const CpuGatherReadRequest&) override;
 
  private:
   struct Impl;

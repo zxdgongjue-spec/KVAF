@@ -13,7 +13,7 @@ class UmdkSession {
  public:
   Status Ensure(peer::PeerLink& link, std::uint64_t region_base, const std::string& device,
                 std::uint32_t eid_index, void* output, std::size_t output_bytes,
-                std::uint32_t payload_bytes, std::uint32_t spans, std::uint32_t workers);
+                std::uint32_t workers);
   Status Shutdown();
   Status Write(const std::vector<UmdkTransfer>& transfers, aclrtStream stream);
   std::uint64_t session() const { return args_.session; }

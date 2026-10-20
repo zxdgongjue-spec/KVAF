@@ -258,4 +258,4 @@ runtime.shutdown()
 
 ## AICPU 流水 GatherRead
 
-可选的 CPU gather + UMDK READ 流水路径及独立构建命令见 [AICPU GatherRead](docs/aicpu_gather_read.md)。现有 AIV/Python 默认路径保持原样。
+现有 Python `NpuRuntime.batch_get` 可选择 CPU gather + AICPU UMDK READ 流水后端，构建和用法见 [AICPU 流水 BatchGet](docs/aicpu_gather_read.md)。

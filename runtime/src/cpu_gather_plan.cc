@@ -47,14 +47,6 @@ bool BuildOffsets(std::uint64_t base, std::uint64_t data_bytes, std::uint64_t de
 
 }  // namespace
 
-bool ValidateDirectGather(std::uint64_t base, std::uint64_t bytes, std::uint64_t descriptor_address,
-                          const GatherDescriptorHeader& header,
-                          const std::vector<GatherSpan>& spans) {
-  return ValidateEnvelope(base, bytes, descriptor_address, header, spans.size()) &&
-         BuildOffsets(base, GatherControlOffset(bytes), descriptor_address, header, spans.data(),
-                      spans.size(), nullptr);
-}
-
 std::size_t CpuGatherTeam::PrepareDirect(std::uint64_t region_bytes,
                                          std::uint64_t descriptor_address, std::uint64_t sequence,
                                          std::size_t max_spans) {
@@ -87,35 +79,12 @@ std::size_t CpuGatherTeam::PrepareDirect(std::uint64_t region_bytes,
 }
 
 void CpuGatherTeam::Copy() {
-  if (copy_profiles_) {
-    copy_profile_ = {};
-    copy_profile_.workers = active_threads_;
-    copy_profile_.begin_ns =
-        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                       std::chrono::steady_clock::now().time_since_epoch())
-                                       .count());
-  }
   completed_.store(0U, std::memory_order_relaxed);
   phase_.store(1U, std::memory_order_release);
-  RunSource(0U);
+  (void)ProcessSource(0U);
   GatherBarrier();
-  const auto wait_begin =
-      copy_profiles_
-          ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                           std::chrono::steady_clock::now().time_since_epoch())
-                                           .count())
-          : 0U;
   while (completed_.load(std::memory_order_acquire) != active_threads_ - 1U) GatherSpinPause();
-  // Concurrent chunk scans may stop at a not-yet-observed completion. Once
-  // every copier has joined, publish the full prefix before the final ACK.
   if (pipeline_ready_ != nullptr) __atomic_store_n(pipeline_ready_, total_bytes_, __ATOMIC_RELEASE);
-  if (copy_profiles_) {
-    copy_profile_.end_ns =
-        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                       std::chrono::steady_clock::now().time_since_epoch())
-                                       .count());
-    copy_profile_.join_wait_ns = copy_profile_.end_ns - wait_begin;
-  }
 }
 
 std::uint64_t CpuGatherTeam::CopyRange(std::uint64_t offset, std::uint64_t end) const {
@@ -163,39 +132,6 @@ std::uint64_t CpuGatherTeam::ProcessSource(std::size_t worker) {
   }
 }
 
-void CpuGatherTeam::RunSource(std::size_t worker) {
-  if (!copy_profiles_) {
-    (void)ProcessSource(worker);
-    return;
-  }
-  auto& profile = copy_profiles_[worker];
-  profile = {};
-  const auto now = [] {
-    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                          std::chrono::steady_clock::now().time_since_epoch())
-                                          .count());
-  };
-  const auto thread_cpu = []() -> std::uint64_t {
-    timespec value{};
-    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) return std::uint64_t{0};
-    return static_cast<std::uint64_t>(value.tv_sec) * 1000000000ULL +
-           static_cast<std::uint64_t>(value.tv_nsec);
-  };
-#if defined(__linux__)
-  profile.start_cpu = sched_getcpu();
-#endif
-  const auto cpu_begin = thread_cpu();
-  profile.begin_ns = now();
-  profile.bytes = ProcessSource(worker);
-  profile.end_ns = now();
-  const auto cpu_end = thread_cpu();
-  profile.thread_cpu_available = cpu_begin != 0U && cpu_end >= cpu_begin;
-  if (profile.thread_cpu_available) profile.thread_cpu_ns = cpu_end - cpu_begin;
-#if defined(__linux__)
-  profile.end_cpu = sched_getcpu();
-#endif
-}
-
 void CpuGatherTeam::RunHelper(std::size_t worker) {
   BindWorker(worker);
   std::uint64_t observed_generation = 0U;
@@ -239,7 +175,7 @@ void CpuGatherTeam::RunHelper(std::size_t worker) {
       if (stopping_.load(std::memory_order_acquire)) return;
       GatherSpinPause();
     }
-    RunSource(worker);
+    (void)ProcessSource(worker);
     GatherBarrier();
     completed_.fetch_add(1U, std::memory_order_release);
   }
