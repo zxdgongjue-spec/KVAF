@@ -16,3 +16,6 @@ Get/Put 共用一个 UMDK 会话与设备 SO，资源管理由 `src/umdk` 负责
 每个 worker 有自己的控制和数据 Jetty/CQ、CPU gather 处理对象、描述头、邮箱和进度。
 staging 来自同一块 DDR 分配，各 worker 使用不重叠的区间，所有通道共用一对 TP。
 完整构建和 Python 调用见 [使用说明](../../../docs/aicpu_gather_read.md)。
+
+`python/test_batch_get.py` 使用真实 `NpuRuntime.batch_get` 接口逐轮校验数据，
+支持一次运行比较 1、2、4 等 worker 数，并输出 Python 端到端耗时和有效载荷带宽。

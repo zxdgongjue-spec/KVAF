@@ -68,6 +68,30 @@ runtime.shutdown()
 设备、URMA device、EID 和服务地址按部署环境调整。原来的 addresses/valid Tensor 重载也可直接使用。
 未设置 `aicpu_urma_kernel_json_path` 时仍走原 AIV 后端。
 
+## 用 Python 检查正确性和比较 worker 数
+
+CPU 服务启动后，在仓库根目录运行：
+
+```bash
+export PYTHONPATH="$PWD/build-aicpu-urma/python:$PYTHONPATH"
+python3 access_operator/demo/aicpu_batch_get/python/test_batch_get.py \
+  --device-id 7 --peer 127.0.0.1:28990 \
+  --urma-device udmac0d1e5 --eid-index 0 \
+  --workers 1 2 4 --blocks 4096 --token-bytes 656 \
+  --tokens-per-block 2 --warmup 10 --iterations 1000
+```
+
+脚本从 CANN 环境变量寻找已安装的 kernel JSON，也可用 `--kernel-json` 显式指定。
+每轮重新生成源数据和请求，稀疏模式下逐轮移动 mask；先完成 BatchPut，再执行 BatchGet，
+逐字节检查整个输出，包括未写入的行和间隔。预检还覆盖两种 Python 重载、稀疏 mask 和全 mask。
+源和输出 Tensor 的注册地址持续有效到 Runtime 关闭；每轮释放 AccessTable 和 key 后重新写入，
+不依赖上一轮数据或远端地址保持不变。设置 `--active-percent 75` 可测试稀疏请求。
+
+每个 worker 配置输出一行 `AICPU_BATCH_GET_PASS`，包含 mean、p50、p95、p99（µs，小数点后 1 位）和有效载荷 GB/s。
+计时覆盖 Python `batch_get(..., synchronize=True)` 调用至完成，包含 Host/AICPU/CPU 和同步开销；
+输入准备、BatchPut、AccessTable 创建与上传、输出下载和正确性检查均在计时之外。
+该脚本测量 Python 端到端耗时，不输出已移除的内部阶段 profile。
+
 ## 执行和资源约定
 
 1..8 个 AICPU worker 共用一对 TP，每个 worker 有独立数据 Jetty/CQ 和控制 Jetty/CQ。
