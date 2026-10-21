@@ -1,16 +1,17 @@
-#include "host.h"
+#include "umdk/kernel_loader.h"
 
 #include <limits.h>
 
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 namespace kvaf::aicpu_urma {
 namespace {
 std::mutex kernel_mutex;
 aclrtBinHandle binary = nullptr;
-aclrtFuncHandle gather_function = nullptr, scatter_function = nullptr;
-aclrtFuncHandle control_function = nullptr;
+std::unordered_map<std::string, aclrtFuncHandle> functions;
 int32_t Launch(aclrtFuncHandle function, void* arguments, std::size_t bytes, aclrtStream stream,
                std::uint32_t blocks = 1U) {
   if (function == nullptr || arguments == nullptr || stream == nullptr) return -1;
@@ -31,7 +32,7 @@ int32_t Launch(aclrtFuncHandle function, void* arguments, std::size_t bytes, acl
 }
 
 }  // namespace
-bool Load(const char* json_path) {
+bool LoadUmdkKernel(const char* json_path) {
   if (json_path == nullptr || json_path[0] == '\0') return false;
   std::lock_guard<std::mutex> lock(kernel_mutex);
   if (binary != nullptr) return true;
@@ -47,39 +48,29 @@ bool Load(const char* json_path) {
   options.options = &option;
   options.numOpt = 1;
   aclrtBinHandle loaded = nullptr;
-  if (aclrtBinaryLoadFromFile(resolved, &options, &loaded) != ACL_SUCCESS ||
-      aclrtBinaryGetFunction(loaded, "KvafAicpuGatherRead", &gather_function) != ACL_SUCCESS ||
-      aclrtBinaryGetFunction(loaded, "KvafAicpuGatherScatter", &scatter_function) != ACL_SUCCESS) {
+  if (aclrtBinaryLoadFromFile(resolved, &options, &loaded) != ACL_SUCCESS) {
     std::fprintf(stderr, "[KVAF_AICPU_URMA] failed to load AICPU kernel path=%s\n", resolved);
-    if (loaded != nullptr) (void)aclrtBinaryUnLoad(loaded);
-    gather_function = nullptr;
-    scatter_function = nullptr;
+    if (loaded) (void)aclrtBinaryUnLoad(loaded);
     return false;
   }
   binary = loaded;
   return true;
 }
-int32_t LaunchUmdkControl(const UmdkControlArgs* arguments, aclrtStream stream) {
-  if (arguments == nullptr) return -1;
+int32_t LaunchUmdkKernel(const char* name, const void* args, std::size_t bytes, aclrtStream stream,
+                         std::uint32_t blocks) {
+  if (!name || !args) return -1;
+  aclrtFuncHandle function = nullptr;
   {
     std::lock_guard<std::mutex> lock(kernel_mutex);
-    if (binary == nullptr) return -1;
-    if (control_function == nullptr &&
-        aclrtBinaryGetFunction(binary, "KvafAicpuUmdkControl", &control_function) != ACL_SUCCESS) {
-      std::fprintf(stderr, "[KVAF_AICPU_URMA] UMDK control missing; rebuild and install kernel\n");
-      return -1;
+    if (!binary) return -1;
+    auto found = functions.find(name);
+    if (found != functions.end())
+      function = found->second;
+    else {
+      if (aclrtBinaryGetFunction(binary, name, &function) != ACL_SUCCESS) return -1;
+      functions.emplace(name, function);
     }
   }
-  return Launch(control_function, const_cast<UmdkControlArgs*>(arguments), sizeof(*arguments),
-                stream);
-}
-int32_t LaunchUmdkGet(const UmdkBatchGetArgs* args, aclrtStream stream) {
-  if (!args) return -1;
-  if (Launch(gather_function, const_cast<UmdkBatchGetArgs*>(args), sizeof(*args), stream))
-    return -1;
-  return args->gather.worker_count <= 1U
-             ? 0
-             : Launch(scatter_function, const_cast<UmdkBatchGetArgs*>(args), sizeof(*args), stream,
-                      args->gather.worker_count);
+  return Launch(function, const_cast<void*>(args), bytes, stream, blocks);
 }
 }  // namespace kvaf::aicpu_urma

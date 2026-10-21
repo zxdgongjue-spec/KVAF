@@ -16,117 +16,17 @@
 #include <string>
 #include <vector>
 
-#include "cpu_gather.h"
-#include "gather_cache.h"
-#include "umdk_control.h"
-#include "umdk_gather.h"
+#include "transport_internal.h"
+#include "umdk/cache.h"
 #include "urma_transport.h"
 
-namespace {
-using namespace kvaf::aicpu_urma;
-using namespace kvaf::urma;
+namespace kvaf::aicpu_urma::detail {
 
 std::uint64_t NowNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
 }
-
-#define KVAF_UMDK_APIS(APPLY)    \
-  APPLY(urma_init)               \
-  APPLY(urma_uninit)             \
-  APPLY(urma_get_device_list)    \
-  APPLY(urma_free_device_list)   \
-  APPLY(urma_get_eid_list)       \
-  APPLY(urma_free_eid_list)      \
-  APPLY(urma_create_context)     \
-  APPLY(urma_delete_context)     \
-  APPLY(urma_create_jfc)         \
-  APPLY(urma_delete_jfc)         \
-  APPLY(urma_create_jfr)         \
-  APPLY(urma_delete_jfr)         \
-  APPLY(urma_create_jetty)       \
-  APPLY(urma_delete_jetty)       \
-  APPLY(urma_alloc_token_id)     \
-  APPLY(urma_free_token_id)      \
-  APPLY(urma_register_seg)       \
-  APPLY(urma_unregister_seg)     \
-  APPLY(urma_import_seg)         \
-  APPLY(urma_unimport_seg)       \
-  APPLY(urma_unimport_jetty)     \
-  APPLY(urma_post_jetty_send_wr) \
-  APPLY(urma_poll_jfc)
-
-struct Api {
-#define KVAF_DECLARE_API(name) decltype(&::name) name = nullptr;
-  KVAF_UMDK_APIS(KVAF_DECLARE_API)
-#undef KVAF_DECLARE_API
-  GetTpList get_tp_list = nullptr;
-  ImportJettyEx import_jetty_ex = nullptr;
-};
-
-struct WrQueue {
-  std::vector<Sge> local_sges;
-  std::vector<Sge> remote_sges;
-  std::vector<urma_jfs_wr_t> wrs;
-};
-
-struct GatherQueue : WrQueue {
-  // Vectors own constructed workspace slots; wr_count is the active chain size.
-  std::vector<kvaf::GatherOutputSpan> targets;
-  std::uint32_t wr_count = 0;
-};
-
-template <typename T>
-void EnsureSlots(std::vector<T>& slots, std::size_t count) {
-  if (count > slots.size()) slots.resize(std::max(count, slots.size() * 2U));
-}
-
-void SnapshotGatherTargets(GatherQueue& queue, const GatherReadArgs& args, std::uint32_t first,
-                           std::uint32_t last) {
-  const auto count = last - first;
-  EnsureSlots(queue.targets, count);
-  std::memcpy(queue.targets.data(),
-              reinterpret_cast<const kvaf::GatherOutputSpan*>(args.output_spans) + first,
-              static_cast<std::size_t>(count) * sizeof(kvaf::GatherOutputSpan));
-}
-
-struct Worker : WrQueue {
-  bool poisoned = false;
-  urma_jfc_t* jfc = nullptr;
-  urma_jfr_t* jfr = nullptr;
-  urma_jetty_t* jetty = nullptr;
-  urma_target_jetty_t* target = nullptr;
-  std::uint64_t tp = 0;
-  std::uint64_t sequence = 0;
-  GatherQueue read_queue;
-};
-
-struct RegisteredBuffer {
-  std::uint64_t base, bytes;
-  urma_token_id_t* token;
-  urma_target_seg_t* segment;
-};
-
-struct State : Worker {
-  Api api;
-  void* library = nullptr;
-  void* common_library = nullptr;
-  bool owns_init = false;
-  urma_context_t* context = nullptr;
-  urma_token_id_t* token = nullptr;
-  urma_target_seg_t* local = nullptr;
-  urma_target_seg_t* remote = nullptr;
-  std::uint64_t session = 0;
-  std::uint64_t shared_tp = 0, shared_peer_tp = 0;
-  std::uint32_t shared_peer_psn = 0;
-  std::array<std::uint8_t, 16> peer_eid{};
-  std::uint64_t buffer = 0, buffer_bytes = 0, remote_address = 0;
-  std::uint32_t worker_count = 1;
-  std::array<std::unique_ptr<Worker>, 7> extra_workers;
-  std::unique_ptr<Worker> control;
-  std::vector<RegisteredBuffer> buffers;
-};
 
 State state;
 std::shared_mutex state_mutex;
@@ -149,7 +49,7 @@ void Stage(UmdkControlStatus& status, const char* name) {
   errno = 0;
 }
 
-bool Fail(UmdkControlStatus& status, const char* stage, int result = -1, const char* detail = "") {
+bool Fail(UmdkControlStatus& status, const char* stage, int result, const char* detail) {
   status.result = result == 0 ? -1 : result;
   status.error_number = errno;
   std::snprintf(status.stage, sizeof(status.stage), "%s", stage);
@@ -391,8 +291,7 @@ bool Connect(const UmdkControlArgs& args, UmdkControlStatus& status) {
                 "all Jettys must use the same peer TP and PSN");
   urma_seg_t segment{};
   std::memcpy(&segment, args.segment, sizeof(segment));
-  if (args.remote_address < segment.ubva.va ||
-      args.remote_address - segment.ubva.va >= segment.len)
+  if (args.remote_address < segment.ubva.va || args.remote_address - segment.ubva.va >= segment.len)
     return Fail(status, "remote range outside segment");
   urma_token_t token{};
   token.token = args.token;
@@ -478,24 +377,23 @@ bool SubmitQueue(Worker& worker, std::vector<urma_jfs_wr_t>& requests, std::uint
 }
 
 urma_target_seg_t* LocalSegment(std::uint64_t address, std::uint64_t bytes,
-                                std::uint64_t* available = nullptr) {
-  if (state.local != nullptr &&
-      kvaf::peer::GatherRange(state.buffer, state.buffer_bytes, address, bytes)) {
+                                std::uint64_t* available) {
+  if (state.local != nullptr && UmdkRange(state.buffer, state.buffer_bytes, address, bytes)) {
     if (available != nullptr) *available = state.buffer_bytes - (address - state.buffer);
     return state.local;
   }
   for (const auto& buffer : state.buffers)
-    if (kvaf::peer::GatherRange(buffer.base, buffer.bytes, address, bytes)) {
+    if (UmdkRange(buffer.base, buffer.bytes, address, bytes)) {
       if (available != nullptr) *available = buffer.bytes - (address - buffer.base);
       return buffer.segment;
     }
   return nullptr;
 }
 
-bool RegisterGatherBuffer(const UmdkControlArgs& args, UmdkControlStatus& status) {
+bool RegisterBuffer(const UmdkControlArgs& args, UmdkControlStatus& status) {
   if (args.local_buffer == 0 || args.buffer_bytes == 0 ||
       args.local_buffer > UINT64_MAX - args.buffer_bytes)
-    return Fail(status, "invalid GatherRead HBM registration");
+    return Fail(status, "invalid UMDK HBM registration");
   if (LocalSegment(args.local_buffer, args.buffer_bytes) != nullptr) return true;
   Stage(status, "urma_alloc_token_id");
   auto* token = state.api.urma_alloc_token_id(state.context);
@@ -526,8 +424,8 @@ bool BuildTransfers(Worker& worker, bool write, const UmdkTransfer* transfers, s
   while (transfer_index < count && worker.wrs.size() < 4096) {
     const auto& transfer = transfers[transfer_index];
     if (transfer.bytes == 0 || offset >= transfer.bytes ||
-        !kvaf::peer::GatherRange(state.remote->seg.ubva.va, state.remote->seg.len, transfer.remote,
-                                 transfer.bytes))
+        !UmdkRange(state.remote->seg.ubva.va, state.remote->seg.len, transfer.remote,
+                   transfer.bytes))
       return Fail(status, "UMDK transfer outside remote region");
     auto* segment = LocalSegment(transfer.local, transfer.bytes);
     if (segment == nullptr) return Fail(status, "UMDK transfer outside registered HBM");
@@ -561,10 +459,10 @@ bool BuildTransfers(Worker& worker, bool write, const UmdkTransfer* transfers, s
   return true;
 }
 
-bool TransferGather(Worker& worker, bool write, const UmdkTransfer* transfers, std::uint32_t count,
-                    UmdkControlStatus& status) {
+bool TransferQueue(Worker& worker, bool write, const UmdkTransfer* transfers, std::uint32_t count,
+                   UmdkControlStatus& status) {
   if (worker.poisoned || worker.target == nullptr || state.remote == nullptr ||
-      transfers == nullptr || count == 0 || count > kGatherMaxSpans)
+      transfers == nullptr || count == 0 || count > kUmdkMaxTransfers)
     return Fail(status, "invalid UMDK transfer queue");
   std::uint32_t index = 0;
   std::uint64_t offset = 0;
@@ -588,254 +486,46 @@ bool TransferControl(bool write, const UmdkTransfer* transfers, std::uint32_t co
   auto* control = SetupQueue(kUmdkControlQueueIndex);
   if (!control) return Fail(status, "control queue is unavailable");
   std::lock_guard<std::mutex> control_lock(control_mutex);
-  return TransferGather(*control, write, transfers, count, status);
+  return TransferQueue(*control, write, transfers, count, status);
 }
 
-constexpr std::uint32_t kGatherWaveWrs = 4096U;
+}  // namespace kvaf::aicpu_urma::detail
 
-void BeginGatherWave(GatherQueue& queue, std::uint32_t sgl_size) {
-  EnsureSlots(queue.local_sges, kGatherWaveWrs * std::min(sgl_size, kvaf::kGatherMaxSglSize));
-  EnsureSlots(queue.remote_sges, kGatherWaveWrs);
-  EnsureSlots(queue.wrs, kGatherWaveWrs);
-  queue.wr_count = 0U;
-}
-
-// Resolve this request's fixed addresses and registration once, before batches.
-// Only allocation capacity survives a request; no WR/layout contents are cached.
-struct GatherBuildLayout {
-  std::uint64_t output, staging;
-  std::uint32_t sgl_size;
-  urma_target_seg_t* local_segment;
-  urma_target_seg_t* remote_segment;
-  urma_jfs_wr_t prototype{};
-
-  GatherBuildLayout(Worker& worker, const GatherReadArgs& args,
-                    urma_target_jetty_t* target = nullptr)
-      : output(args.output),
-        staging(args.remote_staging),
-        sgl_size(std::min(args.sgl_size, kvaf::kGatherMaxSglSize)),
-        local_segment(LocalSegment(args.output, args.output_extent)),
-        remote_segment(state.remote) {
-    prototype.opcode = URMA_OPC_READ;
-    prototype.flag.bs.comp_order = 1;
-    prototype.flag.bs.place_order = URMA_RELAX_ORDER;
-    prototype.tjetty = target == nullptr ? worker.target : target;
-    prototype.rw.src.num_sge = 1U;
-  }
-};
-
-void AppendGatherBatch(Worker& worker, const GatherBuildLayout& layout, std::uint32_t& span_index,
-                       std::uint32_t last, std::uint32_t& span_offset, std::uint64_t& source_offset,
-                       std::uint32_t snapshot_first, std::uint32_t batch_wrs,
-                       std::uint32_t& local_index) {
-  auto& queue = worker.read_queue;
-  const auto* spans = queue.targets.data();
-  auto index = span_index - snapshot_first;
-  auto offset = span_offset;
-  auto source_position = source_offset;
-  const auto limit = last - snapshot_first;
-  auto* local = queue.local_sges.data();
-  auto* remote = queue.remote_sges.data();
-  auto* requests = queue.wrs.data();
-  auto sequence = worker.sequence;
-  auto wr_count = queue.wr_count;
-  const auto wr_limit = wr_count + std::min(batch_wrs, kGatherWaveWrs - wr_count);
-  while (index < limit && wr_count < wr_limit) {
-    const auto wr_index = wr_count++;
-    const auto local_begin = local_index;
-    std::uint32_t bytes = 0U, local_count = 0U;
-    const auto source = layout.staging + source_position;
-    while (index < limit && local_count < layout.sgl_size && bytes < 65536U) {
-      const auto& span = spans[index];
-      const auto length = std::min(span.length - offset, 65536U - bytes);
-      local[local_index++] = {layout.output + span.offset + offset, length, layout.local_segment,
-                              nullptr};
-      ++local_count;
-      bytes += length;
-      source_position += length;
-      offset += length;
-      if (offset == span.length) {
-        ++index;
-        offset = 0U;
-      }
-    }
-    remote[wr_index] = {source, bytes, layout.remote_segment, nullptr};
-    auto wr = layout.prototype;
-    wr.user_ctx = ++sequence;
-    wr.rw.src.sge = reinterpret_cast<urma_sge_t*>(&remote[wr_index]);
-    wr.rw.dst.sge = reinterpret_cast<urma_sge_t*>(local + local_begin);
-    wr.rw.dst.num_sge = local_count;
-    wr.next = requests + wr_index + 1U;
-    requests[wr_index] = wr;
-  }
-  if (wr_count != 0U) {
-    auto& tail = requests[wr_count - 1U];
-    tail.next = nullptr;
-    const bool final = index == limit || wr_count == kGatherWaveWrs;
-    tail.flag.bs.place_order = final ? URMA_STRONG_ORDER : URMA_RELAX_ORDER;
-    tail.flag.bs.complete_enable = final;
-  }
-  queue.wr_count = wr_count;
-  worker.sequence = sequence;
-  span_index = snapshot_first + index;
-  span_offset = offset;
-  source_offset = source_position;
-}
-
-struct GatherPrefix {
-  const GatherReadArgs& args;
-  GatherReadStatus& gather;
-  std::uint32_t worker_index;
-  std::uint64_t ready_bytes = 0;
-};
-
-bool WaitBatchPrefix(GatherPrefix& prefix, const urma_jfs_wr_t& tail,
-                     UmdkControlStatus& submitted) {
-  const auto& args = prefix.args;
-  const auto& source = *reinterpret_cast<const Sge*>(tail.rw.src.sge);
-  const auto required = source.addr + source.len - args.remote_staging;
-  if (required <= prefix.ready_bytes) return true;
-  auto& gather = prefix.gather;
-  gather.phase = 5;
-  const auto scratch = args.scratch + prefix.worker_index * 64U;
-  const UmdkTransfer transfer{
-      args.remote_descriptor + offsetof(kvaf::peer::GatherDescriptorHeader, ready_bytes), scratch,
-      8};
-  bool success = false;
-  for (std::uint32_t poll = 0; poll < 10000; ++poll) {
-    FlushGatherCache(reinterpret_cast<const void*>(scratch), 8);
-    UmdkControlStatus query{};
-    // The dedicated control Jetty can complete this query while data READs
-    // remain outstanding; controls use their own WR storage.
-    if (!TransferControl(false, &transfer, 1, query)) {
-      errno = query.error_number;
-      Fail(submitted, query.stage, query.result);
-      gather.result = 16;
-      break;
-    }
-    FlushGatherCache(reinterpret_cast<const void*>(scratch), 8);
-    prefix.ready_bytes = *reinterpret_cast<const volatile std::uint64_t*>(scratch);
-    if ((prefix.ready_bytes & kvaf::peer::kGatherErrorBit) != 0 ||
-        prefix.ready_bytes > args.bytes) {
-      gather.result = 10;
-      Fail(submitted, "CPU ready prefix error");
-      break;
-    }
-    if (prefix.ready_bytes >= required) {
-      success = true;
-      break;
-    }
-  }
-  if (!success) {
-    gather.ack_seen = prefix.ready_bytes;
-    if (gather.result == 0) {
-      gather.result = 9;
-      errno = ETIMEDOUT;
-      Fail(submitted, "waiting for CPU ready prefix timed out", ETIMEDOUT);
-    }
-  } else
-    gather.phase = 4;
-  return success;
-}
-
-bool ScatterQueue(Worker& worker, const GatherReadArgs& args, GatherReadStatus& status,
-                  std::uint32_t first, std::uint32_t last, std::uint64_t remote_offset,
-                  UmdkControlStatus& error, std::uint32_t timeout_ms,
-                  std::uint32_t worker_index = 0) {
-  if (first == last) return true;
-  const auto snapshot_first = first;
-  SnapshotGatherTargets(worker.read_queue, args, first, last);
-  const GatherBuildLayout layout(worker, args);
-  GatherPrefix prefix{args, status, worker_index};
-  std::uint32_t span_offset = 0;
-  while (first < last) {
-    auto& queue = worker.read_queue;
-    BeginGatherWave(queue, layout.sgl_size);
-    std::uint32_t local_index = 0;
-    const auto start = NowNs();  // Deadline only; no per-stage profiling.
-    do {
-      const auto batch_first = queue.wr_count;
-      AppendGatherBatch(worker, layout, first, last, span_offset, remote_offset, snapshot_first,
-                        args.sq_batch_wqes, local_index);
-      auto* tail = &queue.wrs[queue.wr_count - 1U];
-      if ((args.pipeline_chunk_bytes && !WaitBatchPrefix(prefix, *tail, error)) ||
-          !PostBatch(worker, &queue.wrs[batch_first], tail, batch_first,
-                     queue.wr_count - batch_first, error)) {
-        worker.poisoned = true;
-        return false;
-      }
-    } while (first < last && queue.wr_count < kGatherWaveWrs);
-    // Retain every WR/SGL slot until the final ordered CQE for this wave.
-    if (!WaitCompletion(worker, queue.wrs[queue.wr_count - 1U].user_ctx, start, timeout_ms, error))
-      return false;
-  }
-  return true;
-}
-
-}  // namespace
-
-extern "C" std::uint32_t KvafAicpuUmdkGatherMemory(const GatherReadArgs* args,
-                                                   UmdkGatherMemory* memory) {
+namespace kvaf::aicpu_urma {
+using namespace detail;
+std::uint32_t UmdkGetMemory(const UmdkContext* args, std::uint64_t address, std::uint64_t bytes,
+                            UmdkMemory* memory) {
   std::shared_lock<std::shared_mutex> lock(state_mutex);
-  if (args == nullptr || memory == nullptr || args->umdk_session != state.session ||
-      args->umdk_owner_pid != static_cast<std::uint64_t>(getpid()))
+  if (args == nullptr || memory == nullptr || args->session != state.session ||
+      args->owner_pid != static_cast<std::uint64_t>(getpid()))
     return 16;
   std::uint64_t available = 0;
-  auto* local = LocalSegment(args->output, args->output_extent, &available);
+  auto* local = LocalSegment(address, bytes, &available);
   if (local == nullptr || state.remote == nullptr) return 16;
-  *memory = {args->output, available, state.remote->seg.ubva.va, state.remote->seg.len};
+  *memory = {address, available, state.remote->seg.ubva.va, state.remote->seg.len};
   return 0;
 }
 
-extern "C" std::uint32_t KvafAicpuUmdkGatherTransfer(const GatherReadArgs* args, bool write,
-                                                     const UmdkTransfer* transfers,
-                                                     std::uint32_t count,
-                                                     std::uint32_t worker_index) {
+std::uint32_t UmdkTransferSync(const UmdkContext* args, bool write, const UmdkTransfer* transfers,
+                               std::uint32_t count, std::uint32_t worker_index) {
   std::shared_lock<std::shared_mutex> lock(state_mutex);
-  if (args == nullptr || args->umdk_session != state.session ||
-      args->umdk_owner_pid != static_cast<std::uint64_t>(getpid()) ||
-      worker_index >= state.worker_count)
+  if (args == nullptr || args->session != state.session ||
+      args->owner_pid != static_cast<std::uint64_t>(getpid()) || worker_index >= state.worker_count)
     return 16;
   UmdkControlStatus status{};
   const bool success = TransferControl(write, transfers, count, status);
   if (!success)
-    std::fprintf(
-        stderr,
-        "GATHER_UMDK_CONTROL_ERROR worker=%u write=%u stage=%s result=%d errno=%d cq_status=%d\n",
-        worker_index, write ? 1U : 0U, status.stage, status.result, status.error_number,
-        status.cq_status);
+    std::fprintf(stderr,
+                 "UMDK_CONTROL_ERROR worker=%u write=%u stage=%s result=%d errno=%d cq_status=%d\n",
+                 worker_index, write ? 1U : 0U, status.stage, status.result, status.error_number,
+                 status.cq_status);
   return success ? 0 : 16;
 }
 
-extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkGatherScatter(
-    const kvaf::aicpu_urma::GatherReadArgs* args, kvaf::aicpu_urma::GatherReadStatus* status,
-    std::uint32_t first, std::uint32_t last, std::uint64_t remote_offset,
-    std::uint32_t worker_index) {
-  std::shared_lock<std::shared_mutex> lock(state_mutex);
-  if (args == nullptr || status == nullptr || worker_index >= state.worker_count ||
-      std::max(1U, args->worker_count) != state.worker_count ||
-      args->umdk_owner_pid != static_cast<std::uint64_t>(getpid()) ||
-      args->umdk_session != state.session ||
-      LocalSegment(args->output, args->output_extent) == nullptr || first > last ||
-      last > args->output_span_count || args->sgl_size == 0 || args->sq_batch_wqes == 0)
-    return 16;
-  std::lock_guard<std::mutex> worker_lock(worker_mutexes[worker_index]);
-  auto& worker = GetWorker(worker_index);
-  if (worker.poisoned || worker.target == nullptr) return 16;
-  UmdkControlStatus timeline{};
-  if (!ScatterQueue(worker, *args, *status, first, last, remote_offset, timeline, 1000,
-                    worker_index)) {
-    std::fprintf(stderr,
-                 "GATHER_UMDK_READ_ERROR worker=%u stage=%s result=%d errno=%d cq_status=%d "
-                 "cq_context=%llu\n",
-                 worker_index, timeline.stage, timeline.result, timeline.error_number,
-                 timeline.cq_status, static_cast<unsigned long long>(timeline.cq_context));
-    status->cqe_word = timeline.cq_status != 0 ? timeline.cq_status : timeline.error_number;
-    return status->result != 0 ? static_cast<std::uint32_t>(status->result) : 16;
-  }
-  return 0;
-}
+}  // namespace kvaf::aicpu_urma
 
+using namespace kvaf::aicpu_urma;
+using namespace kvaf::aicpu_urma::detail;
 extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkControl(
     UmdkControlArgs* args) {
   if (!args || !args->status) return 1;
@@ -847,7 +537,7 @@ extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkCon
   status.session = state.session;
 
   errno = 0;
-  if (args->op == UmdkControlOp::kPrepareGather) {
+  if (args->op == UmdkControlOp::kPrepare) {
     if (!args->worker_count || args->worker_count > 8 || !args->local_buffer ||
         !args->buffer_bytes || args->local_buffer > UINT64_MAX - args->buffer_bytes ||
         args->device[63] || args->library[255])
@@ -867,13 +557,13 @@ extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkCon
       case UmdkControlOp::kConnect:
         Connect(*args, status);
         break;
-      case UmdkControlOp::kQueryGatherWorker:
+      case UmdkControlOp::kQueryWorker:
         DescribeWorker(*args, args->worker_index, status);
         break;
-      case UmdkControlOp::kRegisterGatherBuffer:
-        RegisterGatherBuffer(*args, status);
+      case UmdkControlOp::kRegisterBuffer:
+        RegisterBuffer(*args, status);
         break;
-      case UmdkControlOp::kWriteGather:
+      case UmdkControlOp::kWrite:
         TransferControl(true, reinterpret_cast<const UmdkTransfer*>(args->transfer_spans),
                         args->transfer_count, status);
         break;

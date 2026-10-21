@@ -19,5 +19,12 @@
       "kernelSo": "libkvaf_aicpu_urma.so",
       "opKernelLib": "AICPUKernel"
     }
+  },
+  "KvafAicpuBatchPut": {
+    "opInfo": {
+      "functionName": "KvafAicpuBatchPut",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
   }
 }

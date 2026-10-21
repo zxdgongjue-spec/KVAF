@@ -8,12 +8,12 @@ constexpr std::uint64_t kUmdkControlMagic = 0x4b564146554d444bULL;
 // Setup slot for the control queue; data worker indices remain 0..7.
 constexpr std::uint32_t kUmdkControlQueueIndex = 8;
 enum class UmdkControlOp : std::uint32_t {
-  kPrepareGather,
+  kPrepare,
   kConnect,
   kDestroy,
-  kQueryGatherWorker,
-  kRegisterGatherBuffer,
-  kWriteGather
+  kQueryWorker,
+  kRegisterBuffer,
+  kWrite
 };
 
 struct UmdkControlArgs {
@@ -49,6 +49,20 @@ struct alignas(64) UmdkControlStatus {
   char stage[64], detail[256];
 };
 
+struct UmdkContext {
+  std::uint64_t session{0U}, owner_pid{0U};
+};
+struct UmdkMemory {
+  std::uint64_t local_base, local_bytes, remote_base, remote_bytes;
+};
+struct UmdkTransfer {
+  std::uint64_t remote, local, bytes;
+};
+constexpr std::uint32_t kUmdkMaxTransfers = 65536U;
+inline bool UmdkRange(std::uint64_t base, std::uint64_t size, std::uint64_t address,
+                      std::uint64_t bytes) {
+  return bytes && address >= base && bytes <= size && address - base <= size - bytes;
+}
 }  // namespace kvaf::aicpu_urma
 
 extern "C" std::uint32_t KvafAicpuUmdkControl(kvaf::aicpu_urma::UmdkControlArgs* args);

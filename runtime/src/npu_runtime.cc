@@ -27,7 +27,7 @@
 #include "meta_manager.h"
 #include "gather_workspace.h"
 #if defined(KVAF_ENABLE_AICPU_URMA)
-#include "aicpu_gather_access_operator.h"
+#include "aicpu_access_operator.h"
 #endif
 
 namespace kvaf {

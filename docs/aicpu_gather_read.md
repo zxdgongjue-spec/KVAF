@@ -84,3 +84,17 @@ BatchPut 同步完成；BatchGet 默认只 enqueue，`synchronize=True` 等待�
 同一 AICPU 进程只支持一个活动 UMDK 会话。目前该后端使用 eager 调用，不支持 ACL Graph capture/replay。
 
 本地验证使用 ACL/provider 替身；本分支的 NPU 兼容性与性能需要服务器验证。
+
+## 实现位置
+
+| 目录/文件 | 职责 |
+| --- | --- |
+| `access_operator/src/aicpu_access_operator.cc` | Runtime 适配、Get/Put 共享会话和跨操作同步 |
+| `access_operator/demo/aicpu_batch_get/host/` | BatchGet workspace、参数和 kernel 提交 |
+| `access_operator/demo/aicpu_batch_get/kernel/gather_read.cc` | 当前流水算法、READ WR/SGL 组装和调度 |
+| `access_operator/demo/aicpu_batch_put/` | 原有同步 BatchPut 的 Host/设备实现 |
+| `access_operator/src/umdk/host/` | 通用会话和 kernel 加载 |
+| `access_operator/src/umdk/kernel/` | 通用队列、注册、提交、CQ 及统一设备包 |
+
+当前 BatchGet 入口仅调用 `gather_read`；没有其他实现的占位代码或选择参数。
+两个 demo 均按 `include/host/kernel` 分层，共用一个设备包和会话；Python 参数及构建命令保持不变。

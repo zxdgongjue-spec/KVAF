@@ -9,8 +9,8 @@ struct UmdkAccessOperatorConfig {
   std::shared_ptr<PeerLink> peer_link;
   std::uint32_t token_bytes{0U};
 };
-// Opt-in AICPU data plane. Existing AIV operators and public BatchPut inputs
-// are unchanged; setup WRITE and BatchPut/Get share this session.
+// Runtime adapter for the AICPU demos. BatchGet, BatchPut and setup WRITE
+// share one UMDK session.
 class UmdkAccessOperator final : public AccessOperator {
  public:
   explicit UmdkAccessOperator(UmdkAccessOperatorConfig config);

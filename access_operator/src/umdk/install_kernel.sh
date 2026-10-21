@@ -27,6 +27,7 @@ check_artifacts() {
   local dir="$1"
   [[ -s "$dir/$package" && -s "$dir/kernel.json" ]] || die "missing build artifacts in $dir"
   check_archive "$dir/$package"
+  grep -Fq '"KvafAicpuBatchPut"' "$dir/kernel.json" || die "BatchPut missing from $dir/kernel.json"
   grep -Fq '"KvafAicpuGatherRead"' "$dir/kernel.json" || die "GatherRead missing from $dir/kernel.json"
   grep -Fq '"KvafAicpuGatherScatter"' "$dir/kernel.json" || die "GatherScatter missing from $dir/kernel.json"
   grep -Fq '"KvafAicpuUmdkControl"' "$dir/kernel.json" || die "UMDK control missing from $dir/kernel.json"
@@ -37,6 +38,7 @@ check_installed() {
   local count block
   [[ -s "$kernel_dir/$package" && -s "$config_dir/$json" ]] || die "package or JSON missing under $cann_root"
   check_archive "$kernel_dir/$package"
+  grep -Fq '"KvafAicpuBatchPut"' "$config_dir/$json" || die "installed JSON lacks BatchPut"
   grep -Fq '"KvafAicpuGatherRead"' "$config_dir/$json" || die "installed JSON lacks GatherRead"
   grep -Fq '"KvafAicpuGatherScatter"' "$config_dir/$json" || die "installed JSON lacks GatherScatter"
   grep -Fq '"KvafAicpuUmdkControl"' "$config_dir/$json" || die "installed JSON lacks UMDK control"

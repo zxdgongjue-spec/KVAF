@@ -1,8 +1,18 @@
 #pragma once
 #include <cstdint>
 
-#include "gather_output.h"
+#include "../../aiv_batch_get/include/batch_get_abi.h"
 #include "gather_workspace.h"
+#include "umdk/kernel_abi.h"
+namespace kvaf {
+constexpr std::uint32_t kGatherMaxSglSize = 6U;
+struct GatherOutputSpan {
+  std::uint64_t offset;
+  std::uint32_t length;
+  std::uint32_t reserved{0U};
+};
+static_assert(sizeof(GatherOutputSpan) == 16U);
+}  // namespace kvaf
 
 namespace kvaf::aicpu_urma {
 constexpr std::uint64_t kGatherStatusMagic = 0x4b56414647415448ULL;
@@ -15,7 +25,7 @@ struct alignas(64) GatherQueueState {
   std::uint64_t next_worker{0U}, staging_offset{0U}, pipeline_sequence{0U};
 };
 struct GatherReadArgs {
-  std::uint64_t umdk_session{0U}, umdk_owner_pid{0U};
+  UmdkContext context;
   std::uint64_t queue_state{0U}, core_status{0U};
   std::uint64_t output{0U}, output_extent{0U}, scratch{0U};
   std::uint64_t remote_staging{0U}, remote_descriptor{0U};
@@ -33,4 +43,8 @@ constexpr std::uint64_t kGatherTargetsOffset =
 constexpr std::uint64_t kGatherWorkspaceBytes =
     kGatherTargetsOffset + kGatherMaxSpans * sizeof(GatherOutputSpan);
 static_assert(sizeof(GatherReadArgs) <= 256U);
+struct UmdkBatchGetArgs {
+  KvafExecuteBatchGetKernelArgs request;
+  GatherReadArgs gather;
+};
 }  // namespace kvaf::aicpu_urma

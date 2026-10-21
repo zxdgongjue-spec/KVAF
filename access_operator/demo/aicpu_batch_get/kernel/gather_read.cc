@@ -1,0 +1,430 @@
+#include "gather_read.h"
+
+#include <unistd.h>
+
+#include <atomic>
+#include <cstring>
+
+#include "cpu_gather.h"
+#include "transport_internal.h"
+#include "umdk/cache.h"
+
+namespace kvaf::aicpu_urma {
+namespace {
+using namespace detail;
+struct GatherQueue : WrQueue {
+  // Vectors own constructed workspace slots; wr_count is the active chain size.
+  std::vector<kvaf::GatherOutputSpan> targets;
+  std::uint32_t wr_count = 0;
+};
+
+template <typename T>
+void EnsureSlots(std::vector<T>& slots, std::size_t count) {
+  if (count > slots.size()) slots.resize(std::max(count, slots.size() * 2U));
+}
+
+GatherQueue& ReadQueue(Worker& worker) {
+  if (!worker.data_workspace) worker.data_workspace = std::make_unique<GatherQueue>();
+  return static_cast<GatherQueue&>(*worker.data_workspace);
+}
+
+void SnapshotGatherTargets(GatherQueue& queue, const GatherReadArgs& args, std::uint32_t first,
+                           std::uint32_t last) {
+  const auto count = last - first;
+  EnsureSlots(queue.targets, count);
+  std::memcpy(queue.targets.data(),
+              reinterpret_cast<const kvaf::GatherOutputSpan*>(args.output_spans) + first,
+              static_cast<std::size_t>(count) * sizeof(kvaf::GatherOutputSpan));
+}
+
+constexpr std::uint32_t kGatherWaveWrs = 4096U;
+
+void BeginGatherWave(GatherQueue& queue, std::uint32_t sgl_size) {
+  EnsureSlots(queue.local_sges, kGatherWaveWrs * std::min(sgl_size, kvaf::kGatherMaxSglSize));
+  EnsureSlots(queue.remote_sges, kGatherWaveWrs);
+  EnsureSlots(queue.wrs, kGatherWaveWrs);
+  queue.wr_count = 0U;
+}
+
+// Resolve this request's fixed addresses and registration once, before batches.
+// Only allocation capacity survives a request; no WR/layout contents are cached.
+struct GatherBuildLayout {
+  std::uint64_t output, staging;
+  std::uint32_t sgl_size;
+  urma_target_seg_t* local_segment;
+  urma_target_seg_t* remote_segment;
+  urma_jfs_wr_t prototype{};
+
+  GatherBuildLayout(Worker& worker, const GatherReadArgs& args,
+                    urma_target_jetty_t* target = nullptr)
+      : output(args.output),
+        staging(args.remote_staging),
+        sgl_size(std::min(args.sgl_size, kvaf::kGatherMaxSglSize)),
+        local_segment(LocalSegment(args.output, args.output_extent)),
+        remote_segment(state.remote) {
+    prototype.opcode = URMA_OPC_READ;
+    prototype.flag.bs.comp_order = 1;
+    prototype.flag.bs.place_order = URMA_RELAX_ORDER;
+    prototype.tjetty = target == nullptr ? worker.target : target;
+    prototype.rw.src.num_sge = 1U;
+  }
+};
+
+void AppendGatherBatch(Worker& worker, const GatherBuildLayout& layout, std::uint32_t& span_index,
+                       std::uint32_t last, std::uint32_t& span_offset, std::uint64_t& source_offset,
+                       std::uint32_t snapshot_first, std::uint32_t batch_wrs,
+                       std::uint32_t& local_index) {
+  auto& queue = ReadQueue(worker);
+  const auto* spans = queue.targets.data();
+  auto index = span_index - snapshot_first;
+  auto offset = span_offset;
+  auto source_position = source_offset;
+  const auto limit = last - snapshot_first;
+  auto* local = queue.local_sges.data();
+  auto* remote = queue.remote_sges.data();
+  auto* requests = queue.wrs.data();
+  auto sequence = worker.sequence;
+  auto wr_count = queue.wr_count;
+  const auto wr_limit = wr_count + std::min(batch_wrs, kGatherWaveWrs - wr_count);
+  while (index < limit && wr_count < wr_limit) {
+    const auto wr_index = wr_count++;
+    const auto local_begin = local_index;
+    std::uint32_t bytes = 0U, local_count = 0U;
+    const auto source = layout.staging + source_position;
+    while (index < limit && local_count < layout.sgl_size && bytes < 65536U) {
+      const auto& span = spans[index];
+      const auto length = std::min(span.length - offset, 65536U - bytes);
+      local[local_index++] = {layout.output + span.offset + offset, length, layout.local_segment,
+                              nullptr};
+      ++local_count;
+      bytes += length;
+      source_position += length;
+      offset += length;
+      if (offset == span.length) {
+        ++index;
+        offset = 0U;
+      }
+    }
+    remote[wr_index] = {source, bytes, layout.remote_segment, nullptr};
+    auto wr = layout.prototype;
+    wr.user_ctx = ++sequence;
+    wr.rw.src.sge = reinterpret_cast<urma_sge_t*>(&remote[wr_index]);
+    wr.rw.dst.sge = reinterpret_cast<urma_sge_t*>(local + local_begin);
+    wr.rw.dst.num_sge = local_count;
+    wr.next = requests + wr_index + 1U;
+    requests[wr_index] = wr;
+  }
+  if (wr_count != 0U) {
+    auto& tail = requests[wr_count - 1U];
+    tail.next = nullptr;
+    const bool final = index == limit || wr_count == kGatherWaveWrs;
+    tail.flag.bs.place_order = final ? URMA_STRONG_ORDER : URMA_RELAX_ORDER;
+    tail.flag.bs.complete_enable = final;
+  }
+  queue.wr_count = wr_count;
+  worker.sequence = sequence;
+  span_index = snapshot_first + index;
+  span_offset = offset;
+  source_offset = source_position;
+}
+
+struct GatherPrefix {
+  const GatherReadArgs& args;
+  GatherReadStatus& gather;
+  std::uint32_t worker_index;
+  std::uint64_t ready_bytes = 0;
+};
+
+bool WaitBatchPrefix(GatherPrefix& prefix, const urma_jfs_wr_t& tail,
+                     UmdkControlStatus& submitted) {
+  const auto& args = prefix.args;
+  const auto& source = *reinterpret_cast<const Sge*>(tail.rw.src.sge);
+  const auto required = source.addr + source.len - args.remote_staging;
+  if (required <= prefix.ready_bytes) return true;
+  auto& gather = prefix.gather;
+  gather.phase = 5;
+  const auto scratch = args.scratch + prefix.worker_index * 64U;
+  const UmdkTransfer transfer{
+      args.remote_descriptor + offsetof(kvaf::peer::GatherDescriptorHeader, ready_bytes), scratch,
+      8};
+  bool success = false;
+  for (std::uint32_t poll = 0; poll < 10000; ++poll) {
+    FlushUmdkCache(reinterpret_cast<const void*>(scratch), 8);
+    UmdkControlStatus query{};
+    // The dedicated control Jetty can complete this query while data READs
+    // remain outstanding; controls use their own WR storage.
+    if (!TransferControl(false, &transfer, 1, query)) {
+      errno = query.error_number;
+      Fail(submitted, query.stage, query.result);
+      gather.result = 16;
+      break;
+    }
+    FlushUmdkCache(reinterpret_cast<const void*>(scratch), 8);
+    prefix.ready_bytes = *reinterpret_cast<const volatile std::uint64_t*>(scratch);
+    if ((prefix.ready_bytes & kvaf::peer::kGatherErrorBit) != 0 ||
+        prefix.ready_bytes > args.bytes) {
+      gather.result = 10;
+      Fail(submitted, "CPU ready prefix error");
+      break;
+    }
+    if (prefix.ready_bytes >= required) {
+      success = true;
+      break;
+    }
+  }
+  if (!success) {
+    gather.ack_seen = prefix.ready_bytes;
+    if (gather.result == 0) {
+      gather.result = 9;
+      errno = ETIMEDOUT;
+      Fail(submitted, "waiting for CPU ready prefix timed out", ETIMEDOUT);
+    }
+  } else
+    gather.phase = 4;
+  return success;
+}
+
+bool ScatterQueue(Worker& worker, const GatherReadArgs& args, GatherReadStatus& status,
+                  std::uint32_t first, std::uint32_t last, std::uint64_t remote_offset,
+                  UmdkControlStatus& error, std::uint32_t timeout_ms,
+                  std::uint32_t worker_index = 0) {
+  if (first == last) return true;
+  const auto snapshot_first = first;
+  SnapshotGatherTargets(ReadQueue(worker), args, first, last);
+  const GatherBuildLayout layout(worker, args);
+  GatherPrefix prefix{args, status, worker_index};
+  std::uint32_t span_offset = 0;
+  while (first < last) {
+    auto& queue = ReadQueue(worker);
+    BeginGatherWave(queue, layout.sgl_size);
+    std::uint32_t local_index = 0;
+    const auto start = NowNs();  // Deadline only; no per-stage profiling.
+    do {
+      const auto batch_first = queue.wr_count;
+      AppendGatherBatch(worker, layout, first, last, span_offset, remote_offset, snapshot_first,
+                        args.sq_batch_wqes, local_index);
+      auto* tail = &queue.wrs[queue.wr_count - 1U];
+      if ((args.pipeline_chunk_bytes && !WaitBatchPrefix(prefix, *tail, error)) ||
+          !PostBatch(worker, &queue.wrs[batch_first], tail, batch_first,
+                     queue.wr_count - batch_first, error)) {
+        worker.poisoned = true;
+        return false;
+      }
+    } while (first < last && queue.wr_count < kGatherWaveWrs);
+    // Retain every WR/SGL slot until the final ordered CQE for this wave.
+    if (!WaitCompletion(worker, queue.wrs[queue.wr_count - 1U].user_ctx, start, timeout_ms, error))
+      return false;
+  }
+  return true;
+}
+
+}  // namespace
+std::uint32_t GatherScatter(const kvaf::aicpu_urma::GatherReadArgs* args,
+                            kvaf::aicpu_urma::GatherReadStatus* status, std::uint32_t first,
+                            std::uint32_t last, std::uint64_t remote_offset,
+                            std::uint32_t worker_index) {
+  std::shared_lock<std::shared_mutex> lock(state_mutex);
+  if (args == nullptr || status == nullptr || worker_index >= state.worker_count ||
+      std::max(1U, args->worker_count) != state.worker_count ||
+      args->context.owner_pid != static_cast<std::uint64_t>(getpid()) ||
+      args->context.session != state.session ||
+      LocalSegment(args->output, args->output_extent) == nullptr || first > last ||
+      last > args->output_span_count || args->sgl_size == 0 || args->sq_batch_wqes == 0)
+    return 16;
+  std::lock_guard<std::mutex> worker_lock(worker_mutexes[worker_index]);
+  auto& worker = GetWorker(worker_index);
+  if (worker.poisoned || worker.target == nullptr) return 16;
+  UmdkControlStatus timeline{};
+  if (!ScatterQueue(worker, *args, *status, first, last, remote_offset, timeline, 1000,
+                    worker_index)) {
+    std::fprintf(stderr,
+                 "GATHER_UMDK_READ_ERROR worker=%u stage=%s result=%d errno=%d cq_status=%d "
+                 "cq_context=%llu\n",
+                 worker_index, timeline.stage, timeline.result, timeline.error_number,
+                 timeline.cq_status, static_cast<unsigned long long>(timeline.cq_context));
+    status->cqe_word = timeline.cq_status != 0 ? timeline.cq_status : timeline.error_number;
+    return status->result != 0 ? static_cast<std::uint32_t>(status->result) : 16;
+  }
+  return 0;
+}
+
+namespace {
+
+bool InRange(std::uint64_t base, std::uint64_t size, std::uint64_t address, std::uint64_t bytes) {
+  return bytes && address >= base && bytes <= size && address - base <= size - bytes;
+}
+void Flush(const void* address, std::uint64_t bytes) { FlushUmdkCache(address, bytes); }
+
+void WaitAck(const GatherReadArgs& args, GatherReadStatus& status) {
+  const UmdkTransfer transfer{args.remote_ack, args.scratch + 8U, 8U};
+  for (unsigned poll = 0; poll < 10000U; ++poll) {
+    Flush(reinterpret_cast<void*>(transfer.local), transfer.bytes);
+    status.result = UmdkTransferSync(&args.context, false, &transfer, 1U, 0U);
+    if (status.result) return;
+    Flush(reinterpret_cast<void*>(transfer.local), transfer.bytes);
+    status.ack_seen = *reinterpret_cast<const volatile std::uint64_t*>(transfer.local);
+    if (status.ack_seen == args.sequence) return;
+    if (status.ack_seen == (args.sequence | kvaf::peer::kGatherErrorBit)) {
+      status.result = 10U;
+      return;
+    }
+  }
+  status.result = 9U;
+}
+
+void ReadRange(const GatherReadArgs& args, unsigned worker, GatherReadStatus& status) {
+  const auto first =
+      static_cast<std::uint64_t>(args.output_span_count) * worker / args.worker_count;
+  const auto last =
+      static_cast<std::uint64_t>(args.output_span_count) * (worker + 1U) / args.worker_count;
+  const auto* queues = reinterpret_cast<const GatherQueueState*>(args.queue_state);
+  status.phase = 4U;
+  status.result = GatherScatter(&args, &status, first, last, queues[worker].staging_offset, worker);
+  const auto* targets = reinterpret_cast<const kvaf::GatherOutputSpan*>(args.output_spans);
+  for (auto index = first; index < last; ++index)
+    Flush(reinterpret_cast<void*>(args.output + targets[index].offset), targets[index].length);
+}
+
+bool BuildCurrentRequest(const UmdkBatchGetArgs& launch, GatherReadArgs& args) {
+  const auto& request = launch.request;
+  const auto n = request.request_capacity;
+  UmdkMemory memory{};
+  if (!request.address_table || !request.valid_table || !request.indices || !request.offsets ||
+      !request.mask || !request.output_indices || !args.output || !request.token_bytes ||
+      !request.tokens_per_block || n > kGatherMaxSpans ||
+      UmdkGetMemory(&args.context, args.output, args.output_extent, &memory))
+    return false;
+  Flush(reinterpret_cast<void*>(request.address_table), request.table_capacity * 8ULL);
+  Flush(reinterpret_cast<void*>(request.valid_table), request.table_capacity);
+  Flush(reinterpret_cast<void*>(request.indices), n * 4ULL);
+  Flush(reinterpret_cast<void*>(request.offsets), n * 4ULL);
+  Flush(reinterpret_cast<void*>(request.mask), n);
+  Flush(reinterpret_cast<void*>(request.output_indices), n * 4ULL);
+  const auto* addresses = reinterpret_cast<const std::uint64_t*>(request.address_table);
+  const auto* valid = reinterpret_cast<const std::uint8_t*>(request.valid_table);
+  const auto* indices = reinterpret_cast<const std::int32_t*>(request.indices);
+  const auto* offsets = reinterpret_cast<const std::int32_t*>(request.offsets);
+  const auto* mask = reinterpret_cast<const std::uint8_t*>(request.mask);
+  const auto* output_indices = reinterpret_cast<const std::int32_t*>(request.output_indices);
+  auto* descriptor = reinterpret_cast<kvaf::peer::GatherDescriptorHeader*>(args.source_descriptor);
+  auto* sources = reinterpret_cast<kvaf::peer::GatherSpan*>(descriptor + 1);
+  auto* targets = reinterpret_cast<kvaf::GatherOutputSpan*>(args.output_spans);
+  const auto block_bytes =
+      static_cast<std::uint64_t>(request.token_bytes) * request.tokens_per_block;
+  std::uint64_t total = 0;
+  for (unsigned i = 0; i < n; ++i) {
+    if (!mask[i]) continue;
+    const auto index = indices[i], offset = offsets[i], row = output_indices[i];
+    if (index < 0 || static_cast<unsigned>(index) >= request.table_capacity || !valid[index] ||
+        offset < 0 || static_cast<std::uint64_t>(offset) > block_bytes - request.token_bytes ||
+        row < 0 || static_cast<unsigned>(row) >= request.output_rows ||
+        !InRange(memory.remote_base, args.remote_staging - memory.remote_base, addresses[index],
+                 block_bytes) ||
+        total > UINT32_MAX - request.token_bytes)
+      return false;
+    sources[args.source_span_count++] = {addresses[index] + offset, request.token_bytes, 0U};
+    const auto output_offset = static_cast<std::uint64_t>(row) * request.token_bytes;
+    targets[args.output_span_count++] = {output_offset, request.token_bytes, 0U};
+    total += request.token_bytes;
+  }
+  args.bytes = total;
+  *descriptor = {kvaf::peer::kGatherDescriptorMagic,
+                 args.sequence,
+                 args.remote_staging,
+                 args.source_span_count,
+                 args.bytes,
+                 args.pipeline_chunk_bytes};
+  Flush(descriptor, kvaf::peer::GatherDescriptorBytes(args.source_span_count));
+  Flush(targets, args.output_span_count * sizeof(*targets));
+  Flush(reinterpret_cast<void*>(args.output), args.output_extent);
+  return true;
+}
+
+bool StartGather(GatherReadArgs& args, GatherReadStatus& status) {
+  const auto* targets = reinterpret_cast<const kvaf::GatherOutputSpan*>(args.output_spans);
+  auto* queues = reinterpret_cast<GatherQueueState*>(args.queue_state);
+  std::uint64_t bytes = 0U;
+  unsigned next = 0U;
+  for (unsigned i = 0; i < args.output_span_count; ++i) {
+    while (next < args.worker_count &&
+           i == static_cast<std::uint64_t>(args.output_span_count) * next / args.worker_count)
+      queues[next++].staging_offset = bytes;
+    bytes += targets[i].length;
+  }
+  while (next < args.worker_count) queues[next++].staging_offset = bytes;
+  const UmdkTransfer descriptor{args.remote_descriptor, args.source_descriptor,
+                                kvaf::peer::GatherDescriptorBytes(args.source_span_count)};
+  status.phase = 1U;
+  status.result = UmdkTransferSync(&args.context, true, &descriptor, 1U, 0U);
+  if (status.result) return false;
+  status.phase = 2U;
+  auto* scratch = reinterpret_cast<std::uint64_t*>(args.scratch);
+  scratch[0] = args.sequence;
+  scratch[1] = 0U;
+  scratch[2] = args.remote_descriptor;
+  Flush(scratch, 24U);
+  const UmdkTransfer notify[] = {{args.remote_command, args.scratch + 16U, 8U},
+                                 {args.remote_notify, args.scratch, 8U}};
+  status.result = UmdkTransferSync(&args.context, true, notify, 2U, 0U);
+  if (!status.result && !args.pipeline_chunk_bytes) {
+    status.phase = 3U;
+    WaitAck(args, status);
+  }
+  if (!status.result)
+    __atomic_store_n(&queues[0].pipeline_sequence, args.sequence, __ATOMIC_RELEASE);
+  return !status.result;
+}
+}  // namespace
+
+std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
+  if (!launch || !launch->gather.core_status || !launch->gather.scratch ||
+      !launch->gather.queue_state || !launch->gather.worker_count ||
+      launch->gather.worker_count > 8U)
+    return 1U;
+  auto& args = *reinterpret_cast<GatherReadArgs*>(launch->gather.scratch + kGatherArgsOffset);
+  args = launch->gather;
+  auto* statuses = reinterpret_cast<GatherReadStatus*>(args.core_status);
+  for (unsigned i = 0; i < args.worker_count; ++i) {
+    statuses[i] = {};
+    statuses[i].magic = kGatherStatusMagic;
+    statuses[i].sequence = args.sequence;
+  }
+  auto* queues = reinterpret_cast<GatherQueueState*>(args.queue_state);
+  queues[0].next_worker = queues[0].pipeline_sequence = 0U;
+  auto& status = statuses[0];
+  if (!BuildCurrentRequest(*launch, args))
+    status.result = 2U;
+  else if (!args.bytes)
+    status.ack_seen = args.sequence;
+  else if (StartGather(args, status) && args.worker_count == 1U) {
+    ReadRange(args, 0U, status);
+    if (!status.result && args.pipeline_chunk_bytes) WaitAck(args, status);
+  }
+  Flush(&args, sizeof(args));
+  Flush(queues, args.worker_count * sizeof(*queues));
+  Flush(statuses, args.worker_count * sizeof(*statuses));
+  return status.result ? 1U : 0U;
+}
+
+std::uint32_t ExecuteGatherScatter(UmdkBatchGetArgs* launch) {
+  if (!launch || !launch->gather.scratch) return 1U;
+  auto* current = reinterpret_cast<GatherReadArgs*>(launch->gather.scratch + kGatherArgsOffset);
+  Flush(current, sizeof(*current));
+  const auto args = *current;
+  auto* queues = reinterpret_cast<GatherQueueState*>(args.queue_state);
+  auto* statuses = reinterpret_cast<GatherReadStatus*>(args.core_status);
+  const auto worker = __atomic_fetch_add(&queues[0].next_worker, 1U, __ATOMIC_RELAXED);
+  if (worker >= args.worker_count) return 1U;
+  auto& status = statuses[worker];
+  if (!args.bytes) return 0U;
+  if (__atomic_load_n(&queues[0].pipeline_sequence, __ATOMIC_ACQUIRE) != args.sequence)
+    status.result = 11U;
+  else {
+    ReadRange(args, worker, status);
+    if (!worker && !status.result && args.pipeline_chunk_bytes) WaitAck(args, status);
+  }
+  Flush(&status, sizeof(status));
+  return status.result ? 1U : 0U;
+}
+
+}  // namespace kvaf::aicpu_urma

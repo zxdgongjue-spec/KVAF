@@ -1,0 +1,20 @@
+#pragma once
+#include <acl/acl.h>
+
+#include "access_operator.h"
+#include "aicpu_batch_put/include/batch_put_abi.h"
+namespace kvaf::aicpu_urma {
+class UmdkSession;
+class BatchPutTransport {
+ public:
+  explicit BatchPutTransport(UmdkSession& session) : session_(session) {}
+  Status Execute(const RemoteRegionDesc&, const BatchPutExecRequest&);
+  void Shutdown();
+
+ private:
+  UmdkSession& session_;
+  void* transfers_{nullptr};
+  std::size_t capacity_{0};
+};
+int32_t LaunchBatchPut(const BatchPutKernelArgs*, aclrtStream);
+}  // namespace kvaf::aicpu_urma

@@ -6,7 +6,7 @@
 namespace kvaf::aicpu_urma {
 
 // Maintain AICPU cache visibility for DMA buffers.
-inline void FlushGatherCacheLines(const void* address, std::uint64_t bytes) {
+inline void FlushUmdkCacheLines(const void* address, std::uint64_t bytes) {
 #if defined(__linux__) && defined(__aarch64__)
   const auto first = reinterpret_cast<std::uintptr_t>(address) & ~std::uintptr_t{63};
   const auto end = reinterpret_cast<std::uintptr_t>(address) + bytes;
@@ -18,8 +18,8 @@ inline void FlushGatherCacheLines(const void* address, std::uint64_t bytes) {
 #endif
 }
 
-inline void FlushGatherCache(const void* address, std::uint64_t bytes) {
-  FlushGatherCacheLines(address, bytes);
+inline void FlushUmdkCache(const void* address, std::uint64_t bytes) {
+  FlushUmdkCacheLines(address, bytes);
   std::atomic_signal_fence(std::memory_order_seq_cst);
 }
 

@@ -3,7 +3,7 @@
 #include <limits>
 
 #include "access_operator.h"
-#include "batch_get_abi.h"
+#include "../demo/aiv_batch_get/include/batch_get_abi.h"
 
 namespace kvaf::detail {
 struct BatchGetExecutionState {
