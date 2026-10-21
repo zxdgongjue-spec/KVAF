@@ -26,6 +26,7 @@ enum class Command : uint16_t {
   kReleaseRegion = 3U,
   kGetCandidateCount = 4U,
   kEnableDirectGather = 9U,
+  kEnableGatherLanes = 10U,
 };
 
 enum class Result : int32_t {
@@ -111,6 +112,12 @@ struct EnableDirectGatherRequest {
   MessageHeader header;
   uint64_t session_id;
 };
+struct EnableGatherLanesRequest {
+  MessageHeader header;
+  uint64_t session_id;
+  uint64_t control_address;
+  uint32_t lanes;
+};
 #pragma pack(pop)
 
 static_assert(sizeof(MessageHeader) == 12U, "wire header ABI changed");
@@ -119,6 +126,7 @@ static_assert(sizeof(CandidateCountRequest) == 12U, "candidate count request ABI
 static_assert(sizeof(CandidateCountResponse) == 20U, "candidate count response ABI changed");
 static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed");
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");
+static_assert(sizeof(EnableGatherLanesRequest) == 32U, "gather lanes request ABI changed");
 
 inline constexpr uint16_t ResponseCommand(Command command) {
   return static_cast<uint16_t>(command) | 0x8000U;

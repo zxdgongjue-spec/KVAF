@@ -31,7 +31,7 @@ std::uint64_t NowNs() {
 State state;
 std::shared_mutex state_mutex;
 std::array<std::mutex, 8> worker_mutexes;
-std::mutex control_mutex;
+std::array<std::mutex, 8> control_mutexes;
 std::uint64_t generation = 0;
 
 Worker& GetWorker(std::uint32_t index) {
@@ -41,6 +41,8 @@ Worker& GetWorker(std::uint32_t index) {
 Worker* SetupQueue(std::uint32_t index) {
   if (index < state.worker_count) return &GetWorker(index);
   if (index == kUmdkControlQueueIndex) return state.control.get();
+  if (index > kUmdkControlQueueIndex && index < kUmdkControlQueueIndex + state.worker_count)
+    return state.extra_controls[index - kUmdkControlQueueIndex - 1U].get();
   return nullptr;
 }
 
@@ -79,6 +81,8 @@ bool Cleanup(UmdkControlStatus& status) {
     if (!CleanupWorker(GetWorker(index), status)) return false;
   }
   if (state.control && !CleanupWorker(*state.control, status)) return false;
+  for (auto& control : state.extra_controls)
+    if (control && !CleanupWorker(*control, status)) return false;
 #define KVAF_RELEASE(member, function)                       \
   if (state.member != nullptr) {                             \
     errno = 0;                                               \
@@ -252,6 +256,10 @@ bool Prepare(const UmdkControlArgs& args, UmdkControlStatus& status) {
   for (std::uint32_t index = 0; index < state.worker_count; ++index) {
     if (index != 0) state.extra_workers[index - 1] = std::make_unique<Worker>();
     if (!CreateWorker(args, status, GetWorker(index))) return false;
+    if (index != 0) {
+      state.extra_controls[index - 1] = std::make_unique<Worker>();
+      if (!CreateWorker(args, status, *state.extra_controls[index - 1])) return false;
+    }
   }
   Stage(status, "urma_alloc_token_id");
   state.token = state.api.urma_alloc_token_id(state.context);
@@ -482,10 +490,10 @@ bool TransferQueue(Worker& worker, bool write, const UmdkTransfer* transfers, st
 
 // The control Jetty has its own lock and never polls a data CQ.
 bool TransferControl(bool write, const UmdkTransfer* transfers, std::uint32_t count,
-                     UmdkControlStatus& status) {
-  auto* control = SetupQueue(kUmdkControlQueueIndex);
+                     UmdkControlStatus& status, std::uint32_t worker_index) {
+  auto* control = SetupQueue(kUmdkControlQueueIndex + worker_index);
   if (!control) return Fail(status, "control queue is unavailable");
-  std::lock_guard<std::mutex> control_lock(control_mutex);
+  std::lock_guard<std::mutex> control_lock(control_mutexes[worker_index]);
   return TransferQueue(*control, write, transfers, count, status);
 }
 
@@ -513,7 +521,7 @@ std::uint32_t UmdkTransferSync(const UmdkContext* args, bool write, const UmdkTr
       args->owner_pid != static_cast<std::uint64_t>(getpid()) || worker_index >= state.worker_count)
     return 16;
   UmdkControlStatus status{};
-  const bool success = TransferControl(write, transfers, count, status);
+  const bool success = TransferControl(write, transfers, count, status, worker_index);
   if (!success)
     std::fprintf(stderr,
                  "UMDK_CONTROL_ERROR worker=%u write=%u stage=%s result=%d errno=%d cq_status=%d\n",

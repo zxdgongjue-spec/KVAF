@@ -6,6 +6,7 @@
 #include "peer_link.h"
 #include "cpu_gather.h"
 #include "cpu_gather_team.h"
+#include "gather_workspace.h"
 
 #include <dlfcn.h>
 #include <sys/socket.h>
@@ -49,6 +50,7 @@ using kvaf::peer::Command;
 using kvaf::peer::CreateChannelRequest;
 using kvaf::peer::CreateChannelResponse;
 using kvaf::peer::EnableDirectGatherRequest;
+using kvaf::peer::EnableGatherLanesRequest;
 using kvaf::peer::GatherSpan;
 using kvaf::peer::IsValidHeader;
 using kvaf::peer::MakeHeader;
@@ -278,10 +280,12 @@ class CpuGatherWorker {
  public:
   CpuGatherWorker(void* memory, uint64_t base, uint64_t bytes,
                   std::size_t threads, std::size_t min_bytes, bool affinity,
-                  CpuGatherMode mode)
+                  CpuGatherMode mode, uint64_t control_address = 0U,
+                  std::size_t cpu_offset = 0U)
       : memory_(static_cast<std::uint8_t*>(memory)), base_(base), bytes_(bytes),
-        control_(reinterpret_cast<peer::GatherControl*>(memory_ + peer::GatherControlOffset(bytes))),
-        team_(memory, base, threads, min_bytes, TeamWaitMode(mode), affinity), mode_(mode) {
+        control_(reinterpret_cast<peer::GatherControl*>(memory_ +
+            (control_address ? control_address - base : peer::GatherControlOffset(bytes)))),
+        team_(memory, base, threads, min_bytes, TeamWaitMode(mode), affinity, cpu_offset), mode_(mode) {
     std::memset(control_, 0, sizeof(*control_));
     peer::GatherBarrier();
     worker_ = std::thread(&CpuGatherWorker::Run, this);
@@ -348,6 +352,7 @@ struct Region {
   uint32_t token_value = 0U;
   std::vector<Channel> channels;
   std::unique_ptr<CpuGatherWorker> gather;
+  std::vector<std::unique_ptr<CpuGatherWorker>> gather_lanes;
 };
 
 class CpuService {
@@ -537,7 +542,7 @@ class CpuService {
     const auto found = regions_.find(session_id);
     if (found == regions_.end()) return Result::kNotFound;
     Region& region = *found->second;
-    if (region.gather != nullptr) return Result::kResourceError;
+    if (region.gather != nullptr || !region.gather_lanes.empty()) return Result::kResourceError;
     try {
       region.gather = std::make_unique<CpuGatherWorker>(
           region.memory, region.base, region.bytes, gather_threads_,
@@ -546,6 +551,34 @@ class CpuService {
       Log("[KVAF_CPU] GATHER_DIRECT_ENABLE_FAILED reason=%s\n", error.what());
       return Result::kResourceError;
     }
+    return Result::kOk;
+  }
+
+  Result EnableGatherLanes(uint64_t session_id, uint64_t control_address, uint32_t lanes) {
+    const auto found = regions_.find(session_id);
+    if (found == regions_.end()) return Result::kNotFound;
+    auto& region = *found->second;
+    if (!lanes || lanes > kGatherMaxWorkers || lanes > gather_threads_ || control_address % 64U ||
+        !peer::GatherRange(region.base, peer::GatherControlOffset(region.bytes), control_address,
+                           lanes * sizeof(peer::GatherControl)))
+      return Result::kInvalidRequest;
+    if (region.gather || !region.gather_lanes.empty()) return Result::kResourceError;
+    std::vector<std::unique_ptr<CpuGatherWorker>> created;
+    std::size_t cpu_offset = 0U;
+    try {
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        const auto budget = gather_threads_ / lanes + (lane < gather_threads_ % lanes ? 1U : 0U);
+        created.push_back(std::make_unique<CpuGatherWorker>(
+            region.memory, region.base, region.bytes, budget, min_bytes_per_thread_,
+            gather_affinity_, gather_mode_, control_address + lane * sizeof(peer::GatherControl),
+            cpu_offset));
+        cpu_offset += budget;
+      }
+    } catch (const std::exception& error) {
+      Log("[KVAF_CPU] GATHER_LANE_SETUP_FAILED reason=%s\n", error.what());
+      return Result::kResourceError;
+    }
+    region.gather_lanes = std::move(created);
     return Result::kOk;
   }
 
@@ -585,6 +618,7 @@ class CpuService {
       return;
     }
     region->gather.reset();
+    region->gather_lanes.clear();
     while (!region->channels.empty()) region->channels.pop_back();
     if (region->segment != nullptr) {
       (void)urma_unregister_seg(region->segment);
@@ -704,6 +738,19 @@ void HandleClient(int fd, CpuService* service) {
         return;
       }
       SendStatus(fd, command, service->EnableDirectGather(request.session_id));
+      return;
+    }
+    case Command::kEnableGatherLanes: {
+      EnableGatherLanesRequest request{};
+      request.header = header;
+      if (!IsValidHeader(header, command, sizeof(request)) ||
+          !ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header),
+                   sizeof(request) - sizeof(header))) {
+        SendStatus(fd, command, Result::kInvalidRequest);
+        return;
+      }
+      SendStatus(fd, command,
+                 service->EnableGatherLanes(request.session_id, request.control_address, request.lanes));
       return;
     }
 

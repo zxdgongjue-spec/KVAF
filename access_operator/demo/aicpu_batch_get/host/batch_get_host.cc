@@ -21,7 +21,6 @@ struct BatchGetTransport::Impl {
   RemoteRegionDesc region;
   BatchGetExecutionState execution;
   void* workspace{nullptr};
-  std::uint64_t remote_bytes{0};
   void* status_host{nullptr};
   aclrtStream pending{nullptr};
   std::uint64_t sequence{0U};
@@ -45,7 +44,8 @@ Status BatchGetTransport::Initialize(const RemoteRegionDesc& region) {
   if (aclrtMalloc(&state.status, state.status_bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
       aclrtMalloc(&state.queue_state, state.queue_state_bytes, ACL_MEM_MALLOC_HUGE_FIRST) !=
           ACL_SUCCESS ||
-      aclrtMalloc(&impl_->workspace, kGatherWorkspaceBytes, ACL_MEM_MALLOC_HUGE_FIRST) !=
+      aclrtMalloc(&impl_->workspace, GatherWorkspaceBytes(impl_->session.config().workers),
+                  ACL_MEM_MALLOC_HUGE_FIRST) !=
           ACL_SUCCESS ||
       aclrtMallocHost(&impl_->status_host, state.status_bytes) != ACL_SUCCESS) {
     (void)Shutdown();
@@ -58,11 +58,11 @@ Status BatchGetTransport::Initialize(const RemoteRegionDesc& region) {
     return found;
   }
   if (!impl_->token_bytes ||
-      registered.length < region.length + GatherRemoteWorkspaceBytes(impl_->token_bytes)) {
+      registered.length < region.length +
+          GatherRemoteWorkspaceBytes(impl_->token_bytes, impl_->session.config().workers)) {
     (void)Shutdown();
     return InvalidArgument("UMDK BatchGet requires reserved remote gather workspace");
   }
-  impl_->remote_bytes = registered.length;
   impl_->region = region;
   impl_->initialized = true;
   return Status::OK();
@@ -95,12 +95,16 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
   auto ensure = [&](void* buffer, std::size_t bytes) {
     return impl_->session.Ensure(impl_->region.base, buffer, bytes);
   };
-  auto ready = ensure(impl_->workspace, kGatherWorkspaceBytes);
+  const auto workers = impl_->session.config().workers;
+  auto ready = ensure(impl_->workspace, GatherWorkspaceBytes(workers));
   if (!ready.ok()) return ready;
   ready = ensure(exec.request->output.data, exec.request->output.bytes);
   if (!ready.ok()) return ready;
+  const auto staging = (impl_->region.base + impl_->region.length + 63U) & ~std::uint64_t{63U};
+  const auto descriptors = staging + GatherStagingBytes(impl_->token_bytes, workers);
+  const auto controls = descriptors + workers * GatherLaneDescriptorBytes(workers);
   if (!impl_->cpu_enabled) {
-    ready = impl_->session.config().peer_link->EnableDirectGather(impl_->region.base);
+    ready = impl_->session.config().peer_link->EnableGatherLanes(impl_->region.base, controls, workers);
     if (!ready.ok()) return ready;
     impl_->cpu_enabled = true;
   }
@@ -113,17 +117,21 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
   args.core_status = PointerValue(impl_->execution.status);
   args.scratch = PointerValue(impl_->workspace);
   args.source_descriptor = args.scratch + kGatherDescriptorOffset;
-  args.output_spans = args.scratch + kGatherTargetsOffset;
+  args.output_spans = args.scratch + GatherTargetsOffset(workers);
   args.output = PointerValue(exec.request->output.data);
   args.output_extent = exec.request->output.bytes;
-  args.remote_staging = (impl_->region.base + impl_->region.length + 63U) & ~std::uint64_t{63U};
-  args.remote_descriptor = args.remote_staging + GatherStagingBytes(impl_->token_bytes);
-  args.remote_notify = impl_->region.base + peer::GatherControlOffset(impl_->remote_bytes);
+  args.remote_staging = staging;
+  args.remote_descriptor = descriptors;
+  args.remote_data_bytes = impl_->region.length;
+  args.remote_notify = controls;
   args.remote_ack = args.remote_notify + 8U;
   args.remote_command = args.remote_notify + 16U;
   args.worker_count = impl_->session.config().workers;
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);
   impl_->pending = stream;
+  if (aclrtMemsetAsync(impl_->execution.queue_state, impl_->execution.queue_state_bytes, 0,
+                       impl_->execution.queue_state_bytes, stream) != ACL_SUCCESS)
+    return Internal("BatchGet worker counter reset failed");
   if (LaunchBatchGet(&launch, stream)) return Internal("UMDK BatchGet launch failed");
   if (!exec.execution.synchronize) return Status::OK();
   if (aclrtMemcpyAsync(impl_->status_host, impl_->execution.status_bytes, impl_->execution.status,

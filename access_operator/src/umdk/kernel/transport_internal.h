@@ -83,6 +83,7 @@ struct State : Worker {
   std::uint32_t worker_count = 1;
   std::array<std::unique_ptr<Worker>, 7> extra_workers;
   std::unique_ptr<Worker> control;
+  std::array<std::unique_ptr<Worker>, 7> extra_controls;
   std::vector<RegisteredBuffer> buffers;
 };
 
@@ -99,5 +100,6 @@ bool WaitCompletion(Worker&, std::uint64_t context, std::uint64_t start, std::ui
                     UmdkControlStatus&);
 urma_target_seg_t* LocalSegment(std::uint64_t address, std::uint64_t bytes,
                                 std::uint64_t* available = nullptr);
-bool TransferControl(bool write, const UmdkTransfer*, std::uint32_t count, UmdkControlStatus&);
+bool TransferControl(bool write, const UmdkTransfer*, std::uint32_t count, UmdkControlStatus&,
+                     std::uint32_t worker_index = 0U);
 }  // namespace kvaf::aicpu_urma::detail

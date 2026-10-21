@@ -113,9 +113,9 @@ Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t 
     return Status::Internal("invalid UMDK peer descriptor");
   args_.segment_bytes = region.segment_key_bytes;
   std::copy_n(region.segment_key.begin(), args_.segment_bytes, args_.segment);
-  for (std::uint32_t queue = 0; queue < workers + 1U; ++queue) {
-    const bool control = queue == 0U;
-    const auto index = control ? kUmdkControlQueueIndex : queue - 1U;
+  for (std::uint32_t queue = 0; queue < workers * 2U; ++queue) {
+    const bool control = queue < workers;
+    const auto index = control ? kUmdkControlQueueIndex + queue : queue - workers;
     args_.worker_index = index;
     auto descriptor = prepared;
     if (index != 0) {

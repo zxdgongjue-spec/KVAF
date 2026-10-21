@@ -4,7 +4,3 @@ extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuGatherR
     kvaf::aicpu_urma::UmdkBatchGetArgs* args) {
   return kvaf::aicpu_urma::ExecuteGatherRead(args);
 }
-extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuGatherScatter(
-    kvaf::aicpu_urma::UmdkBatchGetArgs* args) {
-  return kvaf::aicpu_urma::ExecuteGatherScatter(args);
-}

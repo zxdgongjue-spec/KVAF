@@ -1,7 +1,8 @@
 # Python BatchGet 使用 AICPU UMDK 流水
 
-已有的 `NpuRuntime.batch_get` 可以选择 UMDK 后端。AICPU 从本轮 NPU Tensor 生成源清单，
-CPU gather 到连续 DDR staging；每完成 128 KiB 连续前缀，AICPU 就提交对应 READ。
+已有的 `NpuRuntime.batch_get` 可以选择 UMDK 后端。一次 launch 启动 N 个 AICPU 实例，
+各自从本轮 NPU Tensor 的输入区间生成源清单，请求 CPU gather 到自己的 DDR staging 区间，
+查询自己的就绪前缀、提交 READ，并等待自己的完成通知和 CPU ACK。
 indices、offsets、mask、output_indices 和数据可以每轮变化，不缓存上一轮内容。
 
 ## 构建和启动
@@ -69,12 +70,18 @@ runtime.shutdown()
 
 ## 执行和资源约定
 
-1..8 个 AICPU worker 共用一对 TP，每个 worker 有独立数据 Jetty/CQ；另有一条专用控制 Jetty/CQ。
+1..8 个 AICPU worker 共用一对 TP，每个 worker 有独立数据 Jetty/CQ 和控制 Jetty/CQ。
 CPU 侧每条通道也各有独立 Jetty/RQ/CQ。CPU 与 AICPU 共用端点枚举、队列创建和 TP/Jetty 扩展代码；
 AICPU 进程内的 liburma 动态加载与会话由 AICPU 自己维护。
 
+每个 worker 负责输入请求下标的一个连续区间，在本区间内跳过 mask=0 的条目。
+描述头、源清单、command、notify、ACK、ready_bytes 和 CPU gather 处理对象均按 worker 独立。
+CPU 服务的 `--gather-threads` 是全部 worker 的总预算，须不小于 AICPU worker 数；
+预算在 worker 之间均分，余数从 worker 0 开始分配。每个 worker 每完成 128 KiB 连续前缀即可开始 READ。
+
 每次最多 65536 项；token 大小由构造参数指定，最大总载荷须能用 uint32 表示。
-Runtime 在用户指定 DDR 数据容量之外预留 `65536 * token_bytes` 的 staging、源描述符和控制区，
+Runtime 在用户指定 DDR 数据容量之外按 worker 数预留 staging、源描述符和控制区，
+每个 staging 区间可容纳 `ceil(65536 / worker_count)` 个 token，并单独对齐到 64 字节。
 这些空间不进入 KV slot 分配。HBM 描述符和 scratch 使用独立内部缓冲，输出 Tensor 无需额外尾部空间。
 READ 使用 SGL 6、每次提交 32 条 WR；每波最多 4096 条 WR，只请求最后一条的有序 CQE，完成后复用 WR/SGL 空间。
 

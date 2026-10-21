@@ -312,4 +312,22 @@ Status PeerLink::EnableDirectGather(uint64_t region_base) const {
   return Status::OK();
 }
 
+Status PeerLink::EnableGatherLanes(uint64_t region_base, uint64_t control_address,
+                                  uint32_t lanes) const {
+  const auto found = regions_.find(region_base);
+  if (found == regions_.end()) return Status::NotFound("peer DDR region was not found");
+  EnableGatherLanesRequest request{};
+  request.header = MakeHeader(Command::kEnableGatherLanes, sizeof(request));
+  request.session_id = found->second.session_id;
+  request.control_address = control_address;
+  request.lanes = lanes;
+  StatusResponse response{};
+  std::string error;
+  if (!Exchange(address_, request, &response, &error) ||
+      !IsValidResponseHeader(response.header, Command::kEnableGatherLanes, sizeof(response)) ||
+      !ResultOk(static_cast<Result>(response.result), &error))
+    return ToStatus("peer independent gather enable failed", std::move(error));
+  return Status::OK();
+}
+
 }  // namespace kvaf::peer

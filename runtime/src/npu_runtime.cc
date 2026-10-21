@@ -461,7 +461,8 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
   impl_->config.peer_link = impl_->peer_link;
   auto allocator = std::make_unique<PeerDdrAllocator>(impl_->peer_link,
       impl_->options.aicpu_urma_kernel_json_path.empty() ? 0U :
-          GatherRemoteWorkspaceBytes(impl_->options.batch_get_token_bytes));
+          GatherRemoteWorkspaceBytes(impl_->options.batch_get_token_bytes,
+                                     impl_->options.npu_core_count));
   impl_->peer_allocator = allocator.get();
   impl_->allocator = std::move(allocator);
   impl_->runtime_core.reset();

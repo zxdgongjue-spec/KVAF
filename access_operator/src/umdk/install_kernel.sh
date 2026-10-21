@@ -29,7 +29,6 @@ check_artifacts() {
   check_archive "$dir/$package"
   grep -Fq '"KvafAicpuBatchPut"' "$dir/kernel.json" || die "BatchPut missing from $dir/kernel.json"
   grep -Fq '"KvafAicpuGatherRead"' "$dir/kernel.json" || die "GatherRead missing from $dir/kernel.json"
-  grep -Fq '"KvafAicpuGatherScatter"' "$dir/kernel.json" || die "GatherScatter missing from $dir/kernel.json"
   grep -Fq '"KvafAicpuUmdkControl"' "$dir/kernel.json" || die "UMDK control missing from $dir/kernel.json"
 }
 
@@ -40,7 +39,6 @@ check_installed() {
   check_archive "$kernel_dir/$package"
   grep -Fq '"KvafAicpuBatchPut"' "$config_dir/$json" || die "installed JSON lacks BatchPut"
   grep -Fq '"KvafAicpuGatherRead"' "$config_dir/$json" || die "installed JSON lacks GatherRead"
-  grep -Fq '"KvafAicpuGatherScatter"' "$config_dir/$json" || die "installed JSON lacks GatherScatter"
   grep -Fq '"KvafAicpuUmdkControl"' "$config_dir/$json" || die "installed JSON lacks UMDK control"
   count="$(grep -Fxc "$header" "$load_config" || true)"
   [[ "$count" == 1 ]] || die "expected one $header entry in $load_config, found $count"
