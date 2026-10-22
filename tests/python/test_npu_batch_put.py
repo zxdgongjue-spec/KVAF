@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Single-layer BatchPut bandwidth test; optional KVAF_DSA_* geometry."""
+"""Single-layer BatchPut bandwidth test; optional KVAF_DSA_* geometry.
+
+KVAF_PEER_UB_DEVICE selects the CPU UB device; KVAF_NPU_EIDS selects local
+NPU EIDs. BatchPut uses the first EID when an explicit list is provided.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kvaf
 
 from backend import detect_torch_backend
+from npu_eids import parse_npu_eids
 
 DEFAULT_BATCH_GET_TOKEN_BYTES = 656
 DEFAULT_BATCH_GET_TOKENS_PER_BLOCK = 128
@@ -116,6 +121,8 @@ def main() -> int:
 
     try:
         device_id = int(os.environ.get("DEVICE_ID", "0"))
+        peer_ub_device = os.environ.get("KVAF_PEER_UB_DEVICE", "").strip()
+        npu_eids = parse_npu_eids(os.environ.get("KVAF_NPU_EIDS"))
         rows = int(os.environ.get("KVAF_NPU_REQUESTS", "4096"))
         token_bytes = int(
             os.environ.get("KVAF_NPU_TOKEN_BYTES", str(DEFAULT_BATCH_GET_TOKEN_BYTES))
@@ -198,6 +205,8 @@ def main() -> int:
         npu_core_count=npu_core_count,
         batch_put_kernel_object_path=str(batch_put_kernel),
         jettys_per_core=jettys_per_core,
+        peer_ub_device=peer_ub_device,
+        npu_eids=npu_eids,
     )
     remote_cpu_service = os.environ.get("KVAF_CPU_SERVICE_ADDR")
     if not remote_cpu_service:
@@ -213,6 +222,8 @@ def main() -> int:
             f"pool_rows={pool_rows} n_layers={n_layers} q_capacity={q_capacity} "
             f"layer={layer} catalog_blocks={catalog_blocks} "
             f"slot_bytes={slot_bytes} ddr_bytes={ddr_bytes} "
+            f"peer_ub_device={peer_ub_device or 'auto'} "
+            f"npu_eids={','.join(npu_eids) or 'auto'} "
             f"batch_get_token_bytes={token_bytes} "
             f"batch_get_tokens_per_block={tokens_per_block} "
             f"jettys_per_core={jettys_per_core} warmup={warmup} "

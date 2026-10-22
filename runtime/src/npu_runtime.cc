@@ -532,19 +532,6 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   if (candidate_count == 0U) {
     return Status::NotFound("peer Runtime returned no UMDK/EID candidates");
   }
-  std::uint32_t first_peer_candidate = 0U;
-  std::uint32_t peer_candidate_end = candidate_count;
-  if (impl_->options.has_cpu_peer_candidate) {
-    if (impl_->options.cpu_peer_candidate >= candidate_count) {
-      return Status::InvalidArgument(
-          "CPU peer candidate " +
-          std::to_string(impl_->options.cpu_peer_candidate) +
-          " is out of range for " + std::to_string(candidate_count) +
-          " discovered candidates");
-    }
-    first_peer_candidate = impl_->options.cpu_peer_candidate;
-    peer_candidate_end = first_peer_candidate + 1U;
-  }
   std::vector<NpuLocalEidCandidate> npu_candidates;
   std::string discovery_error;
   const bool explicit_eids = !impl_->options.npu_eids.empty();
@@ -667,7 +654,8 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
           probe_offsets.reserve(static_cast<std::size_t>(probe_rows));
           probe_lengths.reserve(static_cast<std::size_t>(probe_rows));
           for (std::uint64_t row = 0U; row < probe_rows; ++row) {
-            probe_keys.push_back(std::numeric_limits<KeyId>::max() - row);
+            // MetaManager maps each bounded DSA key directly to its slot.
+            probe_keys.push_back(row);
             probe_offsets.push_back(row * probe_bytes);
             probe_lengths.push_back(probe_bytes);
           }
