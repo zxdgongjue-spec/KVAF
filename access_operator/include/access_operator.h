@@ -36,6 +36,7 @@ class AccessOperator {
 
   virtual Status ExecuteBatchGet(const BatchGetExecRequest& request) = 0;
   virtual Status ExecuteBatchPut(const BatchPutExecRequest& request) = 0;
+
 };
 
 // Configuration for the current NPU-backed default implementation. Transport
