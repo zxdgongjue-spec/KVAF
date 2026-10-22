@@ -36,7 +36,7 @@ output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数�
 
 `NpuRuntime(batch_get_kernel_object_path, batch_get_token_bytes,
 batch_get_tokens_per_block, device_id=0, npu_core_count=2,
-batch_put_kernel_object_path="", jettys_per_core=1, npu_eids=[],
+batch_put_kernel_object_path="", jettys_per_core=2, npu_eids=[],
 adaptive_ub_device=False, adaptive_ub_miss_count=2048, peer_ub_device="",
 adaptive_peer_ub_devices=[], batch_get_max_inflight_total=2048)`
 要求显式传入单 token KV

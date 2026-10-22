@@ -48,7 +48,7 @@ struct AccessOperatorConfig {
   std::string batch_put_kernel_object_path;
   std::uint32_t npu_core_count{0};
   // Direct-HCCP Jettys assigned to each BatchGet AIV core.
-  std::uint32_t jettys_per_core{1};
+  std::uint32_t jettys_per_core{2};
   // Per-launch total READ budget; 0 selects the original whole-batch path.
   std::uint32_t batch_get_max_inflight_total{2048U};
   // BatchPut retains its independent one-or-two-Jetty implementation. Zero

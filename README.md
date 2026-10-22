@@ -247,7 +247,7 @@ runtime = kvaf.NpuRuntime(
     device_id=0,
     npu_core_count=2,
     batch_put_kernel_object_path="build-npu/bin/kvaf_execute_batch_put_kernels.o",
-    jettys_per_core=1,
+    jettys_per_core=2,
     # 可选：每项是32位连续十六进制；空列表保持单 EID 自动发现。
     npu_eids=[
         "00112233445566778899aabbccddeeff",
