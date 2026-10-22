@@ -25,47 +25,29 @@ struct Options {
   std::uint32_t npu_candidate{UINT32_MAX};
 };
 Options Parse(int argc, char** argv) {
-  Options o; o.transport.remote_sgl_size = 16; o.transport.wqes_per_doorbell = 32;
+  Options o; o.transport.jetty_count = kJettyCount;
+  o.transport.remote_sgl_size = 16; o.transport.wqes_per_doorbell = 32;
   for (int i = 1; i < argc; ++i) {
     const std::string flag = argv[i];
-    Require(flag != "--host-numa-node" && flag != "--host-cpu", "use numactl for NUMA/CPU binding");
-    if (flag == "--verify-payload") { o.config.verify_payload = o.config.verify_each_round = 1; continue; }
     Require(i + 1 < argc, "missing value for " + flag); const char* value = argv[++i];
     if (flag == "--peer") { o.transport.peer_address = value; continue; }
     if (flag == "--ub-device") { o.transport.ub_device = value; continue; }
-    if (flag == "--payload-cache-maintenance") {
-      const std::string mode = value; Require(mode == "on" || mode == "off", "payload cache must be on or off");
-      o.config.payload_cache_maintenance = mode == "on"; continue;
-    }
-    if (flag == "--output-verify") {
-      const std::string mode = value; Require(mode == "final" || mode == "urma", "output verify must be final or urma");
-      o.config.verify_each_round = mode == "urma"; continue;
-    }
     const auto n = Number(value);
     if (flag == "--rows") o.config.rows = n;
     else if (flag == "--row-bytes") o.config.row_bytes = n;
     else if (flag == "--warmup") o.config.warmup = n;
     else if (flag == "--iterations") o.config.iterations = n;
     else if (flag == "--timeout-ms") o.config.timeout_ms = n;
-    else if (flag == "--scatter-threads") o.config.scatter_threads = n;
-    else if (flag == "--pipeline-chunk-rows") o.config.pipeline_chunk_rows = n;
     else {
       Require(n <= UINT32_MAX, "option exceeds uint32");
       if (flag == "--device-id") { Require(n <= INT32_MAX, "invalid NPU device"); o.transport.remote_device_id = n; }
       else if (flag == "--npu-candidate") { Require(n < UINT32_MAX, "invalid candidate"); o.npu_candidate = n; }
       else if (flag == "--eid-index") { o.transport.has_eid_index = true; o.transport.eid_index = n; }
-      else if (flag == "--jettys") o.transport.jetty_count = n;
-      else if (flag == "--remote-sgl-size") o.transport.remote_sgl_size = n;
-      else if (flag == "--prepare-threads") o.transport.prepare_thread_count = n;
-      else if (flag == "--wqes-per-doorbell") o.transport.wqes_per_doorbell = n;
       else throw std::runtime_error("unknown option " + flag);
     }
   }
-  o.config.pipeline_jettys = o.transport.jetty_count;
   Layout layout{};
-  Require(MakeLayout(o.config, &layout) && !o.transport.peer_address.empty() &&
-      o.transport.remote_sgl_size && o.transport.prepare_thread_count && o.transport.prepare_thread_count <= 64 &&
-      o.transport.wqes_per_doorbell <= 8192, "invalid benchmark configuration");
+  Require(MakeLayout(o.config, &layout) && !o.transport.peer_address.empty(), "invalid benchmark configuration");
   return o;
 }
 struct Work { std::uint32_t worker; std::uint64_t chunk; RowRange rows; };
@@ -185,11 +167,11 @@ void Run(Options options) {
   Check(transport.WriteSglBatch(kRequestOffset, &request_sge, 1));
   Check(transport.WriteSglBatch(kDoneOffset, &done_sge, 1));
   std::vector<CpuUrmaTransport::WriteChunk> chunks(work.size());
-  std::vector<std::array<std::uint64_t, 16>> markers(work.size());
+  std::vector<std::array<std::uint64_t, kJettyCount>> markers(work.size());
   for (std::size_t i = 0; i < work.size(); ++i) {
     const auto& w = work[i];
-    for (std::uint32_t q = 0; q < options.transport.jetty_count; ++q)
-      markers[i][q] = ChainReadyOffset(options.config, layout, w.worker, q);
+    for (std::uint32_t q = 0; q < kJettyCount; ++q)
+      markers[i][q] = ChainReadyOffset(layout, w.worker, q);
     chunks[i] = {offsets.data() + w.rows.begin, sources.data() + w.rows.begin,
         static_cast<std::size_t>(w.rows.end - w.rows.begin), markers[i].data(), &tokens[i].sequence};
   }
@@ -205,12 +187,10 @@ void Run(Options options) {
     read_sges.push_back({readback + offset, static_cast<std::size_t>(length)}); offset += length;
   }
   OutputReadbackVerifier verifier(options.config, layout);
-  std::fprintf(stderr, "AICPU_GET_CPU CONFIG ready=ordered_write copy=securec_memcpy workers=%u jettys=%u "
-      "chunk_rows=%llu doorbell=%u cq_batch=8 deadline_polls=32 payload_cache=%s output_verify=%s "
+  std::fprintf(stderr, "AICPU_GET_CPU CONFIG ready=ordered_write copy=securec_memcpy workers=%u jettys=4 "
+      "chunk_rows=1024 doorbell=32 cq_batch=8 deadline_polls=32 "
       "data_wrs=%llu marker_wrs=%llu tail_cqes=%llu revision=%llu\n",
-      ActiveThreads(options.config), options.transport.jetty_count,
-      (unsigned long long)options.config.pipeline_chunk_rows, options.transport.wqes_per_doorbell,
-      options.config.payload_cache_maintenance ? "on" : "off", options.config.verify_each_round ? "urma" : "final",
+      ActiveThreads(options.config),
       (unsigned long long)(info.wr_count - info.marker_wrs), (unsigned long long)info.marker_wrs,
       (unsigned long long)(info.tail_cqes + 1), (unsigned long long)kKernelRevision);
   Socket control(Connect(options.transport.peer_address)); SocketTimeout(control.get(), options.config.timeout_ms + 120000);
@@ -236,9 +216,6 @@ void Run(Options options) {
       } while (request->sequence != seq);
       for (std::uint64_t row = 0; row < options.config.rows; ++row) {
         const auto tag = RowTag(seq, row); std::memcpy(input + row * layout.stride, &tag, 8);
-        if (options.config.verify_payload)
-          for (std::uint64_t b = 8; b < options.config.row_bytes; ++b)
-            input[row * layout.stride + b] = PayloadPattern(options.config, seq, row, b);
       }
       for (std::size_t i = 0; i < work.size(); ++i)
         tokens[i].sequence = PipelineProgressToken(seq, work[i].chunk + 1);
@@ -252,7 +229,7 @@ void Run(Options options) {
         data_ns += Ns(producer_begin, data_end);
         producer_ns += Ns(producer_begin, Clock::now());
       }
-      if (ShouldVerifyOutput(options.config, seq)) {
+      if (seq == layout.rounds) {
         const auto verify_deadline = Clock::now() + std::chrono::milliseconds(options.config.timeout_ms);
         do {
           Check(transport.ReadSglBatch(kOutputReadyOffset, &ready_sge, 1));
@@ -285,20 +262,18 @@ void Run(Options options) {
   Report report{}; Receive(control.get(), &report, sizeof(report));
   Require(ok && report.magic == kMagic && !report.status, "benchmark or validation failed");
   const auto n = static_cast<double>(options.config.iterations);
-  std::printf("engine,rows,row_bytes,iterations,scatter_threads,active_threads,e2e_GBps,mean_ns,p50_ns,p99_ns,"
+  std::printf("engine,rows,row_bytes,iterations,active_threads,e2e_GBps,mean_ns,p50_ns,p99_ns,"
       "first_ready_ns,pipeline_ns,cpu_data_span_ns,cpu_data_GBps,cpu_producer_ns,cpu_round_ns,cpu_cycle_GBps,"
-      "npu_prepare_ns,npu_verify_ns,mean_wrs,mean_marker_wrs,mean_tail_cqes,mean_control_reads,"
-      "payload_cache_maintenance,output_verify,verify_payload\n");
-  std::printf("aicpu_sgl_ordered_write,%llu,%llu,%llu,%llu,%llu,%.6f,%.1f,%.1f,%.1f,%.1f,%.1f,"
-      "%.1f,%.6f,%.1f,%.1f,%.6f,%.1f,%.1f,%llu,%llu,%.1f,%.1f,%s,%s,%llu\n",
+      "npu_prepare_ns,npu_verify_ns,mean_wrs,mean_marker_wrs,mean_tail_cqes,mean_control_reads\n");
+  std::printf("aicpu_sgl_ordered_write,%llu,%llu,%llu,%llu,%.6f,%.1f,%.1f,%.1f,%.1f,%.1f,"
+      "%.1f,%.6f,%.1f,%.1f,%.6f,%.1f,%.1f,%llu,%llu,%.1f,%.1f\n",
       (unsigned long long)options.config.rows, (unsigned long long)options.config.row_bytes,
-      (unsigned long long)options.config.iterations, (unsigned long long)options.config.scatter_threads,
+      (unsigned long long)options.config.iterations,
       (unsigned long long)report.active_threads, report.gbps, report.mean_ns, report.p50_ns, report.p99_ns,
       report.wait_ns, report.scatter_ns, data_ns / n, layout.payload_bytes * n / data_ns,
       producer_ns / n, round_ns / n, layout.payload_bytes * n / round_ns, report.prepare_ns, report.verify_ns,
       (unsigned long long)(info.wr_count - info.marker_wrs), (unsigned long long)info.marker_wrs,
-      stats.tail_cqes / n, reads / n, options.config.payload_cache_maintenance ? "on" : "off",
-      options.config.verify_each_round ? "urma" : "final", (unsigned long long)options.config.verify_payload);
+      stats.tail_cqes / n, reads / n);
 }
 }  // namespace
 int main(int argc, char** argv) {

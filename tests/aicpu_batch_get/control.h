@@ -14,8 +14,8 @@
 #include <unistd.h>
 
 namespace kvaf::aicpu_test {
-// Test-only V21 commands; the configure opcode rejects older executables.
-constexpr auto kConfigure = static_cast<peer::Command>(0x7015);
+// The configure opcode rejects executables with an older wire layout.
+constexpr auto kConfigure = static_cast<peer::Command>(0x7016);
 constexpr auto kStart = static_cast<peer::Command>(0x7001);
 constexpr auto kResetSetup = static_cast<peer::Command>(0x7003);
 struct ConfigureRequest {
@@ -34,7 +34,7 @@ struct Report {
   double mean_ns{}, p50_ns{}, p99_ns{}, wait_ns{}, scatter_ns{}, gbps{};
   double prepare_ns{}, verify_ns{};
 };
-static_assert(sizeof(ConfigureRequest) == 120 && sizeof(Ack) == 16 && sizeof(Report) == 96);
+static_assert(sizeof(ConfigureRequest) == 72 && sizeof(Ack) == 16 && sizeof(Report) == 96);
 
 // Literal checks must not construct a temporary string on the success path.
 inline void Require(bool ok, const char* message) {

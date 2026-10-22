@@ -11,12 +11,12 @@
 namespace kvaf::aicpu_test {
 inline std::uint64_t PipelineChunkCount(const Config& c, std::uint32_t worker) {
   const auto r = ScatterRange(c, worker, ActiveThreads(c));
-  return (r.end - r.begin + c.pipeline_chunk_rows - 1) / c.pipeline_chunk_rows;
+  return (r.end - r.begin + kPipelineChunkRows - 1) / kPipelineChunkRows;
 }
 inline RowRange PipelineChunkRange(const Config& c, std::uint32_t worker, std::uint64_t chunk) {
   const auto r = ScatterRange(c, worker, ActiveThreads(c));
-  const auto begin = r.begin + chunk * c.pipeline_chunk_rows;
-  const auto end = begin + c.pipeline_chunk_rows;
+  const auto begin = r.begin + chunk * kPipelineChunkRows;
+  const auto end = begin + kPipelineChunkRows;
   return {begin, end < r.end ? end : r.end};
 }
 inline std::uint64_t PipelineProgressToken(std::uint64_t sequence, std::uint64_t chunks) {
@@ -29,7 +29,7 @@ std::uint64_t ChainReadyProgress(const Config& c, std::uint32_t worker,
   const auto chunks = PipelineChunkCount(c, worker);
   auto progress = chunks;
   bool stale = false;
-  for (std::uint32_t q = 0; q < c.pipeline_jettys; ++q) {
+  for (std::uint32_t q = 0; q < kJettyCount; ++q) {
     const auto token = read(q), seq = token >> 32, value = token & UINT32_MAX;
     if (seq > sequence || (seq == sequence && (!value || value > chunks)))
       return PipelineProgressToken(sequence + 1, 0); // Consumer's sequence-error path.
@@ -52,7 +52,7 @@ template <class Emit> void ForEachPipelineChunk(const Config& c, Emit emit) {
 template <class IO>
 Result RunPipelineChunks(const Config& c, std::uint32_t worker, std::uint64_t sequence,
                          std::uint64_t start, std::uint64_t timeout, IO& io) {
-  if (!c.pipeline_chunk_rows || worker >= ActiveThreads(c) || !sequence ||
+  if (worker >= ActiveThreads(c) || !sequence ||
       sequence > UINT32_MAX || !timeout) return Result::kInvalidArgs;
   const auto chunks = PipelineChunkCount(c, worker);
   std::uint64_t consumed = 0;
@@ -79,8 +79,8 @@ Result RunPipelineChunks(const Config& c, std::uint32_t worker, std::uint64_t se
       io.Relax();
     }
   }
-  io.CleanRange(worker);
-  if (const auto cleaned = io.Status(); cleaned != Result::kPending) return cleaned;
+  io.FinishRange();
+  if (const auto finished = io.Status(); finished != Result::kPending) return finished;
   return io.Now() - start >= timeout ? Result::kTimeout : Result::kOk;
 }
 // Copy packed staging rows into strided output slots.

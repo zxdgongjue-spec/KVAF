@@ -19,10 +19,6 @@ void Bounds() {
   c = {}; c.iterations = 0; Require(!MakeLayout(c, &l), "zero samples accepted");
   c = {}; c.timeout_ms = 0; Require(!MakeLayout(c, &l), "unbounded wait accepted");
   c = {}; c.magic = 0; Require(!MakeLayout(c, &l), "invalid ABI accepted");
-  c = {}; c.pipeline_chunk_rows = 1023; Require(!MakeLayout(c, &l), "unaligned chunk accepted");
-  c = {}; c.pipeline_jettys = 17; Require(!MakeLayout(c, &l), "too many progress queues accepted");
-  c = {}; c.payload_cache_maintenance = 2; Require(!MakeLayout(c, &l), "invalid cache policy accepted");
-  c = {}; c.verify_payload = 1; Require(!MakeLayout(c, &l), "payload check without per-round observer");
 }
 void DeviceSelection() {
   Require(SelectDevice(4, false, 0) == 4, "CPU device-id was ignored");
@@ -36,10 +32,10 @@ void DeviceSelection() {
 
 }
 void RangesAndMetrics() {
-  for (auto rows : {1, 67, 4096}) for (auto bytes : {8, 65, 656, 4096}) for (auto workers : {1, 4, 32}) {
-    Config c; c.rows = rows; c.row_bytes = bytes; c.scatter_threads = workers;
+  for (auto rows : {1, 67, 4096, 16384}) for (auto bytes : {8, 65, 656, 4096}) {
+    Config c; c.rows = rows; c.row_bytes = bytes;
     Layout l{}; Require(MakeLayout(c, &l), "valid layout rejected");
-    Require(ChainReadyOffset(c, l, 0) >= RegisteredOutputOffset(l) + l.output_bytes + kGuardBytes &&
+    Require(ChainReadyOffset(l, 0) >= RegisteredOutputOffset(l) + l.output_bytes + kGuardBytes &&
             l.region_bytes <= kMaxAllocation, "registered ranges overlap/overflow");
     std::vector<unsigned> covered(rows);
     ForEachPipelineChunk(c, [&](auto, auto, RowRange r) {
@@ -50,7 +46,7 @@ void RangesAndMetrics() {
   }
   Config c; c.iterations = 2; c.warmup = 0;
   KernelResult r{}; r.status = Result::kOk; r.completed_rounds = 2; r.counter_frequency = 1000000000;
-  r.requested_threads = c.scatter_threads; r.active_threads = ActiveThreads(c); r.kernel_revision = kKernelRevision;
+  r.active_threads = ActiveThreads(c); r.kernel_revision = kKernelRevision;
   std::vector<Sample> samples{{100, 20, 80, 10, 0}, {200, 30, 170, 10, 40}};
   const auto report = Summarize(c, r, samples);
   Require(report.mean_ns == 150 && report.wait_ns == 25 && report.scatter_ns == 125 &&
@@ -60,19 +56,19 @@ void RangesAndMetrics() {
   Require(rejected, "inconsistent timing accepted");
 }
 struct ChunkIO {
-  std::uint64_t token{}, ticks{}, cleans{};
+  std::uint64_t token{}, ticks{}, finishes{};
   std::vector<RowRange> copied;
   Result Status() { return Result::kPending; }
   std::uint64_t Now() { return ++ticks; }
   std::uint64_t ReadRangeDone(std::uint32_t) { return token; }
   void RangeReady(std::uint64_t) {}
   void CopySpan(RowRange r) { copied.push_back(r); }
-  void CleanRange(std::uint32_t) { ++cleans; }
+  void FinishRange() { ++finishes; }
   void Relax() {}
 };
 void ReadyProgress() {
-  Config c; c.pipeline_chunk_rows = 256;
-  std::array<std::uint64_t, 4> tokens{};
+  Config c; c.rows = 16384;
+  std::array<std::uint64_t, kJettyCount> tokens{};
   auto read = [&](auto q) { return tokens[q]; };
   tokens.fill(PipelineProgressToken(3, 4)); tokens[3] = 0;
   Require(ChainReadyProgress(c, 0, 3, read) == 0, "one queue released incomplete data");
@@ -82,7 +78,7 @@ void ReadyProgress() {
   Require(ChainReadyProgress(c, 0, 3, read) >> 32 == 4, "future marker accepted");
   ChunkIO io; io.token = PipelineProgressToken(3, 4);
   Require(RunPipelineChunks(c, 0, 3, 0, 100, io) == Result::kOk && io.copied.size() == 1 &&
-          io.copied[0].begin == 0 && io.copied[0].end == 1024 && io.cleans == 1, "prefix merge lost data");
+          io.copied[0].begin == 0 && io.copied[0].end == 4096 && io.finishes == 1, "prefix merge lost data");
   io = {}; io.token = PipelineProgressToken(2, 4);
   Require(RunPipelineChunks(c, 0, 3, 0, 3, io) == Result::kTimeout && io.copied.empty(), "stale marker released data");
 }
@@ -124,7 +120,7 @@ void Completions() {
   Require(burst.Empty() && hits[1] == 1 && hits[2] == 1, "lost/duplicated completion");
 }
 void ScatterOutput() {
-  Config c; c.rows = 4; c.verify_payload = c.verify_each_round = 1;
+  Config c; c.rows = 4;
   Layout l{}; Require(MakeLayout(c, &l), "output layout rejected");
   OutputReadbackVerifier verifier(c, l); std::uint64_t mismatch_offset{};
   std::vector<std::uint8_t> source(l.payload_bytes), output(l.output_bytes, 0xA5);
@@ -132,10 +128,15 @@ void ScatterOutput() {
     for (std::uint64_t slot = 0; slot < c.rows; ++slot) {
       const auto row = LogicalRowForOutputSlot(c, slot), tag = RowTag(seq, row);
       std::memcpy(source.data() + slot * c.row_bytes, &tag, 8);
-      for (std::uint64_t b = 8; b < c.row_bytes; ++b) source[slot * c.row_bytes + b] = PayloadPattern(c, seq, row, b);
+      for (std::uint64_t b = 8; b < c.row_bytes; ++b) source[slot * c.row_bytes + b] = Pattern(row, b);
     }
     Require(CopyScatterRows(output.data(), source.data(), c.rows, c.row_bytes, l.stride) &&
             verifier.Check(seq, output.data(), &mismatch_offset), "payload/guard copy mismatch");
+    Require(!verifier.Check(seq + 1, output.data(), &mismatch_offset), "stale row tag accepted");
+    output[8] ^= 1;
+    Require(!verifier.Check(seq, output.data(), &mismatch_offset) && mismatch_offset == 8,
+            "payload corruption accepted");
+    output[8] ^= 1;
     output[c.row_bytes] ^= 1;
     Require(!verifier.Check(seq, output.data(), &mismatch_offset) && mismatch_offset == c.row_bytes, "guard overwrite accepted");
     output[c.row_bytes] ^= 1;

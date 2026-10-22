@@ -12,7 +12,6 @@ inline Report Summarize(const Config& config, const KernelResult& result,
   Require(MakeLayout(config, &layout) && result.status == Result::kOk &&
           result.completed_rounds == layout.rounds && result.counter_frequency > 0 &&
           result.kernel_revision == kKernelRevision &&
-          result.requested_threads == config.scatter_threads &&
           result.active_threads == ActiveThreads(config) &&
           samples.size() == config.iterations, "invalid/incomplete device timings");
   Report report{};

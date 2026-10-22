@@ -16,23 +16,12 @@ Wrapper options:
   --smoke            16 rows x 64 bytes, 1 warmup, 3 measured iterations
   --output FILE      Save CSV and also print it to stdout
 
-Defaults (V21): ordered WRITE chain, 4096 x 656 B, 4 workers/Jettys,
+Fixed path (V22): ordered WRITE chain, 4 workers/Jettys,
 chunk 1024, doorbell 32, securec copy, indexed CQ batch 8/deadline 32,
-payload maintenance off, final output readback, warmup 50/iterations 1000.
-No transfer/backend/poll/window experiment flags are required.
-Use numactl for NUMA/CPU binding; the executable inherits the process policy.
+final output readback. Defaults: 4096 x 656 B, warmup 50/iterations 1000.
 
-  --rows N --row-bytes N --scatter-threads N --pipeline-chunk-rows N
-  --jettys N --remote-sgl-size N --prepare-threads N --wqes-per-doorbell N
+  --rows N --row-bytes N
   --warmup N --iterations N --timeout-ms N
-  --payload-cache-maintenance off|on
-                     Off is the verified fast platform policy; on performs
-                     staging invalidate and output clean. Control maintenance
-                     and cold-output preparation are always retained.
-  --output-verify final|urma
-                     Final checks the last round; urma checks every round.
-  --verify-payload   Change/check every payload byte each round (validation only).
-                     Automatically enables per-round readback; omit for bandwidth.
   --npu-candidate N  Pin the remote EID candidate; default automatic selection.
 
 CSV includes all three bandwidth scopes:

@@ -53,8 +53,8 @@ struct DeviceIO {
     return reinterpret_cast<volatile Control*>(region + kDoneOffset)->sequence;
   }
   std::uint64_t ReadRangeDone(std::uint32_t worker) {
-    const auto offset = ChainReadyOffset(config, layout, worker);
-    Invalidate(region + offset, Align64(config.pipeline_jettys * 8));
+    const auto offset = ChainReadyOffset(layout, worker);
+    Invalidate(region + offset, Align64(kJettyCount * 8));
     auto* words = reinterpret_cast<volatile std::uint64_t*>(region + offset);
     return ChainReadyProgress(config, worker, sequence, [&](std::uint32_t q) { return words[q]; });
   }
@@ -86,27 +86,13 @@ struct RangeIO {
   void RangeReady(std::uint64_t now) { Minimum(coordination.ready_tick, now); }
   void Relax() { device.Relax(); }
   void CopySpan(RowRange r) {
-    if (device.config.payload_cache_maintenance)
-      InvalidateLines(device.region + kStagingOffset + r.begin * device.config.row_bytes,
-                      (r.end - r.begin) * device.config.row_bytes);
     Barrier();
     if (!CopyScatterRows(device.Output() + r.begin * device.layout.stride,
         device.region + kStagingOffset + r.begin * device.config.row_bytes,
         r.end - r.begin, device.config.row_bytes, device.layout.stride))
       Fail(coordination, Result::kCopyError, device.sequence);
   }
-  void CleanRange(std::uint32_t worker) {
-    if (device.config.payload_cache_maintenance) {
-      const auto r = ScatterRange(device.config, worker, ActiveThreads(device.config));
-      // Issue all row payload cache lines, then one completion barrier.
-      for (auto row = r.begin; row < r.end; ++row) {
-        const auto begin = reinterpret_cast<std::uintptr_t>(device.Output() + row * device.layout.stride);
-        for (auto line = begin; line < begin + device.config.row_bytes; line += 64)
-          asm volatile("dc cvac, %0" :: "r"(line) : "memory");
-      }
-    }
-    Barrier();
-  }
+  void FinishRange() { Barrier(); }
 };
 Result Run(DeviceIO& io, Sample* samples, KernelResult* result, MultiBlockCoordination& c) {
   const auto workers = ActiveThreads(io.config);
@@ -118,7 +104,7 @@ Result Run(DeviceIO& io, Sample* samples, KernelResult* result, MultiBlockCoordi
   if (worker >= workers) { Fail(c, Result::kInvalidArgs, 0); return Result::kInvalidArgs; }
   const auto frequency = io.Frequency();
   if (!worker) {
-    *result = {}; result->requested_threads = io.config.scatter_threads;
+    *result = {};
     result->active_threads = workers; result->kernel_revision = kKernelRevision;
     result->counter_frequency = frequency;
     if (!frequency) Fail(c, Result::kInvalidArgs, 0);
@@ -162,7 +148,7 @@ Result Run(DeviceIO& io, Sample* samples, KernelResult* result, MultiBlockCoordi
       if (Status(c) != Result::kPending) break;
       const auto end = io.Now(), ready = Load(c.ready_tick);
       std::uint64_t verification = 0;
-      if (ShouldVerifyOutput(io.config, sequence)) {
+      if (sequence == io.layout.rounds) {
         const auto verify_start = io.Now();
         // No output flush/read before the independent URMA consumer's ACK.
         const auto verified = VerifyOutputViaUrma(sequence, timeout, io);
@@ -185,7 +171,7 @@ Result Run(DeviceIO& io, Sample* samples, KernelResult* result, MultiBlockCoordi
 }
 }
 extern "C" __attribute__((visibility("default")))
-std::uint32_t KvafAicpuBatchGetV21(kvaf::aicpu_test::KernelArgs* args) {
+std::uint32_t KvafAicpuBatchGetV22(kvaf::aicpu_test::KernelArgs* args) {
   if (!args || !args->region || !args->samples || !args->result || !args->coordination) return 1;
   Layout layout{};
   auto* result = reinterpret_cast<KernelResult*>(args->result);
