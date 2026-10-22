@@ -4,45 +4,19 @@ namespace kvaf::peer {
 namespace {
 
 bool ValidateEnvelope(std::uint64_t base, std::uint64_t bytes, std::uint64_t descriptor_address,
-                      const GatherDescriptorHeader& header, std::size_t span_count) {
+                      const GatherDescriptorHeader& header) {
   if (bytes < 64U || base > UINT64_MAX - bytes || header.magic != kGatherDescriptorMagic ||
-      header.span_count == 0U || header.span_count != span_count || header.reserved != 0U ||
+      header.span_count == 0U ||
       header.ready_bytes != 0U ||
       (header.pipeline_chunk_bytes != 0U &&
        (header.pipeline_chunk_bytes < 64U || header.pipeline_chunk_bytes % 64U != 0U)))
     return false;
   const auto data_bytes = GatherControlOffset(bytes);
-  if (!GatherRange(base, data_bytes, descriptor_address, GatherDescriptorBytes(span_count)) ||
+  if (!GatherRange(base, data_bytes, descriptor_address, GatherDescriptorBytes(header.span_count)) ||
       !GatherRange(base, data_bytes, header.staging_address, header.total_bytes))
     return false;
   return descriptor_address >= header.staging_address + header.total_bytes ||
-         header.staging_address >= descriptor_address + GatherDescriptorBytes(span_count);
-}
-
-bool BuildOffsets(std::uint64_t base, std::uint64_t data_bytes, std::uint64_t descriptor_address,
-                  const GatherDescriptorHeader& header, const void* spans, std::size_t span_count,
-                  std::vector<std::uint64_t>* offsets, GatherSpan* snapshot = nullptr) {
-  const auto staging_end = header.staging_address + header.total_bytes;
-  const auto descriptor_end = descriptor_address + GatherDescriptorBytes(span_count);
-  if (offsets != nullptr) {
-    offsets->resize(span_count + 1U);
-    (*offsets)[0U] = 0U;
-  }
-  std::uint64_t total = 0U;
-  for (std::size_t index = 0U; index < span_count; ++index) {
-    // Load once from the published descriptor, then retain the validated value.
-    GatherSpan span;
-    std::memcpy(&span, static_cast<const std::uint8_t*>(spans) + index * sizeof(span),
-                sizeof(span));
-    total += span.length;
-    if (total > header.total_bytes || !GatherRange(base, data_bytes, span.address, span.length) ||
-        (span.address < staging_end && header.staging_address < span.address + span.length) ||
-        (span.address < descriptor_end && descriptor_address < span.address + span.length))
-      return false;
-    if (offsets != nullptr) (*offsets)[index + 1U] = total;
-    if (snapshot != nullptr) snapshot[index] = span;
-  }
-  return total == header.total_bytes;
+         header.staging_address >= descriptor_address + GatherDescriptorBytes(header.span_count);
 }
 
 }  // namespace
@@ -58,13 +32,26 @@ std::size_t CpuGatherTeam::PrepareDirect(std::uint64_t region_bytes,
   GatherDescriptorHeader header;
   std::memcpy(&header, descriptor, sizeof(header));
   if (header.sequence != sequence || header.span_count > max_spans ||
-      !ValidateEnvelope(base_, region_bytes, descriptor_address, header, header.span_count))
+      !ValidateEnvelope(base_, region_bytes, descriptor_address, header))
     return 0U;
-  direct_spans_.resize(header.span_count);
-  const auto* source_spans = descriptor + sizeof(header);
-  if (!BuildOffsets(base_, GatherControlOffset(region_bytes), descriptor_address, header,
-                    source_spans, header.span_count, &offsets_, direct_spans_.data()))
-    return 0U;
+  const auto* source_spans = reinterpret_cast<const GatherSpan*>(descriptor + sizeof(header));
+  span_bytes_ = header.span_bytes;
+  if (span_bytes_ != 0U) {
+    // BatchGet has fixed-size tokens: locate any staging byte by division/remainder.
+    if (static_cast<std::uint64_t>(span_bytes_) * header.span_count != header.total_bytes)
+      return 0U;
+  } else {
+    // Older variable-length descriptors still need a prefix index, but no snapshot.
+    variable_offsets_.resize(header.span_count + 1U);
+    variable_offsets_[0] = 0U;
+    for (std::size_t index = 0; index < header.span_count; ++index) {
+      const auto length = source_spans[index].length;
+      const auto end = variable_offsets_[index] + length;
+      if (length == 0U || end > header.total_bytes) return 0U;
+      variable_offsets_[index + 1U] = end;
+    }
+    if (variable_offsets_.back() != header.total_bytes) return 0U;
+  }
   pipeline_ready_ = nullptr;
   if (header.pipeline_chunk_bytes != 0U) {
     pipeline_chunk_bytes_ = header.pipeline_chunk_bytes;
@@ -75,7 +62,7 @@ std::size_t CpuGatherTeam::PrepareDirect(std::uint64_t region_bytes,
     pipeline_ready_ = reinterpret_cast<std::uint64_t*>(
         memory_ + (descriptor_address - base_) + offsetof(GatherDescriptorHeader, ready_bytes));
   }
-  return Publish(header.staging_address, direct_spans_, header.total_bytes);
+  return Publish(header.staging_address, source_spans, header.span_count, header.total_bytes);
 }
 
 void CpuGatherTeam::Copy() {
@@ -87,18 +74,31 @@ void CpuGatherTeam::Copy() {
   if (pipeline_ready_ != nullptr) __atomic_store_n(pipeline_ready_, total_bytes_, __ATOMIC_RELEASE);
 }
 
+// Copy only this thread's staging range, combining adjacent source spans into one memcpy.
 std::uint64_t CpuGatherTeam::CopyRange(std::uint64_t offset, std::uint64_t end) const {
+  if (offset >= end) return 0U;
   const auto begin = offset;
-  auto found = std::upper_bound(offsets_.begin(), offsets_.end(), offset);
-  std::size_t index = static_cast<std::size_t>(found - offsets_.begin() - 1U);
+  const auto index_for_offset = span_bytes_ != 0U
+      ? offset / span_bytes_
+      : static_cast<std::uint64_t>(std::upper_bound(variable_offsets_.begin(),
+            variable_offsets_.end(), offset) - variable_offsets_.begin() - 1U);
+  std::size_t index = static_cast<std::size_t>(index_for_offset);
+  auto in_span = span_bytes_ != 0U ? offset % span_bytes_ : offset - variable_offsets_[index];
   while (offset < end) {
-    const GatherSpan& span = (*spans_)[index];
-    const std::uint64_t in_span = offset - offsets_[index];
-    const std::uint64_t bytes = std::min<std::uint64_t>(end - offset, span.length - in_span);
-    auto* source = memory_ + (span.address - base_) + in_span;
+    const auto source_address = spans_[index].address + in_span;
+    const auto length = span_bytes_ != 0U ? span_bytes_ : spans_[index].length;
+    auto bytes = std::min<std::uint64_t>(length - in_span, end - offset);
+    ++index;
+    in_span = 0U;
+    while (bytes < end - offset && index < span_count_ &&
+           spans_[index].address == source_address + bytes) {
+      const auto next_length = span_bytes_ != 0U ? span_bytes_ : spans_[index].length;
+      bytes += std::min<std::uint64_t>(next_length, end - offset - bytes);
+      ++index;
+    }
+    const auto* source = memory_ + (source_address - base_);
     std::memcpy(staging_ + offset, source, bytes);
     offset += bytes;
-    ++index;
   }
   return offset - begin;
 }

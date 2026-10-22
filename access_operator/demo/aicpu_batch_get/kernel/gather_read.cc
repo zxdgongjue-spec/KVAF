@@ -373,6 +373,7 @@ bool BuildCurrentRequest(const UmdkBatchGetArgs& launch, GatherReadArgs& args,
                  args.source_span_count,
                  args.bytes,
                  args.pipeline_chunk_bytes};
+  descriptor->span_bytes = request.token_bytes;
   {
     BatchGetProfileScope timer(profile ? &profile->descriptor_cache_ns : nullptr);
     Flush(descriptor, kvaf::peer::GatherDescriptorBytes(args.source_span_count));

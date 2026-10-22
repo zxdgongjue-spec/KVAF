@@ -96,8 +96,8 @@ class CpuGatherTeam {
   void Copy();
 
  private:
-  std::size_t Publish(std::uint64_t staging, const std::vector<GatherSpan>& spans,
-                      std::uint32_t total_bytes) {
+  std::size_t Publish(std::uint64_t staging, const GatherSpan* spans,
+                      std::uint32_t span_count, std::uint32_t total_bytes) {
     const std::size_t threads =
         std::min(max_threads_, std::max<std::size_t>(1U, total_bytes / min_bytes_per_thread_));
     std::unique_lock<std::mutex> lock(mutex_);
@@ -105,7 +105,8 @@ class CpuGatherTeam {
       const std::size_t index = helpers_.size() + 1U;
       helpers_.emplace_back(&CpuGatherTeam::RunHelper, this, index);
     }
-    spans_ = &spans;
+    spans_ = spans;
+    span_count_ = span_count;
     staging_ = memory_ + (staging - base_);
     total_bytes_ = total_bytes;
     active_threads_ = threads;
@@ -155,12 +156,13 @@ class CpuGatherTeam {
   std::mutex mutex_;
   std::condition_variable ready_;
   std::atomic<std::uint64_t> generation_{0U};
-  const std::vector<GatherSpan>* spans_{nullptr};
-  std::vector<GatherSpan> direct_spans_;
+  // The sender retains this descriptor until all copy threads finish and ACK is published.
+  const GatherSpan* spans_{nullptr};
+  std::uint32_t span_count_{0U}, span_bytes_{0U};
   std::uint8_t* staging_{nullptr};
   std::uint64_t total_bytes_{0U};
   std::size_t active_threads_{1U};
-  std::vector<std::uint64_t> offsets_;
+  std::vector<std::uint64_t> variable_offsets_;
   std::uint64_t* pipeline_ready_{nullptr};
   std::uint32_t pipeline_chunk_bytes_{0U};
   std::vector<std::uint32_t> chunk_done_;

@@ -29,7 +29,8 @@ struct GatherDescriptorHeader {
   std::uint32_t span_count;
   std::uint32_t total_bytes;
   std::uint32_t pipeline_chunk_bytes{0U};
-  std::uint32_t reserved{0U};
+  // Fixed bytes per source span; zero retains the variable-length wire format.
+  std::uint32_t span_bytes{0U};
   std::uint64_t ready_bytes{0U};
 };
 

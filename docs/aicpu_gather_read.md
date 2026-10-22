@@ -129,6 +129,12 @@ CPU 侧每条通道也各有独立 Jetty/RQ/CQ。CPU 与 AICPU 共用端点枚�
 AICPU 进程内的 liburma 动态加载与会话由 AICPU 自己维护。
 
 每个 worker 负责输入请求下标的一个连续区间，在本区间内跳过 mask=0 的条目。
+CPU 直接引用收到的源清单，使用到本轮拷贝结束、发布 ACK 为止，不再逐条复制清单或检查源地址范围。
+BatchGet 在描述头中提供固定片段长度 `span_bytes`（例如 656 B）；CPU 用
+`staging_offset / span_bytes` 和 `staging_offset % span_bytes` 定位源片段及片段内偏移，
+不再扫描清单生成累计偏移表。相邻源地址在当前拷贝分块内合并成一次 memcpy；零散地址仍按片段拷贝。
+旧的变长清单使用 `span_bytes=0`，仍按长度构建偏移表。清单头保持 48 B，进度字段位置保持不变。
+启用固定长度描述头的版本需要同时更新 CPU 服务与 AICPU 包，并重启 CPU 服务。
 单 worker 直接使用编号 0；多 worker 从 AICPU 进程内的循环编号器各领一个编号。
 每次 launch 的 N 个实例恰好覆盖全部 N 个编号；上一轮结束后才允许复用资源。
 Host 每轮直接提交算子，不再分配 HBM 编号缓冲或提交清零任务。
