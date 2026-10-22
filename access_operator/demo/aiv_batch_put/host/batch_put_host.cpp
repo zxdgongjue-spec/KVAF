@@ -37,7 +37,6 @@ constexpr uint32_t kMaxDirectAivWorkers =
 
 using DirectHccpApi = hccp::DirectHccpApi;
 using DirectMemory = hccp::DirectMemory;
-
 // A USER_CTL SQ/CQ is strictly single-producer/single-consumer from the AIV
 // kernel's point of view. Each core/Jetty slot therefore owns one complete
 // local AIV Jetty rather than sharing producer/consumer indices.
@@ -104,7 +103,8 @@ std::array<uint8_t, hccp::kEidBytes> ReverseEidForAivWqe(
 }
 
 bool InitContext(const DirectHccpApi &api, int32_t mode, uint32_t physical_device_id,
-                 const std::array<uint8_t, hccp::kEidBytes> &eid, const char *role, void **context) {
+                 const std::array<uint8_t, hccp::kEidBytes> &eid,
+                 const char *role, void **context) {
   hccp::CtxInitCfg cfg{};
   cfg.mode = mode;
   hccp::CtxInitAttr attr{};
@@ -567,11 +567,15 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
   KvafBatchPutTransport *transport = local_buffer->transport;
   std::lock_guard<std::mutex> launch_lock(transport->launch_mutex);
   const uint64_t status_bytes = static_cast<uint64_t>(core_status_count) * sizeof(*core_status);
-  const aclError clear_result =
-      aclrtMemset(reinterpret_cast<void *>(arguments->core_status), status_bytes, 0, status_bytes);
-  if (clear_result != ACL_SUCCESS) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=clear_status acl=%d\n",
-                 static_cast<int>(clear_result));
+  // Status initialization and the kernel are ordered on one stream, so the
+  // host need not block before the launch. core_status is a persistent pinned
+  // host buffer and remains valid until the final stream synchronization.
+  const aclError seed_result = aclrtMemsetAsync(
+      reinterpret_cast<void *>(arguments->core_status), status_bytes, 0,
+      status_bytes, stream);
+  if (seed_result != ACL_SUCCESS) {
+    std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=seed_status acl=%d\n",
+                 static_cast<int>(seed_result));
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
   KvafExecuteBatchPutLaunchArgs launch_args{};
@@ -584,18 +588,20 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=launch result=%d\n", result);
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
+  // Queue the completion status before synchronizing so the host pays one
+  // stream wait for both the AIV kernel and the status D2H copy.
+  const aclError status_copy_result = aclrtMemcpyAsync(
+      core_status, status_bytes, reinterpret_cast<void *>(arguments->core_status),
+      status_bytes, ACL_MEMCPY_DEVICE_TO_HOST, stream);
+  if (status_copy_result != ACL_SUCCESS) {
+    std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=copy_status acl=%d\n",
+                 static_cast<int>(status_copy_result));
+    return KVAF_BATCH_PUT_RUNTIME_ERROR;
+  }
   const aclError synchronize_result = aclrtSynchronizeStream(stream);
   if (synchronize_result != ACL_SUCCESS) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=synchronize acl=%d\n",
                  static_cast<int>(synchronize_result));
-    return KVAF_BATCH_PUT_RUNTIME_ERROR;
-  }
-  const aclError status_copy_result =
-      aclrtMemcpy(core_status, status_bytes, reinterpret_cast<void *>(arguments->core_status), status_bytes,
-                  ACL_MEMCPY_DEVICE_TO_HOST);
-  if (status_copy_result != ACL_SUCCESS) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=copy_status acl=%d\n",
-                 static_cast<int>(status_copy_result));
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
   for (uint32_t core = 0U; core < core_status_count; ++core) {

@@ -654,7 +654,8 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
           probe_offsets.reserve(static_cast<std::size_t>(probe_rows));
           probe_lengths.reserve(static_cast<std::size_t>(probe_rows));
           for (std::uint64_t row = 0U; row < probe_rows; ++row) {
-            probe_keys.push_back(std::numeric_limits<KeyId>::max() - row);
+            // MetaManager maps each bounded DSA key directly to its slot.
+            probe_keys.push_back(row);
             probe_offsets.push_back(row * probe_bytes);
             probe_lengths.push_back(probe_bytes);
           }

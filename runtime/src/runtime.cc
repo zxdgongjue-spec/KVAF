@@ -357,7 +357,6 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
           "BatchPut input_offsets and lengths must describe bytes inside input");
     }
   }
-
   PutContext put_context;
   PutAccessDesc put_desc;
   Status status = meta_manager_.PreparePut(request.keys, request.lengths,
@@ -372,8 +371,11 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
     (void)meta_manager_.AbortPut(put_context);
     return status;
   }
-
-  return meta_manager_.CommitPut(put_context);
+  status = meta_manager_.CommitPut(put_context);
+  if (!status.ok()) {
+    return status;
+  }
+  return Status::OK();
 }
 
 Status RuntimeCore::BatchFree(const BatchFreeRequest& request) {

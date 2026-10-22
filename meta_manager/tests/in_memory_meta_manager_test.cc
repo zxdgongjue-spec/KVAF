@@ -25,6 +25,11 @@ using kvaf::StatusCode;
 constexpr std::uint64_t kBaseAddress = 4096;
 constexpr std::uint64_t kSlotSize = 256;
 
+constexpr KeyId DsaKey(KeyId pool_row, KeyId layer, KeyId block_q) {
+  constexpr KeyId kLayers = 2, kQCapacity = 2;
+  return pool_row * (kLayers * kQCapacity) + layer * kQCapacity + block_q;
+}
+
 // 最轻量的断言助手。失败时直接输出错误信息，便于脱离 gtest 独立运行。
 bool Expect(bool condition, const std::string& message) {
   if (!condition) {
@@ -94,14 +99,14 @@ bool TestRegisterRemoteRegionValidation() {
 }
 
 // 验证 put -> commit -> lock -> get -> unlock -> free 主流程，
-// 同时确认 free 后 slot 会按 FIFO 语义重新进入可分配队列。
+// 同时确认相同 DSA key 在 free 后会复用自己的固定 slot。
 bool TestPutCommitLookupUnlockFreeRoundTrip() {
   auto manager = MakeInitializedManager(2);
   if (!manager) {
     return false;
   }
 
-  const std::vector<KeyId> keys{11, 12};
+  const std::vector<KeyId> keys{DsaKey(0, 0, 0), DsaKey(0, 0, 1)};
   const std::vector<std::uint64_t> lengths{64, 128};
   PutContext put_context;
   PutAccessDesc put_desc;
@@ -182,12 +187,12 @@ bool TestPutCommitLookupUnlockFreeRoundTrip() {
 
   PutContext recycled_put;
   PutAccessDesc recycled_desc;
-  if (!ExpectOk(manager->PreparePut({13}, {32}, &recycled_put, &recycled_desc),
+  if (!ExpectOk(manager->PreparePut({DsaKey(0, 0, 0)}, {32}, &recycled_put, &recycled_desc),
                 "freed slots should be reusable by later puts")) {
     return false;
   }
   return Expect(recycled_desc.entries[0].address == kBaseAddress,
-                "BatchFree should recycle the first freed slot back to the queue");
+                "BatchFree should allow the same key to reuse its slot");
 }
 
 // 验证 AbortPut 不会留下可见映射，并且会回收之前预留的 slot。
@@ -199,7 +204,7 @@ bool TestAbortPutRecyclesSlot() {
 
   PutContext first_put;
   PutAccessDesc first_desc;
-  if (!ExpectOk(manager->PreparePut({21}, {32}, &first_put, &first_desc),
+  if (!ExpectOk(manager->PreparePut({DsaKey(0, 0, 0)}, {32}, &first_put, &first_desc),
                 "first PreparePut should succeed")) {
     return false;
   }
@@ -209,7 +214,7 @@ bool TestAbortPutRecyclesSlot() {
 
   LockContext invisible_lock;
   if (!ExpectStatusCode(
-          manager->LockKeys({21}, MetaManagerLockMode::kStableReadAllowAppend,
+          manager->LockKeys({DsaKey(0, 0, 0)}, MetaManagerLockMode::kStableReadAllowAppend,
                             &invisible_lock),
           StatusCode::kNotFound,
           "aborted puts should not leave visible mappings behind")) {
@@ -218,7 +223,7 @@ bool TestAbortPutRecyclesSlot() {
 
   PutContext second_put;
   PutAccessDesc second_desc;
-  if (!ExpectOk(manager->PreparePut({22}, {48}, &second_put, &second_desc),
+  if (!ExpectOk(manager->PreparePut({DsaKey(0, 0, 0)}, {48}, &second_put, &second_desc),
                 "second PreparePut should reuse the freed slot")) {
     return false;
   }
@@ -227,7 +232,7 @@ bool TestAbortPutRecyclesSlot() {
     return false;
   }
   return Expect(second_desc.entries[0].address == first_desc.entries[0].address,
-                "AbortPut should recycle the reserved slot back to the queue");
+                "AbortPut should allow the same key to reuse its slot");
 }
 
 // 验证只要 key 仍被稳定读快照 pin 住，就不允许 free。
@@ -239,7 +244,7 @@ bool TestBatchFreeFailsWhileLocked() {
 
   PutContext put_context;
   PutAccessDesc put_desc;
-  if (!ExpectOk(manager->PreparePut({31}, {80}, &put_context, &put_desc),
+  if (!ExpectOk(manager->PreparePut({DsaKey(0, 0, 0)}, {80}, &put_context, &put_desc),
                 "PreparePut should succeed")) {
     return false;
   }
@@ -249,20 +254,20 @@ bool TestBatchFreeFailsWhileLocked() {
 
   LockContext lock_context;
   if (!ExpectOk(
-          manager->LockKeys({31}, MetaManagerLockMode::kStableReadAllowAppend,
+          manager->LockKeys({DsaKey(0, 0, 0)}, MetaManagerLockMode::kStableReadAllowAppend,
                             &lock_context),
           "LockKeys should succeed")) {
     return false;
   }
 
-  if (!ExpectStatusCode(manager->BatchFree({31}), StatusCode::kBusy,
+  if (!ExpectStatusCode(manager->BatchFree({DsaKey(0, 0, 0)}), StatusCode::kBusy,
                         "BatchFree should reject locked keys")) {
     return false;
   }
   if (!ExpectOk(manager->UnlockKeys(lock_context), "UnlockKeys should succeed")) {
     return false;
   }
-  return ExpectOk(manager->BatchFree({31}),
+  return ExpectOk(manager->BatchFree({DsaKey(0, 0, 0)}),
                   "BatchFree should succeed after unlock");
 }
 
@@ -275,7 +280,7 @@ bool TestInvalidArgumentAndDuplicateKeyPaths() {
 
   PutContext duplicate_put;
   PutAccessDesc duplicate_desc;
-  if (!ExpectStatusCode(manager->PreparePut({41, 41}, {8, 8}, &duplicate_put,
+  if (!ExpectStatusCode(manager->PreparePut({DsaKey(0, 0, 0), DsaKey(0, 0, 0)}, {8, 8}, &duplicate_put,
                                             &duplicate_desc),
                         StatusCode::kInvalidArgument,
                         "PreparePut should reject duplicate keys in one batch")) {
@@ -284,7 +289,7 @@ bool TestInvalidArgumentAndDuplicateKeyPaths() {
 
   PutContext put_context;
   PutAccessDesc put_desc;
-  if (!ExpectOk(manager->PreparePut({42}, {16}, &put_context, &put_desc),
+  if (!ExpectOk(manager->PreparePut({DsaKey(0, 0, 1)}, {16}, &put_context, &put_desc),
                 "PreparePut should succeed for a fresh key")) {
     return false;
   }
@@ -294,7 +299,7 @@ bool TestInvalidArgumentAndDuplicateKeyPaths() {
 
   PutContext conflict_put;
   PutAccessDesc conflict_desc;
-  if (!ExpectStatusCode(manager->PreparePut({42}, {32}, &conflict_put,
+  if (!ExpectStatusCode(manager->PreparePut({DsaKey(0, 0, 1)}, {32}, &conflict_put,
                                             &conflict_desc),
                         StatusCode::kAlreadyExists,
                         "PreparePut should reject an already committed key")) {
@@ -303,14 +308,14 @@ bool TestInvalidArgumentAndDuplicateKeyPaths() {
 
   LockContext lock_context;
   if (!ExpectOk(
-          manager->LockKeys({42}, MetaManagerLockMode::kStableReadAllowAppend,
+          manager->LockKeys({DsaKey(0, 0, 1)}, MetaManagerLockMode::kStableReadAllowAppend,
                             &lock_context),
           "LockKeys should succeed")) {
     return false;
   }
 
   FlatAccessDesc access_desc;
-  if (!ExpectStatusCode(manager->BatchLookup({99}, lock_context, &access_desc),
+  if (!ExpectStatusCode(manager->BatchLookup({DsaKey(0, 0, 0)}, lock_context, &access_desc),
                         StatusCode::kInvalidArgument,
                         "BatchLookup should validate key order against LockContext")) {
     return false;
@@ -324,7 +329,7 @@ bool TestNotInitializedPaths() {
 
   PutContext put_context;
   PutAccessDesc put_desc;
-  if (!ExpectStatusCode(manager->PreparePut({51}, {8}, &put_context, &put_desc),
+  if (!ExpectStatusCode(manager->PreparePut({DsaKey(0, 0, 0)}, {8}, &put_context, &put_desc),
                         StatusCode::kNotInitialized,
                         "PreparePut should fail before RegisterRemoteRegion")) {
     return false;
@@ -332,14 +337,14 @@ bool TestNotInitializedPaths() {
 
   LockContext lock_context;
   if (!ExpectStatusCode(
-          manager->LockKeys({51}, MetaManagerLockMode::kStableReadAllowAppend,
+          manager->LockKeys({DsaKey(0, 0, 0)}, MetaManagerLockMode::kStableReadAllowAppend,
                             &lock_context),
           StatusCode::kNotInitialized,
           "LockKeys should fail before RegisterRemoteRegion")) {
     return false;
   }
 
-  return ExpectStatusCode(manager->BatchFree({51}), StatusCode::kNotInitialized,
+  return ExpectStatusCode(manager->BatchFree({DsaKey(0, 0, 0)}), StatusCode::kNotInitialized,
                           "BatchFree should fail before RegisterRemoteRegion");
 }
 
@@ -380,13 +385,13 @@ bool TestPreparePutRejectsOversizedLength() {
   PutContext put_context;
   PutAccessDesc put_desc;
   return ExpectStatusCode(
-      manager->PreparePut({61}, {kSlotSize + 1}, &put_context, &put_desc),
+      manager->PreparePut({DsaKey(0, 0, 0)}, {kSlotSize + 1}, &put_context, &put_desc),
       StatusCode::kInvalidArgument,
       "PreparePut should reject payload larger than one slot");
 }
 
-// 验证 free queue 耗尽后会返回 OOM，而不是产生重复分配。
-bool TestPreparePutOutOfMemory() {
+// 固定映射要求 Key 小于注册的 slot 数量。
+bool TestPreparePutRejectsOutOfRangeKey() {
   auto manager = MakeInitializedManager(1);
   if (!manager) {
     return false;
@@ -394,16 +399,16 @@ bool TestPreparePutOutOfMemory() {
 
   PutContext first_put;
   PutAccessDesc first_desc;
-  if (!ExpectOk(manager->PreparePut({71}, {16}, &first_put, &first_desc),
+  if (!ExpectOk(manager->PreparePut({DsaKey(0, 0, 0)}, {16}, &first_put, &first_desc),
                 "first PreparePut should consume the only slot")) {
     return false;
   }
 
   PutContext second_put;
   PutAccessDesc second_desc;
-  return ExpectStatusCode(manager->PreparePut({72}, {16}, &second_put, &second_desc),
-                          StatusCode::kOutOfMemory,
-                          "PreparePut should fail when no free slot remains");
+  return ExpectStatusCode(manager->PreparePut({DsaKey(0, 0, 1)}, {16}, &second_put, &second_desc),
+                          StatusCode::kInvalidArgument,
+                          "PreparePut should reject a key outside the region");
 }
 
 // 验证同一个 lock context 只能释放一次，避免 pin_count 被重复扣减。
@@ -415,7 +420,7 @@ bool TestDoubleUnlockReturnsNotFound() {
 
   PutContext put_context;
   PutAccessDesc put_desc;
-  if (!ExpectOk(manager->PreparePut({81}, {24}, &put_context, &put_desc),
+  if (!ExpectOk(manager->PreparePut({DsaKey(0, 0, 0)}, {24}, &put_context, &put_desc),
                 "PreparePut should succeed")) {
     return false;
   }
@@ -425,7 +430,7 @@ bool TestDoubleUnlockReturnsNotFound() {
 
   LockContext lock_context;
   if (!ExpectOk(
-          manager->LockKeys({81}, MetaManagerLockMode::kStableReadAllowAppend,
+          manager->LockKeys({DsaKey(0, 0, 0)}, MetaManagerLockMode::kStableReadAllowAppend,
                             &lock_context),
           "LockKeys should succeed")) {
     return false;
@@ -437,6 +442,24 @@ bool TestDoubleUnlockReturnsNotFound() {
                           "second UnlockKeys should fail because context is gone");
 }
 
+// DSA directory and prefix keys select fixed addresses even in reverse order.
+bool TestDsaKeySelectsFixedSlot() {
+  constexpr KeyId kDirectoryCells = 2 * 2 * 2;
+  const KeyId prefix_key = kDirectoryCells + 1 * 2 + 1;
+  const std::vector<KeyId> keys{prefix_key, DsaKey(1, 1, 1), DsaKey(0, 0, 0)};
+  auto manager = MakeInitializedManager(kDirectoryCells + 2 * 2);
+  if (!manager) return false;
+  PutContext context;
+  PutAccessDesc desc;
+  if (!ExpectOk(manager->PreparePut(keys, {8, 16, 32}, &context, &desc),
+                "DSA PreparePut should succeed")) return false;
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    if (!Expect(desc.entries[i].address == kBaseAddress + keys[i] * kSlotSize,
+                "DSA key must select its fixed slot")) return false;
+  }
+  return ExpectOk(manager->AbortPut(context), "DSA AbortPut should succeed");
+}
+
 struct TestCase {
   const char* name;
   std::function<bool()> run;
@@ -446,6 +469,7 @@ struct TestCase {
 
 int main() {
   const std::vector<TestCase> tests{
+      {"DsaKeySelectsFixedSlot", TestDsaKeySelectsFixedSlot},
       {"RegisterRemoteRegionValidation", TestRegisterRemoteRegionValidation},
       {"PutCommitLookupUnlockFreeRoundTrip",
        TestPutCommitLookupUnlockFreeRoundTrip},
@@ -456,7 +480,7 @@ int main() {
       {"NotInitializedPaths", TestNotInitializedPaths},
       {"InvalidContextPaths", TestInvalidContextPaths},
       {"PreparePutRejectsOversizedLength", TestPreparePutRejectsOversizedLength},
-      {"PreparePutOutOfMemory", TestPreparePutOutOfMemory},
+      {"PreparePutRejectsOutOfRangeKey", TestPreparePutRejectsOutOfRangeKey},
       {"DoubleUnlockReturnsNotFound", TestDoubleUnlockReturnsNotFound},
   };
 
