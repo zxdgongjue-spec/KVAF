@@ -44,7 +44,9 @@ cd /path/to/kvaf
   --listen 0.0.0.0 --port 28999
 ```
 
-CPU DDR region 支持两种页分配模式；未指定时默认使用 `thp`：
+CPU DDR region 支持 `thp` 与 `origin` 两种页分配模式；未指定时默认使用 `thp`。
+`origin` 保留原始普通内存分配行为，不主动请求大页、不预触页，但不禁止操作系统
+自行使用 THP。旧参数值 `default` 已改名为 `origin`，现有命令需同步更新：
 
 ```bash
 # 默认模式：2 MiB 对齐，MADV_HUGEPAGE，并在注册前主动触页；
@@ -52,9 +54,9 @@ CPU DDR region 支持两种页分配模式；未指定时默认使用 `thp`：
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28999
 
-# 保留原始普通内存行为：4 KiB 对齐，操作系统仍可能自行使用 THP。
+# origin 模式：4 KiB 地址对齐，不主动请求大页、不预触页；实际页大小由系统决定。
 ./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28999 --memory-page-mode default
+  --listen 0.0.0.0 --port 28999 --memory-page-mode origin
 ```
 
 需要固定 NUMA 位置时，应在 UB device 所在 node 启动服务，例如

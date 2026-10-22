@@ -9,7 +9,7 @@
 namespace kvaf {
 
 enum class CpuMemoryPageMode {
-  kDefault,
+  kOrigin,
   kTransparentHugePage,
 };
 

@@ -660,8 +660,8 @@ class CpuService {
  private:
   const char* MemoryPageModeName() const {
     switch (memory_page_mode_) {
-      case CpuMemoryPageMode::kDefault:
-        return "default";
+      case CpuMemoryPageMode::kOrigin:
+        return "origin";
       case CpuMemoryPageMode::kTransparentHugePage:
         return "thp";
     }
