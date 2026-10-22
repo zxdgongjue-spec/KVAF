@@ -63,7 +63,7 @@ void SubmitAndWait(CpuUrmaTransport::PreparedWriteSession& session, std::uint64_
     if (count) { Require(count == 1 && completed.id == id, "unexpected completion"); return; }
   }
 }
-kvaf::peer::PeerRegion Configure(const Options& options, std::uint32_t npu_candidate) {
+kvaf::peer::PeerRegion Configure(Options& options, std::uint32_t npu_candidate) {
   Socket socket(Connect(options.transport.peer_address));
   SocketTimeout(socket.get(), 120000);
   ConfigureRequest request{};
@@ -76,8 +76,10 @@ kvaf::peer::PeerRegion Configure(const Options& options, std::uint32_t npu_candi
   Receive(socket.get(), &reply, sizeof(reply));
   Require(kvaf::peer::IsValidResponseHeader(reply.header, kConfigure, sizeof(reply)) &&
           reply.result == 0 && reply.segment_key_bytes <= kvaf::peer::kSegKeyBytes &&
-          reply.jetty_key_bytes <= kvaf::peer::kQpKeyBytes,
+          reply.jetty_key_bytes <= kvaf::peer::kQpKeyBytes &&
+          reply.reserved > 0 && reply.reserved <= kMaxAicpuBlocks,
           "NPU configure/export failed; check device-id and update both test binaries");
+  options.config.aicpu_blocks = reply.reserved;
   kvaf::peer::PeerRegion region{};
   region.session_id = reply.session_id; region.base = reply.hbm_base;
   region.length = reply.hbm_bytes; region.device_memory = true;
@@ -93,16 +95,8 @@ kvaf::peer::PeerRegion Configure(const Options& options, std::uint32_t npu_candi
 void Run(Options options) {
   kvaf::CpuUrmaDiscovery discovery;
   Check(discovery.Initialize(options.transport.ub_device, options.transport.has_eid_index, options.transport.eid_index));
-  Layout layout{}; Require(MakeLayout(options.config, &layout), "invalid layout");
-  std::vector<Work> work;
-  ForEachPipelineChunk(options.config, [&](auto worker, auto chunk, auto rows) { work.push_back({worker, chunk, rows}); });
-  const auto ready_base = Align64(kStagingOffset + options.config.rows * layout.stride);
-  Require(work.size() <= (kMaxAllocation - ready_base) / sizeof(Control), "too many ready buffers");
-  const auto verify_base = ready_base + work.size() * sizeof(Control);
-  Require(layout.output_bytes + kGuardBytes <= kMaxAllocation - verify_base, "host buffers exceed allocation limit");
   // Registered source memory must outlive the transport on every exit path.
   std::unique_ptr<void, decltype(&std::free)> allocation(nullptr, std::free);
-  options.transport.region_bytes = layout.region_bytes;
   std::unique_ptr<CpuUrmaTransport> selected_transport;
   kvaf::peer::PeerLink peer(options.transport.peer_address);
   Check(kvaf::SelectCpuUrmaDeviceLink(peer, options.transport.remote_device_id, discovery.candidates(),
@@ -114,6 +108,7 @@ void Run(Options options) {
     try {
       config.external_region = Configure(options, npu_index);
       config.has_external_region = true;
+      config.region_bytes = config.external_region.length;
       attempt = candidate->Initialize(config);
     } catch (const std::exception& e) {
       attempt = kvaf::Status::Internal(e.what());
@@ -137,6 +132,15 @@ void Run(Options options) {
     return {attempt, true};
   }, options.npu_candidate));
   CpuUrmaTransport& transport = *selected_transport;
+  Layout layout{};
+  Require(MakeLayout(options.config, &layout) && layout.region_bytes == transport.region_bytes(),
+          "NPU layout does not match configured AICPU blocks");
+  std::vector<Work> work;
+  ForEachPipelineChunk(options.config, [&](auto worker, auto chunk, auto rows) { work.push_back({worker, chunk, rows}); });
+  const auto ready_base = Align64(kStagingOffset + options.config.rows * layout.stride);
+  Require(work.size() <= (kMaxAllocation - ready_base) / sizeof(Control), "too many ready buffers");
+  const auto verify_base = ready_base + work.size() * sizeof(Control);
+  Require(layout.output_bytes + kGuardBytes <= kMaxAllocation - verify_base, "host buffers exceed allocation limit");
   const auto bytes = (verify_base + layout.output_bytes + kGuardBytes + 4095) & ~std::uint64_t{4095};
   Require(bytes <= kMaxAllocation, "rounded host buffers exceed allocation limit");
   void* host = nullptr;
@@ -187,10 +191,10 @@ void Run(Options options) {
     read_sges.push_back({readback + offset, static_cast<std::size_t>(length)}); offset += length;
   }
   OutputReadbackVerifier verifier(options.config, layout);
-  std::fprintf(stderr, "AICPU_GET_CPU CONFIG ready=ordered_write copy=securec_memcpy workers=%u jettys=4 "
+  std::fprintf(stderr, "AICPU_GET_CPU CONFIG ready=ordered_write copy=securec_memcpy aicpu_blocks=%llu workers=%u jettys=4 "
       "chunk_rows=1024 doorbell=32 cq_batch=8 deadline_polls=32 "
       "data_wrs=%llu marker_wrs=%llu tail_cqes=%llu revision=%llu\n",
-      ActiveThreads(options.config),
+      (unsigned long long)options.config.aicpu_blocks, ActiveThreads(options.config),
       (unsigned long long)(info.wr_count - info.marker_wrs), (unsigned long long)info.marker_wrs,
       (unsigned long long)(info.tail_cqes + 1), (unsigned long long)kKernelRevision);
   Socket control(Connect(options.transport.peer_address)); SocketTimeout(control.get(), options.config.timeout_ms + 120000);

@@ -4,9 +4,9 @@
 
 namespace kvaf::aicpu_test {
 constexpr std::uint64_t kMagic = 0x4b56414641424735ULL;
-constexpr char kKernelName[] = "KvafAicpuBatchGetV22";
-constexpr std::uint64_t kKernelRevision = 22;
-constexpr std::uint32_t kScatterWorkers = 4, kJettyCount = 4;
+constexpr char kKernelName[] = "KvafAicpuBatchGetV23";
+constexpr std::uint64_t kKernelRevision = 23;
+constexpr std::uint32_t kDefaultAicpuBlocks = 4, kMaxAicpuBlocks = 32, kJettyCount = 4;
 constexpr std::uint64_t kPipelineChunkRows = 1024;
 constexpr std::uint64_t kRequestOffset = 0;
 constexpr std::uint64_t kDoneOffset = 256;
@@ -24,6 +24,7 @@ struct Config {
   std::uint64_t warmup{50};
   std::uint64_t iterations{1000};
   std::uint64_t timeout_ms{30000};
+  std::uint64_t aicpu_blocks{kDefaultAicpuBlocks};
 };
 
 struct Layout {
@@ -41,21 +42,21 @@ inline std::uint64_t RegisteredOutputOffset(const Layout& l) {
 }
 inline bool MakeLayout(const Config& c, Layout* out) {
   if (!out || c.magic != kMagic || !c.rows || c.rows > UINT32_MAX ||
-      c.row_bytes < 8 || c.row_bytes > UINT32_MAX ||
+      c.row_bytes < 8 || c.row_bytes > UINT32_MAX || !c.aicpu_blocks || c.aicpu_blocks > kMaxAicpuBlocks ||
       !c.iterations || c.iterations > kMaxRounds || c.warmup > kMaxRounds - c.iterations ||
       !c.timeout_ms || c.timeout_ms > 600000) return false;
   const auto stride = Align64(c.row_bytes) + kGuardBytes;
   const auto limit = kMaxAllocation - kStagingOffset - kGuardBytes - 63 -
-      kScatterWorkers * kChainReadyWorkerBytes;
+      c.aicpu_blocks * kChainReadyWorkerBytes;
   if (c.rows > limit / (stride + c.row_bytes) || c.rows > limit / (2 * stride)) return false;
   *out = {c.rows * c.row_bytes, stride, c.rows * stride, 0, c.warmup + c.iterations};
   out->region_bytes = Align64(RegisteredOutputOffset(*out) + out->output_bytes + kGuardBytes) +
-      kScatterWorkers * kChainReadyWorkerBytes;
+      c.aicpu_blocks * kChainReadyWorkerBytes;
   return true;
 }
 inline std::uint64_t ChainReadyOffset(const Layout& l,
                                       std::uint32_t worker, std::uint32_t queue = 0) {
-  return l.region_bytes - kScatterWorkers * kChainReadyWorkerBytes +
+  return Align64(RegisteredOutputOffset(l) + l.output_bytes + kGuardBytes) +
       worker * kChainReadyWorkerBytes + queue * 8;
 }
 inline std::uint64_t OutputVerificationToken(std::uint64_t sequence, bool matches) {
@@ -125,7 +126,7 @@ inline std::uint64_t RowsPerCacheGroup(std::uint64_t row_bytes) {
 inline std::uint32_t ActiveThreads(const Config& c) {
   const auto quantum = RowsPerCacheGroup(c.row_bytes);
   const auto groups = (c.rows + quantum - 1) / quantum;
-  return static_cast<std::uint32_t>(groups < kScatterWorkers ? groups : kScatterWorkers);
+  return static_cast<std::uint32_t>(groups < c.aicpu_blocks ? groups : c.aicpu_blocks);
 }
 struct RowRange { std::uint64_t begin, end; };
 inline RowRange ScatterRange(const Config& c, std::uint32_t worker, std::uint32_t workers) {
@@ -135,7 +136,7 @@ inline RowRange ScatterRange(const Config& c, std::uint32_t worker, std::uint32_
   const auto end = (groups * (worker + 1) / workers) * quantum;
   return {begin, end < c.rows ? end : c.rows};
 }
-static_assert(sizeof(Config) == 48 && sizeof(Control) == 64);
+static_assert(sizeof(Config) == 56 && sizeof(Control) == 64);
 static_assert(sizeof(Sample) == 40 && sizeof(KernelResult) == 64);
-static_assert(sizeof(KernelArgs) == 80 && sizeof(CoordinationWord) == 64);
+static_assert(sizeof(KernelArgs) == 88 && sizeof(CoordinationWord) == 64);
 }  // namespace kvaf::aicpu_test

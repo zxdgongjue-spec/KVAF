@@ -18,6 +18,8 @@ void Bounds() {
   c = {}; c.warmup = UINT64_MAX; Require(!MakeLayout(c, &l), "round overflow accepted");
   c = {}; c.iterations = 0; Require(!MakeLayout(c, &l), "zero samples accepted");
   c = {}; c.timeout_ms = 0; Require(!MakeLayout(c, &l), "unbounded wait accepted");
+  c = {}; c.aicpu_blocks = 0; Require(!MakeLayout(c, &l), "zero blocks accepted");
+  c = {}; c.aicpu_blocks = kMaxAicpuBlocks + 1; Require(!MakeLayout(c, &l), "too many blocks accepted");
   c = {}; c.magic = 0; Require(!MakeLayout(c, &l), "invalid ABI accepted");
 }
 void DeviceSelection() {
@@ -32,10 +34,12 @@ void DeviceSelection() {
 
 }
 void RangesAndMetrics() {
-  for (auto rows : {1, 67, 4096, 16384}) for (auto bytes : {8, 65, 656, 4096}) {
-    Config c; c.rows = rows; c.row_bytes = bytes;
+  for (auto rows : {1, 67, 4096, 16384}) for (auto bytes : {8, 65, 656, 4096})
+      for (auto blocks : {1, 2, 4, 8, 32}) {
+    Config c; c.rows = rows; c.row_bytes = bytes; c.aicpu_blocks = blocks;
     Layout l{}; Require(MakeLayout(c, &l), "valid layout rejected");
     Require(ChainReadyOffset(l, 0) >= RegisteredOutputOffset(l) + l.output_bytes + kGuardBytes &&
+            ChainReadyOffset(l, ActiveThreads(c) - 1, kJettyCount - 1) + 8 <= l.region_bytes &&
             l.region_bytes <= kMaxAllocation, "registered ranges overlap/overflow");
     std::vector<unsigned> covered(rows);
     ForEachPipelineChunk(c, [&](auto, auto, RowRange r) {

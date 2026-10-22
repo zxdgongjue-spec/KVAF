@@ -12,6 +12,7 @@ struct Options {
   std::uint32_t device{};
   bool has_device{};
   std::uint16_t port{29991};
+  std::uint32_t aicpu_blocks{kDefaultAicpuBlocks};
   std::string eid, json;
 };
 Options Parse(int argc, char** argv) {
@@ -19,7 +20,7 @@ Options Parse(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     const std::string flag = argv[i];
     Require(flag == "--kernel-json" || flag == "--eid" || flag == "--device-id" ||
-            flag == "--port", "unknown option " + flag);
+            flag == "--port" || flag == "--aicpu-blocks", "unknown option " + flag);
     Require(i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0,
             "missing option value for " + flag);
     const char* value = argv[++i];
@@ -30,6 +31,9 @@ Options Parse(int argc, char** argv) {
       o.device = n; o.has_device = true;
     } else if (flag == "--port") {
       const auto n = Number(value); Require(n > 0 && n <= UINT16_MAX, "invalid port"); o.port = n;
+    } else if (flag == "--aicpu-blocks") {
+      const auto n = Number(value); Require(n > 0 && n <= kMaxAicpuBlocks, "AICPU blocks must be in [1,32]");
+      o.aicpu_blocks = n;
     } else throw std::runtime_error("unknown option " + flag);
   }
   Require(!o.json.empty(), "--kernel-json PATH is required");
@@ -92,9 +96,9 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
   const KernelArgs args{reinterpret_cast<std::uint64_t>(target.memory()),
       reinterpret_cast<std::uint64_t>(samples.data), reinterpret_cast<std::uint64_t>(result.data),
       reinterpret_cast<std::uint64_t>(coordination.data), config};
-  std::fprintf(stderr, "AICPU_GET_NPU LAUNCH block_dim=%u ready=ordered_write copy=securec_memcpy "
+  std::fprintf(stderr, "AICPU_GET_NPU LAUNCH aicpu_blocks=%llu block_dim=%u ready=ordered_write copy=securec_memcpy "
       "output_cache=cold_before_request cache_prepare=outside_timing revision=%llu\n",
-      ActiveThreads(config), (unsigned long long)kKernelRevision);
+      (unsigned long long)config.aicpu_blocks, ActiveThreads(config), (unsigned long long)kKernelRevision);
   kernel.Launch(args, ActiveThreads(config));
   // Retain buffers until both kernel execution and CPU transport have stopped.
   Ack ack{};
@@ -200,7 +204,8 @@ void HandleDiscovery(int fd, const kvaf::peer::MessageHeader& header, CandidateR
 }
 
 void HandleConfigure(int fd, const kvaf::peer::MessageHeader& header, CandidateResolver& resolver,
-                     std::unique_ptr<NpuTarget>& target, Config& config, std::uint32_t& device) {
+                     std::unique_ptr<NpuTarget>& target, Config& config, std::uint32_t& device,
+                     std::uint32_t aicpu_blocks) {
   kvaf::peer::AllocateHbmRegionResponse response{};
   response.header = kvaf::peer::MakeHeader(kConfigure, sizeof(response));
   response.header.command = kvaf::peer::ResponseCommand(kConfigure);
@@ -209,12 +214,14 @@ void HandleConfigure(int fd, const kvaf::peer::MessageHeader& header, CandidateR
             "invalid configure request or target already active");
     ConfigureRequest request{}; request.header = header;
     Receive(fd, reinterpret_cast<char*>(&request) + sizeof(header), sizeof(request) - sizeof(header));
+    request.config.aicpu_blocks = aicpu_blocks;
     Layout layout{}; Require(MakeLayout(request.config, &layout), "invalid benchmark config");
     const auto& eids = resolver.Get(request.device_id);
     Require(request.npu_candidate < eids.size(), "invalid NPU EID candidate");
     auto candidate = std::make_unique<NpuTarget>();
     candidate->Initialize(request.device_id, eids[request.npu_candidate], layout.region_bytes);
     response = candidate->exported();
+    response.reserved = aicpu_blocks;
     target = std::move(candidate); config = request.config; device = request.device_id;
     std::fprintf(stderr, "AICPU_GET_NPU device-id=%u npu_candidate=%u\n", device, request.npu_candidate);
   } catch (const std::exception& e) {
@@ -226,7 +233,8 @@ void HandleConfigure(int fd, const kvaf::peer::MessageHeader& header, CandidateR
 
 void Run(const Options& options) {
   Socket listener(Listen(options.port));
-  std::fprintf(stderr, "AICPU_GET_NPU listening port=%u engine=aicpu_memcpy\n", options.port);
+  std::fprintf(stderr, "AICPU_GET_NPU listening port=%u engine=aicpu_memcpy aicpu_blocks=%u\n",
+      options.port, options.aicpu_blocks);
   CandidateResolver resolver(options);
   std::unique_ptr<NpuTarget> target;
   Config config{};
@@ -238,7 +246,7 @@ void Run(const Options& options) {
       HandleDiscovery(fd.get(), header, resolver, target != nullptr, device); continue;
     }
     if (header.command == static_cast<std::uint16_t>(kConfigure)) {
-      HandleConfigure(fd.get(), header, resolver, target, config, device); continue;
+      HandleConfigure(fd.get(), header, resolver, target, config, device, options.aicpu_blocks); continue;
     }
     if (kvaf::peer::IsValidHeader(header, kResetSetup, sizeof(header))) {
       // CPU only requests this after a failed setup, before posting any data.

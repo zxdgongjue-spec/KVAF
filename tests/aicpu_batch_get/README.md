@@ -3,14 +3,15 @@
 独立 C++ 测试，复用 `CpuUrmaTransport` 和 NPU RA/TargetChannel，不接入 Runtime BatchPut。
 数据路径固定为离散 CPU 源地址 → 连续 HBM staging → AICPU scatter → output slot。
 
-实现固定使用 4 个 worker、4 个 Jetty、1024 行 chunk、doorbell 32、CQ batch 8/deadline 32，
+默认使用 4 个 worker；NPU 的 `--aicpu-blocks N` 可设置 1～32，CPU 自动同步分片计划。
+固定使用 4 个 Jetty、1024 行 chunk、doorbell 32、CQ batch 8/deadline 32，
 本地 SGE 请求上限 16 并按设备能力裁剪；小数据量自动减少有效 worker。
 每行保留一个本地 SGE，按目标连续性聚合 WR，不做 CPU payload 打包。
 scatter 使用 securec `memcpy_sp`，只在末轮通过 URMA 回读校验完整输出和 guard。
 
 ## 构建与运行
 
-V22 缩减了共享配置结构。CPU、NPU executable 和 device kernel 必须一起重建，
+V23 恢复了可配置的 AICPU 并行度。CPU、NPU executable 和 device kernel 必须一起重建，
 重新安装 kernel 后重启 NPU 测试进程。
 
 ```bash
@@ -21,7 +22,7 @@ bash build.sh aicpu-npu
 先启动 NPU 端；首次使用或 kernel 更新后加 `--install-kernel`：
 
 ```bash
-bash tests/run_aicpu_get_npu.sh --install-kernel --device-id 7
+bash tests/run_aicpu_get_npu.sh --install-kernel --device-id 7 --aicpu-blocks 4
 ```
 
 另一个终端启动 CPU 端：

@@ -16,9 +16,10 @@ Wrapper options:
   --smoke            16 rows x 64 bytes, 1 warmup, 3 measured iterations
   --output FILE      Save CSV and also print it to stdout
 
-Fixed path (V22): ordered WRITE chain, 4 workers/Jettys,
+Fixed path (V23): ordered WRITE chain, 4 Jettys,
 chunk 1024, doorbell 32, securec copy, indexed CQ batch 8/deadline 32,
 final output readback. Defaults: 4096 x 656 B, warmup 50/iterations 1000.
+Worker count follows the NPU's --aicpu-blocks setting (default 4).
 
   --rows N --row-bytes N
   --warmup N --iterations N --timeout-ms N

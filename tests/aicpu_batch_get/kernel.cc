@@ -171,7 +171,7 @@ Result Run(DeviceIO& io, Sample* samples, KernelResult* result, MultiBlockCoordi
 }
 }
 extern "C" __attribute__((visibility("default")))
-std::uint32_t KvafAicpuBatchGetV22(kvaf::aicpu_test::KernelArgs* args) {
+std::uint32_t KvafAicpuBatchGetV23(kvaf::aicpu_test::KernelArgs* args) {
   if (!args || !args->region || !args->samples || !args->result || !args->coordination) return 1;
   Layout layout{};
   auto* result = reinterpret_cast<KernelResult*>(args->result);
