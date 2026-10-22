@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kvaf
 
 from backend import detect_torch_backend
+from npu_eids import parse_npu_eids
 
 DEFAULT_TOKEN_BYTES = 656
 DEFAULT_TOKENS_PER_BLOCK = 128
@@ -131,13 +132,16 @@ def main() -> int:
     block_bytes = token_bytes * tokens_per_block
     source_stride = int(os.environ.get("KVAF_NPU_SOURCE_STRIDE", str(block_bytes)))
     npu_core_count = int(
-        os.environ.get("KVAF_NPU_CORE_COUNT", os.environ.get("KVAF_NPU_AIV_CORES", "1"))
+        os.environ.get("KVAF_NPU_CORE_COUNT", os.environ.get("KVAF_NPU_AIV_CORES", "2"))
     )
     jettys_per_core = int(os.environ.get("KVAF_NPU_JETTYS_PER_CORE", "2"))
+    max_inflight_total = int(os.environ.get("KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL", "2048"))
+    npu_eids = parse_npu_eids(os.environ.get("KVAF_NPU_EIDS"))
     active_percent = int(os.environ.get("KVAF_NPU_ACTIVE_PERCENT", "100"))
     warmup = int(os.environ.get("KVAF_NPU_WARMUP", "1"))
     iterations = int(os.environ.get("KVAF_NPU_ITERATIONS", "5"))
     graph_replays = int(os.environ.get("KVAF_NPU_GRAPH_REPLAYS", "0"))
+    inflight_checks = os.environ.get("KVAF_BATCH_GET_INFLIGHT_CHECKS") == "1"
     # Graph and eager measurements always use the same sample plan.
     graph_warmup = warmup
     graph_iterations = iterations
@@ -150,7 +154,8 @@ def main() -> int:
         and source_stride == block_bytes
         and npu_core_count > 0
         and npu_core_count <= requests
-        and 1 <= jettys_per_core <= 2
+        and 1 <= jettys_per_core <= 64
+        and len(npu_eids) <= npu_core_count * jettys_per_core
         and iterations > 0
         and 1 <= active_percent <= 100
         and graph_replays >= 0
@@ -161,13 +166,13 @@ def main() -> int:
         return 2
 
     # A sparse Device AccessTable can be much larger than the number of valid
-    # remote KV blocks. Only active requests receive a valid table entry; all
-    # masked-out requests are ignored by the kernel.
-    mask_values = [1 if request % 100 < active_percent else 0 for request in range(requests)]
-    active_request_positions = [
-        request for request, enabled in enumerate(mask_values) if enabled
-    ]
-    active_requests = len(active_request_positions)
+    # remote KV blocks. BatchGet consumes only the compact request prefix
+    # [0, miss_count); the remaining request-capacity rows are ignored.
+    active_requests = sum(
+        1 for request in range(requests) if request % 100 < active_percent
+    )
+    active_request_positions = list(range(active_requests))
+    mask_values = [1] * active_requests + [0] * (requests - active_requests)
     if active_requests > table_capacity:
         print(
             "FAIL: KVAF_NPU_TABLE_CAPACITY must be at least the number of active requests",
@@ -175,7 +180,7 @@ def main() -> int:
         )
         return 2
     # Runtime creates a capacity-sized NPU AccessTable. Valid entries occupy
-    # its compact prefix; masked requests use index zero because their lookup
+    # its compact prefix; inactive request-capacity rows use index zero because
     # is skipped by the AIV kernel.
     indices_values = [0] * requests
     offsets_values = [0] * requests
@@ -217,6 +222,8 @@ def main() -> int:
         npu_core_count=npu_core_count,
         batch_put_kernel_object_path=str(batch_put_kernel),
         jettys_per_core=jettys_per_core,
+        batch_get_max_inflight_total=max_inflight_total,
+        npu_eids=npu_eids,
     )
     runtime.link_to(remote_cpu_service)
     table = None
@@ -230,6 +237,8 @@ def main() -> int:
             f"token_bytes={token_bytes} tokens_per_block={tokens_per_block} "
             f"block_bytes={block_bytes} source_stride={source_stride} "
             f"npu_cores={npu_core_count} jettys_per_core={jettys_per_core} "
+            f"eid_paths={len(npu_eids) or 1} "
+            f"npu_eids={','.join(npu_eids) or 'auto'} "
             "batch_put_backend=aiv_direct_hccp"
         )
         if graph_replays:
@@ -325,7 +334,9 @@ def main() -> int:
         )
         indices = torch.tensor(indices_values, dtype=torch.int32, device=device)
         offsets = torch.tensor(offsets_values, dtype=torch.int32, device=device)
-        mask = torch.tensor(mask_values, dtype=torch.uint8, device=device)
+        miss_count = torch.tensor(
+            [active_requests], dtype=torch.int32, device=device
+        )
         output_indices = torch.tensor(output_indices_values, dtype=torch.int32, device=device)
         output_a = torch.zeros(
             (output_rows, token_bytes), dtype=torch.uint8, device=device
@@ -340,7 +351,7 @@ def main() -> int:
                 valid_table,
                 indices,
                 offsets,
-                mask,
+                miss_count,
                 output_indices,
                 output,
                 stream,
@@ -371,6 +382,52 @@ def main() -> int:
             payload_slots, token_bytes
         )
         print("RUNTIME_NPU_DYNAMIC_OUTPUT_VALIDATION_PASS sequence=A_B_A")
+
+        boundary_counts = sorted({
+            count for count in (0, 1, 127, 128, 129, 1023, 1024, 1025,
+                                2047, 2048, 2049, 3072, 4096, 8193,
+                                max_inflight_total - 1, max_inflight_total,
+                                max_inflight_total + 1, active_requests)
+            if 0 <= count <= active_requests
+        })
+
+        def check_inflight_profile(count: int) -> None:
+            profiles = list(runtime.batch_get_kernel_profile())
+            if sum(int(p["active_requests"]) for p in profiles) != count:
+                raise AssertionError("profile active request count mismatch")
+            for profile in profiles:
+                core = int(profile["core"])
+                active = count * (core + 1) // npu_core_count - count * core // npu_core_count
+                limit = active
+                if max_inflight_total and count > max_inflight_total:
+                    limit = (max_inflight_total // npu_core_count
+                             + int(core < max_inflight_total % npu_core_count))
+                if int(profile["peak_submitted_not_drained"]) > limit:
+                    raise AssertionError("per-core inflight budget exceeded")
+                if int(profile["submitted_group_count"]) != int(profile["completed_group_count"]):
+                    raise AssertionError("BatchGet returned with undrained groups")
+                if active and int(profile["completion_count"]) == 0:
+                    raise AssertionError("non-empty BatchGet did not consume a CQE")
+
+        if inflight_checks:
+            runtime.start_batch_get_kernel_profile()
+            # Alternate large/empty/small calls through the same SQ/CQ state.
+            for count in boundary_counts + list(reversed(boundary_counts)):
+                output_a.zero_()
+                miss_count.fill_(count)
+                torch.npu.synchronize()
+                execute(output_a)
+                torch.npu.synchronize()
+                validate_output(
+                    tensor_to_bytes(output_a),
+                    [int(i < count) for i in range(requests)],
+                    output_indices_values, payload_slots, token_bytes,
+                )
+                check_inflight_profile(count)
+            runtime.stop_batch_get_kernel_profile()
+            miss_count.fill_(active_requests)
+            torch.npu.synchronize()
+            print(f"RUNTIME_NPU_INFLIGHT_EAGER_PASS counts={boundary_counts}")
 
         for _ in range(warmup):
             execute(output_a)
@@ -438,7 +495,7 @@ def main() -> int:
             graph_address_table_host = bytearray(tensor_bytes(address_table))
             graph_indices_host = array("i", indices_values)
             graph_offsets_host = array("i", offsets_values)
-            graph_mask_host = bytearray(mask_values)
+            graph_miss_count_host = array("i", [active_requests])
             graph_output_indices_host = array("i", output_indices_values)
             if (
                 graph_indices_host.itemsize != 4
@@ -485,8 +542,8 @@ def main() -> int:
                     graph_offsets_host, capture_stream
                 )
                 graph.copy_host_to_device_async(
-                    int(mask.data_ptr()), tensor_bytes(mask), graph_mask_host,
-                    capture_stream
+                    int(miss_count.data_ptr()), tensor_bytes(miss_count),
+                    graph_miss_count_host, capture_stream
                 )
                 graph.copy_host_to_device_async(
                     int(output_indices.data_ptr()), tensor_bytes(output_indices),
@@ -500,7 +557,7 @@ def main() -> int:
                 f"address_table_bytes={len(graph_address_table_host)} "
                 f"indices_bytes={len(graph_indices_host) * graph_indices_host.itemsize} "
                 f"offsets_bytes={len(graph_offsets_host) * graph_offsets_host.itemsize} "
-                f"mask_bytes={len(graph_mask_host)} "
+                f"miss_count_bytes={graph_miss_count_host.itemsize} "
                 f"output_indices_bytes={len(graph_output_indices_host) * graph_output_indices_host.itemsize}"
             )
             print("RUNTIME_NPU_PHASE_BEGIN phase=graph_capture")
@@ -560,6 +617,26 @@ def main() -> int:
                     token_bytes,
                 )
                 print(f"RUNTIME_NPU_GRAPH_REPLAY_VALIDATION_PASS replay={replay}")
+
+            if inflight_checks:
+                runtime.start_batch_get_kernel_profile()
+                for epoch, count in enumerate(boundary_counts + list(reversed(boundary_counts))):
+                    output_a.zero_()
+                    torch.npu.synchronize()
+                    graph_payload_slots = prepare_graph_inputs(epoch)
+                    graph_miss_count_host[0] = count
+                    enqueue_graph_inputs()
+                    replay_graph_on_capture_stream()
+                    graph.synchronize(capture_stream)
+                    validate_output(
+                        tensor_to_bytes(output_a),
+                        [int(i < count) for i in range(requests)],
+                        output_indices_values, graph_payload_slots, token_bytes,
+                    )
+                    check_inflight_profile(count)
+                runtime.stop_batch_get_kernel_profile()
+                graph_miss_count_host[0] = active_requests
+                print(f"RUNTIME_NPU_INFLIGHT_GRAPH_PASS counts={boundary_counts}")
 
             print(
                 "GRAPH_PERF_CONTRACT "
