@@ -22,12 +22,9 @@ constexpr std::uint32_t kGatherMaxSpans = kGatherMaxRequests;
 struct alignas(64) GatherReadStatus {
   std::uint64_t magic, result, phase, ack_seen, cqe_word, sequence;
 };
-struct alignas(64) GatherQueueState {
-  std::uint64_t next_worker{0U};
-};
 struct GatherReadArgs {
   UmdkContext context;
-  std::uint64_t queue_state{0U}, core_status{0U};
+  std::uint64_t core_status{0U};
   std::uint64_t output{0U}, output_extent{0U}, scratch{0U};
   std::uint64_t remote_staging{0U}, remote_descriptor{0U};
   std::uint64_t remote_command{0U}, remote_notify{0U}, remote_ack{0U};

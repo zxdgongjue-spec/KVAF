@@ -12,6 +12,20 @@
 namespace kvaf::aicpu_urma {
 namespace {
 using namespace detail;
+
+unsigned ClaimWorker(unsigned count) {
+  if (count == 1U) return 0U;
+  // Runtime drains the previous launch before reuse. Exactly N claims assign
+  // every slot once, even if a new session changes N or starts at another slot.
+  static std::atomic<unsigned> next{0U};
+  auto observed = next.load(std::memory_order_relaxed);
+  for (;;) {
+    const auto worker = observed % count;
+    const auto successor = (worker + 1U) % count;
+    if (next.compare_exchange_weak(observed, successor, std::memory_order_relaxed))
+      return worker;
+  }
+}
 struct GatherQueue : WrQueue {
   // Vectors own constructed workspace slots; wr_count is the active chain size.
   std::vector<kvaf::GatherOutputSpan> targets;
@@ -399,18 +413,15 @@ bool StartGather(GatherReadArgs& args, GatherReadStatus& status, BatchGetWorkerP
 
 std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
   if (!launch || !launch->gather.core_status || !launch->gather.scratch ||
-      !launch->gather.queue_state || !launch->gather.worker_count ||
+      !launch->gather.worker_count ||
       launch->gather.worker_count > kGatherMaxWorkers)
     return 1U;
   auto args = launch->gather;
   BatchGetWorkerProfile measured{};
   auto* profile = args.profile ? &measured : nullptr;
   if (profile) profile->enter_ns = BatchGetProfileNowNs();
-  auto* queues = reinterpret_cast<GatherQueueState*>(args.queue_state);
-  Flush(queues, sizeof(*queues));
-  const auto worker = __atomic_fetch_add(&queues[0].next_worker, 1U, __ATOMIC_RELAXED);
-  if (worker >= args.worker_count) return 1U;
-  args.worker_index = static_cast<std::uint32_t>(worker);
+  const auto worker = ClaimWorker(args.worker_count);
+  args.worker_index = worker;
   args.core_status += worker * sizeof(GatherReadStatus);
   args.scratch += worker * 64U;
   args.source_descriptor += worker * GatherLaneDescriptorBytes(args.worker_count);
@@ -448,7 +459,6 @@ std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
       WaitAck(args, status);
     }
   }
-  Flush(queues, sizeof(*queues));
   Flush(&status, sizeof(status));
   if (profile) {
     profile->bytes = args.bytes;

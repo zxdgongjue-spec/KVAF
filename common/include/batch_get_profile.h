@@ -17,7 +17,7 @@ struct alignas(64) BatchGetWorkerProfile {
 
 // Caller-owned result, valid after a successful synchronous AICPU BatchGet.
 struct BatchGetProfile {
-  std::uint64_t prepare_ns{}, reset_enqueue_ns{}, launch_ns{}, status_enqueue_ns{};
+  std::uint64_t prepare_ns{}, launch_ns{}, status_enqueue_ns{};
   std::uint64_t wait_ns{}, finish_ns{}, total_ns{};
   std::uint32_t worker_count{};
   std::array<BatchGetWorkerProfile, 8> workers{};

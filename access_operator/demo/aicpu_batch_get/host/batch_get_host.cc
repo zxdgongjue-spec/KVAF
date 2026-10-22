@@ -42,10 +42,7 @@ Status BatchGetTransport::Initialize(const RemoteRegionDesc& region) {
   if (impl_->initialized) return Status::InvalidState("UMDK operator already initialized");
   auto& state = impl_->execution;
   state.status_bytes = impl_->session.config().workers * sizeof(GatherReadStatus);
-  state.queue_state_bytes = impl_->session.config().workers * sizeof(GatherQueueState);
   if (aclrtMalloc(&state.status, state.status_bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
-      aclrtMalloc(&state.queue_state, state.queue_state_bytes, ACL_MEM_MALLOC_HUGE_FIRST) !=
-          ACL_SUCCESS ||
       aclrtMalloc(&impl_->workspace, GatherWorkspaceBytes(impl_->session.config().workers),
                   ACL_MEM_MALLOC_HUGE_FIRST) !=
           ACL_SUCCESS ||
@@ -77,7 +74,6 @@ Status BatchGetTransport::Shutdown() {
   if (impl_->profile_device) (void)aclrtFree(impl_->profile_device);
   if (impl_->profile_host) (void)aclrtFreeHost(impl_->profile_host);
   if (impl_->execution.status) (void)aclrtFree(impl_->execution.status);
-  if (impl_->execution.queue_state) (void)aclrtFree(impl_->execution.queue_state);
   impl_->workspace = impl_->status_host = nullptr;
   impl_->profile_device = impl_->profile_host = nullptr;
   impl_->execution = {};
@@ -97,7 +93,7 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
     return InvalidArgument("UMDK BatchGet needs initialization and stream");
   UmdkBatchGetArgs launch{};
   auto valid = BuildBatchGetKernelArgs(exec, 1U, 1U, impl_->execution, &launch.request,
-                                       sizeof(GatherReadStatus), sizeof(GatherQueueState));
+                                       sizeof(GatherReadStatus), 0U);
   if (!valid.ok()) return valid;
   if (launch.request.request_capacity > kGatherMaxRequests ||
       launch.request.token_bytes != impl_->token_bytes)
@@ -131,7 +127,6 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
   auto& args = launch.gather;
   args.sequence = ++impl_->sequence;
   args.context = {impl_->session.session(), impl_->session.owner_pid()};
-  args.queue_state = PointerValue(impl_->execution.queue_state);
   args.core_status = PointerValue(impl_->execution.status);
   args.scratch = PointerValue(impl_->workspace);
   args.source_descriptor = args.scratch + kGatherDescriptorOffset;
@@ -150,14 +145,6 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
   impl_->pending = stream;
   auto stamp = profile ? BatchGetProfileNowNs() : 0U;
   if (profile) profile->prepare_ns = stamp - begin;
-  if (aclrtMemsetAsync(impl_->execution.queue_state, impl_->execution.queue_state_bytes, 0,
-                       impl_->execution.queue_state_bytes, stream) != ACL_SUCCESS)
-    return Internal("BatchGet worker counter reset failed");
-  if (profile) {
-    const auto now = BatchGetProfileNowNs();
-    profile->reset_enqueue_ns = now - stamp;
-    stamp = now;
-  }
   if (LaunchBatchGet(&launch, stream)) return Internal("UMDK BatchGet launch failed");
   if (profile) {
     const auto now = BatchGetProfileNowNs();

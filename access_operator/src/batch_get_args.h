@@ -53,9 +53,10 @@ inline Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec, std::uint
       request.mask.bytes != request.indices.bytes / sizeof(std::int32_t) ||
       execution.status == nullptr ||
       execution.status_bytes < static_cast<std::size_t>(npu_core_count) * status_size ||
-      execution.queue_state == nullptr ||
-      execution.queue_state_bytes <
-          static_cast<std::size_t>(npu_core_count) * jettys_per_core * queue_size) {
+      (queue_size != 0U &&
+       (execution.queue_state == nullptr ||
+        execution.queue_state_bytes <
+            static_cast<std::size_t>(npu_core_count) * jettys_per_core * queue_size))) {
     return Status::InvalidArgument("BatchGet request does not satisfy the NPU buffer contract");
   }
 

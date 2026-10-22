@@ -154,7 +154,6 @@ py::dict BatchGetProfileDict(const BatchGetProfile& profile) {
   py::dict result, host;
 #define HOST_TIME(name) host[#name "_us"] = profile.name##_ns / 1000.0
   HOST_TIME(prepare);
-  HOST_TIME(reset_enqueue);
   HOST_TIME(launch);
   HOST_TIME(status_enqueue);
   HOST_TIME(wait);
@@ -458,7 +457,7 @@ class NpuPythonRuntime final {
     if (!profile) return py::none();
     const auto end = BatchGetProfileNowNs();
     auto result = BatchGetProfileDict(*timings);
-    result["tensor_adapt_us"] = (native_begin - begin) / 1000.0;
+    result["binding_prepare_us"] = (native_begin - begin) / 1000.0;
     result["native_call_us"] = (end - native_begin) / 1000.0;
     result["binding_total_us"] = (end - begin) / 1000.0;
     return result;

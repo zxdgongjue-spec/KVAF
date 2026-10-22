@@ -109,9 +109,9 @@ print(profile["workers"])
 
 | 输出 | 含义 |
 | --- | --- |
-| Python `tensor_adapt_us` / `native_call_us` | Tensor 适配与参数检查 / 原生 Runtime 调用；合计为 `binding_total_us` |
+| Python `binding_prepare_us` / `native_call_us` | 绑定层准备（Tensor 信息、参数检查、stream 解析和 profile 对象分配）/ 原生 Runtime 调用；合计为 `binding_total_us` |
 | Python `python_other_us` | 外部 Python 计时减去 `binding_total_us`，含绑定分派与 profile 字典转换 |
-| Host | 准备、清零入队、launch、状态及 profile D2H 入队、等待 stream、收尾；各项之和为 Host total |
+| Host | 准备、launch、状态及 profile D2H 入队、等待 stream、收尾；各项之和为 Host total |
 | Device | 最早 worker 进入至最后 worker 主体退出，使用同一设备时钟；不含最后的 profile 导出 |
 | Worker | 相对进入/退出、总时长、清单构建、源清单 WRITE、通知 CPU、流水 READ、最终 ACK |
 | Within request | 输入缓存维护、清单缓存维护；已包含在清单构建中 |
@@ -129,6 +129,9 @@ CPU 侧每条通道也各有独立 Jetty/RQ/CQ。CPU 与 AICPU 共用端点枚�
 AICPU 进程内的 liburma 动态加载与会话由 AICPU 自己维护。
 
 每个 worker 负责输入请求下标的一个连续区间，在本区间内跳过 mask=0 的条目。
+单 worker 直接使用编号 0；多 worker 从 AICPU 进程内的循环编号器各领一个编号。
+每次 launch 的 N 个实例恰好覆盖全部 N 个编号；上一轮结束后才允许复用资源。
+Host 每轮直接提交算子，不再分配 HBM 编号缓冲或提交清零任务。
 描述头、源清单、command、notify、ACK、ready_bytes 和 CPU gather 处理对象均按 worker 独立。
 CPU 服务的 `--gather-threads` 是全部 worker 的总预算，须不小于 AICPU worker 数；
 预算在 worker 之间均分，余数从 worker 0 开始分配。每个 worker 每完成 128 KiB 连续前缀即可开始 READ。

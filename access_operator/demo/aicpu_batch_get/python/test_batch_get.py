@@ -72,10 +72,10 @@ def print_profile(samples: list[dict]) -> None:
           f"rounds={len(samples)} warmup=1 "
           "aggregation=mean_per_worker units=us output_payload_flushes=0 "
           "instrumented_rounds_excluded_from_bandwidth=1")
-    print("  Python " + fields(samples, ("python_call_us", "tensor_adapt_us", "native_call_us",
+    print("  Python " + fields(samples, ("python_call_us", "binding_prepare_us", "native_call_us",
                                        "binding_total_us", "python_other_us")))
     hosts = [sample["host"] for sample in samples]
-    print("  Host " + fields(hosts, ("prepare_us", "reset_enqueue_us", "launch_us",
+    print("  Host " + fields(hosts, ("prepare_us", "launch_us",
                                    "status_enqueue_us", "wait_us", "finish_us", "total_us")))
     print(f"  Device first_entry_to_last_exit_us={mean('device_span_us', samples):.1f}")
     for index in range(len(samples[0]["workers"])):
