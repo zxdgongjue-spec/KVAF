@@ -22,6 +22,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--active-percent", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument("--profile-rounds", type=int, default=0,
+                        help="extra instrumented rounds, excluded from bandwidth statistics")
     parser.add_argument("--urma-device", default="")
     parser.add_argument("--eid-index", type=int, default=0)
     cann = os.environ.get("ASCEND_HOME_PATH") or os.environ.get("ASCEND_CANN_PACKAGE_PATH")
@@ -41,7 +43,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("block size must be positive and fit uint32")
     if (args.tokens_per_block - 1) * args.token_bytes > 0x7FFFFFFF:
         parser.error("token offsets must fit the int32 input Tensor")
-    if not 0 <= args.active_percent <= 100 or args.warmup < 0 or args.iterations <= 0:
+    if (not 0 <= args.active_percent <= 100 or args.warmup < 0 or args.iterations <= 0
+            or args.profile_rounds < 0):
         parser.error("invalid active percentage, warmup or iteration count")
     if not 0 <= args.eid_index < 0xFFFFFFFF:
         parser.error("--eid-index must be a nonnegative uint32 index")
@@ -56,6 +59,40 @@ def percentile(values: list[float], fraction: float) -> float:
     lower = int(position)
     upper = min(lower + 1, len(ordered) - 1)
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
+def print_profile(samples: list[dict]) -> None:
+    def mean(key: str, rows: list[dict]) -> float:
+        return statistics.mean(row[key] for row in rows)
+
+    def fields(rows: list[dict], keys: tuple[str, ...]) -> str:
+        return " ".join(f"{key}={mean(key, rows):.1f}" for key in keys)
+
+    print(f"AICPU_BATCH_GET_PROFILE workers={len(samples[0]['workers'])} "
+          f"rounds={len(samples)} warmup=1 "
+          "aggregation=mean_per_worker units=us output_payload_flushes=0 "
+          "instrumented_rounds_excluded_from_bandwidth=1")
+    print("  Python " + fields(samples, ("python_call_us", "tensor_adapt_us", "native_call_us",
+                                       "binding_total_us", "python_other_us")))
+    hosts = [sample["host"] for sample in samples]
+    print("  Host " + fields(hosts, ("prepare_us", "reset_enqueue_us", "launch_us",
+                                   "status_enqueue_us", "wait_us", "finish_us", "total_us")))
+    print(f"  Device first_entry_to_last_exit_us={mean('device_span_us', samples):.1f}")
+    for index in range(len(samples[0]["workers"])):
+        rows = [sample["workers"][index] for sample in samples]
+        print(f"  Worker {index} " + fields(rows, ("entry_us", "exit_us", "wall_us",
+                                                  "request_us", "source_write_us", "notify_us",
+                                                  "read_us", "ack_us")))
+        print("    Within request " + fields(rows, ("input_cache_us", "descriptor_cache_us")))
+        print("    Within READ " + fields(rows, ("read_setup_us", "wr_build_us", "ready_wait_us",
+                                                "post_us", "cq_wait_us")))
+        print("    Counts " + fields(rows, ("bytes", "spans", "read_wqes", "post_calls",
+                                           "ready_queries")))
+    print("  Timing: Host phases sum to Host total; Host wait includes queued device work/D2H. "
+          "Worker intervals overlap. Cache times are inside request; READ phases are inside read. "
+          "ready_wait includes CPU gather overlap, not a separate CPU gather measurement. "
+          "post includes provider encoding/SQ/doorbells. python_other includes binding dispatch "
+          "and profile dictionary conversion. Host/device clocks are not subtracted.", flush=True)
 
 
 def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object) -> None:
@@ -86,9 +123,11 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
     rows = torch.empty((n,), dtype=torch.int32, device=device)
     samples_ns: list[int] = []
     payload_bytes: list[int] = []
+    profiles: list[dict] = []
     device_table = None
 
-    def run_round(epoch: int, active_percent: int, raw_tensors: bool = False) -> tuple[int, int]:
+    def run_round(epoch: int, active_percent: int, raw_tensors: bool = False,
+                  synchronize: bool = True, profile: bool = False) -> tuple[int, int]:
         nonlocal device_table
         payload = bytearray(rng.randbytes(n * block_bytes))
         index_values = list(range(n))
@@ -124,14 +163,22 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
         stream.synchronize()
         table_args = (device_table.addresses, device_table.valid) if raw_tensors else (device_table,)
         begin = time.perf_counter_ns()
-        runtime.batch_get(
+        measured = runtime.batch_get(
             *table_args, indices, offsets, mask, rows, output,
-            stream=stream, synchronize=True,
+            stream=stream, synchronize=synchronize, profile=profile,
         )
         elapsed = time.perf_counter_ns() - begin
+        if profile:
+            measured["python_call_us"] = elapsed / 1000
+            measured["python_other_us"] = elapsed / 1000 - measured["binding_total_us"]
+            profiles.append(measured)
 
-        # Compare the entire output, including masked rows and untouched padding.
+        # Consume on the NPU before downloading: this also checks same-stream
+        # visibility after the asynchronous precheck, including gaps/masked rows.
+        consumed = output.to(dtype=torch.int32) + 1
         expected_tensor = torch.frombuffer(expected, dtype=torch.uint8).reshape(n * 2, token)
+        if not torch.equal(consumed.cpu(), expected_tensor.to(dtype=torch.int32) + 1):
+            raise AssertionError(f"NPU consumer mismatch: workers={workers}, round={epoch}")
         if not torch.equal(output.cpu(), expected_tensor):
             raise AssertionError(f"output mismatch: workers={workers}, round={epoch}")
         runtime.release_access_table(table)
@@ -145,12 +192,19 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
         # Exercise both Python overloads, sparse masks and the empty-request path.
         for epoch, (active, raw) in enumerate(((100, False), (75, True), (0, False))):
             run_round(epoch, active, raw)
+        run_round(3, 75, synchronize=False)
         for epoch in range(args.warmup):
-            run_round(epoch + 3, args.active_percent)
+            run_round(epoch + 4, args.active_percent)
         for epoch in range(args.iterations):
-            elapsed, size = run_round(epoch + 3 + args.warmup, args.active_percent)
+            elapsed, size = run_round(epoch + 4 + args.warmup, args.active_percent)
             samples_ns.append(elapsed)
             payload_bytes.append(size)
+        if args.profile_rounds:
+            profile_epoch = 4 + args.warmup + args.iterations
+            run_round(profile_epoch, args.active_percent, profile=True)
+            profiles.clear()
+            for epoch in range(args.profile_rounds):
+                run_round(profile_epoch + 1 + epoch, args.active_percent, profile=True)
     finally:
         # Registered source/output allocations remain alive until teardown.
         runtime.shutdown()
@@ -163,9 +217,12 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
         f"p50_us={percentile(samples_us, 0.50):.1f} "
         f"p95_us={percentile(samples_us, 0.95):.1f} "
         f"p99_us={percentile(samples_us, 0.99):.1f} GBps={bandwidth:.3f} "
-        "verification=every_round_full_output padding_checked=1 changing_inputs=1",
+        "verification=every_round_full_output npu_consumer_checked=1 "
+        "padding_checked=1 changing_inputs=1",
         flush=True,
     )
+    if profiles:
+        print_profile(profiles)
 
 
 def main() -> None:

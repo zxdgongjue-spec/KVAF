@@ -3,6 +3,7 @@
 
 #include "../../aiv_batch_get/include/batch_get_abi.h"
 #include "gather_workspace.h"
+#include "batch_get_profile.h"
 #include "umdk/kernel_abi.h"
 namespace kvaf {
 constexpr std::uint32_t kGatherMaxSglSize = 6U;
@@ -36,6 +37,7 @@ struct GatherReadArgs {
   std::uint32_t sgl_size{6U}, worker_count{1U}, sq_batch_wqes{32U};
   std::uint32_t worker_index{0U};
   std::uint32_t pipeline_chunk_bytes{kGatherChunkBytes};
+  std::uint64_t profile{0U};
 };
 // One stable registered HBM workspace, independent of caller output allocations.
 constexpr std::uint64_t kGatherDescriptorOffset = kGatherMaxWorkers * 64U;

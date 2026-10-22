@@ -22,6 +22,8 @@ struct BatchGetTransport::Impl {
   BatchGetExecutionState execution;
   void* workspace{nullptr};
   void* status_host{nullptr};
+  void* profile_device{nullptr};
+  void* profile_host{nullptr};
   aclrtStream pending{nullptr};
   std::uint64_t sequence{0U};
   bool initialized{false}, cpu_enabled{false};
@@ -72,15 +74,23 @@ Status BatchGetTransport::Shutdown() {
   if (!drained.ok()) return drained;
   if (impl_->workspace) (void)aclrtFree(impl_->workspace);
   if (impl_->status_host) (void)aclrtFreeHost(impl_->status_host);
+  if (impl_->profile_device) (void)aclrtFree(impl_->profile_device);
+  if (impl_->profile_host) (void)aclrtFreeHost(impl_->profile_host);
   if (impl_->execution.status) (void)aclrtFree(impl_->execution.status);
   if (impl_->execution.queue_state) (void)aclrtFree(impl_->execution.queue_state);
   impl_->workspace = impl_->status_host = nullptr;
+  impl_->profile_device = impl_->profile_host = nullptr;
   impl_->execution = {};
   impl_->sequence = 0;
   impl_->initialized = impl_->cpu_enabled = false;
   return Status::OK();
 }
 Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
+  auto* profile = exec.execution.profile;
+  if (profile && !exec.execution.synchronize)
+    return InvalidArgument("BatchGet profiling requires synchronize=true");
+  if (profile) *profile = {};
+  const auto begin = profile ? BatchGetProfileNowNs() : 0U;
   auto drained = impl_->Drain();
   if (!drained.ok()) return drained;
   if (!impl_->initialized || !exec.execution.stream)
@@ -96,6 +106,14 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
     return impl_->session.Ensure(impl_->region.base, buffer, bytes);
   };
   const auto workers = impl_->session.config().workers;
+  const auto profile_bytes = workers * sizeof(BatchGetWorkerProfile);
+  if (profile) {
+    if ((!impl_->profile_device &&
+         aclrtMalloc(&impl_->profile_device, profile_bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) ||
+        (!impl_->profile_host &&
+         aclrtMallocHost(&impl_->profile_host, profile_bytes) != ACL_SUCCESS))
+      return Internal("failed to allocate BatchGet profiling buffers");
+  }
   auto ready = ensure(impl_->workspace, GatherWorkspaceBytes(workers));
   if (!ready.ok()) return ready;
   ready = ensure(exec.request->output.data, exec.request->output.bytes);
@@ -127,18 +145,44 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
   args.remote_ack = args.remote_notify + 8U;
   args.remote_command = args.remote_notify + 16U;
   args.worker_count = impl_->session.config().workers;
+  args.profile = profile ? PointerValue(impl_->profile_device) : 0U;
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);
   impl_->pending = stream;
+  auto stamp = profile ? BatchGetProfileNowNs() : 0U;
+  if (profile) profile->prepare_ns = stamp - begin;
   if (aclrtMemsetAsync(impl_->execution.queue_state, impl_->execution.queue_state_bytes, 0,
                        impl_->execution.queue_state_bytes, stream) != ACL_SUCCESS)
     return Internal("BatchGet worker counter reset failed");
+  if (profile) {
+    const auto now = BatchGetProfileNowNs();
+    profile->reset_enqueue_ns = now - stamp;
+    stamp = now;
+  }
   if (LaunchBatchGet(&launch, stream)) return Internal("UMDK BatchGet launch failed");
+  if (profile) {
+    const auto now = BatchGetProfileNowNs();
+    profile->launch_ns = now - stamp;
+    stamp = now;
+  }
   if (!exec.execution.synchronize) return Status::OK();
   if (aclrtMemcpyAsync(impl_->status_host, impl_->execution.status_bytes, impl_->execution.status,
                        impl_->execution.status_bytes, ACL_MEMCPY_DEVICE_TO_HOST,
                        stream) != ACL_SUCCESS)
     return Internal("BatchGet status enqueue failed");
+  if (profile) {
+    if (aclrtMemcpyAsync(impl_->profile_host, profile_bytes, impl_->profile_device,
+                         profile_bytes, ACL_MEMCPY_DEVICE_TO_HOST, stream) != ACL_SUCCESS)
+      return Internal("BatchGet profile enqueue failed");
+    const auto now = BatchGetProfileNowNs();
+    profile->status_enqueue_ns = now - stamp;
+    stamp = now;
+  }
   auto completed = impl_->Drain();
+  if (profile) {
+    const auto now = BatchGetProfileNowNs();
+    profile->wait_ns = now - stamp;
+    stamp = now;
+  }
   if (!completed.ok()) return completed;
   const auto* statuses = static_cast<const GatherReadStatus*>(impl_->status_host);
   for (unsigned worker = 0; worker < args.worker_count; ++worker)
@@ -147,6 +191,14 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
       return Internal("BatchGet worker " + std::to_string(worker) +
                       " failed: phase=" + std::to_string(statuses[worker].phase) +
                       " result=" + std::to_string(statuses[worker].result));
+  if (profile) {
+    profile->worker_count = workers;
+    std::copy_n(static_cast<const BatchGetWorkerProfile*>(impl_->profile_host), workers,
+                profile->workers.begin());
+    const auto end = BatchGetProfileNowNs();
+    profile->finish_ns = end - stamp;
+    profile->total_ns = end - begin;
+  }
   return Status::OK();
 }
 }  // namespace kvaf::aicpu_urma

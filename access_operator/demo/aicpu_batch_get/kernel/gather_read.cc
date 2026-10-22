@@ -133,6 +133,7 @@ struct GatherPrefix {
   GatherReadStatus& gather;
   std::uint32_t worker_index;
   std::uint64_t ready_bytes = 0;
+  BatchGetWorkerProfile* profile = nullptr;
 };
 
 bool WaitBatchPrefix(GatherPrefix& prefix, const urma_jfs_wr_t& tail,
@@ -143,7 +144,7 @@ bool WaitBatchPrefix(GatherPrefix& prefix, const urma_jfs_wr_t& tail,
   if (required <= prefix.ready_bytes) return true;
   auto& gather = prefix.gather;
   gather.phase = 5;
-  const auto scratch = args.scratch + prefix.worker_index * 64U;
+  const auto scratch = args.scratch;  // Already offset to this worker's mailbox.
   const UmdkTransfer transfer{
       args.remote_descriptor + offsetof(kvaf::peer::GatherDescriptorHeader, ready_bytes), scratch,
       8};
@@ -151,6 +152,7 @@ bool WaitBatchPrefix(GatherPrefix& prefix, const urma_jfs_wr_t& tail,
   for (std::uint32_t poll = 0; poll < 10000; ++poll) {
     FlushUmdkCache(reinterpret_cast<const void*>(scratch), 8);
     UmdkControlStatus query{};
+    if (prefix.profile) ++prefix.profile->ready_queries;
     // The dedicated control Jetty can complete this query while data READs
     // remain outstanding; controls use their own WR storage.
     if (!TransferControl(false, &transfer, 1, query, prefix.worker_index)) {
@@ -187,33 +189,57 @@ bool WaitBatchPrefix(GatherPrefix& prefix, const urma_jfs_wr_t& tail,
 bool ScatterQueue(Worker& worker, const GatherReadArgs& args, GatherReadStatus& status,
                   std::uint32_t first, std::uint32_t last, std::uint64_t remote_offset,
                   UmdkControlStatus& error, std::uint32_t timeout_ms,
-                  std::uint32_t worker_index = 0) {
+                  std::uint32_t worker_index, BatchGetWorkerProfile* profile) {
   if (first == last) return true;
   const auto snapshot_first = first;
+  const auto setup_start = profile ? BatchGetProfileNowNs() : 0U;
   SnapshotGatherTargets(ReadQueue(worker), args, first, last);
   const GatherBuildLayout layout(worker, args);
-  GatherPrefix prefix{args, status, worker_index};
+  GatherPrefix prefix{args, status, worker_index, 0U, profile};
+  if (profile) profile->read_setup_ns += BatchGetProfileNowNs() - setup_start;
   std::uint32_t span_offset = 0;
   while (first < last) {
     auto& queue = ReadQueue(worker);
-    BeginGatherWave(queue, layout.sgl_size);
+    {
+      BatchGetProfileScope timer(profile ? &profile->read_setup_ns : nullptr);
+      BeginGatherWave(queue, layout.sgl_size);
+    }
     std::uint32_t local_index = 0;
-    const auto start = NowNs();  // Deadline only; no per-stage profiling.
+    const auto start = NowNs();
     do {
       const auto batch_first = queue.wr_count;
-      AppendGatherBatch(worker, layout, first, last, span_offset, remote_offset, snapshot_first,
-                        args.sq_batch_wqes, local_index);
+      {
+        BatchGetProfileScope timer(profile ? &profile->wr_build_ns : nullptr);
+        AppendGatherBatch(worker, layout, first, last, span_offset, remote_offset, snapshot_first,
+                          args.sq_batch_wqes, local_index);
+      }
       auto* tail = &queue.wrs[queue.wr_count - 1U];
-      if ((args.pipeline_chunk_bytes && !WaitBatchPrefix(prefix, *tail, error)) ||
-          !PostBatch(worker, &queue.wrs[batch_first], tail, batch_first,
-                     queue.wr_count - batch_first, error)) {
+      bool ready = true;
+      if (args.pipeline_chunk_bytes) {
+        BatchGetProfileScope timer(profile ? &profile->ready_wait_ns : nullptr);
+        ready = WaitBatchPrefix(prefix, *tail, error);
+      }
+      bool posted = false;
+      if (ready) {
+        BatchGetProfileScope timer(profile ? &profile->post_ns : nullptr);
+        posted = PostBatch(worker, &queue.wrs[batch_first], tail, batch_first,
+                           queue.wr_count - batch_first, error);
+      }
+      if (!ready || !posted) {
         worker.poisoned = true;
         return false;
       }
+      if (profile) {
+        profile->read_wqes += queue.wr_count - batch_first;
+        ++profile->post_calls;
+      }
     } while (first < last && queue.wr_count < kGatherWaveWrs);
     // Retain every WR/SGL slot until the final ordered CQE for this wave.
-    if (!WaitCompletion(worker, queue.wrs[queue.wr_count - 1U].user_ctx, start, timeout_ms, error))
-      return false;
+    {
+      BatchGetProfileScope timer(profile ? &profile->cq_wait_ns : nullptr);
+      if (!WaitCompletion(worker, queue.wrs[queue.wr_count - 1U].user_ctx, start, timeout_ms, error))
+        return false;
+    }
   }
   return true;
 }
@@ -222,7 +248,7 @@ bool ScatterQueue(Worker& worker, const GatherReadArgs& args, GatherReadStatus& 
 std::uint32_t GatherScatter(const kvaf::aicpu_urma::GatherReadArgs* args,
                             kvaf::aicpu_urma::GatherReadStatus* status, std::uint32_t first,
                             std::uint32_t last, std::uint64_t remote_offset,
-                            std::uint32_t worker_index) {
+                            std::uint32_t worker_index, BatchGetWorkerProfile* profile) {
   std::shared_lock<std::shared_mutex> lock(state_mutex);
   if (args == nullptr || status == nullptr || worker_index >= state.worker_count ||
       std::max(1U, args->worker_count) != state.worker_count ||
@@ -236,7 +262,7 @@ std::uint32_t GatherScatter(const kvaf::aicpu_urma::GatherReadArgs* args,
   if (worker.poisoned || worker.target == nullptr) return 16;
   UmdkControlStatus timeline{};
   if (!ScatterQueue(worker, *args, *status, first, last, remote_offset, timeline, 1000,
-                    worker_index)) {
+                    worker_index, profile)) {
     std::fprintf(stderr,
                  "GATHER_UMDK_READ_ERROR worker=%u stage=%s result=%d errno=%d cq_status=%d "
                  "cq_context=%llu\n",
@@ -272,18 +298,16 @@ void WaitAck(const GatherReadArgs& args, GatherReadStatus& status) {
   status.result = 9U;
 }
 
-void ReadRange(const GatherReadArgs& args, unsigned worker, GatherReadStatus& status) {
-  const auto* targets = reinterpret_cast<const kvaf::GatherOutputSpan*>(args.output_spans);
-  for (std::uint32_t index = 0; index < args.output_span_count; ++index)
-    Flush(reinterpret_cast<void*>(args.output + targets[index].offset), targets[index].length);
+void ReadRange(const GatherReadArgs& args, unsigned worker, GatherReadStatus& status,
+               BatchGetWorkerProfile* profile) {
+  // AICPU only passes output addresses to URMA; it never loads/stores the payload.
+  // Completion and caller-stream ordering hand the DMA output to its consumer.
   status.phase = 4U;
-  status.result = GatherScatter(&args, &status, 0U, args.output_span_count, 0U, worker);
-  for (std::uint32_t index = 0; index < args.output_span_count; ++index)
-    Flush(reinterpret_cast<void*>(args.output + targets[index].offset), targets[index].length);
+  status.result = GatherScatter(&args, &status, 0U, args.output_span_count, 0U, worker, profile);
 }
 
 bool BuildCurrentRequest(const UmdkBatchGetArgs& launch, GatherReadArgs& args,
-                         std::uint32_t first, std::uint32_t last) {
+                         std::uint32_t first, std::uint32_t last, BatchGetWorkerProfile* profile) {
   const auto& request = launch.request;
   const auto n = request.request_capacity;
   UmdkMemory memory{};
@@ -292,12 +316,15 @@ bool BuildCurrentRequest(const UmdkBatchGetArgs& launch, GatherReadArgs& args,
       !request.tokens_per_block || n > kGatherMaxSpans ||
       UmdkGetMemory(&args.context, args.output, args.output_extent, &memory))
     return false;
-  Flush(reinterpret_cast<void*>(request.address_table), request.table_capacity * 8ULL);
-  Flush(reinterpret_cast<void*>(request.valid_table), request.table_capacity);
-  Flush(reinterpret_cast<void*>(request.indices + first * 4ULL), (last - first) * 4ULL);
-  Flush(reinterpret_cast<void*>(request.offsets + first * 4ULL), (last - first) * 4ULL);
-  Flush(reinterpret_cast<void*>(request.mask + first), last - first);
-  Flush(reinterpret_cast<void*>(request.output_indices + first * 4ULL), (last - first) * 4ULL);
+  {
+    BatchGetProfileScope timer(profile ? &profile->input_cache_ns : nullptr);
+    Flush(reinterpret_cast<void*>(request.address_table), request.table_capacity * 8ULL);
+    Flush(reinterpret_cast<void*>(request.valid_table), request.table_capacity);
+    Flush(reinterpret_cast<void*>(request.indices + first * 4ULL), (last - first) * 4ULL);
+    Flush(reinterpret_cast<void*>(request.offsets + first * 4ULL), (last - first) * 4ULL);
+    Flush(reinterpret_cast<void*>(request.mask + first), last - first);
+    Flush(reinterpret_cast<void*>(request.output_indices + first * 4ULL), (last - first) * 4ULL);
+  }
   const auto* addresses = reinterpret_cast<const std::uint64_t*>(request.address_table);
   const auto* valid = reinterpret_cast<const std::uint8_t*>(request.valid_table);
   const auto* indices = reinterpret_cast<const std::int32_t*>(request.indices);
@@ -332,16 +359,22 @@ bool BuildCurrentRequest(const UmdkBatchGetArgs& launch, GatherReadArgs& args,
                  args.source_span_count,
                  args.bytes,
                  args.pipeline_chunk_bytes};
-  Flush(descriptor, kvaf::peer::GatherDescriptorBytes(args.source_span_count));
-  Flush(targets, args.output_span_count * sizeof(*targets));
+  {
+    BatchGetProfileScope timer(profile ? &profile->descriptor_cache_ns : nullptr);
+    Flush(descriptor, kvaf::peer::GatherDescriptorBytes(args.source_span_count));
+    Flush(targets, args.output_span_count * sizeof(*targets));
+  }
   return true;
 }
 
-bool StartGather(GatherReadArgs& args, GatherReadStatus& status) {
+bool StartGather(GatherReadArgs& args, GatherReadStatus& status, BatchGetWorkerProfile* profile) {
   const UmdkTransfer descriptor{args.remote_descriptor, args.source_descriptor,
                                 kvaf::peer::GatherDescriptorBytes(args.source_span_count)};
   status.phase = 1U;
-  status.result = UmdkTransferSync(&args.context, true, &descriptor, 1U, args.worker_index);
+  {
+    BatchGetProfileScope timer(profile ? &profile->source_write_ns : nullptr);
+    status.result = UmdkTransferSync(&args.context, true, &descriptor, 1U, args.worker_index);
+  }
   if (status.result) return false;
   status.phase = 2U;
   auto* scratch = reinterpret_cast<std::uint64_t*>(args.scratch);
@@ -351,9 +384,13 @@ bool StartGather(GatherReadArgs& args, GatherReadStatus& status) {
   Flush(scratch, 24U);
   const UmdkTransfer notify[] = {{args.remote_command, args.scratch + 16U, 8U},
                                  {args.remote_notify, args.scratch, 8U}};
-  status.result = UmdkTransferSync(&args.context, true, notify, 2U, args.worker_index);
+  {
+    BatchGetProfileScope timer(profile ? &profile->notify_ns : nullptr);
+    status.result = UmdkTransferSync(&args.context, true, notify, 2U, args.worker_index);
+  }
   if (!status.result && !args.pipeline_chunk_bytes) {
     status.phase = 3U;
+    BatchGetProfileScope timer(profile ? &profile->ack_ns : nullptr);
     WaitAck(args, status);
   }
   return !status.result;
@@ -366,6 +403,9 @@ std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
       launch->gather.worker_count > kGatherMaxWorkers)
     return 1U;
   auto args = launch->gather;
+  BatchGetWorkerProfile measured{};
+  auto* profile = args.profile ? &measured : nullptr;
+  if (profile) profile->enter_ns = BatchGetProfileNowNs();
   auto* queues = reinterpret_cast<GatherQueueState*>(args.queue_state);
   Flush(queues, sizeof(*queues));
   const auto worker = __atomic_fetch_add(&queues[0].next_worker, 1U, __ATOMIC_RELAXED);
@@ -389,16 +429,35 @@ std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
   status = {};
   status.magic = kGatherStatusMagic;
   status.sequence = args.sequence;
-  if (!BuildCurrentRequest(*launch, args, first, last))
+  bool built;
+  {
+    BatchGetProfileScope timer(profile ? &profile->request_ns : nullptr);
+    built = BuildCurrentRequest(*launch, args, first, last, profile);
+  }
+  if (!built)
     status.result = 2U;
   else if (!args.bytes)
     status.ack_seen = args.sequence;
-  else if (StartGather(args, status)) {
-    ReadRange(args, args.worker_index, status);
-    if (!status.result && args.pipeline_chunk_bytes) WaitAck(args, status);
+  else if (StartGather(args, status, profile)) {
+    {
+      BatchGetProfileScope timer(profile ? &profile->read_ns : nullptr);
+      ReadRange(args, args.worker_index, status, profile);
+    }
+    if (!status.result && args.pipeline_chunk_bytes) {
+      BatchGetProfileScope timer(profile ? &profile->ack_ns : nullptr);
+      WaitAck(args, status);
+    }
   }
   Flush(queues, sizeof(*queues));
   Flush(&status, sizeof(status));
+  if (profile) {
+    profile->bytes = args.bytes;
+    profile->spans = args.output_span_count;
+    profile->exit_ns = BatchGetProfileNowNs();
+    auto* destination = reinterpret_cast<BatchGetWorkerProfile*>(args.profile) + worker;
+    *destination = *profile;
+    Flush(destination, sizeof(*destination));
+  }
   return status.result ? 1U : 0U;
 }
 

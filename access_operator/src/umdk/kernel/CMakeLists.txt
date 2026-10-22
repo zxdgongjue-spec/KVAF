@@ -22,6 +22,7 @@ set(device_headers "${CMAKE_CURRENT_SOURCE_DIR}/transport_internal.h"
   "${CMAKE_SOURCE_DIR}/runtime/include/cpu_gather.h"
   "${CMAKE_SOURCE_DIR}/common/include/gather_span.h"
   "${CMAKE_SOURCE_DIR}/common/include/gather_workspace.h"
+  "${CMAKE_SOURCE_DIR}/common/include/batch_get_profile.h"
   "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include/batch_get_abi.h")
 add_custom_command(OUTPUT "${kernel_so}"
   COMMAND "${CMAKE_COMMAND}" -E make_directory "${kernel_dir}"

@@ -83,14 +83,44 @@ python3 access_operator/demo/aicpu_batch_get/python/test_batch_get.py \
 
 脚本从 CANN 环境变量寻找已安装的 kernel JSON，也可用 `--kernel-json` 显式指定。
 每轮重新生成源数据和请求，稀疏模式下逐轮移动 mask；先完成 BatchPut，再执行 BatchGet，
-逐字节检查整个输出，包括未写入的行和间隔。预检还覆盖两种 Python 重载、稀疏 mask 和全 mask。
+逐字节检查整个输出，包括未写入的行和间隔；还在 NPU 上执行转换和加法，检查后续算子读取结果。
+预检覆盖两种 Python 重载、稀疏 mask、全 mask，以及异步 BatchGet 后同 stream 的 NPU 消费者。
 源和输出 Tensor 的注册地址持续有效到 Runtime 关闭；每轮释放 AccessTable 和 key 后重新写入，
 不依赖上一轮数据或远端地址保持不变。设置 `--active-percent 75` 可测试稀疏请求。
 
 每个 worker 配置输出一行 `AICPU_BATCH_GET_PASS`，包含 mean、p50、p95、p99（µs，小数点后 1 位）和有效载荷 GB/s。
 计时覆盖 Python `batch_get(..., synchronize=True)` 调用至完成，包含 Host/AICPU/CPU 和同步开销；
 输入准备、BatchPut、AccessTable 创建与上传、输出下载和正确性检查均在计时之外。
-该脚本测量 Python 端到端耗时，不输出已移除的内部阶段 profile。
+正常带宽统计不启用 profile。需要定位阶段耗时时，在同一命令末尾加 `--profile-rounds 100`：
+脚本会在正常测量后另跑 100 轮采样，打印平均阶段耗时，不逐轮刷日志。
+
+Python 也可直接获取单次采样：
+
+```python
+profile = runtime.batch_get(device_table, indices, offsets, mask, output_indices, output,
+                            synchronize=True, profile=True)
+print(profile["host"])
+print(profile["workers"])
+```
+
+`profile` 默认关闭，保持原来的返回值 `None`；开启时仅支持同步 AICPU 调用，返回字典。
+关闭时不读取新增的阶段时钟，也不分配或回传 profile 缓冲区。开启时额外采集时间和回传结果，
+所以用正常测量轮次报告带宽，用独立的 profile 轮次定位耗时。
+
+| 输出 | 含义 |
+| --- | --- |
+| Python `tensor_adapt_us` / `native_call_us` | Tensor 适配与参数检查 / 原生 Runtime 调用；合计为 `binding_total_us` |
+| Python `python_other_us` | 外部 Python 计时减去 `binding_total_us`，含绑定分派与 profile 字典转换 |
+| Host | 准备、清零入队、launch、状态及 profile D2H 入队、等待 stream、收尾；各项之和为 Host total |
+| Device | 最早 worker 进入至最后 worker 主体退出，使用同一设备时钟；不含最后的 profile 导出 |
+| Worker | 相对进入/退出、总时长、清单构建、源清单 WRITE、通知 CPU、流水 READ、最终 ACK |
+| Within request | 输入缓存维护、清单缓存维护；已包含在清单构建中 |
+| Within READ | 工作区准备、WR/SGL 构建、等待就绪前缀、provider 提交、最后 CQE 等待；已包含在 READ 中 |
+
+各 worker 互相重叠，不能把它们的阶段最大值相加为端到端时间。
+`ready_wait` 包含与 CPU gather 重叠的等待，并非 CPU gather 本身的计时。
+provider 提交包含编码、写 SQ 和 doorbell，不能单独当作写 SQ 耗时。
+Host wait 包含排队的设备执行和 D2H；Host 与设备的绝对时间戳不相减。
 
 ## 执行和资源约定
 
@@ -108,6 +138,8 @@ Runtime 在用户指定 DDR 数据容量之外按 worker 数预留 staging、源
 每个 staging 区间可容纳 `ceil(65536 / worker_count)` 个 token，并单独对齐到 64 字节。
 这些空间不进入 KV slot 分配。HBM 描述符和 scratch 使用独立内部缓冲，输出 Tensor 无需额外尾部空间。
 READ 使用 SGL 6、每次提交 32 条 WR；每波最多 4096 条 WR，只请求最后一条的有序 CQE，完成后复用 WR/SGL 空间。
+AICPU 只将输出地址交给 URMA，不直接读写输出 payload，因此 READ 前后不再逐段清理输出的 AICPU 缓存。
+元数据、源清单和控制邮箱仍保留缓存维护；每个 worker 的流水查询只使用自己的 scratch 区间。
 
 BatchPut 同步完成；BatchGet 默认只 enqueue，`synchronize=True` 等待完成并读取错误状态。
 内部 workspace 在下一次操作或 Shutdown 前排空；跨 stream 依赖由调用方负责。
