@@ -130,12 +130,10 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
   args.core_status = PointerValue(impl_->execution.status);
   args.scratch = PointerValue(impl_->workspace);
   args.source_descriptor = args.scratch + kGatherDescriptorOffset;
-  args.output_spans = args.scratch + GatherTargetsOffset(workers);
   args.output = PointerValue(exec.request->output.data);
   args.output_extent = exec.request->output.bytes;
   args.remote_staging = staging;
   args.remote_descriptor = descriptors;
-  args.remote_data_bytes = impl_->region.length;
   args.remote_notify = controls;
   args.remote_ack = args.remote_notify + 8U;
   args.remote_command = args.remote_notify + 16U;

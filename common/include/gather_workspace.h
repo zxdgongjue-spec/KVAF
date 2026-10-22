@@ -16,9 +16,6 @@ inline constexpr std::uint64_t GatherLaneStagingBytes(std::uint32_t token_bytes,
 inline constexpr std::uint64_t GatherLaneDescriptorBytes(std::uint32_t workers) {
   return (64U + GatherLaneCapacity(workers) * 16ULL + 63U) & ~std::uint64_t{63U};
 }
-inline constexpr std::uint64_t GatherLaneTargetsBytes(std::uint32_t workers) {
-  return (GatherLaneCapacity(workers) * 16ULL + 63U) & ~std::uint64_t{63U};
-}
 inline constexpr std::uint64_t GatherStagingBytes(std::uint32_t token_bytes,
                                                 std::uint32_t workers = 1U) {
   return workers * GatherLaneStagingBytes(token_bytes, workers);

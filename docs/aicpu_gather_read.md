@@ -4,6 +4,9 @@
 各自从本轮 NPU Tensor 的输入区间生成源清单，请求 CPU gather 到自己的 DDR staging 区间，
 查询自己的就绪前缀、提交 READ，并等待自己的完成通知和 CPU ACK。
 indices、offsets、mask、output_indices 和数据可以每轮变化，不缓存上一轮内容。
+READ 直接使用调用方的 `output_indices` 和 `mask` 组 SGL，不再生成 HBM 输出位置清单或复制到 AICPU 本地数组。
+AICPU 对 mask 非零项直接取 `addresses[indices[i]] + offsets[i]`，省去逐项地址、索引和输出行号检查；
+调用方保证有效条目的索引、块内偏移、地址有效性及输出行号正确，输入元数据在本轮完成前保持不变。
 
 ## 构建和启动
 
@@ -67,6 +70,16 @@ runtime.shutdown()
 
 设备、URMA device、EID 和服务地址按部署环境调整。原来的 addresses/valid Tensor 重载也可直接使用。
 未设置 `aicpu_urma_kernel_json_path` 时仍走原 AIV 后端。
+
+如果调用方已经持有 NPU 地址表，直接调用现有 Tensor 重载，不必再创建 Host AccessTable 或重新上传地址表：
+
+```python
+runtime.batch_get(addresses, valid, indices, offsets, mask, output_indices, output,
+                  stream=stream, synchronize=True)
+```
+
+调用方管理这些地址对应的远端数据生命周期。使用 `prepare_access_table` 的调用仍保留公共元数据接口，
+Host 地址表通过整段 H2D 上传；每次 BatchGet 本身不遍历或复制 Host 地址表。
 
 ## 用 Python 检查正确性和比较 worker 数
 
@@ -145,7 +158,7 @@ CPU 服务的 `--gather-threads` 是全部 worker 的总预算，须不小于 AI
 每次最多 65536 项；token 大小由构造参数指定，最大总载荷须能用 uint32 表示。
 Runtime 在用户指定 DDR 数据容量之外按 worker 数预留 staging、源描述符和控制区，
 每个 staging 区间可容纳 `ceil(65536 / worker_count)` 个 token，并单独对齐到 64 字节。
-这些空间不进入 KV slot 分配。HBM 描述符和 scratch 使用独立内部缓冲，输出 Tensor 无需额外尾部空间。
+这些空间不进入 KV slot 分配。HBM 仅保留发给 CPU 的源描述符和控制 scratch，输出 Tensor 无需额外尾部空间。
 READ 使用 SGL 6、每次提交 32 条 WR；每波最多 4096 条 WR，只请求最后一条的有序 CQE，完成后复用 WR/SGL 空间。
 AICPU 只将输出地址交给 URMA，不直接读写输出 payload，因此 READ 前后不再逐段清理输出的 AICPU 缓存。
 元数据、源清单和控制邮箱仍保留缓存维护；每个 worker 的流水查询只使用自己的 scratch 区间。
