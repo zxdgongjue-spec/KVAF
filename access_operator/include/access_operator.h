@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "requests.h"
 #include "status.h"
@@ -47,12 +48,41 @@ struct AccessOperatorConfig {
   std::string batch_get_kernel_object_path;
   std::string batch_put_kernel_object_path;
   std::uint32_t npu_core_count{0};
-  // Direct-HCCP Jettys assigned to each AIV core.
+  // Direct-HCCP Jettys assigned to each BatchGet AIV core.
   std::uint32_t jettys_per_core{2};
-  // Runtime supplies the selected local EID. Operator transports consume it;
-  // they do not discover EIDs or make topology decisions.
+  // Per-launch total READ budget; 0 selects the original whole-batch path.
+  std::uint32_t batch_get_max_inflight_total{2048U};
+  // BatchPut retains its independent one-or-two-Jetty implementation. Zero
+  // derives min(jettys_per_core, 2); a direct caller may explicitly select 1/2.
+  std::uint32_t batch_put_jettys_per_core{0};
+  // Legacy single-EID input. Kept for source compatibility; peer_local_eids
+  // takes precedence when it is non-empty.
   std::array<std::uint8_t, 16> peer_local_eid{};
+  // Runtime may supply more than one selected local EID. BatchGet creates one
+  // RaCtx per EID and stripes core/Jetty workers over those paths; BatchPut
+  // continues to use peer_local_eid above.
+  std::vector<std::array<std::uint8_t, 16>> peer_local_eids{};
   std::shared_ptr<PeerLink> peer_link;
+};
+
+struct BatchGetKernelProfile {
+  std::uint64_t kernel_start_cycle{0};
+  std::uint64_t setup_done_cycle{0};
+  std::uint64_t compact_done_cycle{0};
+  std::uint64_t first_doorbell_cycle{0};
+  std::uint64_t post_done_cycle{0};
+  std::uint64_t completion_done_cycle{0};
+  std::uint64_t kernel_finish_cycle{0};
+  std::uint64_t active_requests{0};
+  std::uint64_t total_posts{0};
+  std::array<std::uint64_t, 64> jetty_completion_wait_cycles{};
+  std::array<std::uint64_t, 64> jetty_completion_polls{};
+  std::uint64_t submitted_group_count{0};
+  std::uint64_t completed_group_count{0};
+  std::uint64_t completion_count{0};
+  std::uint64_t post_active_cycles{0};
+  std::uint64_t drain_wait_cycles{0};
+  std::uint64_t peak_submitted_not_drained{0};
 };
 
 // Default synchronous NPU data-plane implementation.
@@ -79,6 +109,12 @@ class DefaultAccessOperator final : public AccessOperator {
   Status Shutdown() override;
   Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
   Status ExecuteBatchPut(const BatchPutExecRequest& request) override;
+
+  // Profiling is opt-in and uses the reserved per-core status area. Callers
+  // must complete the BatchGet stream before copying the latest snapshot.
+  Status SetBatchGetKernelProfiling(bool enabled);
+  Status CopyBatchGetKernelProfiles(
+      std::vector<BatchGetKernelProfile>* profiles) const;
 
  private:
   struct Impl;

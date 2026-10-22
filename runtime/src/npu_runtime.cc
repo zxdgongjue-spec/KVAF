@@ -25,6 +25,8 @@
 #include "access_operator.h"
 #include "peer_link.h"
 #include "meta_manager.h"
+#include "startup_bandwidth_probe.h"
+#include "startup_selection.h"
 
 namespace kvaf {
 namespace {
@@ -364,6 +366,40 @@ bool DiscoverNpuLocalEidCandidates(std::uint32_t logical_device_id,
   return false;
 }
 
+bool ParseConfiguredNpuLocalEids(
+    std::uint32_t logical_device_id, const std::vector<std::string>& configured,
+    std::vector<NpuLocalEidCandidate>* candidates, std::string* error) {
+  if (candidates == nullptr || error == nullptr || configured.empty()) return false;
+  candidates->clear();
+  std::uint32_t physical_device_id = 0U;
+  if (!ResolvePhysicalDeviceId(logical_device_id, &physical_device_id)) {
+    *error = "cannot resolve physical device from logical device " +
+             std::to_string(logical_device_id);
+    return false;
+  }
+  for (std::size_t index = 0U; index < configured.size(); ++index) {
+    std::array<std::uint8_t, peer::kEidBytes> eid{};
+    if (!ParseEid(configured[index], &eid) ||
+        std::all_of(eid.begin(), eid.end(),
+                    [](std::uint8_t byte) { return byte == 0U; })) {
+      *error = "npu_eids[" + std::to_string(index) +
+               "] must be a non-zero 32-digit hexadecimal EID";
+      return false;
+    }
+    if (std::find_if(candidates->begin(), candidates->end(),
+                     [&eid](const NpuLocalEidCandidate& candidate) {
+                       return candidate.eid == eid;
+                     }) != candidates->end()) {
+      *error = "npu_eids contains duplicate EID " + configured[index];
+      return false;
+    }
+    AddNpuLocalEidCandidate(physical_device_id, eid,
+                            "explicit_npu_eid_" + std::to_string(index),
+                            candidates);
+  }
+  return true;
+}
+
 // Keep this aligned with the BatchPut AIV kernel. A real 128-KiB KV dump
 // spreads roughly one 32-WQE post across every AIV core. The startup probe
 // deliberately uses the same fan-out, but only 64 bytes per WQE: it validates
@@ -395,6 +431,11 @@ struct NpuRuntime::Impl {
     config.batch_put_kernel_object_path = options.batch_put_kernel_object_path;
     config.npu_core_count = options.npu_core_count;
     config.jettys_per_core = options.jettys_per_core;
+    config.batch_get_max_inflight_total = options.batch_get_max_inflight_total;
+    // BatchPut is intentionally unchanged and keeps its existing two-Jetty
+    // maximum when BatchGet selects three to sixty-four lanes.
+    config.batch_put_jettys_per_core =
+        std::min(options.jettys_per_core, std::uint32_t{2U});
   }
 
   void CreateCore() {
@@ -404,6 +445,7 @@ struct NpuRuntime::Impl {
   }
 
   void ReleaseProbe() {
+    bandwidth_probe.reset();
     if (probe_buffer != nullptr) {
       (void)aclrtFree(probe_buffer);
       probe_buffer = nullptr;
@@ -419,6 +461,7 @@ struct NpuRuntime::Impl {
   std::unique_ptr<DefaultAccessOperator> access_operator;
   std::unique_ptr<RuntimeCore> runtime_core;
   void* probe_buffer{nullptr};
+  std::unique_ptr<detail::StartupBandwidthProbe> bandwidth_probe;
 };
 
 NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {
@@ -426,8 +469,16 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
       impl_->options.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->options.jettys_per_core == 0U ||
       impl_->options.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
+      (impl_->options.batch_get_max_inflight_total != 0U &&
+       impl_->options.batch_get_max_inflight_total < 2U * impl_->options.npu_core_count) ||
       impl_->options.batch_get_token_bytes == 0U ||
-      impl_->options.batch_get_tokens_per_block == 0U) {
+      impl_->options.batch_get_tokens_per_block == 0U ||
+      (impl_->options.adaptive_ub_device &&
+       !impl_->options.peer_ub_device.empty()) ||
+      (impl_->options.adaptive_ub_device &&
+       (impl_->options.adaptive_ub_miss_count == 0U ||
+        impl_->options.adaptive_ub_miss_count >
+            static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())))) {
     throw std::invalid_argument("invalid NPU Runtime configuration");
   }
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS) {
@@ -465,13 +516,18 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
 Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
   const RuntimeInitRequest request{ddr_bytes, slot_size, DeviceKind::kCpu};
   if (initialized()) return Status::InvalidState("NpuRuntime has already been initialized");
-  if (impl_->peer_link == nullptr || impl_->peer_allocator == nullptr ||
-      impl_->runtime_core == nullptr) {
+  if (impl_->peer_link == nullptr || impl_->peer_allocator == nullptr) {
     return Status::InvalidState("NpuRuntime requires LinkTo before Initialize");
+  }
+  if (ddr_bytes == 0U || slot_size == 0U || ddr_bytes % slot_size != 0U) {
+    return Status::InvalidArgument("DDR size must be a nonzero multiple of slot_size");
   }
 
   std::uint32_t candidate_count = 0U;
-  Status last = impl_->peer_link->GetCandidateCount(&candidate_count);
+  std::uint32_t device_count = 0U;
+  bool device_filter_applied = false;
+  Status last = impl_->peer_link->GetCandidateCount(
+      &candidate_count, &device_count, &device_filter_applied);
   if (!last.ok()) return last;
   if (candidate_count == 0U) {
     return Status::NotFound("peer Runtime returned no UMDK/EID candidates");
@@ -491,32 +547,108 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   }
   std::vector<NpuLocalEidCandidate> npu_candidates;
   std::string discovery_error;
-  if (!DiscoverNpuLocalEidCandidates(impl_->options.device_id, &npu_candidates,
-                                     &discovery_error)) {
+  const bool explicit_eids = !impl_->options.npu_eids.empty();
+  if (explicit_eids) {
+    if (!ParseConfiguredNpuLocalEids(impl_->options.device_id,
+                                     impl_->options.npu_eids,
+                                     &npu_candidates, &discovery_error)) {
+      return Status::InvalidArgument(discovery_error);
+    }
+  } else if (!DiscoverNpuLocalEidCandidates(
+                 impl_->options.device_id, &npu_candidates,
+                 &discovery_error)) {
     return Status::NotFound(discovery_error);
   }
-  for (std::uint32_t peer_candidate = first_peer_candidate;
-       peer_candidate < peer_candidate_end; ++peer_candidate) {
+  const std::size_t worker_count =
+      static_cast<std::size_t>(impl_->options.npu_core_count) *
+      impl_->options.jettys_per_core;
+  if (explicit_eids && npu_candidates.size() > worker_count) {
+    return Status::InvalidArgument(
+        "npu_eids count exceeds npu_core_count * jettys_per_core workers");
+  }
+  const bool fixed_peer_device = !impl_->options.peer_ub_device.empty();
+  const bool has_n_side_allowlist =
+      !impl_->options.adaptive_peer_ub_devices.empty();
+  const bool tune_candidates = impl_->options.adaptive_ub_device &&
+                               !device_filter_applied && has_n_side_allowlist;
+  if (impl_->options.adaptive_ub_device && !tune_candidates) {
+    std::fprintf(stderr,
+                 "[KVAF_AIV] UB_DEVICE_ADAPTIVE_SKIPPED device_id=%u "
+                 "reason=%s\n",
+                 impl_->options.device_id,
+                 device_filter_applied ? "k_side_device_filter"
+                                       : "no_n_side_candidates");
+  }
+  const detail::StartupProbeConfig probe_config{
+      impl_->options.batch_get_token_bytes,
+      impl_->options.batch_get_tokens_per_block,
+      impl_->options.adaptive_ub_miss_count};
+  detail::StartupProbeLayout probe_layout{};
+  if (tune_candidates) {
+    last = detail::BuildStartupProbeLayout(probe_config, &probe_layout);
+    if (!last.ok()) return last;
+  }
+  // An explicit N-side list remains one strict multi-EID group. Automatically
+  // discovered EIDs are connectivity fallbacks.
+  const std::size_t npu_group_count = explicit_eids ? 1U : npu_candidates.size();
+  std::vector<std::string> peer_candidate_device_names;
+  std::vector<bool> peer_candidate_allowed;
+  if (fixed_peer_device) {
+    peer_candidate_allowed.assign(candidate_count, false);
+    std::uint32_t fixed_candidate_count = 0U;
+    for (std::uint32_t peer_candidate = 0U; peer_candidate < candidate_count;
+         ++peer_candidate) {
+      peer::PeerCandidateInfo info{};
+      last = impl_->peer_link->GetCandidateInfo(peer_candidate, &info);
+      if (!last.ok()) return last;
+      if (info.candidate_id != peer_candidate || info.device_id >= device_count) {
+        return Status::Internal("peer Runtime returned invalid candidate metadata");
+      }
+      if (info.device_name == impl_->options.peer_ub_device) {
+        peer_candidate_allowed[peer_candidate] = true;
+        ++fixed_candidate_count;
+      }
+    }
+    if (fixed_candidate_count == 0U) {
+      return Status::NotFound("peer Runtime did not advertise fixed UB device " +
+                              impl_->options.peer_ub_device);
+    }
+  }
+  auto initialize_candidate = [&](const detail::StartupCandidate& candidate,
+                                  bool measure, double* cycles) -> Status {
+    const std::uint32_t peer_candidate = candidate.peer;
+    const RuntimeInitRequest candidate_request = measure
+        ? RuntimeInitRequest{probe_layout.ddr_bytes,
+                             probe_layout.block_bytes,
+                             DeviceKind::kCpu}
+        : request;
+    const auto ddr_bytes = candidate_request.ddr_bytes;
+    const auto slot_size = candidate_request.slot_size;
     impl_->peer_allocator->SetCandidate(peer_candidate);
-    for (std::size_t npu_index = 0; npu_index < npu_candidates.size(); ++npu_index) {
-      const NpuLocalEidCandidate& candidate = npu_candidates[npu_index];
+    Status last;
+    for (const std::size_t npu_group : std::array<std::size_t, 1U>{candidate.local_group}) {
+      const std::size_t group_begin = explicit_eids ? 0U : npu_group;
+      const std::size_t group_size = explicit_eids ? npu_candidates.size() : 1U;
       impl_->runtime_core.reset();
       impl_->access_operator.reset();
       impl_->ReleaseProbe();
-      impl_->config.peer_local_eid = candidate.eid;
+      impl_->config.peer_local_eids.clear();
+      impl_->config.peer_local_eids.reserve(group_size);
+      for (std::size_t offset = 0U; offset < group_size; ++offset) {
+        const NpuLocalEidCandidate& candidate = npu_candidates[group_begin + offset];
+        impl_->config.peer_local_eids.push_back(candidate.eid);
+      }
+      // BatchPut intentionally remains on the established single-EID path.
+      // Multi-EID striping applies only to BatchGet and uses the vector above.
+      impl_->config.peer_local_eid = impl_->config.peer_local_eids.front();
       impl_->CreateCore();
-      std::fprintf(stderr,
-                   "[KVAF_AIV] PEER_LINK_EID_PAIR_ATTEMPT peer_candidate=%u/%u npu_candidate=%zu/%zu "
-                   "npu_source=%s npu_eid=%s\n",
-                   peer_candidate, candidate_count, npu_index, npu_candidates.size(), candidate.source.c_str(),
-                   EidToHex(candidate.eid).c_str());
-      last = impl_->runtime_core->Initialize(request);
+      last = impl_->runtime_core->Initialize(candidate_request);
       if (last.ok()) {
         const std::uint64_t probe_bytes =
             std::min<std::uint64_t>(slot_size, kBatchPutProbeBytesPerRow);
         const std::uint64_t probe_rows = BatchPutStartupProbeRows(
             ddr_bytes, slot_size, impl_->options.npu_core_count,
-            impl_->options.jettys_per_core);
+            impl_->config.batch_put_jettys_per_core);
         const std::uint64_t probe_total_bytes = probe_rows * probe_bytes;
         aclrtStream stream = nullptr;
         if (probe_bytes == 0U || probe_rows == 0U ||
@@ -535,7 +667,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
           probe_offsets.reserve(static_cast<std::size_t>(probe_rows));
           probe_lengths.reserve(static_cast<std::size_t>(probe_rows));
           for (std::uint64_t row = 0U; row < probe_rows; ++row) {
-            probe_keys.push_back(row);
+            probe_keys.push_back(std::numeric_limits<KeyId>::max() - row);
             probe_offsets.push_back(row * probe_bytes);
             probe_lengths.push_back(probe_bytes);
           }
@@ -554,30 +686,138 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
           last = Internal("failed to destroy peer candidate probe stream");
         }
       }
+      if (last.ok() && measure) {
+        impl_->bandwidth_probe =
+            std::make_unique<detail::StartupBandwidthProbe>(probe_config);
+        last = impl_->bandwidth_probe->Run(*impl_->runtime_core, *impl_->access_operator, cycles);
+        if (last.ok()) {
+          std::fprintf(stderr,
+                       "[KVAF_AIV] UB_DEVICE_PROBE_RESULT device_id=%u "
+                       "ub_device=%s miss_count=%u cycles=%.0f\n",
+                       impl_->options.device_id,
+                       peer_candidate_device_names[peer_candidate].c_str(),
+                       probe_config.miss_count, *cycles);
+          return last;
+        }
+      }
       if (last.ok()) {
-        std::fprintf(stderr,
-                     "[KVAF_AIV] PEER_LINK_EID_PAIR_SELECTED peer_candidate=%u/%u npu_candidate=%zu/%zu "
-                     "npu_source=%s validation=aiv_write_cq\n",
-                     peer_candidate, candidate_count, npu_index, npu_candidates.size(), candidate.source.c_str());
+        if (tune_candidates) {
+          std::fprintf(stderr,
+                       "[KVAF_AIV] UB_DEVICE_SELECTED device_id=%u "
+                       "ub_device=%s cycles=%.0f\n",
+                       impl_->options.device_id,
+                       peer_candidate_device_names[peer_candidate].c_str(),
+                       *cycles);
+        } else if (fixed_peer_device) {
+          std::fprintf(stderr,
+                       "[KVAF_AIV] UB_DEVICE_REUSED device_id=%u ub_device=%s\n",
+                       impl_->options.device_id,
+                       impl_->options.peer_ub_device.c_str());
+        }
         return Status::OK();
       }
-      std::fprintf(stderr,
-                   "[KVAF_AIV] PEER_LINK_EID_PAIR_FAILED peer_candidate=%u npu_candidate=%zu npu_source=%s "
-                   "reason=%s\n",
-                   peer_candidate, npu_index, candidate.source.c_str(), last.message().c_str());
-      if (impl_->runtime_core->initialized()) {
-        const Status cleanup = impl_->runtime_core->Shutdown();
-        if (!cleanup.ok()) return cleanup;
-      }
-      if (impl_->peer_allocator->has_allocation()) {
-        return Status::Internal("failed peer candidate left DDR allocated");
+      return last;
+    }
+    return last;
+  };
+  auto cleanup = [&]() -> Status {
+    if (impl_->runtime_core->initialized()) {
+      const Status status = impl_->runtime_core->Shutdown();
+      if (!status.ok()) return status;
+    }
+    if (impl_->peer_allocator->has_allocation()) {
+      return Status::Internal("peer candidate left DDR allocated");
+    }
+    // Registered source/output buffers outlive the transports even on errors.
+    impl_->runtime_core.reset();
+    impl_->access_operator.reset();
+    impl_->ReleaseProbe();
+    return Status::OK();
+  };
+  if (!tune_candidates) {
+    for (std::uint32_t peer_candidate = 0U; peer_candidate < candidate_count;
+         ++peer_candidate) {
+      if (fixed_peer_device && !peer_candidate_allowed[peer_candidate]) continue;
+      for (std::size_t npu_group = 0U; npu_group < npu_group_count; ++npu_group) {
+        last = initialize_candidate(
+            detail::StartupCandidate{peer_candidate, npu_group}, false, nullptr);
+        if (last.ok()) return last;
+        const Status released = cleanup();
+        if (!released.ok()) return released;
       }
     }
+    if (!last.ok() && fixed_peer_device) {
+      return Status::Internal("failed to initialize fixed peer UB device " +
+                              impl_->options.peer_ub_device + ": " +
+                              last.message());
+    }
+    return last;
   }
-  // The failed probe's source buffer is no longer referenced after the
-  // transport teardown above. Keep it only for a successfully selected Link.
-  impl_->ReleaseProbe();
-  return last;
+
+  peer_candidate_device_names.resize(candidate_count);
+  std::vector<std::vector<detail::StartupCandidate>> all_device_candidates(
+      device_count);
+  std::vector<std::string> all_device_names(device_count);
+  for (std::uint32_t peer_candidate = 0U; peer_candidate < candidate_count;
+       ++peer_candidate) {
+    peer::PeerCandidateInfo info{};
+    last = impl_->peer_link->GetCandidateInfo(peer_candidate, &info);
+    if (!last.ok()) return last;
+    if (info.candidate_id != peer_candidate || info.device_id >= device_count) {
+      return Status::Internal("peer Runtime returned invalid candidate metadata");
+    }
+    peer_candidate_device_names[peer_candidate] = info.device_name;
+    std::string& known_name = all_device_names[info.device_id];
+    if (known_name.empty()) {
+      known_name = info.device_name;
+    } else if (known_name != info.device_name) {
+      return Status::Internal("peer Runtime returned inconsistent candidate device grouping");
+    }
+    auto& group = all_device_candidates[info.device_id];
+    for (std::size_t npu_group = 0U; npu_group < npu_group_count; ++npu_group) {
+      group.push_back(detail::StartupCandidate{peer_candidate, npu_group});
+    }
+  }
+  for (std::size_t device = 0U; device < all_device_candidates.size(); ++device) {
+    if (all_device_candidates[device].empty() ||
+        all_device_names[device].empty()) {
+      return Status::Internal("peer Runtime returned incomplete candidate device grouping");
+    }
+  }
+  std::vector<std::size_t> selected_device_indices;
+  for (std::size_t device = 0U; device < all_device_names.size(); ++device) {
+    if (std::find(impl_->options.adaptive_peer_ub_devices.begin(),
+                  impl_->options.adaptive_peer_ub_devices.end(),
+                  all_device_names[device]) !=
+        impl_->options.adaptive_peer_ub_devices.end()) {
+      selected_device_indices.push_back(device);
+    }
+  }
+  if (selected_device_indices.empty()) {
+    return Status::NotFound(
+        "none of the script-configured adaptive UB devices were advertised by the peer");
+  }
+  std::vector<std::vector<detail::StartupCandidate>> device_candidates;
+  std::vector<std::string> device_names;
+  device_candidates.reserve(selected_device_indices.size());
+  device_names.reserve(selected_device_indices.size());
+  for (const std::size_t device : selected_device_indices) {
+    device_candidates.push_back(std::move(all_device_candidates[device]));
+    device_names.push_back(std::move(all_device_names[device]));
+  }
+  for (std::size_t device = 0U; device < device_candidates.size(); ++device) {
+    std::fprintf(stderr,
+                 "[KVAF_AIV] UB_DEVICE_PROBE_PLAN device_id=%u ub_device=%s "
+                 "pairs=%zu token_bytes=%u tokens_per_block=%u miss_count=%u "
+                 "aiv_cores=%u jettys_per_core=%u warmup=%u samples=%u\n",
+                 impl_->options.device_id, device_names[device].c_str(),
+                 device_candidates[device].size(), probe_config.token_bytes,
+                 probe_config.tokens_per_block, probe_config.miss_count,
+                 impl_->options.npu_core_count, impl_->options.jettys_per_core,
+                 detail::kStartupWarmup, detail::kStartupSamples);
+  }
+  return detail::SelectStartupDeviceCandidate(
+      device_candidates, initialize_candidate, cleanup);
 }
 
 RuntimeCore& NpuRuntime::core() {
@@ -595,11 +835,31 @@ const RuntimeCore& NpuRuntime::core() const {
 std::uint32_t NpuRuntime::device_id() const { return impl_->options.device_id; }
 std::uint32_t NpuRuntime::npu_core_count() const { return impl_->options.npu_core_count; }
 std::uint32_t NpuRuntime::jettys_per_core() const { return impl_->options.jettys_per_core; }
+const std::vector<std::string>& NpuRuntime::npu_eids() const {
+  return impl_->options.npu_eids;
+}
 std::uint32_t NpuRuntime::batch_get_token_bytes() const {
   return impl_->options.batch_get_token_bytes;
 }
 std::uint32_t NpuRuntime::batch_get_tokens_per_block() const {
   return impl_->options.batch_get_tokens_per_block;
+}
+
+Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled) {
+  if (impl_->access_operator == nullptr) {
+    return Status::NotInitialized(
+        "NpuRuntime requires LinkTo before configuring BatchGet profiling");
+  }
+  return impl_->access_operator->SetBatchGetKernelProfiling(enabled);
+}
+
+Status NpuRuntime::CopyBatchGetKernelProfiles(
+    std::vector<BatchGetKernelProfile>* profiles) const {
+  if (impl_->access_operator == nullptr) {
+    return Status::NotInitialized(
+        "NpuRuntime requires LinkTo before reading BatchGet profiling");
+  }
+  return impl_->access_operator->CopyBatchGetKernelProfiles(profiles);
 }
 
 Status NpuRuntime::AcceptLink(const LinkTarget&) {
@@ -613,6 +873,7 @@ Status NpuRuntime::ReleaseLink(LinkId link_id) {
   impl_->peer_link.reset();
   impl_->config.peer_link.reset();
   impl_->config.peer_local_eid = {};
+  impl_->config.peer_local_eids.clear();
   impl_->peer_allocator = nullptr;
   impl_->allocator.reset();
   impl_->runtime_core.reset();

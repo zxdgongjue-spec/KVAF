@@ -67,6 +67,7 @@ add_custom_command(
           -o "${KVAF_EXECUTE_KERNEL_OBJECT}"
   DEPENDS "${KVAF_EXECUTE_KERNEL_SOURCE}"
           "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_abi.h"
+          "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_schedule.h"
           "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"
   VERBATIM)
 add_custom_target(kvaf_execute_batch_get_kernel ALL DEPENDS "${KVAF_EXECUTE_KERNEL_OBJECT}")

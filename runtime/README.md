@@ -17,7 +17,7 @@ AccessOperator，并把调用方已经准备好的输入/输出 buffer 交给数
 - `PrepareAccessTable` / `GetAccessTableView` / `ReleaseAccessTable`：持有
   MetaManager 稳定读锁，生成一维 address/length/valid 表，并在 Release 时
   解锁。
-- `BatchGet`：校验调用方的 index、mask、output 和（NPU 路径）Device
+- `BatchGet`：校验调用方的 index、miss-count、output 和（NPU 路径）Device
   AccessTable buffer 后，向调用方 stream 提交 `AccessOperator::ExecuteBatchGet`。
   Python 默认不在 KVAF 内同步；同一 stream 的后续操作自然按序执行。
 - `BatchFree`：将删除请求交给 MetaManager；仍被 AccessTable 持有的 Key
@@ -44,11 +44,29 @@ cd /path/to/kvaf
   --listen 0.0.0.0 --port 28999
 ```
 
+CPU DDR region 支持两种页分配模式；未指定时默认使用 `thp`：
+
+```bash
+# 默认模式：2 MiB 对齐，MADV_HUGEPAGE，并在注册前主动触页；
+# 是否全部合并仍由 Linux THP 决定。
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28999
+
+# 保留原始普通内存行为：4 KiB 对齐，操作系统仍可能自行使用 THP。
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28999 --memory-page-mode default
+```
+
+需要固定 NUMA 位置时，应在 UB device 所在 node 启动服务，例如
+`numactl --cpunodebind=N --membind=N ...`。`REGION_ALLOCATED` 日志会记录
+`page_mode`。默认 THP 模式还应通过 `/proc/<pid>/smaps` 的 `AnonHugePages` 验证实际
+合并量；Linux 使用大页并不保证 UDMA/IOMMU 一定保留相同的页表粒度。
+
 默认自动枚举所有可用 UMDK UB device/EID；`--ub-device NAME` 和
 `--eid-index N` 仅用于诊断。CPU 端可同时保持多个 NPU session，NPU 正常
 `shutdown` 后会释放对应 DDR、segment、token 与 Jetty。
 
-NPU 应用只配置 CPU 服务地址，不配置 EID 或 UDMA device：
+NPU 应用默认只配置 CPU 服务地址，不配置 EID 或 UDMA device：
 
 ```python
 runtime = kvaf.NpuRuntime(
@@ -62,6 +80,9 @@ runtime.link_to("141.61.92.71:28999")
 runtime.initialize(ddr_bytes, kv_block_bytes)
 ```
 
+已知设备名时也可设置 `peer_ub_device="udmac0d1e2"`，只在该设备的 EID 中按
+连通性选择，不执行带宽标定。`peer_ub_device` 与 `adaptive_ub_device=True` 互斥。
+
 `link_to` 必须在 `initialize` 前调用。初始化会从 HCCL root-info 读取当前物理卡的
 CLOS PG EID、追加 `/proc/asdrv_ub/pair_info` fallback，并组合 CPU UMDK 候选。只有
 64B AIV WRITE 与 CQ 完成成功的 EID 对才会被选中；这同时验证 DDR 注册、segment
@@ -69,6 +90,34 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 未建立 CPU 服务 Link 时，`initialize` 会返回 `InvalidState`。
 `batch_get_token_bytes` 和 `batch_get_tokens_per_block` 无默认值，
 构造 `NpuRuntime` 时必须显式传入。
+
+### 可选启动 UB device 选优
+
+`--adaptive-ub-device` 仅在 K 端未指定 `--ub-device` 时启用启动测速：N 端脚本从
+`KVAF_ADAPTIVE_UB_DEVICES` 配置的候选中选择，默认值为
+`udmac0d1e2,udmac0d1e3,udmac1d1e2,udmac1d1e3`，探测请求数由
+`KVAF_ADAPTIVE_UB_MISS_COUNT` 控制（默认 2048）。脚本先用轻量初始化识别 K 侧固定
+设备；未固定时依次通过 `peer_ub_device` 运行完整建表和随机 BatchGet，以固定的
+656B token、128 tokens-per-block、2 个 AIV core、每 core 2 个 Jetty、1 次预热和
+5 次采样所得 `useful_GiBps` 最高者为最佳设备。K 端指定单个 `--ub-device` 时走原生
+路径；后续正式 shape 均复用选择结果。完整校准日志写入 `ub_device_selection.log`，CSV
+的 `selected_ub_device` 列记录设备名。N/K 两端必须同时使用控制协议 v6。
+
+```bash
+KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 \
+KVAF_ADAPTIVE_UB_DEVICES=udmac0d1e2,udmac0d1e3,udmac1d1e2,udmac1d1e3 \
+KVAF_ADAPTIVE_UB_MISS_COUNT=2048 \
+  ./tests/run_remote_cpu_batch_get_miss_count_perf.sh /absolute/path/to/build-npu \
+  --adaptive-ub-device
+```
+
+需要同时使用多个 NPU EID 时，设置 `NpuRuntimeOptions::npu_eids`（Python
+构造参数同名）。列表中每个 EID 必须是 32 位连续十六进制字符；Runtime
+为每个 EID 建立独立 BatchGet RaCtx、MR import 和 channel，并将
+core/Jetty worker 按 Jetty-major 顺序轮转分配。BatchPut 保持原有单 EID
+实现，使用列表第一项。显式列表不使用 rootinfo/`pair_info` 回退，
+任一 EID 失败即使整组初始化失败。当前这些 NPU 路径仍共享一个已选
+CPU EID 和 DDR region。测试脚本可用逗号分隔的 `KVAF_NPU_EIDS` 传入。
 
 现有 `tests/run_remote_cpu_e2e.sh` 与
 `tests/run_remote_cpu_runtime_perf.sh` 接受 `KVAF_CPU_SERVICE_ADDR`，但该变量
@@ -80,7 +129,7 @@ Runtime 持有且负责释放：内部 DDR、AccessTable 状态和 Key 稳定性
 
 调用方持有且必须在其 BatchGet 所在 stream 完成前保持有效：BatchPut 的连续 `input` buffer、
 与 Key 一一对应的 Host `input_offsets` / `lengths` 元数据、BatchGet 的
-index/offset/mask/output-index/output buffer，以及 NPU 上的 address/valid 表。Runtime
+index/offset/miss-count/output-index/output buffer，以及 NPU 上的 address/valid 表。Runtime
 不会为这些调用方 buffer 分配、释放、隐式复制或注册链路。
 
 `BatchPutRequest` 的输入语义为：`keys[i]` 的源数据位于
@@ -120,8 +169,8 @@ source handle 必须在此后才可 `ReleaseAccessTable`。Runtime 不额外注�
 address/valid Tensor。
 
 `valid` 是每个 AccessTable entry 的安全位：`1` 表示可访问，`0` 表示 padding
-或无效 entry。AIV kernel 对 `mask=1 && valid=0` 返回设备侧 `kInvalidLookup`，
-且不会对该地址发起 UDMA 读；padding 应由 Adapter 同时以 `mask=0` 跳过。
+或无效 entry。调用方必须只把有效访问放进 `[0, miss_count)` 请求前缀；该前缀
+之外的容量行不会被 AIV kernel 读取或搬运。
 当前 InMemory MetaManager 对不存在的 Key 在 `PrepareAccessTable` 的
 `LockKeys` 阶段直接返回 `kNotFound`，因此不会产生一张含该 Key 的
 `valid=0` 表。
@@ -172,18 +221,18 @@ DEVICE_ID=0 \
 KVAF_NPU_TOKEN_BYTES=656 \
 KVAF_NPU_TOKENS_PER_BLOCK=128 \
 KVAF_NPU_ACTIVE_PERCENT=5 \
-KVAF_NPU_JETTYS_PER_CORE=2 \
 tests/run_remote_cpu_e2e.sh "$PWD/build-npu"
 ```
 
 该脚本用小规模 case 验证 Runtime 初始化、调用方 Device Tensor、Runtime
 materialize 的 `DeviceAccessTable`、BatchGet 输出字节、`output A -> B -> A` 的 local-buffer 缓存复用及
-teardown。它以 `KVAF_NPU_ACTIVE_PERCENT` 构造稀疏 mask（例如 `5` 表示 5% 请求
-有效），只为 `mask=1` 的请求写入 KV；随后可用 Runtime 的 ACL D2H mock
+teardown。它以 `KVAF_NPU_ACTIVE_PERCENT` 决定 `miss_count`（例如 `5` 表示约 5%
+请求有效），只为 `[0, miss_count)` 前缀写入 KV；随后可用 Runtime 的 ACL D2H mock
 `batch_put` 将 caller-owned NPU source Tensor 写入 Runtime-owned DDR。该小型
 BatchGet 用例不传 BatchPut kernel，因而不启动 Direct-HCCP BatchPut transport。
-每个 AIV core 默认使用 2 个 Jetty；可通过 `KVAF_NPU_JETTYS_PER_CORE=1` 切换为
-单 Jetty 验证。
+默认使用 2 个 AIV core，每个 core 使用 2 个 Jetty；可通过
+`KVAF_NPU_CORE_COUNT` 和 `KVAF_NPU_JETTYS_PER_CORE` 覆盖。BatchGet 每个 core
+支持 1 到 64 个 Jetty，BatchPut 仍最多使用 2 个。
 
 设置 `KVAF_NPU_GRAPH_REPLAYS` 可在同一个 Python 用例中额外运行 Python-owned 的
 raw `kvaf.AclGraph` 图模式：
@@ -205,8 +254,8 @@ capture 中只 capture `runtime.batch_get(..., stream=capture_stream)`。
 
 每次 replay 前，Python 在同一 ACL stream 上以
 `AclGraph.copy_host_to_device_async` 更新固定地址的 `address_table`、`indices`、
-`offsets`、`mask`、`output_indices`；capture 中的 BatchGet 参数和所有 NPU tensor 地址不变。正常
-性能口径是 `graph_replay_to_stream_completion`：四项 H2D 更新会在 replay 前完成并同步，
+`miss_count`、`output_indices`；capture 中的 BatchGet 参数和所有 NPU tensor 地址不变。正常
+性能口径是 `graph_replay_to_stream_completion`：五项 H2D 更新会在 replay 前完成并同步，
 不进入计时窗口；计时仅包含 graph replay 到同一 stream 完成，与 eager 的
 `runtime_batch_get_call_to_stream_completion` 口径对齐。默认 graph 的 warmup/iterations
 与 eager 一律使用相同的 `KVAF_NPU_WARMUP` / `KVAF_NPU_ITERATIONS` 采样计划。
@@ -262,13 +311,11 @@ BatchPut 的 Runtime binding 依赖 BatchGet 的公共 NPU Runtime 构建，因�
 BatchGet/Put 的每个样本均在 Runtime 调用后由调用方 `torch.npu.synchronize()`
 结束；随机源计划与数据填充不进入 BatchGet 提交计时。
 
-每个 BatchGet 样本先生成 `source_token_ids`、随机输出位置和每 2048-request
-分组的 `miss_count`。调用前再派生
-`indices = source_token_ids // tokens_per_block`、
-`offsets = (source_token_ids % tokens_per_block) * token_bytes`、`output_indices` 和
-mask。输入计划与
-BatchGet Tensor 构造都在计时窗口外完成并同步，不输出输入构造阶段耗时。
-脚本仅输出 submit、synchronize 和 BatchGet 的 `PERF_RESULT`。
+每个 BatchGet 样本生成 `source_token_ids`、随机输出位置和一个单元素
+NPU `int32 miss_count`。调用前派生 `indices`、`offsets` 和
+`output_indices`；只有这三个数组的 `[0, miss_count)` 前缀会被搬运，
+不再生成 mask。脚本输出 submit、synchronize 和 BatchGet 的
+`PERF_RESULT`。
 
 ```bash
 KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 \

@@ -6,19 +6,48 @@
 // Shared host/AIV ABI for the graph-safe ExecuteBatchGet kernel.  These
 // records are copied verbatim between host code, HBM and the AIV kernel.
 enum {
-  KVAF_AIV_BATCH_GET_STATUS_BYTES = 384,
+  KVAF_AIV_BATCH_GET_STATUS_BYTES = 1216,
   KVAF_AIV_BATCH_GET_QUEUE_STATE_BYTES = 64,
   KVAF_AIV_BATCH_GET_MAX_AIV_CORES = 48,
-  KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE = 2,
+  KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE = 64,
   // Shared local-memory contract used by the AIV kernel and launcher.
   KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES = 160 * 1024,
 };
 
 static const uint64_t KVAF_AIV_BATCH_GET_STATUS_MAGIC = 0x4b5641464247444fULL;
+static const uint64_t KVAF_AIV_BATCH_GET_PROFILE_MAGIC =
+    0x4b56414650524f46ULL;  // "KVAFPROF"
 
-// Keep the historical 384-byte stride even though ExecuteBatchGet uses only
-// the first cache line. This keeps the verified host/device allocation ABI
-// stable while reserving space for future non-hot diagnostics.
+// Optional, per-core kernel timeline. The host enables collection by placing
+// KVAF_AIV_BATCH_GET_PROFILE_MAGIC in `magic` before launch. The kernel keeps
+// the magic in its output, so repeated launches can reuse the same status
+// buffer. GetSystemCycle frequency is platform-specific and the caller must
+// supply the clock MHz when converting cycles to time.
+typedef struct KvafBatchGetCoreProfile {
+  uint64_t magic;
+  uint64_t kernel_start_cycle;
+  uint64_t setup_done_cycle;
+  // Legacy profile slot retained for ABI stability. The direct-prefix kernel
+  // performs no compaction, so this equals setup_done_cycle.
+  uint64_t compact_done_cycle;
+  uint64_t first_doorbell_cycle;
+  uint64_t post_done_cycle;
+  uint64_t completion_done_cycle;
+  uint64_t kernel_finish_cycle;
+  uint64_t active_requests;
+  uint64_t total_posts;
+  uint64_t jetty_completion_wait_cycles[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE];
+  uint64_t jetty_completion_polls[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE];
+  uint64_t submitted_group_count;
+  uint64_t completed_group_count;
+  uint64_t completion_count;  // CQEs consumed, not completed READs
+  uint64_t post_active_cycles;  // sum of group submissions, excluding CQ waits
+  uint64_t drain_wait_cycles;   // sum of all group completion waits
+  uint64_t peak_submitted_not_drained;  // conservative per-core software peak
+} KvafBatchGetCoreProfile;
+
+// ExecuteBatchGet uses only the first cache line on the normal path. The
+// remaining cache lines carry the opt-in per-Jetty profiling payload.
 typedef struct KvafBatchGetCoreStatus {
   uint64_t magic;
   uint64_t processed_request_count;
@@ -29,7 +58,7 @@ typedef struct KvafBatchGetCoreStatus {
   uint64_t cq_consumer_index;
   uint64_t failed_request_index;
   uint64_t last_wqe_protocol;
-  uint64_t reserved[40];
+  KvafBatchGetCoreProfile profile;
 } KvafBatchGetCoreStatus;
 
 // Persistent, AIV-owned software indices for one USER_CTL SQ/CQ pair. Queue
@@ -41,7 +70,8 @@ typedef struct KvafBatchGetQueueState {
   uint64_t cq_consumer_index;
   uint64_t completed_batch_count;
   uint64_t last_error;
-  uint64_t reserved[3];
+  uint64_t poisoned;  // incomplete/failed submission; requires transport rebuild
+  uint64_t reserved[2];
 } KvafBatchGetQueueState;
 
 // Device view of one Direct-HCCP transport plus one acquired local HBM
@@ -77,14 +107,14 @@ typedef struct KvafBatchGetDirectUrmaEntity {
 
 // Fixed-shape graph ABI. `output` and `channel_entity` must identify the same
 // LocalBufferAcquire result. During capture/replay both addresses stay fixed;
-// address/valid/index/offset/mask/output-index contents may change between
+// address/valid/index/offset/miss-count/output-index contents may change between
 // replays.
 typedef struct KvafExecuteBatchGetKernelArgs {
   uint64_t address_table;       // uint64[table_capacity], absolute Host DDR UBA
   uint64_t valid_table;         // uint8[table_capacity]
   uint64_t indices;             // int32[request_capacity]
   uint64_t offsets;             // int32[request_capacity], byte offset in entry
-  uint64_t mask;                // uint8[request_capacity]
+  uint64_t miss_count;          // int32[1], valid request-prefix length
   uint64_t output_indices;      // int32[request_capacity]
   uint64_t output;              // caller-owned HBM output; must match entity
   uint64_t core_status;         // KvafBatchGetCoreStatus[block_count]
@@ -98,11 +128,18 @@ typedef struct KvafExecuteBatchGetKernelArgs {
   uint32_t block_count;
   // Zero preserves the phase-one ABI and selects one Jetty per AIV core.
   uint32_t jettys_per_core;
+  // Total READ budget across this launch's cores. Zero selects the original
+  // whole-batch path; otherwise must be >= 2 * block_count. Captured by value.
+  // Consumes former padding. Host and V2 kernel MUST be rebuilt together;
+  // the versioned kernel symbol prevents loading a pre-window kernel.
+  uint32_t batch_get_max_inflight_total;
 } KvafExecuteBatchGetKernelArgs;
 
 #if defined(__cplusplus)
 static_assert(sizeof(KvafBatchGetCoreStatus) == KVAF_AIV_BATCH_GET_STATUS_BYTES,
               "KvafBatchGetCoreStatus ABI changed");
+static_assert(sizeof(KvafBatchGetCoreProfile) == 1152,
+              "KvafBatchGetCoreProfile ABI changed");
 static_assert(sizeof(KvafBatchGetQueueState) == KVAF_AIV_BATCH_GET_QUEUE_STATE_BYTES,
               "KvafBatchGetQueueState ABI changed");
 static_assert(sizeof(KvafBatchGetDirectUrmaEntity) == 192,

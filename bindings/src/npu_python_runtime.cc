@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "access_table_python.h"
+#include "access_operator.h"
 #include "acl/acl.h"
 #include "acl_python_utils.h"
 #include "npu_runtime.h"
@@ -216,7 +217,12 @@ class NpuPythonRuntime final {
                    std::uint32_t device_id, std::uint32_t npu_core_count,
                    std::string batch_put_kernel_object_path,
                    std::uint32_t jettys_per_core,
-                   std::optional<std::uint32_t> cpu_peer_candidate) {
+                   std::vector<std::string> npu_eids,
+                   bool adaptive_ub_device,
+                   std::uint32_t adaptive_ub_miss_count,
+                   std::string peer_ub_device,
+                   std::vector<std::string> adaptive_peer_ub_devices,
+                   std::uint32_t batch_get_max_inflight_total) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
                               batch_get_tokens_per_block};
@@ -225,8 +231,12 @@ class NpuPythonRuntime final {
     options.device_id = device_id;
     options.npu_core_count = npu_core_count;
     options.jettys_per_core = jettys_per_core;
-    options.has_cpu_peer_candidate = cpu_peer_candidate.has_value();
-    options.cpu_peer_candidate = cpu_peer_candidate.value_or(0U);
+    options.batch_get_max_inflight_total = batch_get_max_inflight_total;
+    options.npu_eids = std::move(npu_eids);
+    options.adaptive_ub_device = adaptive_ub_device;
+    options.adaptive_ub_miss_count = adaptive_ub_miss_count;
+    options.peer_ub_device = std::move(peer_ub_device);
+    options.adaptive_peer_ub_devices = std::move(adaptive_peer_ub_devices);
     native_ = std::make_unique<::kvaf::NpuRuntime>(std::move(options));
   }
 
@@ -242,6 +252,7 @@ class NpuPythonRuntime final {
   std::uint32_t DeviceId() const { return native_->device_id(); }
   std::uint32_t NpuCoreCount() const { return native_->npu_core_count(); }
   std::uint32_t JettysPerCore() const { return native_->jettys_per_core(); }
+  const std::vector<std::string>& NpuEids() const { return native_->npu_eids(); }
   std::uint32_t BatchGetTokenBytes() const {
     return native_->batch_get_token_bytes();
   }
@@ -363,18 +374,59 @@ class NpuPythonRuntime final {
     ThrowIfError(native_->core().BatchFree(BatchFreeRequest{std::move(copied_keys)}));
   }
 
+  void StartBatchGetKernelProfile() {
+    ThrowIfError(native_->SetBatchGetKernelProfiling(true));
+  }
+
+  py::list BatchGetKernelProfileSnapshot() const {
+    std::vector<kvaf::BatchGetKernelProfile> profiles;
+    ThrowIfError(native_->CopyBatchGetKernelProfiles(&profiles));
+    py::list result;
+    for (std::size_t core = 0; core < profiles.size(); ++core) {
+      const kvaf::BatchGetKernelProfile& profile = profiles[core];
+      py::dict item;
+      item["core"] = core;
+      item["kernel_start_cycle"] = profile.kernel_start_cycle;
+      item["setup_done_cycle"] = profile.setup_done_cycle;
+      item["compact_done_cycle"] = profile.compact_done_cycle;
+      item["first_doorbell_cycle"] = profile.first_doorbell_cycle;
+      item["post_done_cycle"] = profile.post_done_cycle;
+      item["completion_done_cycle"] = profile.completion_done_cycle;
+      item["kernel_finish_cycle"] = profile.kernel_finish_cycle;
+      item["active_requests"] = profile.active_requests;
+      item["total_posts"] = profile.total_posts;
+      item["submitted_group_count"] = profile.submitted_group_count;
+      item["completed_group_count"] = profile.completed_group_count;
+      item["completion_count"] = profile.completion_count;
+      item["post_active_cycles"] = profile.post_active_cycles;
+      item["drain_wait_cycles"] = profile.drain_wait_cycles;
+      item["peak_submitted_not_drained"] = profile.peak_submitted_not_drained;
+      item["jetty_completion_wait_cycles"] =
+          profile.jetty_completion_wait_cycles;
+      item["jetty_completion_polls"] = profile.jetty_completion_polls;
+      result.append(std::move(item));
+    }
+    return result;
+  }
+
+  py::list StopBatchGetKernelProfile() {
+    py::list result = BatchGetKernelProfileSnapshot();
+    ThrowIfError(native_->SetBatchGetKernelProfiling(false));
+    return result;
+  }
+
   // Tensor ownership remains with Python. KVAF creates no output Tensor and
   // only retains its internal Direct-HCCP execution state; callers must keep
   // input/output Tensors and either the DeviceAccessTable or the direct
   // addresses/valid Tensors alive until their stream completes BatchGet.
   void BatchGet(const DeviceAccessTable& access_table,
                 const py::object& indices, const py::object& offsets,
-                const py::object& mask,
+                const py::object& miss_count,
                 const py::object& output_indices, const py::object& output,
                 const py::object& stream, bool synchronize) {
     BatchGetImpl(access_table.source(), access_table.addresses(),
-                 access_table.valid(), indices, offsets, mask, output_indices,
-                 output, stream, synchronize);
+                 access_table.valid(), indices, offsets, miss_count,
+                 output_indices, output, stream, synchronize);
   }
 
   // This overload accepts a caller-owned device table directly. Since bare
@@ -384,40 +436,40 @@ class NpuPythonRuntime final {
                            const py::object& valid,
                            const py::object& indices,
                            const py::object& offsets,
-                           const py::object& mask,
+                           const py::object& miss_count,
                            const py::object& output_indices,
                            const py::object& output,
                            const py::object& stream, bool synchronize) {
-    BatchGetImpl(AccessTableHandle{}, addresses, valid, indices, offsets, mask,
-                 output_indices, output, stream, synchronize);
+    BatchGetImpl(AccessTableHandle{}, addresses, valid, indices, offsets,
+                 miss_count, output_indices, output, stream, synchronize);
   }
 
  private:
   void BatchGetImpl(const AccessTableHandle& access_table,
                     const py::object& addresses, const py::object& valid,
                     const py::object& indices, const py::object& offsets,
-                    const py::object& mask,
+                    const py::object& miss_count,
                     const py::object& output_indices,
                     const py::object& output, const py::object& stream,
                     bool synchronize) {
     const NpuTensorView index_view = GetNpuTensorView(indices, "indices");
     const NpuTensorView offset_view = GetNpuTensorView(offsets, "offsets");
-    const NpuTensorView mask_view = GetNpuTensorView(mask, "mask");
+    const NpuTensorView miss_count_view =
+        GetNpuTensorView(miss_count, "miss_count");
     const NpuTensorView output_index_view =
         GetNpuTensorView(output_indices, "output_indices");
     const NpuTensorView output_view = GetNpuTensorView(output, "output");
     const NpuTensorView address_view = GetNpuTensorView(addresses, "addresses");
     const NpuTensorView valid_view = GetNpuTensorView(valid, "valid");
     if (index_view.shape.size() != 1 || offset_view.shape.size() != 1 ||
-        mask_view.shape.size() != 1 ||
         output_index_view.shape.size() != 1 || output_view.shape.size() < 2 ||
         index_view.element_bytes != sizeof(std::int32_t) ||
         offset_view.element_bytes != sizeof(std::int32_t) ||
         output_index_view.element_bytes != sizeof(std::int32_t) ||
-        mask_view.element_bytes != sizeof(std::uint8_t) ||
+        miss_count_view.element_bytes != sizeof(std::int32_t) ||
+        miss_count_view.bytes != sizeof(std::int32_t) ||
         index_view.bytes != offset_view.bytes ||
         index_view.bytes != output_index_view.bytes ||
-        mask_view.bytes != index_view.bytes / sizeof(std::int32_t) ||
         address_view.element_bytes != sizeof(Address) ||
         valid_view.element_bytes != sizeof(std::uint8_t) ||
         valid_view.bytes != address_view.bytes / sizeof(Address) ||
@@ -436,7 +488,8 @@ class NpuPythonRuntime final {
         access_table,
         ConstBufferView{index_view.data, index_view.bytes, DeviceKind::kNpu},
         ConstBufferView{offset_view.data, offset_view.bytes, DeviceKind::kNpu},
-        ConstBufferView{mask_view.data, mask_view.bytes, DeviceKind::kNpu},
+        ConstBufferView{miss_count_view.data, miss_count_view.bytes,
+                        DeviceKind::kNpu},
         ConstBufferView{output_index_view.data, output_index_view.bytes,
                         DeviceKind::kNpu},
         MutableBufferView{output_view.data, output_view.bytes, DeviceKind::kNpu},
@@ -476,14 +529,21 @@ void BindNpuPythonRuntime(py::module_& module) {
   py::class_<NpuPythonRuntime>(module, "NpuRuntime")
       .def(py::init<std::string, std::uint32_t, std::uint32_t, std::uint32_t,
                     std::uint32_t, std::string, std::uint32_t,
-                    std::optional<std::uint32_t>>(),
+                    std::vector<std::string>, bool, std::uint32_t,
+                    std::string, std::vector<std::string>, std::uint32_t>(),
            py::arg("batch_get_kernel_object_path"),
            py::arg("batch_get_token_bytes"),
            py::arg("batch_get_tokens_per_block"), py::arg("device_id") = 0,
-           py::arg("npu_core_count") = 1,
+           py::arg("npu_core_count") = 2,
            py::arg("batch_put_kernel_object_path") = "",
            py::arg("jettys_per_core") = 2,
-           py::arg("cpu_peer_candidate") = std::nullopt)
+           py::arg("npu_eids") = std::vector<std::string>{},
+           py::arg("adaptive_ub_device") = false,
+           py::arg("adaptive_ub_miss_count") = 2048,
+           py::arg("peer_ub_device") = "",
+           py::arg("adaptive_peer_ub_devices") =
+               std::vector<std::string>{},
+           py::arg("batch_get_max_inflight_total") = 2048)
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
            "Connect this NPU Runtime to a CPU Runtime service before initialize.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),
@@ -493,6 +553,7 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def_property_readonly("device_id", &NpuPythonRuntime::DeviceId)
       .def_property_readonly("npu_core_count", &NpuPythonRuntime::NpuCoreCount)
       .def_property_readonly("jettys_per_core", &NpuPythonRuntime::JettysPerCore)
+      .def_property_readonly("npu_eids", &NpuPythonRuntime::NpuEids)
       .def_property_readonly("batch_get_token_bytes",
                              &NpuPythonRuntime::BatchGetTokenBytes)
       .def_property_readonly("batch_get_tokens_per_block",
@@ -516,16 +577,25 @@ void BindNpuPythonRuntime(py::module_& module) {
            "Release the supplied keys from the Runtime metadata store. keys "
            "accepts a Python key sequence or a contiguous one-dimensional "
            "CPU torch.int64 Tensor.")
+      .def("start_batch_get_kernel_profile",
+           &NpuPythonRuntime::StartBatchGetKernelProfile,
+           "Enable the per-core BatchGet kernel cycle timeline.")
+      .def("batch_get_kernel_profile",
+           &NpuPythonRuntime::BatchGetKernelProfileSnapshot,
+           "Copy the latest completed per-core BatchGet kernel timeline.")
+      .def("stop_batch_get_kernel_profile",
+           &NpuPythonRuntime::StopBatchGetKernelProfile,
+           "Copy the latest timeline and disable BatchGet kernel profiling.")
       .def("batch_get", &NpuPythonRuntime::BatchGet,
            py::arg("device_access_table"), py::arg("indices"), py::arg("offsets"),
-           py::arg("mask"),
+           py::arg("miss_count"),
            py::arg("output_indices"), py::arg("output"),
            py::arg("stream") = py::none(), py::arg("synchronize") = false,
            "Submit BatchGet from NPU Tensors. stream=None uses torch.npu.current_stream(); "
            "the default returns after enqueueing work on that stream.")
       .def("batch_get", &NpuPythonRuntime::BatchGetFromTensors,
            py::arg("addresses"), py::arg("valid"), py::arg("indices"),
-           py::arg("offsets"), py::arg("mask"), py::arg("output_indices"),
+           py::arg("offsets"), py::arg("miss_count"), py::arg("output_indices"),
            py::arg("output"), py::arg("stream") = py::none(),
            py::arg("synchronize") = false,
            "Submit BatchGet from caller-owned NPU addresses and valid Tensors. "
