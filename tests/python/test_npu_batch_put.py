@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Direct pybind + torch_npu integration test for Runtime BatchPut."""
+"""Single-layer BatchPut bandwidth test; optional KVAF_DSA_* geometry."""
 
 from __future__ import annotations
 
@@ -17,6 +17,27 @@ from backend import detect_torch_backend
 
 DEFAULT_BATCH_GET_TOKEN_BYTES = 656
 DEFAULT_BATCH_GET_TOKENS_PER_BLOCK = 128
+DDR_SLOT_ALIGNMENT = 4096  # vLLM-DSA M0_DDR_LAYER_ALIGNMENT_BYTES.
+MAX_AIV_CORES = 48  # batch_put_abi.h.
+
+
+def build_keys(
+    rows: int, pool_rows: int, n_layers: int, q_capacity: int, layer: int
+) -> list[int]:
+    if min(rows, pool_rows, n_layers, q_capacity) <= 0:
+        raise ValueError("block count and DSA dimensions must be positive")
+    if not 0 <= layer < n_layers:
+        raise ValueError("layer ordinal must be in [0, n_layers)")
+    if pool_rows * n_layers * q_capacity > (1 << 31) - 1:
+        raise ValueError("DSA directory exceeds its int32 index range")
+    if rows > pool_rows * q_capacity:
+        raise ValueError("one layer's block count exceeds pool_rows * q_capacity")
+    # Spread one layer's jobs evenly across pool rows; q_capacity stays fixed.
+    return [
+        pool_row * (n_layers * q_capacity) + layer * q_capacity + block_q
+        for pool_row in range(min(pool_rows, rows))
+        for block_q in range(rows // pool_rows + (pool_row < rows % pool_rows))
+    ]
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -40,6 +61,10 @@ def validate_batch(
             raise AssertionError("committed BatchPut lengths do not match")
         if list(view["valid"]) != [1] * rows:
             raise AssertionError("committed BatchPut entries are not valid")
+        base = runtime.remote_region["base"]
+        slot_bytes = runtime.remote_region["slot_size"]
+        if list(view["addresses"]) != [base + key * slot_bytes for key in keys]:
+            raise AssertionError("BatchPut addresses must follow DSA key_id == slot_id")
         # DDR belongs to the CPU service process. The companion BatchGet
         # integration test validates the bytes through AIV UB rather than
         # dereferencing a remote process address from Python.
@@ -89,37 +114,62 @@ def main() -> int:
         )
         return 2
 
-    device_id = int(os.environ.get("DEVICE_ID", "0"))
-    rows = int(os.environ.get("KVAF_NPU_REQUESTS", "4096"))
-    block_bytes = int(os.environ.get("KVAF_NPU_BLOCK_BYTES", "1024"))
-    token_bytes = int(
-        os.environ.get(
-            "KVAF_NPU_TOKEN_BYTES", str(DEFAULT_BATCH_GET_TOKEN_BYTES)
+    try:
+        device_id = int(os.environ.get("DEVICE_ID", "0"))
+        rows = int(os.environ.get("KVAF_NPU_REQUESTS", "4096"))
+        token_bytes = int(
+            os.environ.get("KVAF_NPU_TOKEN_BYTES", str(DEFAULT_BATCH_GET_TOKEN_BYTES))
         )
-    )
-    tokens_per_block = int(
-        os.environ.get(
-            "KVAF_NPU_TOKENS_PER_BLOCK",
-            str(DEFAULT_BATCH_GET_TOKENS_PER_BLOCK),
+        tokens_per_block = int(
+            os.environ.get(
+                "KVAF_NPU_TOKENS_PER_BLOCK", str(DEFAULT_BATCH_GET_TOKENS_PER_BLOCK)
+            )
         )
-    )
-    npu_core_count = int(
-        os.environ.get("KVAF_NPU_CORE_COUNT", os.environ.get("KVAF_NPU_AIV_CORES", "32"))
-    )
-    jettys_per_core = int(os.environ.get("KVAF_NPU_JETTYS_PER_CORE", "2"))
-    warmup = int(os.environ.get("KVAF_NPU_WARMUP", "1"))
-    iterations = int(os.environ.get("KVAF_NPU_ITERATIONS", "5"))
-    if not (
-        rows > 0
-        and block_bytes > 0
-        and token_bytes > 0
-        and tokens_per_block > 0
-        and 0 < npu_core_count <= rows
-        and 1 <= jettys_per_core <= 2
-        and warmup >= 0
-        and iterations > 0
-    ):
-        print("FAIL: invalid KVAF_NPU_* configuration", file=sys.stderr)
+        block_bytes = int(os.environ.get(
+            "KVAF_NPU_BLOCK_BYTES", str(token_bytes * tokens_per_block)
+        ))
+        npu_core_count = int(os.environ.get(
+            "KVAF_NPU_CORE_COUNT", os.environ.get("KVAF_NPU_AIV_CORES", "32")
+        ))
+        jettys_per_core = int(os.environ.get("KVAF_NPU_JETTYS_PER_CORE", "2"))
+        warmup = int(os.environ.get("KVAF_NPU_WARMUP", "20"))
+        iterations = int(os.environ.get("KVAF_NPU_ITERATIONS", "500"))
+        if not (
+            device_id >= 0 and 0 < rows <= (1 << 32) - 1
+            and 0 < block_bytes <= (1 << 32) - 1
+            and token_bytes > 0 and tokens_per_block > 0
+            and block_bytes == token_bytes * tokens_per_block
+            and 0 < npu_core_count <= min(rows, MAX_AIV_CORES)
+            and 1 <= jettys_per_core <= 2 and warmup >= 0 and iterations > 0
+        ):
+            raise ValueError("invalid shape, core count or sampling configuration; "
+                             "block_bytes must equal token_bytes * tokens_per_block")
+
+        geometry_names = ("KVAF_DSA_POOL_ROWS", "KVAF_DSA_N_LAYERS", "KVAF_DSA_Q_CAPACITY")
+        geometry_options = geometry_names + (
+            "KVAF_DSA_LAYER_ORDINAL", "KVAF_DSA_CATALOG_CAPACITY_BLOCKS"
+        )
+        configured = any(name in os.environ for name in geometry_options)
+        if configured:
+            if any(name not in os.environ for name in geometry_names):
+                raise ValueError("set all of " + ", ".join(geometry_names))
+            pool_rows, n_layers, q_capacity = (int(os.environ[name]) for name in geometry_names)
+        else:
+            # A bandwidth baseline, without assuming a real model's geometry.
+            pool_rows, n_layers, q_capacity = 1, 1, rows
+        layer = int(os.environ.get("KVAF_DSA_LAYER_ORDINAL", "0"))
+        catalog_blocks = int(os.environ.get("KVAF_DSA_CATALOG_CAPACITY_BLOCKS", "0"))
+        keys = build_keys(rows, pool_rows, n_layers, q_capacity, layer)
+        slot_count = (pool_rows * q_capacity + catalog_blocks) * n_layers
+        slot_bytes = (
+            (block_bytes + DDR_SLOT_ALIGNMENT - 1)
+            // DDR_SLOT_ALIGNMENT * DDR_SLOT_ALIGNMENT
+        )
+        ddr_bytes = slot_count * slot_bytes
+        if catalog_blocks < 0 or slot_count > (1 << 63) - 1 or ddr_bytes > (1 << 64) - 1:
+            raise ValueError("invalid catalog capacity or DDR size overflow")
+    except ValueError as error:
+        print(f"FAIL: {error}", file=sys.stderr)
         return 2
 
     torch = backend.torch
@@ -128,14 +178,17 @@ def main() -> int:
     device = f"npu:{device_id}"
     source_rows = torch.arange(rows, dtype=torch.int64).unsqueeze(1)
     source_bytes = torch.arange(block_bytes, dtype=torch.int64).unsqueeze(0)
-    source_host = (
-        (source_rows * 131 + source_bytes * 17 + (source_bytes >> 3)) & 0xFF
-    ).to(torch.uint8).contiguous()
+    # Cast the small row/byte patterns first, avoiding a rows*block_bytes int64
+    # temporary (2.56 GiB for the default 4096-block payload).
+    row_pattern = (source_rows * 131).to(torch.uint8)
+    byte_pattern = (source_bytes * 17 + (source_bytes >> 3)).to(torch.uint8)
+    source_host = torch.empty((rows, block_bytes), dtype=torch.uint8)
+    torch.add(row_pattern, byte_pattern, out=source_host)
     source = source_host.to(device)
     offsets = [row * block_bytes for row in range(rows)]
     lengths = [block_bytes] * rows
-    keys = list(range(1, rows + 1))
     torch.npu.synchronize()
+    stream = torch.npu.current_stream()
 
     runtime = kvaf.NpuRuntime(
         str(batch_get_kernel),
@@ -156,16 +209,28 @@ def main() -> int:
         print(
             "RUNTIME_NPU_BATCH_PUT_CONFIG "
             f"rows={rows} block_bytes={block_bytes} npu_cores={npu_core_count} "
+            f"scenario={'dsa_single_layer' if configured else 'bandwidth_baseline'} "
+            f"pool_rows={pool_rows} n_layers={n_layers} q_capacity={q_capacity} "
+            f"layer={layer} catalog_blocks={catalog_blocks} "
+            f"slot_bytes={slot_bytes} ddr_bytes={ddr_bytes} "
             f"batch_get_token_bytes={token_bytes} "
             f"batch_get_tokens_per_block={tokens_per_block} "
             f"jettys_per_core={jettys_per_core} warmup={warmup} "
             f"iterations={iterations} backend=aiv_direct_hccp"
         )
-        runtime.initialize(rows * block_bytes, block_bytes)
+        min_rows_per_core = rows // npu_core_count
+        max_rows_per_core = (rows + npu_core_count - 1) // npu_core_count
+        print(
+            "RUNTIME_NPU_BATCH_PUT_COVERAGE "
+            f"requests_per_core={min_rows_per_core}..{max_rows_per_core} "
+            f"active_jettys_per_core={min(jettys_per_core, (min_rows_per_core + 31) // 32)}"
+            f"..{min(jettys_per_core, (max_rows_per_core + 31) // 32)}"
+        )
+        runtime.initialize(ddr_bytes, slot_bytes)
 
         def execute() -> None:
             nonlocal committed
-            runtime.batch_put(keys, source, offsets, lengths)
+            runtime.batch_put(keys, source, offsets, lengths, stream)
             committed = True
 
         def release() -> None:
@@ -177,7 +242,7 @@ def main() -> int:
         execute()
         torch.npu.synchronize()
         validate_batch(runtime, keys, rows, block_bytes)
-        print(f"RUNTIME_NPU_BATCH_PUT_VALIDATION_PASS rows={rows}")
+        print(f"RUNTIME_NPU_BATCH_PUT_VALIDATION_PASS kind=metadata rows={rows}")
         release()
 
         for _ in range(warmup):
@@ -189,7 +254,7 @@ def main() -> int:
         for iteration in range(iterations):
             begin = time.perf_counter()
             execute()
-            torch.npu.synchronize()
+            # BatchPut already waits for its stream and checks completion status.
             samples.append((time.perf_counter() - begin) * 1000.0)
             if iteration + 1 < iterations:
                 release()
@@ -203,7 +268,7 @@ def main() -> int:
         mean_ms = statistics.mean(samples)
         useful_gbps = rows * block_bytes / 1_000_000_000.0 / (mean_ms / 1000.0)
         print(
-            "PERF_RESULT metric=runtime_batch_put_call_to_stream_completion "
+            "PERF_RESULT metric=runtime_batch_put_sync_call_to_return "
             f"samples={iterations} warmup_excluded={warmup} rows={rows} "
             f"block_bytes={block_bytes} npu_cores={npu_core_count} "
             f"mean_ms={mean_ms:.3f} "
