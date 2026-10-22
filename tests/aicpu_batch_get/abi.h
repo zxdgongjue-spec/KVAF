@@ -104,10 +104,6 @@ struct alignas(64) MultiBlockCoordination {
   CoordinationWord claimed, ready, initialized, request_sequence, request_start, ready_tick;
   CoordinationWord scatter_done, arrivals, round_complete, exited, status, failure_sequence;
 };
-inline bool IsValidMultiBlockCoordination(const MultiBlockCoordination& c, std::uint32_t workers) {
-  return c.magic == kMagic && c.revision == kKernelRevision && workers &&
-      workers <= kScatterWorkers && c.workers == workers;
-}
 inline MultiBlockCoordination MakeMultiBlockCoordination(std::uint32_t workers) {
   MultiBlockCoordination c{}; c.workers = workers; return c;
 }

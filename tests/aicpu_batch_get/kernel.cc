@@ -15,13 +15,13 @@ void Clean(const void* data, std::uint64_t bytes) {
   for (; line < end; line += 64) asm volatile("dc cvac, %0" :: "r"(line) : "memory");
   Barrier();
 }
-void InvalidateLines(const void* data, std::uint64_t bytes) {
+void Invalidate(const void* data, std::uint64_t bytes) {
   auto line = reinterpret_cast<std::uintptr_t>(data) & ~std::uintptr_t{63};
   const auto end = reinterpret_cast<std::uintptr_t>(data) + bytes;
-  // DC IVAC faults at EL0. DMA owns staging: never dirty these input lines.
+  // DC IVAC faults at EL0; use DC CIVAC.
   for (; line < end; line += 64) asm volatile("dc civac, %0" :: "r"(line) : "memory");
+  Barrier();
 }
-void Invalidate(const void* data, std::uint64_t bytes) { InvalidateLines(data, bytes); Barrier(); }
 std::uint64_t Load(const CoordinationWord& word) { return __atomic_load_n(&word.value, __ATOMIC_ACQUIRE); }
 void Store(CoordinationWord& word, std::uint64_t value) { __atomic_store_n(&word.value, value, __ATOMIC_RELEASE); }
 std::uint64_t Add(CoordinationWord& word) { return __atomic_fetch_add(&word.value, 1, __ATOMIC_ACQ_REL); }
@@ -96,18 +96,19 @@ struct RangeIO {
 };
 Result Run(DeviceIO& io, Sample* samples, KernelResult* result, MultiBlockCoordination& c) {
   const auto workers = ActiveThreads(io.config);
-  if (!IsValidMultiBlockCoordination(c, workers)) {
+  if (c.magic != kMagic || c.revision != kKernelRevision || c.workers != workers) {
     *result = {}; result->status = Result::kInvalidArgs; result->kernel_revision = kKernelRevision;
     Clean(result, sizeof(*result)); return Result::kInvalidArgs;
   }
   const auto worker = static_cast<std::uint32_t>(Add(c.claimed));
   if (worker >= workers) { Fail(c, Result::kInvalidArgs, 0); return Result::kInvalidArgs; }
   const auto frequency = io.Frequency();
+  const auto timeout = frequency * io.config.timeout_ms / 1000;
   if (!worker) {
     *result = {};
     result->active_threads = workers; result->kernel_revision = kKernelRevision;
     result->counter_frequency = frequency;
-    if (!frequency) Fail(c, Result::kInvalidArgs, 0);
+    if (!timeout) Fail(c, Result::kInvalidArgs, 0);
     Store(c.initialized, 1);
   }
   const auto startup = io.Now();
@@ -116,7 +117,6 @@ Result Run(DeviceIO& io, Sample* samples, KernelResult* result, MultiBlockCoordi
     Add(c.ready);
     initialized = WaitFor(io, c, c.ready, workers, startup, frequency, 0);
   }
-  const auto timeout = frequency * io.config.timeout_ms / 1000;
   for (std::uint64_t sequence = 1; initialized && sequence <= io.layout.rounds; ++sequence) {
     std::uint64_t prepared = 0;
     if (!worker) {

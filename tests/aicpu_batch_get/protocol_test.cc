@@ -66,6 +66,11 @@ struct ChunkIO {
   void FinishRange() { ++finishes; }
   void Relax() {}
 };
+struct FailedCopyIO : ChunkIO {
+  Result status{Result::kPending};
+  Result Status() { return status; }
+  void CopySpan(RowRange r) { ChunkIO::CopySpan(r); status = Result::kCopyError; }
+};
 void ReadyProgress() {
   Config c; c.rows = 16384;
   std::array<std::uint64_t, kJettyCount> tokens{};
@@ -81,6 +86,12 @@ void ReadyProgress() {
           io.copied[0].begin == 0 && io.copied[0].end == 4096 && io.finishes == 1, "prefix merge lost data");
   io = {}; io.token = PipelineProgressToken(2, 4);
   Require(RunPipelineChunks(c, 0, 3, 0, 3, io) == Result::kTimeout && io.copied.empty(), "stale marker released data");
+  FailedCopyIO failed; failed.token = PipelineProgressToken(3, 4);
+  Require(RunPipelineChunks(c, 0, 3, 0, 100, failed) == Result::kCopyError && failed.copied.size() == 1,
+          "last copy failure was ignored");
+  failed = {}; failed.token = PipelineProgressToken(3, 1);
+  Require(RunPipelineChunks(c, 0, 3, 0, 100, failed) == Result::kCopyError && failed.copied.size() == 1,
+          "partial copy failure was ignored");
 }
 void Completions() {
   Tracker t(2, 4); Tracker::Handle a{}, b{};

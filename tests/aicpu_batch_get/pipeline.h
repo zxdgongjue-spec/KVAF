@@ -52,8 +52,6 @@ template <class Emit> void ForEachPipelineChunk(const Config& c, Emit emit) {
 template <class IO>
 Result RunPipelineChunks(const Config& c, std::uint32_t worker, std::uint64_t sequence,
                          std::uint64_t start, std::uint64_t timeout, IO& io) {
-  if (worker >= ActiveThreads(c) || !sequence ||
-      sequence > UINT32_MAX || !timeout) return Result::kInvalidArgs;
   const auto chunks = PipelineChunkCount(c, worker);
   std::uint64_t consumed = 0;
   while (consumed < chunks) {
@@ -72,8 +70,6 @@ Result RunPipelineChunks(const Config& c, std::uint32_t worker, std::uint64_t se
         const auto last = PipelineChunkRange(c, worker, progress - 1);
         io.CopySpan({first.begin, last.end});
         consumed = progress;
-        if (const auto copied = io.Status(); copied != Result::kPending) return copied;
-        if (io.Now() - start >= timeout) return Result::kTimeout;
         break;
       }
       io.Relax();
