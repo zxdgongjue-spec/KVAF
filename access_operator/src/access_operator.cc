@@ -122,13 +122,18 @@ void LogBatchPutDeviceStatus(const BatchPutExecutionState& execution,
     std::fprintf(stderr,
                  "[KVAF_AIV] BATCH_PUT_DEVICE_ERROR core=%u magic=0x%llx "
                  "result=%llu processed=%llu failed_request=%llu cq_status=%llu "
-                 "cq_sub_status=%llu\n",
+                 "cq_sub_status=%llu completed_batches=%llu sq_pi=%llu cq_ci=%llu "
+                 "last_wqe=0x%llx\n",
                  core, static_cast<unsigned long long>(status.magic),
                  static_cast<unsigned long long>(status.result),
                  static_cast<unsigned long long>(status.processed_request_count),
                  static_cast<unsigned long long>(status.failed_request_index),
                  static_cast<unsigned long long>(status.cq_status),
-                 static_cast<unsigned long long>(status.cq_sub_status));
+                 static_cast<unsigned long long>(status.cq_sub_status),
+                 static_cast<unsigned long long>(status.completed_batch_count),
+                 static_cast<unsigned long long>(status.sq_producer_index),
+                 static_cast<unsigned long long>(status.cq_consumer_index),
+                 static_cast<unsigned long long>(status.last_wqe_protocol));
   }
 }
 #endif
@@ -144,6 +149,7 @@ bool FitsU32(std::uint64_t value) {
 Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
                                std::uint32_t npu_core_count,
                                std::uint32_t jettys_per_core,
+                               std::uint32_t max_inflight_total,
                                const BatchGetExecutionState& execution,
                                KvafExecuteBatchGetKernelArgs* arguments) {
   if (exec.request == nullptr || arguments == nullptr) {
@@ -162,7 +168,9 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
       request.indices.device != request.output.device ||
       request.indices.device != DeviceKind::kNpu ||
       request.output_indices.device != DeviceKind::kNpu ||
-      request.mask.data == nullptr || request.mask.device != DeviceKind::kNpu ||
+      !request.miss_count.has_elements<std::int32_t>() ||
+      request.miss_count.bytes != sizeof(std::int32_t) ||
+      request.miss_count.device != DeviceKind::kNpu ||
       request.output.device != DeviceKind::kNpu ||
       request.device_access_table.addresses.device != DeviceKind::kNpu ||
       request.device_access_table.valid.device != DeviceKind::kNpu ||
@@ -173,7 +181,6 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
       request.indices.bytes % sizeof(std::int32_t) != 0 ||
       request.offsets.bytes != request.indices.bytes ||
       request.output_indices.bytes != request.indices.bytes ||
-      request.mask.bytes != request.indices.bytes / sizeof(std::int32_t) ||
       execution.status == nullptr ||
       execution.status_bytes < static_cast<std::size_t>(npu_core_count) *
                                    sizeof(KvafBatchGetCoreStatus) ||
@@ -198,7 +205,7 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
   arguments->valid_table = PointerValue(request.device_access_table.valid.data);
   arguments->indices = PointerValue(request.indices.data);
   arguments->offsets = PointerValue(request.offsets.data);
-  arguments->mask = PointerValue(request.mask.data);
+  arguments->miss_count = PointerValue(request.miss_count.data);
   arguments->output_indices = PointerValue(request.output_indices.data);
   arguments->output = PointerValue(request.output.data);
   arguments->core_status = PointerValue(execution.status);
@@ -212,6 +219,7 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
       static_cast<std::uint32_t>(request.tokens_per_block);
   arguments->block_count = npu_core_count;
   arguments->jettys_per_core = jettys_per_core;
+  arguments->batch_get_max_inflight_total = max_inflight_total;
   return Status::OK();
 }
 
@@ -274,21 +282,44 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
       impl_->config.npu_core_count == 0 ||
       impl_->config.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->config.jettys_per_core == 0 ||
-      impl_->config.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE) {
+      impl_->config.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
+      (impl_->config.batch_get_max_inflight_total != 0U &&
+       impl_->config.batch_get_max_inflight_total < 2U * impl_->config.npu_core_count)) {
     return InvalidArgument("invalid AccessOperator initialization config");
   }
   if (impl_->config.peer_link == nullptr) {
     return InvalidState("AccessOperator requires an established Runtime Link");
   }
-  if (std::all_of(impl_->config.peer_local_eid.begin(),
+  const std::size_t worker_count =
+      static_cast<std::size_t>(impl_->config.npu_core_count) *
+      impl_->config.jettys_per_core;
+  if (impl_->config.peer_local_eids.empty() &&
+      std::any_of(impl_->config.peer_local_eid.begin(),
                   impl_->config.peer_local_eid.end(),
-                  [](std::uint8_t value) { return value == 0U; })) {
-    return InvalidArgument("Runtime Link requires a Runtime-selected local EID");
+                  [](std::uint8_t value) { return value != 0U; })) {
+    impl_->config.peer_local_eids.push_back(impl_->config.peer_local_eid);
+  }
+  if (impl_->config.peer_local_eids.empty() ||
+      impl_->config.peer_local_eids.size() > worker_count ||
+      std::any_of(impl_->config.peer_local_eids.begin(),
+                  impl_->config.peer_local_eids.end(),
+                  [](const auto& eid) {
+                    return std::all_of(eid.begin(), eid.end(),
+                                       [](std::uint8_t value) { return value == 0U; });
+                  })) {
+    return InvalidArgument("Runtime Link requires valid Runtime-selected local EIDs");
   }
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
+  const std::uint32_t batch_put_jettys_per_core =
+      impl_->config.batch_put_jettys_per_core == 0U
+          ? std::min(
+                impl_->config.jettys_per_core,
+                static_cast<std::uint32_t>(
+                    KVAF_AIV_BATCH_PUT_MAX_JETTYS_PER_CORE))
+          : impl_->config.batch_put_jettys_per_core;
   if (!impl_->config.batch_put_kernel_object_path.empty() &&
       (impl_->config.npu_core_count > KVAF_AIV_BATCH_PUT_MAX_AIV_CORES ||
-       impl_->config.jettys_per_core >
+       batch_put_jettys_per_core >
            KVAF_AIV_BATCH_PUT_MAX_JETTYS_PER_CORE)) {
     return InvalidArgument("invalid BatchPut transport configuration");
   }
@@ -300,10 +331,17 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
   }
 
   KvafBatchGetTransport* transport = nullptr;
-  const int32_t result = KvafBatchGetTransportCreateWithPeerLink(
+  static_assert(sizeof(impl_->config.peer_local_eids.front()) == 16U,
+                "NPU EID storage must remain packed");
+  const auto* peer_local_eids = reinterpret_cast<const std::uint8_t*>(
+      impl_->config.peer_local_eids.data());
+  const auto peer_local_eid_count =
+      static_cast<std::uint32_t>(impl_->config.peer_local_eids.size());
+  const int32_t result = KvafBatchGetTransportCreateWithPeerLinkMultiEid(
       reinterpret_cast<void*>(remote_region.base), remote_region.length,
       impl_->config.npu_core_count, impl_->config.jettys_per_core,
-      impl_->config.peer_link.get(), impl_->config.peer_local_eid.data(), &transport);
+      impl_->config.peer_link.get(), peer_local_eids, peer_local_eid_count,
+      &transport);
   if (result != KVAF_BATCH_GET_SUCCESS || transport == nullptr) {
     return Internal("failed to create reusable BatchGet transport");
   }
@@ -348,7 +386,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     KvafBatchPutTransport* batch_put_transport = nullptr;
     const int32_t batch_put_result = KvafBatchPutTransportCreateWithPeerLink(
         reinterpret_cast<void*>(remote_region.base), remote_region.length,
-        impl_->config.npu_core_count, impl_->config.jettys_per_core,
+        impl_->config.npu_core_count, batch_put_jettys_per_core,
         impl_->config.peer_link.get(), impl_->config.peer_local_eid.data(),
         &batch_put_transport);
     if (batch_put_result != KVAF_BATCH_PUT_SUCCESS ||
@@ -379,7 +417,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
                  "jettys_per_core=%u "
                  "metadata_staging=reusable\n",
                  impl_->config.npu_core_count,
-                 impl_->config.jettys_per_core);
+                 batch_put_jettys_per_core);
   }
 #endif
   impl_->initialized = true;
@@ -427,7 +465,7 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   KvafExecuteBatchGetKernelArgs arguments{};
   Status status = BuildBatchGetKernelArgs(
       exec, impl_->config.npu_core_count, impl_->config.jettys_per_core,
-      impl_->execution, &arguments);
+      impl_->config.batch_get_max_inflight_total, impl_->execution, &arguments);
   if (!status.ok()) {
     return status;
   }
@@ -461,6 +499,94 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
     // Releasing after an externally captured launch keeps KVAF graph-agnostic;
     // the caller owns stream completion and tensor lifetime.
     KvafBatchGetLocalBufferRelease(local_buffer);
+  }
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::SetBatchGetKernelProfiling(bool enabled) {
+  if (!impl_->initialized || impl_->execution.status == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  std::vector<KvafBatchGetCoreStatus> statuses(
+      impl_->config.npu_core_count);
+  if (enabled) {
+    for (KvafBatchGetCoreStatus& status : statuses) {
+      status.profile.magic = KVAF_AIV_BATCH_GET_PROFILE_MAGIC;
+    }
+  }
+  if (aclrtMemcpy(impl_->execution.status, impl_->execution.status_bytes,
+                  statuses.data(), statuses.size() * sizeof(statuses.front()),
+                  ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
+    return Internal("failed to configure BatchGet kernel profiling");
+  }
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
+    std::vector<BatchGetKernelProfile>* profiles) const {
+  if (profiles == nullptr) {
+    return InvalidArgument("BatchGet kernel profile output must not be null");
+  }
+  if (!impl_->initialized || impl_->execution.status == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  std::vector<KvafBatchGetCoreStatus> statuses(
+      impl_->config.npu_core_count);
+  if (aclrtMemcpy(statuses.data(), statuses.size() * sizeof(statuses.front()),
+                  impl_->execution.status, impl_->execution.status_bytes,
+                  ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
+    return Internal("failed to copy BatchGet kernel profiles");
+  }
+  profiles->clear();
+  profiles->reserve(statuses.size());
+  for (const KvafBatchGetCoreStatus& status : statuses) {
+    const KvafBatchGetCoreProfile& source = status.profile;
+    const bool invalid_doorbell =
+        (source.first_doorbell_cycle != 0U &&
+         (source.first_doorbell_cycle < source.compact_done_cycle ||
+          source.first_doorbell_cycle > source.post_done_cycle)) ||
+        (status.result == 0U && source.active_requests != 0U &&
+         source.first_doorbell_cycle == 0U) ||
+        (source.active_requests == 0U &&
+         source.first_doorbell_cycle != 0U);
+    if (status.magic != KVAF_AIV_BATCH_GET_STATUS_MAGIC ||
+        status.result != 0U ||
+        source.magic != KVAF_AIV_BATCH_GET_PROFILE_MAGIC ||
+        source.kernel_start_cycle > source.setup_done_cycle ||
+        source.setup_done_cycle > source.compact_done_cycle ||
+        source.compact_done_cycle > source.post_done_cycle ||
+        source.post_done_cycle > source.completion_done_cycle ||
+        source.completion_done_cycle > source.kernel_finish_cycle ||
+        invalid_doorbell) {
+      profiles->clear();
+      return Internal("BatchGet kernel returned an invalid profile timeline");
+    }
+    BatchGetKernelProfile destination;
+    destination.kernel_start_cycle = source.kernel_start_cycle;
+    destination.setup_done_cycle = source.setup_done_cycle;
+    destination.compact_done_cycle = source.compact_done_cycle;
+    destination.first_doorbell_cycle = source.first_doorbell_cycle;
+    destination.post_done_cycle = source.post_done_cycle;
+    destination.completion_done_cycle = source.completion_done_cycle;
+    destination.kernel_finish_cycle = source.kernel_finish_cycle;
+    destination.active_requests = source.active_requests;
+    destination.total_posts = source.total_posts;
+    destination.submitted_group_count = source.submitted_group_count;
+    destination.completed_group_count = source.completed_group_count;
+    destination.completion_count = source.completion_count;
+    destination.post_active_cycles = source.post_active_cycles;
+    destination.drain_wait_cycles = source.drain_wait_cycles;
+    destination.peak_submitted_not_drained = source.peak_submitted_not_drained;
+    for (std::size_t jetty = 0;
+         jetty < destination.jetty_completion_wait_cycles.size(); ++jetty) {
+      destination.jetty_completion_wait_cycles[jetty] =
+          source.jetty_completion_wait_cycles[jetty];
+      destination.jetty_completion_polls[jetty] =
+          source.jetty_completion_polls[jetty];
+    }
+    profiles->push_back(destination);
   }
   return Status::OK();
 }

@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kvaf
 
 from backend import detect_torch_backend
+from npu_eids import parse_npu_eids
 
 
 AIV_CORES = 32
@@ -93,6 +94,8 @@ def main(batch: int = 16) -> int:
             os.environ.get("KVAF_NPU_JETTYS_PER_CORE", str(JETTYS_PER_CORE)),
         )
     )
+    max_inflight_total = int(os.environ.get("KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL", "2048"))
+    npu_eids = parse_npu_eids(os.environ.get("KVAF_NPU_EIDS"))
     warmup = int(os.environ.get("KVAF_RUNTIME_PERF_WARMUP", str(WARMUP)))
     iterations = int(os.environ.get("KVAF_RUNTIME_PERF_ITERATIONS", str(ITERATIONS)))
     active_percent = int(
@@ -115,7 +118,7 @@ def main(batch: int = 16) -> int:
     )
     table_capacity = int(
         os.environ.get(
-            "KVAF_RUNTIME_PERF_TABLE_CAPACITY", str(batch * PUT_BATCH_SIZE * 1024)
+            "KVAF_RUNTIME_PERF_TABLE_CAPACITY", str(batch * 1024 * 78)
         )
     )
     requests = int(
@@ -127,6 +130,7 @@ def main(batch: int = 16) -> int:
         batch > 0
         and npu_core_count > 0
         and 1 <= jettys_per_core <= 2
+        and len(npu_eids) <= npu_core_count * jettys_per_core
         and warmup >= 0
         and iterations > 0
         and 1 <= active_percent <= 100
@@ -207,6 +211,8 @@ def main(batch: int = 16) -> int:
         npu_core_count=npu_core_count,
         batch_put_kernel_object_path=str(batch_put_kernel),
         jettys_per_core=jettys_per_core,
+        batch_get_max_inflight_total=max_inflight_total,
+        npu_eids=npu_eids,
     )
     remote_cpu_service = os.environ.get("KVAF_CPU_SERVICE_ADDR")
     if not remote_cpu_service:
@@ -227,6 +233,8 @@ def main(batch: int = 16) -> int:
             f"tokens_per_block={tokens_per_block} block_bytes={block_bytes} "
             f"source_stride={source_stride} "
             f"aiv_cores={npu_core_count} jettys_per_core={jettys_per_core} "
+            f"eid_paths={len(npu_eids) or 1} "
+            f"npu_eids={','.join(npu_eids) or 'auto'} "
             f"warmup={warmup} iterations={iterations} "
             "batch_put_backend=aiv_direct_hccp timing=call_to_stream_completion"
         )
@@ -249,7 +257,9 @@ def main(batch: int = 16) -> int:
         )
         preflight_indices = torch.arange(PUT_BATCH_SIZE, dtype=torch.int32, device=device)
         preflight_offsets = torch.zeros(PUT_BATCH_SIZE, dtype=torch.int32, device=device)
-        preflight_mask = torch.ones(PUT_BATCH_SIZE, dtype=torch.uint8, device=device)
+        preflight_miss_count = torch.tensor(
+            [PUT_BATCH_SIZE], dtype=torch.int32, device=device
+        )
         preflight_output = torch.empty(
             (PUT_BATCH_SIZE, token_bytes), dtype=torch.uint8, device=device
         )
@@ -257,7 +267,7 @@ def main(batch: int = 16) -> int:
             preflight_device_table,
             preflight_indices,
             preflight_offsets,
-            preflight_mask,
+            preflight_miss_count,
             preflight_indices,
             preflight_output,
         )
@@ -330,7 +340,6 @@ def main(batch: int = 16) -> int:
         # BatchGet timing.
         probability = active_percent / 100.0
         sample_count = warmup + iterations
-        request_groups = requests // REQUESTS_PER_BATCH
         source_token_id_batches = []
         destination_slot_batches = []
         miss_count_batches = []
@@ -340,29 +349,26 @@ def main(batch: int = 16) -> int:
             )
             destination_slots = torch.randperm(requests, device=device).to(torch.int32)
             miss_count = (
-                torch.rand(
-                    (request_groups, REQUESTS_PER_BATCH - 1), device=device
-                )
-                < probability
-            ).sum(dim=1).to(torch.int32)
+                torch.rand((requests - 1,), device=device) < probability
+            ).sum().reshape(1).to(torch.int32)
             source_token_id_batches.append(source_token_ids)
             destination_slot_batches.append(destination_slots)
             miss_count_batches.append(miss_count)
         torch.npu.synchronize()
 
         miss_count_host = torch.stack(miss_count_batches).cpu()
-        if bool((miss_count_host >= REQUESTS_PER_BATCH).any().item()):
-            raise AssertionError("miss_count must be smaller than 2048")
+        if bool((miss_count_host >= requests).any().item()):
+            raise AssertionError("miss_count must be smaller than request capacity")
         mean_active_requests = float(miss_count_host.sum().item()) / sample_count
         target_active_requests = requests * probability
         print(
             "RUNTIME_PERF_BATCH_GET_INPUTS_READY "
             f"samples={sample_count} total_tokens={total_tokens} "
-            f"requests_per_sample={requests} requests_per_group=2048 "
+            f"requests_per_sample={requests} "
             f"mean_active_requests={mean_active_requests:.3f} "
             f"target_active_requests={target_active_requests:.3f} "
             "source_token_ids=random destination_slots=random_permutation "
-            "mask_layout=miss_count_prefix"
+            "request_layout=miss_count_prefix"
         )
         print("RUNTIME_PERF_PHASE_BEGIN phase=batch_get")
         warmup_inputs = []
@@ -374,16 +380,10 @@ def main(batch: int = 16) -> int:
             indices = source_token_ids // tokens_per_block
             offsets = (source_token_ids % tokens_per_block) * token_bytes
             output_indices = destination_slots.clone()
-            mask = (
-                torch.arange(
-                    REQUESTS_PER_BATCH, dtype=torch.int32, device=device
-                ).unsqueeze(0)
-                < miss_count.unsqueeze(1)
-            ).reshape(requests).to(torch.uint8)
             torch.npu.synchronize()
-            warmup_inputs.append((indices, offsets, output_indices, mask))
+            warmup_inputs.append((indices, offsets, output_indices, miss_count))
             runtime.batch_get(
-                device_table, indices, offsets, mask, output_indices, output
+                device_table, indices, offsets, miss_count, output_indices, output
             )
         torch.npu.synchronize()
         warmup_inputs.clear()
@@ -399,17 +399,11 @@ def main(batch: int = 16) -> int:
             indices = source_token_ids // tokens_per_block
             offsets = (source_token_ids % tokens_per_block) * token_bytes
             output_indices = destination_slots.clone()
-            mask = (
-                torch.arange(
-                    REQUESTS_PER_BATCH, dtype=torch.int32, device=device
-                ).unsqueeze(0)
-                < miss_count.unsqueeze(1)
-            ).reshape(requests).to(torch.uint8)
             torch.npu.synchronize()
 
             begin = time.perf_counter()
             runtime.batch_get(
-                device_table, indices, offsets, mask, output_indices, output
+                device_table, indices, offsets, miss_count, output_indices, output
             )
             submitted = time.perf_counter()
             torch.npu.synchronize()

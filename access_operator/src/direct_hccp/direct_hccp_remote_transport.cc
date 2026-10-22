@@ -157,7 +157,10 @@ bool LoadDirectHccp(DirectHccpApi* api) {
 
 void CloseDirectHccp(DirectHccpApi* api) {
   if (api == nullptr) return;
-  if (api->library != nullptr) dlclose(api->library);
+  // A successfully published transport shares the RA/HDC process bootstrap.
+  // Keep this DSO mapped until process exit: RA can retain service/TLS
+  // callbacks after an individual Runtime has torn down its queues.
+  // LoadDirectHccp still dlcloses an API handle that failed before publication.
   *api = {};
 }
 
@@ -188,13 +191,22 @@ bool GetCurrentNpuPhysicalDeviceId(std::uint32_t* physical_device_id) {
 void ReleaseDeviceAivTransport(const DeviceAivTransportResources& resources) {
   if (resources.api == nullptr) return;
   DirectHccpApi& api = *resources.api;
+  const auto context_for_worker = [&resources](
+                                      const DeviceAivWorkerResources& worker) {
+    if (resources.paths != nullptr && worker.path_index < resources.path_count) {
+      return resources.paths[worker.path_index].device_context;
+    }
+    return resources.device_context;
+  };
   std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=begin\n");
   if (api.qp_unimport != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=unimport_jettys\n");
     for (std::uint32_t index = 0U; index < resources.worker_count; ++index) {
       DeviceAivWorkerResources& worker = resources.workers[index];
-      if (resources.device_context != nullptr && worker.device_peer_target_jetty != nullptr) {
-        (void)api.qp_unimport(resources.device_context, worker.device_peer_target_jetty);
+      void* context = context_for_worker(worker);
+      if (context != nullptr && worker.device_peer_target_jetty != nullptr) {
+        (void)api.qp_unimport(context, worker.device_peer_target_jetty);
+        worker.device_peer_target_jetty = nullptr;
       }
     }
   }
@@ -204,6 +216,7 @@ void ReleaseDeviceAivTransport(const DeviceAivTransportResources& resources) {
       DeviceAivWorkerResources& worker = resources.workers[index];
       if (worker.device_user_ctl_jetty.handle != nullptr) {
         (void)api.qp_destroy(worker.device_user_ctl_jetty.handle);
+        worker.device_user_ctl_jetty.handle = nullptr;
       }
     }
   }
@@ -211,24 +224,56 @@ void ReleaseDeviceAivTransport(const DeviceAivTransportResources& resources) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=destroy_completion_queues\n");
     for (std::uint32_t index = 0U; index < resources.worker_count; ++index) {
       DeviceAivWorkerResources& worker = resources.workers[index];
-      if (resources.device_context != nullptr && worker.device_user_ctl_cq != nullptr) {
-        (void)api.cq_destroy(resources.device_context, worker.device_user_ctl_cq);
+      void* context = context_for_worker(worker);
+      if (context != nullptr && worker.device_user_ctl_cq != nullptr) {
+        (void)api.cq_destroy(context, worker.device_user_ctl_cq);
+        worker.device_user_ctl_cq = nullptr;
       }
     }
   }
-  if (api.rmem_unimport != nullptr && resources.device_context != nullptr &&
-      resources.device_peer_memory_import != nullptr) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=unimport_peer_memory\n");
-    (void)api.rmem_unimport(resources.device_context, resources.device_peer_memory_import);
-  }
-  if (api.token_free != nullptr && resources.device_context != nullptr &&
-      resources.device_transport_token_handle != nullptr) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=free_tokens\n");
-    (void)api.token_free(resources.device_context, resources.device_transport_token_handle);
-  }
-  if (api.ctx_deinit != nullptr && resources.device_context != nullptr) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=deinit_contexts\n");
-    (void)api.ctx_deinit(resources.device_context);
+  if (resources.paths != nullptr) {
+    std::fprintf(stderr,
+                 "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=release_eid_paths count=%u\n",
+                 resources.path_count);
+    for (std::uint32_t reverse = resources.path_count; reverse > 0U; --reverse) {
+      DeviceAivPathResources& path = resources.paths[reverse - 1U];
+      if (api.rmem_unimport != nullptr && path.device_context != nullptr &&
+          path.device_peer_memory_import != nullptr) {
+        (void)api.rmem_unimport(path.device_context,
+                                path.device_peer_memory_import);
+        path.device_peer_memory_import = nullptr;
+      }
+      if (api.token_free != nullptr && path.device_context != nullptr &&
+          path.device_transport_token_handle != nullptr) {
+        (void)api.token_free(path.device_context,
+                             path.device_transport_token_handle);
+        path.device_transport_token_handle = nullptr;
+      }
+      if (api.ctx_deinit != nullptr && path.device_context != nullptr) {
+        (void)api.ctx_deinit(path.device_context);
+        path.device_context = nullptr;
+      }
+    }
+  } else {
+    if (api.rmem_unimport != nullptr && resources.device_context != nullptr &&
+        resources.device_peer_memory_import != nullptr) {
+      std::fprintf(stderr,
+                   "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=unimport_peer_memory\n");
+      (void)api.rmem_unimport(resources.device_context,
+                              resources.device_peer_memory_import);
+    }
+    if (api.token_free != nullptr && resources.device_context != nullptr &&
+        resources.device_transport_token_handle != nullptr) {
+      std::fprintf(stderr,
+                   "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=free_tokens\n");
+      (void)api.token_free(resources.device_context,
+                           resources.device_transport_token_handle);
+    }
+    if (api.ctx_deinit != nullptr && resources.device_context != nullptr) {
+      std::fprintf(stderr,
+                   "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=deinit_contexts\n");
+      (void)api.ctx_deinit(resources.device_context);
+    }
   }
   if (resources.session != nullptr) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=release_session\n");
@@ -341,7 +386,7 @@ bool CreateDeviceAivJetty(const DirectHccpApi& api, void* context,
   attr.ub.jfs_flag = JfsFlagErrorSuspend();
   attr.ub.token_id_handle = token_handle;
   attr.ub.token_value = token_value;
-  attr.ub.priority = 2U;
+  attr.ub.priority = 15U;
   attr.ub.rnr_retry = 7U;
   attr.ub.err_timeout = 16U;
   attr.ub.ext_mode.sqebb_num = sq_depth;

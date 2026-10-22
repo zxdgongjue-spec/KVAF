@@ -22,6 +22,13 @@ struct PeerRegion {
   std::array<uint8_t, kSegKeyBytes> segment_key{};
 };
 
+struct PeerCandidateInfo {
+  uint32_t candidate_id = 0U;
+  uint32_t device_id = 0U;
+  uint32_t eid_index = 0U;
+  std::string device_name;
+};
+
 // Per-Runtime peer control-plane client. Its endpoint is explicit: Runtime
 // receives it through LinkTo and never reads process environment.
 class PeerLink {
@@ -31,7 +38,9 @@ class PeerLink {
   const std::string& address() const { return address_; }
   bool has_region() const { return !regions_.empty(); }
 
-  Status GetCandidateCount(uint32_t* candidate_count) const;
+  Status GetCandidateCount(uint32_t* candidate_count, uint32_t* device_count = nullptr,
+                           bool* device_filter_applied = nullptr) const;
+  Status GetCandidateInfo(uint32_t candidate_id, PeerCandidateInfo* info) const;
   Status AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
                         uint32_t candidate_id, PeerRegion* region);
   Status ReleaseRegion(uint64_t base);
