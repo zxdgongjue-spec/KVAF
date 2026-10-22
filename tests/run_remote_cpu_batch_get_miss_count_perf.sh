@@ -110,7 +110,7 @@ if [[ "$adaptive_requested" == true ]]; then
     --request-length "$calibration_miss_count"
     --token-bytes "$calibration_token_bytes" --tokens-per-block 128
     --miss-count "$calibration_miss_count"
-    --aiv-cores 2 --jettys-per-core 1
+    --aiv-cores 2 --jettys-per-core 2
     --warmup 1 --iterations 5 --no-kernel-profile
   )
   echo "BATCH_GET_UB_DEVICE_FILTER_CHECK_BEGIN" |
@@ -137,7 +137,7 @@ if [[ "$adaptive_requested" == true ]]; then
       tee -a "$selection_log"
   else
     best_gibps=""
-    echo "BATCH_GET_UB_DEVICE_CALIBRATION_BEGIN token_bytes=$calibration_token_bytes miss_count=$calibration_miss_count aiv_cores=2 jettys_per_core=1 warmup=1 samples=5 metric=batch_get_useful_GiBps mode=full_perf_path" |
+    echo "BATCH_GET_UB_DEVICE_CALIBRATION_BEGIN token_bytes=$calibration_token_bytes miss_count=$calibration_miss_count aiv_cores=2 jettys_per_core=2 warmup=1 samples=5 metric=batch_get_useful_GiBps mode=full_perf_path" |
       tee -a "$selection_log"
     for candidate_ub_device in "${adaptive_ub_devices[@]}"; do
       echo "BATCH_GET_UB_DEVICE_CANDIDATE_BEGIN ub_device=$candidate_ub_device" |

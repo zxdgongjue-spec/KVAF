@@ -36,7 +36,7 @@ transport:
 KvafBatchGetTransport *transport = nullptr;
 KvafBatchGetLocalBuffer *output_binding = nullptr;
 uint64_t entity = 0;
-uint32_t jettys_per_core = 1;
+uint32_t jettys_per_core = 2;
 KvafBatchGetTransportCreateWithPeerLink(host_ddr, host_ddr_bytes, aiv_cores,
                                         jettys_per_core, peer_link, npu_local_eid,
                                         &transport);
@@ -45,6 +45,7 @@ KvafBatchGetLocalBufferAcquire(transport, output_hbm, output_bytes,
 args.output = reinterpret_cast<uint64_t>(output_hbm);
 args.channel_entity = entity;
 args.jettys_per_core = jettys_per_core;
+args.batch_get_max_inflight_total = 2048; // 0 selects the baseline
 // args.queue_state points to a zero-initialized
 // KvafBatchGetQueueState[aiv_cores * jettys_per_core] array.
 // launch and synchronize the stream
@@ -65,13 +66,13 @@ the transport.
 
 ## What is included
 
-- `kernel/execute_batch_get_aiv.asc`: SIMT-compacts requests,
-  caches each active request's table index and request ID in UB, generates 32
-  UDMA READ WQEs in parallel, and overlaps vector fill, MTE3 UB-to-SQ copies,
-  and scalar doorbells with two UB banks. It never uses MTE to dereference Host
-  DDR.
+- `kernel/execute_batch_get_aiv.asc`: consumes the compact request prefix,
+  generates up to 128 UDMA READ WQEs in parallel, and overlaps vector fill,
+  MTE3 UB-to-SQ copies, and scalar doorbells with two UB banks. Larger batches
+  use two completion-tracked groups per core under a shared total budget.
+  It never uses MTE to dereference Host DDR.
 - `host/batch_get_host.cpp`: CPU/device EID discovery, Direct-HCCP transport,
-  Host-DDR registration, per-output HBM-MR cache, and up to two private
+  Host-DDR registration, per-output HBM-MR cache, and up to sixty-four private
   USER_CTL SQ/CQ/Jettys per AIV.
 - `host/execute_batch_get_loader.cpp`: ACL binary load and AIV launch.
 - Runtime/Python integration coverage lives in
@@ -88,20 +89,25 @@ The data path keeps the public KVAF ABI and the verified Direct-HCCP WQE token
 fields. It does not copy the AIV_URMA benchmark's server/client handshake,
 control-region writes, fixed 64K request shape, or per-launch CQ reset.
 
-Each AIV consumes its assigned slice of the compact `[0, miss_count)` request
-prefix directly. Before touching the SQ, the kernel rejects an invalid
-descriptor or a per-Jetty assignment that fills the entire SQ.
-The phase-two scheduler assigns complete 32-WQE posts to the core's Jettys in
-round-robin order, with one to sixty-four Jettys supported per core. Each Jetty has an
-independent persistent SQ producer and CQ consumer index. Only the last READ
-assigned to each used Jetty requests a CQE;
-the kernel drains one CQE from every used Jetty before reporting the batch
-complete. This is required because a CQE on one Jetty does not fence READs
-submitted through another Jetty. A core with one post uses only Jetty 0, while
-the one-Jetty phase-one path remains selectable with `JETTYS_PER_CORE=1`.
+Each AIV consumes its assigned slice of the compact `[0, miss_count)` prefix.
+The scheduler assigns posts of up to 128 WQEs to one to sixty-four Jettys in
+round-robin order. Each Jetty has independent persistent SQ/CQ indices.
 
-The ACL launcher explicitly reserves 160 KiB of AIV local memory for the two
-WQE banks, compacted table-index/request-ID arrays and SIMT validation scratch.
+Runtime defaults to a total `batch_get_max_inflight_total` of 2048 READs across
+all AIV cores. Small batches retain the whole-slice path. Larger batches split
+that budget across cores and keep at most two groups pending per core. Every
+group signals its last READ on each participating Jetty; all those CQEs must
+succeed before reusing the group's credit. Jetty rotation continues across
+groups. Zero disables the limit. See [design, configuration and validation](../../../docs/batch_get_inflight_control.md).
+
+Capacity checks use the currently pending groups. Failed submissions poison
+the affected queues until transport rebuild, preventing stale completions from
+being consumed by a later replay. The baseline's descriptor validation remains
+temporarily disabled in this branch.
+
+The ACL launcher reserves 160 KiB of AIV local memory for the two WQE banks and
+SIMT validation scratch. Rebuild Host, Python binding and Kernel together: the
+launcher now requires the `KvafExecuteBatchGetAivKernelV2` symbol.
 
 ## Build and validate on A5
 
@@ -141,7 +147,7 @@ kernel launch. One graph therefore serves replay-time changes to addresses,
 validity, request indices, offsets, miss count and output rows. A different output allocation
 uses its own acquire result and graph instance; eager launches may select any
 cached acquire result at runtime. A capacity, block-size, AIV-count or
-Jetty-count change also needs a new session/captured graph. After all stream
+Jetty-count or inflight-budget change also needs a new session/captured graph. After all stream
 work completes,
 release local buffers before destroying the transport.
 

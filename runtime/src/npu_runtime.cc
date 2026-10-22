@@ -431,6 +431,7 @@ struct NpuRuntime::Impl {
     config.batch_put_kernel_object_path = options.batch_put_kernel_object_path;
     config.npu_core_count = options.npu_core_count;
     config.jettys_per_core = options.jettys_per_core;
+    config.batch_get_max_inflight_total = options.batch_get_max_inflight_total;
     // BatchPut is intentionally unchanged and keeps its existing two-Jetty
     // maximum when BatchGet selects three to sixty-four lanes.
     config.batch_put_jettys_per_core =
@@ -468,6 +469,8 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
       impl_->options.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->options.jettys_per_core == 0U ||
       impl_->options.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
+      (impl_->options.batch_get_max_inflight_total != 0U &&
+       impl_->options.batch_get_max_inflight_total < 2U * impl_->options.npu_core_count) ||
       impl_->options.batch_get_token_bytes == 0U ||
       impl_->options.batch_get_tokens_per_block == 0U ||
       (impl_->options.adaptive_ub_device &&
