@@ -97,7 +97,7 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
       reinterpret_cast<std::uint64_t>(samples.data), reinterpret_cast<std::uint64_t>(result.data),
       reinterpret_cast<std::uint64_t>(coordination.data), config};
   std::fprintf(stderr, "AICPU_GET_NPU LAUNCH aicpu_blocks=%llu block_dim=%u ready=ordered_write copy=securec_memcpy "
-      "output_cache=cold_before_request cache_prepare=outside_timing revision=%llu\n",
+      "kernel_cache_maintenance=none output_cache=unforced revision=%llu\n",
       (unsigned long long)config.aicpu_blocks, ActiveThreads(config), (unsigned long long)kKernelRevision);
   kernel.Launch(args, ActiveThreads(config));
   // Retain buffers until both kernel execution and CPU transport have stopped.

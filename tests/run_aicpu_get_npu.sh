@@ -23,7 +23,8 @@ Without --device-id, use the CPU request's NPU device ID. With it, reject a mism
 The built kernel JSON is selected automatically. No installation by default.
 Set the data shape on the CPU script; CPU partitioning follows the NPU block setting.
 Small inputs use fewer active blocks when there are fewer staging cache-line groups.
-Install the V23 kernel after rebuilding both ends; restart NPU after installation.
+No explicit kernel cache maintenance or per-round cold-output preparation.
+Install the V24 kernel after rebuilding both ends; restart NPU after installation.
 This server handles one test run; restart it for the next run.
 Build: bash build.sh aicpu-npu
 EOF

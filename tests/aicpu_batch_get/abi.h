@@ -4,8 +4,8 @@
 
 namespace kvaf::aicpu_test {
 constexpr std::uint64_t kMagic = 0x4b56414641424735ULL;
-constexpr char kKernelName[] = "KvafAicpuBatchGetV23";
-constexpr std::uint64_t kKernelRevision = 23;
+constexpr char kKernelName[] = "KvafAicpuBatchGetV24";
+constexpr std::uint64_t kKernelRevision = 24;
 constexpr std::uint32_t kDefaultAicpuBlocks = 4, kMaxAicpuBlocks = 32, kJettyCount = 4;
 constexpr std::uint64_t kPipelineChunkRows = 1024;
 constexpr std::uint64_t kRequestOffset = 0;

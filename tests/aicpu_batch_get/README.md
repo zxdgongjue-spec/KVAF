@@ -11,7 +11,7 @@ scatter 使用 securec `memcpy_sp`，只在末轮通过 URMA 回读校验完整�
 
 ## 构建与运行
 
-V23 恢复了可配置的 AICPU 并行度。CPU、NPU executable 和 device kernel 必须一起重建，
+V24 移除了 kernel 内全部显式缓存维护。CPU、NPU executable 和 device kernel 一起重建，
 重新安装 kernel 后重启 NPU 测试进程。
 
 ```bash
@@ -50,7 +50,7 @@ CANN/UMDK 路径通过构建脚本环境或 `KVAF_UMDK_ROOT`、`KVAF_URMA_LIBRAR
 1. 发现 CPU UB/EID 与 NPU candidate，建立 Jetty 通道，注册源内存及目标 HBM。
 2. 按 output slot 顺序重排源 SGL，预构建数据/ready WRITE 链及全局 done 计划。
 3. NPU 一次启动多个 AICPU block，在 kernel 内执行全部轮次。
-4. 每轮 AICPU 准备冷 output 后发布 request；CPU 轮询请求并更新各源行的 8 B 序号。
+4. 每轮 AICPU 直接发布 request；CPU 轮询请求并更新各源行的 8 B 序号。
 5. CPU 提交预构建链。每个 Jetty 在对应数据后发布强序 ready WRITE，仅队列尾产生 CQE。
 6. 各 AICPU worker 收齐全部 Jetty 的进度后，向前复制已就绪范围；连续 chunk 可合并消费。
 7. CPU 收齐数据尾 CQE 后发送 done。全部 scatter 完成且 done 到达，才允许下一轮复用 staging。
@@ -58,23 +58,34 @@ CANN/UMDK 路径通过构建脚本环境或 `KVAF_UMDK_ROOT`、`KVAF_URMA_LIBRAR
 
 默认 4096 × 656 B 的有效 payload 为 2,686,976 B；源/output stride 为 768 B。
 max_sge=13 时，每轮为 320 个数据 WR、16 个 ready WR、1 个 done WR，共 5 个尾 CQE。
-worker 边界按完整 staging 缓存行对齐。scatter 内不执行 payload invalidate/clean；
-控制词缓存维护、DSB 和计时外的冷 output 准备保留。
+worker 边界按完整 staging 缓存行对齐。kernel 不再执行显式 invalidate/clean，
+覆盖数据、控制词、结果和计时缓冲区；保留 DSB、原子同步、超时和序号检查。
+output 跨轮复用，不再人为准备冷缓存。
 
 ## 指标
 
 | CSV 字段 | 范围 |
 |---|---|
-| `mean_ns` / `e2e_GBps` | request 开始到全部 scatter 和 done 完成，排除准备和校验 |
+| `mean_ns` / `e2e_GBps` | request 开始到全部 scatter 和 done 完成，排除末轮校验 |
 | `first_ready_ns` / `pipeline_ns` | 请求到最早 ready / 最早 ready 到本轮结束 |
 | `cpu_data_span_ns` / `cpu_data_GBps` | 数据 Submit 开始到观察到全部数据链尾 CQE，包含 ready 标记 |
 | `cpu_producer_ns` | 数据链及最终 done 的完整提交、等待时间 |
 | `cpu_round_ns` / `cpu_cycle_GBps` | CPU 完整轮次，包含请求等待、源更新及末轮校验 |
-| `npu_prepare_ns` / `npu_verify_ns` | 计时外冷 output 准备 / 末轮校验握手的每轮均摊值 |
+| `npu_prepare_ns` | 保留 CSV 字段以便前后对比；已删除准备流程，恒为 0 |
+| `npu_verify_ns` | 末轮校验握手的每轮均摊值 |
 
 单位为 ns，有效 payload 字节数除以对应平均 ns 即十进制 GB/s。
 `cpu_data_GBps` 是数据交付带宽；通信与 scatter 重叠，相关耗时不能直接相加。
 仅成功完成并通过末轮校验才输出 CSV。建议独立重复 5 次，比较中位数及尾延迟。
+
+## 无缓存维护版本的验证
+
+先用 `--smoke` 确认握手和末轮回读成功，再按上述 4096 × 656 B 命令运行完整测试。
+NPU LAUNCH 日志应包含 `revision=24` 和 `kernel_cache_maintenance=none`，结束时显示
+`status=1 completed=1050 failed_sequence=0`（预热 50、测量 1000），CPU 成功输出 CSV。
+比较 `cpu_data_GBps`、`e2e_GBps`、`cpu_cycle_GBps` 和 p99，并确认 `npu_prepare_ns=0`。
+当前版本与 V23 的区别包含移除冷 output 准备，带宽变化不能全部归因于通信加速。
+末轮回读或序号检查失败、任一端超时，都表示此次删除尚未通过验证。
 
 协议单测覆盖范围划分、ready 进度、过期序号、超时、CQ credit/乱序完成、复制和 guard、
 校验握手及计时统计；不依赖 CANN/URMA。传输或 stream 失败时保留 stderr 和设备日志，

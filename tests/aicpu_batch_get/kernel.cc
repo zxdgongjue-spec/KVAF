@@ -9,19 +9,6 @@
 namespace {
 using namespace kvaf::aicpu_test;
 void Barrier() { asm volatile("dsb sy" ::: "memory"); }
-void Clean(const void* data, std::uint64_t bytes) {
-  auto line = reinterpret_cast<std::uintptr_t>(data) & ~std::uintptr_t{63};
-  const auto end = reinterpret_cast<std::uintptr_t>(data) + bytes;
-  for (; line < end; line += 64) asm volatile("dc cvac, %0" :: "r"(line) : "memory");
-  Barrier();
-}
-void Invalidate(const void* data, std::uint64_t bytes) {
-  auto line = reinterpret_cast<std::uintptr_t>(data) & ~std::uintptr_t{63};
-  const auto end = reinterpret_cast<std::uintptr_t>(data) + bytes;
-  // DC IVAC faults at EL0; use DC CIVAC.
-  for (; line < end; line += 64) asm volatile("dc civac, %0" :: "r"(line) : "memory");
-  Barrier();
-}
 std::uint64_t Load(const CoordinationWord& word) { return __atomic_load_n(&word.value, __ATOMIC_ACQUIRE); }
 void Store(CoordinationWord& word, std::uint64_t value) { __atomic_store_n(&word.value, value, __ATOMIC_RELEASE); }
 std::uint64_t Add(CoordinationWord& word) { return __atomic_fetch_add(&word.value, 1, __ATOMIC_ACQ_REL); }
@@ -46,24 +33,24 @@ struct DeviceIO {
   std::uint64_t Frequency() { std::uint64_t v; asm volatile("mrs %0, cntfrq_el0" : "=r"(v)); return v; }
   void PublishRequest(std::uint64_t seq) {
     reinterpret_cast<volatile Control*>(region + kRequestOffset)->sequence = seq;
-    Clean(region + kRequestOffset, sizeof(Control));
+    Barrier();
   }
   std::uint64_t ReadDone() {
-    Invalidate(region + kDoneOffset, sizeof(Control));
+    Barrier();
     return reinterpret_cast<volatile Control*>(region + kDoneOffset)->sequence;
   }
   std::uint64_t ReadRangeDone(std::uint32_t worker) {
     const auto offset = ChainReadyOffset(layout, worker);
-    Invalidate(region + offset, Align64(kJettyCount * 8));
+    Barrier();
     auto* words = reinterpret_cast<volatile std::uint64_t*>(region + offset);
     return ChainReadyProgress(config, worker, sequence, [&](std::uint32_t q) { return words[q]; });
   }
   void PublishOutputReady(std::uint64_t seq) {
     reinterpret_cast<volatile Control*>(region + kOutputReadyOffset)->sequence = seq;
-    Clean(region + kOutputReadyOffset, sizeof(Control));
+    Barrier();
   }
   std::uint64_t ReadOutputVerified() {
-    Invalidate(region + kOutputVerifiedOffset, sizeof(Control));
+    Barrier();
     return reinterpret_cast<volatile Control*>(region + kOutputVerifiedOffset)->sequence;
   }
   void Relax() { asm volatile("yield" ::: "memory"); }
@@ -98,7 +85,7 @@ Result Run(DeviceIO& io, Sample* samples, KernelResult* result, MultiBlockCoordi
   const auto workers = ActiveThreads(io.config);
   if (c.magic != kMagic || c.revision != kKernelRevision || c.workers != workers) {
     *result = {}; result->status = Result::kInvalidArgs; result->kernel_revision = kKernelRevision;
-    Clean(result, sizeof(*result)); return Result::kInvalidArgs;
+    Barrier(); return Result::kInvalidArgs;
   }
   const auto worker = static_cast<std::uint32_t>(Add(c.claimed));
   if (worker >= workers) { Fail(c, Result::kInvalidArgs, 0); return Result::kInvalidArgs; }
@@ -118,13 +105,8 @@ Result Run(DeviceIO& io, Sample* samples, KernelResult* result, MultiBlockCoordi
     initialized = WaitFor(io, c, c.ready, workers, startup, frequency, 0);
   }
   for (std::uint64_t sequence = 1; initialized && sequence <= io.layout.rounds; ++sequence) {
-    std::uint64_t prepared = 0;
     if (!worker) {
       result->failed_sequence = sequence;
-      const auto before = io.Now();
-      // Retain the cold-output baseline outside the measured transfer span.
-      Invalidate(io.Output(), io.layout.output_bytes);
-      prepared = io.Now() - before;
       const auto start = io.Now(); Store(c.request_start, start); Store(c.ready_tick, UINT64_MAX);
       io.PublishRequest(sequence); Store(c.request_sequence, sequence);
     } else if (!WaitFor(io, c, c.request_sequence, sequence, io.Now(), timeout, sequence)) break;
@@ -150,13 +132,12 @@ Result Run(DeviceIO& io, Sample* samples, KernelResult* result, MultiBlockCoordi
       std::uint64_t verification = 0;
       if (sequence == io.layout.rounds) {
         const auto verify_start = io.Now();
-        // No output flush/read before the independent URMA consumer's ACK.
         const auto verified = VerifyOutputViaUrma(sequence, timeout, io);
         if (verified != Result::kOk) { Fail(c, verified, sequence); break; }
         verification = io.Now() - verify_start;
       }
       if (sequence > io.config.warmup)
-        samples[sequence - io.config.warmup - 1] = {end - start, ready - start, end - ready, prepared, verification};
+        samples[sequence - io.config.warmup - 1] = {end - start, ready - start, end - ready, 0, verification};
       result->completed_rounds = sequence; Store(c.round_complete, sequence);
     } else if (!WaitFor(io, c, c.round_complete, sequence, io.Now(), timeout, sequence)) break;
   }
@@ -166,18 +147,17 @@ Result Run(DeviceIO& io, Sample* samples, KernelResult* result, MultiBlockCoordi
   auto status = Status(c); if (status == Result::kPending) status = Result::kOk;
   result->status = status;
   result->failed_sequence = status == Result::kOk ? 0 : Load(c.failure_sequence);
-  if (status == Result::kOk) Clean(samples, io.config.iterations * sizeof(Sample));
-  Clean(result, sizeof(*result)); return status;
+  Barrier(); return status;
 }
 }
 extern "C" __attribute__((visibility("default")))
-std::uint32_t KvafAicpuBatchGetV23(kvaf::aicpu_test::KernelArgs* args) {
+std::uint32_t KvafAicpuBatchGetV24(kvaf::aicpu_test::KernelArgs* args) {
   if (!args || !args->region || !args->samples || !args->result || !args->coordination) return 1;
   Layout layout{};
   auto* result = reinterpret_cast<KernelResult*>(args->result);
   if (!MakeLayout(args->config, &layout) || args->region > UINT64_MAX - layout.region_bytes) {
     *result = {}; result->status = Result::kInvalidArgs; result->kernel_revision = kKernelRevision;
-    Clean(result, sizeof(*result)); return 1;
+    Barrier(); return 1;
   }
   DeviceIO io{reinterpret_cast<std::uint8_t*>(args->region), args->config, layout};
   return Run(io, reinterpret_cast<Sample*>(args->samples), result,
