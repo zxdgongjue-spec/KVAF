@@ -207,8 +207,7 @@ def main() -> int:
         variable_offsets.append(len(variable_input_host))
         variable_lengths.append(len(payload))
         variable_input_host.extend(payload)
-    # DSA with one pool row/layer: key = block_q. Freed before the main Put.
-    variable_keys = list(range(len(variable_payloads)))
+    variable_keys = list(range(1_000_001, 1_000_001 + len(variable_payloads)))
     ddr_bytes = (active_requests + len(variable_keys)) * source_stride
 
     # torch_npu owns ACL process initialization. Select the device before
@@ -291,7 +290,7 @@ def main() -> int:
         )
 
         print("RUNTIME_NPU_PHASE_BEGIN phase=batch_put")
-        active_keys = list(range(active_requests))
+        active_keys = list(range(1, active_requests + 1))
         source_rows = torch.arange(
             active_requests * tokens_per_block, dtype=torch.int64
         ).unsqueeze(1)
