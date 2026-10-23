@@ -85,6 +85,7 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
     PUBLIC kvaf_runtime
     PRIVATE "${KVAF_URMA_LIBRARY}" "${CMAKE_DL_LIBS}" Threads::Threads kvaf_cpu_gather_executor)
   target_compile_features(kvaf_cpu_runtime PUBLIC cxx_std_17)
+  target_compile_options(kvaf_cpu_runtime PRIVATE "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-g>")
 
   add_executable(kvaf_cpu_service src/cpu_service_main.cc)
   target_link_libraries(kvaf_cpu_service PRIVATE kvaf_cpu_runtime kvaf_runtime)

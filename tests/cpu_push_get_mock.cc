@@ -42,6 +42,9 @@ urma_jfr_t* urma_create_jfr(urma_context_t*, urma_jfr_cfg_t*) { ++live; return n
 urma_status_t urma_delete_jfr(urma_jfr_t* p) { --live; delete p; return URMA_SUCCESS; }
 urma_jetty_t* urma_create_jetty(urma_context_t*, urma_jetty_cfg_t* cfg) {
   Check(cfg->jfs_cfg.max_sge <= max_sge);
+  Check(cfg->jfs_cfg.max_rsge == 1 && cfg->jfs_cfg.priority == URMA_MAX_PRIORITY &&
+        cfg->jfs_cfg.rnr_retry == URMA_TYPICAL_RNR_RETRY &&
+        cfg->jfs_cfg.err_timeout == URMA_TYPICAL_ERR_TIMEOUT);
   auto* q = new urma_jetty_t{}; q->jetty_cfg = *cfg; ++live; return q;
 }
 urma_status_t urma_delete_jetty(urma_jetty_t* q) {
@@ -52,10 +55,14 @@ urma_status_t urma_unimport_jetty(urma_target_jetty_t* q) { --live; delete q; re
 urma_token_id_t* urma_alloc_token_id(urma_context_t*) { ++live; return new urma_token_id_t{}; }
 urma_status_t urma_free_token_id(urma_token_id_t* p) { --live; delete p; return URMA_SUCCESS; }
 urma_target_seg_t* urma_register_seg(urma_context_t*, urma_seg_cfg_t* cfg) {
+  Check(cfg->token_id && cfg->flag.bs.token_id_valid && !cfg->flag.bs.non_pin &&
+        cfg->flag.bs.token_policy == URMA_TOKEN_PLAIN_TEXT && cfg->flag.bs.access == 1);
   auto* p = new urma_target_seg_t{}; p->seg.ubva.va = cfg->va; p->seg.len = cfg->len; ++live; return p;
 }
 urma_status_t urma_unregister_seg(urma_target_seg_t* p) { --live; delete p; return URMA_SUCCESS; }
-urma_target_seg_t* urma_import_seg(urma_context_t*, urma_seg_t* seg, urma_token_t*, uint64_t, urma_import_seg_flag_t) {
+urma_target_seg_t* urma_import_seg(urma_context_t*, urma_seg_t* seg, urma_token_t*, uint64_t, urma_import_seg_flag_t flag) {
+  Check(flag.bs.cacheable == URMA_NON_CACHEABLE && flag.bs.mapping == URMA_SEG_NOMAP &&
+        flag.bs.access == ((1U << 1U) | (1U << 2U)));
   auto* p = new urma_target_seg_t{}; p->seg = *seg; ++live; return p;
 }
 urma_status_t urma_unimport_seg(urma_target_seg_t* p) { --live; delete p; return URMA_SUCCESS; }

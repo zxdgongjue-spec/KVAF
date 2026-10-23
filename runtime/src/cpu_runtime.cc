@@ -665,6 +665,9 @@ class CpuService {
     if (region.push || region.gather || !region.gather_lanes.empty()) return Result::kResourceError;
     if (!request.source_bytes || request.source_bytes > region.bytes)
       return Result::kInvalidRequest;
+    Log("[KVAF_CPU] CPU_PUSH_OPEN session=%llu workers=%u token_bytes=%u hbm_bytes=%llu\n",
+        static_cast<unsigned long long>(request.session_id), request.workers, request.token_bytes,
+        static_cast<unsigned long long>(request.hbm_bytes));
     auto transport = std::make_unique<cpu_push::Transport>();
     const auto status = transport->Initialize(region.resources->context(), region.segment,
         region.base, request, region.resources->tp_query(), region.resources->jetty_import(),

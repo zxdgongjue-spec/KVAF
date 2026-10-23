@@ -1,6 +1,7 @@
 #include "cpu_push_get_transport.h"
 
 #include <chrono>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -12,6 +13,13 @@ namespace {
 Status Error(const char* operation) { return Status::Internal(std::string("CPU push: ") + operation); }
 // Reserve SQ headroom for the provider's multi-block encoding of 16-SGE WRs.
 constexpr std::size_t kWaveWrs = 512;
+void Stage(const char* stage, std::uint32_t queue = UINT32_MAX) {
+  if (queue == UINT32_MAX)
+    std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_INIT stage=%s\n", stage);
+  else
+    std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_INIT stage=%s queue=%u\n", stage, queue);
+  errno = 0;
+}
 }  // namespace
 
 Transport::~Transport() {
@@ -41,26 +49,35 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   hbm_base_ = setup.hbm_base;
   workers_ = setup.workers;
   token_bytes_ = setup.token_bytes;
+  Stage("query_device");
   urma_device_attr_t attr{};
   if (urma_query_device(context->dev, &attr)) return Error("query device");
   max_sge_ = std::min(16U, attr.dev_cap.max_jfs_sge);
   max_bytes_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(65536, attr.dev_cap.max_msg_size));
   if (!max_sge_ || max_bytes_ < sizeof(Request)) return Error("unsupported SGE/message limits");
+  std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_CAP max_sge=%u message_bytes=%u workers=%u token_bytes=%u\n",
+               max_sge_, max_bytes_, workers_, token_bytes_);
   urma_seg_t segment{};
   std::memcpy(&segment, setup.segment, sizeof(segment));
   if (!SourceRange(segment.ubva.va, segment.len, hbm_base_, layout_.bytes))
     return Error("HBM workspace outside exported segment");
   urma_import_seg_flag_t flag{};
-  flag.value = urma::MemImportFlags();
+  // Match the probe's READ/WRITE-only HBM import, without remote atomics.
+  flag.bs.cacheable = URMA_NON_CACHEABLE;
+  flag.bs.access = (1U << 1U) | (1U << 2U);
+  flag.bs.mapping = URMA_SEG_NOMAP;
   urma_token_t token{};
   token.token = setup.token_value;
+  Stage("import_hbm");
   remote_ = urma_import_seg(context_, &segment, &token, 0, flag);
   if (!remote_) return Error("import HBM segment");
   void* buffer = nullptr;
   const auto bytes = (layout_.staging + 4095) & ~std::uint64_t{4095};
+  Stage("allocate_control");
   if (posix_memalign(&buffer, 4096, bytes)) return Error("allocate control buffer");
   memory_ = static_cast<std::uint8_t*>(buffer);
   std::memset(memory_, 0, bytes);
+  Stage("allocate_control_token");
   control_token_ = urma_alloc_token_id(context_);
   if (!control_token_) return Error("allocate control token");
   urma_seg_cfg_t cfg{};
@@ -68,10 +85,17 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   cfg.len = bytes;
   cfg.token_id = control_token_;
   cfg.token_value.token = setup.token_value;
-  cfg.flag.value = urma::MemRegFlags(false);
+  // This pinned buffer receives local READ results and supplies local WRITE
+  // payloads. Use the probe's direct-host registration, not remote DDR flags.
+  cfg.flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
+  cfg.flag.bs.access = 1U;  // LOCAL_WRITE in the deployed public UMDK ABI.
+  cfg.flag.bs.non_pin = 0;
+  cfg.flag.bs.token_id_valid = 1;
+  Stage("register_control");
   control_ = urma_register_seg(context_, &cfg);
   if (!control_) return Error("register control buffer");
   std::uint64_t cpu_tp = 0;
+  Stage("query_ctp");
   if (!urma::QueryTp(query, context_, setup.eid, &cpu_tp)) return Error("query CTP");
   response->cpu_tp = cpu_tp;
   response->cpu_psn = psn;
@@ -80,13 +104,15 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
       return Error("invalid NPU Jetty key");
     auto& queue = queues_[q];
     auto& c = queue.channel;
+    Stage("create_queues", q);
     const auto* error = urma::CreateQueues(urma::NativeApi{}, context_, setup.token_value,
-        {16384, 1024, max_sge_, false}, c.local_jfc, c.local_jfr, c.local_jetty);
+        {16384, 1024, max_sge_, false, true}, c.local_jfc, c.local_jfr, c.local_jetty);
     if (error) return Error(error);
     // Keep slots and all pointers stable until a tail CQE (or queue teardown).
     queue.local.reserve(kWaveWrs * max_sge_);
     queue.remote.reserve(kWaveWrs);
     queue.wrs.reserve(kWaveWrs);
+    Stage("import_jetty", q);
     c.remote_jetty = urma::ImportJetty(import, context_, setup.channels[q].key,
         setup.token_value, cpu_tp, setup.npu_tp, psn, setup.npu_psn);
     if (!c.remote_jetty) return Error("import NPU Jetty");
@@ -96,6 +122,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
     std::memcpy(key.key + sizeof(urma_jetty_id_t), &c.local_jetty->jetty_cfg.jfs_cfg.trans_mode,
                 sizeof(urma_transport_mode_t));
   }
+  Stage("ready");
   return Status::OK();
 }
 

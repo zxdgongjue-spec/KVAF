@@ -787,7 +787,8 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
             detail::StartupCandidate{peer_candidate, npu_group}, false, nullptr);
         if (last.ok()) return last;
         const Status released = cleanup();
-        if (!released.ok()) return released;
+        if (!released.ok()) return Status::Internal(last.message() +
+            "; candidate cleanup failed: " + released.message());
       }
     }
     if (!last.ok() && fixed_peer_device) {
