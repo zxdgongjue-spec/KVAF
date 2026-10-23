@@ -9,6 +9,10 @@
 namespace kvaf {
 
 enum class CpuGatherMode { kAdaptive, kActive, kPassive };
+enum class CpuMemoryPageMode {
+  kDefault,
+  kTransparentHugePage,
+};
 
 struct CpuRuntimeOptions {
   std::string ub_device;
@@ -17,6 +21,7 @@ struct CpuRuntimeOptions {
   std::uint32_t gather_threads{0U};
   bool gather_affinity{true};
   CpuGatherMode gather_mode{CpuGatherMode::kAdaptive};
+  CpuMemoryPageMode memory_page_mode{CpuMemoryPageMode::kTransparentHugePage};
 };
 
 // CPU endpoint Runtime. It owns only CPU-side UMDK resources and sessions;

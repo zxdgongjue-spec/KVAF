@@ -35,8 +35,9 @@ void KvafBatchPutLocalBufferRelease(KvafBatchPutLocalBuffer *local_buffer);
 
 int32_t KvafExecuteBatchPutLoadKernel(const char *kernel_object_path);
 
-// Synchronous eager execution: launch, stream synchronization, status copy
-// and core-status checking all finish before this function returns.
+// Synchronous eager execution: status initialization, launch, status D2H, one
+// stream synchronization, and core-status checking finish before this function
+// returns.
 int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer,
                                const KvafExecuteBatchPutKernelArgs *arguments,
                                aclrtStream stream,

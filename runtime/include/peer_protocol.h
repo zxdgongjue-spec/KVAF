@@ -10,15 +10,15 @@
 namespace kvaf::peer {
 
 constexpr uint32_t kProtocolMagic = 0x4b564350U;  // "KVCP"
-// Version 4 adds the initiating peer's EID to CreateChannel. A Jetty key identifies
-// a Jetty only; it is not an EID and cannot be used by peer UMDK CTP lookup.
-// Rejecting older versions prevents that silent ABI mismatch.
-constexpr uint16_t kProtocolVersion = 4U;
+// Version 6 exposes candidate metadata before allocation so adaptive startup
+// can group EIDs by K-side UB device and benchmark each device only once.
+constexpr uint16_t kProtocolVersion = 6U;
 constexpr uint32_t kQpKeyBytes = 64U;
 constexpr uint32_t kSegKeyBytes = 64U;
 constexpr uint32_t kEidBytes = 16U;
 constexpr uint32_t kMaxGatherSpans = 65536U;
 constexpr uint32_t kChannelSharedTp = 1U;
+constexpr uint32_t kDeviceNameBytes = 64U;
 
 enum class Command : uint16_t {
   kAllocateRegion = 1U,
@@ -27,6 +27,7 @@ enum class Command : uint16_t {
   kGetCandidateCount = 4U,
   kEnableDirectGather = 9U,
   kEnableGatherLanes = 10U,
+  kGetCandidateInfo = 5U,
 };
 
 enum class Result : int32_t {
@@ -61,6 +62,22 @@ struct CandidateCountResponse {
   MessageHeader header;
   int32_t result;
   uint32_t candidate_count;
+  uint32_t device_count;
+  uint32_t device_filter_applied;
+};
+
+struct CandidateInfoRequest {
+  MessageHeader header;
+  uint32_t candidate_id;
+};
+
+struct CandidateInfoResponse {
+  MessageHeader header;
+  int32_t result;
+  uint32_t candidate_id;
+  uint32_t device_id;
+  uint32_t eid_index;
+  char device_name[kDeviceNameBytes];
 };
 
 struct AllocateRegionResponse {
@@ -123,7 +140,9 @@ struct EnableGatherLanesRequest {
 static_assert(sizeof(MessageHeader) == 12U, "wire header ABI changed");
 static_assert(sizeof(AllocateRegionRequest) == 36U, "allocate request ABI changed");
 static_assert(sizeof(CandidateCountRequest) == 12U, "candidate count request ABI changed");
-static_assert(sizeof(CandidateCountResponse) == 20U, "candidate count response ABI changed");
+static_assert(sizeof(CandidateCountResponse) == 28U, "candidate count response ABI changed");
+static_assert(sizeof(CandidateInfoRequest) == 16U, "candidate info request ABI changed");
+static_assert(sizeof(CandidateInfoResponse) == 92U, "candidate info response ABI changed");
 static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed");
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");
 static_assert(sizeof(EnableGatherLanesRequest) == 32U, "gather lanes request ABI changed");

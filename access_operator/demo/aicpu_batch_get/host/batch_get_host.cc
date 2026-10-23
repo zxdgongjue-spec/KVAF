@@ -92,8 +92,7 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
   if (!impl_->initialized || !exec.execution.stream)
     return InvalidArgument("UMDK BatchGet needs initialization and stream");
   UmdkBatchGetArgs launch{};
-  auto valid = BuildBatchGetKernelArgs(exec, 1U, 1U, impl_->execution, &launch.request,
-                                       sizeof(GatherReadStatus), 0U);
+  auto valid = BuildBatchGetKernelArgs(exec, &launch.request);
   if (!valid.ok()) return valid;
   if (launch.request.request_capacity > kGatherMaxRequests ||
       launch.request.token_bytes != impl_->token_bytes)

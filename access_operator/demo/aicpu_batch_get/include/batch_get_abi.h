@@ -1,7 +1,6 @@
 #pragma once
 #include <cstdint>
 
-#include "../../aiv_batch_get/include/batch_get_abi.h"
 #include "gather_workspace.h"
 #include "batch_get_profile.h"
 #include "aicpu_urma/control_abi.h"
@@ -50,8 +49,12 @@ inline constexpr std::uint64_t GatherWorkspaceBytes(std::uint32_t workers) {
   return kGatherDescriptorOffset + workers * GatherLaneDescriptorBytes(workers);
 }
 static_assert(sizeof(GatherReadArgs) <= 256U);
+struct AicpuBatchGetInput {
+  std::uint64_t address_table{}, indices{}, offsets{}, mask{}, miss_count{}, output_indices{};
+  std::uint32_t table_capacity{}, request_capacity{}, token_bytes{};
+};
 struct UmdkBatchGetArgs {
-  KvafExecuteBatchGetKernelArgs request;
+  AicpuBatchGetInput request;
   GatherReadArgs gather;
 };
 }  // namespace kvaf::aicpu_urma

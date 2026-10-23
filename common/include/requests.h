@@ -55,12 +55,12 @@ struct BatchGetRequest {
   AccessTableHandle access_table;
 
   // indices/offsets/output_indices 为 int32[n]；offsets 是表项内的字节偏移。
+  // miss_count 为 int32[1]，只有三个请求数组的 [0, miss_count) 前缀有效。
   // NPU path 由 output_block_bytes 和 tokens_per_block 定义单 token 搬运大小
   // 与表项布局；CPU path 使用实际 AccessTable entry 长度校验 offset。
-  // mask 为空时所有请求均有效。
   ConstBufferView indices;
   ConstBufferView offsets;
-  ConstBufferView mask;
+  ConstBufferView miss_count;
   ConstBufferView output_indices;
   MutableBufferView output;
   std::uint64_t output_block_bytes{0};
@@ -68,6 +68,9 @@ struct BatchGetRequest {
 
   // CPU path 留空。NPU path 必须提供调用方持有的稳定 Device 表。
   AccessTableDeviceView device_access_table;
+  // Optional legacy AICPU sparse selector. Leave miss_count empty when using it.
+  ConstBufferView mask;
+
 };
 
 struct BatchPutRequest {

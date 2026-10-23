@@ -106,6 +106,9 @@ TCP 用于交换控制信息，初始化UB建链；KV 数据 通过 NPU AIV kern
 - `link_to(cpu_ip:port)` 后申请 CPU DDR 并建立 CPU–NPU 链路；
 - 自动发现 NPU 本端 EID：优先使用 HCCL rootinfo 中与当前物理卡匹配的 CLOS PG EID，
   不可用时回退到 `/proc/asdrv_ub/pair_info`；
+- 可通过 `npu_eids=[...]` 严格指定多个 NPU EID，BatchGet 为每个 EID
+  创建独立 Direct-HCCP context/MR/channel，并把 AIV core/Jetty worker
+  轮转分配到各路径；BatchPut 保持单 EID，使用列表第一项；
 - 自动枚举 CPU 服务端的 UMDK EID 候选；对候选组合执行真实的 64B AIV WRITE 和 CQ
   完成验证，只使用确实可访问 CPU DDR 的链路；
 - `BatchPut`：将 NPU Tensor 中的 KV block 写入 CPU DDR，并提交元数据；
@@ -178,6 +181,9 @@ build-npu/bin/kvaf_execute_batch_put_kernels.o
 ```
 
 服务会自动发现 UB device/EID，并打印 `CANDIDATE_DISCOVERED` 与 `LISTEN`。也可按需要传入 `--ub-device NAME --eid-index N` 来选定对应的端口。
+N 端性能脚本开启 `--adaptive-ub-device` 后，K 端未指定设备时会从脚本配置的
+`KVAF_ADAPTIVE_UB_DEVICES` 中测速选优；K 端指定单个 `--ub-device` 时走原生路径。
+详见 [Runtime 启动选优](runtime/README.md#可选启动-ub-device-选优)；N/K 两端需同时升级至控制协议 v6。
 
 ### 2. 运行 NPU 端到端测试
 
@@ -221,40 +227,81 @@ KVAF_RUNTIME_PERF_BLOCK_BYTES
 KVAF_RUNTIME_PERF_SOURCE_STRIDE
 KVAF_RUNTIME_PERF_AIV_CORES
 KVAF_RUNTIME_PERF_JETTYS_PER_CORE
+KVAF_NPU_EIDS
 KVAF_RUNTIME_PERF_WARMUP
 KVAF_RUNTIME_PERF_ITERATIONS
 ```
 
 ## Python 调用流程
 
-`NpuRuntime` 的 CPU 服务地址是唯一需要由应用指定的链路参数；EID 与 UB device 由
-Runtime 选择。
+默认情况下，`NpuRuntime` 只需要应用指定 CPU 服务地址，EID 与 UB device 由 Runtime
+自动选择。需要多 EID 并行时，可以显式提供严格的 NPU EID 列表。
 
 ```python
 import kvaf
 
 runtime = kvaf.NpuRuntime(
     batch_get_kernel_object_path="build-npu/bin/kvaf_execute_batch_get_kernels.o",
+    batch_get_token_bytes=656,
+    batch_get_tokens_per_block=128,
     device_id=0,
-    npu_core_count=1,
+    npu_core_count=2,
     batch_put_kernel_object_path="build-npu/bin/kvaf_execute_batch_put_kernels.o",
     jettys_per_core=2,
+    # 可选：每项是32位连续十六进制；空列表保持单 EID 自动发现。
+    npu_eids=[
+        "00112233445566778899aabbccddeeff",
+        "102132435465768798a9bacbdcedfe0f",
+    ],
 )
-
 runtime.link_to("<cpu-ip>:28999")
 runtime.initialize(ddr_bytes=16 * 1024**3, slot_size=576)
 
 # 使用 NPU Tensor 调用 batch_put / batch_get；具体 Tensor 形状见 tests/python/。
 # table = runtime.prepare_access_table(keys)
 # device_table = runtime.access_table_view(table, device="npu")
-# runtime.batch_get(device_table, indices, mask, output_indices, output)
-
+# runtime.batch_get(
+#     device_table, indices, offsets, miss_count, output_indices, output
+# )
 runtime.shutdown()
 ```
+
+显式列表是原子配置：所有 EID 都必须属于当前物理 NPU，并成功创建
+BatchGet context/MR/channel；任一路径失败都会使该 CPU EID 候选失败，不会回退到
+rootinfo 或 `pair_info`。启动 AIV WRITE/CQ 探测由 BatchPut 在列表第一个 EID
+上完成。EID 数不能超过 `npu_core_count * jettys_per_core`。当前多 EID 指多个
+NPU 本端 EID，它们连接到同一个已选 CPU EID/DDR region；CPU 侧多 EID region striping
+不在这一实现中。
+
+性能脚本也接受逗号分隔的 `KVAF_NPU_EIDS`：
+
+```bash
+KVAF_NPU_EIDS=00112233445566778899aabbccddeeff,102132435465768798a9bacbdcedfe0f \
+tests/run_remote_cpu_batch_get_perf.sh /absolute/path/to/build-npu \
+  --aiv-cores 2 --jettys-per-core 1
+```
+
+Runtime 先按 Jetty-major 顺序把每个 core 的主 Jetty 分散到不同 EID，再分配次 Jetty。
+大批量请求会随各 core/Jetty 的 128-WQE post 自然分摊；每个 core 支持 1 到 64 个
+Jetty。很小的请求如果没有启用所有
+Jetty，则不会产生足够 post 使用所有配置路径。
+
+性能测试可以使用 `--sort-input-indices` 对 `miss_count` 有效前缀排序。测试按实际
+远端地址和 slot 内 offset 排序，并同步重排 `indices`、`offsets` 和
+`output_indices`；请求构造和排序不计入 BatchGet 计时。
 
 `link_to()` 必须先于 `initialize()` 调用。调用方需要在 BatchGet 所在 stream 完成前保持
 输入/输出 Tensor 和 `DeviceAccessTable` 有效；Runtime 只管理内部 DDR、元数据和内部
 传输资源。
+
+### BatchGet 总在途请求预算
+
+`NpuRuntime(..., batch_get_max_inflight_total=2048)` 默认限制单次 BatchGet 所有
+AIV 核合计的未确认 READ 数。小请求保留整批路径；大请求每核使用两个交叠组，
+完成最老组后补发。设为 0 可对照原实现。性能脚本接受 `--max-inflight-total`，
+或环境变量 `KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL`。修改预算需要重新 capture。
+Host、Python binding 和 Kernel 必须一起重编。详见
+[设计、统计和验证步骤](docs/batch_get_inflight_control.md)。
 
 ## AICPU 流水 GatherRead
 

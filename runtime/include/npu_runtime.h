@@ -4,10 +4,13 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "runtime.h"
 
 namespace kvaf {
+
+struct BatchGetKernelProfile;
 
 struct NpuRuntimeOptions {
   NpuRuntimeOptions(std::string kernel_object_path,
@@ -22,12 +25,31 @@ struct NpuRuntimeOptions {
   std::uint32_t batch_get_tokens_per_block;
   std::string batch_put_kernel_object_path;
   std::uint32_t device_id{0U};
-  std::uint32_t npu_core_count{1U};
+  std::uint32_t npu_core_count{2U};
   std::uint32_t jettys_per_core{2U};
   // Nonempty selects the optional AICPU UMDK data plane; AIV defaults stay unchanged.
   std::string aicpu_urma_kernel_json_path;
   std::string urma_device;
   std::uint32_t urma_eid_index{UINT32_MAX};
+  // Total submitted, unconfirmed READs per BatchGet launch; 0 disables control.
+  std::uint32_t batch_get_max_inflight_total{2048U};
+  // Optional strict local-EID list. Empty preserves automatic discovery and
+  // selects one working EID. Multiple entries create simultaneous BatchGet
+  // paths and stripe core/Jetty workers over them in list order. BatchPut
+  // remains on the first EID.
+  std::vector<std::string> npu_eids{};
+  // Opt-in startup BatchGet tuning over adaptive_peer_ub_devices. A K-side
+  // explicit device uses the native first-working path without tuning.
+  bool adaptive_ub_device{false};
+  // BatchGet request count used by adaptive tuning. Performance scripts can
+  // override it independently from the measured shape.
+  std::uint32_t adaptive_ub_miss_count{2048U};
+  // Optional N-side peer-device allowlist for adaptive tuning. It is ignored
+  // when the K-side service applies an explicit --ub-device filter.
+  std::vector<std::string> adaptive_peer_ub_devices{};
+  // Optional strict K-side UB device selected by an earlier Runtime process.
+  // Its EIDs remain connectivity fallbacks, but no bandwidth tuning is run.
+  std::string peer_ub_device{};
 };
 
 // NPU role Runtime. It owns the current MetaManager, NPU AccessOperator and
@@ -47,8 +69,13 @@ class NpuRuntime final : public Runtime {
   std::uint32_t device_id() const;
   std::uint32_t npu_core_count() const;
   std::uint32_t jettys_per_core() const;
+  const std::vector<std::string>& npu_eids() const;
   std::uint32_t batch_get_token_bytes() const;
   std::uint32_t batch_get_tokens_per_block() const;
+
+  Status SetBatchGetKernelProfiling(bool enabled);
+  Status CopyBatchGetKernelProfiles(
+      std::vector<BatchGetKernelProfile>* profiles) const;
 
   Status LinkTo(const LinkTarget& target) override;
   Status AcceptLink(const LinkTarget& peer) override;

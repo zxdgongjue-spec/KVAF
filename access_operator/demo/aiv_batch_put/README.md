@@ -58,7 +58,8 @@ KvafBatchPutTransportCreateWithPeerLink(host_ddr, host_ddr_bytes, aiv_core_count
                                         &transport);
 KvafBatchPutLocalBufferAcquire(transport, input_hbm, input_bytes, &local_buffer);
 
-KvafExecuteBatchPutSync(local_buffer, &args, stream, statuses, aiv_core_count);
+KvafExecuteBatchPutSync(local_buffer, &args, stream, statuses, aiv_core_count,
+                        nullptr);
 
 KvafBatchPutLocalBufferRelease(local_buffer);
 KvafBatchPutTransportDestroy(transport);

@@ -127,7 +127,8 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
     device_table = None
 
     def run_round(epoch: int, active_percent: int, raw_tensors: bool = False,
-                  synchronize: bool = True, profile: bool = False) -> tuple[int, int]:
+                  synchronize: bool = True, profile: bool = False,
+                  prefix_count: bool = False) -> tuple[int, int]:
         nonlocal device_table
         payload = bytearray(rng.randbytes(n * block_bytes))
         index_values = list(range(n))
@@ -136,7 +137,8 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
         rng.shuffle(row_values)
         row_values = [2 * row for row in row_values]
         offset_values = [rng.randrange(args.tokens_per_block) * token for _ in range(n)]
-        mask_values = [int((i + epoch) % 100 < active_percent) for i in range(n)]
+        mask_values = ([int(i < n * active_percent // 100) for i in range(n)] if prefix_count
+                       else [int((i + epoch) % 100 < active_percent) for i in range(n)])
         expected = bytearray([0xA5]) * (n * 2 * token)
         for i, enabled in enumerate(mask_values):
             if enabled:
@@ -162,9 +164,13 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
         device_table = runtime.access_table_view(table, device="npu")
         stream.synchronize()
         table_args = (device_table.addresses, device_table.valid) if raw_tensors else (device_table,)
+        selector = (torch.tensor([sum(mask_values)], dtype=torch.int32, device=device)
+                    if prefix_count else mask)
+        if prefix_count:
+            stream.synchronize()
         begin = time.perf_counter_ns()
         measured = runtime.batch_get(
-            *table_args, indices, offsets, mask, rows, output,
+            *table_args, indices, offsets, selector, rows, output,
             stream=stream, synchronize=synchronize, profile=profile,
         )
         elapsed = time.perf_counter_ns() - begin
@@ -193,6 +199,8 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
         for epoch, (active, raw) in enumerate(((100, False), (75, True), (0, False))):
             run_round(epoch, active, raw)
         run_round(3, 75, synchronize=False)
+        run_round(-2, 75, prefix_count=True)
+        run_round(-1, 0, prefix_count=True)
         for epoch in range(args.warmup):
             run_round(epoch + 4, args.active_percent)
         for epoch in range(args.iterations):

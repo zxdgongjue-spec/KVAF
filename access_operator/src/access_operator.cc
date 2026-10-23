@@ -1,10 +1,10 @@
 #include "access_operator.h"
-#include "batch_get_args.h"
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <utility>
@@ -17,15 +17,12 @@
 
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
 #include "batch_put_abi.h"
+#include "direct_hccp/direct_hccp_session.h"
 #include "kvaf_aiv_batch_put.h"
 #endif
 
 namespace kvaf {
 namespace {
-using detail::BatchGetExecutionState;
-using detail::BuildBatchGetKernelArgs;
-using detail::FitsU32;
-using detail::PointerValue;
 
 Status InvalidArgument(std::string message) {
   return Status::InvalidArgument(std::move(message));
@@ -39,6 +36,12 @@ Status Internal(std::string message) {
   return Status::Internal(std::move(message));
 }
 
+struct BatchGetExecutionState {
+  void* status{nullptr};
+  std::size_t status_bytes{0};
+  void* queue_state{nullptr};
+  std::size_t queue_state_bytes{0};
+};
 
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
 // BatchPut request metadata is transient from the caller's perspective, but
@@ -49,8 +52,10 @@ struct BatchPutExecutionState {
   void* metadata{nullptr};
   void* core_status{nullptr};
   std::size_t metadata_capacity{0};
-  std::vector<std::uint64_t> host_metadata;
-  std::vector<KvafBatchPutCoreStatus> host_core_status;
+  void* host_metadata{nullptr};
+  std::size_t host_metadata_capacity{0};
+  KvafBatchPutCoreStatus* host_core_status{nullptr};
+  std::size_t host_core_status_count{0};
 };
 
 void ReleaseBatchPutExecutionState(BatchPutExecutionState* execution) {
@@ -63,6 +68,12 @@ void ReleaseBatchPutExecutionState(BatchPutExecutionState* execution) {
   if (execution->metadata != nullptr) {
     (void)aclrtFree(execution->metadata);
   }
+  if (execution->host_core_status != nullptr) {
+    (void)aclrtFreeHost(execution->host_core_status);
+  }
+  if (execution->host_metadata != nullptr) {
+    (void)aclrtFreeHost(execution->host_metadata);
+  }
   *execution = BatchPutExecutionState{};
 }
 
@@ -72,9 +83,17 @@ Status InitializeBatchPutExecutionState(std::uint32_t npu_core_count,
     return InvalidArgument("invalid BatchPut execution state");
   }
   BatchPutExecutionState state;
-  state.host_core_status.resize(npu_core_count);
   const std::size_t status_bytes =
       static_cast<std::size_t>(npu_core_count) * sizeof(KvafBatchPutCoreStatus);
+  void* host_core_status = nullptr;
+  if (aclrtMallocHost(&host_core_status, status_bytes) != ACL_SUCCESS ||
+      host_core_status == nullptr) {
+    return Internal("failed to allocate pinned BatchPut core status buffer");
+  }
+  state.host_core_status =
+      static_cast<KvafBatchPutCoreStatus*>(host_core_status);
+  state.host_core_status_count = npu_core_count;
+  std::memset(state.host_core_status, 0, status_bytes);
   if (aclrtMalloc(&state.core_status, status_bytes,
                   ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
       aclrtMemset(state.core_status, status_bytes, 0, status_bytes) != ACL_SUCCESS) {
@@ -92,12 +111,23 @@ Status EnsureBatchPutMetadataCapacity(std::size_t rows,
                  (3U * sizeof(std::uint64_t))) {
     return InvalidArgument("BatchPut metadata dimensions are invalid");
   }
-  execution->host_metadata.resize(rows * 3U);
+  const std::size_t bytes = rows * 3U * sizeof(std::uint64_t);
+  if (rows > execution->host_metadata_capacity) {
+    void* host_metadata = nullptr;
+    if (aclrtMallocHost(&host_metadata, bytes) != ACL_SUCCESS ||
+        host_metadata == nullptr) {
+      return Internal("failed to grow pinned BatchPut host metadata buffer");
+    }
+    if (execution->host_metadata != nullptr) {
+      (void)aclrtFreeHost(execution->host_metadata);
+    }
+    execution->host_metadata = host_metadata;
+    execution->host_metadata_capacity = rows;
+  }
   if (rows <= execution->metadata_capacity) {
     return Status::OK();
   }
 
-  const std::size_t bytes = rows * 3U * sizeof(std::uint64_t);
   void* metadata = nullptr;
   if (aclrtMalloc(&metadata, bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
     return Internal("failed to grow BatchPut device metadata buffers");
@@ -121,16 +151,106 @@ void LogBatchPutDeviceStatus(const BatchPutExecutionState& execution,
     std::fprintf(stderr,
                  "[KVAF_AIV] BATCH_PUT_DEVICE_ERROR core=%u magic=0x%llx "
                  "result=%llu processed=%llu failed_request=%llu cq_status=%llu "
-                 "cq_sub_status=%llu\n",
+                 "cq_sub_status=%llu completed_batches=%llu sq_pi=%llu cq_ci=%llu "
+                 "last_wqe=0x%llx\n",
                  core, static_cast<unsigned long long>(status.magic),
                  static_cast<unsigned long long>(status.result),
                  static_cast<unsigned long long>(status.processed_request_count),
                  static_cast<unsigned long long>(status.failed_request_index),
                  static_cast<unsigned long long>(status.cq_status),
-                 static_cast<unsigned long long>(status.cq_sub_status));
+                 static_cast<unsigned long long>(status.cq_sub_status),
+                 static_cast<unsigned long long>(status.completed_batch_count),
+                 static_cast<unsigned long long>(status.sq_producer_index),
+                 static_cast<unsigned long long>(status.cq_consumer_index),
+                 static_cast<unsigned long long>(status.last_wqe_protocol));
   }
 }
 #endif
+
+std::uint64_t PointerValue(const void* pointer) {
+  return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(pointer));
+}
+
+bool FitsU32(std::uint64_t value) {
+  return value <= std::numeric_limits<std::uint32_t>::max();
+}
+
+Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
+                               std::uint32_t npu_core_count,
+                               std::uint32_t jettys_per_core,
+                               std::uint32_t max_inflight_total,
+                               const BatchGetExecutionState& execution,
+                               KvafExecuteBatchGetKernelArgs* arguments) {
+  if (exec.request == nullptr || arguments == nullptr) {
+    return InvalidArgument("BatchGet request and arguments must not be null");
+  }
+  const BatchGetRequest& request = *exec.request;
+  if (!request.indices.has_elements<std::int32_t>() ||
+      !request.offsets.has_elements<std::int32_t>() ||
+      !request.output_indices.has_elements<std::int32_t>() ||
+      !request.output.valid() ||
+      request.output_block_bytes == 0 ||
+      request.tokens_per_block == 0 ||
+      request.output.bytes % request.output_block_bytes != 0 ||
+      request.indices.device != request.offsets.device ||
+      request.indices.device != request.output_indices.device ||
+      request.indices.device != request.output.device ||
+      request.indices.device != DeviceKind::kNpu ||
+      request.output_indices.device != DeviceKind::kNpu ||
+      !request.miss_count.has_elements<std::int32_t>() ||
+      request.miss_count.bytes != sizeof(std::int32_t) ||
+      request.miss_count.device != DeviceKind::kNpu ||
+      request.output.device != DeviceKind::kNpu ||
+      request.device_access_table.addresses.device != DeviceKind::kNpu ||
+      request.device_access_table.valid.device != DeviceKind::kNpu ||
+      request.device_access_table.addresses.bytes == 0 ||
+      request.device_access_table.addresses.bytes % sizeof(Address) != 0 ||
+      request.device_access_table.valid.bytes !=
+          request.device_access_table.addresses.bytes / sizeof(Address) ||
+      request.indices.bytes % sizeof(std::int32_t) != 0 ||
+      request.offsets.bytes != request.indices.bytes ||
+      request.output_indices.bytes != request.indices.bytes ||
+      execution.status == nullptr ||
+      execution.status_bytes < static_cast<std::size_t>(npu_core_count) *
+                                   sizeof(KvafBatchGetCoreStatus) ||
+      execution.queue_state == nullptr ||
+      execution.queue_state_bytes <
+          static_cast<std::size_t>(npu_core_count) * jettys_per_core *
+              sizeof(KvafBatchGetQueueState)) {
+    return InvalidArgument("BatchGet request does not satisfy the NPU buffer contract");
+  }
+
+  const std::size_t request_count = request.indices.bytes / sizeof(std::int32_t);
+  const std::size_t output_rows = request.output.bytes / request.output_block_bytes;
+  const std::size_t device_table_entries =
+      request.device_access_table.addresses.bytes / sizeof(Address);
+  if (!FitsU32(device_table_entries) || !FitsU32(request_count) ||
+      !FitsU32(output_rows) || !FitsU32(request.output_block_bytes) ||
+      !FitsU32(request.tokens_per_block)) {
+    return InvalidArgument("BatchGet dimensions exceed the device ABI");
+  }
+  *arguments = KvafExecuteBatchGetKernelArgs{};
+  arguments->address_table = PointerValue(request.device_access_table.addresses.data);
+  arguments->valid_table = PointerValue(request.device_access_table.valid.data);
+  arguments->indices = PointerValue(request.indices.data);
+  arguments->offsets = PointerValue(request.offsets.data);
+  arguments->miss_count = PointerValue(request.miss_count.data);
+  arguments->output_indices = PointerValue(request.output_indices.data);
+  arguments->output = PointerValue(request.output.data);
+  arguments->core_status = PointerValue(execution.status);
+  arguments->queue_state = PointerValue(execution.queue_state);
+  arguments->table_capacity = static_cast<std::uint32_t>(device_table_entries);
+  arguments->request_capacity = static_cast<std::uint32_t>(request_count);
+  arguments->output_rows = static_cast<std::uint32_t>(output_rows);
+  arguments->token_bytes =
+      static_cast<std::uint32_t>(request.output_block_bytes);
+  arguments->tokens_per_block =
+      static_cast<std::uint32_t>(request.tokens_per_block);
+  arguments->block_count = npu_core_count;
+  arguments->jettys_per_core = jettys_per_core;
+  arguments->batch_get_max_inflight_total = max_inflight_total;
+  return Status::OK();
+}
 
 void LogBatchGetDeviceStatus(const BatchGetExecutionState& execution,
                              std::uint32_t npu_core_count) {
@@ -191,21 +311,44 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
       impl_->config.npu_core_count == 0 ||
       impl_->config.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->config.jettys_per_core == 0 ||
-      impl_->config.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE) {
+      impl_->config.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
+      (impl_->config.batch_get_max_inflight_total != 0U &&
+       impl_->config.batch_get_max_inflight_total < 2U * impl_->config.npu_core_count)) {
     return InvalidArgument("invalid AccessOperator initialization config");
   }
   if (impl_->config.peer_link == nullptr) {
     return InvalidState("AccessOperator requires an established Runtime Link");
   }
-  if (std::all_of(impl_->config.peer_local_eid.begin(),
+  const std::size_t worker_count =
+      static_cast<std::size_t>(impl_->config.npu_core_count) *
+      impl_->config.jettys_per_core;
+  if (impl_->config.peer_local_eids.empty() &&
+      std::any_of(impl_->config.peer_local_eid.begin(),
                   impl_->config.peer_local_eid.end(),
-                  [](std::uint8_t value) { return value == 0U; })) {
-    return InvalidArgument("Runtime Link requires a Runtime-selected local EID");
+                  [](std::uint8_t value) { return value != 0U; })) {
+    impl_->config.peer_local_eids.push_back(impl_->config.peer_local_eid);
+  }
+  if (impl_->config.peer_local_eids.empty() ||
+      impl_->config.peer_local_eids.size() > worker_count ||
+      std::any_of(impl_->config.peer_local_eids.begin(),
+                  impl_->config.peer_local_eids.end(),
+                  [](const auto& eid) {
+                    return std::all_of(eid.begin(), eid.end(),
+                                       [](std::uint8_t value) { return value == 0U; });
+                  })) {
+    return InvalidArgument("Runtime Link requires valid Runtime-selected local EIDs");
   }
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
+  const std::uint32_t batch_put_jettys_per_core =
+      impl_->config.batch_put_jettys_per_core == 0U
+          ? std::min(
+                impl_->config.jettys_per_core,
+                static_cast<std::uint32_t>(
+                    KVAF_AIV_BATCH_PUT_MAX_JETTYS_PER_CORE))
+          : impl_->config.batch_put_jettys_per_core;
   if (!impl_->config.batch_put_kernel_object_path.empty() &&
       (impl_->config.npu_core_count > KVAF_AIV_BATCH_PUT_MAX_AIV_CORES ||
-       impl_->config.jettys_per_core >
+       batch_put_jettys_per_core >
            KVAF_AIV_BATCH_PUT_MAX_JETTYS_PER_CORE)) {
     return InvalidArgument("invalid BatchPut transport configuration");
   }
@@ -217,10 +360,17 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
   }
 
   KvafBatchGetTransport* transport = nullptr;
-  const int32_t result = KvafBatchGetTransportCreateWithPeerLink(
+  static_assert(sizeof(impl_->config.peer_local_eids.front()) == 16U,
+                "NPU EID storage must remain packed");
+  const auto* peer_local_eids = reinterpret_cast<const std::uint8_t*>(
+      impl_->config.peer_local_eids.data());
+  const auto peer_local_eid_count =
+      static_cast<std::uint32_t>(impl_->config.peer_local_eids.size());
+  const int32_t result = KvafBatchGetTransportCreateWithPeerLinkMultiEid(
       reinterpret_cast<void*>(remote_region.base), remote_region.length,
       impl_->config.npu_core_count, impl_->config.jettys_per_core,
-      impl_->config.peer_link.get(), impl_->config.peer_local_eid.data(), &transport);
+      impl_->config.peer_link.get(), peer_local_eids, peer_local_eid_count,
+      &transport);
   if (result != KVAF_BATCH_GET_SUCCESS || transport == nullptr) {
     return Internal("failed to create reusable BatchGet transport");
   }
@@ -265,7 +415,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     KvafBatchPutTransport* batch_put_transport = nullptr;
     const int32_t batch_put_result = KvafBatchPutTransportCreateWithPeerLink(
         reinterpret_cast<void*>(remote_region.base), remote_region.length,
-        impl_->config.npu_core_count, impl_->config.jettys_per_core,
+        impl_->config.npu_core_count, batch_put_jettys_per_core,
         impl_->config.peer_link.get(), impl_->config.peer_local_eid.data(),
         &batch_put_transport);
     if (batch_put_result != KVAF_BATCH_PUT_SUCCESS ||
@@ -296,7 +446,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
                  "jettys_per_core=%u "
                  "metadata_staging=reusable\n",
                  impl_->config.npu_core_count,
-                 impl_->config.jettys_per_core);
+                 batch_put_jettys_per_core);
   }
 #endif
   impl_->initialized = true;
@@ -344,7 +494,7 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   KvafExecuteBatchGetKernelArgs arguments{};
   Status status = BuildBatchGetKernelArgs(
       exec, impl_->config.npu_core_count, impl_->config.jettys_per_core,
-      impl_->execution, &arguments);
+      impl_->config.batch_get_max_inflight_total, impl_->execution, &arguments);
   if (!status.ok()) {
     return status;
   }
@@ -378,6 +528,94 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
     // Releasing after an externally captured launch keeps KVAF graph-agnostic;
     // the caller owns stream completion and tensor lifetime.
     KvafBatchGetLocalBufferRelease(local_buffer);
+  }
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::SetBatchGetKernelProfiling(bool enabled) {
+  if (!impl_->initialized || impl_->execution.status == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  std::vector<KvafBatchGetCoreStatus> statuses(
+      impl_->config.npu_core_count);
+  if (enabled) {
+    for (KvafBatchGetCoreStatus& status : statuses) {
+      status.profile.magic = KVAF_AIV_BATCH_GET_PROFILE_MAGIC;
+    }
+  }
+  if (aclrtMemcpy(impl_->execution.status, impl_->execution.status_bytes,
+                  statuses.data(), statuses.size() * sizeof(statuses.front()),
+                  ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
+    return Internal("failed to configure BatchGet kernel profiling");
+  }
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
+    std::vector<BatchGetKernelProfile>* profiles) const {
+  if (profiles == nullptr) {
+    return InvalidArgument("BatchGet kernel profile output must not be null");
+  }
+  if (!impl_->initialized || impl_->execution.status == nullptr) {
+    return Status::Error(StatusCode::kNotInitialized,
+                         "AccessOperator has not been initialized");
+  }
+  std::vector<KvafBatchGetCoreStatus> statuses(
+      impl_->config.npu_core_count);
+  if (aclrtMemcpy(statuses.data(), statuses.size() * sizeof(statuses.front()),
+                  impl_->execution.status, impl_->execution.status_bytes,
+                  ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
+    return Internal("failed to copy BatchGet kernel profiles");
+  }
+  profiles->clear();
+  profiles->reserve(statuses.size());
+  for (const KvafBatchGetCoreStatus& status : statuses) {
+    const KvafBatchGetCoreProfile& source = status.profile;
+    const bool invalid_doorbell =
+        (source.first_doorbell_cycle != 0U &&
+         (source.first_doorbell_cycle < source.compact_done_cycle ||
+          source.first_doorbell_cycle > source.post_done_cycle)) ||
+        (status.result == 0U && source.active_requests != 0U &&
+         source.first_doorbell_cycle == 0U) ||
+        (source.active_requests == 0U &&
+         source.first_doorbell_cycle != 0U);
+    if (status.magic != KVAF_AIV_BATCH_GET_STATUS_MAGIC ||
+        status.result != 0U ||
+        source.magic != KVAF_AIV_BATCH_GET_PROFILE_MAGIC ||
+        source.kernel_start_cycle > source.setup_done_cycle ||
+        source.setup_done_cycle > source.compact_done_cycle ||
+        source.compact_done_cycle > source.post_done_cycle ||
+        source.post_done_cycle > source.completion_done_cycle ||
+        source.completion_done_cycle > source.kernel_finish_cycle ||
+        invalid_doorbell) {
+      profiles->clear();
+      return Internal("BatchGet kernel returned an invalid profile timeline");
+    }
+    BatchGetKernelProfile destination;
+    destination.kernel_start_cycle = source.kernel_start_cycle;
+    destination.setup_done_cycle = source.setup_done_cycle;
+    destination.compact_done_cycle = source.compact_done_cycle;
+    destination.first_doorbell_cycle = source.first_doorbell_cycle;
+    destination.post_done_cycle = source.post_done_cycle;
+    destination.completion_done_cycle = source.completion_done_cycle;
+    destination.kernel_finish_cycle = source.kernel_finish_cycle;
+    destination.active_requests = source.active_requests;
+    destination.total_posts = source.total_posts;
+    destination.submitted_group_count = source.submitted_group_count;
+    destination.completed_group_count = source.completed_group_count;
+    destination.completion_count = source.completion_count;
+    destination.post_active_cycles = source.post_active_cycles;
+    destination.drain_wait_cycles = source.drain_wait_cycles;
+    destination.peak_submitted_not_drained = source.peak_submitted_not_drained;
+    for (std::size_t jetty = 0;
+         jetty < destination.jetty_completion_wait_cycles.size(); ++jetty) {
+      destination.jetty_completion_wait_cycles[jetty] =
+          source.jetty_completion_wait_cycles[jetty];
+      destination.jetty_completion_polls[jetty] =
+          source.jetty_completion_polls[jetty];
+    }
+    profiles->push_back(destination);
   }
   return Status::OK();
 }
@@ -422,7 +660,8 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
     if (!status.ok()) {
       return status;
     }
-    std::uint64_t* const host_offsets = execution.host_metadata.data();
+    std::uint64_t* const host_offsets =
+        static_cast<std::uint64_t*>(execution.host_metadata);
     std::uint64_t* const host_lengths = host_offsets + rows;
     std::uint64_t* const host_destinations = host_lengths + rows;
     std::copy(exec.request->input_offsets.begin(),
@@ -434,11 +673,6 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
     }
 
     const std::size_t metadata_bytes = rows * 3U * sizeof(std::uint64_t);
-    if (aclrtMemcpy(execution.metadata, metadata_bytes,
-                    execution.host_metadata.data(), metadata_bytes,
-                    ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
-      return Internal("failed to upload BatchPut metadata to NPU");
-    }
 
     KvafBatchPutLocalBuffer* local_buffer = nullptr;
     if (KvafBatchPutLocalBufferAcquire(
@@ -448,6 +682,7 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
       return Internal("failed to acquire caller input for BatchPut");
     }
 
+    const aclrtStream stream = static_cast<aclrtStream>(exec.execution.stream);
     KvafExecuteBatchPutKernelArgs arguments{};
     arguments.input = PointerValue(exec.request->input.data);
     arguments.input_offsets = PointerValue(execution.metadata);
@@ -462,14 +697,25 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
     arguments.row_count = static_cast<std::uint32_t>(rows);
     arguments.aiv_core_count = impl_->config.npu_core_count;
 
-    for (KvafBatchPutCoreStatus& core_status : execution.host_core_status) {
-      core_status = KvafBatchPutCoreStatus{};
+    std::memset(execution.host_core_status, 0,
+                execution.host_core_status_count *
+                    sizeof(KvafBatchPutCoreStatus));
+    if (aclrtMemcpyAsync(execution.metadata, metadata_bytes,
+                         execution.host_metadata, metadata_bytes,
+                         ACL_MEMCPY_HOST_TO_DEVICE, stream) != ACL_SUCCESS) {
+      KvafBatchPutLocalBufferRelease(local_buffer);
+      return Internal("failed to enqueue BatchPut metadata upload to NPU");
     }
+
     const int32_t result = KvafExecuteBatchPutSync(
-        local_buffer, &arguments,
-        static_cast<aclrtStream>(exec.execution.stream),
-        execution.host_core_status.data(),
-        static_cast<std::uint32_t>(execution.host_core_status.size()));
+        local_buffer, &arguments, stream, execution.host_core_status,
+        static_cast<std::uint32_t>(execution.host_core_status_count));
+    if (result != KVAF_BATCH_PUT_SUCCESS) {
+      // The metadata upload may have been accepted even when launch or status
+      // setup subsequently failed. Do not reuse its pinned source buffer until
+      // the stream has stopped reading it.
+      (void)aclrtSynchronizeStream(stream);
+    }
     KvafBatchPutLocalBufferRelease(local_buffer);
     if (result != KVAF_BATCH_PUT_SUCCESS) {
       LogBatchPutDeviceStatus(execution, impl_->config.npu_core_count, result);

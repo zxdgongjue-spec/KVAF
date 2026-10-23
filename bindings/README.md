@@ -25,23 +25,35 @@ buffer 写入地址稳定的 NPU tensor，再调用 `replay`。`source` 的所�
 `DeviceAccessTable`，其中保存 NPU `addresses` / `valid` Tensor；
 `NpuRuntime.prepare_access_table` 同时接受 Python key 序列或一维、连续的 CPU
 `torch.int64` Tensor；大表应使用后者，避免 Python 逐元素转换。
-`NpuRuntime.batch_get(device_access_table, indices, offsets, mask, output_indices,
-output, stream=None, synchronize=False)` 直接接收 NPU Tensor，也支持
-`batch_get(addresses, valid, indices, offsets, mask, output_indices, output, ...)`
+`NpuRuntime.batch_get(device_access_table, indices, offsets, miss_count,
+output_indices, output, stream=None, synchronize=False)` 直接接收 NPU Tensor，也支持
+`batch_get(addresses, valid, indices, offsets, miss_count, output_indices, output, ...)`
 重载，以使用调用方持有的设备表 Tensor。它不暴露 data pointer、字节数、
 output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数由 output Tensor
 第 0 维之后的连续元素推导，并必须与配置的 `batch_get_token_bytes`
-一致；接口不返回伪装成完成时间的数值。
+一致。`miss_count` 必须是单元素 `torch.int32` NPU Tensor，仅请求数组的
+`[0, miss_count)` 前缀参与搬运。
 
 `NpuRuntime(batch_get_kernel_object_path, batch_get_token_bytes,
-batch_get_tokens_per_block, device_id=0, npu_core_count=1,
-batch_put_kernel_object_path="", jettys_per_core=2)` 要求显式传入单 token KV
+batch_get_tokens_per_block, device_id=0, npu_core_count=2,
+batch_put_kernel_object_path="", jettys_per_core=2, npu_eids=[],
+adaptive_ub_device=False, adaptive_ub_miss_count=2048, peer_ub_device="",
+adaptive_peer_ub_devices=[], batch_get_max_inflight_total=2048)`
+要求显式传入单 token KV
 字节数和每个 KV block 中的 token 数，两个参数均无默认值；
 每个 AccessTable entry 大小为两者乘积。
-`jettys_per_core` 参数同时
-配置 BatchGet 和 BatchPut 每个 AIV core 使用的 Jetty 数量，可选 1 或 2 个独立 Jetty。
-远程 CPU DDR 只增加 `runtime.link_to("CPU_IP:port")`，必须在 `initialize` 前调用；
-EID、UMDK device 与候选 RMA 验证由 C++ Runtime 自动完成，Python 不传递这些硬件细节。
+`jettys_per_core` 配置 BatchGet 每个 AIV core 使用的 Jetty 数量，可选 1 到 64 个独立
+Jetty。BatchPut 保持原有实现：该值为 1 或 2 时使用相同数量，BatchGet 配置为 3 到
+64 时 BatchPut 仍使用 2 个。
+`batch_get_max_inflight_total` 是单次 BatchGet 所有 AIV 核的总请求预算，默认
+2048；0 使用整批提交基线，非零值须至少为 `2 * npu_core_count`。大请求采用
+双组交叠提交，预算变化需新建 Runtime/graph，详见
+[在途控制](../docs/batch_get_inflight_control.md)。
+远程 CPU DDR 只增加 `runtime.link_to("CPU_IP:port")`，必须在 `initialize` 前调用。
+`npu_eids=[]` 时 EID、UMDK device 与候选 RMA 验证由 C++ Runtime 自动完成；
+显式传入多个 32 位十六进制 EID 时，Runtime 为每个 EID 创建独立
+BatchGet 路径，并把 core/Jetty worker 轮转分配到这些路径。BatchPut
+保持原有单 EID 实现，使用列表第一项。该列表是严格配置，不会静默回退。
 `batch_put(keys, packed_input, input_offsets, lengths, stream=None)` 接收 caller-owned
 NPU packed input 和每条 block 的 CPU 整数 metadata；同步写入完成后才返回。未传
 BatchPut kernel 时，该方法保留 ACL D2H mock，便于只验证 BatchGet 的构建。
@@ -54,3 +66,10 @@ stream 时使用 `torch.npu.current_stream()`。KVAF 不创建、不保存或销
 Binding 不负责 vLLM 适配。后续只在 Runtime、Meta Manager 和 KV Access Operator 的 C++ 接口稳定后，将需要暴露的类和方法注册到 Python。
 
 CacheOS-vLLM Adaptor 属于 vLLM 侧实现，不放在本目录。
+
+`adaptive_ub_device=True` 在启动时进行 BatchGet 标定，token 大小沿用
+`batch_get_token_bytes`，请求数由 `adaptive_ub_miss_count` 指定，并为当前 Runtime
+固定最佳组合。K 端未指定设备时，性能脚本从 `KVAF_ADAPTIVE_UB_DEVICES` 中筛选；
+K 端指定单个 `--ub-device` 时走原生路径。`peer_ub_device="NAME"` 用于跨进程复用
+选择结果且不重新标定。默认关闭；用法与协议升级要求见
+[Runtime 启动选优说明](../runtime/README.md#可选启动-ub-device-选优)。

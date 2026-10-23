@@ -26,9 +26,11 @@ void VerboseLog(const char* format, ...);
 bool AcquireDirectHccpSession(uint32_t physical_device_id, uint32_t hdc_type,
                               DirectHccpSession **session);
 
-// Releases a reference. The last release tears down only RA instances owned by
-// KVAF; a borrowed HCCL device RA remains live. Callers keep ownership of their
-// own data-plane resources.
+// Releases a logical transport reference. The RA/HDC bootstrap remains
+// process-owned after its first successful initialization: CANN has no close
+// counterpart for rtOpenNetService and can retain service/TLS callbacks beyond
+// an individual Runtime teardown. Callers still destroy their own RaCtx,
+// token, MR, CQ, Jetty and TP resources before releasing this lease.
 void ReleaseDirectHccpSession(DirectHccpSession *session);
 
 }  // namespace kvaf::direct_hccp

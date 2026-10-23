@@ -262,10 +262,14 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
   }
   const std::size_t request_count =
       request.indices.bytes / sizeof(std::int32_t);
-  if (!request.mask.empty() &&
-      (!request.mask.valid() || request.mask.bytes != request_count ||
-       request.mask.device != request.indices.device)) {
-    return Status::InvalidArgument("mask must match indices when provided");
+  if (request.mask.data != nullptr) {
+    if (request.indices.device != DeviceKind::kNpu || request.mask.device != DeviceKind::kNpu ||
+        request.mask.bytes != request_count || request.miss_count.data != nullptr)
+      return Status::InvalidArgument("AICPU mask must match request capacity and exclude miss_count");
+  } else if (!request.miss_count.has_elements<std::int32_t>() ||
+             request.miss_count.bytes != sizeof(std::int32_t) ||
+             request.miss_count.device != request.indices.device) {
+    return Status::InvalidArgument("miss_count must be a single int32 on the BatchGet device");
   }
   if (!request.output.valid() ||
       request.output_block_bytes == 0 ||
@@ -276,6 +280,15 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
       request.indices.device != request.output_indices.device ||
       request.indices.device != request.output.device) {
     return Status::InvalidArgument("BatchGet input and output buffers must share a device");
+  }
+
+  if (request.indices.device == DeviceKind::kCpu) {
+    const std::int32_t miss_count =
+        *static_cast<const std::int32_t*>(request.miss_count.data);
+    if (miss_count < 0 || static_cast<std::size_t>(miss_count) > request_count) {
+      return Status::InvalidArgument(
+          "miss_count must be between zero and the BatchGet request capacity");
+    }
   }
 
   if (request.indices.device == DeviceKind::kNpu) {
@@ -348,7 +361,6 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
           "BatchPut input_offsets and lengths must describe bytes inside input");
     }
   }
-
   PutContext put_context;
   PutAccessDesc put_desc;
   Status status = meta_manager_.PreparePut(request.keys, request.lengths,
@@ -363,8 +375,11 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
     (void)meta_manager_.AbortPut(put_context);
     return status;
   }
-
-  return meta_manager_.CommitPut(put_context);
+  status = meta_manager_.CommitPut(put_context);
+  if (!status.ok()) {
+    return status;
+  }
+  return Status::OK();
 }
 
 Status RuntimeCore::BatchFree(const BatchFreeRequest& request) {
