@@ -48,6 +48,10 @@ class PeerLink {
   Status LookupRegion(uint64_t base, PeerRegion* region) const;
   Status EnableDirectGather(uint64_t region_base) const;
   Status EnableGatherLanes(uint64_t region_base, uint64_t control_address, uint32_t lanes) const;
+  Status OpenCpuPushGet(uint64_t region_base, OpenCpuPushGetRequest request,
+                        OpenCpuPushGetResponse* response) const;
+  Status StartCpuPushGet(uint64_t region_base) const;
+  Status StopCpuPushGet(uint64_t region_base) const;
   Status CreateChannel(
       uint64_t region_base, const uint8_t local_qp_key[kQpKeyBytes],
       uint32_t local_qp_key_bytes, const uint8_t local_eid[kEidBytes],

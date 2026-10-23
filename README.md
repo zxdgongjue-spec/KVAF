@@ -306,3 +306,6 @@ Host、Python binding 和 Kernel 必须一起重编。详见
 ## AICPU 流水 GatherRead
 
 现有 Python `NpuRuntime.batch_get` 可选择 CPU gather + AICPU UMDK READ 流水后端，构建和用法见 [AICPU 流水 BatchGet](docs/aicpu_gather_read.md)。
+
+设置 `aicpu_batch_get_mode="cpu_push_scatter"` 可使用 Host direct HCCP 建链、CPU SGL WRITE 到连续 HBM、
+AICPU 本地 scatter 的路径，详见 [CPU 回推 BatchGet](docs/aicpu_cpu_push_scatter.md)。

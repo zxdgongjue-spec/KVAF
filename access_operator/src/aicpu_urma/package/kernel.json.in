@@ -1,4 +1,5 @@
 {
+@KVAF_AICPU_CPU_PUSH_ENTRY@
   "KvafAicpuGatherRead": {
     "opInfo": {
       "functionName": "KvafAicpuGatherRead",

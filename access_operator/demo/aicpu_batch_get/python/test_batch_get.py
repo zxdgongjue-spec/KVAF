@@ -16,6 +16,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device-id", type=int, default=7)
     parser.add_argument("--peer", default="127.0.0.1:28990")
     parser.add_argument("--workers", type=int, nargs="+", default=[1, 2, 4])
+    parser.add_argument("--modes", nargs="+", choices=["gather_read", "cpu_push_scatter"],
+                        default=["gather_read"])
+    parser.add_argument("--npu-eid", help="optional single NPU EID for cpu_push_scatter")
+    parser.add_argument("--output-row-step", type=int, choices=[1, 2], default=2,
+                        help="1 checks adjacent output rows; 2 leaves one guard row between outputs")
     parser.add_argument("--blocks", type=int, default=4096)
     parser.add_argument("--token-bytes", type=int, default=656)
     parser.add_argument("--tokens-per-block", type=int, default=2)
@@ -61,16 +66,17 @@ def percentile(values: list[float], fraction: float) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
-def print_profile(samples: list[dict]) -> None:
+def print_profile(samples: list[dict], mode: str) -> None:
     def mean(key: str, rows: list[dict]) -> float:
         return statistics.mean(row[key] for row in rows)
 
     def fields(rows: list[dict], keys: tuple[str, ...]) -> str:
         return " ".join(f"{key}={mean(key, rows):.1f}" for key in keys)
 
-    print(f"AICPU_BATCH_GET_PROFILE workers={len(samples[0]['workers'])} "
+    print(f"AICPU_BATCH_GET_PROFILE mode={mode} workers={len(samples[0]['workers'])} "
           f"rounds={len(samples)} warmup=1 "
-          "aggregation=mean_per_worker units=us output_payload_flushes=0 "
+          "aggregation=mean_per_worker units=us "
+          f"output_payload_flushes={2 if mode == 'cpu_push_scatter' else 0} "
           "instrumented_rounds_excluded_from_bandwidth=1")
     print("  Python " + fields(samples, ("python_call_us", "binding_prepare_us", "native_call_us",
                                        "binding_total_us", "python_other_us")))
@@ -88,6 +94,8 @@ def print_profile(samples: list[dict]) -> None:
                                                 "post_us", "cq_wait_us")))
         print("    Counts " + fields(rows, ("bytes", "spans", "read_wqes", "post_calls",
                                            "ready_queries")))
+        if mode == "cpu_push_scatter":
+            print("    Push " + fields(rows, ("scatter_us", "output_cache_us")))
     print("  Timing: Host phases sum to Host total; Host wait includes queued device work/D2H. "
           "Worker intervals overlap. Cache times are inside request; READ phases are inside read. "
           "ready_wait includes CPU gather overlap, not a separate CPU gather measurement. "
@@ -95,7 +103,8 @@ def print_profile(samples: list[dict]) -> None:
           "and profile dictionary conversion. Host/device clocks are not subtracted.", flush=True)
 
 
-def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object) -> None:
+def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object,
+             mode: str = "gather_read") -> None:
     device = f"npu:{args.device_id}"
     n, token = args.blocks, args.token_bytes
     block_bytes = token * args.tokens_per_block
@@ -113,6 +122,8 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
         aicpu_urma_kernel_json_path=args.kernel_json,
         urma_device=args.urma_device,
         urma_eid_index=args.eid_index,
+        aicpu_batch_get_mode=mode,
+        npu_eids=[args.npu_eid] if mode == "cpu_push_scatter" and args.npu_eid else [],
     )
     # Reuse registered allocations while changing their contents each round.
     source = torch.empty((n, block_bytes), dtype=torch.uint8, device=device)
@@ -134,7 +145,7 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
         row_values = list(range(n))
         rng.shuffle(index_values)
         rng.shuffle(row_values)
-        row_values = [2 * row for row in row_values]
+        row_values = [args.output_row_step * row for row in row_values]
         offset_values = [rng.randrange(args.tokens_per_block) * token for _ in range(n)]
         active_count = n * active_percent // 100
         expected = bytearray([0xA5]) * (n * 2 * token)
@@ -187,7 +198,7 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
     try:
         runtime.link_to(args.peer)
         runtime.initialize(ddr_bytes=(n * 2 + 1) * block_bytes, slot_size=block_bytes)
-        print(f"AICPU_BATCH_GET_BEGIN workers={workers} blocks={n} token_bytes={token}", flush=True)
+        print(f"AICPU_BATCH_GET_BEGIN mode={mode} workers={workers} blocks={n} token_bytes={token}", flush=True)
         # Exercise both Python overloads, partial prefixes and the empty-request path.
         for epoch, (active, raw) in enumerate(((100, False), (75, True), (0, False))):
             run_round(epoch, active, raw)
@@ -211,7 +222,7 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
     samples_us = [value / 1000 for value in samples_ns]
     bandwidth = sum(payload_bytes) / sum(samples_ns)  # bytes/ns == decimal GB/s.
     print(
-        f"AICPU_BATCH_GET_PASS workers={workers} iterations={args.iterations} "
+        f"AICPU_BATCH_GET_PASS mode={mode} workers={workers} iterations={args.iterations} "
         f"mean_us={statistics.mean(samples_us):.1f} "
         f"p50_us={percentile(samples_us, 0.50):.1f} "
         f"p95_us={percentile(samples_us, 0.95):.1f} "
@@ -221,7 +232,7 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
         flush=True,
     )
     if profiles:
-        print_profile(profiles)
+        print_profile(profiles, mode)
 
 
 def main() -> None:
@@ -236,8 +247,9 @@ def main() -> None:
         "input_preparation_batch_put_table_setup_and_verification_excluded=1",
         flush=True,
     )
-    for workers in args.workers:
-        run_case(args, workers, torch, kvaf)
+    for mode in args.modes:
+        for workers in args.workers:
+            run_case(args, workers, torch, kvaf, mode)
 
 
 if __name__ == "__main__":

@@ -91,6 +91,8 @@ bool EnumerateEndpoints(const Api& api, const char* requested_device, std::uint3
 struct QueueOptions {
   std::uint32_t cq_depth, receive_depth, max_sge;
   bool lock_free;
+  // CPU SGL initiators need explicit remote-SGE/retry limits even with locks.
+  bool initiator{false};
 };
 
 template <typename Api>
@@ -117,7 +119,7 @@ const char* CreateQueues(const Api& api, urma_context_t* context, std::uint32_t 
   cfg.jfs_cfg.trans_mode = URMA_TM_RM;
   cfg.jfs_cfg.flag.bs.lock_free = options.lock_free;
   cfg.jfs_cfg.max_sge = options.max_sge;
-  if (options.lock_free) {
+  if (options.lock_free || options.initiator) {
     cfg.jfs_cfg.max_rsge = 1;
     cfg.jfs_cfg.priority = URMA_MAX_PRIORITY;
     cfg.jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;

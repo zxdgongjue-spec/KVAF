@@ -28,6 +28,9 @@ enum class Command : uint16_t {
   kEnableDirectGather = 9U,
   kEnableGatherLanes = 10U,
   kGetCandidateInfo = 5U,
+  kOpenCpuPushGet = 11U,
+  kStartCpuPushGet = 12U,
+  kStopCpuPushGet = 13U,
 };
 
 enum class Result : int32_t {
@@ -135,6 +138,30 @@ struct EnableGatherLanesRequest {
   uint64_t control_address;
   uint32_t lanes;
 };
+// CPU-initiated transfers target Host-registered HBM. Setup completes before
+// the separate start command permits the CPU worker to issue any DMA.
+struct CpuPushChannelKey {
+  uint32_t bytes;
+  uint8_t key[kQpKeyBytes];
+};
+struct OpenCpuPushGetRequest {
+  MessageHeader header;
+  uint64_t session_id, source_bytes, hbm_base, hbm_bytes, npu_tp;
+  uint32_t npu_psn, token_value, segment_bytes, token_bytes, workers;
+  uint8_t eid[kEidBytes], segment[kSegKeyBytes];
+  CpuPushChannelKey channels[4];
+};
+struct OpenCpuPushGetResponse {
+  MessageHeader header;
+  int32_t result;
+  uint64_t cpu_tp;
+  uint32_t cpu_psn;
+  CpuPushChannelKey channels[4];
+};
+struct CpuPushGetSessionRequest {
+  MessageHeader header;
+  uint64_t session_id;
+};
 #pragma pack(pop)
 
 static_assert(sizeof(MessageHeader) == 12U, "wire header ABI changed");
@@ -146,6 +173,9 @@ static_assert(sizeof(CandidateInfoResponse) == 92U, "candidate info response ABI
 static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed");
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");
 static_assert(sizeof(EnableGatherLanesRequest) == 32U, "gather lanes request ABI changed");
+static_assert(sizeof(OpenCpuPushGetRequest) == 424U, "CPU push setup ABI changed");
+static_assert(sizeof(OpenCpuPushGetResponse) == 300U, "CPU push setup response ABI changed");
+static_assert(sizeof(CpuPushGetSessionRequest) == 20U, "CPU push session ABI changed");
 
 inline constexpr uint16_t ResponseCommand(Command command) {
   return static_cast<uint16_t>(command) | 0x8000U;

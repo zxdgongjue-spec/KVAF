@@ -24,3 +24,6 @@ class BatchGetTransport {
 };
 int32_t LaunchBatchGet(const UmdkBatchGetArgs*, aclrtStream);
 }  // namespace kvaf::aicpu_urma
+namespace kvaf::cpu_push {
+int32_t LaunchCpuPushScatter(const KernelArgs*, aclrtStream);
+}  // namespace kvaf::cpu_push

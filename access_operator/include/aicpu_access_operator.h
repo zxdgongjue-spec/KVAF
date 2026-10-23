@@ -1,5 +1,6 @@
 #pragma once
 #include "access_operator.h"
+#include <array>
 namespace kvaf {
 struct UmdkAccessOperatorConfig {
   std::string kernel_json;
@@ -8,9 +9,11 @@ struct UmdkAccessOperatorConfig {
   std::uint32_t workers{1U};
   std::shared_ptr<PeerLink> peer_link;
   std::uint32_t token_bytes{0U};
+  std::string batch_get_mode{"gather_read"};
+  std::array<std::uint8_t, 16> local_eid{};
 };
-// Runtime adapter for the AICPU demos. BatchGet, BatchPut and setup WRITE
-// share one UMDK session.
+// Runtime adapter for the AICPU demos. gather_read and BatchPut share UMDK;
+// cpu_push_scatter owns an independent Host-side direct HCCP target.
 class UmdkAccessOperator final : public AccessOperator {
  public:
   explicit UmdkAccessOperator(UmdkAccessOperatorConfig config);

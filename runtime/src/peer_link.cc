@@ -387,4 +387,44 @@ Status PeerLink::EnableGatherLanes(uint64_t region_base, uint64_t control_addres
   return Status::OK();
 }
 
+Status PeerLink::OpenCpuPushGet(uint64_t base, OpenCpuPushGetRequest request,
+                                OpenCpuPushGetResponse* response) const {
+  const auto found = regions_.find(base);
+  if (found == regions_.end()) return Status::NotFound("peer DDR region was not found");
+  request.header = MakeHeader(Command::kOpenCpuPushGet, sizeof(request));
+  request.session_id = found->second.session_id;
+  std::string error;
+  if (!Exchange(address_, request, response, &error) ||
+      !IsValidResponseHeader(response->header, Command::kOpenCpuPushGet, sizeof(*response)) ||
+      !ResultOk(static_cast<Result>(response->result), &error))
+    return ToStatus("CPU push setup failed", std::move(error));
+  return Status::OK();
+}
+
+namespace {
+Status PushSessionCommand(const std::string& address, uint64_t session, Command command) {
+  CpuPushGetSessionRequest request{};
+  request.header = MakeHeader(command, sizeof(request));
+  request.session_id = session;
+  StatusResponse response{};
+  std::string error;
+  if (!Exchange(address, request, &response, &error) ||
+      !IsValidResponseHeader(response.header, command, sizeof(response)) ||
+      !ResultOk(static_cast<Result>(response.result), &error))
+    return ToStatus("CPU push session command failed", std::move(error));
+  return Status::OK();
+}
+}  // namespace
+
+Status PeerLink::StartCpuPushGet(uint64_t base) const {
+  const auto found = regions_.find(base);
+  if (found == regions_.end()) return Status::NotFound("peer DDR region was not found");
+  return PushSessionCommand(address_, found->second.session_id, Command::kStartCpuPushGet);
+}
+Status PeerLink::StopCpuPushGet(uint64_t base) const {
+  const auto found = regions_.find(base);
+  // ReleaseRegion succeeds only after the remote producer has stopped.
+  if (found == regions_.end()) return Status::OK();
+  return PushSessionCommand(address_, found->second.session_id, Command::kStopCpuPushGet);
+}
 }  // namespace kvaf::peer

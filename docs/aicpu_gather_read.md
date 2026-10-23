@@ -4,6 +4,8 @@
 各自从本轮 NPU Tensor 的输入区间生成源清单，请求 CPU gather 到自己的 DDR staging 区间，
 查询自己的就绪前缀、提交 READ，并等待自己的完成通知和 CPU ACK。
 indices、offsets、miss_count、output_indices 和数据可以每轮变化，不缓存上一轮内容。
+本页描述默认 `aicpu_batch_get_mode="gather_read"`。
+Host direct HCCP 建链的 `cpu_push_scatter` 路径见 [CPU 回推说明](aicpu_cpu_push_scatter.md)。
 与顶层 BatchGet 一致，`int32[1] miss_count` 指定输入数组的有效前缀长度；
 只处理前 `miss_count` 项，取值范围为 0 到输入数组容量。
 AICPU 读取这个计数，将有效前缀均分给各 worker；READ 直接使用调用方的 `output_indices` 组 SGL。
@@ -204,5 +206,6 @@ Shutdown 会先等待尚未确认完成的控制/Put 操作，再销毁通信资
 | `access_operator/src/aicpu_urma/kernel/control_kernel.cc` | Host 控制命令的设备入口和分发 |
 | `access_operator/src/aicpu_urma/package/` | 算子 JSON、UMDK 库打包和安装脚本 |
 
-当前 BatchGet 入口仅调用 `gather_read`；没有其他实现的占位代码或选择参数。
+BatchGet 还提供 `cpu_push_scatter` 入口，通过 `aicpu_batch_get_mode` 在初始化时选择；
+两条路径使用相同的输入前缀和输出地址语义。
 两个 demo 均按 `include/host/kernel` 分层，共用一个设备包和会话；Python 参数及构建命令保持不变。

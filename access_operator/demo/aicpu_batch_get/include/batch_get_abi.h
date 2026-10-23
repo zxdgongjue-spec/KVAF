@@ -4,6 +4,7 @@
 #include "gather_workspace.h"
 #include "batch_get_profile.h"
 #include "aicpu_urma/control_abi.h"
+#include "cpu_push_get_layout.h"
 namespace kvaf {
 constexpr std::uint32_t kGatherMaxSglSize = 6U;
 }  // namespace kvaf
@@ -58,3 +59,12 @@ struct UmdkBatchGetArgs {
   GatherReadArgs gather;
 };
 }  // namespace kvaf::aicpu_urma
+
+namespace kvaf::cpu_push {
+struct KernelArgs {
+  aicpu_urma::AicpuBatchGetInput request;
+  std::uint64_t workspace{}, output{}, output_bytes{}, coordination{}, status{}, profile{};
+  std::uint64_t sequence{};
+  std::uint32_t workers{}, timeout_ms{kTimeoutMs};
+};
+}  // namespace kvaf::cpu_push

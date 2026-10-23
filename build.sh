@@ -18,7 +18,8 @@ Usage: ./build.sh <cpu|npu|aicpu-urma> [--build-dir DIR] [--jobs N]
 
 cpu  Builds the liburma-only CPU Runtime service. If liburma is not installed,
      it clones and builds the pinned UMDK source beside this repository.
-aicpu-urma Builds the UMDK pipeline BatchGet Python binding and AICPU kernel.
+aicpu-urma Builds AICPU gather_read, BatchPut and Python bindings.
+     --cpu-push adds Host direct HCCP and the CPU push/scatter kernel (needs device securec).
      --install-kernel installs it; --check-kernel and --uninstall-kernel manage the package.
 npu  Builds the CANN AIV BatchGet/BatchPut Runtime and Python binding. It
      installs pybind11 for the selected Python interpreter when necessary.
@@ -31,6 +32,9 @@ Environment overrides:
                         CANN toolkit root for the NPU build
   PYTHON               Python interpreter for the NPU binding (default: python3)
   KVAF_AICPU_CXX       AICPU cross compiler override
+  KVAF_AICPU_SECUREC_INCLUDE_DIR
+  KVAF_AICPU_SECUREC_LIBRARY
+                        Device securec header and AArch64 library for memcpy_sp
   KVAF_BUILD_JOBS      Parallel build jobs
 EOF
 }
@@ -186,7 +190,7 @@ check_aicpu_cann_root() {
 }
 
 build_aicpu_urma() {
-  local build_dir="$1" jobs="$2" kernel_action="$3"
+  local build_dir="$1" jobs="$2" kernel_action="$3" cpu_push="$4"
   local cann_root umdk_root="${KVAF_UMDK_ROOT:-$KVAF_ROOT/../third_party/umdk}"
   local -a compiler_option=()
   cann_root="$(find_cann_root)"
@@ -206,10 +210,17 @@ build_aicpu_urma() {
   if [[ -n "${KVAF_AICPU_CXX:-}" ]]; then
     compiler_option+=("-DKVAF_AICPU_CXX=$KVAF_AICPU_CXX")
   fi
+  if [[ -n "${KVAF_AICPU_SECUREC_INCLUDE_DIR:-}" ]]; then
+    compiler_option+=("-DKVAF_AICPU_SECUREC_INCLUDE_DIR=$KVAF_AICPU_SECUREC_INCLUDE_DIR")
+  fi
+  if [[ -n "${KVAF_AICPU_SECUREC_LIBRARY:-}" ]]; then
+    compiler_option+=("-DKVAF_AICPU_SECUREC_LIBRARY=$KVAF_AICPU_SECUREC_LIBRARY")
+  fi
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
     -DBUILD_TESTING=OFF -DKVAF_BUILD_PYTHON=ON -DPython_EXECUTABLE="$python_bin" \
     -DKVAF_ENABLE_AIV_BATCH_GET=OFF -DKVAF_ENABLE_AIV_BATCH_PUT=OFF \
     -DKVAF_BUILD_REMOTE_CPU_SERVICE=OFF -DKVAF_ENABLE_AICPU_URMA=ON \
+    -DKVAF_ENABLE_AICPU_CPU_PUSH="$cpu_push" \
     -DKVAF_URMA_ROOT="$umdk_root" -DASCEND_CANN_PACKAGE_PATH="$cann_root" \
     "${compiler_option[@]}"
   cmake --build "$build_dir" --target _kvaf kvaf_aicpu_urma_kernel --parallel "$jobs"
@@ -230,8 +241,14 @@ esac
 build_dir="$KVAF_ROOT/build-$mode"
 jobs="$(default_jobs)"
 kernel_action=build
+cpu_push=OFF
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --cpu-push)
+      [[ "$mode" == aicpu-urma ]] || die "--cpu-push is only valid for aicpu-urma"
+      cpu_push=ON
+      shift
+      ;;
     --build-dir)
       [[ $# -ge 2 ]] || die "--build-dir requires a value"
       build_dir="$2"
@@ -257,7 +274,7 @@ done
 
 [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || die "KVAF_BUILD_JOBS must be a positive integer"
 if [[ "$mode" == aicpu-urma ]]; then
-  build_aicpu_urma "$build_dir" "$jobs" "$kernel_action"
+  build_aicpu_urma "$build_dir" "$jobs" "$kernel_action" "$cpu_push"
 elif [[ "$mode" == cpu ]]; then
   build_cpu "$build_dir" "$jobs"
 else
