@@ -262,14 +262,6 @@ py::dict BatchGetProfileDict(const BatchGetProfile& profile) {
 
 class NpuPythonRuntime final {
  public:
-  NpuPythonRuntime(std::string get_kernel, std::uint32_t token_bytes,
-                   std::uint32_t tokens_per_block, std::uint32_t device_id,
-                   std::uint32_t cores, std::string put_kernel, std::uint32_t jettys,
-                   std::string aicpu_json, std::string urma_device, std::uint32_t eid_index)
-      : NpuPythonRuntime(std::move(get_kernel), token_bytes, tokens_per_block, device_id,
-                         cores, std::move(put_kernel), jettys, {}, false, 2048U, "", {}, 2048U,
-                         std::move(aicpu_json), std::move(urma_device), eid_index) {}
-
   NpuPythonRuntime(std::string batch_get_kernel_object_path,
                    std::uint32_t batch_get_token_bytes,
                    std::uint32_t batch_get_tokens_per_block,
@@ -524,7 +516,6 @@ class NpuPythonRuntime final {
     const NpuTensorView offset_view = GetNpuTensorView(offsets, "offsets");
     const NpuTensorView miss_count_view =
         GetNpuTensorView(miss_count, "miss_count");
-    const bool sparse = aicpu_backend_ && miss_count_view.element_bytes == sizeof(std::uint8_t);
     const NpuTensorView output_index_view =
         GetNpuTensorView(output_indices, "output_indices");
     const NpuTensorView output_view = GetNpuTensorView(output, "output");
@@ -535,9 +526,8 @@ class NpuPythonRuntime final {
         index_view.element_bytes != sizeof(std::int32_t) ||
         offset_view.element_bytes != sizeof(std::int32_t) ||
         output_index_view.element_bytes != sizeof(std::int32_t) ||
-        (sparse ? miss_count_view.bytes != index_view.bytes / sizeof(std::int32_t)
-                : (miss_count_view.element_bytes != sizeof(std::int32_t) ||
-                   miss_count_view.bytes != sizeof(std::int32_t))) ||
+        miss_count_view.element_bytes != sizeof(std::int32_t) ||
+        miss_count_view.bytes != sizeof(std::int32_t) ||
         index_view.bytes != offset_view.bytes ||
         index_view.bytes != output_index_view.bytes ||
         address_view.element_bytes != sizeof(Address) ||
@@ -558,8 +548,7 @@ class NpuPythonRuntime final {
         access_table,
         ConstBufferView{index_view.data, index_view.bytes, DeviceKind::kNpu},
         ConstBufferView{offset_view.data, offset_view.bytes, DeviceKind::kNpu},
-        sparse ? ConstBufferView{} : ConstBufferView{miss_count_view.data, miss_count_view.bytes,
-                                                     DeviceKind::kNpu},
+        ConstBufferView{miss_count_view.data, miss_count_view.bytes, DeviceKind::kNpu},
         ConstBufferView{output_index_view.data, output_index_view.bytes,
                         DeviceKind::kNpu},
         MutableBufferView{output_view.data, output_view.bytes, DeviceKind::kNpu},
@@ -567,9 +556,7 @@ class NpuPythonRuntime final {
         native_->batch_get_tokens_per_block(),
         AccessTableDeviceView{
             ConstBufferView{address_view.data, address_view.bytes, DeviceKind::kNpu},
-            ConstBufferView{valid_view.data, valid_view.bytes, DeviceKind::kNpu}},
-        sparse ? ConstBufferView{miss_count_view.data, miss_count_view.bytes, DeviceKind::kNpu}
-               : ConstBufferView{}};
+            ConstBufferView{valid_view.data, valid_view.bytes, DeviceKind::kNpu}}};
     const aclrtStream acl_stream = ResolveStream(stream);
     auto timings = profile ? std::make_unique<BatchGetProfile>() : nullptr;
     const auto native_begin = profile ? BatchGetProfileNowNs() : 0U;
@@ -630,14 +617,6 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("aicpu_urma_kernel_json_path") = "",
            py::arg("urma_device") = "",
            py::arg("urma_eid_index") = UINT32_MAX)
-      .def(py::init<std::string, std::uint32_t, std::uint32_t, std::uint32_t,
-                    std::uint32_t, std::string, std::uint32_t, std::string,
-                    std::string, std::uint32_t>(),
-           py::arg("batch_get_kernel_object_path"), py::arg("batch_get_token_bytes"),
-           py::arg("batch_get_tokens_per_block"), py::arg("device_id"),
-           py::arg("npu_core_count"), py::arg("batch_put_kernel_object_path"),
-           py::arg("jettys_per_core"), py::arg("aicpu_urma_kernel_json_path"),
-           py::arg("urma_device") = "", py::arg("urma_eid_index") = UINT32_MAX)
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
            "Connect this NPU Runtime to a CPU Runtime service before initialize.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),
@@ -692,25 +671,6 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("batch_get", &NpuPythonRuntime::BatchGetFromTensors,
            py::arg("addresses"), py::arg("valid"), py::arg("indices"),
            py::arg("offsets"), py::arg("miss_count"), py::arg("output_indices"),
-           py::arg("output"), py::arg("stream") = py::none(),
-           py::arg("synchronize") = false,
-           py::arg("profile") = false,
-           "Submit BatchGet from caller-owned NPU addresses and valid Tensors. "
-           "stream=None uses torch.npu.current_stream(); the default returns "
-           "after enqueueing work on that stream. AICPU profile=True requires "
-           "synchronize=True and returns a stage timing dictionary.")
-      .def("batch_get", &NpuPythonRuntime::BatchGet,
-           py::arg("device_access_table"), py::arg("indices"), py::arg("offsets"),
-           py::arg("mask"),
-           py::arg("output_indices"), py::arg("output"),
-           py::arg("stream") = py::none(), py::arg("synchronize") = false,
-           py::arg("profile") = false,
-           "Submit BatchGet from NPU Tensors. stream=None uses torch.npu.current_stream(); "
-           "the default returns after enqueueing work on that stream. AICPU profile=True "
-           "requires synchronize=True and returns a stage timing dictionary.")
-      .def("batch_get", &NpuPythonRuntime::BatchGetFromTensors,
-           py::arg("addresses"), py::arg("valid"), py::arg("indices"),
-           py::arg("offsets"), py::arg("mask"), py::arg("output_indices"),
            py::arg("output"), py::arg("stream") = py::none(),
            py::arg("synchronize") = false,
            py::arg("profile") = false,

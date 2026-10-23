@@ -68,9 +68,6 @@ struct BatchGetRequest {
 
   // CPU path 留空。NPU path 必须提供调用方持有的稳定 Device 表。
   AccessTableDeviceView device_access_table;
-  // Optional legacy AICPU sparse selector. Leave miss_count empty when using it.
-  ConstBufferView mask;
-
 };
 
 struct BatchPutRequest {

@@ -262,14 +262,11 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
   }
   const std::size_t request_count =
       request.indices.bytes / sizeof(std::int32_t);
-  if (request.mask.data != nullptr) {
-    if (request.indices.device != DeviceKind::kNpu || request.mask.device != DeviceKind::kNpu ||
-        request.mask.bytes != request_count || request.miss_count.data != nullptr)
-      return Status::InvalidArgument("AICPU mask must match request capacity and exclude miss_count");
-  } else if (!request.miss_count.has_elements<std::int32_t>() ||
-             request.miss_count.bytes != sizeof(std::int32_t) ||
-             request.miss_count.device != request.indices.device) {
-    return Status::InvalidArgument("miss_count must be a single int32 on the BatchGet device");
+  if (!request.miss_count.has_elements<std::int32_t>() ||
+      request.miss_count.bytes != sizeof(std::int32_t) ||
+      request.miss_count.device != request.indices.device) {
+    return Status::InvalidArgument(
+        "miss_count must be a single int32 on the BatchGet device");
   }
   if (!request.output.valid() ||
       request.output_block_bytes == 0 ||

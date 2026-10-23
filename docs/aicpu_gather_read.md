@@ -3,14 +3,12 @@
 已有的 `NpuRuntime.batch_get` 可以选择 UMDK 后端。一次 launch 启动 N 个 AICPU 实例，
 各自从本轮 NPU Tensor 的输入区间生成源清单，请求 CPU gather 到自己的 DDR staging 区间，
 查询自己的就绪前缀、提交 READ，并等待自己的完成通知和 CPU ACK。
-indices、offsets、mask、output_indices 和数据可以每轮变化，不缓存上一轮内容。
-READ 直接使用调用方的 `output_indices` 和 `mask` 组 SGL，不再生成 HBM 输出位置清单或复制到 AICPU 本地数组。
-AICPU 对 mask 非零项直接取 `addresses[indices[i]] + offsets[i]`，省去逐项地址、索引和输出行号检查；
-调用方保证有效条目的索引、块内偏移、地址有效性及输出行号正确，输入元数据在本轮完成前保持不变。
-
-AICPU 同时接受两种请求选择方式：原有 `uint8[n] mask` 表示稀疏请求；
-与 main 一致的 `int32[1] miss_count` 表示只处理输入数组的前 N 项。
-两种方式均由 AICPU 读取，本轮完成前保持不变；`mask=` 关键字和原有位置参数调用仍可使用。
+indices、offsets、miss_count、output_indices 和数据可以每轮变化，不缓存上一轮内容。
+与顶层 BatchGet 一致，`int32[1] miss_count` 指定输入数组的有效前缀长度；
+只处理前 `miss_count` 项，取值范围为 0 到输入数组容量。
+AICPU 读取这个计数，将有效前缀均分给各 worker；READ 直接使用调用方的 `output_indices` 组 SGL。
+源地址直接取 `addresses[indices[i]] + offsets[i]`，调用方保证有效条目的索引、
+块内偏移、地址有效性及输出行号正确，输入元数据在本轮完成前保持不变。
 
 ## 构建和启动
 
@@ -65,10 +63,10 @@ table = runtime.prepare_access_table(keys)
 device_table = runtime.access_table_view(table, device="npu")
 indices = torch.arange(4096, dtype=torch.int32, device="npu:7")
 offsets = torch.zeros_like(indices)  # 表项内的字节偏移。
-mask = torch.ones(4096, dtype=torch.uint8, device="npu:7")
+miss_count = torch.tensor([4096], dtype=torch.int32, device="npu:7")
 output_indices = indices.clone()
 output = torch.empty_like(source)
-runtime.batch_get(device_table, indices, offsets, mask, output_indices, output,
+runtime.batch_get(device_table, indices, offsets, miss_count, output_indices, output,
                   synchronize=True)
 assert torch.equal(output, source)
 runtime.release_access_table(table)
@@ -84,7 +82,7 @@ runtime.shutdown()
 如果调用方已经持有 NPU 地址表，直接调用现有 Tensor 重载，不必再创建 Host AccessTable 或重新上传地址表：
 
 ```python
-runtime.batch_get(addresses, valid, indices, offsets, mask, output_indices, output,
+runtime.batch_get(addresses, valid, indices, offsets, miss_count, output_indices, output,
                   stream=stream, synchronize=True)
 ```
 
@@ -105,11 +103,11 @@ python3 access_operator/demo/aicpu_batch_get/python/test_batch_get.py \
 ```
 
 脚本从 CANN 环境变量寻找已安装的 kernel JSON，也可用 `--kernel-json` 显式指定。
-每轮重新生成源数据和请求，稀疏模式下逐轮移动 mask；先完成 BatchPut，再执行 BatchGet，
+每轮重新生成源数据、输入索引、偏移和输出行号；先完成 BatchPut，再执行 BatchGet，
 逐字节检查整个输出，包括未写入的行和间隔；还在 NPU 上执行转换和加法，检查后续算子读取结果。
-预检覆盖两种 Python 重载、稀疏 mask、全 mask，以及异步 BatchGet 后同 stream 的 NPU 消费者。
+预检覆盖两种 Python 重载、完整/部分/空前缀，以及异步 BatchGet 后同 stream 的 NPU 消费者。
 源和输出 Tensor 的注册地址持续有效到 Runtime 关闭；每轮释放 AccessTable 和 key 后重新写入，
-不依赖上一轮数据或远端地址保持不变。设置 `--active-percent 75` 可测试稀疏请求。
+不依赖上一轮数据或远端地址保持不变。设置 `--active-percent 75` 可测试前 75% 的请求。
 
 每个 worker 配置输出一行 `AICPU_BATCH_GET_PASS`，包含 mean、p50、p95、p99（µs，小数点后 1 位）和有效载荷 GB/s。
 计时覆盖 Python `batch_get(..., synchronize=True)` 调用至完成，包含 Host/AICPU/CPU 和同步开销；
@@ -120,7 +118,7 @@ python3 access_operator/demo/aicpu_batch_get/python/test_batch_get.py \
 Python 也可直接获取单次采样：
 
 ```python
-profile = runtime.batch_get(device_table, indices, offsets, mask, output_indices, output,
+profile = runtime.batch_get(device_table, indices, offsets, miss_count, output_indices, output,
                             synchronize=True, profile=True)
 print(profile["host"])
 print(profile["workers"])
@@ -151,7 +149,7 @@ Host wait 包含排队的设备执行和 D2H；Host 与设备的绝对时间戳�
 CPU 侧每条通道也各有独立 Jetty/RQ/CQ。CPU 与 AICPU 共用端点枚举、队列创建和 TP/Jetty 扩展代码；
 AICPU 进程内的 liburma 动态加载与会话由 AICPU 自己维护。
 
-每个 worker 负责输入请求下标的一个连续区间，在本区间内跳过 mask=0 的条目。
+每个 worker 负责有效前缀中的一个连续区间，直接按顺序构建源清单和 READ。
 CPU 直接引用收到的源清单，使用到本轮拷贝结束、发布 ACK 为止，不再逐条复制清单或检查源地址范围。
 BatchGet 在描述头中提供固定片段长度 `span_bytes`（例如 656 B）；CPU 用
 `staging_offset / span_bytes` 和 `staging_offset % span_bytes` 定位源片段及片段内偏移，

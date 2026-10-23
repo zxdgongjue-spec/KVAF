@@ -50,7 +50,7 @@ inline constexpr std::uint64_t GatherWorkspaceBytes(std::uint32_t workers) {
 }
 static_assert(sizeof(GatherReadArgs) <= 256U);
 struct AicpuBatchGetInput {
-  std::uint64_t address_table{}, indices{}, offsets{}, mask{}, miss_count{}, output_indices{};
+  std::uint64_t address_table{}, indices{}, offsets{}, miss_count{}, output_indices{};
   std::uint32_t table_capacity{}, request_capacity{}, token_bytes{};
 };
 struct UmdkBatchGetArgs {

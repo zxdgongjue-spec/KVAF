@@ -32,16 +32,14 @@ inline Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
       request.device_access_table.addresses.device != DeviceKind::kNpu ||
       count > limit || entries > limit || request.output_block_bytes > limit)
     return Status::InvalidArgument("invalid AICPU BatchGet layout");
-  if (request.mask.data) {
-    if (request.mask.device != DeviceKind::kNpu || request.mask.bytes != count || request.miss_count.data)
-      return Status::InvalidArgument("invalid AICPU sparse mask");
-  } else if (!request.miss_count.has_elements<std::int32_t>() ||
-             request.miss_count.bytes != sizeof(std::int32_t) || request.miss_count.device != DeviceKind::kNpu) {
-    return Status::InvalidArgument("AICPU BatchGet requires an int32 miss_count or sparse mask");
+  if (!request.miss_count.has_elements<std::int32_t>() ||
+      request.miss_count.bytes != sizeof(std::int32_t) ||
+      request.miss_count.device != DeviceKind::kNpu) {
+    return Status::InvalidArgument("AICPU BatchGet requires an int32 miss_count");
   }
   *args = {PointerValue(request.device_access_table.addresses.data), PointerValue(request.indices.data),
-           PointerValue(request.offsets.data), PointerValue(request.mask.data),
-           PointerValue(request.miss_count.data), PointerValue(request.output_indices.data),
+           PointerValue(request.offsets.data), PointerValue(request.miss_count.data),
+           PointerValue(request.output_indices.data),
            static_cast<std::uint32_t>(entries), static_cast<std::uint32_t>(count),
            static_cast<std::uint32_t>(request.output_block_bytes)};
   return Status::OK();
