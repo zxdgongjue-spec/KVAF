@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kvaf
 
 from backend import detect_torch_backend
+from dsa_keys import build_dsa_keys
 from npu_eids import parse_npu_eids
 
 DEFAULT_TOKEN_BYTES = 656
@@ -207,8 +208,11 @@ def main() -> int:
         variable_offsets.append(len(variable_input_host))
         variable_lengths.append(len(payload))
         variable_input_host.extend(payload)
-    variable_keys = list(range(1_000_001, 1_000_001 + len(variable_payloads)))
-    ddr_bytes = (active_requests + len(variable_keys)) * source_stride
+    slot_count = active_requests + len(variable_payloads)
+    # Single-pool-row/single-layer DSA baseline. These keys are freed before
+    # the main Put, so the same fixed slots can be reused by its block_q keys.
+    variable_keys = build_dsa_keys(len(variable_payloads), q_capacity=slot_count)
+    ddr_bytes = slot_count * source_stride
 
     # torch_npu owns ACL process initialization. Select the device before
     # passing its caller-owned streams through the pybind Runtime.
@@ -290,7 +294,7 @@ def main() -> int:
         )
 
         print("RUNTIME_NPU_PHASE_BEGIN phase=batch_put")
-        active_keys = list(range(1, active_requests + 1))
+        active_keys = build_dsa_keys(active_requests, q_capacity=slot_count)
         source_rows = torch.arange(
             active_requests * tokens_per_block, dtype=torch.int64
         ).unsqueeze(1)
