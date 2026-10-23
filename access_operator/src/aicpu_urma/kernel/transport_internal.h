@@ -1,6 +1,5 @@
 #pragma once
 #include <array>
-#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <vector>
@@ -42,14 +41,15 @@ struct Api {
   ImportJettyEx import_jetty_ex = nullptr;
 };
 
-struct WrQueue {
-  virtual ~WrQueue() = default;
+struct RequestBuffer {
   std::vector<Sge> local_sges;
   std::vector<Sge> remote_sges;
   std::vector<urma_jfs_wr_t> wrs;
+  std::uint32_t wr_count = 0;
 };
 
-struct Worker : WrQueue {
+struct Queue {
+  RequestBuffer requests;
   // Stable storage for one-WR control transfers, including a failed in-flight WR.
   Sge single_local{}, single_remote{};
   urma_jfs_wr_t single_wr{};
@@ -60,7 +60,6 @@ struct Worker : WrQueue {
   urma_target_jetty_t* target = nullptr;
   std::uint64_t tp = 0;
   std::uint64_t sequence = 0;
-  std::unique_ptr<WrQueue> data_workspace;
 };
 
 struct RegisteredBuffer {
@@ -69,7 +68,7 @@ struct RegisteredBuffer {
   urma_target_seg_t* segment;
 };
 
-struct State : Worker {
+struct SessionState {
   Api api;
   void* library = nullptr;
   void* common_library = nullptr;
@@ -84,18 +83,17 @@ struct State : Worker {
   std::array<std::uint8_t, 16> peer_eid{};
   std::uint64_t buffer = 0, buffer_bytes = 0, remote_address = 0;
   std::uint32_t worker_count = 1;
-  std::array<std::unique_ptr<Worker>, 7> extra_workers;
-  std::unique_ptr<Worker> control;
-  std::array<std::unique_ptr<Worker>, 7> extra_controls;
+  std::array<Queue, kUmdkControlQueueIndex> data_queues;
+  std::array<Queue, kUmdkControlQueueIndex> control_queues;
   std::vector<RegisteredBuffer> buffers;
 };
 
-extern State state;
+extern SessionState state;
 extern std::shared_mutex state_mutex;
 extern std::array<std::mutex, 8> worker_mutexes;
 std::uint64_t NowNs();
-Worker& GetWorker(std::uint32_t index);
-Worker* SetupQueue(std::uint32_t index);
+Queue& DataQueue(std::uint32_t index);
+Queue* FindQueue(std::uint32_t index);
 bool Prepare(const UmdkControlArgs&, UmdkControlStatus&);
 bool Connect(const UmdkControlArgs&, UmdkControlStatus&);
 bool DescribeWorker(const UmdkControlArgs&, std::uint32_t index, UmdkControlStatus&);
@@ -103,11 +101,10 @@ bool RegisterBuffer(const UmdkControlArgs&, UmdkControlStatus&);
 bool Cleanup(UmdkControlStatus&);
 void Stage(UmdkControlStatus&, const char*);
 bool Fail(UmdkControlStatus&, const char*, int result = -1, const char* detail = "");
-bool PostBatch(Worker&, urma_jfs_wr_t* first, urma_jfs_wr_t* tail, UmdkControlStatus&);
-bool WaitCompletion(Worker&, std::uint64_t context, std::uint64_t start, std::uint32_t timeout_ms,
+bool PostBatch(Queue&, urma_jfs_wr_t* first, urma_jfs_wr_t* tail, UmdkControlStatus&);
+bool WaitCompletion(Queue&, std::uint64_t context, std::uint64_t start, std::uint32_t timeout_ms,
                     UmdkControlStatus&);
-urma_target_seg_t* LocalSegment(std::uint64_t address, std::uint64_t bytes,
-                                std::uint64_t* available = nullptr);
+urma_target_seg_t* LocalSegment(std::uint64_t address, std::uint64_t bytes);
 bool TransferControl(bool write, const UmdkTransfer*, std::uint32_t count, UmdkControlStatus&,
                      std::uint32_t worker_index = 0U);
 }  // namespace kvaf::aicpu_urma::detail

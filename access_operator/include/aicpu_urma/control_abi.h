@@ -52,9 +52,6 @@ struct alignas(64) UmdkControlStatus {
 struct UmdkContext {
   std::uint64_t session{0U}, owner_pid{0U};
 };
-struct UmdkMemory {
-  std::uint64_t local_base, local_bytes, remote_base, remote_bytes;
-};
 struct UmdkTransfer {
   std::uint64_t remote, local, bytes;
 };

@@ -19,7 +19,7 @@ std::uint64_t NowNs() {
       .count();
 }
 
-bool PostBatch(Worker& worker, urma_jfs_wr_t* first, urma_jfs_wr_t* tail,
+bool PostBatch(Queue& worker, urma_jfs_wr_t* first, urma_jfs_wr_t* tail,
                UmdkControlStatus& status) {
   auto* saved_next = tail->next;
   tail->next = nullptr;
@@ -33,7 +33,7 @@ bool PostBatch(Worker& worker, urma_jfs_wr_t* first, urma_jfs_wr_t* tail,
   return Fail(status, "urma_post_jetty_send_wr", result);
 }
 
-bool WaitCompletion(Worker& worker, std::uint64_t context, std::uint64_t start,
+bool WaitCompletion(Queue& worker, std::uint64_t context, std::uint64_t start,
                     std::uint32_t timeout_ms, UmdkControlStatus& status) {
   const auto deadline = start + static_cast<std::uint64_t>(timeout_ms) * 1000000;
   std::uint32_t polls = 0;
@@ -62,7 +62,7 @@ bool WaitCompletion(Worker& worker, std::uint64_t context, std::uint64_t start,
   return false;
 }
 
-bool SubmitQueue(Worker& worker, std::vector<urma_jfs_wr_t>& requests, std::uint32_t batch,
+bool SubmitQueue(Queue& worker, std::vector<urma_jfs_wr_t>& requests, std::uint32_t batch,
                  std::uint32_t timeout_ms, UmdkControlStatus& status) {
   const auto start = NowNs();
   for (std::size_t first = 0; first < requests.size(); first += batch) {
@@ -72,13 +72,14 @@ bool SubmitQueue(Worker& worker, std::vector<urma_jfs_wr_t>& requests, std::uint
   return WaitCompletion(worker, requests.back().user_ctx, start, timeout_ms, status);
 }
 
-bool BuildTransfers(Worker& worker, bool write, const UmdkTransfer* transfers, std::uint32_t count,
+bool BuildTransfers(Queue& worker, bool write, const UmdkTransfer* transfers, std::uint32_t count,
                     std::uint32_t& transfer_index, std::uint64_t& offset,
                     UmdkControlStatus& status) {
-  worker.local_sges.clear();
-  worker.remote_sges.clear();
-  worker.wrs.clear();
-  while (transfer_index < count && worker.wrs.size() < 4096) {
+  auto& requests = worker.requests;
+  requests.local_sges.clear();
+  requests.remote_sges.clear();
+  requests.wrs.clear();
+  while (transfer_index < count && requests.wrs.size() < 4096) {
     const auto& transfer = transfers[transfer_index];
     if (transfer.bytes == 0 || offset >= transfer.bytes ||
         !UmdkRange(state.remote->seg.ubva.va, state.remote->seg.len, transfer.remote,
@@ -88,37 +89,37 @@ bool BuildTransfers(Worker& worker, bool write, const UmdkTransfer* transfers, s
     if (segment == nullptr) return Fail(status, "UMDK transfer outside registered HBM");
     const auto bytes =
         static_cast<std::uint32_t>(std::min<std::uint64_t>(65536, transfer.bytes - offset));
-    worker.local_sges.push_back({transfer.local + offset, bytes, segment, nullptr});
-    worker.remote_sges.push_back({transfer.remote + offset, bytes, state.remote, nullptr});
+    requests.local_sges.push_back({transfer.local + offset, bytes, segment, nullptr});
+    requests.remote_sges.push_back({transfer.remote + offset, bytes, state.remote, nullptr});
     urma_jfs_wr_t wr{};
     wr.opcode = write ? URMA_OPC_WRITE : URMA_OPC_READ;
     wr.flag.bs.comp_order = 1;
     wr.tjetty = worker.target;
     wr.user_ctx = ++worker.sequence;
-    worker.wrs.push_back(wr);
+    requests.wrs.push_back(wr);
     offset += bytes;
     if (offset == transfer.bytes) {
       ++transfer_index;
       offset = 0;
     }
   }
-  for (std::size_t index = 0; index < worker.wrs.size(); ++index) {
-    auto& wr = worker.wrs[index];
-    const bool last = index + 1 == worker.wrs.size();
+  for (std::size_t index = 0; index < requests.wrs.size(); ++index) {
+    auto& wr = requests.wrs[index];
+    const bool last = index + 1 == requests.wrs.size();
     wr.flag.bs.place_order = last ? URMA_STRONG_ORDER : URMA_RELAX_ORDER;
     wr.flag.bs.complete_enable = last;
-    urma_sg_t local{reinterpret_cast<urma_sge_t*>(&worker.local_sges[index]), 1};
-    urma_sg_t remote{reinterpret_cast<urma_sge_t*>(&worker.remote_sges[index]), 1};
+    urma_sg_t local{reinterpret_cast<urma_sge_t*>(&requests.local_sges[index]), 1};
+    urma_sg_t remote{reinterpret_cast<urma_sge_t*>(&requests.remote_sges[index]), 1};
     wr.rw.src = write ? local : remote;
     wr.rw.dst = write ? remote : local;
-    wr.next = last ? nullptr : &worker.wrs[index + 1];
+    wr.next = last ? nullptr : &requests.wrs[index + 1];
   }
   return true;
 }
 
 // Mailbox queries and short writes need one WR, not the segmented transfer builder.
 // The caller holds the control lock and waits for the CQE before reusing these slots.
-bool TransferOne(Worker& worker, bool write, const UmdkTransfer& transfer,
+bool TransferOne(Queue& worker, bool write, const UmdkTransfer& transfer,
                  UmdkControlStatus& status) {
   if (!UmdkRange(state.remote->seg.ubva.va, state.remote->seg.len, transfer.remote,
                  transfer.bytes))
@@ -145,7 +146,7 @@ bool TransferOne(Worker& worker, bool write, const UmdkTransfer& transfer,
          WaitCompletion(worker, wr.user_ctx, start, 1000, status);
 }
 
-bool TransferQueue(Worker& worker, bool write, const UmdkTransfer* transfers, std::uint32_t count,
+bool TransferQueue(Queue& worker, bool write, const UmdkTransfer* transfers, std::uint32_t count,
                    UmdkControlStatus& status) {
   if (worker.poisoned || worker.target == nullptr || state.remote == nullptr ||
       transfers == nullptr || count == 0 || count > kUmdkMaxTransfers)
@@ -157,7 +158,7 @@ bool TransferQueue(Worker& worker, bool write, const UmdkTransfer* transfers, st
   while (index < count) {
     if (!BuildTransfers(worker, write, transfers, count, index, offset, status)) return false;
     UmdkControlStatus submitted{};
-    const bool success = SubmitQueue(worker, worker.wrs, 8, 1000, submitted);
+    const bool success = SubmitQueue(worker, worker.requests.wrs, 8, 1000, submitted);
     if (!success) {
       status.cq_status = submitted.cq_status;
       status.cq_context = submitted.cq_context;
@@ -171,7 +172,7 @@ bool TransferQueue(Worker& worker, bool write, const UmdkTransfer* transfers, st
 // The control Jetty has its own lock and never polls a data CQ.
 bool TransferControl(bool write, const UmdkTransfer* transfers, std::uint32_t count,
                      UmdkControlStatus& status, std::uint32_t worker_index) {
-  auto* control = SetupQueue(kUmdkControlQueueIndex + worker_index);
+  auto* control = FindQueue(kUmdkControlQueueIndex + worker_index);
   if (!control) return Fail(status, "control queue is unavailable");
   std::lock_guard<std::mutex> control_lock(control_mutexes[worker_index]);
   return TransferQueue(*control, write, transfers, count, status);

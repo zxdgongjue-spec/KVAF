@@ -11,6 +11,7 @@ namespace kvaf::aicpu_urma {
 namespace {
 std::mutex kernel_mutex;
 aclrtBinHandle binary = nullptr;
+std::string loaded_path;
 std::unordered_map<std::string, aclrtFuncHandle> functions;
 int32_t Launch(aclrtFuncHandle function, void* arguments, std::size_t bytes, aclrtStream stream,
                std::uint32_t blocks = 1U) {
@@ -35,10 +36,15 @@ int32_t Launch(aclrtFuncHandle function, void* arguments, std::size_t bytes, acl
 bool LoadUmdkKernel(const char* json_path) {
   if (json_path == nullptr || json_path[0] == '\0') return false;
   std::lock_guard<std::mutex> lock(kernel_mutex);
-  if (binary != nullptr) return true;
   char resolved[PATH_MAX];
   if (realpath(json_path, resolved) == nullptr) {
     std::fprintf(stderr, "[KVAF_AICPU_URMA] missing kernel JSON path=%s\n", json_path);
+    return false;
+  }
+  if (binary != nullptr) {
+    if (loaded_path == resolved) return true;
+    std::fprintf(stderr, "[KVAF_AICPU_URMA] kernel already loaded from %s; requested %s\n",
+                 loaded_path.c_str(), resolved);
     return false;
   }
   aclrtBinaryLoadOption option{};
@@ -53,6 +59,7 @@ bool LoadUmdkKernel(const char* json_path) {
     if (loaded) (void)aclrtBinaryUnLoad(loaded);
     return false;
   }
+  loaded_path = resolved;
   binary = loaded;
   return true;
 }

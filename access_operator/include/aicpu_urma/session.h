@@ -24,6 +24,8 @@ class UmdkSession {
   Status Load();
   Status Ensure(std::uint64_t region_base, void* output, std::size_t output_bytes);
   Status Shutdown();
+  // A failed launch/completion blocks reuse until Shutdown succeeds.
+  Status Drain();
   using Launch = int32_t (*)(const UmdkControlArgs*, aclrtStream);
   Status WriteDescriptors(std::uint64_t descriptors, std::uint32_t count, aclrtStream stream,
                           Launch);
@@ -34,10 +36,12 @@ class UmdkSession {
  private:
   Status Run(UmdkControlOp op, UmdkControlStatus& status, aclrtStream stream = nullptr,
              Launch launch = nullptr);
+  Status CompletePending(UmdkControlStatus& status);
   UmdkSessionConfig config_;
   UmdkControlArgs args_{};
   aclrtStream stream_{nullptr};
-  bool connected_{false};
+  aclrtStream pending_{nullptr};
+  bool connected_{false}, failed_{false};
   std::vector<std::pair<std::uint64_t, std::size_t>> registered_buffers_;
 };
 

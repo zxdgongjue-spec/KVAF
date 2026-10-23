@@ -25,27 +25,18 @@ unsigned ClaimWorker(unsigned count) {
       return worker;
   }
 }
-struct GatherQueue : WrQueue {
-  // Vectors own constructed workspace slots; wr_count is the active chain size.
-  std::uint32_t wr_count = 0;
-};
 
 template <typename T>
 void EnsureSlots(std::vector<T>& slots, std::size_t count) {
-  if (count > slots.size()) slots.resize(std::max(count, slots.size() * 2U));
-}
-
-GatherQueue& ReadQueue(Worker& worker) {
-  if (!worker.data_workspace) worker.data_workspace = std::make_unique<GatherQueue>();
-  return static_cast<GatherQueue&>(*worker.data_workspace);
+  if (count > slots.size()) slots.resize(count);
 }
 
 constexpr std::uint32_t kGatherWaveWrs = 4096U;
 
-void BeginGatherWave(GatherQueue& queue, std::uint32_t sgl_size) {
-  EnsureSlots(queue.local_sges, kGatherWaveWrs * std::min(sgl_size, kvaf::kGatherMaxSglSize));
-  EnsureSlots(queue.remote_sges, kGatherWaveWrs);
-  EnsureSlots(queue.wrs, kGatherWaveWrs);
+void BeginGatherWave(RequestBuffer& queue, std::uint32_t sgl_size, std::uint32_t wave_wrs) {
+  EnsureSlots(queue.wrs, wave_wrs);
+  EnsureSlots(queue.local_sges, queue.wrs.size() * sgl_size);
+  EnsureSlots(queue.remote_sges, queue.wrs.size());
   queue.wr_count = 0U;
 }
 
@@ -60,7 +51,7 @@ struct GatherBuildLayout {
   urma_target_seg_t* remote_segment;
   urma_jfs_wr_t prototype{};
 
-  GatherBuildLayout(Worker& worker, const GatherReadArgs& args,
+  GatherBuildLayout(Queue& worker, const GatherReadArgs& args,
                     const KvafExecuteBatchGetKernelArgs& request)
       : output(args.output),
         staging(args.remote_staging),
@@ -78,11 +69,10 @@ struct GatherBuildLayout {
   }
 };
 
-void AppendGatherBatch(Worker& worker, const GatherBuildLayout& layout, std::uint32_t& span_index,
-                       std::uint32_t last, std::uint32_t& span_offset, std::uint64_t& source_offset,
-                       std::uint32_t batch_wrs,
-                       std::uint32_t& local_index) {
-  auto& queue = ReadQueue(worker);
+void BuildReadBatch(Queue& worker, const GatherBuildLayout& layout, std::uint32_t& span_index,
+                    std::uint32_t last, std::uint32_t& span_offset, std::uint64_t& source_offset,
+                    std::uint32_t batch_wrs, std::uint32_t& local_index) {
+  auto& queue = worker.requests;
   auto index = span_index;
   auto offset = span_offset;
   auto source_position = source_offset;
@@ -92,7 +82,8 @@ void AppendGatherBatch(Worker& worker, const GatherBuildLayout& layout, std::uin
   auto* requests = queue.wrs.data();
   auto sequence = worker.sequence;
   auto wr_count = queue.wr_count;
-  const auto wr_limit = wr_count + std::min(batch_wrs, kGatherWaveWrs - wr_count);
+  const auto wave_wrs = static_cast<std::uint32_t>(queue.wrs.size());
+  const auto wr_limit = wr_count + std::min(batch_wrs, wave_wrs - wr_count);
   while (index < last && wr_count < wr_limit) {
     const auto wr_index = wr_count++;
     const auto local_begin = local_index;
@@ -125,7 +116,7 @@ void AppendGatherBatch(Worker& worker, const GatherBuildLayout& layout, std::uin
   if (wr_count != 0U) {
     auto& tail = requests[wr_count - 1U];
     tail.next = nullptr;
-    const bool final = index == last || wr_count == kGatherWaveWrs;
+    const bool final = index == last || wr_count == wave_wrs;
     tail.flag.bs.place_order = final ? URMA_STRONG_ORDER : URMA_RELAX_ORDER;
     tail.flag.bs.complete_enable = final;
   }
@@ -151,7 +142,7 @@ bool WaitBatchPrefix(GatherPrefix& prefix, const urma_jfs_wr_t& tail,
   const auto required = source.addr + source.len - args.remote_staging;
   if (required <= prefix.ready_bytes) return true;
   auto& gather = prefix.gather;
-  gather.phase = 5;
+  gather.phase = kWaitReadyPrefix;
   const auto scratch = args.scratch;  // Already offset to this worker's mailbox.
   const UmdkTransfer transfer{
       args.remote_descriptor + offsetof(kvaf::peer::GatherDescriptorHeader, ready_bytes), scratch,
@@ -165,14 +156,14 @@ bool WaitBatchPrefix(GatherPrefix& prefix, const urma_jfs_wr_t& tail,
     if (!TransferControl(false, &transfer, 1, query, prefix.worker_index)) {
       errno = query.error_number;
       Fail(submitted, query.stage, query.result);
-      gather.result = 16;
+      gather.result = kGatherTransportFailed;
       break;
     }
     FlushUmdkCache(reinterpret_cast<const void*>(scratch), 8);
     prefix.ready_bytes = *reinterpret_cast<const volatile std::uint64_t*>(scratch);
     if ((prefix.ready_bytes & kvaf::peer::kGatherErrorBit) != 0 ||
         prefix.ready_bytes > args.bytes) {
-      gather.result = 10;
+      gather.result = kCpuGatherFailed;
       Fail(submitted, "CPU ready prefix error");
       break;
     }
@@ -184,32 +175,36 @@ bool WaitBatchPrefix(GatherPrefix& prefix, const urma_jfs_wr_t& tail,
   if (!success) {
     gather.ack_seen = prefix.ready_bytes;
     if (gather.result == 0) {
-      gather.result = 9;
+      gather.result = kGatherTimeout;
       errno = ETIMEDOUT;
       Fail(submitted, "waiting for CPU ready prefix timed out", ETIMEDOUT);
     }
   } else
-    gather.phase = 4;
+    gather.phase = kReadStaging;
   return success;
 }
 
-bool ScatterQueue(Worker& worker, const KvafExecuteBatchGetKernelArgs& request,
-                  const GatherReadArgs& args, GatherReadStatus& status,
-                  std::uint32_t first, std::uint32_t last, std::uint64_t remote_offset,
-                  UmdkControlStatus& error, std::uint32_t timeout_ms,
-                  std::uint32_t worker_index, BatchGetWorkerProfile* profile) {
+bool ReadBatches(Queue& worker, const KvafExecuteBatchGetKernelArgs& request,
+                 const GatherReadArgs& args, GatherReadStatus& status,
+                 std::uint32_t first, std::uint32_t last, UmdkControlStatus& error,
+                 BatchGetWorkerProfile* profile) {
   if (first == last) return true;
   const auto setup_start = profile ? BatchGetProfileNowNs() : 0U;
   const GatherBuildLayout layout(worker, args, request);
   if (!layout.local_segment) return Fail(error, "READ output is not registered");
-  GatherPrefix prefix{args, status, worker_index, 0U, profile};
+  GatherPrefix prefix{args, status, args.worker_index, 0U, profile};
   if (profile) profile->read_setup_ns += BatchGetProfileNowNs() - setup_start;
+  // A WR ends at the SGL limit, the 64 KiB limit, or the end of this request.
+  const auto max_wrs = (static_cast<std::uint64_t>(args.bytes) + 65535U) / 65536U +
+                       (args.source_span_count + layout.sgl_size - 1U) / layout.sgl_size;
+  const auto wave_wrs = static_cast<std::uint32_t>(std::min<std::uint64_t>(kGatherWaveWrs, max_wrs));
   std::uint32_t span_offset = 0;
+  std::uint64_t remote_offset = 0;
   while (first < last) {
-    auto& queue = ReadQueue(worker);
+    auto& queue = worker.requests;
     {
       BatchGetProfileScope timer(profile ? &profile->read_setup_ns : nullptr);
-      BeginGatherWave(queue, layout.sgl_size);
+      BeginGatherWave(queue, layout.sgl_size, wave_wrs);
     }
     std::uint32_t local_index = 0;
     const auto start = NowNs();
@@ -217,7 +212,7 @@ bool ScatterQueue(Worker& worker, const KvafExecuteBatchGetKernelArgs& request,
       const auto batch_first = queue.wr_count;
       {
         BatchGetProfileScope timer(profile ? &profile->wr_build_ns : nullptr);
-        AppendGatherBatch(worker, layout, first, last, span_offset, remote_offset,
+        BuildReadBatch(worker, layout, first, last, span_offset, remote_offset,
                           args.sq_batch_wqes, local_index);
       }
       auto* tail = &queue.wrs[queue.wr_count - 1U];
@@ -239,49 +234,42 @@ bool ScatterQueue(Worker& worker, const KvafExecuteBatchGetKernelArgs& request,
         profile->read_wqes += queue.wr_count - batch_first;
         ++profile->post_calls;
       }
-    } while (first < last && queue.wr_count < kGatherWaveWrs);
+    } while (first < last && queue.wr_count < queue.wrs.size());
     // Retain every WR/SGL slot until the final ordered CQE for this wave.
     {
       BatchGetProfileScope timer(profile ? &profile->cq_wait_ns : nullptr);
-      if (!WaitCompletion(worker, queue.wrs[queue.wr_count - 1U].user_ctx, start, timeout_ms, error))
+      if (!WaitCompletion(worker, queue.wrs[queue.wr_count - 1U].user_ctx, start, 1000, error))
         return false;
     }
   }
   return true;
 }
 
-}  // namespace
-std::uint32_t GatherScatter(const KvafExecuteBatchGetKernelArgs& request,
-                            const kvaf::aicpu_urma::GatherReadArgs* args,
-                            kvaf::aicpu_urma::GatherReadStatus* status, std::uint32_t first,
-                            std::uint32_t last, std::uint64_t remote_offset,
-                            std::uint32_t worker_index, BatchGetWorkerProfile* profile) {
+std::uint32_t ReadStaging(const KvafExecuteBatchGetKernelArgs& request,
+                         const GatherReadArgs& args, GatherReadStatus& status,
+                         std::uint32_t first, std::uint32_t last,
+                         BatchGetWorkerProfile* profile) {
   std::shared_lock<std::shared_mutex> lock(state_mutex);
-  if (args == nullptr || status == nullptr || worker_index >= state.worker_count ||
-      std::max(1U, args->worker_count) != state.worker_count ||
-      args->context.owner_pid != static_cast<std::uint64_t>(getpid()) ||
-      args->context.session != state.session ||
-      first > last ||
-      last > request.request_capacity || args->sgl_size == 0 || args->sq_batch_wqes == 0)
-    return 16;
+  const auto worker_index = args.worker_index;
+  if (worker_index >= state.worker_count || args.worker_count != state.worker_count ||
+      args.context.owner_pid != static_cast<std::uint64_t>(getpid()) ||
+      args.context.session != state.session || args.sgl_size == 0 || args.sq_batch_wqes == 0)
+    return kGatherTransportFailed;
   std::lock_guard<std::mutex> worker_lock(worker_mutexes[worker_index]);
-  auto& worker = GetWorker(worker_index);
-  if (worker.poisoned || worker.target == nullptr) return 16;
-  UmdkControlStatus timeline{};
-  if (!ScatterQueue(worker, request, *args, *status, first, last, remote_offset, timeline, 1000,
-                    worker_index, profile)) {
+  auto& worker = DataQueue(worker_index);
+  if (worker.poisoned || worker.target == nullptr) return kGatherTransportFailed;
+  UmdkControlStatus error{};
+  if (!ReadBatches(worker, request, args, status, first, last, error, profile)) {
     std::fprintf(stderr,
                  "GATHER_UMDK_READ_ERROR worker=%u stage=%s result=%d errno=%d cq_status=%d "
                  "cq_context=%llu\n",
-                 worker_index, timeline.stage, timeline.result, timeline.error_number,
-                 timeline.cq_status, static_cast<unsigned long long>(timeline.cq_context));
-    status->cqe_word = timeline.cq_status != 0 ? timeline.cq_status : timeline.error_number;
-    return status->result != 0 ? static_cast<std::uint32_t>(status->result) : 16;
+                 worker_index, error.stage, error.result, error.error_number,
+                 error.cq_status, static_cast<unsigned long long>(error.cq_context));
+    status.cqe_word = error.cq_status != 0 ? error.cq_status : error.error_number;
+    return status.result != 0 ? static_cast<std::uint32_t>(status.result) : kGatherTransportFailed;
   }
   return 0;
 }
-
-namespace {
 
 void Flush(const void* address, std::uint64_t bytes) { FlushUmdkCache(address, bytes); }
 
@@ -294,11 +282,11 @@ void WaitAck(const GatherReadArgs& args, GatherReadStatus& status) {
     status.ack_seen = *reinterpret_cast<const volatile std::uint64_t*>(transfer.local);
     if (status.ack_seen == args.sequence) return;
     if (status.ack_seen == (args.sequence | kvaf::peer::kGatherErrorBit)) {
-      status.result = 10U;
+      status.result = kCpuGatherFailed;
       return;
     }
   }
-  status.result = 9U;
+  status.result = kGatherTimeout;
 }
 
 // Build only the source descriptor consumed by the remote CPU. READ destinations
@@ -343,13 +331,13 @@ bool BuildCurrentRequest(const UmdkBatchGetArgs& launch, GatherReadArgs& args,
 bool StartGather(GatherReadArgs& args, GatherReadStatus& status, BatchGetWorkerProfile* profile) {
   const UmdkTransfer descriptor{args.remote_descriptor, args.source_descriptor,
                                 kvaf::peer::GatherDescriptorBytes(args.source_span_count)};
-  status.phase = 1U;
+  status.phase = kWriteSourceList;
   {
     BatchGetProfileScope timer(profile ? &profile->source_write_ns : nullptr);
     status.result = UmdkTransferSync(&args.context, true, &descriptor, 1U, args.worker_index);
   }
   if (status.result) return false;
-  status.phase = 2U;
+  status.phase = kNotifyCpu;
   auto* scratch = reinterpret_cast<std::uint64_t*>(args.scratch);
   scratch[0] = args.sequence;
   scratch[2] = args.remote_descriptor;
@@ -363,7 +351,7 @@ bool StartGather(GatherReadArgs& args, GatherReadStatus& status, BatchGetWorkerP
     status.result = UmdkTransferSync(&args.context, true, notify, 2U, args.worker_index);
   }
   if (!status.result && !args.pipeline_chunk_bytes) {
-    status.phase = 3U;
+    status.phase = kWaitCpuAck;
     BatchGetProfileScope timer(profile ? &profile->ack_ns : nullptr);
     WaitAck(args, status);
   }
@@ -405,15 +393,14 @@ std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
     built = BuildCurrentRequest(*launch, args, first, last, profile);
   }
   if (!built)
-    status.result = 2U;
+    status.result = kInvalidGatherRequest;
   else if (!args.bytes)
     status.ack_seen = args.sequence;
   else if (StartGather(args, status, profile)) {
     {
       BatchGetProfileScope timer(profile ? &profile->read_ns : nullptr);
-      status.phase = 4U;
-      status.result = GatherScatter(launch->request, &args, &status, first, last, 0U,
-                                    args.worker_index, profile);
+      status.phase = kReadStaging;
+      status.result = ReadStaging(launch->request, args, status, first, last, profile);
     }
     if (!status.result && args.pipeline_chunk_bytes) {
       BatchGetProfileScope timer(profile ? &profile->ack_ns : nullptr);

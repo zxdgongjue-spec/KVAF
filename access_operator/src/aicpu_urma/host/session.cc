@@ -9,8 +9,33 @@
 
 namespace kvaf::aicpu_urma {
 
+Status UmdkSession::CompletePending(UmdkControlStatus& status) {
+  if (aclrtSynchronizeStream(pending_) != ACL_SUCCESS)
+    return Status::Internal("UMDK stream completion failed; resources retained");
+  if (aclrtMemcpy(&status, sizeof(status), reinterpret_cast<void*>(args_.status), sizeof(status),
+                  ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS || status.magic != kUmdkControlMagic)
+    return Status::Internal("UMDK completion status unavailable; resources retained");
+  // A recovered prepare/destroy must update ownership before teardown continues.
+  if (args_.op == UmdkControlOp::kPrepare) {
+    args_.session = status.session;
+    args_.owner_pid = status.owner_pid;
+  } else if (args_.op == UmdkControlOp::kDestroy && status.result == 0) {
+    args_.session = 0;
+  }
+  pending_ = nullptr;
+  return Status::OK();
+}
+
+Status UmdkSession::Drain() {
+  if (!pending_) return Status::OK();
+  UmdkControlStatus status{};
+  return CompletePending(status);
+}
+
 Status UmdkSession::Run(UmdkControlOp op, UmdkControlStatus& status, aclrtStream stream,
                         Launch launch_kernel) {
+  if (failed_ && op != UmdkControlOp::kDestroy)
+    return Status::InvalidState("UMDK session failed; shut down before reuse");
   if (stream == nullptr) stream = stream_;
   args_.op = op;
   auto* device_status = reinterpret_cast<void*>(args_.status);
@@ -19,30 +44,32 @@ Status UmdkSession::Run(UmdkControlOp op, UmdkControlStatus& status, aclrtStream
   const auto launch = launch_kernel
                           ? launch_kernel(&args_, stream)
                           : LaunchUmdkKernel("KvafAicpuUmdkControl", &args_, sizeof(args_), stream);
-  const auto sync = aclrtSynchronizeStream(stream);
-  const auto copy = aclrtMemcpy(&status, sizeof(status), device_status, sizeof(status),
-                                ACL_MEMCPY_DEVICE_TO_HOST);
-  if (copy == ACL_SUCCESS && status.magic == kUmdkControlMagic && op == UmdkControlOp::kPrepare) {
-    args_.session = status.session;
-    args_.owner_pid = status.owner_pid;
+  if (launch != 0) {
+    failed_ = true;
+    return Status::Internal("UMDK kernel launch failed");
   }
-  if (launch != 0 || sync != ACL_SUCCESS || copy != ACL_SUCCESS ||
-      status.magic != kUmdkControlMagic || status.result != 0) {
-    if (copy == ACL_SUCCESS && status.magic == kUmdkControlMagic) {
-      std::fprintf(stderr,
-                   "UMDK_SETUP_ERROR op=%u workers=%u host_device='%s' "
-                   "result=%d errno=%d stage=%s detail=%s\n",
-                   static_cast<unsigned>(op), args_.worker_count, args_.device, status.result,
-                   status.error_number, status.stage, status.detail);
-    }
+  pending_ = stream;
+  auto completed = CompletePending(status);
+  if (!completed.ok()) {
+    failed_ = true;
+    return completed;
+  }
+  if (status.result != 0) {
+    failed_ = true;
+    std::fprintf(stderr,
+                 "UMDK_SETUP_ERROR op=%u workers=%u host_device='%s' "
+                 "result=%d errno=%d stage=%s detail=%s\n",
+                 static_cast<unsigned>(op), args_.worker_count, args_.device, status.result,
+                 status.error_number, status.stage, status.detail);
     return Status::Internal("UMDK setup/cleanup failed");
   }
-  if (op == UmdkControlOp::kDestroy) args_.session = 0;
   return Status::OK();
 }
 
 Status UmdkSession::Shutdown() {
   connected_ = false;  // A partial teardown must never be reused as a live session.
+  auto drained = Drain();
+  if (!drained.ok()) return drained;
   if (args_.session != 0) {
     UmdkControlStatus status{};
     auto result = Run(UmdkControlOp::kDestroy, status);
@@ -52,7 +79,7 @@ Status UmdkSession::Shutdown() {
   if (stream_ != nullptr) (void)aclrtDestroyStream(stream_);
   args_ = {};
   stream_ = nullptr;
-  connected_ = false;
+  failed_ = false;
   registered_buffers_.clear();
   return Status::OK();
 }
@@ -65,6 +92,8 @@ Status UmdkSession::Load() {
 }
 
 Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t output_bytes) {
+  if (failed_ || pending_)
+    return Status::InvalidState("UMDK session failed; shut down before reuse");
   auto& link = *config_.peer_link;
   const auto& device = config_.device;
   const auto eid_index = config_.eid_index, workers = config_.workers;
@@ -143,6 +172,8 @@ Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t 
 
 Status UmdkSession::WriteDescriptors(std::uint64_t descriptors, std::uint32_t count,
                                      aclrtStream stream, Launch launch) {
+  if (failed_ || pending_)
+    return Status::InvalidState("UMDK session failed; shut down before reuse");
   if (!connected_ || !stream || !descriptors || !count || count > kUmdkMaxTransfers)
     return Status::InvalidArgument("UMDK WRITE requires a connected session and descriptors");
   args_.transfer_spans = descriptors;

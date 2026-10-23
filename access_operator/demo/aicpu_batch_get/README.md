@@ -9,7 +9,7 @@
 - `kernel/gather_read.cc`：领取 worker 编号，分配各自的输入和工作区，执行完整请求链。
 - `include/batch_get_abi.h`：复用原 BatchGet 输入 ABI，定义流水参数和状态。
 
-具体发送顺序为 `ScatterQueue → AppendGatherBatch → WaitBatchPrefix → PostBatch → WaitCompletion`。
+具体发送顺序为 `ReadBatches → BuildReadBatch → WaitBatchPrefix → PostBatch → WaitCompletion`。
 最后两个通用通信操作由 `src/aicpu_urma/kernel/transfer.cc` 提供。
 
 Get/Put 共用一个 UMDK 会话与设备 SO，资源管理由 `src/aicpu_urma` 负责。

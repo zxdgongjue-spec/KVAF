@@ -13,6 +13,21 @@ namespace kvaf::aicpu_urma {
 constexpr std::uint64_t kGatherStatusMagic = 0x4b56414647415448ULL;
 constexpr std::uint32_t kGatherMaxSpans = kGatherMaxRequests;
 
+enum GatherReadPhase : std::uint64_t {
+  kWriteSourceList = 1,
+  kNotifyCpu = 2,
+  kWaitCpuAck = 3,
+  kReadStaging = 4,
+  kWaitReadyPrefix = 5,
+};
+
+enum GatherReadError : std::uint64_t {
+  kInvalidGatherRequest = 2,
+  kGatherTimeout = 9,
+  kCpuGatherFailed = 10,
+  kGatherTransportFailed = 16,
+};
+
 struct alignas(64) GatherReadStatus {
   std::uint64_t magic, result, phase, ack_seen, cqe_word, sequence;
 };

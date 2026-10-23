@@ -4,10 +4,14 @@
 #include "meta_manager.h"
 #include "aicpu_urma/session.h"
 namespace kvaf::aicpu_urma {
-void BatchPutTransport::Shutdown() {
+Status BatchPutTransport::Shutdown() {
+  auto drained = session_.Drain();
+  if (!drained.ok()) return drained;
   if (transfers_) (void)aclrtFree(transfers_);
   transfers_ = nullptr;
   capacity_ = 0;
+  host_transfers_ = std::vector<UmdkTransfer>{};
+  return Status::OK();
 }
 Status BatchPutTransport::Execute(const RemoteRegionDesc& region, const BatchPutExecRequest& exec) {
   if (!exec.request || !exec.put_desc || !exec.execution.stream)
@@ -22,7 +26,8 @@ Status BatchPutTransport::Execute(const RemoteRegionDesc& region, const BatchPut
   auto ready =
       session_.Ensure(region.base, const_cast<void*>(request.input.data), request.input.bytes);
   if (!ready.ok()) return ready;
-  std::vector<UmdkTransfer> transfers;
+  auto& transfers = host_transfers_;
+  transfers.clear();
   transfers.reserve(request.keys.size());
   for (std::size_t index = 0; index < request.keys.size(); ++index) {
     const auto offset = request.input_offsets[index], length = request.lengths[index];

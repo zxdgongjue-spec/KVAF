@@ -40,7 +40,8 @@ Status UmdkAccessOperator::Shutdown() {
   if (!closed.ok()) return closed;
   auto released = impl_->get.Shutdown();
   if (!released.ok()) return released;
-  impl_->put.Shutdown();
+  auto put_released = impl_->put.Shutdown();
+  if (!put_released.ok()) return put_released;
   impl_->initialized = false;
   return Status::OK();
 }

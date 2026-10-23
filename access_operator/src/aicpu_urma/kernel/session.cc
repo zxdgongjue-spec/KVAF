@@ -14,22 +14,21 @@
 
 namespace kvaf::aicpu_urma::detail {
 
-State state;
+SessionState state;
 std::shared_mutex state_mutex;
 std::array<std::mutex, 8> worker_mutexes;
 namespace {
 std::uint64_t generation = 0;
 }  // namespace
 
-Worker& GetWorker(std::uint32_t index) {
-  return index == 0 ? static_cast<Worker&>(state) : *state.extra_workers[index - 1];
+Queue& DataQueue(std::uint32_t index) {
+  return state.data_queues[index];
 }
 
-Worker* SetupQueue(std::uint32_t index) {
-  if (index < state.worker_count) return &GetWorker(index);
-  if (index == kUmdkControlQueueIndex) return state.control.get();
-  if (index > kUmdkControlQueueIndex && index < kUmdkControlQueueIndex + state.worker_count)
-    return state.extra_controls[index - kUmdkControlQueueIndex - 1U].get();
+Queue* FindQueue(std::uint32_t index) {
+  if (index < state.worker_count) return &DataQueue(index);
+  if (index >= kUmdkControlQueueIndex && index < kUmdkControlQueueIndex + state.worker_count)
+    return &state.control_queues[index - kUmdkControlQueueIndex];
   return nullptr;
 }
 
@@ -46,7 +45,7 @@ bool Fail(UmdkControlStatus& status, const char* stage, int result, const char* 
   return false;
 }
 
-bool CleanupWorker(Worker& worker, UmdkControlStatus& status) {
+bool CleanupQueue(Queue& worker, UmdkControlStatus& status) {
 #define KVAF_RELEASE_WORKER(member, function)                \
   if (worker.member != nullptr) {                            \
     errno = 0;                                               \
@@ -63,13 +62,10 @@ bool CleanupWorker(Worker& worker, UmdkControlStatus& status) {
 }
 
 bool Cleanup(UmdkControlStatus& status) {
-  for (std::uint32_t index = 0; index < state.worker_count; ++index) {
-    if (index != 0 && !state.extra_workers[index - 1]) continue;
-    if (!CleanupWorker(GetWorker(index), status)) return false;
-  }
-  if (state.control && !CleanupWorker(*state.control, status)) return false;
-  for (auto& control : state.extra_controls)
-    if (control && !CleanupWorker(*control, status)) return false;
+  for (std::uint32_t index = 0; index < state.worker_count; ++index)
+    if (!CleanupQueue(state.data_queues[index], status)) return false;
+  for (std::uint32_t index = 0; index < state.worker_count; ++index)
+    if (!CleanupQueue(state.control_queues[index], status)) return false;
 #define KVAF_RELEASE(member, function)                       \
   if (state.member != nullptr) {                             \
     errno = 0;                                               \
@@ -112,7 +108,8 @@ std::string ResidentUrmaPath() {
         const char* name = std::strrchr(info->dlpi_name, '/');
         name = name == nullptr ? info->dlpi_name : name + 1;
         if (std::strncmp(name, "liburma.so", 10) != 0 || (name[10] != '\0' && name[10] != '.') ||
-            std::strstr(info->dlpi_name, "/umdk/") != nullptr)
+            (std::strstr(info->dlpi_name, "/umdk/") != nullptr ||
+             std::strstr(info->dlpi_name, "/umdk_runtime/") != nullptr))
           return 0;
         *static_cast<std::string*>(output) = info->dlpi_name;
         return 1;
@@ -122,7 +119,8 @@ std::string ResidentUrmaPath() {
   auto* symbol = dlsym(RTLD_DEFAULT, "urma_init");
   Dl_info info{};
   if (symbol != nullptr && dladdr(symbol, &info) != 0 && info.dli_fname != nullptr &&
-      std::strstr(info.dli_fname, "/umdk/") == nullptr)
+      std::strstr(info.dli_fname, "/umdk/") == nullptr &&
+      std::strstr(info.dli_fname, "/umdk_runtime/") == nullptr)
     path = info.dli_fname;
 #endif
   return path;
@@ -142,7 +140,7 @@ bool LoadApi(const UmdkControlArgs& args, UmdkControlStatus& status) {
         info.dli_fname != nullptr) {
       const std::string path = info.dli_fname;
       const auto slash = path.find_last_of('/');
-      if (slash != std::string::npos) bundled = path.substr(0, slash) + "/umdk/";
+      if (slash != std::string::npos) bundled = path.substr(0, slash) + "/umdk_runtime/";
     }
     auto core = bundled + "liburma.so.0";
     if (access(core.c_str(), R_OK) != 0) core = bundled + "liburma.so";
@@ -178,7 +176,7 @@ bool LoadApi(const UmdkControlArgs& args, UmdkControlStatus& status) {
   return true;
 }
 
-bool CreateWorker(const UmdkControlArgs& args, UmdkControlStatus& status, Worker& worker) {
+bool CreateQueue(const UmdkControlArgs& args, UmdkControlStatus& status, Queue& worker) {
   const auto* error =
       kvaf::urma::CreateQueues(state.api, state.context, args.token, {64U, 64U, 6U, true},
                                worker.jfc, worker.jfr, worker.jetty);
@@ -186,7 +184,7 @@ bool CreateWorker(const UmdkControlArgs& args, UmdkControlStatus& status, Worker
 }
 
 bool DescribeWorker(const UmdkControlArgs& args, std::uint32_t index, UmdkControlStatus& status) {
-  auto* selected = SetupQueue(index);
+  auto* selected = FindQueue(index);
   if (selected == nullptr) return Fail(status, "invalid worker index");
   auto& worker = *selected;
   if (worker.jetty == nullptr) return Fail(status, "worker Jetty is unavailable");
@@ -235,18 +233,11 @@ bool Prepare(const UmdkControlArgs& args, UmdkControlStatus& status) {
   if (!state.context) return status.result ? false : Fail(status, "no usable UB EID inside AICPU");
   std::copy_n(args.route_eid, 16, state.peer_eid.begin());
   state.worker_count = args.worker_count;
-  // Keep the control queue's creation order independent of the data workers.
-  {
-    state.control = std::make_unique<Worker>();
-    if (!CreateWorker(args, status, *state.control)) return false;
-  }
+  // Preserve queue creation order while storing every worker uniformly.
+  if (!CreateQueue(args, status, state.control_queues[0])) return false;
   for (std::uint32_t index = 0; index < state.worker_count; ++index) {
-    if (index != 0) state.extra_workers[index - 1] = std::make_unique<Worker>();
-    if (!CreateWorker(args, status, GetWorker(index))) return false;
-    if (index != 0) {
-      state.extra_controls[index - 1] = std::make_unique<Worker>();
-      if (!CreateWorker(args, status, *state.extra_controls[index - 1])) return false;
-    }
+    if (!CreateQueue(args, status, state.data_queues[index])) return false;
+    if (index != 0 && !CreateQueue(args, status, state.control_queues[index])) return false;
   }
   Stage(status, "urma_alloc_token_id");
   state.token = state.api.urma_alloc_token_id(state.context);
@@ -267,13 +258,13 @@ bool Prepare(const UmdkControlArgs& args, UmdkControlStatus& status) {
   }
   state.buffer = args.local_buffer;
   state.buffer_bytes = args.buffer_bytes;
-  if (state.control && !DescribeWorker(args, kUmdkControlQueueIndex, status)) return false;
+  if (!DescribeWorker(args, kUmdkControlQueueIndex, status)) return false;
   if (!DescribeWorker(args, 0, status)) return false;
   return true;
 }
 
 bool Connect(const UmdkControlArgs& args, UmdkControlStatus& status) {
-  auto* selected = SetupQueue(args.worker_index);
+  auto* selected = FindQueue(args.worker_index);
   if (selected == nullptr) return Fail(status, "invalid worker index");
   auto& worker = *selected;
   if (state.local == nullptr || worker.target != nullptr || worker.tp == 0)
@@ -308,15 +299,12 @@ bool Connect(const UmdkControlArgs& args, UmdkControlStatus& status) {
   return DescribeWorker(args, args.worker_index, status);
 }
 
-urma_target_seg_t* LocalSegment(std::uint64_t address, std::uint64_t bytes,
-                                std::uint64_t* available) {
+urma_target_seg_t* LocalSegment(std::uint64_t address, std::uint64_t bytes) {
   if (state.local != nullptr && UmdkRange(state.buffer, state.buffer_bytes, address, bytes)) {
-    if (available != nullptr) *available = state.buffer_bytes - (address - state.buffer);
     return state.local;
   }
   for (const auto& buffer : state.buffers)
     if (UmdkRange(buffer.base, buffer.bytes, address, bytes)) {
-      if (available != nullptr) *available = buffer.bytes - (address - buffer.base);
       return buffer.segment;
     }
   return nullptr;
@@ -348,20 +336,3 @@ bool RegisterBuffer(const UmdkControlArgs& args, UmdkControlStatus& status) {
 }
 
 }  // namespace kvaf::aicpu_urma::detail
-
-namespace kvaf::aicpu_urma {
-using namespace detail;
-std::uint32_t UmdkGetMemory(const UmdkContext* args, std::uint64_t address, std::uint64_t bytes,
-                            UmdkMemory* memory) {
-  std::shared_lock<std::shared_mutex> lock(state_mutex);
-  if (args == nullptr || memory == nullptr || args->session != state.session ||
-      args->owner_pid != static_cast<std::uint64_t>(getpid()))
-    return 16;
-  std::uint64_t available = 0;
-  auto* local = LocalSegment(address, bytes, &available);
-  if (local == nullptr || state.remote == nullptr) return 16;
-  *memory = {address, available, state.remote->seg.ubva.va, state.remote->seg.len};
-  return 0;
-}
-
-}  // namespace kvaf::aicpu_urma

@@ -162,7 +162,9 @@ CPU 服务的 `--gather-threads` 是全部 worker 的总预算，须不小于 AI
 Runtime 在用户指定 DDR 数据容量之外按 worker 数预留 staging、源描述符和控制区，
 每个 staging 区间可容纳 `ceil(65536 / worker_count)` 个 token，并单独对齐到 64 字节。
 这些空间不进入 KV slot 分配。HBM 仅保留发给 CPU 的源描述符和控制 scratch，输出 Tensor 无需额外尾部空间。
-READ 使用 SGL 6、每次提交 32 条 WR；每波最多 4096 条 WR，只请求最后一条的有序 CQE，完成后复用 WR/SGL 空间。
+READ 使用 SGL 6、每次提交 32 条 WR；每波最多 4096 条 WR，只请求最后一条的有序 CQE。
+WR/SGL 工作区按本轮请求的上界增长，完成后复用容量；每轮仍重新填写全部有效请求。
+会话用独立数组保存数据队列和控制队列，worker 0 与其他 worker 使用相同的存储和访问方式。
 AICPU 只将输出地址交给 URMA，不直接读写输出 payload，因此 READ 前后不再逐段清理输出的 AICPU 缓存。
 输入元数据读取前、源清单发送前、状态回传前仍做缓存维护。
 每个 worker 的 scratch 独占一条 64 B 缓存行：通知发送前清理一次，此后 AICPU 只读取查询结果，
@@ -174,6 +176,9 @@ AICPU 只将输出地址交给 URMA，不直接读写输出 payload，因此 REA
 
 BatchPut 同步完成；BatchGet 默认只 enqueue，`synchronize=True` 等待完成并读取错误状态。
 内部 workspace 在下一次操作或 Shutdown 前排空；跨 stream 依赖由调用方负责。
+UMDK 控制/Put 的启动或完成处理失败后，会话拒绝后续 Get/Put；应关闭并重新初始化 Runtime。
+Shutdown 会先等待尚未确认完成的控制/Put 操作，再销毁通信资源。若仍无法确认完成，保留缓冲区并返回错误，
+调用方需继续保留已注册的源/输出 Tensor 和对应 stream。
 调用方须保留元数据 Tensor 至执行结束，已注册的源/输出 Tensor 至 Shutdown 前保持有效。
 同一 AICPU 进程只支持一个活动 UMDK 会话。目前该后端使用 eager 调用，不支持 ACL Graph capture/replay。
 
