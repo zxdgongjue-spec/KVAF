@@ -4,7 +4,7 @@
 
 #include "aicpu_batch_get/include/kvaf_aicpu_batch_get.h"
 #include "aicpu_batch_put/include/kvaf_aicpu_batch_put.h"
-#include "umdk/session.h"
+#include "aicpu_urma/session.h"
 namespace kvaf {
 struct UmdkAccessOperator::Impl {
   explicit Impl(UmdkAccessOperatorConfig config)

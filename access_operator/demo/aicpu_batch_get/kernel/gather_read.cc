@@ -6,7 +6,7 @@
 
 #include "cpu_gather.h"
 #include "transport_internal.h"
-#include "umdk/cache.h"
+#include "aicpu_urma/cache.h"
 
 namespace kvaf::aicpu_urma {
 namespace {

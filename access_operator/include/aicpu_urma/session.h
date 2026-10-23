@@ -6,7 +6,7 @@
 
 #include "acl/acl.h"
 #include "peer_link.h"
-#include "umdk/kernel_abi.h"
+#include "aicpu_urma/control_abi.h"
 
 namespace kvaf::aicpu_urma {
 

@@ -4,7 +4,7 @@
 #include "../../aiv_batch_get/include/batch_get_abi.h"
 #include "gather_workspace.h"
 #include "batch_get_profile.h"
-#include "umdk/kernel_abi.h"
+#include "aicpu_urma/control_abi.h"
 namespace kvaf {
 constexpr std::uint32_t kGatherMaxSglSize = 6U;
 }  // namespace kvaf

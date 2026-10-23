@@ -1,11 +1,11 @@
-#include "umdk/session.h"
+#include "aicpu_urma/session.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
-#include "umdk/kernel_loader.h"
+#include "aicpu_urma/kernel_loader.h"
 
 namespace kvaf::aicpu_urma {
 

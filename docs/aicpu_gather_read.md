@@ -69,7 +69,10 @@ runtime.shutdown()
 ```
 
 设备、URMA device、EID 和服务地址按部署环境调整。原来的 addresses/valid Tensor 重载也可直接使用。
-未设置 `aicpu_urma_kernel_json_path` 时仍走原 AIV 后端。
+`NpuRuntime::Impl::CreateCore()` 在创建 RuntimeCore 时选择 AccessOperator：
+`aicpu_urma_kernel_json_path` 非空时创建 `UmdkAccessOperator`，为空时创建 AIV 的
+`DefaultAccessOperator`。同一个 Runtime 的 Get/Put 使用选中的实现。
+相应实现必须在构建时启用；`build.sh aicpu-urma` 只编译 AICPU 后端，因此必须提供该 JSON 路径。
 
 如果调用方已经持有 NPU 地址表，直接调用现有 Tensor 重载，不必再创建 Host AccessTable 或重新上传地址表：
 
@@ -184,8 +187,12 @@ BatchPut 同步完成；BatchGet 默认只 enqueue，`synchronize=True` 等待�
 | `access_operator/demo/aicpu_batch_get/host/` | BatchGet workspace、参数和 kernel 提交 |
 | `access_operator/demo/aicpu_batch_get/kernel/gather_read.cc` | 当前流水算法、READ WR/SGL 组装和调度 |
 | `access_operator/demo/aicpu_batch_put/` | 原有同步 BatchPut 的 Host/设备实现 |
-| `access_operator/src/umdk/host/` | 通用会话和 kernel 加载 |
-| `access_operator/src/umdk/kernel/` | 通用队列、注册、提交、CQ 及统一设备包 |
+| `access_operator/include/aicpu_urma/` | Host 会话、算子加载、Host/设备控制 ABI、设备通信接口和缓存工具 |
+| `access_operator/src/aicpu_urma/host/` | Host 侧会话组织和 kernel 加载 |
+| `access_operator/src/aicpu_urma/kernel/session.cc` | AICPU 加载 liburma、创建/连接队列、注册内存和资源释放 |
+| `access_operator/src/aicpu_urma/kernel/transfer.cc` | READ/WRITE WR 构建、提交和 CQ 完成处理 |
+| `access_operator/src/aicpu_urma/kernel/control_kernel.cc` | Host 控制命令的设备入口和分发 |
+| `access_operator/src/aicpu_urma/package/` | 算子 JSON、UMDK 库打包和安装脚本 |
 
 当前 BatchGet 入口仅调用 `gather_read`；没有其他实现的占位代码或选择参数。
 两个 demo 均按 `include/host/kernel` 分层，共用一个设备包和会话；Python 参数及构建命令保持不变。

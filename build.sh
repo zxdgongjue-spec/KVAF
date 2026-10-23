@@ -193,7 +193,7 @@ build_aicpu_urma() {
   [[ -n "$cann_root" ]] || die "CANN toolkit not found; source CANN set_env.sh first"
   check_aicpu_cann_root "$cann_root"
   if [[ "$kernel_action" == check || "$kernel_action" == uninstall ]]; then
-    bash "$KVAF_ROOT/access_operator/src/umdk/install_kernel.sh" "--$kernel_action" "$cann_root"
+    bash "$KVAF_ROOT/access_operator/src/aicpu_urma/package/install_kernel.sh" "--$kernel_action" "$cann_root"
     return
   fi
   require_command cmake
@@ -214,8 +214,8 @@ build_aicpu_urma() {
     "${compiler_option[@]}"
   cmake --build "$build_dir" --target _kvaf kvaf_aicpu_urma_kernel --parallel "$jobs"
   if [[ "$kernel_action" == install ]]; then
-    bash "$KVAF_ROOT/access_operator/src/umdk/install_kernel.sh" --install \
-      "$build_dir/access_operator/src/umdk" "$cann_root"
+    bash "$KVAF_ROOT/access_operator/src/aicpu_urma/package/install_kernel.sh" --install \
+      "$build_dir/access_operator/src/aicpu_urma" "$cann_root"
   fi
   echo "[KVAF_BUILD] NPU Python package: $build_dir/python/kvaf"
 }

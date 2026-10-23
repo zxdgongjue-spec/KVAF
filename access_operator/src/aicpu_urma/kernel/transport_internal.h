@@ -5,7 +5,7 @@
 #include <shared_mutex>
 #include <vector>
 
-#include "umdk/kernel_transport.h"
+#include "aicpu_urma/transport.h"
 #include "urma_transport.h"
 namespace kvaf::aicpu_urma::detail {
 using namespace kvaf::urma;
@@ -95,6 +95,12 @@ extern std::shared_mutex state_mutex;
 extern std::array<std::mutex, 8> worker_mutexes;
 std::uint64_t NowNs();
 Worker& GetWorker(std::uint32_t index);
+Worker* SetupQueue(std::uint32_t index);
+bool Prepare(const UmdkControlArgs&, UmdkControlStatus&);
+bool Connect(const UmdkControlArgs&, UmdkControlStatus&);
+bool DescribeWorker(const UmdkControlArgs&, std::uint32_t index, UmdkControlStatus&);
+bool RegisterBuffer(const UmdkControlArgs&, UmdkControlStatus&);
+bool Cleanup(UmdkControlStatus&);
 void Stage(UmdkControlStatus&, const char*);
 bool Fail(UmdkControlStatus&, const char*, int result = -1, const char* detail = "");
 bool PostBatch(Worker&, urma_jfs_wr_t* first, urma_jfs_wr_t* tail, UmdkControlStatus&);

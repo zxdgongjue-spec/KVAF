@@ -1,4 +1,4 @@
-#include "umdk/kernel_loader.h"
+#include "aicpu_urma/kernel_loader.h"
 
 #include <limits.h>
 

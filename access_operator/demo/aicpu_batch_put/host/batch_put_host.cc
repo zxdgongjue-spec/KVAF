@@ -2,7 +2,7 @@
 
 #include "aicpu_batch_put/include/kvaf_aicpu_batch_put.h"
 #include "meta_manager.h"
-#include "umdk/session.h"
+#include "aicpu_urma/session.h"
 namespace kvaf::aicpu_urma {
 void BatchPutTransport::Shutdown() {
   if (transfers_) (void)aclrtFree(transfers_);

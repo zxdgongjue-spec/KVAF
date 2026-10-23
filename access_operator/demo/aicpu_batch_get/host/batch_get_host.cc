@@ -4,7 +4,7 @@
 #include "aicpu_batch_get/include/kvaf_aicpu_batch_get.h"
 #include "batch_get_args.h"
 #include "cpu_gather.h"
-#include "umdk/session.h"
+#include "aicpu_urma/session.h"
 namespace kvaf::aicpu_urma {
 namespace {
 Status InvalidArgument(std::string s) { return Status::InvalidArgument(std::move(s)); }

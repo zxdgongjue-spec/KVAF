@@ -10,9 +10,9 @@
 - `include/batch_get_abi.h`：复用原 BatchGet 输入 ABI，定义流水参数和状态。
 
 具体发送顺序为 `ScatterQueue → AppendGatherBatch → WaitBatchPrefix → PostBatch → WaitCompletion`。
-最后两个通用通信操作由 `src/umdk/kernel/transport.cc` 提供。
+最后两个通用通信操作由 `src/aicpu_urma/kernel/transfer.cc` 提供。
 
-Get/Put 共用一个 UMDK 会话与设备 SO，资源管理由 `src/umdk` 负责。
+Get/Put 共用一个 UMDK 会话与设备 SO，资源管理由 `src/aicpu_urma` 负责。
 每个 worker 有自己的控制和数据 Jetty/CQ、CPU gather 处理对象、描述头、邮箱和进度。
 staging 来自同一块 DDR 分配，各 worker 使用不重叠的区间，所有通道共用一对 TP。
 完整构建和 Python 调用见 [使用说明](../../../docs/aicpu_gather_read.md)。

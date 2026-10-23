@@ -9,15 +9,17 @@ if(KVAF_AICPU_UMDK_RUNTIME_DIR)
     "${KVAF_AICPU_UMDK_RUNTIME_DIR}/liburma_common.so*"
     "${KVAF_AICPU_UMDK_RUNTIME_DIR}/urma/*.so*")
 endif()
-configure_file(kernel.json "${package_dir}/kernel.json" COPYONLY)
+configure_file(../package/kernel.json "${package_dir}/kernel.json" COPYONLY)
 # One SO keeps the transport/session state shared by both demos.
-set(device_sources "${CMAKE_CURRENT_SOURCE_DIR}/transport.cc"
+set(device_sources "${CMAKE_CURRENT_SOURCE_DIR}/session.cc"
+  "${CMAKE_CURRENT_SOURCE_DIR}/transfer.cc"
+  "${CMAKE_CURRENT_SOURCE_DIR}/control_kernel.cc"
   ${KVAF_AICPU_BATCH_GET_DEVICE_SOURCES} ${KVAF_AICPU_BATCH_PUT_DEVICE_SOURCES})
 set(device_headers "${CMAKE_CURRENT_SOURCE_DIR}/transport_internal.h"
   ${KVAF_AICPU_BATCH_GET_DEVICE_HEADERS} ${KVAF_AICPU_BATCH_PUT_DEVICE_HEADERS}
-  "${CMAKE_SOURCE_DIR}/access_operator/include/umdk/kernel_abi.h"
-  "${CMAKE_SOURCE_DIR}/access_operator/include/umdk/kernel_transport.h"
-  "${CMAKE_SOURCE_DIR}/access_operator/include/umdk/cache.h"
+  "${CMAKE_SOURCE_DIR}/access_operator/include/aicpu_urma/control_abi.h"
+  "${CMAKE_SOURCE_DIR}/access_operator/include/aicpu_urma/transport.h"
+  "${CMAKE_SOURCE_DIR}/access_operator/include/aicpu_urma/cache.h"
   "${CMAKE_SOURCE_DIR}/common/include/urma_transport.h"
   "${CMAKE_SOURCE_DIR}/runtime/include/cpu_gather.h"
   "${CMAKE_SOURCE_DIR}/common/include/gather_span.h"
@@ -34,8 +36,8 @@ add_custom_command(OUTPUT "${kernel_so}"
     -I "${CMAKE_SOURCE_DIR}/common/include" -I "${KVAF_AICPU_UMDK_INCLUDE_DIR}"
     ${device_sources} -ldl -pthread "-Wl,-rpath,$ORIGIN" -Wl,-z,defs -o "${kernel_so}"
   COMMAND "${CMAKE_COMMAND}" "-DUMDK_RUNTIME_DIR=${KVAF_AICPU_UMDK_RUNTIME_DIR}" "-DOUTPUT_DIR=${kernel_dir}/umdk_runtime"
-    -P "${CMAKE_CURRENT_SOURCE_DIR}/../bundle_umdk.cmake"
-  DEPENDS ${device_sources} ${device_headers} "${CMAKE_CURRENT_SOURCE_DIR}/../bundle_umdk.cmake" ${umdk_runtime_files}
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/../package/bundle_umdk.cmake"
+  DEPENDS ${device_sources} ${device_headers} "${CMAKE_CURRENT_SOURCE_DIR}/../package/bundle_umdk.cmake" ${umdk_runtime_files}
   VERBATIM)
 add_custom_command(OUTPUT "${package_dir}/kvaf-aicpu-urma.tar.gz"
   COMMAND "${CMAKE_COMMAND}" -E tar czf "${package_dir}/kvaf-aicpu-urma.tar.gz" aicpu_kernels_device
