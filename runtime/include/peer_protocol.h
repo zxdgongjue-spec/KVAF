@@ -16,6 +16,8 @@ constexpr uint16_t kProtocolVersion = 6U;
 constexpr uint32_t kQpKeyBytes = 64U;
 constexpr uint32_t kSegKeyBytes = 64U;
 constexpr uint32_t kEidBytes = 16U;
+constexpr uint32_t kMaxGatherSpans = 65536U;
+constexpr uint32_t kChannelSharedTp = 1U;
 constexpr uint32_t kDeviceNameBytes = 64U;
 
 enum class Command : uint16_t {
@@ -23,6 +25,8 @@ enum class Command : uint16_t {
   kCreateChannel = 2U,
   kReleaseRegion = 3U,
   kGetCandidateCount = 4U,
+  kEnableDirectGather = 9U,
+  kEnableGatherLanes = 10U,
   kGetCandidateInfo = 5U,
 };
 
@@ -121,6 +125,16 @@ struct StatusResponse {
   int32_t result;
   uint32_t reserved;
 };
+struct EnableDirectGatherRequest {
+  MessageHeader header;
+  uint64_t session_id;
+};
+struct EnableGatherLanesRequest {
+  MessageHeader header;
+  uint64_t session_id;
+  uint64_t control_address;
+  uint32_t lanes;
+};
 #pragma pack(pop)
 
 static_assert(sizeof(MessageHeader) == 12U, "wire header ABI changed");
@@ -131,6 +145,7 @@ static_assert(sizeof(CandidateInfoRequest) == 16U, "candidate info request ABI c
 static_assert(sizeof(CandidateInfoResponse) == 92U, "candidate info response ABI changed");
 static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed");
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");
+static_assert(sizeof(EnableGatherLanesRequest) == 32U, "gather lanes request ABI changed");
 
 inline constexpr uint16_t ResponseCommand(Command command) {
   return static_cast<uint16_t>(command) | 0x8000U;

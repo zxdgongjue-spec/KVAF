@@ -27,6 +27,10 @@ struct NpuRuntimeOptions {
   std::uint32_t device_id{0U};
   std::uint32_t npu_core_count{2U};
   std::uint32_t jettys_per_core{2U};
+  // Nonempty selects the optional AICPU UMDK data plane; AIV defaults stay unchanged.
+  std::string aicpu_urma_kernel_json_path;
+  std::string urma_device;
+  std::uint32_t urma_eid_index{UINT32_MAX};
   // Total submitted, unconfirmed READs per BatchGet launch; 0 disables control.
   std::uint32_t batch_get_max_inflight_total{2048U};
   // Optional strict local-EID list. Empty preserves automatic discovery and

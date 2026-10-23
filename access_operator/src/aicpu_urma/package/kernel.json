@@ -1,0 +1,23 @@
+{
+  "KvafAicpuGatherRead": {
+    "opInfo": {
+      "functionName": "KvafAicpuGatherRead",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
+  },
+  "KvafAicpuUmdkControl": {
+    "opInfo": {
+      "functionName": "KvafAicpuUmdkControl",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
+  },
+  "KvafAicpuBatchPut": {
+    "opInfo": {
+      "functionName": "KvafAicpuBatchPut",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
+  }
+}

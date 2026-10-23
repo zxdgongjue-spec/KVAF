@@ -8,6 +8,7 @@ option(KVAF_ENABLE_AIV_BATCH_GET
 option(KVAF_ENABLE_AIV_BATCH_PUT
        "Build the CANN-backed Direct-HCCP BatchPut data plane"
        ${KVAF_ENABLE_AIV_BATCH_GET})
+option(KVAF_ENABLE_AICPU_URMA "Build the optional AICPU UMDK GatherRead data plane" OFF)
 option(KVAF_BUILD_REMOTE_CPU_SERVICE
        "Build the liburma-only persistent CPU DDR/Jetty service"
        OFF)
@@ -23,7 +24,7 @@ endif()
 # (notably Status, requests and metadata vectors) has the same object layout.
 # Applying it only to the binding and hardware operator lets Runtime construct
 # ABI-1 objects that an ABI-0 callee later destroys, which corrupts the heap.
-if(KVAF_ENABLE_AIV_BATCH_GET)
+if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA)
   add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=0)
   message(STATUS "KVAF AIV C++ ABI: _GLIBCXX_USE_CXX11_ABI=0 (all targets)")
 endif()

@@ -26,7 +26,7 @@ target_link_libraries(kvaf_runtime
 
 target_compile_features(kvaf_runtime PUBLIC cxx_std_17)
 
-if(KVAF_ENABLE_AIV_BATCH_GET)
+if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA)
   add_library(kvaf_npu_runtime STATIC src/npu_runtime.cc)
   target_include_directories(kvaf_npu_runtime
     PUBLIC
@@ -36,8 +36,15 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
       ${ASCEND_CANN_PACKAGE_PATH}/include)
   target_link_libraries(kvaf_npu_runtime
     PUBLIC kvaf_runtime
-    PRIVATE kvaf_peer_link kvaf_default_access_operator
-            kvaf_execute_batch_get_host ascendcl ${CMAKE_DL_LIBS})
+    PRIVATE kvaf_peer_link ascendcl ${CMAKE_DL_LIBS})
+  if(KVAF_ENABLE_AIV_BATCH_GET)
+    target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_default_access_operator kvaf_execute_batch_get_host)
+    target_compile_definitions(kvaf_npu_runtime PRIVATE KVAF_ENABLE_AIV_BATCH_GET=1)
+  endif()
+  if(KVAF_ENABLE_AICPU_URMA)
+    target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_aicpu_access_operator)
+    target_compile_definitions(kvaf_npu_runtime PRIVATE KVAF_ENABLE_AICPU_URMA=1)
+  endif()
   if(KVAF_ENABLE_AIV_BATCH_PUT)
     target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_execute_batch_put_host)
   endif()
@@ -65,14 +72,14 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
       "KVAF_BUILD_REMOTE_CPU_SERVICE requires urma_api.h and liburma; set KVAF_URMA_ROOT")
   endif()
 
-  add_library(kvaf_cpu_runtime STATIC src/cpu_runtime.cc)
+  add_library(kvaf_cpu_runtime STATIC src/cpu_runtime.cc src/cpu_urma_discovery.cc)
   target_include_directories(kvaf_cpu_runtime
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
       "${KVAF_URMA_INCLUDE_DIR}")
   target_link_libraries(kvaf_cpu_runtime
     PUBLIC kvaf_runtime
-    PRIVATE "${KVAF_URMA_LIBRARY}" "${CMAKE_DL_LIBS}" Threads::Threads)
+    PRIVATE "${KVAF_URMA_LIBRARY}" "${CMAKE_DL_LIBS}" Threads::Threads kvaf_cpu_gather_executor)
   target_compile_features(kvaf_cpu_runtime PUBLIC cxx_std_17)
 
   add_executable(kvaf_cpu_service src/cpu_service_main.cc)
@@ -81,4 +88,12 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   set_property(TARGET kvaf_cpu_service APPEND PROPERTY BUILD_RPATH
     "${KVAF_URMA_LIBRARY_DIR}")
   target_compile_features(kvaf_cpu_service PRIVATE cxx_std_17)
+endif()
+
+if(KVAF_BUILD_REMOTE_CPU_SERVICE)
+  find_package(Threads REQUIRED)
+  add_library(kvaf_cpu_gather_executor STATIC src/cpu_gather_executor.cc)
+  target_include_directories(kvaf_cpu_gather_executor PUBLIC include)
+  target_link_libraries(kvaf_cpu_gather_executor PUBLIC kvaf_common kvaf_access_operator Threads::Threads)
+  target_compile_options(kvaf_cpu_gather_executor PRIVATE "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2>")
 endif()

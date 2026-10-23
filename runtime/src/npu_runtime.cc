@@ -25,6 +25,10 @@
 #include "access_operator.h"
 #include "peer_link.h"
 #include "meta_manager.h"
+#include "gather_workspace.h"
+#if defined(KVAF_ENABLE_AICPU_URMA)
+#include "aicpu_access_operator.h"
+#endif
 #include "startup_bandwidth_probe.h"
 #include "startup_selection.h"
 
@@ -35,8 +39,8 @@ Status Internal(std::string message) { return Status::Internal(std::move(message
 
 class PeerDdrAllocator final : public DdrMemoryAllocator {
  public:
-  explicit PeerDdrAllocator(std::shared_ptr<peer::PeerLink> link)
-      : link_(std::move(link)) {}
+  explicit PeerDdrAllocator(std::shared_ptr<peer::PeerLink> link, std::uint64_t workspace = 0U)
+      : link_(std::move(link)), workspace_(workspace) {}
 
   void SetCandidate(std::uint32_t candidate_id) { candidate_id_ = candidate_id; }
   bool has_allocation() const { return allocated_.base != 0U; }
@@ -48,9 +52,14 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
       return Status::InvalidArgument("invalid peer DDR allocation request");
     }
     if (allocated_.base != 0U) return Status::InvalidState("peer DDR is already allocated");
-    Status status = link_->AllocateRegion(request.ddr_bytes, request.slot_size, candidate_id_, &allocated_);
+    if (workspace_ > UINT64_MAX - (request.slot_size - 1U))
+      return Status::InvalidArgument("gather workspace size overflow");
+    const auto reserved = (workspace_ + request.slot_size - 1U) / request.slot_size * request.slot_size;
+    if (request.ddr_bytes > UINT64_MAX - reserved)
+      return Status::InvalidArgument("DDR allocation size overflow");
+    Status status = link_->AllocateRegion(request.ddr_bytes + reserved, request.slot_size, candidate_id_, &allocated_);
     if (!status.ok()) return status;
-    *region = RemoteRegionDesc{allocated_.base, allocated_.length, request.slot_size, DeviceKind::kCpu};
+    *region = RemoteRegionDesc{allocated_.base, request.ddr_bytes, request.slot_size, DeviceKind::kCpu};
     return Status::OK();
   }
 
@@ -65,6 +74,7 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
 
  private:
   std::shared_ptr<peer::PeerLink> link_;
+  std::uint64_t workspace_{0U};
   std::uint32_t candidate_id_{0U};
   peer::PeerRegion allocated_{};
 };
@@ -440,7 +450,18 @@ struct NpuRuntime::Impl {
 
   void CreateCore() {
     meta_manager = CreateInMemoryMetaManager();
-    access_operator = std::make_unique<DefaultAccessOperator>(config);
+#if defined(KVAF_ENABLE_AICPU_URMA)
+    if (!options.aicpu_urma_kernel_json_path.empty())
+      access_operator = std::make_unique<UmdkAccessOperator>(UmdkAccessOperatorConfig{
+          options.aicpu_urma_kernel_json_path, options.urma_device, options.urma_eid_index,
+          options.npu_core_count, peer_link, options.batch_get_token_bytes});
+    else
+#endif
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+      access_operator = std::make_unique<DefaultAccessOperator>(config);
+#else
+      throw std::invalid_argument("AIV data plane is not built; configure an AICPU UMDK kernel");
+#endif
     runtime_core = std::make_unique<RuntimeCore>(*meta_manager, *access_operator, *allocator);
   }
 
@@ -458,14 +479,14 @@ struct NpuRuntime::Impl {
   std::unique_ptr<DdrMemoryAllocator> allocator;
   PeerDdrAllocator* peer_allocator{nullptr};
   std::shared_ptr<peer::PeerLink> peer_link;
-  std::unique_ptr<DefaultAccessOperator> access_operator;
+  std::unique_ptr<AccessOperator> access_operator;
   std::unique_ptr<RuntimeCore> runtime_core;
   void* probe_buffer{nullptr};
   std::unique_ptr<detail::StartupBandwidthProbe> bandwidth_probe;
 };
 
 NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {
-  if (impl_->config.batch_get_kernel_object_path.empty() || impl_->options.npu_core_count == 0U ||
+  if ((impl_->config.batch_get_kernel_object_path.empty() && impl_->options.aicpu_urma_kernel_json_path.empty()) || impl_->options.npu_core_count == 0U ||
       impl_->options.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->options.jettys_per_core == 0U ||
       impl_->options.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
@@ -481,6 +502,17 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())))) {
     throw std::invalid_argument("invalid NPU Runtime configuration");
   }
+#if !defined(KVAF_ENABLE_AICPU_URMA)
+  if (!impl_->options.aicpu_urma_kernel_json_path.empty())
+    throw std::invalid_argument("AICPU UMDK support was not built");
+#endif
+  if (!impl_->options.aicpu_urma_kernel_json_path.empty() &&
+      (impl_->options.adaptive_ub_device || !impl_->options.npu_eids.empty()))
+    throw std::invalid_argument("AICPU uses urma_device/urma_eid_index; AIV EID striping and startup tuning are unavailable");
+  if (!impl_->options.aicpu_urma_kernel_json_path.empty() &&
+      (impl_->options.npu_core_count > 8U ||
+       GatherStagingBytes(impl_->options.batch_get_token_bytes) > UINT32_MAX))
+    throw std::invalid_argument("UMDK supports 1..8 workers and a gather payload fitting uint32");
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS) {
     throw std::runtime_error("aclrtSetDevice failed for NpuRuntime");
   }
@@ -488,10 +520,10 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
 
 NpuRuntime::~NpuRuntime() {
   if (impl_ != nullptr) {
-    (void)Shutdown();
+    const auto status = Shutdown();
     impl_->runtime_core.reset();
     impl_->access_operator.reset();
-    impl_->ReleaseProbe();
+    if (status.ok()) impl_->ReleaseProbe();
   }
 }
 
@@ -499,12 +531,15 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
   if (target.address.empty()) return Status::InvalidArgument("NpuRuntime LinkTo requires peer host:port");
   if (initialized()) return Status::InvalidState("NpuRuntime LinkTo must run before initialize");
   if (impl_->peer_link != nullptr) return Status::InvalidState("NpuRuntime already has a PeerLink");
-  if (impl_->config.batch_put_kernel_object_path.empty()) {
+  if (impl_->config.batch_put_kernel_object_path.empty() && impl_->options.aicpu_urma_kernel_json_path.empty()) {
     return Status::InvalidArgument("PeerLink requires the AIV BatchPut kernel for RMA validation");
   }
   impl_->peer_link = std::make_shared<peer::PeerLink>(target.address);
   impl_->config.peer_link = impl_->peer_link;
-  auto allocator = std::make_unique<PeerDdrAllocator>(impl_->peer_link);
+  auto allocator = std::make_unique<PeerDdrAllocator>(impl_->peer_link,
+      impl_->options.aicpu_urma_kernel_json_path.empty() ? 0U :
+          GatherRemoteWorkspaceBytes(impl_->options.batch_get_token_bytes,
+                                     impl_->options.npu_core_count));
   impl_->peer_allocator = allocator.get();
   impl_->allocator = std::move(allocator);
   impl_->runtime_core.reset();
@@ -535,7 +570,9 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   std::vector<NpuLocalEidCandidate> npu_candidates;
   std::string discovery_error;
   const bool explicit_eids = !impl_->options.npu_eids.empty();
-  if (explicit_eids) {
+  if (!impl_->options.aicpu_urma_kernel_json_path.empty()) {
+    npu_candidates.push_back({{}, "umdk_device_discovery"});
+  } else if (explicit_eids) {
     if (!ParseConfiguredNpuLocalEids(impl_->options.device_id,
                                      impl_->options.npu_eids,
                                      &npu_candidates, &discovery_error)) {
@@ -677,7 +714,12 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       if (last.ok() && measure) {
         impl_->bandwidth_probe =
             std::make_unique<detail::StartupBandwidthProbe>(probe_config);
-        last = impl_->bandwidth_probe->Run(*impl_->runtime_core, *impl_->access_operator, cycles);
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+        last = impl_->bandwidth_probe->Run(*impl_->runtime_core,
+            static_cast<DefaultAccessOperator&>(*impl_->access_operator), cycles);
+#else
+        last = Status::NotImplemented("AIV startup profiling was not built");
+#endif
         if (last.ok()) {
           std::fprintf(stderr,
                        "[KVAF_AIV] UB_DEVICE_PROBE_RESULT device_id=%u "
@@ -808,6 +850,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       device_candidates, initialize_candidate, cleanup);
 }
 
+
 RuntimeCore& NpuRuntime::core() {
   if (impl_->runtime_core == nullptr) {
     throw std::logic_error("NpuRuntime requires LinkTo before core access");
@@ -838,7 +881,11 @@ Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled) {
     return Status::NotInitialized(
         "NpuRuntime requires LinkTo before configuring BatchGet profiling");
   }
-  return impl_->access_operator->SetBatchGetKernelProfiling(enabled);
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+  if (impl_->options.aicpu_urma_kernel_json_path.empty())
+    return static_cast<DefaultAccessOperator&>(*impl_->access_operator).SetBatchGetKernelProfiling(enabled);
+#endif
+  return Status::NotImplemented("Use BatchGet profile=True for AICPU stage timings");
 }
 
 Status NpuRuntime::CopyBatchGetKernelProfiles(
@@ -847,7 +894,11 @@ Status NpuRuntime::CopyBatchGetKernelProfiles(
     return Status::NotInitialized(
         "NpuRuntime requires LinkTo before reading BatchGet profiling");
   }
-  return impl_->access_operator->CopyBatchGetKernelProfiles(profiles);
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+  if (impl_->options.aicpu_urma_kernel_json_path.empty())
+    return static_cast<DefaultAccessOperator&>(*impl_->access_operator).CopyBatchGetKernelProfiles(profiles);
+#endif
+  return Status::NotImplemented("Use BatchGet profile=True for AICPU stage timings");
 }
 
 Status NpuRuntime::AcceptLink(const LinkTarget&) {
@@ -878,7 +929,7 @@ Status NpuRuntime::Shutdown() {
   const Status status = impl_->runtime_core != nullptr && impl_->runtime_core->initialized()
                             ? impl_->runtime_core->Shutdown()
                             : Status::OK();
-  impl_->ReleaseProbe();
+  if (status.ok()) impl_->ReleaseProbe();
   return status;
 }
 
@@ -887,7 +938,8 @@ bool NpuRuntime::initialized() const {
 }
 
 RuntimeCapabilities NpuRuntime::capabilities() const {
-  return RuntimeCapabilities{true, !impl_->config.batch_put_kernel_object_path.empty(), false, true};
+  return RuntimeCapabilities{true, !impl_->config.batch_put_kernel_object_path.empty() ||
+      !impl_->options.aicpu_urma_kernel_json_path.empty(), false, true};
 }
 
 }  // namespace kvaf

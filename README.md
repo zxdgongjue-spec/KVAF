@@ -302,3 +302,7 @@ AIV 核合计的未确认 READ 数。小请求保留整批路径；大请求每�
 或环境变量 `KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL`。修改预算需要重新 capture。
 Host、Python binding 和 Kernel 必须一起重编。详见
 [设计、统计和验证步骤](docs/batch_get_inflight_control.md)。
+
+## AICPU 流水 GatherRead
+
+现有 Python `NpuRuntime.batch_get` 可选择 CPU gather + AICPU UMDK READ 流水后端，构建和用法见 [AICPU 流水 BatchGet](docs/aicpu_gather_read.md)。

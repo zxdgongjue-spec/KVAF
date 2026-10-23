@@ -61,3 +61,13 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
 
   target_compile_features(kvaf_default_access_operator PUBLIC cxx_std_17)
 endif()
+
+if(KVAF_ENABLE_AICPU_URMA)
+  add_subdirectory(src/aicpu_urma)
+  add_subdirectory(demo/aicpu_batch_get)
+  add_subdirectory(demo/aicpu_batch_put)
+  add_subdirectory(src/aicpu_urma/kernel)
+  add_library(kvaf_aicpu_access_operator STATIC src/aicpu_access_operator.cc)
+  target_link_libraries(kvaf_aicpu_access_operator PUBLIC kvaf_access_operator PRIVATE
+    kvaf_aicpu_batch_get_host kvaf_aicpu_batch_put_host)
+endif()
