@@ -1,4 +1,4 @@
-#include "cpu_gather_team.h"
+#include "cpu_gather_executor.h"
 
 namespace kvaf::peer {
 namespace {
@@ -21,7 +21,7 @@ bool ValidateEnvelope(std::uint64_t base, std::uint64_t bytes, std::uint64_t des
 
 }  // namespace
 
-std::size_t CpuGatherTeam::PrepareDirect(std::uint64_t region_bytes,
+std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
                                          std::uint64_t descriptor_address, std::uint64_t sequence,
                                          std::size_t max_spans) {
   if (region_bytes < 64U || base_ > UINT64_MAX - region_bytes || descriptor_address % 64U != 0U ||
@@ -65,7 +65,7 @@ std::size_t CpuGatherTeam::PrepareDirect(std::uint64_t region_bytes,
   return Publish(header.staging_address, source_spans, header.span_count, header.total_bytes);
 }
 
-void CpuGatherTeam::Copy() {
+void CpuGatherExecutor::Copy() {
   completed_.store(0U, std::memory_order_relaxed);
   phase_.store(1U, std::memory_order_release);
   (void)ProcessSource(0U);
@@ -75,7 +75,7 @@ void CpuGatherTeam::Copy() {
 }
 
 // Copy only this thread's staging range, combining adjacent source spans into one memcpy.
-std::uint64_t CpuGatherTeam::CopyRange(std::uint64_t offset, std::uint64_t end) const {
+std::uint64_t CpuGatherExecutor::CopyRange(std::uint64_t offset, std::uint64_t end) const {
   if (offset >= end) return 0U;
   const auto begin = offset;
   const auto index_for_offset = span_bytes_ != 0U
@@ -103,7 +103,7 @@ std::uint64_t CpuGatherTeam::CopyRange(std::uint64_t offset, std::uint64_t end) 
   return offset - begin;
 }
 
-std::uint64_t CpuGatherTeam::ProcessSource(std::size_t worker) {
+std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
   if (pipeline_ready_ == nullptr) {
     return CopyRange(Boundary(worker), Boundary(worker + 1U));
   }
@@ -132,7 +132,7 @@ std::uint64_t CpuGatherTeam::ProcessSource(std::size_t worker) {
   }
 }
 
-void CpuGatherTeam::RunHelper(std::size_t worker) {
+void CpuGatherExecutor::RunHelper(std::size_t worker) {
   BindWorker(worker);
   std::uint64_t observed_generation = 0U;
   bool was_active = false;

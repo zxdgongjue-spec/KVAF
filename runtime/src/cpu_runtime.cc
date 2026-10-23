@@ -5,7 +5,7 @@
 #include "cpu_urma_discovery.h"
 #include "peer_link.h"
 #include "cpu_gather.h"
-#include "cpu_gather_team.h"
+#include "cpu_gather_executor.h"
 #include "gather_workspace.h"
 
 #include <dlfcn.h>
@@ -267,7 +267,7 @@ class UrmaResourcePool {
 
 using Channel = cpu_runtime_detail::UrmaChannel;
 
-peer::GatherWaitMode TeamWaitMode(CpuGatherMode mode) {
+peer::GatherWaitMode ToGatherWaitMode(CpuGatherMode mode) {
   switch (mode) {
     case CpuGatherMode::kAdaptive: return peer::GatherWaitMode::kAdaptive;
     case CpuGatherMode::kActive: return peer::GatherWaitMode::kActive;
@@ -285,7 +285,7 @@ class CpuGatherWorker {
       : memory_(static_cast<std::uint8_t*>(memory)), base_(base), bytes_(bytes),
         control_(reinterpret_cast<peer::GatherControl*>(memory_ +
             (control_address ? control_address - base : peer::GatherControlOffset(bytes)))),
-        team_(memory, base, threads, min_bytes, TeamWaitMode(mode), affinity, cpu_offset), mode_(mode) {
+        executor_(memory, base, threads, min_bytes, ToGatherWaitMode(mode), affinity, cpu_offset), mode_(mode) {
     std::memset(control_, 0, sizeof(*control_));
     peer::GatherBarrier();
     worker_ = std::thread(&CpuGatherWorker::Run, this);
@@ -296,7 +296,7 @@ class CpuGatherWorker {
   }
  private:
   void Run() {
-    team_.BindWorker(0U);
+    executor_.BindWorker(0U);
     std::uint64_t last = 0U;
     while (!stop_.load(std::memory_order_acquire)) {
       const auto sequence = __atomic_load_n(&control_->notify, __ATOMIC_ACQUIRE);
@@ -313,8 +313,8 @@ class CpuGatherWorker {
       const auto address = __atomic_load_n(&control_->command, __ATOMIC_ACQUIRE);
       bool valid = false;
       try {
-        valid = team_.PrepareDirect(bytes_, address, sequence, peer::kMaxGatherSpans) != 0U;
-        if (valid) team_.Copy();
+        valid = executor_.PrepareDirect(bytes_, address, sequence, peer::kMaxGatherSpans) != 0U;
+        if (valid) executor_.Copy();
       } catch (const std::exception& error) {
         Log("[KVAF_CPU] GatherRead failed: %s\n", error.what());
         valid = false;
@@ -334,7 +334,7 @@ class CpuGatherWorker {
   std::uint8_t* memory_;
   std::uint64_t base_, bytes_;
   peer::GatherControl* control_;
-  peer::CpuGatherTeam team_;
+  peer::CpuGatherExecutor executor_;
   CpuGatherMode mode_;
   std::atomic<bool> stop_{false};
   std::thread worker_;

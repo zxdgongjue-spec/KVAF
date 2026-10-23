@@ -79,7 +79,7 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
       "${KVAF_URMA_INCLUDE_DIR}")
   target_link_libraries(kvaf_cpu_runtime
     PUBLIC kvaf_runtime
-    PRIVATE "${KVAF_URMA_LIBRARY}" "${CMAKE_DL_LIBS}" Threads::Threads kvaf_cpu_gather_plan)
+    PRIVATE "${KVAF_URMA_LIBRARY}" "${CMAKE_DL_LIBS}" Threads::Threads kvaf_cpu_gather_executor)
   target_compile_features(kvaf_cpu_runtime PUBLIC cxx_std_17)
 
   add_executable(kvaf_cpu_service src/cpu_service_main.cc)
@@ -92,8 +92,8 @@ endif()
 
 if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   find_package(Threads REQUIRED)
-  add_library(kvaf_cpu_gather_plan STATIC src/cpu_gather_plan.cc)
-  target_include_directories(kvaf_cpu_gather_plan PUBLIC include)
-  target_link_libraries(kvaf_cpu_gather_plan PUBLIC kvaf_common kvaf_access_operator Threads::Threads)
-  target_compile_options(kvaf_cpu_gather_plan PRIVATE "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2>")
+  add_library(kvaf_cpu_gather_executor STATIC src/cpu_gather_executor.cc)
+  target_include_directories(kvaf_cpu_gather_executor PUBLIC include)
+  target_link_libraries(kvaf_cpu_gather_executor PUBLIC kvaf_common kvaf_access_operator Threads::Threads)
+  target_compile_options(kvaf_cpu_gather_executor PRIVATE "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2>")
 endif()

@@ -45,9 +45,9 @@ inline void GatherSpinPause() {
 
 enum class GatherWaitMode { kActive, kAdaptive, kPassive };
 
-class CpuGatherTeam {
+class CpuGatherExecutor {
  public:
-  CpuGatherTeam(void* memory, std::uint64_t base, std::size_t max_threads,
+  CpuGatherExecutor(void* memory, std::uint64_t base, std::size_t max_threads,
                 std::size_t min_bytes_per_thread = 256U * 1024U,
                 GatherWaitMode wait_mode = GatherWaitMode::kPassive, bool bind_cores = false,
                 std::size_t cpu_offset = 0U)
@@ -60,7 +60,7 @@ class CpuGatherTeam {
         min_bytes_per_thread_(std::max<std::size_t>(1U, min_bytes_per_thread)),
         wait_mode_(wait_mode) {}
 
-  ~CpuGatherTeam() {
+  ~CpuGatherExecutor() {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       stopping_.store(true, std::memory_order_release);
@@ -69,8 +69,8 @@ class CpuGatherTeam {
     for (std::thread& helper : helpers_) helper.join();
   }
 
-  CpuGatherTeam(const CpuGatherTeam&) = delete;
-  CpuGatherTeam& operator=(const CpuGatherTeam&) = delete;
+  CpuGatherExecutor(const CpuGatherExecutor&) = delete;
+  CpuGatherExecutor& operator=(const CpuGatherExecutor&) = delete;
 
   std::size_t PrepareDirect(std::uint64_t region_bytes, std::uint64_t descriptor_address,
                             std::uint64_t sequence, std::size_t max_spans);
@@ -103,7 +103,7 @@ class CpuGatherTeam {
     std::unique_lock<std::mutex> lock(mutex_);
     while (helpers_.size() + 1U < threads) {
       const std::size_t index = helpers_.size() + 1U;
-      helpers_.emplace_back(&CpuGatherTeam::RunHelper, this, index);
+      helpers_.emplace_back(&CpuGatherExecutor::RunHelper, this, index);
     }
     spans_ = spans;
     span_count_ = span_count;
