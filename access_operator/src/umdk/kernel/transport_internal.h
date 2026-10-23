@@ -50,6 +50,9 @@ struct WrQueue {
 };
 
 struct Worker : WrQueue {
+  // Stable storage for one-WR control transfers, including a failed in-flight WR.
+  Sge single_local{}, single_remote{};
+  urma_jfs_wr_t single_wr{};
   bool poisoned = false;
   urma_jfc_t* jfc = nullptr;
   urma_jfr_t* jfr = nullptr;
@@ -94,8 +97,7 @@ std::uint64_t NowNs();
 Worker& GetWorker(std::uint32_t index);
 void Stage(UmdkControlStatus&, const char*);
 bool Fail(UmdkControlStatus&, const char*, int result = -1, const char* detail = "");
-bool PostBatch(Worker&, urma_jfs_wr_t* first, urma_jfs_wr_t* tail, std::uint32_t first_index,
-               std::uint32_t count, UmdkControlStatus&);
+bool PostBatch(Worker&, urma_jfs_wr_t* first, urma_jfs_wr_t* tail, UmdkControlStatus&);
 bool WaitCompletion(Worker&, std::uint64_t context, std::uint64_t start, std::uint32_t timeout_ms,
                     UmdkControlStatus&);
 urma_target_seg_t* LocalSegment(std::uint64_t address, std::uint64_t bytes,

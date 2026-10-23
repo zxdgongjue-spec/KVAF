@@ -23,7 +23,7 @@ CPU 服务使用新二进制重启：
 ```bash
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28990 \
-  --gather-threads 8 --gather-mode active --gather-affinity on
+  --gather-threads 8 --gather-mode active --gather-affinity off
 ```
 
 NPU 进程先加载 CANN 环境，再使用现有 Tensor 接口：
@@ -161,7 +161,14 @@ Runtime 在用户指定 DDR 数据容量之外按 worker 数预留 staging、源
 这些空间不进入 KV slot 分配。HBM 仅保留发给 CPU 的源描述符和控制 scratch，输出 Tensor 无需额外尾部空间。
 READ 使用 SGL 6、每次提交 32 条 WR；每波最多 4096 条 WR，只请求最后一条的有序 CQE，完成后复用 WR/SGL 空间。
 AICPU 只将输出地址交给 URMA，不直接读写输出 payload，因此 READ 前后不再逐段清理输出的 AICPU 缓存。
-元数据、源清单和控制邮箱仍保留缓存维护；每个 worker 的流水查询只使用自己的 scratch 区间。
+输入元数据读取前、源清单发送前、状态回传前仍做缓存维护。
+每个 worker 的 scratch 独占一条 64 B 缓存行：通知发送前清理一次，此后 AICPU 只读取查询结果，
+不再在每次 ready/ACK READ 前重复清理；收到 CQE 后仍清理再取值，避免读到旧缓存。
+不清零 scratch 中的 ACK 槽，查询完成后直接使用远端覆盖的值。
+单个不超过 64 KiB 的控制传输直接填写一个 WR/两端 SGE，保留在队列对象中至完成或队列销毁，
+省去通用分段构建及 vector 操作；清单大于 64 KiB 和多段通知仍走通用路径。
+Python 绑定直接读取 Tensor 属性，只提取维数和首维长度，不再先逐项 hasattr 或复制完整 shape。
+连续性、设备、元素宽度、长度以及队列完成/错误检查仍在相应入口执行。
 
 BatchPut 同步完成；BatchGet 默认只 enqueue，`synchronize=True` 等待完成并读取错误状态。
 内部 workspace 在下一次操作或 Shutdown 前排空；跨 stream 依赖由调用方负责。

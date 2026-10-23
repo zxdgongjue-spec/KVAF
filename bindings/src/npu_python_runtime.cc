@@ -54,40 +54,41 @@ struct NpuTensorView {
   void* data{nullptr};
   std::size_t bytes{0};
   std::size_t element_bytes{0};
-  std::vector<py::ssize_t> shape;
+  std::size_t dimensions{0};
+  py::ssize_t rows{0};
 };
 
 NpuTensorView GetNpuTensorView(const py::object& tensor, const char* name) {
-  if (!py::hasattr(tensor, "data_ptr") || !py::hasattr(tensor, "numel") ||
-      !py::hasattr(tensor, "element_size") ||
-      !py::hasattr(tensor, "is_contiguous") ||
-      !py::hasattr(tensor, "device") || !py::hasattr(tensor, "shape")) {
+  try {
+    if (!tensor.attr("is_contiguous")().cast<bool>()) {
+      throw py::value_error(std::string(name) + " must be contiguous");
+    }
+    const std::string device = py::str(tensor.attr("device")).cast<std::string>();
+    if (device.rfind("npu", 0) != 0) {
+      throw py::value_error(std::string(name) + " must reside on an NPU");
+    }
+    const std::uint64_t pointer = tensor.attr("data_ptr")().cast<std::uint64_t>();
+    const std::uint64_t elements = tensor.attr("numel")().cast<std::uint64_t>();
+    const std::uint64_t element_bytes =
+        tensor.attr("element_size")().cast<std::uint64_t>();
+    if (pointer == 0 || elements == 0 || element_bytes == 0 ||
+        elements > std::numeric_limits<std::size_t>::max() ||
+        element_bytes > std::numeric_limits<std::size_t>::max() ||
+        static_cast<std::size_t>(elements) >
+            std::numeric_limits<std::size_t>::max() /
+                static_cast<std::size_t>(element_bytes)) {
+      throw py::value_error(std::string(name) + " must be a non-empty NPU Tensor");
+    }
+    const auto shape = tensor.attr("shape").cast<py::tuple>();
+    return NpuTensorView{
+        PointerFromValue(pointer),
+        static_cast<std::size_t>(elements) * static_cast<std::size_t>(element_bytes),
+        static_cast<std::size_t>(element_bytes),
+        shape.size(), shape.empty() ? 0 : shape[0].cast<py::ssize_t>()};
+  } catch (py::error_already_set& error) {
+    if (!error.matches(PyExc_AttributeError)) throw;
     throw py::type_error(std::string(name) + " must be a contiguous NPU Tensor");
   }
-  if (!tensor.attr("is_contiguous")().cast<bool>()) {
-    throw py::value_error(std::string(name) + " must be contiguous");
-  }
-  const std::string device = py::str(tensor.attr("device")).cast<std::string>();
-  if (device.rfind("npu", 0) != 0) {
-    throw py::value_error(std::string(name) + " must reside on an NPU");
-  }
-  const std::uint64_t pointer = tensor.attr("data_ptr")().cast<std::uint64_t>();
-  const std::uint64_t elements = tensor.attr("numel")().cast<std::uint64_t>();
-  const std::uint64_t element_bytes =
-      tensor.attr("element_size")().cast<std::uint64_t>();
-  if (pointer == 0 || elements == 0 || element_bytes == 0 ||
-      elements > std::numeric_limits<std::size_t>::max() ||
-      element_bytes > std::numeric_limits<std::size_t>::max() ||
-      static_cast<std::size_t>(elements) >
-          std::numeric_limits<std::size_t>::max() /
-              static_cast<std::size_t>(element_bytes)) {
-    throw py::value_error(std::string(name) + " must be a non-empty NPU Tensor");
-  }
-  return NpuTensorView{
-      PointerFromValue(pointer),
-      static_cast<std::size_t>(elements) * static_cast<std::size_t>(element_bytes),
-      static_cast<std::size_t>(element_bytes),
-      tensor.attr("shape").cast<std::vector<py::ssize_t>>()};
 }
 
 std::vector<KeyId> CopyPrepareKeys(const py::object& keys) {
@@ -411,9 +412,9 @@ class NpuPythonRuntime final {
     const NpuTensorView output_view = GetNpuTensorView(output, "output");
     const NpuTensorView address_view = GetNpuTensorView(addresses, "addresses");
     const NpuTensorView valid_view = GetNpuTensorView(valid, "valid");
-    if (index_view.shape.size() != 1 || offset_view.shape.size() != 1 ||
-        mask_view.shape.size() != 1 ||
-        output_index_view.shape.size() != 1 || output_view.shape.size() < 2 ||
+    if (index_view.dimensions != 1 || offset_view.dimensions != 1 ||
+        mask_view.dimensions != 1 ||
+        output_index_view.dimensions != 1 || output_view.dimensions < 2 ||
         index_view.element_bytes != sizeof(std::int32_t) ||
         offset_view.element_bytes != sizeof(std::int32_t) ||
         output_index_view.element_bytes != sizeof(std::int32_t) ||
@@ -424,12 +425,12 @@ class NpuPythonRuntime final {
         address_view.element_bytes != sizeof(Address) ||
         valid_view.element_bytes != sizeof(std::uint8_t) ||
         valid_view.bytes != address_view.bytes / sizeof(Address) ||
-        output_view.shape.front() <= 0 ||
-        output_view.bytes % static_cast<std::size_t>(output_view.shape.front()) != 0) {
+        output_view.rows <= 0 ||
+        output_view.bytes % static_cast<std::size_t>(output_view.rows) != 0) {
       throw py::value_error("BatchGet Tensors do not satisfy the NPU layout contract");
     }
     const std::uint64_t output_rows =
-        static_cast<std::uint64_t>(output_view.shape.front());
+        static_cast<std::uint64_t>(output_view.rows);
     const std::uint64_t output_block_bytes = output_view.bytes / output_rows;
     if (output_block_bytes != native_->batch_get_token_bytes()) {
       throw py::value_error(

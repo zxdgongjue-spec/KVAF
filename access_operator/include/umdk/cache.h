@@ -8,6 +8,7 @@ namespace kvaf::aicpu_urma {
 // Maintain AICPU cache visibility for DMA buffers.
 inline void FlushUmdkCacheLines(const void* address, std::uint64_t bytes) {
 #if defined(__linux__) && defined(__aarch64__)
+  if (bytes == 0) return;
   const auto first = reinterpret_cast<std::uintptr_t>(address) & ~std::uintptr_t{63};
   const auto end = reinterpret_cast<std::uintptr_t>(address) + bytes;
   for (auto line = first; line < end; line += 64U)

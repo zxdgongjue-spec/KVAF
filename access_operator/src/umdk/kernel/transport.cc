@@ -321,8 +321,8 @@ bool Connect(const UmdkControlArgs& args, UmdkControlStatus& status) {
   return DescribeWorker(args, args.worker_index, status);
 }
 
-bool PostBatch(Worker& worker, urma_jfs_wr_t* first, urma_jfs_wr_t* tail, std::uint32_t first_index,
-               std::uint32_t count, UmdkControlStatus& status) {
+bool PostBatch(Worker& worker, urma_jfs_wr_t* first, urma_jfs_wr_t* tail,
+               UmdkControlStatus& status) {
   auto* saved_next = tail->next;
   tail->next = nullptr;
   urma_jfs_wr_t* bad = nullptr;
@@ -364,24 +364,14 @@ bool WaitCompletion(Worker& worker, std::uint64_t context, std::uint64_t start,
   return false;
 }
 
-template <typename RequestAt>
-bool SubmitRequests(Worker& worker, std::uint32_t count, std::uint32_t batch,
-                    std::uint32_t timeout_ms, UmdkControlStatus& status, RequestAt request_at) {
-  Stage(status, "provider post and CQ wait");
-  const auto start = NowNs();
-  for (std::uint32_t first = 0; first < count; first += batch) {
-    const auto end = std::min(first + batch, count);
-    if (!PostBatch(worker, request_at(first), request_at(end - 1U), first, end - first, status)) {
-      return false;
-    }
-  }
-  return WaitCompletion(worker, request_at(count - 1U)->user_ctx, start, timeout_ms, status);
-}
-
 bool SubmitQueue(Worker& worker, std::vector<urma_jfs_wr_t>& requests, std::uint32_t batch,
                  std::uint32_t timeout_ms, UmdkControlStatus& status) {
-  return SubmitRequests(worker, requests.size(), batch, timeout_ms, status,
-                        [&](std::uint32_t index) { return &requests[index]; });
+  const auto start = NowNs();
+  for (std::size_t first = 0; first < requests.size(); first += batch) {
+    const auto end = std::min(first + batch, requests.size());
+    if (!PostBatch(worker, &requests[first], &requests[end - 1U], status)) return false;
+  }
+  return WaitCompletion(worker, requests.back().user_ctx, start, timeout_ms, status);
 }
 
 urma_target_seg_t* LocalSegment(std::uint64_t address, std::uint64_t bytes,
@@ -467,11 +457,42 @@ bool BuildTransfers(Worker& worker, bool write, const UmdkTransfer* transfers, s
   return true;
 }
 
+// Mailbox queries and short writes need one WR, not the segmented transfer builder.
+// The caller holds the control lock and waits for the CQE before reusing these slots.
+bool TransferOne(Worker& worker, bool write, const UmdkTransfer& transfer,
+                 UmdkControlStatus& status) {
+  if (!UmdkRange(state.remote->seg.ubva.va, state.remote->seg.len, transfer.remote,
+                 transfer.bytes))
+    return Fail(status, "UMDK transfer outside remote region");
+  auto* segment = LocalSegment(transfer.local, transfer.bytes);
+  if (!segment) return Fail(status, "UMDK transfer outside registered HBM");
+  const auto bytes = static_cast<std::uint32_t>(transfer.bytes);
+  worker.single_local = {transfer.local, bytes, segment, nullptr};
+  worker.single_remote = {transfer.remote, bytes, state.remote, nullptr};
+  urma_sg_t local{reinterpret_cast<urma_sge_t*>(&worker.single_local), 1};
+  urma_sg_t remote{reinterpret_cast<urma_sge_t*>(&worker.single_remote), 1};
+  auto& wr = worker.single_wr;
+  wr = {};
+  wr.opcode = write ? URMA_OPC_WRITE : URMA_OPC_READ;
+  wr.flag.bs.comp_order = 1;
+  wr.flag.bs.place_order = URMA_STRONG_ORDER;
+  wr.flag.bs.complete_enable = 1;
+  wr.tjetty = worker.target;
+  wr.user_ctx = ++worker.sequence;
+  wr.rw.src = write ? local : remote;
+  wr.rw.dst = write ? remote : local;
+  const auto start = NowNs();
+  return PostBatch(worker, &wr, &wr, status) &&
+         WaitCompletion(worker, wr.user_ctx, start, 1000, status);
+}
+
 bool TransferQueue(Worker& worker, bool write, const UmdkTransfer* transfers, std::uint32_t count,
                    UmdkControlStatus& status) {
   if (worker.poisoned || worker.target == nullptr || state.remote == nullptr ||
       transfers == nullptr || count == 0 || count > kUmdkMaxTransfers)
     return Fail(status, "invalid UMDK transfer queue");
+  if (count == 1 && transfers[0].bytes > 0 && transfers[0].bytes <= 65536)
+    return TransferOne(worker, write, transfers[0], status);
   std::uint32_t index = 0;
   std::uint64_t offset = 0;
   while (index < count) {

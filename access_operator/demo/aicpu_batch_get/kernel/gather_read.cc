@@ -158,7 +158,6 @@ bool WaitBatchPrefix(GatherPrefix& prefix, const urma_jfs_wr_t& tail,
       8};
   bool success = false;
   for (std::uint32_t poll = 0; poll < 10000; ++poll) {
-    FlushUmdkCache(reinterpret_cast<const void*>(scratch), 8);
     UmdkControlStatus query{};
     if (prefix.profile) ++prefix.profile->ready_queries;
     // The dedicated control Jetty can complete this query while data READs
@@ -202,6 +201,7 @@ bool ScatterQueue(Worker& worker, const KvafExecuteBatchGetKernelArgs& request,
   if (first == last) return true;
   const auto setup_start = profile ? BatchGetProfileNowNs() : 0U;
   const GatherBuildLayout layout(worker, args, request);
+  if (!layout.local_segment) return Fail(error, "READ output is not registered");
   GatherPrefix prefix{args, status, worker_index, 0U, profile};
   if (profile) profile->read_setup_ns += BatchGetProfileNowNs() - setup_start;
   std::uint32_t span_offset = 0;
@@ -229,8 +229,7 @@ bool ScatterQueue(Worker& worker, const KvafExecuteBatchGetKernelArgs& request,
       bool posted = false;
       if (ready) {
         BatchGetProfileScope timer(profile ? &profile->post_ns : nullptr);
-        posted = PostBatch(worker, &queue.wrs[batch_first], tail, batch_first,
-                           queue.wr_count - batch_first, error);
+        posted = PostBatch(worker, &queue.wrs[batch_first], tail, error);
       }
       if (!ready || !posted) {
         worker.poisoned = true;
@@ -262,7 +261,7 @@ std::uint32_t GatherScatter(const KvafExecuteBatchGetKernelArgs& request,
       std::max(1U, args->worker_count) != state.worker_count ||
       args->context.owner_pid != static_cast<std::uint64_t>(getpid()) ||
       args->context.session != state.session ||
-      LocalSegment(args->output, args->output_extent) == nullptr || first > last ||
+      first > last ||
       last > request.request_capacity || args->sgl_size == 0 || args->sq_batch_wqes == 0)
     return 16;
   std::lock_guard<std::mutex> worker_lock(worker_mutexes[worker_index]);
@@ -289,7 +288,6 @@ void Flush(const void* address, std::uint64_t bytes) { FlushUmdkCache(address, b
 void WaitAck(const GatherReadArgs& args, GatherReadStatus& status) {
   const UmdkTransfer transfer{args.remote_ack, args.scratch + 8U, 8U};
   for (unsigned poll = 0; poll < 10000U; ++poll) {
-    Flush(reinterpret_cast<void*>(transfer.local), transfer.bytes);
     status.result = UmdkTransferSync(&args.context, false, &transfer, 1U, args.worker_index);
     if (status.result) return;
     Flush(reinterpret_cast<void*>(transfer.local), transfer.bytes);
@@ -354,8 +352,9 @@ bool StartGather(GatherReadArgs& args, GatherReadStatus& status, BatchGetWorkerP
   status.phase = 2U;
   auto* scratch = reinterpret_cast<std::uint64_t*>(args.scratch);
   scratch[0] = args.sequence;
-  scratch[1] = 0U;
   scratch[2] = args.remote_descriptor;
+  // Clean the entire mailbox line once before DMA. Until the next request,
+  // AICPU only reads it: polling needs cache maintenance after CQ, not before READ.
   Flush(scratch, 24U);
   const UmdkTransfer notify[] = {{args.remote_command, args.scratch + 16U, 8U},
                                  {args.remote_notify, args.scratch, 8U}};
