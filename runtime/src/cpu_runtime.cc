@@ -7,6 +7,7 @@
 #include "cpu_gather.h"
 #include "cpu_gather_executor.h"
 #include "gather_workspace.h"
+#include "cpu_push_get_worker.h"
 
 #include <dlfcn.h>
 #include <sys/mman.h>
@@ -167,6 +168,8 @@ class UrmaResources {
   urma_context_t* context() const { return context_; }
   const std::string& device_name() const { return selected_device_name_; }
   uint32_t eid_index() const { return eid_index_; }
+  urma::GetTpList tp_query() const { return get_tp_list_; }
+  urma::ImportJettyEx jetty_import() const { return import_jetty_ex_; }
 
   bool GetCtpForPeer(const uint8_t peer_eid[kEidBytes], uint64_t* tp_handle) const {
     if (peer_eid == nullptr || tp_handle == nullptr || get_tp_list_ == nullptr || context_ == nullptr) {
@@ -394,6 +397,7 @@ struct Region {
   std::vector<Channel> channels;
   std::unique_ptr<CpuGatherWorker> gather;
   std::vector<std::unique_ptr<CpuGatherWorker>> gather_lanes;
+  std::unique_ptr<cpu_push::Worker> push;
 };
 
 class CpuService {
@@ -597,6 +601,7 @@ class CpuService {
     if (found == regions_.end()) {
       return Result::kNotFound;
     }
+    if (StopCpuPushGet(id) != Result::kOk) return Result::kResourceError;
     Log("[KVAF_CPU] REGION_RELEASE session=%" PRIu64 " channels=%zu\n", id,
         found->second->channels.size());
     ReleaseRegion(found->second.get());
@@ -612,7 +617,7 @@ class CpuService {
     const auto found = regions_.find(session_id);
     if (found == regions_.end()) return Result::kNotFound;
     Region& region = *found->second;
-    if (region.gather != nullptr || !region.gather_lanes.empty()) return Result::kResourceError;
+    if (region.push || region.gather != nullptr || !region.gather_lanes.empty()) return Result::kResourceError;
     try {
       region.gather = std::make_unique<CpuGatherWorker>(
           region.memory, region.base, region.bytes, gather_threads_,
@@ -632,7 +637,7 @@ class CpuService {
         !peer::GatherRange(region.base, peer::GatherControlOffset(region.bytes), control_address,
                            lanes * sizeof(peer::GatherControl)))
       return Result::kInvalidRequest;
-    if (region.gather || !region.gather_lanes.empty()) return Result::kResourceError;
+    if (region.push || region.gather || !region.gather_lanes.empty()) return Result::kResourceError;
     std::vector<std::unique_ptr<CpuGatherWorker>> created;
     std::size_t cpu_offset = 0U;
     try {
@@ -650,6 +655,55 @@ class CpuService {
     }
     region.gather_lanes = std::move(created);
     return Result::kOk;
+  }
+
+  Result OpenCpuPushGet(const peer::OpenCpuPushGetRequest& request,
+                        peer::OpenCpuPushGetResponse* response) {
+    const auto found = regions_.find(request.session_id);
+    if (found == regions_.end()) return Result::kNotFound;
+    auto& region = *found->second;
+    if (region.push || region.gather || !region.gather_lanes.empty()) return Result::kResourceError;
+    if (!request.source_bytes || request.source_bytes > region.bytes)
+      return Result::kInvalidRequest;
+    auto transport = std::make_unique<cpu_push::Transport>();
+    const auto status = transport->Initialize(region.resources->context(), region.segment,
+        region.base, request, region.resources->tp_query(), region.resources->jetty_import(),
+        NextPsn(), response);
+    if (!status.ok()) {
+      Log("[KVAF_CPU] CPU_PUSH_OPEN_FAILED reason=%s\n", status.message().c_str());
+      const auto stopped = transport->Shutdown();
+      if (!stopped.ok()) {
+        // Retain the failed setup in the region so STOP can retry teardown.
+        region.push = std::make_unique<cpu_push::Worker>(std::move(transport));
+      }
+      return Result::kResourceError;
+    }
+    region.push = std::make_unique<cpu_push::Worker>(std::move(transport));
+    return Result::kOk;
+  }
+  Result StartCpuPushGet(uint64_t session) {
+    const auto found = regions_.find(session);
+    if (found == regions_.end() || !found->second->push) return Result::kNotFound;
+    return found->second->push->Start().ok() ? Result::kOk : Result::kResourceError;
+  }
+  Result StopCpuPushGet(uint64_t session) {
+    const auto found = regions_.find(session);
+    if (found == regions_.end()) return Result::kOk;
+    auto& push = found->second->push;
+    if (!push) return Result::kOk;
+    const auto status = push->Stop();
+    if (!status.ok()) {
+      Log("[KVAF_CPU] CPU_PUSH_STOP_FAILED reason=%s\n", status.message().c_str());
+      return Result::kResourceError;
+    }
+    push.reset();
+    return Result::kOk;
+  }
+  Status StopAllPush() {
+    for (auto& entry : regions_)
+      if (StopCpuPushGet(entry.first) != Result::kOk)
+        return Status::Internal("CPU push queues still live; runtime resources retained");
+    return Status::OK();
   }
 
  private:
@@ -788,6 +842,14 @@ class CpuService {
   void ReleaseRegion(Region* region) {
     if (region == nullptr) {
       return;
+    }
+    if (region->push) {
+      if (!region->push->Stop().ok()) {
+        // The process must keep source DDR registered until all DMA stops.
+        Log("[KVAF_CPU] CPU_PUSH_RELEASE_FAILED source region retained\n");
+        return;
+      }
+      region->push.reset();
     }
     region->gather.reset();
     region->gather_lanes.clear();
@@ -950,6 +1012,35 @@ void HandleClient(int fd, CpuService* service) {
       return;
     }
 
+    case Command::kOpenCpuPushGet: {
+      peer::OpenCpuPushGetRequest request{};
+      request.header = header;
+      if (!IsValidHeader(header, command, sizeof(request)) ||
+          !ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header), sizeof(request) - sizeof(header))) {
+        SendStatus(fd, command, Result::kInvalidRequest);
+        return;
+      }
+      peer::OpenCpuPushGetResponse response{};
+      response.header = MakeHeader(command, sizeof(response));
+      response.header.command = ResponseCommand(command);
+      response.result = static_cast<int32_t>(service->OpenCpuPushGet(request, &response));
+      (void)WriteAll(fd, &response, sizeof(response));
+      return;
+    }
+    case Command::kStartCpuPushGet:
+    case Command::kStopCpuPushGet: {
+      peer::CpuPushGetSessionRequest request{};
+      request.header = header;
+      if (!IsValidHeader(header, command, sizeof(request)) ||
+          !ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header), sizeof(request) - sizeof(header))) {
+        SendStatus(fd, command, Result::kInvalidRequest);
+        return;
+      }
+      SendStatus(fd, command, command == Command::kStartCpuPushGet
+          ? service->StartCpuPushGet(request.session_id) : service->StopCpuPushGet(request.session_id));
+      return;
+    }
+
   }
   SendStatus(fd, command, Result::kInvalidRequest);
 }
@@ -963,7 +1054,7 @@ struct CpuRuntime::Impl {
 
 CpuRuntime::CpuRuntime() = default;
 
-CpuRuntime::~CpuRuntime() { (void)Shutdown(); }
+CpuRuntime::~CpuRuntime() { if (!Shutdown().ok()) (void)impl_.release(); }
 
 Status CpuRuntime::Initialize(const CpuRuntimeOptions& options) {
   if (impl_ != nullptr) return Status::InvalidState("CpuRuntime has already been initialized");
@@ -1016,6 +1107,8 @@ Status CpuRuntime::ReleaseLink(LinkId link_id) {
 
 Status CpuRuntime::Shutdown() {
   if (impl_ == nullptr) return Status::OK();
+  auto stopped = impl_->service->StopAllPush();
+  if (!stopped.ok()) return stopped;
   impl_.reset();
   return Status::OK();
 }

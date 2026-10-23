@@ -45,6 +45,9 @@ if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA)
     target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_aicpu_access_operator)
     target_compile_definitions(kvaf_npu_runtime PRIVATE KVAF_ENABLE_AICPU_URMA=1)
   endif()
+  if(KVAF_ENABLE_AICPU_CPU_PUSH)
+    target_compile_definitions(kvaf_npu_runtime PRIVATE KVAF_ENABLE_AICPU_CPU_PUSH=1)
+  endif()
   if(KVAF_ENABLE_AIV_BATCH_PUT)
     target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_execute_batch_put_host)
   endif()
@@ -72,7 +75,8 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
       "KVAF_BUILD_REMOTE_CPU_SERVICE requires urma_api.h and liburma; set KVAF_URMA_ROOT")
   endif()
 
-  add_library(kvaf_cpu_runtime STATIC src/cpu_runtime.cc src/cpu_urma_discovery.cc)
+  add_library(kvaf_cpu_runtime STATIC src/cpu_runtime.cc src/cpu_urma_discovery.cc
+    src/cpu_push_get_transport.cc src/cpu_push_get_worker.cc)
   target_include_directories(kvaf_cpu_runtime
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE

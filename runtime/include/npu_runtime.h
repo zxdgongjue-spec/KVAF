@@ -31,6 +31,8 @@ struct NpuRuntimeOptions {
   std::string aicpu_urma_kernel_json_path;
   std::string urma_device;
   std::uint32_t urma_eid_index{UINT32_MAX};
+  // AICPU BatchGet algorithm; BatchPut continues to use its UMDK session.
+  std::string aicpu_batch_get_mode{"gather_read"};
   // Total submitted, unconfirmed READs per BatchGet launch; 0 disables control.
   std::uint32_t batch_get_max_inflight_total{2048U};
   // Optional strict local-EID list. Empty preserves automatic discovery and

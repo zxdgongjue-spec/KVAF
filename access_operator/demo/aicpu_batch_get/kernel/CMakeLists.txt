@@ -2,7 +2,15 @@ set(KVAF_AICPU_BATCH_GET_DEVICE_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/batch_get.cc"
   "${CMAKE_CURRENT_SOURCE_DIR}/gather_read.cc"
   PARENT_SCOPE)
+if(KVAF_ENABLE_AICPU_CPU_PUSH)
+  set(KVAF_AICPU_BATCH_GET_DEVICE_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/batch_get.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/gather_read.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/cpu_push_scatter.cc" PARENT_SCOPE)
+endif()
 set(KVAF_AICPU_BATCH_GET_DEVICE_HEADERS
   "${CMAKE_CURRENT_SOURCE_DIR}/gather_read.h"
+  "${CMAKE_CURRENT_SOURCE_DIR}/cpu_push_scatter.h"
+  "${CMAKE_CURRENT_SOURCE_DIR}/cpu_push_pipeline.h"
   "${CMAKE_CURRENT_SOURCE_DIR}/../include/batch_get_abi.h"
   PARENT_SCOPE)

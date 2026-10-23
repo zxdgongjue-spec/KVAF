@@ -1,5 +1,36 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+add_executable(kvaf_cpu_push_get_protocol_test cpu_push_get_protocol_test.cc)
+target_link_libraries(kvaf_cpu_push_get_protocol_test PRIVATE kvaf_common)
+target_include_directories(kvaf_cpu_push_get_protocol_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/access_operator/demo/aicpu_batch_get/kernel)
+add_test(NAME kvaf_cpu_push_get_protocol_test COMMAND kvaf_cpu_push_get_protocol_test)
+
+# Mock the provider while exercising the production transport and kernel.
+# No CANN installation, liburma or NPU is needed for these two tests.
+find_path(KVAF_TEST_URMA_INCLUDE_DIR urma_api.h HINTS "${KVAF_URMA_ROOT}/include"
+  "${PROJECT_SOURCE_DIR}/../third_party/umdk/include")
+if(KVAF_TEST_URMA_INCLUDE_DIR)
+  find_package(Threads REQUIRED)
+  add_library(kvaf_cpu_push_get_mock STATIC cpu_push_get_mock.cc
+    ../runtime/src/cpu_push_get_transport.cc ../runtime/src/cpu_push_get_worker.cc)
+  target_link_libraries(kvaf_cpu_push_get_mock PUBLIC kvaf_common Threads::Threads)
+  target_include_directories(kvaf_cpu_push_get_mock PUBLIC "${KVAF_TEST_URMA_INCLUDE_DIR}"
+    "${PROJECT_SOURCE_DIR}/runtime/include" "${PROJECT_SOURCE_DIR}/runtime/src"
+    "${PROJECT_SOURCE_DIR}/access_operator/include"
+    "${PROJECT_SOURCE_DIR}/access_operator/demo"
+    "${PROJECT_SOURCE_DIR}/access_operator/demo/aicpu_batch_get/kernel")
+  add_executable(kvaf_cpu_push_get_transport_test cpu_push_get_transport_test.cc)
+  target_link_libraries(kvaf_cpu_push_get_transport_test PRIVATE kvaf_cpu_push_get_mock)
+  add_test(NAME kvaf_cpu_push_get_transport_test COMMAND kvaf_cpu_push_get_transport_test)
+  add_executable(kvaf_cpu_push_get_pipeline_test cpu_push_get_pipeline_test.cc
+    ../access_operator/demo/aicpu_batch_get/kernel/cpu_push_scatter.cc)
+  target_compile_definitions(kvaf_cpu_push_get_pipeline_test PRIVATE KVAF_CPU_PUSH_HOST_TEST=1)
+  target_link_libraries(kvaf_cpu_push_get_pipeline_test PRIVATE kvaf_cpu_push_get_mock)
+  add_test(NAME kvaf_cpu_push_get_pipeline_test COMMAND kvaf_cpu_push_get_pipeline_test)
+  set_tests_properties(kvaf_cpu_push_get_transport_test kvaf_cpu_push_get_pipeline_test PROPERTIES TIMEOUT 60)
+endif()
+
 add_test(NAME kvaf_dsa_keys_python
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_dsa_keys.py")

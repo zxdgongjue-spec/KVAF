@@ -247,6 +247,8 @@ py::dict BatchGetProfileDict(const BatchGetProfile& profile) {
     WORKER_TIME(ready_wait);
     WORKER_TIME(post);
     WORKER_TIME(cq_wait);
+    WORKER_TIME(scatter);
+    WORKER_TIME(output_cache);
 #undef WORKER_TIME
     worker["bytes"] = sample.bytes;
     worker["spans"] = sample.spans;
@@ -275,7 +277,8 @@ class NpuPythonRuntime final {
                    std::vector<std::string> adaptive_peer_ub_devices,
                    std::uint32_t batch_get_max_inflight_total,
                    std::string aicpu_urma_kernel_json_path,
-                   std::string urma_device, std::uint32_t urma_eid_index) {
+                   std::string urma_device, std::uint32_t urma_eid_index,
+                   std::string aicpu_batch_get_mode) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
                               batch_get_tokens_per_block};
@@ -288,6 +291,7 @@ class NpuPythonRuntime final {
     aicpu_backend_ = !options.aicpu_urma_kernel_json_path.empty();
     options.urma_device = std::move(urma_device);
     options.urma_eid_index = urma_eid_index;
+    options.aicpu_batch_get_mode = std::move(aicpu_batch_get_mode);
     options.batch_get_max_inflight_total = batch_get_max_inflight_total;
     options.npu_eids = std::move(npu_eids);
     options.adaptive_ub_device = adaptive_ub_device;
@@ -600,7 +604,7 @@ void BindNpuPythonRuntime(py::module_& module) {
                     std::uint32_t, std::string, std::uint32_t,
                     std::vector<std::string>, bool, std::uint32_t,
                     std::string, std::vector<std::string>, std::uint32_t,
-                    std::string, std::string, std::uint32_t>(),
+                    std::string, std::string, std::uint32_t, std::string>(),
            py::arg("batch_get_kernel_object_path"),
            py::arg("batch_get_token_bytes"),
            py::arg("batch_get_tokens_per_block"), py::arg("device_id") = 0,
@@ -616,7 +620,8 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("batch_get_max_inflight_total") = 2048,
            py::arg("aicpu_urma_kernel_json_path") = "",
            py::arg("urma_device") = "",
-           py::arg("urma_eid_index") = UINT32_MAX)
+           py::arg("urma_eid_index") = UINT32_MAX,
+           py::arg("aicpu_batch_get_mode") = "gather_read")
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
            "Connect this NPU Runtime to a CPU Runtime service before initialize.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),

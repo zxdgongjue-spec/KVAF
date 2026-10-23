@@ -454,7 +454,8 @@ struct NpuRuntime::Impl {
     if (!options.aicpu_urma_kernel_json_path.empty())
       access_operator = std::make_unique<UmdkAccessOperator>(UmdkAccessOperatorConfig{
           options.aicpu_urma_kernel_json_path, options.urma_device, options.urma_eid_index,
-          options.npu_core_count, peer_link, options.batch_get_token_bytes});
+          options.npu_core_count, peer_link, options.batch_get_token_bytes,
+          options.aicpu_batch_get_mode, config.peer_local_eid});
     else
 #endif
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
@@ -486,6 +487,17 @@ struct NpuRuntime::Impl {
 };
 
 NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {
+  const auto& mode = impl_->options.aicpu_batch_get_mode;
+  if (mode != "gather_read" && mode != "cpu_push_scatter")
+    throw std::invalid_argument("aicpu_batch_get_mode must be gather_read or cpu_push_scatter");
+  const bool push = mode == "cpu_push_scatter";
+#if !defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+  if (push) throw std::invalid_argument("cpu_push_scatter was not built; rebuild with --cpu-push");
+#endif
+  if (push && impl_->options.aicpu_urma_kernel_json_path.empty())
+    throw std::invalid_argument("cpu_push_scatter requires an AICPU kernel JSON");
+  if (push && impl_->options.npu_eids.size() > 1)
+    throw std::invalid_argument("cpu_push_scatter uses one NPU EID");
   if ((impl_->config.batch_get_kernel_object_path.empty() && impl_->options.aicpu_urma_kernel_json_path.empty()) || impl_->options.npu_core_count == 0U ||
       impl_->options.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->options.jettys_per_core == 0U ||
@@ -507,7 +519,7 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
     throw std::invalid_argument("AICPU UMDK support was not built");
 #endif
   if (!impl_->options.aicpu_urma_kernel_json_path.empty() &&
-      (impl_->options.adaptive_ub_device || !impl_->options.npu_eids.empty()))
+      (impl_->options.adaptive_ub_device || (!push && !impl_->options.npu_eids.empty())))
     throw std::invalid_argument("AICPU uses urma_device/urma_eid_index; AIV EID striping and startup tuning are unavailable");
   if (!impl_->options.aicpu_urma_kernel_json_path.empty() &&
       (impl_->options.npu_core_count > 8U ||
@@ -537,7 +549,8 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
   impl_->peer_link = std::make_shared<peer::PeerLink>(target.address);
   impl_->config.peer_link = impl_->peer_link;
   auto allocator = std::make_unique<PeerDdrAllocator>(impl_->peer_link,
-      impl_->options.aicpu_urma_kernel_json_path.empty() ? 0U :
+      impl_->options.aicpu_urma_kernel_json_path.empty() ||
+          impl_->options.aicpu_batch_get_mode == "cpu_push_scatter" ? 0U :
           GatherRemoteWorkspaceBytes(impl_->options.batch_get_token_bytes,
                                      impl_->options.npu_core_count));
   impl_->peer_allocator = allocator.get();
@@ -570,7 +583,8 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   std::vector<NpuLocalEidCandidate> npu_candidates;
   std::string discovery_error;
   const bool explicit_eids = !impl_->options.npu_eids.empty();
-  if (!impl_->options.aicpu_urma_kernel_json_path.empty()) {
+  if (!impl_->options.aicpu_urma_kernel_json_path.empty() &&
+      impl_->options.aicpu_batch_get_mode != "cpu_push_scatter") {
     npu_candidates.push_back({{}, "umdk_device_discovery"});
   } else if (explicit_eids) {
     if (!ParseConfiguredNpuLocalEids(impl_->options.device_id,
