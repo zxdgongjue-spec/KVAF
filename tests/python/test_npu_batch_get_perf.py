@@ -40,6 +40,7 @@ from typing import Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from backend import detect_torch_backend
+from dsa_keys import build_dsa_keys
 from npu_eids import parse_npu_eids
 
 
@@ -745,7 +746,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         populated = 0
         while populated < table_capacity:
             count = min(populate_entries, table_capacity - populated)
-            keys = list(range(populated + 1, populated + count + 1))
+            keys = build_dsa_keys(count, start=populated, q_capacity=table_capacity)
             runtime.batch_put(
                 keys,
                 populate_source[:count],
@@ -760,7 +761,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
         print("BATCH_GET_PERF_PHASE_BEGIN phase=prepare_access_table")
-        prepare_keys = torch.arange(1, table_capacity + 1, dtype=torch.int64)
+        # The same single-pool-row/single-layer DSA order as population:
+        # key = block_q in [0, table_capacity).
+        prepare_keys = torch.arange(table_capacity, dtype=torch.int64)
         table = runtime.prepare_access_table(prepare_keys)
         device_table = runtime.access_table_view(
             table, device="npu", capacity=table_capacity
@@ -818,8 +821,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print("BATCH_GET_PERF_PHASE_DONE phase=correctness_preflight")
 
-        # The table is populated in key order and MetaManager allocates fixed
-        # slots FIFO, so linear token IDs map to adjacent remote CPU addresses.
+        # DSA keys map directly to fixed slots, so linear token IDs map to
+        # adjacent remote CPU addresses.
         # shuffled-contiguous changes only their submission order and keeps the
         # exact same remote working set as contiguous.
         contiguous_source_token_ids = request_ids % total_tokens
