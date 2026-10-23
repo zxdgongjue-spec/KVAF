@@ -1,6 +1,7 @@
 #include "cpu_push_get_mock.h"
 
 #include <atomic>
+#include <array>
 #include <cstring>
 #include <deque>
 #include <stdexcept>
@@ -11,13 +12,16 @@ std::atomic<int> live{0};
 std::atomic<std::uint64_t> writes{0}, markers{0};
 std::uint32_t max_sge = 3, max_bytes = 1024;
 bool fail_post = false, fail_delete = false, error_completion = false;
+bool expanded_attributes = false;
 void Check(bool valid) { if (!valid) throw std::runtime_error("invalid CPU push provider contract"); }
 }  // namespace
 namespace push_mock {
 void Reset(std::uint32_t sge, std::uint32_t bytes) {
   Check(live == 0); max_sge = sge; max_bytes = bytes;
   writes = 0; markers = 0; fail_post = fail_delete = error_completion = false;
+  expanded_attributes = false;
 }
+void UseExpandedDeviceAttributes() { expanded_attributes = true; }
 void FailNextPost() { fail_post = true; }
 void FailNextDelete() { fail_delete = true; }
 void ErrorNextCompletion() { error_completion = true; }
@@ -34,6 +38,18 @@ urma_target_jetty_t* ImportJetty(urma_context_t*, kvaf::urma::RemoteJettyEx*, ur
 
 extern "C" {
 urma_status_t urma_query_device(urma_device_t*, urma_device_attr_t* attr) {
+  if (expanded_attributes) {
+    // Expanded UB SDK response: 496 B, max_jfs_sge at 60, max_msg_size at 72,
+    // reserved_jetty_id_max at 488. Independent of the caller's header layout.
+    std::array<std::uint8_t, 496> response{};
+    std::memcpy(response.data() + 60, &max_sge, 4);
+    const std::uint64_t message = max_bytes;
+    std::memcpy(response.data() + 72, &message, 8);
+    const std::uint32_t reserved_max = 1023;
+    std::memcpy(response.data() + 488, &reserved_max, 4);
+    std::memcpy(attr, response.data(), response.size());
+    return URMA_SUCCESS;
+  }
   *attr = {}; attr->dev_cap.max_jfs_sge = max_sge; attr->dev_cap.max_msg_size = max_bytes; return URMA_SUCCESS;
 }
 urma_jfc_t* urma_create_jfc(urma_context_t*, urma_jfc_cfg_t*) { ++live; return &(new Cq)->handle; }
