@@ -14,9 +14,9 @@
 #include <unistd.h>
 
 namespace kvaf::aicpu_test {
-// Test-only commands; never change the production Runtime protocol.
-// v4 config includes device-side scatter thread count and unaligned row sizes.
-constexpr auto kConfigure = static_cast<peer::Command>(0x7005);
+// The configure opcode rejects executables with an older wire layout.
+// Configure replies carry the NPU's AICPU block setting in the export's reserved field.
+constexpr auto kConfigure = static_cast<peer::Command>(0x7017);
 constexpr auto kStart = static_cast<peer::Command>(0x7001);
 constexpr auto kResetSetup = static_cast<peer::Command>(0x7003);
 struct ConfigureRequest {
@@ -33,9 +33,14 @@ struct Report {
   std::uint64_t rounds{};
   std::uint64_t active_threads{};
   double mean_ns{}, p50_ns{}, p99_ns{}, wait_ns{}, scatter_ns{}, gbps{};
+  double prepare_ns{}, verify_ns{};
 };
-static_assert(sizeof(ConfigureRequest) == 80 && sizeof(Ack) == 16 && sizeof(Report) == 80);
+static_assert(sizeof(ConfigureRequest) == 80 && sizeof(Ack) == 16 && sizeof(Report) == 96);
 
+// Literal checks must not construct a temporary string on the success path.
+inline void Require(bool ok, const char* message) {
+  if (!ok) throw std::runtime_error(message);
+}
 inline void Require(bool ok, const std::string& message) {
   if (!ok) throw std::runtime_error(message);
 }

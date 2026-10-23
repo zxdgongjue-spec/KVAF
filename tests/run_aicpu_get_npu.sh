@@ -18,9 +18,13 @@ Wrapper options:
   --cann-root DIR     Installation root; defaults to CANN environment/cache
 
 Pass-through options: --port 29991 --device-id 0 --eid HEX --kernel-json PATH
+  --aicpu-blocks N   AICPU parallelism, 1..32; default 4.
 Without --device-id, use the CPU request's NPU device ID. With it, reject a mismatch.
 The built kernel JSON is selected automatically. No installation by default.
-Set --rows, --row-bytes and --scatter-threads on the CPU script.
+Set the data shape on the CPU script; CPU partitioning follows the NPU block setting.
+Small inputs use fewer active blocks when there are fewer staging cache-line groups.
+No explicit kernel cache maintenance or per-round cold-output preparation.
+Install the V24 kernel after rebuilding both ends; restart NPU after installation.
 This server handles one test run; restart it for the next run.
 Build: bash build.sh aicpu-npu
 EOF
@@ -30,7 +34,10 @@ EOF
       if [[ "$1" == --build-dir ]]; then build_dir="$2"; else cann_root="$2"; fi
       shift 2 ;;
     --install-kernel) install_kernel=true; shift ;;
-    *) args+=("$1"); shift ;;
+    --port|--device-id|--eid|--kernel-json|--aicpu-blocks)
+      [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "$1 requires a value" >&2; exit 2; }
+      args+=("$1" "$2"); shift 2 ;;
+    *) echo "Unknown option: $1; run with --help" >&2; exit 2 ;;
   esac
 done
 artifact_dir="$build_dir/tests/aicpu_batch_get"

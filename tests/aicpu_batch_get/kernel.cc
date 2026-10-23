@@ -1,103 +1,165 @@
-#include "device_loop.h"
-#include "scatter_pool.h"
-
-#include <cstring>
+#define KVAF_AICPU_TEST_DEVICE_KERNEL 1
+#include "abi.h"
+#include "pipeline.h"
+#include <cstdint>
 
 #if !defined(__aarch64__)
-#error "This AICPU kernel must be cross-compiled for aarch64"
+#error "Cross-compile this kernel for AArch64"
 #endif
-
 namespace {
 using namespace kvaf::aicpu_test;
 void Barrier() { asm volatile("dsb sy" ::: "memory"); }
-void Clean(const void* data, std::uint64_t bytes) {
-  auto begin = reinterpret_cast<std::uintptr_t>(data) & ~std::uintptr_t{63};
-  const auto end = reinterpret_cast<std::uintptr_t>(data) + bytes;
-  for (; begin < end; begin += 64) asm volatile("dc cvac, %0" :: "r"(begin) : "memory");
-  Barrier();
+std::uint64_t Load(const CoordinationWord& word) { return __atomic_load_n(&word.value, __ATOMIC_ACQUIRE); }
+void Store(CoordinationWord& word, std::uint64_t value) { __atomic_store_n(&word.value, value, __ATOMIC_RELEASE); }
+std::uint64_t Add(CoordinationWord& word) { return __atomic_fetch_add(&word.value, 1, __ATOMIC_ACQ_REL); }
+Result Status(const MultiBlockCoordination& c) { return static_cast<Result>(Load(c.status)); }
+void Fail(MultiBlockCoordination& c, Result status, std::uint64_t sequence) {
+  std::uint64_t expected = static_cast<std::uint64_t>(Result::kPending);
+  if (__atomic_compare_exchange_n(&c.status.value, &expected, static_cast<std::uint64_t>(status),
+                                  false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) Store(c.failure_sequence, sequence);
 }
-void Invalidate(const void* data, std::uint64_t bytes) {
-  auto begin = reinterpret_cast<std::uintptr_t>(data) & ~std::uintptr_t{63};
-  const auto end = reinterpret_cast<std::uintptr_t>(data) + bytes;
-  // DC IVAC is privileged and faults at EL0. AICPU user kernels use CIVAC
-  // (subject to platform cache-maintenance permission), as in the reference kernels.
-  // These DMA-owned lines are only read by AICPU; do not dirty them before
-  // invalidation, or the clean part could overwrite newer DMA data.
-  for (; begin < end; begin += 64) asm volatile("dc civac, %0" :: "r"(begin) : "memory");
-  Barrier();
+void Minimum(CoordinationWord& word, std::uint64_t value) {
+  auto previous = Load(word);
+  while (value < previous && !__atomic_compare_exchange_n(&word.value, &previous, value,
+      false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {}
 }
 struct DeviceIO {
   std::uint8_t* region;
-  std::uint8_t* output;
   Config config;
   Layout layout;
-  ScatterPool pool;
-  static void ScatterWorker(void* context, std::uint32_t worker) {
-    auto& io = *static_cast<DeviceIO*>(context);
-    const auto range = ScatterRange(io.config, worker, ActiveThreads(io.config));
-    Invalidate(io.region + kStagingOffset + range.begin * io.config.row_bytes,
-               (range.end - range.begin) * io.config.row_bytes);
-    for (auto row = range.begin; row < range.end; ++row)
-      std::memcpy(io.output + OutputOffset(io.config, io.layout, row),
-                  io.region + kStagingOffset + row * io.config.row_bytes, io.config.row_bytes);
-    Clean(io.output + (io.config.rows - range.end) * io.layout.stride,
-          (range.end - range.begin) * io.layout.stride);
-  }
-  std::uint64_t Frequency() {
-    std::uint64_t value;
-    asm volatile("mrs %0, cntfrq_el0" : "=r"(value));
-    return value;
-  }
-  std::uint64_t Now() {
-    std::uint64_t value;
-    asm volatile("isb; mrs %0, cntvct_el0" : "=r"(value) :: "memory");
-    return value;
-  }
-  void PublishRequest(std::uint64_t sequence) {
-    auto* control = reinterpret_cast<volatile Control*>(region + kRequestOffset);
-    control->sequence = sequence;
-    Clean(region + kRequestOffset, sizeof(Control));
+  std::uint64_t sequence{};
+  std::uint8_t* Output() { return region + RegisteredOutputOffset(layout); }
+  std::uint64_t Now() { std::uint64_t v; asm volatile("isb; mrs %0, cntvct_el0" : "=r"(v) :: "memory"); return v; }
+  std::uint64_t Frequency() { std::uint64_t v; asm volatile("mrs %0, cntfrq_el0" : "=r"(v)); return v; }
+  void PublishRequest(std::uint64_t seq) {
+    reinterpret_cast<volatile Control*>(region + kRequestOffset)->sequence = seq;
+    Barrier();
   }
   std::uint64_t ReadDone() {
-    Invalidate(region + kDoneOffset, sizeof(Control));
+    Barrier();
     return reinterpret_cast<volatile Control*>(region + kDoneOffset)->sequence;
   }
-  void Scatter(const Config&, const Layout&) { pool.Run(); }
-  bool VerifyTags(std::uint64_t seq, const Config& c, const Layout& l) {
-    Invalidate(output, l.output_bytes);
-    for (std::uint64_t row = 0; row < c.rows; ++row) {
-      std::uint64_t value;
-      std::memcpy(&value, output + OutputOffset(c, l, row), sizeof(value));
-      if (value != RowTag(seq, row)) return false;
-    }
-    return true;
+  std::uint64_t ReadRangeDone(std::uint32_t worker) {
+    const auto offset = ChainReadyOffset(layout, worker);
+    Barrier();
+    auto* words = reinterpret_cast<volatile std::uint64_t*>(region + offset);
+    return ChainReadyProgress(config, worker, sequence, [&](std::uint32_t q) { return words[q]; });
   }
+  void PublishOutputReady(std::uint64_t seq) {
+    reinterpret_cast<volatile Control*>(region + kOutputReadyOffset)->sequence = seq;
+    Barrier();
+  }
+  std::uint64_t ReadOutputVerified() {
+    Barrier();
+    return reinterpret_cast<volatile Control*>(region + kOutputVerifiedOffset)->sequence;
+  }
+  void Relax() { asm volatile("yield" ::: "memory"); }
 };
-}  // namespace
-
-extern "C" __attribute__((visibility("default")))
-std::uint32_t KvafAicpuBatchGetV2(KernelArgs* args) {
-  if (!args || !args->region || !args->output || !args->samples || !args->result)
-    return 1;
-  auto* result = reinterpret_cast<KernelResult*>(args->result);
-  auto* samples = reinterpret_cast<Sample*>(args->samples);
-  Layout layout{};
-  if (!MakeLayout(args->config, &layout)) {
-    *result = {}; result->status = Result::kInvalidArgs;
-    Clean(result, sizeof(*result)); return 1;
+bool WaitFor(DeviceIO& io, MultiBlockCoordination& c, const CoordinationWord& word,
+             std::uint64_t target, std::uint64_t start, std::uint64_t timeout, std::uint64_t sequence) {
+  for (;;) {
+    if (Load(word) >= target) return true;
+    if (Status(c) != Result::kPending) return false;
+    if (io.Now() - start >= timeout) { Fail(c, Result::kTimeout, sequence); return false; }
+    io.Relax();
   }
-  DeviceIO io{reinterpret_cast<std::uint8_t*>(args->region),
-              reinterpret_cast<std::uint8_t*>(args->output), args->config, layout, {}};
-  const auto error = io.pool.Initialize(ActiveThreads(args->config), &DeviceIO::ScatterWorker, &io);
-  if (error) {
-    *result = {}; result->status = Result::kThreadError;
-    result->requested_threads = args->config.scatter_threads;
-    result->pthread_error = error; result->kernel_revision = kKernelRevision;
-    Clean(result, sizeof(*result)); return 1;
+}
+struct RangeIO {
+  DeviceIO& device;
+  MultiBlockCoordination& coordination;
+  Result Status() { return ::Status(coordination); }
+  std::uint64_t Now() { return device.Now(); }
+  std::uint64_t ReadRangeDone(std::uint32_t worker) { return device.ReadRangeDone(worker); }
+  void RangeReady(std::uint64_t now) { Minimum(coordination.ready_tick, now); }
+  void Relax() { device.Relax(); }
+  void CopySpan(RowRange r) {
+    Barrier();
+    if (!CopyScatterRows(device.Output() + r.begin * device.layout.stride,
+        device.region + kStagingOffset + r.begin * device.config.row_bytes,
+        r.end - r.begin, device.config.row_bytes, device.layout.stride))
+      Fail(coordination, Result::kCopyError, device.sequence);
   }
-  const auto status = RunDevice(args->config, io, samples, result);
+  void FinishRange() { Barrier(); }
+};
+Result Run(DeviceIO& io, Sample* samples, KernelResult* result, MultiBlockCoordination& c) {
+  const auto workers = ActiveThreads(io.config);
+  if (c.magic != kMagic || c.revision != kKernelRevision || c.workers != workers) {
+    *result = {}; result->status = Result::kInvalidArgs; result->kernel_revision = kKernelRevision;
+    Barrier(); return Result::kInvalidArgs;
+  }
+  const auto worker = static_cast<std::uint32_t>(Add(c.claimed));
+  if (worker >= workers) { Fail(c, Result::kInvalidArgs, 0); return Result::kInvalidArgs; }
+  const auto frequency = io.Frequency();
+  const auto timeout = frequency * io.config.timeout_ms / 1000;
+  if (!worker) {
+    *result = {};
+    result->active_threads = workers; result->kernel_revision = kKernelRevision;
+    result->counter_frequency = frequency;
+    if (!timeout) Fail(c, Result::kInvalidArgs, 0);
+    Store(c.initialized, 1);
+  }
+  const auto startup = io.Now();
+  bool initialized = WaitFor(io, c, c.initialized, 1, startup, frequency, 0);
+  if (initialized) {
+    Add(c.ready);
+    initialized = WaitFor(io, c, c.ready, workers, startup, frequency, 0);
+  }
+  for (std::uint64_t sequence = 1; initialized && sequence <= io.layout.rounds; ++sequence) {
+    if (!worker) {
+      result->failed_sequence = sequence;
+      const auto start = io.Now(); Store(c.request_start, start); Store(c.ready_tick, UINT64_MAX);
+      io.PublishRequest(sequence); Store(c.request_sequence, sequence);
+    } else if (!WaitFor(io, c, c.request_sequence, sequence, io.Now(), timeout, sequence)) break;
+    if (Status(c) != Result::kPending) break;
+    io.sequence = sequence;
+    const auto start = Load(c.request_start);
+    RangeIO range{io, c};
+    const auto status = RunPipelineChunks(io.config, worker, sequence, start, timeout, range);
+    if (status != Result::kOk) { Fail(c, status, sequence); break; }
+    if (Add(c.arrivals) + 1 == sequence * workers) Store(c.scatter_done, sequence);
+    if (!worker) {
+      if (!WaitFor(io, c, c.scatter_done, sequence, start, timeout, sequence)) break;
+      for (;;) {
+        const auto done = io.ReadDone();
+        if (done > sequence) { Fail(c, Result::kSequenceError, sequence); break; }
+        if (Status(c) != Result::kPending) break;
+        if (io.Now() - start >= timeout) { Fail(c, Result::kTimeout, sequence); break; }
+        if (done == sequence) break;
+        io.Relax();
+      }
+      if (Status(c) != Result::kPending) break;
+      const auto end = io.Now(), ready = Load(c.ready_tick);
+      std::uint64_t verification = 0;
+      if (sequence == io.layout.rounds) {
+        const auto verify_start = io.Now();
+        const auto verified = VerifyOutputViaUrma(sequence, timeout, io);
+        if (verified != Result::kOk) { Fail(c, verified, sequence); break; }
+        verification = io.Now() - verify_start;
+      }
+      if (sequence > io.config.warmup)
+        samples[sequence - io.config.warmup - 1] = {end - start, ready - start, end - ready, 0, verification};
+      result->completed_rounds = sequence; Store(c.round_complete, sequence);
+    } else if (!WaitFor(io, c, c.round_complete, sequence, io.Now(), timeout, sequence)) break;
+  }
+  Add(c.exited);
+  if (worker) return Status(c) == Result::kPending ? Result::kOk : Status(c);
+  WaitFor(io, c, c.exited, workers, io.Now(), frequency, result->failed_sequence);
+  auto status = Status(c); if (status == Result::kPending) status = Result::kOk;
   result->status = status;
-  if (status == Result::kOk) Clean(samples, args->config.iterations * sizeof(Sample));
-  Clean(result, sizeof(*result));
-  return status == Result::kOk ? 0 : 1;
+  result->failed_sequence = status == Result::kOk ? 0 : Load(c.failure_sequence);
+  Barrier(); return status;
+}
+}
+extern "C" __attribute__((visibility("default")))
+std::uint32_t KvafAicpuBatchGetV24(kvaf::aicpu_test::KernelArgs* args) {
+  if (!args || !args->region || !args->samples || !args->result || !args->coordination) return 1;
+  Layout layout{};
+  auto* result = reinterpret_cast<KernelResult*>(args->result);
+  if (!MakeLayout(args->config, &layout) || args->region > UINT64_MAX - layout.region_bytes) {
+    *result = {}; result->status = Result::kInvalidArgs; result->kernel_revision = kKernelRevision;
+    Barrier(); return 1;
+  }
+  DeviceIO io{reinterpret_cast<std::uint8_t*>(args->region), args->config, layout};
+  return Run(io, reinterpret_cast<Sample*>(args->samples), result,
+      *reinterpret_cast<MultiBlockCoordination*>(args->coordination)) == Result::kOk ? 0 : 1;
 }

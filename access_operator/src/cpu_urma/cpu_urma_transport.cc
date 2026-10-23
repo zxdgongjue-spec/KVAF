@@ -2,6 +2,7 @@
 #include "cpu_urma/batch_validation.h"
 #include "cpu_urma/sgl_batch_builder.h"
 #include "cpu_urma/jetty_batch_dispatch.h"
+#include "cpu_urma/indexed_async_write_tracker.h"
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -34,6 +35,14 @@ constexpr std::uint32_t kMaxJettyCount = 16;
 constexpr std::uint32_t kMaxPrepareThreadCount = 64;
 constexpr std::uint32_t kPageBytes = 4096;
 constexpr std::size_t kMinRowsPerPrepareWorker = 64;
+
+struct QueueRows { std::size_t first{}, count{}; };
+inline QueueRows RowsForQueue(std::size_t rows, std::size_t queues,
+    std::size_t queue) {
+  if (!queues || queue >= queues) return {};
+  const auto base = rows / queues, remainder = rows % queues;
+  return {queue * base + std::min(queue, remainder), base + (queue < remainder ? 1U : 0U)};
+}
 constexpr std::size_t kParallelPrepareMinItems = 256;
 constexpr std::uint32_t kKeyBytes = sizeof(urma_jetty_id_t) + sizeof(urma_transport_mode_t);
 // AIV/Direct-HCCP and liburma expose the same routing EID prefix but may
@@ -117,6 +126,14 @@ struct CpuUrmaTransport::Impl {
   struct WorkerResult {
     std::string post_error;
     std::string poll_error;
+  };
+
+  struct PreparedWrite {
+    SglBatchJob job;
+    std::array<cpu_urma_detail::IndexedAsyncWriteTracker::Fence, kMaxJettyCount> fences{};
+    std::size_t fence_count{};
+    cpu_urma_detail::IndexedAsyncWriteTracker::Handle handle;
+    std::uint64_t marker_wrs{};
   };
 
   static std::uint64_t MakeUserContext(std::uint64_t generation,
@@ -256,8 +273,27 @@ struct CpuUrmaTransport::Impl {
                                          std::uint64_t* post_ns,
                                          std::uint64_t* poll_ns) {
     std::array<WorkerResult, kMaxJettyCount> results{};
-    std::size_t wr_count = 0U;
-    for (const auto& queue : job.queues) wr_count += queue.count;
+    std::size_t wr_count = 0, active = 0, sole = 0;
+    for (std::size_t q = 0; q < job.queues.size(); ++q) {
+      const auto count = job.queues[q].count;
+      wr_count += count;
+      if (count) { ++active; sole = q; }
+    }
+    // Single-queue control messages bypass the OpenMP team.
+    if (active == 1) {
+      const auto begin = std::chrono::steady_clock::now();
+      for (std::size_t wr = 0; wr < wr_count; ++wr) PrepareSglBatchEntry(job, wr);
+      const auto prepared = std::chrono::steady_clock::now();
+      auto error = PostSglQueue(job, sole);
+      const auto posted = std::chrono::steady_clock::now();
+      if (error.empty()) error = PollSglQueue(job, sole);
+      const auto finished = std::chrono::steady_clock::now();
+      *prepare_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(prepared - begin).count();
+      *post_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(posted - prepared).count();
+      *poll_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(finished - posted).count();
+      if (!error.empty()) batch_poisoned_ = true;
+      return error;
+    }
     const std::size_t prepare_tasks = PrepareWorkerCount(wr_count);
     const std::size_t team_threads =
         std::max(prepare_tasks, job.queues.size());
@@ -338,12 +374,15 @@ struct CpuUrmaTransport::Impl {
         options.wqes_per_doorbell > kJettyDepth || options.remote_sgl_size == 0U ||
         options.jetty_count == 0U || options.jetty_count > kMaxJettyCount ||
         options.prepare_thread_count == 0U ||
-        options.prepare_thread_count > kMaxPrepareThreadCount) {
+        options.prepare_thread_count > kMaxPrepareThreadCount ||
+        !options.async_cq_batch || options.async_cq_batch > 64 ||
+        !options.async_deadline_polls || options.async_deadline_polls > 1024) {
       return Status::InvalidArgument(
           "CPU URMA transport requires peer_address, non-zero region_bytes, "
           "non-zero remote_sgl_size, jetty_count in [1,16], "
           "prepare_thread_count in [1,64] and "
-          "wqes_per_doorbell in [0,8192]");
+          "wqes_per_doorbell in [0,8192], async_cq_batch in [1,64] and "
+          "async_deadline_polls in [1,1024]");
     }
     // URMA is process-wide.  The ACL/HBM runtime may have initialized it
     // before this transport is constructed, in which case liburma returns
@@ -647,6 +686,11 @@ struct CpuUrmaTransport::Impl {
                  static_cast<unsigned long long>(max_message_bytes_), kJettyDepth);
     batch_generation_ = 0U;
     batch_poisoned_ = false;
+    indexed_tracker_ = cpu_urma_detail::IndexedAsyncWriteTracker(local_jettys_.size(), kJettyDepth);
+    async_cq_batch_ = options.async_cq_batch;
+    async_deadline_polls_ = options.async_deadline_polls;
+    async_polls_since_deadline_ = next_async_poll_queue_ = 0;
+    async_stats_ = {};
     initialized_ = true;
     return Status::OK();
   }
@@ -746,6 +790,8 @@ struct CpuUrmaTransport::Impl {
       return Status::InvalidState(
           "CPU URMA transport requires reinitialization after a submission failure");
     }
+    if (!indexed_tracker_.Empty())
+      return Status::InvalidState("host registration while prepared WRITEs are in flight");
     RegisteredHostBuffer* host = nullptr;
     Status status = RegisterHostBuffer(base, bytes, &host);
     if (status.ok()) explicit_host_region_ = *host;
@@ -782,23 +828,23 @@ struct CpuUrmaTransport::Impl {
     return Status::OK();
   }
 
-  Status BuildWriteGatherQueue(
+  // Append into preallocated storage; the caller sets the final completion fence.
+  Status AppendWriteGatherQueue(
       SglBatchJob& job, std::size_t jetty,
       const CpuUrmaTransport::HostSge* buffers,
       const std::uint64_t* remote_offsets, std::size_t row_count,
-      std::size_t first, std::size_t count) {
+      std::size_t first, std::size_t count, std::size_t local_base = 0) {
     SglBatchQueue& queue = job.queues[jetty];
-    queue.count = 0U;
-    queue.missing_host_segments.clear();
     if (count == 0U) return Status::OK();
 
+    const auto wr_base = queue.count;
     std::size_t wr_count = 0U;
     const Status status = cpu_urma_detail::BuildWriteGatherShard(
         buffers, remote_offsets, row_count, first, count,
         batch_local_sgl_size_, remote_region_.length, max_message_bytes_,
         [&](std::size_t local_index, std::size_t row,
             const CpuUrmaTransport::HostSge& buffer) {
-          SglSgeAbi& local = queue.local[local_index];
+          SglSgeAbi& local = queue.local[local_base + local_index];
           local = {};
           local.addr = reinterpret_cast<std::uint64_t>(buffer.data);
           local.len = static_cast<std::uint32_t>(buffer.bytes);
@@ -811,18 +857,19 @@ struct CpuUrmaTransport::Impl {
                      host != nullptr) {
             local.tseg = host->segment;
           } else {
-            queue.missing_host_segments.push_back({row, local_index});
+            queue.missing_host_segments.push_back({row, local_base + local_index});
           }
         },
         [&](std::size_t wr_index,
             const cpu_urma_detail::WriteGatherGroup& group) {
-          SglSgeAbi& remote = queue.remote[wr_index];
+          const auto index = wr_base + wr_index;
+          SglSgeAbi& remote = queue.remote[index];
           remote = {};
           remote.addr = remote_region_.base + remote_offsets[group.first];
           remote.len = static_cast<std::uint32_t>(group.bytes);
           remote.tseg = remote_seg_handle_;
 
-          urma_jfs_wr_t& wr = queue.wrs[wr_index];
+          urma_jfs_wr_t& wr = queue.wrs[index];
           wr = {};
           wr.opcode = URMA_OPC_WRITE;
           wr.flag.bs.place_order = URMA_RELAX_ORDER;
@@ -832,7 +879,7 @@ struct CpuUrmaTransport::Impl {
           wr.user_ctx = MakeUserContext(
               job.generation, jetty, wr_index);
 
-          const std::size_t local_first = group.first - first;
+          const std::size_t local_first = local_base + group.first - first;
           urma_sg_t local_sg{};
           local_sg.sge = reinterpret_cast<urma_sge_t*>(
               queue.local.data() + local_first);
@@ -843,8 +890,8 @@ struct CpuUrmaTransport::Impl {
           wr.rw.src = local_sg;
           wr.rw.dst = remote_sg;
           wr.next = nullptr;
-          if (wr_index != 0U) {
-            queue.wrs[wr_index - 1U].next = &wr;
+          if (index != 0U) {
+            queue.wrs[index - 1U].next = &wr;
           }
         },
         &wr_count);
@@ -853,10 +900,7 @@ struct CpuUrmaTransport::Impl {
       return status;
     }
 
-    queue.count = wr_count;
-    urma_jfs_wr_t& tail = queue.wrs[wr_count - 1U];
-    tail.flag.bs.place_order = URMA_STRONG_ORDER;
-    tail.flag.bs.complete_enable = 1U;
+    queue.count += wr_count;
     return Status::OK();
   }
 
@@ -871,12 +915,9 @@ struct CpuUrmaTransport::Impl {
     job.generation = ++batch_generation_;
     job.queues.resize(local_jettys_.size());
 
-    const std::size_t base = count / job.queues.size();
-    const std::size_t remainder = count % job.queues.size();
     for (std::size_t jetty = 0U; jetty < job.queues.size(); ++jetty) {
-      const std::size_t shard_count =
-          base + (jetty < remainder ? 1U : 0U);
-      EnsureSglQueueStorage(job.queues[jetty], shard_count, shard_count);
+      const auto shard = RowsForQueue(count, job.queues.size(), jetty);
+      EnsureSglQueueStorage(job.queues[jetty], shard.count, shard.count);
       job.queues[jetty].count = 0U;
       job.queues[jetty].missing_host_segments.clear();
     }
@@ -907,14 +948,16 @@ struct CpuUrmaTransport::Impl {
       for (std::int64_t index = 0;
            index < static_cast<std::int64_t>(job.queues.size()); ++index) {
         const std::size_t jetty = static_cast<std::size_t>(index);
-        const std::size_t shard_count =
-            base + (jetty < remainder ? 1U : 0U);
-        const std::size_t shard_first = first + jetty * base +
-            std::min(jetty, remainder);
-        build_status[jetty] = shard_count == 0U
+        const auto shard = RowsForQueue(count, job.queues.size(), jetty);
+        build_status[jetty] = shard.count == 0U
             ? Status::OK()
-            : BuildWriteGatherQueue(job, jetty, buffers, remote_offsets,
-                                    row_count, shard_first, shard_count);
+            : AppendWriteGatherQueue(job, jetty, buffers, remote_offsets,
+                                     row_count, first + shard.first, shard.count);
+        if (build_status[jetty].ok() && shard.count) {
+          auto& tail = job.queues[jetty].wrs[job.queues[jetty].count - 1];
+          tail.flag.bs.place_order = URMA_STRONG_ORDER;
+          tail.flag.bs.complete_enable = 1U;
+        }
       }
 
 #pragma omp master
@@ -1006,18 +1049,13 @@ struct CpuUrmaTransport::Impl {
     return Status::OK();
   }
 
+  // TransferBatch holds the lock and validates state/arguments.
   Status TransferWriteBatchLocked(
       const std::uint64_t* remote_offsets,
       const CpuUrmaTransport::HostSge* buffers, std::size_t count) {
-    if (!initialized_) {
-      return Status::InvalidState("CPU URMA transport is not initialized");
-    }
     if (batch_poisoned_) {
       return Status::InvalidState(
           "CPU URMA transport requires reinitialization after a submission failure");
-    }
-    if (remote_offsets == nullptr || buffers == nullptr || count == 0U) {
-      return Status::InvalidArgument("invalid non-contiguous batch transfer");
     }
 
     const auto start = std::chrono::steady_clock::now();
@@ -1065,6 +1103,8 @@ struct CpuUrmaTransport::Impl {
       return Status::InvalidState(
           "CPU URMA transport requires reinitialization after a submission failure");
     }
+    if (!indexed_tracker_.Empty())
+      return Status::InvalidState("synchronous transfer while prepared WRITEs are in flight");
     if (buffers == nullptr || count == 0U ||
         offset > remote_region_.length) {
       return Status::InvalidArgument("invalid SGL batch transfer");
@@ -1190,6 +1230,8 @@ struct CpuUrmaTransport::Impl {
     if (!initialized_) {
       return Status::InvalidState("CPU URMA transport is not initialized");
     }
+    if (!indexed_tracker_.Empty())
+      return Status::InvalidState("synchronous transfer while prepared WRITEs are in flight");
     if (remote_offsets == nullptr || buffers == nullptr || count == 0U) {
       return Status::InvalidArgument("invalid non-contiguous batch transfer");
     }
@@ -1264,6 +1306,8 @@ struct CpuUrmaTransport::Impl {
   Status ValidateLink() {
     std::unique_lock<std::mutex> submit_lock(batch_submit_mutex_);
     if (!initialized_) return Status::NotInitialized("CPU transport is not initialized");
+    if (!indexed_tracker_.Empty())
+      return Status::InvalidState("link validation while prepared WRITEs are in flight");
     if (batch_poisoned_) {
       return Status::InvalidState(
           "CPU URMA transport requires reinitialization after a submission failure");
@@ -1295,17 +1339,189 @@ struct CpuUrmaTransport::Impl {
     return status;
   }
 
+  Status PrepareWrite(const CpuUrmaTransport::WriteChunk* chunks, std::size_t count,
+      CpuUrmaTransport::PreparedWriteId* id) {
+    std::unique_lock<std::mutex> lock(batch_submit_mutex_);
+    if (!initialized_ || batch_poisoned_ || !indexed_tracker_.Empty())
+      return Status::InvalidState("prepare WRITE requires an initialized, idle transport");
+    if (!chunks || !count || !id || count > kJettyDepth)
+      return Status::InvalidArgument("invalid prepared WRITE chunks");
+    auto plan = std::make_unique<PreparedWrite>();
+    auto& job = plan->job; job.write = true; job.queues.resize(local_jettys_.size());
+    for (std::size_t c = 0; c < count; ++c) {
+      const auto& chunk = chunks[c];
+      if (!chunk.count || !chunk.sources || !chunk.remote_offsets ||
+          (chunk.marker_offsets != nullptr) != (chunk.marker_value != nullptr) ||
+          reinterpret_cast<std::uintptr_t>(chunk.marker_value) % 8 ||
+          chunk.count > kJettyDepth * local_jettys_.size())
+        return Status::InvalidArgument("invalid chain chunk/source/marker alignment");
+      auto status = ValidateAndRegisterHostBuffers(chunk.sources, chunk.remote_offsets, chunk.count);
+      if (!status.ok()) return status;
+      if (chunk.marker_value) {
+        const CpuUrmaTransport::HostSge marker{const_cast<std::uint64_t*>(chunk.marker_value), 8};
+        status = ValidateAndRegisterHostBuffers(&marker, chunk.marker_offsets, 1);
+        if (!status.ok()) return status;
+      }
+    }
+    for (std::size_t q = 0; q < job.queues.size(); ++q) {
+      auto& queue = job.queues[q];
+      std::size_t capacity = 0;
+      for (std::size_t c = 0; c < count; ++c)
+        capacity += RowsForQueue(chunks[c].count, job.queues.size(), q).count +
+                    (chunks[c].marker_value ? 1 : 0);
+      if (capacity > kJettyDepth)
+        return Status::InvalidArgument("WRITE source/marker budget exceeds one SQ wave; reduce rows/chunks");
+      // Keep descriptor addresses stable while appending this queue's chunks.
+      queue.local.resize(capacity); queue.remote.resize(capacity); queue.wrs.resize(capacity);
+      std::size_t local_count = 0;
+      for (std::size_t c = 0; c < count; ++c) {
+        const auto& chunk = chunks[c];
+        const auto range = RowsForQueue(chunk.count, job.queues.size(), q);
+        const auto status = AppendWriteGatherQueue(job, q, chunk.sources, chunk.remote_offsets,
+                                                  chunk.count, range.first, range.count, local_count);
+        if (!status.ok()) return status;
+        local_count += range.count;
+        if (!chunk.marker_value) continue;
+        const auto offset = chunk.marker_offsets[q];
+        if (offset % 8 || offset > remote_region_.length || remote_region_.length - offset < 8)
+          return Status::InvalidArgument("chain marker is outside remote region or unaligned");
+        auto* marker_segment = FindRegisteredHostBuffer(chunk.marker_value, 8)->segment;
+        // Every queue publishes its own progress, including empty shards.
+        const auto index = queue.count++, local = local_count++;
+        queue.local[local] = {reinterpret_cast<std::uint64_t>(chunk.marker_value), 8, marker_segment, nullptr};
+        queue.remote[index] = {remote_region_.base + offset, 8, remote_seg_handle_, nullptr};
+        auto& wr = queue.wrs[index]; wr = {}; wr.opcode = URMA_OPC_WRITE;
+        wr.flag.bs.place_order = URMA_STRONG_ORDER; wr.flag.bs.comp_order = 1;
+        wr.tjetty = remote_jettys_[q];
+        wr.rw.src.sge = reinterpret_cast<urma_sge_t*>(&queue.local[local]); wr.rw.src.num_sge = 1;
+        wr.rw.dst.sge = reinterpret_cast<urma_sge_t*>(&queue.remote[index]); wr.rw.dst.num_sge = 1;
+        if (index) queue.wrs[index - 1].next = &wr;
+        ++plan->marker_wrs;
+      }
+      if (!queue.count) continue;
+      auto& tail = queue.wrs[queue.count - 1]; tail.flag.bs.complete_enable = 1;
+      tail.flag.bs.place_order = URMA_STRONG_ORDER; tail.flag.bs.comp_order = 1;
+      plan->fences[plan->fence_count++] = {q, queue.count, 0};
+    }
+    prepared_writes_.push_back(std::move(plan)); *id = prepared_writes_.size();
+    return Status::OK();
+  }
+
+  Status DescribePreparedWrite(CpuUrmaTransport::PreparedWriteId id,
+                              CpuUrmaTransport::PreparedWriteInfo* info) {
+    std::unique_lock<std::mutex> lock(batch_submit_mutex_);
+    if (!info || !id || id > prepared_writes_.size())
+      return Status::InvalidArgument("unknown prepared WRITE or missing info");
+    *info = {};
+    const auto& plan = *prepared_writes_[id - 1];
+    info->marker_wrs = plan.marker_wrs;
+    for (const auto& q : plan.job.queues) if (q.count) {
+      info->wr_count += q.count;
+      ++info->tail_cqes;
+    }
+    return Status::OK();
+  }
+
+  Status SubmitPreparedWriteLocked(CpuUrmaTransport::PreparedWriteId id, bool* submitted) {
+    if (!submitted) return Status::InvalidArgument("missing submission result");
+    *submitted = false;
+    if (!initialized_ || batch_poisoned_)
+      return Status::InvalidState("prepared WRITE transport is unavailable");
+    if (!id || id > prepared_writes_.size()) return Status::InvalidArgument("unknown prepared WRITE");
+    auto& plan = *prepared_writes_[id - 1];
+    auto& job = plan.job;
+    const auto start = std::chrono::steady_clock::now();
+    auto status = indexed_tracker_.TryBegin(id, plan.handle, plan.fences.data(), plan.fence_count, submitted);
+    if (!status.ok() || !*submitted) return status;
+    job.deadline = start + std::chrono::seconds(5);
+    for (std::size_t i = 0; i < plan.fence_count; ++i) {
+      const auto& f = plan.fences[i];
+      job.queues[f.queue].wrs[f.wrs - 1].user_ctx = f.context;
+      const auto error = PostSglQueue(job, f.queue);
+      if (!error.empty()) {
+        // A failed post may leave live WRs; retain sources and descriptors until teardown.
+        batch_poisoned_ = true;
+        return Status::Internal(error);
+      }
+    }
+    return Status::OK();
+  }
+
+  Status PollPreparedWritesLocked(CpuUrmaTransport::PreparedWriteCompletion* completed,
+                                 std::size_t capacity, std::size_t* count) {
+    if (!completed || !capacity || !count) return Status::InvalidArgument("invalid async completion buffer");
+    *count = 0;
+    if (!initialized_ || batch_poisoned_) return Status::InvalidState("async CQ transport is unavailable");
+    std::array<urma_cr_t, 64> crs;
+    auto sweep = cpu_urma_detail::SweepAsyncCqs(jfcs_.size(), next_async_poll_queue_,
+        async_cq_batch_, capacity, count,
+        [&](std::size_t q) { return indexed_tracker_.Pending(q); },
+        [&](std::size_t q, std::size_t limit, std::size_t* polled) -> Status {
+          const auto n = urma_poll_jfc(jfcs_[q], static_cast<int>(limit), crs.data());
+          if (n < 0) return Status::Internal("prepared WRITE CQ poll failed (queue=" + std::to_string(q) + ")");
+          *polled = static_cast<std::size_t>(n);
+          async_stats_.tail_cqes += static_cast<std::uint64_t>(n);
+          return Status::OK();
+        },
+        [&](std::size_t q, std::size_t index, bool* finished) -> Status {
+          const auto& cr = crs[index];
+          if (cr.status != URMA_CR_SUCCESS)
+            return Status::Internal("prepared WRITE CQ failed (queue=" + std::to_string(q) + ")");
+          std::uint64_t id = 0;
+          auto status = indexed_tracker_.Complete(q, cr.user_ctx, &id);
+          if (!status.ok()) return status;
+          if (!id) return Status::OK();
+          completed[*count] = {id}; *finished = true;
+          return Status::OK();
+        });
+    if (!sweep.ok()) { batch_poisoned_ = true; return sweep; }
+    if (++next_async_poll_queue_ == jfcs_.size()) next_async_poll_queue_ = 0;
+    ++async_polls_since_deadline_;
+    return CheckPreparedDeadlines();
+  }
+
+  Status CheckPreparedDeadlines() {
+    bool expired = false;
+    // Check all outstanding deadlines once per configured poll interval.
+    if (async_polls_since_deadline_ >= async_deadline_polls_) {
+      async_polls_since_deadline_ = 0;
+      const auto now = std::chrono::steady_clock::now();
+      indexed_tracker_.ForEachActive([&](std::uint64_t id) { expired |= now >= prepared_writes_[id - 1]->job.deadline; });
+    }
+    if (expired) {
+      batch_poisoned_ = true;
+      return Status::Internal("prepared WRITE completion timed out");
+    }
+    return Status::OK();
+  }
+
+  Status ReadPreparedAsyncStats(CpuUrmaTransport::PreparedAsyncStats* stats, bool reset) {
+    if (!stats) return Status::InvalidArgument("missing prepared async stats");
+    std::unique_lock<std::mutex> lock(batch_submit_mutex_);
+    *stats = async_stats_;
+    if (reset) { async_stats_ = {}; async_polls_since_deadline_ = 0; }
+    return Status::OK();
+  }
+
   Status Shutdown() {
     std::unique_lock<std::mutex> submit_lock(batch_submit_mutex_);
     initialized_ = false;
+    // Stop local queues before releasing imported targets or registered sources.
+    bool delete_failed = false;
+    for (auto*& local_jetty : local_jettys_) {
+      if (local_jetty == nullptr) continue;
+      if (urma_delete_jetty(local_jetty) == URMA_SUCCESS) local_jetty = nullptr;
+      else delete_failed = true;
+    }
+    if (delete_failed)
+      return Status::Internal("Jetty teardown failed; retain outstanding WRITE sources and descriptors");
+    local_jettys_.clear();
     for (auto* remote_jetty : remote_jettys_) {
       if (remote_jetty != nullptr) (void)urma_unimport_jetty(remote_jetty);
     }
     remote_jettys_.clear();
-    for (auto* local_jetty : local_jettys_) {
-      if (local_jetty != nullptr) (void)urma_delete_jetty(local_jetty);
-    }
-    local_jettys_.clear();
+    prepared_writes_.clear();
+    indexed_tracker_ = cpu_urma_detail::IndexedAsyncWriteTracker();
     for (auto* jfr : jfrs_) {
       if (jfr != nullptr) (void)urma_delete_jfr(jfr);
     }
@@ -1352,6 +1568,11 @@ struct CpuUrmaTransport::Impl {
   std::vector<urma_target_jetty_t*> remote_jettys_;
   std::mutex batch_submit_mutex_;
   SglBatchJob sgl_batch_workspace_;
+  std::vector<std::unique_ptr<PreparedWrite>> prepared_writes_;
+  cpu_urma_detail::IndexedAsyncWriteTracker indexed_tracker_;
+  std::size_t async_cq_batch_{1}, async_deadline_polls_{1}, async_polls_since_deadline_{};
+  std::size_t next_async_poll_queue_{};
+  CpuUrmaTransport::PreparedAsyncStats async_stats_{};
   std::size_t wqes_per_doorbell_{0U};
   std::size_t batch_local_sgl_size_{1U};
   std::size_t prepare_thread_count_{4U};
@@ -1372,6 +1593,30 @@ struct CpuUrmaTransport::Impl {
   ImportJettyEx import_jetty_ex_{nullptr};
 };
 
+struct CpuUrmaTransport::PreparedWriteSession::State {
+  explicit State(Impl* transport) : impl(transport), lock(transport->batch_submit_mutex_) {}
+  Impl* impl;
+  std::unique_lock<std::mutex> lock;
+};
+CpuUrmaTransport::PreparedWriteSession::PreparedWriteSession(std::unique_ptr<State> state)
+    : state_(std::move(state)) {}
+CpuUrmaTransport::PreparedWriteSession::~PreparedWriteSession() = default;
+Status CpuUrmaTransport::PreparedWriteSession::Submit(PreparedWriteId id, bool* submitted) {
+  return state_->impl->SubmitPreparedWriteLocked(id, submitted);
+}
+Status CpuUrmaTransport::PreparedWriteSession::Poll(PreparedWriteCompletion* completed,
+                                                  std::size_t capacity, std::size_t* count) {
+  return state_->impl->PollPreparedWritesLocked(completed, capacity, count);
+}
+Status CpuUrmaTransport::BeginPreparedWriteSession(std::unique_ptr<PreparedWriteSession>* session) {
+  if (!session || *session) return Status::InvalidArgument("missing/nonempty prepared WRITE session");
+  auto state = std::make_unique<PreparedWriteSession::State>(impl_.get());
+  if (!impl_->initialized_ || impl_->batch_poisoned_ || !impl_->indexed_tracker_.Empty())
+    return Status::InvalidState("prepared WRITE session requires an initialized, idle transport");
+  session->reset(new PreparedWriteSession(std::move(state)));
+  return Status::OK();
+}
+
 CpuUrmaTransport::CpuUrmaTransport() : impl_(std::make_unique<Impl>()) {}
 CpuUrmaTransport::~CpuUrmaTransport() = default;
 Status CpuUrmaTransport::Initialize(const CpuUrmaTransportOptions& options) { return impl_->Initialize(options); }
@@ -1385,6 +1630,17 @@ Status CpuUrmaTransport::WriteBatch(const std::uint64_t* remote_offsets,
                                     std::size_t count) {
   return impl_->TransferBatch(true, remote_offsets, sources, count);
 }
+Status CpuUrmaTransport::PrepareWrite(const WriteChunk* chunks, std::size_t count,
+    PreparedWriteId* id) {
+  return impl_->PrepareWrite(chunks, count, id);
+}
+Status CpuUrmaTransport::DescribePreparedWrite(PreparedWriteId id, PreparedWriteInfo* info) const {
+  return impl_->DescribePreparedWrite(id, info);
+}
+Status CpuUrmaTransport::ReadPreparedAsyncStats(PreparedAsyncStats* stats, bool reset) const {
+  return impl_->ReadPreparedAsyncStats(stats, reset);
+}
+std::uint64_t CpuUrmaTransport::max_write_bytes() const { return impl_->max_message_bytes_; }
 Status CpuUrmaTransport::RegisterDirectHostMemory(void* base, std::size_t bytes) {
   return impl_->RegisterDirectHostMemory(base, bytes);
 }

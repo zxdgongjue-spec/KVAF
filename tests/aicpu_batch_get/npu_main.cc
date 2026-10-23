@@ -12,13 +12,17 @@ struct Options {
   std::uint32_t device{};
   bool has_device{};
   std::uint16_t port{29991};
+  std::uint32_t aicpu_blocks{kDefaultAicpuBlocks};
   std::string eid, json;
 };
 Options Parse(int argc, char** argv) {
   Options o;
   for (int i = 1; i < argc; ++i) {
     const std::string flag = argv[i];
-    Require(i + 1 < argc, "missing option value");
+    Require(flag == "--kernel-json" || flag == "--eid" || flag == "--device-id" ||
+            flag == "--port" || flag == "--aicpu-blocks", "unknown option " + flag);
+    Require(i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0,
+            "missing option value for " + flag);
     const char* value = argv[++i];
     if (flag == "--kernel-json") o.json = value;
     else if (flag == "--eid") o.eid = value;
@@ -27,6 +31,9 @@ Options Parse(int argc, char** argv) {
       o.device = n; o.has_device = true;
     } else if (flag == "--port") {
       const auto n = Number(value); Require(n > 0 && n <= UINT16_MAX, "invalid port"); o.port = n;
+    } else if (flag == "--aicpu-blocks") {
+      const auto n = Number(value); Require(n > 0 && n <= kMaxAicpuBlocks, "AICPU blocks must be in [1,32]");
+      o.aicpu_blocks = n;
     } else throw std::runtime_error("unknown option " + flag);
   }
   Require(!o.json.empty(), "--kernel-json PATH is required");
@@ -35,9 +42,8 @@ Options Parse(int argc, char** argv) {
 struct DeviceBuffer {
   void* data{};
   ~DeviceBuffer() { if (data) aclrtFree(data); }
-  void Allocate(std::uint64_t bytes, int fill = 0) {
+  void Allocate(std::uint64_t bytes) {
     Acl(aclrtMalloc(&data, bytes, ACL_MEM_MALLOC_NORMAL_ONLY), "allocate device buffer");
-    Acl(aclrtMemset(data, bytes, fill, bytes), "initialize device buffer");
   }
 };
 class Kernel {
@@ -55,14 +61,14 @@ class Kernel {
     Acl(aclrtBinaryGetFunction(binary_, kKernelName, &function_), "resolve AICPU function");
     Acl(aclrtCreateStream(&stream_), "create AICPU stream");
   }
-  void Launch(const KernelArgs& args) {
+  void Launch(const KernelArgs& args, std::uint32_t blocks) {
     Layout layout{}; Require(MakeLayout(args.config, &layout), "invalid launch shape");
     aclrtLaunchKernelAttr attr{};
     attr.id = ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT;
     attr.value.timeout = static_cast<std::uint32_t>(
         std::min<std::uint64_t>(UINT32_MAX, layout.rounds * (args.config.timeout_ms / 1000 + 2) + 60));
     aclrtLaunchKernelCfg cfg{}; cfg.numAttrs = 1; cfg.attrs = &attr;
-    Acl(aclrtLaunchKernelWithHostArgs(function_, 1, stream_, &cfg,
+    Acl(aclrtLaunchKernelWithHostArgs(function_, blocks, stream_, &cfg,
                                      const_cast<KernelArgs*>(&args), sizeof(args), nullptr, 0),
         "launch AICPU kernel");
   }
@@ -73,44 +79,31 @@ class Kernel {
   aclrtStream stream_{};
 };
 
-void ValidateOutput(const Config& c, const Layout& l, const DeviceBuffer& output) {
-  // Chunked readback avoids a second whole-output host allocation.
-  constexpr std::uint64_t kChunkBytes = 1U << 20;
-  std::vector<std::uint8_t> copy(std::min(kChunkBytes, l.output_bytes));
-  for (std::uint64_t offset = 0; offset < l.output_bytes; offset += copy.size()) {
-    const auto bytes = std::min<std::uint64_t>(copy.size(), l.output_bytes - offset);
-    Acl(aclrtMemcpy(copy.data(), copy.size(), static_cast<std::uint8_t*>(output.data) + offset,
-                     bytes, ACL_MEMCPY_DEVICE_TO_HOST), "read output");
-    for (std::uint64_t i = 0; i < bytes; ++i) {
-      const auto slot = (offset + i) / l.stride;
-      const auto b = (offset + i) % l.stride;
-      const auto row = c.rows - 1 - slot;
-      const auto tag = RowTag(l.rounds, row);
-      const std::uint8_t expected = b >= c.row_bytes ? 0xA5 :
-          b < 8 ? static_cast<std::uint8_t>(tag >> (8 * b)) : Pattern(row, b);
-      Require(copy[i] == expected, "scatter output/guard mismatch at byte " + std::to_string(offset + i));
-    }
-  }
-}
-
 Report Execute(int fd, const Config& config, NpuTarget& target, const std::string& json) {
-  Layout layout{}; Require(MakeLayout(config, &layout), "invalid config");
-  DeviceBuffer output, samples, result;
-  output.Allocate(layout.output_bytes, 0xA5);
-  samples.Allocate(config.iterations * sizeof(Sample));
-  result.Allocate(sizeof(KernelResult));
+  Layout layout{}; Require(MakeLayout(config, &layout), "invalid layout");
+  DeviceBuffer samples, result, coordination;
+  auto* output = static_cast<std::uint8_t*>(target.memory()) + RegisteredOutputOffset(layout);
+  Acl(aclrtMemset(output, layout.output_bytes + kGuardBytes, 0xA5, layout.output_bytes + kGuardBytes),
+      "initialize registered output");
+  samples.Allocate(config.iterations * sizeof(Sample)); result.Allocate(sizeof(KernelResult));
+  // Preserve pending status if the kernel fails before writing its result.
+  Acl(aclrtMemset(result.data, sizeof(KernelResult), 0, sizeof(KernelResult)), "initialize kernel result");
+  const auto host_coordination = MakeMultiBlockCoordination(ActiveThreads(config));
+  coordination.Allocate(sizeof(host_coordination));
+  Acl(aclrtMemcpy(coordination.data, sizeof(host_coordination), &host_coordination,
+                  sizeof(host_coordination), ACL_MEMCPY_HOST_TO_DEVICE), "initialize coordination");
   Kernel kernel; kernel.Load(json);
-  KernelArgs args{reinterpret_cast<std::uint64_t>(target.memory()),
-                  reinterpret_cast<std::uint64_t>(output.data),
-                  reinterpret_cast<std::uint64_t>(samples.data),
-                  reinterpret_cast<std::uint64_t>(result.data), config};
-  kernel.Launch(args);
-  // Once launched, do not unwind allocations until both device execution and
-  // CPU transport have stopped. A lost control connection requires retaining
-  // the process/resources for operator intervention, not eager buffer free.
+  const KernelArgs args{reinterpret_cast<std::uint64_t>(target.memory()),
+      reinterpret_cast<std::uint64_t>(samples.data), reinterpret_cast<std::uint64_t>(result.data),
+      reinterpret_cast<std::uint64_t>(coordination.data), config};
+  std::fprintf(stderr, "AICPU_GET_NPU LAUNCH aicpu_blocks=%llu block_dim=%u ready=ordered_write copy=securec_memcpy "
+      "kernel_cache_maintenance=none output_cache=unforced revision=%llu\n",
+      (unsigned long long)config.aicpu_blocks, ActiveThreads(config), (unsigned long long)kKernelRevision);
+  kernel.Launch(args, ActiveThreads(config));
+  // Retain buffers until both kernel execution and CPU transport have stopped.
   Ack ack{};
   try { Send(fd, &ack, sizeof(ack)); }
-  catch (...) { /* Kernel times out; still perform the drain handshake below. */ }
+  catch (...) { /* Drain even if the launch ACK fails. */ }
   const auto sync = kernel.Synchronize();
   if (sync != ACL_SUCCESS) {
     // Capture immediately: later ACL calls can replace this thread's error.
@@ -128,21 +121,17 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
   }
   Report report{};
   KernelResult device_result{};
-  // An explicit kernel error (timeout, bad sequence, mismatch) can also fail
-  // the stream. Try to retrieve its status before discarding this evidence.
-  // A processor exception may prevent readback; report that separately.
+  // Read kernel status after stream failure to preserve the failure reason.
   const auto result_read = aclrtMemcpy(&device_result, sizeof(device_result), result.data,
                                         sizeof(device_result), ACL_MEMCPY_DEVICE_TO_HOST);
   if (result_read == ACL_SUCCESS) {
     std::fprintf(stderr,
-                 "AICPU_GET_NPU KERNEL_STATUS status=%llu completed=%llu failed_sequence=%llu frequency=%llu requested_threads=%llu active_threads=%llu pthread_error=%llu revision=%llu\n",
+                 "AICPU_GET_NPU KERNEL_STATUS status=%llu completed=%llu failed_sequence=%llu frequency=%llu active_threads=%llu revision=%llu\n",
                  (unsigned long long)device_result.status,
                  (unsigned long long)device_result.completed_rounds,
                  (unsigned long long)device_result.failed_sequence,
                  (unsigned long long)device_result.counter_frequency,
-                 (unsigned long long)device_result.requested_threads,
                  (unsigned long long)device_result.active_threads,
-                 (unsigned long long)device_result.pthread_error,
                  (unsigned long long)device_result.kernel_revision);
   } else {
     std::fprintf(stderr, "AICPU_GET_NPU KERNEL_STATUS_UNAVAILABLE readback_code=%d\n", (int)result_read);
@@ -150,16 +139,13 @@ Report Execute(int fd, const Config& config, NpuTarget& target, const std::strin
   if (sync != ACL_SUCCESS || drained.status != 0) {
     std::fprintf(stderr, "AICPU execution failed: stream=%d cpu_status=%llu\n",
                  (int)sync, (unsigned long long)drained.status);
-    // Existing transport Shutdown ignores some provider teardown errors.
-    // Do not interpret its OK as proof that a failed/partial WRITE is drained.
-    // Let the CPU exit, but retain device resources on this abnormal path.
+    // Retain the target after failed transfers until the CPU has exited.
     try { Send(fd, &report, sizeof(report)); } catch (...) {}
     std::fprintf(stderr, "Failed run: target retained. Stop this process after the CPU test has exited.\n");
     for (;;) pause();
   }
   Acl(result_read, "read kernel result");
   Require(device_result.status == Result::kOk, "AICPU returned an error status");
-  ValidateOutput(config, layout, output);
   std::vector<Sample> timings(config.iterations);
   Acl(aclrtMemcpy(timings.data(), timings.size() * sizeof(Sample), samples.data,
                    timings.size() * sizeof(Sample), ACL_MEMCPY_DEVICE_TO_HOST), "read timings");
@@ -218,7 +204,8 @@ void HandleDiscovery(int fd, const kvaf::peer::MessageHeader& header, CandidateR
 }
 
 void HandleConfigure(int fd, const kvaf::peer::MessageHeader& header, CandidateResolver& resolver,
-                     std::unique_ptr<NpuTarget>& target, Config& config, std::uint32_t& device) {
+                     std::unique_ptr<NpuTarget>& target, Config& config, std::uint32_t& device,
+                     std::uint32_t aicpu_blocks) {
   kvaf::peer::AllocateHbmRegionResponse response{};
   response.header = kvaf::peer::MakeHeader(kConfigure, sizeof(response));
   response.header.command = kvaf::peer::ResponseCommand(kConfigure);
@@ -227,12 +214,14 @@ void HandleConfigure(int fd, const kvaf::peer::MessageHeader& header, CandidateR
             "invalid configure request or target already active");
     ConfigureRequest request{}; request.header = header;
     Receive(fd, reinterpret_cast<char*>(&request) + sizeof(header), sizeof(request) - sizeof(header));
+    request.config.aicpu_blocks = aicpu_blocks;
     Layout layout{}; Require(MakeLayout(request.config, &layout), "invalid benchmark config");
     const auto& eids = resolver.Get(request.device_id);
     Require(request.npu_candidate < eids.size(), "invalid NPU EID candidate");
     auto candidate = std::make_unique<NpuTarget>();
     candidate->Initialize(request.device_id, eids[request.npu_candidate], layout.region_bytes);
     response = candidate->exported();
+    response.reserved = aicpu_blocks;
     target = std::move(candidate); config = request.config; device = request.device_id;
     std::fprintf(stderr, "AICPU_GET_NPU device-id=%u npu_candidate=%u\n", device, request.npu_candidate);
   } catch (const std::exception& e) {
@@ -244,7 +233,8 @@ void HandleConfigure(int fd, const kvaf::peer::MessageHeader& header, CandidateR
 
 void Run(const Options& options) {
   Socket listener(Listen(options.port));
-  std::fprintf(stderr, "AICPU_GET_NPU listening port=%u engine=aicpu_memcpy\n", options.port);
+  std::fprintf(stderr, "AICPU_GET_NPU listening port=%u engine=aicpu_memcpy aicpu_blocks=%u\n",
+      options.port, options.aicpu_blocks);
   CandidateResolver resolver(options);
   std::unique_ptr<NpuTarget> target;
   Config config{};
@@ -256,7 +246,7 @@ void Run(const Options& options) {
       HandleDiscovery(fd.get(), header, resolver, target != nullptr, device); continue;
     }
     if (header.command == static_cast<std::uint16_t>(kConfigure)) {
-      HandleConfigure(fd.get(), header, resolver, target, config, device); continue;
+      HandleConfigure(fd.get(), header, resolver, target, config, device, options.aicpu_blocks); continue;
     }
     if (kvaf::peer::IsValidHeader(header, kResetSetup, sizeof(header))) {
       // CPU only requests this after a failed setup, before posting any data.

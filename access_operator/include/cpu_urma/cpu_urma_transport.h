@@ -14,7 +14,8 @@ namespace kvaf {
 
 // CPU-side URMA data plane shared by the production AccessOperator and its
 // hardware benchmarks. PeerLink supplies the control-plane channel; this
-// class owns only the local URMA resources and synchronous byte transfers.
+// class owns the local URMA resources, synchronous transfers and optional
+// prepared asynchronous WRITEs with a single CQ owner.
 struct CpuUrmaTransportOptions {
   std::string peer_address;  // host:port of kvaf_cpu_service
   std::string ub_device;     // empty: first usable UB device
@@ -51,6 +52,9 @@ struct CpuUrmaTransportOptions {
   // Maximum CPU workers used by batch planning and descriptor preparation.
   // WRITE uses at most one worker per Jetty owner.
   std::uint32_t prepare_thread_count{4};
+  // Prepared WRITE CQ batch size and deadline-check interval.
+  std::uint32_t async_cq_batch{8};
+  std::uint32_t async_deadline_polls{32};
 };
 
 class CpuUrmaTransport final {
@@ -101,6 +105,47 @@ class CpuUrmaTransport final {
   // Queue capacity is applied after grouping, with shared completion fences.
   Status WriteBatch(const std::uint64_t* remote_offsets,
                     const HostSge* sources, std::size_t count);
+  using PreparedWriteId = std::uint64_t;
+  struct PreparedWriteCompletion { PreparedWriteId id{}; };
+  struct WriteChunk {
+    const std::uint64_t* remote_offsets{};
+    const HostSge* sources{};
+    std::size_t count{};
+    // Optional: one aligned 8-byte progress word per Jetty; omit both marker fields.
+    const std::uint64_t* marker_offsets{};
+    // Immutable until completion.
+    const std::uint64_t* marker_value{};
+  };
+  // Prepare reusable one-wave descriptors; optional ordered markers follow each
+  // chunk and only queue tails produce CQEs. Modify payload only while idle;
+  // retain sources until completion or successful Shutdown after failure.
+  // Do not mix live prepared and synchronous transfers.
+  Status PrepareWrite(const WriteChunk* chunks, std::size_t count, PreparedWriteId* id);
+  struct PreparedWriteInfo {
+    std::uint64_t wr_count{}, marker_wrs{}, tail_cqes{};
+  };
+  // Descriptor counts after device SGE/message limits have been applied.
+  Status DescribePreparedWrite(PreparedWriteId id, PreparedWriteInfo* info) const;
+  struct PreparedAsyncStats { std::uint64_t tail_cqes{}; };
+  // Read/reset counters outside the producer session.
+  Status ReadPreparedAsyncStats(PreparedAsyncStats* stats, bool reset = false) const;
+  // One thread owns submission/CQ access for the session lifetime.
+  // Release before other transport calls; outstanding plans survive session exit.
+  class PreparedWriteSession final {
+   public:
+    ~PreparedWriteSession();
+    PreparedWriteSession(const PreparedWriteSession&) = delete;
+    PreparedWriteSession& operator=(const PreparedWriteSession&) = delete;
+    // OK + submitted=false means queue credits are temporarily exhausted.
+    Status Submit(PreparedWriteId id, bool* submitted);
+    Status Poll(PreparedWriteCompletion* completed, std::size_t capacity, std::size_t* count);
+   private:
+    friend class CpuUrmaTransport;
+    struct State;
+    explicit PreparedWriteSession(std::unique_ptr<State> state);
+    std::unique_ptr<State> state_;
+  };
+  Status BeginPreparedWriteSession(std::unique_ptr<PreparedWriteSession>* session);
   // Register one page-aligned host region once. SGL transfers from any
   // sub-range of this region then reuse the same URMA segment.
   Status RegisterDirectHostMemory(void* base, std::size_t bytes);
@@ -114,6 +159,7 @@ class CpuUrmaTransport final {
 
   bool initialized() const;
   std::uint64_t region_bytes() const;
+  std::uint64_t max_write_bytes() const;  // Queried device message limit, <= uint32.
   BatchTiming last_batch_timing() const;
 
  private:
