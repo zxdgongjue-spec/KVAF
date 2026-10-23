@@ -167,7 +167,6 @@ AICPU 只将输出地址交给 URMA，不直接读写输出 payload，因此 REA
 不清零 scratch 中的 ACK 槽，查询完成后直接使用远端覆盖的值。
 单个不超过 64 KiB 的控制传输直接填写一个 WR/两端 SGE，保留在队列对象中至完成或队列销毁，
 省去通用分段构建及 vector 操作；清单大于 64 KiB 和多段通知仍走通用路径。
-Python 绑定直接读取 Tensor 属性，只提取维数和首维长度，不再先逐项 hasattr 或复制完整 shape。
 连续性、设备、元素宽度、长度以及队列完成/错误检查仍在相应入口执行。
 
 BatchPut 同步完成；BatchGet 默认只 enqueue，`synchronize=True` 等待完成并读取错误状态。
