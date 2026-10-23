@@ -1,5 +1,9 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+add_test(NAME kvaf_dsa_keys_python
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/python/test_dsa_keys.py")
+
 add_executable(kvaf_batch_get_schedule_test batch_get_schedule_test.cc)
 target_include_directories(kvaf_batch_get_schedule_test PRIVATE
   ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include)

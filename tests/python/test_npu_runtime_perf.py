@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kvaf
 
 from backend import detect_torch_backend
+from dsa_keys import build_dsa_keys
 from npu_eids import parse_npu_eids
 
 
@@ -177,7 +178,7 @@ def main(batch: int = 16) -> int:
     # All BatchPut and BatchFree inputs are created before their measured loops.
     # Key batches are distinct, so Runtime never sees a duplicate Put or Free.
     # DSA with one pool row/layer: key = block_q in [0, table_capacity).
-    all_keys = list(range(table_capacity))
+    all_keys = build_dsa_keys(table_capacity, q_capacity=table_capacity)
     prepare_keys = torch.arange(table_capacity, dtype=torch.int64)
     key_batches = [
         all_keys[batch_index * PUT_BATCH_SIZE : (batch_index + 1) * PUT_BATCH_SIZE]
