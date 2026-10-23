@@ -2,7 +2,6 @@
 #include "urma_transport.h"
 namespace push_mock {
 void Reset(std::uint32_t max_sge = 3, std::uint32_t max_bytes = 1024);
-void UseExpandedDeviceAttributes();
 void FailNextPost();
 void FailNextDelete();
 void ErrorNextCompletion();

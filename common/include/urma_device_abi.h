@@ -2,13 +2,9 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <urma_api.h>
 
 namespace kvaf::urma {
-// Expanded UB device ABI used by the deployed SDK. Older public UMDK headers
-// stop the capabilities record at max_netaddr_cnt and place the port records
-// earlier. urma_query_device copies the library's complete record, not the
-// caller header's sizeof(urma_device_attr_t).
+// Device-attribute ABI used by the deployed UB SDK.
 struct UbDeviceCapabilities {
   std::uint32_t feature;
   std::uint32_t max_jfc, max_jfs, max_jfr, max_jetty, max_jetty_grp, max_jetty_in_jetty_grp;
@@ -35,16 +31,8 @@ struct UbDeviceAttributes {
   std::uint32_t reserved_jetty_id_min, reserved_jetty_id_max;
 };
 static_assert(sizeof(UbDeviceCapabilities) == 304 && sizeof(UbDeviceAttributes) == 496);
+static_assert(offsetof(UbDeviceAttributes, dev_cap) + offsetof(UbDeviceCapabilities, max_jfs_sge) == 60);
+static_assert(offsetof(UbDeviceAttributes, dev_cap) + offsetof(UbDeviceCapabilities, max_msg_size) == 72);
 static_assert(offsetof(UbDeviceAttributes, port_attr) == 324);
 static_assert(offsetof(UbDeviceAttributes, reserved_jetty_id_max) == 488);
-
-// Retain native-header support as well as the explicit expanded ABI. Only the
-// common SGE/message-limit prefix is consumed by CPU push.
-union DeviceAttributeStorage {
-  urma_device_attr_t native;
-  UbDeviceAttributes ub;
-};
-static_assert(offsetof(urma_device_attr_t, dev_cap) == offsetof(UbDeviceAttributes, dev_cap));
-static_assert(offsetof(urma_device_cap_t, max_jfs_sge) == offsetof(UbDeviceCapabilities, max_jfs_sge));
-static_assert(offsetof(urma_device_cap_t, max_msg_size) == offsetof(UbDeviceCapabilities, max_msg_size));
 }  // namespace kvaf::urma

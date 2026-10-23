@@ -3,10 +3,8 @@
 #include <iostream>
 
 using namespace kvaf::cpu_push;
-void TransferCase(std::uint32_t bytes, std::uint32_t max_sge, std::uint32_t max_message,
-                   bool expanded = false) {
+void TransferCase(std::uint32_t bytes, std::uint32_t max_sge, std::uint32_t max_message) {
   push_mock::Reset(max_sge, max_message);
-  if (expanded) push_mock::UseExpandedDeviceAttributes();
   {
     PushFixture f(bytes, 1031, 1);
     for (std::size_t i = 0; i < f.source.size(); ++i) f.source[i] = (i * 17 + i / bytes) % 251;
@@ -57,7 +55,7 @@ int main() {
   try {
     TransferCase(656, 3, 1024);
     TransferCase(2000, 1, 64); // More than one WR wave; tokens split across WRs.
-    TransferCase(656, 13, 65536, true); // Deployed SDK writes beyond older public headers.
+    TransferCase(656, 13, 65536);
     FailureCase(false); FailureCase(true);
     std::cout << "CPU push transport PASS\n";
   } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

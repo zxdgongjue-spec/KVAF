@@ -51,10 +51,11 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   workers_ = setup.workers;
   token_bytes_ = setup.token_bytes;
   Stage("query_device");
-  urma::DeviceAttributeStorage attr{};
-  if (urma_query_device(context->dev, &attr.native)) return Error("query device");
-  max_sge_ = std::min(16U, attr.native.dev_cap.max_jfs_sge);
-  max_bytes_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(65536, attr.native.dev_cap.max_msg_size));
+  urma::UbDeviceAttributes attr{};
+  if (urma_query_device(context->dev, reinterpret_cast<urma_device_attr_t*>(&attr)))
+    return Error("query device");
+  max_sge_ = std::min(16U, attr.dev_cap.max_jfs_sge);
+  max_bytes_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(65536, attr.dev_cap.max_msg_size));
   if (!max_sge_ || max_bytes_ < sizeof(Request)) return Error("unsupported SGE/message limits");
   std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_CAP max_sge=%u message_bytes=%u workers=%u token_bytes=%u\n",
                max_sge_, max_bytes_, workers_, token_bytes_);
