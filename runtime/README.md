@@ -343,3 +343,61 @@ Jetty 数量可通过
 填充。
 脚本以 CPU `torch.int64` Tensor 传入全量 Prepare key，避免 Python `list[int]` 转换污染
 这项控制面性能数据。
+
+### BatchGet 地址表对照实验
+
+`tests/run_remote_cpu_batch_get_perf.sh` 调用独立的
+`tests/python/test_npu_batch_get_perf.py`，可分别配置请求容量、AccessTable 容量、
+token 大小和精确 `miss_count`。地址表实验通过
+`--address-table-mode original|prewarm|compact` 选择路径，默认 `original`：
+
+| 模式 | 本轮地址表准备 | BatchGet 使用的数据 |
+| --- | --- | --- |
+| `original` | 使用完整原表。 | 原始 address/valid 表与请求 indices。 |
+| `prewarm` | 预先访问有效请求索引对应的原表项。 | 仍使用完整原表与原 indices。 |
+| `compact` | 按有效请求的顺序 gather address/valid，构造紧凑表。 | 紧凑表与对应的连续 indices，offsets 和 output_indices 保持不变。 |
+
+三组均调用 `batch_get(addresses, valid, indices, offsets, miss_count,
+output_indices, output)` 裸 Tensor 重载。`compact` 只改变地址表的组织方式，
+不压缩远端 KV 源区，也不排序或合并 READ；每个有效请求实际读取的远端地址、
+字节数、提交顺序和输出位置与 `original` 相同。`prewarm` 用于观察预先访问原表项
+的影响，其 gather 结果不替换 BatchGet 的原表。
+
+通过 `--timing-scope batch-get|resolve-and-batch-get` 单独选择计时范围，
+默认 `batch-get`：
+
+- `batch-get`：在本轮计时前的 `torch.npu.synchronize()` 之前完成地址表准备，
+  再测量 BatchGet 提交至 stream 完成，排除 prewarm 或 compact 准备成本。
+- `resolve-and-batch-get`：在计时窗口内提交本轮地址表准备与 BatchGet，
+  两者之间不插入同步，最后统一同步；总耗时包含地址解析/紧凑表构造及 BatchGet。
+
+两种范围均保留 `PERF_RESULT operation=batch_get`，配置和计时说明中会记录所选
+scope。每个进程只运行一种 scope，不会自动把两种范围各跑一遍；比较时应分别运行，
+并检查日志中的模式和 scope。
+`batch_get_submit` 始终只统计 BatchGet 调用本身的 Host 提交时间；完整 scope 的
+准备成本体现在 `operation=batch_get` 总耗时中，不能再用 submit 与 synchronize
+两项相加来替代这个总耗时。kernel profile 始终只覆盖 BatchGet kernel。
+
+例如，以下命令固定 2 个 AIV core、每 core 2 个 Jetty、全表随机源请求、连续输出、
+seed 与 inflight 上限。分别把 `--address-table-mode` 改为 `original`、`prewarm`、
+`compact`，即可对照；需要统计准备成本时，另行把 `--timing-scope` 改为
+`resolve-and-batch-get`：
+
+```bash
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:28999 \
+DEVICE_ID=0 \
+tests/run_remote_cpu_batch_get_perf.sh "$PWD/build-npu" \
+  --request-length 32768 --table-capacity 1277952 \
+  --token-bytes 656 --tokens-per-block 128 --miss-count 8192 \
+  --aiv-cores 2 --jettys-per-core 2 --max-inflight-total 2048 \
+  --source-access-pattern random --output-access-pattern contiguous \
+  --no-kernel-profile \
+  --no-sort-input-indices --seed 20260903 --warmup 3 --iterations 100 \
+  --address-table-mode original --timing-scope batch-get
+```
+
+三组应保持相同 CPU 服务/源区配置、请求参数、seed、inflight 和采样次数。
+请求随机生成与排序不计入任一种 scope；两种 scope 的差别仅在本轮地址表准备
+是否进入计时窗口。
+预检会在全表范围内确定性取样，核对改写前后的最终源地址与 valid 位，并检查
+输出及未使用后缀；不会消耗随机数，因此各模式使用相同 seed 时请求计划一致。

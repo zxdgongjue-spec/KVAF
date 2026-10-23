@@ -5,6 +5,9 @@ Unlike ``test_npu_runtime_perf.py``, this benchmark has no derived ``batch``
 dimension. The request-array length, AccessTable capacity, block layout and
 exact ``miss_count`` are independent inputs. BatchPut is used only to populate
 the remote table before measurement and is never included in the timing.
+``--address-table-mode original|prewarm|compact`` compares address metadata
+layouts without changing READs. ``--timing-scope`` selects BatchGet alone or
+address resolution plus BatchGet; request generation/sorting is always excluded.
 
 The five primary settings can be supplied as command-line options or through
 environment variables:
@@ -157,6 +160,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=(
             "local NPU HBM output order; use contiguous while comparing source "
             "patterns to isolate remote CPU DDR access behavior"
+        ),
+    )
+    parser.add_argument(
+        "--address-table-mode",
+        choices=("original", "prewarm", "compact"),
+        default="original",
+        help=(
+            "original uses the full address table; prewarm gathers the active "
+            "addresses but still submits the full table; compact submits the "
+            "gathered address/valid table with sequential indices"
+        ),
+    )
+    parser.add_argument(
+        "--timing-scope",
+        choices=("batch-get", "resolve-and-batch-get"),
+        default="batch-get",
+        help=(
+            "batch-get excludes address-table preparation; resolve-and-batch-get "
+            "includes it without an intermediate device synchronization"
         ),
     )
     parser.add_argument(
@@ -344,6 +366,60 @@ def percentile(values: list[float], fraction: float) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
+def prepare_address_table(
+    torch: object,
+    addresses: object,
+    valid: object,
+    indices: object,
+    active_count: int,
+    compact_indices: object,
+    mode: str,
+) -> tuple[object, object, object, tuple[object, ...]]:
+    """Resolve only metadata; preserve every READ's block base and request order.
+
+    Keep the gathered tensors alive even in prewarm mode. Empty calls retain
+    the nonempty original table because Runtime rejects zero-byte device tables.
+    The caller keeps the original Host AccessTable lease until all work finishes.
+    """
+    if mode == "original" or active_count == 0:
+        return addresses, valid, indices, ()
+    lookup = indices[:active_count].to(torch.int64)
+    resolved_addresses = addresses.index_select(0, lookup)
+    resolved_valid = valid.index_select(0, lookup)
+    keepalive = (lookup, resolved_addresses, resolved_valid)
+    if mode == "compact":
+        return resolved_addresses, resolved_valid, compact_indices, keepalive
+    return addresses, valid, indices, keepalive
+
+
+def validate_resolved_addresses(
+    torch: object,
+    original_addresses: object,
+    original_valid: object,
+    original_indices: object,
+    run_addresses: object,
+    run_valid: object,
+    run_indices: object,
+    offsets: object,
+    active_count: int,
+) -> None:
+    """Check the actual READ addresses once outside measurement.
+
+    Payload checks alone cannot detect a wrong block in this benchmark because
+    every block contains the same token pattern.
+    """
+    original_lookup = original_indices[:active_count].to(torch.int64)
+    run_lookup = run_indices[:active_count].to(torch.int64)
+    active_offsets = offsets[:active_count].to(torch.int64)
+    expected = original_addresses.index_select(0, original_lookup) + active_offsets
+    actual = run_addresses.index_select(0, run_lookup) + active_offsets
+    if not torch.equal(expected, actual) or not torch.equal(
+        original_valid.index_select(0, original_lookup),
+        run_valid.index_select(0, run_lookup),
+    ):
+        raise AssertionError("Address-table preparation changed a READ address or valid bit")
+
+
 def sort_request_plan_prefix(
     torch: object,
     address_table: object,
@@ -383,6 +459,9 @@ def print_samples(
     request_length: int,
     miss_count: int,
     token_bytes: int,
+    *,
+    address_table_mode: str = "original",
+    timing_scope: str = "batch-get",
 ) -> None:
     mean_ms = statistics.mean(samples)
     result = (
@@ -393,6 +472,7 @@ def print_samples(
         f"p50_ms={percentile(samples, 0.50):.3f} "
         f"p90_ms={percentile(samples, 0.90):.3f} "
         f"p99_ms={percentile(samples, 0.99):.3f}"
+        f" address_table_mode={address_table_mode} timing_scope={timing_scope}"
     )
     if operation == "batch_get":
         payload_bytes = miss_count * token_bytes
@@ -687,6 +767,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     device_table = None
     kernel_profile_started = False
     try:
+        timing_label = (
+            "call_to_stream_completion"
+            if args.timing_scope == "batch-get"
+            else "address_resolve_to_stream_completion"
+        )
         print(
             "BATCH_GET_PERF_CONFIG "
             f"request_length={request_length} table_capacity={table_capacity} "
@@ -694,6 +779,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"block_bytes={block_bytes} miss_count={miss_count_value} "
             f"source_access_pattern={args.source_access_pattern} "
             f"output_access_pattern={args.output_access_pattern} "
+            f"address_table_mode={args.address_table_mode} "
+            f"timing_scope={args.timing_scope} "
             f"ddr_bytes={ddr_bytes} aiv_cores={args.aiv_cores} "
             f"max_inflight_total={args.max_inflight_total} "
             f"jettys_per_core={args.jettys_per_core} eid_paths={len(args.npu_eids) or 1} "
@@ -705,7 +792,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"sort_input_indices={int(args.sort_input_indices)} "
             f"kernel_profile={int(args.kernel_profile)} "
             f"kernel_profile_clock_mhz={args.kernel_profile_clock_mhz} "
-            "timing=call_to_stream_completion"
+            f"timing={timing_label}"
         )
 
         print("BATCH_GET_PERF_PHASE_BEGIN phase=initialize", flush=True)
@@ -771,12 +858,39 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"entries={table_capacity}"
         )
 
-        # Execute one deterministic request plan and validate both the copied
-        # prefix and the untouched suffix before collecting timing samples.
+        # Spread the active preflight prefix across the whole source region,
+        # including its first and last entries when at least two are active.
+        # Do not consume RNG state: all modes must measure the same request plans.
         print("BATCH_GET_PERF_PHASE_BEGIN phase=correctness_preflight")
         request_ids = torch.arange(request_length, dtype=torch.int64, device=device)
+        compact_indices = None
+        if args.address_table_mode != "original":
+            compact_indices = torch.zeros(
+                request_length, dtype=torch.int32, device=device
+            )
+            compact_indices[:miss_count_value].copy_(
+                request_ids[:miss_count_value].to(torch.int32)
+            )
+
+        def prepare_call(
+            indices: object, offsets: object, output_indices: object
+        ) -> tuple[tuple[object, ...], tuple[object, ...]]:
+            addresses, valid, run_indices, keepalive = prepare_address_table(
+                torch, device_table.addresses, device_table.valid, indices,
+                miss_count_value, compact_indices, args.address_table_mode,
+            )
+            # Use the same bare-Tensor overload in all three modes. Keep the
+            # original Host AccessTable lease held until the existing finally.
+            return (
+                addresses, valid, run_indices, offsets, miss_count,
+                output_indices, output,
+            ), keepalive
+
         preflight_token_ids = request_ids % total_tokens
-        preflight_indices = (preflight_token_ids // tokens_per_block).to(torch.int32)
+        preflight_indices = (
+            request_ids * (table_capacity - 1)
+            // max(1, miss_count_value - 1) % table_capacity
+        ).to(torch.int32)
         preflight_token_slots = preflight_token_ids % tokens_per_block
         preflight_offsets = (preflight_token_slots * token_bytes).to(torch.int32)
         preflight_output_indices = request_ids.to(torch.int32)
@@ -794,14 +908,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 miss_count_value,
             )
         output.zero_()
-        runtime.batch_get(
-            device_table,
-            preflight_indices,
-            preflight_offsets,
-            miss_count,
-            preflight_output_indices,
-            output,
+        batch_args, resolved_table = prepare_call(
+            preflight_indices, preflight_offsets, preflight_output_indices,
         )
+        validate_resolved_addresses(
+            torch, device_table.addresses, device_table.valid, preflight_indices,
+            batch_args[0], batch_args[1], batch_args[2], preflight_offsets,
+            miss_count_value,
+        )
+        runtime.batch_get(*batch_args)
         torch.npu.synchronize()
         if miss_count_value > 0 and not torch.equal(
             output[:miss_count_value],
@@ -814,7 +929,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise AssertionError("BatchGet modified rows outside miss_count prefix")
         print(
             "BATCH_GET_PERF_CORRECTNESS_PASS "
-            f"request_length={request_length} miss_count={miss_count_value}"
+            f"request_length={request_length} miss_count={miss_count_value} "
+            f"address_table_mode={args.address_table_mode} "
+            f"submitted_table_entries={batch_args[0].numel()} "
+            "source_sampling=deterministic_spread "
+            "resolved_addresses_equal=1"
         )
         print("BATCH_GET_PERF_PHASE_DONE phase=correctness_preflight")
 
@@ -881,15 +1000,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("BATCH_GET_PERF_PHASE_BEGIN phase=warmup")
         for _ in range(args.warmup):
             indices, offsets, output_indices = create_request_plan()
+            batch_args, resolved_table = prepare_call(indices, offsets, output_indices)
             torch.npu.synchronize()
-            runtime.batch_get(
-                device_table,
-                indices,
-                offsets,
-                miss_count,
-                output_indices,
-                output,
-            )
+            runtime.batch_get(*batch_args)
             # Keep caller-owned request Tensors alive through completion.
             torch.npu.synchronize()
         print("BATCH_GET_PERF_PHASE_DONE phase=warmup " f"iterations={args.warmup}")
@@ -901,22 +1014,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         kernel_profile_samples: list[list[dict[str, object]]] = []
         for _ in range(args.iterations):
             indices, offsets, output_indices = create_request_plan()
-            # Request generation and Tensor work are deliberately excluded.
+            if args.timing_scope == "batch-get":
+                batch_args, resolved_table = prepare_call(indices, offsets, output_indices)
+            # Request generation/sorting is excluded in both scopes. The full
+            # scope queues address resolution after this sync and overlaps it
+            # naturally with submission; there is no intermediate device sync.
             torch.npu.synchronize()
 
             begin = time.perf_counter()
-            runtime.batch_get(
-                device_table,
-                indices,
-                offsets,
-                miss_count,
-                output_indices,
-                output,
+            if args.timing_scope == "resolve-and-batch-get":
+                batch_args, resolved_table = prepare_call(indices, offsets, output_indices)
+            call_started = (
+                begin if args.timing_scope == "batch-get" else time.perf_counter()
             )
+            runtime.batch_get(*batch_args)
             submitted = time.perf_counter()
             torch.npu.synchronize()
             completed = time.perf_counter()
-            submit_samples.append((submitted - begin) * 1000.0)
+            submit_samples.append((submitted - call_started) * 1000.0)
             synchronize_samples.append((completed - submitted) * 1000.0)
             batch_get_samples.append((completed - begin) * 1000.0)
             if args.kernel_profile:
@@ -931,6 +1046,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             request_length,
             miss_count_value,
             token_bytes,
+            address_table_mode=args.address_table_mode,
+            timing_scope=args.timing_scope,
         )
         print_samples(
             "batch_get_synchronize",
@@ -939,6 +1056,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             request_length,
             miss_count_value,
             token_bytes,
+            address_table_mode=args.address_table_mode,
+            timing_scope=args.timing_scope,
         )
         print_samples(
             "batch_get",
@@ -947,6 +1066,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             request_length,
             miss_count_value,
             token_bytes,
+            address_table_mode=args.address_table_mode,
+            timing_scope=args.timing_scope,
         )
         if args.kernel_profile:
             print_kernel_profile(
