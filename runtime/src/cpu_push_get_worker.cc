@@ -35,7 +35,7 @@ void Worker::Run() {
     std::uint64_t sequence = 0;
     auto status = transport_->ReadRequest(&sequence);
     if (!status.ok()) { std::fprintf(stderr, "CPU_PUSH: %s\n", status.message().c_str()); return; }
-    if (!sequence || sequence == last) { std::this_thread::yield(); continue; }
+    if (!sequence || sequence == last) continue;
     if (sequence <= last || sequence > UINT32_MAX) {
       (void)transport_->Complete(sequence, Result::kSequenceError);
       return;
@@ -43,23 +43,16 @@ void Worker::Run() {
     last = sequence;
     status = transport_->ReadDescriptor(sequence);
     if (!status.ok()) {
-      // Header/source errors occur before any data WRITE. A transport error may
+      // Header errors occur before any data WRITE. A transport error may
       // leave the queue poisoned; Complete then fails without reusing its slots.
       (void)transport_->Complete(sequence, Result::kInvalidRequest);
       std::fprintf(stderr, "CPU_PUSH: %s\n", status.message().c_str());
       return;
     }
-    const auto& r = transport_->request();
-    std::uint32_t chunks = 0;
-    for (std::uint32_t w = 0; w < r.workers; ++w)
-      chunks = std::max(chunks, ChunkCount(WorkerRange(r.count, r.token_bytes, w, r.workers)));
-    for (std::uint32_t chunk = 0; chunk < chunks && status.ok(); ++chunk)
-      for (std::uint32_t w = 0; w < r.workers && status.ok(); ++w) {
-        const auto range = WorkerRange(r.count, r.token_bytes, w, r.workers);
-        if (chunk < ChunkCount(range)) status = transport_->WriteChunk(w, chunk, ChunkRange(range, chunk));
-      }
+    status = transport_->WriteBatch();
     if (status.ok()) status = transport_->Complete(sequence, Result::kOk);
     if (!status.ok()) { std::fprintf(stderr, "CPU_PUSH: %s\n", status.message().c_str()); return; }
+    transport_->PrintProfile();
   }
 }
 }  // namespace kvaf::cpu_push

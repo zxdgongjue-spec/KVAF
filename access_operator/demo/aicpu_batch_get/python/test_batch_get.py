@@ -76,7 +76,7 @@ def print_profile(samples: list[dict], mode: str) -> None:
     print(f"AICPU_BATCH_GET_PROFILE mode={mode} workers={len(samples[0]['workers'])} "
           f"rounds={len(samples)} warmup=1 "
           "aggregation=mean_per_worker units=us "
-          f"output_payload_flushes={2 if mode == 'cpu_push_scatter' else 0} "
+          "output_payload_flushes=0 "
           "instrumented_rounds_excluded_from_bandwidth=1")
     print("  Python " + fields(samples, ("python_call_us", "binding_prepare_us", "native_call_us",
                                        "binding_total_us", "python_other_us")))
@@ -96,6 +96,8 @@ def print_profile(samples: list[dict], mode: str) -> None:
                                            "ready_queries")))
         if mode == "cpu_push_scatter":
             print("    Push " + fields(rows, ("scatter_us", "output_cache_us")))
+    if mode == "cpu_push_scatter":
+        print("  CPU stages: see CPU_PUSH_PROFILE in the CPU service log (units=us).")
     print("  Timing: Host phases sum to Host total; Host wait includes queued device work/D2H. "
           "Worker intervals overlap. Cache times are inside request; READ phases are inside read. "
           "ready_wait includes CPU gather overlap, not a separate CPU gather measurement. "

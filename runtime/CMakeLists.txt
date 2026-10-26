@@ -57,6 +57,7 @@ endif()
 
 if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   find_package(Threads REQUIRED)
+  find_package(OpenMP REQUIRED COMPONENTS CXX)
   set(KVAF_URMA_ROOT "" CACHE PATH "UMDK source or installation root")
   find_path(KVAF_URMA_INCLUDE_DIR urma_api.h
     HINTS
@@ -83,9 +84,9 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
       "${KVAF_URMA_INCLUDE_DIR}")
   target_link_libraries(kvaf_cpu_runtime
     PUBLIC kvaf_runtime
-    PRIVATE "${KVAF_URMA_LIBRARY}" "${CMAKE_DL_LIBS}" Threads::Threads kvaf_cpu_gather_executor)
+    PRIVATE "${KVAF_URMA_LIBRARY}" "${CMAKE_DL_LIBS}" Threads::Threads OpenMP::OpenMP_CXX kvaf_cpu_gather_executor)
   target_compile_features(kvaf_cpu_runtime PUBLIC cxx_std_17)
-  target_compile_options(kvaf_cpu_runtime PRIVATE "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-g>")
+  target_compile_options(kvaf_cpu_runtime PRIVATE "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2;-g>")
 
   add_executable(kvaf_cpu_service src/cpu_service_main.cc)
   target_link_libraries(kvaf_cpu_service PRIVATE kvaf_cpu_runtime kvaf_runtime)

@@ -24,6 +24,7 @@ runtime.initialize(ddr_bytes=656 * 2 * 8192, slot_size=656 * 2)
 CPU push 自动发现单个 NPU EID，也可通过 `npu_eids=[eid]` 指定一个 EID。
 自动发现的候选按现有 Runtime 初始化流程尝试；多 EID 条带和 AIV 自适应调优不用于此路径。
 Get 使用 Host direct HCCP/RA；Put 继续使用既有 AICPU UMDK session。
+CPU 使用四路 Jetty 和最多四个 OpenMP 线程；`npu_core_count` / `--workers` 控制 AICPU worker 数。
 
 ## 构建并验证
 
@@ -36,6 +37,7 @@ export PYTHONPATH="$PWD/build-aicpu-urma/python:$PYTHONPATH"
 ```
 
 设备 `memcpy_sp` 需要 securec 头文件和 AArch64 动态库，构建会查找 CANN 内的依赖并打包。
+CPU 构建链接 OpenMP，并启用 `-O2`、保留调试信息。
 `--cpu-push` 对应 CMake 的 `KVAF_ENABLE_AICPU_CPU_PUSH=ON`，默认关闭。
 原有 gather-only 构建不查找或链接 securec/direct HCCP。
 布局不同时设置 `KVAF_AICPU_SECUREC_INCLUDE_DIR` 和 `KVAF_AICPU_SECUREC_LIBRARY`。
@@ -59,7 +61,7 @@ python3 access_operator/demo/aicpu_batch_get/python/test_batch_get.py \
 
 一次调用处理 `int32 miss_count` 指定的有效前缀，最多 65536 项。
 每项读取 `addresses[indices[i]] + offsets[i]` 的 `token_bytes` 字节，
-目标为 `output + output_indices[i] * token_bytes`。CPU 校验源范围属于本 session 的 DDR。
+目标为 `output + output_indices[i] * token_bytes`。
 调用方继续负责有效 key、token 布局、输出映射及这些资源在操作完成前的生命周期。
 
 初始化时，Host 通过 RA 注册固定 HBM workspace，创建四个 TargetChannel，
@@ -71,8 +73,8 @@ CPU 建立专用回写队列，返回对端信息；Host 完成导入后才激�
 每轮过程如下：
 
 1. Host 在调用方 stream 清零本次 AICPU coordination，再启动配置数量的实例。
-2. worker 0 读取设备输入，在 HBM 写入请求头和有效源清单，最后发布 request sequence。
-3. CPU 通过 URMA READ 读取 request 和动态源清单，重新构建本轮 SGL。
+2. worker 0 将有效源地址写入连续的 `uint64` 数组，在 HBM 发布请求头和 request sequence。
+3. CPU 通过 URMA READ 整块读取地址数组，OpenMP 按 Jetty 并行更新预构建 SGL 的源地址。
 4. CPU 直接从已注册 DDR 源 WRITE 到 packed HBM staging，不打包 payload 到 CPU 临时区。
 5. 按 worker 的 staging 区间划分 1024 行 chunk，各 Jetty 在其数据之后强序 WRITE ready。
 6. AICPU 取四个 Jetty 的共同就绪前缀，将新就绪范围 scatter 到 `output_indices`。
@@ -83,38 +85,48 @@ ready 用高 32 位 sequence、低 32 位 chunk 数编码；done 在同一个 64
 空前缀不通知 CPU、不修改输出；CPU 允许此类调用造成的序号间隔。
 当前实现针对普通 stream enqueue，Host 固定序号不能用于 graph replay。
 
-CPU 每个提交 wave 至多保留 512 个 WR 槽位，并按设备 SGE/message 上限拆分请求，
-只在有序尾 CQE 后复用 WR/SGL。一个 chunk 超出 wave 容量时分多波完成，最后发布 ready。
-CPU 串行推进各 chunk；WRITE 下一块可与 AICPU scatter 上一块重叠。
+CPU 数据面沿用 `hbm-sgl-probe` V24 的 prepared WRITE、indexed CQ 和轮转 CQ 扫描。
+每个 chunk 按连续行分到四个 Jetty；请求数量不变时复用数据/ready 链，每轮只更新源地址和序号。
+OpenMP 并行更新与提交四路队列，协调线程收齐数据链尾 CQE 后提交预构建的 done 链。
+每个 Jetty 的 SQ 深度为 8192，doorbell 为 32 WR，CQ batch 为 8，每 32 次扫描检查超时。
+超出单 wave 容量的请求分 wave 执行，完成前保留全部 WR/SGL；每个 ready 使用独立的注册源字。
+Runtime 按每次 BatchGet 启动 kernel，接收本轮动态源地址和 `output_indices`。
 
 ## 内存、缓存和完成
 
 HBM workspace 包含独立缓存行上的请求头、notify、done、各 worker 的四路 ready，
 随后是源清单和连续 staging。staging 容量为 `65536 * token_bytes`，
-另有约 1 MiB 的源清单；总 payload 必须能用 uint32 表示。
+另有 512 KiB 的源地址数组；总 payload 必须能用 uint32 表示。
 此路径不预留远端 DDR gather staging，也不注册调用方 output 为 URMA 目标。
 
-worker 分区边界按完整 staging 缓存行对齐。读取元数据、DMA staging 和控制进度时执行缓存维护。
-为支持随机且无 padding 的输出，输出缓存维护由 worker 0 在全部 scatter 前后集中执行，
-避免某个 worker 清理缓存行时干扰其他 worker 对相邻输出行的写入。
-因此该路径与 probe V24 的“无显式缓存维护”版本具有不同的缓存成本。
-目标设备仍需验证 RA 注册内存的缓存属性、CPU WRITE 可见性和同 stream 后继消费。
+此路径使用部署环境提供的 DMA 可见性，不执行手动缓存行刷新。
+算子只遍历输入生成源清单和执行 scatter，不逐项校验 Tensor 内容或校验 payload。
+调用方须提供有效的索引、偏移、源地址和输出行；保留请求容量和有效前缀长度检查。
 
 一次执行完成前不复用 staging。异步返回表示已经入队；下次 Get/Put 会先 Drain，
 检查前一轮执行状态。`synchronize=True` 在本次调用内完成等待和状态检查。
 Shutdown 先停止 CPU worker 并销毁其 DMA 队列，再等待设备执行、释放 HBM。
 传输或 stream 失败会阻止执行资源复用；关闭失败时保留资源以便重试。
 
-## Profile 和本地验证
+## Profile
 
 原有 profile 字段保留，增加 `scatter_us` 和 `output_cache_us`。
 push 路径的 `read_us` 是消费 ready 并执行 scatter 的区间，`ack_us` 是最终 done 等待；
 `source_write_us` 为零，因为本轮源清单由 CPU READ 获取。
-`output_cache_us` 只在 worker 0 记录。设备 worker 的区间重叠，不能相加作为端到端时长。
+缓存维护相关字段为零。设备 worker 的区间重叠，不能相加作为端到端时长。
 
-Host 测试通过 mock URMA 执行生产 transport、CPU worker 和实际 kernel 主体，
-覆盖多 SGE、message 拆分、多 wave、动态输入、多 worker、空/部分前缀、错误 CQ 和关闭重试。
-这些测试验证协议和算法；实际 direct HCCP/RA 建链、设备 securec 链接及缓存行为由目标机测试确认。
+`--profile-rounds` 同时开启 CPU 分段计时。CPU 服务在每个采样请求完成后输出一行
+`CPU_PUSH_PROFILE`，包含 profile 预热轮；普通带宽轮次不采集或打印这些计时。
+`header_read_us`、`address_read_us` 分别是 READ 请求头和整块源地址数组的耗时；
+`write_us` 包含 `build_us`、`post_us`
+和 `cq_wait_us`，分别表示计划构建/源地址更新及 OpenMP 调度、并行提交、提交后的 CQ 等待。
+`submit_to_cqe_us` 从首次提交阶段到最后一个数据链尾 CQE，包含提交期间与 DMA 的重叠；
+`done_us` 是最终 done WRITE 及其 CQ 等待。计时从 CPU 看到新请求后开始，不含空闲轮询。
+`data_wrs`、`ready_wrs`、`post_calls`、`waves` 给出数据 WR、ready WR、provider 提交及 wave 数；
+`plan_reused=1` 表示复用了预构建链；`cpu_threads` 是实际 OpenMP 线程数。
+`tail_cqes` 统计数据链尾 CQE，不含 done。4096 × 656 B、4 worker、max_sge=13 时，
+预期为 320 个数据 WR、16 个 ready WR、4 个数据尾 CQE，随后一个 done 尾 CQE。
+`optimized=1` 表示 CPU transport 编译时已启用优化。
 
 主要文件对应：`cpu_push_host.cc` 管 Host 资源，`cpu_push_get_worker.cc` 管 CPU 请求循环，
 `cpu_push_get_transport.cc` 管 URMA 数据链，`cpu_push_scatter.cc` 管设备消费与本地复制。
