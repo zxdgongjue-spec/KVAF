@@ -20,6 +20,8 @@ void Bounds() {
   c = {}; c.timeout_ms = 0; Require(!MakeLayout(c, &l), "unbounded wait accepted");
   c = {}; c.aicpu_blocks = 0; Require(!MakeLayout(c, &l), "zero blocks accepted");
   c = {}; c.aicpu_blocks = kMaxAicpuBlocks + 1; Require(!MakeLayout(c, &l), "too many blocks accepted");
+  c = {}; c.scatter_start = static_cast<ScatterStart>(2);
+  Require(!MakeLayout(c, &l), "invalid scatter start accepted");
   c = {}; c.magic = 0; Require(!MakeLayout(c, &l), "invalid ABI accepted");
 }
 void DeviceSelection() {
@@ -59,12 +61,31 @@ void RangesAndMetrics() {
   bool rejected = false; try { (void)Summarize(c, r, samples); } catch (...) { rejected = true; }
   Require(rejected, "inconsistent timing accepted");
 }
+void ChunkPartition() {
+  for (auto rows : {1024, 2048, 4096}) for (auto blocks : {1, 4}) {
+    Config c; c.rows = rows; c.row_bytes = 4096; c.aicpu_blocks = blocks;
+    Require(PipelineChunkCount(c, 0) == (blocks == 1 ? rows / 1024 : 1), "unexpected chunks per worker");
+    std::array<std::vector<std::array<std::uint64_t, 4>>, 2> plans;
+    Layout ready{}, done{};
+    for (unsigned mode = 0; mode < 2; ++mode) {
+      c.scatter_start = static_cast<ScatterStart>(mode);
+      Require(MakeLayout(c, mode ? &done : &ready), "scatter mode layout rejected");
+      ForEachPipelineChunk(c, [&](auto w, auto chunk, RowRange r) {
+        plans[mode].push_back({w, chunk, r.begin, r.end});
+      });
+    }
+    Require(plans[0] == plans[1] && ready.region_bytes == done.region_bytes,
+            "scatter start changed the WRITE layout/chunks");
+    Require(plans[0].size() == (blocks == 1 ? rows / 1024 : 4), "unexpected total chunks");
+  }
+}
 struct ChunkIO {
   std::uint64_t token{}, ticks{}, finishes{};
   std::vector<RowRange> copied;
   Result Status() { return Result::kPending; }
   std::uint64_t Now() { return ++ticks; }
   std::uint64_t ReadRangeDone(std::uint32_t) { return token; }
+  std::uint64_t ReadDone() { return 0; }
   void RangeReady(std::uint64_t) {}
   void CopySpan(RowRange r) { copied.push_back(r); }
   void FinishRange() { ++finishes; }
@@ -96,6 +117,43 @@ void ReadyProgress() {
   failed = {}; failed.token = PipelineProgressToken(3, 1);
   Require(RunPipelineChunks(c, 0, 3, 0, 100, failed) == Result::kCopyError && failed.copied.size() == 1,
           "partial copy failure was ignored");
+}
+struct DoneGateIO : ChunkIO {
+  std::uint64_t done{3}, available_at{5}, done_reads{}, ready_tick{}, first_copy_tick{};
+  Result status{Result::kPending};
+  bool cancel_on_read{};
+  Result Status() { return status; }
+  std::uint64_t ReadDone() {
+    ++done_reads;
+    if (cancel_on_read) status = Result::kCopyError;
+    return ticks >= available_at ? done : 0;
+  }
+  void RangeReady(std::uint64_t now) { ready_tick = now; }
+  void CopySpan(RowRange r) {
+    if (!first_copy_tick) first_copy_tick = ticks;
+    ChunkIO::CopySpan(r);
+  }
+};
+void DelayedScatter() {
+  Config c; c.rows = 2048; c.row_bytes = 4096; c.aicpu_blocks = 1;
+  DoneGateIO io; io.token = PipelineProgressToken(3, 2);
+  Require(RunPipelineChunks(c, 0, 3, 0, 100, io) == Result::kOk && !io.done_reads &&
+          io.first_copy_tick < io.available_at, "ready mode waited for global done");
+  c.scatter_start = ScatterStart::kDone;
+  io = {}; io.token = PipelineProgressToken(3, 2);
+  Require(RunPipelineChunks(c, 0, 3, 0, 100, io) == Result::kOk && io.done_reads &&
+          io.ready_tick < io.available_at && io.first_copy_tick >= io.available_at &&
+          io.copied.size() == 1 && io.copied[0].end == c.rows && io.finishes == 1,
+          "done mode copied early or lost the first-ready observation");
+  io = {}; io.token = PipelineProgressToken(3, 2); io.available_at = 0; io.done = 4;
+  Require(RunPipelineChunks(c, 0, 3, 0, 100, io) == Result::kSequenceError && io.copied.empty(),
+          "future global done released scatter");
+  io = {}; io.token = PipelineProgressToken(3, 2); io.available_at = 0; io.done = 2;
+  Require(RunPipelineChunks(c, 0, 3, 0, 10, io) == Result::kTimeout && io.copied.empty(),
+          "stale global done released scatter");
+  io = {}; io.token = PipelineProgressToken(3, 2); io.cancel_on_read = true;
+  Require(RunPipelineChunks(c, 0, 3, 0, 100, io) == Result::kCopyError && io.copied.empty(),
+          "global done wait ignored cancellation");
 }
 void Completions() {
   Tracker t(2, 4); Tracker::Handle a{}, b{};
@@ -177,7 +235,7 @@ void Acknowledgements() {
 }  // namespace
 int main() {
   try {
-    Bounds(); DeviceSelection(); RangesAndMetrics(); ReadyProgress();
+    Bounds(); DeviceSelection(); RangesAndMetrics(); ChunkPartition(); ReadyProgress(); DelayedScatter();
     Completions(); ScatterOutput(); Acknowledgements();
     std::puts("aicpu ordered pipeline protocol: PASS"); return 0;
   } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }

@@ -48,12 +48,25 @@ template <class Emit> void ForEachPipelineChunk(const Config& c, Emit emit) {
     for (std::uint32_t w = 0; w < workers; ++w)
       if (chunk < PipelineChunkCount(c, w)) emit(w, chunk, PipelineChunkRange(c, w, chunk));
 }
+template <class IO>
+Result WaitForProducerDone(std::uint64_t sequence, std::uint64_t start,
+                           std::uint64_t timeout, IO& io) {
+  for (;;) {
+    if (const auto status = io.Status(); status != Result::kPending) return status;
+    const auto done = io.ReadDone();
+    if (done > sequence) return Result::kSequenceError;
+    if (io.Now() - start >= timeout) return Result::kTimeout;
+    if (done == sequence) return Result::kOk;
+    io.Relax();
+  }
+}
 // A progress jump releases all intervening chunks; finalize once per worker.
 template <class IO>
 Result RunPipelineChunks(const Config& c, std::uint32_t worker, std::uint64_t sequence,
                          std::uint64_t start, std::uint64_t timeout, IO& io) {
   const auto chunks = PipelineChunkCount(c, worker);
   std::uint64_t consumed = 0;
+  bool wait_for_done = c.scatter_start == ScatterStart::kDone;
   while (consumed < chunks) {
     for (;;) {
       const auto status = io.Status();
@@ -66,6 +79,12 @@ Result RunPipelineChunks(const Config& c, std::uint32_t worker, std::uint64_t se
       if (observed - start >= timeout) return Result::kTimeout;
       if (seq == sequence && progress > consumed) {
         if (!consumed) io.RangeReady(observed);
+        if (wait_for_done) {
+          // Preserve the first-ready observation while delaying every payload copy.
+          const auto status = WaitForProducerDone(sequence, start, timeout, io);
+          if (status != Result::kOk) return status;
+          wait_for_done = false;
+        }
         const auto first = PipelineChunkRange(c, worker, consumed);
         const auto last = PipelineChunkRange(c, worker, progress - 1);
         io.CopySpan({first.begin, last.end});

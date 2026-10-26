@@ -69,6 +69,7 @@ struct RangeIO {
   MultiBlockCoordination& coordination;
   Result Status() { return ::Status(coordination); }
   std::uint64_t Now() { return device.Now(); }
+  std::uint64_t ReadDone() { return device.ReadDone(); }
   std::uint64_t ReadRangeDone(std::uint32_t worker) { return device.ReadRangeDone(worker); }
   void RangeReady(std::uint64_t now) { Minimum(coordination.ready_tick, now); }
   void Relax() { device.Relax(); }
@@ -119,15 +120,8 @@ Result Run(DeviceIO& io, Sample* samples, KernelResult* result, MultiBlockCoordi
     if (Add(c.arrivals) + 1 == sequence * workers) Store(c.scatter_done, sequence);
     if (!worker) {
       if (!WaitFor(io, c, c.scatter_done, sequence, start, timeout, sequence)) break;
-      for (;;) {
-        const auto done = io.ReadDone();
-        if (done > sequence) { Fail(c, Result::kSequenceError, sequence); break; }
-        if (Status(c) != Result::kPending) break;
-        if (io.Now() - start >= timeout) { Fail(c, Result::kTimeout, sequence); break; }
-        if (done == sequence) break;
-        io.Relax();
-      }
-      if (Status(c) != Result::kPending) break;
+      const auto done = WaitForProducerDone(sequence, start, timeout, range);
+      if (done != Result::kOk) { Fail(c, done, sequence); break; }
       const auto end = io.Now(), ready = Load(c.ready_tick);
       std::uint64_t verification = 0;
       if (sequence == io.layout.rounds) {
@@ -151,7 +145,7 @@ Result Run(DeviceIO& io, Sample* samples, KernelResult* result, MultiBlockCoordi
 }
 }
 extern "C" __attribute__((visibility("default")))
-std::uint32_t KvafAicpuBatchGetV24(kvaf::aicpu_test::KernelArgs* args) {
+std::uint32_t KvafAicpuBatchGetV25(kvaf::aicpu_test::KernelArgs* args) {
   if (!args || !args->region || !args->samples || !args->result || !args->coordination) return 1;
   Layout layout{};
   auto* result = reinterpret_cast<KernelResult*>(args->result);

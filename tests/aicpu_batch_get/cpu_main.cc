@@ -43,6 +43,12 @@ Options Parse(int argc, char** argv) {
     Require(i + 1 < argc, "missing value for " + flag); const char* value = argv[++i];
     if (flag == "--peer") { o.transport.peer_address = value; continue; }
     if (flag == "--ub-device") { o.transport.ub_device = value; continue; }
+    if (flag == "--scatter-start") {
+      const std::string mode = value;
+      Require(mode == "ready" || mode == "done", "--scatter-start requires ready or done");
+      o.config.scatter_start = mode == "done" ? ScatterStart::kDone : ScatterStart::kReady;
+      continue;
+    }
     const auto n = Number(value);
     if (flag == "--rows") o.config.rows = n;
     else if (flag == "--row-bytes") o.config.row_bytes = n;
@@ -62,16 +68,17 @@ Options Parse(int argc, char** argv) {
   return o;
 }
 struct Work { std::uint32_t worker; std::uint64_t chunk; RowRange rows; };
-void SubmitAndWait(CpuUrmaTransport::PreparedWriteSession& session, std::uint64_t id,
-                   Clock::time_point deadline) {
+Clock::time_point SubmitAndWait(CpuUrmaTransport::PreparedWriteSession& session, std::uint64_t id,
+                                Clock::time_point deadline) {
   bool submitted = false;
   Check(session.Submit(id, &submitted)); Require(submitted, "drained queue has insufficient credits");
+  const auto submitted_at = Clock::now();
   std::uint64_t polls = 0;
   for (;;) {
     if (++polls % 32 == 0) Require(Clock::now() < deadline, "producer timeout");
     CpuUrmaTransport::PreparedWriteCompletion completed{}; std::size_t count = 0;
     Check(session.Poll(&completed, 1, &count));
-    if (count) { Require(count == 1 && completed.id == id, "unexpected completion"); return; }
+    if (count) { Require(count == 1 && completed.id == id, "unexpected completion"); return submitted_at; }
   }
 }
 kvaf::peer::PeerRegion Configure(Options& options, std::uint32_t npu_candidate) {
@@ -207,15 +214,17 @@ void Run(Options options) {
   OutputReadbackVerifier verifier(options.config, layout);
   std::fprintf(stderr, "AICPU_GET_CPU CONFIG ready=ordered_write copy=securec_memcpy aicpu_blocks=%llu workers=%u jettys=4 "
       "chunk_rows=1024 doorbell=32 cq_batch=8 deadline_polls=32 "
-      "data_wrs=%llu marker_wrs=%llu tail_cqes=%llu revision=%llu\n",
+      "data_wrs=%llu marker_wrs=%llu tail_cqes=%llu logical_chunks=%zu scatter_start=%s revision=%llu\n",
       (unsigned long long)options.config.aicpu_blocks, ActiveThreads(options.config),
       (unsigned long long)(info.wr_count - info.marker_wrs), (unsigned long long)info.marker_wrs,
-      (unsigned long long)(info.tail_cqes + 1), (unsigned long long)kKernelRevision);
+      (unsigned long long)(info.tail_cqes + 1), work.size(), ScatterStartName(options.config.scatter_start),
+      (unsigned long long)kKernelRevision);
   Socket control(Connect(options.transport.peer_address)); SocketTimeout(control.get(), options.config.timeout_ms + 120000);
   const auto start = kvaf::peer::MakeHeader(kStart, sizeof(kvaf::peer::MessageHeader));
   Send(control.get(), &start, sizeof(start)); Ack launched{}; Receive(control.get(), &launched, sizeof(launched));
   Require(launched.magic == kMagic && !launched.status, "NPU launch failed");
   double data_ns = 0, producer_ns = 0, round_ns = 0;
+  double data_submit_ns = 0, data_wait_ns = 0;
   std::uint64_t reads = 0;
   bool ok = true;
   CpuUrmaTransport::PreparedAsyncStats stats{};
@@ -239,13 +248,16 @@ void Run(Options options) {
         tokens[i].sequence = PipelineProgressToken(seq, work[i].chunk + 1);
       Check(transport.BeginPreparedWriteSession(&session));
       const auto producer_begin = Clock::now();
-      SubmitAndWait(*session, data_id, deadline);
+      const auto submitted_at = SubmitAndWait(*session, data_id, deadline);
       const auto data_end = Clock::now();
       done->sequence = seq; SubmitAndWait(*session, done_id, deadline);
       session.reset();
+      const auto producer_end = Clock::now();
       if (measured) {
         data_ns += Ns(producer_begin, data_end);
-        producer_ns += Ns(producer_begin, Clock::now());
+        data_submit_ns += Ns(producer_begin, submitted_at);
+        data_wait_ns += Ns(submitted_at, data_end);
+        producer_ns += Ns(producer_begin, producer_end);
       }
       if (seq == layout.rounds) {
         const auto verify_deadline = Clock::now() + std::chrono::milliseconds(options.config.timeout_ms);
@@ -285,10 +297,11 @@ void Run(Options options) {
   std::printf("engine,rows,row_bytes,iterations,active_threads,e2e_GBps,mean_ns,p50_ns,p99_ns,"
       "first_ready_ns,pipeline_ns,cpu_data_span_ns,cpu_data_GBps,cpu_producer_ns,cpu_round_ns,cpu_cycle_GBps,"
       "npu_prepare_ns,npu_verify_ns,mean_wrs,mean_marker_wrs,mean_tail_cqes,mean_control_reads,"
-      "ub_device,eid_index,eid,npu_device_id,npu_candidate,npu_eid,aicpu_blocks,jetty_count\n");
+      "ub_device,eid_index,eid,npu_device_id,npu_candidate,npu_eid,aicpu_blocks,jetty_count,"
+      "scatter_start,logical_chunks,cpu_data_submit_ns,cpu_data_wait_ns\n");
   std::printf("aicpu_sgl_ordered_write,%llu,%llu,%llu,%llu,%.6f,%.1f,%.1f,%.1f,%.1f,%.1f,"
       "%.1f,%.6f,%.1f,%.1f,%.6f,%.1f,%.1f,%llu,%llu,%.1f,%.1f,"
-      "%s,%u,%s,%u,%u,%s,%llu,%u\n",
+      "%s,%u,%s,%u,%u,%s,%llu,%u,%s,%zu,%.1f,%.1f\n",
       (unsigned long long)options.config.rows, (unsigned long long)options.config.row_bytes,
       (unsigned long long)options.config.iterations,
       (unsigned long long)report.active_threads, report.gbps, report.mean_ns, report.p50_ns, report.p99_ns,
@@ -297,7 +310,8 @@ void Run(Options options) {
       (unsigned long long)(info.wr_count - info.marker_wrs), (unsigned long long)info.marker_wrs,
       stats.tail_cqes / n, reads / n, options.transport.ub_device.c_str(), options.transport.eid_index,
       eid.c_str(), options.transport.remote_device_id, options.transport.remote_eid_index, npu_eid.c_str(),
-      (unsigned long long)options.config.aicpu_blocks, options.transport.jetty_count);
+      (unsigned long long)options.config.aicpu_blocks, options.transport.jetty_count,
+      ScatterStartName(options.config.scatter_start), work.size(), data_submit_ns / n, data_wait_ns / n);
 }
 }  // namespace
 int main(int argc, char** argv) {

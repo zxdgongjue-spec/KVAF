@@ -16,7 +16,7 @@ Wrapper options:
   --smoke            16 rows x 64 bytes, 1 warmup, 3 measured iterations
   --output FILE      Save CSV and also print it to stdout
 
-Fixed path (V24): ordered WRITE chain, 4 Jettys,
+Fixed path (V25): ordered WRITE chain, 4 Jettys,
 chunk 1024, doorbell 32, securec copy, indexed CQ batch 8/deadline 32,
 final output readback. Defaults: 4096 x 656 B, warmup 50/iterations 1000.
 Worker count follows the NPU's --aicpu-blocks setting (default 4).
@@ -24,6 +24,10 @@ No explicit kernel cache maintenance or per-round cold-output preparation.
 
   --rows N --row-bytes N
   --warmup N --iterations N --timeout-ms N
+  --scatter-start ready|done
+                    ready: copy each ready range immediately (default).
+                    done: observe ready, wait for global done, then copy.
+                    Both modes use the same data/marker WRITE chain.
   --npu-candidate N  Pin the remote EID candidate; default automatic selection.
 
 CSV includes all three bandwidth scopes:
@@ -32,6 +36,8 @@ CSV includes all three bandwidth scopes:
   cpu_cycle_GBps Full CPU round, including request wait, source update and scheduled checks.
 Times are in ns; effective GB/s = rows * row_bytes / corresponding mean_ns.
 Communication time is cpu_data_span_ns, not first_ready_ns or CQ poll time.
+cpu_data_span_ns = cpu_data_submit_ns + cpu_data_wait_ns (subject to rounding).
+cpu_data_wait_ns includes completion polling and device wait, not just CPU work.
 CSV also records the selected route and parallelism:
   ub_device, eid_index, eid; npu_device_id, npu_candidate, npu_eid;
   aicpu_blocks (configured), active_threads (effective), jetty_count (total).

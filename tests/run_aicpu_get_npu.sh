@@ -24,7 +24,8 @@ The built kernel JSON is selected automatically. No installation by default.
 Set the data shape on the CPU script; CPU partitioning follows the NPU block setting.
 Small inputs use fewer active blocks when there are fewer staging cache-line groups.
 No explicit kernel cache maintenance or per-round cold-output preparation.
-Install the V24 kernel after rebuilding both ends; restart NPU after installation.
+The CPU's --scatter-start ready|done selects the scatter release condition.
+Install the V25 kernel after rebuilding both ends; restart NPU after installation.
 This server handles one test run; restart it for the next run.
 Build: bash build.sh aicpu-npu
 EOF

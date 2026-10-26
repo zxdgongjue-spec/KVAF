@@ -4,8 +4,8 @@
 
 namespace kvaf::aicpu_test {
 constexpr std::uint64_t kMagic = 0x4b56414641424735ULL;
-constexpr char kKernelName[] = "KvafAicpuBatchGetV24";
-constexpr std::uint64_t kKernelRevision = 24;
+constexpr char kKernelName[] = "KvafAicpuBatchGetV25";
+constexpr std::uint64_t kKernelRevision = 25;
 constexpr std::uint32_t kDefaultAicpuBlocks = 4, kMaxAicpuBlocks = 32, kJettyCount = 4;
 constexpr std::uint64_t kPipelineChunkRows = 1024;
 constexpr std::uint64_t kRequestOffset = 0;
@@ -17,6 +17,10 @@ constexpr std::uint64_t kMaxAllocation = 8ULL << 30;
 constexpr std::uint64_t kMaxRounds = 100000;
 constexpr std::uint64_t kChainReadyWorkerBytes = 64;
 
+enum class ScatterStart : std::uint64_t { kReady = 0, kDone = 1 };
+inline const char* ScatterStartName(ScatterStart start) {
+  return start == ScatterStart::kDone ? "done" : "ready";
+}
 struct Config {
   std::uint64_t magic{kMagic};
   std::uint64_t rows{4096};
@@ -25,6 +29,7 @@ struct Config {
   std::uint64_t iterations{1000};
   std::uint64_t timeout_ms{30000};
   std::uint64_t aicpu_blocks{kDefaultAicpuBlocks};
+  ScatterStart scatter_start{ScatterStart::kReady};
 };
 
 struct Layout {
@@ -43,6 +48,7 @@ inline std::uint64_t RegisteredOutputOffset(const Layout& l) {
 inline bool MakeLayout(const Config& c, Layout* out) {
   if (!out || c.magic != kMagic || !c.rows || c.rows > UINT32_MAX ||
       c.row_bytes < 8 || c.row_bytes > UINT32_MAX || !c.aicpu_blocks || c.aicpu_blocks > kMaxAicpuBlocks ||
+      (c.scatter_start != ScatterStart::kReady && c.scatter_start != ScatterStart::kDone) ||
       !c.iterations || c.iterations > kMaxRounds || c.warmup > kMaxRounds - c.iterations ||
       !c.timeout_ms || c.timeout_ms > 600000) return false;
   const auto stride = Align64(c.row_bytes) + kGuardBytes;
@@ -136,7 +142,7 @@ inline RowRange ScatterRange(const Config& c, std::uint32_t worker, std::uint32_
   const auto end = (groups * (worker + 1) / workers) * quantum;
   return {begin, end < c.rows ? end : c.rows};
 }
-static_assert(sizeof(Config) == 56 && sizeof(Control) == 64);
+static_assert(sizeof(Config) == 64 && sizeof(Control) == 64);
 static_assert(sizeof(Sample) == 40 && sizeof(KernelResult) == 64);
-static_assert(sizeof(KernelArgs) == 88 && sizeof(CoordinationWord) == 64);
+static_assert(sizeof(KernelArgs) == 96 && sizeof(CoordinationWord) == 64);
 }  // namespace kvaf::aicpu_test
