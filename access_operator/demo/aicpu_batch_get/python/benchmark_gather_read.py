@@ -57,8 +57,12 @@ def create_request_plan(torch, a, length, device):
 
 def token_pattern(torch, token_ids, byte_ids):
     # Encode the source token ID across eight bytes so wrong-block READs are visible.
-    return (((token_ids.unsqueeze(1) >> ((byte_ids % 8) * 8)) ^
-             (byte_ids * 17 + (byte_ids >> 3))) & 0xFF).to(torch.uint8)
+    # torch_npu bitwise ops require equal shapes here; materialize broadcasts.
+    shifts = ((byte_ids % 8) * 8).expand(token_ids.numel(), -1).contiguous()
+    ids = token_ids.unsqueeze(1).expand_as(shifts).contiguous()
+    encoded = ((ids >> shifts) & 0xFF).to(torch.uint8)
+    pattern = ((byte_ids * 17 + (byte_ids >> 3)) & 0xFF).to(torch.uint8)
+    return encoded ^ pattern.expand_as(encoded).contiguous()
 
 
 def summarize_measurements(samples_us, profiles, payload_bytes):
