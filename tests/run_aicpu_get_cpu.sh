@@ -32,6 +32,10 @@ CSV includes all three bandwidth scopes:
   cpu_cycle_GBps Full CPU round, including request wait, source update and scheduled checks.
 Times are in ns; effective GB/s = rows * row_bytes / corresponding mean_ns.
 Communication time is cpu_data_span_ns, not first_ready_ns or CQ poll time.
+CSV also records the selected route and parallelism:
+  ub_device, eid_index, eid; npu_device_id, npu_candidate, npu_eid;
+  aicpu_blocks (configured), active_threads (effective), jetty_count (total).
+EIDs are 32 hex digits; Jettys are not bound to individual AICPU blocks.
 
 Start the NPU script first. Restart it for every test invocation.
 device-id selects the remote NPU (default 0); CPU UB/EID selection is automatic.

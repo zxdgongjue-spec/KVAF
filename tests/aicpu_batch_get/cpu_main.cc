@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace {
@@ -18,6 +19,16 @@ using Clock = std::chrono::steady_clock;
 void Check(const kvaf::Status& s) { Require(s.ok(), s.message()); }
 double Ns(Clock::time_point a, Clock::time_point b) {
   return std::chrono::duration<double, std::nano>(b - a).count();
+}
+std::string EidHex(const std::array<std::uint8_t, kvaf::peer::kEidBytes>& eid) {
+  static constexpr char digits[] = "0123456789abcdef";
+  std::string result;
+  result.reserve(eid.size() * 2);
+  for (const auto byte : eid) {
+    result.push_back(digits[byte >> 4]);
+    result.push_back(digits[byte & 15]);
+  }
+  return result;
 }
 struct Options {
   Config config;
@@ -116,7 +127,10 @@ void Run(Options options) {
     // Retry setup only; a failed data probe may have live WRs.
     if (attempt.ok()) {
       attempt = candidate->ValidateLink();
-      if (attempt.ok()) selected_transport = std::move(candidate);
+      if (attempt.ok()) {
+        options.transport = config;
+        selected_transport = std::move(candidate);
+      }
       return {attempt, false};
     }
     const auto stopped = candidate->Shutdown();
@@ -266,18 +280,24 @@ void Run(Options options) {
   Report report{}; Receive(control.get(), &report, sizeof(report));
   Require(ok && report.magic == kMagic && !report.status, "benchmark or validation failed");
   const auto n = static_cast<double>(options.config.iterations);
+  const auto eid = EidHex(options.transport.preferred_eid);
+  const auto npu_eid = EidHex(options.transport.external_region.route_eid);
   std::printf("engine,rows,row_bytes,iterations,active_threads,e2e_GBps,mean_ns,p50_ns,p99_ns,"
       "first_ready_ns,pipeline_ns,cpu_data_span_ns,cpu_data_GBps,cpu_producer_ns,cpu_round_ns,cpu_cycle_GBps,"
-      "npu_prepare_ns,npu_verify_ns,mean_wrs,mean_marker_wrs,mean_tail_cqes,mean_control_reads\n");
+      "npu_prepare_ns,npu_verify_ns,mean_wrs,mean_marker_wrs,mean_tail_cqes,mean_control_reads,"
+      "ub_device,eid_index,eid,npu_device_id,npu_candidate,npu_eid,aicpu_blocks,jetty_count\n");
   std::printf("aicpu_sgl_ordered_write,%llu,%llu,%llu,%llu,%.6f,%.1f,%.1f,%.1f,%.1f,%.1f,"
-      "%.1f,%.6f,%.1f,%.1f,%.6f,%.1f,%.1f,%llu,%llu,%.1f,%.1f\n",
+      "%.1f,%.6f,%.1f,%.1f,%.6f,%.1f,%.1f,%llu,%llu,%.1f,%.1f,"
+      "%s,%u,%s,%u,%u,%s,%llu,%u\n",
       (unsigned long long)options.config.rows, (unsigned long long)options.config.row_bytes,
       (unsigned long long)options.config.iterations,
       (unsigned long long)report.active_threads, report.gbps, report.mean_ns, report.p50_ns, report.p99_ns,
       report.wait_ns, report.scatter_ns, data_ns / n, layout.payload_bytes * n / data_ns,
       producer_ns / n, round_ns / n, layout.payload_bytes * n / round_ns, report.prepare_ns, report.verify_ns,
       (unsigned long long)(info.wr_count - info.marker_wrs), (unsigned long long)info.marker_wrs,
-      stats.tail_cqes / n, reads / n);
+      stats.tail_cqes / n, reads / n, options.transport.ub_device.c_str(), options.transport.eid_index,
+      eid.c_str(), options.transport.remote_device_id, options.transport.remote_eid_index, npu_eid.c_str(),
+      (unsigned long long)options.config.aicpu_blocks, options.transport.jetty_count);
 }
 }  // namespace
 int main(int argc, char** argv) {

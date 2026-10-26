@@ -74,6 +74,15 @@ output 跨轮复用，不再人为准备冷缓存。
 | `npu_prepare_ns` | 保留 CSV 字段以便前后对比；已删除准备流程，恒为 0 |
 | `npu_verify_ns` | 末轮校验握手的每轮均摊值 |
 
+CSV 末尾追加建链与并行配置，自动选路时也记录成功建链的实际值：
+
+| CSV 字段 | 含义 |
+|---|---|
+| `ub_device` / `eid_index` / `eid` | CPU UB 设备名、本地 EID 索引及完整 EID（32 位十六进制） |
+| `npu_device_id` / `npu_candidate` / `npu_eid` | NPU 逻辑设备号、选中的 candidate 索引及通路 EID |
+| `aicpu_blocks` / `active_threads` | NPU 配置的 block 数 / 实际有效 worker 数 |
+| `jetty_count` | CPU 传输使用的 Jetty 总数，当前固定为 4；不按 AICPU block 绑定 |
+
 单位为 ns，有效 payload 字节数除以对应平均 ns 即十进制 GB/s。
 `cpu_data_GBps` 是数据交付带宽；通信与 scatter 重叠，相关耗时不能直接相加。
 仅成功完成并通过末轮校验才输出 CSV。建议独立重复 5 次，比较中位数及尾延迟。
