@@ -3,11 +3,23 @@
 #include <cstdint>
 
 namespace kvaf::cpu_push {
-constexpr std::uint64_t kMagic = 0x4b56414650555331ULL;
+// V2 adds the sorted output plan before HBM staging and a count in notify.
+// Reject mixed CPU service/device packages before transferring payload.
+constexpr std::uint64_t kMagic = 0x4b56414650555332ULL;
 constexpr std::uint32_t kMaxRequests = 65536, kMaxWorkers = 8, kJettyCount = 4;
 constexpr std::uint32_t kChunkRows = 1024, kTimeoutMs = 30000;
-// Sequence numbers occupy at most 32 bits. Publish the sampling flag with them.
+// Publish the sequence, active count and sampling flag in one aligned word.
 constexpr std::uint64_t kProfileNotify = std::uint64_t{1} << 63;
+inline constexpr std::uint64_t RequestNotify(std::uint32_t sequence, std::uint32_t count,
+                                            bool profile) {
+  return sequence | (std::uint64_t{count} << 32) | (profile ? kProfileNotify : 0);
+}
+inline constexpr std::uint32_t NotifySequence(std::uint64_t notify) {
+  return static_cast<std::uint32_t>(notify);
+}
+inline constexpr std::uint32_t NotifyCount(std::uint64_t notify) {
+  return static_cast<std::uint32_t>((notify & ~kProfileNotify) >> 32);
+}
 
 enum class Result : std::uint64_t {
   kPending = 0, kOk = 1, kInvalidRequest = 2, kTimeout = 3,

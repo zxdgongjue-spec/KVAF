@@ -95,7 +95,8 @@ def print_profile(samples: list[dict], mode: str) -> None:
         print("    Counts " + fields(rows, ("bytes", "spans", "read_wqes", "post_calls",
                                            "ready_queries")))
         if mode == "cpu_push_scatter":
-            print("    Push " + fields(rows, ("scatter_us", "output_cache_us")))
+            print("    Push " + fields(rows, ("request_order_us", "scatter_us", "scatter_copies",
+                                              "output_cache_us")))
     if mode == "cpu_push_scatter":
         print("  CPU stages: see CPU_PUSH_PROFILE in the CPU service log (units=us).")
     print("  Timing: Host phases sum to Host total; Host wait includes queued device work/D2H. "
@@ -200,7 +201,10 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
     try:
         runtime.link_to(args.peer)
         runtime.initialize(ddr_bytes=(n * 2 + 1) * block_bytes, slot_size=block_bytes)
-        print(f"AICPU_BATCH_GET_BEGIN mode={mode} workers={workers} blocks={n} token_bytes={token}", flush=True)
+        print(f"AICPU_BATCH_GET_BEGIN mode={mode} workers={workers} blocks={n} token_bytes={token} "
+              f"tokens_per_block={args.tokens_per_block} active_percent={args.active_percent} "
+              f"output_row_step={args.output_row_step} warmup={args.warmup} "
+              f"iterations={args.iterations}", flush=True)
         # Exercise both Python overloads, partial prefixes and the empty-request path.
         for epoch, (active, raw) in enumerate(((100, False), (75, True), (0, False))):
             run_round(epoch, active, raw)

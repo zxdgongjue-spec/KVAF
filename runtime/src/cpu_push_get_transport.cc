@@ -212,7 +212,9 @@ Status Transport::ReadRequest(std::uint64_t* sequence) {
   auto result = Transfer(false, layout_.notify, sizeof(Word));
   if (result.ok()) {
     const auto notify = reinterpret_cast<const Word*>(memory_ + layout_.notify)->value;
-    *sequence = notify & ~kProfileNotify;
+    *sequence = NotifySequence(notify);
+    announced_count_ = NotifyCount(notify);
+    if (announced_count_ > kMaxRequests) return Error("notify count exceeds request capacity");
     profile_.enabled = (notify & kProfileNotify) != 0;
   }
   return result;
@@ -222,18 +224,18 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
     profile_ = {};
     profile_.enabled = true;
   }
-  Status result;
-  {
-    BatchGetProfileScope timer(profile_.enabled ? &profile_.header_read_ns : nullptr);
-    result = Transfer(false, layout_.request, sizeof(Request));
-  }
+  // The atomically published count lets one bounded READ fetch both header
+  // and addresses. Avoid a serialized header READ before the address READ.
+  BatchGetProfileScope timer(profile_.enabled ? &profile_.address_read_ns : nullptr);
+  const auto bytes = layout_.descriptor - layout_.request +
+                     std::uint64_t{announced_count_} * sizeof(std::uint64_t);
+  auto result = Transfer(false, layout_.request, bytes);
   if (!result.ok()) return result;
   const auto& r = request();
   if (r.magic != kMagic || r.sequence != sequence || !sequence || sequence > UINT32_MAX ||
-      r.count > kMaxRequests || r.token_bytes != token_bytes_ || r.workers != workers_)
+      r.count != announced_count_ || r.token_bytes != token_bytes_ || r.workers != workers_)
     return Status::InvalidArgument("CPU push request header mismatch");
-  BatchGetProfileScope timer(profile_.enabled ? &profile_.address_read_ns : nullptr);
-  return Transfer(false, layout_.descriptor, r.count * sizeof(std::uint64_t));
+  return Status::OK();
 }
 
 // Ported from hbm-sgl-probe PrepareWrite: partition each chunk into contiguous
@@ -277,7 +279,6 @@ Status Transport::PrepareWrites(std::uint32_t count) {
   std::uint32_t chunks = 0;
   for (std::uint32_t w = 0; w < workers_; ++w)
     chunks = std::max(chunks, ChunkCount(WorkerRange(count, token_bytes_, w, workers_)));
-#pragma omp parallel for schedule(static, 1) num_threads(kJettyCount)
   for (std::uint32_t queue = 0; queue < kJettyCount; ++queue) {
     auto& waves = shards[queue];
     waves.emplace_back();
@@ -400,52 +401,37 @@ Status Transport::WriteBatch() {
   BatchGetProfileScope timer(profile_.enabled ? &profile_.write_ns : nullptr);
   auto status = PrepareWrites(request().count);
   if (!status.ok()) return status;
-  std::array<Status, kJettyCount> posted;
-  std::uint64_t phase_begin = 0;
-  std::uint32_t active_threads = 0;
-#pragma omp parallel num_threads(kJettyCount) shared(status, posted, phase_begin, active_threads)
-  {
+  // Match the ordered-WRITE probe: short submissions to all four queues from
+  // their owner, then poll their tails together. Avoid waking an OpenMP team
+  // and crossing several team barriers for each short request.
+  for (std::size_t w = 0; w < prepared_.size(); ++w) {
+    auto& plan = *prepared_[w];
+    for (auto& queue : plan.queues) RefreshPrepared(queue);
+    status = BeginPrepared(plan, w + 1);
+    if (!status.ok()) return status;
     if (profile_.enabled) {
-#pragma omp atomic update
-      ++active_threads;
-    }
-    for (std::size_t w = 0; w < prepared_.size(); ++w) {
-      auto& plan = *prepared_[w];
-#pragma omp for schedule(static, 1)
-      for (std::uint32_t q = 0; q < kJettyCount; ++q) RefreshPrepared(plan.queues[q]);
-#pragma omp single
-      {
-        status = BeginPrepared(plan, w + 1);
-        if (profile_.enabled) {
-          profile_.cpu_threads = active_threads;
-          ++profile_.waves;
-          for (const auto& q : plan.queues) {
-            profile_.ready_wrs += q.markers.size();
-            profile_.data_wrs += q.wrs.size() - q.markers.size();
-            profile_.post_calls += (q.wrs.size() + kDoorbellWrs - 1) / kDoorbellWrs;
-          }
-          phase_begin = BatchGetProfileNowNs();
-          if (!profile_.first_post_ns) profile_.first_post_ns = phase_begin;
-        }
+      profile_.cpu_threads = 1;
+      ++profile_.waves;
+      for (const auto& q : plan.queues) {
+        profile_.ready_wrs += q.markers.size();
+        profile_.data_wrs += q.wrs.size() - q.markers.size();
+        profile_.post_calls += (q.wrs.size() + kDoorbellWrs - 1) / kDoorbellWrs;
       }
-#pragma omp for schedule(static, 1)
-      for (std::uint32_t q = 0; q < kJettyCount; ++q)
-        posted[q] = status.ok() ? PostPrepared(plan.queues[q], q) : status;
-#pragma omp single
-      {
-        if (profile_.enabled) profile_.post_ns += BatchGetProfileNowNs() - phase_begin;
-        for (const auto& result : posted) if (!result.ok()) { status = result; break; }
-        if (status.ok()) {
-          const auto begin = profile_.enabled ? BatchGetProfileNowNs() : 0;
-          status = PollPrepared(w + 1, profile_.enabled ? &profile_ : nullptr);
-          if (profile_.enabled) {
-            profile_.last_cqe_ns = BatchGetProfileNowNs();
-            profile_.cq_wait_ns += profile_.last_cqe_ns - begin;
-          }
-        }
-      }
-      if (!status.ok()) break;
     }
+    const auto phase_begin = profile_.enabled ? BatchGetProfileNowNs() : 0;
+    if (profile_.enabled && !profile_.first_post_ns) profile_.first_post_ns = phase_begin;
+    for (std::uint32_t q = 0; q < kJettyCount; ++q) {
+      status = PostPrepared(plan.queues[q], q);
+      if (!status.ok()) return status;
+    }
+    const auto posted = profile_.enabled ? BatchGetProfileNowNs() : 0;
+    if (profile_.enabled) profile_.post_ns += posted - phase_begin;
+    status = PollPrepared(w + 1, profile_.enabled ? &profile_ : nullptr);
+    if (profile_.enabled) {
+      profile_.last_cqe_ns = BatchGetProfileNowNs();
+      profile_.cq_wait_ns += profile_.last_cqe_ns - posted;
+    }
+    if (!status.ok()) return status;
   }
   return status;
 }
@@ -512,6 +498,7 @@ Status Transport::Shutdown() {
   prepared_.clear();
   done_ = {};
   prepared_count_ = UINT32_MAX;
+  announced_count_ = 0;
   next_poll_queue_ = 0;
   for (auto& q : queues_) { ResetRequests(q); q.poisoned = false; q.sequence = 0; }
   std::free(memory_); memory_ = nullptr;

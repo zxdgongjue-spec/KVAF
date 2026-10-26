@@ -1,5 +1,6 @@
 #include "cpu_push_scatter.h"
 #include "cpu_push_pipeline.h"
+#include "cpu_push_scatter_plan.h"
 
 #include <cstring>
 #if defined(__linux__) && defined(__aarch64__)
@@ -73,18 +74,19 @@ struct Execution {
   bool Copy(Range range) {
     BatchGetProfileScope timer(profile ? &profile->scatter_ns : nullptr);
     const auto bytes = args.request.token_bytes;
-    const auto* rows = reinterpret_cast<const std::int32_t*>(args.request.output_indices);
+    const auto* rows = reinterpret_cast<const std::uint32_t*>(Memory() + layout.destinations);
     auto* source = Memory() + layout.staging;
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    for (auto i = range.begin; i < range.end; ++i) {
-      auto* target = reinterpret_cast<std::uint8_t*>(args.output) + std::uint64_t(rows[i]) * bytes;
+    return CopyScatterRuns(rows, range, bytes, [&](auto destination, auto offset, auto length) {
+      auto* target = reinterpret_cast<std::uint8_t*>(args.output) + destination;
+      if (profile) ++profile->scatter_copies;
 #if defined(__linux__) && defined(__aarch64__)
-      if (memcpy_sp(target, bytes, source + std::uint64_t{i} * bytes, bytes) != EOK) return false;
+      return memcpy_sp(target, length, source + offset, length) == EOK;
 #else
-      std::memcpy(target, source + std::uint64_t{i} * bytes, bytes);
+      std::memcpy(target, source + offset, length);
+      return true;
 #endif
-    }
-    return true;
+    });
   }
   bool Build(std::uint32_t* count) {
     const auto& r = args.request;
@@ -98,9 +100,13 @@ struct Execution {
     const auto* indices = reinterpret_cast<const std::int32_t*>(r.indices);
     const auto* offsets = reinterpret_cast<const std::int32_t*>(r.offsets);
     auto* sources = reinterpret_cast<std::uint64_t*>(Memory() + layout.descriptor);
-    // Tensor contents follow the BatchGet input contract; only build the SGL.
-    for (std::uint32_t i = 0; i < *count; ++i)
-      sources[i] = addresses[indices[i]] + std::uint32_t(offsets[i]);
+    {
+      BatchGetProfileScope order_timer(profile ? &profile->request_order_ns : nullptr);
+      BuildScatterPlan(addresses, indices, offsets,
+          reinterpret_cast<const std::int32_t*>(r.output_indices), *count, sources,
+          reinterpret_cast<std::uint32_t*>(Memory() + layout.destinations),
+          reinterpret_cast<std::uint32_t*>(Memory() + layout.sort_scratch));
+    }
     auto* header = reinterpret_cast<Request*>(Memory() + layout.request);
     *header = {kMagic, args.sequence, *count, r.token_bytes, args.workers, 0, {}};
     return true;
@@ -127,7 +133,7 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) {
     if (Load(c.result) == 0 && count) {
       BatchGetProfileScope timer(profile ? &profile->notify_ns : nullptr);
       auto* notify = reinterpret_cast<Word*>(io.Memory() + layout.notify);
-      Store(*notify, args->sequence | (profile ? kProfileNotify : 0));
+      Store(*notify, RequestNotify(static_cast<std::uint32_t>(args->sequence), count, profile != nullptr));
     }
     Store(c.built, 1);
   } else if (io.Wait(c.built, 1)) {

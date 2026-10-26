@@ -12,7 +12,7 @@
 #include "status.h"
 
 namespace kvaf::cpu_push {
-// One service thread owns the session; OpenMP assigns each Jetty one submitter.
+// One service thread owns and submits the four prepared Jetty chains.
 class Transport {
  public:
   ~Transport();
@@ -76,6 +76,7 @@ class Transport {
   PreparedWrite done_;
   Tracker tracker_{kJettyCount, 8192};
   std::uint32_t prepared_count_{UINT32_MAX}, next_poll_queue_{};
+  std::uint32_t announced_count_{};
   urma_context_t* context_{};
   urma_target_seg_t* source_{};
   urma_target_seg_t* remote_{};
