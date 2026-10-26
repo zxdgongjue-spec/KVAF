@@ -59,7 +59,7 @@ python3 access_operator/demo/aicpu_batch_get/python/test_batch_get.py \
 
 一次调用处理 `int32 miss_count` 指定的有效前缀，最多 65536 项。
 每项读取 `addresses[indices[i]] + offsets[i]` 的 `token_bytes` 字节，
-目标为 `output + output_indices[i] * token_bytes`。CPU 校验源范围属于本 session 的 DDR。
+目标为 `output + output_indices[i] * token_bytes`。
 调用方继续负责有效 key、token 布局、输出映射及这些资源在操作完成前的生命周期。
 
 初始化时，Host 通过 RA 注册固定 HBM workspace，创建四个 TargetChannel，
@@ -71,8 +71,8 @@ CPU 建立专用回写队列，返回对端信息；Host 完成导入后才激�
 每轮过程如下：
 
 1. Host 在调用方 stream 清零本次 AICPU coordination，再启动配置数量的实例。
-2. worker 0 读取设备输入，在 HBM 写入请求头和有效源清单，最后发布 request sequence。
-3. CPU 通过 URMA READ 读取 request 和动态源清单，重新构建本轮 SGL。
+2. worker 0 将有效源地址写入连续的 `uint64` 数组，在 HBM 发布请求头和 request sequence。
+3. CPU 通过 URMA READ 整块读取地址数组，直接将其中的地址填入本轮 WRITE SGL。
 4. CPU 直接从已注册 DDR 源 WRITE 到 packed HBM staging，不打包 payload 到 CPU 临时区。
 5. 按 worker 的 staging 区间划分 1024 行 chunk，各 Jetty 在其数据之后强序 WRITE ready。
 6. AICPU 取四个 Jetty 的共同就绪前缀，将新就绪范围 scatter 到 `output_indices`。
@@ -84,37 +84,31 @@ ready 用高 32 位 sequence、低 32 位 chunk 数编码；done 在同一个 64
 当前实现针对普通 stream enqueue，Host 固定序号不能用于 graph replay。
 
 CPU 每个提交 wave 至多保留 512 个 WR 槽位，并按设备 SGE/message 上限拆分请求，
-只在有序尾 CQE 后复用 WR/SGL。一个 chunk 超出 wave 容量时分多波完成，最后发布 ready。
-CPU 串行推进各 chunk；WRITE 下一块可与 AICPU scatter 上一块重叠。
+只在有序尾 CQE 后复用 WR/SGL。多个 chunk 合并提交，仅在 WR 槽位用满或整批结束时等待 CQE。
+各 chunk 的 ready 使用独立、已注册的源字，提交后保持不变；WRITE 与 AICPU scatter 可重叠。
 
 ## 内存、缓存和完成
 
 HBM workspace 包含独立缓存行上的请求头、notify、done、各 worker 的四路 ready，
 随后是源清单和连续 staging。staging 容量为 `65536 * token_bytes`，
-另有约 1 MiB 的源清单；总 payload 必须能用 uint32 表示。
+另有 512 KiB 的源地址数组；总 payload 必须能用 uint32 表示。
 此路径不预留远端 DDR gather staging，也不注册调用方 output 为 URMA 目标。
 
-worker 分区边界按完整 staging 缓存行对齐。读取元数据、DMA staging 和控制进度时执行缓存维护。
-为支持随机且无 padding 的输出，输出缓存维护由 worker 0 在全部 scatter 前后集中执行，
-避免某个 worker 清理缓存行时干扰其他 worker 对相邻输出行的写入。
-因此该路径与 probe V24 的“无显式缓存维护”版本具有不同的缓存成本。
-目标设备仍需验证 RA 注册内存的缓存属性、CPU WRITE 可见性和同 stream 后继消费。
+此路径使用部署环境提供的 DMA 可见性，不执行手动缓存行刷新。
+算子只遍历输入生成源清单和执行 scatter，不逐项校验 Tensor 内容或校验 payload。
+调用方须提供有效的索引、偏移、源地址和输出行；保留请求容量和有效前缀长度检查。
 
 一次执行完成前不复用 staging。异步返回表示已经入队；下次 Get/Put 会先 Drain，
 检查前一轮执行状态。`synchronize=True` 在本次调用内完成等待和状态检查。
 Shutdown 先停止 CPU worker 并销毁其 DMA 队列，再等待设备执行、释放 HBM。
 传输或 stream 失败会阻止执行资源复用；关闭失败时保留资源以便重试。
 
-## Profile 和本地验证
+## Profile
 
 原有 profile 字段保留，增加 `scatter_us` 和 `output_cache_us`。
 push 路径的 `read_us` 是消费 ready 并执行 scatter 的区间，`ack_us` 是最终 done 等待；
 `source_write_us` 为零，因为本轮源清单由 CPU READ 获取。
-`output_cache_us` 只在 worker 0 记录。设备 worker 的区间重叠，不能相加作为端到端时长。
-
-Host 测试通过 mock URMA 执行生产 transport、CPU worker 和实际 kernel 主体，
-覆盖多 SGE、message 拆分、多 wave、动态输入、多 worker、空/部分前缀、错误 CQ 和关闭重试。
-这些测试验证协议和算法；实际 direct HCCP/RA 建链、设备 securec 链接及缓存行为由目标机测试确认。
+缓存维护相关字段为零。设备 worker 的区间重叠，不能相加作为端到端时长。
 
 主要文件对应：`cpu_push_host.cc` 管 Host 资源，`cpu_push_get_worker.cc` 管 CPU 请求循环，
 `cpu_push_get_transport.cc` 管 URMA 数据链，`cpu_push_scatter.cc` 管设备消费与本地复制。

@@ -16,7 +16,7 @@ inline bool MakeLayout(std::uint32_t token_bytes, std::uint32_t workers, Layout*
       std::uint64_t{token_bytes} * kMaxRequests > UINT32_MAX) return false;
   Layout l;
   l.descriptor = l.ready + workers * sizeof(Ready);
-  l.staging = Align64(l.descriptor + kMaxRequests * sizeof(peer::GatherSpan));
+  l.staging = Align64(l.descriptor + kMaxRequests * sizeof(std::uint64_t));
   l.bytes = Align64(l.staging + std::uint64_t{token_bytes} * kMaxRequests);
   *out = l;
   return true;

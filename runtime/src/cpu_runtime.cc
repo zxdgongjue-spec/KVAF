@@ -670,7 +670,7 @@ class CpuService {
         static_cast<unsigned long long>(request.hbm_bytes));
     auto transport = std::make_unique<cpu_push::Transport>();
     const auto status = transport->Initialize(region.resources->context(), region.segment,
-        region.base, request, region.resources->tp_query(), region.resources->jetty_import(),
+        request, region.resources->tp_query(), region.resources->jetty_import(),
         NextPsn(), response);
     if (!status.ok()) {
       Log("[KVAF_CPU] CPU_PUSH_OPEN_FAILED reason=%s\n", status.message().c_str());

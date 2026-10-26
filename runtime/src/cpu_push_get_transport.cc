@@ -14,6 +14,7 @@ namespace {
 Status Error(const char* operation) { return Status::Internal(std::string("CPU push: ") + operation); }
 // Reserve SQ headroom for the provider's multi-block encoding of 16-SGE WRs.
 constexpr std::size_t kWaveWrs = 512;
+constexpr std::uint32_t kMaxChunks = (kMaxRequests + kChunkRows - 1) / kChunkRows;
 void Stage(const char* stage, std::uint32_t queue = UINT32_MAX) {
   if (queue == UINT32_MAX)
     std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_INIT stage=%s\n", stage);
@@ -33,7 +34,7 @@ Transport::~Transport() {
 }
 
 Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
-    std::uint64_t source_base, const peer::OpenCpuPushGetRequest& setup,
+    const peer::OpenCpuPushGetRequest& setup,
     urma::GetTpList query, urma::ImportJettyEx import, std::uint32_t psn,
     peer::OpenCpuPushGetResponse* response) {
   if (context_ || !context || !source || !query || !import || !response || !psn ||
@@ -45,8 +46,6 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
     return Status::InvalidArgument("invalid CPU push setup");
   context_ = context;
   source_ = source;
-  source_base_ = source_base;
-  source_bytes_ = setup.source_bytes;
   hbm_base_ = setup.hbm_base;
   workers_ = setup.workers;
   token_bytes_ = setup.token_bytes;
@@ -74,7 +73,9 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   remote_ = urma_import_seg(context_, &segment, &token, 0, flag);
   if (!remote_) return Error("import HBM segment");
   void* buffer = nullptr;
-  const auto bytes = (layout_.staging + 4095) & ~std::uint64_t{4095};
+  // Each in-flight ready WRITE has its own immutable registered source word.
+  const auto marker_bytes = workers_ * kMaxChunks * kJettyCount * sizeof(std::uint64_t);
+  const auto bytes = (layout_.staging + marker_bytes + 4095) & ~std::uint64_t{4095};
   Stage("allocate_control");
   if (posix_memalign(&buffer, 4096, bytes)) return Error("allocate control buffer");
   memory_ = static_cast<std::uint8_t*>(buffer);
@@ -213,24 +214,17 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
   if (r.magic != kMagic || r.sequence != sequence || !sequence || sequence > UINT32_MAX ||
       r.count > kMaxRequests || r.token_bytes != token_bytes_ || r.workers != workers_)
     return Status::InvalidArgument("CPU push request header mismatch");
-  result = Transfer(false, layout_.descriptor, r.count * sizeof(peer::GatherSpan));
-  if (!result.ok()) return result;
-  const auto* spans = reinterpret_cast<const peer::GatherSpan*>(memory_ + layout_.descriptor);
-  for (std::uint32_t i = 0; i < r.count; ++i)
-    if (spans[i].length != token_bytes_ ||
-        !SourceRange(source_base_, source_bytes_, spans[i].address, spans[i].length))
-      return Status::InvalidArgument("CPU push source outside source DDR region");
-  return Status::OK();
+  return Transfer(false, layout_.descriptor, r.count * sizeof(std::uint64_t));
 }
 
-Status Transport::WriteChunk(std::uint32_t worker, std::uint32_t chunk, Range range) {
+Status Transport::WriteBatch() {
   const auto& r = request();
-  const auto* spans = reinterpret_cast<const peer::GatherSpan*>(memory_ + layout_.descriptor);
+  const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
+  auto* markers = reinterpret_cast<std::uint64_t*>(memory_ + layout_.staging);
   for (auto& q : queues_) {
     if (q.poisoned || q.pending) return Error("previous WRITE still live");
     ResetRequests(q);
   }
-  std::uint32_t row = range.begin, offset = 0, wr_index = 0;
   const auto flush_wave = [&]() -> Status {
     for (auto& q : queues_) {
       if (q.wrs.empty()) continue;
@@ -243,36 +237,49 @@ Status Transport::WriteChunk(std::uint32_t worker, std::uint32_t chunk, Range ra
     }
     return Status::OK();
   };
-  while (row < range.end) {
-    auto& q = queues_[wr_index++ % kJettyCount];
-    if (q.wrs.size() == kWaveWrs - 1) {
-      auto status = flush_wave();
-      if (!status.ok()) return status;
+  const auto reserve_wr = [&](Queue& q) -> Status {
+    return q.wrs.size() == kWaveWrs ? flush_wave() : Status::OK();
+  };
+  std::uint32_t chunks = 0;
+  for (std::uint32_t w = 0; w < r.workers; ++w)
+    chunks = std::max(chunks, ChunkCount(WorkerRange(r.count, token_bytes_, w, r.workers)));
+  for (std::uint32_t chunk = 0; chunk < chunks; ++chunk) {
+    for (std::uint32_t worker = 0; worker < r.workers; ++worker) {
+      const auto partition = WorkerRange(r.count, token_bytes_, worker, r.workers);
+      if (chunk >= ChunkCount(partition)) continue;
+      const auto range = ChunkRange(partition, chunk);
+      std::uint32_t row = range.begin, offset = 0, wr_index = 0;
+      while (row < range.end) {
+        auto& q = queues_[wr_index++ % kJettyCount];
+        auto status = reserve_wr(q);
+        if (!status.ok()) return status;
+        const auto first = static_cast<std::uint32_t>(q.local.size());
+        const auto destination = hbm_base_ + layout_.staging + std::uint64_t{row} * token_bytes_ + offset;
+        std::uint32_t bytes = 0, sges = 0;
+        while (row < range.end && sges < max_sge_ && bytes < max_bytes_) {
+          const auto length = std::min(token_bytes_ - offset, max_bytes_ - bytes);
+          q.local.push_back({addresses[row] + offset, length, source_, nullptr});
+          ++sges; bytes += length; offset += length;
+          if (offset == token_bytes_) { ++row; offset = 0; }
+        }
+        Add(q, URMA_OPC_WRITE, destination, bytes, first, sges);
+      }
+      for (std::uint32_t index = 0; index < kJettyCount; ++index) {
+        auto& q = queues_[index];
+        auto status = reserve_wr(q);
+        if (!status.ok()) return status;
+        auto* marker = markers + (worker * kMaxChunks + chunk) * kJettyCount + index;
+        *marker = Progress(r.sequence, chunk + 1);
+        const auto first = static_cast<std::uint32_t>(q.local.size());
+        q.local.push_back({reinterpret_cast<std::uint64_t>(marker), 8, control_, nullptr});
+        Add(q, URMA_OPC_WRITE, hbm_base_ + layout_.ready + worker * sizeof(Ready) + index * 8,
+            8, first, 1);
+        q.wrs.back().flag.bs.place_order = URMA_STRONG_ORDER;
+      }
     }
-    const auto first = static_cast<std::uint32_t>(q.local.size());
-    const auto destination = hbm_base_ + layout_.staging + std::uint64_t{row} * token_bytes_ + offset;
-    std::uint32_t bytes = 0, sges = 0;
-    while (row < range.end && sges < max_sge_ && bytes < max_bytes_) {
-      const auto length = std::min(token_bytes_ - offset, max_bytes_ - bytes);
-      q.local.push_back({spans[row].address + offset, length, source_, nullptr});
-      ++sges; bytes += length; offset += length;
-      if (offset == token_bytes_) { ++row; offset = 0; }
-    }
-    Add(q, URMA_OPC_WRITE, destination, bytes, first, sges);
   }
-  auto* ready = reinterpret_cast<Ready*>(memory_ + layout_.ready) + worker;
-  for (std::uint32_t index = 0; index < kJettyCount; ++index) {
-    auto& q = queues_[index];
-    ready->jetty[index] = Progress(r.sequence, chunk + 1);
-    const auto first = static_cast<std::uint32_t>(q.local.size());
-    q.local.push_back({reinterpret_cast<std::uint64_t>(&ready->jetty[index]), 8, control_, nullptr});
-    Add(q, URMA_OPC_WRITE, hbm_base_ + layout_.ready + worker * sizeof(Ready) + index * 8,
-        8, first, 1);
-    auto result = Post(q);
-    if (!result.ok()) return result;
-  }
-  for (auto& q : queues_) { auto result = Wait(q); if (!result.ok()) return result; }
-  return Status::OK();
+  // Chunks share one wave. Wait only before reusing full WR storage or finishing.
+  return flush_wave();
 }
 Status Transport::Complete(std::uint64_t sequence, Result result) {
   auto* done = reinterpret_cast<Completion*>(memory_ + layout_.done);

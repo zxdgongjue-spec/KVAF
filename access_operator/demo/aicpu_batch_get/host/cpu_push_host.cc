@@ -40,14 +40,15 @@ struct CpuPushTransport::Impl {
   Status Drain() {
     if (failed) return Status::InvalidState("CPU push failed; shutdown required");
     if (!pending) return Status::OK();
+    const auto bytes = config.workers * sizeof(WorkerStatus);
+    if (aclrtMemcpyAsync(status_host, bytes, status_device, bytes,
+                         ACL_MEMCPY_DEVICE_TO_HOST, pending) != ACL_SUCCESS) {
+      failed = true;
+      return Error("cannot enqueue execution status; resources retained");
+    }
     if (aclrtSynchronizeStream(pending) != ACL_SUCCESS) {
       failed = true;
       return Error("stream failed; resources retained");
-    }
-    const auto bytes = config.workers * sizeof(WorkerStatus);
-    if (aclrtMemcpy(status_host, bytes, status_device, bytes, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
-      failed = true;
-      return Error("cannot read execution status; resources retained");
     }
     pending = nullptr;
     const auto* statuses = static_cast<const WorkerStatus*>(status_host);

@@ -2,8 +2,6 @@
 
 #include <cstdint>
 
-#include "gather_span.h"
-
 namespace kvaf::cpu_push {
 constexpr std::uint64_t kMagic = 0x4b56414650555331ULL;
 constexpr std::uint32_t kMaxRequests = 65536, kMaxWorkers = 8, kJettyCount = 4;
@@ -37,5 +35,5 @@ inline constexpr std::uint64_t Progress(std::uint64_t sequence, std::uint32_t ch
   return (sequence << 32) | chunks;
 }
 static_assert(sizeof(Request) == 64 && sizeof(Completion) == 64 && sizeof(Ready) == 64);
-static_assert(sizeof(Word) == 64 && sizeof(WorkerStatus) == 64 && sizeof(peer::GatherSpan) == 16);
+static_assert(sizeof(Word) == 64 && sizeof(WorkerStatus) == 64);
 }  // namespace kvaf::cpu_push
