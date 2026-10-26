@@ -35,7 +35,7 @@ void Worker::Run() {
     std::uint64_t sequence = 0;
     auto status = transport_->ReadRequest(&sequence);
     if (!status.ok()) { std::fprintf(stderr, "CPU_PUSH: %s\n", status.message().c_str()); return; }
-    if (!sequence || sequence == last) { std::this_thread::yield(); continue; }
+    if (!sequence || sequence == last) continue;
     if (sequence <= last || sequence > UINT32_MAX) {
       (void)transport_->Complete(sequence, Result::kSequenceError);
       return;

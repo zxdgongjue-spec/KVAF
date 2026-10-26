@@ -14,8 +14,7 @@
 namespace kvaf::cpu_push {
 namespace {
 Status Error(const char* operation) { return Status::Internal(std::string("CPU push: ") + operation); }
-// Reserve SQ headroom for the provider's multi-block encoding of 16-SGE WRs.
-constexpr std::size_t kWaveWrs = 512;
+constexpr std::size_t kJettyDepth = 8192, kDoorbellWrs = 32;
 constexpr std::uint32_t kMaxChunks = (kMaxRequests + kChunkRows - 1) / kChunkRows;
 void Stage(const char* stage, std::uint32_t queue = UINT32_MAX) {
   if (queue == UINT32_MAX)
@@ -111,12 +110,12 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
     auto& c = queue.channel;
     Stage("create_queues", q);
     const auto* error = urma::CreateQueues(urma::NativeApi{}, context_, setup.token_value,
-        {16384, 1024, max_sge_, false, true}, c.local_jfc, c.local_jfr, c.local_jetty);
+        {16384, kJettyDepth, max_sge_, false, true}, c.local_jfc, c.local_jfr, c.local_jetty);
     if (error) return Error(error);
-    // Keep slots and all pointers stable until a tail CQE (or queue teardown).
-    queue.local.reserve(kWaveWrs * max_sge_);
-    queue.remote.reserve(kWaveWrs);
-    queue.wrs.reserve(kWaveWrs);
+    // Control READs use one SGE. Data and done use reusable prepared chains.
+    queue.local.reserve(1);
+    queue.remote.reserve(1);
+    queue.wrs.reserve(1);
     Stage("import_jetty", q);
     c.remote_jetty = urma::ImportJetty(import, context_, setup.channels[q].key,
         setup.token_value, cpu_tp, setup.npu_tp, psn, setup.npu_psn);
@@ -127,6 +126,11 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
     std::memcpy(key.key + sizeof(urma_jetty_id_t), &c.local_jetty->jetty_cfg.jfs_cfg.trans_mode,
                 sizeof(urma_transport_mode_t));
   }
+  auto& done = done_.queues[0];
+  done.local.push_back({reinterpret_cast<std::uint64_t>(memory_ + layout_.done),
+                        sizeof(Completion), control_, nullptr});
+  AppendPrepared(done, 0, hbm_base_ + layout_.done, sizeof(Completion), 1, true);
+  SealPrepared(done_);
   Stage("ready");
   return Status::OK();
 }
@@ -232,93 +236,227 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
   return Transfer(false, layout_.descriptor, r.count * sizeof(std::uint64_t));
 }
 
+// Ported from hbm-sgl-probe PrepareWrite: partition each chunk into contiguous
+// Jetty shards, append ordered ready WRs, and signal only each queue's tail.
+void Transport::AppendPrepared(PreparedQueue& q, std::uint32_t queue,
+    std::uint64_t remote, std::uint32_t bytes, std::uint32_t sges, bool ordered) {
+  q.remote.push_back({remote, bytes, remote_, nullptr});
+  urma_jfs_wr_t wr{};
+  wr.opcode = URMA_OPC_WRITE;
+  wr.flag.bs.comp_order = 1;
+  wr.flag.bs.place_order = ordered ? URMA_STRONG_ORDER : URMA_RELAX_ORDER;
+  wr.tjetty = queues_[queue].channel.remote_jetty;
+  wr.rw.src.num_sge = sges;
+  wr.rw.dst.num_sge = 1;
+  q.wrs.push_back(wr);
+}
+void Transport::SealPrepared(PreparedWrite& plan) {
+  for (std::uint32_t index = 0; index < kJettyCount; ++index) {
+    auto& q = plan.queues[index];
+    if (q.wrs.empty()) continue;
+    std::size_t local = 0;
+    for (std::size_t i = 0; i < q.wrs.size(); ++i) {
+      auto& wr = q.wrs[i];
+      wr.rw.src.sge = reinterpret_cast<urma_sge_t*>(q.local.data() + local);
+      wr.rw.dst.sge = reinterpret_cast<urma_sge_t*>(q.remote.data() + i);
+      local += wr.rw.src.num_sge;
+      wr.next = i + 1 < q.wrs.size() && (i + 1) % kDoorbellWrs ? &q.wrs[i + 1] : nullptr;
+    }
+    q.wrs.back().flag.bs.complete_enable = 1;
+    q.wrs.back().flag.bs.place_order = URMA_STRONG_ORDER;
+    plan.fences[plan.fence_count++] = {index, q.wrs.size(), 0};
+  }
+}
+Status Transport::PrepareWrites(std::uint32_t count) {
+  if (!tracker_.Empty()) return Error("prepare while WRITE is in flight");
+  if (prepared_count_ == count) {
+    profile_.plan_reused = true;
+    return Status::OK();
+  }
+  std::array<std::vector<PreparedQueue>, kJettyCount> shards;
+  std::uint32_t chunks = 0;
+  for (std::uint32_t w = 0; w < workers_; ++w)
+    chunks = std::max(chunks, ChunkCount(WorkerRange(count, token_bytes_, w, workers_)));
+#pragma omp parallel for schedule(static, 1) num_threads(kJettyCount)
+  for (std::uint32_t queue = 0; queue < kJettyCount; ++queue) {
+    auto& waves = shards[queue];
+    waves.emplace_back();
+    for (std::uint32_t chunk = 0; chunk < chunks; ++chunk) {
+      for (std::uint32_t worker = 0; worker < workers_; ++worker) {
+        const auto partition = WorkerRange(count, token_bytes_, worker, workers_);
+        if (chunk >= ChunkCount(partition)) continue;
+        const auto range = ChunkRange(partition, chunk);
+        const auto rows = range.end - range.begin;
+        const auto base = rows / kJettyCount, remainder = rows % kJettyCount;
+        auto row = range.begin + queue * base + std::min(queue, remainder);
+        const auto end = row + base + (queue < remainder ? 1U : 0U);
+        std::uint32_t offset = 0;
+        while (row < end) {
+          // The probe budgets source SGEs as well as WRs against SQ depth.
+          // Continue large requests in another drained wave without narrowing
+          // BatchGet's existing maximum request/token sizes.
+          if (waves.back().local.size() + max_sge_ > kJettyDepth) waves.emplace_back();
+          auto& q = waves.back();
+          const auto destination = hbm_base_ + layout_.staging + std::uint64_t{row} * token_bytes_ + offset;
+          std::uint32_t bytes = 0, sges = 0;
+          while (row < end && sges < max_sge_ && bytes < max_bytes_) {
+            const auto length = std::min(token_bytes_ - offset, max_bytes_ - bytes);
+            q.sources.push_back({static_cast<std::uint32_t>(q.local.size()), row, offset});
+            q.local.push_back({0, length, source_, nullptr});
+            ++sges; bytes += length; offset += length;
+            if (offset == token_bytes_) { ++row; offset = 0; }
+          }
+          AppendPrepared(q, queue, destination, bytes, sges);
+        }
+        if (waves.back().local.size() == kJettyDepth) waves.emplace_back();
+        auto& q = waves.back();
+        auto* marker = reinterpret_cast<std::uint64_t*>(memory_ + layout_.staging) +
+            (worker * kMaxChunks + chunk) * kJettyCount + queue;
+        q.markers.push_back({marker, chunk + 1});
+        q.local.push_back({reinterpret_cast<std::uint64_t>(marker), 8, control_, nullptr});
+        AppendPrepared(q, queue, hbm_base_ + layout_.ready + worker * sizeof(Ready) + queue * 8,
+                       8, 1, true);
+      }
+    }
+  }
+  std::size_t waves = 0;
+  for (const auto& shard : shards) waves = std::max(waves, shard.size());
+  prepared_.clear();
+  for (std::size_t w = 0; w < waves; ++w) {
+    auto plan = std::make_unique<PreparedWrite>();
+    for (std::uint32_t q = 0; q < kJettyCount; ++q)
+      if (w < shards[q].size()) plan->queues[q] = std::move(shards[q][w]);
+    SealPrepared(*plan);
+    if (plan->fence_count) prepared_.push_back(std::move(plan));
+  }
+  prepared_count_ = count;
+  return Status::OK();
+}
+void Transport::RefreshPrepared(PreparedQueue& q) {
+  const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
+  for (const auto& source : q.sources) q.local[source.local].addr = addresses[source.row] + source.offset;
+  for (const auto& marker : q.markers) *marker.value = Progress(request().sequence, marker.progress);
+}
+Status Transport::BeginPrepared(PreparedWrite& plan, std::uint64_t id) {
+  for (const auto& q : queues_)
+    if (q.poisoned || q.pending) return Error("queue unavailable");
+  bool submitted = false;
+  auto status = tracker_.TryBegin(id, plan.handle, plan.fences.data(), plan.fence_count, &submitted);
+  if (!status.ok()) return status;
+  if (!submitted) return Error("drained queue has insufficient credits");
+  for (std::size_t i = 0; i < plan.fence_count; ++i) {
+    const auto& fence = plan.fences[i];
+    plan.queues[fence.queue].wrs.back().user_ctx = fence.context;
+  }
+  return Status::OK();
+}
+Status Transport::PostPrepared(PreparedQueue& q, std::uint32_t queue) {
+  for (std::size_t first = 0; first < q.wrs.size(); first += kDoorbellWrs) {
+    urma_jfs_wr_t* bad = nullptr;
+    if (urma_post_jetty_send_wr(queues_[queue].channel.local_jetty, &q.wrs[first], &bad)) {
+      queues_[queue].poisoned = true;
+      return Error("post prepared WRITE chain");
+    }
+  }
+  return Status::OK();
+}
+Status Transport::PollPrepared(std::uint64_t id, Profile* profile) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kTimeoutMs);
+  std::uint32_t polls = 0;
+  for (;;) {
+    std::array<urma_cr_t, 8> crs;
+    std::size_t count = 0;
+    auto status = cpu_urma_detail::SweepAsyncCqs(kJettyCount, next_poll_queue_, 8, 1, &count,
+        [&](std::size_t q) { return tracker_.Pending(q); },
+        [&](std::size_t q, std::size_t limit, std::size_t* polled) -> Status {
+          const auto n = urma_poll_jfc(queues_[q].channel.local_jfc, static_cast<int>(limit), crs.data());
+          if (n < 0) { queues_[q].poisoned = true; return Error("poll prepared CQ"); }
+          *polled = static_cast<std::size_t>(n);
+          if (profile) profile->tail_cqes += n;
+          return Status::OK();
+        },
+        [&](std::size_t q, std::size_t index, bool* finished) -> Status {
+          const auto& cr = crs[index];
+          if (cr.status != URMA_CR_SUCCESS) {
+            queues_[q].poisoned = true; return Error("prepared CQ status");
+          }
+          std::uint64_t completed = 0;
+          auto status = tracker_.Complete(q, cr.user_ctx, &completed);
+          if (!status.ok()) { queues_[q].poisoned = true; return status; }
+          if (completed && completed != id) return Error("unexpected prepared completion");
+          *finished = completed != 0;
+          return Status::OK();
+        });
+    next_poll_queue_ = (next_poll_queue_ + 1) % kJettyCount;
+    if (!status.ok()) return status;
+    if (count) return Status::OK();
+    if ((++polls & 31) == 0 && std::chrono::steady_clock::now() >= deadline) {
+      for (auto& q : queues_) q.poisoned = true;
+      return Error("prepared CQ timeout; resources retained");
+    }
+  }
+}
 Status Transport::WriteBatch() {
   BatchGetProfileScope timer(profile_.enabled ? &profile_.write_ns : nullptr);
-  const auto& r = request();
-  const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
-  auto* markers = reinterpret_cast<std::uint64_t*>(memory_ + layout_.staging);
-  for (auto& q : queues_) {
-    if (q.poisoned || q.pending) return Error("previous WRITE still live");
-    ResetRequests(q);
-  }
-  const auto flush_wave = [&]() -> Status {
-    if (profile_.enabled) ++profile_.waves;
-    for (auto& q : queues_) {
-      if (q.wrs.empty()) continue;
-      const auto begin = profile_.enabled ? BatchGetProfileNowNs() : 0;
-      if (profile_.enabled && !profile_.first_post_ns) profile_.first_post_ns = begin;
-      auto status = Post(q);
-      if (profile_.enabled) {
-        profile_.post_ns += BatchGetProfileNowNs() - begin;
-        profile_.post_calls += (q.wrs.size() + 31) / 32;
-      }
-      if (!status.ok()) return status;
+  auto status = PrepareWrites(request().count);
+  if (!status.ok()) return status;
+  std::array<Status, kJettyCount> posted;
+  std::uint64_t phase_begin = 0;
+  std::uint32_t active_threads = 0;
+#pragma omp parallel num_threads(kJettyCount) shared(status, posted, phase_begin, active_threads)
+  {
+    if (profile_.enabled) {
+#pragma omp atomic update
+      ++active_threads;
     }
-    for (auto& q : queues_) {
-      if (q.pending) {
-        const auto begin = profile_.enabled ? BatchGetProfileNowNs() : 0;
-        auto status = Wait(q);
+    for (std::size_t w = 0; w < prepared_.size(); ++w) {
+      auto& plan = *prepared_[w];
+#pragma omp for schedule(static, 1)
+      for (std::uint32_t q = 0; q < kJettyCount; ++q) RefreshPrepared(plan.queues[q]);
+#pragma omp single
+      {
+        status = BeginPrepared(plan, w + 1);
         if (profile_.enabled) {
-          profile_.last_cqe_ns = BatchGetProfileNowNs();
-          profile_.cq_wait_ns += profile_.last_cqe_ns - begin;
+          profile_.cpu_threads = active_threads;
+          ++profile_.waves;
+          for (const auto& q : plan.queues) {
+            profile_.ready_wrs += q.markers.size();
+            profile_.data_wrs += q.wrs.size() - q.markers.size();
+            profile_.post_calls += (q.wrs.size() + kDoorbellWrs - 1) / kDoorbellWrs;
+          }
+          phase_begin = BatchGetProfileNowNs();
+          if (!profile_.first_post_ns) profile_.first_post_ns = phase_begin;
         }
-        if (!status.ok()) return status;
       }
-      ResetRequests(q);
-    }
-    return Status::OK();
-  };
-  const auto reserve_wr = [&](Queue& q) -> Status {
-    return q.wrs.size() == kWaveWrs ? flush_wave() : Status::OK();
-  };
-  std::uint32_t chunks = 0;
-  for (std::uint32_t w = 0; w < r.workers; ++w)
-    chunks = std::max(chunks, ChunkCount(WorkerRange(r.count, token_bytes_, w, r.workers)));
-  for (std::uint32_t chunk = 0; chunk < chunks; ++chunk) {
-    for (std::uint32_t worker = 0; worker < r.workers; ++worker) {
-      const auto partition = WorkerRange(r.count, token_bytes_, worker, r.workers);
-      if (chunk >= ChunkCount(partition)) continue;
-      const auto range = ChunkRange(partition, chunk);
-      std::uint32_t row = range.begin, offset = 0, wr_index = 0;
-      while (row < range.end) {
-        auto& q = queues_[wr_index++ % kJettyCount];
-        auto status = reserve_wr(q);
-        if (!status.ok()) return status;
-        const auto first = static_cast<std::uint32_t>(q.local.size());
-        const auto destination = hbm_base_ + layout_.staging + std::uint64_t{row} * token_bytes_ + offset;
-        std::uint32_t bytes = 0, sges = 0;
-        while (row < range.end && sges < max_sge_ && bytes < max_bytes_) {
-          const auto length = std::min(token_bytes_ - offset, max_bytes_ - bytes);
-          q.local.push_back({addresses[row] + offset, length, source_, nullptr});
-          ++sges; bytes += length; offset += length;
-          if (offset == token_bytes_) { ++row; offset = 0; }
+#pragma omp for schedule(static, 1)
+      for (std::uint32_t q = 0; q < kJettyCount; ++q)
+        posted[q] = status.ok() ? PostPrepared(plan.queues[q], q) : status;
+#pragma omp single
+      {
+        if (profile_.enabled) profile_.post_ns += BatchGetProfileNowNs() - phase_begin;
+        for (const auto& result : posted) if (!result.ok()) { status = result; break; }
+        if (status.ok()) {
+          const auto begin = profile_.enabled ? BatchGetProfileNowNs() : 0;
+          status = PollPrepared(w + 1, profile_.enabled ? &profile_ : nullptr);
+          if (profile_.enabled) {
+            profile_.last_cqe_ns = BatchGetProfileNowNs();
+            profile_.cq_wait_ns += profile_.last_cqe_ns - begin;
+          }
         }
-        Add(q, URMA_OPC_WRITE, destination, bytes, first, sges);
-        if (profile_.enabled) ++profile_.data_wrs;
       }
-      for (std::uint32_t index = 0; index < kJettyCount; ++index) {
-        auto& q = queues_[index];
-        auto status = reserve_wr(q);
-        if (!status.ok()) return status;
-        auto* marker = markers + (worker * kMaxChunks + chunk) * kJettyCount + index;
-        *marker = Progress(r.sequence, chunk + 1);
-        const auto first = static_cast<std::uint32_t>(q.local.size());
-        q.local.push_back({reinterpret_cast<std::uint64_t>(marker), 8, control_, nullptr});
-        Add(q, URMA_OPC_WRITE, hbm_base_ + layout_.ready + worker * sizeof(Ready) + index * 8,
-            8, first, 1);
-        q.wrs.back().flag.bs.place_order = URMA_STRONG_ORDER;
-        if (profile_.enabled) ++profile_.ready_wrs;
-      }
+      if (!status.ok()) break;
     }
   }
-  // Chunks share one wave. Wait only before reusing full WR storage or finishing.
-  return flush_wave();
+  return status;
 }
 Status Transport::Complete(std::uint64_t sequence, Result result) {
   BatchGetProfileScope timer(profile_.enabled ? &profile_.done_ns : nullptr);
   auto* done = reinterpret_cast<Completion*>(memory_ + layout_.done);
   *done = {Progress(sequence, static_cast<std::uint32_t>(result)), {}};
-  return Transfer(true, layout_.done, sizeof(Completion));
+  auto status = BeginPrepared(done_, UINT64_MAX);
+  if (status.ok()) status = PostPrepared(done_.queues[0], 0);
+  if (status.ok()) status = PollPrepared(UINT64_MAX);
+  return status;
 }
 
 void Transport::PrintProfile() const {
@@ -336,11 +474,12 @@ void Transport::PrintProfile() const {
       "CPU_PUSH_PROFILE sequence=%" PRIu64 " workers=%u rows=%u bytes=%" PRIu64
       " header_read_us=%.1f address_read_us=%.1f build_us=%.1f post_us=%.1f cq_wait_us=%.1f"
       " write_us=%.1f submit_to_cqe_us=%.1f done_us=%.1f"
-      " data_wrs=%u ready_wrs=%u post_calls=%u waves=%u optimized=%u\n",
+      " data_wrs=%u ready_wrs=%u post_calls=%u waves=%u tail_cqes=%u cpu_threads=%u plan_reused=%u optimized=%u\n",
       r.sequence, r.workers, r.count, std::uint64_t{r.count} * token_bytes_,
       p.header_read_ns / 1000.0, p.address_read_ns / 1000.0, build_ns / 1000.0, p.post_ns / 1000.0,
       p.cq_wait_ns / 1000.0, p.write_ns / 1000.0, submit_ns / 1000.0, p.done_ns / 1000.0,
-      p.data_wrs, p.ready_wrs, p.post_calls, p.waves, optimized);
+      p.data_wrs, p.ready_wrs, p.post_calls, p.waves, p.tail_cqes, p.cpu_threads,
+      unsigned(p.plan_reused), optimized);
 }
 
 Status Transport::Shutdown() {
@@ -369,6 +508,12 @@ Status Transport::Shutdown() {
   if (remote_) { if (urma_unimport_seg(remote_)) return Error("unimport HBM"); remote_ = nullptr; }
   if (control_) { if (urma_unregister_seg(control_)) return Error("unregister controls"); control_ = nullptr; }
   if (control_token_) { if (urma_free_token_id(control_token_)) return Error("free token"); control_token_ = nullptr; }
+  tracker_ = Tracker(kJettyCount, kJettyDepth);
+  prepared_.clear();
+  done_ = {};
+  prepared_count_ = UINT32_MAX;
+  next_poll_queue_ = 0;
+  for (auto& q : queues_) { ResetRequests(q); q.poisoned = false; q.sequence = 0; }
   std::free(memory_); memory_ = nullptr;
   context_ = nullptr;
   return Status::OK();

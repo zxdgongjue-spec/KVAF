@@ -16,7 +16,7 @@ usage() {
   cat <<'EOF'
 Usage: ./build.sh <cpu|npu|aicpu-urma> [--build-dir DIR] [--jobs N]
 
-cpu  Builds the liburma-only CPU Runtime service. If liburma is not installed,
+cpu  Builds the CPU Runtime service with liburma and OpenMP. If liburma is not installed,
      it clones and builds the pinned UMDK source beside this repository.
 aicpu-urma Builds AICPU gather_read, BatchPut and Python bindings.
      --cpu-push adds Host direct HCCP and the CPU push/scatter kernel (needs device securec).

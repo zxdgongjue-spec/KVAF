@@ -8,6 +8,24 @@
 
 namespace kvaf::cpu_push {
 namespace {
+std::uint64_t CounterNow() {
+#if defined(__linux__) && defined(__aarch64__)
+  std::uint64_t value;
+  asm volatile("isb; mrs %0, cntvct_el0" : "=r"(value) :: "memory");
+  return value;
+#else
+  return BatchGetProfileNowNs();
+#endif
+}
+std::uint64_t CounterFrequency() {
+#if defined(__linux__) && defined(__aarch64__)
+  std::uint64_t value;
+  asm volatile("mrs %0, cntfrq_el0" : "=r"(value));
+  return value;
+#else
+  return 1000000000;
+#endif
+}
 std::uint64_t Load(const Word& w) { return __atomic_load_n(&w.value, __ATOMIC_ACQUIRE); }
 void Store(Word& w, std::uint64_t value) { __atomic_store_n(&w.value, value, __ATOMIC_RELEASE); }
 void Fail(Coordination& c, Result result) {
@@ -31,7 +49,7 @@ struct Execution {
   Result Check() {
     auto result = static_cast<Result>(Load(coordination.result));
     if (result != Result::kPending) return result;
-    if (BatchGetProfileNowNs() >= deadline) return Result::kTimeout;
+    if (CounterNow() >= deadline) return Result::kTimeout;
     auto* done = reinterpret_cast<volatile Completion*>(Memory() + layout.done);
     const auto token = done->token, sequence = token >> 32;
     if (sequence > args.sequence) return Result::kSequenceError;
@@ -102,7 +120,7 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) {
   auto* profile = args->profile ? &measured : nullptr;
   if (profile) profile->enter_ns = BatchGetProfileNowNs();
   Execution io{*args, layout, c, worker,
-      BatchGetProfileNowNs() + std::uint64_t{args->timeout_ms} * 1000000, profile};
+      CounterNow() + CounterFrequency() * args->timeout_ms / 1000, profile};
   std::uint32_t count = 0;
   if (!worker) {
     if (!io.Build(&count)) Fail(c, Result::kInvalidRequest);
