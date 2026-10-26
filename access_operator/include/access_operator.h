@@ -65,6 +65,19 @@ struct AccessOperatorConfig {
   std::shared_ptr<PeerLink> peer_link;
 };
 
+struct BatchGetJettyProfile {
+  std::uint64_t requests{0};
+  std::uint64_t posts{0};
+  std::uint64_t first_doorbell_cycle{0};
+  std::uint64_t last_doorbell_cycle{0};
+  std::uint64_t first_completion_cycle{0};
+  std::uint64_t last_completion_cycle{0};
+  std::uint64_t completion_count{0};
+  std::uint32_t priority{0};
+  std::uint32_t jetty_id{0};
+  std::uint32_t eid_path{0};
+};
+
 struct BatchGetKernelProfile {
   std::uint64_t kernel_start_cycle{0};
   std::uint64_t setup_done_cycle{0};
@@ -83,6 +96,7 @@ struct BatchGetKernelProfile {
   std::uint64_t post_active_cycles{0};
   std::uint64_t drain_wait_cycles{0};
   std::uint64_t peak_submitted_not_drained{0};
+  std::array<BatchGetJettyProfile, 64> jettys{};
 };
 
 // Default synchronous NPU data-plane implementation.

@@ -41,8 +41,9 @@ runtime = kvaf.NpuRuntime(
 
 C++ 使用 `NpuRuntimeOptions` / `AccessOperatorConfig` 的同名字段。底层直接
 构造 `KvafExecuteBatchGetKernelArgs` 的调用方须显式填写该字段，零初始化表示基线。
-Kernel 参数仍为 112 字节，新增字段占用原尾部 padding；profile/queue 大小也保持
-不变，但字段语义已更新。Kernel 符号改为 `KvafExecuteBatchGetAivKernelV2`，旧
+Kernel 参数仍为 112 字节，预算字段占用原尾部 padding，queue 大小保持不变。
+新增每 Jetty 测量后，profile 为 5760 字节、每核 status 为 5824 字节。
+Kernel 符号为 `KvafExecuteBatchGetAivKernelV3`，旧
 Host/Kernel 混用会在加载符号时失败。必须整体重编 Host、Python binding 和 Kernel。
 预算按值 capture，改变预算需重建 Runtime/graph；`miss_count` 内容仍可动态更新。
 
@@ -61,17 +62,22 @@ tests/run_remote_cpu_batch_get_perf.sh "$PWD/build-npu" \
 
 Profile 增加 `submitted_group_count`、`completed_group_count`、`completion_count`、
 `post_active_cycles`、`drain_wait_cycles`、`peak_submitted_not_drained`。
-每 Jetty 的等待时间和 poll 次数也累计，poll 累计使用 64 位。
+每 Jetty 的 probe 活跃时间和 poll 次数也累计，poll 累计使用 64 位。
+Profiling 模式轮询全部在途 Jetty 和两组检查点，只有最老组全部完成后才回收额度；
+未开启 profiling 时仍逐 Jetty 阻塞等待。每 Jetty 的实际请求量、提交及观察完成
+时间通过新增统计表和独立 CSV 输出，详见
+[每 Jetty 测量说明](../access_operator/demo/aiv_batch_get/README.md#per-jetty-measurements-and-csv)。
 
-`kernel_post` 和 `kernel_completion_wait` 分别使用累计提交和累计 drain 时间。
+`kernel_post` 使用累计提交时间，`kernel_completion_wait` 包含组间 probe 和 drain 时间。
 `post_done_cycle` 仍表示最后一组提交结束时刻，不能再用它与 setup 的差值代表纯
 提交时间。各核峰值相加只是一种保守上界，并非同一时刻的全局硬件峰值。新增
 CQE、检查点和标量调度都有成本，性能改善需在 A5 上验证。
 
 ## 验证
 
-本地 CTest 增加 `kvaf_batch_get_schedule_test`、`kvaf_batch_get_kernel_model_test`
-和 `kvaf_batch_get_inflight_config_python`，无需 CANN。调度测试直接使用 Kernel 的
+本地 CTest 增加 `kvaf_batch_get_schedule_test`、`kvaf_batch_get_kernel_model_test`、
+`kvaf_batch_get_inflight_config_python` 和 `kvaf_batch_get_jetty_profile_python`，无需 CANN。
+调度测试直接使用 Kernel 的
 分组策略，检查独立推进的多核总预算、奇数预算、尾组、64 Jetty 轮转和边界计数；
 Kernel CPU 模型直接包含实际 `.asc` 源码，以同步 UB copy/SIMT 和延迟生成 CQE
 执行控制流，验证完整 payload、SQ/CQ owner 环回、索引持久化、尾组、多 Jetty

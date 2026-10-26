@@ -614,6 +614,12 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
           source.jetty_completion_wait_cycles[jetty];
       destination.jetty_completion_polls[jetty] =
           source.jetty_completion_polls[jetty];
+      const auto& measured = source.jettys[jetty];
+      destination.jettys[jetty] = {
+          measured.requests, measured.posts, measured.first_doorbell_cycle,
+          measured.last_doorbell_cycle, measured.first_completion_cycle,
+          measured.last_completion_cycle, measured.completion_count,
+          measured.priority, measured.jetty_id, measured.eid_path};
     }
     profiles->push_back(destination);
   }

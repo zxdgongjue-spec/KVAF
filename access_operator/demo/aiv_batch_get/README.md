@@ -107,7 +107,8 @@ temporarily disabled in this branch.
 
 The ACL launcher reserves 160 KiB of AIV local memory for the two WQE banks and
 SIMT validation scratch. Rebuild Host, Python binding and Kernel together: the
-launcher now requires the `KvafExecuteBatchGetAivKernelV2` symbol.
+launcher now requires the `KvafExecuteBatchGetAivKernelV3` symbol and the V3
+profiling status is larger. Old V2 kernel objects are rejected by the loader.
 
 ## Build and validate on A5
 
@@ -208,9 +209,76 @@ grep -E 'BATCH_GET_JETTY_PRIORITY|DIRECT_JETTY_READY' \
 ```
 
 These logs confirm the requested priority, not the hardware's effective SL.
-NPU priority-to-SL mapping must be verified for the actual NPU device. Compare
-overall throughput and latency; existing per-Jetty completion wait counters
-measure sequential polling time and are not independent transfer latencies.
+NPU priority-to-SL mapping must be verified for the actual NPU device.
+
+## Per-Jetty measurements and CSV
+
+`--kernel-profile` now collects each Jetty's actual READ count, post count,
+group-checkpoint completion count, first/last doorbell timestamp and
+first/last observed successful CQE timestamp. Priority, Jetty ID and EID path
+come from the created transport, not from re-reading the environment during
+reporting. There is one table row per configured `(core, jetty_slot)`, including
+unused Jettys.
+
+Profiling probes active Jettys once per round, rotating the starting slot.
+It probes between group submissions and while draining, including both
+pending groups in each Jetty's CQ order. A fast Jetty's younger checkpoint can
+be observed before another Jetty finishes the oldest group. Group credits are
+still released only after every participating Jetty completes. With profiling
+disabled, the existing blocking completion path remains in use.
+
+The original `jetty*_wait_ms_mean` counters now measure active CQ-probe time
+in profiling mode; they are not transmission latency. `kernel_completion_wait`
+includes the between-group probes and group drains. Compare priority settings
+using the same profiling mode: its polling and timestamp overhead affects the
+workload and differs from older profiling results.
+
+Your existing sweep command automatically prints `JETTY_PROFILE_TABLE` for
+each shape and writes CSVs into `KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR`:
+
+```bash
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:29000 \
+DEVICE_ID=7 \
+KVAF_BATCH_GET_JETTY_PRIORITIES=3,10,13,15 \
+tests/run_remote_cpu_batch_get_miss_count_perf.sh "$PWD/build-npu"
+```
+
+- `batch_get_miss_sweep_summary.csv`: existing overall summary, same columns.
+- `batch_get_jetty_summary.csv`: combined per-Jetty summary for all shapes.
+- `token_bytes_..._jettys_per_core_....jetty.csv`: per-shape Jetty summary,
+  beside the corresponding `.log`.
+
+Override the combined path with `KVAF_BATCH_GET_JETTY_SWEEP_CSV`. For the
+single-configuration runner, add `--kernel-profile --jetty-csv logs/jettys.csv`
+(or set `KVAF_BATCH_GET_JETTY_CSV` and enable profiling).
+
+Important per-Jetty CSV columns:
+
+| Column | Meaning |
+| --- | --- |
+| `core`, `jetty_slot`, `entity_index`, `jetty_id`, `eid_path`, `priority` | Actual local resource/configuration identity. |
+| `samples`, `active_samples`, `warmup_excluded` | Measured launch count, launches using this Jetty, and excluded warmup count. |
+| `requests_total`, `bytes_total`, `requests_mean`, `bytes_mean` | Actual volume, total over measured launches or mean per launch. |
+| `posts_mean`, `completions_mean` | Doorbells and signaled group checkpoints per launch; CQEs are not individual READs. |
+| `first_post_us_mean`, `last_post_us_mean` | Submission timestamps relative to this core's kernel start. |
+| `first_completion_seen_us_mean`, `last_completion_seen_us_mean` | Observed completion timestamps relative to this core's kernel start. |
+| `observed_window_us_mean/p50/p90/p99` | First doorbell to last observed completion, per active launch. |
+| `effective_GBps` | Total actual bytes divided by the sum of observed windows, using decimal GB/s. |
+| `probe_active_us_mean`, `polls_mean` | CQ probing cost per measured launch, for diagnostics. |
+
+Unused Jettys have zero volume and blank timing/throughput cells, rather than
+appearing infinitely fast. Timing statistics use active launches only; volume
+means use all measured launches. Zero-miss launches are supported. Full shape,
+token size, inflight budget and clock MHz accompany every row.
+
+These are software observation windows, not hardware transfer latencies or
+per-READ latency. Polling occurs between group submissions, not during WQE
+materialization, so a CQE ready during posting is observed later. The window
+also includes submission gaps and group-credit waits. Raw timestamp offsets
+use each core's own start; compare durations, not presumed synchronized core
+start times. Do not add per-Jetty effective rates to obtain overall bandwidth.
+Exchange priority assignments between slots and repeat with fixed device/EID,
+shape and budget to distinguish priority effects from workload/slot effects.
 
 ## Graph boundary
 

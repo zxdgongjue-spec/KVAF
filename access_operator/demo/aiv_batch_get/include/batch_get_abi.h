@@ -6,7 +6,7 @@
 // Shared host/AIV ABI for the graph-safe ExecuteBatchGet kernel.  These
 // records are copied verbatim between host code, HBM and the AIV kernel.
 enum {
-  KVAF_AIV_BATCH_GET_STATUS_BYTES = 1216,
+  KVAF_AIV_BATCH_GET_STATUS_BYTES = 5824,
   KVAF_AIV_BATCH_GET_QUEUE_STATE_BYTES = 64,
   KVAF_AIV_BATCH_GET_MAX_AIV_CORES = 48,
   KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE = 64,
@@ -16,7 +16,23 @@ enum {
 
 static const uint64_t KVAF_AIV_BATCH_GET_STATUS_MAGIC = 0x4b5641464247444fULL;
 static const uint64_t KVAF_AIV_BATCH_GET_PROFILE_MAGIC =
-    0x4b56414650524f46ULL;  // "KVAFPROF"
+    0x4b56414650523033ULL;  // "KVAFPR03"
+
+// Software observation timestamps, not hardware packet/CQE timestamps.
+// One completion is a signaled group checkpoint, not one READ request.
+typedef struct KvafBatchGetJettyProfile {
+  uint64_t requests;
+  uint64_t posts;
+  uint64_t first_doorbell_cycle;
+  uint64_t last_doorbell_cycle;
+  uint64_t first_completion_cycle;
+  uint64_t last_completion_cycle;
+  uint64_t completion_count;
+  uint32_t priority;
+  uint32_t jetty_id;
+  uint32_t eid_path;
+  uint32_t reserved;
+} KvafBatchGetJettyProfile;
 
 // Optional, per-core kernel timeline. The host enables collection by placing
 // KVAF_AIV_BATCH_GET_PROFILE_MAGIC in `magic` before launch. The kernel keeps
@@ -36,14 +52,16 @@ typedef struct KvafBatchGetCoreProfile {
   uint64_t kernel_finish_cycle;
   uint64_t active_requests;
   uint64_t total_posts;
+  // Legacy field name; V3 profiling measures active nonblocking probe time.
   uint64_t jetty_completion_wait_cycles[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE];
   uint64_t jetty_completion_polls[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE];
   uint64_t submitted_group_count;
   uint64_t completed_group_count;
   uint64_t completion_count;  // CQEs consumed, not completed READs
   uint64_t post_active_cycles;  // sum of group submissions, excluding CQ waits
-  uint64_t drain_wait_cycles;   // sum of all group completion waits
+  uint64_t drain_wait_cycles;   // between-group probes plus group drains
   uint64_t peak_submitted_not_drained;  // conservative per-core software peak
+  KvafBatchGetJettyProfile jettys[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE];
 } KvafBatchGetCoreProfile;
 
 // ExecuteBatchGet uses only the first cache line on the normal path. The
@@ -101,8 +119,9 @@ typedef struct KvafBatchGetDirectUrmaEntity {
   uint32_t jfc_id;
   uint32_t cq_depth;
   uint32_t cqe_size;
-  uint32_t reserved0;
-  uint64_t reserved[7];
+  uint32_t priority;  // requested NPU priority; does not identify effective SL
+  uint64_t eid_path;
+  uint64_t reserved[6];
 } KvafBatchGetDirectUrmaEntity;
 
 // Fixed-shape graph ABI. `output` and `channel_entity` must identify the same
@@ -130,15 +149,17 @@ typedef struct KvafExecuteBatchGetKernelArgs {
   uint32_t jettys_per_core;
   // Total READ budget across this launch's cores. Zero selects the original
   // whole-batch path; otherwise must be >= 2 * block_count. Captured by value.
-  // Consumes former padding. Host and V2 kernel MUST be rebuilt together;
-  // the versioned kernel symbol prevents loading a pre-window kernel.
+  // Consumes former padding. Host and V3 kernel MUST be rebuilt together;
+  // the versioned kernel symbol also guards the expanded profiling status.
   uint32_t batch_get_max_inflight_total;
 } KvafExecuteBatchGetKernelArgs;
 
 #if defined(__cplusplus)
 static_assert(sizeof(KvafBatchGetCoreStatus) == KVAF_AIV_BATCH_GET_STATUS_BYTES,
               "KvafBatchGetCoreStatus ABI changed");
-static_assert(sizeof(KvafBatchGetCoreProfile) == 1152,
+static_assert(sizeof(KvafBatchGetJettyProfile) == 72,
+              "KvafBatchGetJettyProfile ABI changed");
+static_assert(sizeof(KvafBatchGetCoreProfile) == 5760,
               "KvafBatchGetCoreProfile ABI changed");
 static_assert(sizeof(KvafBatchGetQueueState) == KVAF_AIV_BATCH_GET_QUEUE_STATE_BYTES,
               "KvafBatchGetQueueState ABI changed");

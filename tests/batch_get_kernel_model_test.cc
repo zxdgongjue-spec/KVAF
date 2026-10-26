@@ -25,6 +25,9 @@ struct Queue {
   uint32_t sq_db = 0, cq_db = 0;
   uint64_t producer = 0, completed = 0, cq_producer = 0, cq_consumer = 0;
   std::deque<uint64_t> checkpoints;
+  std::deque<uint64_t> ready_cycles;
+  std::vector<uint64_t> observations;
+  uint64_t delay_cycles = 0, posts = 0;
   bool timeout = false, error = false;
 };
 std::vector<Queue> hardware;
@@ -41,6 +44,7 @@ void Doorbell(uint32_t value, uint32_t* address) {
     }
     if (address != &queue.sq_db) continue;
     ++doorbells;
+    ++queue.posts;
     const uint32_t added = value - queue.sq_db;
     CHECK(added > 0 && added <= 128);
     CHECK(queue.producer + added - queue.completed < 32768);
@@ -50,7 +54,10 @@ void Doorbell(uint32_t value, uint32_t* address) {
       CHECK((wqe[0] >> 31U) == 1U - ((pi / 32768) & 1U));
       const bool signal = (wqe[0] & (1U << 21U)) != 0;
       CHECK(((wqe[0] >> 16U) & 3U) == (signal ? 2U : 1U));
-      if (signal) queue.checkpoints.push_back(queue.producer);
+      if (signal) {
+        queue.checkpoints.push_back(queue.producer);
+        queue.ready_cycles.push_back(cycle + queue.delay_cycles);
+      }
     }
     queue.sq_db = value;
     return;
@@ -63,12 +70,14 @@ void Poll(void* address) {
   for (auto& queue : hardware) {
     const auto begin = reinterpret_cast<uintptr_t>(queue.cq.data());
     if (probe < begin || probe >= begin + sizeof(queue.cq)) continue;
-    // Deliver a checkpoint only when polled. This forces the initial two
-    // groups to coexist and leaves the younger group outstanding during refill.
+    // Completion readiness is independent of which Jetty the kernel polls.
+    // Publish a ready CQE when observed; this does not model DMA timing.
     if (queue.timeout || queue.checkpoints.empty() ||
-        queue.cq_consumer != queue.cq_producer) return;
+        queue.cq_consumer != queue.cq_producer || cycle < queue.ready_cycles.front()) return;
     const uint64_t end = queue.checkpoints.front();
     queue.checkpoints.pop_front();
+    queue.ready_cycles.pop_front();
+    queue.observations.push_back(cycle);
     while (queue.completed < end) {
       const uint32_t* wqe = queue.sq.data() + (queue.completed++ % 32768) * 16;
       const uint64_t source = wqe[10] | (uint64_t(wqe[11]) << 32U);
@@ -132,6 +141,9 @@ struct Fixture {
       entity.cq_db_va = reinterpret_cast<uint64_t>(&hardware.cq_db);
       entity.cq_depth = 8;
       entity.cqe_size = 64;
+      entity.priority = i % 16;
+      entity.jetty_id = 100 + i;
+      entity.eid_path = i % 3;
     }
     for (auto& status : statuses) status.profile.magic = KVAF_AIV_BATCH_GET_PROFILE_MAGIC;
     args.address_table = reinterpret_cast<uint64_t>(addresses.data());
@@ -159,10 +171,12 @@ struct Fixture {
     uint64_t cq_before = 0, cq_after = 0, profile_cq = 0;
     const bool profiling = statuses[0].profile.magic == KVAF_AIV_BATCH_GET_PROFILE_MAGIC;
     const auto before = queues;
+    std::vector<uint64_t> posts_before;
+    for (const auto& hardware : aiv_model::hardware) posts_before.push_back(hardware.posts);
     for (const auto& queue : queues) cq_before += queue.cq_consumer_index;
     for (uint32_t c = 0; c < cores; ++c) {
       aiv_model::core = c;
-      KvafExecuteBatchGetAivKernelV2(args);
+      KvafExecuteBatchGetAivKernelV3(args);
       CHECK(statuses[c].result == expected);
       if (expected || !profiling) continue;
       const auto& profile = statuses[c].profile;
@@ -190,6 +204,27 @@ struct Fixture {
       CHECK(hardware.cq_producer == hardware.cq_consumer);
       CHECK(queues[i].sq_producer_index == hardware.producer);
       CHECK(queues[i].cq_consumer_index == hardware.cq_consumer);
+      if (profiling) {
+        const auto& profile = statuses[i / jettys].profile;
+        const auto& measured = profile.jettys[i % jettys];
+        CHECK(measured.requests == hardware.producer - before[i].sq_producer_index);
+        CHECK(measured.posts == hardware.posts - posts_before[i]);
+        CHECK(measured.completion_count == hardware.cq_consumer - before[i].cq_consumer_index);
+        CHECK(measured.priority == entities[i].priority);
+        CHECK(measured.jetty_id == entities[i].jetty_id);
+        CHECK(measured.eid_path == entities[i].eid_path);
+        if (measured.requests == 0) {
+          CHECK(measured.first_doorbell_cycle == 0 && measured.last_doorbell_cycle == 0);
+          CHECK(measured.first_completion_cycle == 0 && measured.last_completion_cycle == 0);
+        } else {
+          CHECK(measured.first_doorbell_cycle >= profile.kernel_start_cycle);
+          CHECK(measured.first_doorbell_cycle <= measured.last_doorbell_cycle);
+          CHECK(measured.first_doorbell_cycle < measured.first_completion_cycle);
+          CHECK(measured.first_completion_cycle <= measured.last_completion_cycle);
+          CHECK(measured.last_doorbell_cycle < measured.last_completion_cycle);
+          CHECK(measured.last_completion_cycle <= profile.completion_done_cycle);
+        }
+      }
       CHECK(queues[i].completed_batch_count == before[i].completed_batch_count +
             (queues[i].sq_producer_index != before[i].sq_producer_index));
       cq_after += queues[i].cq_consumer_index;
@@ -240,14 +275,36 @@ int main() {
     q.cq_consumer_index = h.cq_producer = h.cq_consumer = (1ULL << 22) - 1;
     f.Run(8193);  // hardware doorbell counters wrap; software indices do not
   }
-  for (bool timeout : {false, true}) {
+  {
+    Fixture f(1024, 1, 2, 512);
+    aiv_model::hardware[0].delay_cycles = 300;
+    aiv_model::hardware[1].delay_cycles = 5;
+    f.Run(1024);
+    const auto& slow = aiv_model::hardware[0].observations;
+    const auto& fast = aiv_model::hardware[1].observations;
+    CHECK(slow.size() == 4 && fast.size() == 4);
+    CHECK(fast[1] < slow[0]); // younger group's fast CQE is not hidden by slow oldest group
+    CHECK(f.statuses[0].profile.jettys[1].first_completion_cycle <
+          f.statuses[0].profile.jettys[0].first_completion_cycle);
+  }
+  {
+    Fixture f(1024, 1, 2, 512);
+    aiv_model::hardware[1].delay_cycles = 300;
+    f.Run(1024);
+    CHECK(f.statuses[0].profile.jettys[0].first_completion_cycle <
+          f.statuses[0].profile.jettys[1].first_completion_cycle);
+  }
+  for (bool profiling : {false, true}) for (bool timeout : {false, true}) {
     Fixture f(8193, 1, 2, 2048);
+    if (!profiling) f.statuses[0].profile.magic = 0;
     aiv_model::hardware[1].timeout = timeout;
     aiv_model::hardware[1].error = !timeout;
     f.Run(8193, timeout ? kCqTimeout : kCqError);
     CHECK(f.queues[0].poisoned && f.queues[1].poisoned);
-    CHECK(f.statuses[0].profile.submitted_group_count == 2);
-    CHECK(f.statuses[0].profile.completed_group_count == 0);
+    if (profiling) {
+      CHECK(f.statuses[0].profile.submitted_group_count == (timeout ? 2U : 1U));
+      CHECK(f.statuses[0].profile.completed_group_count == 0);
+    }
     const uint64_t before = aiv_model::doorbells;
     f.Run(8193, kInvalidQueue);
     CHECK(aiv_model::doorbells == before);

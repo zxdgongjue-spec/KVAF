@@ -23,6 +23,7 @@ environment variables:
     --kernel-profile       KVAF_BATCH_GET_PERF_KERNEL_PROFILE=1
     --kernel-profile-clock-mhz
                            KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ
+    --jetty-csv            KVAF_BATCH_GET_JETTY_CSV
     adaptive UB devices    KVAF_ADAPTIVE_UB_DEVICES
     adaptive miss count    KVAF_ADAPTIVE_UB_MISS_COUNT
 """
@@ -42,10 +43,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from backend import detect_torch_backend
 from dsa_keys import build_dsa_keys
 from npu_eids import parse_npu_eids
+import batch_get_jetty_profile as jetty_profile
 
 
 DEFAULT_REQUEST_LENGTH = 32_768
-DEFAULT_TABLE_CAPACITY = 16_384 * 78
+DEFAULT_TABLE_CAPACITY = 16_384
 DEFAULT_TOKENS_PER_BLOCK = 128
 DEFAULT_TOKEN_BYTES = 656
 DEFAULT_AIV_CORES = 2
@@ -264,6 +266,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
         help="AIV clock used to convert profile cycles to milliseconds",
     )
+    parser.add_argument(
+        "--jetty-csv", default=os.environ.get("KVAF_BATCH_GET_JETTY_CSV", ""),
+        help="write per-Jetty summary CSV (requires --kernel-profile)",
+    )
     parser.set_defaults(
         adaptive_peer_ub_devices=configured_adaptive_ub_devices(),
         kernel_profile=environment_bool("KVAF_BATCH_GET_PERF_KERNEL_PROFILE"),
@@ -334,6 +340,8 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "populate-chunk-entries must be positive"
     if args.kernel_profile_clock_mhz <= 0:
         return "kernel-profile-clock-mhz must be positive"
+    if args.jetty_csv and not args.kernel_profile:
+        return "jetty-csv requires kernel-profile"
     return None
 
 
@@ -539,7 +547,8 @@ def print_kernel_profile(
         "setup=entity_queue_and_miss_count compact=removed_direct_prefix "
         "post=sum_group_capacity_check_wqe_fill_sq_copy_and_doorbell "
         "transfer_window=first_doorbell_to_all_cq_complete "
-        "completion_wait=sum_all_group_drains "
+        "completion_wait=round_robin_cq_probes_and_drains "
+        "jetty_wait=probe_active_time "
         "peak_submitted_not_drained=per_core_conservative_software_count "
         "profile_overhead_included=1 d2h_outside_host_metric=1"
     )
@@ -962,6 +971,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 miss_count_value,
                 token_bytes,
             )
+            jetty_rows = jetty_profile.summarize(
+                kernel_profile_samples, clock_mhz=args.kernel_profile_clock_mhz,
+                npu_core_count=args.aiv_cores, jettys_per_core=args.jettys_per_core,
+                token_bytes=token_bytes, miss_count=miss_count_value,
+                request_length=request_length, max_inflight_total=args.max_inflight_total,
+                warmup=args.warmup,
+            )
+            jetty_profile.print_table(jetty_rows)
+            if args.jetty_csv:
+                jetty_profile.write_csv(args.jetty_csv, jetty_rows)
+                print(f"BATCH_GET_JETTY_CSV_WRITTEN path={args.jetty_csv} rows={len(jetty_rows)}")
             runtime.stop_batch_get_kernel_profile()
             kernel_profile_started = False
             print("BATCH_GET_KERNEL_PROFILE_DISABLED")

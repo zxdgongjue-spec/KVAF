@@ -403,6 +403,22 @@ class NpuPythonRuntime final {
       item["jetty_completion_wait_cycles"] =
           profile.jetty_completion_wait_cycles;
       item["jetty_completion_polls"] = profile.jetty_completion_polls;
+      py::list jettys;
+      for (const auto& measured : profile.jettys) {
+        py::dict jetty;
+        jetty["requests"] = measured.requests;
+        jetty["posts"] = measured.posts;
+        jetty["first_doorbell_cycle"] = measured.first_doorbell_cycle;
+        jetty["last_doorbell_cycle"] = measured.last_doorbell_cycle;
+        jetty["first_completion_cycle"] = measured.first_completion_cycle;
+        jetty["last_completion_cycle"] = measured.last_completion_cycle;
+        jetty["completion_count"] = measured.completion_count;
+        jetty["priority"] = measured.priority;
+        jetty["jetty_id"] = measured.jetty_id;
+        jetty["eid_path"] = measured.eid_path;
+        jettys.append(std::move(jetty));
+      }
+      item["jettys"] = std::move(jettys);
       result.append(std::move(item));
     }
     return result;

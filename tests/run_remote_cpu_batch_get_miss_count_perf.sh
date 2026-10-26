@@ -205,6 +205,7 @@ completion_wait_p50_us_values=()
 completion_wait_p90_us_values=()
 completion_wait_p99_us_values=()
 selected_ub_device_values=()
+jetty_csv_files=()
 
 for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
   echo "BATCH_GET_TOKEN_SWEEP_BEGIN token_bytes=$token_bytes"
@@ -215,12 +216,14 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
       for jettys_per_core in "${KVAF_BATCH_GET_JETTYS_PER_CORE[@]}"; do
         echo "BATCH_GET_CONFIG_SWEEP_BEGIN token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core"
         log_file="$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR/token_bytes_${token_bytes}_miss_count_${miss_count}_aiv_cores_${aiv_cores}_jettys_per_core_${jettys_per_core}.log"
+        jetty_csv_file="${log_file%.log}.jetty.csv"
         run_status=0
         if "$KVAF_BATCH_GET_PERF_RUNNER" "$KVAF_BUILD_DIR" \
           ${sweep_options[@]+"${sweep_options[@]}"} \
           --token-bytes "$token_bytes" --miss-count "$miss_count" \
           --aiv-cores "$aiv_cores" --jettys-per-core "$jettys_per_core" \
           --kernel-profile \
+          --jetty-csv "$jetty_csv_file" \
           --kernel-profile-clock-mhz "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" \
           2>&1 | tee "$log_file"; then
           :
@@ -231,6 +234,12 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
           echo "BATCH_GET_MISS_SWEEP_FAILED token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core status=$run_status" >&2
           exit "$run_status"
         fi
+        if [[ ! -s "$jetty_csv_file" ]] ||
+          ! grep -q '^BATCH_GET_JETTY_CSV_WRITTEN ' "$log_file"; then
+          echo "ERROR: missing fresh per-Jetty CSV: $jetty_csv_file" >&2
+          exit 1
+        fi
+        jetty_csv_files+=("$jetty_csv_file")
 
     total_profile_result="$(
       extract_profile_result "$log_file" batch_get_kernel_total
@@ -440,3 +449,7 @@ mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
   done
 } >"$KVAF_BATCH_GET_MISS_SWEEP_CSV"
 echo "BATCH_GET_MISS_SWEEP_CSV_WRITTEN path=$KVAF_BATCH_GET_MISS_SWEEP_CSV rows=${#mean_us_values[@]}"
+
+: "${KVAF_BATCH_GET_JETTY_SWEEP_CSV:=$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR/batch_get_jetty_summary.csv}"
+python3 "$KVAF_ROOT/tests/python/batch_get_jetty_profile.py" \
+  "$KVAF_BATCH_GET_JETTY_SWEEP_CSV" "${jetty_csv_files[@]}"

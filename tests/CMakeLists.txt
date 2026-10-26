@@ -16,6 +16,9 @@ add_test(NAME kvaf_batch_get_kernel_model_test COMMAND kvaf_batch_get_kernel_mod
 add_test(NAME kvaf_batch_get_inflight_config_python
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_inflight_config.py")
+add_test(NAME kvaf_batch_get_jetty_profile_python
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_jetty_profile.py")
 
 add_test(
   NAME kvaf_npu_eid_parser_python

@@ -575,6 +575,8 @@ int32_t CreateBatchGetTransport(void *host_ddr, uint64_t host_ddr_bytes,
       entity.sq_va = worker.device_user_ctl_jetty.info.ub.sq_buffer_va;
       entity.sq_db_va = worker.device_user_ctl_jetty.info.ub.db_addr;
       entity.jetty_id = worker.device_user_ctl_jetty.info.ub.id;
+      entity.priority = priorities[entity_index % priorities.size()];
+      entity.eid_path = path_index;
       // AIV indexes the USER_CTL SQ in 64-byte WQEBBs.  The HCCL AIV reference
       // exposes this context depth as sqDepth * WQE_NUM_PER_SQE, matching the
       // four-WQEBB storage allocation made in CreateJetty.
