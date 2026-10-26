@@ -60,3 +60,18 @@ else()
   message(STATUS
     "Skipping direct Runtime Python tests; configure with -DKVAF_BUILD_PYTHON=ON")
 endif()
+
+# Uses real UMDK headers and a fake provider; no UB device is needed to run it.
+if(KVAF_BUILD_REMOTE_CPU_SERVICE)
+  find_package(Threads REQUIRED)
+  add_executable(kvaf_shared_ddr_control_test shared_ddr_control_test.cc)
+  target_include_directories(kvaf_shared_ddr_control_test PRIVATE "${KVAF_URMA_INCLUDE_DIR}")
+  target_link_libraries(kvaf_shared_ddr_control_test PRIVATE
+    kvaf_runtime kvaf_peer_link ${CMAKE_DL_LIBS} Threads::Threads)
+  add_test(NAME kvaf_shared_ddr_control_test COMMAND kvaf_shared_ddr_control_test)
+  set_tests_properties(kvaf_shared_ddr_control_test PROPERTIES TIMEOUT 30)
+endif()
+
+add_test(NAME kvaf_shared_ddr_protocol_python
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/python/test_shared_ddr_protocol.py")

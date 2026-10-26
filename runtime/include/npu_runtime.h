@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "runtime.h"
+#include "peer_link.h"
 
 namespace kvaf {
 
@@ -59,6 +60,10 @@ class NpuRuntime final : public Runtime {
   NpuRuntime& operator=(const NpuRuntime&) = delete;
 
   Status Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size);
+  // Attach without reallocating memory or writing startup probe data. The
+  // caller must coordinate slot ownership and publication across runtimes.
+  Status InitializeShared(const peer::SharedRegionHandle& handle);
+  Status GetPeerRegion(peer::PeerRegion* region) const;
   RuntimeCore& core();
   const RuntimeCore& core() const;
 
@@ -82,6 +87,8 @@ class NpuRuntime final : public Runtime {
   RuntimeCapabilities capabilities() const override;
 
  private:
+  Status InitializeImpl(std::uint64_t ddr_bytes, std::uint64_t slot_size,
+                        const peer::SharedRegionHandle* shared);
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

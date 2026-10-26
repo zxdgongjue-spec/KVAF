@@ -11,7 +11,17 @@
 
 namespace kvaf::peer {
 
+// Control-plane identity, not a remote pointer or an authorization credential.
+struct SharedRegionHandle {
+  uint64_t server_instance_id = 0U;
+  uint64_t region_id = 0U;
+  uint64_t length = 0U;
+  uint64_t slot_size = 0U;
+  uint32_t candidate_id = 0U;
+};
+
 struct PeerRegion {
+  SharedRegionHandle handle{};
   uint64_t session_id = 0U;
   uint64_t base = 0U;
   uint64_t length = 0U;
@@ -43,6 +53,7 @@ class PeerLink {
   Status GetCandidateInfo(uint32_t candidate_id, PeerCandidateInfo* info) const;
   Status AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
                         uint32_t candidate_id, PeerRegion* region);
+  Status AttachRegion(const SharedRegionHandle& handle, PeerRegion* region);
   Status ReleaseRegion(uint64_t base);
   Status LookupRegion(uint64_t base, PeerRegion* region) const;
   Status CreateChannel(

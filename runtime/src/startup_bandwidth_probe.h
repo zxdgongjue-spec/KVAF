@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <numeric>
 #include <vector>
 
 #include "runtime.h"
@@ -20,6 +21,53 @@ class StartupBandwidthProbe {
   ~StartupBandwidthProbe() {
     if (stream_ != nullptr) (void)aclrtDestroyStream(stream_);
     for (void* buffer : buffers_) (void)aclrtFree(buffer);
+  }
+
+  // Validate an attached region without changing its payload or local metadata.
+  // Every request reads the same first token into an independent output row.
+  template <class ProfiledOperator>
+  Status RunReadOnly(RuntimeCore& core, ProfiledOperator& op) {
+    if (config_.token_bytes == 0U || config_.miss_count == 0U ||
+        core.remote_region().length < config_.token_bytes) {
+      return Status::InvalidArgument("shared region is too small for a read probe");
+    }
+    if (aclrtCreateStream(&stream_) != ACL_SUCCESS) {
+      return Status::Internal("shared read probe stream creation failed");
+    }
+    const Address base = core.remote_region().base;
+    const std::uint8_t valid = 1U;
+    const std::int32_t misses = static_cast<std::int32_t>(config_.miss_count);
+    std::vector<std::int32_t> zero(config_.miss_count, 0);
+    std::vector<std::int32_t> destinations(config_.miss_count);
+    std::iota(destinations.begin(), destinations.end(), 0);
+    BatchGetRequest get;
+    if (!Upload(&base, sizeof(base), &get.device_access_table.addresses) ||
+        !Upload(&valid, sizeof(valid), &get.device_access_table.valid) ||
+        !Upload(zero.data(), zero.size() * sizeof(zero[0]), &get.indices) ||
+        !Upload(zero.data(), zero.size() * sizeof(zero[0]), &get.offsets) ||
+        !Upload(destinations.data(), destinations.size() * sizeof(destinations[0]),
+                &get.output_indices) ||
+        !Upload(&misses, sizeof(misses), &get.miss_count)) return AllocationError();
+    const auto bytes = static_cast<std::size_t>(config_.token_bytes) * config_.miss_count;
+    void* output = Allocate(bytes);
+    if (output == nullptr) return AllocationError();
+    get.output = MutableBufferView{output, bytes, DeviceKind::kNpu};
+    get.output_block_bytes = config_.token_bytes;
+    get.tokens_per_block = config_.tokens_per_block;
+    Status status = op.SetBatchGetKernelProfiling(true);
+    if (!status.ok()) return status;
+    status = core.BatchGet(get, BatchGetExecutionOptions{stream_, true});
+    std::vector<BatchGetKernelProfile> profiles;
+    if (status.ok()) status = op.CopyBatchGetKernelProfiles(&profiles);
+    const Status disabled = op.SetBatchGetKernelProfiling(false);
+    if (!status.ok()) return status;
+    if (!disabled.ok()) return disabled;
+    std::uint64_t completed = 0U;
+    for (const auto& profile : profiles) completed += profile.active_requests;
+    if (completed != config_.miss_count) {
+      return Status::Internal("shared read probe did not complete all requests");
+    }
+    return Status::OK();
   }
 
   template <class ProfiledOperator>

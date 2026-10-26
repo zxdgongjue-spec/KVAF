@@ -64,7 +64,9 @@ CPU DDR region 支持两种页分配模式；未指定时默认使用 `thp`：
 
 默认自动枚举所有可用 UMDK UB device/EID；`--ub-device NAME` 和
 `--eid-index N` 仅用于诊断。CPU 端可同时保持多个 NPU session，NPU 正常
-`shutdown` 后会释放对应 DDR、segment、token 与 Jetty。
+`shutdown` 后会释放该会话的 Jetty；最后一个挂接会话退出时才释放对应 DDR、segment 和 token。
+可使用 `initialize_shared(region)` 显式挂接已有分配，操作步骤见
+[双卡共享 DDR 实验](../docs/shared_ddr_two_npu.md)。
 
 NPU 应用默认只配置 CPU 服务地址，不配置 EID 或 UDMA device：
 
@@ -101,7 +103,7 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 656B token、128 tokens-per-block、2 个 AIV core、每 core 2 个 Jetty、1 次预热和
 5 次采样所得 `useful_GiBps` 最高者为最佳设备。K 端指定单个 `--ub-device` 时走原生
 路径；后续正式 shape 均复用选择结果。完整校准日志写入 `ub_device_selection.log`，CSV
-的 `selected_ub_device` 列记录设备名。N/K 两端必须同时使用控制协议 v6。
+的 `selected_ub_device` 列记录设备名。N/K 两端必须同时使用控制协议 v7。
 
 ```bash
 KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 \

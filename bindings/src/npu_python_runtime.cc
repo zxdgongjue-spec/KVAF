@@ -247,6 +247,16 @@ class NpuPythonRuntime final {
     ThrowIfError(native_->Initialize(ddr_bytes, slot_size));
   }
 
+  void InitializeShared(const py::dict& descriptor) {
+    peer::SharedRegionHandle handle{};
+    handle.server_instance_id = descriptor["server_instance_id"].cast<std::uint64_t>();
+    handle.region_id = descriptor["region_id"].cast<std::uint64_t>();
+    handle.length = descriptor["length"].cast<std::uint64_t>();
+    handle.slot_size = descriptor["slot_size"].cast<std::uint64_t>();
+    handle.candidate_id = descriptor["candidate_id"].cast<std::uint32_t>();
+    ThrowIfError(native_->InitializeShared(handle));
+  }
+
   bool Initialized() const { return native_->initialized(); }
   std::uint32_t DeviceId() const { return native_->device_id(); }
   std::uint32_t NpuCoreCount() const { return native_->npu_core_count(); }
@@ -260,12 +270,18 @@ class NpuPythonRuntime final {
   }
 
   py::dict RemoteRegion() const {
+    peer::PeerRegion peer_region{};
+    ThrowIfError(native_->GetPeerRegion(&peer_region));
     const RemoteRegionDesc& region = native_->core().remote_region();
     py::dict result;
     result["base"] = region.base;
     result["length"] = region.length;
     result["slot_size"] = region.slot_size;
     result["device"] = "cpu";
+    result["server_instance_id"] = peer_region.handle.server_instance_id;
+    result["region_id"] = peer_region.handle.region_id;
+    result["candidate_id"] = peer_region.handle.candidate_id;
+    result["session_id"] = peer_region.session_id;
     return result;
   }
 
@@ -547,6 +563,10 @@ void BindNpuPythonRuntime(py::module_& module) {
            "Connect this NPU Runtime to a CPU Runtime service before initialize.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),
            py::arg("slot_size"))
+      .def("initialize_shared", &NpuPythonRuntime::InitializeShared,
+           py::arg("region"),
+           "Attach the descriptor returned by another Runtime's remote_region. "
+           "Does not write startup probes or share local Key metadata.")
       .def("shutdown", &NpuPythonRuntime::Shutdown)
       .def_property_readonly("initialized", &NpuPythonRuntime::Initialized)
       .def_property_readonly("device_id", &NpuPythonRuntime::DeviceId)

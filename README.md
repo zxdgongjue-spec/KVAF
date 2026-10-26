@@ -117,7 +117,9 @@ TCP 用于交换控制信息，初始化UB建链；KV 数据 通过 NPU AIV kern
 - `BatchGet`：使用 NPU Tensor 发起 AIV 读取；默认仅入队到调用方 stream；
 - `BatchFree`：释放 Key 对应的 slot。仍被 AccessTable 持有的 Key 会返回 busy。
 
-一个 `NpuRuntime` 当前连接一个 CPU 服务并使用一个远端 DDR region。异常退出后的
+一个 `NpuRuntime` 当前连接一个 CPU 服务并使用一个远端 DDR region。
+可通过 `initialize_shared(region)` 挂接另一张 NPU 已分配的 region；
+见 [双卡共享 DDR 实验](docs/shared_ddr_two_npu.md)。异常退出后的
 session 恢复、多个 peer 的选择和 CPU 侧数据面不属于当前范围。
 
 ## 环境要求
@@ -183,7 +185,7 @@ build-npu/bin/kvaf_execute_batch_put_kernels.o
 服务会自动发现 UB device/EID，并打印 `CANDIDATE_DISCOVERED` 与 `LISTEN`。也可按需要传入 `--ub-device NAME --eid-index N` 来选定对应的端口。
 N 端性能脚本开启 `--adaptive-ub-device` 后，K 端未指定设备时会从脚本配置的
 `KVAF_ADAPTIVE_UB_DEVICES` 中测速选优；K 端指定单个 `--ub-device` 时走原生路径。
-详见 [Runtime 启动选优](runtime/README.md#可选启动-ub-device-选优)；N/K 两端需同时升级至控制协议 v6。
+详见 [Runtime 启动选优](runtime/README.md#可选启动-ub-device-选优)；N/K 两端需同时升级至控制协议 v7。
 
 ### 2. 运行 NPU 端到端测试
 

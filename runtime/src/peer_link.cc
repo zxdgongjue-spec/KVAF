@@ -177,6 +177,35 @@ bool GetCandidateInfoAt(const std::string& endpoint, uint32_t candidate_id,
   return true;
 }
 
+bool DecodeRegion(const AllocateRegionResponse& response, Command command,
+                  uint64_t bytes, uint64_t slot_size, uint32_t candidate_id,
+                  PeerRegion* region, std::string* error) {
+  if (!IsValidResponseHeader(response.header, command, sizeof(response)) ||
+      !ResultOk(static_cast<Result>(response.result), error) || response.session_id == 0U ||
+      response.server_instance_id == 0U || response.region_id == 0U ||
+      response.peer_base == 0U || response.peer_length != bytes ||
+      response.slot_size != slot_size || response.candidate_id != candidate_id ||
+      response.token_id == 0U || response.token_value == 0U ||
+      response.segment_key_bytes == 0U || response.segment_key_bytes > kSegKeyBytes) {
+    if (error != nullptr && error->empty()) *error = "peer service returned an invalid region descriptor";
+    return false;
+  }
+  PeerRegion allocated{};
+  allocated.handle = SharedRegionHandle{response.server_instance_id, response.region_id,
+                                       response.peer_length, response.slot_size,
+                                       response.candidate_id};
+  allocated.session_id = response.session_id;
+  allocated.base = response.peer_base;
+  allocated.length = response.peer_length;
+  allocated.token_id = response.token_id;
+  allocated.token_value = response.token_value;
+  allocated.segment_key_bytes = response.segment_key_bytes;
+  std::memcpy(allocated.eid.data(), response.peer_eid, allocated.eid.size());
+  std::memcpy(allocated.segment_key.data(), response.segment_key, allocated.segment_key.size());
+  *region = allocated;
+  return true;
+}
+
 bool AllocateRegionAt(const std::string& endpoint, uint64_t ddr_bytes, uint64_t slot_size,
                       uint32_t candidate_id, PeerRegion* region, std::string* error) {
   if (region == nullptr || ddr_bytes == 0U || slot_size == 0U ||
@@ -190,25 +219,35 @@ bool AllocateRegionAt(const std::string& endpoint, uint64_t ddr_bytes, uint64_t 
   request.slot_size = slot_size;
   request.candidate_id = candidate_id;
   AllocateRegionResponse response{};
-  if (!Exchange(endpoint, request, &response, error) ||
-      !IsValidResponseHeader(response.header, Command::kAllocateRegion, sizeof(response)) ||
-      !ResultOk(static_cast<Result>(response.result), error) || response.session_id == 0U ||
-      response.peer_base == 0U || response.peer_length != ddr_bytes ||
-      response.token_id == 0U || response.token_value == 0U ||
-      response.segment_key_bytes == 0U || response.segment_key_bytes > kSegKeyBytes) {
-    if (error != nullptr && error->empty()) *error = "peer service returned an invalid region descriptor";
+  return Exchange(endpoint, request, &response, error) &&
+         DecodeRegion(response, Command::kAllocateRegion, ddr_bytes, slot_size,
+                      candidate_id, region, error);
+}
+
+bool AttachRegionAt(const std::string& endpoint, const SharedRegionHandle& handle,
+                    PeerRegion* region, std::string* error) {
+  if (handle.server_instance_id == 0U || handle.region_id == 0U ||
+      handle.length == 0U || handle.slot_size == 0U ||
+      handle.length % handle.slot_size != 0U) {
+    SetError(error, "invalid shared region handle");
     return false;
   }
-  PeerRegion allocated{};
-  allocated.session_id = response.session_id;
-  allocated.base = response.peer_base;
-  allocated.length = response.peer_length;
-  allocated.token_id = response.token_id;
-  allocated.token_value = response.token_value;
-  allocated.segment_key_bytes = response.segment_key_bytes;
-  std::memcpy(allocated.eid.data(), response.peer_eid, allocated.eid.size());
-  std::memcpy(allocated.segment_key.data(), response.segment_key, allocated.segment_key.size());
-  *region = allocated;
+  AttachRegionRequest request{};
+  request.header = MakeHeader(Command::kAttachRegion, sizeof(request));
+  request.server_instance_id = handle.server_instance_id;
+  request.region_id = handle.region_id;
+  request.ddr_bytes = handle.length;
+  request.slot_size = handle.slot_size;
+  request.candidate_id = handle.candidate_id;
+  AllocateRegionResponse response{};
+  if (!Exchange(endpoint, request, &response, error) ||
+      !DecodeRegion(response, Command::kAttachRegion, handle.length, handle.slot_size,
+                    handle.candidate_id, region, error)) return false;
+  if (response.server_instance_id != handle.server_instance_id ||
+      response.region_id != handle.region_id) {
+    SetError(error, "peer service attached a different region");
+    return false;
+  }
   return true;
 }
 
@@ -232,6 +271,7 @@ bool CreateChannelAt(const std::string& endpoint, const PeerRegion& region,
   CreateChannelRequest request{};
   request.header = MakeHeader(Command::kCreateChannel, sizeof(request));
   request.session_id = region.session_id;
+  request.server_instance_id = region.handle.server_instance_id;
   request.local_tp_handle = local_tp_handle;
   request.local_qp_key_bytes = local_qp_key_bytes;
   request.peer_token_value = peer_token_value;
@@ -258,6 +298,7 @@ bool ReleaseRegionAt(const std::string& endpoint, const PeerRegion& region, std:
   ReleaseRegionRequest request{};
   request.header = MakeHeader(Command::kReleaseRegion, sizeof(request));
   request.session_id = region.session_id;
+  request.server_instance_id = region.handle.server_instance_id;
   StatusResponse response{};
   if (!Exchange(endpoint, request, &response, error) ||
       !IsValidResponseHeader(response.header, Command::kReleaseRegion, sizeof(response)) ||
@@ -298,6 +339,24 @@ Status PeerLink::AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
   }
   regions_[allocated.base] = allocated;
   if (region != nullptr) *region = allocated;
+  return Status::OK();
+}
+
+Status PeerLink::AttachRegion(const SharedRegionHandle& handle, PeerRegion* region) {
+  // One Runtime owns one attachment per region; reject duplicate local imports.
+  for (const auto& entry : regions_) {
+    if (entry.second.handle.server_instance_id == handle.server_instance_id &&
+        entry.second.handle.region_id == handle.region_id) {
+      return Status::InvalidState("region is already attached to this PeerLink");
+    }
+  }
+  std::string error;
+  PeerRegion attached{};
+  if (!AttachRegionAt(address_, handle, &attached, &error)) {
+    return ToStatus("peer DDR attachment failed", std::move(error));
+  }
+  regions_[attached.base] = attached;
+  if (region != nullptr) *region = attached;
   return Status::OK();
 }
 

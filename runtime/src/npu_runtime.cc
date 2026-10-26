@@ -39,6 +39,10 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
       : link_(std::move(link)) {}
 
   void SetCandidate(std::uint32_t candidate_id) { candidate_id_ = candidate_id; }
+  void SetSharedRegion(const peer::SharedRegionHandle* handle) {
+    shared_ = handle == nullptr ? peer::SharedRegionHandle{} : *handle;
+  }
+  const peer::PeerRegion& allocated() const { return allocated_; }
   bool has_allocation() const { return allocated_.base != 0U; }
 
   Status Allocate(const RuntimeInitRequest& request, RemoteRegionDesc* region) override {
@@ -48,7 +52,9 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
       return Status::InvalidArgument("invalid peer DDR allocation request");
     }
     if (allocated_.base != 0U) return Status::InvalidState("peer DDR is already allocated");
-    Status status = link_->AllocateRegion(request.ddr_bytes, request.slot_size, candidate_id_, &allocated_);
+    Status status = shared_.region_id != 0U
+        ? link_->AttachRegion(shared_, &allocated_)
+        : link_->AllocateRegion(request.ddr_bytes, request.slot_size, candidate_id_, &allocated_);
     if (!status.ok()) return status;
     *region = RemoteRegionDesc{allocated_.base, allocated_.length, request.slot_size, DeviceKind::kCpu};
     return Status::OK();
@@ -67,6 +73,7 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
   std::shared_ptr<peer::PeerLink> link_;
   std::uint32_t candidate_id_{0U};
   peer::PeerRegion allocated_{};
+  peer::SharedRegionHandle shared_{};
 };
 
 using AclrtGetPhyDevIdByLogicDevId = int (*)(int32_t, int32_t*);
@@ -514,6 +521,28 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
 }
 
 Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
+  return InitializeImpl(ddr_bytes, slot_size, nullptr);
+}
+
+Status NpuRuntime::InitializeShared(const peer::SharedRegionHandle& handle) {
+  if (handle.server_instance_id == 0U || handle.region_id == 0U) {
+    return Status::InvalidArgument("shared region identity must be nonzero");
+  }
+  if (impl_->options.adaptive_ub_device) {
+    return Status::InvalidArgument("shared attachment cannot use adaptive UB selection");
+  }
+  return InitializeImpl(handle.length, handle.slot_size, &handle);
+}
+
+Status NpuRuntime::GetPeerRegion(peer::PeerRegion* region) const {
+  if (region == nullptr) return Status::InvalidArgument("region output must not be null");
+  if (!initialized()) return Status::NotInitialized("NpuRuntime has not been initialized");
+  *region = impl_->peer_allocator->allocated();
+  return Status::OK();
+}
+
+Status NpuRuntime::InitializeImpl(std::uint64_t ddr_bytes, std::uint64_t slot_size,
+                                  const peer::SharedRegionHandle* shared) {
   const RuntimeInitRequest request{ddr_bytes, slot_size, DeviceKind::kCpu};
   if (initialized()) return Status::InvalidState("NpuRuntime has already been initialized");
   if (impl_->peer_link == nullptr || impl_->peer_allocator == nullptr) {
@@ -523,6 +552,8 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
     return Status::InvalidArgument("DDR size must be a nonzero multiple of slot_size");
   }
 
+  impl_->peer_allocator->SetSharedRegion(shared);
+
   std::uint32_t candidate_count = 0U;
   std::uint32_t device_count = 0U;
   bool device_filter_applied = false;
@@ -531,6 +562,9 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   if (!last.ok()) return last;
   if (candidate_count == 0U) {
     return Status::NotFound("peer Runtime returned no UMDK/EID candidates");
+  }
+  if (shared != nullptr && shared->candidate_id >= candidate_count) {
+    return Status::InvalidArgument("shared region CPU candidate is not advertised");
   }
   std::vector<NpuLocalEidCandidate> npu_candidates;
   std::string discovery_error;
@@ -601,6 +635,10 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                               impl_->options.peer_ub_device);
     }
   }
+  if (shared != nullptr && fixed_peer_device &&
+      !peer_candidate_allowed[shared->candidate_id]) {
+    return Status::InvalidArgument("shared region conflicts with peer_ub_device filter");
+  }
   auto initialize_candidate = [&](const detail::StartupCandidate& candidate,
                                   bool measure, double* cycles) -> Status {
     const std::uint32_t peer_candidate = candidate.peer;
@@ -630,7 +668,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       impl_->config.peer_local_eid = impl_->config.peer_local_eids.front();
       impl_->CreateCore();
       last = impl_->runtime_core->Initialize(candidate_request);
-      if (last.ok()) {
+      if (last.ok() && shared == nullptr) {
         const std::uint64_t probe_bytes =
             std::min<std::uint64_t>(slot_size, kBatchPutProbeBytesPerRow);
         const std::uint64_t probe_rows = BatchPutStartupProbeRows(
@@ -673,6 +711,20 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
         if (stream != nullptr && aclrtDestroyStream(stream) != ACL_SUCCESS && last.ok()) {
           last = Internal("failed to destroy peer candidate probe stream");
         }
+      }
+      if (last.ok() && shared != nullptr) {
+        // One 128-request group per worker exercises the imported READ paths.
+        // Keep the output alive until the transport releases its registration.
+        const detail::StartupProbeConfig read_config{
+            impl_->options.batch_get_token_bytes,
+            impl_->options.batch_get_tokens_per_block,
+            impl_->options.npu_core_count * impl_->options.jettys_per_core * 128U};
+        impl_->bandwidth_probe = std::make_unique<detail::StartupBandwidthProbe>(read_config);
+        last = impl_->bandwidth_probe->RunReadOnly(*impl_->runtime_core, *impl_->access_operator);
+        std::fprintf(stderr,
+                     "[KVAF_AIV] SHARED_READ_PROBE device_id=%u region=%llu candidate=%u result=%s\n",
+                     impl_->options.device_id, static_cast<unsigned long long>(shared->region_id),
+                     peer_candidate, last.ok() ? "ok" : last.message().c_str());
       }
       if (last.ok() && measure) {
         impl_->bandwidth_probe =
@@ -725,6 +777,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   if (!tune_candidates) {
     for (std::uint32_t peer_candidate = 0U; peer_candidate < candidate_count;
          ++peer_candidate) {
+      if (shared != nullptr && peer_candidate != shared->candidate_id) continue;
       if (fixed_peer_device && !peer_candidate_allowed[peer_candidate]) continue;
       for (std::size_t npu_group = 0U; npu_group < npu_group_count; ++npu_group) {
         last = initialize_candidate(

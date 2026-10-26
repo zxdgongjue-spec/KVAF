@@ -10,9 +10,9 @@
 namespace kvaf::peer {
 
 constexpr uint32_t kProtocolMagic = 0x4b564350U;  // "KVCP"
-// Version 6 exposes candidate metadata before allocation so adaptive startup
-// can group EIDs by K-side UB device and benchmark each device only once.
-constexpr uint16_t kProtocolVersion = 6U;
+// Version 7 separates a registered region from its per-NPU sessions and adds
+// explicit attachment. Both endpoints must use the same protocol version.
+constexpr uint16_t kProtocolVersion = 7U;
 constexpr uint32_t kQpKeyBytes = 64U;
 constexpr uint32_t kSegKeyBytes = 64U;
 constexpr uint32_t kEidBytes = 16U;
@@ -24,6 +24,7 @@ enum class Command : uint16_t {
   kReleaseRegion = 3U,
   kGetCandidateCount = 4U,
   kGetCandidateInfo = 5U,
+  kAttachRegion = 6U,
 };
 
 enum class Result : int32_t {
@@ -81,6 +82,10 @@ struct AllocateRegionResponse {
   int32_t result;
   uint32_t segment_key_bytes;
   uint64_t session_id;
+  uint64_t server_instance_id;
+  uint64_t region_id;
+  uint64_t slot_size;
+  uint32_t candidate_id;
   uint64_t peer_base;
   uint64_t peer_length;
   uint32_t token_id;
@@ -89,9 +94,19 @@ struct AllocateRegionResponse {
   uint8_t segment_key[kSegKeyBytes];
 };
 
+struct AttachRegionRequest {
+  MessageHeader header;
+  uint64_t server_instance_id;
+  uint64_t region_id;
+  uint64_t ddr_bytes;
+  uint64_t slot_size;
+  uint32_t candidate_id;
+};
+
 struct CreateChannelRequest {
   MessageHeader header;
   uint64_t session_id;
+  uint64_t server_instance_id;
   uint64_t local_tp_handle;
   uint32_t local_qp_key_bytes;
   uint32_t peer_token_value;
@@ -114,6 +129,7 @@ struct CreateChannelResponse {
 struct ReleaseRegionRequest {
   MessageHeader header;
   uint64_t session_id;
+  uint64_t server_instance_id;
 };
 
 struct StatusResponse {
@@ -125,12 +141,15 @@ struct StatusResponse {
 
 static_assert(sizeof(MessageHeader) == 12U, "wire header ABI changed");
 static_assert(sizeof(AllocateRegionRequest) == 36U, "allocate request ABI changed");
+static_assert(sizeof(AttachRegionRequest) == 48U, "attach request ABI changed");
+static_assert(sizeof(AllocateRegionResponse) == 160U, "region response ABI changed");
 static_assert(sizeof(CandidateCountRequest) == 12U, "candidate count request ABI changed");
 static_assert(sizeof(CandidateCountResponse) == 28U, "candidate count response ABI changed");
 static_assert(sizeof(CandidateInfoRequest) == 16U, "candidate info request ABI changed");
 static_assert(sizeof(CandidateInfoResponse) == 92U, "candidate info response ABI changed");
-static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed");
+static_assert(sizeof(CreateChannelRequest) == 132U, "channel request ABI changed");
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");
+static_assert(sizeof(ReleaseRegionRequest) == 28U, "release request ABI changed");
 
 inline constexpr uint16_t ResponseCommand(Command command) {
   return static_cast<uint16_t>(command) | 0x8000U;

@@ -17,6 +17,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -29,6 +30,7 @@ namespace {
 
 using kvaf::peer::AllocateRegionRequest;
 using kvaf::peer::AllocateRegionResponse;
+using kvaf::peer::AttachRegionRequest;
 using kvaf::peer::CandidateCountRequest;
 using kvaf::peer::CandidateCountResponse;
 using kvaf::peer::CandidateInfoRequest;
@@ -469,10 +471,11 @@ struct Region {
   UrmaResources* resources = nullptr;
   void* memory = nullptr;
   uint64_t bytes = 0U;
+  uint64_t slot_size = 0U;
   urma_token_id_t* token_id = nullptr;
   urma_target_seg_t* segment = nullptr;
   uint32_t token_value = 0U;
-  std::vector<Channel> channels;
+  std::unordered_map<uint64_t, std::vector<Channel>> sessions;
 };
 
 class CpuService {
@@ -480,7 +483,13 @@ class CpuService {
   CpuService(UrmaResourcePool* resource_pool, CpuMemoryPageMode memory_page_mode,
              bool device_filter_applied)
       : resource_pool_(resource_pool), memory_page_mode_(memory_page_mode),
-        device_filter_applied_(device_filter_applied) {}
+        device_filter_applied_(device_filter_applied) {
+    // A fresh service instance invalidates handles from a previous process.
+    std::random_device random;
+    do {
+      server_instance_id_ = (static_cast<uint64_t>(random()) << 32U) ^ random();
+    } while (server_instance_id_ == 0U);
+  }
   ~CpuService() { ReleaseAll(); }
 
   uint32_t CandidateCount() const {
@@ -528,6 +537,7 @@ class CpuService {
     region->candidate_id = candidate_id;
     region->resources = resources;
     region->bytes = bytes;
+    region->slot_size = slot_size;
     if (!AllocateMemory(region.get())) {
       return Result::kResourceError;
     }
@@ -565,16 +575,7 @@ class CpuService {
     }
     const uint64_t id = next_region_id_++;
     region->id = id;
-    response->session_id = id;
-    response->peer_base = region->segment->seg.ubva.va;
-    response->peer_length = bytes;
-    // HCCP's UB resource-service forwards the public UMDK token object value
-    // (rather than transforming it through its private TokenId wrapper).
-    response->token_id = region->token_id->token_id;
-    response->token_value = region->token_value;
-    response->segment_key_bytes = kSegBytes;
-    std::memcpy(response->peer_eid, region->segment->seg.ubva.eid.raw, kEidBytes);
-    std::memcpy(response->segment_key, &region->segment->seg, kSegBytes);
+    Describe(*region, response);
     if (response->peer_base == 0U || response->token_id == 0U) {
       Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=region_descriptor base=0x%" PRIx64
           " token_id=0x%x\n",
@@ -582,11 +583,38 @@ class CpuService {
       ReleaseRegion(region.get());
       return Result::kResourceError;
     }
+    const uint64_t session_id = next_session_id_++;
+    response->session_id = session_id;
+    region->sessions.emplace(session_id, std::vector<Channel>{});
+    session_regions_.emplace(session_id, id);
     regions_.emplace(id, std::move(region));
     Log("[KVAF_CPU] REGION_ALLOCATED session=%" PRIu64 " candidate=%u ub_device=%s eid_index=%u "
         "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x reg_flags=0x%x page_mode=%s\n",
-        id, candidate_id, resources->device_name().c_str(), resources->eid_index(), bytes,
+        response->session_id, candidate_id, resources->device_name().c_str(), resources->eid_index(), bytes,
         response->peer_base, response->token_id, flag.value, MemoryPageModeName());
+    Log("[KVAF_CPU] REGION_CREATED instance=%" PRIu64 " region=%" PRIu64
+        " session=%" PRIu64 " references=1\n", server_instance_id_, id, response->session_id);
+    return Result::kOk;
+  }
+
+  Result Attach(const AttachRegionRequest& request, AllocateRegionResponse* response) {
+    if (response == nullptr) return Result::kInvalidRequest;
+    if (request.server_instance_id != server_instance_id_) return Result::kNotFound;
+    // Wire records are packed: copy IDs before passing references to STL.
+    const uint64_t region_id = request.region_id;
+    const auto found = regions_.find(region_id);
+    if (found == regions_.end()) return Result::kNotFound;
+    Region& region = *found->second;
+    if (request.ddr_bytes != region.bytes || request.slot_size != region.slot_size ||
+        request.candidate_id != region.candidate_id) return Result::kInvalidRequest;
+    Describe(region, response);
+    const uint64_t session_id = next_session_id_++;
+    response->session_id = session_id;
+    region.sessions.emplace(session_id, std::vector<Channel>{});
+    session_regions_.emplace(session_id, region.id);
+    Log("[KVAF_CPU] REGION_ATTACHED region=%" PRIu64 " session=%" PRIu64
+        " base=0x%" PRIx64 " references=%zu\n", region.id, response->session_id,
+        response->peer_base, region.sessions.size());
     return Result::kOk;
   }
 
@@ -601,13 +629,17 @@ class CpuService {
           static_cast<unsigned long long>(request.local_tp_handle), request.local_psn);
       return Result::kInvalidRequest;
     }
-    const auto found = regions_.find(request.session_id);
+    if (request.server_instance_id != server_instance_id_) return Result::kNotFound;
+    const uint64_t session_id = request.session_id;
+    const auto session = session_regions_.find(session_id);
+    if (session == session_regions_.end()) return Result::kNotFound;
+    const auto found = regions_.find(session->second);
     if (found == regions_.end()) {
       return Result::kNotFound;
     }
     Region& region = *found->second;
     Log("[KVAF_CPU] CHANNEL_REQUEST session=%" PRIu64 " key_bytes=%u token=0x%x npu_tp=0x%llx npu_psn=0x%x npu_eid=",
-        region.id, request.local_qp_key_bytes, request.peer_token_value,
+        request.session_id, request.local_qp_key_bytes, request.peer_token_value,
         static_cast<unsigned long long>(request.local_tp_handle), request.local_psn);
     for (uint8_t byte : request.local_eid) {
       std::fprintf(stderr, "%02x", byte);
@@ -631,13 +663,13 @@ class CpuService {
     response->peer_qp_key_bytes = kJettyKeyBytes;
     response->peer_tp_handle = cpu_tp_handle;
     response->peer_psn = cpu_psn;
-    region.channels.push_back(channel);
+    region.sessions.at(session_id).push_back(channel);
     Log("[KVAF_CPU] CHANNEL_JFC_READY session=%" PRIu64 " jfc_id=%u depth=%u\n",
-        region.id, channel.local_jfc->jfc_id.id, kHostJfcDepth);
+        request.session_id, channel.local_jfc->jfc_id.id, kHostJfcDepth);
     Log("[KVAF_CPU] CHANNEL_CREATED session=%" PRIu64 " local_jetty=%u remote_jetty=%u cpu_tp=0x%llx "
         "cpu_psn=0x%x jfs_depth=%u jfr_depth=%u priority=%u rnr_retry=%u "
         "err_timeout=%u error_suspend=1\n",
-        region.id, channel.local_jetty->jetty_id.id, channel.remote_jetty->id.id,
+        request.session_id, channel.local_jetty->jetty_id.id, channel.remote_jetty->id.id,
         static_cast<unsigned long long>(cpu_tp_handle), cpu_psn, kHostJfsDepth,
         kHostJfrDepth, static_cast<unsigned int>(kHostJettyPriority),
         static_cast<unsigned int>(kHostJettyRnrRetry),
@@ -645,19 +677,43 @@ class CpuService {
     return Result::kOk;
   }
 
-  Result Release(uint64_t id) {
-    const auto found = regions_.find(id);
-    if (found == regions_.end()) {
-      return Result::kNotFound;
+  Result ReleaseLocal(uint64_t session_id) { return Release(session_id, server_instance_id_); }
+
+  Result Release(uint64_t session_id, uint64_t instance_id) {
+    if (instance_id != server_instance_id_) return Result::kNotFound;
+    const auto session = session_regions_.find(session_id);
+    if (session == session_regions_.end()) return Result::kNotFound;
+    const auto found = regions_.find(session->second);
+    Region& region = *found->second;
+    auto& channels = region.sessions.at(session_id);
+    for (auto it = channels.rbegin(); it != channels.rend(); ++it) ReleaseChannel(&*it);
+    region.sessions.erase(session_id);
+    session_regions_.erase(session);
+    Log("[KVAF_CPU] REGION_DETACHED region=%" PRIu64 " session=%" PRIu64
+        " references=%zu\n", region.id, session_id, region.sessions.size());
+    if (region.sessions.empty()) {
+      Log("[KVAF_CPU] REGION_RELEASE region=%" PRIu64 "\n", region.id);
+      ReleaseRegion(&region);
+      regions_.erase(found);
     }
-    Log("[KVAF_CPU] REGION_RELEASE session=%" PRIu64 " channels=%zu\n", id,
-        found->second->channels.size());
-    ReleaseRegion(found->second.get());
-    regions_.erase(found);
     return Result::kOk;
   }
 
  private:
+  void Describe(const Region& region, AllocateRegionResponse* response) const {
+    response->server_instance_id = server_instance_id_;
+    response->region_id = region.id;
+    response->slot_size = region.slot_size;
+    response->candidate_id = region.candidate_id;
+    response->peer_base = region.segment->seg.ubva.va;
+    response->peer_length = region.bytes;
+    response->token_id = region.token_id->token_id;
+    response->token_value = region.token_value;
+    response->segment_key_bytes = kSegBytes;
+    std::memcpy(response->peer_eid, region.segment->seg.ubva.eid.raw, kEidBytes);
+    std::memcpy(response->segment_key, &region.segment->seg, kSegBytes);
+  }
+
   const char* MemoryPageModeName() const {
     switch (memory_page_mode_) {
       case CpuMemoryPageMode::kDefault:
@@ -794,10 +850,12 @@ class CpuService {
     if (region == nullptr) {
       return;
     }
-    for (auto iterator = region->channels.rbegin(); iterator != region->channels.rend(); ++iterator) {
-      ReleaseChannel(&*iterator);
+    for (auto& session : region->sessions) {
+      for (auto it = session.second.rbegin(); it != session.second.rend(); ++it) {
+        ReleaseChannel(&*it);
+      }
     }
-    region->channels.clear();
+    region->sessions.clear();
     if (region->segment != nullptr) {
       (void)urma_unregister_seg(region->segment);
       region->segment = nullptr;
@@ -817,12 +875,16 @@ class CpuService {
       ReleaseRegion(entry.second.get());
     }
     regions_.clear();
+    session_regions_.clear();
   }
 
   UrmaResourcePool* resource_pool_ = nullptr;
   CpuMemoryPageMode memory_page_mode_{CpuMemoryPageMode::kTransparentHugePage};
   bool device_filter_applied_{false};
+  uint64_t server_instance_id_ = 0U;
   uint64_t next_region_id_ = 1U;
+  uint64_t next_session_id_ = 1U;
+  std::unordered_map<uint64_t, uint64_t> session_regions_;
   uint32_t next_token_ = 1U;
   uint32_t next_psn_ = 1U;
   std::unordered_map<uint64_t, std::unique_ptr<Region>> regions_;
@@ -858,6 +920,21 @@ void HandleClient(int fd, CpuService* service) {
       response.header.command = ResponseCommand(command);
       response.result = static_cast<int32_t>(
           service->Allocate(request.ddr_bytes, request.slot_size, request.candidate_id, &response));
+      (void)WriteAll(fd, &response, sizeof(response));
+      return;
+    }
+    case Command::kAttachRegion: {
+      AttachRegionRequest request{};
+      request.header = header;
+      AllocateRegionResponse response{};
+      response.header = MakeHeader(command, sizeof(response));
+      response.header.command = ResponseCommand(command);
+      response.result = static_cast<int32_t>(Result::kInvalidRequest);
+      if (IsValidHeader(header, command, sizeof(request)) &&
+          ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header),
+                  sizeof(request) - sizeof(header))) {
+        response.result = static_cast<int32_t>(service->Attach(request, &response));
+      }
       (void)WriteAll(fd, &response, sizeof(response));
       return;
     }
@@ -923,7 +1000,7 @@ void HandleClient(int fd, CpuService* service) {
         SendStatus(fd, command, Result::kInvalidRequest);
         return;
       }
-      SendStatus(fd, command, service->Release(request.session_id));
+      SendStatus(fd, command, service->Release(request.session_id, request.server_instance_id));
       return;
     }
   }
@@ -967,7 +1044,7 @@ Status CpuRuntime::AcceptLink(const LinkTarget&) {
 
 Status CpuRuntime::ReleaseLink(LinkId link_id) {
   if (!initialized()) return Status::NotInitialized("CpuRuntime has not been initialized");
-  const Result result = impl_->service->Release(link_id);
+  const Result result = impl_->service->ReleaseLocal(link_id);
   if (result == Result::kOk) return Status::OK();
   if (result == Result::kNotFound) return Status::NotFound("CpuRuntime Link was not found");
   return Status::Internal("CpuRuntime failed to release Link");
