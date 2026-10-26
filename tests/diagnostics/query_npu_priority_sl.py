@@ -36,6 +36,10 @@ def main():
     libraries = sorted({p.resolve() for p in build.rglob("libkvaf_direct_hccp_session.so")})
     if len(libraries) != 1:
         parser.error("Expected one built libkvaf_direct_hccp_session.so; run ./build.sh npu first")
+    peer_library = build / "runtime/libkvaf_peer_link.a"
+    if not peer_library.is_file():
+        parser.error(f"Missing {peer_library}; build it with: "
+                     f"cmake --build {shlex.quote(str(build))} --target kvaf_peer_link")
     if args.hccp_include:
         header = args.hccp_include.resolve() / "hccp_ctx.h"
     else:
@@ -48,6 +52,7 @@ def main():
         parser.error(f"Header does not exist: {header}")
     print(f"HCCP_HEADER={header}", file=sys.stderr)
     print(f"KVAF_LIBRARY={libraries[0]}", file=sys.stderr)
+    print(f"KVAF_PEER_LIBRARY={peer_library}", file=sys.stderr)
     output = build / "diagnostics/query_npu_priority_sl"
     output.parent.mkdir(parents=True, exist_ok=True)
     lib_dirs = [libraries[0].parent, cann / "lib64"]
@@ -59,7 +64,10 @@ def main():
     ]
     for directory in lib_dirs:
         command += ["-L" + str(directory), "-Wl,-rpath," + str(directory)]
-    command += ["-lkvaf_direct_hccp_session", "-lascendcl", "-ldl", "-pthread"]
+    # The transport DSO references PeerLink. Normal AIV targets also link
+    # kvaf_peer_link; this standalone executable must supply it explicitly.
+    # Keep the archive after the DSO so the ELF linker can resolve its symbols.
+    command += ["-lkvaf_direct_hccp_session", str(peer_library), "-lascendcl", "-ldl", "-pthread"]
     print("BUILD: " + shlex.join(command), file=sys.stderr)
     subprocess.run(command, check=True)
     env = os.environ.copy()
