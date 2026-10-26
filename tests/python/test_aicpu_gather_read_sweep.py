@@ -6,6 +6,8 @@ import io
 import json
 from pathlib import Path
 import subprocess
+import sys
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -22,6 +24,8 @@ def load(name, path):
 
 sweep = load("gather_sweep", ROOT / "tests/run_aicpu_gather_read_sweep.py")
 demo = load("gather_demo", ROOT / "access_operator/demo/aicpu_batch_get/python/test_batch_get.py")
+sys.path.insert(0, str(ROOT / "access_operator/demo/aicpu_batch_get/python"))
+bench = load("gather_benchmark", sweep.RUNNER)
 
 
 def sample(span, post_a, post_b):
@@ -34,7 +38,9 @@ def sample(span, post_a, post_b):
 
 def result():
     return dict(mode="gather_read", token_bytes=656, miss_count=32, workers=2,
-                blocks=64, tokens_per_block=2, output_row_step=2, payload_bytes=20992,
+                table_capacity=128, tokens_per_block=128, request_length=32768,
+                ddr_bytes=128 * 128 * 656, source_access_pattern="random_with_replacement",
+                output_access_pattern="random_unique_rows", payload_bytes=20992,
                 warmup=1, iterations=2, profile_rounds=2,
                 end_to_end=demo.timing_stats([200, 300], 20992),
                 stages=demo.summarize_profiles([sample(150, 100, 1), sample(200, 1, 100)], 20992))
@@ -62,6 +68,28 @@ class GatherSweepTests(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 demo.parse_args(["--kernel-json", kernel.name, "--blocks", "64", "--miss-count", "65"])
 
+    def test_full_pool_random_sampling_and_unspaced_output(self):
+        class Values(list):
+            def to(self, dtype):
+                return self
+            def __mul__(self, n):
+                return Values(value * n for value in self)
+        calls = []
+        def randint(low, high, shape, **kwargs):
+            calls.append((low, high, shape))
+            return Values([high - 1] * shape[0])
+        torch = SimpleNamespace(int32="int32", randint=randint,
+                                randperm=lambda n, **kw: Values(reversed(range(n))))
+        args = SimpleNamespace(table_capacity=1277952, tokens_per_block=128, token_bytes=656)
+        indices, offsets, rows = bench.create_request_plan(torch, args, 4, "npu:7")
+        self.assertEqual(calls, [(0, 1277952, (4,)), (0, 128, (4,))])
+        self.assertEqual(indices, [1277951] * 4)  # Repeated sources are retained.
+        self.assertEqual(offsets, [127 * 656] * 4)
+        self.assertEqual(rows, [3, 2, 1, 0])  # No factor-of-two spacing or guard rows.
+        with tempfile.NamedTemporaryFile() as kernel:
+            a = bench.parse_args(["--kernel-json", kernel.name, "--table-capacity", "1", "--miss-count", "64"])
+            self.assertEqual(a.miss_count, 64)  # Pool size does not constrain request count.
+
     def test_default_plan_and_override_validation(self):
         with tempfile.TemporaryDirectory() as directory:
             a = sweep.parse_args(["--dry-run", "--output-dir", directory + "/plan"])
@@ -71,13 +99,17 @@ class GatherSweepTests(unittest.TestCase):
             self.assertEqual(len(plan["cases"]), 252)
             for case in plan["cases"]:
                 command = case["command"]
-                self.assertEqual(command[command.index("--modes") + 1], "gather_read")
+                self.assertTrue(command[1].endswith("benchmark_gather_read.py"))
+                self.assertNotIn("--request-capacity", command)
+                self.assertNotIn("--output-row-step", command)
+                self.assertEqual(command[command.index("--table-capacity") + 1], "1277952")
+                self.assertEqual(command[command.index("--tokens-per-block") + 1], "128")
                 self.assertNotIn("--aiv-cores", command)
                 self.assertNotIn("--jettys-per-core", command)
                 self.assertEqual(int(command[command.index("--miss-count") + 1]), case["miss_count"])
             self.assertFalse((a.output_dir / "summary.csv").exists())
         for args in (["--workers", "9"], ["--profile-rounds", "0"],
-                     ["--request-capacity", "32", "--miss-counts", "64"],
+                     ["--request-capacity", "65536"], ["--table-capacity", "0"],
                      ["--miss-counts", "65537"]):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 sweep.parse_args(args)
@@ -89,16 +121,15 @@ class GatherSweepTests(unittest.TestCase):
             (build / "python/kvaf").mkdir(parents=True)
             a = sweep.parse_args(["--build-dir", str(build), "--output-dir", str(base / "out"),
                                   "--token-bytes", "656", "--miss-counts", "32", "64", "128",
-                                  "--workers", "2", "--request-capacity", "128"])
+                                  "--workers", "2", "--table-capacity", "128"])
             def execute(command, **kwargs):
                 count = int(command[command.index("--miss-count") + 1])
-                self.assertEqual(command[command.index("--blocks") + 1], "128")
+                self.assertEqual(command[command.index("--table-capacity") + 1], "128")
                 self.assertTrue(kwargs["env"]["PYTHONPATH"].startswith(str((build / "python").resolve())))
                 kwargs["stdout"].write(f"case {count}\n")
                 if count == 64:
                     return subprocess.CompletedProcess(command, 1)
                 data = result()
-                data["blocks"] = 128
                 Path(command[command.index("--result-json") + 1]).write_text(json.dumps([data]))
                 return subprocess.CompletedProcess(command, 0)
             with patch.object(sweep.subprocess, "run", side_effect=execute) as run, \

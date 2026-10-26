@@ -179,8 +179,12 @@ python3 tests/run_aicpu_gather_read_sweep.py \
 | workers | 1、2、4、8 |
 
 共 252 组，每组独立进程，预热 10 轮、正常计时 100 轮、另采样 profile 100 轮。
-每轮改变输入数据、索引、偏移和输出位置，并校验完整输出、未写入区域和后续 NPU 消费结果。
-默认每组输入容量和地址表大小为 `max(1, miss_count)`；`--request-capacity` 可固定容量以比较不同有效前缀。
+使用 `python/benchmark_gather_read.py`，按 AIV 全量随机测试的方式建立源地址池：
+默认 1,277,952 个源块，每块 128 个 token。数据和地址表初始化一次，测量期间复用。
+每轮从整个源池有放回抽取块索引，随机选择块内 token，再生成不重复的随机输出行号。
+输入数组和输出行数为 `max(32768, miss_count)`；只执行前 miss_count 项。
+输出 HBM 连续分配，所有行都可以被选中，不再固定间隔一行保留保护区。
+每轮在 NPU 上比较整个输出与预期值，同时检查随机未写入行；源数据包含 token 身份信息，以检查读错源块。
 正常测量与 profile 轮次分开，输入准备、BatchPut、地址表准备及校验均在计时之外。
 
 先跑小范围可使用：
@@ -193,7 +197,9 @@ python3 tests/run_aicpu_gather_read_sweep.py \
   --warmup 3 --iterations 20 --profile-rounds 20
 ```
 
-- `--tokens-per-block` 默认 2；`--output-row-step` 默认 2，为输出间隔保留保护行，也可设为 1。
+- `--table-capacity` 默认 1,277,952，只控制源地址池的块数，与 miss_count 独立；`--tokens-per-block` 默认 128。
+- 源 DDR 容量为 `table_capacity × tokens_per_block × token_bytes`。默认 656 B/token 对应约 99.94 GiB，4096 B/token 对应 624 GiB；每组日志和计划都会记录所需源池容量。
+- 原 `python/test_batch_get.py` 仍用于逐轮改变源数据、检查保护行和异步调用的正确性测试，性能扫描不再使用它的数据布局。
 - `--build-dir` 可指定构建目录；`--kernel-json` 可指定已安装的算子 JSON。
 - `--output-dir` 指定一个新结果目录，默认 `reports/aicpu-gather-read/<时间戳>`。
 - `--dry-run` 只生成和打印扫描计划，不加载 torch、不访问设备。
@@ -204,6 +210,7 @@ Jetty 数由 worker 数确定，每个 worker 一条数据队列和一条控制�
 CPU gather 线程预算和绑定策略由服务启动参数控制，同一次扫描中保持一致。
 
 结果目录包含 `plan.json`、每组 `.log`/`.json` 和逐组更新的 `summary.csv`。
+CSV 同时记录源池块数、每块 token 数、输入数组长度、源 DDR 容量及源/目标访问模式。
 汇总字段沿用 AIV 扫描的命名，耗时单位为 µs（显示 1 位小数），带宽为十进制 GB/s：
 
 | 字段 | 统计口径 |
