@@ -24,3 +24,7 @@ staging 来自同一块 DDR 分配，各 worker 使用不重叠的区间，所�
 
 `python/test_batch_get.py` 使用真实 `NpuRuntime.batch_get` 接口逐轮校验数据，
 支持一次运行比较 1、2、4 等 worker 数，并输出 Python 端到端耗时和有效载荷带宽。
+
+全量 GatherRead 性能扫描使用 `tests/run_aicpu_gather_read_sweep.py`，复用上述逐轮校验。
+默认扫描 token 大小、精确 miss_count 和 worker 数，共 252 组；
+命令及 CSV 指标口径见 [GatherRead 性能扫描](../../../docs/aicpu_gather_read.md#全量性能扫描)。

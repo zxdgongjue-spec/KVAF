@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import random
@@ -11,7 +12,7 @@ import statistics
 import time
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device-id", type=int, default=7)
     parser.add_argument("--peer", default="127.0.0.1:28990")
@@ -25,6 +26,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--token-bytes", type=int, default=656)
     parser.add_argument("--tokens-per-block", type=int, default=2)
     parser.add_argument("--active-percent", type=int, default=100)
+    parser.add_argument("--miss-count", type=int,
+                        help="exact active prefix length; overrides --active-percent")
+    parser.add_argument("--result-json", type=Path,
+                        help="write machine-readable summaries after all cases pass")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--profile-rounds", type=int, default=0,
@@ -37,11 +42,13 @@ def parse_args() -> argparse.Namespace:
         default=str(Path(cann) / "opp/vendors/cust/op_impl/aicpu/config/kvaf_aicpu_urma.json")
         if cann else None,
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if not all(1 <= workers <= 8 for workers in args.workers):
         parser.error("--workers must contain values from 1 to 8")
     if not 1 <= args.blocks <= 65536:
         parser.error("--blocks must be from 1 to 65536")
+    if args.miss_count is not None and not 0 <= args.miss_count <= args.blocks:
+        parser.error("--miss-count must be between zero and --blocks")
     if args.token_bytes <= 0 or args.token_bytes * 65536 > 0xFFFFFFFF:
         parser.error("--token-bytes must be positive and 65536 tokens must fit uint32")
     if args.tokens_per_block <= 0 or args.token_bytes * args.tokens_per_block > 0xFFFFFFFF:
@@ -64,6 +71,35 @@ def percentile(values: list[float], fraction: float) -> float:
     lower = int(position)
     upper = min(lower + 1, len(ordered) - 1)
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
+def timing_stats(values: list[float], payload_bytes: int = 0) -> dict:
+    p50 = percentile(values, 0.50)
+    mean = statistics.mean(values)
+    return {
+        "mean_us": mean, "p50_us": p50, "p90_us": percentile(values, 0.90),
+        "p95_us": percentile(values, 0.95), "p99_us": percentile(values, 0.99),
+        "GBps": payload_bytes / mean / 1000 if mean else 0.0,
+        "p50_GBps": payload_bytes / p50 / 1000 if p50 else 0.0,
+    }
+
+
+def summarize_profiles(profiles: list[dict], payload_bytes: int) -> dict:
+    if not profiles:
+        return {}
+    stages = {"kernel_total": timing_stats(
+        [sample["device_span_us"] for sample in profiles], payload_bytes)}
+    # Take the slowest worker in EACH round, then calculate percentiles.
+    # Phase maxima can belong to different workers and must not be added.
+    for stage, field in (
+        ("post", "post_us"), ("completion_wait", "cq_wait_us"),
+        ("ready_wait", "ready_wait_us"), ("read", "read_us"),
+        ("wr_build", "wr_build_us"), ("request", "request_us"),
+        ("source_write", "source_write_us"), ("notify", "notify_us"), ("ack", "ack_us"),
+    ):
+        stages[stage] = timing_stats([
+            max(worker[field] for worker in sample["workers"]) for sample in profiles])
+    return stages
 
 
 def print_profile(samples: list[dict], mode: str) -> None:
@@ -106,9 +142,10 @@ def print_profile(samples: list[dict], mode: str) -> None:
 
 
 def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object,
-             mode: str = "gather_read") -> None:
+             mode: str = "gather_read") -> dict:
     device = f"npu:{args.device_id}"
     n, token = args.blocks, args.token_bytes
+    measured_count = args.miss_count if args.miss_count is not None else n * args.active_percent // 100
     block_bytes = token * args.tokens_per_block
     rng = random.Random(20261021)  # Identical input sequence for every worker count.
     keys = list(range(n))
@@ -139,7 +176,7 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
     profiles: list[dict] = []
     device_table = None
 
-    def run_round(epoch: int, active_percent: int, raw_tensors: bool = False,
+    def run_round(epoch: int, active_count: int, raw_tensors: bool = False,
                   synchronize: bool = True, profile: bool = False) -> tuple[int, int]:
         nonlocal device_table
         payload = bytearray(rng.randbytes(n * block_bytes))
@@ -149,7 +186,6 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
         rng.shuffle(row_values)
         row_values = [args.output_row_step * row for row in row_values]
         offset_values = [rng.randrange(args.tokens_per_block) * token for _ in range(n)]
-        active_count = n * active_percent // 100
         expected = bytearray([0xA5]) * (n * 2 * token)
         for i in range(active_count):
             start = index_values[i] * block_bytes + offset_values[i]
@@ -203,20 +239,20 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
         print(f"AICPU_BATCH_GET_BEGIN mode={mode} workers={workers} blocks={n} token_bytes={token}", flush=True)
         # Exercise both Python overloads, partial prefixes and the empty-request path.
         for epoch, (active, raw) in enumerate(((100, False), (75, True), (0, False))):
-            run_round(epoch, active, raw)
-        run_round(3, 75, synchronize=False)
+            run_round(epoch, n * active // 100, raw)
+        run_round(3, n * 75 // 100, synchronize=False)
         for epoch in range(args.warmup):
-            run_round(epoch + 4, args.active_percent)
+            run_round(epoch + 4, measured_count)
         for epoch in range(args.iterations):
-            elapsed, size = run_round(epoch + 4 + args.warmup, args.active_percent)
+            elapsed, size = run_round(epoch + 4 + args.warmup, measured_count)
             samples_ns.append(elapsed)
             payload_bytes.append(size)
         if args.profile_rounds:
             profile_epoch = 4 + args.warmup + args.iterations
-            run_round(profile_epoch, args.active_percent, profile=True)
+            run_round(profile_epoch, measured_count, profile=True)
             profiles.clear()
             for epoch in range(args.profile_rounds):
-                run_round(profile_epoch + 1 + epoch, args.active_percent, profile=True)
+                run_round(profile_epoch + 1 + epoch, measured_count, profile=True)
     finally:
         # Registered source/output allocations remain alive until teardown.
         runtime.shutdown()
@@ -227,6 +263,7 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
         f"AICPU_BATCH_GET_PASS mode={mode} workers={workers} iterations={args.iterations} "
         f"mean_us={statistics.mean(samples_us):.1f} "
         f"p50_us={percentile(samples_us, 0.50):.1f} "
+        f"p90_us={percentile(samples_us, 0.90):.1f} "
         f"p95_us={percentile(samples_us, 0.95):.1f} "
         f"p99_us={percentile(samples_us, 0.99):.1f} GBps={bandwidth:.3f} "
         "verification=every_round_full_output npu_consumer_checked=1 "
@@ -235,6 +272,17 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
     )
     if profiles:
         print_profile(profiles, mode)
+    return {
+        "mode": mode, "workers": workers, "blocks": n, "miss_count": measured_count,
+        "token_bytes": token, "tokens_per_block": args.tokens_per_block,
+        "output_row_step": args.output_row_step, "payload_bytes": measured_count * token,
+        "warmup": args.warmup, "iterations": args.iterations, "profile_rounds": len(profiles),
+        "end_to_end": timing_stats(samples_us, measured_count * token),
+        "stages": summarize_profiles(profiles, measured_count * token),
+        "verification": "every_round_full_output_and_npu_consumer",
+        "stage_aggregation": "kernel_total=first_entry_to_last_exit; other_stages=max_worker_per_round",
+        "profile_separate_from_end_to_end": True,
+    }
 
 
 def main() -> None:
@@ -249,9 +297,12 @@ def main() -> None:
         "input_preparation_batch_put_table_setup_and_verification_excluded=1",
         flush=True,
     )
+    results = []
     for mode in args.modes:
         for workers in args.workers:
-            run_case(args, workers, torch, kvaf, mode)
+            results.append(run_case(args, workers, torch, kvaf, mode))
+    if args.result_json:
+        args.result_json.write_text(json.dumps(results, indent=2) + "\n")
 
 
 if __name__ == "__main__":
