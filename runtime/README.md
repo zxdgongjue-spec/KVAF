@@ -44,9 +44,11 @@ cd /path/to/kvaf
   --listen 0.0.0.0 --port 28999
 ```
 
-CPU DDR region 支持 `thp` 与 `origin` 两种页分配模式；未指定时默认使用 `thp`。
+CPU DDR region 支持 `thp`、`no-thp` 与 `origin` 三种页分配模式；未指定时默认使用 `thp`。
 `origin` 保留原始普通内存分配行为，不主动请求大页、不预触页，但不禁止操作系统
-自行使用 THP。旧参数值 `default` 已改名为 `origin`，现有命令需同步更新：
+自行使用 THP。`no-thp` 用于匹配对照：与 `thp` 相同的 2 MiB 地址对齐、全量
+`memset` 和内存注册，只把 `MADV_HUGEPAGE` 改为 `MADV_NOHUGEPAGE`。
+旧参数值 `default` 已改名为 `origin`，现有命令需同步更新：
 
 ```bash
 # 默认模式：2 MiB 对齐，MADV_HUGEPAGE，并在注册前主动触页；
@@ -57,12 +59,17 @@ CPU DDR region 支持 `thp` 与 `origin` 两种页分配模式；未指定时默
 # origin 模式：4 KiB 地址对齐，不主动请求大页、不预触页；实际页大小由系统决定。
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28999 --memory-page-mode origin
+
+# 严格对照模式：2 MiB 地址对齐，全量清零，但显式禁止该 region 使用 THP。
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28999 --memory-page-mode no-thp
 ```
 
 需要固定 NUMA 位置时，应在 UB device 所在 node 启动服务，例如
 `numactl --cpunodebind=N --membind=N ...`。`REGION_ALLOCATED` 日志会记录
-`page_mode`。默认 THP 模式还应通过 `/proc/<pid>/smaps` 的 `AnonHugePages` 验证实际
-合并量；Linux 使用大页并不保证 UDMA/IOMMU 一定保留相同的页表粒度。
+`page_mode`。默认 THP 模式还应通过 `/proc/<pid>/smaps` 的 `AnonHugePages` 观察实际
+PMD 级大页映射量；该指标不覆盖所有 mTHP。Linux 使用大页并不保证 UDMA/IOMMU
+一定保留相同的页表粒度。[内核 THP 监控说明](https://www.kernel.org/doc/html/latest/admin-guide/mm/transhuge.html#monitoring-usage)
 
 默认自动枚举所有可用 UMDK UB device/EID；`--ub-device NAME` 和
 `--eid-index N` 仅用于诊断。CPU 端可同时保持多个 NPU session，NPU 正常
@@ -81,6 +88,42 @@ runtime = kvaf.NpuRuntime(
 runtime.link_to("141.61.92.71:28999")
 runtime.initialize(ddr_bytes, kv_block_bytes)
 ```
+
+### 初始化阶段诊断
+
+CPU service 添加 `--profile-initialize`，NPU 构造参数添加
+`profile_initialize=True`，可分别启用两端的初始化诊断；默认关闭。两端须来自
+同一版本并重建，否则旧 binding 不接受新参数。诊断脚本同时提供同名命令行选项：
+
+```bash
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 127.0.0.1 --port 34555 \
+  --memory-page-mode thp --profile-initialize \
+  > cpu-thp-r01.log 2>&1
+```
+
+另一个终端，等服务 `LISTEN` 后：
+
+```bash
+python3 -u tests/diagnostics/ddr_init_probe.py \
+  --build build-npu --address 127.0.0.1:34555 \
+  --device 7 --ddr-gib 64 --profile-initialize --hold \
+  > npu-thp-r01-device7-64g.log 2>&1
+```
+
+`KVAF_INIT_PROFILE` JSONL 会拆出 CPU 的对齐分配、页建议、全量触页、token 和
+segment 注册，以及 NPU 的分配 RPC、候选初始化、通路/元数据初始化、启动写验证。
+CPU 快照在整个分配、`memset` 和 `register_seg` 前后记录全局 vmstat、
+`global_meminfo_kib` 内存瞬时值、NUMA 空闲内存和整个服务进程的 RSS/匿名大页；
+这些不是当前 region 的独立计数。`timestamp_unix_ns` 仅辅助日志对齐，
+跨主机墙上时钟差不能当成精确耗时。`collection_elapsed_ms` 单独记录采样成本，
+其中 `smaps_rollup` 对普通页和大页的开销可能不同；优先比较最内层阶段，并单独
+报告采样开销。总计时包含嵌套打点和快照，RPC 还包含服务端排队和网络，
+不能将总计时与内部阶段相加。
+
+对照 `thp` 与 `no-thp` 时保持容量、实际驻留压力、NUMA、候选和并发方式一致；
+`origin` 不主动触页，不适合作为唯一的 THP 因果对照。完整实验顺序、打点口径和
+汇总命令见 [DDR 初始化诊断说明](../tests/diagnostics/ddr_init_probe.md)。
 
 已知设备名时也可设置 `peer_ub_device="udmac0d1e2"`，只在该设备的 EID 中按
 连通性选择，不执行带宽标定。`peer_ub_device` 与 `adaptive_ub_device=True` 互斥。

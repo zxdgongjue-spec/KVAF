@@ -1,4 +1,25 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+find_package(Threads REQUIRED)
+
+add_executable(kvaf_init_phase_timing_test init_phase_timing_test.cc)
+target_include_directories(kvaf_init_phase_timing_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/runtime/src)
+target_link_libraries(kvaf_init_phase_timing_test PRIVATE Threads::Threads)
+add_test(NAME kvaf_init_phase_timing_test COMMAND kvaf_init_phase_timing_test)
+
+add_executable(kvaf_cpu_memory_page_policy_test cpu_memory_page_policy_test.cc)
+target_include_directories(kvaf_cpu_memory_page_policy_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/runtime/src)
+target_link_libraries(kvaf_cpu_memory_page_policy_test PRIVATE kvaf_runtime)
+add_test(NAME kvaf_cpu_memory_page_policy_test COMMAND kvaf_cpu_memory_page_policy_test)
+
+add_executable(kvaf_runtime_init_profile_test runtime_init_profile_test.cc)
+target_link_libraries(kvaf_runtime_init_profile_test PRIVATE kvaf_runtime)
+add_test(NAME kvaf_runtime_init_profile_test COMMAND kvaf_runtime_init_profile_test)
+
+add_test(NAME kvaf_ddr_init_diagnostics_python
+  COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+          -s "${CMAKE_CURRENT_SOURCE_DIR}/diagnostics" -p "test_*ddr_init*.py")
 
 add_executable(kvaf_batch_get_schedule_test batch_get_schedule_test.cc)
 target_include_directories(kvaf_batch_get_schedule_test PRIVATE

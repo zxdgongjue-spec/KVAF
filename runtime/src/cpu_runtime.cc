@@ -1,6 +1,9 @@
 #include "cpu_runtime.h"
+#include "cpu_memory_page_policy.h"
+#include "init_phase_timing.h"
 #include "peer_protocol.h"
 
+#include <dirent.h>
 #include <dlfcn.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -15,8 +18,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
+#include <map>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -63,8 +69,6 @@ constexpr uint32_t kJettyKeyBytes = sizeof(urma_jetty_id_t) + sizeof(urma_transp
 // and transport mode; the trailing four bytes are retained on the wire.
 constexpr uint32_t kNpuJettyKeyBytes = 32U;
 constexpr uint32_t kSegBytes = sizeof(urma_seg_t);
-constexpr std::size_t kBasePageBytes = 4096U;
-constexpr std::size_t kHugePage2MBytes = 2U * 1024U * 1024U;
 
 static_assert(sizeof(urma_jetty_id_t) == 24U, "UMDK Jetty id ABI changed");
 static_assert(kJettyKeyBytes == 28U, "HCCP UMDK Jetty key ABI changed");
@@ -131,6 +135,142 @@ void Log(const char* format, ...) {
   va_start(arguments, format);
   std::vfprintf(stderr, format, arguments);
   va_end(arguments);
+}
+
+bool ReadKibField(const std::string& path, const char* field, uint64_t* value) {
+  std::ifstream input(path);
+  std::string line;
+  while (std::getline(input, line)) {
+    const auto position = line.find(field);
+    if (position != std::string::npos) {
+      std::istringstream number(line.substr(position + std::strlen(field)));
+      return static_cast<bool>(number >> *value);
+    }
+  }
+  return false;
+}
+
+void WriteCounterObject(const std::map<std::string, uint64_t>& counters) {
+  std::fputc('{', stderr);
+  bool first = true;
+  for (const auto& counter : counters) {
+    if (!first) std::fputc(',', stderr);
+    detail::WriteInitProfileString(counter.first.c_str());
+    std::fprintf(stderr, ":%" PRIu64, counter.second);
+    first = false;
+  }
+  std::fputc('}', stderr);
+}
+
+// These are absolute system/process snapshots, not region-resident-byte
+// measurements. Reading procfs is intentionally outside the inner phase timers.
+void LogMemorySnapshot(bool enabled, const char* phase, uint64_t attempt,
+                       uint64_t bytes, uint32_t candidate, const char* page_mode) {
+  if (!enabled) return;
+  const int saved_errno = errno;
+  const auto timestamp_unix_ns = detail::InitProfileTimestampUnixNs();
+  const auto collection_started = std::chrono::steady_clock::now();
+  std::map<std::string, uint64_t> vmstat;
+  std::map<std::string, uint64_t> global_meminfo;
+  std::map<std::string, uint64_t> numa_memfree;
+  std::map<std::string, uint64_t> process_status;
+  {
+    std::ifstream input("/proc/vmstat");
+    std::string name;
+    uint64_t value = 0U;
+    while (input >> name >> value) {
+      if (name.rfind("compact_", 0U) == 0U ||
+          name.rfind("thp_fault_", 0U) == 0U ||
+          name.rfind("pgscan_direct", 0U) == 0U ||
+          name.rfind("pgsteal_direct", 0U) == 0U ||
+          name.rfind("allocstall", 0U) == 0U || name == "pgmajfault" ||
+          name.rfind("pswp", 0U) == 0U) {
+        vmstat.emplace(name, value);
+      }
+    }
+  }
+  for (const char* field : {"MemAvailable", "MemFree", "SwapFree", "AnonHugePages"}) {
+    uint64_t field_value = 0U;
+    const std::string label = std::string(field) + ":";
+    if (ReadKibField("/proc/meminfo", label.c_str(), &field_value)) {
+      global_meminfo.emplace(field, field_value);
+    }
+  }
+  if (DIR* directory = opendir("/sys/devices/system/node")) {
+    while (const dirent* entry = readdir(directory)) {
+      unsigned int node = 0U;
+      char suffix = '\0';
+      if (std::sscanf(entry->d_name, "node%u%c", &node, &suffix) != 1) continue;
+      uint64_t value = 0U;
+      const std::string name = "node" + std::to_string(node);
+      if (ReadKibField("/sys/devices/system/node/" + name + "/meminfo", "MemFree:", &value)) {
+        numa_memfree.emplace(name, value);
+      }
+    }
+    closedir(directory);
+  }
+  uint64_t value = 0U;
+  if (ReadKibField("/proc/self/status", "VmRSS:", &value)) {
+    process_status.emplace("VmRSS_kib", value);
+  }
+  if (ReadKibField("/proc/self/status", "RssAnon:", &value)) {
+    process_status.emplace("RssAnon_kib", value);
+  }
+  uint64_t anon_huge_pages = 0U;
+  const bool have_anon_huge_pages =
+      ReadKibField("/proc/self/smaps_rollup", "AnonHugePages:", &anon_huge_pages);
+  std::string thp_enabled;
+  std::string thp_defrag;
+  uint64_t hpage_pmd_size = 0U;
+  bool have_enabled = false;
+  bool have_defrag = false;
+  bool have_pmd_size = false;
+  const bool include_config = std::strcmp(phase, "before_allocate") == 0;
+  if (include_config) {
+    std::ifstream enabled_file("/sys/kernel/mm/transparent_hugepage/enabled");
+    have_enabled = static_cast<bool>(std::getline(enabled_file, thp_enabled));
+    std::ifstream defrag_file("/sys/kernel/mm/transparent_hugepage/defrag");
+    have_defrag = static_cast<bool>(std::getline(defrag_file, thp_defrag));
+    std::ifstream size_file("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size");
+    have_pmd_size = static_cast<bool>(size_file >> hpage_pmd_size);
+  }
+  const double collection_elapsed_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - collection_started).count();
+  flockfile(stderr);
+  std::fputs("KVAF_INIT_PROFILE {\"event\":\"snapshot\",\"role\":\"cpu\",\"phase\":", stderr);
+  detail::WriteInitProfileString(phase);
+  std::fprintf(stderr, ",\"timestamp_unix_ns\":%" PRId64 ",\"pid\":%ld,\"attempt\":%" PRIu64 ",\"bytes\":%" PRIu64
+               ",\"candidate\":%u,\"page_mode\":", timestamp_unix_ns,
+               static_cast<long>(getpid()), attempt, bytes, candidate);
+  detail::WriteInitProfileString(page_mode);
+  std::fprintf(stderr, ",\"collection_elapsed_ms\":%.6f", collection_elapsed_ms);
+  std::fputs(",\"counter_scope\":\"global_and_process\",\"global_vmstat\":", stderr);
+  WriteCounterObject(vmstat);
+  std::fputs(",\"global_meminfo_kib\":", stderr);
+  WriteCounterObject(global_meminfo);
+  std::fputs(",\"numa_memfree_kib\":", stderr);
+  WriteCounterObject(numa_memfree);
+  std::fputs(",\"process_status\":", stderr);
+  WriteCounterObject(process_status);
+  std::fputs(",\"process_anon_huge_pages_kib\":", stderr);
+  if (have_anon_huge_pages) std::fprintf(stderr, "%" PRIu64, anon_huge_pages);
+  else std::fputs("null", stderr);
+  if (include_config) {
+    std::fputs(",\"thp_config\":{\"enabled\":", stderr);
+    if (have_enabled) detail::WriteInitProfileString(thp_enabled.c_str());
+    else std::fputs("null", stderr);
+    std::fputs(",\"defrag\":", stderr);
+    if (have_defrag) detail::WriteInitProfileString(thp_defrag.c_str());
+    else std::fputs("null", stderr);
+    std::fputs(",\"hpage_pmd_size\":", stderr);
+    if (have_pmd_size) std::fprintf(stderr, "%" PRIu64, hpage_pmd_size);
+    else std::fputs("null", stderr);
+    std::fputc('}', stderr);
+  }
+  std::fputs("}\n", stderr);
+  std::fflush(stderr);
+  funlockfile(stderr);
+  errno = saved_errno;
 }
 
 bool ReadAll(int fd, void* data, size_t bytes) {
@@ -465,6 +605,7 @@ void ReleaseChannel(Channel* channel) {
 
 struct Region {
   uint64_t id = 0U;
+  uint64_t allocation_attempt = 0U;
   uint32_t candidate_id = 0U;
   UrmaResources* resources = nullptr;
   void* memory = nullptr;
@@ -478,9 +619,10 @@ struct Region {
 class CpuService {
  public:
   CpuService(UrmaResourcePool* resource_pool, CpuMemoryPageMode memory_page_mode,
-             bool device_filter_applied)
+             bool device_filter_applied, bool profile_initialize)
       : resource_pool_(resource_pool), memory_page_mode_(memory_page_mode),
-        device_filter_applied_(device_filter_applied) {}
+        device_filter_applied_(device_filter_applied),
+        profile_initialize_(profile_initialize) {}
   ~CpuService() { ReleaseAll(); }
 
   uint32_t CandidateCount() const {
@@ -516,15 +658,29 @@ class CpuService {
 
   Result Allocate(uint64_t bytes, uint64_t slot_size, uint32_t candidate_id,
                   AllocateRegionResponse* response) {
+    const uint64_t attempt = next_allocation_attempt_++;
+    detail::InitPhaseTimer total(profile_initialize_, "cpu", "total_allocate",
+                                 attempt, bytes, candidate_id, MemoryPageModeName());
+    total.MarkFailed();
     if (response == nullptr || bytes == 0U || slot_size == 0U || bytes % slot_size != 0U ||
         bytes > std::numeric_limits<size_t>::max() || resource_pool_ == nullptr) {
       return Result::kInvalidRequest;
     }
-    UrmaResources* resources = resource_pool_->Get(candidate_id);
+    LogMemorySnapshot(profile_initialize_, "before_allocate", attempt, bytes,
+                       candidate_id, MemoryPageModeName());
+    UrmaResources* resources = nullptr;
+    {
+      detail::InitPhaseTimer timer(profile_initialize_, "cpu", "candidate_resources",
+                                   attempt, bytes, candidate_id, MemoryPageModeName());
+      resources = resource_pool_->Get(candidate_id);
+      if (resources != nullptr) timer.MarkSucceeded();
+      else timer.MarkFailed();
+    }
     if (resources == nullptr) {
       return Result::kResourceError;
     }
     auto region = std::make_unique<Region>();
+    region->allocation_attempt = attempt;
     region->candidate_id = candidate_id;
     region->resources = resources;
     region->bytes = bytes;
@@ -532,7 +688,13 @@ class CpuService {
       return Result::kResourceError;
     }
     region->token_value = NextToken();
-    region->token_id = urma_alloc_token_id(resources->context());
+    {
+      detail::InitPhaseTimer timer(profile_initialize_, "cpu", "alloc_token",
+                                   attempt, bytes, candidate_id, MemoryPageModeName());
+      region->token_id = urma_alloc_token_id(resources->context());
+      if (region->token_id != nullptr) timer.MarkSucceeded();
+      else timer.MarkFailed();
+    }
     if (region->token_id == nullptr) {
       Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=urma_alloc_token_id errno=%d\n", errno);
       ReleaseRegion(region.get());
@@ -555,7 +717,15 @@ class CpuService {
     config.token_id = region->token_id;
     config.token_value.token = region->token_value;
     config.flag = flag;
-    region->segment = urma_register_seg(resources->context(), &config);
+    LogMemorySnapshot(profile_initialize_, "before_register", attempt, bytes,
+                       candidate_id, MemoryPageModeName());
+    {
+      detail::InitPhaseTimer timer(profile_initialize_, "cpu", "register_seg",
+                                   attempt, bytes, candidate_id, MemoryPageModeName());
+      region->segment = urma_register_seg(resources->context(), &config);
+      if (region->segment != nullptr) timer.MarkSucceeded();
+      else timer.MarkFailed();
+    }
     if (region->segment == nullptr) {
       Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=urma_register_seg base=%p bytes=%" PRIu64
           " token_id=0x%x token_value=0x%x reg_flags=0x%x errno=%d\n",
@@ -563,6 +733,8 @@ class CpuService {
       ReleaseRegion(region.get());
       return Result::kResourceError;
     }
+    LogMemorySnapshot(profile_initialize_, "after_register", attempt, bytes,
+                       candidate_id, MemoryPageModeName());
     const uint64_t id = next_region_id_++;
     region->id = id;
     response->session_id = id;
@@ -584,9 +756,21 @@ class CpuService {
     }
     regions_.emplace(id, std::move(region));
     Log("[KVAF_CPU] REGION_ALLOCATED session=%" PRIu64 " candidate=%u ub_device=%s eid_index=%u "
-        "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x reg_flags=0x%x page_mode=%s\n",
+        "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x reg_flags=0x%x page_mode=%s attempt=%" PRIu64 "\n",
         id, candidate_id, resources->device_name().c_str(), resources->eid_index(), bytes,
-        response->peer_base, response->token_id, flag.value, MemoryPageModeName());
+        response->peer_base, response->token_id, flag.value, MemoryPageModeName(), attempt);
+    if (profile_initialize_) {
+      const int saved_errno = errno;
+      std::fprintf(stderr,
+                   "KVAF_INIT_PROFILE {\"event\":\"region\",\"role\":\"cpu\",\"timestamp_unix_ns\":%" PRId64 ",\"pid\":%ld"
+                   ",\"attempt\":%" PRIu64 ",\"bytes\":%" PRIu64 ",\"candidate\":%u"
+                   ",\"page_mode\":\"%s\",\"session\":%" PRIu64 ",\"base\":%" PRIu64 "}\n",
+                   detail::InitProfileTimestampUnixNs(), static_cast<long>(getpid()), attempt, bytes, candidate_id,
+                   MemoryPageModeName(), id, response->peer_base);
+      std::fflush(stderr);
+      errno = saved_errno;
+    }
+    total.MarkSucceeded();
     return Result::kOk;
   }
 
@@ -650,8 +834,8 @@ class CpuService {
     if (found == regions_.end()) {
       return Result::kNotFound;
     }
-    Log("[KVAF_CPU] REGION_RELEASE session=%" PRIu64 " channels=%zu\n", id,
-        found->second->channels.size());
+    Log("[KVAF_CPU] REGION_RELEASE session=%" PRIu64 " channels=%zu attempt=%" PRIu64 "\n", id,
+        found->second->channels.size(), found->second->allocation_attempt);
     ReleaseRegion(found->second.get());
     regions_.erase(found);
     return Result::kOk;
@@ -664,6 +848,8 @@ class CpuService {
         return "origin";
       case CpuMemoryPageMode::kTransparentHugePage:
         return "thp";
+      case CpuMemoryPageMode::kNoHugePage:
+        return "no-thp";
     }
     return "unknown";
   }
@@ -674,11 +860,17 @@ class CpuService {
       return false;
     }
     const std::size_t bytes = static_cast<std::size_t>(region->bytes);
-    const std::size_t alignment =
-        memory_page_mode_ == CpuMemoryPageMode::kTransparentHugePage
-            ? kHugePage2MBytes
-            : kBasePageBytes;
-    const int allocation_status = posix_memalign(&region->memory, alignment, bytes);
+    const auto policy = detail::MemoryPagePolicy(memory_page_mode_);
+    const std::size_t alignment = policy.alignment;
+    int allocation_status = 0;
+    {
+      detail::InitPhaseTimer timer(profile_initialize_, "cpu", "posix_memalign",
+                                   region->allocation_attempt, region->bytes,
+                                   region->candidate_id, MemoryPageModeName());
+      allocation_status = posix_memalign(&region->memory, alignment, bytes);
+      if (allocation_status == 0 && region->memory != nullptr) timer.MarkSucceeded();
+      else timer.MarkFailed();
+    }
     if (allocation_status != 0 || region->memory == nullptr) {
       Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=posix_memalign bytes=%" PRIu64
           " alignment=%zu status=%d memory=%p page_mode=%s\n",
@@ -686,18 +878,41 @@ class CpuService {
           MemoryPageModeName());
       return false;
     }
-    if (memory_page_mode_ == CpuMemoryPageMode::kTransparentHugePage) {
-      if (madvise(region->memory, bytes, MADV_HUGEPAGE) != 0) {
-        Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=madvise_hugepage bytes=%" PRIu64
+    if (policy.advice != detail::CpuMemoryAdvice::kNone) {
+      const int advice = policy.advice == detail::CpuMemoryAdvice::kHugePage
+                             ? MADV_HUGEPAGE : MADV_NOHUGEPAGE;
+      int advice_status = 0;
+      {
+        detail::InitPhaseTimer timer(profile_initialize_, "cpu", "madvise",
+                                     region->allocation_attempt, region->bytes,
+                                     region->candidate_id, MemoryPageModeName());
+        advice_status = madvise(region->memory, bytes, advice);
+        if (advice_status == 0) timer.MarkSucceeded();
+        else timer.MarkFailed();
+      }
+      if (advice_status != 0) {
+        Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=%s bytes=%" PRIu64
             " errno=%d\n",
-            region->bytes, errno);
+            policy.advice == detail::CpuMemoryAdvice::kHugePage
+                ? "madvise_hugepage" : "madvise_nohugepage", region->bytes, errno);
         free(region->memory);
         region->memory = nullptr;
         return false;
       }
-      // Fault the range while huge-page advice is active. Launching the service
-      // under a NUMA memory policy makes placement deterministic as well.
-      std::memset(region->memory, 0, bytes);
+    }
+    if (policy.pre_touch) {
+      LogMemorySnapshot(profile_initialize_, "before_memset", region->allocation_attempt,
+                         region->bytes, region->candidate_id, MemoryPageModeName());
+      // The matched thp/no-thp paths fault exactly the same byte range.
+      {
+        detail::InitPhaseTimer timer(profile_initialize_, "cpu", "memset",
+                                     region->allocation_attempt, region->bytes,
+                                     region->candidate_id, MemoryPageModeName());
+        std::memset(region->memory, 0, bytes);
+        timer.MarkSucceeded();
+      }
+      LogMemorySnapshot(profile_initialize_, "after_memset", region->allocation_attempt,
+                         region->bytes, region->candidate_id, MemoryPageModeName());
     }
     return true;
   }
@@ -810,6 +1025,8 @@ class CpuService {
       free(region->memory);
       region->memory = nullptr;
     }
+    LogMemorySnapshot(profile_initialize_, "after_release", region->allocation_attempt,
+                       region->bytes, region->candidate_id, MemoryPageModeName());
   }
 
   void ReleaseAll() {
@@ -822,6 +1039,8 @@ class CpuService {
   UrmaResourcePool* resource_pool_ = nullptr;
   CpuMemoryPageMode memory_page_mode_{CpuMemoryPageMode::kTransparentHugePage};
   bool device_filter_applied_{false};
+  bool profile_initialize_{false};
+  uint64_t next_allocation_attempt_ = 1U;
   uint64_t next_region_id_ = 1U;
   uint32_t next_token_ = 1U;
   uint32_t next_psn_ = 1U;
@@ -952,7 +1171,8 @@ Status CpuRuntime::Initialize(const CpuRuntimeOptions& options) {
     return Status::Internal("CpuRuntime failed to initialize UMDK resources");
   }
   impl->service = std::make_unique<CpuService>(
-      &impl->resources, options.memory_page_mode, !options.ub_device.empty());
+      &impl->resources, options.memory_page_mode, !options.ub_device.empty(),
+      options.profile_initialize);
   impl_ = std::move(impl);
   return Status::OK();
 }

@@ -38,7 +38,8 @@ output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数�
 batch_get_tokens_per_block, device_id=0, npu_core_count=2,
 batch_put_kernel_object_path="", jettys_per_core=2, npu_eids=[],
 adaptive_ub_device=False, adaptive_ub_miss_count=2048, peer_ub_device="",
-adaptive_peer_ub_devices=[], batch_get_max_inflight_total=2048)`
+adaptive_peer_ub_devices=[], batch_get_max_inflight_total=2048,
+profile_initialize=False)`
 要求显式传入单 token KV
 字节数和每个 KV block 中的 token 数，两个参数均无默认值；
 每个 AccessTable entry 大小为两者乘积。
@@ -49,6 +50,10 @@ Jetty。BatchPut 保持原有实现：该值为 1 或 2 时使用相同数量，
 2048；0 使用整批提交基线，非零值须至少为 `2 * npu_core_count`。大请求采用
 双组交叠提交，预算变化需新建 Runtime/graph，详见
 [在途控制](../docs/batch_get_inflight_control.md)。
+`profile_initialize=True` 开启初始化阶段的 JSON 日志、CPU 时间和缺页计数；
+CPU service 的分配、预触页及注册诊断需另外传入 `--profile-initialize`。
+匹配大页/普通页的实验与日志分析见
+[DDR 初始化诊断](../tests/diagnostics/ddr_init_probe.md)。
 远程 CPU DDR 只增加 `runtime.link_to("CPU_IP:port")`，必须在 `initialize` 前调用。
 `npu_eids=[]` 时 EID、UMDK device 与候选 RMA 验证由 C++ Runtime 自动完成；
 显式传入多个 32 位十六进制 EID 时，Runtime 为每个 EID 创建独立

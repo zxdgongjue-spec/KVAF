@@ -1,4 +1,5 @@
 #include "runtime.h"
+#include "init_phase_timing.h"
 
 #include <cstdint>
 #include <limits>
@@ -93,13 +94,27 @@ Status RuntimeCore::Initialize(const RuntimeInitRequest& request) {
     return Status::InvalidArgument("DDR allocator returned an invalid remote region");
   }
 
-  status = access_operator_.Initialize(remote_region);
+  {
+    detail::InitPhaseTimer timer(profile_initialize_, "npu", "transport_initialize",
+                                initialize_attempt_, request.ddr_bytes,
+                                initialize_candidate_);
+    status = access_operator_.Initialize(remote_region);
+    if (status.ok()) timer.MarkSucceeded();
+    else timer.MarkFailed();
+  }
   if (!status.ok()) {
     (void)ddr_allocator_.Release(remote_region);
     return status;
   }
 
-  status = meta_manager_.RegisterRemoteRegion(remote_region);
+  {
+    detail::InitPhaseTimer timer(profile_initialize_, "npu", "metadata_initialize",
+                                initialize_attempt_, request.ddr_bytes,
+                                initialize_candidate_);
+    status = meta_manager_.RegisterRemoteRegion(remote_region);
+    if (status.ok()) timer.MarkSucceeded();
+    else timer.MarkFailed();
+  }
   if (!status.ok()) {
     (void)access_operator_.Shutdown();
     (void)ddr_allocator_.Release(remote_region);

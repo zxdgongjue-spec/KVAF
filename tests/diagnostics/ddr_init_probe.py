@@ -38,9 +38,10 @@ def timed_call(operation: str, device: int, callback):
     started = time.perf_counter()
     try:
         result = callback()
-    except BaseException:
+    except BaseException as error:
         elapsed = time.perf_counter() - started
-        log("failed", device, operation=operation, elapsed_s=round(elapsed, 6))
+        log("failed", device, operation=operation, elapsed_s=round(elapsed, 6),
+            error_type=type(error).__name__, error=str(error))
         raise
     elapsed = time.perf_counter() - started
     log("done", device, operation=operation, elapsed_s=round(elapsed, 6))
@@ -64,6 +65,7 @@ def main() -> int:
     parser.add_argument("--npu-eids", default="", help="Optional comma-separated known-working NPU EIDs")
     parser.add_argument("--batch-get-kernel", type=Path)
     parser.add_argument("--batch-put-kernel", type=Path)
+    parser.add_argument("--profile-initialize", action="store_true", help="Enable native phase timing/fault diagnostics; requires a matching rebuilt NPU package")
     parser.add_argument("--hold-seconds", type=float, default=0, help="Keep successful regions alive after timing, then release")
     parser.add_argument("--hold", action="store_true", help="Keep the region until Enter; use in a foreground terminal")
     parser.add_argument("--dry-run", action="store_true", help="Print sizing/configuration without importing KVAF or using an NPU")
@@ -91,6 +93,7 @@ def main() -> int:
         slot_count=ddr_bytes // args.slot_size,
         aiv_cores=args.aiv_cores, jettys_per_core=args.jettys_per_core,
         peer_ub_device=args.peer_ub_device or "auto", npu_eids=npu_eids,
+        profile_initialize=args.profile_initialize,
         build=str(build), batch_get_kernel=str(get_kernel), batch_put_kernel=str(put_kernel),
     )
     if args.dry_run:
@@ -110,16 +113,20 @@ def main() -> int:
     signal.signal(signal.SIGTERM, interrupt)
     runtime = None
     interrupted = False
+    operation_failed = False
     try:
         timed_call("set_device", args.device, lambda: torch.npu.set_device(args.device))
-        runtime = timed_call("construct", args.device, lambda: kvaf.NpuRuntime(
-            str(get_kernel), batch_get_token_bytes=TOKEN_BYTES,
-            batch_get_tokens_per_block=TOKENS_PER_BLOCK,
+        runtime_options = dict(
+            batch_get_token_bytes=TOKEN_BYTES, batch_get_tokens_per_block=TOKENS_PER_BLOCK,
             device_id=args.device, npu_core_count=args.aiv_cores,
-            batch_put_kernel_object_path=str(put_kernel),
-            jettys_per_core=args.jettys_per_core,
+            batch_put_kernel_object_path=str(put_kernel), jettys_per_core=args.jettys_per_core,
             peer_ub_device=args.peer_ub_device, npu_eids=npu_eids,
-        ))
+        )
+        # Keep unprofiled runs compatible with the previous Python binding.
+        if args.profile_initialize:
+            runtime_options["profile_initialize"] = True
+        runtime = timed_call("construct", args.device,
+                             lambda: kvaf.NpuRuntime(str(get_kernel), **runtime_options))
         timed_call("link_to", args.device, lambda: runtime.link_to(args.address))
         timed_call("initialize", args.device, lambda: runtime.initialize(ddr_bytes, args.slot_size))
         region = runtime.remote_region
@@ -135,9 +142,17 @@ def main() -> int:
     except KeyboardInterrupt:
         interrupted = True
         log("interrupted", args.device)
+    except BaseException:
+        operation_failed = True
+        raise
     finally:
         if runtime is not None:
-            timed_call("shutdown", args.device, runtime.shutdown)
+            try:
+                timed_call("shutdown", args.device, runtime.shutdown)
+            except Exception:
+                # Preserve the original failure when cleanup also fails.
+                if not operation_failed and not interrupted:
+                    raise
     return 130 if interrupted else 0
 
 

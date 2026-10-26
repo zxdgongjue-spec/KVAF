@@ -76,6 +76,12 @@ class RuntimeCore {
   RuntimeCore& operator=(const RuntimeCore&) = delete;
 
   Status Initialize(const RuntimeInitRequest& request);
+  void SetInitializeProfiling(bool enabled, std::uint64_t attempt,
+                              std::uint32_t candidate) {
+    profile_initialize_ = enabled;
+    initialize_attempt_ = attempt;
+    initialize_candidate_ = candidate;
+  }
   Status Shutdown();
 
   bool initialized() const { return initialized_; }
@@ -119,6 +125,9 @@ class RuntimeCore {
       const AccessTableHandle& handle) const;
 
   bool initialized_{false};
+  bool profile_initialize_{false};
+  std::uint64_t initialize_attempt_{0U};
+  std::uint32_t initialize_candidate_{0U};
   RemoteRegionDesc remote_region_;
   std::uint64_t next_access_table_id_{1};
   std::unordered_map<std::uint64_t, std::unique_ptr<AccessTableState>>

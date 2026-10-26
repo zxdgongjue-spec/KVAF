@@ -1,4 +1,9 @@
-# Paired bandwidth timing scopes
+# Diagnostics
+
+DDR 初始化的匹配 `thp/no-thp` 对照、细粒度计时和分析工具见
+[DDR initialization probe](ddr_init_probe.md)。
+
+## Paired bandwidth timing scopes
 
 Run from KVAF on ak-batchget-test, using its matching build-npu. Existing
 benchmark and kernel files are not modified. The runner instruments a copy of

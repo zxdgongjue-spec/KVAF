@@ -27,6 +27,7 @@
 #include "meta_manager.h"
 #include "startup_bandwidth_probe.h"
 #include "startup_selection.h"
+#include "init_phase_timing.h"
 
 namespace kvaf {
 namespace {
@@ -39,6 +40,12 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
       : link_(std::move(link)) {}
 
   void SetCandidate(std::uint32_t candidate_id) { candidate_id_ = candidate_id; }
+  void SetInitializeProfiling(bool enabled, std::uint64_t attempt,
+                              std::uint32_t device) {
+    profile_initialize_ = enabled;
+    attempt_ = attempt;
+    device_ = device;
+  }
   bool has_allocation() const { return allocated_.base != 0U; }
 
   Status Allocate(const RuntimeInitRequest& request, RemoteRegionDesc* region) override {
@@ -48,8 +55,27 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
       return Status::InvalidArgument("invalid peer DDR allocation request");
     }
     if (allocated_.base != 0U) return Status::InvalidState("peer DDR is already allocated");
-    Status status = link_->AllocateRegion(request.ddr_bytes, request.slot_size, candidate_id_, &allocated_);
+    Status status;
+    {
+      detail::InitPhaseTimer timer(profile_initialize_, "npu", "allocate_rpc", attempt_,
+                                  request.ddr_bytes, candidate_id_);
+      status = link_->AllocateRegion(request.ddr_bytes, request.slot_size, candidate_id_, &allocated_);
+      if (status.ok()) timer.MarkSucceeded();
+      else timer.MarkFailed();
+    }
     if (!status.ok()) return status;
+    if (profile_initialize_) {
+      std::fprintf(stderr,
+                   "KVAF_INIT_PROFILE {\"event\":\"region\",\"role\":\"npu\","
+                   "\"timestamp_unix_ns\":%llu,\"pid\":%ld,\"attempt\":%llu,\"candidate\":%u,\"device\":%u,"
+                   "\"session\":%llu,\"base\":%llu,\"bytes\":%llu}\n",
+                   static_cast<unsigned long long>(detail::InitProfileTimestampUnixNs()),
+                   static_cast<long>(getpid()), static_cast<unsigned long long>(attempt_),
+                   candidate_id_, device_, static_cast<unsigned long long>(allocated_.session_id),
+                   static_cast<unsigned long long>(allocated_.base),
+                   static_cast<unsigned long long>(allocated_.length));
+      std::fflush(stderr);
+    }
     *region = RemoteRegionDesc{allocated_.base, allocated_.length, request.slot_size, DeviceKind::kCpu};
     return Status::OK();
   }
@@ -58,7 +84,14 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
     if (allocated_.base == 0U || allocated_.base != region.base) {
       return Status::NotFound("peer DDR allocation was not found");
     }
-    const Status status = link_->ReleaseRegion(allocated_.base);
+    Status status;
+    {
+      detail::InitPhaseTimer timer(profile_initialize_, "npu", "release_rpc", attempt_,
+                                  region.length, candidate_id_);
+      status = link_->ReleaseRegion(allocated_.base);
+      if (status.ok()) timer.MarkSucceeded();
+      else timer.MarkFailed();
+    }
     if (status.ok()) allocated_ = {};
     return status;
   }
@@ -66,6 +99,9 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
  private:
   std::shared_ptr<peer::PeerLink> link_;
   std::uint32_t candidate_id_{0U};
+  bool profile_initialize_{false};
+  std::uint64_t attempt_{0U};
+  std::uint32_t device_{0U};
   peer::PeerRegion allocated_{};
 };
 
@@ -453,6 +489,7 @@ struct NpuRuntime::Impl {
   }
 
   NpuRuntimeOptions options;
+  std::uint64_t next_initialize_attempt{1U};
   AccessOperatorConfig config;
   std::unique_ptr<MetaManager> meta_manager;
   std::unique_ptr<DdrMemoryAllocator> allocator;
@@ -526,8 +563,15 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   std::uint32_t candidate_count = 0U;
   std::uint32_t device_count = 0U;
   bool device_filter_applied = false;
-  Status last = impl_->peer_link->GetCandidateCount(
-      &candidate_count, &device_count, &device_filter_applied);
+  Status last;
+  {
+    detail::InitPhaseTimer timer(impl_->options.profile_initialize, "npu", "candidate_query",
+                                0U, ddr_bytes, std::numeric_limits<std::uint32_t>::max());
+    last = impl_->peer_link->GetCandidateCount(
+        &candidate_count, &device_count, &device_filter_applied);
+    if (last.ok()) timer.MarkSucceeded();
+    else timer.MarkFailed();
+  }
   if (!last.ok()) return last;
   if (candidate_count == 0U) {
     return Status::NotFound("peer Runtime returned no UMDK/EID candidates");
@@ -535,16 +579,23 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   std::vector<NpuLocalEidCandidate> npu_candidates;
   std::string discovery_error;
   const bool explicit_eids = !impl_->options.npu_eids.empty();
-  if (explicit_eids) {
-    if (!ParseConfiguredNpuLocalEids(impl_->options.device_id,
-                                     impl_->options.npu_eids,
-                                     &npu_candidates, &discovery_error)) {
-      return Status::InvalidArgument(discovery_error);
+  {
+    detail::InitPhaseTimer timer(impl_->options.profile_initialize, "npu", "eid_discovery",
+                                0U, ddr_bytes, std::numeric_limits<std::uint32_t>::max());
+    if (explicit_eids) {
+      if (!ParseConfiguredNpuLocalEids(impl_->options.device_id,
+                                       impl_->options.npu_eids,
+                                       &npu_candidates, &discovery_error)) {
+        timer.MarkFailed();
+        return Status::InvalidArgument(discovery_error);
+      }
+    } else if (!DiscoverNpuLocalEidCandidates(
+                   impl_->options.device_id, &npu_candidates,
+                   &discovery_error)) {
+      timer.MarkFailed();
+      return Status::NotFound(discovery_error);
     }
-  } else if (!DiscoverNpuLocalEidCandidates(
-                 impl_->options.device_id, &npu_candidates,
-                 &discovery_error)) {
-    return Status::NotFound(discovery_error);
+    timer.MarkSucceeded();
   }
   const std::size_t worker_count =
       static_cast<std::size_t>(impl_->options.npu_core_count) *
@@ -601,6 +652,9 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                               impl_->options.peer_ub_device);
     }
   }
+  std::uint64_t initialization_attempt = 0U;
+  std::uint64_t active_attempt_bytes = ddr_bytes;
+  std::uint32_t active_peer_candidate = std::numeric_limits<std::uint32_t>::max();
   auto initialize_candidate = [&](const detail::StartupCandidate& candidate,
                                   bool measure, double* cycles) -> Status {
     const std::uint32_t peer_candidate = candidate.peer;
@@ -611,7 +665,17 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
         : request;
     const auto ddr_bytes = candidate_request.ddr_bytes;
     const auto slot_size = candidate_request.slot_size;
+    const std::uint64_t attempt = impl_->next_initialize_attempt++;
+    initialization_attempt = attempt;
+    active_attempt_bytes = ddr_bytes;
+    active_peer_candidate = peer_candidate;
+    detail::InitPhaseTimer candidate_timer(impl_->options.profile_initialize, "npu",
+                                          "candidate_initialize", attempt, ddr_bytes,
+                                          peer_candidate);
+    candidate_timer.MarkFailed();
     impl_->peer_allocator->SetCandidate(peer_candidate);
+    impl_->peer_allocator->SetInitializeProfiling(
+        impl_->options.profile_initialize, attempt, impl_->options.device_id);
     Status last;
     for (const std::size_t npu_group : std::array<std::size_t, 1U>{candidate.local_group}) {
       const std::size_t group_begin = explicit_eids ? 0U : npu_group;
@@ -629,8 +693,13 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       // Multi-EID striping applies only to BatchGet and uses the vector above.
       impl_->config.peer_local_eid = impl_->config.peer_local_eids.front();
       impl_->CreateCore();
+      impl_->runtime_core->SetInitializeProfiling(
+          impl_->options.profile_initialize, attempt, peer_candidate);
       last = impl_->runtime_core->Initialize(candidate_request);
       if (last.ok()) {
+        detail::InitPhaseTimer probe_timer(impl_->options.profile_initialize, "npu",
+                                          "startup_probe", attempt, ddr_bytes,
+                                          peer_candidate);
         const std::uint64_t probe_bytes =
             std::min<std::uint64_t>(slot_size, kBatchPutProbeBytesPerRow);
         const std::uint64_t probe_rows = BatchPutStartupProbeRows(
@@ -672,6 +741,8 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
         if (stream != nullptr && aclrtDestroyStream(stream) != ACL_SUCCESS && last.ok()) {
           last = Internal("failed to destroy peer candidate probe stream");
         }
+        if (last.ok()) probe_timer.MarkSucceeded();
+        else probe_timer.MarkFailed();
       }
       if (last.ok() && measure) {
         impl_->bandwidth_probe =
@@ -684,6 +755,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                        impl_->options.device_id,
                        peer_candidate_device_names[peer_candidate].c_str(),
                        probe_config.miss_count, *cycles);
+          candidate_timer.MarkSucceeded();
           return last;
         }
       }
@@ -701,6 +773,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                        impl_->options.device_id,
                        impl_->options.peer_ub_device.c_str());
         }
+        candidate_timer.MarkSucceeded();
         return Status::OK();
       }
       return last;
@@ -708,6 +781,9 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
     return last;
   };
   auto cleanup = [&]() -> Status {
+    detail::InitPhaseTimer timer(impl_->options.profile_initialize, "npu", "candidate_cleanup",
+                                initialization_attempt, active_attempt_bytes, active_peer_candidate);
+    timer.MarkFailed();
     if (impl_->runtime_core->initialized()) {
       const Status status = impl_->runtime_core->Shutdown();
       if (!status.ok()) return status;
@@ -719,6 +795,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
     impl_->runtime_core.reset();
     impl_->access_operator.reset();
     impl_->ReleaseProbe();
+    timer.MarkSucceeded();
     return Status::OK();
   };
   if (!tune_candidates) {

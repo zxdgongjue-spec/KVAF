@@ -46,6 +46,8 @@ struct NpuRuntimeOptions {
   // Optional strict K-side UB device selected by an earlier Runtime process.
   // Its EIDs remain connectivity fallbacks, but no bandwidth tuning is run.
   std::string peer_ub_device{};
+  // Opt-in initialization diagnostics; includes startup phase timing and faults.
+  bool profile_initialize{false};
 };
 
 // NPU role Runtime. It owns the current MetaManager, NPU AccessOperator and
