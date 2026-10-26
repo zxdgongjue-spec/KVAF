@@ -1,8 +1,10 @@
 #include "cpu_push_get_transport.h"
 #include "urma_device_abi.h"
+#include "batch_get_profile.h"
 
 #include <chrono>
 #include <cerrno>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -204,20 +206,34 @@ Status Transport::Transfer(bool write, std::uint64_t offset, std::uint64_t bytes
 }
 Status Transport::ReadRequest(std::uint64_t* sequence) {
   auto result = Transfer(false, layout_.notify, sizeof(Word));
-  if (result.ok()) *sequence = reinterpret_cast<const Word*>(memory_ + layout_.notify)->value;
+  if (result.ok()) {
+    const auto notify = reinterpret_cast<const Word*>(memory_ + layout_.notify)->value;
+    *sequence = notify & ~kProfileNotify;
+    profile_.enabled = (notify & kProfileNotify) != 0;
+  }
   return result;
 }
 Status Transport::ReadDescriptor(std::uint64_t sequence) {
-  auto result = Transfer(false, layout_.request, sizeof(Request));
+  if (profile_.enabled) {
+    profile_ = {};
+    profile_.enabled = true;
+  }
+  Status result;
+  {
+    BatchGetProfileScope timer(profile_.enabled ? &profile_.header_read_ns : nullptr);
+    result = Transfer(false, layout_.request, sizeof(Request));
+  }
   if (!result.ok()) return result;
   const auto& r = request();
   if (r.magic != kMagic || r.sequence != sequence || !sequence || sequence > UINT32_MAX ||
       r.count > kMaxRequests || r.token_bytes != token_bytes_ || r.workers != workers_)
     return Status::InvalidArgument("CPU push request header mismatch");
+  BatchGetProfileScope timer(profile_.enabled ? &profile_.address_read_ns : nullptr);
   return Transfer(false, layout_.descriptor, r.count * sizeof(std::uint64_t));
 }
 
 Status Transport::WriteBatch() {
+  BatchGetProfileScope timer(profile_.enabled ? &profile_.write_ns : nullptr);
   const auto& r = request();
   const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
   auto* markers = reinterpret_cast<std::uint64_t*>(memory_ + layout_.staging);
@@ -226,13 +242,28 @@ Status Transport::WriteBatch() {
     ResetRequests(q);
   }
   const auto flush_wave = [&]() -> Status {
+    if (profile_.enabled) ++profile_.waves;
     for (auto& q : queues_) {
       if (q.wrs.empty()) continue;
+      const auto begin = profile_.enabled ? BatchGetProfileNowNs() : 0;
+      if (profile_.enabled && !profile_.first_post_ns) profile_.first_post_ns = begin;
       auto status = Post(q);
+      if (profile_.enabled) {
+        profile_.post_ns += BatchGetProfileNowNs() - begin;
+        profile_.post_calls += (q.wrs.size() + 31) / 32;
+      }
       if (!status.ok()) return status;
     }
     for (auto& q : queues_) {
-      if (q.pending) { auto status = Wait(q); if (!status.ok()) return status; }
+      if (q.pending) {
+        const auto begin = profile_.enabled ? BatchGetProfileNowNs() : 0;
+        auto status = Wait(q);
+        if (profile_.enabled) {
+          profile_.last_cqe_ns = BatchGetProfileNowNs();
+          profile_.cq_wait_ns += profile_.last_cqe_ns - begin;
+        }
+        if (!status.ok()) return status;
+      }
       ResetRequests(q);
     }
     return Status::OK();
@@ -263,6 +294,7 @@ Status Transport::WriteBatch() {
           if (offset == token_bytes_) { ++row; offset = 0; }
         }
         Add(q, URMA_OPC_WRITE, destination, bytes, first, sges);
+        if (profile_.enabled) ++profile_.data_wrs;
       }
       for (std::uint32_t index = 0; index < kJettyCount; ++index) {
         auto& q = queues_[index];
@@ -275,6 +307,7 @@ Status Transport::WriteBatch() {
         Add(q, URMA_OPC_WRITE, hbm_base_ + layout_.ready + worker * sizeof(Ready) + index * 8,
             8, first, 1);
         q.wrs.back().flag.bs.place_order = URMA_STRONG_ORDER;
+        if (profile_.enabled) ++profile_.ready_wrs;
       }
     }
   }
@@ -282,9 +315,32 @@ Status Transport::WriteBatch() {
   return flush_wave();
 }
 Status Transport::Complete(std::uint64_t sequence, Result result) {
+  BatchGetProfileScope timer(profile_.enabled ? &profile_.done_ns : nullptr);
   auto* done = reinterpret_cast<Completion*>(memory_ + layout_.done);
   *done = {Progress(sequence, static_cast<std::uint32_t>(result)), {}};
   return Transfer(true, layout_.done, sizeof(Completion));
+}
+
+void Transport::PrintProfile() const {
+  if (!profile_.enabled) return;
+#ifdef __OPTIMIZE__
+  constexpr unsigned optimized = 1;
+#else
+  constexpr unsigned optimized = 0;
+#endif
+  const auto& p = profile_;
+  const auto& r = request();
+  const auto build_ns = p.write_ns - p.post_ns - p.cq_wait_ns;
+  const auto submit_ns = p.first_post_ns ? p.last_cqe_ns - p.first_post_ns : 0;
+  std::fprintf(stderr,
+      "CPU_PUSH_PROFILE sequence=%" PRIu64 " workers=%u rows=%u bytes=%" PRIu64
+      " header_read_us=%.1f address_read_us=%.1f build_us=%.1f post_us=%.1f cq_wait_us=%.1f"
+      " write_us=%.1f submit_to_cqe_us=%.1f done_us=%.1f"
+      " data_wrs=%u ready_wrs=%u post_calls=%u waves=%u optimized=%u\n",
+      r.sequence, r.workers, r.count, std::uint64_t{r.count} * token_bytes_,
+      p.header_read_ns / 1000.0, p.address_read_ns / 1000.0, build_ns / 1000.0, p.post_ns / 1000.0,
+      p.cq_wait_ns / 1000.0, p.write_ns / 1000.0, submit_ns / 1000.0, p.done_ns / 1000.0,
+      p.data_wrs, p.ready_wrs, p.post_calls, p.waves, optimized);
 }
 
 Status Transport::Shutdown() {

@@ -21,10 +21,17 @@ class Transport {
   Status ReadDescriptor(std::uint64_t sequence);
   Status WriteBatch();
   Status Complete(std::uint64_t sequence, Result result);
+  void PrintProfile() const;
   Status Shutdown();
   const Request& request() const { return *reinterpret_cast<const Request*>(memory_); }
   const Layout& layout() const { return layout_; }
  private:
+  struct Profile {
+    bool enabled{};
+    std::uint64_t header_read_ns{}, address_read_ns{}, write_ns{}, post_ns{}, cq_wait_ns{}, done_ns{};
+    std::uint64_t first_post_ns{}, last_cqe_ns{};
+    std::uint32_t data_wrs{}, ready_wrs{}, post_calls{}, waves{};
+  } profile_;
   struct Queue {
     cpu_runtime_detail::UrmaChannel channel;
     std::vector<urma::Sge> local, remote;

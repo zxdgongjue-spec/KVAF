@@ -6,6 +6,8 @@ namespace kvaf::cpu_push {
 constexpr std::uint64_t kMagic = 0x4b56414650555331ULL;
 constexpr std::uint32_t kMaxRequests = 65536, kMaxWorkers = 8, kJettyCount = 4;
 constexpr std::uint32_t kChunkRows = 1024, kTimeoutMs = 30000;
+// Sequence numbers occupy at most 32 bits. Publish the sampling flag with them.
+constexpr std::uint64_t kProfileNotify = std::uint64_t{1} << 63;
 
 enum class Result : std::uint64_t {
   kPending = 0, kOk = 1, kInvalidRequest = 2, kTimeout = 3,

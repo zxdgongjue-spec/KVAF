@@ -96,6 +96,8 @@ def print_profile(samples: list[dict], mode: str) -> None:
                                            "ready_queries")))
         if mode == "cpu_push_scatter":
             print("    Push " + fields(rows, ("scatter_us", "output_cache_us")))
+    if mode == "cpu_push_scatter":
+        print("  CPU stages: see CPU_PUSH_PROFILE in the CPU service log (units=us).")
     print("  Timing: Host phases sum to Host total; Host wait includes queued device work/D2H. "
           "Worker intervals overlap. Cache times are inside request; READ phases are inside read. "
           "ready_wait includes CPU gather overlap, not a separate CPU gather measurement. "

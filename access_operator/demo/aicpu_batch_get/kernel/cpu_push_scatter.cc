@@ -109,7 +109,7 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) {
     if (Load(c.result) == 0 && count) {
       BatchGetProfileScope timer(profile ? &profile->notify_ns : nullptr);
       auto* notify = reinterpret_cast<Word*>(io.Memory() + layout.notify);
-      Store(*notify, args->sequence);
+      Store(*notify, args->sequence | (profile ? kProfileNotify : 0));
     }
     Store(c.built, 1);
   } else if (io.Wait(c.built, 1)) {

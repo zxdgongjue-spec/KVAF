@@ -110,5 +110,15 @@ push 路径的 `read_us` 是消费 ready 并执行 scatter 的区间，`ack_us` 
 `source_write_us` 为零，因为本轮源清单由 CPU READ 获取。
 缓存维护相关字段为零。设备 worker 的区间重叠，不能相加作为端到端时长。
 
+`--profile-rounds` 同时开启 CPU 分段计时。CPU 服务在每个采样请求完成后输出一行
+`CPU_PUSH_PROFILE`，包含 profile 预热轮；普通带宽轮次不采集或打印这些计时。
+`header_read_us`、`address_read_us` 分别是 READ 请求头和整块源地址数组的耗时；
+`write_us` 包含 `build_us`、`post_us`
+和 `cq_wait_us`，分别表示 WR/SGL 构建及整理、提交、提交后的 CQ 等待。
+`submit_to_cqe_us` 从首次 post 到最后一个数据链尾 CQE，包含提交期间与 DMA 的重叠；
+`done_us` 是最终 done WRITE 及其 CQ 等待。计时从 CPU 看到新请求后开始，不含空闲轮询。
+`data_wrs`、`ready_wrs`、`post_calls`、`waves` 给出数据 WR、ready WR、provider 提交及 wave 数；
+`optimized=0` 表示 CPU transport 编译时未启用优化。
+
 主要文件对应：`cpu_push_host.cc` 管 Host 资源，`cpu_push_get_worker.cc` 管 CPU 请求循环，
 `cpu_push_get_transport.cc` 管 URMA 数据链，`cpu_push_scatter.cc` 管设备消费与本地复制。

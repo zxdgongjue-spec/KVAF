@@ -52,6 +52,7 @@ void Worker::Run() {
     status = transport_->WriteBatch();
     if (status.ok()) status = transport_->Complete(sequence, Result::kOk);
     if (!status.ok()) { std::fprintf(stderr, "CPU_PUSH: %s\n", status.message().c_str()); return; }
+    transport_->PrintProfile();
   }
 }
 }  // namespace kvaf::cpu_push
