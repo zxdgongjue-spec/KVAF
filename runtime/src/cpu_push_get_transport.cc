@@ -1,6 +1,7 @@
 #include "cpu_push_get_transport.h"
 #include "urma_device_abi.h"
 #include "batch_get_profile.h"
+#include "cpu_push/a12bb16/pipeline.h"
 
 #include <chrono>
 #include <cerrno>
@@ -212,9 +213,7 @@ Status Transport::ReadRequest(std::uint64_t* sequence) {
   auto result = Transfer(false, layout_.notify, sizeof(Word));
   if (result.ok()) {
     const auto notify = reinterpret_cast<const Word*>(memory_ + layout_.notify)->value;
-    *sequence = NotifySequence(notify);
-    announced_count_ = NotifyCount(notify);
-    if (announced_count_ > kMaxRequests) return Error("notify count exceeds request capacity");
+    *sequence = notify & ~kProfileNotify;
     profile_.enabled = (notify & kProfileNotify) != 0;
   }
   return result;
@@ -224,18 +223,18 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
     profile_ = {};
     profile_.enabled = true;
   }
-  // The atomically published count lets one bounded READ fetch both header
-  // and addresses. Avoid a serialized header READ before the address READ.
-  BatchGetProfileScope timer(profile_.enabled ? &profile_.address_read_ns : nullptr);
-  const auto bytes = layout_.descriptor - layout_.request +
-                     std::uint64_t{announced_count_} * sizeof(std::uint64_t);
-  auto result = Transfer(false, layout_.request, bytes);
+  Status result;
+  {
+    BatchGetProfileScope timer(profile_.enabled ? &profile_.header_read_ns : nullptr);
+    result = Transfer(false, layout_.request, sizeof(Request));
+  }
   if (!result.ok()) return result;
   const auto& r = request();
   if (r.magic != kMagic || r.sequence != sequence || !sequence || sequence > UINT32_MAX ||
-      r.count != announced_count_ || r.token_bytes != token_bytes_ || r.workers != workers_)
+      r.count > kMaxRequests || r.token_bytes != token_bytes_ || r.workers != workers_)
     return Status::InvalidArgument("CPU push request header mismatch");
-  return Status::OK();
+  BatchGetProfileScope timer(profile_.enabled ? &profile_.address_read_ns : nullptr);
+  return Transfer(false, layout_.descriptor, r.count * sizeof(std::uint64_t));
 }
 
 // Ported from hbm-sgl-probe PrepareWrite: partition each chunk into contiguous
@@ -276,17 +275,15 @@ Status Transport::PrepareWrites(std::uint32_t count) {
     return Status::OK();
   }
   std::array<std::vector<PreparedQueue>, kJettyCount> shards;
-  std::uint32_t chunks = 0;
-  for (std::uint32_t w = 0; w < workers_; ++w)
-    chunks = std::max(chunks, ChunkCount(WorkerRange(count, token_bytes_, w, workers_)));
+  const auto config = ReferenceConfig(count, token_bytes_, workers_);
   for (std::uint32_t queue = 0; queue < kJettyCount; ++queue) {
     auto& waves = shards[queue];
     waves.emplace_back();
-    for (std::uint32_t chunk = 0; chunk < chunks; ++chunk) {
-      for (std::uint32_t worker = 0; worker < workers_; ++worker) {
-        const auto partition = WorkerRange(count, token_bytes_, worker, workers_);
-        if (chunk >= ChunkCount(partition)) continue;
-        const auto range = ChunkRange(partition, chunk);
+    aicpu_test::ForEachPipelineChunk(config,
+      [&](std::uint32_t worker, std::uint64_t chunk_index, aicpu_test::RowRange original) {
+        const auto chunk = static_cast<std::uint32_t>(chunk_index);
+        const Range range{static_cast<std::uint32_t>(original.begin),
+                          static_cast<std::uint32_t>(original.end)};
         const auto rows = range.end - range.begin;
         const auto base = rows / kJettyCount, remainder = rows % kJettyCount;
         auto row = range.begin + queue * base + std::min(queue, remainder);
@@ -317,8 +314,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
         q.local.push_back({reinterpret_cast<std::uint64_t>(marker), 8, control_, nullptr});
         AppendPrepared(q, queue, hbm_base_ + layout_.ready + worker * sizeof(Ready) + queue * 8,
                        8, 1, true);
-      }
-    }
+      });
   }
   std::size_t waves = 0;
   for (const auto& shard : shards) waves = std::max(waves, shard.size());
@@ -498,7 +494,6 @@ Status Transport::Shutdown() {
   prepared_.clear();
   done_ = {};
   prepared_count_ = UINT32_MAX;
-  announced_count_ = 0;
   next_poll_queue_ = 0;
   for (auto& q : queues_) { ResetRequests(q); q.poisoned = false; q.sequence = 0; }
   std::free(memory_); memory_ = nullptr;

@@ -1,14 +1,20 @@
+#if defined(KVAF_CPU_PUSH_DEVICE_KERNEL)
+#define KVAF_AICPU_TEST_DEVICE_KERNEL 1
+#endif
 #include "cpu_push_scatter.h"
 #include "cpu_push_pipeline.h"
-#include "cpu_push_scatter_plan.h"
 
 #include <cstring>
-#if defined(__linux__) && defined(__aarch64__)
-#include <securec.h>
-#endif
 
 namespace kvaf::cpu_push {
 namespace {
+void Barrier() {
+#if defined(__aarch64__)
+  asm volatile("dsb sy" ::: "memory");
+#else
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+}
 std::uint64_t CounterNow() {
 #if defined(__linux__) && defined(__aarch64__)
   std::uint64_t value;
@@ -38,25 +44,41 @@ struct Execution {
   const KernelArgs& args;
   Layout layout;
   Coordination& coordination;
-  std::uint32_t worker;
-  std::uint64_t deadline;
+  std::uint64_t start, timeout;
   BatchGetWorkerProfile* profile;
+  std::uint32_t idle_polls{};
+  aicpu_test::Config config{};
   std::uint8_t* Memory() const { return reinterpret_cast<std::uint8_t*>(args.workspace); }
   void Relax() {
+    // V24's hot Status path reads only shared worker coordination. Runtime
+    // also carries remote errors in done; sample it only while stalled.
+    if ((++idle_polls & 31) == 0) {
+      const auto result = CompletionStatus();
+      if (result != Result::kPending) Fail(coordination, result);
+    }
 #if defined(__aarch64__)
     asm volatile("yield" ::: "memory");
 #endif
   }
-  Result Check() {
-    auto result = static_cast<Result>(Load(coordination.result));
-    if (result != Result::kPending) return result;
-    if (CounterNow() >= deadline) return Result::kTimeout;
+  std::uint64_t Now() { return CounterNow(); }
+  Result Status() {
+    return static_cast<Result>(Load(coordination.result));
+  }
+  Result CompletionStatus() {
+    Barrier();
     auto* done = reinterpret_cast<volatile Completion*>(Memory() + layout.done);
     const auto token = done->token, sequence = token >> 32;
     if (sequence > args.sequence) return Result::kSequenceError;
     if (sequence == args.sequence && static_cast<Result>(std::uint32_t(token)) != Result::kOk)
       return static_cast<Result>(std::uint32_t(token));
     return Result::kPending;
+  }
+  Result Check() {
+    auto result = Status();
+    if (result != Result::kPending) return result;
+    result = CompletionStatus();
+    if (result != Result::kPending) return result;
+    return CounterNow() - start >= timeout ? Result::kTimeout : Result::kPending;
   }
   bool Wait(const Word& word, std::uint64_t value) {
     while (Load(word) < value) {
@@ -66,27 +88,23 @@ struct Execution {
     }
     return true;
   }
-  std::uint64_t ReadReady(std::uint32_t q) {
-    auto* ready = reinterpret_cast<Ready*>(Memory() + layout.ready) + worker;
-    if (!q && profile) ++profile->ready_queries;
-    return reinterpret_cast<volatile Ready*>(ready)->jetty[q];
+  std::uint64_t ReadRangeDone(std::uint32_t w) {
+    Barrier();
+    auto* ready = reinterpret_cast<volatile Ready*>(Memory() + layout.ready) + w;
+    if (profile) ++profile->ready_queries;
+    return aicpu_test::ChainReadyProgress(config,
+        w, args.sequence, [&](std::uint32_t q) { return ready->jetty[q]; });
   }
+  void FinishRange() { Barrier(); }
   bool Copy(Range range) {
     BatchGetProfileScope timer(profile ? &profile->scatter_ns : nullptr);
     const auto bytes = args.request.token_bytes;
-    const auto* rows = reinterpret_cast<const std::uint32_t*>(Memory() + layout.destinations);
+    const auto* rows = reinterpret_cast<const std::int32_t*>(args.request.output_indices);
     auto* source = Memory() + layout.staging;
-    __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    return CopyScatterRuns(rows, range, bytes, [&](auto destination, auto offset, auto length) {
-      auto* target = reinterpret_cast<std::uint8_t*>(args.output) + destination;
-      if (profile) ++profile->scatter_copies;
-#if defined(__linux__) && defined(__aarch64__)
-      return memcpy_sp(target, length, source + offset, length) == EOK;
-#else
-      std::memcpy(target, source + offset, length);
-      return true;
-#endif
-    });
+    Barrier();
+    const bool copied = CopyMappedRows(reinterpret_cast<std::uint8_t*>(args.output), source, rows, range, bytes);
+    if (profile) profile->scatter_copies += range.end - range.begin;
+    return copied;
   }
   bool Build(std::uint32_t* count) {
     const auto& r = args.request;
@@ -100,13 +118,8 @@ struct Execution {
     const auto* indices = reinterpret_cast<const std::int32_t*>(r.indices);
     const auto* offsets = reinterpret_cast<const std::int32_t*>(r.offsets);
     auto* sources = reinterpret_cast<std::uint64_t*>(Memory() + layout.descriptor);
-    {
-      BatchGetProfileScope order_timer(profile ? &profile->request_order_ns : nullptr);
-      BuildScatterPlan(addresses, indices, offsets,
-          reinterpret_cast<const std::int32_t*>(r.output_indices), *count, sources,
-          reinterpret_cast<std::uint32_t*>(Memory() + layout.destinations),
-          reinterpret_cast<std::uint32_t*>(Memory() + layout.sort_scratch));
-    }
+    for (std::uint32_t i = 0; i < *count; ++i)
+      sources[i] = addresses[indices[i]] + static_cast<std::uint32_t>(offsets[i]);
     auto* header = reinterpret_cast<Request*>(Memory() + layout.request);
     *header = {kMagic, args.sequence, *count, r.token_bytes, args.workers, 0, {}};
     return true;
@@ -125,15 +138,16 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) {
   BatchGetWorkerProfile measured{};
   auto* profile = args->profile ? &measured : nullptr;
   if (profile) profile->enter_ns = BatchGetProfileNowNs();
-  Execution io{*args, layout, c, worker,
-      CounterNow() + CounterFrequency() * args->timeout_ms / 1000, profile};
+  Execution io{*args, layout, c, CounterNow(),
+      CounterFrequency() * args->timeout_ms / 1000, profile};
   std::uint32_t count = 0;
   if (!worker) {
     if (!io.Build(&count)) Fail(c, Result::kInvalidRequest);
     if (Load(c.result) == 0 && count) {
       BatchGetProfileScope timer(profile ? &profile->notify_ns : nullptr);
       auto* notify = reinterpret_cast<Word*>(io.Memory() + layout.notify);
-      Store(*notify, RequestNotify(static_cast<std::uint32_t>(args->sequence), count, profile != nullptr));
+      Store(*notify, args->sequence | (profile ? kProfileNotify : 0));
+      Barrier();
     }
     Store(c.built, 1);
   } else if (io.Wait(c.built, 1)) {
@@ -141,10 +155,12 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) {
     count = reinterpret_cast<const Request*>(io.Memory())->count;
   }
   const auto range = WorkerRange(count, args->request.token_bytes, worker, args->workers);
+  io.config = ReferenceConfig(count, args->request.token_bytes, args->workers);
   std::uint32_t consumed = 0;
   if (Load(c.result) == 0 && count) {
     BatchGetProfileScope timer(profile ? &profile->read_ns : nullptr);
-    const auto result = Consume(range, args->sequence, io, &consumed);
+    const auto result = Consume(count, args->request.token_bytes, args->workers, worker,
+                                args->sequence, io.start, io.timeout, io, &consumed);
     if (result != Result::kOk) Fail(c, result);
   }
   __atomic_fetch_add(&c.arrivals.value, 1, __ATOMIC_ACQ_REL);
@@ -166,6 +182,7 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) {
   auto* status = reinterpret_cast<WorkerStatus*>(args->status) + worker;
   *status = {kMagic, args->sequence, Load(c.result) ? Load(c.result) : std::uint64_t(Result::kOk),
              worker, consumed, {}};
+  Barrier();
   if (profile) {
     profile->spans = range.end - range.begin;
     profile->bytes = profile->spans * args->request.token_bytes;

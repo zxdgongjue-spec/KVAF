@@ -30,7 +30,9 @@ CPU 使用四路 Jetty，由所属服务线程更新并依次提交预构建链�
 ## 构建并验证
 
 两端代码、设备 SO 和 kernel JSON 一起更新，重启 CPU 服务及 NPU 进程。
-当前 push 协议为 V2，新增设备输出排序工作区；旧 CPU 服务或旧设备包会被拒绝：
+当前 push 协议为 V3，复制和 ready 流水线固定采用
+`codex/aicpu-ordered-write` 的 `a12bb16c120e885eb18ed61581739e1c212c32e8`（V24）。
+设备入口为 `KvafAicpuCpuPushScatterA12V24`；旧 CPU 服务或旧设备包会被拒绝：
 
 ```bash
 ./build.sh cpu
@@ -39,11 +41,17 @@ export PYTHONPATH="$PWD/build-aicpu-urma/python:$PYTHONPATH"
 ```
 
 设备 `memcpy_sp` 需要 securec 头文件和 AArch64 动态库，构建会查找 CANN 内的依赖并打包。
-CPU 构建链接 OpenMP，并启用 `-O2`、保留调试信息。
+设备 scatter 单独按参考提交使用 `-O3`；其余设备 UMDK/session 源码继续使用 `-O2`。
+CPU 构建链接 OpenMP，并启用 `-O2`、保留调试信息，push 提交由一个服务线程执行。
 `--cpu-push` 对应 CMake 的 `KVAF_ENABLE_AICPU_CPU_PUSH=ON`，默认关闭。
 原有 gather-only 构建不查找或链接 securec/direct HCCP。
 布局不同时设置 `KVAF_AICPU_SECUREC_INCLUDE_DIR` 和 `KVAF_AICPU_SECUREC_LIBRARY`。
 CPU 服务启动方法见 [gather_read 使用说明](aicpu_gather_read.md)。
+初始化日志必须包含：
+
+```text
+CPU_PUSH_REFERENCE commit=a12bb16c120e885eb18ed61581739e1c212c32e8 protocol=3 copy=per_row_memcpy_sp barrier=dsb_sy device_optimization=O3
+```
 
 ```bash
 python3 access_operator/demo/aicpu_batch_get/python/test_batch_get.py \
@@ -54,7 +62,9 @@ python3 access_operator/demo/aicpu_batch_get/python/test_batch_get.py \
   --output-row-step 1 --warmup 10 --iterations 100
 ```
 
-`--output-row-step 1` 检查随机排列的相邻输出行；改为 2 检查输出间隔。
+`--output-row-step 1` 检查相邻输出行；改为 2 检查输出间隔。
+`--output-order random`（默认）随机排列目标行；`sequential` 按目标行顺序请求。
+这个选项只改变测试输入，算子按调用方给定的顺序执行，不排序 Tensor。
 脚本每轮重新写入源数据和输入元数据，比较整个输出，并用后继 NPU 算子消费输出。
 预检包括部分/空 `miss_count`、两种 Tensor 重载和异步调用。
 需要阶段耗时时增加 `--profile-rounds 100`；采样轮次不计入正常带宽。
@@ -75,14 +85,15 @@ CPU 建立专用回写队列，返回对端信息；Host 完成导入后才激�
 每轮过程如下：
 
 1. Host 在调用方 stream 清零本次 AICPU coordination，再启动配置数量的实例。
-2. worker 0 对有效前缀按 `output_indices` 做稳定基数排序，按同一排列构建源地址与目标行清单，
-   在 HBM 发布请求头和 request sequence。调用方的 Tensor 不被修改；已排序输入跳过基数排序。
-3. notify 同时原子发布 sequence、有效数量和 profile 位；CPU 将请求头及源地址数组合并 READ，
-   校验头中的数量与 notify 一致，再由所属线程更新预构建 SGL 的源地址。
+2. worker 0 按原始请求顺序生成源地址清单，在 HBM 发布请求头和 request sequence。
+   不生成设备排序数组，不改写调用方 Tensor。
+3. notify 发布 sequence 和可选 profile 位；CPU READ 请求头，验证后 READ 有效源地址前缀，
+   由所属线程更新预构建 SGL 的源地址。
 4. CPU 直接从已注册 DDR 源 WRITE 到 packed HBM staging，不打包 payload 到 CPU 临时区。
 5. 按 worker 的 staging 区间划分 1024 行 chunk，各 Jetty 在其数据之后强序 WRITE ready。
-6. AICPU 取四个 Jetty 的共同就绪前缀，按排序后的目标行清单 scatter。
-   只在已就绪范围内合并相邻目标行，单次复制最多 1 MiB；目标间隔和未激活行保持不变。
+6. AICPU 使用参考提交原始 `ChainReadyProgress` / `RunPipelineChunks`，取四个 Jetty
+   的共同就绪前缀。每个有效请求调用参考提交的 `CopyScatterRows`，逐行执行 `memcpy_sp`，
+   目标为原始 `output_indices[i]`。ready 读取前、复制前及 worker 复制完成后执行 `dsb sy`。
 7. CPU 收齐数据链尾 CQE 后发布 done；全部 scatter 与 done 均完成后 kernel 结束。
 
 ready 用高 32 位 sequence、低 32 位 chunk 数编码；done 在同一个 64 位字内编码 sequence 和结果。
@@ -90,20 +101,46 @@ ready 用高 32 位 sequence、低 32 位 chunk 数编码；done 在同一个 64
 空前缀不通知 CPU、不修改输出；CPU 允许此类调用造成的序号间隔。
 当前实现针对普通 stream enqueue，Host 固定序号不能用于 graph replay。
 
-CPU 数据面沿用 `hbm-sgl-probe` V24 的 prepared WRITE、indexed CQ 和轮转 CQ 扫描。
+CPU 数据面沿用该提交 V24 的 prepared WRITE、indexed CQ 和轮转 CQ 扫描，
+chunk 枚举直接调用其原始 `ForEachPipelineChunk`。
 每个 chunk 按连续行分到四个 Jetty；请求数量不变时复用数据/ready 链，每轮只更新源地址和序号。
 所属线程更新并依次提交四路队列，收齐数据链尾 CQE 后提交预构建的 done 链，
 消除每轮 OpenMP team 唤醒和多次 barrier；多 wave 请求仍逐 wave 排空再复用 SQ。
 每个 Jetty 的 SQ 深度为 8192，doorbell 为 32 WR，CQ batch 为 8，每 32 次扫描检查超时。
 超出单 wave 容量的请求分 wave 执行，完成前保留全部 WR/SGL；每个 ready 使用独立的注册源字。
 Runtime 按每次 BatchGet 启动 kernel，接收本轮动态源地址和 `output_indices`。
+ready 热循环与 V24 一样只读 worker 协调状态；Runtime 的远端错误完成字在阻塞时每
+32 次轮询检查一次，在最终 done 等待中逐次检查。
+
+## 与指定提交的对应关系
+
+`common/include/cpu_push/a12bb16/abi.h` 和 `pipeline.h` 原样保留参考提交文件，
+来源路径及 Git blob 记录在同目录的 README 中。生产代码直接调用其中的 worker 分区、
+chunk 枚举、四路 ready、消费循环及逐行复制函数，适配层位于 `cpu_push_pipeline.h`。
+
+上一版 V2 新增的设备基数排序、排序 scratch、相邻行合并复制和 notify 数量编码已移除。
+用户提供的 V2 profile 中，排序约 133 μs，而 scatter 仅减少约 30 μs，
+这份实测没有支持原先“减少 memcpy 次数即可改善端到端带宽”的推断。
+
+以下接口和工作量差异保留，用于支持 Runtime 的动态请求，不能由参考代码直接覆盖：
+
+| 项目 | a12bb16 V24 独立测试 | 当前 Runtime |
+| --- | --- | --- |
+| 执行 | 一次 launch，设备内循环所有轮次 | 每次 Python BatchGet 独立 launch、同步并检查状态 |
+| 源 SGL | CPU 预先构建，逐轮修改 ready 序号和源数据标签 | 每轮从动态 Tensor 解析源地址，CPU READ 地址清单并更新 SGL |
+| 输出 | 预先安排顺序输出，656 B 行使用 768 B stride | 按动态 `output_indices` 写入 656 B slot，默认测试随机排列 |
+| 校验 | 源标签每轮变化，末轮完整读回输出 | 每轮变化输入、校验整个输出并由后继 NPU 算子消费 |
+| 带宽计时 | 驻留 kernel 内 request 到 scatter/done | Python 调用开始到本次 stream 完成 |
+
+`--output-order sequential` 可单独测量目标访问顺序的影响；它不改变 slot 大小或带宽计时范围，
+也不能把当前结果等同于旧常驻测试的结果。移植完成和编译通过不等于已恢复 15 GB/s，需硬件复测。
 
 ## 内存、缓存和完成
 
 HBM workspace 包含独立缓存行上的请求头、notify、done、各 worker 的四路 ready，
-随后是源清单、排序后的目标行、基数排序 scratch 和连续 staging。
-staging 容量为 `65536 * token_bytes`，另有 512 KiB 的源地址数组和两个各 256 KiB 的排序数组；
-排序缓冲在初始化时分配，每轮复用，总 payload 必须能用 uint32 表示。
+随后是源清单和连续 staging。
+staging 容量为 `65536 * token_bytes`，另有 512 KiB 的源地址数组；
+workspace 在初始化时分配，每轮复用，总 payload 必须能用 uint32 表示。
 此路径不预留远端 DDR gather staging，也不注册调用方 output 为 URMA 目标。
 
 此路径使用部署环境提供的 DMA 可见性，不执行手动缓存行刷新。
@@ -118,16 +155,17 @@ Shutdown 先停止 CPU worker 并销毁其 DMA 队列，再等待设备执行、
 ## Profile
 
 原有 profile 字段保留，增加 `scatter_us`、`output_cache_us`、`request_order_us` 和 `scatter_copies`。
-`request_order_us` 包含本轮目标排序与源地址清单构建，已包含在 `request_us` 中；
-`scatter_copies` 为实际 memcpy 次数。4096 × 656 B、完整相邻输出、4 worker 时，
-每个 worker 的 1024 行可合并成一次复制，总计 4 次；有间隔、部分前缀或多个 ready 批次时会增加。
+`request_order_us` 为兼容字段，当前没有设备排序，因此为零；
+`request_us` 仍包含动态源地址清单构建。
+`scatter_copies` 为实际逐行 memcpy 次数。4096 × 656 B、完整前缀、4 worker 时，
+每个 worker 为 1024 次，总计 4096 次。这里按参考实现执行，不以复制次数少作为性能通过条件。
 push 路径的 `read_us` 是消费 ready 并执行 scatter 的区间，`ack_us` 是最终 done 等待；
 `source_write_us` 为零，因为本轮源清单由 CPU READ 获取。
 缓存维护相关字段为零。设备 worker 的区间重叠，不能相加作为端到端时长。
 
 `--profile-rounds` 同时开启 CPU 分段计时。CPU 服务在每个采样请求完成后输出一行
 `CPU_PUSH_PROFILE`，包含 profile 预热轮；普通带宽轮次不采集或打印这些计时。
-`address_read_us` 是合并读取请求头和源地址数组的耗时，兼容字段 `header_read_us` 为零；
+`header_read_us` 是请求头 READ 耗时，`address_read_us` 是有效源地址数组 READ 耗时；
 `write_us` 包含 `build_us`、`post_us`
 和 `cq_wait_us`，分别表示计划构建/源地址更新、四路顺序提交、提交后的 CQ 等待。
 `submit_to_cqe_us` 从首次提交阶段到最后一个数据链尾 CQE，包含提交期间与 DMA 的重叠；
@@ -149,18 +187,19 @@ python3 -u access_operator/demo/aicpu_batch_get/python/test_batch_get.py \
   --device-id 7 --peer 127.0.0.1:28990 \
   --modes cpu_push_scatter --workers 4 \
   --blocks 4096 --token-bytes 656 --tokens-per-block 1 \
-  --active-percent 100 --output-row-step 1 \
+  --active-percent 100 --output-row-step 1 --output-order random \
   --warmup 50 --iterations 1000 --profile-rounds 100 \
-  2>&1 | tee results/cpu-push-ordered-4096x656.log
+  2>&1 | tee results/cpu-push-a12bb16-4096x656.log
 ```
 
 保留相同通路、NUMA 策略和测试参数，比较正常轮次的 `GBps`、`mean_us`、`p99_us`。
-profile 中同时检查排序成本 `request_order_us`、复制耗时 `scatter_us` 和 `scatter_copies`：
-该配置每 worker 应为 1 次复制；CPU 应为 `cpu_threads=1`，预热后 `plan_reused=1`。
-将 `--output-row-step` 改为 2 或 `--active-percent` 改为 75，继续验证间隔和部分前缀，
-这两种情况下不要求每 worker 只有一次复制。
+profile 中同时检查 `request_us`、`ready_wait_us`、`scatter_us` 和 `scatter_copies`：
+该配置 `request_order_us=0`，每 worker 为 1024 次复制；CPU 应为 `cpu_threads=1`，
+预热后 `plan_reused=1`。保留 NPU 日志及 CPU 端的 `CPU_PUSH_PROFILE`。
+在单独一次运行中改用 `--output-order sequential`，其余参数不变，可观察输出顺序的影响。
+将 `--output-row-step` 改为 2 或 `--active-percent` 改为 75，继续验证间隔和部分前缀。
 
-端到端仍然计入每次 Python 调用、kernel launch 和状态同步；排序时间也完整计入其中。
+端到端仍然计入每次 Python 调用、kernel launch 和状态同步。
 旧常驻 kernel 的设备内循环带宽和当前 Python 端到端带宽具有不同计时范围。
 
 不依赖 NPU 的回归测试可单独构建运行：
@@ -168,8 +207,13 @@ profile 中同时检查排序成本 `request_order_us`、复制耗时 `scatter_u
 ```bash
 cmake -S . -B build-scatter-tests -DBUILD_TESTING=ON
 cmake --build build-scatter-tests --target kvaf_cpu_push_scatter_test
-ctest --test-dir build-scatter-tests -R '^kvaf_cpu_push_scatter_test$' --output-on-failure
+ctest --test-dir build-scatter-tests -R '^kvaf_cpu_push_(scatter_test|reference_python)$' --output-on-failure
 ```
+
+回归测试直接比较移植适配层与原始 V24 消费循环，覆盖 ready 延迟、跳跃、回退、
+未来序号、超时和复制失败；并执行生产 kernel 的本地线程模型，校验动态源地址、
+输出索引、空/部分前缀、非整除 worker 分区、远端错误及完整输出 guard。
+Python 测试验证参考文件的 Git blob 与指定提交一致，不需要访问 Git 仓库或 NPU。
 
 主要文件对应：`cpu_push_host.cc` 管 Host 资源，`cpu_push_get_worker.cc` 管 CPU 请求循环，
 `cpu_push_get_transport.cc` 管 URMA 数据链，`cpu_push_scatter.cc` 管设备消费与本地复制。

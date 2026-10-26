@@ -21,6 +21,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--npu-eid", help="optional single NPU EID for cpu_push_scatter")
     parser.add_argument("--output-row-step", type=int, choices=[1, 2], default=2,
                         help="1 checks adjacent output rows; 2 leaves one guard row between outputs")
+    parser.add_argument("--output-order", choices=["random", "sequential"], default="random",
+                        help="request order of target slots; sequential matches the V24 probe's output order")
     parser.add_argument("--blocks", type=int, default=4096)
     parser.add_argument("--token-bytes", type=int, default=656)
     parser.add_argument("--tokens-per-block", type=int, default=2)
@@ -148,6 +150,8 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
         row_values = list(range(n))
         rng.shuffle(index_values)
         rng.shuffle(row_values)
+        if args.output_order == "sequential":
+            row_values.sort()
         row_values = [args.output_row_step * row for row in row_values]
         offset_values = [rng.randrange(args.tokens_per_block) * token for _ in range(n)]
         active_count = n * active_percent // 100
@@ -203,7 +207,7 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
         runtime.initialize(ddr_bytes=(n * 2 + 1) * block_bytes, slot_size=block_bytes)
         print(f"AICPU_BATCH_GET_BEGIN mode={mode} workers={workers} blocks={n} token_bytes={token} "
               f"tokens_per_block={args.tokens_per_block} active_percent={args.active_percent} "
-              f"output_row_step={args.output_row_step} warmup={args.warmup} "
+              f"output_row_step={args.output_row_step} output_order={args.output_order} warmup={args.warmup} "
               f"iterations={args.iterations}", flush=True)
         # Exercise both Python overloads, partial prefixes and the empty-request path.
         for epoch, (active, raw) in enumerate(((100, False), (75, True), (0, False))):
@@ -233,6 +237,8 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
         f"p50_us={percentile(samples_us, 0.50):.1f} "
         f"p95_us={percentile(samples_us, 0.95):.1f} "
         f"p99_us={percentile(samples_us, 0.99):.1f} GBps={bandwidth:.3f} "
+        f"output_order={args.output_order} output_row_step={args.output_row_step} "
+        f"active_percent={args.active_percent} "
         "verification=every_round_full_output npu_consumer_checked=1 "
         "padding_checked=1 changing_inputs=1",
         flush=True,

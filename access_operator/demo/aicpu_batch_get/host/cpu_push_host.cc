@@ -7,6 +7,7 @@
 #include "peer_link.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <utility>
 #include <urma_api.h>
@@ -148,6 +149,8 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   result = s.config.peer_link->StartCpuPushGet(source.base);
   if (!result.ok()) return result;
   s.initialized = true;
+  std::fprintf(stderr, "[KVAF_AICPU] CPU_PUSH_REFERENCE commit=%s protocol=3 "
+      "copy=per_row_memcpy_sp barrier=dsb_sy device_optimization=O3\n", kReferenceCommit);
   return Status::OK();
 }
 
