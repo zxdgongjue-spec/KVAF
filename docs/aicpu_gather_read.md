@@ -147,30 +147,27 @@ Host wait 包含排队的设备执行和 D2H；Host 与设备的绝对时间戳�
 
 ## 全量性能扫描
 
-在仓库根目录构建：
+在仓库根目录构建后，先启动 CPU 服务：
 
 ```bash
 ./build.sh cpu
 ./build.sh aicpu-urma --install-kernel
-```
 
-先在一个终端启动 CPU 服务，8 个 gather 线程支持扫描中的 1、2、4、8 worker：
-
-```bash
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28990 \
   --gather-threads 8 --gather-mode active --gather-affinity off
 ```
 
-另一个终端加载 CANN 环境，在仓库根目录运行：
+另一个终端加载 CANN 环境，在仓库根目录运行扫描：
 
 ```bash
-python3 tests/run_aicpu_gather_read_sweep.py \
+./tests/run_aicpu_gather_read_sweep.sh build-aicpu-urma \
   --device-id 7 --peer 127.0.0.1:28990 \
   --urma-device udmac0d1e5 --eid-index 0
 ```
 
-脚本自动使用 `build-aicpu-urma/python`，固定测试 `gather_read`，默认组合为：
+Shell 脚本循环调用 `python/benchmark_gather_read.py`，通过 `NpuRuntime.batch_get` 测量。
+默认扫描 252 组：
 
 | 参数 | 扫描值 |
 | --- | --- |
@@ -178,54 +175,38 @@ python3 tests/run_aicpu_gather_read_sweep.py \
 | miss_count | 32、64、128、256、512、1024、2048、4096、8192 |
 | workers | 1、2、4、8 |
 
-共 252 组，每组独立进程，预热 10 轮、正常计时 100 轮、另采样 profile 100 轮。
-使用 `python/benchmark_gather_read.py`，按 AIV 全量随机测试的方式建立源地址池：
-默认 1,277,952 个源块，每块 128 个 token。数据和地址表初始化一次，测量期间复用。
-每轮从整个源池有放回抽取块索引，随机选择块内 token，再生成不重复的随机输出行号。
-输入数组和输出行数为 `max(32768, miss_count)`；只执行前 miss_count 项。
-输出 HBM 连续分配，所有行都可以被选中，不再固定间隔一行保留保护区。
-每轮在 NPU 上比较整个输出与预期值，同时检查随机未写入行；源数据包含 token 身份信息，以检查读错源块。
-正常测量与 profile 轮次分开，输入准备、BatchPut、地址表准备及校验均在计时之外。
+每组预热 10 轮、测量 100 轮，均开启 profile。端到端、算子和各阶段耗时来自同一批测量轮次。
+只记录一个带宽 `p50_GBps`，计算为 `token_bytes × miss_count / 算子P50耗时(µs) / 1000`。
+算子耗时仍取最早 worker 进入至最后 worker 退出的墙钟时间；各阶段按每轮 worker 最大值统计，不能相加。
 
-先跑小范围可使用：
+默认源池为 1,277,952 个块，每块 128 个 token，数据和地址表初始化一次。
+每轮有放回随机选择源块和块内 token，输出随机选择互不重复的 HBM 行，没有固定隔行保护区。
+输入数组和输出行数为 `max(32768, miss_count)`，每轮校验整个输出和未写入行。
+准备数据、BatchPut、生成请求和结果校验在计时之外。
+
+缩小扫描范围时，设置三个列表即可；其他参数直接传给单组测试：
 
 ```bash
-python3 tests/run_aicpu_gather_read_sweep.py \
+KVAF_AICPU_TOKEN_BYTES="656" \
+KVAF_AICPU_MISS_COUNTS="32 4096" \
+KVAF_AICPU_WORKERS="1 2 4" \
+./tests/run_aicpu_gather_read_sweep.sh build-aicpu-urma \
   --device-id 7 --peer 127.0.0.1:28990 \
   --urma-device udmac0d1e5 --eid-index 0 \
-  --token-bytes 656 --miss-counts 32 4096 --workers 1 2 4 \
-  --warmup 3 --iterations 20 --profile-rounds 20
+  --warmup 3 --iterations 20
 ```
 
-- `--table-capacity` 默认 1,277,952，只控制源地址池的块数，与 miss_count 独立；`--tokens-per-block` 默认 128。
-- 源 DDR 容量为 `table_capacity × tokens_per_block × token_bytes`。默认 656 B/token 对应约 99.94 GiB，4096 B/token 对应 624 GiB；每组日志和计划都会记录所需源池容量。
-- 原 `python/test_batch_get.py` 仍用于逐轮改变源数据、检查保护行和异步调用的正确性测试，性能扫描不再使用它的数据布局。
-- `--build-dir` 可指定构建目录；`--kernel-json` 可指定已安装的算子 JSON。
-- `--output-dir` 指定一个新结果目录，默认 `reports/aicpu-gather-read/<时间戳>`。
-- `--dry-run` 只生成和打印扫描计划，不加载 torch、不访问设备。
-- `--timeout` 默认每组 600 秒，包含数据准备和校验。失败或超时后停止，已完成的 CSV 和日志保留。
+`--table-capacity` 控制源池块数，`--tokens-per-block` 控制每块 token 数。
+默认 656 B/token 对应约 99.94 GiB 源 DDR，4096 B/token 对应 624 GiB。
+CPU 线程预算和绑定策略在同一次扫描中保持一致；SGL 6、每批 32 条 WR、128 KiB 流水前缀保持当前实现配置。
 
-当前 GatherRead 固定使用 SGL 6、每批 32 条 WR、128 KiB 就绪前缀；
-Jetty 数由 worker 数确定，每个 worker 一条数据队列和一条控制队列，不扫描 AIV 核数或每核 Jetty 数。
-CPU gather 线程预算和绑定策略由服务启动参数控制，同一次扫描中保持一致。
+结果只有每组 `.log` 和一个 `summary.csv`，默认保存在 `reports/aicpu-gather-read/<时间戳>`；
+可用 `KVAF_AICPU_SWEEP_LOG_DIR` 指定一个新目录。任一组失败后停止，已完成结果保留。
+CSV 包含源池规模、mean/P50/P90/P99、唯一的 `p50_GBps`、提交/CQ 等待、端到端及流水各阶段耗时。
+耗时显示 1 位小数，带宽为十进制 GB/s。
+`ready_wait` 是等待 CPU 就绪前缀的时间，不是 CPU gather 的独立耗时。
 
-结果目录包含 `plan.json`、每组 `.log`/`.json` 和逐组更新的 `summary.csv`。
-CSV 同时记录源池块数、每块 token 数、输入数组长度、源 DDR 容量及源/目标访问模式。
-汇总字段沿用 AIV 扫描的命名，耗时单位为 µs（显示 1 位小数），带宽为十进制 GB/s：
-
-| 字段 | 统计口径 |
-| --- | --- |
-| mean_us / p50_us / p90_us / p99_us | profile 轮次中，最早 AICPU worker 进入至最后 worker 退出的算子墙钟时间 |
-| p50_GBps | 有效载荷 `token_bytes × miss_count` 除以算子 P50 时间 |
-| post_* | 每轮各 worker 累计 provider 提交时间的最大值，再计算均值和分位数 |
-| completion_wait_* | 每轮各 worker 累计 READ CQ 等待时间的最大值，再计算均值和分位数；不含 CPU ACK 等待 |
-| end_to_end_* | 未启用 profile 的 Python BatchGet 调用至同步完成耗时，另列平均带宽与 P50 带宽 |
-| read_mean_us / ready_wait_mean_us / wr_build_mean_us | 每轮各 worker 的流水 READ、就绪前缀等待、WR/SGL 构建时间取最大值，再求均值 |
-| request_mean_us / source_write_mean_us / notify_mean_us / ack_mean_us | 每轮各 worker 的清单构建、源清单 WRITE、通知和最终 ACK 等待时间取最大值，再求均值 |
-
-阶段最大值可能来自不同 worker，且存在嵌套和重叠，不可相加为总时间。
-`ready_wait` 是 AICPU 等待 CPU 就绪前缀的时间，不是 CPU gather 的独立耗时。
-AICPU profile 使用纳秒计时，无需 AIV 扫描的设备频率换算参数。
+原 `python/test_batch_get.py` 继续用于逐轮改变源数据、保护行和异步调用的正确性测试。
 
 ## 执行和资源约定
 

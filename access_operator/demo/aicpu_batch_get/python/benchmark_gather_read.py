@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 from pathlib import Path
 import time
@@ -30,8 +29,6 @@ def parse_args(argv=None):
     p.add_argument("--tokens-per-block", type=int, default=DEFAULT_TOKENS_PER_BLOCK)
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iterations", type=int, default=100)
-    p.add_argument("--profile-rounds", type=int, default=100)
-    p.add_argument("--result-json", type=Path)
     a = p.parse_args(argv)
     if not 1 <= a.workers <= 8 or not 0 <= a.miss_count <= 65536:
         p.error("workers must be in 1..8 and miss_count in 0..65536")
@@ -41,8 +38,8 @@ def parse_args(argv=None):
             a.token_bytes * a.tokens_per_block > 0xFFFFFFFF or
             a.token_bytes * (a.tokens_per_block - 1) > 0x7FFFFFFF):
         p.error("invalid token/block size for the AICPU input ABI")
-    if a.warmup < 0 or a.iterations <= 0 or a.profile_rounds < 0:
-        p.error("invalid warmup, iterations or profile rounds")
+    if a.warmup < 0 or a.iterations <= 0:
+        p.error("invalid warmup or iterations")
     if a.device_id < 0 or not 0 <= a.eid_index < 0xFFFFFFFF:
         p.error("invalid device or EID index")
     if not a.kernel_json or not Path(a.kernel_json).is_file():
@@ -62,6 +59,17 @@ def token_pattern(torch, token_ids, byte_ids):
     # Encode the source token ID across eight bytes so wrong-block READs are visible.
     return (((token_ids.unsqueeze(1) >> ((byte_ids % 8) * 8)) ^
              (byte_ids * 17 + (byte_ids >> 3))) & 0xFF).to(torch.uint8)
+
+
+def summarize_measurements(samples_us, profiles, payload_bytes):
+    end_to_end = {key: value for key, value in timing_stats(samples_us).items()
+                  if key.endswith("_us")}
+    stages = summarize_profiles(profiles, payload_bytes)
+    for name, stats in stages.items():
+        stats.pop("GBps")
+        if name != "kernel_total":
+            stats.pop("p50_GBps")
+    return end_to_end, stages
 
 
 def run_case(a, torch, kvaf):
@@ -132,35 +140,38 @@ def run_case(a, torch, kvaf):
         run_round(0)
         run_round(a.miss_count)
         for _ in range(a.warmup):
-            run_round(a.miss_count)
-        for _ in range(a.iterations):
-            samples_us.append(run_round(a.miss_count))
-        if a.profile_rounds:
             run_round(a.miss_count, profile=True)
-            profiles.clear()
-            for _ in range(a.profile_rounds):
-                run_round(a.miss_count, profile=True)
+        profiles.clear()
+        for _ in range(a.iterations):
+            samples_us.append(run_round(a.miss_count, profile=True))
     finally:
         runtime.shutdown()
 
-    stats = timing_stats(samples_us, payload_bytes)
+    stats, stages = summarize_measurements(samples_us, profiles, payload_bytes)
     print(f"AICPU_GATHER_READ_PASS workers={a.workers} iterations={a.iterations} "
           f"mean_us={stats['mean_us']:.1f} p50_us={stats['p50_us']:.1f} "
           f"p90_us={stats['p90_us']:.1f} p99_us={stats['p99_us']:.1f} "
-          f"GBps={stats['GBps']:.3f} verification=every_round_full_output_npu_compare", flush=True)
+          f"p50_GBps={stages['kernel_total']['p50_GBps']:.3f} "
+          "timing=end_to_end bandwidth_scope=kernel_total "
+          "verification=every_round_full_output_npu_compare", flush=True)
     if profiles:
-        print_profile(profiles, "gather_read")
-    return dict(
-        mode="gather_read", workers=a.workers, token_bytes=a.token_bytes, miss_count=a.miss_count,
-        table_capacity=a.table_capacity, request_length=length, tokens_per_block=a.tokens_per_block,
-        ddr_bytes=ddr_bytes, source_access_pattern="random_with_replacement",
-        output_access_pattern="random_unique_rows", payload_bytes=payload_bytes,
-        warmup=a.warmup, iterations=a.iterations, profile_rounds=len(profiles),
-        end_to_end=stats, stages=summarize_profiles(profiles, payload_bytes),
-        verification="every_round_full_output_npu_compare",
-        stage_aggregation="kernel_total=first_entry_to_last_exit; other_stages=max_worker_per_round",
-        profile_separate_from_end_to_end=True,
-    )
+        print_profile(profiles, "gather_read", warmup=a.warmup, separate_samples=False)
+    result = dict(token_bytes=a.token_bytes, miss_count=a.miss_count, workers=a.workers,
+                  table_capacity=a.table_capacity, tokens_per_block=a.tokens_per_block,
+                  request_length=length, ddr_bytes=ddr_bytes, payload_bytes=payload_bytes,
+                  warmup=a.warmup, iterations=a.iterations)
+    quantiles = ("mean_us", "p50_us", "p90_us", "p99_us")
+    result.update({key: stages["kernel_total"][key] for key in (*quantiles, "p50_GBps")})
+    for name in ("post", "completion_wait"):
+        result.update({f"{name}_{key}": stages[name][key] for key in quantiles})
+    result.update({f"end_to_end_{key}": stats[key] for key in quantiles})
+    for name in ("read", "ready_wait", "wr_build", "request", "source_write", "notify", "ack"):
+        result[f"{name}_mean_us"] = stages[name]["mean_us"]
+    fields = []
+    for key, value in result.items():
+        formatted = f"{value:.3f}" if key == "p50_GBps" else f"{value:.1f}" if isinstance(value, float) else str(value)
+        fields.append(f"{key}={formatted}")
+    print("AICPU_GATHER_READ_RESULT " + " ".join(fields), flush=True)
 
 
 def main():
@@ -169,9 +180,7 @@ def main():
     import torch_npu  # noqa: F401
     import kvaf
     torch.npu.set_device(a.device_id)
-    result = run_case(a, torch, kvaf)
-    if a.result_json:
-        a.result_json.write_text(json.dumps([result], indent=2) + "\n")
+    run_case(a, torch, kvaf)
 
 
 if __name__ == "__main__":

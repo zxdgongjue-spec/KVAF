@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 from pathlib import Path
 import random
@@ -28,8 +27,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--active-percent", type=int, default=100)
     parser.add_argument("--miss-count", type=int,
                         help="exact active prefix length; overrides --active-percent")
-    parser.add_argument("--result-json", type=Path,
-                        help="write machine-readable summaries after all cases pass")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--profile-rounds", type=int, default=0,
@@ -102,7 +99,8 @@ def summarize_profiles(profiles: list[dict], payload_bytes: int) -> dict:
     return stages
 
 
-def print_profile(samples: list[dict], mode: str) -> None:
+def print_profile(samples: list[dict], mode: str, *, warmup: int = 1,
+                  separate_samples: bool = True) -> None:
     def mean(key: str, rows: list[dict]) -> float:
         return statistics.mean(row[key] for row in rows)
 
@@ -110,10 +108,10 @@ def print_profile(samples: list[dict], mode: str) -> None:
         return " ".join(f"{key}={mean(key, rows):.1f}" for key in keys)
 
     print(f"AICPU_BATCH_GET_PROFILE mode={mode} workers={len(samples[0]['workers'])} "
-          f"rounds={len(samples)} warmup=1 "
+          f"rounds={len(samples)} warmup={warmup} "
           "aggregation=mean_per_worker units=us "
           "output_payload_flushes=0 "
-          "instrumented_rounds_excluded_from_bandwidth=1")
+          f"instrumented_rounds_excluded_from_bandwidth={int(separate_samples)}")
     print("  Python " + fields(samples, ("python_call_us", "binding_prepare_us", "native_call_us",
                                        "binding_total_us", "python_other_us")))
     hosts = [sample["host"] for sample in samples]
@@ -142,7 +140,7 @@ def print_profile(samples: list[dict], mode: str) -> None:
 
 
 def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object,
-             mode: str = "gather_read") -> dict:
+             mode: str = "gather_read") -> None:
     device = f"npu:{args.device_id}"
     n, token = args.blocks, args.token_bytes
     measured_count = args.miss_count if args.miss_count is not None else n * args.active_percent // 100
@@ -272,17 +270,7 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
     )
     if profiles:
         print_profile(profiles, mode)
-    return {
-        "mode": mode, "workers": workers, "blocks": n, "miss_count": measured_count,
-        "token_bytes": token, "tokens_per_block": args.tokens_per_block,
-        "output_row_step": args.output_row_step, "payload_bytes": measured_count * token,
-        "warmup": args.warmup, "iterations": args.iterations, "profile_rounds": len(profiles),
-        "end_to_end": timing_stats(samples_us, measured_count * token),
-        "stages": summarize_profiles(profiles, measured_count * token),
-        "verification": "every_round_full_output_and_npu_consumer",
-        "stage_aggregation": "kernel_total=first_entry_to_last_exit; other_stages=max_worker_per_round",
-        "profile_separate_from_end_to_end": True,
-    }
+
 
 
 def main() -> None:
@@ -297,12 +285,9 @@ def main() -> None:
         "input_preparation_batch_put_table_setup_and_verification_excluded=1",
         flush=True,
     )
-    results = []
     for mode in args.modes:
         for workers in args.workers:
-            results.append(run_case(args, workers, torch, kvaf, mode))
-    if args.result_json:
-        args.result_json.write_text(json.dumps(results, indent=2) + "\n")
+            run_case(args, workers, torch, kvaf, mode)
 
 
 if __name__ == "__main__":
