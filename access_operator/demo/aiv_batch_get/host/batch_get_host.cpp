@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
@@ -32,6 +33,38 @@ constexpr uint32_t kPidHdcType = 18U;
 constexpr uint32_t kMaxDirectAivWorkers =
     KVAF_AIV_BATCH_GET_MAX_AIV_CORES *
     KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE;
+
+namespace {
+
+// Parse once per transport, before allocating any device resources. Only an
+// unset or empty value selects the default; malformed lists must fail setup.
+bool ParseBatchGetJettyPriorities(const char *value,
+                                  std::vector<uint8_t> *priorities) {
+  priorities->clear();
+  if (value == nullptr || *value == '\0') {
+    priorities->push_back(15U);
+    return true;
+  }
+  const char *cursor = value;
+  while (true) {
+    while (std::isspace(static_cast<unsigned char>(*cursor))) ++cursor;
+    if (*cursor < '0' || *cursor > '9') return false;
+    uint32_t priority = 0U;
+    do {
+      priority = priority * 10U + static_cast<uint32_t>(*cursor - '0');
+      // Check each digit so even oversized input cannot overflow.
+      if (priority > 15U) return false;
+      ++cursor;
+    } while (*cursor >= '0' && *cursor <= '9');
+    while (std::isspace(static_cast<unsigned char>(*cursor))) ++cursor;
+    priorities->push_back(static_cast<uint8_t>(priority));
+    if (*cursor == '\0') return true;
+    if (*cursor != ',') return false;
+    ++cursor;
+  }
+}
+
+}  // namespace
 
 bool LocalBufferVerboseLoggingEnabled() {
   const char *value = std::getenv("KVAF_AIV_VERBOSE_LOCAL_BUFFER");
@@ -407,6 +440,28 @@ int32_t CreateBatchGetTransport(void *host_ddr, uint64_t host_ddr_bytes,
   }
   *transport = nullptr;
 
+  const char *priority_env = std::getenv("KVAF_BATCH_GET_JETTY_PRIORITIES");
+  std::vector<uint8_t> priorities;
+  if (!ParseBatchGetJettyPriorities(priority_env, &priorities)) {
+    std::fprintf(stderr,
+                 "[KVAF_AIV] BATCH_GET_JETTY_PRIORITY_CONFIG_INVALID "
+                 "env=KVAF_BATCH_GET_JETTY_PRIORITIES "
+                 "expected=comma_separated_decimal_integers_in_0_to_15\n");
+    return KVAF_BATCH_GET_INVALID_ARGUMENT;
+  }
+  std::string priority_list;
+  for (const uint8_t priority : priorities) {
+    if (!priority_list.empty()) priority_list += ',';
+    priority_list += std::to_string(priority);
+  }
+  std::fprintf(stderr,
+               "[KVAF_AIV] BATCH_GET_JETTY_PRIORITY_CONFIG source=%s "
+               "distribution=core_major_round_robin priorities=%s "
+               "priority_count=%zu workers=%u unused_priorities=%zu\n",
+               priority_env == nullptr || *priority_env == '\0' ? "default" : "environment",
+               priority_list.c_str(), priorities.size(), entity_count,
+               priorities.size() > entity_count ? priorities.size() - entity_count : size_t{0});
+
   auto *state = new (std::nothrow) KvafBatchGetTransport();
   if (state == nullptr) {
     return KVAF_BATCH_GET_RUNTIME_ERROR;
@@ -463,6 +518,7 @@ int32_t CreateBatchGetTransport(void *host_ddr, uint64_t host_ddr_bytes,
   for (uint32_t entity_index = 0U; entity_index < entity_count; ++entity_index) {
     const uint32_t core = entity_index / jettys_per_core;
     const uint32_t jetty_slot = entity_index % jettys_per_core;
+    const uint8_t priority = priorities[entity_index % priorities.size()];
     const uint32_t path_index = hccp::EidPathIndexForWorker(
         core, jetty_slot, aiv_core_count, peer_local_eid_count);
     hccp::DeviceAivPathResources &path = state->paths[path_index];
@@ -479,9 +535,15 @@ int32_t CreateBatchGetTransport(void *host_ddr, uint64_t host_ddr_bytes,
         !hccp::CreateDeviceAivJetty(state->api, path.device_context, worker.device_user_ctl_cq,
                            path.device_transport_token_handle, state->peer_memory.token_value,
                            kDeviceUserCtlSqDepth, device_jetty_role.c_str(),
-                           &worker.device_user_ctl_jetty.info, &worker.device_user_ctl_jetty.handle)) {
+                           &worker.device_user_ctl_jetty.info, &worker.device_user_ctl_jetty.handle,
+                           priority)) {
       goto failed;
     }
+    std::fprintf(stderr,
+                 "[KVAF_AIV] BATCH_GET_JETTY_PRIORITY op=batch_get core=%u "
+                 "jetty_slot=%u entity_index=%u eid_path=%u jetty_id=%u priority=%u\n",
+                 core, jetty_slot, entity_index, path_index,
+                 worker.device_user_ctl_jetty.info.ub.id, static_cast<unsigned int>(priority));
     const std::string device_ctp_role = "device_aiv_peer_link_" + suffix;
     hccp::PeerChannel channel{};
     if (!hccp::CreatePeerChannel(

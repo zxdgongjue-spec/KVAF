@@ -161,6 +161,13 @@ bool CreateDeviceAivJetty(const DirectHccpApi& api, void* context,
                           const char* role, QpCreateInfo* jetty_info,
                           void** jetty_handle);
 
+// Explicit-priority variant. The original entry point retains priority 15.
+bool CreateDeviceAivJetty(const DirectHccpApi& api, void* context,
+                          void* cq_handle, void* token_handle,
+                          std::uint32_t token_value, std::uint32_t sq_depth,
+                          const char* role, QpCreateInfo* jetty_info,
+                          void** jetty_handle, std::uint8_t priority);
+
 bool CreatePeerChannel(const PeerChannelRequest& request,
                        PeerChannel* channel);
 

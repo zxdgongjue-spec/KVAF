@@ -136,6 +136,82 @@ asc-devkit package matching the target CANN version before building; mixing
 headers from a different CANN release is not supported. The example above uses
 656 bytes per token, 128 tokens per block, and a 5% active probability.
 
+## Per-Jetty priority experiments
+
+Set `KVAF_BATCH_GET_JETTY_PRIORITIES` in the NPU test process to configure
+BatchGet's local Jettys. No Python, Runtime, C API, wire protocol or kernel ABI
+change is required. Host Jettys and BatchPut Jettys retain their existing
+configuration; the original Direct-HCCP creation entry point still uses 15.
+
+The value is a comma-separated list of decimal integers in `[0, 15]`.
+Whitespace around each integer is accepted. An unset variable or an empty
+string selects `15` for all Jettys. Invalid values (including empty entries,
+trailing commas, signs and out-of-range integers) fail BatchGet transport
+creation before it allocates device resources; they do not fall back to 15.
+
+Assignment follows the existing core-major worker index:
+
+```text
+entity_index = core * jettys_per_core + jetty_slot
+priority = priorities[entity_index % priority_count]
+```
+
+There is no required relationship between list length and core/Jetty count.
+A single value applies to every Jetty; a shorter list repeats; a longer list
+leaves its unused suffix unapplied. Repeated entries are allowed. Existing
+core and Jetty limits still apply, and EID path assignment is unchanged.
+For example, `3,10,13,15` with three cores and two Jettys per core gives:
+
+| Core | Jetty 0 | Jetty 1 |
+| --- | --- | --- |
+| 0 | 3 | 10 |
+| 1 | 13 | 15 |
+| 2 | 3 | 10 |
+
+The list is read once at transport creation, and each transport starts at its
+first entry. Changing the environment does not change existing Jettys or a
+captured graph; start a new test process to recreate the transport.
+
+After `./build.sh npu`, with the existing CPU service listening on port 29000:
+
+```bash
+mkdir -p logs
+set -o pipefail
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:29000 \
+DEVICE_ID=7 \
+KVAF_BATCH_GET_JETTY_PRIORITIES=3,10,13,15 \
+tests/run_remote_cpu_batch_get_perf.sh "$PWD/build-npu" \
+    --aiv-cores 3 --jettys-per-core 2 \
+    --token-bytes 656 --request-length 4096 --miss-count 4096 \
+    --max-inflight-total 2048 --warmup 20 --iterations 100 \
+    --kernel-profile 2>&1 | tee logs/batch_get_priority_3_10_13_15.log
+```
+
+Use the CPU endpoint and NPU device appropriate to the server. The same
+environment variable also passes through
+`tests/run_remote_cpu_batch_get_miss_count_perf.sh` without script changes;
+its existing sweep determines core/Jetty counts. For controlled comparisons,
+use the single-configuration runner above and keep device/EID selection,
+workload and inflight budget fixed. Compare `15`, `13`, `15,13`, and `13,15`
+in interleaved repeated runs before adding more priority values.
+
+`BATCH_GET_JETTY_PRIORITY_CONFIG` logs the normalized list, assignment order,
+worker count and number of unused entries. `BATCH_GET_JETTY_PRIORITY` logs
+`core`, `jetty_slot`, `entity_index`, `eid_path`, `jetty_id`, and the priority
+passed for each successfully created BatchGet Jetty. `DIRECT_JETTY_READY`
+also includes priority, including 15 for callers of the original entry point.
+Inspect the mapping with:
+
+```bash
+grep -E 'BATCH_GET_JETTY_PRIORITY|DIRECT_JETTY_READY' \
+    logs/batch_get_priority_3_10_13_15.log
+```
+
+These logs confirm the requested priority, not the hardware's effective SL.
+NPU priority-to-SL mapping must be verified for the actual NPU device. Compare
+overall throughput and latency; existing per-Jetty completion wait counters
+measure sequential polling time and are not independent transfer latencies.
+
 ## Graph boundary
 
 `KvafBatchGetTransportCreateWithPeerLink(host_ddr, ..., peer_link, npu_local_eid, ...)`
