@@ -3,10 +3,12 @@
 #include <cstdint>
 
 namespace kvaf::cpu_push {
-constexpr std::uint64_t kMagic = 0x4b56414650555331ULL;
+// V3 ports the a12bb16 V24 per-row pipeline and removes the V2 sort workspace.
+constexpr std::uint64_t kMagic = 0x4b56414650555333ULL;
+inline constexpr char kReferenceCommit[] = "a12bb16c120e885eb18ed61581739e1c212c32e8";
 constexpr std::uint32_t kMaxRequests = 65536, kMaxWorkers = 8, kJettyCount = 4;
 constexpr std::uint32_t kChunkRows = 1024, kTimeoutMs = 30000;
-// Sequence numbers occupy at most 32 bits. Publish the sampling flag with them.
+// Runtime additionally carries the opt-in profile bit with the request sequence.
 constexpr std::uint64_t kProfileNotify = std::uint64_t{1} << 63;
 
 enum class Result : std::uint64_t {

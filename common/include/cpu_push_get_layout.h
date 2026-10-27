@@ -23,21 +23,45 @@ inline bool MakeLayout(std::uint32_t token_bytes, std::uint32_t workers, Layout*
 }
 struct Range { std::uint32_t begin{}, end{}; };
 inline std::uint32_t RowsPerCacheGroup(std::uint32_t bytes) {
-  std::uint32_t a = bytes, b = 64;
-  while (b) { const auto remainder = a % b; a = b; b = remainder; }
-  return 64 / a;
+  auto divisor = 64U;
+  while (divisor) {
+    const auto remainder = bytes % divisor;
+    bytes = divisor; divisor = remainder;
+  }
+  return 64 / bytes;
 }
+inline std::uint32_t ActiveWorkers(std::uint32_t count, std::uint32_t bytes,
+                                   std::uint32_t workers) {
+  const auto quantum = RowsPerCacheGroup(bytes);
+  return std::min(workers, (count + quantum - 1) / quantum);
+}
+// Worker boundaries own complete staging cache lines.
 inline Range WorkerRange(std::uint32_t count, std::uint32_t bytes,
                          std::uint32_t worker, std::uint32_t workers) {
+  const auto active = ActiveWorkers(count, bytes, workers);
+  if (worker >= active) return {count, count};
   const auto quantum = RowsPerCacheGroup(bytes);
   const auto groups = (count + quantum - 1) / quantum;
-  return {std::min(count, static_cast<std::uint32_t>(std::uint64_t{groups} * worker / workers) * quantum),
-          std::min(count, static_cast<std::uint32_t>(std::uint64_t{groups} * (worker + 1) / workers) * quantum)};
+  return {groups * worker / active * quantum,
+          std::min(groups * (worker + 1) / active * quantum, count)};
 }
 inline std::uint32_t ChunkCount(Range r) { return (r.end - r.begin + kChunkRows - 1) / kChunkRows; }
 inline Range ChunkRange(Range r, std::uint32_t chunk) {
   const auto begin = r.begin + chunk * kChunkRows;
   return {begin, std::min(r.end, begin + kChunkRows)};
+}
+template <class Emit>
+void ForEachPipelineChunk(std::uint32_t count, std::uint32_t bytes,
+                          std::uint32_t workers, Emit emit) {
+  const auto active = ActiveWorkers(count, bytes, workers);
+  std::uint32_t max = 0;
+  for (std::uint32_t w = 0; w < active; ++w)
+    max = std::max(max, ChunkCount(WorkerRange(count, bytes, w, active)));
+  for (std::uint32_t chunk = 0; chunk < max; ++chunk)
+    for (std::uint32_t w = 0; w < active; ++w) {
+      const auto range = WorkerRange(count, bytes, w, active);
+      if (chunk < ChunkCount(range)) emit(w, chunk, ChunkRange(range, chunk));
+    }
 }
 inline bool SourceRange(std::uint64_t base, std::uint64_t bytes,
                         std::uint64_t address, std::uint64_t length) {

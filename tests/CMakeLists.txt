@@ -1,5 +1,13 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+find_package(Threads REQUIRED)
+add_executable(kvaf_cpu_push_scatter_test cpu_push_scatter_test.cc
+  ${PROJECT_SOURCE_DIR}/access_operator/demo/aicpu_batch_get/kernel/cpu_push_scatter.cc)
+target_include_directories(kvaf_cpu_push_scatter_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/access_operator/demo ${PROJECT_SOURCE_DIR}/access_operator/include)
+target_link_libraries(kvaf_cpu_push_scatter_test PRIVATE kvaf_common Threads::Threads)
+add_test(NAME kvaf_cpu_push_scatter_test COMMAND kvaf_cpu_push_scatter_test)
+
 add_test(NAME kvaf_dsa_keys_python
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_dsa_keys.py")

@@ -6,7 +6,7 @@ extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuGatherR
   return kvaf::aicpu_urma::ExecuteGatherRead(args);
 }
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
-extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuCpuPushScatter(
+extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuCpuPushScatterA12V24(
     kvaf::cpu_push::KernelArgs* args) {
   return kvaf::cpu_push::ExecuteCpuPushScatter(args);
 }

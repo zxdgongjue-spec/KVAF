@@ -28,9 +28,9 @@ set(cpu_push_libraries "${KVAF_AICPU_SECUREC_LIBRARY}")
 set(cpu_push_dependencies "${KVAF_AICPU_SECUREC_LIBRARY}" "${KVAF_AICPU_SECUREC_INCLUDE_DIR}/securec.h")
 set(cpu_push_commands COMMAND "${CMAKE_COMMAND}" -E copy_if_different
     "${KVAF_AICPU_SECUREC_LIBRARY}" "${kernel_dir}/${securec_library_name}")
-set(KVAF_AICPU_CPU_PUSH_ENTRY [=[  "KvafAicpuCpuPushScatter": {
+set(KVAF_AICPU_CPU_PUSH_ENTRY [=[  "KvafAicpuCpuPushScatterA12V24": {
     "opInfo": {
-      "functionName": "KvafAicpuCpuPushScatter",
+      "functionName": "KvafAicpuCpuPushScatterA12V24",
       "kernelSo": "libkvaf_aicpu_urma.so",
       "opKernelLib": "AICPUKernel"
     }
@@ -63,6 +63,25 @@ set(device_headers "${CMAKE_CURRENT_SOURCE_DIR}/transport_internal.h"
   "${CMAKE_SOURCE_DIR}/common/include/cpu_push_get_abi.h"
   "${CMAKE_SOURCE_DIR}/common/include/cpu_push_get_layout.h"
   "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include/batch_get_abi.h")
+set(cpu_push_objects)
+if(KVAF_ENABLE_AICPU_CPU_PUSH)
+  # Optimize scatter separately from the UMDK/session sources.
+  set(cpu_push_source "${CMAKE_SOURCE_DIR}/access_operator/demo/aicpu_batch_get/kernel/cpu_push_scatter.cc")
+  set(cpu_push_object "${CMAKE_CURRENT_BINARY_DIR}/cpu_push_scatter.o")
+  list(REMOVE_ITEM device_sources "${cpu_push_source}")
+  add_custom_command(OUTPUT "${cpu_push_object}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}"
+    COMMAND "${KVAF_AICPU_CXX}" -std=c++17 -O3 -fPIC -c -DKVAF_CPU_PUSH_DEVICE_KERNEL=1
+      -I "${CMAKE_CURRENT_SOURCE_DIR}"
+      -I "${CMAKE_SOURCE_DIR}/access_operator/include"
+      -I "${CMAKE_SOURCE_DIR}/access_operator/demo"
+      -I "${CMAKE_SOURCE_DIR}/runtime/include"
+      -I "${CMAKE_SOURCE_DIR}/common/include" -I "${KVAF_AICPU_UMDK_INCLUDE_DIR}"
+      ${cpu_push_options} "${cpu_push_source}" -o "${cpu_push_object}"
+    DEPENDS "${cpu_push_source}" ${device_headers} ${cpu_push_dependencies}
+    VERBATIM)
+  list(APPEND cpu_push_objects "${cpu_push_object}")
+endif()
 add_custom_command(OUTPUT "${kernel_so}"
   COMMAND "${CMAKE_COMMAND}" -E make_directory "${kernel_dir}"
   COMMAND "${KVAF_AICPU_CXX}" -std=c++17 -O2 -shared -fPIC
@@ -71,12 +90,12 @@ add_custom_command(OUTPUT "${kernel_so}"
     -I "${CMAKE_SOURCE_DIR}/access_operator/demo"
     -I "${CMAKE_SOURCE_DIR}/runtime/include"
     -I "${CMAKE_SOURCE_DIR}/common/include" -I "${KVAF_AICPU_UMDK_INCLUDE_DIR}"
-    ${cpu_push_options} ${device_sources} ${cpu_push_libraries}
+    ${cpu_push_options} ${device_sources} ${cpu_push_objects} ${cpu_push_libraries}
     -ldl -pthread "-Wl,-rpath,$ORIGIN" -Wl,-z,defs -o "${kernel_so}"
   ${cpu_push_commands}
   COMMAND "${CMAKE_COMMAND}" "-DUMDK_RUNTIME_DIR=${KVAF_AICPU_UMDK_RUNTIME_DIR}" "-DOUTPUT_DIR=${kernel_dir}/umdk_runtime"
     -P "${CMAKE_CURRENT_SOURCE_DIR}/../package/bundle_umdk.cmake"
-  DEPENDS ${device_sources} ${device_headers} ${cpu_push_dependencies}
+  DEPENDS ${device_sources} ${cpu_push_objects} ${device_headers} ${cpu_push_dependencies}
     "${CMAKE_CURRENT_SOURCE_DIR}/../package/bundle_umdk.cmake" ${umdk_runtime_files}
   VERBATIM)
 add_custom_command(OUTPUT "${package_dir}/kvaf-aicpu-urma.tar.gz"

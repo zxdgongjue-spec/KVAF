@@ -255,6 +255,7 @@ py::dict BatchGetProfileDict(const BatchGetProfile& profile) {
     worker["read_wqes"] = sample.read_wqes;
     worker["post_calls"] = sample.post_calls;
     worker["ready_queries"] = sample.ready_queries;
+    worker["scatter_copies"] = sample.scatter_copies;
     workers.append(worker);
   }
   result["workers"] = workers;
