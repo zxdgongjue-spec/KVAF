@@ -60,7 +60,7 @@ awk -F, '
     print "token_bytes miss_count workers device_p50_us p50_GBps"
     next
   }
-  $(col["worker"])==0 {
+  {
     print $(col["token_bytes"]), $(col["miss_count"]), $(col["workers"]),
           $(col["device_p50_us"]), $(col["p50_GBps"])
   }

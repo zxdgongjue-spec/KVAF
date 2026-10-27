@@ -177,7 +177,7 @@ Shell 脚本循环调用 `python/benchmark_gather_read.py`，通过 `NpuRuntime.
 
 每组预热 10 轮、测量 100 轮，均开启 profile。端到端、算子和各阶段耗时来自同一批测量轮次。
 只记录一个带宽 `p50_GBps`，计算为 `token_bytes × miss_count / 算子P50耗时(µs) / 1000`。
-算子耗时仍取最早 worker 进入至最后 worker 退出的墙钟时间；各 worker 分别列出自己的阶段均值。
+算子耗时仍取最早 worker 进入至最后 worker 退出的墙钟时间；各阶段每轮取 worker 最大耗时，再对测量轮次求均值。
 
 通信 DDR 总预算固定为 100 GiB，包含源数据池和 GatherRead 的 staging、描述符、控制区。
 按当前 token 大小和每块 token 数计算源块数量，先扣除按 1..8 worker 最大需求预留的工作区，
@@ -206,19 +206,18 @@ CPU 线程预算和绑定策略在同一次扫描中保持一致；SGL 6、每�
 
 结果只有每组 `.log` 和一个 `summary.csv`，默认保存在 `reports/aicpu-gather-read/<时间戳>`；
 可用 `KVAF_AICPU_SWEEP_LOG_DIR` 指定一个新目录。任一组失败后停止，已完成结果保留。
-终端按现有 profile 的执行顺序显示每个 worker，省略缓存细项、计数和 Host/Python 杂项：
+终端按现有 profile 的执行顺序显示每组配置的一份汇总，省略 worker 明细、缓存细项、计数和 Host/Python 杂项：
 
 - 构建源清单、WRITE 清单、通知 CPU。
 - 流水 READ 总时间，以及其中的 WR/SGL 构建、等待 CPU 就绪前缀、提交 READ、等待 READ CQE。
 - 等待最终 CPU ACK。
 
-上述阶段直接使用现有打点，每个 worker 在全部测量轮次上求均值，不拼接不同 worker 的最大值。
+上述阶段直接使用现有打点，每轮取各 worker 的最大耗时，再对测量轮次求均值。
 “构建源清单”仍包含该阶段内部的缓存维护；READ 下的子项包含在 READ 总时间内。
-多 worker 区间重叠，不能把不同 worker 时间相加为算子时间。
+阶段最大值可能来自不同 worker，且存在嵌套和重叠，不能相加为算子时间。
 
-CSV 每个 worker 一行，包含配置、全局 `device_p50_us` / `p50_GBps`，以及对应 worker 的阶段数据：
-`worker、request_us、source_write_us、notify_us、read_us、wr_build_us、ready_wait_us、post_us、cq_wait_us、ack_us`。
-同一组重复的 P50 和带宽是全局结果，不是每个 worker 的带宽。
+CSV 每组配置一行，包含配置、全局 `device_p50_us` / `p50_GBps` 和选定阶段数据：
+`request_us、source_write_us、notify_us、read_us、wr_build_us、ready_wait_us、post_us、cq_wait_us、ack_us`。
 所有耗时显示 1 位小数，带宽为十进制 GB/s。
 
 原 `python/test_batch_get.py` 继续用于逐轮改变源数据、保护行和异步调用的正确性测试。
