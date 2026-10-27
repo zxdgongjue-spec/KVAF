@@ -4,7 +4,6 @@
 #include <cstdint>
 
 #include "cpu_push_get_abi.h"
-#include "cpu_push/a12bb16/abi.h"
 
 namespace kvaf::cpu_push {
 inline constexpr std::uint64_t Align64(std::uint64_t n) { return (n + 63) & ~std::uint64_t{63}; }
@@ -24,28 +23,45 @@ inline bool MakeLayout(std::uint32_t token_bytes, std::uint32_t workers, Layout*
 }
 struct Range { std::uint32_t begin{}, end{}; };
 inline std::uint32_t RowsPerCacheGroup(std::uint32_t bytes) {
-  return static_cast<std::uint32_t>(aicpu_test::RowsPerCacheGroup(bytes));
+  auto divisor = 64U;
+  while (divisor) {
+    const auto remainder = bytes % divisor;
+    bytes = divisor; divisor = remainder;
+  }
+  return 64 / bytes;
 }
-inline aicpu_test::Config ReferenceConfig(std::uint32_t count, std::uint32_t bytes,
-                                         std::uint32_t workers) {
-  aicpu_test::Config config;
-  config.rows = count;
-  config.row_bytes = bytes;
-  config.aicpu_blocks = workers;
-  return config;
+inline std::uint32_t ActiveWorkers(std::uint32_t count, std::uint32_t bytes,
+                                   std::uint32_t workers) {
+  const auto quantum = RowsPerCacheGroup(bytes);
+  return std::min(workers, (count + quantum - 1) / quantum);
 }
+// Worker boundaries own complete staging cache lines.
 inline Range WorkerRange(std::uint32_t count, std::uint32_t bytes,
                          std::uint32_t worker, std::uint32_t workers) {
-  const auto config = ReferenceConfig(count, bytes, workers);
-  const auto active = aicpu_test::ActiveThreads(config);
+  const auto active = ActiveWorkers(count, bytes, workers);
   if (worker >= active) return {count, count};
-  const auto range = aicpu_test::ScatterRange(config, worker, active);
-  return {static_cast<std::uint32_t>(range.begin), static_cast<std::uint32_t>(range.end)};
+  const auto quantum = RowsPerCacheGroup(bytes);
+  const auto groups = (count + quantum - 1) / quantum;
+  return {groups * worker / active * quantum,
+          std::min(groups * (worker + 1) / active * quantum, count)};
 }
 inline std::uint32_t ChunkCount(Range r) { return (r.end - r.begin + kChunkRows - 1) / kChunkRows; }
 inline Range ChunkRange(Range r, std::uint32_t chunk) {
   const auto begin = r.begin + chunk * kChunkRows;
   return {begin, std::min(r.end, begin + kChunkRows)};
+}
+template <class Emit>
+void ForEachPipelineChunk(std::uint32_t count, std::uint32_t bytes,
+                          std::uint32_t workers, Emit emit) {
+  const auto active = ActiveWorkers(count, bytes, workers);
+  std::uint32_t max = 0;
+  for (std::uint32_t w = 0; w < active; ++w)
+    max = std::max(max, ChunkCount(WorkerRange(count, bytes, w, active)));
+  for (std::uint32_t chunk = 0; chunk < max; ++chunk)
+    for (std::uint32_t w = 0; w < active; ++w) {
+      const auto range = WorkerRange(count, bytes, w, active);
+      if (chunk < ChunkCount(range)) emit(w, chunk, ChunkRange(range, chunk));
+    }
 }
 inline bool SourceRange(std::uint64_t base, std::uint64_t bytes,
                         std::uint64_t address, std::uint64_t length) {

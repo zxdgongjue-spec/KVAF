@@ -97,7 +97,7 @@ def print_profile(samples: list[dict], mode: str) -> None:
         print("    Counts " + fields(rows, ("bytes", "spans", "read_wqes", "post_calls",
                                            "ready_queries")))
         if mode == "cpu_push_scatter":
-            print("    Push " + fields(rows, ("request_order_us", "scatter_us", "scatter_copies",
+            print("    Push " + fields(rows, ("scatter_us", "scatter_copies",
                                               "output_cache_us")))
     if mode == "cpu_push_scatter":
         print("  CPU stages: see CPU_PUSH_PROFILE in the CPU service log (units=us).")

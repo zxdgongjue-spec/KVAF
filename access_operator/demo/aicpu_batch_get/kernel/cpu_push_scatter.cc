@@ -1,10 +1,5 @@
-#if defined(KVAF_CPU_PUSH_DEVICE_KERNEL)
-#define KVAF_AICPU_TEST_DEVICE_KERNEL 1
-#endif
 #include "cpu_push_scatter.h"
 #include "cpu_push_pipeline.h"
-
-#include <cstring>
 
 namespace kvaf::cpu_push {
 namespace {
@@ -47,11 +42,10 @@ struct Execution {
   std::uint64_t start, timeout;
   BatchGetWorkerProfile* profile;
   std::uint32_t idle_polls{};
-  aicpu_test::Config config{};
+  std::uint32_t chunks{};
   std::uint8_t* Memory() const { return reinterpret_cast<std::uint8_t*>(args.workspace); }
   void Relax() {
-    // V24's hot Status path reads only shared worker coordination. Runtime
-    // also carries remote errors in done; sample it only while stalled.
+    // Sample remote errors every 32 stalled polls.
     if ((++idle_polls & 31) == 0) {
       const auto result = CompletionStatus();
       if (result != Result::kPending) Fail(coordination, result);
@@ -92,8 +86,7 @@ struct Execution {
     Barrier();
     auto* ready = reinterpret_cast<volatile Ready*>(Memory() + layout.ready) + w;
     if (profile) ++profile->ready_queries;
-    return aicpu_test::ChainReadyProgress(config,
-        w, args.sequence, [&](std::uint32_t q) { return ready->jetty[q]; });
+    return ChainReadyProgress(chunks, args.sequence, [&](std::uint32_t q) { return ready->jetty[q]; });
   }
   void FinishRange() { Barrier(); }
   bool Copy(Range range) {
@@ -155,7 +148,7 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) {
     count = reinterpret_cast<const Request*>(io.Memory())->count;
   }
   const auto range = WorkerRange(count, args->request.token_bytes, worker, args->workers);
-  io.config = ReferenceConfig(count, args->request.token_bytes, args->workers);
+  io.chunks = ChunkCount(range);
   std::uint32_t consumed = 0;
   if (Load(c.result) == 0 && count) {
     BatchGetProfileScope timer(profile ? &profile->read_ns : nullptr);

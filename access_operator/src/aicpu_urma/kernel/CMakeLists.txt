@@ -62,15 +62,12 @@ set(device_headers "${CMAKE_CURRENT_SOURCE_DIR}/transport_internal.h"
   "${CMAKE_SOURCE_DIR}/common/include/batch_get_profile.h"
   "${CMAKE_SOURCE_DIR}/common/include/cpu_push_get_abi.h"
   "${CMAKE_SOURCE_DIR}/common/include/cpu_push_get_layout.h"
-  "${CMAKE_SOURCE_DIR}/common/include/cpu_push/a12bb16/abi.h"
-  "${CMAKE_SOURCE_DIR}/common/include/cpu_push/a12bb16/pipeline.h"
   "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include/batch_get_abi.h")
 set(cpu_push_objects)
 if(KVAF_ENABLE_AICPU_CPU_PUSH)
-  # a12bb16 builds its AICPU copy loop with -O3. Keep this translation unit
-  # separate so the UMDK/session code retains its existing -O2 compilation.
+  # Optimize scatter separately from the UMDK/session sources.
   set(cpu_push_source "${CMAKE_SOURCE_DIR}/access_operator/demo/aicpu_batch_get/kernel/cpu_push_scatter.cc")
-  set(cpu_push_object "${CMAKE_CURRENT_BINARY_DIR}/cpu_push_scatter_a12bb16.o")
+  set(cpu_push_object "${CMAKE_CURRENT_BINARY_DIR}/cpu_push_scatter.o")
   list(REMOVE_ITEM device_sources "${cpu_push_source}")
   add_custom_command(OUTPUT "${cpu_push_object}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}"

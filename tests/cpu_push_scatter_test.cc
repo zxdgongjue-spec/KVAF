@@ -18,7 +18,6 @@
 } } while (false)
 
 using namespace kvaf::cpu_push;
-namespace reference = kvaf::aicpu_test;
 
 struct alignas(64) CacheLine { std::uint8_t bytes[64]{}; };
 template <class T> std::uint64_t Pointer(T* value) {
@@ -79,7 +78,6 @@ void CheckDeviceKernel(const std::vector<std::uint64_t>& addresses,
     CHECK(statuses[w].worker == w && statuses[w].consumed == ChunkCount(range));
     CHECK(profiles[w].bytes == std::uint64_t{range.end - range.begin} * bytes);
     CHECK(profiles[w].scatter_copies == range.end - range.begin);
-    CHECK(profiles[w].request_order_ns == 0);
     copies += profiles[w].scatter_copies;
   }
   CHECK(copies == active);
@@ -114,19 +112,13 @@ void CheckRound(std::uint32_t capacity, std::uint32_t active, std::uint32_t byte
   for (auto i = active; i < capacity; ++i) indices[i] = offsets[i] = rows[i] = -1;
   const auto original_indices = indices, original_offsets = offsets, original_rows = rows;
   std::vector<unsigned> coverage(active);
-  const auto config = ReferenceConfig(active, bytes, workers);
-  for (std::uint32_t worker = 0; worker < workers; ++worker) {
+  ForEachPipelineChunk(active, bytes, workers, [&](auto worker, auto chunk, Range ready) {
     const auto range = WorkerRange(active, bytes, worker, workers);
-    if (worker < reference::ActiveThreads(config)) {
-      const auto original = reference::ScatterRange(config, worker, reference::ActiveThreads(config));
-      CHECK(range.begin == original.begin && range.end == original.end);
-    } else CHECK(range.begin == active && range.end == active);
-    for (std::uint32_t chunk = 0; chunk < ChunkCount(range); ++chunk) {
-      const auto ready = ChunkRange(range, chunk);
-      for (auto i = ready.begin; i < ready.end; ++i) ++coverage[i];
-      CHECK(CopyMappedRows(output.data(), staging.data(), rows.data(), ready, bytes));
-    }
-  }
+    CHECK(range.begin * bytes % 64 == 0 && ready.begin >= range.begin && ready.end <= range.end);
+    CHECK(chunk < ChunkCount(range));
+    for (auto i = ready.begin; i < ready.end; ++i) ++coverage[i];
+    CHECK(CopyMappedRows(output.data(), staging.data(), rows.data(), ready, bytes));
+  });
   CHECK(output == expected);
   for (const auto covered : coverage) CHECK(covered == 1);
   if ((capacity <= 17 && step == 1 && workers == 8) ||
@@ -136,74 +128,67 @@ void CheckRound(std::uint32_t capacity, std::uint32_t active, std::uint32_t byte
   CHECK(indices == original_indices && offsets == original_offsets && rows == original_rows);
 }
 
-template <class R> struct Model {
+struct Model {
   std::vector<std::uint64_t> tokens;
   std::vector<std::pair<std::uint32_t, std::uint32_t>> copied;
   std::uint32_t polls{}, finishes{};
   std::uint64_t ticks{};
   bool fail_copy{};
-  R status{static_cast<R>(0)};
-  R Status() { return status; }
+  Result status{Result::kPending};
+  Result Status() { return status; }
   std::uint64_t Now() { return ++ticks; }
   std::uint64_t ReadRangeDone(std::uint32_t) {
     const auto index = std::min<std::size_t>(polls++, tokens.size() - 1);
     return tokens[index];
   }
   void Relax() {}
-  void RangeReady(std::uint64_t) {}
   bool Copy(Range range) {
     copied.emplace_back(range.begin, range.end);
-    if (fail_copy) status = static_cast<R>(6);
+    if (fail_copy) status = Result::kCopyError;
     return !fail_copy;
-  }
-  void CopySpan(reference::RowRange range) {
-    Copy({static_cast<std::uint32_t>(range.begin), static_cast<std::uint32_t>(range.end)});
   }
   void FinishRange() { ++finishes; }
 };
 
-void CheckPipelineAgainstCommit() {
-  const auto config = ReferenceConfig(10000, 656, 4);
-  const std::vector<std::vector<std::uint64_t>> cases{
-    {Progress(6, 1), Progress(7, 1), Progress(7, 3)},
-    {Progress(8, 1)}, {Progress(7, 0)}, {Progress(7, 4)},
-    {Progress(7, 2), Progress(7, 1)}, {Progress(6, 1)}, {Progress(7, 3)}
-  };
-  for (std::uint32_t worker = 0; worker < 4; ++worker)
-    for (const auto& tokens : cases)
-      for (const auto fail : {false, true}) {
-        Model<Result> actual;
-        Model<reference::Result> original;
-        actual.tokens = original.tokens = tokens;
-        actual.fail_copy = original.fail_copy = fail;
-        std::uint32_t consumed = 0;
-        const auto result = Consume(10000, 656, 4, worker, 7, 0, 30, actual, &consumed);
-        const auto expected = reference::RunPipelineChunks(config, worker, 7, 0, 30, original);
-        CHECK(static_cast<std::uint64_t>(result) == static_cast<std::uint64_t>(expected));
-        CHECK(actual.copied == original.copied);
-        CHECK(actual.polls == original.polls && actual.finishes == original.finishes);
-        CHECK(actual.ticks == original.ticks);
-      }
+void CheckPipeline() {
+  for (std::uint32_t worker = 0; worker < 4; ++worker) {
+    const auto range = WorkerRange(10000, 656, worker, 4);
+    auto check = [&](std::vector<std::uint64_t> tokens, Result expected,
+                     std::vector<std::pair<std::uint32_t, std::uint32_t>> copied,
+                     std::uint32_t chunks, std::uint32_t finishes, bool fail = false) {
+      Model io;
+      io.tokens = std::move(tokens); io.fail_copy = fail;
+      std::uint32_t consumed = 0;
+      CHECK(Consume(10000, 656, 4, worker, 7, 0, 30, io, &consumed) == expected);
+      CHECK(io.copied == copied && consumed == chunks && io.finishes == finishes);
+    };
+    check({Progress(6, 1), Progress(7, 1), Progress(7, 3)}, Result::kOk,
+          {{range.begin, range.begin + 1024}, {range.begin + 1024, range.end}}, 3, 1);
+    check({Progress(7, 3)}, Result::kOk, {{range.begin, range.end}}, 3, 1);
+    check({Progress(8, 1)}, Result::kSequenceError, {}, 0, 0);
+    check({Progress(7, 0)}, Result::kSequenceError, {}, 0, 0);
+    check({Progress(7, 4)}, Result::kSequenceError, {}, 0, 0);
+    check({Progress(7, 2), Progress(7, 1)}, Result::kSequenceError,
+          {{range.begin, range.begin + 2048}}, 2, 0);
+    check({Progress(6, 1)}, Result::kTimeout, {}, 0, 0);
+    check({Progress(7, 1)}, Result::kCopyError, {{range.begin, range.begin + 1024}}, 0, 0, true);
+    check({Progress(7, 3)}, Result::kCopyError, {{range.begin, range.end}}, 0, 1, true);
+  }
   // A single slow/stale Jetty must prevent release of the other three.
   for (const auto& tokens : std::vector<std::array<std::uint64_t, 4>>{
       {Progress(7, 3), Progress(7, 2), Progress(7, 1), Progress(7, 3)},
       {Progress(7, 3), Progress(6, 3), Progress(7, 3), Progress(7, 3)}}) {
-    const auto progress = reference::ChainReadyProgress(config, 0, 7, [&](auto q) { return tokens[q]; });
+    const auto progress = ChainReadyProgress(3, 7, [&](auto q) { return tokens[q]; });
     CHECK(progress == (tokens[1] == Progress(6, 3) ? 0 : Progress(7, 1)));
   }
-}
-
-void CheckOriginalStridedCopy() {
-  reference::Config config;
-  config.rows = 17;
-  reference::Layout layout;
-  CHECK(reference::MakeLayout(config, &layout) && layout.stride == 768);
-  std::vector<std::uint8_t> source(layout.payload_bytes, 0x6A);
-  std::vector<std::uint8_t> output(layout.output_bytes + 64, 0xA5);
-  CHECK(reference::CopyScatterRows(output.data(), source.data(), config.rows,
-                                   config.row_bytes, layout.stride));
-  for (std::uint64_t i = 0; i < output.size(); ++i)
-    CHECK(output[i] == (i < layout.output_bytes && i % layout.stride < config.row_bytes ? 0x6A : 0xA5));
+  for (const auto sequence : {std::uint64_t{7}, std::uint64_t{UINT32_MAX}})
+    for (const auto progress : {0U, 4U}) {
+      const auto invalid = ChainReadyProgress(3, sequence, [&](auto) { return Progress(sequence, progress); });
+      Model io; io.tokens = {invalid};
+      std::uint32_t consumed = 0;
+      CHECK(Consume(10000, 656, 4, 0, sequence, 0, 30, io, &consumed) == Result::kSequenceError);
+      CHECK(io.copied.empty());
+    }
 }
 
 void CheckRemoteFailure(std::uint64_t done_token, Result expected) {
@@ -236,8 +221,7 @@ void CheckRemoteFailure(std::uint64_t done_token, Result expected) {
 }
 
 int main() {
-  CheckPipelineAgainstCommit();
-  CheckOriginalStridedCopy();
+  CheckPipeline();
   CheckRemoteFailure(Progress(1, static_cast<std::uint32_t>(Result::kTransportError)), Result::kTransportError);
   CheckRemoteFailure(Progress(2, 1), Result::kSequenceError);
   CheckRemoteFailure(0, Result::kTimeout);
@@ -248,5 +232,5 @@ int main() {
           CheckRound(capacity, active, 656, step, workers, capacity + active + step + workers);
   for (const auto bytes : {1U, 17U, 64U, 4096U})
     CheckRound(4103, 3077, bytes, 2, 8, bytes);
-  std::cout << "a12bb16 V24 pipeline equivalence and dynamic Tensor scatter tests passed\n";
+  std::cout << "CPU push pipeline and dynamic Tensor scatter tests passed\n";
 }

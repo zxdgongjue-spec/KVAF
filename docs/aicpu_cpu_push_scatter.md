@@ -30,9 +30,10 @@ CPU 使用四路 Jetty，由所属服务线程更新并依次提交预构建链�
 ## 构建并验证
 
 两端代码、设备 SO 和 kernel JSON 一起更新，重启 CPU 服务及 NPU 进程。
-当前 push 协议为 V3，复制和 ready 流水线固定采用
+当前 push 协议为 V3，复制和 ready 流水线基于
 `codex/aicpu-ordered-write` 的 `a12bb16c120e885eb18ed61581739e1c212c32e8`（V24）。
-设备入口为 `KvafAicpuCpuPushScatterA12V24`；旧 CPU 服务或旧设备包会被拒绝：
+设备入口为 `KvafAicpuCpuPushScatterA12V24`。主机库和设备 SO 必须一起更新，
+包括移除废弃排序字段后的 profile 布局：
 
 ```bash
 ./build.sh cpu
@@ -91,8 +92,7 @@ CPU 建立专用回写队列，返回对端信息；Host 完成导入后才激�
    由所属线程更新预构建 SGL 的源地址。
 4. CPU 直接从已注册 DDR 源 WRITE 到 packed HBM staging，不打包 payload 到 CPU 临时区。
 5. 按 worker 的 staging 区间划分 1024 行 chunk，各 Jetty 在其数据之后强序 WRITE ready。
-6. AICPU 使用参考提交原始 `ChainReadyProgress` / `RunPipelineChunks`，取四个 Jetty
-   的共同就绪前缀。每个有效请求调用参考提交的 `CopyScatterRows`，逐行执行 `memcpy_sp`，
+6. AICPU 取四个 Jetty 的共同就绪前缀，合并连续就绪的 chunk，逐行执行 `memcpy_sp`，
    目标为原始 `output_indices[i]`。ready 读取前、复制前及 worker 复制完成后执行 `dsb sy`。
 7. CPU 收齐数据链尾 CQE 后发布 done；全部 scatter 与 done 均完成后 kernel 结束。
 
@@ -102,7 +102,7 @@ ready 用高 32 位 sequence、低 32 位 chunk 数编码；done 在同一个 64
 当前实现针对普通 stream enqueue，Host 固定序号不能用于 graph replay。
 
 CPU 数据面沿用该提交 V24 的 prepared WRITE、indexed CQ 和轮转 CQ 扫描，
-chunk 枚举直接调用其原始 `ForEachPipelineChunk`。
+CPU 与设备共享 worker 分区和 chunk 枚举逻辑。
 每个 chunk 按连续行分到四个 Jetty；请求数量不变时复用数据/ready 链，每轮只更新源地址和序号。
 所属线程更新并依次提交四路队列，收齐数据链尾 CQE 后提交预构建的 done 链，
 消除每轮 OpenMP team 唤醒和多次 barrier；多 wave 请求仍逐 wave 排空再复用 SQ。
@@ -114,13 +114,9 @@ ready 热循环与 V24 一样只读 worker 协调状态；Runtime 的远端错�
 
 ## 与指定提交的对应关系
 
-`common/include/cpu_push/a12bb16/abi.h` 和 `pipeline.h` 原样保留参考提交文件，
-来源路径及 Git blob 记录在同目录的 README 中。生产代码直接调用其中的 worker 分区、
-chunk 枚举、四路 ready、消费循环及逐行复制函数，适配层位于 `cpu_push_pipeline.h`。
-
-上一版 V2 新增的设备基数排序、排序 scratch、相邻行合并复制和 notify 数量编码已移除。
-用户提供的 V2 profile 中，排序约 133 μs，而 scatter 仅减少约 30 μs，
-这份实测没有支持原先“减少 memcpy 次数即可改善端到端带宽”的推断。
+生产代码仅保留参考提交的缓存行分区、1024 行 chunk、共同 ready 前缀和逐行复制算法。
+`cpu_push_get_layout.h` 提供 CPU/设备共享的分区，`cpu_push_pipeline.h` 实现消费与复制。
+不再携带独立测试的 ABI、结果统计、校验协议或结果转换适配层。
 
 以下接口和工作量差异保留，用于支持 Runtime 的动态请求，不能由参考代码直接覆盖：
 
@@ -133,7 +129,7 @@ chunk 枚举、四路 ready、消费循环及逐行复制函数，适配层位�
 | 带宽计时 | 驻留 kernel 内 request 到 scatter/done | Python 调用开始到本次 stream 完成 |
 
 `--output-order sequential` 可单独测量目标访问顺序的影响；它不改变 slot 大小或带宽计时范围，
-也不能把当前结果等同于旧常驻测试的结果。移植完成和编译通过不等于已恢复 15 GB/s，需硬件复测。
+也不能把当前结果等同于旧常驻测试的结果。
 
 ## 内存、缓存和完成
 
@@ -154,11 +150,9 @@ Shutdown 先停止 CPU worker 并销毁其 DMA 队列，再等待设备执行、
 
 ## Profile
 
-原有 profile 字段保留，增加 `scatter_us`、`output_cache_us`、`request_order_us` 和 `scatter_copies`。
-`request_order_us` 为兼容字段，当前没有设备排序，因此为零；
-`request_us` 仍包含动态源地址清单构建。
+`request_us` 包含动态源地址清单构建，`scatter_us` 记录本地复制。
 `scatter_copies` 为实际逐行 memcpy 次数。4096 × 656 B、完整前缀、4 worker 时，
-每个 worker 为 1024 次，总计 4096 次。这里按参考实现执行，不以复制次数少作为性能通过条件。
+每个 worker 为 1024 次，总计 4096 次。
 push 路径的 `read_us` 是消费 ready 并执行 scatter 的区间，`ack_us` 是最终 done 等待；
 `source_write_us` 为零，因为本轮源清单由 CPU READ 获取。
 缓存维护相关字段为零。设备 worker 的区间重叠，不能相加作为端到端时长。
@@ -194,7 +188,7 @@ python3 -u access_operator/demo/aicpu_batch_get/python/test_batch_get.py \
 
 保留相同通路、NUMA 策略和测试参数，比较正常轮次的 `GBps`、`mean_us`、`p99_us`。
 profile 中同时检查 `request_us`、`ready_wait_us`、`scatter_us` 和 `scatter_copies`：
-该配置 `request_order_us=0`，每 worker 为 1024 次复制；CPU 应为 `cpu_threads=1`，
+该配置每 worker 为 1024 次复制；CPU 应为 `cpu_threads=1`，
 预热后 `plan_reused=1`。保留 NPU 日志及 CPU 端的 `CPU_PUSH_PROFILE`。
 在单独一次运行中改用 `--output-order sequential`，其余参数不变，可观察输出顺序的影响。
 将 `--output-row-step` 改为 2 或 `--active-percent` 改为 75，继续验证间隔和部分前缀。
@@ -207,13 +201,12 @@ profile 中同时检查 `request_us`、`ready_wait_us`、`scatter_us` 和 `scatt
 ```bash
 cmake -S . -B build-scatter-tests -DBUILD_TESTING=ON
 cmake --build build-scatter-tests --target kvaf_cpu_push_scatter_test
-ctest --test-dir build-scatter-tests -R '^kvaf_cpu_push_(scatter_test|reference_python)$' --output-on-failure
+ctest --test-dir build-scatter-tests -R '^kvaf_cpu_push_scatter_test$' --output-on-failure
 ```
 
-回归测试直接比较移植适配层与原始 V24 消费循环，覆盖 ready 延迟、跳跃、回退、
+回归测试覆盖 ready 延迟、跳跃、回退、
 未来序号、超时和复制失败；并执行生产 kernel 的本地线程模型，校验动态源地址、
 输出索引、空/部分前缀、非整除 worker 分区、远端错误及完整输出 guard。
-Python 测试验证参考文件的 Git blob 与指定提交一致，不需要访问 Git 仓库或 NPU。
 
 主要文件对应：`cpu_push_host.cc` 管 Host 资源，`cpu_push_get_worker.cc` 管 CPU 请求循环，
 `cpu_push_get_transport.cc` 管 URMA 数据链，`cpu_push_scatter.cc` 管设备消费与本地复制。

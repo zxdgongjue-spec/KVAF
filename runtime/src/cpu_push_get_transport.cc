@@ -1,7 +1,6 @@
 #include "cpu_push_get_transport.h"
 #include "urma_device_abi.h"
 #include "batch_get_profile.h"
-#include "cpu_push/a12bb16/pipeline.h"
 
 #include <chrono>
 #include <cerrno>
@@ -275,15 +274,11 @@ Status Transport::PrepareWrites(std::uint32_t count) {
     return Status::OK();
   }
   std::array<std::vector<PreparedQueue>, kJettyCount> shards;
-  const auto config = ReferenceConfig(count, token_bytes_, workers_);
   for (std::uint32_t queue = 0; queue < kJettyCount; ++queue) {
     auto& waves = shards[queue];
     waves.emplace_back();
-    aicpu_test::ForEachPipelineChunk(config,
-      [&](std::uint32_t worker, std::uint64_t chunk_index, aicpu_test::RowRange original) {
-        const auto chunk = static_cast<std::uint32_t>(chunk_index);
-        const Range range{static_cast<std::uint32_t>(original.begin),
-                          static_cast<std::uint32_t>(original.end)};
+    ForEachPipelineChunk(count, token_bytes_, workers_,
+      [&](std::uint32_t worker, std::uint32_t chunk, Range range) {
         const auto rows = range.end - range.begin;
         const auto base = rows / kJettyCount, remainder = rows % kJettyCount;
         auto row = range.begin + queue * base + std::min(queue, remainder);

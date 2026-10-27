@@ -249,7 +249,6 @@ py::dict BatchGetProfileDict(const BatchGetProfile& profile) {
     WORKER_TIME(cq_wait);
     WORKER_TIME(scatter);
     WORKER_TIME(output_cache);
-    WORKER_TIME(request_order);
 #undef WORKER_TIME
     worker["bytes"] = sample.bytes;
     worker["spans"] = sample.spans;
