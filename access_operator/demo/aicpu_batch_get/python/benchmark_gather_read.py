@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark GatherRead with full-pool random sources and random output rows."""
+"""Benchmark AICPU BatchGet with full-pool random sources and random output rows."""
 from __future__ import annotations
 
 import argparse
@@ -13,14 +13,17 @@ from test_batch_get import timing_stats
 DDR_BUDGET_BYTES = 100 * 1024**3
 DEFAULT_TOKENS_PER_BLOCK = 128
 DEFAULT_REQUEST_LENGTH = 32_768
+PREFIXES = {"gather_read": "AICPU_GATHER_READ", "cpu_push_scatter": "AICPU_CPU_PUSH_SCATTER"}
 
 
-def parse_args(argv=None):
+def parse_args(argv=None, *, mode="gather_read"):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--device-id", type=int, default=7)
     p.add_argument("--peer", default="127.0.0.1:28990")
     p.add_argument("--urma-device", default="")
     p.add_argument("--eid-index", type=int, default=0)
+    if mode == "cpu_push_scatter":
+        p.add_argument("--npu-eid", help="optional single NPU EID for direct HCCP")
     cann = os.environ.get("ASCEND_HOME_PATH") or os.environ.get("ASCEND_CANN_PACKAGE_PATH")
     p.add_argument("--kernel-json", default=str(Path(cann) / "opp/vendors/cust/op_impl/aicpu/config/kvaf_aicpu_urma.json") if cann else None)
     p.add_argument("--workers", type=int, default=1)
@@ -39,11 +42,11 @@ def parse_args(argv=None):
             a.token_bytes * a.tokens_per_block > 0xFFFFFFFF or
             a.token_bytes * (a.tokens_per_block - 1) > 0x7FFFFFFF):
         p.error("invalid token/block size for the AICPU input ABI")
-    max_capacity, _ = pool_layout(a.token_bytes, a.tokens_per_block)
+    max_capacity, _ = pool_layout(a.token_bytes, a.tokens_per_block, mode=mode)
     if a.table_capacity is None:
         a.table_capacity = max_capacity
     if not 1 <= a.table_capacity <= min(max_capacity, 0x7FFFFFFF):
-        p.error("source pool plus GatherRead workspace must fit the 100 GiB DDR budget")
+        p.error("source pool plus workspace must fit the 100 GiB DDR budget")
     if a.warmup < 0 or a.iterations <= 0:
         p.error("invalid warmup or iterations")
     if a.device_id < 0 or not 0 <= a.eid_index < 0xFFFFFFFF:
@@ -53,8 +56,11 @@ def parse_args(argv=None):
     return a
 
 
-def pool_layout(token_bytes, tokens_per_block):
+def pool_layout(token_bytes, tokens_per_block, *, mode="gather_read"):
     block_bytes = token_bytes * tokens_per_block
+    if mode == "cpu_push_scatter":
+        # CPU push staging and source-address workspace live in HBM.
+        return DDR_BUDGET_BYTES // block_bytes, 0
     # Match GatherRemoteWorkspaceBytes and PeerDdrAllocator's slot alignment.
     # Reserve the maximum for 1..8 workers so every worker count uses the same source pool.
     reserved = 0
@@ -86,10 +92,10 @@ def token_pattern(torch, token_ids, byte_ids):
     return encoded ^ pattern.expand_as(encoded).contiguous()
 
 
-def summarize_measurements(profiles, payload_bytes):
+def summarize_measurements(profiles, payload_bytes, *, mode="gather_read"):
     device = timing_stats([sample["device_span_us"] for sample in profiles], payload_bytes)
     summary = dict(device_p50_us=device["p50_us"], p50_GBps=device["p50_GBps"])
-    for name, field in (
+    phases = (
         ("lookup_table_us", "request_us"),
         ("address_send_us", "source_write_us"),
         ("notify_cpu_us", "notify_us"),
@@ -98,45 +104,64 @@ def summarize_measurements(profiles, payload_bytes):
         ("cpu_gather_wait_us", "ready_wait_us"),
         ("post_us", "post_us"),
         ("cq_wait_us", "cq_wait_us"),
-    ):
+    ) if mode == "gather_read" else (
+        ("lookup_table_us", "request_us"),
+        ("notify_cpu_us", "notify_us"),
+        ("push_total_us", "read_us"),
+        ("ready_wait_us", "ready_wait_us"),
+        ("scatter_us", "scatter_us"),
+        ("done_wait_us", "ack_us"),
+    )
+    for name, field in phases:
         summary[name] = statistics.mean(max(worker[field] for worker in sample["workers"])
                                         for sample in profiles)
     return summary
 
 
-def print_measurements(a, summary):
-    print(f"AICPU_GATHER_READ_PROFILE device_p50_us={summary['device_p50_us']:.1f} "
+def print_measurements(a, summary, *, mode="gather_read"):
+    prefix = PREFIXES[mode]
+    print(f"{prefix}_PROFILE device_p50_us={summary['device_p50_us']:.1f} "
           f"p50_GBps={summary['p50_GBps']:.3f} phase_aggregation=mean_of_per_round_worker_max")
-    print(f"  lookup_table_us={summary['lookup_table_us']:.1f} | "
-          f"address_send_us={summary['address_send_us']:.1f} | "
-          f"notify_cpu_us={summary['notify_cpu_us']:.1f}")
-    print(f"  read_total_us={summary['read_total_us']:.1f}")
-    print(f"    build_wqe_us={summary['build_wqe_us']:.1f} | "
-          f"cpu_gather_wait_us={summary['cpu_gather_wait_us']:.1f} | "
-          f"post_us={summary['post_us']:.1f} | cq_wait_us={summary['cq_wait_us']:.1f}")
+    if mode == "gather_read":
+        print(f"  lookup_table_us={summary['lookup_table_us']:.1f} | "
+              f"address_send_us={summary['address_send_us']:.1f} | "
+              f"notify_cpu_us={summary['notify_cpu_us']:.1f}")
+        print(f"  read_total_us={summary['read_total_us']:.1f}")
+        print(f"    build_wqe_us={summary['build_wqe_us']:.1f} | "
+              f"cpu_gather_wait_us={summary['cpu_gather_wait_us']:.1f} | "
+              f"post_us={summary['post_us']:.1f} | cq_wait_us={summary['cq_wait_us']:.1f}")
+    else:
+        print(f"  lookup_table_us={summary['lookup_table_us']:.1f} | "
+              f"notify_cpu_us={summary['notify_cpu_us']:.1f}")
+        print(f"  push_total_us={summary['push_total_us']:.1f}")
+        print(f"    ready_wait_us={summary['ready_wait_us']:.1f} | "
+              f"scatter_us={summary['scatter_us']:.1f}")
+        print(f"  done_wait_us={summary['done_wait_us']:.1f}")
     result = dict(token_bytes=a.token_bytes, miss_count=a.miss_count, workers=a.workers, **summary)
     fields = []
     for key, value in result.items():
         formatted = f"{value:.3f}" if key == "p50_GBps" else f"{value:.1f}" if isinstance(value, float) else str(value)
         fields.append(f"{key}={formatted}")
-    print("AICPU_GATHER_READ_RESULT " + " ".join(fields), flush=True)
+    print(f"{prefix}_RESULT " + " ".join(fields), flush=True)
 
 
-def run_case(a, torch, kvaf):
+def run_case(a, torch, kvaf, *, mode="gather_read"):
+    prefix = PREFIXES[mode]
     device = f"npu:{a.device_id}"
     length = max(DEFAULT_REQUEST_LENGTH, a.miss_count)
     block_bytes = a.token_bytes * a.tokens_per_block
     ddr_bytes = a.table_capacity * block_bytes
     payload_bytes = a.miss_count * a.token_bytes
-    _, reserved = pool_layout(a.token_bytes, a.tokens_per_block)
+    _, reserved = pool_layout(a.token_bytes, a.tokens_per_block, mode=mode)
     torch.manual_seed(20260903)
     stream = torch.npu.current_stream()
+    mode_options = {"npu_eids": [a.npu_eid]} if mode == "cpu_push_scatter" and a.npu_eid else {}
     runtime = kvaf.NpuRuntime(
         batch_get_kernel_object_path="", batch_get_token_bytes=a.token_bytes,
         batch_get_tokens_per_block=a.tokens_per_block, device_id=a.device_id,
         npu_core_count=a.workers, aicpu_urma_kernel_json_path=a.kernel_json,
         urma_device=a.urma_device, urma_eid_index=a.eid_index,
-        aicpu_batch_get_mode="gather_read",
+        aicpu_batch_get_mode=mode, **mode_options,
     )
     profiles = []
     # Source and output allocations stay alive until the session is closed.
@@ -145,7 +170,7 @@ def run_case(a, torch, kvaf):
     output = torch.empty((length, a.token_bytes), dtype=torch.uint8, device=device)
     byte_ids = torch.arange(a.token_bytes, dtype=torch.int64, device=device).unsqueeze(0)
     table = device_table = None
-    print(f"AICPU_GATHER_READ_CONFIG table_capacity={a.table_capacity} "
+    print(f"{prefix}_CONFIG table_capacity={a.table_capacity} "
           f"tokens_per_block={a.tokens_per_block} request_length={length} "
           f"token_bytes={a.token_bytes} miss_count={a.miss_count} workers={a.workers} "
           f"source_pool_GiB={ddr_bytes / 1024**3:.3f} "
@@ -167,9 +192,9 @@ def run_case(a, torch, kvaf):
         measured = runtime.batch_get(device_table, indices, offsets, miss_count, rows, output,
                                      stream=stream, synchronize=True, profile=profile)
         elapsed_us = (time.perf_counter_ns() - begin) / 1000
-        # NPU comparison consumes READ results and checks every row, including untouched rows.
+        # NPU comparison consumes BatchGet results and checks every row, including untouched rows.
         if not torch.equal(output, expected):
-            raise AssertionError(f"GatherRead output mismatch: miss_count={count}, workers={a.workers}")
+            raise AssertionError(f"{mode} output mismatch: miss_count={count}, workers={a.workers}")
         if profile:
             measured["python_call_us"] = elapsed_us
             measured["python_other_us"] = elapsed_us - measured["binding_total_us"]
@@ -179,7 +204,7 @@ def run_case(a, torch, kvaf):
     try:
         runtime.link_to(a.peer)
         runtime.initialize(ddr_bytes=ddr_bytes, slot_size=block_bytes)
-        print("AICPU_GATHER_READ_POPULATE_BEGIN", flush=True)
+        print(f"{prefix}_POPULATE_BEGIN", flush=True)
         for start in range(0, a.table_capacity, chunk_entries):
             count = min(chunk_entries, a.table_capacity - start)
             ids = torch.arange(start * a.tokens_per_block, (start + count) * a.tokens_per_block,
@@ -190,7 +215,7 @@ def run_case(a, torch, kvaf):
         table = runtime.prepare_access_table(torch.arange(a.table_capacity, dtype=torch.int64))
         device_table = runtime.access_table_view(table, device="npu", capacity=a.table_capacity)
         stream.synchronize()
-        print("AICPU_GATHER_READ_POPULATE_DONE", flush=True)
+        print(f"{prefix}_POPULATE_DONE", flush=True)
         run_round(0)
         run_round(a.miss_count)
         for _ in range(a.warmup):
@@ -201,19 +226,19 @@ def run_case(a, torch, kvaf):
     finally:
         runtime.shutdown()
 
-    print(f"AICPU_GATHER_READ_PASS workers={a.workers} iterations={a.iterations} "
+    print(f"{prefix}_PASS workers={a.workers} iterations={a.iterations} "
           "verification=every_round_full_output_npu_compare", flush=True)
-    summary = summarize_measurements(profiles, payload_bytes)
-    print_measurements(a, summary)
+    summary = summarize_measurements(profiles, payload_bytes, mode=mode)
+    print_measurements(a, summary, mode=mode)
 
 
-def main():
-    a = parse_args()
+def main(*, mode="gather_read"):
+    a = parse_args(mode=mode)
     import torch
     import torch_npu  # noqa: F401
     import kvaf
     torch.npu.set_device(a.device_id)
-    run_case(a, torch, kvaf)
+    run_case(a, torch, kvaf, mode=mode)
 
 
 if __name__ == "__main__":

@@ -29,3 +29,7 @@ staging 来自同一块 DDR 分配，各 worker 使用不重叠的区间，所�
 性能测试从初始化好的大地址池中有放回随机读，向普通 HBM 的随机行写入，并逐轮校验整个输出。
 默认扫描 token 大小、精确 miss_count 和 worker 数，共 252 组；
 命令及 CSV 指标口径见 [GatherRead 性能扫描](../../../docs/aicpu_gather_read.md#全量性能扫描)。
+
+CPU push/scatter 使用 `tests/run_aicpu_cpu_push_scatter_sweep.sh`，调用 `python/benchmark_cpu_push_scatter.py`，
+复用同一随机负载与算子 P50 统计，输出 ready 等待、scatter 和 done 等待等阶段。
+命令和源池预算见 [CPU push 性能扫描](../../../docs/aicpu_cpu_push_scatter.md#全量性能扫描)。
