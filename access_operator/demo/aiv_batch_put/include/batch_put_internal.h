@@ -53,7 +53,7 @@ typedef struct KvafExecuteBatchPutLaunchArgs {
   uint64_t channel_entity;  // Entity[aiv_core_count * jettys_per_core]
   uint64_t queue_state;     // QueueState[aiv_core_count * jettys_per_core]
   uint32_t jettys_per_core;
-  uint32_t reserved0;
+  uint32_t profile_enabled;  // Reuses the reserved word; launch ABI stays 80 B.
 } KvafExecuteBatchPutLaunchArgs;
 
 #if defined(__cplusplus)

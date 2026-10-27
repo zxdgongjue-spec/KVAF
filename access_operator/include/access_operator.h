@@ -17,12 +17,37 @@ class PeerLink;
 namespace kvaf {
 
 struct PutAccessDesc;
+struct BatchPutProfile;
 using PeerLink = peer::PeerLink;
 
 struct BatchPutExecRequest {
   const BatchPutRequest* request{nullptr};
   const PutAccessDesc* put_desc{nullptr};
   BatchPutExecutionOptions execution;
+  // Non-null only for opt-in synchronous BatchPut diagnostics.
+  BatchPutProfile* profile{nullptr};
+};
+
+struct BatchPutProfile {
+  bool valid{false};
+  std::uint64_t row_count{0}, payload_bytes{0}, metadata_bytes{0}, status_bytes{0};
+  std::uint64_t request_validation_ns{0}, prepare_put_ns{0}, commit_put_ns{0};
+  std::uint64_t runtime_total_ns{0}, operator_total_ns{0};
+  std::uint64_t operator_validation_ns{0}, metadata_reserve_ns{0};
+  std::uint64_t metadata_pack_ns{0}, local_buffer_acquire_ns{0}, arguments_ns{0};
+  // Async copy measurements below are Host enqueue times, not DMA durations.
+  std::uint64_t metadata_h2d_enqueue_ns{0}, execute_sync_ns{0};
+  std::uint64_t sync_validation_ns{0}, sync_lock_wait_ns{0};
+  std::uint64_t status_seed_enqueue_ns{0}, kernel_launch_enqueue_ns{0};
+  std::uint64_t status_d2h_enqueue_ns{0}, stream_wait_ns{0}, status_check_ns{0};
+  std::uint64_t local_buffer_release_ns{0};
+};
+
+struct BatchPutKernelProfile {
+  std::uint64_t kernel_start_cycle{0}, setup_done_cycle{0};
+  std::uint64_t first_doorbell_cycle{0}, post_done_cycle{0};
+  std::uint64_t completion_done_cycle{0}, kernel_finish_cycle{0};
+  std::uint64_t active_requests{0}, total_posts{0}, used_jettys{0};
 };
 
 // KV Access Operator 是 Runtime 的数据面依赖。Runtime 管理远端 DDR
@@ -109,6 +134,9 @@ class DefaultAccessOperator final : public AccessOperator {
   Status Shutdown() override;
   Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
   Status ExecuteBatchPut(const BatchPutExecRequest& request) override;
+
+  Status CopyBatchPutKernelProfiles(
+      std::vector<BatchPutKernelProfile>* profiles) const;
 
   // Profiling is opt-in and uses the reserved per-core status area. Callers
   // must complete the BatchGet stream before copying the latest snapshot.

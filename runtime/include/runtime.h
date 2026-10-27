@@ -93,6 +93,8 @@ class RuntimeCore {
   Status BatchPut(const BatchPutRequest& request,
                   BatchPutExecutionOptions execution = {});
   Status BatchFree(const BatchFreeRequest& request);
+  Status SetBatchPutProfiling(bool enabled);
+  Status CopyBatchPutProfile(BatchPutProfile* profile) const;
 
  protected:
   MetaManager& meta_manager_;
@@ -120,6 +122,8 @@ class RuntimeCore {
 
   bool initialized_{false};
   RemoteRegionDesc remote_region_;
+  bool batch_put_profiling_enabled_{false};
+  BatchPutProfile batch_put_profile_;
   std::uint64_t next_access_table_id_{1};
   std::unordered_map<std::uint64_t, std::unique_ptr<AccessTableState>>
       access_tables_;

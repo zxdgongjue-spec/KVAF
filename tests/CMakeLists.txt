@@ -1,5 +1,17 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+add_test(NAME kvaf_batch_put_profile_python
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_put_profile.py")
+add_executable(kvaf_batch_put_profile_test batch_put_profile_test.cc)
+target_link_libraries(kvaf_batch_put_profile_test PRIVATE kvaf_runtime)
+add_test(NAME kvaf_batch_put_profile_test COMMAND kvaf_batch_put_profile_test)
+add_executable(kvaf_batch_put_kernel_profile_test batch_put_kernel_profile_test.cc)
+target_include_directories(kvaf_batch_put_kernel_profile_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/aiv_model
+  ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_put/include)
+add_test(NAME kvaf_batch_put_kernel_profile_test COMMAND kvaf_batch_put_kernel_profile_test)
+
 add_test(NAME kvaf_dsa_keys_python
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_dsa_keys.py")

@@ -10,6 +10,19 @@ enum {
 };
 
 static const uint64_t KVAF_AIV_BATCH_PUT_STATUS_MAGIC = 0x4b5641464250444fULL;
+static const uint64_t KVAF_AIV_BATCH_PUT_PROFILE_MAGIC = 0x4b56414642505052ULL;
+
+typedef struct KvafBatchPutCoreProfile {
+  uint64_t magic;
+  uint64_t kernel_start_cycle;
+  uint64_t setup_done_cycle;
+  uint64_t first_doorbell_cycle;
+  uint64_t post_done_cycle;
+  uint64_t completion_done_cycle;
+  uint64_t kernel_finish_cycle;
+  uint64_t total_posts;
+  uint64_t used_jettys;
+} KvafBatchPutCoreProfile;
 
 enum KvafBatchPutCoreResult {
   KVAF_BATCH_PUT_CORE_SUCCESS = 0,
@@ -35,7 +48,8 @@ typedef struct KvafBatchPutCoreStatus {
   uint64_t last_wqe_protocol;
   uint64_t cq_status;
   uint64_t cq_sub_status;
-  uint64_t reserved[38];
+  KvafBatchPutCoreProfile profile;
+  uint64_t reserved[29];
 } KvafBatchPutCoreStatus;
 
 // Runtime-facing eager BatchPut V1 ABI. All pointer fields are device

@@ -70,6 +70,10 @@ class NpuRuntime final : public Runtime {
   std::uint32_t batch_get_tokens_per_block() const;
 
   Status SetBatchGetKernelProfiling(bool enabled);
+  Status SetBatchPutProfiling(bool enabled);
+  Status CopyBatchPutProfile(BatchPutProfile* profile) const;
+  Status CopyBatchPutKernelProfiles(
+      std::vector<BatchPutKernelProfile>* profiles) const;
   Status CopyBatchGetKernelProfiles(
       std::vector<BatchGetKernelProfile>* profiles) const;
 

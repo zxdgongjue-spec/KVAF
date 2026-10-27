@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -276,6 +277,13 @@ class NpuPythonRuntime final {
   void BatchPut(const py::object& keys, const py::object& source,
                 const py::object& input_offsets, const py::object& lengths,
                 const py::object& stream) {
+    const bool profiling = batch_put_profiling_enabled_;
+    auto now = [profiling]() -> std::uint64_t {
+      return profiling ? std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count() : 0U;
+    };
+    const auto begin = now();
+    batch_put_profile_valid_ = false;
     if (!Initialized()) {
       throw std::runtime_error("Runtime has not been initialized");
     }
@@ -295,8 +303,83 @@ class NpuPythonRuntime final {
     const aclrtStream acl_stream = ResolveStream(stream);
     batch_put_request_.input =
         ConstBufferView{source_view.data, source_view.bytes, DeviceKind::kNpu};
+    if (profiling) binding_metadata_ns_ = now() - begin;
     ThrowIfError(native_->core().BatchPut(
         batch_put_request_, BatchPutExecutionOptions{acl_stream}));
+    if (profiling) {
+      binding_total_ns_ = now() - begin;
+      batch_put_profile_valid_ = true;
+    }
+  }
+
+  void StartBatchPutProfile() {
+    ThrowIfError(native_->SetBatchPutProfiling(true));
+    batch_put_profiling_enabled_ = true;
+    batch_put_profile_valid_ = false;
+  }
+
+  py::dict BatchPutProfileSnapshot() const {
+    if (!batch_put_profiling_enabled_ || !batch_put_profile_valid_) {
+      throw py::value_error("no successful profiled BatchPut is available");
+    }
+    BatchPutProfile profile;
+    ThrowIfError(native_->CopyBatchPutProfile(&profile));
+    std::vector<BatchPutKernelProfile> cores;
+    ThrowIfError(native_->CopyBatchPutKernelProfiles(&cores));
+    py::dict result;
+#define KVAF_PUT_FIELD(name) result[#name] = profile.name
+    KVAF_PUT_FIELD(row_count);
+    KVAF_PUT_FIELD(payload_bytes);
+    KVAF_PUT_FIELD(metadata_bytes);
+    KVAF_PUT_FIELD(status_bytes);
+    KVAF_PUT_FIELD(request_validation_ns);
+    KVAF_PUT_FIELD(prepare_put_ns);
+    KVAF_PUT_FIELD(commit_put_ns);
+    KVAF_PUT_FIELD(runtime_total_ns);
+    KVAF_PUT_FIELD(operator_total_ns);
+    KVAF_PUT_FIELD(operator_validation_ns);
+    KVAF_PUT_FIELD(metadata_reserve_ns);
+    KVAF_PUT_FIELD(metadata_pack_ns);
+    KVAF_PUT_FIELD(local_buffer_acquire_ns);
+    KVAF_PUT_FIELD(arguments_ns);
+    KVAF_PUT_FIELD(metadata_h2d_enqueue_ns);
+    KVAF_PUT_FIELD(execute_sync_ns);
+    KVAF_PUT_FIELD(sync_validation_ns);
+    KVAF_PUT_FIELD(sync_lock_wait_ns);
+    KVAF_PUT_FIELD(status_seed_enqueue_ns);
+    KVAF_PUT_FIELD(kernel_launch_enqueue_ns);
+    KVAF_PUT_FIELD(status_d2h_enqueue_ns);
+    KVAF_PUT_FIELD(stream_wait_ns);
+    KVAF_PUT_FIELD(status_check_ns);
+    KVAF_PUT_FIELD(local_buffer_release_ns);
+#undef KVAF_PUT_FIELD
+    result["binding_metadata_ns"] = binding_metadata_ns_;
+    result["binding_total_ns"] = binding_total_ns_;
+    py::list records;
+    for (std::size_t core = 0; core < cores.size(); ++core) {
+      const auto& p = cores[core];
+      py::dict item;
+      item["core"] = core;
+      item["kernel_start_cycle"] = p.kernel_start_cycle;
+      item["setup_done_cycle"] = p.setup_done_cycle;
+      item["first_doorbell_cycle"] = p.first_doorbell_cycle;
+      item["post_done_cycle"] = p.post_done_cycle;
+      item["completion_done_cycle"] = p.completion_done_cycle;
+      item["kernel_finish_cycle"] = p.kernel_finish_cycle;
+      item["active_requests"] = p.active_requests;
+      item["total_posts"] = p.total_posts;
+      item["used_jettys"] = p.used_jettys;
+      records.append(item);
+    }
+    result["cores"] = records;
+    return result;
+  }
+
+  py::dict StopBatchPutProfile() {
+    py::dict result = BatchPutProfileSnapshot();
+    ThrowIfError(native_->SetBatchPutProfiling(false));
+    batch_put_profiling_enabled_ = false;
+    return result;
   }
 
   AccessTableHandle PrepareAccessTable(const py::object& keys) {
@@ -505,6 +588,8 @@ class NpuPythonRuntime final {
 
  public:
   void Shutdown() {
+    batch_put_profiling_enabled_ = false;
+    batch_put_profile_valid_ = false;
     ThrowIfError(native_->Shutdown());
   }
 
@@ -513,6 +598,9 @@ class NpuPythonRuntime final {
   // Runtime::BatchPut is synchronous, so these vectors can be reused after
   // each call and avoid allocator churn in the measured loop.
   BatchPutRequest batch_put_request_;
+  bool batch_put_profiling_enabled_{false};
+  bool batch_put_profile_valid_{false};
+  std::uint64_t binding_metadata_ns_{0}, binding_total_ns_{0};
 };
 
 }  // namespace
@@ -565,6 +653,10 @@ void BindNpuPythonRuntime(py::module_& module) {
            "lengths are CPU integer sequences or contiguous CPU int64 tensors "
            "with one entry per key; "
            "stream=None uses torch.npu.current_stream().")
+      .def("start_batch_put_profile", &NpuPythonRuntime::StartBatchPutProfile)
+      .def("batch_put_profile", &NpuPythonRuntime::BatchPutProfileSnapshot,
+           "Copy the latest successful synchronous BatchPut Host/AIV timestamps.")
+      .def("stop_batch_put_profile", &NpuPythonRuntime::StopBatchPutProfile)
       .def("prepare_access_table", &NpuPythonRuntime::PrepareAccessTable,
            py::arg("keys"))
       .def("access_table_view", &NpuPythonRuntime::AccessTableView,

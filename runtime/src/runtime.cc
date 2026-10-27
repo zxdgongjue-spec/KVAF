@@ -1,6 +1,7 @@
 #include "runtime.h"
 
 #include <cstdint>
+#include <chrono>
 #include <limits>
 #include <memory>
 #include <new>
@@ -135,6 +136,8 @@ Status RuntimeCore::Shutdown() {
   }
 
   initialized_ = false;
+  batch_put_profiling_enabled_ = false;
+  batch_put_profile_ = BatchPutProfile{};
   remote_region_ = RemoteRegionDesc{};
   return first_error;
 }
@@ -337,6 +340,14 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
 
 Status RuntimeCore::BatchPut(const BatchPutRequest& request,
                              BatchPutExecutionOptions execution) {
+  const bool profiling = batch_put_profiling_enabled_;
+  auto now = [profiling]() -> std::uint64_t {
+    return profiling ? std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() : 0U;
+  };
+  const auto begin = now();
+  if (profiling) batch_put_profile_ = BatchPutProfile{};
+  BatchPutProfile* profile = profiling ? &batch_put_profile_ : nullptr;
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
@@ -356,25 +367,61 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
       return Status::InvalidArgument(
           "BatchPut input_offsets and lengths must describe bytes inside input");
     }
+    if (profiling) {
+      if (length > std::numeric_limits<std::uint64_t>::max() - profile->payload_bytes) {
+        return Status::InvalidArgument("BatchPut profile payload bytes overflow");
+      }
+      profile->payload_bytes += length;
+    }
+  }
+  auto checkpoint = now();
+  if (profiling) {
+    profile->row_count = request.keys.size();
+    profile->request_validation_ns = checkpoint - begin;
   }
   PutContext put_context;
   PutAccessDesc put_desc;
   Status status = meta_manager_.PreparePut(request.keys, request.lengths,
                                            &put_context, &put_desc);
+  if (profiling) profile->prepare_put_ns = now() - checkpoint;
   if (!status.ok()) {
     return status;
   }
 
   status = access_operator_.ExecuteBatchPut(
-      BatchPutExecRequest{&request, &put_desc, execution});
+      BatchPutExecRequest{&request, &put_desc, execution, profile});
   if (!status.ok()) {
     (void)meta_manager_.AbortPut(put_context);
     return status;
   }
+  checkpoint = now();
   status = meta_manager_.CommitPut(put_context);
   if (!status.ok()) {
     return status;
   }
+  if (profiling) {
+    const auto finish = now();
+    profile->commit_put_ns = finish - checkpoint;
+    profile->runtime_total_ns = finish - begin;
+    profile->valid = true;
+  }
+  return Status::OK();
+}
+
+Status RuntimeCore::SetBatchPutProfiling(bool enabled) {
+  if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
+  batch_put_profiling_enabled_ = enabled;
+  batch_put_profile_ = BatchPutProfile{};
+  return Status::OK();
+}
+
+Status RuntimeCore::CopyBatchPutProfile(BatchPutProfile* profile) const {
+  if (profile == nullptr) return Status::InvalidArgument("BatchPut profile output is null");
+  if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
+  if (!batch_put_profiling_enabled_ || !batch_put_profile_.valid) {
+    return Status::InvalidState("no successful profiled BatchPut is available");
+  }
+  *profile = batch_put_profile_;
   return Status::OK();
 }
 

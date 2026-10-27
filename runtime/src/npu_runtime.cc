@@ -841,6 +841,25 @@ Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled) {
   return impl_->access_operator->SetBatchGetKernelProfiling(enabled);
 }
 
+Status NpuRuntime::SetBatchPutProfiling(bool enabled) {
+  return core().SetBatchPutProfiling(enabled);
+}
+
+Status NpuRuntime::CopyBatchPutProfile(BatchPutProfile* profile) const {
+  return core().CopyBatchPutProfile(profile);
+}
+
+Status NpuRuntime::CopyBatchPutKernelProfiles(
+    std::vector<BatchPutKernelProfile>* profiles) const {
+  BatchPutProfile host;
+  const Status available = CopyBatchPutProfile(&host);
+  if (!available.ok()) return available;
+  if (impl_->access_operator == nullptr) {
+    return Status::NotInitialized("NpuRuntime requires LinkTo before reading BatchPut profiling");
+  }
+  return impl_->access_operator->CopyBatchPutKernelProfiles(profiles);
+}
+
 Status NpuRuntime::CopyBatchGetKernelProfiles(
     std::vector<BatchGetKernelProfile>* profiles) const {
   if (impl_->access_operator == nullptr) {

@@ -8,6 +8,7 @@ NPU EIDs. BatchPut uses the first EID when an explicit list is provided.
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 import statistics
 import sys
@@ -18,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kvaf
 
 from backend import detect_torch_backend
+from batch_put_profile import profile_options, print_profile, summarize_sample
 from npu_eids import parse_npu_eids
 
 DEFAULT_BATCH_GET_TOKEN_BYTES = 656
@@ -141,6 +143,11 @@ def main() -> int:
         jettys_per_core = int(os.environ.get("KVAF_NPU_JETTYS_PER_CORE", "2"))
         warmup = int(os.environ.get("KVAF_NPU_WARMUP", "20"))
         iterations = int(os.environ.get("KVAF_NPU_ITERATIONS", "500"))
+        profiling, profile_clock_mhz, profile_path = profile_options(os.environ)
+        if profiling and not all(hasattr(kvaf.NpuRuntime, name) for name in (
+            "start_batch_put_profile", "batch_put_profile", "stop_batch_put_profile",
+        )):
+            raise ValueError("rebuild the NPU binding and BatchPut kernel with profiling support")
         if not (
             device_id >= 0 and 0 < rows <= (1 << 32) - 1
             and 0 < block_bytes <= (1 << 32) - 1
@@ -214,6 +221,7 @@ def main() -> int:
         return 2
     runtime.link_to(remote_cpu_service)
     committed = False
+    profile_log = None
     try:
         print(
             "RUNTIME_NPU_BATCH_PUT_CONFIG "
@@ -228,6 +236,7 @@ def main() -> int:
             f"batch_get_tokens_per_block={tokens_per_block} "
             f"jettys_per_core={jettys_per_core} warmup={warmup} "
             f"iterations={iterations} backend=aiv_direct_hccp"
+            f" profiling={int(profiling)}"
         )
         min_rows_per_core = rows // npu_core_count
         max_rows_per_core = (rows + npu_core_count - 1) // npu_core_count
@@ -261,15 +270,33 @@ def main() -> int:
             release()
         torch.npu.synchronize()
 
+        profile_records = []
+        if profiling:
+            log_path = Path(profile_path)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            profile_log = log_path.open("w", encoding="utf-8")
+            runtime.start_batch_put_profile()
+            print(f"BATCH_PUT_PROFILE_LOG path={log_path.resolve()} counter_clock_mhz={profile_clock_mhz}")
         samples = []
         for iteration in range(iterations):
             begin = time.perf_counter()
             execute()
             # BatchPut already waits for its stream and checks completion status.
             samples.append((time.perf_counter() - begin) * 1000.0)
+            if profiling:
+                snapshot = runtime.batch_put_profile()
+                record = {"iteration": iteration, "clock_mhz": profile_clock_mhz,
+                          "profile": snapshot,
+                          "derived": summarize_sample(snapshot, samples[-1], profile_clock_mhz)}
+                profile_records.append(record)
+                profile_log.write(json.dumps(record) + "\n")
+                profile_log.flush()
             if iteration + 1 < iterations:
                 release()
         print("RUNTIME_NPU_PHASE_DONE phase=runtime_batch_put")
+        if profiling:
+            runtime.stop_batch_put_profile()
+            print_profile(profile_records, warmup, profile_clock_mhz)
 
         print("RUNTIME_NPU_PHASE_BEGIN phase=post_perf_validation")
         validate_batch(runtime, keys, rows, block_bytes)
@@ -287,6 +314,7 @@ def main() -> int:
             f"p90_ms={percentile(samples, 0.90):.3f} "
             f"p99_ms={percentile(samples, 0.99):.3f} "
             f"useful_GBps={useful_gbps:.3f}"
+            f" profiling={int(profiling)}"
         )
         return 0
     except Exception as error:
@@ -297,6 +325,8 @@ def main() -> int:
         )
         raise
     finally:
+        if profile_log is not None:
+            profile_log.close()
         if runtime.initialized:
             if committed:
                 runtime.batch_free(keys)

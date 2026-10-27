@@ -1,6 +1,7 @@
 #include "kvaf_aiv_batch_put.h"
 
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
@@ -552,6 +553,21 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
                                             aclrtStream stream,
                                             KvafBatchPutCoreStatus *core_status,
                                             uint32_t core_status_count) {
+  return KvafExecuteBatchPutSyncProfiled(local_buffer, arguments, stream,
+                                        core_status, core_status_count, nullptr);
+}
+
+extern "C" int32_t KvafExecuteBatchPutSyncProfiled(
+    KvafBatchPutLocalBuffer *local_buffer,
+    const KvafExecuteBatchPutKernelArgs *arguments, aclrtStream stream,
+    KvafBatchPutCoreStatus *core_status, uint32_t core_status_count,
+    KvafBatchPutHostTiming *timing) {
+  auto now = [timing]() -> uint64_t {
+    return timing != nullptr ? std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() : 0U;
+  };
+  if (timing != nullptr) *timing = KvafBatchPutHostTiming{};
+  uint64_t checkpoint = now();
   if (local_buffer == nullptr || local_buffer->reference_count == 0U ||
       local_buffer->transport == nullptr || arguments == nullptr || stream == nullptr || core_status == nullptr ||
       arguments->input == 0U || arguments->input_offsets == 0U || arguments->lengths == 0U ||
@@ -565,7 +581,11 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
   }
 
   KvafBatchPutTransport *transport = local_buffer->transport;
+  if (timing != nullptr) timing->validation_ns = now() - checkpoint;
+  checkpoint = now();
   std::lock_guard<std::mutex> launch_lock(transport->launch_mutex);
+  if (timing != nullptr) timing->lock_wait_ns = now() - checkpoint;
+  checkpoint = now();
   const uint64_t status_bytes = static_cast<uint64_t>(core_status_count) * sizeof(*core_status);
   // Status initialization and the kernel are ordered on one stream, so the
   // host need not block before the launch. core_status is a persistent pinned
@@ -578,16 +598,21 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
                  static_cast<int>(seed_result));
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
+  if (timing != nullptr) timing->seed_enqueue_ns = now() - checkpoint;
+  checkpoint = now();
   KvafExecuteBatchPutLaunchArgs launch_args{};
   launch_args.request = *arguments;
   launch_args.channel_entity = local_buffer->device_channel_entity;
   launch_args.queue_state = reinterpret_cast<uint64_t>(transport->device_queue_state);
   launch_args.jettys_per_core = transport->jettys_per_core;
+  launch_args.profile_enabled = timing != nullptr ? 1U : 0U;
   int32_t result = KvafExecuteBatchPutLaunchInternal(&launch_args, stream);
   if (result != KVAF_BATCH_PUT_SUCCESS) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=launch result=%d\n", result);
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
+  if (timing != nullptr) timing->launch_enqueue_ns = now() - checkpoint;
+  checkpoint = now();
   // Queue the completion status before synchronizing so the host pays one
   // stream wait for both the AIV kernel and the status D2H copy.
   const aclError status_copy_result = aclrtMemcpyAsync(
@@ -598,12 +623,16 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
                  static_cast<int>(status_copy_result));
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
+  if (timing != nullptr) timing->status_enqueue_ns = now() - checkpoint;
+  checkpoint = now();
   const aclError synchronize_result = aclrtSynchronizeStream(stream);
   if (synchronize_result != ACL_SUCCESS) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=synchronize acl=%d\n",
                  static_cast<int>(synchronize_result));
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
+  if (timing != nullptr) timing->stream_wait_ns = now() - checkpoint;
+  checkpoint = now();
   for (uint32_t core = 0U; core < core_status_count; ++core) {
     const uint64_t begin = static_cast<uint64_t>(arguments->row_count) * core / core_status_count;
     const uint64_t end = static_cast<uint64_t>(arguments->row_count) * (core + 1U) / core_status_count;
@@ -614,5 +643,6 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
       return KVAF_BATCH_PUT_KERNEL_ERROR;
     }
   }
+  if (timing != nullptr) timing->status_check_ns = now() - checkpoint;
   return KVAF_BATCH_PUT_SUCCESS;
 }

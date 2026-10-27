@@ -35,6 +35,23 @@ void KvafBatchPutLocalBufferRelease(KvafBatchPutLocalBuffer *local_buffer);
 
 int32_t KvafExecuteBatchPutLoadKernel(const char *kernel_object_path);
 
+typedef struct KvafBatchPutHostTiming {
+  uint64_t validation_ns;
+  uint64_t lock_wait_ns;
+  uint64_t seed_enqueue_ns;
+  uint64_t launch_enqueue_ns;
+  uint64_t status_enqueue_ns;
+  uint64_t stream_wait_ns;
+  uint64_t status_check_ns;
+} KvafBatchPutHostTiming;
+
+// A non-null timing pointer enables both Host timestamps and AIV cycle output.
+int32_t KvafExecuteBatchPutSyncProfiled(
+    KvafBatchPutLocalBuffer *local_buffer,
+    const KvafExecuteBatchPutKernelArgs *arguments, aclrtStream stream,
+    KvafBatchPutCoreStatus *core_status, uint32_t core_status_count,
+    KvafBatchPutHostTiming *timing);
+
 // Synchronous eager execution: status initialization, launch, status D2H, one
 // stream synchronization, and core-status checking finish before this function
 // returns.
