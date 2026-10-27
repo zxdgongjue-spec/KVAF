@@ -155,6 +155,7 @@ bool WaitBatchPrefix(GatherPrefix& prefix, const urma_jfs_wr_t& tail,
       gather.result = kGatherTransportFailed;
       break;
     }
+    // READ DMA replaced the cached progress word; CQ completion precedes this load.
     FlushUmdkCache(reinterpret_cast<const void*>(scratch), 8);
     prefix.ready_bytes = *reinterpret_cast<const volatile std::uint64_t*>(scratch);
     if ((prefix.ready_bytes & kvaf::peer::kGatherErrorBit) != 0 ||
@@ -274,6 +275,7 @@ void WaitAck(const GatherReadArgs& args, GatherReadStatus& status) {
   for (unsigned poll = 0; poll < 10000U; ++poll) {
     status.result = UmdkTransferSync(&args.context, false, &transfer, 1U, args.worker_index);
     if (status.result) return;
+    // READ DMA replaced the ACK word in this running kernel, without a CANN handoff.
     Flush(reinterpret_cast<void*>(transfer.local), transfer.bytes);
     status.ack_seen = *reinterpret_cast<const volatile std::uint64_t*>(transfer.local);
     if (status.ack_seen == args.sequence) return;
@@ -297,15 +299,8 @@ bool BuildCurrentRequest(const UmdkBatchGetArgs& launch, GatherReadArgs& args,
   const auto* addresses = reinterpret_cast<const std::uint64_t*>(request.address_table);
   const auto* indices = reinterpret_cast<const std::int32_t*>(request.indices);
   const auto* offsets = reinterpret_cast<const std::int32_t*>(request.offsets);
-  {
-    BatchGetProfileScope timer(profile ? &profile->input_cache_ns : nullptr);
-    Flush(reinterpret_cast<void*>(request.indices + first * 4ULL), (last - first) * 4ULL);
-    Flush(reinterpret_cast<void*>(request.offsets + first * 4ULL), (last - first) * 4ULL);
-    Flush(reinterpret_cast<void*>(request.output_indices + first * 4ULL), (last - first) * 4ULL);
-    // Only this worker's active lookups need cache visibility, not the whole table.
-    for (auto i = first; i < last; ++i)
-      Flush(addresses + indices[i], sizeof(*addresses));
-  }
+  // Input tensors are ready before this CANN kernel starts, as in the control
+  // and CPU-push kernels. AICPU only reads them; no per-request cache sweep.
   auto* descriptor = reinterpret_cast<kvaf::peer::GatherDescriptorHeader*>(args.source_descriptor);
   auto* sources = reinterpret_cast<kvaf::peer::GatherSpan*>(descriptor + 1);
   for (auto i = first; i < last; ++i) {
@@ -316,8 +311,9 @@ bool BuildCurrentRequest(const UmdkBatchGetArgs& launch, GatherReadArgs& args,
   args.bytes = static_cast<std::uint32_t>(bytes);
   *descriptor = {kvaf::peer::kGatherDescriptorMagic, args.sequence, args.remote_staging,
                  args.source_span_count, args.bytes, args.pipeline_chunk_bytes, request.token_bytes};
-  {
+  if (args.bytes) {
     BatchGetProfileScope timer(profile ? &profile->descriptor_cache_ns : nullptr);
+    // AICPU wrote this descriptor; the following in-kernel URMA WRITE DMA reads it.
     Flush(descriptor, kvaf::peer::GatherDescriptorBytes(args.source_span_count));
   }
   return true;
@@ -336,8 +332,8 @@ bool StartGather(GatherReadArgs& args, GatherReadStatus& status, BatchGetWorkerP
   auto* scratch = reinterpret_cast<std::uint64_t*>(args.scratch);
   scratch[0] = args.sequence;
   scratch[2] = args.remote_descriptor;
-  // Clean the entire mailbox line once before DMA. Until the next request,
-  // AICPU only reads it: polling needs cache maintenance after CQ, not before READ.
+  // AICPU just wrote sequence/descriptor pointer; URMA WRITE DMA reads this line.
+  // AICPU does not write it again until the next request, so polls need no pre-READ flush.
   Flush(scratch, 24U);
   const UmdkTransfer notify[] = {{args.remote_command, args.scratch + 16U, 8U},
                                  {args.remote_notify, args.scratch, 8U}};
@@ -378,11 +374,9 @@ std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
   status = {};
   status.magic = kGatherStatusMagic;
   status.sequence = args.sequence;
-  Flush(reinterpret_cast<const void*>(launch->request.miss_count), sizeof(std::int32_t));
   const auto active = *reinterpret_cast<const volatile std::int32_t*>(launch->request.miss_count);
   if (active < 0 || static_cast<std::uint32_t>(active) > launch->request.request_capacity) {
     status.result = kInvalidGatherRequest;
-    Flush(&status, sizeof(status));
     return 1U;
   }
   const auto count = static_cast<std::uint32_t>(active);
@@ -408,14 +402,13 @@ std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
       WaitAck(args, status);
     }
   }
-  Flush(&status, sizeof(status));
+  // Status/profile are consumed by CANN D2H after kernel completion on this stream.
   if (profile) {
     profile->bytes = args.bytes;
     profile->spans = args.source_span_count;
     profile->exit_ns = BatchGetProfileNowNs();
     auto* destination = reinterpret_cast<BatchGetWorkerProfile*>(args.profile) + worker;
     *destination = *profile;
-    Flush(destination, sizeof(*destination));
   }
   return status.result ? 1U : 0U;
 }

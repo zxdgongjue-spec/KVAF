@@ -5,7 +5,9 @@
 
 namespace kvaf::aicpu_urma {
 
-// Maintain AICPU cache visibility for DMA buffers.
+// Maintain visibility for URMA DMA handoffs inside a running AICPU kernel.
+// Each call must identify its producer/consumer. Do not sweep CANN input tensors
+// or return buffers whose handoff is ordered by the kernel/stream lifecycle.
 inline void FlushUmdkCacheLines(const void* address, std::uint64_t bytes) {
 #if defined(__linux__) && defined(__aarch64__)
   if (bytes == 0) return;

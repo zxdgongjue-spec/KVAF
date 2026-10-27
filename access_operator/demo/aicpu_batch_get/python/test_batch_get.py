@@ -123,7 +123,7 @@ def print_profile(samples: list[dict], mode: str, *, warmup: int = 1,
         print(f"  Worker {index} " + fields(rows, ("entry_us", "exit_us", "wall_us",
                                                   "request_us", "source_write_us", "notify_us",
                                                   "read_us", "ack_us")))
-        print("    Within request " + fields(rows, ("input_cache_us", "descriptor_cache_us")))
+        print("    Within request " + fields(rows, ("descriptor_cache_us",)))
         print("    Within READ " + fields(rows, ("read_setup_us", "wr_build_us", "ready_wait_us",
                                                 "post_us", "cq_wait_us")))
         print("    Counts " + fields(rows, ("bytes", "spans", "read_wqes", "post_calls",
