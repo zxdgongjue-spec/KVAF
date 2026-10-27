@@ -38,7 +38,7 @@ for token in "${token_sizes[@]}"; do
         tail -n 30 "$log_file" >&2
         exit 1
       fi
-      echo "$result"
+      awk '/^AICPU_GATHER_READ_PROFILE / || /^  / { print }' "$log_file"
       printf '%s\n' "$result" | awk -v first="$index" '
         {
           header=""; row=""
@@ -47,7 +47,7 @@ for token in "${token_sizes[@]}"; do
             sep=(i==2 ? "" : ",")
             header=header sep field[1]; row=row sep field[2]
           }
-          if (first==1) print header
+          if (first==1 && NR==1) print header
           print row
         }' >>"$csv_file"
     done
@@ -57,14 +57,12 @@ done
 awk -F, '
   NR==1 {
     for (i=1; i<=NF; i++) col[$i]=i
-    printf "%-11s %-10s %-7s %14s %9s %12s %14s %10s %14s\n",
-           "token_bytes", "miss_count", "workers", "device_p50_us", "p50_GBps",
-           "request_us", "input_cache_us", "read_us", "ready_wait_us"
+    print "token_bytes miss_count workers device_p50_us p50_GBps"
     next
   }
-  { printf "%-11s %-10s %-7s %14s %9s %12s %14s %10s %14s\n",
-           $(col["token_bytes"]), $(col["miss_count"]), $(col["workers"]),
-           $(col["device_p50_us"]), $(col["p50_GBps"]), $(col["request_us"]),
-           $(col["input_cache_us"]), $(col["read_us"]), $(col["ready_wait_us"]) }
+  $(col["worker"])==0 {
+    print $(col["token_bytes"]), $(col["miss_count"]), $(col["workers"]),
+          $(col["device_p50_us"]), $(col["p50_GBps"])
+  }
 ' "$csv_file"
 echo "AICPU_GATHER_READ_SWEEP_PASS cases=$index csv=$csv_file"

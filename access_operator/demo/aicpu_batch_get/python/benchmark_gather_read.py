@@ -8,7 +8,7 @@ import statistics
 from pathlib import Path
 import time
 
-from test_batch_get import print_profile, timing_stats
+from test_batch_get import timing_stats
 
 DDR_BUDGET_BYTES = 100 * 1024**3
 DEFAULT_TOKENS_PER_BLOCK = 128
@@ -88,11 +88,34 @@ def token_pattern(torch, token_ids, byte_ids):
 
 def summarize_measurements(profiles, payload_bytes):
     device = timing_stats([sample["device_span_us"] for sample in profiles], payload_bytes)
-    result = dict(device_p50_us=device["p50_us"], p50_GBps=device["p50_GBps"])
-    for name in ("request_us", "input_cache_us", "read_us", "ready_wait_us"):
-        result[name] = statistics.mean(max(worker[name] for worker in sample["workers"])
-                                       for sample in profiles)
-    return result
+    summary = dict(device_p50_us=device["p50_us"], p50_GBps=device["p50_GBps"])
+    workers = []
+    for index in range(len(profiles[0]["workers"])):
+        phases = {name: statistics.mean(sample["workers"][index][name] for sample in profiles)
+                  for name in ("request_us", "source_write_us", "notify_us", "read_us",
+                               "wr_build_us", "ready_wait_us", "post_us", "cq_wait_us", "ack_us")}
+        workers.append(dict(worker=index, **phases))
+    return summary, workers
+
+
+def print_measurements(a, summary, workers):
+    print(f"AICPU_GATHER_READ_PROFILE 算子P50={summary['device_p50_us']:.1f} us "
+          f"p50_GBps={summary['p50_GBps']:.3f} 阶段耗时=各worker测量轮次均值")
+    for w in workers:
+        print(f"  worker={w['worker']}")
+        print(f"    构建源清单={w['request_us']:.1f} us | WRITE清单={w['source_write_us']:.1f} us | "
+              f"通知CPU={w['notify_us']:.1f} us")
+        print(f"    流水READ={w['read_us']:.1f} us，其中：")
+        print(f"      组装WR/SGL={w['wr_build_us']:.1f} us | 等CPU就绪前缀={w['ready_wait_us']:.1f} us | "
+              f"提交READ={w['post_us']:.1f} us | 等READ CQE={w['cq_wait_us']:.1f} us")
+        print(f"    等最终CPU ACK={w['ack_us']:.1f} us")
+        result = dict(token_bytes=a.token_bytes, miss_count=a.miss_count, workers=a.workers,
+                      **summary, **w)
+        fields = []
+        for key, value in result.items():
+            formatted = f"{value:.3f}" if key == "p50_GBps" else f"{value:.1f}" if isinstance(value, float) else str(value)
+            fields.append(f"{key}={formatted}")
+        print("AICPU_GATHER_READ_RESULT " + " ".join(fields), flush=True)
 
 
 def run_case(a, torch, kvaf):
@@ -176,14 +199,8 @@ def run_case(a, torch, kvaf):
 
     print(f"AICPU_GATHER_READ_PASS workers={a.workers} iterations={a.iterations} "
           "verification=every_round_full_output_npu_compare", flush=True)
-    print_profile(profiles, "gather_read", warmup=a.warmup, separate_samples=False)
-    result = dict(token_bytes=a.token_bytes, miss_count=a.miss_count, workers=a.workers)
-    result.update(summarize_measurements(profiles, payload_bytes))
-    fields = []
-    for key, value in result.items():
-        formatted = f"{value:.3f}" if key == "p50_GBps" else f"{value:.1f}" if isinstance(value, float) else str(value)
-        fields.append(f"{key}={formatted}")
-    print("AICPU_GATHER_READ_RESULT " + " ".join(fields), flush=True)
+    summary, workers = summarize_measurements(profiles, payload_bytes)
+    print_measurements(a, summary, workers)
 
 
 def main():
