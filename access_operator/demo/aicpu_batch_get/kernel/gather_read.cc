@@ -294,16 +294,18 @@ bool BuildCurrentRequest(const UmdkBatchGetArgs& launch, GatherReadArgs& args,
       !request.output_indices || !args.output || !request.token_bytes ||
       request.request_capacity > kGatherMaxSpans)
     return false;
-  {
-    BatchGetProfileScope timer(profile ? &profile->input_cache_ns : nullptr);
-    Flush(reinterpret_cast<void*>(request.address_table), request.table_capacity * 8ULL);
-    Flush(reinterpret_cast<void*>(request.indices + first * 4ULL), (last - first) * 4ULL);
-    Flush(reinterpret_cast<void*>(request.offsets + first * 4ULL), (last - first) * 4ULL);
-    Flush(reinterpret_cast<void*>(request.output_indices + first * 4ULL), (last - first) * 4ULL);
-  }
   const auto* addresses = reinterpret_cast<const std::uint64_t*>(request.address_table);
   const auto* indices = reinterpret_cast<const std::int32_t*>(request.indices);
   const auto* offsets = reinterpret_cast<const std::int32_t*>(request.offsets);
+  {
+    BatchGetProfileScope timer(profile ? &profile->input_cache_ns : nullptr);
+    Flush(reinterpret_cast<void*>(request.indices + first * 4ULL), (last - first) * 4ULL);
+    Flush(reinterpret_cast<void*>(request.offsets + first * 4ULL), (last - first) * 4ULL);
+    Flush(reinterpret_cast<void*>(request.output_indices + first * 4ULL), (last - first) * 4ULL);
+    // Only this worker's active lookups need cache visibility, not the whole table.
+    for (auto i = first; i < last; ++i)
+      Flush(addresses + indices[i], sizeof(*addresses));
+  }
   auto* descriptor = reinterpret_cast<kvaf::peer::GatherDescriptorHeader*>(args.source_descriptor);
   auto* sources = reinterpret_cast<kvaf::peer::GatherSpan*>(descriptor + 1);
   for (auto i = first; i < last; ++i) {
