@@ -75,6 +75,44 @@ there is parallel allocation contention.
 Optional `--peer-ub-device` and `--npu-eids` allow a known-working path to be
 held fixed. Keep these and the AIV configuration fixed across runs.
 
+## 单机初始化串行对照
+
+重建 KVAF NPU Runtime/binding 后，可用 `KVAF_SERIALIZE_INITIALIZE=1` 将同一
+CPU endpoint 的多进程初始化串行化；不改 vLLM 或诊断脚本，CPU service 无需
+仅为此更新。默认关闭，完整变量及文件锁限制见
+[Runtime 初始化串行开关](../../runtime/README.md#单机多进程初始化串行开关)。
+
+先用小容量验证开关和锁日志，例如在 CPU service 已 `LISTEN` 后运行：
+
+```bash
+export KVAF_SERIALIZE_INITIALIZE=1
+export KVAF_INITIALIZE_LOCK_TIMEOUT_SECONDS=1800
+for device in 4 5 6 7; do
+  python3 -u tests/diagnostics/ddr_init_probe.py \
+    --build build-npu --address 127.0.0.1:34555 \
+    --device "$device" --ddr-gib 1 --hold-seconds 30 \
+    > "npu-gate1-device${device}-1g.log" 2>&1 &
+done
+wait
+```
+
+`--hold-seconds` 在初始化完成后保留 region，文件锁则在初始化返回时已经释放。
+上述后台启动只是同时拉起进程，`set_device` 的差异仍可能让各卡进入初始化的
+时间错开；确认日志里实际出现等锁后，才能判断这一轮是否覆盖了重叠初始化。
+锁不保证按 4→5→6→7 的顺序获取。
+
+`[KVAF_INIT_GATE]` 独立记录 `wait/acquired/released/timeout`，不需要打开
+profiling。完整 `DDR_INIT_PROBE` 的 `operation=initialize` 耗时包含等锁时间；
+`KVAF_INIT_PROFILE` 的 `candidate_initialize` 和内部阶段在拿锁后才开始，
+不包含等锁。不要把排队更久误判为 DDR 分配更慢。
+
+正式比较时，将容量改为 32/64 GiB，确认有足够内存；先释放上一组所有 region，
+再使用 `KVAF_SERIALIZE_INITIALIZE=0` 和新的日志文件名运行基线。两组保持相同
+CPU service 页模式、容量、候选和起始驻留压力，保留全部样本；比较每次持锁
+初始化耗时及所有卡的就绪耗时。串行开关是缓解并发启动压力的措施，不证明 THP
+或多卡竞争已经是唯一根因。做后面的 THP 因果对照时，两种页模式应使用相同
+开关设置，原有并发基线则保持 `KVAF_SERIALIZE_INITIALIZE=0`。
+
 ## THP 长耗时诊断：匹配预触页的对照
 
 `origin` 与 `thp` 的实测差异可用于定位代码路径，但不能单独证明内核 THP 有问题。

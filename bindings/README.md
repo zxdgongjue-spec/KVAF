@@ -54,6 +54,10 @@ Jetty。BatchPut 保持原有实现：该值为 1 或 2 时使用相同数量，
 CPU service 的分配、预触页及注册诊断需另外传入 `--profile-initialize`。
 匹配大页/普通页的实验与日志分析见
 [DDR 初始化诊断](../tests/diagnostics/ddr_init_probe.md)。
+单机多个 worker 可在启动前统一设置 `KVAF_SERIALIZE_INITIALIZE=1`，由 KVAF 原生层
+串行执行同 endpoint 的初始化，无需修改 Python/vLLM 调用；默认关闭。
+等锁会计入 `initialize` 总时间，配置和限制见
+[Runtime 初始化串行开关](../runtime/README.md#单机多进程初始化串行开关)。
 远程 CPU DDR 只增加 `runtime.link_to("CPU_IP:port")`，必须在 `initialize` 前调用。
 `npu_eids=[]` 时 EID、UMDK device 与候选 RMA 验证由 C++ Runtime 自动完成；
 显式传入多个 32 位十六进制 EID 时，Runtime 为每个 EID 创建独立

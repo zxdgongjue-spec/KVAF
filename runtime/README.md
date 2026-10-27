@@ -125,6 +125,58 @@ CPU 快照在整个分配、`memset` 和 `register_seg` 前后记录全局 vmsta
 `origin` 不主动触页，不适合作为唯一的 THP 因果对照。完整实验顺序、打点口径和
 汇总命令见 [DDR 初始化诊断说明](../tests/diagnostics/ddr_init_probe.md)。
 
+### 单机多进程初始化串行开关
+
+同一台机器的多个 worker 同时初始化时，可用 KVAF 内部的跨进程文件锁，
+让连接同一个 CPU endpoint 的 `NpuRuntime::Initialize` 依次执行。这是降低并发
+启动压力的可选缓解手段，不代表已定位 DDR 初始化长尾的根因，默认关闭。
+
+更新 KVAF 后重建 NPU Runtime 和 Python binding：
+
+```bash
+./build.sh npu
+```
+
+本开关不改变 CPU 控制协议，CPU service 无需仅为此重建。无需修改 vLLM 代码或
+启动脚本；在启动 vLLM 的 shell 中设置环境变量，再执行原有启动命令即可，
+确保所有 worker 都继承相同配置：
+
+```bash
+export KVAF_SERIALIZE_INITIALIZE=1
+export KVAF_INITIALIZE_LOCK_TIMEOUT_SECONDS=1800
+```
+
+`KVAF_SERIALIZE_INITIALIZE=0` 恢复原来的并发行为。
+`KVAF_INITIALIZE_LOCK_TIMEOUT_SECONDS` 默认为 1800（30 分钟），必须为正的有限秒数，只限制当前进程
+从开始等锁到拿到锁的总等待时间，可能包含前面多个 worker 的初始化时间。
+等锁超时会导致本次初始化失败；已经拿到锁的初始化不受该超时限制。
+
+锁在第一个 CPU RPC 前获取，覆盖候选查询、EID 发现、DDR 申请、通路与元数据
+初始化、启动 RMA 验证和候选失败清理，在整个 `Initialize` 返回时释放。
+某张卡成功返回后，其 DDR 可以继续保留，下一张卡即可开始初始化；锁不覆盖
+后续推理、BatchGet/Put 或 hold 时长。顺序取决于各进程实际拿到锁的顺序，
+不保证按卡号/rank 排列，不使用 `sleep(rank)`。
+
+默认锁文件位于 `/tmp/kvaf-init-<uid>-<endpoint_hash>.lock`，使用稳定的
+endpoint 哈希；同一台机器、同一用户连接同一 endpoint 时可直接使用，不同
+endpoint 默认互不阻塞。需要让 endpoint 别名也使用同一把锁时，可以显式设置
+一个所有相关 worker 均可访问的绝对路径，例如：
+
+```bash
+export KVAF_INITIALIZE_LOCK_PATH=/tmp/kvaf-initialize-local.lock
+```
+
+只有打开开关且使用同一个锁文件的 worker 才会互相等待。容器必须共享该文件
+所在路径，单纯设置相同路径字符串不足以保证跨容器共享；此功能面向单机，
+不是跨主机分布式锁。不要删除或替换正在使用的锁文件；文件存在本身不会阻塞，
+进程退出（包括异常退出）后操作系统会释放其持锁状态，后续运行可复用原文件。
+
+`[KVAF_INIT_GATE]` 的 `wait`、`acquired`、`released`、`timeout` 日志记录
+PID、device、endpoint，以及等锁/持锁耗时。客户端完整 `initialize` 时间包含
+等锁时间，后启动的 worker 变慢可能只是排队；评估缓解效果时分别比较等锁时间、
+持锁初始化耗时和全部 worker 就绪耗时。用法验证见
+[DDR 探针的多进程串行对照](../tests/diagnostics/ddr_init_probe.md#单机初始化串行对照)。
+
 已知设备名时也可设置 `peer_ub_device="udmac0d1e2"`，只在该设备的 EID 中按
 连通性选择，不执行带宽标定。`peer_ub_device` 与 `adaptive_ub_device=True` 互斥。
 

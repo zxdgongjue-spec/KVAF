@@ -28,6 +28,7 @@
 #include "startup_bandwidth_probe.h"
 #include "startup_selection.h"
 #include "init_phase_timing.h"
+#include "initialize_gate.h"
 
 namespace kvaf {
 namespace {
@@ -559,6 +560,15 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   if (ddr_bytes == 0U || slot_size == 0U || ddr_bytes % slot_size != 0U) {
     return Status::InvalidArgument("DDR size must be a nonzero multiple of slot_size");
   }
+
+  // Serialize the whole startup transaction, including the control RPCs used
+  // to create channels after allocation. Locking AllocateRegion alone leaves
+  // those RPCs queued behind other workers' large DDR allocations.
+  detail::InitializeGate initialize_gate;
+  const Status gate_status = initialize_gate.AcquireFromEnvironment(
+      impl_->peer_link->address(), impl_->options.device_id,
+      kUbSelectorLockPath);
+  if (!gate_status.ok()) return gate_status;
 
   std::uint32_t candidate_count = 0U;
   std::uint32_t device_count = 0U;

@@ -1,6 +1,6 @@
 # Diagnostics
 
-DDR 初始化的匹配 `thp/no-thp` 对照、细粒度计时和分析工具见
+DDR 初始化的匹配 `thp/no-thp` 对照、细粒度计时、单机多进程初始化串行开关和分析工具见
 [DDR initialization probe](ddr_init_probe.md)。
 
 ## Paired bandwidth timing scopes
