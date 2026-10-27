@@ -210,30 +210,28 @@ CPU 线程预算和绑定策略在同一次扫描中保持一致；SGL 6、每�
 
 - 准备 CPU 读取请求（地址查表、填写清单并交给 DMA）、发送地址清单、通知 CPU。
 - 流水 READ 总时间，以及其中的 WR/SGL 构建、等待 CPU 就绪前缀、提交 READ、等待 READ CQE。
-- 等待最终 CPU ACK。
 
 上述阶段直接使用现有打点，每轮取各 worker 的最大耗时，再对测量轮次求均值。
 请求准备包含地址查表、填写地址/长度清单及发送前的清单缓存维护；READ 下的子项包含在 READ 总时间内。
 阶段最大值可能来自不同 worker，且存在嵌套和重叠，不能相加为算子时间。
 
-CSV 每组配置一行，使用英文表头，所有时间标明单位及均值/P50：
+CSV 每组配置一行，使用英文表头，时间单位为微秒，阶段列为均值，算子耗时列为 P50：
 
 | 表头 | 含义 |
 | --- | --- |
 | token_bytes / miss_count / workers | 测试配置 |
 | device_p50_us / p50_GBps | 算子耗时中位数及对应的有效载荷带宽 |
-| prepare_cpu_request_mean_us | 按索引和偏移计算 CPU 源地址，填写清单，并在交给 URMA DMA 前清理清单缓存 |
-| send_address_list_mean_us | AICPU 将地址/长度清单 WRITE 到 CPU DDR 并等完成 |
-| notify_cpu_mean_us | WRITE 清单指针和请求编号，通知 CPU 开始 gather |
-| read_pipeline_mean_us | 从 staging READ 到输出 HBM 的整个流水阶段 |
-| read_build_wr_sgl_mean_us | 构建 URMA READ 请求及目标分散地址 |
-| read_wait_cpu_ready_mean_us | 等待 CPU 完成当前需要的 staging 前缀 |
-| read_submit_mean_us | provider 编码、SQ 写入及 doorbell |
-| read_wait_cqe_mean_us | 等待已提交 READ 完成 |
-| wait_cpu_ack_mean_us | 确认 CPU 已完成本轮 gather |
+| lookup_table_us | 按索引和偏移计算 CPU 源地址，填写清单，并在交给 URMA DMA 前清理清单缓存 |
+| address_send_us | AICPU 将地址/长度清单 WRITE 到 CPU DDR 并等完成 |
+| notify_cpu_us | WRITE 清单指针和请求编号，通知 CPU 开始 gather |
+| read_total_us | 从 staging READ 到输出 HBM 的整个流水阶段 |
+| build_wqe_us | 构建 URMA READ 请求及目标分散地址 |
+| cpu_gather_wait_us | 等待 CPU 完成当前需要的 staging 前缀 |
+| post_us | provider 编码、SQ 写入及 doorbell |
+| cq_wait_us | 等待已提交 READ 完成 |
 
-`read_build_wr_sgl_mean_us`、`read_wait_cpu_ready_mean_us`、`read_submit_mean_us` 和 `read_wait_cqe_mean_us` 已经包含在 `read_pipeline_mean_us` 中。阶段为每轮 worker 最大耗时的均值，不与总时间的 P50 相加。
-耗时保留 1 位小数，带宽为十进制 GB/s。`_mean_us` 表示阶段均值（微秒），`device_p50_us` 表示算子耗时中位数（微秒）；日志保留原始打点字段。
+`build_wqe_us`、`cpu_gather_wait_us`、`post_us` 和 `cq_wait_us` 已经包含在 `read_total_us` 中。阶段为每轮 worker 最大耗时的均值，不与总时间的 P50 相加。
+耗时保留 1 位小数，带宽为十进制 GB/s。上述 8 个阶段字段表示均值（微秒），`device_p50_us` 表示算子耗时中位数（微秒）。`lookup_table_us` 沿用请求准备阶段打点，包含查表、填清单和清单缓存维护；`cpu_gather_wait_us` 是 AICPU 等待就绪前缀的时间，不是 CPU gather 的独立执行耗时。
 
 当前 BatchGet 输入是地址表、索引和块内偏移，AICPU 计算 `addresses[indices[i]] + offsets[i]` 后，
 把该地址及 token 长度写入 CPU 可读的清单。CPU 依次按清单 gather 到 staging。

@@ -42,28 +42,12 @@ for token in "${token_sizes[@]}"; do
            /^AICPU_GATHER_READ_RESULT / { profile=0 }
            profile { print }' "$log_file"
       printf '%s\n' "$result" | awk -v first="$index" '
-        BEGIN {
-          label["token_bytes"]="token_bytes"
-          label["miss_count"]="miss_count"
-          label["workers"]="workers"
-          label["device_p50_us"]="device_p50_us"
-          label["p50_GBps"]="p50_GBps"
-          label["request_us"]="prepare_cpu_request_mean_us"
-          label["source_write_us"]="send_address_list_mean_us"
-          label["notify_us"]="notify_cpu_mean_us"
-          label["read_us"]="read_pipeline_mean_us"
-          label["wr_build_us"]="read_build_wr_sgl_mean_us"
-          label["ready_wait_us"]="read_wait_cpu_ready_mean_us"
-          label["post_us"]="read_submit_mean_us"
-          label["cq_wait_us"]="read_wait_cqe_mean_us"
-          label["ack_us"]="wait_cpu_ack_mean_us"
-        }
         {
           header=""; row=""
           for (i=2; i<=NF; i++) {
             split($i, field, "=")
             sep=(i==2 ? "" : ",")
-            header=header sep label[field[1]]; row=row sep field[2]
+            header=header sep field[1]; row=row sep field[2]
           }
           if (first==1 && NR==1) print header
           print row

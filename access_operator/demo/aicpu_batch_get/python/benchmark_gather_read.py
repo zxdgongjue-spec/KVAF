@@ -89,22 +89,31 @@ def token_pattern(torch, token_ids, byte_ids):
 def summarize_measurements(profiles, payload_bytes):
     device = timing_stats([sample["device_span_us"] for sample in profiles], payload_bytes)
     summary = dict(device_p50_us=device["p50_us"], p50_GBps=device["p50_GBps"])
-    for name in ("request_us", "source_write_us", "notify_us", "read_us",
-                 "wr_build_us", "ready_wait_us", "post_us", "cq_wait_us", "ack_us"):
-        summary[name] = statistics.mean(max(worker[name] for worker in sample["workers"])
+    for name, field in (
+        ("lookup_table_us", "request_us"),
+        ("address_send_us", "source_write_us"),
+        ("notify_cpu_us", "notify_us"),
+        ("read_total_us", "read_us"),
+        ("build_wqe_us", "wr_build_us"),
+        ("cpu_gather_wait_us", "ready_wait_us"),
+        ("post_us", "post_us"),
+        ("cq_wait_us", "cq_wait_us"),
+    ):
+        summary[name] = statistics.mean(max(worker[field] for worker in sample["workers"])
                                         for sample in profiles)
     return summary
 
 
 def print_measurements(a, summary):
-    print(f"AICPU_GATHER_READ_PROFILE 算子P50={summary['device_p50_us']:.1f} us "
-          f"p50_GBps={summary['p50_GBps']:.3f} 阶段耗时=每轮worker最大值的均值")
-    print(f"  准备CPU读取请求(查表+填清单)={summary['request_us']:.1f} us | 发送地址清单={summary['source_write_us']:.1f} us | "
-          f"通知CPU={summary['notify_us']:.1f} us")
-    print(f"  流水READ={summary['read_us']:.1f} us，其中：")
-    print(f"    组装WR/SGL={summary['wr_build_us']:.1f} us | 等CPU就绪前缀={summary['ready_wait_us']:.1f} us | "
-          f"提交READ={summary['post_us']:.1f} us | 等READ CQE={summary['cq_wait_us']:.1f} us")
-    print(f"  等最终CPU ACK={summary['ack_us']:.1f} us")
+    print(f"AICPU_GATHER_READ_PROFILE device_p50_us={summary['device_p50_us']:.1f} "
+          f"p50_GBps={summary['p50_GBps']:.3f} phase_aggregation=mean_of_per_round_worker_max")
+    print(f"  lookup_table_us={summary['lookup_table_us']:.1f} | "
+          f"address_send_us={summary['address_send_us']:.1f} | "
+          f"notify_cpu_us={summary['notify_cpu_us']:.1f}")
+    print(f"  read_total_us={summary['read_total_us']:.1f}")
+    print(f"    build_wqe_us={summary['build_wqe_us']:.1f} | "
+          f"cpu_gather_wait_us={summary['cpu_gather_wait_us']:.1f} | "
+          f"post_us={summary['post_us']:.1f} | cq_wait_us={summary['cq_wait_us']:.1f}")
     result = dict(token_bytes=a.token_bytes, miss_count=a.miss_count, workers=a.workers, **summary)
     fields = []
     for key, value in result.items():
