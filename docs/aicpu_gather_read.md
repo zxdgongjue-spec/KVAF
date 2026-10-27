@@ -216,24 +216,24 @@ CPU 线程预算和绑定策略在同一次扫描中保持一致；SGL 6、每�
 请求准备包含输入缓存维护、地址查表、填写地址/长度清单及清单缓存维护；READ 下的子项包含在 READ 总时间内。
 阶段最大值可能来自不同 worker，且存在嵌套和重叠，不能相加为算子时间。
 
-CSV 每组配置一行，使用中文表头，所有时间标明单位及均值/P50：
+CSV 每组配置一行，使用英文表头，所有时间标明单位及均值/P50：
 
 | 表头 | 含义 |
 | --- | --- |
-| 单次读取(B) / 请求数 / worker数 | 测试配置 |
-| 算子P50(us) / p50_GBps | 算子耗时中位数及对应的有效载荷带宽 |
-| 请求准备_含缓存维护和查表_均值(us) | 清理输入缓存，按索引和偏移计算 CPU 源地址，填写并清理待发送的地址清单 |
-| 发送地址清单_均值(us) | AICPU 将地址/长度清单 WRITE 到 CPU DDR 并等完成 |
-| 通知CPU_均值(us) | WRITE 清单指针和请求编号，通知 CPU 开始 gather |
-| 流水READ总计_均值(us) | 从 staging READ 到输出 HBM 的整个流水阶段 |
-| READ内_组装WR及SGL_均值(us) | 构建 URMA READ 请求及目标分散地址 |
-| READ内_等待CPU就绪_均值(us) | 等待 CPU 完成当前需要的 staging 前缀 |
-| READ内_提交READ_均值(us) | provider 编码、SQ 写入及 doorbell |
-| READ内_等待CQE_均值(us) | 等待已提交 READ 完成 |
-| 等待CPU最终ACK_均值(us) | 确认 CPU 已完成本轮 gather |
+| token_bytes / miss_count / workers | 测试配置 |
+| device_p50_us / p50_GBps | 算子耗时中位数及对应的有效载荷带宽 |
+| prepare_cpu_request_mean_us | 清理输入缓存，按索引和偏移计算 CPU 源地址，填写并清理待发送的地址清单 |
+| send_address_list_mean_us | AICPU 将地址/长度清单 WRITE 到 CPU DDR 并等完成 |
+| notify_cpu_mean_us | WRITE 清单指针和请求编号，通知 CPU 开始 gather |
+| read_pipeline_mean_us | 从 staging READ 到输出 HBM 的整个流水阶段 |
+| read_build_wr_sgl_mean_us | 构建 URMA READ 请求及目标分散地址 |
+| read_wait_cpu_ready_mean_us | 等待 CPU 完成当前需要的 staging 前缀 |
+| read_submit_mean_us | provider 编码、SQ 写入及 doorbell |
+| read_wait_cqe_mean_us | 等待已提交 READ 完成 |
+| wait_cpu_ack_mean_us | 确认 CPU 已完成本轮 gather |
 
-`READ内_` 的各列已经包含在 `流水READ总计` 中。阶段为每轮 worker 最大耗时的均值，不与总时间的 P50 相加。
-耗时保留 1 位小数，带宽为十进制 GB/s。原始英文打点字段仅保留在每组日志的结果记录中。
+`read_build_wr_sgl_mean_us`、`read_wait_cpu_ready_mean_us`、`read_submit_mean_us` 和 `read_wait_cqe_mean_us` 已经包含在 `read_pipeline_mean_us` 中。阶段为每轮 worker 最大耗时的均值，不与总时间的 P50 相加。
+耗时保留 1 位小数，带宽为十进制 GB/s。`_mean_us` 表示阶段均值（微秒），`device_p50_us` 表示算子耗时中位数（微秒）；日志保留原始打点字段。
 
 当前 BatchGet 输入是地址表、索引和块内偏移，AICPU 计算 `addresses[indices[i]] + offsets[i]` 后，
 把该地址及 token 长度写入 CPU 可读的清单。CPU 依次按清单 gather 到 staging。

@@ -43,20 +43,20 @@ for token in "${token_sizes[@]}"; do
            profile { print }' "$log_file"
       printf '%s\n' "$result" | awk -v first="$index" '
         BEGIN {
-          label["token_bytes"]="单次读取(B)"
-          label["miss_count"]="请求数"
-          label["workers"]="worker数"
-          label["device_p50_us"]="算子P50(us)"
+          label["token_bytes"]="token_bytes"
+          label["miss_count"]="miss_count"
+          label["workers"]="workers"
+          label["device_p50_us"]="device_p50_us"
           label["p50_GBps"]="p50_GBps"
-          label["request_us"]="请求准备_含缓存维护和查表_均值(us)"
-          label["source_write_us"]="发送地址清单_均值(us)"
-          label["notify_us"]="通知CPU_均值(us)"
-          label["read_us"]="流水READ总计_均值(us)"
-          label["wr_build_us"]="READ内_组装WR及SGL_均值(us)"
-          label["ready_wait_us"]="READ内_等待CPU就绪_均值(us)"
-          label["post_us"]="READ内_提交READ_均值(us)"
-          label["cq_wait_us"]="READ内_等待CQE_均值(us)"
-          label["ack_us"]="等待CPU最终ACK_均值(us)"
+          label["request_us"]="prepare_cpu_request_mean_us"
+          label["source_write_us"]="send_address_list_mean_us"
+          label["notify_us"]="notify_cpu_mean_us"
+          label["read_us"]="read_pipeline_mean_us"
+          label["wr_build_us"]="read_build_wr_sgl_mean_us"
+          label["ready_wait_us"]="read_wait_cpu_ready_mean_us"
+          label["post_us"]="read_submit_mean_us"
+          label["cq_wait_us"]="read_wait_cqe_mean_us"
+          label["ack_us"]="wait_cpu_ack_mean_us"
         }
         {
           header=""; row=""
@@ -75,12 +75,12 @@ done
 awk -F, '
   NR==1 {
     for (i=1; i<=NF; i++) col[$i]=i
-    print "单次读取(B) 请求数 worker数 算子P50(us) p50_GBps"
+    print "token_bytes miss_count workers device_p50_us p50_GBps"
     next
   }
   {
-    print $(col["单次读取(B)"]), $(col["请求数"]), $(col["worker数"]),
-          $(col["算子P50(us)"]), $(col["p50_GBps"])
+    print $(col["token_bytes"]), $(col["miss_count"]), $(col["workers"]),
+          $(col["device_p50_us"]), $(col["p50_GBps"])
   }
 ' "$csv_file"
 echo "AICPU_GATHER_READ_SWEEP_PASS cases=$index csv=$csv_file"
