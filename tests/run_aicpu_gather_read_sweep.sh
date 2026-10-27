@@ -15,7 +15,7 @@ export PYTHONPATH="$build_dir/python${PYTHONPATH:+:$PYTHONPATH}"
 
 read -r -a token_sizes <<< "${KVAF_AICPU_TOKEN_BYTES:-128 256 512 656 1024 2048 4096}"
 read -r -a miss_counts <<< "${KVAF_AICPU_MISS_COUNTS:-32 64 128 256 512 1024 2048 4096 8192}"
-read -r -a worker_counts <<< "${KVAF_AICPU_WORKERS:-1 2 4 8}"
+read -r -a worker_counts <<< "${KVAF_AICPU_WORKERS:-1 2 4 5}"
 log_dir="${KVAF_AICPU_SWEEP_LOG_DIR:-reports/aicpu-gather-read/$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$(dirname "$log_dir")"
 mkdir "$log_dir"
@@ -57,11 +57,14 @@ done
 awk -F, '
   NR==1 {
     for (i=1; i<=NF; i++) col[$i]=i
-    print "token_bytes miss_count workers mean_us p50_us p90_us p99_us p50_GBps"
+    printf "%-11s %-10s %-7s %14s %9s %12s %14s %10s %14s\n",
+           "token_bytes", "miss_count", "workers", "device_p50_us", "p50_GBps",
+           "request_us", "input_cache_us", "read_us", "ready_wait_us"
     next
   }
-  { print $(col["token_bytes"]), $(col["miss_count"]), $(col["workers"]),
-          $(col["mean_us"]), $(col["p50_us"]), $(col["p90_us"]),
-          $(col["p99_us"]), $(col["p50_GBps"]) }
+  { printf "%-11s %-10s %-7s %14s %9s %12s %14s %10s %14s\n",
+           $(col["token_bytes"]), $(col["miss_count"]), $(col["workers"]),
+           $(col["device_p50_us"]), $(col["p50_GBps"]), $(col["request_us"]),
+           $(col["input_cache_us"]), $(col["read_us"]), $(col["ready_wait_us"]) }
 ' "$csv_file"
 echo "AICPU_GATHER_READ_SWEEP_PASS cases=$index csv=$csv_file"

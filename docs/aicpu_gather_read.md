@@ -173,13 +173,16 @@ Shell 脚本循环调用 `python/benchmark_gather_read.py`，通过 `NpuRuntime.
 | --- | --- |
 | token_bytes | 128、256、512、656、1024、2048、4096 B |
 | miss_count | 32、64、128、256、512、1024、2048、4096、8192 |
-| workers | 1、2、4、8 |
+| workers | 1、2、4、5 |
 
 每组预热 10 轮、测量 100 轮，均开启 profile。端到端、算子和各阶段耗时来自同一批测量轮次。
 只记录一个带宽 `p50_GBps`，计算为 `token_bytes × miss_count / 算子P50耗时(µs) / 1000`。
 算子耗时仍取最早 worker 进入至最后 worker 退出的墙钟时间；各阶段按每轮 worker 最大值统计，不能相加。
 
-默认源池为 1,277,952 个块，每块 128 个 token，数据和地址表初始化一次。
+通信 DDR 总预算固定为 100 GiB，包含源数据池和 GatherRead 的 staging、描述符、控制区。
+按当前 token 大小和每块 token 数计算源块数量，先扣除按 1..8 worker 最大需求预留的工作区，
+再按完整块向下取整。同一 token 大小下，不同 worker 使用相同的源地址池。
+每块默认 128 个 token，数据和地址表初始化一次。
 每轮有放回随机选择源块和块内 token，输出随机选择互不重复的 HBM 行，没有固定隔行保护区。
 输入数组和输出行数为 `max(32768, miss_count)`，每轮校验整个输出和未写入行。
 准备数据、BatchPut、生成请求和结果校验在计时之外。
@@ -196,15 +199,28 @@ KVAF_AICPU_WORKERS="1 2 4" \
   --warmup 3 --iterations 20
 ```
 
-`--table-capacity` 控制源池块数，`--tokens-per-block` 控制每块 token 数。
-默认 656 B/token 对应约 99.94 GiB 源 DDR，4096 B/token 对应 624 GiB。
+`--table-capacity` 仅用于选择更小的源池，不能超出上述预算；`--tokens-per-block` 控制每块 token 数。
+`miss_count` 只决定本轮从源池读取多少个 token，不决定源池分配大小。
+每组日志打印源池 GiB、工作区预算 MiB 和总预算，避免字节数用科学计数法显示。
 CPU 线程预算和绑定策略在同一次扫描中保持一致；SGL 6、每批 32 条 WR、128 KiB 流水前缀保持当前实现配置。
 
 结果只有每组 `.log` 和一个 `summary.csv`，默认保存在 `reports/aicpu-gather-read/<时间戳>`；
 可用 `KVAF_AICPU_SWEEP_LOG_DIR` 指定一个新目录。任一组失败后停止，已完成结果保留。
-CSV 包含源池规模、mean/P50/P90/P99、唯一的 `p50_GBps`、提交/CQ 等待、端到端及流水各阶段耗时。
-耗时显示 1 位小数，带宽为十进制 GB/s。
-`ready_wait` 是等待 CPU 就绪前缀的时间，不是 CPU gather 的独立耗时。
+CSV 和终端只显示以下 9 列；完整逐 worker 打点仍在每组日志中：
+
+| 字段 | 含义 |
+| --- | --- |
+| token_bytes / miss_count / workers | token 大小、有效请求数、AICPU worker 数 |
+| device_p50_us | AICPU 算子墙钟时间的 P50 |
+| p50_GBps | 有效载荷除以 device_p50_us 得到的唯一带宽 |
+| request_us | 现有清单构建阶段打点，包含输入缓存维护和源描述符构建 |
+| input_cache_us | request_us 内部的输入缓存维护时间 |
+| read_us | 现有流水 READ 阶段打点 |
+| ready_wait_us | read_us 内部等待 CPU 就绪前缀的时间 |
+
+四个阶段时间使用现有 profile 字段，每轮取最慢 worker 后求均值，不与 P50 总时间相加。
+`input_cache_us` 包含在 `request_us` 内，`ready_wait_us` 包含在 `read_us` 内。
+所有耗时显示 1 位小数，带宽为十进制 GB/s。
 
 原 `python/test_batch_get.py` 继续用于逐轮改变源数据、保护行和异步调用的正确性测试。
 

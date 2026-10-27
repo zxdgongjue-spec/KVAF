@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import statistics
 from pathlib import Path
 import time
 
-from test_batch_get import print_profile, summarize_profiles, timing_stats
+from test_batch_get import print_profile, timing_stats
 
-DEFAULT_TABLE_CAPACITY = 16_384 * 78
+DDR_BUDGET_BYTES = 100 * 1024**3
 DEFAULT_TOKENS_PER_BLOCK = 128
 DEFAULT_REQUEST_LENGTH = 32_768
 
@@ -25,19 +26,24 @@ def parse_args(argv=None):
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--token-bytes", type=int, default=656)
     p.add_argument("--miss-count", type=int, default=4096)
-    p.add_argument("--table-capacity", type=int, default=DEFAULT_TABLE_CAPACITY)
+    p.add_argument("--table-capacity", type=int, help="optional smaller source pool; default fills the 100 GiB DDR budget")
     p.add_argument("--tokens-per-block", type=int, default=DEFAULT_TOKENS_PER_BLOCK)
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iterations", type=int, default=100)
     a = p.parse_args(argv)
     if not 1 <= a.workers <= 8 or not 0 <= a.miss_count <= 65536:
         p.error("workers must be in 1..8 and miss_count in 0..65536")
-    if not 1 <= a.table_capacity <= 0x7FFFFFFF or a.tokens_per_block <= 0:
-        p.error("table capacity must fit positive int32; tokens per block must be positive")
+    if a.tokens_per_block <= 0:
+        p.error("tokens per block must be positive")
     if (a.token_bytes <= 0 or a.token_bytes * 65536 > 0xFFFFFFFF or
             a.token_bytes * a.tokens_per_block > 0xFFFFFFFF or
             a.token_bytes * (a.tokens_per_block - 1) > 0x7FFFFFFF):
         p.error("invalid token/block size for the AICPU input ABI")
+    max_capacity, _ = pool_layout(a.token_bytes, a.tokens_per_block)
+    if a.table_capacity is None:
+        a.table_capacity = max_capacity
+    if not 1 <= a.table_capacity <= min(max_capacity, 0x7FFFFFFF):
+        p.error("source pool plus GatherRead workspace must fit the 100 GiB DDR budget")
     if a.warmup < 0 or a.iterations <= 0:
         p.error("invalid warmup or iterations")
     if a.device_id < 0 or not 0 <= a.eid_index < 0xFFFFFFFF:
@@ -45,6 +51,21 @@ def parse_args(argv=None):
     if not a.kernel_json or not Path(a.kernel_json).is_file():
         p.error("source the CANN environment or pass an installed --kernel-json")
     return a
+
+
+def pool_layout(token_bytes, tokens_per_block):
+    block_bytes = token_bytes * tokens_per_block
+    # Match GatherRemoteWorkspaceBytes and PeerDdrAllocator's slot alignment.
+    # Reserve the maximum for 1..8 workers so every worker count uses the same source pool.
+    reserved = 0
+    for workers in range(1, 9):
+        lane_capacity = (65536 + workers - 1) // workers
+        staging = (lane_capacity * token_bytes + 63) // 64 * 64
+        descriptor = (64 + lane_capacity * 16 + 63) // 64 * 64
+        workspace = workers * (staging + descriptor + 64) + 128
+        reserved = max(reserved, (workspace + block_bytes - 1) // block_bytes * block_bytes)
+    capacity = (DDR_BUDGET_BYTES - reserved) // block_bytes
+    return capacity, reserved
 
 
 def create_request_plan(torch, a, length, device):
@@ -65,15 +86,13 @@ def token_pattern(torch, token_ids, byte_ids):
     return encoded ^ pattern.expand_as(encoded).contiguous()
 
 
-def summarize_measurements(samples_us, profiles, payload_bytes):
-    end_to_end = {key: value for key, value in timing_stats(samples_us).items()
-                  if key.endswith("_us")}
-    stages = summarize_profiles(profiles, payload_bytes)
-    for name, stats in stages.items():
-        stats.pop("GBps")
-        if name != "kernel_total":
-            stats.pop("p50_GBps")
-    return end_to_end, stages
+def summarize_measurements(profiles, payload_bytes):
+    device = timing_stats([sample["device_span_us"] for sample in profiles], payload_bytes)
+    result = dict(device_p50_us=device["p50_us"], p50_GBps=device["p50_GBps"])
+    for name in ("request_us", "input_cache_us", "read_us", "ready_wait_us"):
+        result[name] = statistics.mean(max(worker[name] for worker in sample["workers"])
+                                       for sample in profiles)
+    return result
 
 
 def run_case(a, torch, kvaf):
@@ -82,6 +101,7 @@ def run_case(a, torch, kvaf):
     block_bytes = a.token_bytes * a.tokens_per_block
     ddr_bytes = a.table_capacity * block_bytes
     payload_bytes = a.miss_count * a.token_bytes
+    _, reserved = pool_layout(a.token_bytes, a.tokens_per_block)
     torch.manual_seed(20260903)
     stream = torch.npu.current_stream()
     runtime = kvaf.NpuRuntime(
@@ -91,7 +111,7 @@ def run_case(a, torch, kvaf):
         urma_device=a.urma_device, urma_eid_index=a.eid_index,
         aicpu_batch_get_mode="gather_read",
     )
-    samples_us, profiles = [], []
+    profiles = []
     # Source and output allocations stay alive until the session is closed.
     chunk_entries = min(128, a.table_capacity)
     source = torch.empty((chunk_entries, block_bytes), dtype=torch.uint8, device=device)
@@ -101,7 +121,10 @@ def run_case(a, torch, kvaf):
     print(f"AICPU_GATHER_READ_CONFIG table_capacity={a.table_capacity} "
           f"tokens_per_block={a.tokens_per_block} request_length={length} "
           f"token_bytes={a.token_bytes} miss_count={a.miss_count} workers={a.workers} "
-          f"ddr_bytes={ddr_bytes} source=random_with_replacement output=random_unique_rows "
+          f"source_pool_GiB={ddr_bytes / 1024**3:.3f} "
+          f"workspace_budget_MiB={reserved / 1024**2:.3f} "
+          f"total_budget_GiB={DDR_BUDGET_BYTES / 1024**3:.1f} "
+          "source=random_with_replacement output=random_unique_rows "
           "guard_rows=0 source_initialized_once=1", flush=True)
 
     def run_round(count, profile=False):
@@ -147,30 +170,15 @@ def run_case(a, torch, kvaf):
             run_round(a.miss_count, profile=True)
         profiles.clear()
         for _ in range(a.iterations):
-            samples_us.append(run_round(a.miss_count, profile=True))
+            run_round(a.miss_count, profile=True)
     finally:
         runtime.shutdown()
 
-    stats, stages = summarize_measurements(samples_us, profiles, payload_bytes)
     print(f"AICPU_GATHER_READ_PASS workers={a.workers} iterations={a.iterations} "
-          f"mean_us={stats['mean_us']:.1f} p50_us={stats['p50_us']:.1f} "
-          f"p90_us={stats['p90_us']:.1f} p99_us={stats['p99_us']:.1f} "
-          f"p50_GBps={stages['kernel_total']['p50_GBps']:.3f} "
-          "timing=end_to_end bandwidth_scope=kernel_total "
           "verification=every_round_full_output_npu_compare", flush=True)
-    if profiles:
-        print_profile(profiles, "gather_read", warmup=a.warmup, separate_samples=False)
-    result = dict(token_bytes=a.token_bytes, miss_count=a.miss_count, workers=a.workers,
-                  table_capacity=a.table_capacity, tokens_per_block=a.tokens_per_block,
-                  request_length=length, ddr_bytes=ddr_bytes, payload_bytes=payload_bytes,
-                  warmup=a.warmup, iterations=a.iterations)
-    quantiles = ("mean_us", "p50_us", "p90_us", "p99_us")
-    result.update({key: stages["kernel_total"][key] for key in (*quantiles, "p50_GBps")})
-    for name in ("post", "completion_wait"):
-        result.update({f"{name}_{key}": stages[name][key] for key in quantiles})
-    result.update({f"end_to_end_{key}": stats[key] for key in quantiles})
-    for name in ("read", "ready_wait", "wr_build", "request", "source_write", "notify", "ack"):
-        result[f"{name}_mean_us"] = stages[name]["mean_us"]
+    print_profile(profiles, "gather_read", warmup=a.warmup, separate_samples=False)
+    result = dict(token_bytes=a.token_bytes, miss_count=a.miss_count, workers=a.workers)
+    result.update(summarize_measurements(profiles, payload_bytes))
     fields = []
     for key, value in result.items():
         formatted = f"{value:.3f}" if key == "p50_GBps" else f"{value:.1f}" if isinstance(value, float) else str(value)
