@@ -147,3 +147,7 @@ stateDiagram-v2
 2. 支持覆盖写
 3. 从单 region 扩展到多 region
 4. 评估是否需要可变长分配器
+# 多 Pool 扩展
+
+旧单 region 调用继续使用固定 DSA 记录。一个 RuntimeCore 的多池模式共用同一个 MetaManager：内部 PoolMetadata 管理分层 key、事务与 pin，SlotAllocationProvider 将分配和回收委托给 PoolManager，各池具有独立 DDR region 和共享给绑定层的容量。
+接口、生命周期和验证结果见 [多 Pool 最小实现](../docs/ddr_pool_minimal_implementation.md)。

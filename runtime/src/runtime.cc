@@ -1,6 +1,7 @@
 #include "runtime.h"
 
 #include <cstdint>
+#include <atomic>
 #include <limits>
 #include <memory>
 #include <new>
@@ -12,6 +13,8 @@
 namespace kvaf {
 
 namespace {
+
+std::atomic<std::uint64_t> next_table_id{1};
 
 class HostDdrMemoryAllocator final : public DdrMemoryAllocator {
  public:
@@ -69,6 +72,19 @@ RuntimeCore::RuntimeCore(MetaManager& meta_manager, AccessOperator& access_opera
       ddr_allocator_(ddr_allocator) {}
 
 RuntimeCore::~RuntimeCore() {
+  if (pool_manager_) {
+    // Stop every operator before dropping pins or any region allocation.
+    // A backend that cannot stop must retain its transport resources.
+    for (const auto pool : pool_manager_->Handles()) {
+      if (!pool_manager_->Stop(pool).ok()) {
+        (void)pool_manager_.release();
+        return;
+      }
+    }
+    for (const auto& table : access_tables_)
+      (void)meta_manager_.pools().UnlockKeys(table.second->lock_context);
+    access_tables_.clear();
+  }
   if (initialized_) {
     (void)Shutdown();
   }
@@ -111,9 +127,74 @@ Status RuntimeCore::Initialize(const RuntimeInitRequest& request) {
   return Status::OK();
 }
 
+Status RuntimeCore::InitializePools(AccessOperatorFactory factory) {
+  if (initialized_) return Status::InvalidState("Runtime has already been initialized");
+  if (!factory) return Status::InvalidArgument("pool operator factory is required");
+  pool_manager_ = std::make_unique<PoolManager>(ddr_allocator_, std::move(factory));
+  initialized_ = true;
+  return Status::OK();
+}
+Status RuntimeCore::CreatePool(const PoolSpec& spec, PoolHandle* output) {
+  if (!pool_manager_) return Status::InvalidState("Runtime is not in pool mode");
+  return pool_manager_->Create(spec, output);
+}
+Status RuntimeCore::GetPoolInfo(PoolHandle pool, PoolInfo* output) const {
+  if (!pool_manager_) return Status::InvalidState("Runtime is not in pool mode");
+  return pool_manager_->Info(pool, output);
+}
+Status RuntimeCore::BindLayer(std::uint64_t ns, std::uint64_t layer, PoolHandle pool, LayerHandle* output) {
+  if (!pool_manager_) return Status::InvalidState("Runtime is not in pool mode");
+  return pool_manager_->Bind(ns, layer, pool, output);
+}
+Status RuntimeCore::GetLayer(std::uint64_t ns, std::uint64_t layer, LayerHandle* output) const {
+  if (!pool_manager_) return Status::InvalidState("Runtime is not in pool mode");
+  return pool_manager_->FindLayer(ns, layer, output);
+}
+Status RuntimeCore::GetLayerLayout(LayerHandle layer, LayerLayout* output) const {
+  if (!pool_manager_) return Status::InvalidState("Runtime is not in pool mode");
+  return pool_manager_->Resolve(layer, output);
+}
+Status RuntimeCore::UnbindLayer(LayerHandle layer) {
+  if (!pool_manager_) return Status::InvalidState("Runtime is not in pool mode");
+  LayerLayout layout;
+  auto status = pool_manager_->Resolve(layer, &layout, true);
+  if (!status.ok()) return status;
+  if (meta_manager_.pools().CountLayer(layer)) return Status::Busy("layer still owns keys");
+  return pool_manager_->Unbind(layer);
+}
+Status RuntimeCore::DestroyPool(PoolHandle pool) {
+  if (!pool_manager_) return Status::InvalidState("Runtime is not in pool mode");
+  PoolInfo info;
+  auto status = pool_manager_->Info(pool, &info);
+  if (!status.ok()) return status;
+  if (meta_manager_.pools().CountPool(pool)) return Status::Busy("pool still owns keys");
+  return pool_manager_->Destroy(pool);
+}
+
 Status RuntimeCore::Shutdown() {
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
+  }
+
+  if (pool_manager_) {
+    if (!access_tables_.empty()) return Status::Busy("release AccessTables before pool shutdown");
+    Status first;
+    for (const auto pool : pool_manager_->Handles()) {
+      auto status = pool_manager_->Stop(pool);
+      if (status.ok()) {
+        status = meta_manager_.pools().ErasePool(pool);
+        if (status.ok()) {
+          pool_manager_->UnbindPool(pool);
+          status = pool_manager_->Destroy(pool);
+        }
+      }
+      if (!status.ok() && first.ok()) first = status;
+    }
+    if (pool_manager_->Handles().empty()) {
+      pool_manager_.reset();
+      initialized_ = false;
+    }
+    return first;
   }
 
   Status first_error = Status::OK();
@@ -151,24 +232,31 @@ Status RuntimeCore::PrepareAccessTable(const AccessTablePrepareRequest& request,
     return Status::InvalidArgument("PrepareAccessTable requires at least one key");
   }
 
+  LayerLayout layout;
+  if (pool_manager_) {
+    auto status = pool_manager_->Resolve(request.layer, &layout);
+    if (!status.ok()) return status;
+  } else if (!request.layer.empty()) return Status::InvalidArgument("layer supplied to legacy Runtime");
+  const bool scoped = pool_manager_ != nullptr;
   LockContext lock_context;
-  Status status = meta_manager_.LockKeys(
-      request.flat_keys, MetaManagerLockMode::kStableReadAllowAppend,
-      &lock_context);
+  Status status = scoped ? meta_manager_.pools().LockKeys(layout, request.flat_keys, &lock_context)
+      : meta_manager_.LockKeys(request.flat_keys, MetaManagerLockMode::kStableReadAllowAppend, &lock_context);
   if (!status.ok()) {
     return status;
   }
 
   FlatAccessDesc lookup;
-  status = meta_manager_.BatchLookup(request.flat_keys, lock_context, &lookup);
+  auto unlock = [&] { return scoped ? meta_manager_.pools().UnlockKeys(lock_context) : meta_manager_.UnlockKeys(lock_context); };
+  status = scoped ? meta_manager_.pools().Lookup(request.flat_keys, lock_context, &lookup)
+                  : meta_manager_.BatchLookup(request.flat_keys, lock_context, &lookup);
   if (!status.ok()) {
-    (void)meta_manager_.UnlockKeys(lock_context);
+    (void)unlock();
     return status;
   }
   if (lookup.addresses.size() != request.flat_keys.size() ||
       lookup.lengths.size() != request.flat_keys.size() ||
       lookup.valid.size() != request.flat_keys.size()) {
-    (void)meta_manager_.UnlockKeys(lock_context);
+    (void)unlock();
     return Status::InvalidState("MetaManager returned an invalid AccessTable lookup");
   }
 
@@ -188,20 +276,26 @@ Status RuntimeCore::PrepareAccessTable(const AccessTablePrepareRequest& request,
     }
   }
 
-  const std::uint64_t id = next_access_table_id_++;
+  const std::uint64_t id = next_table_id.fetch_add(1);
   if (id == 0) {
-    (void)meta_manager_.UnlockKeys(lock_context);
+    (void)unlock();
     return Status::InvalidState("AccessTable handle space is exhausted");
   }
-  auto table = std::make_unique<AccessTableState>();
-  table->lock_context = lock_context;
-  table->addresses = std::move(lookup.addresses);
-  table->lengths = std::move(lookup.lengths);
-  table->valid = std::move(lookup.valid);
-  table->has_valid_entries = has_valid_entries;
-  table->has_uniform_valid_length = has_uniform_valid_length;
-  table->uniform_valid_length = uniform_valid_length;
-  access_tables_.emplace(id, std::move(table));
+  try {
+    auto table = std::make_unique<AccessTableState>();
+    table->layout = layout;
+    table->lock_context = lock_context;
+    table->addresses = std::move(lookup.addresses);
+    table->lengths = std::move(lookup.lengths);
+    table->valid = std::move(lookup.valid);
+    table->has_valid_entries = has_valid_entries;
+    table->has_uniform_valid_length = has_uniform_valid_length;
+    table->uniform_valid_length = uniform_valid_length;
+    access_tables_.emplace(id, std::move(table));
+  } catch (const std::bad_alloc&) {
+    (void)unlock();
+    return Status::OutOfMemory("AccessTable allocation failed");
+  }
   *handle = AccessTableHandle{id};
   return Status::OK();
 }
@@ -220,6 +314,7 @@ Status RuntimeCore::GetAccessTableView(const AccessTableHandle& handle,
   }
   *view = AccessTableView{table->addresses.data(), table->lengths.data(),
                           table->valid.data(), table->addresses.size()};
+  view->layout = table->layout;
   return Status::OK();
 }
 
@@ -231,7 +326,8 @@ Status RuntimeCore::ReleaseAccessTable(const AccessTableHandle& handle) {
   if (table == nullptr) {
     return Status::NotFound("AccessTable handle was not found");
   }
-  const Status status = meta_manager_.UnlockKeys(table->lock_context);
+  const Status status = pool_manager_ ? meta_manager_.pools().UnlockKeys(table->lock_context)
+                                      : meta_manager_.UnlockKeys(table->lock_context);
   if (!status.ok()) {
     return status;
   }
@@ -251,6 +347,20 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
       return Status::NotFound("AccessTable handle was not found");
     }
   }
+  AccessOperator* op = &access_operator_;
+  if (pool_manager_) {
+    if (!table) return Status::InvalidArgument("pool BatchGet requires a managed AccessTable");
+    if (!request.layer.empty() &&
+        (request.layer.owner != table->layout.layer.owner || request.layer.id != table->layout.layer.id))
+      return Status::InvalidArgument("AccessTable belongs to another layer");
+    LayerLayout layout;
+    auto status = pool_manager_->Resolve(table->layout.layer, &layout);
+    if (!status.ok()) return status;
+    if (request.output_block_bytes != layout.spec.token_bytes ||
+        (request.indices.device == DeviceKind::kNpu && request.tokens_per_block != layout.spec.tokens_per_block))
+      return Status::InvalidArgument("BatchGet layout does not match pool");
+    op = pool_manager_->Operator(layout.pool);
+  } else if (!request.layer.empty()) return Status::InvalidArgument("layer supplied to legacy Runtime");
   if (!request.indices.has_elements<std::int32_t>() ||
       !request.offsets.has_elements<std::int32_t>() ||
       !request.output_indices.has_elements<std::int32_t>() ||
@@ -330,9 +440,12 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
   if (table != nullptr) {
     view = AccessTableView{table->addresses.data(), table->lengths.data(),
                            table->valid.data(), table->addresses.size()};
+    view.layout = table->layout;
   }
-  return access_operator_.ExecuteBatchGet(
-      BatchGetExecRequest{view, &request, execution});
+  auto status = op->ExecuteBatchGet(BatchGetExecRequest{view, &request, execution});
+  if (!status.ok() && pool_manager_ && request.indices.device == DeviceKind::kNpu)
+    pool_manager_->Quarantine(table->layout.pool);
+  return status;
 }
 
 Status RuntimeCore::BatchPut(const BatchPutRequest& request,
@@ -359,6 +472,30 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
   }
   PutContext put_context;
   PutAccessDesc put_desc;
+  if (pool_manager_) {
+    LayerLayout layout;
+    auto status = pool_manager_->Resolve(request.layer, &layout);
+    if (!status.ok()) return status;
+    const auto block_bytes = std::uint64_t{layout.spec.token_bytes} * layout.spec.tokens_per_block;
+    for (auto length : request.lengths)
+      if (length != block_bytes) return Status::InvalidArgument("pool Put requires complete layout blocks");
+    status = meta_manager_.pools().PreparePut(*pool_manager_, layout, request.keys, request.lengths,
+                                             &put_context, &put_desc);
+    if (!status.ok()) return status;
+    auto* op = pool_manager_->Operator(layout.pool);
+    status = op->ExecuteBatchPut(BatchPutExecRequest{&request, &put_desc, execution});
+    if (!status.ok()) {
+      if (op->FailedPutIsQuiescent()) {
+        auto rollback = meta_manager_.pools().AbortPut(*pool_manager_, put_context);
+        if (!rollback.ok()) pool_manager_->Quarantine(layout.pool);
+      } else pool_manager_->Quarantine(layout.pool);
+      return status;
+    }
+    status = meta_manager_.pools().CommitPut(*pool_manager_, put_context);
+    if (!status.ok()) pool_manager_->Quarantine(layout.pool);
+    return status;
+  }
+  if (!request.layer.empty()) return Status::InvalidArgument("layer supplied to legacy Runtime");
   Status status = meta_manager_.PreparePut(request.keys, request.lengths,
                                            &put_context, &put_desc);
   if (!status.ok()) {
@@ -385,6 +522,13 @@ Status RuntimeCore::BatchFree(const BatchFreeRequest& request) {
   if (request.keys.empty()) {
     return Status::InvalidArgument("BatchFree requires at least one key");
   }
+  if (pool_manager_) {
+    LayerLayout layout;
+    auto status = pool_manager_->Resolve(request.layer, &layout);
+    if (!status.ok()) return status;
+    return meta_manager_.pools().Free(*pool_manager_, layout, request.keys);
+  }
+  if (!request.layer.empty()) return Status::InvalidArgument("layer supplied to legacy Runtime");
   return meta_manager_.BatchFree(request.keys);
 }
 

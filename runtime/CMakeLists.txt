@@ -1,16 +1,21 @@
-add_library(kvaf_peer_link STATIC src/peer_link.cc)
+if(UNIX)
+  add_library(kvaf_peer_link STATIC src/peer_link.cc)
 
-target_include_directories(kvaf_peer_link
-  PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
-target_link_libraries(kvaf_peer_link PUBLIC kvaf_common pthread)
-target_compile_features(kvaf_peer_link PUBLIC cxx_std_17)
+  target_include_directories(kvaf_peer_link
+    PUBLIC
+      ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(kvaf_peer_link PUBLIC kvaf_common pthread)
+  target_compile_features(kvaf_peer_link PUBLIC cxx_std_17)
+endif()
 
 add_library(kvaf_runtime
   src/runtime.cc
-  src/runtime_service.cc
+  src/pool_manager.cc
 )
+if(UNIX)
+  target_sources(kvaf_runtime PRIVATE src/runtime_service.cc)
+endif()
 
 target_include_directories(kvaf_runtime
   PUBLIC

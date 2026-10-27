@@ -15,6 +15,7 @@
 #include "access_operator.h"
 #include "meta_manager.h"
 #include "runtime.h"
+#include "pool_python.h"
 
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
 #include "acl_graph_python.h"
@@ -200,6 +201,7 @@ class MockAccessOperator final : public AccessOperator {
 
   void FailNextPut() { fail_next_put_ = true; }
   void FailNextGet() { fail_next_get_ = true; }
+  bool FailedPutIsQuiescent() const override { return true; }
 
  private:
   bool initialized_{false};
@@ -222,10 +224,15 @@ class PythonRuntime final {
   }
 
   void Shutdown() { ThrowIfError(runtime_->Shutdown()); }
+  RuntimeCore& Core() { return *runtime_; }
+  void InitializePools() {
+    ThrowIfError(runtime_->InitializePools([] { return std::make_unique<MockAccessOperator>(); }));
+  }
 
   bool Initialized() const { return runtime_->initialized(); }
 
   py::dict RemoteRegion() const {
+    if (runtime_->pooled()) throw py::value_error("use pool_info(pool) in pool mode");
     const RemoteRegionDesc& region = runtime_->remote_region();
     py::dict result;
     result["base"] = region.base;
@@ -240,7 +247,7 @@ class PythonRuntime final {
   // upload the same arrays as their per-request execution descriptors.
   void BatchPut(const std::vector<KeyId>& keys, const py::buffer& input,
                 const std::vector<std::uint64_t>& input_offsets,
-                const std::vector<std::uint64_t>& lengths) {
+                const std::vector<std::uint64_t>& lengths, LayerHandle layer) {
     const py::buffer_info info = input.request();
     if (info.ptr == nullptr || info.size <= 0 || info.itemsize <= 0 ||
         !IsCContiguous(info) ||
@@ -256,12 +263,12 @@ class PythonRuntime final {
                             static_cast<std::size_t>(info.itemsize),
                         DeviceKind::kCpu},
         input_offsets,
-        lengths}));
+        lengths, layer}));
   }
 
-  AccessTableHandle PrepareAccessTable(const std::vector<KeyId>& keys) {
+  AccessTableHandle PrepareAccessTable(const std::vector<KeyId>& keys, LayerHandle layer) {
     AccessTableHandle handle;
-    ThrowIfError(runtime_->PrepareAccessTable(AccessTablePrepareRequest{keys},
+    ThrowIfError(runtime_->PrepareAccessTable(AccessTablePrepareRequest{keys, layer},
                                               &handle));
     return handle;
   }
@@ -321,8 +328,8 @@ class PythonRuntime final {
     ThrowIfError(runtime_->BatchGet(request));
   }
 
-  void BatchFree(const std::vector<KeyId>& keys) {
-    ThrowIfError(runtime_->BatchFree(BatchFreeRequest{keys}));
+  void BatchFree(const std::vector<KeyId>& keys, LayerHandle layer) {
+    ThrowIfError(runtime_->BatchFree(BatchFreeRequest{keys, layer}));
   }
 
   void FailNextPut() { access_operator_->FailNextPut(); }
@@ -342,6 +349,7 @@ class PythonRuntime final {
 
 PYBIND11_MODULE(_kvaf, m) {
   m.doc() = "Synchronous KVAF Runtime Python bindings";
+  kvaf::python_binding::BindPoolTypes(m);
 
   py::class_<kvaf::AccessTableHandle>(m, "AccessTable")
       .def_property_readonly("id", [](const kvaf::AccessTableHandle& handle) {
@@ -351,8 +359,9 @@ PYBIND11_MODULE(_kvaf, m) {
         return "AccessTable(id=" + std::to_string(handle.opaque) + ")";
       });
 
-  py::class_<kvaf::PythonRuntime>(m, "Runtime")
-      .def(py::init<>())
+  auto runtime_class = py::class_<kvaf::PythonRuntime>(m, "Runtime");
+  runtime_class.def(py::init<>())
+      .def("initialize_pools", &kvaf::PythonRuntime::InitializePools)
       .def("initialize", &kvaf::PythonRuntime::Initialize, py::arg("ddr_bytes"),
            py::arg("slot_size"),
            "Allocate Runtime-owned host DDR and initialize the mock operator.")
@@ -360,9 +369,10 @@ PYBIND11_MODULE(_kvaf, m) {
       .def_property_readonly("initialized", &kvaf::PythonRuntime::Initialized)
       .def_property_readonly("remote_region", &kvaf::PythonRuntime::RemoteRegion)
       .def("batch_put", &kvaf::PythonRuntime::BatchPut, py::arg("keys"),
-           py::arg("input"), py::arg("input_offsets"), py::arg("lengths"))
+           py::arg("input"), py::arg("input_offsets"), py::arg("lengths"),
+           py::arg("layer") = kvaf::LayerHandle{})
       .def("prepare_access_table", &kvaf::PythonRuntime::PrepareAccessTable,
-           py::arg("keys"))
+           py::arg("keys"), py::arg("layer") = kvaf::LayerHandle{})
       .def("access_table_view", &kvaf::PythonRuntime::AccessTableView,
            py::arg("access_table"))
       .def("release_access_table", &kvaf::PythonRuntime::ReleaseAccessTable,
@@ -372,11 +382,13 @@ PYBIND11_MODULE(_kvaf, m) {
            py::arg("offsets"), py::arg("miss_count"),
            py::arg("output_indices"), py::arg("output"),
            py::arg("output_block_bytes"))
-      .def("batch_free", &kvaf::PythonRuntime::BatchFree, py::arg("keys"))
+      .def("batch_free", &kvaf::PythonRuntime::BatchFree, py::arg("keys"),
+           py::arg("layer") = kvaf::LayerHandle{})
       .def("_fail_next_put", &kvaf::PythonRuntime::FailNextPut,
            "Test hook: make the next BatchPut fail before Meta commit.")
       .def("_fail_next_get", &kvaf::PythonRuntime::FailNextGet,
            "Test hook: make the next BatchGet fail.");
+  kvaf::python_binding::BindPoolMethods(runtime_class);
 
   m.def("create_mock_runtime", [] { return kvaf::PythonRuntime(); },
         "Create an in-process Runtime with the deterministic CPU mock operator.");

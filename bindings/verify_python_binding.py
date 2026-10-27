@@ -13,9 +13,16 @@ def main() -> int:
 
     import kvaf
 
+    if not all(hasattr(kvaf.Runtime, name) for name in (
+        "initialize_pools", "create_pool", "bind_layer", "get_layer", "pool_info", "destroy_pool"
+    )) or not hasattr(kvaf, "LayerHandle") or not hasattr(kvaf, "PoolHandle"):
+        raise RuntimeError("KVAF binding is missing the multi-pool API")
+
     if options.require_aiv:
         if (
             not hasattr(kvaf, "NpuRuntime")
+            or not hasattr(kvaf.NpuRuntime, "initialize_pools")
+            or not hasattr(kvaf.NpuRuntime, "create_pool")
             or not hasattr(kvaf, "DeviceAccessTable")
             or not hasattr(kvaf, "AclGraph")
             or not hasattr(kvaf.NpuRuntime, "batch_free")

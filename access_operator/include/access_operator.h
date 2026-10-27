@@ -37,6 +37,10 @@ class AccessOperator {
   virtual Status ExecuteBatchGet(const BatchGetExecRequest& request) = 0;
   virtual Status ExecuteBatchPut(const BatchPutExecRequest& request) = 0;
 
+  // False conservatively means failed writes may still own target memory.
+  // Only synchronous backends that prove DMA stopped may opt into recycling.
+  virtual bool FailedPutIsQuiescent() const { return false; }
+
 };
 
 // Configuration for the current NPU-backed default implementation. Transport

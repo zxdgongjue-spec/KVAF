@@ -73,3 +73,10 @@ Python API。`NpuRuntime` 的 `batch_get_token_bytes` 配置单 token KV 大小�
 是表项内字节偏移。直接传 `addresses` / `valid` 时，调用方负责表项布局和
 Tensor 生命周期。`AclGraph` 由 Python 调用方持有，直接封装 ACL Runtime Graph 的
 capture / replay / synchronize / reset；图对象不属于 Runtime 或 Operator。
+
+## 多 Pool API
+
+`Runtime` / `NpuRuntime` 可通过 `initialize_pools()` 启用一个 Core 管理多个独立 DDR regions。
+`create_pool`、`bind_layer` 返回 PoolHandle / LayerHandle；Put、PrepareAccessTable、Free 增加 `layer=` 参数，Get 从受管理的 table 获取布局。
+旧的 `initialize(ddr_bytes, slot_size)` 保持单池 DSA 行为。
+完整示例与生命周期见 [最小实现与测试](../../docs/ddr_pool_minimal_implementation.md)。

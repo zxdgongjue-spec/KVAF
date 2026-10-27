@@ -17,6 +17,7 @@
 #include "acl/acl.h"
 #include "acl_python_utils.h"
 #include "npu_runtime.h"
+#include "pool_python.h"
 
 namespace py = pybind11;
 
@@ -246,6 +247,8 @@ class NpuPythonRuntime final {
   void Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
     ThrowIfError(native_->Initialize(ddr_bytes, slot_size));
   }
+  void InitializePools() { ThrowIfError(native_->InitializePools()); }
+  RuntimeCore& Core() { return native_->core(); }
 
   bool Initialized() const { return native_->initialized(); }
   std::uint32_t DeviceId() const { return native_->device_id(); }
@@ -260,6 +263,7 @@ class NpuPythonRuntime final {
   }
 
   py::dict RemoteRegion() const {
+    if (native_->core().pooled()) throw py::value_error("use pool_info(pool) in pool mode");
     const RemoteRegionDesc& region = native_->core().remote_region();
     py::dict result;
     result["base"] = region.base;
@@ -275,7 +279,7 @@ class NpuPythonRuntime final {
   // the Direct-HCCP implementation synchronously completes this stream.
   void BatchPut(const py::object& keys, const py::object& source,
                 const py::object& input_offsets, const py::object& lengths,
-                const py::object& stream) {
+                const py::object& stream, LayerHandle layer) {
     if (!Initialized()) {
       throw std::runtime_error("Runtime has not been initialized");
     }
@@ -295,15 +299,16 @@ class NpuPythonRuntime final {
     const aclrtStream acl_stream = ResolveStream(stream);
     batch_put_request_.input =
         ConstBufferView{source_view.data, source_view.bytes, DeviceKind::kNpu};
+    batch_put_request_.layer = layer;
     ThrowIfError(native_->core().BatchPut(
         batch_put_request_, BatchPutExecutionOptions{acl_stream}));
   }
 
-  AccessTableHandle PrepareAccessTable(const py::object& keys) {
+  AccessTableHandle PrepareAccessTable(const py::object& keys, LayerHandle layer) {
     std::vector<KeyId> copied_keys = CopyPrepareKeys(keys);
     AccessTableHandle handle;
     ThrowIfError(native_->core().PrepareAccessTable(
-        AccessTablePrepareRequest{std::move(copied_keys)}, &handle));
+        AccessTablePrepareRequest{std::move(copied_keys), layer}, &handle));
     return handle;
   }
 
@@ -368,9 +373,9 @@ class NpuPythonRuntime final {
   // Python key forms as PrepareAccessTable (a Python key sequence or a
   // contiguous one-dimensional CPU torch.int64 Tensor), rather than imposing
   // a second representation solely for the NPU Runtime binding.
-  void BatchFree(const py::object& keys) {
+  void BatchFree(const py::object& keys, LayerHandle layer) {
     std::vector<KeyId> copied_keys = CopyPrepareKeys(keys);
-    ThrowIfError(native_->core().BatchFree(BatchFreeRequest{std::move(copied_keys)}));
+    ThrowIfError(native_->core().BatchFree(BatchFreeRequest{std::move(copied_keys), layer}));
   }
 
   void StartBatchGetKernelProfile() {
@@ -479,7 +484,15 @@ class NpuPythonRuntime final {
     const std::uint64_t output_rows =
         static_cast<std::uint64_t>(output_view.shape.front());
     const std::uint64_t output_block_bytes = output_view.bytes / output_rows;
-    if (output_block_bytes != native_->batch_get_token_bytes()) {
+    auto token_bytes = native_->batch_get_token_bytes();
+    auto tokens_per_block = native_->batch_get_tokens_per_block();
+    if (native_->core().pooled()) {
+      kvaf::AccessTableView view;
+      ThrowIfError(native_->core().GetAccessTableView(access_table, &view));
+      token_bytes = view.layout.spec.token_bytes;
+      tokens_per_block = view.layout.spec.tokens_per_block;
+    }
+    if (output_block_bytes != token_bytes) {
       throw py::value_error(
           "BatchGet output Tensor row size does not match batch_get_token_bytes");
     }
@@ -493,7 +506,7 @@ class NpuPythonRuntime final {
                         DeviceKind::kNpu},
         MutableBufferView{output_view.data, output_view.bytes, DeviceKind::kNpu},
         output_block_bytes,
-        native_->batch_get_tokens_per_block(),
+        tokens_per_block,
         AccessTableDeviceView{
             ConstBufferView{address_view.data, address_view.bytes, DeviceKind::kNpu},
             ConstBufferView{valid_view.data, valid_view.bytes, DeviceKind::kNpu}}};
@@ -525,8 +538,8 @@ void BindNpuPythonRuntime(py::module_& module) {
         return table.source().opaque;
       });
 
-  py::class_<NpuPythonRuntime>(module, "NpuRuntime")
-      .def(py::init<std::string, std::uint32_t, std::uint32_t, std::uint32_t,
+  auto runtime_class = py::class_<NpuPythonRuntime>(module, "NpuRuntime");
+  runtime_class.def(py::init<std::string, std::uint32_t, std::uint32_t, std::uint32_t,
                     std::uint32_t, std::string, std::uint32_t,
                     std::vector<std::string>, bool, std::uint32_t,
                     std::string, std::vector<std::string>, std::uint32_t>(),
@@ -547,6 +560,7 @@ void BindNpuPythonRuntime(py::module_& module) {
            "Connect this NPU Runtime to a CPU Runtime service before initialize.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),
            py::arg("slot_size"))
+      .def("initialize_pools", &NpuPythonRuntime::InitializePools)
       .def("shutdown", &NpuPythonRuntime::Shutdown)
       .def_property_readonly("initialized", &NpuPythonRuntime::Initialized)
       .def_property_readonly("device_id", &NpuPythonRuntime::DeviceId)
@@ -560,19 +574,20 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def_property_readonly("remote_region", &NpuPythonRuntime::RemoteRegion)
       .def("batch_put", &NpuPythonRuntime::BatchPut, py::arg("keys"),
            py::arg("source"), py::arg("input_offsets"), py::arg("lengths"),
-           py::arg("stream") = py::none(),
+           py::arg("stream") = py::none(), py::arg("layer") = LayerHandle{},
            "Synchronously write variable-size packed NPU blocks. keys, input_offsets, and "
            "lengths are CPU integer sequences or contiguous CPU int64 tensors "
            "with one entry per key; "
            "stream=None uses torch.npu.current_stream().")
       .def("prepare_access_table", &NpuPythonRuntime::PrepareAccessTable,
-           py::arg("keys"))
+           py::arg("keys"), py::arg("layer") = LayerHandle{})
       .def("access_table_view", &NpuPythonRuntime::AccessTableView,
            py::arg("access_table"), py::arg("device") = "cpu",
            py::arg("capacity") = 0)
       .def("release_access_table", &NpuPythonRuntime::ReleaseAccessTable,
            py::arg("access_table"))
       .def("batch_free", &NpuPythonRuntime::BatchFree, py::arg("keys"),
+           py::arg("layer") = LayerHandle{},
            "Release the supplied keys from the Runtime metadata store. keys "
            "accepts a Python key sequence or a contiguous one-dimensional "
            "CPU torch.int64 Tensor.")
@@ -600,6 +615,7 @@ void BindNpuPythonRuntime(py::module_& module) {
            "Submit BatchGet from caller-owned NPU addresses and valid Tensors. "
            "stream=None uses torch.npu.current_stream(); the default returns "
            "after enqueueing work on that stream.");
+  python_binding::BindPoolMethods(runtime_class);
 }
 
 }  // namespace kvaf

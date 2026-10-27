@@ -1,5 +1,7 @@
 # KVAF Runtime
 
+当前多 Pool 最小实现采用一个 RuntimeCore、每 Pool 一个独立 region/operator，统一管理 layer 路由和 AccessTable；旧单池接口继续兼容。实际 API 与测试见 [多 Pool 最小实现](../docs/ddr_pool_minimal_implementation.md)。
+
 ## 模块定位
 
 KVAF Runtime 是对外的 KV 控制面入口。它不处理 Prefix Key 或

@@ -16,6 +16,8 @@ except ImportError as error:
     ) from error
 
 AccessTable = _native.AccessTable
+PoolHandle = _native.PoolHandle
+LayerHandle = _native.LayerHandle
 Runtime = _native.Runtime
 MockRuntime = _native.MockRuntime
 create_mock_runtime = _native.create_mock_runtime
@@ -30,6 +32,8 @@ if hasattr(_native, "NpuRuntime"):
 
 __all__ = [
     "AccessTable",
+    "PoolHandle",
+    "LayerHandle",
     "Runtime",
     "MockRuntime",
     "create_mock_runtime",

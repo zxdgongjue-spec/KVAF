@@ -11,6 +11,7 @@
 #include "requests.h"
 #include "status.h"
 #include "types.h"
+#include "pool_manager.h"
 
 namespace kvaf {
 
@@ -76,6 +77,15 @@ class RuntimeCore {
   RuntimeCore& operator=(const RuntimeCore&) = delete;
 
   Status Initialize(const RuntimeInitRequest& request);
+  Status InitializePools(AccessOperatorFactory factory);
+  Status CreatePool(const PoolSpec&, PoolHandle*);
+  Status GetPoolInfo(PoolHandle, PoolInfo*) const;
+  Status BindLayer(std::uint64_t namespace_id, std::uint64_t layer_id, PoolHandle, LayerHandle*);
+  Status GetLayer(std::uint64_t namespace_id, std::uint64_t layer_id, LayerHandle*) const;
+  Status GetLayerLayout(LayerHandle, LayerLayout*) const;
+  Status UnbindLayer(LayerHandle);
+  Status DestroyPool(PoolHandle);
+  bool pooled() const { return pool_manager_ != nullptr; }
   Status Shutdown();
 
   bool initialized() const { return initialized_; }
@@ -101,6 +111,7 @@ class RuntimeCore {
 
  private:
   struct AccessTableState {
+    LayerLayout layout;
     LockContext lock_context;
     std::vector<Address> addresses;
     std::vector<std::uint64_t> lengths;
@@ -119,8 +130,8 @@ class RuntimeCore {
       const AccessTableHandle& handle) const;
 
   bool initialized_{false};
+  std::unique_ptr<PoolManager> pool_manager_;
   RemoteRegionDesc remote_region_;
-  std::uint64_t next_access_table_id_{1};
   std::unordered_map<std::uint64_t, std::unique_ptr<AccessTableState>>
       access_tables_;
 };

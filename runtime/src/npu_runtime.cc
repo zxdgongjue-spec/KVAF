@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <utility>
 #include <vector>
+#include <unordered_map>
 
 #include "batch_get_abi.h"
 #include "access_operator.h"
@@ -39,7 +40,7 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
       : link_(std::move(link)) {}
 
   void SetCandidate(std::uint32_t candidate_id) { candidate_id_ = candidate_id; }
-  bool has_allocation() const { return allocated_.base != 0U; }
+  bool has_allocation() const { return !allocations_.empty(); }
 
   Status Allocate(const RuntimeInitRequest& request, RemoteRegionDesc* region) override {
     if (link_ == nullptr || region == nullptr || request.ddr_device != DeviceKind::kCpu ||
@@ -47,26 +48,27 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
         request.ddr_bytes % request.slot_size != 0U) {
       return Status::InvalidArgument("invalid peer DDR allocation request");
     }
-    if (allocated_.base != 0U) return Status::InvalidState("peer DDR is already allocated");
-    Status status = link_->AllocateRegion(request.ddr_bytes, request.slot_size, candidate_id_, &allocated_);
+    peer::PeerRegion allocated;
+    Status status = link_->AllocateRegion(request.ddr_bytes, request.slot_size, candidate_id_, &allocated);
     if (!status.ok()) return status;
-    *region = RemoteRegionDesc{allocated_.base, allocated_.length, request.slot_size, DeviceKind::kCpu};
+    allocations_.emplace(allocated.base, allocated);
+    *region = RemoteRegionDesc{allocated.base, allocated.length, request.slot_size, DeviceKind::kCpu};
     return Status::OK();
   }
 
   Status Release(const RemoteRegionDesc& region) override {
-    if (allocated_.base == 0U || allocated_.base != region.base) {
+    if (!allocations_.count(region.base)) {
       return Status::NotFound("peer DDR allocation was not found");
     }
-    const Status status = link_->ReleaseRegion(allocated_.base);
-    if (status.ok()) allocated_ = {};
+    const Status status = link_->ReleaseRegion(region.base);
+    if (status.ok()) allocations_.erase(region.base);
     return status;
   }
 
  private:
   std::shared_ptr<peer::PeerLink> link_;
   std::uint32_t candidate_id_{0U};
-  peer::PeerRegion allocated_{};
+  std::unordered_map<std::uint64_t, peer::PeerRegion> allocations_;
 };
 
 using AclrtGetPhyDevIdByLogicDevId = int (*)(int32_t, int32_t*);
@@ -808,6 +810,24 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       device_candidates, initialize_candidate, cleanup);
 }
 
+Status NpuRuntime::InitializePools() {
+  if (initialized()) return Status::InvalidState("NpuRuntime already initialized");
+  // Reuse the established EID/candidate validation and clean up its private
+  // probe region before publishing any user pool. No extra Core stays alive.
+  const auto rows = std::uint64_t{impl_->options.npu_core_count} *
+      (kBatchPutProbeWqesPerPost + std::min(impl_->options.jettys_per_core, 2U) - 1U);
+  auto status = Initialize(rows * kBatchPutProbeBytesPerRow, kBatchPutProbeBytesPerRow);
+  if (!status.ok()) return status;
+  status = Shutdown();
+  if (!status.ok()) return status;
+  impl_->runtime_core.reset();
+  impl_->access_operator.reset();
+  impl_->CreateCore();
+  return impl_->runtime_core->InitializePools([state = impl_.get()] {
+    return std::make_unique<DefaultAccessOperator>(state->config);
+  });
+}
+
 RuntimeCore& NpuRuntime::core() {
   if (impl_->runtime_core == nullptr) {
     throw std::logic_error("NpuRuntime requires LinkTo before core access");
@@ -834,6 +854,8 @@ std::uint32_t NpuRuntime::batch_get_tokens_per_block() const {
 }
 
 Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled) {
+  if (initialized() && impl_->runtime_core->pooled())
+    return Status::NotImplemented("pool profiling is not exposed in this version");
   if (impl_->access_operator == nullptr) {
     return Status::NotInitialized(
         "NpuRuntime requires LinkTo before configuring BatchGet profiling");
@@ -843,6 +865,8 @@ Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled) {
 
 Status NpuRuntime::CopyBatchGetKernelProfiles(
     std::vector<BatchGetKernelProfile>* profiles) const {
+  if (initialized() && impl_->runtime_core->pooled())
+    return Status::NotImplemented("pool profiling is not exposed in this version");
   if (impl_->access_operator == nullptr) {
     return Status::NotInitialized(
         "NpuRuntime requires LinkTo before reading BatchGet profiling");

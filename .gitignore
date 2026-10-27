@@ -16,3 +16,6 @@ __pycache__/
 
 # macOS metadata
 .DS_Store
+
+# Local portable build toolchain
+.build-tools/

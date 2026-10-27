@@ -6,6 +6,7 @@
 
 #include "status.h"
 #include "types.h"
+#include "pool_metadata.h"
 
 namespace kvaf {
 
@@ -54,6 +55,8 @@ class MetaManager {
  public:
   virtual ~MetaManager() = default;
 
+  PoolMetadata& pools() { return pool_metadata_; }
+
   // 注册远端区域；DSA Key 必须位于 [0, length / slot_size)。
   // 固定映射 slot_id = key，地址为 base + key * slot_size。
   virtual Status RegisterRemoteRegion(const RemoteRegionDesc& region) = 0;
@@ -88,6 +91,9 @@ class MetaManager {
 
   // 释放一批 key 当前占用的 slot，使相同 Key 可以复用该 slot。
   virtual Status BatchFree(const std::vector<KeyId>& flat_keys) = 0;
+
+ private:
+  PoolMetadata pool_metadata_;
 };
 
 // 创建一个基于内存数据结构的 MetaManager POC 实现。

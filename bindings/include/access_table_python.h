@@ -29,6 +29,13 @@ inline pybind11::dict MakeAccessTableView(const AccessTableView& view) {
       static_cast<py::ssize_t>(sizeof(std::uint8_t)), "B", {size},
       {static_cast<py::ssize_t>(sizeof(std::uint8_t))}, true);
   result["size"] = view.size;
+  if (!view.layout.layer.empty()) {
+    result["layer"] = py::cast(view.layout.layer);
+    result["pool"] = py::cast(view.layout.pool);
+    result["token_bytes"] = view.layout.spec.token_bytes;
+    result["tokens_per_block"] = view.layout.spec.tokens_per_block;
+    result["slot_size"] = view.layout.spec.slot_size;
+  }
   return result;
 }
 

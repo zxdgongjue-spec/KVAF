@@ -59,6 +59,8 @@ class NpuRuntime final : public Runtime {
   NpuRuntime& operator=(const NpuRuntime&) = delete;
 
   Status Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size);
+  // Select/validate the existing peer route, then start one multi-pool Core.
+  Status InitializePools();
   RuntimeCore& core();
   const RuntimeCore& core() const;
 

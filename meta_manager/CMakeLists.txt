@@ -1,5 +1,6 @@
 add_library(kvaf_meta_manager
   src/in_memory_meta_manager.cc
+  src/pool_metadata.cc
 )
 
 target_include_directories(kvaf_meta_manager

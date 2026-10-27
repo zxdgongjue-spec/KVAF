@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "types.h"
+#include "pool_types.h"
 
 namespace kvaf {
 
@@ -20,6 +21,7 @@ struct RuntimeInitRequest {
 // 需要保留自己的逻辑 shape，并以 indices 指向这张表。
 struct AccessTablePrepareRequest {
   std::vector<KeyId> flat_keys;
+  LayerHandle layer;
 };
 
 // Runtime 内部 AccessTable 的只读宿主视图。view 只在关联 Handle 有效时
@@ -30,6 +32,7 @@ struct AccessTableView {
   const std::uint64_t* lengths{nullptr};
   const std::uint8_t* valid{nullptr};
   std::size_t size{0};
+  LayerLayout layout;
 };
 
 // NPU BatchGet 使用的 device AccessTable buffer。C++ Runtime 不拥有这些
@@ -66,6 +69,7 @@ struct BatchGetRequest {
 
   // CPU path 留空。NPU path 必须提供调用方持有的稳定 Device 表。
   AccessTableDeviceView device_access_table;
+  LayerHandle layer;
 };
 
 struct BatchPutRequest {
@@ -78,6 +82,7 @@ struct BatchPutRequest {
   ConstBufferView input;
   std::vector<std::uint64_t> input_offsets;
   std::vector<std::uint64_t> lengths;
+  LayerHandle layer;
 };
 
 // BatchPut V1 is synchronous, but the Direct-HCCP launch still needs the
@@ -89,6 +94,7 @@ struct BatchPutExecutionOptions {
 
 struct BatchFreeRequest {
   std::vector<KeyId> keys;
+  LayerHandle layer;
 };
 
 // 一次 BatchGet 提交使用的调用方 stream。Runtime 不解释 stream 的具体

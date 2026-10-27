@@ -1,5 +1,9 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+add_executable(kvaf_runtime_pool_test runtime_pool_test.cc)
+target_link_libraries(kvaf_runtime_pool_test PRIVATE kvaf_runtime)
+add_test(NAME kvaf_runtime_pool_test COMMAND kvaf_runtime_pool_test)
+
 add_test(NAME kvaf_dsa_keys_python
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_dsa_keys.py")
@@ -24,6 +28,14 @@ add_test(
 )
 
 if(KVAF_BUILD_PYTHON)
+  add_test(NAME kvaf_runtime_pools_python
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_runtime_pools.py")
+  set_tests_properties(kvaf_runtime_pools_python PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}/python")
+  add_test(NAME kvaf_npu_pools_python
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_npu_pools.py")
+  set_tests_properties(kvaf_npu_pools_python PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}/python" TIMEOUT 240 SKIP_RETURN_CODE 77)
   add_test(
     NAME kvaf_runtime_mock_python
     COMMAND "${Python3_EXECUTABLE}"
