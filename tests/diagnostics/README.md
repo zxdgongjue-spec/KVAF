@@ -1,3 +1,10 @@
+# READ QoS evidence
+
+Use `collect_read_qos.py` to collect the actual server's driver identity, EID-bound
+QoS configuration, live Jetty queries and per-VL TX/RX bandwidth where available.
+See [READ request/response SL and VL confirmation](read_qos.md) for commands,
+the HDC-versus-Host namespace distinction, and the limits of each kind of evidence.
+
 # Paired bandwidth timing scopes
 
 Run from KVAF on ak-batchget-test, using its matching build-npu. Existing
