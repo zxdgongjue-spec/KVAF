@@ -208,17 +208,36 @@ CPU 线程预算和绑定策略在同一次扫描中保持一致；SGL 6、每�
 可用 `KVAF_AICPU_SWEEP_LOG_DIR` 指定一个新目录。任一组失败后停止，已完成结果保留。
 终端按现有 profile 的执行顺序显示每组配置的一份汇总，省略 worker 明细、缓存细项、计数和 Host/Python 杂项：
 
-- 构建源清单、WRITE 清单、通知 CPU。
+- 准备 CPU 读取请求（包含缓存维护和地址查表）、发送地址清单、通知 CPU。
 - 流水 READ 总时间，以及其中的 WR/SGL 构建、等待 CPU 就绪前缀、提交 READ、等待 READ CQE。
 - 等待最终 CPU ACK。
 
 上述阶段直接使用现有打点，每轮取各 worker 的最大耗时，再对测量轮次求均值。
-“构建源清单”仍包含该阶段内部的缓存维护；READ 下的子项包含在 READ 总时间内。
+请求准备包含输入缓存维护、地址查表、填写地址/长度清单及清单缓存维护；READ 下的子项包含在 READ 总时间内。
 阶段最大值可能来自不同 worker，且存在嵌套和重叠，不能相加为算子时间。
 
-CSV 每组配置一行，包含配置、全局 `device_p50_us` / `p50_GBps` 和选定阶段数据：
-`request_us、source_write_us、notify_us、read_us、wr_build_us、ready_wait_us、post_us、cq_wait_us、ack_us`。
-所有耗时显示 1 位小数，带宽为十进制 GB/s。
+CSV 每组配置一行，使用中文表头，所有时间标明单位及均值/P50：
+
+| 表头 | 含义 |
+| --- | --- |
+| 单次读取(B) / 请求数 / worker数 | 测试配置 |
+| 算子P50(us) / p50_GBps | 算子耗时中位数及对应的有效载荷带宽 |
+| 请求准备_含缓存维护和查表_均值(us) | 清理输入缓存，按索引和偏移计算 CPU 源地址，填写并清理待发送的地址清单 |
+| 发送地址清单_均值(us) | AICPU 将地址/长度清单 WRITE 到 CPU DDR 并等完成 |
+| 通知CPU_均值(us) | WRITE 清单指针和请求编号，通知 CPU 开始 gather |
+| 流水READ总计_均值(us) | 从 staging READ 到输出 HBM 的整个流水阶段 |
+| READ内_组装WR及SGL_均值(us) | 构建 URMA READ 请求及目标分散地址 |
+| READ内_等待CPU就绪_均值(us) | 等待 CPU 完成当前需要的 staging 前缀 |
+| READ内_提交READ_均值(us) | provider 编码、SQ 写入及 doorbell |
+| READ内_等待CQE_均值(us) | 等待已提交 READ 完成 |
+| 等待CPU最终ACK_均值(us) | 确认 CPU 已完成本轮 gather |
+
+`READ内_` 的各列已经包含在 `流水READ总计` 中。阶段为每轮 worker 最大耗时的均值，不与总时间的 P50 相加。
+耗时保留 1 位小数，带宽为十进制 GB/s。原始英文打点字段仅保留在每组日志的结果记录中。
+
+当前 BatchGet 输入是地址表、索引和块内偏移，AICPU 计算 `addresses[indices[i]] + offsets[i]` 后，
+把该地址及 token 长度写入 CPU 可读的清单。CPU 依次按清单 gather 到 staging。
+这一步只准备请求元数据，不搬运实际 payload；当前实现还会刷新整张地址表，因此请求准备耗时不能当作纯清单填写耗时。
 
 原 `python/test_batch_get.py` 继续用于逐轮改变源数据、保护行和异步调用的正确性测试。
 

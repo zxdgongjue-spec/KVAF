@@ -99,7 +99,7 @@ def summarize_measurements(profiles, payload_bytes):
 def print_measurements(a, summary):
     print(f"AICPU_GATHER_READ_PROFILE 算子P50={summary['device_p50_us']:.1f} us "
           f"p50_GBps={summary['p50_GBps']:.3f} 阶段耗时=每轮worker最大值的均值")
-    print(f"  构建源清单={summary['request_us']:.1f} us | WRITE清单={summary['source_write_us']:.1f} us | "
+    print(f"  准备CPU读取请求(含缓存维护和查表)={summary['request_us']:.1f} us | 发送地址清单={summary['source_write_us']:.1f} us | "
           f"通知CPU={summary['notify_us']:.1f} us")
     print(f"  流水READ={summary['read_us']:.1f} us，其中：")
     print(f"    组装WR/SGL={summary['wr_build_us']:.1f} us | 等CPU就绪前缀={summary['ready_wait_us']:.1f} us | "
