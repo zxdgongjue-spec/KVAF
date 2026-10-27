@@ -274,18 +274,11 @@ Status Transport::PrepareWrites(std::uint32_t count) {
     return Status::OK();
   }
   std::array<std::vector<PreparedQueue>, kJettyCount> shards;
-  std::uint32_t chunks = 0;
-  for (std::uint32_t w = 0; w < workers_; ++w)
-    chunks = std::max(chunks, ChunkCount(WorkerRange(count, token_bytes_, w, workers_)));
-#pragma omp parallel for schedule(static, 1) num_threads(kJettyCount)
   for (std::uint32_t queue = 0; queue < kJettyCount; ++queue) {
     auto& waves = shards[queue];
     waves.emplace_back();
-    for (std::uint32_t chunk = 0; chunk < chunks; ++chunk) {
-      for (std::uint32_t worker = 0; worker < workers_; ++worker) {
-        const auto partition = WorkerRange(count, token_bytes_, worker, workers_);
-        if (chunk >= ChunkCount(partition)) continue;
-        const auto range = ChunkRange(partition, chunk);
+    ForEachPipelineChunk(count, token_bytes_, workers_,
+      [&](std::uint32_t worker, std::uint32_t chunk, Range range) {
         const auto rows = range.end - range.begin;
         const auto base = rows / kJettyCount, remainder = rows % kJettyCount;
         auto row = range.begin + queue * base + std::min(queue, remainder);
@@ -316,8 +309,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
         q.local.push_back({reinterpret_cast<std::uint64_t>(marker), 8, control_, nullptr});
         AppendPrepared(q, queue, hbm_base_ + layout_.ready + worker * sizeof(Ready) + queue * 8,
                        8, 1, true);
-      }
-    }
+      });
   }
   std::size_t waves = 0;
   for (const auto& shard : shards) waves = std::max(waves, shard.size());
@@ -400,52 +392,37 @@ Status Transport::WriteBatch() {
   BatchGetProfileScope timer(profile_.enabled ? &profile_.write_ns : nullptr);
   auto status = PrepareWrites(request().count);
   if (!status.ok()) return status;
-  std::array<Status, kJettyCount> posted;
-  std::uint64_t phase_begin = 0;
-  std::uint32_t active_threads = 0;
-#pragma omp parallel num_threads(kJettyCount) shared(status, posted, phase_begin, active_threads)
-  {
+  // Match the ordered-WRITE probe: short submissions to all four queues from
+  // their owner, then poll their tails together. Avoid waking an OpenMP team
+  // and crossing several team barriers for each short request.
+  for (std::size_t w = 0; w < prepared_.size(); ++w) {
+    auto& plan = *prepared_[w];
+    for (auto& queue : plan.queues) RefreshPrepared(queue);
+    status = BeginPrepared(plan, w + 1);
+    if (!status.ok()) return status;
     if (profile_.enabled) {
-#pragma omp atomic update
-      ++active_threads;
-    }
-    for (std::size_t w = 0; w < prepared_.size(); ++w) {
-      auto& plan = *prepared_[w];
-#pragma omp for schedule(static, 1)
-      for (std::uint32_t q = 0; q < kJettyCount; ++q) RefreshPrepared(plan.queues[q]);
-#pragma omp single
-      {
-        status = BeginPrepared(plan, w + 1);
-        if (profile_.enabled) {
-          profile_.cpu_threads = active_threads;
-          ++profile_.waves;
-          for (const auto& q : plan.queues) {
-            profile_.ready_wrs += q.markers.size();
-            profile_.data_wrs += q.wrs.size() - q.markers.size();
-            profile_.post_calls += (q.wrs.size() + kDoorbellWrs - 1) / kDoorbellWrs;
-          }
-          phase_begin = BatchGetProfileNowNs();
-          if (!profile_.first_post_ns) profile_.first_post_ns = phase_begin;
-        }
+      profile_.cpu_threads = 1;
+      ++profile_.waves;
+      for (const auto& q : plan.queues) {
+        profile_.ready_wrs += q.markers.size();
+        profile_.data_wrs += q.wrs.size() - q.markers.size();
+        profile_.post_calls += (q.wrs.size() + kDoorbellWrs - 1) / kDoorbellWrs;
       }
-#pragma omp for schedule(static, 1)
-      for (std::uint32_t q = 0; q < kJettyCount; ++q)
-        posted[q] = status.ok() ? PostPrepared(plan.queues[q], q) : status;
-#pragma omp single
-      {
-        if (profile_.enabled) profile_.post_ns += BatchGetProfileNowNs() - phase_begin;
-        for (const auto& result : posted) if (!result.ok()) { status = result; break; }
-        if (status.ok()) {
-          const auto begin = profile_.enabled ? BatchGetProfileNowNs() : 0;
-          status = PollPrepared(w + 1, profile_.enabled ? &profile_ : nullptr);
-          if (profile_.enabled) {
-            profile_.last_cqe_ns = BatchGetProfileNowNs();
-            profile_.cq_wait_ns += profile_.last_cqe_ns - begin;
-          }
-        }
-      }
-      if (!status.ok()) break;
     }
+    const auto phase_begin = profile_.enabled ? BatchGetProfileNowNs() : 0;
+    if (profile_.enabled && !profile_.first_post_ns) profile_.first_post_ns = phase_begin;
+    for (std::uint32_t q = 0; q < kJettyCount; ++q) {
+      status = PostPrepared(plan.queues[q], q);
+      if (!status.ok()) return status;
+    }
+    const auto posted = profile_.enabled ? BatchGetProfileNowNs() : 0;
+    if (profile_.enabled) profile_.post_ns += posted - phase_begin;
+    status = PollPrepared(w + 1, profile_.enabled ? &profile_ : nullptr);
+    if (profile_.enabled) {
+      profile_.last_cqe_ns = BatchGetProfileNowNs();
+      profile_.cq_wait_ns += profile_.last_cqe_ns - posted;
+    }
+    if (!status.ok()) return status;
   }
   return status;
 }

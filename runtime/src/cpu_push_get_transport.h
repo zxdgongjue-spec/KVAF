@@ -12,7 +12,7 @@
 #include "status.h"
 
 namespace kvaf::cpu_push {
-// One service thread owns the session; OpenMP assigns each Jetty one submitter.
+// One service thread owns and submits the four prepared Jetty chains.
 class Transport {
  public:
   ~Transport();
