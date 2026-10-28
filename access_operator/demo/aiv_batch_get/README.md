@@ -107,7 +107,9 @@ temporarily disabled in this branch.
 
 The ACL launcher reserves 160 KiB of AIV local memory for the two WQE banks and
 SIMT validation scratch. Rebuild Host, Python binding and Kernel together: the
-launcher now requires the `KvafExecuteBatchGetAivKernelV2` symbol.
+launcher now requires the `KvafExecuteBatchGetAivKernelV3` symbol. The V3 status
+stride is 5376 bytes, including optional per-Jetty scheduling/timeline profiles;
+rebuild the loader, binding and kernel together. Kernel arguments remain 112 bytes.
 
 ## Build and validate on A5
 

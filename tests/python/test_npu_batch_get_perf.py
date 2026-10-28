@@ -21,6 +21,7 @@ environment variables:
                            KVAF_BATCH_GET_PERF_OUTPUT_ACCESS_PATTERN
     --sort-input-indices   KVAF_BATCH_GET_PERF_SORT_INPUT_INDICES=1
     --kernel-profile       KVAF_BATCH_GET_PERF_KERNEL_PROFILE=1
+    --kernel-profile-jetty-timeline  diagnostic round-robin CQ observation
     --kernel-profile-clock-mhz
                            KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ
     adaptive UB devices    KVAF_ADAPTIVE_UB_DEVICES
@@ -253,6 +254,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="disable AIV kernel cycle profiling",
     )
     parser.add_argument(
+        "--kernel-profile-jetty-timeline", action="store_true",
+        help="with --kernel-profile, observe pending Jetty CQs round-robin; diagnostic overhead",
+    )
+    parser.add_argument(
         "--kernel-profile-clock-mhz",
         type=int,
         default=environment_int(
@@ -334,6 +339,8 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "populate-chunk-entries must be positive"
     if args.kernel_profile_clock_mhz <= 0:
         return "kernel-profile-clock-mhz must be positive"
+    if args.kernel_profile_jetty_timeline and not args.kernel_profile:
+        return "kernel-profile-jetty-timeline requires --kernel-profile"
     return None
 
 
@@ -409,6 +416,79 @@ def print_samples(
     print(result)
 
 
+def print_jetty_profile(
+    samples: list[list[dict[str, object]]], clock_mhz: int,
+    npu_core_count: int, jettys_per_core: int, token_bytes: int,
+) -> None:
+    """Scheduling proof and per-Jetty software observation times, in us."""
+    divisor = float(len(samples))
+    for core in range(npu_core_count):
+        records = [sample[core] for sample in samples]
+        # Host-only fixtures and old bindings can still report the core stages.
+        if not all("jettys" in record for record in records):
+            continue
+        if any(int(record["core"]) != core or
+               not jettys_per_core <= len(record["jettys"]) <= MAX_JETTYS_PER_CORE
+               for record in records):
+            raise AssertionError("invalid per-Jetty profile shape")
+        modes = {bool(record["jetty_timeline_enabled"]) for record in records}
+        limits = {int(record["small_post_max_requests"]) for record in records}
+        if len(modes) != 1 or len(limits) != 1:
+            raise AssertionError("profile mode or compiled small-post limit changed within a run")
+        round_robin = modes.pop()
+        widths = [int(record["selected_post_width"]) for record in records]
+        print(
+            f"KERNEL_PROFILE_SCHEDULE core={core} samples={len(samples)} "
+            f"small_post_max_requests={limits.pop()} "
+            f"post_width_min={min(widths)} post_width_max={max(widths)} "
+            f"small_post_active_samples={sum(int(r['small_post_group_count']) > 0 for r in records)} "
+            + " ".join(
+                f"{label}={sum(int(r[name]) for r in records) / divisor:.6f}"
+                for label, name in (
+                    ("small_post_groups_per_call", "small_post_group_count"),
+                    ("fused_groups_per_call", "fused_group_count"),
+                    ("wqe_build_calls_per_call", "wqe_build_calls"),
+                )
+            )
+        )
+        for jetty in range(jettys_per_core):
+            traces = [record["jettys"][jetty] for record in records]
+            active = [(record, trace) for record, trace in zip(records, traces)
+                      if int(trace["submitted_reads"]) > 0]
+            fields = dict(
+                core=core, jetty=jetty, samples=len(samples), active_samples=len(active),
+                completion_poll_mode="round_robin" if round_robin else "serial",
+                reads_per_call=sum(int(t["submitted_reads"]) for t in traces) / divisor,
+                posts_per_call=sum(int(t["submitted_posts"]) for t in traces) / divisor,
+                completions_per_call=sum(int(t["completed_checkpoints"]) for t in traces) / divisor,
+                payload_bytes_per_call=sum(int(t["submitted_reads"]) for t in traces) * token_bytes / divisor,
+                polls_per_call=sum(int(r["jetty_completion_polls"][jetty]) for r in records) / divisor,
+                probe_active_us_mean=(
+                    statistics.mean(int(t["probe_active_cycles"]) / clock_mhz for _, t in active)
+                    if round_robin and active else "n/a"
+                ),
+            )
+            for name, begin, end in (
+                ("first_doorbell_offset", "kernel_start_cycle", "first_doorbell_cycle"),
+                ("last_doorbell_offset", "kernel_start_cycle", "last_doorbell_cycle"),
+                ("first_cqe_seen_offset", "kernel_start_cycle", "first_cqe_seen_cycle"),
+                ("last_cqe_seen_offset", "kernel_start_cycle", "last_cqe_seen_cycle"),
+                ("first_db_to_last_cqe", "first_doorbell_cycle", "last_cqe_seen_cycle"),
+                ("last_db_to_last_cqe", "last_doorbell_cycle", "last_cqe_seen_cycle"),
+            ):
+                values = [(int(trace[end]) - int(record[begin] if begin == "kernel_start_cycle"
+                                               else trace[begin])) / clock_mhz
+                          for record, trace in active]
+                fields[name + "_us_mean"] = statistics.mean(values) if values else "n/a"
+                if name.endswith("last_cqe"):
+                    fields[name + "_us_p50"] = percentile(values, 0.50) if values else "n/a"
+                    fields[name + "_us_p99"] = percentile(values, 0.99) if values else "n/a"
+            print("KERNEL_PROFILE_JETTY " + " ".join(
+                f"{key}={value:.6f}" if isinstance(value, float) else f"{key}={value}"
+                for key, value in fields.items()
+            ))
+
+
 def print_kernel_profile(
     samples: list[list[dict[str, object]]],
     warmup: int,
@@ -421,6 +501,14 @@ def print_kernel_profile(
 ) -> None:
     if not samples or any(len(sample) != npu_core_count for sample in samples):
         raise AssertionError("BatchGet kernel profile sample/core count mismatch")
+    modes = {bool(profile.get("jetty_timeline_enabled", False))
+             for sample in samples for profile in sample}
+    versions = {int(profile.get("profile_version", 0))
+                for sample in samples for profile in sample}
+    if len(modes) != 1 or len(versions) != 1:
+        raise AssertionError("mixed profile versions or CQ polling modes")
+    round_robin = modes.pop()
+    profile_version = versions.pop()
 
     def elapsed_ms(profile: dict[str, object], begin: str, end: str) -> float:
         return (int(profile[end]) - int(profile[begin])) / clock_mhz / 1000.0
@@ -547,6 +635,8 @@ def print_kernel_profile(
 
     print(
         "KERNEL_PROFILE_CONTRACT "
+        f"profile_version={profile_version} "
+        f"completion_poll_mode={'round_robin' if round_robin else 'serial'} "
         f"clock_mhz={clock_mhz} unit=ms samples={len(samples)} "
         f"aiv_cores={npu_core_count} jettys_per_core={jettys_per_core} "
         f"request_length={request_length} miss_count={miss_count} "
@@ -555,8 +645,11 @@ def print_kernel_profile(
         "first_doorbell=kernel_start_to_first_doorbell_zero_for_idle_core "
         "transfer_window=first_doorbell_to_all_cq_complete "
         "completion_wait=sum_all_group_drains "
+        "jetty_wait=serial_residual_wait_unavailable_in_round_robin "
+        "jetty_cqe_time=software_first_observation_after_posting_not_hardware_completion "
         "peak_submitted_not_drained=per_core_conservative_software_count "
-        "profile_overhead_included=1 d2h_outside_host_metric=1"
+        "profile_overhead_included=1 profile_writeback_outside_kernel_total=1 "
+        "d2h_outside_host_metric=1"
     )
     total_useful_bytes = len(samples) * miss_count * token_bytes
     for stage, values in stage_samples.items():
@@ -589,8 +682,10 @@ def print_kernel_profile(
             + " ".join(
                 f"{name}_mean={value / divisor:.6f}"
                 for name, value in accumulator.items()
+                if not (round_robin and name.startswith("jetty") and name.endswith("_wait_ms"))
             )
         )
+    print_jetty_profile(samples, clock_mhz, npu_core_count, jettys_per_core, token_bytes)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -720,6 +815,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"iterations={args.iterations} seed={args.seed} "
             f"sort_input_indices={int(args.sort_input_indices)} "
             f"kernel_profile={int(args.kernel_profile)} "
+            f"kernel_profile_jetty_timeline={int(args.kernel_profile_jetty_timeline)} "
             f"kernel_profile_clock_mhz={args.kernel_profile_clock_mhz} "
             "timing=call_to_stream_completion"
         )
@@ -892,7 +988,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return indices, offsets, output_indices
 
         if args.kernel_profile:
-            runtime.start_batch_get_kernel_profile()
+            if args.kernel_profile_jetty_timeline:
+                runtime.start_batch_get_kernel_profile(jetty_timeline=True)
+            else:
+                runtime.start_batch_get_kernel_profile()
             kernel_profile_started = True
             print("BATCH_GET_KERNEL_PROFILE_ENABLED units=cycles")
 

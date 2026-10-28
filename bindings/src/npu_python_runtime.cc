@@ -373,8 +373,8 @@ class NpuPythonRuntime final {
     ThrowIfError(native_->core().BatchFree(BatchFreeRequest{std::move(copied_keys)}));
   }
 
-  void StartBatchGetKernelProfile() {
-    ThrowIfError(native_->SetBatchGetKernelProfiling(true));
+  void StartBatchGetKernelProfile(bool jetty_timeline = false) {
+    ThrowIfError(native_->SetBatchGetKernelProfiling(true, jetty_timeline));
   }
 
   py::list BatchGetKernelProfileSnapshot() const {
@@ -403,6 +403,29 @@ class NpuPythonRuntime final {
       item["jetty_completion_wait_cycles"] =
           profile.jetty_completion_wait_cycles;
       item["jetty_completion_polls"] = profile.jetty_completion_polls;
+      item["small_post_max_requests"] = profile.small_post_max_requests;
+      item["selected_post_width"] = profile.selected_post_width;
+      item["small_post_group_count"] = profile.small_post_group_count;
+      item["fused_group_count"] = profile.fused_group_count;
+      item["wqe_build_calls"] = profile.wqe_build_calls;
+      item["jetty_timeline_enabled"] = profile.jetty_timeline_enabled;
+      item["profile_version"] = profile.profile_version;
+      py::list jettys;
+      const auto jetty_count = native_->jettys_per_core() == 0U ? 1U : native_->jettys_per_core();
+      for (std::size_t index = 0; index < jetty_count; ++index) {
+        const auto& trace = profile.jettys[index];
+        py::dict jetty;
+        jetty["submitted_reads"] = trace.submitted_reads;
+        jetty["submitted_posts"] = trace.submitted_posts;
+        jetty["completed_checkpoints"] = trace.completed_checkpoints;
+        jetty["first_doorbell_cycle"] = trace.first_doorbell_cycle;
+        jetty["last_doorbell_cycle"] = trace.last_doorbell_cycle;
+        jetty["first_cqe_seen_cycle"] = trace.first_cqe_seen_cycle;
+        jetty["last_cqe_seen_cycle"] = trace.last_cqe_seen_cycle;
+        jetty["probe_active_cycles"] = trace.probe_active_cycles;
+        jettys.append(std::move(jetty));
+      }
+      item["jettys"] = std::move(jettys);
       result.append(std::move(item));
     }
     return result;
@@ -578,7 +601,8 @@ void BindNpuPythonRuntime(py::module_& module) {
            "CPU torch.int64 Tensor.")
       .def("start_batch_get_kernel_profile",
            &NpuPythonRuntime::StartBatchGetKernelProfile,
-           "Enable the per-core BatchGet kernel cycle timeline.")
+           py::arg("jetty_timeline") = false,
+           "Enable profiling; jetty_timeline uses diagnostic round-robin CQ probes.")
       .def("batch_get_kernel_profile",
            &NpuPythonRuntime::BatchGetKernelProfileSnapshot,
            "Copy the latest completed per-core BatchGet kernel timeline.")

@@ -22,6 +22,7 @@ CONFIG_FIELDS = SHAPE_FIELDS + (
     "source_access_pattern", "output_access_pattern", "sort_input_indices",
     "seed", "warmup", "iterations", "npu_eids", "eid_paths", "peer_ub_device",
     "adaptive_ub_device", "adaptive_ub_miss_count", "selected_ub_device", "clock_mhz",
+    "completion_poll_mode", "profile_version",
 )
 STAGES = {
     "batch_get_kernel_total": "",
@@ -32,7 +33,20 @@ STAGES = {
 OPTIONAL_STAGES = {
     "batch_get_kernel_first_doorbell": "first_doorbell_",
     "batch_get_kernel_transfer_window": "transfer_window_",
+    "batch_get_kernel_setup": "setup_",
+    "batch_get_kernel_finalize": "finalize_",
 }
+SCHEDULE_METRICS = ("small_post_groups_per_call", "fused_groups_per_call", "wqe_build_calls_per_call")
+JETTY_METRICS = (
+    "active_samples", "reads_per_call", "posts_per_call", "completions_per_call",
+    "payload_bytes_per_call", "polls_per_call", "probe_active_us_mean",
+    "first_doorbell_offset_us_mean", "last_doorbell_offset_us_mean",
+    "first_cqe_seen_offset_us_mean", "last_cqe_seen_offset_us_mean",
+    "first_db_to_last_cqe_us_mean", "first_db_to_last_cqe_us_p50", "first_db_to_last_cqe_us_p99",
+    "last_db_to_last_cqe_us_mean", "last_db_to_last_cqe_us_p50", "last_db_to_last_cqe_us_p99",
+)
+SCHEDULE_FIELDS = ("small_post_max_requests", "post_width_min", "post_width_max",
+                   "small_post_active_samples") + SCHEDULE_METRICS
 STATS = ("mean", "p50", "p90", "p99")
 RUN_METRICS = tuple(prefix + stat + "_us"
                     for prefix in (*STAGES.values(), *OPTIONAL_STAGES.values())
@@ -43,11 +57,13 @@ PAIR_METRICS = (
     "posts_per_call", "completions_per_call",
     "first_doorbell_p50_us", "first_doorbell_p99_us",
     "transfer_window_p50_us", "transfer_window_p99_us",
-)
+    "setup_p50_us", "finalize_p50_us",
+) + SCHEDULE_METRICS
 DELTA_FIELDS = (
     "p50_speedup", "p50_latency_reduction_pct", "p99_latency_reduction_pct",
     "p50_bandwidth_gain_pct", "post_p50_change_us", "completion_wait_p50_change_us",
     "first_doorbell_p50_change_us", "transfer_window_p50_change_us",
+    "setup_p50_change_us", "finalize_p50_change_us",
 )
 PAIR_VALUES = tuple(
     variant + "_" + metric
@@ -106,9 +122,13 @@ def _parse_run(path: Path) -> dict:
         if line.startswith(("[KVAF_AIV] UB_DEVICE_SELECTED ", "[KVAF_AIV] UB_DEVICE_REUSED ")):
             selected_device = fields(line)["ub_device"]
     row = {name: config[name] for name in CONFIG_FIELDS
-           if name not in ("selected_ub_device", "clock_mhz")}
+           if name not in ("selected_ub_device", "clock_mhz", "completion_poll_mode", "profile_version")}
     row.update(round=int(match[1]), variant=match[3], clock_mhz=clock,
-               selected_ub_device=selected_device, log_file=str(path.resolve()))
+               selected_ub_device=selected_device, log_file=str(path.resolve()),
+               completion_poll_mode=contract.get("completion_poll_mode", "serial"),
+               profile_version=contract.get("profile_version", "0"))
+    if row["completion_poll_mode"] not in ("serial", "round_robin"):
+        raise ValueError("unknown completion polling mode")
 
     results = {}
     for line in lines:
@@ -148,6 +168,61 @@ def _parse_run(path: Path) -> dict:
         raise ValueError("per-core active request sum differs from miss_count")
     row["posts_per_call"] = sum(number(core["total_posts_mean"]) for core in cores)
     row["completions_per_call"] = sum(number(core["completion_count_mean"]) for core in cores)
+    schedules = [fields(line) for line in lines if line.startswith("KERNEL_PROFILE_SCHEDULE ")]
+    jettys = [fields(line) for line in lines if line.startswith("KERNEL_PROFILE_JETTY ")]
+    row["_jettys"] = []
+    row.update({name: "" for name in SCHEDULE_METRICS})
+    if schedules or jettys or int(contract.get("profile_version", 0)) >= 3:
+        core_count, jetty_count = int(config["aiv_cores"]), int(config["jettys_per_core"])
+        if sorted(int(s["core"]) for s in schedules) != list(range(core_count)):
+            raise ValueError("incomplete or duplicate scheduling proof")
+        if sorted((int(j["core"]), int(j["jetty"])) for j in jettys) != [
+                (c, j) for c in range(core_count) for j in range(jetty_count)]:
+            raise ValueError("incomplete or duplicate per-Jetty profile")
+        for name in SCHEDULE_METRICS:
+            row[name] = sum(number(s[name]) for s in schedules)
+        for core in cores:
+            core_id = int(core["core"])
+            schedule = next(s for s in schedules if int(s["core"]) == core_id)
+            if int(schedule["samples"]) != int(config["iterations"]):
+                raise ValueError("scheduling proof sample count mismatch")
+            for name in SCHEDULE_FIELDS:
+                number(schedule[name])
+            if not 1 <= int(schedule["post_width_min"]) <= int(schedule["post_width_max"]) <= 128:
+                raise ValueError("invalid selected post width")
+            traces = [j for j in jettys if int(j["core"]) == core_id]
+            for metric, core_metric in (("reads_per_call", "active_requests_mean"),
+                                        ("posts_per_call", "total_posts_mean"),
+                                        ("completions_per_call", "completion_count_mean")):
+                if not math.isclose(sum(number(j[metric]) for j in traces), number(core[core_metric]),
+                                    rel_tol=0, abs_tol=1e-4):
+                    raise ValueError(f"per-Jetty {metric} differs from core counters")
+            for trace in traces:
+                if (int(trace["samples"]) != int(config["iterations"]) or
+                        trace["completion_poll_mode"] != row["completion_poll_mode"]):
+                    raise ValueError("per-Jetty sample count or polling mode mismatch")
+                record = dict(core=core_id, jetty=int(trace["jetty"]))
+                record.update({name: number(schedule[name]) for name in SCHEDULE_FIELDS})
+                record.update({name: "" if trace[name] == "n/a" and "_us_" in name
+                               else number(trace[name])
+                               for name in JETTY_METRICS})
+                active = record["active_samples"]
+                if active != int(active) or not 0 <= active <= int(config["iterations"]):
+                    raise ValueError("invalid per-Jetty active sample count")
+                if (active == 0) != (record["reads_per_call"] == 0):
+                    raise ValueError("per-Jetty active samples differ from READ count")
+                timing = [name for name in JETTY_METRICS if "_us_" in name
+                          and name != "probe_active_us_mean"]
+                if any((record[name] == "") != (active == 0) for name in timing):
+                    raise ValueError("missing active or populated idle per-Jetty timing")
+                probe_available = active > 0 and row["completion_poll_mode"] == "round_robin"
+                if (record["probe_active_us_mean"] != "") != probe_available:
+                    raise ValueError("per-Jetty probe timing differs from polling mode")
+                if not math.isclose(record["payload_bytes_per_call"],
+                                    record["reads_per_call"] * int(config["token_bytes"]),
+                                    rel_tol=0, abs_tol=1e-4):
+                    raise ValueError("per-Jetty payload differs from READ count")
+                row["_jettys"].append(record)
     return row
 
 
@@ -217,8 +292,8 @@ def write_csv(path: Path, rows: list[dict], columns: tuple[str, ...]) -> None:
         writer = csv.DictWriter(stream, fieldnames=columns)
         writer.writeheader()
         for row in rows:
-            writer.writerow({key: f"{value:.6f}" if isinstance(value, float) else value
-                             for key, value in row.items()})
+            writer.writerow({key: f"{row[key]:.6f}" if isinstance(row[key], float) else row[key]
+                             for key in columns})
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -235,17 +310,21 @@ def main(argv: list[str] | None = None) -> int:
         runs = [parse_run(path) for path in paths]
         runs.sort(key=lambda row: (row["round"], *(int(row[name]) for name in SHAPE_FIELDS), row["variant"]))
         pairs, summary = compare_runs(runs)
+        jettys = [{**{key: run[key] for key in ("round", "variant") + CONFIG_FIELDS}, **trace}
+                  for run in runs for trace in run["_jettys"]]
         output = args.output_dir or args.log_dir
         output.mkdir(parents=True, exist_ok=True)
         outputs = (
             ("small_post_runs.csv", runs,
              ("round", "variant") + CONFIG_FIELDS + ("payload_bytes",) + RUN_METRICS +
-             ("p50_GBps", "posts_per_call", "completions_per_call", "log_file")),
+             ("p50_GBps", "posts_per_call", "completions_per_call") + SCHEDULE_METRICS + ("log_file",)),
             ("small_post_pairs.csv", pairs,
              ("round",) + CONFIG_FIELDS + PAIR_VALUES + ("baseline_log", "small_post_log")),
             ("small_post_summary.csv", summary,
-             CONFIG_FIELDS + ("rounds", "round_ids", "first_doorbell_rounds", "transfer_window_rounds") +
+             CONFIG_FIELDS + ("rounds", "round_ids") + tuple(prefix + "rounds" for prefix in OPTIONAL_STAGES.values()) +
              tuple("median_" + name for name in PAIR_VALUES)),
+            ("small_post_jettys.csv", jettys,
+             ("round", "variant") + CONFIG_FIELDS + ("core", "jetty") + SCHEDULE_FIELDS + JETTY_METRICS),
         )
         # Validate every log and pair before creating any result CSV.
         for filename, rows, columns in outputs:

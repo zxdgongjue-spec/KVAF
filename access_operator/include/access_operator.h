@@ -75,6 +75,7 @@ struct BatchGetKernelProfile {
   std::uint64_t kernel_finish_cycle{0};
   std::uint64_t active_requests{0};
   std::uint64_t total_posts{0};
+  // The serial residual-wait array is unavailable (zeroed) in timeline mode.
   std::array<std::uint64_t, 64> jetty_completion_wait_cycles{};
   std::array<std::uint64_t, 64> jetty_completion_polls{};
   std::uint64_t submitted_group_count{0};
@@ -83,6 +84,24 @@ struct BatchGetKernelProfile {
   std::uint64_t post_active_cycles{0};
   std::uint64_t drain_wait_cycles{0};
   std::uint64_t peak_submitted_not_drained{0};
+  std::uint64_t small_post_max_requests{0};
+  std::uint64_t selected_post_width{0};
+  std::uint64_t small_post_group_count{0};
+  std::uint64_t fused_group_count{0};
+  std::uint64_t wqe_build_calls{0};
+  bool jetty_timeline_enabled{false};
+  std::uint64_t profile_version{0};
+  struct JettyProfile {
+    std::uint64_t submitted_reads{0};
+    std::uint64_t submitted_posts{0};
+    std::uint64_t completed_checkpoints{0};
+    std::uint64_t first_doorbell_cycle{0};
+    std::uint64_t last_doorbell_cycle{0};
+    std::uint64_t first_cqe_seen_cycle{0};
+    std::uint64_t last_cqe_seen_cycle{0};
+    std::uint64_t probe_active_cycles{0};
+  };
+  std::array<JettyProfile, 64> jettys{};
 };
 
 // Default synchronous NPU data-plane implementation.
@@ -112,7 +131,9 @@ class DefaultAccessOperator final : public AccessOperator {
 
   // Profiling is opt-in and uses the reserved per-core status area. Callers
   // must complete the BatchGet stream before copying the latest snapshot.
-  Status SetBatchGetKernelProfiling(bool enabled);
+  // jetty_timeline enables diagnostic round-robin CQ observation; its probe
+  // costs and observation times are separate from serial residual waits.
+  Status SetBatchGetKernelProfiling(bool enabled, bool jetty_timeline = false);
   Status CopyBatchGetKernelProfiles(
       std::vector<BatchGetKernelProfile>* profiles) const;
 

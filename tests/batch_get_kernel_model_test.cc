@@ -27,12 +27,13 @@ struct Queue {
   uint64_t producer = 0, completed = 0, cq_producer = 0, cq_consumer = 0;
   std::deque<uint64_t> checkpoints;
   bool timeout = false, error = false;
+  uint32_t defer_polls = 0;
   uint32_t tp_id = 0, remote_token_id = 0, remote_token_value = 0, local_token_id = 0;
   std::array<uint32_t, 4> remote_eid{};
 };
 std::vector<Queue> hardware;
 uint64_t doorbells = 0;
-enum class EventKind { kVector, kSqCopy, kSqDoorbell };
+enum class EventKind { kVector, kSqCopy, kSqDoorbell, kCqProbe };
 struct Event { EventKind kind; uint32_t queue; };
 std::vector<Event> trace;
 
@@ -98,6 +99,9 @@ void Poll(void* address) {
   for (auto& queue : hardware) {
     const auto begin = reinterpret_cast<uintptr_t>(queue.cq.data());
     if (probe < begin || probe >= begin + sizeof(queue.cq)) continue;
+    trace.push_back({EventKind::kCqProbe,
+                     static_cast<uint32_t>(&queue - hardware.data())});
+    if (queue.defer_polls != 0) { --queue.defer_polls; return; }
     // Deliver a checkpoint only when polled. This forces the initial two
     // groups to coexist and leaves the younger group outstanding during refill.
     if (queue.timeout || queue.checkpoints.empty() ||
@@ -201,17 +205,44 @@ struct Fixture {
     misses = count;
     std::fill(output.begin(), output.end(), 0);
     uint64_t cq_before = 0, cq_after = 0, profile_cq = 0;
-    const bool profiling = statuses[0].profile.magic == KVAF_AIV_BATCH_GET_PROFILE_MAGIC;
+    const bool profiling = statuses[0].profile.magic == KVAF_AIV_BATCH_GET_PROFILE_MAGIC ||
+        statuses[0].profile.magic == KVAF_AIV_BATCH_GET_JETTY_TIMELINE_MAGIC;
     const auto before = queues;
     for (const auto& queue : queues) cq_before += queue.cq_consumer_index;
     for (uint32_t c = 0; c < cores; ++c) {
       aiv_model::core = c;
       const uint64_t doorbells_before = aiv_model::doorbells;
-      KvafExecuteBatchGetAivKernelV2(args);
+      KvafExecuteBatchGetAivKernelV3(args);
       CHECK(statuses[c].result == expected);
       if (expected || !profiling) continue;
       const auto& profile = statuses[c].profile;
       CHECK(profile.total_posts == aiv_model::doorbells - doorbells_before);
+      CHECK(profile.profile_version == 3);
+      CHECK(profile.small_post_max_requests == kvaf_batch_get::kSmallPostMaxRequests);
+      uint64_t read_sum = 0, post_sum = 0, checkpoint_sum = 0;
+      for (uint32_t j = 0; j < KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE; ++j) {
+        const auto& trace = profile.jettys[j];
+        read_sum += trace.submitted_reads;
+        post_sum += trace.submitted_posts;
+        checkpoint_sum += trace.completed_checkpoints;
+        if (j < jettys) {
+          CHECK(trace.submitted_reads == queues[c * jettys + j].sq_producer_index -
+                before[c * jettys + j].sq_producer_index);
+        }
+        if (trace.submitted_reads == 0) {
+          CHECK(trace.first_doorbell_cycle == 0 && trace.last_cqe_seen_cycle == 0);
+          CHECK(trace.submitted_posts == 0 && trace.completed_checkpoints == 0);
+        } else {
+          CHECK(trace.first_doorbell_cycle >= profile.kernel_start_cycle);
+          CHECK(trace.first_doorbell_cycle <= trace.last_doorbell_cycle);
+          CHECK(trace.last_doorbell_cycle <= trace.last_cqe_seen_cycle);
+          CHECK(trace.first_cqe_seen_cycle <= trace.last_cqe_seen_cycle);
+          CHECK(trace.last_cqe_seen_cycle <= profile.completion_done_cycle);
+        }
+      }
+      CHECK(read_sum == profile.active_requests);
+      CHECK(post_sum == profile.total_posts);
+      CHECK(checkpoint_sum == profile.completion_count);
       CHECK(profile.submitted_group_count == profile.completed_group_count);
       CHECK(profile.kernel_start_cycle <= profile.setup_done_cycle);
       CHECK(profile.setup_done_cycle <= profile.post_done_cycle);
@@ -264,6 +295,9 @@ int main() {
     for (uint32_t c = 0; c < 2; ++c) {
       CHECK(f.statuses[c].profile.total_posts == (small_posts ? 2 : 1));
       CHECK(f.statuses[c].profile.completion_count == (small_posts ? 2 : 1));
+      CHECK(f.statuses[c].profile.small_post_group_count == (small_posts ? 1 : 0));
+      CHECK(f.statuses[c].profile.fused_group_count == (small_posts ? 1 : 0));
+      CHECK(f.statuses[c].profile.wqe_build_calls == 1);
       CHECK(f.queues[c * 2].sq_producer_index == (small_posts ? 8 : 16));
       CHECK(f.queues[c * 2 + 1].sq_producer_index == (small_posts ? 8 : 0));
     }
@@ -371,6 +405,36 @@ int main() {
     CHECK(f.statuses[0].profile.completed_group_count == 0);
     const uint64_t before = aiv_model::doorbells;
     f.Run(8193, kInvalidQueue);
+    CHECK(aiv_model::doorbells == before);
+  }
+  {
+    Fixture f(512, 1, 2, 2048);
+    f.statuses[0].profile.magic = KVAF_AIV_BATCH_GET_JETTY_TIMELINE_MAGIC;
+    aiv_model::hardware[0].defer_polls = 8;
+    f.Run(512);
+    const auto& p = f.statuses[0].profile;
+    CHECK(p.jetty_timeline_enabled == 1);
+    CHECK(p.jettys[0].submitted_reads == 256 && p.jettys[1].submitted_reads == 256);
+    CHECK(p.jettys[1].first_cqe_seen_cycle < p.jettys[0].first_cqe_seen_cycle);
+    CHECK(p.jettys[0].probe_active_cycles > 0 && p.jettys[1].probe_active_cycles > 0);
+    CHECK(p.jetty_completion_wait_cycles[0] == 0);
+    CHECK(p.fused_group_count == 0 && p.wqe_build_calls == 4);
+    f.Run(0);  // no timestamps/counters leak from the previous replay
+  }
+  {
+    Fixture f(513, 2, 2, 4);
+    for (auto& status : f.statuses) status.profile.magic = KVAF_AIV_BATCH_GET_JETTY_TIMELINE_MAGIC;
+    for (uint32_t n : {32U, 33U, 256U, 257U, 513U, 0U}) f.Run(n);
+  }
+  for (bool timeout : {false, true}) {
+    Fixture f(512, 1, 2, 2048);
+    f.statuses[0].profile.magic = KVAF_AIV_BATCH_GET_JETTY_TIMELINE_MAGIC;
+    aiv_model::hardware[1].timeout = timeout;
+    aiv_model::hardware[1].error = !timeout;
+    f.Run(512, timeout ? kCqTimeout : kCqError);
+    CHECK(f.queues[0].poisoned && f.queues[1].poisoned);
+    const auto before = aiv_model::doorbells;
+    f.Run(512, kInvalidQueue);
     CHECK(aiv_model::doorbells == before);
   }
   std::cout << "BatchGet kernel CPU model: small-post cutoff="

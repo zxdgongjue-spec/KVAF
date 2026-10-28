@@ -833,12 +833,12 @@ std::uint32_t NpuRuntime::batch_get_tokens_per_block() const {
   return impl_->options.batch_get_tokens_per_block;
 }
 
-Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled) {
+Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled, bool jetty_timeline) {
   if (impl_->access_operator == nullptr) {
     return Status::NotInitialized(
         "NpuRuntime requires LinkTo before configuring BatchGet profiling");
   }
-  return impl_->access_operator->SetBatchGetKernelProfiling(enabled);
+  return impl_->access_operator->SetBatchGetKernelProfiling(enabled, jetty_timeline);
 }
 
 Status NpuRuntime::CopyBatchGetKernelProfiles(

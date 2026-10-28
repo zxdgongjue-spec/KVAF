@@ -88,7 +88,7 @@ void CheckLaunch(uint32_t misses, uint32_t cores, uint32_t jettys,
 int main() {
   static_assert(offsetof(KvafExecuteBatchGetKernelArgs,
                         batch_get_max_inflight_total) == 108);
-  static_assert(sizeof(KvafBatchGetCoreStatus) == 1216);
+  static_assert(sizeof(KvafBatchGetCoreStatus) == 5376);
   Schedule tail{{}, 0, 2049, 2048, 16, 0, 0, 0};
   std::string trace;
   std::vector<Group> groups;

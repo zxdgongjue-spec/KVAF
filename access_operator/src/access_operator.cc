@@ -532,7 +532,8 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   return Status::OK();
 }
 
-Status DefaultAccessOperator::SetBatchGetKernelProfiling(bool enabled) {
+Status DefaultAccessOperator::SetBatchGetKernelProfiling(bool enabled,
+                                                        bool jetty_timeline) {
   if (!impl_->initialized || impl_->execution.status == nullptr) {
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
@@ -541,7 +542,8 @@ Status DefaultAccessOperator::SetBatchGetKernelProfiling(bool enabled) {
       impl_->config.npu_core_count);
   if (enabled) {
     for (KvafBatchGetCoreStatus& status : statuses) {
-      status.profile.magic = KVAF_AIV_BATCH_GET_PROFILE_MAGIC;
+      status.profile.magic = jetty_timeline ? KVAF_AIV_BATCH_GET_JETTY_TIMELINE_MAGIC
+                                           : KVAF_AIV_BATCH_GET_PROFILE_MAGIC;
     }
   }
   if (aclrtMemcpy(impl_->execution.status, impl_->execution.status_bytes,
@@ -582,7 +584,11 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
          source.first_doorbell_cycle != 0U);
     if (status.magic != KVAF_AIV_BATCH_GET_STATUS_MAGIC ||
         status.result != 0U ||
-        source.magic != KVAF_AIV_BATCH_GET_PROFILE_MAGIC ||
+        (source.magic != KVAF_AIV_BATCH_GET_PROFILE_MAGIC &&
+         source.magic != KVAF_AIV_BATCH_GET_JETTY_TIMELINE_MAGIC) ||
+        source.profile_version != 3U ||
+        source.jetty_timeline_enabled !=
+            (source.magic == KVAF_AIV_BATCH_GET_JETTY_TIMELINE_MAGIC) ||
         source.kernel_start_cycle > source.setup_done_cycle ||
         source.setup_done_cycle > source.compact_done_cycle ||
         source.compact_done_cycle > source.post_done_cycle ||
@@ -608,12 +614,56 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
     destination.post_active_cycles = source.post_active_cycles;
     destination.drain_wait_cycles = source.drain_wait_cycles;
     destination.peak_submitted_not_drained = source.peak_submitted_not_drained;
+    destination.small_post_max_requests = source.small_post_max_requests;
+    destination.selected_post_width = source.selected_post_width;
+    destination.small_post_group_count = source.small_post_group_count;
+    destination.fused_group_count = source.fused_group_count;
+    destination.wqe_build_calls = source.wqe_build_calls;
+    destination.jetty_timeline_enabled = source.jetty_timeline_enabled != 0;
+    destination.profile_version = source.profile_version;
+    std::uint64_t reads = 0, posts = 0, checkpoints = 0;
     for (std::size_t jetty = 0;
          jetty < destination.jetty_completion_wait_cycles.size(); ++jetty) {
       destination.jetty_completion_wait_cycles[jetty] =
           source.jetty_completion_wait_cycles[jetty];
       destination.jetty_completion_polls[jetty] =
           source.jetty_completion_polls[jetty];
+      const auto& trace = source.jettys[jetty];
+      auto& target = destination.jettys[jetty];
+      target.submitted_reads = trace.submitted_reads;
+      target.submitted_posts = trace.submitted_posts;
+      target.completed_checkpoints = trace.completed_checkpoints;
+      target.first_doorbell_cycle = trace.first_doorbell_cycle;
+      target.last_doorbell_cycle = trace.last_doorbell_cycle;
+      target.first_cqe_seen_cycle = trace.first_cqe_seen_cycle;
+      target.last_cqe_seen_cycle = trace.last_cqe_seen_cycle;
+      target.probe_active_cycles = trace.probe_active_cycles;
+      reads += trace.submitted_reads;
+      posts += trace.submitted_posts;
+      checkpoints += trace.completed_checkpoints;
+      const bool idle = trace.submitted_reads == 0;
+      if ((idle && (trace.submitted_posts != 0 || trace.completed_checkpoints != 0 ||
+                    trace.first_doorbell_cycle != 0 || trace.last_doorbell_cycle != 0 ||
+                    trace.first_cqe_seen_cycle != 0 || trace.last_cqe_seen_cycle != 0)) ||
+          (!idle && (trace.submitted_posts == 0 || trace.completed_checkpoints == 0 ||
+                     trace.first_doorbell_cycle < source.kernel_start_cycle ||
+                     trace.first_doorbell_cycle > trace.last_doorbell_cycle ||
+                     trace.last_doorbell_cycle > source.post_done_cycle ||
+                     trace.first_cqe_seen_cycle < trace.first_doorbell_cycle ||
+                     trace.first_cqe_seen_cycle > trace.last_cqe_seen_cycle ||
+                     trace.last_cqe_seen_cycle < trace.last_doorbell_cycle ||
+                     trace.last_cqe_seen_cycle > source.completion_done_cycle))) {
+        profiles->clear();
+        return Internal("BatchGet kernel returned an invalid per-Jetty timeline");
+      }
+    }
+    if (reads != source.active_requests || posts != source.total_posts ||
+        checkpoints != source.completion_count || source.selected_post_width == 0 ||
+        source.selected_post_width > 128 ||
+        source.fused_group_count > source.small_post_group_count ||
+        source.wqe_build_calls > source.total_posts) {
+      profiles->clear();
+      return Internal("BatchGet kernel returned inconsistent scheduling counters");
     }
     profiles->push_back(destination);
   }

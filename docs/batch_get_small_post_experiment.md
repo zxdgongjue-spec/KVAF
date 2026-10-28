@@ -29,8 +29,9 @@ READ；极小或不能整除的请求区间可能无法用满全部 Jetty。
 | 256 | 128 | Jetty0: 128 | Jetty0: 64, Jetty1: 64 |
 | 257 | 128 / 129 | 原有 128 条/post 调度 | 回到相同调度 |
 
-UB 双 bank 容量、128 线程 SIMT 调用、112 字节 Kernel 参数、公开 Runtime /
-Python 接口和在途预算均保持不变。post 数、请求偏移、SQ/CQ 容量检查、
+UB 双 bank 容量、128 线程 SIMT 调用、112 字节 Kernel 参数和在途预算均保持不变。
+逐 Jetty 诊断扩展了 status/profile；Kernel 使用 V3 符号，必须一起重编 host、
+Python binding 和 kernel，不能混用旧构建。post 数、请求偏移、SQ/CQ 容量检查、
 跨组 Jetty 轮转、尾部 CQE 回收和 profile 统一使用实际 `post_width`。
 
 第二版对单核、单组不超过 128 条的拆分请求使用低开销发射路径，且要求
@@ -82,7 +83,7 @@ benchmark 的 CLI 选项。
 
 ```bash
 export KVAF_CPU_SERVICE_ADDR=CPU_IP:28999
-mkdir -p logs/small-post-v2
+mkdir -p logs/small-post-v3-serial
 
 for round in 1 2 3; do
   variants=(baseline small-post)
@@ -99,17 +100,17 @@ for round in 1 2 3; do
         --source-access-pattern random --output-access-pattern contiguous \
         --no-sort-input-indices --seed 20260903 \
         --warmup 20 --iterations 1000 --kernel-profile \
-        > "logs/small-post-v2/r${round}_n${n}_${variant}.log" 2>&1 || exit 1
+        > "logs/small-post-v3-serial/r${round}_n${n}_${variant}.log" 2>&1 || exit 1
     done
   done
 done
 
-python3 tests/diagnostics/summarize_small_post.py logs/small-post-v2
+python3 tests/diagnostics/summarize_small_post.py logs/small-post-v3-serial
 ```
 
 另测 `token_bytes=1024`、每核 Jetty 数为 4，分别使用新的日志目录。
 每核 Jetty 数为 1 时应作为策略不变的对照。
-第二版采用新的日志目录，避免覆盖第一版日志或混合两次实验。
+V3 采用新的日志目录，避免覆盖旧日志或混合不同版本的实验。
 
 先核对 `KERNEL_PROFILE_CORE`：32 条请求、2 核 × 2 Jetty 时，每核
 `total_posts_mean` 和 `completion_count_mean` 应从基线的 1 变成 2，
@@ -130,12 +131,80 @@ python3 tests/diagnostics/summarize_small_post.py logs/small-post-v2
 两个版本的顺序做 A/A，并核对实际 EID/UB 设备及系统负载，再判断发射策略
 收益。1000 次采样不能替代多轮独立运行；均值、P50、P99 应同时观察。
 
+## 验证策略触发与逐 Jetty 完成观测
+
+普通 `--kernel-profile` 新增以下日志，仍采用串行 CQ 等待：
+
+- `KERNEL_PROFILE_SCHEDULE`：由实际运行的 kernel 返回编译上限、选中的
+  `post_width_min/max`、`small_post_active_samples`、`small_post_groups_per_call`、
+  `fused_groups_per_call` 和 `wqe_build_calls_per_call`。
+- `KERNEL_PROFILE_JETTY`：每核、每 Jetty 的实际 `reads_per_call`、
+  `posts_per_call`、`completions_per_call`、payload 和软件时间戳统计。
+  READ/post 计数在对应 SQ doorbell 提交后更新，不只根据策略公式推算。
+
+例如总 32 READ、2 核 × 2 Jetty、上限 256 时，每核应打印：
+
+```text
+KERNEL_PROFILE_SCHEDULE ... small_post_max_requests=256 post_width_min=8 post_width_max=8 small_post_active_samples=1000 small_post_groups_per_call=1.000000 fused_groups_per_call=1.000000 wqe_build_calls_per_call=1.000000
+KERNEL_PROFILE_JETTY ... jetty=0 ... reads_per_call=8.000000 posts_per_call=1.000000 completions_per_call=1.000000 ...
+KERNEL_PROFILE_JETTY ... jetty=1 ... reads_per_call=8.000000 posts_per_call=1.000000 completions_per_call=1.000000 ...
+```
+
+这证明策略触发、请求实际拆到两个 Jetty，并使用一次合并构造。性能收益仍
+需通过整次延迟验证。基线应为每核 Jetty0 16 READ、Jetty1 0 READ，
+`small_post_groups_per_call=0`、`fused_groups_per_call=0`。
+总 1024 READ 时每核 512 READ、128 条/post，两个版本都使用原发射路径，
+`fused_groups_per_call=0`；不要用这组日志验证小 post 是否触发。
+
+为了比较 Jetty 的完成观测时间，在原 benchmark 命令末尾同时添加：
+
+```bash
+--kernel-profile --kernel-profile-jetty-timeline
+```
+
+该开关需要 `--kernel-profile`。在每个 group 回收阶段，它轮流探测所有未完成
+Jetty，且轮换每轮的首个探测对象；每个 Jetty 的最后一个 CQE 都回收成功后
+才归还该 group 的预算。CQ owner/CI、错误处理及队列禁用规则保持一致。
+Python 也可用 `runtime.start_batch_get_kernel_profile(jetty_timeline=True)`。
+
+关注以下以 **us** 为单位、仅对该 Jetty 活跃的样本统计的字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `first_doorbell_offset_us_mean` / `last_doorbell_offset_us_mean` | 本核开始到该 Jetty 首次/最后一次 doorbell 的软件记录点 |
+| `first_cqe_seen_offset_us_mean` / `last_cqe_seen_offset_us_mean` | 本核开始到该 Jetty 首个/最后一个 checkpoint 的 CQE 首次被软件观察到 |
+| `first_db_to_last_cqe_us_mean/p50/p99` | 该 Jetty 本次调用首次发射到最后一个 checkpoint 被观察到 |
+| `last_db_to_last_cqe_us_mean/p50/p99` | 该 Jetty 本次调用最后一次发射到最后一个 checkpoint 被观察到 |
+| `probe_active_us_mean` | round-robin 模式实际执行该 Jetty CQ 探测/回收函数的累计时间，仍不是 Jetty 运行时间 |
+
+READ/post/CQE 数与 `polls_per_call` 则按全部调用求均值。无请求 Jetty 的时间
+打印 `n/a`，CSV 留空。多个 group 时，上述跨度覆盖整次调用，不是每个 group
+的平均 RTT；比较小 post 时先用在途预算内的单 group 样本。
+
+时间戳是软件观察值，不是硬件完成时间。探测在 group 提交完后进行，包含
+排队、后续 posting、CQ 可见性与轮询采样误差。若 CQE 在开始探测前就已就绪，
+无法从这个日志恢复其更早的真实完成时刻。先在同一核内比较 Jetty；跨核
+offset 各自以本核开始为零，不能据此宣称硬件完成时刻一致。
+
+`KERNEL_PROFILE_CONTRACT completion_poll_mode=serial/round_robin` 标明模式。
+串行模式的 `jetty*_wait_ms_mean` 仍是轮到该 Jetty 后的剩余等待时间，不能
+比较执行均衡；round-robin 模式不打印这些字段，使用独立的 probe-active 指标。
+额外探测和计时会改变诊断模式的开销，不能把它自动视为性能优化。
+
+两个版本都要使用相同模式与同一版本的构建。新日志分别写到
+`logs/small-post-v3-serial`、`logs/small-post-v3-timeline`，不要覆盖或混入旧版日志。
+用详细模式确认调度与时序，再关闭详细模式和 profile 评估端到端收益。
+最终 profile 写回位于 `kernel_finish_cycle` 之后，不计入 `kernel_total`，
+但会计入 host 到 stream 完成的耗时；新 contract 显式标记这一点。
+V3 status 为 5376 字节/profile 为 5312 字节，queue state 仍为 64 字节，
+Kernel 参数仍为 112 字节；loader 要求 `KvafExecuteBatchGetAivKernelV3`。
+
 ## CSV 汇总
 
 已有上述循环生成的日志时，无需重跑测试，只需执行：
 
 ```bash
-python3 tests/diagnostics/summarize_small_post.py logs/small-post-v2
+python3 tests/diagnostics/summarize_small_post.py logs/small-post-v3-serial
 ```
 
 脚本只使用 Python 标准库，不需要 CANN、NPU 或 PyTorch。默认在日志目录
@@ -146,6 +215,7 @@ python3 tests/diagnostics/summarize_small_post.py logs/small-post-v2
 | `small_post_runs.csv` | 一次 benchmark：轮次、版本、请求配置、时间、带宽、post/CQE 数及日志路径 |
 | `small_post_pairs.csv` | 同轮、同请求形状的 baseline/small-post 配对结果及提升比例 |
 | `small_post_summary.csv` | 相同完整配置下多轮配对结果的中位数汇总，附实际轮数和轮次列表 |
+| `small_post_jettys.csv` | 每轮、版本、核、Jetty 的实际分配、策略证明和完成观测时间；旧日志仅生成表头 |
 
 脚本递归查找 `r<轮次>_n<请求数>_baseline.log` 和
 `r<轮次>_n<请求数>_small-post.log`。上述 3 轮、8 个请求数的完整实验应得到
@@ -172,6 +242,12 @@ python3 tests/diagnostics/summarize_small_post.py logs/small-post-v2
 相应配对与汇总；`first_doorbell_rounds`、`transfer_window_rounds` 标明
 各指标实际有效的配对轮数。
 
+另外输出 `setup_*_us`、`finalize_*_us` 及相应差值/有效轮数，便于定位小 batch
+固定开销。运行/配对/汇总表还包含实际 small-post/fused group 数及 WQE 构造
+调用数。逐 Jetty 表的时间采用日志中的 us，不从已舍入的毫秒字段恢复。
+不同 profile 版本、串行和 round-robin 模式不能互相配对；脚本检查逐 Jetty READ/post/CQE 合计
+与每核统计一致，并拒绝缺失或重复的 V3 诊断行。
+
 汇总表的 `median_*` 均是各轮对应值的中位数；提升比例先逐轮配对计算，
 再取中位数。`median_baseline_p99_us` 等字段不是合并所有样本后重新计算的
 P99，不能当作合并样本分位数。
@@ -182,7 +258,7 @@ P99，不能当作合并样本分位数。
 `selected_ub_device` 为空表示日志未记录实际设备；两个空值相同不能证明
 两次运行实际走了同一设备。不同轮次的已记录配置不同时，会分组汇总。
 
-CSV 使用 UTF-8 BOM，便于在 Excel 中打开。重复执行会更新这三个 CSV，
+CSV 使用 UTF-8 BOM，便于在 Excel 中打开。重复执行会更新这四个 CSV，
 原始日志保持不变。
 
 ## 本地检查范围
@@ -197,6 +273,8 @@ CSV 使用 UTF-8 BOM，便于在 Excel 中打开。重复执行会更新这三�
 第二版另外记录模拟 SIMT 调用与 SQ copy/doorbell 顺序，检查一次 SIMT
 构造多个 post、首个 doorbell 早于第二段 SQ 拷贝，并验证不同 Jetty 的
 TP/token/EID、独立 SQ head 和跨 owner 边界的 WQE。
+逐 Jetty 诊断用例还覆盖实际 SQ 提交量、inactive/replay 清零、延迟 CQ 时对另一
+Jetty 的探测、窗口组回收及 round-robin 模式下的超时/错误禁用。
 
 CPU 模型不验证 AIV 时序、DMA/cache 可见性、真实硬件保序或 CANN 编译，
 也不能用于给出性能结论。

@@ -34,8 +34,14 @@ Convert existing logs from the small-post experiment without running a benchmark
 python3 tests/diagnostics/summarize_small_post.py logs/small-post
 ```
 
-This creates `small_post_runs.csv`, `small_post_pairs.csv` and
-`small_post_summary.csv`. The exporter uses logged raw cycles and clock MHz,
+This creates `small_post_runs.csv`, `small_post_pairs.csv`,
+`small_post_summary.csv` and `small_post_jettys.csv`. The last file contains
+actual per-Jetty READ/post/CQE counts, compiled scheduling policy and software
+doorbell/CQE observation times from V3 logs (header only for older logs).
+Use `--kernel-profile --kernel-profile-jetty-timeline` for diagnostic round-robin
+CQ observation. Serial and round-robin runs cannot be paired; inactive/unavailable
+Jetty times stay blank. Setup/finalize stages and actual fused/build counts are
+also exported when present. The exporter uses logged raw cycles and clock MHz,
 checks matching baseline/small-post configurations, and rejects incomplete or
 unpaired logs. Summary statistics are medians of round statistics and paired
 speedups, not percentiles of pooled samples. See the
