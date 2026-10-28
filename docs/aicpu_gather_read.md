@@ -91,6 +91,43 @@ runtime.batch_get(addresses, valid, indices, offsets, miss_count, output_indices
 调用方管理这些地址对应的远端数据生命周期。使用 `prepare_access_table` 的调用仍保留公共元数据接口，
 Host 地址表通过整段 H2D 上传；每次 BatchGet 本身不遍历或复制 Host 地址表。
 
+## 测试直接输入 CPU 源地址
+
+给性能扫描加 `--source-mode direct`，AICPU 就直接读取本轮的 `addresses[i]`，
+跳过 `address_table[indices[i]] + offsets[i]`。默认 `--source-mode table` 保留查表方式。
+两种方式使用相同的 100 GiB CPU DDR 总预算、随机源数据和输出行，CPU gather、流水 READ 均相同。
+
+```bash
+./build.sh aicpu-urma --install-kernel
+
+KVAF_AICPU_TOKEN_BYTES="656" \
+KVAF_AICPU_MISS_COUNTS="4096" \
+KVAF_AICPU_WORKERS="1" \
+./tests/run_aicpu_gather_read_sweep.sh build-aicpu-urma \
+  --device-id 7 --peer 127.0.0.1:28888 \
+  --urma-device udmac0d1e5 --eid-index 0 \
+  --source-mode direct --warmup 10 --iterations 100
+```
+
+测试在每轮计时前从地址表生成裸地址，并同步完成；传入 kernel 的是本轮裸地址数组。
+所以这组数据衡量的是**源地址已准备好时**的性能，地址生成成本不在计时中。
+终端和 CSV 增加 `source_mode`；裸地址模式将 `lookup_table_us` 换成 `prepare_request_us`，
+包含填写地址/长度清单和发送前的清单缓存维护，其余阶段口径相同。
+
+实际调用使用 `aicpu_batch_get_mode="gather_read_direct"` 创建 Runtime，再调用已有 Tensor 重载：
+
+```python
+# source_addresses: HBM 中连续的 int64 数组，每项已包含完整 CPU 源地址。
+# 每个有效地址至少可读取 token_bytes 字节；output_indices 指定 HBM 输出行。
+runtime.batch_get(source_addresses, valid, indices, offsets, miss_count,
+                  output_indices, output, stream=stream, synchronize=True)
+```
+
+为复用现有 Python 接口，`valid`、`indices`、`offsets` 仍需满足原来的 Tensor 形状与类型要求，
+但裸地址模式的 AICPU kernel 不读取它们。地址数组容量须覆盖请求数组容量；
+只处理 `miss_count` 指定的有效前缀。调用方可直接提供已有的裸地址，不需要创建全量地址表。
+默认查表模式及 CPU-push 模式的输入含义不变。CPU 服务无需修改，Host 库与设备包需一起更新。
+
 ## 用 Python 检查正确性和比较 worker 数
 
 CPU 服务启动后，在仓库根目录运行：
@@ -219,9 +256,11 @@ CSV 每组配置一行，使用英文表头，时间单位为微秒，阶段列�
 
 | 表头 | 含义 |
 | --- | --- |
+| source_mode | `table` 为查表输入，`direct` 为本轮完整源地址输入 |
 | token_bytes / miss_count / workers | 测试配置 |
 | device_p50_us / p50_GBps | 算子耗时中位数及对应的有效载荷带宽 |
 | lookup_table_us | 按索引和偏移计算 CPU 源地址，填写清单，并在交给 URMA DMA 前清理清单缓存 |
+| prepare_request_us | 裸地址模式下替代 `lookup_table_us`：顺序读取源地址、填写清单并清理清单缓存 |
 | address_send_us | AICPU 将地址/长度清单 WRITE 到 CPU DDR 并等完成 |
 | notify_cpu_us | WRITE 清单指针和请求编号，通知 CPU 开始 gather |
 | read_total_us | 从 staging READ 到输出 HBM 的整个流水阶段 |

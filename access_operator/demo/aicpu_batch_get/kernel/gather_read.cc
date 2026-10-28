@@ -292,7 +292,7 @@ void WaitAck(const GatherReadArgs& args, GatherReadStatus& status) {
 bool BuildCurrentRequest(const UmdkBatchGetArgs& launch, GatherReadArgs& args,
                          std::uint32_t first, std::uint32_t last, BatchGetWorkerProfile* profile) {
   const auto& request = launch.request;
-  if (!request.address_table || !request.indices || !request.offsets || !request.miss_count ||
+  if (!request.address_table || (request.indices && !request.offsets) || !request.miss_count ||
       !request.output_indices || !args.output || !request.token_bytes ||
       request.request_capacity > kGatherMaxSpans)
     return false;
@@ -303,8 +303,12 @@ bool BuildCurrentRequest(const UmdkBatchGetArgs& launch, GatherReadArgs& args,
   // and CPU-push kernels. AICPU only reads them; no per-request cache sweep.
   auto* descriptor = reinterpret_cast<kvaf::peer::GatherDescriptorHeader*>(args.source_descriptor);
   auto* sources = reinterpret_cast<kvaf::peer::GatherSpan*>(descriptor + 1);
-  for (auto i = first; i < last; ++i) {
-    sources[args.source_span_count++] = {addresses[indices[i]] + offsets[i], request.token_bytes, 0U};
+  if (!request.indices) {
+    for (auto i = first; i < last; ++i)
+      sources[args.source_span_count++] = {addresses[i], request.token_bytes, 0U};
+  } else {
+    for (auto i = first; i < last; ++i)
+      sources[args.source_span_count++] = {addresses[indices[i]] + offsets[i], request.token_bytes, 0U};
   }
   const auto bytes = static_cast<std::uint64_t>(args.source_span_count) * request.token_bytes;
   if (bytes > UINT32_MAX) return false;

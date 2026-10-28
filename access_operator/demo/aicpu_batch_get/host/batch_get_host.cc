@@ -15,9 +15,11 @@ using kvaf::detail::PointerValue;
 
 }  // namespace
 struct BatchGetTransport::Impl {
-  Impl(UmdkSession& shared, std::uint32_t token) : session(shared), token_bytes(token) {}
+  Impl(UmdkSession& shared, std::uint32_t token, bool direct)
+      : session(shared), token_bytes(token), direct_addresses(direct) {}
   UmdkSession& session;
   std::uint32_t token_bytes;
+  bool direct_addresses;
   RemoteRegionDesc region;
   BatchGetExecutionState execution;
   void* workspace{nullptr};
@@ -34,8 +36,9 @@ struct BatchGetTransport::Impl {
     return Status::OK();
   }
 };
-BatchGetTransport::BatchGetTransport(UmdkSession& session, std::uint32_t token_bytes)
-    : impl_(std::make_unique<Impl>(session, token_bytes)) {}
+BatchGetTransport::BatchGetTransport(UmdkSession& session, std::uint32_t token_bytes,
+                                     bool direct_addresses)
+    : impl_(std::make_unique<Impl>(session, token_bytes, direct_addresses)) {}
 BatchGetTransport::~BatchGetTransport() = default;
 Status BatchGetTransport::Drain() { return impl_->Drain(); }
 Status BatchGetTransport::Initialize(const RemoteRegionDesc& region) {
@@ -97,6 +100,13 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
   if (launch.request.request_capacity > kGatherMaxRequests ||
       launch.request.token_bytes != impl_->token_bytes)
     return InvalidArgument("UMDK BatchGet exceeds 65536 requests or configured token size");
+  if (impl_->direct_addresses) {
+    if (exec.request->access_table.opaque != 0U)
+      return InvalidArgument("gather_read_direct requires the addresses Tensor overload");
+    if (launch.request.table_capacity < launch.request.request_capacity)
+      return InvalidArgument("direct addresses must cover the request capacity");
+    launch.request.indices = launch.request.offsets = 0U;
+  }
   auto ensure = [&](void* buffer, std::size_t bytes) {
     return impl_->session.Ensure(impl_->region.base, buffer, bytes);
   };
