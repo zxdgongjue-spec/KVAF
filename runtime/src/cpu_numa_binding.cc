@@ -118,44 +118,16 @@ Status Resolve(const std::string& device, std::optional<int> requested_node, Bin
     nodes.push_back(std::move(node));
   }
 
-  // UMDK uses ubcore, with uburma as its legacy class path. Prefer a driver
-  // locality hint; cN is the deployed udmac naming convention when absent.
-  for (const char* class_name : {"ubcore", "uburma"}) {
-    for (const char* attribute : {"device/numa_node", "numa_node"}) {
-      int local_node = -1;
-      const auto path = std::string("/sys/class/") + class_name + "/" + device + "/" + attribute;
-      std::ifstream input(path);
-      if (!input) {
-        if (errno == ENOENT || errno == ENOTDIR) continue;
-        return Status::Internal("cannot read device NUMA hint: " + path);
-      }
-      std::string hint;
-      input >> hint;
-      if (hint == "-1") continue;  // The driver explicitly reports unknown locality.
-      if (!Number(hint, &local_node))
-        return Status::InvalidArgument("invalid device NUMA hint: " + path);
-      const auto found = std::find_if(nodes.begin(), nodes.end(),
-                                     [local_node](const Node& n) { return n.id == local_node; });
-      if (found == nodes.end() || found->package < 0)
-        return Status::NotFound("cannot resolve device NUMA node to CPU package: " + path);
-      binding.package = found->package;
-      binding.node = local_node;
-      binding.source = path;
-      break;
-    }
-    if (binding.package >= 0) break;
-  }
-  if (binding.package < 0) {
-    // The name has already been selected from UMDK's device list. Only its c
-    // component is needed; d/e describe the device rather than the CPU package.
-    if (device.compare(0, 5, "udmac") != 0)
-      return Status::NotFound("no device NUMA hint or udmac name: " + device);
-    const char* end = device.data() + device.size();
-    const auto parsed = std::from_chars(device.data() + 5, end, binding.package);
-    if (parsed.ec != std::errc{} || parsed.ptr == end || *parsed.ptr != 'd' || binding.package < 0)
-      return Status::InvalidArgument("cannot read CPU package from device name: " + device);
-    binding.source = "device_name_c_package";
-  }
+  // On the deployed udmac devices, cN identifies Linux CPU package N.
+  // The UB device/numa attribute is a firmware proximity domain (PXM), so it
+  // must not be used directly as a Linux node ID.
+  if (device.compare(0, 5, "udmac") != 0)
+    return Status::NotFound("cannot resolve CPU package from device name: " + device);
+  const char* end = device.data() + device.size();
+  const auto parsed = std::from_chars(device.data() + 5, end, binding.package);
+  if (parsed.ec != std::errc{} || parsed.ptr == end || *parsed.ptr != 'd' || binding.package < 0)
+    return Status::InvalidArgument("cannot read CPU package from device name: " + device);
+  binding.source = "device_name_c_package";
   for (const auto& node : nodes) {
     if (node.package != binding.package) continue;
     if (Contains(memory_nodes, node.id)) binding.nodes.push_back(node.id);
@@ -210,10 +182,10 @@ Status Allocate(Binding& binding, std::size_t bytes, bool huge_pages,
   }
   if (nodes.empty())
     return Status::InvalidArgument("target NUMA nodes are not allowed by cpuset");
-  // Prefer the driver's node hint. With only package locality available, use
-  // the lowest allowed local node for a deterministic starting point. Linux's
-  // zonelist orders fallback nodes by topology; MPOL_BIND disables fallback.
-  if (!Contains(nodes, binding.node)) binding.node = nodes.front();
+  // Select a deterministic preferred node within the device's package. With
+  // an explicit node, this list has exactly that one entry. The kernel handles
+  // preferred-node fallback; MPOL_BIND disables it.
+  binding.node = nodes.front();
   selected_nodes[binding.node / word_bits] |= 1UL << (binding.node % word_bits);
 
   const long page_size_result = sysconf(_SC_PAGESIZE);
