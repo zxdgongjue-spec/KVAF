@@ -26,6 +26,9 @@ add_test(NAME kvaf_batch_get_small_post_kernel_model_test
 add_test(NAME kvaf_batch_get_inflight_config_python
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_inflight_config.py")
+add_test(NAME kvaf_batch_get_small_post_csv_python
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/diagnostics/test_small_post_csv.py")
 
 add_test(
   NAME kvaf_npu_eid_parser_python

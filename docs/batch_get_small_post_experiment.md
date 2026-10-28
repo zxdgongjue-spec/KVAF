@@ -84,6 +84,8 @@ for round in 1 2 3; do
     done
   done
 done
+
+python3 tests/diagnostics/summarize_small_post.py logs/small-post
 ```
 
 另测 `token_bytes=1024`、每核 Jetty 数为 4，分别使用新的日志目录。
@@ -100,6 +102,54 @@ done
 阶段统计不能直接相加减；传输会与 posting 重叠。
 
 选出配置后可关闭 profile，另测端到端耗时，以评估采样本身的影响。
+
+## CSV 汇总
+
+已有上述循环生成的日志时，无需重跑测试，只需执行：
+
+```bash
+python3 tests/diagnostics/summarize_small_post.py logs/small-post
+```
+
+脚本只使用 Python 标准库，不需要 CANN、NPU 或 PyTorch。默认在日志目录
+生成以下文件，也可通过 `--output-dir reports/small-post` 指定输出目录：
+
+| 文件 | 每行含义 |
+| --- | --- |
+| `small_post_runs.csv` | 一次 benchmark：轮次、版本、请求配置、时间、带宽、post/CQE 数及日志路径 |
+| `small_post_pairs.csv` | 同轮、同请求形状的 baseline/small-post 配对结果及提升比例 |
+| `small_post_summary.csv` | 相同完整配置下多轮配对结果的中位数汇总，附实际轮数和轮次列表 |
+
+脚本递归查找 `r<轮次>_n<请求数>_baseline.log` 和
+`r<轮次>_n<请求数>_small-post.log`。上述 3 轮、8 个请求数的完整实验应得到
+48 行运行结果、24 行配对结果；完整配置固定时为 8 行汇总结果。
+每核 Jetty 数、token 大小等不同的实验仍建议放在不同日志目录，避免覆盖
+相同轮次/请求数的文件名。
+
+各核时间使用日志中的 `*_cycles / clock_mhz` 换算微秒，避免原有三位小数
+毫秒输出的舍入误差。`p50_GBps` 使用十进制 GB/s，公式为
+`miss_count * token_bytes / p50_us / 1000`，不是日志里的 `useful_GiBps`。
+`posts_per_call`、`completions_per_call` 是各核相应均值之和。
+
+配对表中的对比字段：
+
+- `p50_speedup = baseline_p50_us / small_post_p50_us`，大于 1 表示加速。
+- `p50_latency_reduction_pct`、`p99_latency_reduction_pct`：延迟降低百分比，正值表示改善。
+- `p50_bandwidth_gain_pct`：带宽提升百分比，正值表示改善。
+- `post_p50_change_us`、`completion_wait_p50_change_us`：实验减基线的时间差，正值表示该阶段增加开销。
+
+汇总表的 `median_*` 均是各轮对应值的中位数；提升比例先逐轮配对计算，
+再取中位数。`median_baseline_p99_us` 等字段不是合并所有样本后重新计算的
+P99，不能当作合并样本分位数。
+
+脚本在写 CSV 前检查日志完成标记、采样数、profile、重复运行、缺失配对，
+并检查同轮两种版本的访问模式、容量、种子、在途预算、时钟及设备等已记录
+配置是否相同。不完整或不一致会报错，不会静默混合结果。
+`selected_ub_device` 为空表示日志未记录实际设备；两个空值相同不能证明
+两次运行实际走了同一设备。不同轮次的已记录配置不同时，会分组汇总。
+
+CSV 使用 UTF-8 BOM，便于在 Excel 中打开。重复执行会更新这三个 CSV，
+原始日志保持不变。
 
 ## 本地检查范围
 

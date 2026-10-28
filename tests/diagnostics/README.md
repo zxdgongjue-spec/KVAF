@@ -25,3 +25,18 @@ The independent upstream script remains the uninstrumented control.
 
 Validation: python3 -m unittest discover -s tests/diagnostics -p 'test_*.py'.
 Actual device execution must be validated on an NPU.
+
+## Small-post A/B CSV export
+
+Convert existing logs from the small-post experiment without running a benchmark:
+
+```bash
+python3 tests/diagnostics/summarize_small_post.py logs/small-post
+```
+
+This creates `small_post_runs.csv`, `small_post_pairs.csv` and
+`small_post_summary.csv`. The exporter uses logged raw cycles and clock MHz,
+checks matching baseline/small-post configurations, and rejects incomplete or
+unpaired logs. Summary statistics are medians of round statistics and paired
+speedups, not percentiles of pooled samples. See the
+[experiment guide](../../docs/batch_get_small_post_experiment.md#csv-汇总).
