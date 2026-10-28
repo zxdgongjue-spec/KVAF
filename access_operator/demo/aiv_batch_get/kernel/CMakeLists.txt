@@ -3,6 +3,20 @@ set(KVAF_EXECUTE_KERNEL_TMP "${CMAKE_CURRENT_BINARY_DIR}/kvaf_execute_batch_get.
 set(KVAF_EXECUTE_KERNEL_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/kvaf_execute_batch_get_kernels.o")
 set(KVAF_CCEC_DIR "${ASCEND_CANN_PACKAGE_PATH}/tools/ccec_compiler/bin")
 
+if(NOT DEFINED KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS)
+  set(KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS 0)
+endif()
+if(NOT KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS MATCHES "^(0|[1-9][0-9]*)$" OR
+   KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS GREATER 2147483647)
+  message(FATAL_ERROR
+    "KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS must be in [0, INT32_MAX]")
+endif()
+# Also invalidate the custom object with Makefile generators when this cached
+# setting changes; a changed command line alone is not a portable dependency.
+set(KVAF_SMALL_POST_CONFIG "${CMAKE_CURRENT_BINARY_DIR}/small_post_config.txt")
+file(GENERATE OUTPUT "${KVAF_SMALL_POST_CONFIG}"
+  CONTENT "max_requests=${KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS}\n")
+
 find_program(KVAF_CCEC NAMES ccec HINTS "${KVAF_CCEC_DIR}")
 find_program(KVAF_LLD NAMES ld.lld HINTS "${KVAF_CCEC_DIR}")
 if(NOT KVAF_CCEC OR NOT KVAF_LLD)
@@ -62,10 +76,13 @@ add_custom_command(
           --cce-aicore-arch=dav-c310-vec --cce-aicore-input-parameter-size=8192 --cce-aicore-only
           -mllvm -cce-aicore-function-stack-size=0x4000 -mllvm -cce-aicore-stack-size=0x4000
           -mllvm -cce-aicore-record-overflow=false -mllvm -cce-aicore-addr-transform
-          -mllvm -cce-aicore-jump-expand=true -std=c++17 -fstack-protector-all ${KVAF_KERNEL_INCLUDES}
+          -mllvm -cce-aicore-jump-expand=true -std=c++17 -fstack-protector-all
+          -DKVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS=${KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS}
+          ${KVAF_KERNEL_INCLUDES}
   COMMAND "${KVAF_LLD}" -m aicorelinux -Ttext=0 "${KVAF_EXECUTE_KERNEL_TMP}" -static
           -o "${KVAF_EXECUTE_KERNEL_OBJECT}"
   DEPENDS "${KVAF_EXECUTE_KERNEL_SOURCE}"
+          "${KVAF_SMALL_POST_CONFIG}"
           "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_abi.h"
           "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_schedule.h"
           "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"

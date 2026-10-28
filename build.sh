@@ -15,11 +15,16 @@ die() {
 usage() {
   cat <<'EOF'
 Usage: ./build.sh <cpu|npu> [--build-dir DIR] [--jobs N]
+                 [--batch-get-small-post-max-requests N]
 
 cpu  Builds the liburma-only CPU Runtime service. If liburma is not installed,
      it clones and builds the pinned UMDK source beside this repository.
 npu  Builds the CANN AIV BatchGet/BatchPut Runtime and Python binding. It
      installs pybind11 for the selected Python interpreter when necessary.
+
+--batch-get-small-post-max-requests N
+     NPU-only experiment: use smaller posts for at most N READs per BatchGet.
+     0 disables it. If omitted, preserve the CMake cache (new builds default 0).
 
 Environment overrides:
   KVAF_UMDK_ROOT       UMDK source/header root for the CPU build
@@ -157,13 +162,20 @@ build_npu() {
   fi
   pybind11_dir="$($python_bin -m pybind11 --cmakedir)"
 
+  local extra_cmake_options=()
+  if [[ -n "$small_post_max_requests" ]]; then
+    extra_cmake_options+=(
+      "-DKVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS=$small_post_max_requests")
+  fi
+
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
     -DBUILD_TESTING=ON \
     -DKVAF_BUILD_PYTHON=ON \
     -DKVAF_ENABLE_AIV_BATCH_GET=ON \
     -DKVAF_ENABLE_AIV_BATCH_PUT=ON \
     -DASCEND_CANN_PACKAGE_PATH="$cann_root" \
-    -Dpybind11_DIR="$pybind11_dir"
+    -Dpybind11_DIR="$pybind11_dir" \
+    "${extra_cmake_options[@]}"
   cmake --build "$build_dir" --parallel "$jobs"
   echo "[KVAF_BUILD] NPU Python package: $build_dir/python/kvaf"
   echo "[KVAF_BUILD] BatchGet kernel: $build_dir/bin/kvaf_execute_batch_get_kernels.o"
@@ -179,6 +191,7 @@ esac
 
 build_dir="$KVAF_ROOT/build-$mode"
 jobs="$(default_jobs)"
+small_post_max_requests=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --build-dir)
@@ -191,11 +204,20 @@ while [[ $# -gt 0 ]]; do
       jobs="$2"
       shift 2
       ;;
+    --batch-get-small-post-max-requests)
+      [[ $# -ge 2 && "$2" =~ ^(0|[1-9][0-9]*)$ ]] ||
+        die "--batch-get-small-post-max-requests requires a non-negative integer"
+      small_post_max_requests="$2"
+      shift 2
+      ;;
     *) die "unknown argument: $1" ;;
   esac
 done
 
 [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || die "KVAF_BUILD_JOBS must be a positive integer"
+if [[ "$mode" != npu && -n "$small_post_max_requests" ]]; then
+  die "--batch-get-small-post-max-requests is supported only for npu"
+fi
 if [[ "$mode" == cpu ]]; then
   build_cpu "$build_dir" "$jobs"
 else

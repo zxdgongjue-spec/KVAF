@@ -12,6 +12,16 @@ option(KVAF_BUILD_REMOTE_CPU_SERVICE
        "Build the liburma-only persistent CPU DDR/Jetty service"
        OFF)
 
+set(KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS "0" CACHE STRING
+    "Experimental small-post BatchGet request limit; 0 disables the policy")
+if(NOT KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS MATCHES "^(0|[1-9][0-9]*)$" OR
+   KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS GREATER 2147483647)
+  message(FATAL_ERROR
+    "KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS must be in [0, INT32_MAX]")
+endif()
+message(STATUS
+  "BatchGet small-post experiment: max requests=${KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS}")
+
 if(KVAF_ENABLE_AIV_BATCH_PUT AND NOT KVAF_ENABLE_AIV_BATCH_GET)
   message(FATAL_ERROR
     "KVAF_ENABLE_AIV_BATCH_PUT requires KVAF_ENABLE_AIV_BATCH_GET because "

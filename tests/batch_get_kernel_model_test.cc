@@ -162,10 +162,12 @@ struct Fixture {
     for (const auto& queue : queues) cq_before += queue.cq_consumer_index;
     for (uint32_t c = 0; c < cores; ++c) {
       aiv_model::core = c;
+      const uint64_t doorbells_before = aiv_model::doorbells;
       KvafExecuteBatchGetAivKernelV2(args);
       CHECK(statuses[c].result == expected);
       if (expected || !profiling) continue;
       const auto& profile = statuses[c].profile;
+      CHECK(profile.total_posts == aiv_model::doorbells - doorbells_before);
       CHECK(profile.submitted_group_count == profile.completed_group_count);
       CHECK(profile.kernel_start_cycle <= profile.setup_done_cycle);
       CHECK(profile.setup_done_cycle <= profile.post_done_cycle);
@@ -204,6 +206,55 @@ struct Fixture {
 };
 
 int main() {
+  {
+    Fixture f(257, 2, 2, 2048);
+    f.Run(32);
+    const bool small_posts = kvaf_batch_get::kSmallPostMaxRequests >= 32;
+    for (uint32_t c = 0; c < 2; ++c) {
+      CHECK(f.statuses[c].profile.total_posts == (small_posts ? 2 : 1));
+      CHECK(f.statuses[c].profile.completion_count == (small_posts ? 2 : 1));
+      CHECK(f.queues[c * 2].sq_producer_index == (small_posts ? 8 : 16));
+      CHECK(f.queues[c * 2 + 1].sq_producer_index == (small_posts ? 8 : 0));
+    }
+    // Replay on the same queues while changing both the request count and
+    // the selected post width, including the experiment's default cutoff.
+    for (uint32_t count : {0U, 1U, 31U, 33U, 64U, 127U, 128U, 129U,
+                           255U, 256U, 257U, 32U}) f.Run(count);
+  }
+  for (const auto& shape : {std::array<uint32_t, 2>{2, 4}, {3, 3}, {1, 64}}) {
+    Fixture f(513, shape[0], shape[1], 2048);
+    for (uint32_t count : {0U, 1U, 3U, 31U, 32U, 33U, 128U, 255U,
+                           256U, 257U, 512U, 513U}) f.Run(count);
+  }
+  {
+    Fixture f(257, 1, 4, 4);
+    for (uint32_t count : {32U, 33U, 255U, 256U, 257U, 1U, 0U}) f.Run(count);
+  }
+  {
+    Fixture f(257, 2, 2, 2048);
+    for (uint32_t i = 0; i < 4; ++i) {
+      auto& q = f.queues[i];
+      auto& h = aiv_model::hardware[i];
+      q.magic = 0x4b564151U;
+      q.initialized = 1;
+      q.sq_producer_index = h.producer = h.completed = 32764;
+      h.sq_db = 32764;
+      q.cq_consumer_index = h.cq_producer = h.cq_consumer = 7;
+    }
+    for (int replay = 0; replay < 20; ++replay) f.Run(33);
+  }
+  if (kvaf_batch_get::kSmallPostMaxRequests >= 32) {
+    for (bool timeout : {false, true}) {
+      Fixture f(257, 1, 2, 2048);
+      aiv_model::hardware[1].timeout = timeout;
+      aiv_model::hardware[1].error = !timeout;
+      f.Run(32, timeout ? kCqTimeout : kCqError);
+      CHECK(f.queues[0].poisoned && f.queues[1].poisoned);
+      const uint64_t before = aiv_model::doorbells;
+      f.Run(32, kInvalidQueue);
+      CHECK(aiv_model::doorbells == before);
+    }
+  }
   for (const auto& shape : {std::array<uint32_t, 3>{1, 1, 2048}, {1, 16, 2048},
                            {1, 64, 2048}, {4, 4, 2048}, {3, 3, 2049}, {1, 1, 2},
                            {1, 16, 0}}) {
@@ -252,5 +303,7 @@ int main() {
     f.Run(8193, kInvalidQueue);
     CHECK(aiv_model::doorbells == before);
   }
-  std::cout << "BatchGet kernel CPU model: payload, CQ/SQ wrap, tail, replay and faults passed\n";
+  std::cout << "BatchGet kernel CPU model: small-post cutoff="
+            << kvaf_batch_get::kSmallPostMaxRequests
+            << ", payload, CQ/SQ wrap, tail, replay and faults passed\n";
 }
