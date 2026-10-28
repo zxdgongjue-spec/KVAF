@@ -176,6 +176,40 @@ KVAF_CPU_SERVICE_ADDR=CPU_IP:28999 \
 
 加 `--dry-run` 可预览全部命令。`--requests` 默认 8192，须足以覆盖所有 worker；
 核数、Jetty 数、预算改变时请保持共享与不同 EID 两组的其他参数一致。
+
+每组测试保存独立日志，并向日志目录下的 `peer_eid_sweep_summary.csv` 写入一行结果。
+`--output-dir` 与 `--log-dir` 等价；也可通过 `KVAF_PEER_EID_SWEEP_LOG_DIR` 设置目录，
+未指定时使用当前目录下的 `peer_eid_sweep_logs`。`--csv` 或
+`KVAF_PEER_EID_SWEEP_CSV` 可以单独指定 CSV 路径；命令行选项优先于对应环境变量。
+例如：
+
+```bash
+KVAF_CPU_SERVICE_ADDR=CPU_IP:28999 \
+  python3 tests/python/run_peer_eid_sweep.py /absolute/path/to/build-npu \
+  --peer-eids "$CPU_EIDS" --npu-eid "$NPU_EID" \
+  --cores 4 8 --jettys 1 2 4 --iterations 20 \
+  --log-dir /absolute/path/to/peer_eid_results \
+  --csv /absolute/path/to/peer_eid_results/summary.csv
+```
+
+CSV 包含 `shared`/`distinct` 模式、核数、Jetty 数、请求及 block 配置、inflight 预算、
+两端 EID、样本数、时钟频率、状态和对应日志路径。性能字段与 miss-count 扫描采用相同口径：
+
+| 字段 | 含义 |
+| --- | --- |
+| `mean_us`、`p50_us`、`p90_us`、`p99_us` | AIV kernel total 耗时，每个样本取各 core 最大耗时，再统计分位数。 |
+| `p50_GBps` | 请求有效字节数 / kernel p50 耗时，十进制 GB/s。 |
+| `post_*_us`、`completion_wait_*_us` | AIV 发请求、等待完成阶段的耗时。 |
+| `batch_get_*_ms`、`batch_get_useful_GiBps` | 完整 BatchGet 的主机侧耗时，以及按平均耗时计算的有效 GiB/s。 |
+
+AIV 微秒值直接由日志中的 cycles 换算，避免使用已舍入的毫秒值。
+`--kernel-profile-clock-mhz`（或 `KVAF_BATCH_GET_KERNEL_CLOCK_MHZ`）应设置为平台的
+GetSystemCycle 频率，默认 1000 MHz；该值同时传给测试进程并写入 CSV。
+每行立即刷新到文件。子进程失败、正确性标记缺失或性能字段不完整时，写入 `FAIL` 和错误原因，
+保留之前的结果并以非零状态退出；失败行的性能字段留空。所有组完成后输出
+`PEER_EID_SWEEP_CSV_WRITTEN path=... rows=...`。已有日志或 CSV 不会被覆盖；
+重复测试请更换输出目录（若单独指定 CSV，也需更换 CSV 路径）。`--dry-run` 不创建文件。
+
 控制协议已从 v6 升至 v7，即使未配置此功能，也需要同时重编译和更新 CPU/NPU 两端。
 
 现有 `tests/run_remote_cpu_e2e.sh` 与
