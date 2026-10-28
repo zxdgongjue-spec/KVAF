@@ -38,7 +38,7 @@ output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数�
 batch_get_tokens_per_block, device_id=0, npu_core_count=2,
 batch_put_kernel_object_path="", jettys_per_core=2, npu_eids=[],
 adaptive_ub_device=False, adaptive_ub_miss_count=2048, peer_ub_device="",
-adaptive_peer_ub_devices=[], batch_get_max_inflight_total=2048)`
+adaptive_peer_ub_devices=[], batch_get_max_inflight_total=2048, peer_eids_by_core=[])`
 要求显式传入单 token KV
 字节数和每个 KV block 中的 token 数，两个参数均无默认值；
 每个 AccessTable entry 大小为两者乘积。
@@ -54,6 +54,12 @@ Jetty。BatchPut 保持原有实现：该值为 1 或 2 时使用相同数量，
 显式传入多个 32 位十六进制 EID 时，Runtime 为每个 EID 创建独立
 BatchGet 路径，并把 core/Jetty worker 轮转分配到这些路径。BatchPut
 保持原有单 EID 实现，使用列表第一项。该列表是严格配置，不会静默回退。
+`peer_eids_by_core=[A,B,C,D]` 则为 4 个逻辑 core 分别指定 CPU EID，同核所有
+Jetty 使用相同目标。列表长度须等于 `npu_core_count`，可重复 EID 做对照；8 核
+传 8 项。该模式支持一个本地 NPU EID，禁用 adaptive 选优；默认空列表保留原行为。
+CPU 多 EID 共享一块 DDR，初始化会校验所有 worker 的真实 READ。
+用法、2/4/8 核扫描和协议 v7 升级要求见
+[按 core 指定 CPU EID](../runtime/README.md#按-aiv-core-指定-cpu-eid)。
 `batch_put(keys, packed_input, input_offsets, lengths, stream=None)` 接收 caller-owned
 NPU packed input 和每条 block 的 CPU 整数 metadata；同步写入完成后才返回。未传
 BatchPut kernel 时，该方法保留 ACL D2H mock，便于只验证 BatchGet 的构建。

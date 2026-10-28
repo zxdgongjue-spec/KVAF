@@ -101,7 +101,7 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 656B token、128 tokens-per-block、2 个 AIV core、每 core 2 个 Jetty、1 次预热和
 5 次采样所得 `useful_GiBps` 最高者为最佳设备。K 端指定单个 `--ub-device` 时走原生
 路径；后续正式 shape 均复用选择结果。完整校准日志写入 `ub_device_selection.log`，CSV
-的 `selected_ub_device` 列记录设备名。N/K 两端必须同时使用控制协议 v6。
+的 `selected_ub_device` 列记录设备名。N/K 两端必须同时使用控制协议 v7。
 
 ```bash
 KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 \
@@ -116,8 +116,67 @@ KVAF_ADAPTIVE_UB_MISS_COUNT=2048 \
 为每个 EID 建立独立 BatchGet RaCtx、MR import 和 channel，并将
 core/Jetty worker 按 Jetty-major 顺序轮转分配。BatchPut 保持原有单 EID
 实现，使用列表第一项。显式列表不使用 rootinfo/`pair_info` 回退，
-任一 EID 失败即使整组初始化失败。当前这些 NPU 路径仍共享一个已选
+任一 EID 失败即使整组初始化失败。这种多 NPU EID 配置共享一个已选
 CPU EID 和 DDR region。测试脚本可用逗号分隔的 `KVAF_NPU_EIDS` 传入。
+
+### 按 AIV core 指定 CPU EID
+
+`peer_eids_by_core` 为每个逻辑 AIV core（`GetBlockIdx()`）指定一个 CPU EID，
+该 core 的所有 Jetty 均使用这一 EID。支持 2、4、8 核等合法 Runtime 核数，
+非空列表长度必须等于 `npu_core_count`，每项为非零的 32 位十六进制 EID。
+允许重复项，例如 `[A,A,A,A]` 与 `[A,B,C,D]` 可以作为同核数对照。
+
+```python
+runtime = kvaf.NpuRuntime(
+    batch_get_kernel,
+    batch_get_token_bytes=656,
+    batch_get_tokens_per_block=128,
+    batch_put_kernel_object_path=batch_put_kernel,
+    npu_core_count=8,
+    jettys_per_core=2,
+    npu_eids=[npu_eid],
+    peer_eids_by_core=cpu_eids[:8],
+)
+runtime.link_to(cpu_service_address)
+runtime.initialize(ddr_bytes, 656 * 128)
+```
+
+CPU 只分配一块 DDR，按不同 EID 分别注册 segment/token ID；endpoint 0 为列表
+第一项，并供 BatchPut 使用。重复 EID 复用注册。同一个 NPU RaCtx 导入多个远端
+segment，HBM output 仍只在该本地 context 注册一次。每个 worker 的 EID、远端
+token 和 TPN 来自其对应路径；kernel ABI、地址表和执行调度保持不变。
+
+本模式目前要求至多一个显式 `npu_eids`，且 `adaptive_ub_device=False`。
+`npu_eids=[]` 时会寻找能够访问整组 CPU EID 的一个本地 EID。CPU EID 不会被自动
+替换；`peer_ub_device` 若设置，则所有目标必须属于该设备。CPU 服务的
+`--ub-device/--eid-index` 过滤同样有效。不同 CPU device 上的 EID 可以同时使用，
+前提是同一 DDR 的多 context 注册、NPU 导入和连通性均在部署环境可用。
+
+初始化除原有 WRITE 探测外，会通过默认 endpoint 写入两轮不同数据，再通过每核
+每个 Jetty READ 并校验。探测使用一个 slot，要求 `slot_size` 至少为
+`batch_get_token_bytes * batch_get_tokens_per_block`，结束后释放探测 key。
+探测 buffer 因 transport 注册缓存而保留到 shutdown。任一绑定、注册、建链或
+READ 失败会回滚本次初始化。先等待调用方的异步任务结束再 shutdown。
+日志 `PEER_CORE_CANDIDATE`、`CORE_PEER_MAPPING`、`REGION_ENDPOINT_READY` 和
+`CHANNEL_CREATED` 可关联 core、Jetty、两端 EID、CPU device、endpoint、token、TPN。
+`PEER_ENDPOINT_READ_VALIDATED round=1` 表示所有 worker 通过了两轮数据验证。
+
+单组性能测试支持 `--peer-eids-by-core` 或环境变量 `KVAF_PEER_EIDS_BY_CORE`。
+扫描脚本默认运行 2/4/8 核 × 每核 1/2/4 Jetty × 共享/不同 EID，共 18 组；
+固定 NPU EID、请求量、随机种子及总 inflight 预算，日志分别保存且拒绝覆盖旧结果：
+
+```bash
+# CPU_EIDS 为至少 8 个不同 CPU EID，逗号分隔；NPU_EID 为一个本地 EID。
+KVAF_CPU_SERVICE_ADDR=CPU_IP:28999 \
+  python3 tests/python/run_peer_eid_sweep.py /absolute/path/to/build-npu \
+  --peer-eids "$CPU_EIDS" --npu-eid "$NPU_EID" \
+  --cores 2 4 8 --jettys 1 2 4 --max-inflight-total 2048 \
+  --output-dir /absolute/path/to/peer_eid_results
+```
+
+加 `--dry-run` 可预览全部命令。`--requests` 默认 8192，须足以覆盖所有 worker；
+核数、Jetty 数、预算改变时请保持共享与不同 EID 两组的其他参数一致。
+控制协议已从 v6 升至 v7，即使未配置此功能，也需要同时重编译和更新 CPU/NPU 两端。
 
 现有 `tests/run_remote_cpu_e2e.sh` 与
 `tests/run_remote_cpu_runtime_perf.sh` 接受 `KVAF_CPU_SERVICE_ADDR`，但该变量

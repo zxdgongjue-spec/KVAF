@@ -24,6 +24,8 @@
 #include "batch_get_abi.h"
 #include "access_operator.h"
 #include "peer_link.h"
+#include "peer_eid_mapping.h"
+#include "startup_read_probe.h"
 #include "meta_manager.h"
 #include "startup_bandwidth_probe.h"
 #include "startup_selection.h"
@@ -446,6 +448,7 @@ struct NpuRuntime::Impl {
 
   void ReleaseProbe() {
     bandwidth_probe.reset();
+    read_probe.reset();
     if (probe_buffer != nullptr) {
       (void)aclrtFree(probe_buffer);
       probe_buffer = nullptr;
@@ -462,6 +465,7 @@ struct NpuRuntime::Impl {
   std::unique_ptr<RuntimeCore> runtime_core;
   void* probe_buffer{nullptr};
   std::unique_ptr<detail::StartupBandwidthProbe> bandwidth_probe;
+  std::unique_ptr<detail::StartupReadProbe> read_probe;
 };
 
 NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {
@@ -481,6 +485,10 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())))) {
     throw std::invalid_argument("invalid NPU Runtime configuration");
   }
+  const Status mapping_status = detail::ValidatePeerEidsByCore(
+      impl_->options.peer_eids_by_core, impl_->options.npu_core_count,
+      impl_->options.npu_eids.size(), impl_->options.adaptive_ub_device);
+  if (!mapping_status.ok()) throw std::invalid_argument(mapping_status.message());
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS) {
     throw std::runtime_error("aclrtSetDevice failed for NpuRuntime");
   }
@@ -531,6 +539,29 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   if (!last.ok()) return last;
   if (candidate_count == 0U) {
     return Status::NotFound("peer Runtime returned no UMDK/EID candidates");
+  }
+  const bool explicit_peer_eids = !impl_->options.peer_eids_by_core.empty();
+  impl_->config.peer_candidates_by_core.clear();
+  if (explicit_peer_eids) {
+    std::vector<peer::PeerCandidateInfo> candidates(candidate_count);
+    for (uint32_t id = 0U; id < candidate_count; ++id) {
+      last = impl_->peer_link->GetCandidateInfo(id, &candidates[id]);
+      if (!last.ok()) return last;
+      if (candidates[id].device_id >= device_count) {
+        return Status::Internal("peer Runtime returned invalid candidate device ID");
+      }
+    }
+    last = detail::ResolvePeerEidsByCore(impl_->options.peer_eids_by_core, candidates,
+                                        impl_->options.peer_ub_device,
+                                        &impl_->config.peer_candidates_by_core);
+    if (!last.ok()) return last;
+    for (uint32_t core = 0U; core < impl_->options.npu_core_count; ++core) {
+      const auto& candidate = candidates[impl_->config.peer_candidates_by_core[core]];
+      std::fprintf(stderr, "[KVAF_AIV] PEER_CORE_CANDIDATE core=%u candidate=%u "
+                           "ub_device=%s eid_index=%u eid=%s\n",
+                   core, candidate.candidate_id, candidate.device_name.c_str(),
+                   candidate.eid_index, impl_->options.peer_eids_by_core[core].c_str());
+    }
   }
   std::vector<NpuLocalEidCandidate> npu_candidates;
   std::string discovery_error;
@@ -674,6 +705,13 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
           last = Internal("failed to destroy peer candidate probe stream");
         }
       }
+      if (last.ok() && explicit_peer_eids) {
+        impl_->read_probe = std::make_unique<detail::StartupReadProbe>();
+        last = impl_->read_probe->Run(*impl_->runtime_core, *impl_->access_operator,
+                                      impl_->options.npu_core_count, impl_->options.jettys_per_core,
+                                      impl_->options.batch_get_token_bytes,
+                                      impl_->options.batch_get_tokens_per_block);
+      }
       if (last.ok() && measure) {
         impl_->bandwidth_probe =
             std::make_unique<detail::StartupBandwidthProbe>(probe_config);
@@ -722,6 +760,18 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
     impl_->ReleaseProbe();
     return Status::OK();
   };
+  if (explicit_peer_eids) {
+    // Retry automatic LOCAL EID discovery as a whole group, keeping every
+    // requested CPU endpoint fixed. An explicit local EID has one attempt.
+    for (std::size_t local = 0U; local < npu_group_count; ++local) {
+      last = initialize_candidate(
+          detail::StartupCandidate{impl_->config.peer_candidates_by_core.front(), local}, false, nullptr);
+      if (last.ok()) return last;
+      const Status released = cleanup();
+      if (!released.ok()) return released;
+    }
+    return Status::Internal("failed to initialize all configured peer EIDs: " + last.message());
+  }
   if (!tune_candidates) {
     for (std::uint32_t peer_candidate = 0U; peer_candidate < candidate_count;
          ++peer_candidate) {
@@ -826,6 +876,9 @@ std::uint32_t NpuRuntime::jettys_per_core() const { return impl_->options.jettys
 const std::vector<std::string>& NpuRuntime::npu_eids() const {
   return impl_->options.npu_eids;
 }
+const std::vector<std::string>& NpuRuntime::peer_eids_by_core() const {
+  return impl_->options.peer_eids_by_core;
+}
 std::uint32_t NpuRuntime::batch_get_token_bytes() const {
   return impl_->options.batch_get_token_bytes;
 }
@@ -862,6 +915,7 @@ Status NpuRuntime::ReleaseLink(LinkId link_id) {
   impl_->config.peer_link.reset();
   impl_->config.peer_local_eid = {};
   impl_->config.peer_local_eids.clear();
+  impl_->config.peer_candidates_by_core.clear();
   impl_->peer_allocator = nullptr;
   impl_->allocator.reset();
   impl_->runtime_core.reset();

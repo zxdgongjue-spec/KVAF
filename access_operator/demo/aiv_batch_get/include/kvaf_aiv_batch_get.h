@@ -39,6 +39,16 @@ int32_t KvafBatchGetTransportCreateWithPeerLinkMultiEid(
     KvafBatchGetTransport **transport);
 void KvafBatchGetTransportDestroy(KvafBatchGetTransport *transport);
 
+// Strict CPU candidate mapping in logical-core order. Empty mapping preserves
+// the legacy behavior. A nonempty mapping requires one local NPU EID and
+// exactly aiv_core_count entries; repeated CPU candidates are deduplicated.
+int32_t KvafBatchGetTransportCreateWithPeerEndpoints(
+    void *host_ddr, uint64_t host_ddr_bytes, uint32_t aiv_core_count,
+    uint32_t jettys_per_core, void *peer_link,
+    const uint8_t *peer_local_eids, uint32_t peer_local_eid_count,
+    const uint32_t *peer_candidates_by_core, uint32_t peer_core_count,
+    KvafBatchGetTransport **transport);
+
 // Acquire registers/caches one caller-owned HBM output range. Re-acquiring
 // the exact (address, bytes) pair returns the same local-buffer handle and
 // entity table while adding one reference. The returned entity is passed in

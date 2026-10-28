@@ -231,6 +231,15 @@ void ReleaseDeviceAivTransport(const DeviceAivTransportResources& resources) {
       }
     }
   }
+  for (std::uint32_t reverse = resources.remote_path_count; reverse > 0U; --reverse) {
+    auto& remote = resources.remote_paths[reverse - 1U];
+    if (resources.paths != nullptr && remote.local_path_index < resources.path_count &&
+        remote.memory_import != nullptr && api.rmem_unimport != nullptr) {
+      (void)api.rmem_unimport(resources.paths[remote.local_path_index].device_context,
+                              remote.memory_import);
+      remote.memory_import = nullptr;
+    }
+  }
   if (resources.paths != nullptr) {
     std::fprintf(stderr,
                  "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=release_eid_paths count=%u\n",
@@ -285,10 +294,11 @@ void ReleaseDeviceAivTransport(const DeviceAivTransportResources& resources) {
 
 bool LoadPeerMemory(PeerLink* link, std::uint64_t peer_base,
                     DirectMemory* memory,
-                    std::array<std::uint8_t, kEidBytes>* peer_eid) {
+                    std::array<std::uint8_t, kEidBytes>* peer_eid,
+                    std::uint32_t endpoint_id) {
   PeerRegion region{};
   if (link == nullptr || memory == nullptr || peer_eid == nullptr) return false;
-  const Status link_status = link->LookupRegion(peer_base, &region);
+  const Status link_status = link->LookupRegion(peer_base, &region, endpoint_id);
   if (!link_status.ok() || region.length == 0U || region.token_id == 0U || region.token_value == 0U ||
       region.segment_key_bytes == 0U || region.segment_key_bytes > kMemKeyBytes) {
     const char* reason = link_status.ok() ? "invalid peer region descriptor" : link_status.message().c_str();
@@ -464,7 +474,7 @@ bool CreatePeerChannel(const PeerChannelRequest& request,
       request.peer_base, request.local_jetty_info->key.value,
       request.local_jetty_info->key.size, request.local_eid->data(),
       request.peer_memory->token_value, local_tp_handle, local_psn, &peer_qp_key,
-      &peer_qp_key_bytes, &peer_tp_handle, &peer_psn);
+      &peer_qp_key_bytes, &peer_tp_handle, &peer_psn, request.endpoint_id);
   if (!status.ok()) {
     std::fprintf(stderr, "[KVAF_AIV] PEER_LINK_CHANNEL_FAILED role=%s reason=%s\n",
                  request.role, status.message().c_str());
@@ -475,6 +485,12 @@ bool CreatePeerChannel(const PeerChannelRequest& request,
                        local_tp_handle, peer_tp_handle, local_psn, peer_psn,
                        request.role, &channel->local_import_info,
                        &channel->local_target_jetty)) {
+    // A provider may return a handle before a later output validation fails.
+    // The caller has not published this handle into its worker yet.
+    if (channel->local_target_jetty != nullptr && request.api->qp_unimport != nullptr) {
+      (void)request.api->qp_unimport(request.device_context, channel->local_target_jetty);
+    }
+    *channel = {};
     std::fprintf(stderr,
                  "[KVAF_AIV] PEER_LINK_CHANNEL_FAILED role=%s reason=import_peer_jetty\n",
                  request.role);

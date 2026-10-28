@@ -59,6 +59,15 @@ For simultaneous local-EID paths, call
 EID, then assigns the existing core/Jetty workers to paths in jetty-major
 round-robin order. The single-EID function above is retained as an ABI wrapper.
 
+`KvafBatchGetTransportCreateWithPeerEndpoints` additionally accepts CPU
+candidate IDs in logical-core order. A nonempty mapping requires one local
+NPU EID and exactly one entry per core. Distinct candidates register the same
+CPU DDR under separate EID contexts; repeated candidates reuse the endpoint.
+Remote segment imports are owned separately from the shared local RaCtx.
+Each worker receives its endpoint's EID/token and channel TPN while retaining
+independent SQ/CQ state. The existing kernel ABI remains unchanged. Runtime
+exposes this as `peer_eids_by_core`; see the [Runtime guide](../../../runtime/README.md#按-aiv-core-指定-cpu-eid).
+
 An exact repeat of `Acquire(transport, output_hbm, output_bytes, ...)`
 returns the cached binding/entity and increments its use reference. New HBM
 addresses receive one local MR per EID context and a new entity table but reuse

@@ -204,6 +204,34 @@ struct Fixture {
 };
 
 int main() {
+  for (uint32_t cores : {2U, 4U, 8U}) {
+    for (uint32_t budget : {0U, 2048U}) {
+      Fixture f(cores * 513U, cores, 4U, budget);
+      for (uint32_t i = 0U; i < f.entities.size(); ++i) {
+        auto& entity = f.entities[i];
+        const uint32_t core = i / 4U;
+        entity.remote_token_id = 0x123U + core;
+        entity.remote_token_value = 0x345U + core;
+        entity.tp_id = 0x567U + i;
+        for (uint32_t byte = 0U; byte < 16U; ++byte) {
+          entity.remote_eid[byte] = static_cast<uint8_t>(core * 16U + byte + 1U);
+        }
+      }
+      f.Run(f.capacity);
+      for (uint32_t i = 0U; i < f.entities.size(); ++i) {
+        const auto& queue = aiv_model::hardware[i];
+        const auto& entity = f.entities[i];
+        CHECK(queue.producer > 0U);
+        for (uint64_t posted = 0U; posted < queue.producer; ++posted) {
+          const uint32_t* wqe = queue.sq.data() + posted * 16U;
+          CHECK(wqe[3] == entity.remote_token_id);
+          CHECK((wqe[2] & 0x00ffffffU) == entity.tp_id);
+          CHECK(wqe[8] == entity.remote_token_value);
+          CHECK(std::memcmp(wqe + 4U, entity.remote_eid, 16U) == 0);
+        }
+      }
+    }
+  }
   for (const auto& shape : {std::array<uint32_t, 3>{1, 1, 2048}, {1, 16, 2048},
                            {1, 64, 2048}, {4, 4, 2048}, {3, 3, 2049}, {1, 1, 2},
                            {1, 16, 0}}) {

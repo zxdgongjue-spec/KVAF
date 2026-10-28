@@ -15,6 +15,7 @@ environment variables:
     --token-bytes          KVAF_BATCH_GET_PERF_TOKEN_BYTES
     --miss-count           KVAF_BATCH_GET_PERF_MISS_COUNT
     --max-inflight-total   KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL
+    --peer-eids-by-core    KVAF_PEER_EIDS_BY_CORE
     --source-access-pattern
                            KVAF_BATCH_GET_PERF_SOURCE_ACCESS_PATTERN
     --output-access-pattern
@@ -41,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from backend import detect_torch_backend
 from dsa_keys import build_dsa_keys
-from npu_eids import parse_npu_eids
+from npu_eids import parse_npu_eids, parse_peer_eids_by_core
 
 
 DEFAULT_REQUEST_LENGTH = 32_768
@@ -183,6 +184,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--peer-eids-by-core",
+        type=parse_peer_eids_by_core,
+        default=parse_peer_eids_by_core(os.environ.get("KVAF_PEER_EIDS_BY_CORE")),
+        help="comma-separated CPU EID for each logical AIV core; repetitions allowed",
+    )
+    parser.add_argument(
         "--adaptive-ub-device", action="store_true",
         help=(
             "startup tuning over the N-side peer-device allowlist when K has "
@@ -320,6 +327,11 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "KVAF_ADAPTIVE_UB_DEVICES must contain unique non-empty names"
     if args.aiv_cores <= 0 or args.aiv_cores > 48:
         return "aiv-cores must be in [1, 48]"
+    if args.peer_eids_by_core:
+        if len(args.peer_eids_by_core) != args.aiv_cores:
+            return "peer-eids-by-core must contain exactly aiv-cores entries"
+        if len(args.npu_eids) > 1 or args.adaptive_ub_device:
+            return "peer-eids-by-core requires at most one NPU EID and no adaptive-ub-device"
     if len(args.npu_eids) > args.aiv_cores * args.jettys_per_core:
         return "npu-eids count must not exceed aiv-cores * jettys-per-core"
     if not 0 <= args.max_inflight_total <= 0xFFFFFFFF:
@@ -678,6 +690,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         jettys_per_core=args.jettys_per_core,
         batch_get_max_inflight_total=args.max_inflight_total,
         npu_eids=args.npu_eids,
+        peer_eids_by_core=args.peer_eids_by_core,
         adaptive_ub_device=args.adaptive_ub_device,
         adaptive_ub_miss_count=args.adaptive_ub_miss_count,
         peer_ub_device=args.peer_ub_device,
@@ -699,6 +712,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"max_inflight_total={args.max_inflight_total} "
             f"jettys_per_core={args.jettys_per_core} eid_paths={len(args.npu_eids) or 1} "
             f"npu_eids={','.join(args.npu_eids) or 'auto'} warmup={args.warmup} "
+            f"peer_eids_by_core={','.join(args.peer_eids_by_core) or 'auto'} "
             f"adaptive_ub_device={int(args.adaptive_ub_device)} "
             f"adaptive_ub_miss_count={args.adaptive_ub_miss_count} "
             f"peer_ub_device={args.peer_ub_device or 'auto'} "

@@ -221,7 +221,8 @@ class NpuPythonRuntime final {
                    std::uint32_t adaptive_ub_miss_count,
                    std::string peer_ub_device,
                    std::vector<std::string> adaptive_peer_ub_devices,
-                   std::uint32_t batch_get_max_inflight_total) {
+                   std::uint32_t batch_get_max_inflight_total,
+                   std::vector<std::string> peer_eids_by_core) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
                               batch_get_tokens_per_block};
@@ -232,6 +233,7 @@ class NpuPythonRuntime final {
     options.jettys_per_core = jettys_per_core;
     options.batch_get_max_inflight_total = batch_get_max_inflight_total;
     options.npu_eids = std::move(npu_eids);
+    options.peer_eids_by_core = std::move(peer_eids_by_core);
     options.adaptive_ub_device = adaptive_ub_device;
     options.adaptive_ub_miss_count = adaptive_ub_miss_count;
     options.peer_ub_device = std::move(peer_ub_device);
@@ -252,6 +254,7 @@ class NpuPythonRuntime final {
   std::uint32_t NpuCoreCount() const { return native_->npu_core_count(); }
   std::uint32_t JettysPerCore() const { return native_->jettys_per_core(); }
   const std::vector<std::string>& NpuEids() const { return native_->npu_eids(); }
+  const std::vector<std::string>& PeerEidsByCore() const { return native_->peer_eids_by_core(); }
   std::uint32_t BatchGetTokenBytes() const {
     return native_->batch_get_token_bytes();
   }
@@ -529,7 +532,8 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def(py::init<std::string, std::uint32_t, std::uint32_t, std::uint32_t,
                     std::uint32_t, std::string, std::uint32_t,
                     std::vector<std::string>, bool, std::uint32_t,
-                    std::string, std::vector<std::string>, std::uint32_t>(),
+                    std::string, std::vector<std::string>, std::uint32_t,
+                    std::vector<std::string>>(),
            py::arg("batch_get_kernel_object_path"),
            py::arg("batch_get_token_bytes"),
            py::arg("batch_get_tokens_per_block"), py::arg("device_id") = 0,
@@ -542,7 +546,8 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("peer_ub_device") = "",
            py::arg("adaptive_peer_ub_devices") =
                std::vector<std::string>{},
-           py::arg("batch_get_max_inflight_total") = 2048)
+           py::arg("batch_get_max_inflight_total") = 2048,
+           py::arg("peer_eids_by_core") = std::vector<std::string>{})
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
            "Connect this NPU Runtime to a CPU Runtime service before initialize.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),
@@ -553,6 +558,7 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def_property_readonly("npu_core_count", &NpuPythonRuntime::NpuCoreCount)
       .def_property_readonly("jettys_per_core", &NpuPythonRuntime::JettysPerCore)
       .def_property_readonly("npu_eids", &NpuPythonRuntime::NpuEids)
+      .def_property_readonly("peer_eids_by_core", &NpuPythonRuntime::PeerEidsByCore)
       .def_property_readonly("batch_get_token_bytes",
                              &NpuPythonRuntime::BatchGetTokenBytes)
       .def_property_readonly("batch_get_tokens_per_block",

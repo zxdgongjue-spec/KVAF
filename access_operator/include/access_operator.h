@@ -62,6 +62,8 @@ struct AccessOperatorConfig {
   // RaCtx per EID and stripes core/Jetty workers over those paths; BatchPut
   // continues to use peer_local_eid above.
   std::vector<std::array<std::uint8_t, 16>> peer_local_eids{};
+  // Runtime-resolved CPU candidates, one per core; empty selects endpoint 0.
+  std::vector<std::uint32_t> peer_candidates_by_core{};
   std::shared_ptr<PeerLink> peer_link;
 };
 

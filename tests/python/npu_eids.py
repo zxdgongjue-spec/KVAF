@@ -20,3 +20,16 @@ def parse_npu_eids(value: str | None) -> list[str]:
     if len(set(eids)) != len(eids):
         raise ValueError("NPU EID list contains a duplicate entry")
     return eids
+
+
+def parse_peer_eids_by_core(value: str | None) -> list[str]:
+    """Ordered CPU EIDs, including repetitions for shared-EID controls."""
+    if value is None or not value.strip():
+        return []
+    eids = []
+    for part in value.split(","):
+        if not part.strip():
+            raise ValueError("CPU EID mapping contains an empty entry")
+        # Validate each encoding without rejecting repetitions across cores.
+        eids.extend(parse_npu_eids(part))
+    return eids

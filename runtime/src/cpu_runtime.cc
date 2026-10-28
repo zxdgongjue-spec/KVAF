@@ -29,6 +29,8 @@ namespace {
 
 using kvaf::peer::AllocateRegionRequest;
 using kvaf::peer::AllocateRegionResponse;
+using kvaf::peer::BindRegionEndpointRequest;
+using kvaf::peer::BindRegionEndpointResponse;
 using kvaf::peer::CandidateCountRequest;
 using kvaf::peer::CandidateCountResponse;
 using kvaf::peer::CandidateInfoRequest;
@@ -463,16 +465,21 @@ void ReleaseChannel(Channel* channel) {
   }
 }
 
-struct Region {
-  uint64_t id = 0U;
+struct RegionEndpoint {
   uint32_t candidate_id = 0U;
-  UrmaResources* resources = nullptr;
-  void* memory = nullptr;
-  uint64_t bytes = 0U;
+  UrmaResources* resources = nullptr;  // Owned by UrmaResourcePool.
   urma_token_id_t* token_id = nullptr;
   urma_target_seg_t* segment = nullptr;
-  uint32_t token_value = 0U;
   std::vector<Channel> channels;
+};
+
+struct Region {
+  uint64_t id = 0U;
+  void* memory = nullptr;
+  uint64_t bytes = 0U;
+  uint32_t token_value = 0U;
+  // Vector index is the wire endpoint ID; endpoint zero is the default.
+  std::vector<RegionEndpoint> endpoints;
 };
 
 class CpuService {
@@ -509,6 +516,7 @@ class CpuService {
     response->candidate_id = candidate.id;
     response->device_id = candidate.device_id;
     response->eid_index = candidate.eid_index;
+    std::memcpy(response->eid, candidate.eid.data(), kEidBytes);
     std::memcpy(response->device_name, candidate.device_name.c_str(),
                 candidate.device_name.size());
     return Result::kOk;
@@ -520,74 +528,29 @@ class CpuService {
         bytes > std::numeric_limits<size_t>::max() || resource_pool_ == nullptr) {
       return Result::kInvalidRequest;
     }
-    UrmaResources* resources = resource_pool_->Get(candidate_id);
-    if (resources == nullptr) {
-      return Result::kResourceError;
-    }
     auto region = std::make_unique<Region>();
-    region->candidate_id = candidate_id;
-    region->resources = resources;
+    region->id = next_region_id_++;
     region->bytes = bytes;
-    if (!AllocateMemory(region.get())) {
-      return Result::kResourceError;
-    }
     region->token_value = NextToken();
-    region->token_id = urma_alloc_token_id(resources->context());
-    if (region->token_id == nullptr) {
-      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=urma_alloc_token_id errno=%d\n", errno);
+    if (!AllocateMemory(region.get())) return Result::kResourceError;
+    const Result result = BindEndpoint(region.get(), candidate_id, response);
+    if (result != Result::kOk) {
       ReleaseRegion(region.get());
-      return Result::kResourceError;
+      return result;
     }
-    urma_reg_seg_flag_t flag{};
-    flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
-    flag.bs.cacheable = URMA_NON_CACHEABLE;
-    // Keep the CPU DDR registration equivalent to the existing HCCP host-memory
-    // path. LOCAL_WRITE is deliberately absent: it was rejected by the deployed
-    // UDMA driver, whereas remote atomic and non-pinned registration are part of
-    // the established host-DDR contract.
-    flag.bs.access = URMA_ACCESS_REMOTE_READ | URMA_ACCESS_REMOTE_WRITE |
-                     URMA_ACCESS_REMOTE_ATOMIC;
-    flag.bs.non_pin = 1U;
-    flag.bs.token_id_valid = 1U;
-    urma_seg_cfg_t config{};
-    config.va = reinterpret_cast<uint64_t>(region->memory);
-    config.len = bytes;
-    config.token_id = region->token_id;
-    config.token_value.token = region->token_value;
-    config.flag = flag;
-    region->segment = urma_register_seg(resources->context(), &config);
-    if (region->segment == nullptr) {
-      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=urma_register_seg base=%p bytes=%" PRIu64
-          " token_id=0x%x token_value=0x%x reg_flags=0x%x errno=%d\n",
-          region->memory, bytes, region->token_id->token_id, region->token_value, flag.value, errno);
-      ReleaseRegion(region.get());
-      return Result::kResourceError;
-    }
-    const uint64_t id = next_region_id_++;
-    region->id = id;
-    response->session_id = id;
-    response->peer_base = region->segment->seg.ubva.va;
-    response->peer_length = bytes;
-    // HCCP's UB resource-service forwards the public UMDK token object value
-    // (rather than transforming it through its private TokenId wrapper).
-    response->token_id = region->token_id->token_id;
-    response->token_value = region->token_value;
-    response->segment_key_bytes = kSegBytes;
-    std::memcpy(response->peer_eid, region->segment->seg.ubva.eid.raw, kEidBytes);
-    std::memcpy(response->segment_key, &region->segment->seg, kSegBytes);
-    if (response->peer_base == 0U || response->token_id == 0U) {
-      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=region_descriptor base=0x%" PRIx64
-          " token_id=0x%x\n",
-        response->peer_base, response->token_id);
-      ReleaseRegion(region.get());
-      return Result::kResourceError;
-    }
+    const uint64_t id = region->id;
     regions_.emplace(id, std::move(region));
-    Log("[KVAF_CPU] REGION_ALLOCATED session=%" PRIu64 " candidate=%u ub_device=%s eid_index=%u "
-        "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x reg_flags=0x%x page_mode=%s\n",
-        id, candidate_id, resources->device_name().c_str(), resources->eid_index(), bytes,
-        response->peer_base, response->token_id, flag.value, MemoryPageModeName());
+    Log("[KVAF_CPU] REGION_ALLOCATED session=%" PRIu64 " candidate=%u bytes=%" PRIu64
+        " base=0x%" PRIx64 " page_mode=%s\n",
+        id, candidate_id, bytes, response->peer_base, MemoryPageModeName());
     return Result::kOk;
+  }
+
+  Result BindRegionEndpoint(const BindRegionEndpointRequest& request,
+                            BindRegionEndpointResponse* response) {
+    const auto found = regions_.find(request.session_id);
+    if (found == regions_.end()) return Result::kNotFound;
+    return BindEndpoint(found->second.get(), request.candidate_id, response);
   }
 
   Result CreateChannel(const CreateChannelRequest& request, CreateChannelResponse* response) {
@@ -606,6 +569,8 @@ class CpuService {
       return Result::kNotFound;
     }
     Region& region = *found->second;
+    if (request.endpoint_id >= region.endpoints.size()) return Result::kNotFound;
+    RegionEndpoint& endpoint = region.endpoints[request.endpoint_id];
     Log("[KVAF_CPU] CHANNEL_REQUEST session=%" PRIu64 " key_bytes=%u token=0x%x npu_tp=0x%llx npu_psn=0x%x npu_eid=",
         region.id, request.local_qp_key_bytes, request.peer_token_value,
         static_cast<unsigned long long>(request.local_tp_handle), request.local_psn);
@@ -616,10 +581,10 @@ class CpuService {
     Channel channel{};
     uint64_t cpu_tp_handle = 0U;
     const uint32_t cpu_psn = NextPsn();
-    if (!CreateLocalJetty(region.resources, region.token_value, &channel.local_jfc,
+    if (!CreateLocalJetty(endpoint.resources, region.token_value, &channel.local_jfc,
                           &channel.local_jfr, &channel.local_jetty) ||
-        !region.resources->GetCtpForPeer(request.local_eid, &cpu_tp_handle) ||
-        !ImportRemoteJetty(region.resources, request.local_qp_key, request.peer_token_value, cpu_tp_handle,
+        !endpoint.resources->GetCtpForPeer(request.local_eid, &cpu_tp_handle) ||
+        !ImportRemoteJetty(endpoint.resources, request.local_qp_key, request.peer_token_value, cpu_tp_handle,
                            request.local_tp_handle, cpu_psn, request.local_psn, &channel.remote_jetty)) {
       ReleaseChannel(&channel);
       return Result::kResourceError;
@@ -631,13 +596,14 @@ class CpuService {
     response->peer_qp_key_bytes = kJettyKeyBytes;
     response->peer_tp_handle = cpu_tp_handle;
     response->peer_psn = cpu_psn;
-    region.channels.push_back(channel);
+    endpoint.channels.push_back(channel);
     Log("[KVAF_CPU] CHANNEL_JFC_READY session=%" PRIu64 " jfc_id=%u depth=%u\n",
         region.id, channel.local_jfc->jfc_id.id, kHostJfcDepth);
-    Log("[KVAF_CPU] CHANNEL_CREATED session=%" PRIu64 " local_jetty=%u remote_jetty=%u cpu_tp=0x%llx "
+    Log("[KVAF_CPU] CHANNEL_CREATED session=%" PRIu64 " endpoint=%u candidate=%u local_jetty=%u remote_jetty=%u cpu_tp=0x%llx "
         "cpu_psn=0x%x jfs_depth=%u jfr_depth=%u priority=%u rnr_retry=%u "
         "err_timeout=%u error_suspend=1\n",
-        region.id, channel.local_jetty->jetty_id.id, channel.remote_jetty->id.id,
+        region.id, request.endpoint_id, endpoint.candidate_id,
+        channel.local_jetty->jetty_id.id, channel.remote_jetty->id.id,
         static_cast<unsigned long long>(cpu_tp_handle), cpu_psn, kHostJfsDepth,
         kHostJfrDepth, static_cast<unsigned int>(kHostJettyPriority),
         static_cast<unsigned int>(kHostJettyRnrRetry),
@@ -650,8 +616,8 @@ class CpuService {
     if (found == regions_.end()) {
       return Result::kNotFound;
     }
-    Log("[KVAF_CPU] REGION_RELEASE session=%" PRIu64 " channels=%zu\n", id,
-        found->second->channels.size());
+    Log("[KVAF_CPU] REGION_RELEASE session=%" PRIu64 " endpoints=%zu\n", id,
+        found->second->endpoints.size());
     ReleaseRegion(found->second.get());
     regions_.erase(found);
     return Result::kOk;
@@ -790,26 +756,105 @@ class CpuService {
     return true;
   }
 
+  static void ReleaseEndpoint(RegionEndpoint* endpoint) {
+    for (auto it = endpoint->channels.rbegin(); it != endpoint->channels.rend(); ++it) {
+      ReleaseChannel(&*it);
+    }
+    endpoint->channels.clear();
+    if (endpoint->segment != nullptr) {
+      (void)urma_unregister_seg(endpoint->segment);
+      endpoint->segment = nullptr;
+    }
+    if (endpoint->token_id != nullptr) {
+      (void)urma_free_token_id(endpoint->token_id);
+      endpoint->token_id = nullptr;
+    }
+  }
+
   void ReleaseRegion(Region* region) {
-    if (region == nullptr) {
-      return;
+    if (region == nullptr) return;
+    for (auto it = region->endpoints.rbegin(); it != region->endpoints.rend(); ++it) {
+      ReleaseEndpoint(&*it);
     }
-    for (auto iterator = region->channels.rbegin(); iterator != region->channels.rend(); ++iterator) {
-      ReleaseChannel(&*iterator);
-    }
-    region->channels.clear();
-    if (region->segment != nullptr) {
-      (void)urma_unregister_seg(region->segment);
-      region->segment = nullptr;
-    }
-    if (region->token_id != nullptr) {
-      (void)urma_free_token_id(region->token_id);
-      region->token_id = nullptr;
-    }
+    region->endpoints.clear();
     if (region->memory != nullptr) {
       free(region->memory);
       region->memory = nullptr;
     }
+  }
+
+  static void DescribeEndpoint(const Region& region, uint32_t endpoint_id,
+                               AllocateRegionResponse* response) {
+    const auto& endpoint = region.endpoints[endpoint_id];
+    response->session_id = region.id;
+    response->endpoint_id = endpoint_id;
+    response->peer_base = endpoint.segment->seg.ubva.va;
+    response->peer_length = region.bytes;
+    // Keep the public UMDK token ID on the wire; AIV encoding happens on NPU.
+    response->token_id = endpoint.token_id->token_id;
+    response->token_value = region.token_value;
+    response->segment_key_bytes = kSegBytes;
+    std::memcpy(response->peer_eid, endpoint.segment->seg.ubva.eid.raw, kEidBytes);
+    std::memcpy(response->segment_key, &endpoint.segment->seg, kSegBytes);
+  }
+
+  Result BindEndpoint(Region* region, uint32_t candidate_id,
+                      AllocateRegionResponse* response) {
+    if (region == nullptr || response == nullptr || resource_pool_ == nullptr) {
+      return Result::kInvalidRequest;
+    }
+    for (uint32_t id = 0U; id < region->endpoints.size(); ++id) {
+      if (region->endpoints[id].candidate_id == candidate_id) {
+        DescribeEndpoint(*region, id, response);
+        return Result::kOk;
+      }
+    }
+    RegionEndpoint endpoint{};
+    endpoint.candidate_id = candidate_id;
+    endpoint.resources = resource_pool_->Get(candidate_id);
+    if (endpoint.resources == nullptr) return Result::kResourceError;
+    endpoint.token_id = urma_alloc_token_id(endpoint.resources->context());
+    if (endpoint.token_id == nullptr) return Result::kResourceError;
+    urma_reg_seg_flag_t flag{};
+    flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
+    flag.bs.cacheable = URMA_NON_CACHEABLE;
+    // Preserve the deployed CPU DDR registration contract (no LOCAL_WRITE).
+    flag.bs.access = URMA_ACCESS_REMOTE_READ | URMA_ACCESS_REMOTE_WRITE |
+                     URMA_ACCESS_REMOTE_ATOMIC;
+    flag.bs.non_pin = 1U;
+    flag.bs.token_id_valid = 1U;
+    urma_seg_cfg_t config{};
+    config.va = reinterpret_cast<uint64_t>(region->memory);
+    config.len = region->bytes;
+    config.token_id = endpoint.token_id;
+    config.token_value.token = region->token_value;
+    config.flag = flag;
+    endpoint.segment = urma_register_seg(endpoint.resources->context(), &config);
+    if (endpoint.segment == nullptr || endpoint.token_id->token_id == 0U ||
+        endpoint.segment->seg.ubva.va == 0U ||
+        endpoint.segment->seg.len < region->bytes ||
+        (!region->endpoints.empty() && endpoint.segment->seg.ubva.va !=
+             region->endpoints.front().segment->seg.ubva.va) ||
+        std::memcmp(endpoint.segment->seg.ubva.eid.raw,
+                    endpoint.resources->context()->eid.raw, kEidBytes) != 0) {
+      Log("[KVAF_CPU] REGION_ENDPOINT_FAILED session=%" PRIu64
+          " candidate=%u base=%p errno=%d\n", region->id, candidate_id, region->memory, errno);
+      ReleaseEndpoint(&endpoint);
+      return Result::kResourceError;
+    }
+    const uint32_t id = static_cast<uint32_t>(region->endpoints.size());
+    region->endpoints.push_back(std::move(endpoint));
+    DescribeEndpoint(*region, id, response);
+    Log("[KVAF_CPU] REGION_ENDPOINT_READY session=%" PRIu64
+        " endpoint=%u candidate=%u ub_device=%s eid_index=%u base=0x%" PRIx64
+        " bytes=%" PRIu64 " token_id=0x%x eid=",
+        region->id, id, candidate_id,
+        region->endpoints[id].resources->device_name().c_str(),
+        region->endpoints[id].resources->eid_index(), response->peer_base,
+        region->bytes, response->token_id);
+    for (uint8_t byte : response->peer_eid) std::fprintf(stderr, "%02x", byte);
+    std::fprintf(stderr, "\n");
+    return Result::kOk;
   }
 
   void ReleaseAll() {
@@ -895,6 +940,22 @@ void HandleClient(int fd, CpuService* service) {
           service == nullptr
               ? Result::kResourceError
               : service->GetCandidateInfo(request.candidate_id, &response));
+      (void)WriteAll(fd, &response, sizeof(response));
+      return;
+    }
+    case Command::kBindRegionEndpoint: {
+      BindRegionEndpointRequest request{};
+      request.header = header;
+      if (!IsValidHeader(header, command, sizeof(request)) ||
+          !ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header),
+                   sizeof(request) - sizeof(header))) {
+        SendStatus(fd, command, Result::kInvalidRequest);
+        return;
+      }
+      BindRegionEndpointResponse response{};
+      response.header = MakeHeader(command, sizeof(response));
+      response.header.command = ResponseCommand(command);
+      response.result = static_cast<int32_t>(service->BindRegionEndpoint(request, &response));
       (void)WriteAll(fd, &response, sizeof(response));
       return;
     }

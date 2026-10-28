@@ -18,6 +18,7 @@ struct PeerRegion {
   uint32_t token_id = 0U;
   uint32_t token_value = 0U;
   uint32_t segment_key_bytes = 0U;
+  uint32_t endpoint_id = 0U;
   std::array<uint8_t, kEidBytes> eid{};
   std::array<uint8_t, kSegKeyBytes> segment_key{};
 };
@@ -27,6 +28,7 @@ struct PeerCandidateInfo {
   uint32_t device_id = 0U;
   uint32_t eid_index = 0U;
   std::string device_name;
+  std::array<uint8_t, kEidBytes> eid{};
 };
 
 // Per-Runtime peer control-plane client. Its endpoint is explicit: Runtime
@@ -44,18 +46,20 @@ class PeerLink {
   Status AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
                         uint32_t candidate_id, PeerRegion* region);
   Status ReleaseRegion(uint64_t base);
-  Status LookupRegion(uint64_t base, PeerRegion* region) const;
+  Status BindRegionEndpoint(uint64_t base, uint32_t candidate_id, PeerRegion* region);
+  Status LookupRegion(uint64_t base, PeerRegion* region, uint32_t endpoint_id = 0U) const;
   Status CreateChannel(
       uint64_t region_base, const uint8_t local_qp_key[kQpKeyBytes],
       uint32_t local_qp_key_bytes, const uint8_t local_eid[kEidBytes],
       uint32_t peer_token_value, uint64_t local_tp_handle, uint32_t local_psn,
       std::array<uint8_t, kQpKeyBytes>* peer_qp_key,
       uint32_t* peer_qp_key_bytes, uint64_t* peer_tp_handle,
-      uint32_t* peer_psn);
+      uint32_t* peer_psn, uint32_t endpoint_id = 0U);
 
  private:
   std::string address_;
   std::unordered_map<uint64_t, PeerRegion> regions_;
+  std::unordered_map<uint64_t, std::unordered_map<uint32_t, PeerRegion>> endpoints_;
 };
 
 }  // namespace kvaf::peer

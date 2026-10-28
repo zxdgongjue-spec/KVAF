@@ -366,11 +366,12 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
       impl_->config.peer_local_eids.data());
   const auto peer_local_eid_count =
       static_cast<std::uint32_t>(impl_->config.peer_local_eids.size());
-  const int32_t result = KvafBatchGetTransportCreateWithPeerLinkMultiEid(
+  const int32_t result = KvafBatchGetTransportCreateWithPeerEndpoints(
       reinterpret_cast<void*>(remote_region.base), remote_region.length,
       impl_->config.npu_core_count, impl_->config.jettys_per_core,
       impl_->config.peer_link.get(), peer_local_eids, peer_local_eid_count,
-      &transport);
+      impl_->config.peer_candidates_by_core.data(),
+      static_cast<std::uint32_t>(impl_->config.peer_candidates_by_core.size()), &transport);
   if (result != KVAF_BATCH_GET_SUCCESS || transport == nullptr) {
     return Internal("failed to create reusable BatchGet transport");
   }

@@ -10,9 +10,9 @@
 namespace kvaf::peer {
 
 constexpr uint32_t kProtocolMagic = 0x4b564350U;  // "KVCP"
-// Version 6 exposes candidate metadata before allocation so adaptive startup
-// can group EIDs by K-side UB device and benchmark each device only once.
-constexpr uint16_t kProtocolVersion = 6U;
+// Version 7 binds multiple EID endpoints to one DDR allocation. Both peers
+// must be upgraded together; endpoint zero is the allocation's default path.
+constexpr uint16_t kProtocolVersion = 7U;
 constexpr uint32_t kQpKeyBytes = 64U;
 constexpr uint32_t kSegKeyBytes = 64U;
 constexpr uint32_t kEidBytes = 16U;
@@ -24,6 +24,7 @@ enum class Command : uint16_t {
   kReleaseRegion = 3U,
   kGetCandidateCount = 4U,
   kGetCandidateInfo = 5U,
+  kBindRegionEndpoint = 6U,
 };
 
 enum class Result : int32_t {
@@ -74,6 +75,7 @@ struct CandidateInfoResponse {
   uint32_t device_id;
   uint32_t eid_index;
   char device_name[kDeviceNameBytes];
+  uint8_t eid[kEidBytes];
 };
 
 struct AllocateRegionResponse {
@@ -85,9 +87,18 @@ struct AllocateRegionResponse {
   uint64_t peer_length;
   uint32_t token_id;
   uint32_t token_value;
+  uint32_t endpoint_id;
   uint8_t peer_eid[kEidBytes];
   uint8_t segment_key[kSegKeyBytes];
 };
+
+struct BindRegionEndpointRequest {
+  MessageHeader header;
+  uint64_t session_id;
+  uint32_t candidate_id;
+};
+
+using BindRegionEndpointResponse = AllocateRegionResponse;
 
 struct CreateChannelRequest {
   MessageHeader header;
@@ -96,7 +107,7 @@ struct CreateChannelRequest {
   uint32_t local_qp_key_bytes;
   uint32_t peer_token_value;
   uint32_t local_psn;
-  uint32_t reserved;
+  uint32_t endpoint_id;
   uint8_t local_eid[kEidBytes];
   uint8_t local_qp_key[kQpKeyBytes];
 };
@@ -128,7 +139,9 @@ static_assert(sizeof(AllocateRegionRequest) == 36U, "allocate request ABI change
 static_assert(sizeof(CandidateCountRequest) == 12U, "candidate count request ABI changed");
 static_assert(sizeof(CandidateCountResponse) == 28U, "candidate count response ABI changed");
 static_assert(sizeof(CandidateInfoRequest) == 16U, "candidate info request ABI changed");
-static_assert(sizeof(CandidateInfoResponse) == 92U, "candidate info response ABI changed");
+static_assert(sizeof(CandidateInfoResponse) == 108U, "candidate info response ABI changed");
+static_assert(sizeof(AllocateRegionResponse) == 136U, "allocate response ABI changed");
+static_assert(sizeof(BindRegionEndpointRequest) == 24U, "bind endpoint request ABI changed");
 static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed");
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");
 

@@ -26,7 +26,7 @@ import kvaf
 
 from backend import detect_torch_backend
 from dsa_keys import build_dsa_keys
-from npu_eids import parse_npu_eids
+from npu_eids import parse_npu_eids, parse_peer_eids_by_core
 
 DEFAULT_TOKEN_BYTES = 656
 DEFAULT_TOKENS_PER_BLOCK = 128
@@ -138,6 +138,7 @@ def main() -> int:
     jettys_per_core = int(os.environ.get("KVAF_NPU_JETTYS_PER_CORE", "2"))
     max_inflight_total = int(os.environ.get("KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL", "2048"))
     npu_eids = parse_npu_eids(os.environ.get("KVAF_NPU_EIDS"))
+    peer_eids_by_core = parse_peer_eids_by_core(os.environ.get("KVAF_PEER_EIDS_BY_CORE"))
     active_percent = int(os.environ.get("KVAF_NPU_ACTIVE_PERCENT", "100"))
     warmup = int(os.environ.get("KVAF_NPU_WARMUP", "1"))
     iterations = int(os.environ.get("KVAF_NPU_ITERATIONS", "5"))
@@ -228,6 +229,7 @@ def main() -> int:
         jettys_per_core=jettys_per_core,
         batch_get_max_inflight_total=max_inflight_total,
         npu_eids=npu_eids,
+        peer_eids_by_core=peer_eids_by_core,
     )
     runtime.link_to(remote_cpu_service)
     table = None
@@ -243,6 +245,7 @@ def main() -> int:
             f"npu_cores={npu_core_count} jettys_per_core={jettys_per_core} "
             f"eid_paths={len(npu_eids) or 1} "
             f"npu_eids={','.join(npu_eids) or 'auto'} "
+            f"peer_eids_by_core={','.join(peer_eids_by_core) or 'auto'} "
             "batch_put_backend=aiv_direct_hccp"
         )
         if graph_replays:

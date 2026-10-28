@@ -66,14 +66,24 @@ struct DeviceAivWorkerResources {
   QpImportInfoT device_peer_import_info{};
 };
 
-// One Direct-HCCP RaCtx per selected local EID. Remote DDR and transport
-// tokens are context-owned, so a multi-EID transport cannot share these
-// handles even when every path targets the same CPU DDR region.
+// One Direct-HCCP RaCtx per selected local EID. Tokens and imported handles
+// remain context-owned; BatchGet tracks remote imports in the separate array
+// below. The single import field is retained for older transport callers.
 struct DeviceAivPathResources {
   std::array<std::uint8_t, kEidBytes> local_eid{};
   void* device_context{nullptr};
   void* device_transport_token_handle{nullptr};
   void* device_peer_memory_import{nullptr};
+};
+
+// Remote registrations are distinct from local contexts: one NPU EID can
+// import several CPU EID registrations of the same physical DDR allocation.
+struct DeviceAivRemotePathResources {
+  std::uint32_t local_path_index{0U};
+  std::uint32_t endpoint_id{0U};
+  DirectMemory memory{};
+  std::array<std::uint8_t, kEidBytes> peer_eid{};
+  void* memory_import{nullptr};
 };
 
 struct DeviceAivTransportResources {
@@ -88,6 +98,8 @@ struct DeviceAivTransportResources {
   // BatchGet uses these fields when more than one local EID is configured.
   DeviceAivPathResources* paths{nullptr};
   std::uint32_t path_count{0U};
+  DeviceAivRemotePathResources* remote_paths{nullptr};
+  std::uint32_t remote_path_count{0U};
 };
 
 // Queue arrays remain core-major for the AIV ABI, but path assignment is
@@ -128,6 +140,7 @@ struct PeerChannelRequest {
   const std::array<std::uint8_t, kEidBytes>* peer_eid{nullptr};
   const QpCreateInfo* local_jetty_info{nullptr};
   const char* role{nullptr};
+  std::uint32_t endpoint_id{0U};
 };
 
 struct PeerChannel {
@@ -144,7 +157,8 @@ void ReleaseDeviceAivTransport(const DeviceAivTransportResources& resources);
 // Converts the Link descriptor's raw UMDK token to the AIV WQE token format.
 bool LoadPeerMemory(PeerLink* link, std::uint64_t peer_base,
                     DirectMemory* memory,
-                    std::array<std::uint8_t, kEidBytes>* peer_eid);
+                    std::array<std::uint8_t, kEidBytes>* peer_eid,
+                    std::uint32_t endpoint_id = 0U);
 
 bool ImportPeerJetty(const DirectHccpApi& api, void* context,
                      const std::uint8_t* peer_key, std::uint32_t peer_key_bytes,

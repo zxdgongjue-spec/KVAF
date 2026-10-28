@@ -34,6 +34,10 @@ struct NpuRuntimeOptions {
   // paths and stripe core/Jetty workers over them in list order. BatchPut
   // remains on the first EID.
   std::vector<std::string> npu_eids{};
+  // Optional strict CPU EID for each logical AIV core. All Jettys on a core
+  // share that endpoint. Repeated EIDs are allowed for control experiments.
+  // Requires one local NPU EID (explicit or discovered), no adaptive tuning.
+  std::vector<std::string> peer_eids_by_core{};
   // Opt-in startup BatchGet tuning over adaptive_peer_ub_devices. A K-side
   // explicit device uses the native first-working path without tuning.
   bool adaptive_ub_device{false};
@@ -66,6 +70,7 @@ class NpuRuntime final : public Runtime {
   std::uint32_t npu_core_count() const;
   std::uint32_t jettys_per_core() const;
   const std::vector<std::string>& npu_eids() const;
+  const std::vector<std::string>& peer_eids_by_core() const;
   std::uint32_t batch_get_token_bytes() const;
   std::uint32_t batch_get_tokens_per_block() const;
 

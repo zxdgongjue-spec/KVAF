@@ -170,6 +170,7 @@ bool GetCandidateInfoAt(const std::string& endpoint, uint32_t candidate_id,
   candidate.candidate_id = response.candidate_id;
   candidate.device_id = response.device_id;
   candidate.eid_index = response.eid_index;
+  std::memcpy(candidate.eid.data(), response.eid, candidate.eid.size());
   candidate.device_name.assign(
       response.device_name,
       static_cast<const char*>(name_end) - response.device_name);
@@ -193,7 +194,7 @@ bool AllocateRegionAt(const std::string& endpoint, uint64_t ddr_bytes, uint64_t 
   if (!Exchange(endpoint, request, &response, error) ||
       !IsValidResponseHeader(response.header, Command::kAllocateRegion, sizeof(response)) ||
       !ResultOk(static_cast<Result>(response.result), error) || response.session_id == 0U ||
-      response.peer_base == 0U || response.peer_length != ddr_bytes ||
+      response.peer_base == 0U || response.peer_length != ddr_bytes || response.endpoint_id != 0U ||
       response.token_id == 0U || response.token_value == 0U ||
       response.segment_key_bytes == 0U || response.segment_key_bytes > kSegKeyBytes) {
     if (error != nullptr && error->empty()) *error = "peer service returned an invalid region descriptor";
@@ -206,6 +207,7 @@ bool AllocateRegionAt(const std::string& endpoint, uint64_t ddr_bytes, uint64_t 
   allocated.token_id = response.token_id;
   allocated.token_value = response.token_value;
   allocated.segment_key_bytes = response.segment_key_bytes;
+  allocated.endpoint_id = response.endpoint_id;
   std::memcpy(allocated.eid.data(), response.peer_eid, allocated.eid.size());
   std::memcpy(allocated.segment_key.data(), response.segment_key, allocated.segment_key.size());
   *region = allocated;
@@ -232,6 +234,7 @@ bool CreateChannelAt(const std::string& endpoint, const PeerRegion& region,
   CreateChannelRequest request{};
   request.header = MakeHeader(Command::kCreateChannel, sizeof(request));
   request.session_id = region.session_id;
+  request.endpoint_id = region.endpoint_id;
   request.local_tp_handle = local_tp_handle;
   request.local_qp_key_bytes = local_qp_key_bytes;
   request.peer_token_value = peer_token_value;
@@ -297,6 +300,7 @@ Status PeerLink::AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
     return ToStatus("peer DDR allocation failed", std::move(error));
   }
   regions_[allocated.base] = allocated;
+  endpoints_[allocated.base][allocated.endpoint_id] = allocated;
   if (region != nullptr) *region = allocated;
   return Status::OK();
 }
@@ -308,15 +312,67 @@ Status PeerLink::ReleaseRegion(uint64_t base) {
   if (!ReleaseRegionAt(address_, found->second, &error)) {
     return ToStatus("peer DDR release failed", std::move(error));
   }
+  endpoints_.erase(base);
   regions_.erase(found);
   return Status::OK();
 }
 
-Status PeerLink::LookupRegion(uint64_t base, PeerRegion* region) const {
-  if (region == nullptr) return Status::InvalidArgument("peer region output must not be null");
+Status PeerLink::BindRegionEndpoint(uint64_t base, uint32_t candidate_id,
+                                    PeerRegion* region) {
+  if (region == nullptr) return Status::InvalidArgument("peer endpoint output must not be null");
   const auto found = regions_.find(base);
   if (found == regions_.end()) return Status::NotFound("peer region was not found");
-  *region = found->second;
+  BindRegionEndpointRequest request{};
+  request.header = MakeHeader(Command::kBindRegionEndpoint, sizeof(request));
+  request.session_id = found->second.session_id;
+  request.candidate_id = candidate_id;
+  BindRegionEndpointResponse response{};
+  std::string error;
+  if (!Exchange(address_, request, &response, &error) ||
+      !IsValidResponseHeader(response.header, Command::kBindRegionEndpoint, sizeof(response)) ||
+      !ResultOk(static_cast<Result>(response.result), &error)) {
+    return ToStatus("peer endpoint binding failed", std::move(error));
+  }
+  // Every endpoint exports exactly the same allocation and authentication
+  // value. Only the EID, context-owned token ID and segment key may differ.
+  if (response.session_id != found->second.session_id || response.peer_base != base ||
+      response.peer_length != found->second.length || response.token_id == 0U ||
+      response.token_value != found->second.token_value ||
+      response.segment_key_bytes == 0U || response.segment_key_bytes > kSegKeyBytes ||
+      std::all_of(response.peer_eid, response.peer_eid + kEidBytes,
+                  [](uint8_t byte) { return byte == 0U; })) {
+    return Status::Internal("peer endpoint returned an inconsistent region descriptor");
+  }
+  PeerRegion bound{};
+  bound.session_id = response.session_id;
+  bound.base = response.peer_base;
+  bound.length = response.peer_length;
+  bound.token_id = response.token_id;
+  bound.token_value = response.token_value;
+  bound.endpoint_id = response.endpoint_id;
+  bound.segment_key_bytes = response.segment_key_bytes;
+  std::memcpy(bound.eid.data(), response.peer_eid, bound.eid.size());
+  std::memcpy(bound.segment_key.data(), response.segment_key, bound.segment_key.size());
+  auto& endpoints = endpoints_[base];
+  const auto existing = endpoints.find(bound.endpoint_id);
+  if (existing != endpoints.end() &&
+      (existing->second.eid != bound.eid || existing->second.token_id != bound.token_id ||
+       existing->second.segment_key_bytes != bound.segment_key_bytes ||
+       existing->second.segment_key != bound.segment_key)) {
+    return Status::Internal("peer endpoint ID was reused for a different registration");
+  }
+  endpoints[bound.endpoint_id] = bound;
+  *region = bound;
+  return Status::OK();
+}
+
+Status PeerLink::LookupRegion(uint64_t base, PeerRegion* region, uint32_t endpoint_id) const {
+  if (region == nullptr) return Status::InvalidArgument("peer region output must not be null");
+  const auto found = endpoints_.find(base);
+  if (found == endpoints_.end()) return Status::NotFound("peer region was not found");
+  const auto endpoint = found->second.find(endpoint_id);
+  if (endpoint == found->second.end()) return Status::NotFound("peer endpoint was not found");
+  *region = endpoint->second;
   return Status::OK();
 }
 
@@ -325,11 +381,13 @@ Status PeerLink::CreateChannel(
     uint32_t local_qp_key_bytes, const uint8_t local_eid[kEidBytes],
     uint32_t peer_token_value, uint64_t local_tp_handle, uint32_t local_psn,
     std::array<uint8_t, kQpKeyBytes>* peer_qp_key,
-    uint32_t* peer_qp_key_bytes, uint64_t* peer_tp_handle, uint32_t* peer_psn) {
-  const auto found = regions_.find(region_base);
-  if (found == regions_.end()) return Status::NotFound("peer region was not found");
+    uint32_t* peer_qp_key_bytes, uint64_t* peer_tp_handle, uint32_t* peer_psn,
+    uint32_t endpoint_id) {
+  PeerRegion region{};
+  const Status status = LookupRegion(region_base, &region, endpoint_id);
+  if (!status.ok()) return status;
   std::string error;
-  return CreateChannelAt(address_, found->second, local_qp_key, local_qp_key_bytes,
+  return CreateChannelAt(address_, region, local_qp_key, local_qp_key_bytes,
                          local_eid, peer_token_value, local_tp_handle, local_psn,
                          peer_qp_key, peer_qp_key_bytes, peer_tp_handle, peer_psn, &error)
              ? Status::OK()

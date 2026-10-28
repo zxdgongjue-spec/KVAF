@@ -183,7 +183,11 @@ build-npu/bin/kvaf_execute_batch_put_kernels.o
 服务会自动发现 UB device/EID，并打印 `CANDIDATE_DISCOVERED` 与 `LISTEN`。也可按需要传入 `--ub-device NAME --eid-index N` 来选定对应的端口。
 N 端性能脚本开启 `--adaptive-ub-device` 后，K 端未指定设备时会从脚本配置的
 `KVAF_ADAPTIVE_UB_DEVICES` 中测速选优；K 端指定单个 `--ub-device` 时走原生路径。
-详见 [Runtime 启动选优](runtime/README.md#可选启动-ub-device-选优)；N/K 两端需同时升级至控制协议 v6。
+详见 [Runtime 启动选优](runtime/README.md#可选启动-ub-device-选优)；N/K 两端需同时升级至控制协议 v7。
+
+`peer_eids_by_core` 支持为 2/4/8 核等配置逐核指定 CPU EID，同核 Jetty 使用同一
+目标，所有 EID 共享一块 DDR。用法及共享/不同 EID 对照扫描见
+[按 core 指定 CPU EID](runtime/README.md#按-aiv-core-指定-cpu-eid)。
 
 ### 2. 运行 NPU 端到端测试
 
