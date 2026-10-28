@@ -52,7 +52,21 @@ class InflightConfigTests(unittest.TestCase):
                 records[fields["operation"]] = fields
         self.assertEqual(records["batch_get_kernel_post"]["mean_cycles"], "80.000")
         self.assertEqual(records["batch_get_kernel_completion_wait"]["mean_cycles"], "100.000")
+        self.assertEqual(records["batch_get_kernel_first_doorbell"]["mean_cycles"], "20.000")
+        self.assertEqual(records["batch_get_kernel_transfer_window"]["mean_cycles"], "190.000")
         self.assertIn("peak_submitted_not_drained_mean=2048", output.getvalue())
+
+        profile.update(first_doorbell_cycle=0, active_requests=0)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            perf.print_kernel_profile([[profile]], 0, 1000, 1, 1, 2049, 0, 656)
+        records = {}
+        for line in output.getvalue().splitlines():
+            if line.startswith("PERF_RESULT "):
+                fields = dict(field.split("=", 1) for field in line.split()[1:])
+                records[fields["operation"]] = fields
+        self.assertEqual(records["batch_get_kernel_first_doorbell"]["mean_cycles"], "0.000")
+        self.assertEqual(records["batch_get_kernel_transfer_window"]["mean_cycles"], "0.000")
 
 
 if __name__ == "__main__":

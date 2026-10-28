@@ -29,16 +29,25 @@ STAGES = {
     "batch_get_kernel_post": "post_",
     "batch_get_kernel_completion_wait": "completion_wait_",
 }
+OPTIONAL_STAGES = {
+    "batch_get_kernel_first_doorbell": "first_doorbell_",
+    "batch_get_kernel_transfer_window": "transfer_window_",
+}
 STATS = ("mean", "p50", "p90", "p99")
-RUN_METRICS = tuple(prefix + stat + "_us" for prefix in STAGES.values() for stat in STATS)
+RUN_METRICS = tuple(prefix + stat + "_us"
+                    for prefix in (*STAGES.values(), *OPTIONAL_STAGES.values())
+                    for stat in STATS)
 PAIR_METRICS = (
     "mean_us", "p50_us", "p90_us", "p99_us", "p50_GBps",
     "wall_p50_us", "wall_p99_us", "post_p50_us", "completion_wait_p50_us",
     "posts_per_call", "completions_per_call",
+    "first_doorbell_p50_us", "first_doorbell_p99_us",
+    "transfer_window_p50_us", "transfer_window_p99_us",
 )
 DELTA_FIELDS = (
     "p50_speedup", "p50_latency_reduction_pct", "p99_latency_reduction_pct",
     "p50_bandwidth_gain_pct", "post_p50_change_us", "completion_wait_p50_change_us",
+    "first_doorbell_p50_change_us", "transfer_window_p50_change_us",
 )
 PAIR_VALUES = tuple(
     variant + "_" + metric
@@ -109,8 +118,13 @@ def _parse_run(path: Path) -> dict:
             if operation in results:
                 raise ValueError(f"duplicate PERF_RESULT operation={operation}")
             results[operation] = record
-    for operation, prefix in STAGES.items():
+    for operation, prefix in (*STAGES.items(), *OPTIONAL_STAGES.items()):
         if operation not in results:
+            if operation in OPTIONAL_STAGES:
+                # Old benchmark logs have no first-doorbell stage. An absent
+                # measurement is distinct from the zero for an idle core.
+                row.update({prefix + stat + "_us": "" for stat in STATS})
+                continue
             raise ValueError(f"missing PERF_RESULT operation={operation}")
         record = results[operation]
         if (int(record["samples"]) != int(config["iterations"]) or
@@ -158,8 +172,9 @@ def compare_runs(runs: list[dict]) -> tuple[list[dict], list[dict]]:
         pair = {name: base[name] for name in CONFIG_FIELDS}
         pair["round"] = base["round"]
         for metric in PAIR_METRICS:
-            pair["baseline_" + metric] = base[metric]
-            pair["small_post_" + metric] = small[metric]
+            available = base[metric] != "" and small[metric] != ""
+            pair["baseline_" + metric] = base[metric] if available else ""
+            pair["small_post_" + metric] = small[metric] if available else ""
         pair.update(
             p50_speedup=base["p50_us"] / small["p50_us"],
             p50_latency_reduction_pct=100 * (1 - small["p50_us"] / base["p50_us"]),
@@ -171,6 +186,12 @@ def compare_runs(runs: list[dict]) -> tuple[list[dict], list[dict]]:
                                            base["completion_wait_p50_us"]),
             baseline_log=base["log_file"], small_post_log=small["log_file"],
         )
+        for prefix in OPTIONAL_STAGES.values():
+            metric = prefix + "p50_us"
+            pair[prefix + "p50_change_us"] = (
+                small[metric] - base[metric]
+                if base[metric] != "" and small[metric] != "" else ""
+            )
         pairs.append(pair)
 
     configurations = {}
@@ -180,6 +201,10 @@ def compare_runs(runs: list[dict]) -> tuple[list[dict], list[dict]]:
     for group in configurations.values():
         row = {name: group[0][name] for name in CONFIG_FIELDS}
         row.update(rounds=len(group), round_ids=";".join(str(pair["round"]) for pair in group))
+        for prefix in OPTIONAL_STAGES.values():
+            row[prefix + "rounds"] = sum(
+                pair["baseline_" + prefix + "p50_us"] != "" for pair in group
+            )
         for metric in PAIR_VALUES:
             values = [pair[metric] for pair in group if pair[metric] != ""]
             row["median_" + metric] = statistics.median(values) if values else ""
@@ -219,7 +244,8 @@ def main(argv: list[str] | None = None) -> int:
             ("small_post_pairs.csv", pairs,
              ("round",) + CONFIG_FIELDS + PAIR_VALUES + ("baseline_log", "small_post_log")),
             ("small_post_summary.csv", summary,
-             CONFIG_FIELDS + ("rounds", "round_ids") + tuple("median_" + name for name in PAIR_VALUES)),
+             CONFIG_FIELDS + ("rounds", "round_ids", "first_doorbell_rounds", "transfer_window_rounds") +
+             tuple("median_" + name for name in PAIR_VALUES)),
         )
         # Validate every log and pair before creating any result CSV.
         for filename, rows, columns in outputs:

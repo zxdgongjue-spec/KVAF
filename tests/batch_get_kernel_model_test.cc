@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdlib>
 #include <deque>
 #include <iostream>
@@ -26,9 +27,33 @@ struct Queue {
   uint64_t producer = 0, completed = 0, cq_producer = 0, cq_consumer = 0;
   std::deque<uint64_t> checkpoints;
   bool timeout = false, error = false;
+  uint32_t tp_id = 0, remote_token_id = 0, remote_token_value = 0, local_token_id = 0;
+  std::array<uint32_t, 4> remote_eid{};
 };
 std::vector<Queue> hardware;
 uint64_t doorbells = 0;
+enum class EventKind { kVector, kSqCopy, kSqDoorbell };
+struct Event { EventKind kind; uint32_t queue; };
+std::vector<Event> trace;
+
+void VectorCall() {
+  ++vector_calls;
+  trace.push_back({EventKind::kVector, UINT32_MAX});
+}
+
+void SqCopy(void* address, uint64_t bytes) {
+  const auto destination = reinterpret_cast<uintptr_t>(address);
+  for (uint32_t i = 0; i < hardware.size(); ++i) {
+    const auto begin = reinterpret_cast<uintptr_t>(hardware[i].sq.data());
+    const auto end = begin + hardware[i].sq.size() * sizeof(uint32_t);
+    if (destination >= begin && destination < end) {
+      CHECK(destination + bytes <= end);
+      trace.push_back({EventKind::kSqCopy, i});
+      return;
+    }
+  }
+  CHECK(false);
+}
 
 void Doorbell(uint32_t value, uint32_t* address) {
   for (auto& queue : hardware) {
@@ -41,6 +66,8 @@ void Doorbell(uint32_t value, uint32_t* address) {
     }
     if (address != &queue.sq_db) continue;
     ++doorbells;
+    trace.push_back({EventKind::kSqDoorbell,
+                     static_cast<uint32_t>(&queue - hardware.data())});
     const uint32_t added = value - queue.sq_db;
     CHECK(added > 0 && added <= 128);
     CHECK(queue.producer + added - queue.completed < 32768);
@@ -50,6 +77,14 @@ void Doorbell(uint32_t value, uint32_t* address) {
       CHECK((wqe[0] >> 31U) == 1U - ((pi / 32768) & 1U));
       const bool signal = (wqe[0] & (1U << 21U)) != 0;
       CHECK(((wqe[0] >> 16U) & 3U) == (signal ? 2U : 1U));
+      CHECK(wqe[1] == (0x6U << 8U));
+      CHECK(wqe[2] == ((queue.tp_id & 0x00ffffffU) | 0x01000000U));
+      CHECK(wqe[3] == (queue.remote_token_id & 0x000fffffU));
+      for (uint32_t word = 0; word < 4; ++word) {
+        CHECK(wqe[4 + word] == queue.remote_eid[word]);
+      }
+      CHECK(wqe[8] == queue.remote_token_value);
+      CHECK(wqe[13] == queue.local_token_id);
       if (signal) queue.checkpoints.push_back(queue.producer);
     }
     queue.sq_db = value;
@@ -105,6 +140,8 @@ struct Fixture {
         entities(c * j), statuses(c) {
     aiv_model::hardware.clear();
     aiv_model::hardware.resize(c * j);
+    aiv_model::trace.clear();
+    aiv_model::vector_calls = 0;
     for (uint32_t i = 0; i < remote.size(); ++i) remote[i] = (i * 7 + 1) % 251;
     for (uint32_t i = 0; i < 16; ++i) {
       addresses[i] = reinterpret_cast<uint64_t>(remote.data() + 16 * i);
@@ -123,7 +160,14 @@ struct Fixture {
       entity.remote_host_ddr_size = remote.size();
       entity.local_hbm_address = reinterpret_cast<uint64_t>(output.data());
       entity.local_hbm_size = output.size();
-      entity.local_token_id = 1;
+      entity.tp_id = hardware.tp_id = 0x100U + i;
+      entity.remote_token_id = hardware.remote_token_id = 11;
+      entity.remote_token_value = hardware.remote_token_value = 22;
+      entity.local_token_id = hardware.local_token_id = 0x200U + i;
+      for (uint32_t byte = 0; byte < 16; ++byte) {
+        entity.remote_eid[byte] = static_cast<uint8_t>(i * 17 + byte);
+      }
+      std::memcpy(hardware.remote_eid.data(), entity.remote_eid, 16);
       entity.sq_va = reinterpret_cast<uint64_t>(hardware.sq.data());
       entity.sq_db_va = reinterpret_cast<uint64_t>(&hardware.sq_db);
       entity.sq_depth = 32768;
@@ -173,6 +217,12 @@ struct Fixture {
       CHECK(profile.setup_done_cycle <= profile.post_done_cycle);
       CHECK(profile.post_done_cycle <= profile.completion_done_cycle);
       CHECK(profile.completion_done_cycle <= profile.kernel_finish_cycle);
+      if (profile.active_requests != 0) {
+        CHECK(profile.first_doorbell_cycle >= profile.kernel_start_cycle);
+        CHECK(profile.first_doorbell_cycle <= profile.post_done_cycle);
+      } else {
+        CHECK(profile.first_doorbell_cycle == 0);
+      }
       profile_cq += profile.completion_count;
       if (args.batch_get_max_inflight_total && count > args.batch_get_max_inflight_total) {
         CHECK(profile.peak_submitted_not_drained <=
@@ -210,11 +260,30 @@ int main() {
     Fixture f(257, 2, 2, 2048);
     f.Run(32);
     const bool small_posts = kvaf_batch_get::kSmallPostMaxRequests >= 32;
+    CHECK(aiv_model::vector_calls == 2);  // one fill per core, even with two Jettys
     for (uint32_t c = 0; c < 2; ++c) {
       CHECK(f.statuses[c].profile.total_posts == (small_posts ? 2 : 1));
       CHECK(f.statuses[c].profile.completion_count == (small_posts ? 2 : 1));
       CHECK(f.queues[c * 2].sq_producer_index == (small_posts ? 8 : 16));
       CHECK(f.queues[c * 2 + 1].sq_producer_index == (small_posts ? 8 : 0));
+    }
+    if (small_posts) {
+      for (uint32_t c = 0; c < 2; ++c) {
+        std::size_t first_doorbell = aiv_model::trace.size();
+        std::size_t second_copy = aiv_model::trace.size();
+        for (std::size_t i = 0; i < aiv_model::trace.size(); ++i) {
+          const auto& event = aiv_model::trace[i];
+          if (event.kind == aiv_model::EventKind::kSqDoorbell && event.queue == c * 2) {
+            first_doorbell = i;
+          }
+          if (event.kind == aiv_model::EventKind::kSqCopy && event.queue == c * 2 + 1) {
+            second_copy = i;
+          }
+        }
+        CHECK(first_doorbell < aiv_model::trace.size());
+        CHECK(second_copy < aiv_model::trace.size());
+        CHECK(first_doorbell < second_copy);
+      }
     }
     // Replay on the same queues while changing both the request count and
     // the selected post width, including the experiment's default cutoff.
@@ -237,8 +306,9 @@ int main() {
       auto& h = aiv_model::hardware[i];
       q.magic = 0x4b564151U;
       q.initialized = 1;
-      q.sq_producer_index = h.producer = h.completed = 32764;
-      h.sq_db = 32764;
+      const uint64_t heads[] = {32764, 65534, 131069, 0};
+      q.sq_producer_index = h.producer = h.completed = heads[i];
+      h.sq_db = static_cast<uint32_t>(heads[i]);
       q.cq_consumer_index = h.cq_producer = h.cq_consumer = 7;
     }
     for (int replay = 0; replay < 20; ++replay) f.Run(33);

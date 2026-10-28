@@ -40,3 +40,8 @@ checks matching baseline/small-post configurations, and rejects incomplete or
 unpaired logs. Summary statistics are medians of round statistics and paired
 speedups, not percentiles of pooled samples. See the
 [experiment guide](../../docs/batch_get_small_post_experiment.md#csv-汇总).
+
+New benchmark logs export kernel-start-to-first-doorbell latency and the
+first-doorbell-to-completion window. Old logs remain supported: missing timeline
+values stay empty, and paired summaries use only rounds with both measurements.
+The summary includes `first_doorbell_rounds` and `transfer_window_rounds`.

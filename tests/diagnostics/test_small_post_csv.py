@@ -14,7 +14,8 @@ class SmallPostCsvTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
 
-    def log(self, name, p50_cycles=3485.5, seed=20260903, clock=500):
+    def log(self, name, p50_cycles=3485.5, seed=20260903, clock=500,
+            first_delay_cycles=None):
         config = dict(
             token_bytes=656, miss_count=32, aiv_cores=2, jettys_per_core=2,
             request_length=32768, table_capacity=16384, tokens_per_block=128,
@@ -29,6 +30,9 @@ class SmallPostCsvTests(unittest.TestCase):
                      "jettys_per_core=2 request_length=32768 miss_count=32")
         stages = {"total": p50_cycles, "wall": p50_cycles + 100,
                   "post": 600, "completion_wait": 2000}
+        if first_delay_cycles is not None:
+            stages.update(first_doorbell=first_delay_cycles,
+                          transfer_window=p50_cycles - first_delay_cycles)
         for stage, cycles in stages.items():
             lines.append(
                 f"PERF_RESULT operation=batch_get_kernel_{stage} samples=1000 "
@@ -53,6 +57,29 @@ class SmallPostCsvTests(unittest.TestCase):
         self.assertAlmostEqual(run["p50_GBps"], 20992 / 6971)
         self.assertEqual(run["posts_per_call"], 2)
         self.assertEqual(run["completions_per_call"], 2)
+        self.assertEqual(run["first_doorbell_p50_us"], "")
+
+    def test_timeline_metrics_and_paired_summary(self):
+        baseline = parse_run(self.log("r1_n32_baseline.log", first_delay_cycles=500))
+        small = parse_run(self.log("r1_n32_small-post.log", first_delay_cycles=250))
+        self.assertEqual(baseline["first_doorbell_p50_us"], 1)
+        self.assertEqual(small["first_doorbell_p50_us"], 0.5)
+        pairs, summary = compare_runs([baseline, small])
+        self.assertEqual(pairs[0]["first_doorbell_p50_change_us"], -0.5)
+        self.assertEqual(summary[0]["first_doorbell_rounds"], 1)
+        self.assertEqual(summary[0]["transfer_window_rounds"], 1)
+        self.assertEqual(summary[0]["median_first_doorbell_p50_change_us"], -0.5)
+
+    def test_mixed_old_new_timeline_is_not_treated_as_zero(self):
+        baseline = parse_run(self.log("r1_n32_baseline.log"))
+        small = parse_run(self.log("r1_n32_small-post.log", first_delay_cycles=250))
+        pairs, summary = compare_runs([baseline, small])
+        self.assertEqual(small["first_doorbell_p50_us"], 0.5)
+        self.assertEqual(pairs[0]["baseline_first_doorbell_p50_us"], "")
+        self.assertEqual(pairs[0]["small_post_first_doorbell_p50_us"], "")
+        self.assertEqual(pairs[0]["first_doorbell_p50_change_us"], "")
+        self.assertEqual(summary[0]["first_doorbell_rounds"], 0)
+        self.assertEqual(summary[0]["median_first_doorbell_p50_change_us"], "")
 
     def test_exports_three_csv_files(self):
         self.log("r1_n32_baseline.log", p50_cycles=5000)

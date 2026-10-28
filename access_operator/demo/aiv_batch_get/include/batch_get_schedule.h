@@ -41,6 +41,18 @@ KVAF_BATCH_GET_SCHEDULE_INLINE uint32_t SelectPostWidth(
   return width < kWqesPerPost ? width : kWqesPerPost;
 }
 
+KVAF_BATCH_GET_SCHEDULE_INLINE bool CanFuseSmallPosts(
+    uint32_t count, uint32_t post_width, uint32_t jettys) {
+  if (count == 0U || count > kWqesPerPost || post_width == 0U ||
+      post_width >= kWqesPerPost) {
+    return false;
+  }
+  const uint32_t posts = PostCount(count, post_width);
+  // Each post must have a distinct Jetty, so all SQ heads can be snapshotted
+  // before the one vector fill. Larger groups retain the two-bank pipeline.
+  return posts > 1U && posts <= jettys;
+}
+
 KVAF_BATCH_GET_SCHEDULE_INLINE uint32_t CoreBudget(
     uint32_t total, uint32_t cores, uint32_t core) {
   return total / cores + (core < total % cores);

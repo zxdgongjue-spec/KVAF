@@ -11,12 +11,16 @@
 #define __gm__
 #define __ubuf__
 #define __simt_vf__
+#define __simt_callee__
 #define LAUNCH_BOUND(n)
 
 namespace aiv_model {
 alignas(64) inline uint8_t ub[160 * 1024];
 inline uint32_t core = 0;
 inline uint64_t cycle = 0;
+inline uint64_t vector_calls = 0;
+void VectorCall();
+void SqCopy(void* address, uint64_t bytes);
 void Poll(void* address);
 void Doorbell(uint32_t value, uint32_t* address);
 }  // namespace aiv_model
@@ -42,6 +46,7 @@ inline uintptr_t get_imm(uint32_t offset) {
 }
 inline void copy_ubuf_to_gm_align_v2(float* dst, float* src, uint64_t config, uint64_t) {
   std::memcpy(dst, src, config >> 25U);
+  aiv_model::SqCopy(dst, config >> 25U);
 }
 inline void st_dev(uint32_t value, uint32_t* address, int) {
   aiv_model::Doorbell(value, address);
@@ -65,6 +70,7 @@ namespace Simt {
 struct Dim3 { uint32_t x, y, z; };
 template <auto Function, typename... Args>
 void VF_CALL(Dim3 dim, Args... args) {
+  aiv_model::VectorCall();
   for (threadIdx.x = 0; threadIdx.x < dim.x; ++threadIdx.x) Function(args...);
 }
 }  // namespace Simt

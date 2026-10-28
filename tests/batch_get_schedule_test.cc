@@ -127,6 +127,15 @@ int main() {
   CHECK(kvaf_batch_get::SelectPostWidth(1, 0, 64, 256) == 128);
   CHECK(kvaf_batch_get::SelectPostWidth(1, 1, 64, 256) == 1);
   CHECK(kvaf_batch_get::SelectPostWidth(33, 17, 2, 256) == 9);
+  CHECK(kvaf_batch_get::CanFuseSmallPosts(16, 8, 2));
+  CHECK(kvaf_batch_get::CanFuseSmallPosts(17, 9, 2));
+  CHECK(kvaf_batch_get::CanFuseSmallPosts(128, 64, 2));
+  CHECK(kvaf_batch_get::CanFuseSmallPosts(128, 2, 64));
+  CHECK(!kvaf_batch_get::CanFuseSmallPosts(129, 65, 2));
+  CHECK(!kvaf_batch_get::CanFuseSmallPosts(128, 1, 64));
+  CHECK(!kvaf_batch_get::CanFuseSmallPosts(16, 128, 2));
+  CHECK(!kvaf_batch_get::CanFuseSmallPosts(1, 1, 2));
+  CHECK(!kvaf_batch_get::CanFuseSmallPosts(0, 0, 64));
   CHECK(kvaf_batch_get::SelectPostWidth(UINT32_MAX, UINT32_MAX, 64,
                                        UINT32_MAX) == 128);
   CHECK(kvaf_batch_get::PostCount(UINT32_MAX, 1) == UINT32_MAX);

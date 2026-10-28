@@ -431,6 +431,7 @@ def print_kernel_profile(
         "kernel_setup": [],
         "kernel_compact": [],
         "kernel_post": [],
+        "kernel_first_doorbell": [],
         "kernel_transfer_window": [],
         "kernel_completion_wait": [],
         "kernel_finalize": [],
@@ -441,6 +442,8 @@ def print_kernel_profile(
             "setup_ms": 0.0,
             "compact_ms": 0.0,
             "post_ms": 0.0,
+            "first_doorbell_ms": 0.0,
+            "transfer_window_ms": 0.0,
             "completion_wait_ms": 0.0,
             "finalize_ms": 0.0,
             "active_requests": 0.0,
@@ -471,6 +474,7 @@ def print_kernel_profile(
             "kernel_setup": 0.0,
             "kernel_compact": 0.0,
             "kernel_post": 0.0,
+            "kernel_first_doorbell": 0.0,
             "kernel_transfer_window": 0.0,
             "kernel_completion_wait": 0.0,
             "kernel_finalize": 0.0,
@@ -486,6 +490,11 @@ def print_kernel_profile(
                 profile, "completion_done_cycle", "kernel_finish_cycle"
             )
             first_doorbell = int(profile["first_doorbell_cycle"])
+            first_doorbell_delay = (
+                0.0 if first_doorbell == 0 else
+                (first_doorbell - int(profile["kernel_start_cycle"]))
+                / clock_mhz / 1000.0
+            )
             transfer = (
                 0.0
                 if first_doorbell == 0
@@ -499,6 +508,9 @@ def print_kernel_profile(
             critical["kernel_setup"] = max(critical["kernel_setup"], setup)
             critical["kernel_compact"] = max(critical["kernel_compact"], compact)
             critical["kernel_post"] = max(critical["kernel_post"], post)
+            critical["kernel_first_doorbell"] = max(
+                critical["kernel_first_doorbell"], first_doorbell_delay
+            )
             critical["kernel_transfer_window"] = max(
                 critical["kernel_transfer_window"], transfer
             )
@@ -513,6 +525,8 @@ def print_kernel_profile(
             accumulator["setup_ms"] += setup
             accumulator["compact_ms"] += compact
             accumulator["post_ms"] += post
+            accumulator["first_doorbell_ms"] += first_doorbell_delay
+            accumulator["transfer_window_ms"] += transfer
             accumulator["completion_wait_ms"] += completion
             accumulator["finalize_ms"] += finalize
             accumulator["active_requests"] += int(profile["active_requests"])
@@ -538,6 +552,7 @@ def print_kernel_profile(
         f"request_length={request_length} miss_count={miss_count} "
         "setup=entity_queue_and_miss_count compact=removed_direct_prefix "
         "post=sum_group_capacity_check_wqe_fill_sq_copy_and_doorbell "
+        "first_doorbell=kernel_start_to_first_doorbell_zero_for_idle_core "
         "transfer_window=first_doorbell_to_all_cq_complete "
         "completion_wait=sum_all_group_drains "
         "peak_submitted_not_drained=per_core_conservative_software_count "
