@@ -72,16 +72,18 @@ CPU 服务默认优先使用建链选中设备附近的 DDR，容量不足时允
 探测候选分别选择各自的本地内存。指定节点时直接使用该节点，不依赖 device 的拓扑。
 
 默认按部署设备的 `udmac<N>d<D>e<E>` 命名约定，将 `c<N>` 匹配到 Linux
-`physical_package_id=N`，从该 package 中选择 cpuset 允许且有内存的最小编号节点
-作为首选。该对应关系要求 c 编号与 Linux package 编号一致；node 归属从 Linux
+`physical_package_id=N`，将该 package 中 cpuset 允许且有内存的所有节点
+组成首选集合。该对应关系要求 c 编号与 Linux package 编号一致；node 归属从 Linux
 CPU topology 读取，不按数量平均划分。可用 `lscpu -e=CPU,NODE,SOCKET -y` 查看。
 
 UB 的 `device/numa` 在上游驱动中输出固件 proximity domain（PXM），不是已转换的
 Linux node ID；当前实现不直接使用该值，也不探测未经确认的设备 NUMA 属性。
 
-默认对每个 region 设置 `MPOL_PREFERRED`：先尝试首选节点，无法满足时由 Linux
-根据 NUMA 拓扑和内存状态回退到其他允许节点。它不保证同一 package 的两个节点
-平均分担内存，也不保证所有页都在首选节点。`--numa-bind N` 则使用 `MPOL_BIND`，
+默认对每个 region 设置 `MPOL_PREFERRED_MANY`：例如本地集合为 `{0,1}` 时，
+Linux 优先在这组节点内分配，组内无法满足时再回退到其他允许节点。
+组内选择由 Linux 根据 NUMA 拓扑和内存状态决定，不固定先用 node 0，也不要求平均分配。
+此策略要求 Linux 5.15 或更新内核及包含该策略定义的内核头文件，目标 Linux 6.6 支持。
+`--numa-bind N` 则使用 `MPOL_BIND`，
 严格限制在 node N；该节点不足时可能触发 OOM。两种情况下都受系统 cpuset 限制。
 
 每块 DDR 使用独立 `mmap`，在触页和 segment 注册前设置区域策略。默认触页时临时
@@ -90,9 +92,11 @@ Linux node ID；当前实现不直接使用该值，也不探测未经确认的�
 `default` 和 `thp` 页模式都会主动触页，`thp` 保留 2 MiB 对齐和大页建议；segment
 注销后释放映射，不需要安装 libnuma。
 
-`REGION_NUMA_ALLOCATED` 日志中的 `policy_node` 是首选或强制节点，`memory_policy`
-为 `preferred` 或 `bind`；实际页分布用 `numastat -p <pid>` 或 `/proc/<pid>/numa_maps`
-查看。为使一个服务能处理两侧设备，启动时应允许两颗 CPU 的核，避免额外绑核到一侧。
+`REGION_NUMA_ALLOCATED` 日志中的 `policy_nodes` 是首选或强制节点集合，`memory_policy`
+为 `preferred_many` 或 `bind`，例如 `policy_nodes=0,1 memory_policy=preferred_many`。
+`touch_cpu_affinity` 表示触页时的 CPU 亲和性；显式指定节点时显示 `unchanged`。
+实际页分布用 `numastat -p <pid>` 或 `/proc/<pid>/numa_maps` 查看。
+为使一个服务能处理两侧设备，启动时应允许两颗 CPU 的核，避免额外绑核到一侧。
 
 `REGION_ALLOCATED` 日志会记录 `page_mode`。默认 THP 模式还应通过
 `/proc/<pid>/smaps` 的 `AnonHugePages` 验证实际

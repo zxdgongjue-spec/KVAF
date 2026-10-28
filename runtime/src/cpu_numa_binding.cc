@@ -96,7 +96,6 @@ Status Resolve(const std::string& device, std::optional<int> requested_node, Bin
     if (!Contains(online_nodes, *requested_node) || !Contains(memory_nodes, *requested_node))
       return Status::InvalidArgument("requested NUMA node is not online with memory: " +
                                      std::to_string(*requested_node));
-    binding.node = *requested_node;
     binding.nodes = {*requested_node};
     binding.strict = true;
     binding.source = "command_line";
@@ -177,16 +176,12 @@ Status Allocate(Binding& binding, std::size_t bytes, bool huge_pages,
   for (const int node : binding.nodes) {
     const auto bit = 1UL << (node % word_bits);
     if (allowed_nodes[node / word_bits] & bit) {
+      selected_nodes[node / word_bits] |= bit;
       nodes.push_back(node);
     }
   }
   if (nodes.empty())
     return Status::InvalidArgument("target NUMA nodes are not allowed by cpuset");
-  // Select a deterministic preferred node within the device's package. With
-  // an explicit node, this list has exactly that one entry. The kernel handles
-  // preferred-node fallback; MPOL_BIND disables it.
-  binding.node = nodes.front();
-  selected_nodes[binding.node / word_bits] |= 1UL << (binding.node % word_bits);
 
   const long page_size_result = sysconf(_SC_PAGESIZE);
   if (page_size_result <= 0) return Status::Internal("cannot determine system page size");
@@ -204,7 +199,9 @@ Status Allocate(Binding& binding, std::size_t bytes, bool huge_pages,
   allocation->mapping = mapping;
   const auto address = reinterpret_cast<std::uintptr_t>(mapping);
   allocation->data = reinterpret_cast<void*>((address + alignment - 1U) / alignment * alignment);
-  const int policy = binding.strict ? MPOL_BIND : MPOL_PREFERRED;
+  // Let Linux choose within the whole local set before falling back outside it.
+  // An explicit node produces a singleton mask with no fallback.
+  const int policy = binding.strict ? MPOL_BIND : MPOL_PREFERRED_MANY;
   if (syscall(SYS_mbind, allocation->data, bound_bytes, policy,
               selected_nodes.data(), maxnode, 0UL) != 0) return error("mbind");
   if (huge_pages && madvise(allocation->data, bound_bytes, MADV_HUGEPAGE) != 0)
@@ -218,6 +215,7 @@ Status Allocate(Binding& binding, std::size_t bytes, bool huge_pages,
   if (!binding.strict && sched_setaffinity(0, mask_bytes, allowed.get()) != 0)
     return error("restore sched_setaffinity after NUMA allocation");
   binding.cpus = std::move(cpus);
+  binding.nodes = std::move(nodes);
   memory = std::move(allocation);
   return Status::OK();
 }

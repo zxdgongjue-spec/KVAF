@@ -16,7 +16,7 @@ void PrintUsage(const char* program) {
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
                "candidates are discovered automatically. "
                "The default memory page mode is thp. DDR prefers the selected device's local NUMA "
-               "node with fallback; --numa-bind NODE restricts DDR to that node. "
+               "node set with fallback; --numa-bind NODE restricts DDR to that node. "
                "The service requires only liburma and /dev/uburma.\n",
                program);
 }

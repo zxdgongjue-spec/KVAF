@@ -12,7 +12,6 @@ namespace kvaf::cpu_numa {
 
 struct Binding {
   int package{-1};
-  int node{-1};
   bool strict{false};
   std::string source;
   std::vector<int> nodes;
@@ -21,7 +20,7 @@ struct Binding {
   int possible_nodes{0};
 };
 
-// Prefer a node on the device's package unless an explicit node overrides it.
+// Prefer the device's local node set unless an explicit node overrides it.
 Status Resolve(const std::string& device, std::optional<int> requested_node, Binding& binding);
 
 // A dedicated mapping keeps its NUMA policy independent of other sessions and
@@ -36,7 +35,7 @@ struct Memory {
   std::size_t mapping_bytes{0};
 };
 
-// Use MPOL_PREFERRED normally, MPOL_BIND for an explicit node. Default placement
+// Use MPOL_PREFERRED_MANY normally, MPOL_BIND for an explicit node. Default placement
 // temporarily binds the touching thread to device-local CPUs; explicit-node
 // placement leaves CPU affinity alone. Neither changes the thread memory policy.
 Status Allocate(Binding& binding, std::size_t bytes, bool huge_pages,

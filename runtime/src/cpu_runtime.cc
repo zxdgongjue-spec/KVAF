@@ -685,11 +685,12 @@ class CpuService {
       return false;
     }
     region->memory = region->numa_memory->data;
+    const std::string touch_cpus = binding.strict ? "unchanged" : cpu_numa::FormatIds(binding.cpus);
     Log("[KVAF_CPU] REGION_NUMA_ALLOCATED candidate=%u ub_device=%s base=%p bytes=%" PRIu64
-        " policy_node=%d memory_policy=%s allocation_cpus=%s source=%s\n",
-        region->candidate_id, device.c_str(), region->memory, region->bytes, binding.node,
-        binding.strict ? "bind" : "preferred", cpu_numa::FormatIds(binding.cpus).c_str(),
-        binding.source.c_str());
+        " policy_nodes=%s memory_policy=%s touch_cpu_affinity=%s source=%s\n",
+        region->candidate_id, device.c_str(), region->memory, region->bytes,
+        cpu_numa::FormatIds(binding.nodes).c_str(), binding.strict ? "bind" : "preferred_many",
+        touch_cpus.c_str(), binding.source.c_str());
     return true;
   }
 
