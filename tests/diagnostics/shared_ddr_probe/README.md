@@ -105,6 +105,10 @@ export KVAF_BATCH_GET_KERNEL="$PWD/build-npu/bin/kvaf_execute_batch_get_kernels.
 export KVAF_BATCH_PUT_KERNEL="$PWD/build-npu/bin/kvaf_execute_batch_put_kernels.o"
 ```
 
+Decode 建链校验需要 BatchPut kernel，即使本测试的数据读取使用 BatchGet。
+脚本会把 `--put-kernel`（或 `KVAF_BATCH_PUT_KERNEL`）显式传入 Runtime；仅设置环境变量
+不会让原生 Runtime 自动读取它。启动前检查两个 kernel 文件存在、可读。
+
 Prefill/Decode Python 环境需要 `torch`、`torch_npu`、`numpy`；Decode 还需要这个构建的 `kvaf`。
 Prefill 导出库自己加载 Direct HCCP，建议和 Decode 使用独立进程、独立 NPU。
 可以先在同一 NPU 主机上用两张卡跑通；三机结果仍须在目标拓扑上复测。
@@ -134,6 +138,7 @@ python3 tests/diagnostics/shared_ddr_probe/run_probe.py decode \
   --control K_IP:29991 --cpu K_IP:29990 \
   --device 0 --eid DECODE_EID_32_HEX --peer-ub-device udma0 \
   --get-kernel "$KVAF_BATCH_GET_KERNEL" \
+  --put-kernel "$KVAF_BATCH_PUT_KERNEL" \
   --token-bytes 656 --rows 4096 --rounds 3 \
   2>&1 | tee single-plus-bit0.decode.log
 ```
@@ -149,8 +154,11 @@ python3 tests/diagnostics/shared_ddr_probe/run_probe.py prefill \
 ```
 
 两端默认等待 120 秒；如果启动间隔较长，在两条 Python 命令都加 `--timeout 600`。
+`--cpu` 必须指向 K 的 KVAF 端口（示例 `29990`），`--control` 指向诊断端口（示例 `29991`）。
+脚本会在连接前拒绝两个参数指向同一端点，避免把不同协议发给同一个监听器。
 若当前部署需要额外 Runtime 参数（如 `reuse_device_ra`），可通过 Decode 的
 `--runtime-options /absolute/path/options.json` 传入 JSON 对象；这不会更改控制协议版本。
+kernel 路径优先级是显式命令行参数、JSON 中的对应路径、环境变量。
 
 成功后，Prefill 打印 `PASS`，Decode 打印 `ALL_PASS`，K 每轮打印 `ROUND_PASS`。
 两端正常退出后停止 K，再把 case 改成 `dual-compatible`，重复三端启动。
@@ -207,6 +215,9 @@ K 不在 Decode 读取前预读或 flush payload，避免检查本身掩盖 DMA�
 失败或超时时程序不会把超时当作 DMA 已停止。Python 进程保留 Tensor，K 保留已武装的资源；
 先停止 K 诊断进程，再中断 Prefill/Decode，最后启动全新三进程。不要强行复用原地址继续测。
 该保留策略也适用于 Python 检查失败，需人工结束测试进程；正常成功路径会按依赖顺序释放。
+kernel 路径、明显的端口冲突等本地参数错误在 NPU 初始化和 RPC 之前退出，不向 K 发送 FAIL。
+如果 K 日志只有 `PROBE_FAIL op=7`，表示某个客户端上报失败，应先看该客户端的首个 traceback；
+此时日志附带的 errno 不足以认定发生了 MR 注册失败。`op=1` 是另一个客户端查询状态时读到失败。
 
 ## 无硬件的本地检查
 
@@ -223,10 +234,12 @@ host 测试覆盖九组注册视图、先后顺序、同 allocation 校验、跨
 另用明确标注的 24.12 core 校验模型检查：0xe 拒绝、0xf 接受。数据搬运 fake provider
 只检查测试工具流程，不声明真实 provider 支持这些配置。
 控制测试覆盖二进制布局、碎片响应、错误响应、版本不匹配和数据版本变化。
+启动测试覆盖 Runtime 构造参数包含 BatchPut kernel、CLI/JSON/环境变量优先级，
+以及缺少文件、端口冲突时不发 RPC、不污染 K 会话。
 这些检查验证的是测试工具，最终驱动兼容性仍以目标机三端结果为准。
 
 本次本地检查（2026-10-27，macOS）：已改用上述 24.12 提交的真实头文件，
 两个 C++ 主体文件通过 `clang++ -fsyntax-only`；fake-provider 可执行测试通过；
-6 项 Python 控制测试此前已通过，控制协议未改变。
+Python 控制和启动回归测试于 2026-10-28 全部通过（14 项），控制协议未改变。
 macOS 检查仅为编译提供 `MADV_HUGEPAGE` 常量，不执行 Linux 页管理操作。
 当前环境没有完整 Linux UMDK/CANN 链接环境，目标机完整构建和硬件运行仍未执行。

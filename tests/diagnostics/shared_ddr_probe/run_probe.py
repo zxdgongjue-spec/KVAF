@@ -5,6 +5,7 @@ import argparse
 import ctypes as C
 import ipaddress
 import json
+import os
 import socket
 import sys
 import time
@@ -77,6 +78,55 @@ def eid(value):
     return (C.c_uint8 * 16).from_buffer_copy(raw)
 
 
+def endpoint(value, option):
+    """Validate endpoints without connecting to or changing the K service."""
+    try:
+        host, port_text = value.rsplit(":", 1)
+        port = int(port_text)
+        if not host or not 1 <= port <= 65535:
+            raise ValueError
+    except (AttributeError, ValueError):
+        raise ValueError(f"{option} must be host:port with a port in 1..65535") from None
+    host = host.strip("[]").lower().rstrip(".")
+    if host in ("localhost", "127.0.0.1", "::1"):
+        host = "loopback"
+    return host, port
+
+
+def input_file(value, option):
+    if not value:
+        raise ValueError(f"{option} is required")
+    filename = Path(value).expanduser().resolve()
+    if not filename.is_file():
+        raise ValueError(f"{option} file does not exist: {filename}")
+    if not os.access(filename, os.R_OK):
+        raise ValueError(f"{option} file is not readable: {filename}")
+    return str(filename)
+
+
+def decode_runtime_options(args):
+    extra = {}
+    if args.runtime_options:
+        extra = json.loads(Path(args.runtime_options).read_text())
+        if not isinstance(extra, dict):
+            raise ValueError("--runtime-options must contain a JSON object")
+    for name in ("batch_get_token_bytes", "batch_get_tokens_per_block"):
+        if name in extra:
+            raise ValueError(f"--runtime-options cannot override probe layout field {name}")
+    # Explicit CLI paths override JSON, which overrides environment defaults.
+    get_default = extra.pop("batch_get_kernel_object_path", os.environ.get("KVAF_BATCH_GET_KERNEL"))
+    put_default = extra.pop("batch_put_kernel_object_path", os.environ.get("KVAF_BATCH_PUT_KERNEL"))
+    args.get_kernel = input_file(args.get_kernel if args.get_kernel is not None else get_default,
+                                 "--get-kernel / KVAF_BATCH_GET_KERNEL")
+    args.put_kernel = input_file(args.put_kernel if args.put_kernel is not None else put_default,
+                                 "--put-kernel / KVAF_BATCH_PUT_KERNEL (required for RMA link validation)")
+    kwargs = dict(device_id=args.device, npu_core_count=1, jettys_per_core=1,
+                  npu_eids=[bytes(eid(args.eid)).hex()], peer_ub_device=args.peer_ub_device)
+    kwargs.update(extra)
+    kwargs["batch_put_kernel_object_path"] = args.put_kernel
+    return kwargs
+
+
 def prefill(args, torch, device):
     info = wait_for(args, lambda m: m.base != 0)
     if info.bytes != args.allocation_bytes:
@@ -120,12 +170,7 @@ def prefill(args, torch, device):
 def decode(args, torch, device):
     import numpy as np
     import kvaf
-    kwargs = dict(device_id=args.device, npu_core_count=1, jettys_per_core=1,
-                  npu_eids=[bytes(eid(args.eid)).hex()], peer_ub_device=args.peer_ub_device)
-    # Optional explicit constructor settings for a matching alternative build.
-    if args.runtime_options:
-        kwargs.update(json.loads(Path(args.runtime_options).read_text()))
-    runtime = kvaf.NpuRuntime(args.get_kernel, args.token_bytes, 1, **kwargs)
+    runtime = kvaf.NpuRuntime(args.get_kernel, args.token_bytes, 1, **args.runtime_kwargs)
     args._retained = [runtime]
     runtime.link_to(args.cpu)
     # 4096-byte slots keep guarded allocation exact even for 656-byte tokens.
@@ -179,7 +224,7 @@ def decode(args, torch, device):
     print(json.dumps({"role": "decode", "result": "ALL_PASS", "rounds": args.rounds}), flush=True)
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("role", choices=["prefill", "decode"])
     parser.add_argument("--control", required=True, help="K diagnostic IPv4:port")
@@ -188,13 +233,14 @@ def main():
     parser.add_argument("--eid", required=True, help="this NPU's reachable EID")
     parser.add_argument("--peer-ub-device", default="")
     parser.add_argument("--exporter", help="libkvaf_probe_hbm.so (Prefill)")
-    parser.add_argument("--get-kernel", default="")
+    parser.add_argument("--get-kernel", help="BatchGet kernel path; defaults to KVAF_BATCH_GET_KERNEL")
+    parser.add_argument("--put-kernel", help="BatchPut kernel for link validation; defaults to KVAF_BATCH_PUT_KERNEL")
     parser.add_argument("--runtime-options", help="JSON object of extra NpuRuntime constructor arguments")
     parser.add_argument("--token-bytes", type=int, default=656)
     parser.add_argument("--rows", type=int, default=4096)
     parser.add_argument("--rounds", type=int, default=100)
     parser.add_argument("--timeout", type=float, default=120)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     args.payload_bytes = args.token_bytes * args.rows
     args.allocation_bytes = args.payload_bytes + 2 * GUARD
     if (args.rows < 3 or args.token_bytes <= 0 or args.rounds < 1 or args.timeout <= 0 or
@@ -206,6 +252,25 @@ def main():
         parser.error("Decode requires --cpu")
     if sys.byteorder != "little":
         parser.error("the deployed probe ABI requires little-endian hosts")
+    # Local argument/file errors must exit before NPU allocation or any RPC.
+    # They must not send FAIL and poison another client's K probe session.
+    try:
+        control = endpoint(args.control, "--control")
+        eid(args.eid)
+        if args.role == "decode":
+            if endpoint(args.cpu, "--cpu") == control:
+                raise ValueError("--cpu and --control must use different service endpoints: "
+                                 "normally --cpu K_IP:29990 and --control K_IP:29991")
+            args.runtime_kwargs = decode_runtime_options(args)
+        else:
+            args.exporter = input_file(args.exporter, "--exporter")
+    except (ValueError, OSError, TypeError) as exc:
+        parser.error(str(exc))
+    return args
+
+
+def main():
+    args = parse_args()
     import torch
     import torch_npu  # noqa: F401
     torch.npu.set_device(args.device)
@@ -224,7 +289,6 @@ def main():
             while True:
                 time.sleep(1)
         except KeyboardInterrupt:
-            import os
             os._exit(2)
 
 
