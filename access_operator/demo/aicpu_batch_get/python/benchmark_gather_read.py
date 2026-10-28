@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import statistics
+import sys
 from pathlib import Path
 import time
 
@@ -240,7 +241,13 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
         profiles.clear()
         for _ in range(a.iterations):
             run_round(a.miss_count, profile=True)
-    finally:
+    except BaseException:
+        try:
+            runtime.shutdown()
+        except Exception as cleanup_error:
+            print(f"{prefix}_CLEANUP_ERROR {cleanup_error}", file=sys.stderr, flush=True)
+        raise
+    else:
         runtime.shutdown()
 
     print(f"{prefix}_PASS workers={a.workers} iterations={a.iterations} "

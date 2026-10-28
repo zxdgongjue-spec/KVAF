@@ -29,9 +29,17 @@ struct BatchGetTransport::Impl {
   aclrtStream pending{nullptr};
   std::uint64_t sequence{0U};
   bool initialized{false}, cpu_enabled{false};
-  Status Drain() {
-    if (pending && aclrtSynchronizeStream(pending) != ACL_SUCCESS)
-      return Internal("GatherRead stream still has pending work; buffers retained");
+  Status Drain(const char* stage = "drain") {
+    if (!pending) return Status::OK();
+    const auto result = aclrtSynchronizeStream(pending);
+    if (result != ACL_SUCCESS) {
+      const char* detail = aclGetRecentErrMsg();
+      return Internal("GatherRead stream synchronization failed: acl=" + std::to_string(result) +
+                      " stage=" + stage + " sequence=" + std::to_string(sequence) +
+                      " workers=" + std::to_string(session.config().workers) +
+                      " source_mode=" + (direct_addresses ? "direct" : "table") +
+                      "; buffers retained; detail=" + (detail ? detail : "unavailable"));
+    }
     pending = nullptr;
     return Status::OK();
   }
@@ -70,7 +78,7 @@ Status BatchGetTransport::Initialize(const RemoteRegionDesc& region) {
   return Status::OK();
 }
 Status BatchGetTransport::Shutdown() {
-  auto drained = impl_->Drain();
+  auto drained = impl_->Drain("shutdown");
   if (!drained.ok()) return drained;
   if (impl_->workspace) (void)aclrtFree(impl_->workspace);
   if (impl_->status_host) (void)aclrtFreeHost(impl_->status_host);
@@ -90,7 +98,7 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
     return InvalidArgument("BatchGet profiling requires synchronize=true");
   if (profile) *profile = {};
   const auto begin = profile ? BatchGetProfileNowNs() : 0U;
-  auto drained = impl_->Drain();
+  auto drained = impl_->Drain("previous_request");
   if (!drained.ok()) return drained;
   if (!impl_->initialized || !exec.execution.stream)
     return InvalidArgument("UMDK BatchGet needs initialization and stream");
@@ -171,7 +179,7 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
     profile->status_enqueue_ns = now - stamp;
     stamp = now;
   }
-  auto completed = impl_->Drain();
+  auto completed = impl_->Drain("completion");
   if (profile) {
     const auto now = BatchGetProfileNowNs();
     profile->wait_ns = now - stamp;
