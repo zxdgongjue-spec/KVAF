@@ -52,18 +52,52 @@ CPU DDR region 支持两种页分配模式；未指定时默认使用 `thp`：
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28999
 
-# 保留原始普通内存行为：4 KiB 对齐，操作系统仍可能自行使用 THP。
+# 系统页对齐并主动触页，不请求 THP；操作系统仍可能自行使用 THP。
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28999 --memory-page-mode default
 ```
 
-需要固定 NUMA 位置时，应在 UB device 所在 node 启动服务，例如
-`numactl --cpunodebind=N --membind=N ...`。`REGION_ALLOCATED` 日志会记录
-`page_mode`。默认 THP 模式还应通过 `/proc/<pid>/smaps` 的 `AnonHugePages` 验证实际
+CPU 服务默认优先使用建链选中设备附近的 DDR，容量不足时允许回退到其他节点。
+启动时无需指定 UB device 或 NUMA 参数：
+
+```bash
+./build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999
+
+# 对比测试：本服务的 DDR 只允许分配到 node 2，容量不足时不回退。
+./build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999 --numa-bind 2
+```
+
+`--numa-bind` 只接受一个非负节点编号。NPU 端选设备和测试命令无需修改。
+未指定节点时，每次根据分配请求的 `candidate_id` 找到实际 UB device；不同连接和
+探测候选分别选择各自的本地内存。指定节点时直接使用该节点，不依赖 device 的拓扑。
+
+默认先读取 `/sys/class/ubcore/<device>/device/numa_node` 或 `numa_node`
+（兼容旧的 `uburma` class），优先使用驱动标记的节点。驱动未提供位置时，按
+`udmac<N>d<D>e<E>` 的 `c<N>` 匹配 Linux `physical_package_id=N`，从该 package
+中选择 cpuset 允许且有内存的最小编号节点作为首选。该命名路径要求 c 编号与
+Linux package 编号一致；node 归属从系统拓扑读取，不按数量平均划分。
+
+默认对每个 region 设置 `MPOL_PREFERRED`：先尝试首选节点，无法满足时由 Linux
+根据 NUMA 拓扑和内存状态回退到其他允许节点。它不保证同一 package 的两个节点
+平均分担内存，也不保证所有页都在首选节点。`--numa-bind N` 则使用 `MPOL_BIND`，
+严格限制在 node N；该节点不足时可能触发 OOM。两种情况下都受系统 cpuset 限制。
+
+每块 DDR 使用独立 `mmap`，在触页和 segment 注册前设置区域策略。默认触页时临时
+绑定到设备所在 package 的可用 CPU 核，随后恢复原 CPU affinity；显式指定内存节点
+时保持原 CPU affinity，便于单独比较内存位置。线程原有内存策略不变。
+`default` 和 `thp` 页模式都会主动触页，`thp` 保留 2 MiB 对齐和大页建议；segment
+注销后释放映射，不需要安装 libnuma。
+
+`REGION_NUMA_ALLOCATED` 日志中的 `policy_node` 是首选或强制节点，`memory_policy`
+为 `preferred` 或 `bind`；实际页分布用 `numastat -p <pid>` 或 `/proc/<pid>/numa_maps`
+查看。为使一个服务能处理两侧设备，启动时应允许两颗 CPU 的核，避免额外绑核到一侧。
+
+`REGION_ALLOCATED` 日志会记录 `page_mode`。默认 THP 模式还应通过
+`/proc/<pid>/smaps` 的 `AnonHugePages` 验证实际
 合并量；Linux 使用大页并不保证 UDMA/IOMMU 一定保留相同的页表粒度。
 
-默认自动枚举所有可用 UMDK UB device/EID；`--ub-device NAME` 和
-`--eid-index N` 仅用于诊断。CPU 端可同时保持多个 NPU session，NPU 正常
+默认自动枚举所有可用 UMDK UB device/EID；`--ub-device NAME` 可固定设备，
+`--eid-index N` 可进一步固定 EID。CPU 端可同时保持多个 NPU session，NPU 正常
 `shutdown` 后会释放对应 DDR、segment、token 与 Jetty。
 
 NPU 应用默认只配置 CPU 服务地址，不配置 EID 或 UDMA device：

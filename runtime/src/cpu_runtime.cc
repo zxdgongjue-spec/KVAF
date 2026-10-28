@@ -1,8 +1,8 @@
 #include "cpu_runtime.h"
+#include "cpu_numa_binding.h"
 #include "peer_protocol.h"
 
 #include <dlfcn.h>
-#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -63,8 +63,6 @@ constexpr uint32_t kJettyKeyBytes = sizeof(urma_jetty_id_t) + sizeof(urma_transp
 // and transport mode; the trailing four bytes are retained on the wire.
 constexpr uint32_t kNpuJettyKeyBytes = 32U;
 constexpr uint32_t kSegBytes = sizeof(urma_seg_t);
-constexpr std::size_t kBasePageBytes = 4096U;
-constexpr std::size_t kHugePage2MBytes = 2U * 1024U * 1024U;
 
 static_assert(sizeof(urma_jetty_id_t) == 24U, "UMDK Jetty id ABI changed");
 static_assert(kJettyKeyBytes == 28U, "HCCP UMDK Jetty key ABI changed");
@@ -468,6 +466,7 @@ struct Region {
   uint32_t candidate_id = 0U;
   UrmaResources* resources = nullptr;
   void* memory = nullptr;
+  std::unique_ptr<cpu_numa::Memory> numa_memory;
   uint64_t bytes = 0U;
   urma_token_id_t* token_id = nullptr;
   urma_target_seg_t* segment = nullptr;
@@ -478,9 +477,9 @@ struct Region {
 class CpuService {
  public:
   CpuService(UrmaResourcePool* resource_pool, CpuMemoryPageMode memory_page_mode,
-             bool device_filter_applied)
+             bool device_filter_applied, std::optional<int> numa_node)
       : resource_pool_(resource_pool), memory_page_mode_(memory_page_mode),
-        device_filter_applied_(device_filter_applied) {}
+        device_filter_applied_(device_filter_applied), numa_node_(numa_node) {}
   ~CpuService() { ReleaseAll(); }
 
   uint32_t CandidateCount() const {
@@ -674,31 +673,23 @@ class CpuService {
       return false;
     }
     const std::size_t bytes = static_cast<std::size_t>(region->bytes);
-    const std::size_t alignment =
-        memory_page_mode_ == CpuMemoryPageMode::kTransparentHugePage
-            ? kHugePage2MBytes
-            : kBasePageBytes;
-    const int allocation_status = posix_memalign(&region->memory, alignment, bytes);
-    if (allocation_status != 0 || region->memory == nullptr) {
-      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=posix_memalign bytes=%" PRIu64
-          " alignment=%zu status=%d memory=%p page_mode=%s\n",
-          region->bytes, alignment, allocation_status, region->memory,
-          MemoryPageModeName());
+    cpu_numa::Binding binding;
+    const auto& device = region->resources->device_name();
+    auto status = cpu_numa::Resolve(device, numa_node_, binding);
+    if (status.ok())
+      status = cpu_numa::Allocate(binding, bytes,
+          memory_page_mode_ == CpuMemoryPageMode::kTransparentHugePage, region->numa_memory);
+    if (!status.ok()) {
+      Log("[KVAF_CPU] REGION_NUMA_FAILED candidate=%u ub_device=%s bytes=%" PRIu64 " reason=%s\n",
+          region->candidate_id, device.c_str(), region->bytes, status.message().c_str());
       return false;
     }
-    if (memory_page_mode_ == CpuMemoryPageMode::kTransparentHugePage) {
-      if (madvise(region->memory, bytes, MADV_HUGEPAGE) != 0) {
-        Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=madvise_hugepage bytes=%" PRIu64
-            " errno=%d\n",
-            region->bytes, errno);
-        free(region->memory);
-        region->memory = nullptr;
-        return false;
-      }
-      // Fault the range while huge-page advice is active. Launching the service
-      // under a NUMA memory policy makes placement deterministic as well.
-      std::memset(region->memory, 0, bytes);
-    }
+    region->memory = region->numa_memory->data;
+    Log("[KVAF_CPU] REGION_NUMA_ALLOCATED candidate=%u ub_device=%s base=%p bytes=%" PRIu64
+        " policy_node=%d memory_policy=%s allocation_cpus=%s source=%s\n",
+        region->candidate_id, device.c_str(), region->memory, region->bytes, binding.node,
+        binding.strict ? "bind" : "preferred", cpu_numa::FormatIds(binding.cpus).c_str(),
+        binding.source.c_str());
     return true;
   }
 
@@ -807,7 +798,7 @@ class CpuService {
       region->token_id = nullptr;
     }
     if (region->memory != nullptr) {
-      free(region->memory);
+      region->numa_memory.reset();
       region->memory = nullptr;
     }
   }
@@ -822,6 +813,7 @@ class CpuService {
   UrmaResourcePool* resource_pool_ = nullptr;
   CpuMemoryPageMode memory_page_mode_{CpuMemoryPageMode::kTransparentHugePage};
   bool device_filter_applied_{false};
+  std::optional<int> numa_node_;
   uint64_t next_region_id_ = 1U;
   uint32_t next_token_ = 1U;
   uint32_t next_psn_ = 1U;
@@ -952,7 +944,7 @@ Status CpuRuntime::Initialize(const CpuRuntimeOptions& options) {
     return Status::Internal("CpuRuntime failed to initialize UMDK resources");
   }
   impl->service = std::make_unique<CpuService>(
-      &impl->resources, options.memory_page_mode, !options.ub_device.empty());
+      &impl->resources, options.memory_page_mode, !options.ub_device.empty(), options.numa_node);
   impl_ = std::move(impl);
   return Status::OK();
 }

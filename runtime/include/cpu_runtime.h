@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "runtime.h"
@@ -18,6 +19,8 @@ struct CpuRuntimeOptions {
   bool has_eid_index{false};
   std::uint32_t eid_index{0};
   CpuMemoryPageMode memory_page_mode{CpuMemoryPageMode::kTransparentHugePage};
+  // Unset: prefer device-local DDR with fallback. Set: bind DDR strictly to this node.
+  std::optional<int> numa_node;
 };
 
 // CPU endpoint Runtime. It owns only CPU-side UMDK resources and sessions;
