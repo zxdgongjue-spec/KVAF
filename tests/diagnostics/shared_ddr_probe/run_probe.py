@@ -151,6 +151,20 @@ def prefill(args, torch, device):
     if not handle:
         raise RuntimeError(lib.probe_hbm_error().decode())
     args._retained.append(handle)
+    # Keep the full keys as well as their EID prefixes: the prefixes follow the
+    # expected UMDK layout, while raw bytes also help identify a deployed ABI
+    # difference. Do not rewrite either key to make an identity check pass.
+    segment_key = bytes(descriptor.segment)[:descriptor.segment_bytes]
+    jetty_key = bytes(descriptor.key)[:descriptor.key_bytes]
+    print(json.dumps({"role": "prefill", "event": "HBM_EXPORT",
+                      "logical_device": args.device,
+                      "configured_eid": bytes(descriptor.eid).hex(),
+                      "segment_eid_prefix": segment_key[:16].hex(),
+                      "jetty_eid_prefix": jetty_key[:16].hex(),
+                      "segment_bytes": descriptor.segment_bytes,
+                      "jetty_key_bytes": descriptor.key_bytes,
+                      "segment_key": segment_key.hex(),
+                      "jetty_key": jetty_key.hex()}), flush=True)
     reply = rpc(args, descriptor)
     if lib.probe_hbm_bind(handle, C.byref(reply)):
         raise RuntimeError(lib.probe_hbm_error().decode())

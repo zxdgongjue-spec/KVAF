@@ -219,6 +219,13 @@ kernel 路径、明显的端口冲突等本地参数错误在 NPU 初始化和 R
 如果 K 日志只有 `PROBE_FAIL op=7`，表示某个客户端上报失败，应先看该客户端的首个 traceback；
 此时日志附带的 errno 不足以认定发生了 MR 注册失败。`op=1` 是另一个客户端查询状态时读到失败。
 
+若出现 `HBM EID differs from Jetty EID`，当前 K 检查实际比较的是 HBM segment 中的 EID
+与 Prefill 命令行提供的 EID，并未从 Jetty key 中取值。Prefill 在发送 EXPORT 前打印
+`event=HBM_EXPORT`，包含 `configured_eid`、`segment_eid_prefix`、`jetty_eid_prefix` 和两个完整 key。
+后两个前缀按本诊断所需 ABI 取 key 的前 16 B；原始 key 用于进一步核对部署 ABI。
+将三者与实际物理 NPU 的 rootinfo CLOS EID 对照；不能仅凭该报错断定命令行 EID 填错，
+也不能改写 MR key 或删除检查来绕过。增加这组日志只需更新 Python 脚本，不需要重编 C++。
+
 ## 无硬件的本地检查
 
 ```bash
