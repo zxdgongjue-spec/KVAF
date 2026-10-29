@@ -28,6 +28,7 @@ struct Queue {
   std::deque<uint64_t> ready_cycles;
   std::vector<uint64_t> observations;
   uint64_t delay_cycles = 0, posts = 0;
+  uint32_t local_token_id = 1;
   bool timeout = false, error = false;
 };
 std::vector<Queue> hardware;
@@ -51,6 +52,7 @@ void Doorbell(uint32_t value, uint32_t* address) {
     for (uint32_t i = 0; i < added; ++i) {
       const uint64_t pi = queue.producer++;
       const uint32_t* wqe = queue.sq.data() + (pi % 32768) * 16;
+      CHECK(wqe[13] == queue.local_token_id);
       CHECK((wqe[0] >> 31U) == 1U - ((pi / 32768) & 1U));
       const bool signal = (wqe[0] & (1U << 21U)) != 0;
       CHECK(((wqe[0] >> 16U) & 3U) == (signal ? 2U : 1U));
@@ -177,6 +179,10 @@ struct Fixture {
     for (uint32_t c = 0; c < cores; ++c) {
       aiv_model::core = c;
       KvafExecuteBatchGetAivKernelV3(args);
+      if (statuses[c].result != expected) {
+        std::cerr << "core " << c << " result=" << statuses[c].result
+                  << " expected=" << expected << "\n";
+      }
       CHECK(statuses[c].result == expected);
       if (expected || !profiling) continue;
       const auto& profile = statuses[c].profile;
@@ -239,6 +245,31 @@ struct Fixture {
 };
 
 int main() {
+  for (bool profiling : {false, true}) {
+    // Reproduce one core striped across two independently registered EID
+    // contexts. The tokens are from the failing hardware preflight log.
+    Fixture f(8192, 1, 4, 2048);
+    const std::array<uint32_t, 2> tokens{0x10f1U, 0x10f3U};
+    for (uint32_t jetty = 0; jetty < f.jettys; ++jetty) {
+      f.entities[jetty].eid_path = jetty % tokens.size();
+      f.entities[jetty].local_token_id = tokens[jetty % tokens.size()];
+      aiv_model::hardware[jetty].local_token_id = f.entities[jetty].local_token_id;
+    }
+    if (!profiling) f.statuses[0].profile.magic = 0;
+    f.Run(8192);
+    for (const auto& queue : aiv_model::hardware) CHECK(queue.producer == 2048);
+    f.Run(8192);  // cached registration and persistent queues are reused
+    f.Run(129);   // an unbudgeted tail also reaches both EID paths
+
+    const uint64_t doorbells_before = aiv_model::doorbells;
+    f.entities[1].local_token_id = 0;
+    f.Run(8192, kInvalidEntity);
+    CHECK(aiv_model::doorbells == doorbells_before);
+    f.entities[1].local_token_id = tokens[1];
+    f.entities[1].local_hbm_size -= 16;
+    f.Run(8192, kInvalidEntity);
+    CHECK(aiv_model::doorbells == doorbells_before);
+  }
   for (const auto& shape : {std::array<uint32_t, 3>{1, 1, 2048}, {1, 16, 2048},
                            {1, 64, 2048}, {4, 4, 2048}, {3, 3, 2049}, {1, 1, 2},
                            {1, 16, 0}}) {
@@ -309,5 +340,5 @@ int main() {
     f.Run(8193, kInvalidQueue);
     CHECK(aiv_model::doorbells == before);
   }
-  std::cout << "BatchGet kernel CPU model: payload, CQ/SQ wrap, tail, replay and faults passed\n";
+  std::cout << "BatchGet kernel CPU model: multi-EID tokens, payload, CQ/SQ wrap, tail, replay and faults passed\n";
 }
