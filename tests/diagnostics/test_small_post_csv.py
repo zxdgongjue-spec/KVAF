@@ -156,6 +156,81 @@ class SmallPostCsvTests(unittest.TestCase):
         with (self.root / "small_post_jettys.csv").open(encoding="utf-8-sig", newline="") as stream:
             self.assertEqual(len(list(csv.DictReader(stream))), 8)
 
+    def test_recovers_native_log_attached_to_na_value(self):
+        path = self.timeline_log("r1_n32_baseline.log")
+        text = path.read_text(encoding="utf-8")
+        text = text.replace("last_db_to_last_cqe_us_p99=n/a",
+                            "last_db_to_last_cqe_us_p99=n/a[KVAF_AIV] "
+                            "DIRECT_HCCP_TEARDOWN phase=delete_transport\n", 1)
+        path.write_text(text, encoding="utf-8")
+        run = parse_run(path)
+        self.assertEqual(run["_jettys"][1]["last_db_to_last_cqe_us_p99"], "")
+        self.assertEqual(run["_native_interleavings_recovered"], 1)
+        self.assertEqual(run["active_jettys_per_call"], 2)
+
+    def test_rejoins_numeric_fields_keys_and_completion_markers(self):
+        path = self.timeline_log("r1_n32_baseline.log")
+        original = path.read_text(encoding="utf-8")
+        # Native fields deliberately overlap benchmark field names. They must
+        # remain separate rather than overwrite the actual samples/core values.
+        native = "[KVAF_AIV] DIRECT_HCCP_TEARDOWN core=999 samples=7\n"
+        cases = (
+            ("p50_cycles=3485.5", "p50_cycles=34" + native + "85.5"),
+            ("active_samples=0", "active_sam" + native + "ples=0"),
+            ("phase=shutdown", "phase=shut" + native + "down"),
+            ("p50_cycles=3485.5", "p50_cycles=34" + native + native + "85.5"),
+        )
+        for old, new in cases:
+            with self.subTest(old=old, new=new):
+                path.write_text(original.replace(old, new, 1), encoding="utf-8")
+                run = parse_run(path)
+                self.assertAlmostEqual(run["p50_us"], 6.971)
+                self.assertEqual(run["_jettys"][1]["active_samples"], 0)
+                self.assertEqual(run["posts_per_call"], 2)
+
+    def test_retains_native_device_selection_order_after_recovery(self):
+        path = self.timeline_log("r1_n32_baseline.log")
+        text = path.read_text(encoding="utf-8")
+        text = "[KVAF_AIV] UB_DEVICE_SELECTED ub_device=first\n" + text
+        text = text.replace("last_db_to_last_cqe_us_p99=n/a",
+                            "last_db_to_last_cqe_us_p99=n/a[KVAF_AIV] "
+                            "UB_DEVICE_REUSED ub_device=second\n", 1)
+        path.write_text(text, encoding="utf-8")
+        self.assertEqual(parse_run(path)["selected_ub_device"], "second")
+
+    def test_does_not_hide_corrupt_values_or_ambiguous_interleaving(self):
+        path = self.timeline_log("r1_n32_baseline.log")
+        original = path.read_text(encoding="utf-8")
+        cases = (
+            original.replace("last_db_to_last_cqe_us_p99=n/a",
+                             "last_db_to_last_cqe_us_p99=broken[KVAF_AIV] teardown=1\n", 1),
+            original.replace("last_db_to_last_cqe_us_p99=n/a",
+                             "last_db_to_last_cqe_us_p99=n/a[UNKNOWN] teardown=1\n", 1),
+            original.replace("KERNEL_PROFILE_JETTY ", "[KVAF_AIV] partial KERNEL_PROFILE_JETTY ", 1),
+            original + "[KVAF_AIV] partial PERF_RESULT operation=batch_get_kernel_setup\n",
+            original.rstrip("\n") + "[KVAF_AIV] truncated",
+            original.replace("BATCH_GET_PERF_PHASE_DONE phase=shutdown", ""),
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                path.write_text(text, encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    parse_run(path)
+
+    def test_exports_existing_interleaved_logs_without_modifying_them(self):
+        baseline = self.timeline_log("r1_n32_baseline.log")
+        self.timeline_log("r1_n32_small-post.log")
+        text = baseline.read_text(encoding="utf-8").replace(
+            "last_db_to_last_cqe_us_p99=n/a", "last_db_to_last_cqe_us_p99=n/a"
+            "[KVAF_AIV] DIRECT_HCCP_TEARDOWN phase=delete_transport\n", 1)
+        baseline.write_text(text, encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(main([str(self.root)]), 0)
+        self.assertIn("SMALL_POST_LOG_RECOVERED", output.getvalue())
+        self.assertEqual(baseline.read_text(encoding="utf-8"), text)
+        with (self.root / "small_post_jettys.csv").open(encoding="utf-8-sig", newline="") as stream:
+            self.assertEqual(len(list(csv.DictReader(stream))), 8)
+
     def test_rejects_polling_mode_mismatch_and_incomplete_jetty_evidence(self):
         baseline = parse_run(self.timeline_log("r1_n32_baseline.log", "serial"))
         small_path = self.timeline_log("r1_n32_small-post.log")

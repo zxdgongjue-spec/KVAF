@@ -84,6 +84,40 @@ JETTY_PAIR_VALUES = tuple(
 ) + DELTA_FIELDS
 JETTY_SUMMARY_COUNTS = ("p50_win_rounds", "p99_regression_rounds",
                         "worst_p50_latency_reduction_pct", "worst_p99_latency_reduction_pct")
+NATIVE_LOG_LINE = re.compile(r"\[KVAF_AIV\][ \t]+[^\r\n]*(?:\r?\n|$)")
+BENCHMARK_RECORD = re.compile(
+    r"BATCH_GET_PERF_|BATCH_GET_KERNEL_PROFILE_|KERNEL_PROFILE_|PERF_RESULT |"
+    r"FAIL:|Traceback \(most recent call last\):"
+)
+
+
+def log_lines(text: str) -> tuple[list[str], int]:
+    """Rejoin stdout split by complete native stderr records in a merged log.
+
+    Buffered Python stdout can stop in the middle of a field, followed by a
+    newline-terminated C++ stderr message and then the rest of the stdout field.
+    Remove only those known native records, including their newline, before
+    splitting stdout into lines. Keep native records for UB-device validation.
+    """
+    native = []
+    recovered = 0
+
+    def extract_native(match: re.Match) -> str:
+        nonlocal recovered
+        record = match.group().rstrip("\r\n")
+        if BENCHMARK_RECORD.search(record):
+            # A stdout record inside a native line has ambiguous boundaries.
+            # Do not discard it or guess numeric/missing values.
+            raise ValueError("cannot recover stdout/stderr interleaving inside native log line")
+        if match.start() and text[match.start() - 1] not in "\r\n":
+            if not match.group().endswith("\n"):
+                raise ValueError("unterminated native log inserted inside benchmark record")
+            recovered += 1
+        native.append(record)
+        return ""
+
+    stdout = NATIVE_LOG_LINE.sub(extract_native, text)
+    return stdout.splitlines() + native, recovered
 
 
 def fields(line: str) -> dict[str, str]:
@@ -109,7 +143,7 @@ def _parse_run(path: Path) -> dict:
     if match is None:
         raise ValueError("expected r<round>_n<count>_[c<cores>_j<jettys>_|<jettys>_]"
                          "<baseline|small-post>.log")
-    lines = path.read_text(encoding="utf-8-sig").splitlines()
+    lines, recovered = log_lines(path.read_text(encoding="utf-8-sig"))
     for marker in ("BATCH_GET_PERF_PHASE_DONE phase=batch_get",
                    "BATCH_GET_PERF_PHASE_DONE phase=shutdown"):
         if marker not in lines:
@@ -148,7 +182,8 @@ def _parse_run(path: Path) -> dict:
     row.update(round=int(match["round"]), variant=match["variant"], clock_mhz=clock,
                selected_ub_device=selected_device, log_file=str(path.resolve()),
                completion_poll_mode=contract.get("completion_poll_mode", "serial"),
-               profile_version=contract.get("profile_version", "0"))
+               profile_version=contract.get("profile_version", "0"),
+               _native_interleavings_recovered=recovered)
     if row["completion_poll_mode"] not in ("serial", "round_robin"):
         raise ValueError("unknown completion polling mode")
 
@@ -442,6 +477,10 @@ def main(argv: list[str] | None = None) -> int:
              JETTY_SUMMARY_COUNTS + tuple("median_" + name for name in JETTY_PAIR_VALUES)),
         )
         # Validate every log and pair before creating any result CSV.
+        for run in runs:
+            if run["_native_interleavings_recovered"]:
+                print(f"SMALL_POST_LOG_RECOVERED path={run['log_file']} "
+                      f"native_interleavings={run['_native_interleavings_recovered']}")
         print("SMALL_POST_JETTY_REFERENCE variant=baseline jettys_per_core=1 "
               f"matched_runs={len(jetty_pairs)} missing_reference_runs={len(runs) - len(jetty_pairs)}")
         for filename, rows, columns in outputs:

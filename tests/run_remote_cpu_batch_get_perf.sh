@@ -34,5 +34,7 @@ export KVAF_BATCH_PUT_KERNEL="$KVAF_PUT_KERNEL"
 export DEVICE_ID
 export PYTHONPATH="$KVAF_BUILD_DIR/python${PYTHONPATH:+:$PYTHONPATH}"
 
+# Keep Python result lines ahead of native teardown messages when stdout and
+# stderr are redirected to the same file; buffered writes can split a record.
 exec timeout "${KVAF_REMOTE_CPU_PERF_TIMEOUT}s" \
-  python3 "$KVAF_ROOT/tests/python/test_npu_batch_get_perf.py" "$@"
+  python3 -u "$KVAF_ROOT/tests/python/test_npu_batch_get_perf.py" "$@"

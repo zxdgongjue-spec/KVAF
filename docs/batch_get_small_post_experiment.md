@@ -386,6 +386,14 @@ P99，不能当作合并样本分位数。
 CSV 使用 UTF-8 BOM，便于在 Excel 中打开。重复执行会更新这六个 CSV，
 原始日志保持不变。
 
+若旧日志出现 `n/a[KVAF_AIV]` 等粘连，通常是 Python stdout 缓冲块与
+C++ stderr 经 `2>&1` 合并后交错。脚本会提取完整、以换行结束的
+`[KVAF_AIV]` 原生日志，并拼回其前后被打断的 stdout 字段；原生日志中的
+UB 设备选择仍保留用于配置校验。恢复成功时输出 `SMALL_POST_LOG_RECOVERED`，
+无需修改原日志或重跑 benchmark。未知前缀、损坏数值、丢失字段或无法
+确定边界的交错仍会报错，不把它们补成零或 `n/a`。runner 使用 `python3 -u`
+减少后续采样日志中的缓冲交错；这不改变请求、调度或内核计时范围。
+
 ## 本地检查范围
 
 `kvaf_batch_get_schedule_test` 覆盖基线/小 post、奇数尾部、请求数少于
