@@ -167,7 +167,8 @@ struct Fixture {
       entity.tp_id = hardware.tp_id = 0x100U + i;
       entity.remote_token_id = hardware.remote_token_id = 11;
       entity.remote_token_value = hardware.remote_token_value = 22;
-      entity.local_token_id = hardware.local_token_id = 0x200U + i;
+      // One acquired HBM buffer/token per core; route TP/EID still vary by lane.
+      entity.local_token_id = hardware.local_token_id = 0x200U + i / j;
       for (uint32_t byte = 0; byte < 16; ++byte) {
         entity.remote_eid[byte] = static_cast<uint8_t>(i * 17 + byte);
       }
@@ -218,7 +219,22 @@ struct Fixture {
       const auto& profile = statuses[c].profile;
       CHECK(profile.total_posts == aiv_model::doorbells - doorbells_before);
       CHECK(profile.profile_version == 3);
-      CHECK(profile.small_post_max_requests == kvaf_batch_get::kSmallPostMaxRequests);
+      CHECK(profile.small_post_max_requests == 0);
+      CHECK(profile.selected_post_width == 128);
+      CHECK(profile.small_post_group_count == 0 && profile.fused_group_count == 0);
+      CHECK((profile.schedule_metadata & KVAF_BATCH_GET_SCHEDULE_METADATA_V1) != 0);
+      CHECK(bool(profile.schedule_metadata & KVAF_BATCH_GET_SCHEDULE_LEAN) ==
+            kvaf_batch_get::kLeanSchedule);
+      const uint32_t core_budget = args.batch_get_max_inflight_total &&
+          count > args.batch_get_max_inflight_total ?
+          kvaf_batch_get::CoreBudget(args.batch_get_max_inflight_total, cores, c) : 0;
+      const uint32_t managed = static_cast<uint32_t>(
+          (profile.schedule_metadata >> KVAF_BATCH_GET_SCHEDULE_MANAGED_SHIFT) &
+          KVAF_BATCH_GET_SCHEDULE_MANAGED_MASK);
+      CHECK(managed == kvaf_batch_get::ManagedJettys(
+          static_cast<uint32_t>(profile.active_requests), core_budget, jettys));
+      CHECK(bool(profile.schedule_metadata & KVAF_BATCH_GET_SCHEDULE_SINGLE_GROUP) ==
+            (kvaf_batch_get::kLeanSchedule && profile.active_requests != 0 && core_budget == 0));
       uint64_t read_sum = 0, post_sum = 0, checkpoint_sum = 0;
       for (uint32_t j = 0; j < KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE; ++j) {
         const auto& trace = profile.jettys[j];
@@ -287,40 +303,51 @@ struct Fixture {
 };
 
 int main() {
+  if (kvaf_batch_get::kLeanSchedule) {
+    {
+      Fixture f(513, 2, 8, 2048);
+      f.Run(1);  // core 0 is empty; core 1 MUST use resource slot 8, not slot 1.
+      for (uint32_t i = 0; i < 16; ++i) {
+        CHECK(f.queues[i].initialized == (i == 8));
+        CHECK(f.queues[i].sq_producer_index == (i == 8 ? 1 : 0));
+      }
+      for (uint32_t n : {257U, 128U, 513U, 0U, 1U}) f.Run(n);
+      for (auto& s : f.statuses) s.profile.magic = 0;
+      f.Run(257); f.Run(1); f.Run(0);  // profile-disabled path too
+    }
+    {
+      Fixture f(512, 1, 4, 2048);
+      f.entities[1].magic = 0;
+      f.Run(1);  // unused resources do not enter the hot path
+      const auto before = aiv_model::doorbells;
+      f.Run(512, kInvalidEntity);  // validate before first activation
+      CHECK(aiv_model::doorbells == before);
+      f.entities[1].magic = kEntityMagic;
+      f.Run(512);
+    }
+    for (bool timeout : {false, true}) {
+      Fixture f(512, 1, 4, 2048);
+      aiv_model::hardware[0].timeout = timeout;
+      aiv_model::hardware[0].error = !timeout;
+      f.Run(1, timeout ? kCqTimeout : kCqError);
+      CHECK(!f.queues[1].initialized && f.queues[1].poisoned);
+      const auto before = aiv_model::doorbells;
+      f.Run(512, kInvalidQueue);  // poison survives activation of new lanes
+      CHECK(aiv_model::doorbells == before);
+    }
+  }
   {
     Fixture f(257, 2, 2, 2048);
     f.Run(32);
-    const bool small_posts = kvaf_batch_get::kSmallPostMaxRequests >= 32;
-    CHECK(aiv_model::vector_calls == 2);  // one fill per core, even with two Jettys
+    CHECK(aiv_model::vector_calls == 2);
     for (uint32_t c = 0; c < 2; ++c) {
-      CHECK(f.statuses[c].profile.total_posts == (small_posts ? 2 : 1));
-      CHECK(f.statuses[c].profile.completion_count == (small_posts ? 2 : 1));
-      CHECK(f.statuses[c].profile.small_post_group_count == (small_posts ? 1 : 0));
-      CHECK(f.statuses[c].profile.fused_group_count == (small_posts ? 1 : 0));
+      CHECK(f.statuses[c].profile.total_posts == 1);
+      CHECK(f.statuses[c].profile.completion_count == 1);
       CHECK(f.statuses[c].profile.wqe_build_calls == 1);
-      CHECK(f.queues[c * 2].sq_producer_index == (small_posts ? 8 : 16));
-      CHECK(f.queues[c * 2 + 1].sq_producer_index == (small_posts ? 8 : 0));
+      CHECK(f.queues[c * 2].sq_producer_index == 16);
+      CHECK(f.queues[c * 2 + 1].sq_producer_index == 0);
     }
-    if (small_posts) {
-      for (uint32_t c = 0; c < 2; ++c) {
-        std::size_t first_doorbell = aiv_model::trace.size();
-        std::size_t second_copy = aiv_model::trace.size();
-        for (std::size_t i = 0; i < aiv_model::trace.size(); ++i) {
-          const auto& event = aiv_model::trace[i];
-          if (event.kind == aiv_model::EventKind::kSqDoorbell && event.queue == c * 2) {
-            first_doorbell = i;
-          }
-          if (event.kind == aiv_model::EventKind::kSqCopy && event.queue == c * 2 + 1) {
-            second_copy = i;
-          }
-        }
-        CHECK(first_doorbell < aiv_model::trace.size());
-        CHECK(second_copy < aiv_model::trace.size());
-        CHECK(first_doorbell < second_copy);
-      }
-    }
-    // Replay on the same queues while changing both the request count and
-    // the selected post width, including the experiment's default cutoff.
+    // Replay across the baseline 128-READ boundary and changing active lanes.
     for (uint32_t count : {0U, 1U, 31U, 33U, 64U, 127U, 128U, 129U,
                            255U, 256U, 257U, 32U}) f.Run(count);
   }
@@ -347,17 +374,15 @@ int main() {
     }
     for (int replay = 0; replay < 20; ++replay) f.Run(33);
   }
-  if (kvaf_batch_get::kSmallPostMaxRequests >= 32) {
-    for (bool timeout : {false, true}) {
-      Fixture f(257, 1, 2, 2048);
-      aiv_model::hardware[1].timeout = timeout;
-      aiv_model::hardware[1].error = !timeout;
-      f.Run(32, timeout ? kCqTimeout : kCqError);
-      CHECK(f.queues[0].poisoned && f.queues[1].poisoned);
-      const uint64_t before = aiv_model::doorbells;
-      f.Run(32, kInvalidQueue);
-      CHECK(aiv_model::doorbells == before);
-    }
+  for (bool timeout : {false, true}) {
+    Fixture f(257, 1, 2, 2048);
+    aiv_model::hardware[1].timeout = timeout;
+    aiv_model::hardware[1].error = !timeout;
+    f.Run(257, timeout ? kCqTimeout : kCqError);
+    CHECK(f.queues[0].poisoned && f.queues[1].poisoned);
+    const uint64_t before = aiv_model::doorbells;
+    f.Run(257, kInvalidQueue);
+    CHECK(aiv_model::doorbells == before);
   }
   for (const auto& shape : {std::array<uint32_t, 3>{1, 1, 2048}, {1, 16, 2048},
                            {1, 64, 2048}, {4, 4, 2048}, {3, 3, 2049}, {1, 1, 2},
@@ -437,7 +462,7 @@ int main() {
     f.Run(512, kInvalidQueue);
     CHECK(aiv_model::doorbells == before);
   }
-  std::cout << "BatchGet kernel CPU model: small-post cutoff="
-            << kvaf_batch_get::kSmallPostMaxRequests
+  std::cout << "BatchGet kernel CPU model: baseline posts, lean="
+            << kvaf_batch_get::kLeanSchedule
             << ", payload, CQ/SQ wrap, tail, replay and faults passed\n";
 }

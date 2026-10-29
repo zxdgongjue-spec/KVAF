@@ -437,6 +437,27 @@ def print_jetty_profile(
             raise AssertionError("profile mode or compiled small-post limit changed within a run")
         round_robin = modes.pop()
         widths = [int(record["selected_post_width"]) for record in records]
+        management_proof = ""
+        versions = {int(r.get("schedule_metadata_version", 0)) for r in records}
+        if len(versions) != 1 or not versions <= {0, 1}:
+            raise AssertionError("invalid or changing schedule metadata version")
+        if versions == {1}:
+            enabled = {bool(r["lean_schedule_enabled"]) for r in records}
+            managed = [int(r["managed_jettys"]) for r in records]
+            if (len(enabled) != 1 or any(int(r["configured_jettys"]) != jettys_per_core
+                                        for r in records) or
+                    any(not 0 <= j <= jettys_per_core for j in managed)):
+                raise AssertionError("invalid configured/managed Jetty counts")
+            active_jettys = sum(sum(int(t["submitted_reads"]) > 0 for t in r["jettys"])
+                               for r in records) / divisor
+            management_proof = (
+                f" schedule_metadata_version=1 lean_schedule_enabled={int(enabled.pop())} "
+                f"configured_jettys={jettys_per_core} "
+                f"active_jettys_per_call={active_jettys:.6f} "
+                f"managed_jettys_min={min(managed)} managed_jettys_max={max(managed)} "
+                f"managed_jettys_per_call={sum(managed) / divisor:.6f} "
+                f"single_group_fast_path_samples={sum(bool(r['single_group_fast_path']) for r in records)}"
+            )
         print(
             f"KERNEL_PROFILE_SCHEDULE core={core} samples={len(samples)} "
             f"small_post_max_requests={limits.pop()} "
@@ -449,7 +470,7 @@ def print_jetty_profile(
                     ("fused_groups_per_call", "fused_group_count"),
                     ("wqe_build_calls_per_call", "wqe_build_calls"),
                 )
-            )
+            ) + management_proof
         )
         for jetty in range(jettys_per_core):
             traces = [record["jettys"][jetty] for record in records]

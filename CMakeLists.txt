@@ -12,15 +12,14 @@ option(KVAF_BUILD_REMOTE_CPU_SERVICE
        "Build the liburma-only persistent CPU DDR/Jetty service"
        OFF)
 
-set(KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS "0" CACHE STRING
-    "Experimental small-post BatchGet request limit; 0 disables the policy")
-if(NOT KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS MATCHES "^(0|[1-9][0-9]*)$" OR
-   KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS GREATER 2147483647)
-  message(FATAL_ERROR
-    "KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS must be in [0, INT32_MAX]")
+if(DEFINED KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS)
+  message(STATUS "Discarding obsolete BatchGet small-post cache setting; posts use up to 128 READs")
+  unset(KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS CACHE)
+  unset(KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS)
 endif()
-message(STATUS
-  "BatchGet small-post experiment: max requests=${KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS}")
+option(KVAF_BATCH_GET_LEAN_SCHEDULE
+       "Manage only used BatchGet Jettys and bypass the scheduler for one group" ON)
+message(STATUS "BatchGet baseline posts, lean schedule: ${KVAF_BATCH_GET_LEAN_SCHEDULE}")
 
 if(KVAF_ENABLE_AIV_BATCH_PUT AND NOT KVAF_ENABLE_AIV_BATCH_GET)
   message(FATAL_ERROR

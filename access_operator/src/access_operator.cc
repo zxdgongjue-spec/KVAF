@@ -634,6 +634,34 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
     destination.wqe_build_calls = source.wqe_build_calls;
     destination.jetty_timeline_enabled = source.jetty_timeline_enabled != 0;
     destination.profile_version = source.profile_version;
+    destination.configured_jettys = impl_->config.jettys_per_core;
+    destination.managed_jettys = destination.configured_jettys;
+    if (source.schedule_metadata != 0) {
+      constexpr std::uint64_t known_bits = KVAF_BATCH_GET_SCHEDULE_METADATA_V1 |
+          KVAF_BATCH_GET_SCHEDULE_LEAN | KVAF_BATCH_GET_SCHEDULE_SINGLE_GROUP |
+          (std::uint64_t(KVAF_BATCH_GET_SCHEDULE_MANAGED_MASK) <<
+           KVAF_BATCH_GET_SCHEDULE_MANAGED_SHIFT);
+      destination.schedule_metadata_version = 1;
+      destination.lean_schedule_enabled =
+          (source.schedule_metadata & KVAF_BATCH_GET_SCHEDULE_LEAN) != 0;
+      destination.single_group_fast_path =
+          (source.schedule_metadata & KVAF_BATCH_GET_SCHEDULE_SINGLE_GROUP) != 0;
+      destination.managed_jettys = static_cast<std::uint32_t>(
+          (source.schedule_metadata >> KVAF_BATCH_GET_SCHEDULE_MANAGED_SHIFT) &
+          KVAF_BATCH_GET_SCHEDULE_MANAGED_MASK);
+      if ((source.schedule_metadata & ~known_bits) != 0 ||
+          (source.schedule_metadata & KVAF_BATCH_GET_SCHEDULE_METADATA_V1) == 0 ||
+          destination.managed_jettys > destination.configured_jettys ||
+          (source.active_requests != 0 && destination.managed_jettys == 0) ||
+          (!destination.lean_schedule_enabled &&
+           destination.managed_jettys != destination.configured_jettys) ||
+          (destination.single_group_fast_path &&
+           (!destination.lean_schedule_enabled || source.active_requests == 0 ||
+            source.submitted_group_count != 1 || source.completed_group_count != 1))) {
+        profiles->clear();
+        return Internal("BatchGet kernel returned invalid schedule metadata");
+      }
+    }
     std::uint64_t reads = 0, posts = 0, checkpoints = 0;
     for (std::size_t jetty = 0;
          jetty < destination.jetty_completion_wait_cycles.size(); ++jetty) {
@@ -655,7 +683,10 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
       posts += trace.submitted_posts;
       checkpoints += trace.completed_checkpoints;
       const bool idle = trace.submitted_reads == 0;
-      if ((idle && (trace.submitted_posts != 0 || trace.completed_checkpoints != 0 ||
+      if ((jetty >= destination.managed_jettys &&
+           (!idle || source.jetty_completion_wait_cycles[jetty] != 0 ||
+            source.jetty_completion_polls[jetty] != 0)) ||
+          (idle && (trace.submitted_posts != 0 || trace.completed_checkpoints != 0 ||
                     trace.first_doorbell_cycle != 0 || trace.last_doorbell_cycle != 0 ||
                     trace.first_cqe_seen_cycle != 0 || trace.last_cqe_seen_cycle != 0)) ||
           (!idle && (trace.submitted_posts == 0 || trace.completed_checkpoints == 0 ||

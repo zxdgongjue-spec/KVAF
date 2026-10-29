@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 from summarize_small_post import JETTY_METRICS, compare_jetty_scaling, compare_runs, main, parse_run
+from summarize_batch_get import main as lean_main
 
 
 class SmallPostCsvTests(unittest.TestCase):
@@ -167,6 +168,91 @@ class SmallPostCsvTests(unittest.TestCase):
         self.assertEqual(run["_jettys"][1]["last_db_to_last_cqe_us_p99"], "")
         self.assertEqual(run["_native_interleavings_recovered"], 1)
         self.assertEqual(run["active_jettys_per_call"], 2)
+
+    def management_log(self, name, enabled):
+        path = self.timeline_log(name)
+        text = path.read_text(encoding="utf-8")
+        active = 2 if "small-post" in name else 1
+        managed = active if enabled else 2
+        extension = (
+            f"schedule_metadata_version=1 lean_schedule_enabled={int(enabled)} "
+            f"configured_jettys=2 managed_jettys_min={managed} managed_jettys_max={managed} "
+            f"managed_jettys_per_call={managed} single_group_fast_path_samples={1000 if enabled else 0} "
+        )
+        path.write_text(text.replace("KERNEL_PROFILE_SCHEDULE ",
+                                     "KERNEL_PROFILE_SCHEDULE " + extension), encoding="utf-8")
+        return path
+
+    def test_management_proof_and_backward_compatible_export(self):
+        baseline = parse_run(self.management_log("r1_n32_baseline.log", False))
+        small = parse_run(self.management_log("r1_n32_small-post.log", True))
+        self.assertEqual(baseline["managed_jettys_per_call"], 4)
+        self.assertEqual(small["managed_jettys_per_call"], 4)
+        self.assertEqual(small["single_group_fast_path_calls"], 2)
+        self.assertEqual(small["_jettys"][0]["managed_jettys_min"], 2)
+        pairs, summary = compare_runs([baseline, small])
+        self.assertEqual(pairs[0]["baseline_lean_schedule_enabled"], 0)
+        self.assertEqual(summary[0]["median_small_post_single_group_fast_path_calls"], 2)
+        # An older V3 log has no extension: leave it missing, never infer OFF.
+        old_base = parse_run(self.timeline_log("r2_n32_baseline.log"))
+        old_small = parse_run(self.timeline_log("r2_n32_small-post.log"))
+        self.assertEqual(old_base["lean_schedule_enabled"], "")
+        self.assertEqual(len(compare_runs([baseline, small, old_base, old_small])[1]), 2)
+        mixed_base = parse_run(self.timeline_log("r3_n32_baseline.log"))
+        mixed_small = parse_run(self.management_log("r3_n32_small-post.log", True))
+        mixed_pair = compare_runs([mixed_base, mixed_small])[0][0]
+        self.assertEqual(mixed_pair["baseline_lean_schedule_enabled"], "")
+        self.assertEqual(mixed_pair["small_post_lean_schedule_enabled"], 1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main([str(self.root)]), 0)
+
+    def test_trims_management_without_changing_active_reads(self):
+        run = parse_run(self.management_log("r1_n32_baseline.log", True))
+        self.assertEqual(run["managed_jettys_per_call"], 2)
+        self.assertEqual(run["active_jettys_per_call"], 2)
+        self.assertEqual(run["single_group_fast_path_calls"], 2)
+        path = self.management_log("r1_n32_small-post.log", True)
+        original = path.read_text(encoding="utf-8")
+        for old, new in (("managed_jettys_per_call=2", "managed_jettys_per_call=0"),
+                         ("single_group_fast_path_samples=1000", "single_group_fast_path_samples=1001"),
+                         ("configured_jettys=2", "configured_jettys=8"),
+                         ("schedule_metadata_version=1 ", "")):
+            with self.subTest(old=old):
+                path.write_text(original.replace(old, new, 1), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    parse_run(path)
+
+    def test_fixed_post_lean_export_has_unambiguous_names(self):
+        self.management_log("r1_n32_baseline.log", False)
+        self.management_log("r1_n32_lean.log", True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(lean_main([str(self.root)]), 0)
+        files = list(self.root.glob("batch_get_*.csv"))
+        self.assertEqual(len(files), 6)
+        with (self.root / "batch_get_pairs.csv").open(encoding="utf-8-sig", newline="") as stream:
+            reader = csv.DictReader(stream)
+            row = next(reader)
+            self.assertIn("lean_p50_us", reader.fieldnames)
+            self.assertFalse(any("small_post" in name or "fused" in name for name in reader.fieldnames))
+        self.assertEqual(row["baseline_lean_schedule_enabled"], "0")
+        self.assertEqual(row["lean_lean_schedule_enabled"], "1")
+        self.assertEqual(row["baseline_active_jettys_per_call"], row["lean_active_jettys_per_call"])
+        self.assertEqual(row["lean_managed_jettys_per_call"], "2.000000")
+        self.assertEqual(row["lean_single_group_fast_path_calls"], "2.000000")
+        self.assertEqual(list(self.root.glob("small_post_*.csv")), [])
+
+    def test_fixed_post_export_rejects_wrong_build_or_old_experiment(self):
+        self.management_log("r1_n32_baseline.log", False)
+        lean = self.management_log("r1_n32_lean.log", True)
+        text = lean.read_text(encoding="utf-8")
+        lean.write_text(text.replace("lean_schedule_enabled=1", "lean_schedule_enabled=0"), encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(lean_main([str(self.root)]), 2)
+        self.assertEqual(list(self.root.glob("*.csv")), [])
+        lean.write_text(text, encoding="utf-8")
+        self.management_log("r1_n32_small-post.log", True)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(lean_main([str(self.root)]), 2)
 
     def test_rejoins_numeric_fields_keys_and_completion_markers(self):
         path = self.timeline_log("r1_n32_baseline.log")

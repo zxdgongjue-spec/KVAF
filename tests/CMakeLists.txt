@@ -12,21 +12,18 @@ add_executable(kvaf_batch_get_kernel_model_test batch_get_kernel_model_test.cc)
 target_include_directories(kvaf_batch_get_kernel_model_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/aiv_model
   ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include)
-target_compile_definitions(kvaf_batch_get_kernel_model_test PRIVATE
-  KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS=${KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS})
+target_compile_definitions(kvaf_batch_get_kernel_model_test PRIVATE KVAF_BATCH_GET_LEAN_SCHEDULE=0)
 add_test(NAME kvaf_batch_get_kernel_model_test COMMAND kvaf_batch_get_kernel_model_test)
-add_executable(kvaf_batch_get_small_post_kernel_model_test batch_get_kernel_model_test.cc)
-target_include_directories(kvaf_batch_get_small_post_kernel_model_test PRIVATE
+add_executable(kvaf_batch_get_lean_kernel_model_test batch_get_kernel_model_test.cc)
+target_include_directories(kvaf_batch_get_lean_kernel_model_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/aiv_model
   ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include)
-target_compile_definitions(kvaf_batch_get_small_post_kernel_model_test PRIVATE
-  KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS=256)
-add_test(NAME kvaf_batch_get_small_post_kernel_model_test
-  COMMAND kvaf_batch_get_small_post_kernel_model_test)
+target_compile_definitions(kvaf_batch_get_lean_kernel_model_test PRIVATE KVAF_BATCH_GET_LEAN_SCHEDULE=1)
+add_test(NAME kvaf_batch_get_lean_kernel_model_test COMMAND kvaf_batch_get_lean_kernel_model_test)
 add_test(NAME kvaf_batch_get_inflight_config_python
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_inflight_config.py")
-add_test(NAME kvaf_batch_get_small_post_csv_python
+add_test(NAME kvaf_batch_get_csv_python
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/diagnostics/test_small_post_csv.py")
 

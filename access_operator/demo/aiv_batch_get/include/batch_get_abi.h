@@ -20,6 +20,16 @@ static const uint64_t KVAF_AIV_BATCH_GET_PROFILE_MAGIC =
 static const uint64_t KVAF_AIV_BATCH_GET_JETTY_TIMELINE_MAGIC =
     0x4b56414650525433ULL;  // "KVAFPRT3": round-robin CQ observation
 
+// Optional V3 extension in the former reserved profile word. Zero denotes an
+// older V3 kernel. Resource-table strides and all ABI record sizes stay fixed.
+enum {
+  KVAF_BATCH_GET_SCHEDULE_METADATA_V1 = 1U << 16U,
+  KVAF_BATCH_GET_SCHEDULE_LEAN = 1U,
+  KVAF_BATCH_GET_SCHEDULE_SINGLE_GROUP = 2U,
+  KVAF_BATCH_GET_SCHEDULE_MANAGED_SHIFT = 8U,
+  KVAF_BATCH_GET_SCHEDULE_MANAGED_MASK = 0x7fU,
+};
+
 // Actual SQ publications and software CQ observations, reset on every launch.
 // CQ timestamps are observations after posting, not hardware completion times.
 typedef struct KvafBatchGetJettyProfile {
@@ -60,6 +70,8 @@ typedef struct KvafBatchGetCoreProfile {
   uint64_t post_active_cycles;  // sum of group submissions, excluding CQ waits
   uint64_t drain_wait_cycles;   // sum of all group completion waits
   uint64_t peak_submitted_not_drained;  // conservative per-core software peak
+  // Retired small-post slots are always zero in current kernels. Keep these
+  // words for V3 layout compatibility and historical log decoding.
   uint64_t small_post_max_requests;
   uint64_t selected_post_width;
   uint64_t small_post_group_count;
@@ -67,7 +79,7 @@ typedef struct KvafBatchGetCoreProfile {
   uint64_t wqe_build_calls;
   uint64_t jetty_timeline_enabled;
   uint64_t profile_version;
-  uint64_t reserved;
+  uint64_t schedule_metadata;
   KvafBatchGetJettyProfile jettys[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE];
 } KvafBatchGetCoreProfile;
 

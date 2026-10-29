@@ -15,16 +15,18 @@ die() {
 usage() {
   cat <<'EOF'
 Usage: ./build.sh <cpu|npu> [--build-dir DIR] [--jobs N]
-                 [--batch-get-small-post-max-requests N]
+                 [--batch-get-lean-schedule 0|1]
 
 cpu  Builds the liburma-only CPU Runtime service. If liburma is not installed,
      it clones and builds the pinned UMDK source beside this repository.
 npu  Builds the CANN AIV BatchGet/BatchPut Runtime and Python binding. It
      installs pybind11 for the selected Python interpreter when necessary.
 
---batch-get-small-post-max-requests N
-     NPU-only experiment: use smaller posts for at most N READs per BatchGet.
-     0 disables it. If omitted, preserve the CMake cache (new builds default 0).
+--batch-get-lean-schedule 0|1
+     NPU-only: skip idle-Jetty management and use a single-group
+     fast path when the whole call fits the inflight budget (or budget is 0).
+     Posts use at most 128 READs. If omitted, preserve the CMake cache
+     (new builds default 1); use explicit 0/1 for an A/B rebuild.
 
 Environment overrides:
   KVAF_UMDK_ROOT       UMDK source/header root for the CPU build
@@ -163,9 +165,8 @@ build_npu() {
   pybind11_dir="$($python_bin -m pybind11 --cmakedir)"
 
   local extra_cmake_options=()
-  if [[ -n "$small_post_max_requests" ]]; then
-    extra_cmake_options+=(
-      "-DKVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS=$small_post_max_requests")
+  if [[ -n "$lean_schedule" ]]; then
+    extra_cmake_options+=("-DKVAF_BATCH_GET_LEAN_SCHEDULE=$lean_schedule")
   fi
 
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
@@ -191,7 +192,7 @@ esac
 
 build_dir="$KVAF_ROOT/build-$mode"
 jobs="$(default_jobs)"
-small_post_max_requests=""
+lean_schedule=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --build-dir)
@@ -204,10 +205,10 @@ while [[ $# -gt 0 ]]; do
       jobs="$2"
       shift 2
       ;;
-    --batch-get-small-post-max-requests)
-      [[ $# -ge 2 && "$2" =~ ^(0|[1-9][0-9]*)$ ]] ||
-        die "--batch-get-small-post-max-requests requires a non-negative integer"
-      small_post_max_requests="$2"
+    --batch-get-lean-schedule)
+      [[ $# -ge 2 && "$2" =~ ^[01]$ ]] ||
+        die "--batch-get-lean-schedule requires 0 or 1"
+      lean_schedule="$2"
       shift 2
       ;;
     *) die "unknown argument: $1" ;;
@@ -215,8 +216,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || die "KVAF_BUILD_JOBS must be a positive integer"
-if [[ "$mode" != npu && -n "$small_post_max_requests" ]]; then
-  die "--batch-get-small-post-max-requests is supported only for npu"
+if [[ "$mode" != npu && -n "$lean_schedule" ]]; then
+  die "--batch-get-lean-schedule is supported only for npu"
 fi
 if [[ "$mode" == cpu ]]; then
   build_cpu "$build_dir" "$jobs"

@@ -410,6 +410,11 @@ class NpuPythonRuntime final {
       item["wqe_build_calls"] = profile.wqe_build_calls;
       item["jetty_timeline_enabled"] = profile.jetty_timeline_enabled;
       item["profile_version"] = profile.profile_version;
+      item["schedule_metadata_version"] = profile.schedule_metadata_version;
+      item["lean_schedule_enabled"] = profile.lean_schedule_enabled;
+      item["single_group_fast_path"] = profile.single_group_fast_path;
+      item["configured_jettys"] = profile.configured_jettys;
+      item["managed_jettys"] = profile.managed_jettys;
       py::list jettys;
       const auto jetty_count = native_->jettys_per_core() == 0U ? 1U : native_->jettys_per_core();
       for (std::size_t index = 0; index < jetty_count; ++index) {

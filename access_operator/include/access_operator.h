@@ -84,6 +84,7 @@ struct BatchGetKernelProfile {
   std::uint64_t post_active_cycles{0};
   std::uint64_t drain_wait_cycles{0};
   std::uint64_t peak_submitted_not_drained{0};
+  // Legacy V3 small-post counters; current kernels report zero.
   std::uint64_t small_post_max_requests{0};
   std::uint64_t selected_post_width{0};
   std::uint64_t small_post_group_count{0};
@@ -91,6 +92,12 @@ struct BatchGetKernelProfile {
   std::uint64_t wqe_build_calls{0};
   bool jetty_timeline_enabled{false};
   std::uint64_t profile_version{0};
+  // Version 0 means an older V3 kernel supplied no scheduling extension.
+  std::uint64_t schedule_metadata_version{0};
+  bool lean_schedule_enabled{false};
+  bool single_group_fast_path{false};
+  std::uint32_t configured_jettys{0};
+  std::uint32_t managed_jettys{0};
   struct JettyProfile {
     std::uint64_t submitted_reads{0};
     std::uint64_t submitted_posts{0};

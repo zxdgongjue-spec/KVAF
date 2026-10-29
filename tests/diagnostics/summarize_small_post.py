@@ -19,7 +19,7 @@ LOG_NAME = re.compile(
     r"r(?P<round>[1-9][0-9]*)_n(?P<count>0|[1-9][0-9]*)_"
     r"(?:(?:c(?P<cores>[1-9][0-9]*)_j(?P<jettys>[1-9][0-9]*)|"
     r"(?P<legacy_jettys>[1-9][0-9]*))_)?"
-    r"(?P<variant>baseline|small-post)\.log"
+    r"(?P<variant>baseline|small-post|lean)\.log"
 )
 SHAPE_FIELDS = ("token_bytes", "miss_count", "aiv_cores", "jettys_per_core")
 SHAPE_METRICS = ("reads_per_core_min", "reads_per_core_max", "reads_per_core_mean",
@@ -45,7 +45,13 @@ OPTIONAL_STAGES = {
 }
 SCHEDULE_METRICS = ("small_post_groups_per_call", "fused_groups_per_call", "wqe_build_calls_per_call")
 PROOF_METRICS = ("small_post_max_requests", "post_width_min", "post_width_max",
-                 "active_jettys_per_call")
+                 "active_jettys_per_call", "schedule_metadata_version",
+                 "lean_schedule_enabled", "managed_jettys_per_call",
+                 "single_group_fast_path_calls")
+MANAGEMENT_FIELDS = ("schedule_metadata_version", "lean_schedule_enabled",
+                     "configured_jettys", "managed_jettys_min", "managed_jettys_max",
+                     "managed_jettys_per_call", "single_group_fast_path_samples")
+POLICY_METRICS = ("small_post_max_requests", "schedule_metadata_version", "lean_schedule_enabled")
 JETTY_METRICS = (
     "active_samples", "reads_per_call", "posts_per_call", "completions_per_call",
     "payload_bytes_per_call", "polls_per_call", "probe_active_us_mean",
@@ -142,7 +148,7 @@ def _parse_run(path: Path) -> dict:
     match = LOG_NAME.fullmatch(path.name)
     if match is None:
         raise ValueError("expected r<round>_n<count>_[c<cores>_j<jettys>_|<jettys>_]"
-                         "<baseline|small-post>.log")
+                         "<baseline|small-post|lean>.log")
     lines, recovered = log_lines(path.read_text(encoding="utf-8-sig"))
     for marker in ("BATCH_GET_PERF_PHASE_DONE phase=batch_get",
                    "BATCH_GET_PERF_PHASE_DONE phase=shutdown"):
@@ -264,6 +270,8 @@ def _parse_run(path: Path) -> dict:
                     raise ValueError("per-Jetty sample count or polling mode mismatch")
                 record = dict(core=core_id, jetty=int(trace["jetty"]))
                 record.update({name: number(schedule[name]) for name in SCHEDULE_FIELDS})
+                record.update({name: number(schedule[name]) if name in schedule else ""
+                               for name in MANAGEMENT_FIELDS})
                 record.update({name: "" if trace[name] == "n/a" and "_us_" in name
                                else number(trace[name])
                                for name in JETTY_METRICS})
@@ -292,6 +300,34 @@ def _parse_run(path: Path) -> dict:
                    post_width_max=max(int(s["post_width_max"]) for s in schedules),
                    active_jettys_per_call=sum(j["active_samples"] for j in row["_jettys"]) /
                                          int(config["iterations"]))
+        if any(name in s for s in schedules for name in MANAGEMENT_FIELDS):
+            if any(name not in s for s in schedules for name in MANAGEMENT_FIELDS):
+                raise ValueError("incomplete Jetty management proof")
+            versions = {number(s["schedule_metadata_version"]) for s in schedules}
+            enabled = {number(s["lean_schedule_enabled"]) for s in schedules}
+            if versions != {1} or len(enabled) != 1 or not enabled <= {0, 1}:
+                raise ValueError("invalid or changing Jetty management policy")
+            lean = enabled.pop()
+            for schedule in schedules:
+                minimum, maximum = (number(schedule[name]) for name in
+                                    ("managed_jettys_min", "managed_jettys_max"))
+                managed = number(schedule["managed_jettys_per_call"])
+                fast = number(schedule["single_group_fast_path_samples"])
+                actual = sum(j["active_samples"] for j in row["_jettys"]
+                             if j["core"] == int(schedule["core"])) / int(config["iterations"])
+                if (number(schedule["configured_jettys"]) != jetty_count or
+                        not 0 <= minimum <= managed <= maximum <= jetty_count or
+                        minimum != int(minimum) or maximum != int(maximum) or
+                        actual > managed + 1e-6 or
+                        not 0 <= fast <= int(config["iterations"]) or fast != int(fast) or
+                        (not lean and (fast != 0 or minimum != jetty_count)) or
+                        any(j["reads_per_call"] > 0 and j["jetty"] >= maximum
+                            for j in row["_jettys"] if j["core"] == int(schedule["core"]))):
+                    raise ValueError("Jetty management proof differs from actual activity")
+            row.update(schedule_metadata_version=1, lean_schedule_enabled=int(lean),
+                       managed_jettys_per_call=sum(number(s["managed_jettys_per_call"]) for s in schedules),
+                       single_group_fast_path_calls=sum(number(s["single_group_fast_path_samples"])
+                                                        for s in schedules) / int(config["iterations"]))
     return row
 
 
@@ -338,8 +374,8 @@ def compare_runs(runs: list[dict]) -> tuple[list[dict], list[dict]]:
         pair["round"] = base["round"]
         for metric in PAIR_METRICS:
             available = base[metric] != "" and small[metric] != ""
-            pair["baseline_" + metric] = base[metric] if available else ""
-            pair["small_post_" + metric] = small[metric] if available else ""
+            pair["baseline_" + metric] = base[metric] if available or metric in POLICY_METRICS else ""
+            pair["small_post_" + metric] = small[metric] if available or metric in POLICY_METRICS else ""
         pair.update(comparison_deltas(base, small))
         pair.update(baseline_log=base["log_file"], small_post_log=small["log_file"])
         pairs.append(pair)
@@ -347,7 +383,9 @@ def compare_runs(runs: list[dict]) -> tuple[list[dict], list[dict]]:
     configurations = {}
     for pair in pairs:
         key = tuple(pair[name] for name in CONFIG_FIELDS) + (
-            pair["baseline_small_post_max_requests"], pair["small_post_small_post_max_requests"])
+            pair["baseline_small_post_max_requests"], pair["small_post_small_post_max_requests"],
+            *(pair[prefix + name] for prefix in ("baseline_", "small_post_")
+              for name in ("schedule_metadata_version", "lean_schedule_enabled")))
         configurations.setdefault(key, []).append(pair)
     summary = []
     for group in configurations.values():
@@ -401,15 +439,17 @@ def compare_jetty_scaling(runs: list[dict]) -> tuple[list[dict], list[dict]]:
                         reference_log=reference["log_file"], candidate_log=candidate["log_file"])
             for metric in PAIR_METRICS:
                 available = reference[metric] != "" and candidate[metric] != ""
-                pair["reference_" + metric] = reference[metric] if available else ""
-                pair["candidate_" + metric] = candidate[metric] if available else ""
+                pair["reference_" + metric] = reference[metric] if available or metric in POLICY_METRICS else ""
+                pair["candidate_" + metric] = candidate[metric] if available or metric in POLICY_METRICS else ""
             pair.update(comparison_deltas(reference, candidate))
             pairs.append(pair)
 
     configurations = {}
     for pair in pairs:
         key = (pair["variant"], *(pair[name] for name in CONFIG_FIELDS),
-               pair["reference_small_post_max_requests"], pair["candidate_small_post_max_requests"])
+               pair["reference_small_post_max_requests"], pair["candidate_small_post_max_requests"],
+               *(pair[prefix + name] for prefix in ("reference_", "candidate_")
+                 for name in ("schedule_metadata_version", "lean_schedule_enabled")))
         configurations.setdefault(key, []).append(pair)
     summary = []
     for group in configurations.values():
@@ -436,8 +476,11 @@ def write_csv(path: Path, rows: list[dict], columns: tuple[str, ...]) -> None:
                              for key in columns})
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(argv: list[str] | None = None, *, experiment: str = "small-post") -> int:
+    lean_experiment = experiment == "lean"
+    parser = argparse.ArgumentParser(description=(
+        "Export fixed-post baseline/lean BatchGet logs as six CSV files."
+        if lean_experiment else __doc__))
     parser.add_argument("log_dir", type=Path,
                         help="recursively read r<round>_n<count>_[c<cores>_j<jettys>_|<jettys>_]<variant>.log")
     parser.add_argument("--output-dir", type=Path, help="CSV destination; defaults to log_dir")
@@ -450,12 +493,45 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError(f"no A/B logs found under {args.log_dir}")
         runs = [parse_run(path) for path in paths]
         runs.sort(key=lambda row: (row["round"], *(int(row[name]) for name in SHAPE_FIELDS), row["variant"]))
-        pairs, summary = compare_runs(runs)
+        comparison_runs = runs
+        if lean_experiment:
+            for run in runs:
+                if run["variant"] not in ("baseline", "lean"):
+                    raise ValueError("use a separate directory for baseline/lean logs")
+                if (run["schedule_metadata_version"] != 1 or
+                        run["lean_schedule_enabled"] != int(run["variant"] == "lean") or
+                        run["small_post_max_requests"] != 0 or
+                        run["post_width_min"] != 128 or run["post_width_max"] != 128):
+                    raise ValueError(f"not a fixed-post baseline/lean build: {run['log_file']}")
+            # Reuse the historical pair/statistics engine; translate its output
+            # column prefixes below. Public filenames and labels remain lean.
+            comparison_runs = [dict(run, variant=("small-post" if run["variant"] == "lean"
+                                                 else "baseline")) for run in runs]
+        elif any(run["variant"] == "lean" for run in runs):
+            raise ValueError("use summarize_batch_get.py for baseline/lean logs")
+        pairs, summary = compare_runs(comparison_runs)
+        if lean_experiment:
+            by_log = {run["log_file"]: run for run in runs}
+            for pair in pairs:
+                if any(not math.isclose(pair["baseline_" + metric], pair["small_post_" + metric],
+                                        rel_tol=0, abs_tol=1e-4)
+                       for metric in ("posts_per_call", "completions_per_call", "active_jettys_per_call")):
+                    raise ValueError("baseline/lean performed different READ/post/CQE assignments")
+                assignments = []
+                for name in ("baseline_log", "small_post_log"):
+                    assignments.append({(j["core"], j["jetty"]):
+                                        tuple(j[metric] for metric in
+                                              ("reads_per_call", "posts_per_call", "completions_per_call"))
+                                        for j in by_log[pair[name]]["_jettys"]})
+                before, after = assignments
+                if before.keys() != after.keys() or any(
+                        not math.isclose(a, b, rel_tol=0, abs_tol=1e-4)
+                        for key in before for a, b in zip(before[key], after[key])):
+                    raise ValueError("baseline/lean per-Jetty READ/post/CQE assignments differ")
         jetty_pairs, jetty_summary = compare_jetty_scaling(runs)
         jettys = [{**{key: run[key] for key in ("round", "variant") + CONFIG_FIELDS}, **trace}
                   for run in runs for trace in run["_jettys"]]
         output = args.output_dir or args.log_dir
-        output.mkdir(parents=True, exist_ok=True)
         outputs = (
             ("small_post_runs.csv", runs,
              ("round", "variant") + CONFIG_FIELDS + SHAPE_METRICS + ("payload_bytes",) + RUN_METRICS +
@@ -466,7 +542,8 @@ def main(argv: list[str] | None = None) -> int:
              CONFIG_FIELDS + SHAPE_METRICS + ("rounds", "round_ids") + tuple(prefix + "rounds" for prefix in OPTIONAL_STAGES.values()) +
              tuple("median_" + name for name in PAIR_VALUES)),
             ("small_post_jettys.csv", jettys,
-             ("round", "variant") + CONFIG_FIELDS + ("core", "jetty") + SCHEDULE_FIELDS + JETTY_METRICS),
+             ("round", "variant") + CONFIG_FIELDS + ("core", "jetty") + SCHEDULE_FIELDS +
+             MANAGEMENT_FIELDS + JETTY_METRICS),
             ("small_post_jetty_pairs.csv", jetty_pairs,
              ("round", "variant") + CONFIG_FIELDS + SHAPE_METRICS +
              ("reference_variant", "reference_jettys_per_core") + JETTY_PAIR_VALUES +
@@ -476,17 +553,36 @@ def main(argv: list[str] | None = None) -> int:
              ("reference_variant", "reference_jettys_per_core", "paired_rounds", "round_ids") +
              JETTY_SUMMARY_COUNTS + tuple("median_" + name for name in JETTY_PAIR_VALUES)),
         )
+        if lean_experiment:
+            retired_metrics = ("small_post_max_requests", "small_post_groups_per_call",
+                               "fused_groups_per_call", "small_post_active_samples")
+
+            def column_name(name):
+                if name.startswith("median_small_post_"):
+                    return "median_lean_" + name[len("median_small_post_"):]
+                if name.startswith("small_post_"):
+                    return "lean_" + name[len("small_post_"):]
+                return name
+
+            outputs = tuple((filename.replace("small_post_", "batch_get_", 1),
+                             [{column_name(key): value for key, value in row.items()} for row in rows],
+                             tuple(column_name(name) for name in columns
+                                   if not any(name == metric or name.endswith("_" + metric)
+                                              for metric in retired_metrics)))
+                            for filename, rows, columns in outputs)
+        output.mkdir(parents=True, exist_ok=True)
+        log_prefix = "BATCH_GET" if lean_experiment else "SMALL_POST"
         # Validate every log and pair before creating any result CSV.
         for run in runs:
             if run["_native_interleavings_recovered"]:
-                print(f"SMALL_POST_LOG_RECOVERED path={run['log_file']} "
+                print(f"{log_prefix}_LOG_RECOVERED path={run['log_file']} "
                       f"native_interleavings={run['_native_interleavings_recovered']}")
-        print("SMALL_POST_JETTY_REFERENCE variant=baseline jettys_per_core=1 "
+        print(f"{log_prefix}_JETTY_REFERENCE variant=baseline jettys_per_core=1 "
               f"matched_runs={len(jetty_pairs)} missing_reference_runs={len(runs) - len(jetty_pairs)}")
         for filename, rows, columns in outputs:
             path = output / filename
             write_csv(path, rows, columns)
-            print(f"SMALL_POST_CSV_WRITTEN path={path} rows={len(rows)}")
+            print(f"{log_prefix}_CSV_WRITTEN path={path} rows={len(rows)}")
     except (OSError, ValueError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2

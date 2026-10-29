@@ -12,45 +12,15 @@ namespace kvaf_batch_get {
 
 constexpr uint32_t kWqesPerPost = 128U;
 
-#ifndef KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS
-#define KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS 0
+#ifndef KVAF_BATCH_GET_LEAN_SCHEDULE
+#define KVAF_BATCH_GET_LEAN_SCHEDULE 1
 #endif
+static_assert(KVAF_BATCH_GET_LEAN_SCHEDULE == 0 || KVAF_BATCH_GET_LEAN_SCHEDULE == 1,
+              "KVAF_BATCH_GET_LEAN_SCHEDULE must be 0 or 1");
+constexpr bool kLeanSchedule = KVAF_BATCH_GET_LEAN_SCHEDULE != 0;
 
-// This compile-time experiment changes scheduling only. UB bank capacity,
-// SIMT width and the public kernel ABI remain unchanged.
-constexpr uint32_t kSmallPostMaxRequests =
-    KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS;
-
-KVAF_BATCH_GET_SCHEDULE_INLINE uint32_t PostCount(
-    uint32_t count, uint32_t post_width = kWqesPerPost) {
-  return count / post_width + (count % post_width != 0U);
-}
-
-KVAF_BATCH_GET_SCHEDULE_INLINE uint32_t SelectPostWidth(
-    uint32_t total_requests, uint32_t core_requests, uint32_t jettys,
-    uint32_t small_post_max_requests = kSmallPostMaxRequests) {
-  if (small_post_max_requests == 0U ||
-      total_requests > small_post_max_requests || core_requests == 0U ||
-      jettys <= 1U) {
-    return kWqesPerPost;
-  }
-  // Use roughly one post per Jetty on short slices, without padding READs.
-  // A tiny/uneven slice can use fewer Jettys than configured.
-  const uint32_t width = core_requests / jettys +
-      (core_requests % jettys != 0U);
-  return width < kWqesPerPost ? width : kWqesPerPost;
-}
-
-KVAF_BATCH_GET_SCHEDULE_INLINE bool CanFuseSmallPosts(
-    uint32_t count, uint32_t post_width, uint32_t jettys) {
-  if (count == 0U || count > kWqesPerPost || post_width == 0U ||
-      post_width >= kWqesPerPost) {
-    return false;
-  }
-  const uint32_t posts = PostCount(count, post_width);
-  // Each post must have a distinct Jetty, so all SQ heads can be snapshotted
-  // before the one vector fill. Larger groups retain the two-bank pipeline.
-  return posts > 1U && posts <= jettys;
+KVAF_BATCH_GET_SCHEDULE_INLINE uint32_t PostCount(uint32_t count) {
+  return count / kWqesPerPost + (count % kWqesPerPost != 0U);
 }
 
 KVAF_BATCH_GET_SCHEDULE_INLINE uint32_t CoreBudget(
@@ -58,20 +28,33 @@ KVAF_BATCH_GET_SCHEDULE_INLINE uint32_t CoreBudget(
   return total / cores + (core < total % cores);
 }
 
+// A whole-slice group starts at Jetty 0. Reducing its local scheduling width
+// to this prefix preserves every post's destination and completion checkpoint.
+// Windowed groups retain the configured width because later groups rotate.
+// This is NOT the stride of the core-major entity/queue resource tables.
+KVAF_BATCH_GET_SCHEDULE_INLINE uint32_t ManagedJettys(
+    uint32_t core_requests, uint32_t core_budget, uint32_t configured_jettys,
+    bool lean = kLeanSchedule) {
+  if (!lean) return configured_jettys;
+  if (core_requests == 0U) return 0U;
+  if (core_budget != 0U) return configured_jettys;
+  const uint32_t posts = PostCount(core_requests);
+  return posts < configured_jettys ? posts : configured_jettys;
+}
+
 struct Group {
   uint32_t begin;
   uint32_t count;
   uint32_t first_jetty;
-  uint32_t post_width = kWqesPerPost;
 };
 
 KVAF_BATCH_GET_SCHEDULE_INLINE uint32_t AssignedRequests(
     const Group &group, uint32_t jetty, uint32_t jettys) {
   const uint32_t relative = (jetty + jettys - group.first_jetty) % jettys;
-  const uint32_t full_posts = group.count / group.post_width;
+  const uint32_t full_posts = group.count / kWqesPerPost;
   return (full_posts / jettys + (relative < full_posts % jettys)) *
-             group.post_width +
-         (relative == full_posts % jettys ? group.count % group.post_width : 0U);
+             kWqesPerPost +
+         (relative == full_posts % jettys ? group.count % kWqesPerPost : 0U);
 }
 
 // Two FIFO slots. A slot is reused only after ALL of its Jetty checkpoints
@@ -86,7 +69,6 @@ struct Schedule {
   uint32_t next_jetty;
   uint32_t oldest;
   uint32_t pending;
-  uint32_t post_width = kWqesPerPost;
 
   KVAF_BATCH_GET_SCHEDULE_INLINE bool CanPost() const {
     return cursor < end && pending < 2U;
@@ -97,15 +79,14 @@ struct Schedule {
     const uint32_t capacity =
         budget == 0U ? end - cursor : budget / 2U + slot * (budget % 2U);
     const uint32_t remaining = end - cursor;
-    return Group{cursor, remaining < capacity ? remaining : capacity,
-                 next_jetty, post_width};
+    return Group{cursor, remaining < capacity ? remaining : capacity, next_jetty};
   }
 
   KVAF_BATCH_GET_SCHEDULE_INLINE void Posted(const Group &group) {
     groups[(oldest + pending) % 2U] = group;
     ++pending;
     cursor += group.count;
-    next_jetty = (next_jetty + PostCount(group.count, group.post_width)) % jettys;
+    next_jetty = (next_jetty + PostCount(group.count)) % jettys;
   }
 
   KVAF_BATCH_GET_SCHEDULE_INLINE void Completed() {
