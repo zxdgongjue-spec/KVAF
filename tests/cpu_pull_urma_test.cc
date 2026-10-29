@@ -1,14 +1,19 @@
 // The real CPU READ backend linked against a fake URMA provider. Requires the
 // public 24.12 headers; verifies descriptors, splitting and CQ correlation.
 #include "cpu_pull_urma.h"
+#include <cerrno>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
+#include <sys/wait.h>
+#include <unistd.h>
 
 namespace p = kvaf::offload;
 void Require(bool value,const char* text){if(!value)throw std::runtime_error(text);}
-int posts{}, local_mrs{}, imported_mrs{}, queues{};
+int posts{}, post_calls{}, local_mrs{}, imported_mrs{}, queues{};
+enum class Fault { None, Post, Poll, CqStatus, UserContext };
+Fault fault = Fault::None;
 std::uint64_t pending{};
 urma_seg_t expected_segment{};
 std::uint8_t expected_jetty_key[32]{};
@@ -54,7 +59,9 @@ urma_target_jetty_t* urma_import_jetty_ex(void*,void* remote,void*,void*){
   Require(!std::memcmp(remote,expected_jetty_key,28),"import provider Jetty identity verbatim");
   return new urma_target_jetty_t{};
 }
-urma_status_t urma_post_jetty_send_wr(urma_jetty_t*,urma_jfs_wr_t* wr,urma_jfs_wr_t**){
+urma_status_t urma_post_jetty_send_wr(urma_jetty_t*,urma_jfs_wr_t* wr,urma_jfs_wr_t** bad){
+  ++post_calls;
+  if(fault==Fault::Post){*bad=wr;errno=EINVAL;return URMA_EINVAL;}
   Require(!pending&&wr->opcode==URMA_OPC_READ&&wr->flag.bs.complete_enable,"one signalled READ at a time");
   Require(wr->rw.src.num_sge==1&&wr->rw.dst.num_sge==1,"one source and destination");
   const auto& source=*reinterpret_cast<Sge*>(wr->rw.src.sge);
@@ -66,7 +73,11 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t*,urma_jfs_wr_t* wr,urma_jfs_w
   pending=wr->user_ctx;++posts;return URMA_SUCCESS;
 }
 int urma_poll_jfc(urma_jfc_t*,int,urma_cr_t* cr){
-  Require(pending!=0,"poll follows post");cr->status=URMA_CR_SUCCESS;cr->user_ctx=pending;pending=0;return 1;
+  Require(pending!=0,"poll follows post");
+  if(fault==Fault::Poll){errno=EIO;return -1;}
+  cr->status=fault==Fault::CqStatus?URMA_CR_REM_ACCESS_ABORT_ERR:URMA_CR_SUCCESS;
+  cr->user_ctx=fault==Fault::UserContext?pending+1:pending;
+  cr->local_id=17;cr->tpn=23;pending=0;return 1;
 }
 }
 void ReadTest(bool distinct_eids){
@@ -91,7 +102,29 @@ void ReadTest(bool distinct_eids){
   Require(backend->Open(source,&cpu).ok(),"open source");
   std::vector<p::Span> spans{{7,64,10001},{15000,16000,123}};
   const int before=posts;
-  Require(backend->Read(spans).ok()&&posts==before+4,"3+1 WR split");
+  const auto result=backend->Read(spans);
+  if(fault!=Fault::None){
+    Require(result.code()==kvaf::StatusCode::kInDoubt,"READ failure remains in doubt");
+    const char* stage=fault==Fault::Post?"stage=post_read":fault==Fault::Poll?"stage=poll_cq":"stage=cq_completion";
+    Require(result.message().find(stage)!=std::string::npos,"failure identifies READ stage");
+    Require(result.message().find("sge_bytes="+std::to_string(sizeof(Sge)))!=std::string::npos,"failure identifies active SGE ABI");
+    if(fault==Fault::Post)
+      Require(result.message().find("errno="+std::to_string(EINVAL))!=std::string::npos&&
+              result.message().find("bad_wr_is_current=1")!=std::string::npos,"post error keeps errno and bad WR");
+    if(fault==Fault::CqStatus||fault==Fault::UserContext)
+      Require(result.message().find("cq_status=")!=std::string::npos&&
+              result.message().find("cq_user_ctx=")!=std::string::npos&&
+              result.message().find("local_id=17 tpn=23")!=std::string::npos,"CQ diagnostics retain completion details");
+    const int calls=post_calls;
+    Require(backend->Read(spans).message()==result.message()&&post_calls==calls,"quarantined backend never resubmits READ");
+    Require(backend->ReleaseSource().message()==result.message()&&backend->Close().message()==result.message(),
+            "cleanup preserves original failure");
+    Require(local_mrs==1&&imported_mrs==1&&queues==3,"quarantined resources remain alive");
+    // This child models process exit with deliberately quarantined resources.
+    // Do not destruct/free them, or report their required retention as a leak.
+    _exit(0);
+  }
+  Require(result.ok()&&posts==before+4,"3+1 WR split");
   Require(!std::memcmp(reinterpret_cast<void*>(cpu.base+64),memory.data()+7,10001),"READ bytes");
   const auto* data=reinterpret_cast<const std::uint8_t*>(cpu.base);
   Require(data[63]==0&&data[10065]==0&&data[15999]==0&&data[16123]==0,"guard bytes unchanged");
@@ -103,5 +136,10 @@ void ReadTest(bool distinct_eids){
 int main(){try{
   ReadTest(false);
   ReadTest(true);
+  for(auto injected:{Fault::Post,Fault::Poll,Fault::CqStatus,Fault::UserContext}){
+    const auto child=fork();Require(child>=0,"fork failure scenario");
+    if(child==0){fault=injected;try{ReadTest(true);}catch(const std::exception& e){std::cerr<<e.what()<<'\n';}_exit(1);}
+    int status{};Require(waitpid(child,&status,0)==child&&WIFEXITED(status)&&WEXITSTATUS(status)==0,"READ failure scenario passed");
+  }
   std::cout<<"CPU URMA READ provider model passed\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

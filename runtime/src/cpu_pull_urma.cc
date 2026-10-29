@@ -1,10 +1,12 @@
 #include "cpu_pull_urma.h"
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <dlfcn.h>
 #include <limits>
+#include <sstream>
 #include <thread>
 
 #if !defined(URMA_ACCESS_LOCAL_WRITE) || defined(URMA_ACCESS_LOCAL_ONLY)
@@ -129,6 +131,9 @@ class UrmaBackend final : public Backend {
     return Status::OK();
   }
   Status Read(const std::vector<Span>& spans) override {
+    if (poisoned_) return Status::InDoubt(failure_);
+    if (!source_ || !destination_ || !jetty_ || !peer_ || !max_bytes_)
+      return Error("READ transport is not ready");
     for (const auto& span : spans) {
       for (std::uint64_t offset = 0; offset < span.bytes;) {
         const auto length = static_cast<std::uint32_t>(std::min<std::uint64_t>(max_bytes_, span.bytes-offset));
@@ -141,16 +146,24 @@ class UrmaBackend final : public Backend {
         wr_.rw.src = {reinterpret_cast<urma_sge_t*>(&source_sge_), 1};
         wr_.rw.dst = {reinterpret_cast<urma_sge_t*>(&destination_sge_), 1};
         urma_jfs_wr_t* bad = nullptr;
-        if (urma_post_jetty_send_wr(jetty_, &wr_, &bad)) return Poison("post READ");
+        errno = 0;
+        const int post_ret = urma_post_jetty_send_wr(jetty_, &wr_, &bad);
+        const int post_errno = errno;
+        if (post_ret) return ReadFailure("post_read", post_ret, post_errno, bad);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
         for (;;) {
-          urma_cr_t cr{}; const int n = urma_poll_jfc(cq_, 1, &cr);
-          if (n < 0) return Poison("poll CQ");
+          urma_cr_t cr{};
+          errno = 0;
+          const int n = urma_poll_jfc(cq_, 1, &cr);
+          const int poll_errno = errno;
+          if (n < 0) return ReadFailure("poll_cq", n, poll_errno);
           if (n) {
-            if (cr.status != URMA_CR_SUCCESS || cr.user_ctx != sequence_) return Poison("CQ status/context");
+            if (cr.status != URMA_CR_SUCCESS || cr.user_ctx != sequence_)
+              return ReadFailure("cq_completion", n, poll_errno, nullptr, &cr);
             break;
           }
-          if (std::chrono::steady_clock::now() >= deadline) return Poison("CQ timeout");
+          if (std::chrono::steady_clock::now() >= deadline)
+            return ReadFailure("cq_timeout", n, poll_errno);
           std::this_thread::yield();
         }
         offset += length;
@@ -161,7 +174,7 @@ class UrmaBackend final : public Backend {
     return Status::OK();
   }
   Status ReleaseSource() override {
-    if (poisoned_) return Status::InDoubt("READ has not quiesced");
+    if (poisoned_) return Status::InDoubt(failure_);
 #define RELEASE(handle, operation) \
     if (handle) { if (operation(handle)) return Poison(#operation); handle = nullptr; }
     RELEASE(peer_, urma_unimport_jetty)
@@ -186,12 +199,35 @@ class UrmaBackend final : public Backend {
     return hash;
   }
  private:
-  Status Poison(const char* operation) { poisoned_ = true; return Status::InDoubt(std::string("CPU Pull: ") + operation); }
+  Status ReadFailure(const char* stage, int ret, int error_number,
+                     const urma_jfs_wr_t* bad = nullptr, const urma_cr_t* cr = nullptr) {
+    std::ostringstream message;
+    message << "stage=" << stage << " ret=" << ret << " errno=" << error_number
+            << " sge_bytes=" << sizeof(Sge) << " wr_id=" << wr_.user_ctx
+            << " src=0x" << std::hex << source_sge_.addr
+            << " dst=0x" << destination_sge_.addr << std::dec
+            << " bytes=" << source_sge_.len << " bad_wr_nonnull=" << (bad != nullptr)
+            << " bad_wr_is_current=" << (bad == &wr_);
+    if (cr)
+      message << " cq_status=" << static_cast<unsigned>(cr->status)
+              << " cq_user_ctx=" << cr->user_ctx << " cq_flags=" << unsigned(cr->flag.value)
+              << " local_id=" << cr->local_id << " tpn=" << cr->tpn;
+    if (std::strcmp(stage, "cq_timeout") == 0) message << " timeout_ms=15000";
+    return Poison(message.str());
+  }
+  Status Poison(const std::string& operation) {
+    if (!poisoned_) {
+      failure_ = "CPU Pull: " + operation;
+      poisoned_ = true;
+    }
+    return Status::InDoubt(failure_);
+  }
   urma_context_t* context_;
   void* memory_{};
   std::uint64_t bytes_{}, source_base_{}, sequence_{};
   std::uint32_t max_bytes_{};
   bool poisoned_{};
+  std::string failure_;
   urma_token_id_t* token_{};
   urma_target_seg_t *destination_{}, *source_{};
   urma_jfc_t* cq_{};

@@ -1,5 +1,7 @@
 #include "offload_service.h"
 #include "offload_client.h"
+#include <cstdio>
+#include <exception>
 #include <mutex>
 #include <random>
 #include <thread>
@@ -161,13 +163,21 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
   s.spans = spans;
   s.state = State::Running;
   try {
-    s.worker = std::thread([&s] {
+    s.worker = std::thread([&s, region = r.region, task = r.task] {
+      std::fprintf(stderr, "[KVAF_CPU] CPU_PULL_TASK_BEGIN region=%llu task=%llu spans=%zu\n",
+                   static_cast<unsigned long long>(region), static_cast<unsigned long long>(task),
+                   s.spans.size());
       Status status;
       try { status = s.backend->Read(s.spans); }
+      catch (const std::exception& e) { status = Status::InDoubt(std::string("CPU Pull worker exception: ") + e.what()); }
       catch (...) { status = Status::InDoubt("CPU Pull worker exception"); }
       std::lock_guard<std::mutex> guard(s.mutex);
       s.state = status.ok() ? State::Done :
           (status.code() == StatusCode::kInDoubt ? State::InDoubt : State::Failed);
+      std::fprintf(stderr, "[KVAF_CPU] CPU_PULL_TASK_END region=%llu task=%llu state=%u status=%u detail=%s\n",
+                   static_cast<unsigned long long>(region), static_cast<unsigned long long>(task),
+                   static_cast<unsigned>(s.state), static_cast<unsigned>(status.code()),
+                   status.ok() ? "completed" : status.message().c_str());
     });
   } catch (...) { s.spans.clear(); s.state = State::Failed; out.result = Result::Failed; return out; }
   out.state = State::Running; out.result = Result::Ok;

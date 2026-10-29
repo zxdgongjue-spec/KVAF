@@ -111,6 +111,7 @@ class Server {
   std::thread thread;
   std::atomic<bool> stop{false};
   std::atomic<std::uint16_t> drop{0};
+  std::atomic<p::State> query_state{p::State::Empty};
   std::uint16_t port{};
   Server(){
     listener=socket(AF_INET,SOCK_STREAM,0);Require(listener>=0,"socket");
@@ -126,6 +127,9 @@ class Server {
           std::vector<p::Span> spans(request.count);
           if(p::ReadBytes(fd,spans.data(),spans.size()*sizeof(p::Span))){
             auto response=service.Dispatch(request,spans);
+            const auto state=query_state.load();
+            if(request.header.command==static_cast<std::uint16_t>(p::Command::Query)&&state!=p::State::Empty)
+              response.state=state;
             auto expected=request.header.command;
             if(!drop.compare_exchange_strong(expected,0))p::WriteBytes(fd,&response,sizeof(response));
           }
@@ -187,6 +191,19 @@ int main(){try{
   Require(!runtime.ResolveOffload().ok()&&!runtime.pending_offload()&&registrations==0,"unsubmitted task aborts after release confirmation");
   Require(reads==4,"lost open never submits DMA");
   Require(runtime.Offload(request,{stream}).ok(),"aborted slots reusable after lost open");
+  for(auto state:{p::State::InDoubt,p::State::Running}){
+    Require(runtime.core().BatchFree({{1,3}}).ok(),"free before remote status scenario");
+    const auto before=reads.load();server.query_state=state;
+    const auto status=runtime.Offload(request,{stream});
+    const char* diagnostic=state==p::State::InDoubt?"transport quarantined":"still running after timeout_ms=1000";
+    Require(status.code()==kvaf::StatusCode::kInDoubt&&status.message().find(diagnostic)!=std::string::npos,
+            "quarantine differs from client wait timeout");
+    Require(status.message().find("region=")!=std::string::npos&&status.message().find("task=")!=std::string::npos,
+            "pending error identifies CPU task");
+    Require(runtime.pending_offload()&&registrations==1,"pending remote state retains source");
+    server.query_state=p::State::Empty;
+    Require(runtime.ResolveOffload().ok()&&reads==before+1&&registrations==0,"query resolution never resubmits READ");
+  }
   server.drop=static_cast<std::uint16_t>(p::Command::Close);
   Require(runtime.Shutdown().code()==kvaf::StatusCode::kInDoubt,"lost close ack");
   Require(runtime.Shutdown().ok(),"close retry");

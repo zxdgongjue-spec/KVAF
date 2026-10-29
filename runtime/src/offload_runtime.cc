@@ -264,8 +264,16 @@ class PullOperator final : public AccessOperator, public DdrMemoryAllocator {
       if (response.result != p::Result::Ok) return Status::InDoubt("cannot identify CPU task; retain source");
       if (response.state == p::State::Done) { outcome_ = Status::OK(); return Cleanup(); }
       if (response.state == p::State::Failed || response.state == p::State::Open) return Cleanup();
-      if (response.state != p::State::Running || std::chrono::steady_clock::now() >= deadline)
-        return Status::InDoubt("CPU Pull pending/quarantined; call resolve_offload with source retained");
+      const auto identity = [this] { return " region=" + std::to_string(region_id_) + " task=" + std::to_string(task_); };
+      if (response.state == p::State::InDoubt)
+        return Status::InDoubt("CPU Pull transport quarantined; inspect CPU_PULL_TASK_END on CPU service;" +
+                               identity() + "; retain source; resolve_offload does not resubmit READ");
+      if (response.state != p::State::Running)
+        return Status::InDoubt("unexpected CPU Pull state=" + std::to_string(static_cast<unsigned>(response.state)) +
+                               identity() + "; retain source");
+      if (std::chrono::steady_clock::now() >= deadline)
+        return Status::InDoubt("CPU Pull is still running after timeout_ms=" + std::to_string(options_.timeout_ms) +
+                               identity() + "; call resolve_offload with source retained");
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
   }

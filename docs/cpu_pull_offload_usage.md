@@ -18,6 +18,15 @@ cmake --build build-cpu-offload -j8
 
 默认 CPU READ 使用公开的 24 字节 SGE；如果已确认部署 provider 使用参考 CPU push 中的 32 字节扩展 SGE，则额外设置 `-DKVAF_CPU_PULL_EXTENDED_SGE=ON`。不能只根据头文件版本判断实际加载库的 ABI。
 
+沿用 `aicpu-urma@8bc5a2a` 的 provider 环境时，显式选择其 32 字节 SGE。已有构建目录需重新配置，仅执行 build 不会改变缓存中的 OFF：
+
+```bash
+cmake -S . -B build-cpu-offload -DKVAF_CPU_PULL_EXTENDED_SGE=ON
+cmake --build build-cpu-offload -j8
+```
+
+重新启动 CPU 服务后，下一次分配应打印 `CPU_PULL_DDR ... sge_bytes=32`。这确认当前二进制使用了所选布局；是否匹配实际加载的 provider 仍需以部署版本和硬件验收确认。
+
 NPU 机器需要 CANN、Python、pybind11，以及运行时的 torch/torch_npu：
 
 ```bash
@@ -104,6 +113,19 @@ CQ 错误或超时会隔离该 CPU transport，首版不尝试强制取消/重�
 - `common/include/urma_transport.h`：封装 CTP/Jetty 导入参数，并采用 32 字节扩展 SGE。本分支通过 `KVAF_CPU_PULL_EXTENDED_SGE` 显式选择该 ABI，仍须匹配实际部署的 provider。
 
 Offload 沿用上述 EID 与导出标识的处理方式，将 READ 来源扩展为调用方的 Tensor HBM；源 MR 只开放远端 READ，任务完成后提交元数据。
+
+### READ 未完成时
+
+Jetty 导入成功只代表建链资源已创建，初始化还要用一次 READ 验证 HBM 到 DDR 的数据路径。CPU 服务按 `region`、`task` 打印 `CPU_PULL_TASK_BEGIN` 和 `CPU_PULL_TASK_END`；错误详情包含以下阶段：
+
+- `stage=post_read`：提交失败，保留 URMA 返回值、`errno` 和 bad WR 信息。
+- `stage=poll_cq`：查询 CQ 失败。
+- `stage=cq_completion`：CQ 状态非成功或返回的 `user_ctx` 不匹配；打印 `cq_status`、`cq_user_ctx`、预期 `wr_id`、`local_id`、`tpn`。
+- `stage=cq_timeout`：提交后 15 秒仍未收到有效完成。
+
+每种 READ 错误都保留 `sge_bytes`、源/目标地址和长度。NPU 异常会区分 CPU transport 已隔离和任务仍在运行但调用方等待超时，并给出相同的 `region/task` 以关联 CPU 日志。`resolve_offload()` 只查询原任务，不重发 READ，也不重建已隔离的硬件队列。
+
+若使用参考分支的 provider，先确认 `sge_bytes=32`，并保留本轮设备、NPU EID、CPU candidate 参数复测，以便区分 ABI 变化和路径变化。当前独立验收进程已经退出且 CPU transport 被隔离时，应停止旧 CPU 服务，再启动新二进制和新的 Python 验收进程。仅凭 `pending/quarantined` 无法判断 ABI 或链路是哪一个出了问题，需要完整的 CPU 任务错误行。
 
 ## 验证与限制
 
