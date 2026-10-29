@@ -221,7 +221,8 @@ Status AccessOperator::Initialize(const RemoteRegionDesc& region) {
     impl_->remote = region;
     impl_->retained = true;
     impl_->mapping = std::make_unique<Mapping>(impl_->hal);
-    status = impl_->mapping->Import(peer.fabric_handle, peer.fabric_mapping_bytes, logical_device);
+    status = impl_->mapping->Import(peer.fabric_handle, peer.fabric_mapping_bytes, logical_device,
+                                   aclrtReserveMemAddress, aclrtReleaseMemAddress);
   }
   if (status.ok()) status = impl_->LoadKernel();
   if (!status.ok()) { (void)Shutdown(); return status; }

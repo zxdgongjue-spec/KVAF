@@ -10,6 +10,24 @@
 
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); std::abort(); } } while (0)
 
+namespace {
+kvaf::ubmem::Hal* device_allocator;
+int device_reservations = 0;
+// Stand-ins for the ACL reserve/release pair supplied by the NPU operator.
+// Reject the old HAL DEVICE_SHARE flag and track matching ownership on errors.
+int ReserveDevice(void** out, std::size_t bytes, std::size_t alignment, void* hint, std::uint64_t flags) {
+  CHECK(flags == 1 && hint == nullptr && alignment == 0);
+  const int ret = device_allocator->reserve(out, bytes, alignment, hint, flags);
+  if (ret == 0) ++device_reservations;
+  return ret;
+}
+int ReleaseDevice(void* address) {
+  const int ret = device_allocator->free_address(address);
+  if (ret == 0) --device_reservations;
+  return ret;
+}
+}
+
 int main(int argc, char** argv) {
   CHECK(argc == 2);
   void* library = dlopen(argv[1], RTLD_NOW);
@@ -21,6 +39,7 @@ int main(int argc, char** argv) {
   CHECK(fail && handles && addresses && maps);
   auto hal = std::make_shared<kvaf::ubmem::Hal>();
   CHECK(hal->Load(argv[1]).ok());
+  device_allocator = hal.get();
   for (const char* stage : {"create", "reserve", "map", "export", "translate", "attribute"}) {
     fail(stage);
     { kvaf::ubmem::Mapping mapping(hal); kvaf::ubmem::FabricHandle descriptor{};
@@ -46,10 +65,18 @@ int main(int argc, char** argv) {
   kvaf::peer::PeerLink link("127.0.0.1:" + std::to_string(ntohs(address.sin_port)));
   kvaf::peer::PeerRegion region{};
   CHECK(link.AllocateUbmemRegion(kvaf::ubmem::kPageBytes, 4096, &region).ok());
+  for (const char* stage : {"import", "reserve", "map"}) {
+    fail(stage);
+    {
+      kvaf::ubmem::Mapping failed(hal);
+      CHECK(!failed.Import(region.fabric_handle, region.length, 0, ReserveDevice, ReleaseDevice).ok());
+    }
+    CHECK(device_reservations == 0 && handles() == 1 && addresses() == 1 && maps() == 1);
+  }
   {
     kvaf::ubmem::Mapping imported(hal);
-    fail("import"); CHECK(!imported.Import(region.fabric_handle, region.length, 0).ok());
-    CHECK(imported.Import(region.fabric_handle, region.length, 0).ok());
+    CHECK(imported.Import(region.fabric_handle, region.length, 0, ReserveDevice, ReleaseDevice).ok());
+    CHECK(device_reservations == 1);
     CHECK(link.RetainUbmemMapping(region.base).ok());
     CHECK(link.ReleaseRegion(region.base).code() == kvaf::StatusCode::kBusy);
     CHECK(link.UbmemRange(region.base, 0, 656, 29, true).ok());
@@ -60,8 +87,11 @@ int main(int argc, char** argv) {
     data[0] ^= 1;
     CHECK(!link.UbmemRange(region.base, 0, 656, 71, false).ok());
     fail("unmap"); CHECK(!imported.Close().ok());
-    CHECK(handles() == 2 && maps() == 2);  // failed unmap retains the allocation
+    CHECK(handles() == 2 && maps() == 2 && device_reservations == 1);
+    fail("free"); CHECK(!imported.Close().ok());
+    CHECK(handles() == 2 && maps() == 1 && device_reservations == 1);
     CHECK(imported.Close().ok());
+    CHECK(device_reservations == 0);
     link.ReleaseUbmemMapping(region.base);
   }
   CHECK(link.ReleaseRegion(region.base).ok());

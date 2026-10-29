@@ -77,14 +77,15 @@ CPU Host P2P DDR
                                       │
                          TCP PeerLink 交换描述符
                                       │
-NPU halMemImportFromShareableHandleV2 → Device VA reserve/map
+NPU HAL import → aclrtReserveMemAddress → halMemMap
                                       │
           BatchPut: 本地 HBM → SIMT store → CPU DDR
           BatchGet: CPU DDR → SIMT load → 本地 HBM
 ```
 
 - `access_operator/src/ubmem/hal.cc`：动态加载 HAL，管理不透明物理句柄、Fabric handle 与映射。
-  Host 分配采用 `MEM_P2P_DDR_TYPE`、huge page；Host UVA 和 NPU Device-share VA 分别预留。
+  Host 分配采用 `MEM_P2P_DDR_TYPE`、huge page 和 HAL Host UVA。NPU VA 使用
+  `aclrtReserveMemAddress(..., nullptr, 1)`，释放时配对调用 `aclrtReleaseMemAddress`。
 - `runtime/src/ubmem_cpu_runtime.cc`：使用已有 RuntimeService 接收控制请求，拥有 CPU DDR 生命周期。
 - `runtime/src/peer_link.cc`：增加 UBmem 分配、CPU oracle 请求；沿用原有 region release。
 - `access_operator/src/ubmem/access_operator.cc`：实现现有 AccessOperator 接口，保持 BatchPut 同步提交、
@@ -126,8 +127,16 @@ HAL 映射和 UB 通路，需运行 CPU 改写后 NPU Get、NPU Put 后 CPU chec
   三个内核共享编译器、头文件查找和编译参数。
 - SIMT 搬运：SHMEM `src/device_simt/gm2gm/engine/shmem_device_simt_mte.hpp` 的 GM load/store 循环。
 - HAL ABI：CANN Driver `pkg_inc/ascend_hal_base.h` 的 `drv_mem_prop` 和函数声明，
-  `ascend_hal_define.h` 的内存类型、Host UVA / Device-share 标志和 Fabric handle。
+  `ascend_hal_define.h` 的内存类型、Host UVA 标志和 Fabric handle。
+- NPU VA：SHMEM `hybm_vmm_based_segment.cpp::ReserveEachPeMemorySpace` 和
+  `hybm_acl_device_mem_segment.cpp::ReserveEachPeMemorySpace` 的 Ascend950 分支均用
+  `aclrtReserveMemAddress(..., nullptr, 1)`。`dl_acl_api.cpp::AclrtReserveMemAddress` 明确要求
+  nullptr 自动选址使用 ACL。KVAF 配对使用 ACL 预留/释放，HAL 导入/映射沿用前者的 `Map` 路径。
 - Fabric 导出及共享属性：SHMEM `src/host/mem/heap/hybm_vmm_based_segment.cpp::ExportInner`。
+
+SHMEM 的 `rma_d2h_demo` 是标量 p/g，`mte_perftest --memory-type dram` 使用 MTE/UB 搬运。
+本分支的 SIMT GM 拷贝并不是这两个 Host DDR 示例的同一数据面；它借鉴的是 SHMEM 的
+SIMT GM 循环，Host DDR 可达性必须由实际 Put/Get 校验确认。
 
 独立 CPU 节点使用这组 HAL 接口导出 DDR，是本测试要验证的能力。SHMEM 的 Host DDR
 示例运行在 Ascend runtime 环境，不能据此认定独立 CPU 节点已经支持。
@@ -138,7 +147,7 @@ HAL 映射和 UB 通路，需运行 CPU 改写后 NPU Get、NPU Put 后 CPU chec
 
 - `cannot load libascend_hal.so`：HAL 库未安装或不在加载路径。
 - `halMemCreate(Host P2P DDR)`：当前驱动／节点不能分配此类 DDR，或资源不足。
-- `halMemAddressReserve`：不支持当前 Host UVA／Device-share VA 预留方式，或地址资源不足。
+- `reserve virtual address`：CPU 的 HAL Host UVA 或 NPU 的 ACL 设备 VA 预留失败。
 - `halMemExportToShareableHandleV2(FABRIC)`：CPU 端 Fabric 导出失败。
 - `halMemImportFromShareableHandleV2(FABRIC)` / `halMemMap`：NPU 侧导入、路由、权限或映射失败。
 - `CPU_MISMATCH` / `KERNEL_ERROR`：分别为 CPU 内容校验失败、内核请求范围等校验失败。
