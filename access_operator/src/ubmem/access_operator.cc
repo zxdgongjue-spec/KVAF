@@ -320,8 +320,23 @@ Status AccessOperator::ProbeLocalCopy(const ConstBufferView& input, const Mutabl
   Impl::StreamState* state;
   auto status = impl_->State(stream, &state);
   if (!status.ok()) return status;
+  // Test-only, read-only diagnosis: distinguish absent device permissions
+  // from an access fault despite driver-reported RW permission. A query
+  // unsupported by a deployed driver is logged, not a new transfer prerequisite.
+  aclrtMemLocation location{};
+  location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
+  location.id = impl_->options.device_id;
+  std::uint64_t access = 0;
+  const auto ret = aclrtMemGetAccess(reinterpret_cast<void*>(impl_->mapping->address()), &location, &access);
+  if (ret == ACL_SUCCESS) {
+    std::fprintf(stderr, "[KVAF_UBMEM] MAPPING_ACCESS device=%u flags=0x%llx expected_rw=0x%x\n",
+        impl_->options.device_id, static_cast<unsigned long long>(access), ACL_RT_MEM_ACCESS_FLAGS_READWRITE);
+  } else {
+    (void)Acl("aclrtMemGetAccess(diagnostic)", ret);
+  }
   auto a = impl_->Args(Operation::kPut, const_cast<void*>(input.data), input.bytes, *state);
-  a.remote_base = 0;  // Probe destinations are offsets into local HBM.
+  // Keep the CPU base and absolute destinations: the control must exercise
+  // the same 64-bit address subtraction as the mapped-DDR Put.
   a.remote_bytes = output.bytes;
   a.mapped_base = AddressOf(output.data);
   a.capacity = metadata.bytes / (3 * sizeof(std::uint64_t));

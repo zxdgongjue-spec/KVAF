@@ -43,6 +43,7 @@ source /actual/path/to/cann/set_env.sh
 ## 测试程序实际验证什么
 
 每轮先执行本地 HBM 拷贝对照，复用同一 Put kernel、源数据、偏移、长度和核数，
+目的元数据保留绝对 CPU 地址和实际 `remote_base`，覆盖与真实 Put 相同的 64 位地址换算，
 仅把目的区换成本地 HBM，并逐字节校验。通过后打印 `LOCAL_COPY_VERIFIED`，
 随后打印 `MAPPED_PUT_BEGIN` 并开始真实 UBmem 测试。对照失败会停止测试。
 
@@ -152,6 +153,8 @@ HAL 映射和 UB 通路，需运行 CPU 改写后 NPU Get、NPU Put 后 CPU chec
   当前设备，转换编号并检查 server；同 server 且共享内存拥有者不是 Host 时才启用设备 P2P。
   `src/runtime/driver/npu_driver_mem.cc::MapMem` 最终直接调用 `halMemMap`，
   此路径没有额外的地址范围注册。上述核对基于 Runtime commit `b44e41e4476a3eaff0be1287f786ebb076311d0c`。
+  对照公开 `v9.1.0`（`0b4af8a`）的 `core/src/api_impl/api_impl.cc` 后，Host 导入的 P2P 分支
+  和直接调用 HAL map 的结论相同；诊断所用 `aclrtMemGetAccess` 也已在该版本声明。
 - Fabric 导出及共享属性：SHMEM `src/host/mem/heap/hybm_vmm_based_segment.cpp::ExportInner`。
 
 NPU 数据面按 SHMEM `mte_perftest --memory-type dram` 的 MTE/UB 路径实现，
@@ -179,12 +182,17 @@ CPU 服务的独立 HAL 分配/导出仍由本测试验证。
 `MAPPED_PUT_BEGIN` 后，重点排查映射目的地址及其可达性。
 `DEVICE_MAPPING_READY` 和 `FAILED_LAUNCH` 输出设备编号、映射与输入范围，可与故障地址对照。
 当前 ACL 实现会输出 `mapping=acl`。
+本地对照会通过只读 `aclrtMemGetAccess` 输出 `MAPPING_ACCESS`：`flags=0x3` 表示驱动报告
+当前设备具备读写权限，并不表示 AI Core 的实际访问已成功。查询失败时打印接口错误，
+继续执行对照，不改变访问权限或映射。
 
 2026-10-29 的硬件结果：本地 HBM 对照通过，混合 ACL reserve / HAL import-map 路径在
 映射 DDR 写入时报 MTE 错误 95（DDR address out of range）；之前 SIMT 对同一类目的区报 334。
-现已统一为 SHMEM 的 ACL 导入/映射生命周期，仍待硬件复测。源码核对不能证明这次 95
-由 API 混用导致；特别是 Host 拥有的同 server 内存不会走上述设备 P2P 分支。
-若 ACL 路径仍报 95，需要结合目标机 CANN/驱动版本及 SVM 映射日志核实实际映射，而不是增加缓存刷新。
+完整 ACL 路径的复测仍在相同 PC 报 95；API 路径对齐没有解决故障。
+先前本地对照以零基址加偏移，现改为使用实际 CPU 基址和绝对地址，排除高位地址换算差异。
+需结合该对照结果、目标机 CANN/驱动版本及 SVM 映射日志继续定位设备访问失败的原因。
+此次失败设备为 Ascend950DT，驱动 `25.6.rc1.b175`、HAL `7.35.23`，已提供的 compiler
+版本为 CANN `9.1.0`；`dmesg` 的 SVM/页故障筛选未返回记录。
 
 同步 BatchPut 输出每核 `PUT_CORE`，包含设备报告的 `completed` 和 host 计算的 `expected`。
 默认 17 行、2 核应分别完成 9 行和 8 行；计数不符会在 MetaManager 提交前报错。

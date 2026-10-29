@@ -72,12 +72,13 @@ void FullBlocks(kvaf::RuntimeCore& core, kvaf::ubmem::AccessOperator& op,
   for (std::uint32_t i = 0; i < c.rows; ++i) {
     probe_metadata[i] = offsets[i];
     probe_metadata[c.rows + i] = lengths[i];
-    probe_metadata[2 * c.rows + i] = keys[i] * slot;
+    probe_metadata[2 * c.rows + i] = base + keys[i] * slot;
   }
   std::vector<std::uint8_t> local_copy(c.rows * slot, 0xD3);
   auto* local_device = pool.Copy(local_copy);
   auto* probe_device = pool.Copy(probe_metadata);
-  std::fprintf(stderr, "[KVAF_UBMEM] LOCAL_COPY_BEGIN rows=%u bytes=%zu\n", c.rows, local_copy.size());
+  std::fprintf(stderr, "[KVAF_UBMEM] LOCAL_COPY_BEGIN rows=%u bytes=%zu remote_base=0x%llx\n",
+      c.rows, local_copy.size(), static_cast<unsigned long long>(base));
   Check(op.ProbeLocalCopy({source, input.size(), kvaf::DeviceKind::kNpu},
       {local_device, local_copy.size(), kvaf::DeviceKind::kNpu},
       {probe_device, probe_metadata.size() * sizeof(std::uint64_t), kvaf::DeviceKind::kNpu}, pool.stream));
