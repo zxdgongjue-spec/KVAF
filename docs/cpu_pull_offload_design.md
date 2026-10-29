@@ -107,3 +107,8 @@ Python binding 持有 pending 源 Tensor 的强引用；C++ 调用者负责保�
 真实硬件使用 `tests/python/test_cpu_offload.py`：先检查 64 字节启动探测，再验证三轮
 不同数据、非连续源偏移和超过 64 KiB 的 payload。构建与运行见
 [cpu_pull_offload_usage.md](cpu_pull_offload_usage.md)。
+
+2026-10-29 用户确认，device=7、CPU candidate=0、NPU EID 为
+`000000000000020000100000df00e100` 时，当前分支及原 `codex/cpu-pull-hbm` 分支
+均在测试机器上成功。此前首次 READ 失败与固定选择另一个 NPU 路由 EID 有关；
+参考分支的自动候选回退是复现成功配置时必须考虑的差异。详细配置见使用文档。

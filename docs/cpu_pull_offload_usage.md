@@ -50,17 +50,26 @@ CANN 默认位置为 `/usr/local/Ascend/ascend-toolkit/latest`；也可通过
 
 ## 硬件验收
 
-沿用此前测试参数的命令如下；device/EID/candidate 的有效配对仍应以同机参考分支
-成功运行时的配置为准：
+2026-10-29，用户在测试机器上确认：使用以下配置，当前
+`codex/cpu-pull-hbm-reference` 和此前的 `codex/cpu-pull-hbm` 分支均测试成功。
+其他机器的 device/EID/candidate 仍需按实际拓扑选择。
 
 ```bash
 python tests/python/test_cpu_offload.py \
   --cpu 127.0.0.1:28999 \
-  --npu-eid 00000000003f030000100000df00eb00 \
+  --npu-eid 000000000000020000100000df00e100 \
   --device 7 --cpu-candidate 0
 ```
 
 CPU 服务不在本机时，将 `127.0.0.1` 改为 CPU 服务地址。
+
+此次 CPU candidate 0 对应 `udmac0d1e2`、eid_index=0，CPU EID 为
+`00000000003f020000100000df080b00`。
+之前固定使用的 NPU CLOS EID `00000000003f030000100000df00eb00` 能完成 Jetty
+导入，但首次 READ 返回 `URMA_CR_LOC_ACCESS_ERR`。参考分支按发现顺序尝试 NPU EID：
+第一组 session 释放后，第二个 `asdrv_pair_info_device_eid` 候选通过初始化。
+Offload 固定指定该第二个 EID 后，两条分支均成功，因此本次恢复成功不依赖于新分支的
+传输改写。EID 选择结论仅针对这台机器；CQ 状态本身不能解释底层硬件为何拒绝第一条路径。
 
 检查输出：
 
