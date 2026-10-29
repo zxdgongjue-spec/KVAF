@@ -7,7 +7,9 @@ enum class Operation : std::uint32_t { kGet = 0, kPut = 1 };
 // The host and kernel are built together.
 struct alignas(64) CoreStatus {
   std::uint64_t result, failed_request, completed;
-  std::uint64_t reserved[5];
+  // Echo launch fields so an empty report is distinguishable from zero work.
+  std::uint64_t capacity, blocks, operation;
+  std::uint64_t reserved[2];
 };
 struct BatchArgs {
   std::uint64_t remote_base, remote_bytes, mapped_base;

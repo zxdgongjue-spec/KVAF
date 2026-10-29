@@ -36,6 +36,7 @@ struct AccessOperator::Impl {
     enum class Pending { kNone, kEvent, kStream };
     aclrtEvent event{};
     void* statuses{};
+    void* host_statuses{};
     void* metadata{};
     std::size_t capacity{};
     Pending pending{Pending::kNone};
@@ -63,7 +64,7 @@ struct AccessOperator::Impl {
     auto status = Acl("aclrtBinaryLoad", aclrtBinaryLoad(input, &binary));
     aclrtDestroyBinary(input);
     if (status.ok()) status = Acl("aclrtBinaryGetFunction",
-        aclrtBinaryGetFunction(binary, "KvafUbmemBatchKernel", &function));
+        aclrtBinaryGetFunction(binary, "KvafUbmemBatchKernelV2", &function));
     return status;
   }
 
@@ -76,7 +77,10 @@ struct AccessOperator::Impl {
       auto status = Acl("aclrtCreateEvent", aclrtCreateEvent(&state.event));
       if (status.ok()) status = Acl("aclrtMalloc(status)", aclrtMalloc(
           &state.statuses, options.cores * sizeof(CoreStatus), ACL_MEM_MALLOC_NORMAL_ONLY));
+      if (status.ok()) status = Acl("aclrtMallocHost(status)", aclrtMallocHost(
+          &state.host_statuses, options.cores * sizeof(CoreStatus)));
       if (!status.ok()) {
+        if (state.statuses) aclrtFree(state.statuses);
         if (state.event) aclrtDestroyEvent(state.event);
         streams.erase(it);
         return status;
@@ -100,6 +104,14 @@ struct AccessOperator::Impl {
   }
 
   Status Launch(BatchArgs& args, aclrtStream stream, StreamState& state, bool synchronize) {
+    const auto size = options.cores * sizeof(CoreStatus);
+    if (synchronize) {
+      // Same ordering as KvafExecuteBatchPutSync. An unwritten report must
+      // not look like a successful zero-row kernel.
+      auto status = Acl("aclrtMemsetAsync(status)", aclrtMemsetAsync(state.statuses, size, 0xFF, size, stream));
+      if (!status.ok()) return status;
+      state.pending = StreamState::Pending::kStream;
+    }
     aclrtLaunchKernelAttr attrs[3]{};
     attrs[0].id = ACL_RT_LAUNCH_KERNEL_ATTR_SCHEM_MODE;
     attrs[0].value.schemMode = 1;
@@ -112,40 +124,57 @@ struct AccessOperator::Impl {
         function, options.cores, stream, &cfg, &args, sizeof(args), nullptr, 0));
     if (!status.ok()) return status;
     state.pending = StreamState::Pending::kStream;
-    status = Acl("aclrtRecordEvent", aclrtRecordEvent(state.event, stream));
-    if (!status.ok()) {
-      ready = false;
-      // The kernel was submitted but has no completion event. Drain now;
-      // if that fails, Shutdown must retry before unmapping remote memory.
-      if (aclrtSynchronizeStream(stream) == ACL_SUCCESS) state.pending = StreamState::Pending::kNone;
-      return status;
+    if (!synchronize) {
+      status = Acl("aclrtRecordEvent", aclrtRecordEvent(state.event, stream));
+      if (!status.ok()) {
+        ready = false;
+        // No event: drain now or leave Shutdown responsible for retrying.
+        if (aclrtSynchronizeStream(stream) == ACL_SUCCESS) state.pending = StreamState::Pending::kNone;
+        return status;
+      }
+      state.pending = StreamState::Pending::kEvent;
+      return Status::OK();
     }
-    state.pending = StreamState::Pending::kEvent;
-    if (!synchronize) return Status::OK();
-    status = Acl("aclrtSynchronizeEvent", aclrtSynchronizeEvent(state.event));
+    // Keep the kernel, status D2H and completion wait on the caller's stream,
+    // exactly as the existing synchronous BatchPut path does.
+    status = Acl("aclrtMemcpyAsync(status)", aclrtMemcpyAsync(state.host_statuses, size,
+        state.statuses, size, ACL_MEMCPY_DEVICE_TO_HOST, stream));
+    if (status.ok()) status = Acl("aclrtSynchronizeStream", aclrtSynchronizeStream(stream));
     if (!status.ok()) { ready = false; return status; }
     state.pending = StreamState::Pending::kNone;
-    std::vector<CoreStatus> reports(options.cores);
-    const auto size = reports.size() * sizeof(CoreStatus);
-    status = Acl("aclrtMemcpy(status)", aclrtMemcpy(reports.data(), size, state.statuses, size,
-                                                   ACL_MEMCPY_DEVICE_TO_HOST));
-    if (!status.ok()) return status;
-    for (std::size_t i = 0; i < reports.size(); ++i) {
+    const auto* reports = static_cast<const CoreStatus*>(state.host_statuses);
+    // Print every Put core before validating, including cores after a failure.
+    for (std::size_t i = 0; i < options.cores; ++i) {
       if (args.operation == Operation::kPut) {
         const std::uint64_t expected = args.capacity / args.blocks + (i < args.capacity % args.blocks);
-        std::fprintf(stderr, "[KVAF_UBMEM] PUT_CORE core=%zu result=%llu completed=%llu expected=%llu\n", i,
+        std::fprintf(stderr, "[KVAF_UBMEM] PUT_CORE core=%zu result=%llu completed=%llu expected=%llu "
+            "failed_request=%llu seen_capacity=%llu seen_blocks=%llu seen_op=%llu\n", i,
             static_cast<unsigned long long>(reports[i].result),
             static_cast<unsigned long long>(reports[i].completed),
-            static_cast<unsigned long long>(expected));
-        if (reports[i].result == 0 && reports[i].completed != expected) {
-          return Status::Internal("UBmem Put completion report does not cover the submitted rows");
-        }
+            static_cast<unsigned long long>(expected),
+            static_cast<unsigned long long>(reports[i].failed_request),
+            static_cast<unsigned long long>(reports[i].capacity),
+            static_cast<unsigned long long>(reports[i].blocks),
+            static_cast<unsigned long long>(reports[i].operation));
+      }
+    }
+    for (std::size_t i = 0; i < options.cores; ++i) {
+      if (reports[i].result == UINT64_MAX) {
+        return Status::Internal("UBmem kernel status was not written (still 0xFF)");
+      }
+      if (reports[i].capacity != args.capacity || reports[i].blocks != args.blocks ||
+          reports[i].operation != static_cast<std::uint32_t>(args.operation)) {
+        return Status::Internal("UBmem kernel launch fields differ from the host request");
       }
       if (reports[i].result != 0) {
         std::fprintf(stderr, "[KVAF_UBMEM] KERNEL_ERROR core=%zu code=%llu request=%llu\n", i,
             static_cast<unsigned long long>(reports[i].result),
             static_cast<unsigned long long>(reports[i].failed_request));
         return Status::InvalidArgument("UBmem kernel rejected a request; see KERNEL_ERROR");
+      }
+      if (args.operation == Operation::kPut &&
+          reports[i].completed != args.capacity / args.blocks + (i < args.capacity % args.blocks)) {
+        return Status::Internal("UBmem Put completion report does not cover the submitted rows");
       }
     }
     return Status::OK();
@@ -203,6 +232,7 @@ Status AccessOperator::Shutdown() {
     auto& s = entry.second;
     if (s.metadata) aclrtFree(s.metadata);
     if (s.statuses) aclrtFree(s.statuses);
+    if (s.host_statuses) aclrtFreeHost(s.host_statuses);
     if (s.event) aclrtDestroyEvent(s.event);
   }
   impl_->streams.clear();

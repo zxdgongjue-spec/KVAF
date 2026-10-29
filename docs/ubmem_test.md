@@ -103,8 +103,9 @@ MetaManager 负责按请求顺序分配 Put 目的范围；UBmem adapter 只增�
 每个 core 遇到无效 Get 行时停止自己的循环并报告行号；此前完成的行和其他 core 的工作
 不会回滚。异步 Get 只返回入队结果；需要读取内核错误报告时使用 `synchronize=true`。
 
-元数据和状态沿用现有 `execute_batch_get_aiv.asc` 的 kernel 边界用法：调用方 stream
-先生产元数据，kernel 执行后写状态，host 等待完成事件再读取。UBmem 不额外添加入口或
+同步执行沿用现有 `KvafExecuteBatchPutSync` 的顺序：在调用方 stream 上初始化设备状态、
+启动 kernel、将状态 D2H 到固定页 host buffer，最后同步 stream。异步 Get 仍用完成事件
+跟踪映射生命周期。UBmem 不额外添加入口或
 出口 DCCI。每次 VF 调用前使用 `S→V` set/wait，调用后使用 `V→S` set/wait，再处理下一行。
 这沿用 KVAF `RunBatchGetValidation` 和 SHMEM `simt_rma_perftest` 的 `VSSync<Simt>`，
 交接标量准备参数、向量消费参数及标量复用调用状态的顺序；它不是远端完成通知。
@@ -140,6 +141,9 @@ HAL 映射和 UB 通路，需运行 CPU 改写后 NPU Get、NPU Put 后 CPU chec
 
 同步 BatchPut 输出每核 `PUT_CORE`，包含设备报告的 `completed` 和 host 计算的 `expected`。
 默认 17 行、2 核应分别完成 9 行和 8 行；计数不符会在 MetaManager 提交前报错。
+状态在每次同步启动前填为 `0xFF`，用于识别本次 kernel 是否写入报告；`seen_capacity`、
+`seen_blocks`、`seen_op` 是内核实际收到的启动字段，默认 Put 应为 `17`、`2`、`1`。
+host 和 kernel 使用 `KvafUbmemBatchKernelV2` 符号，旧 kernel 文件会在加载时被拒绝。
 `CPU_MISMATCH` 同时输出 `expected` / `actual` 字节。默认倒序 Put 首先检查 slot 16，
 起点为 `16 × 656 × 128 = 1343488`；该处失败并不表示前面的 slot 已经通过校验。
 

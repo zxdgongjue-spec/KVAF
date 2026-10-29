@@ -14,7 +14,14 @@
 using namespace kvaf::ubmem;
 template <typename T> std::uint64_t Ptr(T* value) { return reinterpret_cast<std::uintptr_t>(value); }
 void Run(BatchArgs args) {
-  for (model_core = 0; model_core < args.blocks; ++model_core) KvafUbmemBatchKernel(args);
+  auto* reports = reinterpret_cast<CoreStatus*>(args.statuses);
+  std::fill_n(reinterpret_cast<unsigned char*>(reports), args.blocks * sizeof(CoreStatus), 0xFF);
+  for (model_core = 0; model_core < args.blocks; ++model_core) {
+    KvafUbmemBatchKernelV2(args);
+    CHECK(reports[model_core].capacity == args.capacity);
+    CHECK(reports[model_core].blocks == args.blocks);
+    CHECK(reports[model_core].operation == static_cast<std::uint32_t>(args.operation));
+  }
 }
 int main() {
   constexpr std::uint64_t remote_base = 0x100000000ULL;
