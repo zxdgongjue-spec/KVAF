@@ -78,10 +78,15 @@ target_include_directories(kvaf_sequential_batch_get_kernel_model_test PRIVATE
   ${PROJECT_SOURCE_DIR}/common/include)
 target_link_libraries(kvaf_sequential_batch_get_kernel_model_test PRIVATE pthread)
 add_test(NAME kvaf_sequential_batch_get_kernel_model_test COMMAND kvaf_sequential_batch_get_kernel_model_test)
-add_test(NAME kvaf_aiv_sequential_hardware_python
-  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_aiv_sequential_batch_get.py")
-set_tests_properties(kvaf_aiv_sequential_hardware_python PROPERTIES
-  SKIP_RETURN_CODE 77 TIMEOUT 600 ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}/python")
+foreach(mode scatter gather)
+  add_test(NAME kvaf_aiv_${mode}_hardware_python
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_aiv_${mode}_batch_get.py")
+  set_tests_properties(kvaf_aiv_${mode}_hardware_python PROPERTIES
+    SKIP_RETURN_CODE 77 TIMEOUT 600 RESOURCE_LOCK kvaf_aiv_stage1_device
+    ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}/python")
+endforeach()
+add_test(NAME kvaf_aiv_mode_isolation_python
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_aiv_mode_isolation.py")
 add_test(NAME kvaf_scatter_probe_result_python
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_scatter_probe_result.py")
 
@@ -93,17 +98,20 @@ if(NOT KVAF_ENABLE_AIV_BATCH_GET)
             "${CMAKE_COMMAND}")
   add_executable(kvaf_sequential_loader_test sequential_batch_get_loader_test.cc
     ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/execute_batch_get_loader.cpp
-    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/execute_sequential_batch_get_loader.cpp)
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/execute_scatter_batch_get_loader.cpp
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/execute_gather_batch_get_loader.cpp)
   target_include_directories(kvaf_sequential_loader_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/fake_acl
     ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include
     ${PROJECT_SOURCE_DIR}/access_operator/include
     ${PROJECT_SOURCE_DIR}/common/include)
-  foreach(scenario compat explicit custom relative missing)
+  foreach(scenario compat legacy explicit custom relative missing wrong_symbol)
     add_test(NAME kvaf_sequential_loader_${scenario} COMMAND kvaf_sequential_loader_test ${scenario})
   endforeach()
   add_executable(kvaf_sequential_host_test sequential_batch_get_host_test.cc
-    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/sequential_batch_get.cpp)
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/sequential_batch_get.cpp
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/scatter_batch_get.cpp
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/gather_batch_get.cpp)
   target_include_directories(kvaf_sequential_host_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/fake_acl
     ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include
@@ -113,7 +121,10 @@ if(NOT KVAF_ENABLE_AIV_BATCH_GET)
   add_test(NAME kvaf_sequential_host_test COMMAND kvaf_sequential_host_test)
   add_library(kvaf_sequential_host_compile_check OBJECT
     ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/sequential_batch_get.cpp
-    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/execute_sequential_batch_get_loader.cpp
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/scatter_batch_get.cpp
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/gather_batch_get.cpp
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/execute_scatter_batch_get_loader.cpp
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/execute_gather_batch_get_loader.cpp
     ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/batch_get_host.cpp
     ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_put/host/batch_put_host.cpp
     ${PROJECT_SOURCE_DIR}/access_operator/src/access_operator.cc

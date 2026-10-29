@@ -33,30 +33,56 @@ Gather 的控制与数据队列分开，每核固定两条 Jetty。可配置 1�
 阶段内部批量提交，只在物理 SQ/WR 容量不足或阶段结束时 drain；
 `batch_get_max_inflight_total` 仅对原 `direct_read` 生效。
 
-## 代码入口
+## 代码入口与模式隔离
 
-- `access_operator/demo/aiv_batch_get/kernel/execute_sequential_batch_get_aiv.asc`：
-  两种模式、行校验、notify/ACK、CQ、精确字节搬运及状态回写。
-- `access_operator/demo/aiv_batch_get/host/sequential_batch_get.cpp`：
-  workspace、注册内存、CPU 会话、序号和异步状态回收。
-- `access_operator/demo/aiv_batch_get/include/sequential_batch_get_abi.h`：
-  独立的 V1 参数与状态 ABI；kernel symbol 为 `KvafSequentialBatchGetAivKernelV1`。
-- `runtime/src/cpu_push_get_*`、`runtime/src/cpu_gather_executor.cc`：
-  复用 `aicpu-urma` 的 CPU 数据面，未引入 AICPU kernel 或设备端 liburma。
-- `runtime/src/peer_link.cc`、`runtime/src/cpu_runtime.cc`：
-  增加 enable/open/start/stop；新增 `StopGatherLanes` 在释放 DDR 前 join worker。
-- `runtime/src/npu_runtime.cc`、`bindings/src/npu_python_runtime.cc`：配置入口及
-  gather 的 DDR 预留区，预留区不参与 KV slot 分配。
+Python 继续使用统一的 `kvaf.NpuRuntime(..., aiv_batch_get_mode=...)` 和
+`batch_get()`；每个 Runtime 在初始化时选择一个 backend。CPU 服务与 wire
+协议保持不变，仍分别使用 `cpu_push::Worker` 和 `CpuGatherWorker`。
 
-两端需一起重编译。初始化通过新增控制命令的响应确认能力；不支持的 CPU
-服务会初始化失败。Host 和 AIV object 也必须来自同一版本。
+| 层次 | Scatter | Gather |
+| --- | --- | --- |
+| Host owner | `host/scatter_batch_get.cpp` | `host/gather_batch_get.cpp` |
+| Loader | `host/execute_scatter_batch_get_loader.cpp` | `host/execute_gather_batch_get_loader.cpp` |
+| 参数 ABI | `include/scatter_batch_get_abi.h`，176 B | `include/gather_batch_get_abi.h`，216 B |
+| AIV 源码 | `kernel/execute_scatter_batch_get_aiv.asc` | `kernel/execute_gather_batch_get_aiv.asc` |
+| Kernel symbol | `KvafScatterBatchGetAivKernelV1` | `KvafGatherBatchGetAivKernelV1` |
+| 二进制 | `kvaf_scatter_batch_get_kernels.o` | `kvaf_gather_batch_get_kernels.o` |
+| 独立测试 | `tests/python/test_aiv_scatter_batch_get.py` | `tests/python/test_aiv_gather_batch_get.py` |
 
-构建产出两个独立二进制：`kvaf_execute_batch_get_kernels.o`（direct_read）和
-`kvaf_sequential_batch_get_kernels.o`（scatter/gather），均复制到 `build-npu/bin/`。
-AscendC 会在每个编译单元中生成 `g_tilingKey` 等全局符号，因此不合并两个
-临时 object。顺序模式收到标准 `kvaf_execute_batch_get_kernels.o` 路径时，
-自动加载同目录下的 `kvaf_sequential_batch_get_kernels.o`；也可直接传入顺序
-二进制路径。部署时需要一起复制两个文件。
+表中 Host/include/kernel 路径均相对于 `access_operator/demo/aiv_batch_get/`。
+`host/sequential_batch_get.cpp` 只按模式创建 backend，公共 interface 只约定
+Initialize/Execute/Drain/Shutdown。两种 owner 分别管理自己的 workspace、
+序号、资源回收和错误状态；两个 loader 分别保存自己的 binary/function handle。
+Host 代码仍链接到原有 `libkvaf_execute_batch_get_host.so`，上层链接配置不变。
+
+只复用稳定的基础部分：`sequential_batch_get_common.h` 的输入检查，
+`batch_get_kernel_common.h` 的地址/行校验与缓存工具，及通用请求/状态结构。
+两套 launch 参数均不含 mode 分支；gather 参数不含 scatter probe，scatter
+参数不含 gather 的 lane/远端 staging/SGL 配置。gather 忽略 scatter 探针环境变量，
+scatter 不校验 gather 专用 SGL 参数。
+
+本次仅做结构拆分，保留各自入口的 `InitSocState()` 和退出屏障，未继续修复
+scatter 507015，也没有加入流水或软件在途控制。共享基础头文件的修改仍需两种
+模式回归；修改某一种模式的独立 `.asc` 不会导致另一种 kernel 重编译。
+
+原 `direct_read` 仍使用 `kvaf_execute_batch_get_kernels.o`。三个模块各自编译和
+链接，均安装到 `build-npu/bin/`，不合并包含 SDK 全局符号的临时 object。
+默认构建包含三个模块，也可只构建单个 kernel：
+
+```bash
+cmake --build build-npu --target kvaf_gather_batch_get_kernel -j
+cmake --build build-npu --target kvaf_scatter_batch_get_kernel -j
+```
+
+传入标准 `kvaf_execute_batch_get_kernels.o` 或旧
+`kvaf_sequential_batch_get_kernels.o` 路径时，Host 按模式选择同目录的新模块，
+不加载旧的合并二进制；这两个路径在顺序模式下只是选择器，文件本身无需存在。
+也可直接传入对应模式的新 `.o` 或包含对应新 symbol 的自定义文件。缺失目标
+模块或 symbol 会报错，不回退到另一模式。旧合并模块不再构建。
+
+升级时必须同时更新 NPU Host 库和对应的新 kernel，避免混用参数 ABI。
+已经部署第一阶段协议的 CPU 服务不需要因这次拆分更新。首次部署第一阶段时，
+两端仍须具备对应的 enable/open/start/stop 控制命令。
 
 ## 使用约束
 
@@ -112,19 +138,27 @@ export KVAF_CPU_SERVICE_ADDR=CPU_IP:28999
 export KVAF_BATCH_GET_KERNEL="$PWD/build-npu/bin/kvaf_execute_batch_get_kernels.o"
 export KVAF_BATCH_PUT_KERNEL="$PWD/build-npu/bin/kvaf_execute_batch_put_kernels.o"
 ls -l "$KVAF_BATCH_GET_KERNEL" "$KVAF_BATCH_PUT_KERNEL" \
-  "$PWD/build-npu/bin/kvaf_sequential_batch_get_kernels.o"
-KVAF_NPU_CORE_COUNT=1 python tests/python/test_aiv_sequential_batch_get.py
-KVAF_NPU_CORE_COUNT=3 python tests/python/test_aiv_sequential_batch_get.py
-KVAF_NPU_CORE_COUNT=8 python tests/python/test_aiv_sequential_batch_get.py
+  "$PWD/build-npu/bin/kvaf_scatter_batch_get_kernels.o" \
+  "$PWD/build-npu/bin/kvaf_gather_batch_get_kernels.o"
+# 两个入口固定测试自己的模式，不受 KVAF_AIV_BATCH_GET_MODES 影响。
+DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 python tests/python/test_aiv_gather_batch_get.py
+DEVICE_ID=7 KVAF_NPU_CORE_COUNT=3 python tests/python/test_aiv_gather_batch_get.py
+DEVICE_ID=7 KVAF_NPU_CORE_COUNT=8 python tests/python/test_aiv_gather_batch_get.py
+DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 python tests/python/test_aiv_scatter_batch_get.py
 ```
 
-脚本默认分别测试两种模式，使用 8193 请求容量，覆盖空批次、尾批、重复调用、
+两个入口复用 `aiv_batch_get_test_common.py` 中的数据准备和校验，使用 8193
+请求容量，覆盖空批次、尾批、重复调用、
 随机输出、重复源、guard、A/B/A 输出、两种 Tensor 重载以及跨 stream 顺序复用。
 可用 `KVAF_NPU_TOKEN_BYTES=13`、`KVAF_NPU_REQUESTS=65536`、
 `KVAF_AIV_GATHER_SGL_SIZE=1` 增加边界组合。
 CPU `--gather-threads` 至少等于 gather 的 AIV 核数。
-上述命令在仓库根目录执行。Get、Put 及同目录下的 sequential 三个 `.o` 文件
-都应存在；路径检查失败时脚本会打印具体变量及绝对路径，并在初始化 NPU 前退出。
+上述命令在仓库根目录执行。单模式测试只检查对应 Get 二进制和 BatchPut，
+不要求另一模式的二进制存在；路径检查失败会在初始化 NPU 前报具体路径。
+兼容入口 `test_aiv_sequential_batch_get.py` 仍支持 `KVAF_AIV_BATCH_GET_MODES`，
+但现在为每种模式启动独立 Python 子进程，即使第一种失败也执行后一种，最后
+汇总非零退出码。这隔离了 Python/ACL 进程状态，不承诺设备故障后自动恢复硬件。
+CTest 也分别注册两个硬件用例。
 
 ## 初始化失败的定位
 
@@ -144,7 +178,7 @@ NPU 端可单独运行 scatter 并开启阶段日志：
 ```bash
 DEVICE_ID=5 KVAF_NPU_CORE_COUNT=1 KVAF_AIV_BATCH_GET_MODES=cpu_push_scatter \
   KVAF_AIV_VERBOSE_DIRECT_HCCP=1 \
-  python -u tests/python/test_aiv_sequential_batch_get.py > npu-stage1.log 2>&1
+  python -u tests/python/test_aiv_scatter_batch_get.py > npu-stage1.log 2>&1
 ```
 
 观察 `STARTUP_CANDIDATE_BEGIN`、`STARTUP_PROBE_BEGIN/READY`、
@@ -181,8 +215,8 @@ payload 和 done 的 CQ 回收，回到下一轮 notify READ；不要把这个�
 
 ## Scatter 507015 的分段定位
 
-用户已反馈 `gather_read` 在 1、3、8 核通过。Gather 和 scatter 使用同一个
-`KvafSequentialBatchGetAivKernelV1`，但走不同分支；gather 不经过 scatter 的
+拆分前，用户已反馈 `gather_read` 在 1、3、8 核通过。当时 Gather 和 scatter
+共用 `KvafSequentialBatchGetAivKernelV1`，通过 mode 走不同分支；gather 不经过 scatter 的
 HBM done 轮询和本地 `CopyPayload`，所以这些部分仍需单独定位。
 
 新增 scatter Host 模型还发现：packed 的 open 请求中，`npu_tp` 字段的地址
@@ -219,7 +253,7 @@ set -o pipefail
 for stage in done flush load copy; do
   KVAF_RUN_NPU_TESTS=1 DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 KVAF_NPU_TOKEN_BYTES=656 \
     KVAF_AIV_BATCH_GET_MODES=cpu_push_scatter KVAF_AIV_SCATTER_PROBE="$stage" \
-    python -u tests/python/test_aiv_sequential_batch_get.py 2>&1 | tee "scatter-${stage}.log"
+    python -u tests/python/test_aiv_scatter_batch_get.py 2>&1 | tee "scatter-${stage}.log"
   rc=$?
   if [ "$rc" -ne 0 ]; then
     break
@@ -229,7 +263,8 @@ done
 
 完成检查点会打印 `[KVAF_AIV_SCATTER_PROBE_COMPLETE] stage=...`，验证 output
 和正常 shutdown 后打印 `PROBE_COMPLETE: ...`，不打印普通回归的 `PASS`。
-实现使用原 ABI 的 reserved word，参数总长仍是 232 B。Host 必须核对每核的
+探针最初使用旧 232 B ABI 的 reserved word；拆分后使用 scatter 独立的
+176 B ABI 中的 `scatter_probe` 字段。Host 必须核对每核的
 magic、sequence、专用 result 和 phase，旧 kernel 忽略该字段时会明确失败。
 探针要求 `synchronize=True`，不允许异步普通成功；普通调用者会收到明确的
 诊断异常，只有诊断脚本识别这个完成标记。空批次不能证明检查点已执行，因而
@@ -255,7 +290,7 @@ abort 的 context 强行读取状态；保留本轮 `PROBE_BEGIN`、CPU 日志�
 ```bash
 KVAF_AIV_SCATTER_PROBE= DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 \
   KVAF_AIV_BATCH_GET_MODES=cpu_push_scatter \
-  python -u tests/python/test_aiv_sequential_batch_get.py
+  python -u tests/python/test_aiv_scatter_batch_get.py
 ```
 
 ### flush 完成、load 报错后的更新
@@ -357,6 +392,8 @@ manifest、宏和 `.ii`，按预处理后的有效定义提取初始化函数，
 本地无 CANN/NPU，已完成：
 
 - CMake 普通 C++ 构建和现有回归。
+- 拆分隔离回归：独立 loader 的路径/symbol/ABI 和交错调用、缺失另一模式二进制，
+  scatter 增量重编译不改变 gather/direct 产物、独立 Python 入口和组合子进程失败汇总。
 - 候选选择回归覆盖连接回退、本地设备错误停止重试、普通/自适应选择及清理错误
   不覆盖原始失败。
 - 生产 `.asc` 的 CPU 模型执行：解码 SQ/CQ，调用真实 CPU gather executor，
@@ -375,7 +412,8 @@ manifest、宏和 `.ii`，按预处理后的有效定义提取初始化函数，
 - CPU 新源码使用 UMDK 24.12 头文件通过语法检查；macOS 检查时仅补充 Linux
   的 `MADV_HUGEPAGE` 常量，未链接或执行 CPU 硬件服务。
 
-用户已在硬件反馈 gather 的 1/3/8 核回归通过；scatter 探针已反馈 flush 完成、
+用户此前已在硬件反馈 gather 的 1/3/8 核回归通过；拆分后的新 kernel 尚待上机
+复测。scatter 探针已反馈 flush 完成、
 load 失败，补初始化后仍有 507015，正在核对实际初始化源码。尚待验证 scatter
 的非对齐 MTE3 写出、CPU/NPU 缓存可见性、跨 Jetty
 done 保序及真实超时/断链回收。这些本地检查不替代 CANN 编译和双机验收。

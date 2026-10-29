@@ -1,24 +1,17 @@
 #pragma once
-
 #include <memory>
 #include "access_operator.h"
-#include "sequential_batch_get_abi.h"
-
-extern "C" int32_t KvafSequentialBatchGetLoadKernel(const char* path);
-extern "C" int32_t KvafSequentialBatchGetLaunch(
-    const KvafSequentialBatchGetArgs* args, void* stream);
 
 namespace kvaf {
+// Common lifecycle only; resources, launch arguments and algorithms live in
+// separate backends. A Runtime selects its backend once during initialization.
 class SequentialBatchGet {
  public:
-  explicit SequentialBatchGet(AccessOperatorConfig config);
-  ~SequentialBatchGet();
-  Status Initialize(const RemoteRegionDesc& region);
-  Status Execute(const BatchGetExecRequest& exec);
-  Status Drain();
-  Status Shutdown();
- private:
-  struct Impl;
-  std::unique_ptr<Impl> impl_;
+  virtual ~SequentialBatchGet() = default;
+  virtual Status Initialize(const RemoteRegionDesc& region) = 0;
+  virtual Status Execute(const BatchGetExecRequest& exec) = 0;
+  virtual Status Drain() = 0;
+  virtual Status Shutdown() = 0;
 };
+std::unique_ptr<SequentialBatchGet> CreateSequentialBatchGet(AccessOperatorConfig config);
 }  // namespace kvaf

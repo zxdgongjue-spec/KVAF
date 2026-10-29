@@ -1,7 +1,7 @@
 """A device fault or an old binary must not look like a completed probe."""
 import unittest
 
-from test_aiv_sequential_batch_get import expect_scatter_probe
+from aiv_batch_get_test_common import expect_scatter_probe
 
 
 class ScatterProbeResultTest(unittest.TestCase):

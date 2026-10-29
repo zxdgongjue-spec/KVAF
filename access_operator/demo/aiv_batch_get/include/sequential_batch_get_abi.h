@@ -2,7 +2,7 @@
 
 #include "batch_get_abi.h"
 
-// A separate eager ABI: the V2 direct-read/graph ABI remains unchanged.
+// Shared eager status contract. Each mode owns its launch argument ABI.
 enum {
   KVAF_SEQ_SCATTER = 1,
   KVAF_SEQ_GATHER = 2,
@@ -23,42 +23,7 @@ enum KvafSequentialPhase : uint64_t {
   KVAF_SEQ_AFTER_DONE = 7, KVAF_SEQ_AFTER_FLUSH = 8, KVAF_SEQ_AFTER_LOAD = 9,
   KVAF_SEQ_AFTER_COPY = 10,
 };
-enum KvafSequentialScatterProbe : uint32_t {
-  KVAF_SEQ_PROBE_NONE = 0, KVAF_SEQ_PROBE_DONE = 1,
-  KVAF_SEQ_PROBE_FLUSH = 2, KVAF_SEQ_PROBE_LOAD = 3, KVAF_SEQ_PROBE_COPY = 4,
-};
 struct alignas(64) KvafSequentialStatus {
   uint64_t magic, sequence, result, phase, requests, data_wrs, sq_pi, cq_ci;
 };
-struct KvafSequentialBatchGetArgs {
-  KvafExecuteBatchGetKernelArgs request;
-  uint64_t workspace;
-  uint64_t workspace_bytes;
-  uint64_t workspace_entity;
-  uint64_t descriptor_offset;
-  uint64_t staging_offset;
-  uint64_t lane_descriptor_bytes;
-  uint64_t lane_staging_bytes;
-  uint64_t remote_staging;
-  uint64_t remote_descriptor;
-  uint64_t remote_control;
-  uint64_t source_base;
-  uint64_t source_bytes;
-  uint64_t sequence;
-  uint32_t mode;
-  uint32_t sgl_size;
-  uint32_t max_polls;
-  uint32_t scatter_probe;  // Former reserved word; zero preserves normal execution.
-};
 static_assert(sizeof(KvafSequentialStatus) == 64);
-static_assert(sizeof(KvafSequentialBatchGetArgs) == 232);
-
-// Device-friendly subset of the shared CPU gather wire protocol.
-struct KvafSequentialGatherHeader {
-  uint64_t magic, sequence, staging_address;
-  uint32_t span_count, total_bytes, pipeline_chunk_bytes, span_bytes;
-  uint64_t ready_bytes;
-};
-struct KvafSequentialGatherSpan { uint64_t address; uint32_t length, reserved; };
-static_assert(sizeof(KvafSequentialGatherHeader) == 48);
-static_assert(sizeof(KvafSequentialGatherSpan) == 16);

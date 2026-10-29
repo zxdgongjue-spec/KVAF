@@ -2,7 +2,7 @@ import contextlib
 import io
 import unittest
 
-from test_aiv_sequential_batch_get import shutdown_runtime
+from aiv_batch_get_test_common import shutdown_runtime
 
 
 class Runtime:

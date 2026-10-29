@@ -19,9 +19,9 @@ import sys
 import tempfile
 
 
-SOURCE = "execute_sequential_batch_get_aiv.asc"
-TEMP_OBJECT = "kvaf_sequential_batch_get.tmp.o"
-OBJECT = "kvaf_sequential_batch_get_kernels.o"
+SOURCE = "execute_scatter_batch_get_aiv.asc"
+TEMP_OBJECT = "kvaf_scatter_batch_get.tmp.o"
+OBJECT = "kvaf_scatter_batch_get_kernels.o"
 
 
 def compile_recipe(build: Path):
@@ -160,11 +160,12 @@ def collect(build: Path, kernel: Path | None = None) -> tuple[Path, bool]:
         snapshot(path, output / "original" / label / path.name, files)
     if kernel is not None:
         kernel = kernel.expanduser().resolve()
-        if kernel.name == "kvaf_execute_batch_get_kernels.o":
+        if kernel.name in ("kvaf_execute_batch_get_kernels.o", "kvaf_sequential_batch_get_kernels.o"):
             kernel = kernel.with_name(OBJECT)
         snapshot(kernel, output / "original" / "configured" / kernel.name, files)
     snapshot(source, output / "source" / source.name, files)
-    for name in ("sequential_batch_get_abi.h", "batch_get_abi.h"):
+    snapshot(source.parent / "batch_get_kernel_common.h", output / "source" / "batch_get_kernel_common.h", files)
+    for name in ("scatter_batch_get_abi.h", "sequential_batch_get_abi.h", "batch_get_abi.h"):
         snapshot(source.parent.parent / "include" / name, output / "source" / name, files)
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 

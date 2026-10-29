@@ -364,7 +364,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
   }
 #endif
   if (sequential) {
-    impl_->sequential = std::make_unique<SequentialBatchGet>(impl_->config);
+    impl_->sequential = CreateSequentialBatchGet(impl_->config);
     const auto status = impl_->sequential->Initialize(remote_region);
     if (!status.ok()) return status;
     impl_->remote_region = remote_region;

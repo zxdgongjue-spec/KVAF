@@ -481,7 +481,7 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
     throw std::invalid_argument("aiv_batch_get_mode must be direct_read, gather_read or cpu_push_scatter");
   if (sequential && (o.npu_core_count > 8 || o.npu_eids.size() > 1 || o.adaptive_ub_device ||
       uint64_t(o.batch_get_token_bytes) * kGatherMaxRequests > UINT32_MAX ||
-      !o.aiv_gather_sgl_size || o.aiv_gather_sgl_size > 6))
+      (o.aiv_batch_get_mode == "gather_read" && (!o.aiv_gather_sgl_size || o.aiv_gather_sgl_size > 6))))
     throw std::invalid_argument("sequential BatchGet needs 1..8 cores, one EID, SGL 1..6 and uint32 payload; no startup tuning");
   if (impl_->config.batch_get_kernel_object_path.empty() || impl_->options.npu_core_count == 0U ||
       impl_->options.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||

@@ -97,10 +97,15 @@ add_subdirectory(kernel)
 ''')
         build = root / 'build'
         run([cmake, '-S', root, '-B', build])
-        command = [cmake, '--build', build, '--target', 'kvaf_execute_batch_get_kernel', '-j4']
+        run([cmake, '--build', build, '--target', 'kvaf_gather_batch_get_kernel', '-j4'])
+        assert (build / 'bin/kvaf_gather_batch_get_kernels.o').is_file()
+        assert not (build / 'bin/kvaf_scatter_batch_get_kernels.o').exists()
+        assert not (build / 'bin/kvaf_execute_batch_get_kernels.o').exists()
+        command = [cmake, '--build', build, '--target', 'kvaf_batch_get_kernels', '-j4']
         run(command)
         for stem, symbol in (('kvaf_execute_batch_get', 'execute_batch_get_aiv'),
-                             ('kvaf_sequential_batch_get', 'execute_sequential_batch_get_aiv')):
+                             ('kvaf_scatter_batch_get', 'execute_scatter_batch_get_aiv'),
+                             ('kvaf_gather_batch_get', 'execute_gather_batch_get_aiv')):
             product = build / 'kernel' / f'{stem}_kernels.o'
             installed = build / 'bin' / product.name
             assert product.read_bytes() == installed.read_bytes()
@@ -108,13 +113,20 @@ add_subdirectory(kernel)
         direct = build / 'kernel/kvaf_execute_batch_get_kernels.o'
         old_mtime = direct.stat().st_mtime_ns
         # A missing deployed companion must be restored by an incremental build.
-        companion = build / 'bin/kvaf_sequential_batch_get_kernels.o'
+        companion = build / 'bin/kvaf_scatter_batch_get_kernels.o'
         companion.unlink()
         run(command)
         assert companion.is_file()
         assert direct.stat().st_mtime_ns == old_mtime
-        originals = [companion, build / 'kernel/kvaf_sequential_batch_get_kernels.o',
-                     build / 'kernel/kvaf_sequential_batch_get.tmp.o']
+        gather = build / 'kernel/kvaf_gather_batch_get_kernels.o'
+        gather_before = (gather.read_bytes(), gather.stat().st_mtime_ns)
+        scatter_source = root / 'kernel/execute_scatter_batch_get_aiv.asc'
+        scatter_source.write_text(scatter_source.read_text() + '\n// isolation rebuild\n')
+        run([cmake, '--build', build, '--target', 'kvaf_scatter_batch_get_kernel', '-j4'])
+        assert (gather.read_bytes(), gather.stat().st_mtime_ns) == gather_before
+        assert direct.stat().st_mtime_ns == old_mtime
+        originals = [companion, build / 'kernel/kvaf_scatter_batch_get_kernels.o',
+                     build / 'kernel/kvaf_scatter_batch_get.tmp.o']
         before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in originals]
         report, complete = collect(build, build / 'bin/kvaf_execute_batch_get_kernels.o')
         assert complete
@@ -129,7 +141,7 @@ add_subdirectory(kernel)
         assert 'assembly' not in manifest['steps']
         assert all(path.read_bytes() == data and path.stat().st_mtime_ns == stamp
                    for path, (data, stamp) in zip(originals, before))
-        assert (report / 'original/configured/kvaf_sequential_batch_get_kernels.o').read_bytes() == before[0][0]
+        assert (report / 'original/configured/kvaf_scatter_batch_get_kernels.o').read_bytes() == before[0][0]
         # Wrapper/declaration presence alone must not claim complete evidence.
         (root / 'wrapper-only').touch()
         partial, complete = collect(build)
@@ -160,9 +172,10 @@ add_subdirectory(kernel)
         assert all(p.read_bytes() == data and p.stat().st_mtime_ns == stamp
                    for p, (data, stamp) in zip(originals, before))
         # Never guess between multiple compile recipes.
-        makefile = next(build.rglob('build.make'))
+        makefile = next(p for p in build.rglob('build.make')
+                        if 'execute_scatter_batch_get_aiv.asc' in p.read_text())
         recipe = next(line for line in makefile.read_text().splitlines()
-                      if line.startswith('\t') and 'execute_sequential_batch_get_aiv.asc' in line)
+                      if line.startswith('\t') and 'execute_scatter_batch_get_aiv.asc' in line)
         makefile.write_text(makefile.read_text() + '\n' + recipe + '\n')
         try:
             compile_recipe(build)

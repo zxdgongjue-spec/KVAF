@@ -1,5 +1,6 @@
 // Exercise the real Host owner with deferred ACL work and transport doubles.
-#include "sequential_batch_get.h"
+#include "scatter_batch_get.h"
+#include "gather_batch_get.h"
 #include "kvaf_aiv_batch_get.h"
 #include "direct_hccp/direct_hccp_remote_transport.h"
 #include "direct_hccp/direct_hccp_session.h"
@@ -40,8 +41,10 @@ int aclrtSynchronizeStream(aclrtStream) {
 int aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus* s, aclmdlRI*) {
   *s = capturing ? ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE : ACL_MODEL_RI_CAPTURE_STATUS_NONE; return 0;
 }
-extern "C" int32_t KvafSequentialBatchGetLoadKernel(const char*) { return 0; }
-extern "C" int32_t KvafSequentialBatchGetLaunch(const KvafSequentialBatchGetArgs* a, void*) {
+uint32_t loaded_mode{};
+extern "C" int32_t KvafScatterBatchGetLoadKernel(const char*) { loaded_mode = KVAF_SEQ_SCATTER; return 0; }
+extern "C" int32_t KvafGatherBatchGetLoadKernel(const char*) { loaded_mode = KVAF_SEQ_GATHER; return 0; }
+int Launch(const KvafScatterBatchGetArgs* a) {
   // The previous request must finish before its workspace is reused.
   assert(completed == launches);
   const auto args = *a;
@@ -58,6 +61,16 @@ extern "C" int32_t KvafSequentialBatchGetLaunch(const KvafSequentialBatchGetArgs
                    phase, 0, 0, 0, 0};
     ++completed;
   }); return 0;
+}
+extern "C" int32_t KvafScatterBatchGetLaunch(const KvafScatterBatchGetArgs* a, void*) {
+  assert(loaded_mode == KVAF_SEQ_SCATTER);
+  return Launch(a);
+}
+extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, void*) {
+  assert(loaded_mode == KVAF_SEQ_GATHER);
+  KvafScatterBatchGetArgs model{};
+  model.request = a->request; model.sequence = a->sequence;
+  return Launch(&model);
 }
 struct KvafBatchGetTransport {};
 struct KvafBatchGetLocalBuffer {};
@@ -146,111 +159,114 @@ int main() {
   request.output_block_bytes = 16; request.tokens_per_block = 1;
   BatchGetExecRequest exec{{}, &request, {reinterpret_cast<void*>(1), false}};
   {
-    SequentialBatchGet owner(config);
-    assert(owner.Initialize(region).ok());
-    assert(owner.Execute(exec).ok()); assert(completed == 0 && refs == 2);
-    assert(owner.Execute(exec).ok()); assert(completed == 1 && refs == 2);
-    assert(owner.Drain().ok()); assert(completed == 2 && refs == 1);
-    capturing = true; assert(!owner.Execute(exec).ok()); capturing = false;
+    auto owner = CreateSequentialBatchGet(config);
+    assert(owner->Initialize(region).ok());
+    assert(owner->Execute(exec).ok()); assert(completed == 0 && refs == 2);
+    assert(owner->Execute(exec).ok()); assert(completed == 1 && refs == 2);
+    assert(owner->Drain().ok()); assert(completed == 2 && refs == 1);
+    capturing = true; assert(!owner->Execute(exec).ok()); capturing = false;
     assert(launches == 2);
-    request.output.bytes = 15; assert(!owner.Execute(exec).ok()); request.output.bytes = 16;
+    request.output.bytes = 15; assert(!owner->Execute(exec).ok()); request.output.bytes = 16;
     exec.execution.synchronize = true;
-    assert(owner.Execute(exec).ok()); assert(completed == 3 && refs == 1);
+    assert(owner->Execute(exec).ok()); assert(completed == 3 && refs == 1);
     exec.execution.synchronize = false;
-    assert(owner.Execute(exec).ok());
-    assert(owner.Shutdown().ok()); assert(completed == 4 && !refs && !allocations);
+    assert(owner->Execute(exec).ok());
+    assert(owner->Shutdown().ok()); assert(completed == 4 && !refs && !allocations);
     assert((sequences == std::vector<uint64_t>{1, 2, 3, 4}));
   }
   {
-    SequentialBatchGet owner(config); assert(owner.Initialize(region).ok());
+    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
     kernel_result = KVAF_SEQ_CQ_ERROR;
-    assert(owner.Execute(exec).ok()); assert(!owner.Drain().ok());
-    assert(!owner.Execute(exec).ok()); assert(refs == 2);
-    fail_quiesce = true; assert(!owner.Shutdown().ok());
+    assert(owner->Execute(exec).ok()); assert(!owner->Drain().ok());
+    assert(!owner->Execute(exec).ok()); assert(refs == 2);
+    fail_quiesce = true; assert(!owner->Shutdown().ok());
     assert(refs == 2 && allocations == 4);
-    fail_quiesce = false; assert(owner.Shutdown().ok());
+    fail_quiesce = false; assert(owner->Shutdown().ok());
     assert(!refs && !allocations); kernel_result = 0;
   }
   {
-    SequentialBatchGet owner(config); assert(owner.Initialize(region).ok());
-    assert(owner.Execute(exec).ok()); fail_sync = true;
-    const auto failure = owner.Drain();
+    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
+    assert(owner->Execute(exec).ok()); fail_sync = true;
+    const auto failure = owner->Drain();
     assert(failure.code() == StatusCode::kDeviceError);
     assert(failure.message().find("sequence=1 phase=synchronize acl=507034") != std::string::npos);
-    const auto cleanup = owner.Shutdown();
+    const auto cleanup = owner->Shutdown();
     assert(cleanup.message().find("phase=shutdown_synchronize acl=507034") != std::string::npos);
     assert(refs == 2 && allocations == 4);
-    fail_sync = false; assert(owner.Shutdown().ok()); assert(!refs && !allocations);
+    fail_sync = false; assert(owner->Shutdown().ok()); assert(!refs && !allocations);
   }
   {
-    SequentialBatchGet owner(config); assert(owner.Initialize(region).ok());
-    assert(owner.Execute(exec).ok()); fail_copy = true;
-    const auto failure = owner.Drain();
+    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
+    assert(owner->Execute(exec).ok()); fail_copy = true;
+    const auto failure = owner->Drain();
     assert(failure.code() == StatusCode::kDeviceError);
     assert(failure.message().find("sequence=1 phase=copy_status acl=507035") != std::string::npos);
     assert(refs == 2 && allocations == 4);
-    fail_copy = false; assert(owner.Shutdown().ok()); assert(!refs && !allocations);
+    fail_copy = false; assert(owner->Shutdown().ok()); assert(!refs && !allocations);
   }
   {
-    SequentialBatchGet owner(config); fail_enable = true;
-    assert(!owner.Initialize(region).ok()); fail_enable = false;
-    assert(owner.Shutdown().ok()); assert(!refs && !allocations);
+    auto owner = CreateSequentialBatchGet(config); fail_enable = true;
+    assert(!owner->Initialize(region).ok()); fail_enable = false;
+    assert(owner->Shutdown().ok()); assert(!refs && !allocations);
   }
   {
-    SequentialBatchGet owner(config); assert(owner.Initialize(region).ok());
+    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
     kernel_result = KVAF_SEQ_TIMEOUT;
-    assert(owner.Execute(exec).ok());
+    assert(owner->Execute(exec).ok());
     // Closing an unobserved failed async request must surface its status.
-    assert(!owner.Shutdown().ok()); assert(!refs && !allocations);
-    assert(owner.Shutdown().ok()); kernel_result = 0;
+    assert(!owner->Shutdown().ok()); assert(!refs && !allocations);
+    assert(owner->Shutdown().ok()); kernel_result = 0;
   }
   assert(stopped == 6 && quiesced == 6);
   {
     setenv("KVAF_AIV_SCATTER_PROBE", "done", 1);
-    SequentialBatchGet owner(config);
-    assert(owner.Initialize(region).code() == StatusCode::kInvalidArgument);
-    assert(!allocations && !hccp_refs);
+    auto owner = CreateSequentialBatchGet(config);
+    assert(owner->Initialize(region).ok());
+    assert(owner->Execute(exec).ok());
+    assert(owner->Shutdown().ok());
+    assert(!allocations && !hccp_refs && !refs);
   }
   config.aiv_batch_get_mode = "cpu_push_scatter";
+  config.aiv_gather_sgl_size = 0; // A gather-only option must not affect scatter.
   {
     setenv("KVAF_AIV_SCATTER_PROBE", "typo", 1);
-    SequentialBatchGet owner(config);
-    assert(owner.Initialize(region).code() == StatusCode::kInvalidArgument);
+    auto owner = CreateSequentialBatchGet(config);
+    assert(owner->Initialize(region).code() == StatusCode::kInvalidArgument);
     assert(!allocations && !hccp_refs);
   }
   for (const char* probe : {"done", "flush", "load", "copy"}) {
     setenv("KVAF_AIV_SCATTER_PROBE", probe, 1);
-    SequentialBatchGet owner(config); assert(owner.Initialize(region).ok());
+    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
     const auto before = launches;
     exec.execution.synchronize = false;
-    assert(owner.Execute(exec).code() == StatusCode::kInvalidArgument && launches == before);
+    assert(owner->Execute(exec).code() == StatusCode::kInvalidArgument && launches == before);
     exec.execution.synchronize = true;
     for (uint32_t i = 0; i < 2; ++i) {
-      const auto result = owner.Execute(exec);
+      const auto result = owner->Execute(exec);
       assert(result.code() == StatusCode::kNotImplemented); // Never ordinary success.
       assert(result.message().find(std::string("[KVAF_AIV_SCATTER_PROBE_COMPLETE] stage=") + probe + " ") == 0);
-      assert(owner.Drain().ok()); // The observed diagnostic leaves no pending work.
+      assert(owner->Drain().ok()); // The observed diagnostic leaves no pending work.
     }
-    assert(owner.Shutdown().ok()); assert(!refs && !allocations && !hccp_refs);
+    assert(owner->Shutdown().ok()); assert(!refs && !allocations && !hccp_refs);
   }
   for (uint32_t mismatch = 0; mismatch < 3; ++mismatch) {
-    SequentialBatchGet owner(config); assert(owner.Initialize(region).ok());
+    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
     old_probe_kernel = mismatch == 0; wrong_probe_phase = mismatch == 1;
     kernel_result = mismatch == 2 ? KVAF_SEQ_TIMEOUT : KVAF_SEQ_OK;
-    const auto result = owner.Execute(exec);
+    const auto result = owner->Execute(exec);
     assert(result.code() == StatusCode::kInternal);
     assert(result.message().find("[KVAF_AIV_SCATTER_PROBE_COMPLETE]") == std::string::npos);
     assert(result.message().find("expected_result=6") != std::string::npos);
-    assert(owner.Shutdown().ok()); assert(!refs && !allocations && !hccp_refs);
+    assert(owner->Shutdown().ok()); assert(!refs && !allocations && !hccp_refs);
     old_probe_kernel = wrong_probe_phase = false; kernel_result = 0;
   }
   {
-    SequentialBatchGet owner(config); assert(owner.Initialize(region).ok());
+    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
     fail_sync = true;
-    const auto result = owner.Execute(exec);
+    const auto result = owner->Execute(exec);
     assert(result.code() == StatusCode::kDeviceError && result.message().find("probe=copy") != std::string::npos);
-    assert(!owner.Shutdown().ok() && allocations && hccp_refs);
-    fail_sync = false; assert(owner.Shutdown().ok());
+    assert(!owner->Shutdown().ok() && allocations && hccp_refs);
+    fail_sync = false; assert(owner->Shutdown().ok());
     assert(!refs && !allocations && !hccp_refs);
   }
   assert(push_stopped == 8);

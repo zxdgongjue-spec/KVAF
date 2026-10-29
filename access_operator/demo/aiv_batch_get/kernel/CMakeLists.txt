@@ -74,12 +74,17 @@ function(kvaf_compile_batch_get_kernel stem source)
             "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"
             ${ARGN}
     VERBATIM)
-  set(KVAF_BATCH_GET_KERNEL_OUTPUTS ${KVAF_BATCH_GET_KERNEL_OUTPUTS}
-      "${object}" "${installed}" PARENT_SCOPE)
+  add_custom_target(${stem}_kernel DEPENDS "${object}" "${installed}")
 endfunction()
 
 kvaf_compile_batch_get_kernel(kvaf_execute_batch_get execute_batch_get_aiv.asc
   "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_schedule.h")
-kvaf_compile_batch_get_kernel(kvaf_sequential_batch_get execute_sequential_batch_get_aiv.asc
-  "${KVAF_AIV_DEMO_INCLUDE_DIR}/sequential_batch_get_abi.h")
-add_custom_target(kvaf_execute_batch_get_kernel ALL DEPENDS ${KVAF_BATCH_GET_KERNEL_OUTPUTS})
+foreach(mode scatter gather)
+  kvaf_compile_batch_get_kernel(kvaf_${mode}_batch_get execute_${mode}_batch_get_aiv.asc
+    "${KVAF_AIV_DEMO_INCLUDE_DIR}/${mode}_batch_get_abi.h"
+    "${KVAF_AIV_DEMO_INCLUDE_DIR}/sequential_batch_get_abi.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/batch_get_kernel_common.h")
+endforeach()
+add_custom_target(kvaf_batch_get_kernels ALL)
+add_dependencies(kvaf_batch_get_kernels kvaf_execute_batch_get_kernel
+  kvaf_scatter_batch_get_kernel kvaf_gather_batch_get_kernel)

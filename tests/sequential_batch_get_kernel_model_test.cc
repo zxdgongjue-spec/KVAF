@@ -13,9 +13,47 @@
 #include "cpu_gather_executor.h"
 #include "cpu_push_get_abi.h"
 #include "sequential_batch_get_abi.h"
-#include "../access_operator/demo/aiv_batch_get/kernel/execute_sequential_batch_get_aiv.asc"
+#include "../access_operator/demo/aiv_batch_get/kernel/execute_scatter_batch_get_aiv.asc"
+#include "../access_operator/demo/aiv_batch_get/kernel/execute_gather_batch_get_aiv.asc"
 
 namespace {
+using namespace kvaf_scatter;
+using kvaf_gather::kRead;
+using kvaf_gather::kWrite;
+using kvaf_gather::kErrorBit;
+// Test fixture only; production launch ABIs are independent.
+struct ModelArgs {
+  KvafExecuteBatchGetKernelArgs request;
+  uint64_t workspace;
+  uint64_t workspace_bytes;
+  uint64_t workspace_entity;
+  uint64_t descriptor_offset;
+  uint64_t staging_offset;
+  uint64_t lane_descriptor_bytes;
+  uint64_t lane_staging_bytes;
+  uint64_t remote_staging;
+  uint64_t remote_descriptor;
+  uint64_t remote_control;
+  uint64_t source_base;
+  uint64_t source_bytes;
+  uint64_t sequence;
+  uint32_t mode;
+  uint32_t sgl_size;
+  uint32_t max_polls;
+  uint32_t scatter_probe;  // Former reserved word; zero preserves normal execution.
+};
+void Launch(const ModelArgs& a) {
+  if (a.mode == KVAF_SEQ_SCATTER) {
+    KvafScatterBatchGetAivKernelV1({a.request, a.workspace, a.workspace_bytes,
+      a.descriptor_offset, a.staging_offset, a.source_base, a.source_bytes,
+      a.sequence, a.max_polls, a.scatter_probe});
+  } else {
+    KvafGatherBatchGetAivKernelV1({a.request, a.workspace, a.workspace_bytes,
+      a.workspace_entity, a.descriptor_offset, a.lane_descriptor_bytes,
+      a.lane_staging_bytes, a.remote_staging, a.remote_descriptor, a.remote_control,
+      a.source_base, a.source_bytes, a.sequence, a.sgl_size, a.max_polls});
+  }
+}
 uint64_t Address(const void* p) { return reinterpret_cast<uint64_t>(p); }
 uint64_t Align(uint64_t n) { return (n + 63) & ~uint64_t(63); }
 template<class T> struct AlignedAllocator {
@@ -42,7 +80,7 @@ Fixture* fixture;
 struct Fixture {
   uint32_t count, token, workers;
   int32_t active;
-  KvafSequentialBatchGetArgs args{};
+  ModelArgs args{};
   std::vector<uint8_t, AlignedAllocator<uint8_t>> remote, workspace;
   std::vector<uint8_t> output, expected, valid;
   std::vector<uint64_t> addresses;
@@ -195,6 +233,7 @@ struct Fixture {
     assert(false && "unknown doorbell");
   }
   void Run(bool success = true, bool allow_partial = false) {
+    const auto reads = aiv_model::mte2_copies, writes = aiv_model::mte3_copies;
     expected = output;
     if (success && active >= 0) for (int32_t i = 0; i < active; ++i)
       std::memcpy(expected.data() + uint64_t(rows[i]) * token,
@@ -203,10 +242,14 @@ struct Fixture {
       aiv_model::core = core;
       // Simulate a core last used by another operator, on every launch/core.
       aiv_model::dma_state_dirty = true;
-      KvafSequentialBatchGetAivKernelV1(args);
+      Launch(args);
       assert(status[core].magic == KVAF_SEQ_STATUS_MAGIC);
       assert(status[core].sequence == args.sequence);
       assert((status[core].result == KVAF_SEQ_OK) == success);
+    }
+    if (args.mode == KVAF_SEQ_GATHER) {
+      assert(aiv_model::mte2_copies == reads && aiv_model::mte3_copies == writes);
+      assert(!push_requests);
     }
     if (success) assert(output == expected);
     else if (!allow_partial) CheckGuard();
@@ -243,7 +286,7 @@ int main() {
           for (uint32_t core = 0; core < workers; ++core) {
             aiv_model::core = core;
             aiv_model::dma_state_dirty = true;
-            KvafSequentialBatchGetAivKernelV1(f.args);
+            Launch(f.args);
             const auto& s = f.status[core];
             assert(s.magic == KVAF_SEQ_STATUS_MAGIC && s.sequence == f.args.sequence);
             assert(s.result == KVAF_SEQ_PROBE_COMPLETE);
@@ -268,7 +311,8 @@ int main() {
     Fixture invalid(1, 656, 1, KVAF_SEQ_SCATTER, 6);
     invalid.args.scatter_probe = 99; invalid.Run(false); assert(!invalid.push_requests);
     Fixture gather(1, 656, 1, KVAF_SEQ_GATHER, 6);
-    gather.args.scatter_probe = KVAF_SEQ_PROBE_DONE; gather.Run(false); assert(!gather.completions);
+    // Scatter-only configuration cannot reach the gather ABI.
+    gather.args.scatter_probe = KVAF_SEQ_PROBE_DONE; gather.Run(); assert(gather.completions);
     Fixture timeout(1, 656, 1, KVAF_SEQ_SCATTER, 6);
     timeout.args.scatter_probe = KVAF_SEQ_PROBE_DONE; timeout.timeout = true; timeout.Run(false);
     assert(timeout.status[0].result == KVAF_SEQ_TIMEOUT);
