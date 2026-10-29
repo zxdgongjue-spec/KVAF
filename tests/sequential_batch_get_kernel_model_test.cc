@@ -308,6 +308,8 @@ int main() {
             std::memcpy(expected.data() + uint64_t(f.rows[i]) * bytes,
                         reinterpret_cast<void*>(f.addresses[f.indices[i]] + f.offsets[i]), bytes);
           const auto reads = aiv_model::mte2_copies, writes = aiv_model::mte3_copies;
+          const auto aligned_reads = aiv_model::mte2_aligned_copies;
+          const auto tail_reads = aiv_model::mte2_tail_copies;
           const auto scalar_reads = aiv_model::ub_scalar_reads;
           const auto resets = aiv_model::out_to_ub_resets;
           const auto setup_waits = aiv_model::event_waits[PIPE_S][PIPE_MTE2];
@@ -324,13 +326,18 @@ int main() {
           assert(f.output == expected);
           const auto chunks = count * ((bytes + kCopyBytes - 1) / kCopyBytes);
           const bool configured = probe != KVAF_SEQ_PROBE_DONE && probe != KVAF_SEQ_PROBE_FLUSH;
-          const auto expected_reads = configured && probe != KVAF_SEQ_PROBE_SETUP ? chunks : 0;
+          const bool copied = configured && probe != KVAF_SEQ_PROBE_SETUP;
+          const auto expected_aligned = copied ? count * (bytes / kCopyBytes +
+              (bytes % kCopyBytes >= 32 ? 1 : 0)) : 0;
+          const auto expected_tail = copied && bytes % 32 ? count : 0;
+          const auto expected_reads = expected_aligned + expected_tail;
           assert(aiv_model::out_to_ub_resets - resets == (configured ? chunks : 0));
           assert(aiv_model::event_waits[PIPE_S][PIPE_MTE2] - setup_waits == (configured ? chunks : 0));
-          assert(aiv_model::event_waits[PIPE_MTE2][PIPE_S] - dma_waits ==
-              (probe == KVAF_SEQ_PROBE_DMA || probe == KVAF_SEQ_PROBE_LOAD ? chunks : 0));
+          assert(aiv_model::event_waits[PIPE_MTE2][PIPE_S] - dma_waits == expected_reads);
           assert(aiv_model::mte2_copies - reads == expected_reads);
-          assert(aiv_model::mte3_copies - writes == (probe == KVAF_SEQ_PROBE_COPY ? expected_reads : 0));
+          assert(aiv_model::mte2_aligned_copies - aligned_reads == expected_aligned);
+          assert(aiv_model::mte2_tail_copies - tail_reads == expected_tail);
+          assert(aiv_model::mte3_copies - writes == (probe == KVAF_SEQ_PROBE_COPY ? chunks : 0));
           assert(aiv_model::ub_scalar_reads - scalar_reads ==
               (probe == KVAF_SEQ_PROBE_LOAD ? uint64_t(count) * bytes : 0));
           assert(!aiv_model::mte2.destination && !aiv_model::mte3.destination);
@@ -388,6 +395,8 @@ int main() {
   {
     // Isolate the real payload helper from URMA: all GM alignment residues,
     // nonaligned byte counts, UB chunk boundaries, and repeated staging writes.
+    // Bound every MTE2 read to this token; vector allocation slack must not
+    // conceal a rounded-up read of the final tail.
     Fixture f(1, 656, 1, KVAF_SEQ_SCATTER, 1);
     for (uint32_t bytes : {1U, 13U, 31U, 32U, 33U, 63U, 64U, 65U, 656U,
                            16383U, 16384U, 16385U, 32769U, 65535U}) {
@@ -405,6 +414,8 @@ int main() {
           // change, MTE3 copy, or padding byte may participate in verification.
           const auto writes = aiv_model::mte3_copies;
           const auto scalar_reads = aiv_model::ub_scalar_reads;
+          aiv_model::mte2_source_begin = Address(source.data() + offset);
+          aiv_model::mte2_source_end = aiv_model::mte2_source_begin + bytes;
           assert(CopyPayload(Address(source.data() + offset), Address(output.data() + destination_offset),
                              bytes, KVAF_SEQ_PROBE_LOAD) == KVAF_SEQ_OK);
           assert(aiv_model::mte3_copies == writes);
@@ -412,6 +423,7 @@ int main() {
           assert(std::all_of(output.begin(), output.end(), [](uint8_t b) { return b == 0xad; }));
           assert(CopyPayload(Address(source.data() + offset), Address(output.data() + destination_offset),
                              bytes) == KVAF_SEQ_OK);
+          aiv_model::mte2_source_begin = aiv_model::mte2_source_end = 0;
           assert(output == expected);
           assert(!aiv_model::mte2.destination && !aiv_model::mte3.destination);
           assert(std::all_of(aiv_model::ub + kCopyBytes, aiv_model::ub + sizeof(aiv_model::ub),

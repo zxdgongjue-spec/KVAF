@@ -16,9 +16,11 @@ Gather 的 `pipeline_chunk_bytes=0`，不把 CPU 的 `~sequence` started ACK 当
 多核 gather 每个核拥有独立 lane，各 lane 按上述依赖顺序执行。
 AIV 不调用 UMDK；scatter 使用注册 HBM mailbox，gather 使用手写 USER_CTL WQE。
 
-Scatter 的本地 payload 搬运使用 `DataCopyPad<uint8_t>`，通过一个 16 KiB UB
-缓冲顺序执行 MTE2（GM→UB）和 MTE3（UB→GM）。MTE2 完成后才写出，MTE3
-完成后才复用缓冲并报告完成；长度按字节给出，UB padding 不写到 output。
+Scatter 的本地 payload 搬运通过一个 16 KiB UB 缓冲顺序执行 MTE2（GM→UB）
+和 MTE3（UB→GM）。MTE2 参考 `ops-transformer v9.1.0`：32 B 整数倍主体
+使用 `DataCopy<uint8_t>`，不足 32 B 的尾部使用 `DataCopyPad<uint8_t>`；
+两次搬运各自等待 MTE2→S 完成。MTE3 仍使用原有精确长度的 DataCopyPad，
+完成后才复用缓冲并报告完成，UB padding 不写到 output。
 UB 通过公开的 `LocalTensor<uint8_t>(TPosition::VECIN, 0, 16384)` 构造，
 每次读入前单独调用 `ResetLoopModePara(DataCopyMVType::OUT_TO_UB)`，
 将 GM→UB 恢复为普通搬运模式。这项配置不调用 `InitSocState()` 或 TPipe。
@@ -366,8 +368,8 @@ CPU payload/done 协议，在同一份 `CopyPayload` 中按每个最多 16 KiB �
 依次执行到指定位置：
 
 - `setup`：完成 staging flush、tensor/拷贝参数准备、`ResetLoopModePara(OUT_TO_UB)`
-  和 S→MTE2 的 set/wait，然后跳到下一块；不调用 payload DataCopyPad。
-- `dma`：在上述基础上执行 GM→UB DataCopyPad，完成 MTE2→S 的 set/wait
+  和 S→MTE2 的 set/wait，然后跳到下一块；不调用 payload DMA。
+- `dma`：在上述基础上执行 GM→UB CopyIn，完成每次搬运的 MTE2→S set/wait
   后才处理下一块；不调用 `scratch.GetValue`，也不比较 staging 内容。
 - `load`：在 `dma` 的执行范围之后逐字节比较 UB 和 staging。
 
@@ -391,6 +393,48 @@ magic/sequence/result/phase，并拒绝总处理请求数为零的 MTE2 检查�
 三个批次。默认 1 核时是 `[1, 3, 1]`，相应字节数为 656、1968、656。
 需要同时重编 Host 与 kernel；旧 Host 会拒绝新开关，旧 kernel 会拒绝
 新增 probe 编号，不能混用。CPU 服务协议没有改变。
+
+### 按 ops-transformer 重写 MTE2
+
+硬件反馈为 `setup` 通过、`dma` 仍报 507015；当前暂停继续增加诊断点，
+按用户指定的算子库实现 GM→UB 搬运。参考版本固定为
+`ops-transformer v9.1.0`（`c77c0829f1f0f0b8f882db1d9b051a758b605472`）：
+
+- [GmUbGmCopy::GmUbGmDataBlockCopy](https://gitcode.com/cann/ops-transformer/blob/v9.1.0/mc2/common/op_kernel/gm_ub_gm_copy.h)
+  的普通块使用 `DataCopy`，搬运元素数为 32 B 的整数倍。
+- [MoeDistributeDispatchTeardown::LocalWindowCopy](https://gitcode.com/cann/ops-transformer/blob/v9.1.0/mc2/moe_distribute_dispatch_teardown/op_kernel/arch35/moe_distribute_dispatch_teardown_arch35.h)
+  使用 `DataCopyPad`、按字节配置长度、禁用源 L2 hint，并在读取 UB 前同步 MTE2→S。
+
+新的 `CopyIn` 先搬运 `floor(n / 32) * 32` 字节主体，再把剩余字节精确搬到
+`scratch[body]`。例如 656 B 为 640 B DataCopy + 16 B DataCopyPad；13 B 只有
+DataCopyPad；16384 B 只有 DataCopy。UB 尾部地址始终 32 B 对齐。
+GM 使用 uint8_t 类型，按照 [DataCopy 连续搬运约束](https://asc.gitcode.com/api/SIMD-API/basic_api/memory_vector_compute/data_move/DataCopy_GMAndUB_continuous.html)
+只需满足 1 B 对齐，因此相邻 packed token 的起点不要求 32 B 对齐。
+
+这里是针对本项目的适配，未整份移植参考类：原通用类会把尾部读长度向上取整，
+而本项目的 CPU staging 按 token 紧凑排列，所以尾部必须精确读取。参考类的
+TPipe/TQue 管理也未引入：核对 `asc-devkit v9.1.0` 的
+`impl/basic_api/dav_3510/kernel_tpipe_impl_c310.h` 后确认，TPipe 构造会隐式调用
+`InitSocState()`，与已确认的初始化故障回退冲突。继续使用公开的静态 LocalTensor
+和显式事件同步，每次搬运完成后才发下一次；没有双缓冲或流水。
+
+本次仅替换 scatter 的 MTE2 实现，MTE3 搬运、gather、Host/参数 ABI、Python
+调用及 CPU wire 协议保持原有行为。沿用现有 `dma` 和 `load` 检查点：
+
+```bash
+cmake --build build-npu --target kvaf_scatter_batch_get_kernel -j
+DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 KVAF_NPU_TOKEN_BYTES=656 \
+  KVAF_AIV_SCATTER_PROBE=load \
+  KVAF_BATCH_GET_KERNEL="$PWD/build-npu/bin/kvaf_scatter_batch_get_kernels.o" \
+  python tests/python/test_aiv_scatter_batch_get.py
+```
+
+沿用此前的 Python、CPU 地址、BatchPut kernel 和测试开关环境。已有最新 Host
+时仅需重编 scatter kernel；`load` 要求三个批次的 GM/UB 字节比较全部通过，
+而且 output 保持 guard。先验收 MTE2，MTE3 仍留到后续。
+本地模型覆盖主体/尾部、全部 64 种源地址余数、1～65535 B 长度、跨 UB 分块、
+1/3/8 核及重复批次；模型对每次 GM 读取施加 token 边界，防止越界读取被
+分配余量掩盖。本地没有 CANN/NPU，模型通过不代表 507015 已经修复。
 
 ## Scatter 507015 的分段定位
 
@@ -459,7 +503,7 @@ magic、sequence、专用 result 和 phase，旧 kernel 忽略该字段时会明
   done 轮询和状态写回，结合该次 CPU 日志与 Ascend 异常。
 - `done` 完成、`flush` 失败：优先检查输出行寻址、UB 初始化及 staging cache 操作。
 - `flush` 完成、`setup` 失败：优先检查 MTE2 普通模式配置、S→MTE2 同步及收尾。
-- `setup` 完成、`dma` 失败：范围缩小到 GM→UB DataCopyPad、MTE2→S 同步及收尾。
+- `setup` 完成、`dma` 失败：范围缩小到 GM→UB CopyIn、MTE2→S 同步及收尾。
 - `dma` 完成、`load` 失败：重点检查 UB 标量读取和内容比较；若返回
   `MTE2_GM_UB_byte_mismatch` 则是校验不一致，需与设备异常 507015 区分。
 - `load` 完成、`copy` 失败：优先检查 UB→GM、输出地址和 MTE3 完成同步；若是

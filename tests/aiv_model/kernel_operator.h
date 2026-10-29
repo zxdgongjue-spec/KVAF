@@ -43,9 +43,19 @@ struct PendingCopy {
 };
 inline PendingCopy mte2, mte3;
 inline uint64_t mte2_copies{}, mte3_copies{};
+inline uint64_t mte2_aligned_copies{}, mte2_tail_copies{};
 inline uint64_t ub_scalar_reads{};
 inline uint64_t out_to_ub_resets{}, event_waits[4][4]{};
 inline bool corrupt_next_mte2{};
+// Optional exact source interval for tests: a padded UB tail must never cause
+// a read outside the requested GM token, even if the allocation has slack.
+inline uintptr_t mte2_source_begin{}, mte2_source_end{};
+inline void CheckMte2Source(const void* source, uint64_t bytes) {
+  if (!mte2_source_end) return;
+  const auto address = reinterpret_cast<uintptr_t>(source);
+  if (address < mte2_source_begin || address > mte2_source_end ||
+      bytes > mte2_source_end - address) std::abort();
+}
 }
 inline void set_flag(int source, int target, event_t event) {
   if (model_events[source][target][event]) std::abort();
@@ -106,7 +116,7 @@ template <typename T> struct GlobalTensor {
   T* data;
   void SetGlobalBuffer(T* value) { data = value; }
   void SetL2CacheHint(CacheMode) {}
-  GlobalTensor operator[](uint64_t offset) { return GlobalTensor{data + offset}; }
+  GlobalTensor operator[](uint64_t offset) const { return GlobalTensor{data + offset}; }
 };
 template <typename T> struct LocalTensor {
   struct { uint8_t logicPos; uintptr_t bufferAddr; uint32_t dataLen; } address_{};
@@ -115,6 +125,14 @@ template <typename T> struct LocalTensor {
     if (offset % 32 || uint64_t(offset) + uint64_t(elements) * sizeof(T) > sizeof(aiv_model::ub))
       std::abort();
     address_ = {static_cast<uint8_t>(pos), get_imm(offset), elements * uint32_t(sizeof(T))};
+  }
+  LocalTensor operator[](uint32_t offset) const {
+    const uint64_t byte_offset = uint64_t(offset) * sizeof(T);
+    if (byte_offset > address_.dataLen) std::abort();
+    auto result = *this;
+    result.address_.bufferAddr += byte_offset;
+    result.address_.dataLen -= byte_offset;
+    return result;
   }
   T GetValue(uint32_t index) const {
     // A scalar consumer must wait for MTE2 before reading its destination.
@@ -136,9 +154,22 @@ template <typename T> struct DataCopyPadExtParams {
   T paddingValue;
 };
 template <typename T>
+void DataCopy(const LocalTensor<T>& dst, const GlobalTensor<T>& src, uint32_t count) {
+  const uint64_t bytes = uint64_t(count) * sizeof(T);
+  aiv_model::CheckMte2Source(src.data, bytes);
+  if (!bytes || bytes % 32 || dst.address_.bufferAddr % 32 ||
+      reinterpret_cast<uintptr_t>(src.data) % sizeof(T) || bytes > dst.address_.dataLen ||
+      aiv_model::mte2.destination || aiv_model::mte3.destination) std::abort();
+  aiv_model::mte2 = {reinterpret_cast<uint8_t*>(dst.address_.bufferAddr),
+                    reinterpret_cast<const uint8_t*>(src.data), uint32_t(bytes), uint32_t(bytes)};
+  ++aiv_model::mte2_copies;
+  ++aiv_model::mte2_aligned_copies;
+}
+template <typename T>
 void DataCopyPad(const LocalTensor<T>& dst, const GlobalTensor<T>& src,
                  const DataCopyExtParams& p, const DataCopyPadExtParams<T>& pad) {
   const uint32_t padded = (p.blockLen + 31) & ~31U;
+  aiv_model::CheckMte2Source(src.data, p.blockLen);
   if (p.blockCount != 1 || p.srcStride || p.dstStride || p.rsv || pad.isPad ||
       pad.leftPadding || pad.rightPadding || dst.address_.bufferAddr % 32 ||
       padded > dst.address_.dataLen || aiv_model::mte2.destination ||
@@ -146,6 +177,7 @@ void DataCopyPad(const LocalTensor<T>& dst, const GlobalTensor<T>& src,
   aiv_model::mte2 = {reinterpret_cast<uint8_t*>(dst.address_.bufferAddr),
                     reinterpret_cast<const uint8_t*>(src.data), p.blockLen, padded};
   ++aiv_model::mte2_copies;
+  ++aiv_model::mte2_tail_copies;
 }
 template <typename T>
 void DataCopyPad(const GlobalTensor<T>& dst, const LocalTensor<T>& src,
