@@ -60,3 +60,48 @@ else()
   message(STATUS
     "Skipping direct Runtime Python tests; configure with -DKVAF_BUILD_PYTHON=ON")
 endif()
+
+add_executable(kvaf_sequential_batch_get_kernel_model_test
+  sequential_batch_get_kernel_model_test.cc
+  ${PROJECT_SOURCE_DIR}/runtime/src/cpu_gather_executor.cc)
+target_include_directories(kvaf_sequential_batch_get_kernel_model_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/aiv_model
+  ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include
+  ${PROJECT_SOURCE_DIR}/runtime/include
+  ${PROJECT_SOURCE_DIR}/common/include)
+target_link_libraries(kvaf_sequential_batch_get_kernel_model_test PRIVATE pthread)
+add_test(NAME kvaf_sequential_batch_get_kernel_model_test COMMAND kvaf_sequential_batch_get_kernel_model_test)
+add_test(NAME kvaf_aiv_sequential_hardware_python
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_aiv_sequential_batch_get.py")
+set_tests_properties(kvaf_aiv_sequential_hardware_python PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 600 ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}/python")
+
+# Compile hardware Host sources even on development machines without CANN.
+# Object-only: never link the declaration doubles into the production libraries.
+if(NOT KVAF_ENABLE_AIV_BATCH_GET)
+  add_executable(kvaf_sequential_host_test sequential_batch_get_host_test.cc
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/sequential_batch_get.cpp)
+  target_include_directories(kvaf_sequential_host_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/fake_acl
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include
+    ${PROJECT_SOURCE_DIR}/access_operator/include
+    ${PROJECT_SOURCE_DIR}/runtime/include
+    ${PROJECT_SOURCE_DIR}/common/include)
+  add_test(NAME kvaf_sequential_host_test COMMAND kvaf_sequential_host_test)
+  add_library(kvaf_sequential_host_compile_check OBJECT
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/sequential_batch_get.cpp
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/execute_sequential_batch_get_loader.cpp
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/batch_get_host.cpp
+    ${PROJECT_SOURCE_DIR}/access_operator/src/access_operator.cc
+    ${PROJECT_SOURCE_DIR}/access_operator/src/direct_hccp/direct_hccp_remote_transport.cc
+    ${PROJECT_SOURCE_DIR}/runtime/src/npu_runtime.cc)
+  target_include_directories(kvaf_sequential_host_compile_check PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/fake_acl
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_put/include
+    ${PROJECT_SOURCE_DIR}/access_operator/include
+    ${PROJECT_SOURCE_DIR}/runtime/include
+    ${PROJECT_SOURCE_DIR}/meta_manager/include
+    ${PROJECT_SOURCE_DIR}/common/include)
+  target_compile_definitions(kvaf_sequential_host_compile_check PRIVATE KVAF_ENABLE_AIV_BATCH_PUT=1)
+endif()

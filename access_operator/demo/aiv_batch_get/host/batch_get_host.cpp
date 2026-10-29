@@ -634,3 +634,20 @@ extern "C" void KvafBatchGetLocalBufferRelease(KvafBatchGetLocalBuffer *local_bu
 extern "C" void KvafBatchGetTransportDestroy(KvafBatchGetTransport *transport) {
   ReleaseTransport(transport);
 }
+
+extern "C" int32_t KvafBatchGetTransportQuiesce(KvafBatchGetTransport *t) {
+  if (!t) return KVAF_BATCH_GET_SUCCESS;
+  for (uint32_t i = 0; i < t->worker_count; ++i) {
+    auto &w = t->workers[i];
+    auto *context = t->paths[w.path_index].device_context;
+    if (w.device_peer_target_jetty) {
+      if (t->api.qp_unimport(context, w.device_peer_target_jetty)) return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
+      w.device_peer_target_jetty = nullptr;
+    }
+    if (w.device_user_ctl_jetty.handle) {
+      if (t->api.qp_destroy(w.device_user_ctl_jetty.handle)) return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
+      w.device_user_ctl_jetty.handle = nullptr;
+    }
+  }
+  return KVAF_BATCH_GET_SUCCESS;
+}

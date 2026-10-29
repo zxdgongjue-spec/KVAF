@@ -65,11 +65,13 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
       "KVAF_BUILD_REMOTE_CPU_SERVICE requires urma_api.h and liburma; set KVAF_URMA_ROOT")
   endif()
 
-  add_library(kvaf_cpu_runtime STATIC src/cpu_runtime.cc)
+  add_library(kvaf_cpu_runtime STATIC src/cpu_runtime.cc src/cpu_urma_discovery.cc
+    src/cpu_gather_executor.cc src/cpu_push_get_transport.cc src/cpu_push_get_worker.cc)
   target_include_directories(kvaf_cpu_runtime
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
-      "${KVAF_URMA_INCLUDE_DIR}")
+      "${KVAF_URMA_INCLUDE_DIR}"
+      "${PROJECT_SOURCE_DIR}/access_operator/include")
   target_link_libraries(kvaf_cpu_runtime
     PUBLIC kvaf_runtime
     PRIVATE "${KVAF_URMA_LIBRARY}" "${CMAKE_DL_LIBS}" Threads::Threads)

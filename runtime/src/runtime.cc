@@ -95,13 +95,24 @@ Status RuntimeCore::Initialize(const RuntimeInitRequest& request) {
 
   status = access_operator_.Initialize(remote_region);
   if (!status.ok()) {
+    const auto closed = access_operator_.Shutdown();
+    if (!closed.ok()) {
+      remote_region_ = remote_region;
+      initialized_ = true;  // Retain ownership so Shutdown can retry safely.
+      return closed;
+    }
     (void)ddr_allocator_.Release(remote_region);
     return status;
   }
 
   status = meta_manager_.RegisterRemoteRegion(remote_region);
   if (!status.ok()) {
-    (void)access_operator_.Shutdown();
+    const auto closed = access_operator_.Shutdown();
+    if (!closed.ok()) {
+      remote_region_ = remote_region;
+      initialized_ = true;
+      return closed;
+    }
     (void)ddr_allocator_.Release(remote_region);
     return status;
   }
@@ -116,6 +127,8 @@ Status RuntimeCore::Shutdown() {
     return Status::NotInitialized("Runtime has not been initialized");
   }
 
+  const Status operator_status = access_operator_.Shutdown();
+  if (!operator_status.ok()) return operator_status;
   Status first_error = Status::OK();
   for (const auto& entry : access_tables_) {
     const Status status = meta_manager_.UnlockKeys(entry.second->lock_context);
@@ -125,10 +138,6 @@ Status RuntimeCore::Shutdown() {
   }
   access_tables_.clear();
 
-  const Status operator_status = access_operator_.Shutdown();
-  if (!operator_status.ok() && first_error.ok()) {
-    first_error = operator_status;
-  }
   const Status release_status = ddr_allocator_.Release(remote_region_);
   if (!release_status.ok() && first_error.ok()) {
     first_error = release_status;

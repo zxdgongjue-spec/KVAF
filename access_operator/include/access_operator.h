@@ -63,6 +63,10 @@ struct AccessOperatorConfig {
   // continues to use peer_local_eid above.
   std::vector<std::array<std::uint8_t, 16>> peer_local_eids{};
   std::shared_ptr<PeerLink> peer_link;
+  std::string aiv_batch_get_mode{"direct_read"};
+  std::uint32_t batch_get_token_bytes{0};
+  // Gather uses 1..6 local SGEs. No software inflight budget in sequential modes.
+  std::uint32_t aiv_gather_sgl_size{6};
 };
 
 struct BatchGetKernelProfile {

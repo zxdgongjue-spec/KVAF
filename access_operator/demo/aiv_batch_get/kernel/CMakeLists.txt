@@ -63,9 +63,16 @@ add_custom_command(
           -mllvm -cce-aicore-function-stack-size=0x4000 -mllvm -cce-aicore-stack-size=0x4000
           -mllvm -cce-aicore-record-overflow=false -mllvm -cce-aicore-addr-transform
           -mllvm -cce-aicore-jump-expand=true -std=c++17 -fstack-protector-all ${KVAF_KERNEL_INCLUDES}
-  COMMAND "${KVAF_LLD}" -m aicorelinux -Ttext=0 "${KVAF_EXECUTE_KERNEL_TMP}" -static
+  COMMAND "${KVAF_CCEC}" -c -x cce -O2 "${CMAKE_CURRENT_SOURCE_DIR}/execute_sequential_batch_get_aiv.asc" -o "${CMAKE_CURRENT_BINARY_DIR}/kvaf_sequential_batch_get.tmp.o"
+          --cce-aicore-arch=dav-c310-vec --cce-aicore-input-parameter-size=8192 --cce-aicore-only
+          -mllvm -cce-aicore-function-stack-size=0x4000 -mllvm -cce-aicore-stack-size=0x4000
+          -mllvm -cce-aicore-record-overflow=false -mllvm -cce-aicore-addr-transform
+          -mllvm -cce-aicore-jump-expand=true -std=c++17 -fstack-protector-all ${KVAF_KERNEL_INCLUDES}
+  COMMAND "${KVAF_LLD}" -m aicorelinux -Ttext=0 "${KVAF_EXECUTE_KERNEL_TMP}" "${CMAKE_CURRENT_BINARY_DIR}/kvaf_sequential_batch_get.tmp.o" -static
           -o "${KVAF_EXECUTE_KERNEL_OBJECT}"
   DEPENDS "${KVAF_EXECUTE_KERNEL_SOURCE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/execute_sequential_batch_get_aiv.asc"
+          "${KVAF_AIV_DEMO_INCLUDE_DIR}/sequential_batch_get_abi.h"
           "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_abi.h"
           "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_schedule.h"
           "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"

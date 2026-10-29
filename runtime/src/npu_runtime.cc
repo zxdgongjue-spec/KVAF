@@ -25,6 +25,7 @@
 #include "access_operator.h"
 #include "peer_link.h"
 #include "meta_manager.h"
+#include "gather_workspace.h"
 #include "startup_bandwidth_probe.h"
 #include "startup_selection.h"
 
@@ -35,8 +36,8 @@ Status Internal(std::string message) { return Status::Internal(std::move(message
 
 class PeerDdrAllocator final : public DdrMemoryAllocator {
  public:
-  explicit PeerDdrAllocator(std::shared_ptr<peer::PeerLink> link)
-      : link_(std::move(link)) {}
+  explicit PeerDdrAllocator(std::shared_ptr<peer::PeerLink> link, uint64_t workspace = 0)
+      : link_(std::move(link)), workspace_(workspace) {}
 
   void SetCandidate(std::uint32_t candidate_id) { candidate_id_ = candidate_id; }
   bool has_allocation() const { return allocated_.base != 0U; }
@@ -48,9 +49,14 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
       return Status::InvalidArgument("invalid peer DDR allocation request");
     }
     if (allocated_.base != 0U) return Status::InvalidState("peer DDR is already allocated");
-    Status status = link_->AllocateRegion(request.ddr_bytes, request.slot_size, candidate_id_, &allocated_);
+    if (workspace_ > UINT64_MAX - (request.slot_size - 1))
+      return Status::InvalidArgument("gather workspace size overflow");
+    const auto reserved = (workspace_ + request.slot_size - 1) / request.slot_size * request.slot_size;
+    if (request.ddr_bytes > UINT64_MAX - reserved)
+      return Status::InvalidArgument("DDR allocation size overflow");
+    Status status = link_->AllocateRegion(request.ddr_bytes + reserved, request.slot_size, candidate_id_, &allocated_);
     if (!status.ok()) return status;
-    *region = RemoteRegionDesc{allocated_.base, allocated_.length, request.slot_size, DeviceKind::kCpu};
+    *region = RemoteRegionDesc{allocated_.base, request.ddr_bytes, request.slot_size, DeviceKind::kCpu};
     return Status::OK();
   }
 
@@ -65,6 +71,7 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
 
  private:
   std::shared_ptr<peer::PeerLink> link_;
+  uint64_t workspace_{0};
   std::uint32_t candidate_id_{0U};
   peer::PeerRegion allocated_{};
 };
@@ -428,6 +435,9 @@ std::uint64_t BatchPutStartupProbeRows(std::uint64_t ddr_bytes,
 struct NpuRuntime::Impl {
   explicit Impl(NpuRuntimeOptions init_options) : options(std::move(init_options)) {
     config.batch_get_kernel_object_path = options.batch_get_kernel_object_path;
+    config.aiv_batch_get_mode = options.aiv_batch_get_mode;
+    config.aiv_gather_sgl_size = options.aiv_gather_sgl_size;
+    config.batch_get_token_bytes = options.batch_get_token_bytes;
     config.batch_put_kernel_object_path = options.batch_put_kernel_object_path;
     config.npu_core_count = options.npu_core_count;
     config.jettys_per_core = options.jettys_per_core;
@@ -465,11 +475,19 @@ struct NpuRuntime::Impl {
 };
 
 NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {
+  const auto& o = impl_->options;
+  const bool sequential = o.aiv_batch_get_mode != "direct_read";
+  if (sequential && o.aiv_batch_get_mode != "gather_read" && o.aiv_batch_get_mode != "cpu_push_scatter")
+    throw std::invalid_argument("aiv_batch_get_mode must be direct_read, gather_read or cpu_push_scatter");
+  if (sequential && (o.npu_core_count > 8 || o.npu_eids.size() > 1 || o.adaptive_ub_device ||
+      uint64_t(o.batch_get_token_bytes) * kGatherMaxRequests > UINT32_MAX ||
+      !o.aiv_gather_sgl_size || o.aiv_gather_sgl_size > 6))
+    throw std::invalid_argument("sequential BatchGet needs 1..8 cores, one EID, SGL 1..6 and uint32 payload; no startup tuning");
   if (impl_->config.batch_get_kernel_object_path.empty() || impl_->options.npu_core_count == 0U ||
       impl_->options.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->options.jettys_per_core == 0U ||
       impl_->options.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
-      (impl_->options.batch_get_max_inflight_total != 0U &&
+      (!sequential && impl_->options.batch_get_max_inflight_total != 0U &&
        impl_->options.batch_get_max_inflight_total < 2U * impl_->options.npu_core_count) ||
       impl_->options.batch_get_token_bytes == 0U ||
       impl_->options.batch_get_tokens_per_block == 0U ||
@@ -488,7 +506,8 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
 
 NpuRuntime::~NpuRuntime() {
   if (impl_ != nullptr) {
-    (void)Shutdown();
+    const auto closed = Shutdown();
+    if (!closed.ok()) { (void)impl_.release(); return; }
     impl_->runtime_core.reset();
     impl_->access_operator.reset();
     impl_->ReleaseProbe();
@@ -504,7 +523,9 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
   }
   impl_->peer_link = std::make_shared<peer::PeerLink>(target.address);
   impl_->config.peer_link = impl_->peer_link;
-  auto allocator = std::make_unique<PeerDdrAllocator>(impl_->peer_link);
+  auto allocator = std::make_unique<PeerDdrAllocator>(impl_->peer_link,
+      impl_->options.aiv_batch_get_mode == "gather_read" ?
+      GatherRemoteWorkspaceBytes(impl_->options.batch_get_token_bytes, impl_->options.npu_core_count) : 0);
   impl_->peer_allocator = allocator.get();
   impl_->allocator = std::move(allocator);
   impl_->runtime_core.reset();
@@ -878,7 +899,7 @@ Status NpuRuntime::Shutdown() {
   const Status status = impl_->runtime_core != nullptr && impl_->runtime_core->initialized()
                             ? impl_->runtime_core->Shutdown()
                             : Status::OK();
-  impl_->ReleaseProbe();
+  if (status.ok()) impl_->ReleaseProbe();
   return status;
 }
 

@@ -21,6 +21,8 @@ struct NpuRuntimeOptions {
         batch_get_tokens_per_block(tokens_per_block) {}
 
   std::string batch_get_kernel_object_path;
+  std::string aiv_batch_get_mode{"direct_read"};
+  std::uint32_t aiv_gather_sgl_size{6};
   std::uint32_t batch_get_token_bytes;
   std::uint32_t batch_get_tokens_per_block;
   std::string batch_put_kernel_object_path;

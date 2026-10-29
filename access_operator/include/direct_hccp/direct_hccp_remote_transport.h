@@ -139,6 +139,10 @@ bool LoadDirectHccp(DirectHccpApi* api);
 void CloseDirectHccp(DirectHccpApi* api);
 
 bool GetCurrentNpuPhysicalDeviceId(std::uint32_t* physical_device_id);
+bool GetPeerTp(const DirectHccpApi&, void* context,
+               const std::array<std::uint8_t, kEidBytes>& local_eid,
+               const std::array<std::uint8_t, kEidBytes>& peer_eid,
+               const char* role, std::uint64_t* tp);
 void ReleaseDeviceAivTransport(const DeviceAivTransportResources& resources);
 
 // Converts the Link descriptor's raw UMDK token to the AIV WQE token format.

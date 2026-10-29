@@ -13,6 +13,7 @@
 #include "acl/acl.h"
 #include "batch_get_abi.h"
 #include "kvaf_aiv_batch_get.h"
+#include "sequential_batch_get.h"
 #include "meta_manager.h"
 
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
@@ -290,6 +291,7 @@ struct DefaultAccessOperator::Impl {
   RemoteRegionDesc remote_region;
   KvafBatchGetTransport* transport{nullptr};
   BatchGetExecutionState execution;
+  std::unique_ptr<SequentialBatchGet> sequential;
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   KvafBatchPutTransport* batch_put_transport{nullptr};
   BatchPutExecutionState batch_put_execution;
@@ -300,19 +302,25 @@ struct DefaultAccessOperator::Impl {
 DefaultAccessOperator::DefaultAccessOperator(AccessOperatorConfig config)
     : impl_(std::make_unique<Impl>(std::move(config))) {}
 
-DefaultAccessOperator::~DefaultAccessOperator() { (void)Shutdown(); }
+DefaultAccessOperator::~DefaultAccessOperator() {
+  if (!Shutdown().ok()) (void)impl_.release();
+}
 
 Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) {
-  if (impl_->initialized) {
+  if (impl_->initialized || impl_->sequential) {
     return InvalidState("AccessOperator has already been initialized");
   }
+  const bool sequential = impl_->config.aiv_batch_get_mode != "direct_read";
+  if (sequential && impl_->config.aiv_batch_get_mode != "gather_read" &&
+      impl_->config.aiv_batch_get_mode != "cpu_push_scatter")
+    return InvalidArgument("unknown AIV BatchGet mode");
   if (remote_region.base == 0 || remote_region.length == 0 ||
       impl_->config.batch_get_kernel_object_path.empty() ||
       impl_->config.npu_core_count == 0 ||
       impl_->config.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->config.jettys_per_core == 0 ||
       impl_->config.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
-      (impl_->config.batch_get_max_inflight_total != 0U &&
+      (!sequential && impl_->config.batch_get_max_inflight_total != 0U &&
        impl_->config.batch_get_max_inflight_total < 2U * impl_->config.npu_core_count)) {
     return InvalidArgument("invalid AccessOperator initialization config");
   }
@@ -353,51 +361,58 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     return InvalidArgument("invalid BatchPut transport configuration");
   }
 #endif
-  if (KvafExecuteBatchGetLoadKernel(
-          impl_->config.batch_get_kernel_object_path.c_str()) !=
-      KVAF_BATCH_GET_SUCCESS) {
-    return Internal("failed to load BatchGet kernel");
-  }
+  if (sequential) {
+    impl_->sequential = std::make_unique<SequentialBatchGet>(impl_->config);
+    const auto status = impl_->sequential->Initialize(remote_region);
+    if (!status.ok()) return status;
+    impl_->remote_region = remote_region;
+  } else {
+    if (KvafExecuteBatchGetLoadKernel(
+            impl_->config.batch_get_kernel_object_path.c_str()) !=
+        KVAF_BATCH_GET_SUCCESS) {
+      return Internal("failed to load BatchGet kernel");
+    }
 
-  KvafBatchGetTransport* transport = nullptr;
-  static_assert(sizeof(impl_->config.peer_local_eids.front()) == 16U,
-                "NPU EID storage must remain packed");
-  const auto* peer_local_eids = reinterpret_cast<const std::uint8_t*>(
-      impl_->config.peer_local_eids.data());
-  const auto peer_local_eid_count =
-      static_cast<std::uint32_t>(impl_->config.peer_local_eids.size());
-  const int32_t result = KvafBatchGetTransportCreateWithPeerLinkMultiEid(
-      reinterpret_cast<void*>(remote_region.base), remote_region.length,
-      impl_->config.npu_core_count, impl_->config.jettys_per_core,
-      impl_->config.peer_link.get(), peer_local_eids, peer_local_eid_count,
-      &transport);
-  if (result != KVAF_BATCH_GET_SUCCESS || transport == nullptr) {
-    return Internal("failed to create reusable BatchGet transport");
-  }
+    KvafBatchGetTransport* transport = nullptr;
+    static_assert(sizeof(impl_->config.peer_local_eids.front()) == 16U,
+                  "NPU EID storage must remain packed");
+    const auto* peer_local_eids = reinterpret_cast<const std::uint8_t*>(
+        impl_->config.peer_local_eids.data());
+    const auto peer_local_eid_count =
+        static_cast<std::uint32_t>(impl_->config.peer_local_eids.size());
+    const int32_t result = KvafBatchGetTransportCreateWithPeerLinkMultiEid(
+        reinterpret_cast<void*>(remote_region.base), remote_region.length,
+        impl_->config.npu_core_count, impl_->config.jettys_per_core,
+        impl_->config.peer_link.get(), peer_local_eids, peer_local_eid_count,
+        &transport);
+    if (result != KVAF_BATCH_GET_SUCCESS || transport == nullptr) {
+      return Internal("failed to create reusable BatchGet transport");
+    }
 
-  BatchGetExecutionState execution;
-  execution.status_bytes = static_cast<std::size_t>(impl_->config.npu_core_count) *
-                           sizeof(KvafBatchGetCoreStatus);
-  execution.queue_state_bytes =
-      static_cast<std::size_t>(impl_->config.npu_core_count) *
-      impl_->config.jettys_per_core *
-      sizeof(KvafBatchGetQueueState);
-  if (aclrtMalloc(&execution.status, execution.status_bytes,
-                  ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
-      aclrtMalloc(&execution.queue_state, execution.queue_state_bytes,
-                  ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
-      aclrtMemset(execution.status, execution.status_bytes, 0,
-                  execution.status_bytes) != ACL_SUCCESS ||
-      aclrtMemset(execution.queue_state, execution.queue_state_bytes, 0,
-                  execution.queue_state_bytes) != ACL_SUCCESS) {
-    if (execution.queue_state != nullptr) (void)aclrtFree(execution.queue_state);
-    if (execution.status != nullptr) (void)aclrtFree(execution.status);
-    KvafBatchGetTransportDestroy(transport);
-    return Internal("failed to allocate internal BatchGet execution state");
+    BatchGetExecutionState execution;
+    execution.status_bytes = static_cast<std::size_t>(impl_->config.npu_core_count) *
+                             sizeof(KvafBatchGetCoreStatus);
+    execution.queue_state_bytes =
+        static_cast<std::size_t>(impl_->config.npu_core_count) *
+        impl_->config.jettys_per_core *
+        sizeof(KvafBatchGetQueueState);
+    if (aclrtMalloc(&execution.status, execution.status_bytes,
+                    ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
+        aclrtMalloc(&execution.queue_state, execution.queue_state_bytes,
+                    ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
+        aclrtMemset(execution.status, execution.status_bytes, 0,
+                    execution.status_bytes) != ACL_SUCCESS ||
+        aclrtMemset(execution.queue_state, execution.queue_state_bytes, 0,
+                    execution.queue_state_bytes) != ACL_SUCCESS) {
+      if (execution.queue_state != nullptr) (void)aclrtFree(execution.queue_state);
+      if (execution.status != nullptr) (void)aclrtFree(execution.status);
+      KvafBatchGetTransportDestroy(transport);
+      return Internal("failed to allocate internal BatchGet execution state");
+    }
+    impl_->remote_region = remote_region;
+    impl_->transport = transport;
+    impl_->execution = execution;
   }
-  impl_->remote_region = remote_region;
-  impl_->transport = transport;
-  impl_->execution = execution;
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   if (!impl_->config.batch_put_kernel_object_path.empty()) {
     if (impl_->config.npu_core_count > KVAF_AIV_BATCH_PUT_MAX_AIV_CORES ||
@@ -454,6 +469,11 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
 }
 
 Status DefaultAccessOperator::Shutdown() {
+  if (impl_->sequential) {
+    auto status = impl_->sequential->Shutdown();
+    if (!status.ok()) return status;
+    impl_->sequential.reset();
+  }
   if (!impl_->initialized) {
     return Status::OK();
   }
@@ -484,6 +504,7 @@ Status DefaultAccessOperator::Shutdown() {
 }
 
 Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
+  if (impl_->sequential) return impl_->sequential->Execute(exec);
   if (!impl_->initialized || impl_->transport == nullptr) {
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
@@ -533,6 +554,7 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
 }
 
 Status DefaultAccessOperator::SetBatchGetKernelProfiling(bool enabled) {
+  if (impl_->sequential) return Status::NotImplemented("direct-read profile is unavailable for sequential modes");
   if (!impl_->initialized || impl_->execution.status == nullptr) {
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
@@ -554,6 +576,7 @@ Status DefaultAccessOperator::SetBatchGetKernelProfiling(bool enabled) {
 
 Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
     std::vector<BatchGetKernelProfile>* profiles) const {
+  if (impl_->sequential) return Status::NotImplemented("direct-read profile is unavailable for sequential modes");
   if (profiles == nullptr) {
     return InvalidArgument("BatchGet kernel profile output must not be null");
   }
@@ -621,6 +644,10 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
 }
 
 Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
+  if (impl_->sequential) {
+    auto status = impl_->sequential->Drain();
+    if (!status.ok()) return status;
+  }
   if (!impl_->initialized) {
     return Status::NotInitialized("AccessOperator has not been initialized");
   }

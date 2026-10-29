@@ -38,6 +38,8 @@ int32_t KvafBatchGetTransportCreateWithPeerLinkMultiEid(
     const uint8_t *peer_local_eids, uint32_t peer_local_eid_count,
     KvafBatchGetTransport **transport);
 void KvafBatchGetTransportDestroy(KvafBatchGetTransport *transport);
+// Stop all queue DMA before unregistering buffers. Retains failed handles for retry.
+int32_t KvafBatchGetTransportQuiesce(KvafBatchGetTransport *transport);
 
 // Acquire registers/caches one caller-owned HBM output range. Re-acquiring
 // the exact (address, bytes) pair returns the same local-buffer handle and
