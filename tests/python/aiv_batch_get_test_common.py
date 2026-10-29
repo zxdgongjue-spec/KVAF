@@ -81,16 +81,6 @@ def run(mode: str) -> int:
     probe = os.environ.get("KVAF_AIV_SCATTER_PROBE", "") if mode == "cpu_push_scatter" else ""
     if probe and probe not in ("done", "flush", "load", "copy"):
         raise ValueError("scatter probe must be done/flush/load/copy")
-    if mode == "cpu_push_scatter":
-        # Reject an old/mistyped module before opening transports or touching NPU.
-        from aiv_kernel_metadata import check_aiv_kernel_metadata
-        try:
-            check_aiv_kernel_metadata(kernel, "KvafScatterBatchGetAivKernelV1")
-        except (OSError, ValueError) as error:
-            raise RuntimeError(f"scatter AIV metadata check failed: {error}; "
-                               "rebuild kvaf_scatter_batch_get_kernel") from error
-        print(f"[KVAF_TEST] AIV_METADATA_OK kernel=KvafScatterBatchGetAivKernelV1 "
-              f"type=K_TYPE_AIV(3) binary={kernel}", flush=True)
     from backend import detect_torch_backend
     from dsa_keys import build_dsa_keys
     from npu_eids import parse_npu_eids

@@ -13,12 +13,8 @@
 #include "cpu_gather_executor.h"
 #include "cpu_push_get_abi.h"
 #include "sequential_batch_get_abi.h"
-// Ascend ELF metadata attributes are not native Mach-O sections. Keep the
-// production declarations, but omit their section placement in the CPU model.
-#define __attribute__(...)
 #include "../access_operator/demo/aiv_batch_get/kernel/execute_scatter_batch_get_aiv.asc"
 #include "../access_operator/demo/aiv_batch_get/kernel/execute_gather_batch_get_aiv.asc"
-#undef __attribute__
 
 namespace {
 using namespace kvaf_scatter;
