@@ -109,7 +109,28 @@ struct FakePullQuery {
   std::uint32_t count{};
   std::uint64_t handle{};
   unsigned calls{};
+  bool clear_config{};
+  unsigned spill_output{};
 } fake_pull_query;
+
+template <class Function> void ExpectDiagnosticFailure(Function action, const char* marker) {
+  bool rejected = false;
+  try { action(); }
+  catch (const std::runtime_error& error) {
+    rejected = true;
+    Require(std::strstr(error.what(), marker) != nullptr, "wrong memory diagnostic failure");
+  }
+  Require(rejected, "memory diagnostic did not reject corruption");
+}
+
+template <class T> void ClobberNativeTail(T* value) {
+  // Touch the helper's actual allocated guard, rather than writing beyond an
+  // allocation or relying on undefined stack adjacency in this test.
+  using Buffer = probe::NativeBuffer<T>;
+  auto* buffer = reinterpret_cast<Buffer*>(reinterpret_cast<std::uint8_t*>(value) -
+    offsetof(Buffer, value));
+  std::memset(buffer->after, 0, 16);
+}
 
 int QueryPullTpFake(urma_context_t* context, probe::TpQuery* config,
                     std::uint32_t* count, probe::TpInfo* info) {
@@ -125,16 +146,25 @@ int QueryPullTpFake(urma_context_t* context, probe::TpQuery* config,
   Require(*count == 1 && info->handle == 0, "pull CTP query outputs not initialized");
   *count = fake.count;
   info->handle = fake.handle;
+  if (fake.clear_config) std::memset(config, 0, sizeof(*config));
+  if (fake.spill_output == 1) ClobberNativeTail(config);
+  if (fake.spill_output == 2) ClobberNativeTail(count);
+  if (fake.spill_output == 3) ClobberNativeTail(info);
   errno = fake.error;
   return fake.rc;
 }
 
-void TestPullCtpQuery() {
-  urma_context_t context{};
+probe::TpQuery PullQueryFixture() {
   probe::TpQuery config{};
   config.flag = 1; config.mode = URMA_TM_RM;
   CopyHex("00000000007f020000100000df0a0b00", config.local, 16);
   CopyHex("00000000003f030000100000df00ab00", config.peer, 16);
+  return config;
+}
+
+void TestPullCtpQuery() {
+  urma_context_t context{};
+  const auto config = PullQueryFixture();
   struct Scenario {
     int rc;
     std::uint32_t count;
@@ -172,6 +202,112 @@ void TestPullCtpQuery() {
       "pull CTP query misclassified its result");
   }
   std::cerr << "PULL_CTP_QUERY_TEST_PASS single_call=1 endpoints_preserved=1 errno_captured=1\n";
+}
+
+struct FakeDeviceQuery {
+  urma_device_t* device{};
+  urma_status_t rc{URMA_SUCCESS};
+  std::uint64_t max_bytes{131072};
+  std::uint32_t max_sge{1};
+  int error{};
+  unsigned calls{};
+  bool spill{};
+} fake_device_query;
+
+urma_status_t QueryDeviceFake(urma_device_t* device, urma_device_attr_t* attributes) {
+  auto& fake = fake_device_query;
+  ++fake.calls;
+  Require(fake.calls == 1 && device == fake.device && attributes, "wrong device query arguments");
+  attributes->dev_cap.max_msg_size = fake.max_bytes;
+  attributes->dev_cap.max_jfs_sge = fake.max_sge;
+  if (fake.spill) ClobberNativeTail(attributes);
+  errno = fake.error;
+  return fake.rc;
+}
+
+void TestNativeMemoryDiagnostics() {
+  probe::NativeBuffer<std::uint64_t> intact;
+  probe::CheckNativeBuffer("fake.intact", intact, 0, 0);
+  intact.before[63] = 0;
+  ExpectDiagnosticFailure([&] { probe::CheckNativeBuffer("fake.leading", intact, 0, 0); },
+    "native ABI output boundary overwritten at fake.leading");
+  probe::NativeBuffer<std::uint64_t> trailing;
+  trailing.after[0] = 0;
+  ExpectDiagnosticFailure([&] { probe::CheckNativeBuffer("fake.trailing", trailing, 0, 0); },
+    "native ABI output boundary overwritten at fake.trailing");
+
+  urma_device_t device{};
+  for (auto bytes : {UINT64_C(32768), UINT64_C(131072)}) {
+    fake_device_query = {};
+    fake_device_query.device = &device;
+    fake_device_query.max_bytes = bytes;
+    const auto limit = probe::QueryDeviceReadLimit(QueryDeviceFake, &device);
+    Require(limit == (bytes == 32768 ? 32768U : 65536U) && fake_device_query.calls == 1,
+      "device READ limit query returned the wrong chunk size");
+  }
+  fake_device_query = {};
+  fake_device_query.device = &device;
+  fake_device_query.rc = URMA_FAIL;
+  fake_device_query.error = EIO;
+  ExpectDiagnosticFailure([&] { (void)probe::QueryDeviceReadLimit(QueryDeviceFake, &device); },
+    "query device");
+  fake_device_query = {};
+  fake_device_query.device = &device;
+  fake_device_query.spill = true;
+  fake_device_query.max_bytes = 0;
+  fake_device_query.max_sge = 0;
+  // Guard corruption must win over the simultaneously invalid capability
+  // fields, proving the helper checks bounds before trusting those fields.
+  ExpectDiagnosticFailure([&] { (void)probe::QueryDeviceReadLimit(QueryDeviceFake, &device); },
+    "native ABI output boundary overwritten at urma_query_device");
+  Require(fake_device_query.calls == 1, "device query retried after an ABI overwrite");
+
+  urma_context_t context{};
+  const auto expected = PullQueryFixture();
+  probe::CheckPullQueryState("decoded", expected, expected);
+  auto cleared = expected;
+  std::memset(&cleared, 0, sizeof(cleared));
+  fake_pull_query = {};
+  ExpectDiagnosticFailure([&] {
+    probe::CheckPullQueryState("after_query_device", cleared, expected);
+    (void)probe::QueryPullCtp(QueryPullTpFake, &context, cleared);
+  }, "pull CTP parameters overwritten at after_query_device");
+  Require(fake_pull_query.calls == 0, "corrupted stage reached the CTP callback");
+  auto changed_peer = expected;
+  changed_peer.peer[15] ^= 1;
+  ExpectDiagnosticFailure([&] {
+    probe::CheckPullQueryState("after_create_jetty", changed_peer, expected);
+  }, "pull CTP parameters overwritten at after_create_jetty");
+
+  ExpectDiagnosticFailure([&] { (void)probe::QueryPullCtp(QueryPullTpFake, &context, cleared); },
+    "invalid or overwritten pull CTP input");
+  Require(fake_pull_query.calls == 0, "invalid CTP input reached the library");
+
+  fake_pull_query = {};
+  fake_pull_query.context = &context;
+  fake_pull_query.config = expected;
+  fake_pull_query.count = 1;
+  fake_pull_query.handle = 0x1234;
+  fake_pull_query.clear_config = true;
+  auto caller_config = expected;
+  const auto result = probe::QueryPullCtp(QueryPullTpFake, &context, caller_config);
+  Require(result.ok() && fake_pull_query.calls == 1 &&
+    std::memcmp(&caller_config, &expected, sizeof(expected)) == 0,
+    "library input mutation changed the caller's CTP query or success result");
+
+  for (unsigned output = 1; output <= 3; ++output) {
+    fake_pull_query = {};
+    fake_pull_query.context = &context;
+    fake_pull_query.config = expected;
+    fake_pull_query.count = 1;
+    fake_pull_query.handle = 0x1234;
+    fake_pull_query.spill_output = output;
+    const char* operations[] = {"urma_get_tp_list.config", "urma_get_tp_list.count", "urma_get_tp_list.info"};
+    ExpectDiagnosticFailure([&] { (void)probe::QueryPullCtp(QueryPullTpFake, &context, expected); },
+      operations[output - 1]);
+    Require(fake_pull_query.calls == 1, "CTP query retried after an ABI overwrite");
+  }
+  std::cerr << "NATIVE_MEMORY_DIAGNOSTIC_TEST_PASS guards_checked=1 stage_checked=1 caller_query_preserved=1\n";
 }
 }
 extern "C" {
@@ -233,6 +369,7 @@ int main() {
     std::cerr << "HARNESS_UNIT_TEST fake_provider=1 profile=plumbing_only hardware_result=UNKNOWN\n";
     TestSourceDescriptor();
     TestPullCtpQuery();
+    TestNativeMemoryDiagnostics();
     allocation_bytes = 3 * kGuard;
     std::vector<std::uint8_t> target(allocation_bytes), source(allocation_bytes);
     urma_context_t ctx{};

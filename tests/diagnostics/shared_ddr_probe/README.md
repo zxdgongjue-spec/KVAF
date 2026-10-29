@@ -238,6 +238,20 @@ flag/mode、容量、API 返回码 `rc`、输出 `count`、`tp` 和即时保存�
 `zero_handle` 表示有条目但 handle 为 0。成功要求 `rc=0`、`count>0` 且 `tp!=0`，
 不能单凭非零 errno 判断失败。查询前清零 errno，避免将先前操作的错误误归到 CTP。
 程序仍只查询配置的 EID 一次，不自动改用资源 EID 或切换 K 的 UB 设备。
+若查询日志中 flag/mode 和双端 EID 全零，不能继续按普通路径不可达判断。
+`DecodeSourceDescriptor` 应构造 flag=1、RM 模式及非零 EID；当前程序在解码后保存独立 heap 快照，
+在 import_seg、query_device、三个队列创建调用后逐次输出 `PULL_CTP_STATE stage=... unchanged=...`。
+首次变化立即失败，绝不重新填回字段继续执行。`PULL_CTP_QUERY_BEGIN` 在实际查询之前打印，
+避免把查询返回后已被破坏的输入快照误认为真实入参。
+
+编译头文件来自下载的 24.12 源码、运行库来自系统 `/usr/lib64`，不能单凭头文件宏认定 ABI 配套。
+特别是 `urma_query_device` 没有输出长度参数；若部署库的 `urma_device_attr_t` 更大，可能覆盖
+按旧头文件分配的调用方存储。程序为该输出以及 CTP config/count/info 分别分配带前后哨兵的
+独立 heap 缓冲，打印 `NATIVE_ABI_GUARD op=... value_bytes=... before_ok=... after_ok=...`。
+检测到边界改写时，在使用返回字段之前立即停止；哨兵填充仅用于定位，不是 ABI 兼容层。
+即使哨兵完整，也不能据此证明所有字段偏移与部署库一致。需要保留首次失败的 stage/op 日志，
+并核对实际库及其配套头文件；不要仅扩容输出结构后宣称兼容。
+
 Decode 的 CTP 成功或 Prefill→K 的查询成功，不能代替验证 K→Prefill 的查询。
 可用全新 K、同一 UB device/EID/case，将 NPU 5 临时作为 Decode（使用它自己的配置 EID）
 做普通通道初始化对照；此时不启动 Prefill，出现 `ARMED` 后等待 round 1 是预期行为。
@@ -259,6 +273,8 @@ host 测试覆盖九组注册视图、先后顺序、同 allocation 校验、跨
 验证配置 EID 与资源 EID 不同但 MR/Jetty 身份一致时可通过，CTP 查询仍保留配置 EID；
 同时拒绝真实资源身份不一致、错误 key 长度/RM 模式、越界、地址溢出及全零 EID。
 CTP 查询回归覆盖成功和三种失败分类、清除陈旧 errno、立即捕获错误及单次调用保留双端 EID。
+内存诊断回归覆盖前后哨兵破坏、query_device 输出超写先于能力字段读取被拒绝、逐阶段查询数据
+损坏、实际查询前拒绝全零入参，以及 CTP 三个输出缓冲越界和库内正常改写 config 本体的区分。
 另用明确标注的 24.12 core 校验模型检查：0xe 拒绝、0xf 接受。数据搬运 fake provider
 只检查测试工具流程，不声明真实 provider 支持这些配置。
 控制测试覆盖二进制布局、碎片响应、错误响应、版本不匹配和数据版本变化。

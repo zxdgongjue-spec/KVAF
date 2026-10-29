@@ -14,6 +14,7 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -190,6 +191,73 @@ std::string SourceEidHex(const std::uint8_t* eid) {
   return result;
 }
 
+// Spare storage catches a larger deployed output layout. It is a diagnostic
+// boundary, not an ABI adapter: any write past the declared value is rejected.
+template <class T> struct NativeBuffer {
+  alignas(T) std::uint8_t before[64];
+  T value{};
+  std::uint8_t after[4096];
+  NativeBuffer() {
+    static_assert(64 % alignof(T) == 0);
+    static_assert(offsetof(NativeBuffer<T>, value) == 64);
+    static_assert(offsetof(NativeBuffer<T>, after) == 64 + sizeof(T));
+    std::fill(std::begin(before), std::end(before), 0xa7);
+    std::fill(std::begin(after), std::end(after), 0xa7);
+  }
+};
+
+template <class T> void CheckNativeBuffer(const char* operation, const NativeBuffer<T>& buffer,
+                                         int rc, int error) {
+  bool before_ok = true, after_ok = true;
+  const char* side = "none";
+  std::ptrdiff_t first_bad = 0;
+  const volatile std::uint8_t* leading = buffer.before;
+  const volatile std::uint8_t* trailing = buffer.after;
+  for (std::size_t i = 0; i < sizeof(buffer.before); ++i) {
+    if (leading[i] != 0xa7) {
+      if (before_ok) { side = "before"; first_bad = static_cast<std::ptrdiff_t>(i) - 64; }
+      before_ok = false;
+    }
+  }
+  for (std::size_t i = 0; i < sizeof(buffer.after); ++i) {
+    if (trailing[i] != 0xa7) {
+      if (before_ok && after_ok) { side = "after"; first_bad = sizeof(T) + i; }
+      after_ok = false;
+    }
+  }
+  std::fprintf(stderr, "NATIVE_ABI_GUARD op=%s value=%p value_bytes=%zu before_ok=%u after_ok=%u "
+    "bad_side=%s first_bad_offset=%td rc=%d errno=%d\n", operation, (const void*)&buffer.value,
+    sizeof(T), unsigned(before_ok), unsigned(after_ok), side, first_bad, rc, error);
+  if (!before_ok || !after_ok)
+    throw std::runtime_error(std::string("native ABI output boundary overwritten at ") + operation);
+}
+
+void CheckPullQueryState(const char* stage, const TpQuery& actual, const TpQuery& expected) {
+  const bool same = std::memcmp(&actual, &expected, sizeof(actual)) == 0;
+  std::fprintf(stderr, "PULL_CTP_STATE stage=%s unchanged=%u query=%p flag=0x%x mode=%u "
+    "local_eid=%s peer_eid=%s\n", stage, unsigned(same), (const void*)&actual, actual.flag,
+    actual.mode, SourceEidHex(actual.local).c_str(), SourceEidHex(actual.peer).c_str());
+  if (!same)
+    throw std::runtime_error(std::string("pull CTP parameters overwritten at ") + stage);
+}
+
+using QueryDeviceFn = urma_status_t (*)(urma_device_t*, urma_device_attr_t*);
+std::uint32_t QueryDeviceReadLimit(QueryDeviceFn query, urma_device_t* device) {
+  auto output = std::make_unique<NativeBuffer<urma_device_attr_t>>();
+  errno = 0;
+  const int rc = query(device, &output->value);
+  const int saved_errno = errno;
+  // Validate storage before trusting any field from an incompatible library.
+  CheckNativeBuffer("urma_query_device", *output, rc, saved_errno);
+  errno = saved_errno;
+  Check(rc == 0, "query device");
+  const auto& capabilities = output->value;
+  const auto limit = static_cast<std::uint32_t>(
+    std::min<std::uint64_t>(65536, capabilities.dev_cap.max_msg_size));
+  Check(limit && capabilities.dev_cap.max_jfs_sge, "invalid device READ limits");
+  return limit;
+}
+
 struct PullCtpResult {
   int rc{};
   std::uint32_t count{};
@@ -205,18 +273,33 @@ struct PullCtpResult {
 };
 
 PullCtpResult QueryPullCtp(GetTp query, urma_context_t* ctx, TpQuery config) {
-  const auto input = config;
-  TpInfo info{};
-  std::uint32_t count = 1;
+  const auto input = std::make_unique<TpQuery>(config);
+  std::fprintf(stderr, "PULL_CTP_QUERY_BEGIN ctx=%p flag=0x%x mode=%u local_eid=%s peer_eid=%s "
+    "config_bytes=%zu count_bytes=%zu info_bytes=%zu\n", (void*)ctx, input->flag, input->mode,
+    SourceEidHex(input->local).c_str(), SourceEidHex(input->peer).c_str(), sizeof(TpQuery),
+    sizeof(std::uint32_t), sizeof(TpInfo));
+  Check(input->flag == 1 && input->mode == URMA_TM_RM &&
+    std::any_of(input->local, input->local + 16, [](std::uint8_t b) { return b != 0; }) &&
+    std::any_of(input->peer, input->peer + 16, [](std::uint8_t b) { return b != 0; }),
+    "invalid or overwritten pull CTP input (see PULL_CTP_QUERY_BEGIN)");
+  auto query_config = std::make_unique<NativeBuffer<TpQuery>>();
+  auto count = std::make_unique<NativeBuffer<std::uint32_t>>();
+  auto info = std::make_unique<NativeBuffer<TpInfo>>();
+  query_config->value = config;
+  count->value = 1;
   errno = 0;
-  const int rc = query(ctx, &config, &count, &info);
+  const int rc = query(ctx, &query_config->value, &count->value, &info->value);
   const int saved_errno = errno;
-  const PullCtpResult result{rc, count, info.handle, saved_errno};
+  CheckNativeBuffer("urma_get_tp_list.config", *query_config, rc, saved_errno);
+  CheckNativeBuffer("urma_get_tp_list.count", *count, rc, saved_errno);
+  CheckNativeBuffer("urma_get_tp_list.info", *info, rc, saved_errno);
+  const PullCtpResult result{rc, count->value, info->value.handle, saved_errno};
+  const bool config_changed = std::memcmp(&query_config->value, input.get(), sizeof(TpQuery)) != 0;
   std::fprintf(stderr, "PULL_CTP_QUERY result=%s ctx=%p flag=0x%x mode=%u "
-    "local_eid=%s peer_eid=%s capacity=1 rc=%d count=%u tp=0x%llx errno=%d\n",
-    result.outcome(), (void*)ctx, input.flag, input.mode,
-    SourceEidHex(input.local).c_str(), SourceEidHex(input.peer).c_str(),
-    result.rc, result.count, (unsigned long long)result.handle, result.error);
+    "local_eid=%s peer_eid=%s capacity=1 rc=%d count=%u tp=0x%llx errno=%d config_changed=%u\n",
+    result.outcome(), (void*)ctx, input->flag, input->mode,
+    SourceEidHex(input->local).c_str(), SourceEidHex(input->peer).c_str(),
+    result.rc, result.count, (unsigned long long)result.handle, result.error, unsigned(config_changed));
   errno = saved_errno;
   return result;
 }
@@ -237,6 +320,11 @@ struct State {
     Check(region && !source && !jetty, "ARM required, or source already connected");
     auto* ctx = region->context;
     auto descriptor = DecodeSourceDescriptor(request, region->bytes, ctx->eid);
+    const auto expected_query = std::make_unique<TpQuery>(descriptor.tp_query);
+    const auto check_query = [&](const char* stage) {
+      CheckPullQueryState(stage, descriptor.tp_query, *expected_query);
+    };
+    check_query("decoded");
     auto& segment = descriptor.segment;
     auto& remote = descriptor.remote;
     std::fprintf(stderr, "SOURCE_DESCRIPTOR route_eid=%s mr_eid=%s jetty_eid=%s source_tp=0x%llx\n",
@@ -247,28 +335,31 @@ struct State {
     import_flags.bs.access = 2;  // remote READ only, no bit 0
     import_flags.bs.mapping = URMA_SEG_NOMAP;
     source = urma_import_seg(ctx, &segment, &token, 0, import_flags);
+    check_query("after_import_seg");
     Check(source, "import HBM segment");
     source_base = request.base;
-    urma_device_attr_t capabilities{};
-    Check(urma_query_device(ctx->dev, &capabilities) == 0, "query device");
-    max_bytes = static_cast<std::uint32_t>(std::min<std::uint64_t>(65536, capabilities.dev_cap.max_msg_size));
-    Check(max_bytes && capabilities.dev_cap.max_jfs_sge, "invalid device READ limits");
+    max_bytes = QueryDeviceReadLimit(urma_query_device, ctx->dev);
+    check_query("after_query_device");
     urma_jfc_cfg_t cq_cfg{}; cq_cfg.depth = 16384;
-    cq = urma_create_jfc(ctx, &cq_cfg); Check(cq, "create pull CQ");
+    cq = urma_create_jfc(ctx, &cq_cfg);
+    check_query("after_create_jfc"); Check(cq, "create pull CQ");
     urma_jfr_cfg_t rq_cfg{};
     rq_cfg.depth = 1024; rq_cfg.trans_mode = URMA_TM_RM; rq_cfg.max_sge = 1;
     rq_cfg.jfc = cq; rq_cfg.token_value.token = request.token;
-    rq = urma_create_jfr(ctx, &rq_cfg); Check(rq, "create pull RQ");
+    rq = urma_create_jfr(ctx, &rq_cfg);
+    check_query("after_create_jfr"); Check(rq, "create pull RQ");
     urma_jetty_cfg_t cfg{};
     cfg.flag.bs.share_jfr = URMA_SHARE_JFR;
     cfg.jfs_cfg.depth = 8192; cfg.jfs_cfg.trans_mode = URMA_TM_RM;
     cfg.jfs_cfg.max_sge = 1; cfg.jfs_cfg.max_rsge = 1;
     cfg.jfs_cfg.priority = 15; cfg.jfs_cfg.rnr_retry = 7; cfg.jfs_cfg.err_timeout = 16;
     cfg.jfs_cfg.jfc = cq; cfg.shared.jfr = rq; cfg.shared.jfc = cq;
-    jetty = urma_create_jetty(ctx, &cfg); Check(jetty, "create pull Jetty");
+    jetty = urma_create_jetty(ctx, &cfg);
+    check_query("after_create_jetty"); Check(jetty, "create pull Jetty");
     auto query = reinterpret_cast<GetTp>(dlsym(RTLD_DEFAULT, "urma_get_tp_list"));
     auto import = reinterpret_cast<ImportJetty>(dlsym(RTLD_DEFAULT, "urma_import_jetty_ex"));
     Check(query && import, "missing deployed expanded CTP APIs");
+    check_query("before_ctp_query");
     const auto ctp = QueryPullCtp(query, ctx, descriptor.tp_query);
     Check(ctp.ok(), "query pull CTP (see PULL_CTP_QUERY)");
     remote.policy = URMA_JETTY_GRP_POLICY_RR; remote.type = URMA_JETTY; remote.tp_type = 1;
