@@ -1,7 +1,8 @@
 #pragma once
 
-// CPU-only shim for executing the actual .asc control flow. It models neither
-// AIV pipeline timing nor DMA/cache visibility; those require CANN/A5 tests.
+// CPU-only shim for executing the actual .asc control flow. It does not model
+// AIV register initialization, pipeline timing, or DMA/cache visibility;
+// those require CANN/A5 tests.
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -42,9 +43,6 @@ struct PendingCopy {
 };
 inline PendingCopy mte2, mte3;
 inline uint64_t mte2_copies{}, mte3_copies{};
-// Coarse contract for state inherited from a preceding operator, not a model
-// of any hardware register encoding or errcode 78. DMA needs initialized state.
-inline bool dma_state_dirty{};
 }
 inline void set_flag(int source, int target, event_t event) {
   if (model_events[source][target][event]) std::abort();
@@ -71,7 +69,6 @@ inline void st_dev(uint32_t value, uint32_t* address, int) {
 }
 
 namespace AscendC {
-inline void InitSocState() { aiv_model::dma_state_dirty = false; }
 template <int pipe> inline void PipeBarrier() {
   static_assert(pipe == PIPE_ALL);
   for (const auto& pipeline : model_events)
@@ -110,7 +107,7 @@ template <typename T>
 void DataCopyPad(const LocalTensor<T>& dst, const GlobalTensor<T>& src,
                  const DataCopyExtParams& p, const DataCopyPadExtParams<T>& pad) {
   const uint32_t padded = (p.blockLen + 31) & ~31U;
-  if (aiv_model::dma_state_dirty || p.blockCount != 1 || p.srcStride || p.dstStride || p.rsv || pad.isPad ||
+  if (p.blockCount != 1 || p.srcStride || p.dstStride || p.rsv || pad.isPad ||
       pad.leftPadding || pad.rightPadding || dst.address_.bufferAddr % 32 ||
       padded > dst.address_.dataLen || aiv_model::mte2.destination ||
       aiv_model::mte3.destination) std::abort();
@@ -121,7 +118,7 @@ void DataCopyPad(const LocalTensor<T>& dst, const GlobalTensor<T>& src,
 template <typename T>
 void DataCopyPad(const GlobalTensor<T>& dst, const LocalTensor<T>& src,
                  const DataCopyExtParams& p) {
-  if (aiv_model::dma_state_dirty || p.blockCount != 1 || p.srcStride || p.dstStride || p.rsv ||
+  if (p.blockCount != 1 || p.srcStride || p.dstStride || p.rsv ||
       src.address_.bufferAddr % 32 || p.blockLen > src.address_.dataLen ||
       aiv_model::mte2.destination || aiv_model::mte3.destination) std::abort();
   aiv_model::mte3 = {reinterpret_cast<uint8_t*>(dst.data),

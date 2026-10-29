@@ -21,9 +21,9 @@ Scatter 的本地 payload 搬运使用 `DataCopyPad<uint8_t>`，通过一个 16 
 完成后才复用缓冲并报告完成；长度按字节给出，UB padding 不写到 output。
 源 GlobalTensor 禁用 L2 cache hint，且不再经 SIMT 读取被 CPU WRITE 更新的
 staging。原实现的 MainScalar cache 刷新不能代替 SIMT cache 刷新。
-Scatter kernel 在入口调用 `InitSocState()`，在退出前调用
-`PipeBarrier<PIPE_ALL>()`；没有 TPipe 的静态 Tensor 写法必须自行初始化和收尾，
-尤其不能假定前一个算子留下的搬运 loop-mode、原子操作等全局状态为默认值。
+Scatter kernel 已按硬件故障定位需要撤掉入口的 `InitSocState()`，保留退出前的
+`PipeBarrier<PIPE_ALL>()` 与原有搬运事件同步；此次只回退入口初始化，
+尚未确认原有 `load` 阶段的 MTE 异常是否消除。
 接口约束见 [GMToUB DataCopyPad](https://asc.gitcode.com/api/SIMD-API/basic_api/memory_vector_compute/data_move/DataCopyPad_GMToUB.html)、
 [UBToGM DataCopyPad](https://asc.gitcode.com/api/SIMD-API/basic_api/memory_vector_compute/data_move/DataCopyPad_UBToGM.html) 和
 [SIMD/SIMT 内存层次](https://asc.gitcode.com/guide/programming_guide/advanced_programming/advanced_ai_core_programming_model/simd_simt_hybrid_programming/memory_hierarchy.html)。
@@ -31,7 +31,7 @@ Scatter kernel 在入口调用 `InitSocState()`，在退出前调用
 Gather 的控制与数据队列分开，每核固定两条 Jetty。可配置 1～6 个本地 SGE，
 每条 READ 的总长度最多 64 KiB，按 64 B WQEBB 处理变长 WQE 和 SQ 回绕。
 Gather 只使用标量 GM 访问、缓存操作与 USER_CTL 队列，不使用 LocalTensor
-或 MTE payload 拷贝；其入口不调用 scatter 的 `InitSocState()`，退出不附加
+或 MTE payload 拷贝；其入口不调用 `InitSocState()`，退出不附加
 `PipeBarrier<PIPE_ALL>()`，恢复此前通过硬件测试时的执行方式。
 阶段内部批量提交，只在物理 SQ/WR 容量不足或阶段结束时 drain；
 `batch_get_max_inflight_total` 仅对原 `direct_read` 生效。
@@ -227,15 +227,16 @@ probe、写入和 access table 准备已完成，但 `gather_read` 的第一次
 
 之前通过 1、3、8 核测试的 gather 路径没有 `InitSocState()` 和
 `PipeBarrier<PIPE_ALL>()`。它们在 `bc5aad5` 为 scatter 的静态 LocalTensor
-搬运加入共用入口，随后被保留在拆分后的两个 kernel 中。当前只从 gather
+搬运加入共用入口，随后被保留在拆分后的两个 kernel 中。`d949503` 只从 gather
 移除这两项，保留空批次真实 launch、输入/状态缓存处理和原有队列逻辑。
-scatter 的代码与诊断路径保持原样。
+该提交未改变 scatter 的代码与诊断路径。
 
 模型增加 1、3、8 核及 SGL=1/6 的首批为空、随后非空序列，检查空批次状态
 完成、output guard 和 SQ/CQ 不推进，后续请求仍能得到正确数据。
 模型不能复现 CANN 生成的设备指令；当前日志也没有对应的 errcode、
-fixedPCOffset 或 fault kernel name，因此这是针对新增入口操作的回退验证，
-尚不能认定具体故障指令或宣称 507015 已在硬件上修复。
+fixedPCOffset 或 fault kernel name。用户随后确认上述修改后的独立 gather
+测试成功（所给命令为 1 核）；入口回退已有硬件反馈，但不能单独认定是哪项
+操作或哪条指令导致了异常。
 
 更新后只需重编译 gather kernel，再运行独立测试（沿用现有 peer 配置）：
 
@@ -246,6 +247,31 @@ KVAF_RUN_NPU_TESTS=1 DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 \
   KVAF_BATCH_GET_KERNEL="$PWD/build-npu/bin/kvaf_gather_batch_get_kernels.o" \
   python tests/python/test_aiv_gather_batch_get.py
 ```
+
+## Scatter 入口初始化回退
+
+在 gather 回退通过后，按用户要求单独撤掉 scatter 入口的 `InitSocState()`。
+保留 `PipeBarrier<PIPE_ALL>()`、S→MTE2、MTE2→MTE3、MTE2→S 和 MTE3→S
+事件同步，DataCopyPad 参数、UB 配置、notify/done 协议和四个探针均保持不变。
+此次没有改用 TPipe，也没有增加开关或流水。
+
+此前模型用 `dma_state_dirty` 布尔量强制要求先调用初始化再搬运，它并不模拟
+实际寄存器或设备指令。此次同时撤掉这项人为门禁，模型继续检查拷贝参数、
+UB 范围、异步搬运依赖、缓冲复用和输出内容；模型通过不代表硬件初始化状态
+已验证。原来的 MTE 异常是否仍然存在，需要用新二进制复测。
+
+沿用现有 CPU 服务和 peer 配置，只需重编译 scatter kernel，先测试 `load`：
+
+```bash
+git pull --ff-only
+cmake --build build-npu --target kvaf_scatter_batch_get_kernel -j
+KVAF_RUN_NPU_TESTS=1 DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 \
+  KVAF_AIV_SCATTER_PROBE=load \
+  KVAF_BATCH_GET_KERNEL="$PWD/build-npu/bin/kvaf_scatter_batch_get_kernels.o" \
+  python -u tests/python/test_aiv_scatter_batch_get.py
+```
+
+`load` 通过后再测 `copy`，然后清空探针运行完整 scatter 回归。
 
 ## Scatter 507015 的分段定位
 
@@ -343,12 +369,12 @@ payload 的 UB→GM。首个 staging 源地址按参数计算为
 要求入口初始化、结束前执行全流水屏障；
 [InitSocState 说明](https://asc.gitcode.com/api/SIMD-API/basic_api/tool_interface/system_init/InitSocState.html)
 列出 950 AIV 的初始化内容包含 loop-mode、原子操作和 CTRL 等状态。
-现已补齐入口初始化及退出屏障，原有 DataCopyPad 参数、同步和四个检查点保持不变，
-先用同一 `load` 用例验证此修正，不再增加同步对照开关。
+当时据此补齐了入口初始化及退出屏障，原有 DataCopyPad 参数、同步和四个
+检查点保持不变。该入口初始化现已撤回，见上文回退记录。
 
-遗漏初始化是已确认的代码缺陷，但尚未证明它就是此次 errcode 78 的根因。
-本地模型在每次 launch/core 前模拟被其他算子改变的 DMA 状态，验证 kernel
-会先初始化再搬运；模型不解码真实 MTE 寄存器，也不模拟硬件错误码 78。
+当时根据静态 Tensor 的接口约束补充初始化，但尚未证明它就是此次 errcode 78
+的根因。模型曾在每次 launch/core 前设置一个模拟 DMA 状态标记；这一抽象
+不能验证真实 MTE 寄存器或硬件错误码 78，现已随入口初始化一起撤回。
 
 重编译后依次复测 `KVAF_AIV_SCATTER_PROBE=load`、`copy`，均完成后清空开关
 跑完整 scatter 回归。若 `load` 仍失败，应保留新 `.o` 和此次异常摘要，并核对
