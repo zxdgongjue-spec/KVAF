@@ -13,8 +13,9 @@
 
 namespace {
 std::vector<std::function<void()>> work;
-int allocations{}, refs{}, launches{}, completed{}, stopped{}, quiesced{};
+int allocations{}, refs{}, launches{}, completed{}, stopped{}, quiesced{}, hccp_refs{}, push_stopped{};
 bool fail_sync{}, fail_copy{}, fail_quiesce{}, fail_enable{}, capturing{};
+bool old_probe_kernel{}, wrong_probe_phase{};
 uint64_t kernel_result{};
 std::vector<uint64_t> sequences;
 }
@@ -45,12 +46,16 @@ extern "C" int32_t KvafSequentialBatchGetLaunch(const KvafSequentialBatchGetArgs
   assert(completed == launches);
   const auto args = *a;
   ++launches; sequences.push_back(a->sequence);
-  const auto result = kernel_result;
+  const auto result = args.scatter_probe && !old_probe_kernel && !kernel_result ?
+      uint64_t(KVAF_SEQ_PROBE_COMPLETE) : kernel_result;
+  const auto phase = result == KVAF_SEQ_PROBE_COMPLETE ?
+      uint64_t(KVAF_SEQ_AFTER_DONE) + args.scatter_probe - 1 + wrong_probe_phase :
+      uint64_t(result ? KVAF_SEQ_WAIT_REMOTE : KVAF_SEQ_COMPLETE);
   work.push_back([=] {
     auto* status = reinterpret_cast<KvafSequentialStatus*>(args.request.core_status);
     for (uint32_t i = 0; i < args.request.block_count; ++i)
       status[i] = {KVAF_SEQ_STATUS_MAGIC, args.sequence, result,
-                   result ? KVAF_SEQ_WAIT_REMOTE : KVAF_SEQ_COMPLETE, 0, 0, 0, 0};
+                   phase, 0, 0, 0, 0};
     ++completed;
   }); return 0;
 }
@@ -73,7 +78,7 @@ extern "C" void KvafBatchGetTransportDestroy(KvafBatchGetTransport* t) { delete 
 namespace kvaf::peer {
 PeerLink::PeerLink(std::string a) : address_(std::move(a)) {}
 Status PeerLink::LookupRegion(uint64_t base, PeerRegion* r) const {
-  *r = {}; r->base = base; r->length = 16 * 1024 * 1024; return Status::OK();
+  *r = {}; r->base = base; r->length = 16 * 1024 * 1024; r->token_value = 3; return Status::OK();
 }
 Status PeerLink::EnableGatherLanes(uint64_t, uint64_t, uint32_t) const {
   return fail_enable ? Status::Internal("lost enable response") : Status::OK();
@@ -81,22 +86,52 @@ Status PeerLink::EnableGatherLanes(uint64_t, uint64_t, uint32_t) const {
 Status PeerLink::StopGatherLanes(uint64_t) const { assert(work.empty()); ++stopped; return Status::OK(); }
 Status PeerLink::OpenCpuPushGet(uint64_t, OpenCpuPushGetRequest, OpenCpuPushGetResponse*) const { return Status::OK(); }
 Status PeerLink::StartCpuPushGet(uint64_t) const { return Status::OK(); }
-Status PeerLink::StopCpuPushGet(uint64_t) const { return Status::OK(); }
+Status PeerLink::StopCpuPushGet(uint64_t) const { assert(work.empty()); ++push_stopped; return Status::OK(); }
 }
 namespace kvaf::direct_hccp {
-bool LoadDirectHccp(DirectHccpApi*) { return false; }
+void* Hold() { ++hccp_refs; return new int; }
+int Release(void* p) { assert(p && hccp_refs); --hccp_refs; delete static_cast<int*>(p); return 0; }
+bool LoadDirectHccp(DirectHccpApi* api) {
+  api->ctx_init = [](CtxInitCfg*, CtxInitAttr*, void** out) { *out = Hold(); return 0; };
+  api->ctx_deinit = Release;
+  api->token_alloc = [](void*, TokenId*, void** out) { *out = Hold(); return 0; };
+  api->token_free = [](void*, void* handle) { return Release(handle); };
+  api->lmem_register = [](void*, MrRegInfo* mr, void** out) {
+    *out = Hold(); mr->out.key.size = 48;
+    std::memcpy(mr->out.key.value + 20, &mr->in.mem.addr, 8);
+    std::memcpy(mr->out.key.value + 32, &mr->in.mem.size, 8);
+    return 0;
+  };
+  api->lmem_unregister = [](void*, void* handle) { return Release(handle); };
+  api->cq_create = [](void*, CqInfo*, void** out) { *out = Hold(); return 0; };
+  api->cq_destroy = [](void*, void* handle) { return Release(handle); };
+  api->qp_create = [](void*, QpCreateAttr*, QpCreateInfo* info, void** out) {
+    *out = Hold(); info->key.size = 32; return 0;
+  };
+  api->qp_destroy = Release;
+  api->qp_unimport = [](void*, void* handle) { return Release(handle); };
+  return true;
+}
 void CloseDirectHccp(DirectHccpApi*) {}
-bool GetCurrentNpuPhysicalDeviceId(uint32_t*) { return false; }
-bool AcquireDirectHccpSession(uint32_t, uint32_t, DirectHccpSession**) { return false; }
-void ReleaseDirectHccpSession(DirectHccpSession*) {}
+bool GetCurrentNpuPhysicalDeviceId(uint32_t* device) { *device = 0; return true; }
+bool AcquireDirectHccpSession(uint32_t, uint32_t, DirectHccpSession** out) {
+  *out = reinterpret_cast<DirectHccpSession*>(Hold()); return true;
+}
+void ReleaseDirectHccpSession(DirectHccpSession* session) { Release(session); }
 bool GetPeerTp(const DirectHccpApi&, void*, const std::array<uint8_t, kEidBytes>&,
-               const std::array<uint8_t, kEidBytes>&, const char*, uint64_t*) { return false; }
+               const std::array<uint8_t, kEidBytes>&, const char*, uint64_t* tp) {
+  assert(reinterpret_cast<uintptr_t>(tp) % alignof(uint64_t) == 0);
+  *tp = 1; return true;
+}
 bool ImportPeerJetty(const DirectHccpApi&, void*, const uint8_t*, uint32_t, uint32_t,
-                     uint64_t, uint64_t, uint32_t, uint32_t, const char*, QpImportInfoT*, void**) { return false; }
+                     uint64_t, uint64_t, uint32_t, uint32_t, const char*, QpImportInfoT*, void** out) {
+  *out = Hold(); return true;
+}
 }
 
 int main() {
   using namespace kvaf;
+  unsetenv("KVAF_AIV_SCATTER_PROBE");
   AccessOperatorConfig config;
   config.aiv_batch_get_mode = "gather_read"; config.batch_get_token_bytes = 16;
   config.npu_core_count = 3; config.peer_link = std::make_shared<peer::PeerLink>("test");
@@ -170,5 +205,55 @@ int main() {
     assert(owner.Shutdown().ok()); kernel_result = 0;
   }
   assert(stopped == 6 && quiesced == 6);
+  {
+    setenv("KVAF_AIV_SCATTER_PROBE", "done", 1);
+    SequentialBatchGet owner(config);
+    assert(owner.Initialize(region).code() == StatusCode::kInvalidArgument);
+    assert(!allocations && !hccp_refs);
+  }
+  config.aiv_batch_get_mode = "cpu_push_scatter";
+  {
+    setenv("KVAF_AIV_SCATTER_PROBE", "typo", 1);
+    SequentialBatchGet owner(config);
+    assert(owner.Initialize(region).code() == StatusCode::kInvalidArgument);
+    assert(!allocations && !hccp_refs);
+  }
+  for (const char* probe : {"done", "flush", "load", "copy"}) {
+    setenv("KVAF_AIV_SCATTER_PROBE", probe, 1);
+    SequentialBatchGet owner(config); assert(owner.Initialize(region).ok());
+    const auto before = launches;
+    exec.execution.synchronize = false;
+    assert(owner.Execute(exec).code() == StatusCode::kInvalidArgument && launches == before);
+    exec.execution.synchronize = true;
+    for (uint32_t i = 0; i < 2; ++i) {
+      const auto result = owner.Execute(exec);
+      assert(result.code() == StatusCode::kNotImplemented); // Never ordinary success.
+      assert(result.message().find(std::string("[KVAF_AIV_SCATTER_PROBE_COMPLETE] stage=") + probe + " ") == 0);
+      assert(owner.Drain().ok()); // The observed diagnostic leaves no pending work.
+    }
+    assert(owner.Shutdown().ok()); assert(!refs && !allocations && !hccp_refs);
+  }
+  for (uint32_t mismatch = 0; mismatch < 3; ++mismatch) {
+    SequentialBatchGet owner(config); assert(owner.Initialize(region).ok());
+    old_probe_kernel = mismatch == 0; wrong_probe_phase = mismatch == 1;
+    kernel_result = mismatch == 2 ? KVAF_SEQ_TIMEOUT : KVAF_SEQ_OK;
+    const auto result = owner.Execute(exec);
+    assert(result.code() == StatusCode::kInternal);
+    assert(result.message().find("[KVAF_AIV_SCATTER_PROBE_COMPLETE]") == std::string::npos);
+    assert(result.message().find("expected_result=6") != std::string::npos);
+    assert(owner.Shutdown().ok()); assert(!refs && !allocations && !hccp_refs);
+    old_probe_kernel = wrong_probe_phase = false; kernel_result = 0;
+  }
+  {
+    SequentialBatchGet owner(config); assert(owner.Initialize(region).ok());
+    fail_sync = true;
+    const auto result = owner.Execute(exec);
+    assert(result.code() == StatusCode::kDeviceError && result.message().find("probe=copy") != std::string::npos);
+    assert(!owner.Shutdown().ok() && allocations && hccp_refs);
+    fail_sync = false; assert(owner.Shutdown().ok());
+    assert(!refs && !allocations && !hccp_refs);
+  }
+  assert(push_stopped == 8);
+  unsetenv("KVAF_AIV_SCATTER_PROBE");
   std::cout << "sequential Host lifecycle: PASS\n";
 }

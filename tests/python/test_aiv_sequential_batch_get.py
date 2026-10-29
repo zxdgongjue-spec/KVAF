@@ -48,6 +48,19 @@ def shutdown_runtime(runtime) -> None:
                   file=sys.stderr, flush=True)
 
 
+def expect_scatter_probe(call, stage: str) -> None:
+    """Only accept an acknowledged checkpoint, never a device/transport failure."""
+    marker = f"[KVAF_AIV_SCATTER_PROBE_COMPLETE] stage={stage} "
+    try:
+        call()
+    except RuntimeError as error:
+        if not str(error).startswith(marker):
+            raise
+        print(str(error), flush=True)
+    else:
+        raise AssertionError("scatter probe returned ordinary success; rebuild Host and kernel together")
+
+
 def main() -> int:
     if os.environ.get("KVAF_RUN_NPU_TESTS") != "1":
         print("SKIP: set KVAF_RUN_NPU_TESTS=1 on the A5/CANN target")
@@ -57,6 +70,11 @@ def main() -> int:
     except ValueError as error:
         print(f"FAIL: {error}", file=sys.stderr)
         return 2
+    probe = os.environ.get("KVAF_AIV_SCATTER_PROBE", "")
+    modes = os.environ.get("KVAF_AIV_BATCH_GET_MODES", "cpu_push_scatter,gather_read").split(",")
+    assert all(mode in ("cpu_push_scatter", "gather_read") for mode in modes)
+    if probe and (probe not in ("done", "flush", "load", "copy") or modes != ["cpu_push_scatter"]):
+        raise ValueError("scatter probe must be done/flush/load/copy with KVAF_AIV_BATCH_GET_MODES=cpu_push_scatter")
     from backend import detect_torch_backend
     from dsa_keys import build_dsa_keys
     from npu_eids import parse_npu_eids
@@ -67,8 +85,6 @@ def main() -> int:
         raise RuntimeError("hardware test was requested but NPU Runtime is unavailable")
     torch = backend.torch
     endpoint = os.environ["KVAF_CPU_SERVICE_ADDR"]
-    modes = os.environ.get("KVAF_AIV_BATCH_GET_MODES", "cpu_push_scatter,gather_read").split(",")
-    assert all(mode in ("cpu_push_scatter", "gather_read") for mode in modes)
     cores = int(os.environ.get("KVAF_NPU_CORE_COUNT", "1"))
     token = int(os.environ.get("KVAF_NPU_TOKEN_BYTES", "656"))
     capacity = int(os.environ.get("KVAF_NPU_REQUESTS", "8193"))
@@ -86,6 +102,10 @@ def main() -> int:
     keys = build_dsa_keys(blocks, q_capacity=blocks)
     counts = sorted({0, 1, min(7, capacity), min(19, capacity), capacity})
     counts += list(reversed(counts))
+    if probe:
+        # One nonempty request per participating core; keep normal allocation and
+        # output placement. Empty requests cannot establish a checkpoint.
+        counts = [min(cores, capacity)]
     for mode in modes:
         runtime = kvaf.NpuRuntime(
             kernel, token, tokens_per_block, device_id=device_id,
@@ -122,17 +142,28 @@ def main() -> int:
                 count = torch.tensor([active], dtype=torch.int32, device=device)
                 output = outputs[epoch % 2]
                 output.fill_(0xAD)
-                kwargs = dict(synchronize=bool(epoch % 2))
-                if epoch % 2:
+                kwargs = dict(synchronize=bool(probe) or bool(epoch % 2))
+                if probe:
+                    expect_scatter_probe(lambda: runtime.batch_get(
+                        view, indices, offsets, count, rows, output, **kwargs), probe)
+                elif epoch % 2:
                     runtime.batch_get(view, indices, offsets, count, rows, output, **kwargs)
                 else:
                     runtime.batch_get(view.addresses, view.valid, indices, offsets,
                                       count, rows, output, **kwargs)
                 torch.npu.synchronize()
                 expected = torch.full_like(output.cpu(), 0xAD)
-                src_rows = index_cpu[:active].long() * 4 + offset_cpu[:active].long() // token
-                expected[row_cpu[:active].long()] = source_cpu[src_rows]
+                if not probe or probe == "copy":
+                    src_rows = index_cpu[:active].long() * 4 + offset_cpu[:active].long() // token
+                    expected[row_cpu[:active].long()] = source_cpu[src_rows]
                 assert torch.equal(output.cpu(), expected), (mode, cores, token, active, epoch)
+
+            if probe:
+                runtime.shutdown()
+                output_check = "verified" if probe == "copy" else "unchanged"
+                print(f"PROBE_COMPLETE: stage={probe} cores={cores} token_bytes={token} "
+                      f"counts={counts} output={output_check} (not a full regression PASS)", flush=True)
+                continue
 
             # Enqueue on two caller streams without an intervening caller sync.
             # The owner must drain the first request before reusing workspace.

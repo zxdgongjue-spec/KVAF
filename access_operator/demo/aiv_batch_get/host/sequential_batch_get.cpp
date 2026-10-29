@@ -9,6 +9,8 @@
 #include <acl/acl.h>
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -19,6 +21,24 @@ namespace d = direct_hccp;
 namespace {
 Status Error(const char* what) { return Status::Internal(std::string("AIV sequential BatchGet: ") + what); }
 uint64_t Ptr(const void* p) { return reinterpret_cast<uint64_t>(p); }
+const char* ProbeName(uint32_t probe) {
+  switch (probe) {
+    case KVAF_SEQ_PROBE_DONE: return "done";
+    case KVAF_SEQ_PROBE_FLUSH: return "flush";
+    case KVAF_SEQ_PROBE_LOAD: return "load";
+    case KVAF_SEQ_PROBE_COPY: return "copy";
+    default: return "none";
+  }
+}
+uint64_t ProbePhase(uint32_t probe) {
+  switch (probe) {
+    case KVAF_SEQ_PROBE_DONE: return KVAF_SEQ_AFTER_DONE;
+    case KVAF_SEQ_PROBE_FLUSH: return KVAF_SEQ_AFTER_FLUSH;
+    case KVAF_SEQ_PROBE_LOAD: return KVAF_SEQ_AFTER_LOAD;
+    case KVAF_SEQ_PROBE_COPY: return KVAF_SEQ_AFTER_COPY;
+    default: return KVAF_SEQ_COMPLETE;
+  }
+}
 // The exported segment is the public 48-byte urma_seg_t wire ABI; no liburma is
 // loaded on the NPU Host or AIV. ubva.va is packed at byte 20, len at byte 32.
 constexpr uint32_t kSegmentBytes = 48;
@@ -89,7 +109,8 @@ struct SequentialBatchGet::Impl {
   Status AclFailure(const char* phase, aclError code) const {
     return Status::DeviceError("AIV sequential BatchGet: mode=" + config.aiv_batch_get_mode +
         " sequence=" + std::to_string(sequence) + " phase=" + phase +
-        " acl=" + std::to_string(code) + "; resources retained");
+        " acl=" + std::to_string(code) + " probe=" + ProbeName(args.scatter_probe) +
+        "; resources retained");
   }
 
   Status Drain() {
@@ -106,19 +127,30 @@ struct SequentialBatchGet::Impl {
     }
     pending = nullptr;
     const auto* statuses = static_cast<const KvafSequentialStatus*>(status_host);
+    const uint64_t expected_result = args.scatter_probe ? KVAF_SEQ_PROBE_COMPLETE : KVAF_SEQ_OK;
+    const uint64_t expected_phase = ProbePhase(args.scatter_probe);
     for (uint32_t i = 0; i < config.npu_core_count; ++i) {
       const auto& s = statuses[i];
-      if (s.magic != KVAF_SEQ_STATUS_MAGIC || s.sequence != sequence || s.result != KVAF_SEQ_OK ||
-          s.phase != KVAF_SEQ_COMPLETE) {
+      if (s.magic != KVAF_SEQ_STATUS_MAGIC || s.sequence != sequence || s.result != expected_result ||
+          s.phase != expected_phase) {
         failed = true;
         return Status::Internal("AIV sequential BatchGet worker=" + std::to_string(i) +
             " sequence=" + std::to_string(sequence) + " observed_sequence=" +
             std::to_string(s.sequence) + " phase=" + std::to_string(s.phase) +
-            " result=" + std::to_string(s.result));
+            " result=" + std::to_string(s.result) + " probe=" + ProbeName(args.scatter_probe) +
+            " expected_phase=" + std::to_string(expected_phase) +
+            " expected_result=" + std::to_string(expected_result));
       }
     }
     if (output_buffer) KvafBatchGetLocalBufferRelease(output_buffer);
     output_buffer = nullptr;
+    if (args.scatter_probe) {
+      // Prefix probes do not fill output. Even the full-copy probe uses this
+      // marker, so ordinary callers cannot mistake a diagnostic for normal work.
+      return Status::NotImplemented("[KVAF_AIV_SCATTER_PROBE_COMPLETE] stage=" +
+          std::string(ProbeName(args.scatter_probe)) + " sequence=" + std::to_string(sequence) +
+          " cores=" + std::to_string(config.npu_core_count));
+    }
     return Status::OK();
   }
 
@@ -159,8 +191,11 @@ struct SequentialBatchGet::Impl {
     open.token_bytes = config.batch_get_token_bytes; open.workers = config.npu_core_count;
     std::copy(config.peer_local_eid.begin(), config.peer_local_eid.end(), open.eid);
     std::memcpy(open.segment, mr.out.key.value, kSegmentBytes);
-    if (!d::GetPeerTp(api, context, config.peer_local_eid, peer.eid, "aiv_scatter", &open.npu_tp))
+    // The wire request is packed; do not pass an unaligned field as uint64_t*.
+    uint64_t npu_tp = 0;
+    if (!d::GetPeerTp(api, context, config.peer_local_eid, peer.eid, "aiv_scatter", &npu_tp))
       return Error("query scatter TP");
+    open.npu_tp = npu_tp;
     for (uint32_t q = 0; q < 4; ++q) {
       channels[q] = std::make_unique<d::TargetChannel>(api, context);
       auto result = channels[q]->Initialize(token, peer.token_value, 1024, 1024, 16384);
@@ -278,6 +313,14 @@ Status SequentialBatchGet::Initialize(const RemoteRegionDesc& region) {
       (s.config.aiv_batch_get_mode != "cpu_push_scatter" && s.config.aiv_batch_get_mode != "gather_read") ||
       s.config.peer_local_eids.size() > 1)
     return Status::InvalidArgument("invalid sequential BatchGet configuration");
+  const char* probe = std::getenv("KVAF_AIV_SCATTER_PROBE");
+  if (probe && *probe) {
+    if (!s.Push()) return Status::InvalidArgument("KVAF_AIV_SCATTER_PROBE requires cpu_push_scatter");
+    for (uint32_t value = KVAF_SEQ_PROBE_DONE; value <= KVAF_SEQ_PROBE_COPY; ++value)
+      if (std::strcmp(probe, ProbeName(value)) == 0) s.args.scatter_probe = value;
+    if (!s.args.scatter_probe)
+      return Status::InvalidArgument("KVAF_AIV_SCATTER_PROBE must be done, flush, load or copy");
+  }
   s.region = region;
   if (s.config.peer_local_eids.size() == 1) s.config.peer_local_eid = s.config.peer_local_eids.front();
   peer::PeerRegion peer;
@@ -316,6 +359,8 @@ Status SequentialBatchGet::Execute(const BatchGetExecRequest& exec) {
     return Error("query stream capture state");
   if (capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE)
     return Status::NotImplemented("sequential BatchGet supports eager execution only");
+  if (s.args.scatter_probe && !exec.execution.synchronize)
+    return Status::InvalidArgument("scatter probes require synchronize=True");
   auto result = s.Drain();
   if (!result.ok()) return result;
   auto args = s.args;
@@ -327,6 +372,12 @@ Status SequentialBatchGet::Execute(const BatchGetExecRequest& exec) {
     return Error("register output");
   args.request.core_status = Ptr(s.status_device); args.request.queue_state = Ptr(s.queues);
   args.sequence = ++s.sequence;
+  if (args.scatter_probe) {
+    std::fprintf(stderr, "[KVAF_AIV_SCATTER_PROBE_BEGIN] stage=%s sequence=%llu cores=%u token_bytes=%u\n",
+                 ProbeName(args.scatter_probe), static_cast<unsigned long long>(args.sequence),
+                 args.request.block_count, args.request.token_bytes);
+    std::fflush(stderr);
+  }
   s.pending = static_cast<aclrtStream>(exec.execution.stream);
   if (aclrtMemsetAsync(s.status_device, s.StatusBytes(), 0, s.StatusBytes(), s.pending) != ACL_SUCCESS ||
       KvafSequentialBatchGetLaunch(&args, s.pending)) {

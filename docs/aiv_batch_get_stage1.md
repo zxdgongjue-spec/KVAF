@@ -176,6 +176,85 @@ payload 和 done 的 CQ 回收，回到下一轮 notify READ；不要把这个�
 具体哪条指令违反约束。DataCopyPad 改动修正了 payload 缓存可见性并替换裸搬运
 路径，但在硬件复测/指令核对前，不将它视为已证实的 errcode 259 根因修复。
 
+## Scatter 507015 的分段定位
+
+用户已反馈 `gather_read` 在 1、3、8 核通过。Gather 和 scatter 使用同一个
+`KvafSequentialBatchGetAivKernelV1`，但走不同分支；gather 不经过 scatter 的
+HBM done 轮询和本地 `CopyPayload`，所以这些部分仍需单独定位。
+
+新增 scatter Host 模型还发现：packed 的 open 请求中，`npu_tp` 字段的地址
+不满足 `uint64_t*` 对齐要求。现改为先查询到对齐的局部变量，再赋值到协议
+字段，UBSan 可复现并验证此修正。这是 Host 初始化问题，尚无证据将它与
+AIV kernel 的 507015/errcode 259 联系起来。
+
+`KVAF_AIV_SCATTER_PROBE` 提供同一 kernel 的四个检查点。每次只运行一个非空
+批次，保留真实的 descriptor/notify、CPU payload WRITE 和 done 协议；不能
+用 CPU 侧 WRITE CQ 成功代替 AIV 读到本轮 done 的证明。
+
+| 值 | AIV 执行到哪里 | Python 检查 |
+| --- | --- | --- |
+| `done` | 确认本轮 done 的 sequence/status，随后返回 | output 全部保持 guard |
+| `flush` | 再执行输出行寻址、UB tensor 初始化和 staging 的 scalar cache 处理 | output 全部保持 guard，没有 payload DMA |
+| `load` | 再执行参数设置、事件同步和 GM→UB，等待 MTE2 完成 | output 全部保持 guard，没有 MTE3 写出 |
+| `copy` | 完整执行 GM→UB→GM 并等待 MTE3 完成 | 精确比较 payload 和所有 guard |
+
+`load` 为安全返回额外使用 MTE2→S 同步；它验证读取阶段及其诊断收尾，
+不提供 UB 数据正确性的证明。数据正确性由 `copy` 的逐字节比较验证。
+各探针使用相同的请求形状；单核默认 active=1、token=656 B，保留普通回归的
+8193 请求容量和输出行位置。多核时 active=min(cores, capacity)。
+
+先在 NPU 端更新并重编译 Host 和 kernel，保留前文的 Python/kernel/CPU 地址
+环境变量。本次诊断开关不修改 CPU 协议，CPU 端可继续使用已匹配分支的服务。
+
+```bash
+git pull --ff-only
+cmake --build build-npu -j
+export PYTHONPATH="$PWD/build-npu/python"
+
+# Bash：每个检查点使用独立进程，首次失败就停下，日志同时留存。
+set -o pipefail
+for stage in done flush load copy; do
+  KVAF_RUN_NPU_TESTS=1 DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 KVAF_NPU_TOKEN_BYTES=656 \
+    KVAF_AIV_BATCH_GET_MODES=cpu_push_scatter KVAF_AIV_SCATTER_PROBE="$stage" \
+    python -u tests/python/test_aiv_sequential_batch_get.py 2>&1 | tee "scatter-${stage}.log"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    break
+  fi
+done
+```
+
+完成检查点会打印 `[KVAF_AIV_SCATTER_PROBE_COMPLETE] stage=...`，验证 output
+和正常 shutdown 后打印 `PROBE_COMPLETE: ...`，不打印普通回归的 `PASS`。
+实现使用原 ABI 的 reserved word，参数总长仍是 232 B。Host 必须核对每核的
+magic、sequence、专用 result 和 phase，旧 kernel 忽略该字段时会明确失败。
+探针要求 `synchronize=True`，不允许异步普通成功；普通调用者会收到明确的
+诊断异常，只有诊断脚本识别这个完成标记。空批次不能证明检查点已执行，因而
+在探针模式下被拒绝。
+
+按第一个失败的检查点缩小范围：
+
+- `done` 就失败：尚不能证明 AIV 已读到 done，继续检查参数/描述符、notify、
+  done 轮询和状态写回，结合该次 CPU 日志与 Ascend 异常。
+- `done` 完成、`flush` 失败：优先检查输出行寻址、UB 初始化及 staging cache 操作。
+- `flush` 完成、`load` 失败：优先检查 GM→UB 参数、cache hint、事件同步与诊断收尾。
+- `load` 完成、`copy` 失败：优先检查 UB→GM、输出地址和 MTE3 完成同步；若是
+  output 比较失败而非 507015，则转查内容、长度和可见性。
+
+这是执行范围的定位，不能直接断言某条指令就是根因。507015 后不尝试从已
+abort 的 context 强行读取状态；保留本轮 `PROBE_BEGIN`、CPU 日志和设备异常。
+先确保故障进程结束、设备恢复可用，再运行下一次试验。新二进制的故障 PC
+需要与新 `.o` 对应，不能沿用旧 `+0xa18`。
+
+四个检查点均完成后，清除开关运行普通回归，覆盖空批次、序号复用、A/B/A
+输出、大小批次和跨 stream；探针只测一个批次，不能替代这些场景。
+
+```bash
+KVAF_AIV_SCATTER_PROBE= DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 \
+  KVAF_AIV_BATCH_GET_MODES=cpu_push_scatter \
+  python -u tests/python/test_aiv_sequential_batch_get.py
+```
+
 ## 当前验证状态
 
 本地无 CANN/NPU，已完成：
@@ -191,10 +270,15 @@ payload 和 done 的 CQ 回收，回到下一轮 notify READ；不要把这个�
   output 与 UB 边界 guard。模型不替代真实 CANN 编译和设备异常检查。
 - 真实 Host owner 的延迟 ACL 模型：串行复用、异步错误上报、capture 拒绝、
   部分初始化和关闭失败时资源保留/重试。Host 集成源码使用 ACL 声明替身编译。
+- Scatter 四个检查点的模型覆盖：真实 notify/done 流程、1/3/8 核、656/16385 B
+  token、重复序号、预期 DMA 次数、output guard、空请求/非法模式/超时拒绝；
+  Host 覆盖旧 kernel、错误 phase、设备错误保留、同步要求和诊断后的资源回收。
+  Python 检查只接受对应 checkpoint 标记，不吞掉 507015 或其他异常。
 - 新增内核模型和 Host 生命周期测试通过 AddressSanitizer / UndefinedBehaviorSanitizer。
 - CPU 新源码使用 UMDK 24.12 头文件通过语法检查；macOS 检查时仅补充 Linux
   的 `MADV_HUGEPAGE` 常量，未链接或执行 CPU 硬件服务。
 
-这些检查不替代 CANN 编译和双机验收。尚待验证多 SGE 硬件布局、非对齐 MTE3
-写出、CPU/NPU 缓存可见性、跨 Jetty done 保序及真实超时/断链回收。
+用户已在硬件反馈 gather 的 1/3/8 核回归通过；scatter 仍有 507015，新增探针
+待上机。尚待验证 scatter 的非对齐 MTE3 写出、CPU/NPU 缓存可见性、跨 Jetty
+done 保序及真实超时/断链回收。这些本地检查不替代 CANN 编译和双机验收。
 硬件回归未启用时返回 skip，不能视为硬件验收通过。

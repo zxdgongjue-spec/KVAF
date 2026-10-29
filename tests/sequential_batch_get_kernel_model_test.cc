@@ -226,6 +226,53 @@ void Poll(void* p) { fixture->Poll(p); }
 void Doorbell(uint32_t value, uint32_t* p) { fixture->Doorbell(value, p); }
 }
 int main() {
+  for (uint32_t probe : {KVAF_SEQ_PROBE_DONE, KVAF_SEQ_PROBE_FLUSH, KVAF_SEQ_PROBE_LOAD, KVAF_SEQ_PROBE_COPY})
+    for (uint32_t workers : {1U, 3U, 8U})
+      for (uint32_t bytes : {656U, 16385U}) {
+        Fixture f(19, bytes, workers, KVAF_SEQ_SCATTER, 6);
+        f.args.scatter_probe = probe;
+        for (uint32_t count : {19U, 1U, 7U}) {
+          f.Next(count);
+          auto expected = f.output;
+          if (probe == KVAF_SEQ_PROBE_COPY) for (uint32_t i = 0; i < count; ++i)
+            std::memcpy(expected.data() + uint64_t(f.rows[i]) * bytes,
+                        reinterpret_cast<void*>(f.addresses[f.indices[i]] + f.offsets[i]), bytes);
+          const auto reads = aiv_model::mte2_copies, writes = aiv_model::mte3_copies;
+          for (uint32_t core = 0; core < workers; ++core) {
+            aiv_model::core = core;
+            KvafSequentialBatchGetAivKernelV1(f.args);
+            const auto& s = f.status[core];
+            assert(s.magic == KVAF_SEQ_STATUS_MAGIC && s.sequence == f.args.sequence);
+            assert(s.result == KVAF_SEQ_PROBE_COMPLETE);
+            assert(s.phase == uint64_t(KVAF_SEQ_AFTER_DONE) + probe - KVAF_SEQ_PROBE_DONE);
+          }
+          assert(f.push_done);  // Every probe still needs the real notify/done protocol.
+          assert(f.output == expected);
+          const auto expected_reads = probe >= KVAF_SEQ_PROBE_LOAD ?
+              count * ((bytes + kCopyBytes - 1) / kCopyBytes) : 0;
+          assert(aiv_model::mte2_copies - reads == expected_reads);
+          assert(aiv_model::mte3_copies - writes == (probe == KVAF_SEQ_PROBE_COPY ? expected_reads : 0));
+          assert(!aiv_model::mte2.destination && !aiv_model::mte3.destination);
+          for (const auto& pipeline : model_events)
+            for (const auto& direction : pipeline)
+              for (bool pending : direction) assert(!pending);
+        }
+      }
+  {
+    Fixture empty(1, 656, 1, KVAF_SEQ_SCATTER, 6);
+    empty.args.scatter_probe = KVAF_SEQ_PROBE_DONE; empty.active = 0; empty.Run(false);
+    assert(empty.status[0].result == KVAF_SEQ_INVALID && !empty.push_requests);
+    Fixture invalid(1, 656, 1, KVAF_SEQ_SCATTER, 6);
+    invalid.args.scatter_probe = 99; invalid.Run(false); assert(!invalid.push_requests);
+    Fixture gather(1, 656, 1, KVAF_SEQ_GATHER, 6);
+    gather.args.scatter_probe = KVAF_SEQ_PROBE_DONE; gather.Run(false); assert(!gather.completions);
+    Fixture timeout(1, 656, 1, KVAF_SEQ_SCATTER, 6);
+    timeout.args.scatter_probe = KVAF_SEQ_PROBE_DONE; timeout.timeout = true; timeout.Run(false);
+    assert(timeout.status[0].result == KVAF_SEQ_TIMEOUT);
+    Fixture remote(1, 656, 1, KVAF_SEQ_SCATTER, 6);
+    remote.args.scatter_probe = KVAF_SEQ_PROBE_LOAD; remote.remote_error = true; remote.Run(false);
+    assert(remote.status[0].result == KVAF_SEQ_REMOTE_ERROR);
+  }
   {
     // Isolate the real payload helper from URMA: all GM alignment residues,
     // nonaligned byte counts, UB chunk boundaries, and repeated staging writes.

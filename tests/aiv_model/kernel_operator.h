@@ -41,6 +41,7 @@ struct PendingCopy {
   }
 };
 inline PendingCopy mte2, mte3;
+inline uint64_t mte2_copies{}, mte3_copies{};
 }
 inline void set_flag(int source, int target, event_t event) {
   if (model_events[source][target][event]) std::abort();
@@ -103,6 +104,7 @@ void DataCopyPad(const LocalTensor<T>& dst, const GlobalTensor<T>& src,
       aiv_model::mte3.destination) std::abort();
   aiv_model::mte2 = {reinterpret_cast<uint8_t*>(dst.address_.bufferAddr),
                     reinterpret_cast<const uint8_t*>(src.data), p.blockLen, padded};
+  ++aiv_model::mte2_copies;
 }
 template <typename T>
 void DataCopyPad(const GlobalTensor<T>& dst, const LocalTensor<T>& src,
@@ -112,6 +114,7 @@ void DataCopyPad(const GlobalTensor<T>& dst, const LocalTensor<T>& src,
       aiv_model::mte2.destination || aiv_model::mte3.destination) std::abort();
   aiv_model::mte3 = {reinterpret_cast<uint8_t*>(dst.data),
                     reinterpret_cast<const uint8_t*>(src.address_.bufferAddr), p.blockLen, 0};
+  ++aiv_model::mte3_copies;
 }
 template <typename T, CacheLine, DcciDst>
 void DataCacheCleanAndInvalid(GlobalTensor<T> tensor) {

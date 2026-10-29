@@ -82,6 +82,8 @@ add_test(NAME kvaf_aiv_sequential_hardware_python
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_aiv_sequential_batch_get.py")
 set_tests_properties(kvaf_aiv_sequential_hardware_python PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 600 ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}/python")
+add_test(NAME kvaf_scatter_probe_result_python
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_scatter_probe_result.py")
 
 # Compile hardware Host sources even on development machines without CANN.
 # Object-only: never link the declaration doubles into the production libraries.
