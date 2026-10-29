@@ -37,6 +37,14 @@ constexpr uint32_t kMaxDirectAivWorkers =
 
 using DirectHccpApi = hccp::DirectHccpApi;
 using DirectMemory = hccp::DirectMemory;
+
+static void TraceBatchPutPhase(const char *phase, const char *state,
+                               uint64_t bytes, int32_t result = 0) {
+  hccp::VerboseLog(
+      "[KVAF_AIV] DIRECT_BATCH_PUT_PHASE phase=%s state=%s bytes=%llu result=%d\n",
+      phase, state, static_cast<unsigned long long>(bytes), static_cast<int>(result));
+}
+
 // A USER_CTL SQ/CQ is strictly single-producer/single-consumer from the AIV
 // kernel's point of view. Each core/Jetty slot therefore owns one complete
 // local AIV Jetty rather than sharing producer/consumer indices.
@@ -509,10 +517,21 @@ extern "C" int32_t KvafBatchPutLocalBufferAcquire(KvafBatchPutTransport *transpo
   }
   const uint64_t entity_bytes =
       static_cast<uint64_t>(transport->worker_count) * sizeof(entities.front());
-  if (aclrtMalloc(&candidate->device_entities, entity_bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
-      candidate->device_entities == nullptr ||
-      aclrtMemcpy(candidate->device_entities, entity_bytes, entities.data(), entity_bytes,
-                  ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
+  TraceBatchPutPhase("local_entities_alloc", "begin", entity_bytes);
+  const aclError allocation_result = aclrtMalloc(
+      &candidate->device_entities, entity_bytes, ACL_MEM_MALLOC_NORMAL_ONLY);
+  TraceBatchPutPhase("local_entities_alloc", "end", entity_bytes,
+                     static_cast<int32_t>(allocation_result));
+  aclError copy_result = ACL_SUCCESS;
+  if (allocation_result == ACL_SUCCESS && candidate->device_entities != nullptr) {
+    TraceBatchPutPhase("local_entities_copy", "begin", entity_bytes);
+    copy_result = aclrtMemcpy(candidate->device_entities, entity_bytes,
+                              entities.data(), entity_bytes, ACL_MEMCPY_HOST_TO_DEVICE);
+    TraceBatchPutPhase("local_entities_copy", "end", entity_bytes,
+                       static_cast<int32_t>(copy_result));
+  }
+  if (allocation_result != ACL_SUCCESS || candidate->device_entities == nullptr ||
+      copy_result != ACL_SUCCESS) {
     if (candidate->device_entities != nullptr) (void)aclrtFree(candidate->device_entities);
     if (candidate->memory.handle != nullptr && transport->api.lmem_unregister != nullptr) {
       (void)transport->api.lmem_unregister(transport->device_context, candidate->memory.handle);
@@ -570,9 +589,11 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
   // Status initialization and the kernel are ordered on one stream, so the
   // host need not block before the launch. core_status is a persistent pinned
   // host buffer and remains valid until the final stream synchronization.
+  TraceBatchPutPhase("seed_status", "begin", status_bytes);
   const aclError seed_result = aclrtMemsetAsync(
       reinterpret_cast<void *>(arguments->core_status), status_bytes, 0,
       status_bytes, stream);
+  TraceBatchPutPhase("seed_status", "end", status_bytes, static_cast<int32_t>(seed_result));
   if (seed_result != ACL_SUCCESS) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=seed_status acl=%d\n",
                  static_cast<int>(seed_result));
@@ -583,22 +604,28 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
   launch_args.channel_entity = local_buffer->device_channel_entity;
   launch_args.queue_state = reinterpret_cast<uint64_t>(transport->device_queue_state);
   launch_args.jettys_per_core = transport->jettys_per_core;
+  TraceBatchPutPhase("kernel_launch", "begin", arguments->input_bytes);
   int32_t result = KvafExecuteBatchPutLaunchInternal(&launch_args, stream);
+  TraceBatchPutPhase("kernel_launch", "end", arguments->input_bytes, result);
   if (result != KVAF_BATCH_PUT_SUCCESS) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=launch result=%d\n", result);
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
   // Queue the completion status before synchronizing so the host pays one
   // stream wait for both the AIV kernel and the status D2H copy.
+  TraceBatchPutPhase("copy_status", "begin", status_bytes);
   const aclError status_copy_result = aclrtMemcpyAsync(
       core_status, status_bytes, reinterpret_cast<void *>(arguments->core_status),
       status_bytes, ACL_MEMCPY_DEVICE_TO_HOST, stream);
+  TraceBatchPutPhase("copy_status", "end", status_bytes, static_cast<int32_t>(status_copy_result));
   if (status_copy_result != ACL_SUCCESS) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=copy_status acl=%d\n",
                  static_cast<int>(status_copy_result));
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
+  TraceBatchPutPhase("synchronize", "begin", status_bytes);
   const aclError synchronize_result = aclrtSynchronizeStream(stream);
+  TraceBatchPutPhase("synchronize", "end", status_bytes, static_cast<int32_t>(synchronize_result));
   if (synchronize_result != ACL_SUCCESS) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=synchronize acl=%d\n",
                  static_cast<int>(synchronize_result));

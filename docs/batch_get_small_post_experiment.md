@@ -394,6 +394,65 @@ UB 设备选择仍保留用于配置校验。恢复成功时输出 `SMALL_POST_L
 确定边界的交错仍会报错，不把它们补成零或 `n/a`。runner 使用 `python3 -u`
 减少后续采样日志中的缓冲交错；这不改变请求、调度或内核计时范围。
 
+## 初始化阶段卡住
+
+`PHASE_BEGIN phase=initialize` 尚未出现对应 DONE 时，还没有开始本次
+BatchGet 测量。Runtime 创建传输后会先执行 BatchPut RMA 连通性探针，
+即使 `adaptive_ub_device=0` 也会执行。1 核、BatchPut 每核 1 Jetty 时是
+32 条 × 64 字节，注册的源 HBM 因而为 2048 字节，与待测 `miss_count`
+无关。TCP 握手和 Jetty import 成功不代表该探针或后续设备调用已经完成。
+
+当前源码在 `DIRECT_MEMORY_REGISTERED role=device_hbm` 后，需要为通道
+entity 调用 `aclrtMalloc`、`aclrtMemcpy`，之后才打印
+`DIRECT_LOCAL_BUFFER_REGISTERED`。不能仅凭这条注册日志就判定卡在 CQ
+轮询。设置 `KVAF_AIV_VERBOSE_DIRECT_HCCP=1` 后，新日志
+`DIRECT_BATCH_PUT_PHASE` 用 begin/end 标记如下边界：
+
+| phase | 调用 |
+| --- | --- |
+| `local_entities_alloc` | `aclrtMalloc` |
+| `local_entities_copy` | `aclrtMemcpy` H2D |
+| `metadata_upload` | `aclrtMemcpyAsync` H2D，上传 offset/length/destination 元数据 |
+| `seed_status` | `aclrtMemsetAsync` |
+| `kernel_launch` | BatchPut kernel launch |
+| `copy_status` | `aclrtMemcpyAsync` D2H |
+| `synchronize` | `aclrtSynchronizeStream` |
+
+Runtime 的 `RUNTIME_RMA_PROBE` 另标明 prepare、BatchPut、释放 key 和
+销毁 stream 的进度。新增 C++ 日志需要重编对应 NPU 构建；它们用于定位
+阻塞调用，不跳过连通性校验，也不改变 BatchGet 调度。
+
+若出现 `failed to enqueue BatchPut metadata upload to NPU`，该探针尚未
+提交 BatchPut kernel，是 H2D metadata 复制的 API 调用返回失败。错误路径
+会立即读取并复制 `aclGetRecentErrMsg()`，在
+`BATCH_PUT_METADATA_UPLOAD_ERROR` 中保留 ACL 返回码、rows/bytes、源/目的
+地址、64 字节对齐余数、容量和 stream，并将原始错误码与详情传到最终
+Python 异常；不要用外层 `ERR99999` 代替这个返回码判断原因。
+
+Verbose 模式下的 `RUNTIME_RMA_PROBE_CONTEXT` 记录创建 probe stream 后的
+当前设备/context，`BATCH_PUT_ACL_CONTEXT` 记录本地 buffer acquire 前及
+metadata 上传前的设备/context，便于核对中间调用是否改变了线程上下文。
+诊断不自动切换 context、不重试成同步复制，也不跳过失败的探针。
+若重编后仍完全看不到这些标记，应核对 `kvaf` / `kvaf._kvaf` 的实际
+导入路径及动态库加载路径，确认运行的是当前构建。
+
+已有进程卡住时，可先在另一终端获取线程栈，避免丢失现场。以下命令中的
+PID 需换成 `pgrep` 列出的当前 benchmark 进程，不是 CPU 服务或 timeout：
+
+```bash
+pgrep -af '[t]est_npu_batch_get_perf.py'
+perf_pid=12345
+mkdir -p results
+ps -L -p "$perf_pid" -o pid,tid,stat,wchan:32,comm
+gdb -q -batch -ex 'set pagination off' -ex 'thread apply all bt' \
+  -p "$perf_pid" > "results/batch-get-hang-${perf_pid}.bt" 2>&1
+```
+
+以调用栈区分 ACL 内存操作、stream 等待、用户态 mutex 和控制面 I/O。
+runner 的 `KVAF_REMOTE_CPU_PERF_TIMEOUT` 默认 600 秒，并在超时发送 TERM
+后等待 10 秒再升级 KILL；它不保证恢复驱动或设备状态。换 TCP 端口不会
+重新初始化设备侧上下文或队列。
+
 ## 本地检查范围
 
 `kvaf_batch_get_schedule_test` 覆盖基线/小 post、奇数尾部、请求数少于

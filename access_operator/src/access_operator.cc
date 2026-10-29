@@ -58,6 +58,19 @@ struct BatchPutExecutionState {
   std::size_t host_core_status_count{0};
 };
 
+void TraceBatchPutAclContext(const char* phase, bool force = false) {
+  if (!force && !direct_hccp::VerboseLoggingEnabled()) return;
+  int32_t device = -1;
+  aclrtContext context = nullptr;
+  const aclError device_result = aclrtGetDevice(&device);
+  const aclError context_result = aclrtGetCurrentContext(&context);
+  std::fprintf(stderr,
+               "[KVAF_AIV] BATCH_PUT_ACL_CONTEXT phase=%s device=%d context=%p "
+               "get_device_acl=%d get_context_acl=%d\n",
+               phase, static_cast<int>(device), context,
+               static_cast<int>(device_result), static_cast<int>(context_result));
+}
+
 void ReleaseBatchPutExecutionState(BatchPutExecutionState* execution) {
   if (execution == nullptr) {
     return;
@@ -724,6 +737,7 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
 
     const std::size_t metadata_bytes = rows * 3U * sizeof(std::uint64_t);
 
+    TraceBatchPutAclContext("before_local_buffer_acquire");
     KvafBatchPutLocalBuffer* local_buffer = nullptr;
     if (KvafBatchPutLocalBufferAcquire(
             impl_->batch_put_transport, const_cast<void*>(exec.request->input.data),
@@ -750,12 +764,46 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
     std::memset(execution.host_core_status, 0,
                 execution.host_core_status_count *
                     sizeof(KvafBatchPutCoreStatus));
-    if (aclrtMemcpyAsync(execution.metadata, metadata_bytes,
-                         execution.host_metadata, metadata_bytes,
-                         ACL_MEMCPY_HOST_TO_DEVICE, stream) != ACL_SUCCESS) {
+    TraceBatchPutAclContext("before_metadata_upload");
+    direct_hccp::VerboseLog(
+        "[KVAF_AIV] DIRECT_BATCH_PUT_PHASE phase=metadata_upload state=begin "
+        "rows=%zu bytes=%zu src=%p dst=%p stream=%p host_capacity_rows=%zu "
+        "device_capacity_rows=%zu src_mod64=%zu dst_mod64=%zu\n",
+        rows, metadata_bytes, execution.host_metadata, execution.metadata, stream,
+        execution.host_metadata_capacity, execution.metadata_capacity,
+        static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(execution.host_metadata) % 64U),
+        static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(execution.metadata) % 64U));
+    const aclError metadata_copy_result = aclrtMemcpyAsync(
+        execution.metadata, metadata_bytes, execution.host_metadata, metadata_bytes,
+        ACL_MEMCPY_HOST_TO_DEVICE, stream);
+    if (metadata_copy_result != ACL_SUCCESS) {
+      // Capture the original ACL error before context queries or teardown can
+      // replace/clear it. Keep a string copy: ACL owns the returned pointer.
+      const char* recent_error = aclGetRecentErrMsg();
+      std::string detail = recent_error == nullptr ? "unavailable" : recent_error;
+      std::replace(detail.begin(), detail.end(), '\n', ' ');
+      std::replace(detail.begin(), detail.end(), '\r', ' ');
+      std::fprintf(stderr,
+                   "[KVAF_AIV] BATCH_PUT_METADATA_UPLOAD_ERROR api=aclrtMemcpyAsync "
+                   "acl=%d rows=%zu bytes=%zu src=%p dst=%p stream=%p "
+                   "host_capacity_rows=%zu device_capacity_rows=%zu "
+                   "src_mod64=%zu dst_mod64=%zu detail=%s\n",
+                   static_cast<int>(metadata_copy_result), rows, metadata_bytes,
+                   execution.host_metadata, execution.metadata, stream,
+                   execution.host_metadata_capacity, execution.metadata_capacity,
+                   static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(execution.host_metadata) % 64U),
+                   static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(execution.metadata) % 64U),
+                   detail.c_str());
+      TraceBatchPutAclContext("metadata_upload_error", true);
       KvafBatchPutLocalBufferRelease(local_buffer);
-      return Internal("failed to enqueue BatchPut metadata upload to NPU");
+      return Internal("failed to enqueue BatchPut metadata upload to NPU: acl=" +
+                      std::to_string(static_cast<int>(metadata_copy_result)) +
+                      " rows=" + std::to_string(rows) +
+                      " bytes=" + std::to_string(metadata_bytes) +
+                      " detail=" + detail);
     }
+    direct_hccp::VerboseLog(
+        "[KVAF_AIV] DIRECT_BATCH_PUT_PHASE phase=metadata_upload state=end result=0\n");
 
     const int32_t result = KvafExecuteBatchPutSync(
         local_buffer, &arguments, stream, execution.host_core_status,

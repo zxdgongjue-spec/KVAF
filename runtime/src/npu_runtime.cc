@@ -638,6 +638,15 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
             impl_->config.batch_put_jettys_per_core);
         const std::uint64_t probe_total_bytes = probe_rows * probe_bytes;
         aclrtStream stream = nullptr;
+        std::fprintf(stderr,
+                     "[KVAF_AIV] RUNTIME_RMA_PROBE phase=prepare state=begin "
+                     "peer_candidate=%u npu_group=%zu cores=%u jettys_per_core=%u "
+                     "rows=%llu bytes_per_row=%llu bytes=%llu\n",
+                     peer_candidate, npu_group, impl_->options.npu_core_count,
+                     impl_->config.batch_put_jettys_per_core,
+                     static_cast<unsigned long long>(probe_rows),
+                     static_cast<unsigned long long>(probe_bytes),
+                     static_cast<unsigned long long>(probe_total_bytes));
         if (probe_bytes == 0U || probe_rows == 0U ||
             aclrtMalloc(&impl_->probe_buffer, probe_total_bytes,
                         ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
@@ -647,6 +656,19 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
             aclrtCreateStream(&stream) != ACL_SUCCESS || stream == nullptr) {
           last = Internal("failed to prepare peer candidate RMA probe");
         } else {
+          std::fprintf(stderr, "[KVAF_AIV] RUNTIME_RMA_PROBE phase=prepare state=end result=0\n");
+          const char* verbose = std::getenv("KVAF_AIV_VERBOSE_DIRECT_HCCP");
+          if (verbose != nullptr && std::strcmp(verbose, "1") == 0) {
+            int32_t device = -1;
+            aclrtContext context = nullptr;
+            const aclError device_result = aclrtGetDevice(&device);
+            const aclError context_result = aclrtGetCurrentContext(&context);
+            std::fprintf(stderr,
+                         "[KVAF_AIV] RUNTIME_RMA_PROBE_CONTEXT stream=%p device=%d context=%p "
+                         "get_device_acl=%d get_context_acl=%d\n",
+                         stream, static_cast<int>(device), context,
+                         static_cast<int>(device_result), static_cast<int>(context_result));
+          }
           std::vector<KeyId> probe_keys;
           std::vector<std::uint64_t> probe_offsets;
           std::vector<std::uint64_t> probe_lengths;
@@ -659,6 +681,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
             probe_offsets.push_back(row * probe_bytes);
             probe_lengths.push_back(probe_bytes);
           }
+          std::fprintf(stderr, "[KVAF_AIV] RUNTIME_RMA_PROBE phase=batch_put state=begin\n");
           last = impl_->runtime_core->BatchPut(
               BatchPutRequest{probe_keys,
                               ConstBufferView{impl_->probe_buffer,
@@ -666,12 +689,23 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                                               DeviceKind::kNpu},
                               probe_offsets, probe_lengths},
               BatchPutExecutionOptions{stream});
+          std::fprintf(stderr, "[KVAF_AIV] RUNTIME_RMA_PROBE phase=batch_put state=end result=%d\n",
+                       static_cast<int>(last.code()));
           if (last.ok()) {
+            std::fprintf(stderr, "[KVAF_AIV] RUNTIME_RMA_PROBE phase=free_keys state=begin\n");
             last = impl_->runtime_core->BatchFree(BatchFreeRequest{probe_keys});
+            std::fprintf(stderr, "[KVAF_AIV] RUNTIME_RMA_PROBE phase=free_keys state=end result=%d\n",
+                         static_cast<int>(last.code()));
           }
         }
-        if (stream != nullptr && aclrtDestroyStream(stream) != ACL_SUCCESS && last.ok()) {
-          last = Internal("failed to destroy peer candidate probe stream");
+        if (stream != nullptr) {
+          std::fprintf(stderr, "[KVAF_AIV] RUNTIME_RMA_PROBE phase=destroy_stream state=begin\n");
+          const aclError destroy_result = aclrtDestroyStream(stream);
+          std::fprintf(stderr, "[KVAF_AIV] RUNTIME_RMA_PROBE phase=destroy_stream state=end result=%d\n",
+                       static_cast<int>(destroy_result));
+          if (destroy_result != ACL_SUCCESS && last.ok()) {
+            last = Internal("failed to destroy peer candidate probe stream");
+          }
         }
       }
       if (last.ok() && measure) {
