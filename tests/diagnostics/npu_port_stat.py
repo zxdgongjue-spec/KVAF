@@ -7,9 +7,7 @@ GetNPUUbStatInfo). See npu_port_stat.md for measurement scope and usage.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-import csv
 import math
-from pathlib import Path
 import re
 import shutil
 import subprocess
@@ -23,8 +21,6 @@ COUNTERS = {
     "tx_flit_ps": "tx_busi_flit_num",
     "rx_flit_ps": "rx_busi_flit_num",
 }
-FIELDS = ["sample", "unix_time", "device", "udie", "port", "query_seconds",
-          "tx_MBps", "rx_MBps", "counter_dt", *COUNTERS, "error"]
 
 
 def run_hccn(tool, arguments, timeout):
@@ -116,6 +112,7 @@ def counter_rates(previous, current):
 
 
 def collect_port(args, key, baseline=False):
+    start = time.monotonic()
     udie, port = key
     selection = ["-i", args.device_id, "-u", udie, "-p", port]
     row = dict(device=args.device_id, udie=udie, port=port)
@@ -127,8 +124,6 @@ def collect_port(args, key, baseline=False):
         except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
             errors.append(f"stat: {exc}")
     if not baseline:
-        start = time.monotonic()
-        row["unix_time"] = time.time()
         try:
             # Same hardware measurement setting as the official NPU Exporter.
             raw = run_hccn(args.hccn_tool,
@@ -136,46 +131,57 @@ def collect_port(args, key, baseline=False):
             row["tx_MBps"], row["rx_MBps"] = parse_bandwidth(raw)
         except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
             errors.append(f"bandwidth: {exc}")
-        row["query_seconds"] = time.monotonic() - start
+    row["query_seconds"] = time.monotonic() - start
     row["error"] = "; ".join(errors)
     return key, row, snapshot
 
 
-def sample(args, keys, writer=None):
-    previous, failed = {}, False
+def sample(args, keys):
+    previous, failed, last_start = {}, False, None
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         if args.counters:
-            for key, row, snapshot in executor.map(lambda k: collect_port(args, k, True), keys):
+            last_start = time.monotonic()
+            baseline = list(executor.map(lambda k: collect_port(args, k, True), keys))
+            for key, row, snapshot in baseline:
                 previous[key] = snapshot
                 if row["error"]:
                     failed = True
                     print(f"[WARN] baseline {key}: {row['error']}", file=sys.stderr)
-            time.sleep(args.interval)
         iteration = 0
         while args.count == 0 or iteration < args.count:
+            if last_start is not None:
+                remaining = args.interval - (time.monotonic() - last_start)
+                if remaining > 0:
+                    time.sleep(remaining)
+            start = time.monotonic()
+            results = list(executor.map(lambda k: collect_port(args, k), keys))
+            collect_seconds = time.monotonic() - start
+            actual_interval = "--" if last_start is None else f"{start - last_start:.3f}s"
+            last_start = start
             iteration += 1
-            print(f"===== sample #{iteration} {time.strftime('%Y-%m-%d %H:%M:%S')} =====")
-            header = " NPU Udie Port   TxBW(MB/s)   RxBW(MB/s)"
+            lines = [f"===== sample #{iteration} {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                     f"target={args.interval:g}s start_dt={actual_interval} "
+                     f"collect={collect_seconds:.3f}s workers={args.workers} ====="]
+            header = " NPU Udie Port      Query(s)    TxBW(MB/s)    RxBW(MB/s)"
             if args.counters:
-                header += "   dt(s)       TxCTP/s       RxCTP/s      TxFlit/s      RxFlit/s"
-            print(header)
-            for key, row, snapshot in executor.map(lambda k: collect_port(args, k), keys):
+                header += "         dt(s)       TxCTP/s       RxCTP/s      TxFlit/s      RxFlit/s"
+            lines.append(header)
+            warnings = []
+            for key, row, snapshot in results:
                 row.update(counter_rates(previous.get(key), snapshot))
                 previous[key] = snapshot
-                row["sample"] = iteration
-                values = ["tx_MBps", "rx_MBps"]
+                values = ["query_seconds", "tx_MBps", "rx_MBps"]
                 if args.counters:
                     values += ["counter_dt", *COUNTERS]
                 numbers = " ".join(f"{row[name]:13,.3f}" if name in row else f"{'N/A':>13}"
                                    for name in values)
-                print(f"{args.device_id:4} {key[0]:4} {key[1]:4} {numbers}", flush=True)
+                lines.append(f"{args.device_id:4} {key[0]:4} {key[1]:4} {numbers}")
                 if row["error"]:
                     failed = True
-                    print(f"[WARN] {key}: {row['error']}", file=sys.stderr)
-                if writer:
-                    writer.writerow(row)
-            if args.count == 0 or iteration < args.count:
-                time.sleep(args.interval)
+                    warnings.append(f"[WARN] {key}: {row['error']}")
+            print("\n".join(lines) + "\n", flush=True)
+            if warnings:
+                print("\n".join(warnings), file=sys.stderr, flush=True)
     return int(failed)
 
 
@@ -184,12 +190,13 @@ def main(argv=None):
     parser.add_argument("--device-id", type=int, required=True, help="hccn_tool 的 NPU logic ID")
     parser.add_argument("--ports", help="Udie:Port 列表，如 0:4,1:9；默认选择 UP 的 UB 端口")
     parser.add_argument("--list", action="store_true", help="仅列出实际发现的 UB 端口")
-    parser.add_argument("-i", "--interval", type=float, default=1, help="每轮查询后等待秒数，默认 1")
+    parser.add_argument("-i", "--interval", type=float, default=1,
+                        help="两轮开始之间的目标间隔秒数，默认 1；采集耗时超过间隔时不额外等待")
     parser.add_argument("-n", "--count", type=int, default=1, help="采样轮数，0 表示持续采集")
     parser.add_argument("--counters", action="store_true", help="同时查询 CTP 包率与原始 flit/s")
-    parser.add_argument("--workers", type=int, default=1, help="并行查询数，默认串行；各端口窗口不完全同步")
+    parser.add_argument("--workers", type=int, default=8,
+                        help="并行查询端口数，默认 8；整轮采集完成后统一打印")
     parser.add_argument("--timeout", type=float, default=10, help="每条 hccn_tool 命令的超时秒数")
-    parser.add_argument("--csv", type=Path, help="将每轮结果写入新的 CSV 文件")
     parser.add_argument("--hccn-tool", default=shutil.which("hccn_tool") or
                         "/usr/local/Ascend/driver/tools/hccn_tool")
     args = parser.parse_args(argv)
@@ -215,11 +222,6 @@ def main(argv=None):
             keys = sorted(key for key, state in ports.items() if state == "UP")
         if not keys:
             raise ValueError("没有 UP 的 UB 端口；请检查 --list 输出")
-        if args.csv:
-            with args.csv.open("x", newline="", encoding="utf-8") as file:
-                writer = csv.DictWriter(file, fieldnames=FIELDS)
-                writer.writeheader()
-                return sample(args, keys, writer)
         return sample(args, keys)
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)

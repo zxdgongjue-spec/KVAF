@@ -1,8 +1,8 @@
-import csv
 from contextlib import redirect_stderr, redirect_stdout
 import io
-from pathlib import Path
-import tempfile
+from itertools import count
+from threading import Barrier
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -55,7 +55,7 @@ class NpuPortStatTest(unittest.TestCase):
         self.assertEqual(stat.counter_rates(None, after), {})
         self.assertEqual(stat.counter_rates(after, after), {})
 
-    def test_main_discovers_ports_samples_and_writes_csv(self):
+    def test_main_discovers_ports_samples_and_prints_counters(self):
         calls, samples = [], 0
 
         def run(tool, args, timeout):
@@ -70,22 +70,70 @@ class NpuPortStatTest(unittest.TestCase):
             self.assertEqual(args[-2:], ["-time", 100])
             return BW
 
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "ports.csv"
-            with patch.object(stat, "run_hccn", side_effect=run), \
-                    patch.object(stat.time, "sleep"), \
-                    patch.object(stat.time, "monotonic", side_effect=[10, 12, 12, 12.1]), \
-                    redirect_stdout(io.StringIO()), \
-                    redirect_stderr(io.StringIO()):
-                status = stat.main(["--device-id", "7", "--counters", "--csv", str(output)])
-            self.assertEqual(status, 0)
-            with output.open(newline="", encoding="utf-8") as file:
-                rows = list(csv.DictReader(file))
-            self.assertEqual(len(rows), 1)
-            self.assertEqual((rows[0]["tx_MBps"], rows[0]["rx_MBps"]), ("1.25", "0.0"))
-            self.assertEqual(rows[0]["rx_ctp_pps"], "")
-            self.assertEqual(float(rows[0]["tx_flit_ps"]), 50)
+        terminal = io.StringIO()
+        with patch.object(stat, "run_hccn", side_effect=run), \
+                patch.object(stat.time, "sleep"), \
+                patch.object(stat.time, "monotonic", side_effect=count(10)), \
+                redirect_stdout(terminal), redirect_stderr(io.StringIO()):
+            status = stat.main(["--device-id", "7", "--counters"])
+        self.assertEqual(status, 0)
+        row = terminal.getvalue().splitlines()[2].split()
+        self.assertEqual(row[:3], ["7", "1", "9"])
+        self.assertEqual(row[4:6], ["1.250", "0.000"])
+        self.assertEqual(row[7:9], ["N/A", "N/A"])
+        self.assertGreater(float(row[9]), 0)
         self.assertEqual(len(calls), 4)  # discovery, baseline, stat, bandwidth
+
+    def test_default_queries_in_parallel_and_prints_one_complete_sample(self):
+        rendezvous = Barrier(2)
+        completed, writes = [], []
+
+        class Output(io.StringIO):
+            def write(self, text):
+                if text.strip():
+                    writes.append((text, len(completed)))
+                return super().write(text)
+
+        def run(tool, args, timeout):
+            if "-dev_info" in args:
+                return PORTS.replace("DOWN", "UP")
+            rendezvous.wait(timeout=3)  # Serial collection cannot pass this barrier.
+            completed.append(args[7])
+            return BW
+
+        with patch.object(stat, "run_hccn", side_effect=run), \
+                redirect_stdout(Output()), redirect_stderr(io.StringIO()):
+            status = stat.main(["--device-id", "7"])
+        self.assertEqual(status, 0)
+        self.assertEqual(sorted(completed), [8, 9])
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0][1], 2)
+        self.assertIn("workers=8", writes[0][0])
+        self.assertEqual(len(writes[0][0].strip().splitlines()), 4)
+
+    def test_interval_includes_collection_time_and_does_not_sleep_after_overrun(self):
+        for duration, expected_starts, expected_sleeps in (
+                (0.25, [0, 1], [0.75]), (1.5, [0, 1.5], [])):
+            with self.subTest(duration=duration):
+                now, starts, sleeps = [0.0], [], []
+
+                def collect(args, key):
+                    starts.append(now[0])
+                    now[0] += duration
+                    return key, dict(query_seconds=duration, tx_MBps=0, rx_MBps=0, error=""), None
+
+                def sleep(seconds):
+                    sleeps.append(seconds)
+                    now[0] += seconds
+
+                args = SimpleNamespace(device_id=7, workers=1, counters=False, interval=1, count=2)
+                with patch.object(stat, "collect_port", side_effect=collect), \
+                        patch.object(stat.time, "monotonic", side_effect=lambda: now[0]), \
+                        patch.object(stat.time, "sleep", side_effect=sleep), \
+                        redirect_stdout(io.StringIO()):
+                    self.assertEqual(stat.sample(args, [(1, 9)]), 0)
+                self.assertEqual(starts, expected_starts)
+                self.assertEqual(sleeps, expected_sleeps)
 
     def test_failed_sampling_exits_after_requested_count_and_records_no_fake_zero(self):
         def run(tool, args, timeout):
