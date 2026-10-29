@@ -193,6 +193,39 @@ CPU 服务的独立 HAL 分配/导出仍由本测试验证。
 需结合该对照结果、目标机 CANN/驱动版本及 SVM 映射日志继续定位设备访问失败的原因。
 此次失败设备为 Ascend950DT，驱动 `25.6.rc1.b175`、HAL `7.35.23`，已提供的 compiler
 版本为 CANN `9.1.0`；`dmesg` 的 SVM/页故障筛选未返回记录。
+随后复测：实际 CPU 高位地址的本地 HBM 对照通过，`MAPPING_ACCESS flags=0x3`，
+映射 DDR 仍报 95。驱动 `svm_vmm.c::vmm_get_access` 返回权限记录，不检测 AI Core 的实际读写。
+
+### 区分本地 VMM 与跨进程导入故障
+
+保持 CPU 服务运行，分别在独立进程执行以下对照：
+
+```bash
+for memory in hbm dram; do
+  ./build-ubmem-npu/bin/kvaf_ubmem_test \
+    --peer 127.0.0.1:28888 \
+    --kernel "$PWD/build-ubmem-npu/bin/kvaf_ubmem_kernels.o" \
+    --device 6 --cores 2 --rows 17 \
+    --token-bytes 656 --tokens-per-block 128 --repeat 1 \
+    --probe-vmm "$memory"
+done
+```
+
+`--probe-vmm` 是独立诊断模式：先运行普通 HBM 对照，再把目的区换成本进程的 VMM 分配，
+使用同一 Put kernel、输入、地址换算和字节校验。仍通过 `--peer` 初始化现有 operator，
+但不向 CPU 服务的 DDR 发起 Put/Get，也不输出端到端通过。
+
+- `hbm`：`ACL_HBM_MEM_HUGE`、当前设备，检查 VMM 地址能否被同一内核访问。
+- `dram`：与 SHMEM `AclMemSegmentDevice::AllocLocalMemory` 一致，使用
+  `ACL_DDR_MEM_P2P_HUGE`、`HOST_NUMA=-1`，Map 后通过 `aclrtMemSetAccess` 赋予当前 NPU 读写权限。
+  初始化及回读采用 `rma_d2h_demo` 的 `aclrtMemcpy` H2D/D2H 方式。
+
+日志将分配、初始化、MTE 和回读错误分开，成功输出 `VMM_CONTROL_VERIFIED kind=hbm|dram`。
+若 HBM 对照失败，先定位 VMM 地址访问；若仅 DDR 对照失败，先定位本机 Host DDR 路径；
+若两者都通过，再定位 CPU 服务的 HAL 分配/导出与跨进程 Fabric 导入。
+对照中的 VMM 内存与现有调用方 buffer 一样，在 stream 成功 drain 后才释放。
+
+### Put 完成报告
 
 同步 BatchPut 输出每核 `PUT_CORE`，包含设备报告的 `completed` 和 host 计算的 `expected`。
 默认 17 行、2 核应分别完成 9 行和 8 行；计数不符会在 MetaManager 提交前报错。

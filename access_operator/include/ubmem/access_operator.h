@@ -20,10 +20,10 @@ class AccessOperator final : public kvaf::AccessOperator {
   Status Shutdown() override;
   Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
   Status ExecuteBatchPut(const BatchPutExecRequest& request) override;
-  // Test runner control experiment: same Put kernel, with local HBM as the
+  // Test runner control experiment: same Put kernel, with local HBM/DDR as the
   // destination. metadata is device uint64[3 * rows]: source offsets, lengths,
   // absolute CPU destination addresses. Buffers/ranges are prepared by
-  // tests/ubmem/npu_test.cc; only mapped_base is replaced with local HBM.
+  // tests/ubmem/npu_test.cc; only mapped_base is replaced with local memory.
   Status ProbeLocalCopy(const ConstBufferView& input, const MutableBufferView& output,
                        const ConstBufferView& metadata, void* stream);
  private:
