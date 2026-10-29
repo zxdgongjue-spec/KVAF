@@ -60,10 +60,14 @@ def expect_scatter_probe(call, stage: str, *, expected_bytes: int | None = None)
             raise
         if stage == "load" and not re.search(r"(?:^| )verification=gm_ub_byte_compare(?: |$)", str(error)):
             raise AssertionError("load checkpoint has no byte verification; rebuild Host and kernel together") from error
-        if stage == "load":
-            match = re.search(r"(?:^| )verified_bytes=(\d+)(?: |$)", str(error))
+        byte_fields = {"setup": ("configured_bytes", "configured byte count"),
+                       "dma": ("dma_bytes", "DMA byte count"),
+                       "load": ("verified_bytes", "verified byte count")}
+        if stage in byte_fields:
+            field, description = byte_fields[stage]
+            match = re.search(rf"(?:^| ){field}=(\d+)(?: |$)", str(error))
             if not match or int(match[1]) == 0 or (expected_bytes is not None and int(match[1]) != expected_bytes):
-                raise AssertionError("load checkpoint verified byte count does not match the request") from error
+                raise AssertionError(f"{stage} checkpoint {description} does not match the request") from error
         print(str(error), flush=True)
     else:
         raise AssertionError("scatter probe returned ordinary success; rebuild Host and kernel together")
@@ -79,8 +83,8 @@ def run(mode: str) -> int:
         print(f"FAIL: {error}", file=sys.stderr)
         return 2
     probe = os.environ.get("KVAF_AIV_SCATTER_PROBE", "") if mode == "cpu_push_scatter" else ""
-    if probe and probe not in ("done", "flush", "load", "copy"):
-        raise ValueError("scatter probe must be done/flush/load/copy")
+    if probe and probe not in ("done", "flush", "setup", "dma", "load", "copy"):
+        raise ValueError("scatter probe must be done/flush/setup/dma/load/copy")
     from backend import detect_torch_backend
     from dsa_keys import build_dsa_keys
     from npu_eids import parse_npu_eids
@@ -112,7 +116,7 @@ def run(mode: str) -> int:
         # One nonempty request per participating core; keep normal allocation and
         # output placement. Empty requests cannot establish a checkpoint.
         counts = [min(cores, capacity)]
-        if probe == "load":
+        if probe in ("setup", "dma", "load"):
             # Reuse the same per-core UB across rows and launches, with changing
             # source metadata; include workers with no rows in the first batch.
             counts = [1, min(2 * cores + 1, capacity), 1]
@@ -172,7 +176,9 @@ def run(mode: str) -> int:
         if probe:
             runtime.shutdown()
             output_check = "verified" if probe == "copy" else "unchanged"
-            load_check = " mte2=byte_verified_against_staging" if probe == "load" else ""
+            load_check = {"setup": " mte2=configured_only payload_dma=none",
+                          "dma": " mte2=completed content=not_checked",
+                          "load": " mte2=byte_verified_against_staging"}.get(probe, "")
             print(f"PROBE_COMPLETE: stage={probe} cores={cores} token_bytes={token} "
                   f"counts={counts} output={output_check}{load_check} (not a full regression PASS)", flush=True)
             return 0

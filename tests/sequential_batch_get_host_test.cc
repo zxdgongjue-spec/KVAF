@@ -16,7 +16,7 @@ namespace {
 std::vector<std::function<void()>> work;
 int allocations{}, refs{}, launches{}, completed{}, stopped{}, quiesced{}, hccp_refs{}, push_stopped{};
 bool fail_sync{}, fail_copy{}, fail_quiesce{}, fail_enable{}, capturing{};
-bool old_probe_kernel{}, wrong_probe_phase{}, legacy_load_kernel{};
+bool old_probe_kernel{}, wrong_probe_phase{}, legacy_load_kernel{}, zero_probe_requests{};
 uint64_t kernel_result{};
 std::vector<uint64_t> sequences;
 }
@@ -51,15 +51,22 @@ int Launch(const KvafScatterBatchGetArgs* a) {
   ++launches; sequences.push_back(a->sequence);
   const auto result = args.scatter_probe && !old_probe_kernel && !kernel_result ?
       uint64_t(KVAF_SEQ_PROBE_COMPLETE) : kernel_result;
-  const auto phase = result == KVAF_SEQ_PROBE_COMPLETE ?
-      (args.scatter_probe == KVAF_SEQ_PROBE_LOAD && !legacy_load_kernel ?
-          KVAF_SCATTER_AFTER_LOAD_VERIFIED : uint64_t(KVAF_SEQ_AFTER_DONE) + args.scatter_probe - 1) + wrong_probe_phase :
-      uint64_t(result ? KVAF_SEQ_WAIT_REMOTE : KVAF_SEQ_COMPLETE);
+  uint64_t phase = result ? KVAF_SEQ_WAIT_REMOTE : KVAF_SEQ_COMPLETE;
+  if (result == KVAF_SEQ_PROBE_COMPLETE) {
+    switch (args.scatter_probe) {
+      case KVAF_SEQ_PROBE_SETUP: phase = KVAF_SCATTER_AFTER_SETUP; break;
+      case KVAF_SEQ_PROBE_DMA: phase = KVAF_SCATTER_AFTER_DMA; break;
+      case KVAF_SEQ_PROBE_LOAD: phase = legacy_load_kernel ?
+          uint64_t(KVAF_SEQ_AFTER_LOAD) : KVAF_SCATTER_AFTER_LOAD_VERIFIED; break;
+      default: phase = uint64_t(KVAF_SEQ_AFTER_DONE) + args.scatter_probe - 1; break;
+    }
+    phase += wrong_probe_phase;
+  }
   work.push_back([=] {
     auto* status = reinterpret_cast<KvafSequentialStatus*>(args.request.core_status);
     const auto active = uint64_t(*reinterpret_cast<const int32_t*>(args.request.miss_count));
     for (uint32_t i = 0; i < args.request.block_count; ++i) {
-      const auto requests = args.scatter_probe == KVAF_SEQ_PROBE_DONE ? 0 :
+      const auto requests = args.scatter_probe == KVAF_SEQ_PROBE_DONE || zero_probe_requests ? 0 :
           active * (i + 1) / args.request.block_count - active * i / args.request.block_count;
       status[i] = {KVAF_SEQ_STATUS_MAGIC, args.sequence, result,
                    phase, requests, 0, 0, 0};
@@ -239,7 +246,7 @@ int main() {
     assert(owner->Initialize(region).code() == StatusCode::kInvalidArgument);
     assert(!allocations && !hccp_refs);
   }
-  for (const char* probe : {"done", "flush", "load", "copy"}) {
+  for (const char* probe : {"done", "flush", "setup", "dma", "load", "copy"}) {
     setenv("KVAF_AIV_SCATTER_PROBE", probe, 1);
     auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
     const auto before = launches;
@@ -252,9 +259,29 @@ int main() {
       assert(result.message().find(std::string("[KVAF_AIV_SCATTER_PROBE_COMPLETE] stage=") + probe + " ") == 0);
       if (std::strcmp(probe, "load") == 0)
         assert(result.message().find("verification=gm_ub_byte_compare verified_bytes=") != std::string::npos);
+      if (std::strcmp(probe, "setup") == 0 || std::strcmp(probe, "dma") == 0) {
+        const auto bytes = uint64_t(count) * config.batch_get_token_bytes;
+        const auto field = std::strcmp(probe, "setup") == 0 ? " configured_bytes=" : " dma_bytes=";
+        assert(result.message().find(field + std::to_string(bytes)) != std::string::npos);
+        assert(result.message().find("verified_bytes") == std::string::npos);
+      }
       assert(owner->Drain().ok()); // The observed diagnostic leaves no pending work.
     }
     assert(owner->Shutdown().ok()); assert(!refs && !allocations && !hccp_refs);
+  }
+  for (const char* probe : {"setup", "dma"}) {
+    setenv("KVAF_AIV_SCATTER_PROBE", probe, 1);
+    for (uint32_t mismatch = 0; mismatch < 3; ++mismatch) {
+      auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
+      // Older kernels reject IDs 5/6; wrong phases and empty work must also fail.
+      kernel_result = mismatch == 0 ? KVAF_SEQ_INVALID : KVAF_SEQ_OK;
+      wrong_probe_phase = mismatch == 1; zero_probe_requests = mismatch == 2;
+      const auto result = owner->Execute(exec);
+      assert(result.code() == StatusCode::kInternal);
+      assert(result.message().find("[KVAF_AIV_SCATTER_PROBE_COMPLETE]") == std::string::npos);
+      assert(owner->Shutdown().ok()); assert(!refs && !allocations && !hccp_refs);
+      kernel_result = 0; wrong_probe_phase = zero_probe_requests = false;
+    }
   }
   {
     setenv("KVAF_AIV_SCATTER_PROBE", "load", 1);
@@ -288,7 +315,7 @@ int main() {
     fail_sync = false; assert(owner->Shutdown().ok());
     assert(!refs && !allocations && !hccp_refs);
   }
-  assert(push_stopped == 9);
+  assert(push_stopped == 17);
   unsetenv("KVAF_AIV_SCATTER_PROBE");
   std::cout << "sequential Host lifecycle: PASS\n";
 }

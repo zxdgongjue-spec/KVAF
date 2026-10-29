@@ -342,8 +342,8 @@ payload MTE3。这次日志报告 MTE 异常，不能沿用旧二进制的标量
 LocalTensor。根据 [CANN 9.1 aclrtLaunchKernelAttrValue](https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/910/API/runtimeapi/aclcppdevg_03_1814.html)，
 `dynUBufSize` 用于 SIMT 动态 UB，纯 SIMD 算子只能设为 0。
 此次将 scatter 的该参数设为 0，保持 `.asc`、ABI 和拷贝同步流程不变。
-这个接口约束错误已修正，是否导致本次硬件异常仍需实测；不据此声称 MTE2
-已经通过。暂不增加 `setup`/`dma` 检查点，先复测现有字节校验 `load`。
+这个接口约束错误已修正，但用户确认新 Host 生效后仍报 507015，MTE2 尚未
+通过。后续按下文的 `setup`/`dma` 检查点继续分段定位。
 
 本次修改位于 Host loader，**只重编译 kernel `.o` 不会生效**。在目标机器
 运行 `cmake --build build-npu -j`，确保 Python 加载新生成的
@@ -359,6 +359,39 @@ LocalTensor。根据 [CANN 9.1 aclrtLaunchKernelAttrValue](https://www.hiascend.
 本地 loader 回归直接检查传给 ACL 的 scatter 动态 UB 为 0，同时检查
 direct SIMT 的 160 KiB 配置；修复前新增断言失败，修复后通过。
 
+### setup / dma 独立检查点
+
+在回退元数据及 ELF 检查器提交后，增加 `setup` 和 `dma`。两者沿用真实的
+CPU payload/done 协议，在同一份 `CopyPayload` 中按每个最多 16 KiB 的块
+依次执行到指定位置：
+
+- `setup`：完成 staging flush、tensor/拷贝参数准备、`ResetLoopModePara(OUT_TO_UB)`
+  和 S→MTE2 的 set/wait，然后跳到下一块；不调用 payload DataCopyPad。
+- `dma`：在上述基础上执行 GM→UB DataCopyPad，完成 MTE2→S 的 set/wait
+  后才处理下一块；不调用 `scratch.GetValue`，也不比较 staging 内容。
+- `load`：在 `dma` 的执行范围之后逐字节比较 UB 和 staging。
+
+三个检查点均不发出 MTE3 payload 拷贝，output 必须保持 guard。现有状态写回、
+flush 和最终 `PipeBarrier<PIPE_ALL>()` 仍执行，所以异常定位范围也包括对应
+路径的收尾；不能把检查点的成败直接等同于某一条具体指令。
+
+新增 probe 编号 `setup=5`、`dma=6`，完成 phase 分别为 12、13；保留原编号
+`done=1/flush=2/load=3/copy=4` 和 176 B 参数 ABI。Host 校验每个核的
+magic/sequence/result/phase，并拒绝总处理请求数为零的 MTE2 检查点。
+完成标记分别带 `configured_bytes`、`dma_bytes`；Python 要求它们等于该批
+`active * token_bytes`，不把配置完成或 DMA 完成当成内容校验。
+
+```text
+[KVAF_AIV_SCATTER_PROBE_COMPLETE] stage=setup ... configured_bytes=656
+[KVAF_AIV_SCATTER_PROBE_COMPLETE] stage=dma ... dma_bytes=656
+[KVAF_AIV_SCATTER_PROBE_COMPLETE] stage=load ... verification=gm_ub_byte_compare verified_bytes=656
+```
+
+`setup/dma/load` 各在一个 Runtime 中执行 `[1, min(2 * cores + 1, capacity), 1]`
+三个批次。默认 1 核时是 `[1, 3, 1]`，相应字节数为 656、1968、656。
+需要同时重编 Host 与 kernel；旧 Host 会拒绝新开关，旧 kernel 会拒绝
+新增 probe 编号，不能混用。CPU 服务协议没有改变。
+
 ## Scatter 507015 的分段定位
 
 拆分前，用户已反馈 `gather_read` 在 1、3、8 核通过。当时 Gather 和 scatter
@@ -370,8 +403,8 @@ HBM done 轮询和本地 `CopyPayload`，所以这些部分仍需单独定位。
 字段，UBSan 可复现并验证此修正。这是 Host 初始化问题，尚无证据将它与
 AIV kernel 的 507015/errcode 259 联系起来。
 
-`KVAF_AIV_SCATTER_PROBE` 提供同一 kernel 的四个检查点。done/flush/copy 各运行
-一个非空批次，load 运行三个批次校验 UB 复用。保留真实的 descriptor/notify、
+`KVAF_AIV_SCATTER_PROBE` 提供同一 kernel 的六个检查点。done/flush/copy 各运行
+一个非空批次，setup/dma/load 各运行三个批次。保留真实的 descriptor/notify、
 CPU payload WRITE 和 done 协议；不能
 用 CPU 侧 WRITE CQ 成功代替 AIV 读到本轮 done 的证明。
 
@@ -379,12 +412,14 @@ CPU payload WRITE 和 done 协议；不能
 | --- | --- | --- |
 | `done` | 确认本轮 done 的 sequence/status，随后返回 | output 全部保持 guard |
 | `flush` | 再执行输出行寻址、UB tensor 初始化和 staging 的 scalar cache 处理 | output 全部保持 guard，没有 payload DMA |
+| `setup` | 再完成 MTE2 普通模式配置和 S→MTE2 同步 | configured_bytes 匹配，output 保持 guard，没有 payload DMA |
+| `dma` | 再执行 GM→UB 并完成 MTE2→S 同步 | dma_bytes 匹配，output 保持 guard，不读取 UB 校验，没有 MTE3 写出 |
 | `load` | GM→UB 后通过 MTE2→S 等待读入，再逐字节比较 UB/staging | 必须有字节校验完成标记且字节数匹配，output 保持 guard，没有 MTE3 写出 |
 | `copy` | 完整执行 GM→UB→GM 并等待 MTE3 完成 | 精确比较 payload 和所有 guard |
 
 `load` 现在验证全部有效 UB 数据与 staging 一致；`copy` 进一步验证最终输出。
 各探针保留普通回归的默认 8193 请求容量、656 B token 和输出行位置。
-done/flush/copy 的 active=min(cores, capacity)；load 的批次数量见上节。
+done/flush/copy 的 active=min(cores, capacity)；setup/dma/load 的批次数量见上节。
 
 先在 NPU 端更新并重编译 Host 和 kernel，保留前文的 Python/kernel/CPU 地址
 环境变量。本次诊断开关不修改 CPU 协议，CPU 端可继续使用已匹配分支的服务。
@@ -396,7 +431,7 @@ export PYTHONPATH="$PWD/build-npu/python"
 
 # Bash：每个检查点使用独立进程，首次失败就停下，日志同时留存。
 set -o pipefail
-for stage in done flush load copy; do
+for stage in done flush setup dma load; do
   KVAF_RUN_NPU_TESTS=1 DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 KVAF_NPU_TOKEN_BYTES=656 \
     KVAF_AIV_BATCH_GET_MODES=cpu_push_scatter KVAF_AIV_SCATTER_PROBE="$stage" \
     python -u tests/python/test_aiv_scatter_batch_get.py 2>&1 | tee "scatter-${stage}.log"
@@ -406,6 +441,8 @@ for stage in done flush load copy; do
   fi
 done
 ```
+
+当前先定位 MTE2；`copy` 的 MTE3 检查和完整 scatter 回归留待 MTE2 通过后。
 
 完成检查点会打印 `[KVAF_AIV_SCATTER_PROBE_COMPLETE] stage=...`，验证 output
 和正常 shutdown 后打印 `PROBE_COMPLETE: ...`，不打印普通回归的 `PASS`。
@@ -421,7 +458,10 @@ magic、sequence、专用 result 和 phase，旧 kernel 忽略该字段时会明
 - `done` 就失败：尚不能证明 AIV 已读到 done，继续检查参数/描述符、notify、
   done 轮询和状态写回，结合该次 CPU 日志与 Ascend 异常。
 - `done` 完成、`flush` 失败：优先检查输出行寻址、UB 初始化及 staging cache 操作。
-- `flush` 完成、`load` 失败：优先检查 GM→UB 参数、cache hint、事件同步与诊断收尾。
+- `flush` 完成、`setup` 失败：优先检查 MTE2 普通模式配置、S→MTE2 同步及收尾。
+- `setup` 完成、`dma` 失败：范围缩小到 GM→UB DataCopyPad、MTE2→S 同步及收尾。
+- `dma` 完成、`load` 失败：重点检查 UB 标量读取和内容比较；若返回
+  `MTE2_GM_UB_byte_mismatch` 则是校验不一致，需与设备异常 507015 区分。
 - `load` 完成、`copy` 失败：优先检查 UB→GM、输出地址和 MTE3 完成同步；若是
   output 比较失败而非 507015，则转查内容、长度和可见性。
 
@@ -430,8 +470,8 @@ abort 的 context 强行读取状态；保留本轮 `PROBE_BEGIN`、CPU 日志�
 先确保故障进程结束、设备恢复可用，再运行下一次试验。新二进制的故障 PC
 需要与新 `.o` 对应，不能沿用旧 `+0xa18`。
 
-四个检查点均完成后，清除开关运行普通回归，覆盖空批次、序号复用、A/B/A
-输出、大小批次和跨 stream；探针只测一个批次，不能替代这些场景。
+后续 `copy` 检查点也完成后，清除开关运行普通回归，覆盖空批次、序号复用、A/B/A
+输出、大小批次和跨 stream；检查点测试不能替代这些完整输出场景。
 
 ```bash
 KVAF_AIV_SCATTER_PROBE= DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 \
@@ -552,10 +592,12 @@ manifest、宏和 `.ii`，按预处理后的有效定义提取初始化函数，
   output 与 UB 边界 guard。模型不替代真实 CANN 编译和设备异常检查。
 - 真实 Host owner 的延迟 ACL 模型：串行复用、异步错误上报、capture 拒绝、
   部分初始化和关闭失败时资源保留/重试。Host 集成源码使用 ACL 声明替身编译。
-- Scatter 四个检查点的模型覆盖：真实 notify/done 流程、1/3/8 核、656/16385 B
+- Scatter 六个检查点的模型覆盖：真实 notify/done 流程、1/3/8 核、656/16385 B
   token、重复序号、预期 DMA 次数、output guard、空请求/非法模式/超时拒绝；
+  分别检查普通模式配置、S→MTE2/MTE2→S 等待次数，以及 UB 标量读取次数；
+  注入损坏 UB 时，dma 仅报告搬运完成，load 必须报告内容不匹配。
   Host 覆盖旧 kernel、错误 phase、设备错误保留、同步要求和诊断后的资源回收。
-  Python 检查只接受对应 checkpoint 标记，不吞掉 507015 或其他异常。
+  Python 检查只接受对应 checkpoint 标记及匹配字节数，不吞掉 507015 或其他异常。
 - 新增内核模型和 Host 生命周期测试通过 AddressSanitizer / UndefinedBehaviorSanitizer。
 - CPU 新源码使用 UMDK 24.12 头文件通过语法检查；macOS 检查时仅补充 Linux
   的 `MADV_HUGEPAGE` 常量，未链接或执行 CPU 硬件服务。
@@ -563,8 +605,10 @@ manifest、宏和 `.ii`，按预处理后的有效定义提取初始化函数，
 用户此前已在硬件反馈 gather 的 1/3/8 核回归通过；拆分后撤回入口操作的独立
 gather 也已反馈成功（所给命令为 1 核）。scatter 探针此前反馈 flush 完成、
 load 失败，补初始化后仍有 507015。撤掉整体初始化、按官方源码调整 MTE2
-配置、UB 构造及内容验证后，新日志仍报告 MTE 异常 78。当前进一步修正了
-scatter Host 的纯 SIMD 启动参数，尚待上机验收新版 load。尚待验证 scatter
+配置、UB 构造及内容验证后，新日志仍报告 MTE 异常 78。修正 scatter Host
+的纯 SIMD 启动参数后，用户确认新 Host 生效但仍报 507015。元数据及 ELF
+检查器提交已按用户要求回退；当前增加 setup/dma 分段检查点，尚待上机验证。
+尚待验证 scatter
 的非对齐 MTE3 写出、CPU/NPU 缓存可见性、跨 Jetty
 done 保序及真实超时/断链回收。这些本地检查不替代 CANN 编译和双机验收。
 硬件回归未启用时返回 skip，不能视为硬件验收通过。

@@ -24,6 +24,8 @@ const char* ProbeName(uint32_t probe) {
   switch (probe) {
     case KVAF_SEQ_PROBE_DONE: return "done";
     case KVAF_SEQ_PROBE_FLUSH: return "flush";
+    case KVAF_SEQ_PROBE_SETUP: return "setup";
+    case KVAF_SEQ_PROBE_DMA: return "dma";
     case KVAF_SEQ_PROBE_LOAD: return "load";
     case KVAF_SEQ_PROBE_COPY: return "copy";
     default: return "none";
@@ -33,6 +35,8 @@ uint64_t ProbePhase(uint32_t probe) {
   switch (probe) {
     case KVAF_SEQ_PROBE_DONE: return KVAF_SEQ_AFTER_DONE;
     case KVAF_SEQ_PROBE_FLUSH: return KVAF_SEQ_AFTER_FLUSH;
+    case KVAF_SEQ_PROBE_SETUP: return KVAF_SCATTER_AFTER_SETUP;
+    case KVAF_SEQ_PROBE_DMA: return KVAF_SCATTER_AFTER_DMA;
     case KVAF_SEQ_PROBE_LOAD: return KVAF_SCATTER_AFTER_LOAD_VERIFIED;
     case KVAF_SEQ_PROBE_COPY: return KVAF_SEQ_AFTER_COPY;
     default: return KVAF_SEQ_COMPLETE;
@@ -99,7 +103,7 @@ struct ScatterBatchGet::Impl {
     const auto* statuses = static_cast<const KvafSequentialStatus*>(status_host);
     const uint64_t expected_result = args.scatter_probe ? KVAF_SEQ_PROBE_COMPLETE : KVAF_SEQ_OK;
     const uint64_t expected_phase = ProbePhase(args.scatter_probe);
-    uint64_t verified_requests = 0;
+    uint64_t completed_requests = 0;
     for (uint32_t i = 0; i < config.npu_core_count; ++i) {
       const auto& s = statuses[i];
       if (s.magic != KVAF_SEQ_STATUS_MAGIC || s.sequence != sequence || s.result != expected_result ||
@@ -113,11 +117,12 @@ struct ScatterBatchGet::Impl {
             " expected_result=" + std::to_string(expected_result) +
             (s.result == KVAF_SCATTER_MTE2_MISMATCH ? " detail=MTE2_GM_UB_byte_mismatch" : ""));
       }
-      verified_requests += s.requests;
+      completed_requests += s.requests;
     }
-    if (args.scatter_probe == KVAF_SEQ_PROBE_LOAD && !verified_requests) {
+    if ((args.scatter_probe == KVAF_SEQ_PROBE_SETUP || args.scatter_probe == KVAF_SEQ_PROBE_DMA ||
+         args.scatter_probe == KVAF_SEQ_PROBE_LOAD) && !completed_requests) {
       failed = true;
-      return Error("MTE2 load probe verified no requests");
+      return Error("MTE2 probe completed no requests");
     }
     if (args.scatter_probe) {
       // Prefix probes do not fill output. Even the full-copy probe uses this
@@ -125,9 +130,13 @@ struct ScatterBatchGet::Impl {
       return Status::NotImplemented("[KVAF_AIV_SCATTER_PROBE_COMPLETE] stage=" +
           std::string(ProbeName(args.scatter_probe)) + " sequence=" + std::to_string(sequence) +
           " cores=" + std::to_string(config.npu_core_count) +
-          (args.scatter_probe == KVAF_SEQ_PROBE_LOAD ?
+          (args.scatter_probe == KVAF_SEQ_PROBE_SETUP ?
+              " configured_bytes=" + std::to_string(completed_requests * config.batch_get_token_bytes) :
+           args.scatter_probe == KVAF_SEQ_PROBE_DMA ?
+              " dma_bytes=" + std::to_string(completed_requests * config.batch_get_token_bytes) :
+           args.scatter_probe == KVAF_SEQ_PROBE_LOAD ?
               " verification=gm_ub_byte_compare verified_bytes=" +
-                  std::to_string(verified_requests * config.batch_get_token_bytes) : ""));
+                  std::to_string(completed_requests * config.batch_get_token_bytes) : ""));
     }
     return Status::OK();
   }
@@ -251,10 +260,10 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
     return Status::InvalidArgument("invalid sequential BatchGet configuration");
   const char* probe = std::getenv("KVAF_AIV_SCATTER_PROBE");
   if (probe && *probe) {
-    for (uint32_t value = KVAF_SEQ_PROBE_DONE; value <= KVAF_SEQ_PROBE_COPY; ++value)
+    for (uint32_t value = KVAF_SEQ_PROBE_DONE; value <= KVAF_SEQ_PROBE_DMA; ++value)
       if (std::strcmp(probe, ProbeName(value)) == 0) s.args.scatter_probe = value;
     if (!s.args.scatter_probe)
-      return Status::InvalidArgument("KVAF_AIV_SCATTER_PROBE must be done, flush, load or copy");
+      return Status::InvalidArgument("KVAF_AIV_SCATTER_PROBE must be done, flush, setup, dma, load or copy");
   }
   s.region = region;
   if (s.config.peer_local_eids.size() == 1) s.config.peer_local_eid = s.config.peer_local_eids.front();

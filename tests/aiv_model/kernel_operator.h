@@ -44,6 +44,7 @@ struct PendingCopy {
 inline PendingCopy mte2, mte3;
 inline uint64_t mte2_copies{}, mte3_copies{};
 inline uint64_t ub_scalar_reads{};
+inline uint64_t out_to_ub_resets{}, event_waits[4][4]{};
 inline bool corrupt_next_mte2{};
 }
 inline void set_flag(int source, int target, event_t event) {
@@ -53,6 +54,7 @@ inline void set_flag(int source, int target, event_t event) {
 inline void wait_flag(int source, int target, event_t event) {
   if (!model_events[source][target][event]) std::abort();
   model_events[source][target][event] = false;
+  ++aiv_model::event_waits[source][target];
   if (source == PIPE_MTE2) {
     auto* dst = aiv_model::mte2.destination;
     const auto bytes = aiv_model::mte2.bytes;
@@ -98,6 +100,7 @@ inline void ResetLoopModePara(DataCopyMVType type) {
   // Hardware register effects need device validation; model only the selected
   // direction. The MTE2 probe must not configure the MTE3 pipeline.
   if (type != DataCopyMVType::OUT_TO_UB) std::abort();
+  ++aiv_model::out_to_ub_resets;
 }
 template <typename T> struct GlobalTensor {
   T* data;

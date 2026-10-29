@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <memory>
+#include <utility>
 #include <vector>
 #include "kernel_operator.h"
 #include "cpu_gather_executor.h"
@@ -291,7 +292,11 @@ int main() {
       gather.Next(19); gather.Run();
       assert(gather.completions && gather.data_reads);
     }
-  for (uint32_t probe : {KVAF_SEQ_PROBE_DONE, KVAF_SEQ_PROBE_FLUSH, KVAF_SEQ_PROBE_LOAD, KVAF_SEQ_PROBE_COPY})
+  const std::pair<uint32_t, uint64_t> probes[] = {
+      {KVAF_SEQ_PROBE_DONE, KVAF_SEQ_AFTER_DONE}, {KVAF_SEQ_PROBE_FLUSH, KVAF_SEQ_AFTER_FLUSH},
+      {KVAF_SEQ_PROBE_SETUP, KVAF_SCATTER_AFTER_SETUP}, {KVAF_SEQ_PROBE_DMA, KVAF_SCATTER_AFTER_DMA},
+      {KVAF_SEQ_PROBE_LOAD, KVAF_SCATTER_AFTER_LOAD_VERIFIED}, {KVAF_SEQ_PROBE_COPY, KVAF_SEQ_AFTER_COPY}};
+  for (const auto& [probe, phase] : probes)
     for (uint32_t workers : {1U, 3U, 8U})
       for (uint32_t bytes : {656U, 16385U}) {
         Fixture f(19, bytes, workers, KVAF_SEQ_SCATTER, 6);
@@ -304,19 +309,26 @@ int main() {
                         reinterpret_cast<void*>(f.addresses[f.indices[i]] + f.offsets[i]), bytes);
           const auto reads = aiv_model::mte2_copies, writes = aiv_model::mte3_copies;
           const auto scalar_reads = aiv_model::ub_scalar_reads;
+          const auto resets = aiv_model::out_to_ub_resets;
+          const auto setup_waits = aiv_model::event_waits[PIPE_S][PIPE_MTE2];
+          const auto dma_waits = aiv_model::event_waits[PIPE_MTE2][PIPE_S];
           for (uint32_t core = 0; core < workers; ++core) {
             aiv_model::core = core;
             Launch(f.args);
             const auto& s = f.status[core];
             assert(s.magic == KVAF_SEQ_STATUS_MAGIC && s.sequence == f.args.sequence);
             assert(s.result == KVAF_SEQ_PROBE_COMPLETE);
-            assert(s.phase == (probe == KVAF_SEQ_PROBE_LOAD ? KVAF_SCATTER_AFTER_LOAD_VERIFIED :
-                uint64_t(KVAF_SEQ_AFTER_DONE) + probe - KVAF_SEQ_PROBE_DONE));
+            assert(s.phase == phase);
           }
           assert(f.push_done);  // Every probe still needs the real notify/done protocol.
           assert(f.output == expected);
-          const auto expected_reads = probe >= KVAF_SEQ_PROBE_LOAD ?
-              count * ((bytes + kCopyBytes - 1) / kCopyBytes) : 0;
+          const auto chunks = count * ((bytes + kCopyBytes - 1) / kCopyBytes);
+          const bool configured = probe != KVAF_SEQ_PROBE_DONE && probe != KVAF_SEQ_PROBE_FLUSH;
+          const auto expected_reads = configured && probe != KVAF_SEQ_PROBE_SETUP ? chunks : 0;
+          assert(aiv_model::out_to_ub_resets - resets == (configured ? chunks : 0));
+          assert(aiv_model::event_waits[PIPE_S][PIPE_MTE2] - setup_waits == (configured ? chunks : 0));
+          assert(aiv_model::event_waits[PIPE_MTE2][PIPE_S] - dma_waits ==
+              (probe == KVAF_SEQ_PROBE_DMA || probe == KVAF_SEQ_PROBE_LOAD ? chunks : 0));
           assert(aiv_model::mte2_copies - reads == expected_reads);
           assert(aiv_model::mte3_copies - writes == (probe == KVAF_SEQ_PROBE_COPY ? expected_reads : 0));
           assert(aiv_model::ub_scalar_reads - scalar_reads ==
@@ -327,6 +339,21 @@ int main() {
               for (bool pending : direction) assert(!pending);
         }
       }
+  {
+    // DMA completion alone cannot establish correct contents: even corrupted
+    // UB is deliberately not read by dma. The load case below must reject it.
+    Fixture dma(3, 656, 1, KVAF_SEQ_SCATTER, 6);
+    dma.args.scatter_probe = KVAF_SEQ_PROBE_DMA;
+    const auto scalar_reads = aiv_model::ub_scalar_reads, writes = aiv_model::mte3_copies;
+    const auto output = dma.output;
+    aiv_model::corrupt_next_mte2 = true;
+    dma.Run(false);
+    assert(!aiv_model::corrupt_next_mte2);
+    assert(dma.status[0].result == KVAF_SEQ_PROBE_COMPLETE);
+    assert(dma.status[0].phase == KVAF_SCATTER_AFTER_DMA);
+    assert(aiv_model::ub_scalar_reads == scalar_reads && aiv_model::mte3_copies == writes);
+    assert(dma.output == output);
+  }
   {
     // A successful DMA completion with one wrong UB byte must fail the load
     // probe, without changing output or issuing any MTE3 payload operation.
@@ -341,20 +368,22 @@ int main() {
     assert(aiv_model::mte3_copies == writes);
   }
   {
-    Fixture empty(1, 656, 1, KVAF_SEQ_SCATTER, 6);
-    empty.args.scatter_probe = KVAF_SEQ_PROBE_DONE; empty.active = 0; empty.Run(false);
-    assert(empty.status[0].result == KVAF_SEQ_INVALID && !empty.push_requests);
+    for (uint32_t probe : {KVAF_SEQ_PROBE_DONE, KVAF_SEQ_PROBE_SETUP, KVAF_SEQ_PROBE_DMA, KVAF_SEQ_PROBE_LOAD}) {
+      Fixture empty(1, 656, 1, KVAF_SEQ_SCATTER, 6);
+      empty.args.scatter_probe = probe; empty.active = 0; empty.Run(false);
+      assert(empty.status[0].result == KVAF_SEQ_INVALID && !empty.push_requests);
+      Fixture timeout(1, 656, 1, KVAF_SEQ_SCATTER, 6);
+      timeout.args.scatter_probe = probe; timeout.timeout = true; timeout.Run(false);
+      assert(timeout.status[0].result == KVAF_SEQ_TIMEOUT);
+      Fixture remote(1, 656, 1, KVAF_SEQ_SCATTER, 6);
+      remote.args.scatter_probe = probe; remote.remote_error = true; remote.Run(false);
+      assert(remote.status[0].result == KVAF_SEQ_REMOTE_ERROR);
+    }
     Fixture invalid(1, 656, 1, KVAF_SEQ_SCATTER, 6);
     invalid.args.scatter_probe = 99; invalid.Run(false); assert(!invalid.push_requests);
     Fixture gather(1, 656, 1, KVAF_SEQ_GATHER, 6);
     // Scatter-only configuration cannot reach the gather ABI.
     gather.args.scatter_probe = KVAF_SEQ_PROBE_DONE; gather.Run(); assert(gather.completions);
-    Fixture timeout(1, 656, 1, KVAF_SEQ_SCATTER, 6);
-    timeout.args.scatter_probe = KVAF_SEQ_PROBE_DONE; timeout.timeout = true; timeout.Run(false);
-    assert(timeout.status[0].result == KVAF_SEQ_TIMEOUT);
-    Fixture remote(1, 656, 1, KVAF_SEQ_SCATTER, 6);
-    remote.args.scatter_probe = KVAF_SEQ_PROBE_LOAD; remote.remote_error = true; remote.Run(false);
-    assert(remote.status[0].result == KVAF_SEQ_REMOTE_ERROR);
   }
   {
     // Isolate the real payload helper from URMA: all GM alignment residues,

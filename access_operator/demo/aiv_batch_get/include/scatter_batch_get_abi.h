@@ -4,10 +4,14 @@
 enum KvafSequentialScatterProbe : uint32_t {
   KVAF_SEQ_PROBE_NONE = 0, KVAF_SEQ_PROBE_DONE = 1,
   KVAF_SEQ_PROBE_FLUSH = 2, KVAF_SEQ_PROBE_LOAD = 3, KVAF_SEQ_PROBE_COPY = 4,
+  // Append IDs so existing Host/kernel probe values retain their meaning.
+  KVAF_SEQ_PROBE_SETUP = 5, KVAF_SEQ_PROBE_DMA = 6,
 };
 // Distinguish a byte-verified MTE2 load from the legacy AFTER_LOAD checkpoint.
 // Launch/status layouts stay unchanged; old Host/kernel combinations fail closed.
 constexpr uint64_t KVAF_SCATTER_AFTER_LOAD_VERIFIED = 11;
+constexpr uint64_t KVAF_SCATTER_AFTER_SETUP = 12;
+constexpr uint64_t KVAF_SCATTER_AFTER_DMA = 13;
 constexpr uint64_t KVAF_SCATTER_MTE2_MISMATCH = 7;
 struct KvafScatterBatchGetArgs {
   KvafExecuteBatchGetKernelArgs request;
