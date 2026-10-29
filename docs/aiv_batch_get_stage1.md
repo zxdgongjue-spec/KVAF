@@ -97,8 +97,10 @@ cmake --build build-npu -j
 export PYTHONPATH="$PWD/build-npu/python"
 export KVAF_RUN_NPU_TESTS=1
 export KVAF_CPU_SERVICE_ADDR=CPU_IP:28999
-export KVAF_BATCH_GET_KERNEL="$PWD/build-npu/access_operator/demo/aiv_batch_get/kernel/kvaf_execute_batch_get_kernels.o"
-export KVAF_BATCH_PUT_KERNEL=/path/to/built/kvaf_execute_batch_put_kernels.o
+export KVAF_BATCH_GET_KERNEL="$PWD/build-npu/bin/kvaf_execute_batch_get_kernels.o"
+export KVAF_BATCH_PUT_KERNEL="$PWD/build-npu/bin/kvaf_execute_batch_put_kernels.o"
+ls -l "$KVAF_BATCH_GET_KERNEL" "$KVAF_BATCH_PUT_KERNEL" \
+  "$PWD/build-npu/bin/kvaf_sequential_batch_get_kernels.o"
 KVAF_NPU_CORE_COUNT=1 python tests/python/test_aiv_sequential_batch_get.py
 KVAF_NPU_CORE_COUNT=3 python tests/python/test_aiv_sequential_batch_get.py
 KVAF_NPU_CORE_COUNT=8 python tests/python/test_aiv_sequential_batch_get.py
@@ -109,6 +111,8 @@ KVAF_NPU_CORE_COUNT=8 python tests/python/test_aiv_sequential_batch_get.py
 可用 `KVAF_NPU_TOKEN_BYTES=13`、`KVAF_NPU_REQUESTS=65536`、
 `KVAF_AIV_GATHER_SGL_SIZE=1` 增加边界组合。
 CPU `--gather-threads` 至少等于 gather 的 AIV 核数。
+上述命令在仓库根目录执行。Get、Put 及同目录下的 sequential 三个 `.o` 文件
+都应存在；路径检查失败时脚本会打印具体变量及绝对路径，并在初始化 NPU 前退出。
 
 ## 当前验证状态
 

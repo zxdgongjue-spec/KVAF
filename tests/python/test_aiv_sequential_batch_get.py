@@ -8,12 +8,42 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import sys
+
+
+def kernel_paths() -> tuple[str, str]:
+    paths = {}
+    errors = []
+    for name in ("KVAF_BATCH_GET_KERNEL", "KVAF_BATCH_PUT_KERNEL"):
+        value = os.environ.get(name, "")
+        if not value:
+            errors.append(f"{name} is not set")
+            continue
+        path = Path(value).expanduser().resolve()
+        paths[name] = path
+        if not path.is_file():
+            errors.append(f"{name} does not name an existing file: {path}")
+    get_kernel = paths.get("KVAF_BATCH_GET_KERNEL")
+    if get_kernel is not None and get_kernel.name == "kvaf_execute_batch_get_kernels.o":
+        companion = get_kernel.with_name("kvaf_sequential_batch_get_kernels.o")
+        if not companion.is_file():
+            errors.append(f"sequential BatchGet companion is missing: {companion}")
+    if errors:
+        raise ValueError("\n".join(errors) +
+                         "\nBuild with cmake --build build-npu -j, then point the kernel "
+                         "variables to the .o files in build-npu/bin/.")
+    return str(paths["KVAF_BATCH_GET_KERNEL"]), str(paths["KVAF_BATCH_PUT_KERNEL"])
 
 
 def main() -> int:
     if os.environ.get("KVAF_RUN_NPU_TESTS") != "1":
         print("SKIP: set KVAF_RUN_NPU_TESTS=1 on the A5/CANN target")
         return 77
+    try:
+        kernel, put_kernel = kernel_paths()
+    except ValueError as error:
+        print(f"FAIL: {error}", file=sys.stderr)
+        return 2
     from backend import detect_torch_backend
     from dsa_keys import build_dsa_keys
     from npu_eids import parse_npu_eids
@@ -23,9 +53,6 @@ def main() -> int:
     if backend.name != "npu" or not hasattr(kvaf, "NpuRuntime"):
         raise RuntimeError("hardware test was requested but NPU Runtime is unavailable")
     torch = backend.torch
-    kernel = os.environ["KVAF_BATCH_GET_KERNEL"]
-    put_kernel = os.environ["KVAF_BATCH_PUT_KERNEL"]
-    assert Path(kernel).is_file() and Path(put_kernel).is_file()
     endpoint = os.environ["KVAF_CPU_SERVICE_ADDR"]
     modes = os.environ.get("KVAF_AIV_BATCH_GET_MODES", "cpu_push_scatter,gather_read").split(",")
     assert all(mode in ("cpu_push_scatter", "gather_read") for mode in modes)
