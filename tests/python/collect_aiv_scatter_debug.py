@@ -19,7 +19,6 @@ import sys
 import tempfile
 
 
-KERNEL = "KvafSequentialBatchGetAivKernelV1"
 SOURCE = "execute_sequential_batch_get_aiv.asc"
 TEMP_OBJECT = "kvaf_sequential_batch_get.tmp.o"
 OBJECT = "kvaf_sequential_batch_get_kernels.o"
@@ -79,18 +78,74 @@ def snapshot(path: Path, destination: Path, records: list) -> None:
     records.append(record)
 
 
-def excerpts(text: str, pattern: str, following: int, limit: int = 2) -> str:
-    lines = text.splitlines()
-    selected = []
-    end = -1
-    for i, line in enumerate(lines):
-        if i <= end or not re.search(pattern, line):
+def init_definitions(text: str) -> list[dict]:
+    # Inspect active, preprocessed definitions, not a header-name whitelist or
+    # the first occurrence (which is commonly a declaration or wrapper call).
+    # Blank literals/comments while preserving offsets for brace matching.
+    tokens = r'//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\''
+    masked = re.sub(tokens, lambda m: re.sub(r"[^\n]", " ", m.group()), text)
+    pattern = r"\b(InitSocState(?:Impl)?)\s*\([^(){};]*\)\s*\{"
+    definitions = []
+    for match in re.finditer(pattern, masked):
+        depth, end = 1, match.end()
+        while depth and end < len(masked):
+            depth += (masked[end] == "{") - (masked[end] == "}")
+            end += 1
+        if depth:
             continue
-        end = min(len(lines), i + following)
-        selected.append("\n".join(f"{j + 1}: {lines[j]}" for j in range(max(0, i - 2), end)))
-        if len(selected) == limit:
-            break
-    return "\n\n".join(selected)
+        start = text.rfind("\n", 0, match.start()) + 1
+        path, line = "<unknown>", 1
+        for previous in text[:start].splitlines():
+            marker = re.match(r'^#\s+(\d+)\s+"([^"\n]+)"', previous)
+            if marker:
+                line, path = int(marker[1]), marker[2]
+            else:
+                line += 1
+        definitions.append({"name": match[1], "path": path, "line": line,
+                            "ii_line": text.count("\n", 0, start) + 1,
+                            "text": text[start:end]})
+    return definitions
+
+
+def init_evidence(output: Path) -> tuple[str, list[dict]]:
+    report = ["ACTIVE INITIALIZATION SOURCE (not an instruction/PC mapping):"]
+    macros = output / "macros.txt"
+    if macros.is_file():
+        # Avoid hundreds of ASCEND header guards and unrelated library macros.
+        pattern = r"^#define (?:__CCE_\w*|__DAV_\w*|__NPU_ARCH__|ASCEND_IS_AI[CV])\b"
+        report.extend(["ARCHITECTURE MACROS:", "\n".join(
+            line for line in macros.read_text(errors="replace").splitlines() if re.match(pattern, line))])
+    preprocessed = output / "sequential.ii"
+    if not preprocessed.is_file():
+        return "\n\n".join(report + ["MISSING sequential.ii"]), []
+    data = preprocessed.read_bytes()
+    report.append(f"PREPROCESSED: {preprocessed}\nSHA256: {hashlib.sha256(data).hexdigest()}")
+    definitions = init_definitions(data.decode(errors="replace"))
+    for definition in definitions:
+        report.append(f"DEFINITION: {definition['name']}\n"
+                      f"SOURCE: {definition['path']}:{definition['line']}\n"
+                      f"PREPROCESSED LINE: {definition['ii_line']}\n{definition['text']}")
+    if not any(d["name"] == "InitSocStateImpl" for d in definitions):
+        report.append("InitSocStateImpl DEFINITION NOT FOUND; wrapper alone is insufficient.")
+    return "\n\n".join(report), definitions
+
+
+def analyze_saved(output: Path) -> tuple[Path, bool]:
+    # Read existing evidence only: do not invoke the compiler, load a kernel,
+    # reread today's SDK headers, or replace the original collection report.
+    manifest_path = output / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    evidence, definitions = init_evidence(output)
+    complete = any(d["name"] == "InitSocStateImpl" for d in definitions)
+    report = ["KVAF saved initialization source analysis", "Not a hardware PASS or a fault-PC mapping.",
+              "SAVED MANIFEST: " + str(manifest_path),
+              "COMPILE COMMAND: " + shlex.join(manifest["compile_command"]),
+              "ORIGINAL STEPS: " + json.dumps(manifest["steps"]), evidence,
+              "INIT_SOURCE_FOUND" if complete else "INIT_SOURCE_INCOMPLETE"]
+    with tempfile.NamedTemporaryFile(mode="w", prefix="init-report-", suffix=".txt",
+                                     dir=output, delete=False) as stream:
+        stream.write("\n\n".join(report) + "\n")
+        return Path(stream.name), complete
 
 
 def collect(build: Path, kernel: Path | None = None) -> tuple[Path, bool]:
@@ -160,15 +215,18 @@ def collect(build: Path, kernel: Path | None = None) -> tuple[Path, bool]:
             skip = True
         elif arg != "-c":
             base.append(arg)
+    # CANN 9.1 rejects device-side -S. Collect supported preprocessing evidence;
+    # do not guess alternative assembly flags or claim an instruction mapping.
     for name, flags, filename in (("macros", ["-E", "-dM"], "macros.txt"),
-                                  ("preprocess", ["-E"], "sequential.ii"),
-                                  ("assembly", ["-S"], "sequential.s")):
+                                  ("preprocess", ["-E"], "sequential.ii")):
         print(f"[KVAF_DEBUG] phase={name}", flush=True)
         target = output / filename
         codes[name] = run(base + flags + ["-o", str(target)], cwd, output / f"{name}.log")
         if codes[name] == 0 and (not target.is_file() or target.stat().st_size == 0):
             codes[name] = 125
 
+    evidence, definitions = init_evidence(output)
+    codes["init_impl"] = 0 if any(d["name"] == "InitSocStateImpl" for d in definitions) else 125
     headers = []
     preprocessed = output / "sequential.ii"
     if preprocessed.is_file():
@@ -177,7 +235,9 @@ def collect(build: Path, kernel: Path | None = None) -> tuple[Path, bool]:
                  "kernel_operator_data_copy_impl.h", "kernel_operator_data_copy_intf_impl.h",
                  "kernel_struct_data_copy.h"}
         included = re.findall(r'^#\s+\d+\s+"([^"\n]+)"', preprocessed.read_text(errors="replace"), re.M)
-        for path in sorted({(cwd / name).resolve() for name in included if Path(name).name in names}):
+        selected = {name for name in included if Path(name).name in names}
+        selected.update(d["path"] for d in definitions if d["path"] != "<unknown>")
+        for path in sorted({(cwd / name).resolve() for name in selected}):
             if not path.is_file():
                 continue
             saved = output / "headers" / f"{len(headers)}_{path.name}"
@@ -186,8 +246,8 @@ def collect(build: Path, kernel: Path | None = None) -> tuple[Path, bool]:
 
     report = ["KVAF sequential scatter compiler diagnostics", "",
               "This is a collection report, not a hardware PASS.",
-              "Original .o files are preserved. Re-emitted .s is not proven byte-identical to them;",
-              "do not equate an assembly line number with the old fault PC offset.", "",
+              "Original .o files are preserved. Source evidence does not map the fault PC.",
+              "Device-side -S is unsupported by the observed CANN 9.1; assembly is not requested.", "",
               "COMPILE CWD: " + str(cwd), "COMPILE COMMAND: " + shlex.join(argv),
               "COMPILER RESOLVED: " + str(compiler.resolve()), "CACHE PATHS: " + json.dumps(paths, indent=2), "",
               "FILES: " + json.dumps(files, indent=2), "",
@@ -195,29 +255,13 @@ def collect(build: Path, kernel: Path | None = None) -> tuple[Path, bool]:
     for record in files:
         if "/versions/" in record.get("saved", ""):
             report.extend(["VERSION FILE: " + record["path"], Path(record["saved"]).read_text(errors="replace")])
-    macros = output / "macros.txt"
-    if macros.is_file():
-        report.extend(["ARCHITECTURE MACROS:", "\n".join(line for line in macros.read_text(errors="replace").splitlines()
-                       if re.search(r"CCE|NPU_ARCH|ASCEND|DAV", line))])
-    for original, saved in headers:
-        snippet = excerpts(saved.read_text(errors="replace"), r"\bInitSocState\w*\s*\(", 100)
-        if snippet:
-            report.extend(["INIT IMPLEMENTATION: " + str(original), snippet])
-    assembly = output / "sequential.s"
-    if assembly.is_file():
-        text = assembly.read_text(errors="replace")
-        snippet = excerpts(text, rf"^\s*{KERNEL}:", 180, 1)
-        if not snippet:
-            snippet = excerpts(text, KERNEL, 180, 1)
-        if not snippet:
-            codes["assembly"] = 125
-        report.extend(["ASSEMBLY ENTRY EXCERPT (full listing: sequential.s):", snippet or "KERNEL SYMBOL NOT FOUND"])
+    report.append(evidence)
     for name, code in codes.items():
         log = output / f"{name}.log"
         if code and log.is_file():
             report.extend(["FAILED STEP: " + name, log.read_text(errors="replace")])
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    complete = all(codes.get(name) == 0 for name in ("compiler_version", "macros", "preprocess", "assembly"))
+    complete = all(codes.get(name) == 0 for name in ("compiler_version", "macros", "preprocess", "init_impl"))
     report.append("STEPS: " + json.dumps(codes, indent=2))
     report.append("COLLECTION_COMPLETE" if complete else "COLLECTION_PARTIAL: inspect step logs; originals retained")
     (output / "report.txt").write_text("\n\n".join(report) + "\n")
@@ -226,16 +270,26 @@ def collect(build: Path, kernel: Path | None = None) -> tuple[Path, bool]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("build_dir", type=Path)
+    parser.add_argument("build_dir", type=Path, nargs="?")
+    parser.add_argument("--analyze", type=Path, metavar="SAVED_DIRECTORY",
+                        help="extract actual InitSocStateImpl from saved .ii without invoking any compiler")
     parser.add_argument("--kernel", type=Path, default=os.environ.get("KVAF_BATCH_GET_KERNEL"),
                         help="also preserve the configured kernel (default: KVAF_BATCH_GET_KERNEL)")
     args = parser.parse_args()
+    if args.analyze and (args.build_dir or "--kernel" in sys.argv[1:]):
+        parser.error("--analyze uses only saved evidence; do not specify build_dir or --kernel")
+    if not args.analyze and not args.build_dir:
+        parser.error("specify build_dir or --analyze SAVED_DIRECTORY")
     try:
-        output, complete = collect(args.build_dir.resolve(), args.kernel)
+        if args.analyze:
+            report, complete = analyze_saved(args.analyze.resolve())
+        else:
+            output, complete = collect(args.build_dir.resolve(), args.kernel)
+            report = output / "report.txt"
     except (OSError, ValueError) as error:
         print(f"COLLECT_FAILED: {error}", file=sys.stderr)
         return 2
-    print(f"{'COLLECTED' if complete else 'PARTIAL'}: {output / 'report.txt'}", flush=True)
+    print(f"{'COLLECTED' if complete else 'PARTIAL'}: {report}", flush=True)
     return 0 if complete else 2
 
 
