@@ -50,6 +50,25 @@ CANN 默认位置为 `/usr/local/Ascend/ascend-toolkit/latest`；也可通过
 
 ## 硬件验收
 
+默认自动选择 CPU 候选和 NPU EID，可省略这两个参数：
+
+```bash
+python tests/python/test_cpu_offload.py --cpu 127.0.0.1:28999 --device 7
+```
+
+CPU 候选按服务发现的 ID 顺序遍历；对每个 CPU 候选，先试当前物理 NPU 的
+`/etc/hccl_rootinfo.json` 中 `net_layer=1` 的 CLOS EID，再试
+`/proc/asdrv_ub/pair_info` 中唯一活动通道的 device EID。两种来源去重。
+`KVAF_HCCL_ROOTINFO_PATH` 可指定其他 rootinfo 文件；读取 pair_info 会在共享锁内
+向 `/proc/asdrv_ub/dev_id` 写入物理设备 ID，需要具备相应访问权限。
+某个来源不可用时继续使用另一来源；都不可用则报错，可显式指定 EID。
+
+每组候选必须通过真实 READ 和 CPU DDR 校验和才会选中。失败且已清理的候选输出
+`CPU_PULL_CANDIDATE_REJECTED ... cleanup=complete`，随后尝试下一组；成功输出
+`CPU_PULL_CANDIDATE_SELECTED cpu_candidate=... cpu_eid=... npu_eid=...`。
+自动选择仅发生在初始化阶段，后续 offload 固定使用选中的组合。
+这次新增的自动回退尚需硬件验证，以下记录是此前显式指定参数的验证结果。
+
 2026-10-29，用户在测试机器上确认：使用以下配置，当前
 `codex/cpu-pull-hbm-reference` 和此前的 `codex/cpu-pull-hbm` 分支均测试成功。
 其他机器的 device/EID/candidate 仍需按实际拓扑选择。
@@ -86,9 +105,10 @@ Offload 固定指定该第二个 EID 后，两条分支均成功，因此本次�
 ## 接口
 
 ```python
-runtime = kvaf.OffloadRuntime(npu_eid, device_id=7, cpu_candidate=0, timeout_ms=30000)
+runtime = kvaf.OffloadRuntime(device_id=7, timeout_ms=30000)
 runtime.link_to("127.0.0.1:28999")
 runtime.initialize(ddr_bytes=8 * 131072, slot_size=131072)
+print(runtime.selected_cpu_candidate, runtime.selected_npu_eid)
 runtime.offload([1, 3], source, [7, 100003], [656, 100001], stream=producer_stream)
 checksum = runtime.last_checksum()
 runtime.batch_free([1, 3])
@@ -103,17 +123,28 @@ key 是池内 slot ID，单块不能超过 slot_size，单次最多 4096 块。s
 初始化仅用 key 0 做探测，成功后会释放该 key。Checksum 是测试诊断接口，读取 CPU DDR；
 本实现不提供 Decode/BatchGet。
 
+`npu_eid=""`、`cpu_candidate=-1` 是 Python 的自动默认值；C++ 使用
+`OffloadRuntimeOptions::kAutoCandidate`。显式指定其中一个参数时只自动选择另一项；
+两个都指定则只探测该组合，失败不会换到其他候选。选中前和 Shutdown 后，
+`selected_npu_eid` 返回空字符串，Python `selected_cpu_candidate` 返回 -1。
+
 ## 失败恢复
 
 - `pending_offload=False`：源已安全释放；检查错误后可处理失败或关闭实例。
 - `pending_offload=True`：保留 runtime 和源 Tensor，不覆盖源数据，调用
   `runtime.resolve_offload()` 查询原任务。Python binding 也会保留源的强引用。
 - TCP ACK 丢失但任务已完成：Resolve 确认 CPU 状态、释放源并完成元数据提交，不重发 READ。
-- `CPU Pull transport quarantined`：查看 CPU 的 `CPU_PULL_TASK_END`。READ 提交、CQ
-  或超时错误会保留资源，Resolve 不会重新提交或强制释放。保留双方日志后协调停止测试进程，
+- 初始化 Probe 收到唯一在途 READ 的匹配发送完成记录，即使 CQ status 非成功，
+  只要 CPU 队列和 HBM 导入均销毁成功，即可报告候选失败；NPU 再释放本端资源及 DDR 池，
+  使用全新的池和元数据尝试下一组。此规则只适用于不超过 64 字节的启动 Probe。
+- `CPU Pull transport quarantined`：查看 CPU 的 `CPU_PULL_TASK_END`。用户 payload 的
+  READ 提交、CQ 或超时错误仍保留资源。启动 Probe 的提交/轮询错误、超时、完成记录不匹配，
+  或任何清理失败同样停止切换。Resolve 不会重新提交或强制释放。保留双方日志后协调停止测试进程，
   重新运行时启动新 CPU 服务，避免旧隔离资源占用。
 - 初始化探测未决：Resolve 只解决传输状态。确认不再 pending 后 Shutdown，创建新的
   OffloadRuntime 再初始化；不会把未经过校验和检查的旧实例直接标记为 ready。
+- Allocate 响应丢失也停止切换；Shutdown 使用原 region ID 重试 Allocate 确认后再关闭，
+  不会另建一个 region。释放响应丢失时同样保留原候选，待 Shutdown/Resolve 确认。
 
 CPU 失败日志记录 stage、ret、errno、wr_id、源/目的地址、长度、CQ status/user_ctx、
 local_id、tpn 和两端 MR 属性。出现 `cq_status=4` 时仍需在实际 provider 环境定位，

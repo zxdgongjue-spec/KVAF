@@ -16,9 +16,9 @@ def fnv64(payload):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cpu", required=True, help="CPU service host:port")
-    parser.add_argument("--npu-eid", required=True)
+    parser.add_argument("--npu-eid", default="", help="pin one NPU route EID; omitted = automatic discovery")
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--cpu-candidate", type=int, default=0)
+    parser.add_argument("--cpu-candidate", type=int, default=-1, help="pin one CPU candidate; -1 = automatic")
     args = parser.parse_args()
     import torch
     import torch_npu  # noqa: F401
@@ -30,6 +30,7 @@ def main():
         runtime.link_to(args.cpu)
         runtime.initialize(ddr_bytes=8 * 131072, slot_size=131072)
         print("startup CPU DDR checksum passed (HBM + 64, 64 bytes)")
+        print(f"selected cpu_candidate={runtime.selected_cpu_candidate} npu_eid={runtime.selected_npu_eid}")
         stream = torch.npu.Stream(device=args.device)
         offsets = [7, 100003, 250019]
         lengths = [1, 656, 100001]  # final block requires multiple <=64 KiB READs

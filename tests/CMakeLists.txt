@@ -1,5 +1,10 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+add_executable(kvaf_npu_eid_discovery_test npu_eid_discovery_test.cc)
+target_include_directories(kvaf_npu_eid_discovery_test PRIVATE ${PROJECT_SOURCE_DIR}/runtime/src)
+target_link_libraries(kvaf_npu_eid_discovery_test PRIVATE kvaf_peer_link ${CMAKE_DL_LIBS})
+add_test(NAME kvaf_npu_eid_discovery_test COMMAND kvaf_npu_eid_discovery_test)
+
 add_executable(kvaf_offload_test offload_test.cc)
 target_include_directories(kvaf_offload_test PRIVATE ${PROJECT_SOURCE_DIR}/runtime/src)
 target_link_libraries(kvaf_offload_test PRIVATE kvaf_runtime kvaf_offload_control)
@@ -9,7 +14,7 @@ set_tests_properties(kvaf_offload_test PROPERTIES TIMEOUT 20)
 add_executable(kvaf_offload_runtime_test offload_runtime_test.cc ../runtime/src/offload_runtime.cc)
 target_include_directories(kvaf_offload_runtime_test PRIVATE
   ${PROJECT_SOURCE_DIR}/runtime/src ${CMAKE_CURRENT_SOURCE_DIR}/offload_fake_acl)
-target_link_libraries(kvaf_offload_runtime_test PRIVATE kvaf_runtime kvaf_offload_control)
+target_link_libraries(kvaf_offload_runtime_test PRIVATE kvaf_runtime kvaf_offload_control kvaf_peer_link)
 add_test(NAME kvaf_offload_runtime_test COMMAND kvaf_offload_runtime_test)
 set_tests_properties(kvaf_offload_runtime_test PROPERTIES TIMEOUT 30)
 

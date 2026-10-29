@@ -56,7 +56,7 @@ if(KVAF_ENABLE_CPU_OFFLOAD)
   target_include_directories(kvaf_offload_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/include)
   target_link_libraries(kvaf_offload_runtime PUBLIC kvaf_runtime
-    PRIVATE kvaf_offload_control kvaf_direct_hccp_session "${KVAF_ASCENDCL_LIBRARY}" ${CMAKE_DL_LIBS})
+    PRIVATE kvaf_offload_control kvaf_peer_link kvaf_direct_hccp_session "${KVAF_ASCENDCL_LIBRARY}" ${CMAKE_DL_LIBS})
   target_link_directories(kvaf_offload_runtime PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/lib64)
 endif()
 

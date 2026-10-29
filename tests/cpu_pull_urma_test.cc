@@ -15,9 +15,10 @@ namespace p = kvaf::offload;
 void Require(bool value,const char* text){if(!value)throw std::runtime_error(text);}
 int posts{}, post_calls{}, local_mrs{}, imported_mrs{}, queues{}, peers{}, imports{};
 int fail_create = -1, fail_import = -1;
+bool fail_delete = false;
 bool ctp_queried{};
 std::uint32_t expected_token{};
-enum class Fault { None, Post, Poll, CqStatus, LocalAccess, UserContext };
+enum class Fault { None, Post, Poll, CqStatus, LocalAccess, UserContext, Receive, Multiple };
 Fault fault = Fault::None;
 enum class BadLocalSegment { None, ZeroBase, Short, NoWrite, NonPin };
 BadLocalSegment bad_local_segment = BadLocalSegment::None;
@@ -79,7 +80,7 @@ urma_jetty_t* urma_create_jetty(urma_context_t*,urma_jetty_cfg_t* cfg){
   if(imports==fail_create)return nullptr;
   auto* q=new urma_jetty_t{};q->jetty_cfg=*cfg;q->jetty_id.id=10+imports%p::kChannelCount;++queues;return q;
 }
-urma_status_t urma_delete_jetty(urma_jetty_t* q){--queues;delete q;return URMA_SUCCESS;}
+urma_status_t urma_delete_jetty(urma_jetty_t* q){if(fail_delete)return URMA_EINVAL;--queues;delete q;return URMA_SUCCESS;}
 urma_status_t urma_unimport_jetty(urma_target_jetty_t* q){--peers;delete q;return URMA_SUCCESS;}
 int urma_get_tp_list(void*,void* input,std::uint32_t* count,void* info){
   const auto* cfg=static_cast<TpQuery*>(input);
@@ -116,9 +117,10 @@ int urma_poll_jfc(urma_jfc_t*,int capacity,urma_cr_t* cr){
   Require(pending!=0,"poll follows post");
   if(fault==Fault::Poll){errno=EIO;return -1;}
   cr->status=fault==Fault::CqStatus?URMA_CR_REM_ACCESS_ABORT_ERR:URMA_CR_SUCCESS;
-  if(fault==Fault::LocalAccess)cr->status=URMA_CR_LOC_ACCESS_ERR;
+  if(fault==Fault::LocalAccess||fault==Fault::Receive||fault==Fault::Multiple)cr->status=URMA_CR_LOC_ACCESS_ERR;
+  cr->flag.bs.s_r=fault==Fault::Receive;
   cr->user_ctx=fault==Fault::UserContext?pending+1:pending;
-  cr->local_id=17;cr->tpn=23;pending=0;return 1;
+  cr->local_id=17;cr->tpn=23;pending=0;return fault==Fault::Multiple?2:1;
 }
 }
 p::Endpoint Source(std::vector<std::uint8_t>& memory,std::uint32_t token,bool distinct_eids){
@@ -229,11 +231,44 @@ void PartialChannelFailureTest(){
     Require(backend->Close().ok()&&queues==0&&peers==0&&local_mrs==0&&imported_mrs==0,"retry closes cleanly");
   }
 }
+void ProbeFailureTest(Fault injected, bool teardown_failure=false) {
+  fault=injected;fail_delete=teardown_failure;
+  urma_context_t context{};context.eid.raw[15]=1;
+  auto backend=p::CreateUrmaBackend(&context);p::Endpoint cpu{};
+  Require(backend->Allocate(4096,&cpu).ok(),"probe pool");
+  std::vector<std::uint8_t> memory(4096,0xa5);
+  const auto source=Source(memory,cpu.token,true);
+  Require(backend->Open(source,&cpu).ok(),"probe link");
+  const auto result=backend->Probe({{64,0,64}});
+  const bool retired=!teardown_failure&&(injected==Fault::LocalAccess||injected==Fault::CqStatus);
+  Require(!result.ok(),"probe error cannot select candidate");
+  if(retired) {
+    Require(result.code()==kvaf::StatusCode::kInternal&&result.message().find("probe queues and source retired")!=std::string::npos,
+            "matching terminal CQ plus successful destruction permits fallback");
+    Require(queues==0&&peers==0&&imported_mrs==0&&local_mrs==1,"retire transport before allowing fallback");
+    Require(backend->ReleaseSource().ok()&&backend->Close().ok()&&local_mrs==0,"host can release and close rejected candidate");
+    fault=Fault::None;
+  } else {
+    Require(result.code()==kvaf::StatusCode::kInDoubt,"unknown completion or failed teardown forbids fallback");
+    const auto calls=post_calls;
+    Require(!backend->Probe({{64,0,64}}).ok()&&post_calls==calls,"quarantined probe never retries READ");
+    Require(!backend->ReleaseSource().ok()&&!backend->Close().ok(),"unresolved probe retains resources");
+    Require(queues==12&&peers==4&&imported_mrs==1&&local_mrs==1,"unknown probe retains all leases");
+    _exit(0);
+  }
+}
 int main(){try{
   RegistrationFailureTest();
   PartialChannelFailureTest();
   ReadTest(false);
   ReadTest(true);
+  ProbeFailureTest(Fault::LocalAccess);
+  ProbeFailureTest(Fault::CqStatus);
+  for(auto injected:{Fault::Post,Fault::Poll,Fault::UserContext,Fault::Receive,Fault::Multiple,Fault::LocalAccess}){
+    const auto child=fork();Require(child>=0,"fork probe scenario");
+    if(child==0){try{ProbeFailureTest(injected,injected==Fault::LocalAccess);}catch(const std::exception& e){std::cerr<<e.what()<<'\n';}_exit(1);}
+    int status{};Require(waitpid(child,&status,0)==child&&WIFEXITED(status)&&WEXITSTATUS(status)==0,"probe quarantine scenario passed");
+  }
   for(auto injected:{Fault::Post,Fault::Poll,Fault::CqStatus,Fault::LocalAccess,Fault::UserContext}){
     const auto child=fork();Require(child>=0,"fork failure scenario");
     if(child==0){fault=injected;try{ReadTest(true);}catch(const std::exception& e){std::cerr<<e.what()<<'\n';}_exit(1);}

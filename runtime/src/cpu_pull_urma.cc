@@ -159,10 +159,17 @@ class UrmaBackend final : public Backend {
           const int count = urma_poll_jfc(q.cq, records.size(), records.data());
           const int poll_errno = errno;
           if (count < 0 || count > static_cast<int>(records.size())) return ReadFailure("poll_cq", count, poll_errno);
+          if (count > 1) return ReadFailure("unexpected_cq_count", count, poll_errno, nullptr, &records[0]);
           for (int i = 0; i < count; ++i) {
             const auto& cr = records[i];
-            if (cr.status != URMA_CR_SUCCESS || cr.user_ctx != q.pending)
+            if (cr.status != URMA_CR_SUCCESS || cr.user_ctx != q.pending || cr.flag.bs.s_r) {
+              // Only this exact send completion retires our sole outstanding
+              // READ. Unknown completions/post/poll failures cannot authorize
+              // fallback, even during initialization.
+              completed_error_ = count == 1 && cr.user_ctx == q.pending &&
+                                 !cr.flag.bs.s_r && cr.status != URMA_CR_SUCCESS;
               return ReadFailure("cq_completion", count, poll_errno, nullptr, &cr);
+            }
             q.pending = 0;
           }
           if ((++polls & 31) == 0 && q.pending && std::chrono::steady_clock::now() >= deadline)
@@ -172,6 +179,27 @@ class UrmaBackend final : public Backend {
       }
     }
     return Status::OK();
+  }
+
+  Status Probe(const std::vector<Span>& spans) override {
+    if (poisoned_) return Status::InDoubt(failure_);
+    if (spans.size() != 1 || !spans[0].bytes || spans[0].bytes > 64)
+      return Error("probe requires one span of at most 64 bytes");
+    completed_error_ = false;
+    auto status = Read(spans);
+    if (status.ok() || !completed_error_) return status;
+    const auto failure = failure_;
+    // The probe received its terminal CQE. Confirm queue/source destruction
+    // before reporting a recoverable candidate failure to the NPU host.
+    queues_[0].pending = 0;
+    poisoned_ = false;
+    status = ReleaseSource();
+    if (!status.ok()) {
+      failure_ = failure + "; probe teardown failed: " + status.message();
+      return Status::InDoubt(failure_);
+    }
+    failure_.clear(); completed_error_ = false;
+    return Status::Internal(failure + "; probe queues and source retired");
   }
 
   Status ReleaseSource() override {
@@ -269,7 +297,7 @@ class UrmaBackend final : public Backend {
   urma_token_id_t* token_{};
   urma_target_seg_t *destination_{}, *source_{};
   std::array<Queue, kChannelCount> queues_;
-  bool ready_{}, poisoned_{}, destination_valid_{};
+  bool ready_{}, poisoned_{}, destination_valid_{}, completed_error_{};
   std::string failure_;
 };
 }

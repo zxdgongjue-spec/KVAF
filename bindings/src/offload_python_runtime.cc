@@ -21,8 +21,13 @@ std::vector<std::uint64_t> Integers(py::object value) {
 }
 class PythonOffload {
  public:
-  PythonOffload(std::string eid, std::uint32_t device, std::uint32_t candidate, std::uint32_t timeout)
-      : runtime_({device, std::move(eid), candidate, timeout}) {}
+  static std::uint32_t Candidate(std::int64_t value) {
+    if (value < -1 || value >= OffloadRuntimeOptions::kAutoCandidate)
+      throw py::value_error("cpu_candidate must be -1 (automatic) or a non-negative candidate ID");
+    return value == -1 ? OffloadRuntimeOptions::kAutoCandidate : static_cast<std::uint32_t>(value);
+  }
+  PythonOffload(std::string eid, std::uint32_t device, std::int64_t candidate, std::uint32_t timeout)
+      : runtime_({device, std::move(eid), Candidate(candidate), timeout}) {}
   ~PythonOffload() {
     if (!runtime_.Shutdown().ok() && !source_.is_none())
       (void)source_.release(); // Leak the strong reference with quarantined DMA, never free its HBM.
@@ -65,8 +70,8 @@ class PythonOffload {
 }
 void BindOffloadRuntime(py::module_& module) {
   py::class_<PythonOffload>(module, "OffloadRuntime")
-    .def(py::init<std::string, std::uint32_t, std::uint32_t, std::uint32_t>(),
-         py::arg("npu_eid"), py::arg("device_id") = 0, py::arg("cpu_candidate") = 0, py::arg("timeout_ms") = 30000)
+    .def(py::init<std::string, std::uint32_t, std::int64_t, std::uint32_t>(),
+         py::arg("npu_eid") = "", py::arg("device_id") = 0, py::arg("cpu_candidate") = -1, py::arg("timeout_ms") = 30000)
     .def("link_to", [](PythonOffload& r, const std::string& address) { Check(r.runtime_.LinkTo({address})); })
     .def("initialize", [](PythonOffload& r, std::uint64_t bytes, std::uint64_t slot) { Check(r.runtime_.Initialize(bytes, slot)); },
          py::arg("ddr_bytes"), py::arg("slot_size"))
@@ -78,6 +83,11 @@ void BindOffloadRuntime(py::module_& module) {
     .def("shutdown", [](PythonOffload& r) { Check(r.runtime_.Shutdown()); })
     .def_property_readonly("initialized", [](PythonOffload& r) { return r.runtime_.initialized(); })
     .def_property_readonly("pending_offload", [](PythonOffload& r) { return r.runtime_.pending_offload(); })
+    .def_property_readonly("selected_npu_eid", [](PythonOffload& r) { return r.runtime_.selected_npu_eid(); })
+    .def_property_readonly("selected_cpu_candidate", [](PythonOffload& r) -> std::int64_t {
+      const auto id = r.runtime_.selected_cpu_candidate();
+      return id == OffloadRuntimeOptions::kAutoCandidate ? -1 : static_cast<std::int64_t>(id);
+    })
     .def_property_readonly("task_id", [](PythonOffload& r) { return r.runtime_.task_id(); });
 }
 }

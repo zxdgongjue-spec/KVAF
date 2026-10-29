@@ -11,6 +11,9 @@ class Backend {
   virtual Status Allocate(std::uint64_t bytes, Endpoint* local) = 0;
   virtual Status Open(const Endpoint& source, Endpoint* local) = 0;
   virtual Status Read(const std::vector<Span>& spans) = 0;
+  // Startup only. A backend may retire a failed, completed probe before
+  // returning a non-InDoubt error; unresolved DMA must remain InDoubt.
+  virtual Status Probe(const std::vector<Span>& spans) { return Read(spans); }
   virtual Status ReleaseSource() = 0;
   virtual Status Close() = 0;
   virtual std::uint64_t Checksum(const std::vector<Span>& spans) const = 0;

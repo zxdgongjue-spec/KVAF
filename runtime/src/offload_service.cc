@@ -175,7 +175,7 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
                    static_cast<unsigned long long>(region), static_cast<unsigned long long>(task),
                    s.spans.size(), probe ? "probe_service_thread" : "offload_worker");
       Status status;
-      try { status = s.backend->Read(s.spans); }
+      try { status = probe ? s.backend->Probe(s.spans) : s.backend->Read(s.spans); }
       catch (const std::exception& e) { status = Status::InDoubt(std::string("CPU Pull worker exception: ") + e.what()); }
       catch (...) { status = Status::InDoubt("CPU Pull worker exception"); }
       std::lock_guard<std::mutex> guard(s.mutex);

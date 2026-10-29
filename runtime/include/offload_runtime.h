@@ -3,9 +3,12 @@
 
 namespace kvaf {
 struct OffloadRuntimeOptions {
+  static constexpr std::uint32_t kAutoCandidate = UINT32_MAX;
   std::uint32_t device_id{0};
-  std::string npu_eid; // Explicit 16-byte EID in hexadecimal, optional ':' separators.
-  std::uint32_t cpu_candidate{0};
+  // Empty discovers CLOS EIDs then the active asdrv pair_info device EID.
+  // Nonempty pins one hexadecimal EID (optional ':' separators).
+  std::string npu_eid;
+  std::uint32_t cpu_candidate{kAutoCandidate}; // Otherwise pins one CPU candidate.
   std::uint32_t timeout_ms{30000};
 };
 // CANN host control only: no AIV kernels, and one synchronous caller per runtime.
@@ -24,6 +27,8 @@ class OffloadRuntime {
   bool pending_offload() const;
   std::uint64_t task_id() const;
   std::uint32_t device_id() const;
+  std::string selected_npu_eid() const; // Empty until the startup probe passes.
+  std::uint32_t selected_cpu_candidate() const; // kAutoCandidate until selected.
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

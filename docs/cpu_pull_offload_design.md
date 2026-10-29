@@ -45,7 +45,8 @@
 
 ## 初始化与 Offload 流程
 
-1. `link_to()` 保存 CPU 服务地址。`initialize()` 请求分配 DDR 池，得到地址、
+1. `link_to()` 保存 CPU 服务地址。`initialize()` 默认枚举 CPU 候选和当前物理 NPU 的
+   EID，按 CPU 外层、EID 内层依次尝试。每组请求分配独立 DDR 池，得到地址、
    长度、候选 EID、服务 epoch 和 region token。DDR 此时已分配，注册延后到第一次 Open。
 2. NPU 创建 Direct HCCP context、token ID，注册源 HBM。查询 CTP 后创建四路
    TargetChannel，发送 Open，携带原始 segment、四个 key、路由 EID、TP、PSN。
@@ -61,6 +62,15 @@
    提交 READ，确认 CQ 后处理下一段。全部成功将状态设为 Done。
 8. NPU Query 看到 Done 后，要求 CPU ReleaseSource，确认 CPU 释放源引用和队列；
    NPU 随后注销 HBM、销毁通道，最后 CommitPut，返回成功。CPU DDR 池保留到 Shutdown。
+
+NPU EID 发现与 NpuRuntime 共用 `npu_eid_discovery.h`，顺序为 HCCL CLOS EID →
+asdrv pair_info 的活动 device EID，去重并保留来源；共用同一 selector 文件锁。
+CPU 候选数量通过现有 KVCP GetCandidateCount 查询，KVOF wire ABI 不变。
+显式指定的 CPU 候选/EID 分别固定对应维度。成功后记录选中的组合，payload 不自动换路。
+
+每次候选尝试包含独立 MetaManager、RuntimeCore、PullOperator 和探测 HBM。
+探测失败且确认无在途 DMA 后，释放源、关闭 DDR 池、释放探测 HBM，才创建下一次尝试。
+候选全部失败时返回尝试总数及最后错误；各次失败原因记录在两端日志。
 
 ## 与参考场景的必要适配
 
@@ -86,9 +96,15 @@ KVOF 使用版本 2，与主线 KVCP 协议分开。V2 Endpoint 交换四个 Jet
 及命令类型，重复请求不提交第二次 READ。Probe 限定一个不超过 64 字节的 span。
 
 成功路径仅在 CQ 确认后发布元数据。注册/建链等未提交 READ 的错误可释放资源并 AbortPut。
-READ 提交错误、CQ 错误、超时或完成关联异常进入 InDoubt：保留队列、MR、DDR、源 Tensor
+payload READ 提交错误、CQ 错误、超时或完成关联异常进入 InDoubt：保留队列、MR、DDR、源 Tensor
 和 pending 元数据，不允许复用目标 slots。TCP 响应丢失同样先保留源，随后通过 Query 恢复。
 `resolve_offload()` 查询已有任务，不重发 READ；transport 已隔离时不会自动解除隔离。
+
+启动 Probe 的特殊处理：只有一次 poll 返回唯一且 user_ctx 匹配的发送错误 CQE，
+才能确认该唯一在途 READ 已结束；随后必须确认 CPU Jetty、JFR、CQ、HBM 导入全部销毁成功，
+才将任务报告为 Failed 并允许候选回退。任何未知完成、提交/轮询错误、超时或销毁失败仍然
+InDoubt，并立即停止候选遍历。TCP ACK 丢失也停止遍历，保留原 region/task 用于恢复。
+Allocate ACK 丢失时，Shutdown 用同一 region ID 重试幂等 Allocate，然后关闭该池。
 
 CPU 释放顺序沿用参考：本地 Jetty → 导入 Jetty → JFR → CQ → 导入 HBM。
 关闭池时再注销 DDR、释放 token ID 和内存。NPU TargetChannel 使用参考 Shutdown。
@@ -96,12 +112,15 @@ CPU 释放顺序沿用参考：本地 Jetty → 导入 Jetty → JFR → CQ → 
 
 Python binding 持有 pending 源 Tensor 的强引用；C++ 调用者负责保留源。单 Runtime
 只支持串行调用。初始化探测未决时内部 HBM 同样保留；恢复成功也不自动跳过校验将 Runtime
-标记 ready，应 Shutdown 后创建新实例重新初始化。与主线元数据管理一致，一个实例只注册一次池。
+标记 ready，应 Shutdown 后重新初始化。与主线元数据管理一致，每个内部 RuntimeCore
+只注册一次池；后续候选或重新初始化使用新的 RuntimeCore/MetaManager。
 
 ## 验证边界
 
 主机测试覆盖事务可见性、重复请求、四路 key/参数、部分建链清理、分段 READ、校验和、
-生产者 event、初始化线程顺序、响应丢失和 CQ 失败隔离。URMA/ACL/HCCP 使用测试替身，
+生产者 event、初始化线程顺序、响应丢失和 CQ 失败隔离。自动选择测试覆盖发现顺序与去重、
+跨 CPU/EID 回退、显式固定、校验和失败、候选耗尽，以及未知状态/清理失败停止切换。
+URMA/ACL/HCCP 使用测试替身，
 只能证明编排和传输描述符符合约定，不能证明真实 UB 链路可用。
 
 真实硬件使用 `tests/python/test_cpu_offload.py`：先检查 64 字节启动探测，再验证三轮
