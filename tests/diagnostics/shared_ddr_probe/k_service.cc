@@ -304,6 +304,45 @@ PullCtpResult QueryPullCtp(GetTp query, urma_context_t* ctx, TpQuery config) {
   return result;
 }
 
+bool MrContains(const urma_target_seg_t& mr, std::uint64_t address, std::uint32_t length) {
+  const auto base = mr.seg.ubva.va, bytes = mr.seg.len;
+  return length && base <= UINT64_MAX - bytes && address >= base &&
+    address <= UINT64_MAX - length && length <= bytes && address - base <= bytes - length;
+}
+
+void AuditReadMrs(const urma_target_seg_t* source, const urma_target_seg_t* destination,
+                  urma_context_t* context, std::uint64_t src, std::uint64_t dst,
+                  std::uint32_t length, const char* target, bool verbose) {
+  Check(source && destination, "READ preflight: null MR");
+  const bool src_range = MrContains(*source, src, length);
+  const bool dst_range = MrContains(*destination, dst, length);
+  const bool src_context = source->urma_ctx == context;
+  const bool dst_context = destination->urma_ctx == context;
+  if (verbose || !src_range || !dst_range || !src_context || !dst_context) {
+    const auto print = [&](const char* role, const urma_target_seg_t& mr, std::uint64_t address) {
+      std::fprintf(stderr, "READ_MR target=%s role=%s layout=compiled_header mr=%p context=%p "
+        "expected_ctx=%p eid=%s uasid=0x%x base=0x%llx bytes=%llu attr=0x%x access=0x%x "
+        "non_pin=%u mva=0x%llx token_id=0x%x token_handle=%p wr_va=0x%llx wr_bytes=%u\n",
+        target, role, (const void*)&mr, (void*)mr.urma_ctx, (void*)context,
+        SourceEidHex(mr.seg.ubva.eid.raw).c_str(), mr.seg.ubva.uasid,
+        (unsigned long long)mr.seg.ubva.va, (unsigned long long)mr.seg.len, mr.seg.attr.value,
+        mr.seg.attr.bs.access, mr.seg.attr.bs.non_pin, (unsigned long long)mr.mva,
+        mr.seg.token_id, (void*)mr.token_id, (unsigned long long)address, length);
+    };
+    print("source", *source, src); print("destination", *destination, dst);
+    std::fprintf(stderr, "READ_PREFLIGHT target=%s src_range_ok=%u dst_range_ok=%u "
+      "src_context_ok=%u dst_context_ok=%u src_read_bit=%u dst_bit0=%u\n", target,
+      unsigned(src_range), unsigned(dst_range), unsigned(src_context), unsigned(dst_context),
+      unsigned((source->seg.attr.bs.access & 2U) != 0),
+      unsigned((destination->seg.attr.bs.access & 1U) != 0));
+  }
+  // These checks validate the reported layout, not hardware translation or
+  // authorization. Do not impose old LOCAL_WRITE semantics on a deployed MR.
+  Check(src_range, "READ preflight: source outside reported MR range");
+  Check(dst_range, "READ preflight: destination outside reported MR range");
+  Check(src_context && dst_context, "READ preflight: MR context differs from pull context");
+}
+
 struct State {
   Registration* region{};
   urma_target_seg_t* source{};
@@ -341,7 +380,18 @@ struct State {
     urma_import_seg_flag_t import_flags{};
     import_flags.bs.access = 2;  // remote READ only, no bit 0
     import_flags.bs.mapping = URMA_SEG_NOMAP;
+    std::fprintf(stderr, "SOURCE_SEGMENT base=0x%llx bytes=%llu attr=0x%x access=0x%x "
+      "non_pin=%u eid=%s uasid=0x%x token_id=0x%x\n", (unsigned long long)segment.ubva.va,
+      (unsigned long long)segment.len, segment.attr.value, segment.attr.bs.access,
+      segment.attr.bs.non_pin, SourceEidHex(segment.ubva.eid.raw).c_str(),
+      segment.ubva.uasid, segment.token_id);
+    std::fprintf(stderr, "SOURCE_IMPORT context=%p access=0x%x flags=0x%x mapping=%u "
+      "requested_addr=0x0 token_value=0x%x\n", (void*)ctx, import_flags.bs.access,
+      import_flags.value, import_flags.bs.mapping, token.token);
+    errno = 0;
     source = urma_import_seg(ctx, &segment, &token, 0, import_flags);
+    const int import_error = errno;
+    std::fprintf(stderr, "SOURCE_IMPORT_RESULT mr=%p errno=%d\n", (void*)source, import_error);
     check_query("after_import_seg");
     Check(source, "import HBM segment");
     source_base = request.base;
@@ -394,6 +444,8 @@ struct State {
     auto completion = std::make_unique<NativeBuffer<urma_cr_t>>();
     Sge src{}; src.addr = source_base + kGuard + offset; src.len = length; src.tseg = source;
     Sge dst{}; dst.addr = destination; dst.len = length; dst.tseg = destination_mr;
+    AuditReadMrs(source, destination_mr, region->context, src.addr, dst.addr,
+      length, target, offset == 0);
     urma_jfs_wr_t wr{};
     wr.opcode = URMA_OPC_READ; wr.tjetty = peer; wr.user_ctx = ++sequence;
     wr.flag.bs.complete_enable = 1; wr.flag.bs.comp_order = 1;

@@ -314,6 +314,7 @@ urma_target_seg_t* urma_register_seg(urma_context_t* ctx, urma_seg_cfg_t* cfg) {
   }
   auto* seg = new urma_target_seg_t{};
   seg->seg.ubva.va = cfg->va; seg->seg.len = cfg->len; seg->urma_ctx = ctx;
+  seg->seg.attr.value = cfg->flag.value; seg->token_id = cfg->token_id;
   ranges[seg] = {cfg->va, cfg->len}; ++live_segments;
   return seg;
 }
@@ -403,7 +404,11 @@ void TestIndependentDdrControl() {
     State state;
     state.region = &registrations.at(remote);
     state.peer = reinterpret_cast<urma_target_jetty_t*>(1);
-    state.source = reinterpret_cast<urma_target_seg_t*>(2);
+    urma_target_seg_t source_mr{};
+    source_mr.seg.ubva.va = reinterpret_cast<std::uint64_t>(source.data());
+    source_mr.seg.len = allocation_bytes; source_mr.seg.attr.bs.access = 14;
+    source_mr.urma_ctx = &context;
+    state.source = &source_mr;
     state.source_base = reinterpret_cast<std::uint64_t>(source.data());
     state.max_bytes = 997;
     state.independent_ddr_control = true;
@@ -487,6 +492,26 @@ int main() {
     TestPullCtpQuery();
     TestReadChunkBytes();
     TestNativeMemoryDiagnostics();
+    {
+      urma_context_t context{}, other{};
+      urma_target_seg_t mr{};
+      mr.seg.ubva.va = 4096; mr.seg.len = 8192; mr.urma_ctx = &context;
+      Require(MrContains(mr, 8192, 4096), "exact end of MR must be allowed");
+      Require(!MrContains(mr, 8193, 4096) && !MrContains(mr, 4095, 1) &&
+        !MrContains(mr, 12288, 1) && !MrContains(mr, 4096, 0), "invalid MR interval accepted");
+      mr.seg.ubva.va = UINT64_MAX - 3;
+      Require(!MrContains(mr, mr.seg.ubva.va, 1), "overflowing MR accepted");
+      mr.seg.ubva.va = 4096;
+      // Permission bits are evidence, not an assumed deployed access model.
+      AuditReadMrs(&mr, &mr, &context, 4096, 8192, 4096, "test", false);
+      ExpectDiagnosticFailure([&] { AuditReadMrs(&mr, &mr, &context, 4095, 8192, 4096,
+        "test", false); }, "source outside reported MR range");
+      ExpectDiagnosticFailure([&] { AuditReadMrs(&mr, &mr, &context, 4096, 8193, 4096,
+        "test", false); }, "destination outside reported MR range");
+      ExpectDiagnosticFailure([&] { AuditReadMrs(&mr, &mr, &other, 4096, 8192, 4096,
+        "test", false); }, "MR context differs");
+      std::cerr << "READ_MR_AUDIT_TEST_PASS bounds=1 overflow=1 context=1\n";
+    }
     TestIndependentDdrControl();
     allocation_bytes = 3 * kGuard;
     std::vector<std::uint8_t> target(allocation_bytes), source(allocation_bytes);
@@ -507,6 +532,11 @@ int main() {
       if (mode == "dual-separate-context") Require(r.context != &ctx, "separate context not used");
       State state;
       state.region = &r; state.peer = reinterpret_cast<urma_target_jetty_t*>(1);
+      urma_target_seg_t source_mr{};
+      source_mr.seg.ubva.va = reinterpret_cast<std::uint64_t>(source.data());
+      source_mr.seg.len = allocation_bytes; source_mr.seg.attr.bs.access = 14;
+      source_mr.urma_ctx = r.context;
+      state.source = &source_mr;
       state.source_base = reinterpret_cast<std::uint64_t>(source.data());
       state.max_bytes = 997;  // Force unaligned chunk boundaries and a tail.
       std::fill(target.begin(), target.end(), 0xa5);

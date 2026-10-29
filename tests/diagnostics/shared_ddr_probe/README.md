@@ -288,6 +288,19 @@ grep -Ei 'URMA_LOG_TAG|UDMA_LOG_TAG|urma|udma|ummu' \
 
 ### 失败定位与资源保留
 
+READ 提交前进行 MR 对照，首块打印以下记录（权限、VA、context 均按编译头布局解读）：
+
+- `SOURCE_SEGMENT`：Prefill 导出的 HBM segment 的原始 attr/access、范围、EID、UASID 和 token ID。
+- `SOURCE_IMPORT` / `SOURCE_IMPORT_RESULT`：K 的导入权限、mapping、token value 和返回句柄/errno。
+- `READ_MR role=source/destination`：实际 SGE 引用的返回 MR，包含范围、attr/access、MVA、context 和 token 信息。
+- `READ_PREFLIGHT`：本次 SGE 是否在两个返回 MR 的范围内、context 是否与 pull context 一致，以及原始权限位。
+
+每块都做防整数溢出的区间检查，允许访问恰好结束于 MR 末尾；零长度、越界或 context 不一致会在 post 前失败。
+这只能核对返回结构和请求，不能认证部署 ABI、物理映射或硬件授权。
+`src_read_bit` 与 `dst_bit0` 是证据字段，不自动改变权限；尤其不能把 bit0 的旧 LOCAL_WRITE 与新 LOCAL_ONLY
+语义混用。MVA 被记录但不自动替换提交地址。若出现 `READ preflight: ...`，保留对应 MR 行定位返回布局/对象问题；
+若范围/context 全通过但 CQ 仍报错，应带这些记录进一步核对 provider 的访问授权和地址转换。
+
 失败或超时时程序不会把超时当作 DMA 已停止。Python 进程保留 Tensor，K 保留已武装的资源；
 先停止 K 诊断进程，再中断 Prefill/Decode，最后启动全新三进程。不要强行复用原地址继续测。
 该保留策略也适用于 Python 检查失败，需人工结束测试进程；正常成功路径会按依赖顺序释放。
