@@ -81,6 +81,19 @@ CQ 错误或超时会隔离该 CPU transport，首版不尝试强制取消/重�
 
 初始化探测若失败且留下 pending 事务，同样先 resolve，再 shutdown，之后重新 initialize；探测失败时不会将 runtime 标记为就绪。
 
+### 初始化错误定位
+
+`create HBM context` 表示 NPU 侧 `RaCtxInit` 失败，还没有注册源 MR 或发起 CPU READ。异常中包含底层 `ret`、物理设备号、EID 和 `eid_index`。先核对 `--device` 对应的物理设备和 `--npu-eid`；CPU candidate 是后续建链使用的路径，不能修复本地 NPU context 的创建失败。
+
+`invalid exported HBM range` 表示 context 和源 HBM 注册已成功，但导出的 segment 没有通过校验。异常包含：
+
+- `zero_base`：导出地址为零。
+- `short_segment`：导出长度小于请求长度。
+- `address_overflow`：导出地址加请求长度会溢出。
+- `eid_mismatch`：segment 内 EID 与配置 NPU EID 不同。
+
+同时保留 `requested_base/exported_base`、`requested_bytes/exported_bytes`、`npu_eid/segment_eid` 与 `key_bytes`，用于区分范围、EID 选择和 ABI 问题。提供整条异常即可进一步定位；不要仅凭通用错误跳过校验或更改 SGE ABI。验收脚本在初始化失败时也会执行安全清理；未决任务继续保留资源。
+
 ## 验证与限制
 
 主机测试包含事务提交/回滚、pending 数据不可见、目标范围检查、任务去重，以及真实 TCP 上丢失 Submit/Open/ReleaseSource/Close 响应后的恢复。测试使用 fake ACL/HCCP 和 Host 内存后端，不代表硬件通过。

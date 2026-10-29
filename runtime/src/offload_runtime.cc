@@ -6,13 +6,24 @@
 #include <chrono>
 #include <cstdio>
 #include <random>
+#include <sstream>
 #include <thread>
 
 namespace kvaf {
 namespace {
 namespace h = direct_hccp;
 namespace p = offload;
-Status Error(const char* text) { return Status::Internal(std::string("Offload: ") + text); }
+Status Error(const std::string& text) { return Status::Internal("Offload: " + text); }
+std::string EidHex(const std::uint8_t* eid) {
+  constexpr char digits[] = "0123456789abcdef";
+  std::string text;
+  text.reserve(32);
+  for (std::size_t i = 0; i < 16; ++i) {
+    text.push_back(digits[eid[i] >> 4]);
+    text.push_back(digits[eid[i] & 15]);
+  }
+  return text;
+}
 std::uint64_t Nonce() {
   std::random_device r;
   const auto n = (std::uint64_t(r()) << 32) ^ r();
@@ -44,12 +55,22 @@ class Exporter {
   Status Open(const ConstBufferView& input, const std::string& eid, const p::Endpoint& cpu) {
     std::uint32_t physical{};
     if (!ParseEid(eid, descriptor.eid)) return Status::InvalidArgument("npu_eid must contain 32 hex digits");
-    if (!h::LoadDirectHccp(&api_) || !h::GetCurrentNpuPhysicalDeviceId(&physical) ||
-        !h::AcquireDirectHccpSession(physical, 18, &session_)) return Error("initialize Direct HCCP");
+    if (!h::LoadDirectHccp(&api_)) return Error("load Direct HCCP API");
+    if (!h::GetCurrentNpuPhysicalDeviceId(&physical)) return Error("resolve NPU physical device");
+    if (!h::AcquireDirectHccpSession(physical, 18, &session_))
+      return Error("initialize Direct HCCP session: physical=" + std::to_string(physical));
     h::CtxInitCfg cfg{}; cfg.mode = h::kOfflineHdc;
     h::CtxInitAttr attr{}; attr.phy_id = physical;
     std::memcpy(attr.ub.eid.raw, descriptor.eid, 16);
-    if (api_.ctx_init(&cfg, &attr, &context_) || !context_) return Error("create HBM context");
+    const int context_ret = api_.ctx_init(&cfg, &attr, &context_);
+    if (context_ret || !context_) {
+      std::ostringstream message;
+      message << "create HBM context: RaCtxInit ret=" << context_ret
+              << " context_nonnull=" << (context_ != nullptr) << " mode=" << cfg.mode
+              << " physical=" << physical << " eid_index=" << attr.ub.eid_index
+              << " npu_eid=" << EidHex(descriptor.eid);
+      return Error(message.str());
+    }
     h::TokenId token{};
     if (api_.token_alloc(context_, &token, &token_) || !token_) return Error("allocate source token");
     descriptor.token = static_cast<std::uint32_t>(Nonce()) | 1U;
@@ -58,17 +79,41 @@ class Exporter {
     // Public 24.12: REMOTE_READ only, non-pinned device HBM, valid token.
     mr.in.ub.flags = 1U | (2U << 5U) | (1U << 11U) | (1U << 13U);
     mr.in.ub.token_value = descriptor.token; mr.in.ub.token_id_handle = token_;
-    if (api_.lmem_register(context_, &mr, &mr_) || !mr_) return Error("register source HBM");
-    if (mr.out.key.size != 48) return Error("unsupported HBM segment ABI");
+    const int register_ret = api_.lmem_register(context_, &mr, &mr_);
+    if (register_ret || !mr_) {
+      std::ostringstream message;
+      message << "register source HBM: RaCtxLmemRegister ret=" << register_ret
+              << " handle_nonnull=" << (mr_ != nullptr) << " physical=" << physical
+              << " addr=0x" << std::hex << mr.in.mem.addr << " flags=0x" << mr.in.ub.flags
+              << std::dec << " bytes=" << input.bytes;
+      return Error(message.str());
+    }
+    if (mr.out.key.size != 48)
+      return Error("unsupported HBM segment ABI: key_bytes=" + std::to_string(mr.out.key.size) +
+                   " expected=48 physical=" + std::to_string(physical));
     descriptor.segment_bytes = mr.out.key.size;
     std::memcpy(descriptor.segment, mr.out.key.value, mr.out.key.size);
     // urma_seg_t: packed UBVA {eid[16], uasid[4], va[8]}, aligned len at 32.
     std::uint64_t exported_bytes{};
     std::memcpy(&descriptor.base, descriptor.segment + 20, 8);
     std::memcpy(&exported_bytes, descriptor.segment + 32, 8);
-    if (!descriptor.base || exported_bytes < input.bytes ||
-        descriptor.base > UINT64_MAX-input.bytes || std::memcmp(descriptor.eid, descriptor.segment, 16))
-      return Error("invalid exported HBM range");
+    const bool zero_base = descriptor.base == 0;
+    const bool short_segment = exported_bytes < input.bytes;
+    const bool address_overflow = descriptor.base > UINT64_MAX-input.bytes;
+    const bool eid_mismatch = std::memcmp(descriptor.eid, descriptor.segment, 16) != 0;
+    if (zero_base || short_segment || address_overflow || eid_mismatch) {
+      std::ostringstream message;
+      message << "invalid exported HBM range: zero_base=" << zero_base
+              << " short_segment=" << short_segment << " address_overflow=" << address_overflow
+              << " eid_mismatch=" << eid_mismatch << " physical=" << physical
+              << " eid_index=" << attr.ub.eid_index << " key_bytes=" << unsigned(mr.out.key.size)
+              << " requested_base=0x" << std::hex << reinterpret_cast<std::uint64_t>(input.data)
+              << " exported_base=0x" << descriptor.base << std::dec
+              << " requested_bytes=" << input.bytes << " exported_bytes=" << exported_bytes
+              << " npu_eid=" << EidHex(descriptor.eid)
+              << " segment_eid=" << EidHex(descriptor.segment);
+      return Error(message.str());
+    }
     descriptor.bytes = input.bytes;
     h::CqInfo cq{}; cq.in.depth = 256; cq.in.ub.mode = h::kJfcNormal;
     if (api_.cq_create(context_, &cq, &cq_) || !cq_) return Error("create source CQ");

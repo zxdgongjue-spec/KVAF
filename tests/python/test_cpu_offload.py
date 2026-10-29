@@ -26,13 +26,13 @@ def main():
 
     torch.npu.set_device(args.device)
     runtime = kvaf.OffloadRuntime(args.npu_eid, args.device, args.cpu_candidate)
-    runtime.link_to(args.cpu)
-    runtime.initialize(ddr_bytes=8 * 131072, slot_size=131072)
-    stream = torch.npu.Stream(device=args.device)
-    offsets = [7, 100003, 250019]
-    lengths = [1, 656, 100001]  # final block requires multiple <=64 KiB READs
-    source = torch.empty(400128, dtype=torch.uint8, device=f"npu:{args.device}")
     try:
+        runtime.link_to(args.cpu)
+        runtime.initialize(ddr_bytes=8 * 131072, slot_size=131072)
+        stream = torch.npu.Stream(device=args.device)
+        offsets = [7, 100003, 250019]
+        lengths = [1, 656, 100001]  # final block requires multiple <=64 KiB READs
+        source = torch.empty(400128, dtype=torch.uint8, device=f"npu:{args.device}")
         for round_id in range(3):
             expected = ((torch.arange(source.numel(), dtype=torch.int64) * 17 + round_id) % 251).to(torch.uint8)
             with torch.npu.stream(stream):

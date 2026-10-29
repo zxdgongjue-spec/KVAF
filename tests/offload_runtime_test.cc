@@ -17,11 +17,16 @@
 
 namespace p = kvaf::offload;
 std::atomic<int> registrations{0}, events{0}, event_waits{0}, reads{0};
+std::atomic<int> sessions{0}, contexts{0}, probe_allocations{0};
+int context_error = 0;
+bool null_context = false;
+enum class BadSegment { None, ZeroBase, Short, Overflow, Eid, Abi };
+BadSegment bad_segment = BadSegment::None;
 void Require(bool ok,const char* text){if(!ok)throw std::runtime_error(text);}
 extern "C" {
 aclError aclrtGetDevice(int32_t* d){*d=0;return 0;}
-aclError aclrtMalloc(void** p,std::size_t n,int){*p=std::malloc(n);return *p?0:1;}
-aclError aclrtFree(void* p){std::free(p);return 0;}
+aclError aclrtMalloc(void** p,std::size_t n,int){*p=std::malloc(n);if(*p)++probe_allocations;return *p?0:1;}
+aclError aclrtFree(void* p){if(p)--probe_allocations;std::free(p);return 0;}
 aclError aclrtMemset(void* p,std::size_t,int value,std::size_t n){std::memset(p,value,n);return 0;}
 aclError aclrtCreateStream(aclrtStream* p){*p=new int;return 0;}
 aclError aclrtDestroyStream(aclrtStream p){delete static_cast<int*>(p);return 0;}
@@ -32,21 +37,30 @@ aclError aclrtDestroyEvent(aclrtEvent p){--events;delete static_cast<int*>(p);re
 }
 namespace kvaf::direct_hccp {
 struct DirectHccpSession {};
-bool AcquireDirectHccpSession(std::uint32_t,std::uint32_t,DirectHccpSession** s){*s=new DirectHccpSession;return true;}
-void ReleaseDirectHccpSession(DirectHccpSession* s){delete s;}
+bool AcquireDirectHccpSession(std::uint32_t,std::uint32_t,DirectHccpSession** s){++sessions;*s=new DirectHccpSession;return true;}
+void ReleaseDirectHccpSession(DirectHccpSession* s){--sessions;delete s;}
 bool GetCurrentNpuPhysicalDeviceId(std::uint32_t* d){*d=0;return true;}
 int Destroy(void* p){delete static_cast<int*>(p);return 0;}
 int DestroyWithContext(void*,void* p){return Destroy(p);}
 bool LoadDirectHccp(DirectHccpApi* a){
-  a->ctx_init=[](CtxInitCfg*,CtxInitAttr*,void** p){*p=new int;return 0;};
-  a->ctx_deinit=Destroy;
+  a->ctx_init=[](CtxInitCfg*,CtxInitAttr*,void** p){
+    if(context_error || null_context){*p=nullptr;return context_error;}
+    ++contexts;*p=new int;return 0;
+  };
+  a->ctx_deinit=[](void* p){--contexts;return Destroy(p);};
   a->token_alloc=[](void*,TokenId*,void** p){*p=new int;return 0;};
   a->token_free=DestroyWithContext;
   a->lmem_register=[](void*,MrRegInfo* mr,void** p){
     ++registrations;*p=new int;mr->out.key.size=48;
     std::memset(mr->out.key.value,0,48);mr->out.key.value[15]=1;
-    std::memcpy(mr->out.key.value+20,&mr->in.mem.addr,8);
-    std::memcpy(mr->out.key.value+32,&mr->in.mem.size,8);return 0;
+    auto base=mr->in.mem.addr,bytes=mr->in.mem.size;
+    if(bad_segment==BadSegment::ZeroBase)base=0;
+    if(bad_segment==BadSegment::Short)bytes-=1;
+    if(bad_segment==BadSegment::Overflow)base=UINT64_MAX;
+    if(bad_segment==BadSegment::Eid)mr->out.key.value[15]=2;
+    if(bad_segment==BadSegment::Abi)mr->out.key.size=52;
+    std::memcpy(mr->out.key.value+20,&base,8);
+    std::memcpy(mr->out.key.value+32,&bytes,8);return 0;
   };
   a->lmem_unregister=[](void*,void* p){--registrations;return Destroy(p);};
   a->cq_create=[](void*,CqInfo*,void** p){*p=new int;return 0;};a->cq_destroy=DestroyWithContext;
@@ -112,8 +126,29 @@ class Server {
   }
   ~Server(){stop=true;shutdown(listener,SHUT_RDWR);close(listener);if(thread.joinable())thread.join();}
 };
+void StartupFailureTest(Server& server) {
+  auto fail=[&](const char* diagnostic){
+    kvaf::OffloadRuntime runtime({0,"00000000000000000000000000000001",0,1000});
+    Require(runtime.LinkTo({"127.0.0.1:"+std::to_string(server.port)}).ok(),"link failed startup");
+    const auto status=runtime.Initialize(1024,256);
+    Require(!status.ok()&&status.message().find(diagnostic)!=std::string::npos,"startup preserves failure detail");
+    Require(status.message().find("physical=0")!=std::string::npos,"startup identifies physical device");
+    Require(!runtime.initialized()&&!runtime.pending_offload(),"setup failure is safe, not ready or pending");
+    Require(reads==0&&registrations==0&&contexts==0&&sessions==0,"setup failure cleans source before any READ");
+    Require(runtime.Shutdown().ok()&&probe_allocations==0,"failed startup releases probe and CPU pool");
+  };
+  context_error=-17;fail("RaCtxInit ret=-17");context_error=0;
+  null_context=true;fail("RaCtxInit ret=0 context_nonnull=0");null_context=false;
+  bad_segment=BadSegment::ZeroBase;fail("zero_base=1");
+  bad_segment=BadSegment::Short;fail("short_segment=1");
+  bad_segment=BadSegment::Overflow;fail("address_overflow=1");
+  bad_segment=BadSegment::Eid;fail("eid_mismatch=1");
+  bad_segment=BadSegment::Abi;fail("key_bytes=52 expected=48");
+  bad_segment=BadSegment::None;
+}
 int main(){try{
   Server server;
+  StartupFailureTest(server);
   kvaf::OffloadRuntime runtime({0,"00000000000000000000000000000001",0,1000});
   Require(runtime.LinkTo({"127.0.0.1:"+std::to_string(server.port)}).ok(),"link");
   Require(runtime.Initialize(1024,256).ok()&&runtime.initialized(),"startup CPU Pull probe");
@@ -146,7 +181,8 @@ int main(){try{
   server.drop=static_cast<std::uint16_t>(p::Command::Close);
   Require(runtime.Shutdown().code()==kvaf::StatusCode::kInDoubt,"lost close ack");
   Require(runtime.Shutdown().ok(),"close retry");
-  Require(events==0&&registrations==0,"no source leaks on recovered paths");
+  Require(events==0&&registrations==0&&contexts==0&&sessions==0&&probe_allocations==0,
+          "no source leaks on recovered paths");
   aclrtDestroyStream(stream);
   std::cout<<"Offload runtime/TCP recovery tests passed\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
