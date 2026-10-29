@@ -28,4 +28,8 @@ if(BUILD_TESTING)
     ${PROJECT_SOURCE_DIR}/tests/ubmem/model ${PROJECT_SOURCE_DIR}/access_operator/include)
   add_test(NAME kvaf_ubmem_kernel_test COMMAND kvaf_ubmem_kernel_test)
   add_test(NAME kvaf_ubmem_simt_kernel_test COMMAND kvaf_ubmem_kernel_test simt)
+  add_executable(kvaf_ubmem_bandwidth_test ${PROJECT_SOURCE_DIR}/tests/ubmem/bandwidth_test.cc)
+  target_include_directories(kvaf_ubmem_bandwidth_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/tests/ubmem/model ${PROJECT_SOURCE_DIR}/access_operator/include)
+  add_test(NAME kvaf_ubmem_bandwidth_test COMMAND kvaf_ubmem_bandwidth_test)
 endif()

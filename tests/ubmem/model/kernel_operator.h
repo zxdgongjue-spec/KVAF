@@ -52,6 +52,7 @@ void VF_CALL(Dim3 dimensions, Args... args) {
 }
 }
 inline unsigned GetBlockIdx() { return model_core; }
+inline std::uint64_t GetSystemCycle() { static std::uint64_t tick = 0; return ++tick; }
 enum class TPosition { VECIN };
 enum class HardEvent { S_MTE2, MTE2_MTE3, MTE3_MTE2, MTE3_S };
 template <HardEvent> void SetFlag(unsigned) {}
