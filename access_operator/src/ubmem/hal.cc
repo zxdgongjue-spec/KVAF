@@ -42,7 +42,6 @@ Status Hal::Load(const std::string& path) {
       !Symbol(library_, "halMemMap", &map) ||
       !Symbol(library_, "halMemUnmap", &unmap) ||
       !Symbol(library_, "halMemExportToShareableHandleV2", &export_memory) ||
-      !Symbol(library_, "halMemImportFromShareableHandleV2", &import_memory) ||
       !Symbol(library_, "halMemTransShareableHandle", &translate_handle) ||
       !Symbol(library_, "halMemShareHandleSetAttribute", &share_attribute)) {
     dlclose(library_);
@@ -55,9 +54,8 @@ Status Hal::Load(const std::string& path) {
 
 Mapping::~Mapping() { (void)Close(); }
 
-Status Mapping::ReserveAndMap(ReserveAddressFn reserve, ReleaseAddressFn release, std::uint64_t flags) {
-  release_address_ = release;
-  int ret = reserve(&address_, bytes_, 0, nullptr, flags);
+Status Mapping::ReserveAndMap() {
+  int ret = hal_->reserve(&address_, bytes_, 0, nullptr, kHugePage | kHostUva);
   if (ret != 0) return HalError("reserve virtual address", ret);
   ret = hal_->map(address_, bytes_, 0, handle_, 0);
   if (ret != 0) return HalError("halMemMap", ret);
@@ -76,7 +74,7 @@ Status Mapping::AllocateHost(std::uint64_t bytes, int numa, FabricHandle* descri
   int ret = hal_->create(&handle_, bytes, &prop, 0);
   if (ret != 0) return HalError("halMemCreate(Host P2P DDR)", ret);
   bytes_ = bytes;
-  Status status = ReserveAndMap(hal_->reserve, hal_->free_address, kHugePage | kHostUva);
+  Status status = ReserveAndMap();
   if (!status.ok()) return status;
   ret = hal_->export_memory(handle_, kFabric, 0, descriptor);
   if (ret != 0) return HalError("halMemExportToShareableHandleV2(FABRIC)", ret);
@@ -92,22 +90,6 @@ Status Mapping::AllocateHost(std::uint64_t bytes, int numa, FabricHandle* descri
   return ret == 0 ? Status::OK() : HalError("halMemShareHandleSetAttribute", ret);
 }
 
-Status Mapping::Import(const FabricHandle& descriptor, std::uint64_t bytes, std::uint32_t device,
-                       ReserveAddressFn reserve, ReleaseAddressFn release) {
-  if (handle_ != nullptr || bytes == 0 || bytes % kPageBytes != 0 ||
-      bytes > std::numeric_limits<std::size_t>::max()) {
-    return Status::InvalidArgument("invalid Fabric import size or mapping state");
-  }
-  FabricHandle copy = descriptor;
-  const int ret = hal_->import_memory(kFabric, &copy, device, &handle_);
-  if (ret != 0) return HalError("halMemImportFromShareableHandleV2(FABRIC)", ret);
-  bytes_ = bytes;
-  // SHMEM HybmVmmBasedSegment uses aclrtReserveMemAddress(..., nullptr, 1)
-  // for the Ascend950 device VA and HAL for the Fabric import/map.
-  // DEVICE_SHARE is a HAL VA allocation policy, not an ACL page-type flag.
-  return ReserveAndMap(reserve, release, kHugePage);
-}
-
 Status Mapping::Close() {
   int ret;
   if (mapped_) {
@@ -116,7 +98,7 @@ Status Mapping::Close() {
     mapped_ = false;
   }
   if (address_ != nullptr) {
-    ret = release_address_(address_);
+    ret = hal_->free_address(address_);
     if (ret != 0) return HalError("release virtual address", ret);
     address_ = nullptr;
   }

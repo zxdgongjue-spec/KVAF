@@ -1,4 +1,5 @@
 #include "ubmem_runtime.h"
+#include "ubmem/device_mapping.h"
 
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -10,23 +11,8 @@
 
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); std::abort(); } } while (0)
 
-namespace {
-kvaf::ubmem::Hal* device_allocator;
-int device_reservations = 0;
-// Stand-ins for the ACL reserve/release pair supplied by the NPU operator.
-// Reject the old HAL DEVICE_SHARE flag and track matching ownership on errors.
-int ReserveDevice(void** out, std::size_t bytes, std::size_t alignment, void* hint, std::uint64_t flags) {
-  CHECK(flags == 1 && hint == nullptr && alignment == 0);
-  const int ret = device_allocator->reserve(out, bytes, alignment, hint, flags);
-  if (ret == 0) ++device_reservations;
-  return ret;
-}
-int ReleaseDevice(void* address) {
-  const int ret = device_allocator->free_address(address);
-  if (ret == 0) --device_reservations;
-  return ret;
-}
-}
+extern "C" int KvafFakeAclReservations();
+extern "C" int KvafFakeAclHandles();
 
 int main(int argc, char** argv) {
   CHECK(argc == 2);
@@ -39,7 +25,6 @@ int main(int argc, char** argv) {
   CHECK(fail && handles && addresses && maps);
   auto hal = std::make_shared<kvaf::ubmem::Hal>();
   CHECK(hal->Load(argv[1]).ok());
-  device_allocator = hal.get();
   for (const char* stage : {"create", "reserve", "map", "export", "translate", "attribute"}) {
     fail(stage);
     { kvaf::ubmem::Mapping mapping(hal); kvaf::ubmem::FabricHandle descriptor{};
@@ -68,15 +53,15 @@ int main(int argc, char** argv) {
   for (const char* stage : {"import", "reserve", "map"}) {
     fail(stage);
     {
-      kvaf::ubmem::Mapping failed(hal);
-      CHECK(!failed.Import(region.fabric_handle, region.length, 0, ReserveDevice, ReleaseDevice).ok());
+      kvaf::ubmem::DeviceMapping failed;
+      CHECK(!failed.Import(region.fabric_handle, region.fabric_mapping_bytes).ok());
     }
-    CHECK(device_reservations == 0 && handles() == 1 && addresses() == 1 && maps() == 1);
+    CHECK(KvafFakeAclHandles() == 0 && KvafFakeAclReservations() == 0 && handles() == 1 && addresses() == 1 && maps() == 1);
   }
   {
-    kvaf::ubmem::Mapping imported(hal);
-    CHECK(imported.Import(region.fabric_handle, region.length, 0, ReserveDevice, ReleaseDevice).ok());
-    CHECK(device_reservations == 1);
+    kvaf::ubmem::DeviceMapping imported;
+    CHECK(imported.Import(region.fabric_handle, region.fabric_mapping_bytes).ok());
+    CHECK(KvafFakeAclReservations() == 1);
     CHECK(link.RetainUbmemMapping(region.base).ok());
     CHECK(link.ReleaseRegion(region.base).code() == kvaf::StatusCode::kBusy);
     CHECK(link.UbmemRange(region.base, 0, 656, 29, true).ok());
@@ -87,11 +72,13 @@ int main(int argc, char** argv) {
     data[0] ^= 1;
     CHECK(!link.UbmemRange(region.base, 0, 656, 71, false).ok());
     fail("unmap"); CHECK(!imported.Close().ok());
-    CHECK(handles() == 2 && maps() == 2 && device_reservations == 1);
+    CHECK(handles() == 2 && maps() == 2 && KvafFakeAclReservations() == 1);
+    fail("release"); CHECK(!imported.Close().ok());
+    CHECK(handles() == 2 && maps() == 1 && KvafFakeAclReservations() == 1 && KvafFakeAclHandles() == 1);
     fail("free"); CHECK(!imported.Close().ok());
-    CHECK(handles() == 2 && maps() == 1 && device_reservations == 1);
+    CHECK(handles() == 1 && maps() == 1 && KvafFakeAclReservations() == 1 && KvafFakeAclHandles() == 0);
     CHECK(imported.Close().ok());
-    CHECK(device_reservations == 0);
+    CHECK(KvafFakeAclReservations() == 0);
     link.ReleaseUbmemMapping(region.base);
   }
   CHECK(link.ReleaseRegion(region.base).ok());
@@ -105,5 +92,5 @@ int main(int argc, char** argv) {
   CHECK(provider.Shutdown().ok());
   CHECK(handles() == 0 && addresses() == 0 && maps() == 0);
   dlclose(library);
-  std::puts("UBmem HAL rollback, aliasing, CPU oracle, and control protocol passed");
+  std::puts("UBmem HAL export / ACL import rollback, aliasing, CPU oracle, and control protocol passed");
 }

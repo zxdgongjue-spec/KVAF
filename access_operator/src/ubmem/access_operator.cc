@@ -1,37 +1,17 @@
 #include "ubmem/access_operator.h"
 #include "ubmem/batch_abi.h"
-#include "ubmem/hal.h"
+#include "ubmem/device_mapping.h"
 #include "peer_link.h"
 #include "meta_manager.h"
 
 #include <acl/acl.h>
-#include <dlfcn.h>
 #include <cstdio>
 #include <fstream>
 #include <unordered_map>
 
 namespace kvaf::ubmem {
 namespace {
-Status Acl(const char* operation, aclError code) {
-  if (code == ACL_SUCCESS) return Status::OK();
-  // Capture the failing task's details before cleanup ACL calls replace them.
-  const char* detail = aclGetRecentErrMsg();
-  if (detail && *detail) std::fprintf(stderr, "[KVAF_UBMEM] %s detail: %s\n", operation, detail);
-  return HalError(operation, code);
-}
 std::uint64_t AddressOf(const void* ptr) { return reinterpret_cast<std::uintptr_t>(ptr); }
-Status DriverDevice(std::uint32_t user_device, std::uint32_t* device) {
-  void* library = dlopen("libruntime.so", RTLD_NOW | RTLD_LOCAL);
-  if (!library) return Status::NotFound("cannot load libruntime.so for HAL logical-device resolution");
-  using Resolve = int(*)(int32_t, int32_t*);
-  auto resolve = reinterpret_cast<Resolve>(dlsym(library, "rtGetLogicDevIdByUserDevId"));
-  int32_t result = -1;
-  const int ret = resolve ? resolve(user_device, &result) : -1;
-  dlclose(library);
-  if (ret != 0 || result < 0) return HalError("rtGetLogicDevIdByUserDevId", ret);
-  *device = result;
-  return Status::OK();
-}
 }  // namespace
 
 struct AccessOperator::Impl {
@@ -46,8 +26,7 @@ struct AccessOperator::Impl {
     Pending pending{Pending::kNone};
   };
   OperatorOptions options;
-  std::shared_ptr<Hal> hal = std::make_shared<Hal>();
-  std::unique_ptr<Mapping> mapping;
+  std::unique_ptr<DeviceMapping> mapping;
   RemoteRegionDesc remote{};
   aclrtBinHandle binary{};
   aclrtFuncHandle function{};
@@ -213,26 +192,22 @@ Status AccessOperator::Initialize(const RemoteRegionDesc& region) {
     return Status::InvalidArgument("invalid UBmem configuration/remote region");
   }
   auto status = Acl("aclrtSetDevice", aclrtSetDevice(impl_->options.device_id));
-  std::uint32_t logical_device = 0;
-  if (status.ok()) status = DriverDevice(impl_->options.device_id, &logical_device);
   peer::PeerRegion peer;
   if (status.ok()) status = impl_->options.peer_link->LookupRegion(region.base, &peer);
-  if (status.ok()) status = impl_->hal->Load(impl_->options.hal_library);
   if (status.ok()) status = impl_->options.peer_link->RetainUbmemMapping(region.base);
   if (status.ok()) {
     impl_->remote = region;
     impl_->retained = true;
-    impl_->mapping = std::make_unique<Mapping>(impl_->hal);
-    status = impl_->mapping->Import(peer.fabric_handle, peer.fabric_mapping_bytes, logical_device,
-                                   aclrtReserveMemAddress, aclrtReleaseMemAddress);
+    impl_->mapping = std::make_unique<DeviceMapping>();
+    status = impl_->mapping->Import(peer.fabric_handle, peer.fabric_mapping_bytes);
   }
   if (status.ok()) status = impl_->LoadKernel();
   if (!status.ok()) { (void)Shutdown(); return status; }
   impl_->ready = true;
-  std::fprintf(stderr, "[KVAF_UBMEM] DEVICE_MAPPING_READY engine=mte ub_bytes=%u bytes=%llu cores=%u acl_device=%u hal_device=%u "
+  std::fprintf(stderr, "[KVAF_UBMEM] DEVICE_MAPPING_READY engine=mte mapping=acl ub_bytes=%u bytes=%llu cores=%u acl_device=%u "
       "host_base=0x%llx mapped_base=0x%llx\n",
       kMteBufferBytes, static_cast<unsigned long long>(region.length), impl_->options.cores,
-      impl_->options.device_id, logical_device,
+      impl_->options.device_id,
       static_cast<unsigned long long>(region.base),
       static_cast<unsigned long long>(impl_->mapping->address()));
   return Status::OK();

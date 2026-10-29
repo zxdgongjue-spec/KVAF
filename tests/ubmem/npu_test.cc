@@ -49,7 +49,7 @@ struct DevicePool {
   }
 };
 struct Config {
-  std::string peer, kernel, hal{"libascend_hal.so"};
+  std::string peer, kernel;
   std::uint32_t device = 0, cores = 2, rows = 17, token = 656, tokens = 128, repeat = 2;
 };
 
@@ -173,7 +173,6 @@ Config Parse(int argc, char** argv) {
     const char* value = argv[++i];
     if (key == "--peer") c.peer = value;
     else if (key == "--kernel") c.kernel = value;
-    else if (key == "--hal-library") c.hal = value;
     else {
       char* end; errno = 0; const auto n = std::strtoul(value, &end, 10);
       Require(!errno && end != value && !*end && n <= UINT32_MAX && value[0] != '-', "invalid " + key);
@@ -198,7 +197,7 @@ Config Parse(int argc, char** argv) {
 int main(int argc, char** argv) {
   if (argc == 2 && std::string(argv[1]) == "--help") {
     std::puts("Usage: kvaf_ubmem_test --peer CPU:PORT --kernel PATH [--device 0] [--cores 2] [--rows 17] "
-              "[--token-bytes 656] [--tokens-per-block 128] [--repeat 2] [--hal-library PATH]"); return 0;
+              "[--token-bytes 656] [--tokens-per-block 128] [--repeat 2]"); return 0;
   }
   try {
     const auto c = Parse(argc, argv);
@@ -210,7 +209,7 @@ int main(int argc, char** argv) {
       DevicePool buffers;
       auto link = std::make_shared<kvaf::peer::PeerLink>(c.peer);
       kvaf::ubmem::DdrAllocator allocator(link);
-      kvaf::ubmem::AccessOperator op({c.kernel, c.hal, c.device, c.cores, link});
+      kvaf::ubmem::AccessOperator op({c.kernel, c.device, c.cores, link});
       auto meta = kvaf::CreateInMemoryMetaManager();
       kvaf::RuntimeCore core(*meta, op, allocator);
       const auto slot = static_cast<std::uint64_t>(c.token) * c.tokens;

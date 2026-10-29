@@ -4,7 +4,6 @@
 namespace kvaf::ubmem {
 struct OperatorOptions {
   std::string kernel_object_path;
-  std::string hal_library{"libascend_hal.so"};
   std::uint32_t device_id{0};
   std::uint32_t cores{2};
   std::shared_ptr<peer::PeerLink> peer_link;

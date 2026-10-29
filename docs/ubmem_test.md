@@ -77,15 +77,17 @@ CPU Host P2P DDR
                                       │
                          TCP PeerLink 交换描述符
                                       │
-NPU HAL import → aclrtReserveMemAddress → halMemMap
+NPU aclrtReserveMemAddress → aclrtMemImportFromShareableHandleV2 → aclrtMapMem
                                       │
           BatchPut: 本地 HBM → MTE2 → UB → MTE3 → CPU DDR
           BatchGet: CPU DDR → MTE2 → UB → MTE3 → 本地 HBM
 ```
 
-- `access_operator/src/ubmem/hal.cc`：动态加载 HAL，管理不透明物理句柄、Fabric handle 与映射。
-  Host 分配采用 `MEM_P2P_DDR_TYPE`、huge page 和 HAL Host UVA。NPU VA 使用
-  `aclrtReserveMemAddress(..., nullptr, 1)`，释放时配对调用 `aclrtReleaseMemAddress`。
+- `access_operator/src/ubmem/hal.cc`：CPU 端动态加载 HAL，分配和导出 Host DDR。
+  Host 分配采用 `MEM_P2P_DDR_TYPE`、huge page 和 HAL Host UVA。
+- `access_operator/src/ubmem/device_mapping.cc`：NPU 端按 SHMEM Host DDR 路径，使用 ACL
+  预留 VA、导入 Fabric handle 和映射；关闭时依次 unmap、free physical、release VA。
+  某一步释放失败时保留该资源及后续资源，供 Shutdown 重试。
 - `runtime/src/ubmem_cpu_runtime.cc`：使用已有 RuntimeService 接收控制请求，拥有 CPU DDR 生命周期。
 - `runtime/src/peer_link.cc`：增加 UBmem 分配、CPU oracle 请求；沿用原有 region release。
 - `access_operator/src/ubmem/access_operator.cc`：实现现有 AccessOperator 接口，保持 BatchPut 同步提交、
@@ -94,7 +96,8 @@ NPU HAL import → aclrtReserveMemAddress → halMemMap
   检查设备端 Get 元数据中的有效请求前缀、表索引、远端 block 范围和输出范围。
 - `tests/ubmem/npu_test.cc`：以真实 RuntimeCore、MetaManager 运行上述测试。
 
-NPU 端先将 ACL 用户 device ID 转为 HAL logical device ID，支持可见设备编号重映射。
+NPU 端通过 `aclrtSetDevice` 选择设备，导入时由 ACL/Runtime 处理当前设备及编号转换。
+NPU 测试程序不再接受 `--hal-library`；其 HAL 依赖由 CANN 加载。CPU 服务仍接受该选项。
 内核使用 `mapped_base + (remote_address - remote_region_base)` 转换地址，无需对称地址空间。
 CPU region 在 NPU 映射持有期间不能释放；解除映射前先等待各 stream 的完成事件。
 
@@ -141,10 +144,14 @@ HAL 映射和 UB 通路，需运行 CPU 改写后 NPU Get、NPU Put 后 CPU chec
   `examples/shmem_perftest/mte_perftest/mte_perftest_kernel.cpp` 的行间同步。
 - HAL ABI：CANN Driver `pkg_inc/ascend_hal_base.h` 的 `drv_mem_prop` 和函数声明，
   `ascend_hal_define.h` 的内存类型、Host UVA 标志和 Fabric handle。
-- NPU VA：SHMEM `hybm_vmm_based_segment.cpp::ReserveEachPeMemorySpace` 和
-  `hybm_acl_device_mem_segment.cpp::ReserveEachPeMemorySpace` 的 Ascend950 分支均用
-  `aclrtReserveMemAddress(..., nullptr, 1)`。`dl_acl_api.cpp::AclrtReserveMemAddress` 明确要求
-  nullptr 自动选址使用 ACL。KVAF 配对使用 ACL 预留/释放，HAL 导入/映射沿用前者的 `Map` 路径。
+- NPU 映射：SHMEM `hybm_mem_segment.cpp::MemSegment::Create` 的 DRAM 分支选择
+  `AclMemSegmentDevice`；其 `ReserveEachPeMemorySpace`、`Mmap` 使用 ACL 预留、导入、映射。
+  HAL 的 Fabric 类型值是 1，ACL 的 `ACL_MEM_SHARE_HANDLE_TYPE_FABRIC` 是 2，不能混用。
+- Runtime：CANN Runtime `src/acl/aclrt_impl/memory.cpp` 与
+  `src/runtime/api/impl/api_impl_vmm.cc::ImportFromShareableHandleV2` 显示，ACL 导入使用
+  当前设备，转换编号并检查 server；同 server 且共享内存拥有者不是 Host 时才启用设备 P2P。
+  `src/runtime/driver/npu_driver_mem.cc::MapMem` 最终直接调用 `halMemMap`，
+  此路径没有额外的地址范围注册。上述核对基于 Runtime commit `b44e41e4476a3eaff0be1287f786ebb076311d0c`。
 - Fabric 导出及共享属性：SHMEM `src/host/mem/heap/hybm_vmm_based_segment.cpp::ExportInner`。
 
 NPU 数据面按 SHMEM `mte_perftest --memory-type dram` 的 MTE/UB 路径实现，
@@ -155,13 +162,13 @@ CPU 服务的独立 HAL 分配/导出仍由本测试验证。
 
 ## 定位不支持的环节
 
-测试会报告具体失败的 HAL 接口，并通过 TCP 将 CPU 分配错误返回 NPU 端，例如：
+测试会报告具体失败的 HAL/ACL 接口，并通过 TCP 将 CPU 分配错误返回 NPU 端，例如：
 
 - `cannot load libascend_hal.so`：HAL 库未安装或不在加载路径。
 - `halMemCreate(Host P2P DDR)`：当前驱动／节点不能分配此类 DDR，或资源不足。
-- `reserve virtual address`：CPU 的 HAL Host UVA 或 NPU 的 ACL 设备 VA 预留失败。
+- `reserve virtual address` / `aclrtReserveMemAddress`：分别为 CPU Host UVA / NPU 设备 VA 预留失败。
 - `halMemExportToShareableHandleV2(FABRIC)`：CPU 端 Fabric 导出失败。
-- `halMemImportFromShareableHandleV2(FABRIC)` / `halMemMap`：NPU 侧导入、路由、权限或映射失败。
+- `aclrtMemImportFromShareableHandleV2(FABRIC)` / `aclrtMapMem`：NPU 侧导入、路由、权限或映射失败。
 - `CPU_MISMATCH` / `KERNEL_ERROR`：分别为 CPU 内容校验失败、内核请求范围等校验失败。
 - `aclrtSynchronizeStream` 返回 `507035`：CANN 定义为 Vector Core 执行异常。
   程序立即输出 `aclGetRecentErrMsg()` 的详细信息；结合运行时日志中的 PC、访问地址和
@@ -171,6 +178,13 @@ CPU 服务的独立 HAL 分配/导出仍由本测试验证。
 若本地校验通过、错误出现在
 `MAPPED_PUT_BEGIN` 后，重点排查映射目的地址及其可达性。
 `DEVICE_MAPPING_READY` 和 `FAILED_LAUNCH` 输出设备编号、映射与输入范围，可与故障地址对照。
+当前 ACL 实现会输出 `mapping=acl`。
+
+2026-10-29 的硬件结果：本地 HBM 对照通过，混合 ACL reserve / HAL import-map 路径在
+映射 DDR 写入时报 MTE 错误 95（DDR address out of range）；之前 SIMT 对同一类目的区报 334。
+现已统一为 SHMEM 的 ACL 导入/映射生命周期，仍待硬件复测。源码核对不能证明这次 95
+由 API 混用导致；特别是 Host 拥有的同 server 内存不会走上述设备 P2P 分支。
+若 ACL 路径仍报 95，需要结合目标机 CANN/驱动版本及 SVM 映射日志核实实际映射，而不是增加缓存刷新。
 
 同步 BatchPut 输出每核 `PUT_CORE`，包含设备报告的 `completed` 和 host 计算的 `expected`。
 默认 17 行、2 核应分别完成 9 行和 8 行；计数不符会在 MetaManager 提交前报错。
@@ -191,8 +205,10 @@ cmake --build build-ubmem-host --parallel
 ctest --test-dir build-ubmem-host --output-on-failure
 ```
 
-`kvaf_ubmem_control_test` 使用仅测试链接的 fake HAL，共享文件映射模拟同一物理内存的两个 VA，
-覆盖故障回滚、真实 loopback TCP 描述符交换、CPU oracle、逻辑长度和映射引用保护。
+`kvaf_ubmem_control_test` 编译实际 `DeviceMapping`，以测试用 ACL VMM 接口和 fake HAL
+模拟同一物理内存的两个 VA，检查 ACL Fabric 类型、配对释放、导入失败回滚及释放失败重试，
+并覆盖真实 loopback TCP 描述符交换、CPU oracle、逻辑长度和映射引用保护。
+该模型不模拟 Runtime 的 server/P2P 行为或真实设备可达性。
 它需要允许在 loopback 临时监听端口。
 
 `kvaf_ubmem_kernel_test` 包含实际 `.asc` 内核源码，在 CPU 模型中覆盖非对齐、656 字节读、
@@ -201,4 +217,5 @@ ctest --test-dir build-ubmem-host --output-on-failure
 NPU 编译及跨机映射、数据可见性必须使用上面的硬件程序验证。
 
 参考：[SHMEM PR !285](https://gitcode.com/cann/shmem/pull/285)、
-[CANN Driver SVM](https://gitcode.com/cann/driver/tree/master/src/ascend_hal/svm)。
+[CANN Driver SVM](https://gitcode.com/cann/driver/tree/master/src/ascend_hal/svm)、
+[CANN Runtime](https://gitcode.com/cann/runtime)。

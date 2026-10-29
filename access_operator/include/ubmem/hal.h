@@ -21,8 +21,6 @@ static_assert(sizeof(MemoryProperty) == 32);
 static_assert(offsetof(MemoryProperty, reserved) == 24);
 using FabricHandle = std::array<std::uint8_t, 128>;
 constexpr std::size_t kPageBytes = 2ULL * 1024 * 1024;
-using ReserveAddressFn = int (*)(void**, std::size_t, std::size_t, void*, std::uint64_t);
-using ReleaseAddressFn = int (*)(void*);
 
 class Hal {
  public:
@@ -34,12 +32,11 @@ class Hal {
 
   int (*create)(void**, std::size_t, const MemoryProperty*, std::uint64_t){};
   int (*release)(void*){};
-  ReserveAddressFn reserve{};
-  ReleaseAddressFn free_address{};
+  int (*reserve)(void**, std::size_t, std::size_t, void*, std::uint64_t){};
+  int (*free_address)(void*){};
   int (*map)(void*, std::size_t, std::size_t, void*, std::uint64_t){};
   int (*unmap)(void*){};
   int (*export_memory)(void*, int, std::uint64_t, FabricHandle*){};
-  int (*import_memory)(int, FabricHandle*, std::uint32_t, void**){};
   int (*translate_handle)(int, FabricHandle*, std::uint32_t*, std::uint64_t*){};
   struct ShareAttribute { std::uint32_t enable; std::uint32_t reserved[8]; };
   int (*share_attribute)(std::uint64_t, int, ShareAttribute){};
@@ -59,20 +56,15 @@ class Mapping {
   Mapping& operator=(const Mapping&) = delete;
 
   Status AllocateHost(std::uint64_t bytes, int numa_node, FabricHandle* descriptor);
-  // NPU callers supply aclrtReserveMemAddress/aclrtReleaseMemAddress, as SHMEM
-  // does for an automatically chosen device VA. CPU allocation remains HAL-only.
-  Status Import(const FabricHandle& descriptor, std::uint64_t bytes, std::uint32_t logical_device,
-                ReserveAddressFn reserve, ReleaseAddressFn release);
   Status Close();
   std::uint64_t address() const { return reinterpret_cast<std::uintptr_t>(address_); }
   std::uint64_t bytes() const { return bytes_; }
 
  private:
-  Status ReserveAndMap(ReserveAddressFn reserve, ReleaseAddressFn release, std::uint64_t flags);
+  Status ReserveAndMap();
   std::shared_ptr<Hal> hal_;
   void* handle_{};
   void* address_{};
-  ReleaseAddressFn release_address_{};
   std::uint64_t bytes_{};
   bool mapped_{};
 };
