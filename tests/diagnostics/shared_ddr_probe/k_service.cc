@@ -144,6 +144,52 @@ static_assert(offsetof(Sge, tseg) == 16);
 using GetTp = int (*)(urma_context_t*, TpQuery*, std::uint32_t*, TpInfo*);
 using ImportJetty = urma_target_jetty_t* (*)(urma_context_t*, RemoteJetty*, urma_token_t*, ActiveTp*);
 
+struct SourceDescriptor {
+  urma_seg_t segment{};
+  RemoteJetty remote{};
+  TpQuery tp_query{};
+};
+
+SourceDescriptor DecodeSourceDescriptor(const Message& request, std::uint64_t expected_bytes,
+                                        const urma_eid_t& local_eid) {
+  Check(request.segment_bytes == sizeof(urma_seg_t) && request.key_bytes == 32 &&
+    request.tp && request.psn && request.token, "invalid HBM descriptor/Jetty ABI");
+  SourceDescriptor descriptor;
+  std::memcpy(&descriptor.segment, request.segment, sizeof(descriptor.segment));
+  const auto& segment = descriptor.segment;
+  Check(request.bytes == expected_bytes && request.base <= UINT64_MAX - request.bytes &&
+    request.base >= segment.ubva.va && request.bytes <= segment.len &&
+    request.base - segment.ubva.va <= segment.len - request.bytes,
+    "HBM range does not cover the full guarded allocation");
+  std::memcpy(&descriptor.remote.id, request.key, sizeof(descriptor.remote.id));
+  std::memcpy(&descriptor.remote.mode, request.key + sizeof(descriptor.remote.id),
+    sizeof(descriptor.remote.mode));
+  Check(descriptor.remote.mode == URMA_TM_RM, "source Jetty must use RM");
+  Check(std::any_of(descriptor.remote.id.eid.raw, descriptor.remote.id.eid.raw + 16,
+    [](std::uint8_t byte) { return byte != 0; }), "source Jetty EID must be nonzero");
+  Check(std::memcmp(segment.ubva.eid.raw, descriptor.remote.id.eid.raw, 16) == 0,
+    "HBM segment EID differs from exported Jetty EID");
+  // As in CpuService::CreateChannel, the configured CTP route and the resource
+  // identity in the Jetty key are separate inputs. Never rewrite either key.
+  descriptor.tp_query.flag = 1;
+  descriptor.tp_query.mode = URMA_TM_RM;
+  Check(std::any_of(request.eid, request.eid + 16,
+    [](std::uint8_t byte) { return byte != 0; }), "source route EID must be nonzero");
+  std::memcpy(descriptor.tp_query.local, local_eid.raw, 16);
+  std::memcpy(descriptor.tp_query.peer, request.eid, 16);
+  return descriptor;
+}
+
+std::string SourceEidHex(const std::uint8_t* eid) {
+  constexpr char digits[] = "0123456789abcdef";
+  std::string result(32, '0');
+  for (std::size_t i = 0; i < 16; ++i) {
+    result[2*i] = digits[eid[i] >> 4];
+    result[2*i+1] = digits[eid[i] & 15];
+  }
+  return result;
+}
+
 struct State {
   Registration* region{};
   urma_target_seg_t* source{};
@@ -158,16 +204,13 @@ struct State {
 
   void Connect(const Message& request, Message& reply) {
     Check(region && !source && !jetty, "ARM required, or source already connected");
-    Check(request.segment_bytes == sizeof(urma_seg_t) && request.key_bytes == 32 &&
-      request.tp && request.psn && request.token, "invalid HBM descriptor/Jetty ABI");
     auto* ctx = region->context;
-    urma_seg_t segment{};
-    std::memcpy(&segment, request.segment, sizeof(segment));
-    Check(request.bytes == region->bytes && request.base <= UINT64_MAX - request.bytes &&
-      request.base >= segment.ubva.va &&
-      request.bytes <= segment.len && request.base - segment.ubva.va <= segment.len - request.bytes,
-      "HBM range does not cover the full guarded allocation");
-    Check(std::memcmp(segment.ubva.eid.raw, request.eid, 16) == 0, "HBM EID differs from Jetty EID");
+    auto descriptor = DecodeSourceDescriptor(request, region->bytes, ctx->eid);
+    auto& segment = descriptor.segment;
+    auto& remote = descriptor.remote;
+    std::fprintf(stderr, "SOURCE_DESCRIPTOR route_eid=%s mr_eid=%s jetty_eid=%s\n",
+      SourceEidHex(request.eid).c_str(), SourceEidHex(segment.ubva.eid.raw).c_str(),
+      SourceEidHex(remote.id.eid.raw).c_str());
     urma_token_t token{}; token.token = request.token;
     urma_import_seg_flag_t import_flags{};
     import_flags.bs.access = 2;  // remote READ only, no bit 0
@@ -195,14 +238,8 @@ struct State {
     auto query = reinterpret_cast<GetTp>(dlsym(RTLD_DEFAULT, "urma_get_tp_list"));
     auto import = reinterpret_cast<ImportJetty>(dlsym(RTLD_DEFAULT, "urma_import_jetty_ex"));
     Check(query && import, "missing deployed expanded CTP APIs");
-    TpQuery q{}; q.flag = 1; q.mode = URMA_TM_RM;
-    std::memcpy(q.local, ctx->eid.raw, 16); std::memcpy(q.peer, request.eid, 16);
     TpInfo info{}; std::uint32_t count = 1;
-    Check(query(ctx, &q, &count, &info) == 0 && count && info.handle, "query pull CTP");
-    RemoteJetty remote{};
-    std::memcpy(&remote.id, request.key, sizeof(remote.id));
-    std::memcpy(&remote.mode, request.key + sizeof(remote.id), sizeof(remote.mode));
-    Check(remote.mode == URMA_TM_RM, "source Jetty must use RM");
+    Check(query(ctx, &descriptor.tp_query, &count, &info) == 0 && count && info.handle, "query pull CTP");
     remote.policy = URMA_JETTY_GRP_POLICY_RR; remote.type = URMA_JETTY; remote.tp_type = 1;
     urma_import_jetty_flag_t flag{}; flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
     remote.flag = flag.value;

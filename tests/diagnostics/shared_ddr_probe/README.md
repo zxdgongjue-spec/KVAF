@@ -2,7 +2,7 @@
 
 ## 当前交付与结论边界
 
-这是一组独立诊断程序，尚未在 UB/NPU 硬件上执行，不能据此宣布单 MR 或双 MR 已获驱动支持。
+这是一组独立诊断程序，目前尚无 UB/NPU 三端完整通过结果，不能据此宣布单 MR 或双 MR 已获驱动支持。
 
 - `k_service.cc` 使用本工作区真实 `CpuRuntime` 的分配、注册和建链代码，仅在诊断可执行文件中拦截 KV MR 注册。
 - `hbm_export.cc` 在 Prefill 进程内导出已有 Tensor HBM，使用现有 Direct HCCP/RA ABI。
@@ -219,12 +219,18 @@ kernel 路径、明显的端口冲突等本地参数错误在 NPU 初始化和 R
 如果 K 日志只有 `PROBE_FAIL op=7`，表示某个客户端上报失败，应先看该客户端的首个 traceback；
 此时日志附带的 errno 不足以认定发生了 MR 注册失败。`op=1` 是另一个客户端查询状态时读到失败。
 
-若出现 `HBM EID differs from Jetty EID`，当前 K 检查实际比较的是 HBM segment 中的 EID
-与 Prefill 命令行提供的 EID，并未从 Jetty key 中取值。Prefill 在发送 EXPORT 前打印
-`event=HBM_EXPORT`，包含 `configured_eid`、`segment_eid_prefix`、`jetty_eid_prefix` 和两个完整 key。
-后两个前缀按本诊断所需 ABI 取 key 的前 16 B；原始 key 用于进一步核对部署 ABI。
-将三者与实际物理 NPU 的 rootinfo CLOS EID 对照；不能仅凭该报错断定命令行 EID 填错，
-也不能改写 MR key 或删除检查来绕过。增加这组日志只需更新 Python 脚本，不需要重编 C++。
+Prefill 在发送 EXPORT 前打印 `event=HBM_EXPORT`，包含 `configured_eid`、
+`segment_eid_prefix`、`jetty_eid_prefix` 和两个完整 key。后两个前缀按本诊断所需 ABI
+取 key 的前 16 B；原始 key 用于进一步核对部署 ABI。
+`configured_eid`（命令行 `--eid`）供两端查询 CTP 路径使用，可以与实际资源 key 中的 EID 不同。
+例如已观察到配置 CLOS EID 为 `00000000003f030000100000df00ab00`，而 HBM MR 和 Jetty
+都返回 `000000000001030000100000df00a200`。这不证明任意两种 EID 均可互换或可达。
+K 比较的是 HBM segment 与实际导出的 Jetty key 中的资源 EID；不要求它们等于配置 EID。
+接收成功后打印 `SOURCE_DESCRIPTOR route_eid=... mr_eid=... jetty_eid=...`，
+仍将原配置 EID 用于 CTP 查询，并原样导入两个 key。
+若出现 `HBM segment EID differs from exported Jetty EID`，表示两个资源身份确实不一致；
+应核对部署 ABI 和源端资源，不能改写 MR key 或删除检查来绕过。
+升级这项 K 端校验需要重新编译 `kvaf_ddr_probe`；Prefill 导出库和 Decode 无需因此重编。
 
 ## 无硬件的本地检查
 
@@ -238,6 +244,9 @@ python3 -m unittest discover -s tests/diagnostics/shared_ddr_probe -p 'test_*.py
 
 host 测试覆盖九组注册视图、先后顺序、同 allocation 校验、跨 context、分块 READ、
 多轮数据更换、post/CQ 错误不发布完成，以及第二个 MR 注册失败时回滚。
+源描述符回归使用上述真机返回的 48 B segment 和 32 B Jetty key 作为固定输入，
+验证配置 EID 与资源 EID 不同但 MR/Jetty 身份一致时可通过，CTP 查询仍保留配置 EID；
+同时拒绝真实资源身份不一致、错误 key 长度/RM 模式、越界、地址溢出及全零 EID。
 另用明确标注的 24.12 core 校验模型检查：0xe 拒绝、0xf 接受。数据搬运 fake provider
 只检查测试工具流程，不声明真实 provider 支持这些配置。
 控制测试覆盖二进制布局、碎片响应、错误响应、版本不匹配和数据版本变化。
@@ -249,4 +258,6 @@ host 测试覆盖九组注册视图、先后顺序、同 allocation 校验、跨
 两个 C++ 主体文件通过 `clang++ -fsyntax-only`；fake-provider 可执行测试通过；
 Python 控制和启动回归测试于 2026-10-28 全部通过（14 项），控制协议未改变。
 macOS 检查仅为编译提供 `MADV_HUGEPAGE` 常量，不执行 Linux 页管理操作。
-当前环境没有完整 Linux UMDK/CANN 链接环境，目标机完整构建和硬件运行仍未执行。
+2026-10-29 补充检查：使用同一 24.12 提交的真实头文件，通过 clang++ 编译并运行新增源描述符
+回归及原 fake-provider 测试。当前本地环境没有完整 Linux UMDK/CANN 链接环境，
+这些检查不能代替目标机完整构建、建链、READ 和全轮数据验证。
