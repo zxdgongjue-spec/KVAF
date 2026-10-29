@@ -101,6 +101,78 @@ void TestSourceDescriptor() {
   ExpectSourceRejected(bad, cpu_eid, "invalid HBM descriptor/Jetty ABI");
   std::cerr << "SOURCE_DESCRIPTOR_TEST_PASS route_eid_preserved=1 resource_identity_checked=1\n";
 }
+
+struct FakePullQuery {
+  urma_context_t* context{};
+  probe::TpQuery config{};
+  int rc{}, error{};
+  std::uint32_t count{};
+  std::uint64_t handle{};
+  unsigned calls{};
+} fake_pull_query;
+
+int QueryPullTpFake(urma_context_t* context, probe::TpQuery* config,
+                    std::uint32_t* count, probe::TpInfo* info) {
+  auto& fake = fake_pull_query;
+  ++fake.calls;
+  Require(fake.calls == 1, "pull CTP query retried or fell back to another route");
+  Require(errno == 0, "pull CTP query inherited stale errno");
+  Require(context == fake.context && config && count && info, "wrong pull CTP query arguments");
+  Require(config->flag == fake.config.flag && config->mode == fake.config.mode &&
+    std::memcmp(config->local, fake.config.local, 16) == 0 &&
+    std::memcmp(config->peer, fake.config.peer, 16) == 0,
+    "pull CTP query rewrote its flags or endpoint EIDs");
+  Require(*count == 1 && info->handle == 0, "pull CTP query outputs not initialized");
+  *count = fake.count;
+  info->handle = fake.handle;
+  errno = fake.error;
+  return fake.rc;
+}
+
+void TestPullCtpQuery() {
+  urma_context_t context{};
+  probe::TpQuery config{};
+  config.flag = 1; config.mode = URMA_TM_RM;
+  CopyHex("00000000007f020000100000df0a0b00", config.local, 16);
+  CopyHex("00000000003f030000100000df00ab00", config.peer, 16);
+  struct Scenario {
+    int rc;
+    std::uint32_t count;
+    std::uint64_t handle;
+    int error;
+    bool ok;
+    const char* outcome;
+  };
+  const Scenario scenarios[] = {
+    {0, 1, 0x1234, 0, true, "ok"},
+    {0, 1, 0x1234, EAGAIN, true, "ok"},
+    {EINVAL, 1, 0x1234, EIO, false, "api_error"},
+    {-1, 1, 0x1234, 0, false, "api_error"},
+    {0, 0, 0, 0, false, "empty_list"},
+    {0, 0, 0x1234, 0, false, "empty_list"},
+    {0, 1, 0, 0, false, "zero_handle"},
+  };
+  for (const auto& scenario : scenarios) {
+    fake_pull_query = {};
+    fake_pull_query.context = &context;
+    fake_pull_query.config = config;
+    fake_pull_query.rc = scenario.rc;
+    fake_pull_query.count = scenario.count;
+    fake_pull_query.handle = scenario.handle;
+    fake_pull_query.error = scenario.error;
+    errno = EINVAL;  // Must be cleared even when the callback leaves errno zero.
+    const auto result = probe::QueryPullCtp(QueryPullTpFake, &context, config);
+    const int restored_errno = errno;
+    Require(fake_pull_query.calls == 1, "pull CTP query did not issue exactly one call");
+    Require(result.rc == scenario.rc && result.count == scenario.count &&
+      result.handle == scenario.handle && result.error == scenario.error,
+      "pull CTP query lost raw callback results");
+    Require(restored_errno == scenario.error, "pull CTP query logging overwrote captured errno");
+    Require(result.ok() == scenario.ok && std::strcmp(result.outcome(), scenario.outcome) == 0,
+      "pull CTP query misclassified its result");
+  }
+  std::cerr << "PULL_CTP_QUERY_TEST_PASS single_call=1 endpoints_preserved=1 errno_captured=1\n";
+}
 }
 extern "C" {
 urma_target_seg_t* urma_register_seg(urma_context_t* ctx, urma_seg_cfg_t* cfg) {
@@ -160,6 +232,7 @@ int main() {
   try {
     std::cerr << "HARNESS_UNIT_TEST fake_provider=1 profile=plumbing_only hardware_result=UNKNOWN\n";
     TestSourceDescriptor();
+    TestPullCtpQuery();
     allocation_bytes = 3 * kGuard;
     std::vector<std::uint8_t> target(allocation_bytes), source(allocation_bytes);
     urma_context_t ctx{};

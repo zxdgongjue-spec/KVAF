@@ -190,6 +190,37 @@ std::string SourceEidHex(const std::uint8_t* eid) {
   return result;
 }
 
+struct PullCtpResult {
+  int rc{};
+  std::uint32_t count{};
+  std::uint64_t handle{};
+  int error{};
+  bool ok() const { return rc == 0 && count != 0 && handle != 0; }
+  const char* outcome() const {
+    if (rc != 0) return "api_error";
+    if (count == 0) return "empty_list";
+    if (handle == 0) return "zero_handle";
+    return "ok";
+  }
+};
+
+PullCtpResult QueryPullCtp(GetTp query, urma_context_t* ctx, TpQuery config) {
+  const auto input = config;
+  TpInfo info{};
+  std::uint32_t count = 1;
+  errno = 0;
+  const int rc = query(ctx, &config, &count, &info);
+  const int saved_errno = errno;
+  const PullCtpResult result{rc, count, info.handle, saved_errno};
+  std::fprintf(stderr, "PULL_CTP_QUERY result=%s ctx=%p flag=0x%x mode=%u "
+    "local_eid=%s peer_eid=%s capacity=1 rc=%d count=%u tp=0x%llx errno=%d\n",
+    result.outcome(), (void*)ctx, input.flag, input.mode,
+    SourceEidHex(input.local).c_str(), SourceEidHex(input.peer).c_str(),
+    result.rc, result.count, (unsigned long long)result.handle, result.error);
+  errno = saved_errno;
+  return result;
+}
+
 struct State {
   Registration* region{};
   urma_target_seg_t* source{};
@@ -208,9 +239,9 @@ struct State {
     auto descriptor = DecodeSourceDescriptor(request, region->bytes, ctx->eid);
     auto& segment = descriptor.segment;
     auto& remote = descriptor.remote;
-    std::fprintf(stderr, "SOURCE_DESCRIPTOR route_eid=%s mr_eid=%s jetty_eid=%s\n",
+    std::fprintf(stderr, "SOURCE_DESCRIPTOR route_eid=%s mr_eid=%s jetty_eid=%s source_tp=0x%llx\n",
       SourceEidHex(request.eid).c_str(), SourceEidHex(segment.ubva.eid.raw).c_str(),
-      SourceEidHex(remote.id.eid.raw).c_str());
+      SourceEidHex(remote.id.eid.raw).c_str(), (unsigned long long)request.tp);
     urma_token_t token{}; token.token = request.token;
     urma_import_seg_flag_t import_flags{};
     import_flags.bs.access = 2;  // remote READ only, no bit 0
@@ -238,15 +269,15 @@ struct State {
     auto query = reinterpret_cast<GetTp>(dlsym(RTLD_DEFAULT, "urma_get_tp_list"));
     auto import = reinterpret_cast<ImportJetty>(dlsym(RTLD_DEFAULT, "urma_import_jetty_ex"));
     Check(query && import, "missing deployed expanded CTP APIs");
-    TpInfo info{}; std::uint32_t count = 1;
-    Check(query(ctx, &descriptor.tp_query, &count, &info) == 0 && count && info.handle, "query pull CTP");
+    const auto ctp = QueryPullCtp(query, ctx, descriptor.tp_query);
+    Check(ctp.ok(), "query pull CTP (see PULL_CTP_QUERY)");
     remote.policy = URMA_JETTY_GRP_POLICY_RR; remote.type = URMA_JETTY; remote.tp_type = 1;
     urma_import_jetty_flag_t flag{}; flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
     remote.flag = flag.value;
-    ActiveTp active{}; active.local = info.handle; active.peer = request.tp;
+    ActiveTp active{}; active.local = ctp.handle; active.peer = request.tp;
     active.tx = 1; active.rx = request.psn;
     peer = import(ctx, &remote, &token, &active); Check(peer, "import source Jetty");
-    reply.tp = info.handle; reply.psn = 1; reply.token = request.token;
+    reply.tp = ctp.handle; reply.psn = 1; reply.token = request.token;
     reply.key_bytes = 28;
     std::memcpy(reply.key, &jetty->jetty_id, 24);
     auto tm = jetty->jetty_cfg.jfs_cfg.trans_mode;
