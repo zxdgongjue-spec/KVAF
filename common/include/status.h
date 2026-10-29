@@ -16,6 +16,8 @@ enum class StatusCode {
   kInvalidState,
   kOutOfMemory,
   kInternal,
+  // Local device execution/ACL failure: changing the peer EID is not a retry.
+  kDeviceError,
 };
 
 class Status {
@@ -62,6 +64,10 @@ class Status {
 
   static Status Internal(std::string message) {
     return Error(StatusCode::kInternal, std::move(message));
+  }
+
+  static Status DeviceError(std::string message) {
+    return Error(StatusCode::kDeviceError, std::move(message));
   }
 
   bool ok() const { return code_ == StatusCode::kOk; }

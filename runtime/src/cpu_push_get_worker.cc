@@ -16,10 +16,10 @@ Status Worker::Start() {
   // READ/WRITE path here so initialization can reject a disconnected EID pair.
   std::uint64_t sequence = 0;
   auto linked = transport_->ReadRequest(&sequence);
-  if (!linked.ok()) return linked;
+  if (!linked.ok()) return Status::Error(linked.code(), "startup notify READ: " + linked.message());
   if (sequence != 0) return Status::InvalidState("CPU push target is not idle at startup");
   linked = transport_->Complete(0, Result::kPending);
-  if (!linked.ok()) return linked;
+  if (!linked.ok()) return Status::Error(linked.code(), "startup completion WRITE: " + linked.message());
   try { thread_ = std::thread(&Worker::Run, this); }
   catch (const std::exception& e) { return Status::Internal(e.what()); }
   return Status::OK();

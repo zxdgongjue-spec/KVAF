@@ -86,9 +86,12 @@ def main() -> int:
         runtime.link_to(endpoint)
         retained = []
         try:
+            print(f"[KVAF_TEST] mode={mode} device={device_id} phase=initialize", flush=True)
             runtime.initialize(blocks * block_bytes, block_bytes)
+            print(f"[KVAF_TEST] mode={mode} phase=batch_put bytes={source.numel()}", flush=True)
             runtime.batch_put(keys, source, [i * block_bytes for i in range(blocks)],
                               [block_bytes] * blocks)
+            print(f"[KVAF_TEST] mode={mode} phase=prepare_access_table", flush=True)
             table = runtime.prepare_access_table(keys)
             view = runtime.access_table_view(table, device="npu", capacity=blocks)
             if not isinstance(view, kvaf.DeviceAccessTable):
@@ -96,6 +99,8 @@ def main() -> int:
             outputs = [torch.empty((2 * capacity + 2, token), dtype=torch.uint8, device=device)
                        for _ in range(2)]
             for epoch, active in enumerate(counts):
+                print(f"[KVAF_TEST] mode={mode} phase=batch_get epoch={epoch} active={active}",
+                      flush=True)
                 # Reuse A/B/A while changing metadata, including repeated sources.
                 index_cpu = (torch.arange(capacity, dtype=torch.int32) * 7 + epoch) % blocks
                 offset_cpu = ((torch.arange(capacity, dtype=torch.int32) + epoch) % 4) * token

@@ -114,11 +114,42 @@ CPU `--gather-threads` 至少等于 gather 的 AIV 核数。
 上述命令在仓库根目录执行。Get、Put 及同目录下的 sequential 三个 `.o` 文件
 都应存在；路径检查失败时脚本会打印具体变量及绝对路径，并在初始化 NPU 前退出。
 
+## 初始化失败的定位
+
+`runtime.initialize()` 会先建立传输，再运行原有 BatchPut kernel 做连通性探针。
+本测试默认 16 个 block，探针为 16 行、每行 64 B（合计 1024 B），
+此时还没有运行 scatter/gather BatchGet kernel。
+
+Scatter 的四次 `JETTY_IMPORT_READY` 只表示接口导入成功；随后
+`CPU_PUSH_START` 还会 READ HBM notify、WRITE 初始完成状态，检验实际 RMA 路径。
+协议 `result=3` 是 `kResourceError`，需要结合命令名和 CPU 日志确定原因。
+CPU 端现在记录 `CPU_PUSH_START_FAILED session=... reason=...`，区分
+`startup notify READ` 与 `startup completion WRITE`；停止失败则记录
+`CPU_PUSH_STOP_FAILED`。出现这种错误时需要同时保留两端日志。
+
+NPU 端可单独运行 scatter 并开启阶段日志：
+
+```bash
+DEVICE_ID=5 KVAF_NPU_CORE_COUNT=1 KVAF_AIV_BATCH_GET_MODES=cpu_push_scatter \
+  KVAF_AIV_VERBOSE_DIRECT_HCCP=1 \
+  python -u tests/python/test_aiv_sequential_batch_get.py > npu-stage1.log 2>&1
+```
+
+观察 `STARTUP_CANDIDATE_BEGIN`、`STARTUP_PROBE_BEGIN/READY`、
+`DIRECT_BATCH_PUT_STAGE`、`DIRECT_BATCH_PUT_RUNTIME_ERROR` 和
+`STARTUP_CANDIDATE_FAILED`。`phase=synchronize` 后返回 ACL 错误说明等待设备
+执行失败，仍需对应进程的 Ascend 日志定位具体 kernel/指令；不能仅凭
+`Vector core execution timed out` 判定为 notify 或 CQ 的问题。
+BatchPut 路径上的本地 ACL 失败会停止候选 EID 重试；正常返回的 CQ 错误仍允许
+连接回退。清理同时失败时，异常保留原始原因并附加清理错误。
+
 ## 当前验证状态
 
 本地无 CANN/NPU，已完成：
 
 - CMake 普通 C++ 构建和现有回归。
+- 候选选择回归覆盖连接回退、本地设备错误停止重试、普通/自适应选择及清理错误
+  不覆盖原始失败。
 - 生产 `.asc` 的 CPU 模型执行：解码 SQ/CQ，调用真实 CPU gather executor，
   比较全部 output/guard。覆盖 1/3/8 核、1/13/656/4096/65535 B token、
   1～6 SGE、65536 请求、SQ/CQ 回绕、旧序号、非法行、超时及控制/数据 CQ 错误。

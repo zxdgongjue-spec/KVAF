@@ -1,5 +1,10 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+add_executable(kvaf_startup_selection_test startup_selection_test.cc)
+target_include_directories(kvaf_startup_selection_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/runtime/include ${PROJECT_SOURCE_DIR}/common/include)
+add_test(NAME kvaf_startup_selection_test COMMAND kvaf_startup_selection_test)
+
 add_test(NAME kvaf_dsa_keys_python
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_dsa_keys.py")
@@ -106,6 +111,7 @@ if(NOT KVAF_ENABLE_AIV_BATCH_GET)
     ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/sequential_batch_get.cpp
     ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/execute_sequential_batch_get_loader.cpp
     ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/batch_get_host.cpp
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_put/host/batch_put_host.cpp
     ${PROJECT_SOURCE_DIR}/access_operator/src/access_operator.cc
     ${PROJECT_SOURCE_DIR}/access_operator/src/direct_hccp/direct_hccp_remote_transport.cc
     ${PROJECT_SOURCE_DIR}/runtime/src/npu_runtime.cc)

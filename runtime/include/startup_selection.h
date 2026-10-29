@@ -83,6 +83,28 @@ struct StartupCandidate {
   double cycles{0.0};
 };
 
+inline Status StartupCleanupFailure(const Status& attempt, const Status& cleanup) {
+  if (attempt.ok()) return cleanup;
+  return Status::Error(attempt.code(), attempt.message() +
+      "; startup cleanup also failed: " + cleanup.message());
+}
+
+// Connectivity failures can try another EID. A local ACL failure must stop,
+// while still attempting teardown and retaining the original error if it fails.
+template <class Initialize, class Cleanup>
+Status SelectFirstStartupCandidate(const std::vector<StartupCandidate>& candidates,
+                                   Initialize initialize, Cleanup cleanup) {
+  Status last = Status::NotFound("no usable peer candidate");
+  for (const auto& candidate : candidates) {
+    last = initialize(candidate, false, nullptr);
+    if (last.ok()) return last;
+    const Status released = cleanup();
+    if (!released.ok()) return StartupCleanupFailure(last, released);
+    if (last.code() == StatusCode::kDeviceError) return last;
+  }
+  return last;
+}
+
 // Adaptive selection treats a peer device as the performance candidate. The
 // entries within each device are connectivity fallbacks (K EID x N EID group),
 // so only the first working entry for that device is benchmarked.
@@ -105,7 +127,8 @@ Status SelectStartupDeviceCandidate(
         }
       }
       const Status released = cleanup();
-      if (!released.ok()) return released;
+      if (!released.ok()) return StartupCleanupFailure(last, released);
+      if (last.code() == StatusCode::kDeviceError) return last;
       if (device_ready) break;
     }
   }
@@ -115,7 +138,8 @@ Status SelectStartupDeviceCandidate(
     last = initialize(candidate, false, &candidate.cycles);
     if (last.ok()) return last;
     const Status released = cleanup();
-    if (!released.ok()) return released;
+    if (!released.ok()) return StartupCleanupFailure(last, released);
+    if (last.code() == StatusCode::kDeviceError) return last;
   }
   return last;
 }

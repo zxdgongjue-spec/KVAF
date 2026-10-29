@@ -649,9 +649,16 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       // BatchPut intentionally remains on the established single-EID path.
       // Multi-EID striping applies only to BatchGet and uses the vector above.
       impl_->config.peer_local_eid = impl_->config.peer_local_eids.front();
+      std::fprintf(stderr,
+                   "[KVAF_AIV] STARTUP_CANDIDATE_BEGIN device_id=%u peer=%u "
+                   "local_group=%zu eid=%s\n", impl_->options.device_id,
+                   peer_candidate, npu_group,
+                   EidToHex(impl_->config.peer_local_eid).c_str());
       impl_->CreateCore();
+      const char* phase = "initialize_transports";
       last = impl_->runtime_core->Initialize(candidate_request);
       if (last.ok()) {
+        phase = "prepare_batch_put_probe";
         const std::uint64_t probe_bytes =
             std::min<std::uint64_t>(slot_size, kBatchPutProbeBytesPerRow);
         const std::uint64_t probe_rows = BatchPutStartupProbeRows(
@@ -659,15 +666,27 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
             impl_->config.batch_put_jettys_per_core);
         const std::uint64_t probe_total_bytes = probe_rows * probe_bytes;
         aclrtStream stream = nullptr;
-        if (probe_bytes == 0U || probe_rows == 0U ||
-            aclrtMalloc(&impl_->probe_buffer, probe_total_bytes,
-                        ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
-            impl_->probe_buffer == nullptr ||
-            aclrtMemset(impl_->probe_buffer, probe_total_bytes, 0xA5U,
-                        probe_total_bytes) != ACL_SUCCESS ||
-            aclrtCreateStream(&stream) != ACL_SUCCESS || stream == nullptr) {
-          last = Internal("failed to prepare peer candidate RMA probe");
+        if (probe_bytes == 0U || probe_rows == 0U) {
+          last = Internal("empty peer candidate RMA probe");
         } else {
+          const char* prepare_phase = "allocate";
+          aclError result = aclrtMalloc(&impl_->probe_buffer, probe_total_bytes,
+                                        ACL_MEM_MALLOC_NORMAL_ONLY);
+          if (result == ACL_SUCCESS && impl_->probe_buffer != nullptr) {
+            prepare_phase = "memset";
+            result = aclrtMemset(impl_->probe_buffer, probe_total_bytes, 0xA5U,
+                                probe_total_bytes);
+          }
+          if (result == ACL_SUCCESS && impl_->probe_buffer != nullptr) {
+            prepare_phase = "create_stream";
+            result = aclrtCreateStream(&stream);
+          }
+          if (result != ACL_SUCCESS || impl_->probe_buffer == nullptr || stream == nullptr) {
+            last = Status::DeviceError(std::string("prepare BatchPut startup probe phase=") +
+                                       prepare_phase + " acl=" + std::to_string(result));
+          }
+        }
+        if (last.ok()) {
           std::vector<KeyId> probe_keys;
           std::vector<std::uint64_t> probe_offsets;
           std::vector<std::uint64_t> probe_lengths;
@@ -680,6 +699,11 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
             probe_offsets.push_back(row * probe_bytes);
             probe_lengths.push_back(probe_bytes);
           }
+          phase = "batch_put_probe";
+          std::fprintf(stderr,
+                       "[KVAF_AIV] STARTUP_PROBE_BEGIN kernel=BatchPut rows=%llu bytes=%llu\n",
+                       static_cast<unsigned long long>(probe_rows),
+                       static_cast<unsigned long long>(probe_total_bytes));
           last = impl_->runtime_core->BatchPut(
               BatchPutRequest{probe_keys,
                               ConstBufferView{impl_->probe_buffer,
@@ -688,14 +712,24 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
                               probe_offsets, probe_lengths},
               BatchPutExecutionOptions{stream});
           if (last.ok()) {
+            std::fprintf(stderr, "[KVAF_AIV] STARTUP_PROBE_READY kernel=BatchPut\n");
+            phase = "free_probe_keys";
             last = impl_->runtime_core->BatchFree(BatchFreeRequest{probe_keys});
           }
         }
-        if (stream != nullptr && aclrtDestroyStream(stream) != ACL_SUCCESS && last.ok()) {
-          last = Internal("failed to destroy peer candidate probe stream");
+        if (stream != nullptr) {
+          const aclError destroyed = aclrtDestroyStream(stream);
+          if (destroyed != ACL_SUCCESS) {
+            std::fprintf(stderr, "[KVAF_AIV] STARTUP_PROBE_STREAM_ERROR acl=%d\n",
+                         static_cast<int>(destroyed));
+            const auto message = "failed to destroy peer candidate probe stream, acl=" +
+                                 std::to_string(destroyed);
+            last = Status::DeviceError(last.ok() ? message : last.message() + "; " + message);
+          }
         }
       }
       if (last.ok() && measure) {
+        phase = "bandwidth_probe";
         impl_->bandwidth_probe =
             std::make_unique<detail::StartupBandwidthProbe>(probe_config);
         last = impl_->bandwidth_probe->Run(*impl_->runtime_core, *impl_->access_operator, cycles);
@@ -725,6 +759,11 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
         }
         return Status::OK();
       }
+      std::fprintf(stderr,
+                   "[KVAF_AIV] STARTUP_CANDIDATE_FAILED device_id=%u peer=%u local_group=%zu "
+                   "phase=%s local_device_error=%u reason=%s\n",
+                   impl_->options.device_id, peer_candidate, npu_group, phase,
+                   last.code() == StatusCode::kDeviceError ? 1U : 0U, last.message().c_str());
       return last;
     }
     return last;
@@ -744,19 +783,17 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
     return Status::OK();
   };
   if (!tune_candidates) {
+    std::vector<detail::StartupCandidate> candidates;
     for (std::uint32_t peer_candidate = 0U; peer_candidate < candidate_count;
          ++peer_candidate) {
       if (fixed_peer_device && !peer_candidate_allowed[peer_candidate]) continue;
       for (std::size_t npu_group = 0U; npu_group < npu_group_count; ++npu_group) {
-        last = initialize_candidate(
-            detail::StartupCandidate{peer_candidate, npu_group}, false, nullptr);
-        if (last.ok()) return last;
-        const Status released = cleanup();
-        if (!released.ok()) return released;
+        candidates.push_back(detail::StartupCandidate{peer_candidate, npu_group});
       }
     }
+    last = detail::SelectFirstStartupCandidate(candidates, initialize_candidate, cleanup);
     if (!last.ok() && fixed_peer_device) {
-      return Status::Internal("failed to initialize fixed peer UB device " +
+      return Status::Error(last.code(), "failed to initialize fixed peer UB device " +
                               impl_->options.peer_ub_device + ": " +
                               last.message());
     }

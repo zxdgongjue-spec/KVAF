@@ -403,6 +403,8 @@ Status PeerLink::OpenCpuPushGet(uint64_t base, OpenCpuPushGetRequest request,
 
 namespace {
 Status PushSessionCommand(const std::string& address, uint64_t session, Command command) {
+  const char* name = command == Command::kStartCpuPushGet ? "StartCpuPushGet" :
+                     command == Command::kStopCpuPushGet ? "StopCpuPushGet" : "StopGatherLanes";
   CpuPushGetSessionRequest request{};
   request.header = MakeHeader(command, sizeof(request));
   request.session_id = session;
@@ -411,7 +413,8 @@ Status PushSessionCommand(const std::string& address, uint64_t session, Command 
   if (!Exchange(address, request, &response, &error) ||
       !IsValidResponseHeader(response.header, command, sizeof(response)) ||
       !ResultOk(static_cast<Result>(response.result), &error))
-    return ToStatus("peer session command failed", std::move(error));
+    return ToStatus(std::string("peer session command failed: command=") + name +
+                    " session=" + std::to_string(session), std::move(error));
   return Status::OK();
 }
 }  // namespace

@@ -695,7 +695,15 @@ class CpuService {
   Result StartCpuPushGet(uint64_t session) {
     const auto found = regions_.find(session);
     if (found == regions_.end() || !found->second->push) return Result::kNotFound;
-    return found->second->push->Start().ok() ? Result::kOk : Result::kResourceError;
+    Log("[KVAF_CPU] CPU_PUSH_START session=%llu\n", static_cast<unsigned long long>(session));
+    const auto status = found->second->push->Start();
+    if (!status.ok()) {
+      Log("[KVAF_CPU] CPU_PUSH_START_FAILED session=%llu reason=%s\n",
+          static_cast<unsigned long long>(session), status.message().c_str());
+      return Result::kResourceError;
+    }
+    Log("[KVAF_CPU] CPU_PUSH_STARTED session=%llu\n", static_cast<unsigned long long>(session));
+    return Result::kOk;
   }
   Result StopCpuPushGet(uint64_t session) {
     const auto found = regions_.find(session);
@@ -704,7 +712,8 @@ class CpuService {
     if (!push) return Result::kOk;
     const auto status = push->Stop();
     if (!status.ok()) {
-      Log("[KVAF_CPU] CPU_PUSH_STOP_FAILED reason=%s\n", status.message().c_str());
+      Log("[KVAF_CPU] CPU_PUSH_STOP_FAILED session=%llu reason=%s\n",
+          static_cast<unsigned long long>(session), status.message().c_str());
       return Result::kResourceError;
     }
     push.reset();
