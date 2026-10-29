@@ -104,6 +104,7 @@ struct DevicePool {
 };
 struct Config {
   std::string peer, kernel, probe_vmm;
+  kvaf::ubmem::TransferEngine engine = kvaf::ubmem::TransferEngine::kMte;
   std::uint32_t device = 0, cores = 2, rows = 17, token = 656, tokens = 128, repeat = 2;
 };
 
@@ -150,7 +151,8 @@ void FullBlocks(kvaf::RuntimeCore& core, kvaf::ubmem::AccessOperator& op,
     // Same initialization/readback as SHMEM's rma_d2h_demo, including Host DDR.
     Acl(aclrtMemcpy(destination, local_copy.size(), local_copy.data(), local_copy.size(),
         ACL_MEMCPY_HOST_TO_DEVICE), "VMM control H2D initialization");
-    std::fprintf(stderr, "[KVAF_UBMEM] VMM_CONTROL_MTE_BEGIN kind=%s\n", c.probe_vmm.c_str());
+    std::fprintf(stderr, "[KVAF_UBMEM] VMM_CONTROL_COPY_BEGIN kind=%s engine=%s\n", c.probe_vmm.c_str(),
+        c.engine == kvaf::ubmem::TransferEngine::kSimt ? "simt" : "mte");
     Check(op.ProbeLocalCopy({source, input.size(), kvaf::DeviceKind::kNpu},
         {destination, local_copy.size(), kvaf::DeviceKind::kNpu},
         {probe_device, probe_metadata.size() * sizeof(std::uint64_t), kvaf::DeviceKind::kNpu}, pool.stream));
@@ -246,6 +248,11 @@ Config Parse(int argc, char** argv) {
     const char* value = argv[++i];
     if (key == "--peer") c.peer = value;
     else if (key == "--kernel") c.kernel = value;
+    else if (key == "--engine") {
+      const std::string engine = value;
+      Require(engine == "mte" || engine == "simt", "--engine must be mte or simt");
+      c.engine = engine == "simt" ? kvaf::ubmem::TransferEngine::kSimt : kvaf::ubmem::TransferEngine::kMte;
+    }
     else if (key == "--probe-vmm") {
       c.probe_vmm = value;
       Require(c.probe_vmm == "hbm" || c.probe_vmm == "dram", "--probe-vmm must be hbm or dram");
@@ -274,7 +281,8 @@ Config Parse(int argc, char** argv) {
 int main(int argc, char** argv) {
   if (argc == 2 && std::string(argv[1]) == "--help") {
     std::puts("Usage: kvaf_ubmem_test --peer CPU:PORT --kernel PATH [--device 0] [--cores 2] [--rows 17] "
-              "[--token-bytes 656] [--tokens-per-block 128] [--repeat 2] [--probe-vmm hbm|dram]"); return 0;
+              "[--token-bytes 656] [--tokens-per-block 128] [--repeat 2] "
+              "[--engine mte|simt (default: mte)] [--probe-vmm hbm|dram]"); return 0;
   }
   try {
     const auto c = Parse(argc, argv);
@@ -286,7 +294,7 @@ int main(int argc, char** argv) {
       DevicePool buffers;
       auto link = std::make_shared<kvaf::peer::PeerLink>(c.peer);
       kvaf::ubmem::DdrAllocator allocator(link);
-      kvaf::ubmem::AccessOperator op({c.kernel, c.device, c.cores, link});
+      kvaf::ubmem::AccessOperator op({c.kernel, c.device, c.cores, link, c.engine});
       auto meta = kvaf::CreateInMemoryMetaManager();
       kvaf::RuntimeCore core(*meta, op, allocator);
       const auto slot = static_cast<std::uint64_t>(c.token) * c.tokens;

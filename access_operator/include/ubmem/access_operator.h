@@ -2,11 +2,14 @@
 #include "../access_operator.h"
 
 namespace kvaf::ubmem {
+enum class TransferEngine { kMte, kSimt };
+
 struct OperatorOptions {
   std::string kernel_object_path;
   std::uint32_t device_id{0};
   std::uint32_t cores{2};
   std::shared_ptr<peer::PeerLink> peer_link;
+  TransferEngine engine{TransferEngine::kMte};
 };
 
 // Experimental mapped-memory implementation of the existing KVAF contract.

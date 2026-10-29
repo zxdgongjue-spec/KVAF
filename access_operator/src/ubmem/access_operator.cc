@@ -46,8 +46,10 @@ struct AccessOperator::Impl {
     if (input == nullptr) return Status::Internal("aclrtCreateBinary failed");
     auto status = Acl("aclrtBinaryLoad", aclrtBinaryLoad(input, &binary));
     aclrtDestroyBinary(input);
+    const char* name = options.engine == TransferEngine::kSimt
+        ? "KvafUbmemBatchSimtKernel" : "KvafUbmemBatchMteKernel";
     if (status.ok()) status = Acl("aclrtBinaryGetFunction",
-        aclrtBinaryGetFunction(binary, "KvafUbmemBatchMteKernel", &function));
+        aclrtBinaryGetFunction(binary, name, &function));
     return status;
   }
 
@@ -98,13 +100,16 @@ struct AccessOperator::Impl {
     aclrtLaunchKernelAttr attrs[4]{};
     attrs[0].id = ACL_RT_LAUNCH_KERNEL_ATTR_SCHEM_MODE;
     attrs[0].value.schemMode = 1;
-    attrs[1].id = ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE;
-    attrs[1].value.dynUBufSize = kMteBufferBytes;
-    attrs[2].id = ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT_US;
-    attrs[2].value.timeoutUs.timeoutLow = 180000000U;
-    attrs[3].id = ACL_RT_LAUNCH_KERNEL_ATTR_ENGINE_TYPE;
-    attrs[3].value.engineType = ACL_RT_ENGINE_TYPE_AIV;
-    aclrtLaunchKernelCfg cfg{}; cfg.numAttrs = 4; cfg.attrs = attrs;
+    attrs[1].id = ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT_US;
+    attrs[1].value.timeoutUs.timeoutLow = 180000000U;
+    attrs[2].id = ACL_RT_LAUNCH_KERNEL_ATTR_ENGINE_TYPE;
+    attrs[2].value.engineType = ACL_RT_ENGINE_TYPE_AIV;
+    aclrtLaunchKernelCfg cfg{}; cfg.numAttrs = 3; cfg.attrs = attrs;
+    if (options.engine == TransferEngine::kMte) {
+      attrs[3].id = ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE;
+      attrs[3].value.dynUBufSize = kMteBufferBytes;
+      cfg.numAttrs = 4;
+    }
     auto status = Acl("aclrtLaunchKernelWithHostArgs", aclrtLaunchKernelWithHostArgs(
         function, options.cores, stream, &cfg, &args, sizeof(args), nullptr, 0));
     if (!status.ok()) return status;
@@ -204,9 +209,11 @@ Status AccessOperator::Initialize(const RemoteRegionDesc& region) {
   if (status.ok()) status = impl_->LoadKernel();
   if (!status.ok()) { (void)Shutdown(); return status; }
   impl_->ready = true;
-  std::fprintf(stderr, "[KVAF_UBMEM] DEVICE_MAPPING_READY engine=mte mapping=acl ub_bytes=%u bytes=%llu cores=%u acl_device=%u "
+  const bool simt = impl_->options.engine == TransferEngine::kSimt;
+  std::fprintf(stderr, "[KVAF_UBMEM] DEVICE_MAPPING_READY engine=%s mapping=acl ub_bytes=%u bytes=%llu cores=%u acl_device=%u "
       "host_base=0x%llx mapped_base=0x%llx\n",
-      kMteBufferBytes, static_cast<unsigned long long>(region.length), impl_->options.cores,
+      simt ? "simt" : "mte", simt ? 0U : kMteBufferBytes,
+      static_cast<unsigned long long>(region.length), impl_->options.cores,
       impl_->options.device_id,
       static_cast<unsigned long long>(region.base),
       static_cast<unsigned long long>(impl_->mapping->address()));

@@ -12,19 +12,22 @@
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); std::abort(); } } while (0)
 
 using namespace kvaf::ubmem;
+auto run_kernel = KvafUbmemBatchMteKernel;
 template <typename T> std::uint64_t Ptr(T* value) { return reinterpret_cast<std::uintptr_t>(value); }
 void Run(BatchArgs args) {
   auto* reports = reinterpret_cast<CoreStatus*>(args.statuses);
   std::fill_n(reinterpret_cast<unsigned char*>(reports), args.blocks * sizeof(CoreStatus), 0xFF);
   for (model_core = 0; model_core < args.blocks; ++model_core) {
-    KvafUbmemBatchMteKernel(args);
-    CHECK(!model_mte2 && !model_mte3);
+    run_kernel(args);
+    CHECK(!model_mte2 && !model_mte3 && !model_simt && !model_simt_ready);
     CHECK(reports[model_core].capacity == args.capacity);
     CHECK(reports[model_core].blocks == args.blocks);
     CHECK(reports[model_core].operation == static_cast<std::uint32_t>(args.operation));
   }
 }
-int main() {
+int main(int argc, char** argv) {
+  CHECK(argc == 1 || (argc == 2 && std::strcmp(argv[1], "simt") == 0));
+  if (argc == 2) run_kernel = KvafUbmemBatchSimtKernel;
   constexpr std::uint64_t remote_base = 0x100000000ULL;
   std::vector<std::uint8_t> remote(32768, 0xCF), local(5000, 0xD7);
   for (std::size_t i = 0; i < remote.size(); ++i) remote[i] = i * 37 + 3;
@@ -124,8 +127,10 @@ int main() {
   Run(a);
   for (std::uint64_t i = 0; i < rows * slot; ++i) CHECK(big_remote[i] == TestPattern(i, 17));
   for (std::uint64_t i = rows * slot; i < big_remote.size(); ++i) CHECK(big_remote[i] == 0xCF);
-  // Exact MTE tile boundaries and tails: padding must never reach GM guards.
-  for (const std::uint64_t bytes : {kMteBufferBytes - 1U, kMteBufferBytes,
+  // SIMT lane / MTE tile boundaries and tails must not reach GM guards.
+  for (const std::uint64_t bytes : {1U, kSimtThreads - 1U, kSimtThreads, kSimtThreads + 1U,
+                                   2 * kSimtThreads - 1U, 2 * kSimtThreads, 2 * kSimtThreads + 1U,
+                                   kMteBufferBytes - 1U, kMteBufferBytes,
                                    kMteBufferBytes + 1U, 2 * kMteBufferBytes + 17U}) {
     std::vector<std::uint8_t> source(bytes + 1), destination(bytes + 7, 0xCF);
     for (std::size_t i = 0; i < source.size(); ++i) source[i] = TestPattern(i, 53);
@@ -140,5 +145,6 @@ int main() {
     for (unsigned i = 0; i < 3; ++i) CHECK(destination[i] == 0xCF);
     for (std::size_t i = 3 + bytes; i < destination.size(); ++i) CHECK(destination[i] == 0xCF);
   }
-  std::puts("UBmem actual kernel: mapped addressing, 656-byte reads, variable puts, inactive tail, guards, and invalid ranges passed");
+  std::printf("UBmem %s kernel: mapped addressing, 656-byte reads, variable puts, inactive tail, guards, and invalid ranges passed\n",
+      argc == 2 ? "SIMT" : "MTE");
 }

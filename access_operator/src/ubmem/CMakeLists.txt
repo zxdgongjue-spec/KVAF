@@ -27,4 +27,5 @@ if(BUILD_TESTING)
   target_include_directories(kvaf_ubmem_kernel_test PRIVATE
     ${PROJECT_SOURCE_DIR}/tests/ubmem/model ${PROJECT_SOURCE_DIR}/access_operator/include)
   add_test(NAME kvaf_ubmem_kernel_test COMMAND kvaf_ubmem_kernel_test)
+  add_test(NAME kvaf_ubmem_simt_kernel_test COMMAND kvaf_ubmem_kernel_test simt)
 endif()

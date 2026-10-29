@@ -1,6 +1,6 @@
 #pragma once
-// CPU model for address/tail correctness and UB reuse dependencies. DMA actions
-// run at the corresponding wait; hardware timing/cache/UB fabric are unmodeled.
+// CPU model for address/tail correctness and MTE/SIMT handoff dependencies.
+// Work runs at the corresponding wait; hardware timing/cache/fabric are unmodeled.
 #include "ubmem/batch_abi.h"
 #include <array>
 #include <cstdint>
@@ -11,11 +11,46 @@
 #define __global__
 #define __aicore__
 #define __gm__
+#define __simt_vf__
+#define LAUNCH_BOUND(n)
 inline unsigned model_core;
 inline std::array<std::uint8_t, kvaf::ubmem::kMteBufferBytes> model_ub;
 inline std::function<void()> model_mte2, model_mte3;
+inline std::function<void()> model_simt;
+inline bool model_simt_ready = false;
 inline void ModelCheck(bool condition) { if (!condition) std::abort(); }
+enum pipe_t { PIPE_S, PIPE_V };
+enum event_t { EVENT_ID0 };
+inline void set_flag(pipe_t, pipe_t, event_t) {}
+inline void wait_flag(pipe_t from, pipe_t to, event_t) {
+  if (from == PIPE_S && to == PIPE_V) {
+    ModelCheck(!model_simt && !model_simt_ready);
+    model_simt_ready = true;
+  } else {
+    ModelCheck(from == PIPE_V && to == PIPE_S && static_cast<bool>(model_simt));
+    auto action = std::move(model_simt); model_simt = {}; action();
+  }
+}
+struct ModelThreadIndex { unsigned x{}; };
+inline ModelThreadIndex threadIdx;
 namespace AscendC {
+namespace Simt {
+struct Dim3 { unsigned x, y, z; };
+template <auto Function, typename... Args>
+void VF_CALL(Dim3 dimensions, Args... args) {
+  ModelCheck(model_simt_ready && !model_simt && !model_mte2 && !model_mte3);
+  ModelCheck(dimensions.x != 0 && dimensions.y == 1 && dimensions.z == 1);
+  model_simt_ready = false;
+  model_simt = [=] {
+    // Reverse lane order also catches accidental dependence on lane 0
+    // publishing data for other lanes without a thread-group barrier.
+    for (unsigned lane = dimensions.x; lane > 0; --lane) {
+      threadIdx.x = lane - 1;
+      Function(args...);
+    }
+  };
+}
+}
 inline unsigned GetBlockIdx() { return model_core; }
 enum class TPosition { VECIN };
 enum class HardEvent { S_MTE2, MTE2_MTE3, MTE3_MTE2, MTE3_S };
