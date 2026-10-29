@@ -271,6 +271,28 @@ void Poll(void* p) { fixture->Poll(p); }
 void Doorbell(uint32_t value, uint32_t* p) { fixture->Doorbell(value, p); }
 }
 int main() {
+  // Match the hardware smoke test: the first launch is empty, followed by
+  // nonempty launches on the same queues. Empty work must finish all worker
+  // statuses without notifying the CPU or advancing any SQ/CQ state.
+  for (uint32_t workers : {1U, 3U, 8U})
+    for (uint32_t sgl : {1U, 6U}) {
+      Fixture gather(19, 656, workers, KVAF_SEQ_GATHER, sgl);
+      gather.active = 0;
+      gather.Run();
+      assert(!gather.completions && !gather.data_reads && !gather.push_requests);
+      for (const auto& s : gather.status) {
+        assert(s.phase == KVAF_SEQ_COMPLETE && s.sequence == 1);
+        assert(!s.requests && !s.data_wrs && !s.sq_pi && !s.cq_ci);
+      }
+      for (const auto& s : gather.states)
+        assert(!s.initialized && !s.sq_producer_index && !s.cq_consumer_index);
+      for (const auto& q : gather.queues)
+        assert(!q->pi && !q->cq_pi && !q->db && !q->cq_db);
+      for (const auto notify : gather.notified) assert(!notify);
+      gather.Next(1); gather.Run();
+      gather.Next(19); gather.Run();
+      assert(gather.completions && gather.data_reads);
+    }
   for (uint32_t probe : {KVAF_SEQ_PROBE_DONE, KVAF_SEQ_PROBE_FLUSH, KVAF_SEQ_PROBE_LOAD, KVAF_SEQ_PROBE_COPY})
     for (uint32_t workers : {1U, 3U, 8U})
       for (uint32_t bytes : {656U, 16385U}) {

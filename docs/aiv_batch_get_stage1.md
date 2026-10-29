@@ -21,7 +21,7 @@ Scatter 的本地 payload 搬运使用 `DataCopyPad<uint8_t>`，通过一个 16 
 完成后才复用缓冲并报告完成；长度按字节给出，UB padding 不写到 output。
 源 GlobalTensor 禁用 L2 cache hint，且不再经 SIMT 读取被 CPU WRITE 更新的
 staging。原实现的 MainScalar cache 刷新不能代替 SIMT cache 刷新。
-顺序 kernel 在入口调用 `InitSocState()`，在退出前调用
+Scatter kernel 在入口调用 `InitSocState()`，在退出前调用
 `PipeBarrier<PIPE_ALL>()`；没有 TPipe 的静态 Tensor 写法必须自行初始化和收尾，
 尤其不能假定前一个算子留下的搬运 loop-mode、原子操作等全局状态为默认值。
 接口约束见 [GMToUB DataCopyPad](https://asc.gitcode.com/api/SIMD-API/basic_api/memory_vector_compute/data_move/DataCopyPad_GMToUB.html)、
@@ -30,6 +30,9 @@ staging。原实现的 MainScalar cache 刷新不能代替 SIMT cache 刷新。
 
 Gather 的控制与数据队列分开，每核固定两条 Jetty。可配置 1～6 个本地 SGE，
 每条 READ 的总长度最多 64 KiB，按 64 B WQEBB 处理变长 WQE 和 SQ 回绕。
+Gather 只使用标量 GM 访问、缓存操作与 USER_CTL 队列，不使用 LocalTensor
+或 MTE payload 拷贝；其入口不调用 scatter 的 `InitSocState()`，退出不附加
+`PipeBarrier<PIPE_ALL>()`，恢复此前通过硬件测试时的执行方式。
 阶段内部批量提交，只在物理 SQ/WR 容量不足或阶段结束时 drain；
 `batch_get_max_inflight_total` 仅对原 `direct_read` 生效。
 
@@ -61,8 +64,9 @@ Host 代码仍链接到原有 `libkvaf_execute_batch_get_host.so`，上层链接
 参数不含 gather 的 lane/远端 staging/SGL 配置。gather 忽略 scatter 探针环境变量，
 scatter 不校验 gather 专用 SGL 参数。
 
-本次仅做结构拆分，保留各自入口的 `InitSocState()` 和退出屏障，未继续修复
-scatter 507015，也没有加入流水或软件在途控制。共享基础头文件的修改仍需两种
+结构拆分后，gather 入口另行移除了从 scatter 带入的静态 Tensor 初始化和
+退出屏障（见下文空批次回归记录）。scatter 507015 尚未解决，
+也没有加入流水或软件在途控制。共享基础头文件的修改仍需两种
 模式回归；修改某一种模式的独立 `.asc` 不会导致另一种 kernel 重编译。
 
 原 `direct_read` 仍使用 `kvaf_execute_batch_get_kernels.o`。三个模块各自编译和
@@ -212,6 +216,36 @@ payload 和 done 的 CQ 回收，回到下一轮 notify READ；不要把这个�
 需要在重编译前保留旧 `.o` 并用匹配 CANN 的反汇编工具查看该偏移，才能判断
 具体哪条指令违反约束。DataCopyPad 改动修正了 payload 缓存可见性并替换裸搬运
 路径，但在硬件复测/指令核对前，不将它视为已证实的 errcode 259 根因修复。
+
+## 独立 Gather 首个空批次的回归
+
+拆分后提交 `32a52c4` 的硬件反馈：Device 7、PID 12157，BatchPut startup
+probe、写入和 access table 准备已完成，但 `gather_read` 的第一次
+`epoch=0 active=0` 在同步时返回 507015。该空批次不进入 `Gather()`，
+不会提交 descriptor、command、notify 或数据 READ；应先核对入口、输入缓存
+处理、状态写回和退出路径，不能据此归因于 CPU gather 或网络传输。
+
+之前通过 1、3、8 核测试的 gather 路径没有 `InitSocState()` 和
+`PipeBarrier<PIPE_ALL>()`。它们在 `bc5aad5` 为 scatter 的静态 LocalTensor
+搬运加入共用入口，随后被保留在拆分后的两个 kernel 中。当前只从 gather
+移除这两项，保留空批次真实 launch、输入/状态缓存处理和原有队列逻辑。
+scatter 的代码与诊断路径保持原样。
+
+模型增加 1、3、8 核及 SGL=1/6 的首批为空、随后非空序列，检查空批次状态
+完成、output guard 和 SQ/CQ 不推进，后续请求仍能得到正确数据。
+模型不能复现 CANN 生成的设备指令；当前日志也没有对应的 errcode、
+fixedPCOffset 或 fault kernel name，因此这是针对新增入口操作的回退验证，
+尚不能认定具体故障指令或宣称 507015 已在硬件上修复。
+
+更新后只需重编译 gather kernel，再运行独立测试（沿用现有 peer 配置）：
+
+```bash
+git pull --ff-only
+cmake --build build-npu --target kvaf_gather_batch_get_kernel -j
+KVAF_RUN_NPU_TESTS=1 DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 \
+  KVAF_BATCH_GET_KERNEL="$PWD/build-npu/bin/kvaf_gather_batch_get_kernels.o" \
+  python tests/python/test_aiv_gather_batch_get.py
+```
 
 ## Scatter 507015 的分段定位
 
