@@ -25,6 +25,12 @@ struct BatchPutExecRequest {
   BatchPutExecutionOptions execution;
 };
 
+struct OffloadExecRequest {
+  const BatchPutRequest* request{nullptr};
+  const PutAccessDesc* put_desc{nullptr};
+  OffloadExecutionOptions execution;
+};
+
 // KV Access Operator 是 Runtime 的数据面依赖。Runtime 管理远端 DDR
 // 生命周期和 Meta 可见性；Operator 只负责初始化链路并执行同步搬运。
 class AccessOperator {
@@ -36,6 +42,14 @@ class AccessOperator {
 
   virtual Status ExecuteBatchGet(const BatchGetExecRequest& request) = 0;
   virtual Status ExecuteBatchPut(const BatchPutExecRequest& request) = 0;
+
+  // A non-InDoubt failure guarantees no DMA can still access either buffer.
+  virtual Status ExecuteOffload(const OffloadExecRequest&) {
+    return Status::NotImplemented("Offload is unavailable on this operator");
+  }
+  virtual Status ResolveOffload() {
+    return Status::NotImplemented("Offload recovery is unavailable");
+  }
 
 };
 

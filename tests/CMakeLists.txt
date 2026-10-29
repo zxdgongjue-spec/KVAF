@@ -1,5 +1,28 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+add_executable(kvaf_offload_test offload_test.cc)
+target_include_directories(kvaf_offload_test PRIVATE ${PROJECT_SOURCE_DIR}/runtime/src)
+target_link_libraries(kvaf_offload_test PRIVATE kvaf_runtime kvaf_offload_control)
+add_test(NAME kvaf_offload_test COMMAND kvaf_offload_test)
+set_tests_properties(kvaf_offload_test PROPERTIES TIMEOUT 20)
+
+add_executable(kvaf_offload_runtime_test offload_runtime_test.cc ../runtime/src/offload_runtime.cc)
+target_include_directories(kvaf_offload_runtime_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/runtime/src ${CMAKE_CURRENT_SOURCE_DIR}/offload_fake_acl)
+target_link_libraries(kvaf_offload_runtime_test PRIVATE kvaf_runtime kvaf_offload_control)
+add_test(NAME kvaf_offload_runtime_test COMMAND kvaf_offload_runtime_test)
+set_tests_properties(kvaf_offload_runtime_test PROPERTIES TIMEOUT 30)
+
+set(KVAF_TEST_URMA_INCLUDE_DIR "" CACHE PATH "Optional UMDK 24.12 headers for CPU Pull fake-provider test")
+if(KVAF_TEST_URMA_INCLUDE_DIR)
+  add_executable(kvaf_cpu_pull_urma_test cpu_pull_urma_test.cc ../runtime/src/cpu_pull_urma.cc)
+  target_include_directories(kvaf_cpu_pull_urma_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/runtime/src ${PROJECT_SOURCE_DIR}/runtime/include ${KVAF_TEST_URMA_INCLUDE_DIR})
+  target_link_libraries(kvaf_cpu_pull_urma_test PRIVATE kvaf_common ${CMAKE_DL_LIBS})
+  set_target_properties(kvaf_cpu_pull_urma_test PROPERTIES ENABLE_EXPORTS ON)
+  add_test(NAME kvaf_cpu_pull_urma_test COMMAND kvaf_cpu_pull_urma_test)
+endif()
+
 add_test(NAME kvaf_dsa_keys_python
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_dsa_keys.py")

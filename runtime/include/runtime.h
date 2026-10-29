@@ -94,6 +94,12 @@ class RuntimeCore {
                   BatchPutExecutionOptions execution = {});
   Status BatchFree(const BatchFreeRequest& request);
 
+  // Keep the caller-owned source alive until pending_offload() becomes false.
+  // This synchronous API serializes Offload; it is not a concurrent entrypoint.
+  Status Offload(const BatchPutRequest& request, OffloadExecutionOptions execution = {});
+  Status ResolveOffload();
+  bool pending_offload() const { return offload_context_.id != 0; }
+
  protected:
   MetaManager& meta_manager_;
   AccessOperator& access_operator_;
@@ -119,6 +125,9 @@ class RuntimeCore {
       const AccessTableHandle& handle) const;
 
   bool initialized_{false};
+  PutContext offload_context_{};
+  bool offload_data_ready_{false};
+  Status FinishOffload(Status status);
   RemoteRegionDesc remote_region_;
   std::uint64_t next_access_table_id_{1};
   std::unordered_map<std::uint64_t, std::unique_ptr<AccessTableState>>

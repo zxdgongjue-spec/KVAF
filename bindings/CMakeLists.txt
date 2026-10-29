@@ -13,6 +13,14 @@ target_include_directories(_kvaf
 
 set(KVAF_PYTHON_BINDING_PREFLIGHT_ARGS)
 
+if(KVAF_ENABLE_CPU_OFFLOAD)
+  target_sources(_kvaf PRIVATE src/offload_python_runtime.cc)
+  target_link_libraries(_kvaf PRIVATE kvaf_offload_runtime)
+  target_compile_definitions(_kvaf PRIVATE KVAF_ENABLE_CPU_OFFLOAD=1)
+  set_property(TARGET _kvaf APPEND PROPERTY BUILD_RPATH "$<TARGET_FILE_DIR:kvaf_direct_hccp_session>")
+  list(APPEND KVAF_PYTHON_BINDING_PREFLIGHT_ARGS --require-offload)
+endif()
+
 if(KVAF_ENABLE_AIV_BATCH_GET)
   target_sources(_kvaf PRIVATE
     src/acl_python_utils.cc

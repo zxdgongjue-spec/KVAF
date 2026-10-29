@@ -340,7 +340,14 @@ class PythonRuntime final {
 }  // namespace
 }  // namespace kvaf
 
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+namespace kvaf { void BindOffloadRuntime(pybind11::module_&); }
+#endif
+
 PYBIND11_MODULE(_kvaf, m) {
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+  kvaf::BindOffloadRuntime(m);
+#endif
   m.doc() = "Synchronous KVAF Runtime Python bindings";
 
   py::class_<kvaf::AccessTableHandle>(m, "AccessTable")

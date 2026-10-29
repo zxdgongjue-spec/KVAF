@@ -9,9 +9,17 @@ import argparse
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--require-aiv", action="store_true")
+    parser.add_argument("--require-offload", action="store_true")
     options = parser.parse_args()
 
     import kvaf
+
+    if options.require_offload:
+        if not hasattr(kvaf, "OffloadRuntime") or any(
+            not hasattr(kvaf.OffloadRuntime, name)
+            for name in ("offload", "resolve_offload", "pending_offload", "last_checksum")
+        ):
+            raise RuntimeError("KVAF Offload binding is incomplete")
 
     if options.require_aiv:
         if (

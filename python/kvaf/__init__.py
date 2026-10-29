@@ -44,3 +44,7 @@ if hasattr(_native, "NpuRuntime"):
         "AclGraph",
         "DeviceAccessTable",
     ]
+
+if hasattr(_native, "OffloadRuntime"):
+    OffloadRuntime = _native.OffloadRuntime
+    __all__.append("OffloadRuntime")

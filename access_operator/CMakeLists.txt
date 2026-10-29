@@ -9,8 +9,11 @@ target_link_libraries(kvaf_access_operator INTERFACE kvaf_common)
 
 target_compile_features(kvaf_access_operator INTERFACE cxx_std_17)
 
-if(KVAF_ENABLE_AIV_BATCH_GET)
+if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_CPU_OFFLOAD)
   add_subdirectory(src/direct_hccp)
+endif()
+
+if(KVAF_ENABLE_AIV_BATCH_GET)
   add_subdirectory(demo/aiv_batch_get)
   if(KVAF_ENABLE_AIV_BATCH_PUT)
     add_subdirectory(demo/aiv_batch_put)

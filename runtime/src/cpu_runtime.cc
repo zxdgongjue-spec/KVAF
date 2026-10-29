@@ -1,5 +1,6 @@
 #include "cpu_runtime.h"
 #include "peer_protocol.h"
+#include "cpu_pull_urma.h"
 
 #include <dlfcn.h>
 #include <sys/mman.h>
@@ -480,8 +481,14 @@ class CpuService {
   CpuService(UrmaResourcePool* resource_pool, CpuMemoryPageMode memory_page_mode,
              bool device_filter_applied)
       : resource_pool_(resource_pool), memory_page_mode_(memory_page_mode),
-        device_filter_applied_(device_filter_applied) {}
+        device_filter_applied_(device_filter_applied),
+        pull_service_([resource_pool](std::uint32_t candidate) {
+          auto* resources = resource_pool->Get(candidate);
+          return offload::CreateUrmaBackend(resources ? resources->context() : nullptr);
+        }) {}
   ~CpuService() { ReleaseAll(); }
+  void ServePull(int fd, const MessageHeader& header) { pull_service_.Serve(fd, header); }
+  Status ShutdownPull() { return pull_service_.Shutdown(); }
 
   uint32_t CandidateCount() const {
     return resource_pool_ == nullptr ? 0U : resource_pool_->CandidateCount();
@@ -826,6 +833,7 @@ class CpuService {
   uint32_t next_token_ = 1U;
   uint32_t next_psn_ = 1U;
   std::unordered_map<uint64_t, std::unique_ptr<Region>> regions_;
+  offload::Service pull_service_;
 };
 
 void SendStatus(int fd, Command command, Result result) {
@@ -838,7 +846,9 @@ void SendStatus(int fd, Command command, Result result) {
 
 void HandleClient(int fd, CpuService* service) {
   MessageHeader header{};
-  if (!ReadAll(fd, &header, sizeof(header)) || header.magic != kvaf::peer::kProtocolMagic ||
+  if (!ReadAll(fd, &header, sizeof(header))) return;
+  if (header.magic == offload::kMagic) { service->ServePull(fd, header); return; }
+  if (header.magic != kvaf::peer::kProtocolMagic ||
       header.version != kvaf::peer::kProtocolVersion) {
     return;
   }
@@ -939,7 +949,9 @@ struct CpuRuntime::Impl {
 
 CpuRuntime::CpuRuntime() = default;
 
-CpuRuntime::~CpuRuntime() { (void)Shutdown(); }
+CpuRuntime::~CpuRuntime() {
+  if (!Shutdown().ok()) (void)impl_.release(); // Keep contexts alive with quarantined DMA.
+}
 
 Status CpuRuntime::Initialize(const CpuRuntimeOptions& options) {
   if (impl_ != nullptr) return Status::InvalidState("CpuRuntime has already been initialized");
@@ -982,6 +994,8 @@ Status CpuRuntime::ServeConnection(int connection_fd) {
 
 Status CpuRuntime::Shutdown() {
   if (impl_ == nullptr) return Status::OK();
+  const auto pull_status = impl_->service->ShutdownPull();
+  if (!pull_status.ok()) return pull_status;
   impl_.reset();
   return Status::OK();
 }
