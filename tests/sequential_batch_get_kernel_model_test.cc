@@ -201,6 +201,8 @@ struct Fixture {
                   reinterpret_cast<void*>(addresses[indices[i]] + offsets[i]), token);
     for (uint32_t core = 0; core < workers; ++core) {
       aiv_model::core = core;
+      // Simulate a core last used by another operator, on every launch/core.
+      aiv_model::dma_state_dirty = true;
       KvafSequentialBatchGetAivKernelV1(args);
       assert(status[core].magic == KVAF_SEQ_STATUS_MAGIC);
       assert(status[core].sequence == args.sequence);
@@ -240,6 +242,7 @@ int main() {
           const auto reads = aiv_model::mte2_copies, writes = aiv_model::mte3_copies;
           for (uint32_t core = 0; core < workers; ++core) {
             aiv_model::core = core;
+            aiv_model::dma_state_dirty = true;
             KvafSequentialBatchGetAivKernelV1(f.args);
             const auto& s = f.status[core];
             assert(s.magic == KVAF_SEQ_STATUS_MAGIC && s.sequence == f.args.sequence);
@@ -289,6 +292,8 @@ int main() {
           std::memset(aiv_model::ub, 0xe9, sizeof(aiv_model::ub));
           expected = output;
           std::copy_n(source.data() + offset, bytes, expected.data() + destination_offset);
+          // This helper-only case deliberately bypasses the kernel entry.
+          AscendC::InitSocState();
           CopyPayload(Address(source.data() + offset), Address(output.data() + destination_offset), bytes);
           assert(output == expected);
           assert(!aiv_model::mte2.destination && !aiv_model::mte3.destination);

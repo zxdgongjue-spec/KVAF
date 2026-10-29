@@ -22,7 +22,7 @@ void Doorbell(uint32_t value, uint32_t* address);
 }  // namespace aiv_model
 
 inline struct { uint32_t x; } threadIdx;
-enum { PIPE_S, PIPE_V, PIPE_MTE3, PIPE_MTE2 };
+enum { PIPE_S, PIPE_V, PIPE_MTE3, PIPE_MTE2, PIPE_ALL };
 using event_t = uint32_t;
 inline bool model_events[4][4][3]{};
 namespace aiv_model {
@@ -42,6 +42,9 @@ struct PendingCopy {
 };
 inline PendingCopy mte2, mte3;
 inline uint64_t mte2_copies{}, mte3_copies{};
+// Coarse contract for state inherited from a preceding operator, not a model
+// of any hardware register encoding or errcode 78. DMA needs initialized state.
+inline bool dma_state_dirty{};
 }
 inline void set_flag(int source, int target, event_t event) {
   if (model_events[source][target][event]) std::abort();
@@ -68,6 +71,15 @@ inline void st_dev(uint32_t value, uint32_t* address, int) {
 }
 
 namespace AscendC {
+inline void InitSocState() { aiv_model::dma_state_dirty = false; }
+template <int pipe> inline void PipeBarrier() {
+  static_assert(pipe == PIPE_ALL);
+  for (const auto& pipeline : model_events)
+    for (const auto& direction : pipeline)
+      for (bool pending : direction) if (pending) std::abort();
+  aiv_model::mte2.Finish();
+  aiv_model::mte3.Finish();
+}
 inline uint32_t GetBlockIdx() { return aiv_model::core; }
 inline uint64_t GetSystemCycle() { return ++aiv_model::cycle; }
 enum class CacheLine { SINGLE_CACHE_LINE };
@@ -98,7 +110,7 @@ template <typename T>
 void DataCopyPad(const LocalTensor<T>& dst, const GlobalTensor<T>& src,
                  const DataCopyExtParams& p, const DataCopyPadExtParams<T>& pad) {
   const uint32_t padded = (p.blockLen + 31) & ~31U;
-  if (p.blockCount != 1 || p.srcStride || p.dstStride || p.rsv || pad.isPad ||
+  if (aiv_model::dma_state_dirty || p.blockCount != 1 || p.srcStride || p.dstStride || p.rsv || pad.isPad ||
       pad.leftPadding || pad.rightPadding || dst.address_.bufferAddr % 32 ||
       padded > dst.address_.dataLen || aiv_model::mte2.destination ||
       aiv_model::mte3.destination) std::abort();
@@ -109,7 +121,7 @@ void DataCopyPad(const LocalTensor<T>& dst, const GlobalTensor<T>& src,
 template <typename T>
 void DataCopyPad(const GlobalTensor<T>& dst, const LocalTensor<T>& src,
                  const DataCopyExtParams& p) {
-  if (p.blockCount != 1 || p.srcStride || p.dstStride || p.rsv ||
+  if (aiv_model::dma_state_dirty || p.blockCount != 1 || p.srcStride || p.dstStride || p.rsv ||
       src.address_.bufferAddr % 32 || p.blockLen > src.address_.dataLen ||
       aiv_model::mte2.destination || aiv_model::mte3.destination) std::abort();
   aiv_model::mte3 = {reinterpret_cast<uint8_t*>(dst.data),

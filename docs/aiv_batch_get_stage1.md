@@ -21,6 +21,9 @@ Scatter 的本地 payload 搬运使用 `DataCopyPad<uint8_t>`，通过一个 16 
 完成后才复用缓冲并报告完成；长度按字节给出，UB padding 不写到 output。
 源 GlobalTensor 禁用 L2 cache hint，且不再经 SIMT 读取被 CPU WRITE 更新的
 staging。原实现的 MainScalar cache 刷新不能代替 SIMT cache 刷新。
+顺序 kernel 在入口调用 `InitSocState()`，在退出前调用
+`PipeBarrier<PIPE_ALL>()`；没有 TPipe 的静态 Tensor 写法必须自行初始化和收尾，
+尤其不能假定前一个算子留下的搬运 loop-mode、原子操作等全局状态为默认值。
 接口约束见 [GMToUB DataCopyPad](https://asc.gitcode.com/api/SIMD-API/basic_api/memory_vector_compute/data_move/DataCopyPad_GMToUB.html)、
 [UBToGM DataCopyPad](https://asc.gitcode.com/api/SIMD-API/basic_api/memory_vector_compute/data_move/DataCopyPad_UBToGM.html) 和
 [SIMD/SIMT 内存层次](https://asc.gitcode.com/guide/programming_guide/advanced_programming/advanced_ai_core_programming_model/simd_simt_hybrid_programming/memory_hierarchy.html)。
@@ -254,6 +257,33 @@ KVAF_AIV_SCATTER_PROBE= DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 \
   KVAF_AIV_BATCH_GET_MODES=cpu_push_scatter \
   python -u tests/python/test_aiv_sequential_batch_get.py
 ```
+
+### flush 完成、load 报错后的更新
+
+PID 7820、卡 7 的新日志将失败进一步限定在 MTE：`errcode=78`、
+`MTE_ERROR_T0_0=0x4000`、`SU_ERROR_T0_0=0`、`fixedPCOffset=0xd28`。
+这与旧日志的标量异常 259 不同，不能仅凭两次 ACL 都是 507015 认定根因相同。
+此次 kernel 参数末字的高 32 位为 3，对应 `load` 检查点；该检查点不执行
+payload 的 UB→GM。首个 staging 源地址按参数计算为
+`0x120000200000 + 0x80100 = 0x120000280100`，token 长度为 656 B，
+代码配置的 UB 偏移为 0、缓冲大小为 16 KiB；显式长度/对齐未见违反已知约束。
+这不等于已经验证了编译器实际生成的指令参数。
+
+代码核对发现顺序 kernel 使用静态 LocalTensor，却遗漏了 `InitSocState()`。
+[官方静态 Tensor 指南](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/programug/Ascendcopdevg/docs/en/guide/programming_guide/programming_model/ai_core_simd_programming/cpp_tensor_programming/static_tensor_programming.md)
+要求入口初始化、结束前执行全流水屏障；
+[InitSocState 说明](https://asc.gitcode.com/api/SIMD-API/basic_api/tool_interface/system_init/InitSocState.html)
+列出 950 AIV 的初始化内容包含 loop-mode、原子操作和 CTRL 等状态。
+现已补齐入口初始化及退出屏障，原有 DataCopyPad 参数、同步和四个检查点保持不变，
+先用同一 `load` 用例验证此修正，不再增加同步对照开关。
+
+遗漏初始化是已确认的代码缺陷，但尚未证明它就是此次 errcode 78 的根因。
+本地模型在每次 launch/core 前模拟被其他算子改变的 DMA 状态，验证 kernel
+会先初始化再搬运；模型不解码真实 MTE 寄存器，也不模拟硬件错误码 78。
+
+重编译后依次复测 `KVAF_AIV_SCATTER_PROBE=load`、`copy`，均完成后清空开关
+跑完整 scatter 回归。若 `load` 仍失败，应保留新 `.o` 和此次异常摘要，并核对
+部署端 CANN 版本、实际头文件和新二进制的故障指令；不能继续沿用旧 `+0xd28`。
 
 ## 当前验证状态
 
