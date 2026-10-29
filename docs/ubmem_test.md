@@ -79,8 +79,8 @@ CPU Host P2P DDR
                                       │
 NPU HAL import → aclrtReserveMemAddress → halMemMap
                                       │
-          BatchPut: 本地 HBM → SIMT store → CPU DDR
-          BatchGet: CPU DDR → SIMT load → 本地 HBM
+          BatchPut: 本地 HBM → MTE2 → UB → MTE3 → CPU DDR
+          BatchGet: CPU DDR → MTE2 → UB → MTE3 → 本地 HBM
 ```
 
 - `access_operator/src/ubmem/hal.cc`：动态加载 HAL，管理不透明物理句柄、Fabric handle 与映射。
@@ -90,7 +90,7 @@ NPU HAL import → aclrtReserveMemAddress → halMemMap
 - `runtime/src/peer_link.cc`：增加 UBmem 分配、CPU oracle 请求；沿用原有 region release。
 - `access_operator/src/ubmem/access_operator.cc`：实现现有 AccessOperator 接口，保持 BatchPut 同步提交、
   BatchGet 按调用方 stream 入队。每个 stream 独立持有状态和完成事件。
-- `access_operator/src/ubmem/batch_kernel.asc`：对已映射的内存执行 SIMT load/store；逐行解析、搬运，
+- `access_operator/src/ubmem/batch_kernel.asc`：使用 MTE 在已映射的内存间搬运；每核 32 KiB UB 分块，逐行解析，
   检查设备端 Get 元数据中的有效请求前缀、表索引、远端 block 范围和输出范围。
 - `tests/ubmem/npu_test.cc`：以真实 RuntimeCore、MetaManager 运行上述测试。
 
@@ -110,10 +110,21 @@ MetaManager 负责按请求顺序分配 Put 目的范围；UBmem adapter 只增�
 
 同步执行沿用现有 `KvafExecuteBatchPutSync` 的顺序：在调用方 stream 上初始化设备状态、
 启动 kernel、将状态 D2H 到固定页 host buffer，最后同步 stream。异步 Get 仍用完成事件
-跟踪映射生命周期。UBmem 不额外添加入口或
-出口 DCCI。每次 VF 调用前使用 `S→V` set/wait，调用后使用 `V→S` set/wait，再处理下一行。
-这沿用 KVAF `RunBatchGetValidation` 和 SHMEM `simt_rma_perftest` 的 `VSSync<Simt>`，
-交接标量准备参数、向量消费参数及标量复用调用状态的顺序；它不是远端完成通知。
+跟踪映射生命周期。
+
+搬运采用 SHMEM `aclshmemx_mte_put_nbi/get_nbi` 的 GM → UB → GM 结构，每核独占 32 KiB UB，
+通过 `ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE` 显式预留。`DataCopyPad` 的 `blockLen`
+始终是本块的实际字节数，UB 内补齐不扩大目的 GM 写入范围；例如 656 字节只写出 656 字节。
+
+每行的同步对应明确的数据依赖：
+
+- `S→MTE2`：标量准备好本行的拷贝参数后开始读取。
+- `MTE2→MTE3`：源数据到达 UB 后，才允许将 UB 写入目的 GM。
+- `MTE3→MTE2`：还有后续块时，等待当前块输出完成再复用 UB。
+- `MTE3→S`：本行最后一块输出完成后，再增加完成计数并处理下一行。
+
+这些事件顺序来自 SHMEM 的 `shmem_device_mte.hpp` 和 `mte_perftest_kernel.cpp`。
+数据搬运不经过标量 DCache，没有新增 DCCI 操作。
 
 CPU oracle 只在 fill 完成后执行内存屏障，保证 DDR store 先于允许 NPU 开始 Get 的 TCP
 响应；只读 check 无需出口屏障。这个屏障不清理 CPU cache。跨节点数据可见性依赖目标
@@ -125,7 +136,9 @@ HAL 映射和 UB 通路，需运行 CPU 改写后 NPU Get、NPU Put 后 CPU chec
 
 - 构建：`access_operator/cmake/aiv_toolchain.cmake` 从已有 BatchGet/BatchPut 构建配置提取，
   三个内核共享编译器、头文件查找和编译参数。
-- SIMT 搬运：SHMEM `src/device_simt/gm2gm/engine/shmem_device_simt_mte.hpp` 的 GM load/store 循环。
+- MTE 搬运：SHMEM `src/device/gm2gm/engine/shmem_device_mte.hpp` 的分块 put/get，
+  `src/device/ub2gm/mte/shmem_device_mte.hpp` 的 `DataCopyPad` 用法，以及
+  `examples/shmem_perftest/mte_perftest/mte_perftest_kernel.cpp` 的行间同步。
 - HAL ABI：CANN Driver `pkg_inc/ascend_hal_base.h` 的 `drv_mem_prop` 和函数声明，
   `ascend_hal_define.h` 的内存类型、Host UVA 标志和 Fabric handle。
 - NPU VA：SHMEM `hybm_vmm_based_segment.cpp::ReserveEachPeMemorySpace` 和
@@ -134,9 +147,8 @@ HAL 映射和 UB 通路，需运行 CPU 改写后 NPU Get、NPU Put 后 CPU chec
   nullptr 自动选址使用 ACL。KVAF 配对使用 ACL 预留/释放，HAL 导入/映射沿用前者的 `Map` 路径。
 - Fabric 导出及共享属性：SHMEM `src/host/mem/heap/hybm_vmm_based_segment.cpp::ExportInner`。
 
-SHMEM 的 `rma_d2h_demo` 是标量 p/g，`mte_perftest --memory-type dram` 使用 MTE/UB 搬运。
-本分支的 SIMT GM 拷贝并不是这两个 Host DDR 示例的同一数据面；它借鉴的是 SHMEM 的
-SIMT GM 循环，Host DDR 可达性必须由实际 Put/Get 校验确认。
+NPU 数据面按 SHMEM `mte_perftest --memory-type dram` 的 MTE/UB 路径实现，
+CPU 服务的独立 HAL 分配/导出仍由本测试验证。
 
 独立 CPU 节点使用这组 HAL 接口导出 DDR，是本测试要验证的能力。SHMEM 的 Host DDR
 示例运行在 Ascend runtime 环境，不能据此认定独立 CPU 节点已经支持。
@@ -155,8 +167,8 @@ SIMT GM 循环，Host DDR 可达性必须由实际 Put/Get 校验确认。
   程序立即输出 `aclGetRecentErrMsg()` 的详细信息；结合运行时日志中的 PC、访问地址和
   vec/mte error info 定位，单凭该错误码不能确定具体原因。
 
-当前设备日志中的 334 表示 SIMT 非法 GM 访问或跨设备访问超时。若错误出现在
-`LOCAL_COPY_BEGIN` 后，先排查本地 SIMT 搬运及参数；若本地校验通过、错误出现在
+若错误出现在 `LOCAL_COPY_BEGIN` 后，先排查本地 MTE 搬运、UB 配置及参数；
+若本地校验通过、错误出现在
 `MAPPED_PUT_BEGIN` 后，重点排查映射目的地址及其可达性。
 `DEVICE_MAPPING_READY` 和 `FAILED_LAUNCH` 输出设备编号、映射与输入范围，可与故障地址对照。
 
@@ -164,7 +176,7 @@ SIMT GM 循环，Host DDR 可达性必须由实际 Put/Get 校验确认。
 默认 17 行、2 核应分别完成 9 行和 8 行；计数不符会在 MetaManager 提交前报错。
 状态在每次同步启动前填为 `0xFF`，用于识别本次 kernel 是否写入报告；`seen_capacity`、
 `seen_blocks`、`seen_op` 是内核实际收到的启动字段，默认 Put 应为 `17`、`2`、`1`。
-host 和 kernel 使用 `KvafUbmemBatchKernelV2` 符号，旧 kernel 文件会在加载时被拒绝。
+host 和 kernel 使用 `KvafUbmemBatchMteKernel` 符号，旧 kernel 文件会在加载时被拒绝。
 `CPU_MISMATCH` 同时输出 `expected` / `actual` 字节。默认倒序 Put 首先检查 slot 16，
 起点为 `16 × 656 × 128 = 1343488`；该处失败并不表示前面的 slot 已经通过校验。
 
@@ -184,7 +196,8 @@ ctest --test-dir build-ubmem-host --output-on-failure
 它需要允许在 loopback 临时监听端口。
 
 `kvaf_ubmem_kernel_test` 包含实际 `.asc` 内核源码，在 CPU 模型中覆盖非对齐、656 字节读、
-变长写、无效 offset/地址、零 miss 和输出边界。该模型不模拟硬件缓存、SIMT 时序或 UB 总线。
+变长写、无效 offset/地址、零 miss、32 KiB 分块边界和输出 guard。DMA 模型在对应事件等待时
+执行搬运，检查 UB 复用与完成依赖；它不模拟硬件缓存、实际 DMA 延迟或 UB 总线。
 NPU 编译及跨机映射、数据可见性必须使用上面的硬件程序验证。
 
 参考：[SHMEM PR !285](https://gitcode.com/cann/shmem/pull/285)、

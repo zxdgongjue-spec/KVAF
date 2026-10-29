@@ -2,6 +2,7 @@
 #include <cstdint>
 
 namespace kvaf::ubmem {
+constexpr std::uint32_t kMteBufferBytes = 32 * 1024;
 enum class Operation : std::uint32_t { kGet = 0, kPut = 1 };
 // Separate each core's status stores, as in the existing BatchGet status ABI.
 // The host and kernel are built together.

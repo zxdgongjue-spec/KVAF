@@ -68,7 +68,7 @@ struct AccessOperator::Impl {
     auto status = Acl("aclrtBinaryLoad", aclrtBinaryLoad(input, &binary));
     aclrtDestroyBinary(input);
     if (status.ok()) status = Acl("aclrtBinaryGetFunction",
-        aclrtBinaryGetFunction(binary, "KvafUbmemBatchKernelV2", &function));
+        aclrtBinaryGetFunction(binary, "KvafUbmemBatchMteKernel", &function));
     return status;
   }
 
@@ -116,14 +116,16 @@ struct AccessOperator::Impl {
       if (!status.ok()) return status;
       state.pending = StreamState::Pending::kStream;
     }
-    aclrtLaunchKernelAttr attrs[3]{};
+    aclrtLaunchKernelAttr attrs[4]{};
     attrs[0].id = ACL_RT_LAUNCH_KERNEL_ATTR_SCHEM_MODE;
     attrs[0].value.schemMode = 1;
-    attrs[1].id = ACL_RT_LAUNCH_KERNEL_ATTR_ENGINE_TYPE;
-    attrs[1].value.engineType = ACL_RT_ENGINE_TYPE_AIV;
+    attrs[1].id = ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE;
+    attrs[1].value.dynUBufSize = kMteBufferBytes;
     attrs[2].id = ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT_US;
     attrs[2].value.timeoutUs.timeoutLow = 180000000U;
-    aclrtLaunchKernelCfg cfg{}; cfg.numAttrs = 3; cfg.attrs = attrs;
+    attrs[3].id = ACL_RT_LAUNCH_KERNEL_ATTR_ENGINE_TYPE;
+    attrs[3].value.engineType = ACL_RT_ENGINE_TYPE_AIV;
+    aclrtLaunchKernelCfg cfg{}; cfg.numAttrs = 4; cfg.attrs = attrs;
     auto status = Acl("aclrtLaunchKernelWithHostArgs", aclrtLaunchKernelWithHostArgs(
         function, options.cores, stream, &cfg, &args, sizeof(args), nullptr, 0));
     if (!status.ok()) return status;
@@ -227,9 +229,9 @@ Status AccessOperator::Initialize(const RemoteRegionDesc& region) {
   if (status.ok()) status = impl_->LoadKernel();
   if (!status.ok()) { (void)Shutdown(); return status; }
   impl_->ready = true;
-  std::fprintf(stderr, "[KVAF_UBMEM] DEVICE_MAPPING_READY bytes=%llu cores=%u acl_device=%u hal_device=%u "
+  std::fprintf(stderr, "[KVAF_UBMEM] DEVICE_MAPPING_READY engine=mte ub_bytes=%u bytes=%llu cores=%u acl_device=%u hal_device=%u "
       "host_base=0x%llx mapped_base=0x%llx\n",
-      static_cast<unsigned long long>(region.length), impl_->options.cores,
+      kMteBufferBytes, static_cast<unsigned long long>(region.length), impl_->options.cores,
       impl_->options.device_id, logical_device,
       static_cast<unsigned long long>(region.base),
       static_cast<unsigned long long>(impl_->mapping->address()));

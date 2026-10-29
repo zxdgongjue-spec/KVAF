@@ -66,7 +66,7 @@ void FullBlocks(kvaf::RuntimeCore& core, kvaf::ubmem::AccessOperator& op,
     for (std::uint64_t b = 0; b < slot; ++b) input[offsets[i] + b] = Pattern(keys[i] * slot + b, seed);
   }
   auto* source = pool.Copy(input);
-  // Control for SIMT GM faults: use the same source bytes, per-row offsets,
+  // Control for mapped GM faults: use the same source bytes, per-row offsets,
   // lengths and cores, but copy into local HBM instead of mapped CPU DDR.
   std::vector<std::uint64_t> probe_metadata(3 * c.rows);
   for (std::uint32_t i = 0; i < c.rows; ++i) {

@@ -17,7 +17,8 @@ void Run(BatchArgs args) {
   auto* reports = reinterpret_cast<CoreStatus*>(args.statuses);
   std::fill_n(reinterpret_cast<unsigned char*>(reports), args.blocks * sizeof(CoreStatus), 0xFF);
   for (model_core = 0; model_core < args.blocks; ++model_core) {
-    KvafUbmemBatchKernelV2(args);
+    KvafUbmemBatchMteKernel(args);
+    CHECK(!model_mte2 && !model_mte3);
     CHECK(reports[model_core].capacity == args.capacity);
     CHECK(reports[model_core].blocks == args.blocks);
     CHECK(reports[model_core].operation == static_cast<std::uint32_t>(args.operation));
@@ -83,7 +84,7 @@ int main() {
     for (unsigned b = 0; b < lengths[r]; ++b)
       CHECK(remote[destinations[r] - remote_base + b] == local[put_offsets[r] + b]);
   }
-  // Exercise the aligned 64-bit copy path as well as its byte tail.
+  // An aligned source with a non-32-byte tail must still copy exact bytes.
   put_offsets[2] = 0; destinations[2] = remote_base + 16384;
   Run(a);
   for (unsigned b = 0; b < lengths[2]; ++b) CHECK(remote[16384 + b] == local[b]);
@@ -113,6 +114,7 @@ int main() {
   CHECK(statuses[1].result == 0 && statuses[1].completed == 8);
   for (std::uint64_t i = 0; i < rows * slot; ++i) CHECK(big_remote[i] == TestPattern(i, 17));
   for (std::uint64_t i = rows * slot; i < big_remote.size(); ++i) CHECK(big_remote[i] == 0xCF);
+
   // The local-HBM control experiment uses the same kernel with offset-based
   // destinations. It must produce exactly the same bytes as mapped addressing.
   a.remote_base = 0;
@@ -121,5 +123,21 @@ int main() {
   Run(a);
   for (std::uint64_t i = 0; i < rows * slot; ++i) CHECK(big_remote[i] == TestPattern(i, 17));
   for (std::uint64_t i = rows * slot; i < big_remote.size(); ++i) CHECK(big_remote[i] == 0xCF);
+  // Exact MTE tile boundaries and tails: padding must never reach GM guards.
+  for (const std::uint64_t bytes : {kMteBufferBytes - 1U, kMteBufferBytes,
+                                   kMteBufferBytes + 1U, 2 * kMteBufferBytes + 17U}) {
+    std::vector<std::uint8_t> source(bytes + 1), destination(bytes + 7, 0xCF);
+    for (std::size_t i = 0; i < source.size(); ++i) source[i] = TestPattern(i, 53);
+    std::uint64_t source_offset = 1, destination_offset = 3, length = bytes;
+    a.local_base = Ptr(source.data()); a.local_bytes = source.size();
+    a.mapped_base = Ptr(destination.data()); a.remote_base = 0; a.remote_bytes = destination.size();
+    a.blocks = 1; a.capacity = 1;
+    a.put_offsets = Ptr(&source_offset); a.put_lengths = Ptr(&length); a.put_destinations = Ptr(&destination_offset);
+    Run(a);
+    CHECK(statuses[0].result == 0 && statuses[0].completed == 1);
+    for (std::uint64_t i = 0; i < bytes; ++i) CHECK(destination[3 + i] == source[1 + i]);
+    for (unsigned i = 0; i < 3; ++i) CHECK(destination[i] == 0xCF);
+    for (std::size_t i = 3 + bytes; i < destination.size(); ++i) CHECK(destination[i] == 0xCF);
+  }
   std::puts("UBmem actual kernel: mapped addressing, 656-byte reads, variable puts, inactive tail, guards, and invalid ranges passed");
 }
