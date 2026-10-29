@@ -16,6 +16,8 @@ enum class StatusCode {
   kInvalidState,
   kOutOfMemory,
   kInternal,
+  // DMA or a remote operation may still be active. Retain its resources.
+  kInDoubt,
 };
 
 class Status {
@@ -62,6 +64,10 @@ class Status {
 
   static Status Internal(std::string message) {
     return Error(StatusCode::kInternal, std::move(message));
+  }
+
+  static Status InDoubt(std::string message) {
+    return Error(StatusCode::kInDoubt, std::move(message));
   }
 
   bool ok() const { return code_ == StatusCode::kOk; }

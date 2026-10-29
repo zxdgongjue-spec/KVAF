@@ -1,0 +1,103 @@
+# CPU Pull / Offload 构建与运行
+
+实现提供独立的 `kvaf.OffloadRuntime`。调用端运行于持有 HBM 的 NPU 进程，CPU 服务主动 READ 到自己的 DDR。正常路径是 `PreparePut → CPU Pull → CommitPut`，不要求 AIV BatchGet/BatchPut kernel。
+
+## 构建
+
+三端卸载与 Decode 读取不在本版范围。以下两个进程使用同一份源码构建。
+
+CPU 机器需要 Linux、UMDK 24.12 配套头文件以及部署时的 liburma/provider。CPU 建链继续使用 KVAF 已有部署要求的 `urma_get_tp_list` 和 `urma_import_jetty_ex` 扩展。
+
+```bash
+cmake -S . -B build-cpu-offload \
+  -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON \
+  -DKVAF_URMA_ROOT=/path/to/umdk \
+  -DKVAF_URMA_LIBRARY=/path/to/liburma.so
+cmake --build build-cpu-offload -j8
+```
+
+默认 CPU READ 使用公开的 24 字节 SGE；如果已确认部署 provider 使用参考 CPU push 中的 32 字节扩展 SGE，则额外设置 `-DKVAF_CPU_PULL_EXTENDED_SGE=ON`。不能只根据头文件版本判断实际加载库的 ABI。
+
+NPU 机器需要 CANN、Python、pybind11，以及运行时的 torch/torch_npu：
+
+```bash
+cmake -S . -B build-offload \
+  -DKVAF_ENABLE_CPU_OFFLOAD=ON \
+  -DKVAF_ENABLE_AIV_BATCH_GET=OFF \
+  -DKVAF_ENABLE_AIV_BATCH_PUT=OFF \
+  -DKVAF_BUILD_PYTHON=ON \
+  -DASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/ascend-toolkit/latest
+cmake --build build-offload -j8
+export PYTHONPATH="$PWD/build-offload/python${PYTHONPATH:+:$PYTHONPATH}"
+```
+
+原有 `NpuRuntime` 和 BatchPut 入口保持独立。Offload 的编译开关不触发 AIV kernel 编译。
+
+## 使用
+
+在 CPU 机器按现有服务方式启动 `build-cpu-offload/runtime/kvaf_cpu_service`，通过其 `--help` 查看绑定地址、端口、UB device 与 EID 选择参数。控制端口供受信任调用方使用；新协议与原 KVCP v6 共用监听入口，但采用独立 magic/version。
+
+调用端显式提供 NPU EID 与 CPU candidate，不执行 BatchGet 自适应选路。初始化会分配目标池，并通过一次小规模 CPU Pull 和 CPU DDR 校验验证所选路径。
+
+```python
+import torch
+import torch_npu
+import kvaf
+
+torch.npu.set_device(0)
+runtime = kvaf.OffloadRuntime(
+    npu_eid="替换为本机 NPU 的 32 位十六进制 EID",
+    device_id=0,
+    cpu_candidate=0,
+    timeout_ms=30000,
+)
+runtime.link_to("CPU_HOST:PORT")
+runtime.initialize(ddr_bytes=16 * 1024 * 1024, slot_size=65536)
+
+source = torch.arange(4096, device="npu:0", dtype=torch.int32)
+runtime.offload(
+    keys=[1, 3], source=source,
+    input_offsets=[0, 8192], lengths=[8192, 4096],
+)
+checksum = runtime.last_checksum()  # 可选诊断：按请求顺序对 CPU DDR 计算 FNV-1a 64
+runtime.batch_free([1, 3])
+runtime.shutdown()
+```
+
+每个 runtime 只允许一个调用线程和一个在途 Offload。源必须是当前所选 NPU 上的连续 Tensor；元数据使用整数序列或一维连续 CPU int64 Tensor，最多 4096 项。key 沿用当前固定 slot ID 语义，单项长度不超过 slot_size。
+
+`stream` 缺省为当前 NPU stream。Offload 在该 stream 上记录并等待 producer event，再通知 CPU；调用方负责其他 stream 上的依赖，且在调用期间不能覆盖源数据。首版不支持图捕获。
+
+## 失败与恢复
+
+`offload()` 成功才表示 CPU 数据和元数据均已提交。发生异常后检查 `runtime.pending_offload`：
+
+- 为 false：没有仍被该任务保留的源内存，安全失败的预留已回滚。
+- 为 true：不要修改或复用 source。使用 `runtime.task_id` 识别任务，再调用 `runtime.resolve_offload()`；它查询原任务，不重新提交 DMA。
+
+Python binding 保持未决任务的源 Tensor 强引用。C++ 调用方必须自行保持源 allocation 和内容有效，直到 `pending_offload()` 为 false。MR 注册不能代替内存所有权。
+
+CQ 错误或超时会隔离该 CPU transport，首版不尝试强制取消/重建 DMA。状态仍未知时 Shutdown 返回错误，目标 slot 和源注册继续保留；异常析构也保留相关资源到进程退出。网络恢复可解决丢失响应，但不能自动修复硬件队列错误。
+
+初始化探测若失败且留下 pending 事务，同样先 resolve，再 shutdown，之后重新 initialize；探测失败时不会将 runtime 标记为就绪。
+
+## 验证与限制
+
+主机测试包含事务提交/回滚、pending 数据不可见、目标范围检查、任务去重，以及真实 TCP 上丢失 Submit/Open/ReleaseSource/Close 响应后的恢复。测试使用 fake ACL/HCCP 和 Host 内存后端，不代表硬件通过。
+
+```bash
+cmake -S . -B build-host -DBUILD_TESTING=ON
+cmake --build build-host -j8
+ctest --test-dir build-host --output-on-failure
+```
+
+两机硬件验收运行：
+
+```bash
+python tests/python/test_cpu_offload.py \
+  --cpu CPU_HOST:PORT --npu-eid NPU_EID_HEX --device 0 --cpu-candidate 0
+```
+
+脚本覆盖 producer stream、不同长度、非零源 offset、多次复用及跨 64 KiB WR 的 READ，直接校验 CPU DDR，不依赖 Decode/BatchGet。
+
+目标 DDR 使用 pinned `LOCAL_WRITE` MR；源 HBM 按远端 READ 用途注册。当前后端要求部署平台支持 CQ 完成后的 coherent host-DMA 可见性。注册权限、pin 模式、SGE/设备属性 ABI、驱动配套和 CPU 可见性须在目标硬件验证。本版未验证同一池作为远端 BatchGet 源的行为。

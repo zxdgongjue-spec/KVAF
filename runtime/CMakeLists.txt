@@ -7,6 +7,12 @@ target_include_directories(kvaf_peer_link
 target_link_libraries(kvaf_peer_link PUBLIC kvaf_common pthread)
 target_compile_features(kvaf_peer_link PUBLIC cxx_std_17)
 
+add_library(kvaf_offload_control STATIC src/offload_client.cc src/offload_service.cc)
+target_include_directories(kvaf_offload_control PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(kvaf_offload_control PUBLIC kvaf_common pthread)
+target_compile_features(kvaf_offload_control PUBLIC cxx_std_17)
+
 add_library(kvaf_runtime
   src/runtime.cc
   src/runtime_service.cc
@@ -45,6 +51,15 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
   target_compile_features(kvaf_npu_runtime PUBLIC cxx_std_17)
 endif()
 
+if(KVAF_ENABLE_CPU_OFFLOAD)
+  add_library(kvaf_offload_runtime STATIC src/offload_runtime.cc)
+  target_include_directories(kvaf_offload_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/include)
+  target_link_libraries(kvaf_offload_runtime PUBLIC kvaf_runtime
+    PRIVATE kvaf_offload_control kvaf_direct_hccp_session "${KVAF_ASCENDCL_LIBRARY}" ${CMAKE_DL_LIBS})
+  target_link_directories(kvaf_offload_runtime PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/lib64)
+endif()
+
 if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   find_package(Threads REQUIRED)
   set(KVAF_URMA_ROOT "" CACHE PATH "UMDK source or installation root")
@@ -65,14 +80,17 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
       "KVAF_BUILD_REMOTE_CPU_SERVICE requires urma_api.h and liburma; set KVAF_URMA_ROOT")
   endif()
 
-  add_library(kvaf_cpu_runtime STATIC src/cpu_runtime.cc)
+  add_library(kvaf_cpu_runtime STATIC src/cpu_runtime.cc src/cpu_pull_urma.cc)
   target_include_directories(kvaf_cpu_runtime
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
       "${KVAF_URMA_INCLUDE_DIR}")
   target_link_libraries(kvaf_cpu_runtime
     PUBLIC kvaf_runtime
-    PRIVATE "${KVAF_URMA_LIBRARY}" "${CMAKE_DL_LIBS}" Threads::Threads)
+    PRIVATE kvaf_offload_control "${KVAF_URMA_LIBRARY}" "${CMAKE_DL_LIBS}" Threads::Threads)
+  if(KVAF_CPU_PULL_EXTENDED_SGE)
+    target_compile_definitions(kvaf_cpu_runtime PRIVATE KVAF_CPU_PULL_EXTENDED_SGE=1)
+  endif()
   target_compile_features(kvaf_cpu_runtime PUBLIC cxx_std_17)
 
   add_executable(kvaf_cpu_service src/cpu_service_main.cc)

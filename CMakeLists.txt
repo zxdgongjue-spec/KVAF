@@ -3,6 +3,8 @@ cmake_minimum_required(VERSION 3.18)
 project(kvaf LANGUAGES CXX)
 
 option(KVAF_BUILD_PYTHON "Build the optional Pybind Python registration module" OFF)
+option(KVAF_ENABLE_CPU_OFFLOAD "Build CANN host OffloadRuntime without AIV kernels" OFF)
+option(KVAF_CPU_PULL_EXTENDED_SGE "Use the deployed 32-byte CPU READ SGE ABI (otherwise public 24-byte)" OFF)
 option(KVAF_ENABLE_AIV_BATCH_GET
        "Build the CANN-backed default BatchGet AccessOperator" OFF)
 option(KVAF_ENABLE_AIV_BATCH_PUT
@@ -23,9 +25,26 @@ endif()
 # (notably Status, requests and metadata vectors) has the same object layout.
 # Applying it only to the binding and hardware operator lets Runtime construct
 # ABI-1 objects that an ABI-0 callee later destroys, which corrupts the heap.
-if(KVAF_ENABLE_AIV_BATCH_GET)
+if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_CPU_OFFLOAD)
   add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=0)
-  message(STATUS "KVAF AIV C++ ABI: _GLIBCXX_USE_CXX11_ABI=0 (all targets)")
+  message(STATUS "KVAF CANN C++ ABI: _GLIBCXX_USE_CXX11_ABI=0 (all targets)")
+endif()
+
+if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_CPU_OFFLOAD)
+  if(NOT DEFINED ASCEND_CANN_PACKAGE_PATH)
+    if(DEFINED ENV{ASCEND_CANN_PACKAGE_PATH})
+      set(ASCEND_CANN_PACKAGE_PATH "$ENV{ASCEND_CANN_PACKAGE_PATH}")
+    elseif(DEFINED ENV{ASCEND_HOME_PATH})
+      set(ASCEND_CANN_PACKAGE_PATH "$ENV{ASCEND_HOME_PATH}")
+    else()
+      set(ASCEND_CANN_PACKAGE_PATH "/usr/local/Ascend/ascend-toolkit/latest")
+    endif()
+  endif()
+  if(NOT EXISTS "${ASCEND_CANN_PACKAGE_PATH}/include/acl/acl.h")
+    message(FATAL_ERROR "CANN headers not found: ${ASCEND_CANN_PACKAGE_PATH}")
+  endif()
+  find_library(KVAF_ASCENDCL_LIBRARY NAMES ascendcl
+    HINTS "${ASCEND_CANN_PACKAGE_PATH}/lib64" REQUIRED)
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
