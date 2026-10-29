@@ -22,6 +22,8 @@ Scatter 的本地 payload 搬运使用 `DataCopyPad<uint8_t>`，通过一个 16 
 UB 通过公开的 `LocalTensor<uint8_t>(TPosition::VECIN, 0, 16384)` 构造，
 每次读入前单独调用 `ResetLoopModePara(DataCopyMVType::OUT_TO_UB)`，
 将 GM→UB 恢复为普通搬运模式。这项配置不调用 `InitSocState()` 或 TPipe。
+Scatter 的 Host loader 按纯 SIMD 启动，`dynUBufSize=0`；16 KiB 静态 UB
+缓冲不通过 SIMT 的动态 UB 启动参数分配。
 源 GlobalTensor 禁用 L2 cache hint，且不再经 SIMT 读取被 CPU WRITE 更新的
 staging。原实现的 MainScalar cache 刷新不能代替 SIMT cache 刷新。
 Scatter kernel 已按硬件故障定位需要撤掉入口的 `InitSocState()`，保留退出前的
@@ -326,6 +328,37 @@ CPU 模型还注入单字节 UB 损坏，确保同步完成但内容错误时测
 这个校验证明的是当前 staging→UB 的内容一致性；它不能单独证明 CPU 取到了
 正确的业务源数据，也不能代替后续的完整输出校验。
 
+### 修正 scatter 的 SIMD 启动参数
+
+2026-10-29 19:48，PID 18131、Device 7 的新版 `load` 仍失败，用户确认
+`flush` 通过。设备日志为 `errcode=78`、`MTE_ERROR_T0_0=0x4000`、
+`SU_ERROR_T0_0=0`，匹配的故障符号是 `kvaf_scatter::Scatter+0x5b4`，
+`fixedPCOffset=0x768`。参数末字 `0x305f5e100` 对应 `load`，没有执行
+payload MTE3。这次日志报告 MTE 异常，不能沿用旧二进制的标量异常结论；
+该偏移也不能脱离匹配二进制直接映射到某条源码语句。
+
+核对 Host 启动配置时发现，scatter loader 仍继承 direct SIMT 路径的
+`dynUBufSize=160 * 1024`。当前 scatter 是纯 SIMD kernel，使用静态
+LocalTensor。根据 [CANN 9.1 aclrtLaunchKernelAttrValue](https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/910/API/runtimeapi/aclcppdevg_03_1814.html)，
+`dynUBufSize` 用于 SIMT 动态 UB，纯 SIMD 算子只能设为 0。
+此次将 scatter 的该参数设为 0，保持 `.asc`、ABI 和拷贝同步流程不变。
+这个接口约束错误已修正，是否导致本次硬件异常仍需实测；不据此声称 MTE2
+已经通过。暂不增加 `setup`/`dma` 检查点，先复测现有字节校验 `load`。
+
+本次修改位于 Host loader，**只重编译 kernel `.o` 不会生效**。在目标机器
+运行 `cmake --build build-npu -j`，确保 Python 加载新生成的
+`libkvaf_execute_batch_get_host.so`，然后使用上文的 `load` 命令。新 Host
+加载 scatter binary 时会打印一次：
+
+```text
+[KVAF_AIV] SCATTER_KERNEL_READY path=... dyn_ubuf_bytes=0
+```
+
+若没有此行，先核对实际加载的 Host 库路径。验收仍要求三个批次的
+`verification=gm_ub_byte_compare` 标记与正确的 `verified_bytes`。
+本地 loader 回归直接检查传给 ACL 的 scatter 动态 UB 为 0，同时检查
+direct SIMT 的 160 KiB 配置；修复前新增断言失败，修复后通过。
+
 ## Scatter 507015 的分段定位
 
 拆分前，用户已反馈 `gather_read` 在 1、3、8 核通过。当时 Gather 和 scatter
@@ -507,6 +540,8 @@ manifest、宏和 `.ii`，按预处理后的有效定义提取初始化函数，
 - CMake 普通 C++ 构建和现有回归。
 - 拆分隔离回归：独立 loader 的路径/symbol/ABI 和交错调用、缺失另一模式二进制，
   scatter 增量重编译不改变 gather/direct 产物、独立 Python 入口和组合子进程失败汇总。
+- Loader 启动参数回归：scatter 的纯 SIMD 动态 UB 参数为 0，direct SIMT
+  路径仍为 160 KiB。
 - 候选选择回归覆盖连接回退、本地设备错误停止重试、普通/自适应选择及清理错误
   不覆盖原始失败。
 - 生产 `.asc` 的 CPU 模型执行：解码 SQ/CQ，调用真实 CPU gather executor，
@@ -527,8 +562,9 @@ manifest、宏和 `.ii`，按预处理后的有效定义提取初始化函数，
 
 用户此前已在硬件反馈 gather 的 1/3/8 核回归通过；拆分后撤回入口操作的独立
 gather 也已反馈成功（所给命令为 1 核）。scatter 探针此前反馈 flush 完成、
-load 失败，补初始化后仍有 507015。当前已撤掉整体初始化，并按官方源码调整
-MTE2 配置、UB 构造及内容验证，尚待上机验收新版 load。尚待验证 scatter
+load 失败，补初始化后仍有 507015。撤掉整体初始化、按官方源码调整 MTE2
+配置、UB 构造及内容验证后，新日志仍报告 MTE 异常 78。当前进一步修正了
+scatter Host 的纯 SIMD 启动参数，尚待上机验收新版 load。尚待验证 scatter
 的非对齐 MTE3 写出、CPU/NPU 缓存可见性、跨 Jetty
 done 保序及真实超时/断链回收。这些本地检查不替代 CANN 编译和双机验收。
 硬件回归未启用时返回 skip，不能视为硬件验收通过。
