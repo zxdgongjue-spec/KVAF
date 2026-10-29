@@ -30,6 +30,7 @@ struct Registration {
   urma_target_seg_t* local{};
   urma_token_id_t* local_token{};
   std::uint64_t va{}, bytes{};
+  std::uint32_t token_value{};
   bool armed{};
 };
 std::map<urma_target_seg_t*, Registration> registrations;
@@ -64,6 +65,7 @@ urma_target_seg_t* Register(urma_context_t* ctx, urma_seg_cfg_t* original) {
     return urma_register_seg(ctx, original);
   Registration r;
   r.context = ctx; r.va = original->va; r.bytes = original->len;
+  r.token_value = original->token_value.token;
   auto remote_cfg = *original;
   const bool dual = mode.rfind("dual", 0) == 0;
   if (mode == "single-pinned" || mode == "dual-both-pinned" || mode == "single-local-write-pinned")
@@ -312,6 +314,12 @@ struct State {
   std::uint64_t source_base{}, ready{}, acknowledged{}, sequence{};
   std::uint32_t max_bytes{};
   bool failed{}, closed{};
+  bool independent_ddr_control{}, control_verified{};
+  // Explicitly released only after successful queue teardown. Failed DMA or
+  // validation retains these resources until the K process is stopped.
+  void* control_memory{};
+  urma_target_seg_t* control_mr{};
+  urma_token_id_t* control_token{};
   std::string failure;
 
   void Connect(const Message& request, Message& reply) {
@@ -380,74 +388,142 @@ struct State {
       (unsigned long long)region->local->seg.ubva.va,
       (unsigned long long)region->local->seg.len, region->local->seg.attr.value);
   }
+  void PostReadAndWait(std::uint64_t round, std::uint64_t offset, std::uint32_t length,
+                       std::uint64_t destination, urma_target_seg_t* destination_mr,
+                       const char* target) {
+    auto completion = std::make_unique<NativeBuffer<urma_cr_t>>();
+    Sge src{}; src.addr = source_base + kGuard + offset; src.len = length; src.tseg = source;
+    Sge dst{}; dst.addr = destination; dst.len = length; dst.tseg = destination_mr;
+    urma_jfs_wr_t wr{};
+    wr.opcode = URMA_OPC_READ; wr.tjetty = peer; wr.user_ctx = ++sequence;
+    wr.flag.bs.complete_enable = 1; wr.flag.bs.comp_order = 1;
+    wr.flag.bs.place_order = URMA_STRONG_ORDER;
+    wr.rw.src = {reinterpret_cast<urma_sge_t*>(&src), 1};
+    wr.rw.dst = {reinterpret_cast<urma_sge_t*>(&dst), 1};
+    urma_jfs_wr_t* bad{};
+    errno = 0;
+    const auto post_rc = urma_post_jetty_send_wr(jetty, &wr, &bad);
+    const int post_error = errno;
+    if (post_rc != 0) {
+      std::fprintf(stderr, "READ_POST_FAILURE target=%s round=%llu offset=%llu bytes=%u context=%llu "
+        "rc=%d bad_wr=%p errno=%d\n", target, (unsigned long long)round,
+        (unsigned long long)offset, length, (unsigned long long)sequence,
+        int(post_rc), (void*)bad, post_error);
+      Check(false, "post READ (resources retained)");
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    for (;;) {
+      completion->value = {};
+      errno = 0;
+      const int n = urma_poll_jfc(cq, 1, &completion->value);
+      const int poll_error = errno;
+      CheckNativeBuffer("urma_poll_jfc.cr", *completion, n, poll_error, false);
+      if (n < 0 || n > 1)
+        std::fprintf(stderr, "READ_POLL_FAILURE target=%s round=%llu offset=%llu bytes=%u "
+          "context=%llu capacity=1 rc=%d errno=%d\n", target, (unsigned long long)round,
+          (unsigned long long)offset, length, (unsigned long long)sequence, n, poll_error);
+      Check(n >= 0, "poll READ CQ");
+      Check(n <= 1, "unexpected READ CQ count");
+      if (n) {
+        const auto& cr = completion->value;
+        if (cr.status != URMA_CR_SUCCESS || cr.user_ctx != sequence) {
+          const char* name = cr.status == URMA_CR_SUCCESS ? "URMA_CR_SUCCESS" :
+            cr.status == URMA_CR_LOC_ACCESS_ERR ? "URMA_CR_LOC_ACCESS_ERR" : "OTHER";
+          std::fprintf(stderr, "CQ_FAILURE status=%u status_name=%s status_ok=%u "
+            "context=%llu expected=%llu context_match=%u round=%llu offset=%llu bytes=%u "
+            "src_va=0x%llx dst_va=0x%llx src_mr=%p dst_mr=%p exported_mr=%p "
+            "wire_sge_bytes=%zu native_cr_bytes=%zu target=%s errno=%d\n", unsigned(cr.status), name,
+            unsigned(cr.status == URMA_CR_SUCCESS), (unsigned long long)cr.user_ctx,
+            (unsigned long long)sequence, unsigned(cr.user_ctx == sequence),
+            (unsigned long long)round, (unsigned long long)offset, length,
+            (unsigned long long)src.addr, (unsigned long long)dst.addr, (void*)src.tseg,
+            (void*)dst.tseg, (void*)region->remote, sizeof(Sge), sizeof(urma_cr_t), target, poll_error);
+          Check(cr.status == URMA_CR_SUCCESS, "READ CQ returned error status");
+          Check(false, "READ CQ user_ctx mismatch");
+        }
+        break;
+      }
+      Check(std::chrono::steady_clock::now() < deadline, "READ CQ timeout (resources retained)");
+    }
+  }
+  void ReadIndependentDdr(std::uint64_t round, std::uint32_t length) {
+    Check(!control_memory && !control_mr && !control_token, "fresh independent DDR control required");
+    // Match the allocation size and first READ length; only the destination VA
+    // and its single local registration change. Never copy this data to KV DDR.
+    const int allocation_rc = posix_memalign(&control_memory, 4096, region->bytes);
+    std::fprintf(stderr, "INDEPENDENT_DDR_ALLOCATE bytes=%llu alignment=4096 rc=%d va=%p\n",
+      (unsigned long long)region->bytes, allocation_rc, control_memory);
+    Check(allocation_rc == 0 && control_memory, "allocate independent DDR control");
+    Check(reinterpret_cast<std::uint64_t>(control_memory) != region->va,
+      "independent DDR must use a different allocation");
+    auto* ctx = region->context;
+    errno = 0;
+    control_token = urma_alloc_token_id(ctx);
+    Check(control_token, "allocate independent DDR token");
+    urma_seg_cfg_t cfg{};
+    cfg.va = reinterpret_cast<std::uint64_t>(control_memory); cfg.len = region->bytes;
+    cfg.token_id = control_token; cfg.token_value.token = region->token_value;
+    cfg.flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
+    cfg.flag.bs.access = kLocalWrite; cfg.flag.bs.non_pin = 0; cfg.flag.bs.token_id_valid = 1;
+    errno = 0;
+    control_mr = urma_register_seg(ctx, &cfg);
+    const int register_error = errno;
+    std::fprintf(stderr, "REGISTER role=independent_ddr va=0x%llx bytes=%llu access=0x%x "
+      "non_pin=%u flags=0x%x mr=%p context=%p errno=%d\n", (unsigned long long)cfg.va,
+      (unsigned long long)cfg.len, cfg.flag.bs.access, cfg.flag.bs.non_pin, cfg.flag.value,
+      (void*)control_mr, (void*)ctx, register_error);
+    Check(control_mr, "register independent DDR control");
+    // Like ARM for default KV DDR, initialize only after registration.
+    std::memset(control_memory, 0xa5, region->bytes);
+    auto* initial = static_cast<std::uint8_t*>(control_memory) + kGuard;
+    for (std::uint32_t i = 0; i < length; ++i) initial[i] = Pattern(i, round) ^ 0xff;
+    std::fprintf(stderr, "INDEPENDENT_DDR_READ_BEGIN round=%llu bytes=%u src_va=0x%llx "
+      "dst_va=0x%llx shared_dst_va=0x%llx dst_mr=%p context=%p wire_sge_bytes=%zu\n",
+      (unsigned long long)round, length, (unsigned long long)(source_base + kGuard),
+      (unsigned long long)(cfg.va + kGuard), (unsigned long long)(region->va + kGuard),
+      (void*)control_mr, (void*)ctx, sizeof(Sge));
+    PostReadAndWait(round, 0, length, cfg.va + kGuard, control_mr, "independent_ddr");
+    const auto* memory = static_cast<const volatile std::uint8_t*>(control_memory);
+    for (std::uint64_t i = 0; i < region->bytes; ++i) {
+      const auto expected = i >= kGuard && i - kGuard < length ? Pattern(i - kGuard, round) : 0xa5;
+      if (memory[i] != expected) {
+        std::fprintf(stderr, "INDEPENDENT_DDR_MISMATCH offset=%llu expected=%u actual=%u\n",
+          (unsigned long long)i, unsigned(expected), unsigned(memory[i]));
+        Check(false, "independent DDR data/guard validation failed");
+      }
+    }
+    control_verified = true;
+    std::fprintf(stderr, "INDEPENDENT_DDR_CONTROL_PASS round=%llu bytes=%u cpu=ok guards=ok "
+      "scope=first_chunk_only shared_ddr_verified=0\n", (unsigned long long)round, length);
+  }
+  void ReleaseIndependentDdr() {
+    if (control_mr) {
+      Check(urma_unregister_seg(control_mr) == 0, "unregister independent DDR control");
+      control_mr = nullptr;
+    }
+    if (control_token) {
+      Check(urma_free_token_id(control_token) == 0, "free independent DDR token");
+      control_token = nullptr;
+    }
+    std::free(control_memory); control_memory = nullptr;
+  }
   void Read(std::uint64_t round) {
     Check(peer && !closed && round == ready + 1 && acknowledged == ready,
       "PULL requires connected source and previous Decode ACK");
     Check(max_bytes && max_bytes <= kMaxReadChunkBytes, "invalid explicit READ chunk bytes");
     const auto bytes = region->bytes - 2 * kGuard;
-    auto completion = std::make_unique<NativeBuffer<urma_cr_t>>();
+    if (independent_ddr_control && !control_verified)
+      ReadIndependentDdr(round, static_cast<std::uint32_t>(std::min<std::uint64_t>(max_bytes, bytes)));
     for (std::uint64_t offset = 0; offset < bytes;) {
       const auto length = static_cast<std::uint32_t>(std::min<std::uint64_t>(max_bytes, bytes - offset));
       // The destination is the original KV allocation, never a staging buffer.
-      Sge src{}; src.addr = source_base + kGuard + offset; src.len = length; src.tseg = source;
-      Sge dst{}; dst.addr = region->va + kGuard + offset; dst.len = length; dst.tseg = region->local;
-      urma_jfs_wr_t wr{};
-      wr.opcode = URMA_OPC_READ; wr.tjetty = peer; wr.user_ctx = ++sequence;
-      wr.flag.bs.complete_enable = 1; wr.flag.bs.comp_order = 1;
-      wr.flag.bs.place_order = URMA_STRONG_ORDER;
-      wr.rw.src = {reinterpret_cast<urma_sge_t*>(&src), 1};
-      wr.rw.dst = {reinterpret_cast<urma_sge_t*>(&dst), 1};
-      urma_jfs_wr_t* bad{};
-      errno = 0;
-      const auto post_rc = urma_post_jetty_send_wr(jetty, &wr, &bad);
-      const int post_error = errno;
-      if (post_rc != 0) {
-        std::fprintf(stderr, "READ_POST_FAILURE round=%llu offset=%llu bytes=%u context=%llu "
-          "rc=%d bad_wr=%p errno=%d\n", (unsigned long long)round,
-          (unsigned long long)offset, length, (unsigned long long)sequence,
-          int(post_rc), (void*)bad, post_error);
-        Check(false, "post READ (resources retained)");
-      }
-      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
-      for (;;) {
-        completion->value = {};
-        errno = 0;
-        const int n = urma_poll_jfc(cq, 1, &completion->value);
-        const int poll_error = errno;
-        CheckNativeBuffer("urma_poll_jfc.cr", *completion, n, poll_error, false);
-        if (n < 0 || n > 1)
-          std::fprintf(stderr, "READ_POLL_FAILURE round=%llu offset=%llu bytes=%u "
-            "context=%llu capacity=1 rc=%d errno=%d\n", (unsigned long long)round,
-            (unsigned long long)offset, length, (unsigned long long)sequence, n, poll_error);
-        Check(n >= 0, "poll READ CQ");
-        Check(n <= 1, "unexpected READ CQ count");
-        if (n) {
-          const auto& cr = completion->value;
-          if (cr.status != URMA_CR_SUCCESS || cr.user_ctx != sequence) {
-            const char* name = cr.status == URMA_CR_SUCCESS ? "URMA_CR_SUCCESS" :
-              cr.status == URMA_CR_LOC_ACCESS_ERR ? "URMA_CR_LOC_ACCESS_ERR" : "OTHER";
-            std::fprintf(stderr, "CQ_FAILURE status=%u status_name=%s status_ok=%u "
-              "context=%llu expected=%llu context_match=%u round=%llu offset=%llu bytes=%u "
-              "src_va=0x%llx dst_va=0x%llx src_mr=%p dst_mr=%p exported_mr=%p "
-              "wire_sge_bytes=%zu native_cr_bytes=%zu errno=%d\n", unsigned(cr.status), name,
-              unsigned(cr.status == URMA_CR_SUCCESS), (unsigned long long)cr.user_ctx,
-              (unsigned long long)sequence, unsigned(cr.user_ctx == sequence),
-              (unsigned long long)round, (unsigned long long)offset, length,
-              (unsigned long long)src.addr, (unsigned long long)dst.addr, (void*)src.tseg,
-              (void*)dst.tseg, (void*)region->remote, sizeof(Sge), sizeof(urma_cr_t), poll_error);
-            Check(cr.status == URMA_CR_SUCCESS, "READ CQ returned error status");
-            Check(false, "READ CQ user_ctx mismatch");
-          }
-          break;
-        }
-        Check(std::chrono::steady_clock::now() < deadline, "READ CQ timeout (resources retained)");
-      }
+      PostReadAndWait(round, offset, length, region->va + kGuard + offset, region->local, "kv_pool");
       offset += length;
     }
     // Deliberately do not CPU-read/flush/copy the payload before Decode reads.
     ready = round;
-    std::fprintf(stderr, "PULL_CQ_OK round=%llu bytes=%llu\n",
-      (unsigned long long)round, (unsigned long long)bytes);
+    std::fprintf(stderr, "PULL_CQ_OK round=%llu bytes=%llu independent_ddr_control=%u\n",
+      (unsigned long long)round, (unsigned long long)bytes, unsigned(independent_ddr_control));
   }
   void VerifyCpu(std::uint64_t round) {
     Check(round == ready && acknowledged + 1 == round, "ACK round mismatch");
@@ -462,7 +538,8 @@ struct State {
       }
     }
     acknowledged = round;
-    std::fprintf(stderr, "ROUND_PASS round=%llu decode=ok cpu=ok guards=ok\n", (unsigned long long)round);
+    std::fprintf(stderr, "ROUND_PASS round=%llu decode=ok cpu=ok guards=ok independent_ddr_control=%u\n",
+      (unsigned long long)round, unsigned(independent_ddr_control));
   }
   void Shutdown() {
     Check(!failed && acknowledged == ready, "cannot CLOSE failed or unacknowledged transfer");
@@ -471,6 +548,7 @@ struct State {
     if (rq) { Check(urma_delete_jfr(rq) == 0, "destroy pull RQ"); rq = nullptr; }
     if (cq) { Check(urma_delete_jfc(cq) == 0, "destroy pull CQ"); cq = nullptr; }
     if (source) { Check(urma_unimport_seg(source) == 0, "unimport HBM segment"); source = nullptr; }
+    ReleaseIndependentDdr();
     if (region) region->armed = false;
     region = nullptr;
     closed = true;
@@ -537,11 +615,13 @@ int Listen(const char* address, int port) {
 
 int main(int argc, char** argv) {
   using namespace probe;
-  if (argc != 11 || std::string(argv[9]) != "--read-chunk-bytes") {
-    std::fprintf(stderr, "Usage: %s CASE UB_DEVICE EID_INDEX ALLOCATION_BYTES LISTEN_IPV4 KVAF_PORT PROBE_PORT PAGE_MODE --read-chunk-bytes N\n"
+  if ((argc != 11 && argc != 12) || std::string(argv[9]) != "--read-chunk-bytes" ||
+      (argc == 12 && std::string(argv[11]) != "--independent-ddr-control")) {
+    std::fprintf(stderr, "Usage: %s CASE UB_DEVICE EID_INDEX ALLOCATION_BYTES LISTEN_IPV4 KVAF_PORT PROBE_PORT PAGE_MODE --read-chunk-bytes N [--independent-ddr-control]\n"
       "CASE: single-current single-pinned single-plus-bit0 single-local-write-pinned dual dual-compatible dual-reverse dual-both-pinned dual-separate-context\n"
       "PAGE_MODE: default or thp\n"
-      "READ CHUNK: required explicit candidate, software range 1..65536; hardware limits are NOT queried\n",
+      "READ CHUNK: required explicit candidate, software range 1..65536; hardware limits are NOT queried\n"
+      "INDEPENDENT DDR CONTROL: optional first-chunk comparison, requires default page mode\n",
       argv[0]); return 2;
   }
   try {
@@ -555,6 +635,8 @@ int main(int argc, char** argv) {
     kvaf::CpuRuntimeOptions options;
     options.ub_device = argv[2]; options.has_eid_index = true; options.eid_index = std::stoul(argv[3]);
     Check(std::string(argv[8]) == "default" || std::string(argv[8]) == "thp", "invalid page mode");
+    Check(argc != 12 || std::string(argv[8]) == "default",
+      "independent DDR control requires default page mode");
     options.memory_page_mode = std::string(argv[8]) == "thp" ? kvaf::CpuMemoryPageMode::kTransparentHugePage : kvaf::CpuMemoryPageMode::kDefault;
     kvaf::CpuRuntime runtime;
     Check(runtime.Initialize(options).ok(), "initialize real KVAF CPU runtime");
@@ -562,11 +644,12 @@ int main(int argc, char** argv) {
     int diagnostic = Listen(argv[5], std::stoi(argv[7]));
     State state;
     state.max_bytes = read_chunk_bytes;
+    state.independent_ddr_control = argc == 12;
     std::fprintf(stderr, "PROBE_READY case=%s bytes=%llu header=%s native_sge_bytes=%zu wire_sge_bytes=%zu "
       "native_wr_bytes=%zu native_cr_bytes=%zu read_chunk_bytes=%u "
-      "capability_source=explicit_candidate hardware_limits_queried=0 src_sge=1 dst_sge=1\n",
+      "capability_source=explicit_candidate hardware_limits_queried=0 src_sge=1 dst_sge=1 independent_ddr_control=%u\n",
       mode.c_str(), (unsigned long long)allocation_bytes, kHeaderAccessModel, sizeof(urma_sge_t), sizeof(Sge),
-      sizeof(urma_jfs_wr_t), sizeof(urma_cr_t), read_chunk_bytes);
+      sizeof(urma_jfs_wr_t), sizeof(urma_cr_t), read_chunk_bytes, unsigned(state.independent_ddr_control));
     for (;;) {
       fd_set fds; FD_ZERO(&fds); FD_SET(service, &fds); FD_SET(diagnostic, &fds);
       const int rc = select(std::max(service, diagnostic)+1, &fds, nullptr, nullptr, nullptr);

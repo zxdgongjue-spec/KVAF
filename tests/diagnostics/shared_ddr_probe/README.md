@@ -227,6 +227,67 @@ K 不在 Decode 读取前预读或 flush payload，避免检查本身掩盖 DMA�
 建议留存表：case、页模式、allocation bytes、头文件宏、liburma/provider/驱动/固件/CANN 版本、
 两个注册的 flags/errno、首次失败阶段/CQ 状态、成功轮数、三端日志。
 
+### 独立 DDR 首块对照
+
+当 `dual` 在 SGE24 和 SGE32 下都于首条 READ 返回本地访问错误时，可在 K 命令末尾添加
+`--independent-ddr-control`。它是额外诊断开关，不是新的 MR case，默认关闭，仅支持 `default` 页模式。
+保留本轮卡、EID、SGE32 和 4096 B 分块，三端启动全新进程；Prefill、Decode 命令不变，无需因此重编。
+
+```bash
+# 沿用现有构建缓存的 UMDK include 和 liburma 路径。
+cmake -S tests/diagnostics/shared_ddr_probe -B build-ddr-probe-cpu \
+  -DPROBE_EXTENDED_SGE=ON
+cmake --build build-ddr-probe-cpu --target kvaf_ddr_probe -j8
+
+env URMA_LOG_LEVEL=debug build-ddr-probe-cpu/kvaf_ddr_probe \
+  dual udmac0d1e2 0 2695168 0.0.0.0 29990 29991 default \
+  --read-chunk-bytes 4096 --independent-ddr-control \
+  2>&1 | tee dual.sge32.independent.k.log
+```
+
+`PROBE_READY` 应包含 `wire_sge_bytes=32 independent_ddr_control=1`（字段可不相邻）。
+收到首次 PULL、Prefill 已完成 bind 和 Pattern 更新后，K 额外分配与原 KV allocation **同大小**
+的独立 DDR，仅注册一次 `access=1/non_pin=0`，使用相同 context、token value 和新的 token ID。
+与 default KV DDR 一样，在注册后初始化内存；首块预填期望值逐字节取反，其余字节为保护值。
+使用同一 HBM 源、源 MR、Jetty、SGE 布局和首 WR 长度发起 READ，并在成功 CQ 后逐字节校验。
+它不 CPU 读取原 KV payload，也不把控制结果 memcpy 到原 KV DDR。
+
+- `REGISTER role=independent_ddr`：独立注册结果；不等于 READ 成功。
+- `INDEPENDENT_DDR_CONTROL_PASS ... scope=first_chunk_only shared_ddr_verified=0`：首块进入独立 DDR 且 CPU 数据/保护区正确。
+- 随后仍执行原 KV DDR READ；错误日志的 `target=independent_ddr/kv_pool` 区分两个目标。
+- 只有原来的共享 DDR 全轮 `ROUND_PASS` 及两端最终成功，才满足共享数据路径验收；控制成功不发布 round/ACK。
+
+控制成功而原 KV DDR 失败，可将问题收敛到两个目的 allocation/注册映射等差异，不能唯一认定重复 MR 不支持。
+控制也报同样错误，说明“必须使用原共享 allocation 才会触发”不是必要条件；仍需核对通用注册、
+地址转换、READ 请求/导入契约和 provider，不能直接判定 HBM 不可读。
+原 KV 的两个 MR 此时仍保留在同一 context，因此这个结果也不能排除它们对 context 整体的影响。
+该控制会预热源 HBM/队列/映射；启用时 `PULL_CQ_OK` 和 `ROUND_PASS` 都标记
+`independent_ddr_control=1`。若共享路径随后通过，应再使用全新进程、不带该开关复测原始路径。
+额外 DDR/MR/token 在控制失败时保留；正常 CLOSE 先销毁队列和导入资源，再按 MR、token、内存顺序释放。
+
+### 用户态库日志
+
+真机加载列表已观察到 `/usr/lib64/liburma.so.0.0.3`、`libummu.so.1.0.5`、
+`/usr/lib64/urma/liburma-udma.so` 与 `liburma_ubagg.so.0.0.3`。
+文件名不能证明具体 UMDK 提交或当前设备实际采用哪个插件；需保留部署配套信息。
+内核的 `Adding to iommu group` 是设备入组信息，不是本次 READ 的访问故障证据。
+
+仓库固定提交的 [URMA core 日志实现](https://gitee.com/openeuler/umdk/blob/8cb685a80bf92e6287c3262d46b3d513fb3a3302/lib/urma/core/urma_log.c)
+使用字符串 `URMA_LOG_LEVEL=debug`，默认写 syslog，故 `tee` 和 `dmesg` 未必收集到这些日志。
+上面的命令启用该开关；复测后及时收集用户态时间窗口：
+
+```bash
+journalctl --since '5 minutes ago' --no-pager -o short-precise > dual.sge32.independent.journal.log
+grep -Ei 'URMA_LOG_TAG|UDMA_LOG_TAG|urma|udma|ummu' \
+  dual.sge32.independent.journal.log > dual.sge32.independent.urma.log
+```
+
+若 journal 没有记录，按 `/etc/rsyslog.conf`、`/etc/rsyslog.d/` 中的规则查实际落盘日志；
+不能将 journal 或 dmesg 为空解释为 provider 没有错误。
+部署 UDMA/UB 聚合插件可能有独立 logger，该开关不能保证覆盖全部插件。
+
+### 失败定位与资源保留
+
 失败或超时时程序不会把超时当作 DMA 已停止。Python 进程保留 Tensor，K 保留已武装的资源；
 先停止 K 诊断进程，再中断 Prefill/Decode，最后启动全新三进程。不要强行复用原地址继续测。
 该保留策略也适用于 Python 检查失败，需人工结束测试进程；正常成功路径会按依赖顺序释放。
@@ -302,6 +363,8 @@ host 测试覆盖九组注册视图、先后顺序、同 allocation 校验、跨
 多轮数据更换、post/CQ 错误不发布完成，以及第二个 MR 注册失败时回滚。
 READ 完成回归另覆盖状态错误但请求号匹配、成功状态但请求号不匹配、poll 返回负数、
 容量为 1 却返回多条以及 CR 输出越界；均验证不继续提交后续分块、不发布完成轮次。
+独立 DDR 回归覆盖注册配置与源/首 WR 长度保持、目的 allocation 隔离、成功后继续原共享 READ、
+控制 CQ/数据错误时不发布完成且保留资源，以及已停止的 fake DMA 下显式释放资源无泄露。
 源描述符回归使用上述真机返回的 48 B segment 和 32 B Jetty key 作为固定输入，
 验证配置 EID 与资源 EID 不同但 MR/Jetty 身份一致时可通过，CTP 查询仍保留配置 EID；
 同时拒绝真实资源身份不一致、错误 key 长度/RM 模式、越界、地址溢出及全零 EID。

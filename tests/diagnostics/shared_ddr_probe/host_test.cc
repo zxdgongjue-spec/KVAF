@@ -14,6 +14,18 @@ std::uint64_t completed{};
 unsigned post_calls{}, poll_calls{};
 std::vector<unsigned> access_order;
 std::map<urma_target_seg_t*, std::pair<std::uint64_t, std::uint64_t>> ranges;
+probe::State* observed_control_state{};
+bool reject_control_cq{}, skip_control_copy{}, completion_is_control{};
+unsigned control_registrations{}, shared_control_test_reads{};
+urma_context_t* control_registration_context{};
+urma_seg_cfg_t control_registration_config{};
+struct ObservedRead {
+  std::uint64_t source{}, destination{};
+  std::uint32_t bytes{};
+  urma_target_seg_t *source_mr{}, *destination_mr{};
+  std::uint64_t user_ctx{};
+};
+std::vector<ObservedRead> observed_reads;
 void Require(bool ok, const char* text) { if (!ok) throw std::runtime_error(text); }
 
 void CopyHex(const char* hex, std::uint8_t* bytes, std::size_t count) {
@@ -287,6 +299,11 @@ void TestNativeMemoryDiagnostics() {
 extern "C" {
 urma_target_seg_t* urma_register_seg(urma_context_t* ctx, urma_seg_cfg_t* cfg) {
   access_order.push_back(cfg->flag.bs.access);
+  if (observed_control_state) {
+    ++control_registrations;
+    control_registration_context = ctx;
+    control_registration_config = *cfg;
+  }
   // Optional model of br_UMDK_24.12.0_LTS's core permission validation.
   // The plumbing profile deliberately makes no provider capability claims.
   const bool remote_write_or_atomic = cfg->flag.bs.access &
@@ -327,7 +344,25 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t*, urma_jfs_wr_t* wr, urma_jfs
   const auto range = ranges.at(dst.tseg);
   Require(src.len == dst.len && dst.addr >= range.first &&
     dst.addr + dst.len <= range.first + range.second, "READ destination escapes original allocation");
-  std::memcpy(reinterpret_cast<void*>(dst.addr), reinterpret_cast<void*>(src.addr), src.len);
+  completion_is_control = observed_control_state && dst.tseg == observed_control_state->control_mr;
+  if (observed_control_state) {
+    const auto& state = *observed_control_state;
+    Require(state.ready == 0 && state.acknowledged == 0, "control path published a round before shared READ");
+    const auto* shared = reinterpret_cast<const std::uint8_t*>(state.region->va);
+    if (!shared_control_test_reads)
+      Require(std::all_of(shared, shared + state.region->bytes,
+        [](std::uint8_t byte) { return byte == 0xa5; }), "control READ touched shared DDR");
+    if (completion_is_control) {
+      Require(!state.control_verified, "independent control ran after it was verified");
+    } else {
+      Require(dst.tseg == state.region->local && state.control_verified,
+        "shared READ started before independent control verification");
+      ++shared_control_test_reads;
+    }
+    observed_reads.push_back({src.addr, dst.addr, src.len, src.tseg, dst.tseg, wr->user_ctx});
+  }
+  if (!completion_is_control || !skip_control_copy)
+    std::memcpy(reinterpret_cast<void*>(dst.addr), reinterpret_cast<void*>(src.addr), src.len);
   completed = wr->user_ctx; return URMA_SUCCESS;
 }
 int urma_poll_jfc(urma_jfc_t*, int capacity, urma_cr_t* cr) {
@@ -337,9 +372,110 @@ int urma_poll_jfc(urma_jfc_t*, int capacity, urma_cr_t* cr) {
   if (!completed) return 0;
   cr->user_ctx = completed + (wrong_cq_context ? 1 : 0); completed = 0;
   if (reject_poll) { errno = EIO; return -1; }
-  cr->status = error_cq ? URMA_CR_LOC_ACCESS_ERR : URMA_CR_SUCCESS;
+  cr->status = error_cq || (completion_is_control && reject_control_cq) ?
+    URMA_CR_LOC_ACCESS_ERR : URMA_CR_SUCCESS;
   if (spill_cr) ClobberNativeTail(cr);
   return excess_cq_count ? 2 : 1;
+}
+}
+
+namespace {
+void TestIndependentDdrControl() {
+  using namespace probe;
+  allocation_bytes = 3 * kGuard;
+  for (unsigned failure = 0; failure < 3; ++failure) {
+    Require(!live_segments && !live_tokens && registrations.empty(), "control fixture inherited resources");
+    void* target_memory{};
+    Require(posix_memalign(&target_memory, 4096, allocation_bytes) == 0, "allocate shared test DDR");
+    std::unique_ptr<std::uint8_t, decltype(&std::free)> target(
+      static_cast<std::uint8_t*>(target_memory), std::free);
+    std::memset(target.get(), 0xa5, allocation_bytes);
+    std::vector<std::uint8_t> source(allocation_bytes, 0xa5);
+    for (std::uint64_t i = 0; i < kGuard; ++i) source[kGuard+i] = Pattern(i, 1);
+    urma_context_t context{};
+    urma_seg_cfg_t cfg{};
+    cfg.va = reinterpret_cast<std::uint64_t>(target.get());
+    cfg.len = allocation_bytes; cfg.flag.bs.access = 14; cfg.flag.bs.non_pin = 1;
+    cfg.token_value.token = 0x51a7d009;
+    mode = "single-current";
+    auto* remote = Register(&context, &cfg);
+    Require(remote, "register shared control fixture");
+    State state;
+    state.region = &registrations.at(remote);
+    state.peer = reinterpret_cast<urma_target_jetty_t*>(1);
+    state.source = reinterpret_cast<urma_target_seg_t*>(2);
+    state.source_base = reinterpret_cast<std::uint64_t>(source.data());
+    state.max_bytes = 997;
+    state.independent_ddr_control = true;
+    observed_reads.clear();
+    control_registrations = shared_control_test_reads = 0;
+    reject_control_cq = failure == 1;
+    skip_control_copy = failure == 2;
+    observed_control_state = &state;
+    bool rejected = false;
+    try { state.Read(1); }
+    catch (const std::runtime_error& error) {
+      rejected = true;
+      if (failure == 1)
+        Require(std::strstr(error.what(), "READ CQ returned error status"), "wrong control CQ failure");
+      if (failure == 2)
+        Require(std::strstr(error.what(), "independent DDR data/guard validation failed"),
+          "wrong control data failure");
+    }
+    Require(rejected == (failure != 0), "wrong independent control result");
+    Require(state.control_memory && state.control_mr && state.control_token,
+      "independent control resources were not retained");
+    Require(control_registrations == 1 && control_registration_context == &context &&
+      control_registration_config.va == reinterpret_cast<std::uint64_t>(state.control_memory) &&
+      control_registration_config.len == cfg.len && control_registration_config.va != cfg.va &&
+      control_registration_config.va % 4096 == 0 && control_registration_config.flag.bs.access == 1 &&
+      control_registration_config.flag.bs.non_pin == 0 &&
+      control_registration_config.flag.bs.token_policy == URMA_TOKEN_PLAIN_TEXT &&
+      control_registration_config.flag.bs.token_id_valid == 1 &&
+      control_registration_config.token_id == state.control_token &&
+      control_registration_config.token_value.token == cfg.token_value.token,
+      "wrong independent DDR registration or allocation");
+    Require(observed_reads.size() >= 1 && observed_reads[0].source == state.source_base + kGuard &&
+      observed_reads[0].bytes == state.max_bytes &&
+      observed_reads[0].destination == reinterpret_cast<std::uint64_t>(state.control_memory) + kGuard &&
+      observed_reads[0].source_mr == state.source &&
+      observed_reads[0].destination_mr == state.control_mr, "wrong independent control READ");
+    if (!failure) {
+      Require(state.control_verified && state.ready == 1 && state.acknowledged == 0 &&
+        shared_control_test_reads != 0 && observed_reads.size() > 1,
+        "control success replaced shared READ or acknowledged it early");
+      Require(observed_reads[1].source == observed_reads[0].source &&
+        observed_reads[1].bytes == observed_reads[0].bytes &&
+        observed_reads[1].source_mr == observed_reads[0].source_mr &&
+        observed_reads[1].user_ctx == observed_reads[0].user_ctx + 1 &&
+        observed_reads[1].destination != observed_reads[0].destination &&
+        observed_reads[1].destination_mr == state.region->local,
+        "control and shared first READs differ beyond their destination");
+      Require(std::equal(source.begin()+kGuard, source.end()-kGuard, target.get()+kGuard),
+        "shared READ did not follow successful control");
+      const auto* control = static_cast<const std::uint8_t*>(state.control_memory);
+      for (std::uint64_t i = 0; i < allocation_bytes; ++i)
+        Require(control[i] == (i >= kGuard && i < kGuard + state.max_bytes ? Pattern(i-kGuard, 1) : 0xa5),
+          "independent control wrote outside its first payload chunk");
+    } else {
+      Require(!state.control_verified && state.ready == 0 && state.acknowledged == 0 &&
+        shared_control_test_reads == 0 && observed_reads.size() == 1,
+        "failed control submitted shared READs or published completion");
+      Require(std::all_of(target.get(), target.get() + allocation_bytes,
+        [](std::uint8_t byte) { return byte == 0xa5; }), "failed control modified shared DDR");
+    }
+    Require(live_segments == 2 && live_tokens == 1, "control MR/token released before CLOSE");
+    observed_control_state = nullptr;
+    reject_control_cq = skip_control_copy = completion_is_control = false;
+    // The synchronous fake has no pending DMA after these assertions. Explicit
+    // test cleanup is safe; the real failure path must retain these resources.
+    state.ReleaseIndependentDdr();
+    Require(!state.control_memory && !state.control_mr && !state.control_token &&
+      live_segments == 1 && live_tokens == 0, "independent control release leaked resources");
+    Unregister(remote);
+    Require(!live_segments && !live_tokens && registrations.empty(), "control fixture leaked resources");
+  }
+  std::cerr << "INDEPENDENT_DDR_CONTROL_TEST_PASS separate_target=1 failure_retains=1 shared_validation_required=1\n";
 }
 }
 
@@ -351,6 +487,7 @@ int main() {
     TestPullCtpQuery();
     TestReadChunkBytes();
     TestNativeMemoryDiagnostics();
+    TestIndependentDdrControl();
     allocation_bytes = 3 * kGuard;
     std::vector<std::uint8_t> target(allocation_bytes), source(allocation_bytes);
     urma_context_t ctx{};
