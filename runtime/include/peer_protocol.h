@@ -24,6 +24,9 @@ enum class Command : uint16_t {
   kReleaseRegion = 3U,
   kGetCandidateCount = 4U,
   kGetCandidateInfo = 5U,
+  kAllocateUbmemRegion = 6U,
+  kCheckUbmemRange = 7U,
+  kFillUbmemRange = 8U,
 };
 
 enum class Result : int32_t {
@@ -116,12 +119,43 @@ struct ReleaseRegionRequest {
   uint64_t session_id;
 };
 
+// Additive test command; existing URMA v6 records and entry points stay usable.
+struct AllocateUbmemRegionRequest {
+  MessageHeader header;
+  uint64_t ddr_bytes;
+  uint64_t slot_size;
+};
+
+struct AllocateUbmemRegionResponse {
+  MessageHeader header;
+  int32_t result;
+  uint64_t session_id;
+  uint64_t peer_base;
+  uint64_t peer_length;
+  uint64_t mapping_bytes;
+  uint8_t fabric_handle[128];
+  char error_message[256];
+};
+
+// Test oracle: CPU checks/fills its own DDR without sending KV payload over TCP.
+struct UbmemRangeRequest {
+  MessageHeader header;
+  uint64_t session_id;
+  uint64_t offset;
+  uint64_t length;
+  uint32_t seed;
+};
+
 struct StatusResponse {
   MessageHeader header;
   int32_t result;
   uint32_t reserved;
 };
 #pragma pack(pop)
+
+static_assert(sizeof(AllocateUbmemRegionRequest) == 28U, "UBmem allocation ABI changed");
+static_assert(sizeof(AllocateUbmemRegionResponse) == 432U, "UBmem descriptor ABI changed");
+static_assert(sizeof(UbmemRangeRequest) == 40U, "UBmem oracle ABI changed");
 
 static_assert(sizeof(MessageHeader) == 12U, "wire header ABI changed");
 static_assert(sizeof(AllocateRegionRequest) == 36U, "allocate request ABI changed");

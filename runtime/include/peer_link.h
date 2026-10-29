@@ -20,6 +20,8 @@ struct PeerRegion {
   uint32_t segment_key_bytes = 0U;
   std::array<uint8_t, kEidBytes> eid{};
   std::array<uint8_t, kSegKeyBytes> segment_key{};
+  std::array<uint8_t, 128> fabric_handle{};
+  uint64_t fabric_mapping_bytes{};
 };
 
 struct PeerCandidateInfo {
@@ -43,6 +45,11 @@ class PeerLink {
   Status GetCandidateInfo(uint32_t candidate_id, PeerCandidateInfo* info) const;
   Status AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
                         uint32_t candidate_id, PeerRegion* region);
+  Status AllocateUbmemRegion(uint64_t ddr_bytes, uint64_t slot_size, PeerRegion* region);
+  Status UbmemRange(uint64_t base, uint64_t offset, uint64_t length,
+                    uint32_t seed, bool fill) const;
+  Status RetainUbmemMapping(uint64_t base);
+  void ReleaseUbmemMapping(uint64_t base);
   Status ReleaseRegion(uint64_t base);
   Status LookupRegion(uint64_t base, PeerRegion* region) const;
   Status CreateChannel(
@@ -56,6 +63,7 @@ class PeerLink {
  private:
   std::string address_;
   std::unordered_map<uint64_t, PeerRegion> regions_;
+  std::unordered_map<uint64_t, std::size_t> ubmem_mappings_;
 };
 
 }  // namespace kvaf::peer

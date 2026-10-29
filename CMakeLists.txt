@@ -11,6 +11,12 @@ option(KVAF_ENABLE_AIV_BATCH_PUT
 option(KVAF_BUILD_REMOTE_CPU_SERVICE
        "Build the liburma-only persistent CPU DDR/Jetty service"
        OFF)
+option(KVAF_BUILD_UBMEM_TEST "Build the HAL/Fabric UBmem CPU service and tests" OFF)
+option(KVAF_BUILD_UBMEM_NPU_TEST "Build the Ascend950 UBmem BatchGet/BatchPut runner" OFF)
+
+if(KVAF_BUILD_UBMEM_NPU_TEST)
+  set(KVAF_BUILD_UBMEM_TEST ON)
+endif()
 
 if(KVAF_ENABLE_AIV_BATCH_PUT AND NOT KVAF_ENABLE_AIV_BATCH_GET)
   message(FATAL_ERROR
@@ -23,7 +29,7 @@ endif()
 # (notably Status, requests and metadata vectors) has the same object layout.
 # Applying it only to the binding and hardware operator lets Runtime construct
 # ABI-1 objects that an ABI-0 callee later destroys, which corrupts the heap.
-if(KVAF_ENABLE_AIV_BATCH_GET)
+if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_BUILD_UBMEM_NPU_TEST)
   add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=0)
   message(STATUS "KVAF AIV C++ ABI: _GLIBCXX_USE_CXX11_ABI=0 (all targets)")
 endif()
@@ -39,6 +45,10 @@ add_subdirectory(common)
 add_subdirectory(meta_manager)
 add_subdirectory(access_operator)
 add_subdirectory(runtime)
+
+if(KVAF_BUILD_UBMEM_TEST)
+  add_subdirectory(access_operator/src/ubmem)
+endif()
 
 if(KVAF_BUILD_PYTHON)
   find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)

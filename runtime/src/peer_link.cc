@@ -302,6 +302,7 @@ Status PeerLink::AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
 }
 
 Status PeerLink::ReleaseRegion(uint64_t base) {
+  if (ubmem_mappings_.count(base)) return Status::Busy("UBmem Device VA must be unmapped before releasing CPU DDR");
   const auto found = regions_.find(base);
   if (found == regions_.end()) return Status::NotFound("peer region was not found");
   std::string error;
@@ -309,6 +310,82 @@ Status PeerLink::ReleaseRegion(uint64_t base) {
     return ToStatus("peer DDR release failed", std::move(error));
   }
   regions_.erase(found);
+  return Status::OK();
+}
+
+Status PeerLink::RetainUbmemMapping(uint64_t base) {
+  const auto found = regions_.find(base);
+  if (found == regions_.end() || found->second.fabric_mapping_bytes == 0) {
+    return Status::NotFound("UBmem mapping has no allocated Fabric region");
+  }
+  ++ubmem_mappings_[base];
+  return Status::OK();
+}
+
+void PeerLink::ReleaseUbmemMapping(uint64_t base) {
+  auto found = ubmem_mappings_.find(base);
+  if (found != ubmem_mappings_.end() && --found->second == 0) ubmem_mappings_.erase(found);
+}
+
+Status PeerLink::AllocateUbmemRegion(uint64_t bytes, uint64_t slot_size, PeerRegion* region) {
+  if (region == nullptr || bytes == 0 || slot_size == 0 || bytes % slot_size != 0) {
+    return Status::InvalidArgument("invalid UBmem region request");
+  }
+  AllocateUbmemRegionRequest request{};
+  request.header = MakeHeader(Command::kAllocateUbmemRegion, sizeof(request));
+  request.ddr_bytes = bytes;
+  request.slot_size = slot_size;
+  AllocateUbmemRegionResponse response{};
+  std::string error;
+  if (!Exchange(address_, request, &response, &error)) {
+    return ToStatus("UBmem allocation exchange failed", std::move(error));
+  }
+  if (!IsValidResponseHeader(response.header, Command::kAllocateUbmemRegion, sizeof(response))) {
+    return Status::Internal("peer returned an invalid UBmem response");
+  }
+  if (response.result != static_cast<int32_t>(Result::kOk)) {
+    response.error_message[sizeof(response.error_message) - 1] = '\0';
+    return Status::Internal(std::string("CPU UBmem allocation failed: ") + response.error_message);
+  }
+  if (response.session_id == 0 || response.peer_base == 0 || response.peer_length != bytes ||
+      response.peer_base > UINT64_MAX - bytes || response.mapping_bytes < bytes ||
+      response.mapping_bytes % (2ULL * 1024 * 1024) != 0) {
+    return Status::Internal("peer returned an invalid UBmem region");
+  }
+  PeerRegion allocated{};
+  allocated.session_id = response.session_id;
+  allocated.base = response.peer_base;
+  allocated.length = response.peer_length;
+  allocated.fabric_mapping_bytes = response.mapping_bytes;
+  std::memcpy(allocated.fabric_handle.data(), response.fabric_handle, sizeof(response.fabric_handle));
+  regions_[allocated.base] = allocated;
+  *region = allocated;
+  return Status::OK();
+}
+
+Status PeerLink::UbmemRange(uint64_t base, uint64_t offset, uint64_t length,
+                           uint32_t seed, bool fill) const {
+  const auto found = regions_.find(base);
+  if (found == regions_.end()) return Status::NotFound("UBmem region was not found");
+  if (length == 0 || offset > found->second.length || length > found->second.length - offset) {
+    return Status::InvalidArgument("UBmem test range is outside DDR");
+  }
+  UbmemRangeRequest request{};
+  const Command command = fill ? Command::kFillUbmemRange : Command::kCheckUbmemRange;
+  request.header = MakeHeader(command, sizeof(request));
+  request.session_id = found->second.session_id;
+  request.offset = offset;
+  request.length = length;
+  request.seed = seed;
+  StatusResponse response{};
+  std::string error;
+  if (!Exchange(address_, request, &response, &error)) {
+    return ToStatus("UBmem CPU oracle exchange failed", std::move(error));
+  }
+  if (!IsValidResponseHeader(response.header, command, sizeof(response)) ||
+      response.result != static_cast<int32_t>(Result::kOk)) {
+    return Status::Internal(fill ? "CPU UBmem fill failed" : "CPU UBmem content mismatch");
+  }
   return Status::OK();
 }
 

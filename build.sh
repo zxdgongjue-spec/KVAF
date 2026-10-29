@@ -14,12 +14,14 @@ die() {
 
 usage() {
   cat <<'EOF'
-Usage: ./build.sh <cpu|npu> [--build-dir DIR] [--jobs N]
+Usage: ./build.sh <cpu|npu|ubmem-cpu|ubmem-npu> [--build-dir DIR] [--jobs N]
 
 cpu  Builds the liburma-only CPU Runtime service. If liburma is not installed,
      it clones and builds the pinned UMDK source beside this repository.
 npu  Builds the CANN AIV BatchGet/BatchPut Runtime and Python binding. It
      installs pybind11 for the selected Python interpreter when necessary.
+ubmem-cpu  Builds the experimental HAL/Fabric CPU service, without UMDK/OBMM.
+ubmem-npu  Builds the Ascend950 UBmem kernel and KVAF BatchGet/BatchPut test.
 
 Environment overrides:
   KVAF_UMDK_ROOT       UMDK source/header root for the CPU build
@@ -172,7 +174,7 @@ build_npu() {
 
 mode="${1:-}"
 case "$mode" in
-  cpu|npu) shift ;;
+  cpu|npu|ubmem-cpu|ubmem-npu) shift ;;
   -h|--help|help) usage; exit 0 ;;
   *) usage >&2; exit 2 ;;
 esac
@@ -196,7 +198,18 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || die "KVAF_BUILD_JOBS must be a positive integer"
-if [[ "$mode" == cpu ]]; then
+if [[ "$mode" == ubmem-cpu || "$mode" == ubmem-npu ]]; then
+  require_command cmake
+  ubmem_options=(-DKVAF_BUILD_UBMEM_TEST=ON -DBUILD_TESTING=ON)
+  if [[ "$mode" == ubmem-npu ]]; then
+    cann_root="$(find_cann_root)"
+    [[ -n "$cann_root" ]] || die "CANN toolkit not found; set ASCEND_CANN_PACKAGE_PATH"
+    ubmem_options+=(-DKVAF_BUILD_UBMEM_NPU_TEST=ON "-DASCEND_CANN_PACKAGE_PATH=$cann_root")
+  fi
+  cmake -S "$KVAF_ROOT" -B "$build_dir" "${ubmem_options[@]}"
+  cmake --build "$build_dir" --parallel "$jobs"
+  echo "[KVAF_BUILD] UBmem test artifacts: $build_dir/bin"
+elif [[ "$mode" == cpu ]]; then
   build_cpu "$build_dir" "$jobs"
 else
   build_npu "$build_dir" "$jobs"
