@@ -285,6 +285,44 @@ payload 的 UB→GM。首个 staging 源地址按参数计算为
 跑完整 scatter 回归。若 `load` 仍失败，应保留新 `.o` 和此次异常摘要，并核对
 部署端 CANN 版本、实际头文件和新二进制的故障指令；不能继续沿用旧 `+0xd28`。
 
+### 初始化修正后，异常前移到标量指令
+
+PID 8769、卡 7 的后续日志仍是 `load`（参数末字高 32 位为 3），但异常变为
+`errcode=259`、`SU_ERROR_T0_0=0x8`、`MTE_ERROR_T0_0=0`，修正偏移为
+`+0x148`，kernel hash 为 `2185961939610012134`。这表明初始化修正没有完成
+硬件验收；不能将保留的 `MTE_ERR_INFO=0x34a` 当成当前仍有 MTE 异常的证据。
+偏移靠近入口，优先核对新增 `InitSocState()` 及其编译结果，但在看到匹配的
+汇编前不能把 `+0x148` 直接对应到某个 C++ 调用，更不能判断原 MTE 问题已解决。
+
+这一轮先保留 kernel 逻辑，采集部署端实际编译环境。不要为采集先重编译或
+覆盖故障 `.o`；更新脚本后，在原有 Unix Makefiles 构建目录运行：
+
+```bash
+git pull --ff-only
+python tests/python/collect_aiv_scatter_debug.py build-npu
+```
+
+脚本打印新建的 `build-npu/scatter-debug-*/report.txt` 路径。它不导入
+torch/kvaf，也不运行 NPU kernel；读取 `build.make` 中现有的真实编译命令，
+保留原来的架构、优化和 include 参数，只将编译动作改为 `-E/-dM/-S`，输出
+到独立目录。遇到多个候选命令或不支持的 recipe 会明确拒绝，不猜参数。
+
+采集内容：
+
+- 原部署、链接和临时 `.o` 的副本、SHA-256、时间戳，以及本地源码快照。
+  若设置了 `KVAF_BATCH_GET_KERNEL`，额外保存其实际 sequential 路径；也可用
+  `--kernel /path/to/kernel.o` 明确指定。
+- 实际调用的编译器及其 symlink 解析位置、版本、CMake 选择的头文件路径，
+  可发现的 CANN 版本文件和 `__CCE_AICORE__` / `__NPU_ARCH__` 等宏。
+- 编译器预处理后的完整 `.ii`、实际包含的 common/data-copy 实现头文件、
+  `InitSocState` 实现片段和直接导出的 `sequential.s`。
+- 每一步的命令、输出和退出码。某一步失败会保留其他结果并返回
+  `COLLECTION_PARTIAL`，不会误报采集完成或硬件通过。
+
+先提供 `report.txt`，若入口片段不足再查看同目录的完整 `.s` 和头文件。
+新导出的 `.s` 用于检查 SDK 展开和指令生成，不保证与已保存 `.o` 字节相同；
+汇编行号不等于设备故障 PC，精确 `+0x148` 映射仍须对应原二进制。
+
 ## 当前验证状态
 
 本地无 CANN/NPU，已完成：
