@@ -79,6 +79,20 @@ set_tests_properties(kvaf_aiv_sequential_hardware_python PROPERTIES
 # Compile hardware Host sources even on development machines without CANN.
 # Object-only: never link the declaration doubles into the production libraries.
 if(NOT KVAF_ENABLE_AIV_BATCH_GET)
+  add_test(NAME kvaf_aiv_kernel_build_python
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_aiv_kernel_build.py"
+            "${CMAKE_COMMAND}")
+  add_executable(kvaf_sequential_loader_test sequential_batch_get_loader_test.cc
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/execute_batch_get_loader.cpp
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/execute_sequential_batch_get_loader.cpp)
+  target_include_directories(kvaf_sequential_loader_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/fake_acl
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include
+    ${PROJECT_SOURCE_DIR}/access_operator/include
+    ${PROJECT_SOURCE_DIR}/common/include)
+  foreach(scenario compat explicit custom relative missing)
+    add_test(NAME kvaf_sequential_loader_${scenario} COMMAND kvaf_sequential_loader_test ${scenario})
+  endforeach()
   add_executable(kvaf_sequential_host_test sequential_batch_get_host_test.cc
     ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/sequential_batch_get.cpp)
   target_include_directories(kvaf_sequential_host_test PRIVATE

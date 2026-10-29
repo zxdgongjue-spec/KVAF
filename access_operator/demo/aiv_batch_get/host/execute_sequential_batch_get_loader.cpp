@@ -5,6 +5,7 @@
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "acl/acl.h"
@@ -19,6 +20,17 @@ bool g_loaded = false;
 aclrtBinHandle g_binary = nullptr;
 aclrtFuncHandle g_function = nullptr;
 std::vector<char> g_binary_bytes;
+
+std::string SequentialBinaryPath(const char* configured) {
+  std::string path(configured);
+  const auto separator = path.find_last_of("/\\");
+  const auto filename = separator == std::string::npos ? 0 : separator + 1;
+  // CMake installs the sequential binary next to the standard direct-read
+  // binary, preserving the existing Runtime configuration for every mode.
+  if (path.compare(filename, std::string::npos, "kvaf_execute_batch_get_kernels.o") == 0)
+    path.replace(filename, std::string::npos, "kvaf_sequential_batch_get_kernels.o");
+  return path;  // Explicit sequential/custom binary paths are used as-is.
+}
 
 bool ReadBinary(const char *path) {
   std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -35,7 +47,13 @@ extern "C" int32_t KvafSequentialBatchGetLoadKernel(const char *kernel_object_pa
   if (kernel_object_path == nullptr || kernel_object_path[0] == '\0') return KVAF_BATCH_GET_INVALID_ARGUMENT;
   std::lock_guard<std::mutex> lock(g_mutex);
   if (g_loaded) return KVAF_BATCH_GET_SUCCESS;
-  if (!ReadBinary(kernel_object_path)) return KVAF_BATCH_GET_RUNTIME_ERROR;
+  const auto path = SequentialBinaryPath(kernel_object_path);
+  if (!ReadBinary(path.c_str())) {
+    std::fprintf(stderr, "[KVAF_AIV] cannot read sequential BatchGet kernel: %s; "
+        "rebuild and deploy kvaf_sequential_batch_get_kernels.o alongside the direct-read binary\n",
+        path.c_str());
+    return KVAF_BATCH_GET_RUNTIME_ERROR;
+  }
   aclrtBinary binary = aclrtCreateBinary(g_binary_bytes.data(), g_binary_bytes.size());
   if (binary == nullptr) return KVAF_BATCH_GET_RUNTIME_ERROR;
   const aclError load = aclrtBinaryLoad(binary, &g_binary);

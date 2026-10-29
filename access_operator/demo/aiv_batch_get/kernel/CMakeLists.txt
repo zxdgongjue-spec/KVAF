@@ -1,6 +1,3 @@
-set(KVAF_EXECUTE_KERNEL_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/execute_batch_get_aiv.asc")
-set(KVAF_EXECUTE_KERNEL_TMP "${CMAKE_CURRENT_BINARY_DIR}/kvaf_execute_batch_get.tmp.o")
-set(KVAF_EXECUTE_KERNEL_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/kvaf_execute_batch_get_kernels.o")
 set(KVAF_CCEC_DIR "${ASCEND_CANN_PACKAGE_PATH}/tools/ccec_compiler/bin")
 
 find_program(KVAF_CCEC NAMES ccec HINTS "${KVAF_CCEC_DIR}")
@@ -56,29 +53,33 @@ set(KVAF_KERNEL_INCLUDES
   "-I${ASCEND_CANN_PACKAGE_PATH}/tikcpp/tikcfw/impl"
   "-I${KVAF_AIV_DEMO_INCLUDE_DIR}")
 
-add_custom_command(
-  OUTPUT "${KVAF_EXECUTE_KERNEL_OBJECT}"
-  COMMAND "${KVAF_CCEC}" -c -x cce -O2 "${KVAF_EXECUTE_KERNEL_SOURCE}" -o "${KVAF_EXECUTE_KERNEL_TMP}"
-          --cce-aicore-arch=dav-c310-vec --cce-aicore-input-parameter-size=8192 --cce-aicore-only
-          -mllvm -cce-aicore-function-stack-size=0x4000 -mllvm -cce-aicore-stack-size=0x4000
-          -mllvm -cce-aicore-record-overflow=false -mllvm -cce-aicore-addr-transform
-          -mllvm -cce-aicore-jump-expand=true -std=c++17 -fstack-protector-all ${KVAF_KERNEL_INCLUDES}
-  COMMAND "${KVAF_CCEC}" -c -x cce -O2 "${CMAKE_CURRENT_SOURCE_DIR}/execute_sequential_batch_get_aiv.asc" -o "${CMAKE_CURRENT_BINARY_DIR}/kvaf_sequential_batch_get.tmp.o"
-          --cce-aicore-arch=dav-c310-vec --cce-aicore-input-parameter-size=8192 --cce-aicore-only
-          -mllvm -cce-aicore-function-stack-size=0x4000 -mllvm -cce-aicore-stack-size=0x4000
-          -mllvm -cce-aicore-record-overflow=false -mllvm -cce-aicore-addr-transform
-          -mllvm -cce-aicore-jump-expand=true -std=c++17 -fstack-protector-all ${KVAF_KERNEL_INCLUDES}
-  COMMAND "${KVAF_LLD}" -m aicorelinux -Ttext=0 "${KVAF_EXECUTE_KERNEL_TMP}" "${CMAKE_CURRENT_BINARY_DIR}/kvaf_sequential_batch_get.tmp.o" -static
-          -o "${KVAF_EXECUTE_KERNEL_OBJECT}"
-  DEPENDS "${KVAF_EXECUTE_KERNEL_SOURCE}"
-          "${CMAKE_CURRENT_SOURCE_DIR}/execute_sequential_batch_get_aiv.asc"
-          "${KVAF_AIV_DEMO_INCLUDE_DIR}/sequential_batch_get_abi.h"
-          "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_abi.h"
-          "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_schedule.h"
-          "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"
-  VERBATIM)
-add_custom_target(kvaf_execute_batch_get_kernel ALL DEPENDS "${KVAF_EXECUTE_KERNEL_OBJECT}")
-add_custom_command(TARGET kvaf_execute_batch_get_kernel POST_BUILD
-  COMMAND "${CMAKE_COMMAND}" -E make_directory "${KVAF_AIV_DEMO_BIN_DIR}"
-  COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${KVAF_EXECUTE_KERNEL_OBJECT}"
-          "${KVAF_AIV_DEMO_BIN_DIR}/kvaf_execute_batch_get_kernels.o")
+# AscendC emits SDK globals (including g_tilingKey) in each translation unit.
+# Link each kernel separately; combining the two objects gives duplicate symbols.
+function(kvaf_compile_batch_get_kernel stem source)
+  set(object "${CMAKE_CURRENT_BINARY_DIR}/${stem}_kernels.o")
+  set(temporary "${CMAKE_CURRENT_BINARY_DIR}/${stem}.tmp.o")
+  set(installed "${KVAF_AIV_DEMO_BIN_DIR}/${stem}_kernels.o")
+  add_custom_command(
+    OUTPUT "${object}" "${installed}"
+    COMMAND "${KVAF_CCEC}" -c -x cce -O2 "${CMAKE_CURRENT_SOURCE_DIR}/${source}" -o "${temporary}"
+            --cce-aicore-arch=dav-c310-vec --cce-aicore-input-parameter-size=8192 --cce-aicore-only
+            -mllvm -cce-aicore-function-stack-size=0x4000 -mllvm -cce-aicore-stack-size=0x4000
+            -mllvm -cce-aicore-record-overflow=false -mllvm -cce-aicore-addr-transform
+            -mllvm -cce-aicore-jump-expand=true -std=c++17 -fstack-protector-all ${KVAF_KERNEL_INCLUDES}
+    COMMAND "${KVAF_LLD}" -m aicorelinux -Ttext=0 "${temporary}" -static -o "${object}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${KVAF_AIV_DEMO_BIN_DIR}"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${object}" "${installed}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${source}"
+            "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_abi.h"
+            "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"
+            ${ARGN}
+    VERBATIM)
+  set(KVAF_BATCH_GET_KERNEL_OUTPUTS ${KVAF_BATCH_GET_KERNEL_OUTPUTS}
+      "${object}" "${installed}" PARENT_SCOPE)
+endfunction()
+
+kvaf_compile_batch_get_kernel(kvaf_execute_batch_get execute_batch_get_aiv.asc
+  "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_schedule.h")
+kvaf_compile_batch_get_kernel(kvaf_sequential_batch_get execute_sequential_batch_get_aiv.asc
+  "${KVAF_AIV_DEMO_INCLUDE_DIR}/sequential_batch_get_abi.h")
+add_custom_target(kvaf_execute_batch_get_kernel ALL DEPENDS ${KVAF_BATCH_GET_KERNEL_OUTPUTS})

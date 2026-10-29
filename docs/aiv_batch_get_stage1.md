@@ -39,6 +39,13 @@ Gather 的控制与数据队列分开，每核固定两条 Jetty。可配置 1�
 两端需一起重编译。初始化通过新增控制命令的响应确认能力；不支持的 CPU
 服务会初始化失败。Host 和 AIV object 也必须来自同一版本。
 
+构建产出两个独立二进制：`kvaf_execute_batch_get_kernels.o`（direct_read）和
+`kvaf_sequential_batch_get_kernels.o`（scatter/gather），均复制到 `build-npu/bin/`。
+AscendC 会在每个编译单元中生成 `g_tilingKey` 等全局符号，因此不合并两个
+临时 object。顺序模式收到标准 `kvaf_execute_batch_get_kernels.o` 路径时，
+自动加载同目录下的 `kvaf_sequential_batch_get_kernels.o`；也可直接传入顺序
+二进制路径。部署时需要一起复制两个文件。
+
 ## 使用约束
 
 ```python

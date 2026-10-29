@@ -165,6 +165,7 @@ export ASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/ascend-toolkit/latest
 ```text
 build-npu/python/kvaf/
 build-npu/bin/kvaf_execute_batch_get_kernels.o
+build-npu/bin/kvaf_sequential_batch_get_kernels.o
 build-npu/bin/kvaf_execute_batch_put_kernels.o
 ```
 
