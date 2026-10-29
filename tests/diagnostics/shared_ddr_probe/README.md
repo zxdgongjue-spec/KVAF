@@ -286,6 +286,30 @@ grep -Ei 'URMA_LOG_TAG|UDMA_LOG_TAG|urma|udma|ummu' \
 不能将 journal 或 dmesg 为空解释为 provider 没有错误。
 部署 UDMA/UB 聚合插件可能有独立 logger，该开关不能保证覆盖全部插件。
 
+若已确认 UDMA 库包含 `UDMA_LOG_LEVEL` / `UDMA_LOG_TAG`，但系统 journal 和 rsyslog 文件均不可用，
+可用本目录的可选 syslog 捕获库。它仅在指定 K 进程内将 libc 的 `syslog/vsyslog` 及 glibc
+加固入口重定向到 stderr；不依赖日志服务，也不修改 READ、MR 或系统日志配置。
+日志过滤若发生在 provider 内，仍需其自己的 debug 开关；直接写文件/其他进程的日志不在捕获范围内。
+
+```bash
+cmake -S tests/diagnostics/shared_ddr_probe -B build-ddr-probe-cpu \
+  -DPROBE_EXTENDED_SGE=ON
+cmake --build build-ddr-probe-cpu --target kvaf_ddr_probe kvaf_probe_syslog -j8
+
+env LD_PRELOAD="$PWD/build-ddr-probe-cpu/libkvaf_probe_syslog.so${LD_PRELOAD:+:$LD_PRELOAD}" \
+  URMA_LOG_LEVEL=debug UDMA_LOG_LEVEL=debug \
+  build-ddr-probe-cpu/kvaf_ddr_probe \
+  dual udmac0d1e2 0 2695168 0.0.0.0 29990 29991 default \
+  --read-chunk-bytes 4096 --independent-ddr-control \
+  2>&1 | tee dual.provider.k.log
+```
+
+使用全新三端进程。K 首先应出现 `PROBE_SYSLOG_CAPTURE_READY`，捕获的调用带 `PROBE_SYSLOG` 前缀。
+READY 只证明库已加载，不能保证 provider 一定使用这些入口；请保留完整日志及首个 CQ 错误附近的记录。
+捕获库保留调用者 errno，单条记录限 4096 B，超长尾部标记 `[truncated]`。
+`test_syslog_capture.py` 在 Linux 验证 LD_PRELOAD 和 glibc `%m`，在 macOS 仅直接链接检查四个入口、
+errno 保留及截断行为；本地检查不能替代目标 Linux 上的动态加载验证。
+
 ### 失败定位与资源保留
 
 READ 提交前进行 MR 对照，首块打印以下记录（权限、VA、context 均按编译头布局解读）：

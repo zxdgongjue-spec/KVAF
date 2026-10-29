@@ -17,6 +17,7 @@ include_directories("${UMDK_INCLUDE_DIR}" "${KVAF_SOURCE_DIR}/common/include"
   "${KVAF_SOURCE_DIR}/runtime/include" "${KVAF_SOURCE_DIR}/access_operator/include"
   "${KVAF_SOURCE_DIR}/meta_manager/include")
 if(PROBE_ROLE STREQUAL "cpu")
+  add_library(kvaf_probe_syslog SHARED syslog_capture.cc)
   find_library(PROBE_URMA NAMES urma REQUIRED)
   set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
   set(KVAF_BUILD_REMOTE_CPU_SERVICE OFF CACHE BOOL "" FORCE)
