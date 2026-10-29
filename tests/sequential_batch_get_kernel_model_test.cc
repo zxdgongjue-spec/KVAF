@@ -226,6 +226,34 @@ void Poll(void* p) { fixture->Poll(p); }
 void Doorbell(uint32_t value, uint32_t* p) { fixture->Doorbell(value, p); }
 }
 int main() {
+  {
+    // Isolate the real payload helper from URMA: all GM alignment residues,
+    // nonaligned byte counts, UB chunk boundaries, and repeated staging writes.
+    Fixture f(1, 656, 1, KVAF_SEQ_SCATTER, 1);
+    for (uint32_t bytes : {1U, 13U, 31U, 32U, 33U, 63U, 64U, 65U, 656U,
+                           16383U, 16384U, 16385U, 32769U, 65535U}) {
+      std::vector<uint8_t> source(bytes + 128), output(bytes + 128), expected;
+      for (uint32_t offset = 0; offset < 64; ++offset) {
+        const auto destination_offset = (offset * 17 + 3) % 64;
+        for (uint32_t epoch = 0; epoch < 2; ++epoch) {
+          for (uint32_t i = 0; i < source.size(); ++i)
+            source[i] = (i * 13 + offset * 7 + epoch * 31) % 251;
+          std::fill(output.begin(), output.end(), 0xad);
+          std::memset(aiv_model::ub, 0xe9, sizeof(aiv_model::ub));
+          expected = output;
+          std::copy_n(source.data() + offset, bytes, expected.data() + destination_offset);
+          CopyPayload(Address(source.data() + offset), Address(output.data() + destination_offset), bytes);
+          assert(output == expected);
+          assert(!aiv_model::mte2.destination && !aiv_model::mte3.destination);
+          assert(std::all_of(aiv_model::ub + kCopyBytes, aiv_model::ub + sizeof(aiv_model::ub),
+                             [](uint8_t byte) { return byte == 0xe9; }));
+          for (const auto& pipeline : model_events)
+            for (const auto& direction : pipeline)
+              for (bool pending : direction) assert(!pending);
+        }
+      }
+    }
+  }
   for (auto mode : {KVAF_SEQ_SCATTER, KVAF_SEQ_GATHER})
     for (uint32_t workers : {1U, 3U, 8U})
       for (uint32_t bytes : {1U, 13U, 656U, 4096U, 65535U}) {

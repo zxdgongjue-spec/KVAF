@@ -16,6 +16,15 @@ Gather 的 `pipeline_chunk_bytes=0`，不把 CPU 的 `~sequence` started ACK 当
 多核 gather 每个核拥有独立 lane，各 lane 按上述依赖顺序执行。
 AIV 不调用 UMDK；scatter 使用注册 HBM mailbox，gather 使用手写 USER_CTL WQE。
 
+Scatter 的本地 payload 搬运使用 `DataCopyPad<uint8_t>`，通过一个 16 KiB UB
+缓冲顺序执行 MTE2（GM→UB）和 MTE3（UB→GM）。MTE2 完成后才写出，MTE3
+完成后才复用缓冲并报告完成；长度按字节给出，UB padding 不写到 output。
+源 GlobalTensor 禁用 L2 cache hint，且不再经 SIMT 读取被 CPU WRITE 更新的
+staging。原实现的 MainScalar cache 刷新不能代替 SIMT cache 刷新。
+接口约束见 [GMToUB DataCopyPad](https://asc.gitcode.com/api/SIMD-API/basic_api/memory_vector_compute/data_move/DataCopyPad_GMToUB.html)、
+[UBToGM DataCopyPad](https://asc.gitcode.com/api/SIMD-API/basic_api/memory_vector_compute/data_move/DataCopyPad_UBToGM.html) 和
+[SIMD/SIMT 内存层次](https://asc.gitcode.com/guide/programming_guide/advanced_programming/advanced_ai_core_programming_model/simd_simt_hybrid_programming/memory_hierarchy.html)。
+
 Gather 的控制与数据队列分开，每核固定两条 Jetty。可配置 1～6 个本地 SGE，
 每条 READ 的总长度最多 64 KiB，按 64 B WQEBB 处理变长 WQE 和 SQ 回绕。
 阶段内部批量提交，只在物理 SQ/WR 容量不足或阶段结束时 drain；
@@ -152,6 +161,21 @@ worker 尚未接受非空请求。控制 CQ 错误包含数值 `status`、`expec
 NPU drain 异常包含 `sequence`、`phase=copy_status/synchronize` 和原始 ACL
 错误码。测试脚本会另外打印清理失败，但保留原始执行异常作为最终异常。
 
+`phase=read_notify last_sequence=N`（N 非零）意味着 worker 已完成第 N 批
+payload 和 done 的 CQ 回收，回到下一轮 notify READ；不要把这个后续 READ
+错误直接解释为第 N 批没有收到请求或没有写完 payload。`actual_ctx` 与
+`expected_ctx` 相同但 `status` 非零时，是 CQ 状态失败而非 context 错配。
+当前 UMDK 头文件中 status 9 为 `URMA_CR_ACK_TIMEOUT_ERR`，部署端仍应以
+匹配的头文件/库为准。`acl=507015` 表示 AI Core 执行异常，具体指令和先后
+因果需要结合对应进程的 Ascend 设备异常日志确认。
+
+卡 7、PID 2365 的异常日志进一步报告 `KvafSequentialBatchGetAivKernelV1`、
+`errcode=259`（标量指令异常）、`SU_ERROR_T0_0=0x8`，修正后的偏移为
+`KvafSequentialBatchGetAivKernelV1+0xa18`；该偏移只适用于此次故障的旧二进制。
+需要在重编译前保留旧 `.o` 并用匹配 CANN 的反汇编工具查看该偏移，才能判断
+具体哪条指令违反约束。DataCopyPad 改动修正了 payload 缓存可见性并替换裸搬运
+路径，但在硬件复测/指令核对前，不将它视为已证实的 errcode 259 根因修复。
+
 ## 当前验证状态
 
 本地无 CANN/NPU，已完成：
@@ -162,6 +186,9 @@ NPU drain 异常包含 `sequence`、`phase=copy_status/synchronize` 和原始 AC
 - 生产 `.asc` 的 CPU 模型执行：解码 SQ/CQ，调用真实 CPU gather executor，
   比较全部 output/guard。覆盖 1/3/8 核、1/13/656/4096/65535 B token、
   1～6 SGE、65536 请求、SQ/CQ 回绕、旧序号、非法行、超时及控制/数据 CQ 错误。
+- payload 搬运模型延迟执行 MTE2/MTE3，验证同步后可见及单 UB 复用；覆盖
+  GM 地址的 64 种对齐余数、1～65535 B 尾部和 16 KiB 分块边界、重复源更新、
+  output 与 UB 边界 guard。模型不替代真实 CANN 编译和设备异常检查。
 - 真实 Host owner 的延迟 ACL 模型：串行复用、异步错误上报、capture 拒绝、
   部分初始化和关闭失败时资源保留/重试。Host 集成源码使用 ACL 声明替身编译。
 - 新增内核模型和 Host 生命周期测试通过 AddressSanitizer / UndefinedBehaviorSanitizer。
