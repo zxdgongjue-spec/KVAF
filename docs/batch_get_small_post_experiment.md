@@ -199,6 +199,88 @@ offset 各自以本核开始为零，不能据此宣称硬件完成时刻一致�
 V3 status 为 5376 字节/profile 为 5312 字节，queue state 仍为 64 字节，
 Kernel 参数仍为 112 字节；loader 要求 `KvafExecuteBatchGetAivKernelV3`。
 
+## 扫描 AIV 核数与每核 Jetty 数
+
+128 是每个 post 的 READ 上限，分配规律应结合**每核 READ 数**观察，而不是
+只看整次 `miss_count`。例如 1 核时 128 READ 是候选边界，2 核时对应总数
+256，4 核时对应总数 512。baseline 在单组内按 post 轮转 Jetty；它并不限制
+一个 Jetty 只能处理 128 READ。同一 Jetty 可以承接多个 post。
+
+先固定 token 大小、访问分布、在途预算和设备，扫描总 READ 数 × 核数 ×
+每核 Jetty 数。既比较固定总 READ 数下的最低延迟，也沿着每核 READ 数
+相近的配置观察分配规律；不同核数的结果保留为不同配置，不合并采样。
+
+若要探索 512/1024 的 small-post 分配，实验构建的编译阈值必须覆盖这些值：
+
+```bash
+./build.sh npu --build-dir "$PWD/build-npu-baseline" \
+  --batch-get-small-post-max-requests 0
+./build.sh npu --build-dir "$PWD/build-npu-small-post" \
+  --batch-get-small-post-max-requests 1024
+```
+
+上限 256 的构建也能完成扫描，但大于 256 时实验版本使用 baseline 调度。
+上限 1024 也不保证每种配置都改变分配：1 核、256 READ、2 Jetty 时两者
+都是 128 + 128；4 Jetty 的 small post 则是 64 × 4。单核单组超过 128
+READ 时，拆分可能生效，但不使用一次 SIMT 合并构造，需要分别判断分配
+收益和发射成本。运行表会保留实际上限、post 宽度与合并构造次数。
+
+下面的循环覆盖 1/2/4/8 核和每核 1/2/4/8 Jetty。文件名同时记录核数和
+Jetty 数，避免多核扫描时覆盖结果。串行与 round-robin 模式、不同编译
+上限的实验应使用不同日志目录。
+
+```bash
+export KVAF_CPU_SERVICE_ADDR=127.0.0.1:29991
+export DEVICE_ID=7
+log_dir=logs/small-post-core-jetty-1024-timeline
+mkdir -p "$log_dir"
+
+for round in 1 2 3; do
+  variants=(baseline small-post)
+  cores=(1 2 4 8)
+  jettys=(1 2 4 8)
+  if ((round % 2 == 0)); then
+    variants=(small-post baseline)
+    cores=(8 4 2 1)
+    jettys=(8 4 2 1)
+  fi
+  for n in 128 256 512 1024; do
+    for core in "${cores[@]}"; do
+      for jetty in "${jettys[@]}"; do
+        for variant in "${variants[@]}"; do
+          bash tests/run_remote_cpu_batch_get_perf.sh "$PWD/build-npu-$variant" \
+            --request-length 32768 --table-capacity 16384 \
+            --tokens-per-block 128 --token-bytes 656 \
+            --miss-count "$n" --aiv-cores "$core" --jettys-per-core "$jetty" \
+            --max-inflight-total 2048 \
+            --source-access-pattern random --output-access-pattern contiguous \
+            --no-sort-input-indices --seed 20260903 \
+            --warmup 20 --iterations 1000 --kernel-profile --kernel-profile-jetty-timeline \
+            > "$log_dir/r${round}_n${n}_c${core}_j${jetty}_${variant}.log" 2>&1 || exit 1
+        done
+      done
+    done
+  done
+done
+
+python3 tests/diagnostics/summarize_small_post.py "$log_dir"
+```
+
+这组完整实验有 384 次运行、192 对固定核数/Jetty 数的 A/B 配对，及 384
+条相对同轮同核 baseline 1 Jetty 的比较（包含 baseline 1 Jetty 自身作为
+零收益参照）。它用于初筛，再对表现接近的候选增加独立轮次，补测 32/64
+以及 `128 * aiv_cores` 附近的请求数，例如边界前后一条。对多 Jetty 收益
+同时看 P50、均值、P99 和各轮一致性，不仅看跨轮中位数。
+补测边界时，编译上限也必须覆盖新增请求数；例如 8 核的 1025 READ
+超过了示例上限。还应固定足够大的在途预算，使每核请求仍能容纳于单组，
+避免同时跨越 group 容量边界。示例扫描至 1024 时预算 2048 满足该条件；
+扩展至 1025 可另用上限/预算更大的独立实验，并重跑相应参照点。
+
+round-robin 日志用于解释实际分配与完成观测。选出候选后，用普通串行
+profile 复核，并关闭 profile 确认单次 BatchGet 的 host 端到端延迟。
+当前 CSV 需要 kernel profile，不解析关闭 profile 的日志；其中主要延迟
+与带宽字段是 kernel total 口径，不能直接当作 host 端到端结果。
+
 ## CSV 汇总
 
 已有上述循环生成的日志时，无需重跑测试，只需执行：
@@ -216,12 +298,55 @@ python3 tests/diagnostics/summarize_small_post.py logs/small-post-v3-serial
 | `small_post_pairs.csv` | 同轮、同请求形状的 baseline/small-post 配对结果及提升比例 |
 | `small_post_summary.csv` | 相同完整配置下多轮配对结果的中位数汇总，附实际轮数和轮次列表 |
 | `small_post_jettys.csv` | 每轮、版本、核、Jetty 的实际分配、策略证明和完成观测时间；旧日志仅生成表头 |
+| `small_post_jetty_pairs.csv` | 每轮每种核数/Jetty 数/版本，相对同轮同核 baseline 1 Jetty 的比较 |
+| `small_post_jetty_summary.csv` | 上述 Jetty 比较的多轮中位数、P50 获益轮数、P99 退化轮数和最差轮收益 |
 
-脚本递归查找 `r<轮次>_n<请求数>_baseline.log` 和
-`r<轮次>_n<请求数>_small-post.log`。上述 3 轮、8 个请求数的完整实验应得到
+脚本递归查找日志，兼容三种命名（版本均为 `baseline` 或 `small-post`）：
+
+- `r<轮次>_n<请求数>_<版本>.log`：原有格式。
+- `r<轮次>_n<请求数>_<Jetty数>_<版本>.log`：只扫描 Jetty 数时使用。
+- `r<轮次>_n<请求数>_c<核数>_j<Jetty数>_<版本>.log`：核数 × Jetty 扫描推荐格式。
+
+核数与 Jetty 数仍以日志中的 `BATCH_GET_PERF_CONFIG` 为准；文件名显式
+记录的值必须匹配，否则报错。相同运行的不同文件名不是独立样本，重复
+的 round/shape/variant 仍会报错。
+
+上文固定 2 核 × 2 Jetty 的 3 轮、8 个请求数实验应得到
 48 行运行结果、24 行配对结果；完整配置固定时为 8 行汇总结果。
-每核 Jetty 数、token 大小等不同的实验仍建议放在不同日志目录，避免覆盖
-相同轮次/请求数的文件名。
+核数/Jetty 数可放在同一目录，通过推荐文件名区分。不同 token 大小仍应
+使用独立子目录，避免相同文件名被覆盖。
+
+运行/配对/汇总表新增 `reads_per_core_min/max/mean`（逐核 READ 均值的
+最小值、最大值和平均值）及 `configured_jettys_total`（核数 × 每核配置
+Jetty 数）。例如总数 257、2 核时每核是 128/129 READ，不能只用 128.5
+掩盖边界差异。运行表还包含实际 `small_post_max_requests`、
+`post_width_min/max` 和 `active_jettys_per_call`；最后一项来自每个 Jetty
+的 active samples 合计除以迭代数，旧日志缺失时留空，不用配置数代替。
+
+两个新的 Jetty 比较表统一以同轮、同 token 大小、同总 READ 数、同核数
+的 **baseline 1 Jetty/core** 为参照，`reference_*` 是该参照，
+`candidate_*` 是当前行 `variant` / `jettys_per_core` 的结果。
+因此可以同时比较 baseline 4 Jetty 与 baseline 1 Jetty，以及 small-post
+4 Jetty 与 baseline 1 Jetty。原有 A/B 表继续比较固定核数、固定 Jetty 数
+的两种构建，两类比较回答的问题不同。
+
+除 Jetty 数外，已记录配置必须一致，包括时钟、实际 UB 设备和 profile
+模式，否则在写 CSV 前报错。缺少某轮某核的 baseline 1 Jetty 时，该组
+不生成 Jetty 比较，原有 A/B 表仍正常导出，不借用其他核数或其他轮次。
+控制台 `SMALL_POST_JETTY_REFERENCE` 报告匹配和缺少参照的运行数。
+
+`small_post_jetty_summary.csv` 中：
+
+- `paired_rounds` / `round_ids`：实际配对轮次。
+- `median_p50_latency_reduction_pct`：逐轮相对 baseline 1 Jetty 的延迟收益中位数，正值改善。
+- `p50_win_rounds`：P50 严格改善的轮数。
+- `p99_regression_rounds`：P99 严格退化的轮数；不设置隐含容差。
+- `worst_p50_latency_reduction_pct` / `worst_p99_latency_reduction_pct`：最差一轮的收益，负值表示退化。
+
+对固定 miss_count，先在相同核数下比较 Jetty 数，再比较不同核数的配置。
+缺少的轮次不补零；收益比例先逐轮配对计算再取中位数，不用两个中位数
+相除代替。不同编译 small-post 上限按独立组汇总，不能把两种策略的轮次
+合成同一收益。获益轮数只是描述结果，不自动认定统计显著或生产策略。
 
 各核时间使用日志中的 `*_cycles / clock_mhz` 换算微秒，避免原有三位小数
 毫秒输出的舍入误差。`p50_GBps` 使用十进制 GB/s，公式为
@@ -258,7 +383,7 @@ P99，不能当作合并样本分位数。
 `selected_ub_device` 为空表示日志未记录实际设备；两个空值相同不能证明
 两次运行实际走了同一设备。不同轮次的已记录配置不同时，会分组汇总。
 
-CSV 使用 UTF-8 BOM，便于在 Excel 中打开。重复执行会更新这四个 CSV，
+CSV 使用 UTF-8 BOM，便于在 Excel 中打开。重复执行会更新这六个 CSV，
 原始日志保持不变。
 
 ## 本地检查范围

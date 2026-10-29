@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export existing baseline/small-post A/B logs to run, pair and summary CSVs.
+"""Export baseline/small-post logs and compare core/Jetty sweep configurations.
 
 This script uses only the Python standard library and never starts a benchmark.
 """
@@ -15,8 +15,15 @@ import statistics
 import sys
 
 
-LOG_NAME = re.compile(r"r([1-9][0-9]*)_n(0|[1-9][0-9]*)_(baseline|small-post)\.log")
+LOG_NAME = re.compile(
+    r"r(?P<round>[1-9][0-9]*)_n(?P<count>0|[1-9][0-9]*)_"
+    r"(?:(?:c(?P<cores>[1-9][0-9]*)_j(?P<jettys>[1-9][0-9]*)|"
+    r"(?P<legacy_jettys>[1-9][0-9]*))_)?"
+    r"(?P<variant>baseline|small-post)\.log"
+)
 SHAPE_FIELDS = ("token_bytes", "miss_count", "aiv_cores", "jettys_per_core")
+SHAPE_METRICS = ("reads_per_core_min", "reads_per_core_max", "reads_per_core_mean",
+                 "configured_jettys_total")
 CONFIG_FIELDS = SHAPE_FIELDS + (
     "request_length", "table_capacity", "tokens_per_block", "max_inflight_total",
     "source_access_pattern", "output_access_pattern", "sort_input_indices",
@@ -37,6 +44,8 @@ OPTIONAL_STAGES = {
     "batch_get_kernel_finalize": "finalize_",
 }
 SCHEDULE_METRICS = ("small_post_groups_per_call", "fused_groups_per_call", "wqe_build_calls_per_call")
+PROOF_METRICS = ("small_post_max_requests", "post_width_min", "post_width_max",
+                 "active_jettys_per_call")
 JETTY_METRICS = (
     "active_samples", "reads_per_call", "posts_per_call", "completions_per_call",
     "payload_bytes_per_call", "polls_per_call", "probe_active_us_mean",
@@ -58,7 +67,7 @@ PAIR_METRICS = (
     "first_doorbell_p50_us", "first_doorbell_p99_us",
     "transfer_window_p50_us", "transfer_window_p99_us",
     "setup_p50_us", "finalize_p50_us",
-) + SCHEDULE_METRICS
+) + SCHEDULE_METRICS + PROOF_METRICS
 DELTA_FIELDS = (
     "p50_speedup", "p50_latency_reduction_pct", "p99_latency_reduction_pct",
     "p50_bandwidth_gain_pct", "post_p50_change_us", "completion_wait_p50_change_us",
@@ -69,6 +78,12 @@ PAIR_VALUES = tuple(
     variant + "_" + metric
     for metric in PAIR_METRICS for variant in ("baseline", "small_post")
 ) + DELTA_FIELDS
+JETTY_PAIR_VALUES = tuple(
+    prefix + metric
+    for metric in PAIR_METRICS for prefix in ("reference_", "candidate_")
+) + DELTA_FIELDS
+JETTY_SUMMARY_COUNTS = ("p50_win_rounds", "p99_regression_rounds",
+                        "worst_p50_latency_reduction_pct", "worst_p99_latency_reduction_pct")
 
 
 def fields(line: str) -> dict[str, str]:
@@ -92,7 +107,8 @@ def parse_run(path: Path) -> dict:
 def _parse_run(path: Path) -> dict:
     match = LOG_NAME.fullmatch(path.name)
     if match is None:
-        raise ValueError("expected filename r<round>_n<count>_<baseline|small-post>.log")
+        raise ValueError("expected r<round>_n<count>_[c<cores>_j<jettys>_|<jettys>_]"
+                         "<baseline|small-post>.log")
     lines = path.read_text(encoding="utf-8-sig").splitlines()
     for marker in ("BATCH_GET_PERF_PHASE_DONE phase=batch_get",
                    "BATCH_GET_PERF_PHASE_DONE phase=shutdown"):
@@ -111,8 +127,14 @@ def _parse_run(path: Path) -> dict:
     clock = int(contract["clock_mhz"])
     if clock <= 0 or clock != int(config["kernel_profile_clock_mhz"]):
         raise ValueError("invalid or inconsistent profile clock MHz")
-    if int(config["miss_count"]) != int(match[2]):
+    if int(config["miss_count"]) != int(match["count"]):
         raise ValueError("filename miss_count differs from PERF_CONFIG")
+    for name, value in (("aiv_cores", match["cores"]),
+                        ("jettys_per_core", match["jettys"] or match["legacy_jettys"])):
+        if value is not None and int(config[name]) != int(value):
+            raise ValueError(f"filename {name} differs from PERF_CONFIG")
+    if any(int(config[name]) <= 0 for name in ("aiv_cores", "jettys_per_core", "iterations")):
+        raise ValueError("core, Jetty and iteration counts must be positive")
     if any(config[name] != contract[name] for name in
            ("aiv_cores", "jettys_per_core", "request_length", "miss_count")):
         raise ValueError("profile contract differs from PERF_CONFIG")
@@ -123,7 +145,7 @@ def _parse_run(path: Path) -> dict:
             selected_device = fields(line)["ub_device"]
     row = {name: config[name] for name in CONFIG_FIELDS
            if name not in ("selected_ub_device", "clock_mhz", "completion_poll_mode", "profile_version")}
-    row.update(round=int(match[1]), variant=match[3], clock_mhz=clock,
+    row.update(round=int(match["round"]), variant=match["variant"], clock_mhz=clock,
                selected_ub_device=selected_device, log_file=str(path.resolve()),
                completion_poll_mode=contract.get("completion_poll_mode", "serial"),
                profile_version=contract.get("profile_version", "0"))
@@ -168,10 +190,14 @@ def _parse_run(path: Path) -> dict:
         raise ValueError("per-core active request sum differs from miss_count")
     row["posts_per_call"] = sum(number(core["total_posts_mean"]) for core in cores)
     row["completions_per_call"] = sum(number(core["completion_count_mean"]) for core in cores)
+    core_reads = [number(core["active_requests_mean"]) for core in cores]
+    row.update(reads_per_core_min=min(core_reads), reads_per_core_max=max(core_reads),
+               reads_per_core_mean=active / len(cores),
+               configured_jettys_total=len(cores) * int(config["jettys_per_core"]))
     schedules = [fields(line) for line in lines if line.startswith("KERNEL_PROFILE_SCHEDULE ")]
     jettys = [fields(line) for line in lines if line.startswith("KERNEL_PROFILE_JETTY ")]
     row["_jettys"] = []
-    row.update({name: "" for name in SCHEDULE_METRICS})
+    row.update({name: "" for name in SCHEDULE_METRICS + PROOF_METRICS})
     if schedules or jettys or int(contract.get("profile_version", 0)) >= 3:
         core_count, jetty_count = int(config["aiv_cores"]), int(config["jettys_per_core"])
         if sorted(int(s["core"]) for s in schedules) != list(range(core_count)):
@@ -223,7 +249,35 @@ def _parse_run(path: Path) -> dict:
                                     rel_tol=0, abs_tol=1e-4):
                     raise ValueError("per-Jetty payload differs from READ count")
                 row["_jettys"].append(record)
+        limits = {int(s["small_post_max_requests"]) for s in schedules}
+        if len(limits) != 1:
+            raise ValueError("per-core small-post limits differ")
+        row.update(small_post_max_requests=limits.pop(),
+                   post_width_min=min(int(s["post_width_min"]) for s in schedules),
+                   post_width_max=max(int(s["post_width_max"]) for s in schedules),
+                   active_jettys_per_call=sum(j["active_samples"] for j in row["_jettys"]) /
+                                         int(config["iterations"]))
     return row
+
+
+def comparison_deltas(reference: dict, candidate: dict) -> dict:
+    result = dict(
+        p50_speedup=reference["p50_us"] / candidate["p50_us"],
+        p50_latency_reduction_pct=100 * (1 - candidate["p50_us"] / reference["p50_us"]),
+        p99_latency_reduction_pct=100 * (1 - candidate["p99_us"] / reference["p99_us"]),
+        p50_bandwidth_gain_pct=(100 * (candidate["p50_GBps"] / reference["p50_GBps"] - 1)
+                                if reference["p50_GBps"] else ""),
+        post_p50_change_us=candidate["post_p50_us"] - reference["post_p50_us"],
+        completion_wait_p50_change_us=(candidate["completion_wait_p50_us"] -
+                                       reference["completion_wait_p50_us"]),
+    )
+    for prefix in OPTIONAL_STAGES.values():
+        metric = prefix + "p50_us"
+        result[prefix + "p50_change_us"] = (
+            candidate[metric] - reference[metric]
+            if reference[metric] != "" and candidate[metric] != "" else ""
+        )
+    return result
 
 
 def compare_runs(runs: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -245,42 +299,93 @@ def compare_runs(runs: list[dict]) -> tuple[list[dict], list[dict]]:
         if mismatches:
             raise ValueError(f"configuration mismatch for round/shape={key}: {', '.join(mismatches)}")
         pair = {name: base[name] for name in CONFIG_FIELDS}
+        pair.update({name: base[name] for name in SHAPE_METRICS})
         pair["round"] = base["round"]
         for metric in PAIR_METRICS:
             available = base[metric] != "" and small[metric] != ""
             pair["baseline_" + metric] = base[metric] if available else ""
             pair["small_post_" + metric] = small[metric] if available else ""
-        pair.update(
-            p50_speedup=base["p50_us"] / small["p50_us"],
-            p50_latency_reduction_pct=100 * (1 - small["p50_us"] / base["p50_us"]),
-            p99_latency_reduction_pct=100 * (1 - small["p99_us"] / base["p99_us"]),
-            p50_bandwidth_gain_pct=(100 * (small["p50_GBps"] / base["p50_GBps"] - 1)
-                                     if base["p50_GBps"] else ""),
-            post_p50_change_us=small["post_p50_us"] - base["post_p50_us"],
-            completion_wait_p50_change_us=(small["completion_wait_p50_us"] -
-                                           base["completion_wait_p50_us"]),
-            baseline_log=base["log_file"], small_post_log=small["log_file"],
-        )
-        for prefix in OPTIONAL_STAGES.values():
-            metric = prefix + "p50_us"
-            pair[prefix + "p50_change_us"] = (
-                small[metric] - base[metric]
-                if base[metric] != "" and small[metric] != "" else ""
-            )
+        pair.update(comparison_deltas(base, small))
+        pair.update(baseline_log=base["log_file"], small_post_log=small["log_file"])
         pairs.append(pair)
 
     configurations = {}
     for pair in pairs:
-        configurations.setdefault(tuple(pair[name] for name in CONFIG_FIELDS), []).append(pair)
+        key = tuple(pair[name] for name in CONFIG_FIELDS) + (
+            pair["baseline_small_post_max_requests"], pair["small_post_small_post_max_requests"])
+        configurations.setdefault(key, []).append(pair)
     summary = []
     for group in configurations.values():
         row = {name: group[0][name] for name in CONFIG_FIELDS}
+        row.update({name: group[0][name] for name in SHAPE_METRICS})
         row.update(rounds=len(group), round_ids=";".join(str(pair["round"]) for pair in group))
         for prefix in OPTIONAL_STAGES.values():
             row[prefix + "rounds"] = sum(
                 pair["baseline_" + prefix + "p50_us"] != "" for pair in group
             )
         for metric in PAIR_VALUES:
+            values = [pair[metric] for pair in group if pair[metric] != ""]
+            row["median_" + metric] = statistics.median(values) if values else ""
+        summary.append(row)
+    return pairs, summary
+
+
+def compare_jetty_scaling(runs: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Pair every configuration with the same-round/core baseline using one Jetty.
+
+    A missing reference leaves the original A/B export usable, but produces no
+    Jetty comparison for that round/core. Never substitute a different round or
+    core count, or silently compare different routing/profile configurations.
+    """
+    grouped = {}
+    shape = tuple(name for name in SHAPE_FIELDS if name != "jettys_per_core")
+    for run in runs:
+        key = (run["round"], *(run[name] for name in shape))
+        candidates = grouped.setdefault(key, {})
+        identity = (run["variant"], int(run["jettys_per_core"]))
+        if identity in candidates:
+            raise ValueError(f"duplicate Jetty candidate for round/shape={key}: {identity}")
+        candidates[identity] = run
+
+    pairs = []
+    for key in sorted(grouped, key=lambda key: tuple(int(value) for value in key)):
+        candidates = grouped[key]
+        reference = candidates.get(("baseline", 1))
+        if reference is None:
+            continue
+        for identity in sorted(candidates, key=lambda item: (item[1], item[0])):
+            candidate = candidates[identity]
+            mismatches = [name for name in CONFIG_FIELDS
+                          if name != "jettys_per_core" and reference[name] != candidate[name]]
+            if mismatches:
+                raise ValueError(f"Jetty reference configuration mismatch for round/shape={key}: "
+                                 + ", ".join(mismatches))
+            pair = {name: candidate[name] for name in CONFIG_FIELDS + SHAPE_METRICS}
+            pair.update(round=candidate["round"], variant=candidate["variant"],
+                        reference_variant="baseline", reference_jettys_per_core=1,
+                        reference_log=reference["log_file"], candidate_log=candidate["log_file"])
+            for metric in PAIR_METRICS:
+                available = reference[metric] != "" and candidate[metric] != ""
+                pair["reference_" + metric] = reference[metric] if available else ""
+                pair["candidate_" + metric] = candidate[metric] if available else ""
+            pair.update(comparison_deltas(reference, candidate))
+            pairs.append(pair)
+
+    configurations = {}
+    for pair in pairs:
+        key = (pair["variant"], *(pair[name] for name in CONFIG_FIELDS),
+               pair["reference_small_post_max_requests"], pair["candidate_small_post_max_requests"])
+        configurations.setdefault(key, []).append(pair)
+    summary = []
+    for group in configurations.values():
+        row = {name: group[0][name] for name in ("variant",) + CONFIG_FIELDS + SHAPE_METRICS}
+        row.update(reference_variant="baseline", reference_jettys_per_core=1,
+                   paired_rounds=len(group), round_ids=";".join(str(pair["round"]) for pair in group),
+                   p50_win_rounds=sum(pair["p50_latency_reduction_pct"] > 0 for pair in group),
+                   p99_regression_rounds=sum(pair["p99_latency_reduction_pct"] < 0 for pair in group),
+                   worst_p50_latency_reduction_pct=min(pair["p50_latency_reduction_pct"] for pair in group),
+                   worst_p99_latency_reduction_pct=min(pair["p99_latency_reduction_pct"] for pair in group))
+        for metric in JETTY_PAIR_VALUES:
             values = [pair[metric] for pair in group if pair[metric] != ""]
             row["median_" + metric] = statistics.median(values) if values else ""
         summary.append(row)
@@ -298,7 +403,8 @@ def write_csv(path: Path, rows: list[dict], columns: tuple[str, ...]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("log_dir", type=Path, help="directory containing r*_n*_<variant>.log; searched recursively")
+    parser.add_argument("log_dir", type=Path,
+                        help="recursively read r<round>_n<count>_[c<cores>_j<jettys>_|<jettys>_]<variant>.log")
     parser.add_argument("--output-dir", type=Path, help="CSV destination; defaults to log_dir")
     args = parser.parse_args(argv)
     try:
@@ -310,23 +416,34 @@ def main(argv: list[str] | None = None) -> int:
         runs = [parse_run(path) for path in paths]
         runs.sort(key=lambda row: (row["round"], *(int(row[name]) for name in SHAPE_FIELDS), row["variant"]))
         pairs, summary = compare_runs(runs)
+        jetty_pairs, jetty_summary = compare_jetty_scaling(runs)
         jettys = [{**{key: run[key] for key in ("round", "variant") + CONFIG_FIELDS}, **trace}
                   for run in runs for trace in run["_jettys"]]
         output = args.output_dir or args.log_dir
         output.mkdir(parents=True, exist_ok=True)
         outputs = (
             ("small_post_runs.csv", runs,
-             ("round", "variant") + CONFIG_FIELDS + ("payload_bytes",) + RUN_METRICS +
-             ("p50_GBps", "posts_per_call", "completions_per_call") + SCHEDULE_METRICS + ("log_file",)),
+             ("round", "variant") + CONFIG_FIELDS + SHAPE_METRICS + ("payload_bytes",) + RUN_METRICS +
+             ("p50_GBps", "posts_per_call", "completions_per_call") + SCHEDULE_METRICS + PROOF_METRICS + ("log_file",)),
             ("small_post_pairs.csv", pairs,
-             ("round",) + CONFIG_FIELDS + PAIR_VALUES + ("baseline_log", "small_post_log")),
+             ("round",) + CONFIG_FIELDS + SHAPE_METRICS + PAIR_VALUES + ("baseline_log", "small_post_log")),
             ("small_post_summary.csv", summary,
-             CONFIG_FIELDS + ("rounds", "round_ids") + tuple(prefix + "rounds" for prefix in OPTIONAL_STAGES.values()) +
+             CONFIG_FIELDS + SHAPE_METRICS + ("rounds", "round_ids") + tuple(prefix + "rounds" for prefix in OPTIONAL_STAGES.values()) +
              tuple("median_" + name for name in PAIR_VALUES)),
             ("small_post_jettys.csv", jettys,
              ("round", "variant") + CONFIG_FIELDS + ("core", "jetty") + SCHEDULE_FIELDS + JETTY_METRICS),
+            ("small_post_jetty_pairs.csv", jetty_pairs,
+             ("round", "variant") + CONFIG_FIELDS + SHAPE_METRICS +
+             ("reference_variant", "reference_jettys_per_core") + JETTY_PAIR_VALUES +
+             ("reference_log", "candidate_log")),
+            ("small_post_jetty_summary.csv", jetty_summary,
+             ("variant",) + CONFIG_FIELDS + SHAPE_METRICS +
+             ("reference_variant", "reference_jettys_per_core", "paired_rounds", "round_ids") +
+             JETTY_SUMMARY_COUNTS + tuple("median_" + name for name in JETTY_PAIR_VALUES)),
         )
         # Validate every log and pair before creating any result CSV.
+        print("SMALL_POST_JETTY_REFERENCE variant=baseline jettys_per_core=1 "
+              f"matched_runs={len(jetty_pairs)} missing_reference_runs={len(runs) - len(jetty_pairs)}")
         for filename, rows, columns in outputs:
             path = output / filename
             write_csv(path, rows, columns)
