@@ -235,6 +235,13 @@ struct Fixture {
           static_cast<uint32_t>(profile.active_requests), core_budget, jettys));
       CHECK(bool(profile.schedule_metadata & KVAF_BATCH_GET_SCHEDULE_SINGLE_GROUP) ==
             (kvaf_batch_get::kLeanSchedule && profile.active_requests != 0 && core_budget == 0));
+      CHECK(((profile.schedule_metadata >> KVAF_BATCH_GET_SCHEDULE_MIN_TAIL_SHIFT) &
+             KVAF_BATCH_GET_SCHEDULE_MIN_TAIL_MASK) ==
+            (kvaf_batch_get::kLeanSchedule ? kvaf_batch_get::kMinTailReads : 0U));
+      const auto whole_posts = kvaf_batch_get::PostCount(static_cast<uint32_t>(profile.active_requests));
+      CHECK(bool(profile.schedule_metadata & KVAF_BATCH_GET_SCHEDULE_TAIL_REUSED) ==
+            (kvaf_batch_get::kLeanSchedule && core_budget == 0 &&
+             managed < jettys && managed < whole_posts));
       uint64_t read_sum = 0, post_sum = 0, checkpoint_sum = 0;
       for (uint32_t j = 0; j < KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE; ++j) {
         const auto& trace = profile.jettys[j];
@@ -303,6 +310,46 @@ struct Fixture {
 };
 
 int main() {
+  if (kvaf_batch_get::kLeanSchedule && kvaf_batch_get::kMinTailReads == 32) {
+    for (bool round_robin : {false, true}) {
+      Fixture f(380, 1, 8, 2048);
+      f.statuses[0].profile.magic = round_robin ?
+          KVAF_AIV_BATCH_GET_JETTY_TIMELINE_MAGIC : KVAF_AIV_BATCH_GET_PROFILE_MAGIC;
+      // The reused lane crosses the SQ owner boundary across its two posts.
+      auto& q = f.queues[0];
+      auto& h = aiv_model::hardware[0];
+      q.magic = 0x4b564151U; q.initialized = 1;
+      q.sq_producer_index = h.producer = h.completed = 32700;
+      h.sq_db = 32700;
+      q.cq_consumer_index = h.cq_producer = h.cq_consumer = 7;
+      for (const auto& test : {std::array<uint32_t, 4>{130, 1, 130, 0},
+                               {160, 2, 128, 32}, {257, 2, 129, 128},
+                               {288, 3, 128, 128}, {320, 3, 128, 128},
+                               {380, 3, 128, 128}, {129, 1, 129, 0}}) {
+        f.Run(test[0]);  // validates payloads, owner bits and actual hardware CQEs
+        const auto& p = f.statuses[0].profile;
+        CHECK(p.completion_count == test[1]);
+        CHECK(p.jettys[0].submitted_reads == test[2]);
+        CHECK(p.jettys[1].submitted_reads == test[3]);
+        CHECK(p.jettys[0].submitted_posts == (test[2] > 128 ? 2 : 1));
+        CHECK(p.jettys[0].completed_checkpoints == 1);
+      }
+      f.Run(0); f.Run(1);
+      for (auto& status : f.statuses) status.profile.magic = 0;
+      f.Run(130); f.Run(320); f.Run(257);
+    }
+    for (bool timeout : {false, true}) {
+      Fixture f(130, 1, 8, 2048);
+      aiv_model::hardware[0].timeout = timeout;
+      aiv_model::hardware[0].error = !timeout;
+      f.Run(130, timeout ? kCqTimeout : kCqError);
+      CHECK(f.queues[0].sq_producer_index == 130);
+      CHECK(!f.queues[1].initialized && f.queues[1].poisoned);
+      const auto doorbells = aiv_model::doorbells;
+      f.Run(130, kInvalidQueue);
+      CHECK(aiv_model::doorbells == doorbells);
+    }
+  }
   if (kvaf_batch_get::kLeanSchedule) {
     {
       Fixture f(513, 2, 8, 2048);

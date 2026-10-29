@@ -51,6 +51,7 @@ class InflightConfigTests(unittest.TestCase):
             jetty_timeline_enabled=True, profile_version=3,
             schedule_metadata_version=1, lean_schedule_enabled=True,
             configured_jettys=3, managed_jettys=2, single_group_fast_path=True,
+            min_tail_reads=32, tail_jetty_reused=True,
         )
         trace = dict(submitted_reads=8, submitted_posts=1, completed_checkpoints=1,
                      first_doorbell_cycle=1200, last_doorbell_cycle=1200,
@@ -70,6 +71,7 @@ class InflightConfigTests(unittest.TestCase):
         self.assertIn("lean_schedule_enabled=1 configured_jettys=3", text)
         self.assertIn("active_jettys_per_call=2.000000 managed_jettys_min=2", text)
         self.assertIn("managed_jettys_per_call=2.000000 single_group_fast_path_samples=1", text)
+        self.assertIn("min_tail_reads=32 tail_jetty_reuse_samples=1", text)
         self.assertNotIn("jetty0_wait_ms_mean", text)
         records = [dict(word.split("=", 1) for word in line.split()[1:])
                    for line in text.splitlines() if line.startswith("KERNEL_PROFILE_JETTY ")]

@@ -108,6 +108,42 @@ int main() {
   }
   CHECK(kvaf_batch_get::ManagedJettys(128, 0, 8) == 1);
   CHECK(kvaf_batch_get::ManagedJettys(129, 0, 8) == 2);
+  // Tail activation changes the number of lanes, never the 128-READ post
+  // boundaries. Exact multiples and widths already capped by configuration
+  // must not lose a lane. Check both sides of each threshold explicitly.
+  for (const auto& test : {
+      std::array<uint32_t, 4>{130, 8, 0, 2}, {130, 8, 1, 2},
+      {129, 8, 32, 1}, {130, 8, 32, 1}, {159, 8, 32, 1},
+      {160, 8, 32, 2}, {255, 8, 32, 2}, {256, 8, 32, 2},
+      {257, 8, 32, 2}, {287, 8, 32, 2}, {288, 8, 32, 3},
+      {320, 8, 32, 3}, {380, 8, 32, 3}, {384, 8, 32, 3},
+      {385, 8, 32, 3}, {257, 2, 32, 2}, {513, 4, 32, 4},
+      {65537, 64, 32, 64}, {255, 8, 128, 1}, {256, 8, 128, 2},
+      {257, 8, 128, 2}, {320, 8, 128, 2}, {0, 8, 32, 0}}) {
+    const auto reads = test[0], configured = test[1], threshold = test[2];
+    const auto managed = kvaf_batch_get::ManagedJettys(reads, 0, configured, true, threshold);
+    CHECK(managed == test[3]);
+    CHECK(kvaf_batch_get::ManagedJettys(reads, 0, configured, false, threshold) == configured);
+    CHECK(kvaf_batch_get::ManagedJettys(reads, 8, configured, true, threshold) ==
+          (reads ? configured : 0));
+    if (!reads) continue;
+    CheckAssignment(Group{0, reads, 0}, managed);
+    uint64_t sum = 0;
+    for (uint32_t j = 0; j < managed; ++j) {
+      const auto assigned = kvaf_batch_get::AssignedRequests(Group{0, reads, 0}, j, managed);
+      CHECK(assigned != 0);
+      CHECK(assigned <= kvaf_batch_get::AssignedRequests(Group{0, reads, 0}, 0, managed));
+      sum += assigned;
+    }
+    CHECK(sum == reads);
+  }
+  CHECK(kvaf_batch_get::AssignedRequests(Group{0, 257, 0}, 0, 2) == 129);
+  CHECK(kvaf_batch_get::AssignedRequests(Group{0, 257, 0}, 1, 2) == 128);
+  // The 128/129 split of N=257 over two cores now uses one lane on each core.
+  for (uint32_t c = 0; c < 2; ++c) {
+    const auto reads = 257U * (c + 1U) / 2U - 257U * c / 2U;
+    CHECK(kvaf_batch_get::ManagedJettys(reads, 0, 8, true, 32) == 1);
+  }
   Schedule tail{{}, 0, 2049, 2048, 16, 0, 0, 0};
   std::string trace;
   std::vector<Group> groups;

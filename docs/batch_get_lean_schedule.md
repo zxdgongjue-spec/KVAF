@@ -33,7 +33,7 @@ R = floor(N * (c + 1) / C) - floor(N * c / C)
 ```
 
 整批能放进在途预算时，每核只有一个 group，从 Jetty 0 开始按 post 轮转。
-实际参与数为 `min(配置 Jetty 数, ceil(R / 128))`，R=0 时为 0。例如：
+默认尾部门槛为 0，实际参与数为 `min(配置 Jetty 数, ceil(R / 128))`，R=0 时为 0。例如：
 
 | 本核 R | 配置 Jetty 数 | 实际参与数 | 分配 |
 | ---: | ---: | ---: | --- |
@@ -136,3 +136,105 @@ doorbell、post、finalize 定位减少的管理时间。传输与完成等待�
 
 CPU 模型分别覆盖 lean OFF/ON、128/129 边界、配置步长、空核、活跃范围变化、
 队列回绕、预算窗口、profile 关闭和错误禁用；不替代 CANN 编译或硬件验证。
+
+## 小尾部复用：可调的 Jetty 启用门槛
+
+新增构建参数 `--batch-get-min-tail-reads N`，对应 CMake
+`KVAF_BATCH_GET_MIN_TAIL_READS`，范围 0～128。新构建默认 0，省略参数保留
+CMake 缓存；0 关闭尾部复用，1 与原分配等价。该门槛只在 lean 开启、整批能放入
+在途预算（或预算为 0）时生效，依据每核实际 R，单位为 READ 数。
+
+令 `P=ceil(R/128)`、`T=R%128`、配置数为 J。当
+`1 < P <= J` 且 `0 < T < N` 时，只启用 P-1 个 Jetty，最后一个 post
+按轮转复用 Jetty 0；其他情况保持默认分配。T 恰好达到门槛时启用新 Jetty。
+如果 post 数已超过配置数，尾部原本就在复用已有 Jetty，无须再减少活跃数。
+
+门槛为 32、配置 4 个 Jetty 的例子：
+
+| 每核 READ 数 | 默认活跃数 | 新活跃数 | 新分配 | post 数 | CQ checkpoint 数 |
+| ---: | ---: | ---: | --- | ---: | ---: |
+| 128 | 1 | 1 | 128 | 1 | 1 |
+| 130 | 2 | 1 | 128+2，均发到 Jetty0 | 2 | 1 |
+| 159 | 2 | 1 | 128+31，均发到 Jetty0 | 2 | 1 |
+| 160 | 2 | 2 | 128 / 32 | 2 | 2 |
+| 255 | 2 | 2 | 128 / 127 | 2 | 2 |
+| 256 | 2 | 2 | 128 / 128 | 2 | 2 |
+| 257 | 3 | 2 | 129 / 128 | 3 | 2 |
+| 288 | 3 | 3 | 128 / 128 / 32 | 3 | 3 |
+| 320 | 3 | 3 | 128 / 128 / 64 | 3 | 3 |
+
+每个 post 仍最多 128 READ；复用队列只在其最后一个 post 产生完成 checkpoint。
+130 READ 仍提交两次 doorbell，不会合成一个 130-READ post。收益来源是少管理
+一条队列并少回收一个 checkpoint，也避免极短尾部独占一条队列。整除 128 的场景、
+配置资源表步长和多 group 预算窗口不受此参数影响。
+
+现有单轮数据中，每核 129～130 READ 使用 1 Jetty 更好，160 READ 使用 2 Jetty
+已有 P50 收益，257 READ 多开第三条队列有损失，而 320 READ 使用 3 Jetty 有收益。
+因此 32 是供 A/B 验证的候选门槛，尚未证明是跨核数、token_bytes 和 P99 的最优值。
+这次修改不宣称已测得收益，也不将候选门槛设为默认值。
+
+### 只验证 Jetty 启用策略
+
+两侧都保留相同 lean 管理和单 group 路径，避免混入其他优化。构建目录名称中
+baseline 表示门槛 0 的对照组，lean 表示门槛 32 的候选组：
+
+```bash
+./build.sh npu --build-dir "$PWD/build-npu-tail-baseline" \
+  --batch-get-lean-schedule 1 --batch-get-min-tail-reads 0
+./build.sh npu --build-dir "$PWD/build-npu-tail-lean" \
+  --batch-get-lean-schedule 1 --batch-get-min-tail-reads 32
+
+export KVAF_CPU_SERVICE_ADDR=127.0.0.1:29991
+export DEVICE_ID=7
+log_dir=logs/batch-get-tail-32
+mkdir -p "$log_dir"
+for round in 1 2 3 4 5 6; do
+  variants=(baseline lean)
+  if ((round % 2 == 0)); then variants=(lean baseline); fi
+  for core in 1 2; do
+    for reads in 128 129 130 144 152 159 160 190 255 256 257 272 287 288 320 380 512; do
+      n=$((reads * core))
+      for jetty in 1 2 3 4; do
+        for variant in "${variants[@]}"; do
+          bash tests/run_remote_cpu_batch_get_perf.sh "$PWD/build-npu-tail-$variant" \
+            --request-length 32768 --table-capacity 16384 \
+            --tokens-per-block 128 --token-bytes 656 --miss-count "$n" \
+            --aiv-cores "$core" --jettys-per-core "$jetty" \
+            --max-inflight-total 2048 \
+            --source-access-pattern random --output-access-pattern contiguous \
+            --no-sort-input-indices --seed 20260903 \
+            --warmup 100 --iterations 2000 --kernel-profile \
+            > "$log_dir/r${round}_n${n}_c${core}_j${jetty}_${variant}.log" 2>&1 || exit 1
+        done
+      done
+    done
+  done
+done
+python3 tests/diagnostics/summarize_batch_get.py "$log_dir" --reference-lean
+```
+
+这是每核 READ 数扫描，N=reads×core；另可补 N=257、C=2 验证 128/129
+不均匀切分。更换门槛时使用不同日志目录。serial profile 主测 P50/P99；
+时间线诊断和关闭 profile 的端到端验证各用独立目录。
+
+`--reference-lean` 要求 baseline 和 lean 标签均实际开启 lean；未传该选项时，
+仍要求 baseline=lean OFF、lean=lean ON。工具逐侧校验单 group 实际 READ/post/CQE
+分配，允许门槛引起的活跃数和 CQ 数变化；多窗口仍要求两侧分配相同。
+
+新增证明字段：
+
+- `KERNEL_PROFILE_SCHEDULE min_tail_reads=32 tail_jetty_reuse_samples=2000`：
+  该核本轮 2000 个样本均避免为短尾部启用新 Jetty；0 表示未触发。
+- CSV `min_tail_reads`：实际生效门槛；lean OFF 记为 0。旧日志缺少字段时留空。
+- CSV `tail_jetty_reuse_calls`：各核触发次数之和除以迭代数；可能大于 1。
+- 逐 Jetty 日志/CSV 中，R=130 应出现 Jetty0 READ=130、post=2、CQ=1，
+  其他 Jetty READ/post/CQ=0。R=257、配置 4 时应为 129/128/0/0、CQ 总数 2。
+
+六张 CSV 文件名保持不变，汇总按两侧门槛分组。Jetty scaling 表的参考始终是
+同轮同核、baseline 标签的配置 1 Jetty，具体 lean 开关和门槛同时保存在参考列中。
+`p50_GBps` 使用内核 total P50，完整调用延迟另看 wall 指标。
+
+profile 扩展复用 V3 保留字，设备记录大小保持不变；使用新增字段时应整体重建
+host、binding 和 kernel。CPU 模型增加 32/128 门槛目标，覆盖尾部复用、实际 CQ 数、
+SQ 回绕、资源增长/收缩、serial/RR、profile 关闭和出错禁用；CSV 用例覆盖新旧日志
+及误分配拒绝。测试代码已补充，需由使用者在相应环境执行。

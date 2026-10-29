@@ -16,6 +16,7 @@ usage() {
   cat <<'EOF'
 Usage: ./build.sh <cpu|npu> [--build-dir DIR] [--jobs N]
                  [--batch-get-lean-schedule 0|1]
+                 [--batch-get-min-tail-reads 0..128]
 
 cpu  Builds the liburma-only CPU Runtime service. If liburma is not installed,
      it clones and builds the pinned UMDK source beside this repository.
@@ -27,6 +28,12 @@ npu  Builds the CANN AIV BatchGet/BatchPut Runtime and Python binding. It
      fast path when the whole call fits the inflight budget (or budget is 0).
      Posts use at most 128 READs. If omitted, preserve the CMake cache
      (new builds default 1); use explicit 0/1 for an A/B rebuild.
+
+--batch-get-min-tail-reads 0..128
+     NPU-only, lean schedule: reuse an existing Jetty for a shorter final post
+     in a single-group call. 0 disables (default); 32 is an experimental
+     candidate. Units are READs per core, not bytes or total miss_count.
+     Omission preserves the CMake cache. Posts still use at most 128 READs.
 
 Environment overrides:
   KVAF_UMDK_ROOT       UMDK source/header root for the CPU build
@@ -168,6 +175,9 @@ build_npu() {
   if [[ -n "$lean_schedule" ]]; then
     extra_cmake_options+=("-DKVAF_BATCH_GET_LEAN_SCHEDULE=$lean_schedule")
   fi
+  if [[ -n "$min_tail_reads" ]]; then
+    extra_cmake_options+=("-DKVAF_BATCH_GET_MIN_TAIL_READS=$min_tail_reads")
+  fi
 
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
     -DBUILD_TESTING=ON \
@@ -193,6 +203,7 @@ esac
 build_dir="$KVAF_ROOT/build-$mode"
 jobs="$(default_jobs)"
 lean_schedule=""
+min_tail_reads=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --build-dir)
@@ -211,13 +222,20 @@ while [[ $# -gt 0 ]]; do
       lean_schedule="$2"
       shift 2
       ;;
+    --batch-get-min-tail-reads)
+      [[ $# -ge 2 && "$2" =~ ^(0|[1-9][0-9]{0,2})$ ]] ||
+        die "--batch-get-min-tail-reads requires an integer in [0, 128]"
+      (( $2 <= 128 )) || die "--batch-get-min-tail-reads requires an integer in [0, 128]"
+      min_tail_reads="$2"
+      shift 2
+      ;;
     *) die "unknown argument: $1" ;;
   esac
 done
 
 [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || die "KVAF_BUILD_JOBS must be a positive integer"
-if [[ "$mode" != npu && -n "$lean_schedule" ]]; then
-  die "--batch-get-lean-schedule is supported only for npu"
+if [[ "$mode" != npu && ( -n "$lean_schedule" || -n "$min_tail_reads" ) ]]; then
+  die "BatchGet scheduling options are supported only for npu"
 fi
 if [[ "$mode" == cpu ]]; then
   build_cpu "$build_dir" "$jobs"

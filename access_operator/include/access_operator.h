@@ -98,6 +98,8 @@ struct BatchGetKernelProfile {
   bool single_group_fast_path{false};
   std::uint32_t configured_jettys{0};
   std::uint32_t managed_jettys{0};
+  std::uint32_t min_tail_reads{0};
+  bool tail_jetty_reused{false};
   struct JettyProfile {
     std::uint64_t submitted_reads{0};
     std::uint64_t submitted_posts{0};

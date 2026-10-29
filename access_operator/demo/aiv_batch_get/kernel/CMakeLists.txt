@@ -6,11 +6,14 @@ set(KVAF_CCEC_DIR "${ASCEND_CANN_PACKAGE_PATH}/tools/ccec_compiler/bin")
 if(NOT DEFINED KVAF_BATCH_GET_LEAN_SCHEDULE)
   set(KVAF_BATCH_GET_LEAN_SCHEDULE ON)
 endif()
+if(NOT DEFINED KVAF_BATCH_GET_MIN_TAIL_READS)
+  set(KVAF_BATCH_GET_MIN_TAIL_READS 0)
+endif()
 # Also invalidate the custom object with Makefile generators when this cached
 # setting changes; a changed command line alone is not a portable dependency.
 set(KVAF_SCHEDULE_CONFIG "${CMAKE_CURRENT_BINARY_DIR}/schedule_config.txt")
 file(GENERATE OUTPUT "${KVAF_SCHEDULE_CONFIG}"
-  CONTENT "lean_schedule=$<BOOL:${KVAF_BATCH_GET_LEAN_SCHEDULE}>\n")
+  CONTENT "lean_schedule=$<BOOL:${KVAF_BATCH_GET_LEAN_SCHEDULE}>\nmin_tail_reads=${KVAF_BATCH_GET_MIN_TAIL_READS}\n")
 
 find_program(KVAF_CCEC NAMES ccec HINTS "${KVAF_CCEC_DIR}")
 find_program(KVAF_LLD NAMES ld.lld HINTS "${KVAF_CCEC_DIR}")
@@ -73,6 +76,7 @@ add_custom_command(
           -mllvm -cce-aicore-record-overflow=false -mllvm -cce-aicore-addr-transform
           -mllvm -cce-aicore-jump-expand=true -std=c++17 -fstack-protector-all
           -DKVAF_BATCH_GET_LEAN_SCHEDULE=$<BOOL:${KVAF_BATCH_GET_LEAN_SCHEDULE}>
+          -DKVAF_BATCH_GET_MIN_TAIL_READS=${KVAF_BATCH_GET_MIN_TAIL_READS}
           ${KVAF_KERNEL_INCLUDES}
   COMMAND "${KVAF_LLD}" -m aicorelinux -Ttext=0 "${KVAF_EXECUTE_KERNEL_TMP}" -static
           -o "${KVAF_EXECUTE_KERNEL_OBJECT}"

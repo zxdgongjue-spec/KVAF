@@ -19,7 +19,15 @@ if(DEFINED KVAF_BATCH_GET_SMALL_POST_MAX_REQUESTS)
 endif()
 option(KVAF_BATCH_GET_LEAN_SCHEDULE
        "Manage only used BatchGet Jettys and bypass the scheduler for one group" ON)
-message(STATUS "BatchGet baseline posts, lean schedule: ${KVAF_BATCH_GET_LEAN_SCHEDULE}")
+set(KVAF_BATCH_GET_MIN_TAIL_READS "0" CACHE STRING
+    "Minimum tail READs to activate another Jetty in a lean single-group call (0 disables)")
+if(NOT KVAF_BATCH_GET_MIN_TAIL_READS MATCHES "^(0|[1-9][0-9]*)$")
+  message(FATAL_ERROR "KVAF_BATCH_GET_MIN_TAIL_READS must be an integer in [0, 128]")
+endif()
+if(KVAF_BATCH_GET_MIN_TAIL_READS GREATER 128)
+  message(FATAL_ERROR "KVAF_BATCH_GET_MIN_TAIL_READS must be an integer in [0, 128]")
+endif()
+message(STATUS "BatchGet baseline posts, lean schedule: ${KVAF_BATCH_GET_LEAN_SCHEDULE}, min tail READs: ${KVAF_BATCH_GET_MIN_TAIL_READS}")
 
 if(KVAF_ENABLE_AIV_BATCH_PUT AND NOT KVAF_ENABLE_AIV_BATCH_GET)
   message(FATAL_ERROR

@@ -19,6 +19,13 @@ static_assert(KVAF_BATCH_GET_LEAN_SCHEDULE == 0 || KVAF_BATCH_GET_LEAN_SCHEDULE 
               "KVAF_BATCH_GET_LEAN_SCHEDULE must be 0 or 1");
 constexpr bool kLeanSchedule = KVAF_BATCH_GET_LEAN_SCHEDULE != 0;
 
+#ifndef KVAF_BATCH_GET_MIN_TAIL_READS
+#define KVAF_BATCH_GET_MIN_TAIL_READS 0
+#endif
+static_assert(KVAF_BATCH_GET_MIN_TAIL_READS >= 0 && KVAF_BATCH_GET_MIN_TAIL_READS <= 128,
+              "KVAF_BATCH_GET_MIN_TAIL_READS must be in [0, 128]");
+constexpr uint32_t kMinTailReads = KVAF_BATCH_GET_MIN_TAIL_READS;
+
 KVAF_BATCH_GET_SCHEDULE_INLINE uint32_t PostCount(uint32_t count) {
   return count / kWqesPerPost + (count % kWqesPerPost != 0U);
 }
@@ -29,16 +36,24 @@ KVAF_BATCH_GET_SCHEDULE_INLINE uint32_t CoreBudget(
 }
 
 // A whole-slice group starts at Jetty 0. Reducing its local scheduling width
-// to this prefix preserves every post's destination and completion checkpoint.
+// to this prefix preserves baseline routing when min_tail_reads == 0. With a
+// threshold, a short final post wraps onto Jetty 0 instead of opening a new
+// lane. Full posts still contain 128 READs; the reused lane signals only its
+// final post. If posts outnumber configured lanes, the tail already reuses one.
 // Windowed groups retain the configured width because later groups rotate.
 // This is NOT the stride of the core-major entity/queue resource tables.
 KVAF_BATCH_GET_SCHEDULE_INLINE uint32_t ManagedJettys(
     uint32_t core_requests, uint32_t core_budget, uint32_t configured_jettys,
-    bool lean = kLeanSchedule) {
+    bool lean = kLeanSchedule, uint32_t min_tail_reads = kMinTailReads) {
   if (!lean) return configured_jettys;
   if (core_requests == 0U) return 0U;
   if (core_budget != 0U) return configured_jettys;
   const uint32_t posts = PostCount(core_requests);
+  const uint32_t tail = core_requests % kWqesPerPost;
+  if (posts > 1U && posts <= configured_jettys &&
+      tail != 0U && tail < min_tail_reads) {
+    return posts - 1U;
+  }
   return posts < configured_jettys ? posts : configured_jettys;
 }
 

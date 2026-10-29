@@ -415,6 +415,8 @@ class NpuPythonRuntime final {
       item["single_group_fast_path"] = profile.single_group_fast_path;
       item["configured_jettys"] = profile.configured_jettys;
       item["managed_jettys"] = profile.managed_jettys;
+      item["min_tail_reads"] = profile.min_tail_reads;
+      item["tail_jetty_reused"] = profile.tail_jetty_reused;
       py::list jettys;
       const auto jetty_count = native_->jettys_per_core() == 0U ? 1U : native_->jettys_per_core();
       for (std::size_t index = 0; index < jetty_count; ++index) {

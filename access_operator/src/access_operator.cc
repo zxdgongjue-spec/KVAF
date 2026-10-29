@@ -639,6 +639,9 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
     if (source.schedule_metadata != 0) {
       constexpr std::uint64_t known_bits = KVAF_BATCH_GET_SCHEDULE_METADATA_V1 |
           KVAF_BATCH_GET_SCHEDULE_LEAN | KVAF_BATCH_GET_SCHEDULE_SINGLE_GROUP |
+          KVAF_BATCH_GET_SCHEDULE_TAIL_REUSED |
+          (std::uint64_t(KVAF_BATCH_GET_SCHEDULE_MIN_TAIL_MASK) <<
+           KVAF_BATCH_GET_SCHEDULE_MIN_TAIL_SHIFT) |
           (std::uint64_t(KVAF_BATCH_GET_SCHEDULE_MANAGED_MASK) <<
            KVAF_BATCH_GET_SCHEDULE_MANAGED_SHIFT);
       destination.schedule_metadata_version = 1;
@@ -649,8 +652,26 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
       destination.managed_jettys = static_cast<std::uint32_t>(
           (source.schedule_metadata >> KVAF_BATCH_GET_SCHEDULE_MANAGED_SHIFT) &
           KVAF_BATCH_GET_SCHEDULE_MANAGED_MASK);
+      destination.min_tail_reads = static_cast<std::uint32_t>(
+          (source.schedule_metadata >> KVAF_BATCH_GET_SCHEDULE_MIN_TAIL_SHIFT) &
+          KVAF_BATCH_GET_SCHEDULE_MIN_TAIL_MASK);
+      destination.tail_jetty_reused =
+          (source.schedule_metadata & KVAF_BATCH_GET_SCHEDULE_TAIL_REUSED) != 0;
+      const auto whole_posts = source.active_requests / 128U +
+          (source.active_requests % 128U != 0);
+      const auto baseline_active = std::min<std::uint64_t>(
+          whole_posts, destination.configured_jettys);
+      const bool expect_tail_reuse = destination.single_group_fast_path &&
+          whole_posts > 1 && whole_posts <= destination.configured_jettys &&
+          source.active_requests % 128U != 0 &&
+          source.active_requests % 128U < destination.min_tail_reads;
       if ((source.schedule_metadata & ~known_bits) != 0 ||
           (source.schedule_metadata & KVAF_BATCH_GET_SCHEDULE_METADATA_V1) == 0 ||
+          destination.min_tail_reads > 128 ||
+          (!destination.lean_schedule_enabled && destination.min_tail_reads != 0) ||
+          destination.tail_jetty_reused != expect_tail_reuse ||
+          (destination.single_group_fast_path &&
+           destination.managed_jettys != baseline_active - expect_tail_reuse) ||
           destination.managed_jettys > destination.configured_jettys ||
           (source.active_requests != 0 && destination.managed_jettys == 0) ||
           (!destination.lean_schedule_enabled &&

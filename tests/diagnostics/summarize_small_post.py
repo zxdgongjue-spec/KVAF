@@ -47,11 +47,13 @@ SCHEDULE_METRICS = ("small_post_groups_per_call", "fused_groups_per_call", "wqe_
 PROOF_METRICS = ("small_post_max_requests", "post_width_min", "post_width_max",
                  "active_jettys_per_call", "schedule_metadata_version",
                  "lean_schedule_enabled", "managed_jettys_per_call",
-                 "single_group_fast_path_calls")
+                 "single_group_fast_path_calls", "min_tail_reads", "tail_jetty_reuse_calls")
 MANAGEMENT_FIELDS = ("schedule_metadata_version", "lean_schedule_enabled",
                      "configured_jettys", "managed_jettys_min", "managed_jettys_max",
                      "managed_jettys_per_call", "single_group_fast_path_samples")
-POLICY_METRICS = ("small_post_max_requests", "schedule_metadata_version", "lean_schedule_enabled")
+TAIL_FIELDS = ("min_tail_reads", "tail_jetty_reuse_samples")
+POLICY_METRICS = ("small_post_max_requests", "schedule_metadata_version", "lean_schedule_enabled",
+                  "min_tail_reads")
 JETTY_METRICS = (
     "active_samples", "reads_per_call", "posts_per_call", "completions_per_call",
     "payload_bytes_per_call", "polls_per_call", "probe_active_us_mean",
@@ -271,7 +273,7 @@ def _parse_run(path: Path) -> dict:
                 record = dict(core=core_id, jetty=int(trace["jetty"]))
                 record.update({name: number(schedule[name]) for name in SCHEDULE_FIELDS})
                 record.update({name: number(schedule[name]) if name in schedule else ""
-                               for name in MANAGEMENT_FIELDS})
+                               for name in MANAGEMENT_FIELDS + TAIL_FIELDS})
                 record.update({name: "" if trace[name] == "n/a" and "_us_" in name
                                else number(trace[name])
                                for name in JETTY_METRICS})
@@ -328,7 +330,67 @@ def _parse_run(path: Path) -> dict:
                        managed_jettys_per_call=sum(number(s["managed_jettys_per_call"]) for s in schedules),
                        single_group_fast_path_calls=sum(number(s["single_group_fast_path_samples"])
                                                         for s in schedules) / int(config["iterations"]))
+        if any(name in s for s in schedules for name in TAIL_FIELDS):
+            if row["schedule_metadata_version"] != 1 or any(
+                    name not in s for s in schedules for name in TAIL_FIELDS):
+                raise ValueError("incomplete tail-Jetty policy proof")
+            thresholds = {number(s["min_tail_reads"]) for s in schedules}
+            if len(thresholds) != 1:
+                raise ValueError("per-core tail thresholds differ")
+            threshold = thresholds.pop()
+            if (threshold != int(threshold) or not 0 <= threshold <= 128 or
+                    (not row["lean_schedule_enabled"] and threshold != 0)):
+                raise ValueError("invalid tail READ threshold")
+            for schedule in schedules:
+                reuse = number(schedule["tail_jetty_reuse_samples"])
+                if (reuse != int(reuse) or
+                        not 0 <= reuse <= number(schedule["single_group_fast_path_samples"]) or
+                        (threshold <= 1 and reuse != 0)):
+                    raise ValueError("invalid tail-Jetty reuse sample count")
+            row.update(min_tail_reads=int(threshold), tail_jetty_reuse_calls=sum(
+                number(s["tail_jetty_reuse_samples"]) for s in schedules) / int(config["iterations"]))
     return row
+
+
+def validate_fixed_post_assignment(run: dict) -> None:
+    """Check actual whole-slice READ/post/CQE routing against the logged policy.
+
+    Windowed calls retain their old rotating mapping and are compared between
+    builds separately. A policy label alone never excuses an assignment change.
+    """
+    misses, cores, configured, budget, iterations = (
+        int(run[name]) for name in ("miss_count", "aiv_cores", "jettys_per_core",
+                                   "max_inflight_total", "iterations"))
+    if budget and misses > budget:
+        if (run["tail_jetty_reuse_calls"] not in ("", 0) or
+                run["single_group_fast_path_calls"] != 0):
+            raise ValueError("tail reuse and single-group fast path must be disabled for windowed groups")
+        return
+    lean = bool(run["lean_schedule_enabled"])
+    threshold = 0 if run["min_tail_reads"] == "" else int(run["min_tail_reads"])
+    for core in range(cores):
+        reads = misses * (core + 1) // cores - misses * core // cores
+        full, tail = divmod(reads, 128)
+        posts = full + bool(tail)
+        reuse = lean and 1 < posts <= configured and 0 < tail < threshold
+        width = min(configured, posts) - int(reuse) if lean else configured
+        for trace in (j for j in run["_jettys"] if j["core"] == core):
+            j = trace["jetty"]
+            assigned_posts = posts // width + (j < posts % width) if j < width else 0
+            assigned_reads = ((full // width + (j < full % width)) * 128 +
+                              (tail if j == full % width else 0)) if j < width else 0
+            expected = dict(reads_per_call=assigned_reads, posts_per_call=assigned_posts,
+                            completions_per_call=int(assigned_posts > 0),
+                            active_samples=iterations if assigned_posts else 0,
+                            managed_jettys_min=width, managed_jettys_max=width,
+                            managed_jettys_per_call=width,
+                            single_group_fast_path_samples=iterations if lean and reads else 0)
+            if trace["tail_jetty_reuse_samples"] != "":
+                expected["tail_jetty_reuse_samples"] = iterations if reuse else 0
+            if any(not math.isclose(trace[name], value, rel_tol=0, abs_tol=1e-4)
+                   for name, value in expected.items()):
+                raise ValueError(f"READ/post/CQE assignment differs from policy: "
+                                 f"{run['log_file']} core={core} jetty={j}")
 
 
 def comparison_deltas(reference: dict, candidate: dict) -> dict:
@@ -385,7 +447,7 @@ def compare_runs(runs: list[dict]) -> tuple[list[dict], list[dict]]:
         key = tuple(pair[name] for name in CONFIG_FIELDS) + (
             pair["baseline_small_post_max_requests"], pair["small_post_small_post_max_requests"],
             *(pair[prefix + name] for prefix in ("baseline_", "small_post_")
-              for name in ("schedule_metadata_version", "lean_schedule_enabled")))
+              for name in ("schedule_metadata_version", "lean_schedule_enabled", "min_tail_reads")))
         configurations.setdefault(key, []).append(pair)
     summary = []
     for group in configurations.values():
@@ -449,7 +511,7 @@ def compare_jetty_scaling(runs: list[dict]) -> tuple[list[dict], list[dict]]:
         key = (pair["variant"], *(pair[name] for name in CONFIG_FIELDS),
                pair["reference_small_post_max_requests"], pair["candidate_small_post_max_requests"],
                *(pair[prefix + name] for prefix in ("reference_", "candidate_")
-                 for name in ("schedule_metadata_version", "lean_schedule_enabled")))
+                 for name in ("schedule_metadata_version", "lean_schedule_enabled", "min_tail_reads")))
         configurations.setdefault(key, []).append(pair)
     summary = []
     for group in configurations.values():
@@ -484,6 +546,9 @@ def main(argv: list[str] | None = None, *, experiment: str = "small-post") -> in
     parser.add_argument("log_dir", type=Path,
                         help="recursively read r<round>_n<count>_[c<cores>_j<jettys>_|<jettys>_]<variant>.log")
     parser.add_argument("--output-dir", type=Path, help="CSV destination; defaults to log_dir")
+    if lean_experiment:
+        parser.add_argument("--reference-lean", action="store_true",
+                            help="baseline-labelled logs also use lean=1; isolate tail-threshold changes")
     args = parser.parse_args(argv)
     try:
         if not args.log_dir.is_dir():
@@ -499,10 +564,11 @@ def main(argv: list[str] | None = None, *, experiment: str = "small-post") -> in
                 if run["variant"] not in ("baseline", "lean"):
                     raise ValueError("use a separate directory for baseline/lean logs")
                 if (run["schedule_metadata_version"] != 1 or
-                        run["lean_schedule_enabled"] != int(run["variant"] == "lean") or
+                        run["lean_schedule_enabled"] != int(run["variant"] == "lean" or args.reference_lean) or
                         run["small_post_max_requests"] != 0 or
                         run["post_width_min"] != 128 or run["post_width_max"] != 128):
                     raise ValueError(f"not a fixed-post baseline/lean build: {run['log_file']}")
+                validate_fixed_post_assignment(run)
             # Reuse the historical pair/statistics engine; translate its output
             # column prefixes below. Public filenames and labels remain lean.
             comparison_runs = [dict(run, variant=("small-post" if run["variant"] == "lean"
@@ -513,6 +579,12 @@ def main(argv: list[str] | None = None, *, experiment: str = "small-post") -> in
         if lean_experiment:
             by_log = {run["log_file"]: run for run in runs}
             for pair in pairs:
+                base = by_log[pair["baseline_log"]]
+                budget = int(base["max_inflight_total"])
+                if not budget or int(base["miss_count"]) <= budget:
+                    # Each side was checked independently above, including all
+                    # READs and the changed number of terminal CQ checkpoints.
+                    continue
                 if any(not math.isclose(pair["baseline_" + metric], pair["small_post_" + metric],
                                         rel_tol=0, abs_tol=1e-4)
                        for metric in ("posts_per_call", "completions_per_call", "active_jettys_per_call")):
@@ -543,7 +615,7 @@ def main(argv: list[str] | None = None, *, experiment: str = "small-post") -> in
              tuple("median_" + name for name in PAIR_VALUES)),
             ("small_post_jettys.csv", jettys,
              ("round", "variant") + CONFIG_FIELDS + ("core", "jetty") + SCHEDULE_FIELDS +
-             MANAGEMENT_FIELDS + JETTY_METRICS),
+             MANAGEMENT_FIELDS + TAIL_FIELDS + JETTY_METRICS),
             ("small_post_jetty_pairs.csv", jetty_pairs,
              ("round", "variant") + CONFIG_FIELDS + SHAPE_METRICS +
              ("reference_variant", "reference_jettys_per_core") + JETTY_PAIR_VALUES +

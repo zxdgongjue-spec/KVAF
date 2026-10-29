@@ -444,9 +444,11 @@ def print_jetty_profile(
         if versions == {1}:
             enabled = {bool(r["lean_schedule_enabled"]) for r in records}
             managed = [int(r["managed_jettys"]) for r in records]
+            tails = {int(r.get("min_tail_reads", 0)) for r in records}
             if (len(enabled) != 1 or any(int(r["configured_jettys"]) != jettys_per_core
                                         for r in records) or
-                    any(not 0 <= j <= jettys_per_core for j in managed)):
+                    any(not 0 <= j <= jettys_per_core for j in managed) or
+                    len(tails) != 1 or not all(0 <= t <= 128 for t in tails)):
                 raise AssertionError("invalid configured/managed Jetty counts")
             active_jettys = sum(sum(int(t["submitted_reads"]) > 0 for t in r["jettys"])
                                for r in records) / divisor
@@ -457,6 +459,8 @@ def print_jetty_profile(
                 f"managed_jettys_min={min(managed)} managed_jettys_max={max(managed)} "
                 f"managed_jettys_per_call={sum(managed) / divisor:.6f} "
                 f"single_group_fast_path_samples={sum(bool(r['single_group_fast_path']) for r in records)}"
+                f" min_tail_reads={tails.pop()} "
+                f"tail_jetty_reuse_samples={sum(bool(r.get('tail_jetty_reused', False)) for r in records)}"
             )
         print(
             f"KERNEL_PROFILE_SCHEDULE core={core} samples={len(samples)} "

@@ -254,6 +254,106 @@ class SmallPostCsvTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(lean_main([str(self.root)]), 2)
 
+    def tail_log(self, name, assignments, threshold, enabled=True, configured=4):
+        """Explicit per-core lane loads, independent of the selection formula."""
+        misses = sum(sum(lanes) for lanes in assignments)
+        path = self.log(name, miss_count=misses, aiv_cores=len(assignments),
+                        jettys_per_core=configured, small_post_max_requests=0)
+        lines = [line for line in path.read_text(encoding="utf-8").splitlines()
+                 if not line.startswith("KERNEL_PROFILE_CORE ")]
+        lines = [line.replace("KERNEL_PROFILE_CONTRACT ",
+                              "KERNEL_PROFILE_CONTRACT profile_version=3 completion_poll_mode=serial ")
+                 for line in lines]
+        for core, loads in enumerate(assignments):
+            loads = list(loads) + [0] * (configured - len(loads))
+            reads = sum(loads)
+            posts = sum((n + 127) // 128 for n in loads)
+            active = sum(n > 0 for n in loads)
+            managed = active if enabled else configured
+            reuse = active < min(configured, (reads + 127) // 128)
+            lines.append(f"KERNEL_PROFILE_CORE core={core} samples=1000 "
+                         f"active_requests_mean={reads} total_posts_mean={posts} "
+                         f"completion_count_mean={active}")
+            lines.append(f"KERNEL_PROFILE_SCHEDULE core={core} samples=1000 "
+                         "small_post_max_requests=0 post_width_min=128 post_width_max=128 "
+                         "small_post_active_samples=0 small_post_groups_per_call=0 fused_groups_per_call=0 "
+                         f"wqe_build_calls_per_call={posts} schedule_metadata_version=1 "
+                         f"lean_schedule_enabled={int(enabled)} configured_jettys={configured} "
+                         f"managed_jettys_min={managed} managed_jettys_max={managed} "
+                         f"managed_jettys_per_call={managed} "
+                         f"single_group_fast_path_samples={1000 if enabled and reads else 0} "
+                         f"min_tail_reads={threshold} tail_jetty_reuse_samples={1000 if reuse else 0}")
+            for jetty, n in enumerate(loads):
+                record = {key: "n/a" for key in JETTY_METRICS}
+                record.update(core=core, jetty=jetty, samples=1000, completion_poll_mode="serial",
+                              active_samples=1000 if n else 0, reads_per_call=n,
+                              posts_per_call=(n + 127) // 128, completions_per_call=int(n > 0),
+                              payload_bytes_per_call=n * 656, polls_per_call=int(n > 0))
+                if n:
+                    record.update({key: 1 for key in JETTY_METRICS
+                                   if key.endswith(("_mean", "_p50", "_p99"))})
+                    record["probe_active_us_mean"] = "n/a"
+                lines.append("KERNEL_PROFILE_JETTY " + " ".join(f"{k}={v}" for k, v in record.items()))
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    def test_tail_reuse_export_isolates_policy_and_records_changed_checkpoints(self):
+        self.tail_log("r1_n130_baseline.log", [[128, 2]], 0)
+        self.tail_log("r1_n130_lean.log", [[130]], 32)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(lean_main([str(self.root), "--reference-lean"]), 0)
+        with (self.root / "batch_get_pairs.csv").open(encoding="utf-8-sig", newline="") as stream:
+            row = next(csv.DictReader(stream))
+        self.assertEqual(row["baseline_lean_schedule_enabled"], "1")
+        self.assertEqual(row["baseline_posts_per_call"], row["lean_posts_per_call"])
+        self.assertEqual(row["baseline_completions_per_call"], "2.000000")
+        self.assertEqual(row["lean_completions_per_call"], "1.000000")
+        self.assertEqual(row["baseline_min_tail_reads"], "0")
+        self.assertEqual(row["lean_min_tail_reads"], "32")
+        self.assertEqual(row["lean_tail_jetty_reuse_calls"], "1.000000")
+        self.assertEqual(len(list(self.root.glob("batch_get_*.csv"))), 6)
+
+    def test_tail_reuse_also_compares_against_lean_off(self):
+        self.tail_log("r1_n257_baseline.log", [[128, 128, 1]], 0, enabled=False)
+        self.tail_log("r1_n257_lean.log", [[129, 128]], 32)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(lean_main([str(self.root)]), 0)
+
+    def test_tail_reuse_uses_actual_uneven_core_slices(self):
+        self.tail_log("r1_n257_baseline.log", [[128], [128, 1]], 0)
+        self.tail_log("r1_n257_lean.log", [[128], [129]], 32)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(lean_main([str(self.root), "--reference-lean"]), 0)
+
+    def test_tail_policy_misrouting_or_false_reuse_proof_rejected(self):
+        self.tail_log("r1_n130_baseline.log", [[128, 2]], 0)
+        candidate = self.tail_log("r1_n130_lean.log", [[65, 65]], 32)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(lean_main([str(self.root), "--reference-lean"]), 2)
+        self.assertEqual(list(self.root.glob("*.csv")), [])
+        candidate = self.tail_log("r1_n130_lean.log", [[130]], 32)
+        original = candidate.read_text(encoding="utf-8")
+        for before, after in (("tail_jetty_reuse_samples=1000", "tail_jetty_reuse_samples=0"),
+                              ("min_tail_reads=32", "min_tail_reads=129"),
+                              ("min_tail_reads=32 ", ""),
+                              ("max_inflight_total=2048", "max_inflight_total=128")):
+            with self.subTest(before=before):
+                candidate.write_text(original.replace(before, after), encoding="utf-8")
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(lean_main([str(self.root), "--reference-lean"]), 2)
+                self.assertEqual(list(self.root.glob("*.csv")), [])
+
+    def test_tail_thresholds_not_pooled_in_multi_round_summary(self):
+        for round_id, threshold in ((1, 32), (2, 128), (3, 32)):
+            self.tail_log(f"r{round_id}_n130_baseline.log", [[128, 2]], 0)
+            self.tail_log(f"r{round_id}_n130_lean.log", [[130]], threshold)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(lean_main([str(self.root), "--reference-lean"]), 0)
+        with (self.root / "batch_get_summary.csv").open(encoding="utf-8-sig", newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(sorted(int(row["rounds"]) for row in rows), [1, 2])
+
     def test_rejoins_numeric_fields_keys_and_completion_markers(self):
         path = self.timeline_log("r1_n32_baseline.log")
         original = path.read_text(encoding="utf-8")

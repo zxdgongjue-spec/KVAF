@@ -20,6 +20,16 @@ target_include_directories(kvaf_batch_get_lean_kernel_model_test PRIVATE
   ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include)
 target_compile_definitions(kvaf_batch_get_lean_kernel_model_test PRIVATE KVAF_BATCH_GET_LEAN_SCHEDULE=1)
 add_test(NAME kvaf_batch_get_lean_kernel_model_test COMMAND kvaf_batch_get_lean_kernel_model_test)
+foreach(tail_threshold IN ITEMS 32 128)
+  set(tail_target kvaf_batch_get_tail_${tail_threshold}_kernel_model_test)
+  add_executable(${tail_target} batch_get_kernel_model_test.cc)
+  target_include_directories(${tail_target} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/aiv_model
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include)
+  target_compile_definitions(${tail_target} PRIVATE
+    KVAF_BATCH_GET_LEAN_SCHEDULE=1 KVAF_BATCH_GET_MIN_TAIL_READS=${tail_threshold})
+  add_test(NAME ${tail_target} COMMAND ${tail_target})
+endforeach()
 add_test(NAME kvaf_batch_get_inflight_config_python
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_inflight_config.py")
