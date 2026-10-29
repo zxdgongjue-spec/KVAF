@@ -33,7 +33,7 @@ uint64_t ProbePhase(uint32_t probe) {
   switch (probe) {
     case KVAF_SEQ_PROBE_DONE: return KVAF_SEQ_AFTER_DONE;
     case KVAF_SEQ_PROBE_FLUSH: return KVAF_SEQ_AFTER_FLUSH;
-    case KVAF_SEQ_PROBE_LOAD: return KVAF_SEQ_AFTER_LOAD;
+    case KVAF_SEQ_PROBE_LOAD: return KVAF_SCATTER_AFTER_LOAD_VERIFIED;
     case KVAF_SEQ_PROBE_COPY: return KVAF_SEQ_AFTER_COPY;
     default: return KVAF_SEQ_COMPLETE;
   }
@@ -99,6 +99,7 @@ struct ScatterBatchGet::Impl {
     const auto* statuses = static_cast<const KvafSequentialStatus*>(status_host);
     const uint64_t expected_result = args.scatter_probe ? KVAF_SEQ_PROBE_COMPLETE : KVAF_SEQ_OK;
     const uint64_t expected_phase = ProbePhase(args.scatter_probe);
+    uint64_t verified_requests = 0;
     for (uint32_t i = 0; i < config.npu_core_count; ++i) {
       const auto& s = statuses[i];
       if (s.magic != KVAF_SEQ_STATUS_MAGIC || s.sequence != sequence || s.result != expected_result ||
@@ -109,15 +110,24 @@ struct ScatterBatchGet::Impl {
             std::to_string(s.sequence) + " phase=" + std::to_string(s.phase) +
             " result=" + std::to_string(s.result) + " probe=" + ProbeName(args.scatter_probe) +
             " expected_phase=" + std::to_string(expected_phase) +
-            " expected_result=" + std::to_string(expected_result));
+            " expected_result=" + std::to_string(expected_result) +
+            (s.result == KVAF_SCATTER_MTE2_MISMATCH ? " detail=MTE2_GM_UB_byte_mismatch" : ""));
       }
+      verified_requests += s.requests;
+    }
+    if (args.scatter_probe == KVAF_SEQ_PROBE_LOAD && !verified_requests) {
+      failed = true;
+      return Error("MTE2 load probe verified no requests");
     }
     if (args.scatter_probe) {
       // Prefix probes do not fill output. Even the full-copy probe uses this
       // marker, so ordinary callers cannot mistake a diagnostic for normal work.
       return Status::NotImplemented("[KVAF_AIV_SCATTER_PROBE_COMPLETE] stage=" +
           std::string(ProbeName(args.scatter_probe)) + " sequence=" + std::to_string(sequence) +
-          " cores=" + std::to_string(config.npu_core_count));
+          " cores=" + std::to_string(config.npu_core_count) +
+          (args.scatter_probe == KVAF_SEQ_PROBE_LOAD ?
+              " verification=gm_ub_byte_compare verified_bytes=" +
+                  std::to_string(verified_requests * config.batch_get_token_bytes) : ""));
     }
     return Status::OK();
   }

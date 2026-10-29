@@ -303,13 +303,15 @@ int main() {
             std::memcpy(expected.data() + uint64_t(f.rows[i]) * bytes,
                         reinterpret_cast<void*>(f.addresses[f.indices[i]] + f.offsets[i]), bytes);
           const auto reads = aiv_model::mte2_copies, writes = aiv_model::mte3_copies;
+          const auto scalar_reads = aiv_model::ub_scalar_reads;
           for (uint32_t core = 0; core < workers; ++core) {
             aiv_model::core = core;
             Launch(f.args);
             const auto& s = f.status[core];
             assert(s.magic == KVAF_SEQ_STATUS_MAGIC && s.sequence == f.args.sequence);
             assert(s.result == KVAF_SEQ_PROBE_COMPLETE);
-            assert(s.phase == uint64_t(KVAF_SEQ_AFTER_DONE) + probe - KVAF_SEQ_PROBE_DONE);
+            assert(s.phase == (probe == KVAF_SEQ_PROBE_LOAD ? KVAF_SCATTER_AFTER_LOAD_VERIFIED :
+                uint64_t(KVAF_SEQ_AFTER_DONE) + probe - KVAF_SEQ_PROBE_DONE));
           }
           assert(f.push_done);  // Every probe still needs the real notify/done protocol.
           assert(f.output == expected);
@@ -317,12 +319,27 @@ int main() {
               count * ((bytes + kCopyBytes - 1) / kCopyBytes) : 0;
           assert(aiv_model::mte2_copies - reads == expected_reads);
           assert(aiv_model::mte3_copies - writes == (probe == KVAF_SEQ_PROBE_COPY ? expected_reads : 0));
+          assert(aiv_model::ub_scalar_reads - scalar_reads ==
+              (probe == KVAF_SEQ_PROBE_LOAD ? uint64_t(count) * bytes : 0));
           assert(!aiv_model::mte2.destination && !aiv_model::mte3.destination);
           for (const auto& pipeline : model_events)
             for (const auto& direction : pipeline)
               for (bool pending : direction) assert(!pending);
         }
       }
+  {
+    // A successful DMA completion with one wrong UB byte must fail the load
+    // probe, without changing output or issuing any MTE3 payload operation.
+    Fixture corrupt(3, 656, 1, KVAF_SEQ_SCATTER, 6);
+    corrupt.args.scatter_probe = KVAF_SEQ_PROBE_LOAD;
+    const auto writes = aiv_model::mte3_copies;
+    aiv_model::corrupt_next_mte2 = true;
+    corrupt.Run(false);
+    assert(!aiv_model::corrupt_next_mte2);
+    assert(corrupt.status[0].result == KVAF_SCATTER_MTE2_MISMATCH);
+    assert(corrupt.status[0].phase == KVAF_SEQ_PAYLOAD);
+    assert(aiv_model::mte3_copies == writes);
+  }
   {
     Fixture empty(1, 656, 1, KVAF_SEQ_SCATTER, 6);
     empty.args.scatter_probe = KVAF_SEQ_PROBE_DONE; empty.active = 0; empty.Run(false);
@@ -355,7 +372,17 @@ int main() {
           std::memset(aiv_model::ub, 0xe9, sizeof(aiv_model::ub));
           expected = output;
           std::copy_n(source.data() + offset, bytes, expected.data() + destination_offset);
-          CopyPayload(Address(source.data() + offset), Address(output.data() + destination_offset), bytes);
+          // First validate MTE2 independently against the GM source. No output
+          // change, MTE3 copy, or padding byte may participate in verification.
+          const auto writes = aiv_model::mte3_copies;
+          const auto scalar_reads = aiv_model::ub_scalar_reads;
+          assert(CopyPayload(Address(source.data() + offset), Address(output.data() + destination_offset),
+                             bytes, KVAF_SEQ_PROBE_LOAD) == KVAF_SEQ_OK);
+          assert(aiv_model::mte3_copies == writes);
+          assert(aiv_model::ub_scalar_reads - scalar_reads == bytes);
+          assert(std::all_of(output.begin(), output.end(), [](uint8_t b) { return b == 0xad; }));
+          assert(CopyPayload(Address(source.data() + offset), Address(output.data() + destination_offset),
+                             bytes) == KVAF_SEQ_OK);
           assert(output == expected);
           assert(!aiv_model::mte2.destination && !aiv_model::mte3.destination);
           assert(std::all_of(aiv_model::ub + kCopyBytes, aiv_model::ub + sizeof(aiv_model::ub),

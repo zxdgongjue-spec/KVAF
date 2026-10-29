@@ -43,6 +43,8 @@ struct PendingCopy {
 };
 inline PendingCopy mte2, mte3;
 inline uint64_t mte2_copies{}, mte3_copies{};
+inline uint64_t ub_scalar_reads{};
+inline bool corrupt_next_mte2{};
 }
 inline void set_flag(int source, int target, event_t event) {
   if (model_events[source][target][event]) std::abort();
@@ -51,7 +53,15 @@ inline void set_flag(int source, int target, event_t event) {
 inline void wait_flag(int source, int target, event_t event) {
   if (!model_events[source][target][event]) std::abort();
   model_events[source][target][event] = false;
-  if (source == PIPE_MTE2) aiv_model::mte2.Finish();
+  if (source == PIPE_MTE2) {
+    auto* dst = aiv_model::mte2.destination;
+    const auto bytes = aiv_model::mte2.bytes;
+    aiv_model::mte2.Finish();
+    if (dst && bytes && aiv_model::corrupt_next_mte2) {
+      dst[bytes - 1] ^= 1;
+      aiv_model::corrupt_next_mte2 = false;
+    }
+  }
   if (source == PIPE_MTE3) aiv_model::mte3.Finish();
 }
 inline void set_loop_size_ubtoout(uint64_t) {}
@@ -83,6 +93,12 @@ enum class CacheLine { SINGLE_CACHE_LINE };
 enum class DcciDst { CACHELINE_OUT };
 enum class CacheMode { CACHE_MODE_DISABLE };
 enum class TPosition : uint8_t { VECIN };
+enum class DataCopyMVType : uint8_t { UB_TO_OUT, OUT_TO_UB };
+inline void ResetLoopModePara(DataCopyMVType type) {
+  // Hardware register effects need device validation; model only the selected
+  // direction. The MTE2 probe must not configure the MTE3 pipeline.
+  if (type != DataCopyMVType::OUT_TO_UB) std::abort();
+}
 template <typename T> struct GlobalTensor {
   T* data;
   void SetGlobalBuffer(T* value) { data = value; }
@@ -91,6 +107,19 @@ template <typename T> struct GlobalTensor {
 };
 template <typename T> struct LocalTensor {
   struct { uint8_t logicPos; uintptr_t bufferAddr; uint32_t dataLen; } address_{};
+  LocalTensor() = default;
+  LocalTensor(TPosition pos, uint32_t offset, uint32_t elements) {
+    if (offset % 32 || uint64_t(offset) + uint64_t(elements) * sizeof(T) > sizeof(aiv_model::ub))
+      std::abort();
+    address_ = {static_cast<uint8_t>(pos), get_imm(offset), elements * uint32_t(sizeof(T))};
+  }
+  T GetValue(uint32_t index) const {
+    // A scalar consumer must wait for MTE2 before reading its destination.
+    if (aiv_model::mte2.destination || uint64_t(index + 1) * sizeof(T) > address_.dataLen)
+      std::abort();
+    ++aiv_model::ub_scalar_reads;
+    return reinterpret_cast<const T*>(address_.bufferAddr)[index];
+  }
 };
 struct DataCopyExtParams {
   uint16_t blockCount;

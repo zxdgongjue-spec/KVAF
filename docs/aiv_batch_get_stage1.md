@@ -19,6 +19,9 @@ AIV 不调用 UMDK；scatter 使用注册 HBM mailbox，gather 使用手写 USER
 Scatter 的本地 payload 搬运使用 `DataCopyPad<uint8_t>`，通过一个 16 KiB UB
 缓冲顺序执行 MTE2（GM→UB）和 MTE3（UB→GM）。MTE2 完成后才写出，MTE3
 完成后才复用缓冲并报告完成；长度按字节给出，UB padding 不写到 output。
+UB 通过公开的 `LocalTensor<uint8_t>(TPosition::VECIN, 0, 16384)` 构造，
+每次读入前单独调用 `ResetLoopModePara(DataCopyMVType::OUT_TO_UB)`，
+将 GM→UB 恢复为普通搬运模式。这项配置不调用 `InitSocState()` 或 TPipe。
 源 GlobalTensor 禁用 L2 cache hint，且不再经 SIMT 读取被 CPU WRITE 更新的
 staging。原实现的 MainScalar cache 刷新不能代替 SIMT cache 刷新。
 Scatter kernel 已按硬件故障定位需要撤掉入口的 `InitSocState()`，保留退出前的
@@ -260,18 +263,68 @@ KVAF_RUN_NPU_TESTS=1 DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 \
 UB 范围、异步搬运依赖、缓冲复用和输出内容；模型通过不代表硬件初始化状态
 已验证。原来的 MTE 异常是否仍然存在，需要用新二进制复测。
 
-沿用现有 CPU 服务和 peer 配置，只需重编译 scatter kernel，先测试 `load`：
+回退初始化时只需重编译 scatter kernel。当前 `load` 已增加 MTE2 内容校验，
+需要同时重编译 Host 和 kernel，沿用现有 CPU 服务和 peer 配置：
 
 ```bash
 git pull --ff-only
-cmake --build build-npu --target kvaf_scatter_batch_get_kernel -j
+cmake --build build-npu -j
 KVAF_RUN_NPU_TESTS=1 DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 \
   KVAF_AIV_SCATTER_PROBE=load \
   KVAF_BATCH_GET_KERNEL="$PWD/build-npu/bin/kvaf_scatter_batch_get_kernels.o" \
   python -u tests/python/test_aiv_scatter_batch_get.py
 ```
 
-`load` 通过后再测 `copy`，然后清空探针运行完整 scatter 回归。
+当前先验收 `load`；MTE3 的 `copy` 和完整 scatter 回归留待后续。
+
+## MTE2 独立内容校验
+
+本次先落实 GM→UB，`load` 不发出 MTE3 payload 拷贝，也不执行 MTE2→MTE3
+事件握手。其路径为：CPU 发布整批 done → 刷新 staging → 配置 MTE2 普通模式
+→ S→MTE2 → `DataCopyPad` → MTE2→S → 标量逐字节比较 UB 与 staging。
+每一块最多 16 KiB，只比较本次有效的 n 字节，比较完才复用 UB；output 始终
+保留 guard。保留 kernel 退出屏障，不引入流水或在途控制。
+
+参考源码固定到官方 `ops-transformer v9.1.0`：
+
+- [arch35 LocalWindowCopy](https://gitcode.com/cann/ops-transformer/blob/v9.1.0/mc2/moe_distribute_dispatch_teardown/op_kernel/arch35/moe_distribute_dispatch_teardown_arch35.h)：
+  使用字节长度的 DataCopyPad 参数、关闭源 L2 cache hint，并在标量读取 UB 前
+  同步 MTE2→S。此处只参考读入与同步，不复制其量化和写出逻辑。
+- [GM→UB→GM helper](https://gitcode.com/cann/ops-transformer/blob/v9.1.0/mc2/common/op_kernel/gm_ub_gm_copy.h)：
+  参考缓冲生命周期；不照搬其向上取整的 GM 尾块读入长度。
+
+同时核对了官方 `asc-devkit v9.1.0`（`e5451c7`）的实际实现：
+
+- [LocalTensor 构造和 GetValue](https://gitcode.com/cann/asc-devkit/blob/v9.1.0/impl/basic_api/kernel_tensor_impl.h)：
+  构造函数设置 UB 偏移、位置及长度，不调用全局初始化；`GetValue` 读取 UB。
+- [3510 TPipe 构造](https://gitcode.com/cann/asc-devkit/blob/v9.1.0/impl/basic_api/dav_3510/kernel_tpipe_impl_c310.h)：
+  会调用 `InitSocState()`，因此此次不引入 TPipe/TQue。
+- [3510 搬运实现](https://gitcode.com/cann/asc-devkit/blob/v9.1.0/impl/basic_api/dav_3510/kernel_operator_data_copy_impl.h)：
+  `ResetOutLoopModeParaImpl` 仅将 `LOOP_SIZE_OUTTOUB` 写为普通模式值
+  `(1UL << 21) | 1UL`。通过公开的 `ResetLoopModePara(OUT_TO_UB)` 调用，
+  不恢复 CTRL、Mask、atomic 或 MTE3 配置。模型不模拟这个寄存器的硬件效果。
+
+协议布局不变，但 `load` 完成 phase 改为 11，表示字节校验完成；旧 phase=9
+仅代表执行到达，新的 Host 会拒绝。出现内容不一致时返回 result=7，错误含
+`detail=MTE2_GM_UB_byte_mismatch`，不报告 probe 完成。全部通过时输出：
+
+```text
+[KVAF_AIV_SCATTER_PROBE_COMPLETE] stage=load ... verification=gm_ub_byte_compare verified_bytes=...
+```
+
+Python 校验标记和 `verified_bytes == active * token_bytes`，同时检查 output
+未变。默认在一个 Runtime 中执行 `[1, min(2 * cores + 1, capacity), 1]` 三个
+批次，改变源索引，覆盖多行/多批次 UB 复用与无任务核；不仅测试一次到达。
+CPU 模型还注入单字节 UB 损坏，确保同步完成但内容错误时测试会失败。
+
+先按上文命令测试 1 核、656 B；再通过 `KVAF_NPU_TOKEN_BYTES` 分别测试
+31、32、33、16383、16384、16385，覆盖非对齐长度和 16 KiB 边界，
+再用 `KVAF_NPU_CORE_COUNT=3/8` 测试分核。大 token 测试可设置
+`KVAF_NPU_REQUESTS=19` 降低输出张量内存占用。当前只要求验收 `load`，
+不运行 `copy`。本地没有 CANN 编译器和 NPU，硬件正确性需以上测试确认。
+
+这个校验证明的是当前 staging→UB 的内容一致性；它不能单独证明 CPU 取到了
+正确的业务源数据，也不能代替后续的完整输出校验。
 
 ## Scatter 507015 的分段定位
 
@@ -284,21 +337,21 @@ HBM done 轮询和本地 `CopyPayload`，所以这些部分仍需单独定位。
 字段，UBSan 可复现并验证此修正。这是 Host 初始化问题，尚无证据将它与
 AIV kernel 的 507015/errcode 259 联系起来。
 
-`KVAF_AIV_SCATTER_PROBE` 提供同一 kernel 的四个检查点。每次只运行一个非空
-批次，保留真实的 descriptor/notify、CPU payload WRITE 和 done 协议；不能
+`KVAF_AIV_SCATTER_PROBE` 提供同一 kernel 的四个检查点。done/flush/copy 各运行
+一个非空批次，load 运行三个批次校验 UB 复用。保留真实的 descriptor/notify、
+CPU payload WRITE 和 done 协议；不能
 用 CPU 侧 WRITE CQ 成功代替 AIV 读到本轮 done 的证明。
 
 | 值 | AIV 执行到哪里 | Python 检查 |
 | --- | --- | --- |
 | `done` | 确认本轮 done 的 sequence/status，随后返回 | output 全部保持 guard |
 | `flush` | 再执行输出行寻址、UB tensor 初始化和 staging 的 scalar cache 处理 | output 全部保持 guard，没有 payload DMA |
-| `load` | 再执行参数设置、事件同步和 GM→UB，等待 MTE2 完成 | output 全部保持 guard，没有 MTE3 写出 |
+| `load` | GM→UB 后通过 MTE2→S 等待读入，再逐字节比较 UB/staging | 必须有字节校验完成标记且字节数匹配，output 保持 guard，没有 MTE3 写出 |
 | `copy` | 完整执行 GM→UB→GM 并等待 MTE3 完成 | 精确比较 payload 和所有 guard |
 
-`load` 为安全返回额外使用 MTE2→S 同步；它验证读取阶段及其诊断收尾，
-不提供 UB 数据正确性的证明。数据正确性由 `copy` 的逐字节比较验证。
-各探针使用相同的请求形状；单核默认 active=1、token=656 B，保留普通回归的
-8193 请求容量和输出行位置。多核时 active=min(cores, capacity)。
+`load` 现在验证全部有效 UB 数据与 staging 一致；`copy` 进一步验证最终输出。
+各探针保留普通回归的默认 8193 请求容量、656 B token 和输出行位置。
+done/flush/copy 的 active=min(cores, capacity)；load 的批次数量见上节。
 
 先在 NPU 端更新并重编译 Host 和 kernel，保留前文的 Python/kernel/CPU 地址
 环境变量。本次诊断开关不修改 CPU 协议，CPU 端可继续使用已匹配分支的服务。
@@ -472,9 +525,10 @@ manifest、宏和 `.ii`，按预处理后的有效定义提取初始化函数，
 - CPU 新源码使用 UMDK 24.12 头文件通过语法检查；macOS 检查时仅补充 Linux
   的 `MADV_HUGEPAGE` 常量，未链接或执行 CPU 硬件服务。
 
-用户此前已在硬件反馈 gather 的 1/3/8 核回归通过；拆分后的新 kernel 尚待上机
-复测。scatter 探针已反馈 flush 完成、
-load 失败，补初始化后仍有 507015，正在核对实际初始化源码。尚待验证 scatter
+用户此前已在硬件反馈 gather 的 1/3/8 核回归通过；拆分后撤回入口操作的独立
+gather 也已反馈成功（所给命令为 1 核）。scatter 探针此前反馈 flush 完成、
+load 失败，补初始化后仍有 507015。当前已撤掉整体初始化，并按官方源码调整
+MTE2 配置、UB 构造及内容验证，尚待上机验收新版 load。尚待验证 scatter
 的非对齐 MTE3 写出、CPU/NPU 缓存可见性、跨 Jetty
 done 保序及真实超时/断链回收。这些本地检查不替代 CANN 编译和双机验收。
 硬件回归未启用时返回 skip，不能视为硬件验收通过。

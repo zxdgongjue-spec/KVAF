@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import sys
 
 
@@ -49,7 +50,7 @@ def shutdown_runtime(runtime) -> None:
                   file=sys.stderr, flush=True)
 
 
-def expect_scatter_probe(call, stage: str) -> None:
+def expect_scatter_probe(call, stage: str, *, expected_bytes: int | None = None) -> None:
     """Only accept an acknowledged checkpoint, never a device/transport failure."""
     marker = f"[KVAF_AIV_SCATTER_PROBE_COMPLETE] stage={stage} "
     try:
@@ -57,6 +58,12 @@ def expect_scatter_probe(call, stage: str) -> None:
     except RuntimeError as error:
         if not str(error).startswith(marker):
             raise
+        if stage == "load" and not re.search(r"(?:^| )verification=gm_ub_byte_compare(?: |$)", str(error)):
+            raise AssertionError("load checkpoint has no byte verification; rebuild Host and kernel together") from error
+        if stage == "load":
+            match = re.search(r"(?:^| )verified_bytes=(\d+)(?: |$)", str(error))
+            if not match or int(match[1]) == 0 or (expected_bytes is not None and int(match[1]) != expected_bytes):
+                raise AssertionError("load checkpoint verified byte count does not match the request") from error
         print(str(error), flush=True)
     else:
         raise AssertionError("scatter probe returned ordinary success; rebuild Host and kernel together")
@@ -105,6 +112,10 @@ def run(mode: str) -> int:
         # One nonempty request per participating core; keep normal allocation and
         # output placement. Empty requests cannot establish a checkpoint.
         counts = [min(cores, capacity)]
+        if probe == "load":
+            # Reuse the same per-core UB across rows and launches, with changing
+            # source metadata; include workers with no rows in the first batch.
+            counts = [1, min(2 * cores + 1, capacity), 1]
     runtime = kvaf.NpuRuntime(
         kernel, token, tokens_per_block, device_id=device_id,
         npu_core_count=cores, batch_put_kernel_object_path=put_kernel,
@@ -144,7 +155,8 @@ def run(mode: str) -> int:
             kwargs = dict(synchronize=bool(probe) or bool(epoch % 2))
             if probe:
                 expect_scatter_probe(lambda: runtime.batch_get(
-                    view, indices, offsets, count, rows, output, **kwargs), probe)
+                    view, indices, offsets, count, rows, output, **kwargs), probe,
+                    expected_bytes=active * token)
             elif epoch % 2:
                 runtime.batch_get(view, indices, offsets, count, rows, output, **kwargs)
             else:
@@ -160,8 +172,9 @@ def run(mode: str) -> int:
         if probe:
             runtime.shutdown()
             output_check = "verified" if probe == "copy" else "unchanged"
+            load_check = " mte2=byte_verified_against_staging" if probe == "load" else ""
             print(f"PROBE_COMPLETE: stage={probe} cores={cores} token_bytes={token} "
-                  f"counts={counts} output={output_check} (not a full regression PASS)", flush=True)
+                  f"counts={counts} output={output_check}{load_check} (not a full regression PASS)", flush=True)
             return 0
 
         # Enqueue on two caller streams without an intervening caller sync.
