@@ -22,7 +22,13 @@ struct DevicePool {
   std::vector<void*> host_allocations;
   DevicePool() { Acl(aclrtCreateStream(&stream), "aclrtCreateStream"); }
   ~DevicePool() {
-    (void)aclrtSynchronizeStream(stream);
+    const auto ret = aclrtSynchronizeStream(stream);
+    if (ret != ACL_SUCCESS) {
+      // The process is exiting. Do not free caller buffers still referenced
+      // by failed work, or destroy the stream needed to drain that work.
+      std::fprintf(stderr, "[KVAF_UBMEM] retaining caller buffers/stream after failed drain, ret=%d\n", ret);
+      return;
+    }
     for (void* ptr : allocations) aclrtFree(ptr);
     for (void* ptr : host_allocations) aclrtFreeHost(ptr);
     aclrtDestroyStream(stream);
@@ -47,7 +53,8 @@ struct Config {
   std::uint32_t device = 0, cores = 2, rows = 17, token = 656, tokens = 128, repeat = 2;
 };
 
-void FullBlocks(kvaf::RuntimeCore& core, kvaf::peer::PeerLink& link, DevicePool& pool,
+void FullBlocks(kvaf::RuntimeCore& core, kvaf::ubmem::AccessOperator& op,
+                kvaf::peer::PeerLink& link, DevicePool& pool,
                 const Config& c, unsigned seed) {
   const std::uint64_t slot = static_cast<std::uint64_t>(c.token) * c.tokens;
   const auto base = core.remote_region().base;
@@ -59,6 +66,29 @@ void FullBlocks(kvaf::RuntimeCore& core, kvaf::peer::PeerLink& link, DevicePool&
     for (std::uint64_t b = 0; b < slot; ++b) input[offsets[i] + b] = Pattern(keys[i] * slot + b, seed);
   }
   auto* source = pool.Copy(input);
+  // Control for SIMT GM faults: use the same source bytes, per-row offsets,
+  // lengths and cores, but copy into local HBM instead of mapped CPU DDR.
+  std::vector<std::uint64_t> probe_metadata(3 * c.rows);
+  for (std::uint32_t i = 0; i < c.rows; ++i) {
+    probe_metadata[i] = offsets[i];
+    probe_metadata[c.rows + i] = lengths[i];
+    probe_metadata[2 * c.rows + i] = keys[i] * slot;
+  }
+  std::vector<std::uint8_t> local_copy(c.rows * slot, 0xD3);
+  auto* local_device = pool.Copy(local_copy);
+  auto* probe_device = pool.Copy(probe_metadata);
+  std::fprintf(stderr, "[KVAF_UBMEM] LOCAL_COPY_BEGIN rows=%u bytes=%zu\n", c.rows, local_copy.size());
+  Check(op.ProbeLocalCopy({source, input.size(), kvaf::DeviceKind::kNpu},
+      {local_device, local_copy.size(), kvaf::DeviceKind::kNpu},
+      {probe_device, probe_metadata.size() * sizeof(std::uint64_t), kvaf::DeviceKind::kNpu}, pool.stream));
+  Acl(aclrtMemcpy(local_copy.data(), local_copy.size(), local_device, local_copy.size(),
+                  ACL_MEMCPY_DEVICE_TO_HOST), "D2H local copy probe");
+  for (std::size_t i = 0; i < local_copy.size(); ++i) {
+    if (local_copy[i] != Pattern(i, seed))
+      throw std::runtime_error("local HBM copy payload mismatch at " + std::to_string(i));
+  }
+  std::fprintf(stderr, "[KVAF_UBMEM] LOCAL_COPY_VERIFIED\n");
+  std::fprintf(stderr, "[KVAF_UBMEM] MAPPED_PUT_BEGIN\n");
   Check(core.BatchPut({keys, {source, input.size(), kvaf::DeviceKind::kNpu}, offsets, lengths}, {pool.stream}));
   for (const auto key : keys) Check(link.UbmemRange(base, key * slot, slot, seed, false));
   std::puts("[KVAF_UBMEM] BATCH_PUT_CPU_VERIFIED");
@@ -175,6 +205,9 @@ int main(int argc, char** argv) {
     Acl(aclInit(nullptr), "aclInit");
     Acl(aclrtSetDevice(c.device), "aclrtSetDevice");
     {
+      // Declared first so the caller stream and buffers outlive RuntimeCore
+      // and AccessOperator during both normal and exception unwinding.
+      DevicePool buffers;
       auto link = std::make_shared<kvaf::peer::PeerLink>(c.peer);
       kvaf::ubmem::DdrAllocator allocator(link);
       kvaf::ubmem::AccessOperator op({c.kernel, c.hal, c.device, c.cores, link});
@@ -182,9 +215,8 @@ int main(int argc, char** argv) {
       kvaf::RuntimeCore core(*meta, op, allocator);
       const auto slot = static_cast<std::uint64_t>(c.token) * c.tokens;
       Check(core.Initialize({slot * c.rows, slot, kvaf::DeviceKind::kCpu}));
-      DevicePool buffers;
       for (unsigned iteration = 0; iteration < c.repeat; ++iteration) {
-        FullBlocks(core, *link, buffers, c, 17 + iteration * 13);
+        FullBlocks(core, op, *link, buffers, c, 17 + iteration * 13);
         VariablePut(core, *link, buffers, c, 91 + iteration * 13);
       }
       // RuntimeCore shuts down the operator before releasing remote DDR.

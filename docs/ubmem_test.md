@@ -42,6 +42,10 @@ source /actual/path/to/cann/set_env.sh
 
 ## 测试程序实际验证什么
 
+每轮先执行本地 HBM 拷贝对照，复用同一 Put kernel、源数据、偏移、长度和核数，
+仅把目的区换成本地 HBM，并逐字节校验。通过后打印 `LOCAL_COPY_VERIFIED`，
+随后打印 `MAPPED_PUT_BEGIN` 并开始真实 UBmem 测试。对照失败会停止测试。
+
 每轮测试依次执行：
 
 1. 通过现有 MetaManager 为一批倒序 Key 分配 slot，调用 BatchPut 写入完整 KV block。
@@ -138,6 +142,14 @@ HAL 映射和 UB 通路，需运行 CPU 改写后 NPU Get、NPU Put 后 CPU chec
 - `halMemExportToShareableHandleV2(FABRIC)`：CPU 端 Fabric 导出失败。
 - `halMemImportFromShareableHandleV2(FABRIC)` / `halMemMap`：NPU 侧导入、路由、权限或映射失败。
 - `CPU_MISMATCH` / `KERNEL_ERROR`：分别为 CPU 内容校验失败、内核请求范围等校验失败。
+- `aclrtSynchronizeStream` 返回 `507035`：CANN 定义为 Vector Core 执行异常。
+  程序立即输出 `aclGetRecentErrMsg()` 的详细信息；结合运行时日志中的 PC、访问地址和
+  vec/mte error info 定位，单凭该错误码不能确定具体原因。
+
+当前设备日志中的 334 表示 SIMT 非法 GM 访问或跨设备访问超时。若错误出现在
+`LOCAL_COPY_BEGIN` 后，先排查本地 SIMT 搬运及参数；若本地校验通过、错误出现在
+`MAPPED_PUT_BEGIN` 后，重点排查映射目的地址及其可达性。
+`DEVICE_MAPPING_READY` 和 `FAILED_LAUNCH` 输出设备编号、映射与输入范围，可与故障地址对照。
 
 同步 BatchPut 输出每核 `PUT_CORE`，包含设备报告的 `completed` 和 host 计算的 `expected`。
 默认 17 行、2 核应分别完成 9 行和 8 行；计数不符会在 MetaManager 提交前报错。

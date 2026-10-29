@@ -13,7 +13,11 @@
 namespace kvaf::ubmem {
 namespace {
 Status Acl(const char* operation, aclError code) {
-  return code == ACL_SUCCESS ? Status::OK() : HalError(operation, code);
+  if (code == ACL_SUCCESS) return Status::OK();
+  // Capture the failing task's details before cleanup ACL calls replace them.
+  const char* detail = aclGetRecentErrMsg();
+  if (detail && *detail) std::fprintf(stderr, "[KVAF_UBMEM] %s detail: %s\n", operation, detail);
+  return HalError(operation, code);
 }
 std::uint64_t AddressOf(const void* ptr) { return reinterpret_cast<std::uintptr_t>(ptr); }
 Status DriverDevice(std::uint32_t user_device, std::uint32_t* device) {
@@ -140,7 +144,18 @@ struct AccessOperator::Impl {
     status = Acl("aclrtMemcpyAsync(status)", aclrtMemcpyAsync(state.host_statuses, size,
         state.statuses, size, ACL_MEMCPY_DEVICE_TO_HOST, stream));
     if (status.ok()) status = Acl("aclrtSynchronizeStream", aclrtSynchronizeStream(stream));
-    if (!status.ok()) { ready = false; return status; }
+    if (!status.ok()) {
+      std::fprintf(stderr, "[KVAF_UBMEM] FAILED_LAUNCH op=%u rows=%u local_base=0x%llx local_bytes=%llu "
+          "mapped_base=0x%llx remote_bytes=%llu metadata=0x%llx\n",
+          static_cast<unsigned>(args.operation), args.capacity,
+          static_cast<unsigned long long>(args.local_base),
+          static_cast<unsigned long long>(args.local_bytes),
+          static_cast<unsigned long long>(args.mapped_base),
+          static_cast<unsigned long long>(args.remote_bytes),
+          static_cast<unsigned long long>(args.put_offsets));
+      ready = false;
+      return status;
+    }
     state.pending = StreamState::Pending::kNone;
     const auto* reports = static_cast<const CoreStatus*>(state.host_statuses);
     // Print every Put core before validating, including cores after a failure.
@@ -211,8 +226,12 @@ Status AccessOperator::Initialize(const RemoteRegionDesc& region) {
   if (status.ok()) status = impl_->LoadKernel();
   if (!status.ok()) { (void)Shutdown(); return status; }
   impl_->ready = true;
-  std::fprintf(stderr, "[KVAF_UBMEM] DEVICE_MAPPING_READY bytes=%llu cores=%u\n",
-      static_cast<unsigned long long>(region.length), impl_->options.cores);
+  std::fprintf(stderr, "[KVAF_UBMEM] DEVICE_MAPPING_READY bytes=%llu cores=%u acl_device=%u hal_device=%u "
+      "host_base=0x%llx mapped_base=0x%llx\n",
+      static_cast<unsigned long long>(region.length), impl_->options.cores,
+      impl_->options.device_id, logical_device,
+      static_cast<unsigned long long>(region.base),
+      static_cast<unsigned long long>(impl_->mapping->address()));
   return Status::OK();
 }
 
@@ -314,6 +333,23 @@ Status AccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
   a.put_offsets = AddressOf(state->metadata);
   a.put_lengths = a.put_offsets + rows * 8;
   a.put_destinations = a.put_lengths + rows * 8;
+  return impl_->Launch(a, stream, *state, true);
+}
+
+Status AccessOperator::ProbeLocalCopy(const ConstBufferView& input, const MutableBufferView& output,
+                                     const ConstBufferView& metadata, void* caller_stream) {
+  auto stream = static_cast<aclrtStream>(caller_stream);
+  Impl::StreamState* state;
+  auto status = impl_->State(stream, &state);
+  if (!status.ok()) return status;
+  auto a = impl_->Args(Operation::kPut, const_cast<void*>(input.data), input.bytes, *state);
+  a.remote_base = 0;  // Probe destinations are offsets into local HBM.
+  a.remote_bytes = output.bytes;
+  a.mapped_base = AddressOf(output.data);
+  a.capacity = metadata.bytes / (3 * sizeof(std::uint64_t));
+  a.put_offsets = AddressOf(metadata.data);
+  a.put_lengths = a.put_offsets + a.capacity * sizeof(std::uint64_t);
+  a.put_destinations = a.put_lengths + a.capacity * sizeof(std::uint64_t);
   return impl_->Launch(a, stream, *state, true);
 }
 }  // namespace kvaf::ubmem

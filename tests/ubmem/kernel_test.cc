@@ -113,5 +113,13 @@ int main() {
   CHECK(statuses[1].result == 0 && statuses[1].completed == 8);
   for (std::uint64_t i = 0; i < rows * slot; ++i) CHECK(big_remote[i] == TestPattern(i, 17));
   for (std::uint64_t i = rows * slot; i < big_remote.size(); ++i) CHECK(big_remote[i] == 0xCF);
+  // The local-HBM control experiment uses the same kernel with offset-based
+  // destinations. It must produce exactly the same bytes as mapped addressing.
+  a.remote_base = 0;
+  for (auto& address : dst_addresses) address -= remote_base;
+  std::fill(big_remote.begin(), big_remote.end(), 0xCF);
+  Run(a);
+  for (std::uint64_t i = 0; i < rows * slot; ++i) CHECK(big_remote[i] == TestPattern(i, 17));
+  for (std::uint64_t i = rows * slot; i < big_remote.size(); ++i) CHECK(big_remote[i] == 0xCF);
   std::puts("UBmem actual kernel: mapped addressing, 656-byte reads, variable puts, inactive tail, guards, and invalid ranges passed");
 }
