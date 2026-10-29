@@ -39,6 +39,20 @@ std::map<urma_target_seg_t*, Registration> registrations;
   std::_Exit(2);
 }
 void Check(bool ok, const char* text) { if (!ok) throw std::runtime_error(text); }
+constexpr std::uint32_t kMaxReadChunkBytes = 65536;  // Diagnostic software limit, not a device capability.
+std::uint32_t ParseReadChunkBytes(const std::string& text) {
+  constexpr const char* error = "read chunk bytes must be a decimal integer in [1,65536]";
+  Check(!text.empty(), error);
+  std::uint32_t value = 0;
+  for (char c : text) {
+    Check(c >= '0' && c <= '9', error);
+    const auto digit = static_cast<std::uint32_t>(c - '0');
+    Check(value <= (kMaxReadChunkBytes - digit) / 10, error);
+    value = value * 10 + digit;
+  }
+  Check(value != 0, error);
+  return value;
+}
 void ReleaseAlias(Registration& r) {
   if (r.local && r.local != r.remote && urma_unregister_seg(r.local)) Fatal("unregister local alias");
   if (r.local_token && urma_free_token_id(r.local_token)) Fatal("free alias token");
@@ -241,23 +255,6 @@ void CheckPullQueryState(const char* stage, const TpQuery& actual, const TpQuery
     throw std::runtime_error(std::string("pull CTP parameters overwritten at ") + stage);
 }
 
-using QueryDeviceFn = urma_status_t (*)(urma_device_t*, urma_device_attr_t*);
-std::uint32_t QueryDeviceReadLimit(QueryDeviceFn query, urma_device_t* device) {
-  auto output = std::make_unique<NativeBuffer<urma_device_attr_t>>();
-  errno = 0;
-  const int rc = query(device, &output->value);
-  const int saved_errno = errno;
-  // Validate storage before trusting any field from an incompatible library.
-  CheckNativeBuffer("urma_query_device", *output, rc, saved_errno);
-  errno = saved_errno;
-  Check(rc == 0, "query device");
-  const auto& capabilities = output->value;
-  const auto limit = static_cast<std::uint32_t>(
-    std::min<std::uint64_t>(65536, capabilities.dev_cap.max_msg_size));
-  Check(limit && capabilities.dev_cap.max_jfs_sge, "invalid device READ limits");
-  return limit;
-}
-
 struct PullCtpResult {
   int rc{};
   std::uint32_t count{};
@@ -318,6 +315,7 @@ struct State {
 
   void Connect(const Message& request, Message& reply) {
     Check(region && !source && !jetty, "ARM required, or source already connected");
+    Check(max_bytes && max_bytes <= kMaxReadChunkBytes, "explicit READ chunk bytes required");
     auto* ctx = region->context;
     auto descriptor = DecodeSourceDescriptor(request, region->bytes, ctx->eid);
     const auto expected_query = std::make_unique<TpQuery>(descriptor.tp_query);
@@ -338,8 +336,6 @@ struct State {
     check_query("after_import_seg");
     Check(source, "import HBM segment");
     source_base = request.base;
-    max_bytes = QueryDeviceReadLimit(urma_query_device, ctx->dev);
-    check_query("after_query_device");
     urma_jfc_cfg_t cq_cfg{}; cq_cfg.depth = 16384;
     cq = urma_create_jfc(ctx, &cq_cfg);
     check_query("after_create_jfc"); Check(cq, "create pull CQ");
@@ -380,6 +376,7 @@ struct State {
   void Read(std::uint64_t round) {
     Check(peer && !closed && round == ready + 1 && acknowledged == ready,
       "PULL requires connected source and previous Decode ACK");
+    Check(max_bytes && max_bytes <= kMaxReadChunkBytes, "invalid explicit READ chunk bytes");
     const auto bytes = region->bytes - 2 * kGuard;
     for (std::uint64_t offset = 0; offset < bytes;) {
       const auto length = static_cast<std::uint32_t>(std::min<std::uint64_t>(max_bytes, bytes - offset));
@@ -504,12 +501,15 @@ int Listen(const char* address, int port) {
 
 int main(int argc, char** argv) {
   using namespace probe;
-  if (argc != 9) {
-    std::fprintf(stderr, "Usage: %s CASE UB_DEVICE EID_INDEX ALLOCATION_BYTES LISTEN_IPV4 KVAF_PORT PROBE_PORT PAGE_MODE\n"
+  if (argc != 11 || std::string(argv[9]) != "--read-chunk-bytes") {
+    std::fprintf(stderr, "Usage: %s CASE UB_DEVICE EID_INDEX ALLOCATION_BYTES LISTEN_IPV4 KVAF_PORT PROBE_PORT PAGE_MODE --read-chunk-bytes N\n"
       "CASE: single-current single-pinned single-plus-bit0 single-local-write-pinned dual dual-compatible dual-reverse dual-both-pinned dual-separate-context\n"
-      "PAGE_MODE: default or thp\n", argv[0]); return 2;
+      "PAGE_MODE: default or thp\n"
+      "READ CHUNK: required explicit candidate, software range 1..65536; hardware limits are NOT queried\n",
+      argv[0]); return 2;
   }
   try {
+    const auto read_chunk_bytes = ParseReadChunkBytes(argv[10]);
     mode = argv[1];
     const std::vector<std::string> cases{"single-current", "single-pinned", "single-plus-bit0",
       "single-local-write-pinned", "dual", "dual-compatible", "dual-reverse", "dual-both-pinned", "dual-separate-context"};
@@ -525,8 +525,11 @@ int main(int argc, char** argv) {
     int service = Listen(argv[5], std::stoi(argv[6]));
     int diagnostic = Listen(argv[5], std::stoi(argv[7]));
     State state;
-    std::fprintf(stderr, "PROBE_READY case=%s bytes=%llu header=%s native_sge_bytes=%zu wire_sge_bytes=%zu\n",
-      mode.c_str(), (unsigned long long)allocation_bytes, kHeaderAccessModel, sizeof(urma_sge_t), sizeof(Sge));
+    state.max_bytes = read_chunk_bytes;
+    std::fprintf(stderr, "PROBE_READY case=%s bytes=%llu header=%s native_sge_bytes=%zu wire_sge_bytes=%zu "
+      "read_chunk_bytes=%u capability_source=explicit_candidate hardware_limits_queried=0 src_sge=1 dst_sge=1\n",
+      mode.c_str(), (unsigned long long)allocation_bytes, kHeaderAccessModel, sizeof(urma_sge_t), sizeof(Sge),
+      read_chunk_bytes);
     for (;;) {
       fd_set fds; FD_ZERO(&fds); FD_SET(service, &fds); FD_SET(diagnostic, &fds);
       const int rc = select(std::max(service, diagnostic)+1, &fds, nullptr, nullptr, nullptr);

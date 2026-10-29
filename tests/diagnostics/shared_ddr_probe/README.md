@@ -69,6 +69,9 @@ segment=48 B、Jetty ID=24 B、NPU Jetty key=32 B、CPU Jetty key=28 B 的约束
 
 目标为 Linux AArch64 + 部署时配套的 UMDK/CANN。所有命令从 KVAF 仓库根目录执行。
 示例路径需要替换成目标机路径；构建不下载或安装驱动。
+K 是运行 Linux 服务的 Host CPU，可以是 NPU 服务器的机头；Prefill、Decode 分别使用该机
+两张 NPU 和独立进程。三角色不要求三台机器。控制端口可以用 loopback，但 KV payload
+仍须经 K 的 URMA READ 进入 DDR，再由 Decode BatchGet 读取；同机通过不能外推三机拓扑。
 
 K 机器：
 
@@ -125,11 +128,20 @@ Prefill 导出库自己加载 Direct HCCP，建议和 Decode 使用独立进程�
 set -o pipefail
 build-ddr-probe-cpu/kvaf_ddr_probe \
   single-plus-bit0 udma0 0 2695168 0.0.0.0 29990 29991 default \
+  --read-chunk-bytes 4096 \
   2>&1 | tee single-plus-bit0.k.log
 ```
 
-末参数 `default` 使用现有 service 的普通页模式，改成 `thp` 可复测其 THP 分配路径。
+`PAGE_MODE` 参数 `default` 使用现有 service 的普通页模式，改成 `thp` 可复测其 THP 分配路径。
 THP 是另一个变量，不能由 `non_pin` 的数值推断。测试端口是无鉴权诊断接口，只在隔离测试网络使用。
+
+`--read-chunk-bytes` 是必填的 K 端实验参数，无默认值；软件允许范围是十进制整数 1..65536 B。
+示例的 4096 B 是待验证的分块候选，不代表已经查询或确认设备能力上限。
+请按部署资料核对候选单次 READ 长度；本实验每条 READ 固定源、目的各一个 SGE，仍检查
+Jetty 创建、post、CQ 和最终数据。若缺少能力资料，全轮通过只能证明该显式候选在本次部署可用。
+小分块会增加串行请求数量；其超时不能直接解释为硬件不支持 READ。本程序不做吞吐验收。
+启动日志打印 `capability_source=explicit_candidate hardware_limits_queried=0`，
+不会自动查询能力或按未知硬件能力下调配置值；最后一块仅读取剩余字节，失败后不改用另一长度重试。
 
 2. Decode：替换 K 的 IP、NPU device ID、该 NPU 的 32 位十六进制 EID、K UB 设备名。
 
@@ -240,17 +252,20 @@ flag/mode、容量、API 返回码 `rc`、输出 `count`、`tp` 和即时保存�
 程序仍只查询配置的 EID 一次，不自动改用资源 EID 或切换 K 的 UB 设备。
 若查询日志中 flag/mode 和双端 EID 全零，不能继续按普通路径不可达判断。
 `DecodeSourceDescriptor` 应构造 flag=1、RM 模式及非零 EID；当前程序在解码后保存独立 heap 快照，
-在 import_seg、query_device、三个队列创建调用后逐次输出 `PULL_CTP_STATE stage=... unchanged=...`。
+在 import_seg、三个队列创建调用后逐次输出 `PULL_CTP_STATE stage=... unchanged=...`。
 首次变化立即失败，绝不重新填回字段继续执行。`PULL_CTP_QUERY_BEGIN` 在实际查询之前打印，
 避免把查询返回后已被破坏的输入快照误认为真实入参。
 
 编译头文件来自下载的 24.12 源码、运行库来自系统 `/usr/lib64`，不能单凭头文件宏认定 ABI 配套。
-特别是 `urma_query_device` 没有输出长度参数；若部署库的 `urma_device_attr_t` 更大，可能覆盖
-按旧头文件分配的调用方存储。程序为该输出以及 CTP config/count/info 分别分配带前后哨兵的
-独立 heap 缓冲，打印 `NATIVE_ABI_GUARD op=... value_bytes=... before_ok=... after_ok=...`。
-检测到边界改写时，在使用返回字段之前立即停止；哨兵填充仅用于定位，不是 ABI 兼容层。
-即使哨兵完整，也不能据此证明所有字段偏移与部署库一致。需要保留首次失败的 stage/op 日志，
-并核对实际库及其配套头文件；不要仅扩容输出结构后宣称兼容。
+真机已观察到 `urma_query_device` 返回成功，却写出了该头文件声明的 312 B 输出边界；
+它没有输出长度参数，旧布局不能安全解释部署库的完整属性结构。
+本版删除这次非必需的能力查询，改为显式分块候选；不再分配大缓冲后继续按旧布局读字段。
+这消除了已定位的越界调用，不代表其余所有 ABI 已认证兼容；SGE/Jetty/segment 等仍需核对。
+CTP config/count/info 继续使用带前后哨兵的独立 heap 缓冲，打印
+`NATIVE_ABI_GUARD op=... value_bytes=... before_ok=... after_ok=...`。
+检测到边界改写时，在使用返回字段之前立即停止；哨兵填充仅用于定位，不是 ABI 兼容层，
+即使完整也不能证明所有字段偏移与部署库一致。若后续需要恢复自动能力发现，应使用与运行库
+准确配套的部署头文件，或以该头编译仅输出固定宽度标量的独立适配层。
 
 Decode 的 CTP 成功或 Prefill→K 的查询成功，不能代替验证 K→Prefill 的查询。
 可用全新 K、同一 UB device/EID/case，将 NPU 5 临时作为 Decode（使用它自己的配置 EID）
@@ -273,8 +288,9 @@ host 测试覆盖九组注册视图、先后顺序、同 allocation 校验、跨
 验证配置 EID 与资源 EID 不同但 MR/Jetty 身份一致时可通过，CTP 查询仍保留配置 EID；
 同时拒绝真实资源身份不一致、错误 key 长度/RM 模式、越界、地址溢出及全零 EID。
 CTP 查询回归覆盖成功和三种失败分类、清除陈旧 errno、立即捕获错误及单次调用保留双端 EID。
-内存诊断回归覆盖前后哨兵破坏、query_device 输出超写先于能力字段读取被拒绝、逐阶段查询数据
-损坏、实际查询前拒绝全零入参，以及 CTP 三个输出缓冲越界和库内正常改写 config 本体的区分。
+内存诊断回归覆盖前后哨兵破坏、逐阶段查询数据损坏、实际查询前拒绝全零入参，
+以及 CTP 三个输出缓冲越界和库内正常改写 config 本体的区分。
+显式分块回归覆盖合法边界以及缺失、零、负数、非整数和超限/溢出输入；参数在 Runtime 初始化前校验。
 另用明确标注的 24.12 core 校验模型检查：0xe 拒绝、0xf 接受。数据搬运 fake provider
 只检查测试工具流程，不声明真实 provider 支持这些配置。
 控制测试覆盖二进制布局、碎片响应、错误响应、版本不匹配和数据版本变化。

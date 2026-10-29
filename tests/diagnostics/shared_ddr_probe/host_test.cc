@@ -204,25 +204,23 @@ void TestPullCtpQuery() {
   std::cerr << "PULL_CTP_QUERY_TEST_PASS single_call=1 endpoints_preserved=1 errno_captured=1\n";
 }
 
-struct FakeDeviceQuery {
-  urma_device_t* device{};
-  urma_status_t rc{URMA_SUCCESS};
-  std::uint64_t max_bytes{131072};
-  std::uint32_t max_sge{1};
-  int error{};
-  unsigned calls{};
-  bool spill{};
-} fake_device_query;
-
-urma_status_t QueryDeviceFake(urma_device_t* device, urma_device_attr_t* attributes) {
-  auto& fake = fake_device_query;
-  ++fake.calls;
-  Require(fake.calls == 1 && device == fake.device && attributes, "wrong device query arguments");
-  attributes->dev_cap.max_msg_size = fake.max_bytes;
-  attributes->dev_cap.max_jfs_sge = fake.max_sge;
-  if (fake.spill) ClobberNativeTail(attributes);
-  errno = fake.error;
-  return fake.rc;
+void TestReadChunkBytes() {
+  Require(probe::ParseReadChunkBytes("1") == 1 &&
+    probe::ParseReadChunkBytes("4096") == 4096 &&
+    probe::ParseReadChunkBytes("65536") == 65536,
+    "valid explicit READ chunk size rejected or changed");
+  for (const auto& text : {std::string(""), std::string("0"), std::string("000"),
+      std::string("65537"), std::string("-1"), std::string("+1"),
+      std::string(" 4096"), std::string("4096 "), std::string("4096\n"),
+      std::string("4.0"), std::string("1e3"), std::string("0x1000"),
+      std::string("4096garbage"), std::string("\xd9\xa1"),
+      std::string("4294967296"), std::string("18446744073709551616"), std::string(1000, '9')}) {
+    bool rejected = false;
+    try { (void)probe::ParseReadChunkBytes(text); }
+    catch (const std::exception&) { rejected = true; }
+    Require(rejected, "invalid explicit READ chunk size accepted");
+  }
+  std::cerr << "READ_CHUNK_BYTES_TEST_PASS explicit_positive_ascii=1 software_limit_checked=1\n";
 }
 
 void TestNativeMemoryDiagnostics() {
@@ -236,32 +234,6 @@ void TestNativeMemoryDiagnostics() {
   ExpectDiagnosticFailure([&] { probe::CheckNativeBuffer("fake.trailing", trailing, 0, 0); },
     "native ABI output boundary overwritten at fake.trailing");
 
-  urma_device_t device{};
-  for (auto bytes : {UINT64_C(32768), UINT64_C(131072)}) {
-    fake_device_query = {};
-    fake_device_query.device = &device;
-    fake_device_query.max_bytes = bytes;
-    const auto limit = probe::QueryDeviceReadLimit(QueryDeviceFake, &device);
-    Require(limit == (bytes == 32768 ? 32768U : 65536U) && fake_device_query.calls == 1,
-      "device READ limit query returned the wrong chunk size");
-  }
-  fake_device_query = {};
-  fake_device_query.device = &device;
-  fake_device_query.rc = URMA_FAIL;
-  fake_device_query.error = EIO;
-  ExpectDiagnosticFailure([&] { (void)probe::QueryDeviceReadLimit(QueryDeviceFake, &device); },
-    "query device");
-  fake_device_query = {};
-  fake_device_query.device = &device;
-  fake_device_query.spill = true;
-  fake_device_query.max_bytes = 0;
-  fake_device_query.max_sge = 0;
-  // Guard corruption must win over the simultaneously invalid capability
-  // fields, proving the helper checks bounds before trusting those fields.
-  ExpectDiagnosticFailure([&] { (void)probe::QueryDeviceReadLimit(QueryDeviceFake, &device); },
-    "native ABI output boundary overwritten at urma_query_device");
-  Require(fake_device_query.calls == 1, "device query retried after an ABI overwrite");
-
   urma_context_t context{};
   const auto expected = PullQueryFixture();
   probe::CheckPullQueryState("decoded", expected, expected);
@@ -269,9 +241,9 @@ void TestNativeMemoryDiagnostics() {
   std::memset(&cleared, 0, sizeof(cleared));
   fake_pull_query = {};
   ExpectDiagnosticFailure([&] {
-    probe::CheckPullQueryState("after_query_device", cleared, expected);
+    probe::CheckPullQueryState("after_import_seg", cleared, expected);
     (void)probe::QueryPullCtp(QueryPullTpFake, &context, cleared);
-  }, "pull CTP parameters overwritten at after_query_device");
+  }, "pull CTP parameters overwritten at after_import_seg");
   Require(fake_pull_query.calls == 0, "corrupted stage reached the CTP callback");
   auto changed_peer = expected;
   changed_peer.peer[15] ^= 1;
@@ -369,6 +341,7 @@ int main() {
     std::cerr << "HARNESS_UNIT_TEST fake_provider=1 profile=plumbing_only hardware_result=UNKNOWN\n";
     TestSourceDescriptor();
     TestPullCtpQuery();
+    TestReadChunkBytes();
     TestNativeMemoryDiagnostics();
     allocation_bytes = 3 * kGuard;
     std::vector<std::uint8_t> target(allocation_bytes), source(allocation_bytes);
