@@ -107,6 +107,8 @@ Status RuntimeCore::Offload(
 
 源 HBM 由持有 Tensor 的 NPU 进程注册并导出。CPU 取得 segment、token、可读范围及导出 generation 后，在自己的 context 中导入。CPU READ 只需获得源区域的读取权限。
 
+遵循 `aicpu-urma@8bc5a2a` 的 CPU READ 建链方式，配置的 NPU EID 用于 CTP 路径查询；导出的 segment 与 Jetty key 保存 provider 返回的内存和队列标识，原样传递和导入。这些对象内的 EID 不要求与路径 EID 相等，也不能用路径 EID 覆盖。源地址、长度、溢出和 segment 覆盖范围仍须校验。
+
 通道生命周期与源内存注册生命周期分开：通道可以长期复用；首版可按调用注册源 HBM、在 DMA 安全结束后注销。后续再增加具备 allocation 生命周期保证的注册缓存。
 
 不需要独立的 HBM service 进程。NPU 调用端通过已有控制连接完成资源交换，但导出资源必须一直保留到相应 CPU 访问结束。

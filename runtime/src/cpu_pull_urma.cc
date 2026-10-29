@@ -70,8 +70,12 @@ class UrmaBackend final : public Backend {
         source.key_bytes != 32 || !source.tp || !source.psn || !source.token)
       return Error("invalid source endpoint");
     urma_seg_t segment{}; std::memcpy(&segment, source.segment, sizeof(segment));
-    if (source.base < segment.ubva.va || !Contains(segment.len, source.base-segment.ubva.va, source.bytes) ||
-        std::memcmp(segment.ubva.eid.raw, source.eid, 16)) return Error("source segment range/EID");
+    // The CTP route EID and the exported segment's EID need not be equal.
+    // Import the provider's segment verbatim, just as aicpu-urma does, while
+    // retaining the route EID for the TP query below.
+    if (!source.base || source.base > UINT64_MAX-source.bytes || source.base < segment.ubva.va ||
+        !Contains(segment.len, source.base-segment.ubva.va, source.bytes))
+      return Error("source segment range");
     auto query = reinterpret_cast<QueryTp>(dlsym(RTLD_DEFAULT, "urma_get_tp_list"));
     auto import = reinterpret_cast<ImportJetty>(dlsym(RTLD_DEFAULT, "urma_import_jetty_ex"));
     if (!query || !import) return Error("missing expanded CTP symbols");

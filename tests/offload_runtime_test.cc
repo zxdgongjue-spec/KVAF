@@ -20,7 +20,7 @@ std::atomic<int> registrations{0}, events{0}, event_waits{0}, reads{0};
 std::atomic<int> sessions{0}, contexts{0}, probe_allocations{0};
 int context_error = 0;
 bool null_context = false;
-enum class BadSegment { None, ZeroBase, Short, Overflow, Eid, Abi };
+enum class BadSegment { None, ZeroBase, Short, Overflow, Abi };
 BadSegment bad_segment = BadSegment::None;
 void Require(bool ok,const char* text){if(!ok)throw std::runtime_error(text);}
 extern "C" {
@@ -43,7 +43,8 @@ bool GetCurrentNpuPhysicalDeviceId(std::uint32_t* d){*d=0;return true;}
 int Destroy(void* p){delete static_cast<int*>(p);return 0;}
 int DestroyWithContext(void*,void* p){return Destroy(p);}
 bool LoadDirectHccp(DirectHccpApi* a){
-  a->ctx_init=[](CtxInitCfg*,CtxInitAttr*,void** p){
+  a->ctx_init=[](CtxInitCfg*,CtxInitAttr* attr,void** p){
+    Require(attr->ub.eid.raw[15]==1,"context uses configured route EID");
     if(context_error || null_context){*p=nullptr;return context_error;}
     ++contexts;*p=new int;return 0;
   };
@@ -52,27 +53,33 @@ bool LoadDirectHccp(DirectHccpApi* a){
   a->token_free=DestroyWithContext;
   a->lmem_register=[](void*,MrRegInfo* mr,void** p){
     ++registrations;*p=new int;mr->out.key.size=48;
-    std::memset(mr->out.key.value,0,48);mr->out.key.value[15]=1;
+    // Reproduce the hardware case: route EID 1, exported memory EID 3.
+    std::memset(mr->out.key.value,0,48);mr->out.key.value[15]=3;
     auto base=mr->in.mem.addr,bytes=mr->in.mem.size;
     if(bad_segment==BadSegment::ZeroBase)base=0;
     if(bad_segment==BadSegment::Short)bytes-=1;
     if(bad_segment==BadSegment::Overflow)base=UINT64_MAX;
-    if(bad_segment==BadSegment::Eid)mr->out.key.value[15]=2;
     if(bad_segment==BadSegment::Abi)mr->out.key.size=52;
     std::memcpy(mr->out.key.value+20,&base,8);
     std::memcpy(mr->out.key.value+32,&bytes,8);return 0;
   };
   a->lmem_unregister=[](void*,void* p){--registrations;return Destroy(p);};
   a->cq_create=[](void*,CqInfo*,void** p){*p=new int;return 0;};a->cq_destroy=DestroyWithContext;
-  a->qp_create=[](void*,QpCreateAttr*,QpCreateInfo* info,void** p){info->key.size=32;*p=new int;return 0;};
+  a->qp_create=[](void*,QpCreateAttr*,QpCreateInfo* info,void** p){info->key.size=32;info->key.value[15]=3;*p=new int;return 0;};
   a->qp_destroy=Destroy;a->qp_unimport=DestroyWithContext;
-  a->get_tp_info_async=[](void*,GetTpCfg*,TpInfo* info,std::uint32_t* count,void** p){info->tp_handle=1;*count=1;*p=new int;return 0;};
+  a->get_tp_info_async=[](void*,GetTpCfg* cfg,TpInfo* info,std::uint32_t* count,void** p){
+    Require(cfg->local_eid.raw[15]==1&&cfg->peer_eid.raw[15]==2,"CTP uses route EIDs, not memory EIDs");
+    info->tp_handle=1;*count=1;*p=new int;return 0;
+  };
   a->get_async_req_result=[](void* p,int* result){*result=0;return Destroy(p);};
   return true;
 }
 void CloseDirectHccp(DirectHccpApi* a){*a={};}
-bool ImportPeerJetty(const DirectHccpApi&,void*,const std::uint8_t*,std::uint32_t,std::uint32_t,
-    std::uint64_t,std::uint64_t,std::uint32_t,std::uint32_t,const char*,QpImportInfoT*,void** p){*p=new int;return true;}
+bool ImportPeerJetty(const DirectHccpApi&,void*,const std::uint8_t* key,std::uint32_t,std::uint32_t,
+    std::uint64_t,std::uint64_t,std::uint32_t,std::uint32_t,const char*,QpImportInfoT*,void** p){
+  Require(key[15]==4,"CPU Jetty identity is not rewritten with CPU route EID");
+  *p=new int;return true;
+}
 }
 struct Backend final:p::Backend {
   std::vector<std::uint8_t> memory;
@@ -80,7 +87,10 @@ struct Backend final:p::Backend {
   kvaf::Status Allocate(std::uint64_t bytes,p::Endpoint* e) override {
     memory.resize(bytes);e->base=reinterpret_cast<std::uint64_t>(memory.data());e->bytes=bytes;e->eid[15]=2;return kvaf::Status::OK();
   }
-  kvaf::Status Open(const p::Endpoint& s,p::Endpoint* e) override {source=s;e->key_bytes=28;e->tp=1;e->psn=1;return kvaf::Status::OK();}
+  kvaf::Status Open(const p::Endpoint& s,p::Endpoint* e) override {
+    Require(s.eid[15]==1&&s.segment[15]==3&&s.key[15]==3,"wire preserves separate route, memory and Jetty identities");
+    source=s;e->key_bytes=28;e->key[15]=4;e->tp=1;e->psn=1;return kvaf::Status::OK();
+  }
   kvaf::Status Read(const std::vector<p::Span>& spans) override {
     const int previous=reads.fetch_add(1);
     Require(event_waits>previous,"producer event must complete before READ");
@@ -142,7 +152,6 @@ void StartupFailureTest(Server& server) {
   bad_segment=BadSegment::ZeroBase;fail("zero_base=1");
   bad_segment=BadSegment::Short;fail("short_segment=1");
   bad_segment=BadSegment::Overflow;fail("address_overflow=1");
-  bad_segment=BadSegment::Eid;fail("eid_mismatch=1");
   bad_segment=BadSegment::Abi;fail("key_bytes=52 expected=48");
   bad_segment=BadSegment::None;
 }

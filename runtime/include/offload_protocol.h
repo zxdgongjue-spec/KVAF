@@ -19,6 +19,8 @@ struct Span { std::uint64_t source, destination, bytes; };
 struct Endpoint {
   std::uint64_t base{}, bytes{}, tp{};
   std::uint32_t psn{}, token{}, key_bytes{}, segment_bytes{};
+  // eid selects the CTP route. key and segment are opaque provider exports;
+  // their embedded EIDs can differ from the route EID and must stay unchanged.
   std::uint8_t eid[16]{}, key[64]{}, segment[64]{};
 };
 struct Request {

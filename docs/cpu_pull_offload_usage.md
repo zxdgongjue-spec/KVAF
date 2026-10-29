@@ -39,6 +39,8 @@ export PYTHONPATH="$PWD/build-offload/python${PYTHONPATH:+:$PYTHONPATH}"
 
 调用端显式提供 NPU EID 与 CPU candidate，不执行 BatchGet 自适应选路。初始化会分配目标池，并通过一次小规模 CPU Pull 和 CPU DDR 校验验证所选路径。
 
+`npu_eid` 用于 CTP 路径查询；HCCP 返回的 HBM segment 和 Jetty key 分别携带 provider 的内存与队列标识。按 `aicpu-urma@8bc5a2a` 的 CPU READ 实现，这些导出数据原样用于导入，不要求内嵌 EID 与配置的路径 EID 相等，不应把 segment EID 直接替换成 `npu_eid`。
+
 ```python
 import torch
 import torch_npu
@@ -90,9 +92,18 @@ CQ 错误或超时会隔离该 CPU transport，首版不尝试强制取消/重�
 - `zero_base`：导出地址为零。
 - `short_segment`：导出长度小于请求长度。
 - `address_overflow`：导出地址加请求长度会溢出。
-- `eid_mismatch`：segment 内 EID 与配置 NPU EID 不同。
 
-同时保留 `requested_base/exported_base`、`requested_bytes/exported_bytes`、`npu_eid/segment_eid` 与 `key_bytes`，用于区分范围、EID 选择和 ABI 问题。提供整条异常即可进一步定位；不要仅凭通用错误跳过校验或更改 SGE ABI。验收脚本在初始化失败时也会执行安全清理；未决任务继续保留资源。
+同时保留 `requested_base/exported_base`、`requested_bytes/exported_bytes`、`npu_eid/segment_eid` 与 `key_bytes`，用于区分范围和 ABI 问题。旧版本还会因 `eid_mismatch=1` 拒绝有效的导出；这项相等检查已在 NPU 导出和 CPU 导入两端移除，需要两端都更新、重新编译并重启 CPU 服务。地址和长度检查仍然保留。验收脚本在初始化失败时也会执行安全清理；未决任务继续保留资源。
+
+### 与 aicpu-urma 的对照
+
+参考版本：`aicpu-urma@8bc5a2a`。
+
+- `access_operator/demo/aicpu_batch_get/host/cpu_push_host.cc`：通过 HCCP 注册 HBM，单独传递配置 EID 和原始 segment，再查询 CTP、创建 NPU target Jetty。
+- `runtime/src/cpu_push_get_transport.cc`：检查 HBM 范围，原样导入 segment；使用配置 EID 查询 CPU 侧 CTP，并以原始 key 导入 NPU Jetty。`Transfer(false, ...)` 通过 CPU READ 拉取 HBM 中的通知和描述符。
+- `common/include/urma_transport.h`：封装 CTP/Jetty 导入参数，并采用 32 字节扩展 SGE。本分支通过 `KVAF_CPU_PULL_EXTENDED_SGE` 显式选择该 ABI，仍须匹配实际部署的 provider。
+
+Offload 沿用上述 EID 与导出标识的处理方式，将 READ 来源扩展为调用方的 Tensor HBM；源 MR 只开放远端 READ，任务完成后提交元数据。
 
 ## 验证与限制
 

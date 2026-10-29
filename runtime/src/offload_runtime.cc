@@ -100,12 +100,14 @@ class Exporter {
     const bool zero_base = descriptor.base == 0;
     const bool short_segment = exported_bytes < input.bytes;
     const bool address_overflow = descriptor.base > UINT64_MAX-input.bytes;
-    const bool eid_mismatch = std::memcmp(descriptor.eid, descriptor.segment, 16) != 0;
-    if (zero_base || short_segment || address_overflow || eid_mismatch) {
+    // Match aicpu-urma's CPU-push export: the configured EID selects a CTP
+    // route, while the segment carries the provider's memory identity. Do not
+    // require equality or replace either EID with the other one.
+    if (zero_base || short_segment || address_overflow) {
       std::ostringstream message;
       message << "invalid exported HBM range: zero_base=" << zero_base
               << " short_segment=" << short_segment << " address_overflow=" << address_overflow
-              << " eid_mismatch=" << eid_mismatch << " physical=" << physical
+              << " physical=" << physical
               << " eid_index=" << attr.ub.eid_index << " key_bytes=" << unsigned(mr.out.key.size)
               << " requested_base=0x" << std::hex << reinterpret_cast<std::uint64_t>(input.data)
               << " exported_base=0x" << descriptor.base << std::dec

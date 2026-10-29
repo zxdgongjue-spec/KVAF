@@ -10,6 +10,9 @@ namespace p = kvaf::offload;
 void Require(bool value,const char* text){if(!value)throw std::runtime_error(text);}
 int posts{}, local_mrs{}, imported_mrs{}, queues{};
 std::uint64_t pending{};
+urma_seg_t expected_segment{};
+std::uint8_t expected_jetty_key[32]{};
+struct TpQuery { std::uint32_t flag, mode; std::uint8_t local[16], remote[16]; };
 #ifdef KVAF_CPU_PULL_EXTENDED_SGE
 struct Sge {std::uint64_t addr;std::uint32_t len;urma_target_seg_t* tseg;void* user_tseg;};
 #else
@@ -28,6 +31,7 @@ urma_target_seg_t* urma_register_seg(urma_context_t*,urma_seg_cfg_t* cfg){
 urma_status_t urma_unregister_seg(urma_target_seg_t* mr){--local_mrs;delete mr;return URMA_SUCCESS;}
 urma_target_seg_t* urma_import_seg(urma_context_t*,urma_seg_t* seg,urma_token_t*,std::uint64_t,urma_import_seg_flag_t flags){
   Require(flags.bs.access==URMA_ACCESS_REMOTE_READ,"source must be READ-only");
+  Require(!std::memcmp(seg,&expected_segment,sizeof(*seg)),"import exported segment verbatim, including memory EID");
   auto* mr=new urma_target_seg_t{};mr->seg=*seg;++imported_mrs;return mr;
 }
 urma_status_t urma_unimport_seg(urma_target_seg_t* mr){--imported_mrs;delete mr;return URMA_SUCCESS;}
@@ -41,8 +45,15 @@ urma_jetty_t* urma_create_jetty(urma_context_t*,urma_jetty_cfg_t* cfg){
 }
 urma_status_t urma_delete_jetty(urma_jetty_t* q){--queues;delete q;return URMA_SUCCESS;}
 urma_status_t urma_unimport_jetty(urma_target_jetty_t* q){delete q;return URMA_SUCCESS;}
-int urma_get_tp_list(void*,void*,std::uint32_t* count,void* info){*count=1;*static_cast<std::uint64_t*>(info)=9;return 0;}
-urma_target_jetty_t* urma_import_jetty_ex(void*,void*,void*,void*){return new urma_target_jetty_t{};}
+int urma_get_tp_list(void*,void* input,std::uint32_t* count,void* info){
+  const auto* cfg=static_cast<TpQuery*>(input);
+  Require(cfg->local[15]==1&&cfg->remote[15]==2,"CTP uses selected route EIDs, not segment EID");
+  *count=1;*static_cast<std::uint64_t*>(info)=9;return 0;
+}
+urma_target_jetty_t* urma_import_jetty_ex(void*,void* remote,void*,void*){
+  Require(!std::memcmp(remote,expected_jetty_key,28),"import provider Jetty identity verbatim");
+  return new urma_target_jetty_t{};
+}
 urma_status_t urma_post_jetty_send_wr(urma_jetty_t*,urma_jfs_wr_t* wr,urma_jfs_wr_t**){
   Require(!pending&&wr->opcode==URMA_OPC_READ&&wr->flag.bs.complete_enable,"one signalled READ at a time");
   Require(wr->rw.src.num_sge==1&&wr->rw.dst.num_sge==1,"one source and destination");
@@ -58,18 +69,29 @@ int urma_poll_jfc(urma_jfc_t*,int,urma_cr_t* cr){
   Require(pending!=0,"poll follows post");cr->status=URMA_CR_SUCCESS;cr->user_ctx=pending;pending=0;return 1;
 }
 }
-int main(){try{
+void ReadTest(bool distinct_eids){
   urma_device_t device{};urma_context_t context{};context.dev=&device;context.eid.raw[15]=1;
   auto backend=p::CreateUrmaBackend(&context);
   p::Endpoint cpu{};Require(backend->Allocate(32768,&cpu).ok(),"allocate");
   std::vector<std::uint8_t> memory(20000);for(std::size_t i=0;i<memory.size();++i)memory[i]=i%251;
   p::Endpoint source{};source.base=reinterpret_cast<std::uint64_t>(memory.data());source.bytes=memory.size();
   source.tp=7;source.psn=1;source.token=2;source.key_bytes=32;source.segment_bytes=48;source.eid[15]=2;
-  urma_seg_t segment{};segment.ubva.va=source.base;segment.len=source.bytes;segment.ubva.eid.raw[15]=2;
+  urma_seg_t segment{};segment.ubva.va=source.base;segment.len=source.bytes;
+  segment.ubva.eid.raw[15]=distinct_eids?3:2;
+  source.key[15]=segment.ubva.eid.raw[15];
   std::memcpy(source.segment,&segment,sizeof(segment));auto mode=URMA_TM_RM;std::memcpy(source.key+24,&mode,4);
+  expected_segment=segment;std::memcpy(expected_jetty_key,source.key,sizeof(expected_jetty_key));
+  auto invalid=source;invalid.base=segment.ubva.va-1;
+  Require(!backend->Open(invalid,&cpu).ok(),"reject source before exported range");
+  invalid=source;invalid.bytes=segment.len+1;
+  Require(!backend->Open(invalid,&cpu).ok(),"reject source extending past exported range");
+  invalid=source;invalid.base=UINT64_MAX;invalid.bytes=2;
+  Require(!backend->Open(invalid,&cpu).ok(),"reject source address overflow");
+  Require(imported_mrs==0&&queues==0,"range errors rejected before resource creation");
   Require(backend->Open(source,&cpu).ok(),"open source");
   std::vector<p::Span> spans{{7,64,10001},{15000,16000,123}};
-  Require(backend->Read(spans).ok()&&posts==4,"3+1 WR split");
+  const int before=posts;
+  Require(backend->Read(spans).ok()&&posts==before+4,"3+1 WR split");
   Require(!std::memcmp(reinterpret_cast<void*>(cpu.base+64),memory.data()+7,10001),"READ bytes");
   const auto* data=reinterpret_cast<const std::uint8_t*>(cpu.base);
   Require(data[63]==0&&data[10065]==0&&data[15999]==0&&data[16123]==0,"guard bytes unchanged");
@@ -77,5 +99,9 @@ int main(){try{
   Require(backend->Checksum(spans)==expected,"checksum source order");
   Require(backend->ReleaseSource().ok()&&imported_mrs==0&&queues==0&&local_mrs==1,"release source before pool");
   Require(backend->Close().ok()&&local_mrs==0,"release pool");
+}
+int main(){try{
+  ReadTest(false);
+  ReadTest(true);
   std::cout<<"CPU URMA READ provider model passed\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
