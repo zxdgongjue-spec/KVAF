@@ -147,7 +147,7 @@ struct RemoteJetty {
 };
 struct ActiveTp { std::uint64_t local, peer, tag; std::uint32_t tx, rx; std::uint64_t reserved; };
 #if defined(PROBE_EXTENDED_SGE)
-// Use only after checking the installed vendor liburma/provider ABI.
+// Explicit CPU-push reference layout; validate the deployed provider separately.
 struct Sge { std::uint64_t addr; std::uint32_t len; urma_target_seg_t* tseg; void* user_tseg; };
 static_assert(sizeof(Sge) == 32);
 #else
@@ -221,7 +221,7 @@ template <class T> struct NativeBuffer {
 };
 
 template <class T> void CheckNativeBuffer(const char* operation, const NativeBuffer<T>& buffer,
-                                         int rc, int error) {
+                                         int rc, int error, bool log_healthy = true) {
   bool before_ok = true, after_ok = true;
   const char* side = "none";
   std::ptrdiff_t first_bad = 0;
@@ -239,9 +239,10 @@ template <class T> void CheckNativeBuffer(const char* operation, const NativeBuf
       after_ok = false;
     }
   }
-  std::fprintf(stderr, "NATIVE_ABI_GUARD op=%s value=%p value_bytes=%zu before_ok=%u after_ok=%u "
-    "bad_side=%s first_bad_offset=%td rc=%d errno=%d\n", operation, (const void*)&buffer.value,
-    sizeof(T), unsigned(before_ok), unsigned(after_ok), side, first_bad, rc, error);
+  if (log_healthy || !before_ok || !after_ok)
+    std::fprintf(stderr, "NATIVE_ABI_GUARD op=%s value=%p value_bytes=%zu before_ok=%u after_ok=%u "
+      "bad_side=%s first_bad_offset=%td rc=%d errno=%d\n", operation, (const void*)&buffer.value,
+      sizeof(T), unsigned(before_ok), unsigned(after_ok), side, first_bad, rc, error);
   if (!before_ok || !after_ok)
     throw std::runtime_error(std::string("native ABI output boundary overwritten at ") + operation);
 }
@@ -372,12 +373,19 @@ struct State {
     std::fprintf(stderr, "SOURCE_CONNECTED local_mr=%p exported_mr=%p local_va=0x%llx exported_va=0x%llx bytes=%llu\n",
       (void*)region->local, (void*)region->remote, (unsigned long long)region->va,
       (unsigned long long)region->remote->seg.ubva.va, (unsigned long long)region->bytes);
+    // Decode only the compiled layout for diagnosis, without treating it as
+    // independent evidence that the deployed target-segment ABI matches.
+    std::fprintf(stderr, "READ_LOCAL_MR layout=compiled_header expected_ctx=%p mr_ctx=%p "
+      "mr_va=0x%llx mr_bytes=%llu attr=0x%x\n", (void*)ctx, (void*)region->local->urma_ctx,
+      (unsigned long long)region->local->seg.ubva.va,
+      (unsigned long long)region->local->seg.len, region->local->seg.attr.value);
   }
   void Read(std::uint64_t round) {
     Check(peer && !closed && round == ready + 1 && acknowledged == ready,
       "PULL requires connected source and previous Decode ACK");
     Check(max_bytes && max_bytes <= kMaxReadChunkBytes, "invalid explicit READ chunk bytes");
     const auto bytes = region->bytes - 2 * kGuard;
+    auto completion = std::make_unique<NativeBuffer<urma_cr_t>>();
     for (std::uint64_t offset = 0; offset < bytes;) {
       const auto length = static_cast<std::uint32_t>(std::min<std::uint64_t>(max_bytes, bytes - offset));
       // The destination is the original KV allocation, never a staging buffer.
@@ -390,17 +398,45 @@ struct State {
       wr.rw.src = {reinterpret_cast<urma_sge_t*>(&src), 1};
       wr.rw.dst = {reinterpret_cast<urma_sge_t*>(&dst), 1};
       urma_jfs_wr_t* bad{};
-      Check(urma_post_jetty_send_wr(jetty, &wr, &bad) == 0, "post READ (resources retained)");
+      errno = 0;
+      const auto post_rc = urma_post_jetty_send_wr(jetty, &wr, &bad);
+      const int post_error = errno;
+      if (post_rc != 0) {
+        std::fprintf(stderr, "READ_POST_FAILURE round=%llu offset=%llu bytes=%u context=%llu "
+          "rc=%d bad_wr=%p errno=%d\n", (unsigned long long)round,
+          (unsigned long long)offset, length, (unsigned long long)sequence,
+          int(post_rc), (void*)bad, post_error);
+        Check(false, "post READ (resources retained)");
+      }
       const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
       for (;;) {
-        urma_cr_t cr{};
-        const int n = urma_poll_jfc(cq, 1, &cr);
+        completion->value = {};
+        errno = 0;
+        const int n = urma_poll_jfc(cq, 1, &completion->value);
+        const int poll_error = errno;
+        CheckNativeBuffer("urma_poll_jfc.cr", *completion, n, poll_error, false);
+        if (n < 0 || n > 1)
+          std::fprintf(stderr, "READ_POLL_FAILURE round=%llu offset=%llu bytes=%u "
+            "context=%llu capacity=1 rc=%d errno=%d\n", (unsigned long long)round,
+            (unsigned long long)offset, length, (unsigned long long)sequence, n, poll_error);
         Check(n >= 0, "poll READ CQ");
+        Check(n <= 1, "unexpected READ CQ count");
         if (n) {
+          const auto& cr = completion->value;
           if (cr.status != URMA_CR_SUCCESS || cr.user_ctx != sequence) {
-            std::fprintf(stderr, "CQ_FAILURE status=%u context=%llu expected=%llu\n",
-              unsigned(cr.status), (unsigned long long)cr.user_ctx, (unsigned long long)sequence);
-            Check(false, "READ CQ status/context mismatch");
+            const char* name = cr.status == URMA_CR_SUCCESS ? "URMA_CR_SUCCESS" :
+              cr.status == URMA_CR_LOC_ACCESS_ERR ? "URMA_CR_LOC_ACCESS_ERR" : "OTHER";
+            std::fprintf(stderr, "CQ_FAILURE status=%u status_name=%s status_ok=%u "
+              "context=%llu expected=%llu context_match=%u round=%llu offset=%llu bytes=%u "
+              "src_va=0x%llx dst_va=0x%llx src_mr=%p dst_mr=%p exported_mr=%p "
+              "wire_sge_bytes=%zu native_cr_bytes=%zu errno=%d\n", unsigned(cr.status), name,
+              unsigned(cr.status == URMA_CR_SUCCESS), (unsigned long long)cr.user_ctx,
+              (unsigned long long)sequence, unsigned(cr.user_ctx == sequence),
+              (unsigned long long)round, (unsigned long long)offset, length,
+              (unsigned long long)src.addr, (unsigned long long)dst.addr, (void*)src.tseg,
+              (void*)dst.tseg, (void*)region->remote, sizeof(Sge), sizeof(urma_cr_t), poll_error);
+            Check(cr.status == URMA_CR_SUCCESS, "READ CQ returned error status");
+            Check(false, "READ CQ user_ctx mismatch");
           }
           break;
         }
@@ -527,9 +563,10 @@ int main(int argc, char** argv) {
     State state;
     state.max_bytes = read_chunk_bytes;
     std::fprintf(stderr, "PROBE_READY case=%s bytes=%llu header=%s native_sge_bytes=%zu wire_sge_bytes=%zu "
-      "read_chunk_bytes=%u capability_source=explicit_candidate hardware_limits_queried=0 src_sge=1 dst_sge=1\n",
+      "native_wr_bytes=%zu native_cr_bytes=%zu read_chunk_bytes=%u "
+      "capability_source=explicit_candidate hardware_limits_queried=0 src_sge=1 dst_sge=1\n",
       mode.c_str(), (unsigned long long)allocation_bytes, kHeaderAccessModel, sizeof(urma_sge_t), sizeof(Sge),
-      read_chunk_bytes);
+      sizeof(urma_jfs_wr_t), sizeof(urma_cr_t), read_chunk_bytes);
     for (;;) {
       fd_set fds; FD_ZERO(&fds); FD_SET(service, &fds); FD_SET(diagnostic, &fds);
       const int rc = select(std::max(service, diagnostic)+1, &fds, nullptr, nullptr, nullptr);

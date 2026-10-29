@@ -8,8 +8,10 @@
 namespace {
 int live_segments{}, live_tokens{}, live_contexts{};
 bool reject_local{}, reject_post{}, error_cq{};
+bool wrong_cq_context{}, reject_poll{}, spill_cr{}, excess_cq_count{};
 bool strict_24_12{};
 std::uint64_t completed{};
+unsigned post_calls{}, poll_calls{};
 std::vector<unsigned> access_order;
 std::map<urma_target_seg_t*, std::pair<std::uint64_t, std::uint64_t>> ranges;
 void Require(bool ok, const char* text) { if (!ok) throw std::runtime_error(text); }
@@ -316,6 +318,7 @@ urma_status_t urma_delete_context(urma_context_t* ctx) {
   delete ctx; --live_contexts; return URMA_SUCCESS;
 }
 urma_status_t urma_post_jetty_send_wr(urma_jetty_t*, urma_jfs_wr_t* wr, urma_jfs_wr_t**) {
+  ++post_calls;
   if (reject_post) return URMA_FAIL;
   Require(wr->opcode == URMA_OPC_READ && wr->rw.src.num_sge == 1 && wr->rw.dst.num_sge == 1,
     "must issue a READ with one source and destination SGE");
@@ -327,11 +330,16 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t*, urma_jfs_wr_t* wr, urma_jfs
   std::memcpy(reinterpret_cast<void*>(dst.addr), reinterpret_cast<void*>(src.addr), src.len);
   completed = wr->user_ctx; return URMA_SUCCESS;
 }
-int urma_poll_jfc(urma_jfc_t*, int, urma_cr_t* cr) {
+int urma_poll_jfc(urma_jfc_t*, int capacity, urma_cr_t* cr) {
+  ++poll_calls;
+  Require(capacity == 1 && cr && errno == 0, "invalid or stale-error CQ poll input");
+  Require(cr->user_ctx == 0 && cr->status == URMA_CR_SUCCESS, "CQ output not reset before polling");
   if (!completed) return 0;
-  cr->user_ctx = completed; completed = 0;
+  cr->user_ctx = completed + (wrong_cq_context ? 1 : 0); completed = 0;
+  if (reject_poll) { errno = EIO; return -1; }
   cr->status = error_cq ? URMA_CR_LOC_ACCESS_ERR : URMA_CR_SUCCESS;
-  return 1;
+  if (spill_cr) ClobberNativeTail(cr);
+  return excess_cq_count ? 2 : 1;
 }
 }
 
@@ -374,17 +382,28 @@ int main() {
         state.VerifyCpu(round);
       }
       reject_post = true;
-      bool rejected = false;
-      try { state.Read(4); } catch (const std::runtime_error&) { rejected = true; }
+      const auto target_before = target;
+      const auto posts_before = post_calls;
+      const auto polls_before = poll_calls;
+      ExpectDiagnosticFailure([&] { state.Read(4); }, "post READ");
       reject_post = false;
-      Require(rejected, "post error ignored");
-      Require(state.ready == 3, "failed post published a round");
-      error_cq = true;
-      rejected = false;
-      try { state.Read(4); } catch (const std::runtime_error&) { rejected = true; }
-      error_cq = false;
-      Require(rejected, "CQ error ignored");
-      Require(state.ready == 3, "failed CQ published a round");
+      Require(state.ready == 3 && target == target_before && post_calls == posts_before + 1 &&
+        poll_calls == polls_before, "failed post published, copied, polled or continued READs");
+      const auto expect_cq_failure = [&](bool& injection, const char* reason) {
+        const auto posts = post_calls, polls = poll_calls;
+        injection = true;
+        ExpectDiagnosticFailure([&] { state.Read(4); }, reason);
+        injection = false;
+        // An error CQ can follow a partial transfer. Only assert that no later
+        // chunk was posted and no completed round was published.
+        Require(state.ready == 3 && state.acknowledged == 3 && post_calls == posts + 1 &&
+          poll_calls == polls + 1, "failed CQ published a round or continued READs");
+      };
+      expect_cq_failure(error_cq, "READ CQ returned error status");
+      expect_cq_failure(wrong_cq_context, "READ CQ user_ctx mismatch");
+      expect_cq_failure(reject_poll, "poll READ CQ");
+      expect_cq_failure(spill_cr, "native ABI output boundary overwritten at urma_poll_jfc.cr");
+      expect_cq_failure(excess_cq_count, "unexpected READ CQ count");
       Unregister(remote);
       Require(!live_segments && !live_tokens && !live_contexts && registrations.empty(), "case leaks resources");
     }

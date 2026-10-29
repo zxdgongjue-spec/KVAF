@@ -37,7 +37,10 @@
 `access_compat.h` 现在拒绝新版 LOCAL_ONLY 头文件，避免测试时再次混淆。
 
 这版公开头文件的 SGE 是 **24 B**，程序默认按其布局提交。
-仅在确认部署 provider 使用参考 CPU push 的扩展 **32 B SGE** 时，设置 `-DPROBE_EXTENDED_SGE=ON`。
+`-DPROBE_EXTENDED_SGE=ON` 显式选择参考 CPU push 的扩展 **32 B SGE**，尾部 `user_tseg` 为零。
+应优先用部署头文件/provider 实现确认布局；若用于 ABI 排查，应保持 case、卡、EID、分块大小
+和页模式不变，只比较这一项，并保留两组日志。它是候选布局，不因参考实现使用就自动视为目标机契约。
+当前 AIV BatchGet 直接构造硬件 WQE，不通过 host SGE，故其成功不能认证 CPU READ 的 SGE 布局。
 segment=48 B、Jetty ID=24 B、NPU Jetty key=32 B、CPU Jetty key=28 B 的约束保持不变。
 建链还沿用现有 KVAF 所需的 `urma_get_tp_list`、`urma_import_jetty_ex` expanded CTP 扩展；
 本次取得的原版分支源码没有这两个函数定义，不能假定自行编译原版库就具备部署扩展。
@@ -231,6 +234,18 @@ kernel 路径、明显的端口冲突等本地参数错误在 NPU 初始化和 R
 如果 K 日志只有 `PROBE_FAIL op=7`，表示某个客户端上报失败，应先看该客户端的首个 traceback；
 此时日志附带的 errno 不足以认定发生了 MR 注册失败。`op=1` 是另一个客户端查询状态时读到失败。
 
+例如 `CQ_FAILURE status=4 context=1 expected=1` 中，请求标识匹配；按编译使用的 24.12
+头文件，状态 4 是 `URMA_CR_LOC_ACCESS_ERR`（本地内存访问错误），不是 context 不匹配。
+现分别报告 `READ CQ returned error status` 和 `READ CQ user_ctx mismatch`，并保留原始状态、
+请求标识、轮次、分块范围及两个 SGE 的地址/MR。post 成功仅表示提交被接受，错误完成不发布 round。
+CTP 查询与 Jetty 导入返回成功，也不代表实际 READ 已成功访问 HBM 或写入 DDR。
+已观察到 `single-current` 与 `dual` 都在首个 READ 返回该状态；这说明增加独立本地 MR 仍未解决问题，
+不能只归因于 0xe 缺少 LOCAL_WRITE，也不能据此宣布 CPU READ HBM 不可行。
+此时优先核对部署的 SGE/WR/CR 布局、实际本地 MR 的范围/context 和 provider 记录，
+避免同时轮换 MR case、EID、卡和分块，导致结果无法归因。
+`READ_LOCAL_MR layout=compiled_header` 打印按编译布局解读的本地 MR 范围/context/属性，
+用于与 REGISTER 和提交 context 对照；它本身不能认证目标库 ABI。
+
 Prefill 在发送 EXPORT 前打印 `event=HBM_EXPORT`，包含 `configured_eid`、
 `segment_eid_prefix`、`jetty_eid_prefix` 和两个完整 key。后两个前缀按本诊断所需 ABI
 取 key 的前 16 B；原始 key 用于进一步核对部署 ABI。
@@ -261,8 +276,9 @@ flag/mode、容量、API 返回码 `rc`、输出 `count`、`tp` 和即时保存�
 它没有输出长度参数，旧布局不能安全解释部署库的完整属性结构。
 本版删除这次非必需的能力查询，改为显式分块候选；不再分配大缓冲后继续按旧布局读字段。
 这消除了已定位的越界调用，不代表其余所有 ABI 已认证兼容；SGE/Jetty/segment 等仍需核对。
-CTP config/count/info 继续使用带前后哨兵的独立 heap 缓冲，打印
+CTP config/count/info 和 READ 的 CR 输出使用带前后哨兵的独立 heap 缓冲，打印
 `NATIVE_ABI_GUARD op=... value_bytes=... before_ok=... after_ok=...`。
+CR 轮询只在哨兵异常时打印边界日志，以免空轮询刷屏；每次返回均先检查哨兵，再解释 CR。
 检测到边界改写时，在使用返回字段之前立即停止；哨兵填充仅用于定位，不是 ABI 兼容层，
 即使完整也不能证明所有字段偏移与部署库一致。若后续需要恢复自动能力发现，应使用与运行库
 准确配套的部署头文件，或以该头编译仅输出固定宽度标量的独立适配层。
@@ -284,6 +300,8 @@ python3 -m unittest discover -s tests/diagnostics/shared_ddr_probe -p 'test_*.py
 
 host 测试覆盖九组注册视图、先后顺序、同 allocation 校验、跨 context、分块 READ、
 多轮数据更换、post/CQ 错误不发布完成，以及第二个 MR 注册失败时回滚。
+READ 完成回归另覆盖状态错误但请求号匹配、成功状态但请求号不匹配、poll 返回负数、
+容量为 1 却返回多条以及 CR 输出越界；均验证不继续提交后续分块、不发布完成轮次。
 源描述符回归使用上述真机返回的 48 B segment 和 32 B Jetty key 作为固定输入，
 验证配置 EID 与资源 EID 不同但 MR/Jetty 身份一致时可通过，CTP 查询仍保留配置 EID；
 同时拒绝真实资源身份不一致、错误 key 长度/RM 模式、越界、地址溢出及全零 EID。
