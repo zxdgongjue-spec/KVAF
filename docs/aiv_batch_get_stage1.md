@@ -24,6 +24,8 @@ UB 通过公开的 `LocalTensor<uint8_t>(TPosition::VECIN, 0, 16384)` 构造，
 将 GM→UB 恢复为普通搬运模式。这项配置不调用 `InitSocState()` 或 TPipe。
 Scatter 的 Host loader 按纯 SIMD 启动，`dynUBufSize=0`；16 KiB 静态 UB
 缓冲不通过 SIMT 的动态 UB 启动参数分配。
+Scatter 独立 ELF 显式导出 `.ascend.meta.KvafScatterBatchGetAivKernelV1`，
+其 kernel type 为 `K_TYPE_AIV`。硬件测试在加载前校验实际二进制的类型标记。
 源 GlobalTensor 禁用 L2 cache hint，且不再经 SIMT 读取被 CPU WRITE 更新的
 staging。原实现的 MainScalar cache 刷新不能代替 SIMT cache 刷新。
 Scatter kernel 已按硬件故障定位需要撤掉入口的 `InitSocState()`，保留退出前的
@@ -359,6 +361,40 @@ LocalTensor。根据 [CANN 9.1 aclrtLaunchKernelAttrValue](https://www.hiascend.
 本地 loader 回归直接检查传给 ACL 的 scatter 动态 UB 为 0，同时检查
 direct SIMT 的 160 KiB 配置；修复前新增断言失败，修复后通过。
 
+### 补齐 scatter 独立二进制的 AIV 类型元数据
+
+用户随后确认已出现 `SCATTER_KERNEL_READY ... dyn_ubuf_bytes=0`，但仍报
+507015。因此动态 UB 修正没有消除故障；本次未提供新的设备异常摘要，不能
+直接沿用旧 kernel 的 PC 偏移或断言新异常的设备子错误码。
+
+进一步对照独立加载链路发现，direct BatchGet 和 BatchPut 在源文件末尾均
+导出 `FunLevelKType`，scatter 独立源文件遗漏了这个声明。官方
+[AIV 算子下发示例](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/commlib/commopdev/docs/en/comm_op_dev_guide/aiv_comm_op_dev/op_dispatch.md)
+同时设置 Host 的 engine 属性和 Device ELF 的 `.ascend.meta.<kernel_name>`
+类型标记，不能仅凭编译参数 `dav-c310-vec`、核函数名字带 Aiv 或 Host 的
+engine 属性证明已按正确核类型下发。
+
+本次为 scatter 补上同样的 `K_TYPE_AIV` 元数据；拷贝函数和入口/退出指令
+保持不变。此缺失可能造成核类型识别与代码所需执行单元不一致，但还没有
+旧二进制元数据及调度记录来确认它就是本次硬件根因。暂不扩展 `setup`/`dma`
+检查点，先单独检验元数据补齐后已有 `load` 的行为。
+
+新增的纯 Python 检查器读取 ELF section 和 TLV，不依赖反汇编器，也不加载
+NPU。它要求指定核函数的 metadata 中存在且仅存在一个 `F_TYPE_KTYPE=1`、
+长度 4、值 `K_TYPE_AIV=3` 的 TLV；缺失、错误类型、重复和损坏文件均拒绝。
+可在重编译前检查旧产物，保存其输出作为证据：
+
+```bash
+python tests/python/aiv_kernel_metadata.py \
+  build-npu/bin/kvaf_scatter_batch_get_kernels.o
+```
+
+重编译 `cmake --build build-npu -j` 后继续运行前面的 `load` 命令。
+scatter 硬件测试现在会在导入 NPU/建立 CPU 连接前自动执行相同检查，成功时
+打印 `AIV_METADATA_OK ... type=K_TYPE_AIV(3)`。这个标记只确认 ELF 类型，
+MTE2 验收仍要求三个批次完成内容校验；若仍发生 507015，需要结合本次日志
+继续定位。gather 的运行通过也不能替代 scatter 的 MTE2 验收。
+
 ## Scatter 507015 的分段定位
 
 拆分前，用户已反馈 `gather_read` 在 1、3、8 核通过。当时 Gather 和 scatter
@@ -542,6 +578,8 @@ manifest、宏和 `.ii`，按预处理后的有效定义提取初始化函数，
   scatter 增量重编译不改变 gather/direct 产物、独立 Python 入口和组合子进程失败汇总。
 - Loader 启动参数回归：scatter 的纯 SIMD 动态 UB 参数为 0，direct SIMT
   路径仍为 160 KiB。
+- 二进制预检查回归：ELF32/ELF64、扩展 section 编号、额外 TLV、缺失/错误/
+  重复 KTYPE、截断文件；无效 scatter 文件在导入硬件模块前拒绝。
 - 候选选择回归覆盖连接回退、本地设备错误停止重试、普通/自适应选择及清理错误
   不覆盖原始失败。
 - 生产 `.asc` 的 CPU 模型执行：解码 SQ/CQ，调用真实 CPU gather executor，
@@ -563,8 +601,9 @@ manifest、宏和 `.ii`，按预处理后的有效定义提取初始化函数，
 用户此前已在硬件反馈 gather 的 1/3/8 核回归通过；拆分后撤回入口操作的独立
 gather 也已反馈成功（所给命令为 1 核）。scatter 探针此前反馈 flush 完成、
 load 失败，补初始化后仍有 507015。撤掉整体初始化、按官方源码调整 MTE2
-配置、UB 构造及内容验证后，新日志仍报告 MTE 异常 78。当前进一步修正了
-scatter Host 的纯 SIMD 启动参数，尚待上机验收新版 load。尚待验证 scatter
+配置、UB 构造及内容验证后，新日志仍报告 MTE 异常 78。进一步修正 scatter
+Host 的纯 SIMD 启动参数后，用户确认新 Host 生效但仍报 507015。当前补齐了
+scatter 独立 ELF 的 AIV 类型元数据，尚待上机验收新版 load。尚待验证 scatter
 的非对齐 MTE3 写出、CPU/NPU 缓存可见性、跨 Jetty
 done 保序及真实超时/断链回收。这些本地检查不替代 CANN 编译和双机验收。
 硬件回归未启用时返回 skip，不能视为硬件验收通过。
