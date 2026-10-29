@@ -11,6 +11,8 @@ struct OperatorOptions {
 };
 
 // Experimental mapped-memory implementation of the existing KVAF contract.
+// Execute methods consume RuntimeCore-validated requests and MetaManager's
+// PutAccessDesc; call RuntimeCore::BatchGet/BatchPut as the public entry points.
 class AccessOperator final : public kvaf::AccessOperator {
  public:
   explicit AccessOperator(OperatorOptions options);

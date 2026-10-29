@@ -1,5 +1,6 @@
 #include "kernel_operator.h"
 #include "ubmem/batch_abi.h"
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -24,7 +25,7 @@ int main() {
   std::int32_t indices[]{1, 0, 1, -999}, offsets[]{0, 17, 656, -999}, outputs[]{2, 0, 1, -999};
   std::int32_t count = 3;
   BatchArgs a{};
-  a.magic = kBatchMagic; a.remote_base = remote_base; a.remote_bytes = remote.size();
+  a.remote_base = remote_base; a.remote_bytes = remote.size();
   a.mapped_base = Ptr(remote.data()); a.local_base = Ptr(local.data() + 1); a.local_bytes = 3 * 656;
   a.addresses = Ptr(addresses); a.valid = Ptr(valid); a.indices = Ptr(indices); a.offsets = Ptr(offsets);
   a.output_indices = Ptr(outputs); a.miss_count = Ptr(&count); a.statuses = Ptr(statuses.data());
@@ -51,6 +52,19 @@ int main() {
   offsets[0] = 0; outputs[0] = 3; Run(a); CHECK(statuses[0].result == 3);
   outputs[0] = 2; addresses[1] = remote_base + remote.size() - 16; Run(a); CHECK(statuses[0].result == 2);
 
+  // Validation is per row, not transactional: a bad later row leaves the
+  // previous rows copied, stops its core, and never writes the invalid row.
+  addresses[1] = remote_base + 8192;
+  a.blocks = 1;
+  outputs[1] = 3;
+  std::fill(local.begin(), local.end(), 0xD7);
+  Run(a);
+  CHECK(statuses[0].result == 3 && statuses[0].failed_request == 1 && statuses[0].completed == 1);
+  for (unsigned b = 0; b < 656; ++b) CHECK(local[1 + 2 * 656 + b] == remote[8192 + b]);
+  CHECK(local[1] == 0xD7 && local[1 + 656] == 0xD7 && local[1 + 3 * 656] == 0xD7);
+  outputs[1] = 0;
+  a.blocks = 3;
+
   std::uint64_t put_offsets[]{1, 20, 680}, lengths[]{1, 655, 4097};
   std::uint64_t destinations[]{remote_base + 1, remote_base + 8193, remote_base + 16384};
   a.operation = Operation::kPut; a.capacity = 3; a.local_base = Ptr(local.data()); a.local_bytes = local.size();
@@ -61,7 +75,9 @@ int main() {
     for (unsigned b = 0; b < lengths[r]; ++b)
       CHECK(remote[destinations[r] - remote_base + b] == local[put_offsets[r] + b]);
   }
-  destinations[2] = remote_base + remote.size() - 10; Run(a); CHECK(statuses[2].result == 2);
-  destinations[2] = remote_base; put_offsets[2] = local.size(); Run(a); CHECK(statuses[2].result == 3);
+  // Exercise the aligned 64-bit copy path as well as its byte tail.
+  put_offsets[2] = 0; destinations[2] = remote_base + 16384;
+  Run(a);
+  for (unsigned b = 0; b < lengths[2]; ++b) CHECK(remote[16384 + b] == local[b]);
   std::puts("UBmem actual kernel: mapped addressing, 656-byte reads, variable puts, inactive tail, guards, and invalid ranges passed");
 }

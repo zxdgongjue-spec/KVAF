@@ -85,13 +85,41 @@ NPU halMemImportFromShareableHandleV2 → Device VA reserve/map
 - `runtime/src/peer_link.cc`：增加 UBmem 分配、CPU oracle 请求；沿用原有 region release。
 - `access_operator/src/ubmem/access_operator.cc`：实现现有 AccessOperator 接口，保持 BatchPut 同步提交、
   BatchGet 按调用方 stream 入队。每个 stream 独立持有状态和完成事件。
-- `access_operator/src/ubmem/batch_kernel.asc`：对已映射的内存执行 SIMT load/store；检查逻辑 region、
-  输入输出范围和有效请求前缀；按 SHMEM quiet 的方式执行 pipeline barrier 和整缓存清理。
+- `access_operator/src/ubmem/batch_kernel.asc`：对已映射的内存执行 SIMT load/store；逐行解析、搬运，
+  检查设备端 Get 元数据中的有效请求前缀、表索引、远端 block 范围和输出范围。
 - `tests/ubmem/npu_test.cc`：以真实 RuntimeCore、MetaManager 运行上述测试。
 
 NPU 端先将 ACL 用户 device ID 转为 HAL logical device ID，支持可见设备编号重映射。
 内核使用 `mapped_base + (remote_address - remote_region_base)` 转换地址，无需对称地址空间。
 CPU region 在 NPU 映射持有期间不能释放；解除映射前先等待各 stream 的完成事件。
+
+## 校验与同步的职责
+
+使用 `RuntimeCore::BatchGet/BatchPut` 作为入口。Runtime 负责 buffer 格式、布局及 Put 源范围，
+MetaManager 负责按请求顺序分配 Put 目的范围；UBmem adapter 只增加 NPU 类型、kernel ABI
+位宽和 stream/state 检查。内核不重复检查 host 构造的参数；Get 的 `miss_count`、索引、
+偏移和地址表内容在设备上产生，仍由内核检查，避免越界读写。
+
+每个 core 遇到无效 Get 行时停止自己的循环并报告行号；此前完成的行和其他 core 的工作
+不会回滚。异步 Get 只返回入队结果；需要读取内核错误报告时使用 `synchronize=true`。
+
+缓存维护仅针对 **AIV 标量 DCache**，直接调用 AscendC 的 `DataCacheCleanAndInvalid`：
+
+| 位置 | 范围 | 生产者 → 消费者及理由 |
+| --- | --- | --- |
+| 内核入口、读取元数据前 | 本核整个标量 DCache，一次 | H2D 或前序 kernel → 当前标量读取。复用地址时不能读到此前缓存的请求数组、miss count 或地址表。元数据分散在多个数组，地址表还要间接索引，统一失效避免逐行刷新和额外遍历。 |
+| 内核出口、写入报告后 | 本核独占的 64 字节状态行，一次 | 标量 status store → host `aclrtMemcpy`。将状态写回，使 host 能读取错误码和完成行数；每核按缓存行隔离，避免写回其他 core 的报告。 |
+
+入口没有本 kernel 的待完成工作，因此不加 `PIPE_ALL`。出口的 `PIPE_ALL` 用于等待本核 VF
+工作完成后再发布状态；ACL event/stream 用于 host 等待和后续同 stream 操作排序。
+SIMT payload 使用普通 GM load/store，不对每条 payload 或每行数据添加 DCCI。
+上述标量缓存操作不能用来证明远端 DDR 的写入完成或 CPU/NPU 的缓存一致性。
+
+CPU oracle 只在 fill 完成后执行内存屏障，保证 DDR store 先于允许 NPU 开始 Get 的 TCP
+响应；只读 check 无需出口屏障。这个屏障不清理 CPU cache。跨节点数据可见性依赖目标
+HAL 映射和 UB 通路，需运行 CPU 改写后 NPU Get、NPU Put 后 CPU check 的硬件测试确认。
+驱动的 `SVM_FLAG_BY_PASS_CACHE` 在 `malloc_mng.c` 中控制分配器缓存，不能作为硬件绕过
+缓存的依据。
 
 ## 定位不支持的环节
 

@@ -2,14 +2,14 @@
 #include <cstdint>
 
 namespace kvaf::ubmem {
-constexpr std::uint64_t kBatchMagic = 0x4b56414655424d31ULL;
 enum class Operation : std::uint32_t { kGet = 0, kPut = 1 };
+// One scalar DCache line per core: publishing a report cannot write back
+// another core's report. The host and kernel are built together.
 struct alignas(64) CoreStatus {
-  std::uint64_t magic, result, failed_request, completed;
-  std::uint64_t reserved[4];
+  std::uint64_t result, failed_request, completed;
+  std::uint64_t reserved[5];
 };
 struct BatchArgs {
-  std::uint64_t magic;
   std::uint64_t remote_base, remote_bytes, mapped_base;
   std::uint64_t local_base, local_bytes;
   std::uint64_t addresses, valid, indices, offsets, output_indices, miss_count;
@@ -19,5 +19,5 @@ struct BatchArgs {
   std::uint32_t blocks, capacity, table_entries, token_bytes, tokens_per_block;
 };
 static_assert(sizeof(CoreStatus) == 64);
-static_assert(sizeof(BatchArgs) == 152);
+static_assert(sizeof(BatchArgs) == 144);
 }  // namespace kvaf::ubmem

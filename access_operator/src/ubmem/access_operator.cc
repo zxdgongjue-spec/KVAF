@@ -8,7 +8,6 @@
 #include <dlfcn.h>
 #include <cstdio>
 #include <fstream>
-#include <limits>
 #include <unordered_map>
 
 namespace kvaf::ubmem {
@@ -17,9 +16,6 @@ Status Acl(const char* operation, aclError code) {
   return code == ACL_SUCCESS ? Status::OK() : HalError(operation, code);
 }
 std::uint64_t AddressOf(const void* ptr) { return reinterpret_cast<std::uintptr_t>(ptr); }
-bool DeviceBuffer(const ConstBufferView& buffer, std::size_t unit) {
-  return buffer.valid() && buffer.device == DeviceKind::kNpu && buffer.bytes % unit == 0;
-}
 Status DriverDevice(std::uint32_t user_device, std::uint32_t* device) {
   void* library = dlopen("libruntime.so", RTLD_NOW | RTLD_LOCAL);
   if (!library) return Status::NotFound("cannot load libruntime.so for HAL logical-device resolution");
@@ -37,12 +33,12 @@ Status DriverDevice(std::uint32_t user_device, std::uint32_t* device) {
 struct AccessOperator::Impl {
   explicit Impl(OperatorOptions value) : options(std::move(value)) {}
   struct StreamState {
+    enum class Pending { kNone, kEvent, kStream };
     aclrtEvent event{};
     void* statuses{};
     void* metadata{};
     std::size_t capacity{};
-    bool recorded{};
-    bool needs_stream_drain{};
+    Pending pending{Pending::kNone};
   };
   OperatorOptions options;
   std::shared_ptr<Hal> hal = std::make_shared<Hal>();
@@ -53,7 +49,6 @@ struct AccessOperator::Impl {
   std::vector<char> binary_bytes;
   std::unordered_map<aclrtStream, StreamState> streams;
   bool ready{};
-  bool poisoned{};
   bool retained{};
 
   Status LoadKernel() {
@@ -73,7 +68,7 @@ struct AccessOperator::Impl {
   }
 
   Status State(aclrtStream stream, StreamState** result) {
-    if (!ready || poisoned) return Status::InvalidState("UBmem operator is uninitialized or failed; rebuild it");
+    if (!ready) return Status::InvalidState("UBmem operator is uninitialized or failed; rebuild it");
     if (stream == nullptr) return Status::InvalidArgument("UBmem requires a caller-owned ACL stream");
     auto [it, inserted] = streams.try_emplace(stream);
     auto& state = it->second;
@@ -93,7 +88,6 @@ struct AccessOperator::Impl {
 
   BatchArgs Args(Operation operation, void* local, std::size_t bytes, StreamState& state) const {
     BatchArgs a{};
-    a.magic = kBatchMagic;
     a.operation = operation;
     a.remote_base = remote.base;
     a.remote_bytes = remote.length;
@@ -117,25 +111,27 @@ struct AccessOperator::Impl {
     auto status = Acl("aclrtLaunchKernelWithHostArgs", aclrtLaunchKernelWithHostArgs(
         function, options.cores, stream, &cfg, &args, sizeof(args), nullptr, 0));
     if (!status.ok()) return status;
-    state.needs_stream_drain = true;
+    state.pending = StreamState::Pending::kStream;
     status = Acl("aclrtRecordEvent", aclrtRecordEvent(state.event, stream));
     if (!status.ok()) {
-      poisoned = true;
-      (void)aclrtSynchronizeStream(stream);
+      ready = false;
+      // The kernel was submitted but has no completion event. Drain now;
+      // if that fails, Shutdown must retry before unmapping remote memory.
+      if (aclrtSynchronizeStream(stream) == ACL_SUCCESS) state.pending = StreamState::Pending::kNone;
       return status;
     }
-    state.recorded = true;
-    state.needs_stream_drain = false;
+    state.pending = StreamState::Pending::kEvent;
     if (!synchronize) return Status::OK();
     status = Acl("aclrtSynchronizeEvent", aclrtSynchronizeEvent(state.event));
-    if (!status.ok()) { poisoned = true; return status; }
+    if (!status.ok()) { ready = false; return status; }
+    state.pending = StreamState::Pending::kNone;
     std::vector<CoreStatus> reports(options.cores);
     const auto size = reports.size() * sizeof(CoreStatus);
     status = Acl("aclrtMemcpy(status)", aclrtMemcpy(reports.data(), size, state.statuses, size,
                                                    ACL_MEMCPY_DEVICE_TO_HOST));
     if (!status.ok()) return status;
     for (std::size_t i = 0; i < reports.size(); ++i) {
-      if (reports[i].magic != kBatchMagic || reports[i].result != 0) {
+      if (reports[i].result != 0) {
         std::fprintf(stderr, "[KVAF_UBMEM] KERNEL_ERROR core=%zu code=%llu request=%llu\n", i,
             static_cast<unsigned long long>(reports[i].result),
             static_cast<unsigned long long>(reports[i].failed_request));
@@ -175,9 +171,7 @@ Status AccessOperator::Initialize(const RemoteRegionDesc& region) {
   }
   if (status.ok()) status = impl_->LoadKernel();
   if (!status.ok()) { (void)Shutdown(); return status; }
-  impl_->remote = region;
   impl_->ready = true;
-  impl_->poisoned = false;
   std::fprintf(stderr, "[KVAF_UBMEM] DEVICE_MAPPING_READY bytes=%llu cores=%u\n",
       static_cast<unsigned long long>(region.length), impl_->options.cores);
   return Status::OK();
@@ -186,15 +180,14 @@ Status AccessOperator::Initialize(const RemoteRegionDesc& region) {
 Status AccessOperator::Shutdown() {
   impl_->ready = false;
   for (auto& entry : impl_->streams) {
-    if (entry.second.needs_stream_drain) {
+    if (entry.second.pending == Impl::StreamState::Pending::kStream) {
       auto status = Acl("aclrtSynchronizeStream(recovery)", aclrtSynchronizeStream(entry.first));
       if (!status.ok()) return status;
-      entry.second.needs_stream_drain = false;
-    }
-    if (entry.second.recorded) {
+    } else if (entry.second.pending == Impl::StreamState::Pending::kEvent) {
       auto status = Acl("aclrtSynchronizeEvent(shutdown)", aclrtSynchronizeEvent(entry.second.event));
       if (!status.ok()) return status;
     }
+    entry.second.pending = Impl::StreamState::Pending::kNone;
   }
   for (auto& entry : impl_->streams) {
     auto& s = entry.second;
@@ -218,20 +211,14 @@ Status AccessOperator::Shutdown() {
     impl_->options.peer_link->ReleaseUbmemMapping(impl_->remote.base);
     impl_->retained = false;
   }
-  impl_->ready = false;
   return Status::OK();
 }
 
 Status AccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
-  if (!exec.request) return Status::InvalidArgument("missing UBmem BatchGet request");
+  // RuntimeCore owns buffer/layout validation. This adapter only restricts
+  // the device and checks narrowing to its kernel ABI.
   const auto& r = *exec.request;
-  if (!DeviceBuffer(r.indices, 4) || !DeviceBuffer(r.offsets, 4) ||
-      !DeviceBuffer(r.output_indices, 4) || !DeviceBuffer(r.miss_count, 4) || r.miss_count.bytes != 4 ||
-      r.indices.bytes != r.offsets.bytes || r.indices.bytes != r.output_indices.bytes ||
-      !DeviceBuffer(r.device_access_table.addresses, 8) || !DeviceBuffer(r.device_access_table.valid, 1) ||
-      r.device_access_table.valid.bytes != r.device_access_table.addresses.bytes / 8 ||
-      !r.output.valid() || r.output.device != DeviceKind::kNpu || r.output_block_bytes == 0 ||
-      r.output.bytes % r.output_block_bytes != 0 || r.tokens_per_block == 0 ||
+  if (r.output.device != DeviceKind::kNpu ||
       r.output_block_bytes > UINT32_MAX || r.tokens_per_block > UINT32_MAX ||
       r.indices.bytes / 4 > INT32_MAX || r.device_access_table.valid.bytes > UINT32_MAX) {
     return Status::InvalidArgument("invalid UBmem BatchGet device buffers/layout");
@@ -255,25 +242,17 @@ Status AccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
 }
 
 Status AccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
-  if (!exec.request || !exec.put_desc) return Status::InvalidArgument("missing UBmem BatchPut request/allocations");
   const auto& r = *exec.request;
   const auto rows = r.keys.size();
-  if (!DeviceBuffer(r.input, 1) || rows == 0 || rows > UINT32_MAX || r.input_offsets.size() != rows ||
-      r.lengths.size() != rows || exec.put_desc->entries.size() != rows || rows > SIZE_MAX / 24) {
+  if (r.input.device != DeviceKind::kNpu || rows > UINT32_MAX) {
     return Status::InvalidArgument("invalid UBmem BatchPut metadata");
   }
+  // RuntimeCore checked source ranges; MetaManager allocated these destination
+  // ranges in the region supplied to Initialize, in request order.
   std::vector<std::uint64_t> metadata(rows * 3);
   for (std::size_t i = 0; i < rows; ++i) {
-    const auto& dest = exec.put_desc->entries[i];
-    if (r.lengths[i] == 0 || r.input_offsets[i] > r.input.bytes ||
-        r.lengths[i] > r.input.bytes - r.input_offsets[i] || dest.key != r.keys[i] ||
-        dest.reserved_length != r.lengths[i] || dest.address < impl_->remote.base ||
-        r.lengths[i] > impl_->remote.length ||
-        dest.address - impl_->remote.base > impl_->remote.length - r.lengths[i]) {
-      return Status::InvalidArgument("UBmem BatchPut source/destination is outside its region");
-    }
     metadata[i] = r.input_offsets[i]; metadata[rows + i] = r.lengths[i];
-    metadata[2 * rows + i] = dest.address;
+    metadata[2 * rows + i] = exec.put_desc->entries[i].address;
   }
   Impl::StreamState* state;
   auto stream = static_cast<aclrtStream>(exec.execution.stream);

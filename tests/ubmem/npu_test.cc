@@ -187,8 +187,7 @@ int main(int argc, char** argv) {
         FullBlocks(core, *link, buffers, c, 17 + iteration * 13);
         VariablePut(core, *link, buffers, c, 91 + iteration * 13);
       }
-      // Drain all mapped accesses before RuntimeCore releases remote DDR.
-      Check(op.Shutdown());
+      // RuntimeCore shuts down the operator before releasing remote DDR.
       Check(core.Shutdown());
     }
     Acl(aclrtResetDevice(c.device), "aclrtResetDevice");

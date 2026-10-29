@@ -10,8 +10,14 @@
 inline struct { unsigned x; } threadIdx;
 inline unsigned model_core;
 enum { PIPE_ALL };
-inline void dcci_entire_cache() {}
 namespace AscendC {
+enum class CacheLine { ENTIRE_DATA_CACHE, SINGLE_CACHE_LINE };
+enum class DcciDst { CACHELINE_OUT };
+template <typename T> struct GlobalTensor {
+  void SetGlobalBuffer(T*) {}
+};
+template <typename T, CacheLine, DcciDst>
+void DataCacheCleanAndInvalid(GlobalTensor<T>&) {}
 template <int> void PipeBarrier() {}
 inline unsigned GetBlockIdx() { return model_core; }
 namespace Simt {

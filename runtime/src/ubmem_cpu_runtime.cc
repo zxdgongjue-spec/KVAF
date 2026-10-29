@@ -88,7 +88,9 @@ struct CpuRuntime::Impl {
         return peer::Result::kResourceError;
       }
     }
-    __sync_synchronize();
+    // Publish CPU stores before the TCP fill response lets the NPU start GET.
+    // This orders stores; it does not clean CPU caches on a noncoherent mapping.
+    if (fill) __sync_synchronize();
     return peer::Result::kOk;
   }
 };
