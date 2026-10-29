@@ -137,7 +137,7 @@ def print_table(rows):
         print(" ".join(f"{cell(name):>23}" for name in columns))
 
 
-def merge_csv(output, inputs):
+def merge_csv(output, inputs, *, emit=print):
     rows = []
     for source in inputs:
         if Path(source).resolve() == Path(output).resolve():
@@ -151,7 +151,7 @@ def merge_csv(output, inputs):
                 raise ValueError(f"Empty Jetty CSV: {source}")
             rows.extend(part)
     write_csv(output, rows)
-    print(f"BATCH_GET_JETTY_SWEEP_CSV_WRITTEN path={output} rows={len(rows)}")
+    emit(f"BATCH_GET_JETTY_SWEEP_CSV_WRITTEN path={output} rows={len(rows)}")
 
 
 if __name__ == "__main__":

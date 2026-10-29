@@ -48,11 +48,13 @@ python3 tests/python/run_peer_eid_sweep.py "$PWD/build-npu" \
 | `--cores` | 一次 kernel 使用的 AIV core 总数，1–48 |
 | `--jettys` | **每 core 的 Jetty 总数**，2–64，按 0、1、0、1 分配给两个 EID |
 | `--table-capacity` | 共享 DDR 表的条目数 |
-| `--request-length` | 每次 BatchGet 的总请求数，默认 32768，两路共同分担 |
+| `--request-length` | 请求数组容量，默认 32768 |
+| `--miss-count` | 每次 BatchGet 的有效请求总数，两路共同分担；默认等于 request-length |
 | `--token-bytes` / `--tokens-per-block` | 默认 656 / 128 |
 | `--warmup` / `--iterations` | 默认 3 / 100，warmup 不计入结果 |
 | `--max-inflight-total` | 总 inflight 上限；默认 `max(2048, cores * jettys * 256)` |
 | `--timeout` | 完整测试超时秒数，默认 600 |
+| `--kernel-profile-clock-mhz` | AIV 周期换算频率，默认读取 `KVAF_BATCH_GET_KERNEL_CLOCK_MHZ`，未设置时为 1000 MHz，与原 miss-count 脚本一致 |
 
 因此 `--cores 1 --jettys 4` 是 1 core、共 4 Jetty，每个 CPU EID 分到 2 个。
 这不等同于两个各用 1 core、4 Jetty 的独立测试；比较基线时应匹配资源和流量。
@@ -79,8 +81,30 @@ READ 的粒度轮转，尾部也可能使两路字节数不同，实际分配以
 
 ## 查看结果
 
+终端输出与 `tests/run_remote_cpu_batch_get_miss_count_perf.sh` 保持相同的主要结构：
+运行时实时显示原生建链日志、测试阶段、`PERF_RESULT` 和每 Jetty 表，同时写入
+`batch_get.log`；结束后打印三张 `BATCH_GET_MISS_SWEEP_STAGE_SUMMARY` 表：
+
+| stage | 主要列 |
+| --- | --- |
+| `kernel_total` | token_bytes、miss_count、aiv_cores、jettys_per_core、mean_us、p50_us、p90_us、p99_us、p50_GB/s |
+| `kernel_post` | 相同配置列，以及 mean_us、p50_us、p90_us、p99_us |
+| `kernel_completion_wait` | 相同配置列，以及 mean_us、p50_us、p90_us、p99_us |
+
+微秒数使用 `cycles / clock_mhz`，不从四舍五入后的毫秒数换算；
+`p50_GB/s` 使用两路合计的 `miss_count * token_bytes` 除以 kernel_total 的 p50
+时间，以十进制 GB/s 表示，与原脚本口径一致，不再额外乘以 EID 数量。
+每次调用依然只有一个配置（`combinations=1`），两个 EID 在该配置内并发。
+没有自动改成原 shell 脚本的 2048/4096/8192 三组请求量。需要对比某一组时，
+在原命令末尾追加例如 `--miss-count 2048`；两路共同分担这 2048 个请求。
+
 - `config.json`：启动参数、命令、设备和 CPU 地址。
-- `batch_get.log`：原生建链/路由日志、预热、校验、总吞吐及每 Jetty 性能输出。
+- `batch_get.log`：完整终端日志，包含原生建链/路由、预热、校验、总吞吐、
+  每 Jetty 性能、最后三张汇总表以及失败信息。超时或子进程失败时返回非零，
+  保留已有日志，不生成成功汇总。
+- `batch_get_miss_sweep_summary.csv`：与原脚本同名、同列顺序的一行性能汇总。
+  `selected_ub_device` 留空，因为本次使用两个远端；具体 EID 见 config/peer CSV。
+- `batch_get_jetty_summary.csv`：与原脚本同名、同 schema 的 Jetty 汇总。
 - `jettys.csv`：测量迭代的每 Jetty 汇总，`eid_path` 为 CPU EID 列表下标。
 - `peer_samples.csv`：每次迭代、每个 core、每个 CPU EID 的请求数、字节数、
   首末 doorbell/CQE 观测周期及 `first_wave_observed_overlap_cycles`。
@@ -94,6 +118,9 @@ READ 的粒度轮转，尾部也可能使两路字节数不同，实际分配以
 它不能证明物理线上每一瞬间都存在两路流量。不同 core 的周期不直接比较。
 判断是否争用你给定的共享物理端口，还需对照单 EID 基线以及端口计数器；
 代码本身不推断 EID 到物理端口的拓扑。建议使用已有端口统计脚本辅助观察。
+
+本次输出格式调整只改 Python 脚本，无需再次编译 CPU/NPU 二进制；首次启用双 EID
+功能所需的 v7 构建要求仍适用。原有命令可继续使用，请换一个尚无同名结果的输出目录。
 
 ## 已完成的验证与目标机验收
 
