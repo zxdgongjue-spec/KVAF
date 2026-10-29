@@ -31,13 +31,22 @@ Status Worker::Stop() {
 }
 void Worker::Run() {
   std::uint64_t last = 0;
+  const auto report = [&](const char* phase, const Status& status) {
+    std::fprintf(stderr,
+        "[KVAF_CPU] CPU_PUSH_WORKER_FAILED session=%llu phase=%s last_sequence=%llu reason=%s\n",
+        static_cast<unsigned long long>(transport_->session()), phase,
+        static_cast<unsigned long long>(last), status.message().c_str());
+  };
   while (!stop_.load(std::memory_order_acquire)) {
     std::uint64_t sequence = 0;
     auto status = transport_->ReadRequest(&sequence);
-    if (!status.ok()) { std::fprintf(stderr, "CPU_PUSH: %s\n", status.message().c_str()); return; }
+    if (!status.ok()) { report("read_notify", status); return; }
     if (!sequence || sequence == last) continue;
     if (sequence <= last || sequence > UINT32_MAX) {
-      (void)transport_->Complete(sequence, Result::kSequenceError);
+      report("validate_sequence", Status::InvalidState("invalid notify sequence=" +
+                                                       std::to_string(sequence)));
+      const auto completion = transport_->Complete(sequence, Result::kSequenceError);
+      if (!completion.ok()) report("write_error_completion", completion);
       return;
     }
     last = sequence;
@@ -45,13 +54,15 @@ void Worker::Run() {
     if (!status.ok()) {
       // Header errors occur before any data WRITE. A transport error may
       // leave the queue poisoned; Complete then fails without reusing its slots.
-      (void)transport_->Complete(sequence, Result::kInvalidRequest);
-      std::fprintf(stderr, "CPU_PUSH: %s\n", status.message().c_str());
+      report("read_descriptor", status);
+      const auto completion = transport_->Complete(sequence, Result::kInvalidRequest);
+      if (!completion.ok()) report("write_error_completion", completion);
       return;
     }
     status = transport_->WriteBatch();
-    if (status.ok()) status = transport_->Complete(sequence, Result::kOk);
-    if (!status.ok()) { std::fprintf(stderr, "CPU_PUSH: %s\n", status.message().c_str()); return; }
+    if (!status.ok()) { report("write_payload", status); return; }
+    status = transport_->Complete(sequence, Result::kOk);
+    if (!status.ok()) { report("write_completion", status); return; }
     transport_->PrintProfile();
   }
 }

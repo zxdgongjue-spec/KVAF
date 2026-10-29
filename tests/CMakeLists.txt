@@ -4,6 +4,8 @@ add_executable(kvaf_startup_selection_test startup_selection_test.cc)
 target_include_directories(kvaf_startup_selection_test PRIVATE
   ${PROJECT_SOURCE_DIR}/runtime/include ${PROJECT_SOURCE_DIR}/common/include)
 add_test(NAME kvaf_startup_selection_test COMMAND kvaf_startup_selection_test)
+add_test(NAME kvaf_aiv_test_cleanup_python
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_aiv_test_cleanup.py")
 
 add_test(NAME kvaf_dsa_keys_python
   COMMAND "${Python3_EXECUTABLE}"

@@ -27,6 +27,7 @@ class Transport {
   Status Shutdown();
   const Request& request() const { return *reinterpret_cast<const Request*>(memory_); }
   const Layout& layout() const { return layout_; }
+  std::uint64_t session() const { return session_; }
  private:
   struct Profile {
     bool enabled{};
@@ -82,7 +83,7 @@ class Transport {
   urma_target_seg_t* control_{};
   urma_token_id_t* control_token_{};
   std::uint8_t* memory_{};
-  std::uint64_t hbm_base_{};
+  std::uint64_t hbm_base_{}, session_{};
   std::uint32_t max_sge_{}, max_bytes_{}, workers_{}, token_bytes_{};
   Layout layout_;
 };

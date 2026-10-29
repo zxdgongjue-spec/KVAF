@@ -35,6 +35,19 @@ def kernel_paths() -> tuple[str, str]:
     return str(paths["KVAF_BATCH_GET_KERNEL"]), str(paths["KVAF_BATCH_PUT_KERNEL"])
 
 
+def shutdown_runtime(runtime) -> None:
+    """Retain a test failure when device/transport teardown fails as well."""
+    original = sys.exc_info()[1]
+    if runtime.initialized:
+        try:
+            runtime.shutdown()
+        except Exception as error:
+            if original is None:
+                raise
+            print(f"[KVAF_TEST] shutdown also failed; preserving original exception: {error}",
+                  file=sys.stderr, flush=True)
+
+
 def main() -> int:
     if os.environ.get("KVAF_RUN_NPU_TESTS") != "1":
         print("SKIP: set KVAF_RUN_NPU_TESTS=1 on the A5/CANN target")
@@ -141,8 +154,7 @@ def main() -> int:
             runtime.shutdown()
             print(f"PASS: mode={mode} cores={cores} token_bytes={token} counts={counts}")
         finally:
-            if runtime.initialized:
-                runtime.shutdown()
+            shutdown_runtime(runtime)
     return 0
 
 

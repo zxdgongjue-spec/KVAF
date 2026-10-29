@@ -143,6 +143,15 @@ DEVICE_ID=5 KVAF_NPU_CORE_COUNT=1 KVAF_AIV_BATCH_GET_MODES=cpu_push_scatter \
 BatchPut 路径上的本地 ACL 失败会停止候选 EID 重试；正常返回的 CQ 错误仍允许
 连接回退。清理同时失败时，异常保留原始原因并附加清理错误。
 
+若 `STARTUP_PROBE_READY` 和实际 `batch_put` 均已完成，而首次非空 scatter
+失败，应查看 CPU 的 `CPU_PUSH_WORKER_FAILED`。其中 `phase` 区分 notify READ、
+descriptor READ、payload WRITE 和 completion WRITE；`last_sequence=0` 表示
+worker 尚未接受非空请求。控制 CQ 错误包含数值 `status`、`expected_ctx`、
+`actual_ctx`、队列/Jetty/CQ/TPN、WR 操作和访问地址，不能只凭旧版
+`CQ status/context mismatch` 判断是链路失败还是完成记录错配。
+NPU drain 异常包含 `sequence`、`phase=copy_status/synchronize` 和原始 ACL
+错误码。测试脚本会另外打印清理失败，但保留原始执行异常作为最终异常。
+
 ## 当前验证状态
 
 本地无 CANN/NPU，已完成：

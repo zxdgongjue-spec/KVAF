@@ -86,13 +86,23 @@ struct SequentialBatchGet::Impl {
   bool Push() const { return config.aiv_batch_get_mode == "cpu_push_scatter"; }
   uint64_t StatusBytes() const { return config.npu_core_count * sizeof(KvafSequentialStatus); }
 
+  Status AclFailure(const char* phase, aclError code) const {
+    return Status::DeviceError("AIV sequential BatchGet: mode=" + config.aiv_batch_get_mode +
+        " sequence=" + std::to_string(sequence) + " phase=" + phase +
+        " acl=" + std::to_string(code) + "; resources retained");
+  }
+
   Status Drain() {
     if (failed) return Status::InvalidState("sequential BatchGet failed; shutdown/reinitialize required");
     if (!pending) return Status::OK();
-    if (aclrtMemcpyAsync(status_host, StatusBytes(), status_device, StatusBytes(),
-                         ACL_MEMCPY_DEVICE_TO_HOST, pending) != ACL_SUCCESS ||
-        aclrtSynchronizeStream(pending) != ACL_SUCCESS) {
-      failed = true; return Error("cannot drain execution; resources retained");
+    const aclError copied = aclrtMemcpyAsync(status_host, StatusBytes(), status_device,
+                                            StatusBytes(), ACL_MEMCPY_DEVICE_TO_HOST, pending);
+    if (copied != ACL_SUCCESS) {
+      failed = true; return AclFailure("copy_status", copied);
+    }
+    const aclError synchronized = aclrtSynchronizeStream(pending);
+    if (synchronized != ACL_SUCCESS) {
+      failed = true; return AclFailure("synchronize", synchronized);
     }
     pending = nullptr;
     const auto* statuses = static_cast<const KvafSequentialStatus*>(status_host);
@@ -102,7 +112,9 @@ struct SequentialBatchGet::Impl {
           s.phase != KVAF_SEQ_COMPLETE) {
         failed = true;
         return Status::Internal("AIV sequential BatchGet worker=" + std::to_string(i) +
-            " phase=" + std::to_string(s.phase) + " result=" + std::to_string(s.result));
+            " sequence=" + std::to_string(sequence) + " observed_sequence=" +
+            std::to_string(s.sequence) + " phase=" + std::to_string(s.phase) +
+            " result=" + std::to_string(s.result));
       }
     }
     if (output_buffer) KvafBatchGetLocalBufferRelease(output_buffer);
@@ -204,8 +216,10 @@ struct SequentialBatchGet::Impl {
     // On execution errors, keep closing the transports before releasing memory.
     const auto execution_status = failed ? Status::OK() : Drain();
     failed = true;  // A partially closed transport cannot accept another Execute.
-    if (pending && aclrtSynchronizeStream(pending) != ACL_SUCCESS)
-      return Error("stream not drained; resources retained");
+    if (pending) {
+      const aclError synchronized = aclrtSynchronizeStream(pending);
+      if (synchronized != ACL_SUCCESS) return AclFailure("shutdown_synchronize", synchronized);
+    }
     pending = nullptr;
     if (push_open) {
       auto result = config.peer_link->StopCpuPushGet(region.base);

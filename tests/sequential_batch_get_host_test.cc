@@ -14,7 +14,7 @@
 namespace {
 std::vector<std::function<void()>> work;
 int allocations{}, refs{}, launches{}, completed{}, stopped{}, quiesced{};
-bool fail_sync{}, fail_quiesce{}, fail_enable{}, capturing{};
+bool fail_sync{}, fail_copy{}, fail_quiesce{}, fail_enable{}, capturing{};
 uint64_t kernel_result{};
 std::vector<uint64_t> sequences;
 }
@@ -29,10 +29,11 @@ int aclrtMemsetAsync(void* p, size_t, int32_t v, size_t n, aclrtStream) {
   work.push_back([=] { std::memset(p, v, n); }); return 0;
 }
 int aclrtMemcpyAsync(void* d, size_t, const void* s, size_t n, aclrtMemcpyKind, aclrtStream) {
+  if (fail_copy) return 507035;
   work.push_back([=] { std::memcpy(d, s, n); }); return 0;
 }
 int aclrtSynchronizeStream(aclrtStream) {
-  if (fail_sync) return 1;
+  if (fail_sync) return 507034;
   for (auto& f : work) f(); work.clear(); return 0;
 }
 int aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus* s, aclmdlRI*) {
@@ -138,9 +139,22 @@ int main() {
   {
     SequentialBatchGet owner(config); assert(owner.Initialize(region).ok());
     assert(owner.Execute(exec).ok()); fail_sync = true;
-    assert(!owner.Drain().ok()); assert(!owner.Shutdown().ok());
+    const auto failure = owner.Drain();
+    assert(failure.code() == StatusCode::kDeviceError);
+    assert(failure.message().find("sequence=1 phase=synchronize acl=507034") != std::string::npos);
+    const auto cleanup = owner.Shutdown();
+    assert(cleanup.message().find("phase=shutdown_synchronize acl=507034") != std::string::npos);
     assert(refs == 2 && allocations == 4);
     fail_sync = false; assert(owner.Shutdown().ok()); assert(!refs && !allocations);
+  }
+  {
+    SequentialBatchGet owner(config); assert(owner.Initialize(region).ok());
+    assert(owner.Execute(exec).ok()); fail_copy = true;
+    const auto failure = owner.Drain();
+    assert(failure.code() == StatusCode::kDeviceError);
+    assert(failure.message().find("sequence=1 phase=copy_status acl=507035") != std::string::npos);
+    assert(refs == 2 && allocations == 4);
+    fail_copy = false; assert(owner.Shutdown().ok()); assert(!refs && !allocations);
   }
   {
     SequentialBatchGet owner(config); fail_enable = true;
@@ -155,6 +169,6 @@ int main() {
     assert(!owner.Shutdown().ok()); assert(!refs && !allocations);
     assert(owner.Shutdown().ok()); kernel_result = 0;
   }
-  assert(stopped == 5 && quiesced == 5);
+  assert(stopped == 6 && quiesced == 6);
   std::cout << "sequential Host lifecycle: PASS\n";
 }

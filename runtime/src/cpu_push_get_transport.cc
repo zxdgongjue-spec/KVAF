@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <sstream>
 #include <thread>
 
 namespace kvaf::cpu_push {
@@ -22,6 +23,17 @@ void Stage(const char* stage, std::uint32_t queue = UINT32_MAX) {
   else
     std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_INIT stage=%s queue=%u\n", stage, queue);
   errno = 0;
+}
+std::string CqDetails(std::size_t queue, const urma_cr_t& cr,
+                      const cpu_runtime_detail::UrmaChannel& channel) {
+  std::ostringstream out;
+  out << " queue=" << queue << " status=" << static_cast<unsigned>(cr.status)
+      << " actual_ctx=0x" << std::hex << cr.user_ctx << std::dec
+      << " flags=" << static_cast<unsigned>(cr.flag.value)
+      << " completion_bytes=" << cr.completion_len << " local_id=" << cr.local_id
+      << " jetty_id=" << channel.local_jetty->jetty_id.id
+      << " cq_id=" << channel.local_jfc->jfc_id.id << " tpn=" << cr.tpn;
+  return out.str();
 }
 }  // namespace
 
@@ -46,6 +58,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
       setup.hbm_base > UINT64_MAX - setup.hbm_bytes)
     return Status::InvalidArgument("invalid CPU push setup");
   context_ = context;
+  session_ = setup.session_id;
   source_ = source;
   hbm_base_ = setup.hbm_base;
   workers_ = setup.workers;
@@ -180,7 +193,18 @@ Status Transport::Wait(Queue& q) {
     if (count < 0) { q.poisoned = true; return Error("poll CQ"); }
     for (int i = 0; i < count; ++i) {
       if (crs[i].status != URMA_CR_SUCCESS || crs[i].user_ctx != q.pending) {
-        q.poisoned = true; return Error("CQ status/context mismatch");
+        q.poisoned = true;
+        std::ostringstream out;
+        out << "CPU push: control CQ "
+            << (crs[i].status != URMA_CR_SUCCESS ? "failed" : "context mismatch")
+            << CqDetails(&q - queues_.data(), crs[i], q.channel)
+            << " expected_ctx=0x" << std::hex << q.pending
+            << " local_addr=0x" << q.local.front().addr
+            << " remote_addr=0x" << q.remote.front().addr << std::dec
+            << " bytes=" << q.remote.front().len
+            << " wr_opcode=" << static_cast<unsigned>(q.wrs.back().opcode)
+            << " notify_offset=" << layout_.notify;
+        return Status::Internal(out.str());
       }
       q.pending = 0;
     }
@@ -370,11 +394,17 @@ Status Transport::PollPrepared(std::uint64_t id, Profile* profile) {
         [&](std::size_t q, std::size_t index, bool* finished) -> Status {
           const auto& cr = crs[index];
           if (cr.status != URMA_CR_SUCCESS) {
-            queues_[q].poisoned = true; return Error("prepared CQ status");
+            queues_[q].poisoned = true;
+            return Status::Internal("CPU push: prepared CQ failed" +
+                                    CqDetails(q, cr, queues_[q].channel));
           }
           std::uint64_t completed = 0;
           auto status = tracker_.Complete(q, cr.user_ctx, &completed);
-          if (!status.ok()) { queues_[q].poisoned = true; return status; }
+          if (!status.ok()) {
+            queues_[q].poisoned = true;
+            return Status::Error(status.code(), status.message() +
+                                 CqDetails(q, cr, queues_[q].channel));
+          }
           if (completed && completed != id) return Error("unexpected prepared completion");
           *finished = completed != 0;
           return Status::OK();
